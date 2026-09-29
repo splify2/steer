@@ -202,6 +202,8 @@ struct srv {
 static unsigned char g_rs_priv[32], g_rs_pub[32];
 /* Что сервер увидел в ALPN последнего ClientHello (для прогонов через run_case). */
 static volatile int g_seen_h11 = -1;
+/* Новый Xray-core принимает Reality только если гибридная группа стоит перед X25519. */
+static volatile int g_seen_mlkem_before_x25519 = -1;
 
 /* HKDF-Expand-Label из RFC 8446 §7.1. Своя копия, а не вызов статической из tls13.c:
  * стенд обязан считать метку САМ, иначе ошибка в клиентской обёртке сошлась бы сама с
@@ -445,11 +447,15 @@ static int ch_pick(const unsigned char *b, size_t n, unsigned char pub[32],
              * X25519 (0x001d): reality.c умеет предлагать и постквантовую группу, и она в
              * списке стоит первой. */
             size_t q = 2;
+            int saw_mlkem = 0;
             while (q + 4 <= elen) {
                 unsigned grp = ((unsigned)b[p + q] << 8) | b[p + q + 1];
                 size_t kn = ((size_t)b[p + q + 2] << 8) | b[p + q + 3];
                 if (q + 4 + kn > elen) break;
+                if (grp == REALITY_GROUP_MLKEM && kn == REALITY_MLKEM_SHARE)
+                    saw_mlkem = 1;
                 if (grp == 0x001d && kn == 32) {
+                    g_seen_mlkem_before_x25519 = saw_mlkem;
                     memcpy(pub, b + p + q + 4, 32);
                     return 0;
                 }
@@ -1113,8 +1119,11 @@ int main(void) {
             int rc;
             if (u == 0) {
                 g_seen_h11 = -1;
+                g_seen_mlkem_before_x25519 = -1;
                 rc = run_case(&up, &rn, NULL, 0, NULL);
                 check("reality: временный сертификат признан — соединение установлено", 0, rc);
+                check("reality + tcp: X25519MLKEM768 стоит перед X25519", 1,
+                      g_seen_mlkem_before_x25519);
                 check("reality + tcp: ALPN прежний, не один http/1.1", 0, g_seen_h11);
                 check("reality + tcp: дескрипторы вернулись к исходному числу", fd0, fd_count());
                 continue;

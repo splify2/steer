@@ -65,12 +65,17 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
     /* ws и httpupgrade просят в ALPN ТОЛЬКО http/1.1 — как Xray (WebsocketHandshakeContext у
      * uTLS переписывает ALPN отпечатка на один http/1.1) и как сам Chrome на соединении
      * веб-сокета. С обычной парой «h2, http/1.1» сервер за TLS вправе выбрать h2, и наш запрос
-     * Upgrade по HTTP/1.1 уйдёт в соединение HTTP/2 мусором. У остальных транспортов Hello не
-     * меняется ни на бит (tests/hellofreeze.c): носитель зовётся только ради этих двух. */
-    struct reality_carrier car = { .alpn_http11 = 1 };
+     * Upgrade по HTTP/1.1 уйдёт в соединение HTTP/2 мусором.
+     *
+     * Xray-core 26.9.8+ отвергает Reality ClientHello, если гибридный key_share
+     * X25519MLKEM768 не стоит перед обычным X25519. Секрет Reality по-прежнему выводится из
+     * X25519 (сервер делает так же); гибридная доля — часть современного облика Chrome и
+     * обязательная проверка свежести клиента на сервере. Поэтому pq включён у каждого
+     * TLS-подобного транспорта VLESS, включая ws/httpupgrade. */
+    struct reality_carrier car = { .pq = 1, .alpn_http11 = 1 };
     const int h11 = alpn && !strcmp(alpn, "http/1.1");
-    int rc = h11 ? reality_build_hello_carry(&cfg, &rst, &car, hello, sizeof(hello), &hello_n)
-                 : reality_build_hello(&cfg, &rst, hello, sizeof(hello), &hello_n);
+    if (!h11) car.alpn_http11 = 0;
+    int rc = reality_build_hello_carry(&cfg, &rst, &car, hello, sizeof(hello), &hello_n);
     if (rc) return rc;
 
     size_t sent = 0;
