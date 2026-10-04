@@ -158,8 +158,15 @@ static int grpc_read(struct transport *t, unsigned char *d, size_t cap, size_t *
  * указывал бы в брошенное место. */
 static void grpc_moved(struct transport *t) { t->h2.io.ctx = &t->link; }
 
+/* Конец потока уже известен (END_STREAM пришёл вместе с последними данными или отказ отложен до
+ * следующего чтения, h2.h: pend_err), а сказать о нём можно только следующим h2_read. Сокет при этом
+ * молчит — сервер всё отправил, — и без этого признака цикл туннеля, отдав клиенту данные, не звал бы
+ * чтение снова: соединение клиента висело бы без FIN до уборки по простою (120 с). Тот же случай — ответ
+ * из одних концевых HEADERS (сервер gRPC отказал в методе): данных нет вовсе, а поток закончен. */
+static int grpc_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
+
 const struct transport_ops tr_grpc = {
     .name = "grpc", .alpn = "h2", .zc = 0,
     .open = grpc_open, .write = grpc_write, .read = grpc_read,
-    .moved = grpc_moved, .close = NULL,
+    .moved = grpc_moved, .close = NULL, .pending = grpc_pending,
 };

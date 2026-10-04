@@ -324,8 +324,13 @@ static void xhttp_close(struct transport *t) {
     u->started = 0;
 }
 
+/* Конец ответа уже известен, а сказать о нём можно только следующим чтением (причина — у grpc_pending в
+ * trgrpc.c): иначе цикл туннеля не звал бы его, пока сокет молчит. Смотрим на поток ЗАГРУЗКИ (t->h2):
+ * ответы на куски выгрузки (up.h2) законно кончаются на каждом куске. */
+static int xhttp_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
+
 const struct transport_ops tr_xhttp = {
     .name = "xhttp", .alpn = "h2", .zc = 0,
     .open = xhttp_open, .write = xhttp_write, .read = xhttp_read,
-    .moved = xhttp_moved, .close = xhttp_close,
+    .moved = xhttp_moved, .close = xhttp_close, .pending = xhttp_pending,
 };

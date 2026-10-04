@@ -61,6 +61,10 @@
  * только если сервер сам разрешил в SETTINGS. */
 #define DEFAULT_MAX_FRAME 16384
 
+/* Причина последнего конца потока от сервера — для h2_strerror. В потоке: соединители работают
+ * параллельно (как и g_last_status ниже). */
+static __thread char g_reset_why[64];
+
 static void put32(unsigned char *p, uint32_t v) {
     p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
     p[2] = (unsigned char)(v >> 8);  p[3] = (unsigned char)v;
@@ -299,6 +303,14 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
 int h2_next(struct h2 *h, const char *authority, const char *path,
             const char *content_type, const char *referer, int method) {
     if (!h->started) return H2_EPROTO;
+    /* После GOAWAY сервер новых потоков не принимает (RFC 9113 §6.8): запрос ушёл бы в пустоту, а
+     * ответ на него никогда не пришёл. Отказ сейчас — это переподключение сразу, а не по таймауту. */
+    if (h->goaway) {
+        snprintf(h->why, sizeof(h->why), "GOAWAY: новых потоков нет");
+        snprintf(g_reset_why, sizeof(g_reset_why), "%s", h->why);
+        return H2_ERESET;
+    }
+    h->pend_err = 0;                 /* конец прежнего куска к новому не переходит */
 
     /* Номер растёт на два: у клиента потоки нечётные (RFC 7540 §5.1.1), а переиспользовать
      * номер закрытого потока нельзя — сервер ответит на такое ошибкой соединения, а не
@@ -358,6 +370,26 @@ static int window_refill(struct h2 *h) {
     return 0;
 }
 
+/* Имя кода ошибки HTTP/2 (RFC 9113 §7) — для причины в журнале. «Поток закрыт сервером» без кода
+ * не отличает отмену (CANCEL: сервер закончил обработчик) от FLOW_CONTROL_ERROR (мы вышли за окно) и
+ * от ENHANCE_YOUR_CALM (слишком частые PING) — а это три разных разговора с владельцем узла. */
+static const char *h2_err_name(uint32_t code) {
+    static const char *const n[] = {
+        "NO_ERROR", "PROTOCOL_ERROR", "INTERNAL_ERROR", "FLOW_CONTROL_ERROR", "SETTINGS_TIMEOUT",
+        "STREAM_CLOSED", "FRAME_SIZE_ERROR", "REFUSED_STREAM", "CANCEL", "COMPRESSION_ERROR",
+        "CONNECT_ERROR", "ENHANCE_YOUR_CALM", "INADEQUATE_SECURITY", "HTTP_1_1_REQUIRED",
+    };
+    return code < sizeof(n) / sizeof(n[0]) ? n[code] : "неизвестный код";
+}
+
+/* Запомнить, чем кончился поток, и вернуть H2_ERESET. Текст — в состоянии соединения, а не в
+ * переменной потока: между обнаружением конца и возвратом его вызывающему могут пройти чтения
+ * других соединений того же потока цикла. */
+static int h2_reset(struct h2 *h, const char *what, uint32_t code) {
+    snprintf(h->why, sizeof(h->why), "%s %s", what, h2_err_name(code));
+    return H2_ERESET;
+}
+
 /* Разобрать служебный кадр, тело которого собрано целиком. */
 static int ctl_handle(struct h2 *h) {
     switch (h->frame_type) {
@@ -407,8 +439,14 @@ static int ctl_handle(struct h2 *h) {
              * поэтому рвём соединение, а не подрезаем окно молча: подрезанное окно
              * разошлось бы с тем, что считает сервер, и встало бы всё равно — но уже
              * непонятно почему. */
+            /* Три адресата, а не два. Кадр на закрытый поток прежнего куска (packet-up) приходит с
+             * его номером, а «не наш» прежде значило «окно соединения»: прибавка чужого потока
+             * раздувала общее окно, и мы отправляли больше, чем сервер разрешил, — сервер отвечал
+             * FLOW_CONTROL_ERROR и рвал соединение целиком. Закрытому потоку окно уже не нужно
+             * (RFC 9113 §6.9: кадр на закрытый поток игнорируется). */
+            if (h->frame_sid != 0 && !h->frame_ours) return 0;
             int64_t w = (int64_t)(h->frame_ours ? h->send_win : h->send_win_conn) + inc;
-            if (w > 0x7FFFFFFF) return H2_ERESET;
+            if (w > 0x7FFFFFFF) return h2_reset(h, "окно за пределом,", 3);
             if (h->frame_ours) h->send_win = (int32_t)w;
             else h->send_win_conn = (int32_t)w;
             return 0;
@@ -419,12 +457,28 @@ static int ctl_handle(struct h2 *h) {
              * поток, обработчик которого уже отработал, и у packet-up он приходит по прежнему
              * куску, когда открыт следующий. Раньше такой кадр рвал всё соединение. */
             if (!h->frame_ours) return 0;
-            return H2_ERESET;
+            return h2_reset(h, "RST_STREAM", h->ctl_n >= 4 ? get32(h->ctl) : 0);
 
-        case FR_GOAWAY:
+        case FR_GOAWAY: {
             /* Номер потока у GOAWAY всегда нулевой: это конец СОЕДИНЕНИЯ, чужим он не бывает.
-             * Новых запросов по нему сервер уже не примет, поэтому и рвём. */
-            return H2_ERESET;
+             * Новых потоков по нему сервер не примет — это запоминается (h2_next откажет), — но
+             * текущий НЕ обязательно погиб: last_stream_id говорит, до какого номера сервер
+             * довёл дело (RFC 9113 §6.8). Go-сервер закрывает так соединение милосердно:
+             * сначала GOAWAY с последним возможным номером и NO_ERROR, потом PING и второй GOAWAY
+             * уже с настоящим, а идущие потоки дослуживает. Рвать поток на первом кадре значило
+             * бросить закачку, которую сервер собирался доотдать. Рвём, когда потоку конец
+             * объявлен всерьёз: код не NO_ERROR (ENHANCE_YOUR_CALM, PROTOCOL_ERROR… — сервер
+             * закроет соединение сразу) или наш номер больше last_stream_id (до него не дошли). */
+            uint32_t last = h->ctl_n >= 4 ? get32(h->ctl) & 0x7FFFFFFFu : 0;
+            uint32_t code = h->ctl_n >= 8 ? get32(h->ctl + 4) : 0;
+            h->goaway = 1;
+            if (code != 0) return h2_reset(h, "GOAWAY", code);
+            if (h->sid > last) {
+                snprintf(h->why, sizeof(h->why), "GOAWAY: поток не принят");
+                return H2_ERESET;
+            }
+            return 0;
+        }
     }
     return 0;
 }
@@ -509,9 +563,20 @@ static void status_peek(struct h2 *h, const unsigned char *p, size_t n) {
     }
 }
 
-int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
+/* Остановить разбор записи отказом rc. Если данные этого вызова уже лежат в out, они ОТДАЮТСЯ, а
+ * отказ откладывается до следующего вызова (pend_err в h2.h): возврат кода выбрасывал их вместе с
+ * записью, потому что вызывающие смотрят на код раньше, чем на got. */
+#define H2_STOP(code) do { int e_ = (code); if (*got) { h->pend_err = e_; goto deliver; } return e_; } while (0)
+
+static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
     *got = 0;
     if (!h->started) return H2_EPROTO;
+    if (h->pend_err) {
+        int e = h->pend_err;
+        h->pend_err = 0;
+        h->done = 1;                 /* дальше — тот же конец, сколько ни спрашивай */
+        return e;
+    }
     if (h->done) return H2_ERESET;
     /* Договор проверяется ДО чтения. Отказ посреди кадра (ниже) выбрасывал уже прочитанную
      * запись вместе с хвостом, а счётчик тела оставался — и следующий кадр читался как
@@ -541,7 +606,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
                  * остаток кадра, иначе это ошибка протокола (RFC 7540 §6.1), а не повод
                  * читать за край. */
                 h->pad_wait = 0;
-                if ((uint32_t)rec[p] + h->skip_left > h->frame_left - 1) return H2_EPROTO;
+                if ((uint32_t)rec[p] + h->skip_left > h->frame_left - 1) H2_STOP(H2_EPROTO);
                 h->pad_left = rec[p];
                 if (h->frame_type == FR_DATA) {
                     h->recv_credit_conn += 1;
@@ -574,7 +639,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
                  * Зачитывается и набивка: окно тратит весь кадр (RFC 7540 §6.9.1). */
                 h->recv_credit_conn += (int32_t)take;
                 if (h->frame_ours) {
-                    if (*got + real > cap) return H2_ETOOBIG;
+                    if (*got + real > cap) H2_STOP(H2_ETOOBIG);
                     memcpy(out + *got, rec + p, real);
                     *got += real;
                     h->recv_credit += (int32_t)take;
@@ -605,7 +670,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
             if (h->frame_left == 0) {
                 if (h->frame_type != FR_DATA && h->frame_type != FR_HEADERS) {
                     rc = ctl_handle(h);
-                    if (rc) return rc;
+                    if (rc) H2_STOP(rc);
                 }
                 if ((h->frame_flags & FLAG_END_STREAM) && h->frame_ours &&
                     (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS))
@@ -633,6 +698,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
          * делает общий разбор ниже) и отбрасываются: их содержимое — пустой ответ 200 на
          * выгрузку, читать в нём нечего. */
         h->frame_ours = (sid == h->sid);
+        h->frame_sid = sid;
         h->frame_peeked = 0;
         h->frame_left = len;
         h->ctl_n = 0;
@@ -644,22 +710,25 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
             h->pad_wait = (h->frame_flags & FLAG_PADDED) != 0;
             if (h->frame_type == FR_HEADERS && (h->frame_flags & FLAG_PRIORITY))
                 h->skip_left = 5;
-            if (h->pad_wait + h->skip_left > len) return H2_EPROTO;
+            if (h->pad_wait + h->skip_left > len) H2_STOP(H2_EPROTO);
         }
 
         /* Кадр без тела обрабатывается сразу: цикл выше ждёт байт, которых не будет. */
         if (len == 0) {
             if (h->frame_type != FR_DATA && h->frame_type != FR_HEADERS) {
                 rc = ctl_handle(h);
-                if (rc) return rc;
+                if (rc) H2_STOP(rc);
             }
             if ((h->frame_flags & FLAG_END_STREAM) && h->frame_ours) h->done = 1;
             h->frame_type = 0xFF;
         }
     }
 
+deliver:
     if (h->status > 0 && h->status != 200) { g_last_status = h->status; return H2_ESTATUS; }
     if (h->old_status) { g_last_status = h->old_status; return H2_ESTATUS; }
+    /* Поток закончен отказом, который ждёт следующего вызова: растить его окно незачем. */
+    if (h->pend_err) return 0;
     rc = window_refill(h);
     if (rc) return rc;
     /* Ноль байт — это законный результат: в записи мог приехать только PING или SETTINGS.
@@ -667,6 +736,12 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
      * кадра, а закрытие — потерять его. Вызывающий обязан отличать «нечего отдать» от
      * «конец потока», и именно поэтому конец приходит кодом, а не нулём. */
     return 0;
+}
+
+int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
+    int rc = h2_read_in(h, out, cap, got);
+    if (rc == H2_ERESET) snprintf(g_reset_why, sizeof(g_reset_why), "%s", h->why[0] ? h->why : "конец потока");
+    return rc;
 }
 
 /* Отправить данные ЦЕЛИКОМ или не отправлять вовсе.
@@ -712,12 +787,17 @@ const char *h2_strerror(int rc) {
          * есть между тремя совершенно разными разговорами с владельцем узла. Без кода все
          * три выглядели одинаково, и на живом узле пришлось гадать. */
         case H2_ESTATUS: {
-            static __thread char st[48];
+            static __thread char st[64];
             if (g_last_status > 0) snprintf(st, sizeof st, "сервер ответил %d, а не 200", g_last_status);
             else                   snprintf(st, sizeof st, "сервер ответил не 200");
             return st;
         }
-        case H2_ERESET: return "поток закрыт сервером (RST/GOAWAY)";
+        case H2_ERESET: {
+            static __thread char rs[112];
+            if (g_reset_why[0]) snprintf(rs, sizeof rs, "поток закрыт сервером (%s)", g_reset_why);
+            else                snprintf(rs, sizeof rs, "поток закрыт сервером (RST/GOAWAY)");
+            return rs;
+        }
         case H2_ETOOBIG: return "кадр не влез";
         case H2_EWINDOW: return "окно HTTP/2 закрыто";
         default: return "неизвестная ошибка HTTP/2";

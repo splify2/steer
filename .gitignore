@@ -60,6 +60,7 @@ build/xsepochmatch
 build/tungromatch
 build/tunnelmatch
 build/xhupmatch
+build/grpcmatch
 build/wsmatch
 build/tunnamematch
 build/xsconfmatch

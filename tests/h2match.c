@@ -549,6 +549,143 @@ int main(void) {
         check("после отказа: тело второго кадра не искажено", 0, memcmp(last, "abcd", 4));
     }
 
+    {
+        /* ---- конец потока в ТОЙ ЖЕ записи, что и последние данные (issue 39) ----------
+         *
+         * Xray (grpc-go) кончает поток, когда цель закрылась: данные, концевые HEADERS с
+         * END_STREAM и RST_STREAM(NO_ERROR) уходят одним сбросом буфера — то есть одной записью
+         * TLS. h2_read разбирал кадры по порядку, на RST_STREAM возвращал H2_ERESET, а уже
+         * набранные в этом же вызове данные пропадали: вызывающие смотрят на код раньше, чем на
+         * got. Проба узла (запрос на 1.1.1.1:80 с «Connection: close», ответ цели — один пакет и
+         * FIN) падала с «ответа нет: поток закрыт сервером (RST/GOAWAY)» на исправном узле, а
+         * сторож после двух таких проб объявлял узел мёртвым и останавливал трафик; у каждого
+         * десятого-третьего клиентского соединения терялся хвост ответа. Данные обязаны дойти, а
+         * конец потока — прийти СЛЕДУЮЩИМ вызовом. */
+        static const unsigned char hdr200[] = { 0x88 };
+        static const unsigned char trailers[] = { 0x88 };      /* содержимое концевых HEADERS не читается */
+        static const unsigned char no_error[4] = { 0, 0, 0, 0 };
+        struct h2 h;
+        struct fake_io io;
+        static unsigned char feed[512];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0, n = 0;
+
+        h2_open(&h, &io);
+        n += put_frame(feed + n, FR_HEADERS, FLAG_END_HEADERS, h.sid, hdr200, sizeof hdr200);
+        n += put_frame(feed + n, FR_DATA, 0, h.sid, (const unsigned char *)"hello", 5);
+        n += put_frame(feed + n, FR_DATA, 0, h.sid, (const unsigned char *)" world", 6);
+        n += put_frame(feed + n, FR_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, h.sid, trailers, sizeof trailers);
+        n += put_frame(feed + n, FR_RST_STREAM, 0, h.sid, no_error, 4);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        int rc = h2_read(&h, out, sizeof(out), &got);
+        check("данные + END_STREAM + RST_STREAM в одной записи: первый вызов — без ошибки", 0, rc);
+        check("  данные отданы целиком (11 байт)", 11, (int)got);
+        check("  и не искажены", 0, got == 11 ? memcmp(out, "hello world", 11) : 1);
+        io.feed_pos = io.feed_n;
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("  второй вызов — конец потока", H2_ERESET, rc);
+        check("  причина называет RST_STREAM и код", 1, strstr(h2_strerror(H2_ERESET), "RST_STREAM NO_ERROR") != NULL);
+        check("  и дальше — тот же конец", H2_ERESET, h2_read(&h, out, sizeof(out), &got));
+
+        /* Тот же набор, но без END_STREAM: сервер сбросил поток посреди ответа. */
+        h2_open(&h, &io);
+        n = 0;
+        n += put_frame(feed + n, FR_DATA, 0, h.sid, (const unsigned char *)"abc", 3);
+        static const unsigned char cancel[4] = { 0, 0, 0, 8 };
+        n += put_frame(feed + n, FR_RST_STREAM, 0, h.sid, cancel, 4);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("данные + RST_STREAM(CANCEL): данные отданы", 3, rc == 0 ? (int)got : -1);
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("  потом разрыв с названным кодом", 1, rc == H2_ERESET && strstr(h2_strerror(rc), "CANCEL") != NULL);
+
+        /* RST_STREAM без данных перед ним — разрыв сразу, ждать нечего. */
+        h2_open(&h, &io);
+        n = put_frame(feed, FR_RST_STREAM, 0, h.sid, cancel, 4);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        check("RST_STREAM без данных: разрыв сразу", H2_ERESET, h2_read(&h, out, sizeof(out), &got));
+    }
+
+    {
+        /* ---- GOAWAY (RFC 9113 §6.8) ----------------------------------------------------
+         *
+         * GOAWAY NO_ERROR с last_stream_id не меньше нашего номера — милосердное закрытие
+         * соединения: идущие потоки сервер дослуживает. Прежний разбор рвал поток на первом
+         * кадре. Рвать надо, когда конец объявлен всерьёз: код ошибки (ENHANCE_YOUR_CALM у
+         * слишком частых PING, PROTOCOL_ERROR…) или номер потока больше last_stream_id. */
+        struct h2 h;
+        struct fake_io io;
+        static unsigned char feed[256];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0, n;
+        unsigned char ga[8];
+
+        /* Милосердный: last = 2^31-1, NO_ERROR — потом ещё данные по нашему потоку. */
+        h2_open(&h, &io);
+        put32(ga, 0x7FFFFFFFu); put32(ga + 4, 0);
+        n = put_frame(feed, FR_GOAWAY, 0, 0, ga, 8);
+        n += put_frame(feed + n, FR_DATA, 0, h.sid, (const unsigned char *)"tail", 4);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        int rc = h2_read(&h, out, sizeof(out), &got);
+        check("GOAWAY(NO_ERROR, last >= наш номер): поток не оборван", 0, rc);
+        check("  данные после GOAWAY дошли", 4, (int)got);
+        check("  соединение помечено: новых потоков нет", 1, h.goaway);
+        check("  h2_next после GOAWAY: отказ сразу",
+              H2_ERESET, h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST));
+
+        /* Серьёзный: ENHANCE_YOUR_CALM — данные перед ним отдаются, потом разрыв с названием кода. */
+        h2_open(&h, &io);
+        put32(ga, 1); put32(ga + 4, 11);
+        n = put_frame(feed, FR_DATA, 0, h.sid, (const unsigned char *)"xy", 2);
+        n += put_frame(feed + n, FR_GOAWAY, 0, 0, ga, 8);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("данные + GOAWAY(ENHANCE_YOUR_CALM): данные отданы", 2, rc == 0 ? (int)got : -1);
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("  потом разрыв, причина — «too_many_pings»-код",
+              1, rc == H2_ERESET && strstr(h2_strerror(rc), "GOAWAY ENHANCE_YOUR_CALM") != NULL);
+
+        /* Наш поток дальше last_stream_id: до него не дошли — разрыв, хоть код и NO_ERROR. */
+        h2_open(&h, &io);
+        h2_end_stream(&h);
+        h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST);   /* поток 3 */
+        put32(ga, 1); put32(ga + 4, 0);
+        n = put_frame(feed, FR_GOAWAY, 0, 0, ga, 8);
+        io.feed = feed; io.feed_n = n; io.feed_pos = 0;
+        rc = h2_read(&h, out, sizeof(out), &got);
+        check("GOAWAY(last=1) при потоке 3: разрыв", H2_ERESET, rc);
+    }
+
+    {
+        /* ---- WINDOW_UPDATE на закрытый поток не раздувает окно соединения ------------
+         *
+         * «Не наш» поток считался окном СОЕДИНЕНИЯ: у packet-up кадр на прежний кусок
+         * прибавлял общему окну чужое, и мы отправляли больше разрешённого — сервер отвечал
+         * FLOW_CONTROL_ERROR и рвал соединение целиком. */
+        struct h2 h;
+        struct fake_io io;
+        unsigned char feed[64], out[H2_MIN_READ_CAP], inc[4];
+        size_t got = 0;
+        h2_open(&h, &io);
+        h2_end_stream(&h);
+        h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST);   /* поток 3 */
+        int conn0 = h.send_win_conn, str0 = h.send_win;
+        put32(inc, 1000);
+        io.feed = feed; io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_WINDOW_UPDATE, 0, 1, inc, 4);
+        h2_read(&h, out, sizeof(out), &got);
+        check("WINDOW_UPDATE на закрытый поток 1: окно соединения не тронуто", conn0, h.send_win_conn);
+        check("  и окно текущего потока тоже", str0, h.send_win);
+        io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_WINDOW_UPDATE, 0, 0, inc, 4);
+        h2_read(&h, out, sizeof(out), &got);
+        check("WINDOW_UPDATE на соединение: окно соединения +1000", conn0 + 1000, h.send_win_conn);
+        io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_WINDOW_UPDATE, 0, h.sid, inc, 4);
+        h2_read(&h, out, sizeof(out), &got);
+        check("WINDOW_UPDATE на текущий поток: окно потока +1000", str0 + 1000, h.send_win);
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
 
     return fails ? 1 : 0;
