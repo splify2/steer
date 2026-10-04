@@ -588,6 +588,8 @@ check "замера нет ни у кого: в журнале — строка,
     "$(grep -q 'группа rt: ни у одного живого члена нет замера' "$tmp/d.err" && echo yes || echo no)"
 check "  группа по порядку (b), status — no_measure и члены без замера" "sw2 b no_measure b,a" \
     "$(tdev rt) $(st outputs.rt.group.selected) $(st outputs.rt.group.why) $(st outputs.rt.group.latency_failed)"
+check "  причина каждой неудачи — в журнале, с группой, членом и адресом: ответ 503 вместо 204/200" "yes yes" \
+    "$(for m in b a; do grep -q "latency: группа rt, член $m: замер http://10.2.0.1:8080/rt_204 не удался — ответ 503 вместо 204/200" "$tmp/d.err" && echo yes || echo no; done | tr '\n' ' ' | sed 's/ $//')"
 rm -f "$tmp/rt.fail"
 t0="$(date +%s)"
 wait_for '[ "$(tdev rt) $(st outputs.rt.group.selected) $(st outputs.rt.group.why)" = "sw1 a fastest" ]' 45

@@ -105,11 +105,15 @@ static void srv_up(int mode) {
 
 static struct loop *g_l;
 static int g_ms, g_calls;
+/* Причина неудачи последнего замера (urltest_why), снятая в обратном вызове или сразу после
+ * urltest_start, вернувшего NULL: дальше её затирает следующий замер. */
+static char g_whyc[192];
 
 static void on_done(void *arg, int ms) {
     (void)arg;
     g_ms = ms;
     g_calls++;
+    snprintf(g_whyc, sizeof(g_whyc), "%s", urltest_why());
     loop_stop(g_l, 0);
 }
 
@@ -131,10 +135,12 @@ static void on_guard(struct loop *l, struct loop_timer *t, void *arg) {
 static int run_fam(const char *url, int fam, int timeout_ms, long *took) {
     g_calls = 0;
     g_ms = -2;
+    g_whyc[0] = '\0';
     fresh();
     long t0 = loop_now_ms();
     int ms = -2;
     struct urltest *u = urltest_start(g_l, url, fam, 0, NULL, timeout_ms, on_done, NULL, &ms);
+    if (!u) snprintf(g_whyc, sizeof(g_whyc), "%s", urltest_why());
     if (u) {
         struct loop_timer *g = loop_timer_new(g_l, on_guard, NULL);
         loop_timer_set(g, timeout_ms + 3000);
@@ -254,12 +260,15 @@ int main(void) {
     check("https:// без urltls — итог сразу (NULL)", 1,
           urltest_start(g_l, "https://127.0.0.1/", AF_INET, 0, NULL, 1000, on_done, NULL, &ms) == NULL);
     check("  и это -1", -1, ms);
+    check("  причина названа: https:// в этой сборке нет", 1, strstr(urltest_why(), "https://") != NULL);
     check("негодный адрес — итог сразу", 1,
           urltest_start(g_l, "gopher://x/", AF_INET, 0, NULL, 1000, on_done, NULL, &ms) == NULL && ms == -1);
+    check("  причина названа: адрес негоден", 1, strstr(urltest_why(), "негоден") != NULL);
     ms = 5;
     check("IPv6 к литералу IPv4 — итог сразу: -1 (AAAA не спросить)", 1,
           urltest_start(g_l, "http://127.0.0.1/", AF_INET6, 0, NULL, 1000, on_done, NULL, &ms) == NULL &&
           ms == -1);
+    check("  причина пустая: по построению, а не неудача", 0, (int)strlen(urltest_why()));
 
     /* ---- замеры ---- */
     char url[128];
@@ -267,6 +276,7 @@ int main(void) {
     url_of(url, sizeof(url), M204, "/generate_204");
     int r = run(url, 2000, &took);
     check("204 сразу — замер есть", 1, r >= 0 && r < 200);
+    check("  причина пустая", 0, (int)strlen(g_whyc));
     check("  запрос — GET пути", 1, strncmp(g_srv[M204].last_req, "GET /generate_204 HTTP/1.1\r\n", 28) == 0);
     char hh[64];
     snprintf(hh, sizeof(hh), "Host: 127.0.0.1:%u\r\n", g_srv[M204].port);
@@ -281,13 +291,17 @@ int main(void) {
     check("200 — тоже годен", 1, run(url, 2000, NULL) >= 0);
     url_of(url, sizeof(url), M404, "/");
     check("404 — не измерилось", -1, run(url, 2000, NULL));
+    check("  причина: ответ 404 вместо 204/200", 1, strstr(g_whyc, "ответ 404 вместо 204/200") != NULL);
     url_of(url, sizeof(url), MGARBAGE, "/");
     check("мусор вместо HTTP — не измерилось", -1, run(url, 2000, NULL));
+    check("  причина: не похож на HTTP", 1, strstr(g_whyc, "не похож на HTTP") != NULL);
     url_of(url, sizeof(url), MCLOSE, "/");
     check("закрыл без ответа — не измерилось", -1, run(url, 2000, NULL));
+    check("  причина: закрыто до ответа", 1, strstr(g_whyc, "закрыто до ответа") != NULL);
     url_of(url, sizeof(url), MSILENT, "/");
     r = run(url, 500, &took);
     check("молчит — не измерилось по сроку", -1, r);
+    check("  причина: срок вышел, ответа нет", 1, strstr(g_whyc, "срок вышел: ответа нет") != NULL);
     check("  срок соблюдён (≈500 мс)", 1, took >= 450 && took < 1400);
     url_of(url, sizeof(url), MSPLIT, "/");
     r = run(url, 2000, NULL);
@@ -302,6 +316,8 @@ int main(void) {
     close(dead);
     snprintf(url, sizeof(url), "http://127.0.0.1:%u/", ntohs(da.sin_port));
     check("порт закрыт — не измерилось", -1, run(url, 2000, NULL));
+    check("  причина: соединение отвергнуто", 1, strstr(g_whyc, "соединение:") != NULL &&
+          strstr(g_whyc, strerror(ECONNREFUSED)) != NULL);
 
     /* Имя, а не литерал: через рабочий поток gaiw, затем из кэша. */
     snprintf(url, sizeof(url), "http://localhost:%u/", g_srv[M204].port);
@@ -325,6 +341,8 @@ int main(void) {
 
     /* Имя, которого нет: -1 (по отказу DNS или по сроку). */
     check("несуществующее имя — не измерилось", -1, run("http://no-such-host.invalid/", 2500, NULL));
+    check("  причина: имя не разрешилось (или срок на DNS вышел)", 1,
+          strstr(g_whyc, "не разрешилось") != NULL);
 
     /* IPv6: имя с AAAA на ::1 — запрос из сокета AF_INET6 доходит до ответчика на [::1], а тот же
      * адрес по IPv4 — нет (там ответчика на этом порту нет). Нет IPv6 на петле или имени с AAAA —

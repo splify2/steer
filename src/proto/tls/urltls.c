@@ -49,12 +49,18 @@
 
 const int steer_urltls_present = 1;
 
+/* Итог потока: время и, если не вышло, почему — строкой для журнала (urltest_why в urltest.c). */
+struct urltls_res {
+    int ms;
+    char why[192];
+};
+
 struct urltls {
     struct loop *l;
     int fd;
-    void (*cb)(void *arg, int ms);
+    void (*cb)(void *arg, int ms, const char *why);
     void *arg;
-    unsigned char got[sizeof(int)];
+    unsigned char got[sizeof(struct urltls_res)];
     size_t gn;
 };
 
@@ -103,45 +109,91 @@ static int status_ok(const unsigned char *b, size_t n) {
     return code == 204 || code == 200;
 }
 
-/* Весь замер — в потоке. Итог: мс или -1. */
-static int measure(const struct urltls_work *w) {
+/* Длина s до конца последнего ЦЕЛОГО символа UTF-8: недобитый хвост (ведущий байт без всех
+ * продолжений) отбрасывается. Причину проверки сертификата (tls13_verify_reason) обрезает буфер
+ * tls13.c в 96 байт — у двух самых длинных фраз это посреди буквы (R-120, I-236), и недобитый байт
+ * в журнале выглядит как «…на это и�». Буфер — защищённый путь, его правит владелец; здесь не
+ * пропускаем в журнал половину буквы. */
+static size_t utf8_whole(const char *s, size_t n) {
+    size_t i = n;
+    while (i > 0 && ((unsigned char)s[i - 1] & 0xC0) == 0x80) i--;   /* продолжения в хвосте */
+    if (i == 0) return 0;
+    unsigned char lead = (unsigned char)s[i - 1];
+    size_t have = n - (i - 1);                                       /* байт хвостового символа */
+    size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+    return have < need ? i - 1 : n;
+}
+
+/* Весь замер — в потоке. Итог: мс или -1; при -1 в why — почему (одна строка). */
+#define WHY(...) snprintf(why, wn, __VA_ARGS__)
+static int measure(const struct urltls_work *w, char *why, size_t wn) {
     long t0 = mono_ms(), deadline = t0 + w->timeout_ms;
     int v6 = w->dst.ss_family == AF_INET6;
+    why[0] = '\0';
     int fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
-    if (w->mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &w->mark, sizeof(w->mark)) != 0) goto fail;
-    if (!w->mark && w->dev[0] &&
-        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, w->dev, (socklen_t)strlen(w->dev) + 1) != 0)
+    if (fd < 0) { WHY("socket: %s", strerror(errno)); return -1; }
+    if (w->mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &w->mark, sizeof(w->mark)) != 0) {
+        WHY("метка члена не поставилась: %s", strerror(errno));
         goto fail;
+    }
+    if (!w->mark && w->dev[0] &&
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, w->dev, (socklen_t)strlen(w->dev) + 1) != 0) {
+        WHY("привязка к устройству %s: %s", w->dev, strerror(errno));
+        goto fail;
+    }
     socklen_t dl = v6 ? (socklen_t)sizeof(struct sockaddr_in6) : (socklen_t)sizeof(struct sockaddr_in);
     if (connect(fd, (const struct sockaddr *)&w->dst, dl) != 0) {
-        if (errno != EINPROGRESS) goto fail;
+        if (errno != EINPROGRESS) { WHY("соединение: %s", strerror(errno)); goto fail; }
         struct pollfd p = { fd, POLLOUT, 0 };
         long left = deadline - mono_ms();
-        if (left <= 0) goto fail;
+        if (left <= 0) { WHY("срок вышел до соединения"); goto fail; }
         int pr;
         do pr = poll(&p, 1, (int)left); while (pr < 0 && errno == EINTR);
-        if (pr <= 0) goto fail;
+        if (pr <= 0) { WHY("соединение не установилось за срок"); goto fail; }
         int err = 0;
         socklen_t el = sizeof(err);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err) goto fail;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err) {
+            WHY("соединение: %s", strerror(err ? err : errno));
+            goto fail;
+        }
     }
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
-    if (set_timeo(fd, deadline)) goto fail;
+    if (set_timeo(fd, deadline)) { WHY("срок вышел до рукопожатия TLS"); goto fail; }
 
     struct reality_cfg cfg = { .sni = w->host, .alpn = "http/1.1", .plain = 1 };
     struct reality_state rst;
     unsigned char hello[2048];
     size_t hello_n = 0;
-    if (reality_build_hello(&cfg, &rst, hello, sizeof(hello), &hello_n) != 0) goto fail;
-    if (write_all(fd, hello, hello_n) != 0) goto fail;
+    if (reality_build_hello(&cfg, &rst, hello, sizeof(hello), &hello_n) != 0) {
+        WHY("ClientHello не собрался");
+        goto fail;
+    }
+    if (write_all(fd, hello, hello_n) != 0) { WHY("ClientHello не отправился: %s", strerror(errno)); goto fail; }
 
     struct tls13 *t = calloc(1, sizeof(*t));
-    if (!t) goto fail;
+    if (!t) { WHY("нет памяти"); goto fail; }
     struct tls13_auth auth = { .host = w->host, .roots = tls_cert_roots() };
     int res = -1;
-    if (tls13_handshake_auth(t, fd, hello, hello_n, rst.priv, &auth) != 0) goto done;
-    if (t->alpn[0] && strcmp(t->alpn, "http/1.1") != 0) goto done;
+    int hrc = tls13_handshake_auth(t, fd, hello, hello_n, rst.priv, &auth);
+    if (hrc != 0) {
+        /* Сертификат не принят — самая частая причина, и она же самая непонятная снаружи: нет
+         * пакета ca-bundle, часы без NTP (сертификат «ещё не действует»), страница плена или чужой
+         * узел с другим сертификатом. Причину называет сама проверка (tls13_verify_reason). */
+        if (hrc == TLS13_ECERT) {
+            const char *vr = tls13_verify_reason();
+            if (vr && vr[0]) WHY("сертификат не принят: %.*s", (int)utf8_whole(vr, strlen(vr)), vr);
+            else WHY("сертификат не принят: причина не названа");
+        } else if (hrc == TLS13_ETIMEOUT) {
+            WHY("рукопожатие TLS не уложилось в срок");
+        } else {
+            WHY("рукопожатие TLS не удалось (код %d)", hrc);
+        }
+        goto done;
+    }
+    if (t->alpn[0] && strcmp(t->alpn, "http/1.1") != 0) {
+        WHY("сервер выбрал ALPN %.20s, а нужен http/1.1", t->alpn);
+        goto done;
+    }
 
     /* Порт в Host — только нестандартный (RFC 9110 §7.2), как у HTTP в urltest.c. */
     char hh[160], req[512];
@@ -154,8 +206,8 @@ static int measure(const struct urltls_work *w) {
     int rn = snprintf(req, sizeof(req),
                       "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: steer/%s\r\nAccept: */*\r\n"
                       "Connection: close\r\n\r\n", w->path, hh, STEER_VERSION);
-    if (rn <= 0 || (size_t)rn >= sizeof(req)) goto done;
-    if (tls13_write(t, (const unsigned char *)req, (size_t)rn) != 0) goto done;
+    if (rn <= 0 || (size_t)rn >= sizeof(req)) { WHY("запрос не уместился в буфер"); goto done; }
+    if (tls13_write(t, (const unsigned char *)req, (size_t)rn) != 0) { WHY("запрос не отправился"); goto done; }
 
     /* Первый прикладной байт: пустые чтения — пропущенные NewSessionTicket и набивка. */
     static __thread unsigned char buf[TLS13_MAX_PLAIN];
@@ -163,9 +215,14 @@ static int measure(const struct urltls_work *w) {
     size_t ln = 0;
     long t_first = 0;
     for (;;) {
-        if (set_timeo(fd, deadline)) goto done;
+        if (set_timeo(fd, deadline)) { WHY("срок вышел: ответа нет"); goto done; }
         size_t got = 0;
-        if (tls13_read(t, buf, sizeof(buf), &got) != 0) goto done;
+        int rrc = tls13_read(t, buf, sizeof(buf), &got);
+        if (rrc != 0) {
+            if (rrc == TLS13_ETIMEOUT) WHY("срок вышел: ответа нет");
+            else WHY("соединение закрыто до ответа (код %d)", rrc);
+            goto done;
+        }
         if (!got) continue;
         if (!t_first) t_first = mono_ms();
         size_t take = got < sizeof(line) - ln ? got : sizeof(line) - ln;
@@ -173,7 +230,13 @@ static int measure(const struct urltls_work *w) {
         ln += take;
         if (memchr(line, '\n', ln) || ln >= sizeof(line)) break;
     }
-    if (status_ok(line, ln)) res = (int)(t_first - t0 > 0 ? t_first - t0 : 0);
+    if (status_ok(line, ln)) {
+        res = (int)(t_first - t0 > 0 ? t_first - t0 : 0);
+    } else if (ln >= 12 && !memcmp(line, "HTTP/1.", 7) && line[8] == ' ') {
+        WHY("ответ %.3s вместо 204/200", (const char *)line + 9);
+    } else {
+        WHY("ответ не похож на HTTP");
+    }
 done:
     tls13_free(t);
     free(t);
@@ -186,9 +249,11 @@ fail:
 
 static void *urltls_thread(void *arg) {
     struct urltls_work *w = arg;
-    int ms = measure(w);
-    const unsigned char *p = (const unsigned char *)&ms;
-    size_t left = sizeof(ms);
+    struct urltls_res res;
+    memset(&res, 0, sizeof(res));
+    res.ms = measure(w, res.why, sizeof(res.why));
+    const unsigned char *p = (const unsigned char *)&res;
+    size_t left = sizeof(res);
     while (left) {
         ssize_t k = send(w->fd, p, left, MSG_NOSIGNAL);
         if (k < 0 && errno == EINTR) continue;
@@ -218,17 +283,21 @@ static void urltls_ready(struct loop *l, int fd, uint32_t ev, void *arg) {
         if (k <= 0) break;
         t->gn += (size_t)k;
     }
-    int ms = -1;
-    if (t->gn == sizeof(t->got)) memcpy(&ms, t->got, sizeof(ms));
-    void (*cb)(void *, int) = t->cb;
+    struct urltls_res res;
+    memset(&res, 0, sizeof(res));
+    res.ms = -1;
+    if (t->gn == sizeof(t->got)) memcpy(&res, t->got, sizeof(res));
+    else snprintf(res.why, sizeof(res.why), "поток HTTPS оборвался");
+    res.why[sizeof(res.why) - 1] = '\0';
+    void (*cb)(void *, int, const char *) = t->cb;
     void *a = t->arg;
     urltls_free(t);
-    cb(a, ms);
+    cb(a, res.ms, res.why);
 }
 
 struct urltls *urltls_start(struct loop *l, const struct sockaddr_storage *dst, const char *host,
                             const char *path, uint32_t mark, const char *dev, int timeout_ms,
-                            void (*cb)(void *arg, int ms), void *arg) {
+                            void (*cb)(void *arg, int ms, const char *why), void *arg) {
     struct urltls *t = calloc(1, sizeof(*t));
     struct urltls_work *w = calloc(1, sizeof(*w));
     int sv[2] = { -1, -1 };

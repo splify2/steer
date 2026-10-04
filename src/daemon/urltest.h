@@ -34,4 +34,10 @@ struct urltest *urltest_start(struct loop *l, const char *url, int fam, uint32_t
  * зовётся. NULL — ничего. */
 void urltest_cancel(struct urltest *u);
 
+/* ПОЧЕМУ ЗАМЕР НЕ УДАЛСЯ — строкой («имя probe.test не разрешилось (A)», «ответ 503 вместо
+ * 204/200», «сертификат не принят: …», «срок вышел: ответа нет»). Спрашивать — из обратного вызова
+ * cb и сразу после urltest_start, вернувшего NULL с *ms < 0: дальше строку затрёт следующий замер.
+ * Пустая — замер удался, либо сказать нечего (замера по IPv6 у литерала IPv4 нет по построению). */
+const char *urltest_why(void);
+
 #endif

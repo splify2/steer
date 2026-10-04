@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -66,7 +67,8 @@
 struct urltls;
 extern struct urltls *urltls_start(struct loop *l, const struct sockaddr_storage *dst, const char *host,
                                    const char *path, uint32_t mark, const char *dev, int timeout_ms,
-                                   void (*cb)(void *arg, int ms), void *arg) __attribute__((weak));
+                                   void (*cb)(void *arg, int ms, const char *why), void *arg)
+    __attribute__((weak));
 extern void urltls_cancel(struct urltls *t) __attribute__((weak));
 
 /* ---- кэш имён ---------------------------------------------------------------------------- */
@@ -137,10 +139,31 @@ struct urltest {
     size_t req_n, req_off;
     char buf[80];
     size_t bn;
+    /* Почему замер не удался — для журнала (urltest_why): пишется перед ut_finish(-1). */
+    char why[192];
     /* Пока идёт urltest_start, итог не отдаётся обратным вызовом, а запоминается: договор —
      * «NULL и итог в *ms», когда замер кончился сразу. */
     int in_start, done, res;
 };
+
+/* ПРИЧИНА НЕУДАЧИ — строкой, для журнала. Замер отвечает числом (-1 — не измерилось), и по числу
+ * не отличить «адрес не разрешился» от «ответ 503» и от «сертификат не принят»: а именно это человек
+ * и спрашивает, когда группа «самый быстрый» идёт по порядку из-за того, что мерить не вышло.
+ * Причина доступна, пока выполняется обратный вызов, и сразу после urltest_start, вернувшего NULL
+ * (urltest_why); у удавшегося замера — пустая. Цикл демона один, и глобальной строки хватает. */
+static char g_why[192];
+
+const char *urltest_why(void) {
+    return g_why;
+}
+
+static void ut_why(struct urltest *u, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void ut_why(struct urltest *u, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(u->why, sizeof(u->why), fmt, ap);
+    va_end(ap);
+}
 
 static void ut_free(struct urltest *u) {
     if (u->fd >= 0) {
@@ -155,6 +178,7 @@ static void ut_free(struct urltest *u) {
 }
 
 static void ut_finish(struct urltest *u, int ms) {
+    snprintf(g_why, sizeof(g_why), "%s", ms >= 0 ? "" : u->why);
     if (u->in_start) {
         u->done = 1;
         u->res = ms;
@@ -168,7 +192,12 @@ static void ut_finish(struct urltest *u, int ms) {
 
 static void ut_timeout(struct loop *l, struct loop_timer *t, void *arg) {
     (void)l; (void)t;
-    ut_finish(arg, -1);
+    struct urltest *u = arg;
+    /* По порядку состояний (UT_DNS … UT_TLS): на каком шаге вышел срок. */
+    static const char *const at[] = { "имя не разрешилось", "соединение не установилось",
+                                      "запрос не ушёл", "ответа нет", "рукопожатие TLS и ответ не пришли" };
+    ut_why(u, "срок вышел: %s", at[u->st]);
+    ut_finish(u, -1);
 }
 
 /* Строка статуса «HTTP/1.x NNN …»: годен ли ответ. */
@@ -178,6 +207,14 @@ static int status_ok(const char *b, size_t n) {
         return 0;
     int code = (b[9] - '0') * 100 + (b[10] - '0') * 10 + (b[11] - '0');
     return code == 204 || code == 200;
+}
+
+/* Почему ответ негоден: код статуса, если он есть, иначе «не HTTP». */
+static void ut_status_why(struct urltest *u) {
+    if (u->bn >= 12 && !strncmp(u->buf, "HTTP/1.", 7) && u->buf[8] == ' ')
+        ut_why(u, "ответ %.3s вместо 204/200", u->buf + 9);
+    else
+        ut_why(u, "ответ не похож на HTTP");
 }
 
 static void ut_io(struct loop *l, int fd, uint32_t ev, void *arg);
@@ -190,11 +227,18 @@ static void ut_send(struct urltest *u) {
             if (u->st != UT_SEND) { u->st = UT_SEND; loop_fd_mod(u->l, u->fd, EPOLLOUT); }
             return;
         }
-        if (k <= 0) { ut_finish(u, -1); return; }
+        if (k <= 0) {
+            ut_why(u, "запрос не отправился: %s", k < 0 ? strerror(errno) : "соединение закрыто");
+            ut_finish(u, -1);
+            return;
+        }
         u->req_off += (size_t)k;
     }
     u->st = UT_RECV;
-    if (loop_fd_mod(u->l, u->fd, EPOLLIN | EPOLLRDHUP) != 0) ut_finish(u, -1);
+    if (loop_fd_mod(u->l, u->fd, EPOLLIN | EPOLLRDHUP) != 0) {
+        ut_why(u, "цикл событий не принял сокет");
+        ut_finish(u, -1);
+    }
 }
 
 static void ut_recv(struct urltest *u) {
@@ -203,7 +247,12 @@ static void ut_recv(struct urltest *u) {
         ssize_t k = recv(u->fd, tmp, sizeof(tmp), 0);
         if (k < 0 && errno == EINTR) continue;
         if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-        if (k <= 0) { ut_finish(u, -1); return; }   /* закрыто или сброшено до строки статуса */
+        if (k <= 0) {                                /* закрыто или сброшено до строки статуса */
+            if (k < 0) ut_why(u, "чтение: %s", strerror(errno));
+            else ut_why(u, "соединение закрыто до ответа");
+            ut_finish(u, -1);
+            return;
+        }
         if (!u->t_first) u->t_first = loop_now_ms();
         size_t take = (size_t)k;
         if (take > sizeof(u->buf) - 1 - u->bn) take = sizeof(u->buf) - 1 - u->bn;
@@ -214,7 +263,9 @@ static void ut_recv(struct urltest *u) {
         if (eol || u->bn >= 64) {
             long ms = u->t_first - u->t0;
             if (ms < 0) ms = 0;
-            ut_finish(u, status_ok(u->buf, u->bn) ? (int)ms : -1);
+            int ok = status_ok(u->buf, u->bn);
+            if (!ok) ut_status_why(u);
+            ut_finish(u, ok ? (int)ms : -1);
             return;
         }
     }
@@ -226,21 +277,30 @@ static void ut_io(struct loop *l, int fd, uint32_t ev, void *arg) {
     if (u->st == UT_CONN) {
         int err = 0;
         socklen_t el = sizeof(err);
-        if (getsockopt(u->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err) { ut_finish(u, -1); return; }
+        if (getsockopt(u->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err) {
+            ut_why(u, "соединение: %s", strerror(err ? err : errno));
+            ut_finish(u, -1);
+            return;
+        }
         ut_send(u);
         return;
     }
     if (u->st == UT_SEND) {
-        if (ev & (EPOLLERR | EPOLLHUP)) { ut_finish(u, -1); return; }
+        if (ev & (EPOLLERR | EPOLLHUP)) {
+            ut_why(u, "соединение сброшено при отправке запроса");
+            ut_finish(u, -1);
+            return;
+        }
         ut_send(u);
         return;
     }
     if (u->st == UT_RECV) ut_recv(u);
 }
 
-static void ut_tls_cb(void *arg, int ms) {
+static void ut_tls_cb(void *arg, int ms, const char *why) {
     struct urltest *u = arg;
     u->tls = NULL;              /* поток отдал итог и освободил своё */
+    if (ms < 0) ut_why(u, "%s", why && why[0] ? why : "HTTPS не удался");
     ut_finish(u, ms);
 }
 
@@ -256,27 +316,29 @@ static void ut_connect(struct urltest *u, const struct sockaddr_storage *a) {
         dl = sizeof(struct sockaddr_in);
     }
     long left = u->deadline - loop_now_ms();
-    if (left <= 0) { ut_finish(u, -1); return; }
+    if (left <= 0) { ut_why(u, "срок вышел до соединения"); ut_finish(u, -1); return; }
 
     if (u->u.https) {
-        if (!urltls_start) { ut_finish(u, -1); return; }
+        if (!urltls_start) { ut_why(u, "https:// в этой сборке нет"); ut_finish(u, -1); return; }
         u->st = UT_TLS;
         u->tls = urltls_start(u->l, &u->dst, u->u.host, u->u.path, u->mark, u->dev[0] ? u->dev : NULL,
                               (int)left, ut_tls_cb, u);
-        if (!u->tls) ut_finish(u, -1);
+        if (!u->tls) { ut_why(u, "поток HTTPS не завёлся"); ut_finish(u, -1); }
         return;
     }
 
     int fd = socket(u->dst.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) { ut_finish(u, -1); return; }
+    if (fd < 0) { ut_why(u, "socket: %s", strerror(errno)); ut_finish(u, -1); return; }
     if (u->mark) {
         if (setsockopt(fd, SOL_SOCKET, SO_MARK, &u->mark, sizeof(u->mark)) != 0) {
+            ut_why(u, "метка члена не поставилась: %s", strerror(errno));
             close(fd);
             ut_finish(u, -1);
             return;
         }
     } else if (u->dev[0]) {
         if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, u->dev, (socklen_t)strlen(u->dev) + 1) != 0) {
+            ut_why(u, "привязка к устройству %s: %s", u->dev, strerror(errno));
             close(fd);
             ut_finish(u, -1);
             return;
@@ -284,10 +346,16 @@ static void ut_connect(struct urltest *u, const struct sockaddr_storage *a) {
     }
     u->t0 = loop_now_ms();
     int rc = connect(fd, (struct sockaddr *)&u->dst, dl);
-    if (rc != 0 && errno != EINPROGRESS) { close(fd); ut_finish(u, -1); return; }
+    if (rc != 0 && errno != EINPROGRESS) {
+        ut_why(u, "соединение: %s", strerror(errno));
+        close(fd);
+        ut_finish(u, -1);
+        return;
+    }
     u->fd = fd;
     u->st = rc == 0 ? UT_SEND : UT_CONN;
     if (loop_fd_add(u->l, fd, EPOLLOUT, ut_io, u) != 0) {
+        ut_why(u, "цикл событий не принял сокет");
         close(fd);
         u->fd = -1;
         ut_finish(u, -1);
@@ -304,19 +372,33 @@ static void ut_gai_cb(void *arg, const struct kind_name *names, size_t n) {
     int ok = n >= 1 && names[0].rc == 0 && names[0].addr_len >= need &&
              names[0].addr.ss_family == u->fam;
     dns_put(u->u.host, u->fam, ok, &names[0].addr);
-    if (!ok) { ut_finish(u, -1); return; }
+    if (!ok) {
+        ut_why(u, "имя %s не разрешилось (%s)", u->u.host, u->fam == AF_INET6 ? "AAAA" : "A");
+        ut_finish(u, -1);
+        return;
+    }
     ut_connect(u, &names[0].addr);
 }
 
 struct urltest *urltest_start(struct loop *l, const char *url, int fam, uint32_t mark,
                               const char *dev, int timeout_ms, urltest_cb cb, void *arg, int *ms) {
     *ms = -1;
+    g_why[0] = '\0';
     struct urltest_url pu;
-    if (urltest_url_parse(url, &pu, NULL, 0) != 0) return NULL;
-    if (pu.https && !urltls_start) return NULL;
+    if (urltest_url_parse(url, &pu, NULL, 0) != 0) {
+        snprintf(g_why, sizeof(g_why), "адрес проверки негоден");
+        return NULL;
+    }
+    if (pu.https && !urltls_start) {
+        snprintf(g_why, sizeof(g_why), "https:// в этой сборке нет");
+        return NULL;
+    }
     if (fam != AF_INET6) fam = AF_INET;
     struct urltest *u = calloc(1, sizeof(*u));
-    if (!u) return NULL;
+    if (!u) {
+        snprintf(g_why, sizeof(g_why), "нет памяти");
+        return NULL;
+    }
     u->l = l;
     u->u = pu;
     u->fam = fam;
@@ -326,7 +408,11 @@ struct urltest *urltest_start(struct loop *l, const char *url, int fam, uint32_t
     u->arg = arg;
     u->fd = -1;
     u->tm = loop_timer_new(l, ut_timeout, u);
-    if (!u->tm) { free(u); return NULL; }
+    if (!u->tm) {
+        snprintf(g_why, sizeof(g_why), "нет памяти");
+        free(u);
+        return NULL;
+    }
     if (timeout_ms <= 0) timeout_ms = 1;
     u->deadline = loop_now_ms() + timeout_ms;
     loop_timer_set(u->tm, timeout_ms);
@@ -343,6 +429,7 @@ struct urltest *urltest_start(struct loop *l, const char *url, int fam, uint32_t
     memset(&a, 0, sizeof(a));
     struct in_addr a4;
     if (!u->req_n) {
+        ut_why(u, "запрос не уместился в буфер");
         ut_finish(u, -1);
     } else if (inet_pton(AF_INET, pu.host, &a4) == 1) {
         /* Литерал IPv4 — замера по IPv6 у такого адреса нет: AAAA не спросить. */
@@ -357,8 +444,10 @@ struct urltest *urltest_start(struct loop *l, const char *url, int fam, uint32_t
     } else {
         int c = dns_get(pu.host, fam, &a);
         if (c == 1) ut_connect(u, &a);
-        else if (c == 0) ut_finish(u, -1);
-        else {
+        else if (c == 0) {
+            ut_why(u, "имя %s не разрешилось (%s, недавний отказ)", pu.host, fam == AF_INET6 ? "AAAA" : "A");
+            ut_finish(u, -1);
+        } else {
             struct kind_name nm;
             memset(&nm, 0, sizeof(nm));
             snprintf(nm.host, sizeof(nm.host), "%s", pu.host);

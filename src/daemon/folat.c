@@ -136,7 +136,57 @@ struct folat_m {
     int ms4, ms6, left;
     folat_m_cb cb;
     void *arg;
+    /* Чей это замер и по какому адресу — для строки журнала о неудаче (fm_note): к моменту обратного
+     * вызова спека могла смениться, поэтому копии, а не указатели в неё. */
+    char grp[32], key[32], url[192];
 };
+
+/* ЖУРНАЛ НЕУДАЧ ЗАМЕРА. Замер, не давший ответа, превращает «самый быстрый» в «первый живой», и без
+ * причины в журнале человек видит только то, что группа «не работает»: пустой `latency` в status
+ * говорит, ЧТО мерить не вышло, но не почему (имя не разрешилось, порт закрыт, ответ 503,
+ * сертификат не принят, часы без NTP). Строка — на (группу, члена): пока причина та же, не чаще раза
+ * в FOLAT_NOTE_S, а после удачного замера следующая неудача скажет снова. Только IPv4: по IPv6
+ * у большинства туннелей ответа нет, и это не новость. */
+#define FOLAT_NOTE_S 600
+#define LOG_WL "steer[warn] latency: "
+struct fl_note {
+    char grp[32], key[32], why[192];
+    long at;                          /* CLOCK_MONOTONIC, с; 0 — говорить, как только случится */
+};
+static struct fl_note *g_notes;
+static size_t g_notes_n, g_notes_cap;
+
+static void fm_note(const struct folat_m *fm, int fam, int ms) {
+    if (fam != 4) return;
+    struct fl_note *n = NULL;
+    for (size_t i = 0; i < g_notes_n && !n; i++)
+        if (!strcmp(g_notes[i].grp, fm->grp) && !strcmp(g_notes[i].key, fm->key)) n = &g_notes[i];
+    if (ms >= 0) {                    /* удалось — следующая неудача заговорит сразу */
+        if (n) n->at = 0;
+        return;
+    }
+    const char *why = urltest_why();
+    if (!why[0]) return;
+    long now = loop_now_ms() / 1000 + 1;
+    if (n && n->at && now - n->at < FOLAT_NOTE_S && !strcmp(n->why, why)) return;
+    if (!n) {
+        if (g_notes_n == g_notes_cap) {
+            size_t nc = g_notes_cap ? g_notes_cap * 2 : 16;
+            struct fl_note *nn = realloc(g_notes, nc * sizeof(*nn));
+            if (!nn) return;
+            g_notes = nn;
+            g_notes_cap = nc;
+        }
+        n = &g_notes[g_notes_n++];
+        memset(n, 0, sizeof(*n));
+        snprintf(n->grp, sizeof(n->grp), "%s", fm->grp);
+        snprintf(n->key, sizeof(n->key), "%s", fm->key);
+    }
+    snprintf(n->why, sizeof(n->why), "%s", why);
+    n->at = now;
+    fprintf(stderr, LOG_WL "группа %s, член %s: замер %s не удался — %s\n", fm->grp, fm->key,
+            fm->url, why);
+}
 
 static void fm_done(struct folat_m *fm) {
     if (--fm->left > 0) return;
@@ -151,6 +201,7 @@ static void fm_cb4(void *arg, int ms) {
     struct folat_m *fm = arg;
     fm->u4 = NULL;
     fm->ms4 = ms;
+    fm_note(fm, 4, ms);
     fm_done(fm);
 }
 
@@ -188,10 +239,16 @@ struct folat_m *folat_member(struct loop *l, const struct spec *sp, const struct
     fm->arg = arg;
     fm->ms4 = -1;
     fm->ms6 = v6 ? -1 : -2;
+    snprintf(fm->grp, sizeof(fm->grp), "%s", go->name);
+    snprintf(fm->key, sizeof(fm->key), "%s", m ? fog_lat_key(m) : dev);
+    snprintf(fm->url, sizeof(fm->url), "%s", url);
     int r;
     fm->u4 = urltest_start(l, url, AF_INET, mark, mark ? NULL : dev, FOLAT_TIMEOUT_MS, fm_cb4, fm, &r);
     if (fm->u4) fm->left++;
-    else fm->ms4 = r;
+    else {
+        fm->ms4 = r;
+        fm_note(fm, 4, r);            /* итог сразу: причина — у urltest_why, пока не начат другой замер */
+    }
     if (v6) {
         fm->u6 = urltest_start(l, url, AF_INET6, mark, NULL, FOLAT_TIMEOUT_MS, fm_cb6, fm, &r);
         if (fm->u6) fm->left++;
