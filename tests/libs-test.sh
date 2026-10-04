@@ -407,6 +407,19 @@ case "$o" in
        printf '%s\n' "$o" | grep -q ', 0 fail$' || printf '%s\n' "$full" | sed 's/^/    rcvwnd: /' ;;
 esac
 
+# Замер группы latency по HTTPS (urltls.c) — раньше его не доставал ни один стенд: демон раскладки, два
+# члена-интерфейса, сервер TLS 1.3 со своим CA; хранилище корней без CA — причина неудачи в журнале и в
+# status, с CA — замер есть и группа на быстром. Нужны root, сетевые пространства, tc с netem, openssl и
+# python3 с ssl — нет их, и стенд сам говорит «пропуск».
+full="$(LIBS="$L" sh tests/urlhttps.sh 2>&1)"
+o="$(printf '%s\n' "$full" | tail -n 1)"
+case "$o" in
+    *пропуск*) echo "libs-test: $o" ;;
+    *) check "замер группы по HTTPS: стенд tests/urlhttps.sh" "1" \
+           "$(printf '%s' "$o" | grep -c '^urlhttps: [0-9]* ok, 0 fail$')"
+       printf '%s\n' "$o" | grep -q ', 0 fail$' || printf '%s\n' "$full" | sed 's/^/    urlhttps: /' ;;
+esac
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'
