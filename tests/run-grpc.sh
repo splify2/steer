@@ -1,0 +1,198 @@
+#!/bin/sh
+# VLESS через gRPC + Reality против НАСТОЯЩЕГО Xray-core: проба узла и несколько минут нагрузки в обе стороны
+# (issue 39, «постоянно рвётся туннель Vless gRPC Reality»).
+#
+# Зачем, если есть tests/grpcmatch.c и tests/h2match.c. Те проверяют кадры и транспорт в памяти, с кадрами,
+# написанными руками. Но поломка issue 39 живёт на сочетании, которое руками не придумать: что именно
+# сервер gRPC кладёт в одну запись TLS, зависит от того, как grpc-go сбрасывает буфер, и от темпа ответа
+# цели. h2_read терял данные, набранные в одном вызове с концом потока от Xray (RST_STREAM(NO_ERROR) после
+# концевых HEADERS), и ломалось три вещи сразу:
+#   - проба узла (запрос на 1.1.1.1:80 с «Connection: close») падала «ответа нет: поток закрыт сервером
+#     (RST/GOAWAY)» на исправном узле — с Xray 26.3.27 14 проб из 30 в режиме gun и 21 из 30 в multi; при подъёме
+#     без заданного узла перебор по пробе мог не найти ни одного;
+#   - сторож после двух таких проб подряд (раз в `interval`, по умолчанию 60 с) объявлял узел мёртвым и
+#     сбрасывал все соединения: «работает минуту, потом интернет рвётся полностью», узел в панели красный;
+#   - около 20% коротких соединений (42 страницы из 200 по 30 КБ) теряли хвост ответа.
+# Клиент Xray на том же узле отдаёт те же страницы без единого отказа: ломался именно разбор кадров в steer.
+#
+# Что проверяется (провал — код 1, причина в последней строке):
+#   1. проба узла (`steer-vless vless-probe`) 30 раз подряд: отказов 0;
+#   2. DUR секунд (умолчание 190 — три минуты с запасом) нагрузки через туннель: два долгих потока вниз, два
+#      вверх и короткие «страницы» по 10 в секунду: ни одна страница не усечена и не повисла, долгие потоки
+#      не оборваны и ни одно направление не встаёт на 15 секунд;
+#   3. сторож: `interval: 10` у выхода — за прогон около 19 проверок каждого узла; в журнале steer не должно
+#      быть «не отвечает», «ищу замену» и «не открылся» (то, что и видела панель: узел мёртв → трафик остановлен).
+# MODES — режимы gRPC через пробел (gun, multi); умолчание — gun.
+#
+# Стороны РАЗВЕДЕНЫ по сетевым пространствам, как в run-reality.sh: клиент (steer-vless, его устройство vl и
+# нагрузка) — в одном, Xray, маскировочный сайт Reality и цель — в другом. «Сайт» — адрес на lo сервера; там же
+# 1.1.1.1 и 8.8.8.8 с HTTP на :80 — цели пробы узла.
+#
+# Нужны: root, ip netns, python3, openssl и Xray-core: XRAY=/путь/к/бинарнику (или xray в PATH). Нет Xray или прав
+# — громкий пропуск (код 0), не молчание. Раскладка steer — LIBS (умолчание build/libs-host): её собирает
+# `make libs-test`. В make test не входит — как run-reality.sh, run-tunnel.sh и run-udp.sh; идёт минуты.
+set -eu
+cd "$(dirname "$0")/.."
+
+LIBS="${LIBS:-build/libs-host}"
+DUR="${DUR:-190}"
+MODES="${MODES:-gun}"
+XRAY="${XRAY:-$(command -v xray 2>/dev/null || true)}"
+
+[ "$(id -u)" = 0 ] || { echo "run-grpc: ПРОПУСК — нужен root (ip netns). Это не падение."; exit 0; }
+command -v ip >/dev/null 2>&1 || { echo "run-grpc: ПРОПУСК — нет ip. Это не падение."; exit 0; }
+command -v python3 >/dev/null 2>&1 || { echo "run-grpc: ПРОПУСК — нужен python3. Это не падение."; exit 0; }
+command -v openssl >/dev/null 2>&1 || { echo "run-grpc: ПРОПУСК — нужен openssl. Это не падение."; exit 0; }
+[ -n "$XRAY" ] && [ -x "$XRAY" ] || { echo "run-grpc: ПРОПУСК — нет Xray-core (XRAY=/путь/к/бинарнику). Это не падение."; exit 0; }
+[ -x "$LIBS/steer-vless" ] || { echo "run-grpc: нет $LIBS/steer-vless (его собирает make libs-test; LIBS=каталог)"; exit 2; }
+LIBS="$(cd "$LIBS" && pwd)"
+ip netns add "grpc-probe-$$" 2>/dev/null || { echo "run-grpc: ПРОПУСК — ip netns недоступен. Это не падение."; exit 0; }
+ip netns delete "grpc-probe-$$"
+
+NSC="grpcc$$"; NSS="grpcs$$"
+S_IP=10.93.0.1; C_IP=10.93.0.2; TARGET=203.0.113.9
+PORT=18443; MASK=mask.grpc.test; SVC=grpcsvc
+UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
+SID=0123456789abcdef
+W="$(mktemp -d)"
+PIDS=""
+cleanup() {
+    for p in $PIDS; do kill "$p" 2>/dev/null || true; done
+    for n in "$NSC" "$NSS"; do
+        for p in $(ip netns pids "$n" 2>/dev/null || true); do kill "$p" 2>/dev/null || true; done
+    done
+    sleep 0.3
+    for n in "$NSC" "$NSS"; do
+        for p in $(ip netns pids "$n" 2>/dev/null || true); do kill -9 "$p" 2>/dev/null || true; done
+        ip netns delete "$n" 2>/dev/null || true
+    done
+    rm -rf "$W"
+}
+trap cleanup EXIT INT TERM
+
+bg_in() { ns="$1"; log="$2"; shift 2; ip netns exec "$ns" "$@" > "$log" 2>&1 & PIDS="$PIDS $!"; }
+
+echo "run-grpc: сервер — $("$XRAY" version 2>/dev/null | head -1)"
+
+ip netns add "$NSC"; ip netns add "$NSS"
+ip -n "$NSC" link set lo up; ip -n "$NSS" link set lo up
+ip link add grc0 netns "$NSC" type veth peer name grs0 netns "$NSS"
+ip -n "$NSC" addr add "$C_IP/24" dev grc0
+ip -n "$NSS" addr add "$S_IP/24" dev grs0
+ip -n "$NSC" link set grc0 up; ip -n "$NSS" link set grs0 up
+for a in "$TARGET" 1.1.1.1 8.8.8.8; do ip -n "$NSS" addr add "$a/32" dev lo; done
+
+"$XRAY" x25519 > "$W/keys.txt" 2>&1
+PRIV=$(awk '/^PrivateKey:/ {print $2}' "$W/keys.txt")
+PUB=$(awk '/PublicKey/ {print $NF}' "$W/keys.txt")
+[ -n "$PRIV" ] && [ -n "$PUB" ] || { echo "run-grpc: xray x25519 не дал ключей:"; cat "$W/keys.txt"; exit 1; }
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+    -keyout "$W/mask.key" -out "$W/mask.pem" -subj "/CN=$MASK" -addext "subjectAltName=DNS:$MASK" >/dev/null 2>&1
+
+# Маскировочный сайт Reality: любой сервер TLS 1.3 с h2 в ALPN.
+bg_in "$NSS" "$W/mask.log" openssl s_server -accept "$S_IP:8443" -cert "$W/mask.pem" -key "$W/mask.key" \
+    -tls1_3 -alpn h2,http/1.1 -www -quiet
+# Цель и цели пробы узла.
+bg_in "$NSS" "$W/target.log" python3 tests/grpc-target.py "$TARGET" 8080
+bg_in "$NSS" "$W/probe1.log" python3 tests/grpc-target.py 1.1.1.1 80
+bg_in "$NSS" "$W/probe2.log" python3 tests/grpc-target.py 8.8.8.8 80
+# Счётчик SYN к узлу — сколько соединений TCP открыто за прогон (только для печати; нет nft — без него).
+if command -v nft >/dev/null 2>&1; then
+    ip netns exec "$NSS" nft -f - >/dev/null 2>&1 <<NFT || true
+table inet grpccnt { chain in { type filter hook input priority -300; policy accept;
+    iifname "grs0" tcp dport $PORT tcp flags & (syn | ack) == syn counter comment "syn" } }
+NFT
+fi
+
+FAIL=0
+for MODE in $MODES; do
+    MULTI=false; [ "$MODE" = multi ] && MULTI=true
+    echo "run-grpc: ==== режим $MODE ===="
+    cat > "$W/xray.json" <<JSON
+{"log":{"loglevel":"warning","access":"$W/xray-access-$MODE.log"},
+ "inbounds":[{"listen":"$S_IP","port":$PORT,"protocol":"vless",
+   "settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
+   "streamSettings":{"network":"grpc","security":"reality",
+     "grpcSettings":{"serviceName":"$SVC","multiMode":$MULTI},
+     "realitySettings":{"show":false,"dest":"$S_IP:8443","xver":0,"serverNames":["$MASK"],
+       "privateKey":"$PRIV","shortIds":["$SID"]}}}],
+ "outbounds":[{"protocol":"freedom","tag":"direct"}]}
+JSON
+    ip netns exec "$NSS" "$XRAY" run -c "$W/xray.json" > "$W/xray-$MODE.log" 2>&1 &
+    XPID=$!; PIDS="$PIDS $XPID"
+    for _ in $(seq 40); do ip netns exec "$NSS" ss -ltn 2>/dev/null | grep -q ":$PORT " && break; sleep 0.25; done
+    ip netns exec "$NSS" ss -ltn 2>/dev/null | grep -q ":$PORT " || { echo "run-grpc: Xray не поднялся:"; tail -5 "$W/xray-$MODE.log"; exit 1; }
+
+    printf '%s\n' "vless://$UUID@$S_IP:$PORT?encryption=none&type=grpc&serviceName=$SVC&mode=$MODE&security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=chrome#grpc-$MODE" > "$W/sub.txt"
+    # interval: 10 — сторож проверяет узел каждые 10 секунд, а не раз в минуту: за прогон набирается около 19
+    # проверок, и ложное «узел мёртв» (две неудачи подряд) не придётся ждать.
+    cat > "$W/spec.yaml" <<SPEC
+version: 2
+outputs:
+  vl: { kind: tunnel, protocol: vless, subscription: $W/sub.txt, interval: 10 }
+SPEC
+
+    # Прогрев: самое первое соединение с только что запущенным Xray у Reality бывает долгим (сервер при первом
+    # рукопожатии ещё поднимает своё; у `openssl s_server` в роли маскировочного сайта — тем более), и проба на
+    # нём молчит до срока. Это свойство стенда, а не клиента, поэтому ждём первого ответа (не дольше минуты),
+    # и счёт отказов начинается только после него.
+    warm=0
+    for _ in $(seq 12); do
+        out=$(LD_LIBRARY_PATH="$LIBS" ip netns exec "$NSC" "$LIBS/steer-vless" vless-probe "$W/sub.txt" --node 0 --timeout 5 2>&1 || true)
+        if printf '%s' "$out" | grep -q '"ok":true'; then warm=1; break; fi
+        sleep 1
+    done
+    [ "$warm" -eq 1 ] || { echo "run-grpc: ПРОВАЛ — узел не ответил на проверку за минуту: $(printf '%s' "$out" | grep -o '"why":"[^"]*"' | head -1)"; FAIL=1; kill "$XPID" 2>/dev/null || true; continue; }
+
+    # 1. Проба узла: 30 раз. С прежним кодом отказывала большая часть.
+    ok=0; bad=0
+    for i in $(seq 30); do
+        out=$(LD_LIBRARY_PATH="$LIBS" ip netns exec "$NSC" "$LIBS/steer-vless" vless-probe "$W/sub.txt" --node 0 --timeout 5 2>&1 || true)
+        if printf '%s' "$out" | grep -q '"ok":true'; then ok=$((ok + 1)); else
+            bad=$((bad + 1)); LAST="$out"
+            echo "run-grpc:   проба $i: $(printf '%s' "$out" | grep -o '"why":"[^"]*"' | head -1)"
+        fi
+    done
+    echo "run-grpc: проба узла: ok $ok, отказов $bad"
+    if [ "$bad" -ne 0 ]; then
+        echo "run-grpc: ПРОВАЛ — проба отказывает на исправном узле: $(printf '%s' "$LAST" | grep -o '"why":"[^"]*"' | head -1)"
+        FAIL=1; kill "$XPID" 2>/dev/null || true; continue
+    fi
+
+    # 2-3. Туннель и нагрузка.
+    mkdir -p "$W/state"
+    LD_LIBRARY_PATH="$LIBS" ip netns exec "$NSC" "$LIBS/steer-vless" vless vl \
+        --spec "$W/spec.yaml" --state-dir "$W/state" > "$W/steer-$MODE.log" 2>&1 &
+    SPID=$!; PIDS="$PIDS $SPID"
+    for _ in $(seq 60); do ip netns exec "$NSC" ip link show vl >/dev/null 2>&1 && break; sleep 0.25; done
+    ip netns exec "$NSC" ip link show vl >/dev/null 2>&1 || {
+        echo "run-grpc: ПРОВАЛ — туннель vl не поднялся:"; tail -8 "$W/steer-$MODE.log"; FAIL=1
+        kill "$SPID" "$XPID" 2>/dev/null || true; continue; }
+    ip netns exec "$NSC" ip route replace "$TARGET/32" dev vl
+    echo "run-grpc: туннель поднят, нагрузка $DUR с (два потока вниз, два вверх, страницы по 10/с)"
+
+    rc=0
+    ip netns exec "$NSC" python3 tests/grpc-load.py --target "$TARGET:8080" --dur "$DUR" \
+        --down 2 --up 2 --rate 10 --report 10 || rc=$?
+
+    # Что видела панель: узел объявлен мёртвым, соединения сброшены, поток к узлу не открылся.
+    bad_log=$(grep -E "не отвечает|ищу замену|не открылся|снова отвечает" "$W/steer-$MODE.log" || true)
+    if [ -n "$bad_log" ]; then
+        echo "run-grpc: ПРОВАЛ — сторож объявлял узел мёртвым или поток не открывался:"
+        printf '%s\n' "$bad_log" | head -5 | sed 's/^/    /'
+        rc=1
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        syns=$(ip netns exec "$NSS" nft list chain inet grpccnt in 2>/dev/null | sed -n 's/.*packets \([0-9]*\) .*comment "syn".*/\1/p')
+        [ -n "$syns" ] && echo "run-grpc: соединений TCP к узлу за режим: $syns"
+    fi
+    kill "$SPID" 2>/dev/null || true
+    sleep 0.5
+    ip netns exec "$NSC" ip link delete vl 2>/dev/null || true
+    kill "$XPID" 2>/dev/null || true
+    sleep 0.5
+    if [ "$rc" -ne 0 ]; then FAIL=1; echo "run-grpc: режим $MODE — ПРОВАЛ"; else echo "run-grpc: режим $MODE — ok"; fi
+done
+
+[ "$FAIL" -eq 0 ] && echo "run-grpc: все проверки прошли" || echo "run-grpc: ЕСТЬ ПРОВАЛЫ"
+exit "$FAIL"
