@@ -565,9 +565,17 @@ sleep 7
 check "a упал: группа на c (самый быстрый из живых), а не на первом живом b" "sw3 c c" \
     "$(tdev dead3) $(st outputs.dead3.group.selected) $(st outputs.dead3.group.fastest)"
 check "  status: живые — b и c" "b,c" "$(st outputs.dead3.group.alive)"
+# Причина смены — «упал», а не «по замеру»: замер лишь выбрал из оставшихся.
+sw_why() {   # ВЫХОД УСТРОЙСТВО — «причина член» последнего switched в устройство
+    grep '"ev":"switched"' "$tmp/sub.out" | grep "\"out\":\"$1\"" | grep "\"to\":\"$2\"" | tail -n 1 |
+        sed -n 's/.*"why":"\([a-z]*\)".*"member":"\([a-z]*\)".*/\1 \2/p'
+}
+check "  подписчику — switched на c с причиной down (не latency)" "down c" "$(sw_why dead3 sw3)"
 ip link set sw1 up
 wait_for '[ "$(tdev dead3)" = sw1 ]' 40
 check "a вернулся: группа снова на самом быстром" "sw1 a" "$(tdev dead3) $(st outputs.dead3.group.selected)"
+wait_for '[ "$(sw_why dead3 sw1)" = "latency a" ]' 10
+check "  возврат на a — switched с причиной latency" "latency a" "$(sw_why dead3 sw1)"
 R tc qdisc del dev sw2p root
 R tc qdisc del dev sw3p root
 R tc qdisc del dev sw1p root
