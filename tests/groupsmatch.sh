@@ -21,14 +21,25 @@
 #     запись сторожа, устаревшая относительно файла select (файл сменили при остановленном
 #     демоне), выбор не перебивает.
 #  2. latency = urltest: через двух членов с разной задержкой выбирается быстрый, хотя он второй
-#     по порядку; запрос идёт именно через члена (ответчик видит адрес его устройства); гистерезис:
-#     выигрыш меньше tolerance — остаётся на текущем; больше — уходит.
+#     по порядку; запрос идёт именно через члена (ответчик видит адрес его устройства); без `url` в
+#     спеке — адрес по умолчанию (имя cp.cloudflare.com из hosts, порт 80); гистерезис: выигрыш меньше
+#     tolerance — остаётся на текущем; больше — уходит.
 #  2а. interval короче периода сторожа: группа с interval 10 при периоде 60 меряется каждые ~10 с
 #     (по счётчику запросов у ответчика), а член, ставший медленным, теряет группу по замеру, не
 #     дожидаясь прохода по периоду.
 #  2б. IPv6: у группы, все члены которой несут IPv6, замер идёт и по IPv4, и по IPv6 (ответчик видит
 #     запрос с адреса IPv6 каждого члена); status — latency4 и latency6; член, быстрый по IPv4, но
 #     медленный по IPv6, не выигрывает (выбор — по худшему из двух).
+#  2в. допуск: при разнице меньше допуска по умолчанию (50) остаётся первый по порядку, и status
+#     объясняет это (fastest, why: in_tolerance, tolerance); tolerance: 0 — настоящий ноль: выбирается
+#     строго самый быстрый, хотя он второй по порядку (прежде 0 читался как «не задан» и давал 50, и
+#     «самый быстрый» превращался в первого живого). У группы из одного члена выбирать не из чего, и
+#     why, fastest, latency_failed у неё нет.
+#  2г. самый быстрый член упал: группа уходит на следующего по замеру (самого быстрого из живых), а не
+#     на первого живого по порядку, и возвращается на него, когда он ожил.
+#  2д. замер не удался ни у кого (проверочный адрес не ответил): группа идёт по порядку, status —
+#     why: no_measure и latency_failed, в журнале — строка об этом; повтор замера — раньше срока
+#     (interval группы — 90 с, а повтор — через ~15), и группа переходит на самого быстрого.
 #  3. balance: новые соединения клиента расходятся по обоим членам; упавший член выпадает из карты
 #     (карта в ядре — только цепочка живого, событие balance), новые идут на живого; установленное
 #     соединение не перескакивает ни при уходе, ни при возврате другого члена.
@@ -37,7 +48,8 @@
 #     разошлись по живым; a вернулся — каждый сайт снова там, где был. by: site_client — у каждого
 #     из двух адресов клиента сайт на одном члене, но у разных клиентов один и тот же сайт может
 #     быть на разных членах.
-#  4. idle_timeout: без трафика через группу ни одного запроса проверки; трафик пошёл — замер есть.
+#  4. idle_timeout: без трафика через группу ни одного запроса проверки, status — why: idle (простой
+#     не отказ: latency_failed нет, в журнале нет «замера нет»); трафик пошёл — замер есть.
 #
 # Нужны root, unshare, nsenter, nft, ip, tc и python3; без них — пропуск.
 set -u
@@ -113,7 +125,7 @@ for k in 1 2; do
     R ip -6 addr add fd02::1/128 dev sw${k}p nodad 2>/dev/null || V6=0
 done
 # Имя адреса проверки с A и AAAA — файлом hosts в пространстве имён монтирования демона.
-printf '127.0.0.1 localhost\n10.2.0.1 probe.test\nfd02::1 probe.test\n' > "$tmp/hosts"
+printf '127.0.0.1 localhost\n10.2.0.1 probe.test\n10.2.0.1 cp.cloudflare.com\nfd02::1 probe.test\n' > "$tmp/hosts"
 ip link add lanx type veth peer name lanxp
 ip link set lanxp netns "$CPID"
 ip link set lanx up; ip addr add 192.168.7.1/24 dev lanx
@@ -140,9 +152,9 @@ chmod +x "$tmp/bin/ifdown" "$tmp/bin/ifup"
 PATH="$tmp/bin:$PATH"
 export PATH
 
-# HTTP-ответчик: 204 на /generate_204 и /idle_204, журнал «путь адрес» по строке; /who — адрес.
+# HTTP-ответчик: 204 на /generate_204 и /idle_204 (порты 8080 и 80), журнал «путь адрес» по строке; /who — адрес.
 cat > "$tmp/http.py" <<'PY'
-import socket, sys, threading
+import os, socket, sys, threading
 log = open(sys.argv[1], 'a', buffering=1)
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('10.2.0.1', 8080)); s.listen(64)
@@ -158,6 +170,9 @@ def serve(c, a):
         if path == '/who':
             body = a[0].encode()
             c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % len(body) + body)
+        elif path.startswith('/rt_') and len(sys.argv) > 3 and os.path.exists(sys.argv[3]):
+            # Отказ проверочного адреса (2д): пока лежит файл, путь /rt_… отвечает 503.
+            c.sendall(b'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n')
         else:
             c.sendall(b'HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n')
     finally:
@@ -166,6 +181,10 @@ def accept_loop(sock):
     while True:
         c, a = sock.accept()
         threading.Thread(target=serve, args=(c, a), daemon=True).start()
+# Порт 80 — адрес проверки по умолчанию (http://cp.cloudflare.com/generate_204, имя — из hosts).
+s80 = socket.socket(); s80.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s80.bind(('10.2.0.1', 80)); s80.listen(64)
+threading.Thread(target=accept_loop, args=(s80,), daemon=True).start()
 # IPv6 (2б): тот же ответчик на [fd02::1]:8080, журнал — с адресом IPv6 члена.
 if len(sys.argv) > 2 and sys.argv[2] == '1':
     s6 = socket.socket(socket.AF_INET6); s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -216,7 +235,7 @@ while True:
 PY
 : > "$tmp/http.log"
 # nsenter напрямую, а не функцией R: у функции в фоне $! — подоболочка, и kill её не снял бы сервер.
-nsenter -t "$RPID" -n python3 "$tmp/http.py" "$tmp/http.log" "$V6" >"$tmp/http.err" 2>&1 & HP=$!
+nsenter -t "$RPID" -n python3 "$tmp/http.py" "$tmp/http.log" "$V6" "$tmp/rt.fail" >"$tmp/http.err" 2>&1 & HP=$!
 nsenter -t "$RPID" -n python3 "$tmp/echo.py" >"$tmp/echo.err" 2>&1 & EP=$!
 nsenter -t "$RPID" -n python3 "$tmp/site.py" >"$tmp/site.err" 2>&1 & SP=$!
 sleep 0.5
@@ -257,6 +276,12 @@ outputs:
   idl: { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/idle_204", idle_timeout: 3600 }
   iv:  { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/iv_204", tolerance: 60, interval: 10, idle_timeout: 0 }
 $V6G
+  dflt:  { kind: group, pick: latency, members: [b, a], idle_timeout: 0 }
+  one:   { kind: group, pick: latency, members: [a], idle_timeout: 0 }
+  tol:   { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/tol_204", idle_timeout: 0 }
+  strict: { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/strict_204", tolerance: 0, idle_timeout: 0 }
+  dead3: { kind: group, pick: latency, members: [b, c, a], url: "http://10.2.0.1:8080/dead3_204", idle_timeout: 0 }
+  rt:    { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/rt_204", interval: 90, idle_timeout: 0 }
   bal: { kind: group, pick: balance, members: [a, b] }
   sit: { kind: group, pick: balance, by: site, members: [a, b, c] }
   sic: { kind: group, pick: balance, by: site_client, members: [a, b, c] }
@@ -299,9 +324,10 @@ start_bare() {
 # «Перезагрузка»: каталог состояния пуст (tmpfs), таблица группы в ядре пуста; спека и файл select
 # рядом с ней — на месте.
 reboot_state() {
-    t="$(reg "$1" 3)"
+    ts=""
+    for g in "$@"; do ts="$ts $(reg "$g" 3)"; done
     [ -n "$tmp" ] && [ -d "$tmp/st" ] && rm -rf "$tmp/st" && mkdir -p "$tmp/st"
-    [ -n "$t" ] && ip route flush table "$t"
+    for t in $ts; do ip route flush table "$t"; done
 }
 reg() { awk -v o="$1" '$1 == o { print $'"$2"' }' "$tmp/st/registry"; }
 tdev() { ip route show table "$(reg "$1" 3)" | awk '$1 == "default" && $2 == "dev" { print $3 }' | head -n 1; }
@@ -420,6 +446,11 @@ check "  status: замеры обоих, b медленнее a на задер
     "$([ -n "$lat_a" ] && [ -n "$lat_b" ] && [ "$lat_b" -ge 190 ] && [ "$lat_a" -lt 150 ] && echo yes || echo "a=$lat_a b=$lat_b")"
 check "  запрос шёл через каждого члена (ответчик видел оба адреса)" "2" \
     "$(grep '^/generate_204 ' "$tmp/http.log" | awk '{ print $2 }' | sort -u | grep -c '^10\.9\.[12]\.1$')"
+# Адрес проверки по умолчанию (в спеке группы dflt url нет): имя cp.cloudflare.com из hosts, порт 80.
+wait_for '[ "$(st outputs.dflt.group.latency | tr "," "\n" | grep -c "^[ab]=")" = 2 ]' 20
+check "url по умолчанию (имя из hosts, порт 80): быстрый член выбран, хотя он второй по порядку" "sw1 a" \
+    "$(tdev dflt) $(st outputs.dflt.group.selected)"
+check "  status: адрес проверки — умолчание" "http://cp.cloudflare.com/generate_204" "$(st outputs.dflt.group.url)"
 # Гистерезис: теперь b быстрее, но меньше чем на tolerance 60 мс — остаёмся на a. Задержка netem
 # на стороне ответчика ложится в замер дважды (SYN-ACK и ответ): 15 мс — около 30 мс разницы.
 R tc qdisc del dev sw2p root
@@ -490,9 +521,92 @@ else
     echo "groupsmatch: IPv6 в пространстве стенда не встал — часть 2б пропущена"
 fi
 
+# ---- 2в. допуск: умолчание 50 и tolerance: 0 ----
+# b (первый по порядку) медленнее a ненамного: 15 мс на стороне ответчика против 5 — разница замера
+# около 20-30 мс, меньше допуска по умолчанию (50), но заметна при допуске 0.
+R tc qdisc add dev sw2p root netem delay 15ms
+R tc qdisc add dev sw1p root netem delay 5ms
+stop_daemon
+reboot_state tol strict        # без памяти о прежнем выборе: у группы нет текущего члена
+start_daemon
+wait_for '[ "$(st outputs.tol.group.latency | tr "," "\n" | grep -c "^[ab]=")" = 2 ] && [ "$(st outputs.strict.group.latency | tr "," "\n" | grep -c "^[ab]=")" = 2 ]' 25
+lt_a="$(st outputs.tol.group.latency | tr ',' '\n' | awk -F= '$1 == "a" { print $2 }')"
+lt_b="$(st outputs.tol.group.latency | tr ',' '\n' | awk -F= '$1 == "b" { print $2 }')"
+check "допуск: b медленнее a, но меньше чем на 50 мс (условие части)" "yes" \
+    "$([ -n "$lt_a" ] && [ -n "$lt_b" ] && [ "$lt_b" -gt "$lt_a" ] && [ $((lt_b - lt_a)) -lt 50 ] && echo yes || echo "a=$lt_a b=$lt_b")"
+check "допуск не задан (50): остаётся первый по порядку, не самый быстрый" "sw2 b" \
+    "$(tdev tol) $(st outputs.tol.group.selected)"
+check "  status объясняет: самый быстрый a, выбран в допуске" "a in_tolerance 50 180" \
+    "$(st outputs.tol.group.fastest) $(st outputs.tol.group.why) $(st outputs.tol.group.tolerance) $(st outputs.tol.group.interval)"
+check "tolerance: 0 — выбирается строго самый быстрый, хотя он второй по порядку" "sw1 a" \
+    "$(tdev strict) $(st outputs.strict.group.selected)"
+check "  status: допуск 0, самый быстрый — выбранный" "a fastest 0" \
+    "$(st outputs.strict.group.fastest) $(st outputs.strict.group.why) $(st outputs.strict.group.tolerance)"
+check "группа latency из одного члена: выбирать не из чего — why, fastest и latency_failed нет" "- - - 180" \
+    "$(st outputs.one.group.why) $(st outputs.one.group.fastest) $(st outputs.one.group.latency_failed) $(st outputs.one.group.interval)"
+R tc qdisc del dev sw2p root
+R tc qdisc del dev sw1p root
+
+# ---- 2г. самый быстрый член упал ----
+# dead3: b (первый по порядку) медленный, c средний, a быстрый. Упал a — группа на c (самый быстрый из
+# живых), а не на первом живом b: запись замеров ещё свежая и называет a лучшим, но он мёртв.
+R tc qdisc add dev sw2p root netem delay 100ms
+R tc qdisc add dev sw3p root netem delay 40ms
+R tc qdisc add dev sw1p root netem delay 5ms
+stop_daemon
+reboot_state dead3
+start_daemon
+wait_for '[ "$(st outputs.dead3.group.latency | tr "," "\n" | grep -c "^[abc]=")" = 3 ] && [ "$(tdev dead3) $(st outputs.dead3.group.selected)" = "sw1 a" ]' 30
+check "три члена: выбран самый быстрый (a — последний по порядку)" "sw1 a fastest" \
+    "$(tdev dead3) $(st outputs.dead3.group.selected) $(st outputs.dead3.group.why)"
+ip link set sw1 down
+wait_for '[ -n "$(tdev dead3)" ] && [ "$(tdev dead3)" != sw1 ]' 30
+sleep 7
+check "a упал: группа на c (самый быстрый из живых), а не на первом живом b" "sw3 c c" \
+    "$(tdev dead3) $(st outputs.dead3.group.selected) $(st outputs.dead3.group.fastest)"
+check "  status: живые — b и c" "b,c" "$(st outputs.dead3.group.alive)"
+ip link set sw1 up
+wait_for '[ "$(tdev dead3)" = sw1 ]' 40
+check "a вернулся: группа снова на самом быстром" "sw1 a" "$(tdev dead3) $(st outputs.dead3.group.selected)"
+R tc qdisc del dev sw2p root
+R tc qdisc del dev sw3p root
+R tc qdisc del dev sw1p root
+
+# ---- 2д. замер не удался: порядок, объяснение и повтор раньше срока ----
+# Пока лежит файл rt.fail, ответчик отвечает на /rt_204 статусом 503 — замер не удаётся ни у кого.
+# Группа идёт по порядку (b, самый медленный), и status с журналом говорят почему. interval группы —
+# 90 с: без повтора раньше срока она оставалась бы на b все полторы минуты после того, как адрес
+# проверки ожил; повтор — через ~15 с.
+R tc qdisc add dev sw2p root netem delay 100ms
+R tc qdisc add dev sw1p root netem delay 5ms
+: > "$tmp/rt.fail"
+stop_daemon
+reboot_state rt
+start_daemon
+wait_for 'grep -q "группа rt: ни у одного живого члена нет замера" "$tmp/d.err"' 20
+check "замера нет ни у кого: в журнале — строка, что группа идёт по порядку (не только под -v)" "yes" \
+    "$(grep -q 'группа rt: ни у одного живого члена нет замера' "$tmp/d.err" && echo yes || echo no)"
+check "  группа по порядку (b), status — no_measure и члены без замера" "sw2 b no_measure b,a" \
+    "$(tdev rt) $(st outputs.rt.group.selected) $(st outputs.rt.group.why) $(st outputs.rt.group.latency_failed)"
+rm -f "$tmp/rt.fail"
+t0="$(date +%s)"
+wait_for '[ "$(tdev rt) $(st outputs.rt.group.selected) $(st outputs.rt.group.why)" = "sw1 a fastest" ]' 45
+t1="$(date +%s)"
+check "адрес проверки ожил: группа на самом быстром по повтору замера, раньше interval (90 с)" "sw1 a fastest yes" \
+    "$(tdev rt) $(st outputs.rt.group.selected) $(st outputs.rt.group.why) $([ $((t1 - t0)) -lt 40 ] && echo yes || echo "$((t1 - t0)) с")"
+check "  status: живых без замера нет" "-" "$(st outputs.rt.group.latency_failed)"
+check "  в журнале — замеры снова есть" "yes" \
+    "$(grep -q 'группа rt: замеры снова есть' "$tmp/d.err" && echo yes || echo no)"
+R tc qdisc del dev sw2p root
+R tc qdisc del dev sw1p root
+
 # ---- 4. idle_timeout ----
 check "idle_timeout: без трафика через группу — ни одного запроса проверки" "0" \
     "$(grep -c '^/idle_204 ' "$tmp/http.log")"
+check "  status: замер на паузе — why idle (не отказ: latency_failed нет), idle_timeout 3600" "idle - 3600" \
+    "$(st outputs.idl.group.why) $(st outputs.idl.group.latency_failed) $(st outputs.idl.group.idle_timeout)"
+check "  в журнале нет «замера нет» для группы на паузе" "0" \
+    "$(grep -c 'группа idl: ни у одного живого члена нет замера' "$tmp/d.err")"
 # Трафик — после того как сторож хотя бы раз прошёл группу (первая встреча берёт отсчёт), и
 # пачками, пока замер не появится.
 sleep 5
@@ -505,6 +619,8 @@ for i in range(5):
 done
 check "  трафик пошёл — замер сделан" "yes" \
     "$([ "$(grep -c '^/idle_204 ' "$tmp/http.log")" -ge 1 ] && echo yes || echo no)"
+wait_for '[ "$(st outputs.idl.group.why)" != idle ]' 10
+check "  и why больше не idle" "no" "$([ "$(st outputs.idl.group.why)" = idle ] && echo yes || echo no)"
 
 # ---- 3. balance ----
 who() { C python3 -c 'import socket

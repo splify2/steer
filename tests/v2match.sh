@@ -748,6 +748,23 @@ EOF
 "$BIN" spec convert --spec "$tmp/s.yaml" > "$tmp/c1.yaml" 2>&1 && "$BIN" spec convert --spec "$tmp/c1.yaml" > "$tmp/c2.yaml" 2>&1
 if cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml" && grep -q 'tolerance: 80' "$tmp/c1.yaml"; then ok; else bad "convert v2 → v2 — неподвижная точка" "$(head -n 20 "$tmp/c1.yaml")"; fi
 
+# tolerance: 0 — настоящий ноль («выигрыш любой величины значим»), а не «не задан»: convert печатает его у
+# группы, где он написан, и не придумывает допуск группе без него; напечатанное читается обратно.
+y <<'EOF'
+version: 2
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  wg1: { kind: interface, device: wg1 }
+  strict: { kind: group, pick: latency, members: [wg0, wg1], tolerance: 0 }
+  plain: { kind: group, pick: latency, members: [wg0, wg1] }
+rules:
+  - { to: all, out: strict }
+EOF
+"$BIN" spec convert --spec "$tmp/s.yaml" > "$tmp/c3.yaml" 2>&1 && "$BIN" spec convert --spec "$tmp/c3.yaml" > "$tmp/c4.yaml" 2>&1
+if cmp -s "$tmp/c3.yaml" "$tmp/c4.yaml" && grep 'strict:' "$tmp/c3.yaml" | grep -q 'tolerance: 0' &&
+   ! grep 'plain:' "$tmp/c3.yaml" | grep -q tolerance; then ok; else
+    bad "convert: tolerance: 0 печатается, у группы без допуска — нет" "$(head -n 20 "$tmp/c3.yaml")"; fi
+
 # Ключ ipv6 у выхода (шаг 8 выпуска 1.10): режимы, prefix и отказы с местом.
 y <<'EOF'
 version: 2

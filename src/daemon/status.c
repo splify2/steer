@@ -26,6 +26,7 @@
 #include "srs.h"
 #include "ctl.h"
 #include "daemon.h"
+#include "fogroup.h"
 #include "groups.h"
 #include "generate.h"
 #include "grpurl.h"
@@ -113,6 +114,14 @@ int status_fast(FILE *out) {
  *   alive    — живые члены по последнему проходу; у balance это и есть состав карты раздачи;
  *   select   — manual: выбор человека (команда select) или default, пока выбора не было;
  *   url, latency — latency: адрес проверки и замеры urltest по членам, мс (только измеренные);
+ *   latency_failed — latency: живые члены без замера (проверочный адрес через них не ответил) —
+ *              поля нет, когда таких нет;
+ *   tolerance, interval, idle_timeout — latency: допуск (мс), интервал замера и пауза замера без
+ *              трафика (с; 0 — мерить всегда), с умолчаниями платформы;
+ *   fastest, why — latency: самый быстрый из живых измеренных членов и почему группа сейчас на
+ *              выбранном (group_latency_why: fastest, in_tolerance, no_measure, unmeasured,
+ *              pending; idle — замер на паузе без трафика); fastest нет, пока никто не измерен,
+ *              why — пока группа никого не выбрала. У группы с одним членом ни того, ни другого;
  *   latency4, latency6 — у группы, меренной по обоим семействам: замеры по IPv4 и IPv6 порознь
  *              (latency тогда — худший из двух у каждого члена); у остальных полей нет;
  *   weights  — balance: веса членов по порядку. */
@@ -139,6 +148,31 @@ static void group_emit(FILE *out, const struct spec *sp, const struct output *o)
             if (g->lat_ms[k] >= 0)
                 fprintf(out, "%s\"%s\":%d", n++ ? "," : "", spec_out(sp, g->members[k])->name, g->lat_ms[k]);
         fprintf(out, "}");
+        /* Живые члены без замера и причина выбора. Сторож выбирает по тем же числам тем же
+         * правилом (group_latency_pick), а why называет, что из этого вышло: «первый живой», о
+         * котором пишут «самый быстрый не работает», — это либо замера нет вовсе (no_measure), либо
+         * выбранный не хуже самого быстрого на допуск (in_tolerance). */
+        /* У группы с одним членом выбирать не из чего: замера нет и не будет (его ведёт расписание
+         * групп от двух членов, folat.c), и «замера нет» тут не неудача — об этом молчим. */
+        int multi = g->members_n > 1;
+        /* Замер на паузе без трафика (idle_timeout): замера нет не из-за неудачи, и называть членов
+         * «без замера» значило бы выдать простой за отказ. */
+        int idle = fog_idle_limit(o) > 0 && fog_idle_now(o->name);
+        n = 0;
+        for (size_t k = 0; multi && !idle && k < g->members_n; k++)
+            if (g->alive[k] && g->lat_ms[k] < 0)
+                fprintf(out, "%s\"%s\"", n++ ? "," : ",\"latency_failed\":[",
+                        spec_out(sp, g->members[k])->name);
+        if (n) fputc(']', out);
+        int tol = group_tolerance_ms(g), fastest = -1;
+        fprintf(out, ",\"tolerance\":%d,\"interval\":%d,\"idle_timeout\":%d", tol, group_interval_s(g),
+                fog_idle_limit(o));
+        int why = multi ? group_latency_why(g->lat_ms, g->alive, g->members_n, g->cur, tol, &fastest)
+                        : GW_NONE;
+        if (why == GW_NOMEASURE && idle) why = GW_IDLE;
+        if (fastest >= 0)
+            fprintf(out, ",\"fastest\":\"%s\"", spec_out(sp, g->members[fastest])->name);
+        if (group_why_name(why)) fprintf(out, ",\"why\":\"%s\"", group_why_name(why));
         /* Группа, меренная по обоим семействам (все живые члены несут IPv6, src/daemon/folat.c):
          * замеры по IPv4 и IPv6 порознь; latency тогда — худший из двух, по нему и выбор. */
         int fam = 0;

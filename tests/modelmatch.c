@@ -181,6 +181,10 @@ static void t_groups(void) {
     check("… допуск", 20, f ? f->lat_tolerance_ms : -1);
     check("… интервал", 60, f ? f->lat_interval_s : -1);
     check("… членов три", 3, f ? (long)f->members_n : -1);
+    check("допуск не задан — «не задан» (-1), умолчание 50 даёт group_tolerance_ms", 1,
+          g && g->lat_tolerance_ms == -1 && group_tolerance_ms(g) == GROUP_TOL_DEFAULT_MS &&
+          f && group_tolerance_ms(f) == 20);
+    check("интервал не задан — умолчание 180", GROUP_INT_DEFAULT_S, g ? group_interval_s(g) : -1);
 
     struct output *odd = &g_spec.out[4];
     check("device и другое devices — группа", 1, out_group(odd) != NULL);
@@ -189,6 +193,15 @@ static void t_groups(void) {
     check_str("… член — из devices", "wg7", mn ? out_member(&g_spec, odd, 0)->device : "");
 
     check("прямому выходу выбирать не из чего", 0, (long)out_members_n(&g_spec, &g_spec.out[0]));
+
+    /* Ноль допуска законен («переключаться на любое улучшение», model/v1.c) и остаётся нулём: прежде
+     * он читался как «не задан» и подменялся умолчанием 50 — group_tolerance_ms. */
+    check("v1: latency_tolerance_ms 0 разобран", 0, load(
+        "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
+        "\"outputs\":{\"fast\":{\"kind\":\"interface\",\"devices\":[\"wg3\",\"wg4\"],"
+        "\"prefer\":\"latency\",\"latency_tolerance_ms\":0}},\"channels\":[]}"));
+    const struct group_cfg *z = g_spec.out_n ? out_group(&g_spec.out[0]) : NULL;
+    check("… нулевой допуск остаётся нулём", 0, z ? group_tolerance_ms(z) : -1);
 
     check("via → over", 0, load(
         "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
@@ -325,7 +338,8 @@ static void t_groups_v2(void) {
         "  top: { kind: group, pick: order, members: [res, b] }\n"
         "  man: { kind: group, pick: manual, members: [a, top], default: top }\n"
         "  bal: { kind: group, pick: balance, members: [res, b], weights: [3, 1] }\n"
-        "  lat: { kind: group, pick: latency, members: [a, b], url: \"http://example.net:8080/x\", idle_timeout: 90 }\n"));
+        "  lat: { kind: group, pick: latency, members: [a, b], url: \"http://example.net:8080/x\", idle_timeout: 90 }\n"
+        "  strict: { kind: group, pick: latency, members: [a, b], tolerance: 0 }\n"));
     if (g_msg[0]) printf("     %s\n", g_msg);
     const struct output *top = out_by_name(&g_spec, "top"), *man = out_by_name(&g_spec, "man");
     const struct output *bal = out_by_name(&g_spec, "bal"), *lat = out_by_name(&g_spec, "lat");
@@ -336,6 +350,10 @@ static void t_groups_v2(void) {
     check("balance: веса по членам", 31, bal ? out_group(bal)->weight[0] * 10 + out_group(bal)->weight[1] : 0);
     check_str("latency: url", "http://example.net:8080/x", lat ? out_group(lat)->url : "");
     check("latency: idle_timeout", 90, lat ? out_group(lat)->idle_timeout_s : -1);
+    const struct output *strict = out_by_name(&g_spec, "strict");
+    check("latency: допуск не задан — умолчание", GROUP_TOL_DEFAULT_MS, lat ? group_tolerance_ms(out_group(lat)) : -1);
+    check("latency: tolerance: 0 — настоящий ноль, а не умолчание", 0,
+          strict ? group_tolerance_ms(out_group(strict)) : -1);
     check("без idle_timeout — умолчание платформы (-1)", -1, top ? out_group(top)->idle_timeout_s : 0);
     check("состояние сторожа до прохода — «нет»", 1,
           man && out_group(man)->cur == -1 && out_group(man)->sel == -1 && out_group(man)->lat_ms[0] == -1);
@@ -502,6 +520,37 @@ static void t_pick(void) {
     int d4[] = { -1, 60 }, d6[] = { 30, 70 };
     group_latency_score(d4, d6, 2, sc);
     check("IPv4 у члена не ответил — член выбыл и по обоим", 1, sc[0] == -1 && sc[1] == 70);
+
+    /* ПОЧЕМУ ГРУППА НА ЭТОМ ЧЛЕНЕ (status, group.why): «первый живой», о котором говорят
+     * «самый быстрый не работает», — это либо допуск (in_tolerance), либо замера нет (no_measure). */
+    int fa = -2;
+    unsigned char al2[] = { 1, 1 }, al3[] = { 1, 0, 1 };
+    int w1[] = { 200, 20 };
+    check("why: выбран самый быстрый", GW_FASTEST, group_latency_why(w1, al2, 2, 1, 50, &fa));
+    check("… он и назван", 1, fa);
+    check("why: выбран не самый быстрый, но внутри допуска", GW_TOLERANCE,
+          group_latency_why(ms2, al2, 2, 0, 50, &fa));
+    check("… самый быстрый назван, хоть выбран не он", 1, fa);
+    check("why: хуже самого быстрого больше допуска — ждёт прохода", GW_PENDING,
+          group_latency_why(w1, al2, 2, 0, 50, &fa));
+    check("why: допуск 0 — любая разница значима", GW_PENDING, group_latency_why(ms2, al2, 2, 0, 0, &fa));
+    check("why: у равных по замеру — самый быстрый", GW_FASTEST,
+          group_latency_why(ms2, al2, 2, 1, 0, &fa));
+    check("why: замера нет ни у кого — по порядку", GW_NOMEASURE, group_latency_why(ms3, al2, 2, 0, 50, &fa));
+    check("… самого быстрого нет", -1, fa);
+    int w4[] = { 30, -1 };
+    check("why: выбранный жив, но не измерен, другие измерены", GW_UNMEASURED,
+          group_latency_why(w4, al2, 2, 1, 50, &fa));
+    int w5[] = { 200, 5, 20 };
+    check("why: упавший самый быстрый в счёт не идёт", GW_FASTEST, group_latency_why(w5, al3, 3, 2, 50, &fa));
+    check("… самый быстрый — из живых", 2, fa);
+    check("why: группа никого не выбрала", GW_NONE, group_latency_why(w1, al2, 2, -1, 50, &fa));
+    check_str("имя: fastest", "fastest", group_why_name(GW_FASTEST));
+    check_str("имя: in_tolerance", "in_tolerance", group_why_name(GW_TOLERANCE));
+    check_str("имя: no_measure", "no_measure", group_why_name(GW_NOMEASURE));
+    check_str("имя: pending", "pending", group_why_name(GW_PENDING));
+    check_str("имя: unmeasured", "unmeasured", group_why_name(GW_UNMEASURED));
+    check("имени у GW_NONE нет", 1, group_why_name(GW_NONE) == NULL);
 
     int ns = -1;
     check("гистерезис: держим живое текущее", 1, group_hysteresis(1, 0, 1, 0, 3, &ns));

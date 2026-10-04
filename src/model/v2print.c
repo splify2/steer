@@ -267,7 +267,7 @@ static void output_flow(FILE *f, const struct output *o, const struct onames *on
         fputc(']', f);
         if (g->pick == PICK_MANUAL && g->def >= 0 && (size_t)g->def < g->members_n)
             fs(&w, "default", oname_of(oname, g->members[g->def]));
-        if (g->pick == PICK_LATENCY && g->lat_tolerance_ms) {
+        if (g->pick == PICK_LATENCY && g->lat_tolerance_ms >= 0) {   /* ноль — заданный допуск, а не «нет» */
             fk(&w, "tolerance");
             fprintf(f, "%d", g->lat_tolerance_ms);
         }

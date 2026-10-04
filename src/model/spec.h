@@ -339,8 +339,12 @@ struct group_cfg {
     size_t members_n;
     /* manual: номер члена по умолчанию — выбор до первой команды select; -1 — первый. */
     int def;
-    /* latency: допуск и интервал замера; 0 — умолчание сторожа (LAT_TOLERANCE_MS,
-     * LAT_INTERVAL_S в failover.c). Числа взяты у sing-box: интервал 3 минуты, допуск 50 мс. */
+    /* latency: допуск и интервал замера. Допуск: -1 — не задан (умолчание GROUP_TOL_DEFAULT_MS),
+     * 0..60000 — задан человеком, и ноль здесь настоящее значение — «без допуска, побеждает самый
+     * быстрый» (прежде 0 читался как «не задан», и человек, поставивший 0, получал 50, —
+     * group_tolerance_ms). Интервал: 0 — не задан (GROUP_INT_DEFAULT_S), у заданного нижний
+     * предел 5, так что ноль занят однозначно (group_interval_s). Числа умолчаний взяты у
+     * sing-box: интервал 3 минуты, допуск 50 мс. */
     int lat_tolerance_ms;
     int lat_interval_s;
     /* latency: адрес проверки urltest (пусто — GROUP_URL_DEFAULT, src/kinds/grpurl.h) и сколько

@@ -1480,8 +1480,6 @@ void failover_hyst_reset_for_test(void) { g_hyst_cache = -2; }
  * семействам, строка несёт ещё замеры IPv4 и IPv6, а читают запись и проход, и расписание замеров
  * демона, и status. Запись — заменой целиком (у файлов — временный файл и rename, см. files_put):
  * обрыв на середине оставил бы половину строк. */
-#define LAT_TOLERANCE_MS FOLAT_TOLERANCE_MS
-#define LAT_INTERVAL_S   FOLAT_INTERVAL_S
 
 static long mono_now(void) {
     struct timespec t;
@@ -1863,6 +1861,9 @@ struct fo_run {
      * живых членов без замера вовсе. */
     int lat_extern;
     int best, pick;
+    /* Сколько выбранных замером оказались неживыми и были отброшены (S_LAT_PICK_R), и стоит ли
+     * замер группы на паузе без трафика (idle_timeout) — тогда «замера нет» не неудача. */
+    int lat_dropped, lat_idle;
     /* Группа v2 (именованные члены, group_named): здоровье члена — приговор его прохода (alive),
      * своих проб и оживления у группы нет (fogroup.c, шапка). pk — номер выбранного члена, galive —
      * живые члены; по выходам — для записи groups в конце прохода. */
@@ -2590,6 +2591,7 @@ static void fo_step(struct fo_run *r) {
             /* Для события switched: чем выбор объяснить. Устройства 0..first_h пробой уже
              * спрошены, поэтому «текущее мертво» при cur < first_h известно без новой пробы. */
             r->by_latency = 0;
+            r->lat_dropped = r->lat_idle = 0;
             r->cur_dead = r->cur >= 0 && r->first_h >= 0 && r->cur < r->first_h;
             /* ---- ВЫБОР ПО ЗАМЕРУ, если выход этого просит ----------------------------
              *
@@ -2635,8 +2637,8 @@ static void fo_step(struct fo_run *r) {
                 continue;
             }
             if (g && g->pick == PICK_LATENCY && r->first_h >= 0 && r->cand_n > 1) {
-                r->tol = g->lat_tolerance_ms > 0 ? g->lat_tolerance_ms : LAT_TOLERANCE_MS;
-                r->iv  = g->lat_interval_s  > 0 ? g->lat_interval_s  : LAT_INTERVAL_S;
+                r->tol = group_tolerance_ms(g);
+                r->iv  = group_interval_s(g);
                 int stale = 0;
                 for (size_t k = 0; k < r->cand_n; k++) {
                     struct folat_rec rc;
@@ -2647,12 +2649,20 @@ static void fo_step(struct fo_run *r) {
                         /* У демона срок замера — его таймер (folat.c), а не проход. */
                         if (!r->lat_extern && (age > r->iv || age < 0)) stale = 1;
                     } else if (!r->named || r->galive[k]) stale = 1;
+                    /* Замер члена, которого сейчас нет в живых, — от тех времён, когда он жил, и
+                     * выбирать по нему нельзя: самый быстрый, но упавший, оставлял бы группу «на
+                     * первом живом по порядку» (S_HYST) вместо самого быстрого из ЖИВЫХ — до
+                     * следующего круга замера, а это interval. Подхват (fog_pick_known) так и
+                     * решает, и проход обязан решать так же. У пула v1 живость члена здесь не
+                     * известна — там то же делает S_LAT_PICK_R пробой выбранного. */
+                    if (r->named && !r->galive[k]) r->ms[k] = -1;
                 }
                 r->v6 = r->named && folat_want_v6(sp, o, r->galive);
                 /* Без трафика через группу замеров нет (idle_timeout): выбор — по тому, что уже
                  * измерено, а новый замер — когда трафик пойдёт. */
                 if (stale && fog_idle(sp, o, fog_idle_limit(o), r->traffic, r->traffic_arg)) {
                     stale = 0;
+                    r->lat_idle = 1;
                     if (r->verbose)
                         fprintf(stderr, LOG_I "%s: трафика через группу нет — замер отложен\n",
                                 o->name);
@@ -2711,15 +2721,29 @@ static void fo_step(struct fo_run *r) {
             int best = -1;
             int pick = group_latency_pick(r->ms, r->cand_n, r->tol, &best);
             if (best < 0) {
-                /* Ни один замер не удался — режим молча становится прежним. Сказать надо:
-                 * иначе человек думает, что выбор идёт по задержке, а он идёт по списку.
-                 * Так бывает у выхода kind=xsteer, который не меряется никогда. */
-                if (r->verbose)
-                    fprintf(stderr, LOG_W "%s: задержку измерить не удалось ни у одного "
-                                    "устройства — выбираю по порядку\n", o->name);
+                /* Ни один замер не удался — режим становится прежним, «первый живой». Сказать
+                 * надо, и не только под -v: иначе человек думает, что выбор идёт по задержке, а он
+                 * идёт по списку, и «самый быстрый» выглядит как не работающий. Строка — на
+                 * переходе (fog_lat_note), а не на каждом проходе; причина «замера нет» видна и
+                 * в status (group.why). Так бывает у выхода kind=xsteer, который не меряется
+                 * никогда, и когда проверочный адрес не отвечает через членов (DNS, порт, часы
+                 * у HTTPS) — повтор замера демон делает раньше срока (folat.h, FOLAT_RETRY_S).
+                 * Если замеры были, но их члены оказались неживыми (r->lat_dropped), это не
+                 * «замера нет»: решает первый живой, и говорить о замере нечего. */
+                if (!r->lat_dropped && !r->lat_idle) {
+                    if (fog_lat_note(o->name, 1))
+                        fprintf(stderr, LOG_W "группа %s: ни у одного живого члена нет замера "
+                                        "задержки — выбор по порядку (первый живой), пока замер не "
+                                        "удастся\n", o->name);
+                    else if (r->verbose)
+                        fprintf(stderr, LOG_W "%s: задержку измерить не удалось ни у одного "
+                                        "устройства — выбираю по порядку\n", o->name);
+                }
                 r->s = S_HYST;
                 continue;
             }
+            if (!r->lat_dropped && !r->lat_idle && fog_lat_note(o->name, 0))
+                fprintf(stderr, LOG_I "группа %s: замеры снова есть — выбор по задержке\n", o->name);
             r->best = best;
             r->pick = pick;
             if (pick < 0) { r->s = S_HYST; continue; }
@@ -2745,10 +2769,25 @@ static void fo_step(struct fo_run *r) {
             continue;
 
         case S_LAT_PICK_R:
-            if (r->res) {
+            if (!r->res) {
+                /* Выбранный замером не отвечает на пробу здоровья — его замер от тех времён, когда
+                 * он жил, или он умер за время круга. Берётся следующий по замеру, а не «первый
+                 * живой по порядку» (S_HYST): тот мог быть заметно медленнее, и группа сидела бы
+                 * на нём до следующего круга замера. Каждый отброшенный выходит из выбора, так что
+                 * круг конечен; не осталось никого — S_LAT_C отдаёт выбор порядку. */
+                r->ms[r->pick] = -1;
+                r->lat_dropped++;
+                r->s = S_LAT_C;
+                continue;
+            }
+            {
                 r->chosen = r->cand[r->pick]->device;
                 r->pk = r->pick;
-                r->by_latency = 1;
+                /* Текущий член упал — причина смены «упал», а не «по замеру»: замер лишь выбрал
+                 * из оставшихся. */
+                int dead = r->cur_dead || (r->named && r->cur >= 0 && !r->galive[r->cur]);
+                r->by_latency = !dead;
+                if (dead) r->cur_dead = 1;
                 if (r->verbose)
                     fprintf(stderr, LOG_I "%s: по замеру выбран %s (%d мс, лучший %d, "
                                     "допуск %d)\n",

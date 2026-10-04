@@ -226,12 +226,39 @@ int fog_pick_known(const struct spec *sp, struct fo_store *st, const struct outp
             if (alive[k] && folat_rec_get(st, go->name, fog_lat_key(spec_out(sp, g->members[k])), &rc))
                 ms[k] = rc.ms;
         }
-        int tol = g->lat_tolerance_ms > 0 ? g->lat_tolerance_ms : FOLAT_TOLERANCE_MS;
-        int p = group_latency_pick(ms, n, tol, &best);
+        int p = group_latency_pick(ms, n, group_tolerance_ms(g), &best);
         free(ms);
         if (p >= 0) return p;
     }
     return first;
+}
+
+/* ---- состояние «замера нет» (журнал) -------------------------------------------------------- */
+
+struct lat_note {
+    char name[32];
+    int none;
+};
+static struct lat_note *g_latn;
+static size_t g_latn_n, g_latn_cap;
+
+int fog_lat_note(const char *group, int none) {
+    for (size_t i = 0; i < g_latn_n; i++)
+        if (!strcmp(g_latn[i].name, group)) {
+            int changed = g_latn[i].none != none;
+            g_latn[i].none = none;
+            return changed;
+        }
+    if (g_latn_n == g_latn_cap) {
+        size_t nc = g_latn_cap ? g_latn_cap * 2 : 8;
+        struct lat_note *nn = realloc(g_latn, nc * sizeof(*nn));
+        if (!nn) return none;
+        g_latn = nn;
+        g_latn_cap = nc;
+    }
+    snprintf(g_latn[g_latn_n].name, sizeof(g_latn[g_latn_n].name), "%s", group);
+    g_latn[g_latn_n++].none = none;
+    return none;
 }
 
 /* ---- простой группы (idle_timeout) --------------------------------------------------------- */
@@ -250,6 +277,7 @@ struct idle_rec {
     char name[32];
     unsigned long long pkts;
     long changed;       /* CLOCK_MONOTONIC, с: когда счётчик последний раз рос */
+    int limit;          /* с каким пределом спрашивали в последний раз (fog_idle_now) */
     int seen;
 };
 /* Записи простоя групп растут по числу групп (раньше — 16 мест, и 17-я группа считалась
@@ -283,16 +311,25 @@ int fog_idle(const struct spec *sp, const struct output *go, int limit, fo_traff
         memset(r, 0, sizeof(*r));
         snprintf(r->name, sizeof(r->name), "%s", go->name);
         r->seen = 1;
+        r->limit = limit;
         r->pkts = pk;
         /* Первая встреча: отсчёт взят, трафика ещё не видели — замера нет, пока он не пойдёт. */
         r->changed = now - limit - 1;
         return 1;
     }
+    r->limit = limit;
     if (pk != r->pkts) {
         r->pkts = pk;
         r->changed = now;
     }
     return now - r->changed > limit;
+}
+
+int fog_idle_now(const char *group) {
+    for (size_t i = 0; i < g_idle_n; i++)
+        if (g_idle[i].seen && !strcmp(g_idle[i].name, group))
+            return g_idle[i].limit > 0 && mono_s() - g_idle[i].changed > g_idle[i].limit;
+    return 0;
 }
 
 /* ---- balance: карта в ядре --------------------------------------------------------------- */

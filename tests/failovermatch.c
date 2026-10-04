@@ -318,6 +318,20 @@ static void out_pool(struct output *o, const char *d0, const char *d1) {
     }
 }
 
+/* То же из трёх устройств — стенду выбора по замеру, где у самого быстрого должен быть «второй по
+ * скорости» запас. */
+static void out_pool3(struct output *o, const char *d0, const char *d1, const char *d2) {
+    char devs[3][32];
+    snprintf(devs[0], sizeof(devs[0]), "%s", d0);
+    snprintf(devs[1], sizeof(devs[1]), "%s", d1);
+    snprintf(devs[2], sizeof(devs[2]), "%s", d2);
+    struct err e = {0};
+    if (group_of_devices(&g_spec, o, (const char (*)[32])devs, 3, &e) != 0) {
+        fprintf(stderr, "out_pool3: %s\n", e.msg);
+        exit(1);
+    }
+}
+
 /* Настройка группы выхода o — для правки pick и допуска в стенде. */
 static struct group_cfg *grp(struct output *o) { return &o->grp; }
 
@@ -374,20 +388,22 @@ static void out_set_pool(const char *dev) {
  * каждого задаётся стендом по тику через шов g_health_probe, поэтому ни /sys, ни сокеты не
  * нужны. Это ровно форма, на которой мелькал живой роутер: узел-предпочтение подхватывался
  * пробой на тик и снова падал. */
-static int g_h_first = 1, g_h_second = 1;
+static int g_h_first = 1, g_h_second = 1, g_h_third = 1;
 static int hyst_health(const struct spec *sp, const struct output *o, const char *dev) {
     (void)sp; (void)o;
     if (!strcmp(dev, "vpref"))  return g_h_first;
     if (!strcmp(dev, "vspare")) return g_h_second;
+    if (!strcmp(dev, "vthird")) return g_h_third;
     return 0;
 }
 /* Задержки кандидатов задаёт стенд — тем же приёмом, что и здоровье. Сокетов не надо:
  * device_latency в бою мерит соединением TCP через устройство, а здесь шов отдаёт число. */
-static int g_ms_first = -1, g_ms_second = -1;
+static int g_ms_first = -1, g_ms_second = -1, g_ms_third = -1;
 static int lat_probe(const struct spec *sp, const struct output *o, const char *dev) {
     (void)sp; (void)o;
     if (!strcmp(dev, "vpref"))  return g_ms_first;
     if (!strcmp(dev, "vspare")) return g_ms_second;
+    if (!strcmp(dev, "vthird")) return g_ms_third;
     return -1;
 }
 /* Файл замеров между проверками убираем: он живёт своим интервалом (умолчание 180 с), и
@@ -1227,7 +1243,7 @@ int main(void) {
         cmd_failover(NULL, 0);
         active_dev(dev, sizeof(dev));
         check("замер: свой допуск делает ту же разницу значимой", !strcmp(dev, "vspare"), 1);
-        grp(&g_spec.out[0])->lat_tolerance_ms = 0;
+        grp(&g_spec.out[0])->lat_tolerance_ms = -1;     /* не задан — умолчание 50 */
 
         /* И ОБРАТНАЯ СТОРОНА ДОПУСКА: с текущего не уходим ради выигрыша внутри него.
          *
@@ -1275,6 +1291,66 @@ int main(void) {
         cmd_failover(NULL, 0);
         active_dev(dev, sizeof(dev));
         check("замер: без замеров выбор по порядку", !strcmp(dev, "vpref"), 1);
+
+        /* ДОПУСК 0 — НАСТОЯЩИЙ НОЛЬ. Раньше 0 читался как «не задан» и подменялся умолчанием 50:
+         * человек, поставивший 0, чтобы выбирался строго самый быстрый, получал первого, пока
+         * разница меньше 50 мс («самый быстрый» не работает — один первый живой). 40 против 20 —
+         * в умолчании «не хуже», при допуске 0 — значимо. */
+        g_ms_first = 40; g_ms_second = 20;
+        grp(&g_spec.out[0])->lat_tolerance_ms = 0;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: допуск 0 — самый быстрый строго, а не умолчание 50", !strcmp(dev, "vspare"), 1);
+        /* И уходим с текущего на любое улучшение: допуск 0 не держит его ради «почти равных». */
+        g_ms_first = 19; g_ms_second = 20;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: допуск 0 — уходим с текущего и на выигрыш в 1 мс", !strcmp(dev, "vpref"), 1);
+        grp(&g_spec.out[0])->lat_tolerance_ms = -1;
+        g_ms_first = 40; g_ms_second = 20;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: допуск не задан — умолчание 50 держит текущего", !strcmp(dev, "vpref"), 1);
+
+        /* САМЫЙ БЫСТРЫЙ УПАЛ — берётся следующий по замеру, а не первый живой по порядку. Запись
+         * замеров ещё свежая и называет упавшего лучшим; прежде выбор тут же упирался в его
+         * здоровье и сваливался на первого живого (самого медленного из троих) до следующего
+         * круга замера — то есть до interval. */
+        {
+            outs_reset();
+            g_spec.out_n = 1;
+            snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "vl");
+            g_spec.out[0].kind = OUT_INTERFACE;
+            g_spec.out[0].on_fail = FAIL_DROP;
+            g_spec.out[0].mark = 0x100000;
+            g_spec.out[0].table = 300;
+            out_pool3(&g_spec.out[0], "vpref", "vspare", "vthird");
+            grp(&g_spec.out[0])->pick = PICK_LATENCY;
+            g_h_first = g_h_second = g_h_third = 1;
+            g_ms_first = 300; g_ms_second = 5; g_ms_third = 100;
+            unlink_lat();
+            cmd_failover(NULL, 0);
+            active_dev(dev, sizeof(dev));
+            check("три устройства: самый быстрый выбран", !strcmp(dev, "vspare"), 1);
+            g_h_second = 0;                         /* он упал; замеры в записи прежние */
+            cmd_failover(NULL, 0);
+            active_dev(dev, sizeof(dev));
+            check("три устройства: самый быстрый упал — следующий по замеру, не первый по порядку",
+                  !strcmp(dev, "vthird"), 1);
+            g_h_third = 0;                          /* и следующий упал — остаётся единственный живой */
+            cmd_failover(NULL, 0);
+            active_dev(dev, sizeof(dev));
+            check("три устройства: быстрые упали — остаётся единственный живой",
+                  !strcmp(dev, "vpref"), 1);
+            g_h_first = g_h_second = g_h_third = 1;
+            g_ms_third = -1;
+            outs_reset();
+            out_set_two();
+            grp(&g_spec.out[0])->pick = PICK_LATENCY;
+        }
 
         grp(&g_spec.out[0])->pick = PICK_ORDER;
         g_ms_first = 500; g_ms_second = 5;

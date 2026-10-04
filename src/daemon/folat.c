@@ -220,6 +220,11 @@ struct fl_grp {
     char name[32];
     struct folat *f;
     struct loop_timer *tm;
+    /* Подряд неудавшихся кругов замера (у живого члена нет ответа проверочного узла) и когда
+     * таймер сработает (loop_now_ms): по первому — повтор раньше срока (fl_delay_ms), по второму
+     * folat_sync не отодвигает повтор, который и так ближе. */
+    int fails;
+    long due;
     /* Идущий замер: ключи членов на момент начала (сверка в конце), кого мерить, итоги. */
     int running;
     size_t n, k;
@@ -278,13 +283,27 @@ static const struct output *fl_group(const struct spec *sp, const char *name) {
 }
 
 static long fl_interval_ms(const struct output *go) {
-    const struct group_cfg *g = out_group(go);
-    long s = g && g->lat_interval_s > 0 ? g->lat_interval_s : FOLAT_INTERVAL_S;
-    return s * 1000L;
+    return (long)group_interval_s(out_group(go)) * 1000L;
+}
+
+/* Через сколько мс следующий круг: после удачного — interval, после неудавшегося — повтор раньше
+ * (FOLAT_RETRY_S, дальше вдвое реже на каждый неудавшийся круг подряд), но не позже самого
+ * interval: короче срок не станет у того, у кого он и так короткий. */
+static long fl_delay_ms(const struct fl_grp *g, const struct output *go) {
+    long iv = go ? fl_interval_ms(go) : FOLAT_INTERVAL_S * 1000L;
+    if (g->fails <= 0) return iv;
+    long r = FOLAT_RETRY_S * 1000L;
+    for (int i = 1; i < g->fails && r < iv; i++) r *= 2;
+    return r < iv ? r : iv;
+}
+
+static void fl_rearm_ms(struct fl_grp *g, long ms) {
+    g->due = loop_now_ms() + ms;
+    loop_timer_set(g->tm, ms);
 }
 
 static void fl_rearm(struct fl_grp *g, const struct output *go) {
-    loop_timer_set(g->tm, go ? fl_interval_ms(go) : FOLAT_INTERVAL_S * 1000L);
+    fl_rearm_ms(g, fl_delay_ms(g, go));
 }
 
 static void fl_abort(struct fl_grp *g) {
@@ -316,6 +335,13 @@ static void fl_finish(struct fl_grp *g) {
     if (!score || !rec) { free(score); free(rec); free(cand); fl_rearm(g, go); return; }
     folat_score(g->ms4, g->ms6, g->n, g->v6, score);
     long now = mono_s();
+    /* Неудавшийся круг — у живого члена не ответил проверочный узел по IPv4 (у xsteer мерить нечем
+     * вовсе, и такой круг повторяется с нарастающим сроком до самого interval — как обычный). У
+     * пула v1 кандидаты мерятся все, живы они или нет, и мёртвый запас не повод повторять круг. */
+    int bad = 0;
+    for (size_t k = 0; group_named(gc) && k < g->n; k++)
+        if (g->todo[k] && g->ms4[k] < 0) bad++;
+    g->fails = bad ? (g->fails < 30 ? g->fails + 1 : g->fails) : 0;
     for (size_t k = 0; k < g->n; k++) {
         int mine = g->todo[k];
         rec[k].ms = mine ? score[k] : -2;
@@ -339,7 +365,7 @@ static void fl_finish(struct fl_grp *g) {
                 if (!strcmp(cand[k]->device, dev)) cur = (int)k;
         }
     }
-    int tol = gc->lat_tolerance_ms > 0 ? gc->lat_tolerance_ms : FOLAT_TOLERANCE_MS;
+    int tol = group_tolerance_ms(gc);
     int best = -1;
     int pick = group_latency_pick(score, g->n, tol, &best);
     if (cur >= 0 && pick >= 0 && pick != cur &&
@@ -415,7 +441,7 @@ static void fl_timer(struct loop *l, struct loop_timer *t, void *arg) {
     const struct output *go = fl_group(sp, g->name);
     if (!go) return;                          /* ушла — folat_sync снимет слот */
     /* Без трафика через группу замеров нет (idle_timeout) — таймер идёт дальше. */
-    if (fog_idle(sp, go, fog_idle_limit(go), f->c.traffic, f->c.arg)) { fl_rearm(g, go); return; }
+    if (fog_idle(sp, go, fog_idle_limit(go), f->c.traffic, f->c.arg)) { fl_rearm_ms(g, fl_interval_ms(go)); return; }
     size_t cn = 0;
     const struct output **cand = fl_cands(sp, go, &cn);
     if (!cand || fl_alloc(g, cn) != 0) { free(cand); fl_rearm(g, go); return; }
@@ -468,6 +494,28 @@ static struct fl_grp *fl_slot(struct folat *f) {
     return g;
 }
 
+/* У живого члена группы (по записи groups последнего прохода) нет удачного замера: записи нет или
+ * в ней «не ответил». Только у группы v2: у пула v1 живость членов в записи не хранится, и мёртвый
+ * кандидат давал бы «нет замера» всегда. И только у группы, что мерится всегда: с паузой замера без
+ * трафика (idle_timeout, умолчание телефона) замера нет не из-за неудачи, а потому что трафика нет, и
+ * будить ради повтора незачем. */
+static int fl_unmeasured(struct folat *f, const struct spec *sp, const struct output *go) {
+    size_t n = out_members_n(sp, go);
+    if (!n || !group_named(out_group(go)) || fog_idle_limit(go) > 0) return 0;
+    unsigned char *al = calloc(n, 1);
+    if (!al) return 0;
+    int bad = 0;
+    if (fog_groups_alive(f->c.st, sp, go, al))
+        for (size_t k = 0; k < n && !bad; k++) {
+            struct folat_rec rc;
+            if (al[k] && (!folat_rec_get(f->c.st, go->name, fog_lat_key(out_member(sp, go, k)), &rc) ||
+                          rc.ms < 0))
+                bad = 1;
+        }
+    free(al);
+    return bad;
+}
+
 void folat_sync(struct folat *f) {
     if (!f) return;
     const struct spec *sp = f->c.spec(f->c.arg);
@@ -495,6 +543,14 @@ void folat_sync(struct folat *f) {
             for (size_t s = 0; s < f->g_n; s++) if (f->g[s] == slot) gi = s;
         } else if (!g->running && !loop_timer_armed(g->tm)) {
             fl_rearm(g, go);
+        }
+        /* Замер проходом (первый после старта, член ожил) мог не удаться у живого члена — и тогда
+         * повтор раньше срока: до него группа шла бы «по порядку». Уже идущий повтор (fails) и
+         * срок, что и так ближе, не трогаются. */
+        if (!g->running && !g->fails && fl_unmeasured(f, sp, go)) {
+            g->fails = 1;
+            long ms = fl_delay_ms(g, go);
+            if (g->due > loop_now_ms() + ms) fl_rearm_ms(g, ms);
         }
         if (gi < was_n) seen[gi] = 1;
     }

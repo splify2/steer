@@ -269,7 +269,7 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
         struct out_keys k = {0};
         /* Второй оси сторожа в модели у выхода нет — она у группы (pick: latency): здесь только
          * запоминаем написанное, а в группу оно ляжет, если выход окажется пулом. */
-        int prefer_latency = 0, lat_tolerance_ms = 0, lat_interval_s = 0;
+        int prefer_latency = 0, lat_tolerance_ms = -1, lat_interval_s = 0;   /* -1 — допуск не задан */
         if (js_str(j, o.name, sizeof(o.name), e) != 0)
             return err_prop(e, "outputs: expected a name", NULL);
         /* Состав имени — см. name_ok(). Оно уходит в командную строку через diag и в имя

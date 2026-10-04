@@ -77,6 +77,7 @@ const struct output *out_member(const struct spec *sp, const struct output *o, s
 void group_cfg_init(struct group_cfg *g) {
     memset(g, 0, sizeof(*g));
     g->def = -1;
+    g->lat_tolerance_ms = -1;
     g->idle_timeout_s = -1;
     g->cur = -1;
     g->sel = -1;
@@ -177,6 +178,14 @@ int group_of_devices(struct spec *sp, struct output *o, const char (*devs)[32], 
     return group_seal(sp, o, e);
 }
 
+int group_tolerance_ms(const struct group_cfg *g) {
+    return g && g->lat_tolerance_ms >= 0 ? g->lat_tolerance_ms : GROUP_TOL_DEFAULT_MS;
+}
+
+int group_interval_s(const struct group_cfg *g) {
+    return g && g->lat_interval_s > 0 ? g->lat_interval_s : GROUP_INT_DEFAULT_S;
+}
+
 int group_latency_pick(const int *ms, size_t n, int tol, int *best) {
     int b = -1;
     for (size_t k = 0; k < n; k++)
@@ -190,6 +199,31 @@ int group_latency_pick(const int *ms, size_t n, int tol, int *best) {
 
 int group_latency_keep(const int *ms, int cur, int pick, int tol) {
     return ms[cur] - ms[pick] <= tol;
+}
+
+int group_latency_why(const int *ms, const unsigned char *alive, size_t n, int cur, int tol,
+                      int *fastest) {
+    int f = -1;
+    for (size_t k = 0; k < n; k++)
+        if (alive[k] && ms[k] >= 0 && (f < 0 || ms[k] < ms[f])) f = (int)k;
+    if (fastest) *fastest = f;
+    if (cur < 0 || (size_t)cur >= n) return GW_NONE;
+    if (f < 0) return GW_NOMEASURE;
+    if (!alive[cur] || ms[cur] < 0) return GW_UNMEASURED;
+    if (ms[cur] == ms[f]) return GW_FASTEST;
+    return ms[cur] - ms[f] <= tol ? GW_TOLERANCE : GW_PENDING;
+}
+
+const char *group_why_name(int why) {
+    switch (why) {
+    case GW_NOMEASURE:  return "no_measure";
+    case GW_UNMEASURED: return "unmeasured";
+    case GW_FASTEST:    return "fastest";
+    case GW_TOLERANCE:  return "in_tolerance";
+    case GW_PENDING:    return "pending";
+    case GW_IDLE:       return "idle";
+    default:            return NULL;
+    }
 }
 
 void group_latency_score(const int *ms4, const int *ms6, size_t n, int *score) {

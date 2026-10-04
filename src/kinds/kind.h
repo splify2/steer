@@ -353,6 +353,41 @@ int group_hysteresis(int cur, int first, int cur_alive, int streak, int hyst, in
 #define GROUP_TOL_MAX_MS  60000
 #define GROUP_INT_MIN_S   5
 #define GROUP_INT_MAX_S   86400
+/* Умолчания, когда человек допуск и интервал не задал, — числа sing-box (interval 3m, tolerance
+ * 50). Одно место на всех, кто их читает: сторож (failover.c), таймеры замера (folat.c), подхват
+ * (fogroup.c) и status. */
+#define GROUP_TOL_DEFAULT_MS 50
+#define GROUP_INT_DEFAULT_S  180
+/* Допуск и интервал группы latency с учётом умолчаний. Допуск 0, заданный человеком, остаётся
+ * нулём (lat_tolerance_ms: -1 — не задан), а не превращается в умолчание: ноль — это «выигрыш
+ * любой величины значим», и настройка «самый быстрый строго» без него недостижима. */
+int group_tolerance_ms(const struct group_cfg *g);
+int group_interval_s(const struct group_cfg *g);
+
+/* ПОЧЕМУ ГРУППА latency СЕЙЧАС НА ЭТОМ ЧЛЕНЕ — для status (docs/contract-v1.md, поле `why`).
+ * ms — задержки, по которым выбирает сторож (-1 — не измерено), alive — живые члены (байт на
+ * члена; замер члена, которого нет в живых, не в счёт), cur — выбранный член (-1 — группа в отказе
+ * или сторож не проходил), tol — допуск. *fastest — самый быстрый из живых измеренных (-1 — таких
+ * нет; NULL — не нужен). Возврат — GW_*: по порядку проверок —
+ *   GW_NONE      — группа никого не выбрала;
+ *   GW_NOMEASURE — ни у одного живого члена нет замера: группа идёт по порядку (первый живой), и
+ *                  «самый быстрый» здесь ничего не решает — причина в том, что мерить не вышло;
+ *   GW_UNMEASURED — выбранный жив, но не измерен, тогда как другие измерены;
+ *   GW_FASTEST   — выбран самый быстрый (или равный ему);
+ *   GW_TOLERANCE — выбран не самый быстрый, но не хуже него больше чем на допуск: порядок и
+ *                  текущий член решают при равенстве (docs/spec-v2.md, «Как выбирает каждый pick»);
+ *   GW_PENDING   — выбран не самый быстрый и хуже него больше допуска: переход — на ближайшем
+ *                  проходе сторожа (или член только что оказался хуже);
+ *   GW_IDLE      — замера нет, потому что он на паузе без трафика (idle_timeout); сама функция его не
+ *                  возвращает — про простой знает status (fog_idle_now) и подменяет GW_NOMEASURE.
+ * Чистая функция: её зовёт status и сверяет стенд. */
+enum group_why { GW_NONE = 0, GW_NOMEASURE, GW_UNMEASURED, GW_FASTEST, GW_TOLERANCE, GW_PENDING,
+                GW_IDLE };
+int group_latency_why(const int *ms, const unsigned char *alive, size_t n, int cur, int tol,
+                      int *fastest);
+/* Имя причины, как оно печатается в status: no_measure, unmeasured, fastest, in_tolerance, pending,
+ * idle; NULL у GW_NONE — группа никого не выбрала, и поля `why` нет. */
+const char *group_why_name(int why);
 
 /* interface: обфускация транспорта или NULL, если её нет (или выход не interface). */
 const struct out_obfs *iface_obfs(const struct output *o);

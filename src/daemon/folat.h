@@ -12,9 +12,16 @@ struct loop;
 
 /* Срок одного запроса проверки — на весь замер члена, с DNS. */
 #define FOLAT_TIMEOUT_MS 5000
-/* Умолчания группы без tolerance и interval — числа sing-box (interval 3m, tolerance 50). */
-#define FOLAT_TOLERANCE_MS 50
-#define FOLAT_INTERVAL_S   180
+/* Умолчания группы без tolerance и interval — числа sing-box (interval 3m, tolerance 50); значения
+ * — у группы (kind.h), здесь прежние имена. Допуск и интервал группы с умолчаниями —
+ * group_tolerance_ms и group_interval_s. */
+#define FOLAT_TOLERANCE_MS GROUP_TOL_DEFAULT_MS
+#define FOLAT_INTERVAL_S   GROUP_INT_DEFAULT_S
+/* Первый повтор замера, когда у живого члена он не удался (DNS ещё не поднялся, туннель только
+ * встал, часы без NTP у HTTPS): не ждать целого interval, а повторить через столько секунд, дальше
+ * вдвое реже, но не дольше самого interval. Без этого неудавшийся замер держал группу «по порядку» до
+ * следующего срока — у interval в час это час. */
+#define FOLAT_RETRY_S      15
 
 /* ---- запись latency ------------------------------------------------------------------------
  *

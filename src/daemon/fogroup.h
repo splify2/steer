@@ -45,6 +45,10 @@ int fog_idle_limit(const struct output *g);
  * узнать нечем, и тогда трафик «есть»). Первая встреча группы берёт отсчёт и считает её
  * незанятой: без трафика замеров нет. 1 — простаивает. */
 int fog_idle(const struct spec *sp, const struct output *g, int limit, fo_traffic_fn fn, void *arg);
+/* Простаивает ли группа group по последнему наблюдению процесса (без чтения счётчиков — для status):
+ * 1 — трафика не видели дольше предела, замер на паузе. 0 — нет, пределом не спрашивали или группы
+ * сторож ещё не встречал. */
+int fog_idle_now(const char *group);
 
 /* balance: привести карту группы в ядре к живым членам alive (байт на члена: 1 — жив). По факту в ядре, а
  * не по памяти: apply ставит карту со всеми членами, и сверка обязана это заметить. 1 — карта
@@ -66,6 +70,12 @@ int fog_groups_alive(struct fo_store *st, const struct spec *sp, const struct ou
 /* Состояние групп для status (cur, alive, sel, lat_ms у struct group_cfg) — из записей `groups`,
  * `select` и `latency` хранилища st. */
 void fog_adopt(struct spec *sp, struct fo_store *st);
+
+/* Группа latency: замер дал ответ хотя бы у одного живого члена (none = 0) или не дал ни у одного
+ * (none = 1) — и сменилось ли это с прошлого вопроса процесса о группе: 1 — сменилось (строку в
+ * журнал пишут на смене, а не на каждом проходе). Первый вопрос о группе с замерами — не смена
+ * (молчим), без замеров — смена (сказать надо: группа идёт по порядку). */
+int fog_lat_note(const char *group, int none);
 
 /* Ключ замера члена в записи `latency`: имя именованного члена, устройство безымянного (v1). */
 const char *fog_lat_key(const struct output *m);
