@@ -278,6 +278,11 @@ struct conn {
     unsigned char *early;
     uint32_t early_n;
     uint32_t early_off;
+    /* Когда пришёл SYN и уходило ли что-нибудь узлу: клиент, молчащий SERVER_FIRST_MS, ждёт,
+     * что первым заговорит сервер, и узлу надо сообщить, куда подключаться, без данных
+     * (conn_deadlines). */
+    uint64_t syn_ns;
+    uint8_t sent_any;
     /* Клиент передумал (RST), пока установщик работал: запись трогать нельзя,
      * поэтому только помечаем, а закрываем по готовности установщика. */
     uint8_t client_gone;
@@ -309,6 +314,11 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
  * НЕ ПОДТВЕРЖДАЕМ: клиент повторит сам, когда поток будет готов, — это то же удержание
  * потока отсутствием ACK, которым уже пользуется путь SEND_AGAIN. */
 #define EARLY_CAP 8192
+
+/* Сколько клиент может молчать, прежде чем поток открывается без его данных: SSH, SMTP, FTP и
+ * подобные ждут приветствия сервера, а VLESS сообщает назначение только с первыми данными. 100 мс,
+ * как у собственного клиента Xray (buf.CopyOnceTimeout в его исходящем VLESS). */
+#define SERVER_FIRST_MS 100
 
 /* Сколько неподтверждённых байт храним на соединение — и, тем самым, каков наш предел
  * «в пути».
@@ -1443,7 +1453,9 @@ static void conn_drop(struct conn *c) {
 /* Отправить узлу данные клиента. Форма — заголовок запроса, обёртки, упаковка транспорта —
  * дело дайлера (dialer_ops.send); итог — SEND_* (dialer.h). */
 static int upstream_send(struct conn *c, const unsigned char *data, size_t n) {
-    return g_dl->ops->send(g_dl->ctx, SESS(c), &c->key, c->is_udp, data, n);
+    int sr = g_dl->ops->send(g_dl->ctx, SESS(c), &c->key, c->is_udp, data, n);
+    if (sr == SEND_OK) c->sent_any = 1;
+    return sr;
 }
 
 /* SYN-ACK клиенту. ISN всегда 1 и в our_seq не хранится: our_seq заводится сразу как 2
@@ -2004,6 +2016,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         memset(c, 0, sizeof(*c));
         c->used = 1;
         c->born_turn = g_turn;
+        c->syn_ns = g_now_ns;
         c->key = k;
         c->fd = -1;
         /* Место в списках — ПОСЛЕ memset и ПОСЛЕ ключа: хэш считается по ключу, а memset
@@ -2503,6 +2516,18 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
     if (c->early && early_flush(c) < 0) {
         conn_reset(c, tun);
         return 1;
+    }
+
+    /* Клиент молчит с самого SYN: открыть поток без его данных, чтобы мог заговорить сервер,
+     * говорящий первым (dialer.h, send с n == 0). Клиента, который говорил, обслуживает путь
+     * ранних данных выше. */
+    if (!c->is_udp && !c->sent_any && !c->early && !c->srv_closed &&
+        now - c->syn_ns >= SERVER_FIRST_MS * 1000000ull) {
+        int sr = upstream_send(c, NULL, 0);
+        if (sr == SEND_FATAL) {
+            conn_reset(c, tun);
+            return 1;
+        }
     }
 
     /* Истёкшие сроки — повторяем. После обработки пакетов, а не до: подтверждение,

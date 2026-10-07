@@ -364,6 +364,10 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         if (!len) return SEND_FATAL;
     }
 
+    /* n == 0 (вызов стека для молчащего клиента, dialer.h): один заголовок, как клиент Xray
+     * отправляет его через 100 мс без данных. Vision начинается с первых настоящих данных. */
+    if (!n && !len) return SEND_OK;
+
     /* Оборачивать нужно только пока Vision не закончил набивку. После кадра end vision_wrap
      * сводится к копированию данных на месте — а копию мы делали ДВАЖДЫ: сначала в framed,
      * потом из него в out. То есть каждый байт выгрузки проходил по памяти трижды (третий
@@ -380,7 +384,7 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
      *
      * Шестьдесят четыре байта копии против невоспроизводимой поломки протокола. */
     struct vision vis_before = s->vis;
-    if (node->flow[0] && !s->vis.sent_end) {
+    if (node->flow[0] && !s->vis.sent_end && n) {
         size_t fn = vision_wrap(&s->vis, data, n, out + len, sizeof(out) - len);
         if (!fn) return SEND_FATAL;
         len += fn;

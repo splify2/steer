@@ -110,6 +110,8 @@ int run_quiet(const char *const argv[]) {
 static int g_sess_pipe[2] = { -1, -1 };
 static int g_send_rc;                 /* что вернёт transport_write: 0 или H2_EWINDOW */
 static int g_send_again_n;            /* столько раз подряд вернуть H2_EWINDOW, потом 0 */
+static int g_send_calls;              /* сколько раз вызван transport_write */
+static size_t g_send_last_n;          /* длина последнего transport_write */
 static int g_recv_calls;
 static int g_recv_rc;                 /* что вернёт transport_read_zc: 0 или -1 (конец потока) */
 static unsigned char g_recv_buf[4096];
@@ -123,7 +125,9 @@ int vless_connect(const struct vless_node *node, struct transport *conn, int tim
     return 0;
 }
 int transport_write(struct transport *c, const unsigned char *d, size_t n) {
-    (void)c; (void)d; (void)n;
+    (void)c; (void)d;
+    g_send_calls++;
+    g_send_last_n = n;
     if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
     return g_send_rc;
 }
@@ -784,6 +788,46 @@ static void t_fin_window(void) {
     int n = dev_drain(&last);
     check(n == 1 && (last.tcp_flags & TCP_FIN) && last.window != 0,
           "окно в FIN: FIN сервера уходит клиенту с открытым окном, не с нулевым");
+}
+
+/* Сервер говорит первым (SSH, SMTP): клиент после рукопожатия молчит. VLESS сообщает узлу
+ * назначение только в заголовке запроса, поэтому стек обязан сам послать один заголовок через
+ * SERVER_FIRST_MS, один раз и без кадра Vision (как клиент Xray). Прежде такой поток не
+ * открывался: узел ждал заголовка, клиент приветствия. */
+static void server_first(const char *flow, size_t header_n) {
+    snprintf(g_node.flow, sizeof(g_node.flow), "%s", flow);
+    struct flow_key k = cli_key();
+    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
+    struct conn *c = conn_find(&k);
+    if (!c || wait_ready(c, 2000) != 0) {
+        check(0, "сервер первым: тестовое соединение не открылось");
+        if (c) conn_drop(c);
+        g_node.flow[0] = 0;
+        return;
+    }
+    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
+    char what[96];
+    int calls = g_send_calls;
+    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS / 2) * 1000000ull);
+    snprintf(what, sizeof(what), "сервер первым%s: до %d мс ничего не отправлено",
+             flow[0] ? ", Vision" : "", SERVER_FIRST_MS);
+    check(g_send_calls == calls, what);
+    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS + 50) * 1000000ull);
+    const struct vl_sess *vs = SESS(c);
+    snprintf(what, sizeof(what), "сервер первым%s: затем один заголовок в %zu байт",
+             flow[0] ? ", Vision" : "", header_n);
+    check(g_send_calls == calls + 1 && g_send_last_n == header_n && vs->header_sent, what);
+    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS + 100) * 1000000ull);
+    snprintf(what, sizeof(what), "сервер первым%s: и только один раз", flow[0] ? ", Vision" : "");
+    check(g_send_calls == calls + 1, what);
+    conn_drop(c);
+    dev_drain(NULL);
+    g_node.flow[0] = 0;
+}
+
+static void t_server_first(void) {
+    server_first("", 26);                    /* версия, UUID, без доп., команда, порт, IPv4 */
+    server_first("xtls-rprx-vision", 44);    /* плюс дополнение flow: 0a 10 "xtls-rprx-vision" */
 }
 
 /* ==== ПУЛ УЗЛОВ ВЫХОДА И СБРОС СОЕДИНЕНИЙ (src/tunnel/pool.c) ================================
@@ -1570,6 +1614,7 @@ int main(void) {
     t_dns_evict();
     t_spare_slot();
     t_born_turn();
+    t_server_first();
     t_fin_window();
     t_udp_early_bounds();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");

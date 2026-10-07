@@ -97,6 +97,8 @@ def worker(kind, target, deadline, st):
                     while time.time() < deadline:
                         sent += s.send(blob)
                     st.add("up:срок вышел")
+                except socket.timeout:
+                    st.add("up:застряло")
                 except OSError:
                     # узел закрыл соединение, туннель ответил RST (или оборвал запись) — штатный исход
                     st.add("up:оборвано узлом")
