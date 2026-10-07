@@ -39,6 +39,7 @@ build/bench
 build/dnsmatch
 build/specmatch
 build/failovermatch
+build/rrkeepmatch
 build/h2match
 build/submatch
 build/hy2match

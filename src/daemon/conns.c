@@ -4,6 +4,7 @@
 #include "groups.h"
 #include "nftdump.h"
 #include "daemon.h"
+#include "rrkeep.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
@@ -341,14 +342,6 @@ struct rr_snap *reroute_snap(const struct spec *sp) {
     return s;
 }
 
-/* Интервалы назначений из наборов ядра, отсортированные по началу; конец включительно. */
-struct rr_iv { uint8_t lo[16], hi[16]; };
-struct rr_ivs {
-    struct rr_iv *v4, *v6;
-    size_t n4, n6, c4, c6;
-    int bad;
-};
-
 /* Элементы одного набора, как отдаёт ядро: начала и концы (флаг INTERVAL_END, конец — первый
  * адрес ПОСЛЕ диапазона) порознь; пары собираются после дампа. */
 struct rr_raw { uint8_t k[16]; int end; };
@@ -383,7 +376,7 @@ static int rr_raw_cmp(const void *a, const void *b) {
     return y->end - x->end;                    /* конец прежнего диапазона — раньше начала */
 }
 
-static int rr_iv_cmp(const void *a, const void *b) {
+int rr_iv_cmp(const void *a, const void *b) {
     return memcmp(((const struct rr_iv *)a)->lo, ((const struct rr_iv *)b)->lo, 16);
 }
 
@@ -445,7 +438,17 @@ static int rr_load_set(struct rr_ivs *iv, const char *name, size_t alen) {
     return rc;
 }
 
-static int rr_keep(uint8_t family, const uint8_t *dst, void *ctx) {
+/* После сортировки по началу: pm[i] = max(hi[0..i]). Интервалы перекрываются, и «назначение лежит
+ * в каком-то из них с началом не больше адреса» — это «наибольший конец среди них не меньше адреса»:
+ * rr_keep отвечает двоичным поиском, без прохода назад по всем интервалам для каждой записи. */
+void rr_iv_ready(struct rr_iv *v, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        memcpy(v[i].pm, v[i].hi, 16);
+        if (i && memcmp(v[i - 1].pm, v[i].pm, 16) > 0) memcpy(v[i].pm, v[i - 1].pm, 16);
+    }
+}
+
+int rr_keep(uint8_t family, const uint8_t *dst, void *ctx) {
     const struct rr_ivs *iv = ctx;
     int v6 = family == AF_INET6;
     size_t alen = v6 ? 16 : 4, n = v6 ? iv->n6 : iv->n4;
@@ -453,16 +456,14 @@ static int rr_keep(uint8_t family, const uint8_t *dst, void *ctx) {
     uint8_t k[16];
     memset(k, 0, 16);
     memcpy(k, dst, alen);
-    /* Последний интервал с началом не больше адреса — и адрес не дальше его конца. Интервалы
-     * разных наборов могут перекрываться, поэтому — назад, пока начало не больше адреса. */
+    /* Интервалы с началом не больше адреса — префикс; адрес в одном из них, если не дальше
+     * наибольшего конца префикса (pm, rr_iv_ready). Перекрытия разных наборов этому не мешают. */
     size_t lo = 0, hi = n;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
         if (memcmp(v[mid].lo, k, 16) <= 0) lo = mid + 1; else hi = mid;
     }
-    for (size_t i = lo; i-- > 0;)
-        if (memcmp(v[i].hi, k, 16) >= 0) return 1;
-    return 0;
+    return lo > 0 && memcmp(v[lo - 1].pm, k, 16) >= 0;
 }
 
 /* Снятие для одной метки, которую держат и неизменившиеся правила: оставить записи с
@@ -493,6 +494,8 @@ static int rr_evict_filtered(const struct spec *sp, const struct groups *gr, uns
     if (rc == 0) {
         qsort(iv.v4, iv.n4, sizeof(*iv.v4), rr_iv_cmp);
         qsort(iv.v6, iv.n6, sizeof(*iv.v6), rr_iv_cmp);
+        rr_iv_ready(iv.v4, iv.n4);
+        rr_iv_ready(iv.v6, iv.n6);
         *evicted = ctnl_evict_mark_keep(mark, STEER_MARK_MASK, rr_keep, &iv);
         if (*evicted < 0) rc = -1;
     }
