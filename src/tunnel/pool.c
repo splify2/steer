@@ -120,6 +120,7 @@ static struct {
     struct pool_cfg cf;
     const struct dialer_ops *in;
     struct pl_slot *slot;
+    int *live;                  /* запас pl_pick: индексы живых слотов, по числу слотов; под замком */
     int n;                      /* слотов: active, но не больше кандидатов */
     unsigned rr;                /* круг запасных связей */
     int said_up;                /* демону последним сказано up (а не down) */
@@ -166,11 +167,11 @@ static unsigned pl_rand(void) {
 /* Слот нового соединения по раздаче. Под замком. -1 — ни у одного слота нет узла. Живых нет — мёртвый
  * слот с узлом: соединение откажет быстро (RST), а выход к этому времени уже в отказе у демона. */
 static int pl_pick(const struct flow_key *k) {
-    int live[64], nl = 0, any = -1;
+    int *live = g_pl.live, nl = 0, any = -1;
     for (int i = 0; i < g_pl.n; i++) {
         if (g_pl.slot[i].node < 0) continue;
         if (any < 0) any = i;
-        if (g_pl.slot[i].up && nl < (int)(sizeof live / sizeof live[0])) live[nl++] = i;
+        if (g_pl.slot[i].up) live[nl++] = i;
     }
     if (!nl) return any;
     if (g_pl.cf.by == BY_CONNECTION || !k) return live[pl_rand() % (unsigned)nl];
@@ -640,7 +641,9 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     }
     if (g_pl.n < 1) g_pl.n = 1;
     g_pl.slot = calloc((size_t)g_pl.n, sizeof *g_pl.slot);
-    if (!g_pl.slot) { fprintf(stderr, PL_LOG_W "нет памяти под слоты узлов\n"); return NULL; }
+    free(g_pl.live);
+    g_pl.live = malloc((size_t)g_pl.n * sizeof *g_pl.live);
+    if (!g_pl.slot || !g_pl.live) { fprintf(stderr, PL_LOG_W "нет памяти под слоты узлов\n"); return NULL; }
     uint64_t now = pl_now_ms();
     for (int i = 0; i < g_pl.n; i++) {
         g_pl.slot[i].node = -1;

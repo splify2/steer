@@ -773,7 +773,7 @@ static void t_spare_slot(void) {
 /* ---- поддельный протокол: узел и связь ------------------------------------------------------ */
 
 struct fnode { char name[16]; char host[16]; int alive; };
-static struct fnode g_fn[5];
+static struct fnode g_fn[80];
 
 struct fsess { int fd; const struct fnode *node; int flow_opens; };
 
@@ -874,7 +874,7 @@ static int f_probe(const void *node, int t, char *why, size_t n) {
 static const char *f_name(const void *node) { return ((const struct fnode *)node)->name; }
 static const struct pool_proto f_proto = { .ops = &f_ops, .probe = f_probe, .name = f_name, .tag = "pm" };
 
-static int g_sel[5] = { 0, 1, 2, 3, 4 };
+static int g_sel[80] = { 0, 1, 2, 3, 4 };
 
 /* Пул заново: active слотов, кандидаты 0..ncand-1, первый — узел 0. */
 static void pool_new(int active, int by, int ncand, const char *out) {
@@ -1173,6 +1173,19 @@ static void t_pool_pick(void) {
     check(cnt[0] > 800 && cnt[1] > 800 && cnt[2] > 800, "by: connection — новые соединения поровну");
 }
 
+/* active до 65536 допустимо спекой: новые соединения by: connection идут на все живые слоты, а не на
+ * первые 64 (pl_pick держал живых в live[64]). */
+static void t_pool_many(void) {
+    for (int i = 0; i < 80; i++) g_fn[i].alive = 1;
+    pool_new(70, BY_CONNECTION, 70, NULL);
+    for (int s = 1; s < 70; s++) pl_check(s);
+    struct flow_key k = pm_key(1, htonl(0x5db80001u));
+    int hit[70] = { 0 }, hi = 0;
+    for (int i = 0; i < 20000; i++) { int s = pl_pick(&k); if (s >= 0) hit[s] = 1; }
+    for (int s = 64; s < 70; s++) hi += hit[s];
+    check(hi == 6, "by: connection — слоты с 65-го по 70-й тоже получают соединения (не только первые 64)");
+}
+
 static void t_pool_refill(void) {
     for (int i = 0; i < 5; i++) g_fn[i].alive = 1;
     g_fn[1].alive = 0;
@@ -1461,7 +1474,8 @@ static void t_ack_paced(void) {
  * таблица соединений с этого места живёт с ним. */
 static int pool_part(void) {
     signal(SIGPIPE, SIG_IGN);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 80; i++) {
+        g_sel[i] = i;
         snprintf(g_fn[i].name, sizeof g_fn[i].name, "n%d", i);
         snprintf(g_fn[i].host, sizeof g_fn[i].host, "h%d", i);
         g_fn[i].alive = 1;
@@ -1477,6 +1491,7 @@ static int pool_part(void) {
     t_pool_stack();
     t_pool_stale();
     t_pool_pick();
+    t_pool_many();
     t_pool_refill();
     t_pool_spares();
     t_pool_state();
