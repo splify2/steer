@@ -859,6 +859,32 @@ int main(void) {
         snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingBytes%%22%%3A%%22900-100%%22%%7D#x", base);
         vless_parse_url(url, &n);
         check_n("extra: перевёрнутый диапазон отвергнут", 0, (int)n.pad_to);
+
+        /* scMaxEachPostBytes: сервер отвечает 413 на POST packet-up больше предела (hub.go в
+         * Xray), поэтому предел читается, числом или диапазоном. */
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22scMaxEachPostBytes%%22%%3A4096%%7D#x", base);
+        vless_parse_url(url, &n);
+        check_n("extra: scMaxEachPostBytes числом, нижняя", 4096, (int)n.post_from);
+        check_n("extra: scMaxEachPostBytes числом, верхняя", 4096, (int)n.post_to);
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22scMaxEachPostBytes%%22%%3A%%22500000-1000000%%22%%7D#x", base);
+        vless_parse_url(url, &n);
+        check_n("extra: scMaxEachPostBytes диапазоном, нижняя", 500000, (int)n.post_from);
+        check_n("extra: scMaxEachPostBytes диапазоном, верхняя", 1000000, (int)n.post_to);
+
+        /* Настройки, меняющие запросы на проводе, отсеивают узел по ЗНАЧЕНИЮ: панели записывают
+         * умолчания Xray явно, и именно их клиент и шлёт. */
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22uplinkDataPlacement%%22%%3A%%22auto%%22%%2C%%22sessionPlacement%%22%%3A%%22path%%22%%2C%%22seqPlacement%%22%%3A%%22path%%22%%2C%%22xPaddingMethod%%22%%3A%%22repeat-x%%22%%2C%%22xPaddingObfsMode%%22%%3Afalse%%7D#x", base);
+        check_n("extra: умолчания Xray, записанные явно, — узел пригоден", 0, vless_parse_url(url, &n));
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22uplinkDataPlacement%%22%%3A%%22header%%22%%7D#x", base);
+        check_n("extra: uplinkDataPlacement=header — пропущен", 1, vless_parse_url(url, &n));
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22sessionPlacement%%22%%3A%%22query%%22%%7D#x", base);
+        check_n("extra: sessionPlacement=query — пропущен", 1, vless_parse_url(url, &n));
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingMethod%%22%%3A%%22tokenish%%22%%7D#x", base);
+        check_n("extra: xPaddingMethod=tokenish — пропущен", 1, vless_parse_url(url, &n));
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingObfsMode%%22%%3Atrue%%7D#x", base);
+        check_n("extra: xPaddingObfsMode — пропущен", 1, vless_parse_url(url, &n));
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22downloadSettings%%22%%3A%%7B%%22address%%22%%3A%%22d.example%%22%%7D%%7D#x", base);
+        check_n("extra: downloadSettings — пропущен", 1, vless_parse_url(url, &n));
     }
     {
         /* ---- режимы xhttp -------------------------------------------------------

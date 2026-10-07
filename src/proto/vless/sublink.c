@@ -195,22 +195,39 @@ void sl_set_name(char *dst, size_t n, const char *src) {
  * Ничего не понято — поля не трогаются, и дальше работает умолчание. Молчание здесь верно:
  * набивка, которую мы не сумели прочитать, не повод объявлять узел негодным — умолчание
  * Xray подойдёт большинству серверов. */
-void sl_pad_range(struct vless_node *n, const char *v) {
-    unsigned a = 0, b = 0;
+static int sl_range(const char *v, unsigned long max, unsigned long *from, unsigned long *to) {
+    unsigned long a = 0, b = 0;
     const char *p = v;
     while (*p == ' ' || *p == '"') p++;
-    if (*p < '0' || *p > '9') return;
-    while (*p >= '0' && *p <= '9') { a = a * 10 + (unsigned)(*p - '0'); p++; if (a > 65535) return; }
+    if (*p < '0' || *p > '9') return -1;
+    while (*p >= '0' && *p <= '9') { a = a * 10 + (unsigned)(*p - '0'); p++; if (a > max) return -1; }
     if (*p == '-') {
         p++;
-        if (*p < '0' || *p > '9') return;
-        while (*p >= '0' && *p <= '9') { b = b * 10 + (unsigned)(*p - '0'); p++; if (b > 65535) return; }
+        if (*p < '0' || *p > '9') return -1;
+        while (*p >= '0' && *p <= '9') { b = b * 10 + (unsigned)(*p - '0'); p++; if (b > max) return -1; }
     } else {
         b = a;
     }
-    if (b < a) return;
+    if (b < a) return -1;
+    *from = a;
+    *to = b;
+    return 0;
+}
+
+void sl_pad_range(struct vless_node *n, const char *v) {
+    unsigned long a, b;
+    if (sl_range(v, 65535, &a, &b) != 0) return;
     n->pad_from = (uint16_t)a;
     n->pad_to = (uint16_t)b;
+}
+
+/* xhttp `scMaxEachPostBytes` в тех же формах. 0 — предел, который Xray не принял бы (его клиент
+ * по нему не режет): остаётся умолчание. */
+void sl_post_range(struct vless_node *n, const char *v) {
+    unsigned long a, b;
+    if (sl_range(v, 100000000, &a, &b) != 0 || a == 0) return;
+    n->post_from = (uint32_t)a;
+    n->post_to = (uint32_t)b;
 }
 
 /* `extra` ссылки — это кусок настроек транспорта в JSON, и нас в нём занимает ровно одно
@@ -221,33 +238,61 @@ void sl_pad_range(struct vless_node *n, const char *v) {
  * Поиск по имени поля, а не разбор объекта: `extra` приезжает уже раскодированным из
  * процентной формы, вложенность в нём одна, и вытащить одно число дешевле, чем заводить
  * второй разбор JSON рядом с тем, что уже есть в этом файле. */
-/* Признаки того, что сервер включил обфускацию xhttp, которой у клиента нет: поле присутствует с
- * непустым значением (или true). Ложное срабатывание хуже пропуска не бывает — узел с ними и так не
- * откроется на сервере, ждущем другого запроса. */
+/* Настройки xhttp, меняющие запросы на проводе в форму, которой клиент не делает (имена Xray
+ * 26.3): идентификатор сессии или seq не в пути, данные выгрузки в заголовках или куках,
+ * tokenish-набивка, обфусцированная набивка, отдельный сервер скачивания. Узел с одной из них не
+ * откроется, потому что сервер ждёт другого запроса, так что отсев сразу, с названной причиной,
+ * ничего не теряет.
+ *
+ * По ЗНАЧЕНИЮ, а не по наличию: панели записывают умолчания явно ("path", "auto", "repeat-x"), а
+ * это ровно то, что шлёт клиент. uplinkHTTPMethod и xPaddingPlacement здесь нет: сервер не
+ * проверяет метод, а место набивки важно только при xPaddingObfsMode. */
+int sl_xh_setting_bad(const char *key, const char *val) {
+    if (!val || !val[0] || !strcmp(val, "null")) return 0;
+    if (!strcmp(key, "downloadSettings")) return 1;
+    if (!strcmp(key, "sessionPlacement") || !strcmp(key, "sessionIDPlacement") ||
+        !strcmp(key, "seqPlacement"))
+        return strcmp(val, "path") != 0;
+    if (!strcmp(key, "uplinkDataPlacement")) return strcmp(val, "auto") && strcmp(val, "body");
+    if (!strcmp(key, "xPaddingMethod")) return strcmp(val, "repeat-x") != 0;
+    if (!strcmp(key, "xPaddingObfsMode")) return !strcmp(val, "true");
+    return 0;
+}
+
 static int xh_extra_bad(const char *json) {
-    static const char *const keys[] = { "\"downloadSettings\"", "\"sessionIDPlacement\"", "\"seqPlacement\"",
-                                        "\"uplinkDataPlacement\"", "\"xPaddingPlacement\"", "\"xPaddingMethod\"" };
+    static const char *const keys[] = { "downloadSettings", "sessionPlacement", "sessionIDPlacement",
+                                        "seqPlacement", "uplinkDataPlacement", "xPaddingMethod",
+                                        "xPaddingObfsMode" };
     for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
-        const char *k = strstr(json, keys[i]);
-        if (!k) continue;
-        k = strchr(k, ':');
-        if (!k) continue;
+        char q[32];
+        snprintf(q, sizeof q, "\"%s\"", keys[i]);
+        const char *k = strstr(json, q);
+        if (!k || !(k = strchr(k + strlen(q), ':'))) continue;
         k++;
         while (*k == ' ') k++;
-        if (*k && *k != 'n' && !(k[0] == '"' && k[1] == '"') && *k != '}' && *k != ',') return 1;
+        /* Значение: содержимое строки или голое слово (true, null, скобка объекта). */
+        char v[32];
+        size_t l = 0;
+        if (*k == '"') {
+            k++;
+            while (k[l] && k[l] != '"' && l < sizeof v - 1) l++;
+        } else {
+            while (k[l] && k[l] != ',' && k[l] != '}' && k[l] != ' ' && l < sizeof v - 1) l++;
+            if (*k == '{') l = 1;
+        }
+        memcpy(v, k, l);
+        v[l] = 0;
+        if (sl_xh_setting_bad(keys[i], v)) return 1;
     }
-    const char *o = strstr(json, "\"xPaddingObfsMode\"");
-    if (o && (o = strchr(o, ':'))) { o++; while (*o == ' ') o++; if (!strncmp(o, "true", 4)) return 1; }
     return 0;
 }
 
 void sl_parse_extra(struct vless_node *n, const char *extra) {
     if (xh_extra_bad(extra)) n->xh_extra = 1;
     const char *k = strstr(extra, "\"xPaddingBytes\"");
-    if (!k) return;
-    k = strchr(k + 15, ':');
-    if (!k) return;
-    sl_pad_range(n, k + 1);
+    if (k && (k = strchr(k + 15, ':'))) sl_pad_range(n, k + 1);
+    k = strstr(extra, "\"scMaxEachPostBytes\"");
+    if (k && (k = strchr(k + 20, ':'))) sl_post_range(n, k + 1);
 }
 
 

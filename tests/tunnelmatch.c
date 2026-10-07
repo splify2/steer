@@ -148,7 +148,7 @@ int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
     return 0;
 }
 int transport_has_data(const struct transport *c) { (void)c; return 0; }
-long transport_room(const struct transport *c) { (void)c; return g_room; }
+long transport_room(struct transport *c) { (void)c; return g_room; }
 void transport_close(struct transport *c) { c->link.fd = -1; }   /* канал общий — не закрываем */
 void transport_moved(struct transport *c) { (void)c; }
 void transport_direct(struct transport *c) { c->link.rx_direct = 1; }

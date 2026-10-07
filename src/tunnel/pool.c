@@ -542,11 +542,11 @@ static int pl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     return g_pl.in->send(s->node, INNER(s), k, udp, d, n);
 }
 
-static long pl_room(const void *ctx, const void *sess) {
+static long pl_room(const void *ctx, void *sess) {
     (void)ctx;
-    const struct pl_sess *s = sess;
+    struct pl_sess *s = sess;
     if (!g_pl.in->room || !s->node) return -1;
-    return g_pl.in->room(s->node, (const char *)sess + PL_HDR);
+    return g_pl.in->room(s->node, INNER(s));
 }
 
 static size_t pl_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {

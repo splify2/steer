@@ -136,11 +136,92 @@ static void t_stream_up(unsigned char hpack, int want_refused, const char *what)
     close(fd);
 }
 
+/* packet-up: запись больше scMaxEachPostBytes уходит несколькими кусками, а не одним POST, на который
+ * сервер отвечает 413. Номер куска растёт на каждый. */
+static void t_post_max(void) {
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    struct transport c;
+    conn_init(&c, XH_PACKET_UP, fd);
+    c.xh.post_max = 4;
+    unsigned char d[10];
+    memset(d, 'p', sizeof(d));
+    int rc = transport_write(&c, d, sizeof(d));
+    srv_drain();
+    check(rc == 0 && c.xh.seq == 3, "packet-up: запись в 10 байт при пределе 4 — три куска (4+4+2)");
+    c.xh.post_max = 0;
+    rc = transport_write(&c, d, sizeof(d));
+    srv_drain();
+    check(rc == 0 && c.xh.seq == 4, "packet-up: без предела запись остаётся одним куском");
+    close(fd);
+}
+
+/* auto решается как у клиента Xray: stream-one при reality, иначе packet-up; названный режим не
+ * трогается. Сервер packet-up отвечает на stream-one 400. */
+static void t_auto_mode(void) {
+    struct tr_node n;
+    memset(&n, 0, sizeof(n));
+    n.mode = "";
+    n.security = "reality";
+    check(xhttp_mode_of(&n) == XH_STREAM_ONE, "auto при reality — stream-one");
+    n.security = "tls";
+    check(xhttp_mode_of(&n) == XH_PACKET_UP, "auto при tls — packet-up");
+    n.security = "none";
+    check(xhttp_mode_of(&n) == XH_PACKET_UP, "auto без защиты — packet-up");
+    n.mode = "auto";
+    n.security = "tls";
+    check(xhttp_mode_of(&n) == XH_PACKET_UP, "mode=auto при tls — packet-up");
+    n.mode = "stream-one";
+    check(xhttp_mode_of(&n) == XH_STREAM_ONE, "stream-one, названный явно, при tls остаётся");
+    n.mode = "stream-up";
+    n.security = "reality";
+    check(xhttp_mode_of(&n) == XH_STREAM_UP, "stream-up, названный явно, остаётся");
+}
+
+/* WINDOW_UPDATE на 500000 для соединения и потока. */
+static void srv_window_update(uint32_t sid) {
+    unsigned char f[13] = { 0, 0, 4, 0x08, 0, (unsigned char)(sid >> 24), (unsigned char)(sid >> 16),
+                            (unsigned char)(sid >> 8), (unsigned char)sid, 0, 0x07, 0xA1, 0x20 };
+    if (write(g_srv, f, sizeof(f)) != (ssize_t)sizeof(f)) { perror("write"); exit(2); }
+}
+
+/* Связь выгрузки цикл туннеля не читает: низкое место должно сначала слить её, иначе WINDOW_UPDATE
+ * сервера лежат непрочитанными, окно клиента остаётся закрытым, и выгрузка встаёт (stream-up падал с
+ * 3 ГБ до 14 МБ за 20 с). */
+static void t_room_drains_up_link(void) {
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    struct transport c;
+    conn_init(&c, XH_STREAM_UP, fd);
+    int ro = up_request(&c, -1);
+    srv_drain();
+    srv_window_update(0);
+    srv_window_update(1);
+    long room = transport_room(&c);
+    check(ro == 0 && room > 500000, "stream-up: место читает WINDOW_UPDATE связи выгрузки, окно не стоит закрытым");
+    close(fd);
+
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    conn_init(&c, XH_PACKET_UP, fd);
+    static unsigned char big[60000];
+    int rc = transport_write(&c, big, sizeof(big));         /* окно соединения почти выбрано */
+    srv_drain();
+    long before = packet_room(&c.xh.up);
+    srv_window_update(0);
+    room = transport_room(&c);
+    check(rc == 0 && before < 10000 && room == 65535,
+          "packet-up: место читает WINDOW_UPDATE связи выгрузки (потолок — окно потока)");
+    close(fd);
+}
+
 int main(void) {
     t_packet_up(0x8C, 1, "I-219: packet-up — 400 на прошлый кусок возвращён отправке");
     t_packet_up(0x88, 0, "I-219: packet-up — 200 на прошлый кусок отказом не считается");
     t_stream_up(0x8C, 1, "I-219: stream-up — 400 на выгрузку возвращён отправке");
     t_stream_up(0x88, 0, "I-219: stream-up — 200 на выгрузку отказом не считается");
+    t_post_max();
+    t_auto_mode();
+    t_room_drains_up_link();
     printf(g_fail ? "\nxhupmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;
 }

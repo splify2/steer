@@ -32,13 +32,16 @@ static void xhttp_path(const struct tr_node *n, char *out, size_t cap) {
              len && p[len - 1] == '/' ? "" : "/");
 }
 
-/* Режим xhttp узла. Пусто и «auto» — stream-one: его же выбирает Xray при reality, и он
- * дешевле всех. Всё остальное названо в ссылке явно, и разбор подписки уже отсеял то, чего
+/* Режим xhttp узла. Пусто и «auto» решаются как у клиента Xray (splithttp/dialer.go): stream-one
+ * при reality, иначе (tls, none) packet-up. Сервер вправе принимать только тот режим, на который
+ * настроен, и сервер packet-up отвечает на stream-one 400, поэтому auto обязан выбрать то, что
+ * выбрал бы клиент Xray. Всё остальное названо в ссылке явно, и разбор подписки уже отсеял то, чего
  * мы не умеем (sub.c), так что сюда доходят только эти три. */
 static enum xhttp_mode xhttp_mode_of(const struct tr_node *n) {
     if (!strcmp(n->mode, "packet-up")) return XH_PACKET_UP;
     if (!strcmp(n->mode, "stream-up")) return XH_STREAM_UP;
-    return XH_STREAM_ONE;
+    if (!strcmp(n->mode, "stream-one")) return XH_STREAM_ONE;
+    return n->security && !strcmp(n->security, "reality") ? XH_STREAM_ONE : XH_PACKET_UP;
 }
 
 /* Идентификатор сессии. Ровно им сервер связывает запрос выгрузки с запросом загрузки, и
@@ -146,7 +149,10 @@ static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
 static int up_drain(struct xh_up *u) {
     if (!u->started) return 0;
     static __thread unsigned char sink[H2_MIN_READ_CAP];
-    for (int i = 0; i < 4; i++) {
+    /* Пока связь не опустеет (h2_read без ожидания ничего не вернул), но с пределом, чтобы один
+     * вызов не крутился вечно: packet-up оставляет ответ на каждый кусок, а WINDOW_UPDATE лежат
+     * за ними. */
+    for (int i = 0; i < 64; i++) {
         size_t got = 0;
         int rc = h2_read(&u->h2, sink, sizeof(sink), &got);
         if (rc == H2_ESTATUS) return rc;
@@ -184,14 +190,17 @@ static int up_request(struct transport *t, long long seq) {
     if (xhttp_referer(ref, sizeof(ref), x->authority, path, x->pad_from, x->pad_to))
         return H2_ETOOBIG;
 
+    /* Content-Type: application/grpc только у запроса stream-up. Xray ставит его на запросы потока
+     * (stream-up, stream-one), на куски packet-up — никогда; сервер его не проверяет, но кусок с
+     * ним не похож на кусок Xray. */
+    const char *ctype = seq < 0 ? "application/grpc" : NULL;
     if (!u->started) {
-        int rc = h2_start_ex(&u->h2, &io, x->authority, path, "application/grpc", ref,
-                             H2_POST, 0, 1);
+        int rc = h2_start_ex(&u->h2, &io, x->authority, path, ctype, ref, H2_POST, 0, 1);
         if (rc) return rc;
         u->started = 1;
         return 0;
     }
-    return h2_next(&u->h2, x->authority, path, "application/grpc", ref, H2_POST);
+    return h2_next(&u->h2, x->authority, path, ctype, ref, H2_POST);
 }
 
 /* Поднять выгрузку, если она нужна этому режиму. Для stream-one не делает ничего: там
@@ -219,9 +228,11 @@ static int up_open(struct transport *t, const struct tr_node *n, int timeout_s) 
 static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     struct xh_state *x = &t->xh;
     struct h2_io io = { .ctx = &t->link, .write = tr_link_write, .read = tr_link_read };
-    /* Имя хоста в :authority — маскировочный домен, как и в SNI: сервер прикрывается им,
-     * и запрос к другому имени выдал бы нас сразу. */
-    const char *authority = n->sni[0] ? n->sni : n->host;
+    /* :authority так, как клиент Xray собирает URL: настройка host узла, иначе SNI (маскировочный
+     * домен, которым прикрывается сервер), иначе адрес. Сервер с заданным host сравнивает его с
+     * :authority и на любое другое имя отвечает 404 (hub.go). */
+    const char *authority = n->http_host && n->http_host[0] ? n->http_host
+                          : n->sni[0] ? n->sni : n->host;
     char path[320];
 
     /* Режим определяется ЗДЕСЬ, один раз: дальше он читается и при открытии потоков, и при
@@ -231,6 +242,13 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
     snprintf(x->authority, sizeof(x->authority), "%s", authority);
     x->pad_from = n->pad_from;
     x->pad_to = n->pad_to;
+    /* Одно значение на соединение из диапазона узла, как выбирает клиент Xray (dialer.go). */
+    x->post_max = 0;
+    if (n->post_to) {
+        uint32_t r = 0;
+        if (getrandom(&r, sizeof r, 0) != (ssize_t)sizeof r) r = 0;
+        x->post_max = n->post_from + r % (n->post_to - n->post_from + 1);
+    }
 
     /* __thread: буфер живёт между вызовами, но потоков теперь несколько, и один общий
      * массив они переписывали бы друг под другом. Своя копия на поток — 1,4 КБ. */
@@ -265,6 +283,21 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
     return up_open(t, n, timeout_s);
 }
 
+/* packet-up: сколько все куски записи могут нести вместе (окно соединения). */
+static long packet_conn_room(const struct xh_up *u) {
+    if (!u->started) return 65535;
+    return u->h2.send_win_conn > 0 ? u->h2.send_win_conn : 0;
+}
+
+/* packet-up: сколько несёт запрос следующего куска. До первого запроса окна — умолчательные
+ * 65535. */
+static long packet_room(const struct xh_up *u) {
+    if (!u->started) return 65535;
+    const struct h2 *h = &u->h2;
+    int32_t r = h->send_win_conn < h->peer_init_win ? h->send_win_conn : h->peer_init_win;
+    return r > 0 ? r : 0;
+}
+
 static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
     struct xh_state *x = &t->xh;
     switch (x->mode) {
@@ -272,8 +305,10 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
             return h2_write(&t->h2, d, n);
         case XH_STREAM_UP: {
             /* Один длинный POST на всё соединение: пишем в него и попутно забираем то, что
-             * сервер успел ответить. */
+             * сервер успел ответить. Закрытое окно может значить лишь непрочитанный
+             * WINDOW_UPDATE: слить и попробовать ещё раз, прежде чем отказывать. */
             int rc = h2_write(&x->up.h2, d, n);
+            if (rc == H2_EWINDOW && up_drain(&x->up) == 0) rc = h2_write(&x->up.h2, d, n);
             int dr = up_drain(&x->up);
             return rc ? rc : dr;
         }
@@ -286,13 +321,26 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
              * потока на каждое соединение, — а туннель зовёт отправку сам и о
              * времени ничего не знает. Поэтому один запрос на один вызов, и это
              * честная плата за режим, который выбирают тогда, когда другие не
-             * проходят вовсе. */
-            int rc = up_request(t, (long long)x->seq);
-            if (rc) return rc;
-            rc = h2_write(&x->up.h2, d, n);
-            if (rc) return rc;
-            rc = h2_end_stream(&x->up.h2);
-            x->seq++;
+             * проходят вовсе.
+             *
+             * Сервер отвечает 413 на тело POST больше своего scMaxEachPostBytes: запись больше
+             * post_max уходит несколькими кусками. «Всё или ничего» по-прежнему верно (контракт
+             * h2_write, на который опирается Vision выше): окна проверяются для всей записи до
+             * открытия первого куска, окно соединения — для суммы, окно каждого нового потока — для
+             * одного куска. */
+            size_t piece = x->post_max && x->post_max < n ? x->post_max : n;
+            if ((long)piece > packet_room(&x->up) || (long)n > packet_conn_room(&x->up))
+                up_drain(&x->up);
+            if ((long)piece > packet_room(&x->up) || (long)n > packet_conn_room(&x->up))
+                return H2_EWINDOW;
+            int rc = 0;
+            for (size_t off = 0; off < n && !rc; off += piece) {
+                size_t m = n - off < piece ? n - off : piece;
+                rc = up_request(t, (long long)x->seq);
+                if (!rc) rc = h2_write(&x->up.h2, d + off, m);
+                if (!rc) rc = h2_end_stream(&x->up.h2);
+                if (!rc) x->seq++;
+            }
             int dr = up_drain(&x->up);
             return rc ? rc : dr;
         }
@@ -329,18 +377,24 @@ static void xhttp_close(struct transport *t) {
  * ответы на куски выгрузки (up.h2) законно кончаются на каждом куске. */
 static int xhttp_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
 
-/* Что примет xhttp_write сейчас, по режимам: те же окна, которые он проверяет. */
-static long xhttp_room(const struct transport *t) {
-    const struct xh_state *x = &t->xh;
+/* Что примет xhttp_write сейчас, по режимам: те же окна, которые он проверяет.
+ *
+ * stream-up и packet-up выгружают по своей связи, которую цикл туннеля не наблюдает: он читает
+ * только связь загрузки. WINDOW_UPDATE сервера для выгрузки читал лишь up_drain после записи, и
+ * когда окно клиента стало выбираться по месту (dialer_ops.room), закрытое место значило «нет
+ * записей», то есть «нет чтений», и место оставалось закрытым: выгрузка stream-up падала с 3 ГБ до
+ * 14 МБ за 20 с. Поэтому низкое место сначала сливает связь выгрузки, а потом сообщается. */
+#define UP_ROOM_LOW 65536
+static long xhttp_room(struct transport *t) {
+    struct xh_state *x = &t->xh;
     switch (x->mode) {
         case XH_STREAM_ONE: return h2_room(&t->h2);
-        case XH_STREAM_UP: return h2_room(&x->up.h2);
-        case XH_PACKET_UP: {
-            if (!x->up.started) return 65535;
-            const struct h2 *h = &x->up.h2;
-            int32_t r = h->send_win_conn < h->peer_init_win ? h->send_win_conn : h->peer_init_win;
-            return r > 0 ? r : 0;
-        }
+        case XH_STREAM_UP:
+            if (h2_room(&x->up.h2) < UP_ROOM_LOW) up_drain(&x->up);
+            return h2_room(&x->up.h2);
+        case XH_PACKET_UP:
+            if (packet_room(&x->up) < UP_ROOM_LOW) up_drain(&x->up);
+            return packet_room(&x->up);
     }
     return h2_room(&t->h2);
 }

@@ -166,7 +166,7 @@ static void grpc_moved(struct transport *t) { t->h2.io.ctx = &t->link; }
 static int grpc_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
 
 /* Сообщение gRPC добавляет к каждой записи 5 байт заголовка и до 4 байт тега и длины protobuf. */
-static long grpc_room(const struct transport *t) {
+static long grpc_room(struct transport *t) {
     long r = h2_room(&t->h2) - 9;
     return r > 0 ? r : 0;
 }

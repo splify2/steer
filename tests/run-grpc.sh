@@ -1,5 +1,5 @@
 #!/bin/sh
-# VLESS через gRPC + Reality против НАСТОЯЩЕГО Xray-core: проба узла и несколько минут нагрузки в обе стороны
+# VLESS против НАСТОЯЩЕГО Xray-core, по случаю на каждую настройку транспорта: проба узла и нагрузка в обе стороны
 # (issue 39, «постоянно рвётся туннель Vless gRPC Reality»).
 #
 # Зачем, если есть tests/grpcmatch.c и tests/h2match.c. Те проверяют кадры и транспорт в памяти, с кадрами,
@@ -17,12 +17,14 @@
 #
 # Что проверяется (провал — код 1, причина в последней строке):
 #   1. проба узла (`steer-vless vless-probe`) 30 раз подряд: отказов 0;
-#   2. DUR секунд (умолчание 190 — три минуты с запасом) нагрузки через туннель: два долгих потока вниз, два
+#   2. DUR секунд (умолчание 60) нагрузки через туннель: два долгих потока вниз, два
 #      вверх и короткие «страницы» по 10 в секунду: ни одна страница не усечена и не повисла, долгие потоки
 #      не оборваны и ни одно направление не встаёт на 15 секунд;
 #   3. сторож: `interval: 10` у выхода — за прогон около 19 проверок каждого узла; в журнале steer не должно
 #      быть «не отвечает», «ищу замену» и «не открылся» (то, что и видела панель: узел мёртв → трафик остановлен).
-# MODES — режимы gRPC через пробел (gun, multi); умолчание — gun.
+# CASES — случаи через пробел (умолчание — все, см. case_cfg). Случай — это конфиг сервера (streamSettings
+# Xray) и подходящая ему ссылка, так что настройка, которую клиент читает неверно, видна как провал пробы
+# или нагрузки против настоящего сервера.
 #
 # Стороны РАЗВЕДЕНЫ по сетевым пространствам, как в run-reality.sh: клиент (steer-vless, его устройство vl и
 # нагрузка) — в одном, Xray, маскировочный сайт Reality и цель — в другом. «Сайт» — адрес на lo сервера; там же
@@ -35,8 +37,11 @@ set -eu
 cd "$(dirname "$0")/.."
 
 LIBS="${LIBS:-build/libs-host}"
-DUR="${DUR:-190}"
-MODES="${MODES:-gun}"
+DUR="${DUR:-60}"
+ALL_CASES="grpc-gun grpc-multi xhttp-auto xhttp-stream-one xhttp-stream-up xhttp-packet-up xhttp-tls
+           xhttp-auto-tls xhttp-auto-one xhttp-padding xhttp-host xhttp-path xhttp-up-secs
+           xhttp-no-sse xhttp-post-max"
+CASES="${CASES:-$ALL_CASES}"
 XRAY="${XRAY:-$(command -v xray 2>/dev/null || true)}"
 
 [ "$(id -u)" = 0 ] || { echo "run-grpc: ПРОПУСК — нужен root (ip netns). Это не падение."; exit 0; }
@@ -105,17 +110,62 @@ NFT
 fi
 
 FAIL=0
-for MODE in $MODES; do
-    MULTI=false; [ "$MODE" = multi ] && MULTI=true
-    echo "run-grpc: ==== режим $MODE ===="
+# Один случай: NET (streamSettings без security), SEC (reality | tls), Q (параметры транспорта ссылки).
+# Умолчания — у самого Xray.
+case_cfg() {
+    SEC=reality
+    XP='{"path":"/xp/"}'
+    case "$1" in
+    grpc-gun|grpc-multi)
+        m=${1#grpc-}; multi=false; [ "$m" = multi ] && multi=true
+        NET="\"network\":\"grpc\",\"grpcSettings\":{\"serviceName\":\"$SVC\",\"multiMode\":$multi}"
+        Q="type=grpc&serviceName=$SVC&mode=$m" ;;
+    xhttp-auto)        Q="type=xhttp&path=%2Fxp%2F" ;;
+    xhttp-stream-one|xhttp-stream-up|xhttp-packet-up)
+                       Q="type=xhttp&path=%2Fxp%2F&mode=${1#xhttp-}" ;;
+    # TLS вместо Reality: клиент сверяет сертификат узла по отпечатку (pcs).
+    xhttp-tls)         SEC=tls; Q="type=xhttp&path=%2Fxp%2F&mode=stream-up" ;;
+    # auto решается как у клиента Xray: packet-up при TLS, stream-one при Reality. Сервер, настроенный
+    # на один режим, отвечает на остальные 400 (hub.go), так что неверный выбор падает здесь.
+    xhttp-auto-tls)    SEC=tls; XP='{"path":"/xp/","mode":"packet-up"}'
+                       Q="type=xhttp&path=%2Fxp%2F" ;;
+    xhttp-auto-one)    XP='{"path":"/xp/","mode":"stream-one"}'; Q="type=xhttp&path=%2Fxp%2F" ;;
+    # Сервер сверяет длину набивки со своим диапазоном: ссылка несёт его в extra.
+    xhttp-padding)     XP='{"path":"/xp/","xPaddingBytes":"20-40"}'
+                       Q="type=xhttp&path=%2Fxp%2F&mode=packet-up&extra=%7B%22xPaddingBytes%22%3A%2220-40%22%7D" ;;
+    # host задан на сервере: запросы обязаны его называть.
+    xhttp-host)        XP='{"path":"/xp/","host":"cdn.xhttp.test"}'
+                       Q="type=xhttp&path=%2Fxp%2F&mode=stream-up&host=cdn.xhttp.test" ;;
+    # Путь без завершающего слэша, как его пишут панели.
+    xhttp-path)        XP='{"path":"/a/b"}'; Q="type=xhttp&path=%2Fa%2Fb&mode=packet-up" ;;
+    # stream-up: сервер пишет набивку в ответ выгрузки раз в 1-2 с.
+    xhttp-up-secs)     XP='{"path":"/xp/","scStreamUpServerSecs":"1-2"}'
+                       Q="type=xhttp&path=%2Fxp%2F&mode=stream-up" ;;
+    xhttp-no-sse)      XP='{"path":"/xp/","noSSEHeader":true}'; Q="type=xhttp&path=%2Fxp%2F&mode=packet-up" ;;
+    # packet-up: сервер ограничивает тело каждого POST; ссылка называет предел.
+    xhttp-post-max)    XP='{"path":"/xp/","scMaxEachPostBytes":4096}'
+                       Q="type=xhttp&path=%2Fxp%2F&mode=packet-up&extra=%7B%22scMaxEachPostBytes%22%3A4096%7D" ;;
+    *) echo "run-grpc: неизвестный случай $1"; exit 2 ;;
+    esac
+    case "$1" in xhttp-*) NET="\"network\":\"xhttp\",\"xhttpSettings\":$XP" ;; esac
+    if [ "$SEC" = reality ]; then
+        SECJ="\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"dest\":\"$S_IP:8443\",\"xver\":0,\"serverNames\":[\"$MASK\"],\"privateKey\":\"$PRIV\",\"shortIds\":[\"$SID\"]}"
+        LSEC="security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=chrome"
+    else
+        SECJ="\"security\":\"tls\",\"tlsSettings\":{\"alpn\":[\"h2\",\"http/1.1\"],\"certificates\":[{\"certificateFile\":\"$W/mask.pem\",\"keyFile\":\"$W/mask.key\"}]}"
+        PCS=$(openssl x509 -in "$W/mask.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+        LSEC="security=tls&sni=$MASK&alpn=h2&fp=chrome&pcs=$PCS"
+    fi
+}
+
+for MODE in $CASES; do
+    case_cfg "$MODE"
+    echo "run-grpc: ==== случай $MODE ===="
     cat > "$W/xray.json" <<JSON
 {"log":{"loglevel":"warning","access":"$W/xray-access-$MODE.log"},
  "inbounds":[{"listen":"$S_IP","port":$PORT,"protocol":"vless",
    "settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
-   "streamSettings":{"network":"grpc","security":"reality",
-     "grpcSettings":{"serviceName":"$SVC","multiMode":$MULTI},
-     "realitySettings":{"show":false,"dest":"$S_IP:8443","xver":0,"serverNames":["$MASK"],
-       "privateKey":"$PRIV","shortIds":["$SID"]}}}],
+   "streamSettings":{$NET,$SECJ}}],
  "outbounds":[{"protocol":"freedom","tag":"direct"}]}
 JSON
     ip netns exec "$NSS" "$XRAY" run -c "$W/xray.json" > "$W/xray-$MODE.log" 2>&1 &
@@ -123,7 +173,7 @@ JSON
     for _ in $(seq 40); do ip netns exec "$NSS" ss -ltn 2>/dev/null | grep -q ":$PORT " && break; sleep 0.25; done
     ip netns exec "$NSS" ss -ltn 2>/dev/null | grep -q ":$PORT " || { echo "run-grpc: Xray не поднялся:"; tail -5 "$W/xray-$MODE.log"; exit 1; }
 
-    printf '%s\n' "vless://$UUID@$S_IP:$PORT?encryption=none&type=grpc&serviceName=$SVC&mode=$MODE&security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=chrome#grpc-$MODE" > "$W/sub.txt"
+    printf '%s\n' "vless://$UUID@$S_IP:$PORT?encryption=none&$Q&$LSEC#$MODE" > "$W/sub.txt"
     # interval: 10 — сторож проверяет узел каждые 10 секунд, а не раз в минуту: за прогон набирается около 19
     # проверок, и ложное «узел мёртв» (две неудачи подряд) не придётся ждать.
     cat > "$W/spec.yaml" <<SPEC
@@ -176,22 +226,23 @@ SPEC
         --down 2 --up 2 --rate 10 --report 10 || rc=$?
 
     # Что видела панель: узел объявлен мёртвым, соединения сброшены, поток к узлу не открылся.
-    bad_log=$(grep -E "не отвечает|ищу замену|не открылся|снова отвечает" "$W/steer-$MODE.log" || true)
+    # ... или узел не принял выгруженные данные (xhttp: 413 сверх scMaxEachPostBytes, 400 на набивку).
+    bad_log=$(grep -E "не отвечает|ищу замену|не открылся|снова отвечает|не принял данные" "$W/steer-$MODE.log" || true)
     if [ -n "$bad_log" ]; then
-        echo "run-grpc: ПРОВАЛ — сторож объявлял узел мёртвым или поток не открывался:"
+        echo "run-grpc: ПРОВАЛ — сторож объявлял узел мёртвым, поток не открывался или данные были отвергнуты:"
         printf '%s\n' "$bad_log" | head -5 | sed 's/^/    /'
         rc=1
     fi
     if command -v nft >/dev/null 2>&1; then
         syns=$(ip netns exec "$NSS" nft list chain inet grpccnt in 2>/dev/null | sed -n 's/.*packets \([0-9]*\) .*comment "syn".*/\1/p')
-        [ -n "$syns" ] && echo "run-grpc: соединений TCP к узлу за режим: $syns"
+        [ -n "$syns" ] && echo "run-grpc: соединений TCP к узлу за случай: $syns"
     fi
     kill "$SPID" 2>/dev/null || true
     sleep 0.5
     ip netns exec "$NSC" ip link delete vl 2>/dev/null || true
     kill "$XPID" 2>/dev/null || true
     sleep 0.5
-    if [ "$rc" -ne 0 ]; then FAIL=1; echo "run-grpc: режим $MODE — ПРОВАЛ"; else echo "run-grpc: режим $MODE — ok"; fi
+    if [ "$rc" -ne 0 ]; then FAIL=1; echo "run-grpc: случай $MODE — ПРОВАЛ"; else echo "run-grpc: случай $MODE — ok"; fi
 done
 
 [ "$FAIL" -eq 0 ] && echo "run-grpc: все проверки прошли" || echo "run-grpc: ЕСТЬ ПРОВАЛЫ"

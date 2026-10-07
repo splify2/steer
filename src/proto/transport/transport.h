@@ -84,6 +84,8 @@ struct tr_node {
     /* Длина набивки xhttp, объявленная узлом (см. vless_node.pad_from в vless.h). 0 в pad_to —
      * не объявлено, тогда умолчание Xray. */
     uint16_t pad_from, pad_to;
+    /* Предел тела POST packet-up у узла (см. vless_node.post_from). 0 в post_to — не объявлено. */
+    uint32_t post_from, post_to;
     /* Reality: открытый ключ ML-DSA-65 для проверки подписи сертификата, base64url (1952 байта в
      * бинарном виде), или NULL. Поле mldsa65Verify конфига Xray, `pqv` ссылки. */
     const char *pqv;
@@ -170,6 +172,10 @@ struct xh_state {
      * (packet-up) собираются уже без узла на руках, а набивка нужна каждому: сервер
      * проверяет её у КАЖДОГО запроса, а не только у первого. */
     uint16_t pad_from, pad_to;
+    /* packet-up: сколько самое большее несёт один POST на этом соединении, выбрано при открытии
+     * из диапазона узла (как делает клиент Xray); запись больше уходит несколькими кусками.
+     * 0 — предела нет. */
+    uint32_t post_max;
 };
 
 /* Разбор кадров WebSocket от сервера (RFC 6455, раздел 5) — потоком, по кускам любой длины.
@@ -277,7 +283,7 @@ struct transport_ops {
     int  (*busy)(const struct transport *t);
     /* Сколько байт запись примет сейчас: окно отправки HTTP/2 (grpc, xhttp). Запись больше этого
      * закончится H2_EWINDOW. NULL — предела нет (tcp, ws, httpupgrade: буфер сокета). */
-    long (*room)(const struct transport *t);
+    long (*room)(struct transport *t);
 };
 
 /* Безопасность — поле security= ссылки. Различаются только рукопожатием (см. шапку). */
@@ -322,7 +328,7 @@ int transport_write(struct transport *t, const unsigned char *d, size_t n);
  * транспорта (заголовок сообщения gRPC, записи шифрования VLESS); -1 — предела нет. Туннель
  * по этому числу выбирает окно клиента: клиент шлёт то, что узел может принять, а не узнаёт
  * об этом по таймаутам повторной передачи (см. dialer_ops.room). */
-long transport_room(const struct transport *t);
+long transport_room(struct transport *t);
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got);
 
 /* Приём БЕЗ ЛИШНЕЙ КОПИИ там, где транспорт это позволяет (transport_ops.zc).

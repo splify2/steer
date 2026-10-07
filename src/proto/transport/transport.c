@@ -176,7 +176,7 @@ int transport_write(struct transport *t, const unsigned char *d, size_t n) {
     return t->fr->write(t, d, n);
 }
 
-long transport_room(const struct transport *t) {
+long transport_room(struct transport *t) {
     if (!t->fr || !t->fr->room) return -1;
     long r = t->fr->room(t);
     /* Шифрование VLESS оборачивает каждую запись в запись AEAD: длина и метка. Берём запас, а не

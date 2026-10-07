@@ -426,6 +426,15 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
                     sj_str(j, pb, sizeof(pb));
                     sl_pad_range(n, pb);
                 }
+                /* Число или строка «от-до»: сырое слово, разбирается как в ссылке. */
+                else if (!strcmp(k2, "scMaxEachPostBytes")) {
+                    sj_ws(j);
+                    const char *b = j->p;
+                    sj_skip(j);
+                    char raw[48];
+                    size_t l = (size_t)(j->p - b);
+                    if (l < sizeof raw) { memcpy(raw, b, l); raw[l] = 0; sl_post_range(n, raw); }
+                }
                 else if (!strcmp(k2, "extra")) {
                     /* Вложенный extra (форма ссылки внутри конфига): тот же просмотр, что у ссылки. */
                     const char *b = j->p;
@@ -434,13 +443,18 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
                     char *cp = malloc(l + 1);
                     if (cp) { memcpy(cp, b, l); cp[l] = 0; sl_parse_extra(n, cp); free(cp); }
                 }
-                else if (!strcmp(k2, "downloadSettings") || !strcmp(k2, "sessionIDPlacement") ||
-                         !strcmp(k2, "seqPlacement") || !strcmp(k2, "uplinkDataPlacement") ||
-                         !strcmp(k2, "xPaddingPlacement") || !strcmp(k2, "xPaddingMethod")) {
+                else if (!strcmp(k2, "downloadSettings")) {
                     sj_ws(j);
-                    if (*j->p == '"' && j->p[1] == '"') { sj_skip(j); }
-                    else if (!strncmp(j->p, "null", 4)) sj_skip(j);
-                    else { n->xh_extra = 1; sj_skip(j); }
+                    if (strncmp(j->p, "null", 4) != 0) n->xh_extra = 1;
+                    sj_skip(j);
+                }
+                else if (!strcmp(k2, "sessionPlacement") || !strcmp(k2, "sessionIDPlacement") ||
+                         !strcmp(k2, "seqPlacement") || !strcmp(k2, "uplinkDataPlacement") ||
+                         !strcmp(k2, "xPaddingMethod")) {
+                    char v[32] = "";
+                    sj_ws(j);
+                    if (*j->p == '"') sj_str(j, v, sizeof v); else sj_skip(j);
+                    if (sl_xh_setting_bad(k2, v)) n->xh_extra = 1;
                 }
                 else if (!strcmp(k2, "xPaddingObfsMode")) { if (sj_bool(j)) n->xh_extra = 1; }
                 else sj_skip(j);

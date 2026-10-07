@@ -149,7 +149,7 @@ struct dialer_ops {
      * передачи, который удваивается на каждом повторе. Против окна gRPC у Xray в 94 КБ это
      * держало выгрузку на 10-20 Мбит/с с многосекундными остановками. Когда место
      * возвращается (WINDOW_UPDATE, прочитанный drain_conn), стек шлёт клиенту обновление окна. */
-    long (*room)(const void *ctx, const void *sess);
+    long (*room)(const void *ctx, void *sess);
     /* Уложить датаграмму клиента в байты потока к узлу; 0 — не влезла. */
     size_t (*dgram_frame)(const unsigned char *p, size_t n, unsigned char *out, size_t cap);
     /* Прочитать у связи. *got — сколько байт пришло от узла (до разбора: по ним стек мерит

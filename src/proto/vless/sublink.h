@@ -58,6 +58,9 @@ void sl_set_vcn(struct vless_node *n, const char *v);
 void sl_set_ech(struct vless_node *n, const char *v);
 /* xhttp: длина набивки «512» или «50-150» и поле extra ссылки (JSON). */
 void sl_pad_range(struct vless_node *n, const char *v);
+void sl_post_range(struct vless_node *n, const char *v);
+/* 1: значение этой настройки xhttp требует запросов, которых клиент не делает (см. sublink.c). */
+int sl_xh_setting_bad(const char *key, const char *val);
 void sl_parse_extra(struct vless_node *n, const char *extra);
 
 /* ---- ссылка целиком ------------------------------------------------------------------------- */
@@ -110,6 +113,8 @@ static inline void sl_tr_node(const struct vless_node *n, struct tr_node *t) {
     t->mode = n->mode;
     t->pad_from = n->pad_from;
     t->pad_to = n->pad_to;
+    t->post_from = n->post_from;
+    t->post_to = n->post_to;
     t->http_host = n->http_host;
     t->headers = n->headers;
     t->pqv = n->pqv;

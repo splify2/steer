@@ -654,9 +654,9 @@ int vless_tunnel_run(struct output *o, const struct pool_cfg *pc,
 /* Что примет vl_send сейчас (dialer_ops.room): место у транспорта без того, что vl_send ставит
  * перед данными, — заголовка запроса, пока он не отправлен, и кадра Vision (набивка до
  * примерно 1400 байт), пока Vision не закончил набивку. */
-static long vl_room(const void *ctx, const void *sess) {
+static long vl_room(const void *ctx, void *sess) {
     const struct vless_node *node = ctx;
-    const struct vl_sess *s = sess;
+    struct vl_sess *s = sess;
     long r = transport_room(&s->t);
     if (r < 0) return -1;
     if (!s->header_sent) r -= 64;

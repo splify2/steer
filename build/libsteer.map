@@ -256,6 +256,7 @@ LIBSTEER_1 {
     sl_parse_extra;
     sl_pct_decode;
     sl_port_of;
+    sl_post_range;
     sl_set_ech;
     sl_set_field;
     sl_set_name;
@@ -265,6 +266,7 @@ LIBSTEER_1 {
     sl_truthy;
     sl_utf8_trim_tail;
     sl_uuid_parse;
+    sl_xh_setting_bad;
     spec_dns_up_used;
     spec_is_mac;
     spec_line_family;
