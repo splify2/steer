@@ -149,15 +149,27 @@ static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
 static int up_drain(struct xh_up *u) {
     if (!u->started) return 0;
     static __thread unsigned char sink[H2_MIN_READ_CAP];
-    /* Пока связь не опустеет (h2_read без ожидания ничего не вернул), но с пределом, чтобы один
-     * вызов не крутился вечно: packet-up оставляет ответ на каждый кусок, а WINDOW_UPDATE лежат
-     * за ними. */
+    /* Пока связь не опустеет, но с пределом, чтобы один вызов не крутился вечно. НЕ пока чтение не
+     * вернёт данных: на этой связи оно не вернёт их никогда (ответы — пустые 200), и остановка
+     * по этому признаку брала по одной записи за вызов, а ответ на кусок лежал за WINDOW_UPDATE и
+     * SETTINGS. */
     for (int i = 0; i < 64; i++) {
+        /* packet-up: ответ на ТЕКУЩИЙ кусок (done) ничего не говорит о старых, ответы на которые
+         * ещё в пути: сервер отвечает в любом порядке. h2_read отказался бы читать, раз done стоит,
+         * и ответ на самый старый кусок никогда не прочитался бы: его окно оставалось полным, и
+         * выгрузка вставала навсегда (нового куска нет, значит нет и h2_next, который сбросил бы
+         * done). */
+        if (u->h2.done && !u->h2.pend_err && h2_open_streams(&u->h2) > 0) u->h2.done = 0;
+        int more = !u->link.plain && tls13_has_record(&u->link.tls);
+        if (!more) {
+            struct pollfd p = { .fd = u->link.fd, .events = POLLIN };
+            more = poll(&p, 1, 0) > 0 && (p.revents & POLLIN);
+        }
+        if (!more) return 0;
         size_t got = 0;
         int rc = h2_read(&u->h2, sink, sizeof(sink), &got);
         if (rc == H2_ESTATUS) return rc;
         if (rc) return 0;
-        if (!got) return 0;
     }
     return 0;
 }
@@ -289,10 +301,33 @@ static long packet_conn_room(const struct xh_up *u) {
     return u->h2.send_win_conn > 0 ? u->h2.send_win_conn : 0;
 }
 
+/* packet-up: насколько вперёд от самого старого неотвеченного куска может уйти новый, в кусках.
+ * Сервер берёт каждый POST в своей горутине и ставит куски по порядку seq, держа не больше
+ * scMaxBufferedPosts (умолчание 30) за пропавшим; сверх этого он рвёт соединение без ошибки HTTP
+ * («packet queue is too large», upload_queue.go), и поток просто кончается. Посланные вплотную,
+ * наши куски под нагрузкой туда доходили: одна медленная горутина — это дыра, и всё, что ушло
+ * тем временем, копится за ней. Ограничить число неотвеченных кусков мало: поздние отвечаются и
+ * освобождают места, а дыра остаётся. Поэтому предел — окно по seq, как в TCP: ни один кусок не
+ * дальше PACKET_INFLIGHT от самого старого неотвеченного. Восемь — с большим запасом до умолчания
+ * сервера и ниже даже сниженного. */
+#define PACKET_INFLIGHT 8
+#define PACKET_SLOT 8192
+
+/* Сколько кусков ещё можно послать, пока окно по seq не заполнено (см. PACKET_INFLIGHT). Номера
+ * потоков растут на два за кусок. */
+static long packet_slots(const struct xh_up *u) {
+    if (!u->started) return PACKET_INFLIGHT;
+    uint32_t oldest = h2_oldest_open(&u->h2);
+    if (!oldest) return PACKET_INFLIGHT;
+    long ahead = (long)(u->h2.sid - oldest) / 2 + 1;   /* кусков от самого старого до последнего */
+    return ahead >= PACKET_INFLIGHT ? 0 : PACKET_INFLIGHT - ahead;
+}
+
 /* packet-up: сколько несёт запрос следующего куска. До первого запроса окна — умолчательные
  * 65535. */
 static long packet_room(const struct xh_up *u) {
     if (!u->started) return 65535;
+    if (packet_slots(u) <= 0) return 0;
     const struct h2 *h = &u->h2;
     int32_t r = h->send_win_conn < h->peer_init_win ? h->send_win_conn : h->peer_init_win;
     return r > 0 ? r : 0;
@@ -329,10 +364,15 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
              * открытия первого куска, окно соединения — для суммы, окно каждого нового потока — для
              * одного куска. */
             size_t piece = x->post_max && x->post_max < n ? x->post_max : n;
-            if ((long)piece > packet_room(&x->up) || (long)n > packet_conn_room(&x->up))
-                up_drain(&x->up);
-            if ((long)piece > packet_room(&x->up) || (long)n > packet_conn_room(&x->up))
-                return H2_EWINDOW;
+            /* Куски этой записи обязаны уместиться среди неотвеченных; запись, которой одной нужно
+             * больше PACKET_INFLIGHT (крошечный scMaxEachPostBytes), никого не ждёт. */
+            int pieces = (int)((n + piece - 1) / piece);
+#define PACKET_FITS() ((long)piece <= packet_room(&x->up) && (long)n <= packet_conn_room(&x->up) && \
+                       (packet_slots(&x->up) >= pieces || \
+                        (pieces > PACKET_INFLIGHT && !h2_open_streams(&x->up.h2))))
+            if (!PACKET_FITS()) up_drain(&x->up);
+            if (!PACKET_FITS()) return H2_EWINDOW;
+#undef PACKET_FITS
             int rc = 0;
             for (size_t off = 0; off < n && !rc; off += piece) {
                 size_t m = n - off < piece ? n - off : piece;
@@ -392,9 +432,23 @@ static long xhttp_room(struct transport *t) {
         case XH_STREAM_UP:
             if (h2_room(&x->up.h2) < UP_ROOM_LOW) up_drain(&x->up);
             return h2_room(&x->up.h2);
-        case XH_PACKET_UP:
-            if (packet_room(&x->up) < UP_ROOM_LOW) up_drain(&x->up);
-            return packet_room(&x->up);
+        case XH_PACKET_UP: {
+            /* В БАЙТАХ, которые несут свободные места под куски, а не окно HTTP/2: окно бывает в
+             * мегабайты, а неотвеченных кусков может быть лишь PACKET_INFLIGHT. Получив окно, клиент
+             * слал куда больше, чем брали места, и каждый отказанный сегмент ждал таймаута повторной
+             * передачи (11 МБ выгружено за 20 с). Место считается по PACKET_SLOT байт, меньше того, что
+             * стек собирает в одну отправку (до 16 КБ), так что выданное окно заполняет куски целиком;
+             * post_max — когда предел узла меньше. */
+            if (packet_room(&x->up) < UP_ROOM_LOW || packet_slots(&x->up) <= PACKET_INFLIGHT / 2)
+                up_drain(&x->up);
+            long r = packet_room(&x->up);
+            long slots = packet_slots(&x->up);
+            long per = x->post_max && x->post_max < PACKET_SLOT ? (long)x->post_max : PACKET_SLOT;
+            if (slots < 0) slots = 0;
+            if (r > slots * per) r = slots * per;
+            if (r > packet_conn_room(&x->up)) r = packet_conn_room(&x->up);
+            return r;
+        }
     }
     return h2_room(&t->h2);
 }

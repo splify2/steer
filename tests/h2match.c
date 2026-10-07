@@ -397,6 +397,48 @@ int main(void) {
     }
 
     {
+        /* ---- потоки, ответ на которые не закончился, считаются (h2_open_streams) ----
+         *
+         * Число неотвеченных кусков packet-up ограничивается по нему: Go-сервер рвёт сессию, когда
+         * слишком много кусков ждут пропавшего. Поток кончается END_STREAM на своих HEADERS или DATA
+         * либо RST_STREAM, чем бы ни пришло первым, и только один раз. */
+        static const unsigned char st200[1] = { 0x88 };
+        static const unsigned char no_error[4] = { 0, 0, 0, 0 };
+        struct h2 h;
+        struct fake_io io;
+        unsigned char feed[128];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+
+        h2_open(&h, &io);
+        h2_end_stream(&h);
+        h2_next(&h, "example.org", "/x/sid/1", NULL, NULL, H2_POST);
+        h2_end_stream(&h);
+        h2_next(&h, "example.org", "/x/sid/2", NULL, NULL, H2_POST);
+        check("открытые потоки: три запроса, ни один не отвечен", 3, h2_open_streams(&h));
+        io.feed = feed; io.feed_pos = 0;
+        size_t fn = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, st200, 1);
+        io.feed_n = fn;
+        h2_read(&h, out, sizeof(out), &got);
+        check("открытые потоки: END_STREAM на первом", 2, h2_open_streams(&h));
+        check("открытые потоки: самый старый — второй запрос", 3, (int)h2_oldest_open(&h));
+        io.feed_pos = 0;
+        fn = put_frame(feed, FR_RST_STREAM, 0, 1, no_error, 4);             /* уже закончен */
+        fn += put_frame(feed + fn, FR_RST_STREAM, 0, 3, no_error, 4);
+        io.feed_n = fn;
+        h2_read(&h, out, sizeof(out), &got);
+        check("открытые потоки: RST_STREAM на втором, опоздавший на первом", 1,
+              h2_open_streams(&h));
+        io.feed_pos = 0;
+        fn = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS, h.sid, st200, 1);
+        fn += put_frame(feed + fn, FR_DATA, FLAG_END_STREAM, h.sid, NULL, 0);
+        io.feed_n = fn;
+        h2_read(&h, out, sizeof(out), &got);
+        check("открытые потоки: END_STREAM на пустом DATA текущего", 0, h2_open_streams(&h));
+        check("открытые потоки: открытых нет, самого старого нет", 0, (int)h2_oldest_open(&h));
+    }
+
+    {
         /* ---- следующий запрос влезает туда же, куда первый (I-325) -----------------
          *
          * Кусок packet-up идёт обликом браузера с Referer до 1399 байт (предел xhttp_referer_r

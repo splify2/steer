@@ -209,12 +209,60 @@ static void t_room_drains_up_link(void) {
     long before = packet_room(&c.xh.up);
     srv_window_update(0);
     room = transport_room(&c);
-    check(rc == 0 && before < 10000 && room == 65535,
-          "packet-up: место читает WINDOW_UPDATE связи выгрузки (потолок — окно потока)");
+    check(rc == 0 && before < 10000 && room == (PACKET_INFLIGHT - 1) * PACKET_SLOT,
+          "packet-up: место читает WINDOW_UPDATE связи выгрузки (потолок — свободные места под куски)");
+    close(fd);
+}
+
+/* Осталось ли в сокете «клиента» непрочитанное от «сервера». */
+static int unread(int fd) {
+    char b;
+    return recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT) > 0;
+}
+
+/* packet-up: сервер отвечает на куски в любом порядке. Здесь ТЕКУЩИЙ кусок (поток 3) отвечен первым,
+ * а старый (поток 1) — следующим чтением. up_drain переставал читать, как только текущий поток
+ * закончен, и ответ на старый оставался непрочитанным: кусок считался неотвеченным навсегда, окно по
+ * seq заполнялось, и выгрузка вставала, когда слать уже было нечего. */
+static void t_packet_up_order(void) {
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    struct transport c;
+    conn_init(&c, XH_PACKET_UP, fd);
+    int rc0 = transport_write(&c, piece, sizeof(piece));     /* кусок 0, поток 1 */
+    int rc1 = transport_write(&c, piece, sizeof(piece));     /* кусок 1, поток 3 */
+    srv_drain();
+    srv_headers(3, 0x88, 1);                                 /* сначала новый кусок */
+    long r1 = transport_room(&c);
+    srv_headers(1, 0x88, 1);                                 /* затем старый */
+    long r2 = transport_room(&c);
+    check(rc0 == 0 && rc1 == 0 && r1 >= 0 && r2 > 0 && h2_open_streams(&c.xh.up.h2) == 0 &&
+          !unread(fd), "packet-up: ответ 200 на старый кусок после ответа на текущий прочитан");
+    close(fd);
+}
+
+/* Окно по seq: не больше PACKET_INFLIGHT неотвеченных кусков, дальше запись ждёт (H2_EWINDOW), а
+ * место, о котором узнаёт стек, нулевое; ответ на самый старый открывает его снова. */
+static void t_packet_up_window_over_seq(void) {
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    struct transport c;
+    conn_init(&c, XH_PACKET_UP, fd);
+    int rc = 0;
+    for (int i = 0; i < PACKET_INFLIGHT && !rc; i++) rc = transport_write(&c, piece, sizeof(piece));
+    srv_drain();
+    int over = transport_write(&c, piece, sizeof(piece));
+    long full = transport_room(&c);
+    srv_headers(1, 0x88, 1);                                 /* ответ на самый старый кусок */
+    int again = transport_write(&c, piece, sizeof(piece));
+    check(rc == 0 && over == H2_EWINDOW && full == 0 && again == 0,
+          "packet-up: окно по seq — за PACKET_INFLIGHT неотвеченными запись ждёт, ответ на старый открывает");
     close(fd);
 }
 
 int main(void) {
+    t_packet_up_window_over_seq();
+    t_packet_up_order();
     t_packet_up(0x8C, 1, "I-219: packet-up — 400 на прошлый кусок возвращён отправке");
     t_packet_up(0x88, 0, "I-219: packet-up — 200 на прошлый кусок отказом не считается");
     t_stream_up(0x8C, 1, "I-219: stream-up — 400 на выгрузку возвращён отправке");

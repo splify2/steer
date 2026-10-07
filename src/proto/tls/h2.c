@@ -178,6 +178,26 @@ static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint
     return h->io.write(h->io.ctx, one, 9 + n);
 }
 
+/* Следим за ответом потока: открыт (open_add), закончен (open_end). Номера сверх H2_OPEN_MAX не
+ * отслеживаются: вызывающие, ограничивающие их число, до этого не доходят. */
+static void open_add(struct h2 *h, uint32_t sid) {
+    if (h->open_n < H2_OPEN_MAX) h->open_sid[h->open_n++] = sid;
+}
+
+static void open_end(struct h2 *h, uint32_t sid) {
+    for (unsigned i = 0; i < h->open_n; i++)
+        if (h->open_sid[i] == sid) { h->open_sid[i] = h->open_sid[--h->open_n]; return; }
+}
+
+int h2_open_streams(const struct h2 *h) { return h->open_n; }
+
+uint32_t h2_oldest_open(const struct h2 *h) {
+    uint32_t m = 0;
+    for (unsigned i = 0; i < h->open_n; i++)
+        if (!m || h->open_sid[i] < m) m = h->open_sid[i];
+    return m;
+}
+
 /* HEADERS одного запроса. Псевдозаголовки обязаны идти первыми и в этом порядке.
  *
  * Вынесено из h2_start потому, что запросов на соединении стало больше одного: packet-up
@@ -247,6 +267,8 @@ int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
     h->io = *io;
     h->browser = browser;
     h->sid = 1;                          /* первый поток клиента — всегда первый нечётный */
+    h->open_n = 0;
+    open_add(h, h->sid);
     h->send_win = 65535;                 /* до SETTINGS сервера — значение по умолчанию */
     h->send_win_conn = 65535;
     h->peer_init_win = 65535;            /* то же умолчание, от него считается сдвиг */
@@ -316,6 +338,7 @@ int h2_next(struct h2 *h, const char *authority, const char *path,
      * номер закрытого потока нельзя — сервер ответит на такое ошибкой соединения, а не
      * потока, и связь оборвётся целиком. */
     h->sid += 2;
+    open_add(h, h->sid);
 
     /* Состояние ПОТОКА свежее, состояние СОЕДИНЕНИЯ нетронуто. Разница существенная: окно
      * соединения и настройки сервера общие для всех запросов, а окно потока сервер выдаёт
@@ -453,6 +476,7 @@ static int ctl_handle(struct h2 *h) {
         }
 
         case FR_RST_STREAM:
+            open_end(h, h->frame_sid);
             /* Сброс ЗАКРЫТОГО потока — не наш конец. Go-сервер шлёт RST_STREAM(NO_ERROR) на
              * поток, обработчик которого уже отработал, и у packet-up он приходит по прежнему
              * куску, когда открыт следующий. Раньше такой кадр рвал всё соединение. */
@@ -672,9 +696,11 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
                     rc = ctl_handle(h);
                     if (rc) H2_STOP(rc);
                 }
-                if ((h->frame_flags & FLAG_END_STREAM) && h->frame_ours &&
-                    (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS))
-                    h->done = 1;
+                if ((h->frame_flags & FLAG_END_STREAM) &&
+                    (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS)) {
+                    open_end(h, h->frame_sid);
+                    if (h->frame_ours) h->done = 1;
+                }
                 h->frame_type = 0xFF;
             }
             continue;
@@ -719,7 +745,11 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
                 rc = ctl_handle(h);
                 if (rc) H2_STOP(rc);
             }
-            if ((h->frame_flags & FLAG_END_STREAM) && h->frame_ours) h->done = 1;
+            if ((h->frame_flags & FLAG_END_STREAM) &&
+                (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS)) {
+                open_end(h, h->frame_sid);
+                if (h->frame_ours) h->done = 1;
+            }
             h->frame_type = 0xFF;
         }
     }
