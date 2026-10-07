@@ -768,6 +768,24 @@ static void t_born_turn(void) {
     dev_drain(NULL);
 }
 
+/* Наш FIN, когда сервер закрыл первым, обязан нести открытое окно. FIN занимает номер, а Linux не
+ * шлёт ничего в нулевое окно: прежний FIN с окном 0 оставлял собственный FIN клиента ждать
+ * обновления окна, которое не придёт, и сокет клиента навсегда застревал в LAST-ACK. */
+static void t_fin_window(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "окно в FIN: соединение не открылось"); return; }
+    cli_send(1001, 1002, TCP_ACK, 65535, NULL, 0);        /* клиент подтвердил всё принятое */
+    c->srv_closed = 1;
+    c->closed_at = now_ns();
+    dev_drain(NULL);
+    conn_deadlines(c, &g_tun, now_ns());
+    struct flow_key last;
+    memset(&last, 0, sizeof(last));
+    int n = dev_drain(&last);
+    check(n == 1 && (last.tcp_flags & TCP_FIN) && last.window != 0,
+          "окно в FIN: FIN сервера уходит клиенту с открытым окном, не с нулевым");
+}
+
 /* ==== ПУЛ УЗЛОВ ВЫХОДА И СБРОС СОЕДИНЕНИЙ (src/tunnel/pool.c) ================================
  *
  * ЧТО ПРОВЕРЯЕТСЯ. Две половины одной задачи (узел умер, а соединения через него висят):
@@ -1552,6 +1570,7 @@ int main(void) {
     t_dns_evict();
     t_spare_slot();
     t_born_turn();
+    t_fin_window();
     t_udp_early_bounds();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");
 

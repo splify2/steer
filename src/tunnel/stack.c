@@ -2545,12 +2545,15 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
         if (!drained)
             TR("conn#%ld: клиент не подтвердил %u байт за %d мс, закрываю\n",
                (long)(c - g_conns), c->rtx.len, CLOSE_DRAIN_MS);
-        /* FIN, иначе клиент будет ждать данных, которых больше не будет. */
+        /* FIN, иначе клиент будет ждать данных, которых больше не будет. С открытым окном:
+         * FIN занимает номер, а Linux не шлёт ничего в нулевое окно. Собственный FIN клиента
+         * ждал бы обновления окна, которое не придёт (сокет навсегда в LAST-ACK,
+         * tests/run-tunnel-fin.sh, случай separate). */
         unsigned char fin[64];
         size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
                               c->key.dport, c->key.sport,
                               c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
-                              NULL, 0, 0, 0, -1);
+                              NULL, 0, rcv_win_field(c), 0, -1);
         if (fl) tun_write_ctl(tun, fin, fl);
         conn_drop(c);
         return 1;

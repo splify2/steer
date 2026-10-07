@@ -12,7 +12,8 @@
 #   separate — данные и FIN разными сегментами;
 #   silent   — сервер (порт 9) не отвечает и не закрывает: соединение обязано закрыться
 #              само за CLOSE_DRAIN_MS, а не висеть до уборки по простою.
-# Что FIN и данные действительно шли одним сегментом, считает правило nft на выходе в vl.
+# Что FIN и данные действительно шли одним сегментом, считает правило nft на выходе в vl. После каждого случая
+# ни один сокет клиента не должен остаться в LAST-ACK.
 #
 # Использование: tests/run-tunnel-fin.sh   (нужен root: своё сетевое пространство)
 #   STEER=<бинарник>      по умолчанию ./build/steer-ext-check
@@ -116,6 +117,15 @@ PY
     after=$(ip netns exec "$NS" nft list chain inet fin out | sed -n 's/.*packets \([0-9]*\).*/\1/p')
     merged=$((after - before))
     echo "  $mode: $got (сегментов FIN+данные: $merged)"
+    # Свой FIN клиент тоже должен отправить и получить подтверждение: сокет в LAST-ACK значит, что
+    # туннель его не принял (наш FIN когда-то нёс нулевое окно, а Linux не шлёт FIN в нулевое).
+    sleep 1
+    lastack=$(ip netns exec "$NS" ss -Htn state last-ack dst "$TARGET" | wc -l)
+    if [ "$lastack" != 0 ]; then
+        echo "  $mode: сокетов клиента в LAST-ACK: $lastack"
+        ip netns exec "$NS" ss -tni state last-ack dst "$TARGET" | sed 's/^/    /'
+        fail=1
+    fi
     [ "$got" = ok ] || fail=1
     if [ "$mode" != separate ] && [ "$mode" != silent ] && [ "$merged" = 0 ]; then
         echo "  $mode: FIN не склеился с данными — случай не воспроизведён"; fail=1
