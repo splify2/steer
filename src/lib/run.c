@@ -35,6 +35,9 @@ int run(const char *const argv[]) {
          * would otherwise land in the middle of explain's answer. */
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+        /* SIG_IGN переживает execve: модульные команды выключают SIGPIPE (cli/modcmd.c), и без
+         * сброса его унаследовали бы nft, ip и загрузчик подписок. */
+        signal(SIGPIPE, SIG_DFL);
         execvp(argv[0], (char *const *)argv);
         _exit(127);
     }

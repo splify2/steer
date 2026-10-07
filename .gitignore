@@ -40,6 +40,7 @@ build/dnsmatch
 build/specmatch
 build/failovermatch
 build/rrkeepmatch
+build/runmatch
 build/h2match
 build/submatch
 build/hy2match
