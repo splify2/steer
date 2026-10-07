@@ -542,6 +542,13 @@ static int pl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     return g_pl.in->send(s->node, INNER(s), k, udp, d, n);
 }
 
+static long pl_room(const void *ctx, const void *sess) {
+    (void)ctx;
+    const struct pl_sess *s = sess;
+    if (!g_pl.in->room || !s->node) return -1;
+    return g_pl.in->room(s->node, (const char *)sess + PL_HDR);
+}
+
 static size_t pl_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
     return g_pl.in->dgram_frame(p, n, out, cap);
 }
@@ -670,6 +677,7 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.has_data = pl_has_data;
     g_pl_ops.flow_open = pl_flow_open;
     g_pl_ops.send = pl_send;
+    g_pl_ops.room = pl_room;
     g_pl_ops.dgram_frame = pl_dgram_frame;
     g_pl_ops.read = pl_read;
     g_pl_ops.deliver = pl_deliver;

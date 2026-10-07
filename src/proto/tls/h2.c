@@ -778,6 +778,12 @@ int h2_write(struct h2 *h, const unsigned char *d, size_t n) {
     return 0;
 }
 
+long h2_room(const struct h2 *h) {
+    if (!h->started) return 0;
+    int32_t w = h->send_win < h->send_win_conn ? h->send_win : h->send_win_conn;
+    return w > 0 ? w : 0;
+}
+
 const char *h2_strerror(int rc) {
     switch (rc) {
         case H2_EIO: return "обрыв HTTP/2";

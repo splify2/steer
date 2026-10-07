@@ -318,6 +318,7 @@ LIBSTEER_1 {
     transport_open;
     transport_read;
     transport_read_zc;
+    transport_room;
     transport_set_sock_mark;
     transport_strerror;
     transport_write;

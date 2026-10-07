@@ -480,12 +480,23 @@ static void rcv_window_set(uint32_t wnd) {
  * делённый на множитель, который ему назвали в SYN-ACK. Потолок кратен 2^множитель, пока он не упёрся в
  * 65535 << 14, а при 65535 (STEER_TUN_RCVWND=0) множитель 0 и делить нечего; округление вверх нужно только
  * там, где потолок не кратен (его задали числом): вниз 65535 при множителе 7 стали бы 65408. */
+static long conn_room(const struct conn *c);
+
 static uint16_t rcv_win_field(const struct conn *c) {
     /* Предел дайлера (dialer_ops.rcv_wnd_max): у DC_ACK_PACED окно обязано помещаться в очередь к узлу,
      * а потолок выше выбран по памяти машины и очередь переполнил бы. */
     uint32_t cap = g_rcv_wnd_max;
     uint32_t w = c->ws_on ? g_rcv_wnd : RCV_WND_MIN;
     if (cap && w > cap) w = cap;
+    /* Сколько узел принимает сейчас (dialer_ops.room): больше вернулось бы отказом SEND_AGAIN и
+     * стоило бы клиенту таймаута повторной передачи. Округляем ВНИЗ, в отличие от потолка:
+     * окно на несколько байт больше места — это отказанный сегмент. */
+    long room = conn_room(c);
+    if (room >= 0 && (uint32_t)room < w) {
+        w = (uint32_t)room;
+        if (!c->ws_on) return (uint16_t)w;
+        return (uint16_t)(w >> g_rcv_shift);
+    }
     if (!c->ws_on) return (uint16_t)w;
     uint32_t f = (w + ((1u << g_rcv_shift) - 1)) >> g_rcv_shift;
     return (uint16_t)(f > 65535u ? 65535u : f);
@@ -1334,6 +1345,14 @@ static void conn_unlink(struct conn *c) {
 
 static void conn_drop(struct conn *c);
 
+/* Данные клиента, собранные для одной отправки узлу: см. «сборка сегментов клиента». */
+#define UP_MAX (TUNNEL_BUF - 2048)          /* место дайлера под заголовок и кадр Vision */
+static __thread struct {
+    struct conn *c;
+    uint32_t n;
+    unsigned char buf[UP_MAX];
+} g_up;
+
 /* Свободное место в таблице, а если его нет — освободить самое давнее.
  *
  * Прежде здесь стоял отказ: «предел, клиент повторит SYN». Рассуждение выглядело безобидно
@@ -1433,6 +1452,7 @@ static struct conn *conn_new(const struct tun_dev *tun) {
  * нужно, и делать его после close значило бы ходить в ядро с закрытым номером. */
 static void conn_drop(struct conn *c) {
     TR("закрываю conn#%ld fd=%d\n", (long)(c - g_conns), c->fd);
+    if (g_up.c == c) g_up.c = NULL;                 /* собранные байты: подтверждены не были */
     if (c->used) {
         g_dl->ops->close(SESS(c));
         conn_unlink(c);
@@ -1448,6 +1468,13 @@ static void conn_drop(struct conn *c) {
     c->livepos = -1;
     c->hnext = -1;
     g_dl->ops->clear(SESS(c));
+}
+
+/* dialer_ops.room для установленного TCP-соединения; -1 — предела нет или он не применим (UDP,
+ * установщик ещё работает). */
+static long conn_room(const struct conn *c) {
+    if (c->is_udp || c->pending || c->fd < 0 || !g_dl->ops->room) return -1;
+    return g_dl->ops->room(g_dl->ctx, SESS(c));
 }
 
 /* Отправить узлу данные клиента. Форма — заголовок запроса, обёртки, упаковка транспорта —
@@ -1955,6 +1982,110 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
 /* Один пакет из TUN. */
 static void drain_conn(struct conn *c, const struct tun_dev *tun);
 
+/* send_or_wait: узел закрылся, пока мы ждали, — данные уже не уйдут. */
+#define SEND_CLOSED 2
+
+/* Отправить данные клиента узлу; при SEND_AGAIN (окно HTTP/2 закрыто) недолго подождать, пока
+ * оно откроется. Итог: SEND_OK, SEND_AGAIN (всё ещё закрыто: не подтверждать), SEND_FATAL или
+ * SEND_CLOSED.
+ *
+ * Прежде чем перекладывать задержку на клиента, разберём то, что уже лежит в сокете:
+ * WINDOW_UPDATE приходит именно оттуда и обычно УЖЕ там — сервер присылает его, как только
+ * освободил буфер. Без этой попытки каждое закрытие окна стоило бы таймаута повторной передачи у
+ * клиента, то есть двухсот миллисекунд на каждые 64 КБ. Замер: выгрузка через grpc шла 200 КБ/с
+ * вместо мегабайта.
+ *
+ * Пять миллисекунд ожидания, а не ноль. Кадр WINDOW_UPDATE обычно уже в сокете, но иногда отстаёт
+ * на доли круга — и тогда нулевое ожидание отдаёт задержку клиенту, у которого таймаут повторной
+ * передачи двести миллисекунд. Больше нельзя: цикл здесь один на все соединения, и каждая
+ * миллисекунда ожидания — это миллисекунда, на которую стоят остальные.
+ *
+ * Читаем тем же drain_conn, что и цикл (I-320): только он спрашивает окно клиента и на конце
+ * потока ставит srv_closed, а не закрывает. Прямой downstream_pump здесь отдавал клиенту записи
+ * за его окном (приёмник их выбросит — лечится повтором по таймауту), а конец потока в этот
+ * момент рвал соединение вместе с кольцом, то есть с хвостом ответа, который drain_conn в том же
+ * случае додаёт. Окна у клиента нет — не читаем вовсе: клиент повторит пакет.
+ *
+ * DC_ACK_PACED не ждёт: у него отказ значит «очередь к узлу полна», а освобождает её
+ * мультиплексор, и читать у узла для этого нечего — пять миллисекунд простоя цикла ради ответа,
+ * которого не будет. До сюда такой дайлер доходит, только если очередь всё же переполнилась
+ * (клиент вышел за окно); пакет тогда не подтверждается. */
+static int send_or_wait(struct conn *c, const struct tun_dev *tun, const unsigned char *d,
+                        size_t n) {
+    int sr = upstream_send(c, d, n);
+    if (sr != SEND_AGAIN) return sr;
+    struct pollfd sp = { .fd = c->fd, .events = POLLIN };
+    if (!(g_dl->ops->caps & DC_ACK_PACED) && client_can_take_record(c) &&
+        poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
+        drain_conn(c, tun);
+        if (c->srv_closed) return SEND_CLOSED;
+        sr = upstream_send(c, d, n);
+    }
+    return sr;
+}
+
+/* ---- сборка сегментов клиента ---------------------------------------------------------------
+ *
+ * Ядро отдаёт читателю устройства склеенные кадры (приёмная разгрузка, rx_gso в tun.h), а
+ * tun_read_packet режет их обратно на пакеты по MTU. Отправленный по одному, каждый сегмент в
+ * 1,4 КБ стоил связи с узлом запись TLS, кадр HTTP/2 и write: когда выгрузка пошла вообще
+ * (dialer_ops.room), они съедали 80% цикла, и скачивание рядом падало с 4 Гбит/с до 160 Мбит/с.
+ * Поэтому идущие подряд сегменты данных одного соединения в одной порции из TUN собираются здесь
+ * и уходят узлу одной отправкой с одним подтверждением.
+ *
+ * Одно соединение за раз на поток цикла. Всё, что не продолжение (другой поток, FIN, чистый ACK,
+ * дыра), сначала отправляет собранное, и конец порции тоже (up_flush в worker_loop, до
+ * flush_acks). До этого client_seq собранного не включает: байты не подтверждаются, пока узел их
+ * не принял, как и прежде. */
+/* (UP_MAX и g_up объявлены перед conn_drop: он забывает собранное закрытого соединения.) */
+
+/* Отправить собранное. При успехе байты подтверждены; иначе нет, и клиент повторит их
+ * (SEND_AGAIN) или получит RST (отказ). */
+static void up_flush(const struct tun_dev *tun) {
+    struct conn *c = g_up.c;
+    if (!c) return;
+    g_up.c = NULL;
+    TR("данные клиента %u байт (собранные) -> серверу\n", g_up.n);
+    int sr = send_or_wait(c, tun, g_up.buf, g_up.n);
+    if (sr == SEND_CLOSED) return;
+    if (sr == SEND_AGAIN) {
+        TR("окно закрыто, %u собранных байт не подтверждены — клиент повторит\n", g_up.n);
+        return;
+    }
+    if (sr != SEND_OK) {
+        conn_node_lost(c);
+        conn_reset(c, tun);
+        return;
+    }
+    c->client_seq += g_up.n;
+    c->ack_due = 1;
+}
+
+/* Собрать сегмент (seq, d, n) соединения c, пришедший по порядку (вызывающий порядок проверил).
+ * Если сегмент не поместится после собранного, сначала отправляет собранное. 0 — сегмент собран
+ * (g_up.c == c) либо слишком велик для сборки, и вызывающий отправит его сам; -1 — сейчас он не
+ * уходит: c закрыт, либо отправка перед ним не удалась и он уже не стыкуется (не подтверждён,
+ * клиент повторит). */
+static int up_add(struct conn *c, const struct tun_dev *tun, uint32_t seq, const unsigned char *d,
+                  size_t n) {
+    long room = conn_room(c);
+    if (g_up.c == c && (g_up.n + n > UP_MAX || (room >= 0 && g_up.n + n > (size_t)room)))
+        up_flush(tun);
+    if (g_up.c && g_up.c != c) up_flush(tun);
+    if (!c->used || c->srv_closed || c->aborted) return -1;
+    if (g_up.c != c && seq != c->client_seq) return -1;
+    if (n > UP_MAX) return 0;
+    if (!g_up.c) {
+        g_up.c = c;
+        g_up.n = 0;
+    } else if (g_up.c != c) {
+        return 0;
+    }
+    memcpy(g_up.buf + g_up.n, d, n);
+    g_up.n += (uint32_t)n;
+    return 0;
+}
+
 static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, size_t n) {
     struct flow_key k;
     size_t off = 0;
@@ -1973,6 +2104,15 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
     }
 
     if (ip_parse(pkt, n, &k, &off) != 0) { TR("пакет не разобран (%zu байт)\n", n); return; }
+    /* Всё, кроме следующего сегмента данных собранного потока, сначала отправляет собранное: оно
+     * стоит в потоке раньше или относится к другому потоку. */
+    if (g_up.c) {
+        const struct conn *u = g_up.c;
+        if (k.proto != 6 || k.src != u->key.src || k.dst != u->key.dst ||
+            k.sport != u->key.sport || k.dport != u->key.dport || n == off ||
+            (k.tcp_flags & (TCP_SYN | TCP_RST | TCP_FIN)) || k.seq != u->client_seq + g_up.n)
+            up_flush(tun);
+    }
     TR("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto=%u flags=0x%02x len=%zu\n",
        k.src&255,(k.src>>8)&255,(k.src>>16)&255,(k.src>>24)&255, k.sport,
        k.dst&255,(k.dst>>8)&255,(k.dst>>16)&255,(k.dst>>24)&255, k.dport,
@@ -2209,6 +2349,10 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         return;
     }
 
+    /* Проба нулевого окна (или keepalive): без данных, номер на единицу НИЖЕ ожидаемого. Окно
+     * может быть нулевым потому, что нет места у узла (dialer_ops.room); без ответа клиент узнает
+     * об открытии только из нашего обновления окна, а если оно потеряется — будет ждать. */
+    if (!data_n && !fin && k.seq == c->client_seq - 1) { c->ack_due = 1; return; }
     if (!data_n && !fin) return;                    /* чистый ACK */
 
     /* Не по порядку — отбрасываем. Буфер переупорядочивания на каждое соединение это как
@@ -2218,7 +2362,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
      * значит, что предыдущий потерян, и именно дубликаты ACK запускают у клиента быстрый
      * повтор — без них дыра закрывалась только по таймауту. Повтор уже принятого значит,
      * что потерялся наш ACK, и без ответа клиент повторял бы до исчерпания попыток. */
-    if (k.seq != c->client_seq) { c->ack_due = 1; return; }
+    if (k.seq != c->client_seq + (g_up.c == c ? g_up.n : 0)) { c->ack_due = 1; return; }
 
     /* Хвост ранних данных ещё не ушёл (окно h2 было закрыто на готовности потока):
      * свежие данные вперёд него отправлять нельзя — байты поменяются местами. Не
@@ -2229,43 +2373,16 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         if (fr > 0) return;
     }
 
-    TR("данные клиента %zu байт -> серверу%s\n", data_n, fin ? " (и FIN)" : "");
-    int sr = data_n ? upstream_send(c, pkt + off, data_n) : SEND_OK;
-    if (sr == SEND_AGAIN) {
-        /* Окно закрыто. Прежде чем перекладывать задержку на клиента, разберём то, что уже
-         * лежит в сокете: WINDOW_UPDATE приходит именно оттуда и обычно УЖЕ там — сервер
-         * присылает его, как только освободил буфер.
-         *
-         * Без этой попытки каждое закрытие окна стоило бы таймаута повторной передачи у
-         * клиента, то есть двухсот миллисекунд на каждые 64 КБ. Замер: выгрузка через
-         * grpc шла 200 КБ/с вместо мегабайта.
-         *
-         * Читаем через downstream_pump, а не сами: только он умеет отдать пришедшие данные
-         * клиенту. Читать «на выброс» здесь означало бы потерять ответ сервера. */
-        /* Пять миллисекунд ожидания, а не ноль. Кадр WINDOW_UPDATE обычно уже в сокете, но
-         * иногда отстаёт на доли круга — и тогда нулевое ожидание отдаёт задержку клиенту,
-         * у которого таймаут повторной передачи двести миллисекунд. Пять против двухсот.
-         *
-         * Больше нельзя: цикл здесь один на все соединения, и каждая миллисекунда ожидания
-         * — это миллисекунда, на которую стоят остальные. */
-        /* Читаем тем же drain_conn, что и цикл (I-320): только он спрашивает окно клиента
-         * и на конце потока ставит srv_closed, а не закрывает. Прямой downstream_pump здесь
-         * отдавал клиенту записи за его окном (приёмник их выбросит — лечится повтором по
-         * таймауту), а конец потока в этот момент рвал соединение вместе с кольцом, то есть
-         * с хвостом ответа, который drain_conn в том же случае додаёт. Окна у клиента нет —
-         * не читаем вовсе: клиент повторит пакет, как ниже. */
-        /* DC_ACK_PACED не ждёт: у него отказ значит «очередь к узлу полна», а освобождает её
-         * мультиплексор, и читать у узла для этого нечего — пять миллисекунд простоя цикла ради
-         * ответа, которого не будет. До сюда такой дайлер доходит, только если очередь всё же
-         * переполнилась (клиент вышел за окно); пакет тогда не подтверждается, как ниже. */
-        struct pollfd sp = { .fd = c->fd, .events = POLLIN };
-        if (!(g_dl->ops->caps & DC_ACK_PACED) && client_can_take_record(c) &&
-            poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
-            drain_conn(c, tun);
-            if (c->srv_closed) return;          /* пакет не ушёл и уже не уйдёт */
-            sr = upstream_send(c, pkt + off, data_n);
-        }
+    /* Просто данные, без FIN: собираем их с идущими следом (см. g_up). */
+    if (data_n && !fin) {
+        if (up_add(c, tun, k.seq, pkt + off, data_n) != 0) return;
+        if (g_up.c == c) return;                    /* собрано: отправка и подтверждение позже */
+        /* Больше буфера сборки: сам, ниже. */
     }
+
+    TR("данные клиента %zu байт -> серверу%s\n", data_n, fin ? " (и FIN)" : "");
+    int sr = data_n ? send_or_wait(c, tun, pkt + off, data_n) : SEND_OK;
+    if (sr == SEND_CLOSED) return;                  /* пакет не ушёл и уже не уйдёт */
     if (sr == SEND_AGAIN) {
         /* Всё ещё нельзя: не подтверждаем и не двигаем счётчик — пакет для нас как бы не
          * приходил. Клиент повторит его сам, и это единственный способ придержать поток,
@@ -2406,7 +2523,29 @@ void tun_bring_up(const char *dev, int table) {
  * Отдельной функцией, потому что вызывается из двух мест: по событию epoll и по флагу
  * rx_ready. Копия этой логики в двух местах означала бы, что предел порции соблюдается в
  * одном из них и не соблюдается в другом. */
+/* Чтение у узла может принести WINDOW_UPDATE, который увеличивает место (dialer_ops.room),
+ * ограничивающее окно клиента. Клиент должен услышать об этом от нас: ему нечего нести с новым
+ * окном, и он ждёт в таймере настойчивости, который отступает, как повторная передача.
+ * WIN_UPDATE_MIN: меньший рост ждёт следующего ACK, чтобы один WINDOW_UPDATE на кадр gRPC не
+ * стал пакетом на каждый. Ставит drain_conn, шлёт цикл (flush_acks). */
+#define WIN_UPDATE_MIN 4096
+static __thread int g_win_woke;
+
+static void drain_conn_reads(struct conn *c, const struct tun_dev *tun);
+
 static void drain_conn(struct conn *c, const struct tun_dev *tun) {
+    long before = conn_room(c);
+    drain_conn_reads(c, tun);
+    if (before < 0 || c->srv_closed || !c->used) return;
+    long after = conn_room(c);
+    if (after >= before + WIN_UPDATE_MIN ||
+        (before < WIN_UPDATE_MIN && after > before)) {
+        c->ack_due = 1;
+        g_win_woke = 1;
+    }
+}
+
+static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
     const struct dialer_ops *d = g_dl->ops;
     void *s = SESS(c);
     int reads = 0;
@@ -2877,6 +3016,7 @@ static void *worker_loop(void *arg) {
                 handle_packet(&tun, pkt, (size_t)rn);
                 if (g_stats) g_st.pkt_ns += now_ns() - t1;
             }
+            up_flush(&tun);
             flush_acks(&tun);
         }
         int out_woke = 0;
@@ -2921,6 +3061,12 @@ static void *worker_loop(void *arg) {
             if (!c->rx_ready || c->pending) continue;
             forced--;
             drain_conn(c, &tun);
+        }
+        /* Место у узла вернулось (drain_conn): обновление окна клиенту сейчас, а не со следующей
+         * порцией из TUN, которой выгрузка, остановленная нулевым окном, никогда не пришлёт. */
+        if (g_win_woke) {
+            g_win_woke = 0;
+            flush_acks(&tun);
         }
 
         /* Один проход на все сроки: повтор, закрытие после сервера, уборка задержавшихся.

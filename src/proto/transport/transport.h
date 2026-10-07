@@ -275,6 +275,9 @@ struct transport_ops {
      * данными): чтение без копии (zc) пока нельзя, даже когда своего непрочитанного нет. NULL —
      * такого не бывает. */
     int  (*busy)(const struct transport *t);
+    /* Сколько байт запись примет сейчас: окно отправки HTTP/2 (grpc, xhttp). Запись больше этого
+     * закончится H2_EWINDOW. NULL — предела нет (tcp, ws, httpupgrade: буфер сокета). */
+    long (*room)(const struct transport *t);
 };
 
 /* Безопасность — поле security= ссылки. Различаются только рукопожатием (см. шапку). */
@@ -314,6 +317,12 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s);
  * знает — иначе о нём пришлось бы помнить и в туннеле, и в проверке, и в каждом новом
  * месте, а забытое место означало бы поток, который уходит не в той упаковке. */
 int transport_write(struct transport *t, const unsigned char *d, size_t n);
+
+/* Сколько байт данных вызывающего transport_write примет сейчас, после собственной упаковки
+ * транспорта (заголовок сообщения gRPC, записи шифрования VLESS); -1 — предела нет. Туннель
+ * по этому числу выбирает окно клиента: клиент шлёт то, что узел может принять, а не узнаёт
+ * об этом по таймаутам повторной передачи (см. dialer_ops.room). */
+long transport_room(const struct transport *t);
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got);
 
 /* Приём БЕЗ ЛИШНЕЙ КОПИИ там, где транспорт это позволяет (transport_ops.zc).

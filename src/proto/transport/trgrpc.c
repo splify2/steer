@@ -165,8 +165,15 @@ static void grpc_moved(struct transport *t) { t->h2.io.ctx = &t->link; }
  * из одних концевых HEADERS (сервер gRPC отказал в методе): данных нет вовсе, а поток закончен. */
 static int grpc_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
 
+/* Сообщение gRPC добавляет к каждой записи 5 байт заголовка и до 4 байт тега и длины protobuf. */
+static long grpc_room(const struct transport *t) {
+    long r = h2_room(&t->h2) - 9;
+    return r > 0 ? r : 0;
+}
+
 const struct transport_ops tr_grpc = {
     .name = "grpc", .alpn = "h2", .zc = 0,
     .open = grpc_open, .write = grpc_write, .read = grpc_read,
     .moved = grpc_moved, .close = NULL, .pending = grpc_pending,
+    .room = grpc_room,
 };

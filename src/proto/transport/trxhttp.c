@@ -329,8 +329,25 @@ static void xhttp_close(struct transport *t) {
  * ответы на куски выгрузки (up.h2) законно кончаются на каждом куске. */
 static int xhttp_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
 
+/* Что примет xhttp_write сейчас, по режимам: те же окна, которые он проверяет. */
+static long xhttp_room(const struct transport *t) {
+    const struct xh_state *x = &t->xh;
+    switch (x->mode) {
+        case XH_STREAM_ONE: return h2_room(&t->h2);
+        case XH_STREAM_UP: return h2_room(&x->up.h2);
+        case XH_PACKET_UP: {
+            if (!x->up.started) return 65535;
+            const struct h2 *h = &x->up.h2;
+            int32_t r = h->send_win_conn < h->peer_init_win ? h->send_win_conn : h->peer_init_win;
+            return r > 0 ? r : 0;
+        }
+    }
+    return h2_room(&t->h2);
+}
+
 const struct transport_ops tr_xhttp = {
     .name = "xhttp", .alpn = "h2", .zc = 0,
     .open = xhttp_open, .write = xhttp_write, .read = xhttp_read,
     .moved = xhttp_moved, .close = xhttp_close, .pending = xhttp_pending,
+    .room = xhttp_room,
 };
