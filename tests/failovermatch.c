@@ -826,6 +826,23 @@ int main(void) {
     check("первая привязка в то же устройство — маршрут ставится",
           cmd_seen("ip route replace default dev lo table 300"), 1);
     check("  а соединения не снимаются", cmd_seen("ctnl evict") + cmd_seen("conntrack -D"), 0);
+    /* Контроль к контролю: таблица уже в том же устройстве, но привязка отказала (устройство ушло
+     * между проверкой и привязкой), и сторож сбросил таблицу (direct) или поставил запрет (drop):
+     * трафик выхода больше не идёт в прежнее устройство — соединения снимаются, как при смене. */
+    out_set("lo", FAIL_DIRECT);
+    state_write("active", "");
+    g_route_add_fails = 1;
+    tick(RULES_WITH, "default dev lo scope link \nblackhole default metric 65535 \n");
+    g_route_add_fails = 0;
+    check("отказ привязки в то же устройство (direct) — таблица сброшена", cmd_seen("ip route flush table 300"), 1);
+    check("  и соединения сняты", cmd_seen("ctnl evict") + cmd_seen("conntrack -D") > 0, 1);
+    out_set("lo", FAIL_DROP);
+    state_write("active", "");
+    g_route_add_fails = 1;
+    tick(RULES_WITH, "default dev lo scope link \nblackhole default metric 65535 \n");
+    g_route_add_fails = 0;
+    check("отказ привязки в то же устройство (drop) — запрет, и соединения сняты",
+          cmd_seen("ip route replace blackhole default table 300") && cmd_seen("ctnl evict") > 0, 1);
     /* Контроль: первая привязка, а таблица вела в другое устройство — снимаются. */
     out_set("lo", FAIL_DROP);
     state_write("active", "");
