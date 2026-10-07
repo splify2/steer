@@ -286,6 +286,9 @@ struct conn {
      * подтвердить (our_seq сдвинулся), и соединение зависало навсегда (run-tunnel.sh с потерями
      * 3%, примерно один запуск из сорока). */
     uint64_t estab_ns;
+    /* Место у узла (dialer_ops.room), когда клиент в последний раз слышал наше окно; UINT32_MAX —
+     * ещё нет. room_watch сравнивает с ним нынешнее место, чтобы сообщить клиенту о росте. */
+    uint32_t room_seen;
     uint8_t sent_any;
     /* Клиент передумал (RST), пока установщик работал: запись трогать нельзя,
      * поэтому только помечаем, а закрываем по готовности установщика. */
@@ -486,12 +489,26 @@ static void rcv_window_set(uint32_t wnd) {
  * там, где потолок не кратен (его задали числом): вниз 65535 при множителе 7 стали бы 65408. */
 static long conn_room(const struct conn *c);
 
+/* Цикл отстаёт от устройства: последняя порция из TUN упёрлась в TUN_DRAIN_MAX, и пакеты ждут в
+ * очереди ядра. Ставится на поток цикла после каждой порции (worker_loop).
+ *
+ * Пока так, клиенты получают не больше RCV_WND_BACKLOG окна. Что клиент может послать без
+ * подтверждения, то и ждёт в этой очереди, а за ней ждут ACK клиентов на скачивания: при окне в
+ * мегабайты две выгрузки держали очередь полной, ACK приходили поздно, и скачивание, которому
+ * разрешено не больше RTX_CAP в полёте, двигалось на RTX_CAP за ожидание очереди (xhttp
+ * stream-one, 20 с: 0,6 ГБ вниз против 10,3 ГБ вверх; с этим пределом 2,8 против 7,4). Только
+ * пока отстаём: клиенту по Wi-Fi с парой миллисекунд задержки для быстрой выгрузки нужно полное
+ * окно, а когда цикл успевает, очередь пуста и ничего не стоит. */
+#define RCV_WND_BACKLOG (64u * 1024)
+static __thread uint8_t g_tun_backlog;
+
 static uint16_t rcv_win_field(const struct conn *c) {
     /* Предел дайлера (dialer_ops.rcv_wnd_max): у DC_ACK_PACED окно обязано помещаться в очередь к узлу,
      * а потолок выше выбран по памяти машины и очередь переполнил бы. */
     uint32_t cap = g_rcv_wnd_max;
     uint32_t w = c->ws_on ? g_rcv_wnd : RCV_WND_MIN;
     if (cap && w > cap) w = cap;
+    if (g_tun_backlog && w > RCV_WND_BACKLOG) w = RCV_WND_BACKLOG;
     /* Сколько узел принимает сейчас (dialer_ops.room): больше вернулось бы отказом SEND_AGAIN и
      * стоило бы клиенту таймаута повторной передачи. Округляем ВНИЗ, в отличие от потолка:
      * окно на несколько байт больше места — это отказанный сегмент. */
@@ -2160,6 +2177,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         memset(c, 0, sizeof(*c));
         c->used = 1;
         c->born_turn = g_turn;
+        c->room_seen = UINT32_MAX;
         c->key = k;
         c->fd = -1;
         /* Место в списках — ПОСЛЕ memset и ПОСЛЕ ключа: хэш считается по ключу, а memset
@@ -2441,6 +2459,10 @@ static void flush_acks(const struct tun_dev *tun) {
         if (!c->ack_due) continue;
         if (ack_must_wait(c)) continue;
         c->ack_due = 0;
+        if (!c->is_udp) {
+            long r = conn_room(c);
+            if (r >= 0) c->room_seen = r > 0x7FFFFFFF ? 0x7FFFFFFFu : (uint32_t)r;
+        }
         unsigned char ackp[64];
         size_t al = tcp_build(ackp, sizeof(ackp), c->key.dst, c->key.src,
                               c->key.dport, c->key.sport,
@@ -2530,26 +2552,37 @@ void tun_bring_up(const char *dev, int table) {
  * Отдельной функцией, потому что вызывается из двух мест: по событию epoll и по флагу
  * rx_ready. Копия этой логики в двух местах означала бы, что предел порции соблюдается в
  * одном из них и не соблюдается в другом. */
-/* Чтение у узла может принести WINDOW_UPDATE, который увеличивает место (dialer_ops.room),
- * ограничивающее окно клиента. Клиент должен услышать об этом от нас: ему нечего нести с новым
- * окном, и он ждёт в таймере настойчивости, который отступает, как повторная передача.
- * WIN_UPDATE_MIN: меньший рост ждёт следующего ACK, чтобы один WINDOW_UPDATE на кадр gRPC не
- * стал пакетом на каждый. Ставит drain_conn, шлёт цикл (flush_acks). */
+/* Место (dialer_ops.room), которым ограничено окно клиента, растёт, когда узел впускает больше:
+ * WINDOW_UPDATE, прочитанный у узла, или, у транспорта с отдельной связью для выгрузки (xhttp
+ * stream-up, packet-up), ответ, прочитанный там, о котором событие нашего сокета не скажет.
+ * Клиент должен услышать об этом от нас: ему нечего нести с новым окном, и он ждёт в таймере
+ * настойчивости, который отступает, как повторная передача (выгрузка packet-up: 11 МБ за 20 с
+ * против 400 МБ). Поэтому место сравнивается после каждого чтения и на каждом проходе цикла с тем,
+ * что клиент слышал в последний раз, и выросшее шлёт обновление окна. WIN_UPDATE_MIN: меньший рост
+ * ждёт следующего ACK, чтобы один WINDOW_UPDATE на кадр gRPC не стал пакетом на каждый. Шлёт цикл
+ * (flush_acks). */
 #define WIN_UPDATE_MIN 4096
 static __thread int g_win_woke;
+
+static void room_watch(struct conn *c) {
+    if (c->is_udp || c->srv_closed || !c->used) return;
+    long r = conn_room(c);
+    if (r < 0) return;
+    uint32_t now_r = r > 0x7FFFFFFF ? 0x7FFFFFFFu : (uint32_t)r;
+    uint32_t was = c->room_seen;
+    if (was == UINT32_MAX) { c->room_seen = now_r; return; }
+    if (now_r >= was + WIN_UPDATE_MIN || (was < WIN_UPDATE_MIN && now_r > was)) {
+        c->room_seen = now_r;
+        c->ack_due = 1;
+        g_win_woke = 1;
+    }
+}
 
 static void drain_conn_reads(struct conn *c, const struct tun_dev *tun);
 
 static void drain_conn(struct conn *c, const struct tun_dev *tun) {
-    long before = conn_room(c);
     drain_conn_reads(c, tun);
-    if (before < 0 || c->srv_closed || !c->used) return;
-    long after = conn_room(c);
-    if (after >= before + WIN_UPDATE_MIN ||
-        (before < WIN_UPDATE_MIN && after > before)) {
-        c->ack_due = 1;
-        g_win_woke = 1;
-    }
+    room_watch(c);
 }
 
 static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
@@ -2675,6 +2708,8 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
             return 1;
         }
     }
+
+    room_watch(c);
 
     /* Истёкшие сроки — повторяем. После обработки пакетов, а не до: подтверждение,
      * приехавшее в этом же витке, могло снять надобность. */
@@ -3014,7 +3049,8 @@ static void *worker_loop(void *arg) {
              * Устройство переведено в неблокирующий режим, поэтому «больше нечего» приходит
              * как EAGAIN, а не как сон. Предел на проход всё равно нужен: иначе поток
              * пакетов от одного клиента не даст дойти до чтения у серверов. */
-            for (int k = 0; k < TUN_DRAIN_MAX; k++) {
+            int k;
+            for (k = 0; k < TUN_DRAIN_MAX; k++) {
                 uint64_t t0 = g_stats ? now_ns() : 0;
                 ssize_t rn = tun_read_packet(&tun, pkt, sizeof(pkt));
                 uint64_t t1 = g_stats ? now_ns() : 0;
@@ -3023,6 +3059,8 @@ static void *worker_loop(void *arg) {
                 handle_packet(&tun, pkt, (size_t)rn);
                 if (g_stats) g_st.pkt_ns += now_ns() - t1;
             }
+            /* До ACK этой порции, чтобы они уже несли окно, которого она требует. */
+            g_tun_backlog = k == TUN_DRAIN_MAX;
             up_flush(&tun);
             flush_acks(&tun);
         }
@@ -3096,6 +3134,11 @@ static void *worker_loop(void *arg) {
             struct conn *c = &g_conns[g_live[li]];
             /* Заявка в работе — установщик пишет в сессию, не трогать. */
             if (c->pending || !conn_deadlines(c, &tun, now)) li++;
+        }
+        /* Обновления окна для места, выросшего без нашего чтения (room_watch). */
+        if (g_win_woke) {
+            g_win_woke = 0;
+            flush_acks(&tun);
         }
     }
     /* Сначала отпустить установщиков, только потом закрывать сессии: иначе закрываем то,

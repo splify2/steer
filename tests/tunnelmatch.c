@@ -909,6 +909,24 @@ static void t_room_window(void) {
 
     g_room = -1;
     g_room_on_read = -2;
+
+    /* Цикл отстаёт от устройства (порция из TUN упёрлась в TUN_DRAIN_MAX): клиент с масштабом
+     * получает не больше RCV_WND_BACKLOG, чтобы его неподтверждённые данные, ждущие в очереди
+     * устройства перед ACK скачиваний, оставались короткими; цикл успевает — снова полное окно. */
+    uint32_t save_wnd = g_rcv_wnd;
+    uint8_t save_shift = g_rcv_shift;
+    rcv_window_set(4u << 20);
+    c->ws_on = 1;
+    uint32_t full = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    g_tun_backlog = 1;
+    uint32_t held = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    g_tun_backlog = 0;
+    uint32_t back = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    check(full >= (4u << 20) && held <= RCV_WND_BACKLOG && held > RCV_WND_BACKLOG / 2 && back == full,
+          "отставание цикла: окно падает до RCV_WND_BACKLOG и возвращается");
+    c->ws_on = 0;
+    g_rcv_wnd = save_wnd;
+    g_rcv_shift = save_shift;
     conn_drop(c);
     dev_drain(NULL);
 }
