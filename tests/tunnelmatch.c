@@ -819,19 +819,26 @@ static void server_first(const char *flow, size_t header_n) {
         g_node.flow[0] = 0;
         return;
     }
-    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
-    char what[96];
+    char what[128];
     int calls = g_send_calls;
-    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS / 2) * 1000000ull);
+    /* SYN-ACK потерян: клиент его не подтвердил и повторит SYN. Откроем поток сейчас — ответ
+     * сервера уйдёт раньше рукопожатия, и повторный SYN уже не получит ответа: ничего не должно
+     * уходить, сколько бы ни прошло времени. */
+    conn_deadlines(c, &g_tun, g_now_ns + 2000 * 1000000ull);
+    snprintf(what, sizeof(what), "сервер первым%s: до ACK клиента ничего не отправлено",
+             flow[0] ? ", Vision" : "");
+    check(g_send_calls == calls && c->our_seq == 2, what);
+    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
+    conn_deadlines(c, &g_tun, c->estab_ns + (SERVER_FIRST_MS / 2) * 1000000ull);
     snprintf(what, sizeof(what), "сервер первым%s: до %d мс ничего не отправлено",
              flow[0] ? ", Vision" : "", SERVER_FIRST_MS);
     check(g_send_calls == calls, what);
-    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS + 50) * 1000000ull);
+    conn_deadlines(c, &g_tun, c->estab_ns + (SERVER_FIRST_MS + 50) * 1000000ull);
     const struct vl_sess *vs = SESS(c);
     snprintf(what, sizeof(what), "сервер первым%s: затем один заголовок в %zu байт",
              flow[0] ? ", Vision" : "", header_n);
     check(g_send_calls == calls + 1 && g_send_last_n == header_n && vs->header_sent, what);
-    conn_deadlines(c, &g_tun, c->syn_ns + (SERVER_FIRST_MS + 100) * 1000000ull);
+    conn_deadlines(c, &g_tun, c->estab_ns + (SERVER_FIRST_MS + 100) * 1000000ull);
     snprintf(what, sizeof(what), "сервер первым%s: и только один раз", flow[0] ? ", Vision" : "");
     check(g_send_calls == calls + 1, what);
     conn_drop(c);

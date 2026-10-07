@@ -278,10 +278,14 @@ struct conn {
     unsigned char *early;
     uint32_t early_n;
     uint32_t early_off;
-    /* Когда пришёл SYN и уходило ли что-нибудь узлу: клиент, молчащий SERVER_FIRST_MS, ждёт,
-     * что первым заговорит сервер, и узлу надо сообщить, куда подключаться, без данных
-     * (conn_deadlines). */
-    uint64_t syn_ns;
+    /* Когда клиент завершил рукопожатие (его первый ACK; 0 — ещё нет) и уходило ли что-нибудь
+     * узлу: клиент, молчащий SERVER_FIRST_MS после этого, ждёт, что первым заговорит сервер, и
+     * узлу надо сообщить, куда подключаться, без данных (conn_deadlines). От SYN не считаем:
+     * клиент, чей SYN-ACK потерян, не молчит, у него ещё нет соединения. Открытие потока тогда
+     * пускало ответ сервера раньше рукопожатия, повторный SYN клиента уже нельзя было
+     * подтвердить (our_seq сдвинулся), и соединение зависало навсегда (run-tunnel.sh с потерями
+     * 3%, примерно один запуск из сорока). */
+    uint64_t estab_ns;
     uint8_t sent_any;
     /* Клиент передумал (RST), пока установщик работал: запись трогать нельзя,
      * поэтому только помечаем, а закрываем по готовности установщика. */
@@ -2156,7 +2160,6 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         memset(c, 0, sizeof(*c));
         c->used = 1;
         c->born_turn = g_turn;
-        c->syn_ns = g_now_ns;
         c->key = k;
         c->fd = -1;
         /* Место в списках — ПОСЛЕ memset и ПОСЛЕ ключа: хэш считается по ключу, а memset
@@ -2250,7 +2253,10 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         if (k.tcp_flags & TCP_RST) { c->client_gone = 1; return; }
         int fin = (k.tcp_flags & TCP_FIN) != 0;
         if (c->client_fin) { if (fin) c->ack_due = 1; return; }
-        if (k.tcp_flags & TCP_ACK) c->client_win = k.window;
+        if (k.tcp_flags & TCP_ACK) {
+            c->client_win = k.window;
+            if (!c->estab_ns) c->estab_ns = g_now_ns ? g_now_ns : 1;
+        }
         size_t dn = n - off;
         if ((!dn && !fin) || k.seq != c->client_seq) return;
         /* Не поместилось — не подтверждаем: клиент повторит сам, когда поток будет готов. */
@@ -2290,6 +2296,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
     size_t data_n = n - off;
 
     if (k.tcp_flags & TCP_ACK) {
+        if (!c->estab_ns) c->estab_ns = g_now_ns ? g_now_ns : 1;
         /* Сравнение с учётом переполнения счётчика: разность как знаковая. */
         if ((int32_t)(k.ack - c->client_ack) > 0) {
             /* Продвигаем client_ack ТОЛЬКО на подтверждённое и не дальше our_seq.
@@ -2657,11 +2664,11 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
         return 1;
     }
 
-    /* Клиент молчит с самого SYN: открыть поток без его данных, чтобы мог заговорить сервер,
-     * говорящий первым (dialer.h, send с n == 0). Клиента, который говорил, обслуживает путь
-     * ранних данных выше. */
-    if (!c->is_udp && !c->sent_any && !c->early && !c->srv_closed &&
-        now - c->syn_ns >= SERVER_FIRST_MS * 1000000ull) {
+    /* Клиент молчит с самого рукопожатия: открыть поток без его данных, чтобы мог заговорить
+     * сервер, говорящий первым (dialer.h, send с n == 0). Клиента, который говорил, обслуживает
+     * путь ранних данных выше. */
+    if (!c->is_udp && !c->sent_any && !c->early && !c->srv_closed && c->estab_ns &&
+        now - c->estab_ns >= SERVER_FIRST_MS * 1000000ull) {
         int sr = upstream_send(c, NULL, 0);
         if (sr == SEND_FATAL) {
             conn_reset(c, tun);
