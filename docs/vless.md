@@ -22,8 +22,10 @@
   `ws` и `httpupgrade` (запрос Upgrade по HTTP/1.1 — см. [ws и httpupgrade](#ws-и-httpupgrade)).
 - **Безопасность**: `reality`, `tls` (с проверкой цепочки сертификата и имени), `none`. Любая из
   трёх сочетается с любым транспортом.
-- **Поток**: `xtls-rprx-vision` или без него (у `ws` и `httpupgrade` — только без него: как и у
-  Xray, Vision там не бывает, такой узел пропускается с причиной).
+- **Поток**: `xtls-rprx-vision` или без него. Vision бывает только поверх `tcp`: у `grpc`, `xhttp`,
+  `ws` и `httpupgrade` — только без него, как и у Xray (иначе тот отвечает «XTLS only supports TLS
+  and REALITY directly for now», и выход перезапускался бы без конца); такой узел пропускается с
+  причиной «vision поверх … не бывает», в любом формате подписки.
 - **Постквантовая часть**: гибрид X25519MLKEM768 в TLS 1.3 и REALITY, проверка подписи ML-DSA-65 у
   REALITY (`pqv`), шифрование VLESS `mlkem768x25519plus` — см. [Постквантовая часть](#постквантовая-часть).
 - **Трафик**: TCP и UDP через TUN — см. [UDP и QUIC](#udp-и-quic).

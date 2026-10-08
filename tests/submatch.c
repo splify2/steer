@@ -1243,6 +1243,60 @@ int main(void) {
         free(nodes);
     }
 
+    /* ---- Vision только поверх голого TCP: Xray отказывает на любом другом транспорте (I-479) ---
+     *
+     * Xray 26.3.27 на узле с flow=xtls-rprx-vision и network, отличном от raw/tcp, отвечает
+     * «XTLS only supports TLS and REALITY directly for now» и выход перезапускается без конца.
+     * Правило одно на все форматы подписки: ссылка vless://, конфиг Xray, sing-box, Clash. */
+    {
+        static const char *const U = "11111111-2222-3333-4444-555555555555";
+        static const char *const tr[] = { "xhttp", "grpc", "ws", "httpupgrade" };
+        static const char *const fl[] = { "xtls-rprx-vision", "xtls-rprx-vision-udp443" };
+        char url[512], want[64];
+        struct vless_node n;
+        for (size_t t = 0; t < 4; t++)
+            for (size_t f = 0; f < 2; f++) {
+                snprintf(url, sizeof url, "vless://%s@h.example:443?type=%s&security=tls&sni=s.example&path=/p"
+                         "&serviceName=s&flow=%s#v", U, tr[t], fl[f]);
+                snprintf(want, sizeof want, "vision поверх %s не бывает", tr[t]);
+                char nm[96];
+                snprintf(nm, sizeof nm, "vision поверх %s (%s): пропущен", tr[t], fl[f]);
+                check_n(nm, 1, vless_parse_url(url, &n));
+                check("  причина", want, n.skip_reason);
+                snprintf(url, sizeof url, "vless://%s@h.example:443?type=%s&security=tls&sni=s.example&path=/p"
+                         "&serviceName=s#v", U, tr[t]);
+                snprintf(nm, sizeof nm, "%s без flow: пригоден", tr[t]);
+                check_n(nm, 0, vless_parse_url(url, &n));
+            }
+        snprintf(url, sizeof url, "vless://%s@h.example:443?type=tcp&security=reality&sni=s.example"
+                 "&pbk=Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyMDA&flow=xtls-rprx-vision#v", U);
+        check_n("vision поверх tcp: пригоден", 0, vless_parse_url(url, &n));
+
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+        char cfg[2048];
+        snprintf(cfg, sizeof cfg,
+            "{\"outbounds\":[{\"tag\":\"x\",\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"h.example\","
+            "\"port\":443,\"users\":[{\"id\":\"%s\",\"flow\":\"xtls-rprx-vision\",\"encryption\":\"none\"}]}]},"
+            "\"streamSettings\":{\"network\":\"xhttp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"s.example\"},"
+            "\"xhttpSettings\":{\"path\":\"/p\"}}}]}", U);
+        check_n("конфиг Xray: vision поверх xhttp пропущен", 0, (long)vless_parse_sub(cfg, nodes, 4, &st));
+        check_n("  посчитан как пропущенный", 1, (long)st.skipped);
+        check("  причина", "vision поверх xhttp не бывает", st.reasons[0].reason);
+        snprintf(cfg, sizeof cfg,
+            "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"sb\",\"server\":\"h.example\",\"server_port\":443,\"uuid\":\"%s\","
+            "\"flow\":\"xtls-rprx-vision\",\"tls\":{\"enabled\":true,\"server_name\":\"s.example\"},"
+            "\"transport\":{\"type\":\"grpc\",\"service_name\":\"s\"}}]}", U);
+        check_n("sing-box: vision поверх grpc пропущен", 0, (long)vless_parse_sub(cfg, nodes, 4, &st));
+        check("  причина", "vision поверх grpc не бывает", st.reasons[0].reason);
+        snprintf(cfg, sizeof cfg,
+            "proxies:\n  - name: c\n    type: vless\n    server: h.example\n    port: 443\n    uuid: %s\n"
+            "    network: grpc\n    tls: true\n    servername: s.example\n    flow: xtls-rprx-vision\n"
+            "    grpc-opts:\n      grpc-service-name: s\n", U);
+        check_n("Clash: vision поверх grpc пропущен", 0, (long)vless_parse_sub(cfg, nodes, 4, &st));
+        check("  причина", "vision поверх grpc не бывает", st.reasons[0].reason);
+    }
+
     printf("\nвсе проверки прошли\n");
     return 0;
 }

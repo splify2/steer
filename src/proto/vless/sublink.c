@@ -507,19 +507,14 @@ uint16_t sl_port_of(const char *s) {
 /* Узел ws или httpupgrade: то, на чём Xray споткнулся бы сам, — заранее и с причиной. 1 —
  * непригоден (причина в skip_reason).
  *
- *   - Vision (flow xtls-rprx-vision) поверх них не бывает: Xray требует для Vision голую связь
- *     TLS или REALITY и отказывает («failed to use xtls-rprx-vision, maybe "security" is not
- *     "tls"…»), а у нас прямое копирование Vision прочитало бы сокет мимо кадров;
+ *   - Vision поверх них не бывает (отказ — в sl_link_usable_post, общий для всех транспортов,
+ *     кроме tcp): у нас прямое копирование Vision прочитало бы сокет мимо кадров;
  *   - путь, который Xray не разобрал бы однозначно или у ws не открыл бы вовсе (trpath.h) — одно
  *     правило с транспортом, чтобы «пригоден» здесь значило «откроется» там;
  *   - host — имя для заголовка Host: без пробелов и управляющих знаков, иначе строка запроса
  *     рвётся посередине;
  *   - заголовки из конфига, которые не влезли или негодны (headers_bad, см. xray_headers). */
 static int upg_node_bad(struct vless_node *n, int ws) {
-    if (n->flow[0]) {
-        snprintf(n->skip_reason, sizeof(n->skip_reason), "vision поверх %s не бывает", n->type);
-        return 1;
-    }
     char tgt[1024];
     const char *why = "";
     if (tr_upgrade_target(n->path, ws, tgt, sizeof(tgt), &why) != 0) {
@@ -767,6 +762,15 @@ int sl_link_usable_post(struct vless_node *n) {
     if (strcmp(n->type, "tcp") != 0 && strcmp(n->type, "grpc") != 0 &&
         strcmp(n->type, "xhttp") != 0 && !upg) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "транспорт %s не поддержан", n->type);
+        return 1;
+    }
+    /* Vision (flow xtls-rprx-vision, а при чтении и xtls-rprx-vision-udp443 — sub.c приводит его к
+     * обычному) бывает только поверх голого TCP: Xray требует, чтобы под ним лежала связь TLS или
+     * REALITY напрямую, и на ws, httpupgrade, grpc и xhttp отвечает «XTLS only supports TLS and
+     * REALITY directly for now», после чего выход перезапускается без конца. Отказ — здесь, до
+     * кандидатов, и один на все форматы подписки: ссылка, конфиг Xray, sing-box, Clash. */
+    if (n->flow[0] && strcmp(n->type, "tcp") != 0) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "vision поверх %s не бывает", n->type);
         return 1;
     }
     if (upg && upg_node_bad(n, upg_ws)) return 1;
