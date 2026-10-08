@@ -18,6 +18,8 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <time.h>
+#include <pthread.h>
 
 #include "transport.h"
 #include "reality.h"
@@ -65,8 +67,10 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
         /* Гибрид X25519MLKEM768 в ClientHello — как у Chrome 131+, uTLS HelloChrome_Auto и Go 1.24+,
          * то есть у любого клиента Xray с fp=chrome и без fp. Без него наш Hello — «Chrome позапрошлого
          * года» и по размеру (537 байт вместо около 1760), и по составу supported_groups. Выключатель
-         * STEER_NOPQ=1 — для разбора: посредник, роняющий Hello больше одного сегмента. */
-        .pq = !getenv("STEER_NOPQ"),
+         * STEER_NOPQ=1 — для разбора: посредник, роняющий Hello больше одного сегмента.
+         * Посредник, который роняет такой Hello молча, ловит tr_link_open: таймаут длинного Hello —
+         * одна повторная попытка коротким, и узел запоминается (l->nopq). */
+        .pq = !getenv("STEER_NOPQ") && !l->nopq,
     };
     /* pqv: ключ ML-DSA-65, base64url. Разбирается ДО отправки Hello: испорченный ключ — отказ узла, а не
      * повод отправить Hello и потом молча не проверять подпись. Разбор подписки (sub.c) такой ключ
@@ -173,8 +177,75 @@ const struct security_ops *tr_security(const char *name) {
     return &tr_sec_reality;
 }
 
-int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s) {
+/* ---- память «этому узлу нужен короткий Hello» ------------------------------------------------
+ *
+ * Известно, что часть российских посредников (ТСПУ) роняет или душит TLS-соединения, чей ClientHello
+ * несёт постквантовый обмен и не влезает в один сегмент (около 1760 байт против 537). Сервер такого
+ * Hello не видит, и рукопожатие кончается TLS13_ETIMEOUT без единого байта ответа. Поэтому: таймаут
+ * Hello с гибридом — ОДНА повторная попытка на новом соединении с коротким Hello, и, если она удалась,
+ * узел (хост:порт) запоминается — следующие соединения не платят таймаут каждый раз.
+ *
+ * Запоминается только после удавшейся короткой попытки: мёртвый узел молчит на любой Hello, и «длинный
+ * не прошёл» про него ничего не доказывает. Срок памяти — час, а не до перезапуска: правила посредника
+ * меняются (и снимаются), а постквантовый Hello — облик Chrome, который мы хотим держать там, где он
+ * проходит. Цена пересмотра раз в час — одно соединение с таймаутом на узел. Предела на число узлов
+ * нет: запись — хост и срок, их ровно столько, сколько узлов с таким посредником на пути. */
+/* Срок памяти, секунды. Не static — шов стенда tests/pqfallbackmatch.c (0 — не помнить). */
+long tr_nopq_ttl_s = 3600;
+static pthread_mutex_t g_nopq_mu = PTHREAD_MUTEX_INITIALIZER;
+struct nopq_ent {
+    char *host;
+    uint16_t port;
+    long until;                /* CLOCK_MONOTONIC, секунды */
+    int logged;                /* о решении по этому узлу уже сказано в журнале */
+};
+static struct nopq_ent *g_nopq;
+static size_t g_nopq_n;
+
+static long nopq_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec;
+}
+
+static struct nopq_ent *nopq_find(const char *host, uint16_t port) {
+    for (size_t i = 0; i < g_nopq_n; i++)
+        if (g_nopq[i].port == port && !strcmp(g_nopq[i].host, host)) return &g_nopq[i];
+    return NULL;
+}
+
+static int nopq_known(const struct tr_node *n) {
+    pthread_mutex_lock(&g_nopq_mu);
+    struct nopq_ent *e = nopq_find(n->host, n->port);
+    int r = e && e->until > nopq_now();
+    pthread_mutex_unlock(&g_nopq_mu);
+    return r;
+}
+
+static void nopq_remember(const struct tr_node *n) {
+    pthread_mutex_lock(&g_nopq_mu);
+    struct nopq_ent *e = nopq_find(n->host, n->port);
+    if (!e) {
+        struct nopq_ent *g = realloc(g_nopq, (g_nopq_n + 1) * sizeof *g);
+        char *h = g ? strdup(n->host) : NULL;
+        if (!h) { if (g) g_nopq = g; pthread_mutex_unlock(&g_nopq_mu); return; }
+        g_nopq = g;
+        e = &g_nopq[g_nopq_n++];
+        e->host = h; e->port = n->port; e->logged = 0;
+    }
+    e->until = nopq_now() + tr_nopq_ttl_s;
+    if (!e->logged) {
+        e->logged = 1;
+        fprintf(stderr, "steer[warn] узел %s:%u не ответил на длинный ClientHello — дальше короткий, "
+                "без постквантового обмена (раз в %ld мин пробуем снова)\n",
+                n->host, (unsigned)n->port, tr_nopq_ttl_s / 60);
+    }
+    pthread_mutex_unlock(&g_nopq_mu);
+}
+
+static int link_try(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s, int nopq) {
     l->fd = -1;
+    l->nopq = nopq;
     int fd = tr_dial(n->host, n->port, timeout_s);
     if (fd < 0) return fd;
     l->fd = fd;
@@ -184,4 +255,20 @@ int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, i
     int rc = tr_security(n->security)->handshake(l, n, alpn);
     if (rc) { close(fd); l->fd = -1; return rc; }
     return 0;
+}
+
+int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s) {
+    /* Гибрид предлагается только у tls и reality и только если его не выключили (STEER_NOPQ). */
+    const int pq_able = strcmp(n->security, "none") != 0 && !getenv("STEER_NOPQ");
+    const int known = pq_able && nopq_known(n);
+    int rc = link_try(l, n, alpn, timeout_s, known || !pq_able);
+    if (rc == TLS13_ETIMEOUT && pq_able && !known) {
+        /* Одна повторная попытка, не цикл: короткий Hello тоже без ответа — узел мёртв, и дальше
+         * это дело вызывающего (сторож, пул), а не ещё одного круга здесь. */
+        const int rc2 = link_try(l, n, alpn, timeout_s, 1);
+        if (rc2 == 0) { nopq_remember(n); return 0; }
+        /* Причина — первая: сервер Reality 26.9 отдаёт Hello без гибрида на маскировочный сайт, и
+         * ответом коротким был бы «не признал ключ», тогда как корень беды — потерянный длинный Hello. */
+    }
+    return rc;
 }
