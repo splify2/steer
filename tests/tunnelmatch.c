@@ -1611,6 +1611,28 @@ static void t_pool_spares(void) {
     g_fn[0].alive = 1;
 }
 
+/* Серия отказов установления зовёт проверку узла один раз, а не на каждый следующий отказ: пока
+ * клиенты повторяют соединения к молчащему узлу, проверки (каждая — соединение к узлу) шли бы одна
+ * за другой. */
+static void t_pool_kick_once(void) {
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 1;
+    pool_new(1, BY_CONNECTION, 1, NULL);
+    static unsigned char dst[PL_HDR + sizeof(struct fsess)];
+    struct pl_sess *d = (struct pl_sess *)dst;
+    pl_clear(dst);
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(d, 0);
+    pthread_mutex_unlock(&g_pl.mu);
+    for (int i = 0; i < 3; i++) pl_seen(d, -1);
+    check(g_pl.slot[0].kick == 1, "серия: три отказа подряд зовут проверку");
+    g_pl.slot[0].kick = 0;                      /* поток слежки взял просьбу */
+    pl_seen(d, -1);
+    check(!g_pl.slot[0].kick, "серия: следующий отказ после взятой просьбы проверку заново не зовёт");
+    pl_seen(d, -1);
+    pl_seen(d, -1);
+    check(g_pl.slot[0].kick == 1, "серия: ещё три отказа — проверка зовётся снова");
+}
+
 static void t_pool_state(void) {
     char dir[] = "/tmp/poolmatch.XXXXXX";
     if (!mkdtemp(dir)) { check(0, "стенд: каталог состояния"); return; }
@@ -1819,6 +1841,7 @@ static int pool_part(void) {
     t_pool_many();
     t_pool_refill();
     t_pool_spares();
+    t_pool_kick_once();
     t_pool_state();
     t_ack_paced();
     return 0;

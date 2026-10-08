@@ -466,7 +466,12 @@ static void pl_seen(const struct pl_sess *s, int rc) {
     struct pl_slot *sl = &g_pl.slot[s->slot];
     if (sl->gen == s->gen) {
         if (rc == 0) sl->streak = 0;
-        else if (++sl->streak >= PL_STREAK) pl_kick(s->slot);
+        else if (++sl->streak >= PL_STREAK) {
+            /* Серия отсчитана заново: иначе каждый следующий отказ звал бы проверку ещё раз, и
+             * пока клиенты повторяют соединения, проверки шли бы одна за другой. */
+            sl->streak = 0;
+            pl_kick(s->slot);
+        }
     }
     pthread_mutex_unlock(&g_pl.mu);
 }
