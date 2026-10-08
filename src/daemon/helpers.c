@@ -214,7 +214,9 @@ struct helper *helpers_exited(struct helper_set *s, pid_t pid, int st) {
          * procd. */
         long now = helpers_now_ms();
         long lived = now - h->started_ms;
+        long cap = h->st.said_down ? HELPERS_DELAY_DOWN_MAX_MS : HELPERS_DELAY_MAX_MS;
         if (lived >= HELPERS_STABLE_MS) h->delay_ms = HELPERS_DELAY_MS;
+        if (h->delay_ms > cap) h->delay_ms = cap;
         h->next_ms = now + h->delay_ms;
         if (!h->gone)
             fprintf(stderr, "steer[warn] supervise: %s вышел (%s %d) — перезапуск "
@@ -222,9 +224,8 @@ struct helper *helpers_exited(struct helper_set *s, pid_t pid, int st) {
                     WIFEXITED(st) ? "код" : "сигнал",
                     WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st),
                     h->delay_ms / 1000);
-        if (lived < HELPERS_STABLE_MS && h->delay_ms < HELPERS_DELAY_MAX_MS)
-            h->delay_ms = h->delay_ms * 2 > HELPERS_DELAY_MAX_MS ? HELPERS_DELAY_MAX_MS
-                                                                 : h->delay_ms * 2;
+        if (lived < HELPERS_STABLE_MS && h->delay_ms < cap)
+            h->delay_ms = h->delay_ms * 2 > cap ? cap : h->delay_ms * 2;
         return h;
     }
     return NULL;
