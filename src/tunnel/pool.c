@@ -83,6 +83,9 @@
 #define PL_RETRY_S     15
 #define PL_RETRY_MAX_S 300
 #define PL_STREAK      3
+/* Проверок, прошедших подряд при том, что живые соединения так и не открылись (каждая — после
+ * PL_STREAK отказов подряд), после которых узел всё равно мёртв. */
+#define PL_UNPROVEN    2
 #define PL_TIMEOUT_S   8
 /* Обрыв соединения зовёт проверку не чаще, чем раз в столько: обрывы приходят пачкой (все соединения
  * умершего узла рвутся по одному сроку), а проверке хватает одной. */
@@ -107,6 +110,7 @@ struct pl_slot {
     unsigned gen;
     int fails;                  /* неудачных проверок подряд */
     int streak;                 /* отказов установления подряд */
+    int unproven;               /* проверок, прошедших после серии отказов, без удачного соединения между */
     int kick;                   /* проверить сейчас */
     int lost;                   /* позвал обрыв связи по порогу молчания: одной неудачи хватит */
     uint64_t due;               /* срок следующей проверки, мс CLOCK_MONOTONIC */
@@ -298,7 +302,7 @@ static int pl_refill(int i, int own) {
             struct pl_slot *sl = &g_pl.slot[i];
             sl->up = 1;
             sl->fails = sl->streak = sl->kick = sl->lost = 0;
-            sl->retry = PL_RETRY_S;
+            if (!sl->unproven) sl->retry = PL_RETRY_S;     /* оживал без соединений — пауза не сбрасывается */
             sl->checked_at = pl_now_ms();
             sl->due = sl->checked_at + (uint64_t)g_pl.cf.interval_s * 1000ull;
             pthread_mutex_unlock(&g_pl.mu);
@@ -326,7 +330,7 @@ static int pl_refill(int i, int own) {
         sl->node = c;
         sl->up = 1;
         __atomic_add_fetch(&sl->gen, 1, __ATOMIC_RELEASE);  /* pl_stale читает без замка */
-        sl->fails = sl->streak = sl->kick = sl->lost = 0;
+        sl->fails = sl->streak = sl->kick = sl->lost = sl->unproven = 0;
         sl->retry = PL_RETRY_S;
         sl->checked_at = pl_now_ms();
         sl->due = sl->checked_at + (uint64_t)g_pl.cf.interval_s * 1000ull;
@@ -355,7 +359,7 @@ static int pl_refill(int i, int own) {
 static void pl_check(int i) {
     pthread_mutex_lock(&g_pl.mu);
     struct pl_slot *sl = &g_pl.slot[i];
-    int node = sl->node, up = sl->up, lost = sl->lost;
+    int node = sl->node, up = sl->up, lost = sl->lost, kicked = sl->kick;
     sl->kick = sl->lost = 0;
     pthread_mutex_unlock(&g_pl.mu);
     if (node < 0 || !up) { pl_refill(i, 1); return; }
@@ -364,15 +368,24 @@ static void pl_check(int i) {
     int rc = pl_probe(node, why, sizeof why);
     pthread_mutex_lock(&g_pl.mu);
     sl->checked_at = pl_now_ms();
-    if (rc == 0) {
+    /* Проверку позвала серия отказов установления, а она прошла: узел принимает проверку и не несёт
+     * соединения (сервер с ограничением соединений отвечает на одиночный запрос и молчит на
+     * параллельные ClientHello). Прежде удачная проверка обнуляла счёт, и такой узел оставался
+     * «жив» навсегда: выход числился up, а группа не уходила на запасного члена. Первый такой
+     * случай — только счёт, второй подряд, без удачного соединения между, — приговор. */
+    int unproven = rc == 0 && kicked && !lost && ++sl->unproven >= PL_UNPROVEN;
+    if (rc == 0 && !unproven) {
         sl->fails = sl->streak = 0;
         sl->due = sl->checked_at + (uint64_t)g_pl.cf.interval_s * 1000ull;
         pthread_mutex_unlock(&g_pl.mu);
         return;
     }
+    if (unproven)
+        snprintf(why, sizeof why, "проверка проходит, а соединения не открываются (отказов подряд: %d)",
+                 PL_STREAK * sl->unproven);
     /* Две неудачи подряд — против одной потери на радиоканале. Проверку, которую позвал обрыв связи
      * ядром, первая неудача уже подтверждает: узел и так молчал дольше порога silence. */
-    if (++sl->fails < 2 && !lost) {
+    if (!unproven && ++sl->fails < 2 && !lost) {
         sl->due = sl->checked_at + PL_CONFIRM_S * 1000ull;
         pthread_mutex_unlock(&g_pl.mu);
         return;
@@ -381,7 +394,8 @@ static void pl_check(int i) {
     sl->up = 0;
     sl->fails = 0;
     __atomic_add_fetch(&sl->gen, 1, __ATOMIC_RELEASE);
-    sl->retry = PL_RETRY_S;
+    /* Узел, который оживал и снова не нёс соединения, ищется всё реже, а не заново с 15 с. */
+    if (!unproven) sl->retry = PL_RETRY_S;
     pthread_mutex_unlock(&g_pl.mu);
     snprintf(g_pl.why, sizeof g_pl.why, "%s", why);
     fprintf(stderr, PL_LOG_W "узел %s не отвечает: %s — ищу замену\n",
@@ -465,7 +479,7 @@ static void pl_seen(const struct pl_sess *s, int rc) {
     pthread_mutex_lock(&g_pl.mu);
     struct pl_slot *sl = &g_pl.slot[s->slot];
     if (sl->gen == s->gen) {
-        if (rc == 0) sl->streak = 0;
+        if (rc == 0) sl->streak = sl->unproven = 0;
         else if (++sl->streak >= PL_STREAK) {
             /* Серия отсчитана заново: иначе каждый следующий отказ звал бы проверку ещё раз, и
              * пока клиенты повторяют соединения, проверки шли бы одна за другой. */

@@ -1633,6 +1633,43 @@ static void t_pool_kick_once(void) {
     check(g_pl.slot[0].kick == 1, "серия: ещё три отказа — проверка зовётся снова");
 }
 
+/* Узел, который принимает проверку, а живые соединения не несёт (сервер с ограничением соединений:
+ * одиночный запрос проходит, а на параллельные ClientHello отвечает молчанием), — мёртв для группы.
+ * Раньше удачная проверка обнуляла счёт отказов, и такой узел оставался «жив» навсегда: выход
+ * числился up, группа не уходила на запасного члена. */
+static void t_pool_unproven(void) {
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 1;
+    pool_new(1, BY_CONNECTION, 1, NULL);
+    static unsigned char dst[PL_HDR + sizeof(struct fsess)];
+    struct pl_sess *d = (struct pl_sess *)dst;
+    pl_clear(dst);
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(d, 0);
+    pthread_mutex_unlock(&g_pl.mu);
+    for (int i = 0; i < 3; i++) pl_seen(d, -1);
+    pl_check(0);
+    check(g_pl.slot[0].up, "проверка проходит после первой серии отказов — узел ещё жив");
+    pl_seen(d, 0);                              /* соединение открылось — счёт заново */
+    for (int i = 0; i < 3; i++) pl_seen(d, -1);
+    pl_check(0);
+    check(g_pl.slot[0].up, "между сериями было удачное соединение — вторая серия счёт не продолжает");
+    for (int i = 0; i < 3; i++) pl_seen(d, -1);
+    pl_check(0);
+    check(!g_pl.slot[0].up && g_pl.said_up == 0,
+          "две серии отказов подряд, и проверка проходила, — узел мёртв, демону down");
+    check(strstr(g_pl.why, "соединения не открываются") != NULL, "причина называет соединения, а не молчание узла");
+    uint64_t retry = g_pl.slot[0].retry;
+    pl_check(0);                                /* круг: свой прежний узел отвечает на проверку */
+    check(g_pl.slot[0].up, "круг: узел ответил на проверку — слот снова жив");
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(d, 0);                              /* поколение слота сменилось */
+    pthread_mutex_unlock(&g_pl.mu);
+    for (int i = 0; i < 3; i++) pl_seen(d, -1);
+    pl_check(0);
+    check(!g_pl.slot[0].up && g_pl.slot[0].retry >= retry,
+          "ожил без удачных соединений — первой же серии хватает, пауза круга не сбрасывается");
+}
+
 static void t_pool_state(void) {
     char dir[] = "/tmp/poolmatch.XXXXXX";
     if (!mkdtemp(dir)) { check(0, "стенд: каталог состояния"); return; }
@@ -1842,6 +1879,7 @@ static int pool_part(void) {
     t_pool_refill();
     t_pool_spares();
     t_pool_kick_once();
+    t_pool_unproven();
     t_pool_state();
     t_ack_paced();
     return 0;
