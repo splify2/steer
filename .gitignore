@@ -41,6 +41,8 @@ build/specmatch
 build/failovermatch
 build/rrkeepmatch
 build/runmatch
+build/helpersmatch
+build/pqfallbackmatch
 build/h2match
 build/submatch
 build/hy2match
