@@ -983,6 +983,31 @@ static void t_udp_big(void) {
     conn_drop(k);
     dev_drain(NULL);
 
+    /* Первая датаграмма потока крупнее буфера ранних данных (8 КиБ): раньше терялась без повтора,
+     * теперь буфер растёт до её размера; вторая крупная, пока первая не ушла, — отказ. */
+    g_dl = &big_dl;
+    struct conn *e = conn_new(&g_tun);
+    memset(e, 0, sizeof(*e));
+    e->used = 1; e->fd = -1; e->key = cli_key(); e->key.proto = 17; e->key.sport = 30003;
+    e->is_udp = 1; e->pending = 1;
+    conn_link(e);
+    g_es_n = 0;
+    int h1 = udp_send_dgram(e, dg, 60000);
+    int h2 = udp_send_dgram(e, dg, 20000);
+    e->pending = 0;
+    int fl = early_flush(e);
+    check(h1 == SEND_OK && h2 == SEND_AGAIN && fl == 0 && g_es_n == 1 && g_es_len[0] == 60000 &&
+              e->early == NULL && e->early_cap == 0,
+          "ранние данные: первая датаграмма 60000 байт придержана и ушла целиком, вторая крупная — отказ");
+    e->pending = 1;
+    int h3 = udp_send_dgram(e, dg, 1000), h4 = udp_send_dgram(e, dg, 20000);
+    check(h3 == SEND_OK && h4 == SEND_AGAIN,
+          "ранние данные: крупная после мелкой в буфере — отказ (растёт только пустой буфер)");
+    e->pending = 0;
+    (void)early_flush(e);
+    g_dl = save;
+    conn_drop(e);
+    dev_drain(NULL);
     check(vless_dialer.dgram_max == TUNNEL_BUF - 2048 - 512 && vless_dialer.dgram_frame(dg, vless_dialer.dgram_max,
           g_fr_out, sizeof g_fr_out) != 0 &&
           vless_dialer.dgram_frame(dg, vless_dialer.dgram_max + 1, g_fr_out, sizeof g_fr_out) == 0,

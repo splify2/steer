@@ -278,6 +278,7 @@ struct conn {
     unsigned char *early;
     uint32_t early_n;
     uint32_t early_off;
+    uint32_t early_cap;        /* размер early; 0 — EARLY_CAP (крупную датаграмму UDP см. early_reserve) */
     /* Когда клиент завершил рукопожатие (его первый ACK; 0 — ещё нет) и уходило ли что-нибудь
      * узлу: клиент, молчащий SERVER_FIRST_MS после этого, ждёт, что первым заговорит сервер, и
      * узлу надо сообщить, куда подключаться, без данных (conn_deadlines). От SYN не считаем:
@@ -1645,7 +1646,7 @@ static int early_flush(struct conn *c) {
     }
     free(c->early);
     c->early = NULL;
-    c->early_n = c->early_off = 0;
+    c->early_n = c->early_off = c->early_cap = 0;
     return 0;
 }
 
@@ -1656,13 +1657,35 @@ static int early_flush(struct conn *c) {
  * (dgram_frame), каждая со своей длиной впереди (udp_send_dgram): обрамление границ не несёт у
  * всех — у hysteria2 датаграмма уходит как есть, и склеенные они приходили серверу одной. */
 static int early_hold(struct conn *c, const unsigned char *d, size_t n) {
-    if (n > EARLY_CAP - c->early_n) return -1;
+    uint32_t cap = c->early_cap ? c->early_cap : EARLY_CAP;
+    if (n > cap - c->early_n) return -1;
     if (!c->early) {
-        c->early = malloc(EARLY_CAP);
+        c->early = malloc(cap);
         if (!c->early) return -1;
     }
     memcpy(c->early + c->early_n, d, n);
     c->early_n += (uint32_t)n;
+    return 0;
+}
+
+/* Место под датаграмму UDP, которая крупнее EARLY_CAP, пока поток к узлу ещё открывается.
+ *
+ * Без этого первая датаграмма потока крупнее 8 КиБ терялась БЕЗ повтора: у UDP нет
+ * подтверждений, а клиент, отправивший её один раз (DNS по UDP с большим ответом, обмен
+ * WireGuard внутри туннеля, игра), ждёт ответа, которого не будет. Буфер растёт до размера
+ * ЭТОЙ датаграммы и только когда он пуст: придерживается не больше одной крупной. Цена —
+ * не больше UDP_DGRAM_ABS + 66 байт на соединение, и только у соединения, чья первая
+ * датаграмма крупная, пока длится рукопожатие; при предельных 320 соединениях и все с
+ * максимальной датаграммой это ~20 МиБ на секунды, чего обычная работа не даёт.
+ * 0 — место есть (или готово), -1 — нет. */
+static int early_reserve(struct conn *c, size_t need) {
+    uint32_t cap = c->early_cap ? c->early_cap : EARLY_CAP;
+    if (need <= cap - c->early_n) return 0;
+    if (c->early_n || need > UDP_DGRAM_ABS + 66) return -1;
+    free(c->early);
+    c->early = malloc(need);
+    if (!c->early) { c->early_cap = 0; return -1; }
+    c->early_cap = (uint32_t)need;
     return 0;
 }
 
@@ -1698,7 +1721,7 @@ static int udp_send_dgram(struct conn *c, const unsigned char *p, size_t n) {
      * имеет право трогать сессию», и второе однажды разошлось бы с первым. */
     if (c->pending) {
         uint32_t dl = (uint32_t)fn;
-        if (sizeof(dl) + fn > EARLY_CAP - c->early_n) return SEND_AGAIN;
+        if (early_reserve(c, sizeof(dl) + fn) != 0) return SEND_AGAIN;
         if (early_hold(c, (const unsigned char *)&dl, sizeof(dl)) != 0) return SEND_AGAIN;
         return early_hold(c, fr, fn) == 0 ? SEND_OK : SEND_AGAIN;
     }
