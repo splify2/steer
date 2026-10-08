@@ -1125,6 +1125,19 @@ int main(void) {
         check_n("network raw: узел пригоден", 1, (long)n);
         check("network raw читается как tcp", "tcp", n ? nodes[0].type : "");
     }
+    /* ---- type=raw и type=websocket в ссылке ----------------------------------------
+     * raw — каноническое имя tcp у Xray с 24.9.30, websocket — второе имя ws; конфиг Xray их
+     * приводит (sub.c), а ссылка отсеивала узел «транспорт raw не поддержан». */
+    {
+        struct vless_node n;
+        check_n("type=raw по ссылке (reality + vision): пригоден", 0, vless_parse_url(
+            "vless://u@h:443?type=raw&security=reality&pbk=k&flow=xtls-rprx-vision#r", &n));
+        check("type=raw: это tcp", "tcp", n.type);
+        check_n("type=websocket по ссылке: пригоден", 0,
+                vless_parse_url("vless://u@h:443?type=websocket&path=/w#w", &n));
+        check("type=websocket: это ws", "ws", n.type);
+    }
+
     /* ---- ws и httpupgrade (шаг 5 выпуска 1.10) --------------------------------- */
     {
         struct vless_node n;

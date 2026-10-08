@@ -596,7 +596,13 @@ static int upg_node_bad(struct vless_node *n, int ws) {
 /* Поле транспорта или безопасности ссылки (sublink.h). Ключи и их разбор — прежние, из цикла
  * параметров vless:// в sub.c; VLESS-своё (flow, encryption) разбирает own вызывающего. */
 int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen) {
-    if (klen == 4 && !strncmp(k, "type", 4)) sl_set_field(n->type, sizeof(n->type), v, vlen);
+    if (klen == 4 && !strncmp(k, "type", 4)) {
+        sl_set_field(n->type, sizeof(n->type), v, vlen);
+        /* Те же вторые имена, что у конфига Xray (sub.c): raw — каноническое имя tcp с Xray 24.9.30,
+         * websocket — ws. Без этого ссылка с type=raw отсеивалась «транспорт raw не поддержан». */
+        if (!strcmp(n->type, "raw")) snprintf(n->type, sizeof(n->type), "tcp");
+        else if (!strcmp(n->type, "websocket")) snprintf(n->type, sizeof(n->type), "ws");
+    }
     else if (klen == 8 && !strncmp(k, "security", 8)) sl_set_field(n->security, sizeof(n->security), v, vlen);
     else if (klen == 3 && !strncmp(k, "sni", 3)) sl_set_field(n->sni, sizeof(n->sni), v, vlen);
     else if (klen == 2 && !strncmp(k, "fp", 2)) sl_set_field(n->fp, sizeof(n->fp), v, vlen);
