@@ -295,9 +295,63 @@ static void scenario_fail(const char *name, const char *alpn, const char *sni, c
     qc_free(s.q);
 }
 
+/* Крупные датаграммы: всё, что qc_datagram_max() обещает, обязано уйти, а очередь датаграмм не
+ * должна застревать — следом идут поток и ещё одна датаграмма. Дефект I-480: датаграмма,
+ * не влезавшая в пакет, оставалась головой очереди навсегда, и всё соединение замирало. */
+static int c_bigdg_done(struct srv *s, struct cli *c) { (void)s; return c->fin; }
+
+static void scenario_bigdg(void) {
+    struct srv s;
+    struct cli c;
+    uint16_t port = 0;
+    char nm[96];
+    memset(&c, 0, sizeof c);
+    int rc = start_srv(&s, 65535, 0, &port);
+    check("крупные датаграммы: сервер поднялся", 0, rc);
+    if (rc) return;
+    struct qc_cfg cfg;
+    cfg_default(&cfg, port);
+    cfg.datagram_max = 65535;
+    rc = qc_open(&cfg, &cli_ops, &c, &c.q);
+    check("крупные датаграммы: qc_open", 0, rc);
+    if (rc) { qc_free(s.q); return; }
+    check("крупные датаграммы: рукопожатие", 1, pump(&s, &c, c_hs, 5000));
+    size_t mx = qc_datagram_max(c.q);
+    static uint8_t d[4096];
+    memset(d, 0x5a, sizeof d);
+    int sent = 0;
+    for (size_t n = mx > 80 ? mx - 80 : 1; n <= mx + 100 && n <= sizeof d; n += 4) {
+        int r = qc_datagram_send(c.q, d, n);
+        if (r == 0) sent++;
+        else if (r != QC_ETOOBIG) check("крупные датаграммы: отказ только QC_ETOOBIG", 0, r);
+        qc_run(s.q, 0);
+        qc_run(c.q, 0);
+    }
+    pump(&s, &c, c_closed_any, 800);
+    size_t got_before = s.dg_in;
+    snprintf(nm, sizeof nm, "крупные датаграммы: дошла хотя бы одна из %d (max=%zu)", sent, mx);
+    check(nm, 1, got_before > 0);
+    /* Очередь жива: поток эхом и маленькая датаграмма. */
+    c.sendbuf = malloc(STREAM_N);
+    for (size_t i = 0; i < STREAM_N; i++) c.sendbuf[i] = pat(i);
+    int64_t sid = 0;
+    check("крупные датаграммы: поток открылся", 0, qc_stream_open(c.q, &sid));
+    check("крупные датаграммы: поток принят", 1000, qc_stream_send(c.q, sid, c.sendbuf, 1000, 1));
+    uint8_t small[21];
+    memset(small, 1, sizeof small);
+    check("крупные датаграммы: малая датаграмма принята", 0, qc_datagram_send(c.q, small, sizeof small));
+    check("крупные датаграммы: после них эхо потока вернулось (соединение не замерло)", 1,
+          pump(&s, &c, c_bigdg_done, 3000));
+    check("крупные датаграммы: после них дошла и малая", 1, s.dg_in > got_before);
+    free(c.sendbuf);
+    qc_free(c.q);
+    qc_free(s.q);
+}
+
 int main(void) {
     scenario_echo("CUBIC", 0);
     scenario_echo("Brutal", 50u * 1000 * 1000);
+    scenario_bigdg();
 
     /* Проверка сертификата. */
     scenario_fail("чужой корень", ALPN, "localhost", qc_other_pem, sizeof qc_other_pem - 1, 0, QC_CLOSE_HANDSHAKE);

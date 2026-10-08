@@ -1331,6 +1331,15 @@ static void *engine(void *arg) {
             struct qc_stats qs;
             qc_stats_get(E.qc, &qs);
             E.st.rtt_us = qs.rtt_us;
+            /* Датаграмма, не влезшая в пакет, выбрасывается (как потеря в сети) — но не молча:
+             * строка в журнал не чаще раза в десять секунд, с числом выброшенных. */
+            static uint64_t dg_seen, dg_log_ms;
+            if (qs.dg_dropped > dg_seen && now_ms() - dg_log_ms >= 10000) {
+                fprintf(stderr, LOG_W2 "hysteria2: выброшено датаграмм UDP, не влезших в пакет: %llu\n",
+                        (unsigned long long)qs.dg_dropped);
+                dg_seen = qs.dg_dropped;
+                dg_log_ms = now_ms();
+            }
         }
         pthread_mutex_unlock(&E.mu);
     }

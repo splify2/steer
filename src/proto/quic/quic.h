@@ -176,6 +176,7 @@ struct qc_stats {
     uint64_t bytes_sent, bytes_recv;
     int      handshake_done;
     int      brutal;            /* 1 — работает Brutal */
+    uint64_t dg_dropped;        /* датаграмм выброшено из очереди (не влезли в пакет) */
 };
 
 /* Контекст TLS отдельно от соединения: разбор корней (полторы сотни сертификатов) — не то, что

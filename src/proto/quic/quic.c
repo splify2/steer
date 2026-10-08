@@ -113,6 +113,7 @@ struct qc {
     struct qc_stream *rr;       /* с кого продолжать обход потоков */
     struct qc_dg dgq[QC_DG_QUEUE];
     unsigned  dg_head, dg_n;
+    uint64_t  dg_dropped;       /* датаграммы, выброшенные из очереди, не дойдя до пакета */
 
     int       hs_done;
     int       closed;           /* on_closed уже вызвано */
@@ -605,6 +606,15 @@ static ngtcp2_ssize write_pkt_cb(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pk
     ngtcp2_ssize nw;
     ngtcp2_ssize dl = -1;
 
+    /* Голова очереди, что уже не влезает в пакет (путь уже, чем было при постановке), не должна
+     * стоять вечно: ngtcp2 на такую отвечает «0, не принята», как на окно перегрузки, и очередь
+     * вместе с потоками замирала (I-480). Датаграммы ненадёжны — выбрасываем и считаем. */
+    while (q->dg_n > 0 && q->hs_done && q->dgq[q->dg_head].n > qc_datagram_max(q)) {
+        free(q->dgq[q->dg_head].d);
+        q->dg_head = (q->dg_head + 1) % QC_DG_QUEUE;
+        q->dg_n--;
+        q->dg_dropped++;
+    }
     if (q->dg_n > 0 && q->hs_done) {
         struct qc_dg *g = &q->dgq[q->dg_head];
         ngtcp2_vec v = { .base = g->d, .len = g->n };
@@ -617,6 +627,7 @@ static ngtcp2_ssize write_pkt_cb(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pk
             free(g->d);
             q->dg_head = (q->dg_head + 1) % QC_DG_QUEUE;
             q->dg_n--;
+            if (!accepted) q->dg_dropped++;
         }
         return nw < 0 ? 0 : nw;
     }
@@ -1199,7 +1210,9 @@ size_t qc_datagram_max(const struct qc *q) {
     const ngtcp2_transport_params *rp = ngtcp2_conn_get_remote_transport_params2(q->conn);
     if (!rp || rp->max_datagram_frame_size == 0) return 0;
     /* Пакет: короткий заголовок (1 + cid + номер до 4) + тег 16 + кадр (тип 1 + длина до 2). */
-    size_t udp = ngtcp2_conn_get_max_tx_udp_payload_size2(q->conn);
+    /* Размер пути, а не потолок настроек: пакет больше пути ngtcp2 не собирает (до разведки PMTU —
+     * 1200), и датаграмма по потолку застревала бы в очереди навсегда (I-480). */
+    size_t udp = ngtcp2_conn_get_path_max_tx_udp_payload_size2(q->conn);
     size_t over = 1 + QC_CID_LEN + 4 + 16 + 3;
     size_t cap = udp > over ? udp - over : 0;
     size_t peer = rp->max_datagram_frame_size > 3 ? (size_t)rp->max_datagram_frame_size - 3 : 0;
@@ -1270,4 +1283,5 @@ void qc_stats_get(struct qc *q, struct qc_stats *st) {
     st->pkt_lost = ci.pkt_lost;
     st->handshake_done = q->hs_done;
     st->brutal = q->brutal;
+    st->dg_dropped = q->dg_dropped;
 }
