@@ -985,8 +985,8 @@ int udp_write_to_client(const struct tun_dev *d, uint32_t src, uint32_t dst,
     /* Заголовок UDP плюс сама датаграмма: сумма UDP считается по ВСЕЙ датаграмме, а не по
      * куску, поэтому собрать её надо целиком и только потом нарезать. Статический буфер, а
      * не стек: 64 КБ на стеке в цикле, который и без того держит буфер записи TLS. */
-    static __thread unsigned char l4[8 + UDP_DGRAM_MAX];
-    if (n > UDP_DGRAM_MAX) return -1;
+    static __thread unsigned char l4[8 + UDP_DGRAM_ABS];
+    if (n > UDP_DGRAM_ABS) return -1;
 
     size_t udp_len = 8 + n;
     l4[0] = (unsigned char)(sport >> 8); l4[1] = (unsigned char)sport;

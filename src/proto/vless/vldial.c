@@ -98,6 +98,8 @@ static void vl_clear(void *sess) {
     s->lenb_n = 0;
     s->xs = 0;
     s->xdiscard = 0;
+    free(s->dgbig);
+    s->dgbig = NULL;
 }
 
 static int vl_fd(const void *sess) {
@@ -237,6 +239,28 @@ static size_t xudp_frames(const struct flow_key *k, int first, const unsigned ch
     return o;
 }
 
+/* Самая большая датаграмма клиента, которую мы несём узлу. Отправка склеивает заголовок запроса,
+ * кадр Vision или рамку XUDP и саму датаграмму в ОДИН буфер записи TUNNEL_BUF — одним куском
+ * обязательно, окно h2 принимает либо всё, либо ничего, — и обёртки не должны его переполнить:
+ * иначе датаграмма крупнее ломала бы поток (SEND_FATAL), а не терялась. Запас тот же, что у
+ * TCP (TUNNEL_BUF - 2048 в стеке: заголовок и обёртка Vision), и ещё 512 под рамку XUDP и длину.
+ * В обратную сторону предел шире — UDP_DGRAM_ABS: приём собирает датаграмму в куче по её длине. */
+#define VL_DGRAM_UP (TUNNEL_BUF - 2048 - 512)
+
+/* Куда собирать датаграмму длиной want: в dg, а крупнее — в кучу. NULL — памяти нет; вызывающий
+ * тогда выбрасывает датаграмму по длине, как слишком крупную (поток остаётся). Размер кучи —
+ * всегда UDP_DGRAM_ABS, чтобы следующая крупная датаграмма не перевыделяла. */
+static unsigned char *dg_reserve(struct vl_sess *s, size_t want) {
+    if (want <= sizeof s->dg) return s->dg;
+    if (!s->dgbig) s->dgbig = malloc(UDP_DGRAM_ABS);
+    return s->dgbig;
+}
+
+/* Буфер текущей датаграммы: тот же выбор, что сделал dg_reserve, когда длина стала известна. */
+static unsigned char *dg_cur(struct vl_sess *s) {
+    return s->dg_want <= sizeof s->dg ? s->dg : s->dgbig;
+}
+
 /* Разобрать поток рамок XUDP от узла (после снятия Vision) и отдать датаграммы клиенту. Потоковый,
  * как udp_downstream: границы рамок, кадров Vision и записей TLS не совпадают. 0 или -1.
  *
@@ -260,7 +284,7 @@ static int xudp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
                 s->xs = XS_META;
             } else if (!v) {
                 s->xs = XS_LEN;
-            } else if (v > UDP_DGRAM_MAX) {
+            } else if (v > UDP_DGRAM_ABS || !dg_reserve(s, v)) {
                 s->dg_skip = v;                          /* выбросить ровно по длине, см. udp_downstream */
                 s->xdiscard = 1;
                 s->xs = XS_SKIP;
@@ -289,13 +313,13 @@ static int xudp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
         case XS_DATA: {
             size_t take = (size_t)s->dg_want - s->dg_have;
             if (take > n) take = n;
-            memcpy(s->dg + s->dg_have, d, take);
+            memcpy(dg_cur(s) + s->dg_have, d, take);
             s->dg_have = (uint16_t)(s->dg_have + take);
             d += take;
             n -= take;
             if (s->dg_have < s->dg_want) return 0;
             s->xs = XS_LEN;
-            if (!s->xdiscard && emit(arg, s->dg, s->dg_want) != 0) return -1;
+            if (!s->xdiscard && emit(arg, dg_cur(s), s->dg_want) != 0) return -1;
             s->dg_want = 0;
             s->dg_have = 0;
             break;
@@ -437,7 +461,7 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
  * на два вызова, при закрытом окне уехала бы половиной — сервер прочитал бы длину и стал
  * ждать хвост, которого нет, а следующая датаграмма приехала бы внутрь предыдущей. */
 static size_t vl_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
-    if (n > UDP_DGRAM_MAX || 2 + n > cap) return 0;
+    if (n > VL_DGRAM_UP || 2 + n > cap) return 0;
     out[0] = (unsigned char)(n >> 8);
     out[1] = (unsigned char)n;
     memcpy(out + 2, p, n);
@@ -494,15 +518,15 @@ static int udp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
                 n -= 2;
             }
             if (!s->dg_want) continue;              /* длина 0: отдавать нечего */
-            if (s->dg_want > UDP_DGRAM_MAX) {
+            if (s->dg_want > UDP_DGRAM_ABS || !dg_reserve(s, s->dg_want)) {
                 /* Строка — слово в слово прежняя, вместе с повтором «tunnel:» после
                  * приставки: по ней журнал уже читают. */
                 static __thread time_t said;
                 time_t now = stack_now_s();
                 if (now - said >= 10) {
                     said = now;
-                    fprintf(stderr, LOG_W "tunnel: датаграмма %u байт больше предела %d — "
-                            "выброшена\n", s->dg_want, UDP_DGRAM_MAX);
+                    fprintf(stderr, LOG_W "tunnel: датаграмма %u байт не принята (предел %d, "
+                            "или нет памяти) — выброшена\n", s->dg_want, UDP_DGRAM_ABS);
                 }
                 s->dg_skip = s->dg_want;
                 s->dg_want = 0;
@@ -512,7 +536,7 @@ static int udp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
         }
         size_t need = (size_t)s->dg_want - s->dg_have;
         size_t take = n < need ? n : need;
-        memcpy(s->dg + s->dg_have, d, take);
+        memcpy(dg_cur(s) + s->dg_have, d, take);
         s->dg_have = (uint16_t)(s->dg_have + take);
         d += take;
         n -= take;
@@ -521,7 +545,7 @@ static int udp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
         /* Датаграмма целиком — клиенту. Метку времени соединения стек двигает сам, на КАЖДОЙ
          * отданной датаграмме: поток, по которому идёт только приём, иначе убрали бы по простою
          * прямо во время работы. */
-        if (emit(arg, s->dg, s->dg_want) != 0) return -1;
+        if (emit(arg, dg_cur(s), s->dg_want) != 0) return -1;
         s->dg_want = 0;
         s->dg_have = 0;
     }
@@ -681,6 +705,7 @@ const struct dialer_ops vless_dialer = {
     .send = vl_send,
     .room = vl_room,
     .dgram_frame = vl_dgram_frame,
+    .dgram_max = VL_DGRAM_UP,
     .read = vl_read,
     .deliver = vl_deliver,
 };

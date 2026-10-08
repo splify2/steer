@@ -1673,6 +1673,12 @@ static int early_hold(struct conn *c, const unsigned char *d, size_t n) {
  * никому не важно, кроме сборщика фрагментов. */
 static __thread uint16_t g_ip_id;
 
+/* Самая большая датаграмма, которую несёт текущий дайлер (dialer_ops.dgram_max). */
+static size_t dgram_limit(void) {
+    size_t m = g_dl->ops->dgram_max;
+    return !m ? UDP_DGRAM_MAX : m < UDP_DGRAM_ABS ? m : UDP_DGRAM_ABS;
+}
+
 /* Датаграмма серверу: обрамление дайлера и данные ОДНИМ куском.
  *
  * Одним обязательно: h2_write отправляет либо всё, либо ничего, и датаграмма, разрезанная
@@ -1682,8 +1688,8 @@ static __thread uint16_t g_ip_id;
  * Запас в 64 байта под обрамление: у VLESS оно два байта длины, но буфер стека не должен
  * знать, чьё именно. */
 static int udp_send_dgram(struct conn *c, const unsigned char *p, size_t n) {
-    static __thread unsigned char fr[UDP_DGRAM_MAX + 64];
-    if (n > UDP_DGRAM_MAX) return SEND_FATAL;
+    static __thread unsigned char fr[UDP_DGRAM_ABS + 64];
+    if (n > dgram_limit()) return SEND_FATAL;
     size_t fn = g_dl->ops->dgram_frame(p, n, fr, sizeof(fr));
     if (!fn) return SEND_FATAL;
     /* Сессия ещё устанавливается: писать в неё нельзя — в ней работает установщик, — а
@@ -1868,8 +1874,8 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
  *
  * Пределы и их причины:
  *  - DEFRAG_SLOTS = 16 одновременных сборок на поток обработки. Каждая держит до
- *    8 + UDP_DGRAM_MAX байт плюс три битовые карты, то есть 16 сборок — ~1 МиБ в худшем
- *    случае при пределе датаграммы в UDP_DGRAM_MAX. Больше одновременно незавершённых
+ *    8 + UDP_DGRAM_ABS (65515) байт плюс три битовые карты по 1 КиБ, то есть 16 сборок —
+ *    ~1 МиБ в худшем случае, и куча освобождается по готовности сборки. Больше одновременно незавершённых
  *    датаграмм у LAN роутера не бывает: сборка живёт доли секунды, а потерянный хвост
  *    держится до срока. Когда все слоты заняты, вытесняется САМАЯ СТАРАЯ — новая
  *    датаграмма живее брошенной, — и это считается и попадает в журнал.
@@ -1877,7 +1883,8 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
  *    15 с), Linux держит 30 с (net.ipv4.ipfrag_time), RFC 8200 — 60 с для IPv6. Берём
  *    значение Linux: клиент за этим роутером — обычно Linux-стек, и его повторная
  *    отправка укладывается в тот же срок.
- *  - Датаграмма не больше 8 + UDP_DGRAM_MAX: больше узлы нести не берутся (tun.h).
+ *  - Датаграмма не больше 8 + UDP_DGRAM_ABS = 65515: больше по IPv4 не бывает. Что из собранного
+ *    возьмёт дайлер, решает он сам (dgram_max), а сборка от этого не зависит.
  *
  * Наложение и повтор. Точный повтор уже принятого фрагмента (те же смещение и длина)
  * молча пропускается: сеть иногда дублирует пакеты, и датаграмма от этого не портится.
@@ -1894,7 +1901,7 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
  * соберётся неверно. */
 #define DEFRAG_SLOTS  16
 #define DEFRAG_TTL_NS 30000000000ull
-#define DEFRAG_MAXLEN (8 + UDP_DGRAM_MAX)           /* UDP-датаграмма целиком, с заголовком */
+#define DEFRAG_MAXLEN (8 + UDP_DGRAM_ABS)           /* UDP-датаграмма целиком, с заголовком */
 #define DEFRAG_BLOCKS ((DEFRAG_MAXLEN + 7) / 8)
 
 struct frag_slot {
@@ -2080,7 +2087,7 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
     /* Сюда попадают только целые датаграммы: фрагменты собирает udp_defrag ещё до разбора
      * заголовка, и неполной датаграммы здесь быть не может. Проверка всё равно стоит —
      * отправить серверу обрубок под видом целой датаграммы хуже, чем потерять её. */
-    if (k->frag || !dn || dn > UDP_DGRAM_MAX) return;
+    if (k->frag || !dn || dn > dgram_limit()) return;
 
     if (!c) {
         c = conn_new(tun);
@@ -2278,7 +2285,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
      * дальше общим путём, поэтому знать про фрагменты больше никому не нужно. */
     if (n >= 20 && (pkt[0] >> 4) == 4 && pkt[9] == 17 &&
         (((pkt[6] << 8) | pkt[7]) & 0x3FFF)) {
-        static __thread unsigned char asm_pkt[20 + 8 + UDP_DGRAM_MAX];
+        static __thread unsigned char asm_pkt[20 + 8 + UDP_DGRAM_ABS];
         size_t an = udp_defrag(pkt, n, asm_pkt, sizeof(asm_pkt));
         if (!an) { TR("фрагмент UDP: %s\n", "ждём продолжения или отказ"); return; }
         TR("датаграмма собрана из фрагментов: %zu байт\n", an);

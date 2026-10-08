@@ -8,7 +8,10 @@
              сверяется хеш), PUT /up — принимает тело и отвечает числом принятых байт;
   UDP :53    ответчик DNS: на любой запрос типа A отвечает 192.0.2.53 (разбор вопроса — руками);
   UDP :7     эхо: возвращает датаграмму как есть (проверка фрагментации: 3000 байт не влезают в один
-             датаграмм QUIC).
+             датаграмм QUIC);
+  UDP :9     сумма: отвечает sha256 принятой датаграммы и её длиной — ответ короткий, поэтому им
+             проверяется ПУТЬ ТУДА для крупных датаграмм (эталонный сервер ответов от 4096 байт
+             клиенту не возвращает, так что эхо на них не годится).
 """
 import argparse
 import hashlib
@@ -84,6 +87,8 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Thread(target=udp_loop, args=(a.ip, 53, dns_answer), daemon=True).start()
     threading.Thread(target=udp_loop, args=(a.ip, 7, lambda d: d), daemon=True).start()
+    threading.Thread(target=udp_loop, args=(a.ip, 9, lambda d: hashlib.sha256(d).hexdigest().encode()
+                                            + b" %d" % len(d)), daemon=True).start()
     print("targets: ready", flush=True)
     threading.Event().wait()
 

@@ -152,6 +152,10 @@ struct dialer_ops {
     long (*room)(const void *ctx, void *sess);
     /* Уложить датаграмму клиента в байты потока к узлу; 0 — не влезла. */
     size_t (*dgram_frame)(const unsigned char *p, size_t n, unsigned char *out, size_t cap);
+    /* Самая большая датаграмма клиента, которую дайлер несёт в обе стороны, байт полезной
+     * нагрузки. 0 — UDP_DGRAM_MAX (tun.h); больше UDP_DGRAM_ABS не бывает. Крупнее предела
+     * датаграмма отбрасывается целиком, соединение остаётся. */
+    size_t dgram_max;
     /* Прочитать у связи. *got — сколько байт пришло от узла (до разбора: по ним стек мерит
      * свою порцию за проход); 0 при коде 0 — законно (служебный кадр). Не 0 — связь кончилась. */
     int  (*read)(void *sess, unsigned char *buf, size_t cap, const unsigned char **data,

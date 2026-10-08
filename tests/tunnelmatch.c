@@ -917,6 +917,123 @@ static void t_udp_defrag(void) {
     check(!c, "UDP: длина в заголовке не равна собранному — отказ");
 }
 
+/* ---- крупные датаграммы UDP: выше 4096 байт ---------------------------------------------
+ * Датаграмма в 4097 байт данных приходит от клиента тремя фрагментами (1480 + 1480 + 1145 байт
+ * UDP) и раньше терялась на пределе в 4096, хотя собиралась. Здесь: сборка, обрамление
+ * дайлера с dgram_max, разбор от узла VLESS и обратная запись клиенту с нарезкой. */
+static struct { size_t n[8]; int cnt; int bad; } g_em;
+static int em_chk(void *arg, const unsigned char *d, size_t n) {
+    (void)arg;
+    size_t i = g_em.cnt == 3 ? 4 : (size_t)g_em.cnt;    /* четвёртой (65535) не будет */
+    for (size_t j = 0; j < n; j++) if (d[j] != (unsigned char)(i * 31 + j)) { g_em.bad = 1; break; }
+    if (g_em.cnt < 8) g_em.n[g_em.cnt] = n;
+    g_em.cnt++;
+    return 0;
+}
+
+static void t_udp_big(void) {
+    g_now_ns = 5000ull * 1000000000ull;
+    fr_make(4097, 21);                                  /* UDP 4105: 1480 + 1480 + 1145 */
+    size_t a = fr_feed(FR_SRC, 61, 0, 1480, 1);
+    size_t b = fr_feed(FR_SRC, 61, 1480, 1480, 1);
+    size_t c = fr_feed(FR_SRC, 61, 2960, 1145, 0);
+    check(!a && !b && fr_same(c), "UDP: 4097 байт данных тремя фрагментами — собрана");
+
+    /* Предельная датаграмма: 65507 байт данных, 45 фрагментов, в обратном порядке. */
+    fr_make(UDP_DGRAM_ABS, 22);                         /* UDP 65515 */
+    size_t total = g_fr_len, got = 0;
+    int nfr = 0;
+    for (size_t off = (total - 1) / 1480 * 1480;; off -= 1480) {
+        size_t len = total - off < 1480 ? total - off : 1480;
+        got = fr_feed(FR_SRC, 62, off, len, off + len < total);
+        nfr++;
+        if (!off) break;
+    }
+    check(nfr == 45 && fr_same(got), "UDP: 65507 байт данных, 45 фрагментов в обратном порядке — собрана");
+
+    /* Один байт сверх предела протокола: фрагмент выходит за 65515 — отказ. */
+    fr_make(UDP_DGRAM_ABS, 23);
+    size_t over = fr_feed(FR_SRC, 63, 65512, 8, 0);
+    check(!over, "UDP: фрагмент за пределом 65515 байт — отказ");
+
+    /* Обрамление и придержанные ранние данные: крупнее предела дайлера — отказ, в пределе — ок. */
+    static const struct dialer_ops big_ops = { .name = "крупные", .dgram_frame = es_frame,
+                                               .send = es_send, .dgram_max = UDP_DGRAM_ABS };
+    static const struct dialer_ops small_ops = { .name = "мелкие", .dgram_frame = es_frame,
+                                                 .send = es_send };
+    static const struct dialer big_dl = { &big_ops, NULL, 0 }, small_dl = { &small_ops, NULL, 0 };
+    const struct dialer *save = g_dl;
+    static unsigned char dg[UDP_DGRAM_ABS + 1];
+    struct conn *k = conn_new(&g_tun);
+    memset(k, 0, sizeof(*k));
+    k->used = 1; k->fd = -1; k->key = cli_key(); k->key.proto = 17; k->key.sport = 30002;
+    k->is_udp = 1;
+    conn_link(k);
+    g_dl = &small_dl;
+    g_es_n = 0;
+    int r1 = udp_send_dgram(k, dg, 4096), r2 = udp_send_dgram(k, dg, 4097);
+    check(r1 == SEND_OK && r2 == SEND_FATAL,
+          "дайлер без dgram_max: 4096 байт уходят, 4097 — отказ (прежнее поведение)");
+    g_dl = &big_dl;
+    int r3 = udp_send_dgram(k, dg, 4097), r4 = udp_send_dgram(k, dg, UDP_DGRAM_ABS),
+        r5 = udp_send_dgram(k, dg, UDP_DGRAM_ABS + 1);
+    check(r3 == SEND_OK && r4 == SEND_OK && r5 == SEND_FATAL && g_es_len[2] == UDP_DGRAM_ABS,
+          "дайлер с dgram_max: 4097 и 65507 байт уходят целиком, 65508 — отказ");
+    g_dl = save;
+    conn_drop(k);
+    dev_drain(NULL);
+
+    check(vless_dialer.dgram_max == TUNNEL_BUF - 2048 - 512 && vless_dialer.dgram_frame(dg, vless_dialer.dgram_max,
+          g_fr_out, sizeof g_fr_out) != 0 &&
+          vless_dialer.dgram_frame(dg, vless_dialer.dgram_max + 1, g_fr_out, sizeof g_fr_out) == 0,
+          "VLESS: вверх несёт датаграмму до TUNNEL_BUF - 2560 байт, на байт больше — не берётся");
+
+    /* Запись клиенту: 60000 байт нарезаются под MTU, и собранное совпадает с исходным. */
+    fr_make(60000, 24);
+    int w = udp_write_to_client(&g_tun, FR_DST, FR_SRC, 443, 40000, g_fr_dgram + 8, 60000, 77);
+    unsigned char p[2048];
+    size_t pk = 0, asm_n = 0, maxlen = 0;
+    ssize_t rn;
+    while ((rn = recv(g_dev_peer, p, sizeof p, MSG_DONTWAIT)) > 0) {
+        pk++;
+        if ((size_t)rn > maxlen) maxlen = (size_t)rn;
+        asm_n = udp_defrag(p, (size_t)rn, g_fr_out, sizeof g_fr_out);
+    }
+    check(w == 0 && pk == 41 && maxlen <= TUN_MTU && asm_n == 20 + 8 + 60000 &&
+          memcmp(g_fr_out + 28, g_fr_dgram + 8, 60000) == 0,
+          "клиенту: 60000 байт нарезаны на 41 фрагмент не больше MTU и собираются обратно");
+    if (pk != 41 || asm_n != 20 + 8 + 60000) fprintf(stderr, "  пакетов %zu, собрано %zu\n", pk, asm_n);
+
+    /* От узла VLESS: датаграммы [длина(2)][данные] — 100, 20000, 65507 и 65535 (за пределом) и
+     * ещё 50 за ними; записи режутся по 1000 байт, как приходят от узла по кускам TLS. */
+    struct vl_sess *vs = calloc(1, sizeof *vs);
+    vs->established = 1;
+    static unsigned char wire[300000];
+    size_t wl = 0;
+    size_t lens[] = { 100, 20000, 65507, 65535, 50 };
+    for (size_t i = 0; i < 5; i++) {
+        wire[wl++] = (unsigned char)(lens[i] >> 8);
+        wire[wl++] = (unsigned char)lens[i];
+        for (size_t j = 0; j < lens[i]; j++) wire[wl++] = (unsigned char)(i * 31 + j);
+    }
+    memset(&g_em, 0, sizeof g_em);
+    int drc = 0;
+    int save_err = dup(2), nul = open("/dev/null", O_WRONLY);
+    dup2(nul, 2);
+    for (size_t off = 0; off < wl && !drc; off += 1000)
+        drc = vless_dialer.deliver(&g_node, vs, 1, wire + off, wl - off < 1000 ? wl - off : 1000,
+                                   em_chk, NULL);
+    fflush(stderr);
+    dup2(save_err, 2); close(save_err); close(nul);
+    check(!drc && g_em.cnt == 4 && g_em.n[0] == 100 && g_em.n[1] == 20000 && g_em.n[2] == 65507 &&
+              g_em.n[3] == 50 && !g_em.bad,
+          "VLESS от узла: 100, 20000 и 65507 байт отданы целиком, 65535 выброшена по длине, 50 после неё живы");
+    if (g_em.cnt != 4) fprintf(stderr, "  отдано %d: %zu %zu %zu %zu\n", g_em.cnt, g_em.n[0], g_em.n[1], g_em.n[2], g_em.n[3]);
+    vless_dialer.clear(vs);
+    check(vs->dgbig == NULL, "VLESS: куча крупной датаграммы возвращена при закрытии сессии");
+    free(vs);
+}
+
 /* Заполнить таблицу целиком свежими TCP, кроме одного потока UDP с заданными портом и
  * возрастом, и спросить conn_new о новом месте. Возвращает, отдали ли место этого потока. */
 static int full_table_gives_udp(uint16_t dport, int idle_s) {
@@ -2212,6 +2329,7 @@ int main(void) {
     t_fin_window();
     t_udp_early_bounds();
     t_udp_defrag();
+    t_udp_big();
     t_early_window();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");
 

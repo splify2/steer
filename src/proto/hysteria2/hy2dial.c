@@ -117,6 +117,17 @@ static int h2_read(void *sess, unsigned char *buf, size_t cap, const unsigned ch
     struct hy2_sess *s = sess;
     *got = 0;
     *data = buf;
+    /* Датаграмма UDP приходит одним сообщением SEQPACKET, и сообщение длиннее буфера чтения
+     * ядро обрезает, а остаток выбрасывает: клиент получил бы обрубок под видом целой
+     * датаграммы. Буфер стека (TUNNEL_BUF) меньше самой крупной датаграммы (UDP_DGRAM_ABS),
+     * поэтому читаем в свой, по размеру протокола. Поток TCP режется на куски не больше
+     * буфера стека (CHUNK в hy2conn.c) и читается как раньше. */
+    if (s->udp) {
+        static __thread unsigned char big[UDP_DGRAM_ABS];
+        buf = big;
+        cap = sizeof big;
+        *data = big;
+    }
     ssize_t r = recv(s->fd, buf, cap, MSG_DONTWAIT);
     if (r > 0) { *got = (size_t)r; return 0; }
     if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
@@ -151,6 +162,7 @@ const struct dialer_ops hy2_dialer = {
     .flow_open = h2_flow_open,
     .send = h2_send,
     .dgram_frame = h2_dgram_frame,
+    .dgram_max = UDP_DGRAM_ABS,
     .read = h2_read,
     .deliver = h2_deliver,
 };
