@@ -1670,6 +1670,23 @@ static void t_pool_unproven(void) {
           "ожил без удачных соединений — первой же серии хватает, пауза круга не сбрасывается");
 }
 
+/* Круг поиска узла у мёртвого слота не растёт до минут: сервер вернулся, а группа возвращается на него
+ * только когда круг дойдёт до проверки (на стенде QEMU — через 313 с). Пауза растёт 15, 30 с и
+ * остаётся на PL_RETRY_MAX_S. */
+static void t_pool_retry_cap(void) {
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 0;
+    pool_new(1, BY_CONNECTION, 2, NULL);
+    pl_check(0);
+    pl_check(0);                                /* мёртв: первый круг пуст */
+    uint64_t at[8];
+    for (int k = 0; k < 8; k++) { pl_check(0); at[k] = g_pl.slot[0].retry; }
+    check(at[7] == PL_RETRY_MAX_S && PL_RETRY_MAX_S <= 30,
+          "круг пустого слота: пауза после восьми пустых кругов — не больше 30 с");
+    g_fn[0].alive = 1;
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].retry == PL_RETRY_S, "круг: узел вернулся — слот жив, пауза круга заново 15 с");
+}
+
 static void t_pool_state(void) {
     char dir[] = "/tmp/poolmatch.XXXXXX";
     if (!mkdtemp(dir)) { check(0, "стенд: каталог состояния"); return; }
@@ -1880,6 +1897,7 @@ static int pool_part(void) {
     t_pool_spares();
     t_pool_kick_once();
     t_pool_unproven();
+    t_pool_retry_cap();
     t_pool_state();
     t_ack_paced();
     return 0;
