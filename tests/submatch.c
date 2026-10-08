@@ -1297,6 +1297,129 @@ int main(void) {
         check("  причина", "vision поверх grpc не бывает", st.reasons[0].reason);
     }
 
+    /* ---- имена узлов: эмодзи, символы, флаги и кириллица доходят целиком, во всех форматах ----
+     *
+     * Подписка «StressKVN»: у людей в splify2 пропадали ⭐ 📱 ⚡, а имена приходили обрезанными.
+     * Панели, выдающие JSON из Python/PHP, пишут не-ASCII как \uXXXX с суррогатными парами
+     * (📱 = 📱), YAML-эмиттеры — как "\U0001F4F1"; разбор прежде отбрасывал обратную
+     * косую черту и оставлял «ud83dudcf1». */
+    {
+        static const char *const U = "11111111-2222-3333-4444-555555555555";
+        const char *names[] = {
+            "\xE2\x9A\xA1 \xE2\xAD\x90 \xD0\x92\xD0\xB5\xD0\xBB\xD0\xB8\xD0\xBA\xD0\xBE\xD0\xB1\xD1\x80\xD0\xB8\xD1\x82\xD0\xB0\xD0\xBD\xD0\xB8\xD1\x8F",
+            "\xF0\x9F\x93\xB1 \xD0\x93\xD0\xB5\xD1\x80\xD0\xBC\xD0\xB0\xD0\xBD\xD0\xB8\xD1\x8F #4",
+            "\xF0\x9F\x87\xA9\xF0\x9F\x87\xAA \xD0\x93\xD0\xB5\xD1\x80\xD0\xBC\xD0\xB0\xD0\xBD\xD0\xB8\xD1\x8F",
+            "\xE2\xAD\x90\xEF\xB8\x8F \xE2\x9A\xA1\xEF\xB8\x8F \xD0\x9D\xD0\xB8\xD0\xB4\xD0\xB5\xD1\x80\xD0\xBB\xD0\xB0\xD0\xBD\xD0\xB4\xD1\x8B",
+        };
+        /* Те же имена в записи \u (Python json.dumps) и "\U" (YAML). */
+        const char *jesc[] = {
+            "\\u26a1 \\u2b50 \\u0412\\u0435\\u043b\\u0438\\u043a\\u043e\\u0431\\u0440\\u0438\\u0442\\u0430\\u043d\\u0438\\u044f",
+            "\\ud83d\\udcf1 \\u0413\\u0435\\u0440\\u043c\\u0430\\u043d\\u0438\\u044f #4",
+            "\\ud83c\\udde9\\ud83c\\uddea \\u0413\\u0435\\u0440\\u043c\\u0430\\u043d\\u0438\\u044f",
+            "\\u2b50\\ufe0f \\u26a1\\ufe0f \\u041d\\u0438\\u0434\\u0435\\u0440\\u043b\\u0430\\u043d\\u0434\\u044b",
+        };
+        const char *yesc[] = {
+            "\\u26A1 \\u2B50 \\u0412\\u0435\\u043B\\u0438\\u043A\\u043E\\u0431\\u0440\\u0438\\u0442\\u0430\\u043D\\u0438\\u044F",
+            "\\U0001F4F1 \\u0413\\u0435\\u0440\\u043C\\u0430\\u043D\\u0438\\u044F #4",
+            "\\U0001F1E9\\U0001F1EA \\u0413\\u0435\\u0440\\u043C\\u0430\\u043D\\u0438\\u044F",
+            "\\u2B50\\uFE0F \\u26A1\\uFE0F \\u041D\\u0438\\u0434\\u0435\\u0440\\u043B\\u0430\\u043D\\u0434\\u044B",
+        };
+        const char *pct[] = {
+            "%E2%9A%A1%20%E2%AD%90%20%D0%92%D0%B5%D0%BB%D0%B8%D0%BA%D0%BE%D0%B1%D1%80%D0%B8%D1%82%D0%B0%D0%BD%D0%B8%D1%8F",
+            "%F0%9F%93%B1%20%D0%93%D0%B5%D1%80%D0%BC%D0%B0%D0%BD%D0%B8%D1%8F%20%234",
+            "%F0%9F%87%A9%F0%9F%87%AA%20%D0%93%D0%B5%D1%80%D0%BC%D0%B0%D0%BD%D0%B8%D1%8F",
+            "%E2%AD%90%EF%B8%8F%20%E2%9A%A1%EF%B8%8F%20%D0%9D%D0%B8%D0%B4%D0%B5%D1%80%D0%BB%D0%B0%D0%BD%D0%B4%D1%8B",
+        };
+        for (int i = 0; i < 4; i++) {
+            char txt[1024], lbl[96];
+            struct vless_node nodes[4], n;
+            struct vless_sub_stats st;
+            snprintf(txt, sizeof txt, "vless://%s@h.example:443?security=none#%s", U, pct[i]);
+            snprintf(lbl, sizeof lbl, "имя %d: ссылка, процентная форма", i);
+            check_n(lbl, 0, vless_parse_url(txt, &n));
+            check("  имя цело", names[i], n.name);
+            snprintf(txt, sizeof txt, "vless://%s@h.example:443?security=none#%s", U, names[i]);
+            snprintf(lbl, sizeof lbl, "имя %d: ссылка, сырой UTF-8", i);
+            check_n(lbl, 0, vless_parse_url(txt, &n));
+            check("  имя цело", names[i], n.name);
+            /* Список ссылок в base64: так приходит большинство подписок. */
+            {
+                static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                char raw[512], enc[1024];
+                int rl = snprintf(raw, sizeof raw, "vless://%s@h.example:443?security=none#%s\nvless://%s@h2.example:443?security=none#x\n",
+                                  U, pct[i], U);
+                size_t o = 0;
+                for (int k = 0; k < rl; k += 3) {
+                    unsigned v = (unsigned)(unsigned char)raw[k] << 16 | (k + 1 < rl ? (unsigned)(unsigned char)raw[k + 1] : 0u) << 8 |
+                                 (k + 2 < rl ? (unsigned)(unsigned char)raw[k + 2] : 0u);
+                    enc[o++] = A[v >> 18 & 63]; enc[o++] = A[v >> 12 & 63];
+                    enc[o++] = k + 1 < rl ? A[v >> 6 & 63] : '='; enc[o++] = k + 2 < rl ? A[v & 63] : '=';
+                }
+                enc[o] = '\0';
+                /* base64 раскодирует загрузка файла, не vless_parse_sub. */
+                char path[64];
+                snprintf(path, sizeof path, "/tmp/submatch-b64.%d", (int)getpid());
+                FILE *bf = fopen(path, "w");
+                if (bf) { fputs(enc, bf); fclose(bf); }
+                size_t bn = 0;
+                struct vless_node *bnodes = vless_load_sub(path, &bn, &st);
+                unlink(path);
+                snprintf(lbl, sizeof lbl, "имя %d: base64-подписка", i);
+                check_n(lbl, 2, (long)bn);
+                check("  имя цело", names[i], bnodes && bn ? bnodes[0].name : "");
+                free(bnodes);
+            }
+            /* Конфиг Xray и sing-box: remarks и tag, сырой UTF-8 и \u. */
+            const char *form[] = { names[i], jesc[i] };
+            for (int e = 0; e < 2; e++) {
+                snprintf(txt, sizeof txt,
+                    "[{\"remarks\":\"%s\",\"outbounds\":[{\"tag\":\"proxy\",\"protocol\":\"vless\",\"settings\":{\"address\":\"h.example\","
+                    "\"port\":443,\"id\":\"%s\",\"encryption\":\"none\"}}]}]", form[e], U);
+                snprintf(lbl, sizeof lbl, "имя %d: Xray remarks (%s)", i, e ? "\\u" : "UTF-8");
+                check_n(lbl, 1, (long)vless_parse_sub(txt, nodes, 4, &st));
+                check("  имя цело", names[i], nodes[0].name);
+                snprintf(txt, sizeof txt,
+                    "{\"outbounds\":[{\"tag\":\"%s\",\"protocol\":\"vless\",\"settings\":{\"address\":\"h.example\","
+                    "\"port\":443,\"id\":\"%s\",\"encryption\":\"none\"}}]}", form[e], U);
+                snprintf(lbl, sizeof lbl, "имя %d: Xray tag (%s)", i, e ? "\\u" : "UTF-8");
+                check_n(lbl, 1, (long)vless_parse_sub(txt, nodes, 4, &st));
+                check("  имя цело", names[i], nodes[0].name);
+                snprintf(txt, sizeof txt,
+                    "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"%s\",\"server\":\"h.example\",\"server_port\":443,\"uuid\":\"%s\"}]}",
+                    form[e], U);
+                snprintf(lbl, sizeof lbl, "имя %d: sing-box tag (%s)", i, e ? "\\u" : "UTF-8");
+                check_n(lbl, 1, (long)vless_parse_sub(txt, nodes, 4, &st));
+                check("  имя цело", names[i], nodes[0].name);
+            }
+            /* Clash: без кавычек, в одинарных, в двойных с \u / \U, и блоком, и потоком {…}. */
+            const char *yq[] = { "%s", "'%s'", "\"%s\"" };
+            const char *yv[] = { names[i], names[i], yesc[i] };
+            for (int q = 0; q < 3; q++) {
+                char nm[256];
+                if (q == 0 && strstr(names[i], " #")) continue;   /* без кавычек « #» — начало комментария YAML */
+                snprintf(nm, sizeof nm, yq[q], yv[q]);
+                snprintf(txt, sizeof txt,
+                    "proxies:\n  - name: %s\n    type: vless\n    server: h.example\n    port: 443\n    uuid: %s\n", nm, U);
+                snprintf(lbl, sizeof lbl, "имя %d: Clash, блок, вид %d", i, q);
+                check_n(lbl, 1, (long)vless_parse_sub(txt, nodes, 4, &st));
+                check("  имя цело", names[i], nodes[0].name);
+                snprintf(txt, sizeof txt,
+                    "proxies:\n  - {name: %s, type: vless, server: h.example, port: 443, uuid: %s}\n", nm, U);
+                snprintf(lbl, sizeof lbl, "имя %d: Clash, поток, вид %d", i, q);
+                check_n(lbl, 1, (long)vless_parse_sub(txt, nodes, 4, &st));
+                check("  имя цело", names[i], nodes[0].name);
+            }
+        }
+        /* Длинное имя режется по границе знака: 4-байтовый эмодзи на границе не рвётся. */
+        char big[400] = "\xF0\x9F\x93\xB1";
+        for (int i = 0; i < 40; i++) strcat(big, "\xF0\x9F\x93\xB1\xF0\x9F\x87\xA9");
+        char txt[1024];
+        struct vless_node n;
+        snprintf(txt, sizeof txt, "vless://%s@h.example:443?security=none#%s", U, big);
+        check_n("длинное имя из эмодзи: разобрано", 0, vless_parse_url(txt, &n));
+        check_n("  UTF-8 цел", 1, utf8_ok(n.name));
+    }
+
     printf("\nвсе проверки прошли\n");
     return 0;
 }

@@ -57,6 +57,11 @@ static void test_parse(void) {
 
     /* tcp с HTTP-маскировкой (type=http у v2rayN) — заголовка мы не шлём: узел непригоден с
      * причиной, а не идёт голым tcp на сервер, который ждёт HTTP-запрос. */
+    /* Имя vmess в записи \u с суррогатной парой (v2rayN, панели на Python): ⚡ 📱 Германия целиком. */
+    check("vmess ps с \\u: узел", 0, px_parse_url("vmess://eyJ2IjoiMiIsInBzIjoiXHUyNmExIFx1ZDgzZFx1ZGNmMSBcdTA0MTNcdTA0MzVcdTA0NDBcdTA0M2NcdTA0MzBcdTA0M2RcdTA0MzhcdTA0NGYiLCJhZGQiOiJoLmV4YW1wbGUiLCJwb3J0IjoiNDQzIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDEiLCJhaWQiOiIwIiwic2N5IjoiYXV0byIsIm5ldCI6InRjcCIsInRscyI6InRscyIsInNuaSI6InMuZXhhbXBsZSJ9", &n, 0));
+    check_str("vmess ps с \\u: имя цело", "\xE2\x9A\xA1 \xF0\x9F\x93\xB1 \xD0\x93\xD0\xB5\xD1\x80\xD0\xBC\xD0\xB0\xD0\xBD\xD0\xB8\xD1\x8F", n.name);
+    check("trojan: эмодзи в имени", 0, px_parse_url("trojan://pass@h.example:443?security=tls&sni=s.example#%E2%9A%A1%20%F0%9F%93%B1%20%D0%93", &n, 0));
+    check_str("trojan: имя цело", "\xE2\x9A\xA1 \xF0\x9F\x93\xB1 \xD0\x93", n.name);
     check("vmess tcp type=http — негоден", 1, px_parse_url("vmess://eyJ2IjoiMiIsInBzIjoibiIsImFkZCI6ImguZXhhbXBsZSIsInBvcnQiOiI0NDMiLCJpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidHlwZSI6Imh0dHAiLCJob3N0IjoieC5leGFtcGxlIiwicGF0aCI6Ii8iLCJ0bHMiOiIifQ==", &n, 0));
     check_str("vmess tcp type=http — причина", "tcp headerType=http не поддержан", n.skip_reason);
 

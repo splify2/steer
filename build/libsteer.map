@@ -264,6 +264,7 @@ LIBSTEER_1 {
     sl_set_vcn;
     sl_skip_note;
     sl_truthy;
+    sl_unescape;
     sl_utf8_trim_tail;
     sl_uuid_parse;
     sl_xh_setting_bad;

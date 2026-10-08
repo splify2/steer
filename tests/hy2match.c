@@ -343,6 +343,14 @@ static void test_sub(void) {
     CHECK(nodes[0].hop_n == 1 && nodes[0].hop[0] == 20000 && nodes[0].hop[1] == 20100 && nodes[0].hop_s == 10);
     CHECK(nodes[0].up_bps == 6250000 && nodes[0].down_bps == 12500000);
 
+    /* Имя в записи \u с суррогатной парой (панели на Python/PHP): ⚡ 📱 Германия — один знак вне BMP, не два CESU. */
+    const char *jsn =
+        "{\"outbounds\":[{\"protocol\":\"hysteria\",\"tag\":\"\\u26a1 \\ud83d\\udcf1 \\u0413\\u0435\\u0440\","
+        "\"settings\":{\"version\":2,\"address\":\"h.example\",\"port\":443},"
+        "\"streamSettings\":{\"hysteriaSettings\":{\"version\":2,\"auth\":\"a\"}}}]}";
+    n = hy2_parse_sub(jsn, nodes, 8, &st);
+    CHECK(n == 1 && !strcmp(nodes[0].name, "\xE2\x9A\xA1 \xF0\x9F\x93\xB1 \xD0\x93\xD0\xB5\xD1\x80"));
+
     /* salamander с packetSize в Xray-core — Gecko. */
     const char *js2 =
         "[{\"outbounds\":[{\"protocol\":\"hysteria\",\"tag\":\"g\",\"settings\":{\"version\":2,\"address\":\"g.example\",\"port\":443},"

@@ -385,9 +385,16 @@ static int vj_get(const char *json, const char *key, char *out, size_t cap) {
         size_t o = 0;
         if (*c == '"') {
             c++;
-            while (*c && *c != '"' && o + 1 < cap) {
-                if (*c == '\\' && c[1]) c++;
-                out[o++] = *c++;
+            /* Экранирование раскрывается (sl_unescape): v2rayN на Windows пишет ps как \uXXXX с
+             * суррогатной парой для эмодзи. Знак, которому не хватило места, не пишется. */
+            while (*c && *c != '"') {
+                char e[4] = { *c, 0, 0, 0 };
+                size_t el = 1;
+                if (*c == '\\' && c[1]) c += sl_unescape(c + 1, 0, e, &el);
+                c++;
+                if (o + el >= cap) break;
+                memcpy(out + o, e, el);
+                o += el;
             }
         } else {
             while (*c && *c != ',' && *c != '}' && *c != ' ' && o + 1 < cap) out[o++] = *c++;

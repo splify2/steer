@@ -168,6 +168,64 @@ void sl_utf8_trim_tail(char *s) {
     s[at - 1] = '\0';
 }
 
+static size_t utf8_put(unsigned cp, char out[4]) {
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) { out[0] = (char)(0xC0 | cp >> 6); out[1] = (char)(0x80 | (cp & 63)); return 2; }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | cp >> 12); out[1] = (char)(0x80 | (cp >> 6 & 63)); out[2] = (char)(0x80 | (cp & 63));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | cp >> 18); out[1] = (char)(0x80 | (cp >> 12 & 63));
+    out[2] = (char)(0x80 | (cp >> 6 & 63)); out[3] = (char)(0x80 | (cp & 63));
+    return 4;
+}
+
+/* Ровно n шестнадцатеричных цифр (строка оканчивается нулём, за него не читаем): -1, если их меньше. */
+static long hex_run(const char *p, int n) {
+    long v = 0;
+    for (int i = 0; i < n; i++) {
+        int h = pct_hex((unsigned char)p[i]);
+        if (h < 0) return -1;
+        v = v * 16 + h;
+    }
+    return v;
+}
+
+size_t sl_unescape(const char *p, int yaml, char out[4], size_t *olen) {
+    char c = *p;
+    *olen = 1;
+    out[0] = c;
+    switch (c) {
+    case 'n': out[0] = '\n'; return 1;
+    case 't': out[0] = '\t'; return 1;
+    case 'r': out[0] = '\r'; return 1;
+    case 'b': out[0] = '\b'; return 1;
+    case 'f': out[0] = '\f'; return 1;
+    case 'u': {
+        long u = hex_run(p + 1, 4);
+        if (u < 0) break;
+        size_t used = 5;
+        if (u >= 0xD800 && u <= 0xDBFF) {
+            long lo = (p[5] == '\\' && p[6] == 'u') ? hex_run(p + 7, 4) : -1;
+            if (lo >= 0xDC00 && lo <= 0xDFFF) { u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00); used = 11; }
+            else u = 0xFFFD;
+        } else if (u >= 0xDC00 && u <= 0xDFFF) u = 0xFFFD;
+        *olen = utf8_put((unsigned)u, out);
+        return used;
+    }
+    case 'U': case 'x': {
+        if (!yaml) break;
+        int nd = c == 'U' ? 8 : 2;
+        long u = hex_run(p + 1, nd);
+        if (u < 0 || u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF)) break;
+        *olen = utf8_put((unsigned)u, out);
+        return (size_t)nd + 1;
+    }
+    default: break;
+    }
+    return 1;
+}
+
 /* Имя узла: единственное поле, куда подписка кладёт что угодно, включая UTF-8, и потому
  * единственное, где обрезка по байту буфера видна снаружи. Порядок важен: сначала снять
  * оборванную процентную форму (её оставила та же обрезка, декодировать её нечем), потом

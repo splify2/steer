@@ -380,6 +380,19 @@ static int j_str(const struct js *j, int i, char *out, size_t cap) {
                 unsigned u = 0;
                 for (int q = 1; q <= 4; q++) u = u * 16 + (unsigned)(hexv(j->s[p + q]) < 0 ? 0 : hexv(j->s[p + q]));
                 p += 4;
+                /* Суррогатная пара \ud83d\udcf1 — один знак вне BMP (эмодзи), а не два трёхбайтовых. */
+                if (u >= 0xd800 && u <= 0xdbff && p + 6 < j->t[i].end && j->s[p + 1] == '\\' && j->s[p + 2] == 'u') {
+                    unsigned lo = 0;
+                    for (int q = 3; q <= 6; q++) lo = lo * 16 + (unsigned)(hexv(j->s[p + q]) < 0 ? 0 : hexv(j->s[p + q]));
+                    if (lo >= 0xdc00 && lo <= 0xdfff) {
+                        unsigned cp = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00);
+                        p += 6;
+                        out[o++] = (char)(0xf0 | (cp >> 18)); out[o++] = (char)(0x80 | ((cp >> 12) & 63));
+                        out[o++] = (char)(0x80 | ((cp >> 6) & 63)); out[o++] = (char)(0x80 | (cp & 63));
+                        continue;
+                    }
+                }
+                if (u >= 0xd800 && u <= 0xdfff) u = 0xfffd;      /* одинокий суррогат */
                 if (u < 0x80) out[o++] = (char)u;
                 else if (u < 0x800) { out[o++] = (char)(0xc0 | (u >> 6)); out[o++] = (char)(0x80 | (u & 63)); }
                 else { out[o++] = (char)(0xe0 | (u >> 12)); out[o++] = (char)(0x80 | ((u >> 6) & 63)); out[o++] = (char)(0x80 | (u & 63)); }
@@ -410,6 +423,7 @@ static int xray_outbound(const struct js *j, int ob, struct hy2_node *n) {
     j_get_str(j, st, "version", tmp, sizeof tmp);
     if (tmp[0] && atoi(tmp) != 2) { snprintf(n->skip_reason, sizeof n->skip_reason, "hysteria версии %.4s не поддержан", tmp); return 1; }
     j_get_str(j, ob, "tag", n->name, sizeof n->name);
+    utf8_trim(n->name);
 
     int ss = j_get(j, ob, "streamSettings");
     int hs = j_get(j, ss, "hysteriaSettings");
