@@ -185,6 +185,9 @@ struct conn {
      * тысячи в секунду — вызывать системный вызов на каждый значило бы заменить обход
      * таблицы обходом ядра. */
     uint8_t armed;
+    /* Вторая связь дайлера (dialer_ops.aux_fd), стоящая в epoll: её дескриптор; -1 — нет; -2 —
+     * слушать больше нечего (aux_drain отказал), заново не ставить. */
+    int aux;
     /* В буфере записей уже лежит ЦЕЛАЯ запись, а мы прервались (упёрлись в предел порции
      * или в окно клиента).
      *
@@ -312,6 +315,7 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
 /* Биты поля armed. */
 #define ARM_IN  1
 #define ARM_OUT 2
+#define AUX_BIT 0x40000000u   /* в data события epoll: вторая связь дайлера этого соединения */
 
 /* Сколько ждём подтверждений после закрытия сервером. Секунды, а не «сколько понадобится»:
  * клиент мог уйти совсем, и тогда кольцо не опустеет никогда. */
@@ -1355,6 +1359,7 @@ static int conn_table_init(void) {
         g_conns[i].livepos = -1;
         g_conns[i].hnext = -1;
         g_conns[i].fd = -1;
+        g_conns[i].aux = -1;
         g_dl->ops->clear(SESS(&g_conns[i]));
         g_freelist[g_free_n++] = (uint16_t)i;
     }
@@ -1537,6 +1542,7 @@ static void conn_drop(struct conn *c) {
      * связи. Сессию к новому соединению готовит дайлер (clear), трогая только её начало. */
     memset(c, 0, sizeof(*c));
     c->fd = -1;
+    c->aux = -1;
     c->livepos = -1;
     c->hnext = -1;
     g_dl->ops->clear(SESS(c));
@@ -2121,6 +2127,7 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
         c->is_udp = 1;
         c->key = *k;
         c->fd = -1;
+        c->aux = -1;
         conn_link(c);                               /* после ключа: хэш считается по нему */
         c->last = g_now_s;
         /* Отказ дайлер называет сам (у VLESS — негодный UUID узла, I-097). */
@@ -2372,6 +2379,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         c->room_seen = UINT32_MAX;
         c->key = k;
         c->fd = -1;
+        c->aux = -1;
         /* Место в списках — ПОСЛЕ memset и ПОСЛЕ ключа: хэш считается по ключу, а memset
          * обнулил бы отметки о месте в цепочке. */
         conn_link(c);
@@ -2770,6 +2778,32 @@ static void room_watch(struct conn *c) {
     }
 }
 
+/* Вторая связь дайлера (dialer_ops.aux_fd; у xhttp — ответы на выгрузку): её событие — повод пересчитать
+ * место сразу, а не когда проснётся клиент, которому отказано в окне и который молчит до своего таймера.
+ * aux_sync зовётся на каждом проходе по соединениям — сессия могла переехать из запасной, и дескриптор
+ * стал другим, — а epoll_ctl только на изменение. */
+static void aux_sync(int ep, struct conn *c) {
+    if (!g_dl->ops->aux_fd || c->aux == -2) return;
+    int af = g_dl->ops->aux_fd(SESS(c));
+    if (af == c->aux) return;
+    if (c->aux >= 0) epoll_ctl(ep, EPOLL_CTL_DEL, c->aux, NULL);
+    c->aux = -1;
+    if (af < 0) return;
+    struct epoll_event e = { .events = EPOLLIN, .data = { .u32 = AUX_BIT | (uint32_t)(c - g_conns) } };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, af, &e) == 0) c->aux = af;
+}
+
+/* Событие второй связи: слить пришедшее, и если место выросло — room_watch велит послать окно. Связь, которую
+ * дайлер больше слушать не просит, снимается с epoll навсегда: закрытая, она читалась бы на каждом витке. */
+static void aux_event(int ep, struct conn *c) {
+    if (!c->used || c->pending || c->born_turn == g_turn || c->aux < 0) return;
+    if (g_dl->ops->aux_drain(SESS(c)) != 0) {
+        epoll_ctl(ep, EPOLL_CTL_DEL, c->aux, NULL);
+        c->aux = -2;
+    }
+    room_watch(c);
+}
+
 static void drain_conn_reads(struct conn *c, const struct tun_dev *tun);
 
 static void drain_conn(struct conn *c, const struct tun_dev *tun) {
@@ -3163,6 +3197,7 @@ static void *worker_loop(void *arg) {
                 if (epoll_ctl(ep, op, c->fd, &e) == 0 || !arm)
                     c->armed = (uint8_t)arm;
             }
+            aux_sync(ep, c);
             /* Данные уже у нас, и ядро о них не сообщит: разберём их без ожидания. */
             if (want && c->rx_ready) forced++;
 
@@ -3265,6 +3300,10 @@ static void *worker_loop(void *arg) {
         }
         int out_woke = 0;
         for (int i = 0; i < r; i++) {
+            if (evs[i].data.u32 & AUX_BIT) {
+                aux_event(ep, &g_conns[evs[i].data.u32 & ~AUX_BIT]);
+                continue;
+            }
             if (evs[i].data.u32 >= (uint32_t)MAX_CONNS) continue;  /* TUN и eventfd */
             struct conn *c = &g_conns[evs[i].data.u32];
             /* Слот мог освободиться в этом же витке — на FIN или RST от клиента — и даже

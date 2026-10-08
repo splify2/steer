@@ -227,6 +227,16 @@ int transport_has_data(const struct transport *t) {
 
 void transport_direct(struct transport *t) { t->link.rx_direct = 1; }
 
+int transport_aux_fd(const struct transport *t) {
+    if (!t->fr || !t->fr->aux_fd) return -1;
+    return t->fr->aux_fd(t);
+}
+
+int transport_aux_drain(struct transport *t) {
+    if (!t->fr || !t->fr->aux_drain) return -1;
+    return t->fr->aux_drain(t);
+}
+
 void transport_moved(struct transport *t) {
     if (t->fr && t->fr->moved) t->fr->moved(t);
 }

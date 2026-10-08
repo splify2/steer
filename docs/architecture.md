@@ -405,6 +405,8 @@ struct dialer_ops {              /* src/tunnel/dialer.h */
     int  (*deliver)(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
                     dialer_emit_fn emit, void *arg);   /* кусками потока или датаграммами */
     /* служебные: peer, describe, strerror, close, clear, fd, has_data */
+    /* вторая связь (NULL — нет): aux_fd — дескриптор, который стек ставит в epoll, aux_drain — слить
+     * пришедшее; у xhttp это связь выгрузки, ответы на которую освобождают место (room) */
     /* узлов несколько (пул, pool.c; NULL — узел один): peer_of, match — годится ли запасная,
      * stale — узел соединения больше не активен (RST), lost — связь оборвана ядром или узлом */
 };
@@ -419,6 +421,8 @@ struct transport_ops {           /* src/proto/transport/transport.h — tcp, grp
     void (*moved)(struct transport *);       /* структура переехала — поправить самоуказатели */
     void (*close)(struct transport *);       /* своё сверх основной связи: вторая связь xhttp */
     int  (*pending)(const struct transport *); /* своё непрочитанное: остаток за ответом 101 */
+    int  (*aux_fd)(const struct transport *);  /* вторая связь для epoll цикла (xhttp: выгрузка), -1 — нет */
+    int  (*aux_drain)(struct transport *);     /* слить её по событию; не 0 — слушать больше нечего */
 };
 struct security_ops {            /* none, tls, reality */
     const char *name;

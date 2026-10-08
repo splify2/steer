@@ -148,6 +148,22 @@ int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
     return 0;
 }
 int transport_has_data(const struct transport *c) { (void)c; return 0; }
+/* Вторая связь транспорта (transport_aux_fd): дескриптор, который назовёт стенд, и что случится при
+ * сливе — место у узла вырастет (g_room_on_aux, как от ответа на кусок) и вернётся g_aux_rc. */
+static int g_aux_fd = -1;
+static int g_aux_drains;
+static int g_aux_rc;
+static long g_room_on_aux = -2;
+int transport_aux_fd(const struct transport *c) { (void)c; return g_aux_fd; }
+int transport_aux_drain(struct transport *c) {
+    (void)c;
+    char b[64];
+    ssize_t r = g_aux_fd >= 0 ? read(g_aux_fd, b, sizeof(b)) : 0;
+    (void)r;
+    g_aux_drains++;
+    if (g_room_on_aux != -2) { g_room = g_room_on_aux; g_room_on_aux = -2; }
+    return g_aux_rc;
+}
 long transport_room(struct transport *c) { (void)c; return g_room; }
 void transport_close(struct transport *c) { c->link.fd = -1; }   /* канал общий — не закрываем */
 void transport_moved(struct transport *c) { (void)c; }
@@ -1302,6 +1318,76 @@ static void t_room_window(void) {
     dev_drain(NULL);
 }
 
+/* Вторая связь дайлера (xhttp: ответы на выгрузку) стоит в epoll цикла. Прежде освободившееся ответом место
+ * замечалось, лишь когда цикл просыпался по пакету клиента, а клиент, которому отказано в окне, молчит до
+ * своего таймера: выгрузка packet-up шла кусками «окно, пауза». Теперь событие связи сливает её и шлёт окно. */
+static void t_aux_wake(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "вторая связь: тестовое соединение не открылось"); return; }
+    int ap[2], ep = epoll_create1(0);
+    if (pipe(ap) != 0 || ep < 0) { check(0, "вторая связь: канал или epoll"); return; }
+    struct epoll_event ev[4];
+    unsigned char d[100];
+    memset(d, 'u', sizeof(d));
+    uint32_t seq = 1001;
+
+    g_room = 5000;
+    cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
+    seq += sizeof(d);
+    flush_acks(&g_tun);
+    dev_drain(NULL);
+
+    g_aux_fd = ap[0];
+    aux_sync(ep, c);
+    check(c->aux == ap[0], "вторая связь: дескриптор, названный дайлером, поставлен в epoll");
+    aux_sync(ep, c);
+    check(epoll_wait(ep, ev, 4, 0) == 0, "вторая связь: пока ответов нет, цикл не будят");
+
+    if (write(ap[1], "x", 1) != 1) return;
+    int n = epoll_wait(ep, ev, 4, 0);
+    check(n == 1 && (ev[0].data.u32 & AUX_BIT) && (ev[0].data.u32 & ~AUX_BIT) == (uint32_t)(c - g_conns),
+          "вторая связь: ответ на выгрузку будит цикл событием этого соединения");
+    g_room_on_aux = 60000;
+    g_aux_drains = 0;
+    g_win_woke = 0;
+    g_turn++;
+    aux_event(ep, c);
+    check(g_aux_drains == 1 && c->ack_due && g_win_woke,
+          "вторая связь: слив по событию — место выросло, обновление окна назначено без пакета клиента");
+    flush_acks(&g_tun);
+    g_win_woke = 0;
+    struct flow_key last;
+    memset(&last, 0, sizeof(last));
+    dev_drain(&last);
+    check(last.ack == seq && last.window == 60000, "вторая связь: клиент получает окно, выросшее от ответа");
+
+    /* Связь, которую дайлер слушать больше не просит, снимается навсегда. */
+    if (write(ap[1], "x", 1) != 1) return;
+    g_aux_rc = -1;
+    aux_event(ep, c);
+    check(c->aux == -2, "вторая связь: отказ слива — слушать её больше не будем");
+    if (write(ap[1], "x", 1) != 1) return;
+    aux_sync(ep, c);
+    check(c->aux == -2 && epoll_wait(ep, ev, 4, 0) == 0,
+          "вторая связь: снятая связь заново в epoll не ставится и не будит цикл");
+    g_aux_rc = 0;
+
+    /* Связи у сессии нет (-1): с epoll снимается, если стояла. */
+    c->aux = -1;
+    aux_sync(ep, c);
+    check(c->aux == ap[0], "вторая связь: после снятия слежка возобновляется при новом соединении");
+    g_aux_fd = -1;
+    aux_sync(ep, c);
+    check(c->aux == -1, "вторая связь: дайлер связи больше не называет — с epoll снята");
+
+    g_room = -1;
+    close(ep);
+    close(ap[0]);
+    close(ap[1]);
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
 /* Подряд идущие сегменты одного потока в одной порции из TUN уходят узлу ОДНОЙ отправкой (g_up
  * в stack.c): одна запись TLS и один write вместо одной на каждый сегмент в 1,4 КБ, что стоило
  * выгрузке 80% цикла. Подтверждаются, только когда узел их принял, как и прежде. */
@@ -2350,6 +2436,7 @@ int main(void) {
     t_born_turn();
     t_server_first();
     t_room_window();
+    t_aux_wake();
     t_gather();
     t_fin_window();
     t_udp_early_bounds();

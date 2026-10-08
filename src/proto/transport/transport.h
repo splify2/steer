@@ -179,6 +179,9 @@ struct xh_state {
      * из диапазона узла (как делает клиент Xray); запись больше уходит несколькими кусками.
      * 0 — предела нет. */
     uint32_t post_max;
+    /* Отказ сервера на кусок выгрузки, прочитанный не записью, а слежкой за второй связью
+     * (xhttp_aux_drain): отправка вернёт его первой, как вернула бы, прочитав сама. */
+    int drain_err;
 };
 
 /* Разбор кадров WebSocket от сервера (RFC 6455, раздел 5) — потоком, по кускам любой длины.
@@ -287,6 +290,13 @@ struct transport_ops {
     /* Сколько байт запись примет сейчас: окно отправки HTTP/2 (grpc, xhttp). Запись больше этого
      * закончится H2_EWINDOW. NULL — предела нет (tcp, ws, httpupgrade: буфер сокета). */
     long (*room)(struct transport *t);
+    /* Вторая связь, о которой событие основного сокета не скажет (xhttp stream-up и packet-up:
+     * ответы на выгрузку приходят по ней). aux_fd — её дескриптор, -1 — второй связи нет; цикл
+     * туннеля ставит его в epoll. aux_drain читает с неё то, что пришло: 0 — связь жива, не 0 —
+     * больше слушать нечего (закрыта или сломана; причина остаётся записи, а не этому вызову).
+     * NULL — второй связи у транспорта не бывает. */
+    int  (*aux_fd)(const struct transport *t);
+    int  (*aux_drain)(struct transport *t);
 };
 
 /* Безопасность — поле security= ссылки. Различаются только рукопожатием (см. шапку). */
@@ -357,6 +367,11 @@ void transport_direct(struct transport *t);
 void transport_moved(struct transport *t);
 
 static inline int transport_fd(const struct transport *t) { return t->link.fd; }
+
+/* Дескриптор второй связи транспорта (transport_ops.aux_fd) или -1; слить с неё пришедшее
+ * (transport_ops.aux_drain). Подробности — в transport.c. */
+int transport_aux_fd(const struct transport *t);
+int transport_aux_drain(struct transport *t);
 
 /* Закрыть всё: дескрипторы обеих связей и контексты шифров в куче. Годится и для структуры,
  * которую transport_open не довёл до конца или не открывал вовсе (fd -1). */

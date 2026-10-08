@@ -112,6 +112,16 @@ static int vl_has_data(const void *sess) {
     return transport_has_data(&s->t);
 }
 
+static int vl_aux_fd(const void *sess) {
+    const struct vl_sess *s = sess;
+    return transport_aux_fd(&s->t);
+}
+
+static int vl_aux_drain(void *sess) {
+    struct vl_sess *s = sess;
+    return transport_aux_drain(&s->t);
+}
+
 /* ---- поток ----------------------------------------------------------------------------- */
 
 /* Идентификатор узла не разобрался, и соединение закрывается. Причина известна здесь и
@@ -701,6 +711,8 @@ const struct dialer_ops vless_dialer = {
     .clear = vl_clear,
     .fd = vl_fd,
     .has_data = vl_has_data,
+    .aux_fd = vl_aux_fd,
+    .aux_drain = vl_aux_drain,
     .flow_open = vl_flow_open,
     .send = vl_send,
     .room = vl_room,

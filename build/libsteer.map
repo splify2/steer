@@ -314,6 +314,8 @@ LIBSTEER_1 {
     tls13_verify_reason;
     tls13_write;
     tls_cert_roots;
+    transport_aux_drain;
+    transport_aux_fd;
     transport_close;
     transport_direct;
     transport_has_data;

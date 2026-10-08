@@ -310,7 +310,7 @@ static long packet_conn_room(const struct xh_up *u) {
  * освобождают места, а дыра остаётся. Поэтому предел — окно по seq, как в TCP: ни один кусок не
  * дальше PACKET_INFLIGHT от самого старого неотвеченного. Восемь — с большим запасом до умолчания
  * сервера и ниже даже сниженного. */
-#define PACKET_INFLIGHT 8
+#define PACKET_INFLIGHT 16
 #define PACKET_SLOT 8192
 
 /* Сколько кусков ещё можно послать, пока окно по seq не заполнено (см. PACKET_INFLIGHT). Номера
@@ -335,6 +335,9 @@ static long packet_room(const struct xh_up *u) {
 
 static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
     struct xh_state *x = &t->xh;
+    /* Отказ, прочитанный слежкой за второй связью: кусок потерян, и поток за ним цел уже не
+     * будет (I-219) — тот же ответ, что дал бы слив внутри этой отправки. */
+    if (x->drain_err) { int e = x->drain_err; x->drain_err = 0; return e; }
     switch (x->mode) {
         case XH_STREAM_ONE:
             return h2_write(&t->h2, d, n);
@@ -453,9 +456,36 @@ static long xhttp_room(struct transport *t) {
     return h2_room(&t->h2);
 }
 
+/* Вторая связь под наблюдение цикла туннеля.
+ *
+ * Ответы на выгрузку приходят по ней, а цикл ждёт события только основного сокета. Освободившееся
+ * место (ответ на кусок packet-up, WINDOW_UPDATE stream-up) без этого замечалось, лишь когда цикл
+ * просыпался по чужому поводу — пакету клиента, — а клиент, которому отказано в окне, молчит до
+ * своего таймера: выгрузка packet-up шла кусками «окно, пауза» (8-10 Мбит/с при 150 у stream-up).
+ * Теперь ответ будит цикл сам: он сливает связь и, если место выросло, шлёт клиенту окно. */
+static int xhttp_aux_fd(const struct transport *t) {
+    const struct xh_state *x = &t->xh;
+    if (x->mode == XH_STREAM_ONE || !x->up.started || x->up.link.fd <= 0) return -1;
+    return x->up.link.fd;
+}
+
+static int xhttp_aux_drain(struct transport *t) {
+    struct xh_state *x = &t->xh;
+    int rc = up_drain(&x->up);
+    /* Отказ не теряем: он останется записи. Читать эту связь дальше незачем — сломанная, она
+     * иначе будила бы цикл на каждом витке. */
+    if (rc && !x->drain_err) x->drain_err = rc;
+    if (rc) return rc;
+    /* Закрытая сервером связь читается всегда (конец потока): будить цикл ею бесконечно нельзя. */
+    struct pollfd p = { .fd = x->up.link.fd, .events = POLLIN | POLLRDHUP };
+    if (poll(&p, 1, 0) > 0 && (p.revents & (POLLRDHUP | POLLHUP | POLLERR))) return -1;
+    return 0;
+}
+
 const struct transport_ops tr_xhttp = {
     .name = "xhttp", .alpn = "h2", .zc = 0,
     .open = xhttp_open, .write = xhttp_write, .read = xhttp_read,
     .moved = xhttp_moved, .close = xhttp_close, .pending = xhttp_pending,
     .room = xhttp_room,
+    .aux_fd = xhttp_aux_fd, .aux_drain = xhttp_aux_drain,
 };

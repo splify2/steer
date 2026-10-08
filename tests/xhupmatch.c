@@ -207,6 +207,9 @@ static void t_room_drains_up_link(void) {
     int rc = transport_write(&c, big, sizeof(big));         /* окно соединения почти выбрано */
     srv_drain();
     long before = packet_room(&c.xh.up);
+    /* Окно потока у настоящего сервера — мегабайт (SETTINGS); без кадра SETTINGS стенд держит прежние
+     * 65535, и они, а не места под куски, оказались бы потолком. */
+    c.xh.up.h2.peer_init_win = 1 << 20;
     srv_window_update(0);
     room = transport_room(&c);
     check(rc == 0 && before < 10000 && room == (PACKET_INFLIGHT - 1) * PACKET_SLOT,
@@ -260,7 +263,64 @@ static void t_packet_up_window_over_seq(void) {
     close(fd);
 }
 
+/* Вторая связь под наблюдение цикла: ответ на кусок не будит цикл по событию основного сокета, а клиент,
+ * которому отказано в окне, молчит до своего таймера — выгрузка packet-up шла «окно, пауза» (5-7 Мбит/с
+ * при 150 у stream-up). Транспорт называет дескриптор связи выгрузки (aux_fd) и сам сливает её (aux_drain). */
+static void t_aux(void) {
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    struct transport c;
+    conn_init(&c, XH_PACKET_UP, fd);
+    check(transport_aux_fd(&c) == -1, "packet-up: пока не отправлено ничего, второй связи для слежки нет");
+    int rc0 = transport_write(&c, piece, sizeof(piece));     /* кусок 0, поток 1 */
+    int rc1 = transport_write(&c, piece, sizeof(piece));     /* кусок 1, поток 3 */
+    srv_drain();
+    check(rc0 == 0 && rc1 == 0 && transport_aux_fd(&c) == fd,
+          "packet-up: после первого куска связь выгрузки названа для слежки");
+    long slots_before = packet_slots(&c.xh.up);
+    srv_headers(1, 0x88, 1);                                 /* ответ на самый старый кусок */
+    srv_headers(3, 0x88, 1);
+    /* Ничего не пишем и не спрашиваем место: только слив по событию связи. */
+    int dr = transport_aux_drain(&c);
+    check(dr == 0 && h2_open_streams(&c.xh.up.h2) == 0 && packet_slots(&c.xh.up) > slots_before &&
+          !unread(fd), "packet-up: слив по событию связи читает ответы и освобождает места под куски");
+    close(fd);
+
+    /* Отказ сервера, прочитанный слежкой, не теряется: его вернёт следующая отправка (I-219). */
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    conn_init(&c, XH_PACKET_UP, fd);
+    rc0 = transport_write(&c, piece, sizeof(piece));
+    srv_drain();
+    srv_headers(1, 0x8C, 1);                                 /* 400 на кусок */
+    dr = transport_aux_drain(&c);
+    int wr = transport_write(&c, piece, sizeof(piece));
+    check(rc0 == 0 && dr == H2_ESTATUS && wr == H2_ESTATUS && transport_write(&c, piece, sizeof(piece)) == 0,
+          "packet-up: 400, прочитанный слежкой, возвращён следующей отправкой, и один раз");
+    close(fd);
+
+    /* Закрытая сервером связь: слушать её дальше нельзя, иначе она будила бы цикл на каждом витке. */
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    conn_init(&c, XH_PACKET_UP, fd);
+    rc0 = transport_write(&c, piece, sizeof(piece));
+    srv_drain();
+    close(g_srv);
+    g_srv = -1;
+    check(rc0 == 0 && transport_aux_drain(&c) != 0, "packet-up: связь, закрытая сервером, больше не слушается");
+    close(fd);
+
+    /* stream-up наблюдается так же, stream-one второй связи не имеет. */
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    conn_init(&c, XH_STREAM_UP, fd);
+    int ro = up_request(&c, -1);
+    srv_drain();
+    check(ro == 0 && transport_aux_fd(&c) == fd, "stream-up: связь выгрузки названа для слежки");
+    conn_init(&c, XH_STREAM_ONE, fd);
+    check(transport_aux_fd(&c) == -1, "stream-one: второй связи нет");
+    close(fd);
+}
+
 int main(void) {
+    t_aux();
     t_packet_up_window_over_seq();
     t_packet_up_order();
     t_packet_up(0x8C, 1, "I-219: packet-up — 400 на прошлый кусок возвращён отправке");
