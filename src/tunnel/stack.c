@@ -952,9 +952,13 @@ static int g_trace;
  * DC_PRECONNECT (dialer.h): у протокола, где адрес нужен уже при установлении, пула нет.
  *
  * Пул пополняется ТОЛЬКО по приходу SYN — на тихом роутере фоновых рукопожатий нет
- * совсем. Браузер же открывает соединения пачками: первый SYN пачки берёт запасную
- * сессию прошлой активности или (на холодном старте) идёт обычным путём и заводит
- * пополнение, остальные достаются из пула готовыми.
+ * совсем — и только когда SYN идут потоком: первое соединение после затишья
+ * (SPARE_TTL_MS) идёт обычным путём и запасных не заводит, второе, пришедшее раньше, чем
+ * протухла бы запасная, пополнение заводит. Браузер открывает соединения пачками, и
+ * остальные соединения пачки достаются из пула готовыми; одиночная проверка отклика
+ * стоит узлу одно соединение, а не пять. Отказ узла (запасной или живого соединения)
+ * отодвигает пополнение на 5, 10, 20, 40 с и дальше на минуту; удачное установление
+ * паузу снимает.
  *
  * Срок годности короткий не по нашей воле: Xray закрывает соединение, не приславшее
  * запрос VLESS, по таймауту рукопожатия — по умолчанию 4 секунды. Запас старше считаем
@@ -986,6 +990,22 @@ static int g_spare_want;
 /* Последний отказ установления запасной: пока узел не отвечает, пополнять пул — значит
  * занимать установщиков заведомо мёртвыми попытками наперегонки с живыми заявками. */
 static uint64_t g_spare_fail_ns;
+/* Отказов подряд (запасных и живых соединений вместе) — от него растёт пауза до следующего
+ * пополнения: SPARE_PAUSE_MS << (n-1), не больше SPARE_PAUSE_MAX_MS. Любое удачное установление
+ * обнуляет счёт. Прежде пауза была одна, пять секунд: узел, который не отвечает минутами, получал
+ * по четыре лишних соединения каждые пять секунд, пока человек (или проверка в интерфейсе)
+ * продолжал открывать соединения. */
+static unsigned g_spare_fail_n;
+#define SPARE_PAUSE_MS 5000
+#define SPARE_PAUSE_MAX_MS 60000
+/* Когда в последний раз приходило соединение: запасные копятся только под поток соединений.
+ * Одиночное (проверка отклика, замер страны выхода) — это одно соединение к узлу, а не пять:
+ * пять разом похожи на перебор для сервера с ограничением соединений с адреса, и тот начинает
+ * отвечать на ClientHello молчанием. */
+static uint64_t g_spare_syn_ns;
+/* Часы запасных. Ноль — настоящие; стенд (tests/tunnelmatch.c) ставит своё время, чтобы считать
+ * соединения за минуты без ожидания. */
+static uint64_t g_spare_clock_ns;
 
 /* Сессия передаётся указателем, а не считается установщиком по индексу: g_sess у каждого
  * потока своя, и SESS() в чужом потоке адресовал бы чужую таблицу. Ошибка была бы из тех,
@@ -1005,6 +1025,21 @@ static struct {
     int started;
 } g_cq = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
 
+static uint64_t spare_now(void) { return g_spare_clock_ns ? g_spare_clock_ns : now_ns(); }
+
+/* Исход установления соединения к узлу: отказ удлиняет паузу пополнения, успех её снимает. */
+static void spare_note(int ok) {
+    pthread_mutex_lock(&g_spare_mu);
+    if (ok) {
+        g_spare_fail_n = 0;
+        g_spare_fail_ns = 0;
+    } else {
+        if (g_spare_fail_n < 32) g_spare_fail_n++;
+        g_spare_fail_ns = spare_now();
+    }
+    pthread_mutex_unlock(&g_spare_mu);
+}
+
 static void *connector(void *arg) {
     (void)arg;
     for (;;) {
@@ -1023,19 +1058,20 @@ static void *connector(void *arg) {
             int rc = g_dl->ops->connect(g_dl->ctx, j.sess, CONNECT_TIMEOUT_S);
             pthread_mutex_lock(&g_spare_mu);
             if (rc == 0) {
-                sp->born_ns = now_ns();
+                sp->born_ns = spare_now();
                 sp->state = SPARE_READY;
             } else {
                 sp->state = SPARE_EMPTY;
-                g_spare_fail_ns = now_ns();
             }
             pthread_mutex_unlock(&g_spare_mu);
+            spare_note(rc == 0);
             continue;
         }
 
         /* Исход — и слежке за узлом (под демоном): серия отказов зовёт её проверку раньше
          * срока. Докладывает дайлер, потому что мера «жив ли узел» — его. */
         int rc = g_dl->ops->connect(g_dl->ctx, j.sess, CONNECT_TIMEOUT_S);
+        spare_note(rc == 0);
         j.c->rc = rc;
         /* RELEASE: цикл читает done с ACQUIRE, и всё, что записано в сессию выше, обязано
          * быть видно ему к этому моменту. Без барьера это ровно та ошибка, которая
@@ -1113,7 +1149,7 @@ static int connq_push(const struct connjob *j) {
  * SYN приходят десятками в секунду, не тысячами. */
 static int spare_checkout(void *out) {
     const struct dialer_ops *d = g_dl->ops;
-    uint64_t now = now_ns();
+    uint64_t now = spare_now();
     struct spare *best = NULL;
     pthread_mutex_lock(&g_spare_mu);
     for (int i = 0; i < SPARE_MAX; i++) {
@@ -1166,7 +1202,7 @@ static int spare_checkout(void *out) {
  * мьютексом — это дешевле, чем одна проверка одного соединения рядом. */
 static void spare_sweep(void) {
     if (g_spare_want <= 0) return;
-    uint64_t now = now_ns();
+    uint64_t now = spare_now();
     pthread_mutex_lock(&g_spare_mu);
     for (int i = 0; i < SPARE_MAX; i++) {
         struct spare *sp = &g_spares[i];
@@ -1186,9 +1222,23 @@ static void spare_refill(void) {
     int fill[SPARE_MAX];
     int nfill = 0;
     pthread_mutex_lock(&g_spare_mu);
-    if (g_spare_fail_ns && (now_ns() - g_spare_fail_ns) / 1000000 < 5000) {
+    uint64_t now = spare_now();
+    uint64_t prev = g_spare_syn_ns;
+    g_spare_syn_ns = now;
+    /* Первое соединение после затишья — без запасных: копить их есть под что, только когда
+     * соединения идут потоком (следующее придёт раньше, чем протухнет запасная). */
+    if (!prev || (now - prev) / 1000000 >= SPARE_TTL_MS) {
         pthread_mutex_unlock(&g_spare_mu);
         return;
+    }
+    if (g_spare_fail_ns) {
+        uint64_t pause = g_spare_fail_n > 5 ? SPARE_PAUSE_MAX_MS
+                       : (uint64_t)SPARE_PAUSE_MS << (g_spare_fail_n > 1 ? g_spare_fail_n - 1 : 0);
+        if (pause > SPARE_PAUSE_MAX_MS) pause = SPARE_PAUSE_MAX_MS;
+        if ((now - g_spare_fail_ns) / 1000000 < pause) {
+            pthread_mutex_unlock(&g_spare_mu);
+            return;
+        }
     }
     int have = 0;
     for (int i = 0; i < SPARE_MAX; i++)

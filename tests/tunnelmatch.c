@@ -1824,6 +1824,112 @@ static int pool_part(void) {
     return 0;
 }
 
+/* ---- пополнение запасных не молотит узел ------------------------------------------------------- */
+
+/* Жалоба (Telegram, splify2 26.10, узел 3x-ui): после нескольких «пингов» узла из интерфейса роутер
+ * открывает соединения к узлу и без правил, узел начинает молчать на ClientHello и приходит в себя через
+ * 10-15 с. Каждое соединение, пришедшее после затишья, тянуло за собой ещё четыре запасных, а отказ узла
+ * отодвигал пополнение на одни и те же пять секунд. Здесь считаются попытки установления к узлу на
+ * подменённом дайлере и подменённых часах (g_spare_clock_ns): минуты — без ожидания. */
+struct csess { int fd; };
+static int g_cd_rc;                  /* что вернёт connect */
+static int g_cd_total, g_cd_spare;   /* попыток всего и в запасные слоты */
+static int g_cd_busy;                /* connect сейчас идёт */
+
+static int cd_connect(const void *ctx, void *sess, int t) {
+    (void)ctx; (void)t;
+    __atomic_add_fetch(&g_cd_busy, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&g_cd_total, 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < SPARE_MAX; i++)
+        if (g_spares[i].sess == sess) __atomic_add_fetch(&g_cd_spare, 1, __ATOMIC_SEQ_CST);
+    int rc = g_cd_rc;
+    ((struct csess *)sess)->fd = rc == 0 ? 99 : -1;
+    __atomic_sub_fetch(&g_cd_busy, 1, __ATOMIC_SEQ_CST);
+    return rc;
+}
+static void cd_take(void *dst, void *src) { (void)dst; (void)src; }
+static void cd_close(void *sess) { ((struct csess *)sess)->fd = -1; }
+static void cd_clear(void *sess) { ((struct csess *)sess)->fd = -1; }
+static int cd_fd(const void *sess) { (void)sess; return -1; }   /* poll в checkout: -1 не опрашивается */
+static int cd_has_data(const void *sess) { (void)sess; return 0; }
+static const struct dialer_ops cd_ops = {
+    .name = "счёт", .caps = DC_PRECONNECT, .rcv_wnd_max = 100000, .sess_size = sizeof(struct csess),
+    .peer = h_peer, .describe = h_describe, .strerror = h_strerror, .connect = cd_connect,
+    .take = cd_take, .close = cd_close, .clear = cd_clear, .fd = cd_fd, .has_data = cd_has_data,
+    .flow_open = h_flow_open, .send = h_send, .dgram_frame = f_dgram_frame, .read = h_read,
+    .deliver = h_deliver,
+};
+
+/* Дождаться, пока установщики разберут очередь и закончат. */
+static void cd_settle(void) {
+    for (int i = 0; i < 400; i++) {
+        pthread_mutex_lock(&g_cq.mu);
+        int n = (int)g_cq.n;
+        pthread_mutex_unlock(&g_cq.mu);
+        if (!n && !__atomic_load_n(&g_cd_busy, __ATOMIC_SEQ_CST)) { usleep(20000); return; }
+        usleep(5000);
+    }
+}
+
+/* Одно «соединение клиента» в момент t мс: то, что делает SYN в stack.c, — взять запасную и
+ * пополнить пул. */
+static void cd_syn(uint64_t t_ms) {
+    g_spare_clock_ns = t_ms * 1000000ull + 1000000000000ull;
+    static struct csess out;
+    spare_sweep();
+    if (spare_checkout(&out) == 0) cd_close(&out);
+    spare_refill();
+    cd_settle();
+}
+
+static void t_spare_churn(void) {
+    static struct dialer cd = { .ops = &cd_ops, .ctx = NULL };
+    const struct dialer *save_dl = g_dl;
+    int save_want = g_spare_want;
+    g_spare_want = 4;
+    stack_setup(&cd);
+    g_spare_fail_ns = 0;
+    g_spare_syn_ns = 0;
+    for (int i = 0; i < SPARE_MAX; i++) g_spares[i].state = SPARE_EMPTY;
+
+    /* Одиночные соединения раз в десять секунд (проверка отклика из интерфейса): по одному
+     * соединению к узлу на проверку, без запасных. */
+    g_cd_rc = 0; g_cd_total = g_cd_spare = 0;
+    for (int k = 0; k < 6; k++) cd_syn((uint64_t)k * 10000);
+    check(g_cd_spare == 0, "запасные: одиночные соединения раз в 10 с запасных не заводят");
+
+    /* Поток соединений к здоровому узлу — запасные копятся, выгода пула цела. */
+    g_cd_total = g_cd_spare = 0;
+    for (int k = 0; k < 5; k++) cd_syn(100000 + (uint64_t)k * 100);
+    check(g_cd_spare >= 3, "запасные: поток соединений к здоровому узлу пополняет пул");
+
+    /* Затишье: ни одной попытки установления, пока соединений нет. */
+    g_cd_total = 0;
+    cd_settle();
+    g_spare_clock_ns += 300ull * 1000000000ull;
+    spare_sweep();
+    check(g_cd_total == 0, "запасные: в затишье без соединений узлу не уходит ни одной попытки");
+
+    /* Узел отказывает на каждом соединении, клиент открывает соединение каждую секунду две минуты. */
+    for (int i = 0; i < SPARE_MAX; i++) { g_spares[i].state = SPARE_EMPTY; }
+    g_spare_fail_ns = 0; g_spare_fail_n = 0; g_spare_syn_ns = 0;
+    g_cd_rc = -1; g_cd_total = g_cd_spare = 0;
+    for (int k = 0; k < 120; k++) cd_syn(1000000 + (uint64_t)k * 1000);
+    printf("  отказ узла, 120 соединений за 120 с: запасных попыток %d\n", g_cd_spare);
+    check(g_cd_spare <= 16, "запасные: узел отказывает две минуты — попыток в запасные не больше шестнадцати (было 96)");
+
+    /* Узел ожил — первое же удачное установление снимает паузу, пул снова копится. */
+    g_cd_rc = 0; g_cd_total = g_cd_spare = 0;
+    g_spare_clock_ns += 100ull * 1000000000ull;
+    for (int k = 0; k < 4; k++) cd_syn(2000000 + (uint64_t)k * 100);
+    check(g_cd_spare >= 1, "запасные: узел ожил — пополнение возобновляется");
+
+    for (int i = 0; i < SPARE_MAX; i++) g_spares[i].state = SPARE_EMPTY;
+    g_spare_clock_ns = 0;
+    g_spare_want = save_want;
+    stack_setup(save_dl);
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -1853,6 +1959,7 @@ int main(void) {
     t_send_refused();
     t_dns_evict();
     t_spare_slot();
+    t_spare_churn();
     t_born_turn();
     t_server_first();
     t_room_window();
