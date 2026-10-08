@@ -1855,29 +1855,78 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
  * из его стека это уже несколько IP-фрагментов. Нести их по отдельности нельзя: заголовок
  * UDP есть только в первом, а серверу нужна ЦЕЛАЯ датаграмма. Значит собирать.
  *
- * Слот ОДИН на поток обработки, а не на соединение, и это не экономия: фрагменты одной
- * датаграммы идут подряд — их только что нарезал один и тот же стек, — поэтому больше
- * одной незавершённой сборки одновременно не бывает почти никогда. Таблица сборки на 320
- * соединений стоила бы мегабайты ради случая, которого нет.
+ * Собираем в любом порядке. Прежняя версия держала один слот и принимала куски строго
+ * подряд, и обоснование («фрагменты одной датаграммы идут подряд») верно лишь пока в
+ * сети один отправитель: два клиента LAN, пишущие крупное одновременно, или один клиент с
+ * двумя потоками перемешивают куски, и первый фрагмент второй датаграммы сбрасывал сборку
+ * первой. Не по порядку куски приходят и при нескольких очередях TUN.
  *
- * Фрагменты принимаются ТОЛЬКО ПО ПОРЯДКУ, и это сознательный отказ от общего случая.
- * Перестановка на пути от клиента до роутера означала бы разные очереди в LAN, чего на
- * одном сегменте не бывает; зато отказ от произвольного порядка убирает необходимость в
- * карте занятых кусков — а с ней и весь класс ошибок с перекрывающимися фрагментами,
- * которым в чужих реализациях посвящены отдельные CVE. Не по порядку — сборка сбрасывается,
- * датаграмма теряется: для UDP это штатный исход.
+ * Ключ сборки — (источник, получатель, номер) для UDP: RFC 791 добавляет протокол, но
+ * сюда попадает только UDP. IPv6 стек не обслуживает вовсе (ip_parse), поэтому заголовка
+ * фрагментации IPv6 здесь нет и его правил (RFC 8200, 5722) применять не к чему; когда
+ * IPv6 появится, он добавится ключом сюда же.
  *
- * Срок жизни сборки — секунда. Брошенный хвост иначе занимал бы слот до следующей
- * датаграммы с тем же номером, то есть отравлял бы её. */
-#define DEFRAG_TTL_NS 1000000000ull
-static __thread struct {
+ * Пределы и их причины:
+ *  - DEFRAG_SLOTS = 16 одновременных сборок на поток обработки. Каждая держит до
+ *    8 + UDP_DGRAM_MAX байт плюс три битовые карты, то есть 16 сборок — ~1 МиБ в худшем
+ *    случае при пределе датаграммы в UDP_DGRAM_MAX. Больше одновременно незавершённых
+ *    датаграмм у LAN роутера не бывает: сборка живёт доли секунды, а потерянный хвост
+ *    держится до срока. Когда все слоты заняты, вытесняется САМАЯ СТАРАЯ — новая
+ *    датаграмма живее брошенной, — и это считается и попадает в журнал.
+ *  - DEFRAG_TTL_NS = 30 с: RFC 791 советует держать сборку по сроку жизни пакета (не менее
+ *    15 с), Linux держит 30 с (net.ipv4.ipfrag_time), RFC 8200 — 60 с для IPv6. Берём
+ *    значение Linux: клиент за этим роутером — обычно Linux-стек, и его повторная
+ *    отправка укладывается в тот же срок.
+ *  - Датаграмма не больше 8 + UDP_DGRAM_MAX: больше узлы нести не берутся (tun.h).
+ *
+ * Наложение и повтор. Точный повтор уже принятого фрагмента (те же смещение и длина)
+ * молча пропускается: сеть иногда дублирует пакеты, и датаграмма от этого не портится.
+ * Любое другое наложение — признак порчи или атаки (классический приём обхода фильтров и
+ * основа ряда CVE в стеках IP), и вся датаграмма отбрасывается, как велит RFC 5722 для
+ * IPv6 и как делает Linux для IPv4 в режиме без перекрытий. Для UDP потеря датаграммы —
+ * штатный исход.
+ *
+ * Несколько потоков обработки (STEER_TUN_THREADS > 1): таблица своя у каждого потока.
+ * Ядро выбирает очередь TUN по хэшу потока, а у фрагментированного пакета хэш считается
+ * только по адресам — без портов, и у первого фрагмента тоже, — поэтому все куски одной
+ * датаграммы попадают в одну очередь. Это свойство ядра Linux, на стенде с несколькими
+ * очередями не проверялось; если очереди разойдутся, датаграмма потеряется по сроку, а не
+ * соберётся неверно. */
+#define DEFRAG_SLOTS  16
+#define DEFRAG_TTL_NS 30000000000ull
+#define DEFRAG_MAXLEN (8 + UDP_DGRAM_MAX)           /* UDP-датаграмма целиком, с заголовком */
+#define DEFRAG_BLOCKS ((DEFRAG_MAXLEN + 7) / 8)
+
+struct frag_slot {
     uint32_t src, dst;
     uint16_t id;
-    uint16_t next_off;         /* сколько байт полезной нагрузки IP уже собрано */
-    uint64_t at;               /* когда пришёл первый фрагмент */
-    int active;
-    unsigned char buf[8 + UDP_DGRAM_MAX];   /* заголовок UDP плюс данные */
-} g_defrag;
+    uint64_t at;                                     /* когда пришёл первый кусок */
+    uint32_t total;                                  /* длина целиком; 0 — последний ещё не пришёл */
+    uint32_t got;                                    /* сколько байт уже лежит */
+    /* Карты по восьмибайтовым блокам: занят блок, с него начинается кусок, на нём кончается.
+     * Две последние нужны, чтобы отличить точный повтор от накрывшего два прежних. */
+    uint8_t have[DEFRAG_BLOCKS], start[DEFRAG_BLOCKS], end[DEFRAG_BLOCKS];
+    unsigned char buf[DEFRAG_MAXLEN];
+};
+
+/* Счётчики за жизнь потока: что собрано и сколько потеряно, по причинам. Печатаются в
+ * журнал не чаще раза в 10 с, и только когда есть потери. */
+struct defrag_stat {
+    unsigned long done, overlap, bad, expired, evicted;
+};
+static __thread struct frag_slot *g_frag[DEFRAG_SLOTS];
+static __thread struct defrag_stat g_dfs;
+
+static void defrag_say(const char *why) {
+    static __thread uint64_t said;
+    if (g_now_ns - said < 10000000000ull && said) return;
+    said = g_now_ns ? g_now_ns : 1;
+    fprintf(stderr, LOG_W "фрагменты UDP: датаграмма потеряна (%s); всего потеряно: наложение %lu, "
+            "брак %lu, срок %lu, вытеснено %lu, собрано %lu\n", why, g_dfs.overlap, g_dfs.bad,
+            g_dfs.expired, g_dfs.evicted, g_dfs.done);
+}
+
+static void frag_free(int i) { free(g_frag[i]); g_frag[i] = NULL; }
 
 /* Собрать датаграмму из фрагментов. Возвращает длину готового пакета в out (то есть
  * собранная датаграмма выглядит как обычный нефрагментированный пакет и разбирается тем же
@@ -1889,7 +1938,7 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
     if (ihl < 20 || n < ihl) return 0;
     size_t total = (size_t)((pkt[2] << 8) | pkt[3]);
     if (total > n || total < ihl) return 0;           /* заявленная длина больше пришедшей */
-    size_t payload_n = total - ihl;
+    size_t len = total - ihl;
     unsigned frag = (unsigned)((pkt[6] << 8) | pkt[7]);
     size_t off = (size_t)(frag & 0x1FFF) * 8;
     int more = (frag & 0x2000) != 0;
@@ -1898,48 +1947,93 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
     memcpy(&src, pkt + 12, 4);
     memcpy(&dst, pkt + 16, 4);
 
-    if (g_defrag.active && g_now_ns - g_defrag.at > DEFRAG_TTL_NS)
-        g_defrag.active = 0;                         /* хвост брошен — слот свободен */
+    /* Просроченные сборки — прочь. Каждый приём: слотов шестнадцать, обход дешёвый. */
+    for (int i = 0; i < DEFRAG_SLOTS; i++)
+        if (g_frag[i] && g_now_ns - g_frag[i]->at > DEFRAG_TTL_NS) {
+            frag_free(i);
+            g_dfs.expired++;
+            defrag_say("срок сборки 30 с вышел");
+        }
 
-    if (off == 0) {
-        /* Первый фрагмент: начинаем заново, даже если в слоте что-то лежало. Лежать там
-         * может только брошенное — своё продолжение придёт следом. */
-        if (payload_n < 8 || payload_n > sizeof(g_defrag.buf)) return 0;
-        memcpy(g_defrag.buf, pkt + ihl, payload_n);
-        g_defrag.src = src;
-        g_defrag.dst = dst;
-        g_defrag.id = id;
-        g_defrag.next_off = (uint16_t)payload_n;
-        g_defrag.at = g_now_ns;
-        g_defrag.active = 1;
-    } else {
-        if (!g_defrag.active || g_defrag.src != src || g_defrag.dst != dst ||
-            g_defrag.id != id || g_defrag.next_off != off) {
-            /* Чужой или не по порядку. Свою сборку при этом НЕ трогаем: пришедшее не имеет
-             * к ней отношения, а бросить её значило бы потерять из-за чужого пакета. */
-            if (g_defrag.active && g_defrag.src == src && g_defrag.dst == dst &&
-                g_defrag.id == id)
-                g_defrag.active = 0;                 /* своё, но вне порядка — сборке конец */
-            return 0;
+    int si = -1;
+    for (int i = 0; i < DEFRAG_SLOTS; i++)
+        if (g_frag[i] && g_frag[i]->src == src && g_frag[i]->dst == dst && g_frag[i]->id == id) {
+            si = i;
+            break;
         }
-        if (payload_n > sizeof(g_defrag.buf) - g_defrag.next_off) {
-            g_defrag.active = 0;                     /* датаграмма больше нашего предела */
-            return 0;
-        }
-        memcpy(g_defrag.buf + g_defrag.next_off, pkt + ihl, payload_n);
-        g_defrag.next_off = (uint16_t)(g_defrag.next_off + payload_n);
+
+    /* Куски, которые собрать нельзя при любом раскладе: пустой, не кратный восьми (кроме
+     * последнего) и выходящий за предел. Сборку своего ключа они ломают: с такими данными
+     * датаграмма не склеится, и держать остальные куски до срока незачем. */
+    if (!len || (more && (len & 7)) || off + len > DEFRAG_MAXLEN ||
+        (!more && off + len < 8)) {
+        if (si >= 0) frag_free(si);
+        g_dfs.bad++;
+        defrag_say("фрагмент неправильной длины или за пределом");
+        return 0;
     }
-    if (more) return 0;                              /* продолжение ещё в пути */
+
+    if (si < 0) {
+        for (int i = 0; i < DEFRAG_SLOTS; i++)
+            if (!g_frag[i]) { si = i; break; }
+        if (si < 0) {                                /* все заняты: вытесняем самую старую */
+            si = 0;
+            for (int i = 1; i < DEFRAG_SLOTS; i++)
+                if (g_frag[i]->at < g_frag[si]->at) si = i;
+            frag_free(si);
+            g_dfs.evicted++;
+            defrag_say("все 16 слотов сборки заняты, вытеснена самая старая");
+        }
+        g_frag[si] = calloc(1, sizeof(struct frag_slot));
+        if (!g_frag[si]) return 0;                   /* памяти нет — датаграммы нет */
+        g_frag[si]->src = src;
+        g_frag[si]->dst = dst;
+        g_frag[si]->id = id;
+        g_frag[si]->at = g_now_ns;
+    }
+    struct frag_slot *s = g_frag[si];
+
+    size_t b0 = off / 8, b1 = (off + len - 1) / 8;   /* блоки [b0, b1] */
+    /* Конец последнего куска задаёт длину всей датаграммы; два последних разной длины —
+     * наложение. Уже известная длина меньше конца этого куска — тоже брак. */
+    if (!more) {
+        if (s->total && s->total != off + len) goto overlap;
+        s->total = (uint32_t)(off + len);
+    }
+    if (s->total && off + len > s->total) goto overlap;
+
+    unsigned have = 0, starts = 0, ends = 0;
+    for (size_t b = b0; b <= b1; b++) {
+        have += s->have[b];
+        if (b > b0) starts += s->start[b];
+        if (b < b1) ends += s->end[b];
+    }
+    if (have) {
+        /* Точный повтор: ровно такой же кусок уже принят — занят весь диапазон, на краях
+         * стоят начало и конец, а внутри ни одного чужого. */
+        if (have == b1 - b0 + 1 && s->start[b0] && s->end[b1] && !starts && !ends)
+            return 0;
+        goto overlap;
+    }
+    memcpy(s->buf + off, pkt + ihl, len);
+    for (size_t b = b0; b <= b1; b++) s->have[b] = 1;
+    s->start[b0] = 1;
+    s->end[b1] = 1;
+    s->got += (uint32_t)len;
+    if (!s->total || s->got < s->total) return 0;    /* ждём остальное */
 
     /* Собрали. Отдаём как обычный пакет: заголовок IP на 20 байт, длина по факту, флагов
      * фрагментации нет — дальше его разбирает тот же путь, что и всё остальное. */
-    size_t asm_total = 20 + g_defrag.next_off;
-    g_defrag.active = 0;
-    if (asm_total > out_cap) return 0;
+    size_t asm_total = 20 + s->total;
     /* Длина в заголовке UDP обязана совпасть с собранной: сервер читает именно её, и
      * фрагмент, потерянный ядром клиента, дал бы здесь короткую датаграмму с чужой длиной. */
-    size_t udp_len = (size_t)((g_defrag.buf[4] << 8) | g_defrag.buf[5]);
-    if (udp_len != g_defrag.next_off) return 0;
+    size_t udp_len = (size_t)((s->buf[4] << 8) | s->buf[5]);
+    if (udp_len != s->total || asm_total > out_cap) {
+        frag_free(si);
+        g_dfs.bad++;
+        defrag_say("длина в заголовке UDP не равна собранной");
+        return 0;
+    }
     memset(out, 0, 20);
     out[0] = 0x45;
     out[2] = (unsigned char)(asm_total >> 8);
@@ -1950,8 +2044,16 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
     out[9] = 17;
     memcpy(out + 12, &src, 4);
     memcpy(out + 16, &dst, 4);
-    memcpy(out + 20, g_defrag.buf, g_defrag.next_off);
+    memcpy(out + 20, s->buf, s->total);
+    frag_free(si);
+    g_dfs.done++;
     return asm_total;
+
+overlap:
+    frag_free(si);
+    g_dfs.overlap++;
+    defrag_say("фрагменты накладываются");
+    return 0;
 }
 
 /* Датаграмма из TUN: своя сессия на каждый поток «адрес-порт → адрес-порт».

@@ -751,6 +751,172 @@ static void t_udp_early_bounds(void) {
     dev_drain(NULL);
 }
 
+/* ---- сборка фрагментов UDP из TUN ------------------------------------------------------
+ * Фрагменты кладутся прямо в udp_defrag: он принимает пакет IPv4 и либо отдаёт собранную
+ * датаграмму (длина > 0), либо молчит (0). Собранное сверяется с отправленным побайтно. */
+#define FR_SRC 0x0100a8c0u
+#define FR_DST 0x0771cbcbu
+static unsigned char g_fr_dgram[70000];       /* UDP-датаграмма целиком: заголовок + данные */
+static size_t g_fr_len;
+
+/* Заготовить датаграмму из n байт данных с настоящим заголовком UDP и узором в теле. */
+static void fr_make(size_t n, unsigned char seed) {
+    g_fr_len = 8 + n;
+    g_fr_dgram[0] = 0x9c; g_fr_dgram[1] = 0x40; g_fr_dgram[2] = 0x01; g_fr_dgram[3] = 0xbb;
+    g_fr_dgram[4] = (unsigned char)(g_fr_len >> 8); g_fr_dgram[5] = (unsigned char)g_fr_len;
+    g_fr_dgram[6] = g_fr_dgram[7] = 0;
+    for (size_t i = 0; i < n; i++) g_fr_dgram[8 + i] = (unsigned char)(seed + i * 7);
+}
+
+/* Фрагмент [off, off+len) датаграммы g_fr_dgram с номером id. */
+static size_t fr_pkt(unsigned char *out, uint32_t src, uint16_t id, size_t off, size_t len,
+                     int more) {
+    memset(out, 0, 20);
+    out[0] = 0x45;
+    out[2] = (unsigned char)((20 + len) >> 8); out[3] = (unsigned char)(20 + len);
+    out[4] = (unsigned char)(id >> 8); out[5] = (unsigned char)id;
+    unsigned f = (unsigned)(off / 8) | (more ? 0x2000u : 0u);
+    out[6] = (unsigned char)(f >> 8); out[7] = (unsigned char)f;
+    out[8] = 64; out[9] = 17;
+    memcpy(out + 12, &src, 4);
+    uint32_t dst = FR_DST;
+    memcpy(out + 16, &dst, 4);
+    memcpy(out + 20, g_fr_dgram + off, len);
+    return 20 + len;
+}
+
+/* Отдать фрагмент и вернуть длину собранного (0 — ждём или отказ). */
+static unsigned char g_fr_out[20 + 8 + 70000];
+static size_t fr_feed(uint32_t src, uint16_t id, size_t off, size_t len, int more) {
+    static unsigned char pk[2048 + 20];
+    size_t n = fr_pkt(pk, src, id, off, len, more);
+    return udp_defrag(pk, n, g_fr_out, sizeof g_fr_out);
+}
+
+static int fr_same(size_t got) {
+    return got == 20 + g_fr_len && memcmp(g_fr_out + 20, g_fr_dgram, g_fr_len) == 0;
+}
+
+static void t_udp_defrag(void) {
+    uint64_t t0 = 1000ull * 1000000000ull;
+    g_now_ns = t0;
+    fr_make(3000, 1);                                   /* UDP 3008: 1480 + 1480 + 48 */
+    size_t a = fr_feed(FR_SRC, 11, 0, 1480, 1);
+    size_t b = fr_feed(FR_SRC, 11, 1480, 1480, 1);
+    size_t c = fr_feed(FR_SRC, 11, 2960, 48, 0);
+    check(!a && !b && fr_same(c), "UDP: три фрагмента по порядку — датаграмма собрана целиком");
+
+    fr_make(3000, 2);
+    a = fr_feed(FR_SRC, 12, 2960, 48, 0);
+    b = fr_feed(FR_SRC, 12, 0, 1480, 1);
+    c = fr_feed(FR_SRC, 12, 1480, 1480, 1);
+    check(!a && !b && fr_same(c), "UDP: хвост первым, потом начало и середина — собрана");
+
+    fr_make(3000, 3);
+    a = fr_feed(FR_SRC, 13, 1480, 1480, 1);
+    b = fr_feed(FR_SRC, 13, 2960, 48, 0);
+    c = fr_feed(FR_SRC, 13, 0, 1480, 1);
+    check(!a && !b && fr_same(c), "UDP: середина, хвост, начало — собрана");
+
+    fr_make(3000, 4);
+    a = fr_feed(FR_SRC, 14, 0, 1480, 1);
+    b = fr_feed(FR_SRC, 14, 0, 1480, 1);                /* точный повтор */
+    c = fr_feed(FR_SRC, 14, 1480, 1480, 1);
+    size_t d = fr_feed(FR_SRC, 14, 1480, 1480, 1);      /* и ещё повтор */
+    size_t e = fr_feed(FR_SRC, 14, 2960, 48, 0);
+    check(!a && !b && !c && !d && fr_same(e),
+          "UDP: точные повторы фрагментов не мешают — датаграмма собрана один раз");
+
+    /* Две датаграммы вперемешку: два клиента за раз, или один шлёт без пауз. */
+    static unsigned char first[70000];
+    fr_make(3000, 5);
+    memcpy(first, g_fr_dgram, g_fr_len);
+    size_t first_len = g_fr_len;
+    fr_feed(FR_SRC, 21, 0, 1480, 1);
+    fr_make(2500, 6);                                   /* UDP 2508: 1480 + 1028 */
+    fr_feed(FR_SRC + 1, 21, 0, 1480, 1);                /* тот же id, другой отправитель */
+    memcpy(g_fr_dgram, first, first_len); g_fr_len = first_len;
+    a = fr_feed(FR_SRC, 21, 1480, 1480, 1);
+    b = fr_feed(FR_SRC, 21, 2960, 48, 0);
+    int ok1 = fr_same(b) && !a;
+    fr_make(2500, 6);
+    c = fr_feed(FR_SRC + 1, 21, 1480, 1028, 0);
+    check(ok1 && fr_same(c),
+          "UDP: две датаграммы вперемешку (разные отправители, один id) — обе собраны");
+
+    /* Наложение: кусок с иными границами поверх пришедшего — отказ целиком. */
+    fr_make(3000, 7);
+    fr_feed(FR_SRC, 31, 0, 1480, 1);
+    a = fr_feed(FR_SRC, 31, 1000, 1480, 1);
+    b = fr_feed(FR_SRC, 31, 1480, 1480, 1);
+    c = fr_feed(FR_SRC, 31, 2960, 48, 0);
+    check(!a && !b && !c, "UDP: наложение фрагментов — датаграмма отброшена, не собрана");
+
+    /* Длинный фрагмент поверх двух коротких: края совпали, а фрагментов было два. */
+    fr_make(3000, 8);
+    fr_feed(FR_SRC, 32, 0, 800, 1);
+    fr_feed(FR_SRC, 32, 800, 680, 1);
+    a = fr_feed(FR_SRC, 32, 0, 1480, 1);
+    b = fr_feed(FR_SRC, 32, 1480, 1480, 1);
+    c = fr_feed(FR_SRC, 32, 2960, 48, 0);
+    check(!a && !b && !c, "UDP: фрагмент, накрывший два прежних, — отказ, а не повтор");
+
+    /* Не последний фрагмент не кратен восьми — так не бывает. */
+    fr_make(3000, 9);
+    a = fr_feed(FR_SRC, 33, 0, 1479, 1);
+    b = fr_feed(FR_SRC, 33, 1480, 1480, 1);
+    c = fr_feed(FR_SRC, 33, 2960, 48, 0);
+    check(!a && !b && !c, "UDP: длина не последнего фрагмента не кратна восьми — отказ");
+
+    /* Срок сборки: хвост позже срока — отказ; потом тот же id собирается заново. */
+    fr_make(3000, 10);
+    g_now_ns = t0;
+    fr_feed(FR_SRC, 41, 0, 1480, 1);
+    g_now_ns = t0 + 31ull * 1000000000ull;
+    a = fr_feed(FR_SRC, 41, 1480, 1480, 1);
+    b = fr_feed(FR_SRC, 41, 2960, 48, 0);
+    check(!a && !b, "UDP: хвост через 31 с после начала — сборка просрочена, датаграммы нет");
+    /* Просроченный хвост завёл новую сборку без начала — она сама просрочится ещё через 30 с. */
+    g_now_ns = t0 + 62ull * 1000000000ull;
+    a = fr_feed(FR_SRC, 41, 0, 1480, 1);
+    b = fr_feed(FR_SRC, 41, 1480, 1480, 1);
+    c = fr_feed(FR_SRC, 41, 2960, 48, 0);
+    check(!a && !b && fr_same(c), "UDP: тот же id после просрочки (и просроченного хвоста) собирается заново");
+
+    g_now_ns = t0 + 100ull * 1000000000ull;
+    fr_make(3000, 11);
+    fr_feed(FR_SRC, 42, 0, 1480, 1);
+    g_now_ns += 29ull * 1000000000ull;
+    a = fr_feed(FR_SRC, 42, 1480, 1480, 1);
+    b = fr_feed(FR_SRC, 42, 2960, 48, 0);
+    check(!a && fr_same(b), "UDP: хвост через 29 с — сборка ещё живая, собрана");
+
+    /* Слотов шестнадцать: семнадцатая незавершённая вытесняет самую старую, остальные живы. */
+    g_now_ns = t0 + 200ull * 1000000000ull;
+    fr_make(3000, 13);
+    for (uint16_t i = 0; i < 17; i++) {
+        g_now_ns += 1000000ull;
+        fr_feed(FR_SRC, (uint16_t)(100 + i), 0, 1480, 1);
+    }
+    a = fr_feed(FR_SRC, 116, 1480, 1480, 1);            /* самая новая жива */
+    b = fr_feed(FR_SRC, 116, 2960, 48, 0);
+    check(!a && fr_same(b), "UDP: самая новая из 17 сборок жива и собрана");
+    a = fr_feed(FR_SRC, 101, 1480, 1480, 1);            /* вторая по возрасту не тронута */
+    b = fr_feed(FR_SRC, 101, 2960, 48, 0);
+    check(!a && fr_same(b), "UDP: вторая по возрасту сборка не тронута вытеснением");
+    a = fr_feed(FR_SRC, 100, 1480, 1480, 1);            /* вытеснена: середина осиротела */
+    b = fr_feed(FR_SRC, 100, 2960, 48, 0);
+    check(!a && !b, "UDP: 17-я сборка вытеснила самую старую (id 100) — её датаграммы нет");
+
+    /* Длина в заголовке UDP не равна собранному — отказ. */
+    fr_make(3000, 12);
+    g_fr_dgram[4] = 0x0f; g_fr_dgram[5] = 0x00;
+    fr_feed(FR_SRC, 43, 0, 1480, 1);
+    fr_feed(FR_SRC, 43, 1480, 1480, 1);
+    c = fr_feed(FR_SRC, 43, 2960, 48, 0);
+    check(!c, "UDP: длина в заголовке не равна собранному — отказ");
+}
+
 /* Заполнить таблицу целиком свежими TCP, кроме одного потока UDP с заданными портом и
  * возрастом, и спросить conn_new о новом месте. Возвращает, отдали ли место этого потока. */
 static int full_table_gives_udp(uint16_t dport, int idle_s) {
@@ -2045,6 +2211,7 @@ int main(void) {
     t_gather();
     t_fin_window();
     t_udp_early_bounds();
+    t_udp_defrag();
     t_early_window();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");
 
