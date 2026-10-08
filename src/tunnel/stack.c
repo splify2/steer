@@ -1491,10 +1491,19 @@ static void conn_drop(struct conn *c) {
     g_dl->ops->clear(SESS(c));
 }
 
-/* dialer_ops.room для установленного TCP-соединения; -1 — предела нет или он не применим (UDP,
- * установщик ещё работает). */
+/* Сколько клиент может прислать сейчас, не вылезая за то, что мы способны принять. Пока установщик
+ * ещё работает (pending), принять можно только то, что влезет в буфер ранних данных (EARLY_CAP):
+ * остальное handle_packet не подтверждает, и клиенту, который уже отправил окно из десяти сегментов,
+ * дыра стоит таймаута повторной передачи, а следом ещё одного и ещё: Linux без SACK после первого
+ * таймаута уходит в состояние потери, где дубликаты ACK быстрый повтор не запускают, а мы сегменты
+ * за дырой выбрасываем, и таймаут удваивается на каждом круге (выгрузка стоит дольше десяти секунд).
+ * Окно, которое не обещает лишнего, дыры не создаёт вовсе.
+ *
+ * Для готового соединения — dialer_ops.room; -1 — предела нет или он не применим (UDP). */
 static long conn_room(const struct conn *c) {
-    if (c->is_udp || c->pending || c->fd < 0 || !g_dl->ops->room) return -1;
+    if (c->is_udp) return -1;
+    if (c->pending) return c->early_n >= EARLY_CAP ? 0 : (long)(EARLY_CAP - c->early_n);
+    if (c->fd < 0 || !g_dl->ops->room) return -1;
     return g_dl->ops->room(g_dl->ctx, SESS(c));
 }
 
@@ -1514,7 +1523,8 @@ static void send_synack(struct conn *c, const struct tun_dev *tun) {
     size_t sl = tcp_build(sa, sizeof(sa), c->key.dst, c->key.src,
                           c->key.dport, c->key.sport,
                           1, c->client_seq, TCP_SYN | TCP_ACK,
-                          NULL, 0, RCV_WND_MIN, TUN_MSS, c->ws_on ? (int)g_rcv_shift : -1);
+                          NULL, 0, c->pending ? EARLY_CAP : RCV_WND_MIN, TUN_MSS,
+                          c->ws_on ? (int)g_rcv_shift : -1);
     if (sl) tun_write_ctl(tun, sa, sl);
     TR("SYN-ACK отправлен (ack=%u)\n", c->client_seq);
 }
@@ -2663,6 +2673,13 @@ static int conn_ready(struct conn *c, const struct tun_dev *tun) {
         return 1;
     }
     c->last = g_now_s;
+    /* Клиент слышал окно по месту в буфере ранних данных (conn_room): теперь буфера нет, окно —
+     * полное, и сказать об этом надо сразу, иначе клиент с окном в несколько сотен байт ждёт
+     * пробы нулевого окна. room_seen заводится заново — сравнивать теперь не с чем. */
+    if (c->room_seen != UINT32_MAX) {
+        c->room_seen = UINT32_MAX;
+        c->ack_due = 1;
+    }
     TR("поток готов (conn#%ld), ранние данные ушли\n", (long)(c - g_conns));
     return 0;
 }

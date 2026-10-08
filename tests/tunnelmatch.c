@@ -441,7 +441,7 @@ static void t_window_scale(void) {
     check(c && n == 1 && (last.tcp_flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) && last.ws_seen &&
               last.wscale == 5,
           "SYN с опцией масштаба: SYN-ACK несёт нашу опцию с множителем 5");
-    check(n == 1 && last.window == 65535, "  окно в самом SYN-ACK — 65535, без масштаба");
+    check(n == 1 && last.window == EARLY_CAP, "  окно в самом SYN-ACK — без масштаба, по буферу ранних данных (установщик работает)");
     check(c && c->ws_on && c->client_wscale == 7, "  у соединения: масштаб включён, множитель клиента 7 прочитан");
     if (c && wait_ready(c, 2000) == 0) {
         cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
@@ -491,8 +491,8 @@ static void t_window_scale(void) {
     c = conn_find(&k);
     memset(&last, 0, sizeof(last));
     n = dev_drain(&last);
-    check(c && !c->ws_on && n == 1 && !last.ws_seen && last.window == 65535,
-          "SYN без опции масштаба: SYN-ACK без опции, окно 65535");
+    check(c && !c->ws_on && n == 1 && !last.ws_seen && last.window == EARLY_CAP,
+          "SYN без опции масштаба: SYN-ACK без опции, окно по буферу ранних данных");
     if (c && wait_ready(c, 2000) == 0) {
         cli_send(3001, 2, TCP_ACK, 65535, NULL, 0);
         n = ack_after_data(3001, &last);
@@ -544,6 +544,69 @@ static void t_release_last_sleep(void) {
     check(rc == -1 && g_sleep_n == 1500, "I-193: не доложивший за 15 с — отказ, снов 1500");
     g_sleep_c = NULL;
     *c = save;
+}
+
+/* Окно клиента, пока установщик ещё работает: не больше места в буфере ранних данных (EARLY_CAP).
+ * Прежде SYN-ACK и подтверждения обещали полное окно, клиент отправлял десять сегментов, в буфер
+ * влезало пять, а остальные handle_packet не подтверждал: дыра, таймаут повтора у клиента (200 мс,
+ * потом вдвое чаще каждый круг: без SACK Linux после него в состоянии потери, дубликаты ACK быстрый
+ * повтор не запускают, а сегменты за дырой мы выбрасываем) — и выгрузка на нагрузке стояла больше
+ * десяти секунд (tests/sigpipe.sh: «ни одна выгрузка не застряла на записи»). */
+static void t_early_window(void) {
+    struct flow_key k = cli_key();
+    struct conn *c = conn_find(&k);
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
+    struct flow_key last;
+    memset(&last, 0, sizeof(last));
+    dev_drain(&last);
+    c = conn_find(&k);
+    check(c && c->pending && (last.tcp_flags & TCP_SYN) && last.window <= EARLY_CAP,
+          "ранние данные: SYN-ACK при работающем установщике обещает не больше EARLY_CAP");
+    if (!c || !c->pending) return;
+    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
+
+    /* Десять сегментов подряд, как первое окно клиента: в буфер влезает пять. */
+    unsigned char d[1460];
+    memset(d, 'e', sizeof(d));
+    uint32_t seq = 1001;
+    for (int i = 0; i < 10; i++) {
+        cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d));
+        seq += sizeof(d);
+    }
+    uint32_t held = c->early_n;
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    dev_drain(&last);
+    check(held == 5 * sizeof(d) && last.ack == 1001 + held,
+          "ранние данные: подтверждено ровно то, что поместилось в буфер");
+    check(last.window == EARLY_CAP - held,
+          "ранние данные: подтверждение обещает остаток буфера, а не полное окно");
+
+    /* Клиент, который послушался окна, дыры не получает: остаток помещается. */
+    seq = 1001 + held;
+    cli_send(seq, 2, TCP_ACK, 65535, d, EARLY_CAP - held);
+    check(c->early_n == EARLY_CAP, "ранние данные: сегмент в пределах окна принят");
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    dev_drain(&last);
+    check(last.window == 0, "ранние данные: буфер полон — нулевое окно");
+
+    /* Установщик доложил: окно снова полное и клиенту об этом сказано сразу, а не по его пробе. */
+    for (int i = 0; i < 2000 && !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE); i++) {
+        struct timespec ts = { 0, 1000000 };
+        nanosleep(&ts, NULL);
+    }
+    int rd = __atomic_load_n(&c->done, __ATOMIC_ACQUIRE) ? conn_ready(c, &g_tun) : -1;
+    check(rd == 0 && !c->pending, "ранние данные: соединение готово");
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    int n = dev_drain(&last);
+    check(n >= 1 && last.ack == 1001 + EARLY_CAP && last.window == 65535,
+          "ранние данные: на готовности клиент получает обновление окна");
+    conn_drop(c);
+    dev_drain(NULL);
 }
 
 /* Выполнить f с stderr в файл и вернуть, нашлась ли в написанном строка needle. */
@@ -1796,6 +1859,7 @@ int main(void) {
     t_gather();
     t_fin_window();
     t_udp_early_bounds();
+    t_early_window();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
