@@ -44,6 +44,19 @@ int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
     return tls13_write(&l->tls, d, n);
 }
 
+/* Прочитать у голого сокета, НЕ ЖДА: данных нет — 0 байт и код 0, как «пока нечего» у tls13_read. Сокет
+ * узла блокирующий и со сроком (trdial.c), и обычный read на пустом ждал бы до его конца — восьми секунд
+ * на весь цикл туннеля. Поэтому цикл (stack.c, drain_conn_reads) прежде каждого чтения спрашивал poll;
+ * теперь чтение само не ждёт, и спрашивать незачем: один вызов вместо двух на каждое чтение у узла. */
+int tr_sock_read(int fd, unsigned char *d, size_t cap, size_t *got) {
+    *got = 0;
+    ssize_t r = recv(fd, d, cap, MSG_DONTWAIT);
+    if (r > 0) { *got = (size_t)r; return 0; }
+    if (r == 0) return TR_ECLOSED;
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
+    return TR_EIO;
+}
+
 int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
     struct tr_link *l = ctx;
     /* Прямое копирование: сервер перестал шифровать в нашу сторону, и расшифровывать
@@ -57,12 +70,7 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
         size_t pending = tls13_take_pending(&l->tls, d, cap);
         if (pending) { *got = pending; return 0; }
     }
-    if (l->plain || l->rx_direct) {
-        ssize_t r = read(l->fd, d, cap);
-        if (r <= 0) return r == 0 ? TR_ECLOSED : TR_EIO;
-        *got = (size_t)r;
-        return 0;
-    }
+    if (l->plain || l->rx_direct) return tr_sock_read(l->fd, d, cap, got);
     return tls13_read(&l->tls, d, cap, got);
 }
 

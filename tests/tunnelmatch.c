@@ -58,6 +58,20 @@ int pthread_attr_setstacksize(pthread_attr_t *a, size_t s) {
     return real(a, s);
 }
 
+/* ---- счёт poll ------------------------------------------------------------------ */
+
+/* Проход чтения у узла (drain_conn_reads) не спрашивает poll перед каждым чтением: чтение дайлера
+ * не ждёт само. Стенд считает вызовы poll, чтобы это было видно: вызов за каждое чтение — это
+ * ~2 % цикла и 36-116 системных вызовов на МБ (замер профилировщика). */
+static int g_poll_calls;
+
+int poll(struct pollfd *fds, nfds_t n, int timeout) {
+    static int (*real)(struct pollfd *, nfds_t, int);
+    g_poll_calls++;
+    if (!real) real = (int (*)(struct pollfd *, nfds_t, int))dlsym(RTLD_NEXT, "poll");
+    return real(fds, n, timeout);
+}
+
 /* ---- сон установщика ----------------------------------------------------------- */
 
 /* connq_release ждёт доклада установщиков сном по 10 мс до 15 с. Проверке I-193 нужен не
@@ -1373,8 +1387,11 @@ static void t_tx_batch(void) {
     size_t mx = 0;
 
     g_recv_rep = 10; g_recv_rep_n = 4000;
+    g_poll_calls = 0;
     drain_conn(c, &g_tun);
+    int polls = g_poll_calls;
     int cnt = tx_collect(&pos, &seq, &bad, &mx);
+    check(polls == 0, "чтение у узла: десять чтений подряд без единого poll");
     check(pos == 40000 && bad == 0, "склейка: все 40000 байт дошли по порядку и без порчи");
     check(cnt == 1 && mx == 40000, "склейка: десять чтений у узла — одна запись в устройство");
     check(c->our_seq - c->client_ack == 41000 && c->rtx.len == 41000 && !c->tx_unsent,

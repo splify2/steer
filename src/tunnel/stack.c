@@ -1927,19 +1927,21 @@ static int emit_stream(void *arg, const unsigned char *p, size_t n) {
  * что считал всегда, — сколько байт пришло от узла за порцию (DRAIN_MAX_BYTES) и сколько
  * времени ушло на само чтение (STEER_TUN_STATS), — и эти числа не должны зависеть от того,
  * сколько стоит разбор протокола. */
-static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
+static int downstream_pump(struct conn *c, const struct tun_dev *tun, size_t *rx_n) {
     /* Статический, а не на стеке: буфер размером с запись TLS — это шестнадцать килобайт
      * стека на каждый вызов, а поток обработки здесь один. */
     static __thread unsigned char buf[TUNNEL_BUF];
     size_t got = 0;
+    *rx_n = 0;
     void *s = SESS(c);
     TR("чтение conn#%ld fd=%d\n", (long)(c - g_conns), c->fd);
     uint64_t r0 = g_stats ? now_ns() : 0;
     const unsigned char *rx = buf;
     int rc = g_dl->ops->read(s, buf, sizeof(buf), &rx, &got);
+    *rx_n = got;
     if (g_stats) g_st.recv_ns += now_ns() - r0;
     g_rx_total += got;
-    if (g_stats) { g_st.recs++; g_st.rec_bytes += got; }
+    if (g_stats && got) { g_st.recs++; g_st.rec_bytes += got; }
     if (rc) { TR("чтение от сервера: rc=%d\n", rc); return rc; }
     /* Ноль байт — законно: приехал служебный кадр HTTP/2, данных пока нет. Принять это за
      * конец потока значило бы разрывать соединение на первом же SETTINGS. */
@@ -2896,7 +2898,8 @@ static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
     uint64_t drained_from = g_rx_total;
     c->rx_ready = 0;
     for (;;) {
-        if (downstream_pump(c, tun) != 0) {
+        size_t rx_n = 0;
+        if (downstream_pump(c, tun, &rx_n) != 0) {
             /* Сервер закрыл. Соединение НЕ закрываем, пока клиент не подтвердит всё
              * отправленное: пока в кольце есть неподтверждённое, его надо повторять, а
              * закрыв соединение, мы уничтожим и кольцо. FIN уйдёт из общего прохода. */
@@ -2921,10 +2924,12 @@ static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
         }
         /* Целая запись уже прочитана у сокета — спрашивать ядро незачем. */
         if (d->has_data(s)) continue;
-        /* Есть ли ещё что читать. Без этой проверки следующее чтение заблокируется на
-         * таймауте сокета (восемь секунд) и остановит весь цикл. */
-        struct pollfd sp = { .fd = c->fd, .events = POLLIN };
-        if (poll(&sp, 1, 0) <= 0 || !(sp.revents & POLLIN)) return;
+        /* Есть ли ещё что читать — спрашиваем само чтение, а не poll перед ним: read дайлера не ждёт (нет
+         * данных — rx_n == 0 и код 0, см. dialer_ops.read), так что лишний вызов стоил одного системного
+         * вызова на каждое чтение у узла (замер: poll ~2 % цикла, 36-116 вызовов на МБ). Пустое чтение — конец
+         * порции: данные у сокета придут событием epoll (по уровню), а служебный кадр HTTP/2 без данных не
+         * значит, что за ним в сокете пусто, но и тогда epoll сразу разбудит это же соединение. */
+        if (!rx_n) return;
     }
 }
 

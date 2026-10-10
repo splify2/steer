@@ -34,6 +34,8 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <poll.h>
+#include <time.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -742,8 +744,8 @@ static void srv_stop(struct srv *s, pthread_t th) {
     close(s->lfd);
 }
 
-/* Ждать, как цикл туннеля: своё непрочитанное транспорта или готовность сокета. Голый сокет
- * читается блокирующим read, и звать чтение без готовности значило бы ждать срока сокета. */
+/* Ждать, как цикл туннеля: своё непрочитанное транспорта или готовность сокета. Чтение голого сокета
+ * не ждёт (tr_sock_read), но этот стенд ждёт готовности сам — чтобы не крутиться впустую. */
 static int ready(struct transport *t) {
     if (transport_has_data(t)) return 1;
     struct pollfd p = { .fd = transport_fd(t), .events = POLLIN, .revents = 0 };
@@ -759,6 +761,43 @@ static int tread(struct transport *t, unsigned char *b, size_t cap, size_t *got)
         if (rc || *got) return rc;
     }
     return 0;
+}
+
+/* Чтение голого сокета не ждёт: цикл туннеля больше не спрашивает poll перед чтением (drain_conn_reads),
+ * и чтение на пустом сокете, ждавшее срока SO_RCVTIMEO, остановило бы все соединения разом. Срок
+ * сокета здесь — 2 с, как у настоящих связей (trdial.c ставит больше), а ждать позволено не дольше 200 мс. */
+static int64_t ms_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void test_nowait(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { check(0, "пара сокетов"); return; }
+    struct timeval tv = { 2, 0 };
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct tr_link l;
+    memset(&l, 0, sizeof(l));
+    l.fd = sv[0];
+    l.plain = 1;
+    unsigned char b[64];
+    size_t got = 99;
+    int64_t t0 = ms_now();
+    int rc = tr_link_read(&l, b, sizeof(b), &got);
+    check(rc == 0 && got == 0 && ms_now() - t0 < 200, "голый сокет: чтение на пустом не ждёт и ничего не отдаёт");
+    check(write(sv[1], "abc", 3) == 3, "голый сокет: запись в пару");
+    rc = tr_link_read(&l, b, sizeof(b), &got);
+    check(rc == 0 && got == 3 && !memcmp(b, "abc", 3), "голый сокет: пришедшее читается");
+    l.rx_direct = 1;
+    got = 99;
+    t0 = ms_now();
+    rc = tr_link_read(&l, b, sizeof(b), &got);
+    check(rc == 0 && got == 0 && ms_now() - t0 < 200, "прямое копирование: чтение на пустом не ждёт");
+    close(sv[1]);
+    rc = tr_link_read(&l, b, sizeof(b), &got);
+    check(rc == TR_ECLOSED, "голый сокет: закрытие узлом — конец потока");
+    close(sv[0]);
 }
 
 static void test_socket(void) {
@@ -929,6 +968,8 @@ int main(void) {
     test_resp();
     printf("wsmatch: на сокете\n");
     test_socket();
+    printf("wsmatch: чтение без ожидания\n");
+    test_nowait();
     printf("wsmatch: %d проверок, %s\n", g_pass + g_fail, g_fail ? "ЕСТЬ ПРОВАЛЫ" : "все прошли");
     return g_fail ? 1 : 0;
 }

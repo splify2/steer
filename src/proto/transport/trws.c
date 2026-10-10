@@ -308,9 +308,8 @@ static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
         const unsigned char *in = d;
         size_t n = 0;
         if (t->link.plain) {
-            ssize_t k = read(t->link.fd, d, cap);
-            if (k <= 0) return k == 0 ? TR_ECLOSED : TR_EIO;
-            n = (size_t)k;
+            rc = tr_sock_read(t->link.fd, d, cap, &n);
+            if (rc) return rc;
         } else {
             rc = tls13_read_ref(&t->link.tls, &in, &n);
             if (rc) return rc;
@@ -339,9 +338,11 @@ static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
         rc = tr_ws_parse(r, in, n, d, cap, &on);
     } else {
         /* Голый сокет: читаем прямо в d и разбираем на месте. */
-        ssize_t k = read(t->link.fd, d, cap);
-        if (k <= 0) return k == 0 ? TR_ECLOSED : TR_EIO;
-        rc = tr_ws_parse(r, d, (size_t)k, d, cap, &on);
+        size_t k = 0;
+        rc = tr_sock_read(t->link.fd, d, cap, &k);
+        if (rc) return rc;
+        if (!k) return 0;
+        rc = tr_ws_parse(r, d, k, d, cap, &on);
     }
     if (rc) return rc;
     rc = ws_answer(t);

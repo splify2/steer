@@ -480,6 +480,9 @@ int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, i
 int tr_link_write(void *ctx, const unsigned char *d, size_t n);
 int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got);
 
+/* Чтение голого сокета без ожидания: нет данных — *got = 0 и 0; конец — TR_ECLOSED; сбой — TR_EIO. */
+int tr_sock_read(int fd, unsigned char *d, size_t cap, size_t *got);
+
 /* Закрыть связь: сокет и, если это был TLS, ключи в куче. */
 void tr_link_close(struct tr_link *l);
 

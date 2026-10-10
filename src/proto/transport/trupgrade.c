@@ -737,9 +737,8 @@ static int hu_read_wait(struct transport *t, unsigned char *d, size_t cap, size_
     const unsigned char *in = d;
     size_t n = 0;
     if (t->link.plain) {
-        ssize_t k = read(t->link.fd, d, cap);
-        if (k <= 0) return k == 0 ? TR_ECLOSED : TR_EIO;
-        n = (size_t)k;
+        int rc = tr_sock_read(t->link.fd, d, cap, &n);
+        if (rc) return rc;
     } else {
         int rc = tls13_read_ref(&t->link.tls, &in, &n);
         if (rc) return rc;
