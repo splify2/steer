@@ -14,6 +14,7 @@
 #include "xslink.h"
 #include "xswire.h"
 #include "reality.h"
+#include "wipe.h"
 
 /* Что именно принято, человеческими словами.
  *
@@ -147,7 +148,7 @@ int cmd_xsteer_link(const char *what, const char *name) {
         return 2;
     }
     printf("%s\n", out);
-    memset(out, 0, sizeof(out));
+    steer_wipe(out, sizeof(out));
     xs_conf_wipe(&sec);
     return 0;
 }
