@@ -43,6 +43,7 @@ build/rrkeepmatch
 build/runmatch
 build/helpersmatch
 build/pqfallbackmatch
+build/dupfragmatch
 build/h2match
 build/submatch
 build/hy2match
