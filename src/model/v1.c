@@ -221,7 +221,10 @@ static int port_list(struct js *j, const char *chan, struct port_range *dst, siz
         }
         break;
     }
-    js_lit(j, ']');
+    if (js_lit(j, ']') != 0) {
+        snprintf(msg, sizeof(msg), "channels.%.24s: ports: ожидалась запятая или ']'", chan);
+        return err_set(e, "%s", msg);
+    }
     *out_n = n;
     return 0;
 }
@@ -315,7 +318,8 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
                             if (*j->p == ']') return err_set(e, "outputs.%s: trailing comma in devices", o.name);
                             continue;
                         }
-                        js_lit(j, ']');
+                        if (js_lit(j, ']') != 0)
+                            return err_set(e, "outputs.%s: devices: ожидалась запятая или ']'", o.name);
                         break;
                     }
                 }
