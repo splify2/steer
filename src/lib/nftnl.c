@@ -342,7 +342,7 @@ static int nftlk_txn(uint8_t *const msgs[], const size_t lens[], int n,
      * against BATCH_BEGIN's own seq is a batch-level refusal (e.g. ENOMEM): none
      * of the messages then get an ack of their own. */
     int got = 0, seen[4] = {0};
-    uint8_t rbuf[1024];
+    _Alignas(8) uint8_t rbuf[1024];
     while (got < n) {
         ssize_t r = recv(g_nlk_fd, rbuf, sizeof(rbuf), 0);
         if (r < (ssize_t)NLMSG_HDRLEN) {
@@ -748,7 +748,7 @@ static int nftlk_get_elem(const char *table, const char *set, const uint8_t *key
     /* Ответ — сообщение NEWSETELEM с найденным элементом и за ним подтверждение (NLM_F_ACK); на
      * отказ — одно подтверждение с кодом. Чужие номера — хвосты прежних запросов, мимо. */
     int found = 0;
-    uint8_t rbuf[2048];
+    _Alignas(8) uint8_t rbuf[2048];
     for (;;) {
         ssize_t r = recv(g_nlk_fd, rbuf, sizeof(rbuf), 0);
         if (r < (ssize_t)NLMSG_HDRLEN) return found ? 0 : -ETIMEDOUT;

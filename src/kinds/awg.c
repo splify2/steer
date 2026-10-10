@@ -692,7 +692,7 @@ static int nl_talk(int fd, void *msg, size_t len, nl_cb cb, void *ctx) {
     int dump = (req->nlmsg_flags & NLM_F_DUMP) == NLM_F_DUMP;
     struct sockaddr_nl to = { .nl_family = AF_NETLINK };
     if (sendto(fd, msg, len, 0, (struct sockaddr *)&to, sizeof(to)) < 0) return errno;
-    static uint8_t rbuf[65536];
+    static _Alignas(8) uint8_t rbuf[65536];
     int rc = EIO, done = 0;
     while (!done) {
         ssize_t n = recv(fd, rbuf, sizeof rbuf, 0);

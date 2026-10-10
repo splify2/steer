@@ -59,7 +59,7 @@ static int rtnl_talk(void *msg, size_t len, rtnl_cb cb, void *ctx) {
         close(fd);
         return rc;
     }
-    static uint8_t rbuf[65536];
+    static _Alignas(8) uint8_t rbuf[65536];
     for (int done = 0; !done; ) {
         ssize_t n = recv(fd, rbuf, sizeof(rbuf), 0);
         if (n < 0) { if (errno == EINTR) continue; rc = errno; break; }
@@ -347,7 +347,7 @@ int rtnl_routes_text6(int table, char *out, size_t n) {
 }
 
 int rtnl_table_flush(int table) {
-    static uint8_t raw[16384];
+    static _Alignas(8) uint8_t raw[16384];
     struct route_ctx c;
     memset(&c, 0, sizeof(c));
     c.table = (uint32_t)table;
