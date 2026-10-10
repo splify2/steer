@@ -1424,10 +1424,12 @@ static void conn_drop(struct conn *c);
 
 /* Данные клиента, собранные для одной отправки узлу: см. «сборка сегментов клиента». */
 #define UP_MAX (TUNNEL_BUF - 2048)          /* место дайлера под заголовок и кадр Vision */
+_Static_assert(TUNNEL_GATHER_MAX >= TUN_DRAIN_MAX * TUN_MSS && TUNNEL_GATHER_MAX >= UP_MAX,
+               "буфер сборки меньше порции из TUN (TUN_DRAIN_MAX пакетов)");
 static __thread struct {
     struct conn *c;
     uint32_t n;
-    unsigned char buf[UP_MAX];
+    unsigned char buf[TUNNEL_GATHER_MAX];
 } g_up;
 
 /* Свободное место в таблице, а если его нет — освободить самое давнее.
@@ -1562,6 +1564,16 @@ static long conn_room(const struct conn *c) {
     if (c->pending) return c->early_n >= EARLY_CAP ? 0 : (long)(EARLY_CAP - c->early_n);
     if (c->fd < 0 || !g_dl->ops->room) return -1;
     return g_dl->ops->room(g_dl->ctx, SESS(c));
+}
+
+/* Сколько байт клиента соединения c собирается в одну отправку (см. dialer_ops.up_max). Пока
+ * соединение не готово или дайлер не называет большего — UP_MAX: место дайлера под заголовок и
+ * кадр Vision. */
+static size_t conn_up_max(const struct conn *c) {
+    if (c->is_udp || c->pending || c->fd < 0 || !g_dl->ops->up_max) return UP_MAX;
+    size_t m = g_dl->ops->up_max(g_dl->ctx, SESS(c));
+    if (m < UP_MAX) return UP_MAX;
+    return m > sizeof(g_up.buf) ? sizeof(g_up.buf) : m;
 }
 
 /* Отправить узлу данные клиента. Форма — заголовок запроса, обёртки, упаковка транспорта —
@@ -2289,12 +2301,13 @@ static void up_flush(const struct tun_dev *tun) {
 static int up_add(struct conn *c, const struct tun_dev *tun, uint32_t seq, const unsigned char *d,
                   size_t n) {
     long room = conn_room(c);
-    if (g_up.c == c && (g_up.n + n > UP_MAX || (room >= 0 && g_up.n + n > (size_t)room)))
+    size_t cap = conn_up_max(c);
+    if (g_up.c == c && (g_up.n + n > cap || (room >= 0 && g_up.n + n > (size_t)room)))
         up_flush(tun);
     if (g_up.c && g_up.c != c) up_flush(tun);
     if (!c->used || c->srv_closed || c->aborted) return -1;
     if (g_up.c != c && seq != c->client_seq) return -1;
-    if (n > UP_MAX) return 0;
+    if (n > cap) return 0;
     if (!g_up.c) {
         g_up.c = c;
         g_up.n = 0;

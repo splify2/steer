@@ -176,6 +176,10 @@ int transport_write(struct transport *t, const unsigned char *d, size_t n) {
     return t->fr->write(t, d, n);
 }
 
+int transport_big_write(const struct transport *t) {
+    return !t->enc && t->fr && t->fr->big_write && t->fr->big_write(t);
+}
+
 long transport_room(struct transport *t) {
     if (!t->fr || !t->fr->room) return -1;
     long r = t->fr->room(t);

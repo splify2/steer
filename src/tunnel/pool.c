@@ -570,6 +570,12 @@ static long pl_room(const void *ctx, void *sess) {
     return g_pl.in->room(s->node, INNER(s));
 }
 
+static size_t pl_up_max(const void *ctx, void *sess) {
+    (void)ctx;
+    struct pl_sess *s = sess;
+    return s->node ? g_pl.in->up_max(s->node, INNER(s)) : 0;
+}
+
 static size_t pl_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
     return g_pl.in->dgram_frame(p, n, out, cap);
 }
@@ -701,6 +707,7 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.flow_open = pl_flow_open;
     g_pl_ops.send = pl_send;
     g_pl_ops.room = pl_room;
+    g_pl_ops.up_max = g_pl.in->up_max ? pl_up_max : NULL;
     g_pl_ops.dgram_frame = pl_dgram_frame;
     g_pl_ops.read = pl_read;
     g_pl_ops.deliver = pl_deliver;

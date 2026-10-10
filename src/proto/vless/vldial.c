@@ -698,6 +698,19 @@ static long vl_room(const void *ctx, void *sess) {
     return r > 0 ? r : 0;
 }
 
+/* Сколько байт клиента собирать в одну отправку (dialer_ops.up_max). Больше обычного — только у
+ * xhttp packet-up, который режет запись на POST сам (transport_big_write), и только когда vl_send
+ * ничего не клеит к данным: заголовок запроса уже ушёл (иначе он и данные копируются в out, а это
+ * TUNNEL_BUF) и у узла нет flow. Vision кладёт перед данными кадр с набивкой и держит их в одной
+ * записи — у него потолок прежний; узел xhttp с flow отсеивается ещё при разборе ссылки, а это
+ * условие — вторая, независимая защита. */
+static size_t vl_up_max(const void *ctx, void *sess) {
+    const struct vless_node *node = ctx;
+    struct vl_sess *s = sess;
+    if (node->flow[0] || !s->header_sent) return 0;
+    return transport_big_write(&s->t) ? TUNNEL_GATHER_MAX : 0;
+}
+
 const struct dialer_ops vless_dialer = {
     .name = "vless",
     .caps = DC_PRECONNECT,
@@ -716,6 +729,7 @@ const struct dialer_ops vless_dialer = {
     .flow_open = vl_flow_open,
     .send = vl_send,
     .room = vl_room,
+    .up_max = vl_up_max,
     .dgram_frame = vl_dgram_frame,
     .dgram_max = VL_DGRAM_UP,
     .read = vl_read,

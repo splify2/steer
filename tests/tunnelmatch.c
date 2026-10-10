@@ -165,6 +165,9 @@ int transport_aux_drain(struct transport *c) {
     return g_aux_rc;
 }
 long transport_room(struct transport *c) { (void)c; return g_room; }
+/* Принимает ли транспорт запись любой длины (xhttp packet-up). */
+static int g_big_write;
+int transport_big_write(const struct transport *c) { (void)c; return g_big_write; }
 void transport_close(struct transport *c) { c->link.fd = -1; }   /* канал общий — не закрываем */
 void transport_moved(struct transport *c) { (void)c; }
 void transport_direct(struct transport *c) { c->link.rx_direct = 1; }
@@ -1463,6 +1466,61 @@ static void t_gather(void) {
     dev_drain(NULL);
 }
 
+/* Транспорт, который режет запись сам (xhttp packet-up), получает собранное крупнее прежних 16 КБ:
+ * меньше POST на тот же трафик. Но только когда заголовок VLESS уже ушёл и у узла нет flow: Vision
+ * держит кадр в одной записи, а заголовок клеится к данным в буфер TUNNEL_BUF. */
+static void t_gather_big(void) {
+    unsigned char d[1000];
+    memset(d, 'g', sizeof(d));
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "большая сборка: тестовое соединение не открылось"); return; }
+    uint32_t seq = 1001;
+
+    /* Первая отправка несёт заголовок (он клеится к данным в буфер TUNNEL_BUF): потолок прежний,
+     * даже у транспорта с большой записью. */
+    g_big_write = 1;
+    struct vl_sess *vs = SESS(c);
+    uint8_t was = vs->header_sent;
+    vs->header_sent = 0;
+    check(vless_dialer.up_max(&g_node, vs) == 0, "большая сборка: пока заголовок не ушёл, потолок прежний");
+    vs->header_sent = 1;
+    check(vless_dialer.up_max(&g_node, vs) == TUNNEL_GATHER_MAX, "большая сборка: заголовок ушёл — большой потолок");
+    vs->header_sent = was;
+    int calls;
+    /* Сегменты отправлены (open_conn): заголовок ушёл вместе с ними. */
+    vs->header_sent = 1;
+
+    /* Заголовок ушёл, flow нет: все 60 сегментов — одна отправка. */
+    calls = g_send_calls;
+    for (int i = 0; i < 60; i++) { cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d)); seq += sizeof(d); }
+    up_flush(&g_tun);
+    check(g_send_calls == calls + 1 && g_send_last_n == 60000,
+          "большая сборка: packet-up без flow — 60000 байт одной отправкой");
+    dev_drain(NULL);
+
+    /* Транспорт без большой записи: прежний потолок. */
+    g_big_write = 0;
+    calls = g_send_calls;
+    for (int i = 0; i < 60; i++) { cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d)); seq += sizeof(d); }
+    up_flush(&g_tun);
+    check(g_send_calls - calls >= 4 && g_send_last_n <= UP_MAX,
+          "большая сборка: транспорт без большой записи — не крупнее UP_MAX");
+    dev_drain(NULL);
+
+    /* Узел с flow (Vision): даже при большой записи транспорта — прежний потолок. */
+    g_big_write = 1;
+    snprintf(g_node.flow, sizeof(g_node.flow), "xtls-rprx-vision");
+    calls = g_send_calls;
+    for (int i = 0; i < 60; i++) { cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d)); seq += sizeof(d); }
+    up_flush(&g_tun);
+    check(g_send_calls - calls >= 4 && g_send_last_n <= UP_MAX + 2048,
+          "большая сборка: узел с flow (Vision) большой записи не получает");
+    g_node.flow[0] = 0;
+    g_big_write = 0;
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
 /* ==== ПУЛ УЗЛОВ ВЫХОДА И СБРОС СОЕДИНЕНИЙ (src/tunnel/pool.c) ================================
  *
  * ЧТО ПРОВЕРЯЕТСЯ. Две половины одной задачи (узел умер, а соединения через него висят):
@@ -2438,6 +2496,7 @@ int main(void) {
     t_room_window();
     t_aux_wake();
     t_gather();
+    t_gather_big();
     t_fin_window();
     t_udp_early_bounds();
     t_udp_defrag();
