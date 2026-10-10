@@ -118,7 +118,7 @@ static int ctnl_copy_attr(struct nlbuf *b, const struct nlattr *x) {
 /* Снять одну запись; 1 — снята, 0 — нет (уже умерла или ядро отказало). */
 static int ctnl_delete(int fd, uint8_t family, uint32_t seq, const struct nlattr *tuple,
                        const struct nlattr *id, const struct nlattr *zone) {
-    uint8_t req[512];
+    _Alignas(8) uint8_t req[512];
     struct nlbuf b;
     struct nlmsghdr *nh = ctnl_msg(&b, req, sizeof(req), IPCTNL_MSG_CT_DELETE,
                                    NLM_F_REQUEST | NLM_F_ACK, seq, family);
@@ -127,7 +127,7 @@ static int ctnl_delete(int fd, uint8_t family, uint32_t seq, const struct nlattr
     nh->nlmsg_len = (uint32_t)(b.p - b.base);
     struct sockaddr_nl k = { .nl_family = AF_NETLINK };
     if (sendto(fd, req, nh->nlmsg_len, 0, (struct sockaddr *)&k, sizeof(k)) < 0) return 0;
-    uint8_t ack[512];
+    _Alignas(8) uint8_t ack[512];
     for (;;) {
         ssize_t n = recv(fd, ack, sizeof(ack), 0);
         if (n <= 0) return 0;
@@ -158,7 +158,7 @@ typedef int (*ctnl_rec_fn)(const uint8_t *a, const uint8_t *end, uint8_t family,
 
 int ctnl_dump(int dfd, uint8_t family, int filter, uint32_t val, uint32_t mask,
                      uint32_t *seq, uint8_t *buf, ctnl_rec_fn fn, void *ctx) {
-    uint8_t req[128];
+    _Alignas(8) uint8_t req[128];
     struct nlbuf b;
     uint32_t dseq = ++*seq;
     struct nlmsghdr *nh = ctnl_msg(&b, req, sizeof(req), IPCTNL_MSG_CT_GET,

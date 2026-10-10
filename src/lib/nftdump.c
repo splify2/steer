@@ -58,7 +58,7 @@ typedef void (*nfd_cb)(const struct nlmsghdr *h, void *arg);
 static int nfd_talk(int fd, uint16_t msg, int dump, uint8_t family,
                     uint16_t a1, const char *s1, uint16_t a2, const char *s2,
                     nfd_cb cb, void *arg) {
-    uint8_t req[512];
+    _Alignas(8) uint8_t req[512];
     memset(req, 0, sizeof(req));
     struct nlbuf b;
     nlbuf_init(&b, req, sizeof(req));
