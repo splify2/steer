@@ -10,6 +10,7 @@
 #include "xswire.h"
 #include "chello.h"
 #include "reality.h"
+#include "wipe.h"
 
 /* Имя протокола Noise. Для ChaCha оно ровно 32 символа, то есть h инициализируется без
  * хеширования — приятная мелочь, обещанная спецификацией Noise. Для AES-GCM короче, и тогда
@@ -59,10 +60,17 @@ static void mix_hash(struct xs_hs *hs, const uint8_t *data, size_t n) {
  * подсчётом, потому что «должно совпадать» и «совпадает» — разные утверждения. */
 static int mix_key(struct xs_hs *hs, const uint8_t *ikm, size_t ikm_n) {
     uint8_t prk[32], out[64];
-    if (sc_hkdf_extract(SC_SHA256, hs->ck, 32, ikm, ikm_n, prk) != 0) return XS_ECRYPTO;
-    if (sc_hkdf_expand(SC_SHA256, prk, 32, NULL, 0, out, sizeof(out)) != 0) return XS_ECRYPTO;
-    memcpy(hs->ck, out, 32);
-    memcpy(hs->k, out + 32, 32);
+    /* prk и out — материал ключа цепочки и ключа шага: затираются на любом пути, в том числе
+     * на отказе HKDF, а не остаются в стеке до следующей перезаписи. */
+    int bad = sc_hkdf_extract(SC_SHA256, hs->ck, 32, ikm, ikm_n, prk) != 0 ||
+              sc_hkdf_expand(SC_SHA256, prk, 32, NULL, 0, out, sizeof(out)) != 0;
+    if (!bad) {
+        memcpy(hs->ck, out, 32);
+        memcpy(hs->k, out + 32, 32);
+    }
+    steer_wipe(prk, sizeof(prk));
+    steer_wipe(out, sizeof(out));
+    if (bad) return XS_ECRYPTO;
     /* Контекст шифра разворачивается заново на каждый шаг: ключ сменился, а держать старый
      * означало бы шифровать не тем. Это единственное место, где setkey зовётся часто, — но
      * шагов в рукопожатии четыре, а не на каждый пакет (см. tls13.h про цену setkey). */
@@ -110,9 +118,13 @@ static int decrypt_and_hash(struct xs_hs *hs, const uint8_t *ct, size_t ct_n, ui
  * ключи: совместимость на проводе не тронута, и поддельный TCP не задет вовсе. */
 static int split_keys(struct xs_hs *hs, struct tls13_keys *i2r, struct tls13_keys *r2i) {
     uint8_t prk[32], out[152];
-    if (sc_hkdf_extract(SC_SHA256, hs->ck, 32, (const uint8_t *)"", 0, prk) != 0) return XS_ECRYPTO;
-    if (sc_hkdf_expand(SC_SHA256, prk, 32, (const uint8_t *)"xsteer split", 12,
-                       out, sizeof(out)) != 0) return XS_ECRYPTO;
+    if (sc_hkdf_extract(SC_SHA256, hs->ck, 32, (const uint8_t *)"", 0, prk) != 0 ||
+        sc_hkdf_expand(SC_SHA256, prk, 32, (const uint8_t *)"xsteer split", 12,
+                       out, sizeof(out)) != 0) {
+        steer_wipe(prk, sizeof(prk));
+        steer_wipe(out, sizeof(out));
+        return XS_ECRYPTO;
+    }
     size_t kn = hs->aead == TLS13_AEAD_AES128 ? 16 : 32;
     memset(i2r, 0, sizeof(*i2r));
     memset(r2i, 0, sizeof(*r2i));
@@ -131,11 +143,8 @@ static int split_keys(struct xs_hs *hs, struct tls13_keys *i2r, struct tls13_key
     /* Выведенный материал затирается ЗДЕСЬ, а не оставляется на стеке: за ключами в out
      * лежат корни эпох, из которых выводятся ВСЕ будущие ключи соединения, — то есть цена
      * забытых шестидесяти четырёх байт равна цене забытого ключа. */
-    {
-        volatile uint8_t *a = out, *b = prk;
-        for (size_t i = 0; i < sizeof(out); i++) a[i] = 0;
-        for (size_t i = 0; i < sizeof(prk); i++) b[i] = 0;
-    }
+    steer_wipe(out, sizeof(out));
+    steer_wipe(prk, sizeof(prk));
     if (setup_bad) return XS_ECRYPTO;
     /* Ключ шага рукопожатия больше не нужен: Split — его последнее применение. Освобождаем
      * ЗДЕСЬ, а не оставляем вызывающему: контекст AES лежит в куче, а рукопожатий за час
@@ -234,14 +243,20 @@ static void payload_unpack(const uint8_t in[XS_SID_PLAIN], struct xs_payload *p)
  * нулевым nonce означало бы повтор пары «ключ, nonce» — то есть полную потерю защиты. */
 static int auth_key(const struct xs_hs *hs, struct tls13_keys *k) {
     uint8_t prk[32], out[44];
-    if (sc_hkdf_extract(SC_SHA256, hs->ck, 32, (const uint8_t *)"", 0, prk) != 0) return XS_ECRYPTO;
-    if (sc_hkdf_expand(SC_SHA256, prk, 32, (const uint8_t *)"xsteer auth", 11,
-                       out, sizeof(out)) != 0) return XS_ECRYPTO;
-    memset(k, 0, sizeof(*k));
-    k->aead = hs->aead;
-    k->key_n = hs->aead == TLS13_AEAD_AES128 ? 16 : 32;
-    memcpy(k->key, out, k->key_n);
-    memcpy(k->iv, out + 32, 12);
+    int bad = sc_hkdf_extract(SC_SHA256, hs->ck, 32, (const uint8_t *)"", 0, prk) != 0 ||
+              sc_hkdf_expand(SC_SHA256, prk, 32, (const uint8_t *)"xsteer auth", 11,
+                             out, sizeof(out)) != 0;
+    if (!bad) {
+        memset(k, 0, sizeof(*k));
+        k->aead = hs->aead;
+        k->key_n = hs->aead == TLS13_AEAD_AES128 ? 16 : 32;
+        memcpy(k->key, out, k->key_n);
+        memcpy(k->iv, out + 32, 12);
+    }
+    /* Ключ аутентификатора уже в k: копия на стеке не нужна ни на каком пути. */
+    steer_wipe(prk, sizeof(prk));
+    steer_wipe(out, sizeof(out));
+    if (bad) return XS_ECRYPTO;
     return tls13_keys_setup(k) == 0 ? 0 : XS_ECRYPTO;
 }
 
@@ -268,9 +283,15 @@ static int carry_ech(void *ctx, unsigned char *ech, size_t ech_n,
     if ((c->rc = mix_key(hs, shared, 32)) != 0) return -1;      /* es */
     if ((c->rc = encrypt_and_hash(hs, c->our_static, 32, ech)) != 0) return -1;   /* s */
     uint8_t ss[32];
-    if (x25519_shared_ext(c->our_priv, hs->rs, ss) != 0) { c->rc = XS_ECRYPTO; return -1; }
-    if ((c->rc = mix_key(hs, ss, 32)) != 0) return -1;          /* ss */
-    memset(ss, 0, sizeof(ss));
+    if (x25519_shared_ext(c->our_priv, hs->rs, ss) != 0) {
+        steer_wipe(ss, sizeof(ss));
+        c->rc = XS_ECRYPTO;
+        return -1;
+    }
+    /* Затирание — ДО проверки: выход по ошибке mix_key оставлял ss в стеке. */
+    c->rc = mix_key(hs, ss, 32);                                /* ss */
+    steer_wipe(ss, sizeof(ss));
+    if (c->rc != 0) return -1;
     /* Пустая нагрузка: один тег. Всё содержательное (версия, MTU, время) едет в
      * аутентификаторе session_id — он и так подписывает весь Hello, значит второй экземпляр
      * тех же полей был бы лишними байтами. */
@@ -395,11 +416,11 @@ static int xs_hs_server_read_impl(struct xs_hs *hs, const struct xs_secrets *sec
 
     /* es считается НАШИМ статическим и ЕГО эфемерным — то же значение, что у него. */
     uint8_t es[32];
-    if (x25519_shared_ext(sec->priv, hs->e_pub, es) != 0) return XS_ECRYPTO;
+    if (x25519_shared_ext(sec->priv, hs->e_pub, es) != 0) { steer_wipe(es, sizeof(es)); return XS_ECRYPTO; }
 
     mix_hash(hs, hs->e_pub, 32);
     int rc = mix_key(hs, es, 32);
-    memset(es, 0, sizeof(es));
+    steer_wipe(es, sizeof(es));
     if (rc != 0) return rc;
 
     /* Личность инициатора приезжает зашифрованной — расшифровываем и только потом ищем её в
@@ -407,9 +428,9 @@ static int xs_hs_server_read_impl(struct xs_hs *hs, const struct xs_secrets *sec
     if ((rc = decrypt_and_hash(hs, rec + ref.ech_off, XS_ENC_STATIC, peer_static)) != 0)
         return rc;
     uint8_t ss[32];
-    if (x25519_shared_ext(sec->priv, peer_static, ss) != 0) return XS_ECRYPTO;
+    if (x25519_shared_ext(sec->priv, peer_static, ss) != 0) { steer_wipe(ss, sizeof(ss)); return XS_ECRYPTO; }
     rc = mix_key(hs, ss, 32);
-    memset(ss, 0, sizeof(ss));
+    steer_wipe(ss, sizeof(ss));
     if (rc != 0) return rc;
     if ((rc = decrypt_and_hash(hs, rec + ref.ech_off + XS_ENC_STATIC, XS_ENC_EMPTY, NULL)) != 0)
         return rc;
@@ -497,15 +518,15 @@ static int xs_hs_server_write_impl(struct xs_hs *hs, int mtu, uint8_t *out, size
     mix_hash(hs, out + 5, o - 5);
 
     uint8_t ee[32], se[32];
-    if (x25519_shared_ext(hs->e_priv, peer_e, ee) != 0) return XS_ECRYPTO;
+    if (x25519_shared_ext(hs->e_priv, peer_e, ee) != 0) { steer_wipe(ee, sizeof(ee)); return XS_ECRYPTO; }
     int rc = mix_key(hs, ee, 32);
-    memset(ee, 0, sizeof(ee));
+    steer_wipe(ee, sizeof(ee));
     if (rc != 0) return rc;
     /* se: наш эфемерный и СТАТИЧЕСКИЙ инициатора. Именно этот шаг аутентифицирует пир —
      * без него любой, кто перехватил её Hello, мог бы выдать себя за неё. */
-    if (x25519_shared_ext(hs->e_priv, hs->peer_static, se) != 0) return XS_ECRYPTO;
+    if (x25519_shared_ext(hs->e_priv, hs->peer_static, se) != 0) { steer_wipe(se, sizeof(se)); return XS_ECRYPTO; }
     rc = mix_key(hs, se, 32);
-    memset(se, 0, sizeof(se));
+    steer_wipe(se, sizeof(se));
     if (rc != 0) return rc;
 
     /* Фальшивый ChangeCipherSpec: настоящий TLS 1.3 его посылает ради посредников, и его
@@ -588,14 +609,14 @@ static int xs_hs_client_finish_impl(struct xs_hs *hs, const uint8_t *in, size_t 
 
     mix_hash(hs, sh, sh_len);
     uint8_t ee[32], se[32];
-    if (x25519_shared_ext(hs->e_priv, peer_e, ee) != 0) return XS_ECRYPTO;
+    if (x25519_shared_ext(hs->e_priv, peer_e, ee) != 0) { steer_wipe(ee, sizeof(ee)); return XS_ECRYPTO; }
     int rc = mix_key(hs, ee, 32);
-    memset(ee, 0, sizeof(ee));
+    steer_wipe(ee, sizeof(ee));
     if (rc != 0) return rc;
     /* se со стороны пира: его СТАТИЧЕСКИЙ и эфемерный сервера. */
-    if (x25519_shared_ext(hs->s_priv, peer_e, se) != 0) return XS_ECRYPTO;
+    if (x25519_shared_ext(hs->s_priv, peer_e, se) != 0) { steer_wipe(se, sizeof(se)); return XS_ECRYPTO; }
     rc = mix_key(hs, se, 32);
-    memset(se, 0, sizeof(se));
+    steer_wipe(se, sizeof(se));
     if (rc != 0) return rc;
     i = 5 + sh_len;
 
