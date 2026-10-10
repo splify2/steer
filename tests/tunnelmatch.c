@@ -132,7 +132,7 @@ static long g_room = -1;
 static long g_room_on_read = -2;
 static int g_recv_calls;
 static int g_recv_rc;                 /* что вернёт transport_read_zc: 0 или -1 (конец потока) */
-static unsigned char g_recv_buf[4096];
+static unsigned char g_recv_buf[TUNNEL_BUF];
 static size_t g_recv_n;               /* сколько отдать при g_recv_rc == 0 (разово) */
 /* Поток-образец для проверки склейки записей клиенту: g_recv_rep раз подряд по g_recv_rep_n байт,
  * байт номер i потока равен (i * 7 + i / 251), чтобы сдвиг или порча на краю кольца были видны. */
@@ -1403,6 +1403,13 @@ static void t_empty_read(void) {
     dev_drain(NULL);
 }
 
+/* Дайлер-нарушитель: разбор отдаёт прочитанное дважды — как накопитель, отдающий накопленное плюс прочитанное. */
+static int dup_deliver(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
+                       dialer_emit_fn emit, void *arg) {
+    (void)ctx; (void)sess; (void)udp;
+    return emit(arg, d, n) != 0 || emit(arg, d, n) != 0 ? -1 : 0;
+}
+
 static void t_tx_batch(void) {
     struct conn *c = open_conn(65535);
     if (!c) { check(0, "склейка записей: тестовое соединение не открылось"); return; }
@@ -1429,6 +1436,9 @@ static void t_tx_batch(void) {
     check(c->our_seq - c->client_ack == 41000 && c->rtx.len == 41000 && !c->tx_unsent,
           "склейка: отправленное целиком лежит в кольце повтора, неотправленного нет");
 
+    /* Договор дайлера: за проход не больше запаса кольца (CLIENT_ROOM_RESERVE). Верная раздача — тишина,
+     * раздача вдвое больше прочитанного (накопитель, как был у ss и vmess) — строка в журнале и счёт. */
+    check(g_overemit == 0, "договор дайлера: порция в рамках запаса — нарушений нет");
     /* Клиент подтверждает всё; вторая порция ложится через конец кольца. */
     cli_send(1001, c->our_seq, TCP_ACK, 65535, NULL, 0);
     dev_drain(NULL);
@@ -1464,6 +1474,21 @@ static void t_tx_batch(void) {
     check(pos == 136000 && bad == 0 && cnt == 4, "склейка: STEER_TUN_NOTXBATCH — запись на каждое чтение");
     g_tx_nobatch = 0;
 
+    /* Нарушение договора: один проход отдаёт 2 x 18000 при запасе TUNNEL_BUF + 1024. */
+    cli_send(1001, c->our_seq, TCP_ACK, 65535, NULL, 0);
+    dev_drain(NULL);
+    struct dialer_ops over = *g_dl->ops;
+    over.deliver = dup_deliver;
+    struct dialer over_dl = *g_dl;
+    over_dl.ops = &over;
+    const struct dialer *real_dl = g_dl;
+    g_dl = &over_dl;
+    g_recv_rep = 1; g_recv_rep_n = 18000;
+    drain_conn(c, &g_tun);
+    g_dl = real_dl;
+    check(g_overemit == 1, "договор дайлера: проход отдал 36000 байт при запасе 19472 — нарушение сосчитано и названо");
+    size_t pos2 = 0; uint32_t seq2 = c->our_seq; int bad2 = 0; size_t mx2 = 0;
+    (void)tx_collect(&pos2, &seq2, &bad2, &mx2);   /* поток испорчен намеренно — только вычерпать устройство */
     g_tun.gso = 0;
     conn_drop(c);
     dev_drain(NULL);

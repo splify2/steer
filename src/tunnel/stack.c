@@ -1924,6 +1924,9 @@ static int emit_stream(void *arg, const unsigned char *p, size_t n) {
     return 0;
 }
 
+/* Сколько раз дайлер отдал за проход больше запаса (см. downstream_pump). Счётчик ради стенда и журнала. */
+static __thread unsigned g_overemit;
+
 /* Прочитать у сервера и отдать клиенту как TCP-пакет (или датаграммы UDP).
  *
  * Два шага дайлера, а не один: чтение (read) и разбор (deliver). Между ними стек считает то,
@@ -1960,6 +1963,20 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun, size_t *rx
         return -1;
     if (c->is_udp) return 0;
 
+    /* Договор дайлера (dialer.h, deliver): за проход — не больше, чем стек проверил в кольце повтора
+     * (CLIENT_ROOM_RESERVE). Сверх этого emit может отказать на полном кольце, и исправное соединение рвётся
+     * (так умирали ss и vmess: накопитель отдавал acc_n + прочитанное). Само нарушение — не отказ, а запись в
+     * журнал, чтобы следующий такой дайлер нашёлся по строке, а не по оборванным загрузкам. */
+    if (e.total > CLIENT_ROOM_RESERVE) {
+        static __thread time_t said;
+        g_overemit++;
+        if (g_now_s - said >= 10) {
+            said = g_now_s;
+            fprintf(stderr, LOG_W "дайлер %s отдал за проход %zu байт при запасе %d — нарушен договор "
+                    "dialer.h (deliver), кольцо повтора может не вместить\n",
+                    g_dl->ops->name, e.total, (int)CLIENT_ROOM_RESERVE);
+        }
+    }
     if (!e.total) { TR("после разбора данных нет\n"); return 0; }
     TR("клиенту %zu байт (seq до %u)\n", e.total, c->our_seq);
     return 0;
