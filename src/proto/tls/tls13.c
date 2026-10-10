@@ -27,7 +27,6 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <poll.h>
 
 #include "scrypto.h"
 #include "certverify.h"
@@ -146,12 +145,13 @@ static int rbuf_fill(struct tls13 *t, int may_wait) {
     }
     if (t->rbuf_n >= sizeof(t->rbuf)) return TLS13_ETOOBIG;
 
-    if (!may_wait) {
-        struct pollfd p = { .fd = t->fd, .events = POLLIN };
-        int pr = poll(&p, 1, 0);
-        if (pr <= 0 || !(p.revents & POLLIN)) return TLS13_EAGAIN;
-    }
-    ssize_t r = read(t->fd, t->rbuf + t->rbuf_n, sizeof(t->rbuf) - t->rbuf_n);
+    /* Поток данных не ждёт — и спрашивает не poll перед чтением, а само чтение: recv с MSG_DONTWAIT
+     * на пустом сокете сразу даёт EAGAIN. Прежде здесь стоял poll(…, 0) перед каждым read — второй
+     * системный вызов на каждое чтение: 66–115 вызовов poll на МБ у gRPC и Vision (замер R-148),
+     * а сокет узла блокирующий и со сроком, так что read без проверки ждал бы до его конца. Рукопожатие
+     * (may_wait) читает как раньше — ждёт. */
+    ssize_t r = may_wait ? read(t->fd, t->rbuf + t->rbuf_n, sizeof(t->rbuf) - t->rbuf_n)
+                         : recv(t->fd, t->rbuf + t->rbuf_n, sizeof(t->rbuf) - t->rbuf_n, MSG_DONTWAIT);
     if (r == 0) return TLS13_ECLOSED;
     if (r < 0) {
         if (errno == EINTR) return 0;
