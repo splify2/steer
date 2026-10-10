@@ -1090,15 +1090,8 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
             }
             if (strncmp(st, "down", 4) == 0) {
                 const struct output *po = out_for_device(sp, &sp->out[i], sp->out[i].device);
-                if (sp->out[i].failed)
-                    snprintf(what, sizeof(what), "выход %.40s: %.24s выключено, трафик канала %s",
-                             sp->out[i].name, sp->out[i].device,
-                             sp->out[i].on_fail == FAIL_DROP ? "остановлен" :
-                             sp->out[i].on_fail == FAIL_ZAPRET ? "идёт через обход" :
-                             "идёт напрямую");
-                else
-                    snprintf(what, sizeof(what), "выход %.40s: устройство %.24s выключено",
-                             sp->out[i].name, sp->out[i].device);
+                snprintf(what, sizeof(what), "выход %.40s: устройство %.24s выключено",
+                         sp->out[i].name, sp->out[i].device);
                 snprintf(why, sizeof(why), "%s",
                          out_engine_managed(po)
                              ? "туннель не поднят — смотрите журнал ядра steer"
