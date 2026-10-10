@@ -224,7 +224,10 @@ size_t str_list(struct js *j, const char **dst, size_t max, struct err *e) {
         }
         break;
     }
-    js_lit(j, ']');
+    if (js_lit(j, ']') != 0) {
+        err_set(e, "list: expected ',' or ']'", NULL);
+        return (size_t)-1;
+    }
     return n;
 }
 
