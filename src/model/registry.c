@@ -122,7 +122,7 @@ int registry_assign(struct spec *s, struct err *e) {
             snprintf(msg, sizeof(msg), "out of mark slots for output %.31s: outputs with a mark are at most "
                      "%u (mark field is %d bits, %d-%d; values that a neighbour's rewrite of bits "
                      "16-23 could turn into another output's mark are not handed out), and all %u "
-                     "are taken", s->out[i].name, nslots, STEER_MARK_BITS, STEER_MARK_LOBIT,
+                     "are taken", s->out[i].name, nslots, (int)STEER_MARK_BITS, STEER_MARK_LOBIT,
                      STEER_MARK_HIBIT, nslots);
             free(taken);
             return err_set(e, "%s", msg);

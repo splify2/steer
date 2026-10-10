@@ -344,7 +344,7 @@ int check_mark_slots(const struct spec *sp, struct err *e) {
     snprintf(msg, sizeof(msg), "выходов с меткой %zu, а поле метки даёт мест не больше %u: у метки "
              "%d бит (биты %d-%d), значения, которые чужая перезапись соседних битов 16-23 могла бы "
              "превратить в метку другого выхода, не раздаются. Выходы без метки (direct) в счёт не "
-             "идут", n, slots, STEER_MARK_BITS,
+             "идут", n, slots, (int)STEER_MARK_BITS,
              STEER_MARK_LOBIT, STEER_MARK_HIBIT);
     return err_set(e, "%s", msg);
 }
