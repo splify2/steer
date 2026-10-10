@@ -43,6 +43,10 @@ struct ss_sess {
     uint32_t dst; uint16_t dport;
 
     size_t acc_n, want;          /* накопитель и сколько байт ждём на стадии */
+    /* Расшифрованный кусок, который за один проход не влез в место стека, лежит в acc
+     * [out_off, out_n): ss_read отдаёт его следующим проходом, а у сокета в это время не читает. */
+    size_t out_off, out_n;
+    uint8_t flushing;            /* ss_read только что вернул остаток — deliver отдаёт его как есть */
     /* Под наибольший кусок, какой может прислать сервер (SIP022 — 0xFFFF и тег). Страницы
      * таблицы сессий стек отображает лениво: хвост буфера занимает память, только когда кусок
      * больше 0x3FFF на самом деле пришёл. */
@@ -75,6 +79,7 @@ static void ss_clear(void *sess) {
     s->is2022 = s->has_enc = s->has_dec = 0;
     s->rx = RS_SALT;
     s->acc_n = s->want = 0;
+    s->out_off = s->out_n = 0; s->flushing = 0;
     s->t.link.fd = -1;
 }
 
@@ -141,7 +146,8 @@ static int ss_fd(const void *sess) {
 }
 static int ss_has_data(const void *sess) {
     const struct ss_sess *s = sess;
-    return s->udpfd >= 0 ? 0 : transport_has_data(&s->t);
+    if (s->udpfd >= 0) return 0;
+    return s->out_off < s->out_n || transport_has_data(&s->t);
 }
 
 /* Добавить к out зашифрованный кусок данных (len-кадр + полезная нагрузка). */
@@ -305,6 +311,27 @@ static size_t ss_dgram_frame(const unsigned char *p, size_t n, unsigned char *ou
     return 2 + n;
 }
 
+/* Сколько сырых байт можно взять у сокета за проход, чтобы расшифровка не отдала стеку больше
+ * cap байт.
+ *
+ * Стек берёт у дайлера не больше cap (TUNNEL_BUF) за проход и перед проходом проверяет место в
+ * кольце повтора ровно под это число (CLIENT_ROOM_RESERVE). Расшифровка же отдаёт не столько,
+ * сколько прочитано, а сколько накопилось: недобранный кусок из прошлого прохода (acc_n байт)
+ * плюс всё, что прочитано сейчас. Прежний код читал cap сырых байт всегда и отдавал до
+ * acc_n + cap: у сервера с кусками по 8 КБ это 24474 байта при месте под 19472 — emit отказывал,
+ * и исправное соединение рвалось на 135-420 МБ, как только кольцо наполнялось. Здесь вход
+ * режется так, чтобы acc_n + прочитанное не выходило за cap.
+ *
+ * Кусок, который не влезает в cap сам по себе (SIP022: до 0xFFFF), добирается ровно до конца,
+ * без хвоста, а отдаётся по cap за проход (ss_tcp_down, out_off). */
+static size_t ss_take_limit(const struct ss_sess *s, size_t cap) {
+    if (s->rx != RS_PAY) return cap;
+    size_t need = s->want - s->acc_n;                 /* до конца текущего куска */
+    size_t pl = s->want - 16;                         /* его нагрузка */
+    size_t lim = need + (cap > pl ? cap - pl : 0);
+    return lim < cap ? lim : cap;
+}
+
 static int ss_read(void *sess, unsigned char *buf, size_t cap, const unsigned char **data, size_t *got) {
     struct ss_sess *s = sess;
     *data = buf; *got = 0;
@@ -314,7 +341,15 @@ static int ss_read(void *sess, unsigned char *buf, size_t cap, const unsigned ch
         if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
         return -1;
     }
-    return transport_read(&s->t, buf, cap, got);
+    if (s->out_off < s->out_n) {                      /* остаток прошлого куска — раньше сокета */
+        size_t k = s->out_n - s->out_off;
+        if (k > cap) k = cap;
+        *data = s->acc + s->out_off; *got = k;
+        s->out_off += k;
+        s->flushing = 1;
+        return 0;
+    }
+    return transport_read(&s->t, buf, ss_take_limit(s, cap), got);
 }
 
 /* Снять адрес SOCKS5 в начале буфера: вернуть его длину, 0 — не хватает/брак. */
@@ -355,6 +390,11 @@ static int ss_udp_down(const struct px_node *n, struct ss_sess *s, const unsigne
 static int ss_tcp_down(const struct px_node *n, struct ss_sess *s, const unsigned char *d, size_t len,
                        dialer_emit_fn emit, void *arg) {
     if (n->ss_method == SS_NONE) return len ? emit(arg, d, len) : 0;
+    if (s->flushing) {                    /* остаток куска из ss_read: уже расшифрован */
+        s->flushing = 0;
+        return len ? emit(arg, d, len) : 0;
+    }
+    size_t emitted = 0;                   /* за этот проход — не больше TUNNEL_BUF */
     while (len) {
         if (s->rx == RS_SALT) {
             size_t need = s->keylen - s->acc_n;
@@ -392,9 +432,19 @@ static int ss_tcp_down(const struct px_node *n, struct ss_sess *s, const unsigne
             s->rx = RS_PAY;
             s->want = want + 16;
         } else {                              /* RS_PAY */
-            if (emit(arg, s->acc, ct) != 0) return -1;
             s->rx = RS_LEN;
             s->want = 2 + 16;
+            size_t room = TUNNEL_BUF - emitted;
+            size_t k = ct < room ? ct : room;
+            if (emit(arg, s->acc, k) != 0) return -1;
+            emitted += k;
+            if (k < ct) {
+                /* Кусок больше места за проход: остаток ждёт в acc, пока ss_read его не отдаст.
+                 * Вход после такого куска ss_take_limit не оставляет; если он всё же есть,
+                 * его некуда деть — это не наш read. */
+                s->out_off = k; s->out_n = ct;
+                return len ? -1 : 0;
+            }
         }
     }
     return 0;

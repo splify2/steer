@@ -270,9 +270,15 @@ static size_t vm_dgram_frame(const unsigned char *p, size_t n, unsigned char *ou
     return 2 + n;
 }
 
+/* Вход режется так, чтобы за проход стеку ушло не больше cap байт: расшифровка отдаёт недобранный
+ * кусок прошлого прохода (acc_n) плюс всё прочитанное сейчас, а место в кольце повтора стек
+ * проверяет ровно под cap. Подробнее — ss_take_limit в pxss.c. Кусок vmess не больше 0x4000 —
+ * сам в cap помещается, держать остаток незачем. */
 static int vm_read(void *sess, unsigned char *buf, size_t cap, const unsigned char **data, size_t *got) {
+    struct vmess_sess *s = sess;
     *data = buf;
-    return transport_read(&((struct vmess_sess *)sess)->t, buf, cap, got);
+    size_t lim = cap > s->acc_n ? cap - s->acc_n : 1;
+    return transport_read(&s->t, buf, lim, got);
 }
 
 static int vm_deliver(const void *ctx, void *sess, int udp, const unsigned char *d, size_t len,
