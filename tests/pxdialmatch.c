@@ -290,8 +290,144 @@ static void test_ss2022_big_chunk(void) {
     free(sess);
 }
 
+
+/* ---- нисходящий поток: свободное место кольца клиента ---------------------------------------- */
+
+/* Модель стека. Перед каждым проходом (read + deliver) стек убеждается, что в кольце повтора есть
+ * CLIENT_ROOM_RESERVE = TUNNEL_BUF + 1024 байт, и больше за проход эмитить нельзя: отказ emit —
+ * это обрыв соединения (emit_to_client: «буфер повтора полон»). Дайлер, который за один проход
+ * отдаёт больше, рвёт исправный поток. */
+#define ROOM_RESERVE (TUNNEL_BUF + 1024)
+static unsigned char g_big[1 << 21];
+static size_t g_big_n, g_pass_n, g_pass_max;
+static int g_overflow;
+static int emit_room(void *arg, const unsigned char *p, size_t n) {
+    (void)arg;
+    if (g_pass_n + n > ROOM_RESERVE) { g_overflow++; return -1; }
+    g_pass_n += n;
+    if (g_pass_n > g_pass_max) g_pass_max = g_pass_n;
+    if (g_big_n + n <= sizeof g_big) { memcpy(g_big + g_big_n, p, n); g_big_n += n; }
+    return 0;
+}
+
+/* Гоняет ответ сервера так, как гоняет стек: read при непустом, deliver, снова — пока не
+ * кончится вход и не опустеет has_data. Возвращает 0 либо код отказа дайлера. */
+static int pump_down(const struct dialer_ops *ops, const struct px_node *n, void *sess,
+                     const unsigned char *rx, size_t rxn) {
+    static unsigned char buf[TUNNEL_BUF];
+    feed_reset(rx, rxn);
+    g_rx_chunk = TUNNEL_BUF;
+    g_big_n = 0; g_pass_max = 0; g_overflow = 0;
+    int rc = 0;
+    for (int guard = 0; guard < 100000 && (g_rx_off < g_rx_n || ops->has_data(sess)); guard++) {
+        const unsigned char *data = buf; size_t got = 0;
+        g_pass_n = 0;
+        if (ops->read(sess, buf, sizeof buf, &data, &got)) { rc = -2; break; }
+        if (got && (rc = ops->deliver(n, sess, 0, data, got, emit_room, NULL)) != 0) break;
+    }
+    g_rx_chunk = 4096;
+    return rc;
+}
+
+static size_t put_pat(unsigned char *o, size_t len, unsigned char seed) {
+    for (size_t i = 0; i < len; i++) o[i] = (unsigned char)(seed + i * 7);
+    return len;
+}
+
+/* Ответ shadowsocks из nch кусков по plen байт (AEAD заглушена: шифртекст = открытый текст).
+ * Эталон нагрузки — в want. 2022: заголовок ответа с солью запроса, как в тесте выше. */
+static size_t ss_stream(unsigned char *rx, unsigned char *want, size_t *want_n, int is2022,
+                        const unsigned char reqsalt[16], int nch, size_t plen) {
+    size_t o = 0; *want_n = 0;
+    memset(rx + o, 7, 16); o += 16;
+    if (is2022) {
+        rx[o++] = 1; memset(rx + o, 0, 8); o += 8;
+        memcpy(rx + o, reqsalt, 16); o += 16;
+        rx[o++] = (unsigned char)(plen >> 8); rx[o++] = (unsigned char)plen;
+        memset(rx + o, 0, 16); o += 16;
+    }
+    for (int i = 0; i < nch; i++) {
+        if (!(is2022 && i == 0)) {
+            rx[o++] = (unsigned char)(plen >> 8); rx[o++] = (unsigned char)plen;
+            memset(rx + o, 0, 16); o += 16;
+        }
+        put_pat(rx + o, plen, (unsigned char)i);
+        put_pat(want + *want_n, plen, (unsigned char)i);
+        o += plen; *want_n += plen;
+        memset(rx + o, 0, 16); o += 16;
+    }
+    return o;
+}
+
+static void ss_down_case(const char *name, int method, int is2022, int nch, size_t plen) {
+    const struct dialer_ops *ops = &proxy_ss_dialer;
+    struct px_node n; memset(&n, 0, sizeof n);
+    n.proto = PX_SS; n.ss_method = method; n.ss_key_n = 16;
+    void *sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    struct flow_key k; memset(&k, 0, sizeof k);
+    ops->flow_open(&n, sess, &k, 0);
+    ops->connect(&n, sess, 2);
+    feed_reset(NULL, 0);
+    ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5);
+    unsigned char reqsalt[16]; memcpy(reqsalt, g_tx, 16);
+    unsigned char *rx = malloc(nch * (plen + 40) + 200), *want = malloc((size_t)nch * plen);
+    size_t want_n, rxn = ss_stream(rx, want, &want_n, is2022, reqsalt, nch, plen);
+    char t[160];
+    int rc = pump_down(ops, &n, sess, rx, rxn);
+    snprintf(t, sizeof t, "%s: поток цел при месте в кольце TUNNEL_BUF+1024 за проход", name);
+    check(t, 0, rc);
+    snprintf(t, sizeof t, "%s: отказов emit из-за места нет", name);
+    check(t, 0, g_overflow);
+    snprintf(t, sizeof t, "%s: вся нагрузка отдана", name);
+    check(t, (long)want_n, (long)g_big_n);
+    snprintf(t, sizeof t, "%s: нагрузка без искажений и в порядке", name);
+    check(t, 1, g_big_n == want_n && !memcmp(g_big, want, want_n));
+    ops->close(sess); free(sess); free(rx); free(want);
+}
+
+static void test_ss_down_room(void) {
+    ss_down_case("ss aes-gcm, куски 8158 (Xray)", SS_AES128_GCM, 0, 40, 8158);
+    ss_down_case("ss aes-gcm, куски 16383", SS_AES128_GCM, 0, 20, 0x3FFF);
+    ss_down_case("ss 2022, куски 8158", SS_2022_AES128, 1, 40, 8158);
+    ss_down_case("ss 2022, кусок 40000 больше кольца за проход", SS_2022_AES128, 1, 4, 40000);
+    ss_down_case("ss 2022, кусок 65535 (предел SIP022)", SS_2022_AES128, 1, 3, 0xFFFF);
+}
+
+static void test_vmess_down_room(void) {
+    const struct dialer_ops *ops = &proxy_vmess_dialer;
+    struct px_node n; memset(&n, 0, sizeof n);
+    n.proto = PX_VMESS; n.vmess_sec = VMESS_AES128_GCM;
+    void *sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    struct flow_key k; memset(&k, 0, sizeof k);
+    ops->flow_open(&n, sess, &k, 0);
+    ops->connect(&n, sess, 2);
+    feed_reset(NULL, 0);
+    ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5);
+    unsigned char respv = g_tx[16 + 18 + 8 + 33];      /* H[33] заголовка запроса (заглушки не шифруют) */
+    enum { NCH = 40, PL = 8158 };
+    static unsigned char rx[(2 + 16) + (4 + 16) + NCH * (2 + PL + 16)], want[NCH * PL];
+    size_t o = 0, wn = 0;
+    rx[o++] = 0; rx[o++] = 4; memset(rx + o, 0, 16); o += 16;       /* длина заголовка ответа + тег */
+    rx[o++] = respv; rx[o++] = 0; rx[o++] = 0; rx[o++] = 0; memset(rx + o, 0, 16); o += 16;
+    for (int i = 0; i < NCH; i++) {
+        size_t L = PL + 16;
+        rx[o++] = (unsigned char)(L >> 8); rx[o++] = (unsigned char)L;
+        put_pat(rx + o, PL, (unsigned char)i); put_pat(want + wn, PL, (unsigned char)i);
+        o += PL; wn += PL; memset(rx + o, 0, 16); o += 16;
+    }
+    int rc = pump_down(ops, &n, sess, rx, o);
+    check("vmess: поток цел при месте в кольце TUNNEL_BUF+1024 за проход", 0, rc);
+    check("vmess: отказов emit из-за места нет", 0, g_overflow);
+    check("vmess: нагрузка без искажений и в порядке", 1, g_big_n == wn && !memcmp(g_big, want, wn));
+    ops->close(sess); free(sess);
+}
+
 int main(void) {
     test_ss2022_big_chunk();
+    test_ss_down_room();
+    test_vmess_down_room();
     test_vmess_key_fail();
     test_http_early_bytes();
     test_trojan_udp();
