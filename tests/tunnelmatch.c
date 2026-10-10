@@ -120,6 +120,12 @@ static int g_recv_calls;
 static int g_recv_rc;                 /* что вернёт transport_read_zc: 0 или -1 (конец потока) */
 static unsigned char g_recv_buf[4096];
 static size_t g_recv_n;               /* сколько отдать при g_recv_rc == 0 (разово) */
+/* Поток-образец для проверки склейки записей клиенту: g_recv_rep раз подряд по g_recv_rep_n байт,
+ * байт номер i потока равен (i * 7 + i / 251), чтобы сдвиг или порча на краю кольца были видны. */
+static int g_recv_rep;
+static size_t g_recv_rep_n;
+static size_t g_stream_pos;
+static unsigned char stream_byte(size_t i) { return (unsigned char)(i * 7 + i / 251); }
 
 int vless_connect(const struct vless_node *node, struct transport *conn, int timeout_s) {
     (void)node; (void)timeout_s;
@@ -142,6 +148,12 @@ int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
     if (g_room_on_read != -2) { g_room = g_room_on_read; g_room_on_read = -2; }
     *got = 0;
     if (g_recv_rc) return g_recv_rc;
+    if (!g_recv_n && g_recv_rep > 0) {
+        for (size_t i = 0; i < g_recv_rep_n; i++) g_recv_buf[i] = stream_byte(g_stream_pos + i);
+        g_stream_pos += g_recv_rep_n;
+        g_recv_n = g_recv_rep_n;
+        g_recv_rep--;
+    }
     *data = g_recv_buf;
     *got = g_recv_n;
     g_recv_n = 0;
@@ -1321,6 +1333,93 @@ static void t_room_window(void) {
     dev_drain(NULL);
 }
 
+/* Склейка записей клиенту (R-147): порция чтений у узла уходит в устройство ОДНОЙ записью с разгрузкой,
+ * а не записью на каждое чтение. Устройство стенда — сокетная пара, поэтому с gso=1 каждая запись —
+ * датаграмма «заголовок разгрузки (10 байт) + IP-пакет», и видно и число записей, и их содержимое.
+ * Проверяются и перенос через край кольца повтора (вторая порция идёт через его конец), и порядок
+ * номеров, и то, что неподтверждённое лежит в кольце целиком. */
+static int tx_collect(size_t *pos, uint32_t *seq, int *bad, size_t *max_n) {
+    unsigned char p[70000];
+    int cnt = 0;
+    for (;;) {
+        ssize_t r = recv(g_dev_peer, p, sizeof(p), MSG_DONTWAIT);
+        if (r <= 0) break;
+        if (r < 10 + 40) { (*bad)++; continue; }
+        const unsigned char *ip = p + 10;
+        size_t tot = ((size_t)ip[2] << 8) | ip[3];
+        if (tot != (size_t)r - 10 || tot < 40) { (*bad)++; continue; }
+        uint32_t sq = ((uint32_t)ip[24] << 24) | ((uint32_t)ip[25] << 16) | ((uint32_t)ip[26] << 8) | ip[27];
+        size_t n = tot - 40;
+        if (!n) continue;
+        if (*seq && sq != *seq) (*bad)++;
+        *seq = sq + (uint32_t)n;
+        for (size_t i = 0; i < n; i++)
+            if (ip[40 + i] != stream_byte(*pos + i)) { (*bad)++; break; }
+        *pos += n;
+        if (n > *max_n) *max_n = n;
+        cnt++;
+    }
+    return cnt;
+}
+
+static void t_tx_batch(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "склейка записей: тестовое соединение не открылось"); return; }
+    g_tun.gso = 1;
+    g_stream_pos = 0;
+    size_t pos = 0;
+    uint32_t seq = c->our_seq;
+    int bad = 0;
+    size_t mx = 0;
+
+    g_recv_rep = 10; g_recv_rep_n = 4000;
+    drain_conn(c, &g_tun);
+    int cnt = tx_collect(&pos, &seq, &bad, &mx);
+    check(pos == 40000 && bad == 0, "склейка: все 40000 байт дошли по порядку и без порчи");
+    check(cnt == 1 && mx == 40000, "склейка: десять чтений у узла — одна запись в устройство");
+    check(c->our_seq - c->client_ack == 41000 && c->rtx.len == 41000 && !c->tx_unsent,
+          "склейка: отправленное целиком лежит в кольце повтора, неотправленного нет");
+
+    /* Клиент подтверждает всё; вторая порция ложится через конец кольца. */
+    cli_send(1001, c->our_seq, TCP_ACK, 65535, NULL, 0);
+    dev_drain(NULL);
+    check(c->rtx.len == 0, "склейка: подтверждение освободило кольцо");
+    g_recv_rep = 10; g_recv_rep_n = 4000;
+    drain_conn(c, &g_tun);
+    uint32_t head = c->rtx.head;
+    cnt = tx_collect(&pos, &seq, &bad, &mx);
+    check(pos == 80000 && bad == 0 && cnt == 1,
+          "склейка: порция через конец кольца уходит одной записью и без порчи");
+    check(head > 64 * 1024 - 40000 && /* голова ушла к краю */ c->rtx.cap == 64 * 1024, "склейка: проверка идёт через край кольца");
+
+    /* Предел записи: больше него — несколько записей, остаток не теряется. */
+    cli_send(1001, c->our_seq, TCP_ACK, 65535, NULL, 0);
+    dev_drain(NULL);
+    int save_max = g_tx_batch_max;
+    g_tx_batch_max = 16 * TUN_MSS;
+    mx = 0;
+    g_recv_rep = 10; g_recv_rep_n = 4000;
+    drain_conn(c, &g_tun);
+    cnt = tx_collect(&pos, &seq, &bad, &mx);
+    check(pos == 120000 && bad == 0 && cnt == 2 && mx == 16 * TUN_MSS,
+          "склейка: предел записи 16 сегментов — 40000 байт уходят двумя записями без потерь");
+    g_tx_batch_max = save_max;
+
+    /* Выключатель: запись на каждое чтение, как прежде. */
+    cli_send(1001, c->our_seq, TCP_ACK, 65535, NULL, 0);
+    dev_drain(NULL);
+    g_tx_nobatch = 1;
+    g_recv_rep = 4; g_recv_rep_n = 4000;
+    drain_conn(c, &g_tun);
+    cnt = tx_collect(&pos, &seq, &bad, &mx);
+    check(pos == 136000 && bad == 0 && cnt == 4, "склейка: STEER_TUN_NOTXBATCH — запись на каждое чтение");
+    g_tx_nobatch = 0;
+
+    g_tun.gso = 0;
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
 /* Вторая связь дайлера (xhttp: ответы на выгрузку) стоит в epoll цикла. Прежде освободившееся ответом место
  * замечалось, лишь когда цикл просыпался по пакету клиента, а клиент, которому отказано в окне, молчит до
  * своего таймера: выгрузка packet-up шла кусками «окно, пауза». Теперь событие связи сливает её и шлёт окно. */
@@ -2495,6 +2594,7 @@ int main(void) {
     t_server_first();
     t_room_window();
     t_aux_wake();
+    t_tx_batch();
     t_gather();
     t_gather_big();
     t_fin_window();

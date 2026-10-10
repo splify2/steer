@@ -570,10 +570,17 @@ static int tun_writev(const struct tun_dev *d, struct iovec *iov, int n) {
 
 int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
                    const unsigned char *data, size_t data_n) {
-    struct iovec iov[3];
+    return tun_write_data2(d, hdr, data, data_n, NULL, 0);
+}
+
+int tun_write_data2(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
+                    const unsigned char *data, size_t data_n,
+                    const unsigned char *data2, size_t data2_n) {
+    struct iovec iov[4];
     int n = 0;
     struct vnet_hdr vh;
-    size_t tcp_len = 20 + data_n;
+    size_t body_n = data_n + data2_n;
+    size_t tcp_len = 20 + body_n;
     /* Адреса берём из уже собранного заголовка через memcpy, а не сдвигами: в flow_key они
      * лежат в СЕТЕВОМ порядке внутри uint32_t, и сборка сдвигами дала бы верный результат
      * только на little-endian — то есть mips_24kc считал бы сумму от перевёрнутых адресов. */
@@ -603,7 +610,7 @@ int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
         vh.hdr_len = TUN_HDR_LEN;
         /* Нарезку просим только когда резать есть что: пометка GSO на сегменте в один MSS
          * лишней работы ядру не добавляет, но и смысла не несёт. */
-        if (data_n > TUN_MSS) {
+        if (body_n > TUN_MSS) {
             vh.gso_type = VNET_GSO_TCPV4;
             vh.gso_size = TUN_MSS;
         }
@@ -611,7 +618,11 @@ int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
         iov[n].iov_len = sizeof(vh);
         n++;
     } else {
-        /* Без разгрузки сумму приходится считать самим, и это проход по ВСЕМ данным. */
+        /* Без разгрузки сумму приходится считать самим, и это проход по ВСЕМ данным. Данные в
+         * двух кусках здесь не принимаются: csum_add не переносит нечётный остаток первого куска
+         * во второй, а зовущему, у которого устройство без разгрузки, второй кусок не нужен —
+         * он режет сам по MSS (stack.c, emit_to_client). */
+        if (data2_n) return -1;
         uint32_t acc = tcp_pseudo_sum(src, dst, tcp_len);
         acc = csum_add(hdr + 20, 20, acc);
         acc = csum_add(data, data_n, acc);
@@ -626,6 +637,11 @@ int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
     if (data_n) {
         iov[n].iov_base = (void *)(uintptr_t)data;
         iov[n].iov_len = data_n;
+        n++;
+    }
+    if (data2_n) {
+        iov[n].iov_base = (void *)(uintptr_t)data2;
+        iov[n].iov_len = data2_n;
         n++;
     }
     return tun_writev(d, iov, n);

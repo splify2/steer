@@ -247,6 +247,9 @@ struct conn {
      * последний раз). Ноль означает «неподтверждённого нет». */
     uint64_t rtx_at;
     uint32_t rto_ms;          /* текущий таймаут, растёт вдвое на каждый повтор */
+    /* Хвост кольца, который уже учтён (our_seq ушёл вперёд), но в устройство ещё НЕ записан: записи
+     * клиенту склеиваются до конца порции чтений у узла (tx_flush). Всегда ноль между проходами цикла. */
+    uint32_t tx_unsent;
     time_t last;
     /* --- дальше то, что проход цикла НЕ читает: только работа с пакетом и установка. --- */
     struct flow_key key;
@@ -366,6 +369,25 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
  * запись» с первой же попытки — то есть соединение, которое не читает у сервера НИКОГДА и
  * до роста не доживает. */
 #define RTX_START (32 * 1024)
+
+/* Склейка записей клиенту. Порция чтений у узла (drain_conn_reads) приносит записи TLS по 8-16 КБ, и
+ * раньше каждая уходила в устройство своим writev: на замере 8-9 КБ на запись, а ядро клиента на каждую
+ * такую запись отвечает своим подтверждением — второй вызов, чтение из TUN по 42 байта. Теперь данные
+ * ложатся в кольцо повтора сразу (как и раньше), а в устройство уходят одной записью с разгрузкой в конце
+ * порции, из самого кольца (tx_flush); ядро нарежет её по MSS. Меньше записей — меньше и подтверждений.
+ *
+ * Предел записи — 44 сегмента: 64240 байт кратно MSS, и вместе с 40 байтами заголовка влезает в
+ * шестнадцатибитную длину IP (65535). Меньшего предела причины нет; выше нельзя — длина IP. Фактически
+ * записи короче: порция ограничена окном клиента и кольцом (RTX_CAP минус CLIENT_ROOM_RESERVE, то есть
+ * ~44 КБ), и больше этого в пути не бывает.
+ *
+ * g_tx_nobatch — выключатель STEER_TUN_NOTXBATCH (как STEER_TUN_NOGSO и соседи: утверждение «стало
+ * быстрее» без возврата на прежний путь одной переменной на своём железе не проверить); g_tx_batch_max —
+ * предел записи, переменная ради стенда. Без разгрузки устройства склейки нет: там пишем по MSS сразу. */
+#define TX_BATCH_MAX (44 * TUN_MSS)
+_Static_assert(TX_BATCH_MAX + TUN_HDR_LEN <= 65535, "запись клиенту длиннее IP-пакета");
+static int g_tx_nobatch;
+static int g_tx_batch_max = TX_BATCH_MAX;
 
 /* Таймаут повтора. Растёт вдвое до секунды — на случай, если клиент действительно ушёл.
  *
@@ -1769,6 +1791,39 @@ static int emit_dgram(void *arg, const unsigned char *p, size_t n) {
     return 0;
 }
 
+/* Записать клиенту неотправленное из кольца. final == 0 — только полные записи по g_tx_batch_max, остаток
+ * ждёт следующих данных; final == 1 — всё, это конец порции. Данные берутся ИЗ КОЛЬЦА, а не оттуда, где
+ * лежали при расшифровке: те давно перезаписаны следующим чтением. Кольцо может переходить через край — тогда
+ * запись идёт двумя кусками одного пакета (tun_write_data2).
+ *
+ * Отказ записи возвращает -1 только вызывающему из emit_to_client (там он значит «клиент не принять не может,
+ * соединение разорвано»); итоговый сброс в конце порции отказ не рвёт: байты остались в кольце, our_seq на них
+ * уже ушёл, и повторит их таймер повтора — тот же путь, что у любого потерянного сегмента. */
+static int tx_flush(struct conn *c, const struct tun_dev *tun, int final) {
+    while (c->tx_unsent && (final || c->tx_unsent >= (uint32_t)g_tx_batch_max)) {
+        uint32_t n = c->tx_unsent < (uint32_t)g_tx_batch_max ? c->tx_unsent : (uint32_t)g_tx_batch_max;
+        uint32_t start = c->rtx.head + (c->rtx.len - c->tx_unsent);
+        if (start >= c->rtx.cap) start -= c->rtx.cap;
+        uint32_t first = c->rtx.cap - start;
+        if (first > n) first = n;
+        unsigned char hdr[TUN_HDR_LEN];
+        tcp_hdr_build(hdr, c->key.dst, c->key.src, c->key.dport, c->key.sport,
+                      c->our_seq - c->tx_unsent, c->client_seq, TCP_ACK | TCP_PSH, n,
+                      rcv_win_field(c));
+        uint64_t w0 = g_stats ? now_ns() : 0;
+        int wr = tun_write_data2(tun, hdr, c->rtx.buf + start, first,
+                                 c->rtx.buf, n - first);
+        if (g_stats) { g_st.tun_writes++; g_st.tun_write_ns += now_ns() - w0; }
+        if (wr != 0) {
+            TR("запись в TUN не удалась (%u байт): %s\n", n, strerror(errno));
+            c->tx_unsent = 0;
+            return -1;
+        }
+        c->tx_unsent -= n;
+    }
+    return 0;
+}
+
 /* Отдать клиенту кусок потока как TCP.
  *
  * Один вызов на кусок, без промежуточного буфера: данные уходят в устройство прямо оттуда,
@@ -1799,6 +1854,15 @@ static int emit_to_client(struct conn *c, const struct tun_dev *tun,
     }
     if (!c->rtx.len) { c->rtx_at = g_now_ns; c->rto_ms = rto_floor(); }
     rtx_push(&c->rtx, p, (uint32_t)n);
+
+    if (tun->gso && !g_tx_nobatch) {
+        /* Учтено и лежит в кольце; в устройство уйдёт одной записью (tx_flush). */
+        c->our_seq += (uint32_t)n;
+        c->tx_unsent += (uint32_t)n;
+        c->ack_due = 0;
+        if (c->tx_unsent >= (uint32_t)g_tx_batch_max) return tx_flush(c, tun, 0);
+        return 0;
+    }
 
     size_t seg = tun->gso ? (size_t)TUN_GSO_MAX : (size_t)TUN_MSS;
     size_t sent = 0;
@@ -2821,6 +2885,7 @@ static void drain_conn_reads(struct conn *c, const struct tun_dev *tun);
 
 static void drain_conn(struct conn *c, const struct tun_dev *tun) {
     drain_conn_reads(c, tun);
+    tx_flush(c, tun, 1);
     room_watch(c);
 }
 
@@ -3466,6 +3531,11 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     const char *dev = o->device;
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     g_stats = getenv("STEER_TUN_STATS") != NULL;
+    g_tx_nobatch = getenv("STEER_TUN_NOTXBATCH") != NULL;
+    if (getenv("STEER_TUN_TXBATCH")) {
+        int seg = atoi(getenv("STEER_TUN_TXBATCH"));
+        if (seg >= 1 && seg <= 44) g_tx_batch_max = seg * TUN_MSS;
+    }
 
     /* Читается ЗДЕСЬ, до запуска потоков: дальше поле только читают, и getenv в пути
      * пакета не нужен. Ноль выключает пул совсем — тогда каждый SYN платит рукопожатие,
@@ -3521,8 +3591,11 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     fprintf(stderr, LOG_I "%s -> %s\n", dev, desc);
     /* Печатается всегда: без разгрузки и без второй очереди скорость падает в разы, и знать,
      * что именно досталось, надо до замеров, а не после. */
+    char gso_says[96];
+    snprintf(gso_says, sizeof(gso_says), "включена (записи до %d КБ, суммы считает ядро)",
+             (g_tx_nobatch ? TUN_GSO_MAX : g_tx_batch_max) / 1024);
     fprintf(stderr, LOG_I "разгрузка записи в %s %s; потоков %d из %d запрошенных\n",
-            dev, queues[0].gso ? "включена (сегменты до 16 КБ, суммы считает ядро)"
+            dev, queues[0].gso ? gso_says
                                : "НЕДОСТУПНА — нарезаем по 1460 и считаем суммы сами",
             n, want);
     fprintf(stderr, LOG_I "запасных сессий к узлу: %d (STEER_TUN_SPARES)\n", g_spare_want);
