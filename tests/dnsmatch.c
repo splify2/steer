@@ -26,6 +26,17 @@
 
 static int fails;
 
+/* Подмена strdup: ruleset_add обязан пережить отказ выделения (раньше str_lower(NULL) валил резолвер).
+ * Тест линкуется с кодом резолвера одним объектом, так что наш strdup перекрывает libc. */
+static int g_strdup_fail;
+char *strdup(const char *s) {
+    if (g_strdup_fail) return NULL;
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
 static void check(const char *what, int want, int got) {
     printf("%-58s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
     if (want != got) fails++;
@@ -63,6 +74,17 @@ static void build(struct ruleset *rs, const char *const *lines) {
 }
 
 int main(void) {
+    {
+        struct ruleset rs;
+        memset(&rs, 0, sizeof(rs));
+        static const char *const raw[] = { "example.com", "=exact.example", "*.wild.example", "re:^a$" };
+        g_strdup_fail = 1;
+        for (size_t i = 0; i < sizeof(raw) / sizeof(*raw); i++)
+            check(raw[i], -1, ruleset_add(&rs, raw[i]));
+        g_strdup_fail = 0;
+        check("ruleset_add при отказе strdup: набор пуст", 0, (int)rs.n);
+        ruleset_free(&rs);
+    }
     /* Раскладка ядра — современная, без пробы nft: от неё зависит половина IPv6 каналов
      * fake-IP (dom6_ok), и стенд не должен зависеть от машины. */
     setenv("STEER_NFT_COMPAT", "modern", 1);

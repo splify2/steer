@@ -58,20 +58,23 @@ int ruleset_add(struct ruleset *rs, const char *raw) {
             return -1; /* bad pattern: skip this rule, don't crash the daemon */
         r->re_valid = 1;
         r->pattern = strdup(raw + 3);
+        if (!r->pattern) { regfree(&r->re); return -1; }
     } else if (raw[0] == '=') {
         r->type = RULE_EXACT;
         r->pattern = strdup(raw + 1);
+        if (!r->pattern) return -1;
         str_lower(r->pattern);
     } else if (strchr(raw, '*') || strchr(raw, '?')) {
         r->type = RULE_WILDCARD;
         r->pattern = strdup(raw);
+        if (!r->pattern) return -1;
         str_lower(r->pattern);
     } else {
         r->type = RULE_NAMESPACE;
         r->pattern = strdup(raw);
+        if (!r->pattern) return -1;
         str_lower(r->pattern);
     }
-    if (!r->pattern && r->type != RULE_REGEX) return -1;
     /* Запись FQDN с завершающей точкой (`foo.org.`) — законная для человека, но имя вопроса
      * из пакета собирается без неё, и такое правило не совпадало ни с чем: канал молча не
      * брал домен (I-318). Точка снимается. Если после этого не осталось ни буквы, ни цифры
