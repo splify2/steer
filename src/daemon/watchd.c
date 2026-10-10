@@ -401,7 +401,7 @@ static void watchd_lan_msg(struct watchd *w, const struct nlmsghdr *h) {
  * (ENOBUFS: события потеряны) — номера устройств раздачи сверяются с ядром заново. */
 static int watchd_drain(struct watchd *w) {
     if (w->nl < 0) return 0;
-    char buf[8192];
+    _Alignas(struct nlmsghdr) char buf[8192];
     int any = 0, lost = 0;
     ssize_t r;
     while ((r = recv(w->nl, buf, sizeof(buf), 0)) > 0 || (r < 0 && errno == ENOBUFS)) {

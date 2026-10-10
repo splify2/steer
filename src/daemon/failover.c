@@ -2136,7 +2136,7 @@ static void rv_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
     struct fo_run *r = arg;
     unsigned idx = if_nametoindex(r->rv.dev);
     int mine = 0;
-    char buf[8192];
+    _Alignas(struct nlmsghdr) char buf[8192];
     ssize_t n;
     while ((n = recv(fd, buf, sizeof(buf), 0)) > 0 || (n < 0 && errno == ENOBUFS)) {
         if (n < 0) { mine = 1; continue; }   /* события потеряны — могли быть и наши */

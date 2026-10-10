@@ -450,7 +450,7 @@ static int route_is_backstop6(const struct nlmsghdr *h) {
 static void rulewd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
     (void)l; (void)ev;
     struct rulewd *r = arg;
-    char buf[8192];
+    _Alignas(struct nlmsghdr) char buf[8192];
     int ours = 0;
     for (;;) {
         ssize_t m = recv(fd, buf, sizeof(buf), 0);
