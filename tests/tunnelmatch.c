@@ -138,6 +138,7 @@ static size_t g_recv_n;               /* сколько отдать при g_re
  * байт номер i потока равен (i * 7 + i / 251), чтобы сдвиг или порча на краю кольца были видны. */
 static int g_recv_rep;
 static size_t g_recv_rep_n;
+static int g_recv_empty;              /* сколько первых чтений вернут 0 байт при коде 0 — как съеденный служебный кадр */
 static size_t g_stream_pos;
 static unsigned char stream_byte(size_t i) { return (unsigned char)(i * 7 + i / 251); }
 
@@ -162,6 +163,7 @@ int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
     if (g_room_on_read != -2) { g_room = g_room_on_read; g_room_on_read = -2; }
     *got = 0;
     if (g_recv_rc) return g_recv_rc;
+    if (g_recv_empty > 0) { g_recv_empty--; *data = g_recv_buf; return 0; }
     if (!g_recv_n && g_recv_rep > 0) {
         for (size_t i = 0; i < g_recv_rep_n; i++) g_recv_buf[i] = stream_byte(g_stream_pos + i);
         g_stream_pos += g_recv_rep_n;
@@ -1376,6 +1378,31 @@ static int tx_collect(size_t *pos, uint32_t *seq, int *bad, size_t *max_n) {
     return cnt;
 }
 
+/* Пустое чтение не значит «сокет пуст»: у связи съеден служебный кадр (билет сессии TLS, WINDOW_UPDATE
+ * HTTP/2), а за ним в сокете лежат данные. Чтение стоит в epoll по фронту — нового события на эти данные
+ * не будет, — поэтому проход проверяет сокет poll'ом и читает дальше. Здесь сокет «готов» (байт в канале
+ * сессии), и данные после пустого чтения обязаны дойти в том же проходе. */
+static void t_empty_read(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "пустое чтение: тестовое соединение не открылось"); return; }
+    g_tun.gso = 1;
+    g_stream_pos = 0;
+    size_t pos = 0;
+    uint32_t seq = c->our_seq;
+    int bad = 0;
+    size_t mx = 0;
+    g_recv_empty = 1;
+    g_recv_rep = 3; g_recv_rep_n = 4000;
+    drain_conn(c, &g_tun);
+    g_recv_empty = 0;
+    (void)tx_collect(&pos, &seq, &bad, &mx);
+    check(pos == 12000 && bad == 0, "пустое чтение (служебный кадр) при готовом сокете: данные за ним дошли в том же проходе");
+    g_recv_rep = 0;
+    g_tun.gso = 0;
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
 static void t_tx_batch(void) {
     struct conn *c = open_conn(65535);
     if (!c) { check(0, "склейка записей: тестовое соединение не открылось"); return; }
@@ -1387,11 +1414,16 @@ static void t_tx_batch(void) {
     size_t mx = 0;
 
     g_recv_rep = 10; g_recv_rep_n = 4000;
+    /* Канал «сессии» пуст на время прохода: с непрочитанным байтом poll видит готовность всегда, и порция
+     * не кончалась бы, пока чтения не упрутся в свой предел. */
+    unsigned char hold;
+    int held = read(g_sess_pipe[0], &hold, 1) == 1;
     g_poll_calls = 0;
     drain_conn(c, &g_tun);
     int polls = g_poll_calls;
+    if (held && write(g_sess_pipe[1], &hold, 1) != 1) check(0, "канал сессии не восстановлен");
     int cnt = tx_collect(&pos, &seq, &bad, &mx);
-    check(polls == 0, "чтение у узла: десять чтений подряд без единого poll");
+    check(polls <= 1, "чтение у узла: десять чтений подряд — не больше одного poll (на конце порции, не на каждом чтении)");
     check(pos == 40000 && bad == 0, "склейка: все 40000 байт дошли по порядку и без порчи");
     check(cnt == 1 && mx == 40000, "склейка: десять чтений у узла — одна запись в устройство");
     check(c->our_seq - c->client_ack == 41000 && c->rtx.len == 41000 && !c->tx_unsent,
@@ -2612,6 +2644,7 @@ int main(void) {
     t_room_window();
     t_aux_wake();
     t_tx_batch();
+    t_empty_read();
     t_gather();
     t_gather_big();
     t_fin_window();

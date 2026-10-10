@@ -64,7 +64,15 @@ ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --
 SRV_PID=$!
 sleep 1
 
-ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" vless vl \
+# Один поток без потерь (проход, где счёт вызовов не искажает повторы): туннель под strace, считаем
+# epoll_ctl. Читающий дескриптор соединения стоит в epoll по фронту и не снимается на каждое закрытие окна
+# клиента, поэтому за 8 МБ вызовов единицы; прежде была пара DEL/ADD на каждое закрытие окна (323 на этот же
+# прогон). Без strace проверка пропускается.
+TRACE=""
+if [ "$LOSS" = 0 ] && [ "$STREAMS" = 1 ] && command -v strace >/dev/null 2>&1; then
+    TRACE="strace -f -qq -e trace=epoll_ctl -o $WORK/ctl.txt"
+fi
+ip netns exec "$NS" env STEER_TUN_STATS=1 $TRACE "$BIN" vless vl \
     --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 
@@ -116,6 +124,14 @@ dropped=0
 [ "$LOSS" != 0 ] && dropped=$(ip netns exec "$NS" nft list table inet loss 2>/dev/null |
     sed -n 's/.*packets \([0-9]*\).*/\1/p' | head -1)
 
+if [ -n "$TRACE" ]; then
+    ctl=$(wc -l < "$WORK/ctl.txt")
+    echo "  epoll_ctl за прогон: $ctl"
+    if [ "$ctl" -gt 32 ]; then
+        echo "  ОШИБКА: epoll_ctl $ctl раз за $MB МБ (ждали не больше 32): дескриптор соединения снова гасится на закрытом окне"
+        exit 1
+    fi
+fi
 echo "  повторов у туннеля:"
 grep -o 'повторов [0-9]*/с ([0-9.]* КБ/с)' "$WORK/tun.log" 2>/dev/null |
     grep -v 'повторов 0/с' | sort -u | tail -2 | sed 's/^/    /' || true
