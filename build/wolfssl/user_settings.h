@@ -65,6 +65,14 @@
  * (--enable-reproducible-build). */
 #define HAVE_REPRODUCIBLE_BUILD
 
+/* Порядок байт — по компилятору. wolfSSL берёт BIG_ENDIAN_ORDER только из WORDS_BIGENDIAN (types.h),
+ * которого у нашего рецепта нет (ни configure, ни config.h), и на big-endian цели (mips_24kc) молча
+ * считала бы SHA, HMAC и AES-GCM как на little-endian: векторы RFC на ней не сходились. Для остальных
+ * девяти целей (все little-endian) ничего не меняется. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define BIG_ENDIAN_ORDER
+#endif
+
 /* ---- TLS-стек wolfSSL: ровно то, что нужно QUIC --------------------------------------- */
 #define WOLFSSL_TLS13
 #define WOLFSSL_NO_TLS12
