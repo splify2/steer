@@ -2634,6 +2634,163 @@ static void t_spare_churn(void) {
     stack_setup(save_dl);
 }
 
+/* ---- раздача пакетов по рабочим потокам (R-146) ---------------------------------------------
+ * Хэш владельца (stack_owner) — единственное, на чём держится «обе половины соединения у одного
+ * потока»: читатель раздаёт им, рабочий проверяет им же. Проверяется то, что от него требуется:
+ *   - один владелец у всех пакетов одного соединения, что бы в них ни менялось (флаги, номера,
+ *     окно, размер, нагрузка), и у фрагментов одной датаграммы;
+ *   - соединения расходятся по рабочим ровно, а не кучей, и не по тем же признакам, что корзины
+ *     таблицы потока (иначе рабочий использовал бы 1/N корзин);
+ *   - собранная из фрагментов датаграмма уходит владельцу своей пятёрки через почту, а не
+ *     открывает вторую сессию у собравшего. */
+static size_t own_pkt(unsigned char *p, uint32_t src, uint32_t dst, unsigned proto, unsigned sport,
+                      unsigned dport, size_t pay, unsigned flags) {
+    size_t hl = proto == 6 ? 40 : 28;
+    memset(p, 0, hl + pay);
+    p[0] = 0x45;
+    p[2] = (unsigned char)((hl + pay) >> 8); p[3] = (unsigned char)(hl + pay);
+    p[8] = 64; p[9] = (unsigned char)proto;
+    memcpy(p + 12, &src, 4); memcpy(p + 16, &dst, 4);
+    p[20] = (unsigned char)(sport >> 8); p[21] = (unsigned char)sport;
+    p[22] = (unsigned char)(dport >> 8); p[23] = (unsigned char)dport;
+    if (proto == 6) { p[32] = 0x50; p[33] = (unsigned char)flags; p[24] = (unsigned char)flags; p[28] = (unsigned char)(pay); }
+    return hl + pay;
+}
+
+static void t_owner(void) {
+    static unsigned char p[2048];
+    int ok = 1;
+    /* Один и тот же поток TCP: меняются флаги, номера, окно, нагрузка — владелец один. */
+    for (unsigned nw = 2; nw <= 9; nw++) {
+        size_t n0 = own_pkt(p, 0x0100a8c0u, 0x0771cbcbu, 6, 40001, 443, 0, 0x02);
+        unsigned o = stack_owner(p, n0, nw);
+        for (unsigned fl = 0; fl < 256; fl += 17)
+            for (size_t pay = 0; pay < 1400; pay += 233) {
+                size_t n = own_pkt(p, 0x0100a8c0u, 0x0771cbcbu, 6, 40001, 443, pay, fl);
+                p[24] = (unsigned char)(fl * 3); p[28] = (unsigned char)pay; p[34] = (unsigned char)fl;
+                if (stack_owner(p, n, nw) != o) ok = 0;
+            }
+        if (o >= nw) ok = 0;
+    }
+    check(ok, "владелец: все пакеты одного соединения (флаги, номера, нагрузка) — у одного рабочего");
+
+    /* Расход: 8000 соединений от одного клиента по разным портам на 4 и 8 рабочих. */
+    for (unsigned nw = 4; nw <= 8; nw += 4) {
+        unsigned cnt[8] = { 0 };
+        unsigned char used[8][CONN_BUCKETS];
+        memset(used, 0, sizeof used);
+        for (unsigned i = 0; i < 8000; i++) {
+            size_t n = own_pkt(p, 0x0100a8c0u, 0x0771cbcbu + (i % 7) * 0x01000000u, i & 1 ? 6 : 17,
+                               30000 + i, 443 + (i % 3), 0, 0x10);
+            unsigned o = stack_owner(p, n, nw);
+            cnt[o]++;
+            struct flow_key k;
+            size_t off;
+            if (ip_parse(p, n, &k, &off) == 0) used[o][flow_hash(&k)] = 1;
+        }
+        unsigned lo = 8000, hi = 0, minb = CONN_BUCKETS;
+        for (unsigned w = 0; w < nw; w++) {
+            if (cnt[w] < lo) lo = cnt[w];
+            if (cnt[w] > hi) hi = cnt[w];
+            unsigned b = 0;
+            for (unsigned j = 0; j < CONN_BUCKETS; j++) b += used[w][j];
+            if (b < minb) minb = b;
+        }
+        printf("  %u рабочих: меньше всего %u, больше всего %u соединений из 8000; корзин у худшего %u из %d\n",
+               nw, lo, hi, minb, CONN_BUCKETS);
+        check(lo * 100 >= (8000 / nw) * 90 && hi * 100 <= (8000 / nw) * 110,
+              nw == 4 ? "владелец: 8000 соединений на 4 рабочих — доли в пределах ±10%" :
+                        "владелец: 8000 соединений на 8 рабочих — доли в пределах ±10%");
+        check(minb >= CONN_BUCKETS * 8 / 10,
+              "владелец не совпадает с корзиной таблицы: у каждого рабочего занято не меньше 80% корзин (при общем хэше было бы 1/N)");
+    }
+
+    /* Фрагменты: первый несёт порты, остальные нет, а хэш один. */
+    fr_make(3000, 1);
+    static unsigned char f1[2048], f2[2048], f3[2048];
+    fr_pkt(f1, FR_SRC, 77, 0, 1480, 1);
+    fr_pkt(f2, FR_SRC, 77, 1480, 1480, 1);
+    fr_pkt(f3, FR_SRC, 77, 2960, 48, 0);
+    int same = 1;
+    for (unsigned nw = 2; nw <= 9; nw++) {
+        unsigned a = stack_owner(f1, 20 + 1480, nw), b = stack_owner(f2, 20 + 1480, nw),
+                 c = stack_owner(f3, 20 + 48, nw);
+        if (a != b || b != c) same = 0;
+    }
+    check(same, "владелец: все фрагменты одной датаграммы — у одного рабочего");
+
+    /* Мусор не роняет: короткий, не IPv4, нулевые длины. */
+    unsigned char junk[8] = { 0x60 };
+    check(stack_owner(junk, 8, 4) == 0 && stack_owner(p, 0, 4) == 0 && stack_owner(p, 20, 1) == 0,
+          "владелец: короткий и не-IPv4 пакет и один рабочий — ноль, без чтения за границей");
+}
+
+/* Собранная из фрагментов датаграмма уходит владельцу пятёрки, а не остаётся у собравшего. */
+static void t_owner_mail(void) {
+    enum { NW = 4 };
+    struct ring_work *rws;
+    if (posix_memalign((void **)&rws, 64, NW * sizeof(*rws)) != 0) { check(0, "почта: нет памяти"); return; }
+    memset(rws, 0, NW * sizeof(*rws));
+    for (int i = 0; i < NW; i++) { pthread_mutex_init(&rws[i].mail.mu, NULL); rws[i].ring.efd = -1; }
+    struct ring_work *save_rw = g_rw;
+    unsigned save_nw = g_nwork;
+    int save_worker = g_worker;
+    g_rw = rws;
+    g_nwork = NW;
+
+    /* Подобрать отправителя, у которого владелец фрагментов (по адресам) не тот, что у пятёрки. */
+    uint32_t src = FR_SRC;
+    unsigned fo = 0, so = 0;
+    static unsigned char fp[2048];
+    for (int tries = 0; tries < 64; tries++, src += 0x01000000u) {
+        fr_make(3000, 12);
+        size_t n = fr_pkt(fp, src, 90, 0, 1480, 1);
+        fo = stack_owner(fp, n, NW);
+        static unsigned char whole[20 + 8 + 3000];
+        size_t wn = own_pkt(whole, src, FR_DST, 17, 0x9c40, 0x01bb, 3000, 0);
+        so = stack_owner(whole, wn, NW);
+        if (fo != so) break;
+    }
+    check(fo != so, "почта: нашёлся отправитель с разными владельцами фрагментов и сессии");
+
+    g_worker = (int)fo;
+    g_now_ns = 3000ull * 1000000000ull;
+    g_now_s = (time_t)(g_now_ns / 1000000000ull);
+    unsigned long long no0 = g_not_owner;
+    int live0 = g_live_n;
+    fr_make(3000, 12);
+    static unsigned char q[2048];
+    size_t n1 = fr_pkt(q, src, 90, 0, 1480, 1);   handle_packet(&g_tun, q, n1);
+    size_t n2 = fr_pkt(q, src, 90, 1480, 1480, 1); handle_packet(&g_tun, q, n2);
+    size_t n3 = fr_pkt(q, src, 90, 2960, 48, 0);   handle_packet(&g_tun, q, n3);
+    dev_drain(NULL);
+    check(g_not_owner == no0, "почта: фрагменты пришли своему рабочему — «не у владельца» не растёт");
+    check(g_live_n == live0, "почта: у собравшего сессии не появилось");
+    check(rws[so].mail.n == 1 && rws[fo].mail.n == 0,
+          "почта: собранная датаграмма лежит в почте владельца пятёрки, и только там");
+    struct xpkt *x = xmail_take(&rws[so].mail);
+    int whole_ok = x && x->n == 20 + g_fr_len && memcmp(x->d + 20, g_fr_dgram, g_fr_len) == 0 &&
+                   stack_owner(x->d, x->n, NW) == so;
+    check(whole_ok, "почта: пакет в ней — собранная датаграмма целиком, и хэш называет получателя");
+    free(x);
+
+    /* Пакет чужого рабочего считается и называется. */
+    g_worker = (int)((so + 1) % NW);
+    static unsigned char own[64];
+    size_t on = own_pkt(own, src, FR_DST, 17, 0x9c40, 0x01bb, 3000 > 40 ? 8 : 0, 0);
+    own[2] = 0; own[3] = 36;
+    unsigned char *pk = own;
+    no0 = g_not_owner;
+    handle_packet(&g_tun, pk, on);
+    dev_drain(NULL);
+    check(g_not_owner == no0 + 1, "владелец: пакет, пришедший не тому рабочему, попал в счётчик");
+
+    g_rw = save_rw;
+    g_nwork = save_nw;
+    g_worker = save_worker;
+    free(rws);
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -2675,6 +2832,8 @@ int main(void) {
     t_fin_window();
     t_udp_early_bounds();
     t_udp_defrag();
+    t_owner();
+    t_owner_mail();
     t_udp_big();
     t_early_window();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");

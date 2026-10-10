@@ -46,11 +46,13 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 
 #include "tun.h"
 #include "rtx.h"
+#include "spsc.h"
 #include "dialer.h"
 #include "stack.h"
 #include "spec.h"
@@ -671,11 +673,11 @@ static int client_can_take_record(struct conn *c) {
 /* ВСЁ изменяемое состояние — у каждого потока своё (__thread).
  *
  * Общая таблица под мьютексом означала бы замок на каждый пакет, а пакетов семьсот на
- * мегабайт: второе ядро ушло бы на борьбу за первое. Поэтому таблица потоковая — и поэтому
- * же потоков по умолчанию ОДИН, см. worker_count.
+ * мегабайт: второе ядро ушло бы на борьбу за первое. Поэтому таблица потоковая, а пакеты до
+ * потока доставляет читатель по хэшу соединения (R-146, см. g_rw).
  *
- * ЗДЕСЬ СТОЯЛО, что ядро раскладывает пакеты по очередям устройства, хэшируя поток
- * симметрично, поэтому обе половины одного TCP-соединения всегда попадают одному потоку, —
+ * ИСТОРИЯ (почему пакеты раздаёт не ядро). Здесь стояло, что ядро раскладывает пакеты по очередям
+ * устройства, хэшируя поток симметрично, поэтому обе половины одного TCP-соединения всегда попадают одному потоку, —
  * со ссылкой на tun_open. Утверждение неверное, и ссылка ведёт в место, где ничего такого
  * не устанавливается: tun_open только открывает N очередей с IFF_MULTI_QUEUE, никакой
  * программы распределения (TUNSETSTEERINGEBPF) не ставит и вообще про распределение не
@@ -685,6 +687,9 @@ static int client_can_take_record(struct conn *c) {
  * соединения: таблица-то потоковая. Подтверждения клиента не доходят до владельца
  * соединения, client_ack не двигается, client_can_take_record навсегда ложно — и владелец
  * перестаёт читать у сервера. Соединение живо в таблице и не несёт ничего.
+ *
+ * Это и было причиной прежнего умолчания в ОДИН поток; с читателем раздача по соединению
+ * гарантируется самим кодом, а не ядром.
  *
  * Замерено на роутере (Filogic, два ядра, VLESS, speedtest через туннель): при двух
  * очередях один поток держал 44 соединения при ОДНОМ витке в секунду, нуле МБ/с и 39
@@ -755,10 +760,155 @@ static unsigned g_nodes_epoch;
 
 void stack_nodes_changed(void) { __atomic_add_fetch(&g_nodes_epoch, 1, __ATOMIC_RELEASE); }
 
-/* Поток цикла один (STEER_TUN_THREADS не задан): тогда соединения, которого нет в таблице, нет вовсе,
- * и на его данные можно ответить RST (handle_packet). При нескольких потоках половина соединения
- * бывает в чужой очереди (см. worker_count), и RST убил бы живое. */
+/* Соединение, которого нет в таблице, ответа RST заслуживает, когда ВЛАДЕЛЕЦ соединения — этот самый
+ * поток, то есть когда нет второго потока, у которого оно могло бы быть. Так при одном потоке цикла
+ * и так при нескольких: читатель раздаёт пакеты по хэшу соединения (stack_owner), и «нет в таблице»
+ * у владельца значит «нет вообще». До R-146 при нескольких потоках половина соединения бывала в
+ * чужой очереди TUN, и RST убил бы живое; теперь это невозможно по построению, а счётчик
+ * g_not_owner (ниже) покажет, если построение нарушено. Остался флагом, чтобы стенд мог выключить
+ * ответ. */
 static int g_one_worker = 1;
+
+/* ---- несколько рабочих потоков: раздача пакетов (R-146) ----------------------------------------
+ *
+ * УСТРОЙСТВО. Один поток (читатель, это поток stack_run) читает единственную очередь TUN и по хэшу
+ * соединения кладёт каждый пакет в кольцо одного из N рабочих (spsc.h). Рабочий — прежний worker_loop:
+ * своя таблица соединений, свой epoll, свои сокеты узла, ответы клиенту он пишет в TUN сам (запись в
+ * дескриптор устройства из нескольких потоков безопасна: один write — один пакет, ядро берёт
+ * очередь устройства по-пакетно). Решение владельца: «ядра = потоки», вариант А.
+ *
+ * ПОЧЕМУ НЕ ОЧЕРЕДИ УСТРОЙСТВА, КАК БЫЛО ДО R-146. Ядро раскладывает пакеты по очередям IFF_MULTI_QUEUE
+ * хэшем потока, но обе половины одного соединения оно к одной очереди не привязывает (12 против
+ * 292 Мбит/с на роутере, подробно — у g_conns). Читатель привязывает: ключ — адреса, протокол и порты
+ * из заголовка пакета КЛИЕНТА, а у всех пакетов одного соединения от клиента он один. Ответы идут не
+ * через читателя вовсе — их порождает владелец.
+ *
+ * ПОРЯДОК В ВИТКЕ РАБОЧЕГО ВАЖЕН (отчёт по R-147/R-148). Сначала разбирается кольцо пакетов от
+ * читателя — подтверждения клиента открывают окно, — и только потом проход по rx_ready/rx_dirty (чтение
+ * у узла). Подтверждение соединения всегда разбирает тот же поток, что читает его сокет, — по хэшу.
+ *
+ * ЧТО ХЭШ НЕ ЛОВИТ — ФРАГМЕНТЫ. Ядро клиента режет UDP-датаграмму крупнее MTU, и в продолжении нет
+ * портов: хэш по адресам и протоколу, как у ядра Linux. Датаграмму собирает тот, кому достались куски
+ * (g_frag у него своя), и дальше она уходит ВЛАДЕЛЬЦУ по обычному хэшу через почту (xmail) — иначе
+ * сессия того же потока, пришедшая нефрагментированными датаграммами, жила бы у одного рабочего, а
+ * собранные — у другого: два соединения к узлу на один поток клиента, для QUIC это смена пути.
+ * Через почту же идёт и пакет, не влезающий в слот кольца (устройству подняли MTU): путь
+ * медленный (malloc), зато правильный, и порядок с кольцом он не сохраняет — для TCP это
+ * переупорядочение, которое клиент переживёт, а редкость случая — повышенный MTU.
+ *
+ * ЦИФРЫ. Слотов в кольце RING_SLOTS = 256 по 1536 байт (данные до 1528: пакет по MTU 1500 влезает с
+ * запасом) — 384 КБ на рабочего. Под нагрузкой тронутся все страницы: на двухъядерном роутере это
+ * 768 КБ, на восьмиядерном хосте 3 МБ. 256 — с запасом на то, что ядро отдаёт склеенный кадр
+ * (rx_gso) до 64 КБ, то есть до 45 пакетов разом, а рабочий разбирает по TUN_DRAIN_MAX = 64 за
+ * виток. Переполнение не блокирует читателя: пакет отбрасывается и считается (g_rd_full).
+ * Почты: до XMAIL_MAX = 64 пакетов на рабочего; больше — отбрасываются (UDP-потеря обычна), причина
+ * числа та же, что у DEFRAG_SLOTS: 16 сборок в работе, по ≤ 64 КБ, не больше четырёх-пяти
+ * датаграмм на сборку в ожидании. */
+#define RING_SLOTS 256u
+#define RING_SLOT_DATA (1536u - SPSC_HDR)
+#define XMAIL_MAX 64u
+
+struct xpkt {
+    struct xpkt *next;
+    uint32_t n;
+    unsigned char d[];
+};
+struct xmail {
+    pthread_mutex_t mu;
+    struct xpkt *head, *tail;
+    unsigned n;
+    unsigned long long dropped;
+};
+
+/* Рабочий потока в режиме с читателем. Заполняется до пуска читателя и дальше только читается,
+ * кроме полей-счётчиков, у каждого из которых один писатель. */
+struct ring_work {
+    struct spsc ring;
+    struct xmail mail;
+    /* Счётчики читателя (пишет только он). */
+    unsigned long long rd_pkts, rd_full;
+};
+static struct ring_work *g_rw;          /* NULL — режим одного потока, без читателя */
+static unsigned g_nwork = 1;            /* рабочих; задаётся до запуска читателя */
+
+/* Хэш пакета клиента -> номер рабочего. Читатель считает его по сырым байтам, рабочий проверяет
+ * тем же по тому же пакету (handle_packet), поэтому разошедшиеся «читатель» и «владелец» — это
+ * ошибка кода, а не гонка, и счётчик g_not_owner её показывает.
+ *
+ * Ключ: источник, назначение, протокол и порты (для TCP и UDP без фрагментации). Фрагмент — по
+ * адресам и протоколу, потому что в продолжении портов нет, а у первого куска они есть и дали бы
+ * ДРУГОЙ рабочий, чем у остальных кусков: хэш обязан быть одним на всю датаграмму.
+ *
+ * Сжатие в номер — умножением на старшие биты (fast range), а не остатком: младшие биты хэша
+ * здесь не используются, и у flow_hash (корзины таблицы потока) свои; остаток от степени двойки
+ * совпал бы с его корзинами, и каждый рабочий занял бы только 1/N своих корзин. */
+static inline uint32_t mix32(uint32_t h) {
+    h ^= h >> 16; h *= 0x85EBCA6Bu;
+    h ^= h >> 13; h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    return h;
+}
+static unsigned stack_owner(const unsigned char *p, size_t n, unsigned nw) {
+    if (nw <= 1 || n < 20 || (p[0] >> 4) != 4) return 0;   /* не IPv4: разберёт и откажет любой */
+    size_t ihl = (size_t)(p[0] & 0x0F) * 4;
+    uint32_t src, dst;
+    memcpy(&src, p + 12, 4);
+    memcpy(&dst, p + 16, 4);
+    uint32_t h = mix32(src ^ mix32(dst + p[9]));
+    int frag = (((p[6] << 8) | p[7]) & 0x3FFF) != 0;
+    if (!frag && (p[9] == 6 || p[9] == 17) && ihl >= 20 && n >= ihl + 4) {
+        uint32_t ports;
+        memcpy(&ports, p + ihl, 4);
+        h = mix32(h ^ ports);
+    }
+    return (unsigned)(((uint64_t)h * nw) >> 32);
+}
+
+/* Останов режима с читателем: ставит читатель (ошибка устройства) или вышедший рабочий. */
+static int g_ring_stop;
+
+/* Пакеты не у владельца: пришли рабочему, которому по хэшу не принадлежат. Должно быть 0 всегда.
+ * Печатается в строке статистики и, не чаще раза в 5 с, предупреждением. */
+static __thread unsigned long long g_not_owner;
+/* Пакетов из кольца за всё время (для распределения нагрузки в статистике). */
+static __thread unsigned long long g_ring_pkts;
+
+/* Положить пакет в почту рабочего o и разбудить его. 0 — положен. */
+static int xmail_put(unsigned o, const unsigned char *pkt, size_t n) {
+    struct ring_work *w = &g_rw[o];
+    struct xpkt *x = malloc(sizeof(*x) + n);
+    if (!x) return -1;
+    x->next = NULL;
+    x->n = (uint32_t)n;
+    memcpy(x->d, pkt, n);
+    pthread_mutex_lock(&w->mail.mu);
+    if (w->mail.n >= XMAIL_MAX) {
+        w->mail.dropped++;
+        pthread_mutex_unlock(&w->mail.mu);
+        free(x);
+        return -1;
+    }
+    if (w->mail.tail) w->mail.tail->next = x; else w->mail.head = x;
+    w->mail.tail = x;
+    __atomic_store_n(&w->mail.n, w->mail.n + 1, __ATOMIC_RELAXED);   /* без замка читает владелец */
+    pthread_mutex_unlock(&w->mail.mu);
+    if (w->ring.efd >= 0) {
+        uint64_t one = 1;
+        ssize_t wr = write(w->ring.efd, &one, sizeof(one));
+        (void)wr;
+    }
+    return 0;
+}
+
+/* Забрать всю почту разом: цепочка, которую владелец разбирает и освобождает сам. */
+static struct xpkt *xmail_take(struct xmail *m) {
+    pthread_mutex_lock(&m->mu);
+    struct xpkt *l = m->head;
+    m->head = m->tail = NULL;
+    __atomic_store_n(&m->n, 0, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&m->mu);
+    return l;
+}
 
 /* ПОРОГ МОЛЧАНИЯ УЗЛА (struct dialer, silence_s) — сокету связи, как только связь отдана соединению.
  *
@@ -914,7 +1064,8 @@ static void stats_dump(uint64_t window_ns) {
             "предел чтения %.0f/с | соединений %u | повторов %.0f/с (%.0f КБ/с) | "
             "потеряно датаграмм %.0f/с | подтверждений придержано %.0f/с | "
             "окно клиента %u..%u (масштаб %u), в пути до %u | порог повтора %u мс | "
-            "чтение у сервера %.0f%% | разбор из TUN %.0f%% | чтение из TUN %.0f%%\n",
+            "чтение у сервера %.0f%% | разбор из TUN %.0f%% | чтение из TUN %.0f%% | "
+            "из кольца всего %llu | не у владельца всего %llu\n",
             g_worker,
             (double)g_st.rec_bytes / s / 1048576.0,
             (double)g_st.iters / s,
@@ -932,7 +1083,8 @@ static void stats_dump(uint64_t window_ns) {
             g_st.wscale_seen, g_st.inflight_max, rto_floor(),
             100.0 * (double)g_st.recv_ns / (double)window_ns,
             100.0 * (double)g_st.pkt_ns / (double)window_ns,
-            100.0 * (double)g_st.tun_read_ns / (double)window_ns);
+            100.0 * (double)g_st.tun_read_ns / (double)window_ns,
+            g_ring_pkts, g_not_owner);
     memset(&g_st, 0, sizeof(g_st));
     g_st.win_min = 0xFFFFFFFFu;
 }
@@ -1734,10 +1886,17 @@ static int early_reserve(struct conn *c, size_t need) {
 
 /* ---- UDP -------------------------------------------------------------------- */
 /* Номер IP-пакета для датаграмм, отдаваемых клиенту. Осмыслен только при нарезке: по нему
- * клиент склеивает фрагменты одной датаграммы и не путает их с чужими. Свой у каждого
- * потока обработки — общий счётчик означал бы борьбу за строку кэша ради числа, которое
- * никому не важно, кроме сборщика фрагментов. */
-static __thread uint16_t g_ip_id;
+ * клиент склеивает фрагменты одной датаграммы и не путает их с чужими.
+ *
+ * ОДИН НА ПРОЦЕСС, а не на поток, и это изменено ради нескольких рабочих потоков (R-146). Сборка
+ * у клиента идёт по тройке «адрес источника, адрес назначения, номер» — а источник у всех потоков
+ * один и тот же (адрес, который клиент считает адресом сервера), и клиент один. Два рабочих с
+ * независимыми счётчиками рано или поздно выдавали ОДИН номер двум разным датаграммам для одного
+ * клиента, и тот склеивал куски чужих: молча испорченная датаграмма. Счётчик общий; атомарный
+ * инкремент без порядка стоит одной команды и берётся только при нарезке (датаграмма крупнее
+ * MTU — редкость), так что борьбы за строку кэша нет. */
+static uint16_t g_ip_id;
+static uint16_t ip_id_next(void) { return __atomic_add_fetch(&g_ip_id, 1, __ATOMIC_RELAXED); }
 
 /* Самая большая датаграмма, которую несёт текущий дайлер (dialer_ops.dgram_max). */
 static size_t dgram_limit(void) {
@@ -1784,7 +1943,7 @@ static int emit_dgram(void *arg, const unsigned char *p, size_t n) {
     struct emit_ctx *e = arg;
     struct conn *c = e->c;
     if (udp_write_to_client(e->tun, c->key.dst, c->key.src, c->key.dport, c->key.sport,
-                            p, n, ++g_ip_id) != 0)
+                            p, n, ip_id_next()) != 0)
         return -1;
     TR("клиенту датаграмма %zu байт\n", n);
     /* Метка времени двигается на КАЖДОЙ датаграмме, а не только на пакетах клиента:
@@ -2020,12 +2179,11 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun, size_t *rx
  * IPv6 и как делает Linux для IPv4 в режиме без перекрытий. Для UDP потеря датаграммы —
  * штатный исход.
  *
- * Несколько потоков обработки (STEER_TUN_THREADS > 1): таблица своя у каждого потока.
- * Ядро выбирает очередь TUN по хэшу потока, а у фрагментированного пакета хэш считается
- * только по адресам — без портов, и у первого фрагмента тоже, — поэтому все куски одной
- * датаграммы попадают в одну очередь. Это свойство ядра Linux, на стенде с несколькими
- * очередями не проверялось; если очереди разойдутся, датаграмма потеряется по сроку, а не
- * соберётся неверно. */
+ * Несколько рабочих потоков: таблица сборки своя у каждого. Читатель TUN раздаёт фрагменты по
+ * хэшу адресов и протокола БЕЗ портов (stack_owner) — у первого куска порты есть, у остальных
+ * нет, и хэш по портам развёл бы куски одной датаграммы. Поэтому все куски приходят одному
+ * рабочему, он собирает, а готовую датаграмму отдаёт владельцу её пятёрки (xmail, см. g_rw).
+ * Проверяется стендом tests/tunnelmatch.c (t_owner, t_owner_mail). */
 #define DEFRAG_SLOTS  16
 #define DEFRAG_TTL_NS 30000000000ull
 #define DEFRAG_MAXLEN (8 + UDP_DGRAM_ABS)           /* UDP-датаграмма целиком, с заголовком */
@@ -2409,6 +2567,20 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
     struct flow_key k;
     size_t off = 0;
 
+    /* Пакет обязан принадлежать этому рабочему по тому же хэшу, которым его раздал читатель (R-146).
+     * Не принадлежит — ошибка раздачи: половина соединения не у владельца, и подтверждения до него не
+     * дойдут (то самое зависание, ради которого потоки были выключены). Пакет всё равно
+     * разбирается, как прежде, а ошибка считается и называется в журнале. */
+    if (g_rw && stack_owner(pkt, n, g_nwork) != (unsigned)g_worker) {
+        g_not_owner++;
+        static __thread time_t said_no;
+        if (g_now_s - said_no >= 5) {
+            said_no = g_now_s;
+            fprintf(stderr, LOG_W "пакет пришёл рабочему %d, которому он не принадлежит "
+                            "(всего %llu) — ошибка раздачи по потокам\n", g_worker, g_not_owner);
+        }
+    }
+
     /* Фрагменты UDP собираем ДО разбора: у продолжения нет заголовка UDP, и разбирать в нём
      * нечего — ip_parse такой пакет и не примет. Собранное выглядит обычным пакетом и идёт
      * дальше общим путём, поэтому знать про фрагменты больше никому не нужно. */
@@ -2420,6 +2592,13 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         TR("датаграмма собрана из фрагментов: %zu байт\n", an);
         pkt = asm_pkt;
         n = an;
+        /* Собрана у того, кому достались куски, а владелец сессии — по хэшу пятёрки, и это может быть
+         * другой рабочий (см. «что хэш не ловит» у g_rw). Отдаём ему целиком; сюда же она вернётся
+         * уже без признаков фрагмента, и тот же хэш назовёт его самого. */
+        if (g_rw) {
+            unsigned o = stack_owner(pkt, n, g_nwork);
+            if (o != (unsigned)g_worker) { xmail_put(o, pkt, n); return; }
+        }
     }
 
     if (ip_parse(pkt, n, &k, &off) != 0) { TR("пакет не разобран (%zu байт)\n", n); return; }
@@ -3141,6 +3320,14 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
 struct worker {
     struct tun_dev tun;
     int id;
+    /* Кольцо и почта этого рабочего; NULL — прежний путь: поток сам читает свою очередь TUN. В
+     * режиме с читателем дескриптор TUN общий и принадлежит читателю: рабочий только пишет в него и
+     * не закрывает. */
+    struct ring_work *rw;
+    /* Дошёл ли поток до цикла (1) или отказал при подготовке (2); пока 0 — ещё готовится. Читатель
+     * не запускается, пока все рабочие не доложили: число рабочих и их номера должны быть
+     * окончательны до первого пакета. */
+    int state;
     /* Дошёл ли поток до цикла, то есть нёс ли эта очередь трафик хоть секунду. Нужно
      * ровно для одного: различить в журнале «туннель не поднялся» и «туннель работал и
      * умер». Для кода выхода разницы нет — он в обоих случаях ненулевой. */
@@ -3151,6 +3338,9 @@ static void *worker_loop(void *arg) {
     struct worker *w = arg;
     struct tun_dev tun = w->tun;
     int tun_fd = tun.fd;
+    struct ring_work *rw = w->rw;
+    /* Общий дескриптор TUN закрывает читатель (stack_run), а не рабочий. */
+    int own_tun = rw == NULL;
     g_worker = w->id;
 
     g_st.win_min = 0xFFFFFFFFu;
@@ -3164,7 +3354,8 @@ static void *worker_loop(void *arg) {
     if (conn_table_init() != 0) {
         fprintf(stderr, LOG_W "нет памяти под таблицу соединений (%s) — поток не запущен, "
                         "очередь отдана остальным\n", strerror(errno));
-        close(tun_fd);
+        if (own_tun) close(tun_fd);
+        __atomic_store_n(&w->state, 2, __ATOMIC_RELEASE);
         return NULL;
     }
     unsigned char pkt[TUNNEL_BUF];
@@ -3196,14 +3387,16 @@ static void *worker_loop(void *arg) {
         fprintf(stderr, LOG_W "epoll недоступен (%s) — поток не запущен, "
                         "очередь отдана остальным\n", strerror(errno));
         conn_table_free();
-        close(tun_fd);
+        if (own_tun) close(tun_fd);
+        __atomic_store_n(&w->state, 2, __ATOMIC_RELEASE);
         return NULL;
     }
     /* Метки TUN и eventfd не могут совпасть с номером соединения: слотов MAX_CONNS,
      * метки выше. */
     const uint32_t TUN_TOKEN = MAX_CONNS;
     const uint32_t EFD_TOKEN = MAX_CONNS + 1;
-    {
+    /* С читателем (rw) в epoll рабочего устройства нет: пакеты приходят в кольцо, а будит eventfd. */
+    if (own_tun) {
         struct epoll_event e = { .events = EPOLLIN, .data = { .u32 = TUN_TOKEN } };
         if (epoll_ctl(ep, EPOLL_CTL_ADD, tun_fd, &e) != 0) {
             fprintf(stderr, LOG_W "TUN не встал в epoll (%s) — поток не запущен, "
@@ -3223,10 +3416,18 @@ static void *worker_loop(void *arg) {
         if (epoll_ctl(ep, EPOLL_CTL_ADD, efd, &e) != 0) { close(efd); efd = -1; }
     }
     g_conn_efd = efd;
+    /* Читатель будит этот же eventfd: побудка от установщика и от читателя — одно и то же «проснись и
+     * посмотри», а разбор всего сразу — в витке. Ставится ДО state: читатель не начнёт, пока не доложат
+     * все, и увидит дескриптор. */
+    if (rw) rw->ring.efd = efd;
     struct epoll_event evs[MAX_CONNS + 2];
     w->served = 1;      /* очередь встала в epoll — дальше она несёт трафик */
+    __atomic_store_n(&w->state, 1, __ATOMIC_RELEASE);
 
     for (;;) {
+        /* Читатель ушёл (ошибка устройства) или другой рабочий упал: выходим и мы, чтобы процесс
+         * завершился целиком и procd поднял его заново, а не держал половину рабочих. */
+        if (rw && __atomic_load_n(&g_ring_stop, __ATOMIC_RELAXED)) break;
         /* Время снимается ОДИН раз на виток и лежит в g_now_ns/g_now_s — почему, написано
          * там же, у их объявления. */
         uint64_t now = now_ns();
@@ -3340,7 +3541,19 @@ static void *worker_loop(void *arg) {
         /* Событий за виток может прийти на одно больше, чем соединений: TUN и побудка — тоже
          * дескрипторы. Меньший предел не терял бы событие (уровневый epoll покажет его
          * снова), но откладывал бы его на виток, а откладывать здесь нечего. */
+        /* Кольцо от читателя. Спать можно, только объявив себя спящим и проверив кольцо ещё раз
+         * (spsc_sleep_begin): иначе пакет, пришедший между проверкой и сном, будил бы нас лишь со
+         * следующим. Почта будит безусловно (eventfd уровневый), ей проверки достаточно. Без eventfd
+         * (ядро не дало) будить нечем — просыпаемся раз в миллисекунду. */
+        int sleeping = 0;
+        if (rw && wait_ms > 0) {
+            if (__atomic_load_n(&rw->mail.n, __ATOMIC_RELAXED)) wait_ms = 0;
+            else if (efd < 0) { if (wait_ms > 1) wait_ms = 1; }
+            else if (spsc_sleep_begin(&rw->ring)) sleeping = 1;
+            else wait_ms = 0;
+        }
         int r = epoll_wait(ep, evs, MAX_CONNS + 2, wait_ms);
+        if (sleeping) spsc_sleep_end(&rw->ring);
         g_turn++;
         uint64_t after_poll = now_ns();
         loop_at = after_poll;
@@ -3390,7 +3603,37 @@ static void *worker_loop(void *arg) {
             }
         }
 
-        if (tun_ready) {
+        if (rw) {
+            /* ПЕРВЫМ — пакеты клиента от читателя, и только потом чтение у узлов (rx_ready ниже): по
+             * подтверждению открывается окно, и обратный порядок читал бы у узла на виток позже
+             * (отчёт по R-147/R-148). Порция — те же TUN_DRAIN_MAX пакетов, что и у прямого чтения:
+             * на неё рассчитан буфер сборки g_up. */
+            int k = 0;
+            struct xpkt *mail = __atomic_load_n(&rw->mail.n, __ATOMIC_RELAXED) ? xmail_take(&rw->mail) : NULL;
+            while (mail) {
+                struct xpkt *x = mail;
+                mail = x->next;
+                handle_packet(&tun, x->d, x->n);
+                free(x);
+                k++;
+            }
+            uint32_t rn;
+            const unsigned char *rp;
+            uint64_t t1 = 0;
+            while (k < TUN_DRAIN_MAX && (rp = spsc_peek(&rw->ring, &rn)) != NULL) {
+                if (g_stats) t1 = now_ns();
+                handle_packet(&tun, rp, rn);
+                spsc_pop(&rw->ring);
+                g_ring_pkts++;
+                if (g_stats) { g_st.tun_reads++; g_st.pkt_ns += now_ns() - t1; }
+                k++;
+            }
+            if (k) {
+                g_tun_backlog = k == TUN_DRAIN_MAX;
+                up_flush(&tun);
+                flush_acks(&tun);
+            }
+        } else if (tun_ready) {
             /* ВЫЧЕРПЫВАЕМ устройство, а не читаем по пакету за проход.
              *
              * Во время скачивания из TUN приходят подтверждения клиента, и именно они
@@ -3516,40 +3759,129 @@ static void *worker_loop(void *arg) {
     if (efd >= 0) close(efd);
     g_conn_efd = -1;
     close(ep);
-    close(tun_fd);
+    if (own_tun) close(tun_fd);
+    /* Рабочий вышел — читателю больше некому отдавать, и процесс должен завершиться. */
+    if (rw) __atomic_store_n(&g_ring_stop, 1, __ATOMIC_RELAXED);
     return NULL;
 }
 
-/* Сколько потоков поднимать.
+/* Читатель: единственный, кто читает TUN в режиме с несколькими рабочими. Читает до пустоты,
+ * считает хэш соединения, копирует пакет в кольцо владельца и будит его, если он спит. Крутится в
+ * потоке stack_run (так процесс остаётся тем, чем был для procd: вышел цикл — вышел процесс).
  *
- * По числу ядер, но не больше MAX_WORKERS: на двухъядерной коробке третий поток только
- * добавил бы переключений. Один поток на ядро, а не больше, потому что цикл почти всё время
- * либо ждёт в poll, либо считает — очередь на процессоре ему не помогает.
+ * Ничего не ждёт: кольцо полно — пакет отбрасывается и считается. Ждать значило бы остановить
+ * чтение для всех рабочих из-за одного медленного, а TCP повторит потерянное сам.
  *
- * STEER_TUN_THREADS задаёт число вручную. Нужно ровно для того же, для чего STEER_TUN_NOGSO:
- * «стало быстрее от второго ядра» — утверждение, которое надо уметь перепроверить, вернувшись
- * к одному потоку на том же железе. */
-#define MAX_WORKERS 4
+ * Выход — только по ошибке устройства или останову рабочего (g_ring_stop): штатно процесс умирает от
+ * сигнала. */
+#define READER_BATCH 256
+static void reader_loop(struct tun_dev *t, struct ring_work *rws, int nw) {
+    unsigned char pkt[TUNNEL_BUF];
+    struct pollfd pf = { .fd = t->fd, .events = POLLIN };
+    uint64_t stats_at = now_ns(), said_full = 0;
+    unsigned long long last_pkts = 0, last_full = 0;
+    uint64_t busy_ns = 0;
+    for (;;) {
+        if (__atomic_load_n(&g_ring_stop, __ATOMIC_RELAXED)) return;
+        uint64_t t0 = g_stats ? now_ns() : 0;
+        int drained = 0;     /* устройство отдало EAGAIN: пусто */
+        for (int k = 0; k < READER_BATCH; k++) {
+            ssize_t rn = tun_read_packet(t, pkt, sizeof(pkt));
+            if (rn < 0) {
+                if (errno == EAGAIN || errno == EINTR) { drained = 1; break; }
+                fprintf(stderr, LOG_W "чтение из TUN отказало (%s) — туннель останавливается\n",
+                        strerror(errno));
+                __atomic_store_n(&g_ring_stop, 1, __ATOMIC_RELAXED);
+                return;
+            }
+            if (rn == 0) continue;
+            unsigned o = stack_owner(pkt, (size_t)rn, (unsigned)nw);
+            struct ring_work *w = &rws[o];
+            if ((size_t)rn > spsc_cap(&w->ring)) {
+                /* Не влезает в слот: почта, медленный путь (см. «цифры» у g_rw). */
+                if (xmail_put(o, pkt, (size_t)rn) == 0) w->rd_pkts++; else w->rd_full++;
+                continue;
+            }
+            unsigned char *slot = spsc_reserve(&w->ring);
+            if (!slot) {
+                w->rd_full++;
+                if (now_ns() - said_full > 5000000000ull) {
+                    said_full = now_ns();
+                    fprintf(stderr, LOG_W "кольцо рабочего %u переполнено: пакеты отбрасываются (всего "
+                                    "%llu) — рабочий не успевает\n", o, w->rd_full);
+                }
+                continue;
+            }
+            memcpy(slot, pkt, (size_t)rn);
+            spsc_commit(&w->ring, (uint32_t)rn);
+            w->rd_pkts++;
+        }
+        if (g_stats) {
+            uint64_t t1 = now_ns();
+            busy_ns += t1 - t0;
+            if (t1 - stats_at >= 2000000000ull) {
+                unsigned long long pk = 0, full = 0;
+                char per[256] = "";
+                size_t pl = 0;
+                for (int i = 0; i < nw; i++) {
+                    pk += rws[i].rd_pkts;
+                    full += rws[i].rd_full;
+                    if (pl < sizeof(per) - 24)
+                        pl += (size_t)snprintf(per + pl, sizeof(per) - pl, "%s%llu", i ? " " : "",
+                                               rws[i].rd_pkts);
+                }
+                double sec = (double)(t1 - stats_at) / 1e9;
+                fprintf(stderr, "tun-reader: пакетов %.0f/с | занят %.0f%% | кольцо переполнено %llu "
+                                "(за период %llu) | по рабочим всего [%s]\n",
+                        (double)(pk - last_pkts) / sec, 100.0 * (double)busy_ns / (double)(t1 - stats_at),
+                        full, full - last_full, per);
+                last_pkts = pk;
+                last_full = full;
+                busy_ns = 0;
+                stats_at = t1;
+            }
+        }
+        if (!drained) continue;
+        /* Пусто — ждём пакет, но не вечно: раз в секунду проверяем останов рабочих. */
+        if (poll(&pf, 1, 1000) < 0 && errno != EINTR) {
+            fprintf(stderr, LOG_W "poll по TUN отказал (%s) — туннель останавливается\n", strerror(errno));
+            __atomic_store_n(&g_ring_stop, 1, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+}
 
-/* Сколько потоков цикла заводить, и почему по умолчанию ОДИН.
+/* Сколько рабочих потоков поднимать (R-146): по числу ядер, которыми процесс вправе пользоваться.
  *
- * Поток на ядро выглядит очевидной победой, и цена этого выбора была спрятана в
- * предположении, которого ядро не выполняет: что обе половины одного TCP-соединения
- * попадут в одну очередь устройства (разбор — у g_conns). Не попадают, и тогда владелец
- * соединения не видит подтверждений клиента и перестаёт читать у сервера. На роутере это
- * дало 12 Мбит против 292 на одной очереди и зависание коробки под speedtest.
+ * Решение владельца — «пусть ядра = потоки». Считаем ядра, которые процесс действительно может занять:
+ * min(онлайн, число в маске affinity). Процесс под taskset на двух ядрах восьмиядерной машины с восемью
+ * рабочими получил бы борьбу за два ядра вместо работы — а на роутере с cpuset так бывает.
  *
- * Поэтому число потоков БОЛЬШЕ ОДНОГО — это осознанное включение, а не умолчание, и
- * включать его имеет смысл только там, где распределение по очередям обеспечено чем-то
- * ещё. Ключ оставлен: без возможности вернуться на прежний путь одной переменной замер
- * «стало быстрее» нельзя перепроверить на том же железе. */
+ * Читатель TUN — ещё один поток сверх этого числа: большую часть времени он спит в poll и занимает
+ * ядро только пока пакеты идут (чтение и копия в кольцо, на пакет их доли микросекунды).
+ *
+ * Одно ядро — один поток и прежний путь без читателя: раздавать там некому, а лишний поток только
+ * добавил бы переключений. STEER_TUN_THREADS=N задаёт число вручную, и STEER_TUN_THREADS=1 — это тот
+ * самый прежний путь, одной переменной: утверждение «стало быстрее от второго ядра» надо уметь
+ * перепроверить на том же железе (тот же довод, что у STEER_TUN_NOGSO). Предела сверху нет: число задаёт
+ * человек и ядра, а у каждого рабочего своя таблица в 320 соединений (MAX_CONNS), так что и
+ * соединений при N рабочих до 320 N, а не 320. */
 static int worker_count(void) {
     const char *env = getenv("STEER_TUN_THREADS");
     if (env) {
         int n = atoi(env);
-        if (n >= 1) return n < MAX_WORKERS ? n : MAX_WORKERS;
+        if (n >= 1) return n;
     }
-    return 1;
+    long on = sysconf(_SC_NPROCESSORS_ONLN);
+    int n = on < 1 ? 1 : (int)on;
+#ifdef CPU_COUNT
+    cpu_set_t cs;
+    if (sched_getaffinity(0, sizeof(cs), &cs) == 0) {
+        int a = CPU_COUNT(&cs);
+        if (a >= 1 && a < n) n = a;
+    }
+#endif
+    return n;
 }
 
 time_t stack_now_s(void) { return g_now_s; }
@@ -3598,25 +3930,20 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     /* Узел, который заведомо не годится (у VLESS — негодный UUID, I-097), модуль протокола
      * отвергает ДО этой функции, пока узел ещё можно назвать: здесь устройство уже поднимется. */
 
-    static struct worker workers[MAX_WORKERS];
-    struct tun_dev queues[MAX_WORKERS];
+    /* Одна очередь устройства, всегда: рабочие потоки получают пакеты не от ядра (IFF_MULTI_QUEUE), а от
+     * читателя (см. «несколько рабочих потоков» у g_rw). */
     int want = worker_count();
-    int n = tun_open(queues, want, dev);
-    g_one_worker = n == 1;
+    struct tun_dev q0;
+    int nq = tun_open(&q0, 1, dev);
     /* Код выхода — ОДИН, и он положительный. Возвращая сюда -40 или -41, движок отдавал
      * их main, а тот отдавал ядру: отрицательное обрезается до байта, и procd получал 216
      * или 215. Число, которое ничего не значит ни для человека, ни для splify2. Причину
      * называет tun_open своим сообщением, здесь остаётся признак отказа. */
-    if (n < 0) return 1;
-
-    for (int i = 0; i < n; i++) {
-        /* Неблокирующее чтение: цикл вычерпывает устройство до EAGAIN, и без этого флага
-         * последнее чтение засыпало бы, останавливая все соединения. */
-        int fl = fcntl(queues[i].fd, F_GETFL, 0);
-        if (fl >= 0) fcntl(queues[i].fd, F_SETFL, fl | O_NONBLOCK);
-        workers[i].tun = queues[i];
-        workers[i].id = i;
-    }
+    if (nq < 0) return 1;
+    /* Неблокирующее чтение: цикл вычерпывает устройство до EAGAIN, и без этого флага
+     * последнее чтение засыпало бы, останавливая все соединения. */
+    int fl = fcntl(q0.fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(q0.fd, F_SETFL, fl | O_NONBLOCK);
     tun_bring_up(dev, o->table);
 
     /* Устройство готово — сказать об этом модулю, а маршрут НЕ трогать.
@@ -3637,35 +3964,111 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     char desc[512];
     d->ops->describe(d->ctx, desc, sizeof(desc));
     fprintf(stderr, LOG_I "%s -> %s\n", dev, desc);
+
+    struct worker *workers = calloc((size_t)want, sizeof(*workers));
+    pthread_t *tids = calloc((size_t)want, sizeof(*tids));
+    /* Выровнено по строке кэша: в кольце головы и хвосты разнесены по строкам, и сбитое выравнивание
+     * свело бы их обратно. */
+    struct ring_work *rws = NULL;
+    if (want > 1 && posix_memalign((void **)&rws, SPSC_LINE, (size_t)want * sizeof(*rws)) == 0)
+        memset(rws, 0, (size_t)want * sizeof(*rws));
+    if (!workers || !tids || (want > 1 && !rws)) {
+        fprintf(stderr, LOG_W "нет памяти под %d рабочих потоков\n", want);
+        return 1;
+    }
+
+    int n = 1;                          /* сколько рабочих встало */
+    int started = 0;
+    int served;
+    if (want == 1) {
+        /* Прежний путь: один поток читает устройство сам, читателя и колец нет. Ничем не отличается от
+         * того, что было до R-146 (STEER_TUN_THREADS=1 и одноядерные). */
+        workers[0].tun = q0;
+        workers[0].id = 0;
+        workers[0].rw = NULL;
+    } else {
+        /* Рабочие встают ПО ОДНОМУ, и следующий — когда предыдущий доложил: номер рабочего — это его
+         * место в хэше (stack_owner), и отказавший при подготовке (нет памяти, нет epoll) не должен
+         * оставить в нумерации дыру, в которую читатель стал бы класть пакеты. */
+        int made = 0;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        /* Стек задан явно: у musl он по умолчанию 128 КБ, а цикл держит на стеке буферы и вызывает
+         * шифр и рукопожатия. Миб виртуальной памяти, трогаются только нужные страницы. */
+        pthread_attr_setstacksize(&at, 1024 * 1024);
+        for (int i = 0; i < want; i++) {
+            struct ring_work *rw = &rws[made];
+            if (spsc_init(&rw->ring, RING_SLOTS, RING_SLOT_DATA) != 0) {
+                fprintf(stderr, LOG_W "нет памяти под кольцо рабочего %d — потоков будет %d\n", i, made);
+                break;
+            }
+            pthread_mutex_init(&rw->mail.mu, NULL);
+            struct worker *w = &workers[made];
+            memset(w, 0, sizeof(*w));
+            w->tun = q0;
+            w->tun.rx = NULL;           /* читает только читатель: у рабочих буфера склейки нет */
+            w->tun.rx_gso = 0;
+            w->id = made;
+            w->rw = rw;
+            if (pthread_create(&tids[made], &at, worker_loop, w) != 0) {
+                fprintf(stderr, LOG_W "поток %d не создался, работаем без него\n", i);
+                spsc_free(&rw->ring);
+                break;
+            }
+            while (!__atomic_load_n(&w->state, __ATOMIC_ACQUIRE)) {
+                struct timespec ts = { 0, 1000000 };
+                nanosleep(&ts, NULL);
+            }
+            if (__atomic_load_n(&w->state, __ATOMIC_ACQUIRE) == 2) {
+                pthread_join(tids[made], NULL);   /* уже вышел, причину назвал сам */
+                spsc_free(&rw->ring);
+                continue;
+            }
+            made++;
+        }
+        pthread_attr_destroy(&at);
+        started = made;
+        n = made;
+        if (!made) {
+            fprintf(stderr, LOG_W "%s не поднялся ни одним рабочим потоком\n", dev);
+            return 1;
+        }
+        /* Остался один рабочий (на остальных не хватило памяти или потока) — читатель всё равно
+         * нужен: рабочий уже запущен без устройства в epoll. Хэш при одном рабочем даёт 0. */
+        g_nwork = (unsigned)made;
+        g_rw = rws;
+    }
+
     /* Печатается всегда: без разгрузки и без второй очереди скорость падает в разы, и знать,
      * что именно досталось, надо до замеров, а не после. */
     char gso_says[96];
     snprintf(gso_says, sizeof(gso_says), "включена (записи до %d КБ, суммы считает ядро)",
              (g_tx_nobatch ? TUN_GSO_MAX : g_tx_batch_max) / 1024);
-    fprintf(stderr, LOG_I "разгрузка записи в %s %s; потоков %d из %d запрошенных\n",
-            dev, queues[0].gso ? gso_says
-                               : "НЕДОСТУПНА — нарезаем по 1460 и считаем суммы сами",
-            n, want);
+    fprintf(stderr, LOG_I "разгрузка записи в %s %s; потоков %d из %d запрошенных%s\n",
+            dev, q0.gso ? gso_says
+                        : "НЕДОСТУПНА — нарезаем по 1460 и считаем суммы сами",
+            n, want, want > 1 ? " (рабочих; пакеты раздаёт читатель TUN)" : "");
     fprintf(stderr, LOG_I "запасных сессий к узлу: %d (STEER_TUN_SPARES)\n", g_spare_want);
     if (n < want)
-        fprintf(stderr, LOG_W "очередей меньше запрошенного — ядро без "
-                        "IFF_MULTI_QUEUE, работаем в один поток\n");
+        fprintf(stderr, LOG_W "рабочих потоков меньше запрошенного (%d из %d)\n", n, want);
 
-    /* Потоки со второго по последний — отдельными, первый работает в этом же. Так процесс
-     * остаётся тем, чем был для procd: если цикл завершится, завершится и процесс. */
-    for (int i = 0; i < n; i++) workers[i].served = 0;
-    pthread_t tids[MAX_WORKERS];
-    int started = 0;
-    for (int i = 1; i < n; i++) {
-        if (pthread_create(&tids[started], NULL, worker_loop, &workers[i]) != 0) {
-            fprintf(stderr, LOG_W "поток %d не создался, работаем без него\n", i);
-            close(workers[i].tun.fd);
-            continue;
+    if (want == 1) {
+        worker_loop(&workers[0]);
+        served = workers[0].served;
+    } else {
+        reader_loop(&q0, rws, n);
+        /* Читатель вышел: рабочих просим закончить (флаг уже стоит) и будим — они ждут в epoll. */
+        for (int i = 0; i < n; i++) {
+            if (rws[i].ring.efd >= 0) {
+                uint64_t one = 1;
+                ssize_t wr = write(rws[i].ring.efd, &one, sizeof(one));
+                (void)wr;
+            }
         }
-        started++;
+        for (int i = 0; i < started; i++) pthread_join(tids[i], NULL);
+        served = 1;
+        close(q0.fd);
     }
-    worker_loop(&workers[0]);
-    for (int i = 0; i < started; i++) pthread_join(tids[i], NULL);
 
     /* Досюда мы доходим ТОЛЬКО когда все очереди завершились, а завершиться они могут
      * лишь по ошибке: успешного выхода у worker_loop нет ни одного. Штатное окончание
@@ -3676,12 +4079,10 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
      * «завершился успешно» в тот момент, когда туннель не нёс трафик: интерфейс показывал
      * выход настроенным, журнал — ни одной жалобы, а сайты не открывались. Ровно тот
      * тихий сбой, который в этом коде вычищен везде, кроме этой строки. */
-    int served = 0;
-    for (int i = 0; i < n; i++) served += workers[i].served;
     if (!served)
         fprintf(stderr, LOG_W "%s не поднялся ни одной очередью из %d\n", dev, n);
     else
-        fprintf(stderr, LOG_W "%s больше не несёт трафик — все очереди (%d) "
+        fprintf(stderr, LOG_W "%s больше не несёт трафик — все потоки (%d) "
                         "завершились\n", dev, n);
     return 1;
 }
