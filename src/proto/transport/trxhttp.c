@@ -112,22 +112,9 @@ static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
      *
      * ЖДАТЬ ЗДЕСЬ НЕЛЬЗЯ. Слив ответов делается попутно с отправкой, и блокирующее чтение
      * остановило бы выгрузку до прихода ответа — то есть превратило бы поток в череду
-     * «отправил и жду». Поверх TLS ожидания и нет: tls13_read опрашивает сокет с нулевым
-     * сроком и отдаёт ноль байт, когда записи ещё нет. На голом сокете (security=none)
-     * такого поведения нет, и опрос приходится ставить самим — поэтому чтение этой связи
-     * своё, а не tr_link_read основной. */
-    if (u->link.plain) {
-        struct pollfd p = { .fd = u->link.fd, .events = POLLIN };
-        if (poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN)) { *got = 0; return 0; }
-        ssize_t r = read(u->link.fd, d, cap);
-        if (r == 0) return TR_ECLOSED;
-        if (r < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { *got = 0; return 0; }
-            return TR_EIO;
-        }
-        *got = (size_t)r;
-        return 0;
-    }
+     * «отправил и жду». Ожидания нет ни поверх TLS, ни на голом сокете (security=none): оба
+     * чтения не ждут (recv с MSG_DONTWAIT) и отдают ноль байт, когда записи ещё нет. */
+    if (u->link.plain) return tr_sock_read(u->link.fd, d, cap, got);
     return tls13_read(&u->link.tls, d, cap, got);
 }
 
