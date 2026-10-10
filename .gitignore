@@ -67,6 +67,7 @@ build/tunnelmatch
 build/xhupmatch
 build/grpcmatch
 build/wsmatch
+build/tls13readmatch
 build/tunnamematch
 build/xsconfmatch
 build/xsroutematch
