@@ -12,6 +12,7 @@
 #include "scrypto.h"
 #include "reality.h"
 #include "ech.h"
+#include "wipe.h"
 
 static unsigned be16(const uint8_t *p) { return ((unsigned)p[0] << 8) | p[1]; }
 static size_t be24(const uint8_t *p) { return ((size_t)p[0] << 16) | ((size_t)p[1] << 8) | p[2]; }
@@ -189,8 +190,8 @@ int ech_hpke_seal(const struct ech_cfg *cfg, const uint8_t *eph,
     if (pt_n) memcpy(ct, pt, pt_n);
     int rc = sc_aead_seal(&k, nonce, aad, aad_n, ct, pt_n, ct + pt_n);
     sc_aead_free(&k);
-    memset(sk, 0, sizeof sk);
-    memset(key, 0, sizeof key);
+    steer_wipe(sk, sizeof sk);
+    steer_wipe(key, sizeof key);
     return rc == 0 ? 0 : ECH_ECRYPTO;
 }
 
@@ -356,6 +357,6 @@ int ech_wrap(const struct ech_cfg *cfg, const uint8_t *hello, size_t hello_n,
     if (memcmp(enc_check, enc_key, 32) != 0) return ECH_ECRYPTO;
     memcpy(out + payload_off, ct, payload_n);
     *out_n = o.n;
-    memset(eph, 0, sizeof eph);
+    steer_wipe(eph, sizeof eph);
     return 0;
 }

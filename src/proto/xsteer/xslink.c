@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 
 #include "xslink.h"
+#include "wipe.h"
 
 #define LFAIL(...) do { if (err && errn) snprintf(err, errn, __VA_ARGS__); return -1; } while (0)
 
@@ -368,12 +369,12 @@ int xs_link_parse(const char *s, enum xs_role role, struct xs_conf *c, struct xs
     char perr[320];
     if (xs_conf_parse(text, (size_t)o, role, c, sec, perr, sizeof(perr)) != 0) {
         /* Приватный ключ ушёл в текст — затираем его до возврата, каким бы ни был исход. */
-        memset(text, 0, sizeof(text));
-        memset(priv, 0, sizeof(priv));
+        steer_wipe(text, sizeof(text));
+        steer_wipe(priv, sizeof(priv));
         LFAIL("ссылка разобрана, но конфигурация из неё не проходит проверку: %s", perr);
     }
-    memset(text, 0, sizeof(text));
-    memset(priv, 0, sizeof(priv));
+    steer_wipe(text, sizeof(text));
+    steer_wipe(priv, sizeof(priv));
     return 0;
 }
 
@@ -404,11 +405,11 @@ int xs_conf_load_any(const char *what, enum xs_role role, struct xs_conf *c,
         if (xs_is_link(b)) {
             if (was_link) *was_link = 1;
             int rc = xs_link_parse(b, role, c, sec, name, namen, err, errn);
-            memset(buf, 0, sizeof(buf));
+            steer_wipe(buf, sizeof(buf));
             return rc;
         }
         int rc = xs_conf_parse(buf, strlen(buf), role, c, sec, err, errn);
-        memset(buf, 0, sizeof(buf));
+        steer_wipe(buf, sizeof(buf));
         return rc;
     }
     if (xs_is_link(what)) {

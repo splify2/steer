@@ -47,6 +47,7 @@
 #include "transport.h"
 #include "reality.h"
 #include "vencp.h"
+#include "wipe.h"
 
 #define REC_MAX_DATA 8192              /* данных в записи при отправке (как у Xray: без второго copy у пира) */
 #define REC_MAX_LEN  16640             /* длина тела записи, допустимая при приёме */
@@ -90,7 +91,7 @@ static int va_init(struct v_aead *a, const void *ctx, size_t ctx_n, const void *
     sc_blake3_derive_key(k, 32, ctx, ctx_n, key, key_n);
     memset(a->nonce, 0, 12);
     int rc = sc_aead_setkey(&a->k, use_aes ? SC_AES256_GCM : SC_CHACHA20_POLY1305, k);
-    memset(k, 0, sizeof k);
+    steer_wipe(k, sizeof k);
     a->ok = rc == 0;
     return rc;
 }
@@ -116,7 +117,7 @@ static int ctr_new(struct sc_aesctr *c, const void *key, size_t key_n, const uns
     unsigned char k[32];
     sc_blake3_derive_key(k, 32, "VLESS", 5, key, key_n);
     int rc = sc_aesctr_init(c, k, iv);
-    memset(k, 0, sizeof k);
+    steer_wipe(k, sizeof k);
     return rc;
 }
 
@@ -529,9 +530,9 @@ int tr_venc_open(struct transport *t, const struct tr_node *node, int timeout_s)
 out:
     if (have_tmp) sc_aesctr_free(&tmpctr);
     if (have_last) sc_aesctr_free(&last);
-    memset(mlk_dk, 0, sizeof mlk_dk);
-    memset(xpriv, 0, sizeof xpriv);
-    memset(nfs, 0, sizeof nfs);
+    steer_wipe(mlk_dk, sizeof mlk_dk);
+    steer_wipe(xpriv, sizeof xpriv);
+    steer_wipe(nfs, sizeof nfs);
     va_free(&nfs_a);
     free(keys);
     free(hello);
