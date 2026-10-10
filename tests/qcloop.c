@@ -216,7 +216,8 @@ static uint16_t dead_port(void) {
     return ntohs(a.sin_port);
 }
 
-static void scenario_echo(const char *tag, uint64_t cli_brutal) {
+/* gso/gro: -1 — как есть (что дало ядро), 0 — выключить, 1 — включить (qc_io_force) у ОБЕИХ сторон. */
+static void scenario_echo(const char *tag, uint64_t cli_brutal, int gso, int gro) {
     struct srv s;
     struct cli c;
     uint16_t port = 0;
@@ -234,6 +235,7 @@ static void scenario_echo(const char *tag, uint64_t cli_brutal) {
     snprintf(nm, sizeof nm, "%s: qc_open", tag);
     check(nm, 0, rc);
     if (rc) { qc_free(s.q); return; }
+    if (gso >= 0) { qc_io_force(c.q, gso, gro); qc_io_force(s.q, gso, gro); }
     snprintf(nm, sizeof nm, "%s: рукопожатие TLS 1.3 + ALPN + проверка сертификата", tag);
     check(nm, 1, pump(&s, &c, c_hs, 5000));
     snprintf(nm, sizeof nm, "%s: клиент знает, что рукопожатие завершено", tag);
@@ -249,6 +251,13 @@ static void scenario_echo(const char *tag, uint64_t cli_brutal) {
         qc_stats_get(c.q, &st);
         snprintf(nm, sizeof nm, "%s: статистика идёт (отправлено > 300 КБ, RTT задан)", tag);
         check(nm, 1, st.bytes_sent > STREAM_N && st.rtt_us > 0);
+        /* Пакетный ввод-вывод: вызовов UDP заметно меньше, чем пакетов (раньше — по вызову на пакет). */
+        snprintf(nm, sizeof nm, "%s: отправка пачками (вызовов %llu на %llu пакетов)", tag,
+                 (unsigned long long)st.tx_calls, (unsigned long long)st.pkt_sent);
+        check(nm, 1, st.tx_calls * 2 < st.pkt_sent);
+        snprintf(nm, sizeof nm, "%s: приём пачками (вызовов %llu на %llu пакетов)", tag,
+                 (unsigned long long)st.rx_calls, (unsigned long long)st.pkt_recv);
+        check(nm, 1, st.rx_calls * 2 < st.pkt_recv);
         /* Закрытие клиентом доходит до сервера. */
         qc_close(c.q, 7);
         snprintf(nm, sizeof nm, "%s: закрытие клиентом — сервер видит (peer)", tag);
@@ -349,8 +358,13 @@ static void scenario_bigdg(void) {
 }
 
 int main(void) {
-    scenario_echo("CUBIC", 0);
-    scenario_echo("Brutal", 50u * 1000 * 1000);
+    scenario_echo("CUBIC", 0, -1, -1);
+    scenario_echo("Brutal", 50u * 1000 * 1000, -1, -1);
+    /* Запасные пути ввода-вывода: без GSO — sendmmsg, без GRO — recvmmsg, без обоих; с GRO принудительно. */
+    scenario_echo("CUBIC без GSO", 0, 0, 1);
+    scenario_echo("CUBIC без GRO", 0, 1, 0);
+    scenario_echo("CUBIC без GSO и GRO", 0, 0, 0);
+    scenario_echo("Brutal с GSO и GRO", 50u * 1000 * 1000, 1, 1);
     scenario_bigdg();
 
     /* Проверка сертификата. */

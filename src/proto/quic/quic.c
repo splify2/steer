@@ -10,9 +10,12 @@
  *
  * ПАЧКИ. Пакеты пишет ngtcp2_conn_write_aggregate_pkt: она сама складывает их в буфер подряд (до
  * send_quantum — а это то, что решил алгоритм перегрузки: у Brutal миллисекунда на выбранной
- * скорости), сама вызывает ngtcp2_conn_update_pkt_tx_time. Нарезаем буфер по gso_size на отдельные
- * датаграммы UDP: GSO (UDP_SEGMENT) не используется — переносимость важнее (телефон, mips), а
- * узкое место роутера — шифр, не число системных вызовов.
+ * скорости), сама вызывает ngtcp2_conn_update_pkt_tx_time. Буфер нарезаем по gso_size на датаграммы
+ * UDP и отдаём ядру пачкой (send_batch): равные по размеру — одним sendmsg с UDP_SEGMENT, остальные —
+ * sendmmsg; ядро без GSO или устройство без контрольной суммы (EIO, EINVAL) выключают GSO для сокета.
+ * ПРИЁМ — recvmmsg, с UDP_GRO ядро склеивает подряд пришедшие датаграммы, и qc_on_readable режет их
+ * обратно по размеру сегмента. Приём одной датаграммой за вызов (по умолчанию при отказе UDP_GRO)
+ * стоил на роутере больше, чем шифр: 1 Гбит/с — около 100 тысяч вызовов в секунду.
  *
  * ТАЙМЕР. Срок — ngtcp2_conn_get_expiry: потеря, PTO, idle, пейсинг. Линия событий потребителя
  * держит его в миллисекундах (qc_timeout_ms округляет вверх); опоздание на миллисекунду пейсинг
@@ -31,6 +34,7 @@
 #include <sys/epoll.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
@@ -44,7 +48,30 @@
  * отбрасывает пакет, как сеть при перегрузке); растущая очередь только добавила бы задержку. */
 #define QC_DG_QUEUE     64
 #define QC_RXBUF        65536
-#define QC_OBUF         (2 * 1500)      /* результат фильтра отправки: одна датаграмма с запасом */
+/* Результат фильтра отправки для целой пачки: сама пачка (до QC_TXBUF) и запас фильтра (n + 64) на
+ * каждую из QC_GSO_SEGS датаграмм. */
+#define QC_OBUF         (QC_TXBUF + 64 * 64)
+/* Пакетный ввод-вывод UDP (quic.h, «ПАКЕТНЫЙ ВВОД-ВЫВОД»). Пределы — ядра Linux: UDP_SEGMENT нарезает
+ * не больше 64 сегментов и не больше 65507 байт (65535 минус заголовки IPv4 и UDP) за один вызов. */
+#define QC_GSO_SEGS     64
+#define QC_GSO_BYTES    65507
+#define QC_RX_BATCH     32              /* сообщений за один recvmmsg без UDP_GRO: слоты по 2 КиБ */
+#define QC_RX_SLOT      (QC_RXBUF / QC_RX_BATCH)
+/* С UDP_GRO сообщение — до 64 КиБ склеенных датаграмм, и слот нужен на целых 64 КиБ. Слотов 16: если
+ * ядро ничего не склеило (loopback, veth, сетевая карта без GRO), recvmmsg всё равно берёт по 16
+ * датаграмм за вызов, а если склеило — до 16 склеек. Буфер приёма — 1 МиБ виртуальной памяти: ядро
+ * пишет ровно столько, сколько пришло, остальное страниц не занимает (RSS не растёт). */
+#define QC_RX_GRO_BATCH 16
+#define QC_RXBUF_GRO    (QC_RX_GRO_BATCH * 65536)
+#ifndef SOL_UDP
+#define SOL_UDP         17
+#endif
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT     103
+#endif
+#ifndef UDP_GRO
+#define UDP_GRO         104
+#endif
 /* Длина нашего идентификатора соединения. Была 17; против сервера эталона (quic-go) это стоило
  * потери датаграмм: он режет фрагменты UDP по предельному размеру датаграммы, посчитанному
  * без учёта длинного CID адресата, и первый (самый большой) фрагмент не влезал в пакет и молча
@@ -81,6 +108,15 @@ struct qc_stream {
 struct qc_dg {
     uint8_t  *d;
     size_t    n;
+};
+
+/* Рабочие массивы приёма: recvmmsg берёт до QC_RX_BATCH датаграмм, у каждой свой адрес отправителя.
+ * Живут в куче, а не на стеке потока потребителя (около восьми килобайт). */
+struct qc_rx {
+    struct mmsghdr mm[QC_RX_BATCH];
+    struct iovec iov[QC_RX_BATCH];
+    struct sockaddr_storage from[QC_RX_BATCH];
+    union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr a; } ctl[QC_RX_BATCH];    /* UDP_GRO: размер сегмента */
 };
 
 struct qc {
@@ -123,11 +159,15 @@ struct qc {
     int       credit_dirty;     /* окна продлены, а пакет с их обновлением ещё не уходил (qc_flush_credit) */
     uint8_t  *txbuf;
     uint8_t  *rxbuf;
+    struct qc_rx *rx;
     /* Шов «фильтр датаграмм» (quic.h, struct qc_filter): обфускация всего, что идёт по сокету.
      * obuf — куда фильтр отправки складывает результат (пачка ngtcp2 нарезана на кусочки размером
      * с датаграмму, поэтому достаточно одной датаграммы с запасом). */
     struct qc_filter filter;
     uint8_t  *obuf;
+    uint64_t  tx_calls, rx_calls;
+    int       gso_ok;           /* отправка пачкой через UDP_SEGMENT ещё не отказывала */
+    int       gro_on;           /* приём склеенных датаграмм (UDP_GRO) включён на сокете */
     /* Прыжки по портам сервера (quic.h): диапазоны, интервал, текущий порт и момент последней
      * смены. Сокет тогда не connect()-нут: адрес назначения выбирает каждая отправка. */
     uint16_t  hop[QC_HOP_RANGES * 2];
@@ -557,25 +597,132 @@ static void send_udp(struct qc *q, const uint8_t *p, size_t n) {
     raw_send(q, p, n);
 }
 
-static void raw_send(struct qc *q, const uint8_t *p, size_t n) {
-    /* EAGAIN — буфер сокета полон: пакет пропадает, как в сети, и ngtcp2 его пересдаст. Ждать
-     * POLLOUT ради этого не стоит — линия событий потребителя не должна знать о записи. */
+/* Куда слать. 0 — сокет connect()-нут, адрес не нужен; иначе длина адреса, сам адрес — в *to. */
+static socklen_t tx_dest(struct qc *q, struct sockaddr_storage *to) {
     if (q->hop_n) {
         /* Смена порта — при отправке, а не по своему таймеру: молчащее соединение шлёт
          * keepalive, и следующий пакет уйдёт уже на новый порт; отдельный таймер ради этого
-         * стоил бы ещё одного срока в qc_timeout_ms. */
+         * стоил бы ещё одного срока в qc_timeout_ms. Пачка уходит на один порт целиком. */
         uint64_t now = now_ns();
         if (!q->hop_port || (q->hop_ms && now - q->hop_at_ns >= (uint64_t)q->hop_ms * 1000000ull)) {
             q->hop_port = hop_pick(q);
             q->hop_at_ns = now;
         }
-        struct sockaddr_storage to = q->remote;
-        *sa_port(&to) = htons(q->hop_port);
-        (void)sendto(q->fd, p, n, MSG_DONTWAIT, (struct sockaddr *)&to, q->remote_len);
-        return;
+        *to = q->remote;
+        *sa_port(to) = htons(q->hop_port);
+        return q->remote_len;
     }
-    if (q->connected) (void)send(q->fd, p, n, MSG_DONTWAIT);
-    else (void)sendto(q->fd, p, n, MSG_DONTWAIT, (struct sockaddr *)&q->remote, q->remote_len);
+    if (q->connected) return 0;
+    *to = q->remote;
+    return q->remote_len;
+}
+
+static void raw_send(struct qc *q, const uint8_t *p, size_t n) {
+    /* EAGAIN — буфер сокета полон: пакет пропадает, как в сети, и ngtcp2 его пересдаст. Ждать
+     * POLLOUT ради этого не стоит — линия событий потребителя не должна знать о записи. */
+    struct sockaddr_storage to;
+    socklen_t tl = tx_dest(q, &to);
+    q->tx_calls++;
+    if (tl) (void)sendto(q->fd, p, n, MSG_DONTWAIT, (struct sockaddr *)&to, tl);
+    else (void)send(q->fd, p, n, MSG_DONTWAIT);
+}
+
+/* ---- пакетный ввод-вывод: чистые части (проверяются tests/qcbatch.c) ---------------------------- */
+
+size_t qc_io_gso_run(const size_t *len, size_t n) {
+    if (!n) return 0;
+    size_t seg = len[0], bytes = seg, k = 1;
+    if (!seg) return 1;
+    while (k < n && k < QC_GSO_SEGS) {
+        size_t l = len[k];
+        if (!l || l > seg || bytes + l > QC_GSO_BYTES) break;
+        bytes += l;
+        k++;
+        if (l < seg) break;         /* короткая — только последняя в пачке */
+    }
+    return k;
+}
+
+int qc_io_gso_fatal(int err) {
+    /* Нет UDP_SEGMENT в ядре (EINVAL, ENOPROTOOPT) или нет контрольной суммы в устройстве (EIO): так
+     * будет и со следующей пачкой. Всё остальное — обычная потеря отправки (буфер полон, порт закрыт),
+     * её отмечать «отказом GSO» нельзя. */
+    return err == EIO || err == EINVAL || err == ENOPROTOOPT || err == EOPNOTSUPP || err == EPROTONOSUPPORT;
+}
+
+size_t qc_io_gro_next(size_t total, size_t seg, size_t off) {
+    if (off >= total) return 0;
+    size_t rem = total - off;
+    if (!seg) return rem;
+    return rem < seg ? rem : seg;
+}
+
+/* Размер сегмента из дополнительных данных приёма (UDP_GRO); 0 — приём не склеен. Ядро кладёт int. */
+static size_t gro_seg(struct msghdr *mh) {
+    /* Обход вручную, а не CMSG_NXTHDR: у musl его проверка границы даёт -Wsign-compare. */
+    size_t off = 0, end = mh->msg_controllen;
+    while (off + sizeof(struct cmsghdr) <= end) {
+        struct cmsghdr *c = (struct cmsghdr *)((char *)mh->msg_control + off);
+        size_t clen = c->cmsg_len;
+        if (clen < CMSG_LEN(0) || clen > end - off) break;
+        if (c->cmsg_level == SOL_UDP && c->cmsg_type == UDP_GRO) {
+            size_t l = clen - CMSG_LEN(0);
+            if (l >= sizeof(int)) { int v; memcpy(&v, CMSG_DATA(c), sizeof v); return v > 0 ? (size_t)v : 0; }
+            if (l == sizeof(uint16_t)) { uint16_t v; memcpy(&v, CMSG_DATA(c), sizeof v); return v; }
+        }
+        off += CMSG_ALIGN(clen);
+    }
+    return 0;
+}
+
+/* Отправить n готовых датаграмм (iov). Подряд идущие одного размера (последняя может быть короче) —
+ * одним вызовом с UDP_SEGMENT: ядро (или сетевая карта) нарезает сегменты, а к нам один вызов вместо
+ * десятков. Остальные — sendmmsg по датаграмме на сообщение. Отказ GSO (qc_io_gso_fatal) выключает его
+ * для сокета, и пачка уходит sendmmsg; потерянное при EAGAIN ngtcp2 пересдаёт сама. */
+static void send_batch(struct qc *q, struct iovec *iov, size_t n) {
+    struct sockaddr_storage to;
+    socklen_t tl = tx_dest(q, &to);
+    size_t i = 0;
+    while (i < n) {
+        size_t m = n - i < QC_GSO_SEGS ? n - i : QC_GSO_SEGS;
+        size_t cnt = 1;
+        if (q->gso_ok && m >= 2) {
+            size_t lens[QC_GSO_SEGS];
+            for (size_t k = 0; k < m; k++) lens[k] = iov[i + k].iov_len;
+            size_t run = qc_io_gso_run(lens, m);
+            if (run >= 2) {
+                union { char b[CMSG_SPACE(sizeof(uint16_t))]; struct cmsghdr a; } cu;
+                memset(&cu, 0, sizeof cu);
+                struct msghdr mh = { .msg_name = tl ? (void *)&to : NULL, .msg_namelen = tl,
+                                     .msg_iov = &iov[i], .msg_iovlen = run,
+                                     .msg_control = cu.b, .msg_controllen = sizeof cu.b };
+                struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+                c->cmsg_level = SOL_UDP;
+                c->cmsg_type = UDP_SEGMENT;
+                c->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+                uint16_t sz = (uint16_t)lens[0];
+                memcpy(CMSG_DATA(c), &sz, sizeof sz);
+                q->tx_calls++;
+                if (sendmsg(q->fd, &mh, MSG_DONTWAIT) >= 0 || !qc_io_gso_fatal(errno)) { i += run; continue; }
+                q->gso_ok = 0;      /* ядро без GSO или устройство без контрольной суммы */
+            }
+        }
+        if (!q->gso_ok) cnt = m;
+        struct mmsghdr mm[QC_GSO_SEGS];
+        for (size_t k = 0; k < cnt; k++) {
+            memset(&mm[k], 0, sizeof mm[k]);
+            mm[k].msg_hdr.msg_name = tl ? (void *)&to : NULL;
+            mm[k].msg_hdr.msg_namelen = tl;
+            mm[k].msg_hdr.msg_iov = &iov[i + k];
+            mm[k].msg_hdr.msg_iovlen = 1;
+        }
+        q->tx_calls++;
+        int r = sendmmsg(q->fd, mm, (unsigned)cnt, MSG_DONTWAIT);
+        if (r > 0) { i += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) return;
+        i++;                        /* эту датаграмму сокет не принял (порт закрыт, слишком велика) — к следующей */
+    }
 }
 
 /* Что отдать ngtcp2 из потока: не более двух блоков подряд, начиная со смещения sent. */
@@ -689,9 +836,27 @@ static int flush(struct qc *q) {
         if (nw < 0) return (int)nw;
         if (nw == 0) return 0;
         if (gso == 0) gso = (size_t)nw;
-        for (size_t off = 0; off < (size_t)nw; off += gso) {
-            size_t n = (size_t)nw - off < gso ? (size_t)nw - off : gso;
-            send_udp(q, q->txbuf + off, n);
+        if (q->filter.tx_multi) {
+            for (size_t off = 0; off < (size_t)nw; off += gso)
+                send_udp(q, q->txbuf + off, (size_t)nw - off < gso ? (size_t)nw - off : gso);
+        } else {
+            struct iovec iov[QC_GSO_SEGS];
+            size_t cnt = 0, oo = 0;
+            for (size_t off = 0; off < (size_t)nw; off += gso) {
+                size_t n = (size_t)nw - off < gso ? (size_t)nw - off : gso;
+                const uint8_t *p = q->txbuf + off;
+                if (q->filter.tx) {
+                    /* Фильтр вправе отказать (0): пакет пропадает, как в сети, и ngtcp2 его пересдаст. */
+                    n = q->filter.tx(q->filter.user, q->obuf + oo, p, n);
+                    if (!n) continue;
+                    p = q->obuf + oo;
+                    oo += n;
+                }
+                iov[cnt].iov_base = (void *)p;
+                iov[cnt].iov_len = n;
+                if (++cnt == QC_GSO_SEGS) { send_batch(q, iov, cnt); cnt = 0; oo = 0; }
+            }
+            if (cnt) send_batch(q, iov, cnt);
         }
         /* Пачка кончилась раньше, чем данные: продолжим на следующем круге, если пейсинг позволит
          * (иначе ngtcp2 вернёт 0, а срок — в get_expiry). */
@@ -739,7 +904,7 @@ static void settings_fill(ngtcp2_settings *st, ngtcp2_transport_params *tp, uint
                           size_t datagram_max, unsigned idle_ms, unsigned hs_ms, uint64_t max_data,
                           uint64_t max_stream_data, uint64_t max_streams);
 static int addr_parse(const char *host, uint16_t port, struct sockaddr_storage *ss, socklen_t *len);
-static void sock_tune(int fd);
+static int sock_tune(int fd);
 static struct qc *qc_alloc(const struct qc_ops *ops, void *user);
 
 #ifdef QC_WITH_SERVER
@@ -809,7 +974,7 @@ int qc_listen(const struct qc_srv_cfg *cfg, const struct qc_ops *ops, void *user
     if (addr_parse(cfg->bind_host, cfg->port, &q->local, &q->local_len) != 0) { rc = QC_EINVAL; goto fail; }
     q->fd = socket(q->local.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (q->fd < 0) goto fail;
-    sock_tune(q->fd);
+    q->gro_on = sock_tune(q->fd);
     if (bind(q->fd, (struct sockaddr *)&q->local, q->local_len) != 0) goto fail;
     q->local_len = sizeof q->local;
     if (getsockname(q->fd, (struct sockaddr *)&q->local, &q->local_len) != 0) goto fail;
@@ -859,60 +1024,114 @@ int qc_on_timer(struct qc *q) {
     return q->closed ? QC_ECLOSED : 0;
 }
 
+/* Одна принятая датаграмма: отбор по адресу, фильтр, ngtcp2. 0 — идём дальше (в том числе когда
+ * датаграмма отброшена), QC_ECLOSED — соединение закрылось. */
+static int rx_dgram(struct qc *q, uint8_t *buf, size_t n, const struct sockaddr_storage *src, socklen_t fl) {
+    struct sockaddr_storage from = *src;
+#ifdef QC_WITH_SERVER
+    if (!q->conn && q->server && srv_accept(q, &from, fl, buf, n) != 0) return 0;
+#endif
+    if (!q->conn) return 0;     /* клиент без соединения бывает только после qc_free — сюда не дойти */
+    if (q->hop_n) {
+        /* Ответ пришёл с порта диапазона, а ngtcp2 знает один путь — базовый адрес сервера.
+         * Чужой хозяин или порт вне диапазона — посторонний пакет: отбросить. Порт в пути
+         * подменяется базовым, и для ngtcp2 «прыжков» нет вовсе: это и есть смысл приёма
+         * эталона — QUIC не замечает смены порта. */
+        uint16_t fp = ntohs(*sa_port(&from)), ok = 0;
+        for (unsigned h = 0; h < q->hop_n; h++)
+            if (fp >= q->hop[2 * h] && fp <= q->hop[2 * h + 1]) ok = 1;
+        struct sockaddr_storage cmp = from;
+        *sa_port(&cmp) = *sa_port(&q->remote);
+        if (!ok || fl != q->remote_len || memcmp(&cmp, &q->remote, fl) != 0) return 0;
+        from = q->remote;
+        fl = q->remote_len;
+    }
+    if (q->filter.rx) {
+        size_t m = q->filter.rx(q->filter.user, buf, buf, n);
+        if (!m) return 0;
+        n = m;
+    }
+    ngtcp2_path path = {
+        .local = { .addr = (ngtcp2_sockaddr *)&q->local, .addrlen = q->local_len },
+        .remote = { .addr = (ngtcp2_sockaddr *)&from, .addrlen = fl },
+    };
+    ngtcp2_pkt_info pi = { 0 };
+    int rv = ngtcp2_conn_read_pkt(q->conn, &path, &pi, buf, n, now_ns());
+    if (rv != 0) {
+        if (rv == NGTCP2_ERR_DRAINING) { closed(q, QC_CLOSE_PEER, "peer closed"); return QC_ECLOSED; }
+        if (rv == NGTCP2_ERR_DROP_CONN) { closed(q, QC_CLOSE_ERROR, "dropped"); return QC_ECLOSED; }
+        fail_close(q, rv);
+        return QC_ECLOSED;
+    }
+    return q->closed ? QC_ECLOSED : 0;
+}
+
+/* Принять, что есть в сокете, одним системным вызовом (recvmmsg). С UDP_GRO каждое сообщение — до 64 КиБ:
+ * ядро склеило подряд пришедшие датаграммы одного потока в одну, размер сегмента — в дополнительных
+ * данных (gro_seg). Без него — по QC_RX_BATCH датаграмм в слоты по QC_RX_SLOT байт. Возврат — число сообщений
+ * (в q->rx->mm[i].msg_len длина, в from[i] отправитель), 0 — сокет пуст, -1 — порт закрыт (ICMP),
+ * -2 — иная ошибка. */
+static int rx_batch(const struct qc *q) { return q->gro_on ? QC_RX_GRO_BATCH : QC_RX_BATCH; }
+static uint8_t *rx_slot(const struct qc *q, int i) {
+    return q->rxbuf + (size_t)i * (q->gro_on ? 65536 : QC_RX_SLOT);
+}
+
+static int rx_recv(struct qc *q) {
+    struct qc_rx *r = q->rx;
+    int cnt = rx_batch(q);
+    for (int i = 0; i < cnt; i++) {
+        r->iov[i].iov_base = rx_slot(q, i);
+        r->iov[i].iov_len = q->gro_on ? 65536 : QC_RX_SLOT;
+        memset(&r->mm[i], 0, sizeof r->mm[i]);
+        r->mm[i].msg_hdr.msg_name = &r->from[i];
+        r->mm[i].msg_hdr.msg_namelen = sizeof r->from[i];
+        r->mm[i].msg_hdr.msg_iov = &r->iov[i];
+        r->mm[i].msg_hdr.msg_iovlen = 1;
+        if (q->gro_on) {
+            r->mm[i].msg_hdr.msg_control = r->ctl[i].b;
+            r->mm[i].msg_hdr.msg_controllen = sizeof r->ctl[i].b;
+        }
+    }
+    for (;;) {
+        q->rx_calls++;
+        int got = recvmmsg(q->fd, r->mm, (unsigned)cnt, MSG_DONTWAIT, NULL);
+        if (got >= 0) return got;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return errno == ECONNREFUSED ? -1 : -2;
+    }
+}
+
 int qc_on_readable(struct qc *q) {
     if (q->closed) return QC_ECLOSED;
-    for (int i = 0; i < 256; i++) {
-        struct sockaddr_storage from;
-        socklen_t fl = sizeof from;
-        ssize_t n = recvfrom(q->fd, q->rxbuf, QC_RXBUF, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            if (errno == ECONNREFUSED) { /* ICMP «порт закрыт»: сервера нет */
-                /* Причина — первой: fail_close закрыл бы соединение своим текстом («ERR_CLOSING»), и
-                 * человек читал бы про состояние ngtcp2 вместо «порт закрыт». CONNECTION_CLOSE
-                 * слать некому — порт ответил ICMP. */
-                closed(q, QC_CLOSE_ERROR, "connection refused");
-                return QC_ECLOSED;
-            }
-            break;
-        }
-#ifdef QC_WITH_SERVER
-        if (!q->conn && q->server && srv_accept(q, &from, fl, q->rxbuf, (size_t)n) != 0) continue;
-#endif
-        if (!q->conn) continue;     /* клиент без соединения бывает только после qc_free — сюда не дойти */
-        if (q->hop_n) {
-            /* Ответ пришёл с порта диапазона, а ngtcp2 знает один путь — базовый адрес сервера.
-             * Чужой хозяин или порт вне диапазона — посторонний пакет: отбросить. Порт в пути
-             * подменяется базовым, и для ngtcp2 «прыжков» нет вовсе: это и есть смысл приёма
-             * эталона — QUIC не замечает смены порта. */
-            uint16_t fp = ntohs(*sa_port(&from)), ok = 0;
-            for (unsigned h = 0; h < q->hop_n; h++)
-                if (fp >= q->hop[2 * h] && fp <= q->hop[2 * h + 1]) ok = 1;
-            struct sockaddr_storage cmp = from;
-            *sa_port(&cmp) = *sa_port(&q->remote);
-            if (!ok || fl != q->remote_len || memcmp(&cmp, &q->remote, fl) != 0) continue;
-            from = q->remote;
-            fl = q->remote_len;
-        }
-        if (q->filter.rx) {
-            size_t m = q->filter.rx(q->filter.user, q->rxbuf, q->rxbuf, (size_t)n);
-            if (!m) continue;
-            n = (ssize_t)m;
-        }
-        ngtcp2_path path = {
-            .local = { .addr = (ngtcp2_sockaddr *)&q->local, .addrlen = q->local_len },
-            .remote = { .addr = (ngtcp2_sockaddr *)&from, .addrlen = fl },
-        };
-        ngtcp2_pkt_info pi = { 0 };
-        int rv = ngtcp2_conn_read_pkt(q->conn, &path, &pi, q->rxbuf, (size_t)n, now_ns());
-        if (rv != 0) {
-            if (rv == NGTCP2_ERR_DRAINING) { closed(q, QC_CLOSE_PEER, "peer closed"); return QC_ECLOSED; }
-            if (rv == NGTCP2_ERR_DROP_CONN) { closed(q, QC_CLOSE_ERROR, "dropped"); return QC_ECLOSED; }
-            fail_close(q, rv);
+    /* Не больше 256 датаграмм за проход (как было): линия событий потребителя не должна стоять в
+     * одном соединении, остальное её ждёт по уровню (EPOLLIN не гасится). */
+    for (int budget = 256; budget > 0;) {
+        int cnt = rx_recv(q);
+        if (cnt == 0) break;
+        if (cnt == -1) { /* ICMP «порт закрыт»: сервера нет */
+            /* Причина — первой: fail_close закрыл бы соединение своим текстом («ERR_CLOSING»), и
+             * человек читал бы про состояние ngtcp2 вместо «порт закрыт». CONNECTION_CLOSE
+             * слать некому — порт ответил ICMP. */
+            closed(q, QC_CLOSE_ERROR, "connection refused");
             return QC_ECLOSED;
         }
-        if (q->closed) return QC_ECLOSED;
+        if (cnt < 0) break;
+        for (int m = 0; m < cnt; m++) {
+            struct msghdr *mh = &q->rx->mm[m].msg_hdr;
+            if (mh->msg_flags & MSG_TRUNC) continue;    /* не влезла в слот: ngtcp2 такую всё равно не примет */
+            uint8_t *base = rx_slot(q, m);
+            size_t total = q->rx->mm[m].msg_len;
+            size_t seg = q->gro_on ? gro_seg(mh) : 0;
+            size_t n;
+            for (size_t off = 0; (n = qc_io_gro_next(total, seg, off)) != 0; off += n) {
+                budget--;
+                int rv = rx_dgram(q, base + off, n, &q->rx->from[m], mh->msg_namelen);
+                if (rv != 0) return rv;
+            }
+        }
+        /* recvmmsg вернул меньше, чем просили, — сокет опустел: лишний вызов с EAGAIN не нужен. */
+        if (cnt < rx_batch(q)) break;
     }
     int rv = flush(q);
     if (rv != 0 && rv != QC_ECLOSED) { fail_close(q, rv); return QC_ECLOSED; }
@@ -1004,12 +1223,16 @@ static int addr_parse(const char *host, uint16_t port, struct sockaddr_storage *
     return -1;
 }
 
-static void sock_tune(int fd) {
+/* Возврат — 1, если включён UDP_GRO (приём склеенных датаграмм; ядро Linux с 5.0, на роутерах 6.6 и
+ * новее есть); отказ setsockopt — 0 и приём пачками recvmmsg. */
+static int sock_tune(int fd) {
     /* Буферы побольше: пачка Brutal и приём на скорости в десятки мегабит. Потолок задаёт ядро
      * (rmem_max/wmem_max); отказ безвреден. */
     int sz = 1 << 20;
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+    int one = 1;
+    return setsockopt(fd, SOL_UDP, UDP_GRO, &one, sizeof one) == 0;
 }
 
 static struct qc *qc_alloc(const struct qc_ops *ops, void *user) {
@@ -1019,9 +1242,14 @@ static struct qc *qc_alloc(const struct qc_ops *ops, void *user) {
     q->ops = *ops;
     q->user = user;
     q->txbuf = malloc(QC_TXBUF);
-    q->rxbuf = malloc(QC_RXBUF);
+    q->rxbuf = malloc(QC_RXBUF_GRO);
     q->obuf = malloc(QC_OBUF);
-    if (!q->txbuf || !q->rxbuf || !q->obuf) { free(q->txbuf); free(q->rxbuf); free(q->obuf); free(q); return NULL; }
+    q->rx = calloc(1, sizeof *q->rx);
+    q->gso_ok = 1;
+    if (!q->txbuf || !q->rxbuf || !q->obuf || !q->rx) {
+        free(q->txbuf); free(q->rxbuf); free(q->obuf); free(q->rx); free(q);
+        return NULL;
+    }
     fill_random(q->secret, sizeof q->secret);
     q->ref.get_conn = get_conn_cb;
     q->ref.user_data = q;
@@ -1038,7 +1266,7 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
     if (addr_parse(cfg->host, cfg->port, &q->remote, &q->remote_len) != 0) { rc = QC_EINVAL; goto fail; }
     q->fd = socket(q->remote.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (q->fd < 0) goto fail;
-    sock_tune(q->fd);
+    q->gro_on = sock_tune(q->fd);
     if (cfg->sock_mark && setsockopt(q->fd, SOL_SOCKET, SO_MARK, &cfg->sock_mark, sizeof cfg->sock_mark) != 0 &&
         cfg->mark_required) {
         rc = QC_ESOCK;
@@ -1265,7 +1493,14 @@ void qc_free(struct qc *q) {
     free(q->txbuf);
     free(q->rxbuf);
     free(q->obuf);
+    free(q->rx);
     free(q);
+}
+
+void qc_io_force(struct qc *q, int gso, int gro) {
+    q->gso_ok = gso != 0;
+    int v = gro != 0;
+    q->gro_on = setsockopt(q->fd, SOL_UDP, UDP_GRO, &v, sizeof v) == 0 && v;
 }
 
 void qc_stats_get(struct qc *q, struct qc_stats *st) {
@@ -1284,4 +1519,6 @@ void qc_stats_get(struct qc *q, struct qc_stats *st) {
     st->handshake_done = q->hs_done;
     st->brutal = q->brutal;
     st->dg_dropped = q->dg_dropped;
+    st->tx_calls = q->tx_calls;
+    st->rx_calls = q->rx_calls;
 }

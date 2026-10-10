@@ -375,6 +375,13 @@ if [ -n "$NSRC" ]; then
 	$CC $QCF -o "$BUILD/qcloop" tests/qcloop.c $QCSRC "$NGLIB" "$WLIB" -lpthread -lm
 	"$BUILD/qcloop"
 
+	# qcbatch — чистые части пакетного ввода-вывода UDP (какие датаграммы идут одним вызовом GSO,
+	# какие ошибки его отключают, нарезка склеенного приёма GRO).
+	echo "ext-test: собираю и прогоняю qcbatch..."
+	# shellcheck disable=SC2086
+	$CC $QCF -o "$BUILD/qcbatch" tests/qcbatch.c $QCSRC "$NGLIB" "$WLIB" -lpthread -lm
+	"$BUILD/qcbatch"
+
 	# qcserver и qcbench — пара замера; сам замер (сетевые пространства имён и netem, нужен root) —
 	# tests/qcbench.sh, здесь его короткая проверка «Brutal держит заданное, CUBIC проседает».
 	# shellcheck disable=SC2086

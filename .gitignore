@@ -94,6 +94,7 @@ build/ngtcp2-host/
 build/qcbench
 build/qcbrutal
 build/qcloop
+build/qcbatch
 build/qcserver
 # Архивы wolfSSL под цели сборки (build/build-ext.sh, build/bench.sh, рецепт SDK)
 build/wolfssl-obj/
