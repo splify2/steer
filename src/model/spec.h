@@ -630,6 +630,9 @@ struct spec_dns_up {
     size_t ips_n;
     char (*boot)[46];               /* арена спеки, boot_n записей */
     size_t boot_n;
+    /* `fragment: true` (только DoT и DoH): ClientHello уходит двумя записями TLS с разрезом внутри
+     * имени сервера (SNI) и паузой между двумя отправками — против DPI, ищущего SNI в одной записи. */
+    unsigned char frag;
     unsigned char inl;             /* задан в самом правиле (`dns: { url: … }`), а не в dns.upstreams */
     /* ГРУППА СЕРВЕРОВ (`{ servers: [имя, …], mode: race | failover }`): несколько апстримов как
      * один. grp — DNSG_RACE или DNSG_FAILOVER, 0 — это сервер, а не группа. У группы url, out, ips

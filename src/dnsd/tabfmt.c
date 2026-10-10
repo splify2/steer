@@ -41,7 +41,8 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
         if (c->up) fprintf(out, "|dns:%d", c->up);
         fputc('\n', out);
     }
-    /* Апстрим: имя|адрес|выход|метка|адреса сервера|серверы bootstrap. «-» — пусто. */
+    /* Апстрим: имя|адрес|выход|метка|адреса сервера|серверы bootstrap[|frag]. «-» — пусто;
+     * frag — `fragment: true` (ClientHello двумя записями TLS), поля нет — выключено. */
     for (size_t i = 0; i < g_dup_cfg_n; i++) {
         const struct dup_cfg *u = &g_dup_cfg[i];
         if (u->grp) {
@@ -55,6 +56,7 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
         join_list(out, u->u.ips, u->u.ips_n);
         fputc('|', out);
         join_list(out, u->u.boot, u->u.boot_n);
+        if (u->u.frag) fputs("|frag", out);        /* седьмое поле — только когда оно есть */
         fputc('\n', out);
     }
 }
@@ -223,8 +225,9 @@ static int list_into(const char *s, size_t n, char (**dst)[46], size_t *cnt) {
  * прислал демон другой версии), не роняет резолвер: апстрим остаётся с proto == DNSP_NONE и не
  * используется, а каналы на него отвечают прежним путём наверх. */
 static int parse_up_line(const char *buf, size_t from, size_t end, struct dup_cfg *c) {
-    size_t f[6][2];
-    if (split_fields(buf, from, end, f, 6) != 6) return -1;
+    size_t f[7][2];
+    size_t nf = split_fields(buf, from, end, f, 7);
+    if (nf != 6 && nf != 7) return -1;
     memset(c, 0, sizeof(*c));
     field_copy(c->u.name, sizeof(c->u.name), buf + f[0][0], f[0][1]);
     field_copy(c->u.url, sizeof(c->u.url), buf + f[1][0], f[1][1]);
@@ -259,6 +262,7 @@ static int parse_up_line(const char *buf, size_t from, size_t end, struct dup_cf
     char num[16];
     field_copy(num, sizeof(num), buf + f[3][0], f[3][1]);
     c->mark = (unsigned)strtoul(num, NULL, 10);
+    c->u.frag = nf == 7 && f[6][1] == 4 && !strncmp(buf + f[6][0], "frag", 4);
     /* own = 1 (выше): массивы адресов ниже — куча этой записи (dup_cfg_list_reset) */
     if (list_into(buf + f[4][0], f[4][1], &c->u.ips, &c->u.ips_n) != 0 ||
         list_into(buf + f[5][0], f[5][1], &c->u.boot, &c->u.boot_n) != 0) {

@@ -1174,7 +1174,7 @@ static int ips_of(struct v2 *x, const struct ynode *n, const char *where,
 static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, const char *name,
                     struct spec_dns_up *u) {
     struct spec *s = x->s;
-    static const char *const U[] = { "url", "out", "ips", "bootstrap", NULL };
+    static const char *const U[] = { "url", "out", "ips", "bootstrap", "fragment", NULL };
     char w[96];
     const char *sv;
     memset(u, 0, sizeof(*u));
@@ -1209,6 +1209,16 @@ static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, co
     if (in && ips_of(x, in, w, &u->ips, &u->ips_n)) return -1;
     snprintf(w, sizeof(w), "%s.bootstrap", where);
     if (bn && ips_of(x, bn, w, &u->boot, &u->boot_n)) return -1;
+    const struct ynode *fn = ynode_get(val, "fragment");
+    if (fn) {
+        int fv = 0;
+        snprintf(w, sizeof(w), "%s.fragment", where);
+        if (bool_of(x, fn, w, &fv)) return -1;
+        if (fv && u->proto != DNSP_DOT && u->proto != DNSP_DOH)
+            return fail(x, fn, "%s: делить ClientHello можно только у DoT (tls://) и DoH (https://); "
+                        "у этого сервера нет TLS поверх TCP", w);
+        u->frag = fv ? 1 : 0;
+    }
     return 0;
 }
 

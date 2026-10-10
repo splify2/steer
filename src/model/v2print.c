@@ -117,6 +117,7 @@ static void dns_up_flow(FILE *f, const struct spec *s, const struct spec_dns_up 
     if (u->out >= 0) fs(&w, "out", oname_of(oname, (size_t)u->out));
     if (u->ips_n) fseq_s(&w, "ips", u->ips[0], sizeof(u->ips[0]), u->ips_n);
     if (u->boot_n) fseq_s(&w, "bootstrap", u->boot[0], sizeof(u->boot[0]), u->boot_n);
+    if (u->frag) { fk(&w, "fragment"); fputs("true", f); }
     fputs(" }", f);
 }
 

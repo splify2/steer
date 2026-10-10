@@ -1557,7 +1557,7 @@ static void up_retire(struct dup *up) {
 static int cfg_same(const struct dup_cfg *a, const struct dup_cfg *b) {
     if (strcmp(a->u.name, b->u.name) || strcmp(a->u.url, b->u.url) || strcmp(a->via, b->via) ||
         a->mark != b->mark || a->need_mark != b->need_mark || a->u.ips_n != b->u.ips_n ||
-        a->u.boot_n != b->u.boot_n || a->grp != b->grp || a->gm_n != b->gm_n)
+        a->u.boot_n != b->u.boot_n || a->grp != b->grp || a->gm_n != b->gm_n || a->u.frag != b->u.frag)
         return 0;
     /* Группа — те же члены на тех же местах настройки: паузы членов переживают перенастройку. */
     for (size_t i = 0; i < a->gm_n; i++) if (a->gm[i] != b->gm[i]) return 0;
