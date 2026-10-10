@@ -94,6 +94,10 @@ size_t h2d_request(uint8_t *dst, size_t cap, uint32_t sid, const char *authority
  * нет (трейлеры); -1 — блок не разобрался или ссылается на динамическую таблицу, которой у нас нет. */
 int h2d_status(const uint8_t *blk, size_t n);
 
+/* Три цифры :status из значения поля (huff — оно закодировано Хаффманом, одинаково в HPACK и QPACK); код
+ * 100..999 или -1. Общее с doh3.c. */
+int h2d_status_value(const uint8_t *p, size_t n, int huff);
+
 /* Имя кода ошибки HTTP/2 для журнала («PROTOCOL_ERROR»); неизвестный — «код N». */
 const char *h2d_errname(uint32_t code, char *buf, size_t cap);
 

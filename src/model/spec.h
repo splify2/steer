@@ -609,13 +609,13 @@ struct spec_rule {
  * (src/dnsd/tabfmt.h), а тот разбирает адрес апстрима тем же dnsurl_parse.
  *
  * Апстрим — это ОДИН сервер и путь до него. Транспорт выводится из схемы адреса: udp://, tcp://,
- * tls:// (DoT), https:// (DoH), quic:// (DoQ, RFC 9250).
+ * tls:// (DoT), https:// (DoH), quic:// (DoQ, RFC 9250), h3:// (DoH по HTTP/3, RFC 9114).
  * Имя сервера в tls:// и https:// разрешается не системным резолвером, а bootstrap: адресами
  * `ips` апстрима либо серверами `bootstrap` (свои у апстрима, иначе общие из `dns`). Запрос к
  * апстриму уходит напрямую (out == -1) или с меткой выхода out: это метка выхода-подложки, та же,
  * что у сокета туннеля `over` (out_underlay_mark), и та же цепочка postrouting_guard не даёт ему
  * уйти мимо устройства выхода. */
-enum dns_proto { DNSP_NONE = 0, DNSP_UDP, DNSP_TCP, DNSP_DOT, DNSP_DOH, DNSP_QUIC };
+enum dns_proto { DNSP_NONE = 0, DNSP_UDP, DNSP_TCP, DNSP_DOT, DNSP_DOH, DNSP_QUIC, DNSP_DOH3 };
 struct spec_dns_up {
     char name[32];
     char url[256];

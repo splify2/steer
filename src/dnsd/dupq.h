@@ -14,7 +14,7 @@
  * заголовком по имени, и одноимённый файл снова стал бы «обязательным» в каждом профиле.
  *
  * Имена и смысл — те же, что у qc_* (src/proto/quic/quic.h); здесь только то, что нужно клиенту DoQ:
- * один сервер, один SNI, метка пути, ALPN `doq` и корни как у DoT зашиты внутри. Возврат
+ * один сервер, один SNI, метка пути, ALPN (`doq`, по умолчанию, или `h3`) и корни как у DoT зашиты внутри. Возврат
  * функций — 0 или отрицательное число; DUPQ_EAGAIN — «сейчас нельзя» (новых потоков пока нет). */
 
 #include <stddef.h>
@@ -40,6 +40,7 @@ struct dupq_cfg {
     const char *host;                       /* адрес сервера текстом */
     uint16_t port;
     const char *sni;                        /* имя апстрима: SNI и проверка сертификата */
+    const char *alpn;                       /* NULL — "doq"; DoH по HTTP/3 — "h3" */
     uint32_t sock_mark;                     /* метка пути выхода; 0 — не метить */
     unsigned handshake_ms, idle_ms;
     /* Вопрос можно отправить до конца рукопожатия (0-RTT), если для этого сервера есть билет прошлой
@@ -64,6 +65,8 @@ int dupq_on_timer(struct dupq *q);
 /* Рукопожатие идёт, но по билету потоки уже можно открывать и слать в них (0-RTT). */
 int dupq_early_ready(const struct dupq *q);
 int dupq_stream_open(struct dupq *q, int64_t *sid);
+/* Однонаправленный поток клиента (поток управления HTTP/3). Только после рукопожатия. */
+int dupq_stream_open_uni(struct dupq *q, int64_t *sid);
 ssize_t dupq_stream_send(struct dupq *q, int64_t sid, const uint8_t *d, size_t n, int fin);
 int dupq_stream_reset(struct dupq *q, int64_t sid, uint64_t app_err);
 

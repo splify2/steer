@@ -48,7 +48,7 @@ int dupq_open(const struct dupq_cfg *c, const struct dupq_ops *o, void *user, st
     cfg.host = c->host;
     cfg.port = c->port;
     cfg.sni = c->sni;                       /* проверка имени в сертификате — по нему (verify_name) */
-    cfg.alpn = "doq";                       /* RFC 9250, 4.1.1 */
+    cfg.alpn = c->alpn ? c->alpn : "doq";   /* RFC 9250, 4.1.1; "h3" у DoH по HTTP/3 (RFC 9114, 3.1) */
     cfg.tls = g_tls;
     cfg.sock_mark = c->sock_mark;
     cfg.mark_required = c->sock_mark != 0;  /* без метки уйти мимо выхода нельзя */
@@ -76,6 +76,7 @@ int dupq_on_readable(struct dupq *q) { return qc_on_readable((struct qc *)q); }
 int dupq_on_timer(struct dupq *q) { return qc_on_timer((struct qc *)q); }
 int dupq_early_ready(const struct dupq *q) { return qc_early_ready((const struct qc *)q); }
 int dupq_stream_open(struct dupq *q, int64_t *sid) { return qc_stream_open((struct qc *)q, sid); }
+int dupq_stream_open_uni(struct dupq *q, int64_t *sid) { return qc_stream_open_uni((struct qc *)q, sid); }
 ssize_t dupq_stream_send(struct dupq *q, int64_t sid, const uint8_t *d, size_t n, int fin) {
     return qc_stream_send((struct qc *)q, sid, d, n, fin);
 }

@@ -1285,7 +1285,8 @@ static int p_dns_grp(struct v2 *x, const struct ynode *val, const char *where, c
  * bootstrap (его или общий). Без них апстрим при первом же запросе не нашёл бы сервер. */
 static int up_has_way(const struct spec *s, const struct spec_dns_up *u) {
     struct in6_addr a;
-    if (u->proto != DNSP_DOT && u->proto != DNSP_DOH && u->proto != DNSP_QUIC) return 1;
+    if (u->proto != DNSP_DOT && u->proto != DNSP_DOH && u->proto != DNSP_QUIC &&
+        u->proto != DNSP_DOH3) return 1;
     if (inet_pton(AF_INET, u->host, &a) == 1 || inet_pton(AF_INET6, u->host, &a) == 1) return 1;
     return u->ips_n || u->boot_n || s->dns.boot_n;
 }

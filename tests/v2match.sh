@@ -579,6 +579,31 @@ dns:
 EOF
 refused "doq:// — не схема" "нужен адрес вида" 4
 
+y <<'EOF'
+version: 2
+dns:
+  upstreams:
+    h3: { url: "h3://dns.google/dns-query", ips: [8.8.8.8] }
+    h3p: { url: "h3://1.1.1.1:8443/q" }
+EOF
+accepted "DoH3 (h3://) — принят"
+
+y <<'EOF'
+version: 2
+dns:
+  upstreams:
+    h3: { url: "h3://dns.test" }
+EOF
+refused "имя сервера DoH3 без ips и bootstrap — отказ" "нечем разрешить" 4
+
+y <<'EOF'
+version: 2
+dns:
+  upstreams:
+    q: { url: "quic://dns.test/x", ips: [192.0.2.1] }
+EOF
+refused "путь у quic:// — отказ, и подсказка называет h3://" "только у https:// и h3://" 4
+
 # Адреса IPv6 клиентов и lan законны с 1.9 (docs/architecture.md, «4б»): правило получает
 # v6-двойник, convert печатает адреса как есть.
 y <<'EOF'

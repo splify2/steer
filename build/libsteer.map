@@ -34,6 +34,7 @@ LIBSTEER_1 {
     dupq_prepare;
     dupq_ready;
     dupq_stream_open;
+    dupq_stream_open_uni;
     dupq_stream_reset;
     dupq_stream_send;
     dupq_timeout_ms;

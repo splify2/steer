@@ -687,7 +687,7 @@ int spec_dns_up_used(const struct spec *sp, size_t u) {
 /* ---- адрес апстрима DNS (dns.upstreams, docs/spec-v2.md) ---------------------------------------
  *
  * Схема выбирает транспорт, и только она: `https://` — DoH (RFC 8484), `tls://` — DoT (RFC 7858),
- * `udp://` и `tcp://` — обычный DNS, `quic://` — DoQ (RFC 9250, порт 853 по UDP, ALPN `doq`). Так же
+ * `udp://` и `tcp://` — обычный DNS, `quic://` — DoQ (RFC 9250, порт 853 по UDP, ALPN `doq`), `h3://` — DoH по HTTP/3 (RFC 9114, порт 443 по UDP, ALPN `h3`). Так же
  * пишут DoQ AdGuard (dnsproxy, AdGuard Home) и sing-box (`quic://dns.adguard-dns.com`); Xray для
  * него пишет `quic+local://`, а `doq://` — не схема ни у одного из этих клиентов, поэтому её нет и
  * здесь. Имя в quic:// и tls:// — одного рода: SNI и проверка сертификата идут по нему, а адрес
@@ -696,20 +696,21 @@ int spec_dns_up_used(const struct spec *sp, size_t u) {
  * Имя или адрес сервера — до первого `:` или `/`; адрес IPv6 пишется в скобках, как в любом URL.
  * Для udp:// и tcp:// нужен адрес, а не имя: обычный DNS на имя потребовал бы разрешить его тем же
  * обычным DNS, то есть тем самым системным резолвером, от которого bootstrap и отвязывает
- * апстрим. Путь есть только у DoH (умолчание /dns-query, как у dns.google и cloudflare-dns.com).
+ * апстрим. Путь есть только у DoH и DoH3 (умолчание /dns-query, как у dns.google и cloudflare-dns.com).
  * Порт по умолчанию — у протокола: 53, 853, 443. Разбор один и тот же у спеки (demon) и у
  * резолвера: последнему демон передаёт адрес строкой, и разойтись им нечем. */
 int dnsurl_parse(const char *url, struct spec_dns_up *u, char *why, size_t why_n) {
     static const struct { const char *scheme; int proto; unsigned short port; } S[] = {
         { "udp://", DNSP_UDP, 53 }, { "tcp://", DNSP_TCP, 53 }, { "tls://", DNSP_DOT, 853 },
         { "https://", DNSP_DOH, 443 }, { "quic://", DNSP_QUIC, 853 },
+        { "h3://", DNSP_DOH3, 443 },
     };
     u->proto = DNSP_NONE;
     size_t k = 0;
     for (; k < sizeof(S) / sizeof(S[0]); k++)
         if (!strncmp(url, S[k].scheme, strlen(S[k].scheme))) break;
     if (k == sizeof(S) / sizeof(S[0])) {
-        snprintf(why, why_n, "нужен адрес вида https://… (DoH), tls://… (DoT), quic://… (DoQ), udp://… или tcp://…");
+        snprintf(why, why_n, "нужен адрес вида https://… (DoH), tls://… (DoT), quic://… (DoQ), h3://… (DoH по HTTP/3), udp://… или tcp://…");
         return -1;
     }
     const char *p = url + strlen(S[k].scheme);
@@ -746,8 +747,8 @@ int dnsurl_parse(const char *url, struct spec_dns_up *u, char *why, size_t why_n
     }
     const char *path = "/dns-query";
     if (*p == '/') {
-        if (S[k].proto != DNSP_DOH) {
-            snprintf(why, why_n, "путь есть только у https://");
+        if (S[k].proto != DNSP_DOH && S[k].proto != DNSP_DOH3) {
+            snprintf(why, why_n, "путь есть только у https:// и h3://");
             return -1;
         }
         path = p;
@@ -774,6 +775,6 @@ int dnsurl_parse(const char *url, struct spec_dns_up *u, char *why, size_t why_n
     u->proto = (unsigned char)S[k].proto;
     u->port = (unsigned short)port;
     snprintf(u->host, sizeof(u->host), "%s", host);
-    snprintf(u->path, sizeof(u->path), "%s", S[k].proto == DNSP_DOH ? path : "");
+    snprintf(u->path, sizeof(u->path), "%s", S[k].proto == DNSP_DOH || S[k].proto == DNSP_DOH3 ? path : "");
     return 0;
 }
