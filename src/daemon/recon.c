@@ -331,7 +331,6 @@ static int room(void **arr, size_t *cap, size_t n, size_t esz) {
 int recon_plan_parse(const char *text, size_t n, struct recon_plan *p) {
     recon_plan_free(p);
     p->nftc = -1;
-    p->nftc = -1;
     int have_fp = 0;
     const char *end = text + n;
     for (const char *ln = text; ln < end; ) {
