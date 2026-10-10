@@ -27,6 +27,7 @@
 #define STEER_BLAKE3_H
 #include <stdint.h>
 #include <string.h>
+#include "wipe.h"
 
 #define B3_CHUNK_START 1u
 #define B3_CHUNK_END 2u
@@ -183,8 +184,8 @@ static void b3_derive_key(unsigned char *out, size_t out_n, const void *ctx, siz
         key[i] = (uint32_t)ck[4 * i] | (uint32_t)ck[4 * i + 1] << 8 |
                  (uint32_t)ck[4 * i + 2] << 16 | (uint32_t)ck[4 * i + 3] << 24;
     b3_run(key, B3_DERIVE_MATERIAL, material, material_n, out, out_n);
-    memset(ck, 0, sizeof ck);
-    memset(key, 0, sizeof key);
+    steer_wipe(ck, sizeof ck);
+    steer_wipe(key, sizeof key);
 }
 
 #endif
