@@ -91,8 +91,13 @@ fi
 # wolfSSL, нужная libsteer: слой примитивов, обёртка QUIC (qcssl.c) и криптобэкенд ngtcp2. Из
 # архива берутся все члены, а не достижимые: сборщик выбросит лишнее, а список экспорта от этого
 # зависеть не должен (nm на образе сборщика нет — список считается здесь, один на все архитектуры).
+# Слой примитивов на 32-битном MIPS идёт своей веткой ChaCha20-Poly1305 (SC_CP_OWN в scrypto.c) и зовёт
+# другие функции wolfSSL (wc_Chacha_SetIV, wc_Chacha_Process), чем на остальных целях
+# (wc_ChaCha20Poly1305_*_ex): символы «не зависят от архитектуры» только если взять оба набора.
+# shellcheck disable=SC2086
+$CC $F -DSTEER_CP_OWN -c $CRYPTO -o "$W/scrypto-own.o"
 {
-    nm -u "$W/lib/$(echo "$CRYPTO" | tr / _).o" "$W/lib/$(echo "$(profile_var QUIC_SSL_SRC)" | tr / _).o"
+    nm -u "$W/lib/$(echo "$CRYPTO" | tr / _).o" "$W/scrypto-own.o" "$W/lib/$(echo "$(profile_var QUIC_SSL_SRC)" | tr / _).o"
     nm -u "$W/libngtcp2.a"
 } | awk '$1=="U" && ($2 ~ /^(wc_|wolf)/) {print $2}' | sort -u > "$W/wneed"
 

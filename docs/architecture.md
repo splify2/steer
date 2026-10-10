@@ -495,6 +495,18 @@ FIPS 204) и BLAKE3 (`sc_blake3_*`). Первые два стоят на wolfSSL
 X25519MLKEM768 в TLS 1.3 и REALITY (`src/proto/tls`), подпись ML-DSA-65 у REALITY
 (`certverify.c`) и VLESS encryption (`src/proto/transport/trvenc.c`), см. [vless.md](vless.md).
 
+**ChaCha20-Poly1305 на 32-битном MIPS.** На роутерах без AES и SIMD (MT7621, mipsel_24kc и mips_24kc)
+это шифр туннеля, а поставляемая wolfSSL без ассемблера считает его медленно: Poly1305 — 26-битными
+ветвями с побайтовой сборкой слов, а гамма ChaCha20 накладывается по байту, когда данные не выровнены
+так же, как блок гаммы (запись с 5-байтным заголовком TLS невыровнена, как правило). Поэтому на
+`__mips__` без 64 битов слой `scrypto.c` собирает AEAD сам по RFC 8439 (ветка `SC_CP_OWN`): Poly1305
+на 32-битных словах и multu/maddu — `src/lib/poly1305_32.h`, ChaCha20 — из wolfSSL, но невыровненные
+данные идут через выровненный буфер на 256 байт. На остальных целях слой зовёт
+`wc_ChaCha20Poly1305_*_ex` как прежде (на aarch64 у wolfSSL свой ассемблер — NEON для ChaCha20 и
+Poly1305, расширение Crypto для AES). Ветку сверяет с wolfSSL `tests/cpmatch.c`: на хосте с
+переносимой арифметикой — в `make ext-test`, с настоящими командами MIPS — `tests/cpmips.sh` под
+qemu-user (в `make test` не входит).
+
 **В пакете роутера** библиотека — `libsteer-wolfssl.so.<версия wolfSSL>`, слой `scrypto.c` — в
 `libsteer.so`, и `libsteer.so` зависит от неё (DT_NEEDED). Наружу из `libsteer-wolfssl.so` выходят
 символы `wc_*` и `wolfSSL_*`, которые зовёт слой (`build/wolfssl/libsteer-wolfssl.map`), и

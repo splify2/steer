@@ -96,6 +96,18 @@ echo "ext-test: собираю и прогоняю scryptomatch..."
 $CC -O2 -g -w $STEER_INC -Itests -o "$BUILD/scryptomatch" tests/scryptomatch.c $CRYPTO -lpthread
 "$BUILD/scryptomatch"
 
+# cpmatch — ветка ChaCha20-Poly1305 для 32-битного MIPS (scrypto.c, SC_CP_OWN; poly1305_32.h) на хосте,
+# с переносимой арифметикой вместо multu/maddu, против wolfSSL; сама scryptomatch на этой же ветке — по векторам RFC 8439.
+# Настоящие команды MIPS — tests/cpmips.sh под qemu-user (в make test не входит).
+echo "ext-test: собираю и прогоняю cpmatch..."
+# shellcheck disable=SC2086
+$CC -O2 -g -w $STEER_INC $WCFLAGS -DSTEER_CP_OWN -DSTEER_POLY32_PORTABLE -c src/lib/scrypto.c -o "$BUILD/wolfssl-host/scrypto-own-$CCTAG.o"
+# shellcheck disable=SC2086
+$CC -O2 -g -w $STEER_INC $WCFLAGS -Isrc/lib -Itests -o "$BUILD/cpmatch" tests/cpmatch.c "$BUILD/wolfssl-host/scrypto-own-$CCTAG.o" $WLIB -lpthread
+"$BUILD/cpmatch"
+$CC -O2 -g -w $STEER_INC -Itests -o "$BUILD/scryptomatch-own" tests/scryptomatch.c "$BUILD/wolfssl-host/scrypto-own-$CCTAG.o" $WLIB -lpthread
+"$BUILD/scryptomatch-own" | tail -1
+
 echo "ext-test: собираю и прогоняю hellofreeze..."
 $CC -O2 -w $STEER_INC -o "$BUILD/hellofreeze" tests/hellofreeze.c $CRYPTO -lpthread
 "$BUILD/hellofreeze"
