@@ -237,7 +237,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                  "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
                  "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\",\"awg\","
                  "\"via\",\"failed\",\"groups\",\"balance_by\",\"exclude\",\"active_nodes\","
-                 "\"dns_groups\",\"dns_other\"]",
+                 "\"dns_groups\",\"dns_other\",\"dns_fragment\",\"dns_h3\"]",
             (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды

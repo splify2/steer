@@ -678,6 +678,8 @@ v6-двойник (раздел «IPv6 правил» ниже), резолве�
   | `active_nodes` | Пул узлов туннеля — ключи `active`, `by`, `interval`, `silence` у выхода `kind: tunnel` спеки v2 ([spec-v2.md](spec-v2.md), «Пул узлов туннеля»); у выхода в `status` — объект `vless` (`proxy`) с полем `active` (ниже), в `helper` демона — поле `active`. |
   | `dns_groups` | Группа серверов DNS в `dns.upstreams` спеки v2 — `{ servers, mode: race \| failover }` ([spec-v2.md](spec-v2.md), раздел `dns`); годится в `dns.upstream`, `dns.other` и `dns` правила; в `dns-log` — `proto: "group"` с членами. |
 | `dns_other` | Ключ `dns.other` спеки v2: сервер или группа для имён вне правил, с запасным путём на DNS роутера; в `dns-log` — объект `other` и поле `dns` у имени. |
+| `dns_fragment` | Ключ `fragment` у DoT- и DoH-апстрима (`tls://`, `https://`): первая запись TLS уходит двумя записями. |
+| `dns_h3` | Апстрим DNS-over-HTTP/3: адрес `h3://имя[:порт][/путь]`. |
 | `spec_schema2` | Спека `schema: 2` — сужение канала по протоколу и портам (§1). |
   | `via` | Ключ `via` у выхода (§1) и поле `via` в `status` (ниже). |
   | `status_cache` | `status --fast` отдаёт запомненный ответ с `"cached": true` (§6, «Память состояния»). |
