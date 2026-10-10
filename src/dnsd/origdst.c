@@ -44,7 +44,7 @@ int ct_origdst(const struct sockaddr_storage *cli, const struct dnsd_local *loca
         setsockopt(g_ct_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
     static uint32_t seq;
-    uint8_t req[256];
+    _Alignas(8) uint8_t req[256];
     memset(req, 0, sizeof(req));
     struct nlmsghdr *nh = (struct nlmsghdr *)req;
     nh->nlmsg_type = (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET;
@@ -85,7 +85,7 @@ int ct_origdst(const struct sockaddr_storage *cli, const struct dnsd_local *loca
     struct sockaddr_nl k = { .nl_family = AF_NETLINK };
     if (sendto(g_ct_fd, req, pos, 0, (struct sockaddr *)&k, sizeof(k)) < 0) return -1;
 
-    uint8_t buf[4096];
+    _Alignas(8) uint8_t buf[4096];
     int dst_attr = fam == AF_INET ? CTA_IP_V4_DST : CTA_IP_V6_DST;
     for (;;) {
         ssize_t n = recv(g_ct_fd, buf, sizeof(buf), 0);
