@@ -1,0 +1,3557 @@
+{
+ "version": 2,
+ "warnings": [
+  {
+   "CodeCurrent": 3331824952,
+   "CodeNext": 817597326,
+   "CodePrev": 3261435277,
+   "ErrorCode": "V1042",
+   "FileName": "stack.h",
+   "Message": "This file is marked with copyleft license, which requires you to open the derived source code."
+  },
+  {
+   "CodeCurrent": 1352517,
+   "CodeNext": 4284689339,
+   "CodePrev": 4186257187,
+   "ErrorCode": "V547",
+   "FileName": "conns.c",
+   "Message": "Expression '!o' is always false."
+  },
+  {
+   "CodeCurrent": 1707439727,
+   "CodeNext": 5956772,
+   "CodePrev": 283777,
+   "ErrorCode": "V576",
+   "FileName": "check.c",
+   "Message": "Incorrect format. Consider checking the eighth actual argument of the 'snprintf' function. The SIGNED integer type argument is expected."
+  },
+  {
+   "CodeCurrent": 1686476474,
+   "CodeNext": 125,
+   "CodePrev": 15119,
+   "ErrorCode": "V1026",
+   "FileName": "h2.c",
+   "Message": "The 'h->recv_credit' variable is incremented in the loop. Undefined behavior will occur in case of signed integer overflow."
+  },
+  {
+   "CodeCurrent": 887325282,
+   "CodeNext": 12045,
+   "CodePrev": 4033947231,
+   "ErrorCode": "V641",
+   "FileName": "diag.c",
+   "Message": "The size of the '& dst' buffer is not a multiple of the element size of the type 'struct sockaddr'."
+  },
+  {
+   "CodeCurrent": 1426495789,
+   "CodeNext": 344076349,
+   "CodePrev": 1256617562,
+   "ErrorCode": "V526",
+   "FileName": "fogroup.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 2043403977,
+   "CodeNext": 11233,
+   "CodePrev": 1727855140,
+   "ErrorCode": "V575",
+   "FileName": "srsread.c",
+   "Message": "The potential null pointer is passed into 'fclose' function. Inspect the first argument."
+  },
+  {
+   "CodeCurrent": 2151198669,
+   "CodeNext": 0,
+   "CodePrev": 3154935920,
+   "ErrorCode": "V1065",
+   "FileName": "xshub.c",
+   "Message": "Expression can be simplified, check '_ + _' and similar operands."
+  },
+  {
+   "CodeCurrent": 2294628780,
+   "CodeNext": 100366569,
+   "CodePrev": 3658480196,
+   "ErrorCode": "V1008",
+   "FileName": "tgws.c",
+   "Message": "Consider inspecting the 'for' operator. No more than one iteration of the loop will be performed."
+  },
+  {
+   "CodeCurrent": 106387461,
+   "CodeNext": 125,
+   "CodePrev": 1198570990,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_on_timer'."
+  },
+  {
+   "CodeCurrent": 1426154479,
+   "CodeNext": 3547423667,
+   "CodePrev": 21684683,
+   "ErrorCode": "V658",
+   "FileName": "hy2conn.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '>' comparison operation can potentially behave unexpectedly. Consider inspecting the 'room > sizeof msg - hl' expression."
+  },
+  {
+   "CodeCurrent": 1925027334,
+   "CodeNext": 1829476331,
+   "CodePrev": 403,
+   "ErrorCode": "V526",
+   "FileName": "tgws.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 3246290907,
+   "CodeNext": 3874679984,
+   "CodePrev": 333439261,
+   "ErrorCode": "V1027",
+   "FileName": "quic.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 2469977812,
+   "CodeNext": 10723867,
+   "CodePrev": 694633779,
+   "ErrorCode": "V641",
+   "FileName": "spec.h",
+   "Message": "The size of the allocated memory buffer is not a multiple of the element size."
+  },
+  {
+   "CodeCurrent": 6149989,
+   "CodeNext": 265653,
+   "CodePrev": 9050,
+   "ErrorCode": "V1048",
+   "FileName": "tls13.c",
+   "Message": "The 'ret' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 3854714370,
+   "CodeNext": 0,
+   "CodePrev": 530000953,
+   "ErrorCode": "V575",
+   "FileName": "registry.c",
+   "Message": "The potential null pointer is passed into 'strcmp' function. Inspect the first argument."
+  },
+  {
+   "CodeCurrent": 98157,
+   "CodeNext": 11103,
+   "CodePrev": 1793602986,
+   "ErrorCode": "V547",
+   "FileName": "xsclient.c",
+   "Message": "Expression 'n < _' is always false."
+  },
+  {
+   "CodeCurrent": 6373195,
+   "CodeNext": 2437535737,
+   "CodePrev": 339077957,
+   "ErrorCode": "V522",
+   "FileName": "legacy.c",
+   "Message": "There might be dereferencing of a potential null pointer 'c'."
+  },
+  {
+   "CodeCurrent": 3180389549,
+   "CodeNext": 3114853549,
+   "CodePrev": 2114075824,
+   "ErrorCode": "V525",
+   "FileName": "tun.c",
+   "Message": "The code contains the collection of similar blocks. Check items '_', '_', '_' in lines _, _, _."
+  },
+  {
+   "CodeCurrent": 1941380750,
+   "CodeNext": 18575545,
+   "CodePrev": 2049134537,
+   "ErrorCode": "V641",
+   "FileName": "proxy.c",
+   "Message": "The size of the '& a_' buffer is not a multiple of the element size of the type 'struct sockaddr'."
+  },
+  {
+   "CodeCurrent": 1839850908,
+   "CodeNext": 144360,
+   "CodePrev": 2663271431,
+   "ErrorCode": "V560",
+   "FileName": "tun.c",
+   "Message": "A part of conditional expression is always false: tot < _."
+  },
+  {
+   "CodeCurrent": 3950874614,
+   "CodeNext": 2140929076,
+   "CodePrev": 675889,
+   "ErrorCode": "V658",
+   "FileName": "stack.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '>' comparison operation can potentially behave unexpectedly. Consider inspecting the 'n - sent > seg' expression."
+  },
+  {
+   "CodeCurrent": 4250733307,
+   "CodeNext": 70057,
+   "CodePrev": 3006874481,
+   "ErrorCode": "V576",
+   "FileName": "srsread.c",
+   "Message": "Incorrect format. Consider checking the third actual argument of the 'fprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 1477837,
+   "CodeNext": 377717787,
+   "CodePrev": 3053,
+   "ErrorCode": "V547",
+   "FileName": "nftnl.c",
+   "Message": "Expression 'ttl < _' is always false."
+  },
+  {
+   "CodeCurrent": 2125372120,
+   "CodeNext": 70057,
+   "CodePrev": 3753943773,
+   "ErrorCode": "V576",
+   "FileName": "srsread.c",
+   "Message": "Incorrect format. Consider checking the third actual argument of the 'fprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 1938015544,
+   "CodeNext": 1336327491,
+   "CodePrev": 3055350060,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 2181846707,
+   "CodeNext": 3378127315,
+   "CodePrev": 4273913799,
+   "ErrorCode": "V501",
+   "FileName": "xswire.h",
+   "Message": "There are identical sub-expressions to the left and to the right of the '==' operator: ((_ + _ + _) + _) == _ + _ + _ + _"
+  },
+  {
+   "CodeCurrent": 19967961,
+   "CodeNext": 4995947,
+   "CodePrev": 2701657577,
+   "ErrorCode": "V525",
+   "FileName": "xswire.c",
+   "Message": "The code contains the collection of similar blocks. Check items '_x_', '_x_', '_x_' in lines _, _, _."
+  },
+  {
+   "CodeCurrent": 371290525,
+   "CodeNext": 11888415,
+   "CodePrev": 126766486,
+   "ErrorCode": "V547",
+   "FileName": "xswire.c",
+   "Message": "Expression 'len < _' is always false."
+  },
+  {
+   "CodeCurrent": 3530765632,
+   "CodeNext": 777512773,
+   "CodePrev": 42095,
+   "ErrorCode": "V526",
+   "FileName": "v2.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 3842097377,
+   "CodeNext": 39874929,
+   "CodePrev": 867,
+   "ErrorCode": "V547",
+   "FileName": "xswire.c",
+   "Message": "Expression 'n > sizeof (r->buf)' is always false."
+  },
+  {
+   "CodeCurrent": 768086617,
+   "CodeNext": 197389725,
+   "CodePrev": 2558790589,
+   "ErrorCode": "V560",
+   "FileName": "xslink.c",
+   "Message": "A part of conditional expression is always true: * p."
+  },
+  {
+   "CodeCurrent": 145605,
+   "CodeNext": 125,
+   "CodePrev": 2754783799,
+   "ErrorCode": "V557",
+   "FileName": "xslink.c",
+   "Message": "Array overrun is possible. The value of 'n' index could reach _."
+  },
+  {
+   "CodeCurrent": 1673555916,
+   "CodeNext": 35971505,
+   "CodePrev": 1309218841,
+   "ErrorCode": "V1065",
+   "FileName": "xshub.c",
+   "Message": "Expression can be simplified, check '_' and similar operands."
+  },
+  {
+   "CodeCurrent": 2151198669,
+   "CodeNext": 0,
+   "CodePrev": 3154935920,
+   "ErrorCode": "V1065",
+   "FileName": "xshub.c",
+   "Message": "Expression can be simplified, check '_' and similar operands."
+  },
+  {
+   "CodeCurrent": 1889112286,
+   "CodeNext": 3406501635,
+   "CodePrev": 2635587074,
+   "ErrorCode": "V526",
+   "FileName": "dup.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 332122053,
+   "CodeNext": 26115,
+   "CodePrev": 5008929,
+   "ErrorCode": "V1004",
+   "FileName": "proxy.c",
+   "Message": "The 'u' pointer was used unsafely after it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 2151198669,
+   "CodeNext": 0,
+   "CodePrev": 3154935920,
+   "ErrorCode": "V1065",
+   "FileName": "xshub.c",
+   "Message": "Expression can be simplified, check '(_ + _ + _) + _' and similar operands."
+  },
+  {
+   "CodeCurrent": 1846089749,
+   "CodeNext": 1456,
+   "CodePrev": 773458047,
+   "ErrorCode": "V576",
+   "FileName": "xshub.c",
+   "Message": "Incorrect format. Consider checking the fourth actual argument of the 'fprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 3240296973,
+   "CodeNext": 1938852901,
+   "CodePrev": 839915344,
+   "ErrorCode": "V576",
+   "FileName": "xshub.c",
+   "Message": "Incorrect format. Consider checking the third actual argument of the 'fprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 4099807753,
+   "CodeNext": 856114428,
+   "CodePrev": 4070404780,
+   "ErrorCode": "V547",
+   "FileName": "xshake.c",
+   "Message": "Expression 'o + _ + body + (_ + (_ + _)) > cap' is always false."
+  },
+  {
+   "CodeCurrent": 534933258,
+   "CodeNext": 125,
+   "CodePrev": 20779769,
+   "ErrorCode": "V547",
+   "FileName": "xshake.c",
+   "Message": "Expression 'nl < _' is always true."
+  },
+  {
+   "CodeCurrent": 551838868,
+   "CodeNext": 3421676644,
+   "CodePrev": 2648889161,
+   "ErrorCode": "V512",
+   "FileName": "conns.c",
+   "Message": "A call of the 'memcpy' function will lead to a buffer overflow."
+  },
+  {
+   "CodeCurrent": 2796562242,
+   "CodeNext": 0,
+   "CodePrev": 0,
+   "ErrorCode": "V779",
+   "FileName": "tls13.c",
+   "Message": "Unreachable code detected. It is possible that an error is present."
+  },
+  {
+   "CodeCurrent": 96916729,
+   "CodeNext": 769991809,
+   "CodePrev": 1325289,
+   "ErrorCode": "V581",
+   "FileName": "xsclient.c",
+   "Message": "The conditional expressions of the 'if' statements situated alongside each other are identical. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 3951413635,
+   "CodeNext": 1511283545,
+   "CodePrev": 1511349969,
+   "ErrorCode": "V522",
+   "FileName": "vlmain.c",
+   "Message": "There might be dereferencing of a potential null pointer 'o'."
+  },
+  {
+   "CodeCurrent": 3951413635,
+   "CodeNext": 88840,
+   "CodePrev": 1511349969,
+   "ErrorCode": "V522",
+   "FileName": "vlmain.c",
+   "Message": "There might be dereferencing of a potential null pointer 'o'."
+  },
+  {
+   "CodeCurrent": 3951413635,
+   "CodeNext": 88840,
+   "CodePrev": 1511349969,
+   "ErrorCode": "V595",
+   "FileName": "vlmain.c",
+   "Message": "The 'o' pointer was utilized before it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 2249262807,
+   "CodeNext": 330478593,
+   "CodePrev": 3887536995,
+   "ErrorCode": "V584",
+   "FileName": "vldial.c",
+   "Message": "The '_' value is present on both sides of the '>=' operator. The expression is incorrect or it can be simplified."
+  },
+  {
+   "CodeCurrent": 799637526,
+   "CodeNext": 1086079540,
+   "CodePrev": 403395,
+   "ErrorCode": "V773",
+   "FileName": "vldial.c",
+   "Message": "The return value of the 'dg_reserve' function is not saved. A memory leak is possible."
+  },
+  {
+   "CodeCurrent": 2054884163,
+   "CodeNext": 11233,
+   "CodePrev": 161751163,
+   "ErrorCode": "V526",
+   "FileName": "folat.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 2754953636,
+   "CodeNext": 2573201347,
+   "CodePrev": 42007,
+   "ErrorCode": "V560",
+   "FileName": "sublink.c",
+   "Message": "A part of conditional expression is always true: !bad."
+  },
+  {
+   "CodeCurrent": 3766161133,
+   "CodeNext": 123,
+   "CodePrev": 144920517,
+   "ErrorCode": "V1086",
+   "FileName": "tgws.c",
+   "Message": "A call of the 'memset' function will lead to underflow of the buffer 'body'."
+  },
+  {
+   "CodeCurrent": 1966941301,
+   "CodeNext": 457496832,
+   "CodePrev": 62961923,
+   "ErrorCode": "V581",
+   "FileName": "nftdump.c",
+   "Message": "The conditional expressions of the 'if' statements situated alongside each other are identical. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 105492171,
+   "CodeNext": 1356797,
+   "CodePrev": 3053,
+   "ErrorCode": "V781",
+   "FileName": "sublink.c",
+   "Message": "The value of the 'l' index is checked after it was used. Perhaps there is a mistake in program logic."
+  },
+  {
+   "CodeCurrent": 616902641,
+   "CodeNext": 3053,
+   "CodePrev": 921,
+   "ErrorCode": "V781",
+   "FileName": "sublink.c",
+   "Message": "The value of the 'l' index is checked after it was used. Perhaps there is a mistake in program logic."
+  },
+  {
+   "CodeCurrent": 312302909,
+   "CodeNext": 139601,
+   "CodePrev": 125,
+   "ErrorCode": "V560",
+   "FileName": "sub.c",
+   "Message": "A part of conditional expression is always true: !first."
+  },
+  {
+   "CodeCurrent": 2088083881,
+   "CodeNext": 23062393,
+   "CodePrev": 338961,
+   "ErrorCode": "V658",
+   "FileName": "trws.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '>' comparison operation can potentially behave unexpectedly. Consider inspecting the 'n - off > _' expression."
+  },
+  {
+   "CodeCurrent": 3747897237,
+   "CodeNext": 41251,
+   "CodePrev": 677921,
+   "ErrorCode": "V658",
+   "FileName": "trvenc.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '>' comparison operation can potentially behave unexpectedly. Consider inspecting the 'n - done > _' expression."
+  },
+  {
+   "CodeCurrent": 608327471,
+   "CodeNext": 2148555836,
+   "CodePrev": 86724537,
+   "ErrorCode": "V658",
+   "FileName": "urltest.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '>' comparison operation can potentially behave unexpectedly. Consider inspecting the 'take > sizeof (u->buf) - _ - u->bn' expression."
+  },
+  {
+   "CodeCurrent": 254725941,
+   "CodeNext": 1170052554,
+   "CodePrev": 23145,
+   "ErrorCode": "V522",
+   "FileName": "trsec.c",
+   "Message": "There might be dereferencing of a potential null pointer 'g_nopq'. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1387698650,
+   "CodeNext": 326157280,
+   "CodePrev": 73365809,
+   "ErrorCode": "V641",
+   "FileName": "urltls.c",
+   "Message": "The size of the '& w->dst' buffer is not a multiple of the element size of the type 'const struct sockaddr_in_'."
+  },
+  {
+   "CodeCurrent": 2277208163,
+   "CodeNext": 1859448853,
+   "CodePrev": 142990365,
+   "ErrorCode": "V526",
+   "FileName": "main.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 4289961185,
+   "CodeNext": 380487076,
+   "CodePrev": 2418680676,
+   "ErrorCode": "V522",
+   "FileName": "tls13.c",
+   "Message": "Dereferencing of the null pointer 'auth' might take place. The null pointer is passed into 'handshake' function. Inspect the sixth argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 522678757,
+   "CodeNext": 737785471,
+   "CodePrev": 3759886041,
+   "ErrorCode": "V658",
+   "FileName": "stack.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '>' comparison operation can potentially behave unexpectedly."
+  },
+  {
+   "CodeCurrent": 3322945774,
+   "CodeNext": 4221421829,
+   "CodePrev": 2921253,
+   "ErrorCode": "V1037",
+   "FileName": "srsread.c",
+   "Message": "Two or more case-branches perform the same actions. Check lines: _, _"
+  },
+  {
+   "CodeCurrent": 1348521,
+   "CodeNext": 10964525,
+   "CodePrev": 3881966985,
+   "ErrorCode": "V525",
+   "FileName": "reality.c",
+   "Message": "The code contains the collection of similar blocks. Check items 'put_', 'put_', 'put_' in lines _, _, _."
+  },
+  {
+   "CodeCurrent": 1476892741,
+   "CodeNext": 0,
+   "CodePrev": 173643507,
+   "ErrorCode": "V525",
+   "FileName": "reality.c",
+   "Message": "The code contains the collection of similar blocks. Check items 'put_', 'put_', 'put_' in lines _, _, _."
+  },
+  {
+   "CodeCurrent": 1281904985,
+   "CodeNext": 1240629493,
+   "CodePrev": 1268345801,
+   "ErrorCode": "V614",
+   "FileName": "reality.c",
+   "Message": "Potentially uninitialized buffer 'tag' used. Consider checking the second actual argument of the 'memcpy' function."
+  },
+  {
+   "CodeCurrent": 1386774626,
+   "CodeNext": 125,
+   "CodePrev": 24757697,
+   "ErrorCode": "V560",
+   "FileName": "sub.c",
+   "Message": "A part of conditional expression is always false: _."
+  },
+  {
+   "CodeCurrent": 3258997183,
+   "CodeNext": 17733,
+   "CodePrev": 937400780,
+   "ErrorCode": "V526",
+   "FileName": "nftdump.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 2487064409,
+   "CodeNext": 12466821,
+   "CodePrev": 13017115,
+   "ErrorCode": "V1026",
+   "FileName": "h2.c",
+   "Message": "The 'h->recv_credit_conn' variable is incremented in the loop. Undefined behavior will occur in case of signed integer overflow."
+  },
+  {
+   "CodeCurrent": 4289961185,
+   "CodeNext": 380487076,
+   "CodePrev": 2418680676,
+   "ErrorCode": "V522",
+   "FileName": "tls13.c",
+   "Message": "Dereferencing of the null pointer 'auth' might take place. The potential null pointer is passed into 'handshake' function. Inspect the sixth argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 2348806591,
+   "CodeNext": 125,
+   "CodePrev": 2966402137,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 3127147361,
+   "CodeNext": 3023760048,
+   "CodePrev": 9999181,
+   "ErrorCode": "V522",
+   "FileName": "h2.c",
+   "Message": "Dereferencing of the null pointer 'body' might take place. The null pointer is passed into 'frame_out' function. Inspect the fifth argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1538603909,
+   "CodeNext": 2714301525,
+   "CodePrev": 3686081412,
+   "ErrorCode": "V1037",
+   "FileName": "certverify.c",
+   "Message": "Two or more case-branches perform the same actions. Check lines: _, _"
+  },
+  {
+   "CodeCurrent": 3686081412,
+   "CodeNext": 1538603909,
+   "CodePrev": 730982754,
+   "ErrorCode": "V1037",
+   "FileName": "certverify.c",
+   "Message": "Two or more case-branches perform the same actions. Check lines: _, _"
+  },
+  {
+   "CodeCurrent": 9501,
+   "CodeNext": 868587881,
+   "CodePrev": 2021,
+   "ErrorCode": "V776",
+   "FileName": "tgws.c",
+   "Message": "Potentially infinite loop."
+  },
+  {
+   "CodeCurrent": 2862923245,
+   "CodeNext": 11233,
+   "CodePrev": 1231327590,
+   "ErrorCode": "V526",
+   "FileName": "srs.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 986368372,
+   "CodeNext": 4466317,
+   "CodePrev": 3725011758,
+   "ErrorCode": "V526",
+   "FileName": "subfetch.c",
+   "Message": "The 'strncasecmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 3467700394,
+   "CodeNext": 1962905900,
+   "CodePrev": 3053,
+   "ErrorCode": "V1027",
+   "FileName": "urltest.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 2666810642,
+   "CodeNext": 2152966006,
+   "CodePrev": 3703688313,
+   "ErrorCode": "V526",
+   "FileName": "supd.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 4090472431,
+   "CodeNext": 2818405,
+   "CodePrev": 3067238209,
+   "ErrorCode": "V526",
+   "FileName": "tgws.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 3331824952,
+   "CodeNext": 817597326,
+   "CodePrev": 3261435277,
+   "ErrorCode": "V1042",
+   "FileName": "err.h",
+   "Message": "This file is marked with copyleft license, which requires you to open the derived source code."
+  },
+  {
+   "CodeCurrent": 1492278729,
+   "CodeNext": 494528,
+   "CodePrev": 647028397,
+   "ErrorCode": "V526",
+   "FileName": "hwid.c",
+   "Message": "The 'strncmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1563608369,
+   "CodeNext": 3935102375,
+   "CodePrev": 2668580862,
+   "ErrorCode": "V522",
+   "FileName": "xshake.c",
+   "Message": "Dereferencing of the null pointer 'plain' might take place. The null pointer is passed into 'encrypt_and_hash' function. Inspect the second argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 3072657620,
+   "CodeNext": 1849764812,
+   "CodePrev": 2969,
+   "ErrorCode": "V1048",
+   "FileName": "trvenc.c",
+   "Message": "The 'rc' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 1784633722,
+   "CodeNext": 9576361,
+   "CodePrev": 989467,
+   "ErrorCode": "V1071",
+   "FileName": "rtnl.c",
+   "Message": "Consider inspecting the 'rtnl_talk' function. The return value is not always used. Total calls: _, discarded results: _."
+  },
+  {
+   "CodeCurrent": 730982754,
+   "CodeNext": 3686081412,
+   "CodePrev": 91941195,
+   "ErrorCode": "V1037",
+   "FileName": "certverify.c",
+   "Message": "Two or more case-branches perform the same actions. Check lines: _, _"
+  },
+  {
+   "CodeCurrent": 1029859994,
+   "CodeNext": 3829907644,
+   "CodePrev": 4280769718,
+   "ErrorCode": "V1027",
+   "FileName": "quic.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 2815222517,
+   "CodeNext": 30712233,
+   "CodePrev": 4263632495,
+   "ErrorCode": "V526",
+   "FileName": "quic.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 2196558084,
+   "CodeNext": 125,
+   "CodePrev": 125,
+   "ErrorCode": "V547",
+   "FileName": "quic.c",
+   "Message": "Expression 'q->closed' is always false."
+  },
+  {
+   "CodeCurrent": 1679852604,
+   "CodeNext": 823249716,
+   "CodePrev": 6069913,
+   "ErrorCode": "V658",
+   "FileName": "pxwire.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'key_n - have < _' expression."
+  },
+  {
+   "CodeCurrent": 3331824952,
+   "CodeNext": 817597326,
+   "CodePrev": 3261435277,
+   "ErrorCode": "V1042",
+   "FileName": "quic.h",
+   "Message": "This file is marked with copyleft license, which requires you to open the derived source code."
+  },
+  {
+   "CodeCurrent": 3951094147,
+   "CodeNext": 1163723396,
+   "CodePrev": 1511349969,
+   "ErrorCode": "V522",
+   "FileName": "pxmain.c",
+   "Message": "There might be dereferencing of a potential null pointer 'o'."
+  },
+  {
+   "CodeCurrent": 1451316385,
+   "CodeNext": 1511607004,
+   "CodePrev": 0,
+   "ErrorCode": "V525",
+   "FileName": "proxy.c",
+   "Message": "The code contains the collection of similar blocks. Check items 'on_sighup', 'on_sigterm', 'on_sigterm' in lines _, _, _."
+  },
+  {
+   "CodeCurrent": 1144467414,
+   "CodeNext": 4019371756,
+   "CodePrev": 773458047,
+   "ErrorCode": "V576",
+   "FileName": "xshub.c",
+   "Message": "Incorrect format. Consider checking the fourth actual argument of the 'fprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 1218221787,
+   "CodeNext": 40071095,
+   "CodePrev": 1762454319,
+   "ErrorCode": "V526",
+   "FileName": "cli.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 326157280,
+   "CodeNext": 372175,
+   "CodePrev": 1387698650,
+   "ErrorCode": "V1027",
+   "FileName": "urltls.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 3124980727,
+   "CodeNext": 1562973213,
+   "CodePrev": 3106282940,
+   "ErrorCode": "V522",
+   "FileName": "obfs.c",
+   "Message": "There might be dereferencing of a potential null pointer 'cm'."
+  },
+  {
+   "CodeCurrent": 80447,
+   "CodeNext": 125,
+   "CodePrev": 784449905,
+   "ErrorCode": "V519",
+   "FileName": "trvenc.c",
+   "Message": "The 'have_tmp' variable is assigned values twice successively. Perhaps this is a mistake. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 3375624048,
+   "CodeNext": 173298035,
+   "CodePrev": 0,
+   "ErrorCode": "V522",
+   "FileName": "obfs.c",
+   "Message": "Dereferencing of the null pointer 'payload' might take place. The null pointer is passed into 'obfs_build' function. Inspect the tenth argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1833210937,
+   "CodeNext": 3052838384,
+   "CodePrev": 3831349986,
+   "ErrorCode": "V1027",
+   "FileName": "dupdial.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 239749377,
+   "CodeNext": 2948475916,
+   "CodePrev": 267707,
+   "ErrorCode": "V530",
+   "FileName": "xslink.c",
+   "Message": "The return value of function 'strtol' is required to be utilized."
+  },
+  {
+   "CodeCurrent": 307892028,
+   "CodeNext": 666547730,
+   "CodePrev": 6594899,
+   "ErrorCode": "V576",
+   "FileName": "tgws.c",
+   "Message": "Incorrect format. Consider checking the third actual argument of the 'fprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 2472500320,
+   "CodeNext": 325822915,
+   "CodePrev": 918485638,
+   "ErrorCode": "V1086",
+   "FileName": "origdst.c",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'oaddr'."
+  },
+  {
+   "CodeCurrent": 93782795,
+   "CodeNext": 1908461033,
+   "CodePrev": 194205,
+   "ErrorCode": "V516",
+   "FileName": "dupdial.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_prepare'."
+  },
+  {
+   "CodeCurrent": 1859448853,
+   "CodeNext": 12127709,
+   "CodePrev": 2277208163,
+   "ErrorCode": "V526",
+   "FileName": "main.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1903469819,
+   "CodeNext": 3556801342,
+   "CodePrev": 2690106152,
+   "ErrorCode": "V576",
+   "FileName": "xsadmin.c",
+   "Message": "Incorrect format. Consider checking the second actual argument of the 'printf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 2267152425,
+   "CodeNext": 323510957,
+   "CodePrev": 2261149119,
+   "ErrorCode": "V575",
+   "FileName": "dup.c",
+   "Message": "The potential null pointer is passed into 'memcpy' function. Inspect the first argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1135950877,
+   "CodeNext": 3454199878,
+   "CodePrev": 2720917880,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_timeout_ms'."
+  },
+  {
+   "CodeCurrent": 2505241,
+   "CodeNext": 85630863,
+   "CodePrev": 1760575707,
+   "ErrorCode": "V1086",
+   "FileName": "blake3.h",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'w'."
+  },
+  {
+   "CodeCurrent": 227025862,
+   "CodeNext": 96453,
+   "CodePrev": 403,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'tls__has_record'."
+  },
+  {
+   "CodeCurrent": 3340671118,
+   "CodeNext": 2366424769,
+   "CodePrev": 195437,
+   "ErrorCode": "V1048",
+   "FileName": "hy2sub.c",
+   "Message": "The 'n->obfs' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 1337904632,
+   "CodeNext": 4218169146,
+   "CodePrev": 1657174667,
+   "ErrorCode": "V1027",
+   "FileName": "dupdial.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 681203888,
+   "CodeNext": 522525651,
+   "CodePrev": 401822950,
+   "ErrorCode": "V656",
+   "FileName": "ctnl.c",
+   "Message": "Variables 'dfd', 'xfd' are initialized through the call to the same function. It's probably an error or un-optimized code. Consider inspecting the 'ctnl_socket()' expression."
+  },
+  {
+   "CodeCurrent": 510518000,
+   "CodeNext": 41989,
+   "CodePrev": 678627,
+   "ErrorCode": "V629",
+   "FileName": "hy2wire.c",
+   "Message": "Consider inspecting the '_u << bits' expression. Bit shifting of the _-bit value with a subsequent expansion to the _-bit type."
+  },
+  {
+   "CodeCurrent": 1949521893,
+   "CodeNext": 973672765,
+   "CodePrev": 125,
+   "ErrorCode": "V525",
+   "FileName": "ctl.c",
+   "Message": "The code contains the collection of similar blocks. Check items 'srv_term', 'srv_term', 'srv_hup' in lines _, _, _."
+  },
+  {
+   "CodeCurrent": 3336406611,
+   "CodeNext": 750249020,
+   "CodePrev": 2260287257,
+   "ErrorCode": "V1026",
+   "FileName": "xslink.c",
+   "Message": "The 'o' variable is incremented in the loop. Undefined behavior will occur in case of signed integer overflow."
+  },
+  {
+   "CodeCurrent": 3261580009,
+   "CodeNext": 1999974963,
+   "CodePrev": 260953085,
+   "ErrorCode": "V1086",
+   "FileName": "tun.c",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'g->vh'."
+  },
+  {
+   "CodeCurrent": 3137108577,
+   "CodeNext": 23205,
+   "CodePrev": 1591592585,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'tls__free'."
+  },
+  {
+   "CodeCurrent": 734501717,
+   "CodeNext": 2201767088,
+   "CodePrev": 1708327664,
+   "ErrorCode": "V629",
+   "FileName": "hy2wire.c",
+   "Message": "Consider inspecting the '_u << bits' expression. Bit shifting of the _-bit value with a subsequent expansion to the _-bit type."
+  },
+  {
+   "CodeCurrent": 2423069547,
+   "CodeNext": 46753,
+   "CodePrev": 44951,
+   "ErrorCode": "V512",
+   "FileName": "conns.c",
+   "Message": "A call of the 'memcpy' function will lead to a buffer overflow."
+  },
+  {
+   "CodeCurrent": 3351760223,
+   "CodeNext": 11235,
+   "CodePrev": 96453,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: '!tls__write'."
+  },
+  {
+   "CodeCurrent": 356556770,
+   "CodeNext": 356753378,
+   "CodePrev": 45709,
+   "ErrorCode": "V525",
+   "FileName": "scrypto.c",
+   "Message": "The code contains the collection of similar blocks. Check items '_', '_', '_' in lines _, _, _."
+  },
+  {
+   "CodeCurrent": 2422689321,
+   "CodeNext": 2830425,
+   "CodePrev": 90035,
+   "ErrorCode": "V512",
+   "FileName": "ctnl.c",
+   "Message": "A call of the 'memcpy' function will lead to a buffer overflow."
+  },
+  {
+   "CodeCurrent": 59320630,
+   "CodeNext": 395081217,
+   "CodePrev": 182151016,
+   "ErrorCode": "V595",
+   "FileName": "gaiw.c",
+   "Message": "The 'res' pointer was utilized before it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 375508493,
+   "CodeNext": 89211717,
+   "CodePrev": 323510957,
+   "ErrorCode": "V557",
+   "FileName": "nftdump.c",
+   "Message": "Array overrun is possible. The value of 'i' index could reach _."
+  },
+  {
+   "CodeCurrent": 106387461,
+   "CodeNext": 125,
+   "CodePrev": 1198570990,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_stream_reset'."
+  },
+  {
+   "CodeCurrent": 3375624048,
+   "CodeNext": 173298035,
+   "CodePrev": 0,
+   "ErrorCode": "V522",
+   "FileName": "obfs.c",
+   "Message": "Dereferencing of the null pointer 'payload' might take place. The null pointer is passed into 'conn_send' function. Inspect the fourth argument. Check lines: _, _, _."
+  },
+  {
+   "CodeCurrent": 12122157,
+   "CodeNext": 5607,
+   "CodePrev": 18284394,
+   "ErrorCode": "V1037",
+   "FileName": "failover.c",
+   "Message": "Two or more case-branches perform the same actions. Check lines: _, _"
+  },
+  {
+   "CodeCurrent": 1198570990,
+   "CodeNext": 106387461,
+   "CodePrev": 313286209,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_fd'."
+  },
+  {
+   "CodeCurrent": 2514552236,
+   "CodeNext": 15739,
+   "CodePrev": 809837422,
+   "ErrorCode": "V522",
+   "FileName": "ech.c",
+   "Message": "Dereferencing of the null pointer 'ikm' might take place. The null pointer is passed into 'labeled_extract' function. Inspect the sixth argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1198570990,
+   "CodeNext": 106387461,
+   "CodePrev": 313286209,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_close'."
+  },
+  {
+   "CodeCurrent": 253188205,
+   "CodeNext": 2555225970,
+   "CodePrev": 1253224948,
+   "ErrorCode": "V590",
+   "FileName": "doh2.c",
+   "Message": "Consider inspecting the 'h.n > sizeof (hb) || h.n > _u' expression. The expression is excessive or contains a misprint."
+  },
+  {
+   "CodeCurrent": 3951094147,
+   "CodeNext": 1163723396,
+   "CodePrev": 1511349969,
+   "ErrorCode": "V595",
+   "FileName": "pxmain.c",
+   "Message": "The 'o' pointer was utilized before it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1297001,
+   "CodeNext": 2062202503,
+   "CodePrev": 1534888156,
+   "ErrorCode": "V1086",
+   "FileName": "dupdial.c",
+   "Message": "A call of the 'memset' function will lead to underflow of the buffer 'q'."
+  },
+  {
+   "CodeCurrent": 689008539,
+   "CodeNext": 11235,
+   "CodePrev": 171169,
+   "ErrorCode": "V547",
+   "FileName": "dup.c",
+   "Message": "Expression '!r->used' is always false."
+  },
+  {
+   "CodeCurrent": 2152966006,
+   "CodeNext": 1728233192,
+   "CodePrev": 2666810642,
+   "ErrorCode": "V526",
+   "FileName": "supd.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 155471218,
+   "CodeNext": 3053,
+   "CodePrev": 125,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'tls__has_record'."
+  },
+  {
+   "CodeCurrent": 2998947997,
+   "CodeNext": 125,
+   "CodePrev": 4239634748,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_free'."
+  },
+  {
+   "CodeCurrent": 2143711986,
+   "CodeNext": 30022,
+   "CodePrev": 1115805465,
+   "ErrorCode": "V773",
+   "FileName": "vldial.c",
+   "Message": "The return value of the 'dg_reserve' function is not saved. A memory leak is possible."
+  },
+  {
+   "CodeCurrent": 652033307,
+   "CodeNext": 17733,
+   "CodePrev": 258983593,
+   "ErrorCode": "V526",
+   "FileName": "dcache.c",
+   "Message": "The 'memcmp' function returns _ if corresponding buffers are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 92181503,
+   "CodeNext": 0,
+   "CodePrev": 286084,
+   "ErrorCode": "V1037",
+   "FileName": "failover.c",
+   "Message": "Two or more case-branches perform the same actions. Check lines: _, _"
+  },
+  {
+   "CodeCurrent": 2299419888,
+   "CodeNext": 19376771,
+   "CodePrev": 159367,
+   "ErrorCode": "V1086",
+   "FileName": "origdst.c",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'caddr'."
+  },
+  {
+   "CodeCurrent": 10675951,
+   "CodeNext": 316775261,
+   "CodePrev": 715335,
+   "ErrorCode": "V522",
+   "FileName": "supd.c",
+   "Message": "There might be dereferencing of a potential null pointer 'pid'."
+  },
+  {
+   "CodeCurrent": 292724409,
+   "CodeNext": 125,
+   "CodePrev": 4043188556,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 2125377880,
+   "CodeNext": 70057,
+   "CodePrev": 958660926,
+   "ErrorCode": "V576",
+   "FileName": "srsread.c",
+   "Message": "Incorrect format. Consider checking the third actual argument of the 'fprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 3971071065,
+   "CodeNext": 3053,
+   "CodePrev": 603750715,
+   "ErrorCode": "V547",
+   "FileName": "vision.c",
+   "Message": "Expression 'r + _ > n' is always true."
+  },
+  {
+   "CodeCurrent": 5775070,
+   "CodeNext": 310917,
+   "CodePrev": 96453,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'tls__free'."
+  },
+  {
+   "CodeCurrent": 715335,
+   "CodeNext": 10675951,
+   "CodePrev": 125,
+   "ErrorCode": "V522",
+   "FileName": "supd.c",
+   "Message": "There might be dereferencing of a potential null pointer 'st'."
+  },
+  {
+   "CodeCurrent": 1504558654,
+   "CodeNext": 3925811771,
+   "CodePrev": 538851862,
+   "ErrorCode": "V1027",
+   "FileName": "urltest.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 1622917106,
+   "CodeNext": 3157730948,
+   "CodePrev": 881229996,
+   "ErrorCode": "V522",
+   "FileName": "print.c",
+   "Message": "Dereferencing of the null pointer 'seed' might take place. The potential null pointer is passed into 'emit_mixed_' function. Inspect the third argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1137750623,
+   "CodeNext": 2122308543,
+   "CodePrev": 2367183694,
+   "ErrorCode": "V614",
+   "FileName": "srs.c",
+   "Message": "Uninitialized buffer 'key' used. Consider checking the third actual argument of the 'emit' function."
+  },
+  {
+   "CodeCurrent": 2648438753,
+   "CodeNext": 36311530,
+   "CodePrev": 0,
+   "ErrorCode": "V785",
+   "FileName": "tls13.c",
+   "Message": "Constant expression in switch statement."
+  },
+  {
+   "CodeCurrent": 3987183707,
+   "CodeNext": 86757205,
+   "CodePrev": 3635548155,
+   "ErrorCode": "V547",
+   "FileName": "tls13.c",
+   "Message": "Expression 'p >= n' is always false."
+  },
+  {
+   "CodeCurrent": 1198570990,
+   "CodeNext": 106387461,
+   "CodePrev": 313286209,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_free'."
+  },
+  {
+   "CodeCurrent": 2009021340,
+   "CodeNext": 3715724841,
+   "CodePrev": 331466597,
+   "ErrorCode": "V1027",
+   "FileName": "dupdial.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 3125412280,
+   "CodeNext": 125,
+   "CodePrev": 3750731723,
+   "ErrorCode": "V1095",
+   "FileName": "supd.c",
+   "Message": "Usage of potentially invalid handle. The value should be non-negative. Check the 'fd' argument."
+  },
+  {
+   "CodeCurrent": 399886963,
+   "CodeNext": 963326149,
+   "CodePrev": 3054577337,
+   "ErrorCode": "V522",
+   "FileName": "status.c",
+   "Message": "There might be dereferencing of a potential null pointer 'o_'."
+  },
+  {
+   "CodeCurrent": 3634892754,
+   "CodeNext": 3730223325,
+   "CodePrev": 125,
+   "ErrorCode": "V512",
+   "FileName": "dlog.c",
+   "Message": "A call of the 'memcpy' function will lead to overflow of the buffer 'a.sun_path'."
+  },
+  {
+   "CodeCurrent": 1387698650,
+   "CodeNext": 326157280,
+   "CodePrev": 73365809,
+   "ErrorCode": "V1027",
+   "FileName": "urltls.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 364791797,
+   "CodeNext": 3553793528,
+   "CodePrev": 20745395,
+   "ErrorCode": "V526",
+   "FileName": "v2.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 6373195,
+   "CodeNext": 2437535737,
+   "CodePrev": 14979,
+   "ErrorCode": "V522",
+   "FileName": "legacy.c",
+   "Message": "There might be dereferencing of a potential null pointer 'c'."
+  },
+  {
+   "CodeCurrent": 3193692641,
+   "CodeNext": 125,
+   "CodePrev": 149977,
+   "ErrorCode": "V547",
+   "FileName": "failover.c",
+   "Message": "Expression 's.r' is always true."
+  },
+  {
+   "CodeCurrent": 3829907644,
+   "CodeNext": 125,
+   "CodePrev": 1029859994,
+   "ErrorCode": "V1027",
+   "FileName": "quic.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 1467917991,
+   "CodeNext": 9023,
+   "CodePrev": 3954825589,
+   "ErrorCode": "V557",
+   "FileName": "nftdump.c",
+   "Message": "Array overrun is possible. The value of 'i' index could reach _."
+  },
+  {
+   "CodeCurrent": 443723874,
+   "CodeNext": 2678928017,
+   "CodePrev": 3012480433,
+   "ErrorCode": "V600",
+   "FileName": "scrypto.c",
+   "Message": "Consider inspecting the condition. The 'steer_wolfssl_abi' pointer is always not equal to NULL."
+  },
+  {
+   "CodeCurrent": 87621445,
+   "CodeNext": 2754935586,
+   "CodePrev": 3100495324,
+   "ErrorCode": "V522",
+   "FileName": "kind.c",
+   "Message": "There might be dereferencing of a potential null pointer 'k'."
+  },
+  {
+   "CodeCurrent": 1434652044,
+   "CodeNext": 224623853,
+   "CodePrev": 1216675,
+   "ErrorCode": "V1032",
+   "FileName": "failover.c",
+   "Message": "The pointer 'buf' is cast to a more strictly aligned pointer type."
+  },
+  {
+   "CodeCurrent": 1198570990,
+   "CodeNext": 106387461,
+   "CodePrev": 313286209,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_ready'."
+  },
+  {
+   "CodeCurrent": 55057,
+   "CodeNext": 2654,
+   "CodePrev": 125,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 106387461,
+   "CodeNext": 125,
+   "CodePrev": 1198570990,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_stream_open'."
+  },
+  {
+   "CodeCurrent": 552821908,
+   "CodeNext": 3459425380,
+   "CodePrev": 31643468,
+   "ErrorCode": "V512",
+   "FileName": "conns.c",
+   "Message": "A call of the 'memcpy' function will lead to a buffer overflow."
+  },
+  {
+   "CodeCurrent": 136763,
+   "CodeNext": 741656059,
+   "CodePrev": 125,
+   "ErrorCode": "V525",
+   "FileName": "explain.c",
+   "Message": "The code contains the collection of similar blocks. Check items '_x_', '_x_', '_x_', '_x_', '_x_' in lines _, _, _, _, _."
+  },
+  {
+   "CodeCurrent": 2470553693,
+   "CodeNext": 41594625,
+   "CodePrev": 682890239,
+   "ErrorCode": "V641",
+   "FileName": "proxy.c",
+   "Message": "The size of the '& any_' buffer is not a multiple of the element size of the type 'struct sockaddr'."
+  },
+  {
+   "CodeCurrent": 3216938558,
+   "CodeNext": 3143493,
+   "CodePrev": 1435542853,
+   "ErrorCode": "V641",
+   "FileName": "diag.c",
+   "Message": "The size of the '& from' buffer is not a multiple of the element size of the type 'struct sockaddr'."
+  },
+  {
+   "CodeCurrent": 418118311,
+   "CodeNext": 3603354015,
+   "CodePrev": 829501,
+   "ErrorCode": "V560",
+   "FileName": "tls13.c",
+   "Message": "A part of conditional expression is always true: ((ssl) != NULL)."
+  },
+  {
+   "CodeCurrent": 3362533017,
+   "CodeNext": 5309,
+   "CodePrev": 1239312712,
+   "ErrorCode": "V522",
+   "FileName": "folat.c",
+   "Message": "There might be dereferencing of a potential null pointer 'go'."
+  },
+  {
+   "CodeCurrent": 2546915616,
+   "CodeNext": 159367,
+   "CodePrev": 3417251155,
+   "ErrorCode": "V1027",
+   "FileName": "origdst.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 356753378,
+   "CodeNext": 2376542057,
+   "CodePrev": 356556770,
+   "ErrorCode": "V1037",
+   "FileName": "scrypto.c",
+   "Message": "Two or more case-branches perform the same actions. Check lines: _, _"
+  },
+  {
+   "CodeCurrent": 377577324,
+   "CodeNext": 3896416782,
+   "CodePrev": 2036218368,
+   "ErrorCode": "V1027",
+   "FileName": "proxy.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 916699036,
+   "CodeNext": 3929163166,
+   "CodePrev": 1336327491,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 1977032976,
+   "CodeNext": 709951157,
+   "CodePrev": 1123027038,
+   "ErrorCode": "V560",
+   "FileName": "xshake.c",
+   "Message": "A part of conditional expression is always false: _ + flen > n."
+  },
+  {
+   "CodeCurrent": 2666810642,
+   "CodeNext": 3118721718,
+   "CodePrev": 3703688313,
+   "ErrorCode": "V526",
+   "FileName": "supd.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1264838150,
+   "CodeNext": 1694153214,
+   "CodePrev": 103031187,
+   "ErrorCode": "V576",
+   "FileName": "fwcheck.c",
+   "Message": "Incorrect format. Consider checking the fifth actual argument of the 'fprintf' function. The SIGNED integer type argument is expected."
+  },
+  {
+   "CodeCurrent": 1411009739,
+   "CodeNext": 405509844,
+   "CodePrev": 629797985,
+   "ErrorCode": "V522",
+   "FileName": "cli.c",
+   "Message": "Dereferencing of the null pointer 's' might take place. The potential null pointer is passed into 'cli_int' function. Inspect the second argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 98336005,
+   "CodeNext": 3075123,
+   "CodePrev": 12299213,
+   "ErrorCode": "V609",
+   "FileName": "xsclient.c",
+   "Message": "Mod by zero. Denominator range [_x_.._x_FFFFFFF]."
+  },
+  {
+   "CodeCurrent": 3378127315,
+   "CodeNext": 2325457445,
+   "CodePrev": 2181846707,
+   "ErrorCode": "V1065",
+   "FileName": "xswire.h",
+   "Message": "Expression can be simplified, check '_ + _' and similar operands."
+  },
+  {
+   "CodeCurrent": 3406501635,
+   "CodeNext": 11233,
+   "CodePrev": 1889112286,
+   "ErrorCode": "V526",
+   "FileName": "dup.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1765973132,
+   "CodeNext": 8783,
+   "CodePrev": 2529122154,
+   "ErrorCode": "V576",
+   "FileName": "awg.c",
+   "Message": "Incorrect format. Consider checking the fourth actual argument of the 'fprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 3135271982,
+   "CodeNext": 3512150198,
+   "CodePrev": 1511349969,
+   "ErrorCode": "V595",
+   "FileName": "hy2main.c",
+   "Message": "The 'o' pointer was utilized before it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 586867580,
+   "CodeNext": 1388612420,
+   "CodePrev": 2704362026,
+   "ErrorCode": "V522",
+   "FileName": "main.c",
+   "Message": "There might be dereferencing of a potential null pointer 'elems'."
+  },
+  {
+   "CodeCurrent": 3135271982,
+   "CodeNext": 1511283545,
+   "CodePrev": 1511349969,
+   "ErrorCode": "V522",
+   "FileName": "hy2main.c",
+   "Message": "There might be dereferencing of a potential null pointer 'o'."
+  },
+  {
+   "CodeCurrent": 502447,
+   "CodeNext": 0,
+   "CodePrev": 877929435,
+   "ErrorCode": "V796",
+   "FileName": "tls13.c",
+   "Message": "It is possible that 'break' statement is missing in switch statement."
+  },
+  {
+   "CodeCurrent": 1738765,
+   "CodeNext": 125,
+   "CodePrev": 2091073738,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 1908156317,
+   "CodeNext": 4281567942,
+   "CodePrev": 1504732558,
+   "ErrorCode": "V1065",
+   "FileName": "ech.c",
+   "Message": "Expression can be simplified, check 'sid_n' and similar operands."
+  },
+  {
+   "CodeCurrent": 415951870,
+   "CodeNext": 2712321356,
+   "CodePrev": 125,
+   "ErrorCode": "V512",
+   "FileName": "dlog.c",
+   "Message": "A call of the 'memcpy' function will lead to overflow of the buffer 'a.sun_path'."
+  },
+  {
+   "CodeCurrent": 2471611081,
+   "CodeNext": 1340068660,
+   "CodePrev": 3703688313,
+   "ErrorCode": "V526",
+   "FileName": "supd.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1240779516,
+   "CodeNext": 182151016,
+   "CodePrev": 737841,
+   "ErrorCode": "V1004",
+   "FileName": "gaiw.c",
+   "Message": "The 'res' pointer was used unsafely after it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 106387461,
+   "CodeNext": 125,
+   "CodePrev": 1198570990,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_stream_send'."
+  },
+  {
+   "CodeCurrent": 1284286310,
+   "CodeNext": 5396983,
+   "CodePrev": 1817342593,
+   "ErrorCode": "V522",
+   "FileName": "ctl.c",
+   "Message": "Dereferencing of the null pointer 'b' might take place. The null pointer is passed into 'reload_head' function. Inspect the third argument. Check lines: _, _, _."
+  },
+  {
+   "CodeCurrent": 3471105275,
+   "CodeNext": 125,
+   "CodePrev": 1294034419,
+   "ErrorCode": "V522",
+   "FileName": "dup.c",
+   "Message": "There might be dereferencing of a potential null pointer 'taken'. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 2543258178,
+   "CodeNext": 125,
+   "CodePrev": 1740251803,
+   "ErrorCode": "V641",
+   "FileName": "diag.c",
+   "Message": "The size of the '& s' buffer is not a multiple of the element size of the type 'struct sockaddr'."
+  },
+  {
+   "CodeCurrent": 1407624273,
+   "CodeNext": 416,
+   "CodePrev": 3318452125,
+   "ErrorCode": "V1004",
+   "FileName": "nftnl.c",
+   "Message": "The '(const uint__t *)(e_)' pointer was used unsafely after it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1701954791,
+   "CodeNext": 1559289205,
+   "CodePrev": 771,
+   "ErrorCode": "V658",
+   "FileName": "tls13.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'sizeof (t->rbuf) - t->rbuf_n < _' expression."
+  },
+  {
+   "CodeCurrent": 553340514,
+   "CodeNext": 209565,
+   "CodePrev": 44937,
+   "ErrorCode": "V512",
+   "FileName": "origdst.c",
+   "Message": "A call of the 'memcpy' function will lead to a buffer overflow."
+  },
+  {
+   "CodeCurrent": 4085582159,
+   "CodeNext": 2036218368,
+   "CodePrev": 1582796437,
+   "ErrorCode": "V1027",
+   "FileName": "proxy.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 3014984419,
+   "CodeNext": 125,
+   "CodePrev": 3319768511,
+   "ErrorCode": "V522",
+   "FileName": "v2.c",
+   "Message": "There might be dereferencing of a potential null pointer 'dst'."
+  },
+  {
+   "CodeCurrent": 71210439,
+   "CodeNext": 485028,
+   "CodePrev": 5854621,
+   "ErrorCode": "V768",
+   "FileName": "pxsub.c",
+   "Message": "The variable 'want' is of enum type. It is odd that it is used as a variable of a Boolean-type."
+  },
+  {
+   "CodeCurrent": 1742861,
+   "CodeNext": 125,
+   "CodePrev": 2049392842,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 3473702804,
+   "CodeNext": 3894848224,
+   "CodePrev": 3284370532,
+   "ErrorCode": "V576",
+   "FileName": "xshub.c",
+   "Message": "Incorrect format. Consider checking the fourth actual argument of the 'snprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 1175,
+   "CodeNext": 0,
+   "CodePrev": 125,
+   "ErrorCode": "V1048",
+   "FileName": "trvenc.c",
+   "Message": "The 'rc' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 828109214,
+   "CodeNext": 24804975,
+   "CodePrev": 2391849351,
+   "ErrorCode": "V782",
+   "FileName": "supd.c",
+   "Message": "There is no sense in comparing the location of elements from different arrays: 'a_ < cl + cn'."
+  },
+  {
+   "CodeCurrent": 730335630,
+   "CodeNext": 36265,
+   "CodePrev": 403734459,
+   "ErrorCode": "V641",
+   "FileName": "proxy.c",
+   "Message": "The size of the '& a_' buffer is not a multiple of the element size of the type 'struct sockaddr'."
+  },
+  {
+   "CodeCurrent": 19079791,
+   "CodeNext": 4770195,
+   "CodePrev": 45537,
+   "ErrorCode": "V525",
+   "FileName": "vldial.c",
+   "Message": "The code contains the collection of similar blocks. Check items '_', '_', '_' in lines _, _, _."
+  },
+  {
+   "CodeCurrent": 3471105275,
+   "CodeNext": 125,
+   "CodePrev": 1294034419,
+   "ErrorCode": "V522",
+   "FileName": "dup.c",
+   "Message": "There might be dereferencing of a potential null pointer 'nw'. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 2407184550,
+   "CodeNext": 237048432,
+   "CodePrev": 72023393,
+   "ErrorCode": "V576",
+   "FileName": "failover.c",
+   "Message": "Incorrect format. Consider checking the fourth actual argument of the 'snprintf' function. The SIGNED integer type argument is expected."
+  },
+  {
+   "CodeCurrent": 3548699021,
+   "CodeNext": 1280811829,
+   "CodePrev": 278983595,
+   "ErrorCode": "V658",
+   "FileName": "urltls.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'got < sizeof (line) - ln' expression."
+  },
+  {
+   "CodeCurrent": 161756011,
+   "CodeNext": 2828984675,
+   "CodePrev": 1619,
+   "ErrorCode": "V756",
+   "FileName": "legacy.c",
+   "Message": "The 'i' counter is not used inside a nested loop. Consider inspecting usage of 'k' counter."
+  },
+  {
+   "CodeCurrent": 3850270379,
+   "CodeNext": 405731975,
+   "CodePrev": 3053,
+   "ErrorCode": "V1027",
+   "FileName": "urltest.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 3208848207,
+   "CodeNext": 1604930269,
+   "CodePrev": 3111525820,
+   "ErrorCode": "V522",
+   "FileName": "supd.c",
+   "Message": "There might be dereferencing of a potential null pointer 'ch'."
+  },
+  {
+   "CodeCurrent": 3477595375,
+   "CodeNext": 2000737354,
+   "CodePrev": 141906,
+   "ErrorCode": "V526",
+   "FileName": "failover.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 2575672731,
+   "CodeNext": 125,
+   "CodePrev": 156641601,
+   "ErrorCode": "V516",
+   "FileName": "dupdial.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'tls__free'."
+  },
+  {
+   "CodeCurrent": 234104221,
+   "CodeNext": 3053,
+   "CodePrev": 752658538,
+   "ErrorCode": "V526",
+   "FileName": "failover.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 2407184550,
+   "CodeNext": 2017845561,
+   "CodePrev": 281281,
+   "ErrorCode": "V576",
+   "FileName": "failover.c",
+   "Message": "Incorrect format. Consider checking the fourth actual argument of the 'snprintf' function. The SIGNED integer type argument is expected."
+  },
+  {
+   "CodeCurrent": 2677927753,
+   "CodeNext": 4218169146,
+   "CodePrev": 1651014283,
+   "ErrorCode": "V1027",
+   "FileName": "dupdial.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 1426496069,
+   "CodeNext": 313861187,
+   "CodePrev": 748493115,
+   "ErrorCode": "V526",
+   "FileName": "fogroup.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 10403393,
+   "CodeNext": 43017817,
+   "CodePrev": 3384376833,
+   "ErrorCode": "V512",
+   "FileName": "nftvmap.c",
+   "Message": "A call of the 'memset' function will lead to overflow of the buffer 'nh'."
+  },
+  {
+   "CodeCurrent": 4704035,
+   "CodeNext": 9407155,
+   "CodePrev": 752833,
+   "ErrorCode": "V525",
+   "FileName": "tun.c",
+   "Message": "The code contains the collection of similar blocks. Check items '_', '_', '_' in lines _, _, _."
+  },
+  {
+   "CodeCurrent": 3083821,
+   "CodeNext": 159218913,
+   "CodePrev": 403,
+   "ErrorCode": "V1004",
+   "FileName": "main.c",
+   "Message": "The 'c' pointer was used unsafely after it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 2736922093,
+   "CodeNext": 235060646,
+   "CodePrev": 2838274835,
+   "ErrorCode": "V526",
+   "FileName": "srsplan.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 4000969788,
+   "CodeNext": 1509161,
+   "CodePrev": 1129189553,
+   "ErrorCode": "V526",
+   "FileName": "generate.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 134921,
+   "CodeNext": 17487,
+   "CodePrev": 40814673,
+   "ErrorCode": "V1048",
+   "FileName": "quic.c",
+   "Message": "The 'rc' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 862987822,
+   "CodeNext": 744445,
+   "CodePrev": 4585739,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_timeout_ms'."
+  },
+  {
+   "CodeCurrent": 2966402137,
+   "CodeNext": 2348806591,
+   "CodePrev": 3929163166,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 2872144144,
+   "CodeNext": 66360313,
+   "CodePrev": 169631,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'tls__read'."
+  },
+  {
+   "CodeCurrent": 3888515060,
+   "CodeNext": 2491521,
+   "CodePrev": 1321349269,
+   "ErrorCode": "V658",
+   "FileName": "adopt.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '>' comparison operation can potentially behave unexpectedly. Consider inspecting the 'n > sizeof (m) - (size_t) h' expression."
+  },
+  {
+   "CodeCurrent": 3078411292,
+   "CodeNext": 1403758686,
+   "CodePrev": 125,
+   "ErrorCode": "V560",
+   "FileName": "hy2conn.c",
+   "Message": "A part of conditional expression is always true: !f->up_n."
+  },
+  {
+   "CodeCurrent": 1588775354,
+   "CodeNext": 95998885,
+   "CodePrev": 780897,
+   "ErrorCode": "V1032",
+   "FileName": "recon.c",
+   "Message": "The pointer 'buf' is cast to a more strictly aligned pointer type."
+  },
+  {
+   "CodeCurrent": 23800343,
+   "CodeNext": 2087344778,
+   "CodePrev": 323726141,
+   "ErrorCode": "V547",
+   "FileName": "trxhttp.c",
+   "Message": "Expression 'slots < _' is always false."
+  },
+  {
+   "CodeCurrent": 106387461,
+   "CodeNext": 125,
+   "CodePrev": 1198570990,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_on_readable'."
+  },
+  {
+   "CodeCurrent": 12127709,
+   "CodeNext": 2144024871,
+   "CodePrev": 1859448853,
+   "ErrorCode": "V526",
+   "FileName": "main.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 2575672731,
+   "CodeNext": 125,
+   "CodePrev": 156641601,
+   "ErrorCode": "V516",
+   "FileName": "dupdial.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'tls__handshake_auth'."
+  },
+  {
+   "CodeCurrent": 3999792132,
+   "CodeNext": 125,
+   "CodePrev": 3697731177,
+   "ErrorCode": "V522",
+   "FileName": "kind.c",
+   "Message": "There might be dereferencing of a potential null pointer 'k'."
+  },
+  {
+   "CodeCurrent": 2021028105,
+   "CodeNext": 23950545,
+   "CodePrev": 913457307,
+   "ErrorCode": "V560",
+   "FileName": "v1.c",
+   "Message": "A part of conditional expression is always true: o."
+  },
+  {
+   "CodeCurrent": 3018613793,
+   "CodeNext": 48417,
+   "CodePrev": 125,
+   "ErrorCode": "V581",
+   "FileName": "dup.c",
+   "Message": "The conditional expressions of the 'if' statements situated alongside each other are identical. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 4228347429,
+   "CodeNext": 270026806,
+   "CodePrev": 4153770949,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 2099692914,
+   "CodeNext": 1633829612,
+   "CodePrev": 2217735986,
+   "ErrorCode": "V522",
+   "FileName": "tls13.c",
+   "Message": "Dereferencing of the null pointer 'ctx' might take place. The null pointer is passed into 'expand_label' function. Inspect the fifth argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1814732812,
+   "CodeNext": 105797,
+   "CodePrev": 3768223770,
+   "ErrorCode": "V526",
+   "FileName": "tls13.c",
+   "Message": "The 'memcmp' function returns _ if corresponding buffers are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 593290386,
+   "CodeNext": 748983976,
+   "CodePrev": 815973,
+   "ErrorCode": "V781",
+   "FileName": "supd.c",
+   "Message": "The value of the 'i' index is checked after it was used. Perhaps there is a mistake in program logic."
+  },
+  {
+   "CodeCurrent": 965290005,
+   "CodeNext": 24684629,
+   "CodePrev": 84551,
+   "ErrorCode": "V526",
+   "FileName": "v2.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 3025640337,
+   "CodeNext": 2619583232,
+   "CodePrev": 771,
+   "ErrorCode": "V658",
+   "FileName": "tgws.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '>=' comparison operation can potentially behave unexpectedly. Consider inspecting the 'sizeof (rx.buf) - rx.n >= _' expression."
+  },
+  {
+   "CodeCurrent": 265653,
+   "CodeNext": 2337,
+   "CodePrev": 6149989,
+   "ErrorCode": "V1048",
+   "FileName": "tls13.c",
+   "Message": "The 'digestAlg' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 3083821,
+   "CodeNext": 139980534,
+   "CodePrev": 54147,
+   "ErrorCode": "V1004",
+   "FileName": "main.c",
+   "Message": "The 'c' pointer was used unsafely after it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 2684329444,
+   "CodeNext": 125,
+   "CodePrev": 125,
+   "ErrorCode": "V1004",
+   "FileName": "tls13.c",
+   "Message": "The 'ssl' pointer was used unsafely after it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1227686507,
+   "CodeNext": 1320613344,
+   "CodePrev": 4150147773,
+   "ErrorCode": "V1027",
+   "FileName": "origdst.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 1198570990,
+   "CodeNext": 106387461,
+   "CodePrev": 313286209,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_open'."
+  },
+  {
+   "CodeCurrent": 4126311161,
+   "CodeNext": 12532357,
+   "CodePrev": 3696905714,
+   "ErrorCode": "V1027",
+   "FileName": "dup.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 2613856389,
+   "CodeNext": 601363790,
+   "CodePrev": 323511277,
+   "ErrorCode": "V595",
+   "FileName": "v2.c",
+   "Message": "The 'sn' pointer was utilized before it was verified against nullptr. Check lines: _, _, _, _."
+  },
+  {
+   "CodeCurrent": 1198570990,
+   "CodeNext": 106387461,
+   "CodePrev": 313286209,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_timeout_ms'."
+  },
+  {
+   "CodeCurrent": 2575672731,
+   "CodeNext": 125,
+   "CodePrev": 156641601,
+   "ErrorCode": "V516",
+   "FileName": "dupdial.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'reality_build_hello_carry'."
+  },
+  {
+   "CodeCurrent": 3254343991,
+   "CodeNext": 4556545,
+   "CodePrev": 125,
+   "ErrorCode": "V614",
+   "FileName": "diag.c",
+   "Message": "Potentially uninitialized buffer 'w' used. Consider checking the first actual argument of the 'strcmp' function."
+  },
+  {
+   "CodeCurrent": 1880543,
+   "CodeNext": 3075934009,
+   "CodePrev": 4071942303,
+   "ErrorCode": "V1048",
+   "FileName": "ctl.c",
+   "Message": "The 'c->committed' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 634020417,
+   "CodeNext": 15066742,
+   "CodePrev": 363475,
+   "ErrorCode": "V602",
+   "FileName": "status.c",
+   "Message": "Consider inspecting the '= g->members_n > _' expression. '>' possibly should be replaced with '>>'."
+  },
+  {
+   "CodeCurrent": 3575234728,
+   "CodeNext": 3053,
+   "CodePrev": 159367,
+   "ErrorCode": "V1086",
+   "FileName": "origdst.c",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'caddr'."
+  },
+  {
+   "CodeCurrent": 4992729,
+   "CodeNext": 292791609,
+   "CodePrev": 2945324257,
+   "ErrorCode": "V1086",
+   "FileName": "fpseed.c",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'a_'."
+  },
+  {
+   "CodeCurrent": 2564113466,
+   "CodeNext": 788959,
+   "CodePrev": 375155,
+   "ErrorCode": "V769",
+   "FileName": "pxhttp.c",
+   "Message": "The 'strstr(resp, \"\\r\\n\\r\\n\")' pointer in the 'strstr(resp, \"\\r\\n\\r\\n\") - resp' expression could be nullptr. In such case, resulting value will be senseless and it should not be used."
+  },
+  {
+   "CodeCurrent": 806334438,
+   "CodeNext": 252215,
+   "CodePrev": 1916451866,
+   "ErrorCode": "V560",
+   "FileName": "tun.c",
+   "Message": "A part of conditional expression is always false: doff > _."
+  },
+  {
+   "CodeCurrent": 3655502109,
+   "CodeNext": 1035017052,
+   "CodePrev": 28083,
+   "ErrorCode": "V614",
+   "FileName": "origdst.c",
+   "Message": "Potentially uninitialized buffer 'oaddr' used. Consider checking the first actual argument of the 'memcmp' function."
+  },
+  {
+   "CodeCurrent": 1227686008,
+   "CodeNext": 3039763793,
+   "CodePrev": 10945963,
+   "ErrorCode": "V641",
+   "FileName": "proxy.c",
+   "Message": "The size of the '& ls' buffer is not a multiple of the element size of the type 'const struct sockaddr_in_'."
+  },
+  {
+   "CodeCurrent": 1622917106,
+   "CodeNext": 3157730948,
+   "CodePrev": 881229996,
+   "ErrorCode": "V522",
+   "FileName": "print.c",
+   "Message": "Dereferencing of the null pointer 'seed' might take place. The null pointer is passed into 'emit_mixed_' function. Inspect the third argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 3874679984,
+   "CodeNext": 3086544576,
+   "CodePrev": 3246290907,
+   "ErrorCode": "V1027",
+   "FileName": "quic.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 3331824952,
+   "CodeNext": 817597326,
+   "CodePrev": 3261435277,
+   "ErrorCode": "V1042",
+   "FileName": "tls13.c",
+   "Message": "This file is marked with copyleft license, which requires you to open the derived source code."
+  },
+  {
+   "CodeCurrent": 119163,
+   "CodeNext": 125,
+   "CodePrev": 136740212,
+   "ErrorCode": "V519",
+   "FileName": "nftdump.c",
+   "Message": "The 'r.cur' variable is assigned values twice successively. Perhaps this is a mistake. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1324219341,
+   "CodeNext": 123,
+   "CodePrev": 0,
+   "ErrorCode": "V785",
+   "FileName": "tls13.c",
+   "Message": "Constant expression in switch statement."
+  },
+  {
+   "CodeCurrent": 768256269,
+   "CodeNext": 3004091,
+   "CodePrev": 2635785607,
+   "ErrorCode": "V526",
+   "FileName": "tgws.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 76728245,
+   "CodeNext": 11829985,
+   "CodePrev": 12899,
+   "ErrorCode": "V557",
+   "FileName": "proxy.c",
+   "Message": "Array overrun is possible. The value of 'tag' index is from potentially tainted source."
+  },
+  {
+   "CodeCurrent": 1227686008,
+   "CodeNext": 3039763793,
+   "CodePrev": 10945963,
+   "ErrorCode": "V1027",
+   "FileName": "proxy.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 3366319888,
+   "CodeNext": 3793277,
+   "CodePrev": 60397703,
+   "ErrorCode": "V1027",
+   "FileName": "proxy.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in' class."
+  },
+  {
+   "CodeCurrent": 3203952551,
+   "CodeNext": 735617787,
+   "CodePrev": 881229996,
+   "ErrorCode": "V522",
+   "FileName": "print.c",
+   "Message": "Dereferencing of the null pointer 'seed' might take place. The null pointer is passed into 'emit_mixed' function. Inspect the third argument. Check lines: _, _, _."
+  },
+  {
+   "CodeCurrent": 2425938100,
+   "CodeNext": 371628869,
+   "CodePrev": 42055,
+   "ErrorCode": "V526",
+   "FileName": "v2.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 3823430425,
+   "CodeNext": 2473810976,
+   "CodePrev": 3725045600,
+   "ErrorCode": "V1037",
+   "FileName": "rules.c",
+   "Message": "Two or more case-branches perform the same actions. Check lines: _, _"
+  },
+  {
+   "CodeCurrent": 1926306638,
+   "CodeNext": 2775982393,
+   "CodePrev": 1894765664,
+   "ErrorCode": "V526",
+   "FileName": "table.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1515663434,
+   "CodeNext": 125,
+   "CodePrev": 183965,
+   "ErrorCode": "V547",
+   "FileName": "aggregate.c",
+   "Message": "Expression 'l.n' is always true."
+  },
+  {
+   "CodeCurrent": 3285011217,
+   "CodeNext": 1101,
+   "CodePrev": 2245123129,
+   "ErrorCode": "V1086",
+   "FileName": "awg.c",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'p.addr'."
+  },
+  {
+   "CodeCurrent": 3585594593,
+   "CodeNext": 97649,
+   "CodePrev": 4240559167,
+   "ErrorCode": "V526",
+   "FileName": "supd.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1150297156,
+   "CodeNext": 1238384792,
+   "CodePrev": 0,
+   "ErrorCode": "V1071",
+   "FileName": "srs.c",
+   "Message": "Consider inspecting the 'errf' function. The return value is not always used. Total calls: _, discarded results: _."
+  },
+  {
+   "CodeCurrent": 4289961185,
+   "CodeNext": 380487076,
+   "CodePrev": 2418680676,
+   "ErrorCode": "V1004",
+   "FileName": "tls13.c",
+   "Message": "The 'auth' pointer was used unsafely after it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 3664559371,
+   "CodeNext": 2360816277,
+   "CodePrev": 2289857207,
+   "ErrorCode": "V526",
+   "FileName": "apply.c",
+   "Message": "The 'strncmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 3823641985,
+   "CodeNext": 1475217864,
+   "CodePrev": 660365651,
+   "ErrorCode": "V526",
+   "FileName": "awg.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 79799289,
+   "CodeNext": 788605104,
+   "CodePrev": 2495737,
+   "ErrorCode": "V1086",
+   "FileName": "blake3.h",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'B__IV'."
+  },
+  {
+   "CodeCurrent": 3722900517,
+   "CodeNext": 37844389,
+   "CodePrev": 1294052653,
+   "ErrorCode": "V522",
+   "FileName": "v1.c",
+   "Message": "There might be dereferencing of a potential null pointer 'tmp'. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 2505241,
+   "CodeNext": 125,
+   "CodePrev": 681510794,
+   "ErrorCode": "V1086",
+   "FileName": "blake3.h",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'w'."
+  },
+  {
+   "CodeCurrent": 9970709,
+   "CodeNext": 1953,
+   "CodePrev": 125,
+   "ErrorCode": "V769",
+   "FileName": "ctlcall.c",
+   "Message": "The 'b' pointer in the 'b + n' expression could be nullptr. In such case, resulting value will be senseless and it should not be used. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 3954825589,
+   "CodeNext": 1467917991,
+   "CodePrev": 89211717,
+   "ErrorCode": "V557",
+   "FileName": "nftdump.c",
+   "Message": "Array overrun is possible. The value of 'i' index could reach _."
+  },
+  {
+   "CodeCurrent": 2575672731,
+   "CodeNext": 125,
+   "CodePrev": 156641601,
+   "ErrorCode": "V516",
+   "FileName": "dupdial.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'tls__write'."
+  },
+  {
+   "CodeCurrent": 364791797,
+   "CodeNext": 48246977,
+   "CodePrev": 20745395,
+   "ErrorCode": "V526",
+   "FileName": "v2.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 4042159127,
+   "CodeNext": 1401112071,
+   "CodePrev": 11235,
+   "ErrorCode": "V1103",
+   "FileName": "srs.c",
+   "Message": "The values of padding bytes are unspecified. Comparing objects with padding using 'memcmp' may lead to unexpected result."
+  },
+  {
+   "CodeCurrent": 1943367948,
+   "CodeNext": 125,
+   "CodePrev": 11158195,
+   "ErrorCode": "V560",
+   "FileName": "hy2conn.c",
+   "Message": "A part of conditional expression is always false: E.fl[i] != f."
+  },
+  {
+   "CodeCurrent": 2863403129,
+   "CodeNext": 28077605,
+   "CodePrev": 780897,
+   "ErrorCode": "V1032",
+   "FileName": "rulewd.c",
+   "Message": "The pointer 'buf' is cast to a more strictly aligned pointer type."
+  },
+  {
+   "CodeCurrent": 3280520892,
+   "CodeNext": 1033785783,
+   "CodePrev": 403,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_early_ready'."
+  },
+  {
+   "CodeCurrent": 4004283374,
+   "CodeNext": 3142625,
+   "CodePrev": 4061955013,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 3142625,
+   "CodeNext": 3422621693,
+   "CodePrev": 4004283374,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 1687683642,
+   "CodeNext": 125,
+   "CodePrev": 4065690565,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 3739255697,
+   "CodeNext": 389378532,
+   "CodePrev": 2435284623,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 919140321,
+   "CodeNext": 2614848646,
+   "CodePrev": 1571,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_stream_reset'."
+  },
+  {
+   "CodeCurrent": 389378532,
+   "CodeNext": 125,
+   "CodePrev": 3739255697,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 2053438372,
+   "CodeNext": 4200784805,
+   "CodePrev": 125,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 3538834904,
+   "CodeNext": 1122323,
+   "CodePrev": 268927028,
+   "ErrorCode": "V614",
+   "FileName": "xsclient.c",
+   "Message": "Uninitialized buffer 'acc' used. Consider checking the first actual argument of the 'xs_hs_response_complete' function."
+  },
+  {
+   "CodeCurrent": 3055350060,
+   "CodeNext": 1938015544,
+   "CodePrev": 23396025,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 3471105275,
+   "CodeNext": 125,
+   "CodePrev": 1294034419,
+   "ErrorCode": "V522",
+   "FileName": "dup.c",
+   "Message": "Dereferencing of the null pointer 'c' might take place. The null pointer is passed into 'dup_apply' function. Inspect the first argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 2602082701,
+   "CodeNext": 46261757,
+   "CodePrev": 46065,
+   "ErrorCode": "V516",
+   "FileName": "dupdial.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'tls__verify_reason'."
+  },
+  {
+   "CodeCurrent": 2577993716,
+   "CodeNext": 2712321356,
+   "CodePrev": 125,
+   "ErrorCode": "V512",
+   "FileName": "adopt.c",
+   "Message": "A call of the 'memcpy' function will lead to overflow of the buffer 'a.sun_path'."
+  },
+  {
+   "CodeCurrent": 3510772769,
+   "CodeNext": 633541918,
+   "CodePrev": 382697581,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 270026806,
+   "CodeNext": 1603573779,
+   "CodePrev": 4228347429,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 4043188556,
+   "CodeNext": 292724409,
+   "CodePrev": 4219139402,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 2181353678,
+   "CodeNext": 292294816,
+   "CodePrev": 125,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 292294816,
+   "CodeNext": 355340360,
+   "CodePrev": 2181353678,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 355340360,
+   "CodeNext": 1603456147,
+   "CodePrev": 292294816,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 2151198669,
+   "CodeNext": 0,
+   "CodePrev": 3154935920,
+   "ErrorCode": "V1065",
+   "FileName": "xshub.c",
+   "Message": "Expression can be simplified, check '_ + _ + _' and similar operands."
+  },
+  {
+   "CodeCurrent": 726547119,
+   "CodeNext": 55057,
+   "CodePrev": 125,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 55057,
+   "CodeNext": 2654,
+   "CodePrev": 726547119,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 1444830424,
+   "CodeNext": 17733,
+   "CodePrev": 2753065489,
+   "ErrorCode": "V566",
+   "FileName": "xsclient.c",
+   "Message": "The integer constant is converted to pointer. Possibly an error or a bad coding style: (void *) _"
+  },
+  {
+   "CodeCurrent": 3352738696,
+   "CodeNext": 1281063989,
+   "CodePrev": 3962084748,
+   "ErrorCode": "V658",
+   "FileName": "tls13.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'out_n - off < _' expression."
+  },
+  {
+   "CodeCurrent": 1711233625,
+   "CodeNext": 3937198130,
+   "CodePrev": 0,
+   "ErrorCode": "V560",
+   "FileName": "tls13.c",
+   "Message": "A part of conditional expression is always false: extIdx != _."
+  },
+  {
+   "CodeCurrent": 732912492,
+   "CodeNext": 2185769656,
+   "CodePrev": 3738423070,
+   "ErrorCode": "V658",
+   "FileName": "trxhttp.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'n - off < piece' expression."
+  },
+  {
+   "CodeCurrent": 1336327491,
+   "CodeNext": 916699036,
+   "CodePrev": 1938015544,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 2960962806,
+   "CodeNext": 4274993837,
+   "CodePrev": 1307650969,
+   "ErrorCode": "V526",
+   "FileName": "nftdump.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1694464782,
+   "CodeNext": 4239634748,
+   "CodePrev": 116795,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_close'."
+  },
+  {
+   "CodeCurrent": 453032350,
+   "CodeNext": 1087970820,
+   "CodePrev": 139583,
+   "ErrorCode": "V526",
+   "FileName": "sub.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 757564765,
+   "CodeNext": 919950247,
+   "CodePrev": 283809,
+   "ErrorCode": "V576",
+   "FileName": "registry.c",
+   "Message": "Incorrect format. Consider checking the eighth actual argument of the 'snprintf' function. The SIGNED integer type argument is expected."
+  },
+  {
+   "CodeCurrent": 2499626308,
+   "CodeNext": 125,
+   "CodePrev": 1801342634,
+   "ErrorCode": "V522",
+   "FileName": "v2.c",
+   "Message": "Dereferencing of the null pointer 'n' might take place. The potential null pointer is passed into 'item' function. Inspect the first argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1290367049,
+   "CodeNext": 108209,
+   "CodePrev": 765546449,
+   "ErrorCode": "V512",
+   "FileName": "nftnl.c",
+   "Message": "A call of the 'memcpy' function will lead to a buffer overflow."
+  },
+  {
+   "CodeCurrent": 2838274835,
+   "CodeNext": 2736922093,
+   "CodePrev": 691094709,
+   "ErrorCode": "V526",
+   "FileName": "srsplan.c",
+   "Message": "The 'memcmp' function returns _ if corresponding buffers are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 3767646384,
+   "CodeNext": 6816,
+   "CodePrev": 96713247,
+   "ErrorCode": "V576",
+   "FileName": "xshub.c",
+   "Message": "Incorrect format. Consider checking the third actual argument of the 'fprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 3009855547,
+   "CodeNext": 125,
+   "CodePrev": 98038723,
+   "ErrorCode": "V522",
+   "FileName": "v1.c",
+   "Message": "There might be dereferencing of a potential null pointer 'r->clients'."
+  },
+  {
+   "CodeCurrent": 1444830424,
+   "CodeNext": 17733,
+   "CodePrev": 2531299665,
+   "ErrorCode": "V566",
+   "FileName": "xsclient.c",
+   "Message": "The integer constant is converted to pointer. Possibly an error or a bad coding style: (void *) _"
+  },
+  {
+   "CodeCurrent": 1386452855,
+   "CodeNext": 90637202,
+   "CodePrev": 881252266,
+   "ErrorCode": "V522",
+   "FileName": "v2.c",
+   "Message": "There might be dereferencing of a potential null pointer 'refs'."
+  },
+  {
+   "CodeCurrent": 1000777676,
+   "CodeNext": 125,
+   "CodePrev": 250214327,
+   "ErrorCode": "V547",
+   "FileName": "trvenc.c",
+   "Message": "Expression '!e->pl_len' is always false."
+  },
+  {
+   "CodeCurrent": 2158343694,
+   "CodeNext": 1191149648,
+   "CodePrev": 2082462514,
+   "ErrorCode": "V658",
+   "FileName": "quic.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) nw - off < gso' expression."
+  },
+  {
+   "CodeCurrent": 2065824530,
+   "CodeNext": 125,
+   "CodePrev": 489968298,
+   "ErrorCode": "V522",
+   "FileName": "legacy.c",
+   "Message": "There might be dereferencing of a potential null pointer 'c'."
+  },
+  {
+   "CodeCurrent": 3386705835,
+   "CodeNext": 1113598978,
+   "CodePrev": 3092497,
+   "ErrorCode": "V769",
+   "FileName": "v2.c",
+   "Message": "The 'm->domains_files' pointer in the 'm->domains_files + m->domains_n' expression could be nullptr. In such case, resulting value will be senseless and it should not be used."
+  },
+  {
+   "CodeCurrent": 671014516,
+   "CodeNext": 2575335493,
+   "CodePrev": 1388707241,
+   "ErrorCode": "V658",
+   "FileName": "hy2conn.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'n - off < _' expression."
+  },
+  {
+   "CodeCurrent": 2465503663,
+   "CodeNext": 1674046902,
+   "CodePrev": 557297,
+   "ErrorCode": "V526",
+   "FileName": "v2.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1433101,
+   "CodeNext": 125,
+   "CodePrev": 1582123117,
+   "ErrorCode": "V566",
+   "FileName": "xsclient.c",
+   "Message": "The integer constant is converted to pointer. Possibly an error or a bad coding style: (void *) _"
+  },
+  {
+   "CodeCurrent": 1868839813,
+   "CodeNext": 125,
+   "CodePrev": 489968298,
+   "ErrorCode": "V522",
+   "FileName": "legacy.c",
+   "Message": "There might be dereferencing of a potential null pointer 'c'."
+  },
+  {
+   "CodeCurrent": 764881773,
+   "CodeNext": 4057607840,
+   "CodePrev": 323510957,
+   "ErrorCode": "V522",
+   "FileName": "spec.h",
+   "Message": "There might be dereferencing of a potential null pointer 'arr'."
+  },
+  {
+   "CodeCurrent": 3378127315,
+   "CodeNext": 2325457445,
+   "CodePrev": 2181846707,
+   "ErrorCode": "V1065",
+   "FileName": "xswire.h",
+   "Message": "Expression can be simplified, check '_ + _ + _' and similar operands."
+  },
+  {
+   "CodeCurrent": 2086167186,
+   "CodeNext": 9539,
+   "CodePrev": 1779,
+   "ErrorCode": "V1071",
+   "FileName": "platform.h",
+   "Message": "Consider inspecting the 'plat' function. The return value is not always used. Total calls: _, discarded results: _."
+  },
+  {
+   "CodeCurrent": 502447,
+   "CodeNext": 9050,
+   "CodePrev": 73236,
+   "ErrorCode": "V796",
+   "FileName": "quic.c",
+   "Message": "It is possible that 'break' statement is missing in switch statement."
+  },
+  {
+   "CodeCurrent": 2796600436,
+   "CodeNext": 540908565,
+   "CodePrev": 551602271,
+   "ErrorCode": "V526",
+   "FileName": "hwid.c",
+   "Message": "The 'strncmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1084940288,
+   "CodeNext": 408637,
+   "CodePrev": 1466930818,
+   "ErrorCode": "V526",
+   "FileName": "failover.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 2430131262,
+   "CodeNext": 828010445,
+   "CodePrev": 2261012770,
+   "ErrorCode": "V658",
+   "FileName": "hy2wire.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'n - _ - k < al' expression."
+  },
+  {
+   "CodeCurrent": 1198570990,
+   "CodeNext": 106387461,
+   "CodePrev": 313286209,
+   "ErrorCode": "V516",
+   "FileName": "dup.c",
+   "Message": "Consider inspecting an odd expression. Non-null function pointer is compared to null: 'dupq_prepare'."
+  },
+  {
+   "CodeCurrent": 1772223209,
+   "CodeNext": 4104329044,
+   "CodePrev": 1737691124,
+   "ErrorCode": "V560",
+   "FileName": "tls13.c",
+   "Message": "A part of conditional expression is always true: args->pv.minor == TLSv____MINOR."
+  },
+  {
+   "CodeCurrent": 80667641,
+   "CodeNext": 3760662234,
+   "CodePrev": 44945,
+   "ErrorCode": "V1086",
+   "FileName": "realip.c",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'e->addr'."
+  },
+  {
+   "CodeCurrent": 3448845295,
+   "CodeNext": 33375811,
+   "CodePrev": 448561414,
+   "ErrorCode": "V769",
+   "FileName": "v2.c",
+   "Message": "The 'm->srs_files' pointer in the 'm->srs_files + m->srs_n' expression could be nullptr. In such case, resulting value will be senseless and it should not be used."
+  },
+  {
+   "CodeCurrent": 5001481,
+   "CodeNext": 270509,
+   "CodePrev": 1600950032,
+   "ErrorCode": "V1086",
+   "FileName": "nftnl.c",
+   "Message": "A call of the 'memcpy' function will lead to underflow of the buffer 'out'."
+  },
+  {
+   "CodeCurrent": 2181846707,
+   "CodeNext": 3378127315,
+   "CodePrev": 4273913799,
+   "ErrorCode": "V584",
+   "FileName": "xswire.h",
+   "Message": "The '_' value is present on both sides of the '==' operator. The expression is incorrect or it can be simplified."
+  },
+  {
+   "CodeCurrent": 38073,
+   "CodeNext": 35393,
+   "CodePrev": 10433,
+   "ErrorCode": "V575",
+   "FileName": "ynode.c",
+   "Message": "The null pointer is passed into 'free' function. Inspect the first argument."
+  },
+  {
+   "CodeCurrent": 20653635,
+   "CodeNext": 4175531717,
+   "CodePrev": 1151072,
+   "ErrorCode": "V1048",
+   "FileName": "tls13.c",
+   "Message": "The 'hashType' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 820227645,
+   "CodeNext": 500284999,
+   "CodePrev": 2661214232,
+   "ErrorCode": "V560",
+   "FileName": "tls13.c",
+   "Message": "A part of conditional expression is always true: ((ssl) != NULL)."
+  },
+  {
+   "CodeCurrent": 3378127315,
+   "CodeNext": 2325457445,
+   "CodePrev": 2181846707,
+   "ErrorCode": "V1065",
+   "FileName": "xswire.h",
+   "Message": "Expression can be simplified, check '_' and similar operands."
+  },
+  {
+   "CodeCurrent": 4292080035,
+   "CodeNext": 125,
+   "CodePrev": 3044461621,
+   "ErrorCode": "V614",
+   "FileName": "quic.c",
+   "Message": "Uninitialized buffer 'tmpbuffer' used. Consider checking the second actual argument of the 'wolfSSL_write_early_data' function."
+  },
+  {
+   "CodeCurrent": 1208190009,
+   "CodeNext": 2159596234,
+   "CodePrev": 70177,
+   "ErrorCode": "V576",
+   "FileName": "failover.c",
+   "Message": "Incorrect format. Consider checking the fourth actual argument of the 'snprintf' function. The SIGNED integer type argument is expected."
+  },
+  {
+   "CodeCurrent": 1498782330,
+   "CodeNext": 2463208332,
+   "CodePrev": 5705,
+   "ErrorCode": "V547",
+   "FileName": "quic.c",
+   "Message": "Expression 'xp' is always true."
+  },
+  {
+   "CodeCurrent": 3114311722,
+   "CodeNext": 1454357803,
+   "CodePrev": 3044459196,
+   "ErrorCode": "V560",
+   "FileName": "quic.c",
+   "Message": "A part of conditional expression is always true: (CERT_HEADER_SZ + ((_ * _) + CERT_HEADER_SZ) * _) > (_ * _)."
+  },
+  {
+   "CodeCurrent": 502447,
+   "CodeNext": 294534868,
+   "CodePrev": 2301652,
+   "ErrorCode": "V796",
+   "FileName": "quic.c",
+   "Message": "It is possible that 'break' statement is missing in switch statement."
+  },
+  {
+   "CodeCurrent": 3052838384,
+   "CodeNext": 124821557,
+   "CodePrev": 1833210937,
+   "ErrorCode": "V1027",
+   "FileName": "dupdial.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 1444830424,
+   "CodeNext": 17733,
+   "CodePrev": 1098385023,
+   "ErrorCode": "V566",
+   "FileName": "xsclient.c",
+   "Message": "The integer constant is converted to pointer. Possibly an error or a bad coding style: (void *) _"
+  },
+  {
+   "CodeCurrent": 502447,
+   "CodeNext": 0,
+   "CodePrev": 877928763,
+   "ErrorCode": "V796",
+   "FileName": "tls13.c",
+   "Message": "It is possible that 'break' statement is missing in switch statement."
+  },
+  {
+   "CodeCurrent": 3700988519,
+   "CodeNext": 170368486,
+   "CodePrev": 687086733,
+   "ErrorCode": "V575",
+   "FileName": "main.c",
+   "Message": "The potential null pointer is passed into 'strcmp' function. Inspect the first argument."
+  },
+  {
+   "CodeCurrent": 1744017267,
+   "CodeNext": 3234064059,
+   "CodePrev": 176471531,
+   "ErrorCode": "V522",
+   "FileName": "xsclient.c",
+   "Message": "Dereferencing of the null pointer 'pt' might take place. The null pointer is passed into 'stream_frame' function. Inspect the second argument. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 3716179857,
+   "CodeNext": 2395962986,
+   "CodePrev": 42215,
+   "ErrorCode": "V526",
+   "FileName": "v2.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1175,
+   "CodeNext": 8783,
+   "CodePrev": 105797,
+   "ErrorCode": "V1048",
+   "FileName": "tls13.c",
+   "Message": "The 'rc' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 2143703405,
+   "CodeNext": 25120313,
+   "CodePrev": 42055,
+   "ErrorCode": "V526",
+   "FileName": "v2.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 23029,
+   "CodeNext": 23060897,
+   "CodePrev": 1859,
+   "ErrorCode": "V547",
+   "FileName": "reality.c",
+   "Message": "Expression 'pn > _' is always true."
+  },
+  {
+   "CodeCurrent": 81619,
+   "CodeNext": 1233145,
+   "CodePrev": 1942962260,
+   "ErrorCode": "V507",
+   "FileName": "modcmd.c",
+   "Message": "Pointer to local array 'path' is stored outside the scope of this array. Such a pointer will become invalid."
+  },
+  {
+   "CodeCurrent": 663415437,
+   "CodeNext": 3840219436,
+   "CodePrev": 42031,
+   "ErrorCode": "V781",
+   "FileName": "dup.c",
+   "Message": "The value of the 'l' index is checked after it was used. Perhaps there is a mistake in program logic."
+  },
+  {
+   "CodeCurrent": 76449,
+   "CodeNext": 2895382845,
+   "CodePrev": 1067156749,
+   "ErrorCode": "V575",
+   "FileName": "check.c",
+   "Message": "The null pointer is passed into 'free' function. Inspect the first argument."
+  },
+  {
+   "CodeCurrent": 988462715,
+   "CodeNext": 2620998819,
+   "CodePrev": 42007,
+   "ErrorCode": "V526",
+   "FileName": "recon.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 3766161133,
+   "CodeNext": 4119117328,
+   "CodePrev": 144920541,
+   "ErrorCode": "V1086",
+   "FileName": "tgws.c",
+   "Message": "A call of the 'memset' function will lead to underflow of the buffer 'body'."
+  },
+  {
+   "CodeCurrent": 3135271982,
+   "CodeNext": 3512150198,
+   "CodePrev": 1511349969,
+   "ErrorCode": "V522",
+   "FileName": "hy2main.c",
+   "Message": "There might be dereferencing of a potential null pointer 'o'."
+  },
+  {
+   "CodeCurrent": 3715724841,
+   "CodeNext": 3020144835,
+   "CodePrev": 2009021340,
+   "ErrorCode": "V1027",
+   "FileName": "dupdial.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 4285513919,
+   "CodeNext": 899528106,
+   "CodePrev": 2771827652,
+   "ErrorCode": "V658",
+   "FileName": "hy2conn.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) n - off < room' expression."
+  },
+  {
+   "CodeCurrent": 4222113150,
+   "CodeNext": 5914208,
+   "CodePrev": 12611,
+   "ErrorCode": "V560",
+   "FileName": "tlsprobe.c",
+   "Message": "A part of conditional expression is always false: conn_err == _."
+  },
+  {
+   "CodeCurrent": 4226259035,
+   "CodeNext": 3169943317,
+   "CodePrev": 1955050136,
+   "ErrorCode": "V547",
+   "FileName": "tls13.c",
+   "Message": "Expression 'n < _' is always false."
+  },
+  {
+   "CodeCurrent": 4175531717,
+   "CodeNext": 3254182325,
+   "CodePrev": 20653635,
+   "ErrorCode": "V1048",
+   "FileName": "tls13.c",
+   "Message": "The 'hashSz' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 3951094147,
+   "CodeNext": 1511283545,
+   "CodePrev": 1511349969,
+   "ErrorCode": "V522",
+   "FileName": "pxmain.c",
+   "Message": "There might be dereferencing of a potential null pointer 'o'."
+  },
+  {
+   "CodeCurrent": 3234201656,
+   "CodeNext": 2214947535,
+   "CodePrev": 6161153,
+   "ErrorCode": "V769",
+   "FileName": "v2.c",
+   "Message": "The 'm->prefixes_files' pointer in the 'm->prefixes_files + m->prefixes_n' expression could be nullptr. In such case, resulting value will be senseless and it should not be used."
+  },
+  {
+   "CodeCurrent": 3696905714,
+   "CodeNext": 4126311161,
+   "CodePrev": 1044683136,
+   "ErrorCode": "V1027",
+   "FileName": "dup.c",
+   "Message": "Pointer to an object of the 'sockaddr_storage' class is cast to unrelated 'sockaddr_in_' class."
+  },
+  {
+   "CodeCurrent": 4200784805,
+   "CodeNext": 3552025979,
+   "CodePrev": 2053438372,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 1038246222,
+   "CodeNext": 744065947,
+   "CodePrev": 251695094,
+   "ErrorCode": "V576",
+   "FileName": "xsclient.c",
+   "Message": "Incorrect format. Consider checking the fourth actual argument of the 'snprintf' function. Under certain conditions the pointer can be null."
+  },
+  {
+   "CodeCurrent": 2122433946,
+   "CodeNext": 125,
+   "CodePrev": 3296187625,
+   "ErrorCode": "V1028",
+   "FileName": "awg.c",
+   "Message": "Possible overflow. Consider casting operands of the 'k + _' operator to the 'uint__t' type, not the result."
+  },
+  {
+   "CodeCurrent": 1727855140,
+   "CodeNext": 11233,
+   "CodePrev": 2125377880,
+   "ErrorCode": "V575",
+   "FileName": "srsread.c",
+   "Message": "The potential null pointer is passed into 'fclose' function. Inspect the first argument."
+  },
+  {
+   "CodeCurrent": 1169660522,
+   "CodeNext": 2622075536,
+   "CodePrev": 3101252327,
+   "ErrorCode": "V658",
+   "FileName": "tgws.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'sizeof (rx.buf) - rx.n < _' expression."
+  },
+  {
+   "CodeCurrent": 3308805,
+   "CodeNext": 388377913,
+   "CodePrev": 1683745,
+   "ErrorCode": "V609",
+   "FileName": "xshub.c",
+   "Message": "Mod by zero. Denominator range [_x_.._x_FFFFFFF]."
+  },
+  {
+   "CodeCurrent": 1982524087,
+   "CodeNext": 100,
+   "CodePrev": 1638670970,
+   "ErrorCode": "V595",
+   "FileName": "tls13.c",
+   "Message": "The 'ssl' pointer was utilized before it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 3559014054,
+   "CodeNext": 6113651,
+   "CodePrev": 3414925360,
+   "ErrorCode": "V547",
+   "FileName": "tls13.c",
+   "Message": "Expression 'nonceLength > MAX_TICKET_NONCE_STATIC_SZ' is always false."
+  },
+  {
+   "CodeCurrent": 3271808175,
+   "CodeNext": 2562099637,
+   "CodePrev": 125,
+   "ErrorCode": "V658",
+   "FileName": "hwid.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'outlen - done < _' expression."
+  },
+  {
+   "CodeCurrent": 2960962806,
+   "CodeNext": 3898237386,
+   "CodePrev": 1307650809,
+   "ErrorCode": "V526",
+   "FileName": "nftdump.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 729169,
+   "CodeNext": 2856209804,
+   "CodePrev": 0,
+   "ErrorCode": "V547",
+   "FileName": "tls13.c",
+   "Message": "Expression 'extIdx == _' is always true."
+  },
+  {
+   "CodeCurrent": 46645,
+   "CodeNext": 1704172352,
+   "CodePrev": 0,
+   "ErrorCode": "V547",
+   "FileName": "tls13.c",
+   "Message": "Expression 'ret == _' is always true."
+  },
+  {
+   "CodeCurrent": 1467500607,
+   "CodeNext": 2961527216,
+   "CodePrev": 2093661924,
+   "ErrorCode": "V547",
+   "FileName": "tls13.c",
+   "Message": "Expression 'ret == (VERSION_ERROR)' is always false."
+  },
+  {
+   "CodeCurrent": 253853102,
+   "CodeNext": 57177273,
+   "CodePrev": 3233256383,
+   "ErrorCode": "V595",
+   "FileName": "tls13.c",
+   "Message": "The 'ssl' pointer was utilized before it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 2588622631,
+   "CodeNext": 125,
+   "CodePrev": 30574991,
+   "ErrorCode": "V595",
+   "FileName": "tls13.c",
+   "Message": "The 'ssl' pointer was utilized before it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 89810521,
+   "CodeNext": 125,
+   "CodePrev": 631238826,
+   "ErrorCode": "V595",
+   "FileName": "tls13.c",
+   "Message": "The 'ssl' pointer was utilized before it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 480636518,
+   "CodeNext": 22718835,
+   "CodePrev": 1967037615,
+   "ErrorCode": "V547",
+   "FileName": "tls13.c",
+   "Message": "Expression is always false."
+  },
+  {
+   "CodeCurrent": 1711233625,
+   "CodeNext": 3937198130,
+   "CodePrev": 0,
+   "ErrorCode": "V560",
+   "FileName": "tls13.c",
+   "Message": "A part of conditional expression is always true: extIdx < _."
+  },
+  {
+   "CodeCurrent": 2201668002,
+   "CodeNext": 2834954425,
+   "CodePrev": 3277354444,
+   "ErrorCode": "V560",
+   "FileName": "tls13.c",
+   "Message": "A part of conditional expression is always false: _."
+  },
+  {
+   "CodeCurrent": 2670270,
+   "CodeNext": 1699554340,
+   "CodePrev": 264400038,
+   "ErrorCode": "V560",
+   "FileName": "tls13.c",
+   "Message": "A part of conditional expression is always true: !skipSanity."
+  },
+  {
+   "CodeCurrent": 310321989,
+   "CodeNext": 44087,
+   "CodePrev": 1654755234,
+   "ErrorCode": "V614",
+   "FileName": "tls13.c",
+   "Message": "Potentially uninitialized buffer 'hash' used. Consider checking the tenth actual argument of the 'Tls_HKDFExpandLabel' function."
+  },
+  {
+   "CodeCurrent": 3190545548,
+   "CodeNext": 1119948993,
+   "CodePrev": 875431690,
+   "ErrorCode": "V658",
+   "FileName": "tls13.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'inputLength - HANDSHAKE_HEADER_SZ < size' expression."
+  },
+  {
+   "CodeCurrent": 1693413708,
+   "CodeNext": 286250218,
+   "CodePrev": 0,
+   "ErrorCode": "V785",
+   "FileName": "tls13.c",
+   "Message": "Constant expression in switch statement."
+  },
+  {
+   "CodeCurrent": 4007560617,
+   "CodeNext": 35983082,
+   "CodePrev": 0,
+   "ErrorCode": "V785",
+   "FileName": "tls13.c",
+   "Message": "Constant expression in switch statement."
+  },
+  {
+   "CodeCurrent": 502447,
+   "CodeNext": 0,
+   "CodePrev": 125,
+   "ErrorCode": "V796",
+   "FileName": "tls13.c",
+   "Message": "It is possible that 'break' statement is missing in switch statement."
+  },
+  {
+   "CodeCurrent": 502447,
+   "CodeNext": 0,
+   "CodePrev": 142363106,
+   "ErrorCode": "V796",
+   "FileName": "tls13.c",
+   "Message": "It is possible that 'break' statement is missing in switch statement."
+  },
+  {
+   "CodeCurrent": 6149989,
+   "CodeNext": 2337,
+   "CodePrev": 9050,
+   "ErrorCode": "V1048",
+   "FileName": "tls13.c",
+   "Message": "The 'ret' variable was assigned the same value."
+  },
+  {
+   "CodeCurrent": 4037332154,
+   "CodeNext": 2094203334,
+   "CodePrev": 123,
+   "ErrorCode": "V522",
+   "FileName": "tls13.c",
+   "Message": "There might be dereferencing of a potential null pointer 'ssl'."
+  },
+  {
+   "CodeCurrent": 1913792509,
+   "CodeNext": 650604611,
+   "CodePrev": 1699497728,
+   "ErrorCode": "V575",
+   "FileName": "tls13.c",
+   "Message": "The potential null pointer is passed into 'memcpy' function. Inspect the second argument."
+  },
+  {
+   "CodeCurrent": 1699497728,
+   "CodeNext": 1913792509,
+   "CodePrev": 372046882,
+   "ErrorCode": "V769",
+   "FileName": "tls13.c",
+   "Message": "The 'output' pointer in the 'output + args->idx' expression could be nullptr. In such case, resulting value will be senseless and it should not be used."
+  },
+  {
+   "CodeCurrent": 2261702757,
+   "CodeNext": 2648641424,
+   "CodePrev": 4281234350,
+   "ErrorCode": "V526",
+   "FileName": "generate.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 502447,
+   "CodeNext": 0,
+   "CodePrev": 2728466670,
+   "ErrorCode": "V796",
+   "FileName": "tls13.c",
+   "Message": "It is possible that 'break' statement is missing in switch statement."
+  },
+  {
+   "CodeCurrent": 3604168899,
+   "CodeNext": 2955515414,
+   "CodePrev": 1365304436,
+   "ErrorCode": "V526",
+   "FileName": "dup.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 107171735,
+   "CodeNext": 4256167946,
+   "CodePrev": 1172171010,
+   "ErrorCode": "V1004",
+   "FileName": "tls13.c",
+   "Message": "The 'ssl' pointer was used unsafely after it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 1074015265,
+   "CodeNext": 687688994,
+   "CodePrev": 3774301374,
+   "ErrorCode": "V1008",
+   "FileName": "tls13.c",
+   "Message": "Consider inspecting the 'for' operator. No more than one iteration of the loop will be performed."
+  },
+  {
+   "CodeCurrent": 1296875807,
+   "CodeNext": 4290289539,
+   "CodePrev": 464340884,
+   "ErrorCode": "V526",
+   "FileName": "tgws.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 746756633,
+   "CodeNext": 23118729,
+   "CodePrev": 0,
+   "ErrorCode": "V1051",
+   "FileName": "tls13.c",
+   "Message": "Consider checking for misprints. It's possible that the 'copySz' should be checked here."
+  },
+  {
+   "CodeCurrent": 418008623,
+   "CodeNext": 3819679808,
+   "CodePrev": 3046155196,
+   "ErrorCode": "V1051",
+   "FileName": "tls13.c",
+   "Message": "Consider checking for misprints. It's possible that the 'listSz' should be checked here."
+  },
+  {
+   "CodeCurrent": 2090539955,
+   "CodeNext": 2705944602,
+   "CodePrev": 3070413715,
+   "ErrorCode": "V526",
+   "FileName": "tgws.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 188487235,
+   "CodeNext": 125,
+   "CodePrev": 2313344316,
+   "ErrorCode": "V512",
+   "FileName": "origdst.c",
+   "Message": "A call of the 'memcpy' function will lead to a buffer overflow."
+  },
+  {
+   "CodeCurrent": 2504678713,
+   "CodeNext": 125,
+   "CodePrev": 1901260596,
+   "ErrorCode": "V595",
+   "FileName": "tabfmt.c",
+   "Message": "The 'g_dch' pointer was utilized before it was verified against nullptr. Check lines: _, _."
+  },
+  {
+   "CodeCurrent": 3331824952,
+   "CodeNext": 817597326,
+   "CodePrev": 3261435277,
+   "ErrorCode": "V1042",
+   "FileName": "quic.c",
+   "Message": "This file is marked with copyleft license, which requires you to open the derived source code."
+  },
+  {
+   "CodeCurrent": 3470787344,
+   "CodeNext": 2232375,
+   "CodePrev": 17443887,
+   "ErrorCode": "V526",
+   "FileName": "parse.c",
+   "Message": "The 'strncmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 3929163166,
+   "CodeNext": 2966402137,
+   "CodePrev": 916699036,
+   "ErrorCode": "V658",
+   "FileName": "rtnl.c",
+   "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) w_ < sizeof (line) - k' expression."
+  },
+  {
+   "CodeCurrent": 2014525447,
+   "CodeNext": 11101,
+   "CodePrev": 3819968723,
+   "ErrorCode": "V526",
+   "FileName": "folat.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 1161115022,
+   "CodeNext": 773657,
+   "CodePrev": 41991,
+   "ErrorCode": "V526",
+   "FileName": "awg.c",
+   "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 383001201,
+   "CodeNext": 77629,
+   "CodePrev": 125,
+   "ErrorCode": "V575",
+   "FileName": "ctl.c",
+   "Message": "The potential null pointer is passed into 'qsort' function. Inspect the first argument."
+  },
+  {
+   "CodeCurrent": 1701256423,
+   "CodeNext": 1279143303,
+   "CodePrev": 384698821,
+   "ErrorCode": "V560",
+   "FileName": "diag.c",
+   "Message": "A part of conditional expression is always true: !found."
+  },
+  {
+   "CodeCurrent": 2969646629,
+   "CodeNext": 3087349285,
+   "CodePrev": 4973540,
+   "ErrorCode": "V769",
+   "FileName": "tls13.c",
+   "Message": "The 'args->output' pointer in the 'args->output + RECORD_HEADER_SZ' expression could be nullptr. In such case, resulting value will be senseless and it should not be used."
+  },
+  {
+   "CodeCurrent": 3086878085,
+   "CodeNext": 43344281,
+   "CodePrev": 10780555,
+   "ErrorCode": "V1032",
+   "FileName": "watchd.c",
+   "Message": "The pointer 'buf' is cast to a more strictly aligned pointer type."
+  },
+  {
+   "CodeCurrent": 2657256186,
+   "CodeNext": 82939969,
+   "CodePrev": 280369,
+   "ErrorCode": "V526",
+   "FileName": "hy2sub.c",
+   "Message": "The 'strcasecmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
+  },
+  {
+   "CodeCurrent": 5906687,
+   "CodeNext": 1417340483,
+   "CodePrev": 125,
+   "ErrorCode": "V547",
+   "FileName": "trdial.c",
+   "Message": "Expression 'wait < _' is always false."
+  }
+ ]
+}
