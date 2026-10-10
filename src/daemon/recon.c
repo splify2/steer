@@ -816,7 +816,7 @@ int recon_table_handle(const char *name, uint64_t *h) {
         return -1;
     }
     int rc = -1, done = 0;
-    char buf[8192];
+    _Alignas(struct nlmsghdr) char buf[8192];
     while (!done) {
         ssize_t m = recv(fd, buf, sizeof(buf), 0);
         if (m < 0 && errno == EINTR) continue;
