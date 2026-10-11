@@ -632,3 +632,16 @@ size_t hy2_gecko_rx(void *user, uint8_t *dst, const uint8_t *src, size_t n) {
     s->used = 0;
     return tot;
 }
+
+uint64_t hy2_brutal_share(uint64_t cap, unsigned n) {
+    if (!cap) return 0;
+    uint64_t s = cap / (n ? n : 1);
+    return s ? s : 1;
+}
+
+int hy2_worker_busy(uint64_t bytes, uint64_t ms, uint64_t share_bps) {
+    if (!bytes) return 0;
+    if (!ms) return 1;
+    /* bytes * 8000 / ms >= share_bps / 8, без деления */
+    return (unsigned __int128)bytes * 64000u >= (unsigned __int128)share_bps * ms;
+}

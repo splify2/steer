@@ -184,6 +184,9 @@ struct hq {
     struct hy2_flow *by_usid[1024]; /* по идентификатору сессии UDP */
     /* Для чтения из других потоков (hy2c_status, hy2c_alive). */
     struct hy2c_status st;          /* под g_mu */
+    uint64_t tx_bytes, tx_prev;     /* отправлено вверх всего / к прошлому тику STATUS_MS (только поток рабочего) */
+    uint64_t cap_bps, cur_bps;      /* предел Brutal узла после ответа сервера (0 — BBR) / доля, что стоит сейчас */
+    int busy;                       /* учтён в g_nbusy */
     uint64_t rx_at_ms;              /* последний пакет от узла: атомарно */
     unsigned nflows;                /* атомарно */
 };
@@ -198,6 +201,8 @@ static struct {
 } g_hq = { .mu = PTHREAD_MUTEX_INITIALIZER };
 #define g_mu g_hq.mu
 static __thread struct hq *H;
+/* Сколько рабочих сейчас гонят данные вверх: Brutal узла делится между ними (rebalance). Атомарно. */
+static unsigned g_nbusy;
 static __thread char g_lasterr[160];
 
 /* Кэш разрешённого адреса сервера: пишет hy2c_init (старт) и поток состояния, читают рабочие. */
@@ -440,6 +445,27 @@ static uint64_t apply_cc(struct qc *q, const struct hy2_node *n, const struct hy
         return n->up_bps;
     }
     return want;
+}
+
+/* Brutal узла — один на всех рабочих: у каждого своё соединение QUIC, и с полной скоростью у каждого
+ * сумма была бы до N× заданной. Поэтому cap делится на число рабочих, занятых вверх (g_nbusy), а
+ * простаивающий рабочий считается за одного — при старте загрузки он получает долю, не отнимая у других
+ * больше положенного. Одна загрузка идёт на полной скорости, параллельные на разных рабочих делят её.
+ * Делить по фактическому спросу точнее, но спрос Brutal не виден (он шлёт ровно то, что дано), поэтому
+ * мерой служит доля отправленного от положенного (hy2_worker_busy). Занятость обновляется раз в STATUS_MS,
+ * так что при смене состава рабочих сумма может превышать cap до одного такта. */
+static void rebalance(struct hq *h, int busy_now) {
+    if (busy_now != h->busy) {
+        if (busy_now) __atomic_add_fetch(&g_nbusy, 1, __ATOMIC_RELAXED);
+        else __atomic_sub_fetch(&g_nbusy, 1, __ATOMIC_RELAXED);
+        h->busy = busy_now;
+    }
+    if (!h->cap_bps || !h->qc) return;
+    unsigned n = __atomic_load_n(&g_nbusy, __ATOMIC_RELAXED);
+    if (!h->busy) n++;
+    uint64_t want = hy2_brutal_share(h->cap_bps, n);
+    if (want == h->cur_bps) return;
+    if (qc_set_cc(h->qc, want) == 0) h->cur_bps = want;
 }
 
 /* ---- разовая проверка узла --------------------------------------------------------------------- */
@@ -756,6 +782,7 @@ static void flow_up_flush(struct hy2_flow *f) {
     if (!f->up_n || f->gone || f->sclosed) return;
     ssize_t k = qc_stream_send(h->qc, f->sid, f->up, f->up_n, 0);
     if (k < 0) { flow_kill(f, 0); return; }
+    h->tx_bytes += (uint64_t)k;
     if ((size_t)k < f->up_n) {
         memmove(f->up, f->up + k, f->up_n - (size_t)k);
         f->up_n -= (size_t)k;
@@ -810,6 +837,7 @@ int hy2c_send(struct hy2_flow *f, const unsigned char *d, size_t n) {
     }
     ssize_t k = qc_stream_send(h->qc, f->sid, d, n, 0);
     if (k < 0) return SEND_FATAL;
+    h->tx_bytes += (uint64_t)k;
     if ((size_t)k < n) {
         f->up = malloc(n - (size_t)k);
         if (!f->up) return SEND_FATAL;
@@ -1011,6 +1039,20 @@ static void auth_data(struct hq *h, const uint8_t *d, size_t n) {
     h->state = S_UP;
     h->bg_ms = 0;
     uint64_t eff = apply_cc(h->qc, g_node, &r);
+    h->cap_bps = eff;
+    h->cur_bps = eff;
+    h->tx_prev = h->tx_bytes;
+    h->status_at_ms = now_ms();
+    /* Новое соединение считается занятым: до первого замера доля — как при полной нагрузке всех. */
+    if (eff && h->nworkers > 1) {
+        if (!h->busy) { h->busy = 1; __atomic_add_fetch(&g_nbusy, 1, __ATOMIC_RELAXED); }
+        uint64_t sh = hy2_brutal_share(eff, (unsigned)h->nworkers);
+        if (qc_set_cc(h->qc, sh) == 0) h->cur_bps = sh;
+        if (g_node->down_bps)
+            fprintf(stderr, LOG_W2 "hysteria2: рабочих %d, у каждого своё соединение, и серверу объявлена скорость "
+                    "приёма down у каждого: сервер может слать до down на каждое, а не на все (Brutal вверх "
+                    "рабочие делят)\n", h->nworkers);
+    }
     pthread_mutex_lock(&g_mu);
     h->st.up = 1;
     h->st.udp_ok = r.udp;
@@ -1200,6 +1242,8 @@ static int connect_now(struct hq *h) {
 /* Соединение кончилось: открывающиеся потоки отказывают, открытые — оборваны (связь пропала, а не закрыта:
  * клиенту RST, и стек увидит это при чтении). Сами сессии остаются у стека, пока он их не закроет. */
 static void teardown(struct hq *h, const char *why) {
+    if (h->busy) { h->busy = 0; __atomic_sub_fetch(&g_nbusy, 1, __ATOMIC_RELAXED); }
+    h->cap_bps = h->cur_bps = 0;
     if (h->qc) { qc_free(h->qc); h->qc = NULL; }
     ob_drop(h);
     h->state = S_IDLE;
@@ -1324,6 +1368,10 @@ void hy2c_loop_poll(int ready) {
     }
     expire(h, now);
     if (h->qc && h->state == S_UP && now - h->status_at_ms >= STATUS_MS) {
+        if (h->nworkers > 1 && h->cap_bps) {
+            rebalance(h, hy2_worker_busy(h->tx_bytes - h->tx_prev, now - h->status_at_ms, h->cur_bps));
+            h->tx_prev = h->tx_bytes;
+        }
         h->status_at_ms = now;
         struct qc_stats qs;
         qc_stats_get(h->qc, &qs);
