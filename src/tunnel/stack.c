@@ -380,6 +380,10 @@ static void ooo_free(struct conn *c) {
 #define LOOP_TOKEN (MAX_CONNS + 2)
 #define AUX_BIT 0x40000000u   /* в data события epoll: вторая связь дайлера этого соединения */
 #define SOCK_BIT 0x20000000u  /* в data события epoll: сокет клиента этого соединения (R-152) */
+/* Чтение сокета клиента (sock_read): за вызов, одним read и порция узлу под одну запись TLS с обёртками. */
+#define SOCK_READ_BUDGET (256 * 1024)
+#define SOCK_READ_MAX    (64 * 1024)
+#define SOCK_SEND_CHUNK  (16384 - 128)
 #define CRD        1
 #define CWR        2
 #define CARM_ADDED 0x80
@@ -919,11 +923,18 @@ struct xpkt {
     uint32_t n;
     unsigned char d[];
 };
+struct xfd {
+    struct xfd *next;
+    int fd;
+};
 struct xmail {
     pthread_mutex_t mu;
     struct xpkt *head, *tail;
     unsigned n;
     unsigned long long dropped;
+    /* Принятые сокеты клиентов, отданные этому рабочему (R-152, kaccept); nfd читается без замка. */
+    struct xfd *fds;
+    unsigned nfd;
 };
 
 /* Рабочий потока в режиме с читателем. Заполняется до пуска читателя и дальше только читается,
@@ -985,6 +996,34 @@ static int xmail_put(unsigned o, const unsigned char *pkt, size_t n) {
         (void)wr;
     }
     return 0;
+}
+
+/* Отдать принятый сокет клиента рабочему o (kaccept). 0 — отдан. */
+static int xmail_fd(unsigned o, int fd) {
+    struct ring_work *w = &g_rw[o];
+    struct xfd *x = malloc(sizeof(*x));
+    if (!x) return -1;
+    x->fd = fd;
+    pthread_mutex_lock(&w->mail.mu);
+    x->next = w->mail.fds;
+    w->mail.fds = x;
+    __atomic_store_n(&w->mail.nfd, w->mail.nfd + 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&w->mail.mu);
+    if (w->ring.efd >= 0) {
+        uint64_t one = 1;
+        ssize_t wr = write(w->ring.efd, &one, sizeof(one));
+        (void)wr;
+    }
+    return 0;
+}
+
+static struct xfd *xmail_take_fds(struct xmail *m) {
+    pthread_mutex_lock(&m->mu);
+    struct xfd *l = m->fds;
+    m->fds = NULL;
+    __atomic_store_n(&m->nfd, 0, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&m->mu);
+    return l;
 }
 
 /* Забрать всю почту разом: цепочка, которую владелец разбирает и освобождает сам. */
@@ -1935,9 +1974,10 @@ static int early_flush(struct conn *c) {
             continue;
         }
         size_t chunk = c->early_n - c->early_off;
-        /* Запас под заголовок запроса и обёртку (у VLESS — кадр Vision): дайлер клеит их в
-         * один буфер TUNNEL_BUF, и порция впритык не влезла бы вместе с ними. */
-        if (chunk > TUNNEL_BUF - 2048) chunk = TUNNEL_BUF - 2048;
+        /* Запас под заголовок запроса и обёртку (у VLESS — кадр Vision): дайлер клеит их в один буфер
+         * TUNNEL_BUF. У сокета клиента — порция под одну запись TLS (SOCK_SEND_CHUNK, см. sock_read). */
+        size_t lim = c->cfd1 ? SOCK_SEND_CHUNK : TUNNEL_BUF - 2048;
+        if (chunk > lim) chunk = lim;
         int sr = upstream_send(c, c->early + c->early_off, chunk);
         if (sr == SEND_AGAIN) return 1;
         if (sr != SEND_OK) return -1;
@@ -3612,95 +3652,113 @@ static void sock_rst_close(int fd) {
     close(fd);
 }
 
+/* Одно принятое соединение — в таблицу этого рабочего (R-152): назначение у ядра, поток к узлу. */
+static void kaccept_fd(int fd, const struct tun_dev *tun) {
+    struct sockaddr_in peer, od, me;
+    socklen_t pl = sizeof(peer), ol = sizeof(od), ml = sizeof(me);
+    if (getpeername(fd, (struct sockaddr *)&peer, &pl) != 0) { close(fd); return; }
+    if (getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, &od, &ol) != 0 ||
+        getsockname(fd, (struct sockaddr *)&me, &ml) != 0 ||
+        (od.sin_addr.s_addr == me.sin_addr.s_addr && od.sin_port == me.sin_port)) {
+        close(fd);                      /* не перенаправленное — прямо к порту модуля */
+        return;
+    }
+    uint32_t dst = od.sin_addr.s_addr;
+    uint32_t dh = ntohl(dst);
+    if (dh - FAKE4_BASE < FAKE4_SIZE) {
+        uint32_t real = fake_real(dst);
+        if (!real) {
+            static __thread time_t said;
+            if (g_now_s - said >= 10) {
+                said = g_now_s;
+                char a[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &dst, a, sizeof(a));
+                fprintf(stderr, LOG_W "поддельный адрес %s без настоящего в fakeip.state — соединение "
+                                "сброшено\n", a);
+            }
+            sock_rst_close(fd);
+            return;
+        }
+        dst = real;
+    }
+    struct flow_key key;
+    memset(&key, 0, sizeof(key));
+    key.src = peer.sin_addr.s_addr;
+    key.dst = dst;
+    key.sport = ntohs(peer.sin_port);
+    key.dport = ntohs(od.sin_port);
+    key.proto = 6;
+    struct conn *c = conn_new(tun);
+    if (!c) { sock_rst_close(fd); return; }
+    memset(c, 0, sizeof(*c));
+    c->used = 1;
+    c->born_turn = g_turn;
+    c->room_seen = UINT32_MAX;
+    c->key = key;
+    c->fd = -1;
+    c->aux = -1;
+    c->cfd1 = fd + 1;
+    c->last = g_now_s;
+    c->estab_ns = g_now_ns ? g_now_ns : 1;
+    conn_link(c);
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), &key, 0) != 0) { conn_reset(c, tun); return; }
+    if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
+        c->fd = g_dl->ops->fd(SESS(c));
+        node_sock_silence(c->fd);
+        spare_refill();
+        return;
+    }
+    if (conn_submit(c) != 0) {
+        static __thread time_t said_q;
+        if (g_now_s - said_q >= 5) {
+            said_q = g_now_s;
+            fprintf(stderr, LOG_W "очередь установки соединений полна (%d), соединение сброшено\n", CONNQ);
+        }
+        conn_reset(c, tun);
+        return;
+    }
+    c->pending = 1;                     /* установщик заполняет сессию; сокет не трогаем до готовности */
+    spare_refill();
+}
+
+/* Раздача соединений по рабочим — ПО КРУГУ, а не хэшем SO_REUSEPORT. Хэш пятёрки не балансирует: на
+ * замере четыре выгрузки при двух рабочих в двух прогонах из трёх сели на одного (99 % против 0 %, вв4 5288
+ * Мбит/с против 9411 у TUN). Принявший рабочий берёт следующий номер общего счётчика и, если он чужой,
+ * отдаёт сокет почтой: дескриптор общий для процесса, цена — замок и побудка на соединение, а не на байт. */
+static unsigned g_accept_rr;
+
 /* Принять перенаправленные соединения: до 64 за событие, остальные — следующим витком. */
 static void kaccept(int lfd, const struct tun_dev *tun) {
     for (int k = 0; k < 64; k++) {
-        struct sockaddr_in peer, od, me;
-        socklen_t pl = sizeof(peer), ol = sizeof(od), ml = sizeof(me);
-        int fd = accept4(lfd, (struct sockaddr *)&peer, &pl, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        int fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) return;
-        if (getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, &od, &ol) != 0 ||
-            getsockname(fd, (struct sockaddr *)&me, &ml) != 0 ||
-            (od.sin_addr.s_addr == me.sin_addr.s_addr && od.sin_port == me.sin_port)) {
-            close(fd);                      /* не перенаправленное — прямо к порту модуля */
-            continue;
+        if (g_rw && g_nwork > 1) {
+            unsigned t = __atomic_fetch_add(&g_accept_rr, 1, __ATOMIC_RELAXED) % g_nwork;
+            if (t != (unsigned)g_worker && xmail_fd(t, fd) == 0) continue;
         }
-        uint32_t dst = od.sin_addr.s_addr;
-        uint32_t dh = ntohl(dst);
-        if (dh - FAKE4_BASE < FAKE4_SIZE) {
-            uint32_t real = fake_real(dst);
-            if (!real) {
-                static __thread time_t said;
-                if (g_now_s - said >= 10) {
-                    said = g_now_s;
-                    char a[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &dst, a, sizeof(a));
-                    fprintf(stderr, LOG_W "поддельный адрес %s без настоящего в fakeip.state — соединение "
-                                    "сброшено\n", a);
-                }
-                sock_rst_close(fd);
-                continue;
-            }
-            dst = real;
-        }
-        struct flow_key key;
-        memset(&key, 0, sizeof(key));
-        key.src = peer.sin_addr.s_addr;
-        key.dst = dst;
-        key.sport = ntohs(peer.sin_port);
-        key.dport = ntohs(od.sin_port);
-        key.proto = 6;
-        struct conn *c = conn_new(tun);
-        if (!c) { sock_rst_close(fd); continue; }
-        memset(c, 0, sizeof(*c));
-        c->used = 1;
-        c->born_turn = g_turn;
-        c->room_seen = UINT32_MAX;
-        c->key = key;
-        c->fd = -1;
-        c->aux = -1;
-        c->cfd1 = fd + 1;
-        c->last = g_now_s;
-        c->estab_ns = g_now_ns ? g_now_ns : 1;
-        conn_link(c);
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), &key, 0) != 0) { conn_reset(c, tun); continue; }
-        if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
-            c->fd = g_dl->ops->fd(SESS(c));
-            node_sock_silence(c->fd);
-            spare_refill();
-            continue;
-        }
-        if (conn_submit(c) != 0) {
-            static __thread time_t said_q;
-            if (g_now_s - said_q >= 5) {
-                said_q = g_now_s;
-                fprintf(stderr, LOG_W "очередь установки соединений полна (%d), соединение сброшено\n", CONNQ);
-            }
-            conn_reset(c, tun);
-            continue;
-        }
-        c->pending = 1;                     /* установщик заполняет сессию; сокет не трогаем до готовности */
-        spare_refill();
+        kaccept_fd(fd, tun);
     }
 }
 
-/* Из сокета клиента — узлу. Крупными чтениями, сколько дайлер примет за раз; узел не принял — остаток в
- * early и сокет не читаем (окно клиенту держит ядро). Не больше четырёх чтений за событие, чтобы одна
- * выгрузка не держала цикл. */
 /* Прочитать у клиента и отдать узлу (R-152). Сокет — по фронту: читаем, пока не EAGAIN (тогда CRD снят), или
- * пока узел не перестал принимать (место дайлера, SEND_AGAIN — CRD остаётся, дочитаем, когда место
- * вернётся), или до SOCK_READ_BUDGET за вызов — чтобы одно соединение не держало цикл (CRD остаётся, проход
- * сроков дочитает со следующим витком). */
-#define SOCK_READ_BUDGET (256 * 1024)
+ * пока узел не перестал принимать (место дайлера, SEND_AGAIN — остаток в early, CRD остаётся: дочитаем, когда
+ * место вернётся), или до SOCK_READ_BUDGET за вызов — чтобы одно соединение не держало цикл (CRD остаётся,
+ * проход сроков дочитает со следующим витком).
+ *
+ * Читаем крупно (до SOCK_READ_MAX одним read), а узлу отдаём порциями SOCK_SEND_CHUNK — столько, сколько с
+ * обёртками дайлера (кадр Vision, заголовок ws, кадр gRPC и HTTP/2) ложится в ОДНУ запись TLS (16384 байта
+ * открытого текста). Прежде чтение было ровно UP_MAX = 16400 байт, на 16 больше записи: каждые 16 КБ
+ * уходили двумя записями TLS и двумя write (122 вызова write на МБ против 64 у пути через TUN). */
 static void sock_read(struct conn *c, const struct tun_dev *tun) {
-    static __thread unsigned char buf[TUNNEL_GATHER_MAX];
+    static __thread unsigned char buf[SOCK_READ_MAX];
     size_t got = 0;
     while (got < SOCK_READ_BUDGET && c->used && (c->carmed & CRD) && !c->early && !c->client_fin &&
            !c->srv_closed) {
-        size_t cap = conn_up_max(c);
-        if (cap > sizeof(buf)) cap = sizeof(buf);
+        size_t chunk = conn_up_max(c);
+        if (chunk > SOCK_SEND_CHUNK && chunk <= UP_MAX) chunk = SOCK_SEND_CHUNK;   /* больше UP_MAX — свой предел дайлера */
+        size_t cap = sizeof(buf);
         long room = conn_room(c);
         if (room >= 0 && (size_t)room < cap) cap = (size_t)room;
         if (!cap) return;
@@ -3708,13 +3766,21 @@ static void sock_read(struct conn *c, const struct tun_dev *tun) {
         if (n > 0) {
             c->last = g_now_s;
             got += (size_t)n;
-            int sr = upstream_send(c, buf, (size_t)n);
+            size_t off = 0;
+            int sr = SEND_OK;
+            while (off < (size_t)n) {
+                size_t m = (size_t)n - off < chunk ? (size_t)n - off : chunk;
+                sr = upstream_send(c, buf + off, m);
+                if (sr != SEND_OK) break;
+                off += m;
+            }
             if (sr == SEND_OK) continue;
             if (sr == SEND_AGAIN) {
-                c->early = malloc((size_t)n);
+                size_t rest = (size_t)n - off;
+                c->early = malloc(rest);
                 if (!c->early) { conn_reset(c, tun); return; }
-                memcpy(c->early, buf, (size_t)n);
-                c->early_n = c->early_cap = (uint32_t)n;
+                memcpy(c->early, buf + off, rest);
+                c->early_n = c->early_cap = (uint32_t)rest;
                 c->early_off = 0;
                 return;
             }
@@ -4020,7 +4086,8 @@ static void *worker_loop(void *arg) {
          * (ядро не дало) будить нечем — просыпаемся раз в миллисекунду. */
         int sleeping = 0;
         if (rw && wait_ms > 0) {
-            if (__atomic_load_n(&rw->mail.n, __ATOMIC_RELAXED)) wait_ms = 0;
+            if (__atomic_load_n(&rw->mail.n, __ATOMIC_RELAXED) || __atomic_load_n(&rw->mail.nfd, __ATOMIC_RELAXED))
+                wait_ms = 0;
             else if (g_steered) { /* своя очередь TUN и побудка почты — обе в epoll */ }
             else if (efd < 0) { if (wait_ms > 1) wait_ms = 1; }
             else if (spsc_sleep_begin(&rw->ring)) sleeping = 1;
@@ -4089,6 +4156,16 @@ static void *worker_loop(void *arg) {
             }
         }
 
+        if (rw && __atomic_load_n(&rw->mail.nfd, __ATOMIC_RELAXED)) {
+            /* Сокеты клиентов, отданные другими рабочими (раздача по кругу, kaccept). */
+            struct xfd *l = xmail_take_fds(&rw->mail);
+            while (l) {
+                struct xfd *x = l;
+                l = x->next;
+                kaccept_fd(x->fd, &tun);
+                free(x);
+            }
+        }
         if (rw && g_steered && __atomic_load_n(&rw->mail.n, __ATOMIC_RELAXED)) {
             /* Раздаёт ядро: почта — только датаграммы, собранные из фрагментов у другого рабочего (их
              * владелец — по хэшу пятёрки). Не больше XMAIL_MAX = TUN_DRAIN_MAX за раз — на это рассчитан g_up. */
