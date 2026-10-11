@@ -34,6 +34,7 @@
 #include "tls13.h"
 #include "reality.h"
 #include "dupq.h"
+#include "thrstack.h"
 
 /* Контекст TLS соединений DoQ (корни разбираются один раз на процесс) готовит шов dupq.h — здесь,
  * в потоке установки: разбор файла корней блокирует, а цикл резолвера — нет. Корни те же, что у DoT:
@@ -448,7 +449,7 @@ int dial_launch(struct dial *d) {
     int attr_ok = pthread_attr_init(&at) == 0;
     if (attr_ok) {
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-        pthread_attr_setstacksize(&at, 256 * 1024);
+        pthread_attr_setstacksize(&at, thread_stack(256 * 1024));
     }
     pthread_t th;
     int rc = pthread_create(&th, attr_ok ? &at : NULL, dial_thread, d);
