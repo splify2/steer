@@ -281,8 +281,8 @@ QUIC_STAND_SRC := tests/qcbench.c
 # hysteria2 (модуль steer-hysteria2, docs/hysteria2.md). Запись вида — в libsteer, как у vless и
 # xsteer, но НЕ в KINDS_EXT_SRC: тот список входит в статические профили (extended, android), а
 # hysteria2 в них нет — телефон отложен, и вид там отвечает записью отказа (kind.c). Модуль — свой
-# бинарник на libsteer.so: провод и подписка — hy2wire.c, hy2sub.c; соединение QUIC и мультиплексор
-# потоков — hy2conn.c; дайлер стека — hy2dial.c; команды и слежка — hy2main.c.
+# бинарник на libsteer.so: провод и подписка — hy2wire.c, hy2sub.c; соединение QUIC в цикле рабочего
+# и потоки клиента поверх него — hy2conn.c; дайлер стека — hy2dial.c; команды и слежка — hy2main.c.
 KINDS_HY2_SRC := src/kinds/hysteria2.c
 HY2_MOD_SRC := src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2conn.c \
                src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c

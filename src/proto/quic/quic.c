@@ -1430,6 +1430,15 @@ ssize_t qc_stream_send(struct qc *q, int64_t sid, const uint8_t *d, size_t n, in
     return (ssize_t)take;
 }
 
+size_t qc_stream_room(const struct qc *q, int64_t sid) {
+    for (const struct qc_stream *s = q->streams; s; s = s->next)
+        if (s->id == sid) {
+            size_t used = (size_t)(s->total - s->acked);
+            return used < q->send_buf ? q->send_buf - used : 0;
+        }
+    return q->send_buf;
+}
+
 size_t qc_stream_buffered(const struct qc *q, int64_t sid) {
     for (const struct qc_stream *s = q->streams; s; s = s->next)
         if (s->id == sid) return (size_t)(s->total - s->acked);

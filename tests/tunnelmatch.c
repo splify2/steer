@@ -2405,39 +2405,19 @@ static void t_pool_state(void) {
     rmdir(dir);
 }
 
-/* ---- подтверждения привязаны к очереди дайлера (DC_ACK_PACED) ------------------------------- */
+/* ---- дайлер в цикле рабочего (DC_INLOOP) ------------------------------------------------------- */
 
-/* Поддельный дайлер с ограниченной очередью: связь — пара SOCK_SEQPACKET (как у hysteria2), второй
- * конец g_hpeer — «мультиплексор», который стенд разбирает руками. Очередь мала (буфер отправки
- * 16 КиБ, готовность записи — пока в ней не больше четверти), чтобы заполнить её несколькими пакетами.
- * Стенд проверяет то, что видно снаружи: подтверждение клиенту не уходит, пока очередь выше нижней
- * отметки, и уходит, когда она опустела. Ожидание готовности в epoll (ARM_OUT) — дело цикла
- * worker_loop, и его гоняет стенд в сетевых пространствах (tests/run-hy2.sh, раздел 8). */
-struct hsess { int fd; };
-static int g_hpeer = -1;
-
-static const char *h_peer(const void *ctx) { (void)ctx; return "очередь"; }
-static void h_describe(const void *ctx, char *out, size_t n) { (void)ctx; snprintf(out, n, "очередь"); }
+/* Поддельный дайлер без дескрипторов и без установщика: связь — готовая сессия, нагрузка лежит в ней же
+ * (как у hysteria2: очередь блоков), стенд кладёт и забирает руками. Проверяется то, что видно снаружи:
+ * connect зовётся самим стеком в его потоке (установщиков нет вовсе), исход приходит через
+ * stack_sess_ready — сразу или позже, пока соединение ждёт и копит ранние данные, — чтение отдаёт
+ * указатель в сессию, окно клиента — место у узла (room), а оборванная связь — RST, а не FIN. Само ожидание
+ * в epoll и таймеры дайлера — дело worker_loop, и его гоняет стенд в сетевых пространствах
+ * (tests/run-hy2.sh). */
+struct hsess { int fd; };           /* общий вид для прочих поддельных дайлеров стенда: поле fd первым */
+static const char *h_peer(const void *ctx) { (void)ctx; return "подмена"; }
+static void h_describe(const void *ctx, char *out, size_t n) { (void)ctx; snprintf(out, n, "подмена"); }
 static const char *h_strerror(int rc) { (void)rc; return "подмена"; }
-static int h_connect(const void *ctx, void *sess, int t) {
-    (void)ctx; (void)t;
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK, 0, sv) != 0) return -1;
-    int sz = 16 * 1024;
-    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
-    g_hpeer = sv[1];
-    ((struct hsess *)sess)->fd = sv[0];
-    return 0;
-}
-static void h_take(void *dst, void *src) { (void)dst; (void)src; }
-static void h_close(void *sess) {
-    struct hsess *s = sess;
-    if (s->fd >= 0) close(s->fd);
-    s->fd = -1;
-}
-static void h_clear(void *sess) { ((struct hsess *)sess)->fd = -1; }
-static int h_fd(const void *sess) { return ((const struct hsess *)sess)->fd; }
-static int h_has_data(const void *sess) { (void)sess; return 0; }
 static int h_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
     (void)ctx; (void)sess; (void)k; (void)udp;
     return 0;
@@ -2460,17 +2440,74 @@ static int h_deliver(const void *ctx, void *sess, int udp, const unsigned char *
     (void)ctx; (void)sess; (void)udp;
     return emit(arg, d, n);
 }
+struct isess {
+    int linked;
+    unsigned char q[3000];
+    size_t qn;
+    int rx_fin, aborted;
+    long room;
+};
+static int g_in_connects, g_in_same_thread, g_in_mode, g_in_rc;     /* mode 1 — исход скажет стенд позже */
+static pthread_t g_in_thr;
+static struct isess *g_in_late;
+static size_t g_in_sent;
 
-static const struct dialer_ops h_ops = {
-    .name = "очередь", .caps = DC_ACK_PACED, .rcv_wnd_max = 100000, .sess_size = sizeof(struct hsess),
-    .peer = h_peer, .describe = h_describe, .strerror = h_strerror, .connect = h_connect,
-    .take = h_take, .close = h_close, .clear = h_clear, .fd = h_fd, .has_data = h_has_data,
-    .flow_open = h_flow_open, .send = h_send, .dgram_frame = f_dgram_frame, .read = h_read,
-    .deliver = h_deliver,
+static int in_connect(const void *ctx, void *sess, int t) {
+    (void)ctx; (void)t;
+    struct isess *s = sess;
+    g_in_connects++;
+    g_in_same_thread = pthread_equal(pthread_self(), g_in_thr);
+    if (g_in_rc) return g_in_rc;                 /* отказ на месте: стек сам записывает исход */
+    if (g_in_mode) { g_in_late = s; return 0; }
+    s->linked = 1;
+    stack_sess_ready(sess, 0);                   /* из самого connect — можно */
+    return 0;
+}
+static void in_close(void *sess) { ((struct isess *)sess)->linked = 0; }
+static void in_clear(void *sess) { ((struct isess *)sess)->linked = 0; }
+static int in_fd(const void *sess) { return ((const struct isess *)sess)->linked ? 77 : -1; }
+static int in_has_data(const void *sess) { return ((const struct isess *)sess)->qn > 0; }
+static int in_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
+    (void)ctx; (void)k; (void)udp;
+    memset(sess, 0, sizeof(struct isess));
+    ((struct isess *)sess)->room = 20000;
+    return 0;
+}
+static int in_send(const void *ctx, void *sess, const struct flow_key *k, int udp,
+                   const unsigned char *d, size_t n) {
+    (void)ctx; (void)sess; (void)k; (void)udp; (void)d;
+    g_in_sent += n;
+    return SEND_OK;
+}
+static long in_room(const void *ctx, void *sess) { (void)ctx; return ((struct isess *)sess)->room; }
+static int in_read(void *sess, unsigned char *buf, size_t cap, const unsigned char **data, size_t *got) {
+    struct isess *s = sess;
+    (void)buf; (void)cap;
+    *got = 0;
+    if (s->aborted) return -1;
+    if (!s->qn) return s->rx_fin ? -1 : 0;
+    *data = s->q;                                /* указатель в саму сессию, без копии в буфер стека */
+    *got = s->qn;
+    s->qn = 0;
+    return 0;
+}
+static int in_aborted(const void *sess) { return ((const struct isess *)sess)->aborted; }
+static void in_loop_start(int w, int n) { (void)w; (void)n; }
+static void in_loop_poll(int r) { (void)r; }
+static int in_loop_wait(void) { return -1; }
+static void in_loop_stop(void) {}
+
+static const struct dialer_ops in_ops = {
+    .name = "в цикле", .caps = DC_INLOOP, .sess_size = sizeof(struct isess),
+    .peer = h_peer, .describe = h_describe, .strerror = h_strerror, .connect = in_connect,
+    .close = in_close, .clear = in_clear, .fd = in_fd, .has_data = in_has_data,
+    .flow_open = in_flow_open, .send = in_send, .room = in_room, .dgram_frame = f_dgram_frame,
+    .read = in_read, .deliver = h_deliver, .loop_start = in_loop_start, .loop_poll = in_loop_poll,
+    .loop_wait = in_loop_wait, .loop_stop = in_loop_stop, .aborted = in_aborted,
 };
 
-/* Подтверждения, ушедшие в устройство: сколько и номер подтверждения последнего. */
-static int h_acks(uint32_t *ack) {
+/* Окна пакета из устройства: сколько подтверждений ушло, номер и окно последнего. */
+static int h_acks(uint32_t *ack, unsigned *win) {
     unsigned char p[70000];
     int cnt = 0;
     for (;;) {
@@ -2480,90 +2517,115 @@ static int h_acks(uint32_t *ack) {
         size_t off;
         if (ip_parse(p, (size_t)r, &k, &off) == 0 && (k.tcp_flags & TCP_ACK)) {
             if (ack) *ack = k.ack;
+            if (win) *win = k.window;
             cnt++;
         }
     }
     return cnt;
 }
 
-static int h_writable(int fd) {
-    struct pollfd pf = { .fd = fd, .events = POLLOUT };
-    return poll(&pf, 1, 0) > 0 && (pf.revents & POLLOUT);
-}
-
-static void t_ack_paced(void) {
-    static const struct dialer hd = { .ops = &h_ops, .ctx = NULL };
+static void t_inloop(void) {
+    static const struct dialer hd = { .ops = &in_ops, .ctx = NULL };
     while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
     g_spare_want = 0;
     stack_setup(&hd);
+    g_in_thr = pthread_self();
+    g_in_rc = 0;
+    g_in_mode = 0;
+    g_in_connects = 0;
     pm_drain(NULL, NULL);
+    check(g_inloop, "в цикле: бит DC_INLOOP принят стеком");
+
+    /* Исход сразу, из самого connect: ни установщика, ни потока. Установщики от прежних проверок могут уже
+     * стоять (g_cq.started), поэтому смотрим на очередь: заявка в неё не ложится. */
+    unsigned head0 = g_cq.head;
     struct conn *c = pm_open(41000, SRV_IP);
-    check(c != NULL, "очередь: соединение открылось, дескриптор — пара SEQPACKET");
+    check(c != NULL && g_in_connects == 1 && g_in_same_thread,
+          "в цикле: connect зовёт сам стек, в своём потоке");
+    check(g_cq.head == head0 && g_cq.n == 0, "  заявка установщику не ставилась (очередь не двигалась)");
     if (!c) return;
+    check(c->fd == 77 && !c->armed, "  связь есть, а в epoll соединению ставить нечего (дескриптора нет)");
 
-    /* Окно клиента. Потолок стека — мегабайты (rcv_window_set), очередь пары их не вместит, и
-     * дайлер называет свой предел: клиенту с масштабом объявляется он, а не потолок; без масштаба —
-     * 65535, как у любого. */
-    uint32_t save_wnd = g_rcv_wnd;
-    uint8_t save_shift = g_rcv_shift;
-    rcv_window_set(4u << 20);
-    c->ws_on = 1;
-    uint32_t seen = (uint32_t)rcv_win_field(c) << g_rcv_shift;
-    check(seen >= h_ops.rcv_wnd_max && seen < h_ops.rcv_wnd_max + (1u << g_rcv_shift),
-          "окно клиента с масштабом — предел дайлера (rcv_wnd_max), а не потолок стека в 4 МиБ");
-    c->ws_on = 0;
-    check(rcv_win_field(c) == 65535, "  без масштаба — 65535, как у любого дайлера");
-    g_rcv_wnd = save_wnd;
-    g_rcv_shift = save_shift;
-
-    unsigned char d[1000];
-    memset(d, 'x', sizeof d);
-    uint32_t seq = 1001, ack = 0;
-
-    /* Очередь пуста: подтверждение уходит сразу, как у любого дайлера. */
-    pm_send(41000, SRV_IP, seq, 2, TCP_ACK | TCP_PSH, d, sizeof d);
-    seq += sizeof d;
-    flush_acks(&g_tun);
-    check(h_acks(&ack) == 1 && ack == seq && !c->ack_hold && !c->ack_due,
-          "очередь пуста: данные приняты и подтверждены сразу");
-
-    /* Наполняем, пока очередь не выйдет за нижнюю отметку. Каждый пакет принят — мультиплексор
-     * ничего не разбирает, — подтверждений между ними нет (их шлёт flush_acks, а его зовёт цикл
-     * после порции пакетов, не после каждого). */
-    int sent = 0;
-    while (h_writable(c->fd) && sent < 200) {
-        pm_send(41000, SRV_IP, seq, 2, TCP_ACK | TCP_PSH, d, sizeof d);
-        seq += sizeof d;
-        sent++;
-    }
-    check(sent > 1 && sent < 200 && !h_writable(c->fd),
-          "очередь: после нескольких пакетов запись не готова (выше нижней отметки)");
-    check(c->client_seq == seq, "очередь: все пакеты приняты и отданы дайлеру (счётчик продвинут)");
-
-    /* Запись не готова — подтверждение придержано, соединение просит ждать записи. */
-    h_acks(NULL);
-    flush_acks(&g_tun);
-    check(h_acks(NULL) == 0 && c->ack_hold && c->ack_due,
-          "очередь выше нижней отметки: подтверждение придержано, ждём готовности записи");
-
-    /* Ещё порция при придержанном подтверждении — по-прежнему тишина (клиент ограничен окном). */
-    pm_send(41000, SRV_IP, seq, 2, TCP_ACK | TCP_PSH, d, sizeof d);
-    seq += sizeof d;
-    flush_acks(&g_tun);
-    check(h_acks(NULL) == 0 && c->ack_hold, "  и дальше, пока мультиплексор не разобрал очередь");
-
-    /* Мультиплексор разобрал очередь: запись готова, подтверждение уходит и покрывает всё принятое. */
-    unsigned char sink[4096];
-    while (recv(g_hpeer, sink, sizeof sink, MSG_DONTWAIT) > 0) {}
-    check(h_writable(c->fd), "очередь разобрана: запись готова");
-    flush_acks(&g_tun);
-    check(h_acks(&ack) == 1 && ack == seq && !c->ack_hold && !c->ack_due,
-          "запись готова: подтверждение ушло и покрывает всё принятое, придержки нет");
-
-    conn_drop(c);
-    close(g_hpeer);
-    g_hpeer = -1;
+    /* Данные вниз: сессия говорит stack_sess_rx, стек читает указатель в неё. */
+    struct isess *is = SESS(c);
+    memset(is->q, 'q', 1000);
+    is->qn = 1000;
+    g_rx_kick = 0;
+    c->rx_ready = 0;
+    uint32_t seq0 = c->our_seq;
+    stack_sess_rx(is);
+    check(c->rx_ready && g_rx_kick, "в цикле: stack_sess_rx ставит чтение и признак витка");
+    drain_conn(c, &g_tun);
+    check(c->our_seq == seq0 + 1000, "  клиенту ушло 1000 байт из сессии");
     pm_drain(NULL, NULL);
+
+    /* Окно клиента — место у узла: объявляется оно, а вырастет — уходит обновление. */
+    is->room = 5000;
+    c->ws_on = 0;
+    check(rcv_win_field(c) == 5000, "в цикле: окно клиента — место у узла (room)");
+    c->room_seen = 5000;
+    is->room = 30000;
+    g_win_woke = 0;
+    stack_sess_room(is);
+    check(c->ack_due && g_win_woke, "  выросшее место: обновление окна причитается");
+    flush_acks(&g_tun);
+    uint32_t ack = 0;
+    unsigned win = 0;
+    check(h_acks(&ack, &win) == 1 && win == 30000, "  и ушло клиенту с новым окном (30000)");
+    g_win_woke = 0;
+
+    /* Оборванная связь — RST, а не FIN. */
+    is->aborted = 1;
+    stack_sess_rx(is);
+    drain_conn(c, &g_tun);
+    check(c->srv_closed && c->aborted, "в цикле: чтение с ошибкой при оборванной связи — соединение оборвано");
+    unsigned fl = 0;
+    conn_deadlines(c, &g_tun, g_now_ns ? g_now_ns : now_ns());
+    pm_drain(&fl, NULL);
+    check(fl & TCP_RST, "  клиенту RST, а не FIN");
+
+    /* Исход позже: соединение ждёт (pending), клиент шлёт ранние данные, исход приходит из дайлера. */
+    g_in_mode = 1;
+    g_in_late = NULL;
+    uint16_t sp = 41001;
+    struct flow_key k = pm_key(sp, SRV_IP);
+    pm_send(sp, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    c = conn_find(&k);
+    check(c && c->pending && !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE) && g_in_late,
+          "в цикле: исход не сразу — заявка ждёт, соединение недотрогаемо");
+    if (c && g_in_late) {
+        unsigned char d[100];
+        memset(d, 'e', sizeof d);
+        pm_send(sp, SRV_IP, 1001, 2, TCP_ACK | TCP_PSH, d, sizeof d);
+        size_t was = g_in_sent;
+        check(c->early_n == sizeof d && g_in_sent == was, "  ранние данные клиента копятся в буфере, узлу не уходят");
+        g_in_late->linked = 1;
+        stack_sess_ready(g_in_late, 0);
+        check(__atomic_load_n(&c->done, __ATOMIC_ACQUIRE) && c->rc == 0, "  stack_sess_ready поднимает готовность заявки");
+        check(!conn_ready(c, &g_tun) && g_in_sent == was + sizeof d, "  разбор готовности — ранние данные ушли узлу");
+        pm_drain(NULL, NULL);
+        conn_drop(c);
+    }
+
+    /* Отказ на месте: код из connect — исход заявки, клиенту RST. */
+    g_in_mode = 0;
+    g_in_rc = -2;
+    sp = 41002;
+    k = pm_key(sp, SRV_IP);
+    pm_send(sp, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    c = conn_find(&k);
+    check(c && c->pending && __atomic_load_n(&c->done, __ATOMIC_ACQUIRE) && c->rc == -2,
+          "в цикле: отказ connect — исход заявки без ожидания");
+    pm_drain(NULL, NULL);
+    if (c) {
+        check(conn_ready(c, &g_tun) == 1, "  разбор готовности закрывает соединение");
+        pm_drain(&fl, NULL);
+        check(fl & TCP_RST, "  клиенту RST");
+    }
+    g_in_rc = 0;
+    while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
+    pm_drain(NULL, NULL);
+    g_inloop = 0;
 }
 
 /* Пул узлов и сброс соединений — после проверок разбора: пул заводит свой дайлер (pool_new), и
@@ -2594,7 +2656,7 @@ static int pool_part(void) {
     t_pool_unproven();
     t_pool_retry_cap();
     t_pool_state();
-    t_ack_paced();
+    t_inloop();
     return 0;
 }
 
@@ -2627,7 +2689,7 @@ static void cd_clear(void *sess) { ((struct csess *)sess)->fd = -1; }
 static int cd_fd(const void *sess) { (void)sess; return -1; }   /* poll в checkout: -1 не опрашивается */
 static int cd_has_data(const void *sess) { (void)sess; return 0; }
 static const struct dialer_ops cd_ops = {
-    .name = "счёт", .caps = DC_PRECONNECT, .rcv_wnd_max = 100000, .sess_size = sizeof(struct csess),
+    .name = "счёт", .caps = DC_PRECONNECT, .sess_size = sizeof(struct csess),
     .peer = h_peer, .describe = h_describe, .strerror = h_strerror, .connect = cd_connect,
     .take = cd_take, .close = cd_close, .clear = cd_clear, .fd = cd_fd, .has_data = cd_has_data,
     .flow_open = h_flow_open, .send = h_send, .dgram_frame = f_dgram_frame, .read = h_read,

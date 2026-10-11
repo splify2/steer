@@ -255,6 +255,8 @@ static void state_write(void) {
 static void *state_thread(void *arg) {
     (void)arg;
     for (;;) {
+        /* Имя узла разрешается тут, а не в цикле рабочего: getaddrinfo блокирует (hy2conn.c). */
+        hy2c_refresh_addr();
         state_write();
         struct timespec ts = { 3, 0 };
         nanosleep(&ts, NULL);

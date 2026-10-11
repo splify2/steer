@@ -227,6 +227,9 @@ int  qc_stream_open_uni(struct qc *q, int64_t *sid);
 ssize_t qc_stream_send(struct qc *q, int64_t sid, const uint8_t *d, size_t n, int fin);
 /* Не отправленное и не подтверждённое в потоке, байт. */
 size_t qc_stream_buffered(const struct qc *q, int64_t sid);
+/* Сколько байт ещё примет qc_stream_send в этом потоке сейчас (send_buf минус неподтверждённое): окно клиента
+ * у hysteria2 — это и есть это место. */
+size_t qc_stream_room(const struct qc *q, int64_t sid);
 /* Отменить поток (RESET_STREAM и STOP_SENDING с кодом). */
 int  qc_stream_reset(struct qc *q, int64_t sid, uint64_t app_err);
 /* Датаграмма: 0 — в очереди; QC_ETOOBIG — больше qc_datagram_max; QC_EAGAIN — очередь полна (64).

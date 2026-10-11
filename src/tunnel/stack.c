@@ -180,12 +180,11 @@ struct conn {
     /* Сервер закрыл поток, но у нас ещё есть неподтверждённое клиенту. Подробности ниже,
      * у closed_at; здесь поле стоит потому, что его читает проход цикла. */
     uint8_t srv_closed;
-    /* Чего дескриптор соединения сейчас ждёт в epoll: ARM_IN — чтение (по фронту; стоит всегда, как только
-     * соединение в наборе), ARM_OUT — готовности к записи (подтверждение придержано, см. ack_hold). Ноль — в
-     * наборе его нет.
+    /* Стоит ли дескриптор соединения в epoll (ARM_IN — чтение по фронту; ставится один раз, как только
+     * соединение в наборе). Ноль — в наборе его нет.
      *
-     * Нужен, чтобы epoll_ctl вызывался только на ИЗМЕНЕНИЕ состояния, а не на каждом витке: ADD один раз и
-     * MOD при смене ARM_OUT, а не пара DEL/ADD на каждое закрытие окна клиента. */
+     * Нужен, чтобы epoll_ctl вызывался только на ИЗМЕНЕНИЕ состояния, а не на каждом витке. У дайлера с
+     * DC_INLOOP дескриптора на соединение нет вовсе, и поле остаётся нулём. */
     uint8_t armed;
     /* Вторая связь дайлера (dialer_ops.aux_fd), стоящая в epoll: её дескриптор; -1 — нет; -2 —
      * слушать больше нечего (aux_drain отказал), заново не ставить. */
@@ -209,12 +208,6 @@ struct conn {
      * TUN. Подтверждать каждый пакет отдельно — это лишняя запись в устройство на каждый
      * пакет выгрузки, притом что все они подтверждаются одним ACK с последним номером. */
     uint8_t ack_due;
-    /* Подтверждение причитается, но придержано: дайлер с DC_ACK_PACED (dialer.h) не готов
-     * принять ещё — очередь к узлу выше нижней отметки, — и клиент остановится сам, не получив
-     * подтверждения, ровно на окне. Снимает придержку готовность дескриптора к записи (ARM_OUT в
-     * armed): flush_acks шлёт подтверждение и сбрасывает поле. Хранится, а не выводится заново
-     * из poll, потому что от него зависит состав набора epoll, а набор правится на изменение. */
-    uint8_t ack_hold;
     uint8_t dup_acks;         /* подряд идущие подтверждения того же номера */
     /* Быстрый повтор уже сделан и нового подтверждения ещё не было.
      *
@@ -365,7 +358,8 @@ static void ooo_free(struct conn *c) {
 
 /* Биты поля armed. */
 #define ARM_IN  1
-#define ARM_OUT 2
+/* Метка события сокета дайлера с DC_INLOOP (stack_loop_watch); TUN и eventfd — MAX_CONNS и MAX_CONNS + 1. */
+#define LOOP_TOKEN (MAX_CONNS + 2)
 #define AUX_BIT 0x40000000u   /* в data события epoll: вторая связь дайлера этого соединения */
 
 /* Сколько ждём подтверждений после закрытия сервером. Секунды, а не «сколько понадобится»:
@@ -545,8 +539,6 @@ static int g_tx_batch_max = TX_BATCH_MAX;
 
 static uint32_t g_rcv_wnd = RCV_WND_MIN;   /* потолок нашего окна, байт */
 static uint8_t g_rcv_shift;                /* множитель, который предлагаем в SYN-ACK */
-static uint32_t g_rcv_wnd_max;             /* предел дайлера (dialer_ops.rcv_wnd_max; stack_setup); 0 — нет */
-
 /* Назначить потолок окна и вывести из него множитель: наименьший, при котором 16-битное поле
  * его ещё вмещает. */
 static void rcv_window_set(uint32_t wnd) {
@@ -584,11 +576,7 @@ static __thread uint8_t g_tun_backlog;
 static __thread uint8_t g_down_inflight;
 
 static uint16_t rcv_win_field(const struct conn *c) {
-    /* Предел дайлера (dialer_ops.rcv_wnd_max): у DC_ACK_PACED окно обязано помещаться в очередь к узлу,
-     * а потолок выше выбран по памяти машины и очередь переполнил бы. */
-    uint32_t cap = g_rcv_wnd_max;
     uint32_t w = c->ws_on ? g_rcv_wnd : RCV_WND_MIN;
-    if (cap && w > cap) w = cap;
     if (g_tun_backlog && g_down_inflight && w > RCV_WND_BACKLOG) w = RCV_WND_BACKLOG;
     /* Сколько узел принимает сейчас (dialer_ops.room): больше вернулось бы отказом SEND_AGAIN и
      * стоило бы клиенту таймаута повторной передачи. Округляем ВНИЗ, в отличие от потолка:
@@ -801,6 +789,15 @@ static __thread int16_t *g_bucket;
 /* Дайлер процесса: таблица протокола и узел. Задаётся в stack_run до запуска потоков и дальше
  * только читается — потому и не __thread: установщикам он нужен тот же, что циклу. */
 static const struct dialer *g_dl;
+/* Дайлер живёт в цикле рабочего (DC_INLOOP): у соединения клиента нет дескриптора, а установщика нет вовсе.
+ * Задаётся в stack_setup вместе с g_dl. */
+static int g_inloop;
+/* Сколько рабочих запрошено (stack_run до запуска потоков): дайлер с DC_INLOOP делит по ним то, что у него
+ * общее на процесс (loop_start). */
+static int g_workers_plan = 1;
+/* Epoll и побудка этого потока, и «в сессии появилось, что читать» с последнего разбора (stack_sess_rx). */
+static __thread int g_ep = -1;
+static __thread int g_rx_kick;
 
 /* Набор активных узлов менялся столько раз (stack_nodes_changed): поток цикла сверяет со своим
  * счётом и, разойдясь, спрашивает у дайлера про каждое соединение (stale). Счётчик, а не флаг: потоков
@@ -965,11 +962,11 @@ static struct xpkt *xmail_take(struct xmail *m) {
  * Плата — одна пустая проверка TCP на соединение за порог простоя (52 байта), и только пока соединение
  * живёт (простаивающие убирает IDLE_EVICT_S).
  *
- * Сокет не TCP (у hysteria2 связь — пара SOCK_SEQPACKET к мультиплексору) — первый же setsockopt
- * откажет, и дальше не пробуем: у QUIC своё время простоя. */
+ * Сокет не TCP — первый же setsockopt откажет, и дальше не пробуем; у дайлера в цикле (DC_INLOOP,
+ * hysteria2) сокета на соединение нет вовсе, и у QUIC своё время простоя. */
 static void node_sock_silence(int fd) {
     int t = g_dl->silence_s;
-    if (t <= 0 || fd < 0) return;
+    if (t <= 0 || fd < 0 || g_inloop) return;
     unsigned ms = (unsigned)t * 1000u;
     if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ms, sizeof ms) != 0) return;
     int one = 1, idle = t, intvl = t / 4 ? t / 4 : 1;
@@ -984,7 +981,7 @@ static void node_sock_silence(int fd) {
 static int node_sock_aborted(int fd) {
     struct tcp_info ti;
     socklen_t tl = sizeof ti;
-    if (fd < 0 || getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &tl) != 0) return 0;
+    if (fd < 0 || g_inloop || getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &tl) != 0) return 0;
     return ti.tcpi_state == TCP_CLOSE;
 }
 
@@ -1073,10 +1070,6 @@ static __thread struct {
      * прячется в «ждали окна» и лечится повтором клиента, а у UDP это ПОТЕРЯ — и единственное
      * место, где её видно. Ноль здесь и жалобы на QUIC рядом означают, что дело не в нас. */
     uint64_t udp_drops;
-    /* Подтверждения, придержанные до готовности очереди к узлу (DC_ACK_PACED): единица — один
-     * переход соединения в «держим». Много — узел медленнее клиента, и клиента сдерживает окно,
-     * а не потери; ноль при выгрузке в туннель с DC_ACK_PACED — очередь не переполнялась. */
-    uint64_t acks_held;
     /* Сколько соединений было живо на последнем проходе: «поток встал» и «поток закрылся»
      * в остальных числах выглядят одинаково — оба дают нули. */
     uint32_t conns;
@@ -1100,7 +1093,7 @@ static void stats_dump(uint64_t window_ns) {
             "tun-stats[%d]: %.1f МБ/с | циклов %.0f/с | poll %.0f%% | чтений у сервера %.0f/с "
             "(по %.1f КБ) | записей клиенту %.0f/с (%.0f мкс) | ждали окна %.0f/с | "
             "предел чтения %.0f/с | соединений %u | повторов %.0f/с (%.0f КБ/с) | "
-            "потеряно датаграмм %.0f/с | подтверждений придержано %.0f/с | "
+            "потеряно датаграмм %.0f/с | "
             "окно клиента %u..%u (масштаб %u), в пути до %u | порог повтора %u мс | "
             "чтение у сервера %.0f%% | разбор из TUN %.0f%% | чтение из TUN %.0f%% | "
             "из кольца всего %llu | не у владельца всего %llu | кадров TUN брошено всего %llu | "
@@ -1117,7 +1110,7 @@ static void stats_dump(uint64_t window_ns) {
             (double)g_st.drain_full / s,
             g_st.conns,
             (double)g_st.rtx_sends / s, (double)g_st.rtx_bytes / s / 1024.0,
-            (double)g_st.udp_drops / s, (double)g_st.acks_held / s,
+            (double)g_st.udp_drops / s,
             g_st.win_min == 0xFFFFFFFFu ? 0 : g_st.win_min, g_st.win_max,
             g_st.wscale_seen, g_st.inflight_max, rto_floor(),
             100.0 * (double)g_st.recv_ns / (double)window_ns,
@@ -1499,6 +1492,7 @@ static void spare_refill(void) {
  * сливать НЕЛЬЗЯ — освобождать её под работающим установщиком это и есть то, от чего мы тут
  * защищаемся. Тогда честнее утечь: путь и так предсмертный, а процесс перезапустит procd. */
 static int connq_release(struct conn *base) {
+    if (g_inloop) return 0;     /* установщиков нет: заявок в очереди и в работе не бывает */
     pthread_mutex_lock(&g_cq.mu);
     unsigned kept = 0;
     for (unsigned i = 0; i < g_cq.n; i++) {
@@ -1539,6 +1533,18 @@ static __thread int g_conn_efd = -1;
 
 /* Поставить заявку. 0 — принята, -1 — очередь полна. */
 static int conn_submit(struct conn *c) {
+    if (g_inloop) {
+        /* Без установщика: открытие начинает сам дайлер, здесь же, и не ждёт ответа узла. Исход — через
+         * stack_sess_ready (когда придёт, не раньше), а отказ на месте — кодом. Заявка при этом такая же:
+         * pending до тех пор, пока done не поднят, — разбирает её тот же проход цикла. */
+        c->done = 0;
+        int rc = g_dl->ops->connect(g_dl->ctx, SESS(c), CONNECT_TIMEOUT_S);
+        if (rc) {
+            c->rc = rc;
+            __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
+        }
+        return 0;
+    }
     struct connjob j = { .c = c, .sess = SESS(c), .sp = NULL, .efd = g_conn_efd };
     return connq_push(&j);
 }
@@ -1840,7 +1846,7 @@ static void conn_reset(struct conn *c, const struct tun_dev *tun) {
 /* Связь соединения с узлом кончилась ошибкой: если она оборвана (node_sock_aborted), сказать дайлеру
  * — у слежки за узлом это повод проверить его сейчас. 1 — оборвана. */
 static int conn_node_lost(struct conn *c) {
-    if (!node_sock_aborted(c->fd)) return 0;
+    if (!(g_inloop ? g_dl->ops->aborted(SESS(c)) : node_sock_aborted(c->fd))) return 0;
     if (g_dl->ops->lost) g_dl->ops->lost(g_dl->ctx, SESS(c));
     return 1;
 }
@@ -2516,16 +2522,14 @@ static void drain_conn(struct conn *c, const struct tun_dev *tun);
  * момент рвал соединение вместе с кольцом, то есть с хвостом ответа, который drain_conn в том же
  * случае додаёт. Окна у клиента нет — не читаем вовсе: клиент повторит пакет.
  *
- * DC_ACK_PACED не ждёт: у него отказ значит «очередь к узлу полна», а освобождает её
- * мультиплексор, и читать у узла для этого нечего — пять миллисекунд простоя цикла ради ответа,
- * которого не будет. До сюда такой дайлер доходит, только если очередь всё же переполнилась
- * (клиент вышел за окно); пакет тогда не подтверждается. */
+ * DC_INLOOP не ждёт: у него нет сокета, в котором мог бы лежать ответ, — освободить место может только
+ * ACK узла, а он разбирается в начале витка, не здесь. Пакет тогда не подтверждается. */
 static int send_or_wait(struct conn *c, const struct tun_dev *tun, const unsigned char *d,
                         size_t n) {
     int sr = upstream_send(c, d, n);
     if (sr != SEND_AGAIN) return sr;
     struct pollfd sp = { .fd = c->fd, .events = POLLIN };
-    if (!(g_dl->ops->caps & DC_ACK_PACED) && client_can_take_record(c) &&
+    if (!g_inloop && client_can_take_record(c) &&
         poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
         drain_conn(c, tun);
         if (c->srv_closed) return SEND_CLOSED;
@@ -3022,32 +3026,12 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
     if (c) ooo_drain(c, tun);
 }
 
-/* Придержать ли подтверждение клиенту (DC_ACK_PACED, dialer.h): очередь к узлу выше нижней
- * отметки — дескриптор сессии не готов к записи. Решается здесь, на подтверждении, а не на
- * каждом пакете: опрос стоит системного вызова, а подтверждение и так одно на порцию из TUN, —
- * и очередь за порцию (до TUN_DRAIN_MAX пакетов, около ста килобайт) переполнить не может, пока
- * клиент ограничен окном (у DC_ACK_PACED — не больше rcv_wnd_max, rcv_win_field) и не получает
- * подтверждений.
- *
- * Не придерживаем, когда дескриптора нет (установщик ещё работает: ранние данные), у потока UDP
- * (подтверждений нет) и когда опрос сам отвечает ошибкой или готовностью с ошибкой сокета:
- * оборванное соединение должно оборваться на своём пути, а не зависнуть на подтверждении. */
-static int ack_must_wait(struct conn *c) {
-    if (!(g_dl->ops->caps & DC_ACK_PACED) || c->is_udp || c->pending || c->fd < 0) return 0;
-    struct pollfd p = { .fd = c->fd, .events = POLLOUT };
-    if (poll(&p, 1, 0) != 0) { c->ack_hold = 0; return 0; }
-    if (!c->ack_hold && g_stats) g_st.acks_held++;
-    c->ack_hold = 1;
-    return 1;
-}
-
-/* Разослать отложенные подтверждения. Вызывается после разбора порции пакетов из TUN и после
- * того, как у придержавшего подтверждение соединения открылась запись (ARM_OUT). */
+/* Разослать отложенные подтверждения. Вызывается после разбора порции пакетов из TUN и когда у
+ * соединения выросло место у узла (room_watch). */
 static void flush_acks(const struct tun_dev *tun) {
     for (int li = 0; li < g_live_n; li++) {
         struct conn *c = &g_conns[g_live[li]];
         if (!c->ack_due) continue;
-        if (ack_must_wait(c)) continue;
         c->ack_due = 0;
         if (!c->is_udp) {
             long r = conn_room(c);
@@ -3244,6 +3228,7 @@ static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
          * событие на это не придёт, и соединение встало бы до следующих данных (так вставало на gRPC: две
          * загрузки из пяти). Поэтому пустое чтение проверяется poll'ом: готов сокет — читаем дальше. */
         if (!rx_n) {
+            if (g_inloop) return;       /* дескриптора нет, а всё пришедшее лежит в сессии (has_data выше) */
             struct pollfd sp = { .fd = c->fd, .events = POLLIN, .revents = 0 };
             if (poll(&sp, 1, 0) <= 0 || !(sp.revents & (POLLIN | POLLHUP | POLLERR))) return;
         }
@@ -3533,7 +3518,11 @@ static void *worker_loop(void *arg) {
      * посмотри», а разбор всего сразу — в витке. Ставится ДО state: читатель не начнёт, пока не доложат
      * все, и увидит дескриптор. */
     if (rw) rw->ring.efd = efd;
-    struct epoll_event evs[MAX_CONNS + 2];
+    struct epoll_event evs[MAX_CONNS + 3];
+    g_ep = ep;
+    /* Дайлер встаёт в цикл ДО state: его сокет должен стоять в epoll к первому витку, а соединение с
+     * узлом — подниматься, пока рабочий ещё ничего не несёт. */
+    if (g_inloop) g_dl->ops->loop_start(w->id, g_workers_plan);
     w->served = 1;      /* очередь встала в epoll — дальше она несёт трафик */
     __atomic_store_n(&w->state, 1, __ATOMIC_RELEASE);
 
@@ -3573,7 +3562,13 @@ static void *worker_loop(void *arg) {
         int wait_ms = 1000;
         for (int li = 0; li < g_live_n; li++) {
             struct conn *c = &g_conns[g_live[li]];
-            if (c->pending) { pend++; continue; }
+            if (c->pending) {
+                pend++;
+                /* Дайлер с DC_INLOOP ответил, не дожидаясь витка (отказ на месте): будить некому, разбор
+                 * заявки — в этом же ожидании без сна. */
+                if (g_inloop && __atomic_load_n(&c->done, __ATOMIC_RELAXED)) forced++;
+                continue;
+            }
 
             /* Окно и «в пути» пишем ВСЕГДА, а не только когда отказались читать.
              *
@@ -3606,11 +3601,6 @@ static void *worker_loop(void *arg) {
              * было бы не управлением потоком, а задержкой на пустом месте. */
             int want = !c->srv_closed && (c->is_udp || client_can_take_record(c));
             if (!want && !c->srv_closed && g_stats) g_st.win_skips++;
-            /* Подтверждение придержано (ack_hold) — ждём, когда у дескриптора освободится запись:
-             * это и есть окно клиента. Если подтверждение ушло иным путём (данные клиенту несут
-             * его в заголовке — emit_to_client), ждать нечего: уровневый EPOLLOUT на готовом к
-             * записи дескрипторе будил бы цикл на каждом витке впустую. */
-            if (c->ack_hold && !c->ack_due) c->ack_hold = 0;
             /* Чтение стоит в наборе всегда (по фронту, EPOLLET), а не только пока клиент готов принять: прежде
              * закрытое окно снимало дескриптор с epoll (DEL), открытое — ставило (ADD), и это 36-41 вызова
              * epoll_ctl на МБ, 2,7 % цикла (замер профилировщика). По уровню так нельзя — готовый на чтение
@@ -3618,15 +3608,12 @@ static void *worker_loop(void *arg) {
              * один раз на новые данные, а решает цикл, читать ли сейчас. Событие при закрытом окне не теряется,
              * а откладывается в rx_ready (см. разбор событий ниже), и когда окно откроется, соединение прочтёт
              * проход после разбора TUN. Фронт обязывает читать до пустого сокета или помнить, что недочитали:
-             * drain_conn_reads так и делает (rx_ready). ARM_OUT, наоборот, по уровню нужен только пока
-             * подтверждение придержано, и снимается сразу. */
-            unsigned arm = ARM_IN | (c->ack_hold ? ARM_OUT : 0u);
-            if (arm != c->armed) {
-                struct epoll_event e = { .events = EPOLLIN | EPOLLET | (arm & ARM_OUT ? EPOLLOUT : 0u),
-                                         .data = { .u32 = (uint32_t)(c - g_conns) } };
-                int op = !c->armed ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
-                if (epoll_ctl(ep, op, c->fd, &e) == 0)
-                    c->armed = (uint8_t)arm;
+             * drain_conn_reads так и делает (rx_ready). У дайлера с DC_INLOOP дескриптора нет, и в набор
+             * нечего ставить: события потока приходят из loop_poll (stack_sess_rx). */
+            if (!g_inloop && !c->armed) {
+                struct epoll_event e = { .events = EPOLLIN | EPOLLET, .data = { .u32 = (uint32_t)(c - g_conns) } };
+                if (epoll_ctl(ep, EPOLL_CTL_ADD, c->fd, &e) == 0)
+                    c->armed = ARM_IN;
             }
             aux_sync(ep, c);
             /* Данные уже у нас, и ядро о них не сообщит: разберём их без ожидания. */
@@ -3655,6 +3642,11 @@ static void *worker_loop(void *arg) {
         /* Порция из TUN оборвалась на пределе посреди склеенного кадра: остаток лежит в нашем буфере, и
          * epoll о нём не скажет (tun_buffered). Не спим — разбираем дальше в этом же витке. */
         if (own_tun && tun_buffered(&tun)) wait_ms = 0;
+        /* Дайлер в цикле: доделать накопленное витком и сказать, когда ему нужен следующий (таймер QUIC). */
+        if (g_inloop) {
+            int dw = g_dl->ops->loop_wait();
+            if (dw >= 0 && dw < wait_ms) wait_ms = dw;
+        }
 
         /* Событий за виток может прийти на одно больше, чем соединений: TUN и побудка — тоже
          * дескрипторы. Меньший предел не терял бы событие (уровневый epoll покажет его
@@ -3671,7 +3663,7 @@ static void *worker_loop(void *arg) {
             else if (spsc_sleep_begin(&rw->ring)) sleeping = 1;
             else wait_ms = 0;
         }
-        int r = epoll_wait(ep, evs, MAX_CONNS + 2, wait_ms);
+        int r = epoll_wait(ep, evs, MAX_CONNS + 3, wait_ms);
         if (sleeping) spsc_sleep_end(&rw->ring);
         g_turn++;
         uint64_t after_poll = now_ns();
@@ -3689,6 +3681,17 @@ static void *worker_loop(void *arg) {
         if (r < 0) {
             if (errno == EINTR) continue;
             break;
+        }
+
+        /* Дайлер в цикле разбирает свой сокет и сроки ПЕРВЫМ: исход открытия (stack_sess_ready) нужен
+         * проходу по заявкам ниже, а пришедшие данные и подтверждения — проходу чтения. Ему же принадлежит
+         * весь ввод-вывод связи с узлом, так что отдельного потока и круга через сокеты у него нет. */
+        if (g_inloop) {
+            int lr = 0;
+            for (int i = 0; i < r; i++)
+                if (evs[i].data.u32 == LOOP_TOKEN) { lr = 1; break; }
+            g_dl->ops->loop_poll(lr);
+            if (g_rx_kick) { g_rx_kick = 0; rx_dirty = 1; }
         }
 
         /* Готовые заявки. SYN-ACK клиенту ушёл ещё на SYN — здесь поток к узлу либо
@@ -3808,7 +3811,6 @@ static void *worker_loop(void *arg) {
             up_flush(&tun);
             flush_acks(&tun);
         }
-        int out_woke = 0;
         for (int i = 0; i < r; i++) {
             if (evs[i].data.u32 & AUX_BIT) {
                 aux_event(ep, &g_conns[evs[i].data.u32 & ~AUX_BIT]);
@@ -3824,11 +3826,6 @@ static void *worker_loop(void *arg) {
              * чужое событие, читало свежую связь — блокирующую и пока пустую — и весь цикл
              * вставал на срок соединения. */
             if (!c->used || c->pending || c->born_turn == g_turn) continue;
-            /* Очередь к узлу освободилась — подтверждение, которое мы придержали, можно слать
-             * (flush_acks ниже перепроверит готовность сам). Одна запись и ничего больше —
-             * читать у узла нечего, разбор чтения пропускаем. */
-            if (evs[i].events & EPOLLOUT) out_woke = 1;
-            if (!(evs[i].events & ~(uint32_t)EPOLLOUT)) continue;
             /* Уже прочитанное разбирает второй проход ниже — здесь пропускаем, чтобы одно
              * соединение не получило двойную порцию за виток и не отняло её у остальных. */
             if (c->rx_ready) continue;
@@ -3847,7 +3844,6 @@ static void *worker_loop(void *arg) {
             if (!c->is_udp && !client_can_take_record(c)) { c->rx_ready = 1; rx_dirty = 1; continue; }
             drain_conn(c, &tun);
         }
-        if (out_woke) flush_acks(&tun);
 
         /* Соединения, у которых данные уже лежат в буфере или у сокета, но читать было нельзя или нечем
          * разбудить: ядро о них не сообщит (буфер записей — для epoll не существует, а фронт EPOLLET уже
@@ -3903,6 +3899,7 @@ static void *worker_loop(void *arg) {
      * ядро успело бы отдать кому-то другому. */
     if (connq_release(g_conns) == 0) {
         while (g_live_n) conn_drop(&g_conns[g_live[0]]);
+        if (g_inloop) g_dl->ops->loop_stop();
         conn_table_free();
     }
     if (efd >= 0) close(efd);
@@ -4050,12 +4047,42 @@ static int worker_count(void) {
 }
 
 time_t stack_now_s(void) { return g_now_s; }
+uint64_t stack_now_ns(void) { return g_now_ns; }
+
+/* ---- что дайлер с DC_INLOOP говорит стеку (dialer.h) ---------------------------------------------- */
+
+/* Соединение по сессии: сессии лежат в таблице потока подряд с шагом g_sess_stride, и индекс слота — это
+ * номер сессии (SESS наоборот). Зовут только из потока цикла: у каждого рабочего своя таблица. */
+static struct conn *conn_of_sess(void *sess) {
+    return &g_conns[(size_t)((unsigned char *)sess - g_sess) / g_sess_stride];
+}
+
+int stack_loop_watch(int fd) {
+    struct epoll_event e = { .events = EPOLLIN, .data = { .u32 = LOOP_TOKEN } };
+    return g_ep >= 0 ? epoll_ctl(g_ep, EPOLL_CTL_ADD, fd, &e) : -1;
+}
+
+void stack_sess_ready(void *sess, int rc) {
+    struct conn *c = conn_of_sess(sess);
+    c->rc = rc;
+    __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
+}
+
+void stack_sess_rx(void *sess) {
+    conn_of_sess(sess)->rx_ready = 1;
+    g_rx_kick = 1;
+}
+
+void stack_sess_room(void *sess) {
+    struct conn *c = conn_of_sess(sess);
+    if (c->used && !c->pending) room_watch(c);
+}
 
 /* Шаг сессий и пул запасных — по размеру сессии дайлера. До запуска любых потоков: дальше
  * g_dl, g_sess_stride и g_spares[].sess только читают. */
 static void stack_setup(const struct dialer *d) {
     g_dl = d;
-    g_rcv_wnd_max = d->ops->rcv_wnd_max;
+    g_inloop = (d->ops->caps & DC_INLOOP) != 0;
     g_sess_stride = (d->ops->sess_size + SESS_ALIGN - 1) & ~(size_t)(SESS_ALIGN - 1);
     if (!(d->ops->caps & DC_PRECONNECT)) g_spare_want = 0;
     if (g_spare_want <= 0) return;
@@ -4100,6 +4127,7 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
      * программы ядро разводит половины соединения по разным очередям (12 против 292 Мбит/с на роутере),
      * поэтому несколько очередей без неё не остаются: лишние закрываются, и раздаёт читатель. */
     int want = worker_count();
+    g_workers_plan = want;
     struct tun_dev *qs = calloc((size_t)want, sizeof(*qs));
     if (!qs) { fprintf(stderr, LOG_W "нет памяти под очереди устройства\n"); return 1; }
     int nq = tun_open(qs, want, dev);
@@ -4115,6 +4143,7 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
         g_steered = 1;
     if (g_steered) {
         want = nq;                      /* очередь на рабочего: сколько очередей дали, столько рабочих */
+        g_workers_plan = want;
     } else {
         for (int i = 1; i < nq; i++) close(qs[i].fd);
         nq = 1;
