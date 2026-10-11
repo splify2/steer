@@ -420,6 +420,17 @@ case "$o" in
        printf '%s\n' "$o" | grep -q ', 0 fail$' || printf '%s\n' "$full" | sed 's/^/    urlhttps: /' ;;
 esac
 
+# Узел по IPv6 (issue #7): vless-probe, proxy-probe, UDP SOCKS5 и туннель по адресу IPv6 и по имени только
+# с AAAA — на тех же steerd и модулях (tests/nodev6.sh). Строка итога — «nodev6: N passed, 0 failed».
+full="$(LIBS="$L" BUILD="$BUILD" sh tests/nodev6.sh 2>&1)"
+o="$(printf '%s\n' "$full" | tail -n 1)"
+case "$o" in
+    *ПРОПУСК*) echo "libs-test: $o" ;;
+    *) check "узел по IPv6: стенд tests/nodev6.sh" "1" \
+           "$(printf '%s' "$o" | grep -c '^nodev6: [0-9]* passed, 0 failed$')"
+       printf '%s\n' "$o" | grep -q ', 0 failed$' || printf '%s\n' "$full" | sed 's/^/    nodev6: /' ;;
+esac
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'

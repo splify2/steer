@@ -271,6 +271,30 @@ int main(void) {
           fd >= 0 ? peer_family(fd) : -1);
     if (fd >= 0) close(fd);
     close(l4);
+
+    /* ---- via: метка обязательна — IPv6 к цели не ходит (иначе ушёл бы мимо цели) ---- */
+    l4 = listen_on(AF_INET, &port);
+    l6 = listen_on(AF_INET6, &port);
+    transport_set_sock_mark(0x1234, 1);
+    conn_reset();
+    fd = tr_dial("::1", port, 2);
+    check("via: литерал IPv6 — отказ", TR_ECONNECT, fd);
+    check("via: к IPv6 не было ни одного connect", 0, g_conn_n);
+    fd = tr_dial_udp("::1", 9);
+    check("via: UDP на IPv6 — отказ", TR_ECONNECT, fd);
+    int mk = socket(AF_INET, SOCK_STREAM, 0), mark_ok = 0;
+    if (mk >= 0) { unsigned m = 0x1234; mark_ok = setsockopt(mk, SOL_SOCKET, SO_MARK, &m, sizeof m) == 0; close(mk); }
+    if (mark_ok) {
+        conn_reset();
+        fd = tr_dial("mixed.test", port, 3);
+        check("via: имя с A и AAAA — идёт по IPv4", AF_INET, fd >= 0 ? peer_family(fd) : -1);
+        check("via: IPv6 из ответа не пробовался", AF_INET, g_conn[0].fam);
+        if (fd >= 0) close(fd);
+    } else {
+        printf("via: SO_MARK недоступен (нет CAP_NET_ADMIN) — проверка IPv4 под меткой пропущена\n");
+    }
+    transport_set_sock_mark(0, 0);
+    close(l4); close(l6);
     check("итог: дескрипторы не утекли", fds0 - 2, open_fds());
 
     return unit_done("trdialmatch");

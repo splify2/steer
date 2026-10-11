@@ -74,8 +74,16 @@ void sl_parse_extra(struct vless_node *n, const char *extra);
 /* Свой параметр протокола: 1 — разобран (дальше не смотреть), 0 — не его. */
 typedef int (*sl_own_fn)(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen);
 
-/* Зона IPv6 из ссылки: «%25» → «%» (`[fe80::1%25br-lan]` → `fe80::1%br-lan`), на месте. */
-void sl_host_zone_decode(char *h);
+/* Зона link-local в адресе из ссылки: в URL знак «%» пишется «%25» (RFC 6874), `[fe80::1%25br-lan]`.
+ * getaddrinfo ждёт «fe80::1%br-lan», поэтому «%25» перед зоной сворачивается в «%», на месте. Только у
+ * адреса с двоеточием: в имени «%25» — процентное кодирование, им занимается sl_pct_decode. Встроенная,
+ * а не экспортная функция libsteer: её зовут и ядро, и модуль steer-proxy (pxsub.c), и лишний символ
+ * в списке экспорта (build/libsteer.map) ради четырёх строк не нужен. */
+static inline void sl_host_zone_decode(char *h) {
+    if (!strchr(h, ':')) return;
+    char *z = strstr(h, "%25");
+    if (z) memmove(z + 1, z + 3, strlen(z + 3) + 1);
+}
 
 /* схема://секрет@хост:порт?параметры#имя. Хост — имя, IPv4 или `[IPv6]` (скобки в поле не попадают). Узел обнуляется; секрет (до '@', как есть) ложится в
  * n->uuid, а его начало и длина в ссылке — в *secret и *secret_n (для протокола, которому нужен

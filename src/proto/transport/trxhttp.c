@@ -235,6 +235,11 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
      * :authority и на любое другое имя отвечает 404 (hub.go). */
     const char *authority = n->http_host && n->http_host[0] ? n->http_host
                           : n->sni[0] ? n->sni : n->host;
+    char abuf[136];
+    if (authority == n->host && strchr(authority, ':')) {   /* адрес IPv6 в :authority — в скобках */
+        snprintf(abuf, sizeof(abuf), "[%s]", authority);
+        authority = abuf;
+    }
     char path[320];
 
     /* Режим определяется ЗДЕСЬ, один раз: дальше он читается и при открытии потоков, и при

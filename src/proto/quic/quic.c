@@ -1264,6 +1264,18 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
     int rc = QC_ESOCK;
 
     if (addr_parse(cfg->host, cfg->port, &q->remote, &q->remote_len) != 0) { rc = QC_EINVAL; goto fail; }
+    /* via (метка обязательна) — только IPv4: у выходов-целей без IPv6 нет правила `ip rule fwmark` для
+     * IPv6, и сокет ушёл бы мимо цели напрямую (то же правило у tr_dial, trdial.c, и awg_via_check). */
+    if (cfg->mark_required && cfg->sock_mark && q->remote.ss_family == AF_INET6) {
+        static int told;
+        if (!told) {
+            told = 1;
+            fprintf(stderr, "steer[warn] via: адрес узла по IPv6 — через выход-цель туннель идёт только по IPv4, "
+                            "соединение не открываю: нужен адрес IPv4 или имя с записью A\n");
+        }
+        rc = QC_EINVAL;
+        goto fail;
+    }
     q->fd = socket(q->remote.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (q->fd < 0) goto fail;
     q->gro_on = sock_tune(q->fd);

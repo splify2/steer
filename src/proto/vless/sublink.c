@@ -83,15 +83,6 @@ int sl_host_leads_nowhere(const char *h) {
     return 0;
 }
 
-/* Зона link-local в адресе из ссылки: в URL знак «%» пишется «%25» (RFC 6874), `[fe80::1%25br-lan]`.
- * getaddrinfo ждёт «fe80::1%br-lan», поэтому «%25» перед зоной сворачивается в «%». Только у
- * адреса с двоеточием: в имени «%25» — процентное кодирование, и им занимается sl_pct_decode. */
-void sl_host_zone_decode(char *h) {
-    if (!strchr(h, ':')) return;
-    char *z = strstr(h, "%25");
-    if (z) memmove(z + 1, z + 3, strlen(z + 3) + 1);
-}
-
 /* Имя это или адрес. Нужно security=tls: сертификат выдают на имя, и узел, объявленный
  * одним адресом без sni, проверять не против чего.
  *
@@ -931,7 +922,7 @@ void sl_skip_note(struct vless_sub_stats *st, const struct vless_node *n, const 
      * и host — тогда пример остаётся пустым, и это честнее выдуманного «узел 3». */
     if (n && n->name[0]) snprintf(s->example, sizeof(s->example), "%s", n->name);
     else if (n && n->host[0]) snprintf(s->example, sizeof(s->example), "%s:%u",
-                                      n->host, n->port);
+                                      vless_host_fmt(n->host).s, n->port);
     s->count = 1;
 }
 

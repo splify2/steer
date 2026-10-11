@@ -49,7 +49,7 @@ static const char *vl_peer(const void *ctx) {
 
 static void vl_describe(const void *ctx, char *out, size_t n) {
     const struct vless_node *node = ctx;
-    snprintf(out, n, "%s (%s:%u %s%s)", node->name, node->host, node->port, node->type,
+    snprintf(out, n, "%s (%s:%u %s%s)", node->name, vless_host_fmt(node->host).s, node->port, node->type,
              node->flow[0] ? " +vision" : "");
 }
 

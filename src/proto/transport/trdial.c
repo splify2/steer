@@ -218,9 +218,28 @@ void transport_set_sock_mark(uint32_t mark, int required) {
     g_sock_mark_req = mark && required;
 }
 
+/* ВЫХОД-ЦЕЛЬ (`via`) — ТОЛЬКО IPv4. Метка сокета ведёт пакет в таблицу цели правилом `ip rule fwmark`,
+ * а у движка это правило (и маршрут по умолчанию в таблице выхода) для IPv6 у целей без IPv6 (vless,
+ * xsteer, прокси) нет: сокет IPv6 с той же меткой ушёл бы по обычным правилам, то есть НАПРЯМУЮ, мимо
+ * цели, — ровно то, ради чего via заводят (docs/contract-v1.md, «вложенные выходы»; то же правило у
+ * awg_via_check). Поэтому при обязательной метке адрес IPv6 не пробуется вовсе: отказ называется один
+ * раз в журнале, а имя с записью A идёт по IPv4. 1 — адрес запрещён. */
+static int via_forbids(const struct tr_addr *a) {
+    if (!g_sock_mark_req || a->ss.ss_family != AF_INET6) return 0;
+    static int told;
+    if (!told) {
+        told = 1;
+        fprintf(stderr, "steer[warn] via: адрес узла по IPv6 пропущен — через выход-цель туннель "
+                        "идёт только по IPv4 (без этого он ушёл бы мимо цели); нужен адрес IPv4 "
+                        "или имя с записью A\n");
+    }
+    return 1;
+}
+
 /* Запускает неблокирующий connect. Возвращает fd (соединение уже установлено или в
  * процессе) либо -1. */
 static int attempt_start(const struct tr_addr *ip, int *done) {
+    if (via_forbids(ip)) return -1;
     int fd = socket(ip->ss.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     /* До connect(): маршрут, а с ним устройство и адрес источника, ядро выбирает там — по
@@ -381,6 +400,7 @@ int tr_dial_udp(const char *host, uint16_t port) {
 
     int err = TR_ECONNECT;
     for (unsigned i = 0; i < an; i++) {
+        if (via_forbids(&addr[i])) continue;
         int fd = socket(addr[i].ss.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) { err = TR_ESOCK; continue; }
         if (g_sock_mark &&

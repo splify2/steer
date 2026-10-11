@@ -31,7 +31,9 @@ UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
 PORT=10800
 # Узел стенда — на обычном адресе, а не на петле: движок отвергает узел в 127.0.0.0/8
 # как «отвечать некому» (sub.c), и стенд от этого не поднимался вовсе.
-NODE=10.66.0.1
+# NODE=2001:db8:66::1 — тот же прогон с узлом по адресу IPv6 (issue #7); в ссылке адрес — в скобках.
+NODE="${NODE:-10.66.0.1}"
+case "$NODE" in *:*) NODE_URL="[$NODE]"; NODE_PFX=128 ;; *) NODE_URL="$NODE"; NODE_PFX=32 ;; esac
 WORK="$(mktemp -d)"
 
 cleanup() {
@@ -43,7 +45,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
+printf '%s\n' "vless://$UUID@$NODE_URL:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
 cat > "$WORK/spec.json" <<SPEC
 {"schema":1,
  "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
@@ -55,7 +57,7 @@ ip netns add "$NS"
 ip netns exec "$NS" ip link set lo up
 # Адрес узла живёт на dummy внутри пространства: снаружи он не виден, а петлёй не является.
 ip netns exec "$NS" ip link add stand type dummy
-ip netns exec "$NS" ip addr add "$NODE/32" dev stand
+ip netns exec "$NS" ip addr add "$NODE/$NODE_PFX" dev stand
 ip netns exec "$NS" ip link set stand up
 
 # Сервер и туннель — внутри пространства: сервер слушает на 127.0.0.1, туннель туда и ходит.

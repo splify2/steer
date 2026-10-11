@@ -316,12 +316,16 @@ def main():
     # панели пишут туда заглушки, и человеку полезнее внятная причина, чем ошибка TLS.
     # Стенду от этого доставалось заодно — туннель не поднимался вовсе, — поэтому сервер
     # стенда слушает на обычном адресе, который туннель считает законным узлом.
-    ap.add_argument("--bind", default="127.0.0.1", help="адрес слушателя")
+    ap.add_argument("--bind", default="127.0.0.1", help="адрес слушателя (IPv4 или IPv6)")
     ap.add_argument("--kbps", type=int, default=0, help="предел отдачи, КБ/с (0 — без предела)")
     ap.add_argument("--udp-relay", action="store_true",
                     help="UDP (команда 2) пересылать по адресу из запроса, а не эхом")
     a = ap.parse_args()
 
+    # Адрес IPv6 (`--bind 2001:db8::1`, issue #7: узел по IPv6) — слушатель IPv6; семейство задаётся
+    # классом до создания сокета.
+    if ":" in a.bind:
+        Server.address_family = socket.AF_INET6
     srv = Server((a.bind, a.port), Handler)
     srv.uuid = bytes.fromhex(a.uuid.replace("-", ""))
     srv.body_n = a.mb * 1024 * 1024
@@ -330,7 +334,7 @@ def main():
     # Наполнитель фиксированный: содержимое стенду безразлично, а генерация 64 КБ на
     # каждую порцию упиралась в питон, а не в туннель.
     srv.filler = bytes(i * 131 % 251 for i in range(64 * 1024))
-    print("fake-vless: %s:%d, отдаёт %d МБ" % (a.bind, a.port, a.mb), flush=True)
+    print("fake-vless: %s:%d, отдаёт %d МБ" % ("[%s]" % a.bind if ":" in a.bind else a.bind, a.port, a.mb), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

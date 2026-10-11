@@ -522,7 +522,7 @@ void px_skip_note(struct px_sub_stats *st, const struct px_node *n, const char *
     struct px_skip *s = &st->reasons[st->reasons_n++];
     snprintf(s->reason, sizeof(s->reason), "%s", reason);
     if (n && n->name[0]) snprintf(s->example, sizeof(s->example), "%s", n->name);
-    else if (n && n->vn.host[0]) snprintf(s->example, sizeof(s->example), "%s:%u", n->vn.host, n->vn.port);
+    else if (n && n->vn.host[0]) snprintf(s->example, sizeof(s->example), "%s:%u", vless_host_fmt(n->vn.host).s, n->vn.port);
     s->count = 1;
 }
 

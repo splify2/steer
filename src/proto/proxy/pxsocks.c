@@ -29,7 +29,7 @@ struct socks_sess {
 static const char *sk_peer(const void *ctx) { return ((const struct px_node *)ctx)->vn.host; }
 static void sk_describe(const void *ctx, char *out, size_t n) {
     const struct px_node *nd = ctx;
-    snprintf(out, n, "%s (%s:%u socks%u)", nd->name, nd->vn.host, nd->vn.port, nd->socks_ver);
+    snprintf(out, n, "%s (%s:%u socks%u)", nd->name, vless_host_fmt(nd->vn.host).s, nd->vn.port, nd->socks_ver);
 }
 
 static void sk_clear(void *sess) {
@@ -97,24 +97,33 @@ static int socks5_hello(int fd, const struct px_node *n) {
     return 0;
 }
 
-/* Прочитать и выбросить ответ-адрес SOCKS5 (ATYP+ADDR+PORT) после кода ответа. */
-static int socks5_skip_reply_addr(int fd, unsigned char *bnd_ip, uint16_t *bnd_port) {
+/* Прочитать ответ-адрес SOCKS5 (ATYP+ADDR+PORT) после кода ответа. bnd — текстом адреса (IPv4 или
+ * IPv6 по ATYP 4) для UDP ASSOCIATE; пустая строка у неуказанного 0.0.0.0 и :: и у имени (ATYP 3 —
+ * как прежде, ретранслятор ждёт по адресу самого узла). Прежний код читал только ATYP 1 — ответ
+ * ATYP 4 от сервера на IPv6 терялся, и датаграммы шли на адрес узла вместо названного. */
+static int socks5_skip_reply_addr(int fd, char *bnd, size_t bnd_n, uint16_t *bnd_port) {
     unsigned char a[260];
     if (rd_full(fd, a, 1)) return -1;            /* ATYP */
     size_t al;
-    if (a[0] == 1) al = 4; else if (a[0] == 4) al = 16;
-    else if (a[0] == 3) { if (rd_full(fd, a + 1, 1)) return -1; al = a[1]; }
+    int atyp = a[0];
+    if (atyp == 1) al = 4; else if (atyp == 4) al = 16;
+    else if (atyp == 3) { if (rd_full(fd, a + 1, 1)) return -1; al = a[1]; }
     else return -1;
     if (rd_full(fd, a + 2, al)) return -1;
     unsigned char port[2];
     if (rd_full(fd, port, 2)) return -1;
-    if (bnd_ip && a[0] == 1) memcpy(bnd_ip, a + 2, 4);
+    if (bnd && bnd_n) {
+        bnd[0] = '\0';
+        static const unsigned char zero[16];
+        if ((atyp == 1 || atyp == 4) && memcmp(a + 2, zero, al) != 0)
+            inet_ntop(atyp == 1 ? AF_INET : AF_INET6, a + 2, bnd, (socklen_t)bnd_n);
+    }
     if (bnd_port) *bnd_port = (uint16_t)((port[0] << 8) | port[1]);
     return 0;
 }
 
 static int socks5_request(int fd, uint8_t cmd, uint32_t dst, uint16_t dport,
-                          unsigned char *bnd_ip, uint16_t *bnd_port) {
+                          char *bnd, size_t bnd_n, uint16_t *bnd_port) {
     unsigned char req[10], rep[3];
     req[0] = 5; req[1] = cmd; req[2] = 0;
     req[3] = 1; memcpy(req + 4, &dst, 4);
@@ -123,7 +132,7 @@ static int socks5_request(int fd, uint8_t cmd, uint32_t dst, uint16_t dport,
     if (rd_full(fd, rep, 3)) return TR_EIO;
     if (rep[0] != 5) return PX_EPROTO;
     if (rep[1] != 0) return PX_EADDR;
-    if (socks5_skip_reply_addr(fd, bnd_ip, bnd_port) != 0) return PX_EPROTO;
+    if (socks5_skip_reply_addr(fd, bnd, bnd_n, bnd_port) != 0) return PX_EPROTO;
     return 0;
 }
 
@@ -152,21 +161,16 @@ static int sk_connect(const void *ctx, void *sess, int timeout_s) {
         rc = socks5_hello(fd, n);
         if (rc == 0) {
             if (!s->udp) {
-                rc = socks5_request(fd, 1, s->dst, s->dport, NULL, NULL);
+                rc = socks5_request(fd, 1, s->dst, s->dport, NULL, 0, NULL);
             } else {
-                unsigned char bnd[4] = { 0 };
+                char bnd[INET6_ADDRSTRLEN] = "";
                 uint16_t bport = 0;
                 /* UDP ASSOCIATE: адрес/порт отправителя неизвестны — 0.0.0.0:0. */
-                rc = socks5_request(fd, 3, 0, 0, bnd, &bport);
+                rc = socks5_request(fd, 3, 0, 0, bnd, sizeof bnd, &bport);
                 if (rc == 0) {
-                    /* Ретранслятор: его порт, адрес — названный, если не 0.0.0.0, иначе адрес узла. */
-                    char host[INET_ADDRSTRLEN];
-                    if (bnd[0] | bnd[1] | bnd[2] | bnd[3]) {
-                        struct in_addr a; memcpy(&a.s_addr, bnd, 4);
-                        inet_ntop(AF_INET, &a, host, sizeof host);
-                    } else {
-                        snprintf(host, sizeof host, "%s", n->vn.host);
-                    }
+                    /* Ретранслятор: его порт, адрес — названный (IPv4 или IPv6), если не
+                     * неуказанный 0.0.0.0/::, иначе адрес узла. */
+                    const char *host = bnd[0] ? bnd : n->vn.host;
                     int uf = tr_dial_udp(host, bport);
                     if (uf < 0) rc = uf; else s->udpfd = uf;
                 }
