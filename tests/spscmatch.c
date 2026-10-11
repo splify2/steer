@@ -12,6 +12,8 @@
  *     отправлено» сходится ровно, без дыр и повторов;
  *   - выход через границу 2^32: счётчики голова/хвост бегут по кругу без остановки, и место, где они
  *     переходят через ноль, — классическое место ошибки в разности без знака;
+ *   - ожидание места: производитель на полном кольце спит до побудки потребителя (spsc_room) или до
+ *     срока, ничего не теряя (t_prodwait);
  *   - побудка: потребитель спит по протоколу (spsc_sleep_begin, poll по eventfd), производитель
  *     будит спящего и никого более. Потерянная побудка — это poll, вернувшийся по таймауту при
  *     непустом кольце; допускается ноль таких случаев.
@@ -261,9 +263,101 @@ static void t_wake(void) {
     spsc_free(&w.r);
 }
 
+/* ---- ожидание места: производитель спит на полном кольце (spsc_reserve_wait, spsc_room) ----
+ *
+ * Читатель TUN на полном кольце не бросает пакет, а ждёт место (R-146: без этого при двух рабочих
+ * 830–1253 брошенных пакета на стенде run-tunnel-mt). Проверяется: (1) ожидание с побудкой не теряет
+ * ни пакета и не уходит в срок, хотя потребитель разбирает порциями с паузами — побудка от spsc_room
+ * доходит; (2) производитель спит, а не крутится — будит его потребитель, и побудок не больше, чем
+ * порций; (3) зависший потребитель — срок соблюдается: NULL не раньше срока и без вечного сна. */
+struct pw {
+    struct spsc r;
+    uint64_t total, got, bad, timeouts, waits;
+};
+
+static void *pw_prod(void *a) {
+    struct pw *w = a;
+    for (uint64_t i = 0; i < w->total; i++) {
+        unsigned char *s = spsc_reserve(&w->r);
+        if (!s) {
+            w->waits++;
+            /* Секунда — «никогда» для потребителя, разбирающего каждые доли миллисекунды. */
+            s = spsc_reserve_wait(&w->r, 1000000000ull);
+        }
+        if (!s) { w->timeouts++; continue; }
+        fill(s, i);
+        spsc_commit(&w->r, len_of(i));
+    }
+    return NULL;
+}
+
+static void *pw_cons(void *a) {
+    struct pw *w = a;
+    uint64_t want = 0;
+    unsigned x = 777;
+    while (want < w->total - w->timeouts) {
+        uint32_t n;
+        const unsigned char *p;
+        int k = 0;
+        while (k < 8 && (p = spsc_peek(&w->r, &n)) != NULL) {
+            if (!verify(p, n, want)) w->bad++;
+            want++;
+            spsc_pop(&w->r);
+            w->got++;
+            k++;
+        }
+        if (k) spsc_room(&w->r);
+        /* Пауза после порции: производитель успевает заполнить кольцо и уснуть. */
+        x = x * 1103515245u + 12345u;
+        if ((x >> 16) % 4 == 0) { struct timespec ts = { 0, 50000 }; nanosleep(&ts, NULL); }
+        if (!k) sched_yield();
+    }
+    return NULL;
+}
+
+static long ms_since(const struct timespec *t0) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (t.tv_sec - t0->tv_sec) * 1000L + (t.tv_nsec - t0->tv_nsec) / 1000000L;
+}
+
+static void t_prodwait(void) {
+    static struct pw w;
+    memset(&w, 0, sizeof(w));
+    w.total = 100000;
+    spsc_init(&w.r, 16, CAP);
+    pthread_t a, b;
+    pthread_create(&b, NULL, pw_cons, &w);
+    pthread_create(&a, NULL, pw_prod, &w);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    check("ожидание места: принято всё", (long)w.total, (long)w.got);
+    check("ожидание места: байты и порядок целы", 0, (long)w.bad);
+    check("ожидание места: ни одного ухода в срок", 0, (long)w.timeouts);
+    check("ожидание места: производитель ждал (кольцо заполнялось)", 1, w.waits > 0);
+    printf("     пакетов %llu, ожиданий места %llu\n", (unsigned long long)w.total,
+           (unsigned long long)w.waits);
+    spsc_free(&w.r);
+
+    /* Потребитель завис: кольцо полно, никто не разбирает — ждём срок и получаем NULL. */
+    struct spsc r;
+    spsc_init(&r, 4, CAP);
+    for (int i = 0; i < 4; i++) { unsigned char *s = spsc_reserve(&r); fill(s, (uint64_t)i); spsc_commit(&r, len_of((uint64_t)i)); }
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    unsigned char *s = spsc_reserve_wait(&r, 30000000ull);   /* 30 мс */
+    long ms = ms_since(&t0);
+    check("зависший потребитель: места нет — NULL", 1, s == NULL);
+    check("зависший потребитель: срок выдержан (≥ 29 мс)", 1, ms >= 29);
+    check("зависший потребитель: и не дольше (< 500 мс)", 1, ms < 500);
+    check("после срока флаг ожидания снят", 0, (long)r.prod_waiting);
+    spsc_free(&r);
+}
+
 int main(void) {
     t_single();
     t_overflow();
     t_wake();
+    t_prodwait();
     return unit_done("spscmatch");
 }

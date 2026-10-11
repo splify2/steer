@@ -35,6 +35,14 @@
  * Обмен waiting на 0 даёт ровно одну запись в eventfd на пробуждение, сколько бы пакетов ни
  * пришло, пока рабочий вставал.
  *
+ * ОЖИДАНИЕ МЕСТА (spsc_reserve_wait, spsc_room). Полное кольцо — это рабочий, который отстал, и бросать
+ * пакет сразу — значит отдать повтору TCP то, что рабочий разобрал бы через сотню микросекунд (стенд
+ * run-tunnel-mt: при 2 рабочих без ожидания 830–1253 брошенных пакета и втрое дольше). Производитель
+ * засыпает на самом хвосте (futex): ядро сравнит хвост с виденным и не даст уснуть, если тот уже ушёл.
+ * Будить его потребитель обязан, только если тот спит, — флаг prod_waiting, та же схема Деккера, что
+ * у waiting, но проверяется он раз в порцию разбора (spsc_room), а не на каждый пакет: пакет так и
+ * стоит одного release. Сон ограничен сроком — потребитель, не освободивший места за срок, завис.
+ *
  * Слоты — одно отображение (calloc): страницы, которых не коснулись, памяти не занимают. Но кольцо
  * ходит по кругу, и под нагрузкой тронутся все: см. SPSC_BYTES. */
 #ifndef STEER_SPSC_H
@@ -42,7 +50,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
 
 #define SPSC_LINE 64
 
@@ -50,6 +61,7 @@ struct spsc {
     /* Производитель: пишет head, читает tail. */
     _Alignas(SPSC_LINE) uint32_t head;
     uint32_t tail_seen;           /* хвост, каким его видел производитель; только он его трогает */
+    uint32_t prod_waiting;        /* производитель спит на полном кольце (spsc_reserve_wait) */
     /* Потребитель: пишет tail и waiting, читает head. */
     _Alignas(SPSC_LINE) uint32_t tail;
     uint32_t head_seen;
@@ -122,7 +134,45 @@ static inline int spsc_commit(struct spsc *r, uint32_t len) {
     return 0;
 }
 
+/* Как spsc_reserve, но на полном кольце ждёт места до timeout_ns, не крутясь: спит на хвосте, пока
+ * потребитель его не сдвинет и не разбудит (spsc_room). NULL — места не стало за срок. */
+static inline unsigned char *spsc_reserve_wait(struct spsc *r, uint64_t timeout_ns) {
+    unsigned char *slot = spsc_reserve(r);
+    if (slot || !timeout_ns) return slot;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        /* seq_cst: пара с spsc_room (см. шапку). */
+        __atomic_store_n(&r->prod_waiting, 1, __ATOMIC_SEQ_CST);
+        uint32_t t = __atomic_load_n(&r->tail, __ATOMIC_SEQ_CST);
+        uint32_t h = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
+        if (h - t > r->mask) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t left = (int64_t)timeout_ns - ((int64_t)(now.tv_sec - t0.tv_sec) * 1000000000 +
+                                                  (now.tv_nsec - t0.tv_nsec));
+            if (left <= 0) { __atomic_store_n(&r->prod_waiting, 0, __ATOMIC_RELAXED); return NULL; }
+            struct timespec ts = { (time_t)(left / 1000000000), (long)(left % 1000000000) };
+            /* Хвост уже не t — ядро вернёт сразу (EAGAIN); иначе спим до побудки или срока. */
+            syscall(SYS_futex, &r->tail, FUTEX_WAIT_PRIVATE, t, &ts, NULL, 0);
+        }
+        __atomic_store_n(&r->prod_waiting, 0, __ATOMIC_RELAXED);
+        slot = spsc_reserve(r);
+        if (slot) return slot;
+    }
+}
+
 /* ---- потребитель ---- */
+
+/* После порции spsc_pop: если производитель спит на полном кольце — разбудить. Раз в порцию, а не на
+ * пакет: seq_cst-запись хвоста (того же значения) и чтение флага — пара к spsc_reserve_wait. */
+static inline void spsc_room(struct spsc *r) {
+    uint32_t t = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
+    __atomic_store_n(&r->tail, t, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&r->prod_waiting, __ATOMIC_SEQ_CST) &&
+        __atomic_exchange_n(&r->prod_waiting, 0, __ATOMIC_SEQ_CST))
+        syscall(SYS_futex, &r->tail, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+}
 
 /* Следующий пакет, или NULL. Длина — в *len. Пакет остаётся в кольце до spsc_pop. */
 static inline const unsigned char *spsc_peek(struct spsc *r, uint32_t *len) {

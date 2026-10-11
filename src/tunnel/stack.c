@@ -57,6 +57,7 @@
 #include "stack.h"
 #include "spec.h"
 #include "run.h"
+#include "thrstack.h"
 
 /* ---- журнал с уровнем --------------------------------------------------------
  *
@@ -826,7 +827,7 @@ struct ring_work {
     struct spsc ring;
     struct xmail mail;
     /* Счётчики читателя (пишет только он). */
-    unsigned long long rd_pkts, rd_full;
+    unsigned long long rd_pkts, rd_full, rd_waits;
 };
 static struct ring_work *g_rw;          /* NULL — режим одного потока, без читателя */
 static unsigned g_nwork = 1;            /* рабочих; задаётся до запуска читателя */
@@ -1285,21 +1286,14 @@ static int connq_push(const struct connjob *j) {
     if (!g_cq.started) {
         pthread_attr_t a;
         pthread_attr_init(&a);
-        /* Стек скромный: рукопожатие держит крупные буферы в __thread, а не на стеке. */
-        pthread_attr_setstacksize(&a, 128 * 1024);
+        /* Стек скромный: рукопожатие держит крупные буферы в __thread, а не на стеке. TLS сверх него —
+         * thread_stack (у glibc она берётся из стека, и 128 КБ без неё — EINVAL). */
+        pthread_attr_setstacksize(&a, thread_stack(128 * 1024));
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
         int made = 0, err = 0;
         for (int i = 0; i < CONNECTORS; i++) {
             pthread_t t;
             err = pthread_create(&t, &a, connector, NULL);
-            /* EINVAL при скромном стеке: минимум потока у glibc включает статическую TLS всех
-             * загруженных библиотек, а у libsteer.so она под 300 КБ (thread-local буферы), так что
-             * 128 КБ оказываются меньше минимума. Повторяем с запасом; занятой станет лишь
-             * использованная часть виртуальной памяти. */
-            if (err == EINVAL && !made) {
-                pthread_attr_setstacksize(&a, 1024 * 1024);
-                err = pthread_create(&t, &a, connector, NULL);
-            }
             if (err != 0) break;
             made++;
         }
@@ -3617,22 +3611,38 @@ static void *worker_loop(void *arg) {
                 free(x);
                 k++;
             }
+            /* Кольцо разбирается ЦЕЛИКОМ за виток (до RING_SLOTS пакетов), порциями по TUN_DRAIN_MAX — на
+             * порцию рассчитан буфер сборки g_up, и после каждой выгрузка уходит узлу (up_flush). По одной
+             * порции за виток, как у прямого чтения, было мало: между витками рабочий читает у узлов, и за это
+             * время читатель успевал выложить пачку склеенных кадров выгрузки (до 45 пакетов каждый) —
+             * стенд run-tunnel-mt ловил переполнение кольца при 2, 4 и 8 рабочих (106–1355 пакетов на
+             * 70–100 тыс.). У прямого чтения запас давала очередь устройства в ядре (txqueuelen). */
             uint32_t rn;
             const unsigned char *rp;
             uint64_t t1 = 0;
-            while (k < TUN_DRAIN_MAX && (rp = spsc_peek(&rw->ring, &rn)) != NULL) {
-                if (g_stats) t1 = now_ns();
-                handle_packet(&tun, rp, rn);
-                spsc_pop(&rw->ring);
-                g_ring_pkts++;
-                if (g_stats) { g_st.tun_reads++; g_st.pkt_ns += now_ns() - t1; }
-                k++;
-            }
-            if (k) {
-                g_tun_backlog = k == TUN_DRAIN_MAX;
+            unsigned taken = 0;
+            for (;;) {
+                while (k < TUN_DRAIN_MAX && (rp = spsc_peek(&rw->ring, &rn)) != NULL) {
+                    if (g_stats) t1 = now_ns();
+                    handle_packet(&tun, rp, rn);
+                    spsc_pop(&rw->ring);
+                    g_ring_pkts++;
+                    if (g_stats) { g_st.tun_reads++; g_st.pkt_ns += now_ns() - t1; }
+                    k++;
+                }
+                if (!k) break;
+                spsc_room(&rw->ring);     /* место освободилось — разбудить читателя, если ждёт */
                 up_flush(&tun);
                 flush_acks(&tun);
+                taken += (unsigned)k;
+                if (k < TUN_DRAIN_MAX || taken >= RING_SLOTS) break;
+                k = 0;
             }
+            /* Отстаём — проход упёрся в свой предел (RING_SLOTS), как порция прямого чтения в TUN_DRAIN_MAX:
+             * клиентам меньшее окно (RCV_WND_BACKLOG). НЕ «в кольце что-то осталось»: читатель докладывает
+             * пакеты всё время, пока идёт выгрузка, и такой признак стоял бы почти всегда — окна клиентам
+             * резались до 64 КБ постоянно, и стенд run-tunnel-mt шёл вчетверо дольше (4,2 с против 1,0). */
+            if (taken) g_tun_backlog = taken >= RING_SLOTS;
         } else if (tun_ready) {
             /* ВЫЧЕРПЫВАЕМ устройство, а не читаем по пакету за проход.
              *
@@ -3775,6 +3785,7 @@ static void *worker_loop(void *arg) {
  * Выход — только по ошибке устройства или останову рабочего (g_ring_stop): штатно процесс умирает от
  * сигнала. */
 #define READER_BATCH 256
+#define READER_WAIT_NS 2000000ull
 static void reader_loop(struct tun_dev *t, struct ring_work *rws, int nw) {
     unsigned char pkt[TUNNEL_BUF];
     struct pollfd pf = { .fd = t->fd, .events = POLLIN };
@@ -3804,6 +3815,18 @@ static void reader_loop(struct tun_dev *t, struct ring_work *rws, int nw) {
             }
             unsigned char *slot = spsc_reserve(&w->ring);
             if (!slot) {
+                /* Кольцо полно — рабочий занят (читает у узлов, шифрует). Ждём место (спим, а не крутимся:
+                 * spsc_reserve_wait), а не бросаем сразу: пока читатель ждёт, пакеты копятся в очереди
+                 * устройства в ядре, ровно как при одном потоке, а брошенный пакет выгрузки стоил бы клиенту
+                 * повтора и сброса окна (без ожидания стенд run-tunnel-mt при 2 рабочих: 830–1253 брошенных
+                 * пакета, 1,1–1,5 с против 0,4). Ждать вечно нельзя — остальные рабочие ждут вместе с
+                 * читателем, — поэтому не дольше READER_WAIT_NS: рабочий, не освободивший ни слота за 2 мс,
+                 * завис, а не отстал (порция разбора — десятки микросекунд), и тогда пакет бросается со
+                 * счётом, как раньше. */
+                w->rd_waits++;
+                slot = spsc_reserve_wait(&w->ring, READER_WAIT_NS);
+            }
+            if (!slot) {
                 w->rd_full++;
                 if (now_ns() - said_full > 5000000000ull) {
                     said_full = now_ns();
@@ -3820,21 +3843,22 @@ static void reader_loop(struct tun_dev *t, struct ring_work *rws, int nw) {
             uint64_t t1 = now_ns();
             busy_ns += t1 - t0;
             if (t1 - stats_at >= 2000000000ull) {
-                unsigned long long pk = 0, full = 0;
+                unsigned long long pk = 0, full = 0, waits = 0;
                 char per[256] = "";
                 size_t pl = 0;
                 for (int i = 0; i < nw; i++) {
                     pk += rws[i].rd_pkts;
                     full += rws[i].rd_full;
+                    waits += rws[i].rd_waits;
                     if (pl < sizeof(per) - 24)
                         pl += (size_t)snprintf(per + pl, sizeof(per) - pl, "%s%llu", i ? " " : "",
                                                rws[i].rd_pkts);
                 }
                 double sec = (double)(t1 - stats_at) / 1e9;
                 fprintf(stderr, "tun-reader: пакетов %.0f/с | занят %.0f%% | кольцо переполнено %llu "
-                                "(за период %llu) | по рабочим всего [%s]\n",
+                                "(за период %llu) | ждали места %llu | по рабочим всего [%s]\n",
                         (double)(pk - last_pkts) / sec, 100.0 * (double)busy_ns / (double)(t1 - stats_at),
-                        full, full - last_full, per);
+                        full, full - last_full, waits, per);
                 last_pkts = pk;
                 last_full = full;
                 busy_ns = 0;
@@ -3995,7 +4019,7 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
         pthread_attr_init(&at);
         /* Стек задан явно: у musl он по умолчанию 128 КБ, а цикл держит на стеке буферы и вызывает
          * шифр и рукопожатия. Миб виртуальной памяти, трогаются только нужные страницы. */
-        pthread_attr_setstacksize(&at, 1024 * 1024);
+        pthread_attr_setstacksize(&at, thread_stack(1024 * 1024));
         for (int i = 0; i < want; i++) {
             struct ring_work *rw = &rws[made];
             if (spsc_init(&rw->ring, RING_SLOTS, RING_SLOT_DATA) != 0) {
