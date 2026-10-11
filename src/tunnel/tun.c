@@ -1065,3 +1065,161 @@ int udp_write_to_client(const struct tun_dev *d, uint32_t src, uint32_t dst,
     }
     return 0;
 }
+
+/* ---- программа раздачи в ядре (R-146) ------------------------------------------------------------
+ *
+ * ЗАЧЕМ. Несколько рабочих потоков держат каждое соединение целиком, и пакеты клиента обязаны приходить
+ * владельцу. Раздавал их поток-читатель: читал единственную очередь и копировал пакет в кольцо рабочего.
+ * Это работает, но стоит — на скачивании одним потоком ACK клиента шёл через читателя и будил рабочего
+ * через eventfd: минус 12–25 % скорости и плюс 20–45 % процессора на ГиБ (стенд perf-tb, 2 ядра).
+ * Ядро умеет раздавать само: у устройства с IFF_MULTI_QUEUE очередь для пакета выбирает программа eBPF
+ * (TUNSETSTEERINGEBPF, ядро ≥ 4.16), если она стоит. Тогда каждый рабочий читает СВОЮ очередь, как
+ * единственный поток прежде, — ни читателя, ни копии, ни побудок.
+ *
+ * ПОЧЕМУ НЕ РАЗДАЧА ЯДРА ПО УМОЛЧАНИЮ. Без программы ядро выбирает очередь по своему хэшу и таблице
+ * потоков, и обе половины соединения к одной очереди не привязывает — на роутере это было 12 против
+ * 292 Мбит/с (stack.c, у g_conns). Программа считает tun_flow_owner — тот же хэш, которым рабочий
+ * проверяет, что пакет его (handle_packet), так что расхождение видно счётчиком «не у владельца».
+ *
+ * КАК. Программа — 60 с небольшим инструкций, собранных здесь же (библиотека bpf не нужна): загрузки
+ * LD_ABS/LD_IND по смещениям от сетевого заголовка (SKF_NET_OFF), арифметика 32-битная, как в
+ * tun_mix32, сжатие в номер — 64-битным умножением, как в tun_flow_owner. Ядро берёт результат по
+ * модулю числа очередей, а он и так меньше. Загрузка, выходящая за пакет (усечённый заголовок),
+ * завершает программу с нулём — такой пакет всё равно не разберётся.
+ *
+ * Не встала (ядро без bpf, без JIT — работает интерпретатор, без TUNSETSTEERINGEBPF, отказ проверяющего)
+ * — причина в why, и раздаёт читатель (stack.c). */
+#include <sys/syscall.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
+#ifndef TUNSETSTEERINGEBPF
+#define TUNSETSTEERINGEBPF _IOR('T', 224, int)
+#endif
+#ifndef SKF_NET_OFF
+#define SKF_NET_OFF (-0x100000)
+#endif
+
+struct bpf_prog_buf {
+    struct bpf_insn in[96];
+    int n;
+};
+
+static void bi(struct bpf_prog_buf *b, uint8_t code, uint8_t dst, uint8_t src, int16_t off, int32_t imm) {
+    struct bpf_insn *x = &b->in[b->n++];
+    memset(x, 0, sizeof(*x));
+    x->code = code;
+    x->dst_reg = dst;
+    x->src_reg = src;
+    x->off = off;
+    x->imm = imm;
+}
+
+/* x = tun_mix32(x), t — временный регистр. Всё 32-битное (BPF_ALU): старшие биты обнуляются, как у uint32_t. */
+static void bi_mix32(struct bpf_prog_buf *b, uint8_t x, uint8_t t) {
+    static const struct { int sh; uint32_t mul; } st[3] = { { 16, 0x85EBCA6Bu }, { 13, 0xC2B2AE35u }, { 16, 0 } };
+    for (int i = 0; i < 3; i++) {
+        bi(b, BPF_ALU | BPF_MOV | BPF_X, t, x, 0, 0);
+        bi(b, BPF_ALU | BPF_RSH | BPF_K, t, 0, 0, st[i].sh);
+        bi(b, BPF_ALU | BPF_XOR | BPF_X, x, t, 0, 0);
+        if (st[i].mul) bi(b, BPF_ALU | BPF_MUL | BPF_K, x, 0, 0, (int32_t)st[i].mul);
+    }
+}
+
+/* Переход вперёд на метку, которой ещё нет: запомнить место, смещение вписать потом (bi_land). */
+static int bi_jmp(struct bpf_prog_buf *b, uint8_t op, uint8_t dst, int32_t imm) {
+    bi(b, BPF_JMP | op | BPF_K, dst, 0, 0, imm);
+    return b->n - 1;
+}
+static void bi_land(struct bpf_prog_buf *b, int at) { b->in[at].off = (int16_t)(b->n - at - 1); }
+
+static void steer_prog_build(struct bpf_prog_buf *b, unsigned nq) {
+    enum { R0 = 0, R1, R2, R6 = 6, R7, R8, R9, R10 };
+    b->n = 0;
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R6, R1, 0, 0);              /* LD_ABS берёт пакет из r6 */
+    bi(b, BPF_LD | BPF_B | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 0);     /* версия и длина заголовка */
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R7, R0, 0, 0);
+    bi(b, BPF_ALU | BPF_RSH | BPF_K, R0, 0, 0, 4);
+    int not4 = bi_jmp(b, BPF_JNE, R0, 4);                          /* не IPv4 — очередь 0 */
+    bi(b, BPF_ALU | BPF_AND | BPF_K, R7, 0, 0, 0x0F);
+    bi(b, BPF_ALU | BPF_LSH | BPF_K, R7, 0, 0, 2);                 /* r7 = ihl в байтах */
+    bi(b, BPF_LD | BPF_B | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 9);     /* протокол */
+    bi(b, BPF_STX | BPF_W | BPF_MEM, R10, R0, -4, 0);              /* LD_ABS портит r1-r5: протокол — на стек */
+    bi(b, BPF_LD | BPF_W | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 16);    /* назначение */
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R9, R0, 0, 0);
+    bi(b, BPF_LDX | BPF_W | BPF_MEM, R0, R10, -4, 0);
+    bi(b, BPF_ALU | BPF_ADD | BPF_X, R9, R0, 0, 0);                /* назначение + протокол */
+    bi_mix32(b, R9, R2);
+    bi(b, BPF_LD | BPF_W | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 12);    /* источник */
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R8, R0, 0, 0);
+    bi(b, BPF_ALU | BPF_XOR | BPF_X, R8, R9, 0, 0);
+    bi_mix32(b, R8, R2);                                           /* r8 = хэш адресов и протокола */
+    bi(b, BPF_LD | BPF_H | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 6);     /* флаги и смещение фрагмента */
+    bi(b, BPF_ALU | BPF_AND | BPF_K, R0, 0, 0, 0x3FFF);
+    int frag = bi_jmp(b, BPF_JNE, R0, 0);                          /* фрагмент — без портов */
+    bi(b, BPF_LDX | BPF_W | BPF_MEM, R0, R10, -4, 0);
+    int tcp = bi_jmp(b, BPF_JEQ, R0, 6);
+    int notudp = bi_jmp(b, BPF_JNE, R0, 17);
+    bi_land(b, tcp);
+    int shortihl = bi_jmp(b, BPF_JLT, R7, 20);
+    bi(b, BPF_LD | BPF_W | BPF_IND, 0, R7, 0, SKF_NET_OFF);        /* порты: источник << 16 | назначение */
+    bi(b, BPF_ALU | BPF_XOR | BPF_X, R8, R0, 0, 0);
+    bi_mix32(b, R8, R2);
+    bi_land(b, frag);
+    bi_land(b, notudp);
+    bi_land(b, shortihl);
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R0, R8, 0, 0);              /* (uint64_t)h * nq >> 32 */
+    bi(b, BPF_ALU64 | BPF_MUL | BPF_K, R0, 0, 0, (int32_t)nq);
+    bi(b, BPF_ALU64 | BPF_RSH | BPF_K, R0, 0, 0, 32);
+    bi(b, BPF_JMP | BPF_EXIT, 0, 0, 0, 0);
+    bi_land(b, not4);
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_K, R0, 0, 0, 0);
+    bi(b, BPF_JMP | BPF_EXIT, 0, 0, 0, 0);
+}
+
+int tun_steer_attach(int fd, unsigned nq, char *why, size_t why_n) {
+    if (why_n) why[0] = 0;
+    if (getenv("STEER_TUN_NOSTEER")) {
+        snprintf(why, why_n, "выключена (STEER_TUN_NOSTEER)");
+        return -1;
+    }
+    static struct bpf_prog_buf b;
+    steer_prog_build(&b, nq);
+    union bpf_attr a;
+    memset(&a, 0, sizeof(a));
+    a.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+    a.insns = (uint64_t)(uintptr_t)b.in;
+    a.insn_cnt = (uint32_t)b.n;
+    a.license = (uint64_t)(uintptr_t)"GPL";
+    int pfd = (int)syscall(__NR_bpf, BPF_PROG_LOAD, &a, sizeof(a));
+    if (pfd < 0) {
+        int e = errno;
+        /* Без журнала проверяющего — первая попытка: журнал, не влезший в буфер, сам по себе отказ
+         * (ENOSPC). Отказали — повтор с журналом, только чтобы назвать причину. */
+        static char log[16384];
+        log[0] = 0;
+        a.log_buf = (uint64_t)(uintptr_t)log;
+        a.log_size = sizeof(log);
+        a.log_level = 1;
+        int again = (int)syscall(__NR_bpf, BPF_PROG_LOAD, &a, sizeof(a));
+        if (again >= 0) close(again);
+        /* Последняя непустая строка журнала проверяющего — сама причина отказа. */
+        const char *last = "";
+        for (char *s = log; *s; ) {
+            char *nl = strchr(s, '\n');
+            if (nl) *nl = 0;
+            if (*s) last = s;
+            if (!nl) break;
+            s = nl + 1;
+        }
+        snprintf(why, why_n, "программа не загрузилась: %s%s%s", strerror(e), *last ? " — " : "", last);
+        return -1;
+    }
+    int rc = ioctl(fd, TUNSETSTEERINGEBPF, &pfd);
+    int e = errno;
+    close(pfd);    /* устройство держит свою ссылку на программу */
+    if (rc != 0) {
+        snprintf(why, why_n, "устройство её не приняло (TUNSETSTEERINGEBPF): %s", strerror(e));
+        return -1;
+    }
+    return 0;
+}

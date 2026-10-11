@@ -65,6 +65,7 @@ build/xsepochmatch
 build/tungromatch
 build/spscmatch
 build/spscmatch-tsan
+build/tunsteermatch
 build/.tsanprobe
 build/tunnelmatch
 build/xhupmatch

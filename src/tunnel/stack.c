@@ -778,8 +778,16 @@ static int g_one_worker = 1;
 
 /* ---- несколько рабочих потоков: раздача пакетов (R-146) ----------------------------------------
  *
- * УСТРОЙСТВО. Один поток (читатель, это поток stack_run) читает единственную очередь TUN и по хэшу
- * соединения кладёт каждый пакет в кольцо одного из N рабочих (spsc.h). Рабочий — прежний worker_loop:
+ * ДВА ПУТИ РАЗДАЧИ. Основной — ядро: на устройстве с N очередями стоит программа eBPF (tun_steer_attach,
+ * tun.c), она кладёт пакет в очередь владельца по tun_flow_owner, и рабочий читает свою очередь сам, как
+ * единственный поток прежде (g_steered). Замер (perf-tb, 2 ядра, 2 рабочих против одного потока):
+ * скачивание одним соединением 14180 против 13387 Мбит/с при том же процессоре на ГиБ (0,58 против 0,60),
+ * четырьмя — 19842 против 12678, выгрузка четырьмя — 16167 против 7750. Запасной — читатель (ниже), если
+ * программа не встала: он стоит дороже — на скачивании одним соединением 9872 Мбит/с и 0,90 с/ГиБ, потому
+ * что каждый ACK клиента идёт через него и будит рабочего.
+ *
+ * УСТРОЙСТВО ЗАПАСНОГО ПУТИ. Один поток (читатель, это поток stack_run) читает единственную очередь TUN и
+ * по хэшу соединения кладёт каждый пакет в кольцо одного из N рабочих (spsc.h). Рабочий — прежний worker_loop:
  * своя таблица соединений, свой epoll, свои сокеты узла, ответы клиенту он пишет в TUN сам (запись в
  * дескриптор устройства из нескольких потоков безопасна: один write — один пакет, ядро берёт
  * очередь устройства по-пакетно). Решение владельца: «ядра = потоки», вариант А.
@@ -837,38 +845,17 @@ struct ring_work {
 };
 static struct ring_work *g_rw;          /* NULL — режим одного потока, без читателя */
 static unsigned g_nwork = 1;            /* рабочих; задаётся до запуска читателя */
+/* Пакеты раздаёт ядро (программа на устройстве, tun_steer_attach): у каждого рабочего своя очередь TUN, и
+ * читателя с кольцами нет — рабочий читает устройство сам, как единственный поток прежде. 0 — раздаёт
+ * читатель (ядро без bpf или без нескольких очередей). Задаётся до запуска рабочих. */
+static int g_steered;
 
-/* Хэш пакета клиента -> номер рабочего. Читатель считает его по сырым байтам, рабочий проверяет
- * тем же по тому же пакету (handle_packet), поэтому разошедшиеся «читатель» и «владелец» — это
- * ошибка кода, а не гонка, и счётчик g_not_owner её показывает.
- *
- * Ключ: источник, назначение, протокол и порты (для TCP и UDP без фрагментации). Фрагмент — по
- * адресам и протоколу, потому что в продолжении портов нет, а у первого куска они есть и дали бы
- * ДРУГОЙ рабочий, чем у остальных кусков: хэш обязан быть одним на всю датаграмму.
- *
- * Сжатие в номер — умножением на старшие биты (fast range), а не остатком: младшие биты хэша
- * здесь не используются, и у flow_hash (корзины таблицы потока) свои; остаток от степени двойки
- * совпал бы с его корзинами, и каждый рабочий занял бы только 1/N своих корзин. */
-static inline uint32_t mix32(uint32_t h) {
-    h ^= h >> 16; h *= 0x85EBCA6Bu;
-    h ^= h >> 13; h *= 0xC2B2AE35u;
-    h ^= h >> 16;
-    return h;
-}
+/* Хэш пакета клиента -> номер рабочего: tun_flow_owner (tun.h). Его считает тот, кто раздаёт (читатель
+ * TUN или программа раздачи в ядре, tun_steer_attach), а рабочий проверяет тем же по тому же пакету
+ * (handle_packet), поэтому разошедшиеся «раздающий» и «владелец» — это ошибка кода, а не гонка, и
+ * счётчик g_not_owner её показывает. */
 static unsigned stack_owner(const unsigned char *p, size_t n, unsigned nw) {
-    if (nw <= 1 || n < 20 || (p[0] >> 4) != 4) return 0;   /* не IPv4: разберёт и откажет любой */
-    size_t ihl = (size_t)(p[0] & 0x0F) * 4;
-    uint32_t src, dst;
-    memcpy(&src, p + 12, 4);
-    memcpy(&dst, p + 16, 4);
-    uint32_t h = mix32(src ^ mix32(dst + p[9]));
-    int frag = (((p[6] << 8) | p[7]) & 0x3FFF) != 0;
-    if (!frag && (p[9] == 6 || p[9] == 17) && ihl >= 20 && n >= ihl + 4) {
-        uint32_t ports;
-        memcpy(&ports, p + ihl, 4);
-        h = mix32(h ^ ports);
-    }
-    return (unsigned)(((uint64_t)h * nw) >> 32);
+    return tun_flow_owner(p, n, nw);
 }
 
 /* Останов режима с читателем: ставит читатель (ошибка устройства) или вышедший рабочий. */
@@ -3340,7 +3327,7 @@ static void *worker_loop(void *arg) {
     int tun_fd = tun.fd;
     struct ring_work *rw = w->rw;
     /* Общий дескриптор TUN закрывает читатель (stack_run), а не рабочий. */
-    int own_tun = rw == NULL;
+    int own_tun = rw == NULL || g_steered;
     g_worker = w->id;
 
     g_st.win_min = 0xFFFFFFFFu;
@@ -3550,6 +3537,7 @@ static void *worker_loop(void *arg) {
         int sleeping = 0;
         if (rw && wait_ms > 0) {
             if (__atomic_load_n(&rw->mail.n, __ATOMIC_RELAXED)) wait_ms = 0;
+            else if (g_steered) { /* своя очередь TUN и побудка почты — обе в epoll */ }
             else if (efd < 0) { if (wait_ms > 1) wait_ms = 1; }
             else if (spsc_sleep_begin(&rw->ring)) sleeping = 1;
             else wait_ms = 0;
@@ -3605,7 +3593,20 @@ static void *worker_loop(void *arg) {
             }
         }
 
-        if (rw) {
+        if (rw && g_steered && __atomic_load_n(&rw->mail.n, __ATOMIC_RELAXED)) {
+            /* Раздаёт ядро: почта — только датаграммы, собранные из фрагментов у другого рабочего (их
+             * владелец — по хэшу пятёрки). Не больше XMAIL_MAX = TUN_DRAIN_MAX за раз — на это рассчитан g_up. */
+            struct xpkt *mail = xmail_take(&rw->mail);
+            while (mail) {
+                struct xpkt *x = mail;
+                mail = x->next;
+                handle_packet(&tun, x->d, x->n);
+                free(x);
+            }
+            up_flush(&tun);
+            flush_acks(&tun);
+        }
+        if (rw && !g_steered) {
             /* ПЕРВЫМ — пакеты клиента от читателя, и только потом чтение у узлов (rx_ready ниже): по
              * подтверждению открывается окно, и обратный порядок читал бы у узла на виток позже
              * (отчёт по R-147/R-148). Порция — те же TUN_DRAIN_MAX пакетов, что и у прямого чтения:
@@ -3671,6 +3672,7 @@ static void *worker_loop(void *arg) {
                 if (g_stats) { g_st.tun_reads++; g_st.tun_read_ns += t1 - t0; }
                 handle_packet(&tun, pkt, (size_t)rn);
                 if (g_stats) g_st.pkt_ns += now_ns() - t1;
+                if (rw) g_ring_pkts++;      /* раздаёт ядро: «пакетов от раздачи» — из своей очереди */
             }
             /* До ACK этой порции, чтобы они уже несли окно, которого она требует. */
             g_tun_backlog = k == TUN_DRAIN_MAX;
@@ -3962,20 +3964,37 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     /* Узел, который заведомо не годится (у VLESS — негодный UUID, I-097), модуль протокола
      * отвергает ДО этой функции, пока узел ещё можно назвать: здесь устройство уже поднимется. */
 
-    /* Одна очередь устройства, всегда: рабочие потоки получают пакеты не от ядра (IFF_MULTI_QUEUE), а от
-     * читателя (см. «несколько рабочих потоков» у g_rw). */
+    /* Очереди устройства: по одной на рабочего, если пакеты раздаст ядро (программа на устройстве,
+     * tun_steer_attach), и одна — если раздаёт читатель (см. «несколько рабочих потоков» у g_rw). Без
+     * программы ядро разводит половины соединения по разным очередям (12 против 292 Мбит/с на роутере),
+     * поэтому несколько очередей без неё не остаются: лишние закрываются, и раздаёт читатель. */
     int want = worker_count();
-    struct tun_dev q0;
-    int nq = tun_open(&q0, 1, dev);
+    struct tun_dev *qs = calloc((size_t)want, sizeof(*qs));
+    if (!qs) { fprintf(stderr, LOG_W "нет памяти под очереди устройства\n"); return 1; }
+    int nq = tun_open(qs, want, dev);
     /* Код выхода — ОДИН, и он положительный. Возвращая сюда -40 или -41, движок отдавал
      * их main, а тот отдавал ядру: отрицательное обрезается до байта, и procd получал 216
      * или 215. Число, которое ничего не значит ни для человека, ни для splify2. Причину
      * называет tun_open своим сообщением, здесь остаётся признак отказа. */
     if (nq < 0) return 1;
+    char steer_why[256] = "";
+    if (want > 1 && nq < 2)
+        snprintf(steer_why, sizeof(steer_why), "ядро не дало нескольких очередей (IFF_MULTI_QUEUE)");
+    else if (want > 1 && tun_steer_attach(qs[0].fd, (unsigned)nq, steer_why, sizeof(steer_why)) == 0)
+        g_steered = 1;
+    if (g_steered) {
+        want = nq;                      /* очередь на рабочего: сколько очередей дали, столько рабочих */
+    } else {
+        for (int i = 1; i < nq; i++) close(qs[i].fd);
+        nq = 1;
+    }
+    struct tun_dev q0 = qs[0];
     /* Неблокирующее чтение: цикл вычерпывает устройство до EAGAIN, и без этого флага
      * последнее чтение засыпало бы, останавливая все соединения. */
-    int fl = fcntl(q0.fd, F_GETFL, 0);
-    if (fl >= 0) fcntl(q0.fd, F_SETFL, fl | O_NONBLOCK);
+    for (int i = 0; i < nq; i++) {
+        int fl = fcntl(qs[i].fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(qs[i].fd, F_SETFL, fl | O_NONBLOCK);
+    }
     tun_bring_up(dev, o->table);
 
     /* Устройство готово — сказать об этом модулю, а маршрут НЕ трогать.
@@ -4030,30 +4049,56 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
         pthread_attr_setstacksize(&at, thread_stack(1024 * 1024));
         for (int i = 0; i < want; i++) {
             struct ring_work *rw = &rws[made];
-            if (spsc_init(&rw->ring, RING_SLOTS, RING_SLOT_DATA) != 0) {
+            if (g_steered) {
+                /* Кольцо не нужно — рабочий читает свою очередь; почта остаётся (фрагменты). */
+                rw->ring.efd = -1;
+            } else if (spsc_init(&rw->ring, RING_SLOTS, RING_SLOT_DATA) != 0) {
                 fprintf(stderr, LOG_W "нет памяти под кольцо рабочего %d — потоков будет %d\n", i, made);
                 break;
             }
             pthread_mutex_init(&rw->mail.mu, NULL);
             struct worker *w = &workers[made];
             memset(w, 0, sizeof(*w));
-            w->tun = q0;
-            w->tun.rx = NULL;           /* читает только читатель: у рабочих буфера склейки нет */
-            w->tun.rx_gso = 0;
+            if (g_steered) {
+                w->tun = qs[i];             /* своя очередь, со своим буфером склейки */
+            } else {
+                w->tun = q0;
+                w->tun.rx = NULL;           /* читает только читатель: у рабочих буфера склейки нет */
+                w->tun.rx_gso = 0;
+            }
             w->id = made;
             w->rw = rw;
-            if (pthread_create(&tids[made], &at, worker_loop, w) != 0) {
-                fprintf(stderr, LOG_W "поток %d не создался, работаем без него\n", i);
-                spsc_free(&rw->ring);
-                break;
+            int failed = pthread_create(&tids[made], &at, worker_loop, w) != 0;
+            if (failed) {
+                fprintf(stderr, LOG_W "поток %d не создался\n", i);
+            } else {
+                while (!__atomic_load_n(&w->state, __ATOMIC_ACQUIRE)) {
+                    struct timespec ts = { 0, 1000000 };
+                    nanosleep(&ts, NULL);
+                }
+                if (__atomic_load_n(&w->state, __ATOMIC_ACQUIRE) == 2) {
+                    pthread_join(tids[made], NULL);   /* уже вышел, причину назвал сам */
+                    failed = 1;
+                }
             }
-            while (!__atomic_load_n(&w->state, __ATOMIC_ACQUIRE)) {
-                struct timespec ts = { 0, 1000000 };
-                nanosleep(&ts, NULL);
+            if (failed && g_steered) {
+                /* Раздаёт ядро: очередь без рабочего — пакеты, которые никто не прочтёт, а номер очереди
+                 * зашит в программу. Работать на части рабочих нельзя — выходим, procd поднимет заново. */
+                fprintf(stderr, LOG_W "%s: рабочий %d не встал, а пакеты в его очередь раздаёт ядро — "
+                                "туннель останавливается\n", dev, i);
+                __atomic_store_n(&g_ring_stop, 1, __ATOMIC_RELAXED);
+                for (int k = 0; k < made; k++) {
+                    if (rws[k].ring.efd >= 0) {
+                        uint64_t one = 1;
+                        ssize_t wr = write(rws[k].ring.efd, &one, sizeof(one));
+                        (void)wr;
+                    }
+                }
+                for (int k = 0; k < made; k++) pthread_join(tids[k], NULL);
+                return 1;
             }
-            if (__atomic_load_n(&w->state, __ATOMIC_ACQUIRE) == 2) {
-                pthread_join(tids[made], NULL);   /* уже вышел, причину назвал сам */
-                spsc_free(&rw->ring);
+            if (failed) {
+                spsc_free(&rw->ring);       /* номер не занят — следующий рабочий встанет на него */
                 continue;
             }
             made++;
@@ -4079,7 +4124,10 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     fprintf(stderr, LOG_I "разгрузка записи в %s %s; потоков %d из %d запрошенных%s\n",
             dev, q0.gso ? gso_says
                         : "НЕДОСТУПНА — нарезаем по 1460 и считаем суммы сами",
-            n, want, want > 1 ? " (рабочих; пакеты раздаёт читатель TUN)" : "");
+            n, want, want <= 1 ? "" : g_steered ? " (рабочих; пакеты раздаёт ядро — программа на устройстве)"
+                                                   : " (рабочих; пакеты раздаёт читатель TUN)");
+    if (want > 1 && !g_steered)
+        fprintf(stderr, LOG_I "раздача пакетов ядром недоступна: %s — раздаёт читатель\n", steer_why);
     fprintf(stderr, LOG_I "запасных сессий к узлу: %d (STEER_TUN_SPARES)\n", g_spare_want);
     if (n < want)
         fprintf(stderr, LOG_W "рабочих потоков меньше запрошенного (%d из %d)\n", n, want);
@@ -4087,6 +4135,11 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     if (want == 1) {
         worker_loop(&workers[0]);
         served = workers[0].served;
+    } else if (g_steered) {
+        /* Читателя нет: рабочие читают свои очереди. Ждём их; вышедший ставит g_ring_stop, остальные
+         * замечают его не позже чем через секунду. */
+        for (int i = 0; i < started; i++) pthread_join(tids[i], NULL);
+        served = 1;
     } else {
         reader_loop(&q0, rws, n);
         /* Читатель вышел: рабочих просим закончить (флаг уже стоит) и будим — они ждут в epoll. */
