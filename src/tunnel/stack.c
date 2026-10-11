@@ -319,7 +319,10 @@ struct conn {
      * значила «сокет 0». У сокетного соединения кольцо rtx — то, что ещё не дописано клиенту в сокет, а
      * early — то, что не принял узел; повторов, окна и подтверждений у него нет: это работа ядра. */
     int cfd1;
-    /* Что сокет клиента ждёт в epoll: CARM_IN, CARM_OUT; CARM_ADDED — сокет уже в наборе. */
+    /* Сокет клиента в epoll — один раз и по фронту (CARM_ADDED); готовность помнится здесь: CRD — есть
+     * непрочитанное (фронт EPOLLIN не дочитан до EAGAIN), CWR — в сокет можно писать (последняя запись
+     * не упёрлась в EAGAIN). Подписка не перестраивается на каждом проходе: так у стороны узла было 36-41
+     * вызова epoll_ctl на МБ (см. разбор событий в worker_loop). */
     uint8_t carmed;
 };
 
@@ -370,14 +373,15 @@ static void ooo_free(struct conn *c) {
     c->ooo = NULL;
 }
 
-/* Биты поля armed. */
+/* Биты поля armed. ARM_OUT — только пока узел не принял данные клиента сокета (R-152). */
 #define ARM_IN  1
+#define ARM_OUT 2
 /* Метка события сокета дайлера с DC_INLOOP (stack_loop_watch); TUN и eventfd — MAX_CONNS и MAX_CONNS + 1. */
 #define LOOP_TOKEN (MAX_CONNS + 2)
 #define AUX_BIT 0x40000000u   /* в data события epoll: вторая связь дайлера этого соединения */
 #define SOCK_BIT 0x20000000u  /* в data события epoll: сокет клиента этого соединения (R-152) */
-#define CARM_IN    1
-#define CARM_OUT   2
+#define CRD        1
+#define CWR        2
 #define CARM_ADDED 0x80
 static inline int conn_cfd(const struct conn *c) { return c->cfd1 - 1; }
 
@@ -2072,7 +2076,7 @@ static int sock_flush(struct conn *c) {
         ssize_t w = writev(conn_cfd(c), iov, iov[1].iov_len ? 2 : 1);
         if (w > 0) { rtx_drop(&c->rtx, (uint32_t)w); c->last = g_now_s; continue; }
         if (w < 0 && errno == EINTR) continue;
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { c->carmed &= (uint8_t)~CWR; return 0; }
         c->client_gone = 1;
         return -1;
     }
@@ -2116,6 +2120,16 @@ static int tx_flush(struct conn *c, const struct tun_dev *tun, int final) {
  * отдельным вызовом и отдельным проходом по данным ради контрольной суммы. */
 static int emit_to_client(struct conn *c, const struct tun_dev *tun,
                           const unsigned char *p, size_t n) {
+    if (c->cfd1) {
+        /* Сокет клиента: в кольцо недописанного, в сокет — одной записью в конце прохода (tx_flush). Не
+         * сразу каждой записью TLS: замер (vision, вн1) — запись по 16 КБ отдельным send стоила 2,34 с/ГиБ
+         * против 1,67 у склейки за проход: вызов и отправка TCP на каждые 16 КБ дороже копии в кольцо. */
+        if (!c->rtx.cap && rtx_init(&c->rtx, RTX_START) != 0) return -1;
+        if (rtx_room(&c->rtx) < n && c->rtx.cap < RTX_CAP) rtx_grow(&c->rtx, RTX_CAP);
+        if (rtx_room(&c->rtx) < n) return -1;
+        rtx_push(&c->rtx, p, (uint32_t)n);
+        return 0;
+    }
     /* Копия для повтора — ДО отправки. Место проверено заранее (client_can_take_record), и
      * если его вдруг нет, отправлять нельзя: отправленное без копии повторить нечем, а
      * именно это и подвешивало соединения. */
@@ -2132,11 +2146,6 @@ static int emit_to_client(struct conn *c, const struct tun_dev *tun,
         TR("буфер повтора полон (%u из %u) — не отправляю %zu байт\n",
            c->rtx.len, c->rtx.cap, n);
         return -1;
-    }
-    if (c->cfd1) {
-        /* Сокет клиента: в кольцо недописанного, в сокет — одной записью в конце прохода (tx_flush). */
-        rtx_push(&c->rtx, p, (uint32_t)n);
-        return 0;
     }
     if (!c->rtx.len) { c->rtx_at = g_now_ns; c->rto_ms = rto_floor(); }
     rtx_push(&c->rtx, p, (uint32_t)n);
@@ -3391,6 +3400,9 @@ static void nodes_sweep(unsigned *seen, uint64_t now) {
  * задержавшихся. Один проход цикла на все соединения зовёт это по живым (worker_loop); отдельной
  * функцией — ради стенда (tests/poolmatch.c): сроки видны снаружи только пакетами в устройство. 1 —
  * соединение закрыто (его место в g_live занял другой), 0 — живо. */
+static void sock_read(struct conn *c, const struct tun_dev *tun);
+static inline int sock_want_read(const struct conn *c);
+
 static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t now) {
     /* Хвост ранних данных, не поместившийся в окно h2 на готовности потока:
      * дослать. Новых данных клиента может и не быть — досылать больше некому. */
@@ -3414,6 +3426,12 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
     if (c->cfd1) {
         /* Сокет клиента умер (запись или чтение отказали) — закрыть, узлу больше некому отдавать. */
         if (c->client_gone) { conn_drop(c); return 1; }
+        /* Недочитанное у клиента (предел за вызов, место у узла вернулось, ранние данные ушли). */
+        if (sock_want_read(c)) {
+            sock_read(c, tun);
+            if (!c->used) return 1;
+            if (c->client_gone) { conn_drop(c); return 1; }
+        }
     } else {
         room_watch(c);
 
@@ -3671,9 +3689,16 @@ static void kaccept(int lfd, const struct tun_dev *tun) {
 /* Из сокета клиента — узлу. Крупными чтениями, сколько дайлер примет за раз; узел не принял — остаток в
  * early и сокет не читаем (окно клиенту держит ядро). Не больше четырёх чтений за событие, чтобы одна
  * выгрузка не держала цикл. */
+/* Прочитать у клиента и отдать узлу (R-152). Сокет — по фронту: читаем, пока не EAGAIN (тогда CRD снят), или
+ * пока узел не перестал принимать (место дайлера, SEND_AGAIN — CRD остаётся, дочитаем, когда место
+ * вернётся), или до SOCK_READ_BUDGET за вызов — чтобы одно соединение не держало цикл (CRD остаётся, проход
+ * сроков дочитает со следующим витком). */
+#define SOCK_READ_BUDGET (256 * 1024)
 static void sock_read(struct conn *c, const struct tun_dev *tun) {
     static __thread unsigned char buf[TUNNEL_GATHER_MAX];
-    for (int k = 0; k < 4 && c->used && !c->early && !c->client_fin && !c->srv_closed; k++) {
+    size_t got = 0;
+    while (got < SOCK_READ_BUDGET && c->used && (c->carmed & CRD) && !c->early && !c->client_fin &&
+           !c->srv_closed) {
         size_t cap = conn_up_max(c);
         if (cap > sizeof(buf)) cap = sizeof(buf);
         long room = conn_room(c);
@@ -3682,6 +3707,7 @@ static void sock_read(struct conn *c, const struct tun_dev *tun) {
         ssize_t n = read(conn_cfd(c), buf, cap);
         if (n > 0) {
             c->last = g_now_s;
+            got += (size_t)n;
             int sr = upstream_send(c, buf, (size_t)n);
             if (sr == SEND_OK) continue;
             if (sr == SEND_AGAIN) {
@@ -3696,11 +3722,17 @@ static void sock_read(struct conn *c, const struct tun_dev *tun) {
             conn_reset(c, tun);
             return;
         }
-        if (n == 0) { c->client_fin = 1; return; }
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+        if (n == 0) { c->client_fin = 1; c->carmed &= (uint8_t)~CRD; return; }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) { c->carmed &= (uint8_t)~CRD; return; }
         c->client_gone = 1;
         return;
     }
+}
+
+/* Читать ли сокет клиента сейчас: фронт не дочитан, узел принимает, обе стороны открыты. */
+static inline int sock_want_read(const struct conn *c) {
+    return (c->carmed & CRD) && !c->early && !c->client_fin && !c->srv_closed && conn_room(c) != 0;
 }
 
 struct worker {
@@ -3918,26 +3950,34 @@ static void *worker_loop(void *arg) {
              * а откладывается в rx_ready (см. разбор событий ниже), и когда окно откроется, соединение прочтёт
              * проход после разбора TUN. Фронт обязывает читать до пустого сокета или помнить, что недочитали:
              * drain_conn_reads так и делает (rx_ready). У дайлера с DC_INLOOP дескриптора нет, и в набор
-             * нечего ставить: события потока приходят из loop_poll (stack_sess_rx). */
-            if (!g_inloop && !c->armed) {
-                struct epoll_event e = { .events = EPOLLIN | EPOLLET, .data = { .u32 = (uint32_t)(c - g_conns) } };
-                if (epoll_ctl(ep, EPOLL_CTL_ADD, c->fd, &e) == 0)
-                    c->armed = ARM_IN;
+             * нечего ставить: события потока приходят из loop_poll (stack_sess_rx). EPOLLOUT (по уровню) — только
+             * пока узел не принял данные клиента сокета: SEND_AGAIN у дайлера без своего окна (room -1, сокет
+             * узла полон) ждёт записи узла событием, а не опросом (R-152). */
+            unsigned arm = ARM_IN | (c->cfd1 && c->early && conn_room(c) < 0 ? ARM_OUT : 0u);
+            if (!g_inloop && arm != c->armed) {
+                struct epoll_event e = { .events = EPOLLIN | EPOLLET | (arm & ARM_OUT ? EPOLLOUT : 0u),
+                                         .data = { .u32 = (uint32_t)(c - g_conns) } };
+                int op = !c->armed ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+                if (epoll_ctl(ep, op, c->fd, &e) == 0)
+                    c->armed = (uint8_t)arm;
             }
             aux_sync(ep, c);
             if (c->cfd1) {
-                /* Сокет клиента: читать — пока узел принимает (нет недоотправленного, есть место), клиент
-                 * не закрыл свою сторону и узел не закрыл свою; ждать записи — пока есть недописанное. */
-                long kroom = conn_room(c);
-                unsigned ca = (!c->early && !c->client_fin && !c->srv_closed && kroom != 0 ? CARM_IN : 0u) |
-                              (c->rtx.len ? CARM_OUT : 0u);
-                if ((c->carmed & (CARM_IN | CARM_OUT)) != ca || !(c->carmed & CARM_ADDED)) {
-                    struct epoll_event e = { .events = (ca & CARM_IN ? EPOLLIN : 0u) | (ca & CARM_OUT ? EPOLLOUT : 0u),
+                /* Сокет клиента — в набор один раз, по фронту, на чтение и запись сразу; что из этого готово,
+                 * помнят CRD и CWR, и подписку больше не трогаем. Сразу после ADD ядро само сообщит о
+                 * готовом (данные, пришедшие до установки потока, ждут в сокете). */
+                if (!(c->carmed & CARM_ADDED)) {
+                    struct epoll_event e = { .events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET,
                                              .data = { .u32 = SOCK_BIT | (uint32_t)(c - g_conns) } };
-                    int op = (c->carmed & CARM_ADDED) ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-                    if (epoll_ctl(ep, op, conn_cfd(c), &e) == 0) c->carmed = (uint8_t)(ca | CARM_ADDED);
+                    if (epoll_ctl(ep, EPOLL_CTL_ADD, conn_cfd(c), &e) == 0) c->carmed |= CARM_ADDED;
                 }
-                if (c->early && wait_ms > 10) wait_ms = 10;   /* недоотправленное — повтор скоро */
+                /* Недочитанное, которое можно читать, — без ожидания: фронт потрачен, ядро не напомнит. */
+                if (sock_want_read(c)) forced++;
+                /* Узел не принял (SEND_AGAIN), и у дайлера нет своего окна (room -1: сокет узла полон) —
+                 * ждём записи узла событием (ARM_OUT выше). Окно HTTP/2 (room ≥ 0)
+                 * открывается чтением узла (WINDOW_UPDATE), а не записью: там событием служит чтение, и
+                 * запасной срок — 10 мс. */
+                if (c->early && conn_room(c) >= 0 && wait_ms > 10) wait_ms = 10;
             }
             /* Данные уже у нас, и ядро о них не сообщит: разберём их без ожидания. */
             if (want && c->rx_ready) forced++;
@@ -4142,11 +4182,15 @@ static void *worker_loop(void *arg) {
             }
             if (evs[i].data.u32 & SOCK_BIT) {
                 struct conn *c = &g_conns[evs[i].data.u32 & ~SOCK_BIT];
-                if (!c->used || !c->cfd1 || c->pending) continue;
-                if (evs[i].events & EPOLLOUT) {
-                    if (sock_flush(c) == 0 && c->rx_ready && client_can_take_record(c)) rx_dirty = 1;
-                }
-                if (evs[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) sock_read(c, &tun);
+                if (!c->used || !c->cfd1) continue;
+                /* Готовность запоминается и у ждущего установщика: прочтём, когда поток встанет. Событие
+                 * могло достаться и новому соединению в том же слоте — лишний флаг стоит одного EAGAIN. */
+                if (evs[i].events & EPOLLOUT) c->carmed |= CWR;
+                if (evs[i].events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) c->carmed |= CRD;
+                if (c->pending) continue;
+                if ((c->carmed & CWR) && c->rtx.len &&
+                    sock_flush(c) == 0 && c->rx_ready && client_can_take_record(c)) rx_dirty = 1;
+                if (sock_want_read(c)) sock_read(c, &tun);
                 continue;
             }
             if (evs[i].data.u32 >= (uint32_t)MAX_CONNS) continue;  /* TUN и eventfd */
@@ -4159,6 +4203,8 @@ static void *worker_loop(void *arg) {
              * чужое событие, читало свежую связь — блокирующую и пока пустую — и весь цикл
              * вставал на срок соединения. */
             if (!c->used || c->pending || c->born_turn == g_turn) continue;
+            /* Только запись: узел снова принимает — ранние данные досылает проход сроков (conn_deadlines). */
+            if (!(evs[i].events & ~(uint32_t)EPOLLOUT)) continue;
             /* Уже прочитанное разбирает второй проход ниже — здесь пропускаем, чтобы одно
              * соединение не получило двойную порцию за виток и не отняло её у остальных. */
             if (c->rx_ready) continue;
