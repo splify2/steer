@@ -534,6 +534,12 @@ static long conn_room(const struct conn *c);
  * окно, а когда цикл успевает, очередь пуста и ничего не стоит. */
 #define RCV_WND_BACKLOG (64u * 1024)
 static __thread uint8_t g_tun_backlog;
+/* У потока есть скачивание, ждущее подтверждений клиента (у какого-то соединения rtx.len > 0); считается
+ * на каждом проходе цикла (worker_loop). Предел RCV_WND_BACKLOG — только при нём (R-151): спасает он ACK
+ * скачиваний, застрявшие за очередью выгрузки, а когда скачивать нечего, ему спасать нечего, и он только
+ * душил выгрузку. Замер (стенд perf-tb, один поток на 2 ядрах, медиана из 3): выгрузка одним потоком
+ * 2533 → 8075 Мбит/с plain и 1121 → 3910 gRPC при выключенном пределе; скачивание то же. */
+static __thread uint8_t g_down_inflight;
 
 static uint16_t rcv_win_field(const struct conn *c) {
     /* Предел дайлера (dialer_ops.rcv_wnd_max): у DC_ACK_PACED окно обязано помещаться в очередь к узлу,
@@ -541,7 +547,7 @@ static uint16_t rcv_win_field(const struct conn *c) {
     uint32_t cap = g_rcv_wnd_max;
     uint32_t w = c->ws_on ? g_rcv_wnd : RCV_WND_MIN;
     if (cap && w > cap) w = cap;
-    if (g_tun_backlog && w > RCV_WND_BACKLOG) w = RCV_WND_BACKLOG;
+    if (g_tun_backlog && g_down_inflight && w > RCV_WND_BACKLOG) w = RCV_WND_BACKLOG;
     /* Сколько узел принимает сейчас (dialer_ops.room): больше вернулось бы отказом SEND_AGAIN и
      * стоило бы клиенту таймаута повторной передачи. Округляем ВНИЗ, в отличие от потолка:
      * окно на несколько байт больше места — это отказанный сегмент. */
@@ -3446,7 +3452,7 @@ static void *worker_loop(void *arg) {
          *
          * Здесь считается сразу всё, что нужно перед ожиданием: состав набора epoll, число
          * заявок в работе, соединения с уже прочитанными данными и ближайший срок повтора. */
-        int pend = 0, forced = 0, rx_any = 0, rx_dirty = 0;
+        int pend = 0, forced = 0, rx_any = 0, rx_dirty = 0, down = 0;
         /* Таймаут — до ближайшего срока повтора, а не всегда секунда: иначе повтор ждал бы,
          * пока цикл проснётся сам. При живом трафике это происходит сразу, а при потере
          * последнего сегмента просыпаться уже нечему — ровно тот случай, для которого
@@ -3514,12 +3520,14 @@ static void *worker_loop(void *arg) {
             if (want && c->rx_ready) forced++;
             if (c->rx_ready) rx_any = 1;
 
+            if (c->rtx.len) down = 1;
             if (c->rtx.len && c->rtx_at) {
                 int64_t left = (int64_t)c->rto_ms - (int64_t)((now - c->rtx_at) / 1000000);
                 if (left < 0) left = 0;
                 if (left < wait_ms) wait_ms = (int)left;
             }
         }
+        g_down_inflight = (uint8_t)down;
         if (g_stats) g_st.conns = (uint32_t)g_live_n;
 
         /* Заявки в работе больше не заставляют просыпаться часто: установщик будит цикл сам,

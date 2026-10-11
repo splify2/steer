@@ -1337,11 +1337,19 @@ static void t_room_window(void) {
     c->ws_on = 1;
     uint32_t full = (uint32_t)rcv_win_field(c) << g_rcv_shift;
     g_tun_backlog = 1;
+    g_down_inflight = 1;
     uint32_t held = (uint32_t)rcv_win_field(c) << g_rcv_shift;
     g_tun_backlog = 0;
     uint32_t back = (uint32_t)rcv_win_field(c) << g_rcv_shift;
     check(full >= (4u << 20) && held <= RCV_WND_BACKLOG && held > RCV_WND_BACKLOG / 2 && back == full,
           "отставание цикла: окно падает до RCV_WND_BACKLOG и возвращается");
+    /* R-151: отставание без скачивания в полёте (чистая выгрузка) окно не режет — спасать нечего, а
+     * 64 КБ душили выгрузку одним потоком втрое (2533 против 8075 Мбит/с на стенде perf-tb). */
+    g_tun_backlog = 1;
+    g_down_inflight = 0;
+    uint32_t upl = (uint32_t)rcv_win_field(c) << g_rcv_shift;
+    g_tun_backlog = 0;
+    check(upl == full, "отставание при чистой выгрузке: окно остаётся полным (R-151)");
     c->ws_on = 0;
     g_rcv_wnd = save_wnd;
     g_rcv_shift = save_shift;
