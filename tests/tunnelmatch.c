@@ -149,11 +149,15 @@ int vless_connect(const struct vless_node *node, struct transport *conn, int tim
     conn->link.plain = 1;
     return 0;
 }
+/* Что ушло узлу, подряд — ради стенда переупорядочивания: байты обязаны уйти в порядке потока. */
+static unsigned char g_sent[65536];
+static size_t g_sent_n;
 int transport_write(struct transport *c, const unsigned char *d, size_t n) {
-    (void)c; (void)d;
+    (void)c;
     g_send_calls++;
     g_send_last_n = n;
     if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
+    if (g_send_rc == 0 && g_sent_n + n <= sizeof(g_sent)) { memcpy(g_sent + g_sent_n, d, n); g_sent_n += n; }
     return g_send_rc;
 }
 int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
@@ -430,6 +434,64 @@ static void t_out_of_order_dupack(void) {
     check(n == 1 && last.ack == 1101 && c->client_seq == 1101,
           "I-321: повтор принятого — не принят дважды, ACK с текущим номером");
     conn_drop(c);
+    dev_drain(NULL);
+}
+
+/* Сегменты клиента не по порядку откладываются и разбираются, когда дыра закрыта (ooo_hold, ooo_drain):
+ * переупорядочивание на устройстве больше не стоит клиенту таймаута повтора (стенд sigpipe). Три
+ * сегмента A, B, C приходят как C, B, A: до A ничего не подтверждено и узлу не ушло, после A — узел
+ * получил A, B, C подряд, клиенту — один ACK на всё, отложенное освобождено. */
+static void t_out_of_order_hold(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "не по порядку: соединение не открылось"); return; }
+    unsigned char a[100], b[100], cc[100];
+    memset(a, 'a', sizeof(a));
+    memset(b, 'b', sizeof(b));
+    memset(cc, 'c', sizeof(cc));
+    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, a, sizeof(a));      /* заголовок VLESS уходит с первыми данными */
+    flush_acks(&g_tun);
+    dev_drain(NULL);
+    size_t base = g_sent_n;
+    cli_send_more(1201, 2, TCP_ACK | TCP_PSH, 65535, cc, sizeof(cc));
+    cli_send_more(1101, 2, TCP_ACK | TCP_PSH, 65535, b, sizeof(b));
+    up_flush(&g_tun);
+    flush_acks(&g_tun);
+    struct flow_key last;
+    memset(&last, 0, sizeof(last));
+    dev_drain(&last);
+    check(c->client_seq == 1301 && last.ack == 1301 && g_sent_n - base == 200 &&
+          memcmp(g_sent + base, b, 100) == 0 && memcmp(g_sent + base + 100, cc, 100) == 0 && !c->ooo,
+          "не по порядку: C раньше B — B закрыл дыру, C разобран следом, узлу B и C подряд");
+
+    /* Обгон на два сегмента и повтор уже отложенного. */
+    base = g_sent_n;
+    unsigned char e[100], f[100], g[100];
+    memset(e, 'e', sizeof(e));
+    memset(f, 'f', sizeof(f));
+    memset(g, 'g', sizeof(g));
+    cli_send_more(1501, 2, TCP_ACK | TCP_PSH, 65535, g, sizeof(g));
+    cli_send_more(1401, 2, TCP_ACK | TCP_PSH, 65535, f, sizeof(f));
+    cli_send_more(1501, 2, TCP_ACK | TCP_PSH, 65535, g, sizeof(g));   /* повтор отложенного */
+    up_flush(&g_tun);
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    dev_drain(&last);
+    check(c->client_seq == 1301 && last.ack == 1301 && g_sent_n == base && c->ooo && c->ooo->n == 2,
+          "не по порядку: до закрытия дыры — ничего не подтверждено и узлу не ушло, отложено два");
+    cli_send(1301, 2, TCP_ACK | TCP_PSH, 65535, e, sizeof(e));
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    dev_drain(&last);
+    check(c->client_seq == 1601 && last.ack == 1601 && g_sent_n - base == 300 &&
+          memcmp(g_sent + base, e, 100) == 0 && memcmp(g_sent + base + 100, f, 100) == 0 &&
+          memcmp(g_sent + base + 200, g, 100) == 0 && !c->ooo && g_ooo_bytes == 0,
+          "не по порядку: дыра закрыта — E, F, G подряд, один ACK на всё, память освобождена");
+
+    /* Закрытие соединения с отложенным — память возвращается. */
+    cli_send_more(1701, 2, TCP_ACK | TCP_PSH, 65535, g, sizeof(g));
+    check(c->ooo && g_ooo_bytes > 0, "не по порядку: отложено перед закрытием");
+    conn_drop(c);
+    check(g_ooo_bytes == 0, "не по порядку: закрытие соединения освобождает отложенное");
     dev_drain(NULL);
 }
 
@@ -2822,6 +2884,7 @@ int main(void) {
     t_sendagain_retry();
     t_sendagain_eof();
     t_out_of_order_dupack();
+    t_out_of_order_hold();
     t_window_scale();
     t_release_last_sleep();
     t_bad_uuid();
