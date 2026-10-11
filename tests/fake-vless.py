@@ -281,6 +281,11 @@ class Handler(socketserver.BaseRequestHandler):
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # Очередь входящих — как у настоящего сервера, а не 5 по умолчанию у socketserver: при десятках
+    # одновременных соединений (run-tunnel-mt) лишние SYN ядро отбрасывало, и связь туннеля с узлом
+    # вставала на повтор SYN — данные приходили ступенями через 1, 2, 3, 4 с, и стенд мерил очередь
+    # стенда, а не туннель.
+    request_queue_size = 512
 
 
 def main():
