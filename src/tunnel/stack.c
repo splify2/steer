@@ -49,6 +49,9 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/stat.h>
+#include <linux/netfilter_ipv4.h>
 
 #include "tun.h"
 #include "rtx.h"
@@ -58,6 +61,7 @@
 #include "spec.h"
 #include "run.h"
 #include "thrstack.h"
+#include "platform.h"
 
 /* ---- журнал с уровнем --------------------------------------------------------
  *
@@ -310,12 +314,22 @@ struct conn {
     /* Сегменты клиента, пришедшие РАНЬШЕ ожидаемого (ooo_hold), или NULL. Заводится только при
      * переупорядочивании и освобождается, как только дыра закрыта. */
     struct ooo *ooo;
+    /* Сокет клиента + 1, если TCP клиента завершило ядро (R-152: nft redirect к слушателю модуля); 0 —
+     * соединение пришло пакетами через TUN. +1 — чтобы обнулённая запись (memset в conn_drop) не
+     * значила «сокет 0». У сокетного соединения кольцо rtx — то, что ещё не дописано клиенту в сокет, а
+     * early — то, что не принял узел; повторов, окна и подтверждений у него нет: это работа ядра. */
+    int cfd1;
+    /* Что сокет клиента ждёт в epoll: CARM_IN, CARM_OUT; CARM_ADDED — сокет уже в наборе. */
+    uint8_t carmed;
 };
 
 /* Горячая запись обязана оставаться маленькой — в этом весь смысл разделения. Проверка
  * сборкой, а не обещанием в комментарии: буфер, добавленный сюда «на время отладки», иначе
  * вернёт таблицу к 5,8 МБ, и заметить это можно будет только по скорости на роутере. */
-typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
+/* 200, а не 192, — переходно (R-152): сокет клиента (cfd1, carmed) добавлен, а поля собственного приёмника
+ * TCP (номера, окно, кольцо повтора, отложенные сегменты) уходят на шаге 5 вместе с ним, и запись станет
+ * заметно меньше прежних 192. */
+typedef char conn_hot_size_check[sizeof(struct conn) <= 200 ? 1 : -1];
 
 /* ---- сегменты клиента не по порядку ------------------------------------------------------------
  *
@@ -361,6 +375,15 @@ static void ooo_free(struct conn *c) {
 /* Метка события сокета дайлера с DC_INLOOP (stack_loop_watch); TUN и eventfd — MAX_CONNS и MAX_CONNS + 1. */
 #define LOOP_TOKEN (MAX_CONNS + 2)
 #define AUX_BIT 0x40000000u   /* в data события epoll: вторая связь дайлера этого соединения */
+#define SOCK_BIT 0x20000000u  /* в data события epoll: сокет клиента этого соединения (R-152) */
+#define CARM_IN    1
+#define CARM_OUT   2
+#define CARM_ADDED 0x80
+static inline int conn_cfd(const struct conn *c) { return c->cfd1 - 1; }
+
+/* Порт слушателя TCP модуля (R-152); 0 — слушателя нет, TCP приходит пакетами через TUN. Задаётся до
+ * запуска рабочих (STEER_TUN_TCPPORT), дальше только читается. */
+static int g_kport;
 
 /* Сколько ждём подтверждений после закрытия сервером. Секунды, а не «сколько понадобится»:
  * клиент мог уйти совсем, и тогда кольцо не опустеет никогда. */
@@ -680,6 +703,9 @@ static void rtx_widen_if_self_bound(struct conn *c) {
  * Не const: обнаружив, что мешает размер кольца, мы его тут же и растягиваем — иначе
  * проверка вечно отвечала бы «нет» по причине, которую сама же и создаёт. */
 static int client_can_take_record(struct conn *c) {
+    /* Сокет клиента: принять можно, пока в кольце недописанного есть место под проход дайлера. Окно
+     * клиента держит ядро — по нему и пишет в сокет. */
+    if (c->cfd1) return RTX_CAP - c->rtx.len >= CLIENT_ROOM_RESERVE;
     uint32_t inflight = c->our_seq - c->client_ack;
     uint32_t room = client_room(c);
     if (room <= inflight || room - inflight < CLIENT_ROOM_RESERVE) {
@@ -1716,7 +1742,10 @@ static struct conn *conn_new(const struct tun_dev *tun) {
     /* RST — только вытесняемому TCP: он ждёт ответа по открытому соединению и без отказа
      * досиживал бы до своего таймаута. У потока UDP такого ожидания нет вовсе, а RST на
      * датаграмму — пакет, которого клиентский стек не поймёт. */
-    if (!old->is_udp) {
+    if (old->cfd1) {
+        struct linger lg = { 1, 0 };     /* вытеснение — RST клиенту, как у соединения из TUN */
+        setsockopt(conn_cfd(old), SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    } else if (!old->is_udp) {
         unsigned char rst[64];
         size_t rl = tcp_build(rst, sizeof(rst), old->key.dst, old->key.src,
                               old->key.dport, old->key.sport,
@@ -1756,6 +1785,9 @@ static void conn_drop(struct conn *c) {
     rtx_done(&c->rtx);
     free(c->early);
     ooo_free(c);
+    /* Сокет клиента: обычное закрытие — ядро допишет отданное и пошлёт FIN; RST — если conn_reset
+     * поставил SO_LINGER 0. Из epoll его снимает само закрытие. */
+    if (c->cfd1) close(conn_cfd(c));
     /* Толстую половину НЕ трём целиком: десятки килобайт memset на каждое закрытие — это
      * десятки килобайт, прогнанных через кэш ради нулей, которые всё равно перепишет открытие
      * связи. Сессию к новому соединению готовит дайлер (clear), трогая только её начало. */
@@ -1824,6 +1856,12 @@ static void send_synack(struct conn *c, const struct tun_dev *tun) {
  * потерянной датаграмме. */
 static void conn_reset(struct conn *c, const struct tun_dev *tun) {
     if (c->is_udp) { conn_drop(c); return; }
+    if (c->cfd1) {
+        struct linger lg = { 1, 0 };     /* закрытие с SO_LINGER 0 — RST клиенту */
+        setsockopt(conn_cfd(c), SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        conn_drop(c);
+        return;
+    }
     unsigned char rst[64];
     /* Клиент принимает RST только с номером, РАВНЫМ ожидаемому (RFC 5961); номер внутри окна, но не
      * тот, — повод для «challenge ACK», а соединение у него остаётся. Пока в пути есть
@@ -2001,7 +2039,26 @@ static int emit_dgram(void *arg, const unsigned char *p, size_t n) {
  * Отказ записи возвращает -1 только вызывающему из emit_to_client (там он значит «клиент не принять не может,
  * соединение разорвано»); итоговый сброс в конце порции отказ не рвёт: байты остались в кольце, our_seq на них
  * уже ушёл, и повторит их таймер повтора — тот же путь, что у любого потерянного сегмента. */
+/* Дописать клиенту в сокет то, что лежит в кольце (R-152). Сокет полон — остаток ждёт EPOLLOUT; сокет
+ * клиента умер — client_gone, закроет проход сроков (здесь соединение не закрывается: зовут из прохода
+ * чтения, который ещё держит его). -1 — сокет умер. */
+static int sock_flush(struct conn *c) {
+    while (c->rtx.len) {
+        uint32_t first = c->rtx.cap - c->rtx.head;
+        if (first > c->rtx.len) first = c->rtx.len;
+        struct iovec iov[2] = { { c->rtx.buf + c->rtx.head, first }, { c->rtx.buf, c->rtx.len - first } };
+        ssize_t w = writev(conn_cfd(c), iov, iov[1].iov_len ? 2 : 1);
+        if (w > 0) { rtx_drop(&c->rtx, (uint32_t)w); c->last = g_now_s; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        c->client_gone = 1;
+        return -1;
+    }
+    return 0;
+}
+
 static int tx_flush(struct conn *c, const struct tun_dev *tun, int final) {
+    if (c->cfd1) return sock_flush(c);
     while (c->tx_unsent && (final || c->tx_unsent >= (uint32_t)g_tx_batch_max)) {
         uint32_t n = c->tx_unsent < (uint32_t)g_tx_batch_max ? c->tx_unsent : (uint32_t)g_tx_batch_max;
         uint32_t start = c->rtx.head + (c->rtx.len - c->tx_unsent);
@@ -2053,6 +2110,11 @@ static int emit_to_client(struct conn *c, const struct tun_dev *tun,
         TR("буфер повтора полон (%u из %u) — не отправляю %zu байт\n",
            c->rtx.len, c->rtx.cap, n);
         return -1;
+    }
+    if (c->cfd1) {
+        /* Сокет клиента: в кольцо недописанного, в сокет — одной записью в конце прохода (tx_flush). */
+        rtx_push(&c->rtx, p, (uint32_t)n);
+        return 0;
     }
     if (!c->rtx.len) { c->rtx_at = g_now_ns; c->rto_ms = rto_floor(); }
     rtx_push(&c->rtx, p, (uint32_t)n);
@@ -3031,7 +3093,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
 static void flush_acks(const struct tun_dev *tun) {
     for (int li = 0; li < g_live_n; li++) {
         struct conn *c = &g_conns[g_live[li]];
-        if (!c->ack_due) continue;
+        if (!c->ack_due || c->cfd1) continue;
         c->ack_due = 0;
         if (!c->is_udp) {
             long r = conn_room(c);
@@ -3139,7 +3201,7 @@ void tun_bring_up(const char *dev, int table) {
 static __thread int g_win_woke;
 
 static void room_watch(struct conn *c) {
-    if (c->is_udp || c->srv_closed || !c->used) return;
+    if (c->is_udp || c->srv_closed || !c->used || c->cfd1) return;   /* у сокета окно держит ядро */
     long r = conn_room(c);
     if (r < 0) return;
     uint32_t now_r = r > 0x7FFFFFFF ? 0x7FFFFFFFu : (uint32_t)r;
@@ -3327,13 +3389,18 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
         }
     }
 
-    room_watch(c);
+    if (c->cfd1) {
+        /* Сокет клиента умер (запись или чтение отказали) — закрыть, узлу больше некому отдавать. */
+        if (c->client_gone) { conn_drop(c); return 1; }
+    } else {
+        room_watch(c);
 
-    /* Истёкшие сроки — повторяем. После обработки пакетов, а не до: подтверждение,
-     * приехавшее в этом же витке, могло снять надобность. */
-    if (c->rtx.len && c->rtx_at &&
-        (now - c->rtx_at) / 1000000 >= c->rto_ms)
-        rtx_resend(c, tun, "истёк таймаут");
+        /* Истёкшие сроки — повторяем. После обработки пакетов, а не до: подтверждение,
+         * приехавшее в этом же витке, могло снять надобность. */
+        if (c->rtx.len && c->rtx_at &&
+            (now - c->rtx_at) / 1000000 >= c->rto_ms)
+            rtx_resend(c, tun, "истёк таймаут");
+    }
 
     /* Оборванная связь или узел, который больше не активен: RST клиенту сразу, без
      * дожидания подтверждений — данных за обрывом всё равно не будет (у UDP — просто
@@ -3364,6 +3431,7 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
     /* Закрытые сервером: как только клиент подтвердил всё — FIN и закрываем. Если не
      * подтвердил за отведённое время, закрываем всё равно: клиент мог уйти совсем. */
     if (c->srv_closed) {
+        if (c->cfd1 && c->rtx.len && sock_flush(c) < 0) { conn_drop(c); return 1; }
         int drained = c->rtx.len == 0;
         if (!drained && (now - c->closed_at) / 1000000 < CLOSE_DRAIN_MS) return 0;
         if (!drained)
@@ -3373,13 +3441,15 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
          * FIN занимает номер, а Linux не шлёт ничего в нулевое окно. Собственный FIN клиента
          * ждал бы обновления окна, которое не придёт (сокет навсегда в LAST-ACK,
          * tests/run-tunnel-fin.sh, случай separate). */
-        unsigned char fin[64];
-        size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
-                              c->key.dport, c->key.sport,
-                              c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
-                              NULL, 0, rcv_win_field(c), 0, -1);
-        if (fl) tun_write_ctl(tun, fin, fl);
-        conn_drop(c);
+        if (!c->cfd1) {
+            unsigned char fin[64];
+            size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
+                                  c->key.dport, c->key.sport,
+                                  c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
+                                  NULL, 0, rcv_win_field(c), 0, -1);
+            if (fl) tun_write_ctl(tun, fin, fl);
+        }
+        conn_drop(c);                       /* у сокета FIN пошлёт само закрытие */
         return 1;
     }
 
@@ -3414,6 +3484,203 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
 
 /* Что нужно потоку, чтобы работать: своя очередь устройства и свой номер. Больше ничего —
  * дайлер общий (g_dl), а остальное состояние у потока собственное (__thread и его таблицы). */
+/* ---- TCP через слушатель модуля (R-152) -----------------------------------------------------------
+ *
+ * ЗАЧЕМ. TCP клиента завершает ядро: правило steer в nat (prerouting и output) по метке выхода делает
+ * redirect на порт модуля, и соединение приходит сюда обычным сокетом. Прототип на одном стенде
+ * (без VLESS): 21-27 Гбит/с при 0,22-0,27 с процессора на ГиБ против 0,59 вниз и 1,04 вверх у
+ * собственного приёмника TCP в TUN — и SACK, переупорядочивание, контроль перегрузки ядро даёт
+ * само (I-512 был ровно про это). Решение владельца 2026-10-11, R-152 в хабе.
+ *
+ * Соединение — та же struct conn рабочего, с пулом, запасными и установщиками; сторона клиента —
+ * сокет (cfd1). Из сокета — крупными чтениями прямо дайлеру; узел не принял (SEND_AGAIN) — остаток в
+ * early, и сокет не читается, пока early не ушёл: окно клиенту держит ядро само. Из дайлера — в кольцо
+ * rtx и одной записью в сокет в конце прохода; сокет полон — EPOLLOUT, и у узла не читаем.
+ *
+ * ПРИНИМАЕТСЯ ТОЛЬКО ПЕРЕНАПРАВЛЕННОЕ. Порт слушателя открыт на всех адресах; подключение прямо к нему
+ * (назначение — сам этот адрес и порт) закрывается сразу, иначе любой в сети получил бы прокси.
+ * Перенаправленное ядро помнит в conntrack, и SO_ORIGINAL_DST отдаёт исходное назначение.
+ *
+ * ПОДДЕЛЬНЫЙ АДРЕС. Правило redirect стоит раньше dnat fake-IP (у соединения одна привязка NAT), поэтому
+ * сюда приходит поддельный адрес; настоящий берём из файла состояния резолвера (fakeip.state:
+ * «домен\tподдельный\tнастоящий»), перечитывая его, только когда адреса нет и файл менялся. */
+#define FAKE4_BASE 0xC6120000u              /* 198.18.0.0/15 — пул резолвера (dnsd_int.h) */
+#define FAKE4_SIZE 0x00020000u
+struct fake_pair { uint32_t fake, real; };  /* хостовый порядок у fake, сетевой у real */
+static __thread struct fake_pair *g_fp;
+static __thread size_t g_fp_n;
+static __thread time_t g_fp_mtime;
+
+static int fp_cmp(const void *a, const void *b) {
+    uint32_t x = ((const struct fake_pair *)a)->fake, y = ((const struct fake_pair *)b)->fake;
+    return x < y ? -1 : x > y;
+}
+
+static void fake_load(void) {
+    char path[512];
+    if (snprintf(path, sizeof(path), "%s/fakeip.state", steer_state_dir()) >= (int)sizeof(path)) return;
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_mtime == g_fp_mtime) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    g_fp_mtime = st.st_mtime;
+    size_t cap = 256, n = 0;
+    struct fake_pair *a = malloc(cap * sizeof(*a));
+    char line[512];
+    while (a && fgets(line, sizeof(line), f)) {
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        char *t2 = strchr(t1 + 1, '\t');
+        if (!t2) continue;
+        *t2 = 0;
+        char *t3 = strpbrk(t2 + 1, "\t\n");
+        if (t3) *t3 = 0;
+        struct in_addr fk, rl;
+        if (inet_pton(AF_INET, t1 + 1, &fk) != 1 || inet_pton(AF_INET, t2 + 1, &rl) != 1) continue;
+        if (n == cap) {
+            struct fake_pair *b = realloc(a, cap * 2 * sizeof(*a));
+            if (!b) break;
+            a = b;
+            cap *= 2;
+        }
+        a[n].fake = ntohl(fk.s_addr);
+        a[n].real = rl.s_addr;
+        n++;
+    }
+    fclose(f);
+    if (!a) return;
+    qsort(a, n, sizeof(*a), fp_cmp);
+    free(g_fp);
+    g_fp = a;
+    g_fp_n = n;
+}
+
+/* Настоящий адрес для поддельного (сетевой порядок) или 0 — не знаем. */
+static uint32_t fake_real(uint32_t fake_be) {
+    struct fake_pair key = { ntohl(fake_be), 0 };
+    for (int pass = 0; pass < 2; pass++) {
+        struct fake_pair *hit = g_fp_n ? bsearch(&key, g_fp, g_fp_n, sizeof(*g_fp), fp_cmp) : NULL;
+        if (hit && hit->real) return hit->real;
+        if (pass == 0) fake_load();
+    }
+    return 0;
+}
+
+static void sock_rst_close(int fd) {
+    struct linger lg = { 1, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    close(fd);
+}
+
+/* Принять перенаправленные соединения: до 64 за событие, остальные — следующим витком. */
+static void kaccept(int lfd, const struct tun_dev *tun) {
+    for (int k = 0; k < 64; k++) {
+        struct sockaddr_in peer, od, me;
+        socklen_t pl = sizeof(peer), ol = sizeof(od), ml = sizeof(me);
+        int fd = accept4(lfd, (struct sockaddr *)&peer, &pl, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) return;
+        if (getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, &od, &ol) != 0 ||
+            getsockname(fd, (struct sockaddr *)&me, &ml) != 0 ||
+            (od.sin_addr.s_addr == me.sin_addr.s_addr && od.sin_port == me.sin_port)) {
+            close(fd);                      /* не перенаправленное — прямо к порту модуля */
+            continue;
+        }
+        uint32_t dst = od.sin_addr.s_addr;
+        uint32_t dh = ntohl(dst);
+        if (dh - FAKE4_BASE < FAKE4_SIZE) {
+            uint32_t real = fake_real(dst);
+            if (!real) {
+                static __thread time_t said;
+                if (g_now_s - said >= 10) {
+                    said = g_now_s;
+                    char a[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &dst, a, sizeof(a));
+                    fprintf(stderr, LOG_W "поддельный адрес %s без настоящего в fakeip.state — соединение "
+                                    "сброшено\n", a);
+                }
+                sock_rst_close(fd);
+                continue;
+            }
+            dst = real;
+        }
+        struct flow_key key;
+        memset(&key, 0, sizeof(key));
+        key.src = peer.sin_addr.s_addr;
+        key.dst = dst;
+        key.sport = ntohs(peer.sin_port);
+        key.dport = ntohs(od.sin_port);
+        key.proto = 6;
+        struct conn *c = conn_new(tun);
+        if (!c) { sock_rst_close(fd); continue; }
+        memset(c, 0, sizeof(*c));
+        c->used = 1;
+        c->born_turn = g_turn;
+        c->room_seen = UINT32_MAX;
+        c->key = key;
+        c->fd = -1;
+        c->aux = -1;
+        c->cfd1 = fd + 1;
+        c->last = g_now_s;
+        c->estab_ns = g_now_ns ? g_now_ns : 1;
+        conn_link(c);
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), &key, 0) != 0) { conn_reset(c, tun); continue; }
+        if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
+            c->fd = g_dl->ops->fd(SESS(c));
+            node_sock_silence(c->fd);
+            spare_refill();
+            continue;
+        }
+        if (conn_submit(c) != 0) {
+            static __thread time_t said_q;
+            if (g_now_s - said_q >= 5) {
+                said_q = g_now_s;
+                fprintf(stderr, LOG_W "очередь установки соединений полна (%d), соединение сброшено\n", CONNQ);
+            }
+            conn_reset(c, tun);
+            continue;
+        }
+        c->pending = 1;                     /* установщик заполняет сессию; сокет не трогаем до готовности */
+        spare_refill();
+    }
+}
+
+/* Из сокета клиента — узлу. Крупными чтениями, сколько дайлер примет за раз; узел не принял — остаток в
+ * early и сокет не читаем (окно клиенту держит ядро). Не больше четырёх чтений за событие, чтобы одна
+ * выгрузка не держала цикл. */
+static void sock_read(struct conn *c, const struct tun_dev *tun) {
+    static __thread unsigned char buf[TUNNEL_GATHER_MAX];
+    for (int k = 0; k < 4 && c->used && !c->early && !c->client_fin && !c->srv_closed; k++) {
+        size_t cap = conn_up_max(c);
+        if (cap > sizeof(buf)) cap = sizeof(buf);
+        long room = conn_room(c);
+        if (room >= 0 && (size_t)room < cap) cap = (size_t)room;
+        if (!cap) return;
+        ssize_t n = read(conn_cfd(c), buf, cap);
+        if (n > 0) {
+            c->last = g_now_s;
+            int sr = upstream_send(c, buf, (size_t)n);
+            if (sr == SEND_OK) continue;
+            if (sr == SEND_AGAIN) {
+                c->early = malloc((size_t)n);
+                if (!c->early) { conn_reset(c, tun); return; }
+                memcpy(c->early, buf, (size_t)n);
+                c->early_n = c->early_cap = (uint32_t)n;
+                c->early_off = 0;
+                return;
+            }
+            conn_node_lost(c);
+            conn_reset(c, tun);
+            return;
+        }
+        if (n == 0) { c->client_fin = 1; return; }
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+        c->client_gone = 1;
+        return;
+    }
+}
+
 struct worker {
     struct tun_dev tun;
     int id;
@@ -3514,6 +3781,28 @@ static void *worker_loop(void *arg) {
         if (epoll_ctl(ep, EPOLL_CTL_ADD, efd, &e) != 0) { close(efd); efd = -1; }
     }
     g_conn_efd = efd;
+    /* Слушатель TCP (R-152): свой на рабочего, SO_REUSEPORT — ядро само раскладывает соединения по
+     * рабочим, и каждое целиком у того, кто его принял. Не встал — TCP идёт прежним путём через TUN, а
+     * правило redirect демон ставит только по сообщённому порту. */
+    const uint32_t LST_TOKEN = MAX_CONNS + 2;
+    int lfd = -1;
+    if (g_kport > 0) {
+        lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        int one = 1;
+        struct sockaddr_in la = { .sin_family = AF_INET, .sin_port = htons((uint16_t)g_kport),
+                                  .sin_addr.s_addr = htonl(INADDR_ANY) };
+        if (lfd < 0 || setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
+            setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0 ||
+            bind(lfd, (struct sockaddr *)&la, sizeof(la)) != 0 || listen(lfd, 4096) != 0) {
+            fprintf(stderr, LOG_W "слушатель TCP на порту %d не встал (%s) — TCP идёт через TUN\n",
+                    g_kport, strerror(errno));
+            if (lfd >= 0) close(lfd);
+            lfd = -1;
+        } else {
+            struct epoll_event e = { .events = EPOLLIN, .data = { .u32 = LST_TOKEN } };
+            epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &e);
+        }
+    }
     /* Читатель будит этот же eventfd: побудка от установщика и от читателя — одно и то же «проснись и
      * посмотри», а разбор всего сразу — в витке. Ставится ДО state: читатель не начнёт, пока не доложат
      * все, и увидит дескриптор. */
@@ -3616,6 +3905,20 @@ static void *worker_loop(void *arg) {
                     c->armed = ARM_IN;
             }
             aux_sync(ep, c);
+            if (c->cfd1) {
+                /* Сокет клиента: читать — пока узел принимает (нет недоотправленного, есть место), клиент
+                 * не закрыл свою сторону и узел не закрыл свою; ждать записи — пока есть недописанное. */
+                long kroom = conn_room(c);
+                unsigned ca = (!c->early && !c->client_fin && !c->srv_closed && kroom != 0 ? CARM_IN : 0u) |
+                              (c->rtx.len ? CARM_OUT : 0u);
+                if ((c->carmed & (CARM_IN | CARM_OUT)) != ca || !(c->carmed & CARM_ADDED)) {
+                    struct epoll_event e = { .events = (ca & CARM_IN ? EPOLLIN : 0u) | (ca & CARM_OUT ? EPOLLOUT : 0u),
+                                             .data = { .u32 = SOCK_BIT | (uint32_t)(c - g_conns) } };
+                    int op = (c->carmed & CARM_ADDED) ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+                    if (epoll_ctl(ep, op, conn_cfd(c), &e) == 0) c->carmed = (uint8_t)(ca | CARM_ADDED);
+                }
+                if (c->early && wait_ms > 10) wait_ms = 10;   /* недоотправленное — повтор скоро */
+            }
             /* Данные уже у нас, и ядро о них не сообщит: разберём их без ожидания. */
             if (want && c->rx_ready) forced++;
             if (c->rx_ready) rx_any = 1;
@@ -3718,6 +4021,7 @@ static void *worker_loop(void *arg) {
         int tun_ready = own_tun && tun_buffered(&tun);
         for (int i = 0; i < r; i++) {
             if (evs[i].data.u32 == TUN_TOKEN) tun_ready = 1;
+            else if (evs[i].data.u32 == LST_TOKEN && lfd >= 0) kaccept(lfd, &tun);
             else if (evs[i].data.u32 == EFD_TOKEN && efd >= 0) {
                 uint64_t drained;
                 ssize_t rd = read(efd, &drained, sizeof(drained));
@@ -3816,6 +4120,15 @@ static void *worker_loop(void *arg) {
                 aux_event(ep, &g_conns[evs[i].data.u32 & ~AUX_BIT]);
                 continue;
             }
+            if (evs[i].data.u32 & SOCK_BIT) {
+                struct conn *c = &g_conns[evs[i].data.u32 & ~SOCK_BIT];
+                if (!c->used || !c->cfd1 || c->pending) continue;
+                if (evs[i].events & EPOLLOUT) {
+                    if (sock_flush(c) == 0 && c->rx_ready && client_can_take_record(c)) rx_dirty = 1;
+                }
+                if (evs[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) sock_read(c, &tun);
+                continue;
+            }
             if (evs[i].data.u32 >= (uint32_t)MAX_CONNS) continue;  /* TUN и eventfd */
             struct conn *c = &g_conns[evs[i].data.u32];
             /* Слот мог освободиться в этом же витке — на FIN или RST от клиента — и даже
@@ -3906,6 +4219,7 @@ static void *worker_loop(void *arg) {
     g_conn_efd = -1;
     close(ep);
     if (own_tun) close(tun_fd);
+    if (lfd >= 0) close(lfd);
     /* Рабочий вышел — читателю больше некому отдавать, и процесс должен завершиться. */
     if (rw) __atomic_store_n(&g_ring_stop, 1, __ATOMIC_RELAXED);
     return NULL;
@@ -4104,6 +4418,12 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     g_stats = getenv("STEER_TUN_STATS") != NULL;
     g_tx_nobatch = getenv("STEER_TUN_NOTXBATCH") != NULL;
+    /* Порт слушателя TCP (R-152): соединения клиентов, перенаправленные правилом nft, принимаются здесь, а не
+     * пакетами через TUN. Пока порт задаёт окружение; демон будет передавать его вместе со спекой. */
+    if (getenv("STEER_TUN_TCPPORT")) {
+        int pt = atoi(getenv("STEER_TUN_TCPPORT"));
+        if (pt > 0 && pt < 65536) g_kport = pt;
+    }
     if (getenv("STEER_TUN_TXBATCH")) {
         int seg = atoi(getenv("STEER_TUN_TXBATCH"));
         if (seg >= 1 && seg <= 44) g_tx_batch_max = seg * TUN_MSS;
