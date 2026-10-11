@@ -55,6 +55,7 @@ static int set_hostport(struct vless_node *n, const char *s, size_t len) {
         if (!rb || rb[1] != ':') return -1;
         *rb = '\0';
         sl_set_field(n->host, sizeof(n->host), buf + 1, strlen(buf + 1));
+        sl_host_zone_decode(n->host);
         colon = rb + 1;
     } else {
         colon = strrchr(buf, ':');

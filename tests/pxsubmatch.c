@@ -68,6 +68,26 @@ static void test_parse(void) {
     check("want фильтр: ss при want=vmess — не наша", -1, px_parse_url("ss://aes-128-gcm:p@h.example:1", &n, PX_VMESS));
     check("не наша схема", -1, px_parse_url("wireguard://x@h:1", &n, 0));
     check("адрес «отвечать некому»", 1, px_parse_url("ss://aes-128-gcm:p@127.0.0.1:1", &n, 0));
+
+    /* ---- узел по адресу IPv6 (issue splify2/steer#7): во всех формах ссылок ---- */
+    check("trojan [IPv6]", 0, px_parse_url("trojan://pass@[2001:db8::1]:443?security=tls&sni=s.example", &n, 0));
+    check_str("trojan: хост без скобок", "2001:db8::1", n.vn.host);
+    check("trojan: порт", 443, n.vn.port);
+    check("trojan [IPv6] без порта — не разбирается", -1, px_parse_url("trojan://pass@[2001:db8::1]?security=tls&sni=s", &n, 0));
+    check("ss SIP002 [IPv6]", 0, px_parse_url("ss://aes-256-gcm:secret@[2001:db8::2]:8388#n", &n, 0));
+    check_str("ss: хост", "2001:db8::2", n.vn.host);
+    check("ss: порт", 8388, n.vn.port);
+    check("ss base64 userinfo + [IPv6]", 0, px_parse_url("ss://YWVzLTEyOC1nY206cGFzcw==@[2001:db8::3]:1234", &n, 0));
+    check_str("ss base64: хост", "2001:db8::3", n.vn.host);
+    check("socks5 [IPv6]", 0, px_parse_url("socks5://u:p@[2001:db8::4]:1080", &n, 0));
+    check_str("socks5: хост", "2001:db8::4", n.vn.host);
+    check("socks5: порт", 1080, n.vn.port);
+    check("socks без userinfo [IPv6]", 0, px_parse_url("socks://[2001:db8::5]:1080", &n, 0));
+    check_str("socks: хост", "2001:db8::5", n.vn.host);
+    check("http [IPv6]", 0, px_parse_url("http://u:p@[2001:db8::6]:3128", &n, 0));
+    check_str("http: хост", "2001:db8::6", n.vn.host);
+    check("socks [fe80::1%25br-lan] — зона", 0, px_parse_url("socks5://[fe80::1%25br-lan]:1080", &n, 0));
+    check_str("зона: «%25» свёрнут в «%»", "fe80::1%br-lan", n.vn.host);
 }
 
 static void test_sub(void) {

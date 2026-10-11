@@ -83,6 +83,15 @@ int sl_host_leads_nowhere(const char *h) {
     return 0;
 }
 
+/* Зона link-local в адресе из ссылки: в URL знак «%» пишется «%25» (RFC 6874), `[fe80::1%25br-lan]`.
+ * getaddrinfo ждёт «fe80::1%br-lan», поэтому «%25» перед зоной сворачивается в «%». Только у
+ * адреса с двоеточием: в имени «%25» — процентное кодирование, и им занимается sl_pct_decode. */
+void sl_host_zone_decode(char *h) {
+    if (!strchr(h, ':')) return;
+    char *z = strstr(h, "%25");
+    if (z) memmove(z + 1, z + 3, strlen(z + 3) + 1);
+}
+
 /* Имя это или адрес. Нужно security=tls: сертификат выдают на имя, и узел, объявленный
  * одним адресом без sni, проверять не против чего.
  *
@@ -673,19 +682,33 @@ int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_
     const char *hash = strchr(p, '#');
     const char *hp_end = hash ? hash : p + strlen(p);
     const char *qmark = memchr(p, '?', (size_t)(hp_end - p));
-    const char *colon = memchr(p, ':', (size_t)((qmark ? qmark : hp_end) - p));
-    if (!colon) return -1;
-    sl_set_field(n->host, sizeof(n->host), p, (size_t)(colon - p));
+    const char *hp_stop = qmark ? qmark : hp_end;
+    /* Хост: имя, IPv4 или IPv6 в квадратных скобках (RFC 3986: `[2001:db8::1]:443`). Без скобок
+     * адрес IPv6 от порта не отличить — такая ссылка не разбирается, как и у Xray. Скобки в
+     * поле хоста не попадают: дальше хост идёт в getaddrinfo, а он скобок не знает. */
+    const char *colon, *hs;
+    size_t hl;
+    if (*p == '[') {
+        const char *rb = memchr(p, ']', (size_t)(hp_stop - p));
+        if (!rb || rb + 1 >= hp_stop || rb[1] != ':' || rb == p + 1) return -1;
+        hs = p + 1; hl = (size_t)(rb - hs); colon = rb + 1;
+    } else {
+        colon = memchr(p, ':', (size_t)(hp_stop - p));
+        if (!colon) return -1;
+        hs = p; hl = (size_t)(colon - p);
+    }
+    sl_set_field(n->host, sizeof(n->host), hs, hl);
+    sl_host_zone_decode(n->host);
     {
         /* Порт — только цифры до конца хоста и в диапазоне 1..65535: atoi давал 4464 на
          * «:70000», 65535 на «:-1» и 443 на «:443abc», и узел шёл не туда. */
         char pnum[8];
         const char *pe = colon + 1;
         size_t pl = 0;
-        while (pe < (qmark ? qmark : hp_end) && *pe >= '0' && *pe <= '9' && pl + 1 < sizeof(pnum))
+        while (pe < hp_stop && *pe >= '0' && *pe <= '9' && pl + 1 < sizeof(pnum))
             pnum[pl++] = *pe++;
         pnum[pl] = '\0';
-        if (!pl || pe != (qmark ? qmark : hp_end)) return -1;
+        if (!pl || pe != hp_stop) return -1;
         n->port = sl_port_of(pnum);
     }
     if (!n->port) return -1;

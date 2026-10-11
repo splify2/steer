@@ -175,6 +175,34 @@ int main(void) {
         check("имя раскодировано из процентной формы", "Узел", n.name);
     }
 
+    /* ---- узел по адресу IPv6 (issue splify2/steer#7) ---------------------------------- */
+    {
+        struct vless_node n;
+        check_n("vless://…@[2001:db8::1]:443 разбирается",
+                0, vless_parse_url("vless://u@[2001:db8::1]:443?security=none&type=tcp#v6", &n));
+        check("IPv6: хост без скобок", "2001:db8::1", n.host);
+        check_n("IPv6: порт", 443, n.port);
+        check("IPv6: имя узла", "v6", n.name);
+        check_n("vless IPv6 без параметров, порт 8443",
+                0, vless_parse_url("vless://u@[2001:db8:0:1::7]:8443#x", &n));
+        check("IPv6: сжатая запись", "2001:db8:0:1::7", n.host);
+        check_n("IPv6: порт 8443", 8443, n.port);
+        check_n("link-local с зоной: fe80::1%25eth0",
+                0, vless_parse_url("vless://u@[fe80::1%25eth0]:443#ll", &n));
+        check("зона: «%25» свёрнут в «%»", "fe80::1%eth0", n.host);
+        check_n("скобка не закрыта — отказ", -1, vless_parse_url("vless://u@[2001:db8::1:443#x", &n));
+        check_n("после скобки нет порта — отказ", -1, vless_parse_url("vless://u@[2001:db8::1]#x", &n));
+        check_n("пустые скобки — отказ", -1, vless_parse_url("vless://u@[]:443#x", &n));
+        check_n("IPv6 без скобок с портом — отказ (адрес от порта не отличить)", -1,
+                vless_parse_url("vless://u@2001:db8::1:443#x", &n));
+        check_n("IPv6 + tls без sni — по-прежнему непригоден (проверять сертификат не против чего)",
+                1, vless_parse_url("vless://u@[2001:db8::1]:443?security=tls#x", &n));
+        check_n("IPv6 + tls + sni — пригоден",
+                0, vless_parse_url("vless://u@[2001:db8::1]:443?security=tls&sni=node.example.org#x", &n));
+        check_n("узел «::1» — отвечать некому",
+                1, vless_parse_url("vless://u@[::1]:443#x", &n));
+    }
+
     /* ---- непригодные узлы: пропущены с причиной, а не выброшены ------------ */
     {
         struct vless_node n;
@@ -370,14 +398,15 @@ int main(void) {
      * Заголовок sub.c обещает: «в ней 26 узлов, а steer видит 17» должно объясняться
      * цифрой. Значит ни одна ссылка не имеет права исчезнуть, не попав ни в один
      * счётчик. До правки исчезали две: IPv6-литерал в host (первое двоеточие
-     * оказывается внутри скобок, порт читается как 0) и ссылка с портом 0. Обе
+     * оказывается внутри скобок, порт читается как 0; сегодня скобочная форма разбирается
+     * — issue #7, — и здесь остаётся IPv6 без скобок, который по-прежнему не разбирается) и ссылка с портом 0. Обе
      * возвращают -1, а -1 не считался нигде — узел пропадал из подписки бесследно. */
     {
         struct vless_node nodes[16];
         struct vless_sub_stats st;
         const char *sub =
             "vless://a@1.2.3.4:443?security=reality&pbk=K&sni=x.com#ok\n"
-            "vless://b@[2001:db8::1]:443?security=reality&pbk=K&sni=x.com#ipv6\n"
+            "vless://b@2001:db8::1:443?security=reality&pbk=K&sni=x.com#ipv6\n"
             "vless://c@5.6.7.8:0?security=reality&pbk=K&sni=x.com#zero-port\n"
             "vless://d@9.9.9.9:443?security=tls#tls\n"
             "hy2://e@10.0.0.1:443#foreign\n";
@@ -483,7 +512,7 @@ int main(void) {
             "vless://b@2.2.2.2:443?security=tls#Второй\n"
             "vless://c@3.3.3.3:443?security=tls#Третий\n"
             "vless://d@4.4.4.4:443?type=kcp&security=none#Вебсокет\n"
-            "vless://e@[2001:db8::1]:443?security=none#IPv6\n"
+            "vless://e@2001:db8::1:443?security=none#IPv6\n"
             "vless://f@6.6.6.6:443?security=reality&pbk=K&sni=x.com#Годный\n";
         size_t n = vless_parse_sub(sub, nodes, 16, &st);
         check_n("причины: пригоден один узел", 1, (long)n);
@@ -505,9 +534,10 @@ int main(void) {
         check("вторая причина: транспорт kcp", "транспорт kcp не поддержан",
               st.reasons[1].reason);
         check("kcp: пример — имя своего узла", "Вебсокет", st.reasons[1].example);
-        /* IPv6-литерал разбор не осиливает и до проверки пригодности не доходит —
-         * причину называет уже сам обход подписки, иначе ссылка снова стала бы
-         * «пропущено на единицу больше» без объяснения. */
+        /* IPv6-литерал БЕЗ скобок разбор не осиливает (адрес от порта не отличить; со скобками
+         * узел разбирается — выше) и до проверки пригодности не доходит — причину называет уже
+         * сам обход подписки, иначе ссылка снова стала бы «пропущено на единицу больше» без
+         * объяснения. */
         check("третья причина: ссылка не разобрана", "ссылка не разобрана",
               st.reasons[2].reason);
     }
