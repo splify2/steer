@@ -64,6 +64,7 @@ int steerd_load(struct steerd *d) {
     free(d->sp);
     d->sp = ns;
     d->gr = ng;
+    tcp_redir_learn(ns);
     d->have = 1;
     d->err[0] = '\0';
     spec_fp(d->spec_path, d->fp);

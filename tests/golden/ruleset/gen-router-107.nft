@@ -68,7 +68,7 @@ table inet steer {
         oifname "wg2" meta nfproto ipv6 counter masquerade comment "steer-nat6:other"
     }
     chain prerouting_dns {
-        type nat hook prerouting priority dstnat; policy accept;
+        type nat hook prerouting priority dstnat - 2; policy accept;
         iifname "steer-nolan0" udp dport 53 counter redirect to :5300
         iifname "steer-nolan0" tcp dport 53 counter redirect to :5300
     }

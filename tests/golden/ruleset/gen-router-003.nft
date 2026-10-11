@@ -10,7 +10,7 @@ table inet steer {
         type filter hook postrouting priority srcnat + 10; policy accept;
     }
     chain prerouting_dns {
-        type nat hook prerouting priority dstnat; policy accept;
+        type nat hook prerouting priority dstnat - 2; policy accept;
         ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300
         meta nfproto ipv6 iifname "br-lan" udp dport 53 counter redirect to :5300
         ip saddr 192.168.1.0/24 tcp dport 53 counter redirect to :5300

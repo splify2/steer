@@ -166,7 +166,7 @@ int out_hy2_node_named(const struct output *o) {
 const struct kind_ops kind_hysteria2 = {
     .name = "hysteria2",
     .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER |
-            KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP,
+            KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP | KC_TCP_REDIR,
     .keys = KK_NODES | KK_SUB,
     .selfnat_why = "masquerade не нужен: туннель завершает TCP сам, адреса клиентов "
                    "наружу не уходят",

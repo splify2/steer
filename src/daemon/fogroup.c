@@ -664,5 +664,6 @@ int cmd_select(const char *spec, const char *group, const char *member) {
     struct err e = {0};
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    tcp_redir_learn(&cfg);
     return fog_select(&cfg, &fo_store_files, group, member, 1, NULL, NULL, stdout);
 }

@@ -1119,6 +1119,8 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         if (h->evfd >= 0) ev_drain(s, h);
         if (h->evfd >= 0) { loop_fd_del(s->l, h->evfd); close(h->evfd); h->evfd = -1; }
         int was_up = h->st.up;
+        /* Слушатель TCP модуля ушёл вместе с процессом (R-152): перенаправление к нему — снять. */
+        if (h->st.bound[0]) tcp_redir_dev_gone(h->st.bound);
         h->st.running = 0;
         h->st.up = 0;
         /* down клиента, следившего за узлом, говорил об узлах этого процесса (пул узлов,

@@ -387,6 +387,7 @@ static void apply_routing_one(const struct output *o) {
              * прежнее устройство. */
             const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
             run(flush);
+            tcp_redir_sync(o, NULL);
             if (out_route6(o)) {
                 /* IPv6 — тем же путём напрямую: правило на месте, таблица пуста. */
                 rule_ensure6(o->mark, o->table);
@@ -566,6 +567,7 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
      * единственным способом снять их правила из ядра. */
     registry_snapshot();
     if (registry_assign(cfg, &e) < 0) err_die(&e);
+    tcp_redir_learn(cfg);
     if (!full) {
         outputs_adopt_active(cfg);
         return;
@@ -864,6 +866,7 @@ int cmd_apply(const char *spec, int dry) {
     apply_routing(&cfg);
     if (ruleset_load(&cfg, &gr) != 0) return 1;
     failopen_after_load(&cfg);
+    tcp_redir_after_load(&cfg);
     /* Карта balance из набора правил — «все члены живы»; сразу к живым по подхвату, как её
      * поставил бы проход (fog_balance_adopt в fogroup.c). */
     fog_balance_adopt(&cfg);
@@ -1141,6 +1144,7 @@ int cmd_apply_commit(int argc, char **argv) {
          * членами: отметки — по таблицам выходов (и тех, что привязаны выше: их отметку приняла
          * прежняя таблица), карты — к живым, как у подкоманды. */
         failopen_after_load(&cfg);
+        tcp_redir_after_load(&cfg);
         fog_balance_adopt(&cfg);
     }
     for (const char *p = a.drop; p && *p; ) {

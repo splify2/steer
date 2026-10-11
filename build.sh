@@ -408,6 +408,12 @@ for spec in $ISAS; do
     # Файл кладётся В ПОЛЕЗНУЮ НАГРУЗКУ, а не в скрипт установки: он обязан исчезнуть вместе
     # с пакетом и принадлежать ему, как init-скрипт.
     cp files/lib/upgrade/keep.d/steer "$root/lib/upgrade/keep.d/steer"
+    # Вход fw4 для перенаправленных к службам steer соединений (гостевые зоны с input REJECT) —
+    # почему, в самом файле. fw4 подхватывает его при перечитывании; postinst перечитывает.
+    mkdir -p "$root/usr/share/nftables.d/chain-pre/input"
+    cp files/usr/share/nftables.d/chain-pre/input/30-steer.nft \
+       "$root/usr/share/nftables.d/chain-pre/input/30-steer.nft"
+    chmod 0644 "$root/usr/share/nftables.d/chain-pre/input/30-steer.nft"
     chmod 0755 "$root/usr/sbin/steerd" "$root/usr/sbin/steer" "$root/usr/sbin/steer-nfqws" \
                "$root/etc/init.d/steer" "$root/etc/hotplug.d/iface/95-steer"
     chmod 0644 "$root/lib/upgrade/keep.d/steer"
@@ -439,6 +445,7 @@ for spec in $ISAS; do
     cat > build/scripts/steer.postinst <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
+[ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null
 if grep -q steer-box-connector /etc/init.d/sing-box 2>/dev/null || [ -e /var/run/steer-box-installing ]; then
 	/etc/init.d/steer stop 2>/dev/null
 	/etc/init.d/steer disable 2>/dev/null
@@ -470,7 +477,8 @@ EOF
     printf '#!/bin/sh\nexit 0\n' > build/scripts/noop.postinst
     cp build/scripts/noop.postinst build/scripts/noop.prerm
     cp build/scripts/noop.postinst build/scripts/noop.postrm
-    printf '#!/bin/sh\nexit 0\n' > build/scripts/steer.postrm
+    # Включение входа fw4 (usr/share/nftables.d) уходит с пакетом — fw4 перечитывает набор без него.
+    printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n[ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null\nexit 0\n' > build/scripts/steer.postrm
     chmod +x build/scripts/*
 
     # pack ИМЯ КОРЕНЬ ЗАВИСИМОСТИ ОПИСАНИЕ ВИД-СКРИПТОВ [КОНФЛИКТЫ] [ЗАМЕНЯЕТ] — оба формата из одного

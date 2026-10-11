@@ -127,6 +127,42 @@ cp "$L/steer-hysteria2" "$empty/steer-hysteria2"
 out="$(STEER_MODULE_DIR="$empty" "$L/steerd" apply --dry-run --spec "$L/hy2spec/spec.yaml" --state-dir "$L/hy2spec/st" 2>&1)"
 check "  с модулем та же спека принимается" "0" "$(printf '%s' "$out" | grep -c 'требует пакет')"
 rm -f "$empty/steer-hysteria2"
+# ---- TCP выхода — к слушателю модуля (R-152, generate.c: build_tcp_redir) ------------------------
+# У выхода-туннеля (vless) набор правил несёт карту «метка → порт» и по цепочке nat на prerouting и
+# output раньше подмены fake-IP (dstnat - 1); заворот DNS — ещё раньше (dstnat - 2). У спеки без
+# такого выхода карты нет вовсе.
+mkdir -p "$L/redirspec"
+printf 'vless://11111111-2222-3333-4444-555555555555@10.0.0.1:443?security=none&type=tcp#n\n' \
+    > "$L/redirspec/sub.txt"
+printf '203.0.113.0/24\n' > "$L/redirspec/p.lst"
+cat > "$L/redirspec/spec.yaml" <<SPEC
+version: 2
+outputs:
+  vl: { kind: tunnel, protocol: vless, subscription: $L/redirspec/sub.txt }
+  wg: { kind: interface, device: wg0 }
+lists:
+  p: { prefixes_file: [$L/redirspec/p.lst] }
+rules:
+  - { name: r, to: [p], out: vl }
+SPEC
+out="$("$L/steerd" apply --dry-run --spec "$L/redirspec/spec.yaml" --state-dir "$L/redirspec/st" 2>&1)"
+check "выход vless: карта tcp_redir «метка → порт»" "1" \
+    "$(printf '%s\n' "$out" | grep -c 'type mark : inet_service')"
+check "  перенаправление на prerouting и output, dstnat - 1, только IPv4 и не адрес роутера" "2 2" \
+    "$(printf '%s\n' "$out" | grep -c 'nat hook \(prerouting\|output\) priority dstnat - 1') $(printf '%s\n' "$out" | grep 'steer-tcp-redir' | grep -c 'ip protocol tcp meta mark and 0x0ff00000 @tcp_redir fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
+check "  заворот DNS раньше (dstnat - 2)" "1" \
+    "$(printf '%s\n' "$out" | grep -A1 'chain prerouting_dns' | grep -c 'priority dstnat - 2')"
+cat > "$L/redirspec/spec2.yaml" <<SPEC
+version: 2
+outputs:
+  wg: { kind: interface, device: wg0 }
+lists:
+  p: { prefixes_file: [$L/redirspec/p.lst] }
+rules:
+  - { name: r, to: [p], out: wg }
+SPEC
+out="$("$L/steerd" apply --dry-run --spec "$L/redirspec/spec2.yaml" --state-dir "$L/redirspec/st2" 2>&1)"
+check "  без выхода-туннеля карты и цепочек нет" "0" "$(printf '%s\n' "$out" | grep -c 'tcp_redir')"
 # Спека с группой замера по https:// читается модулем: свойство «https:// доступен» — системы, и
 # steerd, который меряет, его принимает; модуль разбор не отвергает (раньше слабая ссылка на
 # steer_urltls_present в бинарнике модуля была нулевой, и каждый модуль падал кодом 2).

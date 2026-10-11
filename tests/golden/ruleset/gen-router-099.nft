@@ -127,7 +127,7 @@ table inet steer {
         meta mark and 0x0ff00000 == 0x00700000 tcp dport { 443, 80, 5222 } counter redirect to :8486 comment "steer:tgws:tg"
     }
     chain prerouting_dns {
-        type nat hook prerouting priority dstnat; policy accept;
+        type nat hook prerouting priority dstnat - 2; policy accept;
         iifname "nosuch-steer0" udp dport 53 counter redirect to :5300
         iifname "nosuch-steer0" tcp dport 53 counter redirect to :5300
     }

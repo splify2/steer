@@ -382,8 +382,30 @@ static void ooo_free(struct conn *c) {
 static inline int conn_cfd(const struct conn *c) { return c->cfd1 - 1; }
 
 /* Порт слушателя TCP модуля (R-152); 0 — слушателя нет, TCP приходит пакетами через TUN. Задаётся до
- * запуска рабочих (STEER_TUN_TCPPORT), дальше только читается. */
+ * запуска рабочих (out_tcp_port выхода, стенды — STEER_TUN_TCPPORT), дальше только читается. */
 static int g_kport;
+/* Слушатель рабочего 0 — открыт в stack_run ДО сообщения up: демон по up ставит перенаправление, и
+ * соединение, пришедшее раньше рабочих, ждёт в очереди этого слушателя, а не получает сброс. */
+static int g_lfd0 = -1;
+
+/* Слушатель на g_kport. SO_REUSEPORT — свой у каждого рабочего, ядро само раскладывает соединения
+ * по ним, и каждое целиком у того, кто его принял. -1 — не встал (errno). */
+static int klisten_open(void) {
+    int lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (lfd < 0) return -1;
+    int one = 1;
+    struct sockaddr_in la = { .sin_family = AF_INET, .sin_port = htons((uint16_t)g_kport),
+                              .sin_addr.s_addr = htonl(INADDR_ANY) };
+    if (setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0 ||
+        bind(lfd, (struct sockaddr *)&la, sizeof(la)) != 0 || listen(lfd, 4096) != 0) {
+        int er = errno;
+        close(lfd);
+        errno = er;
+        return -1;
+    }
+    return lfd;
+}
 
 /* Сколько ждём подтверждений после закрытия сервером. Секунды, а не «сколько понадобится»:
  * клиент мог уйти совсем, и тогда кольцо не опустеет никогда. */
@@ -3781,23 +3803,21 @@ static void *worker_loop(void *arg) {
         if (epoll_ctl(ep, EPOLL_CTL_ADD, efd, &e) != 0) { close(efd); efd = -1; }
     }
     g_conn_efd = efd;
-    /* Слушатель TCP (R-152): свой на рабочего, SO_REUSEPORT — ядро само раскладывает соединения по
-     * рабочим, и каждое целиком у того, кто его принял. Не встал — TCP идёт прежним путём через TUN, а
-     * правило redirect демон ставит только по сообщённому порту. */
+    /* Слушатель TCP (R-152): у рабочего 0 — открытый в stack_run, у остальных свой (klisten_open).
+     * Не встал у рабочего 1+ — соединения разберут остальные рабочие: группа SO_REUSEPORT раздаёт
+     * только тем, кто в ней. */
     const uint32_t LST_TOKEN = MAX_CONNS + 2;
     int lfd = -1;
     if (g_kport > 0) {
-        lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        int one = 1;
-        struct sockaddr_in la = { .sin_family = AF_INET, .sin_port = htons((uint16_t)g_kport),
-                                  .sin_addr.s_addr = htonl(INADDR_ANY) };
-        if (lfd < 0 || setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
-            setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0 ||
-            bind(lfd, (struct sockaddr *)&la, sizeof(la)) != 0 || listen(lfd, 4096) != 0) {
-            fprintf(stderr, LOG_W "слушатель TCP на порту %d не встал (%s) — TCP идёт через TUN\n",
+        if (w->id == 0 && g_lfd0 >= 0) {
+            lfd = g_lfd0;
+            g_lfd0 = -1;
+        } else {
+            lfd = klisten_open();
+        }
+        if (lfd < 0) {
+            fprintf(stderr, LOG_W "рабочий %d: слушатель TCP на порту %d не встал (%s)\n", w->id,
                     g_kport, strerror(errno));
-            if (lfd >= 0) close(lfd);
-            lfd = -1;
         } else {
             struct epoll_event e = { .events = EPOLLIN, .data = { .u32 = LST_TOKEN } };
             epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &e);
@@ -4419,7 +4439,9 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     g_stats = getenv("STEER_TUN_STATS") != NULL;
     g_tx_nobatch = getenv("STEER_TUN_NOTXBATCH") != NULL;
     /* Порт слушателя TCP (R-152): соединения клиентов, перенаправленные правилом nft, принимаются здесь, а не
-     * пакетами через TUN. Пока порт задаёт окружение; демон будет передавать его вместе со спекой. */
+     * пакетами через TUN. Порт выводится из метки выхода (out_tcp_port) — так же его выводит демон, ставя
+     * элемент карты перенаправления; STEER_TUN_TCPPORT — для стендов без демона. */
+    if (o->mark) g_kport = out_tcp_port(o);
     if (getenv("STEER_TUN_TCPPORT")) {
         int pt = atoi(getenv("STEER_TUN_TCPPORT"));
         if (pt > 0 && pt < 65536) g_kport = pt;
@@ -4476,6 +4498,14 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
         if (fl >= 0) fcntl(qs[i].fd, F_SETFL, fl | O_NONBLOCK);
     }
     tun_bring_up(dev, o->table);
+    /* Слушатель TCP — до up: с up демон начнёт перенаправлять сюда TCP выхода. Порт занят (чужая служба,
+     * второй экземпляр с другой спекой) — выхода без слушателя не бывает: перенаправление отдало бы
+     * соединения тому, кто на порту, или сбросу. Модуль выходит, супервизор повторит по паузе. */
+    if (g_kport > 0 && (g_lfd0 = klisten_open()) < 0) {
+        fprintf(stderr, LOG_W "%s: порт %d для TCP выхода занят или недоступен (%s)\n", dev, g_kport,
+                strerror(errno));
+        return 1;
+    }
 
     /* Устройство готово — сказать об этом модулю, а маршрут НЕ трогать.
      *

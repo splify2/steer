@@ -1438,8 +1438,10 @@ static void build_guard(struct nft_table *t, const struct spec *sp, const struct
  * выбор делать нельзя — разошедшиеся правило и процесс это ровно тот отказ, который
  * здесь и починен. */
 static void build_dns_redirect(struct nft_table *t, const struct spec *sp) {
+    /* dstnat - 2: раньше перенаправления TCP в модули (build_tcp_redir) — запрос к 53-му порту
+     * забирает резолвер, даже если метка клиента ведёт в выход. */
     struct nft_chain *c = ir_base_chain_add(t, "prerouting_dns", "nat", "prerouting",
-                                            "dstnat", 0);
+                                            "dstnat", -2);
     static const char *const protos[2] = { "udp", "tcp" };
     /* Подсети IPv6 в from_default (с 1.9 это законно): тогда и IPv6 забирается по адресу, а не по
      * устройству — ровно как IPv4. Без них — прежние две формы, до байта. */
@@ -1958,6 +1960,69 @@ static void build_nat6(struct nft_table *t, const struct spec *sp) {
     }
 }
 
+/* ---- TCP клиентов — к слушателю модуля (R-152) ----------------------------------------------
+ *
+ * У выхода с KC_TCP_REDIR (vless, hysteria2, прокси) TCP клиентов завершает ядро Linux: первый
+ * пакет соединения перенаправляется по метке выхода на порт слушателя модуля (out_tcp_port), а
+ * модуль гонит поток узлу. Прежде такой TCP шёл пакетами в TUN, и модуль разбирал его своим
+ * стеком: два прохода пакета через границу ядра и свой TCP поверх. Замер на одном стенде —
+ * перенаправление 21-27 Гбит/с при 0,22-0,27 с CPU на ГиБ против 10-12 Гбит/с и 0,59-0,85 у
+ * обхода через TUN (решение владельца 2026-10-11, R-152 в хабе). UDP по-прежнему идёт в TUN.
+ *
+ * КАРТА, А НЕ ПРАВИЛО НА ВЫХОД. Куда вести метку, решает не спека, а сторож: метка группы ведёт
+ * в порт того члена, на котором группа сейчас (таблица выхода привязана к его устройству), а у
+ * выхода без живого модуля элемента нет вовсе — тогда правило не совпадает, и соединение идёт
+ * по маршруту выхода, то есть туда, куда решает on_fail (запрет, напрямую). Элементы ведёт демон
+ * вместе с привязкой таблицы (tcp_redir_sync в failover.c); набор правил приходит с пустой картой
+ * и заполняется после загрузки.
+ *
+ * ПРИОРИТЕТ dstnat - 1 — РАНЬШЕ подмены fake-IP. Трансляция назначения у соединения одна: первая
+ * цепочка nat, назначившая её, решает за остальные (nf_nat_inet_fn), поэтому перенаправление
+ * после dnat по карте fakeip не сработало бы никогда. Поддельный адрес модуль разворачивает сам —
+ * по тому же файлу состояния резолвера, что засевает карту (fakeip.state), — и подделку без
+ * подмены сбрасывает, как сбросило бы правило steer-fakeip-nomap. Заворот DNS стоит ещё раньше,
+ * на dstnat - 2 (build_dns_redirect): запрос к 53-му порту забирает резолвер, а не выход.
+ *
+ * Хук output — для соединений самого роутера с меткой выхода: сокет туннеля поверх другого
+ * выхода (over) несёт метку цели и попадает к её слушателю так же, как трафик клиента. На
+ * платформе с заворотом DNS приложений (output_dns на dstnat) запрос к 53-му порту в выход не
+ * уводится — его забирает тот заворот, как и прежде.
+ *
+ * Старая раскладка (Linux 4.9, legacy.c) складывает nat в таблицы ip и ip6, а карту демон ведёт
+ * в inet: там перенаправления нет, и TCP идёт через TUN, как до R-152. */
+static int has_tcp_redir(const struct spec *sp) {
+    if (g_nftc & NFTC_LEGACY) return 0;
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (sp->out[i].mark && out_has_cap(&sp->out[i], KC_TCP_REDIR)) return 1;
+    return 0;
+}
+
+static void build_tcp_redir(struct nft_table *t, const struct spec *sp) {
+    if (!has_tcp_redir(sp)) return;
+    ir_gap(ir_map_add(t, TCP_REDIR_MAP, "mark", "inet_service"));
+    static const char *const hooks[2] = { "prerouting", "output" };
+    static const char *const names[2] = { "prerouting_tcp_redir", "output_tcp_redir" };
+    char m[40];
+    snprintf(m, sizeof(m), "meta mark and 0x%08x", STEER_MARK_MASK);
+    for (int k = 0; k < 2; k++) {
+        struct nft_chain *c = ir_base_chain_add(t, names[k], "nat", hooks[k], "dstnat", -1);
+        if (!k) ir_gap(c);
+        struct nft_rule *r = ir_rule(c);
+        /* Только IPv4: стек модуля и ключ его потока — IPv4 (tun.h, flow_key). */
+        ir_x(r, "ip protocol tcp");
+        /* Метка — в карте: счётчик правила считает перенаправленные соединения, а не весь TCP. */
+        ir_setref(r, m, TCP_REDIR_MAP);
+        /* Адрес самого роутера (его WAN, адрес в другой своей сети) остаётся ему: в маршруте
+         * выхода такой пакет и прежде доставлялся локально — таблица local стоит раньше правил
+         * меток. */
+        ir_x(r, "fib daddr type != local");
+        if (k == 1 && plat()->local_dns) ir_x(r, "tcp dport != 53");
+        ir_counter(r, 0, 0);
+        ir_x(r, "redirect to :meta mark and 0x%08x map @%s", STEER_MARK_MASK, TCP_REDIR_MAP);
+        ir_comment(r, "steer-tcp-redir");
+    }
+}
+
 /* Дерево набора правил современной раскладки. Порядок объектов — порядок печати, и он
  * прежний до байта (снимок tests/golden/ruleset). */
 int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
@@ -1988,6 +2053,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
      * (kind.c: kind_emit_all). */
     kind_emit_all(rs, sp);
     if (!prof()->no_resolver) build_dns_redirect(t, sp);
+    build_tcp_redir(t, sp);
     /* Остальное по-прежнему по факту доменных каналов: карта fakeip и цепочка dstnat
      * стоят per-packet, и держать их пустыми на роутере без доменов незачем. Это гейт
      * по СТОИМОСТИ, а не по смыслу, и переворачиваться он может свободно — ни один

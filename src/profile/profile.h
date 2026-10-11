@@ -43,6 +43,8 @@ struct profile {
     int table_base;
     const char *rt_tables_file;
     int tgws_port_base;
+    /* Первый порт слушателей TCP модулей с KC_TCP_REDIR (marks.h, out_tcp_port). */
+    int tcp_port_base;
 };
 
 /* Профиль этой сборки: steer_profile из файла профиля, дополненный умолчаниями. */

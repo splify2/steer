@@ -1174,6 +1174,9 @@ static inline int out_skips_zapret(const struct output *o) {
  * ставятся, лишь если в спеке есть такой выход с on_fail не drop, — остальным на каждый
  * пакет лишний поиск ни к чему. */
 #define FAILOPEN_SET "failopen"
+/* Карта «метка выхода → порт слушателя модуля» (R-152): ставит compile (build_tcp_redir), ведёт
+ * демон (tcp_redir_sync в failover.c). */
+#define TCP_REDIR_MAP "tcp_redir"
 /* ВЫХОД, КОТОРЫЙ ВООБЩЕ БЫВАЕТ «ПУЩЕН НАПРЯМУЮ»: с устройством и с on_fail не drop. Отдельно от
  * out_failopen_capable, потому что у набора FAILOPEN_SET после проверки на QEMU 04664a5
  * (docs/architecture.md, раздел 2, «Набор правил») два читателя, а не один:
@@ -1474,6 +1477,16 @@ int table_bind(const struct output *o, const char *dev);
  * up помощника с именем устройства (daemon/supd.c, route_up). До 1.10 её звали и клиенты VLESS и
  * xsteer сами; с шага 3 модули маршрута не трогают (evline.h, поле dev). */
 void bind_device(struct output *o, const char *dev);
+
+/* TCP клиентов — к слушателю модуля (R-152): карта TCP_REDIR_MAP «метка → порт» идёт за
+ * привязкой таблицы выхода (table_bind). learn — устройства модулей с KC_TCP_REDIR и их порты из
+ * спеки этого процесса; sync — элемент выхода под устройство dev (NULL — снять); after_load —
+ * вернуть элементы в карту только что загруженного набора правил. Всё — в failover.c. */
+void tcp_redir_learn(const struct spec *sp);
+void tcp_redir_sync(const struct output *o, const char *dev);
+void tcp_redir_after_load(const struct spec *sp);
+/* Модуль устройства dev вышел — снять элементы, ведущие к его слушателю (supd.c, child_cb). */
+void tcp_redir_dev_gone(const char *dev);
 
 /* ---- IPv6 от хоста: вопросы к выходу и спеке (устройство — у enum out_ipv6 выше) ---------- */
 

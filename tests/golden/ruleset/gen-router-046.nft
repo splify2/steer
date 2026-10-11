@@ -38,7 +38,7 @@ table inet steer {
         meta mark and 0x0ff00000 == 0x00200000 oifname != "tun0" counter drop comment "steer-guard:geo"
     }
     chain prerouting_dns {
-        type nat hook prerouting priority dstnat; policy accept;
+        type nat hook prerouting priority dstnat - 2; policy accept;
         iifname { "br-lan", "tailscale0", "ztrq4abcde" } udp dport 53 counter redirect to :5300
         iifname { "br-lan", "tailscale0", "ztrq4abcde" } tcp dport 53 counter redirect to :5300
     }
