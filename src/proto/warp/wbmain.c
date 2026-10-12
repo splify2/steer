@@ -551,7 +551,6 @@ static void opt_awg(struct wb *w, size_t i) {
     sc.rot = (unsigned)i;
     sc.also_ip = m->ip;
     sc.also_port = m->port;
-    LOG("%s: замер точек — есть ли быстрее %s:%u\n", m->o->name, m->ip, m->port);
     int rc = wb_scan_run(&sc);
     const struct wb_pt *b = NULL;
     for (size_t k = 0; rc == 0 && k < sc.out_n && !b; k++)
@@ -561,8 +560,7 @@ static void opt_awg(struct wb *w, size_t i) {
         LOG("%s: точка быстрее — %s:%u (%d мс, потери %d%%, колония %s) вместо %s:%u (%d мс, потери %d%%)\n",
             m->o->name, b->ip, b->port, b->rtt, b->loss, b->colo, m->ip, m->port, sc.also.rtt, sc.also.loss);
         member_set(w, m, b, 1);
-    } else if (sc.also_ok)
-        LOG("%s: текущая точка не хуже найденных (%d мс, допуск %d мс)\n", m->o->name, sc.also.rtt, tol);
+    }
     wb_scan_free(&sc);
     free(bc);
     free(bi);
@@ -592,8 +590,7 @@ static void opt_masque(struct wb *w, size_t i) {
         m->pt_saved = 0;
         m->mq_set_ms = (long)time(NULL);
         member_say(m, -1);
-    } else if (cur >= 0)
-        LOG("%s: текущая точка MASQUE не хуже других (%d мс, допуск %d мс)\n", m->o->name, t[cur].rtt, tol);
+    }
     mq_tries_free(t);
 }
 

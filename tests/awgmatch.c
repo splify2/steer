@@ -290,7 +290,9 @@ int main(void) {
         check(t, 1, a && NLA_PLEN(a) == 32 && !memcmp(NLA_DATA(a), want, 32));
         a = find(top, tl, AD_FWMARK);
         snprintf(t, sizeof t, "SET v%d: FWMARK u32", ver);
-        check(t, 0x00c00000, a && NLA_PLEN(a) == 4 ? (long)u32of(a) : -1);
+        /* Метка via и — на платформе с zapret — бит «не твой» общему обходу (sockmark.h): внешние
+         * пакеты туннеля мимо zapret роутера; на телефоне бита нет. */
+        check(t, plat()->zapret ? 0x40c00000L : 0x00c00000L, a && NLA_PLEN(a) == 4 ? (long)u32of(a) : -1);
         a = find(top, tl, AD_JC);
         snprintf(t, sizeof t, "SET v%d: JC — u16", ver);
         check(t, 4, a && NLA_PLEN(a) == 2 ? u16of(a) : -1);
