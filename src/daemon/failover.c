@@ -2015,6 +2015,7 @@ struct fo_run {
         int ti, best, rule;
         char src[64];
         struct foprobe *p;
+        unsigned mark;                /* проба TCP: метка выхода с KC_TCP_REDIR (0 — через устройство) */
         const struct output *m;       /* замер: член группы (метка — у именованного) */
         struct folat_m *fm;           /* замер: идущий urltest члена (IPv4 и, если надо, IPv6) */
         int ms6;                      /* замер: итог по IPv6 (-2 — не мерили) */
@@ -2077,7 +2078,7 @@ static void hp_tcp_cb(void *arg, int ok, int ms);
 static int hp_tcp_next(struct fo_run *r) {
     for (; PROBE_TARGETS[r->hp.ti]; r->hp.ti++) {
         int ok = 0, ms = -1;
-        r->hp.p = foprobe_tcp(r->l, r->hp.dev, PROBE_TARGETS[r->hp.ti], TCP_PROBE_PORT,
+        r->hp.p = foprobe_tcp(r->l, r->hp.dev, r->hp.mark, PROBE_TARGETS[r->hp.ti], TCP_PROBE_PORT,
                               TCP_PROBE_TIMEOUT_MS, hp_tcp_cb, r, &ok, &ms);
         if (r->hp.p) return 1;
         if (hp_tcp_take(r, ok, ms)) return 0;
@@ -2165,6 +2166,9 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
     r->res = 0;
     if (!device_present(dev)) return 0;
     o = out_for_device(sp, o, dev);
+    /* TCP выхода с KC_TCP_REDIR завершает ядро и отдаёт слушателю модуля по метке (R-152) — проба идёт тем
+     * же путём, с меткой выхода устройства, а не через TUN. */
+    r->hp.mark = out_has_cap(o, KC_TCP_REDIR) ? o->mark : 0;
     /* Устройство создаёт наш процесс — сначала спросить о нём источник здоровья (fostate.h):
      * «не поднят» — приговор без пробы, «поднят» — дальше прежняя мера устройства, а у
      * помощника, который сам следит за узлом (watch), «поднят» — уже приговор: устройство на
