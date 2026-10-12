@@ -156,14 +156,18 @@ struct iface_cfg {
     struct out_obfs obfs;
 };
 
-/* ПУЛ УЗЛОВ туннеля по подписке (ключи `active`, `by`, `interval`, `silence` спеки v2; src/tunnel/
- * pool.c). Ноль — ключа нет, действует умолчание: один активный узел, раздача connection, проверка
- * раз в 60 с, порог молчания 20 с. silence_s -1 — порог выключен явно (`silence: 0`). */
+/* ПУЛ УЗЛОВ туннеля по подписке (ключи `active`, `by`, `interval`, `silence`, `pick`, `tolerance`
+ * спеки v2; src/tunnel/pool.c). Ноль — ключа нет, действует умолчание: один активный узел, раздача
+ * connection, узлы по порядку предпочтения, проверка раз в 60 с (pick: latency — замер раз в 180 с),
+ * порог молчания 20 с. silence_s -1 — порог выключен явно (`silence: 0`). */
 struct tun_pool {
     int active;                 /* сколько узлов кандидатов работают сразу */
     int by;                     /* enum group_by: те же значения, что у by группы balance */
     int interval_s;             /* период проверки каждого активного узла */
     int silence_s;              /* порог молчания узла на живом соединении */
+    int pick;                   /* enum pool_pick (pool.h): 0 — по порядку, 1 — самые быстрые */
+    int tolerance_ms;           /* pick: latency — допуск смены узла, мс (при tol_set) */
+    int tol_set;                /* tolerance задан: 0 — тоже значение (менять на любой более быстрый) */
 };
 
 struct vless_cfg {

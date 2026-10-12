@@ -159,8 +159,8 @@ outputs:
 ## status и diag
 
 В `steer status` у выхода — `nodes` и объект `proxy` (пока клиент жив): `node` (первый активный),
-`protocol`, `up`, `want`, `slots`, `by` и `active` — активные узлы с номерами и именами, как у
-объекта `vless` ([docs/vless.md](vless.md)). `steer diag` проверяет, что клиент запущен и соединение
+`protocol`, `up`, `want`, `slots`, `by` и `active` — активные узлы с номерами и именами (при
+`pick: latency` — ещё `pick` и `latency`), как у объекта `vless` ([docs/vless.md](vless.md)). `steer diag` проверяет, что клиент запущен и соединение
 поднято, и предупреждает, пока активных узлов меньше `active`.
 
 ## Ограничения

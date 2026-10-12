@@ -304,6 +304,24 @@ if [ -x "$XK" ]; then
     printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, active: 2 }\n' > "$tmp/pl6.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl6.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "у kind hysteria2 нет active больше 1"; then ok; else bad "active у hysteria2 — отказ" "$out"; fi
+    # pick: latency и tolerance — самые быстрые узлы подписки (пул туннеля): convert печатает их, у
+    # hysteria2 — отказ, tolerance без pick: latency — отказ; pick и tolerance у прочих видов — ключи группы.
+    printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, pick: latency, tolerance: 0 }\n' > "$tmp/pl8.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl8.yaml --state-dir "$tmp/state" 2>&1)"
+    if [ $? = 0 ]; then ok; else bad "pick: latency, tolerance: 0 у vless — приняты" "$(echo "$out" | head -n 3)"; fi
+    (cd "$tmp" && "$XKA" spec convert --spec pl8.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
+    if grep -q 'pick: latency, tolerance: 0' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+        bad "convert печатает pick и tolerance туннеля (неподвижная точка)" "$(grep -n nl "$tmp/c1.yaml")"; fi
+    plref "pick: balance у туннеля — отказ с местом" "pick: balance" "«balance» — у туннеля нужен order или latency" 3:68
+    plref "tolerance без pick: latency — отказ" "tolerance: 20" "tolerance — допуск смены узла по замеру, он есть только у pick: latency" ""
+    plref "tolerance: 70000 — отказ" "pick: latency, tolerance: 70000" "tolerance — от 0 до 60000" 3:88
+    printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, pick: latency }\n' > "$tmp/pl9.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl9.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "у kind hysteria2 пока нет pick: latency"; then ok; else bad "pick: latency у hysteria2 — отказ" "$out"; fi
+    printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, pick: latency }\n' > "$tmp/pl10.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl10.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "pick есть только у kind: group"; then ok; else
+        bad "pick у interface — прежний отказ «только у kind: group»" "$out"; fi
     printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, active: 2 }\n' > "$tmp/pl7.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl7.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ключ active есть только у kind: tunnel"; then ok; else
