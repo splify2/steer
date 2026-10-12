@@ -74,6 +74,8 @@ done
 ip netns exec "$NS" ip link show vl >/dev/null 2>&1 ||
     { echo "устройство vl не поднялось:"; sed 's/^/  /' "$WORK/tun.log"; exit 1; }
 ip netns exec "$NS" ip route replace "$TARGET/32" dev vl
+. tests/lib-redir.sh
+redir_dev "$NS" vl   # TCP — к слушателю модуля (R-152), как на роутере
 
 # Сегменты клиента с FIN и данными: ip-длина больше голого заголовка с опциями (20+32).
 ip netns exec "$NS" nft add table inet fin

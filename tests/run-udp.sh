@@ -40,7 +40,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf '%s\n' "vless://$UUID@127.0.0.1:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
+# Узел — на dummy внутри пространства, а не на петле: узел в 127.0.0.0/8 движок отвергает как «отвечать
+# некому» (sub.c), и на петле стенд не поднимался вовсе.
+NODE=10.66.3.1
+printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
 cat > "$WORK/spec.json" <<SPEC
 {"schema":1,
  "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
@@ -50,8 +53,11 @@ SPEC
 ip netns delete "$NS" 2>/dev/null || true
 ip netns add "$NS"
 ip netns exec "$NS" ip link set lo up
+ip netns exec "$NS" ip link add stand type dummy
+ip netns exec "$NS" ip addr add "$NODE/32" dev stand
+ip netns exec "$NS" ip link set stand up
 
-ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb 1 \
+ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb 1 --bind "$NODE" \
     > "$WORK/srv.log" 2>&1 &
 SRV_PID=$!
 sleep 1
@@ -70,6 +76,8 @@ fi
 
 # Куда угодно, кроме localhost: поддельному серверу адрес безразличен, важно попасть в туннель.
 ip netns exec "$NS" ip route replace 203.0.113.0/24 dev vl
+. tests/lib-redir.sh
+redir_dev "$NS" vl   # TCP — к слушателю модуля (R-152), как на роутере
 
 # Клиент внутри пространства: своим сокетом UDP, потому что ни один готовый инструмент не
 # умеет сказать «пришла ли ответная датаграмма ЦЕЛОЙ и той же». ICMP слушаем сырым сокетом —
