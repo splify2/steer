@@ -161,6 +161,12 @@ struct supd {
      * putenv в ребёнке, и pid демона — для проверки getppid() там же. */
     char tag[PATH_MAX + 64];
     pid_t me;
+    /* Приговоры членам групп от их помощника (событие member, модуль steer-warpbox): член мёртв
+     * по проверке модуля раньше, чем это увидит сторож по рукопожатию. Держится, пока жив процесс
+     * помощника: вышел он — его приговоры снимаются (child_cb), иначе член остался бы «мёртвым»
+     * навсегда. */
+    struct mverdict { char out[32], grp[32]; signed char v; } *mv;
+    size_t mv_n, mv_cap;
 };
 
 static void supd_kick(struct supd *s);
@@ -337,6 +343,54 @@ static void ev_awg(struct supd *s, struct helper *h, const struct evline *e) {
     if (s->d->watch) watchd_helper_changed(s->d->watch);
 }
 
+/* member (модуль steer-warpbox, evline.h): приговор члену его группы — ok 0 (мёртв: трафик группы
+ * уходит с него сразу), 1 (жив) или -1 (не знаю: решает сторож по своим признакам). Только член
+ * группы этого помощника. Смена приговора будит сторожа: проход уводит группу с мёртвого члена, не
+ * дожидаясь, пока рукопожатие устареет (у awg это до трёх минут). */
+static void ev_member(struct supd *s, struct helper *h, const struct evline *e) {
+    const char *name = evline_str(e, "out");
+    long v;
+    if (!name || !evline_int(e, "ok", &v) || v < -1 || v > 1 || !s->d->have) return;
+    const struct output *o = out_by_name(s->d->sp, name);
+    if (!o || strcmp(o->warp_of, h->name) != 0) return;
+    struct mverdict *m = NULL;
+    for (size_t i = 0; i < s->mv_n; i++)
+        if (!strcmp(s->mv[i].out, name)) m = &s->mv[i];
+    if (!m) {
+        if (v == -1) return;
+        if (s->mv_n == s->mv_cap) {
+            size_t nc = s->mv_cap ? s->mv_cap * 2 : 8;
+            struct mverdict *n = realloc(s->mv, nc * sizeof(*n));
+            if (!n) return;
+            s->mv = n;
+            s->mv_cap = nc;
+        }
+        m = &s->mv[s->mv_n++];
+        snprintf(m->out, sizeof(m->out), "%s", name);
+        snprintf(m->grp, sizeof(m->grp), "%s", h->name);
+        m->v = -1;
+    }
+    if (m->v == (signed char)v) return;
+    m->v = (signed char)v;
+    if (v == 0) fprintf(stderr, "steer[info] supervise: %s %s: член %s не отвечает — увожу группу с него\n",
+                        h->cmd, h->name, name);
+    if (s->d->watch) watchd_helper_changed(s->d->watch);
+}
+
+static void mv_drop_group(struct supd *s, const char *grp) {
+    size_t w = 0;
+    for (size_t i = 0; i < s->mv_n; i++)
+        if (strcmp(s->mv[i].grp, grp) != 0) s->mv[w++] = s->mv[i];
+    s->mv_n = w;
+}
+
+int supd_member_verdict(const struct steerd *d, const char *out) {
+    const struct supd *s = d ? d->sup : NULL;
+    for (size_t i = 0; s && out && i < s->mv_n; i++)
+        if (!strcmp(s->mv[i].out, out)) return s->mv[i].v;
+    return -1;
+}
+
 static void ev_line(struct supd *s, struct helper *h, const char *line) {
     struct evline e;
     if (evline_parse(line, &e) != 0) return;
@@ -391,6 +445,8 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
         ev_health(s, h, &e);
     } else if (!strcmp(e.ev, "awg")) {
         ev_awg(s, h, &e);
+    } else if (!strcmp(e.ev, "member")) {
+        ev_member(s, h, &e);
     } else if (!strcmp(e.ev, "active")) {
         /* Активные узлы пула: только цифры и запятые — строка ложится в JSON массивом как есть
          * (helper ниже), поэтому чужое в ней отвергается целиком. */
@@ -1137,6 +1193,8 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         if (h->evfd >= 0) ev_drain(s, h);
         if (h->evfd >= 0) { loop_fd_del(s->l, h->evfd); close(h->evfd); h->evfd = -1; }
         int was_up = h->st.up;
+        /* Приговоры членам от этого процесса больше не правда (ev_member). */
+        if (h->name[0]) mv_drop_group(s, h->name);
         /* Слушатель TCP модуля ушёл вместе с процессом (R-152): перенаправление к нему — снять. */
         if (h->st.bound[0]) tcp_redir_dev_gone(h->st.bound);
         h->st.running = 0;

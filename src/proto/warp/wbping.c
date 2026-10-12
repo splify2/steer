@@ -40,13 +40,17 @@ static uint16_t csum(const void *p, size_t n) {
     return htons((uint16_t)~s);
 }
 
-int wb_ping_burst(const char *dst, int count, int step_ms, int wait_ms, struct wb_ping *r) {
+static int burst(const char *dev, const char *dst, int count, int step_ms, int wait_ms, struct wb_ping *r) {
     memset(r, 0, sizeof(*r));
     r->rtt = -1;
     struct sockaddr_in to = { .sin_family = AF_INET };
     if (count <= 0 || count > 64 || inet_pton(AF_INET, dst, &to.sin_addr) != 1) return -1;
     int fd = socket(AF_INET, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, IPPROTO_ICMP);
     if (fd < 0) return -1;
+    if (dev && setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, dev, (socklen_t)strlen(dev) + 1) != 0) {
+        close(fd);
+        return -1;
+    }
     uint16_t id = (uint16_t)(getpid() ^ (now_us() & 0xffff));
     long sent_at[64] = { 0 };
     int seen[64] = { 0 };
@@ -96,4 +100,12 @@ int wb_ping_burst(const char *dst, int count, int step_ms, int wait_ms, struct w
     if (r->got) r->rtt = (int)(rtt_sum / r->got / 1000);
     r->torn = r->got > 0 && r->sent - 1 - hi >= WB_TORN;
     return 0;
+}
+
+int wb_ping_burst(const char *dst, int count, int step_ms, int wait_ms, struct wb_ping *r) {
+    return burst(NULL, dst, count, step_ms, wait_ms, r);
+}
+
+int wb_ping_dev(const char *dev, const char *dst, int count, int step_ms, int wait_ms, struct wb_ping *r) {
+    return burst(dev, dst, count, step_ms, wait_ms, r);
 }

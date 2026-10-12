@@ -29,6 +29,8 @@
 #include "wbhttps.h"
 #include "wbjson.h"
 #include "wbreg.h"
+#include "wbx509.h"
+#include "scrypto.h"
 
 #define CF_UA  "okhttp/3.12.1"
 #define CF_VER "a-6.11-2223"
@@ -53,6 +55,26 @@ static void b64(const unsigned char *in, size_t n, char *out) {
         out[o++] = i + 2 < n ? T[v & 63] : '=';
     }
     out[o] = '\0';
+}
+
+int wb_b64_decode(const char *in, unsigned char *out, size_t cap) {
+    size_t o = 0;
+    unsigned v = 0;
+    int bits = 0;
+    for (const char *p = in; *p && *p != '='; p++) {
+        int c = *p;
+        int d = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26
+              : c >= '0' && c <= '9' ? c - '0' + 52 : c == '+' || c == '-' ? 62 : c == '/' || c == '_' ? 63 : -1;
+        if (d < 0) return -1;
+        v = (v << 6) | (unsigned)d;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o == cap) return -1;
+            out[o++] = (unsigned char)(v >> bits);
+        }
+    }
+    return (int)o;
 }
 
 static void wipe(void *p, size_t n) {
@@ -174,6 +196,7 @@ int wb_register(struct wb_reg *r, char *why, size_t wn) {
 static const struct { const char *k; size_t off, n; } FIELDS[] = {
 #define FL(name) { #name, offsetof(struct wb_reg, name), sizeof(((struct wb_reg *)0)->name) }
     FL(id), FL(token), FL(priv), FL(pub), FL(peer_pub), FL(v4), FL(v6), FL(client_id), FL(api),
+    FL(mq_priv), FL(mq_peer), FL(mq_ep4), FL(mq_ep6),
 #undef FL
 };
 
@@ -212,3 +235,132 @@ int wb_reg_load(const char *path, struct wb_reg *r) {
 }
 
 void wb_reg_wipe(struct wb_reg *r) { wipe(r, sizeof(*r)); }
+
+/* ---- MASQUE: ключ P-256 у регистрации (WARPBOX.md в хабе, «Протокол») ---------------------------
+ *
+ * PATCH /<версия>/reg/<id> с Bearer token и {"key": <SPKI DER base64>, "key_type": "secp256r1",
+ * "tunnel_type": "masque"} — версия API и заголовки клиента Android, с которыми это работает у usque
+ * (v0a4471, «a-6.35-4471», «WARP for Android»). Ответ — та же учётная запись: ключ сервера (PEM) для
+ * сверки в рукопожатии, точка входа (адрес с портом 0 — порт не значим), адреса туннеля. */
+#define MQ_PATH "/v0a4471/reg/"
+#define MQ_UA   "WARP for Android"
+#define MQ_VER  "a-6.35-4471"
+
+/* PEM → base64 тела одной строкой: между «-----BEGIN …-----» и «-----END», только знаки base64.
+ * Переводы строк в ответе бывают и настоящими, и буквальными «\\n» (так их оставляет разбор JSON). */
+static int pem_body(const char *pem, char *out, size_t n) {
+    const char *b = strstr(pem, "-----BEGIN");
+    if (!b || !(b = strstr(b + 10, "-----"))) return -1;
+    b += 5;
+    const char *e = strstr(b, "-----END");
+    if (!e) return -1;
+    size_t o = 0;
+    for (const char *p = b; p < e; p++) {
+        if (*p == '\\' && p + 1 < e) { p++; continue; }        /* \n, \r */
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
+            *p == '+' || *p == '/' || *p == '=') {
+            if (o + 1 >= n) return -1;
+            out[o++] = *p;
+        }
+    }
+    out[o] = '\0';
+    return o ? 0 : -1;
+}
+
+/* «адрес:порт» / «[адрес]:порт» → адрес. */
+static void ep_host(const char *ep, char *out, size_t n) {
+    if (ep[0] == '[') {
+        size_t l = strcspn(ep + 1, "]");
+        snprintf(out, n, "%.*s", (int)l, ep + 1);
+        return;
+    }
+    const char *c = strrchr(ep, ':');
+    snprintf(out, n, "%.*s", c ? (int)(c - ep) : (int)strlen(ep), ep);
+}
+
+/* Вернуть устройству ключ WireGuard (смена transport с masque на awg): включение MASQUE заменило у
+ * Cloudflare ключ устройства на P-256, и прежний файл туннеля awg больше не принимается (стенд QEMU
+ * 2026-10-12: после смены транспорта туда и обратно туннели awg молчали). PATCH тем же путём, что
+ * включение MASQUE, с открытой половиной ключа X25519 регистрации. */
+int wb_enroll_wireguard(struct wb_reg *r, char *why, size_t wn) {
+    if (!r->id[0] || !r->token[0] || !r->pub[0]) {
+        snprintf(why, wn, "у регистрации нет id, token или ключа — ключ WireGuard не вернуть");
+        return -1;
+    }
+    char body[256], path[160], hdr[400];
+    int bn = snprintf(body, sizeof(body), "{\"key\":\"%s\",\"key_type\":\"curve25519\",\"tunnel_type\":\"wireguard\"}",
+                      r->pub);
+    snprintf(path, sizeof(path), MQ_PATH "%s", r->id);
+    snprintf(hdr, sizeof(hdr), "User-Agent: " MQ_UA "\r\nCF-Client-Version: " MQ_VER "\r\n"
+             "Authorization: Bearer %s\r\n", r->token);
+    struct wb_req q = { .host = "api.cloudflareclient.com", .method = "PATCH", .path = path, .headers = hdr,
+                        .body = body, .body_n = (size_t)bn, .timeout_ms = 25000 };
+    struct wb_resp res;
+    if (wb_https(&q, NULL, &res, why, wn) != 0) return -1;
+    int ok = res.status / 100 == 2;
+    if (!ok) snprintf(why, wn, "возврат ключа WireGuard — ответ %d", res.status);
+    wb_resp_free(&res);
+    if (!ok) return -1;
+    wipe(r->mq_priv, sizeof(r->mq_priv));
+    r->mq_peer[0] = r->mq_ep4[0] = r->mq_ep6[0] = '\0';
+    return 0;
+}
+
+int wb_reg_has_masque(const struct wb_reg *r) {
+    return r->mq_priv[0] && r->mq_peer[0] && (r->mq_ep4[0] || r->mq_ep6[0]) && r->v4[0];
+}
+
+int wb_enroll_masque(struct wb_reg *r, char *why, size_t wn) {
+    if (!r->id[0] || !r->token[0]) {
+        snprintf(why, wn, "у регистрации нет id и token (готовая чужая) — MASQUE не включить");
+        return -1;
+    }
+    unsigned char priv[32], pub[65], spki[WB_SPKI_P256];
+    if (sc_p256_keygen(priv, pub) != 0) { snprintf(why, wn, "ключ P-256 не создался"); return -1; }
+    wb_p256_spki(pub, spki);
+    char spki_b64[160], body[320], path[160], hdr[400];
+    b64(spki, sizeof(spki), spki_b64);
+    int bn = snprintf(body, sizeof(body), "{\"key\":\"%s\",\"key_type\":\"secp256r1\",\"tunnel_type\":\"masque\"}",
+                      spki_b64);
+    snprintf(path, sizeof(path), MQ_PATH "%s", r->id);
+    snprintf(hdr, sizeof(hdr), "User-Agent: " MQ_UA "\r\nCF-Client-Version: " MQ_VER "\r\n"
+             "Authorization: Bearer %s\r\n", r->token);
+    struct wb_req q = { .host = "api.cloudflareclient.com", .method = "PATCH", .path = path, .headers = hdr,
+                        .body = body, .body_n = (size_t)bn, .timeout_ms = 25000 };
+    struct wb_resp res;
+    int rc = -1;
+    if (wb_https(&q, NULL, &res, why, wn) != 0) goto out;
+    if (res.status / 100 != 2) {
+        char code[16] = "";
+        wb_json_get(res.body, "errors.0.code", code, sizeof(code));
+        snprintf(why, wn, "включение MASQUE — ответ %d%s%s", res.status, code[0] ? ", код " : "", code);
+        wb_resp_free(&res);
+        goto out;
+    }
+    char pfx[16] = "";
+    char tmp[16];
+    if (wb_json_get(res.body, "result.id", tmp, sizeof(tmp)) == 0) snprintf(pfx, sizeof(pfx), "result.");
+    char p2[96], pem[512], ep[96];
+    snprintf(p2, sizeof(p2), "%sconfig.peers.0.public_key", pfx);
+    int ok = wb_json_get(res.body, p2, pem, sizeof(pem)) == 0 && pem_body(pem, r->mq_peer, sizeof(r->mq_peer)) == 0;
+    snprintf(p2, sizeof(p2), "%sconfig.peers.0.endpoint.v4", pfx);
+    r->mq_ep4[0] = r->mq_ep6[0] = '\0';
+    if (wb_json_get(res.body, p2, ep, sizeof(ep)) == 0) ep_host(ep, r->mq_ep4, sizeof(r->mq_ep4));
+    snprintf(p2, sizeof(p2), "%sconfig.peers.0.endpoint.v6", pfx);
+    if (wb_json_get(res.body, p2, ep, sizeof(ep)) == 0) ep_host(ep, r->mq_ep6, sizeof(r->mq_ep6));
+    snprintf(p2, sizeof(p2), "%sconfig.interface.addresses.v4", pfx);
+    wb_json_get(res.body, p2, r->v4, sizeof(r->v4));
+    snprintf(p2, sizeof(p2), "%sconfig.interface.addresses.v6", pfx);
+    wb_json_get(res.body, p2, r->v6, sizeof(r->v6));
+    wb_resp_free(&res);
+    if (!ok || (!r->mq_ep4[0] && !r->mq_ep6[0])) {
+        snprintf(why, wn, "включение MASQUE: в ответе нет ключа сервера или точки входа");
+        r->mq_peer[0] = '\0';
+        goto out;
+    }
+    b64(priv, 32, r->mq_priv);
+    rc = 0;
+out:
+    wipe(priv, sizeof(priv));
+    return rc;
+}

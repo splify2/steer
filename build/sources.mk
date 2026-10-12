@@ -304,9 +304,11 @@ PROXY_MOD_SRC := src/proto/proxy/pxwire.c src/proto/proxy/pxsub.c src/proto/prox
 # libsteer.so, как hysteria2, и тоже не в статических профилях: телефону — позже, вместе с MASQUE.
 # HTTPS — wbhttps.c (TLS 1.3 libsteer), JSON по пути — wbjson.c, регистрация — wbreg.c, файл туннеля и
 # маски I1 — wbconf.c, пространство сети подбора — wbns.c, эхо-запросы — wbping.c, подбор — wbscan.c,
-# команды и сторож — wbmain.c.
+# сертификат клиента MASQUE и ключ сервера — wbx509.c, туннель MASQUE (QUIC, HTTP/3 CONNECT-IP, TUN) —
+# wbmq.c, команды и сторож — wbmain.c.
 WARP_MOD_SRC := src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/warp/wbreg.c src/proto/warp/wbconf.c \
-                src/proto/warp/wbns.c src/proto/warp/wbping.c src/proto/warp/wbscan.c src/proto/warp/wbmain.c
+                src/proto/warp/wbns.c src/proto/warp/wbping.c src/proto/warp/wbscan.c src/proto/warp/wbx509.c \
+                src/proto/warp/wbmq.c src/proto/warp/wbmain.c
 LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC) $(SUBLINK_SRC) \
                 $(STACK_SRC) $(TRANSPORT_SRC) \
                 src/tunnel/tun.c src/proto/tls/chello.c src/proto/tls/tls13.c \

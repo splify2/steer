@@ -60,6 +60,7 @@ LIBSTEER_1 {
     group_bal_chain;
     group_bal_map;
     group_bal_target;
+    group_carded;
     group_hysteresis;
     group_interval_s;
     group_latency_keep;
@@ -121,8 +122,6 @@ LIBSTEER_1 {
     js_lit;
     jsonw_str;
     jsonw_str_ascii;
-    js_skip;
-    js_str;
     js_ws;
     kind_at;
     kind_by_name;
@@ -130,6 +129,7 @@ LIBSTEER_1 {
     kind_direct;
     kind_emit_all;
     kind_sig_mix;
+    kind_warpm;
     l4_box_text;
     l4_from_text;
     l4match_same;
@@ -202,6 +202,7 @@ LIBSTEER_1 {
     qc_on_readable;
     qc_on_timer;
     qc_open;
+    qc_peer_cert;
     qc_run;
     qc_set_cc;
     qc_stats_get;
@@ -251,6 +252,9 @@ LIBSTEER_1 {
     sc_hkdf_expand;
     sc_hkdf_extract;
     sc_hmac;
+    sc_p256_keygen;
+    sc_p256_public;
+    sc_p256_sign;
     sc_shake128_free;
     sc_shake128_init;
     sc_shake128_read;

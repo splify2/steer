@@ -36,6 +36,7 @@
 #include <wolfssl/wolfcrypt/curve25519.h>
 #include <wolfssl/wolfcrypt/rsa.h>
 #include <wolfssl/wolfcrypt/ecc.h>
+#include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/asn_public.h>
 #include <wolfssl/wolfcrypt/hash.h>
 #include <wolfssl/wolfcrypt/memory.h>
@@ -766,6 +767,81 @@ static int verify_ecdsa(const unsigned char *spki, word32 spki_n,
     }
     wc_ecc_free(key);
     free(key);
+    return rc;
+}
+
+/* ---- ECDSA P-256 ------------------------------------------------------------------------------ */
+
+static int p256_out(ecc_key *key, unsigned char priv[32], unsigned char pub[65]) {
+    word32 n = 65;
+    if (wc_ecc_export_x963(key, pub, &n) != 0 || n != 65) return SC_EPARSE;
+    if (priv) {
+        word32 pn = 32;
+        if (wc_ecc_export_private_only(key, priv, &pn) != 0 || pn != 32) return SC_EPARSE;
+    }
+    return 0;
+}
+
+int sc_p256_keygen(unsigned char priv[32], unsigned char pub[65]) {
+    ecc_key *key = malloc(sizeof(*key));
+    WC_RNG *rng = malloc(sizeof(*rng));
+    int rc = SC_ENOMEM;
+    if (!key || !rng) goto out;
+    rc = SC_EPARSE;
+    if (wc_InitRng(rng) != 0) goto out;
+    if (wc_ecc_init(key) == 0) {
+        if (wc_ecc_make_key_ex(rng, 32, key, ECC_SECP256R1) == 0) rc = p256_out(key, priv, pub);
+        wc_ecc_free(key);
+    }
+    wc_FreeRng(rng);
+out:
+    if (key) { wc_ForceZero(key, sizeof(*key)); free(key); }
+    free(rng);
+    return rc;
+}
+
+/* Ключ из скаляра: импорт закрытой половины и вывод открытой. */
+static int p256_import(ecc_key *key, const unsigned char priv[32]) {
+    if (wc_ecc_init(key) != 0) return SC_EPARSE;
+    if (wc_ecc_import_private_key_ex(priv, 32, NULL, 0, key, ECC_SECP256R1) != 0 ||
+        wc_ecc_make_pub(key, NULL) != 0) {
+        wc_ecc_free(key);
+        return SC_EPARSE;
+    }
+    return 0;
+}
+
+int sc_p256_public(const unsigned char priv[32], unsigned char pub[65]) {
+    ecc_key *key = malloc(sizeof(*key));
+    if (!key) return SC_ENOMEM;
+    int rc = p256_import(key, priv);
+    if (rc == 0) {
+        rc = p256_out(key, NULL, pub);
+        wc_ecc_free(key);
+    }
+    wc_ForceZero(key, sizeof(*key));
+    free(key);
+    return rc;
+}
+
+int sc_p256_sign(const unsigned char priv[32], const unsigned char digest[32],
+                 unsigned char *sig, size_t *sig_n) {
+    ecc_key *key = malloc(sizeof(*key));
+    WC_RNG *rng = malloc(sizeof(*rng));
+    int rc = SC_ENOMEM;
+    if (!key || !rng) goto out;
+    rc = p256_import(key, priv);
+    if (rc) goto out;
+    rc = SC_EPARSE;
+    if (wc_InitRng(rng) == 0) {
+        word32 n = SC_P256_SIG_MAX;
+        if (wc_ecc_sign_hash(digest, 32, sig, &n, rng, key) == 0) { *sig_n = n; rc = 0; }
+        wc_FreeRng(rng);
+    }
+    wc_ecc_free(key);
+out:
+    if (key) { wc_ForceZero(key, sizeof(*key)); free(key); }
+    free(rng);
     return rc;
 }
 

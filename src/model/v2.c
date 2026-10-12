@@ -83,6 +83,7 @@ struct v2 {
     struct v2_client *cl;
     size_t cl_cap;
     size_t clients_named, lists_named;
+    int warp_synth;                 /* разбор разворачивает kind: warp — вид warp-masque допустим */
 };
 
 /* ---- отказы -------------------------------------------------------------------------------- */
@@ -687,6 +688,11 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         kd = kind_by_name(proto);
     } else if (v2_tunnel_proto(kname)) {
         return fail(x, kn, "%s: в спеке v2 туннель пишется kind: tunnel, protocol: %s", where, kname);
+    } else if (!strcmp(kname, "warp-masque")) {
+        /* Член WARP с транспортом MASQUE — только из разворота kind: warp (p_warp). */
+        if (!x->warp_synth)
+            return fail(x, kn, "%s: kind warp-masque заводит только kind: warp (transport: masque)", where);
+        kd = &kind_warpm;
     } else {
         kd = kind_by_name_v2(kname);
         if (!kd)
@@ -1060,9 +1066,8 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
         const char *t;
         snprintf(w, sizeof(w), "%s.transport", where);
         if (str_of(x, v, w, &t)) return -1;
-        if (!strcmp(t, "masque"))
-            return fail(x, v, "%s: masque — следующий этап steer-warpbox, пока есть awg", w);
-        if (strcmp(t, "awg")) return fail(x, v, "%s: «%s» — awg (masque — следующий этап)", w, t);
+        if (!strcmp(t, "masque")) transport = WARP_MASQUE;
+        else if (strcmp(t, "awg")) return fail(x, v, "%s: «%s» — awg или masque", w, t);
     }
     long count = 3;
     if ((v = ynode_get(val, "count"))) {
@@ -1151,22 +1156,31 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
             return fail(x, v6, "%s: «%s» — у kind: warp nat или off (адрес IPv6 у WARP один)", w, t);
     }
     const struct ynode *ov = ynode_get(val, "over");
+    /* Члены: awg — файл туннеля {etc}/warp/<имя>-<n>.conf (его пишет модуль); masque — TUN модуля,
+     * своих ключей у вида нет (kinds/group.c, kind_warpm). */
+    int mq = transport == WARP_MASQUE;
     for (long n = 1; n <= count; n++) {
-        struct ynode *m = yn_new(x, val, YN_MAP, ov ? 4 : 3);
+        size_t pairs = (mq ? 2 : 3) + (ov ? 1 : 0), it = 0;
+        struct ynode *m = yn_new(x, val, YN_MAP, pairs);
         char conf[300];
         snprintf(conf, sizeof(conf), "%s/warp/%s-%ld.conf", plat()->etc_dir, name, n);
         if (!m) return fail(x, val, "%s: недостаточно памяти", where);
-        m->items[0] = yn_str(x, val, "kind");
-        m->items[1] = yn_str(x, val, "awg");
-        m->items[2] = yn_str(x, val, "conf");
-        m->items[3] = yn_str(x, val, conf);
-        m->items[4] = yn_str(x, val, "ipv6");
-        m->items[5] = v6 ? (struct ynode *)v6 : yn_str(x, val, "nat");
-        if (ov) { m->items[6] = yn_str(x, ov, "over"); m->items[7] = (struct ynode *)ov; }
-        for (size_t i = 0; i < (ov ? 8u : 6u); i++)
+        m->items[it++] = yn_str(x, val, "kind");
+        m->items[it++] = yn_str(x, val, mq ? "warp-masque" : "awg");
+        if (!mq) {
+            m->items[it++] = yn_str(x, val, "conf");
+            m->items[it++] = yn_str(x, val, conf);
+        }
+        m->items[it++] = yn_str(x, val, "ipv6");
+        m->items[it++] = v6 ? (struct ynode *)v6 : yn_str(x, val, "nat");
+        if (ov) { m->items[it++] = yn_str(x, ov, "over"); m->items[it++] = (struct ynode *)ov; }
+        for (size_t i = 0; i < it; i++)
             if (!m->items[i]) return fail(x, val, "%s: недостаточно памяти", where);
         size_t midx = x->s->out_n;
-        if (p_output(x, mem->items[n - 1], m)) return -1;
+        x->warp_synth = 1;
+        int prc = p_output(x, mem->items[n - 1], m);
+        x->warp_synth = 0;
+        if (prc) return -1;
         snprintf(x->s->out[midx].warp_of, sizeof(x->s->out[midx].warp_of), "%s", name);
     }
     return 0;

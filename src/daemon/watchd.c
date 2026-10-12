@@ -238,6 +238,17 @@ struct fo_hmem {
  * прежним путём, по файлам: пишет их тот, кто его поднял. */
 static int hmem_state(struct fo_hsrc *hs, const char *out, struct fo_hstate *h) {
     const struct helper_state *st = helper_state_of(((struct fo_hmem *)hs)->d, out);
+    /* Член группы, о котором её помощник сказал своё (модуль steer-warpbox проверяет туннель сам раз в
+     * 30 с — эхо-запросами через устройство): приговор без пробы, как у помощника, который следит за
+     * узлом сам (watch). «Мёртв» — группа уходит с него в этом же проходе, не дожидаясь, пока устареет
+     * рукопожатие; «жив» — без своей пробы. «Не сказано» — решает обычная мера вида. */
+    int mv = st ? -1 : supd_member_verdict(((struct fo_hmem *)hs)->d, out);
+    if (mv >= 0) {
+        h->st = mv ? FO_HS_UP : FO_HS_DOWN;
+        h->node = h->total = 0;
+        h->watch = 1;
+        return 0;
+    }
     if (!st) return fo_hsrc_files.ops->state(&fo_hsrc_files, out, h);
     h->node = h->total = 0;
     /* Процесс жив и сам следит за узлом (последний его up — с watch, evline.h): UP — приговор без

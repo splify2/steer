@@ -122,6 +122,14 @@ struct qc_cfg {
      * (как у эталона), а после рукопожатия отпечаток сверяется, и несовпадение закрывает
      * соединение причиной QC_CLOSE_HANDSHAKE. Работает только с готовым cfg.tls == NULL. */
     const uint8_t *pin_sha256;
+    /* Клиентский сертификат (DER) и его ключ (SEC1 ECPrivateKey, DER): сервер узнаёт клиента по ключу
+     * (MASQUE у WARP — ключ, выданный при регистрации). NULL — без сертификата. Только со своим
+     * контекстом (cfg.tls == NULL). Ключ сервера в таком случае сверяет потребитель
+     * (qc_peer_cert в on_handshake, до первого запроса), а цепочку — никто: insecure = 1. */
+    const uint8_t *client_cert;
+    size_t      client_cert_n;
+    const uint8_t *client_key;
+    size_t      client_key_n;
     const uint8_t *ca_pem;
     size_t      ca_pem_n;
     const char *ca_file;
@@ -213,6 +221,8 @@ int  qc_on_timer(struct qc *q);
 int  qc_run(struct qc *q, int timeout_ms);
 
 int  qc_handshake_done(const struct qc *q);
+/* Листовой сертификат сервера (DER) в out[cap] — после рукопожатия: длина или -1. */
+int  qc_peer_cert(struct qc *q, uint8_t *out, size_t cap);
 /* 0-RTT возможен: рукопожатие ещё идёт, но потоки открывать и слать в них уже можно (cfg.early_data и
  * билет с разрешением early data). После рукопожатия — 0. */
 int  qc_early_ready(const struct qc *q);

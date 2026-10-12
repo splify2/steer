@@ -36,17 +36,21 @@
 #include "awg.h"
 #include "wbconf.h"
 #include "wbns.h"
+#include "wbmq.h"
+#include "marks.h"
+#include <pthread.h>
+#include "wbping.h"
 #include "wbreg.h"
 #include "wbscan.h"
 
 #define LOG(...) fprintf(stderr, "steer-warpbox: " __VA_ARGS__)
 
-#define WB_CHECK_S 60           /* проход сторожа */
-#define WB_HS_FRESH 180         /* рукопожатие моложе — туннель жив (как у awg_healthy) */
+#define WB_CHECK_S 30           /* проход сторожа: отказ туннеля ядро узнаёт отсюда (событие member) */
 #define WB_FAILS 2              /* столько проходов подряд без признаков жизни — замена */
 #define WB_REKEY_AT 3           /* на какой замене подряд — новые ключи */
 #define WB_REKEY_MIN_S 86400    /* новые ключи не чаще раза в сутки на член */
 #define WB_REG_RETRY_S 120
+#define WB_MQ_GRACE_S 15        /* туннелю MASQUE после новой точки — на рукопожатие и CONNECT */
 #define WB_BAD_S 1800           /* снятая точка не возвращается полчаса: молчит она чаще всего не случайно */
 
 static volatile sig_atomic_t g_stop;
@@ -72,14 +76,19 @@ struct member {
     char reg_path[512], conf_path[512];
     struct wb_reg reg;
     int have_reg;
-    char ip[16];
+    char ip[48];
     unsigned port;
     char colo[4], seen[3];
     int ok;                     /* последний проход: жив */
     int fails;                  /* проходов подряд без жизни */
     int replaced;               /* замен подряд без успеха */
     int pt_saved;               /* колония и страна точки записаны в .pt */
-    char bad_ip[16];            /* точка, которую только что сняли: в подбор не берётся WB_BAD_S */
+    int awg;                    /* член awg (transport: awg); иначе MASQUE */
+    int said;                   /* последний приговор демону (member): 1, 0, -1; 2 — ещё не говорили */
+    char bad_ip[48];            /* точка, которую только что сняли: в подбор не берётся WB_BAD_S */
+    unsigned bad_port;          /* у MASQUE снимается пара адрес:порт */
+    struct wb_mq *mq;           /* туннель MASQUE (transport: masque) */
+    long mq_set_ms;             /* когда туннелю дана точка: до WB_MQ_GRACE_S он «ещё поднимается» */
     time_t bad_until;
     time_t rekey_at;
     time_t reg_retry;
@@ -92,6 +101,7 @@ struct wb {
     size_t n;
     int ns;
     int obfs;
+    int mq;                     /* transport: masque */
     int mask;
     char i1[8192];
     char etc[512], st[512];
@@ -140,6 +150,15 @@ static int member_reg(struct member *m, int fresh) {
     return 0;
 }
 
+/* Приговор члену — демону (событие member, daemon/supd.c): 0 — мёртв, ядро уводит группу с него в
+ * этом же проходе сторожа, не дожидаясь, пока рукопожатие устареет (у awg это до трёх минут); 1 —
+ * жив; -1 — не знаю (новая точка ещё не проверена): решает ядро по рукопожатию. Только при смене. */
+static void member_say(struct member *m, int v) {
+    if (m->said == v) return;
+    m->said = v;
+    evline_emit("member", "out", EVLINE_STR, m->o->name, "ok", EVLINE_INT, (long)v, (const char *)NULL);
+}
+
 /* Колония и страна точки члена — в каталоге состояния: после перезапуска модуля точка берётся из
  * файла туннеля, а колонию из него не узнать, и разнесение туннелей по колониям потеряло бы её. */
 static void pt_path(const struct wb *w, const struct member *m, char *p, size_t n) {
@@ -156,11 +175,11 @@ static void pt_save(const struct wb *w, const struct member *m) {
 }
 
 static void pt_load(const struct wb *w, struct member *m) {
-    char p[600], ip[16], colo[8], seen[8];
+    char p[600], ip[48], colo[8], seen[8];
     pt_path(w, m, p, sizeof(p));
     FILE *f = fopen(p, "r");
     if (!f) return;
-    if (fscanf(f, "%15s %7s %7s", ip, colo, seen) == 3 && !strcmp(ip, m->ip)) {
+    if (fscanf(f, "%47s %7s %7s", ip, colo, seen) == 3 && !strcmp(ip, m->ip)) {
         if (strcmp(colo, "-")) snprintf(m->colo, sizeof(m->colo), "%.3s", colo);
         if (strcmp(seen, "-")) snprintf(m->seen, sizeof(m->seen), "%.2s", seen);
     }
@@ -183,6 +202,7 @@ static int member_set(struct wb *w, struct member *m, const struct wb_pt *p) {
     LOG("%s: точка %s (колония %s%s%s)\n", m->o->name, ep, p->colo, p->seen[0] ? ", сайты видят " : "", p->seen);
     pt_save(w, m);
     m->pt_saved = 1;
+    member_say(m, -1);
     evline_emit("awg", "out", EVLINE_STR, m->o->name, (const char *)NULL);
     return 0;
 }
@@ -222,10 +242,10 @@ static int assign(struct wb *w, const int *need) {
     size_t bcn = 0, bin = 0;
     for (size_t i = 0; i < w->n; i++) {
         if (need[i] && w->m[i].bad_ip[0] && time(NULL) < w->m[i].bad_until)
-            snprintf(bi[bin++], 16, "%s", w->m[i].bad_ip);
+            snprintf(bi[bin++], 16, "%.15s", w->m[i].bad_ip);
         if (need[i] || !w->m[i].ip[0]) continue;
         if (w->m[i].colo[0]) snprintf(bc[bcn++], 4, "%s", w->m[i].colo);
-        snprintf(bi[bin++], 16, "%s", w->m[i].ip);
+        snprintf(bi[bin++], 16, "%.15s", w->m[i].ip);
     }
     int rc = -1;
     for (int attempt = 0; attempt < WB_MASKS && !g_stop; attempt++) {
@@ -273,25 +293,195 @@ static int assign(struct wb *w, const int *need) {
     return rc;
 }
 
-/* Жив ли член: 1 — рукопожатие свежее или HTTPS через его устройство идёт; 0 — нет; -1 — устройства
- * нет: демон его ещё не поднял (модуль стартует вместе с демоном, раньше применения спеки) — это не
- * приговор точке, а повод попросить демон поднять член ещё раз. */
+/* Жив ли член: 1 — эхо-запросы через его устройство возвращаются (или, если ICMP молчит, идёт HTTPS);
+ * 0 — нет; -1 — устройства нет: демон его ещё не поднял (модуль стартует вместе с демоном, раньше
+ * применения спеки) — это не приговор точке, а повод попросить демон поднять член ещё раз.
+ *
+ * Проверка ДЕЛОМ на каждом проходе, а не по свежести рукопожатия: рукопожатие считается свежим ещё
+ * три минуты после обрыва (WireGuard обновляет ключи раз в две), и по нему отказ замечался через
+ * 118 с после того, как точку перерезали (стенд QEMU 2026-10-12). Три эхо-запроса — три пакета в
+ * 30 с; trace — только когда эхо молчит (ICMP бывает закрыт) или когда колония и страна неизвестны. */
 static int member_alive(struct member *m) {
     int64_t hs;
     uint64_t rx, tx;
-    if (awg_scan_stat(m->o->device, -1, &hs, &rx, &tx) != 0) return -1;
+    /* Устройство есть? У awg — спросом WireGuard (оно же «наше по виду»), у MASQUE — TUN модуля,
+     * который держит сам поток туннеля (mq_alive зовёт сюда, только когда туннель поднят). */
+    if (m->awg && awg_scan_stat(m->o->device, -1, &hs, &rx, &tx) != 0) return -1;
+    struct wb_ping pg;
+    int echo = wb_ping_dev(m->o->device, "1.1.1.1", 3, 200, 1500, &pg) == 0 && pg.got > 0;
+    if (echo && m->colo[0] && m->seen[0]) return 1;
     struct wb_pt p;
     memset(&p, 0, sizeof(p));
-    /* Свежее рукопожатие — живо, и trace не нужен, если колония и страна уже известны; иначе (точка
-     * поставлена до перезапуска модуля прежней сборкой, файла .pt нет) trace заодно их узнаёт. */
-    int fresh = hs > 0 && time(NULL) - hs <= WB_HS_FRESH;
-    if (fresh && m->colo[0] && m->seen[0]) return 1;
     if (wb_trace_dev(m->o->device, &p) == 0) {
         if (p.colo[0]) snprintf(m->colo, sizeof(m->colo), "%s", p.colo);
         if (p.seen[0]) snprintf(m->seen, sizeof(m->seen), "%s", p.seen);
         return 1;
     }
-    return fresh;
+    return echo;
+}
+
+/* ---- MASQUE (transport: masque, этап 2; WARPBOX.md в хабе, «Протокол») -------------------------
+ *
+ * Точка входа MASQUE — эникаст Cloudflare: адрес даёт API при включении (обычно 162.159.198.x и
+ * 2606:4700:103::x), колонию выбирает сеть, а не адрес, поэтому подбор здесь — не перебор пулов, как
+ * у awg, а выбор открытого порта: API называет 443, 500, 1701, 4500, 4443, 8443, 8095 (все отвечают —
+ * проверено 2026-10-12), и у провайдера, режущего одни, работают другие. Каждая пара адрес:порт
+ * пробуется разом своим соединением (wb_mq_probe: рукопожатие, CONNECT и эхо-запрос в датаграмме),
+ * члены получают разные пары, пока их хватает. */
+static const unsigned MQ_PORTS[] = { 443, 500, 1701, 4500, 4443, 8443, 8095 };
+
+/* Включить MASQUE у регистрации члена (новая регистрация, если у прежней нет id и token). */
+static int member_masque(struct member *m) {
+    if (wb_reg_has_masque(&m->reg)) return 0;
+    char why[256] = "";
+    if ((!m->reg.id[0] || !m->reg.token[0]) && member_reg(m, 1) != 0) return -1;
+    if (wb_enroll_masque(&m->reg, why, sizeof(why)) != 0) {
+        LOG("%s: MASQUE не включился — %s\n", m->o->name, why);
+        m->reg_retry = time(NULL) + WB_REG_RETRY_S;
+        return -1;
+    }
+    if (wb_reg_save(m->reg_path, &m->reg) != 0)
+        LOG("%s: регистрацию не сохранить в %s: %s\n", m->o->name, m->reg_path, strerror(errno));
+    LOG("%s: MASQUE включён (точка %s%s%s)\n", m->o->name, m->reg.mq_ep4, m->reg.mq_ep6[0] ? ", " : "", m->reg.mq_ep6);
+    return 0;
+}
+
+/* Регистрация была включена в MASQUE (transport сменили на awg) — вернуть ключ WireGuard. Файл
+ * туннеля пишется заново при следующем подборе: точка прежняя не годится уже потому, что туннель с
+ * этим ключом у Cloudflare только что снова заведён. */
+static int member_wireguard(struct member *m) {
+    char why[256] = "";
+    if (wb_enroll_wireguard(&m->reg, why, sizeof(why)) != 0) {
+        LOG("%s: ключ WireGuard не вернулся — %s\n", m->o->name, why);
+        return -1;
+    }
+    if (wb_reg_save(m->reg_path, &m->reg) != 0)
+        LOG("%s: регистрацию не сохранить в %s: %s\n", m->o->name, m->reg_path, strerror(errno));
+    LOG("%s: устройству WARP возвращён ключ WireGuard\n", m->o->name);
+    return 0;
+}
+
+static int mq_cfg(const struct wb *w, const struct member *m, struct wb_mq_cfg *c) {
+    memset(c, 0, sizeof(*c));
+    snprintf(c->dev, sizeof(c->dev), "%s", m->o->device);
+    unsigned char b[128];
+    if (wb_b64_decode(m->reg.mq_priv, b, sizeof(b)) != 32) return -1;
+    memcpy(c->priv, b, 32);
+    if (wb_b64_decode(m->reg.mq_peer, b, sizeof(b)) != WB_SPKI_P256) return -1;
+    memcpy(c->spki, b, WB_SPKI_P256);
+    memset(b, 0, sizeof(b));
+    snprintf(c->v4, sizeof(c->v4), "%s", m->reg.v4);
+    snprintf(c->v6, sizeof(c->v6), "%s", m->reg.v6);
+    c->mark = out_underlay_mark(w->sp, m->o);
+    return 0;
+}
+
+struct mq_try {
+    struct wb_mq_cfg c;
+    int rc, rtt, used;
+    char why[160];
+    pthread_t th;
+};
+
+static void *mq_try_run(void *a) {
+    struct mq_try *t = a;
+    t->rc = wb_mq_probe(&t->c, 6000, &t->rtt, t->why, sizeof(t->why));
+    return NULL;
+}
+
+static int mq_point_busy(const struct wb *w, const struct member *self, const char *ep, unsigned port) {
+    for (size_t i = 0; i < w->n; i++) {
+        const struct member *m = &w->m[i];
+        if (m == self) {
+            if (m->bad_ip[0] && time(NULL) < m->bad_until && !strcmp(m->bad_ip, ep) && m->bad_port == port) return 1;
+            continue;
+        }
+        if (m->ip[0] && !strcmp(m->ip, ep) && m->port == port) return 1;
+    }
+    return 0;
+}
+
+/* Точки членам с need[i]: разом все пары адрес:порт, лучшие по задержке — разным членам. */
+static int mq_assign(struct wb *w, const int *need) {
+    struct member *key = NULL;
+    size_t nn = 0;
+    for (size_t i = 0; i < w->n; i++)
+        if (need[i]) { nn++; if (!key && wb_reg_has_masque(&w->m[i].reg)) key = &w->m[i]; }
+    if (!nn || !key) return nn ? -1 : 0;
+    size_t pn = sizeof(MQ_PORTS) / sizeof(MQ_PORTS[0]), tn = 0;
+    struct mq_try *t = calloc(pn + 1, sizeof(*t));
+    if (!t) return -1;
+    for (size_t k = 0; k < pn + 1; k++) {
+        const char *ep = k < pn ? key->reg.mq_ep4 : key->reg.mq_ep6;
+        if (!ep[0] || mq_cfg(w, key, &t[tn].c) != 0) continue;
+        t[tn].c.dev[0] = '\0';
+        snprintf(t[tn].c.ep, sizeof(t[tn].c.ep), "%s", ep);
+        t[tn].c.port = k < pn ? MQ_PORTS[k] : 443;
+        t[tn].rc = -1;
+        if (pthread_create(&t[tn].th, NULL, mq_try_run, &t[tn]) == 0) tn++;
+    }
+    for (size_t k = 0; k < tn; k++) pthread_join(t[k].th, NULL);
+    size_t okn = 0;
+    for (size_t k = 0; k < tn; k++) {
+        if (t[k].rc == 0) {
+            okn++;
+            LOG("%s:%u — MASQUE отвечает, %d мс\n", t[k].c.ep, t[k].c.port, t[k].rtt);
+        } else
+            LOG("%s:%u — %s\n", t[k].c.ep, t[k].c.port, t[k].why[0] ? t[k].why : "не отвечает");
+    }
+    int rc = 0;
+    if (!okn) {
+        char why[256];
+        snprintf(why, sizeof(why), "MASQUE не отвечает ни на одном порту (%.160s)", tn ? t[0].why : "нет точки");
+        LOG("подбор: %s\n", why);
+        evline_emit("down", "why", EVLINE_STR, why, (const char *)NULL);
+        rc = -1;
+    }
+    for (size_t i = 0; okn && i < w->n; i++) {
+        struct member *m = &w->m[i];
+        if (!need[i] || !wb_reg_has_masque(&m->reg)) continue;
+        int best = -1;
+        for (int pass = 0; pass < 2 && best < 0; pass++)
+            for (size_t k = 0; k < tn; k++) {
+                if (t[k].rc != 0 || (!pass && (t[k].used || mq_point_busy(w, m, t[k].c.ep, t[k].c.port)))) continue;
+                if (best < 0 || t[k].rtt < t[best].rtt) best = (int)k;
+            }
+        if (best < 0) continue;
+        t[best].used = 1;
+        struct wb_mq_cfg c;
+        if (mq_cfg(w, m, &c) != 0) { LOG("%s: ключи MASQUE не разобраны\n", m->o->name); continue; }
+        snprintf(c.ep, sizeof(c.ep), "%s", t[best].c.ep);
+        c.port = t[best].c.port;
+        char why[200] = "";
+        if (!m->mq) {
+            if (wb_mq_start(&c, &m->mq, why, sizeof(why)) != 0) { LOG("%s: туннель не поднят — %s\n", m->o->name, why); continue; }
+        } else
+            wb_mq_retarget(m->mq, c.ep, c.port);
+        memset(c.priv, 0, sizeof(c.priv));
+        snprintf(m->ip, sizeof(m->ip), "%.47s", t[best].c.ep);
+        m->port = t[best].c.port;
+        m->colo[0] = m->seen[0] = '\0';
+        m->pt_saved = 0;
+        m->mq_set_ms = (long)time(NULL);
+        member_say(m, -1);
+        LOG("%s: точка MASQUE %s:%u\n", m->o->name, m->ip, m->port);
+    }
+    for (size_t k = 0; k < tn; k++) memset(t[k].c.priv, 0, sizeof(t[k].c.priv));
+    free(t);
+    return rc;
+}
+
+/* Жив ли член MASQUE: туннель поднят (CONNECT принят) и эхо через его устройство возвращается. -1 —
+ * туннель ещё поднимается после новой точки (WB_MQ_GRACE_S). */
+static int mq_alive(struct member *m) {
+    if (!m->mq) return 0;
+    char why[160] = "";
+    if (!wb_mq_up(m->mq, why, sizeof(why))) {
+        if ((long)time(NULL) - m->mq_set_ms < WB_MQ_GRACE_S) return -1;
+        if (why[0] && m->ok) LOG("%s: туннель MASQUE не работает — %s\n", m->o->name, why);
+        return 0;
+    }
+    return member_alive(m) == 1;
 }
 
 /* Состояние группы для `steer status` (поле warp у группы, daemon/status.c): строками в каталоге
@@ -340,8 +530,12 @@ static int load(struct wb *w, const char *spec_path, const char *group) {
         if (!o || strcmp(o->warp_of, group) != 0) continue;
         struct member *m = &w->m[w->n++];
         m->o = o;
-        snprintf(m->conf_path, sizeof(m->conf_path), "%s", o->awg.conf);
-        snprintf(m->reg_path, sizeof(m->reg_path), "%.*s.reg", (int)(strlen(o->awg.conf) - 5), o->awg.conf);
+        m->said = 2;
+        /* Файл регистрации — по имени группы и номеру члена, как файл туннеля awg ({etc}/warp/<группа>-<n>):
+         * у члена MASQUE файла туннеля нет, и выводить путь из него нельзя. */
+        m->awg = w->g->grp.warp.transport == WARP_AWG;
+        if (m->awg) snprintf(m->conf_path, sizeof(m->conf_path), "%s", o->awg.conf);
+        snprintf(m->reg_path, sizeof(m->reg_path), "%s/%s-%zu.reg", w->etc, group, w->n);
     }
     return w->n ? 0 : 2;
 }
@@ -354,51 +548,56 @@ int cmd_warp(const char *spec_path, const char *group) {
     memset(&w, 0, sizeof(w));
     int rc = load(&w, spec_path, group);
     if (rc) return rc;
-    if (w.g->grp.warp.transport != WARP_AWG) {
-        evline_emit("down", "why", EVLINE_STR, "MASQUE — следующий этап", (const char *)NULL);
-        return 2;
-    }
-    w.ns = wb_ns_new();
-    if (w.ns < 0) {
+    w.mq = w.g->grp.warp.transport == WARP_MASQUE;
+    w.ns = w.mq ? -1 : wb_ns_new();
+    if (!w.mq && w.ns < 0) {
         char why[160];
         snprintf(why, sizeof(why), "своё пространство сети для подбора не создать: %s", strerror(errno));
         LOG("%s\n", why);
         evline_emit("down", "why", EVLINE_STR, why, (const char *)NULL);
         return 1;
     }
-    w.obfs = awg_kernel_has_awg();
-    if (!w.obfs) LOG("в ядре нет AmneziaWG — туннели WARP без обфускации (обычный WireGuard)\n");
-    mask_load(&w);
+    w.obfs = !w.mq && awg_kernel_has_awg();
+    if (!w.mq && !w.obfs) LOG("в ядре нет AmneziaWG — туннели WARP без обфускации (обычный WireGuard)\n");
+    if (!w.mq) mask_load(&w);
     int *need = calloc(w.n, sizeof(*need));
     if (!need) return 1;
     int said_up = -1;
     while (!g_stop) {
         /* Регистрации. */
-        for (size_t i = 0; i < w.n && !g_stop; i++)
+        for (size_t i = 0; i < w.n && !g_stop; i++) {
             if (!w.m[i].have_reg) member_reg(&w.m[i], 0);
+            if (w.mq && w.m[i].have_reg) member_masque(&w.m[i]);
+            if (!w.mq && w.m[i].have_reg && w.m[i].reg.mq_priv[0]) member_wireguard(&w.m[i]);
+        }
         /* Кто жив, кому нужна точка. */
         size_t alive = 0;
         for (size_t i = 0; i < w.n; i++) {
             struct member *m = &w.m[i];
             need[i] = 0;
             if (!m->have_reg) continue;
-            if (!m->ip[0]) {
+            if (w.mq && (!wb_reg_has_masque(&m->reg) || !m->mq || !m->ip[0])) {
+                need[i] = wb_reg_has_masque(&m->reg);
+                continue;
+            }
+            if (!w.mq && !m->ip[0]) {
                 char ep[64];
                 /* Файл уже есть (прошлый запуск) — сначала проверить его, а не подбирать заново. */
                 if (wb_conf_endpoint(m->conf_path, ep, sizeof(ep)) == 0 && strchr(ep, ':')) {
                     char *c = strrchr(ep, ':');
                     m->port = (unsigned)atoi(c + 1);
                     *c = '\0';
-                    snprintf(m->ip, sizeof(m->ip), "%.15s", ep);
+                    snprintf(m->ip, sizeof(m->ip), "%.47s", ep);
                     pt_load(&w, m);
                 } else { need[i] = 1; continue; }
             }
-            int al = member_alive(m);
+            int al = w.mq ? mq_alive(m) : member_alive(m);
             if (al < 0) {
-                evline_emit("awg", "out", EVLINE_STR, m->o->name, (const char *)NULL);
+                if (!w.mq) evline_emit("awg", "out", EVLINE_STR, m->o->name, (const char *)NULL);
                 continue;
             }
             if (al) {
+                member_say(m, 1);
                 if (m->colo[0] && m->seen[0] && !m->pt_saved) { pt_save(&w, m); m->pt_saved = 1; }
                 if (!m->ok) LOG("%s: работает (%s%s%s)\n", m->o->name, m->ip, m->colo[0] ? ", колония " : "", m->colo);
                 m->ok = 1;
@@ -408,6 +607,7 @@ int cmd_warp(const char *spec_path, const char *group) {
                 continue;
             }
             m->ok = 0;
+            member_say(m, 0);           /* трафик — с него сразу; точку меняем после WB_FAILS проверок */
             if (++m->fails < WB_FAILS) continue;
             m->fails = 0;
             if (++m->replaced >= WB_REKEY_AT && time(NULL) >= m->rekey_at) {
@@ -415,14 +615,21 @@ int cmd_warp(const char *spec_path, const char *group) {
                 m->rekey_at = time(NULL) + WB_REKEY_MIN_S;
                 m->replaced = 0;
                 if (member_reg(m, 1) != 0) continue;
+                if (w.mq) {
+                    /* Новые ключи — новый туннель: у прежнего потока старый ключ клиента. */
+                    wb_mq_stop(m->mq);
+                    m->mq = NULL;
+                    if (member_masque(m) != 0) continue;
+                }
             } else
                 LOG("%s: точка %s не отвечает — подбираю другую\n", m->o->name, m->ip);
             snprintf(m->bad_ip, sizeof(m->bad_ip), "%s", m->ip);
+            m->bad_port = m->port;
             m->bad_until = time(NULL) + WB_BAD_S;
             m->ip[0] = m->colo[0] = '\0';
             need[i] = 1;
         }
-        if (assign(&w, need) == 0)
+        if ((w.mq ? mq_assign(&w, need) : assign(&w, need)) == 0)
             for (size_t i = 0; i < w.n; i++) if (need[i] && w.m[i].ip[0]) alive++;
         int up = alive > 0;
         const char *why = up ? NULL : "ни один туннель WARP не работает";
@@ -435,7 +642,10 @@ int cmd_warp(const char *spec_path, const char *group) {
         nap(WB_CHECK_S);
     }
     free(need);
-    for (size_t i = 0; i < w.n; i++) wb_reg_wipe(&w.m[i].reg);
+    for (size_t i = 0; i < w.n; i++) {
+        wb_mq_stop(w.m[i].mq);
+        wb_reg_wipe(&w.m[i].reg);
+    }
     return 0;
 }
 
@@ -466,6 +676,38 @@ int cmd_warp_scan(const char *spec_path, const char *group) {
     memset(&w, 0, sizeof(w));
     int rc = load(&w, spec_path, group);
     if (rc) return rc;
+    if (w.g->grp.warp.transport == WARP_MASQUE) {
+        /* MASQUE: пробы всех пар адрес:порт, без туннелей. */
+        if (member_reg(&w.m[0], 0) != 0 || member_masque(&w.m[0]) != 0) {
+            printf("{\"ok\":false,\"error\":\"регистрации MASQUE нет\"}\n");
+            return 1;
+        }
+        size_t pn = sizeof(MQ_PORTS) / sizeof(MQ_PORTS[0]), tn = 0;
+        struct mq_try t[sizeof(MQ_PORTS) / sizeof(MQ_PORTS[0]) + 1];
+        memset(t, 0, sizeof(t));
+        for (size_t k = 0; k < pn + 1; k++) {
+            const char *ep = k < pn ? w.m[0].reg.mq_ep4 : w.m[0].reg.mq_ep6;
+            if (!ep[0] || mq_cfg(&w, &w.m[0], &t[tn].c) != 0) continue;
+            t[tn].c.dev[0] = '\0';
+            snprintf(t[tn].c.ep, sizeof(t[tn].c.ep), "%s", ep);
+            t[tn].c.port = k < pn ? MQ_PORTS[k] : 443;
+            if (pthread_create(&t[tn].th, NULL, mq_try_run, &t[tn]) == 0) tn++;
+        }
+        int any = 0;
+        for (size_t k = 0; k < tn; k++) { pthread_join(t[k].th, NULL); if (t[k].rc == 0) any = 1; }
+        printf("{\"ok\":%s,\"transport\":\"masque\",\"points\":[", any ? "true" : "false");
+        for (size_t k = 0; k < tn; k++) {
+            printf("%s{\"ip\":\"%s\",\"port\":%u,\"ok\":%s", k ? "," : "", t[k].c.ep, t[k].c.port,
+                   t[k].rc == 0 ? "true" : "false");
+            if (t[k].rc == 0) printf(",\"rtt\":%d", t[k].rtt);
+            else { printf(",\"error\":"); jsonw_str(stdout, t[k].why); }
+            printf("}");
+            memset(t[k].c.priv, 0, sizeof(t[k].c.priv));
+        }
+        printf("]}\n");
+        wb_reg_wipe(&w.m[0].reg);
+        return any ? 0 : 1;
+    }
     w.ns = wb_ns_new();
     if (w.ns < 0) {
         printf("{\"ok\":false,\"error\":");

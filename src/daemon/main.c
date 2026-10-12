@@ -283,7 +283,10 @@ int main(int argc, char **argv) {
          * давал пустой вывод и код 0, а по этому выводу init-скрипт решает, каким выходам
          * поднимать процессы. Тишина вместо отказа означала бы не поднятый туннель без
          * единой строки о причине. */
-        if (a.kind && !kind_by_name(a.kind))
+        /* warp-masque — член kind: warp (TUN модуля steer-warpbox): в реестре видов его нет (руками в
+         * спеке не пишется), но управляющему слою устройства таких членов нужны так же, как awg, — для
+         * зоны фаервола. */
+        if (a.kind && !kind_by_name(a.kind) && strcmp(a.kind, kind_warpm.name) != 0)
             die("--kind: нужен interface, vless, xsteer, zapret или direct, а не %s", a.kind);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         for (size_t i = 0; i < cfg.out_n; i++) {

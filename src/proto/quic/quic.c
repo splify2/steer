@@ -1321,6 +1321,11 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
         q->ctx = qcssl_ctx_client(cfg->insecure || cfg->pin_sha256, cfg->ca_pem, cfg->ca_pem_n, cfg->ca_file);
         if (!q->ctx) { rc = QC_ETLS; goto fail; }
         q->own_ctx = 1;
+        if (cfg->client_cert &&
+            qcssl_ctx_client_cert(q->ctx, cfg->client_cert, cfg->client_cert_n, cfg->client_key, cfg->client_key_n) != 0) {
+            rc = QC_ETLS;
+            goto fail;
+        }
     }
     q->ssl = qcssl_new(q->ctx, &q->ref, cfg->sni, cfg->alpn, 0, !(cfg->insecure || cfg->pin_sha256));
     if (!q->ssl) { rc = QC_ETLS; goto fail; }
@@ -1542,4 +1547,8 @@ void qc_stats_get(struct qc *q, struct qc_stats *st) {
     st->dg_dropped = q->dg_dropped;
     st->tx_calls = q->tx_calls;
     st->rx_calls = q->rx_calls;
+}
+
+int qc_peer_cert(struct qc *q, uint8_t *out, size_t cap) {
+    return q && q->ssl ? qcssl_peer_der(q->ssl, out, cap) : -1;
 }

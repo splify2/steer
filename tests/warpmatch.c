@@ -82,8 +82,16 @@ static void t_spec(void) {
     check("  у членов off", OUT_V6_OFF, m ? (long)m->ipv6 : -1);
     check("warp: ipv6: routed — отказ", 1,
           spec_load("version: 2\noutputs:\n  cf: { kind: warp, ipv6: routed }\n", &sp, msg, sizeof msg) < 0);
-    check("warp: masque — следующий этап, отказ", 1,
-          spec_load("version: 2\noutputs:\n  cf: { kind: warp, transport: masque }\n", &sp, msg, sizeof msg) < 0);
+    check("warp: masque — принят", 0,
+          spec_load("version: 2\noutputs:\n  mq: { kind: warp, transport: masque, count: 2 }\n", &sp, msg, sizeof msg) < 0);
+    m = out_by_name(&sp, "mq.2");
+    check("  член — вид warp-masque", 1, m && kind_of(m) == &kind_warpm);
+    check("  у члена устройство, IPv6 nat", 1, m && !strcmp(m->device, "mq.2") && m->ipv6 == OUT_V6_NAT);
+    check_s("  член знает группу", "mq", m ? m->warp_of : "");
+    check("warp-masque руками — отказ", 1,
+          spec_load("version: 2\noutputs:\n  x: { kind: warp-masque }\n", &sp, msg, sizeof msg) < 0);
+    check("неизвестный transport — отказ", 1,
+          spec_load("version: 2\noutputs:\n  cf: { kind: warp, transport: wireguard }\n", &sp, msg, sizeof msg) < 0);
     check("warp: страна и в countries, и в exclude_countries — отказ", 1,
           spec_load("version: 2\noutputs:\n  cf: { kind: warp, countries: [RU], exclude_countries: [ru] }\n", &sp, msg, sizeof msg) < 0);
     check("warp: count 0 — отказ", 1,
@@ -108,6 +116,8 @@ static void t_json(void) {
     check_s("  \\u002b раскодирован", "K+=", o);
     check("json: объект в массиве", 0, wb_json_get(d, "result.x.1.q", o, sizeof o));
     check_s("  значение", "z", o);
+    check("json: \\n — перевод строки", 0, wb_json_get("{\"k\":\"a\\nb\"}", "k", o, sizeof o));
+    check_s("  значение", "a\nb", o);
     check("json: true — текстом", 0, wb_json_get(d, "result.warp_enabled", o, sizeof o));
     check_s("  значение", "true", o);
     check("json: число — текстом", 0, wb_json_get(d, "result.n", o, sizeof o));
@@ -116,6 +126,19 @@ static void t_json(void) {
     check("json: за концом массива", -1, wb_json_get(d, "result.x.5", o, sizeof o));
     check("json: объект — не значение", -1, wb_json_get(d, "result.config", o, sizeof o));
     check("json: не уместилось", -1, wb_json_get(d, "result.config.interface.addresses.v4", o, 4));
+    /* Строка длиннее 512 байт перед искомым полем: обход её пропускает, не копируя (ответ API на
+     * включение MASQUE несёт длинные поля до config). */
+    static char big[2048];
+    char filler[1200];
+    memset(filler, 'x', sizeof(filler) - 1);
+    filler[sizeof(filler) - 1] = '\0';
+    snprintf(big, sizeof(big), "{\"license\":\"%s\",\"a\":[\"%s\",{\"k\":1}],\"config\":{\"v\":\"ok\"}}",
+             filler, filler + 600);
+    check("json: длинная строка до поля — обход её пропускает", 0, wb_json_get(big, "config.v", o, sizeof o));
+    check_s("  значение", "ok", o);
+    check("json: экранированная кавычка в пропускаемой строке", 0,
+          wb_json_get("{\"s\":\"a\\\"b\",\"t\":\"z\"}", "t", o, sizeof o));
+    check_s("  значение", "z", o);
 }
 
 /* Файл туннеля с маской k принимается разбором awg ядра; I1 доходит до разбора целиком. */
