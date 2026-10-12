@@ -103,6 +103,9 @@ int dup_busy(void);
 /* Закрыть всё (выход резолвера). */
 void dup_close_all(void);
 
+/* Последняя ошибка апстрима idx (как поле error в dns-log) или NULL — её нет. */
+const char *dup_error(size_t idx);
+
 /* Состояние для `dns-log`/status: элементы JSON-массива апстримов, через запятую, без скобок. */
 void dup_render(FILE *f);
 

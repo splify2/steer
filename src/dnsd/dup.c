@@ -1999,6 +1999,11 @@ static const char *proto_name(int p) {
     }
 }
 
+const char *dup_error(size_t idx) {
+    if (idx >= g_dups_n || !g_dups[idx] || !g_dups[idx]->err[0]) return NULL;
+    return g_dups[idx]->err;
+}
+
 void dup_render(FILE *f) {
     long now = now_ms();
     for (size_t i = 0; i < g_dups_n; i++) {

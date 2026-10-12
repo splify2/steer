@@ -75,6 +75,9 @@ static int ask_daemon(const char *line, const char *spec, const char *state_dir)
  * вызывающему (die и разбор аргументов) уровня НЕ несут и несут «steer: » — это ответ
  * тому, кто позвал, а не запись в журнал; так и записано в контракте. */
 int dnsd_main(int argc, char **argv);
+/* steer dns-probe — проверка DNS-серверов слоем апстримов резолвера (src/dnsd/dprobe.c). */
+int dns_probe_main(int argc, char **argv);
+void dns_probe_usage_flags(FILE *f);
 
 /* Имя таблицы правил (nft_table) — в spec.h: его спрашивает и сторож, см. failopen_mark в
  * failover.c. */
@@ -201,6 +204,7 @@ int main(int argc, char **argv) {
             if (!strcmp(cmd, "fit")) aggregate_usage_flags(stdout);
             else if (!strcmp(cmd, "daemon") || !strcmp(cmd, "ctl-serve") || !strcmp(cmd, "ctl"))
                 ctl_usage_flags(stdout);
+            else if (!strcmp(cmd, "dns-probe")) dns_probe_usage_flags(stdout);
             else dnsd_usage_flags(stdout);
         }
         return 0;
@@ -215,6 +219,7 @@ int main(int argc, char **argv) {
         if (!strcmp(cmd, "daemon") || !strcmp(cmd, "ctl-serve"))
             return ctl_serve_main(argc - 2, argv + 2);
         if (!strcmp(cmd, "ctl")) return ctl_client_main(argc - 2, argv + 2);
+        if (!strcmp(cmd, "dns-probe")) return dns_probe_main(argc - 2, argv + 2);
         return dnsd_main(argc - 2, argv + 2);
     }
 
