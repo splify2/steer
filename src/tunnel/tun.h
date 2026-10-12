@@ -178,28 +178,6 @@ static inline int tun_buffered(const struct tun_dev *d) {
     return d->single != 0 || d->seg_i < d->seg_n;
 }
 
-/* Заголовок для сегмента данных: суммы в нём НЕ считаются — их поставит tun_write_data,
- * потому что только там известно, считать их нам или это сделает ядро. */
-void tcp_hdr_build(unsigned char out[TUN_HDR_LEN],
-                   uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
-                   uint32_t seq, uint32_t ack, unsigned char flags,
-                   size_t data_n, uint16_t window);
-
-/* Отдать клиенту заголовок вместе с данными. Данные НЕ копируются.
- *
- * Ждёт готовности устройства при заполненной очереди и повторяет: бросить сегмент нельзя,
- * повторной передачи у нас нет, и потерянный сегмент подвесил бы соединение навсегда.
- * Возвращает 0 или -1. */
-int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
-                   const unsigned char *data, size_t data_n);
-
-/* То же, но данные лежат в ДВУХ кусках подряд (хвост и начало кольца повтора, где неотправленное
- * перешло через край). Один пакет, одна запись. Второй кусок допустим только при разгрузке:
- * без неё суммы считаются проходом по данным, и -1 вернётся сразу. */
-int tun_write_data2(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
-                    const unsigned char *data, size_t data_n,
-                    const unsigned char *data2, size_t data2_n);
-
 /* Служебный пакет, собранный tcp_build: суммы в нём уже посчитаны. Без повторов —
  * потерянный SYN-ACK или ACK клиент пришлёт заново сам. */
 void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n);
