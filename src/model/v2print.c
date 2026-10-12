@@ -280,6 +280,7 @@ static void warp_flow(struct flow *w, const struct spec *s, const struct output 
     if (g->members_n) {
         const struct output *m = spec_out(s, g->members[0]);
         if (m->over[0]) fs(w, "over", m->over);
+        if (m->ipv6 == OUT_V6_OFF) fs(w, "ipv6", "off");
     }
     if (o->on_fail != FAIL_DROP) fs(w, "on_fail", on_fail_name(o->on_fail));
 }

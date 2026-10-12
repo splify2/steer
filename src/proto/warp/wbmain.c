@@ -47,6 +47,7 @@
 #define WB_REKEY_AT 3           /* на какой замене подряд — новые ключи */
 #define WB_REKEY_MIN_S 86400    /* новые ключи не чаще раза в сутки на член */
 #define WB_REG_RETRY_S 120
+#define WB_BAD_S 1800           /* снятая точка не возвращается полчаса: молчит она чаще всего не случайно */
 
 static volatile sig_atomic_t g_stop;
 static void on_term(int sig) { (void)sig; g_stop = 1; }
@@ -77,6 +78,8 @@ struct member {
     int ok;                     /* последний проход: жив */
     int fails;                  /* проходов подряд без жизни */
     int replaced;               /* замен подряд без успеха */
+    char bad_ip[16];            /* точка, которую только что сняли: в подбор не берётся WB_BAD_S */
+    time_t bad_until;
     time_t rekey_at;
     time_t reg_retry;
 };
@@ -136,6 +139,33 @@ static int member_reg(struct member *m, int fresh) {
     return 0;
 }
 
+/* Колония и страна точки члена — в каталоге состояния: после перезапуска модуля точка берётся из
+ * файла туннеля, а колонию из него не узнать, и разнесение туннелей по колониям потеряло бы её. */
+static void pt_path(const struct wb *w, const struct member *m, char *p, size_t n) {
+    snprintf(p, n, "%s/%s.pt", w->st, m->o->name);
+}
+
+static void pt_save(const struct wb *w, const struct member *m) {
+    char p[600];
+    pt_path(w, m, p, sizeof(p));
+    FILE *f = fopen(p, "w");
+    if (!f) return;
+    fprintf(f, "%s %s %s\n", m->ip, m->colo[0] ? m->colo : "-", m->seen[0] ? m->seen : "-");
+    fclose(f);
+}
+
+static void pt_load(const struct wb *w, struct member *m) {
+    char p[600], ip[16], colo[8], seen[8];
+    pt_path(w, m, p, sizeof(p));
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    if (fscanf(f, "%15s %7s %7s", ip, colo, seen) == 3 && !strcmp(ip, m->ip)) {
+        if (strcmp(colo, "-")) snprintf(m->colo, sizeof(m->colo), "%.3s", colo);
+        if (strcmp(seen, "-")) snprintf(m->seen, sizeof(m->seen), "%.2s", seen);
+    }
+    fclose(f);
+}
+
 /* Поставить точку члену: файл и событие демону. */
 static int member_set(struct wb *w, struct member *m, const struct wb_pt *p) {
     char ep[40];
@@ -150,6 +180,7 @@ static int member_set(struct wb *w, struct member *m, const struct wb_pt *p) {
     snprintf(m->colo, sizeof(m->colo), "%s", p->colo);
     snprintf(m->seen, sizeof(m->seen), "%s", p->seen);
     LOG("%s: точка %s (колония %s%s%s)\n", m->o->name, ep, p->colo, p->seen[0] ? ", сайты видят " : "", p->seen);
+    pt_save(w, m);
     evline_emit("awg", "out", EVLINE_STR, m->o->name, (const char *)NULL);
     return 0;
 }
@@ -184,10 +215,12 @@ static int assign(struct wb *w, const int *need) {
     if (!nn) return 0;
     if (!key) return -1;
     char (*bc)[4] = calloc(w->n, sizeof(*bc));
-    char (*bi)[16] = calloc(w->n, sizeof(*bi));
+    char (*bi)[16] = calloc(2 * w->n, sizeof(*bi));
     if (!bc || !bi) { free(bc); free(bi); return -1; }
     size_t bcn = 0, bin = 0;
     for (size_t i = 0; i < w->n; i++) {
+        if (need[i] && w->m[i].bad_ip[0] && time(NULL) < w->m[i].bad_until)
+            snprintf(bi[bin++], 16, "%s", w->m[i].bad_ip);
         if (need[i] || !w->m[i].ip[0]) continue;
         if (w->m[i].colo[0]) snprintf(bc[bcn++], 4, "%s", w->m[i].colo);
         snprintf(bi[bin++], 16, "%s", w->m[i].ip);
@@ -238,11 +271,13 @@ static int assign(struct wb *w, const int *need) {
     return rc;
 }
 
-/* Жив ли член: рукопожатие свежее, а если нет — HTTPS через его устройство. */
+/* Жив ли член: 1 — рукопожатие свежее или HTTPS через его устройство идёт; 0 — нет; -1 — устройства
+ * нет: демон его ещё не поднял (модуль стартует вместе с демоном, раньше применения спеки) — это не
+ * приговор точке, а повод попросить демон поднять член ещё раз. */
 static int member_alive(struct member *m) {
     int64_t hs;
     uint64_t rx, tx;
-    if (awg_scan_stat(m->o->device, -1, &hs, &rx, &tx) != 0) return 0;
+    if (awg_scan_stat(m->o->device, -1, &hs, &rx, &tx) != 0) return -1;
     struct wb_pt p;
     memset(&p, 0, sizeof(p));
     if (hs > 0 && time(NULL) - hs <= WB_HS_FRESH) return 1;
@@ -325,10 +360,15 @@ int cmd_warp(const char *spec_path, const char *group) {
                 if (wb_conf_endpoint(m->conf_path, ep, sizeof(ep)) == 0 && strchr(ep, ':')) {
                     *strrchr(ep, ':') = '\0';
                     snprintf(m->ip, sizeof(m->ip), "%.15s", ep);
-                    m->fails = WB_FAILS - 1;            /* одна неудача — и замена */
+                    pt_load(&w, m);
                 } else { need[i] = 1; continue; }
             }
-            if (member_alive(m)) {
+            int al = member_alive(m);
+            if (al < 0) {
+                evline_emit("awg", "out", EVLINE_STR, m->o->name, (const char *)NULL);
+                continue;
+            }
+            if (al) {
                 if (!m->ok) LOG("%s: работает (%s%s%s)\n", m->o->name, m->ip, m->colo[0] ? ", колония " : "", m->colo);
                 m->ok = 1;
                 m->fails = 0;
@@ -346,6 +386,8 @@ int cmd_warp(const char *spec_path, const char *group) {
                 if (member_reg(m, 1) != 0) continue;
             } else
                 LOG("%s: точка %s не отвечает — подбираю другую\n", m->o->name, m->ip);
+            snprintf(m->bad_ip, sizeof(m->bad_ip), "%s", m->ip);
+            m->bad_until = time(NULL) + WB_BAD_S;
             m->ip[0] = m->colo[0] = '\0';
             need[i] = 1;
         }

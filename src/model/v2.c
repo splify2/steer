@@ -1045,7 +1045,7 @@ static int warp_countries(struct v2 *x, const struct ynode *v, const char *w, ch
 
 static const char *const WARP_KEYS[] = { "kind", "transport", "count", "pick", "tolerance", "interval",
                                          "url", "idle_timeout", "countries", "exclude_countries",
-                                         "on_fail", "over", NULL };
+                                         "on_fail", "over", "ipv6", NULL };
 
 static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *val);
 
@@ -1142,9 +1142,19 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
     gc->warp.xcc_n = xcc_n;
     gc->warp.xcc_set = xv != NULL;
 
+    /* IPv6 членов: у регистрации WARP один адрес /128, и IPv6 клиентов через туннель идёт только с
+     * подменой — `ipv6: nat` (подмену ставит ядро в своей таблице) по умолчанию; `off` — без IPv6. */
+    const struct ynode *v6 = ynode_get(val, "ipv6");
+    if (v6) {
+        const char *t;
+        snprintf(w, sizeof(w), "%s.ipv6", where);
+        if (str_of(x, v6, w, &t)) return -1;
+        if (strcmp(t, "nat") && strcmp(t, "off"))
+            return fail(x, v6, "%s: «%s» — у kind: warp nat или off (адрес IPv6 у WARP один)", w, t);
+    }
     const struct ynode *ov = ynode_get(val, "over");
     for (long n = 1; n <= count; n++) {
-        struct ynode *m = yn_new(x, val, YN_MAP, ov ? 3 : 2);
+        struct ynode *m = yn_new(x, val, YN_MAP, ov ? 4 : 3);
         char conf[300];
         snprintf(conf, sizeof(conf), "%s/warp/%s-%ld.conf", plat()->etc_dir, name, n);
         if (!m) return fail(x, val, "%s: недостаточно памяти", where);
@@ -1152,8 +1162,10 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
         m->items[1] = yn_str(x, val, "awg");
         m->items[2] = yn_str(x, val, "conf");
         m->items[3] = yn_str(x, val, conf);
-        if (ov) { m->items[4] = yn_str(x, ov, "over"); m->items[5] = (struct ynode *)ov; }
-        for (size_t i = 0; i < (ov ? 6u : 4u); i++)
+        m->items[4] = yn_str(x, val, "ipv6");
+        m->items[5] = v6 ? (struct ynode *)v6 : yn_str(x, val, "nat");
+        if (ov) { m->items[6] = yn_str(x, ov, "over"); m->items[7] = (struct ynode *)ov; }
+        for (size_t i = 0; i < (ov ? 8u : 6u); i++)
             if (!m->items[i]) return fail(x, val, "%s: недостаточно памяти", where);
         size_t midx = x->s->out_n;
         if (p_output(x, mem->items[n - 1], m)) return -1;

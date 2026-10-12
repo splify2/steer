@@ -384,7 +384,7 @@ $(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbu
 $(BUILD)/warpmatch: tests/warpmatch.c src/kinds/awg.c src/kinds/awg.h src/proto/warp/wbconf.c src/proto/warp/wbconf.h \
                     src/proto/warp/wbjson.c src/proto/warp/wbmask.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/warpmatch.c src/proto/warp/wbconf.c src/proto/warp/wbjson.c $(MODEL_KINDS)
+	$(CC) $(CFLAGS) -o $@ tests/warpmatch.c src/kinds/awg.c src/proto/warp/wbconf.c src/proto/warp/wbjson.c $(MODEL_KINDS)
 
 $(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)

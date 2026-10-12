@@ -364,8 +364,8 @@ check "pack пишет конфликты как !имя (apk) и Conflicts (opk
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c '_dall="\$_dall !\$_c"') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c "Conflicts: ")"
 check "pack пишет Replaces и Provides в обоих форматах" "1 1 1 1" \
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c -- '--info replaces:') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c -- '--info provides:') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'Replaces: ') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'Provides: ')"
-check "build.sh упаковывает модули по кругу vless xsteer obfs tgws hysteria2 proxy" "1 1" \
-    "$(grep -c '^ *pack "steer-\$m" ' build.sh) $(grep -c '^    for m in vless xsteer obfs tgws hysteria2 proxy; do' build.sh)"
+check "build.sh упаковывает модули по кругу vless xsteer obfs tgws hysteria2 proxy warpbox" "1 1" \
+    "$(grep -c '^ *pack "steer-\$m" ' build.sh) $(grep -c '^    for m in vless xsteer obfs tgws hysteria2 proxy warpbox; do' build.sh)"
 check "pack зовёт apk mkpkg и mk_ipk из одного дерева" "1 1" \
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'apk mkpkg') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'mk_ipk ')"
 # Мета-пакет steer-extended ставит ядро и четыре модуля (имя ждёт splify2, пакет устарел), а
@@ -385,7 +385,7 @@ check "steer-extended не включает steer-proxy" "0" \
     "$(grep 'pack steer-extended' build.sh | grep -c steer-proxy)"
 check "модули зависят от steer-core" "1" "$(grep -c 'mdeps="steer-core \$(pkg_deps' build.sh)"
 check "список наших пакетов — новая раскладка (steer-core, модули, мета)" "1" \
-    "$(grep -c '^OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-proxy steer-extended "$' build.sh)"
+    "$(grep -c '^OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-proxy steer-warpbox steer-extended "$' build.sh)"
 # Зависимости между нашими пакетами — точной версии (формат линии событий и ABI libsteer между
 # выпусками не обещаны).
 check "наши пакеты зависят друг от друга точной версией (apk и opkg)" "1 1" \

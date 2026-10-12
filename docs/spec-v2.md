@@ -179,6 +179,7 @@ rules:
 | `zapret` | `strategy` | обход DPI через nfqws; `strategy` — файл ключей nfqws (v1: `opts_file`, умолчание `{etc}/zapret/<имя>.opts`); не на телефоне |
 | `tgws` | `domain` | мост Telegram; `domain` обязателен; `on_fail` — только `drop` |
 | `group` | `members`, `pick`, `default`, `tolerance`, `interval`, `url`, `idle_timeout`, `weights` | группа выходов (ниже) |
+| `warp` | `count`, `transport`, `countries`, `exclude_countries`, `pick`, `tolerance`, `interval`, `url`, `idle_timeout`, `on_fail`, `over`, `ipv6` (`nat` или `off`) | Cloudflare WARP: группа из `count` туннелей `awg` «<имя>.<n>», регистрацию и точки ведёт модуль `steer-warpbox` ([docs/warp.md](warp.md)) |
 
 Почему VLESS пишется `kind: tunnel, protocol: vless`, а не `kind: vless`: туннель поверх потоков —
 общий стек, а протокол — его дайлер (docs/architecture.md, «Туннели: стек, дайлер, транспорт»).
@@ -190,6 +191,12 @@ rules:
 Ключи те же, что у vless, кроме `transport`: у hysteria2 транспорта нет, и ключ — ошибка разбора.
 Узлы подписки — ссылки `hysteria2://` / `hy2://` либо конфиг Xray-core
 ([docs/hysteria2.md](hysteria2.md)). В v1 тот же выход пишется `kind: hysteria2`.
+
+`kind: warp` — выход через Cloudflare WARP одной строкой, только с пакетом `steer-warpbox`. Разбор
+разворачивает его в группу с именем выхода и члены `<имя>.1` … `<имя>.<count>` вида `awg` с файлами
+`{etc}/warp/<имя>-<n>.conf`; файлы пишет модуль, а до первого файла член ждёт и ошибкой apply не
+считается. Имена членов заняты: выход с таким именем рядом — отказ разбора. `steer spec convert`
+печатает выход обратно одной строкой `kind: warp`. Ключи и поведение — [docs/warp.md](warp.md).
 
 `protocol: trojan`, `shadowsocks`, `socks`, `http`, `vmess` — клиенты протоколов прокси
 (podkop/forkop поверх steer через коннектор sing-box), только с пакетом `steer-proxy` (в

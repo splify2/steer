@@ -9,9 +9,7 @@
  *     со всеми масками I1, включая собранные заново DNS, STUN и SIP: маска, которую разбор не
  *     принял, означает туннель, который не поднимется ни на одной точке, и подбор, который
  *     переберёт их все.
- * awg.c — #include, как в tests/awgmatch.c (его статические помощники стенду нужны как есть). */
-/* awg.c ниже — #include, а ему нужен _GNU_SOURCE (setns, устройства подбора) до первого заголовка. */
-#define _GNU_SOURCE
+ * awg.c компонуется (Makefile), а не #include: стенду нужен только его открытый разбор файла (awg.h). */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -22,7 +20,9 @@
 
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 
-#include "../src/kinds/awg.c"
+#include "awg.h"
+#include "kind.h"
+#include "platform.h"
 #include "wbconf.h"
 #include "wbjson.h"
 
@@ -74,7 +74,14 @@ static void t_spec(void) {
         char want[512];
         snprintf(want, sizeof want, "%s/warp/cf-2.conf", plat()->etc_dir);
         check_s("warp: файл члена — {etc}/warp/<группа>-<n>.conf", want, m->awg.conf);
+        check("warp: IPv6 члена — nat по умолчанию", OUT_V6_NAT, m->ipv6);
     }
+    check("warp: ipv6: off — принят", 0,
+          spec_load("version: 2\noutputs:\n  cf: { kind: warp, ipv6: off }\n", &sp, msg, sizeof msg) < 0);
+    m = out_by_name(&sp, "cf.1");
+    check("  у членов off", OUT_V6_OFF, m ? (long)m->ipv6 : -1);
+    check("warp: ipv6: routed — отказ", 1,
+          spec_load("version: 2\noutputs:\n  cf: { kind: warp, ipv6: routed }\n", &sp, msg, sizeof msg) < 0);
     check("warp: masque — следующий этап, отказ", 1,
           spec_load("version: 2\noutputs:\n  cf: { kind: warp, transport: masque }\n", &sp, msg, sizeof msg) < 0);
     check("warp: страна и в countries, и в exclude_countries — отказ", 1,

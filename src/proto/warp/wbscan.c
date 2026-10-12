@@ -410,9 +410,14 @@ int wb_scan_run(struct wb_scan *s) {
     }
     size_t good = 0;
     int altleft = 2;
-    for (size_t oi = 0; oi < order_n && good < s->want; oi++) {
+    /* Хватит, когда набралось want хороших — или want + 2 годных любого класса: если все колонии
+     * заняты соседями (у машины разработки все точки — HEL), хорошей не будет ни одной, и без этого
+     * предела подбор перебирал бы всех кандидатов до последнего. Не ответившие разведке пробуются,
+     * только пока годных меньше want: каждая такая — до трёх рукопожатий по WB_HS_WAIT_MS. */
+    for (size_t oi = 0; oi < order_n && good < s->want && s->out_n < s->want + 2; oi++) {
         const char *ip = cand[order[oi]];
         if (busy_ip(s, ip)) continue;
+        if (!alive[order[oi]] && s->out_n >= s->want) break;
         struct wb_pt p;
         memset(&p, 0, sizeof(p));
         snprintf(p.ip, sizeof(p.ip), "%s", ip);
