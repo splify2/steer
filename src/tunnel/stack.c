@@ -35,6 +35,9 @@
 #include <sys/uio.h>
 #include <sys/stat.h>
 #include <linux/netfilter_ipv4.h>
+#include <linux/netlink.h>
+#include <linux/netfilter/nfnetlink.h>
+#include <linux/netfilter/nf_tables.h>
 
 #include "tun.h"
 #include "rtx.h"
@@ -45,6 +48,7 @@
 #include "run.h"
 #include "thrstack.h"
 #include "platform.h"
+#include "marks.h"
 
 /* ---- журнал с уровнем --------------------------------------------------------
  *
@@ -2492,8 +2496,12 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
  * Перенаправленное ядро помнит в conntrack, и SO_ORIGINAL_DST отдаёт исходное назначение.
  *
  * ПОДДЕЛЬНЫЙ АДРЕС. Правило redirect стоит раньше dnat fake-IP (у соединения одна привязка NAT), поэтому
- * сюда приходит поддельный адрес; настоящий берём из файла состояния резолвера (fakeip.state:
- * «домен\tподдельный\tнастоящий»), перечитывая его, только когда адреса нет и файл менялся. */
+ * сюда приходит поддельный адрес. Настоящий — из карты @fakeip набора правил (fake_real_kernel): её
+ * резолвер ставит синхронно, ДО ответа клиенту, так что к первому соединению она всегда готова.
+ * Файл состояния резолвера (fakeip.state: «домен\tподдельный\tнастоящий») — только запасной путь:
+ * резолвер пишет его не чаще раза в FAKEIP_ANSWER_TTL (60 с, бережёт флеш), и первое соединение к
+ * новому домену его ещё не видело — прежде такое соединение получало сброс (стенд QEMU 2026-10-13:
+ * «поддельный адрес … без настоящего в fakeip.state» на свежем выходе). */
 #define FAKE4_BASE 0xC6120000u              /* 198.18.0.0/15 — пул резолвера (dnsd_int.h) */
 #define FAKE4_SIZE 0x00020000u
 struct fake_pair { uint32_t fake, real; };  /* хостовый порядок у fake, сетевой у real */
@@ -2545,8 +2553,100 @@ static void fake_load(void) {
     g_fp_n = n;
 }
 
-/* Настоящий адрес для поддельного (сетевой порядок) или 0 — не знаем. */
+/* Атрибут netlink в buf[*n]: заголовок и значение, с выравниванием. Возврат — смещение атрибута (для
+ * вложенных: длину дописывает fk_end). */
+static size_t fk_attr(unsigned char *buf, size_t *n, uint16_t type, const void *v, size_t vl) {
+    size_t at = *n;
+    struct nlattr *a = (struct nlattr *)(buf + at);
+    a->nla_type = type;
+    a->nla_len = (uint16_t)(NLA_HDRLEN + vl);
+    if (vl) memcpy(buf + at + NLA_HDRLEN, v, vl);
+    *n = at + NLA_ALIGN(NLA_HDRLEN + vl);
+    return at;
+}
+
+static void fk_end(unsigned char *buf, size_t n, size_t at) {
+    ((struct nlattr *)(buf + at))->nla_len = (uint16_t)(n - at);
+}
+
+static const struct nlattr *fk_find(const unsigned char *p, size_t len, uint16_t type) {
+    while (len >= NLA_HDRLEN) {
+        const struct nlattr *a = (const struct nlattr *)p;
+        if (a->nla_len < NLA_HDRLEN || a->nla_len > len) return NULL;
+        if ((a->nla_type & NLA_TYPE_MASK) == type) return a;
+        size_t step = NLA_ALIGN(a->nla_len);
+        if (step >= len) return NULL;
+        p += step;
+        len -= step;
+    }
+    return NULL;
+}
+#define FK_PAY(a) ((const unsigned char *)(a) + NLA_HDRLEN)
+#define FK_PLEN(a) ((size_t)(a)->nla_len - NLA_HDRLEN)
+
+/* Настоящий адрес из карты @fakeip таблицы inet steer — запросом GETSETELEM (не транзакция: доли
+ * миллисекунды), сокет netlink на поток. 0 — элемента нет или ответа нет (тогда — файл). */
+static uint32_t fake_real_kernel(uint32_t fake_be) {
+    static __thread int fd = -2;
+    static __thread uint32_t seq;
+    if (fd == -2) {
+        fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
+        struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+        if (fd >= 0 && bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); fd = -1; }
+        struct timeval tv = { 0, 200000 };
+        if (fd >= 0) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    if (fd < 0) return 0;
+    _Alignas(8) unsigned char buf[256];
+    memset(buf, 0, sizeof(buf));
+    struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+    struct nfgenmsg *nfg = (struct nfgenmsg *)(buf + NLMSG_HDRLEN);
+    size_t n = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(*nfg));
+    const char *tbl = nft_table();
+    fk_attr(buf, &n, NFTA_SET_ELEM_LIST_TABLE, tbl, strlen(tbl) + 1);
+    fk_attr(buf, &n, NFTA_SET_ELEM_LIST_SET, "fakeip", 7);
+    size_t els = fk_attr(buf, &n, NLA_F_NESTED | NFTA_SET_ELEM_LIST_ELEMENTS, NULL, 0);
+    size_t el = fk_attr(buf, &n, NLA_F_NESTED | NFTA_LIST_ELEM, NULL, 0);
+    size_t key = fk_attr(buf, &n, NLA_F_NESTED | NFTA_SET_ELEM_KEY, NULL, 0);
+    fk_attr(buf, &n, NFTA_DATA_VALUE, &fake_be, 4);
+    fk_end(buf, n, key);
+    fk_end(buf, n, el);
+    fk_end(buf, n, els);
+    nh->nlmsg_len = (uint32_t)n;
+    nh->nlmsg_type = (uint16_t)((NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETSETELEM);
+    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nh->nlmsg_seq = ++seq;
+    nfg->nfgen_family = NFPROTO_INET;
+    nfg->version = NFNETLINK_V0;
+    struct sockaddr_nl dst = { .nl_family = AF_NETLINK };
+    if (sendto(fd, buf, n, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) return 0;
+    uint32_t real = 0;
+    _Alignas(8) unsigned char rb[2048];
+    for (;;) {
+        ssize_t r = recv(fd, rb, sizeof(rb), 0);
+        if (r < (ssize_t)NLMSG_HDRLEN) return real;
+        size_t left = (size_t)r;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)rb; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
+            if (h->nlmsg_seq != seq) continue;                  /* хвост прежнего запроса */
+            if (h->nlmsg_type == NLMSG_ERROR) return real;
+            if (h->nlmsg_type != ((NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWSETELEM)) continue;
+            size_t hl = NLMSG_ALIGN(sizeof(struct nfgenmsg));
+            if (h->nlmsg_len < NLMSG_HDRLEN + hl) continue;
+            const unsigned char *p = (const unsigned char *)NLMSG_DATA(h) + hl;
+            size_t pl = h->nlmsg_len - NLMSG_HDRLEN - hl;
+            const struct nlattr *es = fk_find(p, pl, NFTA_SET_ELEM_LIST_ELEMENTS);
+            const struct nlattr *e1 = es ? fk_find(FK_PAY(es), FK_PLEN(es), NFTA_LIST_ELEM) : NULL;
+            const struct nlattr *da = e1 ? fk_find(FK_PAY(e1), FK_PLEN(e1), NFTA_SET_ELEM_DATA) : NULL;
+            const struct nlattr *dv = da ? fk_find(FK_PAY(da), FK_PLEN(da), NFTA_DATA_VALUE) : NULL;
+            if (dv && FK_PLEN(dv) == 4) memcpy(&real, FK_PAY(dv), 4);
+        }
+    }
+}
+
+/* Настоящий адрес для поддельного (сетевой порядок) или 0 — не знаем: карта ядра, затем файл. */
 static uint32_t fake_real(uint32_t fake_be) {
+    uint32_t k = fake_real_kernel(fake_be);
+    if (k) return k;
     struct fake_pair key = { ntohl(fake_be), 0 };
     for (int pass = 0; pass < 2; pass++) {
         struct fake_pair *hit = g_fp_n ? bsearch(&key, g_fp, g_fp_n, sizeof(*g_fp), fp_cmp) : NULL;
