@@ -221,14 +221,10 @@ static void scan_setup(struct wb *w, struct wb_scan *s, const struct wb_reg *reg
     s->dir = w->st;
     s->cc = (const char (*)[3])gc->warp.cc;
     s->cc_n = gc->warp.cc_n;
-    if (gc->warp.xcc_set || gc->warp.cc_n) {
-        s->xcc = (const char (*)[3])gc->warp.xcc;
-        s->xcc_n = gc->warp.xcc_n;
-    } else {
-        static const char RU[1][3] = { "RU" };
-        s->xcc = RU;
-        s->xcc_n = 1;
-    }
+    /* Без countries и exclude_countries — любые страны (решение владельца 2026-10-13: «сами
+     * разберутся»); прежде здесь молча исключалась Россия. */
+    s->xcc = (const char (*)[3])gc->warp.xcc;
+    s->xcc_n = gc->warp.xcc_n;
 }
 
 /* Подобрать точки членам с нужда[i]. Остальные — занятые колонии и адреса. */

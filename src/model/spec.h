@@ -367,7 +367,7 @@ struct group_cfg {
     /* Группа записана в спеке как `kind: warp` (src/model/v2.c, p_warp): её члены — выходы awg
      * «<имя>.<n>», которые разбор завёл сам, а регистрацию WARP, подбор точек входа и замену ведёт
      * модуль steer-warpbox (помощник группы, kinds/group.c). cc/xcc — страны выхода (cca2): только
-     * эти / кроме этих; xcc_set — exclude_countries задан явно (иначе исключается RU). Массивы — в
+     * эти / кроме этих; xcc_set — exclude_countries задан явно (convert печатает и пустой). Массивы — в
      * арене спеки. */
     struct {
         unsigned char on;
