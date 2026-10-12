@@ -34,7 +34,8 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
         /* family — по факту (1.9, IPv6): «46», когда у доменной группы есть половина IPv6
          * (dom6_ok — парный набор «<set>6» и v6-двойник у компилятора) и спека не v1, иначе
          * «4» (решает dch_fam, table.c). */
-        fprintf(out, "%s|%s|%d|%s|%s", c->set, c->out, c->realip ? 1 : 0,
+        /* Режим: 0 — fake-IP, 1 — real-ip, 2 — блок (пустой адрес в ответ, kinds/block.c). */
+        fprintf(out, "%s|%s|%d|%s|%s", c->set, c->out, c->block ? 2 : c->realip ? 1 : 0,
                 (c->fam & DCH_V6) ? ((c->fam & DCH_V4) ? "46" : "6") : "4", c->chan);
         for (size_t k = 0; k < c->rules_n; k++)
             fprintf(out, "|%s", c->rules_path[k]);
@@ -115,7 +116,9 @@ static int parse_chan_line(const char *buf, size_t from, size_t line_end, struct
             case 2: {
                 char digit[8];
                 field_copy(digit, sizeof(digit), buf + pos, flen);
-                c->realip = atoi(digit) != 0;
+                int m = atoi(digit);
+                c->realip = m == 1;
+                c->block = m == 2;
                 break;
             }
             case 3: field_copy(family, family_cap, buf + pos, flen); break;

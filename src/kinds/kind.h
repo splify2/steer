@@ -238,7 +238,9 @@ void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
 extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer, kind_zapret,
                              kind_tgws, kind_awg, kind_group, kind_hysteria2,
                              kind_trojan, kind_shadowsocks, kind_socks, kind_http, kind_vmess,
-                             kind_warpm;
+                             kind_warpm, kind_block;
+/* Выход «Блок» (kinds/block.c): резолвер отвечает на имена его правил пустым адресом. */
+int out_is_block(const struct output *o);
 
 /* Вид обнулённого выхода (kind == NULL; так их собирают стенды) — direct, как у нулевого
  * значения прежнего перечня видов. Читает его kind_of в spec.h. */
