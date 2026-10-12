@@ -9,6 +9,7 @@ LIBSTEER_1 {
     awg_down_all;
     awg_hs_memory;
     awg_kernel_has_awg;
+    awg_refresh;
     awg_revive;
     awg_scan_down;
     awg_scan_stat;
