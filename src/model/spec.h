@@ -330,6 +330,10 @@ enum group_pick { PICK_ORDER = 0, PICK_LATENCY, PICK_MANUAL, PICK_BALANCE };
  * одного устройства — на одном члене (sticky-sessions). Порядок — как в спеке (group_by_name). */
 enum group_by { BY_CONNECTION = 0, BY_SITE, BY_SITE_CLIENT };
 
+/* Чем выход `kind: warp` ходит к Cloudflare (WARPBOX.md в хабе): AmneziaWG — туннели вида awg ядра
+ * steer; MASQUE — этап 2. */
+enum warp_transport { WARP_AWG = 0, WARP_MASQUE = 1 };
+
 struct group_cfg {
     enum group_pick pick;
     /* Арена спеки (group_members_alloc): members, weight, alive, lat_ms, lat4_ms, lat6_ms — все
@@ -356,6 +360,21 @@ struct group_cfg {
     unsigned char *weight;
     /* balance: чем раздаются новые соединения (enum group_by); 0 — случайно. */
     int by;
+    /* Группа записана в спеке как `kind: warp` (src/model/v2.c, p_warp): её члены — выходы awg
+     * «<имя>.<n>», которые разбор завёл сам, а регистрацию WARP, подбор точек входа и замену ведёт
+     * модуль steer-warpbox (помощник группы, kinds/group.c). cc/xcc — страны выхода (cca2): только
+     * эти / кроме этих; xcc_set — exclude_countries задан явно (иначе исключается RU). Массивы — в
+     * арене спеки. */
+    struct {
+        unsigned char on;
+        unsigned char transport;        /* enum warp_transport */
+        unsigned char xcc_set;
+        unsigned count;
+        char (*cc)[3];
+        size_t cc_n;
+        char (*xcc)[3];
+        size_t xcc_n;
+    } warp;
     /* СОСТОЯНИЕ, а не настройка (как device и failed у выхода): что сторож выбрал в последнем
      * проходе. Заполняет outputs_adopt_active_st из памяти сторожа, разбор оставляет -1/нулями.
      * У группы с именованными членами cur и alive — решение подхвата по приговорам членов
@@ -478,6 +497,9 @@ struct output {
      * обнулённого выхода — «напрямую», а нулевой номер значил бы первый выход. Смысл, проверки
      * и метка — в блоке «подложка» ниже (out_over, out_underlay_mark). */
     char over[32];
+    /* Выход заведён разбором для группы `kind: warp` (её имя) и в спеке не записан: туннель WARP
+     * N из count (src/model/v2.c, p_warp). Печать спеки его пропускает — он часть записи warp. */
+    char warp_of[32];
     /* Настройка вида — ровно одна из этих, по kind. */
     union {
         struct iface_cfg iface;
