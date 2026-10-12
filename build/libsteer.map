@@ -215,7 +215,6 @@ LIBSTEER_1 {
     qc_timeout_ms;
     qc_tls_free;
     qc_tls_new;
-    reality_build_hello;
     reality_build_hello_carry;
     registry_assign;
     rtnl_addrs6;
