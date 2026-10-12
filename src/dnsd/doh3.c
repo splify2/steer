@@ -63,7 +63,7 @@ static void qp_lit(struct wb *b, unsigned name_idx, const char *v, size_t n) {
 
 /* Статическая таблица QPACK (RFC 9204, приложение A) — строки, которыми пользуемся. */
 enum {
-    QS_AUTHORITY = 0, QS_PATH = 1, QS_METHOD_POST = 20, QS_SCHEME_HTTPS = 23,
+    QS_AUTHORITY = 0, QS_PATH = 1, QS_CONTENT_LENGTH = 4, QS_METHOD_POST = 20, QS_SCHEME_HTTPS = 23,
     QS_ACCEPT_DNS = 30, QS_CTYPE_DNS = 44,
 };
 
@@ -92,6 +92,9 @@ size_t h3d_request(uint8_t *dst, size_t cap, const char *authority, const char *
     qp_lit(&h, QS_PATH, path, strlen(path));
     wbyte(&h, QP_STATIC(QS_CTYPE_DNS));
     wbyte(&h, QP_STATIC(QS_ACCEPT_DNS));
+    char cl[8];
+    int cln = snprintf(cl, sizeof(cl), "%zu", qn);
+    qp_lit(&h, QS_CONTENT_LENGTH, cl, (size_t)cln);
     if (h.n > sizeof(hb)) return 0;
     struct wb o = { dst, 0, cap };
     wvar(&o, H3D_HEADERS); wvar(&o, h.n); wput(&o, hb, h.n);
