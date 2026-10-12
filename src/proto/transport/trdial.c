@@ -21,6 +21,7 @@
 #include <time.h>
 
 #include "transport.h"
+#include "sockmark.h"
 
 /* ---- установление TCP: ВСЕ адреса узла, а не первый ---------------------------
  *
@@ -244,9 +245,7 @@ static int attempt_start(const struct tr_addr *ip, int *done) {
     if (fd < 0) return -1;
     /* До connect(): маршрут, а с ним устройство и адрес источника, ядро выбирает там — по
      * метке, то есть по таблице выхода-цели. */
-    if (g_sock_mark &&
-        setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) != 0 &&
-        g_sock_mark_req) {
+    if (steer_sock_mark(fd, g_sock_mark) != 0 && g_sock_mark_req) {
         static int told;
         if (!told) {
             told = 1;
@@ -403,9 +402,7 @@ int tr_dial_udp(const char *host, uint16_t port) {
         if (via_forbids(&addr[i])) continue;
         int fd = socket(addr[i].ss.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) { err = TR_ESOCK; continue; }
-        if (g_sock_mark &&
-            setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) != 0 &&
-            g_sock_mark_req) {
+        if (steer_sock_mark(fd, g_sock_mark) != 0 && g_sock_mark_req) {
             close(fd);
             return TR_ESOCK;
         }

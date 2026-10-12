@@ -41,6 +41,7 @@
 
 #include "quic.h"
 #include "qcssl.h"
+#include "sockmark.h"
 
 #define QC_TXBUF        (64 * 1024)     /* пачка — до send_quantum, а он не больше 64 КиБ */
 /* Очередь исходящих датаграмм — 64: это защита от накопления, а не размер нагрузки. Датаграммы
@@ -867,6 +868,14 @@ static int flush(struct qc *q) {
 static void fail_close(struct qc *q, int err) {
     int reason = QC_CLOSE_ERROR;
     const char *why = q->why ? q->why : ngtcp2_strerror(err);
+    /* Отказ TLS — с номером тревоги (RFC 8446, 6): «ERR_CRYPTO» без него не говорит, что случилось —
+     * сертификат (42–48), ALPN (120), версия (70) или что-то ещё. */
+    char wbuf[96];
+    if (!q->why && err == NGTCP2_ERR_CRYPTO && q->conn) {
+        snprintf(wbuf, sizeof(wbuf), "%s, TLS alert %u", ngtcp2_strerror(err),
+                 (unsigned)ngtcp2_conn_get_tls_alert(q->conn));
+        why = wbuf;
+    }
     if (q->why) reason = QC_CLOSE_HANDSHAKE;
     else if (err == NGTCP2_ERR_IDLE_CLOSE) reason = QC_CLOSE_IDLE;
     else if (err == NGTCP2_ERR_HANDSHAKE_TIMEOUT || err == NGTCP2_ERR_CRYPTO) reason = QC_CLOSE_HANDSHAKE;
@@ -1279,8 +1288,7 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
     q->fd = socket(q->remote.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (q->fd < 0) goto fail;
     q->gro_on = sock_tune(q->fd);
-    if (cfg->sock_mark && setsockopt(q->fd, SOL_SOCKET, SO_MARK, &cfg->sock_mark, sizeof cfg->sock_mark) != 0 &&
-        cfg->mark_required) {
+    if (steer_sock_mark(q->fd, cfg->sock_mark) != 0 && cfg->mark_required) {
         rc = QC_ESOCK;
         goto fail;
     }

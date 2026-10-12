@@ -1113,7 +1113,7 @@ static void sock_path(int fd, const char *via) {
      * ответа на TLS ко всем доменам пула, и не грузилось всё, что лежит в ДЦ1, 3, 5 и 203.
      * Домены пула для того и подобраны, чтобы открываться без ухищрений; tg-ws-proxy ходит
      * к ним тоже без обхода. Метка — та, по которой zapret пропускает пакет (DESYNC_MARK). */
-    unsigned mk = ZAPRET_SKIP_MARK;
+    unsigned mk = ZAPRET_SKIP_MARK;         /* и на телефоне: мост там тоже бывает рядом с обходом */
     setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
 }
 

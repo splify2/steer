@@ -28,6 +28,7 @@
 #include "tls13.h"
 #include "roots.h"
 #include "wbhttps.h"
+#include "sockmark.h"
 
 static long mono_ms(void) {
     struct timespec t;
@@ -62,7 +63,7 @@ static int connect_one(const struct sockaddr *sa, socklen_t sl, const struct wb_
                        long deadline, char *why, size_t wn) {
     int fd = socket(sa->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) { WHY("socket: %s", strerror(errno)); return -1; }
-    if (rt && rt->mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &rt->mark, sizeof(rt->mark)) != 0) {
+    if (steer_sock_mark(fd, rt ? rt->mark : 0) != 0) {
         WHY("метка сокета: %s", strerror(errno));
         close(fd);
         return -1;

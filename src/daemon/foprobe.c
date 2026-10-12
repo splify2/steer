@@ -18,6 +18,7 @@
 
 #include "loop.h"
 #include "foprobe.h"
+#include "sockmark.h"
 
 #define LOG_W "steer[warn] failover: "
 
@@ -115,7 +116,7 @@ struct foprobe *foprobe_tcp(struct loop *l, const char *dev, unsigned mark, cons
     if (fd < 0) return NULL;
     /* С меткой — путь трафика клиентов выхода (R-152: TCP выхода с KC_TCP_REDIR перенаправляется к
      * слушателю модуля по метке, через устройство он не идёт); без метки — через устройство. */
-    if (mark ? setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0
+    if (mark ? steer_sock_mark(fd, mark) != 0
              : setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, dev, (socklen_t)strlen(dev) + 1) != 0) {
         close(fd);
         return NULL;
