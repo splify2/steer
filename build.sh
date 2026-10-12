@@ -44,6 +44,8 @@ REV="$(git describe --tags --exact-match 2>/dev/null ||
       { _h="$(git rev-parse --short HEAD 2>/dev/null)" && echo "$VERSION-g$_h"; } || true)"
 [ -n "$REV" ] || REV="неизвестна"
 OUT=out
+# Сколько частей сборки не собралось (FAILED в выводе) — код возврата в конце.
+fails=0
 # Свой образ, а не образ сборщика splify: в том нет исходников криптобиблиотеки, и расширенная
 # сборка в нём падает на ненайденном заголовке, тогда как базовая проходит. Незаметная поломка:
 # `./build.sh` печатает архитектуры, пакеты появляются, и только extended молча отсутствует.
@@ -274,6 +276,7 @@ for spec in $ISAS; do
         # обновилась, а поведение прежнее» — самый дорогой вид тихого сбоя.
         rm -f "build/steerd-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch.err" || head -1 "build/$arch.err")"
+        fails=$((fails + 1))
         continue
     fi
 
@@ -288,6 +291,7 @@ for spec in $ISAS; do
     else
         rm -f "build/steer-client-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch-client.err" || head -1 "build/$arch-client.err")"
+        fails=$((fails + 1))
         continue
     fi
 
@@ -303,6 +307,7 @@ for spec in $ISAS; do
     else
         rm -f "build/steer-tgws-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch-tgws.err" || head -1 "build/$arch-tgws.err")"
+        fails=$((fails + 1))
     fi
 
     # Мини-вариант для микропакета tgws: только перехват Telegram и то, на чём он стоит.
@@ -321,6 +326,7 @@ for spec in $ISAS; do
     else
         rm -f "build/stgws-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch-tgws.err" || head -1 "build/$arch-tgws.err")"
+        fails=$((fails + 1))
     fi
 
     # Разделяемая раскладка роутера (шаг 4 выпуска 1.10): libsteer-wolfssl.so, libsteer.so, steerd и
@@ -347,6 +353,11 @@ for spec in $ISAS; do
     else
         rm -rf "$libs"
         echo "FAILED — $(grep -m1 error "build/$arch-libs.err" || head -1 "build/$arch-libs.err")"
+        fails=$((fails + 1))
+        # Пакеты этой архитектуры от прошлой сборки — не этой: оставь их в $OUT, и список «packages»
+        # в конце выдал бы их за свежие (так и было: libsteer не собралась, а в out/ лежали пакеты
+        # часовой давности, и сборка отвечала кодом 0).
+        rm -f "$OUT"/steer-*_"$arch".apk "$OUT"/steer-*_"$arch".ipk
         continue
     fi
 
@@ -652,6 +663,7 @@ for arch in x86_64 aarch64_generic; do
     else
         rm -f "build/steer-hub-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch-hub.err" || head -1 "build/$arch-hub.err")"
+        fails=$((fails + 1))
         continue
     fi
     stage="build/hub-$uarch"
@@ -677,3 +689,9 @@ fi
 
 echo "packages:"
 ls -1 "$OUT" 2>/dev/null | sed 's/^/  /'
+# Что-то не собралось — код отказа: прежде сборка с FAILED в выводе отвечала 0, и вызывающий (руками,
+# release.yml) узнавал об этом, только читая вывод.
+if [ "$fails" != 0 ]; then
+    echo "build.sh: не собралось частей — $fails (FAILED выше)" >&2
+    exit 1
+fi
