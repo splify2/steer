@@ -1320,6 +1320,8 @@ static void guard_use(const struct spec *sp, const struct output *o, unsigned ch
     for (size_t k = 0; k < mn; k++) guard_use(sp, out_member(sp, o, k), used, depth + 1);
 }
 
+static int has_tcp_redir(const struct spec *sp);
+
 static void build_guard(struct nft_table *t, const struct spec *sp, const struct groups *gr) {
     unsigned char *used = calloc(sp->out_n ? sp->out_n : 1, 1);
     if (!used) return;
@@ -1352,6 +1354,16 @@ static void build_guard(struct nft_table *t, const struct spec *sp, const struct
             struct nft_rule *r = ir_rule(c);
             ir_x(r, "meta mark and 0x%08x == 0x00000000", STEER_MARK_MASK);
             ir_x(r, "return");
+            /* Петля — не утечка. Собственный сокет роутера с меткой туннельного выхода (замер члена
+             * группы — urltest, туннель поверх туннеля — over) перенаправляется к слушателю модуля
+             * (R-152, build_tcp_redir) и уходит в lo; страж отбрасывал его как «не в устройство
+             * выхода», и замер членов-туннелей не проходил никогда («срок вышел: соединение не
+             * установилось», стенд QEMU 2026-10-13). */
+            if (has_tcp_redir(sp)) {
+                r = ir_rule(c);
+                ir_x(r, "oifname \"lo\"");
+                ir_x(r, "return");
+            }
             if (has_releasable(sp)) {
                 char m[40];
                 snprintf(m, sizeof(m), "meta mark and 0x%08x", STEER_MARK_MASK);

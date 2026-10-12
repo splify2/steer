@@ -326,6 +326,25 @@ if [ -x "$XK" ]; then
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl7.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ключ active есть только у kind: tunnel"; then ok; else
         bad "active у interface — отказ «только у kind: tunnel»" "$out"; fi
+    # kind: block — «Блок»: цепочки forward_block/output_block по метке соединения (TCP — RST,
+    # остальное — ICMP запрет), без устройства и таблиц; доменный канал — режим 2 в таблице резолвера.
+    printf 'bad.example\n' > "$tmp/blk.lst"
+    printf '203.0.113.0/24\n' > "$tmp/blk4.lst"
+    printf 'version: 2\noutputs:\n  blk: { kind: block }\nlists:\n  bd: { domains_file: %s/blk.lst }\n  bp: { prefixes_file: %s/blk4.lst }\nrules:\n  - { name: bd, to: [bd], out: blk, resolve: realip }\n  - { name: bp, to: [bp], out: blk }\n' "$tmp" "$tmp" > "$tmp/bk.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec bk.yaml --state-dir "$tmp/state" 2>&1)"
+    if [ $? = 0 ] && echo "$out" | grep -q 'chain forward_block' && echo "$out" | grep -q 'chain output_block' &&
+       echo "$out" | grep -q 'meta l4proto tcp counter reject with tcp reset' &&
+       echo "$out" | grep -q 'reject with icmpx admin-prohibited'; then ok; else
+        bad "kind: block — цепочки отказа по метке соединения" "$(echo "$out" | grep -n 'block\|reject' | head -n 8)"; fi
+    if ! echo "$out" | grep -q 'ip rule.*blk\|table.*blk_'; then ok; else bad "kind: block — без таблиц маршрутизации"; fi
+    tab="$(cd "$tmp" && "$XKA" dnsd-table --spec bk.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$tab" | grep -q '|blk|2|'; then ok; else bad "kind: block — доменный канал с режимом 2 (пустой адрес)" "$tab"; fi
+    # Страж меток пропускает петлю: собственный сокет роутера с меткой туннельного выхода (замер члена
+    # группы, over) перенаправляется к слушателю модуля и уходит в lo — прежде страж его отбрасывал.
+    printf 'version: 2\noutputs:\n  t1: { kind: tunnel, protocol: vless, subscription: sub/t1 }\n  g: { kind: group, pick: latency, members: [t1] }\nlists:\n  bp: { prefixes_file: %s/blk4.lst }\nrules:\n  - { name: bp, to: [bp], out: g }\n' "$tmp" > "$tmp/lo.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec lo.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | sed -n '/chain postrouting_guard/,/^    }/p' | grep -q 'oifname "lo" return'; then ok; else
+        bad "страж меток пропускает lo при перенаправлении TCP к модулю" "$(echo "$out" | sed -n '/chain postrouting_guard/,/^    }/p' | head -n 8)"; fi
 else
     bad "не собран $XK (make build/steer-xk)"
 fi
