@@ -992,10 +992,10 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
  * вид awg ядра. Регистрацию, подбор точек, страны и замену ведёт модуль steer-warpbox — помощник
  * группы (kinds/group.c). Узлы разворота — в арене спеки: на них ссылаются второй проход и сообщения.
  *
- * Допуск и интервал по умолчанию — 200 мс и 600 с (опыт апстрима Zapret Manager): смена члена рвёт
- * соединения группы (ядро снимает их записи conntrack), и уходить с живого туннеля стоит только за
- * заметный выигрыш. */
-#define WARP_TOL_DEFAULT_MS 200
+ * Интервал замера по умолчанию — 600 с (апстрим Zapret Manager): туннели WARP меняются редко, и мерить
+ * чаще незачем. Допуск — обычное умолчание группы (50 мс): у ZM было 200 мс, и группа оставалась на
+ * туннеле 418 мс при соседе 263 мс (стенд QEMU 2026-10-12) — выглядит поломкой, а смена члена, хоть и
+ * снимает conntrack группы, при такой разнице оправдана. */
 #define WARP_INT_DEFAULT_S  600
 
 static struct ynode *yn_new(struct v2 *x, const struct ynode *at, enum ynode_kind kind, size_t len) {
@@ -1103,7 +1103,6 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
             return fail(x, pk, "%s: у kind: warp — latency или order", w);
     }
     int lat = !strcmp(pick, "latency");
-    if (lat && !ynode_get(val, "tolerance")) gpairs++;
     if (lat && !ynode_get(val, "interval")) gpairs++;
     struct ynode *g = yn_new(x, val, YN_MAP, gpairs), *mem = yn_new(x, val, YN_SEQ, (size_t)count);
     if (!g || !mem) return fail(x, val, "%s: недостаточно памяти для спеки", where);
@@ -1120,7 +1119,6 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
     for (size_t i = 0; copy_keys[i]; i++)
         if ((v = ynode_get(val, copy_keys[i]))) GPUT(copy_keys[i], (struct ynode *)v);
     char num[16];
-    if (lat && !ynode_get(val, "tolerance")) { snprintf(num, sizeof(num), "%d", WARP_TOL_DEFAULT_MS); GPUT("tolerance", yn_str(x, val, num)); }
     if (lat && !ynode_get(val, "interval")) { snprintf(num, sizeof(num), "%d", WARP_INT_DEFAULT_S); GPUT("interval", yn_str(x, val, num)); }
     GPUT("members", mem);
 #undef GPUT

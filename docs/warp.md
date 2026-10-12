@@ -55,7 +55,7 @@ rules:
 | `countries` | только эти страны, коды из двух букв (`[NL, DE]`) | любые |
 | `exclude_countries` | кроме этих стран | `[RU]`, если не заданы ни `countries`, ни `exclude_countries` |
 | `pick` | `latency` или `order` — как у группы | `latency` |
-| `tolerance`, `interval` | как у группы с `pick: latency` | 200 мс, 600 с |
+| `tolerance`, `interval` | как у группы с `pick: latency` | 50 мс (как у группы), 600 с |
 | `url`, `idle_timeout`, `on_fail` | как у группы | как у группы |
 | `over` | туннели WARP идут через этот выход | напрямую |
 | `ipv6` | `nat` — IPv6 клиентов идёт через WARP с подменой адреса (у регистрации WARP один адрес IPv6), `off` — без IPv6 | `nat` |

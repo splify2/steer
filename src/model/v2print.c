@@ -259,7 +259,7 @@ static void warp_flow(struct flow *w, const struct spec *s, const struct output 
     if (g->warp.transport == WARP_MASQUE) fs(w, "transport", "masque");
     if (g->warp.count != 3) { fk(w, "count"); fprintf(f, "%u", g->warp.count); }
     if (g->pick != PICK_LATENCY) fs(w, "pick", "order");
-    if (g->pick == PICK_LATENCY && g->lat_tolerance_ms >= 0 && g->lat_tolerance_ms != 200) {
+    if (g->pick == PICK_LATENCY && g->lat_tolerance_ms >= 0) {
         fk(w, "tolerance");
         fprintf(f, "%d", g->lat_tolerance_ms);
     }
