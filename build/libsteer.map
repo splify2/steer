@@ -1,5 +1,5 @@
 /* Экспорт libsteer.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится.
- * Символы, которые steerd и модули (steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy) берут
+ * Символы, которые steerd и модули (steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy, steer-warpbox) берут
  * из библиотеки, и программный интерфейс QUIC (qc_*), который берёт стенд QUIC_STAND_SRC, пока
  * настоящих потребителей нет; остальное скрыто (local: *). Проверка: check. */
 LIBSTEER_1 {
@@ -8,6 +8,11 @@ LIBSTEER_1 {
     awg_check_all;
     awg_down_all;
     awg_hs_memory;
+    awg_kernel_has_awg;
+    awg_revive;
+    awg_scan_down;
+    awg_scan_stat;
+    awg_scan_up;
     b64_decode;
     chello_parse;
     cli_help;
@@ -113,8 +118,12 @@ LIBSTEER_1 {
     ir_table_add;
     ir_table_find;
     ir_x;
+    js_lit;
     jsonw_str;
     jsonw_str_ascii;
+    js_skip;
+    js_str;
+    js_ws;
     kind_at;
     kind_by_name;
     kind_count;

@@ -250,11 +250,50 @@ static const char *on_fail_name(enum on_fail f) {
     return f == FAIL_DIRECT ? "direct" : f == FAIL_ZAPRET ? "zapret" : "drop";
 }
 
-static void output_flow(FILE *f, const struct output *o, const struct onames *oname) {
+/* `kind: warp` — так, как записан (src/model/v2.c, p_warp): туннели «<имя>.<n>» в спеке не пишутся,
+ * а умолчания (count 3, pick latency, допуск 200 мс, интервал 600 с) не печатаются. */
+static void warp_flow(struct flow *w, const struct spec *s, const struct output *o) {
+    const struct group_cfg *g = &o->grp;
+    FILE *f = w->f;
+    fs(w, "kind", "warp");
+    if (g->warp.transport == WARP_MASQUE) fs(w, "transport", "masque");
+    if (g->warp.count != 3) { fk(w, "count"); fprintf(f, "%u", g->warp.count); }
+    if (g->pick != PICK_LATENCY) fs(w, "pick", "order");
+    if (g->pick == PICK_LATENCY && g->lat_tolerance_ms >= 0 && g->lat_tolerance_ms != 200) {
+        fk(w, "tolerance");
+        fprintf(f, "%d", g->lat_tolerance_ms);
+    }
+    if (g->pick == PICK_LATENCY && g->lat_interval_s && g->lat_interval_s != 600) {
+        fk(w, "interval");
+        fprintf(f, "%d", g->lat_interval_s);
+    }
+    if (g->pick == PICK_LATENCY && g->url[0]) fs(w, "url", g->url);
+    if (g->pick == PICK_LATENCY && g->idle_timeout_s >= 0) {
+        fk(w, "idle_timeout");
+        fprintf(f, "%d", g->idle_timeout_s);
+    }
+    if (g->warp.cc_n) fseq_s(w, "countries", g->warp.cc[0], 3, g->warp.cc_n);
+    if (g->warp.xcc_set) {
+        if (g->warp.xcc_n) fseq_s(w, "exclude_countries", g->warp.xcc[0], 3, g->warp.xcc_n);
+        else { fk(w, "exclude_countries"); fputs("[]", f); }
+    }
+    if (g->members_n) {
+        const struct output *m = spec_out(s, g->members[0]);
+        if (m->over[0]) fs(w, "over", m->over);
+    }
+    if (o->on_fail != FAIL_DROP) fs(w, "on_fail", on_fail_name(o->on_fail));
+}
+
+static void output_flow(FILE *f, const struct spec *s, const struct output *o, const struct onames *oname) {
     const struct kind_ops *k = kind_of(o);
     const struct group_cfg *g = out_group(o);
     struct flow w = { f, 0 };
     fputs("{ ", f);
+    if (g && g->warp.on) {
+        warp_flow(&w, s, o);
+        fputs(" }", f);
+        return;
+    }
     if (g) {
         static const char *const PICK[] = { "order", "latency", "manual", "balance" };
         fs(&w, "kind", "group");
@@ -489,14 +528,15 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
             if (yq_len(oname[anon_order[i]]) > ow) ow = yq_len(oname[anon_order[i]]);
         fputs("\noutputs:\n", f);
         for (size_t i = 0; i < s->out_n; i++) {
+            if (s->out[i].warp_of[0]) continue;         /* туннель kind: warp — часть его записи */
             key_pad(f, oname[i], ow);
-            output_flow(f, &s->out[i], &onm);
+            output_flow(f, s, &s->out[i], &onm);
             fputc('\n', f);
         }
         for (size_t i = 0; i < anon_n; i++) {
             const struct output *m = spec_out(s, SPEC_ANON_BASE + (anon_order[i] - s->out_n));
             key_pad(f, oname[anon_order[i]], ow);
-            output_flow(f, m, &onm);
+            output_flow(f, s, m, &onm);
             fputc('\n', f);
         }
     }

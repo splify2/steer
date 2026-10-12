@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdarg.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -982,6 +983,185 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
     return 0;
 }
 
+/* ---- kind: warp (WARPBOX.md в хабе) ------------------------------------------------------------
+ *
+ * Выход Cloudflare WARP записывается одной строкой, а живёт группой из count туннелей: у каждого своя
+ * регистрация, точка входа и колония, и группа выбирает живой и быстрый тем же сторожем, что у любой
+ * группы. Разбор разворачивает запись сам: группа с именем выхода и члены «<имя>.<n>» вида awg с
+ * conf в {etc}/warp/ — устройство, метку, таблицу, здоровье и смену точки на живом устройстве им даёт
+ * вид awg ядра. Регистрацию, подбор точек, страны и замену ведёт модуль steer-warpbox — помощник
+ * группы (kinds/group.c). Узлы разворота — в арене спеки: на них ссылаются второй проход и сообщения.
+ *
+ * Допуск и интервал по умолчанию — 200 мс и 600 с (опыт апстрима Zapret Manager): смена члена рвёт
+ * соединения группы (ядро снимает их записи conntrack), и уходить с живого туннеля стоит только за
+ * заметный выигрыш. */
+#define WARP_TOL_DEFAULT_MS 200
+#define WARP_INT_DEFAULT_S  600
+
+static struct ynode *yn_new(struct v2 *x, const struct ynode *at, enum ynode_kind kind, size_t len) {
+    struct ynode *n = (struct ynode *)spec_alloc(x->s, sizeof(*n));
+    if (!n) return NULL;
+    memset(n, 0, sizeof(*n));
+    n->kind = kind;
+    n->line = at ? at->line : 0;
+    n->col = at ? at->col : 0;
+    n->len = len;
+    if (kind != YN_SCALAR && len) {
+        size_t cnt = kind == YN_MAP ? 2 * len : len;
+        n->items = (struct ynode **)spec_alloc(x->s, cnt * sizeof(*n->items));
+        if (!n->items) return NULL;
+    }
+    return n;
+}
+
+static struct ynode *yn_str(struct v2 *x, const struct ynode *at, const char *str) {
+    struct ynode *n = yn_new(x, at, YN_SCALAR, 0);
+    if (!n) return NULL;
+    char *c = spec_strdup(x->s, str);
+    if (!c) return NULL;
+    n->str = c;
+    n->len = strlen(c);
+    return n;
+}
+
+/* Страны выхода: двухбуквенные коды (cca2), в любом регистре. */
+static int warp_countries(struct v2 *x, const struct ynode *v, const char *w, char (**out)[3], size_t *n) {
+    if (items_ok(x, v, w)) return -1;
+    size_t k = n_items(v);
+    *n = 0;
+    *out = k ? (char (*)[3])spec_alloc(x->s, k * 3) : NULL;
+    if (k && !*out) return fail(x, v, "%s: недостаточно памяти для спеки", w);
+    for (size_t i = 0; i < k; i++) {
+        const char *c = item(v, i)->str;
+        if (strlen(c) != 2 || !isalpha((unsigned char)c[0]) || !isalpha((unsigned char)c[1]))
+            return fail(x, item(v, i), "%s: «%s» — код страны из двух букв (RU, NL, DE…)", w, c);
+        (*out)[*n][0] = (char)toupper((unsigned char)c[0]);
+        (*out)[*n][1] = (char)toupper((unsigned char)c[1]);
+        (*out)[*n][2] = '\0';
+        (*n)++;
+    }
+    return 0;
+}
+
+static const char *const WARP_KEYS[] = { "kind", "transport", "count", "pick", "tolerance", "interval",
+                                         "url", "idle_timeout", "countries", "exclude_countries",
+                                         "on_fail", "over", NULL };
+
+static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *val);
+
+static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val) {
+    char name[32], where[64], w[128];
+    if (name_of(x, key, "outputs", name)) return -1;
+    snprintf(where, sizeof(where), "outputs.%s", name);
+    if (keys_known(x, val, where, WARP_KEYS)) return -1;
+    const struct ynode *v;
+    unsigned char transport = WARP_AWG;
+    if ((v = ynode_get(val, "transport"))) {
+        const char *t;
+        snprintf(w, sizeof(w), "%s.transport", where);
+        if (str_of(x, v, w, &t)) return -1;
+        if (!strcmp(t, "masque"))
+            return fail(x, v, "%s: masque — следующий этап steer-warpbox, пока есть awg", w);
+        if (strcmp(t, "awg")) return fail(x, v, "%s: «%s» — awg (masque — следующий этап)", w, t);
+    }
+    long count = 3;
+    if ((v = ynode_get(val, "count"))) {
+        snprintf(w, sizeof(w), "%s.count", where);
+        /* Предел — не константа: столько туннелей, сколько выходов с меткой даёт поле метки
+         * (check_slots); 255 — его наибольшее значение. */
+        if (long_of(x, v, w, 1, 255, &count)) return -1;
+    }
+    char (*cc)[3] = NULL, (*xcc)[3] = NULL;
+    size_t cc_n = 0, xcc_n = 0;
+    if ((v = ynode_get(val, "countries"))) {
+        snprintf(w, sizeof(w), "%s.countries", where);
+        if (warp_countries(x, v, w, &cc, &cc_n)) return -1;
+    }
+    const struct ynode *xv = ynode_get(val, "exclude_countries");
+    if (xv) {
+        snprintf(w, sizeof(w), "%s.exclude_countries", where);
+        if (warp_countries(x, xv, w, &xcc, &xcc_n)) return -1;
+    }
+    for (size_t i = 0; i < cc_n; i++)
+        for (size_t j = 0; j < xcc_n; j++)
+            if (!strcmp(cc[i], xcc[j]))
+                return fail(x, xv, "%s: %s — и в countries, и в exclude_countries", where, cc[i]);
+
+    /* Члены: «<имя>.<n>» вида awg. Имя не должно совпасть ни с одним выходом спеки — проверит
+     * p_output (выход описан дважды); здесь — только длина. */
+    if (strlen(name) + 4 > 31)
+        return fail(x, key, "%s: имя для kind: warp — не длиннее 27 знаков (у туннелей «%s.<n>»)", where, name);
+    size_t gpairs = 3;                          /* kind, pick, members */
+    const char *copy_keys[] = { "tolerance", "interval", "url", "idle_timeout", "on_fail", NULL };
+    for (size_t i = 0; copy_keys[i]; i++) if (ynode_get(val, copy_keys[i])) gpairs++;
+    const struct ynode *pk = ynode_get(val, "pick");
+    const char *pick = "latency";
+    if (pk) {
+        snprintf(w, sizeof(w), "%s.pick", where);
+        if (str_of(x, pk, w, &pick)) return -1;
+        if (strcmp(pick, "latency") && strcmp(pick, "order"))
+            return fail(x, pk, "%s: у kind: warp — latency или order", w);
+    }
+    int lat = !strcmp(pick, "latency");
+    if (lat && !ynode_get(val, "tolerance")) gpairs++;
+    if (lat && !ynode_get(val, "interval")) gpairs++;
+    struct ynode *g = yn_new(x, val, YN_MAP, gpairs), *mem = yn_new(x, val, YN_SEQ, (size_t)count);
+    if (!g || !mem) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+    size_t gi = 0;
+#define GPUT(k, vn) do {                                                                          \
+        g->items[2 * gi] = yn_str(x, val, k);                                                     \
+        g->items[2 * gi + 1] = (vn);                                                              \
+        if (!g->items[2 * gi] || !g->items[2 * gi + 1])                                           \
+            return fail(x, val, "%s: недостаточно памяти", where);                                \
+        gi++;                                                                                     \
+    } while (0)
+    GPUT("kind", yn_str(x, val, "group"));
+    GPUT("pick", pk ? (struct ynode *)pk : yn_str(x, val, pick));
+    for (size_t i = 0; copy_keys[i]; i++)
+        if ((v = ynode_get(val, copy_keys[i]))) GPUT(copy_keys[i], (struct ynode *)v);
+    char num[16];
+    if (lat && !ynode_get(val, "tolerance")) { snprintf(num, sizeof(num), "%d", WARP_TOL_DEFAULT_MS); GPUT("tolerance", yn_str(x, val, num)); }
+    if (lat && !ynode_get(val, "interval")) { snprintf(num, sizeof(num), "%d", WARP_INT_DEFAULT_S); GPUT("interval", yn_str(x, val, num)); }
+    GPUT("members", mem);
+#undef GPUT
+    char mname[32];
+    for (long n = 1; n <= count; n++) {
+        snprintf(mname, sizeof(mname), "%s.%ld", name, n);
+        mem->items[n - 1] = yn_str(x, key, mname);
+        if (!mem->items[n - 1]) return fail(x, val, "%s: недостаточно памяти", where);
+    }
+    size_t gidx = x->s->out_n;
+    if (p_output(x, key, g)) return -1;
+    struct group_cfg *gc = &x->s->out[gidx].grp;
+    gc->warp.on = 1;
+    gc->warp.transport = transport;
+    gc->warp.count = (unsigned)count;
+    gc->warp.cc = cc;
+    gc->warp.cc_n = cc_n;
+    gc->warp.xcc = xcc;
+    gc->warp.xcc_n = xcc_n;
+    gc->warp.xcc_set = xv != NULL;
+
+    const struct ynode *ov = ynode_get(val, "over");
+    for (long n = 1; n <= count; n++) {
+        struct ynode *m = yn_new(x, val, YN_MAP, ov ? 3 : 2);
+        char conf[300];
+        snprintf(conf, sizeof(conf), "%s/warp/%s-%ld.conf", plat()->etc_dir, name, n);
+        if (!m) return fail(x, val, "%s: недостаточно памяти", where);
+        m->items[0] = yn_str(x, val, "kind");
+        m->items[1] = yn_str(x, val, "awg");
+        m->items[2] = yn_str(x, val, "conf");
+        m->items[3] = yn_str(x, val, conf);
+        if (ov) { m->items[4] = yn_str(x, ov, "over"); m->items[5] = (struct ynode *)ov; }
+        for (size_t i = 0; i < (ov ? 6u : 4u); i++)
+            if (!m->items[i]) return fail(x, val, "%s: недостаточно памяти", where);
+        size_t midx = x->s->out_n;
+        if (p_output(x, mem->items[n - 1], m)) return -1;
+        snprintf(x->s->out[midx].warp_of, sizeof(x->s->out[midx].warp_of), "%s", name);
+    }
+    return 0;
+}
+
 static int out_idx(const struct spec *s, const char *name) {
     for (size_t i = 0; i < s->out_n; i++)
         if (!strcmp(s->out[i].name, name)) return (int)i;
@@ -1703,8 +1883,11 @@ static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e) {
     x.lists_named = s->list_n;
     if ((v = ynode_get(root, "outputs"))) {
         if (want_map(&x, v, "outputs")) return -1;
-        for (size_t i = 0; i < ynode_len(v); i++)
-            if (p_output(&x, ynode_key_at(v, i), ynode_val_at(v, i))) return -1;
+        for (size_t i = 0; i < ynode_len(v); i++) {
+            const struct ynode *ov = ynode_val_at(v, i), *kn = ov ? ynode_get(ov, "kind") : NULL;
+            int warp = kn && kn->kind == YN_SCALAR && kn->str && !strcmp(kn->str, "warp");
+            if (warp ? p_warp(&x, ynode_key_at(v, i), ov) : p_output(&x, ynode_key_at(v, i), ov)) return -1;
+        }
         if (p_outputs_links(&x)) return -1;
     }
     if ((v = ynode_get(root, "dns")) && p_dns(&x, v)) return -1;

@@ -203,6 +203,17 @@ size_t awg_revive_names(const struct spec *sp, const struct output *o, struct ki
  * идёт в этом же процессе, на его цикле событий). Без круга (один проход, круг shell на
  * роутере) — как прежде, файлом. */
 void awg_hs_memory(int on);
+/* Устройства подбора (steer-warpbox; подробности — в awg.c, «устройства подбора»). awg_scan_up —
+ * создать и настроить dev по файлу conf, как выход без спеки (over — через какой выход идёт туннель,
+ * как `over` членов группы), и (ns >= 0) увести в пространство сети
+ * ns с адресами файла, подъёмом и маршрутом по умолчанию там; 0 — готово, иначе причина в err.
+ * awg_scan_stat — последнее рукопожатие (секунды эпохи, 0 — не было) и счётчики. */
+int awg_scan_up(const struct spec *sp, const char *dev, const char *conf, const char *over, int ns,
+                char *err, size_t en);
+void awg_scan_down(const char *dev, int ns);
+int awg_scan_stat(const char *dev, int ns, int64_t *hs, uint64_t *rx, uint64_t *tx);
+/* Есть ли в ядре AmneziaWG (иначе — только обычный WireGuard, без обфускации). */
+int awg_kernel_has_awg(void);
 /* Поле "awg" у выхода в `steer status`: начинается с запятой. */
 void awg_status_json(FILE *out, const struct output *o);
 

@@ -19,6 +19,8 @@
  * каталогов правила юнит-стендов (раздел 4), поэтому остаётся #include: awg_conf_free и другие его
  * статические помощники стенду нужны как есть. run_quiet — заглушка: до команд ip стенд не
  * доходит. */
+/* awg.c ниже — #include, а ему нужен _GNU_SOURCE (setns, устройства подбора) до первого заголовка. */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

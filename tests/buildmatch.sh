@@ -55,7 +55,7 @@ m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_va
 # Профили разделяемой раскладки (шаг 4 выпуска 1.10: libsteer, steerd, четыре модуля) — тоже
 # профили: точки входа модулей (src/modules/main_*.c) существуют только в них.
 m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; echo
-            for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy; do profile_src "$p"; echo; done; } |
+            for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox; do profile_src "$p"; echo; done; } |
           words | grep -E "^($(profile_var EXT_DIRS | tr ' ' '|'))/" | names)"
 check "sources.mk: профиль base (с видами расширенной части) — это все каталоги ядра"  "$disk_base" "$m_base"
 check "sources.mk: профили покрывают всю расширенную часть" "$disk_ext" "$m_ext"
@@ -860,19 +860,19 @@ check "src/tunnel и src/proto не зовут маршрутизацию дем
 # модулей одно — cli/modcmd.c: он входит в каждый бинарник, потому что слабые ссылки на cmd_*
 # решаются компоновкой, а не загрузчиком.
 sd="$(mktemp -d)"
-for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy extended; do
+for p in libsteer steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox extended; do
     profile_src "$p" | words | sort -u > "$sd/$p"
 done
 modcmd="$(profile_var MODCMD_SRC)"
-for a in steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy; do
+for a in steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox; do
     check "раскладка: в libsteer и $a нет общих файлов" "" \
         "$(comm -12 "$sd/libsteer" "$sd/$a" | tr '\n' ' ')"
 done
-for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy; do
+for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox; do
     check "раскладка: у steerd и $a общий один файл — modcmd.c" "$modcmd " \
         "$(comm -12 "$sd/steerd" "$sd/$a" | tr '\n' ' ')"
 done
-set -- mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy
+set -- mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox
 while [ $# -gt 1 ]; do
     a="$1"; shift
     for b in "$@"; do
@@ -882,7 +882,7 @@ while [ $# -gt 1 ]; do
 done
 # Модуль не несёт ни демона, ни модели: демон (failover.c, supd.c, dnsd…) — в steerd, модель и виды —
 # в libsteer. В списках модулей нет ничего из каталогов демона, резолвера, компилятора и моделей.
-for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy; do
+for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox; do
     check "раскладка: в $a нет файлов демона, компилятора, резолвера и модели" "" \
         "$(grep -E '^src/(daemon|dnsd|compile|model|kinds|platform)/' "$sd/$a" | tr '\n' ' ')"
 done
@@ -891,11 +891,11 @@ check "раскладка: libsteer не несёт демона, компиля
     "$(grep -E '^src/(daemon|dnsd|compile)/' "$sd/libsteer" | grep -v 'src/compile/nftcompat.c' | tr '\n' ' ')"
 # Всё, что было в статическом расширенном профиле, есть в раскладке (кроме файла профиля), а лишнее —
 # только четыре точки входа модулей.
-cat "$sd/libsteer" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" "$sd/mod_tgws" "$sd/mod_hysteria2" "$sd/mod_proxy" | sort -u > "$sd/all"
+cat "$sd/libsteer" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" "$sd/mod_tgws" "$sd/mod_hysteria2" "$sd/mod_proxy" "$sd/mod_warpbox" | sort -u > "$sd/all"
 check "раскладка покрывает расширенный профиль (кроме файла профиля)" "src/profile/extended.c " \
     "$(comm -23 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # (Обёртка QUIC src/proto/quic — в libsteer, в статическом профиле её нет: потребителя нет, телефону — шаг 6.)
-check "  и добавляет только точки входа модулей, обёртку QUIC и модули hysteria2 и proxy с их видами" "src/kinds/hysteria2.c src/kinds/proxy.c src/modules/main_hysteria2.c src/modules/main_obfs.c src/modules/main_proxy.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_xsteer.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/proxy/pxdial.c src/proto/proxy/pxhttp.c src/proto/proxy/pxmain.c src/proto/proxy/pxsocks.c src/proto/proxy/pxss.c src/proto/proxy/pxsub.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxvmess.c src/proto/proxy/pxwire.c src/proto/quic/qcdoq.c src/proto/quic/qcssl.c src/proto/quic/quic.c " \
+check "  и добавляет только точки входа модулей, обёртку QUIC и модули hysteria2, proxy (с их видами) и warpbox" "src/kinds/hysteria2.c src/kinds/proxy.c src/modules/main_hysteria2.c src/modules/main_obfs.c src/modules/main_proxy.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_warpbox.c src/modules/main_xsteer.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/proxy/pxdial.c src/proto/proxy/pxhttp.c src/proto/proxy/pxmain.c src/proto/proxy/pxsocks.c src/proto/proxy/pxss.c src/proto/proxy/pxsub.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxvmess.c src/proto/proxy/pxwire.c src/proto/quic/qcdoq.c src/proto/quic/qcssl.c src/proto/quic/quic.c src/proto/warp/wbconf.c src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/warp/wbmain.c src/proto/warp/wbns.c src/proto/warp/wbping.c src/proto/warp/wbreg.c src/proto/warp/wbscan.c " \
     "$(comm -13 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # Точка входа — единственный main() модуля; steerd свой main держит в daemon/main.c.
 for a in vless xsteer obfs tgws hysteria2 proxy; do

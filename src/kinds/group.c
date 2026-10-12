@@ -350,8 +350,31 @@ static unsigned group_caps_of(const struct output *o) {
     return o->grp.caps;
 }
 
+/* Помощник группы `kind: warp` — модуль steer-warpbox (src/proto/warp/wbmain.c): регистрация WARP,
+ * подбор точек и замена у членов. У обычной группы помощника нет. В подпись — то, что модуль читает
+ * при старте: транспорт, страны и состав членов (имена и over — туннели подбора идут тем же путём). */
+static int group_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
+    const struct group_cfg *g = &o->grp;
+    if (!g->warp.on) return -1;
+    snprintf(h->cmd, sizeof(h->cmd), "warp");
+    h->marks = 1;
+    kind_sig_mix(&h->sig, &g->warp.transport, sizeof(g->warp.transport));
+    kind_sig_mix(&h->sig, &g->warp.xcc_set, sizeof(g->warp.xcc_set));
+    for (size_t i = 0; i < g->warp.cc_n; i++) kind_sig_mix(&h->sig, g->warp.cc[i], 2);
+    kind_sig_mix(&h->sig, "|", 1);
+    for (size_t i = 0; i < g->warp.xcc_n; i++) kind_sig_mix(&h->sig, g->warp.xcc[i], 2);
+    for (size_t k = 0; k < g->members_n; k++) {
+        const struct output *m = spec_out(sp, g->members[k]);
+        if (!m) continue;
+        kind_sig_mix(&h->sig, m->name, strlen(m->name));
+        kind_sig_mix(&h->sig, m->over, strlen(m->over));
+    }
+    return 0;
+}
+
 const struct kind_ops kind_group = {
     .name = "group",
     .caps_of = group_caps_of,
     .novia = "группа",
+    .helper = group_helper,
 };

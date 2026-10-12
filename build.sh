@@ -204,7 +204,7 @@ pkg_deps() {  # ФАЙЛ_БИНАРНИКА ВИД (core|mod|tun) -> "nftables i
 # обновить один, оставив другой (apk — `имя=версия`, opkg — `имя (= версия)`). Чужие пакеты
 # (nftables, kmod-…) остаются без версии. Демон дополнительно проверяет версию при запуске модуля
 # (hello, docs/ctl.md) — на случай установки файлами мимо менеджера.
-OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-proxy steer-extended "
+OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-proxy steer-warpbox steer-extended "
 dep_apk() {  # ИМЕНА через пробел -> "имя=версия ..." для наших
     for _d in $1; do
         case "$OURS" in *" $_d "*) printf '%s=%s-r1 ' "$_d" "$VERSION" ;; *) printf '%s ' "$_d" ;; esac
@@ -536,9 +536,11 @@ EOF
     # Модули: по одному бинарнику в usr/sbin рядом со steerd, где их находит движок (src/lib/
     # module.c). Зависимость от steer-core — точной версии: ядро и модуль общаются линией событий,
     # формат которой между выпусками не обещан (hello в docs/ctl.md).
-    # steer-hysteria2 и steer-proxy — тоже модули, но в steer-extended они НЕ входят: отдельные
-    # пакеты, которые ставят сознательно (см. мета-пакет ниже).
-    for m in vless xsteer obfs tgws hysteria2 proxy; do
+    # steer-hysteria2, steer-proxy и steer-warpbox — тоже модули, но в steer-extended они НЕ входят:
+    # отдельные пакеты, которые ставят сознательно (см. мета-пакет ниже). У steer-warpbox нет
+    # зависимости от модуля ядра: туннели WARP — выходы awg ядра steer, а им годится и kmod-amneziawg
+    # (сторонний, с обфускацией), и kmod-wireguard из фидов OpenWrt — выбор за человеком.
+    for m in vless xsteer obfs tgws hysteria2 proxy warpbox; do
         mroot="build/pkg/$arch-$m"
         rm -rf "$mroot"
         mkdir -p "$mroot/usr/sbin"
@@ -551,6 +553,7 @@ EOF
             tgws)   md="steer-tgws: мост Telegram для steer (модуль)"; mk=mod ;;
             hysteria2) md="steer-hysteria2: клиент hysteria2 (QUIC, Brutal) для steer (модуль)"; mk=tun ;;
             proxy)  md="steer-proxy: клиенты trojan, shadowsocks, socks, http, vmess для steer (модуль)"; mk=tun ;;
+            warpbox) md="steer-warpbox: Cloudflare WARP для steer — регистрация, подбор точек, замена (модуль)"; mk=mod ;;
         esac
         mdeps="steer-core $(pkg_deps "$mroot/usr/sbin/steer-$m" "$mk")"
         pack "steer-$m" "$mroot" "$mdeps" "$md" mod

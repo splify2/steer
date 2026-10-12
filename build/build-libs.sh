@@ -203,6 +203,7 @@ link_app steer-obfs "-O2 $APPF" PROFILE_mod_obfs
 link_app steer-tgws "-O2 $APPF" PROFILE_mod_tgws
 link_app steer-hysteria2 "-O2 $APPF" PROFILE_mod_hysteria2
 link_app steer-proxy "-O2 $APPF" PROFILE_mod_proxy
+link_app steer-warpbox "-O2 $APPF" PROFILE_mod_warpbox
 fi
 
 # Внешние модули (STEER_EXT_APPS="имя:каталог …"): бинарники из исходников ВНЕ этого дерева —
@@ -223,4 +224,4 @@ for _ea in ${STEER_EXT_APPS:-}; do
 done
 
 # Клиент сокета `steer` — по-прежнему статический, один на все раскладки (build.sh собирает его сам).
-echo "libs: готово в $OUT (libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"
+echo "libs: готово в $OUT (libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy, steer-warpbox${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"

@@ -124,6 +124,7 @@
 #include "watchd.h"
 #include "helpers.h"
 #include "module.h"
+#include "awg.h"
 
 #define LOG_SW "steer[warn] supervise: "
 /* Таблицы, не забранные резолвером: одна — десятки килобайт; больше мегабайта в очереди —
@@ -321,6 +322,21 @@ static void mod_hello(struct supd *s, struct helper *h, const struct evline *e) 
     h->hello = 1;
 }
 
+/* awg (модуль steer-warpbox, evline.h): файл члена группы `kind: warp` переписан — перенастроить его
+ * устройство сейчас, тем же awg_revive, что зовёт сторож, а не ждать прохода. Только член группы
+ * этого помощника (warp_of): чужим выходом помощник распоряжаться не вправе. */
+static void ev_awg(struct supd *s, struct helper *h, const struct evline *e) {
+    const char *name = evline_str(e, "out");
+    if (!name || !s->d->have) return;
+    const struct output *o = out_by_name(s->d->sp, name);
+    if (!o || strcmp(o->warp_of, h->name) != 0) {
+        fprintf(stderr, LOG_SW "%s %s просит перенастроить %s — это не член его группы\n", h->cmd, h->name, name);
+        return;
+    }
+    awg_revive(s->d->sp, o, o->device, NULL, 0);
+    if (s->d->watch) watchd_helper_changed(s->d->watch);
+}
+
 static void ev_line(struct supd *s, struct helper *h, const char *line) {
     struct evline e;
     if (evline_parse(line, &e) != 0) return;
@@ -373,6 +389,8 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
         if (evline_int(&e, "total", &t)) st->total = t;
     } else if (!strcmp(e.ev, "health")) {
         ev_health(s, h, &e);
+    } else if (!strcmp(e.ev, "awg")) {
+        ev_awg(s, h, &e);
     } else if (!strcmp(e.ev, "active")) {
         /* Активные узлы пула: только цифры и запятые — строка ложится в JSON массивом как есть
          * (helper ниже), поэтому чужое в ней отвергается целиком. */
