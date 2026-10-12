@@ -169,6 +169,7 @@ LIBSTEER_1 {
     out_hy2_node_list;
     out_hy2_node_named;
     out_hysteria2;
+    out_is_block;
     out_kind_name;
     out_member;
     out_members_n;
