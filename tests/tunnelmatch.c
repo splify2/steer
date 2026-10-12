@@ -43,6 +43,9 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/uio.h>
 
 /* ---- стек установщиков --------------------------------------------------------- */
 
@@ -70,6 +73,19 @@ int poll(struct pollfd *fds, nfds_t n, int timeout) {
     g_poll_calls++;
     if (!real) real = (int (*)(struct pollfd *, nfds_t, int))dlsym(RTLD_NEXT, "poll");
     return real(fds, n, timeout);
+}
+
+/* ---- счёт writev ---------------------------------------------------------------------- */
+
+/* Запись клиенту (sock_flush) — одним writev по кольцу недописанного за проход. Стенд считает вызовы:
+ * запись на каждое чтение у узла стоила бы системного вызова и отправки TCP на каждые 16 КБ. */
+static int g_writev_calls;
+
+ssize_t writev(int fd, const struct iovec *iov, int n) {
+    static ssize_t (*real)(int, const struct iovec *, int);
+    g_writev_calls++;
+    if (!real) real = (ssize_t (*)(int, const struct iovec *, int))dlsym(RTLD_NEXT, "writev");
+    return real(fd, iov, n);
 }
 
 /* ---- сон установщика ----------------------------------------------------------- */
@@ -126,6 +142,7 @@ static int g_send_rc;                 /* что вернёт transport_write: 0 
 static int g_send_again_n;            /* столько раз подряд вернуть H2_EWINDOW, потом 0 */
 static int g_send_calls;              /* сколько раз вызван transport_write */
 static size_t g_send_last_n;          /* длина последнего transport_write */
+static size_t g_send_max_n;           /* самая длинная запись с последнего обнуления стендом */
 /* Место у узла (transport_room): -1 — без предела. g_room_on_read, если не -2, станет местом при
  * следующем чтении, как его сделал бы прочитанный у узла WINDOW_UPDATE. */
 static long g_room = -1;
@@ -156,6 +173,7 @@ int transport_write(struct transport *c, const unsigned char *d, size_t n) {
     (void)c;
     g_send_calls++;
     g_send_last_n = n;
+    if (n > g_send_max_n) g_send_max_n = n;
     if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
     if (g_send_rc == 0 && g_sent_n + n <= sizeof(g_sent)) { memcpy(g_sent + g_sent_n, d, n); g_sent_n += n; }
     return g_send_rc;
@@ -233,20 +251,129 @@ static void check(int ok, const char *what) {
     if (!ok) g_fail = 1;
 }
 
-/* Один пакет клиента посреди порции из TUN: собранные данные остаются собранными. */
-static void cli_send_more(uint32_t seq, uint32_t ack, unsigned char flags, uint16_t win,
-                          const unsigned char *d, size_t n) {
-    unsigned char p[2048];
-    size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, seq, ack, flags,
-                         d, n, win, 0, -1);
-    handle_packet(&g_tun, p, l);
+/* ---- сторона клиента: сокет (R-152) ---------------------------------------------------------- */
+
+/* TCP клиентов завершает ядро: соединение приходит в модуль принятым сокетом (kaccept → conn_accept),
+ * назначение — у ядра (SO_ORIGINAL_DST). Стенд задаёт его сам: сторона клиента — пара сокетов, один конец
+ * принимает conn_accept, второй — «клиент», у которого стенд пишет и читает. AF_UNIX — для данных (буфер
+ * ядра известен и велик), TCP на петле — когда важно различие RST и FIN (conn_reset закрывает с SO_LINGER 0:
+ * по AF_UNIX клиент этого не увидит). Готовность по фронту epoll (CRD) стенд ставит сам, как событие. */
+static int g_cfd[MAX_CONNS];          /* клиентский конец сокета соединения по номеру слота; -1 — нет */
+
+static int cli_pair_unix(int sv[2]) {
+    return socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv);
 }
 
-/* Один пакет клиента как целая порция из TUN: то, что цикл делает после порции, up_flush. */
-static void cli_send(uint32_t seq, uint32_t ack, unsigned char flags, uint16_t win,
-                     const unsigned char *d, size_t n) {
-    cli_send_more(seq, ack, flags, win, d, n);
-    up_flush(&g_tun);
+static int cli_pair_tcp(int sv[2]) {
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET };
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (l < 0) return -1;
+    if (bind(l, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(l, 1) != 0 ||
+        getsockname(l, (struct sockaddr *)&sa, &sl) != 0) { close(l); return -1; }
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0 || connect(c, (struct sockaddr *)&sa, sizeof sa) != 0) { close(l); if (c >= 0) close(c); return -1; }
+    int a = accept(l, NULL, NULL);
+    close(l);
+    if (a < 0) { close(c); return -1; }
+    fcntl(a, F_SETFL, fcntl(a, F_GETFL) | O_NONBLOCK);
+    fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK);
+    sv[0] = a; sv[1] = c;
+    return 0;
+}
+
+/* Принять srv как соединение клиента CLI_IP:sport -> dst:443; cli — клиентский конец. NULL — соединения нет
+ * (conn_accept закрыл srv сам); клиентский конец тогда закрывается здесь. */
+static struct conn *sock_conn_fd(int srv, int cli, uint16_t sport, uint32_t dst) {
+    struct flow_key k;
+    memset(&k, 0, sizeof(k));
+    k.src = CLI_IP; k.dst = dst; k.sport = sport; k.dport = SRV_PORT; k.proto = 6;
+    struct conn *c = conn_accept(srv, &k, &g_tun);
+    if (!c) { close(cli); return NULL; }
+    size_t i = (size_t)(c - g_conns);
+    if (g_cfd[i] >= 0) close(g_cfd[i]);
+    g_cfd[i] = cli;
+    return c;
+}
+
+static struct conn *sock_conn(uint16_t sport, uint32_t dst) {
+    int sv[2];
+    return cli_pair_unix(sv) == 0 ? sock_conn_fd(sv[0], sv[1], sport, dst) : NULL;
+}
+
+static struct conn *sock_conn_tcp(uint16_t sport, uint32_t dst) {
+    int sv[2];
+    return cli_pair_tcp(sv) == 0 ? sock_conn_fd(sv[0], sv[1], sport, dst) : NULL;
+}
+
+static int cli_fd(const struct conn *c) { return g_cfd[c - g_conns]; }
+
+/* Клиент пишет в сокет; ядро сообщило бы о данных событием epoll — стенд ставит готовность (CRD) сам. */
+static void cli_put(struct conn *c, const void *d, size_t n) {
+    int fd = cli_fd(c);
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, (const char *)d + off, n - off);
+        if (w > 0) off += (size_t)w;
+        else if (w < 0 && errno == EINTR) continue;
+        else break;
+    }
+    if (off != n) check(0, "стенд: клиент не смог записать в свой сокет");
+    c->carmed |= CRD;
+}
+
+/* Всё, что дошло до клиента (до cap байт). */
+static size_t cli_get(int fd, unsigned char *buf, size_t cap) {
+    size_t n = 0;
+    while (n < cap) {
+        ssize_t r = read(fd, buf + n, cap - n);
+        if (r > 0) n += (size_t)r;
+        else if (r < 0 && errno == EINTR) continue;
+        else break;
+    }
+    return n;
+}
+
+/* Сколько байт лежит в сокете непрочитанным (fd — клиентский конец: дошедшее до клиента). */
+static int cli_pending(int fd) {
+    int n = 0;
+    if (ioctl(fd, FIONREAD, &n) != 0) return -1;
+    return n;
+}
+
+/* Сколько байт клиента лежит в принятом сокете, не прочитанное стеком. */
+static int srv_pending(const struct conn *c) { return cli_pending(conn_cfd(c)); }
+
+/* Чем кончилось для клиента, когда он вычитал всё: 0 — соединение открыто, 1 — FIN (EOF), 2 — RST. */
+static int cli_end(int fd) {
+    unsigned char b[4096];
+    for (;;) {
+        ssize_t r = read(fd, b, sizeof b);
+        if (r > 0) continue;
+        if (r == 0) return 1;
+        if (errno == EINTR) continue;
+        return errno == ECONNRESET ? 2 : 0;
+    }
+}
+
+/* То, что делает цикл по событию сокета клиента: готовность + чтение, если узел принимает. */
+static void cli_pump(struct conn *c) {
+    c->carmed |= CRD;
+    if (c->used && sock_want_read(c)) sock_read(c, &g_tun);
+}
+
+/* Образец потока клиента узлу: байт i = (i * 13 + i / 7). */
+static void up_fill(unsigned char *p, size_t n, size_t from) {
+    for (size_t i = 0; i < n; i++) p[i] = (unsigned char)((from + i) * 13 + (from + i) / 7);
+}
+
+/* Сколько байт буфера не совпало с потоком-образцом узла (stream_byte), начиная с позиции pos. */
+static int stream_bad(const unsigned char *b, size_t n, size_t pos) {
+    int bad = 0;
+    for (size_t i = 0; i < n; i++)
+        if (b[i] != stream_byte(pos + i)) bad++;
+    return bad;
 }
 
 /* Вычитать всё, что туннель написал в устройство. Возвращает число пакетов, в last — ключ
@@ -286,53 +413,95 @@ static int wait_ready(struct conn *c, int ms) {
     return -1;
 }
 
-/* Открыть соединение до состояния «поток готов, сервер ответил заголовком и 1000 байт,
- * клиент их ещё не подтвердил». Клиентский ISN 1000. */
-static struct conn *open_conn(uint16_t win) {
-    struct flow_key k = cli_key();
-    struct conn *c = conn_find(&k);
-    if (c) conn_drop(c);
-    cli_send(1000, 0, TCP_SYN, win, NULL, 0);
-    c = conn_find(&k);
+/* Соединение до «поток готов и сервер ответил заголовком и 1000 байт», ответ у клиента вычитан. */
+static struct conn *ready_conn(struct conn *c) {
     if (!c || !c->pending || wait_ready(c, 2000) != 0) return NULL;
-    cli_send(1001, 2, TCP_ACK, win, NULL, 0);
     g_recv_rc = 0;
     g_recv_buf[0] = 0; g_recv_buf[1] = 0;                 /* ответ VLESS: версия, длина доп. */
     memset(g_recv_buf + 2, 'r', 1000);
     g_recv_n = 1002;
     drain_conn(c, &g_tun);
-    dev_drain(NULL);
+    unsigned char b[2000];
+    size_t got = cli_get(cli_fd(c), b, sizeof b);
     /* Стенд сам себя проверяет: без этого «провал» мог бы означать сломанную подготовку.
      * «Ответ VLESS снят» — состояние дайлера, оно в его сессии. */
     const struct vl_sess *vs = SESS(c);
-    if (!vs->established || c->rtx.len != 1000 || c->srv_closed) return NULL;
+    if (!vs->established || got != 1000 || c->srv_closed || c->rtx.len) return NULL;
+    g_sent_n = 0;
     return c;
+}
+
+static struct conn *open_conn(void) {
+    struct flow_key k = cli_key();
+    struct conn *c = conn_find(&k);
+    if (c) conn_drop(c);
+    return ready_conn(sock_conn(CLI_PORT, SRV_IP));
 }
 
 /* ---- проверки ------------------------------------------------------------------ */
 
 /* I-322: установщиков не создалось ни одного. Прежде очередь считалась запущенной, SYN
- * получал SYN-ACK, а заявка висела pending навсегда — ни RST, ни повторной попытки. */
+ * получал SYN-ACK, а заявка висела pending навсегда — ни RST, ни повторной попытки. Теперь соединение
+ * принято сокетом: без установщиков оно сбрасывается сразу, RST — клиенту. */
 static void t_no_connectors(void) {
     g_refuse_threads = 1;
     struct flow_key k = cli_key();
-    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
-    struct conn *c = conn_find(&k);
-    struct flow_key last;
-    int synack = 0;
-    int n = dev_drain(&last);
-    if (n && (last.tcp_flags & TCP_SYN)) synack = 1;
-    check(!c && !synack, "I-322: без установщиков SYN отклонён, SYN-ACK не ушёл");
+    int sv[2];
+    if (cli_pair_tcp(sv) != 0) { check(0, "I-322: стенд — пара сокетов"); return; }
+    struct conn *c = conn_accept(sv[0], &k, &g_tun);
+    int end = cli_end(sv[1]);
+    close(sv[1]);
+    check(!c && !conn_find(&k) && end == 2,
+          "I-322: без установщиков соединение сброшено сразу (клиенту RST), заявка не висит");
     if (c) conn_drop(c);
 
-    /* Стек дали — следующий SYN обязан получить установщика: отказ не залипает. */
+    /* Стек дали — следующее соединение обязано получить установщика: отказ не залипает. */
     g_refuse_threads = 0;
-    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
-    c = conn_find(&k);
+    c = sock_conn(CLI_PORT, SRV_IP);
     check(c && c->pending && wait_ready(c, 2000) == 0,
-          "I-322: после отказа установщики заводятся на следующем SYN");
+          "I-322: после отказа установщики заводятся на следующем соединении");
     if (c) conn_drop(c);
+}
+
+/* R-152: TCP в устройство не несётся — его завершает ядро на слушателе модуля. Попавший в TUN пакет TCP
+ * (перенаправления ещё нет или раскладка старого ядра) получает сброс, а не тишину; соединения в таблице
+ * не заводится и установщик не просится. RST клиента отвечать не надо. */
+static void t_tcp_tun_rst(void) {
+    struct flow_key k = cli_key(), last;
+    unsigned char p[128];
     dev_drain(NULL);
+    int live0 = g_live_n;
+    unsigned head0 = g_cq.head;
+    unsigned long long rst0 = g_tcp_tun_rst;
+
+    size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, 1000, 0, TCP_SYN, NULL, 0,
+                         65535, 1460, -1);
+    handle_packet(&g_tun, p, l);
+    memset(&last, 0, sizeof(last));
+    int n = dev_drain(&last);
+    check(n == 1 && (last.tcp_flags & TCP_RST) && (last.tcp_flags & TCP_ACK) && last.ack == 1001 &&
+          last.seq == 0 && last.src == SRV_IP && last.dst == CLI_IP && last.sport == SRV_PORT &&
+          last.dport == CLI_PORT,
+          "TCP в устройстве: SYN получает RST+ACK с номером подтверждения ISN + 1 от имени сервера");
+    check(g_tcp_tun_rst == rst0 + 1, "TCP в устройстве: счётчик g_tcp_tun_rst вырос");
+    check(!conn_find(&k) && g_live_n == live0 && g_cq.head == head0,
+          "TCP в устройстве: соединение в таблицу не заводится, установщик не просится");
+
+    /* Данные и подтверждение: RST с номером из подтверждения (RFC 793, 3.4). */
+    const unsigned char d[] = "GET / HTTP/1.1\r\n";
+    l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, 1001, 777, TCP_ACK | TCP_PSH, d,
+                  sizeof(d) - 1, 65535, 0, -1);
+    handle_packet(&g_tun, p, l);
+    memset(&last, 0, sizeof(last));
+    n = dev_drain(&last);
+    check(n == 1 && (last.tcp_flags & TCP_RST) && last.seq == 777 && last.ack == 1001 + sizeof(d) - 1 &&
+          g_tcp_tun_rst == rst0 + 2 && !conn_find(&k),
+          "TCP в устройстве: данные тоже получают RST с его номером подтверждения");
+
+    /* RST клиента — без ответа и без счёта. */
+    l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, 1001, 0, TCP_RST, NULL, 0, 0, 0, -1);
+    handle_packet(&g_tun, p, l);
+    check(dev_drain(NULL) == 0 && g_tcp_tun_rst == rst0 + 2, "TCP в устройстве: RST клиента — без ответа");
 }
 
 /* I-322: номер адреса устройства из таблицы выхода. Таблица приходит из файла реестра, и
@@ -350,271 +519,171 @@ static void t_bring_up_table(void) {
     check(host >= 1 && host <= 200, "I-322: таблица -7 даёт адрес 198.51.100.1..200");
 }
 
-/* I-320: окно HTTP/2 закрыто (SEND_AGAIN), и туннель читает у сервера, надеясь на
- * WINDOW_UPDATE. Читать можно только то, что клиент в силах принять: прочитанное за его
- * окно уходит в пустоту и лечится лишь повтором по таймауту. */
-static void t_sendagain_window(void) {
-    struct conn *c = open_conn(65535);
-    if (!c) { check(0, "I-320: соединение не открылось"); return; }
-    /* Клиент принял не всё и объявил окно ровно под уже отправленное: места нет. */
-    const unsigned char d[] = "GET / HTTP/1.1\r\n";
-    g_send_rc = H2_EWINDOW;
-    g_recv_rc = 0;
-    memset(g_recv_buf, 'r', 1000);
-    g_recv_n = 1000;
-    int calls = g_recv_calls;
-    cli_send(1001, 2, TCP_ACK | TCP_PSH, 1000, d, sizeof(d) - 1);
-    check(g_recv_calls == calls, "I-320: при закрытом окне клиента у сервера не читаем");
-    g_send_rc = 0;
-    g_recv_n = 0;
+/* I-323 и I-320: поток к узлу ставится, пока клиент уже пишет. Данные клиента лежат в его сокете — окно
+ * держит ядро — и узлу не уходят, пока поток не готов; после готовности уходят все, по порядку, байт в байт. */
+static void t_early_wait(void) {
+    struct flow_key k = cli_key();
+    struct conn *c = conn_find(&k);
+    if (c) conn_drop(c);
+    g_sent_n = 0;
+    c = sock_conn(CLI_PORT, SRV_IP);
+    if (!c || !c->pending) { check(0, "ранние данные: соединение не принято"); return; }
+    static unsigned char d[20000], got[20000 + 64];
+    up_fill(d, sizeof d, 0);
+    int calls = g_send_calls;
+    cli_put(c, d, sizeof d);
+    check(c->pending && c->early_n == 0 && g_send_calls == calls &&
+          srv_pending(c) == (int)sizeof d,
+          "ранние данные: пока поток ставится, клиент пишет в сокет — узлу ничего, в таблице ничего не копится");
+    check(wait_ready(c, 2000) == 0 && !c->pending && g_send_calls == calls,
+          "ранние данные: поток готов — узлу по-прежнему ничего, пока цикл не прочитает сокет");
+    conn_deadlines(c, &g_tun, c->estab_ns + 1);
+    memcpy(got, g_sent, g_sent_n < sizeof got ? g_sent_n : sizeof got);
+    check(c->used && g_sent_n == 26 + sizeof d && memcmp(got + 26, d, sizeof d) == 0 &&
+          c->sent_any && srv_pending(c) == 0,
+          "ранние данные: после готовности ушло всё накопленное — заголовок и 20000 байт, порядок и содержимое целы");
     conn_drop(c);
-    dev_drain(NULL);
 }
 
-/* I-320, обратная сторона: окно клиента открыто — чтение у сервера делается (оттуда
- * приходит WINDOW_UPDATE), повторная отправка удаётся, пакет подтверждён. */
-static void t_sendagain_retry(void) {
-    struct conn *c = open_conn(65535);
+/* I-320: узел не принимает (окно HTTP/2 закрыто, SEND_AGAIN). Принятое у клиента не теряется и не
+ * переставляется: остаток ждёт в буфере (early), сокет клиента не читается, пока он не ушёл, — окно клиенту
+ * держит ядро. Узел снова принимает — уходит остаток, потом то, что клиент дописал за это время. */
+static void t_sendagain_hold(void) {
+    struct conn *c = open_conn();
     if (!c) { check(0, "I-320: соединение не открылось"); return; }
-    const unsigned char d[] = "GET / HTTP/1.1\r\n";
-    g_send_again_n = 1;
-    g_recv_rc = 0;
-    g_recv_n = 0;                                       /* служебный кадр: данных нет */
-    int calls = g_recv_calls;
-    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d) - 1);
-    check(g_recv_calls > calls && c->used && c->client_seq == 1001 + sizeof(d) - 1,
-          "I-320: окно клиента открыто — читаем, повтор отправки удался");
+    static unsigned char d1[3000], d2[5000], want[8000];
+    up_fill(d1, sizeof d1, 0);
+    up_fill(d2, sizeof d2, 3000);
+    memcpy(want, d1, sizeof d1);
+    memcpy(want + sizeof d1, d2, sizeof d2);
+    g_send_rc = H2_EWINDOW;
+    cli_put(c, d1, sizeof d1);
+    cli_pump(c);
+    check(c->early_n == sizeof d1 && !sock_want_read(c) && g_sent_n == 0,
+          "I-320: узел не принял — данные клиента остались у стека (early), сокет читать не просят");
+    cli_put(c, d2, sizeof d2);
+    cli_pump(c);
+    check(c->early_n == sizeof d1 && srv_pending(c) == (int)sizeof d2,
+          "I-320: пока остаток не ушёл, свежие данные клиента остаются в его сокете (порядок байт дороже скорости)");
+    cli_pump(c);                                            /* повторное событие: ничего не меняет */
+    check(c->early_n == sizeof d1 && srv_pending(c) == (int)sizeof d2, "  и повторное событие их не трогает");
+
+    g_send_rc = 0;
+    conn_deadlines(c, &g_tun, c->estab_ns + 1);
+    check(c->used && !c->early && g_sent_n == 26 + sizeof want && memcmp(g_sent + 26, want, sizeof want) == 0 &&
+          srv_pending(c) == 0,
+          "I-320: узел принял — сначала остаток, потом дописанное клиентом: 8000 байт по порядку, без потерь и повторов");
+
+    /* Остаток уходит и когда узел принимает не с первой попытки (SEND_AGAIN несколько раз подряд). */
+    g_sent_n = 0;
+    g_send_again_n = 2;
+    cli_put(c, d1, sizeof d1);
+    cli_pump(c);
+    check(c->early_n == sizeof d1, "I-320: отказ узла — остаток снова в early");
+    conn_deadlines(c, &g_tun, c->estab_ns + 1);             /* второй отказ */
+    check(c->early_n == sizeof d1 && g_sent_n == 0, "  второй отказ — остаток цел");
+    conn_deadlines(c, &g_tun, c->estab_ns + 1);             /* принял */
+    check(!c->early && g_sent_n == sizeof d1 && memcmp(g_sent, d1, sizeof d1) == 0,
+          "  и принятый наконец остаток уходит целиком");
     g_send_again_n = 0;
     conn_drop(c);
-    dev_drain(NULL);
 }
 
-/* I-320: на том же чтении сервер закрыл поток. Соединение обязано дожить до подтверждения
- * уже отправленного (srv_closed, как в drain_conn), а не пропасть вместе с кольцом. */
-static void t_sendagain_eof(void) {
-    struct conn *c = open_conn(65535);
-    if (!c) { check(0, "I-320: соединение не открылось"); return; }
-    const unsigned char d[] = "GET / HTTP/1.1\r\n";
-    g_send_rc = H2_EWINDOW;
-    g_recv_rc = -1;
-    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d) - 1);
+/* Сокет клиента полон (клиент не читает): у узла не читаем больше, чем уместится в кольцо недописанного
+ * (client_can_take_record), — прочитанное за кольцо было бы потеряно. Клиент читает — остаток дописывается
+ * (sock_flush по EPOLLOUT), чтение у узла возобновляется, и поток доходит целиком, по порядку. */
+static void fill_client(struct conn *c, int *total_reads) {
+    g_stream_pos = 0;
+    g_recv_rep = 100; g_recv_rep_n = 4000;                  /* 400000 байт у узла */
+    int calls = g_recv_calls;
+    drain_conn_reads(c, &g_tun);                            /* читает, пока кольцу есть куда; записи клиенту нет */
+    *total_reads = g_recv_calls - calls;
+}
+
+static void t_client_full(void) {
+    int sv[2];
+    if (cli_pair_unix(sv) != 0) { check(0, "стенд: пара сокетов"); return; }
+    int small = 4096;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);   /* принимает мало: клиент не читает */
     struct flow_key k = cli_key();
-    c = conn_find(&k);
-    check(c && c->srv_closed && c->rtx.len == 1000,
-          "I-320: конец потока при SEND_AGAIN — соединение живо, 1000 байт ждут подтверждения");
-    g_send_rc = 0;
-    g_recv_rc = 0;
-    if (c) conn_drop(c);
-    dev_drain(NULL);
-}
-
-/* I-321: сегмент не по порядку отбрасывается (буфера переупорядочивания нет), но ответить
- * на него обязаны подтверждением ожидаемого номера: без дубликатов ACK у клиента не
- * срабатывает быстрый повтор, и дыра закрывается только по таймауту. Тот же ответ нужен и
- * на повтор уже принятого — иначе потерянный наш ACK не восстанавливается ничем. */
-static void t_out_of_order_dupack(void) {
-    struct conn *c = open_conn(65535);
-    if (!c) { check(0, "I-321: соединение не открылось"); return; }
-    const unsigned char d[100] = { 0 };
-    struct flow_key last;
-    cli_send(1001 + 500, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    int n = dev_drain(&last);
-    check(n == 1 && (last.tcp_flags & TCP_ACK) && last.ack == 1001 && c->client_seq == 1001,
-          "I-321: сегмент за дырой — не принят, ушёл ACK ожидаемого номера");
-
-    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));      /* по порядку */
-    flush_acks(&g_tun);
-    dev_drain(NULL);
-    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));      /* его же повтор */
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    n = dev_drain(&last);
-    check(n == 1 && last.ack == 1101 && c->client_seq == 1101,
-          "I-321: повтор принятого — не принят дважды, ACK с текущим номером");
-    conn_drop(c);
-    dev_drain(NULL);
-}
-
-/* Сегменты клиента не по порядку откладываются и разбираются, когда дыра закрыта (ooo_hold, ooo_drain):
- * переупорядочивание на устройстве больше не стоит клиенту таймаута повтора (стенд sigpipe). Три
- * сегмента A, B, C приходят как C, B, A: до A ничего не подтверждено и узлу не ушло, после A — узел
- * получил A, B, C подряд, клиенту — один ACK на всё, отложенное освобождено. */
-static void t_out_of_order_hold(void) {
-    struct conn *c = open_conn(65535);
-    if (!c) { check(0, "не по порядку: соединение не открылось"); return; }
-    unsigned char a[100], b[100], cc[100];
-    memset(a, 'a', sizeof(a));
-    memset(b, 'b', sizeof(b));
-    memset(cc, 'c', sizeof(cc));
-    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, a, sizeof(a));      /* заголовок VLESS уходит с первыми данными */
-    flush_acks(&g_tun);
-    dev_drain(NULL);
-    size_t base = g_sent_n;
-    cli_send_more(1201, 2, TCP_ACK | TCP_PSH, 65535, cc, sizeof(cc));
-    cli_send_more(1101, 2, TCP_ACK | TCP_PSH, 65535, b, sizeof(b));
-    up_flush(&g_tun);
-    flush_acks(&g_tun);
-    struct flow_key last;
-    memset(&last, 0, sizeof(last));
-    dev_drain(&last);
-    check(c->client_seq == 1301 && last.ack == 1301 && g_sent_n - base == 200 &&
-          memcmp(g_sent + base, b, 100) == 0 && memcmp(g_sent + base + 100, cc, 100) == 0 && !c->ooo,
-          "не по порядку: C раньше B — B закрыл дыру, C разобран следом, узлу B и C подряд");
-
-    /* Обгон на два сегмента и повтор уже отложенного. */
-    base = g_sent_n;
-    unsigned char e[100], f[100], g[100];
-    memset(e, 'e', sizeof(e));
-    memset(f, 'f', sizeof(f));
-    memset(g, 'g', sizeof(g));
-    cli_send_more(1501, 2, TCP_ACK | TCP_PSH, 65535, g, sizeof(g));
-    cli_send_more(1401, 2, TCP_ACK | TCP_PSH, 65535, f, sizeof(f));
-    cli_send_more(1501, 2, TCP_ACK | TCP_PSH, 65535, g, sizeof(g));   /* повтор отложенного */
-    up_flush(&g_tun);
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    dev_drain(&last);
-    check(c->client_seq == 1301 && last.ack == 1301 && g_sent_n == base && c->ooo && c->ooo->n == 2,
-          "не по порядку: до закрытия дыры — ничего не подтверждено и узлу не ушло, отложено два");
-    cli_send(1301, 2, TCP_ACK | TCP_PSH, 65535, e, sizeof(e));
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    dev_drain(&last);
-    check(c->client_seq == 1601 && last.ack == 1601 && g_sent_n - base == 300 &&
-          memcmp(g_sent + base, e, 100) == 0 && memcmp(g_sent + base + 100, f, 100) == 0 &&
-          memcmp(g_sent + base + 200, g, 100) == 0 && !c->ooo && g_ooo_bytes == 0,
-          "не по порядку: дыра закрыта — E, F, G подряд, один ACK на всё, память освобождена");
-
-    /* Закрытие соединения с отложенным — память возвращается. */
-    cli_send_more(1701, 2, TCP_ACK | TCP_PSH, 65535, g, sizeof(g));
-    check(c->ooo && g_ooo_bytes > 0, "не по порядку: отложено перед закрытием");
-    conn_drop(c);
-    check(g_ooo_bytes == 0, "не по порядку: закрытие соединения освобождает отложенное");
-    dev_drain(NULL);
-}
-
-/* Масштаб окна приёма (RFC 7323). Клиент с опцией масштаба в SYN получает в SYN-ACK нашу опцию и окно без
- * масштаба (в SYN и SYN-ACK окно не масштабируется никогда); в данных и подтверждениях поле окна — потолок,
- * делённый на наш множитель, то есть настоящее окно выше 64 КБ. Клиент без опции в SYN не получает её в
- * ответ (опция в SYN-ACK без опции в SYN — нарушение RFC 7323, 2.2) и видит 65535 во всех пакетах, как
- * прежде.
- *
- * Стенд проверяет и сам расчёт множителя (rcv_window_set): наименьший, при котором поле вмещает потолок, и
- * поле окна с округлением вверх (rcv_win_field): прежние 65535 при множителе 7 не должны стать 65408. */
-static void syn_opts(uint32_t seq, int wscale) {
-    unsigned char p[128];
-    size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, seq, 0, TCP_SYN, NULL, 0,
-                         65535, 1460, wscale);
-    handle_packet(&g_tun, p, l);
-}
-
-/* Подтверждение 100 байт данных клиента: ключ последнего пакета, ушедшего в «устройство» (n — сколько их). */
-static int ack_after_data(uint32_t seq, struct flow_key *last) {
-    static const unsigned char d[100] = { 0 };
-    cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
-    flush_acks(&g_tun);
-    memset(last, 0, sizeof(*last));
-    return dev_drain(last);
-}
-
-static void t_window_scale(void) {
-    uint32_t keep_wnd = g_rcv_wnd;
-    uint8_t keep_shift = g_rcv_shift;
-
-    rcv_window_set(100);
-    check(g_rcv_wnd == 65535 && g_rcv_shift == 0, "масштаб окна: потолок ниже 65535 — 65535, без множителя");
-    rcv_window_set(65535);
-    check(g_rcv_wnd == 65535 && g_rcv_shift == 0, "  ровно 65535 — множитель 0");
-    rcv_window_set(65536);
-    check(g_rcv_wnd == 65536 && g_rcv_shift == 1, "  65536 — множитель 1 (65535 << 0 не вмещает)");
-    rcv_window_set(1u << 20);
-    check(g_rcv_wnd == (1u << 20) && g_rcv_shift == 5, "  1 МиБ — множитель 5 (65535 << 4 = 1048560 не вмещает)");
-    rcv_window_set(4u << 20);
-    check(g_rcv_wnd == (4u << 20) && g_rcv_shift == 7, "  4 МиБ — множитель 7 (65535 << 6 = 4194240 не вмещает)");
-    rcv_window_set(0xFFFFFFFFu);
-    check(g_rcv_shift == 14 && g_rcv_wnd == (65535u << 14), "  больше предела — множитель 14 (RFC 7323, 2.3), потолок 65535 << 14");
-
-    /* Дальше — потолок 1 МиБ, множитель 5: в поле окна 32768. */
-    rcv_window_set(1u << 20);
-    struct flow_key k = cli_key(), last;
-    struct conn *c0 = conn_find(&k);
-    if (c0) conn_drop(c0);
-    dev_drain(NULL);
-
-    syn_opts(1000, 7);                                    /* клиент: опция масштаба 7 */
     struct conn *c = conn_find(&k);
-    memset(&last, 0, sizeof(last));
-    int n = dev_drain(&last);
-    check(c && n == 1 && (last.tcp_flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) && last.ws_seen &&
-              last.wscale == 5,
-          "SYN с опцией масштаба: SYN-ACK несёт нашу опцию с множителем 5");
-    check(n == 1 && last.window == EARLY_CAP, "  окно в самом SYN-ACK — без масштаба, по буферу ранних данных (установщик работает)");
-    check(c && c->ws_on && c->client_wscale == 7, "  у соединения: масштаб включён, множитель клиента 7 прочитан");
-    if (c && wait_ready(c, 2000) == 0) {
-        cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
-        n = ack_after_data(1001, &last);
-        check(n == 1 && (last.tcp_flags & TCP_ACK) && last.ack == 1101 && last.window == 32768,
-              "  подтверждение данных: поле окна 32768 — с множителем 5 это 1 МиБ");
-        check(((uint32_t)last.window << g_rcv_shift) == g_rcv_wnd, "  и настоящее окно (поле << 5) равно потолку");
-    } else {
-        check(0, "  установщик не доложил");
+    if (c) conn_drop(c);
+    c = ready_conn(sock_conn_fd(sv[0], sv[1], CLI_PORT, SRV_IP));
+    if (!c) { check(0, "кольцо и сокет клиента: соединение не открылось"); return; }
+
+    int reads;
+    fill_client(c, &reads);
+    size_t read_from_node = g_stream_pos;
+    check(c->used && !c->srv_closed && !client_can_take_record(c) && c->rtx.len <= RTX_CAP &&
+          c->rx_ready && read_from_node < 100 * 4000 && read_from_node == c->rtx.len,
+          "сокет клиента полон: прочитанное у узла лежит в кольце целиком — ничего не потеряно, остальное у узла");
+    check(RTX_CAP - c->rtx.len < CLIENT_ROOM_RESERVE && reads >= 2 && reads < 100,
+          "  и остановились, как только в кольце не стало места под целую запись (client_can_take_record)");
+    sock_flush(c);
+    check(c->rtx.len > 0 && read_from_node == c->rtx.len + (size_t)cli_pending(cli_fd(c)),
+          "  сокет принял сколько мог (4 КБ буфера), остаток ждёт EPOLLOUT: кольцо и сокет вместе — всё прочитанное");
+
+    /* Клиент читает: остаток дописывается по готовности записи, чтение у узла возобновляется (как в цикле:
+     * у узла читаем, только когда кольцо принимает целую запись). */
+    static unsigned char buf[400000 + 64];
+    size_t got = 0;
+    int resumed = 0;
+    for (int it = 0; it < 400 && g_stream_pos < 400000; it++) {
+        got += cli_get(cli_fd(c), buf + got, sizeof(buf) - got);
+        c->carmed |= CWR;
+        if (c->rtx.len) sock_flush(c);
+        if (client_can_take_record(c)) { drain_conn(c, &g_tun); resumed++; }
     }
-    if (c) conn_drop(c);
-    dev_drain(NULL);
-
-    /* Множитель 7 и потолок 65535 (STEER_TUN_RCVWND=0 при клиенте с масштабом): поле округляется вверх. */
-    rcv_window_set(65535);
-    check(g_rcv_shift == 0, "потолок 65535 — множитель 0, окно прежнее");
-    rcv_window_set(65536 + 100);
-    c = NULL;
-    syn_opts(1500, 3);
-    c = conn_find(&k);
-    if (c && wait_ready(c, 2000) == 0) {
-        cli_send(1501, 2, TCP_ACK, 65535, NULL, 0);
-        dev_drain(NULL);
-        n = ack_after_data(1501, &last);
-        check(n == 1 && last.window == (65636 + 1) / 2 && ((uint32_t)last.window << g_rcv_shift) >= g_rcv_wnd,
-              "потолок не кратен множителю: поле округлено вверх (окно не меньше потолка)");
-    } else {
-        check(0, "  установщик не доложил (округление)");
+    for (int it = 0; it < 50 && (c->rtx.len || cli_pending(cli_fd(c))); it++) {
+        got += cli_get(cli_fd(c), buf + got, sizeof(buf) - got);
+        c->carmed |= CWR;
+        if (c->rtx.len) sock_flush(c);
     }
-    if (c) conn_drop(c);
-    dev_drain(NULL);
-    rcv_window_set(1u << 20);
+    got += cli_get(cli_fd(c), buf + got, sizeof(buf) - got);
+    check(g_stream_pos == 400000 && got == 400000 && stream_bad(buf, got, 0) == 0 && c->rtx.len == 0,
+          "после чтения клиентом дописан весь остаток: 400000 байт, порядок и содержимое целы");
+    check(resumed > 0 && g_overemit == 0, "  чтение у узла возобновлялось при месте в кольце, нарушений договора нет");
+    g_recv_rep = 0;
+    conn_drop(c);
+}
 
-    /* Опция масштаба с множителем 0 — всё равно опция: ответ обязателен, и окно масштабируется. */
-    syn_opts(2000, 0);
-    c = conn_find(&k);
-    memset(&last, 0, sizeof(last));
-    n = dev_drain(&last);
-    check(c && c->ws_on && n == 1 && last.ws_seen && last.wscale == 5 && c->client_wscale == 0,
-          "SYN с опцией масштаба 0: опция есть (ws_seen), SYN-ACK с нашим множителем");
-    if (c) wait_ready(c, 2000);                           /* заявка в работе закрыть нельзя */
+/* I-320, закрытие сервером: узел закрыл поток, а клиенту не всё дописано (сокет полон). Соединение живёт, пока
+ * клиент не примет остаток (до CLOSE_DRAIN_MS), и закрывается только после него. */
+static void t_srv_close_drain(void) {
+    int sv[2];
+    if (cli_pair_unix(sv) != 0) { check(0, "стенд: пара сокетов"); return; }
+    int small = 4096;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    struct flow_key k = cli_key();
+    struct conn *c = conn_find(&k);
     if (c) conn_drop(c);
-    dev_drain(NULL);
-
-    /* SYN без опции масштаба. */
-    syn_opts(3000, -1);
-    c = conn_find(&k);
-    memset(&last, 0, sizeof(last));
-    n = dev_drain(&last);
-    check(c && !c->ws_on && n == 1 && !last.ws_seen && last.window == EARLY_CAP,
-          "SYN без опции масштаба: SYN-ACK без опции, окно по буферу ранних данных");
-    if (c && wait_ready(c, 2000) == 0) {
-        cli_send(3001, 2, TCP_ACK, 65535, NULL, 0);
-        n = ack_after_data(3001, &last);
-        check(n == 1 && last.ack == 3101 && last.window == 65535,
-              "  и подтверждение данных — окно 65535, масштаб не применяется");
-    } else {
-        check(0, "  установщик не доложил");
+    c = ready_conn(sock_conn_fd(sv[0], sv[1], CLI_PORT, SRV_IP));
+    if (!c) { check(0, "закрытие сервером: соединение не открылось"); return; }
+    int cfd = cli_fd(c);
+    g_stream_pos = 0;
+    g_recv_rep = 12; g_recv_rep_n = 4000;                   /* 48000 байт: клиент их сразу не примет */
+    drain_conn(c, &g_tun);
+    g_recv_rc = -1;                                         /* и узел закрыл поток */
+    drain_conn(c, &g_tun);
+    g_recv_rc = 0;
+    g_recv_rep = 0;
+    check(c->srv_closed && !c->aborted && c->rtx.len > 0,
+          "I-320: узел закрыл поток, клиенту не всё дописано — srv_closed, остаток ждёт в кольце");
+    int alive = conn_deadlines(c, &g_tun, c->closed_at + 1000000ull) == 0 && c->used;
+    check(alive, "  пока клиент не принял остаток, соединение живо (CLOSE_DRAIN_MS не вышел)");
+    static unsigned char buf[48000 + 64];
+    size_t got = 0;
+    int closed = 0;
+    for (int it = 0; it < 2000 && !closed; it++) {
+        got += cli_get(cfd, buf + got, sizeof(buf) - got);
+        c->carmed |= CWR;
+        closed = conn_deadlines(c, &g_tun, c->closed_at + 1000000ull) != 0;
+        if (!closed) usleep(1000);
     }
-    if (c) conn_drop(c);
-    dev_drain(NULL);
-
-    rcv_window_set(keep_wnd);
-    g_rcv_shift = keep_shift;
+    got += cli_get(cfd, buf + got, sizeof(buf) - got);
+    int end = cli_end(cfd);
+    check(closed && got == 48000 && stream_bad(buf, got, 0) == 0 && end == 1,
+          "  клиент принял остаток — 48000 байт целиком, затем закрытие (EOF)");
 }
 
 /* I-193: установщик доложил за время ПОСЛЕДНЕГО сна ожидания. Прежде проверка стояла перед
@@ -655,69 +724,6 @@ static void t_release_last_sleep(void) {
     *c = save;
 }
 
-/* Окно клиента, пока установщик ещё работает: не больше места в буфере ранних данных (EARLY_CAP).
- * Прежде SYN-ACK и подтверждения обещали полное окно, клиент отправлял десять сегментов, в буфер
- * влезало пять, а остальные handle_packet не подтверждал: дыра, таймаут повтора у клиента (200 мс,
- * потом вдвое чаще каждый круг: без SACK Linux после него в состоянии потери, дубликаты ACK быстрый
- * повтор не запускают, а сегменты за дырой мы выбрасываем) — и выгрузка на нагрузке стояла больше
- * десяти секунд (tests/sigpipe.sh: «ни одна выгрузка не застряла на записи»). */
-static void t_early_window(void) {
-    struct flow_key k = cli_key();
-    struct conn *c = conn_find(&k);
-    if (c) conn_drop(c);
-    dev_drain(NULL);
-    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
-    struct flow_key last;
-    memset(&last, 0, sizeof(last));
-    dev_drain(&last);
-    c = conn_find(&k);
-    check(c && c->pending && (last.tcp_flags & TCP_SYN) && last.window <= EARLY_CAP,
-          "ранние данные: SYN-ACK при работающем установщике обещает не больше EARLY_CAP");
-    if (!c || !c->pending) return;
-    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
-
-    /* Десять сегментов подряд, как первое окно клиента: в буфер влезает пять. */
-    unsigned char d[1460];
-    memset(d, 'e', sizeof(d));
-    uint32_t seq = 1001;
-    for (int i = 0; i < 10; i++) {
-        cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d));
-        seq += sizeof(d);
-    }
-    uint32_t held = c->early_n;
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    dev_drain(&last);
-    check(held == 5 * sizeof(d) && last.ack == 1001 + held,
-          "ранние данные: подтверждено ровно то, что поместилось в буфер");
-    check(last.window == EARLY_CAP - held,
-          "ранние данные: подтверждение обещает остаток буфера, а не полное окно");
-
-    /* Клиент, который послушался окна, дыры не получает: остаток помещается. */
-    seq = 1001 + held;
-    cli_send(seq, 2, TCP_ACK, 65535, d, EARLY_CAP - held);
-    check(c->early_n == EARLY_CAP, "ранние данные: сегмент в пределах окна принят");
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    dev_drain(&last);
-    check(last.window == 0, "ранние данные: буфер полон — нулевое окно");
-
-    /* Установщик доложил: окно снова полное и клиенту об этом сказано сразу, а не по его пробе. */
-    for (int i = 0; i < 2000 && !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE); i++) {
-        struct timespec ts = { 0, 1000000 };
-        nanosleep(&ts, NULL);
-    }
-    int rd = __atomic_load_n(&c->done, __ATOMIC_ACQUIRE) ? conn_ready(c, &g_tun) : -1;
-    check(rd == 0 && !c->pending, "ранние данные: соединение готово");
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    int n = dev_drain(&last);
-    check(n >= 1 && last.ack == 1001 + EARLY_CAP && last.window == 65535,
-          "ранние данные: на готовности клиент получает обновление окна");
-    conn_drop(c);
-    dev_drain(NULL);
-}
-
 /* Выполнить f с stderr в файл и вернуть, нашлась ли в написанном строка needle. */
 static int stderr_has(void (*f)(void *), void *arg, const char *needle) {
     char path[] = "/tmp/tunnelmatch-err.XXXXXX";
@@ -738,12 +744,14 @@ static int stderr_has(void (*f)(void *), void *arg, const char *needle) {
 
 static void syn_bad(void *arg) {
     struct vless_node *bad = arg;
-    unsigned char p[128];
-    size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, 1000, 0, TCP_SYN,
-                         NULL, 0, 65535, 0, -1);
+    struct flow_key k = cli_key();
+    int sv[2];
+    if (cli_pair_unix(sv) != 0) return;
     g_dial.ctx = bad;
-    handle_packet(&g_tun, p, l);
+    struct conn *c = conn_accept(sv[0], &k, &g_tun);
     g_dial.ctx = &g_node;
+    if (c) conn_drop(c);
+    close(sv[1]);
 }
 
 static int g_run_rc;
@@ -778,7 +786,7 @@ static void t_bad_uuid(void) {
     g_now_s += 10;                                   /* ограничитель строки не мешает */
     int said = stderr_has(syn_bad, &bad, "не разбирается UUID");
     c = conn_find(&k);
-    check(said && !c, "I-097: SYN к узлу с негодным UUID — отказ назван в журнале");
+    check(said && !c, "I-097: соединение к узлу с негодным UUID — отказ назван в журнале");
     if (c) conn_drop(c);
     dev_drain(NULL);
     said = stderr_has(run_bad, &bad, "не разбирается UUID");
@@ -786,10 +794,11 @@ static void t_bad_uuid(void) {
 }
 
 static void send_refused(void *arg) {
-    (void)arg;
+    struct conn *c = arg;
     const unsigned char d[] = "GET / HTTP/1.1\r\n";
     g_send_rc = H2_ESTATUS;
-    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d) - 1);
+    cli_put(c, d, sizeof(d) - 1);
+    cli_pump(c);
     g_send_rc = 0;
 }
 
@@ -797,15 +806,14 @@ static void send_refused(void *arg) {
  * закрывается, как при любой неудаче отправки, но причину обязан услышать человек: прежде
  * RST уходил молча, и узел выглядел живым. */
 static void t_send_refused(void) {
-    struct conn *c = open_conn(65535);
+    struct conn *c = open_conn();
     if (!c) { check(0, "I-219: соединение не открылось"); return; }
     g_now_s += 10;
-    int said = stderr_has(send_refused, NULL, "не принял данные");
+    int said = stderr_has(send_refused, c, "не принял данные");
     struct flow_key k = cli_key();
     c = conn_find(&k);
     check(said && !c, "I-219: отказ сервера на отправку назван в журнале, соединение закрыто");
     if (c) conn_drop(c);
-    dev_drain(NULL);
 }
 
 /* Датаграммы UDP, придержанные до готовности потока, уходят узлу по одной (каждая — своим вызовом
@@ -1254,8 +1262,7 @@ static void t_born_turn(void) {
     struct conn *c = conn_find(&k);
     if (c) conn_drop(c);
     g_turn = 41;
-    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
-    c = conn_find(&k);
+    c = sock_conn(CLI_PORT, SRV_IP);
     check(c && c->born_turn == 41, "виток рождения: новое TCP-соединение помнит свой виток");
     g_turn = 42;
     check(c && c->born_turn != g_turn, "виток рождения: в следующем витке событие уже его собственное");
@@ -1263,36 +1270,62 @@ static void t_born_turn(void) {
         wait_ready(c, 2000);
         conn_drop(c);
     }
-    dev_drain(NULL);
 }
 
-/* Наш FIN, когда сервер закрыл первым, обязан нести открытое окно. FIN занимает номер, а Linux не
- * шлёт ничего в нулевое окно: прежний FIN с окном 0 оставлял собственный FIN клиента ждать
- * обновления окна, которое не придёт, и сокет клиента навсегда застревал в LAST-ACK. */
-static void t_fin_window(void) {
-    struct conn *c = open_conn(65535);
-    if (!c) { check(0, "окно в FIN: соединение не открылось"); return; }
-    cli_send(1001, 1002, TCP_ACK, 65535, NULL, 0);        /* клиент подтвердил всё принятое */
-    c->srv_closed = 1;
-    c->closed_at = now_ns();
-    dev_drain(NULL);
-    conn_deadlines(c, &g_tun, now_ns());
-    struct flow_key last;
-    memset(&last, 0, sizeof(last));
-    int n = dev_drain(&last);
-    check(n == 1 && (last.tcp_flags & TCP_FIN) && last.window != 0,
-          "окно в FIN: FIN сервера уходит клиенту с открытым окном, не с нулевым");
+/* Сторона клиента — сокет (conn_accept): данные клиента доходят до дайлера байт в байт (порциями под одну
+ * запись TLS), ответ дайлера — клиенту в сокет, закрытие клиентом (FIN) — после данных, не раньше. */
+static void t_sock_path(void) {
+    struct conn *c = open_conn();
+    if (!c) { check(0, "сокет клиента: соединение не открылось"); return; }
+    int cfd = cli_fd(c);
+    static unsigned char up[50000], down[12000 + 64];
+
+    /* Вверх: размер не кратен порции, заголовок VLESS клеится к первой. */
+    up_fill(up, sizeof up, 0);
+    int calls = g_send_calls;
+    cli_put(c, up, sizeof up);
+    cli_pump(c);
+    check(g_sent_n == 26 + sizeof up && memcmp(g_sent + 26, up, sizeof up) == 0 && srv_pending(c) == 0,
+          "conn_accept: 50000 байт клиента дошли до дайлера байт в байт (заголовок 26 + данные)");
+    check(g_send_calls - calls == 4 && g_send_last_n <= SOCK_SEND_CHUNK,
+          "  порциями SOCK_SEND_CHUNK под одну запись TLS: четыре отправки, а не по 1,4 КБ");
+
+    /* Вниз: три чтения у узла — одна запись в сокет клиента. */
+    g_stream_pos = 0;
+    g_recv_rep = 3; g_recv_rep_n = 4000;
+    drain_conn(c, &g_tun);
+    size_t got = cli_get(cfd, down, sizeof down);
+    check(got == 12000 && stream_bad(down, got, 0) == 0 && c->rtx.len == 0,
+          "conn_accept: ответ дайлера — 12000 байт — дошёл до клиента в сокете целиком и по порядку");
+    g_recv_rep = 0;
+
+    /* Клиент закрыл свою половину: дописанное до FIN дошло, FIN — после него. */
+    static unsigned char tail[700];
+    up_fill(tail, sizeof tail, 50000);
+    g_sent_n = 0;
+    cli_put(c, tail, sizeof tail);
+    shutdown(cfd, SHUT_WR);
+    cli_pump(c);
+    check(c->used && g_sent_n == sizeof tail && memcmp(g_sent, tail, sizeof tail) == 0 && c->client_fin,
+          "клиент закрыл половину (FIN): данные до него ушли узлу, затем отмечено client_fin");
+    /* Ответ сервера клиенту после его FIN ещё идёт (I-319). */
+    g_recv_rep = 1; g_recv_rep_n = 500; g_stream_pos = 0;
+    drain_conn(c, &g_tun);
+    check(cli_get(cfd, down, sizeof down) == 500 && stream_bad(down, 500, 0) == 0,
+          "  а ответ узла клиенту после его FIN доходит (I-319)");
+    g_recv_rep = 0;
+    conn_drop(c);
 }
 
-/* Сервер говорит первым (SSH, SMTP): клиент после рукопожатия молчит. VLESS сообщает узлу
- * назначение только в заголовке запроса, поэтому стек обязан сам послать один заголовок через
- * SERVER_FIRST_MS, один раз и без кадра Vision (как клиент Xray). Прежде такой поток не
- * открывался: узел ждал заголовка, клиент приветствия. */
+/* SERVER_FIRST_MS: сервер говорит первым (SSH, SMTP), клиент молчит. VLESS сообщает узлу назначение только
+ * в заголовке запроса, поэтому стек обязан сам послать один заголовок через SERVER_FIRST_MS, один раз и без
+ * кадра Vision (как клиент Xray). Прежде такой поток не открывался: узел ждал заголовка, клиент приветствия. */
 static void server_first(const char *flow, size_t header_n) {
     snprintf(g_node.flow, sizeof(g_node.flow), "%s", flow);
     struct flow_key k = cli_key();
-    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
     struct conn *c = conn_find(&k);
+    if (c) conn_drop(c);
+    c = sock_conn(CLI_PORT, SRV_IP);
     if (!c || wait_ready(c, 2000) != 0) {
         check(0, "сервер первым: тестовое соединение не открылось");
         if (c) conn_drop(c);
@@ -1301,14 +1334,6 @@ static void server_first(const char *flow, size_t header_n) {
     }
     char what[128];
     int calls = g_send_calls;
-    /* SYN-ACK потерян: клиент его не подтвердил и повторит SYN. Откроем поток сейчас — ответ
-     * сервера уйдёт раньше рукопожатия, и повторный SYN уже не получит ответа: ничего не должно
-     * уходить, сколько бы ни прошло времени. */
-    conn_deadlines(c, &g_tun, g_now_ns + 2000 * 1000000ull);
-    snprintf(what, sizeof(what), "сервер первым%s: до ACK клиента ничего не отправлено",
-             flow[0] ? ", Vision" : "");
-    check(g_send_calls == calls && c->our_seq == 2, what);
-    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
     conn_deadlines(c, &g_tun, c->estab_ns + (SERVER_FIRST_MS / 2) * 1000000ull);
     snprintf(what, sizeof(what), "сервер первым%s: до %d мс ничего не отправлено",
              flow[0] ? ", Vision" : "", SERVER_FIRST_MS);
@@ -1322,7 +1347,6 @@ static void server_first(const char *flow, size_t header_n) {
     snprintf(what, sizeof(what), "сервер первым%s: и только один раз", flow[0] ? ", Vision" : "");
     check(g_send_calls == calls + 1, what);
     conn_drop(c);
-    dev_drain(NULL);
     g_node.flow[0] = 0;
 }
 
@@ -1331,146 +1355,54 @@ static void t_server_first(void) {
     server_first("xtls-rprx-vision", 44);    /* плюс дополнение flow: 0a 10 "xtls-rprx-vision" */
 }
 
-/* Место у узла ограничивает окно клиента (dialer_ops.room). Прежде клиенту отдавалось полное
- * окно, сколько бы узел ни мог принять: против окна HTTP/2 в 94 КБ каждый отказ выглядел
- * потерей и стоил таймаута повторной передачи, выгрузка через grpc шла 10-20 Мбит/с с
- * остановками. */
+/* Место у узла (dialer_ops.room) ограничивает чтение сокета клиента: нет места — не читаем, данные ждут в
+ * сокете (окно клиенту держит ядро); есть — читаем не больше места за раз. Прежде место объявлялось клиенту
+ * окном в пакетах, и выгрузка против окна HTTP/2 в 94 КБ стоила таймаутов повтора. */
 static void t_room_window(void) {
-    struct conn *c = open_conn(65535);
+    struct conn *c = open_conn();
     if (!c) { check(0, "место у узла: тестовое соединение не открылось"); return; }
-    unsigned char d[100];
-    memset(d, 'u', sizeof(d));
-    struct flow_key last;
-    uint32_t seq = 1001;
-    cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));        /* заголовок уходит */
-    seq += sizeof(d);
-    flush_acks(&g_tun);
-    dev_drain(&last);
-    check(last.window == 65535, "место у узла: транспорт без предела — полное окно");
-
-    g_room = 5000;
-    cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
-    seq += sizeof(d);
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    dev_drain(&last);
-    check(last.ack == seq && last.window == 5000, "место у узла: окно ограничено местом у узла");
+    static unsigned char d[20000];
+    up_fill(d, sizeof d, 0);
 
     g_room = 0;
-    cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
-    seq += sizeof(d);
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    dev_drain(&last);
-    check(last.ack == seq && last.window == 0, "место у узла: места нет — нулевое окно");
+    int calls = g_send_calls;
+    cli_put(c, d, 1000);
+    cli_pump(c);
+    check(!sock_want_read(c) && g_send_calls == calls && srv_pending(c) == 1000,
+          "место у узла: места нет — сокет клиента не читается, данные ждут в нём");
 
-    /* Проба нулевого окна от клиента: номер на единицу меньше ожидаемого, без данных. */
-    cli_send(seq - 1, 2, TCP_ACK, 65535, NULL, 0);
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    int n = dev_drain(&last);
-    check(n == 1 && last.ack == seq && last.window == 0, "место у узла: проба нулевого окна получает ответ");
-
-    /* WINDOW_UPDATE от узла: обновление окна уходит клиенту, не дожидаясь пакета от него. */
-    g_room_on_read = 60000;
-    g_win_woke = 0;
-    drain_conn(c, &g_tun);
-    check(c->ack_due && g_win_woke, "место у узла: выросло от чтения у узла — обновление окна назначено");
-    flush_acks(&g_tun);
-    g_win_woke = 0;
-    memset(&last, 0, sizeof(last));
-    n = dev_drain(&last);
-    check(n >= 1 && last.ack == seq && last.window == 60000, "место у узла: обновление несёт новое окно");
-
-    /* Рост меньше WIN_UPDATE_MIN при открытом окне ждёт следующего ACK. */
-    g_room_on_read = 60000 + WIN_UPDATE_MIN - 1;
-    drain_conn(c, &g_tun);
-    check(!c->ack_due && !g_win_woke, "место у узла: малый рост сам ничего не шлёт");
-
+    ((struct vl_sess *)SESS(c))->header_sent = 1;           /* заголовок считаем ушедшим: размеры — одни данные */
+    g_room = 5000;
+    g_send_max_n = 0;
+    g_sent_n = 0;
+    cli_put(c, d + 1000, sizeof d - 1000);
+    check(sock_want_read(c), "место у узла: место есть — сокет читается");
+    cli_pump(c);
+    check(g_send_calls - calls >= 4 && g_send_max_n <= 5000 && g_sent_n == sizeof d &&
+          memcmp(g_sent, d, sizeof d) == 0 && srv_pending(c) == 0,
+          "место у узла: 5000 — за один раз узлу не больше места (не меньше четырёх отправок), 20000 байт целы");
     g_room = -1;
-    g_room_on_read = -2;
-
-    /* Цикл отстаёт от устройства (порция из TUN упёрлась в TUN_DRAIN_MAX): клиент с масштабом
-     * получает не больше RCV_WND_BACKLOG, чтобы его неподтверждённые данные, ждущие в очереди
-     * устройства перед ACK скачиваний, оставались короткими; цикл успевает — снова полное окно. */
-    uint32_t save_wnd = g_rcv_wnd;
-    uint8_t save_shift = g_rcv_shift;
-    rcv_window_set(4u << 20);
-    c->ws_on = 1;
-    uint32_t full = (uint32_t)rcv_win_field(c) << g_rcv_shift;
-    g_tun_backlog = 1;
-    g_down_inflight = 1;
-    uint32_t held = (uint32_t)rcv_win_field(c) << g_rcv_shift;
-    g_tun_backlog = 0;
-    uint32_t back = (uint32_t)rcv_win_field(c) << g_rcv_shift;
-    check(full >= (4u << 20) && held <= RCV_WND_BACKLOG && held > RCV_WND_BACKLOG / 2 && back == full,
-          "отставание цикла: окно падает до RCV_WND_BACKLOG и возвращается");
-    /* R-151: отставание без скачивания в полёте (чистая выгрузка) окно не режет — спасать нечего, а
-     * 64 КБ душили выгрузку одним потоком втрое (2533 против 8075 Мбит/с на стенде perf-tb). */
-    g_tun_backlog = 1;
-    g_down_inflight = 0;
-    uint32_t upl = (uint32_t)rcv_win_field(c) << g_rcv_shift;
-    g_tun_backlog = 0;
-    check(upl == full, "отставание при чистой выгрузке: окно остаётся полным (R-151)");
-    c->ws_on = 0;
-    g_rcv_wnd = save_wnd;
-    g_rcv_shift = save_shift;
     conn_drop(c);
-    dev_drain(NULL);
-}
-
-/* Склейка записей клиенту (R-147): порция чтений у узла уходит в устройство ОДНОЙ записью с разгрузкой,
- * а не записью на каждое чтение. Устройство стенда — сокетная пара, поэтому с gso=1 каждая запись —
- * датаграмма «заголовок разгрузки (10 байт) + IP-пакет», и видно и число записей, и их содержимое.
- * Проверяются и перенос через край кольца повтора (вторая порция идёт через его конец), и порядок
- * номеров, и то, что неподтверждённое лежит в кольце целиком. */
-static int tx_collect(size_t *pos, uint32_t *seq, int *bad, size_t *max_n) {
-    unsigned char p[70000];
-    int cnt = 0;
-    for (;;) {
-        ssize_t r = recv(g_dev_peer, p, sizeof(p), MSG_DONTWAIT);
-        if (r <= 0) break;
-        if (r < 10 + 40) { (*bad)++; continue; }
-        const unsigned char *ip = p + 10;
-        size_t tot = ((size_t)ip[2] << 8) | ip[3];
-        if (tot != (size_t)r - 10 || tot < 40) { (*bad)++; continue; }
-        uint32_t sq = ((uint32_t)ip[24] << 24) | ((uint32_t)ip[25] << 16) | ((uint32_t)ip[26] << 8) | ip[27];
-        size_t n = tot - 40;
-        if (!n) continue;
-        if (*seq && sq != *seq) (*bad)++;
-        *seq = sq + (uint32_t)n;
-        for (size_t i = 0; i < n; i++)
-            if (ip[40 + i] != stream_byte(*pos + i)) { (*bad)++; break; }
-        *pos += n;
-        if (n > *max_n) *max_n = n;
-        cnt++;
-    }
-    return cnt;
 }
 
 /* Пустое чтение не значит «сокет пуст»: у связи съеден служебный кадр (билет сессии TLS, WINDOW_UPDATE
  * HTTP/2), а за ним в сокете лежат данные. Чтение стоит в epoll по фронту — нового события на эти данные
  * не будет, — поэтому проход проверяет сокет poll'ом и читает дальше. Здесь сокет «готов» (байт в канале
- * сессии), и данные после пустого чтения обязаны дойти в том же проходе. */
+ * сессии), и данные после пустого чтения обязаны дойти до клиента в том же проходе. */
 static void t_empty_read(void) {
-    struct conn *c = open_conn(65535);
+    struct conn *c = open_conn();
     if (!c) { check(0, "пустое чтение: тестовое соединение не открылось"); return; }
-    g_tun.gso = 1;
     g_stream_pos = 0;
-    size_t pos = 0;
-    uint32_t seq = c->our_seq;
-    int bad = 0;
-    size_t mx = 0;
     g_recv_empty = 1;
     g_recv_rep = 3; g_recv_rep_n = 4000;
     drain_conn(c, &g_tun);
     g_recv_empty = 0;
-    (void)tx_collect(&pos, &seq, &bad, &mx);
-    check(pos == 12000 && bad == 0, "пустое чтение (служебный кадр) при готовом сокете: данные за ним дошли в том же проходе");
+    static unsigned char b[12000 + 64];
+    size_t got = cli_get(cli_fd(c), b, sizeof b);
+    check(got == 12000 && stream_bad(b, got, 0) == 0,
+          "пустое чтение (служебный кадр) при готовом сокете: данные за ним дошли в том же проходе");
     g_recv_rep = 0;
-    g_tun.gso = 0;
     conn_drop(c);
-    dev_drain(NULL);
 }
 
 /* Дайлер-нарушитель: разбор отдаёт прочитанное дважды — как накопитель, отдающий накопленное плюс прочитанное. */
@@ -1480,15 +1412,16 @@ static int dup_deliver(const void *ctx, void *sess, int udp, const unsigned char
     return emit(arg, d, n) != 0 || emit(arg, d, n) != 0 ? -1 : 0;
 }
 
+/* Склейка записей клиенту (R-147): порция чтений у узла уходит в сокет клиента ОДНОЙ записью (writev по кольцу
+ * недописанного), а не записью на каждое чтение: вызов и отправка TCP на каждые 16 КБ дороже копии в кольцо.
+ * Проверяются и перенос через край кольца (вторая порция идёт через его конец — writev с двумя кусками), и
+ * порядок, и то, что прочитанное у узла не теряется. */
 static void t_tx_batch(void) {
-    struct conn *c = open_conn(65535);
+    struct conn *c = open_conn();
     if (!c) { check(0, "склейка записей: тестовое соединение не открылось"); return; }
-    g_tun.gso = 1;
+    static unsigned char b[40000 + 64];
     g_stream_pos = 0;
     size_t pos = 0;
-    uint32_t seq = c->our_seq;
-    int bad = 0;
-    size_t mx = 0;
 
     g_recv_rep = 10; g_recv_rep_n = 4000;
     /* Канал «сессии» пуст на время прохода: с непрочитанным байтом poll видит готовность всегда, и порция
@@ -1496,57 +1429,33 @@ static void t_tx_batch(void) {
     unsigned char hold;
     int held = read(g_sess_pipe[0], &hold, 1) == 1;
     g_poll_calls = 0;
+    g_writev_calls = 0;
     drain_conn(c, &g_tun);
     int polls = g_poll_calls;
     if (held && write(g_sess_pipe[1], &hold, 1) != 1) check(0, "канал сессии не восстановлен");
-    int cnt = tx_collect(&pos, &seq, &bad, &mx);
+    size_t got = cli_get(cli_fd(c), b, sizeof b);
     check(polls <= 1, "чтение у узла: десять чтений подряд — не больше одного poll (на конце порции, не на каждом чтении)");
-    check(pos == 40000 && bad == 0, "склейка: все 40000 байт дошли по порядку и без порчи");
-    check(cnt == 1 && mx == 40000, "склейка: десять чтений у узла — одна запись в устройство");
-    check(c->our_seq - c->client_ack == 41000 && c->rtx.len == 41000 && !c->tx_unsent,
-          "склейка: отправленное целиком лежит в кольце повтора, неотправленного нет");
+    check(got == 40000 && stream_bad(b, got, pos) == 0, "склейка: все 40000 байт дошли по порядку и без порчи");
+    check(g_writev_calls == 1, "склейка: десять чтений у узла — одна запись в сокет клиента (один writev)");
+    check(c->rtx.len == 0, "склейка: клиент принял всё — кольцо пусто");
+    pos += got;
+
+    /* Вторая порция ложится через конец кольца. */
+    uint32_t head = c->rtx.head;
+    g_recv_rep = 10; g_recv_rep_n = 4000;
+    g_writev_calls = 0;
+    drain_conn(c, &g_tun);
+    got = cli_get(cli_fd(c), b, sizeof b);
+    check(got == 40000 && stream_bad(b, got, pos) == 0 && g_writev_calls == 1,
+          "склейка: порция через конец кольца уходит одной записью и без порчи");
+    check(head + 40000 > c->rtx.cap && c->rtx.head < head && c->rtx.cap == 64 * 1024,
+          "склейка: проверка идёт через край кольца");
+    pos += got;
 
     /* Договор дайлера: за проход не больше запаса кольца (CLIENT_ROOM_RESERVE). Верная раздача — тишина,
      * раздача вдвое больше прочитанного (накопитель, как был у ss и vmess) — строка в журнале и счёт. */
     check(g_overemit == 0, "договор дайлера: порция в рамках запаса — нарушений нет");
-    /* Клиент подтверждает всё; вторая порция ложится через конец кольца. */
-    cli_send(1001, c->our_seq, TCP_ACK, 65535, NULL, 0);
-    dev_drain(NULL);
-    check(c->rtx.len == 0, "склейка: подтверждение освободило кольцо");
-    g_recv_rep = 10; g_recv_rep_n = 4000;
-    drain_conn(c, &g_tun);
-    uint32_t head = c->rtx.head;
-    cnt = tx_collect(&pos, &seq, &bad, &mx);
-    check(pos == 80000 && bad == 0 && cnt == 1,
-          "склейка: порция через конец кольца уходит одной записью и без порчи");
-    check(head > 64 * 1024 - 40000 && /* голова ушла к краю */ c->rtx.cap == 64 * 1024, "склейка: проверка идёт через край кольца");
-
-    /* Предел записи: больше него — несколько записей, остаток не теряется. */
-    cli_send(1001, c->our_seq, TCP_ACK, 65535, NULL, 0);
-    dev_drain(NULL);
-    int save_max = g_tx_batch_max;
-    g_tx_batch_max = 16 * TUN_MSS;
-    mx = 0;
-    g_recv_rep = 10; g_recv_rep_n = 4000;
-    drain_conn(c, &g_tun);
-    cnt = tx_collect(&pos, &seq, &bad, &mx);
-    check(pos == 120000 && bad == 0 && cnt == 2 && mx == 16 * TUN_MSS,
-          "склейка: предел записи 16 сегментов — 40000 байт уходят двумя записями без потерь");
-    g_tx_batch_max = save_max;
-
-    /* Выключатель: запись на каждое чтение, как прежде. */
-    cli_send(1001, c->our_seq, TCP_ACK, 65535, NULL, 0);
-    dev_drain(NULL);
-    g_tx_nobatch = 1;
-    g_recv_rep = 4; g_recv_rep_n = 4000;
-    drain_conn(c, &g_tun);
-    cnt = tx_collect(&pos, &seq, &bad, &mx);
-    check(pos == 136000 && bad == 0 && cnt == 4, "склейка: STEER_TUN_NOTXBATCH — запись на каждое чтение");
-    g_tx_nobatch = 0;
-
     /* Нарушение договора: один проход отдаёт 2 x 18000 при запасе TUNNEL_BUF + 1024. */
-    cli_send(1001, c->our_seq, TCP_ACK, 65535, NULL, 0);
-    dev_drain(NULL);
     struct dialer_ops over = *g_dl->ops;
     over.deliver = dup_deliver;
     struct dialer over_dl = *g_dl;
@@ -1557,31 +1466,29 @@ static void t_tx_batch(void) {
     drain_conn(c, &g_tun);
     g_dl = real_dl;
     check(g_overemit == 1, "договор дайлера: проход отдал 36000 байт при запасе 19472 — нарушение сосчитано и названо");
-    size_t pos2 = 0; uint32_t seq2 = c->our_seq; int bad2 = 0; size_t mx2 = 0;
-    (void)tx_collect(&pos2, &seq2, &bad2, &mx2);   /* поток испорчен намеренно — только вычерпать устройство */
-    g_tun.gso = 0;
+    (void)cli_get(cli_fd(c), b, sizeof b);                  /* поток испорчен намеренно — только вычерпать сокет */
+    g_recv_rep = 0;
     conn_drop(c);
-    dev_drain(NULL);
 }
 
 /* Вторая связь дайлера (xhttp: ответы на выгрузку) стоит в epoll цикла. Прежде освободившееся ответом место
  * замечалось, лишь когда цикл просыпался по пакету клиента, а клиент, которому отказано в окне, молчит до
- * своего таймера: выгрузка packet-up шла кусками «окно, пауза». Теперь событие связи сливает её и шлёт окно. */
+ * своего таймера: выгрузка packet-up шла кусками «окно, пауза». Теперь событие связи сливает её, и сокет
+ * клиента, ждавший места у узла, читается со следующим проходом сроков — без нового события на сокете (оно
+ * по фронту, второго не будет). */
 static void t_aux_wake(void) {
-    struct conn *c = open_conn(65535);
+    struct conn *c = open_conn();
     if (!c) { check(0, "вторая связь: тестовое соединение не открылось"); return; }
     int ap[2], ep = epoll_create1(0);
     if (pipe(ap) != 0 || ep < 0) { check(0, "вторая связь: канал или epoll"); return; }
     struct epoll_event ev[4];
     unsigned char d[100];
     memset(d, 'u', sizeof(d));
-    uint32_t seq = 1001;
 
-    g_room = 5000;
-    cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
-    seq += sizeof(d);
-    flush_acks(&g_tun);
-    dev_drain(NULL);
+    g_room = 0;
+    cli_put(c, d, sizeof(d));
+    cli_pump(c);
+    check(!sock_want_read(c) && g_sent_n == 0, "вторая связь: места у узла нет — клиент не читается, данные ждут в сокете");
 
     g_aux_fd = ap[0];
     aux_sync(ep, c);
@@ -1595,17 +1502,13 @@ static void t_aux_wake(void) {
           "вторая связь: ответ на выгрузку будит цикл событием этого соединения");
     g_room_on_aux = 60000;
     g_aux_drains = 0;
-    g_win_woke = 0;
     g_turn++;
     aux_event(ep, c);
-    check(g_aux_drains == 1 && c->ack_due && g_win_woke,
-          "вторая связь: слив по событию — место выросло, обновление окна назначено без пакета клиента");
-    flush_acks(&g_tun);
-    g_win_woke = 0;
-    struct flow_key last;
-    memset(&last, 0, sizeof(last));
-    dev_drain(&last);
-    check(last.ack == seq && last.window == 60000, "вторая связь: клиент получает окно, выросшее от ответа");
+    check(g_aux_drains == 1 && sock_want_read(c),
+          "вторая связь: слив по событию — место выросло, сокет клиента снова читается без нового события на нём");
+    conn_deadlines(c, &g_tun, c->estab_ns + 1);
+    check(g_sent_n == 26 + sizeof(d) && memcmp(g_sent + 26, d, sizeof(d)) == 0 && srv_pending(c) == 0,
+          "вторая связь: проход сроков дочитал клиента — 100 байт ушли узлу");
 
     /* Связь, которую дайлер слушать больше не просит, снимается навсегда. */
     if (write(ap[1], "x", 1) != 1) return;
@@ -1631,93 +1534,17 @@ static void t_aux_wake(void) {
     close(ap[0]);
     close(ap[1]);
     conn_drop(c);
-    dev_drain(NULL);
 }
 
-/* Подряд идущие сегменты одного потока в одной порции из TUN уходят узлу ОДНОЙ отправкой (g_up
- * в stack.c): одна запись TLS и один write вместо одной на каждый сегмент в 1,4 КБ, что стоило
- * выгрузке 80% цикла. Подтверждаются, только когда узел их принял, как и прежде. */
-static void t_gather(void) {
-    struct conn *c = open_conn(65535);
-    if (!c) { check(0, "сборка: тестовое соединение не открылось"); return; }
-    unsigned char d[1000];
-    memset(d, 'g', sizeof(d));
-    struct flow_key last;
-    int calls = g_send_calls;
-    cli_send_more(1001, 2, TCP_ACK, 65535, d, sizeof(d));
-    cli_send_more(2001, 2, TCP_ACK, 65535, d, sizeof(d));
-    cli_send_more(3001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
-    check(g_send_calls == calls && c->client_seq == 1001,
-          "сборка: три сегмента порции — пока ничего не отправлено и не подтверждено");
-    up_flush(&g_tun);
-    flush_acks(&g_tun);
-    memset(&last, 0, sizeof(last));
-    dev_drain(&last);
-    check(g_send_calls == calls + 1 && g_send_last_n == 26 + 3000 && c->client_seq == 4001 &&
-          last.ack == 4001, "сборка: конец порции — одна отправка (заголовок + 3000), один ACK на всё");
-
-    /* FIN после собранных данных: сначала данные, затем отдельный сегмент FIN. */
-    calls = g_send_calls;
-    cli_send_more(4001, 2, TCP_ACK, 65535, d, sizeof(d));
-    cli_send_more(5001, 2, TCP_ACK | TCP_FIN, 65535, d, 10);
-    check(g_send_calls == calls + 2 && c->client_seq == 5012 && c->client_fin,
-          "сборка: FIN сначала отправляет собранное, по порядку");
-    conn_drop(c);
-    dev_drain(NULL);
-
-    /* Дыра: собранное уходит, сегмент за дырой не принят. */
-    c = open_conn(65535);
-    if (!c) { check(0, "сборка: тестовое соединение не открылось"); return; }
-    calls = g_send_calls;
-    cli_send_more(1001, 2, TCP_ACK, 65535, d, sizeof(d));
-    cli_send_more(3001, 2, TCP_ACK, 65535, d, sizeof(d));
-    up_flush(&g_tun);
-    check(g_send_calls == calls + 1 && c->client_seq == 2001,
-          "сборка: сегмент за дырой отправляет собранное и сам не принят");
-
-    /* Узел отказал собранной отправке (окно закрыто): ничего не подтверждено, и продолжение в
-     * той же порции тоже не принято: клиент повторит с 2001. */
-    g_send_again_n = 1;
-    g_recv_rc = -1;                     /* WINDOW_UPDATE не приходит: ожидание читает конец потока */
-    cli_send_more(2001, 2, TCP_ACK, 65535, d, sizeof(d));
-    up_flush(&g_tun);
-    check(c->client_seq == 2001, "сборка: отправка отказана — ничего не подтверждено");
-    g_send_again_n = 0;
-    g_recv_rc = 0;
-    conn_drop(c);
-    dev_drain(NULL);
-
-    /* Буфер полон, а следующий сегмент вынуждает отправку, и узел её отказывает (окно закрыто и
-     * после ожидания). Этот сегмент идёт за байтами, которые НЕ приняты: нового накопления он
-     * начинать не вправе, иначе поток перескочил бы через них. */
-    c = open_conn(65535);
-    if (!c) { check(0, "сборка: тестовое соединение не открылось"); return; }
-    uint32_t seq = 1001;
-    while (seq - 1001 + sizeof(d) <= UP_MAX) {
-        cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d));
-        seq += sizeof(d);
-    }
-    g_send_again_n = 2;                 /* отправка и её повтор после ожидания */
-    g_recv_rc = 0;
-    g_recv_n = 0;
-    cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d));
-    up_flush(&g_tun);
-    check(c->client_seq == 1001 && g_up.c == NULL,
-          "сборка: отказ при полном буфере — следующий сегмент тоже не принят");
-    g_send_again_n = 0;
-    conn_drop(c);
-    dev_drain(NULL);
-}
-
-/* Транспорт, который режет запись сам (xhttp packet-up), получает собранное крупнее прежних 16 КБ:
- * меньше POST на тот же трафик. Но только когда заголовок VLESS уже ушёл и у узла нет flow: Vision
- * держит кадр в одной записи, а заголовок клеится к данным в буфер TUNNEL_BUF. */
-static void t_gather_big(void) {
-    unsigned char d[1000];
-    memset(d, 'g', sizeof(d));
-    struct conn *c = open_conn(65535);
-    if (!c) { check(0, "большая сборка: тестовое соединение не открылось"); return; }
-    uint32_t seq = 1001;
+/* Порции клиента узлу (sock_read): читаем крупно, отдаём по SOCK_SEND_CHUNK — столько, сколько с обёртками
+ * дайлера ложится в ОДНУ запись TLS. Транспорт, который режет запись сам (xhttp packet-up), получает
+ * порцию крупнее: меньше POST на тот же трафик. Но только когда заголовок VLESS уже ушёл и у узла нет flow:
+ * Vision держит кадр в одной записи, а заголовок клеится к данным в буфер TUNNEL_BUF. */
+static void t_sock_chunks(void) {
+    static unsigned char d[60000];
+    up_fill(d, sizeof d, 0);
+    struct conn *c = open_conn();
+    if (!c) { check(0, "порции узлу: тестовое соединение не открылось"); return; }
 
     /* Первая отправка несёт заголовок (он клеится к данным в буфер TUNNEL_BUF): потолок прежний,
      * даже у транспорта с большой записью. */
@@ -1725,43 +1552,43 @@ static void t_gather_big(void) {
     struct vl_sess *vs = SESS(c);
     uint8_t was = vs->header_sent;
     vs->header_sent = 0;
-    check(vless_dialer.up_max(&g_node, vs) == 0, "большая сборка: пока заголовок не ушёл, потолок прежний");
+    check(vless_dialer.up_max(&g_node, vs) == 0, "порции узлу: пока заголовок не ушёл, потолок прежний");
     vs->header_sent = 1;
-    check(vless_dialer.up_max(&g_node, vs) == TUNNEL_GATHER_MAX, "большая сборка: заголовок ушёл — большой потолок");
+    check(vless_dialer.up_max(&g_node, vs) == TUNNEL_GATHER_MAX, "порции узлу: заголовок ушёл — большой потолок");
     vs->header_sent = was;
     int calls;
-    /* Сегменты отправлены (open_conn): заголовок ушёл вместе с ними. */
-    vs->header_sent = 1;
+    vs->header_sent = 1;                                    /* заголовок считаем ушедшим */
 
-    /* Заголовок ушёл, flow нет: все 60 сегментов — одна отправка. */
+    /* Заголовок ушёл, flow нет: все 60000 байт — одна отправка. */
+    g_sent_n = 0;
     calls = g_send_calls;
-    for (int i = 0; i < 60; i++) { cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d)); seq += sizeof(d); }
-    up_flush(&g_tun);
-    check(g_send_calls == calls + 1 && g_send_last_n == 60000,
-          "большая сборка: packet-up без flow — 60000 байт одной отправкой");
-    dev_drain(NULL);
+    cli_put(c, d, sizeof d);
+    cli_pump(c);
+    check(g_send_calls == calls + 1 && g_send_last_n == 60000 && g_sent_n == 60000 &&
+          memcmp(g_sent, d, sizeof d) == 0,
+          "порции узлу: packet-up без flow — 60000 байт одной отправкой, байт в байт");
 
-    /* Транспорт без большой записи: прежний потолок. */
+    /* Транспорт без большой записи: порции SOCK_SEND_CHUNK. */
     g_big_write = 0;
+    g_sent_n = 0;
     calls = g_send_calls;
-    for (int i = 0; i < 60; i++) { cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d)); seq += sizeof(d); }
-    up_flush(&g_tun);
-    check(g_send_calls - calls >= 4 && g_send_last_n <= UP_MAX,
-          "большая сборка: транспорт без большой записи — не крупнее UP_MAX");
-    dev_drain(NULL);
+    cli_put(c, d, sizeof d);
+    cli_pump(c);
+    check(g_send_calls - calls == 4 && g_send_last_n <= UP_MAX && g_sent_n == 60000 &&
+          memcmp(g_sent, d, sizeof d) == 0,
+          "порции узлу: транспорт без большой записи — не крупнее UP_MAX, поток цел");
 
     /* Узел с flow (Vision): даже при большой записи транспорта — прежний потолок. */
     g_big_write = 1;
     snprintf(g_node.flow, sizeof(g_node.flow), "xtls-rprx-vision");
     calls = g_send_calls;
-    for (int i = 0; i < 60; i++) { cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d)); seq += sizeof(d); }
-    up_flush(&g_tun);
+    cli_put(c, d, sizeof d);
+    cli_pump(c);
     check(g_send_calls - calls >= 4 && g_send_last_n <= UP_MAX + 2048,
-          "большая сборка: узел с flow (Vision) большой записи не получает");
+          "порции узлу: узел с flow (Vision) большой записи не получает");
     g_node.flow[0] = 0;
     g_big_write = 0;
     conn_drop(c);
-    dev_drain(NULL);
 }
 
 /* ==== ПУЛ УЗЛОВ ВЫХОДА И СБРОС СОЕДИНЕНИЙ (src/tunnel/pool.c) ================================
@@ -1914,12 +1741,12 @@ static void pool_new(int active, int by, int ncand, const char *out) {
 }
 
 
+/* TCP, пришедший в устройство, — только для проверки сброса (R-152): соединения клиентов приходят сокетом. */
 static void pm_send(uint16_t sport, uint32_t dst, uint32_t seq, uint32_t ack, unsigned char flags,
                      const unsigned char *d, size_t n) {
     unsigned char p[2048];
     size_t l = tcp_build(p, sizeof(p), CLI_IP, dst, sport, 443, seq, ack, flags, d, n, 65535, 0, -1);
     handle_packet(&g_tun, p, l);
-    up_flush(&g_tun);                       /* пакет здесь — целая порция, как в cli_send */
 }
 
 /* Пакеты, написанные стеком в устройство: сколько, флаги всех вместе, номер последнего. */
@@ -1948,20 +1775,17 @@ static struct flow_key pm_key(uint16_t sport, uint32_t dst) {
     return k;
 }
 
-/* Соединение до «поток готов»: SYN, установщик, готовность (conn_ready), ACK клиента. */
+/* Соединение до «поток готов»: принятый сокет (TCP на петле — клиент видит различие RST и FIN), установщик,
+ * готовность (conn_ready). */
 static struct conn *pm_open(uint16_t sport, uint32_t dst) {
-    struct flow_key k = pm_key(sport, dst);
-    pm_send(sport, dst, 1000, 0, TCP_SYN, NULL, 0);
-    struct conn *c = conn_find(&k);
+    struct conn *c = sock_conn_tcp(sport, dst);
     if (!c || !c->pending) return NULL;
     for (int i = 0; i < 3000 && !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE); i++) {
         struct timespec ts = { 0, 1000000 };
         nanosleep(&ts, NULL);
     }
     if (!__atomic_load_n(&c->done, __ATOMIC_ACQUIRE) || conn_ready(c, &g_tun)) return NULL;
-    pm_send(sport, dst, 1001, 2, TCP_ACK, NULL, 0);
-    pm_drain(NULL, NULL);
-    return conn_find(&k);
+    return c;
 }
 
 static int pm_srv_of(const struct conn *c) {
@@ -2013,7 +1837,7 @@ static void t_pool_stack(void) {
     pm_send(50001, 0x0a0a0a0au, 5000, 777, TCP_ACK | TCP_PSH, d, sizeof d - 1);
     int n = pm_drain(&fl, &sq);
     check(n == 1 && (fl & TCP_RST) && sq == 777,
-          "данные без соединения (клиент выхода перезапущен) — RST с номером его подтверждения");
+          "TCP в устройстве (данные без соединения) — RST с номером его подтверждения");
     pm_send(50001, 0x0a0a0a0au, 5000, 778, TCP_ACK, NULL, 0);
     n = pm_drain(&fl, &sq);
     check(n == 1 && (fl & TCP_RST) && sq == 778,
@@ -2044,65 +1868,39 @@ static void t_pool_stack(void) {
     struct timespec ts = { 0, 30000000 };
     nanosleep(&ts, NULL);
     drain_conn(c, &g_tun);
-    pm_drain(NULL, NULL);
-    pm_send(50002, 0x0a0a0a0bu, 1001, c->our_seq, TCP_ACK, NULL, 0);
+    int cfd = cli_fd(c);
     pm_srv_rst(s);
     drain_conn(c, &g_tun);
     check(c->srv_closed && c->aborted, "RST узла — связь оборвана (aborted), а не закрыта");
     check(g_pl.slot[0].kick == 1 && g_pl.slot[0].lost == 1, "обрыв связи — слежке: проверить узел сейчас (lost)");
     pm_sweep();
-    n = pm_drain(&fl, NULL);
     struct flow_key k = pm_key(50002, 0x0a0a0a0bu);
-    check(n == 1 && (fl & TCP_RST) && !(fl & TCP_FIN) && !conn_find(&k),
+    check(cli_end(cfd) == 2 && !conn_find(&k),
           "оборванная связь — клиенту RST, а не FIN (обрезанный ответ не выглядит целым)");
-
-    /* Обрыв, когда клиент ещё не подтвердил отданное: какой номер он ждёт, неизвестно — RST обоими. */
-    c = pm_open(50005, 0x0a0a0a0bu);
-    if (!c) { check(0, "стенд: соединение для двух RST не открылось"); return; }
-    s = pm_srv_of(c);
-    if (send(s, "abcdef", 6, 0) != 6) check(0, "стенд: сервер не отправил");
-    nanosleep(&ts, NULL);
-    drain_conn(c, &g_tun);
-    pm_drain(NULL, NULL);
-    uint32_t ca = c->client_ack, os = c->our_seq;
-    pm_srv_rst(s);
-    drain_conn(c, &g_tun);
-    pm_sweep();
-    {
-        unsigned char p[2048];
-        uint32_t seqs[4];
-        int m = 0;
-        ssize_t r;
-        while (m < 4 && (r = recv(g_dev_peer, p, sizeof p, MSG_DONTWAIT)) > 0) {
-            struct flow_key kk;
-            size_t off;
-            if (ip_parse(p, (size_t)r, &kk, &off) == 0 && (kk.tcp_flags & TCP_RST)) seqs[m++] = kk.seq;
-        }
-        check(os == ca + 6 && m == 2 && seqs[0] == ca && seqs[1] == os,
-              "обрыв при неподтверждённом — RST и с подтверждённым номером, и с отправленным (RFC 5961)");
-    }
 
     /* Узел закрыл связь штатно. */
     c = pm_open(50003, 0x0a0a0a0bu);
     if (!c) { check(0, "стенд: второе соединение не открылось"); return; }
     s = pm_srv_of(c);
+    cfd = cli_fd(c);
     shutdown(s, SHUT_WR);
     nanosleep(&ts, NULL);
     drain_conn(c, &g_tun);
     check(c->srv_closed && !c->aborted, "FIN узла — закрытие, не обрыв");
     pm_sweep();
-    n = pm_drain(&fl, NULL);
-    check(n == 1 && (fl & TCP_FIN) && !(fl & TCP_RST), "закрытая узлом связь — клиенту FIN, как прежде");
+    k = pm_key(50003, 0x0a0a0a0bu);
+    check(cli_end(cfd) == 1 && !conn_find(&k), "закрытая узлом связь — клиенту FIN, как прежде");
     close(s);
 
     /* Отправка узлу не удалась. */
     c = pm_open(50004, 0x0a0a0a0bu);
     if (!c) { check(0, "стенд: третье соединение не открылось"); return; }
+    cfd = cli_fd(c);
     pm_srv_rst(pm_srv_of(c));
-    pm_send(50004, 0x0a0a0a0bu, 1001, 2, TCP_ACK | TCP_PSH, d, sizeof d - 1);
-    n = pm_drain(&fl, NULL);
+    cli_put(c, d, sizeof d - 1);
+    cli_pump(c);
     k = pm_key(50004, 0x0a0a0a0bu);
-    check((fl & TCP_RST) && !conn_find(&k), "отправка узлу не удалась — клиенту RST, а не молчание");
+    check(cli_end(cfd) == 2 && !conn_find(&k), "отправка узлу не удалась — клиенту RST, а не молчание");
 }
 
 /* Узел соединения перестал быть активным: его соединения — RST, соединения живого слота — живы. */
@@ -2124,6 +1922,7 @@ static void t_pool_stale(void) {
     check(a && b, "раздача connection — соединения есть на обоих узлах");
     if (!a || !b) return;
     struct flow_key ka = a->key, kb = b->key;
+    int fa = cli_fd(a);
     unsigned ep0 = __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE);
     g_fn[0].alive = 0;
     pl_check(0);
@@ -2133,9 +1932,7 @@ static void t_pool_stale(void) {
           "две неудачи подряд — замена следующим свободным кандидатом (1 занят, взят 2)");
     check(__atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) != ep0, "смена узла — стеку: набор узлов изменился");
     pm_sweep();
-    unsigned fl;
-    pm_drain(&fl, NULL);
-    check(!conn_find(&ka) && (fl & TCP_RST), "соединение мёртвого узла — RST клиенту, без перезапуска процесса");
+    check(!conn_find(&ka) && cli_end(fa) == 2, "соединение мёртвого узла — RST клиенту, без перезапуска процесса");
     check(conn_find(&kb) != NULL, "соединение живого узла — не тронуто");
     struct conn *cb = conn_find(&kb);
     if (cb) conn_reset(cb, &g_tun);
@@ -2410,8 +2207,9 @@ static void t_pool_state(void) {
 /* Поддельный дайлер без дескрипторов и без установщика: связь — готовая сессия, нагрузка лежит в ней же
  * (как у hysteria2: очередь блоков), стенд кладёт и забирает руками. Проверяется то, что видно снаружи:
  * connect зовётся самим стеком в его потоке (установщиков нет вовсе), исход приходит через
- * stack_sess_ready — сразу или позже, пока соединение ждёт и копит ранние данные, — чтение отдаёт
- * указатель в сессию, окно клиента — место у узла (room), а оборванная связь — RST, а не FIN. Само ожидание
+ * stack_sess_ready — сразу или позже, пока соединение ждёт (данные клиента лежат в его сокете), — чтение
+ * отдаёт указатель в сессию, место у узла (room) решает, читается ли сокет клиента, а оборванная связь —
+ * RST, а не FIN. Само ожидание
  * в epoll и таймеры дайлера — дело worker_loop, и его гоняет стенд в сетевых пространствах
  * (tests/run-hy2.sh). */
 struct hsess { int fd; };           /* общий вид для прочих поддельных дайлеров стенда: поле fd первым */
@@ -2506,24 +2304,6 @@ static const struct dialer_ops in_ops = {
     .loop_wait = in_loop_wait, .loop_stop = in_loop_stop, .aborted = in_aborted,
 };
 
-/* Окна пакета из устройства: сколько подтверждений ушло, номер и окно последнего. */
-static int h_acks(uint32_t *ack, unsigned *win) {
-    unsigned char p[70000];
-    int cnt = 0;
-    for (;;) {
-        ssize_t r = recv(g_dev_peer, p, sizeof(p), MSG_DONTWAIT);
-        if (r <= 0) break;
-        struct flow_key k;
-        size_t off;
-        if (ip_parse(p, (size_t)r, &k, &off) == 0 && (k.tcp_flags & TCP_ACK)) {
-            if (ack) *ack = k.ack;
-            if (win) *win = k.window;
-            cnt++;
-        }
-    }
-    return cnt;
-}
-
 static void t_inloop(void) {
     static const struct dialer hd = { .ops = &in_ops, .ctx = NULL };
     while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
@@ -2546,64 +2326,65 @@ static void t_inloop(void) {
     if (!c) return;
     check(c->fd == 77 && !c->armed, "  связь есть, а в epoll соединению ставить нечего (дескриптора нет)");
 
-    /* Данные вниз: сессия говорит stack_sess_rx, стек читает указатель в неё. */
+    /* Данные вниз: сессия говорит stack_sess_rx, стек читает указатель в неё и отдаёт клиенту в сокет. */
+    int cfd = cli_fd(c);
     struct isess *is = SESS(c);
     memset(is->q, 'q', 1000);
     is->qn = 1000;
     g_rx_kick = 0;
     c->rx_ready = 0;
-    uint32_t seq0 = c->our_seq;
     stack_sess_rx(is);
     check(c->rx_ready && g_rx_kick, "в цикле: stack_sess_rx ставит чтение и признак витка");
     drain_conn(c, &g_tun);
-    check(c->our_seq == seq0 + 1000, "  клиенту ушло 1000 байт из сессии");
-    pm_drain(NULL, NULL);
+    unsigned char qb[1100];
+    check(cli_get(cfd, qb, sizeof qb) == 1000 && qb[0] == 'q' && qb[999] == 'q',
+          "  клиенту ушло 1000 байт из сессии");
 
-    /* Окно клиента — место у узла: объявляется оно, а вырастет — уходит обновление. */
-    is->room = 5000;
-    c->ws_on = 0;
-    check(rcv_win_field(c) == 5000, "в цикле: окно клиента — место у узла (room)");
-    c->room_seen = 5000;
+    /* Место у узла (room) решает, читается ли сокет клиента: нет места — данные ждут в сокете, вырастет —
+     * stack_sess_room будит цикл, и проход сроков дочитывает без нового события на сокете. */
+    unsigned char ud[100];
+    memset(ud, 'u', sizeof ud);
+    size_t was_sent = g_in_sent;
+    is->room = 0;
+    cli_put(c, ud, sizeof ud);
+    cli_pump(c);
+    check(!sock_want_read(c) && g_in_sent == was_sent && srv_pending(c) == (int)sizeof ud,
+          "в цикле: места у узла нет — сокет клиента не читается, данные ждут в нём");
     is->room = 30000;
-    g_win_woke = 0;
+    g_rx_kick = 0;
     stack_sess_room(is);
-    check(c->ack_due && g_win_woke, "  выросшее место: обновление окна причитается");
-    flush_acks(&g_tun);
-    uint32_t ack = 0;
-    unsigned win = 0;
-    check(h_acks(&ack, &win) == 1 && win == 30000, "  и ушло клиенту с новым окном (30000)");
-    g_win_woke = 0;
+    check(g_rx_kick && sock_want_read(c), "  выросшее место: цикл будится, сокет снова читается");
+    conn_deadlines(c, &g_tun, c->estab_ns + 1);
+    check(g_in_sent == was_sent + sizeof ud && srv_pending(c) == 0, "  проход сроков дочитал клиента — 100 байт ушли узлу");
 
     /* Оборванная связь — RST, а не FIN. */
     is->aborted = 1;
     stack_sess_rx(is);
     drain_conn(c, &g_tun);
     check(c->srv_closed && c->aborted, "в цикле: чтение с ошибкой при оборванной связи — соединение оборвано");
-    unsigned fl = 0;
     conn_deadlines(c, &g_tun, g_now_ns ? g_now_ns : now_ns());
-    pm_drain(&fl, NULL);
-    check(fl & TCP_RST, "  клиенту RST, а не FIN");
+    check(cli_end(cfd) == 2, "  клиенту RST, а не FIN");
 
-    /* Исход позже: соединение ждёт (pending), клиент шлёт ранние данные, исход приходит из дайлера. */
+    /* Исход позже: соединение ждёт (pending), клиент пишет в сокет, исход приходит из дайлера. */
     g_in_mode = 1;
     g_in_late = NULL;
     uint16_t sp = 41001;
-    struct flow_key k = pm_key(sp, SRV_IP);
-    pm_send(sp, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
-    c = conn_find(&k);
+    c = sock_conn_tcp(sp, SRV_IP);
     check(c && c->pending && !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE) && g_in_late,
           "в цикле: исход не сразу — заявка ждёт, соединение недотрогаемо");
     if (c && g_in_late) {
         unsigned char d[100];
         memset(d, 'e', sizeof d);
-        pm_send(sp, SRV_IP, 1001, 2, TCP_ACK | TCP_PSH, d, sizeof d);
+        cli_put(c, d, sizeof d);
         size_t was = g_in_sent;
-        check(c->early_n == sizeof d && g_in_sent == was, "  ранние данные клиента копятся в буфере, узлу не уходят");
+        check(c->early_n == 0 && g_in_sent == was && srv_pending(c) == (int)sizeof d,
+              "  данные клиента ждут в его сокете, в буфере ничего, узлу не уходят");
         g_in_late->linked = 1;
         stack_sess_ready(g_in_late, 0);
         check(__atomic_load_n(&c->done, __ATOMIC_ACQUIRE) && c->rc == 0, "  stack_sess_ready поднимает готовность заявки");
-        check(!conn_ready(c, &g_tun) && g_in_sent == was + sizeof d, "  разбор готовности — ранние данные ушли узлу");
-        pm_drain(NULL, NULL);
+        check(!conn_ready(c, &g_tun) && g_in_sent == was, "  разбор готовности — поток поднят, сокет ещё не читали");
+        conn_deadlines(c, &g_tun, c->estab_ns + 1);
+        check(g_in_sent == was + sizeof d, "  проход сроков прочитал сокет — данные ушли узлу");
         conn_drop(c);
     }
 
@@ -2611,16 +2392,13 @@ static void t_inloop(void) {
     g_in_mode = 0;
     g_in_rc = -2;
     sp = 41002;
-    k = pm_key(sp, SRV_IP);
-    pm_send(sp, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
-    c = conn_find(&k);
+    c = sock_conn_tcp(sp, SRV_IP);
     check(c && c->pending && __atomic_load_n(&c->done, __ATOMIC_ACQUIRE) && c->rc == -2,
           "в цикле: отказ connect — исход заявки без ожидания");
-    pm_drain(NULL, NULL);
     if (c) {
+        int rfd = cli_fd(c);
         check(conn_ready(c, &g_tun) == 1, "  разбор готовности закрывает соединение");
-        pm_drain(&fl, NULL);
-        check(fl & TCP_RST, "  клиенту RST");
+        check(cli_end(rfd) == 2, "  клиенту RST");
     }
     g_in_rc = 0;
     while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
@@ -2927,6 +2705,7 @@ int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
     if (write(g_sess_pipe[1], "x", 1) != 1) return 2;
+    for (int i = 0; i < MAX_CONNS; i++) g_cfd[i] = -1;
     memset(&g_tun, 0, sizeof(g_tun));
     g_tun.fd = sp[0];
     g_dev_peer = sp[1];
@@ -2941,13 +2720,13 @@ int main(void) {
     g_now_s = (time_t)(g_now_ns / 1000000000ull);
 
     t_no_connectors();
+    t_tcp_tun_rst();
     t_bring_up_table();
-    t_sendagain_window();
-    t_sendagain_retry();
-    t_sendagain_eof();
-    t_out_of_order_dupack();
-    t_out_of_order_hold();
-    t_window_scale();
+    t_early_wait();
+    t_sendagain_hold();
+    t_client_full();
+    t_srv_close_drain();
+    t_sock_path();
     t_release_last_sleep();
     t_bad_uuid();
     t_send_refused();
@@ -2960,15 +2739,12 @@ int main(void) {
     t_aux_wake();
     t_tx_batch();
     t_empty_read();
-    t_gather();
-    t_gather_big();
-    t_fin_window();
+    t_sock_chunks();
     t_udp_early_bounds();
     t_udp_defrag();
     t_owner();
     t_owner_mail();
     t_udp_big();
-    t_early_window();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
