@@ -81,6 +81,11 @@ static void mask_sip(char *buf, size_t n) {
     strcat(buf, ">");
 }
 
+const char *wb_mask_name(int k) {
+    static const char *const N[WB_MASKS] = { "QUIC", "QUIC-2", "DNS", "STUN", "iCloud-DNS", "SIP" };
+    return k >= 0 && k < WB_MASKS ? N[k] : "?";
+}
+
 const char *wb_mask(int k, char *buf, size_t n, const char **name) {
     /* Порядок апстрима: основная (QUIC), затем quic2 dns stun icloud sip. */
     switch (k) {

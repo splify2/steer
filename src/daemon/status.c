@@ -19,6 +19,7 @@
 #include <time.h>
 
 #include "spec.h"
+#include "platform.h"
 #include "awg.h"
 #include "hwid.h"
 #include "obfs.h"
@@ -125,6 +126,61 @@ int status_fast(FILE *out) {
  *   latency4, latency6 — у группы, меренной по обоим семействам: замеры по IPv4 и IPv6 порознь
  *              (latency тогда — худший из двух у каждого члена); у остальных полей нет;
  *   weights  — balance: веса членов по порядку. */
+/* Группа `kind: warp` (docs/warp.md): что о туннелях знает модуль steer-warpbox — файл состояния
+ * <state>/warp-<группа>/state, который он переписывает каждый проход сторожа (wbmain.c, state_write).
+ * Файл читается как данные: поля разбираются и печатаются здесь своим JSON, а не вставляются текстом.
+ *   warp.mask    — маска первого пакета AmneziaWG (нет поля — обычный WireGuard);
+ *   warp.why     — почему группа не работает (поля нет, пока работает);
+ *   warp.members — по туннелю: out, ip, port, colo (колония Cloudflare), seen (страна, которую видят
+ *                  сайты), ok (последний проход сторожа модуля). Неизвестное — без поля.
+ * Файла нет (модуль не стоит или ещё не прошёл) — поля warp нет. */
+static int warp_tok_ok(const char *t, const char *set, size_t maxlen) {
+    size_t n = strlen(t);
+    return n && n <= maxlen && strspn(t, set) == n && strcmp(t, "-") != 0;
+}
+
+static void warp_emit(FILE *out, const struct output *o) {
+    char p[512];
+    snprintf(p, sizeof(p), "%s/warp-%s/state", steer_state_dir(), o->name);
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    char line[512];
+    int members = 0;
+    fputs(",\"warp\":{", out);
+    int first = 1;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!strncmp(line, "mask ", 5)) {
+            if (!warp_tok_ok(line + 5, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-", 16)) continue;
+            fprintf(out, "%s\"mask\":\"%s\"", first ? "" : ",", line + 5);
+            first = 0;
+        } else if (!strncmp(line, "why ", 4)) {
+            if (!strcmp(line + 4, "-")) continue;
+            fprintf(out, "%s\"why\":", first ? "" : ",");
+            jsonw_str(out, line + 4);
+            first = 0;
+        } else if (!strncmp(line, "member ", 7)) {
+            char name[64], ip[64], colo[16], seen[16];
+            unsigned port;
+            int ok;
+            if (sscanf(line + 7, "%63s %63s %u %15s %15s %d", name, ip, &port, colo, seen, &ok) != 6) continue;
+            if (!members) fprintf(out, "%s\"members\":[", first ? "" : ",");
+            fprintf(out, "%s{\"out\":", members ? "," : "");
+            first = 0;
+            members++;
+            jsonw_str(out, name);
+            if (warp_tok_ok(ip, "0123456789.", 15)) fprintf(out, ",\"ip\":\"%s\"", ip);
+            if (port && port < 65536) fprintf(out, ",\"port\":%u", port);
+            if (warp_tok_ok(colo, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 3)) fprintf(out, ",\"colo\":\"%s\"", colo);
+            if (warp_tok_ok(seen, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 2)) fprintf(out, ",\"seen\":\"%s\"", seen);
+            fprintf(out, ",\"ok\":%s}", ok ? "true" : "false");
+        }
+    }
+    fclose(f);
+    if (members) fputc(']', out);
+    fputc('}', out);
+}
+
 static void group_emit(FILE *out, const struct spec *sp, const struct output *o) {
     const struct group_cfg *g = out_group(o);
     if (!g || g->shown) return;
@@ -187,6 +243,7 @@ static void group_emit(FILE *out, const struct spec *sp, const struct output *o)
             fprintf(out, "}");
         }
     }
+    if (g->warp.on) warp_emit(out, o);
     if (g->pick == PICK_BALANCE) {
         fprintf(out, ",\"weights\":[");
         for (size_t k = 0; k < g->members_n; k++)

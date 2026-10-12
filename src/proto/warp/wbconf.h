@@ -9,6 +9,7 @@
 #define WB_MASKS 6
 /* Маска номер k: текст в buf (собранные заново — DNS, STUN, SIP — каждый раз свои), имя — в *name. */
 const char *wb_mask(int k, char *buf, size_t n, const char **name);
+const char *wb_mask_name(int k);
 
 struct wb_conf {
     const struct wb_reg *reg;

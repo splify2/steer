@@ -288,6 +288,28 @@ static int member_alive(struct member *m) {
     return 0;
 }
 
+/* Состояние группы для `steer status` (поле warp у группы, daemon/status.c): строками в каталоге
+ * состояния, запись заменой. Ядро читает его как данные — разбирает по полям и печатает своим JSON,
+ * сырого текста модуля в ответ не вставляет.
+ *     mask <имя>          маска I1 (или «-» без AmneziaWG)
+ *     why <текст>         почему группа сейчас не работает (или «-»)
+ *     member <выход> <адрес> <порт> <колония> <страна сайтов> <жив 0|1>   «-» — неизвестно */
+static void state_write(const struct wb *w, const char *why) {
+    char p[600], t[620];
+    snprintf(p, sizeof(p), "%s/state", w->st);
+    snprintf(t, sizeof(t), "%s.tmp", p);
+    FILE *f = fopen(t, "w");
+    if (!f) return;
+    fprintf(f, "mask %s\nwhy %s\n", w->obfs ? wb_mask_name(w->mask) : "-", why && why[0] ? why : "-");
+    for (size_t i = 0; i < w->n; i++) {
+        const struct member *m = &w->m[i];
+        fprintf(f, "member %s %s %u %s %s %d\n", m->o->name, m->ip[0] ? m->ip : "-", m->ip[0] ? m->port : 0,
+                m->colo[0] ? m->colo : "-", m->seen[0] ? m->seen : "-", m->ok);
+    }
+    if (fclose(f) == 0) rename(t, p);
+    else unlink(t);
+}
+
 static int load(struct wb *w, const char *spec_path, const char *group) {
     struct err e = { 0 };
     w->sp = calloc(1, sizeof(*w->sp));
@@ -358,7 +380,9 @@ int cmd_warp(const char *spec_path, const char *group) {
                 char ep[64];
                 /* Файл уже есть (прошлый запуск) — сначала проверить его, а не подбирать заново. */
                 if (wb_conf_endpoint(m->conf_path, ep, sizeof(ep)) == 0 && strchr(ep, ':')) {
-                    *strrchr(ep, ':') = '\0';
+                    char *c = strrchr(ep, ':');
+                    m->port = (unsigned)atoi(c + 1);
+                    *c = '\0';
                     snprintf(m->ip, sizeof(m->ip), "%.15s", ep);
                     pt_load(&w, m);
                 } else { need[i] = 1; continue; }
@@ -394,11 +418,13 @@ int cmd_warp(const char *spec_path, const char *group) {
         if (assign(&w, need) == 0)
             for (size_t i = 0; i < w.n; i++) if (need[i] && w.m[i].ip[0]) alive++;
         int up = alive > 0;
+        const char *why = up ? NULL : "ни один туннель WARP не работает";
         if (up != said_up) {
             if (up) evline_emit("up", (const char *)NULL);
-            else evline_emit("down", "why", EVLINE_STR, "ни один туннель WARP не работает", (const char *)NULL);
+            else evline_emit("down", "why", EVLINE_STR, why, (const char *)NULL);
             said_up = up;
         }
+        state_write(&w, why);
         nap(WB_CHECK_S);
     }
     free(need);
