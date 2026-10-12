@@ -1134,6 +1134,19 @@ static inline int out_engine_managed(const struct output *o) { return out_has_ca
  * Отсюда одна функция для решения и разные тексты в сообщениях. */
 static inline int out_self_natting(const struct output *o) { return out_has_cap(o, KC_SELF_NAT); }
 
+/* Подмену IPv4 на устройстве выхода ставит само ядро (compile/generate.c, build_nat4; решение
+ * владельца 2026-10-12 — одна зона steer_zone без masq): у туннеля с устройством, который адреса
+ * клиентов сам не завершает. Проверки фаервола (fwcheck, diag, status) свою таблицу не читают и
+ * спрашивают это условие. Раскладка 4.9 (legacy.c, телефон) цепочки не ставит — там зон fw4 нет. */
+static inline int out_nat4_by_steer(const struct output *o) {
+    /* lo — не туннель: подмена адреса на петле роняет локальные пакеты (EPERM у sendto), а выход на lo
+     * бывает у стендов и у схем, где «туннель» — локальный прокси (стенд tests/dnsgroups.sh). */
+    /* На телефоне (plat()->iptables_masq) подмену выходов и так ставит ядро — правилами iptables при apply
+     * (daemon/apply.c, iptables_masq_sync): своя цепочка nft там была бы второй. */
+    return out_has_device(o) && !out_group(o) && !out_self_natting(o) && o->device[0] &&
+           strcmp(o->device, "lo") != 0 && !plat()->iptables_masq;
+}
+
 /* Выход, трафик которого общий обход DPI трогать НЕ должен.
  *
  * Это все виды, кроме kind=direct, и исключение здесь ровно одно — оно же и есть смысл

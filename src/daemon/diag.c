@@ -1102,6 +1102,8 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
             }
         }
         struct fwcheck c = fw_check(sp->out[i].device);
+        /* Подмену IPv4 ставит само ядро (out_nat4_by_steer) — fw_check свою таблицу не читает. */
+        if (out_nat4_by_steer(out_for_device(sp, &sp->out[i], sp->out[i].device))) c.masqueraded = 1;
         /* Нужен ли masquerade — свойство УСТРОЙСТВА, а не выхода, который его назвал: в пуле
          * kind=interface активным бывает устройство VLESS-туннеля или хаба xsteer, и вопрос
          * решает его владелец. Без этого исправно собранный пул получал бы вечное «нет

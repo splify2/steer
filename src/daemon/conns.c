@@ -299,12 +299,13 @@ static int rr_mark_add(unsigned **v, size_t *n, unsigned m) {
     return 0;
 }
 
-/* Метки, которые соединение через выход o может нести: свою и, у balance, — членов (вглубь). */
+/* Метки, которые соединение через выход o может нести: свою и, у группы с картой (balance,
+ * закрепляющие order/latency), — членов (вглубь). */
 static int rr_marks_of(const struct spec *sp, const struct output *o, unsigned **v, size_t *n,
                        int depth) {
     if (!o || depth > 16) return 0;
     if (out_needs_mark(o) && rr_mark_add(v, n, o->mark & STEER_MARK_MASK) < 0) return -1;
-    if (out_group(o) && o->grp.pick == PICK_BALANCE)
+    if (group_carded(o))
         for (size_t i = 0; i < o->grp.members_n; i++)
             if (rr_marks_of(sp, spec_out(sp, o->grp.members[i]), v, n, depth + 1) < 0) return -1;
     return 0;

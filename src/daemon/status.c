@@ -133,7 +133,8 @@ int status_fast(FILE *out) {
  *   warp.why     — почему группа не работает (поля нет, пока работает);
  *   warp.members — по туннелю: out, ip, port, colo (колония Cloudflare), seen (страна, которую видят
  *                  сайты), ok (последний проход сторожа модуля). Неизвестное — без поля.
- * Файла нет (модуль не стоит или ещё не прошёл) — поля warp нет. */
+ * Файла нет (модуль не стоит или ещё не прошёл) — поля warp нет. У transport: masque mask нет, а ip
+ * бывает IPv6 (точка MASQUE по API). */
 static int warp_tok_ok(const char *t, const char *set, size_t maxlen) {
     size_t n = strlen(t);
     return n && n <= maxlen && strspn(t, set) == n && strcmp(t, "-") != 0;
@@ -169,7 +170,7 @@ static void warp_emit(FILE *out, const struct output *o) {
             first = 0;
             members++;
             jsonw_str(out, name);
-            if (warp_tok_ok(ip, "0123456789.", 15)) fprintf(out, ",\"ip\":\"%s\"", ip);
+            if (warp_tok_ok(ip, "0123456789abcdefABCDEF.:", 45)) fprintf(out, ",\"ip\":\"%s\"", ip);
             if (port && port < 65536) fprintf(out, ",\"port\":%u", port);
             if (warp_tok_ok(colo, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 3)) fprintf(out, ",\"colo\":\"%s\"", colo);
             if (warp_tok_ok(seen, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 2)) fprintf(out, ",\"seen\":\"%s\"", seen);
@@ -333,11 +334,15 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
         if (sp->out[i].over[0]) fprintf(out, ",\"via\":\"%s\"", sp->out[i].over);
         if (out_has_device(&sp->out[i])) {
             struct fwcheck c = fw_check(sp->out[i].device);
+            /* `nat` — подмена IPv4 есть, кем бы ни была: masq зоны fw4 или своя postrouting_nat4
+             * (out_nat4_by_steer); кем — `nat_by`, как `nat6_by` у IPv6. */
+            int nat4_ours = out_nat4_by_steer(out_for_device(sp, &sp->out[i], sp->out[i].device));
             fprintf(out, ",\"device\":\"%s\",\"up\":%s%s,\"mark\":\"0x%08x\",\"table\":%d"
                    ",\"in_firewall\":%s,\"nat\":%s",
                    sp->out[i].device, up ? "true" : "false", failed ? ",\"failed\":true" : "",
                    sp->out[i].mark, sp->out[i].table,
-                   c.in_firewall ? "true" : "false", c.masqueraded ? "true" : "false");
+                   c.in_firewall ? "true" : "false", c.masqueraded || nat4_ours ? "true" : "false");
+            if (nat4_ours || c.masqueraded) fprintf(out, ",\"nat_by\":\"%s\"", nat4_ours ? "steer" : "fw4");
             /* С 1.10 `nat` — подмена IPv4 (masq зоны), а `nat6` — IPv6 (masq6), отдельно
              * (fw_check по семействам, fwcheck.c): прежде одно поле засчитывало любое правило
              * masquerade за оба. `nat6` — только у выхода, который несёт IPv6 (out_route6): у

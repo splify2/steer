@@ -9,6 +9,10 @@ table inet steer {
     chain postrouting_down {
         type filter hook postrouting priority srcnat + 10; policy accept;
     }
+    chain postrouting_nat4 {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "wg0" meta nfproto ipv4 counter masquerade comment "steer-nat4:vpn"
+    }
     chain prerouting_dns {
         type nat hook prerouting priority dstnat - 2; policy accept;
         iifname "br-lan" udp dport 53 counter redirect to :5300

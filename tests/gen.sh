@@ -98,6 +98,10 @@ table inet steer {
         meta mark and 0x0ff00000 == 0x00000000 return
         meta mark and 0x0ff00000 == 0x00100000 oifname != "wg0" counter drop comment "steer-guard:vpn"
     }
+    chain postrouting_nat4 {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "wg0" meta nfproto ipv4 counter masquerade comment "steer-nat4:vpn"
+    }
     chain prerouting_dns {
         type nat hook prerouting priority dstnat - 2; policy accept;
         ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300
@@ -1805,14 +1809,19 @@ check "ingress: цепочка на всех устройствах раздач
 check "ingress: запасные правила prerouting — прежние до байта" \
     "$(chain_of "$pout" prerouting_mark)" \
     "$(chain_of "$iout" prerouting_mark | grep -v 'comment "steer-ingress"$')"
-# Правила ingress — те же правила каналов в том же порядке, без метки соединения; у balance —
-# метка группы вместо перехода в её цепочку (ниже отдельно).
+# Правила ingress — те же правила каналов в том же порядке, без метки соединения; у групп с картой
+# (balance и закрепляющие order/latency, compile/balance.c) — метка группы вместо перехода в её
+# цепочку (ниже отдельно): их правила сравниваются по именам каналов, а не текстом.
+carded="$(chain_of "$pout" prerouting_mark | sed -n 's/.*goto bal_[0-9]* comment "\(steer:[^"]*\)".*/\1"/p')"
 check "ingress: правила каналов — те же, в том же порядке, без ct mark" \
     "$(chain_of "$pout" prerouting_mark | sed '1,2d;$d' | grep -v 'goto bal_' | sed 's/ ct mark set mark//')" \
-    "$(chain_of "$iout" ingress_mark | sed '1,3d;$d' | grep -v 'comment "steer:bal_all')"
+    "$(chain_of "$iout" ingress_mark | sed '1,3d;$d' | grep -vF "$carded")"
+check "ingress: каналы групп с картой (balance, order, latency) — те же и на ingress" \
+    "$(printf '%s\n' "$carded" | sort)" \
+    "$(chain_of "$iout" ingress_mark | grep -oF "$carded" | sort)"
 regmark() { printf '0x%08x' "0x$(awk -v o="$1" '$1 == o { print $2 }' "$tmp/st-ing/registry")"; }
 bmark="$(regmark bal)"
-bchain="$(chain_of "$pout" prerouting_mark | sed -n 's/.*counter goto \(bal_[0-9]*\).*/\1/p' | head -n 1)"
+bchain="$(chain_of "$pout" prerouting_mark | sed -n 's/.*counter goto \(bal_[0-9]*\) comment "steer:bal_all.*/\1/p' | head -n 1)"
 check "ingress: balance — метка группы на ingress (IPv4 и IPv6)" "2" \
     "$(chain_of "$iout" ingress_mark | grep -c "meta mark set mark and 0xf00fffff or $bmark counter return comment \"steer:bal_all")"
 check "ingress: balance — prerouting по метке группы идёт в её цепочку" "1" \

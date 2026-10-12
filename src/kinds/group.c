@@ -42,6 +42,7 @@
 #include <string.h>
 
 #include "spec.h"
+#include "awg.h"
 
 /* Спека v2 знает группу по имени; спека v1 — нет (kind_by_name её не находит, см. kind.h). */
 const struct kind_ops *kind_by_name_v2(const char *name) {
@@ -341,9 +342,15 @@ void group_mark_chain(const struct output *o, char *dst, size_t n) {
     snprintf(dst, n, "mark_%d", o->table);
 }
 void group_bal_target(const struct output *m, char *dst, size_t n) {
-    const struct group_cfg *g = out_group(m);
-    if (g && g->pick == PICK_BALANCE) group_bal_chain(m, dst, n);
+    if (group_carded(m)) group_bal_chain(m, dst, n);
     else group_mark_chain(m, dst, n);
+}
+
+int group_carded(const struct output *o) {
+    const struct group_cfg *g = out_group(o);
+    if (!g) return 0;
+    if (g->pick == PICK_BALANCE) return 1;
+    return (g->pick == PICK_ORDER || g->pick == PICK_LATENCY) && group_named(g);
 }
 
 static unsigned group_caps_of(const struct output *o) {
@@ -371,6 +378,32 @@ static int group_helper(const struct spec *sp, const struct output *o, struct ki
     }
     return 0;
 }
+
+/* ---- член группы `kind: warp, transport: masque` ------------------------------------------------
+ *
+ * Устройство — TUN, который держит модуль steer-warpbox (поток туннеля MASQUE, src/proto/warp/wbmq.c),
+ * как у xsteer; маршрут, метку, таблицу и подмену адресов ведёт ядро, как у любого выхода с
+ * устройством. Своих ключей у вида нет, руками в спеке он не пишется — его заводит только разворот
+ * `kind: warp` (model/v2.c, p_warp), поэтому в реестре видов (kind.c) его нет: разбор находит его сам.
+ * Имя устройства — то же правило, что у awg (awg_default_ifname): имя не должно выдавать туннель. */
+static int warpm_parse(struct output *o, const struct out_keys *k, struct err *e) {
+    if (k->devices_n)
+        return err_set(e, "outputs.%s: устройство члена WARP выбирает ядро steer", o->name);
+    awg_default_ifname(o->name, o->device, sizeof(o->device));
+    return 0;
+}
+
+static void warpm_keys_of(const struct output *o, struct out_keys *k) {
+    (void)o;
+    (void)k;
+}
+
+const struct kind_ops kind_warpm = {
+    .name = "warp-masque",
+    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_OVER | KC_SKIP_ZAPRET | KC_IPV6,
+    .parse = warpm_parse,
+    .keys_of = warpm_keys_of,
+};
 
 const struct kind_ops kind_group = {
     .name = "group",

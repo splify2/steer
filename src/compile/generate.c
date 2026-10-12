@@ -1960,6 +1960,48 @@ static void build_nat6(struct nft_table *t, const struct spec *sp) {
     }
 }
 
+/* Подмена IPv4 на устройствах выходов — в СВОЕЙ таблице, как IPv6 у `ipv6: nat` (build_nat6).
+ *
+ * РЕШЕНИЕ ВЛАДЕЛЬЦА (2026-10-12): все устройства выходов steer лежат в одной зоне fw4 `steer_zone`
+ * БЕЗ masq (её ведёт splify2), а подмену адреса ставит ядро — тем видам, которым она нужна: туннель
+ * с устройством, который адреса клиентов не завершает сам (interface, awg, члены kind: warp — у WARP
+ * туннель принимает пакеты только с адреса регистрации). Сами себе подмена — vless, hysteria2, прокси
+ * (завершают соединения у себя) и xsteer (подмена ему вредна: хаб узнаёт пира по адресу) —
+ * KC_SELF_NAT, им правила нет. Прежде masquerade ставила зона steer_iface, и смысл был тот же; две зоны
+ * splify2 (с подменой и без) сведены в одну.
+ *
+ * Зоны fw4 ядро по-прежнему не трогает, и ЗОНА устройству нужна: политика forward зоны в fw4
+ * действует только внутри зоны, а транзит в устройство вне всех зон уходит в handle_reject (стенд
+ * QEMU 2026-10-12). Подмена дважды (своя зона человека с masq и это правило) не страшна: адрес
+ * соединению назначает первая сработавшая цепочка nat.
+ *
+ * Устройства — выходов спеки и безымянных членов пула v1 (`devices`), каждое один раз. */
+static void nat4_dev(struct nft_table *t, struct nft_chain **c, const struct output *o,
+                     const char **seen, size_t *seen_n) {
+    if (!out_nat4_by_steer(o)) return;
+    for (size_t k = 0; k < *seen_n; k++)
+        if (!strcmp(seen[k], o->device)) return;
+    seen[(*seen_n)++] = o->device;
+    if (!*c) *c = ir_base_chain_add(t, "postrouting_nat4", "nat", "postrouting", "srcnat", 0);
+    struct nft_rule *r = ir_rule(*c);
+    ir_rule_fam(r, 4);
+    ir_x(r, "oifname \"%s\"", o->device);
+    ir_family(r, 4);
+    ir_counter(r, 0, 0);
+    ir_x(r, "masquerade");
+    ir_comment(r, "steer-nat4:%s", o->name[0] ? o->name : o->device);
+}
+
+static void build_nat4(struct nft_table *t, const struct spec *sp) {
+    struct nft_chain *c = NULL;
+    size_t cap = sp->out_n + sp->anon_n + 1, seen_n = 0;
+    const char **seen = calloc(cap, sizeof(*seen));
+    if (!seen) { t->rs->oom = 1; return; }
+    for (size_t i = 0; i < sp->out_n; i++) nat4_dev(t, &c, &sp->out[i], seen, &seen_n);
+    for (size_t i = 0; i < sp->anon_n; i++) nat4_dev(t, &c, &sp->anon[i], seen, &seen_n);
+    free(seen);
+}
+
 /* ---- TCP клиентов — к слушателю модуля (R-152) ----------------------------------------------
  *
  * У выхода с KC_TCP_REDIR (vless, hysteria2, прокси) TCP клиентов завершает ядро Linux: первый
@@ -2048,6 +2090,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     build_forward_v6(t, sp, gr);
     build_guard(t, sp, gr);
     build_nat6(t, sp);
+    build_nat4(t, sp);
     /* Построители видов (kind_ops.emit): по видам, в порядке реестра, поэтому все цепочки
      * zapret в тексте стоят раньше цепочки моста, в каком бы порядке выходы ни шли в спеке
      * (kind.c: kind_emit_all). */

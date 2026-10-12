@@ -2603,10 +2603,21 @@ static void out_finish(struct fo_run *r) {
             }
         }
     }
+    /* Закрепляющая order/latency: новые соединения — на выбранный член этого прохода (карта, fogroup.c);
+     * установленные остаются на своих членах. Карта переписана — строка в журнал; событие смены члена
+     * уже ушло выше (FO_EV_SWITCHED). */
+    if (r->named && gcf && gcf->pick != PICK_BALANCE && group_carded(o) &&
+        fog_balance_sync(r->sp, o, r->galive, chosen ? r->pk : -1) == 1) {
+        r->changed = 1;
+        if (r->verbose || (chosen && r->pk >= 0))
+            fprintf(stderr, LOG_I "выход %s: новые соединения — на %s, установленные остаются на своих "
+                            "членах\n", o->name,
+                    chosen && r->pk >= 0 && (size_t)r->pk < r->cand_n ? r->cand[r->pk]->name : "запасной путь группы");
+    }
     /* balance: карта раздачи в ядре — по живым членам этого прохода (fogroup.c: по факту в ядре,
      * запись — только при расхождении). Переписана — событие balance с составом. */
     if (r->named && gcf && gcf->pick == PICK_BALANCE &&
-        fog_balance_sync(r->sp, o, r->galive) == 1) {
+        fog_balance_sync(r->sp, o, r->galive, -1) == 1) {
         /* Список имён — в куче по числу членов (имя ≤ 31 байт и запятая): раньше буфер был на 16. */
         size_t alc = r->cand_n * 33 + 1, l = 0;
         char *al = malloc(alc);
