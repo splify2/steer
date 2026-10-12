@@ -98,6 +98,12 @@ static void t_spec(void) {
           spec_load("version: 2\noutputs:\n  cf: { kind: warp, count: 0 }\n", &sp, msg, sizeof msg) < 0);
     check("warp: чужой ключ — отказ", 1,
           spec_load("version: 2\noutputs:\n  cf: { kind: warp, members: [a] }\n", &sp, msg, sizeof msg) < 0);
+    check("warp: без count — спека принята", 0,
+          spec_load("version: 2\noutputs:\n  one: { kind: warp }\n", &sp, msg, sizeof msg) < 0);
+    g = out_by_name(&sp, "one");
+    check("warp: count по умолчанию — один туннель (самая быстрая точка — у него же)", 1,
+          g ? (long)g->grp.members_n : -1);
+    check("  и второго члена нет", 1, out_by_name(&sp, "one.2") == NULL);
     check("warp: exclude_countries: [] — исключений нет, задан явно", 0,
           spec_load("version: 2\noutputs:\n  cf: { kind: warp, exclude_countries: [] }\n", &sp, msg, sizeof msg) < 0);
     g = out_by_name(&sp, "cf");

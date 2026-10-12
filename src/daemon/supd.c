@@ -329,8 +329,9 @@ static void mod_hello(struct supd *s, struct helper *h, const struct evline *e) 
 }
 
 /* awg (модуль steer-warpbox, evline.h): файл члена группы `kind: warp` переписан — перенастроить его
- * устройство сейчас, тем же awg_revive, что зовёт сторож, а не ждать прохода. Только член группы
- * этого помощника (warp_of): чужим выходом помощник распоряжаться не вправе. */
+ * устройство сейчас, тем же awg_revive, что зовёт сторож, а не ждать прохода; fresh 1 — живой туннель
+ * пересел на более быструю точку, и сессия нужна новая (awg_refresh). Только член группы этого
+ * помощника (warp_of): чужим выходом помощник распоряжаться не вправе. */
 static void ev_awg(struct supd *s, struct helper *h, const struct evline *e) {
     const char *name = evline_str(e, "out");
     if (!name || !s->d->have) return;
@@ -339,7 +340,9 @@ static void ev_awg(struct supd *s, struct helper *h, const struct evline *e) {
         fprintf(stderr, LOG_SW "%s %s просит перенастроить %s — это не член его группы\n", h->cmd, h->name, name);
         return;
     }
-    awg_revive(s->d->sp, o, o->device, NULL, 0);
+    long fresh = 0;
+    if (evline_int(e, "fresh", &fresh) == 0 && fresh == 1) awg_refresh(s->d->sp, o);
+    else awg_revive(s->d->sp, o, o->device, NULL, 0);
     if (s->d->watch) watchd_helper_changed(s->d->watch);
 }
 

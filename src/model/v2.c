@@ -1069,7 +1069,10 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
         if (!strcmp(t, "masque")) transport = WARP_MASQUE;
         else if (strcmp(t, "awg")) return fail(x, v, "%s: «%s» — awg или masque", w, t);
     }
-    long count = 3;
+    /* Один туннель по умолчанию (решение владельца 2026-10-12: «самый быстрый, не держа кучу
+     * интерфейсов»): самую быструю точку модуль держит у того же устройства сам (wbmain.c). count
+     * больше 1 — запасные туннели для мгновенного переключения при отказе и разные колонии сразу. */
+    long count = 1;
     if ((v = ynode_get(val, "count"))) {
         snprintf(w, sizeof(w), "%s.count", where);
         /* Предел — не константа: столько туннелей, сколько выходов с меткой даёт поле метки

@@ -340,6 +340,51 @@ static int pt_cmp(const void *a, const void *b) {
 
 /* ---- подбор --------------------------------------------------------------------------------- */
 
+enum { J_OK = 0, J_SILENT, J_TORN, J_NOTLS };
+
+/* Приговор точке ip:port на устройстве dev (рукопожатие уже есть — link_try): эхо, trace, meta. p —
+ * итог (loss, rtt, колония, страны). */
+static int judge(struct wb_scan *s, const char *dev, const char *meta_addr, struct wb_pt *p) {
+    struct wb_ping pg = { 0 };
+    int old, pr = -1, tr = -1;
+    if (wb_ns_enter(s->ns, &old) == 0) {
+        pr = wb_ping_burst("1.1.1.1", 10, 200, 2000, &pg);
+        if (pr == 0 && pg.got == 0) pr = wb_ping_burst("8.8.8.8", 10, 200, 2000, &pg);
+        if (pr == 0 && pg.got && !pg.torn) {
+            tr = trace_via(NULL, p);
+            if (tr == 0) meta_via(meta_addr, p);
+        }
+        wb_ns_leave(old);
+    }
+    awg_scan_down(dev, s->ns);
+    if (pr != 0 || !pg.got) return J_SILENT;
+    p->loss = pg.loss;
+    p->rtt = pg.rtt;
+    if (pg.torn) return J_TORN;
+    return tr != 0 ? J_NOTLS : J_OK;
+}
+
+/* Точка, которая уже стоит в туннеле (s->also_ip), — той же мерой, что кандидаты: смена на ходу
+ * сравнивает их на равных (wbmain.c, «самая быстрая точка»). */
+static void judge_also(struct wb_scan *s, const char *dev, const char *meta_addr) {
+    struct wb_pt *p = &s->also;
+    memset(p, 0, sizeof(*p));
+    snprintf(p->ip, sizeof(p->ip), "%s", s->also_ip);
+    p->port = s->also_port;
+    s->also_ok = 0;
+    if (link_try(s, dev, s->also_ip, s->also_port) != 0) {
+        LOG("текущая точка %s:%u — рукопожатия нет\n", s->also_ip, s->also_port);
+        return;
+    }
+    int j = judge(s, dev, meta_addr, p);
+    if (j == J_OK) {
+        s->also_ok = 1;
+        LOG("текущая точка %s:%u — потери %d%%, %d мс, колония %s\n", p->ip, p->port, p->loss, p->rtt, p->colo);
+    } else
+        LOG("текущая точка %s:%u — %s\n", p->ip, p->port,
+            j == J_SILENT ? "туннель молчит" : j == J_TORN ? "трафик обрывается" : "HTTPS через туннель не идёт");
+}
+
 int wb_scan_run(struct wb_scan *s) {
     s->out_n = 0;
     s->torn = s->rufilt = 0;
@@ -408,6 +453,7 @@ int wb_scan_run(struct wb_scan *s) {
             freeaddrinfo(r);
         }
     }
+    if (s->also_ip && s->also_ip[0]) judge_also(s, dev, meta_addr);
     size_t good = 0;
     int altleft = 2;
     /* Хватит, когда набралось want хороших — или want + 2 годных любого класса: если все колонии
@@ -416,7 +462,7 @@ int wb_scan_run(struct wb_scan *s) {
      * только пока годных меньше want: каждая такая — до трёх рукопожатий по WB_HS_WAIT_MS. */
     for (size_t oi = 0; oi < order_n && good < s->want && s->out_n < s->want + 2; oi++) {
         const char *ip = cand[order[oi]];
-        if (busy_ip(s, ip)) continue;
+        if (busy_ip(s, ip) || (s->also_ip && !strcmp(ip, s->also_ip))) continue;
         if (!alive[order[oi]] && s->out_n >= s->want) break;
         struct wb_pt p;
         memset(&p, 0, sizeof(p));
@@ -435,28 +481,15 @@ int wb_scan_run(struct wb_scan *s) {
             LOG("%s:%u — рукопожатия нет, через порт %u есть\n", ip, p0, alt);
             p.port = alt;
         }
-        struct wb_ping pg = { 0 };
-        int old, pr = -1, tr = -1;
-        if (wb_ns_enter(s->ns, &old) == 0) {
-            pr = wb_ping_burst("1.1.1.1", 10, 200, 2000, &pg);
-            if (pr == 0 && pg.got == 0) pr = wb_ping_burst("8.8.8.8", 10, 200, 2000, &pg);
-            if (pr == 0 && pg.got && !pg.torn) {
-                tr = trace_via(NULL, &p);
-                if (tr == 0) meta_via(meta_addr, &p);
-            }
-            wb_ns_leave(old);
-        }
-        awg_scan_down(dev, s->ns);
-        if (pr != 0 || !pg.got) { LOG("%s:%u — туннель молчит\n", ip, p.port); continue; }
-        p.loss = pg.loss;
-        p.rtt = pg.rtt;
-        if (pg.torn) {
+        int j = judge(s, dev, meta_addr, &p);
+        if (j == J_SILENT) { LOG("%s:%u — туннель молчит\n", ip, p.port); continue; }
+        if (j == J_TORN) {
             s->torn++;
             LOG("%s:%u — трафик пошёл и оборвался: так DPI рвёт туннель\n", ip, p.port);
             if (s->torn >= WB_TORN_GIVEUP && !s->out_n) break;
             continue;
         }
-        if (tr != 0) {
+        if (j == J_NOTLS) {
             p.cls = WB_NOTLS;
             snprintf(p.colo, sizeof(p.colo), "?");
             LOG("%s:%u — пинг идёт (%d мс), HTTPS через туннель — нет\n", ip, p.port, p.rtt);

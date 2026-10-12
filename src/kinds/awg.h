@@ -197,6 +197,11 @@ int awg_revive(const struct spec *sp, const struct output *o, const char *dev,
                const struct kind_name *names, size_t n);
 size_t awg_revive_names(const struct spec *sp, const struct output *o, struct kind_name *dst,
                         size_t max);
+/* Перенастроить живое устройство с НОВОЙ сессией: пиры снимаются и ставятся заново, ключи сессии
+ * сбрасываются, и первый же пакет начинает рукопожатие. Для смены точки на ходу (модуль
+ * steer-warpbox): прежняя сессия у новой точки (другая колония Cloudflare) неизвестна, и с ней
+ * туннель молчал бы до повторного рукопожатия по сроку WireGuard (около 15 с). 0 — перенастроено. */
+int awg_refresh(const struct spec *sp, const struct output *o);
 /* ПАМЯТЬ СТОРОЖА: замеры счётчиков между проходами (см. «здоровье» в awg.c) — в памяти, а не в
  * файле <state>/awg-<устройство>.hs. Зовут долгоживущие сторожа — `failover --loop` (watch.c) и
  * демон с --watch (watchd.c): on=1 — проход берёт и кладёт замеры в память процесса (проход

@@ -1329,6 +1329,9 @@ static int warp_waiting(const struct output *o) {
     return o->warp_of[0] && access(o->awg.conf, F_OK) != 0;
 }
 
+/* awg_refresh: следующий awg_configure снимает пиры и ставит заново (новая сессия). */
+static int g_awg_fresh;
+
 static int awg_configure(const struct spec *sp, const struct output *o, int loud,
                          const struct kind_name *names, size_t nn) {
     static struct awg_conf c;         /* ~20 КБ — не на стек телефона */
@@ -1454,8 +1457,8 @@ static int awg_configure(const struct spec *sp, const struct output *o, int loud
     /* Пиры, которых в файле нет, снимаются флагом REPLACE_PEERS. Ставится он ТОЛЬКО когда
      * состав пиров действительно разошёлся: флаг снимает всех и ставит заново, то есть рвёт
      * живые сессии, а повторный apply с тем же файлом не должен рвать ничего. */
-    int replace = 0;
-    if (!created) {
+    int replace = g_awg_fresh && !created;
+    if (!created && !replace) {
         static struct awg_live L;
         if (live_read(dev, kind, &L) == 0) {
             if (L.peer_n != c.peer_n) replace = 1;
@@ -1826,6 +1829,15 @@ int awg_revive(const struct spec *sp, const struct output *o, const char *dev,
         fprintf(stderr, LOG_W "%s: туннель молчит — заново разрешаю Endpoint и перенастраиваю\n", dev);
     if (awg_configure(sp, o, 0, names, n) != 0) return 0;
     return awg_healthy(o, dev);
+}
+
+int awg_refresh(const struct spec *sp, const struct output *o) {
+    if (warp_waiting(o)) return -1;
+    g_awg_fresh = 1;
+    int rc = awg_configure(sp, o, 0, NULL, 0);
+    g_awg_fresh = 0;
+    if (rc == 0) fprintf(stderr, LOG_I "%s: новая точка — туннель перенастроен с новой сессией\n", o->device);
+    return rc;
 }
 
 /* Имена Endpoint, которые починка разрешит, — чтобы сторож разрешил их заранее, не останавливая

@@ -32,7 +32,6 @@
 #include "platform.h"
 #include "registry.h"
 #include "spec.h"
-#include "spec.h"
 #include "awg.h"
 #include "wbconf.h"
 #include "wbns.h"
@@ -52,6 +51,7 @@
 #define WB_REG_RETRY_S 120
 #define WB_MQ_GRACE_S 15        /* туннелю MASQUE после новой точки — на рукопожатие и CONNECT */
 #define WB_BAD_S 1800           /* снятая точка не возвращается полчаса: молчит она чаще всего не случайно */
+#define WB_OPT_S 600            /* замер точек для смены на ходу, когда interval не задан (как у группы, v2.c) */
 
 static volatile sig_atomic_t g_stop;
 static void on_term(int sig) { (void)sig; g_stop = 1; }
@@ -99,6 +99,8 @@ struct wb {
     const struct output *g;
     struct member *m;
     size_t n;
+    struct member scan;         /* своя регистрация замера awg: точки мерятся не ключом живого туннеля */
+    time_t opt_at;              /* следующий замер «самой быстрой точки» */
     int ns;
     int obfs;
     int mq;                     /* transport: masque */
@@ -187,7 +189,7 @@ static void pt_load(const struct wb *w, struct member *m) {
 }
 
 /* Поставить точку члену: файл и событие демону. */
-static int member_set(struct wb *w, struct member *m, const struct wb_pt *p) {
+static int member_set(struct wb *w, struct member *m, const struct wb_pt *p, int fresh) {
     char ep[40];
     snprintf(ep, sizeof(ep), "%s:%u", p->ip, p->port);
     struct wb_conf c = { .reg = &m->reg, .endpoint = ep, .i1 = w->i1, .obfs = w->obfs, .addr = 1, .keepalive = 25 };
@@ -203,7 +205,7 @@ static int member_set(struct wb *w, struct member *m, const struct wb_pt *p) {
     pt_save(w, m);
     m->pt_saved = 1;
     member_say(m, -1);
-    evline_emit("awg", "out", EVLINE_STR, m->o->name, (const char *)NULL);
+    evline_emit("awg", "out", EVLINE_STR, m->o->name, "fresh", EVLINE_INT, (long)(fresh != 0), (const char *)NULL);
     return 0;
 }
 
@@ -279,7 +281,7 @@ static int assign(struct wb *w, const int *need) {
                         if (j != i && w->m[j].ip[0] && !strcmp(w->m[j].colo, s.out[k].colo)) clash = 1;
                     if (clash) continue;
                     used[k] = 1;
-                    member_set(w, &w->m[i], &s.out[k]);
+                    member_set(w, &w->m[i], &s.out[k], 0);
                     break;
                 }
             }
@@ -401,16 +403,13 @@ static int mq_point_busy(const struct wb *w, const struct member *self, const ch
     return 0;
 }
 
-/* Точки членам с need[i]: разом все пары адрес:порт, лучшие по задержке — разным членам. */
-static int mq_assign(struct wb *w, const int *need) {
-    struct member *key = NULL;
-    size_t nn = 0;
-    for (size_t i = 0; i < w->n; i++)
-        if (need[i]) { nn++; if (!key && wb_reg_has_masque(&w->m[i].reg)) key = &w->m[i]; }
-    if (!nn || !key) return nn ? -1 : 0;
+/* Пробы всех пар адрес:порт MASQUE разом, ключом члена key. Массив — в куче (free и затирание ключа —
+ * mq_tries_free); NULL — нет памяти. */
+#define MQ_TRIES (sizeof(MQ_PORTS) / sizeof(MQ_PORTS[0]) + 1)
+static struct mq_try *mq_probe_all(const struct wb *w, const struct member *key, size_t *tn_out) {
     size_t pn = sizeof(MQ_PORTS) / sizeof(MQ_PORTS[0]), tn = 0;
-    struct mq_try *t = calloc(pn + 1, sizeof(*t));
-    if (!t) return -1;
+    struct mq_try *t = calloc(MQ_TRIES, sizeof(*t));
+    if (!t) return NULL;
     for (size_t k = 0; k < pn + 1; k++) {
         const char *ep = k < pn ? key->reg.mq_ep4 : key->reg.mq_ep6;
         if (!ep[0] || mq_cfg(w, key, &t[tn].c) != 0) continue;
@@ -421,6 +420,26 @@ static int mq_assign(struct wb *w, const int *need) {
         if (pthread_create(&t[tn].th, NULL, mq_try_run, &t[tn]) == 0) tn++;
     }
     for (size_t k = 0; k < tn; k++) pthread_join(t[k].th, NULL);
+    *tn_out = tn;
+    return t;
+}
+
+static void mq_tries_free(struct mq_try *t) {
+    if (!t) return;
+    for (size_t k = 0; k < MQ_TRIES; k++) memset(t[k].c.priv, 0, sizeof(t[k].c.priv));
+    free(t);
+}
+
+/* Точки членам с need[i]: разом все пары адрес:порт, лучшие по задержке — разным членам. */
+static int mq_assign(struct wb *w, const int *need) {
+    struct member *key = NULL;
+    size_t nn = 0;
+    for (size_t i = 0; i < w->n; i++)
+        if (need[i]) { nn++; if (!key && wb_reg_has_masque(&w->m[i].reg)) key = &w->m[i]; }
+    if (!nn || !key) return nn ? -1 : 0;
+    size_t tn = 0;
+    struct mq_try *t = mq_probe_all(w, key, &tn);
+    if (!t) return -1;
     size_t okn = 0;
     for (size_t k = 0; k < tn; k++) {
         if (t[k].rc == 0) {
@@ -466,8 +485,7 @@ static int mq_assign(struct wb *w, const int *need) {
         member_say(m, -1);
         LOG("%s: точка MASQUE %s:%u\n", m->o->name, m->ip, m->port);
     }
-    for (size_t k = 0; k < tn; k++) memset(t[k].c.priv, 0, sizeof(t[k].c.priv));
-    free(t);
+    mq_tries_free(t);
     return rc;
 }
 
@@ -482,6 +500,117 @@ static int mq_alive(struct member *m) {
         return 0;
     }
     return member_alive(m) == 1;
+}
+
+/* ---- самая быстрая точка (решение владельца 2026-10-12: «самый быстрый, не держа кучу интерфейсов») --
+ *
+ * Туннель у члена один, а точек входа у Cloudflare много. Раз в interval группы (без него — WB_OPT_S)
+ * модуль меряет кандидатов и, найдя точку быстрее текущей больше чем на tolerance (без неё — 50 мс),
+ * переставляет точку у того же устройства — без нового интерфейса и без перезапуска:
+ *   awg — кандидаты и текущая точка меряются одинаково (wbscan.c, also) на устройствах подбора в своём
+ *     пространстве сети и СВОЕЙ регистрацией замера ({etc}/warp/<группа>-scan.reg): ключ живого
+ *     туннеля на втором устройстве увёл бы его сессию у Cloudflare; смена — файл члена и событие awg
+ *     с fresh: демон ставит пира заново (awg_refresh), и рукопожатие с новой точкой идёт сразу;
+ *   masque — пробы всех пар адрес:порт разом (как при подборе), смена — wb_mq_retarget: TUN тот же,
+ *     переподключается только соединение QUIC под ним.
+ * Смена колонии меняет адрес выхода в интернет: долгие соединения через туннель при ней рвутся
+ * (новые идут уже через быструю точку). Поэтому меняется только заметно лучшая точка — не хуже по
+ * потерям и быстрее больше чем на tolerance. Член, который сейчас не работает, сюда не попадает: его
+ * точку меняет сторож. */
+
+static int opt_tol(const struct wb *w) {
+    return w->g->grp.lat_tolerance_ms >= 0 ? w->g->grp.lat_tolerance_ms : GROUP_TOL_DEFAULT_MS;
+}
+
+static int opt_interval(const struct wb *w) {
+    return w->g->grp.lat_interval_s > 0 ? w->g->grp.lat_interval_s : WB_OPT_S;
+}
+
+/* Лучше ли точка b текущей a (потери в процентах, задержка в мс) с допуском tol. */
+static int opt_better(int a_loss, int a_rtt, int b_loss, int b_rtt, int tol) {
+    if (b_loss > a_loss) return 0;
+    return b_rtt + tol < a_rtt || (a_loss >= 30 && b_loss + 20 <= a_loss);
+}
+
+static void opt_awg(struct wb *w, size_t i) {
+    struct member *m = &w->m[i];
+    if (!w->scan.have_reg && member_reg(&w->scan, 0) != 0) return;
+    char (*bc)[4] = calloc(w->n + 1, sizeof(*bc));
+    char (*bi)[16] = calloc(w->n + 1, sizeof(*bi));
+    if (!bc || !bi) { free(bc); free(bi); return; }
+    size_t bcn = 0, bin = 0;
+    for (size_t j = 0; j < w->n; j++) {
+        if (j == i || !w->m[j].ip[0]) continue;
+        if (w->m[j].colo[0]) snprintf(bc[bcn++], 4, "%s", w->m[j].colo);
+        snprintf(bi[bin++], 16, "%.15s", w->m[j].ip);
+    }
+    struct wb_scan sc;
+    scan_setup(w, &sc, &w->scan.reg);
+    sc.busy_colo = (const char (*)[4])bc;
+    sc.busy_colo_n = bcn;
+    sc.busy_ip = (const char (*)[16])bi;
+    sc.busy_ip_n = bin;
+    sc.want = 2;
+    sc.quick = 1;
+    sc.rot = (unsigned)i;
+    sc.also_ip = m->ip;
+    sc.also_port = m->port;
+    LOG("%s: замер точек — есть ли быстрее %s:%u\n", m->o->name, m->ip, m->port);
+    int rc = wb_scan_run(&sc);
+    const struct wb_pt *b = NULL;
+    for (size_t k = 0; rc == 0 && k < sc.out_n && !b; k++)
+        if (sc.out[k].cls == WB_GOOD) b = &sc.out[k];
+    int tol = opt_tol(w);
+    if (b && sc.also_ok && opt_better(sc.also.loss, sc.also.rtt, b->loss, b->rtt, tol)) {
+        LOG("%s: точка быстрее — %s:%u (%d мс, потери %d%%, колония %s) вместо %s:%u (%d мс, потери %d%%)\n",
+            m->o->name, b->ip, b->port, b->rtt, b->loss, b->colo, m->ip, m->port, sc.also.rtt, sc.also.loss);
+        member_set(w, m, b, 1);
+    } else if (sc.also_ok)
+        LOG("%s: текущая точка не хуже найденных (%d мс, допуск %d мс)\n", m->o->name, sc.also.rtt, tol);
+    wb_scan_free(&sc);
+    free(bc);
+    free(bi);
+}
+
+static void opt_masque(struct wb *w, size_t i) {
+    struct member *m = &w->m[i];
+    if (!m->mq || !wb_reg_has_masque(&m->reg)) return;
+    size_t tn = 0;
+    struct mq_try *t = mq_probe_all(w, m, &tn);
+    if (!t) return;
+    int cur = -1, best = -1;
+    for (size_t k = 0; k < tn; k++) {
+        if (t[k].rc != 0) continue;
+        if (!strcmp(t[k].c.ep, m->ip) && t[k].c.port == m->port) { cur = (int)k; continue; }
+        if (mq_point_busy(w, m, t[k].c.ep, t[k].c.port)) continue;
+        if (best < 0 || t[k].rtt < t[best].rtt) best = (int)k;
+    }
+    int tol = opt_tol(w);
+    if (cur >= 0 && best >= 0 && opt_better(0, t[cur].rtt, 0, t[best].rtt, tol)) {
+        LOG("%s: точка MASQUE быстрее — %s:%u (%d мс) вместо %s:%u (%d мс)\n", m->o->name, t[best].c.ep,
+            t[best].c.port, t[best].rtt, m->ip, m->port, t[cur].rtt);
+        wb_mq_retarget(m->mq, t[best].c.ep, t[best].c.port);
+        snprintf(m->ip, sizeof(m->ip), "%.47s", t[best].c.ep);
+        m->port = t[best].c.port;
+        m->colo[0] = m->seen[0] = '\0';
+        m->pt_saved = 0;
+        m->mq_set_ms = (long)time(NULL);
+        member_say(m, -1);
+    } else if (cur >= 0)
+        LOG("%s: текущая точка MASQUE не хуже других (%d мс, допуск %d мс)\n", m->o->name, t[cur].rtt, tol);
+    mq_tries_free(t);
+}
+
+/* Замер «самой быстрой точки» — работающим членам, по сроку. */
+static void opt_pass(struct wb *w) {
+    if (time(NULL) < w->opt_at) return;
+    w->opt_at = time(NULL) + opt_interval(w);
+    for (size_t i = 0; i < w->n && !g_stop; i++) {
+        struct member *m = &w->m[i];
+        if (!m->ok || !m->ip[0]) continue;
+        if (w->mq) opt_masque(w, i);
+        else opt_awg(w, i);
+    }
 }
 
 /* Состояние группы для `steer status` (поле warp у группы, daemon/status.c): строками в каталоге
@@ -537,6 +666,9 @@ static int load(struct wb *w, const char *spec_path, const char *group) {
         if (m->awg) snprintf(m->conf_path, sizeof(m->conf_path), "%s", o->awg.conf);
         snprintf(m->reg_path, sizeof(m->reg_path), "%s/%s-%zu.reg", w->etc, group, w->n);
     }
+    w->scan.o = w->g;
+    w->scan.said = 2;
+    snprintf(w->scan.reg_path, sizeof(w->scan.reg_path), "%s/%s-scan.reg", w->etc, group);
     return w->n ? 0 : 2;
 }
 
@@ -563,6 +695,7 @@ int cmd_warp(const char *spec_path, const char *group) {
     int *need = calloc(w.n, sizeof(*need));
     if (!need) return 1;
     int said_up = -1;
+    w.opt_at = time(NULL) + opt_interval(&w);      /* подъём уже выбрал лучшую: первый замер — через срок */
     while (!g_stop) {
         /* Регистрации. */
         for (size_t i = 0; i < w.n && !g_stop; i++) {
@@ -639,6 +772,7 @@ int cmd_warp(const char *spec_path, const char *group) {
             said_up = up;
         }
         state_write(&w, why);
+        if (up) opt_pass(&w);
         nap(WB_CHECK_S);
     }
     free(need);
@@ -646,6 +780,7 @@ int cmd_warp(const char *spec_path, const char *group) {
         wb_mq_stop(w.m[i].mq);
         wb_reg_wipe(&w.m[i].reg);
     }
+    wb_reg_wipe(&w.scan.reg);
     return 0;
 }
 

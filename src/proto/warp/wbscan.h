@@ -46,11 +46,15 @@ struct wb_scan {
     unsigned rot;                   /* сдвиг портов: у каждого туннеля свой первый порт */
     int quick;                      /* короткий проход (смена маски) */
     size_t want;                    /* сколько хороших точек искать, прежде чем остановиться */
+    const char *also_ip;            /* точка, стоящая в туннеле: мерить и её (NULL — нет) */
+    unsigned also_port;
     /* итог */
     struct wb_pt *out;              /* найденные, по порядку пригодности */
     size_t out_n, out_cap;
     int torn;                       /* сколько точек оборвали трафик (DPI) */
     int rufilt;                     /* сколько отсеяно фильтром стран */
+    struct wb_pt also;              /* also_ip той же мерой (also_ok — HTTPS идёт) */
+    int also_ok;
     char why[256];
 };
 

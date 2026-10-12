@@ -179,7 +179,7 @@ rules:
 | `zapret` | `strategy` | обход DPI через nfqws; `strategy` — файл ключей nfqws (v1: `opts_file`, умолчание `{etc}/zapret/<имя>.opts`); не на телефоне |
 | `tgws` | `domain` | мост Telegram; `domain` обязателен; `on_fail` — только `drop` |
 | `group` | `members`, `pick`, `default`, `tolerance`, `interval`, `url`, `idle_timeout`, `weights` | группа выходов (ниже) |
-| `warp` | `count`, `transport`, `countries`, `exclude_countries`, `pick`, `tolerance`, `interval`, `url`, `idle_timeout`, `on_fail`, `over`, `ipv6` (`nat` или `off`) | Cloudflare WARP: группа из `count` туннелей «<имя>.<n>» — `awg` или, с `transport: masque`, MASQUE (TUN модуля); регистрацию и точки ведёт модуль `steer-warpbox` ([docs/warp.md](warp.md)) |
+| `warp` | `count`, `transport`, `countries`, `exclude_countries`, `pick`, `tolerance`, `interval`, `url`, `idle_timeout`, `on_fail`, `over`, `ipv6` (`nat` или `off`) | Cloudflare WARP: группа из `count` туннелей «<имя>.<n>» (по умолчанию один: самую быструю точку входа модуль держит у того же устройства) — `awg` или, с `transport: masque`, MASQUE (TUN модуля); регистрацию и точки ведёт модуль `steer-warpbox` ([docs/warp.md](warp.md)) |
 
 Почему VLESS пишется `kind: tunnel, protocol: vless`, а не `kind: vless`: туннель поверх потоков —
 общий стек, а протокол — его дайлер (docs/architecture.md, «Туннели: стек, дайлер, транспорт»).
