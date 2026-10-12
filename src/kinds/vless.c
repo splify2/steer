@@ -134,7 +134,8 @@ static int vless_helper(const struct spec *sp, const struct output *o, struct ki
     /* И исключение узлов: клиент отбирает кандидатов при старте. */
     kind_sig_excl(&h->sig, &o->vless.excl);
     /* И пул узлов: active, by, interval, silence клиент тоже читает при старте. */
-    if (o->vless.pool.active || o->vless.pool.by || o->vless.pool.interval_s || o->vless.pool.silence_s)
+    if (o->vless.pool.active || o->vless.pool.by || o->vless.pool.interval_s || o->vless.pool.silence_s ||
+        o->vless.pool.pick || o->vless.pool.tol_set)
         kind_sig_mix(&h->sig, &o->vless.pool, sizeof(o->vless.pool));
     return 0;
 }

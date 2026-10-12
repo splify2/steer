@@ -87,6 +87,12 @@ class Handler(socketserver.BaseRequestHandler):
         uuid, cmd, port, addr = req
         if uuid != self.server.uuid:
             return                          # чужой ключ — молчим, как настоящий сервер
+        # Задержка узла (--delay-ms): ответ на каждый запрос — не раньше неё. Стенду самых быстрых
+        # узлов (tests/run-latency.sh): проверка узла меряет время до первого байта ответа.
+        if self.server.delay_ms:
+            time.sleep(self.server.delay_ms / 1000.0)
+        if self.server.log:
+            print("req %s:%d" % (addr, port), flush=True)
 
         if cmd == CMD_UDP:
             if self.server.udp_relay:
@@ -318,6 +324,8 @@ def main():
     # стенда слушает на обычном адресе, который туннель считает законным узлом.
     ap.add_argument("--bind", default="127.0.0.1", help="адрес слушателя (IPv4 или IPv6)")
     ap.add_argument("--kbps", type=int, default=0, help="предел отдачи, КБ/с (0 — без предела)")
+    ap.add_argument("--delay-ms", type=int, default=0, help="задержка ответа на каждый запрос, мс")
+    ap.add_argument("--log", action="store_true", help="печатать каждый принятый запрос")
     ap.add_argument("--udp-relay", action="store_true",
                     help="UDP (команда 2) пересылать по адресу из запроса, а не эхом")
     a = ap.parse_args()
@@ -331,6 +339,8 @@ def main():
     srv.body_n = a.mb * 1024 * 1024
     srv.udp_relay = a.udp_relay
     srv.kbps = a.kbps
+    srv.delay_ms = a.delay_ms
+    srv.log = a.log
     # Наполнитель фиксированный: содержимое стенду безразлично, а генерация 64 КБ на
     # каждую порцию упиралась в питон, а не в туннель.
     srv.filler = bytes(i * 131 % 251 for i in range(64 * 1024))

@@ -1618,7 +1618,7 @@ static void t_sock_chunks(void) {
 
 /* ---- поддельный протокол: узел и связь ------------------------------------------------------ */
 
-struct fnode { char name[16]; char host[16]; int alive; };
+struct fnode { char name[16]; char host[16]; int alive; int delay_ms; };
 static struct fnode g_fn[80];
 
 struct fsess { int fd; const struct fnode *node; int flow_opens; };
@@ -1713,6 +1713,11 @@ static const struct dialer_ops f_ops = {
 
 static int f_probe(const void *node, int t, char *why, size_t n) {
     (void)t;
+    int dl = ((const struct fnode *)node)->delay_ms;
+    if (dl > 0) {
+        struct timespec ts = { dl / 1000, (long)(dl % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
     if (((const struct fnode *)node)->alive) return 0;
     snprintf(why, n, "узел стенда молчит");
     return -1;
@@ -1722,7 +1727,9 @@ static const struct pool_proto f_proto = { .ops = &f_ops, .probe = f_probe, .nam
 
 static int g_sel[80] = { 0, 1, 2, 3, 4 };
 
-/* Пул заново: active слотов, кандидаты 0..ncand-1, первый — узел 0. */
+static int g_pick, g_tol = -1;
+
+/* Пул заново: active слотов, кандидаты 0..ncand-1, первый — узел 0; выбор — g_pick и g_tol. */
 static void pool_new(int active, int by, int ncand, const char *out) {
     while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
     free(g_pl.slot);
@@ -1733,7 +1740,7 @@ static void pool_new(int active, int by, int ncand, const char *out) {
     struct pool_cfg pc = {
         .proto = &f_proto, .nodes = g_fn, .stride = sizeof(struct fnode), .sel = g_sel,
         .sel_n = (size_t)ncand, .first = 0, .checked = 1, .active = active, .by = by,
-        .interval_s = 60, .silence_s = 20, .out = out,
+        .interval_s = 60, .silence_s = 20, .out = out, .pick = g_pick, .tolerance_ms = g_tol,
     };
     const struct dialer *d = pool_setup(&pc);
     g_spare_want = 0;
@@ -2202,6 +2209,115 @@ static void t_pool_state(void) {
     rmdir(dir);
 }
 
+/* pick: latency — самые быстрые узлы подписки в одном туннеле: замер всех кандидатов, пересадка слота
+ * на быстрого с допуском, соединения прежнего живого узла доживают на нём, а смерть узла по-прежнему
+ * рвёт только его соединения. */
+static void t_pool_latency(void) {
+    for (int i = 0; i < 5; i++) { g_fn[i].alive = 1; g_fn[i].delay_ms = 0; }
+    g_fn[0].delay_ms = 120;
+    g_fn[1].delay_ms = 10;
+    g_fn[2].alive = 0;
+    g_fn[3].delay_ms = 50;
+    g_pick = POOL_PICK_LATENCY;
+    g_tol = -1;
+    pool_new(1, BY_CONNECTION, 4, NULL);
+    check(g_pl.cf.tolerance_ms == POOL_LAT_TOLERANCE_MS, "pick: latency — допуск по умолчанию 50 мс");
+    uint64_t t0 = pl_now_ms();
+    pl_lat_measure();
+    uint64_t took = pl_now_ms() - t0;
+    check(g_pl.lat[1] >= 0 && g_pl.lat[3] >= 0 && g_pl.lat[0] >= 0 && g_pl.lat[2] == -1 &&
+          g_pl.lat[1] < g_pl.lat[3] && g_pl.lat[3] < g_pl.lat[0],
+          "замер: время проверки каждого кандидата, не ответивший — -1");
+    check(took < 250, "замер: кандидаты меряются разом, а не один за другим");
+
+    /* Соединение на узле 0 до пересадки. */
+    struct conn *a = NULL;
+    for (uint16_t p = 52000; p < 52010 && !a; p++) a = pm_open(p, 0x0c0c0c0cu);
+    check(a && ((const struct pl_sess *)SESS(a))->nidx == 0, "стенд: соединение на узле 0");
+    if (!a) goto out;
+    struct flow_key ka = a->key;
+    unsigned gen0 = g_pl.slot[0].gen;
+    pl_lat_rebalance();
+    check(g_pl.slot[0].node == 1 && g_pl.slot[0].up && g_pl.slot[0].gen != gen0,
+          "пересадка: слот — на самый быстрый узел (1), поколение новое");
+    pm_sweep();
+    check(conn_find(&ka) != NULL, "пересадка: соединение прежнего живого узла не рвётся");
+    struct conn *b = NULL;
+    for (uint16_t p = 52100; p < 52110 && !b; p++) b = pm_open(p, 0x0c0c0c0du);
+    check(b && ((const struct pl_sess *)SESS(b))->nidx == 1, "пересадка: новое соединение — на быстрый узел");
+    if (!b) goto out;
+    struct flow_key kb = b->key;
+
+    /* Допуск: 3 быстрее 1 меньше чем на 50 мс — слот остаётся. */
+    pthread_mutex_lock(&g_pl.mu);
+    g_pl.lat[1] = 80;
+    g_pl.lat[3] = 40;
+    pthread_mutex_unlock(&g_pl.mu);
+    pl_lat_rebalance();
+    check(g_pl.slot[0].node == 1, "допуск: быстрее меньше чем на 50 мс — узел не меняется");
+    pthread_mutex_lock(&g_pl.mu);
+    g_pl.lat[1] = 200;
+    pthread_mutex_unlock(&g_pl.mu);
+    pl_lat_rebalance();
+    check(g_pl.slot[0].node == 3, "допуск: быстрее больше чем на 50 мс — узел меняется");
+
+    /* Новый узел (3) умер: замена — по замеру, а не по порядку (0: 120 мс быстрее 1: 200 мс). Сброс —
+     * только соединений умершего узла. */
+    struct conn *c = NULL;
+    for (uint16_t p = 52200; p < 52210 && !c; p++) c = pm_open(p, 0x0c0c0c0eu);
+    check(c && ((const struct pl_sess *)SESS(c))->nidx == 3, "стенд: соединение на узле 3");
+    if (!c) goto out;
+    struct flow_key kc = c->key;
+    g_fn[3].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 0, "смерть узла: замена — самый быстрый по замеру из живых");
+    pm_sweep();
+    check(!conn_find(&kc), "смерть узла: его соединение — в сброс");
+    check(conn_find(&ka) && conn_find(&kb), "смерть узла: соединения прежних живых узлов не тронуты");
+
+    /* tolerance: 0 — менять на любой более быстрый. */
+    g_tol = 0;
+    g_fn[3].alive = 1;
+    pool_new(1, BY_CONNECTION, 4, NULL);
+    check(g_pl.cf.tolerance_ms == 0, "tolerance: 0 — значение, а не «умолчание»");
+    pthread_mutex_lock(&g_pl.mu);
+    g_pl.lat[0] = 31; g_pl.lat[1] = 30; g_pl.lat[2] = -1; g_pl.lat[3] = 90;
+    pthread_mutex_unlock(&g_pl.mu);
+    pl_lat_rebalance();
+    check(g_pl.slot[0].node == 1, "tolerance: 0 — узел меняется и на 1 мс быстрее");
+
+    /* Файл состояния: замер кандидатов, и diag по-прежнему считает активные узлы по "index". */
+    char dir[] = "/tmp/poolmatch.XXXXXX";
+    if (mkdtemp(dir)) {
+        steer_set_state_dir(dir);
+        pool_new(1, BY_CONNECTION, 4, "lt");
+        pthread_mutex_lock(&g_pl.mu);
+        g_pl.lat[0] = 120; g_pl.lat[1] = 10; g_pl.lat[2] = -1;
+        pthread_mutex_unlock(&g_pl.mu);
+        __atomic_add_fetch(&g_pl.lat_round, 1, __ATOMIC_RELAXED);
+        pl_publish();
+        char path[200], buf[1024] = "";
+        snprintf(path, sizeof path, "%s/pm-lt", dir);
+        FILE *f = fopen(path, "r");
+        size_t r = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+        if (f) fclose(f);
+        buf[r] = '\0';
+        int idx = 0;
+        for (const char *q = buf; (q = strstr(q, "\"index\":")); q++) idx++;
+        check(strstr(buf, "\"pick\":\"latency\",\"latency\":{\"0\":120,\"1\":10,\"2\":-1}}") && idx == 1,
+              "файл состояния: замер кандидатов, не мерянный узел не назван, активный — один \"index\"");
+        unlink(path);
+        rmdir(dir);
+    }
+out:
+    while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
+    pm_drain(NULL, NULL);
+    for (int i = 0; i < 5; i++) { g_fn[i].alive = 1; g_fn[i].delay_ms = 0; }
+    g_pick = 0;
+    g_tol = -1;
+}
+
 /* ---- дайлер в цикле рабочего (DC_INLOOP) ------------------------------------------------------- */
 
 /* Поддельный дайлер без дескрипторов и без установщика: связь — готовая сессия, нагрузка лежит в ней же
@@ -2434,6 +2550,7 @@ static int pool_part(void) {
     t_pool_unproven();
     t_pool_retry_cap();
     t_pool_state();
+    t_pool_latency();
     t_inloop();
     return 0;
 }

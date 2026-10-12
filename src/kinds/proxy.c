@@ -134,7 +134,8 @@ static int proxy_helper(const struct spec *sp, const struct output *o, struct ki
         kind_sig_mix(&h->sig, &o->proxy.nodes[i], sizeof(o->proxy.nodes[i]));
     kind_sig_excl(&h->sig, &o->proxy.excl);
     /* Пул узлов (active, by, interval, silence) клиент читает при старте, как и выбор узлов. */
-    if (o->proxy.pool.active || o->proxy.pool.by || o->proxy.pool.interval_s || o->proxy.pool.silence_s)
+    if (o->proxy.pool.active || o->proxy.pool.by || o->proxy.pool.interval_s || o->proxy.pool.silence_s ||
+        o->proxy.pool.pick || o->proxy.pool.tol_set)
         kind_sig_mix(&h->sig, &o->proxy.pool, sizeof(o->proxy.pool));
     return 0;
 }

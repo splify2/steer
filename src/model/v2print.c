@@ -368,6 +368,8 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
         if (kk.pool.active > 1) { fk(&w, "active"); fprintf(f, "%d", kk.pool.active); }
         if (kk.pool.by != BY_CONNECTION) fs(&w, "by", group_by_name(kk.pool.by));
         if (kk.pool.interval_s) { fk(&w, "interval"); fprintf(f, "%d", kk.pool.interval_s); }
+        if (kk.pool.pick) fs(&w, "pick", "latency");
+        if (kk.pool.tol_set) { fk(&w, "tolerance"); fprintf(f, "%d", kk.pool.tolerance_ms); }
         if (kk.pool.silence_s) { fk(&w, "silence"); fprintf(f, "%d", kk.pool.silence_s < 0 ? 0 : kk.pool.silence_s); }
         if (kk.conf[0]) fpath(&w, "conf", kk.conf);
         if (kk.stream) { fk(&w, "stream"); fputs("true", f); }

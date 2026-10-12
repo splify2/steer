@@ -578,6 +578,8 @@ static const struct { const char *key; unsigned bit; const char *owner; } KIND_K
     { "by",           KK_SUB,    "kind: tunnel" },
     { "interval",     KK_SUB,    "kind: tunnel" },
     { "silence",      KK_SUB,    "kind: tunnel" },
+    { "pick",         KK_SUB,    "kind: tunnel" },
+    { "tolerance",    KK_SUB,    "kind: tunnel" },
     { "stream",       KK_STREAM, "kind: xsteer" },
     { "stream_port",  KK_STREAM, "kind: xsteer" },
     { "strategy",     KK_OPTS,   "kind: zapret" },
@@ -605,7 +607,8 @@ static int p_obfs(struct v2 *x, const struct ynode *n, const char *name, struct 
     return 0;
 }
 
-/* Пул узлов туннеля (struct tun_pool в spec.h, src/tunnel/pool.c): active, by, interval, silence.
+/* Пул узлов туннеля (struct tun_pool в spec.h, src/tunnel/pool.c): active, by, interval, silence,
+ * pick, tolerance.
  * Значения — здесь; что из них годится протоколу и как они сочетаются с nodes — у вида (parse). */
 static int p_tun_pool(struct v2 *x, const struct ynode *v, const char *w, const char *ks,
                       struct out_keys *k) {
@@ -625,6 +628,16 @@ static int p_tun_pool(struct v2 *x, const struct ynode *v, const char *w, const 
     } else if (!strcmp(ks, "interval")) {
         if (long_of(x, v, w, GROUP_INT_MIN_S, GROUP_INT_MAX_S, &lv)) return -1;
         k->pool.interval_s = (int)lv;
+    } else if (!strcmp(ks, "pick")) {
+        /* order — узлы по порядку предпочтения (прежнее); latency — самые быстрые по замеру. */
+        if (str_of(x, v, w, &sv)) return -1;
+        if (!strcmp(sv, "order")) k->pool.pick = 0;
+        else if (!strcmp(sv, "latency")) k->pool.pick = 1;
+        else return fail(x, v, "%s: «%s» — у туннеля нужен order или latency", w, sv);
+    } else if (!strcmp(ks, "tolerance")) {
+        if (long_of(x, v, w, 0, GROUP_TOL_MAX_MS, &lv)) return -1;
+        k->pool.tolerance_ms = (int)lv;
+        k->pool.tol_set = 1;
     } else {
         /* silence: 0 — порога нет (сроки ядра). Снизу 5 с: короче нескольких кругов повторной
          * передачи на медленной линии порог обрывал бы живые соединения. Сверху — предел ядра для
@@ -789,7 +802,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         }
         /* Ключи пула туннеля — до ключей группы: interval и by есть и там, с другим смыслом. */
         if (tunnel && (!strcmp(ks, "active") || !strcmp(ks, "by") || !strcmp(ks, "interval") ||
-                       !strcmp(ks, "silence"))) {
+                       !strcmp(ks, "silence") || !strcmp(ks, "pick") || !strcmp(ks, "tolerance"))) {
             if (p_tun_pool(x, v, w, ks, &k)) return -1;
             continue;
         }
@@ -980,6 +993,9 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             return fail(x, by_key, "%s: by — как раздавать соединения, он есть только у pick: balance",
                         where);
     } else {
+        if (tunnel && k.pool.tol_set && k.pool.pick != 1)
+            return fail(x, ynode_get(val, "tolerance"), "%s: tolerance — допуск смены узла по замеру, он "
+                        "есть только у pick: latency", where);
         /* Разбор и проверка ключей — у вида (один разбор на оба формата, kind.h). */
         if (kd->parse && kd->parse(&o, &k, x->e) != 0) return wrap(x, key);
         if (kd->check && kd->check(s, &o, x->e) != 0) return wrap(x, key);
