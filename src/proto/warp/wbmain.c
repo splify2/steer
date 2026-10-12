@@ -78,6 +78,7 @@ struct member {
     int ok;                     /* последний проход: жив */
     int fails;                  /* проходов подряд без жизни */
     int replaced;               /* замен подряд без успеха */
+    int pt_saved;               /* колония и страна точки записаны в .pt */
     char bad_ip[16];            /* точка, которую только что сняли: в подбор не берётся WB_BAD_S */
     time_t bad_until;
     time_t rekey_at;
@@ -181,6 +182,7 @@ static int member_set(struct wb *w, struct member *m, const struct wb_pt *p) {
     snprintf(m->seen, sizeof(m->seen), "%s", p->seen);
     LOG("%s: точка %s (колония %s%s%s)\n", m->o->name, ep, p->colo, p->seen[0] ? ", сайты видят " : "", p->seen);
     pt_save(w, m);
+    m->pt_saved = 1;
     evline_emit("awg", "out", EVLINE_STR, m->o->name, (const char *)NULL);
     return 0;
 }
@@ -280,12 +282,16 @@ static int member_alive(struct member *m) {
     if (awg_scan_stat(m->o->device, -1, &hs, &rx, &tx) != 0) return -1;
     struct wb_pt p;
     memset(&p, 0, sizeof(p));
-    if (hs > 0 && time(NULL) - hs <= WB_HS_FRESH) return 1;
+    /* Свежее рукопожатие — живо, и trace не нужен, если колония и страна уже известны; иначе (точка
+     * поставлена до перезапуска модуля прежней сборкой, файла .pt нет) trace заодно их узнаёт. */
+    int fresh = hs > 0 && time(NULL) - hs <= WB_HS_FRESH;
+    if (fresh && m->colo[0] && m->seen[0]) return 1;
     if (wb_trace_dev(m->o->device, &p) == 0) {
         if (p.colo[0]) snprintf(m->colo, sizeof(m->colo), "%s", p.colo);
+        if (p.seen[0]) snprintf(m->seen, sizeof(m->seen), "%s", p.seen);
         return 1;
     }
-    return 0;
+    return fresh;
 }
 
 /* Состояние группы для `steer status` (поле warp у группы, daemon/status.c): строками в каталоге
@@ -393,6 +399,7 @@ int cmd_warp(const char *spec_path, const char *group) {
                 continue;
             }
             if (al) {
+                if (m->colo[0] && m->seen[0] && !m->pt_saved) { pt_save(&w, m); m->pt_saved = 1; }
                 if (!m->ok) LOG("%s: работает (%s%s%s)\n", m->o->name, m->ip, m->colo[0] ? ", колония " : "", m->colo);
                 m->ok = 1;
                 m->fails = 0;
