@@ -341,7 +341,7 @@ static void ev_awg(struct supd *s, struct helper *h, const struct evline *e) {
         return;
     }
     long fresh = 0;
-    if (evline_int(e, "fresh", &fresh) == 0 && fresh == 1) awg_refresh(s->d->sp, o);
+    if (evline_int(e, "fresh", &fresh) && fresh == 1) awg_refresh(s->d->sp, o);
     else awg_revive(s->d->sp, o, o->device, NULL, 0);
     if (s->d->watch) watchd_helper_changed(s->d->watch);
 }

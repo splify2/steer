@@ -98,8 +98,15 @@ static void registry_snapshot(void) {
 static void cleanup_stale_routing(const struct spec *sp) {
     for (size_t i = 0; i < g_oldreg_n; i++) {
         int live = 0;
+        /* Живое — та же ПАРА «метка, таблица» у выхода с устройством. Одной метки мало: освободившуюся
+         * метку реестр отдаёт другому выходу, и правило прежнего владельца (`fwmark M lookup
+         * <его таблица>`) пережило бы его, уводя трафик нового в мёртвую таблицу. Так было на
+         * стенде QEMU 2026-10-13: WARP с двух туннелей сократили до одного, метку cf.2 получил
+         * kind: block, и его трафик пропадал в таблице steer_cf.2, не доходя до отказа. rule_drop
+         * снимает именно эту пару — правило нового владельца с другой таблицей не задевается. */
         for (size_t k = 0; k < sp->out_n; k++)
-            if (out_needs_mark(&sp->out[k]) && sp->out[k].mark == g_oldreg[i].mark) {
+            if (out_needs_mark(&sp->out[k]) && sp->out[k].mark == g_oldreg[i].mark &&
+                (!out_has_device(&sp->out[k]) ? 0 : sp->out[k].table == g_oldreg[i].table)) {
                 live = 1;
                 break;
             }
@@ -107,6 +114,12 @@ static void cleanup_stale_routing(const struct spec *sp) {
         char table[16];
         snprintf(table, sizeof(table), "%d", g_oldreg[i].table);
         rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
+        rule_drop6(g_oldreg[i].mark, g_oldreg[i].table);
+        /* Таблицу — только ничью: её номер реестр тоже мог отдать другому выходу. */
+        int tlive = 0;
+        for (size_t k = 0; k < sp->out_n && !tlive; k++)
+            tlive = out_has_device(&sp->out[k]) && sp->out[k].table == g_oldreg[i].table;
+        if (tlive) continue;
         const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
         run(flush);
         routing6_drop(g_oldreg[i].mark, g_oldreg[i].table);

@@ -33,12 +33,17 @@ static void block_emit(struct nft_rs *rs, const struct spec *sp, const struct ou
     for (int k = 0; k < 2; k++) {
         struct nft_chain *c = ir_chain_find(t, chains[k]);
         struct nft_rule *r = ir_rule(c);
+        /* Только исходное направление: ответ отказа (RST, ICMP) привязан к тому же соединению и
+         * несёт ту же метку — без условия output_block отбрасывал бы уже его, и клиент ждал бы
+         * своего срока вместо мгновенного отказа (стенд QEMU 2026-10-13). */
+        ir_x(r, "ct direction original");
         ir_x(r, "ct mark and 0x%08x == 0x%08x", STEER_MARK_MASK, o->mark);
         ir_x(r, "meta l4proto tcp");
         ir_counter(r, 0, 0);
         ir_x(r, "reject with tcp reset");
         ir_comment(r, "steer:block:%s", o->name);
         r = ir_rule(c);
+        ir_x(r, "ct direction original");
         ir_x(r, "ct mark and 0x%08x == 0x%08x", STEER_MARK_MASK, o->mark);
         ir_counter(r, 0, 0);
         ir_x(r, "reject with icmpx admin-prohibited");
