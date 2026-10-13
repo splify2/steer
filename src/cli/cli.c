@@ -55,6 +55,7 @@ static const struct cli_flag FLAGS[] = {
     {"--via",       NULL, NULL,         "только выходы с via: имя и выход, через который идёт туннель"},
     {"--direct",    NULL, NULL,         "проверять путь НАПРЯМУЮ, минуя обход"},
     {"--fast",      NULL, NULL,         "отдать запомненный ответ немедленно, не пересчитывая"},
+    {"--json",      NULL, NULL,         "печатать спеку JSON-объектом, а не YAML"},
     {"--loop",      NULL, "СЕК",        "не завершаться: повторять проход раз в СЕК секунд"},
     {"--node",      NULL, "N",          "номер узла подписки, с нуля; -1 — первый рабочий (по умолчанию)"},
     {"--timeout",   NULL, "СЕК",        "сколько ждать ответа узла (по умолчанию 5)"},
@@ -180,8 +181,12 @@ static const struct cli_cmd CMDS[] = {
  "steer spec convert читает спеку (v1 — JSON со schema, или уже v2) и печатает её\n"
  "спекой v2 (YAML, docs/spec-v2.md). Напечатанное даёт тот же набор правил, что и\n"
  "исходная спека. Файл спеки не меняется: вывод можно положить в {etc}/spec.yaml\n"
- "вместо {etc}/spec.json — обе сразу ядро не читает.",
- "--spec", 1, 0, 0, 0, 0},
+ "вместо {etc}/spec.json — обе сразу ядро не читает.\n"
+ "\n"
+ "--json печатает ту же спеку v2 JSON-объектом с теми же ключами (version: 2, outputs,\n"
+ "lists, dns, rules): для управляющего слоя, которому YAML нечем читать. --spec - — спека\n"
+ "со стандартного ввода. Печать устойчива по кругу: YAML → JSON → YAML даёт тот же текст.",
+ "--spec --json", 1, 0, 0, 0, 0},
 
 {"status", "Диагностика", "",
  "применённое состояние ядра, JSON",
@@ -934,6 +939,7 @@ void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
         else if (!strcmp(f->name, "--via"))        out->via = 1;
         else if (!strcmp(f->name, "--direct"))     out->direct = 1;
         else if (!strcmp(f->name, "--fast"))      out->fast = 1;
+        else if (!strcmp(f->name, "--json"))      out->json = 1;
         else if (!strcmp(f->name, "--insecure"))   out->insecure = 1;
         else if (!strcmp(f->name, "--loop"))       out->loop = cli_int(f->name, val, 1, 86400);
         /* Нижняя граница -1, а не 0: это часовой «первый рабочий», то же умолчание, и

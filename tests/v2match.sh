@@ -302,6 +302,13 @@ if [ -x "$XK" ]; then
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl7.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ключ active есть только у kind: tunnel"; then ok; else
         bad "active у interface — отказ «только у kind: tunnel»" "$out"; fi
+    # spec convert --json: та же спека JSON-объектом; YAML → JSON → YAML — тот же текст, JSON — неподвижная точка,
+    # спека читается и со стандартного ввода (--spec -).
+    printf 'version: 2\noutputs:\n  wg0: { kind: interface, device: wg0 }\n  wg1: { kind: interface, device: wg1 }\n  strict: { kind: group, pick: latency, members: [wg0, wg1], tolerance: 0 }\n' > "$tmp/cj.yaml"
+    (cd "$tmp" && "$XKA" spec convert --spec cj.yaml > j1.yaml && "$XKA" spec convert --json --spec j1.yaml > j.json &&
+        "$XKA" spec convert --spec - < j.json > j2.yaml && "$XKA" spec convert --json --spec - < j.json > j2.json) 2>/dev/null
+    if cmp -s "$tmp/j1.yaml" "$tmp/j2.yaml" && cmp -s "$tmp/j.json" "$tmp/j2.json" && grep -q '^{"version":2,' "$tmp/j.json" &&
+       grep -q '"tolerance":0' "$tmp/j.json"; then ok; else bad "spec convert --json — круг YAML → JSON → YAML" "$(cat "$tmp/j.json" 2>&1 | head -c 300)"; fi
 else
     bad "не собран $XK (make build/steer-xk)"
 fi
