@@ -162,6 +162,7 @@
 #include "fogroup.h"
 #include "nftcompat.h"
 #include "ctl.h"
+#include "ynode.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
 /* Выключатель движка — то же свойство, за которым следит init (vendor/der/init/steerd.rc). */
@@ -2018,18 +2019,42 @@ static void ctl_do_list_files(struct conn *c, struct cbuf *r) {
 
 /* Упомянут ли путь в тексте спеки — строкой JSON, как его пишет приложение ("…/lists/имя"),
  * или с экранированными косыми ("…\/lists\/имя": так пишут некоторые сериализаторы JSON). */
-static int ctl_spec_mentions(const struct cbuf *spec, const char *path) {
-    char want[PATH_MAX + 2], esc[2 * PATH_MAX + 2];
-    snprintf(want, sizeof(want), "\"%s\"", path);
-    size_t k = 0;
-    esc[k++] = '"';
-    for (const char *p = path; *p && k + 3 < sizeof(esc); p++) {
-        if (*p == '/') esc[k++] = '\\';
-        esc[k++] = *p;
+/* Упоминает ли спека файл path. Спека разбирается тем же ynode, что читает её ядро (YAML и JSON), и
+ * путь сверяется с КАЖДЫМ скаляром: прежде путь искался текстом только в двойных кавычках, а в YAML
+ * путь пишется без них — и rm-file удалял файл, на который спека ссылается. Относительный путь спеки
+ * v2 считается от её каталога (docs/spec-v2.md), так и сверяется. Спека не разобралась — поиск
+ * текстом, и без кавычек тоже: лишний отказ «in-use» дешевле пропавшего файла списка. */
+static int ynode_mentions(const struct ynode *n, const char *path, const char *dir) {
+    if (!n) return 0;
+    if (n->kind == YN_SCALAR) {
+        if (!n->str) return 0;
+        if (!strcmp(n->str, path)) return 1;
+        if (n->str[0] != '/' && dir[0]) {
+            char full[PATH_MAX];
+            if ((size_t)snprintf(full, sizeof(full), "%s/%s", dir, n->str) < sizeof(full) && !strcmp(full, path))
+                return 1;
+        }
+        return 0;
     }
-    esc[k++] = '"';
-    esc[k] = '\0';
-    return spec->p && (strstr(spec->p, want) || strstr(spec->p, esc));
+    size_t cnt = n->kind == YN_MAP ? 2 * n->len : n->len;
+    for (size_t i = 0; i < cnt; i++)
+        if (ynode_mentions(n->items[i], path, dir)) return 1;
+    return 0;
+}
+
+static int ctl_spec_mentions(const struct cbuf *spec, const char *path, const char *spec_path) {
+    if (!spec->p) return 0;
+    char dir[PATH_MAX] = "";
+    const char *sl = spec_path ? strrchr(spec_path, '/') : NULL;
+    if (sl && (size_t)(sl - spec_path) < sizeof(dir)) snprintf(dir, sizeof(dir), "%.*s", (int)(sl - spec_path), spec_path);
+    struct err e = { { 0 } };
+    struct ydoc *d = ydoc_parse_buf(spec->p, strlen(spec->p), "spec", &e);
+    if (d) {
+        int m = ynode_mentions(ydoc_root(d), path, dir);
+        ydoc_free(d);
+        return m;
+    }
+    return strstr(spec->p, path) != NULL;
 }
 
 /* rm-file <имя> — убрать файл из каталога списков. Ответ: "code":0, "name", "removed" (false —
@@ -2052,10 +2077,11 @@ static void ctl_do_rm_file(struct conn *c, struct cbuf *r) {
         return;
     }
     struct cbuf spec = {0};
-    int have = ctl_read_file(plat_spec_resolve(q->cf->spec), &spec, 4 * CTL_BODY_MAX);
+    const char *spec_path = plat_spec_resolve(q->cf->spec);
+    int have = ctl_read_file(spec_path, &spec, 4 * CTL_BODY_MAX);
     if (have < 0) {
         resp_error(r, "internal", "не удалось прочитать сохранённую спеку");
-    } else if (have == 1 && ctl_spec_mentions(&spec, path)) {
+    } else if (have == 1 && ctl_spec_mentions(&spec, path, spec_path)) {
         resp_error(r, "in-use", "файл упомянут в сохранённой спеке — сначала примените спеку без него");
     } else {
         int removed = unlink(path) == 0;
@@ -2836,15 +2862,10 @@ static int srv_lan_budget(struct ctl_srv *s);
  * его не делает. */
 static int srv_table_flushed(struct ctl_srv *s) {
     if (!s->d.have || !ctl_enabled()) return 0;
-    size_t routed = 0;
-    for (size_t i = 0; i < s->d.sp->out_n; i++) {
-        const struct output *o = &s->d.sp->out[i];
-        if (out_has_device(o) && o->mark && o->table) routed++;
-    }
-    if (!routed) return 0;
-    char list[512];
-    int miss = rulewd_missing(s->d.sp, list, sizeof(list));
-    return miss >= 0 && (size_t)miss < routed;
+    /* Прямо: стоит ли правило хоть у одного выхода. Прежде — «не у всех выходов не хватает правила»,
+     * а нехватку у выхода с ПУСТОЙ таблицей rulewd нарочно не считает: после штатного `steer down`
+     * (таблицы опустошены, правила сняты) выходило «правила стоят», и сторож возвращал снятое. */
+    return rulewd_present(s->d.sp) > 0;
 }
 
 static void srv_kcheck(void *arg) {

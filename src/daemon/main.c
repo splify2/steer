@@ -252,7 +252,8 @@ int main(int argc, char **argv) {
         if (strcmp(arg, "convert") != 0)
             die("steer spec понимает только convert, а не «%s»", arg);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
-        if (spec_print_v2(stdout, &cfg, &e) < 0) err_die(&e);
+        if ((a.json ? spec_print_v2_json(stdout, &cfg, &e) : spec_print_v2(stdout, &cfg, &e)) < 0)
+            err_die(&e);
         return fflush(stdout) == 0 ? 0 : 1;
     }
     /* status и diag при живом демоне этой спеки — его ответом (ask_daemon): ход перебора узлов,

@@ -677,6 +677,7 @@ v6-двойник (раздел «IPv6 правил» ниже), резолве�
   | `groups` | Группы спеки v2 (`kind: group`): `pick` order/latency/manual/balance, вложенные группы, команда `select`; у выхода-группы в `status` — объект `group` (ниже). |
   | `balance_by` | Ключ `by` у группы `pick: balance` (docs/spec-v2.md): `connection`, `site`, `site_client` — раздача новых соединений случайно или хешем адресов. |
   | `exclude` | Ключи `exclude` (страны по флагу в имени узла) и `exclude_name` (куски имени) у выхода `kind: tunnel` спеки v2 ([spec-v2.md](spec-v2.md)); у узла в `*-nodes` — поля `cc` и `excluded` (§6). |
+  | `spec_json` | `steer spec convert --json [--spec ФАЙЛ\|-]` печатает спеку v2 JSON-объектом с теми же ключами, что YAML-печать; по кругу YAML → JSON → YAML текст тот же. |
   | `pool_latency` | `pick: latency` и `tolerance` у `kind: tunnel` спеки v2 — самые быстрые узлы подписки по замеру; у объекта `vless` (`proxy`) в `status` — поля `pick` и `latency` (ниже). |
   | `active_nodes` | Пул узлов туннеля — ключи `active`, `by`, `interval`, `silence` у выхода `kind: tunnel` спеки v2 ([spec-v2.md](spec-v2.md), «Пул узлов туннеля»); у выхода в `status` — объект `vless` (`proxy`) с полем `active` (ниже), в `helper` демона — поле `active`. |
   | `dns_groups` | Группа серверов DNS в `dns.upstreams` спеки v2 — `{ servers, mode: race \| failover }` ([spec-v2.md](spec-v2.md), раздел `dns`); годится в `dns.upstream`, `dns.other` и `dns` правила; в `dns-log` — `proto: "group"` с членами. |

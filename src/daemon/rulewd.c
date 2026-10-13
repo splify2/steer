@@ -268,6 +268,23 @@ int rulewd_missing(const struct spec *sp, char *list, size_t n) {
     return missing_x(NULL, sp, list, n, NULL);
 }
 
+int rulewd_present(const struct spec *sp) {
+    char *rules, *rules6;
+    if (!sp || rules_read(&rules, &rules6) != 0) return -1;
+    static char routes[8192];
+    int cnt = 0;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if (!out_has_device(o) || !o->mark || !o->table) continue;
+        if (rtnl_routes_text(o->table, routes, sizeof(routes)) != 0) continue;
+        struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+        if (f.known && f.rule) cnt++;
+    }
+    free(rules);
+    free(rules6);
+    return cnt;
+}
+
 /* Приоритет, с которым вернуть правило семейства fam с меткой mark: свой у платформы, иначе тот,
  * что был у снятого (0 — не знаем, ядро выберет само). */
 static uint32_t pref_of(const struct rulewd *r, int fam, uint32_t mark) {

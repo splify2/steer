@@ -387,11 +387,16 @@ STEER_ENGINE=/bin/false "$BIN" apply $S >/dev/null 2>&1
 check "  выход o вернули apply — правило снова стоит" "4" "$(ours)"
 sleep 6   # проход сторожа после apply (выходы изменились) — до steer down, а не посреди него
 
+# Строки «разъехалась» до steer down — их быть не должно (проверка у перезапуска ниже); после down
+# проход сторожа возвращает снятое сам (ctl.c, srv_table_flushed), и они законны.
+raz0="$(grep -c 'разъехал' "$tmp/d.err")"
 # steer down движком при живом демоне (так снимает правила init): таблиц и правил нет — не починка.
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
 check "steer down при живом демоне: наших правил нет" "0" "$(ours)"
 sleep 3
-check "  repaired не пришло, правила не вернулись" "2 0" "$(reps) $(ours)"
+# Правила вернёт ближайший проход сторожа (так задумано: ручной down при живом демоне — не
+# остановка службы), и когда — зависит от его срока; здесь проверяется только, что это не починка.
+check "  repaired не пришло" "2" "$(reps)"
 
 # SIGTERM: демон гасит помощников и резолвер; правила остаются до steer down.
 kill $SUB 2>/dev/null; wait $SUB 2>/dev/null; SUB=""
@@ -413,7 +418,7 @@ check "  правил выходов нет" "0" "$(ip rule show | grep -c 'fwma
 
 # Перезапуск после steer down: выбор устройств остался в active, правил в ядре нет. Первый проход
 # — после стартового apply, и «разъехалась» он не говорит.
-check "старт: при первом запуске строк «разъехалась» нет" "0" "$(grep -c 'разъехал' "$tmp/d.err")"
+check "старт: при первом запуске строк «разъехалась» нет" "0" "$raz0"
 check "  в active остался выбор прежнего демона" "1" "$(grep -c '^vpn sw' "$tmp/st/active")"
 STEER_SUPERVISE_EXE="$tmp/helper" unshare -m sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" \
     daemon --watch --supervise --apply --socket \"$tmp/steer.sock\" $S \

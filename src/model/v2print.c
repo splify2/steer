@@ -615,3 +615,98 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
     }
     return ferror(f) ? (e ? err_set(e, "не удалось напечатать спеку", NULL) : -1) : 0;
 }
+
+/* ---- та же спека JSON-объектом (`steer spec convert --json`) -------------------------------------
+ *
+ * Зачем: управляющий слой на роутере (splify2: jsonfilter, ucode, ответы ubus) читает JSON, а спека на
+ * диске — YAML (решение владельца 2026-10-13). Печать не вторая, а та же: текст spec_print_v2 разбирается
+ * тем же ynode, и дерево выходит JSON-объектом. Так ключи, порядок и значения у двух печатей одни и не
+ * могут разойтись, а YAML → JSON → YAML даёт тот же текст.
+ *
+ * Тип скаляра — по записи, как читает разбор спеки (YAML 1.2, базовая схема): в кавычках — строка;
+ * без кавычек `true`/`false` — логическое, целое или десятичное число — число, `null`, `~` и пусто —
+ * null; остальное — строка. spec_print_v2 берёт в кавычки всё, что без них прочлось бы не строкой
+ * («NO», «1.0» в имени), поэтому строковые значения спеки здесь строками и остаются. */
+#include <stdlib.h>
+#include "ynode.h"
+
+/* Строка JSON: кавычки, обратная косая и управляющие — экранируются, UTF-8 — как есть. Своя, а не
+ * jsonw_str: модель компонуется и без src/lib/jsonw.c (стенды spec*match). */
+static void json_qstr(FILE *f, const char *s) {
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') { fputc('\\', f); fputc(*p, f); }
+        else if (*p == '\n') fputs("\\n", f);
+        else if (*p == '\t') fputs("\\t", f);
+        else if (*p == '\r') fputs("\\r", f);
+        else if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+        else fputc(*p, f);
+    }
+    fputc('"', f);
+}
+
+static int json_plain_number(const char *s) {
+    const char *p = s;
+    if (*p == '-' || *p == '+') p++;
+    if (!*p) return 0;
+    int digits = 0, dot = 0;
+    for (; *p; p++) {
+        if (*p >= '0' && *p <= '9') digits++;
+        else if (*p == '.' && !dot) dot = 1;
+        else return 0;
+    }
+    if (!digits) return 0;
+    /* Ведущий ноль у целого (`012`) JSON не принимает — пусть будет строкой (так спека его и не пишет). */
+    const char *d = s + (*s == '-' || *s == '+');
+    if (d[0] == '0' && d[1] && d[1] != '.') return 0;
+    return 1;
+}
+
+static void json_node(FILE *f, const struct ynode *n) {
+    if (!n) { fputs("null", f); return; }
+    if (n->kind == YN_MAP) {
+        fputc('{', f);
+        for (size_t i = 0; i < n->len; i++) {
+            if (i) fputc(',', f);
+            json_qstr(f, n->items[2 * i]->str);
+            fputc(':', f);
+            json_node(f, n->items[2 * i + 1]);
+        }
+        fputc('}', f);
+        return;
+    }
+    if (n->kind == YN_SEQ) {
+        fputc('[', f);
+        for (size_t i = 0; i < n->len; i++) {
+            if (i) fputc(',', f);
+            json_node(f, n->items[i]);
+        }
+        fputc(']', f);
+        return;
+    }
+    const char *s = n->str ? n->str : "";
+    if (n->style == YS_PLAIN && !n->tag) {
+        if (!strcmp(s, "true") || !strcmp(s, "false")) { fputs(s, f); return; }
+        if (!*s || !strcmp(s, "null") || !strcmp(s, "~")) { fputs("null", f); return; }
+        if (json_plain_number(s)) { fputs(*s == '+' ? s + 1 : s, f); return; }
+    }
+    json_qstr(f, s);
+}
+
+int spec_print_v2_json(FILE *f, const struct spec *s, struct err *e) {
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *m = open_memstream(&buf, &len);
+    if (!m) return e ? err_set(e, "недостаточно памяти для печати спеки", NULL) : -1;
+    int rc = spec_print_v2(m, s, e);
+    if (fclose(m) != 0 && rc == 0) rc = e ? err_set(e, "недостаточно памяти для печати спеки", NULL) : -1;
+    if (rc != 0) { free(buf); return rc; }
+    struct err pe = { { 0 } };
+    struct ydoc *d = ydoc_parse_buf(buf, len, "spec", &pe);
+    free(buf);
+    if (!d) return e ? err_set(e, "печать спеки не разобралась: %s", pe.msg) : -1;
+    json_node(f, ydoc_root(d));
+    fputc('\n', f);
+    ydoc_free(d);
+    return ferror(f) ? (e ? err_set(e, "не удалось напечатать спеку", NULL) : -1) : 0;
+}

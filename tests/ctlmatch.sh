@@ -377,6 +377,15 @@ cp "$tmp/L.yaml" "$tmp/spec.yaml"
 r="$(ctl rm-file yt.lst)"
 check "rm-file файла из сохранённой спеки — in-use, файл на месте" "in-use yes" \
     "$(printf '%s' "$r" | j error) $([ -e "$L/yt.lst" ] && echo yes || echo no)"
+# Спека YAML: путь без кавычек, и путь относительный — от каталога спеки (docs/spec-v2.md). Прежде путь
+# искался текстом только в двойных кавычках, и такой файл удалялся.
+printf 'version: 2\noutputs:\n  vpn: { kind: interface, device: lo }\nlists:\n  p: { prefixes_file: %s }\nrules:\n  - { name: p, to: [p], out: vpn }\n' "$L/yt.lst" > "$tmp/spec.yaml"
+check "rm-file файла из спеки YAML (путь без кавычек) — in-use" "in-use yes" \
+    "$(ctl rm-file yt.lst | j error) $([ -e "$L/yt.lst" ] && echo yes || echo no)"
+rel="${L#"$tmp"/}"
+printf 'version: 2\noutputs:\n  vpn: { kind: interface, device: lo }\nlists:\n  p: { prefixes_file: %s/yt.lst }\nrules:\n  - { name: p, to: [p], out: vpn }\n' "$rel" > "$tmp/spec.yaml"
+check "rm-file файла по относительному пути спеки YAML — in-use" "in-use yes" \
+    "$(ctl rm-file yt.lst | j error) $([ -e "$L/yt.lst" ] && echo yes || echo no)"
 cp "$tmp/spec.keep" "$tmp/spec.yaml"
 check "rm-file после смены спеки — удалён" "true" "$(ctl rm-file yt.lst | j removed)"
 # Временный файл, брошенный убитым обработчиком, сервер убирает при старте.
