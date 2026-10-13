@@ -245,7 +245,9 @@ mk_ipk() {
     cp "build/scripts/$ipk_scr.postinst" "$ipk_root/CONTROL/postinst"
     cp "build/scripts/$ipk_scr.prerm" "$ipk_root/CONTROL/prerm"
     cp "build/scripts/$ipk_scr.postrm" "$ipk_root/CONTROL/postrm"
-    chmod 0755 "$ipk_root/CONTROL/postinst" "$ipk_root/CONTROL/prerm" "$ipk_root/CONTROL/postrm"
+    cp "build/scripts/$ipk_scr.preinst" "$ipk_root/CONTROL/preinst"
+    chmod 0755 "$ipk_root/CONTROL/postinst" "$ipk_root/CONTROL/prerm" "$ipk_root/CONTROL/postrm" \
+        "$ipk_root/CONTROL/preinst"
     # Без -o/-g: нынешний ipkg-build их не понимает (они были в старых версиях), а
     # молчаливый отказ здесь означал бы релиз без половины пакетов.
     if "$PWD/$IPKG" "$ipk_root" "$PWD/$OUT" >/dev/null 2>&1; then
@@ -488,6 +490,30 @@ EOF
     printf '#!/bin/sh\nexit 0\n' > build/scripts/noop.postinst
     cp build/scripts/noop.postinst build/scripts/noop.prerm
     cp build/scripts/noop.postinst build/scripts/noop.postrm
+    # ПЕРЕД ОБНОВЛЕНИЕМ ЯДРА (apk pre-upgrade, opkg preinst — новые файлы ещё не на месте, стоит
+    # прежний бинарник): спеку v1 (JSON со `schema`, без `version`) переводит ПРЕЖНЕЕ ядро — ядро 2.1
+    # её не читает (решение владельца: v1 вырезана к 2.1). Перевод — `steer spec convert` в
+    # spec.yaml рядом, прежняя спека — в spec.json.v1.bak; не вышло — всё остаётся как было, а новое
+    # ядро откажет понятным текстом. splify2 делает то же сам (steer_install), этот хук — для
+    # обновления мимо него: apk руками, install.sh. sysupgrade с сохранёнными настройками сюда не
+    # попадает — прежнего бинарника там уже нет.
+    cat > build/scripts/steer.preinst <<'PREINST'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+S=/etc/steer/spec.json
+Y=/etc/steer/spec.yaml
+[ -f "$S" ] && [ ! -e "$Y" ] && [ -x /usr/sbin/steer ] || exit 0
+grep -q '"schema"' "$S" 2>/dev/null || exit 0
+grep -q '"version"' "$S" 2>/dev/null && exit 0
+if /usr/sbin/steer spec convert --spec "$S" > "$Y.new" 2>/dev/null && [ -s "$Y.new" ]; then
+	cp "$S" "$S.v1.bak" && mv "$Y.new" "$Y" && rm -f "$S"
+else
+	rm -f "$Y.new"
+fi
+exit 0
+PREINST
+    printf '#!/bin/sh\nexit 0\n' > build/scripts/mod.preinst
+    cp build/scripts/mod.preinst build/scripts/noop.preinst
     # Включение входа fw4 (usr/share/nftables.d) уходит с пакетом — fw4 перечитывает набор без него.
     printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n[ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null\nexit 0\n' > build/scripts/steer.postrm
     chmod +x build/scripts/*
@@ -528,6 +554,7 @@ EOF
                --info name:$_n --info version:$VERSION-r1 \
                --info description:'$_ds' \
                --info arch:$arch $_dinfo \
+               --script pre-upgrade:build/scripts/$_sk.preinst \
                --script post-install:build/scripts/$_sk.postinst \
                --script post-upgrade:build/scripts/$_sk.postinst \
                --script pre-deinstall:build/scripts/$_sk.prerm \
