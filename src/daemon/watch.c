@@ -134,7 +134,7 @@ static void fl_done(void *arg, int res) {
     f->run = NULL;
     /* masquerade правилом iptables (телефон): netd при перезапуске перестраивает iptables, и
      * наши правила пропадают — вернуть их (iptables_masq_ensure в apply.c). Смотрит он на
-     * кандидатов выхода (devices), а не на выбранное проходом устройство. */
+     * кандидатов выхода (их устройства), а не на выбранное проходом устройство. */
     if (plat()->iptables_masq && watch_masq_due(&f->masq_at, f->eventful))
         iptables_masq_ensure(&g_loop_spec);
     f->eventful = 0;

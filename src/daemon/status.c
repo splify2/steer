@@ -105,9 +105,7 @@ int status_fast(FILE *out) {
     return 0;
 }
 
-/* ГРУППА СПЕКИ v2 (kind: group, docs/contract-v1.md, §2): как она выбирает и что выбрала. Только
- * у групп, которые видны снаружи группой: пул v1 (`devices`) выглядит прежним выходом interface, и
- * его объект не меняется (контракт со splify2 меняется в паре). Поля — только добавлены:
+/* ГРУППА СПЕКИ v2 (kind: group, docs/contract-v1.md, §2): как она выбирает и что выбрала. Поля — только добавлены:
  *   pick     — order | latency | manual | balance;
  *   members  — члены по порядку (имена выходов, в том числе вложенных групп);
  *   selected — член, чей лист сейчас несёт трафик группы (null — отказ или сторож ещё не проходил);
@@ -184,7 +182,7 @@ static void warp_emit(FILE *out, const struct output *o) {
 
 static void group_emit(FILE *out, const struct spec *sp, const struct output *o) {
     const struct group_cfg *g = out_group(o);
-    if (!g || g->shown) return;
+    if (!g) return;
     fprintf(out, ",\"group\":{\"pick\":\"%s\",\"members\":[", group_pick_name(g->pick));
     for (size_t k = 0; k < g->members_n; k++)
         fprintf(out, "%s\"%s\"", k ? "," : "", spec_out(sp, g->members[k])->name);
@@ -323,8 +321,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
          * от упавшего устройства (docs/contract-v1.md, §2). */
         const int failed = out_has_device(&sp->out[i]) && sp->out[i].failed;
         if (failed) up = 0;
-        /* Вид — каким выход виден снаружи: группа из пула `devices` спеки v1 — interface, как
-         * была (контракт со splify2 меняется в паре, шаг 3 из 1.9). */
+        /* Вид — каким выход виден снаружи. */
         fprintf(out, "%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", sp->out[i].name,
                out_kind_name(&sp->out[i]));
         /* Через какой выход идёт туннель этого выхода (`via`, см. «вложенные выходы» в

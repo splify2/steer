@@ -41,7 +41,7 @@ static int zapret_parse(struct output *o, const struct out_keys *k, struct err *
      * только то, ЧТО с ним по дороге сделает nfqws. Названное устройство здесь —
      * почти наверняка описка (человек копировал выход-туннель), и принять его
      * молча значило бы обещать маршрутизацию, которой не будет. */
-    if (o->device[0] || k->devices_n)
+    if (o->device[0])
         return err_set(e, "outputs.%s: у kind zapret нет устройства — трафик идёт обычным путём",
             o->name);
     /* Путь выводится из имени выхода — тот же довод, что у conf у xsteer: два
@@ -55,7 +55,7 @@ static int zapret_parse(struct output *o, const struct out_keys *k, struct err *
     else if (o->zp.opts[0] != '/' || !label_ok(o->zp.opts)) {
         char msg[192];
         snprintf(msg, sizeof(msg), "outputs.%s: %s должен быть абсолютным путём без кавычек",
-                 o->name, out_key(k, "opts_file", "strategy"));
+                 o->name, "strategy");
         return err_set(e, "%s", msg);
     }
     return 0;

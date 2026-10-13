@@ -2,13 +2,12 @@
  * docs/spec-v2.md).
  *
  * Спека v2 — YAML (или JSON: libyaml читает и его) с `version: 2` наверху. Дерево строит
- * src/lib/ynode.c, этот файл обходит его и собирает ту же модель, что перевод v1 (model/v1.c):
+ * src/lib/ynode.c, этот файл обходит его и собирает модель:
  * правила, списки, клиенты, выходы и группы. Остальной движок формата не видит.
  *
- * ЧЕМ ОТЛИЧАЕТСЯ ОТ v1 ПО ПОВЕДЕНИЮ РАЗБОРА:
- *   - НЕИЗВЕСТНЫЙ КЛЮЧ — ОТКАЗ. v1 пропускал незнакомые ключи ради совместимости вперёд внутри
- *     мажора, и цена этого известна: опечатка в ключе молча не действовала. У v2 совместимость
- *     вперёд держит `version`, а опечатка называется строкой и столбцом;
+ * ПОВЕДЕНИЕ РАЗБОРА:
+ *   - НЕИЗВЕСТНЫЙ КЛЮЧ — ОТКАЗ: опечатка в ключе молча не действовала бы. Совместимость вперёд
+ *     держит `version`, а опечатка называется строкой и столбцом;
  *   - ключ чужого вида — тоже отказ, по битам kind_ops.keys, с тем же доводом;
  *   - все отказы — «файл:строка:столбец: …» (ynode_err): спеку v2 пишет человек руками, и
  *     сообщение без места в тексте заставляло бы искать;
@@ -16,8 +15,7 @@
  *     же: несуществующее имя и круг в группах — отказ.
  *
  * КЛЮЧИ ВИДОВ разбирает не этот файл, а сам вид: здесь значения ключей раскладываются в struct
- * out_keys (то же, что делает v1.c из JSON), и kind_ops.parse проверяет и толкует их одинаково для
- * обоих форматов. Отказ вида приходит без места в тексте — его дополняет место выхода.
+ * out_keys , и kind_ops.parse проверяет и толкует их. Отказ вида приходит без места в тексте — его дополняет место выхода.
  *
  * ЧЕГО ДВИЖОК ЕЩЁ НЕ УМЕЕТ, разбор принимает, проверяет и хранит в модели, но спеку отвергает
  * отказом «ещё не поддерживается в этой версии движка: …» — ПОСЛЕ всех настоящих проверок, чтобы
@@ -310,8 +308,8 @@ static int p_lan(struct v2 *x, const struct ynode *n) {
                 return -1;
         }
     }
-    /* Клиентов по умолчанию описывают ЛИБО адреса, либо устройства — довод у той же проверки в
-     * v1.c (from_default рядом с несколькими lan_devices). Одно устройство рядом с адресами —
+    /* Клиентов по умолчанию описывают ЛИБО адреса, либо устройства — довод: адреса рядом с
+     * несколькими устройствами спорят о том, кто клиент. Одно устройство рядом с адресами —
      * законно: адреса выбирают клиентов, устройство тогда не участвует. */
     if (s->lan.from_n && s->lan_dev_n > 1)
         return fail(x, ad, "lan: клиенты описаны дважды — и addr, и несколько devices. Уберите "
@@ -370,8 +368,8 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
             f->mac = 1;
         }
     }
-    /* «Кто» на самом телефоне — см. from_is_local в spec.h. В модели это те же строки, что пишет
-     * спека v1 в from: «uid:N», «uid:N-M», «self». */
+    /* «Кто» на самом телефоне — см. from_is_local в spec.h. В модели это строки from: «uid:N»,
+     * «uid:N-M», «self». */
     if (ud) {
         snprintf(w, sizeof(w), "%s.uid", where);
         if (!plat()->local_channels)
@@ -509,7 +507,7 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
         const char *v;
         snprintf(w, sizeof(w), "%s.proto", where);
         if (str_of(x, n, w, &v)) return -1;
-        /* `both` — записанное умолчание, как в v1: сужения по протоколу из него не выходит. */
+        /* `both` — записанное умолчание: сужения по протоколу из него не выходит. */
         if (!strcmp(v, "tcp")) l->l4.proto = CH_PROTO_TCP;
         else if (!strcmp(v, "udp")) l->l4.proto = CH_PROTO_UDP;
         else if (!strcmp(v, "both")) l->l4.proto = CH_PROTO_ANY;
@@ -553,7 +551,7 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
     int files = l->srs_n || l->prefixes_n || l->domains_n;
     if (l->all && (files || inl))
         return fail(x, val, "%s: all — весь трафик; источники рядом с ним ничего не значат", where);
-    /* Порты источником совпадения не являются (довод — у той же проверки в v1.c): правило без
+    /* Порты источником совпадения не являются (довод — ниже): правило без
      * набора адресов безусловно, и «udp 50000-65535» ко всему интернету уехало бы в выход. */
     if (!l->all && !files && !inl)
         return fail(x, val, "%s: у списка нет источника — нужен srs, prefixes_file, domains_file или "
@@ -720,7 +718,6 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
 
     struct out_keys k;
     memset(&k, 0, sizeof(k));
-    k.v2 = 1;
     /* Ключи группы, у которых свой pick: tolerance, interval, url, idle_timeout — latency; weights —
      * balance. Какой pick, известно только после всех ключей (pick может стоять последним). */
     const struct ynode *lat_key = NULL, *w_key = NULL, *by_key = NULL;
@@ -1218,7 +1215,7 @@ static int group_cycle(const struct spec *s, int at, int *state, int *path, int 
     const struct group_cfg *g = out_group(&s->out[at]);
     for (size_t i = 0; g && i < g->members_n; i++) {
         int m = g->members[i];
-        if (!spec_is_named((unsigned)m) || !out_group(&s->out[m])) continue;   /* безымянные — не группы */
+        if (!out_group(&s->out[m])) continue;
         if (state[m] == 1) { path[depth + 1] = m; *len = depth + 2; return 1; }
         if (!state[m] && group_cycle(s, m, state, path, depth + 1, len)) return 1;
     }
@@ -1344,12 +1341,12 @@ static int p_outputs_links_tail(struct v2 *x, int *state, int *path, unsigned ch
             int ready = 1;
             for (size_t k = 0; k < o->grp.members_n; k++) {
                 size_t m = o->grp.members[k];
-                if (spec_is_named(m) && out_group(&s->out[m]) && !sealed[m]) ready = 0;
+                if (out_group(&s->out[m]) && !sealed[m]) ready = 0;
             }
             if (!ready) continue;
             if (group_seal(s, o, x->e) != 0) return wrap(x, x->out_key[i]);
             /* Активное устройство до первого прохода сторожа — лист первого по предпочтению члена
-             * (у вложенной группы — её собственное такое же, так же делает перевод v1 у пула). */
+             * (у вложенной группы — её собственное такое же). */
             snprintf(o->device, sizeof(o->device), "%s", spec_out(s, o->grp.members[0])->device);
             sealed[i] = 1;
             progress = 1;
@@ -1364,7 +1361,7 @@ static int reaches_balance(const struct spec *s, const struct output *o, int dep
     if (!g || (size_t)depth > s->out_n) return 0;      /* группы без кругов вкладываются не глубже, чем их всего */
     if (g->pick == PICK_BALANCE) return 1;
     for (size_t k = 0; k < g->members_n; k++)
-        if (spec_is_named(g->members[k]) && reaches_balance(s, &s->out[g->members[k]], depth + 1))
+        if (reaches_balance(s, &s->out[g->members[k]], depth + 1))
             return 1;
     return 0;
 }
@@ -1614,8 +1611,7 @@ static int list_idx(const struct spec *s, size_t named, const char *name) {
 
 /* Несколько списков у правила. Компилятор пока берёт у правила один список (rule_list), и если
  * списки сводятся в один без потери смысла — одно сужение, ни одного «весь трафик», — правилу
- * достаётся безымянный список-объединение: ровно то, что спека v1 пишет несколькими файлами в
- * одном канале. Иначе ссылки хранятся как есть, а спека отвергается «ещё не поддерживается». */
+ * достаётся безымянный список-объединение: несколько файлов в одном списке. Иначе ссылки хранятся как есть, а спека отвергается «ещё не поддерживается». */
 static int merge_lists(struct v2 *x, struct spec_rule *r, const struct ynode *tn, const char *rn) {
     struct spec *s = x->s;
     const struct spec_list *a = &s->list[r->lists[0]];
@@ -1667,7 +1663,7 @@ static int merge_lists(struct v2 *x, struct spec_rule *r, const struct ynode *tn
 }
 
 /* Несколько клиентов у правила — тот же приём: одного вида (все адреса, все MAC или все
- * приложения без self) сводятся в безымянного клиента-объединение, как `from` канала v1. */
+ * приложения без self) сводятся в безымянного клиента-объединение. */
 static int merge_clients(struct v2 *x, struct spec_rule *r, const struct ynode *fn, const char *rn) {
     struct spec *s = x->s;
     const struct v2_client *a = &x->cl[r->clients[0]];
@@ -1842,8 +1838,8 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     if (r->lists_n > 1 && merge_lists(x, r, tn, rn)) return -1;
     if (r->clients_n > 1 && merge_clients(x, r, fn, rn)) return -1;
 
-    /* Выключенное правило не проверяем по смыслу (довод — в v1.c: иначе сломанное правило нельзя
-     * выключить, только удалить). Имена в нём всё равно обязаны существовать: ссылка хранится
+    /* Выключенное правило не проверяем по смыслу (иначе сломанное правило нельзя выключить, только
+     * удалить). Имена в нём всё равно обязаны существовать: ссылка хранится
      * номером. */
     if (!r->disabled) {
         /* Правило на устройство — приоритет ОДНОМУ хозяину, см. dev_scope в spec.h. */
@@ -1940,7 +1936,7 @@ static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e) {
         for (size_t i = 0; i < ynode_len(v); i++)
             if (p_rule(&x, ynode_at(v, i), i)) return -1;
     }
-    /* Петля в локальную сеть, устройство дважды в группе, подложка — общие с v1 (check.c). */
+    /* Петля в локальную сеть, устройство дважды в группе, подложка (check.c). */
     int bad = -1;
     if (spec_check_outputs(s, "over", &bad, e) != 0)
         return bad >= 0 && (size_t)bad < s->out_n && x.out_key[bad] ? wrap(&x, x.out_key[bad]) : -1;

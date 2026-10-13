@@ -36,7 +36,7 @@ static int tgws_parse(struct output *o, const struct out_keys *k, struct err *e)
      * то, куда уводится перехваченное соединение. Названное устройство — почти
      * наверняка описка, и принять её молча значило бы обещать маршрутизацию,
      * которой не будет. */
-    if (o->device[0] || k->devices_n)
+    if (o->device[0])
         return err_set(e, "outputs.%s: у kind tgws нет устройства — соединение перехватывается",
             o->name);
     return 0;

@@ -299,40 +299,55 @@ static void facts_cases(void) {
 /* ---- поведение прохода ------------------------------------------------------ */
 static char g_dir[64];
 
-/* Сбросить выходы спеки — и именованные, и безымянных членов групп. */
+/* Сбросить выходы спеки. */
 static void outs_reset(void) {
     spec_release(&g_spec);
     if (spec_reserve_out(&g_spec, 8) != 0) { perror("outs_reset"); exit(1); }
 }
 
-/* Пул устройств выхода — группа pick: order из безымянных членов (модель v2, «4в»), собранная тем
- * же group_of_devices, каким её собирает перевод спеки v1 из `devices`. */
-static void out_pool(struct output *o, const char *d0, const char *d1) {
-    char devs[2][32];
-    snprintf(devs[0], sizeof(devs[0]), "%s", d0);
-    snprintf(devs[1], sizeof(devs[1]), "%s", d1);
+/* Пул устройств выхода — группа pick: order из именованных членов-интерфейсов (как в спеке v2:
+ * kind: group, members: [...]). Члены встают в g_spec.out после уже записанных выходов, по одному
+ * на устройство, с именем «<группа>.<номер>». */
+static void out_pool_n(struct output *o, const char *const *devs, size_t n) {
     struct err e = {0};
-    if (group_of_devices(&g_spec, o, (const char (*)[32])devs, 2, &e) != 0) {
+    struct output g = {0};
+    memcpy(g.name, o->name, sizeof(g.name));
+    memcpy(g.device, o->device, sizeof(g.device));
+    memcpy(g.over, o->over, sizeof(g.over));
+    g.on_fail = o->on_fail;
+    g.mark = o->mark;
+    g.table = o->table;
+    g.kind = &kind_group;
+    group_cfg_init(&g.grp);
+    if (group_members_alloc(&g_spec, &g.grp, n) != 0) { perror("out_pool"); exit(1); }
+    for (size_t i = 0; i < n; i++) {
+        size_t idx = g_spec.out_n++;
+        struct output *m = spec_out(&g_spec, idx);
+        memset(m, 0, sizeof(*m));
+        m->kind = OUT_INTERFACE;
+        snprintf(m->name, sizeof(m->name), "%s.%zu", g.name, i);
+        snprintf(m->device, sizeof(m->device), "%s", devs[i]);
+        m->on_fail = g.on_fail;
+        g.grp.members[g.grp.members_n++] = (unsigned)idx;
+    }
+    if (!g.device[0] && n) snprintf(g.device, sizeof(g.device), "%s", devs[0]);
+    *o = g;
+    if (group_seal(&g_spec, o, &e) != 0) {
         fprintf(stderr, "out_pool: %s\n", e.msg);
         exit(1);
     }
 }
-
+static void out_pool(struct output *o, const char *d0, const char *d1) {
+    const char *devs[2] = { d0, d1 };
+    out_pool_n(o, devs, 2);
+}
 /* То же из трёх устройств — стенду выбора по замеру, где у самого быстрого должен быть «второй по
  * скорости» запас. */
 static void out_pool3(struct output *o, const char *d0, const char *d1, const char *d2) {
-    char devs[3][32];
-    snprintf(devs[0], sizeof(devs[0]), "%s", d0);
-    snprintf(devs[1], sizeof(devs[1]), "%s", d1);
-    snprintf(devs[2], sizeof(devs[2]), "%s", d2);
-    struct err e = {0};
-    if (group_of_devices(&g_spec, o, (const char (*)[32])devs, 3, &e) != 0) {
-        fprintf(stderr, "out_pool3: %s\n", e.msg);
-        exit(1);
-    }
+    const char *devs[3] = { d0, d1, d2 };
+    out_pool_n(o, devs, 3);
 }
 
-/* Настройка группы выхода o — для правки pick и допуска в стенде. */
 static struct group_cfg *grp(struct output *o) { return &o->grp; }
 
 static void state_write(const char *name, const char *text) {

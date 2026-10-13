@@ -4,17 +4,14 @@
  * таблица и свой on_fail у неё есть, как у любого выхода с устройством, — правило ведёт трафик в
  * группу, а сторож привязывает таблицу группы к устройству выбранного члена. КАК выбрать, говорит
  * pick (group_cfg в spec.h):
- *   order   — первый живой член по порядку. Это прежний пул `devices` у выхода v1: перевод
- *             (model/v1.c) делает из каждого устройства безымянный член-интерфейс, а имя группы
- *             — прежнее имя выхода, поэтому status, реестр меток и имена наборов не меняются;
- *   latency — самый быстрый с допуском (прежний `prefer: latency`); задержка — urltest,
+ *   order   — первый живой член по порядку.
+ *   latency — самый быстрый с допуском; задержка — urltest,
  *             HTTP(S)-запрос к url через члена (src/daemon/urltest.c);
  *   manual  — член, выбранный человеком командой `select` (default — до первой команды);
  *   balance — ядро раскидывает НОВЫЕ соединения по живым членам: правило группы переходит в
  *             свою цепочку, та по карте `numgen random mod GROUP_BAL_SLOTS` ставит метку члена и
  *             сохраняет её в метке соединения (compile/generate.c, build_balance); упавший член
  *             сторож вынимает из карты по netlink (src/daemon/fogroup.c).
- * Спека v1 рождает только order и latency из безымянных членов; v2 — все четыре из именованных.
  *
  * ВЛОЖЕННОСТЬ. Член группы — любой выход с устройством, в том числе другая группа. order, latency
  * и manual разворачивают выбор до ЛИСТА: таблица группы ведёт в устройство, которое сейчас несёт
@@ -32,19 +29,16 @@
  * порядок прежние (это проверяет стенд failovermatch).
  *
  * КАК ГРУППА ОТВЕЧАЕТ НА ВОПРОСЫ О ВИДЕ. Свойства группы — пересечение свойств её членов
- * (group_seal): у пула интерфейсов это ровно свойства интерфейса без obfs, то есть устройство,
- * метка, метка соединения, мимо общего обхода — всё, по чему компилятор, apply и сторож вели
- * прежний пул. Своих проб, оживления, помощника и правил у группы нет (функции NULL): проба и
- * оживление принадлежат устройству и его владельцу (out_for_device), а у безымянного члена
- * владельца нет — и тогда отвечает группа тем же общим путём, каким отвечал выход-пул вида
- * interface (ICMP, ifdown/ifup). */
+ * (group_seal): у группы интерфейсов это ровно свойства интерфейса без obfs, то есть устройство,
+ * метка, метка соединения, мимо общего обхода. Своих проб, оживления, помощника и правил у группы нет (функции NULL): проба и
+ * оживление принадлежат устройству и его владельцу (out_for_device),. */
 #include <stdio.h>
 #include <string.h>
 
 #include "spec.h"
 #include "awg.h"
 
-/* Спека v2 знает группу по имени; спека v1 — нет (kind_by_name её не находит, см. kind.h). */
+/* Спека знает группу по имени; реестр видов — нет (kind_by_name её не находит, см. kind.h). */
 const struct kind_ops *kind_by_name_v2(const char *name) {
     if (!strcmp(name, kind_group.name)) return &kind_group;
     return kind_by_name(name);
@@ -54,13 +48,8 @@ const struct group_cfg *out_group(const struct output *o) {
     return kind_of(o) == &kind_group ? &o->grp : NULL;
 }
 
-const struct kind_ops *out_kind_shown(const struct output *o) {
-    const struct group_cfg *g = out_group(o);
-    return g && g->shown ? g->shown : kind_of(o);
-}
-
 const char *out_kind_name(const struct output *o) {
-    return out_kind_shown(o)->name;
+    return kind_of(o)->name;
 }
 
 size_t out_members_n(const struct spec *sp, const struct output *o) {
@@ -105,7 +94,7 @@ int group_members_alloc(struct spec *sp, struct group_cfg *g, size_t n) {
 }
 
 int group_named(const struct group_cfg *g) {
-    return g && g->members_n && spec_is_named(g->members[0]);
+    return g && g->members_n;
 }
 
 int group_seal(struct spec *sp, struct output *go, struct err *e) {
@@ -143,40 +132,6 @@ int group_seal(struct spec *sp, struct output *go, struct err *e) {
      * членов, не группы. У пула интерфейсов без obfs их и не было. */
     g->caps = caps & ~(unsigned)(KC_OVER | KC_ENGINE_OWNED);
     return 0;
-}
-
-int group_of_devices(struct spec *sp, struct output *o, const char (*devs)[32], size_t n,
-                     struct err *e) {
-    if (spec_grow((void **)&sp->anon, &sp->anon_cap, sp->anon_n + n, sizeof(*sp->anon)) != 0)
-        return err_set(e, "%s", "недостаточно памяти для спеки");
-    /* Члены — того же вида, каким был выход: пул `devices` у interface — это интерфейсы. Своих
-     * настроек вида (obfs) у безымянного члена нет: их нёс выход, а не его устройства. */
-    const struct kind_ops *k = kind_of(o);
-    struct output g = {0};
-    memcpy(g.name, o->name, sizeof(g.name));
-    memcpy(g.device, o->device, sizeof(g.device));
-    memcpy(g.over, o->over, sizeof(g.over));
-    g.on_fail = o->on_fail;
-    g.mark = o->mark;
-    g.table = o->table;
-    g.kind = &kind_group;
-    group_cfg_init(&g.grp);
-    g.grp.shown = k;
-    if (group_members_alloc(sp, &g.grp, n) != 0) return err_set(e, "%s", "недостаточно памяти для спеки");
-    for (size_t i = 0; i < n; i++) {
-        size_t idx = SPEC_ANON_BASE + sp->anon_n++;
-        struct output *m = spec_out(sp, idx);
-        memset(m, 0, sizeof(*m));
-        m->kind = k;
-        snprintf(m->device, sizeof(m->device), "%s", devs[i]);
-        m->on_fail = o->on_fail;
-        g.grp.members[g.grp.members_n++] = (unsigned)idx;
-    }
-    /* Активное устройство до первого прохода сторожа — первое по предпочтению, если выход не
-     * назвал своё (так делал разбор interface: device выводится из devices[0]). */
-    if (!g.device[0] && n) snprintf(g.device, sizeof(g.device), "%s", devs[0]);
-    *o = g;
-    return group_seal(sp, o, e);
 }
 
 int group_tolerance_ms(const struct group_cfg *g) {
@@ -387,8 +342,7 @@ static int group_helper(const struct spec *sp, const struct output *o, struct ki
  * `kind: warp` (model/v2.c, p_warp), поэтому в реестре видов (kind.c) его нет: разбор находит его сам.
  * Имя устройства — то же правило, что у awg (awg_default_ifname): имя не должно выдавать туннель. */
 static int warpm_parse(struct output *o, const struct out_keys *k, struct err *e) {
-    if (k->devices_n)
-        return err_set(e, "outputs.%s: устройство члена WARP выбирает ядро steer", o->name);
+    (void)k; (void)e;
     awg_default_ifname(o->name, o->device, sizeof(o->device));
     return 0;
 }

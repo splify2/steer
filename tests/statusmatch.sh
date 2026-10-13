@@ -43,19 +43,15 @@ outputs:
   pool: { kind: interface, device: nodev0, on_fail: drop }
   direct: { kind: direct }
 EOF
-# Пул devices — выход спеки v1 (в v2 это группа выходов-членов с другим видом в status), поэтому
-# проверки пула идут на спеке v1.
-cat > "$tmp/pool.json" <<EOF
-{
-  "schema": 1,
-  "lan_devices": ["tailscale0", "zt7bcxxxxx"],
-  "outputs": {
-    "loc": { "kind": "vless", "sub_file": "$tmp/sub.txt", "device": "lo" },
-    "pool": { "kind": "interface", "devices": ["nodev0", "lo"], "on_fail": "drop" },
-    "direct": { "kind": "direct" }
-  },
-  "channels": []
-}
+cat > "$tmp/pool.yaml" <<EOF
+version: 2
+lan: { devices: [tailscale0, zt7bcxxxxx] }
+outputs:
+  loc: { kind: tunnel, protocol: vless, subscription: $tmp/sub.txt, device: lo }
+  pool: { kind: group, pick: order, members: [pool.nodev0, pool.lo], on_fail: drop }
+  pool.nodev0: { kind: interface, device: nodev0 }
+  pool.lo: { kind: interface, device: lo }
+  direct: { kind: direct }
 EOF
 
 out="$($BIN status --spec "$tmp/spec.yaml" --state-dir "$tmp/state" 2>/dev/null)"
@@ -90,15 +86,17 @@ check "nodes у выхода подписки печатаются пустым�
       "$(printf '%s' "$out" | grep -c '"nodes":\[\]')"
 
 # ---- устройство выхода: то, что несёт трафик СЕЙЧАС ---------------------------
-# Сторож увёл пул на запасное устройство и записал это в active. Без чтения записи status
-# отдавал первого кандидата — отсутствующий nodev0 с "up":false, то есть рисовал поломку на
-# работающем выходе.
+# Первый член группы отсутствует, трафик идёт через второго (запись сторожа в active — «pool lo»).
+# Без этого status отдавал бы первого члена — отсутствующий nodev0 с "up":false, то есть рисовал
+# поломку на работающем выходе.
 printf 'pool lo\n' > "$tmp/state/active"
-outa="$($BIN status --spec "$tmp/pool.json" --state-dir "$tmp/state" 2>/dev/null)"
-check "пул назван активным устройством" "1" \
-      "$(printf '%s' "$outa" | grep -c '"pool":{"kind":"interface","device":"lo","up":true')"
+outa="$($BIN status --spec "$tmp/pool.yaml" --state-dir "$tmp/state" 2>/dev/null)"
+check "группа названа устройством несущего члена" "1" \
+      "$(printf '%s' "$outa" | grep -c '"pool":{"kind":"group","device":"lo","up":true')"
 check "список кандидатов при этом прежний" "1" \
       "$(printf '%s' "$outa" | grep -c '"devices":\["nodev0","lo"\]')"
+check "выбранный член назван" "1" \
+      "$(printf '%s' "$outa" | grep -c '"selected":"pool.lo"')"
 
 # ---- снимок состояния и --fast ------------------------------------------------
 # ЗАЧЕМ ЭТО ПРОВЕРЯТЬ СТЕНДОМ. `--fast` отдаёт то, что движок ЗАПОМНИЛ, и ошибка здесь

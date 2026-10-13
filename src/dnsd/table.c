@@ -432,13 +432,9 @@ static int dch_join_domain_group(const struct spec *sp, const struct spec_rule *
  * имеет, как и у компилятора, group_has_set6). Раскладка ядра — та, что стоит (nft_compat_seen6:
  * по netlink, без пробы `nft -c` — таблицу собирает и демон в своём процессе), и спрашивается
  * только когда от неё что-то зависит: fake-IP с выходом и клиентами, которые IPv6 допускают.
- *
- * Спека v1 (sp->dns.names_v4 — ставит перевод v1) — всегда только IPv4: на AAAA её имён пустой
- * ответ, как до 1.9, хотя компилятор набор «<имя>6» и двойника заводит. Доводы — у поля в
- * spec.h. Таблица демону несёт это полем семейства «4», и резолверу номер формата спеки знать не
- * нужно. */
+ */
 static int dch_fam(const struct spec *sp, const struct spec_rule *r, int realip, int extra) {
-    if (extra || sp->dns.names_v4) return DCH_V4;
+    if (extra) return DCH_V4;
     const struct spec_client *w = rule_who(sp, r);
     const struct output *o = rule_out(sp, r);
     if (!dom6_ok(sp, o, w->from, w->from_n, realip, 0)) return DCH_V4;
@@ -650,8 +646,7 @@ void dch_build(const struct spec *sp) {
      * Прежде здесь стоял пропуск канала без `domains_files`, и это был не гейт по цене, а
      * решение о смысле: доменность канала определялась ИМЕНЕМ КЛЮЧА в спеке. Из этого
      * следовало, что человек выбирает не сервис, а вид списка — тот самый довод, по
-     * которому в разборе спеки уже снят запрет на адреса и домены в одном правиле (v1 —
-     * parse_channels в src/model/v1.c, «Адреса и домены в одном правиле — МОЖНО»; у списка
+     * которому в разборе спеки снят запрет на адреса и домены в одном правиле (у списка
      * спеки v2 `prefixes_file` и `domains_file` законны вместе).
      *
      * Теперь оба массива читаются одинаково, а кому какая СТРОКА принадлежит, решает
@@ -661,8 +656,7 @@ void dch_build(const struct spec *sp) {
      *
      * Разбирается он, впрочем, не в один механизм, а в два: `8.8.8.0/24` ляжет в набор
      * настоящим префиксом, а `youtube.com` — поддельным адресом плюс правилом DNAT. Набор
-     * с `flags interval,timeout` держит и то и то (проверено опытом — там же, в
-     * parse_channels, src/model/v1.c). */
+     * с `flags interval,timeout` держит и то и то (проверено опытом). */
     for (size_t i = 0; i < sp->rule_n; i++) {
         const struct spec_rule *r = &sp->rule[i];
         const struct spec_list *l = rule_list(sp, r);

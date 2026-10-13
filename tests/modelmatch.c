@@ -128,141 +128,127 @@ static void t_rules(void) {
     const struct spec_client *tv = rule_who(&g_spec, &g_spec.rule[1]);
     group_set_name(&g_spec, n1, sizeof(n1), "direct", "ip", tv->from, tv->from_n, 0, NULL);
     check_str("имя набора правила со своим клиентом", "direct_ip_c1", n1);
-
-    check("allow_all спеки v1 по-прежнему нужен", -1, load(
-        "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
-        "\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
-        "\"channels\":[{\"name\":\"all\",\"match\":{\"any\":true},\"out\":\"vpn\"}]}"));
-    check("… с прежним текстом", 1, has("allow_all"));
 }
 
-/* ---- выходы: пул → группа, via → over --------------------------------------------------- */
+/* ---- выходы: группы и over (спека v2) --------------------------------------------------- */
 
 static void t_groups(void) {
-    check("пул устройств разобран", 0, load(
-        "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
-        "\"outputs\":{\"direct\":{\"kind\":\"direct\"},"
-        " \"pool\":{\"kind\":\"interface\",\"devices\":[\"wg0\",\"wg1\"],\"on_fail\":\"direct\"},"
-        " \"one\":{\"kind\":\"interface\",\"devices\":[\"wg2\"]},"
-        " \"fast\":{\"kind\":\"interface\",\"devices\":[\"wg3\",\"wg4\",\"wg5\"],\"prefer\":\"latency\","
-        "  \"latency_tolerance_ms\":20,\"latency_interval_s\":60},"
-        " \"odd\":{\"kind\":\"interface\",\"device\":\"wg6\",\"devices\":[\"wg7\"]}},"
-        "\"channels\":[{\"name\":\"c\",\"match\":{\"prefixes_file\":\"TMP/a.lst\"},\"out\":\"pool\"}]}"));
+    check("группы разобраны", 0, load(
+        "version: 2\n"
+        "lan: { addr: [192.168.1.0/24] }\n"
+        "lists:\n"
+        "  a: { prefixes_file: TMP/a.lst }\n"
+        "outputs:\n"
+        "  direct: { kind: direct }\n"
+        "  wg0: { kind: interface, device: wg0 }\n"
+        "  wg1: { kind: interface, device: wg1 }\n"
+        "  wg3: { kind: interface, device: wg3 }\n"
+        "  wg4: { kind: interface, device: wg4 }\n"
+        "  wg5: { kind: interface, device: wg5 }\n"
+        "  pool: { kind: group, pick: order, members: [wg0, wg1], on_fail: direct }\n"
+        "  fast: { kind: group, pick: latency, members: [wg3, wg4, wg5], tolerance: 20, interval: 60 }\n"
+        "  slow: { kind: group, pick: latency, members: [wg3, wg4] }\n"
+        "rules:\n"
+        "  - { name: c, to: [a], out: pool }\n"));
     if (g_msg[0]) printf("     %s\n", g_msg);
-    check("именованных выходов — как в спеке", 5, (long)g_spec.out_n);
-    check("безымянных членов — по устройству в пулах", 6, (long)g_spec.anon_n);
+    check("выходов — как в спеке", 9, (long)g_spec.out_n);
 
-    struct output *p = &g_spec.out[1];
-    const struct group_cfg *g = out_group(p);
-    check_str("имя группы — прежнее имя выхода", "pool", p->name);
-    check("пул стал группой", 1, g != NULL);
-    check_str("снаружи — прежний вид", "interface", out_kind_name(p));
-    check("pick: order", PICK_ORDER, g ? (long)g->pick : -1);
-    check("членов два", 2, g ? (long)g->members_n : -1);
+    struct output *p = out_by_name(&g_spec, "pool");
+    const struct group_cfg *g = p ? out_group(p) : NULL;
+    check("pool — группа", 1, g != NULL);
+    if (!p || !g) return;
+    check("pick: order", PICK_ORDER, (long)g->pick);
+    check("членов два", 2, (long)g->members_n);
     size_t mn = out_members_n(&g_spec, p);
     const struct output *m[2] = { mn > 0 ? out_member(&g_spec, p, 0) : NULL,
                                   mn > 1 ? out_member(&g_spec, p, 1) : NULL };
     check("кандидаты группы — её члены", 2, (long)mn);
-    check_str("член 0 — устройство wg0", "wg0", mn > 0 ? m[0]->device : "");
-    check_str("член 1 — устройство wg1", "wg1", mn > 1 ? m[1]->device : "");
-    check("члены безымянные", 1, mn == 2 && !m[0]->name[0] && !m[1]->name[0]);
+    check_str("член 0 — выход wg0", "wg0", mn > 0 ? m[0]->name : "");
+    check_str("член 1 — выход wg1", "wg1", mn > 1 ? m[1]->name : "");
     check_str("члены — интерфейсы", "interface", mn ? out_kind_name(m[0]) : "");
-    check("члены лежат отдельно от именованных (sp->anon)", 1,
-          mn == 2 && m[0] >= g_spec.anon && m[0] < g_spec.anon + g_spec.anon_n);
+    check("члены — именованные выходы спеки", 1,
+          mn == 2 && m[0] == out_by_name(&g_spec, "wg0") && m[1] == out_by_name(&g_spec, "wg1"));
     check_str("активное до сторожа — первое устройство", "wg0", p->device);
     check("on_fail — у группы", FAIL_DIRECT, p->on_fail);
     check("у группы есть устройство (свойство членов)", 1, out_has_device(p));
     check("у группы метка", 1, out_needs_mark(p) && p->mark != 0);
     check("у группы таблица", 1, p->table != 0);
-    check("у безымянных членов меток нет", 1, mn == 2 && !m[0]->mark && !m[1]->mark);
     check("своего сокета наверх у группы нет", 0, out_over_capable(p));
     check("процесса у группы нет", 0, out_engine_managed(p));
-    check("выход по имени — группа", 1, out_by_name(&g_spec, "pool") == p);
 
-    struct output *one = &g_spec.out[2];
-    check("один devices — не группа", 1, out_group(one) == NULL);
-    check_str("… устройство из devices", "wg2", one->device);
-    mn = out_members_n(&g_spec, one);
-    check("… кандидат — он сам", 1, mn == 1 && out_member(&g_spec, one, 0) == one);
-
-    const struct group_cfg *f = out_group(&g_spec.out[3]);
-    check("prefer: latency — pick: latency", PICK_LATENCY, f ? (long)f->pick : -1);
+    const struct group_cfg *f = out_group(out_by_name(&g_spec, "fast"));
+    check("pick: latency", PICK_LATENCY, f ? (long)f->pick : -1);
     check("… допуск", 20, f ? f->lat_tolerance_ms : -1);
     check("… интервал", 60, f ? f->lat_interval_s : -1);
     check("… членов три", 3, f ? (long)f->members_n : -1);
-    check("допуск не задан — «не задан» (-1), умолчание 50 даёт group_tolerance_ms", 1,
-          g && g->lat_tolerance_ms == -1 && group_tolerance_ms(g) == GROUP_TOL_DEFAULT_MS &&
+    const struct group_cfg *s = out_group(out_by_name(&g_spec, "slow"));
+    check("допуск не задан — «не задан» (-1), умолчание даёт group_tolerance_ms", 1,
+          s && s->lat_tolerance_ms == -1 && group_tolerance_ms(s) == GROUP_TOL_DEFAULT_MS &&
           f && group_tolerance_ms(f) == 20);
-    check("интервал не задан — умолчание 180", GROUP_INT_DEFAULT_S, g ? group_interval_s(g) : -1);
+    check("интервал не задан — умолчание", GROUP_INT_DEFAULT_S, s ? group_interval_s(s) : -1);
+    check("прямому выходу выбирать не из чего", 0,
+          (long)out_members_n(&g_spec, out_by_name(&g_spec, "direct")));
 
-    struct output *odd = &g_spec.out[4];
-    check("device и другое devices — группа", 1, out_group(odd) != NULL);
-    check_str("… активное — названное device", "wg6", odd->device);
-    mn = out_members_n(&g_spec, odd);
-    check_str("… член — из devices", "wg7", mn ? out_member(&g_spec, odd, 0)->device : "");
-
-    check("прямому выходу выбирать не из чего", 0, (long)out_members_n(&g_spec, &g_spec.out[0]));
-
-    /* Ноль допуска законен («переключаться на любое улучшение», model/v1.c) и остаётся нулём: прежде
-     * он читался как «не задан» и подменялся умолчанием 50 — group_tolerance_ms. */
-    check("v1: latency_tolerance_ms 0 разобран", 0, load(
-        "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
-        "\"outputs\":{\"fast\":{\"kind\":\"interface\",\"devices\":[\"wg3\",\"wg4\"],"
-        "\"prefer\":\"latency\",\"latency_tolerance_ms\":0}},\"channels\":[]}"));
-    const struct group_cfg *z = g_spec.out_n ? out_group(&g_spec.out[0]) : NULL;
+    /* Ноль допуска законен («переключаться на любое улучшение») и остаётся нулём. */
+    check("tolerance: 0 разобран", 0, load(
+        "version: 2\n"
+        "outputs:\n"
+        "  wg3: { kind: interface, device: wg3 }\n"
+        "  wg4: { kind: interface, device: wg4 }\n"
+        "  fast: { kind: group, pick: latency, members: [wg3, wg4], tolerance: 0 }\n"));
+    const struct group_cfg *z = out_group(out_by_name(&g_spec, "fast"));
     check("… нулевой допуск остаётся нулём", 0, z ? group_tolerance_ms(z) : -1);
 
-    check("via → over", 0, load(
-        "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
-        "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"devices\":[\"wg0\",\"wg1\"]},"
-        " \"ob\":{\"kind\":\"interface\",\"device\":\"wg2\",\"via\":\"wg\","
-        "  \"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
-        "\"channels\":[]}"));
+    check("over: группа — подложка", 0, load(
+        "version: 2\n"
+        "outputs:\n"
+        "  wg0: { kind: interface, device: wg0 }\n"
+        "  wg1: { kind: interface, device: wg1 }\n"
+        "  wg: { kind: group, pick: order, members: [wg0, wg1] }\n"
+        "  ob: { kind: interface, device: wg2, over: wg,\n"
+        "        obfs: { server: \"203.0.113.10:4567\", listen: \"127.0.0.1:51820\" } }\n"));
     if (g_msg[0]) printf("     %s\n", g_msg);
-    check_str("… подложка названа", "wg", g_spec.out[1].over);
-    check("… и найдена: группа", 1, out_over(&g_spec, &g_spec.out[1]) == &g_spec.out[0]);
-    check("… глубина 1", 1, out_over_depth(&g_spec, &g_spec.out[1]));
+    struct output *wg = out_by_name(&g_spec, "wg"), *ob = out_by_name(&g_spec, "ob");
+    check_str("… подложка названа", "wg", ob ? ob->over : "");
+    check("… и найдена: группа", 1, ob && out_over(&g_spec, ob) == wg);
+    check("… глубина 1", 1, ob ? out_over_depth(&g_spec, ob) : -1);
     check("… метка подложки — метка группы", 1,
-          out_underlay_mark(&g_spec, &g_spec.out[1]) == (g_spec.out[0].mark | STEER_TUNNEL_BIT));
+          ob && wg && out_underlay_mark(&g_spec, ob) == (wg->mark | STEER_TUNNEL_BIT));
 
-    check("дубликат устройства в пуле — отказ", -1, load(
-        "{\"schema\":1,\"outputs\":{\"p\":{\"kind\":\"interface\",\"devices\":[\"wg0\",\"wg0\"]}},"
-        "\"channels\":[]}"));
-    check("… прежним текстом", 1, has("указано дважды"));
+    check("дубликат члена в группе — отказ", -1, load(
+        "version: 2\n"
+        "outputs:\n"
+        "  wg0: { kind: interface, device: wg0 }\n"
+        "  p: { kind: group, pick: order, members: [wg0, wg0] }\n"));
+    check("… сказано «указан дважды»", 1, has("указан дважды"));
 
-    check("пул с obfs — отказ", -1, load(
-        "{\"schema\":1,\"outputs\":{\"p\":{\"kind\":\"interface\",\"devices\":[\"wg0\",\"wg1\"],"
-        "\"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
-        "\"channels\":[]}"));
-    check("… сказано про obfs", 1, has("obfs"));
+    check("группа без members — отказ", -1, load(
+        "version: 2\n"
+        "outputs:\n"
+        "  g: { kind: group, pick: order }\n"));
+    check("… сказано про members", 1, has("members"));
 
-    check("kind group в спеке v1 — неизвестный вид", -1, load(
-        "{\"schema\":1,\"outputs\":{\"g\":{\"kind\":\"group\"}},\"channels\":[]}"));
-    check("… прежним текстом", 1, has("неизвестный kind"));
-
-    check("awg с пулом — прежний отказ", -1, load(
-        "{\"schema\":1,\"outputs\":{\"a\":{\"kind\":\"awg\",\"devices\":[\"x0\",\"x1\"]}},"
-        "\"channels\":[]}"));
-    check("… прежним текстом", 1, has("у kind awg одно устройство"));
-
-    /* Пул из ста устройств и пять пулов по шестнадцать: безымянных членов сколько написано (раньше
-     * «не больше 16 в пуле и 64 на спеку»). */
+    /* Группа из ста членов и пять групп по шестнадцать: членов сколько написано (предела нет). */
     {
-        char *big = malloc(65536), *o = big;
-        o += sprintf(o, "{\"schema\":1,\"outputs\":{");
+        char *big = malloc(131072), *o = big;
+        o += sprintf(o, "version: 2\noutputs:\n");
+        for (int i = 0; i < 5; i++)
+            for (int k = 0; k < 16; k++)
+                o += sprintf(o, "  d%d_%d: { kind: interface, device: d%d_%d }\n", i, k, i, k);
+        for (int k = 0; k < 100; k++) o += sprintf(o, "  e%d: { kind: interface, device: e%d }\n", k, k);
         for (int i = 0; i < 5; i++) {
-            o += sprintf(o, "%s\"p%d\":{\"kind\":\"interface\",\"devices\":[", i ? "," : "", i);
-            for (int k = 0; k < 16; k++) o += sprintf(o, "%s\"d%d_%d\"", k ? "," : "", i, k);
-            o += sprintf(o, "]}");
+            o += sprintf(o, "  p%d: { kind: group, pick: order, members: [", i);
+            for (int k = 0; k < 16; k++) o += sprintf(o, "%sd%d_%d", k ? ", " : "", i, k);
+            o += sprintf(o, "] }\n");
         }
-        o += sprintf(o, ",\"big\":{\"kind\":\"interface\",\"devices\":[");
-        for (int k = 0; k < 100; k++) o += sprintf(o, "%s\"e%d\"", k ? "," : "", k);
-        sprintf(o, "]}},\"channels\":[]}");
-        check("пулы на 80 + 100 устройств — принимаются", 0, load(big));
-        check("безымянных членов 180", 180, (long)g_spec.anon_n);
+        o += sprintf(o, "  big: { kind: group, pick: order, members: [");
+        for (int k = 0; k < 100; k++) o += sprintf(o, "%se%d", k ? ", " : "", k);
+        sprintf(o, "] }\n");
+        check("группы на 80 + 100 членов — принимаются", 0, load(big));
+        if (g_msg[0]) printf("     %s\n", g_msg);
         const struct output *bg = out_by_name(&g_spec, "big");
-        check("в пуле из ста устройств сто кандидатов", 100, bg ? (long)out_members_n(&g_spec, bg) : -1);
-        check_str("последний кандидат сотого пула — e99", "e99",
+        check("в группе из ста членов сто кандидатов", 100, bg ? (long)out_members_n(&g_spec, bg) : -1);
+        check_str("последний кандидат — e99", "e99",
                   bg ? out_member(&g_spec, bg, 99)->device : "");
         free(big);
     }
@@ -291,8 +277,7 @@ static void t_v2(void) {
         "  - { to: v, out: wg0, resolve: fakeip, enabled: false }\n"
         "  - { name: all, for: lan, to: all, out: wg1 }\n"));
     if (g_msg[0]) printf("     %s\n", g_msg);
-    check("v2: выходы — именованные, без безымянных", 3, (long)g_spec.out_n);
-    check("v2: безымянных нет", 0, (long)g_spec.anon_n);
+    check("v2: выходы — именованные", 3, (long)g_spec.out_n);
     const struct output *g = out_by_name(&g_spec, "res");
     const struct group_cfg *gc = g ? out_group(g) : NULL;
     check("v2: res — группа", 1, gc != NULL);

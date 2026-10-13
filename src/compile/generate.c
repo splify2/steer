@@ -1306,9 +1306,8 @@ static void guard_devs(const struct spec *sp, const struct output *o, struct gua
 /* Чьи метки вообще бывают на пакетах: выход правила, члены группы balance вглубь (их метку ставит
  * цепочка mark_…, compile/balance.c) и цель подложки `over` (её метку несёт сокет туннеля, marks.h,
  * out_underlay_mark). Правило guard — только им: у выхода, чью метку никто не ставит, правило ничего
- * не ловило бы, а у спеки v2, переведённой из v1, лишние правила членов пула (у v1 они безымянны и
- * без меток) разошлись бы с набором правил v1 (стенд v2match). Замер группы latency через члена
- * (urltest, SO_MARK члена) сюда не входит по той же причине: у v1 он идёт SO_BINDTODEVICE. */
+ * не ловило бы. Замер группы latency через члена
+ * (urltest, SO_MARK члена) сюда не входит: пакеты замера метку ставит сам сокет. */
 static void guard_use(const struct spec *sp, const struct output *o, unsigned char *used,
                       size_t depth) {
     if (!o || depth > sp->out_n) return;
@@ -1987,7 +1986,7 @@ static void build_nat6(struct nft_table *t, const struct spec *sp) {
  * QEMU 2026-10-12). Подмена дважды (своя зона человека с masq и это правило) не страшна: адрес
  * соединению назначает первая сработавшая цепочка nat.
  *
- * Устройства — выходов спеки и безымянных членов пула v1 (`devices`), каждое один раз. */
+ * Устройства — выходов спеки, каждое один раз. */
 static void nat4_dev(struct nft_table *t, struct nft_chain **c, const struct output *o,
                      const char **seen, size_t *seen_n) {
     if (!out_nat4_by_steer(o)) return;
@@ -2006,11 +2005,10 @@ static void nat4_dev(struct nft_table *t, struct nft_chain **c, const struct out
 
 static void build_nat4(struct nft_table *t, const struct spec *sp) {
     struct nft_chain *c = NULL;
-    size_t cap = sp->out_n + sp->anon_n + 1, seen_n = 0;
+    size_t cap = sp->out_n + 1, seen_n = 0;
     const char **seen = calloc(cap, sizeof(*seen));
     if (!seen) { t->rs->oom = 1; return; }
     for (size_t i = 0; i < sp->out_n; i++) nat4_dev(t, &c, &sp->out[i], seen, &seen_n);
-    for (size_t i = 0; i < sp->anon_n; i++) nat4_dev(t, &c, &sp->anon[i], seen, &seen_n);
     free(seen);
 }
 

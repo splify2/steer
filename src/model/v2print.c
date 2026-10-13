@@ -2,18 +2,14 @@
  *
  * Печатает модель — какой бы спекой она ни была прочитана — спекой v2 в стиле примера раздела 3:
  * разделы в том же порядке (version, lan, clients, lists, outputs, dns, rules), сущность — одной
- * строкой в потоковой записи `имя: { ключ: значение }`, имена выровнены. Главное назначение —
- * перевод v1: модель, собранная переводчиком v1 (model/v1.c), печатается так, что разбор v2
- * (model/v2.c) даёт из напечатанного тот же набор правил до байта (стенд tests/v2match.sh).
+ * строкой в потоковой записи `имя: { ключ: значение }`, имена выровнены. Напечатанное разбор v2
+ * (model/v2.c) читает в ту же модель.
  *
- * ЧТО ПРИДУМЫВАЕТСЯ ПРИ ПЕРЕВОДЕ. У v1 клиенты и списки безымянные (по одному на канал), а пул
- * `devices` — группа из безымянных членов. В v2 всё названо, поэтому:
- *   - клиент и список канала получают имя канала, если оно годится в идентификатор (name_ok, до
+ * ЧТО ПРИДУМЫВАЕТСЯ ПРИ ПЕЧАТИ. Клиенты и списки правил бывают безымянными (объединение из
+ * нескольких), а в спеке v2 всё названо, поэтому:
+ *   - клиент и список правила получают имя правила, если оно годится в идентификатор (name_ok, до
  *     24 байт), иначе `rule<N>`; совпадение имён — суффикс `-2`, `-3`…;
  *   - список «весь трафик» без сужения печатается как `to: all`, с сужением — списком `all: true`;
- *   - член пула становится выходом kind: interface с именем `<группа>.<устройство>`. Такие выходы
- *     печатаются ПОСЛЕ всех выходов спеки: реестр раздаёт метки по порядку выходов, и прежние
- *     выходы сохраняют прежние метки;
  *   - ключи видов печатает вид (kind_ops.keys_of — обратное его разбору), выведенные из имени
  *     умолчания (путь conf, имя устройства) не печатаются. */
 #define _GNU_SOURCE
@@ -89,12 +85,9 @@ static void fseq_s(struct flow *w, const char *key, const char *base, size_t str
     fputc(']', w->f);
 }
 
-/* Имена выходов по номеру, каким его хранит модель: именованные — [0, named), безымянные члены
- * пулов (SPEC_ANON_BASE + k) — следом. */
-struct onames { const char (*v)[32]; size_t named; };
-static const char *oname_of(const struct onames *on, size_t idx) {
-    return on->v[idx >= SPEC_ANON_BASE ? on->named + (idx - SPEC_ANON_BASE) : idx];
-}
+/* Имена выходов по номеру, каким его хранит модель (номер в sp->out). */
+struct onames { const char (*v)[32]; };
+static const char *oname_of(const struct onames *on, size_t idx) { return on->v[idx]; }
 
 /* Апстрим DNS одним отображением `{ url: …, out: …, ips: […], bootstrap: […] }`, группа серверов —
  * `{ servers: […], mode: … }` (mode печатается всегда: умолчание failover в спеке не очевидно). */
@@ -199,8 +192,7 @@ static void client_flow(FILE *f, const struct spec_client *c) {
     free(buf);
 }
 
-/* ПУТИ — АБСОЛЮТНЫМИ. У v1 относительный путь — от рабочего каталога движка, у v2 — от каталога
- * файла спеки (v2.c, path_of); напечатать его как есть значило бы сменить файл. */
+/* ПУТИ — АБСОЛЮТНЫМИ. Относительный путь в спеке — от каталога файла спеки (v2.c, path_of); напечатать его как есть значило бы сменить файл. */
 static const char *absp(char *buf, size_t n, const char *p) {
     char cwd[512];
     if (p[0] == '/' || !getcwd(cwd, sizeof(cwd))) return p;
@@ -335,7 +327,6 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
     } else {
         struct out_keys kk;
         memset(&kk, 0, sizeof(kk));
-        kk.v2 = 1;
         if (k->keys_of) k->keys_of(o, &kk);
         if (v2_tunnel_proto(k->name)) {
             fs(&w, "kind", "tunnel");
@@ -391,8 +382,7 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
     if (o->over[0]) fs(&w, "over", o->over);
     if (o->on_fail != FAIL_DROP) fs(&w, "on_fail", on_fail_name(o->on_fail));
     /* Ключ ipv6 (шаг 8 выпуска 1.10) — как записан, а prefix — только записанный: выведенный из
-     * адресов раздачи — состояние, а не настройка. Спека v1 ключа не знает, и её перевод печатается
-     * прежним текстом. */
+     * адресов раздачи — состояние, а не настройка. */
     if (o->ipv6 != OUT_V6_KIND) {
         static const char *const V6[] = { "", "routed", "nat", "off" };
         fs(&w, "ipv6", V6[o->ipv6]);
@@ -405,14 +395,13 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
     fputs(" }", f);
 }
 
-/* Рабочие таблицы печати: имена всех сущностей модели — выходы (именованные и безымянные члены),
+/* Рабочие таблицы печати: имена всех сущностей модели — выходы,
  * клиенты, списки. По числу сущностей спеки, а не на предельное число (раньше — статические
  * массивы под 16 + 64 + 64 + 64 имён). */
 struct pv2 {
     char (*oname)[32], (*cname)[32], (*lname)[32];
     unsigned char *cshow, *lshow;
     struct names on, cn, ln;
-    size_t *anon_order;
 };
 
 static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, struct pv2 *pv);
@@ -420,18 +409,17 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
 int spec_print_v2(FILE *f, const struct spec *s, struct err *e) {
     struct pv2 pv;
     memset(&pv, 0, sizeof(pv));
-    pv.oname = calloc(s->out_n + s->anon_n + 1, sizeof(*pv.oname));
+    pv.oname = calloc(s->out_n + 1, sizeof(*pv.oname));
     pv.cname = calloc(s->client_n + 1, sizeof(*pv.cname));
     pv.lname = calloc(s->list_n + 1, sizeof(*pv.lname));
     pv.cshow = calloc(s->client_n + 1, 1);
     pv.lshow = calloc(s->list_n + 1, 1);
-    pv.anon_order = calloc(s->anon_n + 1, sizeof(*pv.anon_order));
     int rc = -1;
-    if (pv.oname && pv.cname && pv.lname && pv.cshow && pv.lshow && pv.anon_order)
+    if (pv.oname && pv.cname && pv.lname && pv.cshow && pv.lshow)
         rc = spec_print_v2_body(f, s, e, &pv);
     else if (e) err_set(e, "%s", "недостаточно памяти для печати спеки");
     free(pv.oname); free(pv.cname); free(pv.lname); free(pv.cshow); free(pv.lshow);
-    free(pv.anon_order); free(pv.on.v); free(pv.cn.v); free(pv.ln.v);
+    free(pv.on.v); free(pv.cn.v); free(pv.ln.v);
     return rc;
 }
 
@@ -439,31 +427,9 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
     char (*oname)[32] = pv->oname, (*cname)[32] = pv->cname, (*lname)[32] = pv->lname;
     unsigned char *cshow = pv->cshow, *lshow = pv->lshow;
     struct names *on = &pv->on, *cn = &pv->cn, *ln = &pv->ln;
-    size_t *anon_order = pv->anon_order;
-    struct onames onm = { (const char (*)[32])oname, s->out_n };
+    struct onames onm = { (const char (*)[32])oname };
 
     for (size_t i = 0; i < s->out_n; i++) name_take(on, s->out[i].name, NULL, oname[i]);
-    /* Члены пулов — после именованных, в порядке групп. Имя члена лежит в oname за именованными
-     * (oname_of): позиция = out_n + номер в sp->anon. */
-    size_t anon_n = 0;
-    for (size_t i = 0; i < s->out_n; i++) {
-        const struct group_cfg *g = out_group(&s->out[i]);
-        for (size_t k = 0; g && k < g->members_n; k++) {
-            size_t m = g->members[k];
-            if (spec_is_named(m)) continue;
-            size_t slot = s->out_n + (m - SPEC_ANON_BASE);
-            if (oname[slot][0]) continue;
-            char base[64];
-            snprintf(base, sizeof(base), "%.15s.%.15s", s->out[i].name, spec_out(s, m)->device);
-            if (!name_ok(base)) {
-                if (e) err_set(e, "выход %s: имя члена группы не складывается из имени и устройства",
-                               s->out[i].name);
-                return -1;
-            }
-            name_take(on, base, NULL, oname[slot]);
-            anon_order[anon_n++] = slot;
-        }
-    }
     /* Клиенты и списки: свои имена (спека v2) или имя правила, которое на них ссылается первым. */
     for (size_t i = 0; i < s->client_n; i++)
         if (s->client[i].name[0]) { name_take(cn, s->client[i].name, "lan", cname[i]); cshow[i] = 1; }
@@ -527,19 +493,11 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
 
     if (s->out_n) {
         size_t ow = width(oname, s->out_n, NULL);
-        for (size_t i = 0; i < anon_n; i++)
-            if (yq_len(oname[anon_order[i]]) > ow) ow = yq_len(oname[anon_order[i]]);
         fputs("\noutputs:\n", f);
         for (size_t i = 0; i < s->out_n; i++) {
             if (s->out[i].warp_of[0]) continue;         /* туннель kind: warp — часть его записи */
             key_pad(f, oname[i], ow);
             output_flow(f, s, &s->out[i], &onm);
-            fputc('\n', f);
-        }
-        for (size_t i = 0; i < anon_n; i++) {
-            const struct output *m = spec_out(s, SPEC_ANON_BASE + (anon_order[i] - s->out_n));
-            key_pad(f, oname[anon_order[i]], ow);
-            output_flow(f, s, m, &onm);
             fputc('\n', f);
         }
     }

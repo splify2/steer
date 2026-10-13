@@ -49,7 +49,7 @@ static int hy2_parse(struct output *o, const struct out_keys *k, struct err *e) 
     if (!o->hy2.sub_file[0]) {
         char msg[160];
         snprintf(msg, sizeof(msg), "outputs.%s: kind hysteria2 нужен %s с подпиской", o->name,
-                 out_key(k, "sub_file", "subscription"));
+                 "subscription");
         return err_set(e, "%s", msg);
     }
     /* transport — выбор транспорта узла VLESS; у hysteria2 транспорта нет. Промолчать значило бы
@@ -64,9 +64,6 @@ static int hy2_parse(struct output *o, const struct out_keys *k, struct err *e) 
     /* Имя устройства выводится из имени выхода, как у vless, и по тому же доводу: два имени
      * расходились бы, а пользы от различия нет. */
     if (!o->device[0]) snprintf(o->device, sizeof(o->device), "%.15s", o->name);
-    if (k->devices_n > 1 || (k->devices_n == 1 && strcmp(o->device, k->devices[0]) != 0))
-        return err_set(e, "outputs.%s: у kind hysteria2 одно устройство — его заводит ядро steer; пул "
-            "собирается выходом kind=interface", o->name);
     return 0;
 }
 

@@ -36,19 +36,13 @@ static int vless_parse(struct output *o, const struct out_keys *k, struct err *e
     if (!o->vless.sub_file[0]) {
         char msg[160];
         snprintf(msg, sizeof(msg), "outputs.%s: kind vless нужен %s с подпиской", o->name,
-                 out_key(k, "sub_file", "subscription"));
+                 "subscription");
         return err_set(e, "%s", msg);
     }
     /* Имя устройства выводится из имени выхода: держать его отдельным полем
      * значило бы дать двум именам расходиться, а никакой пользы от их различия
      * нет. Ограничение в 15 символов — предел IFNAMSIZ. */
     if (!o->device[0]) snprintf(o->device, sizeof(o->device), "%.15s", o->name);
-    /* Устройство у выхода ОДНО — его создаёт клиент этого выхода, как у awg. Пул из нескольких
-     * туннелей — это группа (`devices` у kind=interface); список здесь означал бы устройства,
-     * которые никто не создаст. */
-    if (k->devices_n > 1 || (k->devices_n == 1 && strcmp(o->device, k->devices[0]) != 0))
-        return err_set(e, "outputs.%s: у kind vless одно устройство — его заводит ядро steer; пул "
-            "собирается выходом kind=interface", o->name);
     return 0;
 }
 

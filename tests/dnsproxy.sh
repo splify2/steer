@@ -434,12 +434,6 @@ printf '{"version":2,"lan":{"addr":["127.0.0.0/8"]},'\
 '{"name":"f6","to":"f6","out":"vpn"},'\
 '{"name":"t4","to":"t4","out":"tg"}]}' \
     "$tmp" "$tmp" "$tmp" > "$tmp/spec6.json"
-printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
-'"outputs":{"vpn":{"kind":"interface","device":"lo"},"tg":{"kind":"tgws","domain":"example.com"}},'\
-'"channels":[{"name":"r6","match":{"domains_files":["%s/r6.lst"],"mode":"realip"},"out":"vpn"},'\
-'{"name":"f6","match":{"domains_files":["%s/f6.lst"]},"out":"vpn"},'\
-'{"name":"t4","match":{"domains_files":["%s/t4.lst"]},"out":"tg"}]}' \
-    "$tmp" "$tmp" "$tmp" > "$tmp/spec6v1.json"
 tab6="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/spec6.json" 2>/dev/null)"
 python3 "$tmp/upstream-aaaa.py" "$UPORT3" & UPID3=$!
 sleep 1
@@ -454,17 +448,6 @@ a_f6="$(python3 "$tmp/qaaaa.py" "$LPORT3" f6.test)"
 a_t4="$(python3 "$tmp/qaaaa.py" "$LPORT3" t4.test)"
 a_out="$(python3 "$tmp/qaaaa.py" "$LPORT3" out.test)"
 kill "$DPID3" 2>/dev/null; wait "$DPID3" 2>/dev/null
-# Спека v1 с теми же каналами — тот же апстрим, свой резолвер. real-ip — главный случай: у спеки v2
-# он отдаёт настоящий AAAA и без ядра, у v1 ответ пустой.
-LPORT4=15303
-tab6v1="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/spec6v1.json" 2>/dev/null)"
-STEER_NFT_COMPAT=modern "$BIN" dnsd --spec "$tmp/spec6v1.json" --state-dir "$tmp/state4" \
-    --listen-port "$LPORT4" --upstream-port "$UPORT3" > "$tmp/log4" 2>&1 & DPID4=$!
-sleep 1
-v1_r6="$(python3 "$tmp/qaaaa.py" "$LPORT4" r6.test)"
-v1_f6="$(python3 "$tmp/qaaaa.py" "$LPORT4" f6.test)"
-v1_out="$(python3 "$tmp/qaaaa.py" "$LPORT4" out.test)"
-kill "$DPID4" 2>/dev/null; wait "$DPID4" 2>/dev/null
 kill "$UPID3" 2>/dev/null; wait "$UPID3" 2>/dev/null
 
 check "таблица: правила в выход с IPv6 — семейства 4 и 6" "2" \
@@ -475,11 +458,6 @@ check "AAAA: real-ip в выход с IPv6 — настоящий адрес (AN
 check "AAAA: fake-IP без карты fakeip6 в ядре — пустой ответ, не настоящий AAAA" "0" "$a_f6"
 check "AAAA: правило в выход без IPv6 — пустой ответ" "0" "$a_t4"
 check "AAAA: имя вне правил — настоящий адрес" "1" "$a_out"
-check "спека v1: в таблице все три — только 4" "4 4 4" \
-    "$(printf '%s\n' "$tab6v1" | awk -F'|' 'NF > 4 { printf "%s%s", s, $4; s = " " }')"
-check "спека v1: AAAA real-ip в выход с IPv6 — пустой ответ, как до 1.9" "0" "$v1_r6"
-check "спека v1: AAAA fake-IP в выход с IPv6 — пустой ответ" "0" "$v1_f6"
-check "спека v1: имя вне правил — настоящий адрес" "1" "$v1_out"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

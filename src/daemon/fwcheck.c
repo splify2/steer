@@ -427,8 +427,7 @@ static const struct output *member_for_device(const struct spec *sp, const struc
     const struct group_cfg *g = out_group(o);
     if (!g || depth > 8) return o;
     for (size_t k = 0; k < g->members_n; k++) {
-        /* spec_out: член бывает безымянным (устройство из `devices`), и его номер — не место в out[]. */
-        const struct output *m = spec_out(sp, g->members[k]);
+                const struct output *m = spec_out(sp, g->members[k]);
         if (m != o && !strcmp(m->device, dev)) return member_for_device(sp, m, dev, depth + 1);
     }
     return o;

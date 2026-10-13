@@ -682,10 +682,11 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && command -v nsenter >/dev/null 2>&1 &&
     ip link set sw1 up; ip link set sw2 up
     ip addr add 10.9.1.1/24 dev sw1; ip addr add 10.9.2.1/24 dev sw2
     mkdir -p "$tmp/wstate"
-    # Пул devices — выход спеки v1 (в v2 это группа из выходов-членов, у неё другие события и
-    # другой файл active), поэтому сторож пула проверяется на спеке v1.
-    printf '{"schema":1,"outputs":{"vpn":{"kind":"interface","devices":["sw1","sw2"],"on_fail":"drop"}},'\
-'"channels":[{"name":"p","match":{"prefixes_files":["%s"]},"out":"vpn"}]}\n' "$tmp/p1.lst" > "$tmp/w.json"
+    # Сторож судит группу v2: члены — выходы kind: interface на устройствах sw1 и sw2, по порядку.
+    printf 'version: 2\nlists:\n  p: { prefixes_file: %s }\noutputs:\n' "$tmp/p1.lst" > "$tmp/w.yaml"
+    printf '  vpn: { kind: group, pick: order, members: [vpn.sw1, vpn.sw2], on_fail: drop }\n' >> "$tmp/w.yaml"
+    printf '  vpn.sw1: { kind: interface, device: sw1 }\n  vpn.sw2: { kind: interface, device: sw2 }\n' >> "$tmp/w.yaml"
+    printf 'rules:\n  - { name: p, to: p, out: vpn }\n' >> "$tmp/w.yaml"
     WD="" WU="" WSUB=""
     # wserve ПЕРИОД [pid] — поднять демона-сторожа заново. С «pid» — ещё и в своём пространстве
     # PID: там номера процессов идут подряд, и по ним видно, запускал ли демон кого-нибудь.
@@ -694,7 +695,7 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && command -v nsenter >/dev/null 2>&1 &&
         wstop
         pidns=""; [ "${2:-}" = pid ] && pidns="-p -f"
         unshare -m $pidns sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" daemon --watch \
-            --watch-period $1 --socket \"$tmp/w.sock\" --spec \"$tmp/w.json\" \
+            --watch-period $1 --socket \"$tmp/w.sock\" --spec \"$tmp/w.yaml\" \
             --state-dir \"$tmp/wstate\"" >>"$tmp/w.out" 2>>"$tmp/w.err" &
         WU=$! WD=$!
         wait_for '[ -S "$tmp/w.sock" ]' 5
@@ -711,6 +712,8 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && command -v nsenter >/dev/null 2>&1 &&
     }
     wctl() { "$BIN" ctl --socket "$tmp/w.sock" "$@"; }
     wdev() { wctl status | j stdout | j outputs.vpn.device; }
+    wactive() { grep '^vpn ' "$tmp/wstate/active"; }
+    wtbl_all() { ip -4 route show table "$(awk '$1 == "vpn" { print $3 }' "$tmp/wstate/registry")"; }
     wtbl() { ip -4 route show table "$(awk '$1 == "vpn" { print $3 }' "$tmp/wstate/registry")" | grep '^default\|^blackhole default' | grep -v 'metric 65535'; }
     # Сколько эхо-запросов ответчик получил (Icmp InEchos его пространства) — по ним видны пробы.
     echos() { R awk '/^Icmp:/ { if (!h) { for (i = 1; i <= NF; i++) if ($i == "InEchos") c = i; h = 1 } else print $c }' /proc/net/snmp; }
@@ -720,7 +723,7 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && command -v nsenter >/dev/null 2>&1 &&
     nspid() { nsenter -t "$WD" -p sh -c 'echo $$'; }
     wserve 60
     wait_for 'grep -q "^vpn sw1 0$" "$tmp/wstate/active" 2>/dev/null' 5
-    check "сторож: первый проход при старте — выход на первом устройстве пула" "sw1" "$(wdev)"
+    check "сторож: первый проход при старте — выход на первом члене группы" "sw1" "$(wdev)"
     check "  таблица выхода привязана к нему" "default dev sw1 scope link" "$(wtbl | sed 's/ *$//')"
     check "  проба — эхо ICMP через устройство, ответчик его получил" "1" \
         "$([ "$(echos)" -ge 1 ] && echo 1 || echo 0)"
@@ -733,20 +736,20 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && command -v nsenter >/dev/null 2>&1 &&
     ip link set sw1 down
     wait_for 'grep -q "\"ev\":\"switched\"" "$tmp/wsub.out"' 12
     check "сторож: устройство упало — подписчику switched с причиной" \
-        '{"v":1,"ev":"switched","out":"vpn","from":"sw1","to":"sw2","why":"down"}' \
+        '{"v":1,"ev":"switched","out":"vpn","from":"sw1","to":"sw2","why":"down","member":"vpn.sw2"}' \
         "$(grep '"ev":"switched"' "$tmp/wsub.out")"
     check "  status из памяти демона — новое устройство" "sw2" "$(wdev)"
     check "  таблица выхода — на новом устройстве" "default dev sw2 scope link" "$(wtbl | sed 's/ *$//')"
-    check "  выбор отражён в файл active (его читают подкоманды) — прежним форматом" "vpn sw2 0" \
-        "$(cat "$tmp/wstate/active")"
+    check "  выбор отражён в файл active (его читают подкоманды)" "vpn sw2 0" \
+        "$(wactive)"
     check "  замеры и отметки оживлений на диск не пишутся" "" \
         "$(ls "$tmp/wstate" | grep '^latency\|^restart-')"
 
     # Долгая проба: первая цель молчит (адрес у ответчика снят — эхо ждёт свои три секунды),
     # а демон отвечает сразу: проба ждёт в его цикле, а не в ребёнке.
     R ip addr del 1.1.1.1/32 dev lo
-    ip link add sw3 type dummy
-    wait_for '[ "$(rawsocks)" -gt 0 ]' 12
+    ip addr add 10.9.9.1/24 dev sw2   # событие адреса члена будит сторожа: проход — через успокоение
+    wait_for '[ "$(rawsocks)" -gt 0 ]' 25
     t0=$(date +%s%N); r="$(wctl status)"; t1=$(date +%s%N)
     ms=$(( (t1 - t0) / 1000000 ))
     check "сторож: status во время пробы отвечает сразу (код 0, быстрее секунды, проба ещё идёт)" \
@@ -755,32 +758,36 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && command -v nsenter >/dev/null 2>&1 &&
     wait_for '[ "$(rawsocks)" = 0 ]' 10
     check "  промолчала первая цель — ответила вторая, выход на месте" "sw2" "$(wdev)"
     R ip addr add 1.1.1.1/32 dev lo
-    ip link del sw3
+    ip addr del 10.9.9.1/24 dev sw2
     sleep 0.5
 
-    # Упало и второе: первое в пуле оживает, пока сторож его ждёт, — revived и возврат на него.
+    # Упало и второе: оба члена в отказе, группа тоже, трафик остановлен (on_fail). Первый
+    # оживает сам, пока сторож его ждёт, — группа возвращается на него. Событие revived здесь
+    # не приходит: оно о перезапуске интерфейса, а подъём устройства своим ходом — recovered; сторож
+    # ждёт оживления члена до ≈70 с (шаги ожидания подъёма), отсюда долгое ожидание ниже.
     before=$(wc -l < "$tmp/w.err")
     ip link set sw2 down
     wait_for '[ "$(tail -n +$((before + 1)) "$tmp/w.err" | grep -c "sw1: не отвечает")" -gt 0 ]' 12
+    wait_for 'grep -q "\"ev\":\"failed\",\"out\":\"vpn\"," "$tmp/wsub.out"' 12
+    check "сторож: оба члена упали — failed у группы" \
+        '{"v":1,"ev":"failed","out":"vpn","from":"sw2","on_fail":"drop","why":"down"}' \
+        "$(grep '"ev":"failed","out":"vpn",' "$tmp/wsub.out")"
     ip link set sw1 up
-    wait_for 'grep -q "\"ev\":\"revived\"" "$tmp/wsub.out"' 12
-    wait_for '[ "$(grep -c "\"ev\":\"switched\"" "$tmp/wsub.out")" -ge 2 ]' 5
-    check "сторож: ожившее при оживлении устройство — revived" \
-        '{"v":1,"ev":"revived","out":"vpn","dev":"sw1"}' "$(grep '"ev":"revived"' "$tmp/wsub.out")"
-    check "  и switched назад на него" \
-        '{"v":1,"ev":"switched","out":"vpn","from":"sw2","to":"sw1","why":"down"}' \
-        "$(grep '"ev":"switched"' "$tmp/wsub.out" | tail -n 1)"
+    wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vpn\",\"from\":null" "$tmp/wsub.out"' 100
+    check "  первый член ожил — switched группы на него (прежнего устройства не было)" \
+        '{"v":1,"ev":"switched","out":"vpn","from":null,"to":"sw1","why":"recovered","member":"vpn.sw1"}' \
+        "$(grep '"ev":"switched","out":"vpn",' "$tmp/wsub.out" | tail -n 1)"
     check "  status — снова первое" "sw1" "$(wdev)"
 
     # Живых нет: sw1 недавно оживляли (отметка в памяти — не чаще раза в пять минут), sw2 ждём
     # десять секунд — и отказ с on_fail=drop.
     ip link set sw1 down
-    wait_for 'grep -q "\"ev\":\"failed\"" "$tmp/wsub.out"' 25
-    check "сторож: живых устройств нет — failed с применённым on_fail" \
+    wait_for '[ "$(grep -c "\"ev\":\"failed\",\"out\":\"vpn\"," "$tmp/wsub.out")" -ge 2 ]' 25
+    check "сторож: живых членов нет — failed группы с применённым on_fail" \
         '{"v":1,"ev":"failed","out":"vpn","from":"sw1","on_fail":"drop","why":"down"}' \
-        "$(grep '"ev":"failed"' "$tmp/wsub.out")"
-    check "  в таблице запрет" "blackhole default" "$(wtbl | sed 's/ *$//')"
-    check "  status: устройства нет" "vpn - 0" "$(cat "$tmp/wstate/active")"
+        "$(grep '"ev":"failed","out":"vpn",' "$tmp/wsub.out" | tail -n 1)"
+    check "  в таблице запрет" "yes" "$(wtbl_all | grep -q '^blackhole default' && echo yes || echo no)"
+    check "  status: устройства нет" "vpn - 0" "$(wactive)"
 
     # Тишина при периоде 60: проход кончился, событий нет — демон спит.
     sleep 1
@@ -799,8 +806,11 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && command -v nsenter >/dev/null 2>&1 &&
     # Смена operstate приходит от linkwatch с задержкой до секунды — пусть придёт прежнему демону,
     # а не новому: иначе его первый период съело бы внеочередное успокоение.
     sleep 2
-    printf 'vpn sw1 0\n' > "$tmp/wstate/active"
-    ip route replace default dev sw1 table "$(awk '$1 == "vpn" { print $3 }' "$tmp/wstate/registry")"
+    # Запись выбора и таблицы — как у исправного демона: группа на sw1, члены каждый на своём.
+    printf 'vpn sw1 0\nvpn.sw1 sw1 0\nvpn.sw2 sw2 0\n' > "$tmp/wstate/active"
+    for o in vpn:sw1 vpn.sw1:sw1 vpn.sw2:sw2; do
+        ip route replace default dev "${o#*:}" table "$(awk -v o="${o%:*}" '$1 == o { print $3 }' "$tmp/wstate/registry")"
+    done
     outs=$(wc -l < "$tmp/w.out")
     e0=$(echos)
     wserve 2 pid
@@ -812,8 +822,8 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && command -v nsenter >/dev/null 2>&1 &&
     check "сторож: после перезапуска демона выход не перепривязан" "0" \
         "$(tail -n +$((outs + 1)) "$tmp/w.out" | grep -c 'выход vpn')"
     n=$((e1 - e0))
-    check "  проходы — по периоду, не чаще (эхо-проб за 7 с при периоде 2)" "ok" \
-        "$([ "$n" -ge 3 ] && [ "$n" -le 5 ] && echo ok || echo "n=$n")"
+    check "  проходы — по периоду, не чаще (эхо-проб за 7 с при периоде 2: у каждого из двух членов)" "ok" \
+        "$([ "$n" -ge 6 ] && [ "$n" -le 10 ] && echo ok || echo "n=$n")"
     check "  процессов на проход нет (новых PID в пространстве демона за 6 с, кроме своих)" "0" \
         "$(( p1 - p0 - 1 ))"
     check "  журнал сторожа — с уровнем" "0" \

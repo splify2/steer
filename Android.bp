@@ -66,7 +66,6 @@ cc_defaults {
         "src/platform/android.c",
         "src/profile/profile.c",
         "src/model/parse.c",
-        "src/model/v1.c",
         "src/model/check.c",
         "src/model/v2.c",
         "src/model/v2print.c",

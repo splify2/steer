@@ -109,17 +109,7 @@ static int load_from_str(const char *spec) {
     return rc;
 }
 
-/* Удобные конструкторы спек: from_default вынесен в обёртку, чтобы каждый тест-случай
- * оставался читаемым и описывал только то, что проверяет.
- * SPEC — для литеральных спек: подставляет body и закрывает объект.
- * SPEC_OPEN — для динамически собираемых (sprintf в цикле): только префикс, закрытие
- *   делает сам тест. Иначе SPEC("") оставлял бы хвостовую '}', и дописанный после неё
- *   "outputs" парсер не видел. */
-#define SPEC(body) \
-    "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"]," body "}"
-#define SPEC_OPEN \
-    "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
-/* Начало спеки v2 (JSON) для спек, собираемых sprintf в цикле; закрытие — за самим тестом. */
+/* Начало спеки v2 (JSON) для спек, собираемых sprintf; закрытие — за самим тестом. */
 #define V2_OPEN "{\"version\":2,"
 
 int main(void) {
@@ -202,7 +192,7 @@ int main(void) {
         check("выключенный канал: disabled=1", 1, CH_RULE(0)->disabled);
     }
     {
-        /* ---- schema 2: протокол и порты назначения ---------------------------------
+        /* ---- протокол и порты назначения ---------------------------------
          *
          * ПОЧЕМУ ВЕРСИЯ, А НЕ ПРОСТО НОВЫЙ КЛЮЧ. Неизвестный ключ парсер пропускает
          * (js_skip), и для всего, что совпадение РАСШИРЯЕТ, это верно: не понял — ничего не
@@ -211,7 +201,7 @@ int main(void) {
          * TCP к Cloudflare молча в туннель. Отсюда major: движок постарше обязан отвергнуть
          * спеку ЦЕЛИКОМ, а не понять её наполовину.
          */
-        check("schema=2: принимается", 0,
+        check("version 2: принимается", 0,
               load_from_str("version: 2\n"
             "lan: { devices: [br-lan] }\n"));
 
@@ -261,33 +251,6 @@ int main(void) {
             "rules:\n"
             "  - { name: p, to: [p], out: wg }\n"));
         check("proto both значит «не критерий»", CH_PROTO_ANY, CH_LIST(0)->l4.proto);
-        /* ...но ключ схемы 2 при этом ЗАПИСАН, и в спеке schema 1 он обязан быть отказом:
-         * иначе «both» проходил бы там, где «udp» отвергается, а человек читал бы это как
-         * «порты в первой схеме работают». */
-        check("proto both в схеме 1: отказ", 2,
-              load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
-                                 "\"channels\":[{\"name\":\"p\",\"out\":\"wg\",\"match\":{"
-                                 "\"prefixes_file\":\"/tmp/p.lst\",\"proto\":\"both\"}}]}")));
-
-        /* Спека schema 1 с полями схемы 2 — отказ, а НЕ молчаливый пропуск. Молчаливый
-         * пропуск и есть та беда, от которой заведена версия: человек считает, что сузил. */
-        check("ports в схеме 1: отказ", 2,
-              load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
-                                 "\"channels\":[{\"name\":\"p\",\"out\":\"wg\",\"match\":{"
-                                 "\"prefixes_file\":\"/tmp/p.lst\",\"ports\":[\"443\"]}}]}")));
-        check("proto в схеме 1: отказ", 2,
-              load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
-                                 "\"channels\":[{\"name\":\"p\",\"out\":\"wg\",\"match\":{"
-                                 "\"prefixes_file\":\"/tmp/p.lst\",\"proto\":\"udp\"}}]}")));
-        /* Отказ касается и ВЫКЛЮЧЕННОГО канала, в отличие от прочих проверок канала. Там
-         * исключение сделано затем, чтобы сломанное правило можно было выключить, а не
-         * только удалить; здесь чинить надо не правило, а число схемы у всей спеки. */
-        check("ports в схеме 1 у выключенного канала: тоже отказ", 2,
-              load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
-                                 "\"channels\":[{\"name\":\"p\",\"out\":\"wg\",\"enabled\":false,"
-                                 "\"match\":{\"prefixes_file\":\"/tmp/p.lst\","
-                                 "\"ports\":[\"443\"]}}]}")));
-
         /* Порты БЕЗ списка адресов — недописанная настройка, а не «канал ловит по портам»:
          * правило без `ip daddr` накрыло бы весь трафик клиентов на этих портах. Прежний
          * отказ обязан остаться в силе — новые поля источником совпадения не являются. */
@@ -320,10 +283,6 @@ int main(void) {
             "rules:\n"
             "  - { name: s, to: [s], out: wg }\n"));
         check("srs_files: два пути", 2, CH_N == 1 ? (long)CH_LIST(0)->srs_n : -1);
-        check("srs_file рядом с srs_files: отказ", 2,
-              load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
-                                 "\"channels\":[{\"name\":\"s\",\"out\":\"wg\",\"match\":{"
-                                 "\"srs_files\":[\"/tmp/a.srs\"],\"srs_file\":\"/tmp/b.srs\"}}]}")));
         check("any рядом с srs_files — не «весь трафик», allow_all не нужен", 0,
               load_from_str("version: 2\n"
             "lan: { devices: [br-lan], addr: [192.168.1.0/24] }\n"
@@ -440,12 +399,39 @@ int main(void) {
     {
         /* ---- невалидные спеки: каждая обязана die()/exit(2) ---- */
 
-        /* Неизвестный major — отказ; весь смысл поля в этом, а не в угадывании. Двойка
-         * теперь ЗНАКОМА (протокол и порты у канала), поэтому граница проверяется тройкой:
-         * стеречь надо отказ на незнакомом числе, а не конкретное число. */
-        check("schema=3: отказ", 2, load_from_str("{\"schema\":3,\"outputs\":{},\"channels\":[]}"));
-        check("schema отсутствует: отказ", 2,
-              load_from_str("{\"outputs\":{},\"channels\":[]}"));
+        /* Спека v1 больше не читается: JSON со "schema", YAML со schema без version, а также
+         * спека без version и без schema — отказ с понятным текстом. */
+        {
+            struct err e1 = {0};
+            const char *txt[] = {
+                "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],\"outputs\":{},\"channels\":[]}",
+                "schema: 1\nfrom_default: [192.168.1.0/24]\noutputs: {}\nchannels: []\n",
+            };
+            for (int k = 0; k < 2; k++) {
+                char tmp[256];
+                snprintf(tmp, sizeof tmp, "/tmp/specmatch.v1.%d.json", (int)getpid());
+                FILE *f = fopen(tmp, "w");
+                if (f) { fputs(txt[k], f); fclose(f); }
+                reset_globals();
+                memset(&e1, 0, sizeof e1);
+                int rc = load_spec(tmp, &g_spec, &e1);
+                unlink(tmp);
+                check(k ? "спека YAML со schema без version: отказ" : "спека JSON со schema:1: отказ", -1, rc);
+                check(k ? "...текст: спека v1 больше не читается (YAML)" : "...текст: спека v1 больше не читается (JSON)",
+                      1, strstr(e1.msg, "спека v1 больше не читается") != NULL);
+            }
+            const char *nov = "lan: { devices: [br-lan] }\noutputs:\n  direct: { kind: direct }\n";
+            char tmp[256];
+            snprintf(tmp, sizeof tmp, "/tmp/specmatch.nov.%d.json", (int)getpid());
+            FILE *f = fopen(tmp, "w");
+            if (f) { fputs(nov, f); fclose(f); }
+            reset_globals();
+            memset(&e1, 0, sizeof e1);
+            int rc = load_spec(tmp, &g_spec, &e1);
+            unlink(tmp);
+            check("спека без version и без schema: отказ", -1, rc);
+            check("...текст: нет version: 2", 1, strstr(e1.msg, "нет version: 2") != NULL);
+        }
 
         /* Канал → несуществующий выход: правило применяется, но ведёт в никуда. */
         check("канал → несуществующий выход: отказ", 2,
@@ -473,13 +459,6 @@ int main(void) {
             "outputs: {\"wg.wg0\": {\"kind\": \"interface\", \"device\": \"wg0\"}, \"wg\": {\"kind\": \"group\", \"pick\": \"order\", \"members\": [\"wg.wg0\", \"wg.wg0\"]}}\n"
             "rules: [{\"name\": \"c\", \"to\": [\"l0\"], \"out\": \"wg\"}]\n"));
 
-        /* any-канал в туннель (interface/vless) без allow_all уводит ВЕСЬ трафик
-         * клиентов, включая доступ к роутеру и DNS. Требует явного согласия. */
-        check("any в туннель без allow_all: отказ", 2,
-              load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
-                                 "\"channels\":[{\"name\":\"a\",\"out\":\"wg\","
-                                 "\"match\":{\"any\":true}}]}")));
-
         /* Тот же any-канал, но с allow_all=true внутри match — законная осознанная
          * конфигурация. allow_all живёт в match, рядом с any (src/model/v1.c). */
         check("any в туннель с allow_all: разрешён", 0,
@@ -502,25 +481,6 @@ int main(void) {
               load_from_str("version: 2\n"
             "lan: {\"addr\": [\"192.168.1.0/24\"]}\n"
             "outputs: {\"wg\": {\"kind\": \"interface\", \"device\": \"wg0\", \"on_fail\": \"teleport\"}}\n"));
-
-        /* Канал без name: его невозможно сослаться, объяснить, отлаживать. */
-        check("канал без name: отказ", 2,
-              load_from_str(SPEC("\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-                                 "\"channels\":[{\"out\":\"direct\","
-                                 "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]}")));
-
-        /* Канал без out: правило без назначения. */
-        check("канал без out: отказ", 2,
-              load_from_str(SPEC("\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-                                 "\"channels\":[{\"name\":\"x\","
-                                 "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]}")));
-
-        /* Канал, который ничего не матчит: нет ни списков, ни any. Правило без
-         * смысла — отказываем громко, а не молча создаём пустой набор. */
-        check("канал matches nothing: отказ", 2,
-              load_from_str(SPEC("\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-                                 "\"channels\":[{\"name\":\"x\",\"out\":\"direct\","
-                                 "\"match\":{}}]}")));
 
         /* Выходов без метки (direct) — сколько написано: предела нет, метка им не нужна. */
         {
@@ -654,49 +614,6 @@ int main(void) {
             free(over);
         }
     }
-    {
-        /* I-006: Trailing comma в domains_files (путь str_list). Раньше str_list на
-         * `[...,]` после последнего элемента делал continue, js_str видел ']' (не '"'),
-         * возвращал -1 → return n ДО js_lit(']'), закрывающая скобка оставалась
-         * несъеденной, и вызывающий цикл parse_channels while(*j.p != '}') крутился на
-         * ']' вечно (100% CPU, зависание демона steer apply). Должен быть die()/exit(2). */
-        const char *s = SPEC(
-            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-            "\"channels\":[{\"name\":\"t\",\"out\":\"direct\","
-            "\"match\":{\"domains_files\":[\"/tmp/a.lst\",]}}]}");
-        check("trailing comma в domains_files: отказ (I-006)", 2, load_from_str(s));
-        /* Список без ']' (и без запятой между записями) раньше принимался: js_lit(']') не
-         * проверялся, и разбор шёл дальше с несъеденным хвостом. */
-        s = SPEC(
-            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-            "\"channels\":[{\"name\":\"t\",\"out\":\"direct\","
-            "\"match\":{\"domains_files\":[\"/tmp/a.lst\" \"/tmp/b.lst\"]}}]}");
-        check("domains_files без запятой между записями: отказ", 2, load_from_str(s));
-    }
-    {
-        /* I-006: тот же дефект в str_array — путь `from`. str_array, как и str_list,
-         * выходил через break до js_lit(']'), и оставшаяся ']' могла увести вызывающий
-         * цикл в бесконечное вращение (js_str для ключа возвращает -1, возврат не
-         * проверяется, j->p не двигается). */
-        const char *s = SPEC(
-            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
-            "\"channels\":[{\"name\":\"t\",\"out\":\"wg\","
-            "\"from\":[\"10.0.0.1\",],"
-            "\"match\":{\"domains_file\":\"/tmp/a.lst\"}}]}");
-        check("trailing comma в from: отказ (I-006)", 2, load_from_str(s));
-    }
-    {
-        /* I-006: тот же дефект в inline-парсере devices внутри parse_outputs. Цикл
-         * `else for(;;)` после `,` делает continue, js_str видит ']', break — и не
-         * доходит до js_lit(']'). Оставшаяся ']' ломает parse_outputs аналогично. */
-        const char *s = SPEC(
-            "\"outputs\":{\"wg\":{\"kind\":\"interface\","
-            "\"devices\":[\"wg0\",]}},"
-            "\"channels\":[{\"name\":\"t\",\"out\":\"wg\","
-            "\"match\":{\"domains_file\":\"/tmp/a.lst\"}}]}");
-        check("trailing comma в devices: отказ (I-006)", 2, load_from_str(s));
-    }
-
     /* ---- obfs: WireGuard поверх поддельного TCP ---------------------------------
      *
      * Проверяется ровно то, что молчаливо ломает туннель: принятое, но неполное
@@ -800,14 +717,6 @@ int main(void) {
             "  yt: { kind: zapret, strategy: /etc/y.opts }\n";
         check("zapret: явный opts_file принят", 0, load_from_str(s));
         check_str("zapret: явный opts_file сохранён", "/etc/y.opts", g_spec.out[0].zp.opts);
-    }
-    {
-        /* Относительный путь «работал бы из шелла» и не работал бы у службы: процесс
-         * запускает procd со своим рабочим каталогом. Тот же барьер, что у conf у xsteer. */
-        const char *s = SPEC(
-            "\"outputs\":{\"yt\":{\"kind\":\"zapret\",\"opts_file\":\"y.opts\"}},"
-            "\"channels\":[]}");
-        check("zapret: относительный opts_file — отказ", 2, load_from_str(s));
     }
     {
         /* Названное устройство — почти наверняка описка при копировании выхода-туннеля.
@@ -1009,15 +918,6 @@ int main(void) {
         check("nodes пустой список: кандидатов не выбрано", 0, (int)g_spec.out[0].vless.nodes_n);
     }
     {
-        /* Обе формы сразу — отказ, ровно как lan_device вместе с lan_devices: взять одну молча
-         * значило бы, что половина написанного человеком не действует. */
-        const char *s = SPEC(
-            "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
-            "\"node\":4,\"nodes\":[6,7]}},"
-            "\"channels\":[]}");
-        check("node вместе с nodes — отказ", 2, load_from_str(s));
-    }
-    {
         /* Дубликат делает перебор бессмысленным так же, как дубликат устройства в devices. */
         const char *s = "version: 2\n"
             "lan: {\"addr\": [\"192.168.1.0/24\"]}\n"
@@ -1055,13 +955,6 @@ int main(void) {
             "outputs: {\"vpn\": {\"kind\": \"tunnel\", \"protocol\": \"vless\", \"subscription\": \"/tmp/sub.txt\", \"nodes\": [\"6\"]}}\n";
         check("номер строкой в nodes — отказ", 2, load_from_str(s));
     }
-    {
-        const char *s = SPEC(
-            "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
-            "\"nodes\":[6,]}},"
-            "\"channels\":[]}");
-        check("хвостовая запятая в nodes — отказ", 2, load_from_str(s));
-    }
 #endif
 #ifdef SPECMATCH_EXT
     {
@@ -1073,12 +966,6 @@ int main(void) {
             "  vpn: { kind: xsteer, conf: /etc/hub.conf }\n";
         check("xsteer: явный conf принят", 0, load_from_str(s));
         check_str("xsteer: явный conf сохранён", "/etc/hub.conf", g_spec.out[0].xs.conf);
-    }
-    {
-        const char *s = SPEC(
-            "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\",\"conf\":\"hub.conf\"}},"
-            "\"channels\":[]}");
-        check("xsteer: относительный conf — отказ", 2, load_from_str(s));
     }
     {
         /* У xsteer свой транспорт и своя маскировка внутри движка: obfs здесь означал бы
@@ -1095,12 +982,6 @@ int main(void) {
             "lan: {\"devices\": [\"br-lan\"], \"addr\": [\"192.168.1.0/24\"]}\n"
             "outputs: {\"vpn\": {\"kind\": \"xsteer\", \"device\": \"br-lan\"}}\n";
         check("xsteer: устройство = lan_device — отказ", 2, load_from_str(s));
-    }
-    {
-        const char *s = SPEC(
-            "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\"}},"
-            "\"channels\":[{\"name\":\"всё\",\"out\":\"vpn\",\"match\":{\"any\":true}}]}");
-        check("xsteer: any без allow_all — отказ", 2, load_from_str(s));
     }
 #endif
     {
@@ -1448,14 +1329,6 @@ int main(void) {
     {
         /* Обрыв после последнего канала: нет `]}`. Так выглядит файл после отключения питания
          * посреди записи — половина спеки применялась без единой жалобы. */
-        check("обрыв: нет закрывающих скобок — отказ", 2, load_from_str(
-            "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
-            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-            "\"channels\":[{\"name\":\"yt\",\"out\":\"direct\","
-            "\"match\":{\"domains_file\":\"/tmp/yt.lst\"}}"));
-        check("обрыв: outputs без закрывающей скобки — отказ", 2, load_from_str(
-            "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
-            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}"));
         /* Два выхода с одним именем: реестр раздаёт две метки, init поднимает два процесса на
          * одно имя, out_by_name всегда берёт первый — как у devices/nodes, это отказ. */
         check("два выхода с одним именем — отказ", 2, load_from_str("version: 2\n"
@@ -1468,15 +1341,6 @@ int main(void) {
         check("node строкой — отказ", 2, load_from_str("version: 2\n"
             "lan: {\"addr\": [\"192.168.1.0/24\"]}\n"
             "outputs: {\"vl\": {\"kind\": \"tunnel\", \"protocol\": \"vless\", \"subscription\": \"/tmp/s\", \"nodes\": [\"3\"]}}\n"));
-        check("schema строкой — отказ", 2, load_from_str(
-            "{\"schema\":\"1\",\"from_default\":[\"192.168.1.0/24\"],"
-            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},\"channels\":[]}"));
-        /* Единственное рядом с множественным у списков канала — как у device/devices: отказ, а
-         * не молчаливая победа того, что прочитано позже. */
-        check("prefixes_file рядом с prefixes_files — отказ", 2, load_from_str(SPEC(
-            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-            "\"channels\":[{\"name\":\"a\",\"out\":\"direct\",\"match\":{"
-            "\"prefixes_files\":[\"/tmp/a\",\"/tmp/b\"],\"prefixes_file\":\"/tmp/c\"}}]")));
         /* Имя длиннее буфера резалось молча до 31 байта: для device это ещё и больше IFNAMSIZ. */
         check("имя выхода длиннее 31 байта — отказ", 2, load_from_str("version: 2\n"
             "lan: {\"addr\": [\"192.168.1.0/24\"]}\n"
@@ -1535,21 +1399,6 @@ int main(void) {
             snprintf(what, sizeof what, "enabled:%s — disabled=%d", ev[k].v, ev[k].disabled);
             check(what, ev[k].disabled, CH_N ? CH_RULE(0)->disabled : -1);
         }
-        /* Числа и null вместо true/false — только спека v1 (v2 принимает одни true и false). */
-        static const struct { const char *v; int disabled; } ev1[] = {
-            { "0", 1 }, { "1", 0 }, { "null", 0 },
-        };
-        for (size_t k = 0; k < sizeof ev1 / sizeof *ev1; k++) {
-            char s[512], what[96];
-            snprintf(s, sizeof s, SPEC(
-                "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-                "\"channels\":[{\"name\":\"c\",\"out\":\"direct\",\"enabled\":%s,"
-                "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]"), ev1[k].v);
-            snprintf(what, sizeof what, "enabled:%s — грузится", ev1[k].v);
-            check(what, 0, load_from_str(s));
-            snprintf(what, sizeof what, "enabled:%s — disabled=%d", ev1[k].v, ev1[k].disabled);
-            check(what, ev1[k].disabled, CH_N ? CH_RULE(0)->disabled : -1);
-        }
     }
 
     /* ---- ключ без двоеточия (I-315) ------------------------------------------------
@@ -1558,19 +1407,6 @@ int main(void) {
      * читался как {"kind":"direct"}. Это не JSON: интерфейс такую спеку не разберёт, а
      * движок молча принимал. Каждое из четырёх мест — отдельный случай. */
     {
-        check("ключ верхнего уровня без ':' — отказ", 2, load_from_str(
-            "{\"schema\" 1,\"from_default\":[\"192.168.1.0/24\"],"
-            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},\"channels\":[]}"));
-        check("ключ выхода без ':' — отказ", 2, load_from_str(SPEC(
-            "\"outputs\":{\"direct\":{\"kind\" \"direct\"}},\"channels\":[]")));
-        check("ключ канала без ':' — отказ", 2, load_from_str(SPEC(
-            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-            "\"channels\":[{\"name\" \"c\",\"out\":\"direct\","
-            "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]")));
-        check("ключ obfs без ':' — отказ", 2, load_from_str(SPEC(
-            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\","
-            "\"obfs\":{\"server\" \"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
-            "\"channels\":[]")));
         check("те же спеки с ':' грузятся", 0, load_from_str("version: 2\n"
             "lan: { devices: [br-lan], addr: [192.168.1.0/24] }\n"
             "lists:\n"
@@ -1614,15 +1450,6 @@ int main(void) {
         check("и пустая выброшена, адрес остался", 1, CH_N ? (int)CH_WHO(0)->from_n : -1);
         check_str("и это тот адрес", "192.168.1.5", CH_N ? CH_WHO(0)->from[0] : "");
         check("и канал применяется", 0, CH_N ? CH_RULE(0)->disabled : -1);
-        check("from:[\"\"] у выключенного канала — грузится", 0, load_from_str(SPEC(
-            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-            "\"channels\":[{\"name\":\"c\",\"out\":\"direct\",\"from\":[\"\"],"
-            "\"enabled\":false,\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]")));
-        check("from_default:[\"\"] у канала без from — отказ", 2, load_from_str(
-            "{\"schema\":1,\"from_default\":[\"\"],"
-            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
-            "\"channels\":[{\"name\":\"c\",\"out\":\"direct\","
-            "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]}"));
     }
 
     /* ---- вложенные выходы: via ---------------------------------------------------------
@@ -1652,9 +1479,6 @@ int main(void) {
     check("via: цель ниже в спеке — принята", 0, load_from_str("version: 2\n"
             "lan: {\"addr\": [\"192.168.1.0/24\"]}\n"
             "outputs: {\"b\": {\"kind\": \"interface\", \"device\": \"wg1\"}, \"a\": {\"kind\": \"interface\", \"device\": \"wg0\", \"obfs\": {\"server\": \"203.0.113.10:4567\", \"listen\": \"127.0.0.1:51820\"}, \"over\": \"b\"}}\n"));
-    check("via: пустая строка — как без via", 0, load_from_str(SPEC(
-        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"\"}},\"channels\":[]}")));
-    check("via: пустая строка — поле пустое", 1, g_spec.out_n == 1 && !out_over(&g_spec, &g_spec.out[0]));
     check("via: негодное имя — отказ", 2, load_from_str("version: 2\n"
             "lan: {\"addr\": [\"192.168.1.0/24\"]}\n"
             "outputs: {\"a\": {\"kind\": \"interface\", \"device\": \"wg0\", \"obfs\": {\"server\": \"203.0.113.10:4567\", \"listen\": \"127.0.0.1:51820\"}, \"over\": \"b c\"}}\n"));

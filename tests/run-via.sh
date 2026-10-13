@@ -103,23 +103,28 @@ if [ "$MODE" = router ]; then
     ip netns exec $C ip link set eth0 up
     ip netns exec $C ip route add default via 10.73.0.1
     inA sysctl -qw net.ipv4.ip_forward=1
-    FROM='"10.73.0.2"'
+    CLIENT="addr: [10.73.0.2]"
 else
-    FROM="\"uid:$APP_UID\""
+    CLIENT="uid: [$APP_UID]"
 fi
+LAN="lan: { devices: [$LAN_DEV] }"
 
 inS python3 tests/fake-vless.py --port $PORT --uuid $UUID --mb $MB --bind $NODE --udp-relay \
     > "$WORK/srv.log" 2>&1 &
 sleep 1
 
 printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-spec() {   # $1 — строка via у выхода vl (пустая — без via)
-    cat > "$WORK/spec.json" <<SPEC
-{"schema":2,"lan_devices":["$LAN_DEV"],
- "outputs":{
-   "vx":{"kind":"interface","device":"vx0","on_fail":"drop"},
-   "vl":{"kind":"vless","sub_file":"$WORK/sub.txt","node":0$1}},
- "channels":[{"name":"all","out":"vl","scope":"device","from":[$FROM],"match":{"any":true}}]}
+spec() {   # $1 — ключ over у выхода vl (пустой — без over): ", over: vx"
+    cat > "$WORK/spec.yaml" <<SPEC
+version: 2
+$LAN
+clients:
+  c: { $CLIENT }
+outputs:
+  vx: { kind: interface, device: vx0, on_fail: drop }
+  vl: { kind: tunnel, protocol: vless, subscription: $WORK/sub.txt$1 }
+rules:
+  - { name: all, for: c, to: all, out: vl, scope: device }
 SPEC
 }
 
@@ -142,7 +147,7 @@ cnt_zero() { inA nft reset rules inet viacnt post >/dev/null 2>&1 || true; }
 start_vless() {
     # Не через inA: функция в фоне — это подоболочка, и $! дал бы её, а не движок (kill
     # оставил бы прежний туннель жить, и следующая часть мерила бы его).
-    ip netns exec $A "$BIN" vless vl --spec "$WORK/spec.json" --state-dir "$WORK/state" \
+    ip netns exec $A "$BIN" vless vl --spec "$WORK/spec.yaml" --state-dir "$WORK/state" \
         > "$WORK/tun.log" 2>&1 &
     VL_PID=$!
     for _ in $(seq 50); do
@@ -185,8 +190,8 @@ fetch() {
 echo "run-via: режим $MODE, раскладка ${STEER_NFT_COMPAT:-по пробе}"
 
 # ---- 1. vl через vx -----------------------------------------------------------------
-spec ',"via":"vx"'
-if inA "$BIN" apply --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/apply.log" 2>&1
+spec ', over: vx'
+if inA "$BIN" apply --spec "$WORK/spec.yaml" --state-dir "$WORK/state" > "$WORK/apply.log" 2>&1
 then ok "apply со спекой via"; else bad "apply со спекой via"; sed 's/^/    /' "$WORK/apply.log"; fi
 start_vless && ok "устройство vl поднялось через vx" || { bad "устройство vl не поднялось"; sed 's/^/    /' "$WORK/tun.log"; }
 cnt_zero
@@ -215,11 +220,11 @@ if [ "$MODE" = android ]; then
 fi
 
 # ---- 2. отказ цели: сторож объявляет нерабочим и vl -----------------------------------
-inA "$BIN" failover --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/fo1.log" 2>&1 || true
+inA "$BIN" failover --spec "$WORK/spec.yaml" --state-dir "$WORK/state" > "$WORK/fo1.log" 2>&1 || true
 if grep -q 'выход vl -> vl\|vl: vl работает' "$WORK/fo1.log" || inA ip route show table all | grep -q 'default dev vl'; then
     ok "сторож: цель жива — vl в работе"; else bad "сторож: vl не в работе"; sed 's/^/    /' "$WORK/fo1.log"; fi
 inA ip link set vx0 down
-inA "$BIN" failover --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/fo2.log" 2>&1 || true
+inA "$BIN" failover --spec "$WORK/spec.yaml" --state-dir "$WORK/state" > "$WORK/fo2.log" 2>&1 || true
 if grep -q 'выход vl: идёт через vx, а тот не работает' "$WORK/fo2.log"; then
     ok "сторож: vx лёг — vl объявлен нерабочим"; else bad "сторож не связал отказ vl с vx"; sed 's/^/    /' "$WORK/fo2.log"; fi
 tbl=$(awk '$1=="vl"{print $3}' "$WORK/state/registry")
@@ -227,7 +232,7 @@ tbl=$(awk '$1=="vl"{print $3}' "$WORK/state/registry")
 if inA ip route show table "$tbl" | grep -v ' metric 65535' | grep -q blackhole; then
     ok "on_fail=drop у vl: blackhole в его таблице"; else bad "у vl нет blackhole"; fi
 inA ip link set vx0 up
-inA "$BIN" failover --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/fo3.log" 2>&1 || true
+inA "$BIN" failover --spec "$WORK/spec.yaml" --state-dir "$WORK/state" > "$WORK/fo3.log" 2>&1 || true
 if inA ip route show table "$tbl" | grep -q 'default dev vl'; then
     ok "vx ожил — vl вернулся тем же проходом"; else bad "vl не вернулся"; sed 's/^/    /' "$WORK/fo3.log"; fi
 # И трафик снова идёт тем же путём: соединение туннеля с сервером переоткрывается с той же
@@ -241,7 +246,7 @@ stop_vless
 
 # ---- 3. контроль: без via тот же выход ходит к серверу через WAN ----------------------
 spec ''
-inA "$BIN" apply --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/apply2.log" 2>&1 || true
+inA "$BIN" apply --spec "$WORK/spec.yaml" --state-dir "$WORK/state" > "$WORK/apply2.log" 2>&1 || true
 start_vless || { bad "без via: устройство vl не поднялось"; sed 's/^/    /' "$WORK/tun.log"; }
 cnt_zero
 if fetch; then ok "без via: скачано $MB МБ"; else bad "без via: скачано $got байт"; fi
@@ -284,16 +289,20 @@ Endpoint = $NODE:51820
 AllowedIPs = 0.0.0.0/0
 CONF
     chmod 600 "$WORK/nl.conf"
-    cat > "$WORK/spec.json" <<SPEC
-{"schema":2,"lan_devices":["$LAN_DEV"],
- "outputs":{
-   "vx":{"kind":"interface","device":"vx0","on_fail":"drop"},
-   "vl":{"kind":"vless","sub_file":"$WORK/sub.txt","node":0,"via":"vx"},
-   "nl":{"kind":"awg","conf":"$WORK/nl.conf","device":"nl","via":"vl","on_fail":"drop"}},
- "channels":[{"name":"all","out":"vl","scope":"device","from":[$FROM],"match":{"any":true}}]}
+    cat > "$WORK/spec.yaml" <<SPEC
+version: 2
+$LAN
+clients:
+  c: { $CLIENT }
+outputs:
+  vx: { kind: interface, device: vx0, on_fail: drop }
+  vl: { kind: tunnel, protocol: vless, subscription: $WORK/sub.txt, over: vx }
+  nl: { kind: awg, conf: $WORK/nl.conf, device: nl, over: vl, on_fail: drop }
+rules:
+  - { name: all, for: c, to: all, out: vl, scope: device }
 SPEC
     inA nft add rule inet viacnt post oifname '"vl"' udp dport 51820 counter comment '"wg-vl"'
-    if inA "$BIN" apply --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/apply3.log" 2>&1
+    if inA "$BIN" apply --spec "$WORK/spec.yaml" --state-dir "$WORK/state" > "$WORK/apply3.log" 2>&1
     then ok "awg: apply цепочки nl → vl → vx"; else bad "awg: apply"; sed 's/^/    /' "$WORK/apply3.log"; fi
     start_vless || { bad "awg: устройство vl не поднялось"; sed 's/^/    /' "$WORK/tun.log"; }
     mk_hex() { printf '0x%x' "$((0x$(mk_of "$1") | TUNBIT))"; }
@@ -328,16 +337,22 @@ if [ "$MODE" = android ]; then
     sleep 1
     printf '%s\n' "vless://$UUID@$NODE:53?security=none&type=tcp#p53" > "$WORK/sub53.txt"
     printf 'example.com\n' > "$WORK/d.lst"
-    cat > "$WORK/spec.json" <<SPEC
-{"schema":2,"lan_devices":["$LAN_DEV"],
- "outputs":{
-   "vx":{"kind":"interface","device":"vx0","on_fail":"drop"},
-   "vl":{"kind":"vless","sub_file":"$WORK/sub53.txt","node":0,"via":"vx"}},
- "channels":[{"name":"d","out":"vx","from":[$FROM],"match":{"domains_files":["$WORK/d.lst"]}},
-             {"name":"all","out":"vl","scope":"device","from":[$FROM],"match":{"any":true}}]}
+    cat > "$WORK/spec.yaml" <<SPEC
+version: 2
+$LAN
+clients:
+  c: { $CLIENT }
+lists:
+  d: { domains_file: $WORK/d.lst }
+outputs:
+  vx: { kind: interface, device: vx0, on_fail: drop }
+  vl: { kind: tunnel, protocol: vless, subscription: $WORK/sub53.txt, over: vx }
+rules:
+  - { name: d, for: c, to: d, out: vx }
+  - { name: all, for: c, to: all, out: vl, scope: device }
 SPEC
     inA nft add rule inet viacnt post oifname '"vx0"' ip daddr $NODE tcp dport 53 counter comment '"node53-vx0"'
-    if inA "$BIN" apply --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/apply5.log" 2>&1
+    if inA "$BIN" apply --spec "$WORK/spec.yaml" --state-dir "$WORK/state" > "$WORK/apply5.log" 2>&1
     then ok "53: apply с доменным каналом телефона и via"; else bad "53: apply"; sed 's/^/    /' "$WORK/apply5.log"; fi
     [ "$(inA nft list ruleset | grep -c 'steer-dns-local')" -gt 0 ] && ok "53: заворот DNS приложений стоит" \
         || bad "53: заворота DNS нет — часть ничего не проверяет"

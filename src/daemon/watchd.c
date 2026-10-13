@@ -531,7 +531,7 @@ void steerd_fo_emit(struct steerd *d, const struct fo_event *e) {
     if (e->to && e->to[0]) steerd_json_str(to, sizeof(to), e->to); else strcpy(to, "null");
     steerd_json_str(why, sizeof(why), e->why ? e->why : "");
     steerd_json_str(of, sizeof(of), e->on_fail ? e->on_fail : "");
-    /* Поля групп v2 — только добавлены и только у них: у пула v1 событие прежнее до байта. */
+    /* Поля групп — только добавлены и только у них. */
     char extra[256] = "";
     if (e->member && e->member[0]) {
         steerd_json_str(mem, sizeof(mem), e->member);
@@ -647,8 +647,7 @@ static int group_reaches(const struct spec *sp, const struct output *a, const st
     if (a == g) return 1;
     const struct group_cfg *ga = out_group(a);
     for (size_t k = 0; ga && k < ga->members_n && (size_t)depth < sp->out_n; k++)
-        if (spec_is_named(ga->members[k]) &&
-            group_reaches(sp, &sp->out[ga->members[k]], g, depth + 1))
+        if (group_reaches(sp, &sp->out[ga->members[k]], g, depth + 1))
             return 1;
     return 0;
 }

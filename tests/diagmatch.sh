@@ -375,64 +375,75 @@ check "пул: masquerade не требуется" "0" \
 check "владелец устройства: masquerade не требуется" "1" \
       "$(printf '%s' "$outp" | grep -c '"what":"выход loc: устройство lo в зоне"')"
 
-# ---- пул судится по устройству, которое НЕСЁТ ТРАФИК, а не по первому в списке ----
+# ---- группа судится по члену, который НЕСЁТ ТРАФИК, а не по первому в списке ----
 #
-# Тот же пул, но кандидатов два, и основной на роутере отсутствует: сторож увёл трафик на
-# запасное устройство и записал это в `active`. Без чтения этой записи diag выносил приговор
-# первому кандидату — «выход pool: устройства nodev0 нет», fail, — то есть рисовал поломку
-# на работающем выходе, а вместе с ней и вечное «нет masquerade» из-за того, что владелец
-# спрашивался про не то устройство.
+# Группа из двух членов, основной на роутере отсутствует: трафик идёт через второго. Приговор
+# первому члену — «выход pool: устройства nodev0 нет», fail — рисовал бы поломку на работающем
+# выходе, а вместе с ней и вечное «нет masquerade», если владелец спрашивается про не то
+# устройство. Выбор группы v2 считается по присутствию членов (outputs_adopt_active_st), запись
+# `active` лишь подсказка: с «pool lo» и без записи результат один.
 mkdir -p "$tmp/state"
-cat > "$tmp/pool2.json" <<EOF
-{
-  "schema": 1,
-  "lan_devices": ["zt7bcxxxxx"],
-  "from_default": ["192.168.1.0/24"],
-  "outputs": {
-    "loc": { "kind": "vless", "sub_file": "/etc/steer/sub.json", "device": "lo" },
-    "pool": { "kind": "interface", "devices": ["nodev0", "lo"], "on_fail": "drop" },
-    "direct": { "kind": "direct" }
-  },
-  "channels": [
-    { "name": "cloudflare", "match": { "prefixes_files": ["$tmp/cf.lst"] }, "out": "pool" }
-  ]
-}
+cat > "$tmp/pool2.yaml" <<EOF
+version: 2
+lan: { devices: [zt7bcxxxxx], addr: [192.168.1.0/24] }
+lists:
+  cloudflare: { prefixes_file: $tmp/cf.lst }
+outputs:
+  loc: { kind: tunnel, protocol: vless, subscription: /etc/steer/sub.json, device: lo }
+  pool: { kind: group, pick: order, members: [pool.nodev0, pool.lo], on_fail: drop }
+  pool.nodev0: { kind: interface, device: nodev0 }
+  pool.lo: { kind: interface, device: lo }
+  direct: { kind: direct }
+rules:
+  - { name: cloudflare, to: cloudflare, out: pool }
 EOF
 printf 'pool lo\n' > "$tmp/state/active"
-outp2="$($DIAG diag --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null)"
-check "пул: приговор про активное устройство" "1" \
-      "$(printf '%s' "$outp2" | grep -c '"what":"выход pool: устройство lo в зоне"')"
-check "пул: про отсутствующий первый кандидат молчим" "0" \
-      "$(printf '%s' "$outp2" | grep -c 'устройства nodev0 нет')"
-check "пул: masquerade не требуется и здесь" "0" \
+outp2="$($DIAG diag --spec "$tmp/pool2.yaml" --state-dir "$tmp/state" 2>/dev/null)"
+st2="$($DIAG status --spec "$tmp/pool2.yaml" --state-dir "$tmp/state" 2>/dev/null)"
+check "группа: status — несёт трафик второй член, устройство lo, выход поднят" "1" \
+      "$(printf '%s' "$st2" | grep -c '"pool":{"kind":"group","device":"lo","up":true,.*"selected":"pool.lo","alive":\["pool.lo"\]')"
+check "группа: masquerade не требуется и здесь" "0" \
       "$(printf '%s' "$outp2" | grep -c 'нет masquerade')"
+# diag судит членов по одному: отсутствующий nodev0 — приговор ему самому, а не группе.
+check "группа: приговор отсутствующему члену — его собственный" "1" \
+      "$(printf '%s' "$outp2" | grep -c '"what":"выход pool.nodev0: устройства nodev0 нет"')"
+check "группа: про саму группу «нет устройства» не сказано" "0" \
+      "$(printf '%s' "$outp2" | grep -c '"what":"выход pool: устройства')"
 
-# Записи сторожа нет вовсе (он ещё не проходил): берётся первый СУЩЕСТВУЮЩИЙ кандидат — то
-# же самое устройство, к которому привяжет таблицу apply. Связывать выход с отсутствующим
-# устройством, когда рядом есть существующее, незачем ни в маршрутизации, ни в отчёте.
+# Записи сторожа нет вовсе (он ещё не проходил): берётся первый СУЩЕСТВУЮЩИЙ член — то же
+# самое устройство, к которому привяжет таблицу apply.
 rm -f "$tmp/state/active"
-outp3="$($DIAG diag --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null)"
-check "пул без записи сторожа: первый существующий кандидат" "1" \
-      "$(printf '%s' "$outp3" | grep -c '"what":"выход pool: устройство lo в зоне"')"
+check "группа без записи сторожа: первый существующий член" "1" \
+      "$($DIAG status --spec "$tmp/pool2.yaml" --state-dir "$tmp/state" 2>/dev/null | grep -c '"pool":{"kind":"group","device":"lo","up":true,')"
 
-# ---- выход в отказе: сторож поставил on_fail --------------------------------------
+# ---- выход в отказе ---------------------------------------------------------------
 #
-# Запись «-» в active — сторож не нашёл живого устройства и поставил on_fail. Устройство при этом
-# может быть на месте и поднято (lo здесь — «поднято»), и раньше status отдавал `up: true`, а diag
-# — «устройство в зоне»: интерфейс рисовал живым выход, чей трафик стоит.
-printf 'pool - 0\n' > "$tmp/state/active"
-stf="$($DIAG status --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null)"
-check "отказ: status — up false и failed true у выхода" "1" \
-      "$(printf '%s' "$stf" | grep -c '"pool":{"kind":"interface","device":"lo","up":false,"failed":true,')"
+# Живых членов нет — группа в отказе, ставится on_fail. У прежнего пула отказ ставила запись «-»
+# в active; у группы v2 он выводится из присутствия и приговоров членов, записи не нужно. Член на
+# отсутствующем устройстве не живой, и status не рисует группу живой, пока трафик её стоит:
+# интерфейс иначе показывал бы работающим выход, чей трафик остановлен.
+cat > "$tmp/pool3.yaml" <<EOF
+version: 2
+lan: { devices: [zt7bcxxxxx], addr: [192.168.1.0/24] }
+lists:
+  cloudflare: { prefixes_file: $tmp/cf.lst }
+outputs:
+  loc: { kind: tunnel, protocol: vless, subscription: /etc/steer/sub.json, device: lo }
+  pool: { kind: group, pick: order, members: [pool.nodev0, pool.nodev1], on_fail: drop }
+  pool.nodev0: { kind: interface, device: nodev0 }
+  pool.nodev1: { kind: interface, device: nodev1 }
+  direct: { kind: direct }
+rules:
+  - { name: cloudflare, to: cloudflare, out: pool }
+EOF
+stf="$($DIAG status --spec "$tmp/pool3.yaml" --state-dir "$tmp/state" 2>/dev/null)"
+check "отказ: status — up false и failed true у группы, выбранного члена нет" "1" \
+      "$(printf '%s' "$stf" | grep -c '"pool":{"kind":"group","device":"nodev0","up":false,"failed":true,.*"selected":null,"alive":\[\]')"
 check "отказ: у соседнего выхода failed нет" "0" \
       "$(printf '%s' "$stf" | grep -c '"loc":{[^}]*"failed"')"
 check "отказ: умение названо" "1" "$(printf '%s' "$stf" | grep -o '"features":\[[^]]*\]' | grep -c '"failed"')"
-dgf="$($DIAG diag --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null)"
-check "отказ: diag — fail, трафик канала остановлен" "1" \
-      "$(printf '%s' "$dgf" | grep -c '{"id":"output","verdict":"fail","what":"выход pool: lo не отвечает, трафик канала остановлен"')"
-rm -f "$tmp/state/active"
 check "без отказа: failed нет" "0" \
-      "$($DIAG status --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null | grep -c '"failed":true')"
+      "$($DIAG status --spec "$tmp/pool2.yaml" --state-dir "$tmp/state" 2>/dev/null | grep -c '"failed":true')"
 
 # ---- число адресов в наборе — у ядра, столько же, сколько у nft ---------------------
 nft add element inet steer vpn_ip '{ 104.16.0.0/13, 1.1.1.0/24, 9.9.9.9 }'

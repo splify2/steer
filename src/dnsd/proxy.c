@@ -1110,9 +1110,6 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
      * - AAAA: since 1.9 the resolver answers it for a rule whose group carries IPv6 (dom6_ok:
      *   the output routes IPv6 and the clients are expressible for IPv6) — with a fake IPv6
      *   (fake-IP) or with the real addresses put into the `<set>6` set (real-ip), see below.
-     *   A v1 spec keeps the pre-1.9 empty answer everywhere: its channels come in as family
-     *   «4» (dch_fam, table.c; the reasons are at names_v4 in spec.h), so nothing here asks
-     *   which spec format it was.
      *   If ANY matched channel lacks the IPv6 half, a real AAAA would hand a dual-stack client
      *   an address no rule of that channel catches, bypassing its output; a fake IPv6 would
      *   be DNATed and go the same way. Empty answer: the client goes over IPv4 at once.

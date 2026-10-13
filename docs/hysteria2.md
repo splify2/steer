@@ -80,8 +80,7 @@ outputs:
 `device`, `over`, `exclude` и `exclude_name` (какие узлы не брать: страна по флагу в имени, кусок
 имени; [spec-v2.md](spec-v2.md)), `interval` и `silence` (период проверки узла и срок простоя QUIC —
 ниже, «Слежка за узлом»). Ключа `transport` у hysteria2 нет — это ошибка разбора, как и `active`
-больше 1 и `by`. В v1 — `kind: hysteria2`,
-`sub_file`, `node`/`nodes`. Без пакета `steer-hysteria2` спека отвергается словами «kind hysteria2
+больше 1 и `by`. Без пакета `steer-hysteria2` спека отвергается словами «kind hysteria2
 требует пакет steer-hysteria2».
 
 ## Подъём и перебор узлов

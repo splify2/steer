@@ -1,9 +1,8 @@
 /* kind=interface — устройство, которое уже есть в системе (wireguard, openvpn, pppoe…): его
  * заводит и поднимает netifd, а движок только ведёт в него трафик меткой и таблицей.
  *
- * Кандидатов несколько (`devices` спеки v1) — это уже не свойство вида, а группа (kind: group,
- * src/kinds/group.c): перевод v1 собирает её из безымянных интерфейсов, по одному на устройство.
- * Вид только принимает такой ключ (KK_DEVICES). Своё у вида одно — обфускация транспорта (`obfs`): WireGuard поверх
+ * Кандидатов несколько — это группа (kind: group, src/kinds/group.c) из выходов-интерфейсов. Своё у
+ * вида одно — обфускация транспорта (`obfs`): WireGuard поверх
  * поддельного TCP через наш процесс-помощник (src/proto/obfs/obfs.c). С ней у выхода появляется
  * свой сокет наверх, а значит и `via` (caps_of ниже). */
 #include <stdio.h>
@@ -22,10 +21,6 @@ const struct out_obfs *iface_obfs(const struct output *o) {
 }
 
 static int iface_parse(struct output *o, const struct out_keys *k, struct err *e) {
-    /* device и devices описывают одно и то же с разных сторон: device — что
-     * работает сейчас, devices — из чего выбирать. Задан только список — устройство выводится
-     * из первого; сам список (если в нём есть из чего выбирать) станет группой у перевода v1. */
-    if (!o->device[0] && k->devices_n) snprintf(o->device, sizeof(o->device), "%s", k->devices[0]);
     if (!o->device[0]) return err_set(e, "outputs.%s: kind interface needs a device", o->name);
     o->iface.obfs = k->obfs;
     return 0;
@@ -162,7 +157,7 @@ static int iface_helper(const struct spec *sp, const struct output *o, struct ki
 const struct kind_ops kind_interface = {
     .name = "interface",
     .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_SKIP_ZAPRET | KC_IPV6,
-    .keys = KK_OBFS | KK_DEVICES,
+    .keys = KK_OBFS,
     .caps_of = iface_caps_of,
     .novia = "interface без obfs",
     .parse = iface_parse,

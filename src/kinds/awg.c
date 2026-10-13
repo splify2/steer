@@ -955,7 +955,7 @@ static const char *awg_out_via(const struct output *o) {
  * за трафик приложений.
  *
  * Здесь остаётся только то, что out_underlay_mark не решает, — имя, которого нет: -1. Спека такое
- * отвергает (over_check в model/v1.c), так что это страховка вызова в обход парсера (стенд awgmatch). Выход via
+ * отвергает (spec_check_outputs, model/check.c), так что это страховка вызова в обход парсера (стенд awgmatch). Выход via
  * без метки (direct; или метка ещё не выдана) означает то же, что via нет. */
 int awg_sock_mark(const struct spec *sp, const char *via, uint32_t *mark) {
     struct output t;
@@ -1933,15 +1933,6 @@ void awg_status_json(FILE *out, const struct output *o) {
  * только netlink. */
 static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) {
     snprintf(o->awg.conf, sizeof(o->awg.conf), "%s", k->conf);
-    /* Устройство у выхода ОДНО — его создаёт этот выход. Пул из нескольких туннелей
-     * собирается выходом kind=interface, в devices которого названо и это устройство;
-     * список здесь означал бы устройства, которые никто не создаст. */
-    if (k->devices_n > 1 ||
-        (k->devices_n == 1 && o->device[0] && strcmp(o->device, k->devices[0]) != 0))
-        return err_set(e, "outputs.%s: у kind awg одно устройство — его заводит ядро steer; пул "
-            "собирается выходом kind=interface", o->name);
-    if (k->devices_n == 1 && !o->device[0])
-        snprintf(o->device, sizeof(o->device), "%s", k->devices[0]);
     /* Имя устройства выбирает движок так, чтобы оно не выдавало туннель (см.
      * awg_default_ifname в awg.h). Названное явно обязано тому же правилу: приложение
      * видит имена интерфейсов, и «wg0» рядом с wlan0 — это ровно тот след, которого

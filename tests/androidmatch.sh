@@ -218,10 +218,6 @@ outputs:
 rules:
   - { name: t, for: t, to: t, out: tg }
 EOF2
-spec_bad "self в from_default — отказ, даже если у каналов свой from" 'сам телефон, а не клиенты' <<EOF2
-{ "schema": 2, "from_default": ["self"], "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "a", "from": ["uid:10123"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
-EOF2
 spec_bad "диапазон UID в правиле на устройство — отказ" 'только одиночных хозяев' <<EOF2
 version: 2
 clients:

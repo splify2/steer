@@ -112,6 +112,12 @@ code "обязательный аргумент пропущен" 2 -- "$BIN" ex
 check "--spec доходит до команды" "1" \
     "$("$BIN" apply --spec "$tmp/нет.json" 2>&1 >/dev/null | grep -c "$tmp/нет.json")"
 
+# Спека v1 (JSON со "schema") больше не читается: отказ с кодом 2 и объяснением.
+printf '{"schema":1,"outputs":{},"channels":[]}\n' > "$tmp/v1.json"
+v1out="$("$BIN" apply --dry-run --spec "$tmp/v1.json" --state-dir "$tmp/state" 2>&1 >/dev/null)"; v1rc=$?
+check "apply --dry-run по спеке v1 — код 2 и «спека v1 больше не читается»" "2 1" \
+    "$v1rc $(printf '%s' "$v1out" | grep -c 'спека v1 больше не читается')"
+
 cat > "$tmp/spec.yaml" <<'EOF'
 version: 2
 lan: { addr: [192.168.1.0/24] }

@@ -48,7 +48,7 @@ static int proxy_parse(struct output *o, const struct out_keys *k, struct err *e
     if (!o->proxy.sub_file[0]) {
         char msg[160];
         snprintf(msg, sizeof(msg), "outputs.%s: kind %s нужен %s с подпиской", o->name,
-                 kind_of(o)->name, out_key(k, "sub_file", "subscription"));
+                 kind_of(o)->name, "subscription");
         return err_set(e, "%s", msg);
     }
     char msg[200];
@@ -66,11 +66,6 @@ static int proxy_parse(struct output *o, const struct out_keys *k, struct err *e
         return err_set(e, "%s", msg);
     }
     if (!o->device[0]) snprintf(o->device, sizeof(o->device), "%.15s", o->name);
-    if (k->devices_n > 1 || (k->devices_n == 1 && strcmp(o->device, k->devices[0]) != 0)) {
-        snprintf(msg, sizeof(msg), "outputs.%s: у kind %s одно устройство — его заводит ядро steer; пул "
-                 "собирается выходом kind=interface", o->name, kind_of(o)->name);
-        return err_set(e, "%s", msg);
-    }
     return 0;
 }
 

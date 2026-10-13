@@ -79,7 +79,7 @@ void fog_adopt(struct spec *sp, struct fo_store *st);
  * (молчим), без замеров — смена (сказать надо: группа идёт по порядку). */
 int fog_lat_note(const char *group, int none);
 
-/* Ключ замера члена в записи `latency`: имя именованного члена, устройство безымянного (v1). */
+/* Ключ замера члена в записи `latency`: имя члена. */
 const char *fog_lat_key(const struct output *m);
 
 /* КОМАНДА select: группа gname (pick: manual) — член mname. Выбор кладётся в запись `select`

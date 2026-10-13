@@ -691,15 +691,13 @@ static int diag_is_member(const struct spec *sp, size_t i) {
  *   - член группы молчит, если его устройство есть у выхода вне групп (не члена и не группы):
  *     у того строка и так будет, и приговор тот же — вопрос задаётся устройству;
  *   - группа молчит, если её нынешнее устройство — у её же именованного члена: тот отчитается
- *     сам. У пула v1 члены безымянные (sp->anon, в раздел 7 не попадают), и там строка группы —
- *     единственная, поэтому правило их не касается (tests/diagmatch.sh, «пул»). */
+ *     сам. */
 static int diag_dup_device(const struct spec *sp, size_t i) {
     const struct output *o = &sp->out[i];
     if (!o->device[0]) return 0;
     const struct group_cfg *gc = out_group(o);
     if (gc) {
         for (size_t k = 0; k < gc->members_n; k++) {
-            if (!spec_is_named(gc->members[k])) continue;
             const struct output *m = spec_out(sp, gc->members[k]);
             if (out_has_device(m) && !strcmp(m->device, o->device)) return 1;
         }
