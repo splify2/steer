@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/loop.json --state-dir TMP/state-g
+# args: apply --dry-run --spec TMP/lanbad.json --state-dir TMP/state-lan
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: выход o ведёт в br-lan — это локальная сеть, трафик закольцуется
+# stderr: steer: TMP/lanbad.json:3:18: lan.devices: «br lan» — имя устройства негодного состава

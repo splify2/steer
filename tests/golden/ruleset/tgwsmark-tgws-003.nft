@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/spec.json --state-dir TMP/st-mini
+# args: apply --dry-run --spec TMP/spec.yaml --state-dir TMP/st-mini
 # exit: 0
 # env: STEER_MARK_ORDER=top
 # env: STEER_NFT_INGRESS=all

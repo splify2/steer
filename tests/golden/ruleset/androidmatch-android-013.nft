@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/loc2.json --state-dir TMP/state
+# args: apply --dry-run --spec TMP/loc2.yaml --state-dir TMP/state
 # exit: 0
 # env: STEER_NFT_COMPAT=legacy
 # stderr: steer[info] apply: ядро без nat в семействе inet — правила собраны для nftables старого ядра: таблицы inet и ip и ip6

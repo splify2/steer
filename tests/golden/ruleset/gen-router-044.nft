@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/dup.json --state-dir TMP/state-g
+# args: apply --dry-run --spec TMP/landup.json --state-dir TMP/state-lan
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: выход o: устройство wg0 указано дважды
+# stderr: steer: TMP/landup.json:3:26: lan.devices: устройство br-lan указано дважды

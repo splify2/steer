@@ -1,4 +1,4 @@
 # args: apply --dry-run --spec TMP/rbad.json --state-dir TMP/state-r
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: channels: unknown mode nonsense (want fakeip or realip)
+# stderr: steer: TMP/rbad.json:12:48: правило dom: resolve: «nonsense» — нужен fakeip или realip

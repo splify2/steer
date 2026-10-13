@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/allspec.json --state-dir TMP/state-dev2
+# args: apply --dry-run --spec TMP/netspec.json --state-dir TMP/state-dev3
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: канал all забирает ВЕСЬ трафик в туннель. Если это правда нужно, добавьте "allow_all": true — иначе выберите список
+# stderr: steer: TMP/netspec.json:12:24: правило half: правило на устройство принимает только одиночных хозяев, а у клиента half подсеть или диапазон — приоритет достался бы не одному устройству, а всем в нём

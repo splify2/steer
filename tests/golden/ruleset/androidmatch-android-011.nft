@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/loc2.json --state-dir TMP/state
+# args: apply --dry-run --spec TMP/loc2.yaml --state-dir TMP/state
 # exit: 0
 # env: STEER_NFT_COMPAT=modern
 table inet steer {

@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/netspec.json --state-dir TMP/state-dev3
+# args: apply --dry-run --spec TMP/emptyspec.json --state-dir TMP/state-dev4
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: канал half: правило на устройство принимает только одиночных хозяев, а «192.168.1.0/24» — подсеть. Приоритет достался бы не одному устройству, а всем в ней
+# stderr: steer: TMP/emptyspec.json:9:50: правило nohost объявлено правилом на устройство (scope: device), но в for нет клиентов — назовите клиента с адресом или MAC

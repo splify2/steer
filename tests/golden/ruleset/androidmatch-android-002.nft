@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/spec.json --state-dir TMP/state
+# args: apply --dry-run --spec TMP/spec.yaml --state-dir TMP/state
 # exit: 0
 # env: STEER_NFT_COMPAT=legacy-min
 # stderr: steer[info] apply: ядро без nat в семействе inet — правила собраны для nftables старого ядра: таблицы inet и ip

@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/lanbad.json --state-dir TMP/state-lan
+# args: apply --dry-run --spec TMP/s2.json --state-dir TMP/state
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: lan_devices: негодный состав имени (br lan)
+# stderr: steer: TMP/s2.json:1:10: version 3 не поддерживается (эта сборка понимает 2)

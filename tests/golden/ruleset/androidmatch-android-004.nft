@@ -1,3 +1,3 @@
-# args: apply --dry-run --spec TMP/zf.json --state-dir TMP/state
+# args: apply --dry-run --spec TMP/zf.yaml --state-dir TMP/state
 # exit: 2
-# stderr: steer: outputs.vpn: on_fail zapret — на телефоне zapret нет (want drop or direct)
+# stderr: steer: TMP/zf.yaml:8:52: outputs.vpn.on_fail: zapret на телефоне нет — нужен drop или direct
