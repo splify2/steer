@@ -244,39 +244,45 @@ static void test_doc_block(void) {
     ydoc_free(d);
 }
 
-/* ---- JSON спек v1 ---------------------------------------------------------------------- */
-/* Тексты из tests/gen.sh ($tmp заменён путём). Первый — как есть, второй — сжатый без пробелов
- * (так пишет JSON splify2: `"a":1`, без пробела после двоеточия — у YAML 1.1 это место спорное,
- * libyaml 0.2.5 принимает его после ключа в кавычках). */
-static const char v1_dspec[] =
-"{ \"schema\": 1, \"from_default\": [\"192.168.1.0/24\"], \"lan_device\": \"br-lan\",\n"
+/* ---- JSON спек v2 ---------------------------------------------------------------------- */
+/* Первый — как есть (с пробелами, в несколько строк), второй — сжатый без пробелов (так пишет JSON
+ * splify2: `"a":1`, без пробела после двоеточия — у YAML 1.1 это место спорное, libyaml 0.2.5
+ * принимает его после ключа в кавычках). */
+static const char v2_dspec[] =
+"{ \"version\": 2, \"lan\": { \"addr\": [\"192.168.1.0/24\"], \"devices\": [\"br-lan\"] },\n"
 "  \"outputs\": { \"geo\": { \"kind\": \"interface\", \"device\": \"tun0\" } },\n"
-"  \"channels\": [ { \"name\": \"dom\", \"match\": { \"domains_file\": \"/tmp/x/d.lst\" }, \"out\": \"geo\" } ] }\n";
-static const char v1_dspec_yaml[] =
-"schema: 1\n"
-"from_default:\n"
-"  - 192.168.1.0/24\n"
-"lan_device: br-lan\n"
+"  \"lists\": { \"dom\": { \"domains_file\": \"/tmp/x/d.lst\" } },\n"
+"  \"rules\": [ { \"name\": \"dom\", \"to\": \"dom\", \"out\": \"geo\" } ] }\n";
+static const char v2_dspec_yaml[] =
+"version: 2\n"
+"lan:\n"
+"  addr:\n"
+"    - 192.168.1.0/24\n"
+"  devices: [br-lan]\n"
 "outputs:\n"
 "  geo:\n"
 "    kind: interface\n"
 "    device: tun0\n"
-"channels:\n"
+"lists:\n"
+"  dom:\n"
+"    domains_file: /tmp/x/d.lst\n"
+"rules:\n"
 "  - name: dom\n"
-"    match:\n"
-"      domains_file: /tmp/x/d.lst\n"
+"    to: dom\n"
 "    out: geo\n";
-static const char v1_mix_compact[] =
-"{\"schema\":1,\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
-"\"channels\":[{\"name\":\"mix\",\"from\":[\"192.168.1.5\",\"a4:83:e7:2c:11:0f\"],"
-"\"match\":{\"prefixes_file\":\"/tmp/x/a.lst\"},\"out\":\"vpn\"}]}";
-static const char v1_mix_yaml[] =
-"schema: 1\n"
+static const char v2_mix_compact[] =
+"{\"version\":2,\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
+"\"clients\":{\"mix\":{\"addr\":[\"192.168.1.5\"]}},\"lists\":{\"l\":{\"prefixes_file\":\"/tmp/x/a.lst\"}},"
+"\"rules\":[{\"name\":\"mix\",\"for\":\"mix\",\"to\":\"l\",\"out\":\"vpn\"}]}";
+static const char v2_mix_yaml[] =
+"version: 2\n"
 "outputs: { vpn: { kind: interface, device: wg0 } }\n"
-"channels:\n"
+"clients: { mix: { addr: [192.168.1.5] } }\n"
+"lists: { l: { prefixes_file: /tmp/x/a.lst } }\n"
+"rules:\n"
 "  - name: mix\n"
-"    from: [192.168.1.5, a4:83:e7:2c:11:0f]\n"
-"    match: { prefixes_file: /tmp/x/a.lst }\n"
+"    for: mix\n"
+"    to: l\n"
 "    out: vpn\n";
 
 static void same_as(const char *what, const char *json, const char *yaml) {
@@ -298,16 +304,16 @@ static void same_as(const char *what, const char *json, const char *yaml) {
 }
 
 static void test_json(void) {
-    same_as("v1: dspec из gen.sh — JSON и блочный YAML совпадают по смыслу", v1_dspec, v1_dspec_yaml);
-    same_as("v1: mix без пробелов («\"a\":1») — совпадает с YAML", v1_mix_compact, v1_mix_yaml);
+    same_as("v2: dspec — JSON и блочный YAML совпадают по смыслу", v2_dspec, v2_dspec_yaml);
+    same_as("v2: mix без пробелов («\"a\":1») — совпадает с YAML", v2_mix_compact, v2_mix_yaml);
 
     struct err e;
-    struct ydoc *d = parse(v1_dspec, &e);
+    struct ydoc *d = parse(v2_dspec, &e);
     const struct ynode *r = ydoc_root(d);
     long s = 0;
-    check("v1: schema — число без кавычек", 0, ynode_long(ynode_get(r, "schema"), &s));
-    check("v1: у строки JSON стиль «двойные кавычки»", YS_DOUBLE, ynode_get(r, "lan_device")->style);
-    check("v1: channels[0].match — со строки 3", 3, (long)ynode_get(ynode_at(ynode_get(r, "channels"), 0), "match")->line);
+    check("v2: version — число без кавычек", 0, ynode_long(ynode_get(r, "version"), &s));
+    check("v2: у строки JSON стиль «двойные кавычки»", YS_DOUBLE, ynode_at(ynode_get(ynode_get(r, "lan"), "devices"), 0)->style);
+    check("v2: lists.dom — со строки 3", 3, (long)ynode_get(ynode_get(r, "lists"), "dom")->line);
     ydoc_free(d);
 
     /* Всё, что JSON умеет, а YAML-автору не придёт в голову: экранирования (в том числе \/ и

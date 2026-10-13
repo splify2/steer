@@ -89,10 +89,11 @@ tc qdisc add dev p0 root netem delay "${DELAY}ms" limit 100000
 python3 "$HERE/sigpipe-node.py" --bind 10.78.0.1 --port 10444 --uuid "$UUID" >"$tmp/node.out" 2>"$tmp/node.err" & NP=$!
 wait_for 'grep -q ready "$tmp/node.out"' 10
 printf 'vless://%s@10.78.0.1:10444?security=none&type=tcp#node\n' "$UUID" > "$tmp/sub.txt"
-cat > "$tmp/spec.json" <<EOF
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$tmp/sub.txt","node":0}},
- "channels":[]}
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+
+outputs:
+  vl: { kind: tunnel, protocol: vless, subscription: $tmp/sub.txt, nodes: [0] }
 EOF
 
 # Клиент: выгрузка на порт 82 узла (приёмник, который не закрывается) SECS секунд; соединение держится
@@ -117,7 +118,7 @@ PY
 # Один прогон: модуль (env — «К=З» или пусто), выгрузка, ss клиента в середине и в конце. Печатает в $tmp/run.*
 run() {
     name="$1"; shift
-    env "$@" "$LIBS/steerd" vless vl --spec "$tmp/spec.json" --state-dir "$tmp/st" >"$tmp/mod.log" 2>&1 &
+    env "$@" "$LIBS/steerd" vless vl --spec "$tmp/spec.yaml" --state-dir "$tmp/st" >"$tmp/mod.log" 2>&1 &
     MP=$!
     wait_for 'ip link show vl >/dev/null 2>&1' 20
     wait_for 'grep -q "запасных сессий" "$tmp/mod.log"' 20

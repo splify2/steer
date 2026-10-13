@@ -35,7 +35,17 @@ check() {
 # Таблицы движка в ядре нет: счётчики каналов при этом не читаются, а верхний уровень ответа от
 # них не зависит вовсе — ровно то, что здесь проверяется.
 
-cat > "$tmp/spec.json" <<EOF
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+lan: { devices: [tailscale0, zt7bcxxxxx] }
+outputs:
+  loc: { kind: tunnel, protocol: vless, subscription: $tmp/sub.txt, device: lo }
+  pool: { kind: interface, device: nodev0, on_fail: drop }
+  direct: { kind: direct }
+EOF
+# Пул devices — выход спеки v1 (в v2 это группа выходов-членов с другим видом в status), поэтому
+# проверки пула идут на спеке v1.
+cat > "$tmp/pool.json" <<EOF
 {
   "schema": 1,
   "lan_devices": ["tailscale0", "zt7bcxxxxx"],
@@ -48,7 +58,7 @@ cat > "$tmp/spec.json" <<EOF
 }
 EOF
 
-out="$($BIN status --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>/dev/null)"
+out="$($BIN status --spec "$tmp/spec.yaml" --state-dir "$tmp/state" 2>/dev/null)"
 
 # ---- признак поколения ------------------------------------------------------
 # Перечень умений печатается ВСЕГДА и верхним уровнем — то есть виден на роутере, где нет ни
@@ -84,7 +94,7 @@ check "nodes у выхода подписки печатаются пустым�
 # отдавал первого кандидата — отсутствующий nodev0 с "up":false, то есть рисовал поломку на
 # работающем выходе.
 printf 'pool lo\n' > "$tmp/state/active"
-outa="$($BIN status --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>/dev/null)"
+outa="$($BIN status --spec "$tmp/pool.json" --state-dir "$tmp/state" 2>/dev/null)"
 check "пул назван активным устройством" "1" \
       "$(printf '%s' "$outa" | grep -c '"pool":{"kind":"interface","device":"lo","up":true')"
 check "список кандидатов при этом прежний" "1" \
@@ -108,7 +118,7 @@ check "время сборки названо" "1" \
 check "умение названо в перечне" "1" \
       "$(printf '%s' "$outa" | grep -c '"status_cache"')"
 
-fast="$($BIN status --spec "$tmp/spec.json" --state-dir "$tmp/state" --fast 2>/dev/null)"
+fast="$($BIN status --spec "$tmp/spec.yaml" --state-dir "$tmp/state" --fast 2>/dev/null)"
 check "запомненный ответ помечен памятью" "1" \
       "$(printf '%s' "$fast" | grep -c ',"cached":true}$')"
 # Тело — ДОСЛОВНО то же: `--fast` не пересобирает ответ, он его отдаёт. Сравнение строкой,
@@ -128,7 +138,7 @@ check "негодная спека --fast не мешает" "$fast" "$fastb"
 # ответ движка, — это разбор, падающий у спрашивающего далеко от причины. Вместо этого
 # считается всё честно, то есть ключ пустотой не отвечает никогда.
 printf '{"schema":1,"at' > "$snap"
-fastt="$($BIN status --spec "$tmp/spec.json" --state-dir "$tmp/state" --fast 2>/dev/null)"
+fastt="$($BIN status --spec "$tmp/spec.yaml" --state-dir "$tmp/state" --fast 2>/dev/null)"
 check "обрубок снимка не отдаётся" "0" \
       "$(printf '%s' "$fastt" | grep -c '"cached"')"
 check "вместо обрубка посчитан честный ответ" "1" \
@@ -138,7 +148,7 @@ check "обрубок при этом заменён свежим снимком
 
 # Снимка нет вовсе — то же самое: считаем всё.
 rm -f "$snap"
-fastn="$($BIN status --spec "$tmp/spec.json" --state-dir "$tmp/state" --fast 2>/dev/null)"
+fastn="$($BIN status --spec "$tmp/spec.yaml" --state-dir "$tmp/state" --fast 2>/dev/null)"
 check "без снимка --fast считает сам" "1" \
       "$(printf '%s' "$fastn" | grep -c '"outputs":{"loc"')"
 check "и снимок после этого появился" "1" "$([ -s "$snap" ] && echo 1 || echo 0)"
@@ -149,7 +159,7 @@ check "и снимок после этого появился" "1" "$([ -s "$sna
 # Каталог берётся под /proc, а не через chmod: стенды здесь гоняются и от root, а ему права
 # каталога не мешают — проверка через chmod была бы зелёной, ничего не проверяя. Под /proc
 # mkdir отказывает всем.
-fastro="$($BIN status --spec "$tmp/spec.json" --state-dir /proc/steer-statusmatch 2>/dev/null)"
+fastro="$($BIN status --spec "$tmp/spec.yaml" --state-dir /proc/steer-statusmatch 2>/dev/null)"
 check "неписуемый снимок не отменяет ответ" "1" \
       "$(printf '%s' "$fastro" | grep -c '"outputs":{"loc"')"
 check "и памятью такой ответ не помечен" "0" \

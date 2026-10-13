@@ -103,14 +103,20 @@ check "без движка: адрес списка у провайдера до
 
 printf '203.0.113.0/24\n2001:db8:1::/48\n' > "$tmp/a.lst"
 printf '2001:db8:5::/48\n' > "$tmp/t.lst"
-cat > "$tmp/spec.json" <<EOF
-{ "schema": 2, "lan_devices": ["r0"],
-  "outputs": { "wg": { "kind": "interface", "device": "t0", "on_fail": "drop" },
-               "tg": { "kind": "tgws", "domain": "example.com" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "wg" },
-                { "name": "t", "match": { "prefixes_file": "$tmp/t.lst" }, "out": "tg" } ] }
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+lan: { devices: [r0] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+  t: { prefixes_file: $tmp/t.lst }
+outputs:
+  wg: { kind: interface, device: t0 }
+  tg: { kind: tgws, domain: example.com }
+rules:
+  - { name: a, to: a, out: wg }
+  - { name: t, to: t, out: tg }
 EOF
-S="--spec $tmp/spec.json --state-dir $tmp/st"
+S="--spec $tmp/spec.yaml --state-dir $tmp/st"
 "$BIN" apply $S >"$tmp/apply.out" 2>&1
 check "apply с правилами IPv6 проходит (nft принял набор)" "0" "$?"
 check "  парный набор IPv6 в ядре" "1" \

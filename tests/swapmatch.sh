@@ -103,22 +103,31 @@ printf 'seed.test\nboth.test\n' > "$tmp/t1/a.lst"
 printf 'both.test\n' > "$tmp/t1/b.lst"
 printf 'rip.test\n' > "$tmp/t1/r.lst"
 printf '203.0.113.0/24\n' > "$tmp/t1/p.lst"
-cat > "$tmp/t1/spec.json" <<EOF
-{ "schema": 1, "from_default": ["10.77.1.0/24"],
-  "outputs": { "wg": { "kind": "interface", "device": "t0" },
-               "wg2": { "kind": "interface", "device": "t0" } },
-  "channels": [
-    { "name": "a", "match": { "domains_files": ["$tmp/t1/a.lst"],
-                              "prefixes_files": ["$tmp/t1/p.lst"] }, "out": "wg" },
-    { "name": "b", "match": { "domains_files": ["$tmp/t1/b.lst"] }, "out": "wg2" },
-    { "name": "r", "match": { "domains_files": ["$tmp/t1/r.lst"], "mode": "realip" }, "out": "wg" } ] }
+cat > "$tmp/t1/spec.yaml" <<EOF
+version: 2
+
+lan: { devices: [br-lan], addr: [10.77.1.0/24] }
+
+lists:
+  a: { prefixes_file: [$tmp/t1/p.lst], domains_file: [$tmp/t1/a.lst] }
+  b: { domains_file: [$tmp/t1/b.lst] }
+  r: { domains_file: [$tmp/t1/r.lst] }
+
+outputs:
+  wg:  { kind: interface, device: t0 }
+  wg2: { kind: interface, device: t0 }
+
+rules:
+  - { name: a, to: [a], out: wg }
+  - { name: b, to: [b], out: wg2 }
+  - { name: r, to: [r], out: wg, resolve: realip }
 EOF
 mkdir -p "$tmp/t1/st"
 printf 'seed.test\t198.18.0.1\t203.0.113.10\nx.seed.test\t198.18.0.2\nboth.test\t198.18.0.5\t203.0.113.11\nrip.test\t198.18.0.6\t203.0.113.12\nnone.example\t198.18.0.7\t203.0.113.13\n' \
     > "$tmp/t1/st/fakeip.state"
-DRY="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/t1/spec.json" \
+DRY="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/t1/spec.yaml" \
        --state-dir "$tmp/t1/st" 2>/dev/null)"
-tab="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/t1/spec.json" --state-dir "$tmp/t1/st" 2>/dev/null)"
+tab="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/t1/spec.yaml" --state-dir "$tmp/t1/st" 2>/dev/null)"
 SA="$(printf '%s\n' "$tab" | awk -F'|' '$5 == "a" { print $1 }')"
 SB="$(printf '%s\n' "$tab" | awk -F'|' '$5 == "b" { print $1 }')"
 SR="$(printf '%s\n' "$tab" | awk -F'|' '$5 == "r" { print $1 }')"
@@ -136,7 +145,7 @@ check "  правило «без подмены — drop» стоит за dnat"
     "$(printf '%s\n' "$DRY" | awk '/chain prerouting_dnat/ { f = 1; next } f && /^    }/ { exit } f && /198\.18/' |
        sed 's/^ *//' | paste -sd'|')"
 # Отпечаток плана от файла состояния не зависит (засев в него не входит, print.c).
-plan_fp() { STEER_NFT_COMPAT=modern "$BIN" apply-plan --spec "$tmp/t1/spec.json" --state-dir "$1" \
+plan_fp() { STEER_NFT_COMPAT=modern "$BIN" apply-plan --spec "$tmp/t1/spec.yaml" --state-dir "$1" \
                 2>/dev/null | awk '$1 == "ruleset" { print $2 }'; }
 mkdir -p "$tmp/t1/st0"
 FP1="$(plan_fp "$tmp/t1/st")"
@@ -144,7 +153,7 @@ FP0="$(plan_fp "$tmp/t1/st0")"
 check "  отпечаток плана — тот же, что без файла состояния" "yes" \
     "$([ -n "$FP1" ] && [ "$FP1" = "$FP0" ] && echo yes || echo "no:$FP1/$FP0")"
 # Старая раскладка: засев — в динамическую половину (hash, имя группы), не в «_n».
-DRYL="$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/t1/spec.json" \
+DRYL="$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/t1/spec.yaml" \
         --state-dir "$tmp/t1/st" 2>/dev/null)"
 set_elsl() { printf '%s\n' "$DRYL" | awk -v s="$1" '$1 == "set" && $2 == s { f = 1 } f && /elements/ { print; exit } f && /^    }/ { exit }'; }
 check "  старая раскладка: засев — в динамическую половину" \
@@ -154,16 +163,25 @@ check "  старая раскладка: «_n» — только список" 
 
 # Составной набор (tests/srs/dnsmixed.srs): имя с сужением — с ним, соседние адреса не слиты,
 # исключённое имя не засеяно. Ядро такой набор принимает (nft -f ниже, часть 2 — своя таблица).
-cat > "$tmp/t1/cspec.json" <<EOF
-{ "schema": 1, "from_default": ["10.77.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "t0" } },
-  "channels": [ { "name": "names", "match": { "srs_file": "$FIX/dnsmixed.srs" }, "out": "vpn" } ] }
+cat > "$tmp/t1/cspec.yaml" <<EOF
+version: 2
+
+lan: { devices: [br-lan], addr: [10.77.1.0/24] }
+
+lists:
+  names: { srs: [$FIX/dnsmixed.srs] }
+
+outputs:
+  vpn: { kind: interface, device: t0 }
+
+rules:
+  - { name: names, to: [names], out: vpn }
 EOF
 mkdir -p "$tmp/t1/cst"
 printf 'a.voice.example\t198.18.0.1\t203.0.113.20\nb.voice.example\t198.18.0.2\t203.0.113.21\nwww.plain.example\t198.18.0.5\t203.0.113.22\nno.excl.example\t198.18.0.7\t203.0.113.23\nwww.excl.example\t198.18.0.8\t203.0.113.24\n' \
     > "$tmp/t1/cst/fakeip.state"
 CDRY="$(STEER_NFT_COMPAT=modern STEER_NFT_CONCAT=1 "$BIN" apply --dry-run \
-        --spec "$tmp/t1/cspec.json" --state-dir "$tmp/t1/cst" 2>/dev/null)"
+        --spec "$tmp/t1/cspec.yaml" --state-dir "$tmp/t1/cst" 2>/dev/null)"
 cels="$(printf '%s\n' "$CDRY" | awk '$1 == "set" && $2 == "vpn_dom_c0_m" { f = 1 } f && /elements/ { print; exit }')"
 # Протокол в тексте генератора — номером (17), как у подсетей набора.
 check "составной: имя с сужением — «адрес . udp . 50000-65535»" "yes" \
@@ -292,15 +310,23 @@ printf 's19.test\n' > "$tmp/d.lst"
 # Клиенты — устройство раздачи r0: так метку каналов ставит цепочка ingress_mark на хуке ingress
 # (generate.c, «разметка на ingress»); без неё (STEER_NFT_INGRESS=0) — prerouting_mark. Засев и
 # правило без подмены от этого не зависят — ниже проверяется и то, и другое.
-cat > "$tmp/spec.json" <<EOF
-{ "schema": 2, "lan_devices": ["r0"],
-  "outputs": { "wg": { "kind": "interface", "device": "t0", "on_fail": "drop" } },
-  "channels": [ { "name": "s", "match": { "domains_files": ["$tmp/d.lst"], "mode": "fakeip" },
-                  "out": "wg" } ] }
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+
+lan: { devices: [r0] }
+
+lists:
+  s: { domains_file: [$tmp/d.lst] }
+
+outputs:
+  wg: { kind: interface, device: t0 }
+
+rules:
+  - { name: s, to: [s], out: wg }
 EOF
 mkdir -p "$tmp/st"
 printf 's19.test\t198.18.0.1\t203.0.113.10\n' > "$tmp/st/fakeip.state"
-S="--spec $tmp/spec.json --state-dir $tmp/st"
+S="--spec $tmp/spec.yaml --state-dir $tmp/st"
 "$BIN" apply $S >"$tmp/apply.out" 2>&1
 check "apply с непустым fakeip.state (резолвера нет) проходит" "0" "$?"
 SS="$("$BIN" dnsd-table $S 2>/dev/null | awk -F'|' '$5 == "s" { print $1 }')"
@@ -414,17 +440,27 @@ check "подкоманда apply: правило fwmark — раньше заг
 # ---- 5. резолвер вырезает адрес из слитого засевом отрезка -----------------------------------
 printf 'x1.a.test\nx2.a.test\nx3.a.test\n' > "$tmp/a.lst"
 printf 'zz.b.test\n' > "$tmp/b.lst"
-cat > "$tmp/cspec.json" <<EOF
-{ "schema": 1, "from_default": ["10.77.1.0/24"],
-  "outputs": { "wg": { "kind": "interface", "device": "t0" },
-               "dm": { "kind": "interface", "device": "dm0" } },
-  "channels": [ { "name": "a", "match": { "domains_files": ["$tmp/a.lst"] }, "out": "wg" },
-                { "name": "b", "match": { "domains_files": ["$tmp/b.lst"] }, "out": "dm" } ] }
+cat > "$tmp/cspec.yaml" <<EOF
+version: 2
+
+lan: { devices: [br-lan], addr: [10.77.1.0/24] }
+
+lists:
+  a: { domains_file: [$tmp/a.lst] }
+  b: { domains_file: [$tmp/b.lst] }
+
+outputs:
+  wg: { kind: interface, device: t0 }
+  dm: { kind: interface, device: dm0 }
+
+rules:
+  - { name: a, to: [a], out: wg }
+  - { name: b, to: [b], out: dm }
 EOF
 mkdir -p "$tmp/cst"
 printf 'x1.a.test\t198.18.0.1\t203.0.113.31\nx2.a.test\t198.18.0.2\t203.0.113.32\nx3.a.test\t198.18.0.3\t203.0.113.33\n' \
     > "$tmp/cst/fakeip.state"
-CS="--spec $tmp/cspec.json --state-dir $tmp/cst"
+CS="--spec $tmp/cspec.yaml --state-dir $tmp/cst"
 "$BIN" apply $CS >/dev/null 2>&1
 tabc="$("$BIN" dnsd-table $CS 2>/dev/null)"
 CA="$(printf '%s\n' "$tabc" | awk -F'|' '$5 == "a" { print $1 }')"
@@ -462,24 +498,33 @@ wait "$DN" 2>/dev/null
 
 # ---- 6. real-ip: резолвер возвращает элементы сразу после загрузки ----------------------------
 printf 'rip.test\n' > "$tmp/r.lst"
-cat > "$tmp/rspec.json" <<EOF
-{ "schema": 1, "from_default": ["10.77.1.0/24"],
-  "outputs": { "wg": { "kind": "interface", "device": "t0", "on_fail": "drop" } },
-  "channels": [ { "name": "s", "match": { "domains_files": ["$tmp/d.lst"] }, "out": "wg" },
-                { "name": "r", "match": { "domains_files": ["$tmp/r.lst"], "mode": "realip" },
-                  "out": "wg" } ] }
+cat > "$tmp/rspec.yaml" <<EOF
+version: 2
+
+lan: { devices: [br-lan], addr: [10.77.1.0/24] }
+
+lists:
+  s: { domains_file: [$tmp/d.lst] }
+  r: { domains_file: [$tmp/r.lst] }
+
+outputs:
+  wg: { kind: interface, device: t0 }
+
+rules:
+  - { name: s, to: [s], out: wg }
+  - { name: r, to: [r], out: wg, resolve: realip }
 EOF
 mkdir -p "$tmp/rst"
 printf 's19.test\t198.18.0.1\t203.0.113.10\n' > "$tmp/rst/fakeip.state"
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
-"$BIN" daemon --supervise --apply --socket "$tmp/r.sock" --spec "$tmp/rspec.json" \
+"$BIN" daemon --supervise --apply --socket "$tmp/r.sock" --spec "$tmp/rspec.yaml" \
     --state-dir "$tmp/rst" --dnsd-flag --listen-port --dnsd-flag 15581 \
     --dnsd-flag --upstream-port --dnsd-flag 15575 >"$tmp/rd.out" 2>"$tmp/rd.err" &
 D=$!
 pids="$pids $D"
 wait_for 'grep -q "спека применена при старте" "$tmp/rd.err"' 15
 wait_for 'grep -q "channel .*rule(s)" "$tmp/rd.err"' 5
-tabr="$("$BIN" dnsd-table --spec "$tmp/rspec.json" --state-dir "$tmp/rst" 2>/dev/null)"
+tabr="$("$BIN" dnsd-table --spec "$tmp/rspec.yaml" --state-dir "$tmp/rst" 2>/dev/null)"
 RS="$(printf '%s\n' "$tabr" | awk -F'|' '$5 == "r" { print $1 }')"
 FS="$(printf '%s\n' "$tabr" | awk -F'|' '$5 == "s" { print $1 }')"
 cat > "$tmp/qa.py" <<'PY'
@@ -502,7 +547,7 @@ wait_for '[ "$(rip_in)" = 1 ]' 3
 check "  адрес — в наборе канала со сроком" "1" "$(rip_in)"
 "$real_nft" add set inet steer junk '{ type ipv4_addr; }'
 n0="$(grep -c 'right after the ruleset load' "$tmp/rd.err")"
-"$BIN" ctl --socket "$tmp/r.sock" apply < "$tmp/rspec.json" >"$tmp/ra.out" 2>&1
+"$BIN" ctl --socket "$tmp/r.sock" apply < "$tmp/rspec.yaml" >"$tmp/ra.out" 2>&1
 fk_now="$("$real_nft" list set inet steer "$FS" 2>/dev/null | grep -c '198\.18\.0\.1')"
 check "замена набора демоном: поддельный адрес в наборе канала сразу после ответа apply" "1" "$fk_now"
 wait_for '[ "$(grep -c "right after the ruleset load" "$tmp/rd.err")" -gt "$n0" ]' 3

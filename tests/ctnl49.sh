@@ -66,12 +66,16 @@ PATH=$T/fakebin:$PATH
 rm -f "$T/conntrack.calls"
 
 printf '203.0.113.0/24\n' > "$W/p.lst"
-cat > "$W/ct.json" <<J
-{ "schema": 2, "lan_devices": ["br-lan"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg9", "on_fail": "direct" } },
-  "channels": [ { "name": "lan", "match": { "prefixes_files": ["$W/p.lst"] }, "out": "vpn" } ] }
+cat > "$W/ct.yaml" <<J
+version: 2
+lists:
+  lan: { prefixes_file: $W/p.lst }
+outputs:
+  vpn: { kind: interface, device: wg9, on_fail: direct }
+rules:
+  - { name: lan, to: lan, out: vpn }
 J
-S="--spec $W/ct.json --state-dir $T/st"
+S="--spec $W/ct.yaml --state-dir $T/st"
 
 up_wg9() { ip link add wg9 type dummy 2>/dev/null; ip link set wg9 up; }
 # Метка и маска выхода — из его правила маршрутизации: так сценарий не повторяет у себя

@@ -59,21 +59,30 @@ static int has(const char *needle) { return strstr(g_msg, needle) != NULL; }
 /* ---- каналы → правила, списки, клиенты ------------------------------------------------ */
 
 static void t_rules(void) {
-    check("каналы v1 разобраны", 0, load(
-        "{\"schema\":2,\"from_default\":[\"192.168.1.0/24\"],"
-        "\"outputs\":{\"direct\":{\"kind\":\"direct\"},\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
-        "\"channels\":["
-        " {\"name\":\"yt\",\"match\":{\"domains_file\":\"TMP/yt.lst\"},\"out\":\"vpn\"},"
-        " {\"name\":\"tv\",\"from\":[\"192.168.1.50\"],\"match\":{\"prefixes_files\":[\"TMP/a.lst\",\"TMP/b.lst\"],"
-        "  \"mode\":\"realip\"},\"out\":\"direct\"},"
-        " {\"name\":\"phone\",\"scope\":\"device\",\"from\":[\"aa:bb:cc:dd:ee:01\"],\"match\":{\"any\":true},\"out\":\"vpn\"},"
-        " {\"name\":\"all\",\"match\":{\"any\":true,\"allow_all\":true,\"proto\":\"udp\",\"ports\":[\"50000-65535\"]},\"out\":\"vpn\"},"
-        " {\"name\":\"off\",\"enabled\":false,\"match\":{\"any\":true,\"srs_file\":\"TMP/x.srs\"},\"out\":\"vpn\"}"
-        "]}"));
+    check("правила v2 разобраны", 0, load(
+        "version: 2\n"
+        "lan: { addr: [192.168.1.0/24] }\n"
+        "clients:\n"
+        "  tv:    { addr: [192.168.1.50] }\n"
+        "  phone: { mac: [aa:bb:cc:dd:ee:01] }\n"
+        "lists:\n"
+        "  yt:   { domains_file: TMP/yt.lst }\n"
+        "  ab:   { prefixes_file: [TMP/a.lst, TMP/b.lst] }\n"
+        "  udp:  { all: true, proto: udp, ports: [\"50000-65535\"] }\n"
+        "  x:    { srs: [TMP/x.srs] }\n"
+        "outputs:\n"
+        "  direct: { kind: direct }\n"
+        "  vpn:    { kind: interface, device: wg0 }\n"
+        "rules:\n"
+        "  - { name: yt, to: yt, out: vpn }\n"
+        "  - { name: tv, for: tv, to: ab, out: direct, resolve: realip }\n"
+        "  - { name: phone, for: phone, to: all, out: vpn, scope: device }\n"
+        "  - { name: all, to: udp, out: vpn }\n"
+        "  - { name: off, to: x, out: vpn, enabled: false }\n"));
     if (g_msg[0]) printf("     %s\n", g_msg);
-    check("правил — по каналу", 5, (long)g_spec.rule_n);
-    check("списков — по каналу", 5, (long)g_spec.list_n);
-    check("клиентов — только у каналов со своим from", 2, (long)g_spec.client_n);
+    check("правил — по записи", 5, (long)g_spec.rule_n);
+    check("списков — по записи (to: all списка не заводит)", 4, (long)g_spec.list_n);
+    check("клиентов — только названные", 2, (long)g_spec.client_n);
 
     const struct spec_rule *r = &g_spec.rule[0];
     check_str("правило 0: имя канала", "yt", r->name);
@@ -82,14 +91,14 @@ static void t_rules(void) {
     check("правило 0: «кто» — клиенты по умолчанию", 1, rule_who(&g_spec, r) == &g_spec.lan);
     check_str("клиенты по умолчанию — from_default", "192.168.1.0/24",
               g_spec.lan.from_n ? g_spec.lan.from[0] : "");
-    check("правило 0: один безымянный список", 1, r->lists_n == 1 && !rule_list(&g_spec, r)->name[0]);
+    check("правило 0: один названный список", 1, r->lists_n == 1 && !strcmp(rule_list(&g_spec, r)->name, "yt"));
     check("правило 0: доменный файл в списке", 1, rule_list(&g_spec, r)->domains_n == 1 &&
           strstr(rule_list(&g_spec, r)->domains_files[0], "yt.lst") != NULL);
     check("правило 0: не весь трафик", 0, rule_list(&g_spec, r)->all);
 
     r = &g_spec.rule[1];
-    check("правило 1: свой безымянный клиент", 1, r->clients_n == 1 && rule_client(&g_spec, r) &&
-          !rule_client(&g_spec, r)->name[0]);
+    check("правило 1: свой названный клиент", 1, r->clients_n == 1 && rule_client(&g_spec, r) &&
+          !strcmp(rule_client(&g_spec, r)->name, "tv"));
     check_str("правило 1: адрес клиента", "192.168.1.50", rule_who(&g_spec, r)->from[0]);
     check("правило 1: два адресных файла", 2, (long)rule_list(&g_spec, r)->prefixes_n);
     check("правило 1: realip", 1, r->realip);

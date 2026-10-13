@@ -100,13 +100,18 @@ mkconf() {   # $1 — дополнительные строки [Interface]
 }
 mkspec() {   # $1 — имя выхода
     printf '198.51.100.0/24\n' > "$tmp/a.lst"
-    cat > "$tmp/spec.json" <<EOF
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "$1": { "kind": "awg", "conf": "$tmp/nl.conf", "on_fail": "drop" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "$1" } ] }
+    cat > "$tmp/spec.yaml" <<EOF
+version: 2
+lan: { addr: [192.168.1.0/24] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+outputs:
+  $1: { kind: awg, conf: $tmp/nl.conf, on_fail: drop }
+rules:
+  - { name: a, to: a, out: $1 }
 EOF
 }
-S="--spec $tmp/spec.json --state-dir $tmp/state"
+S="--spec $tmp/spec.yaml --state-dir $tmp/state"
 st() { "$BIN" status $S 2>/dev/null; }
 field() { st | grep -o "\"$1\":[^,}]*" | head -1 | cut -d: -f2- | tr -d '"'; }
 
@@ -232,12 +237,16 @@ $P ip addr add 203.0.113.9/32 dev dum0
 # отказа ниже проходила бы, ничего не проверяя.
 $P ip addr add 1.1.1.1/32 dev dum0
 sed -i 's/^Endpoint = .*/Endpoint = 203.0.113.9:51820/' "$tmp/nl.conf"
-cat > "$tmp/spec.json" <<SPEC
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "ux": { "kind": "interface", "device": "ux0", "on_fail": "drop" },
-               "nl": { "kind": "awg", "conf": "$tmp/nl.conf", "device": "nl", "via": "ux",
-                       "on_fail": "drop" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "nl" } ] }
+cat > "$tmp/spec.yaml" <<SPEC
+version: 2
+lan: { addr: [192.168.1.0/24] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+outputs:
+  ux: { kind: interface, device: ux0, on_fail: drop }
+  nl: { kind: awg, conf: $tmp/nl.conf, over: ux, on_fail: drop }
+rules:
+  - { name: a, to: a, out: nl }
 SPEC
 nft add table inet awgvia
 nft add chain inet awgvia post '{ type filter hook postrouting priority 300; policy accept; }'
@@ -307,11 +316,16 @@ check "  и она не прежняя" "1" "$([ "$(omark ux)" != "$uxmark" ] &&
 sed -i 's/^Endpoint = .*/Endpoint = 192.0.2.2:51820/' "$tmp/nl.conf"
 sed -e 's/^Endpoint = .*/Endpoint = 192.0.2.2:51821/' -e 's|^Address = .*|Address = 10.77.9.2/24|' \
     "$tmp/nl.conf" > "$tmp/dd.conf"
-cat > "$tmp/spec.json" <<SPEC
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "nl": { "kind": "awg", "conf": "$tmp/nl.conf", "device": "nl", "on_fail": "drop" },
-               "dd": { "kind": "awg", "conf": "$tmp/dd.conf", "device": "dd", "on_fail": "drop" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "nl" } ] }
+cat > "$tmp/spec.yaml" <<SPEC
+version: 2
+lan: { addr: [192.168.1.0/24] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+outputs:
+  nl: { kind: awg, conf: $tmp/nl.conf, on_fail: drop }
+  dd: { kind: awg, conf: $tmp/dd.conf, on_fail: drop }
+rules:
+  - { name: a, to: a, out: nl }
 SPEC
 "$BIN" apply $S >/dev/null 2>&1
 check "круг: apply двух туннелей" "0" "$?"

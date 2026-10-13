@@ -49,19 +49,31 @@ iptables -t nat -A POSTROUTING -o up0 -j MASQUERADE
 printf '203.0.113.0/24\n' > $W/p.lst
 printf '198.51.100.0/24\n' > $W/q.lst
 printf 'example.com\n' > $W/d.lst
-cat > $W/local.json <<J
-{ "schema": 2, "lan_devices": ["rndis0"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg9", "on_fail": "drop" },
-               "vpn2": { "kind": "interface", "device": "wg8", "on_fail": "direct" } },
-  "channels": [
-    { "name": "app", "from": ["uid:10123"], "match": { "prefixes_files": ["$W/p.lst"] }, "out": "vpn" },
-    { "name": "all", "from": ["self"], "match": { "prefixes_files": ["$W/q.lst"] }, "out": "vpn2" },
-    { "name": "full", "from": ["uid:10500-10510"], "match": { "any": true, "allow_all": true }, "out": "vpn" },
-    { "name": "lan", "match": { "prefixes_files": ["$W/p.lst"] }, "out": "vpn2" },
-    { "name": "dom", "from": ["uid:10123"], "match": { "domains_files": ["$W/d.lst"] }, "out": "vpn" } ] }
+cat > $W/local.yaml <<J
+version: 2
+lan: { devices: [rndis0] }
+clients:
+  app:  { uid: [10123] }
+  all:  { self: true }
+  full: { uid: [10500-10510] }
+  dom:  { uid: [10123] }
+lists:
+  app:   { prefixes_file: $W/p.lst }
+  all-2: { prefixes_file: $W/q.lst }
+  lan:   { prefixes_file: $W/p.lst }
+  dom:   { domains_file: $W/d.lst }
+outputs:
+  vpn:  { kind: interface, device: wg9 }
+  vpn2: { kind: interface, device: wg8, on_fail: direct }
+rules:
+  - { name: app, for: app, to: app, out: vpn }
+  - { name: all, for: all, to: all-2, out: vpn2 }
+  - { name: full, for: full, to: all, out: vpn }
+  - { name: lan, to: lan, out: vpn2 }
+  - { name: dom, for: dom, to: dom, out: vpn }
 J
 printf 'example.com\n' > $W/d.lst
-S="--spec $W/local.json --state-dir /tmp/st"
+S="--spec $W/local.yaml --state-dir /tmp/st"
 steer apply $S 2>&1 | grep -v 'masquerade\|not mentioned\|IPv6'
 check "apply с каналами на сам телефон" "0" "$(steer apply $S >/dev/null 2>&1; echo $?)"
 nft list ruleset | grep -A8 'chain output_' | grep -v '^--'

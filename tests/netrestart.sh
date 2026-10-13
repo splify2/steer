@@ -234,20 +234,29 @@ printf 's19.test\n' > "$tmp/d.lst"
 printf '198.51.100.7\n' > "$tmp/dir.lst"
 printf '198.51.100.8\n' > "$tmp/fo.lst"
 printf '2001:db8:77::10/128\n' > "$tmp/v6.lst"
-cat > "$tmp/spec.json" <<EOF
-{ "schema": 2, "lan_devices": ["br0"],
-  "outputs": { "wg": { "kind": "interface", "devices": ["t0", "t2"], "on_fail": "drop" },
-               "dx": { "kind": "interface", "device": "nodev0", "on_fail": "direct" },
-               "dr": { "kind": "direct" } },
-  "channels": [ { "name": "dir", "match": { "prefixes_files": ["$tmp/dir.lst"] }, "out": "dr" },
-                { "name": "fo", "match": { "prefixes_files": ["$tmp/fo.lst"] }, "out": "dx" },
-                { "name": "s", "match": { "domains_files": ["$tmp/d.lst"], "mode": "fakeip" },
-                  "out": "wg" },
-                { "name": "v6", "match": { "prefixes_files": ["$tmp/v6.lst"] }, "out": "wg" } ] }
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+lan: { devices: [br0] }
+lists:
+  dir: { prefixes_file: $tmp/dir.lst }
+  fo:  { prefixes_file: $tmp/fo.lst }
+  s:   { domains_file: $tmp/d.lst }
+  v6:  { prefixes_file: $tmp/v6.lst }
+outputs:
+  wg:    { kind: group, pick: order, members: [wg.t0, wg.t2] }
+  dx:    { kind: interface, device: nodev0, on_fail: direct }
+  dr:    { kind: direct }
+  wg.t0: { kind: interface, device: t0 }
+  wg.t2: { kind: interface, device: t2 }
+rules:
+  - { name: dir, to: dir, out: dr }
+  - { name: fo, to: fo, out: dx }
+  - { name: s, to: s, out: wg }
+  - { name: v6, to: v6, out: wg }
 EOF
 mkdir -p "$tmp/st"
 printf 's19.test\t198.18.0.1\t203.0.113.10\n' > "$tmp/st/fakeip.state"
-S="--spec $tmp/spec.json --state-dir $tmp/st"
+S="--spec $tmp/spec.yaml --state-dir $tmp/st"
 # Правило выхода wg — по метке из реестра: таблица в выводе ip бывает и именем из rt_tables.d.
 ours() { "$real_ip" rule show | grep -c "fwmark 0x$MW/"; }
 pref_of() { "$real_ip" rule show | grep "fwmark 0x$MW/" | head -n 1 | cut -d: -f1; }
@@ -255,10 +264,10 @@ pref_of() { "$real_ip" rule show | grep "fwmark 0x$MW/" | head -n 1 | cut -d: -f
 # ---- A1. без демона: снятое правило — отбрасывание, а не WAN ---------------------------------
 "$BIN" apply $S >"$tmp/apply.out" 2>&1
 check "A1: apply проходит" "0" "$?"
-MW="$(awk '$1 == "wg" { print $2 }' "$tmp/st/registry")"
+MW="$(awk '$1 == "wg.t0" { print $2 }' "$tmp/st/registry")"
 check "  цепочка postrouting_guard в ядре, правило выхода wg — по устройствам пула" "yes" \
     "$("$real_nft" list chain inet steer postrouting_guard 2>/dev/null |
-       grep -q 'oifname != { "t0", "t2" } counter packets [0-9]* bytes [0-9]* drop comment "steer-guard:wg"' &&
+       grep -q 'oifname != "t0" counter packets [0-9]* bytes [0-9]* drop comment "steer-guard:wg.t0"' &&
        echo yes || echo no)"
 W0="$(cnt "$IW" real)" T0="$(cnt "$IT" real1)"
 burst 198.18.0.1 20
@@ -266,11 +275,11 @@ check "  с правилом: пакеты — в туннель, у прова�
     "$([ $(($(cnt "$IT" real1) - T0)) -ge 18 ] && echo yes || echo no) $(($(cnt "$IW" real) - W0))"
 "$real_ip" rule del fwmark "0x$MW/$("$real_ip" rule show | grep -o "fwmark 0x$MW/[^ ]*" | head -n 1 | cut -d/ -f2)"
 check "  правило fwmark выхода снято" "0" "$(ours)"
-W0="$(cnt "$IW" real)" G0="$(guard wg)"
+W0="$(cnt "$IW" real)" G0="$(guard wg.t0)"
 burst 198.18.0.1 20
 check "  без правила: у провайдера ни одного" "0" "$(($(cnt "$IW" real) - W0))"
-check "  отбросило правило steer-guard:wg" "yes" \
-    "$([ $(($(guard wg) - G0)) -ge 18 ] && echo yes || echo "no:$(($(guard wg) - G0))")"
+check "  отбросило правило steer-guard:wg.t0" "yes" \
+    "$([ $(($(guard wg.t0) - G0)) -ge 18 ] && echo yes || echo "no:$(($(guard wg.t0) - G0))")"
 
 # ---- демон ------------------------------------------------------------------------------------
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
@@ -289,7 +298,7 @@ sleep 4   # первый проход и его следствия — до оп
 
 # ---- A2. netifd снимает все правила под трафиком ----------------------------------------------
 P0="$(pref_of)"
-W0="$(cnt "$IW" real)" WP0="$(cnt "$IW" pool)" T0="$(cnt "$IT" real1)" G0="$(guard wg)"
+W0="$(cnt "$IW" real)" WP0="$(cnt "$IW" pool)" T0="$(cnt "$IT" real1)" G0="$(guard wg.t0)"
 n0="$(grep -c 'сняты снаружи — возвращены' "$tmp/d.err")"
 send_start 198.18.0.1
 sleep 0.3
@@ -309,11 +318,11 @@ check "  с прежним приоритетом" "$P0" "$(pref_of)"
 check "  туннель получал" "yes" \
     "$([ $(($(cnt "$IT" real1) - T0)) -gt 50 ] && echo yes || echo "no:$(($(cnt "$IT" real1) - T0))")"
 check "  окно было, и его закрыл steer-guard (отброшено > 0)" "yes" \
-    "$([ $(($(guard wg) - G0)) -gt 0 ] && echo yes || echo no)"
+    "$([ $(($(guard wg.t0) - G0)) -gt 0 ] && echo yes || echo no)"
 check "  в журнале — «возвращены: wg»" "yes" \
     "$([ "$(grep -c 'сняты снаружи — возвращены: wg' "$tmp/d.err")" -gt "$n0" ] && echo yes || echo no)"
 wait_for 'grep -q "\"ev\":\"repaired\"" "$tmp/sub.out"' 3
-check "  подписчику repaired" '{"v":1,"ev":"repaired","outputs":["wg"],"masq":false}' \
+check "  подписчику repaired" '{"v":1,"ev":"repaired","outputs":["wg","wg.t0","wg.t2"],"masq":false}' \
     "$(grep '"ev":"repaired"' "$tmp/sub.out" | tail -n 1)"
 sleep 6   # внеочередной проход сторожа после починки — до следующего опыта
 

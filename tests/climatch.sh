@@ -112,13 +112,16 @@ code "обязательный аргумент пропущен" 2 -- "$BIN" ex
 check "--spec доходит до команды" "1" \
     "$("$BIN" apply --spec "$tmp/нет.json" 2>&1 >/dev/null | grep -c "$tmp/нет.json")"
 
-cat > "$tmp/spec.json" <<'EOF'
-{ "schema": 1,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "direct": { "kind": "direct" }, "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "c", "match": { "any": true, "allow_all": true }, "out": "vpn" } ] }
+cat > "$tmp/spec.yaml" <<'EOF'
+version: 2
+lan: { addr: [192.168.1.0/24] }
+outputs:
+  direct: { kind: direct }
+  vpn: { kind: interface, device: wg0 }
+rules:
+  - { name: c, to: all, out: vpn }
 EOF
-S="--spec $tmp/spec.json --state-dir $tmp/state"
+S="--spec $tmp/spec.yaml --state-dir $tmp/state"
 check "outputs без отбора" "direct
 vpn" "$("$BIN" outputs $S 2>/dev/null)"
 check "outputs --kind отбирает" "vpn" "$("$BIN" outputs $S --kind interface 2>/dev/null)"
@@ -172,12 +175,12 @@ accepted() { # ИМЯ -- команда...
     rc=$?
     check "$name" "принят" "$([ "$rc" = 2 ] && echo "ОТВЕРГНУТ разбором" || echo "принят")"
 }
-accepted "splify2: apply --dry-run --spec" -- "$BIN" apply --dry-run --spec "$tmp/spec.json"
-accepted "splify2: outputs --kind vless --spec" -- "$BIN" outputs --kind vless --spec "$tmp/spec.json"
-accepted "splify2: outputs --obfs --spec" -- "$BIN" outputs --obfs --spec "$tmp/spec.json"
-accepted "splify2: status --spec" -- "$BIN" status --spec "$tmp/spec.json"
-accepted "splify2: diag --spec" -- "$BIN" diag --spec "$tmp/spec.json"
-accepted "splify2: explain АДРЕС --spec" -- "$BIN" explain 1.2.3.4 --spec "$tmp/spec.json"
+accepted "splify2: apply --dry-run --spec" -- "$BIN" apply --dry-run --spec "$tmp/spec.yaml"
+accepted "splify2: outputs --kind vless --spec" -- "$BIN" outputs --kind vless --spec "$tmp/spec.yaml"
+accepted "splify2: outputs --obfs --spec" -- "$BIN" outputs --obfs --spec "$tmp/spec.yaml"
+accepted "splify2: status --spec" -- "$BIN" status --spec "$tmp/spec.yaml"
+accepted "splify2: diag --spec" -- "$BIN" diag --spec "$tmp/spec.yaml"
+accepted "splify2: explain АДРЕС --spec" -- "$BIN" explain 1.2.3.4 --spec "$tmp/spec.yaml"
 # Команды VLESS в базовой сборке отвечают кодом 2 — «в этой сборке их нет», — и по коду
 # это не отличить от отказа разбора. Поэтому здесь проверяется маркер: базовая сборка
 # обязана дойти до отказа САМОЙ КОМАНДЫ и назвать нужный пакет. Заодно это единственное
@@ -193,11 +196,11 @@ ext_marker() { # ИМЯ -- команда...
     check "$name" "1" "$(printf '%s' "$out" | grep -c 'steer-extended')"
 }
 ext_marker "splify2: vless-nodes доходит до команды" -- \
-    "$BIN" vless-nodes v --spec "$tmp/spec.json"
+    "$BIN" vless-nodes v --spec "$tmp/spec.yaml"
 ext_marker "splify2: vless-probe --node -1 --timeout 6 доходит до команды" -- \
-    "$BIN" vless-probe v --node -1 --timeout 6 --spec "$tmp/spec.json"
+    "$BIN" vless-probe v --node -1 --timeout 6 --spec "$tmp/spec.yaml"
 ext_marker "splify2: vless-probe --node 0 доходит до команды" -- \
-    "$BIN" vless-probe v --node 0 --timeout 6 --spec "$tmp/spec.json"
+    "$BIN" vless-probe v --node 0 --timeout 6 --spec "$tmp/spec.yaml"
 # --insecure у перечня и проверки узлов ПО ФАЙЛУ подписки: узлы с allowInsecure входят в перечень с
 # той же нумерацией, что у выхода с insecure: true. Разбор флаг пропускает до команды (в базовой
 # сборке — до отказа «нужен пакет»); с именем выхода флаг — отказ разбора кодом 2 и словами: у выхода
@@ -206,7 +209,7 @@ printf 'vless://x@h.example:443#n\n' > "$tmp/sub.txt"
 for c in vless-nodes vless-probe hysteria2-nodes hysteria2-probe proxy-nodes proxy-probe; do
     out="$("$BIN" $c "$tmp/sub.txt" --insecure 2>&1 >/dev/null)"
     check "$c /файл --insecure доходит до команды" "1" "$(printf '%s' "$out" | grep -c 'нужен пакет')"
-    out="$("$BIN" $c v --insecure --spec "$tmp/spec.json" 2>&1 >/dev/null)"; rc=$?
+    out="$("$BIN" $c v --insecure --spec "$tmp/spec.yaml" 2>&1 >/dev/null)"; rc=$?
     check "$c выход --insecure: отказ кодом 2" "2" "$rc"
     check "  и словами «только с файлом подписки», а не «нужен пакет»" "1 0" \
         "$(printf '%s' "$out" | grep -c 'только с файлом подписки') $(printf '%s' "$out" | grep -c 'нужен пакет')"

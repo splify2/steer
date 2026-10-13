@@ -43,10 +43,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
+cat > "$WORK/spec.yaml" <<SPEC
+version: 2
+
+outputs:
+  vl: { kind: tunnel, protocol: vless, subscription: $WORK/sub.txt, nodes: [0] }
 SPEC
 
 ip netns delete "$NS" 2>/dev/null || true
@@ -65,7 +66,7 @@ sleep 1
 # ОДНО ядро и ОДИН поток: на роутере их столько и есть, а на восьми ядрах разница между
 # «цикл дорогой» и «цикл дешёвый» размазывается по свободным ядрам и не видна.
 ip netns exec "$NS" taskset -c 0 env STEER_TUN_THREADS=1 "$BIN" vless vl \
-    --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
+    --spec "$WORK/spec.yaml" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 
 for _ in $(seq 50); do

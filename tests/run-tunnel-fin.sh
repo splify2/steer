@@ -43,10 +43,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
+cat > "$WORK/spec.yaml" <<SPEC
+version: 2
+
+outputs:
+  vl: { kind: tunnel, protocol: vless, subscription: $WORK/sub.txt, nodes: [0] }
 SPEC
 
 ip netns delete "$NS" 2>/dev/null || true
@@ -64,7 +65,7 @@ sleep 1
 # Без запасных сессий: иначе и «early» получает готовый поток и дорожка «пока поток
 # открывается» не проверяется вовсе.
 ip netns exec "$NS" env STEER_TUN_SPARES=0 ${TRACE:+STEER_TUN_TRACE=1} \
-    ${STEER_PRELOAD:+LD_PRELOAD=$STEER_PRELOAD} "$BIN" vless vl --spec "$WORK/spec.json" --state-dir "$WORK/state" \
+    ${STEER_PRELOAD:+LD_PRELOAD=$STEER_PRELOAD} "$BIN" vless vl --spec "$WORK/spec.yaml" --state-dir "$WORK/state" \
     > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 for _ in $(seq 50); do

@@ -55,13 +55,17 @@ chmod +x "$tmp/bin/nft"
 PATH="$tmp/bin:$PATH"; export PATH
 
 printf '203.0.113.0/24\n' > "$tmp/a.lst"
-cat > "$tmp/spec.json" <<EOF
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "applynft0", "on_fail": "direct" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+lan: { addr: [192.168.1.0/24] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+outputs:
+  vpn: { kind: interface, device: applynft0, on_fail: direct }
+rules:
+  - { name: a, to: a, out: vpn }
 EOF
-S="--spec $tmp/spec.json --state-dir $tmp/state"
+S="--spec $tmp/spec.yaml --state-dir $tmp/state"
 
 "$BIN" apply $S >/dev/null 2>&1
 check "первый apply (таблицы нет) проходит" "0" "$?"

@@ -110,10 +110,13 @@ chmod 600 "$WORK"/*.conf
 
 # Режим потока задан В СПЕКЕ, а не ключом: так проверяется и разбор поля, и путь, которым
 # туннель поднимает procd на роутере. Ключ --stream проверяется отдельно, ниже.
-cat > "$WORK/a.json" <<EOF
-{"schema":1,"lan_device":"lo","from_default":["10.79.0.0/24"],
- "outputs":{"vpna":{"kind":"xsteer","conf":"$WORK/a.conf","stream":true}},
- "channels":[]}
+cat > "$WORK/a.yaml" <<EOF
+version: 2
+
+lan: { devices: [lo], addr: [10.79.0.0/24] }
+
+outputs:
+  vpna: { kind: xsteer, conf: $WORK/a.conf, stream: true }
 EOF
 
 # ---- запуск ------------------------------------------------------------------
@@ -122,7 +125,7 @@ EOF
 ip netns exec $NSH "$GO_XS" hub "$WORK/hub.conf" --stream-only --stream-port "$PORT" \
     > "$WORK/hub.log" 2>&1 &
 sleep 1
-ip netns exec $NSA "$EXT" xsteer vpna --spec "$WORK/a.json" \
+ip netns exec $NSA "$EXT" xsteer vpna --spec "$WORK/a.yaml" \
     --state-dir "$WORK/state-a" > "$WORK/a.log" 2>&1 &
 
 up_count() { grep -c 'поднялся потоком' "$WORK/hub.log" 2>/dev/null | head -1; }

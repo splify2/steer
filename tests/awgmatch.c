@@ -113,7 +113,7 @@ static int spec_str(const char *body) {
     int fd = mkstemp(path);
     if (fd < 0) return -1;
     FILE *f = fdopen(fd, "w");
-    fprintf(f, "{\"schema\":1,%s}", body);
+    fprintf(f, "{\"version\":2,%s}", body);
     fclose(f);
     struct err e = {0};
     int rc = load_spec(path, &g_spec, &e) < 0 ? 2 : 0;
@@ -397,7 +397,7 @@ int main(void) {
 
     /* ---- 8. спека ------------------------------------------------------------------------- */
     check("kind awg без conf — годен", 0,
-          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"on_fail\":\"drop\"}},\"channels\":[]"));
+          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"on_fail\":\"drop\"}}"));
     check_str("  устройство — имя выхода", "nl", g_spec.out[0].device);
     {
         char want[256];
@@ -409,27 +409,28 @@ int main(void) {
     check("  masquerade ему нужен (не self_natting)", 0, out_self_natting(&g_spec.out[0]));
     check_str("  вид печатается как awg", "awg", kind_of(&g_spec.out[0])->name);
     check("kind awg c именем wg0 — годен", 0,
-          spec_str("\"outputs\":{\"wg0\":{\"kind\":\"awg\",\"conf\":\"/data/misc/steer/awg/a.conf\"}},\"channels\":[]"));
+          spec_str("\"outputs\":{\"wg0\":{\"kind\":\"awg\",\"conf\":\"/data/misc/steer/awg/a.conf\"}}"));
     check("  устройство не «wg0»", 1, strcmp(g_spec.out[0].device, "wg0") != 0 && !strncmp(g_spec.out[0].device, "if", 2));
     check("device «tun1» явно — отказ", 2,
-          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"device\":\"tun1\"}},\"channels\":[]"));
+          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"device\":\"tun1\"}}"));
     check("device нейтральный явно — годен", 0,
-          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"device\":\"rt5\"}},\"channels\":[]"));
+          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"device\":\"rt5\"}}"));
     check_str("  взят как есть", "rt5", g_spec.out[0].device);
     check("devices списком из двух — отказ", 2,
-          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"devices\":[\"a1\",\"a2\"]}},\"channels\":[]"));
-    check("conf относительный — отказ", 2,
-          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"conf\":\"a.conf\"}},\"channels\":[]"));
+          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"devices\":[\"a1\",\"a2\"]}}"));
+    check("conf относительный — годен (v2: от каталога спеки)", 0,
+          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"conf\":\"a.conf\"}}"));
     check("stream у awg — отказ", 2,
-          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"stream\":true}},\"channels\":[]"));
+          spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"stream\":true}}"));
     check("канал в выход awg — годен", 0,
           spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\"}},"
-                   "\"channels\":[{\"name\":\"c\",\"out\":\"nl\",\"match\":{\"prefixes_file\":\"/tmp/x\"}}]"));
+                   "\"lists\":{\"l\":{\"prefixes_file\":\"/tmp/x\"}},"
+                   "\"rules\":[{\"name\":\"c\",\"to\":\"l\",\"out\":\"nl\"}]"));
 
     /* ---- 9. метка сокета туннеля ----------------------------------------------------- */
     {
         spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\"},\"up\":{\"kind\":\"interface\",\"device\":\"eth9\"},"
-                 "\"d\":{\"kind\":\"direct\"}},\"channels\":[]");
+                 "\"d\":{\"kind\":\"direct\"}}");
         g_spec.out[1].mark = 0x00300000;
         uint32_t mk = 0xdead;
         uint32_t self = STEER_SELF_MARK;          /* платформы: на роутере 0 */

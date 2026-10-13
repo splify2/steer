@@ -99,12 +99,17 @@ mkconf() {   # $1 — параметры AmneziaWG, $2 — прочее в [Inte
     } > $T/nl.conf
 }
 printf '198.51.100.0/24\n' > $T/a.lst
-cat > $T/spec.json <<EOF
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "nl": { "kind": "awg", "conf": "$T/nl.conf", "on_fail": "drop" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$T/a.lst" }, "out": "nl" } ] }
+cat > $T/spec.yaml <<EOF
+version: 2
+lan: { addr: [192.168.1.0/24] }
+lists:
+  a: { prefixes_file: $T/a.lst }
+outputs:
+  nl: { kind: awg, conf: $T/nl.conf, on_fail: drop }
+rules:
+  - { name: a, to: a, out: nl }
 EOF
-S="--spec $T/spec.json"
+S="--spec $T/spec.yaml"
 st() { steer status $S 2>/dev/null; }
 field() { st | grep -o "\"$1\":[^,}]*" | head -1 | cut -d: -f2- | tr -d '"'; }
 cping() { ip netns exec c ping -c "${1:-3}" -W 2 -q 198.51.100.1 >$T/ping.out 2>&1; r=$?; [ $r = 0 ] || cat $T/ping.out; return $r; }
@@ -190,12 +195,16 @@ ip -n p addr add 203.0.113.9/32 dev lo
 ip -n p addr add 1.1.1.1/32 dev lo      # адрес пробы сторожа — за ux0, иначе ux «мёртв» всегда
 mkconf "$OBFS2"
 sed -i 's/^Endpoint = .*/Endpoint = 203.0.113.9:51820/' $T/nl.conf
-cat > $T/spec.json <<EOF
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "ux": { "kind": "interface", "device": "ux0", "on_fail": "drop" },
-               "nl": { "kind": "awg", "conf": "$T/nl.conf", "device": "nl", "via": "ux",
-                       "on_fail": "drop" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$T/a.lst" }, "out": "nl" } ] }
+cat > $T/spec.yaml <<EOF
+version: 2
+lan: { addr: [192.168.1.0/24] }
+lists:
+  a: { prefixes_file: $T/a.lst }
+outputs:
+  ux: { kind: interface, device: ux0, on_fail: drop }
+  nl: { kind: awg, conf: $T/nl.conf, over: ux, on_fail: drop }
+rules:
+  - { name: a, to: a, out: nl }
 EOF
 steer apply $S >$T/apply5.out 2>&1
 check "via: apply проходит" "0" "$?"
@@ -222,10 +231,15 @@ check "via: ux ожил — nl вернулся" "1" "$(ip route show table "$nl
 cping 3
 check "via: трафик после возврата ux" "0" "$?"
 # Дальше — прежняя спека без via: часть 7 проверяет свои вещи, и via ей ни к чему.
-cat > $T/spec.json <<EOF
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "nl": { "kind": "awg", "conf": "$T/nl.conf", "on_fail": "drop" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$T/a.lst" }, "out": "nl" } ] }
+cat > $T/spec.yaml <<EOF
+version: 2
+lan: { addr: [192.168.1.0/24] }
+lists:
+  a: { prefixes_file: $T/a.lst }
+outputs:
+  nl: { kind: awg, conf: $T/nl.conf, on_fail: drop }
+rules:
+  - { name: a, to: a, out: nl }
 EOF
 
 # ---- 6. down ---------------------------------------------------------------------------
@@ -260,7 +274,7 @@ H4 = 4"
     cping 3
     check "без AmneziaWG: трафик канала через wireguard" "0" "$?"
     mkconf "$OBFS"
-    sed -i 's/"nl"/"nl2"/; s/"out": "nl"/"out": "nl2"/' $T/spec.json
+    sed -i "s/nl:/nl2:/; s/out: nl/out: nl2/" $T/spec.yaml
     steer apply $S >$T/apply4.out 2>&1
     check "обфускация без модуля — отказ назван" "1" "$(grep -c 'нет модуля AmneziaWG' $T/apply4.out)"
     check "устройство nl2 не создано" "0" "$(ip link show nl2 2>/dev/null | grep -c nl2)"

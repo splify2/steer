@@ -33,14 +33,20 @@ check() {
 
 printf '203.0.113.0/24\n' > "$tmp/a.lst"
 printf 'example.com\n' > "$tmp/d.lst"
-cat > "$tmp/spec.json" <<EOF2
-{ "schema": 2, "lan_devices": ["rndis0"],
-  "outputs": { "direct": { "kind": "direct" },
-               "vpn": { "kind": "interface", "device": "wg0", "on_fail": "direct" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" },
-                { "name": "d", "match": { "domains_files": ["$tmp/d.lst"] }, "out": "vpn" } ] }
+cat > "$tmp/spec.yaml" <<EOF2
+version: 2
+lan: { devices: [rndis0] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+  d: { domains_file: $tmp/d.lst }
+outputs:
+  direct: { kind: direct }
+  vpn:    { kind: interface, device: wg0, on_fail: direct }
+rules:
+  - { name: a, to: a, out: vpn }
+  - { name: d, to: d, out: vpn }
 EOF2
-S="--spec $tmp/spec.json --state-dir $tmp/state"
+S="--spec $tmp/spec.yaml --state-dir $tmp/state"
 
 out="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run $S 2>/dev/null)"
 check "современная раскладка собирается" "0" "$?"
@@ -73,23 +79,30 @@ check "старая раскладка: nat в таблице ip" "1" "$(printf 
 check "старая раскладка: метка та же" "2" \
     "$(printf '%s\n' "$lout" | grep -c 'meta mark set mark and 0xf03fffff or 0x00400000')"
 
-sed 's/"kind": "direct" }/"kind": "zapret" }/' "$tmp/spec.json" > "$tmp/z.json"
-"$BIN" apply --dry-run --spec "$tmp/z.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/z.err"
+sed 's/kind: direct }/kind: zapret }/' "$tmp/spec.yaml" > "$tmp/z.yaml"
+"$BIN" apply --dry-run --spec "$tmp/z.yaml" --state-dir "$tmp/state" >/dev/null 2>"$tmp/z.err"
 check "kind zapret — отказ спеки" "2" "$?"
 check "  и причина названа" "1" "$(grep -c 'на телефоне zapret нет' "$tmp/z.err")"
-sed 's/"on_fail": "direct"/"on_fail": "zapret"/' "$tmp/spec.json" > "$tmp/zf.json"
-"$BIN" apply --dry-run --spec "$tmp/zf.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/zf.err"
+sed 's/on_fail: direct/on_fail: zapret/' "$tmp/spec.yaml" > "$tmp/zf.yaml"
+"$BIN" apply --dry-run --spec "$tmp/zf.yaml" --state-dir "$tmp/state" >/dev/null 2>"$tmp/zf.err"
 check "on_fail zapret — отказ спеки" "2" "$?"
 
 # Каналы на сам телефон (from: self / uid:N) — разбор спеки. Поведение в ядре проверяет
 # tests/local49.sh на стенде vm49; здесь — что генератор ставит их на output, а спека
 # отвергает то, чего быть не может.
-cat > "$tmp/local.json" <<EOF2
-{ "schema": 2, "lan_devices": ["rndis0"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "a", "from": ["uid:10123"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
+cat > "$tmp/local.yaml" <<EOF2
+version: 2
+lan: { devices: [rndis0] }
+clients:
+  u: { uid: [10123] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+outputs:
+  vpn: { kind: interface, device: wg0 }
+rules:
+  - { name: a, for: u, to: a, out: vpn }
 EOF2
-lo="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/local.json" --state-dir "$tmp/state" 2>/dev/null)"
+lo="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/local.yaml" --state-dir "$tmp/state" 2>/dev/null)"
 check "канал по UID: правило на output со skuid" "1" \
     "$(printf '%s\n' "$lo" | grep -c 'meta skuid 10123 ct direction original ip daddr @vpn_ip_c0 meta mark set')"
 check "канал по UID: на prerouting его нет" "0" \
@@ -97,29 +110,39 @@ check "канал по UID: на prerouting его нет" "0" \
 check "старая раскладка: бит перемаршрутизации снимает цепочка route в ip" "1" \
     "$(printf '%s\n' "$lo" | grep -c 'type route hook output priority mangle + 2')"
 bad() {   # bad ИМЯ FROM ТЕКСТ — спека с таким «кому» отвергается кодом 2 и называет причину
-    sed "s|\"from\": \[\"uid:10123\"\]|\"from\": $2|" "$tmp/local.json" > "$tmp/bad.json"
-    "$BIN" apply --dry-run --spec "$tmp/bad.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/bad.err"
+    sed "s|{ uid: \[10123\] }|{ $2 }|" "$tmp/local.yaml" > "$tmp/bad.yaml"
+    "$BIN" apply --dry-run --spec "$tmp/bad.yaml" --state-dir "$tmp/state" >/dev/null 2>"$tmp/bad.err"
     check "$1" "2" "$?"
     check "  причина: $3" "1" "$(grep -c "$3" "$tmp/bad.err")"
 }
-bad "смешаны телефон и клиенты — отказ" '["self", "192.168.43.5"]' 'смешаны сам телефон и клиенты'
-bad "self вместе с uid — отказ" '["self", "uid:10123"]' 'уже включает все приложения'
-bad "uid:0 (root) — отказ" '["uid:0"]' 'это root'
-bad "не UID — отказ" '["uid:abc"]' 'не UID приложения'
-bad "обратный диапазон — отказ" '["uid:10200-10100"]' 'не UID приложения'
+bad "смешаны телефон и клиенты — отказ" 'self: true, addr: [192.168.43.5]' 'сам телефон (uid, self) и клиенты раздачи'
+bad "self вместе с uid — отказ" 'self: true, uid: [10123]' 'уже включает все приложения'
+bad "uid:0 (root) — отказ" 'uid: [0]' 'это root'
+bad "не UID — отказ" 'uid: [abc]' 'не UID приложения'
+bad "обратный диапазон — отказ" 'uid: [10200-10100]' 'не UID приложения'
 
 # Вид правил на output. Спека с «self» + весь трафик и сужением, с приложениями списком и
 # диапазоном, с доменным каналом телефона.
-cat > "$tmp/loc2.json" <<EOF2
-{ "schema": 2, "lan_devices": ["rndis0"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "s", "from": ["self"], "match": { "any": true, "allow_all": true, "proto": "udp", "ports": ["50000-65535"] }, "out": "vpn" },
-    { "name": "u", "from": ["uid:10123", "uid:1010200-1010300"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" },
-    { "name": "d", "from": ["uid:10124"], "match": { "domains_files": ["$tmp/d.lst"] }, "out": "vpn" } ] }
+cat > "$tmp/loc2.yaml" <<EOF2
+version: 2
+lan: { devices: [rndis0] }
+clients:
+  s: { self: true }
+  u: { uid: [10123, 1010200-1010300] }
+  d: { uid: [10124] }
+lists:
+  s: { all: true, proto: udp, ports: [50000-65535] }
+  u: { prefixes_file: $tmp/a.lst }
+  d: { domains_file: $tmp/d.lst }
+outputs:
+  vpn: { kind: interface, device: wg0 }
+rules:
+  - { name: s, for: s, to: s, out: vpn }
+  - { name: u, for: u, to: u, out: vpn }
+  - { name: d, for: d, to: d, out: vpn }
 EOF2
-m2="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)"
-l2="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)"
+m2="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/loc2.yaml" --state-dir "$tmp/state" 2>/dev/null)"
+l2="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/loc2.yaml" --state-dir "$tmp/state" 2>/dev/null)"
 c() { printf '%s\n' "$1" | grep -c -- "$2"; }
 check "self — приложения (UID от 10000), только исходящие соединения" "2" \
     "$(c "$m2" 'meta skuid >= 10000 ct direction original')"
@@ -166,7 +189,7 @@ check "раздача: TCP/53 к резолверу, старая расклад
 # Режим legacy спрашивает nat в ip6 у ядра пробой `nft -c`: под root с nft он есть, и правил два
 # (ip и ip6), а на машине без них (runner GitHub) проба отвечает «нет», и правило одно — только в
 # ip. Поэтому ожидание берётся у UDP/53 той же раскладки: TCP обязан стоять везде, где стоит UDP.
-lg="$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)"
+lg="$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/loc2.yaml" --state-dir "$tmp/state" 2>/dev/null)"
 check "раздача: TCP/53 к резолверу, старая раскладка с nat в ip6 — там же, где UDP/53" \
     "$(c "$lg" 'iifname "rndis0" udp dport 53 counter redirect to :5300')" \
     "$(c "$lg" 'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
@@ -179,31 +202,45 @@ check "  и поддельные IPv6 — картой fakeip6" "1" \
 check "masquerade — не в nft (его ставит iptables при apply)" "0" "$(c "$m2$l2" 'masquerade')"
 
 spec_bad() {   # spec_bad ИМЯ ТЕКСТ — спека из stdin отвергается и называет причину
-    cat > "$tmp/sb.json"
-    "$BIN" apply --dry-run --spec "$tmp/sb.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/sb.err"
+    cat > "$tmp/sb.yaml"
+    "$BIN" apply --dry-run --spec "$tmp/sb.yaml" --state-dir "$tmp/state" >/dev/null 2>"$tmp/sb.err"
     check "$1" "2" "$?"
     check "  причина: $2" "1" "$(grep -c "$2" "$tmp/sb.err")"
 }
 spec_bad "канал телефона с выходом tgws — отказ" 'только для клиентов раздачи' <<EOF2
-{ "schema": 2, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
-  "channels": [ { "name": "t", "from": ["uid:10123"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "tg" } ] }
+version: 2
+clients:
+  t: { uid: [10123] }
+lists:
+  t: { prefixes_file: $tmp/a.lst }
+outputs:
+  tg: { kind: tgws, domain: ex.co.uk }
+rules:
+  - { name: t, for: t, to: t, out: tg }
 EOF2
 spec_bad "self в from_default — отказ, даже если у каналов свой from" 'сам телефон, а не клиенты' <<EOF2
 { "schema": 2, "from_default": ["self"], "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
   "channels": [ { "name": "a", "from": ["uid:10123"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
 EOF2
-spec_bad "диапазон UID в правиле на устройство — отказ" 'одно приложение' <<EOF2
-{ "schema": 2, "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "a", "scope": "device", "from": ["uid:10100-10200"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
+spec_bad "диапазон UID в правиле на устройство — отказ" 'только одиночных хозяев' <<EOF2
+version: 2
+clients:
+  a: { uid: [10100-10200] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+outputs:
+  vpn: { kind: interface, device: wg0 }
+rules:
+  - { name: a, for: a, to: a, scope: device, out: vpn }
 EOF2
 # Туннель через via: его сокет несёт метку цели плюс бит «собственный трафик туннеля»
 # (STEER_TUNNEL_BIT, 0x10000000), и заворот DNS приложений обязан его пропускать — иначе туннель
 # с сервером на 53-м порту (UDP или TCP) уходил бы к нашему резолверу и не вставал. Условие
 # пишется только в спеке с via: без via текст правил прежний побайтно (проверки выше).
-sed 's|"outputs": { "vpn": { "kind": "interface", "device": "wg0" } }|"outputs": { "vpn": { "kind": "interface", "device": "wg0" }, "nl": { "kind": "awg", "conf": "/nonexistent/nl.conf", "via": "vpn" } }|' \
-    "$tmp/loc2.json" > "$tmp/via.json"
-mv3="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/via.json" --state-dir "$tmp/state" 2>/dev/null)"
-lv3="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/via.json" --state-dir "$tmp/state" 2>/dev/null)"
+sed 's|^  vpn: { kind: interface, device: wg0 }$|&\n  nl: { kind: awg, conf: /nonexistent/nl.conf, over: vpn }|' \
+    "$tmp/loc2.yaml" > "$tmp/via.yaml"
+mv3="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/via.yaml" --state-dir "$tmp/state" 2>/dev/null)"
+lv3="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/via.yaml" --state-dir "$tmp/state" 2>/dev/null)"
 vdns='meta mark and 0x0fc00000 != 0x0fc00000 meta mark and 0x10000000 == 0x00000000 udp dport 53 ct mark set mark counter redirect to :5300'
 vtcp='meta mark and 0x0fc00000 != 0x0fc00000 meta mark and 0x10000000 == 0x00000000 tcp dport 53 ct mark set mark counter redirect to :5300'
 check "via: заворот UDP/53 пропускает туннель (бит 0x10000000)" "1" "$(c "$mv3" "$vdns")"
@@ -220,7 +257,7 @@ fi
 
 ROUTER="${ROUTER:-./build/steer}"
 if [ -x "$ROUTER" ]; then
-    "$ROUTER" apply --dry-run --spec "$tmp/local.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/r.err"
+    "$ROUTER" apply --dry-run --spec "$tmp/local.yaml" --state-dir "$tmp/state" >/dev/null 2>"$tmp/r.err"
     check "роутерная сборка: каналы на себя — отказ" "2" "$?"
 fi
 

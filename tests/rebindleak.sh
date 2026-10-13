@@ -106,12 +106,19 @@ die_on()  { $P nft add rule inet rej in iifname "s$1" icmp type echo-request rej
 live_all() { $P nft flush chain inet rej in; }
 
 printf '203.0.113.0/24\n' > "$tmp/a.lst"
-cat > "$tmp/spec.json" <<EOF
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "devices": ["t1", "t2"], "on_fail": "drop" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+lan: { addr: [192.168.1.0/24] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+outputs:
+  vpn:    { kind: group, pick: order, members: [vpn.t1, vpn.t2] }
+  vpn.t1: { kind: interface, device: t1 }
+  vpn.t2: { kind: interface, device: t2 }
+rules:
+  - { name: a, to: a, out: vpn }
 EOF
-S="--spec $tmp/spec.json --state-dir $tmp/state"
+S="--spec $tmp/spec.yaml --state-dir $tmp/state"
 "$BIN" apply $S >"$tmp/apply0.log" 2>&1
 check "apply проходит" "0" "$?"
 mark="0x$(awk '$1=="vpn"{print $2}' "$tmp/state/registry")"

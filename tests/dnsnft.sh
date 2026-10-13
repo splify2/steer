@@ -83,16 +83,23 @@ else: print(".".join(str(b) for b in d[-4:]))
 PY
 
 printf 'example.com\nmoved.net\nfail.io\nstay.org\nperm.io\nwin.io\nwin2.io\n' > "$tmp/d.lst"
-printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
-'"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
-'"channels":[{"name":"c","match":{"domains_files":["%s/d.lst"],"mode":"fakeip"},"out":"vpn"}]}' \
-    "$tmp" > "$tmp/spec.json"
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+lan: { addr: [127.0.0.0/8] }
+lists:
+  c: { domains_file: $tmp/d.lst }
+outputs:
+  direct: { kind: direct }
+  vpn: { kind: interface, device: lo }
+rules:
+  - { name: c, to: c, out: vpn }
+EOF
 
 echo 203.0.113.1 > "$tmp/ip"
 python3 "$tmp/upstream.py" "$UPORT" "$tmp/ip" & UPID=$!
 nft monitor > "$tmp/mon" 2>&1 & MPID=$!
 sleep 1
-"$BIN" dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state" \
+"$BIN" dnsd --spec "$tmp/spec.yaml" --state-dir "$tmp/state" \
     --listen-port "$LPORT" --upstream-port "$UPORT" > "$tmp/log" 2>&1 & DPID=$!
 sleep 1
 kill -0 "$DPID" 2>/dev/null || { echo "FAIL резолвер не поднялся:"; cat "$tmp/log"; exit 1; }

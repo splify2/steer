@@ -48,10 +48,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 printf '%s\n' "vless://$UUID@$NODE_URL:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
+cat > "$WORK/spec.yaml" <<SPEC
+version: 2
+
+outputs:
+  vl: { kind: tunnel, protocol: vless, subscription: $WORK/sub.txt, nodes: [0] }
 SPEC
 
 ip netns delete "$NS" 2>/dev/null || true
@@ -77,7 +78,7 @@ if [ "$LOSS" = 0 ] && [ "$STREAMS" = 1 ] && command -v strace >/dev/null 2>&1; t
     TRACE="strace -f -qq -e trace=epoll_ctl -o $WORK/ctl.txt"
 fi
 ip netns exec "$NS" env STEER_TUN_STATS=1 $TRACE "$BIN" vless vl \
-    --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
+    --spec "$WORK/spec.yaml" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 
 # Ждём появления устройства, а не спим наугад: подъём занимает разное время.

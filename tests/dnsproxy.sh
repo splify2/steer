@@ -199,14 +199,21 @@ elif what == 'idle':
 PY
 
 printf 'example.com\n' > "$tmp/d.lst"
-printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
-'"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
-'"channels":[{"name":"c","match":{"domains_files":["%s/d.lst"],"mode":"realip"},"out":"vpn"}]}' \
-    "$tmp" > "$tmp/spec.json"
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+lan: { addr: [127.0.0.0/8] }
+lists:
+  c: { domains_file: $tmp/d.lst }
+outputs:
+  direct: { kind: direct }
+  vpn: { kind: interface, device: lo }
+rules:
+  - { name: c, to: c, out: vpn, resolve: realip }
+EOF
 
 python3 "$tmp/upstream.py" "$UPORT" "$tmp/up.txt" & UPID=$!
 sleep 1
-"$BIN" dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state" \
+"$BIN" dnsd --spec "$tmp/spec.yaml" --state-dir "$tmp/state" \
     --listen-port "$LPORT" --upstream-port "$UPORT" > "$tmp/log" 2>&1 & DPID=$!
 sleep 1
 
@@ -322,12 +329,13 @@ printf 'swap.test\n' > "$tmp/tab.lst"
 # на таблицу). Совпадение исчезает и появляется вместе с таблицей — прямое доказательство, что
 # резолвер живёт по НОВОЙ таблице целиком, а не донашивает старую с обновлёнными файлами.
 mk_tabspec() {  # "1" — канал с swap.test в списке; "" — каналов нет вовсе
-    f="$tmp/tabspec-$1.json"
-    chans='[]'
-    [ -n "$1" ] && chans="[{\"name\":\"c\",\"match\":{\"domains_files\":[\"$tmp/tab.lst\"]},\"out\":\"vpn\"}]"
-    printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
-'"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
-'"channels":%s}' "$chans" > "$f"
+    f="$tmp/tabspec-$1.yaml"
+    {
+        printf 'version: 2\nlan: { addr: [127.0.0.0/8] }\n'
+        [ -n "$1" ] && printf 'lists:\n  c: { domains_file: %s/tab.lst }\n' "$tmp"
+        printf 'outputs:\n  direct: { kind: direct }\n  vpn: { kind: interface, device: lo }\n'
+        [ -n "$1" ] && printf 'rules:\n  - { name: c, to: c, out: vpn }\n'
+    } > "$f"
     printf '%s' "$f"
 }
 tabspec_on="$(mk_tabspec 1)"

@@ -32,16 +32,13 @@ while :; do sleep 1; done
 H
 chmod +x "$tmp/helper"
 spec() {   # spec ВЫХОД... — выходы с obfs; у выхода $CHG другой сервер обфускации
-    printf '{"schema":2,"from_default":["192.168.1.0/24"],"outputs":{' > "$tmp/spec.json"
-    sep=""
+    printf 'version: 2\nlan: { addr: [192.168.1.0/24] }\noutputs:\n' > "$tmp/spec.yaml"
     for o in "$@"; do
         srv=10.99.0.3:4443
         [ "$o" = "${CHG:-}" ] && srv=10.99.0.4:4443
-        printf '%s"%s":{"kind":"interface","device":"wg%s","obfs":{"mode":"wg-over-tcp","server":"%s","listen":"127.0.0.1:5%s"}}' \
-            "$sep" "$o" "${#o}" "$srv" "$(printf '%04d' "${#o}")" >> "$tmp/spec.json"
-        sep=","
+        printf '  %s: { kind: interface, device: wg%s, obfs: { server: %s, listen: 127.0.0.1:5%s } }\n' \
+            "$o" "${#o}" "$srv" "$(printf '%04d' "${#o}")" >> "$tmp/spec.yaml"
     done
-    printf '},"channels":[]}\n' >> "$tmp/spec.json"
 }
 running() { grep -c "^obfs $1 " "$tmp/log" 2>/dev/null; }
 # wait_for УСЛОВИЕ СЕК — ждать, пока shell-условие не станет истинным (вместо sleep на глаз:
@@ -57,7 +54,7 @@ alive() {  # alive ВЫХОД — жив ли его последний помо
 }
 
 spec a bb
-STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/spec.json" 2>"$tmp/sup.err" &
+STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/spec.yaml" 2>"$tmp/sup.err" &
 SUP=$!
 sleep 1
 check "поднят помощник выхода a" "1" "$(running a)"
@@ -124,7 +121,7 @@ exit 1
 H
 chmod +x "$tmp/crash"
 spec d
-STEER_SUPERVISE_EXE="$tmp/crash" "$BIN" supervise --spec "$tmp/spec.json" 2>"$tmp/crash.err" &
+STEER_SUPERVISE_EXE="$tmp/crash" "$BIN" supervise --spec "$tmp/spec.yaml" 2>"$tmp/crash.err" &
 SUP=$!
 sleep 12
 check "падающий сразу: к 12-й секунде два запуска (0 и 5 с)" "2" "$(grep -c '^obfs d ' "$tmp/crash.log")"
@@ -140,15 +137,15 @@ kill -TERM $SUP; wait $SUP 2>/dev/null
 # перезапуска. Здесь «пересоздание» — правка реестра в каталоге состояния супервизора.
 st="$tmp/st"
 mkdir -p "$st"
-cat > "$tmp/via.json" <<EOF
-{"schema":2,"from_default":["192.168.1.0/24"],"outputs":{
- "t":{"kind":"interface","device":"wgt"},
- "a":{"kind":"interface","device":"wga","via":"t",
-      "obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:5101"}}},
- "channels":[]}
+cat > "$tmp/via.yaml" <<EOF
+version: 2
+lan: { addr: [192.168.1.0/24] }
+outputs:
+  t: { kind: interface, device: wgt }
+  a: { kind: interface, device: wga, over: t, obfs: { server: 10.99.0.3:4443, listen: 127.0.0.1:5101 } }
 EOF
 : > "$tmp/log"
-STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/via.json" --state-dir "$st" \
+STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/via.yaml" --state-dir "$st" \
     2>"$tmp/via.err" &
 SUP=$!
 wait_for '[ "$(running a)" = 1 ]' 5

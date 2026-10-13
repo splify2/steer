@@ -29,16 +29,21 @@ printf '198.51.100.5\n' > "$tmp/b.lst"
 spec() { sed "s|TMP|$tmp|g" > "$tmp/spec.json"; }
 
 spec <<'EOF'
-{ "schema": 1,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": {
-    "direct": { "kind": "direct" },
-    "vpn":    { "kind": "interface", "device": "wg0" }
-  },
-  "channels": [
-    { "name": "keep",    "match": { "prefixes_file": "TMP/b.lst" }, "out": "direct" },
-    { "name": "blocked", "match": { "prefixes_file": "TMP/a.lst" }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  keep:    { prefixes_file: [TMP/b.lst] }
+  blocked: { prefixes_file: [TMP/a.lst] }
+
+outputs:
+  direct: { kind: direct }
+  vpn:    { kind: interface, device: wg0 }
+
+rules:
+  - { name: keep, to: [keep], out: direct }
+  - { name: blocked, to: [blocked], out: vpn }
 EOF
 
 out="$("$BIN" apply --dry-run --spec "$tmp/spec.json" $S)"
@@ -203,12 +208,20 @@ check "нули не пишутся числами" "0" \
 # проверялось бы адресом, который туда попадает законно, и тест прошёл бы при сломанном коде.
 printf '10.77.77.0/24\n' > "$tmp/off.lst"
 cat > "$tmp/off.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "on",  "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" },
-    { "name": "off", "enabled": false, "match": { "prefixes_file": "$tmp/off.lst" }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  "on":  { prefixes_file: [$tmp/a.lst] }
+  "off": { prefixes_file: [$tmp/off.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "on", to: ["on"], out: vpn }
+  - { name: "off", to: ["off"], out: vpn, enabled: false }
 EOF
 offout="$("$BIN" apply --dry-run --spec "$tmp/off.json" --state-dir "$tmp/state-off")"
 check "включённое рядом с выключенным работает" "1" \
@@ -228,11 +241,15 @@ check "поля нет — правило работает" "1" \
 # Выключенное правило не проверяется: иначе сломанное правило нельзя было бы выключить,
 # только удалить.
 cat > "$tmp/offbad.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "bad", "enabled": false, "match": { "any": true }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: bad, to: all, out: vpn, enabled: false }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/offbad.json" --state-dir "$tmp/state-ob" >/dev/null 2>&1
 check "выключенное правило не мешает применить спеку" "0" "$?"
@@ -244,12 +261,21 @@ check "выключенное правило не мешает применит�
 # ПОЛУЧАТЕЛЬ, поэтому там ether daddr, а не saddr: перепутать их значит считать нуль
 # скачанного при работающем правиле.
 cat > "$tmp/mac.json" <<EOF
-{ "schema": 1,
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "tv", "from": ["a4:83:e7:2c:11:0f"],
-      "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+clients:
+  tv: { mac: [a4:83:e7:2c:11:0f] }
+
+lists:
+  tv: { prefixes_file: [$tmp/a.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: tv, for: [tv], to: [tv], out: vpn }
 EOF
 macout="$("$BIN" apply --dry-run --spec "$tmp/mac.json" --state-dir "$tmp/state-mac")"
 check "MAC в метке: ether saddr" "1" \
@@ -262,12 +288,21 @@ check "и никакого ip saddr с MAC-ом" "0" \
 # Смешивать адреса и MAC-и в одном правиле нельзя: nft не умеет «или» внутри правила, и
 # молчаливая половина означала бы, что часть устройств правило не касается.
 cat > "$tmp/mix.json" <<EOF
-{ "schema": 1,
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "mix", "from": ["192.168.1.5", "a4:83:e7:2c:11:0f"],
-      "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+clients:
+  mix: { addr: [192.168.1.5], mac: [a4:83:e7:2c:11:0f] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/a.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: mix, for: [mix], to: [rule1], out: vpn }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/mix.json" --state-dir "$tmp/state-mix" >/dev/null 2>&1
 # Сравниваем с фактом отказа, а не с числом: код у die свой (2), и привязка к нему сделала бы
@@ -291,9 +326,18 @@ check "direct output sets no mark" "0" \
 # matching everything from the LAN and marking it all into that tunnel.
 printf 'example.com\n' > "$tmp/d.lst"
 cat > "$tmp/dspec.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"], "lan_device": "br-lan",
-  "outputs": { "geo": { "kind": "interface", "device": "tun0" } },
-  "channels": [ { "name": "dom", "match": { "domains_file": "$tmp/d.lst" }, "out": "geo" } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  dom: { domains_file: [$tmp/d.lst] }
+
+outputs:
+  geo: { kind: interface, device: tun0 }
+
+rules:
+  - { name: dom, to: [dom], out: geo }
 EOF
 # Раздача поддельных адресов резолвером: apply засевает ею карту подмены (emit_fakeip_elements),
 # чтобы пересборка таблицы не оставляла карту пустой до перезапуска dnsd. Строка без настоящего
@@ -344,9 +388,18 @@ check "explain queries domain channels too" "1" \
 # realip mode exists so traceroute stays legible: no DNAT means the kernel does not
 # rewrite ICMP errors, so hops show real routers instead of the fake address.
 cat > "$tmp/rspec.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"], "lan_device": "br-lan",
-  "outputs": { "geo": { "kind": "interface", "device": "tun0" } },
-  "channels": [ { "name": "dom", "match": { "domains_file": "$tmp/d.lst", "mode": "realip" }, "out": "geo" } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  dom: { domains_file: [$tmp/d.lst] }
+
+outputs:
+  geo: { kind: interface, device: tun0 }
+
+rules:
+  - { name: dom, to: [dom], out: geo, resolve: realip }
 EOF
 rout="$("$BIN" apply --dry-run --spec "$tmp/rspec.json" --state-dir "$tmp/state-r")"
 check "realip needs no fake-IP translation" "0" "$(printf '%s\n' "$rout" | grep -c 'fakeip')"
@@ -361,14 +414,14 @@ check "realip redirects DNS over TCP on both families" "2" \
 check "realip channel still has its set" "1" \
     "$(printf '%s\n' "$rout" | grep -c 'ip daddr @geo_dom')"
 
-sed 's/"mode": "realip"/"mode": "nonsense"/' "$tmp/rspec.json" > "$tmp/rbad.json"
+sed 's/resolve: realip/resolve: nonsense/' "$tmp/rspec.json" > "$tmp/rbad.json"
 "$BIN" apply --dry-run --spec "$tmp/rbad.json" --state-dir "$tmp/state-r" >/dev/null 2>&1
 check "refuses an unknown mode" "2" "$?"
 
 # Intermediate traceroute hops: untracking ICMP time-exceeded stops the kernel from
 # rewriting its source to the fake address. Only type 11 — dest-unreachable must stay
 # tracked or path-MTU discovery breaks.
-sed 's/"schema": 1,/"schema": 1, "traceroute_hops": true,/' "$tmp/dspec.json" > "$tmp/tspec.json"
+{ cat "$tmp/dspec.json"; printf '\ndns: { traceroute_hops: true }\n'; } > "$tmp/tspec.json"
 tout="$("$BIN" apply --dry-run --spec "$tmp/tspec.json" --state-dir "$tmp/state-t")"
 check "untracks time-exceeded when asked" "1" \
     "$(printf '%s\n' "$tout" | grep -c 'icmp type time-exceeded counter notrack')"
@@ -384,11 +437,18 @@ check "off by default" "0" "$(printf '%s\n' "$dout" | grep -c notrack)"
 printf '10.1.0.0/24\n' > "$tmp/m1.lst"
 printf '10.2.0.0/24\n10.1.0.0/24\n' > "$tmp/m2.lst"
 cat > "$tmp/mspec.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "many",
-                  "match": { "prefixes_files": ["$tmp/m1.lst", "$tmp/m2.lst"] },
-                  "out": "vpn" } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  many: { prefixes_file: [$tmp/m1.lst, $tmp/m2.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: many, to: [many], out: vpn }
 EOF
 mout="$("$BIN" apply --dry-run --spec "$tmp/mspec.json" --state-dir "$tmp/state-m")"
 # Two lists, one output: one set and one rule, not two of each. On the weak box that
@@ -413,10 +473,18 @@ check "auto-merge lets the kernel fold the duplicate" "1" \
 # временные. Проверяется здесь, потому что сломать это легко и незаметно — набор без timeout
 # примет адреса из файла и молча откажет резолверу, а выглядит это как «домены не работают».
 cat > "$tmp/xspec.json" <<EOF
-{ "schema": 1, "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "mixed",
-                  "match": { "prefixes_files": ["$tmp/m1.lst"], "domains_files": ["$tmp/d.lst"] },
-                  "out": "vpn" } ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+lists:
+  mixed: { prefixes_file: [$tmp/m1.lst], domains_file: [$tmp/d.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: mixed, to: [mixed], out: vpn }
 EOF
 mixout="$("$BIN" apply --dry-run --spec "$tmp/xspec.json" --state-dir "$tmp/state-m" 2>&1)"
 check "адреса и домены в одном правиле принимаются" "1" \
@@ -436,11 +504,20 @@ check "набора _ip при этом не появилось" "0" \
 # клиентов сливаются в один набор. Это и есть «выбирать по сервису»: два способа описать одно и
 # то же перестают быть двумя правилами в ядре.
 cat > "$tmp/twospec.json" <<EOF
-{ "schema": 1, "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "адресами", "match": { "prefixes_files": ["$tmp/m1.lst"] }, "out": "vpn" },
-    { "name": "доменами", "match": { "domains_files": ["$tmp/d.lst"] }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/m1.lst] }
+  rule2: { domains_file: [$tmp/d.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "адресами", to: [rule1], out: vpn }
+  - { name: "доменами", to: [rule2], out: vpn }
 EOF
 twoout="$("$BIN" apply --dry-run --spec "$tmp/twospec.json" --state-dir "$tmp/state-two" 2>&1)"
 # Набор IPv4 один; рядом — его парный набор IPv6 (доменная группа выхода с IPv6), и у правила
@@ -464,9 +541,18 @@ printf '10.0.0.1\n10.0.0.2\n' > "$tmp/pair.lst"
 "$BIN" fit "$tmp/pair.lst" > "$tmp/fitted.lst" 2>/dev/null
 check "fit объединяет пару в диапазон" "10.0.0.1-10.0.0.2" "$(cat "$tmp/fitted.lst")"
 cat > "$tmp/fitspec.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "ужатый", "match": { "prefixes_files": ["$tmp/fitted.lst"] }, "out": "vpn" } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/fitted.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "ужатый", to: [rule1], out: vpn }
 EOF
 fitout="$("$BIN" apply --dry-run --spec "$tmp/fitspec.json" --state-dir "$tmp/state-fit" 2>&1)"
 check "диапазон уезжает в набор" "1" \
@@ -477,9 +563,18 @@ check "и список не назван доменным" "0" \
 # доменным, иначе проверка «адресный список или доменный» перестанет различать их вовсе.
 printf 'my-site.example\n' > "$tmp/dash.lst"
 cat > "$tmp/dashspec.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "дефис", "match": { "prefixes_files": ["$tmp/dash.lst"] }, "out": "vpn" } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/dash.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "дефис", to: [rule1], out: vpn }
 EOF
 # Сообщение сменилось вместе со смыслом: список из одних имён в адресном ключе перестал
 # быть отказом (гибридные списки — резолвер берёт из того же файла доменные строки, если у
@@ -520,15 +615,25 @@ check "без доменного соседа сказано, что канал 
 # Поэтому глобальное правило в спеке ниже стоит ПЕРВЫМ: проверяется, что приоритет — это
 # свойство правила, а не порядка в списке.
 cat > "$tmp/devspec.json" <<EOF
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "direct": { "kind": "direct" },
-               "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "global", "out": "vpn", "match": { "prefixes_files": ["$tmp/p.lst"] } },
-    { "name": "laptop", "out": "direct", "scope": "device",
-      "from": ["192.168.1.55"], "match": { "any": true } },
-    { "name": "phone", "out": "vpn", "scope": "device",
-      "from": ["aa:bb:cc:dd:ee:ff"], "match": { "any": true } } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+clients:
+  laptop: { addr: [192.168.1.55] }
+  phone:  { mac: [aa:bb:cc:dd:ee:ff] }
+
+lists:
+  global: { prefixes_file: [$tmp/p.lst] }
+
+outputs:
+  direct: { kind: direct }
+  vpn:    { kind: interface, device: wg0 }
+
+rules:
+  - { name: global, to: [global], out: vpn }
+  - { name: laptop, for: [laptop], to: all, out: direct, scope: device }
+  - { name: phone, for: [phone], to: all, out: vpn, scope: device }
 EOF
 devout="$("$BIN" apply --dry-run --spec "$tmp/devspec.json" --state-dir "$tmp/state-dev" 2>&1)"
 check "спека с правилами на устройство применяется" "0" \
@@ -549,27 +654,26 @@ check "правило по MAC ловит по ether saddr" "1" \
 check "весь трафик устройства уходит в туннель" "1" \
     "$(printf '%s\n' "$devout" | grep 'ether saddr' | grep -c 'or 0x40100000')"
 
-# `any` без allow_all у правила на устройство ЗАКОНЕН: общий запрет заведён против «все
-# клиенты без интернета и починка с провода», а здесь цена ошибки — один хозяин.
-check "у правила на устройство any не требует allow_all" "0" \
+# `to: all` у правила на устройство законен, и согласия не требует: цена ошибки — один хозяин.
+# В v1 для этого был allow_all; в v2 «весь трафик» — слово `to: all`, и согласия нет вовсе.
+check "правило на устройство с to: all принимается без согласия" "0" \
     "$(printf '%s\n' "$devout" | grep -ci 'allow_all')"
-# А у глобального по-прежнему требует.
-cat > "$tmp/allspec.json" <<EOF
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "all", "out": "vpn", "match": { "any": true } } ] }
-EOF
-check "у глобального any по-прежнему требует allow_all" "1" \
-    "$("$BIN" apply --dry-run --spec "$tmp/allspec.json" --state-dir "$tmp/state-dev2" 2>&1 |
-       grep -c 'allow_all')"
 
 # ПОДСЕТЬ В ПРАВИЛЕ НА УСТРОЙСТВО — ОТКАЗ. Иначе приоритет достался бы не телефону, а
 # половине сети, и достался бы тихо: снаружи такое правило выглядит точно так же.
 cat > "$tmp/netspec.json" <<EOF
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "direct": { "kind": "direct" } },
-  "channels": [ { "name": "half", "out": "direct", "scope": "device",
-                  "from": ["192.168.1.0/24"], "match": { "any": true } } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+clients:
+  half: { addr: [192.168.1.0/24] }
+
+outputs:
+  direct: { kind: direct }
+
+rules:
+  - { name: half, for: [half], to: all, out: direct, scope: device }
 EOF
 check "подсеть в правиле на устройство отвергнута" "1" \
     "$("$BIN" apply --dry-run --spec "$tmp/netspec.json" --state-dir "$tmp/state-dev3" 2>&1 |
@@ -577,25 +681,21 @@ check "подсеть в правиле на устройство отвергн
 # Пустой `from` — тоже отказ: правило «на устройство» без хозяина действует на всех, то есть
 # получает приоритет устройства, будучи глобальным. Самое опасное из недоразумений.
 cat > "$tmp/emptyspec.json" <<EOF
-{ "schema": 2, "from_default": ["192.168.1.0/24"],
-  "outputs": { "direct": { "kind": "direct" } },
-  "channels": [ { "name": "nohost", "out": "direct", "scope": "device",
-                  "match": { "any": true } } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+outputs:
+  direct: { kind: direct }
+
+rules:
+  - { name: nohost, to: all, out: direct, scope: device }
 EOF
 check "правило на устройство без хозяина отвергнуто" "1" \
     "$("$BIN" apply --dry-run --spec "$tmp/emptyspec.json" --state-dir "$tmp/state-dev4" 2>&1 |
-       grep -c 'нет ни одного хозяина')"
-# И ключ `scope` — поле схемы 2: в спеке schema 1 он отвергается, а не игнорируется. Иначе
-# движок постарше положил бы правило в порядке спеки, и приоритет пропал бы молча.
-cat > "$tmp/s1spec.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"],
-  "outputs": { "direct": { "kind": "direct" } },
-  "channels": [ { "name": "dev", "out": "direct", "scope": "device",
-                  "from": ["192.168.1.55"], "match": { "any": true } } ] }
-EOF
-check "scope в спеке schema 1 отвергнут" "1" \
-    "$("$BIN" apply --dry-run --spec "$tmp/s1spec.json" --state-dir "$tmp/state-dev5" 2>&1 |
-       grep -c 'schema 2')"
+       grep -c 'нет клиентов')"
+# (Ключ `scope` у спеки v1 отвергался, чтобы ядро постарше не потеряло приоритет молча. В v2
+# версия одна, и этой проверки больше нет.)
 
 # ---- группы с разными клиентами получают РАЗНЫЕ наборы -----------------------
 # Имя набора собиралось только из выхода и вида, а группы разделяются ещё и по `from` и по
@@ -603,12 +703,23 @@ check "scope в спеке schema 1 отвергнут" "1" \
 # заведённый «только для телевизора», уезжал в туннель для всей сети — без отказа, без
 # предупреждения, потому что nft принимает два объявления одного набора.
 cat > "$tmp/twofrom.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "телевизор", "from": ["192.168.1.5"], "match": { "prefixes_files": ["$tmp/m1.lst"] }, "out": "vpn" },
-    { "name": "остальные", "match": { "prefixes_files": ["$tmp/m2.lst"] }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+clients:
+  rule1: { addr: [192.168.1.5] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/m1.lst] }
+  rule2: { prefixes_file: [$tmp/m2.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "телевизор", for: [rule1], to: [rule1], out: vpn }
+  - { name: "остальные", to: [rule2], out: vpn }
 EOF
 tfout="$("$BIN" apply --dry-run --spec "$tmp/twofrom.json" --state-dir "$tmp/state-tf" 2>&1)"
 check "разные клиенты — два РАЗНЫХ набора" "2" \
@@ -621,20 +732,31 @@ check "клиент по умолчанию сохраняет прежнее и
 # Доменные каналы: свой список клиентов и свой режим тоже обязаны давать свой набор,
 # иначе резолвер кладёт fake-IP и настоящие адреса в один набор.
 cat > "$tmp/threedom.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "d1", "match": { "domains_files": ["$tmp/d.lst"] }, "out": "vpn" },
-    { "name": "d2", "match": { "domains_files": ["$tmp/d.lst"], "mode": "realip" }, "out": "vpn" },
-    { "name": "d3", "from": ["192.168.1.9"], "match": { "domains_files": ["$tmp/d.lst"] }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+clients:
+  d3: { addr: [192.168.1.9] }
+
+lists:
+  d1: { domains_file: [$tmp/d.lst] }
+  d2: { domains_file: [$tmp/d.lst] }
+  d3: { domains_file: [$tmp/d.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: d1, to: [d1], out: vpn }
+  - { name: d2, to: [d2], out: vpn, resolve: realip }
+  - { name: d3, for: [d3], to: [d3], out: vpn }
 EOF
 tdout="$("$BIN" apply --dry-run --spec "$tmp/threedom.json" --state-dir "$tmp/state-td" 2>&1)"
 check "fakeip, realip и свои клиенты — три разных набора" "3" \
     "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*\) .*/\1/p' | grep -v '6$' | sort -u | wc -l)"
 # Половина IPv6 в наборе правил — у fakeip и realip клиентов по умолчанию, но не у клиента из
-# одного адреса IPv4: его IPv6 правилом не узнать. (Спека здесь v1, и на AAAA резолвер отвечает
-# пустым ответом у всех трёх — sp->dns.names_v4; набор правил от этого не меняется.)
+# одного адреса IPv4: его IPv6 правилом не узнать.
 check "  пары IPv6 — у fakeip и realip, у клиента из адреса IPv4 — нет" "vpn_dom6 vpn_dom_c0r6" \
     "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*6\) .*/\1/p' | sort | paste -sd' ')"
 
@@ -642,12 +764,19 @@ check "  пары IPv6 — у fakeip и realip, у клиента из адре�
 # группу, правило получало имя _ip и начинало проверять набор — то есть «весь трафик этой
 # сети в туннель» молча превращался в «только адреса из списка».
 cat > "$tmp/anymix.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "список", "match": { "prefixes_files": ["$tmp/m1.lst"] }, "out": "vpn" },
-    { "name": "всё",    "match": { "any": true, "allow_all": true }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/m1.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "список", to: [rule1], out: vpn }
+  - { name: "всё", to: all, out: vpn }
 EOF
 amout="$("$BIN" apply --dry-run --spec "$tmp/anymix.json" --state-dir "$tmp/state-am" 2>&1)"
 check "any рядом со списком остаётся отдельным правилом" "1" \
@@ -681,13 +810,24 @@ check "и это правило безусловное — набор оно н�
 printf '203.0.113.0/24\n' > "$tmp/p.lst"
 printf '104.16.0.0/12\n' > "$tmp/p2.lst"
 cat > "$tmp/skipspec.json" <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"],
-  "outputs": { "direct": { "kind": "direct" },
-               "vpn": { "kind": "interface", "device": "wg0" },
-               "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
-  "channels": [ { "name": "t", "out": "vpn", "match": { "prefixes_files": ["$tmp/p.lst"] } },
-                { "name": "g", "out": "tg", "match": { "prefixes_files": ["$tmp/p2.lst"] } },
-                { "name": "d", "out": "direct", "match": { "prefixes_files": ["$tmp/p.lst"] } } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  t: { prefixes_file: [$tmp/p.lst] }
+  g: { prefixes_file: [$tmp/p2.lst] }
+  d: { prefixes_file: [$tmp/p.lst] }
+
+outputs:
+  direct: { kind: direct }
+  vpn:    { kind: interface, device: wg0 }
+  tg:     { kind: tgws, domain: ex.co.uk }
+
+rules:
+  - { name: t, to: [t], out: vpn }
+  - { name: g, to: [g], out: tg }
+  - { name: d, to: [d], out: direct }
 EOF
 skipout="$("$BIN" apply --dry-run --spec "$tmp/skipspec.json" --state-dir "$tmp/state-skip" 2>/dev/null)"
 # 0x40100000 = метка выхода 0x00100000 плюс чужой бит 0x40000000.
@@ -732,8 +872,8 @@ check "needs-dnsd: yes for a domain channel" "0" "$?"
 check "needs-dnsd: yes for address channels too" "0" "$?"
 # Отказ на непонятой спеке обязан остаться: init-скрипт не должен поднимать резолвер под
 # конфигурацию, которую apply отвергнет.
-printf '%s' '{"schema":99,"outputs":{},"channels":[]}' > "$tmp/badschema.json"
-"$BIN" needs-dnsd --spec "$tmp/badschema.json" --state-dir "$tmp/state-n" >/dev/null 2>&1
+printf 'version: 99\n' > "$tmp/badversion.json"
+"$BIN" needs-dnsd --spec "$tmp/badversion.json" --state-dir "$tmp/state-n" >/dev/null 2>&1
 check "needs-dnsd: отказ на непонятой спеке" "2" "$?"
 
 # And the shipped init script must ASK rather than guess, or the same trap returns
@@ -771,12 +911,22 @@ fi
 # цепочки (mangle идёт ДО трансляции адресов, а обходу нужен пакет в том виде, в каком он
 # уйдёт с роутера) и `bypass` как выражение on_fail.
 cat > "$tmp/zap.json" <<EOF
-{ "schema": 1, "lan_devices": ["br-lan"],
-  "outputs": { "direct": { "kind": "direct" },
-               "yt":  { "kind": "zapret" },
-               "dis": { "kind": "zapret", "on_fail": "direct" } },
-  "channels": [ { "name": "ю", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "yt" },
-                { "name": "д", "match": { "prefixes_file": "$tmp/b.lst" }, "out": "dis" } ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/a.lst] }
+  rule2: { prefixes_file: [$tmp/b.lst] }
+
+outputs:
+  direct: { kind: direct }
+  yt:     { kind: zapret }
+  dis:    { kind: zapret, on_fail: direct }
+
+rules:
+  - { name: "ю", to: [rule1], out: yt }
+  - { name: "д", to: [rule2], out: dis }
 EOF
 zout="$("$BIN" apply --dry-run --spec "$tmp/zap.json" --state-dir "$tmp/state-z" 2>&1)"
 check "zapret: спека компилируется" "0" "$?"
@@ -856,9 +1006,19 @@ check "и predefrag без них тоже нет" "0" "$(printf '%s\n' "$out" |
 # здесь, а работу целиком — tests/run-tgws.sh на двух сетевых пространствах: на одном
 # пространстве соединение идёт через output и правило не срабатывает вовсе.
 cat > "$tmp/tgws.json" <<EOF
-{ "schema": 1, "lan_devices": ["br-lan"],
-  "outputs": { "direct": { "kind": "direct" }, "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
-  "channels": [ { "name": "тг", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "tg" } ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/a.lst] }
+
+outputs:
+  direct: { kind: direct }
+  tg:     { kind: tgws, domain: ex.co.uk }
+
+rules:
+  - { name: "тг", to: [rule1], out: tg }
 EOF
 tout="$("$BIN" apply --dry-run --spec "$tmp/tgws.json" --state-dir "$tmp/state-t" 2>&1)"
 check "tgws: спека компилируется" "0" "$?"
@@ -883,13 +1043,19 @@ check "без таких выходов код 1" "1" "$?"
 # Устройство у такого выхода — почти наверняка описка, и молча принять её значит обещать
 # маршрутизацию, которой не будет.
 cat > "$tmp/tgws-bad.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk", "device": "eth0" } }, "channels": [] }
+version: 2
+
+outputs:
+  tg: { kind: tgws, domain: ex.co.uk, device: eth0 }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/tgws-bad.json" --state-dir "$tmp/state-tb" >/dev/null 2>&1
 check "устройство у tgws отвергается" "2" "$?"
 # on_fail у него не выражается ничем: правило перехвата стоит в ядре всегда.
 cat > "$tmp/tgws-of.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk", "on_fail": "direct" } }, "channels": [] }
+version: 2
+
+outputs:
+  tg: { kind: tgws, domain: ex.co.uk, on_fail: direct }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/tgws-of.json" --state-dir "$tmp/state-to" >/dev/null 2>&1
 check "on_fail=direct у tgws отвергается" "2" "$?"
@@ -897,53 +1063,64 @@ check "on_fail=direct у tgws отвергается" "2" "$?"
 # телеграмовских адресах, то есть на тех самых, которые режут. Подставить их молча значило бы
 # завести выход, который выглядит настроенным и не работает никогда.
 cat > "$tmp/tgws-nd.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws" } }, "channels": [] }
+version: 2
+
+outputs:
+  tg: { kind: tgws }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/tgws-nd.json" --state-dir "$tmp/state-tn" >/dev/null 2>&1
 check "tgws без domain отвергается" "2" "$?"
 # И наоборот: domain у чужого вида выхода — поле, принятое молча там, где оно ничего не значит.
 cat > "$tmp/tgws-alien.json" <<EOF
-{ "schema": 1, "outputs": { "d": { "kind": "direct", "domain": "ex.co.uk" } }, "channels": [] }
+version: 2
+
+outputs:
+  d: { kind: direct, domain: ex.co.uk }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/tgws-alien.json" --state-dir "$tmp/state-ta" >/dev/null 2>&1
 check "domain у чужого вида выхода отвергается" "2" "$?"
 
-# ---- `any` без списков: согласие требуется независимо от вида выхода -----------------------
+# ---- `to: all` на выход без устройства -----------------------------------------------------
 #
-# Канал `any` без списков уводит В ВЫХОД ВЕСЬ трафик клиентов, и движок этого не разрешает без
-# явного `allow_all`. Но проверка стояла ЗА `continue` по «у выхода нет устройства» — и потому
-# не срабатывала там, где последствие самое тяжёлое: у kind=zapret устройства нет по
-# определению, значит весь трафик локальной сети уходил в nfqws, а при on_fail=drop умирал
-# целиком. Воспроизведено на стенде в QEMU: спека принималась, правило выходило без
-# `ip daddr @набор`, счётчик рос на любом трафике клиента.
-#
-# Проверяются все три случая: запрет там, где его не было, и оба законных обхода запрета.
-cat > "$tmp/any-zap.json" <<EOF
-{ "schema": 1, "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"zapret"} },
-  "channels": [ { "name": "c", "out": "zt", "match": { "any": true } } ] }
-EOF
-"$BIN" apply --dry-run --spec "$tmp/any-zap.json" --state-dir "$tmp/state-any" >/dev/null 2>&1
-check "any без списков на выход БЕЗ устройства отвергается" "2" "$?"
-check "и сказано, что делать" "1" \
-    "$("$BIN" apply --dry-run --spec "$tmp/any-zap.json" --state-dir "$tmp/state-any" 2>&1 |
-       grep -c 'allow_all')"
+# У kind=zapret устройства нет по определению, и весь трафик локальной сети, уведённый в nfqws,
+# при on_fail=drop умирает целиком. В v1 такой канал (`any` без списков) отвергался без
+# согласия allow_all — и проверка когда-то стояла за `continue` по «у выхода нет устройства»,
+# то есть не срабатывала именно здесь. В v2 «весь трафик» — слово `to: all`, написанное нарочно,
+# согласия нет; остаются оба законных случая.
 # Осознанное «весь трафик» — законно и проходит.
 cat > "$tmp/any-ok.json" <<EOF
-{ "schema": 1, "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"zapret"} },
-  "channels": [ { "name": "c", "out": "zt", "match": { "any": true, "allow_all": true } } ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+outputs:
+  direct: { kind: direct }
+  zt:     { kind: zapret }
+
+rules:
+  - { name: c, to: all, out: zt }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/any-ok.json" --state-dir "$tmp/state-any" >/dev/null 2>&1
-check "any с allow_all проходит" "0" "$?"
+check "to: all на выход без устройства проходит" "0" "$?"
 # Правило на ОДНО устройство согласия не требует: цена ошибки — один хозяин, и он её заметит.
 # Это и есть «весь трафик телефона в туннель» и «этот ноутбук не маршрутизируем».
 cat > "$tmp/any-dev.json" <<EOF
-{ "schema": 2, "lan_devices": ["br-lan"],
-  "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"zapret"} },
-  "channels": [ { "name": "d", "out": "zt", "scope": "device", "from": ["192.168.1.50"],
-                  "match": { "any": true } } ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+clients:
+  d: { addr: [192.168.1.50] }
+
+outputs:
+  direct: { kind: direct }
+  zt:     { kind: zapret }
+
+rules:
+  - { name: d, for: [d], to: all, out: zt, scope: device }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/any-dev.json" --state-dir "$tmp/state-any" >/dev/null 2>&1
-check "any на одно устройство проходит без allow_all" "0" "$?"
+check "to: all на одно устройство проходит" "0" "$?"
 
 # ---- подпись таблицы каналов: хватит ли резолверу SIGHUP -----------------------------------
 #
@@ -970,7 +1147,7 @@ check "повторный вызов даёт то же самое — инач�
 # Другой файл списка — другая таблица: перечень файлов берётся из спеки при запуске, и HUP
 # его не пересоберёт. Подпись обязана разойтись, иначе мы пошлём HUP там, где нужен
 # перезапуск, и человек получит старые каналы при новых правилах.
-sed 's#"domains_file": "[^"]*"#"domains_file": "'"$tmp"'/other.lst"#' "$tmp/dspec.json" > "$tmp/dspec-other.json"
+sed 's#domains_file: \[[^]]*\]#domains_file: ['"$tmp"'/other.lst]#' "$tmp/dspec.json" > "$tmp/dspec-other.json"
 printf 'other.example\n' > "$tmp/other.lst"
 sig3="$("$BIN" dnsd-sig --spec "$tmp/dspec-other.json" --state-dir "$tmp/state-sig" 2>/dev/null)"
 check "смена файла списка меняет подпись" "no" \
@@ -993,12 +1170,22 @@ check "команда объявлена с --state-dir" "2" \
 # Спека здесь своя, с `opts_file` В ПЕСОЧНИЦЕ: у zap.json путь выводится из имени и указывает
 # в /etc/steer/zapret, а стенд не вправе ни читать, ни создавать файлы настоящей системы.
 cat > "$tmp/zap-opts.json" <<EOF
-{ "schema": 1, "lan_devices": ["br-lan"],
-  "outputs": { "direct": { "kind": "direct" },
-               "yt":  { "kind": "zapret", "opts_file": "$tmp/yt.opts" },
-               "dis": { "kind": "zapret", "opts_file": "$tmp/dis.opts", "on_fail": "direct" } },
-  "channels": [ { "name": "ю", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "yt" },
-                { "name": "д", "match": { "prefixes_file": "$tmp/b.lst" }, "out": "dis" } ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/a.lst] }
+  rule2: { prefixes_file: [$tmp/b.lst] }
+
+outputs:
+  direct: { kind: direct }
+  yt:     { kind: zapret, strategy: $tmp/yt.opts }
+  dis:    { kind: zapret, strategy: $tmp/dis.opts, on_fail: direct }
+
+rules:
+  - { name: "ю", to: [rule1], out: yt }
+  - { name: "д", to: [rule2], out: dis }
 EOF
 rm -f "$tmp/yt.opts" "$tmp/dis.opts"
 zi="$("$BIN" zapret-instances --spec "$tmp/zap-opts.json" --state-dir "$tmp/state-z" 2>/dev/null)"
@@ -1107,38 +1294,49 @@ fi
 # ---- пустая спека законна ----------------------------------------------------
 # Отказ на ней запирал настройку наглухо: чтобы завести канал, нужен выход, а сохранить
 # выход без каналов движок не давал. Из такого тупика нельзя выйти изнутри интерфейса.
-printf '{"schema":1,"outputs":{},"channels":[]}' > "$tmp/empty.json"
+printf 'version: 2\n' > "$tmp/empty.json"
 "$BIN" apply --dry-run --spec "$tmp/empty.json" --state-dir "$tmp/state-e" >"$tmp/eo" 2>&1
 check "пустая спека компилируется" "0" "$?"
 check "и даёт таблицу с пустой цепочкой" "1" "$(grep -c 'chain prerouting_mark' "$tmp/eo")"
 check "без наборов" "0" "$(grep -c '    set ' "$tmp/eo")"
 
-printf '{"schema":1,"outputs":{"vpn":{"kind":"interface","device":"wg0"}},"channels":[]}' > "$tmp/only.json"
+printf 'version: 2\noutputs:\n  vpn: { kind: interface, device: wg0 }\n' > "$tmp/only.json"
 "$BIN" apply --dry-run --spec "$tmp/only.json" --state-dir "$tmp/state-e" >/dev/null 2>&1
 check "выходы без каналов — законное состояние" "0" "$?"
 
 # ---- защита от конфигураций, отрезающих роутер -------------------------------
 # Всё это компилируется и применяется без жалоб, а замечается как "роутер пропал".
 # Отказать дешевле, чем объяснять, как чинить коробку, до которой не достучаться.
-cat > "$tmp/all.json" <<EOF
-{ "schema": 1, "outputs": { "o": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "все", "match": { "any": true }, "out": "o" } ] }
+cat > "$tmp/allok.json" <<EOF
+version: 2
+
+outputs:
+  o: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "все", to: all, out: o }
 EOF
-"$BIN" apply --dry-run --spec "$tmp/all.json" --state-dir "$tmp/state-g" >/dev/null 2>&1
-check "канал any без списка отвергается" "2" "$?"
-
-# ...но остаётся выразимым, когда это правда то, что нужно.
-sed 's/"any": true/"any": true, "allow_all": true/' "$tmp/all.json" > "$tmp/allok.json"
+# В v2 «весь трафик» пишется словом `to: all` — нарочно, опечаткой оно не получается, и
+# отдельного согласия (allow_all в v1) не нужно.
 "$BIN" apply --dry-run --spec "$tmp/allok.json" --state-dir "$tmp/state-g" >/dev/null 2>&1
-check "с allow_all он проходит" "0" "$?"
+check "канал на весь трафик проходит" "0" "$?"
 
-sed 's/"device": "wg0"/"device": "br-lan"/' "$tmp/allok.json" > "$tmp/loop.json"
+sed 's/device: wg0/device: br-lan/' "$tmp/allok.json" > "$tmp/loop.json"
 "$BIN" apply --dry-run --spec "$tmp/loop.json" --state-dir "$tmp/state-g" >/dev/null 2>&1
 check "выход в локальный мост отвергается" "2" "$?"
 
-sed 's/"device": "wg0"/"devices": ["wg0","wg0"]/' "$tmp/allok.json" > "$tmp/dup.json"
+cat > "$tmp/dup.json" <<EOF
+version: 2
+
+outputs:
+  w: { kind: interface, device: wg0 }
+  o: { kind: group, pick: order, members: [w, w] }
+
+rules:
+  - { name: "все", to: all, out: o }
+EOF
 "$BIN" apply --dry-run --spec "$tmp/dup.json" --state-dir "$tmp/state-g" >/dev/null 2>&1
-check "дубликат устройства отвергается" "2" "$?"
+check "дубликат выхода в группе отвергается" "2" "$?"
 
 # Сообщение обязано называть виновника: "steer: " без текста — это отказ, из
 # которого нельзя понять, что чинить.
@@ -1155,11 +1353,21 @@ check "и объясняет, что не так" "1" "$(printf '%s' "$msg" | gr
 # сливаются в одну группу (это отдельное свойство компилятора), и имена наборов зависели бы
 # от порядка. Разными выходами группы гарантированно две — vpn_ip и geo_dom.
 cat > "$tmp/lan.json" <<EOF
-{ "schema": 1, "lan_devices": ["br-lan", "tailscale0", "ztrq4abcde"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" },
-               "geo": { "kind": "interface", "device": "tun0" } },
-  "channels": [ { "name": "списки", "match": { "prefixes_files": ["$tmp/a.lst"] }, "out": "vpn" },
-                { "name": "домены", "match": { "domains_files": ["$tmp/d.lst"] }, "out": "geo" } ] }
+version: 2
+
+lan: { devices: [br-lan, tailscale0, ztrq4abcde] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/a.lst] }
+  rule2: { domains_file: [$tmp/d.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+  geo: { kind: interface, device: tun0 }
+
+rules:
+  - { name: "списки", to: [rule1], out: vpn }
+  - { name: "домены", to: [rule2], out: geo }
 EOF
 lout="$("$BIN" apply --dry-run --spec "$tmp/lan.json" --state-dir "$tmp/state-lan")"
 check "правило канала висит на всех перечисленных устройствах" "1" \
@@ -1181,16 +1389,25 @@ check "TCP/53 заворачивается по тем же устройства
 check "и без пометки семейства" "0" \
     "$(printf '%s\n' "$lout" | grep 'udp dport 53' | grep -c 'nfproto')"
 # Ровно одно правило на канал, а не два: «или» внутри правила nft не выражается, и добавлять
-# второе значило бы менять смысл уже написанного from_default (см. отказ ниже).
+# второе значило бы менять смысл уже написанного lan.addr (см. отказ ниже).
 check "правило у канала одно" "1" \
     "$(printf '%s\n' "$lout" | grep -c 'comment "steer:vpn_ip"')"
 
 # Одиночная форма остаётся сокращением для списка из одного, и текст правила у неё прежний:
 # без фигурных скобок, ровно так, как печатает сам nft.
 cat > "$tmp/lan1.json" <<EOF
-{ "schema": 1, "lan_device": "br-lan",
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "списки", "match": { "prefixes_files": ["$tmp/a.lst"] }, "out": "vpn" } ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/a.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "списки", to: [rule1], out: vpn }
 EOF
 l1="$("$BIN" apply --dry-run --spec "$tmp/lan1.json" --state-dir "$tmp/state-lan1")"
 check "одно устройство печатается без скобок" "1" \
@@ -1198,42 +1415,35 @@ check "одно устройство печатается без скобок" "
 
 # Петля проверяется по ВСЕМУ списку: выход в tailscale0, с которого мы забираем клиентов,
 # закольцуется ровно так же, как выход в br-lan, и отличать одно от другого нечем.
-sed 's/"device": "wg0"/"device": "tailscale0"/' "$tmp/lan.json" > "$tmp/lanloop.json"
+sed 's/device: wg0/device: tailscale0/' "$tmp/lan.json" > "$tmp/lanloop.json"
 "$BIN" apply --dry-run --spec "$tmp/lanloop.json" --state-dir "$tmp/state-lan" >/dev/null 2>&1
 check "выход в любое из локальных устройств отвергается" "2" "$?"
 
-# Обе формы сразу — противоречие, а не обогащение: молча взять одну значило бы, что половина
-# написанного человеком не действует, и понять это было бы нечем.
-cat > "$tmp/lanboth.json" <<EOF
-{ "schema": 1, "lan_device": "br-lan", "lan_devices": ["br-lan", "tailscale0"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [ { "name": "с", "match": { "prefixes_files": ["$tmp/a.lst"] }, "out": "vpn" } ] }
-EOF
-"$BIN" apply --dry-run --spec "$tmp/lanboth.json" --state-dir "$tmp/state-lan" >/dev/null 2>&1
-check "lan_device и lan_devices вместе отвергаются" "2" "$?"
+# (В v1 были две формы — lan_device и lan_devices — и обе сразу были отказом. В v2 ключ один,
+# lan.devices, и проверять нечего.)
 
-sed 's/"br-lan", "tailscale0", "ztrq4abcde"/"br-lan", "br-lan"/' "$tmp/lan.json" > "$tmp/landup.json"
+sed 's/br-lan, tailscale0, ztrq4abcde/br-lan, br-lan/' "$tmp/lan.json" > "$tmp/landup.json"
 "$BIN" apply --dry-run --spec "$tmp/landup.json" --state-dir "$tmp/state-lan" >/dev/null 2>&1
 check "дубликат в списке устройств отвергается" "2" "$?"
 
-sed 's/"br-lan", "tailscale0", "ztrq4abcde"/"br lan"/' "$tmp/lan.json" > "$tmp/lanbad.json"
+sed 's/br-lan, tailscale0, ztrq4abcde/"br lan"/' "$tmp/lan.json" > "$tmp/lanbad.json"
 "$BIN" apply --dry-run --spec "$tmp/lanbad.json" --state-dir "$tmp/state-lan" >/dev/null 2>&1
 check "негодное имя устройства отвергается" "2" "$?"
 
-# from_default вместе с НЕСКОЛЬКИМИ устройствами — отказ, и это главное решение всей правки.
+# lan.addr (в v1 from_default) вместе с НЕСКОЛЬКИМИ устройствами — отказ, и это главное решение всей правки.
 # Взять только подсети значило бы, что человек добавил tailscale0 и ничего не изменилось.
-# Взять и то, и другое — хуже: from_default пишут, чтобы клиентов ОГРАНИЧИТЬ (гостевая
+# Взять и то, и другое — хуже: addr пишут, чтобы клиентов ОГРАНИЧИТЬ (гостевая
 # подсеть на том же мосту нарочно вне списка), и правило по iifname молча забрало бы её.
-sed 's/"schema": 1,/"schema": 1, "from_default": ["192.168.1.0\/24"],/' "$tmp/lan.json" \
+sed 's/^lan: { devices: \(.*\) }$/lan: { devices: \1, addr: [192.168.1.0\/24] }/' "$tmp/lan.json" \
     > "$tmp/lanboth2.json"
 "$BIN" apply --dry-run --spec "$tmp/lanboth2.json" --state-dir "$tmp/state-lan" >/dev/null 2>&1
-check "from_default вместе с несколькими устройствами отвергается" "2" "$?"
+check "addr вместе с несколькими устройствами отвергается" "2" "$?"
 msg="$("$BIN" apply --dry-run --spec "$tmp/lanboth2.json" --state-dir "$tmp/state-lan" 2>&1 | tail -1)"
-check "и объясняет, что убрать" "1" "$(printf '%s' "$msg" | grep -c 'from_default')"
+check "и объясняет, что убрать" "1" "$(printf '%s' "$msg" | grep -c 'addr')"
 
 # ...а с ОДНИМ устройством — законно и значит ровно то, что значило: так написаны все спеки,
 # сделанные до появления перечня, и ломать их нельзя.
-sed 's/"schema": 1,/"schema": 1, "from_default": ["192.168.1.0\/24"],/' "$tmp/lan1.json" \
+sed 's/^lan: { devices: \(.*\) }$/lan: { devices: \1, addr: [192.168.1.0\/24] }/' "$tmp/lan1.json" \
     > "$tmp/lanold.json"
 lold="$("$BIN" apply --dry-run --spec "$tmp/lanold.json" --state-dir "$tmp/state-lan")"
 check "старая форма (подсети плюс один мост) работает как раньше" "1" \
@@ -1243,33 +1453,43 @@ check "старая форма (подсети плюс один мост) ра�
 # devices — это приоритет, и единственное число остаётся сокращением для одного,
 # чтобы прежние спеки не сломались.
 cat > "$tmp/fo.json" <<EOF
-{ "schema": 1,
-  "outputs": { "o": { "kind": "interface", "devices": ["wg0", "wg1"], "on_fail": "drop" } },
-  "channels": [ { "name": "c", "match": { "domains_files": ["$tmp/d.lst"] }, "out": "o" } ] }
+version: 2
+
+lan: { devices: [br-lan] }
+
+lists:
+  c: { domains_file: [$tmp/d.lst] }
+
+outputs:
+  o:     { kind: group, pick: order, members: [o.wg0, o.wg1] }
+  o.wg0: { kind: interface, device: wg0 }
+  o.wg1: { kind: interface, device: wg1 }
+
+rules:
+  - { name: c, to: [c], out: o }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/fo.json" --state-dir "$tmp/state-f" >/dev/null 2>&1
 check "список устройств принимается" "0" "$?"
 
-sed 's/"on_fail": "drop"/"on_fail": "чепуха"/' "$tmp/fo.json" > "$tmp/fobad.json"
+sed 's/pick: order,/pick: order, on_fail: чепуха,/' "$tmp/fo.json" > "$tmp/fobad.json"
 "$BIN" apply --dry-run --spec "$tmp/fobad.json" --state-dir "$tmp/state-f" >/dev/null 2>&1
 check "неизвестный on_fail отвергается" "2" "$?"
 
 # ---- refusals ---------------------------------------------------------------
-# Guessing at an unknown schema would mean compiling a config we do not understand
+# Guessing at an unknown version would mean compiling a config we do not understand
 # into firewall rules.
 #
-# Число здесь ТРОЙКА, а не двойка: двойку движок теперь понимает (см. раздел про порты
-# ниже). Смысл проверки от этого не изменился — стеречь она обязана не конкретное число, а
-# отказ на major, которого сборка не знает.
-sed 's/"schema": 1/"schema": 3/' "$tmp/spec.json" > "$tmp/s2.json"
+# Число здесь тройка: двойку ядро понимает. Смысл проверки — отказ на версии, которой сборка
+# не знает.
+sed 's/^version: 2$/version: 3/' "$tmp/spec.json" > "$tmp/s2.json"
 "$BIN" apply --dry-run --spec "$tmp/s2.json" $S >/dev/null 2>&1
-check "refuses an unknown schema" "2" "$?"
+check "refuses an unknown version" "2" "$?"
 
-sed 's/"out": "vpn"/"out": "nope"/' "$tmp/spec.json" > "$tmp/s3.json"
+sed 's/out: vpn/out: nope/' "$tmp/spec.json" > "$tmp/s3.json"
 "$BIN" apply --dry-run --spec "$tmp/s3.json" $S >/dev/null 2>&1
 check "refuses a channel pointing at a missing output" "2" "$?"
 
-sed 's/"kind": "interface", "device": "wg0"/"kind": "interface"/' "$tmp/spec.json" > "$tmp/s4.json"
+sed 's/kind: interface, device: wg0/kind: interface/' "$tmp/spec.json" > "$tmp/s4.json"
 "$BIN" apply --dry-run --spec "$tmp/s4.json" $S >/dev/null 2>&1
 check "refuses an interface output with no device" "2" "$?"
 
@@ -1282,7 +1502,7 @@ check "refuses an address that is not address-shaped" "2" "$?"
 # An output must keep its mark across runs: a reshuffle leaves stale `ip rule`
 # entries pointing at the wrong table, and traffic silently takes another path.
 before="$(cat "$tmp/state/registry")"
-sed 's|"vpn":    { "kind": "interface", "device": "wg0" }|"vpn": { "kind": "interface", "device": "wg0" }, "extra": { "kind": "interface", "device": "wg1" }|' \
+sed 's|^  vpn:    { kind: interface, device: wg0 }$|&\n  extra:  { kind: interface, device: wg1 }|' \
     "$tmp/spec.json" > "$tmp/s5.json"
 "$BIN" apply --dry-run --spec "$tmp/s5.json" $S >/dev/null 2>&1
 check "adding an output keeps the existing marks" "$before" \
@@ -1304,16 +1524,21 @@ check "and gives the new one its own" "1" \
 # молча превратил бы узкий канал в полный туннель.
 printf '198.51.100.5\n' > "$tmp/keep2.lst"
 spec <<'EOF'
-{ "schema": 1,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": {
-    "direct": { "kind": "direct" },
-    "vpn":    { "kind": "interface", "device": "wg0" }
-  },
-  "channels": [
-    { "name": "цел",    "match": { "prefixes_file": "TMP/keep2.lst" }, "out": "direct" },
-    { "name": "пропал", "match": { "prefixes_file": "TMP/gone.lst" },  "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  rule1: { prefixes_file: [TMP/keep2.lst] }
+  rule2: { prefixes_file: [TMP/gone.lst] }
+
+outputs:
+  direct: { kind: direct }
+  vpn:    { kind: interface, device: wg0 }
+
+rules:
+  - { name: "цел", to: [rule1], out: direct }
+  - { name: "пропал", to: [rule2], out: vpn }
 EOF
 gout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/state-gone" 2>"$tmp/gerr")"
 check "пропавший список: apply не умирает" "0" "$?"
@@ -1332,19 +1557,24 @@ check "пропавший список: набор объявлен" "1" \
 # лечила бы «весь роутер напрямую» ценой «канал молча стал пустым».
 printf '203.0.113.0/24\n' > "$tmp/half.lst"
 spec <<'EOF'
-{ "schema": 1,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "две половины",
-      "match": { "prefixes_files": ["TMP/half.lst", "TMP/gone.lst"] }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  rule1: { prefixes_file: [TMP/half.lst, TMP/gone.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "две половины", to: [rule1], out: vpn }
 EOF
 hout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/state-half" 2>/dev/null)"
 check "один из двух списков пропал: уцелевший доехал" "1" \
     "$(printf '%s\n' "$hout" | grep -c 'elements = { 203.0.113.0/24 }')"
 
-# ---- schema 2: у канала появилось измерение «протокол и порты» ---------------
+# ---- у канала есть измерение «протокол и порты» -----------------------------
 #
 # ЗАЧЕМ ЭТО ВООБЩЕ. Списки itdoginfo/allow-domains публикуются двоичными `.srs`, и из 25
 # файлов релиза 24 разбираются, а `discord.srs` отвергается с кодом 2: он описывает не
@@ -1352,48 +1582,24 @@ check "один из двух списков пропал: уцелевший д
 # 19000:20000`. Взять его подсети и отбросить порты нельзя — 104.16.0.0/12 это Cloudflare,
 # и весь TCP к нему уехал бы в туннель молча.
 #
-# ЗАЧЕМ ЧИСЛО СХЕМЫ, А НЕ ПРОСТО НОВЫЙ КЛЮЧ. Неизвестный КЛЮЧ старый движок пропускает
-# (js_skip в src/lib/jsonr.c), и это правильно для всего, что совпадение РАСШИРЯЕТ: не понял —
-# ничего не потерял. Порты совпадение СУЖАЮТ, и пропущенный ключ означает «сузить забыли»
-# — то есть ровно тот молчаливый весь-TCP-в-туннель, от которого мы отказывались в srs.c.
-# Поэтому major поднят: старый движок обязан отвергнуть спеку ЦЕЛИКОМ (exit 2), а не понять
-# её наполовину. Управляющий слой это переживает: spec_set проверяет спеку через
-# `apply --dry-run` ДО записи на диск, видит код 2 и говорит человеку «обновите движок».
-
-# Схема 2 сама по себе не меняет НИЧЕГО: та же спека с другим числом обязана дать
-# побайтово тот же набор правил. Иначе поднятие major стало бы вторым изменением поведения,
-# спрятанным за первым.
-spec <<'EOF'
-{ "schema": 1,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": {
-    "direct": { "kind": "direct" },
-    "vpn":    { "kind": "interface", "device": "wg0" }
-  },
-  "channels": [
-    { "name": "keep",    "match": { "prefixes_file": "TMP/b.lst" }, "out": "direct" },
-    { "name": "blocked", "match": { "prefixes_file": "TMP/a.lst" }, "out": "vpn" }
-  ] }
-EOF
-cp "$tmp/spec.json" "$tmp/v1.json"
-sed 's/"schema": 1/"schema": 2/' "$tmp/v1.json" > "$tmp/v2.json"
-o1="$("$BIN" apply --dry-run --spec "$tmp/v1.json" --state-dir "$tmp/st-v1" 2>/dev/null)"
-o2="$("$BIN" apply --dry-run --spec "$tmp/v2.json" --state-dir "$tmp/st-v2" 2>/dev/null)"
-check "схема 2 принимается" "0" \
-    "$("$BIN" apply --dry-run --spec "$tmp/v2.json" --state-dir "$tmp/st-v2" >/dev/null 2>&1; echo $?)"
-check "схема 2 без новых полей даёт тот же набор правил" "$o1" "$o2"
+# Порты совпадение СУЖАЮТ, и потерянный ключ означал бы «сузить забыли» — молчаливый весь-TCP
+# в туннель. Поэтому неизвестный ключ в спеке v2 — отказ, а не пропуск (docs/spec-v2.md).
 
 # Канал Discord: подсети плюс udp плюс два диапазона портов.
 printf '104.16.0.0/12\n' > "$tmp/dc.lst"
 spec <<'EOF'
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "discord", "out": "vpn",
-      "match": { "prefixes_files": ["TMP/dc.lst"],
-                 "proto": "udp", "ports": ["50000-65535", "19000-20000"] } }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  discord: { prefixes_file: [TMP/dc.lst], proto: udp, ports: [50000-65535, 19000-20000] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: discord, to: [discord], out: vpn }
 EOF
 dout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-dc" 2>/dev/null)"
 check "канал с портами компилируется" "0" "$?"
@@ -1420,20 +1626,27 @@ check "резолвер не заводит доменный набор кана
 # клиенты, то же сужение), у резолвера в этой группе и остаётся — гибридные списки.
 printf 'example.org\n' > "$tmp/dcnames.lst"
 spec <<'EOF'
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "имена", "out": "vpn", "match": { "domains_files": ["TMP/dcnames.lst"] } },
-    { "name": "гибрид", "out": "vpn", "match": { "prefixes_files": ["TMP/dc.lst"] } },
-    { "name": "голос", "out": "vpn",
-      "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  rule1: { domains_file: [TMP/dcnames.lst] }
+  rule2: { prefixes_file: [TMP/dc.lst] }
+  rule3: { prefixes_file: [TMP/dc.lst], proto: udp, ports: [50000-65535] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "имена", to: [rule1], out: vpn }
+  - { name: "гибрид", to: [rule2], out: vpn }
+  - { name: "голос", to: [rule3], out: vpn }
 EOF
-# Семейство в подписи — «4»: спека v1, и на AAAA её имён резолвер отвечает пустым ответом, как до
-# 1.9 (sp->dns.names_v4, spec.h), хотя набор vpn_dom6 компилятор заводит (проверка ниже).
+# Семейство в подписи — «46»: спека v2 отвечает и на AAAA имён под правилом (поддельным или
+# настоящим IPv6 — docs/spec-v2.md, dns.mode); у спеки v1 тут стояло «4» — пустой ответ на AAAA.
 hsig="$("$BIN" dnsd-sig --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
-check "гибридный канал в доменной группе соседа" "vpn_dom|0|4|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
+check "гибридный канал в доменной группе соседа" "vpn_dom|0|46|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
 hout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
 check "и компилятор завёл ровно эти наборы" "set vpn_dom {|set vpn_dom6 {|set vpn_ip_c0_p1 {" \
     "$(printf '%s\n' "$hout" | grep -o 'set [a-z0-9_]* {' | paste -sd'|')"
@@ -1449,13 +1662,18 @@ check "набор канала на месте" "1" \
 # Протокол без портов — законное сужение («весь UDP к этим адресам»), и `th` тогда не
 # печатается вовсе.
 spec <<'EOF'
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "quic", "out": "vpn",
-      "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp" } }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  quic: { prefixes_file: [TMP/dc.lst], proto: udp }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: quic, to: [quic], out: vpn }
 EOF
 pout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-p" 2>/dev/null)"
 # Сужение стоит ПЕРЕД поиском по набору: сравнение одного байта протокола дешевле поиска в
@@ -1468,13 +1686,18 @@ check "протокол без портов: порты не выдуманы" "
 # Порты без протокола — «и TCP, и UDP на этих портах». Одним правилом, потому что
 # `meta l4proto { tcp, udp }` это множество, а не «или».
 spec <<'EOF'
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "web", "out": "vpn",
-      "match": { "prefixes_files": ["TMP/dc.lst"], "ports": ["443"] } }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  web: { prefixes_file: [TMP/dc.lst], ports: [443] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: web, to: [web], out: vpn }
 EOF
 wout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-w" 2>/dev/null)"
 check "порты без протокола: оба протокола одним правилом" "1" \
@@ -1485,46 +1708,33 @@ check "один порт печатается без скобок" "0" \
     "$(printf '%s\n' "$wout" | grep -c 'th dport { 443 }')"
 # Явное «both» — это ЗАПИСАННОЕ умолчание, а не третье поведение: сужения по протоколу из
 # него не выходит, только носитель для портов.
-sed 's/"ports": \["443"\]/"proto": "both", "ports": ["443"]/' "$tmp/spec.json" > "$tmp/both.json"
+sed 's/ports: \[443\]/proto: both, ports: [443]/' "$tmp/spec.json" > "$tmp/both.json"
 bout="$("$BIN" apply --dry-run --spec "$tmp/both.json" --state-dir "$tmp/st-b" 2>/dev/null)"
 check "proto both значит то же, что отсутствие proto" "$wout" "$bout"
-
-# ---- поля схемы 2 в спеке schema 1 — ОТКАЗ, а не молчаливый пропуск ----------
-# Молчаливый пропуск здесь и есть та самая беда: человек написал порты, движок их не
-# понял, канал забрал весь трафик к Cloudflare, и сказать об этом было бы нечем.
-spec <<'EOF'
-{ "schema": 1,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "discord", "out": "vpn",
-      "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
-  ] }
-EOF
-msg="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-o" 2>&1 >/dev/null)"
-check "поля схемы 2 при schema 1 отвергаются" "2" \
-    "$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-o" >/dev/null 2>&1; echo $?)"
-check "и сказано, что поднять" "1" "$(printf '%s' "$msg" | grep -c 'schema')"
-check "и назван канал" "1" "$(printf '%s' "$msg" | grep -c 'discord')"
 
 # ---- порты БЕЗ списка адресов — это недописанная настройка -------------------
 # «Канал ловит по портам» выразить нечем и не нужно: без списка адресов правило накрыло бы
 # весь трафик клиентов на этих портах. Проверка «matches nothing» обязана остаться в силе —
 # новые поля источником совпадения не являются.
 spec <<'EOF'
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "только порты", "out": "vpn",
-      "match": { "proto": "udp", "ports": ["50000-65535"] } }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  rule1: { proto: udp, ports: [50000-65535] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "только порты", to: [rule1], out: vpn }
 EOF
 nmsg="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-n" 2>&1 >/dev/null)"
 check "порты без списка: отказ" "2" \
     "$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-n" >/dev/null 2>&1; echo $?)"
 check "порты без списка: отказ тот же, что был" "1" \
-    "$(printf '%s' "$nmsg" | grep -c 'matches nothing')"
+    "$(printf '%s' "$nmsg" | grep -c 'нет источника')"
 
 # ---- каналы с РАЗНЫМИ портами не сливаются в одну группу ---------------------
 # Слияние здесь было бы молчаливой потерей смысла в обе стороны сразу: набор один, а
@@ -1536,14 +1746,20 @@ check "порты без списка: отказ тот же, что был" "1
 # различителя два канала одного выхода делили бы один набор адресов (см. from_disc в
 # src/model/parse.c — та же беда и то же лечение).
 spec <<'EOF'
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "youtube", "out": "vpn", "match": { "prefixes_files": ["TMP/a.lst"] } },
-    { "name": "discord", "out": "vpn",
-      "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  youtube: { prefixes_file: [TMP/a.lst] }
+  discord: { prefixes_file: [TMP/dc.lst], proto: udp, ports: [50000-65535] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: youtube, to: [youtube], out: vpn }
+  - { name: discord, to: [discord], out: vpn }
 EOF
 sout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-s" 2>/dev/null)"
 check "канал без портов сохранил прежнее имя набора" "1" \
@@ -1560,15 +1776,20 @@ check "ограничение стоит только у своего прави
 # ...а каналы с ОДИНАКОВЫМ сужением сливаются, как сливались всегда: иначе предел в 64
 # канала расходовался бы на то, что для ядра одно и то же правило.
 spec <<'EOF'
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "dc1", "out": "vpn",
-      "match": { "prefixes_files": ["TMP/a.lst"], "proto": "udp", "ports": ["50000-65535"] } },
-    { "name": "dc2", "out": "vpn",
-      "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  dc1: { prefixes_file: [TMP/a.lst], proto: udp, ports: [50000-65535] }
+  dc2: { prefixes_file: [TMP/dc.lst], proto: udp, ports: [50000-65535] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: dc1, to: [dc1], out: vpn }
+  - { name: dc2, to: [dc2], out: vpn }
 EOF
 mout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-m" 2>/dev/null)"
 check "одинаковое сужение: правило одно" "1" \
@@ -1582,13 +1803,18 @@ check "одинаковое сужение: набор один и общий" "
 # единого намёка на причину. Тот же довод, что у check_address_lists в src/compile/groups.c.
 portspec() {
     sed "s|PORTS|$1|" > "$tmp/pp.json" <<EOF
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "p", "out": "vpn",
-      "match": { "prefixes_files": ["$tmp/dc.lst"], "ports": PORTS } }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  p: { prefixes_file: [$tmp/dc.lst], ports: PORTS }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: p, to: [p], out: vpn }
 EOF
     "$BIN" apply --dry-run --spec "$tmp/pp.json" --state-dir "$tmp/st-pp" >/dev/null 2>&1
     echo $?
@@ -1599,8 +1825,9 @@ check "перевёрнутый диапазон отвергается"     "2"
 check "не число отвергается"                  "2" "$(portspec '["abc"]')"
 check "двоеточие вместо тире отвергается"     "2" "$(portspec '["50000:65535"]')"
 check "пустая строка отвергается"             "2" "$(portspec '[""]')"
-check "число вместо строки отвергается"       "2" "$(portspec '[443]')"
-check "висящая запятая отвергается"           "2" "$(portspec '["443",]')"
+# В v2 порт — и число, и строка (`ports: [443]`), как всякое значение в YAML; висящая запятая
+# в перечне — законный YAML. В v1 число вместо строки и запятая были отказом, это ушло с v1.
+check "число вместо строки принимается"       "0" "$(portspec '[443]')"
 # Пересечение и повтор — тоже отказ, и по той же причине, что негодная запись: nft не
 # принимает множество с накладывающимися интервалами и отвергает весь набор правил.
 check "повтор диапазона отвергается"          "2" "$(portspec '["443", "443"]')"
@@ -1610,13 +1837,18 @@ check "соседние диапазоны законны"            "0" "$(por
 # там, где он считает, что сузил.
 protospec() {
     sed "s|PROTO|$1|" > "$tmp/pr.json" <<EOF
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "p", "out": "vpn",
-      "match": { "prefixes_files": ["$tmp/dc.lst"], "proto": "PROTO" } }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  p: { prefixes_file: [$tmp/dc.lst], proto: PROTO }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: p, to: [p], out: vpn }
 EOF
     "$BIN" apply --dry-run --spec "$tmp/pr.json" --state-dir "$tmp/st-pr" >/dev/null 2>&1
     echo $?
@@ -1628,13 +1860,18 @@ check "proto tcp принимается"         "0" "$(protospec tcp)"
 # Адрес лежит в наборе — но канал сужен по портам, и «идёт в туннель» верно не для всего
 # его трафика. Прежний ответ был бы правдой лишь наполовину, а по нему настраивают.
 spec <<'EOF'
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
-  "channels": [
-    { "name": "весь udp", "out": "vpn",
-      "match": { "any": true, "allow_all": true, "proto": "udp", "ports": ["50000-65535"] } }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  rule1: { all: true, proto: udp, ports: [50000-65535] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: "весь udp", to: [rule1], out: vpn }
 EOF
 eout="$("$BIN" explain 104.16.0.1 --spec "$tmp/spec.json" --state-dir "$tmp/st-e" 2>/dev/null)"
 check "explain называет сужение канала" "1" \
@@ -1647,10 +1884,18 @@ check "explain называет сужение канала" "1" \
 # цепочка prerouting_failopen по набору меток, который ведёт сторож.
 for of in direct zapret; do
 spec <<EOF
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0", "on_fail": "$of" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "TMP/a.lst" }, "out": "vpn" } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  a: { prefixes_file: [TMP/a.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0, on_fail: $of }
+
+rules:
+  - { name: a, to: [a], out: vpn }
 EOF
 fout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-fo-$of" 2>/dev/null)"
 check "on_fail=$of: набор выходов, пущенных напрямую" "1" \
@@ -1660,10 +1905,18 @@ check "on_fail=$of: бит «не для zapret» снимается с их п�
 done
 # При on_fail=drop напрямую не идёт ничего — ни набора, ни лишнего поиска на каждый пакет.
 spec <<'EOF'
-{ "schema": 2,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0", "on_fail": "drop" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "TMP/a.lst" }, "out": "vpn" } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  a: { prefixes_file: [TMP/a.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+
+rules:
+  - { name: a, to: [a], out: vpn }
 EOF
 check "on_fail=drop: цепочки снятия бита нет" "0" \
     "$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-fo-drop" 2>/dev/null |
@@ -1680,14 +1933,27 @@ check "dry-run без строк замены таблицы" "0" \
 # настоящее 4.9 — стенд tools/vm49 в хабе. Здесь — то, без чего 4.9 отвергнет весь файл.
 printf '198.51.100.0/24\n' > "$tmp/lp.lst"
 cat > "$tmp/legacy.json" <<EOF
-{ "schema": 2, "traceroute_hops": true, "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "wg0" },
-               "yt":  { "kind": "zapret" },
-               "tg":  { "kind": "tgws", "domain": "ex.co.uk" } },
-  "channels": [ { "name": "d", "match": { "domains_file": "$tmp/d.lst",
-                                          "prefixes_files": ["$tmp/lp.lst"] }, "out": "vpn" },
-                { "name": "z", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "yt" },
-                { "name": "t", "match": { "prefixes_file": "$tmp/b.lst" }, "out": "tg" } ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  d: { prefixes_file: [$tmp/lp.lst], domains_file: [$tmp/d.lst] }
+  z: { prefixes_file: [$tmp/a.lst] }
+  t: { prefixes_file: [$tmp/b.lst] }
+
+outputs:
+  vpn: { kind: interface, device: wg0 }
+  yt:  { kind: zapret }
+  tg:  { kind: tgws, domain: ex.co.uk }
+
+dns:
+  traceroute_hops: true
+
+rules:
+  - { name: d, to: [d], out: vpn }
+  - { name: z, to: [z], out: yt }
+  - { name: t, to: [t], out: tg }
 EOF
 lout="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/legacy.json" \
         --state-dir "$tmp/st-legacy" 2>"$tmp/legacy.err")"
@@ -1726,16 +1992,21 @@ check "modern: exthdr frag exists на месте" "1" "$(printf '%s\n' "$mout" 
 # ingressns.sh на настоящем ядре; здесь — устройство, которого точно нет, при STEER_NFT_INGRESS=1.
 chain_of() { printf '%s\n' "$1" | sed -n "/^    chain $2 {/,/^    }/p"; }
 spec <<'EOF'
-{ "schema": 1,
-  "from_default": ["192.168.1.0/24"],
-  "outputs": {
-    "direct": { "kind": "direct" },
-    "vpn":    { "kind": "interface", "device": "wg0" }
-  },
-  "channels": [
-    { "name": "keep",    "match": { "prefixes_file": "TMP/b.lst" }, "out": "direct" },
-    { "name": "blocked", "match": { "prefixes_file": "TMP/a.lst" }, "out": "vpn" }
-  ] }
+version: 2
+
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+
+lists:
+  keep:    { prefixes_file: [TMP/b.lst] }
+  blocked: { prefixes_file: [TMP/a.lst] }
+
+outputs:
+  direct: { kind: direct }
+  vpn:    { kind: interface, device: wg0 }
+
+rules:
+  - { name: keep, to: [keep], out: direct }
+  - { name: blocked, to: [blocked], out: vpn }
 EOF
 iout="$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run --spec "$tmp/spec.json" $S)"
 want="$(cat <<'EOF'

@@ -125,12 +125,17 @@ static void t_router_basic(void) {
     printf("\n-- адресные каналы, современная раскладка --\n");
     put("a.lst", "203.0.113.0/24\n198.51.100.5\n");
     put("b.lst", "198.51.100.5\n");
-    if (load("{ \"schema\": 1, \"from_default\": [\"192.168.1.0/24\"],"
-             "  \"outputs\": { \"direct\": { \"kind\": \"direct\" },"
-             "               \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" } },"
-             "  \"channels\": ["
-             "    { \"name\": \"keep\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"direct\" },"
-             "    { \"name\": \"blocked\", \"match\": { \"prefixes_file\": \"TMP/a.lst\" }, \"out\": \"vpn\" } ] }")) {
+    if (load("version: 2\n"
+             "lan: { addr: [192.168.1.0/24] }\n"
+             "lists:\n"
+             "  keep:    { prefixes_file: TMP/b.lst }\n"
+             "  blocked: { prefixes_file: TMP/a.lst }\n"
+             "outputs:\n"
+             "  direct: { kind: direct }\n"
+             "  vpn:    { kind: interface, device: wg0 }\n"
+             "rules:\n"
+             "  - { name: keep, to: keep, out: direct }\n"
+             "  - { name: blocked, to: blocked, out: vpn }\n")) {
         check("спека разобрана", 0, 1);
         return;
     }
@@ -191,14 +196,19 @@ static int nat_chains(const struct nft_table *t) {
 }
 
 static const char *mixed =
-    "{ \"schema\": 2, \"from_default\": [\"192.168.1.0/24\"],"
-    "  \"outputs\": { \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" },"
-    "               \"yt\": { \"kind\": \"zapret\" },"
-    "               \"tg\": { \"kind\": \"tgws\", \"domain\": \"ex.co.uk\" } },"
-    "  \"channels\": ["
-    "    { \"name\": \"dom\", \"match\": { \"domains_files\": [\"TMP/d.lst\"], \"prefixes_files\": [\"TMP/a.lst\"] }, \"out\": \"vpn\" },"
-    "    { \"name\": \"z\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"yt\" },"
-    "    { \"name\": \"t\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"tg\" } ] }";
+    "version: 2\n"
+    "lan: { addr: [192.168.1.0/24] }\n"
+    "lists:\n"
+    "  dom: { domains_file: [TMP/d.lst], prefixes_file: [TMP/a.lst] }\n"
+    "  b:   { prefixes_file: TMP/b.lst }\n"
+    "outputs:\n"
+    "  vpn: { kind: interface, device: wg0 }\n"
+    "  yt:  { kind: zapret }\n"
+    "  tg:  { kind: tgws, domain: ex.co.uk }\n"
+    "rules:\n"
+    "  - { name: dom, to: dom, out: vpn }\n"
+    "  - { name: z, to: b, out: yt }\n"
+    "  - { name: t, to: b, out: tg }\n";
 
 static void t_mixed_modern(void) {
     printf("\n-- домены, zapret и tgws, современная раскладка --\n");
@@ -345,14 +355,19 @@ static void t_mixed_legacy(int nftc) {
 
 /* ---- 2б. emit вида подключён, и порядок в тексте не зависит от порядка выходов в спеке --- */
 static const char *mixed_rev =
-    "{ \"schema\": 2, \"from_default\": [\"192.168.1.0/24\"],"
-    "  \"outputs\": { \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" },"
-    "               \"tg\": { \"kind\": \"tgws\", \"domain\": \"ex.co.uk\" },"
-    "               \"yt\": { \"kind\": \"zapret\" } },"
-    "  \"channels\": ["
-    "    { \"name\": \"dom\", \"match\": { \"domains_files\": [\"TMP/d.lst\"], \"prefixes_files\": [\"TMP/a.lst\"] }, \"out\": \"vpn\" },"
-    "    { \"name\": \"t\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"tg\" },"
-    "    { \"name\": \"z\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"yt\" } ] }";
+    "version: 2\n"
+    "lan: { addr: [192.168.1.0/24] }\n"
+    "lists:\n"
+    "  dom: { domains_file: [TMP/d.lst], prefixes_file: [TMP/a.lst] }\n"
+    "  b:   { prefixes_file: TMP/b.lst }\n"
+    "outputs:\n"
+    "  vpn: { kind: interface, device: wg0 }\n"
+    "  tg:  { kind: tgws, domain: ex.co.uk }\n"
+    "  yt:  { kind: zapret }\n"
+    "rules:\n"
+    "  - { name: dom, to: dom, out: vpn }\n"
+    "  - { name: t, to: b, out: tg }\n"
+    "  - { name: z, to: b, out: yt }\n";
 
 static void t_mixed_order(void) {
     printf("\n-- emit вида подключён; порядок выходов в спеке текст не меняет --\n");
@@ -385,11 +400,19 @@ static void t_mixed_order(void) {
 
 /* ---- 3. каналы на сам телефон ------------------------------------------------------------ */
 static const char *phone =
-    "{ \"schema\": 2, \"lan_devices\": [\"rndis0\"],"
-    "  \"outputs\": { \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" } },"
-    "  \"channels\": ["
-    "    { \"name\": \"s\", \"from\": [\"self\"], \"match\": { \"any\": true, \"allow_all\": true, \"proto\": \"udp\", \"ports\": [\"50000-65535\"] }, \"out\": \"vpn\" },"
-    "    { \"name\": \"d\", \"from\": [\"uid:10124\"], \"match\": { \"domains_files\": [\"TMP/d.lst\"] }, \"out\": \"vpn\" } ] }";
+    "version: 2\n"
+    "lan: { devices: [rndis0] }\n"
+    "clients:\n"
+    "  me:  { self: true }\n"
+    "  app: { uid: [10124] }\n"
+    "lists:\n"
+    "  udp: { all: true, proto: udp, ports: [\"50000-65535\"] }\n"
+    "  d:   { domains_file: [TMP/d.lst] }\n"
+    "outputs:\n"
+    "  vpn: { kind: interface, device: wg0 }\n"
+    "rules:\n"
+    "  - { name: s, for: me, to: udp, out: vpn }\n"
+    "  - { name: d, for: app, to: d, out: vpn }\n";
 
 static void t_phone(int nftc) {
     printf("\n-- каналы на сам телефон (%s) --\n", !nftc ? "современная" :
@@ -475,18 +498,25 @@ static void t_router_v6(int nftc) {
     put("v6a.lst", "203.0.113.0/24\n2001:db8:1::/48\n2001:db8:2::1-2001:db8:2::9\n");
     put("v6b.lst", "198.51.100.0/24\n");
     put("v6c.lst", "2001:db8:3::/48\n");
-    if (load("{ \"schema\": 2, \"from_default\": [\"192.168.1.0/24\"],"
-             "  \"outputs\": { \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" },"
-             "               \"tg\": { \"kind\": \"tgws\", \"domain\": \"example.com\" },"
-             "               \"dir\": { \"kind\": \"direct\" } },"
-             "  \"channels\": ["
-             "    { \"name\": \"d\", \"match\": { \"prefixes_file\": \"TMP/v6c.lst\" }, \"out\": \"dir\" },"
-             "    { \"name\": \"a\", \"match\": { \"prefixes_file\": \"TMP/v6a.lst\" }, \"out\": \"vpn\" },"
-             "    { \"name\": \"b\", \"match\": { \"prefixes_file\": \"TMP/v6b.lst\" }, \"out\": \"vpn\","
-             "      \"from\": [\"192.168.1.7\"] },"
-             "    { \"name\": \"t\", \"match\": { \"prefixes_file\": \"TMP/v6c.lst\" }, \"out\": \"tg\","
-             "      \"from\": [\"192.168.1.9\", \"fd00::9\"] },"
-             "    { \"name\": \"all\", \"match\": { \"any\": true, \"allow_all\": true }, \"out\": \"vpn\" } ] }")) {
+    if (load("version: 2\n"
+             "lan: { addr: [192.168.1.0/24] }\n"
+             "clients:\n"
+             "  c7: { addr: [192.168.1.7] }\n"
+             "  c9: { addr: [192.168.1.9, \"fd00::9\"] }\n"
+             "lists:\n"
+             "  v6c: { prefixes_file: TMP/v6c.lst }\n"
+             "  v6a: { prefixes_file: TMP/v6a.lst }\n"
+             "  v6b: { prefixes_file: TMP/v6b.lst }\n"
+             "outputs:\n"
+             "  vpn: { kind: interface, device: wg0 }\n"
+             "  tg:  { kind: tgws, domain: example.com }\n"
+             "  dir: { kind: direct }\n"
+             "rules:\n"
+             "  - { name: d, to: v6c, out: dir }\n"
+             "  - { name: a, to: v6a, out: vpn }\n"
+             "  - { name: b, for: c7, to: v6b, out: vpn }\n"
+             "  - { name: t, for: c9, to: v6c, out: tg }\n"
+             "  - { name: all, to: all, out: vpn }\n")) {
         check("спека разобрана", 0, 1);
         return;
     }
@@ -554,8 +584,10 @@ static void t_router_v6(int nftc) {
     nft_rs_free(&rs);
 
     /* Спека без IPv6 и без выходов без IPv6 — ни одного объекта IPv6. */
-    if (load("{ \"schema\": 1, \"outputs\": { \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" } },"
-             "  \"channels\": [ { \"name\": \"b\", \"match\": { \"prefixes_file\": \"TMP/v6b.lst\" }, \"out\": \"vpn\" } ] }")) {
+    if (load("version: 2\n"
+             "lists: { b: { prefixes_file: TMP/v6b.lst } }\n"
+             "outputs: { vpn: { kind: interface, device: wg0 } }\n"
+             "rules: [ { name: b, to: b, out: vpn } ]\n")) {
         check("спека без IPv6 разобрана", 0, 1);
         return;
     }

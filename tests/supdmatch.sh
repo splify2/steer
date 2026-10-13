@@ -125,18 +125,18 @@ printf 'swap.test\n' > "$tmp/swap.lst"
 # spec [chan] — выходы с obfs: a идёт через t (via), b сам по себе; порядок в спеке — a, t, b.
 # $BSRV — сервер обфускации выхода b. chan=1 — доменный канал swap.test → t.
 spec() {
-    chans='[]'
-    [ -n "${1:-}" ] && chans="[{\"name\":\"c\",\"match\":{\"domains_files\":[\"$tmp/swap.lst\"]},\"out\":\"t\"}]"
-    cat > "$tmp/spec.json" <<EOF
-{"schema":2,"from_default":["127.0.0.0/8"],"outputs":{
- "a":{"kind":"interface","device":"wga","via":"t",
-      "obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:5101"}},
- "t":{"kind":"interface","device":"wgt",
-      "obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:5102"}},
- "b":{"kind":"interface","device":"wgb",
-      "obfs":{"mode":"wg-over-tcp","server":"${BSRV:-10.99.0.3:4443}","listen":"127.0.0.1:5103"}}},
- "channels":$chans}
+    {
+        printf 'version: 2\nlan: { addr: [127.0.0.0/8] }\n'
+        [ -n "${1:-}" ] && printf 'lists:\n  c: { domains_file: %s/swap.lst }\n' "$tmp"
+        cat <<EOF
+outputs:
+  a: { kind: interface, device: wga, over: t, obfs: { server: 10.99.0.3:4443, listen: 127.0.0.1:5101 } }
+  t: { kind: interface, device: wgt, obfs: { server: 10.99.0.3:4443, listen: 127.0.0.1:5102 } }
+  b: { kind: interface, device: wgb, obfs: { server: ${BSRV:-10.99.0.3:4443}, listen: 127.0.0.1:5103 } }
 EOF
+        [ -n "${1:-}" ] && printf 'rules:\n  - { name: c, to: c, out: t }\n'
+        return 0
+    } > "$tmp/spec.yaml"
 }
 pid_of() { grep "^obfs $1 " "$tmp/log" | tail -1 | cut -d' ' -f3; }
 runs() { grep -c "^obfs $1 " "$tmp/log" 2>/dev/null; }
@@ -145,7 +145,7 @@ ctl() { "$BIN" ctl --socket "$tmp/s.sock" "$@"; }
 
 spec 1
 STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" daemon --supervise --socket "$tmp/s.sock" \
-    --spec "$tmp/spec.json" --state-dir "$tmp/st" \
+    --spec "$tmp/spec.yaml" --state-dir "$tmp/st" \
     --dnsd-flag --listen-port --dnsd-flag "$LPORT" --dnsd-flag --upstream-port --dnsd-flag "$UPORT" \
     2>"$tmp/d.err" &
 D=$!
@@ -195,11 +195,11 @@ check "  helper у выхода без помощника — код 1" "1" "$(c
 # клиент, уже спросивший демон (STEER_DAEMON_ASKED), получает ответ самого движка.
 ENG="$(dirname "$BIN")/steerd"
 check "steerd status при живом демоне — его ответ, а не подкоманды" "2 True kws2.example 300" \
-    "$(STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/spec.json" --state-dir "$tmp/st" | pdown)"
+    "$(STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/spec.yaml" --state-dir "$tmp/st" | pdown)"
 check "  после клиента (STEER_DAEMON_ASKED) — считает сам" "-" \
-    "$(STEER_DAEMON_ASKED=1 STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/spec.json" --state-dir "$tmp/st" | pdown)"
+    "$(STEER_DAEMON_ASKED=1 STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/spec.yaml" --state-dir "$tmp/st" | pdown)"
 check "  чужая спека — считает сам" "-" \
-    "$(cp "$tmp/spec.json" "$tmp/other.json"; STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/other.json" --state-dir "$tmp/st" | pdown)"
+    "$(cp "$tmp/spec.yaml" "$tmp/other.yaml"; STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/other.yaml" --state-dir "$tmp/st" | pdown)"
 
 # Резолвер на таблице: канал swap.test есть — AAAA погашен; чужое имя — ответ апстрима.
 wait_for '[ "$(python3 "$tmp/qaaaa.py" "$LPORT" other.test)" = 1 ]' 5
@@ -295,11 +295,10 @@ LPORT5=15312
 printf 'swap.test\n' > "$tmp/l5a.lst"
 printf 'swap.test\nnew.test\n' > "$tmp/l5b.lst"
 spec5() {
-    printf '{"schema":2,"from_default":["127.0.0.0/8"],"outputs":{"t":{"kind":"interface","device":"wgt"}},'\
-'"channels":[{"name":"c","match":{"domains_files":["%s"]},"out":"t"}]}\n' "$1" > "$tmp/spec5.json"
+    printf 'version: 2\nlan: { addr: [127.0.0.0/8] }\nlists:\n  c: { domains_file: %s }\noutputs:\n  t: { kind: interface, device: wgt }\nrules:\n  - { name: c, to: c, out: t }\n' "$1" > "$tmp/spec5.yaml"
 }
 d5() {   # d5 ЖУРНАЛ [СПЕКА] — демон стенда в фоне, pid — в $!
-    "$BIN" daemon --supervise --socket "$tmp/s5.sock" --spec "${2:-$tmp/spec5.json}" \
+    "$BIN" daemon --supervise --socket "$tmp/s5.sock" --spec "${2:-$tmp/spec5.yaml}" \
         --state-dir "$tmp/st5" \
         --dnsd-flag --listen-port --dnsd-flag "$LPORT5" --dnsd-flag --upstream-port --dnsd-flag "$UPORT" \
         --dnsd-flag --orphan-timeout --dnsd-flag 4 2>"$tmp/$1" &
@@ -378,7 +377,7 @@ wait_for '[ -n "$(dn5 d5d.err запущен)" ]' 5
 DN5="$(dn5 d5d.err запущен)"
 kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
 sleep 0.5
-d5 d5e.err "$tmp/nospec.json"; D=$!
+d5 d5e.err "$tmp/nospec.yaml"; D=$!
 wait_for '[ "$(gone "$DN5")" = gone ]' 5
 check "демон без спеки гасит оставшийся резолвер сразу" "gone 1" \
     "$(gone "$DN5") $(grep -c "резолвер прежнего демона (pid $DN5) погашен" "$tmp/d5e.err")"
@@ -405,8 +404,7 @@ H
 chmod +x "$tmp/h6"
 mkdir -p "$tmp/st6" "$tmp/st6o"
 spec6() {   # spec6 ФАЙЛ ВЫХОД ПОРТ — один выход с обфускатором
-    printf '{"schema":2,"from_default":["127.0.0.0/8"],"outputs":{"%s":{"kind":"interface",'\
-'"device":"wg%s","obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:%s"}}}}\n' \
+    printf 'version: 2\nlan: { addr: [127.0.0.0/8] }\noutputs:\n  %s: { kind: interface, device: wg%s, obfs: { server: 10.99.0.3:4443, listen: "127.0.0.1:%s" } }\n' \
         "$2" "$2" "$3" > "$1"
 }
 d6() {   # d6 ЖУРНАЛ СПЕКА КАТАЛОГ ПОРТ-РЕЗОЛВЕРА — демон стенда в фоне, pid — в $!
@@ -417,10 +415,10 @@ d6() {   # d6 ЖУРНАЛ СПЕКА КАТАЛОГ ПОРТ-РЕЗОЛВЕРА
 }
 pid6() { grep "^obfs $1 " "$tmp/log6" | tail -1 | cut -d' ' -f3; }
 runs6() { grep -c "^obfs $1 " "$tmp/log6" 2>/dev/null; }
-spec6 "$tmp/spec6.json" v 5106
-spec6 "$tmp/spec6o.json" w 5107
-d6 d6o.err "$tmp/spec6o.json" "$tmp/st6o" 15314; DO6=$!
-d6 d6a.err "$tmp/spec6.json" "$tmp/st6" 15313; D=$!
+spec6 "$tmp/spec6.yaml" v 5106
+spec6 "$tmp/spec6o.yaml" w 5107
+d6 d6o.err "$tmp/spec6o.yaml" "$tmp/st6o" 15314; DO6=$!
+d6 d6a.err "$tmp/spec6.yaml" "$tmp/st6" 15313; D=$!
 wait_for '[ "$(runs6 v)" = 1 ] && [ "$(runs6 w)" = 1 ]' 5
 PV="$(pid6 v)" PW="$(pid6 w)"
 kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
@@ -429,7 +427,7 @@ check "kill -9 демона: помощник вышел сам за секун�
     "$(gone "$PV") $(grep -c "^stop v $PV\$" "$tmp/log6")"
 check "  помощник соседнего живого демона жив" "alive" "$(gone "$PW")"
 touch "$tmp/deaf6.v"
-d6 d6b.err "$tmp/spec6.json" "$tmp/st6" 15313; D=$!
+d6 d6b.err "$tmp/spec6.yaml" "$tmp/st6" 15313; D=$!
 wait_for '[ "$(runs6 v)" = 2 ]' 5
 check "  новый демон поднял своего без отказа «занято»" "2 0" "$(runs6 v) $(grep -c '^busy' "$tmp/log6")"
 PV="$(pid6 v)"
@@ -438,7 +436,7 @@ rm -f "$tmp/deaf6.v"
 kill -KILL "$D"; wait "$D" 2>/dev/null; D=""
 sleep 1.5
 check "глухой к SIGTERM помощник пережил kill -9 демона" "alive" "$(gone "$PV")"
-d6 d6c.err "$tmp/spec6.json" "$tmp/st6" 15313; D=$!
+d6 d6c.err "$tmp/spec6.yaml" "$tmp/st6" 15313; D=$!
 wait_for '[ "$(runs6 v)" = 3 ]' 8
 check "  новый демон погасил его до запуска своего: SIGTERM, по сроку SIGKILL" "gone 1 1" \
     "$(gone "$PV") $(grep -c "помощник прежнего демона (pid $PV, .*) остался без него — гашу" \
@@ -688,20 +686,26 @@ H
     # wspec [wo] — с «wo» ещё и выход с обфускатором.
     wspec() {
         wo=""
-        [ -n "${1:-}" ] && wo=',"wo":{"kind":"interface","device":"wo","obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:5111"}}'
-        cat > "$W/spec.json" <<EOF
-{"schema":2,"from_default":["127.0.0.0/8"],"outputs":{
- "xa":{"kind":"xsteer","conf":"/etc/xa.conf","on_fail":"direct"},
- "xb":{"kind":"xsteer","conf":"/etc/xb.conf","on_fail":"direct"},
- "vpn":{"kind":"interface","devices":["xa","xb"],"on_fail":"drop"},
- "zq":{"kind":"zapret","opts_file":"$W/zq.opts"},
- "zr":{"kind":"zapret","opts_file":"$W/zr.opts"},
- "vl":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
- "vx":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
- "va":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
- "vb":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
- "vv":{"kind":"interface","devices":["va","vb"],"on_fail":"drop"}$wo},
- "channels":[]}
+        [ -n "${1:-}" ] && wo='  wo: { kind: interface, device: wo, obfs: { server: 10.99.0.3:4443, listen: "127.0.0.1:5111" } }'
+        cat > "$W/spec.yaml" <<EOF
+version: 2
+lan: { addr: [127.0.0.0/8] }
+outputs:
+  xa: { kind: xsteer, conf: /etc/xa.conf, on_fail: direct }
+  xb: { kind: xsteer, conf: /etc/xb.conf, on_fail: direct }
+  vpn: { kind: group, pick: order, members: [vpn.xa, vpn.xb] }
+  vpn.xa: { kind: interface, device: xa }
+  vpn.xb: { kind: interface, device: xb }
+  zq: { kind: zapret, strategy: $W/zq.opts }
+  zr: { kind: zapret, strategy: $W/zr.opts }
+  vl: { kind: tunnel, protocol: vless, subscription: $W/sub.txt, on_fail: direct }
+  vx: { kind: tunnel, protocol: vless, subscription: $W/sub.txt, on_fail: direct }
+  va: { kind: tunnel, protocol: vless, subscription: $W/sub.txt, on_fail: direct }
+  vb: { kind: tunnel, protocol: vless, subscription: $W/sub.txt, on_fail: direct }
+  vv: { kind: group, pick: order, members: [vv.va, vv.vb] }
+  vv.va: { kind: interface, device: va }
+  vv.vb: { kind: interface, device: vb }
+$wo
 EOF
     }
     wruns() { grep -c "^$1 $2 " "$W/log" 2>/dev/null; }
@@ -715,7 +719,7 @@ EOF
     # 600 с: всё, что стенд ждёт от сторожа, обязано прийти внеочередным проходом по событию.
     unshare -m sh -c "mount -t sysfs sysfs /sys && PATH=\"$W/bin:\$PATH\" STEER_FAILOVER_HYST=0 \
         STEER_SUPERVISE_EXE=\"$W/helper\" exec \"$XK\" daemon --watch --watch-period 600 --supervise \
-        --socket \"$W/s.sock\" --spec \"$W/spec.json\" --state-dir \"$W/st\" \
+        --socket \"$W/s.sock\" --spec \"$W/spec.yaml\" --state-dir \"$W/st\" \
         --dnsd-flag --listen-port --dnsd-flag 15411 --dnsd-flag --upstream-port --dnsd-flag 15475" \
         >"$W/d.out" 2>"$W/d.err" &
     WD=$!
@@ -727,7 +731,7 @@ EOF
     # встаёт на первое устройство, когда его помощник поднялся (vl ждётся до конца — перебор).
     wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vpn\"" "$W/sub.out"' 40
     check "сторож с супервизором: помощник поднялся — выход-пул на первом устройстве" \
-        '{"v":1,"ev":"switched","out":"vpn","from":null,"to":"xa","why":"start"}' \
+        '{"v":1,"ev":"switched","out":"vpn","from":null,"to":"xa","why":"start","member":"vpn.xa"}' \
         "$(grep '"ev":"switched","out":"vpn"' "$W/sub.out")"
     check "  status из памяти — оно же" '"xa"' "$(wst '["outputs"]["vpn"]["device"]')"
     check "  status: перебор узлов vless — из памяти демона" \
@@ -736,14 +740,14 @@ EOF
     # файлов probe-* нет, и сама она хода перебора не знала бы.
     check "  steerd status мимо клиента — тот же ход перебора, от демона" \
         '{"state":"probing","node":2,"total":5}' \
-        "$(STEER_SOCKET="$W/s.sock" "$XK" status --spec "$W/spec.json" --state-dir "$W/st" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["outputs"]["vl"].get("probe"), separators=(",", ":")))' 2>&1)"
+        "$(STEER_SOCKET="$W/s.sock" "$XK" status --spec "$W/spec.yaml" --state-dir "$W/st" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["outputs"]["vl"].get("probe"), separators=(",", ":")))' 2>&1)"
     # Все кандидаты исключены exclude (событие excluded клиента): своё состояние, а не failed —
     # «в подписке нет пригодных узлов» было бы неправдой, узлы есть, их не велено брать.
     check "  status: все кандидаты исключены — состояние excluded, не failed" \
         '{"state":"excluded","total":3}' "$(wst '["outputs"]["vx"]["probe"]')"
     check "  и в steerd status мимо клиента" \
         '{"state":"excluded","total":3}' \
-        "$(STEER_SOCKET="$W/s.sock" "$XK" status --spec "$W/spec.json" --state-dir "$W/st" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["outputs"]["vx"].get("probe"), separators=(",", ":")))' 2>&1)"
+        "$(STEER_SOCKET="$W/s.sock" "$XK" status --spec "$W/spec.yaml" --state-dir "$W/st" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["outputs"]["vx"].get("probe"), separators=(",", ":")))' 2>&1)"
     check "  helper xa — живое состояние клиента xsteer из памяти демона (xsteer-peers)" \
         "xsteer True True" \
         "$(wctl helper xa | python3 -c 'import json,sys; d=json.loads(json.load(sys.stdin)["stdout"]); print(d["helper"], d["running"], d["up"])' 2>&1)"
@@ -768,7 +772,7 @@ EOF
     touch "$W/down.xa"
     wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vpn\",\"from\":\"xa\"" "$W/sub.out"' 40
     check "помощник xa пишет down — выход переключён на следующее устройство" \
-        '{"v":1,"ev":"switched","out":"vpn","from":"xa","to":"xb","why":"down"}' \
+        '{"v":1,"ev":"switched","out":"vpn","from":"xa","to":"xb","why":"down","member":"vpn.xb"}' \
         "$(grep '"ev":"switched","out":"vpn","from":"xa"' "$W/sub.out")"
     check "  status — новое устройство" '"xb"' "$(wst '["outputs"]["vpn"]["device"]')"
     # down помощника — решает сторож, как прежде: у xa on_fail=direct, правило снято, таблица
@@ -780,7 +784,7 @@ EOF
     rm -f "$W/down.xa"
     wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vpn\",\"from\":\"xb\"" "$W/sub.out"' 40
     check "помощник xa пишет up — возврат на него" \
-        '{"v":1,"ev":"switched","out":"vpn","from":"xb","to":"xa","why":"preferred"}' \
+        '{"v":1,"ev":"switched","out":"vpn","from":"xb","to":"xa","why":"preferred","member":"vpn.xa"}' \
         "$(grep '"ev":"switched","out":"vpn","from":"xb"' "$W/sub.out")"
     # Снова up того же процесса: маршрут возвращает проход сторожа (was «-» → устройство), а
     # демон по up второй раз не привязывает — привязка одна на подъём устройства.
@@ -795,7 +799,7 @@ EOF
     # устройства va и vb (dummy без адреса в пространстве без маршрутов) соединение TCP не уходит
     # вовсе — проба сторожа признала бы их мёртвыми, а выход-пул vv стоит на va.
     check "клиент vless с watch: пул на первом устройстве, хотя проба TCP через него не прошла бы" \
-        '{"v":1,"ev":"switched","out":"vv","from":null,"to":"va","why":"start"}' \
+        '{"v":1,"ev":"switched","out":"vv","from":null,"to":"va","why":"start","member":"vv.va"}' \
         "$(grep '"ev":"switched","out":"vv"' "$W/sub.out" | head -1)"
     check "  соединение TCP через va и правда не уходит" "no" \
         "$(python3 -c 'import socket
@@ -814,7 +818,7 @@ print(d.get("failed", False), n.get("why", "-"), n.get("since", 0) > 0, sep="|")
     touch "$W/down.va"
     wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vv\",\"from\":\"va\"" "$W/sub.out"' 40
     check "клиент vless пишет down — пул переключён без прохода по периоду" \
-        '{"v":1,"ev":"switched","out":"vv","from":"va","to":"vb","why":"down"}' \
+        '{"v":1,"ev":"switched","out":"vv","from":"va","to":"vb","why":"down","member":"vv.vb"}' \
         "$(grep '"ev":"switched","out":"vv","from":"va"' "$W/sub.out")"
     check "  за секунды, а не за период" "yes" "$([ $(($(date +%s) - t0)) -lt 60 ] && echo yes)"
     check "  подписчику — helper-down с причиной клиента" \
@@ -835,7 +839,7 @@ for c in d["checks"]:
     rm -f "$W/down.va"
     wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vv\",\"from\":\"vb\"" "$W/sub.out"' 40
     check "клиент vless пишет up — пул вернулся на va" \
-        '{"v":1,"ev":"switched","out":"vv","from":"vb","to":"va","why":"preferred"}' \
+        '{"v":1,"ev":"switched","out":"vv","from":"vb","to":"va","why":"preferred","member":"vv.va"}' \
         "$(grep '"ev":"switched","out":"vv","from":"vb"' "$W/sub.out")"
     wait_for '[ "$(vast)" = "False|-|False" ]' 10
     check "  status va — снова в строю, node_down нет" "False|-|False" "$(vast)"

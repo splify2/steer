@@ -61,13 +61,22 @@ inc ip link set veth1 up
 inc ip route add default via 10.99.0.1
 
 # ---- набор правил ----------------------------------------------------------------------------
-cat > "$tmp/spec.json" <<EOF
-{ "schema": 1, "from_default": ["10.99.0.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "veth0" } },
-  "channels": [ { "name": "mixed", "match": { "srs_file": "$FIX/mixed.srs" }, "out": "vpn" } ] }
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+
+lan: { devices: [br-lan], addr: [10.99.0.0/24] }
+
+lists:
+  mixed: { srs: [$FIX/mixed.srs] }
+
+outputs:
+  vpn: { kind: interface, device: veth0 }
+
+rules:
+  - { name: mixed, to: [mixed], out: vpn }
 EOF
 # Проба ядра — без подсказок окружения: движок сам спрашивает, примет ли ядро составной набор.
-env -u STEER_NFT_CONCAT -u STEER_NFT_COMPAT "$BIN" apply --dry-run --spec "$tmp/spec.json" \
+env -u STEER_NFT_CONCAT -u STEER_NFT_COMPAT "$BIN" apply --dry-run --spec "$tmp/spec.yaml" \
     --state-dir "$tmp/st" > "$tmp/rs.nft" 2> "$tmp/rs.err"
 check "проба ядра: составной набор выбран сам" yes \
     "$(grep -q 'type ipv4_addr . inet_proto . inet_service' "$tmp/rs.nft" && echo yes || echo no)"
@@ -106,23 +115,32 @@ probe hit  "UDP 50001 к 198.51.100.10 (сужение набора) — в ка
 probe miss "TCP к 198.51.100.10 — мимо"                  tcp 198.51.100.10 443
 
 # ---- explain по составному набору ------------------------------------------------------------
-ex="$("$BIN" explain 203.0.113.10 --spec "$tmp/spec.json" --state-dir "$tmp/st" 2>&1)"
+ex="$("$BIN" explain 203.0.113.10 --spec "$tmp/spec.yaml" --state-dir "$tmp/st" 2>&1)"
 check "explain: адрес найден в составном наборе" yes \
     "$(printf '%s' "$ex" | grep -q '"vpn_dom_c0_m"' && echo yes || echo no)"
 check "explain: и названо сужение" yes \
     "$(printf '%s' "$ex" | grep -q 'канал сужен: только udp 50000-65535' && echo yes || echo no)"
-ex="$("$BIN" explain 198.51.100.200 --spec "$tmp/spec.json" --state-dir "$tmp/st" 2>&1)"
+ex="$("$BIN" explain 198.51.100.200 --spec "$tmp/spec.yaml" --state-dir "$tmp/st" 2>&1)"
 check "explain: адрес без сужения — без строки о сужении" no \
     "$(printf '%s' "$ex" | grep -q 'канал сужен' && echo yes || echo no)"
 
 # ---- резолвер: имена набора в составной набор по netlink --------------------------------------
 nft delete table inet steer 2>/dev/null
-cat > "$tmp/dspec.json" <<EOF
-{ "schema": 1, "from_default": ["10.99.0.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "veth0" } },
-  "channels": [ { "name": "names", "match": { "srs_file": "$FIX/dnsmixed.srs" }, "out": "vpn" } ] }
+cat > "$tmp/dspec.yaml" <<EOF
+version: 2
+
+lan: { devices: [br-lan], addr: [10.99.0.0/24] }
+
+lists:
+  names: { srs: [$FIX/dnsmixed.srs] }
+
+outputs:
+  vpn: { kind: interface, device: veth0 }
+
+rules:
+  - { name: names, to: [names], out: vpn }
 EOF
-STEER_NFT_CONCAT=1 "$BIN" apply --dry-run --spec "$tmp/dspec.json" --state-dir "$tmp/st2" \
+STEER_NFT_CONCAT=1 "$BIN" apply --dry-run --spec "$tmp/dspec.yaml" --state-dir "$tmp/st2" \
     > "$tmp/drs.nft" 2>/dev/null
 nft -f "$tmp/drs.nft"
 check "набор правил резолверного канала принят" 0 "$?"
@@ -160,7 +178,7 @@ print(".".join(str(b) for b in d[-4:]))
 PY
 python3 "$tmp/upstream.py" "$UPORT" & UPID=$!
 sleep 0.5
-STEER_NFT_CONCAT=1 "$BIN" dnsd --spec "$tmp/dspec.json" --state-dir "$tmp/st2" \
+STEER_NFT_CONCAT=1 "$BIN" dnsd --spec "$tmp/dspec.yaml" --state-dir "$tmp/st2" \
     --listen-port "$LPORT" --upstream-port "$UPORT" > "$tmp/dnsd.log" 2>&1 & DPID=$!
 sleep 1
 kill -0 "$DPID" 2>/dev/null || { echo "FAIL резолвер не поднялся:"; cat "$tmp/dnsd.log"; exit 1; }
@@ -191,19 +209,27 @@ check "подсети набора — элементами из набора п
 kill "$DPID" "$UPID" 2>/dev/null; wait "$DPID" "$UPID" 2>/dev/null
 python3 "$tmp/upstream.py" "$UPORT" 100.64.0.7 & UPID=$!
 nft delete table inet steer 2>/dev/null
-cat > "$tmp/rspec.json" <<EOF
-{ "schema": 1, "from_default": ["10.99.0.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "veth0" } },
-  "channels": [ { "name": "names", "match": { "srs_file": "$FIX/dnsmixed.srs", "mode": "realip" },
-                  "out": "vpn" } ] }
+cat > "$tmp/rspec.yaml" <<EOF
+version: 2
+
+lan: { devices: [br-lan], addr: [10.99.0.0/24] }
+
+lists:
+  names: { srs: [$FIX/dnsmixed.srs] }
+
+outputs:
+  vpn: { kind: interface, device: veth0 }
+
+rules:
+  - { name: names, to: [names], out: vpn, resolve: realip }
 EOF
-STEER_NFT_CONCAT=1 "$BIN" apply --dry-run --spec "$tmp/rspec.json" --state-dir "$tmp/st3" \
+STEER_NFT_CONCAT=1 "$BIN" apply --dry-run --spec "$tmp/rspec.yaml" --state-dir "$tmp/st3" \
     > "$tmp/rrs.nft" 2>/dev/null
 nft -f "$tmp/rrs.nft"
 check "real-ip: набор правил принят" 0 "$?"
 RS="$(sed -n 's/^    set \(vpn_dom_[a-z0-9_]*_m\) {/\1/p' "$tmp/rrs.nft" | head -n 1)"
 check "real-ip: у канала составной доменный набор" yes "$([ -n "$RS" ] && echo yes || echo no)"
-STEER_NFT_CONCAT=1 "$BIN" dnsd --spec "$tmp/rspec.json" --state-dir "$tmp/st3" \
+STEER_NFT_CONCAT=1 "$BIN" dnsd --spec "$tmp/rspec.yaml" --state-dir "$tmp/st3" \
     --listen-port "$LPORT" --upstream-port "$UPORT" > "$tmp/dnsd3.log" 2>&1 & DPID=$!
 sleep 1
 rels() { nft list set inet steer "$RS" | tr -d '\n\t' | sed 's/  */ /g'; }

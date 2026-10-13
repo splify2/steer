@@ -73,6 +73,17 @@ static void build(struct ruleset *rs, const char *const *lines) {
     }
 }
 
+/* Путь от рабочего каталога стенда — абсолютным: в спеке v2 относительный путь читается от каталога
+ * файла спеки (во /tmp), а не от рабочего каталога. */
+static const char *abs_path(const char *rel) {
+    static char buf[4][1024];
+    static int k;
+    char *b = buf[k++ & 3], cwd[800];
+    if (!getcwd(cwd, sizeof cwd)) cwd[0] = '\0';
+    snprintf(b, 1024, "%s/%s", cwd, rel);
+    return b;
+}
+
 int main(void) {
     {
         struct ruleset rs;
@@ -454,12 +465,10 @@ int main(void) {
             if (sf >= 0) {
                 FILE *ws = fdopen(sf, "w");
                 fprintf(ws,
-                        "{\"schema\":1,"
-                        "\"outputs\":{\"vl\":{\"kind\":\"interface\",\"device\":\"lo\"}},"
-                        "\"channels\":["
-                        "{\"name\":\"off\",\"enabled\":false,"
-                        "\"match\":{\"domains_files\":[\"%s\"]},\"out\":\"vl\"}"
-                        "]}\n", lst);
+                        "version: 2\n"
+                        "outputs: { vl: { kind: interface, device: lo } }\n"
+                        "lists: { off: { domains_file: [\"%s\"] } }\n"
+                        "rules: [ { name: off, to: off, out: vl, enabled: false } ]\n", lst);
                 fclose(ws);
 
                 static struct spec cfg;
@@ -978,11 +987,10 @@ int main(void) {
         int sf = mkstemp(sp);
         if (sf >= 0) {
             FILE *ws = fdopen(sf, "w");
-            fprintf(ws, "{\"schema\":1,"
-                        "\"outputs\":{\"vl\":{\"kind\":\"interface\",\"device\":\"lo\"}},"
-                        "\"channels\":["
-                        "{\"name\":\"n\",\"match\":{\"srs_file\":\"tests/srs/dnsmixed.srs\"},"
-                        "\"out\":\"vl\"}]}\n");
+            fprintf(ws, "version: 2\n"
+                        "outputs: { vl: { kind: interface, device: lo } }\n"
+                        "lists: { n: { srs: [\"%s\"] } }\n"
+                        "rules: [ { name: n, to: n, out: vl } ]\n", abs_path("tests/srs/dnsmixed.srs"));
             fclose(ws);
             static struct spec cfg;
             struct err e = {0};
@@ -991,8 +999,10 @@ int main(void) {
             dch_build(&cfg);
             check("srs: канал резолвера один (составной набор)", 1, (int)g_dch_n);
             check_str("srs: имя набора — составное", "vl_dom_c0_m", g_dch_n ? g_dch[0].set : "");
-            check_str("srs: источник — клаузы имён с сужением",
-                      "srs:0=udp/50000-65535,1=-,2=-:tests/srs/dnsmixed.srs",
+            char want_src[600];
+            snprintf(want_src, sizeof want_src, "srs:0=udp/50000-65535,1=-,2=-:%s",
+                     abs_path("tests/srs/dnsmixed.srs"));
+            check_str("srs: источник — клаузы имён с сужением", want_src,
                       g_dch_n && g_dch[0].rules_n ? g_dch[0].rules_path[0] : "");
             if (g_dch_n) {
                 struct ruleset m;
@@ -1028,8 +1038,8 @@ int main(void) {
             srs_concat_override = 0;
             dch_build(&cfg);
             check("srs без составных наборов: по каналу на сужение", 2, (int)g_dch_n);
-            check_str("… первый — с сужением набора",
-                      "srs:0:tests/srs/dnsmixed.srs", g_dch_n ? g_dch[0].rules_path[0] : "");
+            snprintf(want_src, sizeof want_src, "srs:0:%s", abs_path("tests/srs/dnsmixed.srs"));
+            check_str("… первый — с сужением набора", want_src, g_dch_n ? g_dch[0].rules_path[0] : "");
             srs_concat_override = -1;
             g_dch_n = 0;
             unlink(sp);
@@ -1048,11 +1058,10 @@ int main(void) {
         int sf = mkstemp(sp);
         if (sf >= 0) {
             FILE *ws = fdopen(sf, "w");
-            fprintf(ws, "{\"schema\":1,"
-                        "\"outputs\":{\"vl\":{\"kind\":\"interface\",\"device\":\"lo\"}},"
-                        "\"channels\":["
-                        "{\"name\":\"a\",\"match\":{\"srs_file\":\"tests/srs/adguard.srs\"},"
-                        "\"out\":\"vl\"}]}\n");
+            fprintf(ws, "version: 2\n"
+                        "outputs: { vl: { kind: interface, device: lo } }\n"
+                        "lists: { a: { srs: [\"%s\"] } }\n"
+                        "rules: [ { name: a, to: a, out: vl } ]\n", abs_path("tests/srs/adguard.srs"));
             fclose(ws);
             static struct spec cfg;
             struct err e = {0};

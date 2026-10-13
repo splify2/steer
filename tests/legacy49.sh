@@ -35,24 +35,38 @@ printf '203.0.113.0/24\n' > /work/a.lst
 printf 'example.com\n' > /work/d.lst
 printf '198.51.100.0/24\n' > /work/p.lst
 printf '104.16.0.0/12\n' > /work/dc.lst
-cat > /work/full.json <<'J'
-{ "schema": 2, "traceroute_hops": true, "from_default": ["10.99.0.0/24"],
-  "outputs": { "direct": { "kind": "direct" },
-    "vpn": { "kind": "interface", "device": "applynft0", "on_fail": "direct" },
-    "vpn2": { "kind": "interface", "device": "applynft1" },
-    "yt": { "kind": "zapret" }, "dis": { "kind": "zapret", "on_fail": "direct" },
-    "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
-  "channels": [
-    { "name": "tv", "from": ["a4:83:e7:2c:11:0f"], "match": { "any": true, "allow_all": true }, "out": "vpn2" },
-    { "name": "blk", "match": { "prefixes_file": "/work/a.lst" }, "out": "vpn" },
-    { "name": "dom", "match": { "domains_files": ["/work/d.lst"], "prefixes_files": ["/work/p.lst"] }, "out": "vpn" },
-    { "name": "rip", "match": { "domains_files": ["/work/d.lst"], "mode": "realip" }, "out": "vpn2" },
-    { "name": "disc", "match": { "prefixes_files": ["/work/dc.lst"], "proto": "udp", "ports": ["50000-65535", "19000-20000"] }, "out": "vpn" },
-    { "name": "z", "match": { "prefixes_file": "/work/a.lst" }, "out": "yt" },
-    { "name": "z2", "match": { "domains_files": ["/work/d.lst"] }, "out": "dis" },
-    { "name": "t", "match": { "prefixes_files": ["/work/dc.lst"] }, "out": "tg" } ] }
+cat > /work/full.yaml <<'J'
+version: 2
+lan: { addr: [10.99.0.0/24] }
+clients:
+  tv: { mac: [a4:83:e7:2c:11:0f] }
+lists:
+  blk:  { prefixes_file: /work/a.lst }
+  dom:  { prefixes_file: /work/p.lst, domains_file: /work/d.lst }
+  rip:  { domains_file: /work/d.lst }
+  disc: { prefixes_file: /work/dc.lst, proto: udp, ports: [50000-65535, 19000-20000] }
+  z:    { prefixes_file: /work/a.lst }
+  z2:   { domains_file: /work/d.lst }
+  t:    { prefixes_file: /work/dc.lst }
+outputs:
+  direct: { kind: direct }
+  vpn:    { kind: interface, device: applynft0, on_fail: direct }
+  vpn2:   { kind: interface, device: applynft1 }
+  yt:     { kind: zapret }
+  dis:    { kind: zapret, on_fail: direct }
+  tg:     { kind: tgws, domain: ex.co.uk }
+dns: { traceroute_hops: true }
+rules:
+  - { name: tv, for: tv, to: all, out: vpn2 }
+  - { name: blk, to: blk, out: vpn }
+  - { name: dom, to: dom, out: vpn }
+  - { name: rip, to: rip, out: vpn2, resolve: realip }
+  - { name: disc, to: disc, out: vpn }
+  - { name: z, to: z, out: yt }
+  - { name: z2, to: z2, out: dis }
+  - { name: t, to: t, out: tg }
 J
-S="--spec /work/full.json --state-dir /tmp/st"
+S="--spec /work/full.yaml --state-dir /tmp/st"
 
 echo "=== 1. проба ядра без подсказки"
 steer apply $S --dry-run > /tmp/dry.nft 2>/tmp/dry.err; echo "dry-run код $?"
@@ -79,13 +93,19 @@ steer apply $S >/dev/null 2>&1
 check "обратно в полную старую раскладку" "1" "$(nft list tables | grep -c 'ip6 steer')"
 
 echo "=== 4. explain без nft get element"
-cat > /work/ex.json <<'J'
-{ "schema": 2, "from_default": ["10.99.0.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "applynft0", "on_fail": "direct" } },
-  "channels": [ { "name": "blk", "match": { "prefixes_file": "/work/a.lst" }, "out": "vpn" },
-    { "name": "dom", "match": { "domains_files": ["/work/d.lst"], "prefixes_files": ["/work/p.lst"] }, "out": "vpn" } ] }
+cat > /work/ex.yaml <<'J'
+version: 2
+lan: { addr: [10.99.0.0/24] }
+lists:
+  blk: { prefixes_file: /work/a.lst }
+  dom: { prefixes_file: /work/p.lst, domains_file: /work/d.lst }
+outputs:
+  vpn: { kind: interface, device: applynft0, on_fail: direct }
+rules:
+  - { name: blk, to: blk, out: vpn }
+  - { name: dom, to: dom, out: vpn }
 J
-E="--spec /work/ex.json --state-dir /tmp/ex"
+E="--spec /work/ex.yaml --state-dir /tmp/ex"
 steer apply $E >/dev/null 2>&1; echo "apply код $?"
 nft get element inet steer vpn_dom_n '{ 198.51.100.9 }' >/dev/null 2>&1; echo "nft get element код $?"
 steer explain 198.51.100.9 $E 2>&1 | head -3
@@ -95,14 +115,20 @@ check "explain не нашёл чужой адрес" "0" "$(steer explain 192.0
 
 echo "=== 5. резолвер и nat: клиент входит через TUN, как из LAN"
 printf 'example.com\n' > /work/d2.lst
-cat > /work/fn.json <<'J'
-{ "schema": 2, "from_default": ["10.99.0.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "device": "applynft0", "on_fail": "direct" },
-               "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
-  "channels": [ { "name": "d", "match": { "domains_files": ["/work/d2.lst"] }, "out": "vpn" },
-                { "name": "t", "match": { "prefixes_files": ["/work/dc.lst"] }, "out": "tg" } ] }
+cat > /work/fn.yaml <<'J'
+version: 2
+lan: { addr: [10.99.0.0/24] }
+lists:
+  d: { domains_file: /work/d2.lst }
+  t: { prefixes_file: /work/dc.lst }
+outputs:
+  vpn: { kind: interface, device: applynft0, on_fail: direct }
+  tg:  { kind: tgws, domain: ex.co.uk }
+rules:
+  - { name: d, to: d, out: vpn }
+  - { name: t, to: t, out: tg }
 J
-F="--spec /work/fn.json --state-dir /tmp/fn"
+F="--spec /work/fn.yaml --state-dir /tmp/fn"
 steer apply $F >/dev/null 2>&1; echo "apply код $?"
 dnstool serve 15363 10.99.0.1 & UP=$!
 steer dnsd $F --listen-port 5300 --upstream-port 15363 >/tmp/dnsd.log 2>&1 & DP=$!

@@ -151,24 +151,29 @@ UPR=$!
 # spec ФАЙЛ СПИСОК_P ON_FAIL_A СЕРВЕР_B ДОМЕННЫЕ_ФАЙЛЫ
 spec() {
     cat > "$tmp/$1" <<EOF
-{"schema":2,"from_default":["192.168.1.0/24"],"outputs":{
- "a":{"kind":"interface","device":"wga","on_fail":"$3",
-      "obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:5101"}},
- "b":{"kind":"interface","device":"wgb",
-      "obfs":{"mode":"wg-over-tcp","server":"$4","listen":"127.0.0.1:5102"}}},
- "channels":[{"name":"p","match":{"prefixes_file":"$tmp/$2"},"out":"a"},
-             {"name":"d","match":{"domains_files":[$5]},"out":"b"},
-             {"name":"r","match":{"domains_files":["$tmp/r.lst"],"mode":"realip"},"out":"b"}]}
+version: 2
+lan: { addr: [192.168.1.0/24] }
+lists:
+  p: { prefixes_file: $tmp/$2 }
+  d: { domains_file: [$5] }
+  r: { domains_file: $tmp/r.lst }
+outputs:
+  a: { kind: interface, device: wga, on_fail: $3, obfs: { server: 10.99.0.3:4443, listen: 127.0.0.1:5101 } }
+  b: { kind: interface, device: wgb, obfs: { server: $4, listen: 127.0.0.1:5102 } }
+rules:
+  - { name: p, to: p, out: a }
+  - { name: d, to: d, out: b }
+  - { name: r, to: r, out: b, resolve: realip }
 EOF
 }
-D1="\"$tmp/d1.lst\"" D12="\"$tmp/d1.lst\",\"$tmp/d2.lst\""
-spec S1.json p1.lst direct 10.99.0.3:4443 "$D1"
-spec S2.json p2.lst direct 10.99.0.3:4443 "$D1"
-spec S3.json p2.lst drop 10.99.0.3:4443 "$D1"
-spec S4.json p2.lst drop 10.99.0.4:4443 "$D1"
-spec S5.json p2.lst drop 10.99.0.4:4443 "$D12"
-spec S6.json p3.lst drop 10.99.0.4:4443 "$D12"
-cp "$tmp/S1.json" "$tmp/spec.json"
+D1="$tmp/d1.lst" D12="$tmp/d1.lst, $tmp/d2.lst"
+spec S1.yaml p1.lst direct 10.99.0.3:4443 "$D1"
+spec S2.yaml p2.lst direct 10.99.0.3:4443 "$D1"
+spec S3.yaml p2.lst drop 10.99.0.3:4443 "$D1"
+spec S4.yaml p2.lst drop 10.99.0.4:4443 "$D1"
+spec S5.yaml p2.lst drop 10.99.0.4:4443 "$D12"
+spec S6.yaml p3.lst drop 10.99.0.4:4443 "$D12"
+cp "$tmp/S1.yaml" "$tmp/spec.yaml"
 
 pid_of() { grep "^obfs $1 " "$tmp/log" | tail -1 | cut -d' ' -f3; }
 handle() { "$real_nft" -a list table inet steer 2>/dev/null | sed -n '1s/.*# handle \([0-9]*\).*/\1/p'; }
@@ -180,7 +185,7 @@ ip_changes() { [ -f "$tmp/ip.log" ] && grep -E 'route (replace|add|flush|del)|ru
                sed -n 's/.* table \([0-9]*\).*/\1/p' | sort -u | tr '\n' ' ' | sed 's/ $//'; }
 fresh() { : > "$tmp/nft.log"; : > "$tmp/ip.log"; }
 
-DARGS="daemon --supervise --socket $tmp/s.sock --spec $tmp/spec.json --state-dir $tmp/st
+DARGS="daemon --supervise --socket $tmp/s.sock --spec $tmp/spec.yaml --state-dir $tmp/st
     --dnsd-flag --listen-port --dnsd-flag 15411 --dnsd-flag --upstream-port --dnsd-flag 15475"
 # Свой /sys, как у daemonmatch: сверка маршрутов с ядром (шаг 2а) спрашивает, есть ли устройство
 # выхода (/sys/class/net), а /sys хоста о dummy этого сетевого пространства не знает. Не
@@ -201,7 +206,7 @@ TB=$(awk '$1 == "b" { print $3 }' "$tmp/st/registry")
 
 # ---- 1. первый apply — всё ---------------------------------------------------------------
 fresh
-r="$(ctl apply < "$tmp/S1.json")"
+r="$(ctl apply < "$tmp/S1.yaml")"
 check "первый apply: применён, набор правил и оба выхода" "0 true true [a,b] [] false" \
     "$(printf '%s' "$r" | j code | tr -d '\n') $(printf '%s' "$r" | j applied | tr -d '\n') $(ch "$r")"
 check "  одна транзакция nft" "1" "$(nft_loads)"
@@ -223,7 +228,7 @@ PA="$(pid_of a)" PB="$(pid_of b)" DN="$(dnsd_pid)" T0="$(tabs)"
 
 # ---- 2. та же спека — ничего ---------------------------------------------------------------
 fresh
-r="$(ctl apply < "$tmp/S1.json")"
+r="$(ctl apply < "$tmp/S1.yaml")"
 check "apply той же спеки: применён, changed пустой" "0 true false [] [] false" \
     "$(printf '%s' "$r" | j code | tr -d '\n') $(printf '%s' "$r" | j applied | tr -d '\n') $(ch "$r")"
 check "  nft не запускался ни разу" "0" "$(nft_runs)"
@@ -264,7 +269,7 @@ wait_for '[ "$(fk_file)" -ge 1 ]' 3
 check "  адрес — и в файле состояния резолвера" "yes" "$([ "$(fk_file)" -ge 1 ] && echo yes || echo no)"
 fresh
 T0="$(tabs)"
-r="$(ctl apply < "$tmp/S1.json")"
+r="$(ctl apply < "$tmp/S1.yaml")"
 check "новый fake-IP в файле состояния: apply той же спеки не заменяет набор правил" \
     "0 false [] [] false 0 $H1" \
     "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_runs) $(handle)"
@@ -292,7 +297,7 @@ rh="$("$real_nft" -a list chain inet steer prerouting_mark |
 check "  правило канала снято снаружи" "0" "$(has_rule)"
 fresh
 T0="$(tabs)"
-r="$(ctl apply < "$tmp/S1.json")"
+r="$(ctl apply < "$tmp/S1.yaml")"
 check "снятое правило канала: apply той же спеки ставит набор правил заново" "0 true [] [] false 1" \
     "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_loads)"
 check "  правило канала на месте, маршруты не тронуты" "1 " "$(has_rule) $(ip_changes)"
@@ -313,13 +318,13 @@ check "  fake-IP и real-ip — на месте" "1 1 1" "$(elems_back)"
 
 "$real_nft" add set inet steer junk '{ type ipv4_addr; }'
 fresh
-r="$(ctl apply < "$tmp/S1.json")"
+r="$(ctl apply < "$tmp/S1.yaml")"
 check "чужой набор в нашей таблице: набор правил заново, чужого нет" "true 1 0 $((DR0 + 3))" \
     "$(ch "$r" | awk '{print $1}') $(nft_loads) \
 $("$real_nft" list sets inet 2>/dev/null | grep -c 'set junk') $(drift_n)"
 
 fresh
-r="$(ctl apply < "$tmp/S1.json")"
+r="$(ctl apply < "$tmp/S1.yaml")"
 check "после сверки apply той же спеки — снова ничего" "0 false [] [] false 0" \
     "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_runs)"
 check "  маршруты не тронуты" "" "$(ip_changes)"
@@ -334,7 +339,7 @@ DE0="$(del_n)"
 check "элементы: подсеть адресного списка снята руками" "0" "$(in_set "$SET" '10\.1\.0\.0/16')"
 fresh
 T0="$(tabs)"
-r="$(ctl apply < "$tmp/S1.json")"
+r="$(ctl apply < "$tmp/S1.yaml")"
 check "  apply той же спеки ставит набор правил заново, подсеть на месте" "0 true [] [] false 1 1" \
     "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_loads) $(in_set "$SET" '10\.1\.0\.0/16')"
 check "  в журнале демона — почему" "$((DE0 + 1))" "$(del_n)"
@@ -353,14 +358,14 @@ check "  fake-IP и real-ip — на месте" "1 1 1" "$(elems_back)"
 # расхождение; элементы резолвера (выше, шаг 2) — нет.
 "$real_nft" add element inet steer b_dom "{ 10.88.0.1 }"
 fresh
-r="$(ctl apply < "$tmp/S1.json")"
+r="$(ctl apply < "$tmp/S1.yaml")"
 check "адрес без срока вне пула в доменном наборе: набор правил заново, адреса нет" \
     "true 1 0 $((DE0 + 3))" \
     "$(ch "$r" | awk '{print $1}') $(nft_loads) $(in_set b_dom '10\.88\.0\.1') $(del_n)"
 check "  fake-IP и real-ip — на месте" "1 1 1" "$(elems_back)"
 # Резолвер вернул свои элементы после замены — это не расхождение: apply той же спеки — ничего.
 fresh
-r="$(ctl apply < "$tmp/S1.json")"
+r="$(ctl apply < "$tmp/S1.yaml")"
 check "после сверки элементов apply той же спеки — снова ничего" "0 false [] [] false 0 $((DE0 + 3))" \
     "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_runs) $(del_n)"
 
@@ -370,7 +375,7 @@ route_n() { "$real_ip" $1 route show table "$2" 2>/dev/null | grep -c "^default 
 "$real_ip" rule del table "$TA"
 check "  маршрут и правило выхода a сняты снаружи" "0 0" "$(route_n -4 "$TA" wga) $(rule_n -4 "$TA")"
 fresh
-r="$(ctl apply < "$tmp/S1.json")"
+r="$(ctl apply < "$tmp/S1.yaml")"
 check "снятые маршрут и правило выхода: привязан заново только a, набор правил не тронут" \
     "0 false [a] [] false 0" \
     "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r") $(nft_loads)"
@@ -387,7 +392,7 @@ check "снятое правило IPv6 выхода b: reload привязыв�
 if [ "$SYSFS" = 1 ]; then
     "$real_ip" route del default dev wga table "$TA"
     fresh
-    r="$(ctl apply < "$tmp/S1.json")"
+    r="$(ctl apply < "$tmp/S1.yaml")"
     check "снятый маршрут выхода (правило на месте): привязан заново a" "false [a] 1" \
         "$(ch "$r" | awk '{print $1, $2}') $(route_n -4 "$TA" wga)"
 fi
@@ -399,7 +404,7 @@ T0="$(tabs)"
 
 # ---- 3. только канал ---------------------------------------------------------------------------
 fresh
-r="$(ctl apply < "$tmp/S2.json")"
+r="$(ctl apply < "$tmp/S2.yaml")"
 check "сменился только канал: набор правил, маршруты и помощники нет" "0 true [] [] false" \
     "$(printf '%s' "$r" | j code | tr -d '\n') $(ch "$r")"
 check "  одна транзакция nft, таблица новая" "1 yes" \
@@ -417,7 +422,7 @@ check "  real-ip: адрес из ответа снова в новом набо
 
 # ---- 4. режим отказа выхода a ----------------------------------------------------------------
 fresh
-r="$(ctl apply < "$tmp/S3.json")"
+r="$(ctl apply < "$tmp/S3.yaml")"
 check "сменился on_fail выхода a: привязан заново только a" "[a] []" \
     "$(ch "$r" | awk '{print $2, $3}')"
 check "  в ядре тронута только таблица a" "$TA" "$(ip_changes)"
@@ -425,7 +430,7 @@ check "  помощники — те же" "$PA $PB" "$(pid_of a) $(pid_of b)"
 
 # ---- 5. сервер обфускации выхода b ----------------------------------------------------------
 fresh
-r="$(ctl apply < "$tmp/S4.json")"
+r="$(ctl apply < "$tmp/S4.yaml")"
 check "сменился сервер обфускации b: перезапущен только его помощник" "[] [b]" \
     "$(ch "$r" | awk '{print $2, $3}')"
 wait_for '[ "$(pid_of b)" != "$PB" ]' 5
@@ -438,7 +443,7 @@ PB="$(pid_of b)"
 fresh
 sleep 0.3
 T0="$(tabs)"
-r="$(ctl apply < "$tmp/S5.json")"
+r="$(ctl apply < "$tmp/S5.yaml")"
 check "сменился состав доменного канала: резолверу новая таблица" "true" \
     "$(ch "$r" | awk '{print $4}')"
 wait_for '[ "$(tabs)" -gt "$T0" ]' 5
@@ -448,18 +453,18 @@ check "  резолвер — тот же процесс, таблицу пол�
 # ---- 7. отказ ядра -------------------------------------------------------------------------------
 H5="$(handle)"
 printf '999.1.1.1\n' > "$tmp/p3.lst"
-before="$(cksum < "$tmp/spec.json")"
+before="$(cksum < "$tmp/spec.yaml")"
 fresh
-r="$(ctl apply < "$tmp/S6.json")"
+r="$(ctl apply < "$tmp/S6.yaml")"
 check "отказ ядра: не применено, прежняя спека возвращена" "false false true" \
     "$(printf '%s' "$r" | j saved | tr -d '\n') $(printf '%s' "$r" | j applied | tr -d '\n') $(printf '%s' "$r" | j rolled_back)"
-check "  spec.json — прежний" "$before" "$(cksum < "$tmp/spec.json")"
+check "  spec.yaml — прежний" "$before" "$(cksum < "$tmp/spec.yaml")"
 check "  прежняя таблица в ядре на месте" "$H5 1" \
     "$(handle) $("$real_nft" list table inet steer | grep -c '10\.2\.0\.0/16')"
 kept="$(printf '%s' "$r" | j stderr | sed -n 's/.*(kept: \(.*\))$/\1/p')"
 [ -n "$kept" ] && rm -f "$kept"
 fresh
-r="$(ctl apply < "$tmp/S5.json")"
+r="$(ctl apply < "$tmp/S5.yaml")"
 check "  после отказа применённое забыто: следующий apply — всё" "true [a,b]" \
     "$(ch "$r" | awk '{print $1, $2}')"
 
@@ -488,14 +493,14 @@ while True:
 PY
 python3 "$tmp/feed.py" "$tmp/big.fifo" "$tmp/big.lst" "$tmp/go" &
 W=$!
-printf '{"schema":2,"from_default":["192.168.1.0/24"],"outputs":{"a":{"kind":"interface","device":"wga"}},"channels":[{"name":"p","match":{"prefixes_file":"%s"},"out":"a"}]}\n' \
-    "$tmp/big.fifo" > "$tmp/big.json"
-cp "$tmp/S1.json" "$tmp/spec2.json"
-STEER_CTL_ENABLED=0 "$BIN" daemon --socket "$tmp/s2.sock" --spec "$tmp/spec2.json" \
+printf 'version: 2\nlan: { addr: [192.168.1.0/24] }\nlists:\n  p: { prefixes_file: %s }\noutputs:\n  a: { kind: interface, device: wga }\nrules:\n  - { name: p, to: p, out: a }\n' \
+    "$tmp/big.fifo" > "$tmp/big.yaml"
+cp "$tmp/S1.yaml" "$tmp/spec2.yaml"
+STEER_CTL_ENABLED=0 "$BIN" daemon --socket "$tmp/s2.sock" --spec "$tmp/spec2.yaml" \
     --state-dir "$tmp/st2" 2>"$tmp/d2.err" &
 D2=$!
 wait_for '[ -S "$tmp/s2.sock" ]' 5
-"$BIN" ctl --socket "$tmp/s2.sock" apply < "$tmp/big.json" > "$tmp/big.out" 2>&1 &
+"$BIN" ctl --socket "$tmp/s2.sock" apply < "$tmp/big.yaml" > "$tmp/big.out" 2>&1 &
 AP=$!
 sleep 0.5
 t="$(python3 -c '

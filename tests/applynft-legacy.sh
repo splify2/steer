@@ -67,18 +67,22 @@ printf 'example.com\n' > "$tmp/d.lst"
 # Адресный список доменного канала: его префикс уходит в статическую половину набора.
 printf '198.51.100.0/24\n' > "$tmp/p.lst"
 printf 'real.io\n' > "$tmp/r.lst"
-cat > "$tmp/spec.json" <<EOF
-{ "schema": 2,
-  "from_default": ["127.0.0.0/8"],
-  "outputs": { "vpn": { "kind": "interface", "device": "applynft0", "on_fail": "direct" },
-               "geo": { "kind": "interface", "device": "applynft1", "on_fail": "direct" } },
-  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" },
-                { "name": "d", "match": { "domains_files": ["$tmp/d.lst"],
-                                          "prefixes_files": ["$tmp/p.lst"] }, "out": "vpn" },
-                { "name": "r", "match": { "domains_files": ["$tmp/r.lst"], "mode": "realip" },
-                  "out": "geo" } ] }
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+lan: { addr: [127.0.0.0/8] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+  d: { domains_file: $tmp/d.lst, prefixes_file: $tmp/p.lst }
+  r: { domains_file: $tmp/r.lst }
+outputs:
+  vpn: { kind: interface, device: applynft0, on_fail: direct }
+  geo: { kind: interface, device: applynft1, on_fail: direct }
+rules:
+  - { name: a, to: a, out: vpn }
+  - { name: d, to: d, out: vpn }
+  - { name: r, to: r, out: geo, resolve: realip }
 EOF
-S="--spec $tmp/spec.json --state-dir $tmp/state"
+S="--spec $tmp/spec.yaml --state-dir $tmp/state"
 
 # --- 1. Раскладка -----------------------------------------------------------------------------
 "$BIN" apply $S >/dev/null 2>"$tmp/err1"

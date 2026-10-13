@@ -132,13 +132,14 @@ stop_server() {
 }
 
 # ---- клиент ----------------------------------------------------------------------------------
-# write_sub ССЫЛКА: подписка и спека v1 с выходом hy (kind hysteria2).
+# write_sub ССЫЛКА: подписка и спека v2 с выходом hy (kind: tunnel, protocol: hysteria2).
 write_sub() {
     printf '%s\n' "$1" > "$WORK/sub.txt"
-    cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"hy":{"name":"hy","kind":"hysteria2","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
+    cat > "$WORK/spec.yaml" <<SPEC
+version: 2
+
+outputs:
+  hy: { kind: tunnel, protocol: hysteria2, subscription: $WORK/sub.txt, nodes: [0] }
 SPEC
 }
 mod() { nsc env LD_LIBRARY_PATH="$LIBS" "$MOD" "$@"; }
@@ -148,7 +149,7 @@ NW=2
 start_client() {
     stop_client
     rm -rf "$WORK/state"
-    ip netns exec "$NSC" env LD_LIBRARY_PATH="$LIBS" STEER_TUN_STATS=1 STEER_TUN_THREADS="$NW" "$MOD" hysteria2 hy --spec "$WORK/spec.json" \
+    ip netns exec "$NSC" env LD_LIBRARY_PATH="$LIBS" STEER_TUN_STATS=1 STEER_TUN_THREADS="$NW" "$MOD" hysteria2 hy --spec "$WORK/spec.yaml" \
         --state-dir "$WORK/state" > "$WORK/client.log" 2>&1 &
     CLI_PID=$!
     for _ in $(seq 60); do
@@ -177,11 +178,11 @@ echo "run-hy2: сервер $("$HY2" version 2>/dev/null | grep -i '^version' | 
 echo "1. авторизация"
 start_server "" || exit 1
 write_sub "$URI#ok"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --state-dir "$WORK/state" 2>&1)"
 contains "проба: узел принял" "$out" '"ok":true'
 contains "  и назвал задержку" "$out" '"handshake_ms":'
 write_sub "hysteria2://wrong@$SIP:4433/?insecure=1#bad"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --state-dir "$WORK/state" 2>&1)"
 contains "неверный пароль: отказ" "$out" '"ok":false'
 contains "  с причиной (HTTP-ответ маскировки)" "$out" 'отказал в авторизации (HTTP 404)'
 
@@ -269,14 +270,14 @@ check "salamander: файл прошёл" "$WANT_SHA" "$got"
 contains "  и журнал называет обфускацию" "$(cat "$WORK/client.log")" "Salamander"
 stop_client
 write_sub "$URI&obfs=salamander&obfs-password=wrongpass#s"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --timeout 4 --state-dir "$WORK/state" 2>&1)"
 contains "salamander: чужой пароль — отказ" "$out" '"ok":false'
 write_sub "$URI#plain"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --timeout 4 --state-dir "$WORK/state" 2>&1)"
 contains "salamander: сервер с obfs, клиент без — отказ" "$out" '"ok":false'
 start_server "" || exit 1
 write_sub "$URI&obfs=salamander&obfs-password=obfspass1#s"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --timeout 4 --state-dir "$WORK/state" 2>&1)"
 contains "salamander: клиент с obfs, сервер без — отказ" "$out" '"ok":false'
 
 # Gecko — Salamander плюс нарезка пакетов рукопожатия (extras/obfs эталона): рукопожатие, TCP и UDP
@@ -291,35 +292,35 @@ check "  и UDP (эхо 3000 байт)" "same" "$(udp_echo 3000)"
 contains "  журнал называет Gecko" "$(cat "$WORK/client.log")" "Gecko"
 stop_client
 write_sub "$URI&obfs=gecko&obfs-password=wrongpass#g"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --timeout 4 --state-dir "$WORK/state" 2>&1)"
 contains "gecko: чужой пароль — отказ" "$out" '"ok":false'
 write_sub "$URI&obfs=salamander&obfs-password=geckopass1#s"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --timeout 4 --state-dir "$WORK/state" 2>&1)"
 contains "gecko-сервер, клиент с salamander — отказ" "$out" '"ok":false'
 start_server "" || exit 1
 
 # ---- 4. pinSHA256 и проверка сертификата ---------------------------------------------------------
 echo "4. сертификат"
 write_sub "hysteria2://hunter2@$SIP:4433/?pinSHA256=$PIN&sni=hy2.test#pin"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --state-dir "$WORK/state" 2>&1)"
 contains "pinSHA256 верный: узел принят" "$out" '"ok":true'
 write_sub "hysteria2://hunter2@$SIP:4433/?pinSHA256=$(printf '%064d' 0)&sni=hy2.test#pin"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --state-dir "$WORK/state" 2>&1)"
 contains "pinSHA256 чужой: отказ" "$out" '"ok":false'
 contains "  с причиной" "$out" 'не совпал с pinSHA256'
 write_sub "hysteria2://hunter2@$SIP:4433/?sni=hy2.test#nocheck"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --state-dir "$WORK/state" 2>&1)"
 contains "самоподписанный без insecure и без отпечатка: отказ" "$out" '"ok":false'
 # sni — адрес, а не имя (так Xray раздаёт узлы с сертификатом на IP): SNI не уходит, сертификат
 # сверяется с SAN IP. Прежде клиент отказывал ещё до первого пакета («QUIC не открылся (-4)»), здесь
 # рукопожатие обязано дойти до проверки сертификата — самоподписанный без insecure она не пропускает.
 write_sub "hysteria2://hunter2@$SIP:4433/?sni=$SIP&alpn=h3#ipsni"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --state-dir "$WORK/state" 2>&1)"
 contains "sni=адрес: отказ проверкой сертификата" "$out" '"ok":false'
 case "$out" in *"QUIC не открылся"*) fail=$((fail + 1)); echo "  FAIL sni=адрес: QUIC не открылся до первого пакета";;
     *) pass=$((pass + 1)); echo "  ok   sni=адрес: QUIC открылся, SNI-адрес не роняет TLS";; esac
 write_sub "hysteria2://hunter2@$SIP:4433/?sni=$SIP&alpn=h3&pinSHA256=$PIN#ippin"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --spec "$WORK/spec.yaml" --state-dir "$WORK/state" 2>&1)"
 contains "sni=адрес и pinSHA256: узел принят" "$out" '"ok":true'
 # Хост — адрес, sni нет: имя сверяется с адресом (SAN IP), как у эталона (Go кладёт хост в ServerName,
 # адрес в нём — проверка по SAN IP). Прежде без sni у адреса имени не проверял никто, и годился
@@ -340,16 +341,16 @@ if [ -f /etc/ssl/certs/ca-certificates.crt ] && command -v unshare >/dev/null 2>
     TLS_EXTRA=", sniGuard: disable"
     start_server "" || exit 1
     write_sub "hysteria2://hunter2@$SIP:4433/#ipnosni"
-    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.yaml" --state-dir "$WORK/state" 2>&1)"
     contains "адрес без sni, в сертификате только имя: отказ" "$out" '"ok":false'
     write_sub "hysteria2://hunter2@$SIP:4433/?sni=hy2.test#dnsni"
-    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.yaml" --state-dir "$WORK/state" 2>&1)"
     contains "  тот же сервер с sni=hy2.test: принят (корни из своего файла)" "$out" '"ok":true'
     cp "$WORK/cert-ip.pem" "$WORK/cert.pem"; cp "$WORK/key-ip.pem" "$WORK/key.pem"
     start_server "" || exit 1
     TLS_EXTRA=""
     write_sub "hysteria2://hunter2@$SIP:4433/#ipsan"
-    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.yaml" --state-dir "$WORK/state" 2>&1)"
     contains "адрес без sni, адрес в SAN IP: принят" "$out" '"ok":true'
 else
     echo "  пропуск: нет /etc/ssl/certs/ca-certificates.crt или unshare — проверка имени по адресу"

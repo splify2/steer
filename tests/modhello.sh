@@ -63,17 +63,18 @@ H
 chmod +x "$tmp/mods/steer-vless"
 
 : > "$tmp/sub.txt"
-cat > "$tmp/spec.json" <<EOF
-{"schema":2,"from_default":["127.0.0.0/8"],"outputs":{
- "vl":{"kind":"vless","sub_file":"$tmp/sub.txt","on_fail":"direct"},
- "vf":{"kind":"vless","sub_file":"$tmp/sub.txt","on_fail":"direct"},
- "vn":{"kind":"vless","sub_file":"$tmp/sub.txt","on_fail":"direct"},
- "xm":{"kind":"xsteer","conf":"/etc/xm.conf","on_fail":"direct"}},
- "channels":[]}
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+lan: { addr: [127.0.0.0/8] }
+outputs:
+  vl: { kind: tunnel, protocol: vless, subscription: $tmp/sub.txt, on_fail: direct }
+  vf: { kind: tunnel, protocol: vless, subscription: $tmp/sub.txt, on_fail: direct }
+  vn: { kind: tunnel, protocol: vless, subscription: $tmp/sub.txt, on_fail: direct }
+  xm: { kind: xsteer, conf: /etc/xm.conf, on_fail: direct }
 EOF
 
 STEER_MODULE_DIR="$tmp/mods" "$XK" daemon --supervise --socket "$tmp/s.sock" \
-    --spec "$tmp/spec.json" --state-dir "$tmp/st" \
+    --spec "$tmp/spec.yaml" --state-dir "$tmp/st" \
     --dnsd-flag --listen-port --dnsd-flag 15511 --dnsd-flag --upstream-port --dnsd-flag 15575 \
     >"$tmp/d.out" 2>"$tmp/d.err" &
 D=$!

@@ -29,17 +29,24 @@ check() {
 
 printf '149.154.160.0/20\n91.108.4.0/22\n' > "$tmp/tg.lst"
 # Та же спека, что пишет /usr/sbin/tgws в brb: один выход kind=tgws и адресный канал на него.
-cat > "$tmp/spec.json" <<JSON
-{ "schema": 1,
-  "outputs": { "direct": { "kind": "direct" },
-               "tg": { "kind": "tgws", "domain": "kws.example.org", "on_fail": "drop" } },
-  "channels": [ { "name": "telegram", "match": { "prefixes_files": [ "$tmp/tg.lst" ] }, "out": "tg" } ] }
-JSON
+cat > "$tmp/spec.yaml" <<YAML
+version: 2
 
-full="$("$STEER" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-full" 2>&1)"
+lists:
+  telegram: { prefixes_file: [$tmp/tg.lst] }
+
+outputs:
+  direct: { kind: direct }
+  tg:     { kind: tgws, domain: kws.example.org }
+
+rules:
+  - { name: telegram, to: [telegram], out: tg }
+YAML
+
+full="$("$STEER" apply --dry-run --spec "$tmp/spec.yaml" --state-dir "$tmp/st-full" 2>&1)"
 check "полный движок: спека принята" "0" "$?"
 mini="$(STEER_NFT_TABLE=stgws STEER_MARK_ORDER=top \
-        "$SIM" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-mini" 2>&1)"
+        "$SIM" apply --dry-run --spec "$tmp/spec.yaml" --state-dir "$tmp/st-mini" 2>&1)"
 check "мини-сборка: спека принята" "0" "$?"
 
 # Маски. Полный движок чистит и ставит восемь бит с двадцатого; мини — только бит 28.
@@ -73,13 +80,20 @@ check "и у полного движка выход kind=tgws тоже не ме
 # цепочка видит единицы пакетов, и пересмотреть маршрут можно только по ней. Проверяется тут
 # же, потому что ошибиться легко в обе стороны, и «убрал лишнее» без этой строки означало бы
 # тихо снятую защиту on_fail=drop у туннелей.
-cat > "$tmp/spec-if.json" <<JSON
-{ "schema": 1,
-  "outputs": { "direct": { "kind": "direct" },
-               "vpn": { "kind": "interface", "device": "tun0", "on_fail": "drop" } },
-  "channels": [ { "name": "x", "match": { "prefixes_files": [ "$tmp/tg.lst" ] }, "out": "vpn" } ] }
-JSON
-ifout="$("$STEER" apply --dry-run --spec "$tmp/spec-if.json" --state-dir "$tmp/st-if" 2>&1)"
+cat > "$tmp/spec-if.yaml" <<YAML
+version: 2
+
+lists:
+  x: { prefixes_file: [$tmp/tg.lst] }
+
+outputs:
+  direct: { kind: direct }
+  vpn:    { kind: interface, device: tun0 }
+
+rules:
+  - { name: x, to: [x], out: vpn }
+YAML
+ifout="$("$STEER" apply --dry-run --spec "$tmp/spec-if.yaml" --state-dir "$tmp/st-if" 2>&1)"
 check "выход с устройством метит соединение как прежде" "1" \
     "$(printf '%s\n' "$ifout" | grep -c 'ct mark set mark')"
 
@@ -96,7 +110,7 @@ check "реестр полного движка: как прежде" "tg 100000
 mkdir -p "$tmp/st-old"
 printf 'tg 08000000 307\n' > "$tmp/st-old/registry"
 old="$(STEER_NFT_TABLE=stgws STEER_MARK_ORDER=top \
-       "$SIM" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-old" 2>&1)"
+       "$SIM" apply --dry-run --spec "$tmp/spec.yaml" --state-dir "$tmp/st-old" 2>&1)"
 check "метка из чужого диапазона в реестре не берётся" "1" \
     "$(printf '%s\n' "$old" | grep -c 'or 0x50000000')"
 check "и в реестре заменяется своей" "tg 10000000 316" "$(grep '^tg ' "$tmp/st-old/registry")"
@@ -106,11 +120,11 @@ check "и в реестре заменяется своей" "tg 10000000 316" "
 # её единственной меткой (steer_ingress_seen_ok, marks.h). Её разметка остаётся на prerouting,
 # а полный движок рядом уходит на ingress.
 imini="$(STEER_NFT_INGRESS=all STEER_NFT_TABLE=stgws STEER_MARK_ORDER=top \
-         "$SIM" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-mini" 2>&1)"
+         "$SIM" apply --dry-run --spec "$tmp/spec.yaml" --state-dir "$tmp/st-mini" 2>&1)"
 check "мини-сборка: разметка на ingress не ставится (в поле из бита нет места)" "0" \
     "$(printf '%s\n' "$imini" | grep -c 'hook ingress')"
 check "  и текст — прежний" "$mini" "$imini"
-ifull="$(STEER_NFT_INGRESS=all "$STEER" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-full" 2>&1)"
+ifull="$(STEER_NFT_INGRESS=all "$STEER" apply --dry-run --spec "$tmp/spec.yaml" --state-dir "$tmp/st-full" 2>&1)"
 check "полный движок рядом — на ingress" "1" "$(printf '%s\n' "$ifull" | grep -c 'hook ingress device "br-lan"')"
 
 printf '%d passed, %d failed\n' "$pass" "$fail"

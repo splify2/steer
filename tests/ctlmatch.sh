@@ -13,7 +13,7 @@
 #     busy, и после ухода первых четырёх сервер снова отвечает.
 #  4. Кого пускать: uid 65534 — denied (и отказ записан в журнал), uid из --allow-uid —
 #     пускается.
-#  5. apply: негодная спека не трогает spec.json и не оставляет временных файлов; годная при
+#  5. apply: негодная спека не трогает spec.yaml и не оставляет временных файлов; годная при
 #     выключенном движке сохраняется и не применяется; check ничего не сохраняет.
 #  6. reload: супервизор помощников получает SIGHUP и поднимает выход, добавленный в спеку.
 #  7. Файлы списков: put-file кладёт файл переименованием (прежний файл, на который держат
@@ -145,25 +145,29 @@ printf 'example.com\n' > "$tmp/d1.lst"
 printf 'example.org\n' > "$tmp/d2.lst"
 # spec ИМЯ [файл подсетей] [файлы доменов через запятую] — спека с выходом vpn на lo.
 spec() {
-    ch='{"name":"p","match":{"prefixes_files":["'"$2"'"]},"out":"vpn"}'
-    if [ -n "${3:-}" ]; then
-        dl=""; for f in $(echo "$3" | tr ',' ' '); do dl="$dl${dl:+,}\"$f\""; done
-        ch="$ch"',{"name":"'"${4:-d}"'","match":{"domains_files":['"$dl"'],"mode":"fakeip"},"out":"vpn"}'
-    fi
-    printf '{"schema":1,"from_default":["127.0.0.0/8"],"outputs":{"direct":{"kind":"direct"},'\
-'"vpn":{"kind":"interface","device":"lo"}},"channels":[%s]}\n' "$ch" > "$tmp/$1"
+    {
+        printf 'version: 2\nlan: { addr: [127.0.0.0/8] }\nlists:\n  p: { prefixes_file: "%s" }\n' "$2"
+        if [ -n "${3:-}" ]; then
+            printf '  %s: { domains_file: [%s] }\n' "${4:-d}" "$(echo "$3" | sed 's/,/, /g')"
+        fi
+        printf 'outputs:\n  direct: { kind: direct }\n  vpn: { kind: interface, device: lo }\nrules:\n'
+        printf '  - { name: p, to: p, out: vpn }\n'
+        if [ -n "${3:-}" ]; then
+            printf '  - { name: %s, to: %s, out: vpn }\n' "${4:-d}" "${4:-d}"
+        fi
+    } > "$tmp/$1"
 }
-spec A.json "$tmp/p1.lst"
-spec B.json "$tmp/p2.lst"
-printf '{"schema":1,"outputs":{"x":{"kind":"bogus"}},"channels":[]}\n' > "$tmp/bad.json"
-cp "$tmp/A.json" "$tmp/spec.json"
+spec A.yaml "$tmp/p1.lst"
+spec B.yaml "$tmp/p2.lst"
+printf 'version: 2\noutputs:\n  x: { kind: bogus }\n' > "$tmp/bad.yaml"
+cp "$tmp/A.yaml" "$tmp/spec.yaml"
 
 # Без root стенд сам — чужой uid для сервера: пускаем его явно, как пустили бы отладку.
 self_uid=""
 [ $ROOT = 1 ] || self_uid="--allow-uid $(id -u)"
 serve() {   # serve ВКЛЮЧЁН — поднять сервер заново
     [ -n "$SRV" ] && { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; }
-    STEER_CTL_ENABLED="$1" "$BIN" ctl-serve --socket "$tmp/s.sock" --spec "$tmp/spec.json" \
+    STEER_CTL_ENABLED="$1" "$BIN" ctl-serve --socket "$tmp/s.sock" --spec "$tmp/spec.yaml" \
         --state-dir "$tmp/state" --lists-dir "$tmp/lists" --allow-uid 65533 $self_uid \
         2>>"$tmp/serve.err" &
     SRV=$!
@@ -176,7 +180,7 @@ r="$(ctl version)"
 check "version: код 0" "0" "$(printf '%s' "$r" | j code)"
 check "version: тот же текст, что у steer version" "$("$BIN" version)" "$(printf '%s' "$r" | j stdout)"
 
-direct="$("$BIN" status --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>/dev/null | sed 's/"at":[0-9]*,//')"
+direct="$("$BIN" status --spec "$tmp/spec.yaml" --state-dir "$tmp/state" 2>/dev/null | sed 's/"at":[0-9]*,//')"
 r="$(ctl status)"
 check "status: код 0" "0" "$(printf '%s' "$r" | j code)"
 check "status: тот же JSON, что у подкоманды (без времени)" "$direct" \
@@ -184,14 +188,14 @@ check "status: тот же JSON, что у подкоманды (без врем
 r="$(ctl status fast)"
 check "status fast: запомненный ответ" "1" "$(printf '%s' "$r" | j stdout | grep -c '"cached":true')"
 
-"$BIN" diag --spec "$tmp/spec.json" --state-dir "$tmp/state" >/dev/null 2>&1; dcode=$?
+"$BIN" diag --spec "$tmp/spec.yaml" --state-dir "$tmp/state" >/dev/null 2>&1; dcode=$?
 r="$(ctl diag)"
 check "diag: тот же код, что у подкоманды" "$dcode" "$(printf '%s' "$r" | j code)"
 check "diag: stdout — JSON" "{" "$(printf '%s' "$r" | j stdout | head -c 1)"
 
 r="$(ctl explain 10.1.2.3)"
 check "explain: тот же ответ, что у подкоманды" \
-    "$("$BIN" explain 10.1.2.3 --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>/dev/null)" \
+    "$("$BIN" explain 10.1.2.3 --spec "$tmp/spec.yaml" --state-dir "$tmp/state" 2>/dev/null)" \
     "$(printf '%s' "$r" | j stdout)"
 
 r="$(ctl vless-nodes vpn)"
@@ -259,22 +263,22 @@ else
 fi
 
 # ---- 5. apply и check -------------------------------------------------------------------
-sum() { cksum < "$tmp/spec.json"; }
+sum() { cksum < "$tmp/spec.yaml"; }
 before="$(sum)"
-r="$(ctl check < "$tmp/bad.json")"
+r="$(ctl check < "$tmp/bad.yaml")"
 check "check негодной спеки: код 2 и причина" "2 1" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j stderr | grep -c 'kind')"
-check "check годной спеки: код 0" "0" "$(ctl check < "$tmp/B.json" | j code)"
+check "check годной спеки: код 0" "0" "$(ctl check < "$tmp/B.yaml" | j code)"
 check "check ничего не сохраняет" "$before" "$(sum)"
-r="$(ctl apply < "$tmp/bad.json")"
+r="$(ctl apply < "$tmp/bad.yaml")"
 check "apply негодной спеки: отказ, saved=false" "2 false false" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j saved) $(printf '%s' "$r" | j applied)"
-check "apply негодной спеки: spec.json не тронут" "$before" "$(sum)"
+check "apply негодной спеки: spec.yaml не тронут" "$before" "$(sum)"
 check "  и временных файлов не осталось" "0" "$(ls "$tmp" | grep -c 'ctl-')"
-r="$(ctl apply < "$tmp/B.json")"
+r="$(ctl apply < "$tmp/B.yaml")"
 check "apply при выключенном движке: сохранена, не применена" "0 true false false" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j saved) $(printf '%s' "$r" | j applied) $(printf '%s' "$r" | j enabled)"
-check "  spec.json — присланная спека" "$(cksum < "$tmp/B.json")" "$(sum)"
+check "  spec.yaml — присланная спека" "$(cksum < "$tmp/B.yaml")" "$(sum)"
 
 # ---- 6. reload: супервизору SIGHUP ------------------------------------------------------
 cat > "$tmp/helper" <<H
@@ -285,20 +289,17 @@ while :; do sleep 1; done
 H
 chmod +x "$tmp/helper"
 obfs_spec() {   # obfs_spec ВЫХОД... — спека супервизора с obfs у каждого выхода
-    printf '{"schema":2,"from_default":["192.168.1.0/24"],"outputs":{' > "$tmp/sup.json"
-    sep=""
+    printf 'version: 2\nlan: { addr: [192.168.1.0/24] }\noutputs:\n' > "$tmp/sup.yaml"
     for o in "$@"; do
-        printf '%s"%s":{"kind":"interface","device":"wg%s","obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:5%s"}}' \
-            "$sep" "$o" "${#o}" "$(printf '%04d' "${#o}")" >> "$tmp/sup.json"
-        sep=","
+        printf '  %s: { kind: interface, device: wg%s, obfs: { server: 10.99.0.3:4443, listen: 127.0.0.1:5%s } }\n' \
+            "$o" "${#o}" "$(printf '%04d' "${#o}")" >> "$tmp/sup.yaml"
     done
-    printf '},"channels":[]}\n' >> "$tmp/sup.json"
 }
 r="$(ctl reload)"
 check "reload без резолвера и супервизора: трогать некого" "0 none none" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j reload.dnsd) $(printf '%s' "$r" | j reload.outputs)"
 obfs_spec a
-STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/sup.json" 2>"$tmp/sup.err" &
+STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/sup.yaml" 2>"$tmp/sup.err" &
 SUP=$!
 wait_for 'grep -q "^obfs a " "$tmp/helper.log" 2>/dev/null' 5
 obfs_spec a bb
@@ -367,16 +368,16 @@ check "rm-file: removed=true, файла нет" "0 true no" \
 r="$(ctl rm-file big.lst)"
 check "rm-file повторно: код 0, removed=false" "0 false" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j removed)"
-check "rm-file с именем «../spec.json» — bad-request" "bad-request" "$(ctl rm-file ../spec.json | j error)"
-check "  спека на месте" "yes" "$([ -e "$tmp/spec.json" ] && echo yes || echo no)"
+check "rm-file с именем «../spec.yaml» — bad-request" "bad-request" "$(ctl rm-file ../spec.yaml | j error)"
+check "  спека на месте" "yes" "$([ -e "$tmp/spec.yaml" ] && echo yes || echo no)"
 # Файл, на который ссылается сохранённая спека, не удаляется.
-spec L.json "$L/yt.lst"
-cp "$tmp/spec.json" "$tmp/spec.keep"
-cp "$tmp/L.json" "$tmp/spec.json"
+spec L.yaml "$L/yt.lst"
+cp "$tmp/spec.yaml" "$tmp/spec.keep"
+cp "$tmp/L.yaml" "$tmp/spec.yaml"
 r="$(ctl rm-file yt.lst)"
 check "rm-file файла из сохранённой спеки — in-use, файл на месте" "in-use yes" \
     "$(printf '%s' "$r" | j error) $([ -e "$L/yt.lst" ] && echo yes || echo no)"
-cp "$tmp/spec.keep" "$tmp/spec.json"
+cp "$tmp/spec.keep" "$tmp/spec.yaml"
 check "rm-file после смены спеки — удалён" "true" "$(ctl rm-file yt.lst | j removed)"
 # Временный файл, брошенный убитым обработчиком, сервер убирает при старте.
 : > "$L/.put-stale1"
@@ -395,7 +396,7 @@ z = lambda x: re.sub(rb'"at":[0-9]+', b'"at":0', x)
 print("same" if a and z(a) == z(b) else "differ")
 PY
 same_status() {
-    "$BIN" status --spec "$tmp/spec.json" --state-dir "$tmp/state" > "$tmp/st.direct" 2>/dev/null
+    "$BIN" status --spec "$tmp/spec.yaml" --state-dir "$tmp/state" > "$tmp/st.direct" 2>/dev/null
     ctl status > "$tmp/st.mem"
     python3 "$tmp/same.py" "$tmp/st.direct" "$tmp/st.mem"
 }
@@ -403,13 +404,13 @@ check "status из памяти — байт в байт как у подком�
 
 # Подписчик, который читает (steer ctl печатает события по мере прихода). Подписка — на
 # спеке A, чтобы apply спеки B сменил отпечаток.
-ctl apply < "$tmp/A.json" >/dev/null
+ctl apply < "$tmp/A.yaml" >/dev/null
 "$BIN" ctl --socket "$tmp/s.sock" subscribe > "$tmp/sub1.out" 2>&1 &
 SUB1=$!
 wait_for 'grep -q "\"cmd\":\"subscribe\",\"code\":0" "$tmp/sub1.out" 2>/dev/null' 5
 check "subscribe: ответ с кодом 0 и отпечатком спеки" "1" \
     "$(head -n 1 "$tmp/sub1.out" | grep -c '"code":0,"spec":"[0-9a-f]\{16\}"')"
-ctl apply < "$tmp/B.json" >/dev/null
+ctl apply < "$tmp/B.yaml" >/dev/null
 wait_for 'grep -q "\"ev\":\"applied\",\"by\":\"apply\"" "$tmp/sub1.out"' 5
 check "subscribe: после apply — событие applied (движок выключен — enabled false)" "1" \
     "$(grep -c '^{"v":1,"ev":"applied","by":"apply","spec":"[0-9a-f]\{16\}","enabled":false,"changed":{"ruleset":false,"routing":\[\],"helpers":\[\],"dnsd":false}}$' "$tmp/sub1.out")"
@@ -419,24 +420,24 @@ check "  отпечаток — уже новой спеки" "yes" \
 check "status из памяти после apply — новая спека, байт в байт" "same" "$(same_status)"
 check "  в ответе канал новой спеки" "1" "$(ctl status | j stdout | grep -c 'p2.lst\|"lists":1')"
 check "explain из памяти — тот же ответ, что у подкоманды" \
-    "$("$BIN" explain 10.2.3.4 --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>/dev/null)" \
+    "$("$BIN" explain 10.2.3.4 --spec "$tmp/spec.yaml" --state-dir "$tmp/state" 2>/dev/null)" \
     "$(ctl explain 10.2.3.4 | j stdout)"
 check "explain: не адрес и не имя — тот же отказ, что у подкоманды" \
-    "2 $("$BIN" explain 1.2.3.4:5 --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>&1)" \
+    "2 $("$BIN" explain 1.2.3.4:5 --spec "$tmp/spec.yaml" --state-dir "$tmp/state" 2>&1)" \
     "$(r="$(ctl explain 1.2.3.4:5)"; printf '%s %s' "$(printf '%s' "$r" | j code)" "$(printf '%s' "$r" | j stderr)")"
 ctl reload >/dev/null
 wait_for 'grep -q "\"by\":\"reload\"" "$tmp/sub1.out"' 5
 check "subscribe: после reload — applied от reload" "1" \
     "$(grep -c '"ev":"applied","by":"reload"' "$tmp/sub1.out")"
-cp "$tmp/spec.json" "$tmp/spec.good"
-printf '{"schema":1,' > "$tmp/spec.json"
+cp "$tmp/spec.yaml" "$tmp/spec.good"
+printf '{"version":2,' > "$tmp/spec.yaml"
 r="$(ctl reload)"
 wait_for 'grep -q "spec-error" "$tmp/sub1.out"' 5
 check "reload негодной спеки: spec-error с причиной" "1" \
     "$(grep -c '^{"v":1,"ev":"spec-error","by":"reload","message":".\+"}$' "$tmp/sub1.out")"
 check "  а status отвечает по последней годной" "0 1" \
     "$(ctl status | j code) $(ctl status | j stdout | grep -c '"lists":1')"
-cp "$tmp/spec.good" "$tmp/spec.json"
+cp "$tmp/spec.good" "$tmp/spec.yaml"
 ctl reload >/dev/null
 
 # Тишина: подписчик подключён, запросов нет — демон спит без срока. Меряется счётчиком
@@ -496,8 +497,8 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && [ -n "$real_nft" ] && ip link set lo up 2>/d
    "$real_nft" add table inet ctlmatch_probe 2>/dev/null; then
     "$real_nft" delete table inet ctlmatch_probe
     serve 1
-    spec D.json "$tmp/p1.lst" "$tmp/d1.lst" "Мои сайты"
-    r="$(ctl apply < "$tmp/D.json")"
+    spec D.yaml "$tmp/p1.lst" "$tmp/d1.lst" "my-sites"
+    r="$(ctl apply < "$tmp/D.yaml")"
     check "apply при включённом движке: применена" "0 true true" \
         "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j saved) $(printf '%s' "$r" | j applied)"
     check "  таблица движка в ядре" "0" "$("$real_nft" list table inet steer >/dev/null 2>&1; echo $?)"
@@ -566,7 +567,7 @@ ipv6 udp 41001 vpn - cnt" "$(printf '%s\n' "$out" | grep -v '^total')"
     kill $CPY 2>/dev/null; wait $CPY 2>/dev/null
     "$real_nft" delete table inet ctt
 
-    "$BIN" dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state" \
+    "$BIN" dnsd --spec "$tmp/spec.yaml" --state-dir "$tmp/state" \
         --fakeip-state "$tmp/state/fakeip" 2>"$tmp/dnsd.err" &
     DNSD=$!
     wait_for '[ -s "$tmp/state/dnsd.sig" ]' 5
@@ -597,7 +598,7 @@ PY
     check "dns-log: код 0, резолвер работает" "0 true" \
         "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j stdout | j running)"
     check "  имена с каналом, выходом и счётчиком (UDP и TCP вместе)" \
-"example.com Мои сайты vpn 3
+"example.com my-sites vpn 3
 nomatch.test null null 1
 only-tcp.test null null 1" \
         "$(printf '%s' "$r" | j stdout | python3 -c 'import json,sys; [print(n["name"], n["channel"] or "null", n["out"] or "null", n["count"]) for n in sorted(json.load(sys.stdin)["names"], key=lambda n: n["name"])]')"
@@ -608,14 +609,14 @@ only-tcp.test null null 1" \
     # Путь файла подсетей в подписи тоже есть (список может нести и домены, и подсети), поэтому
     # меняется содержимое, а не имя.
     printf 'example.com\nexample.net\n' > "$tmp/d1.lst"
-    r="$(ctl apply < "$tmp/D.json")"
+    r="$(ctl apply < "$tmp/D.yaml")"
     check "apply без смены доменных каналов: резолверу HUP" "0 hup" \
         "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j reload.dnsd)"
     sleep 0.5
     check "  резолвер жив и перечитал списки" "yes 2" \
         "$(kill -0 $DNSD 2>/dev/null && echo yes || echo no) $(grep -c 'channel .*rule(s)' "$tmp/dnsd.err")"
-    spec D3.json "$tmp/p1.lst" "$tmp/d1.lst,$tmp/d2.lst" "Мои сайты"
-    r="$(ctl apply < "$tmp/D3.json")"
+    spec D3.yaml "$tmp/p1.lst" "$tmp/d1.lst,$tmp/d2.lst" "my-sites"
+    r="$(ctl apply < "$tmp/D3.yaml")"
     check "apply со сменой состава доменных каналов: резолверу перезапуск" "0 restart" \
         "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j reload.dnsd)"
     wait_for '! kill -0 $DNSD 2>/dev/null' 5
@@ -626,11 +627,11 @@ only-tcp.test null null 1" \
 
     touch "$tmp/failnft"
     before="$(sum)"
-    r="$(ctl apply < "$tmp/B.json")"
+    r="$(ctl apply < "$tmp/B.yaml")"
     check "отказ ядра: apply не прошёл, прежняя спека возвращена" "false false true" \
         "$(printf '%s' "$r" | j saved) $(printf '%s' "$r" | j applied) $(printf '%s' "$r" | j rolled_back)"
     check "  код не 0" "yes" "$([ "$(printf '%s' "$r" | j code)" != 0 ] && echo yes || echo no)"
-    check "  spec.json — прежняя" "$before" "$(sum)"
+    check "  spec.yaml — прежняя" "$before" "$(sum)"
     check "  временных файлов не осталось" "0" "$(ls "$tmp" | grep -c 'ctl-')"
     rm -f "$tmp/failnft"
     "$BIN" down --state-dir "$tmp/state" >/dev/null 2>&1
@@ -672,6 +673,8 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && command -v nsenter >/dev/null 2>&1 &&
     ip link set sw1 up; ip link set sw2 up
     ip addr add 10.9.1.1/24 dev sw1; ip addr add 10.9.2.1/24 dev sw2
     mkdir -p "$tmp/wstate"
+    # Пул devices — выход спеки v1 (в v2 это группа из выходов-членов, у неё другие события и
+    # другой файл active), поэтому сторож пула проверяется на спеке v1.
     printf '{"schema":1,"outputs":{"vpn":{"kind":"interface","devices":["sw1","sw2"],"on_fail":"drop"}},'\
 '"channels":[{"name":"p","match":{"prefixes_files":["%s"]},"out":"vpn"}]}\n' "$tmp/p1.lst" > "$tmp/w.json"
     WD="" WU="" WSUB=""

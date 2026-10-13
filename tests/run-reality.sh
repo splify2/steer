@@ -69,10 +69,11 @@ cat > "$W/server.json" <<CFG
 CFG
 
 printf '%s\n' "vless://$UUID@10.90.0.1:18443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=chrome#local" > "$W/sub.txt"
-cat > "$W/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$W/sub.txt","node":0}},
- "channels":[]}
+cat > "$W/spec.yaml" <<SPEC
+version: 2
+
+outputs:
+  vl: { kind: tunnel, protocol: vless, subscription: $W/sub.txt, nodes: [0] }
 SPEC
 
 "$SB" run -c "$W/server.json" > "$W/srv.log" 2>&1 &
@@ -81,7 +82,7 @@ sleep 2
 grep -q "tcp server started" "$W/srv.log" || { echo "сервер не поднялся:"; tail -5 "$W/srv.log"; exit 1; }
 
 ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" vless vl \
-    --spec "$W/spec.json" --state-dir "$W/state" > "$W/tun.log" 2>&1 &
+    --spec "$W/spec.yaml" --state-dir "$W/state" > "$W/tun.log" 2>&1 &
 for _ in $(seq 40); do
     ip netns exec "$NS" ip link show vl >/dev/null 2>&1 && break
     sleep 0.2

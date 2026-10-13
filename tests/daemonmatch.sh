@@ -233,18 +233,19 @@ printf '10.2.0.0/16\n' > "$tmp/p2.lst"
 printf 'swap.test\n' > "$tmp/d1.lst"
 # spec СЕРВЕР_O [ВТОРОЙ_КАНАЛ]
 spec() {
-    extra=""
-    [ -n "${2:-}" ] && extra=",{\"name\":\"q\",\"match\":{\"prefixes_files\":[\"$tmp/p2.lst\"]},\"out\":\"vpn\"}"
-    cat > "$tmp/spec.json" <<EOF
-{"schema":2,"from_default":["192.168.1.0/24"],"outputs":{
- "vpn":{"kind":"interface","devices":["sw1","sw2"],"on_fail":"drop"},
- "o":{"kind":"interface","device":"sw3",
-      "obfs":{"mode":"wg-over-tcp","server":"$1","listen":"127.0.0.1:5101"}}},
- "channels":[{"name":"p","match":{"prefixes_files":["$tmp/p1.lst"]},"out":"vpn"},
-             {"name":"d","match":{"domains_files":["$tmp/d1.lst"]},"out":"o"}$extra]}
-EOF
+    {
+        printf 'version: 2\nlan: { addr: [192.168.1.0/24] }\nlists:\n  p: { prefixes_file: %s/p1.lst }\n' "$tmp"
+        printf '  d: { domains_file: %s/d1.lst }\n' "$tmp"
+        [ -n "${2:-}" ] && printf '  q: { prefixes_file: %s/p2.lst }\n'  "$tmp"
+        printf 'outputs:\n  vpn: { kind: group, pick: order, members: [vpn.sw1, vpn.sw2] }\n'
+        printf '  o: { kind: interface, device: sw3, obfs: { server: %s, listen: 127.0.0.1:5101 } }\n' "$1"
+        printf '  vpn.sw1: { kind: interface, device: sw1 }\n  vpn.sw2: { kind: interface, device: sw2 }\n'
+        printf 'rules:\n  - { name: p, to: p, out: vpn }\n  - { name: d, to: d, out: o }\n'
+        [ -n "${2:-}" ] && printf '  - { name: q, to: q, out: vpn }\n'
+        return 0
+    } > "$tmp/spec.yaml"
 }
-S="--spec $tmp/spec.json --state-dir $tmp/st"
+S="--spec $tmp/spec.yaml --state-dir $tmp/st"
 STEER_SOCKET="$tmp/steer.sock"
 export STEER_SOCKET
 c() { "$BIN" "$@" $S; }                                  # клиент к демону стенда
@@ -300,16 +301,16 @@ check "  тот же ответ, что у движка без демона (п�
     "$(printf '%s' "$r2" | nostamp)" "$(printf '%s' "$r1" | nostamp)"
 check "  explain через демон — тот же вывод" "$(STEER_SOCKET=/nonexistent "$BIN" explain 10.1.2.3 $S)" \
     "$(STEER_ENGINE=/bin/false "$BIN" explain 10.1.2.3 $S)"
-cp "$tmp/spec.json" "$tmp/other.json"
-STEER_ENGINE=/bin/false "$BIN" status --spec "$tmp/other.json" --state-dir "$tmp/st" >/dev/null 2>&1
+cp "$tmp/spec.yaml" "$tmp/other.yaml"
+STEER_ENGINE=/bin/false "$BIN" status --spec "$tmp/other.yaml" --state-dir "$tmp/st" >/dev/null 2>&1
 check "  чужая спека — движку, не демону" "1" "$?"
-STEER_ENGINE=/bin/false "$BIN" status --spec "$tmp/spec.json" >/dev/null 2>&1
+STEER_ENGINE=/bin/false "$BIN" status --spec "$tmp/spec.yaml" >/dev/null 2>&1
 check "  чужой каталог состояния — движку" "1" "$?"
 
 # apply через клиент: новый канал — через демон (сверка), вывод и код подкоманды.
 spec 10.99.0.3:4443 q
 out="$(STEER_ENGINE=/bin/false "$BIN" apply $S 2>"$tmp/a.err")"; rc=$?
-check "apply через клиент: код 0, вывод подкоманды" "0 steer: applied 3 channel(s), 2 output(s)" "$rc $out"
+check "apply через клиент: код 0, вывод подкоманды" "0 steer: applied 3 channel(s), 4 output(s)" "$rc $out"
 check "  применил демон" "1" "$(grep -c 'ctl: спека применена$' "$tmp/d.err")"
 # Соседние подсети в наборе склеены в интервал: 10.1.0.0/16 и 10.2.0.0/16 — 10.1.0.0-10.2.255.255.
 check "  подсеть нового канала — в наборе выхода в ядре" "1" \
@@ -323,7 +324,7 @@ check "apply --dry-run — движку (компилятор), не демон�
 ip link set sw1 down
 wait_for 'grep "\"ev\":\"switched\"" "$tmp/sub.out" | grep -q "\"why\":\"down\""' 15
 check "устройство упало — switched у подписчика" \
-    '{"v":1,"ev":"switched","out":"vpn","from":"sw1","to":"sw2","why":"down"}' \
+    '{"v":1,"ev":"switched","out":"vpn","from":"sw1","to":"sw2","why":"down","member":"vpn.sw2"}' \
     "$(grep '"ev":"switched"' "$tmp/sub.out" | grep '"why":"down"')"
 check "  status через клиент — новое устройство" "sw2" "$(dev)"
 
@@ -349,9 +350,9 @@ rule_of() { m=$(awk -v o="$1" '$1 == o { print $2 }' "$tmp/st/registry"); ip rul
 reps() { grep -c '"ev":"repaired"' "$tmp/sub.out"; }
 tvpn=$(awk '$1 == "vpn" { print $3 }' "$tmp/st/registry")
 n0=$(ours)
-check "страж правил: у выходов vpn и o по правилу" "2" "$n0"
+check "страж правил: у выходов vpn, o и членов группы vpn по правилу" "4" "$n0"
 ip rule del fwmark "$(rule_of vpn)" table "$tvpn"
-check "  ip rule del — правила vpn нет" "1" "$(ours)"
+check "  ip rule del — правила vpn нет" "3" "$(ours)"
 t0=$(date +%s%N)
 wait_for '[ "$(ours)" = "$n0" ]' 5
 ms=$(( ($(date +%s%N) - t0) / 1000000 ))
@@ -371,25 +372,19 @@ ms=$(( ($(date +%s%N) - t0) / 1000000 ))
 check "  через ≤ 3 с оба на месте" "yes" "$([ "$(ours)" = "$n0" ] && [ $ms -le 3000 ] && echo yes || echo "no:$ms ms, $(ours)")"
 wait_for '[ "$(reps)" = 2 ]' 3
 sleep 2
-check "  на пачку — одна починка, с обоими выходами" '{"v":1,"ev":"repaired","outputs":["vpn","o"],"masq":false}' \
+check "  на пачку — одна починка, с обоими выходами" '{"v":1,"ev":"repaired","outputs":["vpn","o","vpn.sw1","vpn.sw2"],"masq":false}' \
     "$(grep '"ev":"repaired"' "$tmp/sub.out" | tail -n +2)"
 check "  таблица vpn не перепривязана (устройство то же)" "sw2" "$(dev)"
 # Свой apply: выход o убран — его правило и таблицу снимает сверка (--drop). Не починка.
-cp "$tmp/spec.json" "$tmp/spec-o.json"
-python3 - "$tmp/spec.json" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
-del d["outputs"]["o"]
-d["channels"] = [c for c in d["channels"] if c["out"] != "o"]
-json.dump(d, open(sys.argv[1], "w"))
-PY
+cp "$tmp/spec.yaml" "$tmp/spec-o.yaml"
+sed -i '/^  o: /d; /^  d: /d; /name: d,/d' "$tmp/spec.yaml"
 out="$(STEER_ENGINE=/bin/false "$BIN" apply $S 2>&1)"; rc=$?
-check "свой apply (выход o убран): код 0, правило o снято" "0 1" "$rc $(ours)"
+check "свой apply (выход o убран): код 0, правило o снято" "0 3" "$rc $(ours)"
 sleep 3
 check "  repaired не пришло" "2" "$(reps)"
-cp "$tmp/spec-o.json" "$tmp/spec.json"
+cp "$tmp/spec-o.yaml" "$tmp/spec.yaml"
 STEER_ENGINE=/bin/false "$BIN" apply $S >/dev/null 2>&1
-check "  выход o вернули apply — правило снова стоит" "2" "$(ours)"
+check "  выход o вернули apply — правило снова стоит" "4" "$(ours)"
 sleep 6   # проход сторожа после apply (выходы изменились) — до steer down, а не посреди него
 
 # steer down движком при живом демоне (так снимает правила init): таблиц и правил нет — не починка.
@@ -446,15 +441,24 @@ check "steer-tools fit — инструмент работает" "10.0.0.0/23" 
 # ребёнка `steerd diag` и ещё около двадцати (nft, pgrep, ip, пробы `nft -c`).
 mkdir -p "$tmp/st4"
 ip link set sw1 up
-printf '{"schema":2,"from_default":["192.168.1.0/24"],"outputs":{"vpn":{"kind":"interface","device":"sw1","on_fail":"drop"}},'\
-'"channels":[{"name":"p","match":{"prefixes_files":["%s"]},"out":"vpn"},'\
-'{"name":"d","match":{"domains_files":["%s"]},"out":"vpn"}]}\n' "$tmp/p1.lst" "$tmp/d1.lst" > "$tmp/spec4.json"
+cat > "$tmp/spec4.yaml" <<EOF
+version: 2
+lan: { addr: [192.168.1.0/24] }
+lists:
+  p: { prefixes_file: $tmp/p1.lst }
+  d: { domains_file: $tmp/d1.lst }
+outputs:
+  vpn: { kind: interface, device: sw1, on_fail: drop }
+rules:
+  - { name: p, to: p, out: vpn }
+  - { name: d, to: d, out: vpn }
+EOF
 "$real_nft" add table inet fw4
 "$real_nft" add chain inet fw4 srcnat '{ type nat hook postrouting priority srcnat; policy accept; }'
 "$real_nft" add chain inet fw4 srcnat_vpn
 "$real_nft" add rule inet fw4 srcnat oifname '"sw1"' jump srcnat_vpn
 "$real_nft" add rule inet fw4 srcnat_vpn meta nfproto ipv4 masquerade
-S4="--spec $tmp/spec4.json --state-dir $tmp/st4"
+S4="--spec $tmp/spec4.yaml --state-dir $tmp/st4"
 STEER_SUPERVISE_EXE="$tmp/helper" unshare -m -p -f sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" \
     daemon --watch --watch-period 3 --supervise --apply --socket \"$tmp/s4.sock\" $S4 \
     --dnsd-flag --listen-port --dnsd-flag $LPORT --dnsd-flag --upstream-port --dnsd-flag $UPORT" \
@@ -538,17 +542,13 @@ check "  проход ставит набор правил демона зано
 $([ "$(handle4)" != "$H1" ] && echo yes || echo no)"
 # Свои замены набора правил — не расхождение: apply новой спеки (канал прибавился и убавился)
 # шесть раз подряд, пока идут проходы по периоду 3 с.
-cp "$tmp/spec4.json" "$tmp/spec4.bak"
-python3 - "$tmp/spec4.json" "$tmp/p2.lst" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
-d["channels"].append({"name": "q", "match": {"prefixes_files": [sys.argv[2]]}, "out": "vpn"})
-json.dump(d, open(sys.argv[1] + ".q", "w"))
-PY
+cp "$tmp/spec4.yaml" "$tmp/spec4.bak"
+sed -e "/^lists:/a\\  q: { prefixes_file: $tmp/p2.lst }" "$tmp/spec4.yaml" > "$tmp/spec4.yaml.q"
+echo '  - { name: q, to: q, out: vpn }' >> "$tmp/spec4.yaml.q"
 n0=$(grep -c 'разошёлся с поставленным' "$tmp/d4.err")
 i=0 ok=0
 while [ $i -lt 6 ]; do
-    if [ $((i % 2)) = 0 ]; then cp "$tmp/spec4.json.q" "$tmp/spec4.json"; else cp "$tmp/spec4.bak" "$tmp/spec4.json"; fi
+    if [ $((i % 2)) = 0 ]; then cp "$tmp/spec4.yaml.q" "$tmp/spec4.yaml"; else cp "$tmp/spec4.bak" "$tmp/spec4.yaml"; fi
     c4 apply >/dev/null 2>&1 && ok=$((ok + 1))
     sleep 1.3
     i=$((i + 1))
@@ -607,10 +607,17 @@ kill "$D"; wait "$DU" 2>/dev/null; D=""
 # ---- выключенный движок: ноль пробуждений ----
 # Свой выход на sw1 и своё состояние; выключатель — файл (шов стенда вместо свойства телефона).
 mkdir -p "$tmp/st3"
-printf '{"schema":2,"outputs":{"vpn":{"kind":"interface","device":"sw1","on_fail":"drop"}},'\
-'"channels":[{"name":"p","match":{"prefixes_files":["%s"]},"out":"vpn"}]}\n' "$tmp/p1.lst" > "$tmp/spec3.json"
+cat > "$tmp/spec3.yaml" <<EOF
+version: 2
+lists:
+  p: { prefixes_file: $tmp/p1.lst }
+outputs:
+  vpn: { kind: interface, device: sw1, on_fail: drop }
+rules:
+  - { name: p, to: p, out: vpn }
+EOF
 ip link set sw1 up
-S3="--spec $tmp/spec3.json --state-dir $tmp/st3"
+S3="--spec $tmp/spec3.yaml --state-dir $tmp/st3"
 echo 0 > "$tmp/enabled"
 csw() { awk '/^voluntary_ctxt_switches/{print $2}' "/proc/$D/status"; }
 c3() { "$BIN" ctl --socket "$tmp/s3.sock" "$@"; }

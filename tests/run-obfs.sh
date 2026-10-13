@@ -134,10 +134,13 @@ s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 51821
 while True:
     d, a = s.recvfrom(2000); s.sendto(b"echo:" + d, a)' &
 PIDS="$PIDS $!"
-cat >"$WORK/spec2.json" <<'J'
-{"schema":1,"from_default":["192.168.1.0/24"],"outputs":{"wg":{"kind":"interface","device":"wg0","obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:51820"}}},"channels":[]}
+cat >"$WORK/spec2.yaml" <<'J'
+version: 2
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+outputs:
+  wg: { kind: interface, device: wg0, obfs: { server: 10.99.0.3:4443, listen: 127.0.0.1:51820 } }
 J
-run_steer "$C" "$WORK/cli2.log" obfs wg --spec "$WORK/spec2.json"
+run_steer "$C" "$WORK/cli2.log" obfs wg --spec "$WORK/spec2.yaml"
 CLI2=$LAST
 sleep 1
 ans=$(ip netns exec "$C" python3 -c '
@@ -153,8 +156,11 @@ ip netns exec "$C" nft delete table inet steer_obfs 2>/dev/null
 # ---- в. пауза перед переподключением ---------------------------------------------------
 # Порт 4444 никто не слушает: ядро сервера отвечает RST на каждый SYN. SYN считает сырой
 # сокет в пространстве сервера.
-cat >"$WORK/spec3.json" <<'J'
-{"schema":1,"from_default":["192.168.1.0/24"],"outputs":{"wr":{"kind":"interface","device":"wg0","obfs":{"mode":"wg-over-tcp","server":"10.99.0.1:4444","listen":"127.0.0.1:51830"}}},"channels":[]}
+cat >"$WORK/spec3.yaml" <<'J'
+version: 2
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+outputs:
+  wr: { kind: interface, device: wg0, obfs: { server: 10.99.0.1:4444, listen: 127.0.0.1:51830 } }
 J
 ip netns exec "$S" python3 -c '
 import socket, struct, time
@@ -169,7 +175,7 @@ while time.time() < end:
 print(n)' >"$WORK/syn.out" &
 CNT=$!
 sleep 0.3
-run_steer "$C" "$WORK/cli3.log" obfs wr --spec "$WORK/spec3.json"
+run_steer "$C" "$WORK/cli3.log" obfs wr --spec "$WORK/spec3.yaml"
 CLI3=$LAST
 sleep 3
 kill "$CLI3" 2>/dev/null

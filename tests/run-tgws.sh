@@ -82,16 +82,24 @@ ip netns exec "$NSR" ip addr add "$DCIP/32" dev dc0
 ip netns exec "$NSR" ip link set dc0 up
 
 printf '%s/32\n' "$DCIP" > "$tmp/tg.lst"
-cat > "$tmp/spec.json" <<EOF
-{ "schema": 1, "lan_devices": ["veth-r"],
-  "outputs": { "direct": { "kind": "direct" },
-               "tg": { "kind": "tgws", "domain": "stand.invalid" } },
-  "channels": [ { "name": "телеграм", "match": { "prefixes_file": "$tmp/tg.lst" },
-                  "out": "tg" } ] }
+cat > "$tmp/spec.yaml" <<EOF
+version: 2
+
+lan: { devices: [veth-r] }
+
+lists:
+  rule1: { prefixes_file: [$tmp/tg.lst] }
+
+outputs:
+  direct: { kind: direct }
+  tg:     { kind: tgws, domain: stand.invalid }
+
+rules:
+  - { name: "телеграм", to: [rule1], out: tg }
 EOF
 
 # ---- правила перехвата ------------------------------------------------------------------
-out="$(ip netns exec "$NSR" "$BIN" apply --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>&1)" || {
+out="$(ip netns exec "$NSR" "$BIN" apply --spec "$tmp/spec.yaml" --state-dir "$tmp/state" 2>&1)" || {
     echo "apply не прошёл:"; echo "$out"; exit 1; }
 rules="$(ip netns exec "$NSR" nft list table inet steer 2>/dev/null || true)"
 check "цепочка перехвата встала в ядро" "1" \
@@ -108,7 +116,7 @@ sleep 1
 
 ip netns exec "$NSR" env STEER_TGWS_PLAIN=1 STEER_TGWS_ENDPOINT="127.0.0.1:$WSPORT" \
     STEER_TGWS_DCMAP=/dev/null \
-    "$BIN" tgws tg --spec "$tmp/spec.json" --state-dir "$tmp/state" > "$tmp/tgws.log" 2>&1 &
+    "$BIN" tgws tg --spec "$tmp/spec.yaml" --state-dir "$tmp/state" > "$tmp/tgws.log" 2>&1 &
 sleep 1
 check "мост поднялся и слушает" "1" \
       "$(grep -c "жду перехваченные соединения на :$PORT" "$tmp/tgws.log" || true)"
@@ -143,7 +151,7 @@ check "метка транспорта не подменяется" "yes" \
 rm -f "$tmp/report"
 ip netns exec "$NSR" ip addr add 149.154.199.199/32 dev dc0
 printf '149.154.199.199/32\n' >> "$tmp/tg.lst"
-ip netns exec "$NSR" "$BIN" apply --spec "$tmp/spec.json" --state-dir "$tmp/state" >/dev/null 2>&1
+ip netns exec "$NSR" "$BIN" apply --spec "$tmp/spec.yaml" --state-dir "$tmp/state" >/dev/null 2>&1
 ip netns exec "$NSC" timeout 8 python3 tests/tgws-client.py --host 149.154.199.199 \
     --port "$DCPORT" --word x >/dev/null 2>&1 || true
 check "чужой адрес назван и не перехвачен" "yes" \

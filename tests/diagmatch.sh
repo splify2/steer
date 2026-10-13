@@ -61,25 +61,25 @@ check() {
 # проверок больше» превращалось в «4 больше 0» — истинное при любом поведении движка.
 spec() {
     if [ "$2" = "vless" ]; then
-        outdef='"vpn": { "kind": "vless", "sub_file": "/etc/steer/sub.json", "on_fail": "drop" }'
+        outdef='vpn: { kind: tunnel, protocol: vless, subscription: /etc/steer/sub.json, on_fail: drop }'
     else
-        outdef='"vpn": { "kind": "interface", "devices": ["wg0"], "on_fail": "drop" }'
+        outdef='vpn: { kind: interface, device: wg0, on_fail: drop }'
     fi
     # Локальное устройство здесь `lo`, а не `br-lan`, и это не описка. diag проверяет
     # перечисленные устройства по /sys/class/net, и `br-lan` в окружении стенда не
     # существует — то есть КАЖДАЯ фикстура несла бы лишний warn, а две проверки ниже стоят
     # ровно на том, что счётчик warn остаётся нулём. `lo` есть везде, включая контейнер
     # сборки. Сама проверка «устройства нет» стоит отдельным блоком в конце файла.
-    cat > "$tmp/$1.json" <<EOF
-{
-  "schema": 1,
-  "lan_device": "lo",
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { $outdef, "direct": { "kind": "direct" } },
-  "channels": [
-    { "name": "cloudflare", "match": { "prefixes_files": ["$tmp/cf.lst"] }, "out": "vpn" }
-  ]
-}
+    cat > "$tmp/$1.yaml" <<EOF
+version: 2
+lan: { devices: [lo], addr: [192.168.1.0/24] }
+lists:
+  cloudflare: { prefixes_file: $tmp/cf.lst }
+outputs:
+  $outdef
+  direct: { kind: direct }
+rules:
+  - { name: cloudflare, to: cloudflare, out: vpn }
 EOF
 }
 echo '104.16.0.0/13' > "$tmp/cf.lst"
@@ -91,7 +91,7 @@ count() { tr ',' '\n' | grep -c '"id":'; }
 
 # ---- отчёт вообще собирается ------------------------------------------------
 spec iface interface
-out="$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null)"
+out="$($DIAG diag --spec "$tmp/iface.yaml" 2>/dev/null)"
 check "отчёт начинается со schema" "1" "$(printf '%s' "$out" | sed -n 's/.*"schema":\([0-9]*\).*/\1/p')"
 check "таблица найдена" "ok" "$(printf '%s' "$out" | verdict table)"
 check "встречная цепочка найдена" "ok" "$(printf '%s' "$out" | verdict down_chain)"
@@ -104,7 +104,7 @@ check "встречная цепочка найдена" "ok" "$(printf '%s' "$o
 # Проверка осталась, но с обратным ожиданием: пусто. Так поломка «заметку вернули вместе с
 # копипастой» будет видна сразу.
 spec vless vless
-outv="$($DIAG diag --spec "$tmp/vless.json" 2>/dev/null)"
+outv="$($DIAG diag --spec "$tmp/vless.yaml" 2>/dev/null)"
 check "выход vless: про UDP молчим (UDP поддержан)" "" "$(printf '%s' "$outv" | verdict udp)"
 check "выход interface: про UDP молчим" "" "$(printf '%s' "$out" | verdict udp)"
 
@@ -115,7 +115,7 @@ check "выход interface: про UDP молчим" "" "$(printf '%s' "$out" |
 # пару адрес-порт, а DNS берёт новый порт на каждый запрос: имя разрешается ценой отдельного
 # рукопожатия с узлом. Поэтому заметка осталась, а приговор стал мягче.
 echo '1.1.1.0/24' >> "$tmp/cf.lst"
-outr="$($DIAG diag --spec "$tmp/vless.json" 2>/dev/null)"
+outr="$($DIAG diag --spec "$tmp/vless.yaml" 2>/dev/null)"
 check "резолвер в списке: сказано" "note" "$(printf '%s' "$outr" | verdict resolver)"
 check "назван сам адрес" "1" \
       "$(printf '%s' "$outr" | grep -c '1\.1\.1\.0/24' || true)"
@@ -124,22 +124,22 @@ check "назван сам адрес" "1" \
 check "note не идёт в счётчик warn" "0" "$(printf '%s' "$outr" | sed -n 's/.*"warn":\([0-9]*\).*/\1/p')"
 
 # Выход-устройство несёт UDP ядром, своих потоков к узлу там нет — говорить не о чем.
-outri="$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null)"
+outri="$($DIAG diag --spec "$tmp/iface.yaml" 2>/dev/null)"
 check "выход interface: про резолвер молчим" "" "$(printf '%s' "$outri" | verdict resolver)"
 
 # С доменными правилами есть перенаправление DNS, и цену платят только клиенты вне
 # from_default. Приговор тот же note, но текст другой — проверяем, что он про перенаправление.
 echo 'example.com' > "$tmp/dom.lst"
-sed 's#"prefixes_files": \["'"$tmp"'/cf.lst"\]#"prefixes_files": ["'"$tmp"'/cf.lst"], "domains_files": ["'"$tmp"'/dom.lst"]#' \
-    "$tmp/vless.json" > "$tmp/vless-dom.json"
-outrd="$($DIAG diag --spec "$tmp/vless-dom.json" 2>/dev/null)"
+sed 's#prefixes_file: '"$tmp"'/cf.lst }#prefixes_file: '"$tmp"'/cf.lst, domains_file: '"$tmp"'/dom.lst }#' \
+    "$tmp/vless.yaml" > "$tmp/vless-dom.yaml"
+outrd="$($DIAG diag --spec "$tmp/vless-dom.yaml" 2>/dev/null)"
 check "есть редирект DNS: он и назван" "1" \
       "$(printf '%s' "$outrd" | grep -c 'from_default прикрывает' || true)"
 
 # Список без резолверов — молчим: иначе метка станет постоянной.
 grep -v '^1\.1\.1\.0/24$' "$tmp/cf.lst" > "$tmp/cf-clean.lst"
-sed "s#$tmp/cf.lst#$tmp/cf-clean.lst#" "$tmp/vless.json" > "$tmp/vless-clean.json"
-outrc="$($DIAG diag --spec "$tmp/vless-clean.json" 2>/dev/null)"
+sed "s#$tmp/cf.lst#$tmp/cf-clean.lst#" "$tmp/vless.yaml" > "$tmp/vless-clean.yaml"
+outrc="$($DIAG diag --spec "$tmp/vless-clean.yaml" 2>/dev/null)"
 check "список без резолверов: молчим" "" "$(printf '%s' "$outrc" | verdict resolver)"
 
 # ---- отчёт остаётся разбираемым --------------------------------------------
@@ -172,7 +172,7 @@ check "  у интерфейса (IPv6 есть) её нет" "" "$(printf '%s' 
 # источником лжи — «проверяю узлы» навсегда после убитого процесса.
 mkdir -p "$tmp/state"
 probe() { printf '%s\n' "$1" > "$tmp/state/probe-vpn"; }
-dg() { $DIAG diag --spec "$tmp/vless.json" --state-dir "$tmp/state" 2>/dev/null; }
+dg() { $DIAG diag --spec "$tmp/vless.yaml" --state-dir "$tmp/state" 2>/dev/null; }
 # what у проверки с данным id — им и отличаются три случая одного «устройства нет».
 what() { sed -n 's/.*{"id":"output","verdict":"[a-z]*","what":"\([^"]*\)".*/\1/p' | head -1; }
 
@@ -217,7 +217,7 @@ check "неразбираемый файл читается как «не зна
 
 # ---- то же поле в status: интерфейс не должен гадать -------------------------
 probe "probing 7 26 $$ $(date +%s)"
-st() { $DIAG status --spec "$tmp/vless.json" --state-dir "$tmp/state" 2>/dev/null; }
+st() { $DIAG status --spec "$tmp/vless.yaml" --state-dir "$tmp/state" 2>/dev/null; }
 check "status несёт ход перебора" "1" \
       "$(st | grep -c '"probe":{"state":"probing","node":7,"total":26}')"
 probe "failed 0 26 999999 $(date +%s)"
@@ -235,10 +235,10 @@ check "нечего сказать — поля нет вовсе" "0" "$(st | g
 # применяя спеку; ровно тем же приёмом отличается движок с lan_devices.
 check "status: выбор узлов есть и пустым" "1" \
       "$(st | grep -c '"nodes":\[\]')"
-sed 's/"on_fail": "drop"/"on_fail": "drop", "nodes": [6, 7, 12]/' \
-    "$tmp/vless.json" > "$tmp/vless-nodes.json"
+sed 's/on_fail: drop }/on_fail: drop, nodes: [6, 7, 12] }/' \
+    "$tmp/vless.yaml" > "$tmp/vless-nodes.yaml"
 check "status: выбранные узлы в порядке предпочтения" "1" \
-      "$($DIAG status --spec "$tmp/vless-nodes.json" 2>/dev/null | grep -c '"nodes":\[6,7,12\]')"
+      "$($DIAG status --spec "$tmp/vless-nodes.yaml" 2>/dev/null | grep -c '"nodes":\[6,7,12\]')"
 # У выхода без подписки поля нет вовсе: кандидаты kind=interface — устройства, и пустой
 # `nodes` рядом с ними читался бы как «узлы есть, но не выбраны».
 #
@@ -247,7 +247,7 @@ check "status: выбранные узлы в порядке предпочте�
 # по одному имени с появлением перечня стал бы вечнозелёным и перестал бы стеречь то, ради
 # чего заведён.
 check "status: у выхода-интерфейса поля нет" "0" \
-      "$($DIAG status --spec "$tmp/iface.json" 2>/dev/null | grep -c '"nodes":')"
+      "$($DIAG status --spec "$tmp/iface.yaml" 2>/dev/null | grep -c '"nodes":')"
 
 # ---- локальные устройства: перечислено одно, а на роутере его нет (splify2#16) -----
 #
@@ -256,23 +256,24 @@ check "status: у выхода-интерфейса поля нет" "0" \
 # «правило есть, устройства нет» означает «правило не сработает ни разу», и у человека,
 # опечатавшегося в имени, картина ровно та же, что у исправной настройки. Отвечает на это
 # diag, и вот чем именно.
-cat > "$tmp/lan.json" <<EOF
-{
-  "schema": 1,
-  "lan_devices": ["lo", "нетакого0"],
-  "outputs": { "vpn": { "kind": "interface", "devices": ["wg0"] }, "direct": { "kind": "direct" } },
-  "channels": [
-    { "name": "cloudflare", "match": { "prefixes_files": ["$tmp/cf.lst"] }, "out": "vpn" }
-  ]
-}
+cat > "$tmp/lan.yaml" <<EOF
+version: 2
+lan: { devices: [lo, нетакого0] }
+lists:
+  cloudflare: { prefixes_file: $tmp/cf.lst }
+outputs:
+  vpn: { kind: interface, device: wg0 }
+  direct: { kind: direct }
+rules:
+  - { name: cloudflare, to: cloudflare, out: vpn }
 EOF
 # Имя с кириллицей до /sys/class/net не доходит: состав имени проверяется при загрузке
 # спеки, потому что оно уходит и в текст правил, и в командные строки.
 check "негодное имя устройства — отказ загрузки" "2" \
-      "$($DIAG diag --spec "$tmp/lan.json" >/dev/null 2>&1; echo $?)"
+      "$($DIAG diag --spec "$tmp/lan.yaml" >/dev/null 2>&1; echo $?)"
 
-sed -i 's/"нетакого0"/"zt7bcxxxxx"/' "$tmp/lan.json"
-outl="$($DIAG diag --spec "$tmp/lan.json" 2>/dev/null)"
+sed -i 's/нетакого0/zt7bcxxxxx/' "$tmp/lan.yaml"
+outl="$($DIAG diag --spec "$tmp/lan.yaml" 2>/dev/null)"
 # Приговор общий по проверке: первым идёт `lo`, он есть, поэтому ok; отсутствующее
 # устройство ищем по тексту, а не по первому приговору.
 check "существующее устройство — ok" "1" \
@@ -285,7 +286,7 @@ check "отсутствие устройства — не поломка" "0" \
       "$(printf '%s' "$outl" | grep -c '{"id":"lan_device","verdict":"fail"')"
 # И то же поле в status: интерфейсу нужно знать, с чего забирается трафик, не читая спеку.
 check "status перечисляет локальные устройства" "1" \
-      "$($DIAG status --spec "$tmp/lan.json" 2>/dev/null | grep -c '"lan_devices":\["lo","zt7bcxxxxx"\]')"
+      "$($DIAG status --spec "$tmp/lan.yaml" 2>/dev/null | grep -c '"lan_devices":\["lo","zt7bcxxxxx"\]')"
 
 # ---- br_netfilter: кадры внутри моста идут через ip-хуки netfilter -----------
 #
@@ -303,18 +304,18 @@ check "status перечисляет локальные устройства" "1
 #
 # Путь к sysctl берётся из STEER_BRIDGE_NF, иначе стенду нечего проверять: загрузить модуль в
 # контейнере сборки нельзя, а приговор обязан стеречься так же, как остальные.
-cat > "$tmp/nobr.json" <<EOF
-{
-  "schema": 1,
-  "lan_device": "lo",
-  "from_default": ["192.168.1.0/24"],
-  "outputs": { "vpn": { "kind": "interface", "devices": ["wg0"] }, "direct": { "kind": "direct" } },
-  "channels": [
-    { "name": "cloudflare", "match": { "prefixes_files": ["$tmp/cf-clean.lst"] }, "out": "vpn" }
-  ]
-}
+cat > "$tmp/nobr.yaml" <<EOF
+version: 2
+lan: { devices: [lo], addr: [192.168.1.0/24] }
+lists:
+  cloudflare: { prefixes_file: $tmp/cf-clean.lst }
+outputs:
+  vpn: { kind: interface, device: wg0 }
+  direct: { kind: direct }
+rules:
+  - { name: cloudflare, to: cloudflare, out: vpn }
 EOF
-dgb() { STEER_BRIDGE_NF="$1" $DIAG diag --spec "$tmp/nobr.json" 2>/dev/null; }
+dgb() { STEER_BRIDGE_NF="$1" $DIAG diag --spec "$tmp/nobr.yaml" 2>/dev/null; }
 
 # Модуль не загружен — файла нет вовсе. Это хорошее состояние, и сказать о нём надо: «нечего
 # не сказано» человек читает как «не проверяли».
@@ -353,22 +354,19 @@ check "мусор в файле: молчим" "" "$(dgb "$tmp/brnf" | verdict b
 nft add table inet fw4
 nft add chain inet fw4 forward_lan
 nft add rule inet fw4 forward_lan oifname '"lo"' accept
-cat > "$tmp/pool.json" <<EOF
-{
-  "schema": 1,
-  "lan_devices": ["zt7bcxxxxx"],
-  "from_default": ["192.168.1.0/24"],
-  "outputs": {
-    "loc": { "kind": "vless", "sub_file": "/etc/steer/sub.json", "device": "lo" },
-    "pool": { "kind": "interface", "devices": ["lo"], "on_fail": "drop" },
-    "direct": { "kind": "direct" }
-  },
-  "channels": [
-    { "name": "cloudflare", "match": { "prefixes_files": ["$tmp/cf.lst"] }, "out": "pool" }
-  ]
-}
+cat > "$tmp/pool.yaml" <<EOF
+version: 2
+lan: { devices: [zt7bcxxxxx], addr: [192.168.1.0/24] }
+lists:
+  cloudflare: { prefixes_file: $tmp/cf.lst }
+outputs:
+  loc: { kind: tunnel, protocol: vless, subscription: /etc/steer/sub.json, device: lo }
+  pool: { kind: interface, device: lo, on_fail: drop }
+  direct: { kind: direct }
+rules:
+  - { name: cloudflare, to: cloudflare, out: pool }
 EOF
-outp="$($DIAG diag --spec "$tmp/pool.json" 2>/dev/null)"
+outp="$($DIAG diag --spec "$tmp/pool.yaml" 2>/dev/null)"
 check "пул: устройство туннеля в зоне" "1" \
       "$(printf '%s' "$outp" | grep -c '"what":"выход pool: устройство lo в зоне"')"
 check "пул: masquerade не требуется" "0" \
@@ -440,27 +438,27 @@ check "без отказа: failed нет" "0" \
 nft add element inet steer vpn_ip '{ 104.16.0.0/13, 1.1.1.0/24, 9.9.9.9 }'
 want="$(nft list set inet steer vpn_ip | tr ',' '\n' | grep -c '[0-9]\.[0-9]')"
 check "набор: адресов в ядре — столько, сколько элементов печатает nft" "1" \
-      "$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null | grep -c "\"verdict\":\"ok\",\"what\":\"канал vpn_ip: адресов в ядре $want\"")"
+      "$($DIAG diag --spec "$tmp/iface.yaml" 2>/dev/null | grep -c "\"verdict\":\"ok\",\"what\":\"канал vpn_ip: адресов в ядре $want\"")"
 
 # ---- резолвер жив — по /proc своего пространства PID -----------------------------
-check "резолвера нет — fail" "fail" "$($DIAG diag --spec "$tmp/vless-dom.json" 2>/dev/null | verdict dnsd)"
+check "резолвера нет — fail" "fail" "$($DIAG diag --spec "$tmp/vless-dom.yaml" 2>/dev/null | verdict dnsd)"
 mkdir -p "$tmp/fake"
 printf '#!/bin/sh\nsleep 30\n' > "$tmp/fake/steer"
 chmod +x "$tmp/fake/steer"
 "$tmp/fake/steer" dnsd &
 FPID=$!
 sleep 0.2
-check "процесс «…/steer dnsd» есть — ok" "ok" "$($DIAG diag --spec "$tmp/vless-dom.json" 2>/dev/null | verdict dnsd)"
+check "процесс «…/steer dnsd» есть — ok" "ok" "$($DIAG diag --spec "$tmp/vless-dom.yaml" 2>/dev/null | verdict dnsd)"
 kill "$FPID" 2>/dev/null
 wait "$FPID" 2>/dev/null
 
 # ---- IPv6 наружу — маршрут по умолчанию в таблице main -------------------------
-check "маршрута IPv6 нет — проверки нет" "" "$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null | verdict ipv6)"
+check "маршрута IPv6 нет — проверки нет" "" "$($DIAG diag --spec "$tmp/iface.yaml" 2>/dev/null | verdict ipv6)"
 if ip link add d6 type dummy 2>/dev/null && ip link set d6 up && ip -6 route add default dev d6 2>/dev/null; then
     # С 1.9 правила разбирают IPv6 сами (выход с IPv6 ведёт его своей таблицей, on_fail=drop
     # действует на оба семейства) — прежний fail «каналы IPv6 не разбирают» снят.
     check "маршрут IPv6 есть — ok, правила его разбирают" "ok" \
-          "$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null | verdict ipv6)"
+          "$($DIAG diag --spec "$tmp/iface.yaml" 2>/dev/null | verdict ipv6)"
     ip link del d6
 else
     echo "diagmatch: dummy-устройства или IPv6 нет — проверка IPv6 пропущена"
@@ -511,12 +509,12 @@ fi
 # группе), а diag видел только «есть ли /sys/class/net/<имя>» и шёл дальше к зоне и NAT: на
 # выключенном wg0 отчёт молчал о главном. Теперь — отказ «устройство выключено».
 if ip link add wg0 type dummy 2>/dev/null; then
-    outd="$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null)"
+    outd="$($DIAG diag --spec "$tmp/iface.yaml" 2>/dev/null)"
     check "устройство down: отказ" "fail" "$(printf '%s' "$outd" | verdict output)"
     check "устройство down: так и названо" "1" \
           "$(printf '%s' "$outd" | grep -c '"what":"выход vpn: устройство wg0 выключено')"
     ip link set wg0 up
-    outu="$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null)"
+    outu="$($DIAG diag --spec "$tmp/iface.yaml" 2>/dev/null)"
     check "устройство поднято: про «выключено» молчим" "0" \
           "$(printf '%s' "$outu" | grep -c 'выключено')"
     ip link del wg0

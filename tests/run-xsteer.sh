@@ -112,13 +112,16 @@ chmod 600 "$WORK"/*.conf
 # проверяет туннель, а не маршрутизацию по правилам.
 spec() {   # $1 — имя выхода, $2 — путь к конфигурации, $3 — куда писать
     cat > "$3" <<EOF
-{"schema":1,"lan_device":"lo","from_default":["10.77.0.0/24"],
- "outputs":{"$1":{"kind":"xsteer","conf":"$2"}},
- "channels":[]}
+version: 2
+
+lan: { devices: [lo], addr: [10.77.0.0/24] }
+
+outputs:
+  $1: { kind: xsteer, conf: $2 }
 EOF
 }
-spec vpna "$WORK/a.conf" "$WORK/a.json"
-spec vpnb "$WORK/b.conf" "$WORK/b.json"
+spec vpna "$WORK/a.conf" "$WORK/a.yaml"
+spec vpnb "$WORK/b.conf" "$WORK/b.yaml"
 
 # ---- запуск ------------------------------------------------------------------
 # Перепроверка пути — раз в три секунды вместо двух минут: стенду надо УВИДЕТЬ, как пир
@@ -133,10 +136,10 @@ ip netns exec $NSH "$HUB" xsteer-hub --config "$WORK/hub.conf" \
     --state-dir "$WORK/state-hub" > "$WORK/hub.log" 2>&1 &
 HUBPID=$!
 sleep 0.6
-ip netns exec $NSA "$EXT" xsteer vpna --spec "$WORK/a.json" \
+ip netns exec $NSA "$EXT" xsteer vpna --spec "$WORK/a.yaml" \
     --state-dir "$WORK/state-a" > "$WORK/a.log" 2>&1 &
 APID=$!
-ip netns exec $NSB "$EXT" xsteer vpnb --spec "$WORK/b.json" \
+ip netns exec $NSB "$EXT" xsteer vpnb --spec "$WORK/b.yaml" \
     --state-dir "$WORK/state-b" > "$WORK/b.log" 2>&1 &
 
 # Ждём рукопожатий: их видно и в журнале хаба, и в файле состояния пира.
