@@ -345,6 +345,12 @@ if [ -x "$XK" ]; then
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec lo.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | sed -n '/chain postrouting_guard/,/^    }/p' | grep -q 'oifname "lo" return'; then ok; else
         bad "страж меток пропускает lo при перенаправлении TCP к модулю" "$(echo "$out" | sed -n '/chain postrouting_guard/,/^    }/p' | head -n 8)"; fi
+    # spec convert --json: та же спека JSON-объектом; YAML → JSON → YAML — тот же текст, JSON — неподвижная точка,
+    # спека читается и со стандартного ввода (--spec -).
+    (cd "$tmp" && "$XKA" spec convert --spec pl8.yaml > j1.yaml && "$XKA" spec convert --json --spec j1.yaml > j.json &&
+        "$XKA" spec convert --spec - < j.json > j2.yaml && "$XKA" spec convert --json --spec - < j.json > j2.json) 2>/dev/null
+    if cmp -s "$tmp/j1.yaml" "$tmp/j2.yaml" && cmp -s "$tmp/j.json" "$tmp/j2.json" && grep -q '^{"version":2,' "$tmp/j.json" &&
+       grep -q '"tolerance":0' "$tmp/j.json"; then ok; else bad "spec convert --json — круг YAML → JSON → YAML" "$(cat "$tmp/j.json" 2>&1 | head -c 300)"; fi
 else
     bad "не собран $XK (make build/steer-xk)"
 fi

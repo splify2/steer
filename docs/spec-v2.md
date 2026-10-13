@@ -2,7 +2,7 @@
 
 Спека v2 — формат, который ядро читает наряду с JSON со `schema: 1|2` (спека v1,
 [docs/contract-v1.md](contract-v1.md)). Во что спека разбирается — разделы 3 и 4в
-[docs/architecture.md](architecture.md); здесь — все ключи, умолчания и отказы. Разбор — `src/model/v2.c`, печать (`steer spec convert`) — `src/model/v2print.c`,
+[docs/architecture.md](architecture.md); здесь — все ключи, умолчания и отказы. Разбор — `src/model/v2.c`, печать (`steer spec convert`; `--json` — та же спека JSON-объектом с теми же ключами, `--spec -` — со стандартного ввода) — `src/model/v2print.c`,
 стенд — `tests/v2match.sh`.
 
 ## Формат и файл
