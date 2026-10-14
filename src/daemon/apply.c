@@ -64,6 +64,16 @@ static void routing6_drop(unsigned mark, int table) {
     rule_drop6(mark, table);
     route6_flush(table);
 }
+/* Выход целиком: правило метки, таблица IPv4, затем половина IPv6. Порядок один для уборки
+ * прежнего реестра, down и снятия по списку drop. */
+static void routing_drop(unsigned mark, int table) {
+    char t[16];
+    snprintf(t, sizeof(t), "%d", table);
+    rule_drop(mark, table);
+    const char *flush[] = { "ip", "route", "flush", "table", t, NULL };
+    run(flush);
+    routing6_drop(mark, table);
+}
 /* Прежний реестр — по записи на выход, сколько их было; растёт (раньше — 16 записей, и хвост
  * реестра не убирался: правила выходов за шестнадцатым переживали удаление выхода). */
 static struct oldreg *g_oldreg;
@@ -104,12 +114,7 @@ static void cleanup_stale_routing(const struct spec *sp) {
                 break;
             }
         if (live) continue;
-        char table[16];
-        snprintf(table, sizeof(table), "%d", g_oldreg[i].table);
-        rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
-        const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
-        run(flush);
-        routing6_drop(g_oldreg[i].mark, g_oldreg[i].table);
+        routing_drop(g_oldreg[i].mark, g_oldreg[i].table);
     }
 }
 
@@ -168,12 +173,7 @@ int cmd_down(void) {
     }
     registry_snapshot();
     for (size_t i = 0; i < g_oldreg_n; i++) {
-        char table[16];
-        snprintf(table, sizeof(table), "%d", g_oldreg[i].table);
-        rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
-        const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
-        run(flush);
-        routing6_drop(g_oldreg[i].mark, g_oldreg[i].table);
+        routing_drop(g_oldreg[i].mark, g_oldreg[i].table);
     }
     /* Правило и таблица пробы сторожа. Сторож снимает их сам при выходе, но init Android гасит
      * сервис SIGKILL (без gentle_kill — сразу, с ним — через 200 мс), и уборка при выходе может
@@ -1151,12 +1151,7 @@ int cmd_apply_commit(int argc, char **argv) {
             for (size_t k = 0; k < cfg.out_n; k++)
                 if (out_needs_mark(&cfg.out[k]) && cfg.out[k].mark == mark) live = 1;
             if (!live) {
-                char t[16];
-                snprintf(t, sizeof(t), "%d", table);
-                rule_drop(mark, table);
-                const char *flush[] = { "ip", "route", "flush", "table", t, NULL };
-                run(flush);
-                routing6_drop(mark, table);
+                routing_drop(mark, table);
             }
         }
         const char *e = strchr(p, ',');
