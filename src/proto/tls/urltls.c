@@ -160,11 +160,16 @@ static int measure(const struct urltls_work *w, char *why, size_t wn) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
     if (set_timeo(fd, deadline)) { WHY("срок вышел до рукопожатия TLS"); goto fail; }
 
+    /* В ALPN — только http/1.1 (alpn_http11): с обычной парой «h2, http/1.1» сервер вправе выбрать h2,
+     * и Google и Cloudflare его выбирают (www.google.com, cp.cloudflare.com, www.cloudflare.com):
+     * замер по https:// к ним кончался отказом «сервер выбрал ALPN h2», а запрос у замера — HTTP/1.1.
+     * Стенд urlhttps.sh этого не ловит: его сервер на python ssl h2 не предлагает. */
     struct reality_cfg cfg = { .sni = w->host, .alpn = "http/1.1", .plain = 1 };
+    struct reality_carrier car = { .alpn_http11 = 1 };
     struct reality_state rst;
     unsigned char hello[2048];
     size_t hello_n = 0;
-    if (reality_build_hello(&cfg, &rst, hello, sizeof(hello), &hello_n) != 0) {
+    if (reality_build_hello_carry(&cfg, &rst, &car, hello, sizeof(hello), &hello_n) != 0) {
         WHY("ClientHello не собрался");
         goto fail;
     }
