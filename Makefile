@@ -433,11 +433,11 @@ $(BUILD)/urltestmatch: tests/urltestmatch.c src/daemon/urltest.c src/daemon/urlt
 	$(CC) $(CFLAGS) -o $@ tests/urltestmatch.c src/daemon/urltest.c src/kinds/grpurl.c src/daemon/loop.c \
 		src/daemon/gaiw.c -lpthread
 
-# Hello замера по https:// (src/proto/tls/urltls.c): ALPN только http/1.1 через носитель alpn_http11. Там же
-# и по той же причине: measure статическая.
-$(BUILD)/urltlsmatch: tests/urltlsmatch.c src/proto/tls/urltls.c src/proto/tls/reality.h
+# Hello замера по https:// (src/proto/tls/urltls.c): ALPN только http/1.1 через носитель alpn_http11.
+# Модуль линкуется со стендом (без #include .c): замер заводится публичным urltls_start.
+$(BUILD)/urltlsmatch: tests/urltlsmatch.c src/proto/tls/urltls.c src/proto/tls/urltls.h src/proto/tls/reality.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/urltlsmatch.c -lpthread
+	$(CC) $(CFLAGS) -o $@ tests/urltlsmatch.c src/proto/tls/urltls.c -lpthread
 
 # Карта вердиктов balance по netlink (src/lib/nftvmap.c) — инструмент стенда tests/nftvmapmatch.sh.
 $(BUILD)/nftvmap-tool: tests/nftvmap-tool.c src/lib/nftvmap.c src/lib/nftvmap.h

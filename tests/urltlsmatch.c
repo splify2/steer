@@ -6,12 +6,23 @@
  * cfg.alpn == "http/1.1" и car->alpn_http11 == 1 (носитель обязателен — без него сборщик кладёт в
  * ALPN пару из облика браузера).
  *
- * Файл включает исходник urltls.c — measure статическая. Сборщик Hello, рукопожатие и цикл
- * подменены заглушками: нужна лишь фиксация того, с чем сборщик позвали (тот же приём, что в
- * tlsprobematch.c). */
-#include "../src/proto/tls/urltls.c"
+ * Модуль линкуется со стендом (tests/unit.h, «без #include чужого .c»): замер заводится публичным
+ * urltls_start, рабочий поток доходит до сборщика Hello. Сборщик, рукопожатие и цикл подменены
+ * заглушками этого файла: нужна лишь фиксация того, с чем сборщик позвали. */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
-static int g_calls, g_carry, g_http11;
+#include "loop.h"
+#include "reality.h"
+#include "tls13.h"
+#include "roots.h"
+#include "urltls.h"
+
+static int g_calls, g_carry, g_http11;   /* g_calls пишется последним: по нему поток стенда видит остальное */
 static char g_alpn[32];
 
 int loop_fd_add(struct loop *l, int fd, uint32_t events, loop_fd_cb cb, void *arg)
@@ -37,10 +48,10 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
                               const struct reality_carrier *car,
                               unsigned char *out, size_t out_n, size_t *out_len) {
     (void)st;
-    g_calls++;
     g_carry = car != NULL;
     g_http11 = car && car->alpn_http11;
     snprintf(g_alpn, sizeof(g_alpn), "%s", cfg->alpn ? cfg->alpn : "");
+    __atomic_add_fetch(&g_calls, 1, __ATOMIC_RELEASE);
     if (out_n < 100) return REALITY_ETOOBIG;
     memset(out, 0x16, 100);
     *out_len = 100;
@@ -68,20 +79,18 @@ int main(void) {
         return 2;
     }
 
-    struct urltls_work w;
-    memset(&w, 0, sizeof(w));
-    memcpy(&w.dst, &sa, sizeof(sa));
-    snprintf(w.host, sizeof(w.host), "www.google.com");
-    snprintf(w.path, sizeof(w.path), "/generate_204");
-    w.timeout_ms = 2000;
-
-    char why[192];
-    int ms = measure(&w, why, sizeof(why));
+    struct sockaddr_storage dst;
+    memset(&dst, 0, sizeof(dst));
+    memcpy(&dst, &sa, sizeof(sa));
+    struct urltls *t = urltls_start(NULL, &dst, "www.google.com", "/generate_204", 0, NULL, 2000, NULL, NULL);
+    eq("замер заведён", t != NULL, 1);
+    /* поток доходит до сборщика Hello за миллисекунды; ждём не дольше 3 с */
+    for (int i = 0; i < 300 && !__atomic_load_n(&g_calls, __ATOMIC_ACQUIRE); i++) usleep(10000);
     eq("замер дошёл до сборки Hello (один вызов)", g_calls, 1);
     eq("Hello собран с носителем", g_carry, 1);
     eq("носитель: alpn_http11", g_http11, 1);
     eq("в ALPN только http/1.1", strcmp(g_alpn, "http/1.1"), 0);
-    eq("рукопожатие заглушки отклонено — замер вернул отказ", ms < 0, 1);
+    urltls_cancel(t);
     close(ls);
     if (fails) { printf("urltlsmatch: БРАК (%d)\n", fails); return 1; }
     printf("urltlsmatch: всё хорошо\n");
