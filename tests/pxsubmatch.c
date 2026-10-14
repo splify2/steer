@@ -65,6 +65,45 @@ static void test_parse(void) {
     check("vmess tcp type=http — негоден", 1, px_parse_url("vmess://eyJ2IjoiMiIsInBzIjoibiIsImFkZCI6ImguZXhhbXBsZSIsInBvcnQiOiI0NDMiLCJpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidHlwZSI6Imh0dHAiLCJob3N0IjoieC5leGFtcGxlIiwicGF0aCI6Ii8iLCJ0bHMiOiIifQ==", &n, 0));
     check_str("vmess tcp type=http — причина", "tcp headerType=http не поддержан", n.skip_reason);
 
+    /* I-415: tls=reality у vmess не превращается в security=none. */
+    check("vmess tls=reality — негоден", 1, px_parse_url("vmess://eyJ2IjoiMiIsInBzIjoibiIsImFkZCI6ImguZXhhbXBsZSIsInBvcnQiOiI0NDMiLCJpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidGxzIjoicmVhbGl0eSIsInNuaSI6InMuZXhhbXBsZSJ9", &n, 0));
+    check_str("vmess tls=reality — причина", "vmess tls=reality не поддержан (нет pbk в JSON v2rayN)", n.skip_reason);
+
+    /* I-414: JSON vmess, не влезший в буфер, — отказ с причиной, а не обрезанный разбор. */
+    {
+        static char big[8192];
+        strcpy(big, "vmess://eyJ2IjoiMiIsICAiYWRkIjoiaC5leGFtcGxlIiwicG9ydCI6IjQ0MyIsImlkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwiYWlkIjoiMCIsIm5ldCI6InRjcCIsInBzIjoi");
+        for (int i = 0; i < 1500; i++) strcat(big, "eHh4");
+        strcat(big, "In0g");
+        check("vmess JSON > 4096 — негоден", 1, px_parse_url(big, &n, 0));
+        check_str("vmess JSON > 4096 — причина", "vmess JSON длиннее 4094 байт", n.skip_reason);
+    }
+
+    /* I-414: пароль длиннее поля — отказ с причиной. */
+    {
+        static char u[1024];
+        char pw[300];
+        memset(pw, 'a', sizeof(pw) - 1);
+        pw[sizeof(pw) - 1] = '\0';
+        snprintf(u, sizeof(u), "trojan://%s@h.example:443?security=tls&sni=s", pw);
+        check("trojan пароль 299 — негоден", 1, px_parse_url(u, &n, 0));
+        check_str("trojan пароль — причина", "пароль trojan длиннее 255 байт", n.skip_reason);
+        snprintf(u, sizeof(u), "socks5://u:%s@h.example:1080", pw);
+        check("socks пароль 299 — негоден", 1, px_parse_url(u, &n, 0));
+        snprintf(u, sizeof(u), "http://u:%s@h.example:3128", pw);
+        check("http пароль 299 — негоден", 1, px_parse_url(u, &n, 0));
+        snprintf(u, sizeof(u), "trojan://%.254s@h.example:443?security=tls&sni=s", pw);
+        check("trojan пароль 254 — годен", 0, px_parse_url(u, &n, 0));
+    }
+
+    /* I-415: socks из v2rayN — base64(user:pass) в userinfo. */
+    check("socks base64 userinfo", 0, px_parse_url("socks://dXNlcjpwYTU1@h.example:1080", &n, 0));
+    check_str("socks base64: user", "user", n.user);
+    check_str("socks base64: pass", "pa55", n.pass);
+    check("socks имя без пароля остаётся", 0, px_parse_url("socks5://alice@h.example:1080", &n, 0));
+    check_str("socks имя без пароля: user", "alice", n.user);
+    check_str("socks имя без пароля: pass пуст", "", n.pass);
+
     check("want фильтр: ss при want=vmess — не наша", -1, px_parse_url("ss://aes-128-gcm:p@h.example:1", &n, PX_VMESS));
     check("не наша схема", -1, px_parse_url("wireguard://x@h:1", &n, 0));
     check("адрес «отвечать некому»", 1, px_parse_url("ss://aes-128-gcm:p@127.0.0.1:1", &n, 0));

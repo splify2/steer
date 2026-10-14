@@ -81,9 +81,10 @@ struct tr_node {
     const char *headers;
     const char *service;       /* grpc serviceName */
     const char *mode;          /* grpc: multi/gun; xhttp: auto/packet-up… */
-    /* Длина набивки xhttp, объявленная узлом (см. vless_node.pad_from в vless.h). 0 в pad_to —
+    /* Длина набивки xhttp, объявленная узлом (см. vless_node.pad_from в vless.h). Без pad_set —
      * не объявлено, тогда умолчание Xray. */
     uint16_t pad_from, pad_to;
+    uint8_t pad_set;           /* набивка объявлена узлом (в том числе «0» — отключена) */
     /* Предел тела POST packet-up у узла (см. vless_node.post_from). 0 в post_to — не объявлено. */
     uint32_t post_from, post_to;
     /* Reality: открытый ключ ML-DSA-65 для проверки подписи сертификата, base64url (1952 байта в
@@ -175,6 +176,7 @@ struct xh_state {
      * (packet-up) собираются уже без узла на руках, а набивка нужна каждому: сервер
      * проверяет её у КАЖДОГО запроса, а не только у первого. */
     uint16_t pad_from, pad_to;
+    uint8_t pad_set;           /* набивка объявлена узлом (в том числе «0» — отключена) */
     /* packet-up: сколько самое большее несёт один POST на этом соединении, выбрано при открытии
      * из диапазона узла (как делает клиент Xray); запись больше уходит несколькими кусками.
      * 0 — предела нет. */

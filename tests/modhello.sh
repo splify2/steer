@@ -72,7 +72,7 @@ cat > "$tmp/spec.json" <<EOF
  "channels":[]}
 EOF
 
-STEER_MODULE_DIR="$tmp/mods" "$XK" daemon --supervise --socket "$tmp/s.sock" \
+STEER_MODULE_DIR="$tmp/mods" "$XK" daemon --supervise --allow-uid "$(id -u)" --socket "$tmp/s.sock" \
     --spec "$tmp/spec.json" --state-dir "$tmp/st" \
     --dnsd-flag --listen-port --dnsd-flag 15511 --dnsd-flag --upstream-port --dnsd-flag 15575 \
     >"$tmp/d.out" 2>"$tmp/d.err" &
