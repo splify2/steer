@@ -562,12 +562,75 @@ static void t_pick(void) {
     check("гистерезис: несём лучшее — его и берём", 0, group_hysteresis(0, 0, 1, 5, 3, &ns));
 }
 
+/* Имя парного набора IPv6 — «<имя>6»: у набора с номером 1 это «..._c16» / «..._p16», то есть
+ * имя IPv4-набора 16-го списка клиентов / 16-го сужения. Номера с шестёркой на конце (от 10)
+ * получают хвост «x»; остальные имена — как были (от них зависит перенос счётчиков). */
+static void t_set_name_twin(void) {
+    char spec[8192], *o = spec;
+    o += sprintf(o, "{\"schema\":2,\"from_default\":[\"192.168.1.0/24\"],"
+                    "\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},\"channels\":[");
+    o += sprintf(o, "{\"name\":\"k0\",\"match\":{\"prefixes_files\":[\"TMP/a.lst\"]},\"out\":\"vpn\"}");
+    for (int i = 1; i <= 16; i++)
+        o += sprintf(o, ",{\"name\":\"k%d\",\"from\":[\"10.0.0.%d\"],\"match\":{\"prefixes_files\":[\"TMP/a.lst\"]},\"out\":\"vpn\"}", i, i);
+    sprintf(o, "]}");
+    check("17 списков клиентов разобраны", 0, load(spec));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    char a[64], b[64], b6[70];
+    const struct spec_client *c1 = rule_who(&g_spec, &g_spec.rule[1]);
+    const struct spec_client *c16 = rule_who(&g_spec, &g_spec.rule[16]);
+    group_set_name(&g_spec, a, sizeof(a), "vpn", "ip", c1->from, c1->from_n, 0, NULL);
+    group_set_name(&g_spec, b, sizeof(b), "vpn", "ip", c16->from, c16->from_n, 0, NULL);
+    check_str("клиенты 1: имя прежнее", "vpn_ip_c1", a);
+    snprintf(b6, sizeof(b6), "%s6", a);
+    check("клиенты 16: имя не совпадает с двойником IPv6 набора 1", 1, strcmp(b, b6) != 0);
+    check_str("клиенты 16: имя", "vpn_ip_c16x", b);
+    const struct spec_client *c15 = rule_who(&g_spec, &g_spec.rule[15]);
+    group_set_name(&g_spec, a, sizeof(a), "vpn", "ip", c15->from, c15->from_n, 0, NULL);
+    check_str("клиенты 15: имя прежнее", "vpn_ip_c15", a);
+
+    o = spec;
+    o += sprintf(o, "{\"schema\":2,\"from_default\":[\"192.168.1.0/24\"],"
+                    "\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},\"channels\":[");
+    for (int i = 1; i <= 16; i++)
+        o += sprintf(o, "%s{\"name\":\"p%d\",\"match\":{\"prefixes_files\":[\"TMP/a.lst\"],\"proto\":\"udp\",\"ports\":[\"%d\"]},\"out\":\"vpn\"}",
+                     i > 1 ? "," : "", i, 1000 + i);
+    sprintf(o, "]}");
+    check("16 сужений разобраны", 0, load(spec));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    const struct l4match *l1 = &rule_list(&g_spec, &g_spec.rule[0])->l4;
+    const struct l4match *l16 = &rule_list(&g_spec, &g_spec.rule[15])->l4;
+    group_set_name(&g_spec, a, sizeof(a), "vpn", "ip", g_spec.lan.from, g_spec.lan.from_n, 0, l1);
+    group_set_name(&g_spec, b, sizeof(b), "vpn", "ip", g_spec.lan.from, g_spec.lan.from_n, 0, l16);
+    check_str("сужение 1: имя прежнее", "vpn_ip_c0_p1", a);
+    snprintf(b6, sizeof(b6), "%s6", a);
+    check("сужение 16: имя не совпадает с двойником IPv6 сужения 1", 1, strcmp(b, b6) != 0);
+    check_str("сужение 16: имя", "vpn_ip_c0_p16x", b);
+
+    /* Соседа нет — имя прежнее: список клиентов 1 ведёт в другой выход, и «vpn_ip_c16» ни с чьим
+     * двойником IPv6 не совпадает. Переименование выпущенных наборов обнулило бы им счётчики. */
+    o = spec;
+    o += sprintf(o, "{\"schema\":2,\"from_default\":[\"192.168.1.0/24\"],"
+                    "\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"},"
+                    "\"other\":{\"kind\":\"interface\",\"device\":\"wg1\"}},\"channels\":[");
+    o += sprintf(o, "{\"name\":\"k0\",\"match\":{\"prefixes_files\":[\"TMP/a.lst\"]},\"out\":\"vpn\"}");
+    for (int i = 1; i <= 16; i++)
+        o += sprintf(o, ",{\"name\":\"k%d\",\"from\":[\"10.0.0.%d\"],\"match\":{\"prefixes_files\":[\"TMP/a.lst\"]},\"out\":\"%s\"}",
+                     i, i, i == 1 ? "other" : "vpn");
+    sprintf(o, "]}");
+    check("17 списков клиентов, первый — в другой выход, разобраны", 0, load(spec));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    c16 = rule_who(&g_spec, &g_spec.rule[16]);
+    group_set_name(&g_spec, b, sizeof(b), "vpn", "ip", c16->from, c16->from_n, 0, NULL);
+    check_str("клиенты 16 без соседа в том же выходе: имя прежнее", "vpn_ip_c16", b);
+}
+
 int main(void) {
     snprintf(g_tmp, sizeof(g_tmp), "/tmp/modelmatch-XXXXXX");
     if (!mkdtemp(g_tmp)) { perror("mkdtemp"); return 2; }
     steer_set_state_dir(g_tmp);
     t_rules();
     t_groups();
+    t_set_name_twin();
     t_v2();
     t_groups_v2();
     t_pick();
