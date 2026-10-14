@@ -38,9 +38,6 @@
 set -u
 BIN="${STEER:-./build/steer}"
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
-# Без root стенд сам — чужой uid для демона: пускаем его явно, как в tests/ctlmatch.sh.
-self_uid=""
-[ "$(id -u)" = 0 ] || self_uid="--allow-uid $(id -u)"
 [ -x "$BIN" ] || { echo "not built: $BIN (make test)"; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "supdmatch: python3 нет — пропускаю"; exit 0; }
 if [ "${SUPD_INNER:-}" != 1 ] && [ "$(id -u)" = 0 ] && unshare -n true 2>/dev/null; then
@@ -144,10 +141,11 @@ EOF
 pid_of() { grep "^obfs $1 " "$tmp/log" | tail -1 | cut -d' ' -f3; }
 runs() { grep -c "^obfs $1 " "$tmp/log" 2>/dev/null; }
 alive() { p="$(pid_of "$1")"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo yes || echo no; }
+self_uid="--allow-uid $(id -u)"
 ctl() { "$BIN" ctl --socket "$tmp/s.sock" "$@"; }
 
 spec 1
-STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" daemon $self_uid --supervise --socket "$tmp/s.sock" \
+STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" daemon --supervise $self_uid --socket "$tmp/s.sock" \
     --spec "$tmp/spec.json" --state-dir "$tmp/st" \
     --dnsd-flag --listen-port --dnsd-flag "$LPORT" --dnsd-flag --upstream-port --dnsd-flag "$UPORT" \
     2>"$tmp/d.err" &
@@ -302,7 +300,7 @@ spec5() {
 '"channels":[{"name":"c","match":{"domains_files":["%s"]},"out":"t"}]}\n' "$1" > "$tmp/spec5.json"
 }
 d5() {   # d5 ЖУРНАЛ [СПЕКА] — демон стенда в фоне, pid — в $!
-    "$BIN" daemon $self_uid --supervise --socket "$tmp/s5.sock" --spec "${2:-$tmp/spec5.json}" \
+    "$BIN" daemon --supervise $self_uid --socket "$tmp/s5.sock" --spec "${2:-$tmp/spec5.json}" \
         --state-dir "$tmp/st5" \
         --dnsd-flag --listen-port --dnsd-flag "$LPORT5" --dnsd-flag --upstream-port --dnsd-flag "$UPORT" \
         --dnsd-flag --orphan-timeout --dnsd-flag 4 2>"$tmp/$1" &
@@ -413,7 +411,7 @@ spec6() {   # spec6 ФАЙЛ ВЫХОД ПОРТ — один выход с об
         "$2" "$2" "$3" > "$1"
 }
 d6() {   # d6 ЖУРНАЛ СПЕКА КАТАЛОГ ПОРТ-РЕЗОЛВЕРА — демон стенда в фоне, pid — в $!
-    STEER_SUPERVISE_EXE="$tmp/h6" "$BIN" daemon $self_uid --supervise --socket "$3/s.sock" --spec "$2" \
+    STEER_SUPERVISE_EXE="$tmp/h6" "$BIN" daemon --supervise $self_uid --socket "$3/s.sock" --spec "$2" \
         --state-dir "$3" \
         --dnsd-flag --listen-port --dnsd-flag "$4" --dnsd-flag --upstream-port --dnsd-flag "$UPORT" \
         --dnsd-flag --orphan-timeout --dnsd-flag 2 2>"$tmp/$1" &
@@ -717,7 +715,7 @@ EOF
     # прохода: стенд смотрит на то, откуда сторож берёт здоровье, а не на гистерезис. Период —
     # 600 с: всё, что стенд ждёт от сторожа, обязано прийти внеочередным проходом по событию.
     unshare -m sh -c "mount -t sysfs sysfs /sys && PATH=\"$W/bin:\$PATH\" STEER_FAILOVER_HYST=0 \
-        STEER_SUPERVISE_EXE=\"$W/helper\" exec \"$XK\" daemon $self_uid --watch --watch-period 600 --supervise \
+        STEER_SUPERVISE_EXE=\"$W/helper\" exec \"$XK\" daemon --watch --watch-period 600 --supervise $self_uid \
         --socket \"$W/s.sock\" --spec \"$W/spec.json\" --state-dir \"$W/st\" \
         --dnsd-flag --listen-port --dnsd-flag 15411 --dnsd-flag --upstream-port --dnsd-flag 15475" \
         >"$W/d.out" 2>"$W/d.err" &

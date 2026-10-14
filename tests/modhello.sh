@@ -20,9 +20,6 @@
 set -u
 BIN="${STEER:-./build/steer}"
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
-# Без root стенд сам — чужой uid для демона: пускаем его явно, как в tests/ctlmatch.sh.
-self_uid=""
-[ "$(id -u)" = 0 ] || self_uid="--allow-uid $(id -u)"
 XK="${STEER_XK:-$(dirname "$BIN")/steer-xk}"
 [ -x "$XK" ] || { echo "modhello: не собран $XK (make build/steer-xk)"; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "modhello: python3 нет — пропускаю"; exit 0; }
@@ -75,7 +72,7 @@ cat > "$tmp/spec.json" <<EOF
  "channels":[]}
 EOF
 
-STEER_MODULE_DIR="$tmp/mods" "$XK" daemon $self_uid --supervise --socket "$tmp/s.sock" \
+STEER_MODULE_DIR="$tmp/mods" "$XK" daemon --supervise --allow-uid "$(id -u)" --socket "$tmp/s.sock" \
     --spec "$tmp/spec.json" --state-dir "$tmp/st" \
     --dnsd-flag --listen-port --dnsd-flag 15511 --dnsd-flag --upstream-port --dnsd-flag 15575 \
     >"$tmp/d.out" 2>"$tmp/d.err" &
