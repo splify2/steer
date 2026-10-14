@@ -72,7 +72,7 @@ static void session_id(char *out, size_t cap) {
  * то, против чего она заведена. Диапазон 100..1000 знаков задан сервером Xray
  * (GetNormalizedXPaddingBytes), и выйти за него значит получить отказ. */
 static int xhttp_referer(char *out, size_t cap, const char *authority, const char *path,
-                         uint16_t pf, uint16_t pt) {
+                         uint16_t pf, uint16_t pt, uint8_t pset) {
     /* ДЛИНУ ЗАДАЁТ СЕРВЕР, А НЕ МЫ. Она приезжает в ссылке полем `xPaddingBytes` (см.
      * pad_range в sub.c), и сервер её ПРОВЕРЯЕТ: не попал в диапазон — 400 и всё.
      *
@@ -83,8 +83,8 @@ static int xhttp_referer(char *out, size_t cap, const char *authority, const cha
      *
      * Пусто — умолчание Xray 100…1000 (GetNormalizedXPaddingBytes), а не прежние 150…660:
      * повторяем upstream, чтобы у нас и у него совпадали не только границы, но и середина. */
-    size_t lo = pt ? pf : 100;
-    size_t hi = pt ? pt : 1000;
+    size_t lo = pset ? pf : 100;
+    size_t hi = pset ? pt : 1000;
     unsigned char r = 0;
     if (getrandom(&r, 1, 0) != 1) r = 128;
     size_t pad = lo + (size_t)r * (hi - lo + 1) / 256;
@@ -199,7 +199,7 @@ static int up_request(struct transport *t, long long seq) {
     else         snprintf(path, sizeof(path), "%s/%lld", x->up_path, seq);
 
     static __thread char ref[1400];
-    if (xhttp_referer(ref, sizeof(ref), x->authority, path, x->pad_from, x->pad_to))
+    if (xhttp_referer(ref, sizeof(ref), x->authority, path, x->pad_from, x->pad_to, x->pad_set))
         return H2_ETOOBIG;
 
     /* Content-Type: application/grpc только у запроса stream-up. Xray ставит его на запросы потока
@@ -254,6 +254,7 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
     snprintf(x->authority, sizeof(x->authority), "%s", authority);
     x->pad_from = n->pad_from;
     x->pad_to = n->pad_to;
+    x->pad_set = n->pad_set;
     /* Одно значение на соединение из диапазона узла, как выбирает клиент Xray (dialer.go). */
     x->post_max = 0;
     if (n->post_to) {
@@ -267,7 +268,7 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
     static __thread char ref[1400];
 
     if (x->mode == XH_STREAM_ONE) {
-        if (xhttp_referer(ref, sizeof(ref), authority, path, n->pad_from, n->pad_to))
+        if (xhttp_referer(ref, sizeof(ref), authority, path, n->pad_from, n->pad_to, n->pad_set))
             return H2_ETOOBIG;
         /* Content-Type: application/grpc и здесь — так делает Xray (FillStreamRequest ставит
          * его на любой запрос С ТЕЛОМ), и посредники по нему не пытаются буферизовать поток.
@@ -288,7 +289,7 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
      * сервер отличает выгрузку от загрузки именно им (hub.go: GET без номера куска — это
      * stream-down). POST без тела сервер счёл бы выгрузкой и стал бы ждать байт, которых
      * не будет, а вниз не отдал бы ничего. */
-    if (xhttp_referer(ref, sizeof(ref), authority, x->up_path, n->pad_from, n->pad_to))
+    if (xhttp_referer(ref, sizeof(ref), authority, x->up_path, n->pad_from, n->pad_to, n->pad_set))
         return H2_ETOOBIG;
     int rc = h2_start_ex(&t->h2, &io, authority, x->up_path, NULL, ref, H2_GET, 1, 1);
     if (rc) return rc;

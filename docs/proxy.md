@@ -116,7 +116,7 @@ vmess://base64(JSON)
 
 JSON v2rayN: `add`, `port`, `id`, `aid` (только 0), `scy` (auto, aes-128-gcm, chacha20-poly1305),
 `net` (tcp, ws, grpc, httpupgrade; `h2` читается как xhttp), `type`, `host`, `path`, `tls`, `sni`,
-`fp`, `ps` (имя). `alpn` не читается. Признака `allowInsecure` у ссылки vmess ядро не читает: сертификат
+`fp`, `ps` (имя). `alpn` не читается; `tls=reality` — узел пропускается с причиной (в JSON v2rayN нет ключа Reality). Признака `allowInsecure` у ссылки vmess ядро не читает: сертификат
 узла vmess не проверяется только при `insecure: true` у выхода.
 
 ## Выход в спеке

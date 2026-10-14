@@ -272,11 +272,17 @@ static int sl_range(const char *v, unsigned long max, unsigned long *from, unsig
     return 0;
 }
 
+/* «0» и «0-0» — объявленная набивка ноль (узел её отключил), а не «не объявлено»: pad_set отличает
+ * их, и тогда trxhttp.c шлёт x_padding нулевой длины, а не умолчание 100…1000, за которое такой
+ * узел отвечает 400. Что именно Xray принимает при длине 0, в репозитории не видно (только симптом
+ * «400» с живой подписки) — здесь повторяется объявленное узлом. Для scMaxEachPostBytes (sl_post_range)
+ * 0 по-прежнему отвергается: его клиент Xray по нулю не режет. */
 void sl_pad_range(struct vless_node *n, const char *v) {
     unsigned long a, b;
     if (sl_range(v, 65535, &a, &b) != 0) return;
     n->pad_from = (uint16_t)a;
     n->pad_to = (uint16_t)b;
+    n->pad_set = 1;
 }
 
 /* xhttp `scMaxEachPostBytes` в тех же формах. 0 — предел, который Xray не принял бы (его клиент

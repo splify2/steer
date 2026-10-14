@@ -90,13 +90,29 @@ static const char *parse_query(struct px_node *n, const char *q, const char *end
 }
 
 /* userinfo (до '@') процентно-раскодированным в dst. secret — начало userinfo, secret_n — длина. */
-static void set_secret(char *dst, size_t cap, const char *s, size_t n) {
+static int set_secret(char *dst, size_t cap, const char *s, size_t n) {
     char tmp[PX_PASS_MAX * 3];
-    if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+    if (n >= sizeof(tmp)) return -1;
     memcpy(tmp, s, n);
     tmp[n] = '\0';
     sl_pct_decode(tmp);
+    if (strlen(tmp) >= cap) return -1;     /* не влезло: обрезанный пароль не пустит, а причины не даст */
     sl_set_field(dst, cap, tmp, strlen(tmp));
+    return 0;
+}
+
+/* user[:pass] (уже раскодированное) в user/pass узла. -1 — не влезло в поле: обрезать нельзя,
+ * узел с чужим паролем только выглядит исправным. */
+static int set_userpass(struct px_node *n, char *ui) {
+    char *colon = strchr(ui, ':');
+    if (colon) {
+        *colon = '\0';
+        if (strlen(colon + 1) >= sizeof(n->pass)) return -1;
+        snprintf(n->pass, sizeof(n->pass), "%s", colon + 1);
+    }
+    if (strlen(ui) >= sizeof(n->user)) return -1;
+    snprintf(n->user, sizeof(n->user), "%s", ui);
+    return 0;
 }
 
 /* ---- trojan ---------------------------------------------------------------------------------- */
@@ -109,9 +125,13 @@ static int trojan_parse(const char *url, struct px_node *n) {
     int rc = sl_link_parse(url, "trojan://", &n->vn, NULL, &secret, &secret_n);
     if (rc) return rc;
     n->proto = PX_TROJAN;
-    set_secret(n->pass, sizeof(n->pass), secret, secret_n);
+    int too_long = set_secret(n->pass, sizeof(n->pass), secret, secret_n);
     sl_set_field(n->name, sizeof(n->name), n->vn.name, strlen(n->vn.name));
     if (sl_link_usable_pre(&n->vn)) { goto skip; }
+    if (too_long) {
+        snprintf(n->vn.skip_reason, sizeof(n->vn.skip_reason), "пароль trojan длиннее %d байт", PX_PASS_MAX - 1);
+        goto skip;
+    }
     if (!n->pass[0]) { snprintf(n->vn.skip_reason, sizeof(n->vn.skip_reason), "trojan без пароля"); goto skip; }
     /* trojan не бывает голым (security=none): это TLS или Reality с паролем вместо UUID. */
     if (!strcmp(n->vn.security, "none")) {
@@ -181,6 +201,7 @@ static int ss_parse(const char *url, struct px_node *n) {
     const char *at = memchr(p, '@', (size_t)(body_end - p));
 
     char method[64] = "", pass[PX_PASS_MAX] = "";
+    int pass_long = 0;
     const char *hp;                      /* host:port */
     if (at) {
         /* SIP002: userinfo@host:port. userinfo — base64url(method:pass) или method:pass
@@ -203,6 +224,7 @@ static int ss_parse(const char *url, struct px_node *n) {
         if (!colon) return -1;
         *colon = '\0';
         snprintf(method, sizeof(method), "%s", ui);
+        if (strlen(colon + 1) >= sizeof(pass)) pass_long = 1;
         snprintf(pass, sizeof(pass), "%s", colon + 1);
         hp = at + 1;
     } else {
@@ -216,6 +238,7 @@ static int ss_parse(const char *url, struct px_node *n) {
         *colon = '\0';
         *a2 = '\0';
         snprintf(method, sizeof(method), "%s", dec);
+        if (strlen(colon + 1) >= sizeof(pass)) pass_long = 1;
         snprintf(pass, sizeof(pass), "%s", colon + 1);
         if (set_hostport(&n->vn, a2 + 1, strlen(a2 + 1)) != 0) return -1;
         hp = NULL;
@@ -227,6 +250,10 @@ static int ss_parse(const char *url, struct px_node *n) {
     snprintf(n->vn.type, sizeof(n->vn.type), "tcp");
     snprintf(n->vn.security, sizeof(n->vn.security), "none");
 
+    if (pass_long) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "пароль ss длиннее %d байт", PX_PASS_MAX - 1);
+        return 1;
+    }
     n->ss_method = ss_method_by_name(method);
     if ((int)n->ss_method < 0) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "метод %.40s не поддержан", method);
@@ -286,20 +313,33 @@ static int socks_parse(const char *url, struct px_node *n, int ver) {
     const char *q = memchr(p, '?', (size_t)(end - p));
     const char *body_end = q ? q : end;
     const char *at = memchr(p, '@', (size_t)(body_end - p));
+    int ui_long = 0;
     if (at) {
         char ui[PX_PASS_MAX * 2];
         size_t ul = (size_t)(at - p);
         if (ul >= sizeof(ui)) return -1;
         memcpy(ui, p, ul); ui[ul] = '\0';
         sl_pct_decode(ui);
-        char *colon = strchr(ui, ':');
-        if (colon) { *colon = '\0'; snprintf(n->pass, sizeof(n->pass), "%s", colon + 1); }
-        snprintf(n->user, sizeof(n->user), "%s", ui);
+        if (!strchr(ui, ':')) {
+            /* v2rayN пишет socks://base64(user:pass)@host:port. Принимаем расшифровку, только если
+             * это похоже на user:pass: двоеточие и печатные знаки, иначе имя без пароля остаётся как есть. */
+            char dec[PX_PASS_MAX * 2];
+            size_t dn = b64_decode(ui, strlen(ui), dec, sizeof(dec));
+            int ok = dn > 0 && dn + 1 < sizeof(dec) && memchr(dec, ':', dn) != NULL;
+            for (size_t i = 0; ok && i < dn; i++)
+                if ((unsigned char)dec[i] < 0x20 || (unsigned char)dec[i] == 0x7f) ok = 0;
+            if (ok) { dec[dn] = '\0'; memcpy(ui, dec, dn + 1); }
+        }
+        if (set_userpass(n, ui) != 0) ui_long = 1;
         p = at + 1;
     }
     if (set_hostport(&n->vn, p, (size_t)(body_end - p)) != 0) return -1;
     if (hash) sl_set_name(n->vn.name, sizeof(n->vn.name), hash + 1);
     sl_set_field(n->name, sizeof(n->name), n->vn.name, strlen(n->vn.name));
+    if (ui_long) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "имя или пароль socks длиннее поля (%d/%d байт)", PX_USER_MAX - 1, PX_PASS_MAX - 1);
+        return 1;
+    }
     snprintf(n->vn.type, sizeof(n->vn.type), "tcp");
     snprintf(n->vn.security, sizeof(n->vn.security), "none");
     if (ver == 5 && n->user[0] && !n->pass[0]) {
@@ -330,15 +370,14 @@ static int http_parse(const char *url, struct px_node *n, int tls) {
     const char *q = memchr(p, '?', (size_t)((slash ? slash : end) - p));
     const char *body_end = q ? q : slash ? slash : end;
     const char *at = memchr(p, '@', (size_t)(body_end - p));
+    int ui_long = 0;
     if (at) {
         char ui[PX_PASS_MAX * 2];
         size_t ul = (size_t)(at - p);
         if (ul >= sizeof(ui)) return -1;
         memcpy(ui, p, ul); ui[ul] = '\0';
         sl_pct_decode(ui);
-        char *colon = strchr(ui, ':');
-        if (colon) { *colon = '\0'; snprintf(n->pass, sizeof(n->pass), "%s", colon + 1); }
-        snprintf(n->user, sizeof(n->user), "%s", ui);
+        if (set_userpass(n, ui) != 0) ui_long = 1;
         p = at + 1;
     }
     if (set_hostport(&n->vn, p, (size_t)(body_end - p)) != 0) return -1;
@@ -346,6 +385,10 @@ static int http_parse(const char *url, struct px_node *n, int tls) {
     if (q) parse_query(n, q + 1, hash ? hash : end, NULL);
     if (hash) sl_set_name(n->vn.name, sizeof(n->vn.name), hash + 1);
     sl_set_field(n->name, sizeof(n->name), n->vn.name, strlen(n->vn.name));
+    if (ui_long) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "имя или пароль http длиннее поля (%d/%d байт)", PX_USER_MAX - 1, PX_PASS_MAX - 1);
+        return 1;
+    }
     snprintf(n->vn.type, sizeof(n->vn.type), "%s", n->vn.type[0] ? n->vn.type : "tcp");
     snprintf(n->vn.security, sizeof(n->vn.security), tls ? "tls" : "none");
     if (tls && !n->vn.sni[0] && sl_host_is_name(n->vn.host))
@@ -426,6 +469,10 @@ static int vmess_parse(const char *url, struct px_node *n) {
     size_t jn = b64_decode(b, strlen(b), json, sizeof(json));
     json[jn < sizeof(json) ? jn : sizeof(json) - 1] = '\0';
     if (json[0] != '{') return -1;
+    if (jn + 1 >= sizeof(json)) {       /* декодер встал на краю буфера: хвост JSON потерян */
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "vmess JSON длиннее %zu байт", sizeof(json) - 2);
+        return 1;
+    }
     char v[256];
     vj_get(json, "add", n->vn.host, sizeof(n->vn.host));
     if (vj_get(json, "port", v, sizeof(v))) n->vn.port = sl_port_of(v);
@@ -462,6 +509,11 @@ static int vmess_parse(const char *url, struct px_node *n) {
     if (!strcmp(net, "grpc")) sl_set_field(n->vn.service, sizeof(n->vn.service), n->vn.path, strlen(n->vn.path));
     char tls[16] = "";
     vj_get(json, "tls", tls, sizeof(tls));
+    if (!strcasecmp(tls, "reality")) {
+        /* В JSON v2rayN нет ни pbk, ни sid: молча принять за security=none значило бы слать открытый vmess туда, где ждут Reality. */
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "vmess tls=reality не поддержан (нет pbk в JSON v2rayN)");
+        return 1;
+    }
     snprintf(n->vn.security, sizeof(n->vn.security), !strcasecmp(tls, "tls") ? "tls" : "none");
     vj_get(json, "sni", n->vn.sni, sizeof(n->vn.sni));
     vj_get(json, "fp", n->vn.fp, sizeof(n->vn.fp));
