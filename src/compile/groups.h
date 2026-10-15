@@ -125,7 +125,9 @@ static inline int group_has_set6(const struct group *g) {
 }
 
 /* Имя парного набора IPv6: имя группы и «6». Имена групп рассчитаны на 31 символ старых ядер
- * (group_set_name), и одна цифра в них укладывается: самое длинное имя с ней — 28 символов. */
+ * (group_set_name), и одна цифра в них укладывается: самое длинное имя с ней — 28 символов.
+ * С именем набора IPv4 двойник совпасть не должен («_c1»+«6» и «_c16»): group_set_name сама
+ * разводит такое имя хвостом «x» у старшего набора (twin_clash, src/model/parse.c). */
 static inline void group_set6_name(const struct group *g, char *dst, size_t n) {
     snprintf(dst, n, "%.62s6", g->name);
 }

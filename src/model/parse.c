@@ -198,6 +198,34 @@ static int l4_disc(const struct spec *sp, const struct l4match *m) {
     return idx + 1 + (int)c.n;
 }
 
+/* Имя набора совпало бы с именем двойника IPv6 другого набора. Двойник — «<имя>6»
+ * (group_set6_name): у набора с номером c1 это «_c16», то есть имя набора IPv4 у списка клиентов
+ * номер 16 (так же _p1 и _p16), а nft отвергает правила с одноимёнными наборами целиком.
+ *
+ * Разводится только такое имя, и только когда сосед есть: в спеке есть правило того же выхода с
+ * номером в десять раз меньше (c1 для c16, c2 для c26, c10 для c106; у сужений — p1 для p16 при
+ * том же списке клиентов). Остальные имена остаются как были, до символа: от имени набора
+ * зависит перенос счётчиков (см. комментарий в group_set_name), а прежнее решение — хвост «x»
+ * всем номерам с шестёркой на конце — переименовало бы выпущенные наборы. Вид (ip/dom) и режим
+ * real-ip соседа не сверяются: их знают только собранные группы, а имя вычисляют и резолвер, и
+ * компилятор из одной спеки. Лишний хвост у набора, чей сосед другого вида, — цена за то, что
+ * оба вызывающих получают одно имя. */
+static int twin_clash(const struct spec *sp, const char *out, int cd, int pd) {
+    int num = pd ? pd : cd;
+    if (num < 16 || num % 10 != 6) return 0;
+    int sib = num / 10;
+    for (size_t i = 0; i < sp->rule_n; i++) {
+        const struct spec_rule *r = &sp->rule[i];
+        const struct spec_list *l = rule_list(sp, r);
+        if (r->disabled || l->all || strcmp(rule_out(sp, r)->name, out) != 0) continue;
+        size_t fn;
+        const char (*f)[64] = rule_from(sp, r, &fn);
+        int rc = from_disc(sp, f, fn), rp = l4_disc(sp, &l->l4);
+        if (pd ? rc == cd && rp == sib : rc == sib && rp == 0) return 1;
+    }
+    return 0;
+}
+
 void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out, const char *kind,
                     const char (*from)[64], size_t from_n, int realip,
                     const struct l4match *l4) {
@@ -215,12 +243,15 @@ void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out,
         }
         /* Выход обрезается сильнее, чтобы имя с суффиксом осталось коротким: у наборов
          * nftables на старых ядрах предел длины 32 символа. */
-        snprintf(dst, n, "%.18s_%s_c%d%s", out, kind, from_disc(sp, from, from_n), rip ? "r" : "");
+        int cd = from_disc(sp, from, from_n);
+        snprintf(dst, n, "%.18s_%s_c%d%s%s", out, kind, cd, rip ? "r" : "",
+                 !rip && twin_clash(sp, out, cd, 0) ? "x" : "");
         return;
     }
     /* Выход обрезается ещё сильнее: суффиксов теперь два, а предел в 32 символа тот же. */
-    snprintf(dst, n, "%.14s_%s_c%d%s_p%d", out, kind, from_disc(sp, from, from_n),
-             rip ? "r" : "", pd);
+    int cd = from_disc(sp, from, from_n);
+    snprintf(dst, n, "%.14s_%s_c%d%s_p%d%s", out, kind, cd, rip ? "r" : "", pd,
+             twin_clash(sp, out, cd, pd) ? "x" : "");
 }
 
 /* Имя СОСТАВНОГО набора канала со смешанным сужением (src/model/srsplan.c): у элементов свои

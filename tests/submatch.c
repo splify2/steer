@@ -854,6 +854,19 @@ int main(void) {
         check_n("extra: нижняя граница", 50, (int)n.pad_from);
         check_n("extra: верхняя граница", 150, (int)n.pad_to);
 
+        /* I-215: «0» — объявленная набивка ноль (узел её отключил), а не «не объявлено». */
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingBytes%%22%%3A%%220%%22%%7D#x", base);
+        vless_parse_url(url, &n);
+        check_n("extra: «0» — объявлено", 1, (int)n.pad_set);
+        check_n("extra: «0» — нижняя 0", 0, (int)n.pad_from);
+        check_n("extra: «0» — верхняя 0", 0, (int)n.pad_to);
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingBytes%%22%%3A%%220-0%%22%%7D#x", base);
+        vless_parse_url(url, &n);
+        check_n("extra: «0-0» — объявлено", 1, (int)n.pad_set);
+        snprintf(url, sizeof(url), "%s#x", base);
+        vless_parse_url(url, &n);
+        check_n("без extra: pad_set не выставлен", 0, (int)n.pad_set);
+
         /* Длинный extra: продавец кладёт перед xPaddingBytes заголовки на сотни знаков, и в
          * процентной форме это втрое длиннее. Буфер в 256 байт обрезал JSON до раскодирования,
          * и диапазон терялся молча. */

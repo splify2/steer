@@ -130,6 +130,7 @@ static inline void sl_tr_node(const struct vless_node *n, struct tr_node *t) {
     t->mode = n->mode;
     t->pad_from = n->pad_from;
     t->pad_to = n->pad_to;
+    t->pad_set = n->pad_set;
     t->post_from = n->post_from;
     t->post_to = n->post_to;
     t->http_host = n->http_host;
