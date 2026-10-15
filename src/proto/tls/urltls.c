@@ -42,6 +42,7 @@
 #include "tls13.h"
 #include "roots.h"
 #include "urltls.h"
+#include "sockmark.h"
 
 #ifndef STEER_VERSION
 #define STEER_VERSION "dev"
@@ -132,7 +133,7 @@ static int measure(const struct urltls_work *w, char *why, size_t wn) {
     why[0] = '\0';
     int fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) { WHY("socket: %s", strerror(errno)); return -1; }
-    if (w->mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &w->mark, sizeof(w->mark)) != 0) {
+    if (steer_sock_mark(fd, w->mark) != 0) {
         WHY("метка члена не поставилась: %s", strerror(errno));
         goto fail;
     }

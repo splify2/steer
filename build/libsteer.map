@@ -274,6 +274,7 @@ LIBSTEER_1 {
     spec_line_is_addr;
     spec_list_all;
     spec_print_v2;
+    spec_print_v2_json;
     srs_clause;
     srs_clause_n;
     srs_open;
@@ -342,6 +343,9 @@ LIBSTEER_1 {
     xc_random;
     xc_x25519_keypair;
     xc_x25519_public;
+    ydoc_free;
+    ydoc_parse_buf;
+    ydoc_root;
     zapret_instances;
     zapret_present;
     zapret_running;

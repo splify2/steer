@@ -12,9 +12,13 @@
  * годного не дал никто. Члены — обычные апстримы той же настройки, со своими соединениями,
  * путями и паузами после неудачи соединения; группа только решает, кого и когда спросить.
  *
- * RACE. Вопрос уходит всем членам сразу, в порядке спеки. Первый годный ответ уходит клиенту,
- * остальные ответы приходят и выбрасываются (каждому члену их вопрос — свой, dup отвечает на
- * каждый ровно один раз). Отказ — когда отказали все.
+ * RACE. Вопрос уходит всем членам без паузы сразу, в порядке спеки. Первый годный ответ уходит
+ * клиенту, остальные ответы приходят и выбрасываются (каждому члену их вопрос — свой, dup отвечает на
+ * каждый ровно один раз). Отказ — когда отказали все. Член, отказавший прежде, на паузе (как у
+ * failover) и не спрашивается, пока она идёт.
+ *
+ * ВЫЖИВАНИЕ. Все члены на паузе — вопрос уходит ОДНОМУ, наименее плохому (grp_ask): без обхода и без
+ * веера. Годный ответ снимает паузу, только если вопрос ушёл позже последнего отказа (dpause_ok_at).
  *
  * FAILOVER. Порядок опроса — порядок спеки, но член на паузе (struct dpause, dup.h: отказал — не
  * ответил за срок, нет соединения, SERVFAIL или REFUSED) уходит в конец, за всех без паузы, и
@@ -66,8 +70,17 @@ void dpause_ok(struct dpause *p) {
     p->until_ms = 0;
 }
 
+void dpause_ok_at(struct dpause *p, long sent_ms) {
+    if (sent_ms < p->fail_ms) {         /* вопрос старше последнего отказа: в счёт, но паузу не трогает */
+        p->ok++;
+        return;
+    }
+    dpause_ok(p);
+}
+
 void dpause_fail(struct dpause *p, long now) {
     p->fail++;
+    p->fail_ms = now;
     p->step_ms = p->step_ms ? p->step_ms * 2 : pause_first();
     if (p->step_ms > PAUSE_MAX_MS) p->step_ms = PAUSE_MAX_MS;
     p->until_ms = now + p->step_ms;
@@ -88,6 +101,7 @@ struct gsub {
     struct greq *r;
     size_t pos;                 /* номер члена в группе (в cfg.gm) */
     int st;                     /* 0 — не спрошен, 1 — ждём, 2 — вернулся */
+    long sent_ms;               /* когда вопрос ушёл члену (для dpause_ok_at) */
 };
 struct greq {
     struct greq *link;          /* список живых вопросов (g_greqs) */
@@ -129,18 +143,12 @@ static void greq_settle(struct greq *r) {
     if (r->done && r->outstanding == 0) greq_unlink_free(r);
 }
 
-/* Итог члена: у failover — пауза (dpause), у race — только счёт: race спрашивает всех всегда, и
- * пауза ему ничего не значит. */
-static void member_note(struct dup *g, size_t pos, int good) {
+/* Итог члена: отказ — пауза (dpause), годный ответ её снимает, но только если вопрос ушёл позже
+ * последнего отказа. Одинаково у failover и race: по паузам группа решает, кого спрашивать (grp_ask). */
+static void member_note(struct dup *g, size_t pos, int good, long sent_ms) {
     struct dpause *p = &g->gp[pos];
-    if (g->cfg.grp == DNSG_FAILOVER) {
-        if (good) dpause_ok(p);
-        else dpause_fail(p, dup_now_ms());
-    } else if (good) {
-        p->ok++;
-    } else {
-        p->fail++;
-    }
+    if (good) dpause_ok_at(p, sent_ms);
+    else dpause_fail(p, dup_now_ms());
 }
 
 static void member_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, size_t qn) {
@@ -150,7 +158,7 @@ static void member_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *
     s->st = 2;
     r->outstanding--;
     int good = dup_ans_good(ans, n);
-    if (greq_alive(r) && s->pos < r->g->cfg.gm_n) member_note(r->g, s->pos, good);
+    if (greq_alive(r) && s->pos < r->g->cfg.gm_n) member_note(r->g, s->pos, good, s->sent_ms);
     if (!r->done && good) {
         r->done = 1;
         if (greq_alive(r)) { r->g->q_ok++; r->g->ok_ms = dup_now_ms(); }
@@ -174,12 +182,13 @@ static void greq_step(struct greq *r) {
         struct gsub *s = &r->sub[pos];
         unsigned idx = r->g->cfg.gm[pos];
         s->st = 1;
+        s->sent_ms = dup_now_ms();
         r->outstanding++;
         if (idx >= g_dups_n || !g_dups[idx] || g_dups[idx] == r->g || g_dups[idx]->cfg.grp ||
             dup_ask(idx, r->q, r->qn, member_done, s) != 0) {
             r->outstanding--;
             s->st = 2;
-            member_note(r->g, pos, 0);
+            member_note(r->g, pos, 0, s->sent_ms);
             if (!race) r->want++;
             continue;
         }
@@ -205,22 +214,36 @@ int grp_ask(struct dup *g, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx
     memcpy(r->q, q, n);
     r->qn = (uint16_t)n;
     for (size_t i = 0; i < m; i++) { r->sub[i].r = r; r->sub[i].pos = i; }
-    /* Порядок: без паузы — по спеке; на паузе — следом, по сроку её окончания (у race порядок —
-     * только очерёдность отправки). */
+    /* Порядок и состав. Без паузы — по спеке. Все на паузе (выживание): ОДНА попытка через наименее
+     * плохого — с самым коротким нынешним сроком паузы (меньше подряд отказов), при равных — чья пауза
+     * кончается раньше; не обход всех и не веер. Отказавший уходит на паузу вдвое длиннее, и со
+     * следующим вопросом наименее плохим становится другой. Часть на паузе: race спрашивает только
+     * тех, кто без паузы (известно плохих не дёргает), failover ставит их следом, по сроку окончания
+     * паузы, — запасной ход, если отказали все без паузы. */
     long now = dup_now_ms();
     size_t k = 0;
     for (size_t i = 0; i < m; i++)
-        if (g->cfg.grp == DNSG_RACE || !dpause_on(&g->gp[i], now)) ord[k++] = i;
-    size_t first_paused = k;
-    for (size_t i = 0; i < m && g->cfg.grp != DNSG_RACE; i++)
-        if (dpause_on(&g->gp[i], now)) {
-            size_t j = k++;
-            while (j > first_paused && g->gp[ord[j - 1]].until_ms > g->gp[i].until_ms) {
-                ord[j] = ord[j - 1];
-                j--;
-            }
-            ord[j] = i;
+        if (!dpause_on(&g->gp[i], now)) ord[k++] = i;
+    if (!k) {
+        size_t best = 0;
+        for (size_t i = 1; i < m; i++) {
+            const struct dpause *a = &g->gp[i], *b = &g->gp[best];
+            if (a->step_ms < b->step_ms || (a->step_ms == b->step_ms && a->until_ms < b->until_ms)) best = i;
         }
+        ord[k++] = best;
+    } else if (g->cfg.grp != DNSG_RACE) {
+        size_t first_paused = k;
+        for (size_t i = 0; i < m; i++)
+            if (dpause_on(&g->gp[i], now)) {
+                size_t j = k++;
+                while (j > first_paused && g->gp[ord[j - 1]].until_ms > g->gp[i].until_ms) {
+                    ord[j] = ord[j - 1];
+                    j--;
+                }
+                ord[j] = i;
+            }
+    }
+    r->n = k;
     r->link = g_greqs;
     g_greqs = r;
     g->q_sent++;

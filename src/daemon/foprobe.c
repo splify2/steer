@@ -18,6 +18,7 @@
 
 #include "loop.h"
 #include "foprobe.h"
+#include "sockmark.h"
 
 #define LOG_W "steer[warn] failover: "
 
@@ -113,6 +114,8 @@ struct foprobe *foprobe_tcp(struct loop *l, const char *dev, const char *host, i
     if (inet_aton(host, &a) == 0) return NULL;
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return NULL;
+    /* Бит «не твой» общему zapret (sockmark.h): проба — собственный сокет steer. */
+    steer_sock_mark(fd, 0);
     if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, dev, (socklen_t)strlen(dev) + 1) != 0) {
         close(fd);
         return NULL;

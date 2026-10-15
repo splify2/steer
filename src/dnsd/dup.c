@@ -59,6 +59,7 @@
 #include "doq.h"
 #include "doh2.h"
 #include "dupq.h"
+#include "sockmark.h"
 
 /* Обёртка QUIC — через шов dupq.h, слабыми ссылками, как и TLS ниже: в статической базовой сборке
  * (без src/proto/quic) DoQ-апстрим отвечает причиной в status, а сборка не падает. В разделяемой
@@ -531,7 +532,7 @@ static void up_backoff(struct dup *up) {
 static int tcp_dial(struct dup *up, struct dconn *c) {
     int fd = socket(up->srv.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
-    if (up->cfg.mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &up->cfg.mark, sizeof(up->cfg.mark)) != 0) {
+    if (steer_sock_mark(fd, up->cfg.mark) != 0) {
         close(fd);
         return -1;
     }
@@ -1469,7 +1470,7 @@ static int udp_open(struct dup *up) {
     if (!up->srv_ok) return -1;
     int fd = socket(up->srv.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
-    if (up->cfg.mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &up->cfg.mark, sizeof(up->cfg.mark)) != 0) {
+    if (steer_sock_mark(fd, up->cfg.mark) != 0) {
         close(fd);
         return -1;
     }

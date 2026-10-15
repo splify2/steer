@@ -102,6 +102,8 @@ build/bench-*
 build/xsbench-*
 build/ext-sym
 build/scryptomatch
+build/scryptomatch-own
+build/cpmatch
 build/xsepochmatch
 build/steer-hub-native
 build/asan-probe*

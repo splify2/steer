@@ -34,6 +34,8 @@
 #include "tls13.h"
 #include "reality.h"
 #include "dupq.h"
+#include "thrstack.h"
+#include "sockmark.h"
 
 /* Контекст TLS соединений DoQ (корни разбираются один раз на процесс) готовит шов dupq.h — здесь,
  * в потоке установки: разбор файла корней блокирует, а цикл резолвера — нет. Корни те же, что у DoT:
@@ -125,7 +127,7 @@ static int boot_ask(const struct sockaddr_storage *srv, unsigned mark, const cha
     q[qn++] = 0; q[qn++] = 1;
     int fd = socket(srv->ss_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
-    if (mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0) { close(fd); return -1; }
+    if (steer_sock_mark(fd, mark) != 0) { close(fd); return -1; }
     int found = -1;
     if (connect(fd, (const struct sockaddr *)srv, (socklen_t)sa_len(srv)) == 0 &&
         send(fd, q, qn, MSG_NOSIGNAL) == (ssize_t)qn) {
@@ -197,7 +199,7 @@ int dup_bootstrap(const char *host, const char (*boot)[46], size_t boot_n, unsig
 static int connect_to(const struct sockaddr_storage *a, unsigned mark, long deadline) {
     int fd = socket(a->ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
-    if (mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0) goto fail;
+    if (steer_sock_mark(fd, mark) != 0) goto fail;
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     if (connect(fd, (const struct sockaddr *)a, (socklen_t)sa_len(a)) != 0) {
@@ -386,7 +388,7 @@ int dial_launch(struct dial *d) {
     int attr_ok = pthread_attr_init(&at) == 0;
     if (attr_ok) {
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-        pthread_attr_setstacksize(&at, 256 * 1024);
+        pthread_attr_setstacksize(&at, thread_stack(256 * 1024));
     }
     pthread_t th;
     int rc = pthread_create(&th, attr_ok ? &at : NULL, dial_thread, d);

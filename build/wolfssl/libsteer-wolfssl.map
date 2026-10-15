@@ -17,6 +17,8 @@
     wc_AesSetKey;
     wc_ChaCha20Poly1305_Decrypt_ex;
     wc_ChaCha20Poly1305_Encrypt_ex;
+    wc_Chacha_Process;
+    wc_Chacha_SetIV;
     wc_Chacha_SetKey;
     wc_curve25519_generic;
     wc_curve25519_make_pub;

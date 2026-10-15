@@ -305,12 +305,53 @@ struct conn {
      * FIN сказал бы «ответ кончился», и обрезанная закачка выглядела бы целой. Ставится вместе с
      * srv_closed. */
     uint8_t aborted;
+    /* Сегменты клиента, пришедшие РАНЬШЕ ожидаемого (ooo_hold), или NULL. Заводится только при
+     * переупорядочивании и освобождается, как только дыра закрыта. */
+    struct ooo *ooo;
 };
 
 /* Горячая запись обязана оставаться маленькой — в этом весь смысл разделения. Проверка
  * сборкой, а не обещанием в комментарии: буфер, добавленный сюда «на время отладки», иначе
  * вернёт таблицу к 5,8 МБ, и заметить это можно будет только по скорости на роутере. */
 typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
+
+/* ---- сегменты клиента не по порядку ------------------------------------------------------------
+ *
+ * ЗАЧЕМ. Пакеты одного соединения доходят до устройства не всегда по порядку: ядро пересылает их с
+ * интерфейса клиента на разных процессорах, и сегмент за дырой обгоняет сегмент перед ней (стенд
+ * sigpipe, захват на устройстве: 78841:110961 раньше 75921:78841). Принимали мы только ожидаемый номер,
+ * а пришедшее раньше выбрасывали с одним повторным ACK на порцию — SACK мы не шлём, — и клиенту не
+ * хватало ни подтверждений для быстрого повтора, ни сведений, что именно потеряно. Оставался таймер:
+ * 0,2 с, потом вдвое, и после каждого срока Linux (F-RTO) шлёт вперемешку повтор и новые данные — новые
+ * снова приходили «раньше» и снова выбрасывались. Выгрузка вставала на 0,2 + 0,4 + … + 6,5 с, и клиент
+ * обрывал её по своему сроку (sigpipe: «выгрузка застряла на записи», чаще при нескольких очередях
+ * устройства — там переупорядочивание вероятнее). Та же спираль, что у ранних данных (conn_room), только
+ * причина — порядок, а не место.
+ *
+ * КАК. Пришедшее раньше ожидаемого — в пределах окна — откладывается копией пакета (ooo_hold), а как
+ * только принят ожидаемый сегмент, отложенные с подходящим номером разбираются тем же путём, что и
+ * свежий пакет (ooo_drain): данные, подтверждения, FIN — ровно как если бы они пришли по порядку.
+ *
+ * ПРЕДЕЛЫ — по памяти, с причиной. OOO_SEGS = 64 на соединение: порция из TUN — 64 пакета
+ * (TUN_DRAIN_MAX), и обгон больше чем на порцию — уже не переупорядочивание, а потеря. OOO_WORKER_BYTES =
+ * 2 МБ на рабочий поток: столько готовы держать под чужую дыру на роутере со 128 МБ; дальше — как
+ * прежде, выбрасываем и ждём повтора. Память берётся, только когда обгон случился. */
+#define OOO_SEGS 64
+#define OOO_WORKER_BYTES (2u << 20)
+struct ooo {
+    uint32_t n;
+    uint8_t busy;                  /* ooo_drain идёт — вложенный вызов не нужен */
+    struct { uint32_t seq, len; unsigned char *pkt; } s[OOO_SEGS];
+};
+static __thread size_t g_ooo_bytes;
+
+static void ooo_free(struct conn *c) {
+    struct ooo *o = c->ooo;
+    if (!o) return;
+    for (uint32_t i = 0; i < o->n; i++) { g_ooo_bytes -= o->s[i].len; free(o->s[i].pkt); }
+    free(o);
+    c->ooo = NULL;
+}
 
 /* Биты поля armed. */
 #define ARM_IN  1
@@ -1537,6 +1578,7 @@ static void conn_drop(struct conn *c) {
     }
     rtx_done(&c->rtx);
     free(c->early);
+    ooo_free(c);
     /* Толстую половину НЕ трём целиком: десятки килобайт memset на каждое закрытие — это
      * десятки килобайт, прогнанных через кэш ради нулей, которые всё равно перепишет открытие
      * связи. Сессию к новому соединению готовит дайлер (clear), трогая только её начало. */
@@ -2306,7 +2348,65 @@ static int up_add(struct conn *c, const struct tun_dev *tun, uint32_t seq, const
     return 0;
 }
 
-static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, size_t n) {
+/* Соединение, у которого в этом пакете принят ожидаемый сегмент, а отложенные ждут (ooo_drain). */
+static __thread struct conn *g_ooo_conn;
+
+/* Отложить сегмент, пришедший раньше ожидаемого: копия пакета целиком, разберётся позже тем же путём. */
+static void ooo_hold(struct conn *c, const unsigned char *pkt, size_t n, uint32_t seq) {
+    if (!c->ooo) {
+        c->ooo = calloc(1, sizeof(*c->ooo));
+        if (!c->ooo) return;
+    }
+    struct ooo *o = c->ooo;
+    for (uint32_t i = 0; i < o->n; i++)
+        if (o->s[i].seq == seq) return;             /* повтор уже отложенного */
+    if (o->n >= OOO_SEGS || g_ooo_bytes + n > OOO_WORKER_BYTES) return;
+    unsigned char *copy = malloc(n);
+    if (!copy) return;
+    memcpy(copy, pkt, n);
+    o->s[o->n].seq = seq;
+    o->s[o->n].len = (uint32_t)n;
+    o->s[o->n].pkt = copy;
+    o->n++;
+    g_ooo_bytes += n;
+}
+
+static void handle_packet_one(const struct tun_dev *tun, const unsigned char *pkt, size_t n);
+
+/* Разобрать отложенные сегменты, которые теперь по порядку. Устаревшие (их байты уже приняты повтором)
+ * выбрасываются. Разбор — handle_packet_one, как у свежего пакета: он может и закрыть соединение (RST,
+ * отказ узла), тогда conn_drop освобождает остаток, и мы выходим, не трогая его. */
+static void ooo_drain(struct conn *c, const struct tun_dev *tun) {
+    struct ooo *o = c->ooo;
+    if (!o || o->busy) return;
+    o->busy = 1;
+    for (;;) {
+        uint32_t want = c->client_seq + (g_up.c == c ? g_up.n : 0);
+        int found = -1;
+        for (uint32_t i = 0; i < o->n; ) {
+            if (o->s[i].seq == want) { found = (int)i; break; }
+            if ((int32_t)(o->s[i].seq - want) < 0) {   /* уже принято повтором */
+                g_ooo_bytes -= o->s[i].len;
+                free(o->s[i].pkt);
+                o->s[i] = o->s[--o->n];
+                continue;
+            }
+            i++;
+        }
+        if (found < 0) break;
+        unsigned char *p = o->s[found].pkt;
+        uint32_t len = o->s[found].len;
+        g_ooo_bytes -= len;
+        o->s[found] = o->s[--o->n];
+        handle_packet_one(tun, p, len);
+        free(p);
+        if (c->ooo != o) return;                    /* соединение закрыто при разборе */
+    }
+    o->busy = 0;
+    if (!o->n) { free(o); c->ooo = NULL; }
+}
+
+static void handle_packet_one(const struct tun_dev *tun, const unsigned char *pkt, size_t n) {
     struct flow_key k;
     size_t off = 0;
 
@@ -2580,14 +2680,22 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
     if (!data_n && !fin && k.seq == c->client_seq - 1) { c->ack_due = 1; return; }
     if (!data_n && !fin) return;                    /* чистый ACK */
 
-    /* Не по порядку — отбрасываем. Буфер переупорядочивания на каждое соединение это как
-     * раз та память, которой на слабой коробке нет; клиент повторит.
+    /* Не по порядку: сегмент за дырой откладывается (ooo_hold, память — только при обгоне), остальное
+     * отбрасывается, клиент повторит.
      *
      * Но не молча (I-321): отвечаем подтверждением ожидаемого номера. Сегмент за дырой
      * значит, что предыдущий потерян, и именно дубликаты ACK запускают у клиента быстрый
      * повтор — без них дыра закрывалась только по таймауту. Повтор уже принятого значит,
      * что потерялся наш ACK, и без ответа клиент повторял бы до исчерпания попыток. */
-    if (k.seq != c->client_seq + (g_up.c == c ? g_up.n : 0)) { c->ack_due = 1; return; }
+    uint32_t want_seq = c->client_seq + (g_up.c == c ? g_up.n : 0);
+    if (k.seq != want_seq) {
+        /* Раньше ожидаемого и в пределах окна — отложить до закрытия дыры (ooo_hold). */
+        if (data_n && (int32_t)(k.seq - want_seq) > 0 && k.seq - want_seq < (64u << 20))
+            ooo_hold(c, pkt, n, k.seq);
+        c->ack_due = 1;
+        return;
+    }
+    if (c->ooo && c->ooo->n) g_ooo_conn = c;
 
     /* Хвост ранних данных ещё не ушёл (окно h2 было закрыто на готовности потока):
      * свежие данные вперёд него отправлять нельзя — байты поменяются местами. Не
@@ -2630,6 +2738,15 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
      * устройство незачем: за проход их приезжает до шестидесяти четырёх, и все они
      * подтверждаются одним ACK с последним номером. */
     c->ack_due = 1;
+}
+
+/* Пакет клиента — и следом отложенные сегменты того же соединения, ставшие по порядку (ooo_drain). */
+static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, size_t n) {
+    g_ooo_conn = NULL;
+    handle_packet_one(tun, pkt, n);
+    struct conn *c = g_ooo_conn;
+    g_ooo_conn = NULL;
+    if (c) ooo_drain(c, tun);
 }
 
 /* Придержать ли подтверждение клиенту (DC_ACK_PACED, dialer.h): очередь к узлу выше нижней
