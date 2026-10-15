@@ -414,6 +414,53 @@ static void test_brutal_share(void) {
     CHECK(hy2_worker_busy(125000, 1000, 8000000));
     CHECK(hy2_worker_busy(500000, 1000, 8000000));
     CHECK(!hy2_worker_busy(124999, 1000, 8000000));
+    /* границы 64 бит */
+    const uint64_t M = UINT64_MAX;
+    CHECK(!hy2_worker_busy(0, 0, 0));
+    CHECK(!hy2_worker_busy(0, M, M));
+    CHECK(hy2_worker_busy(1, 0, M));
+    CHECK(hy2_worker_busy(M, 0, 0));
+    CHECK(hy2_worker_busy(1, 1, 0));
+    CHECK(hy2_worker_busy(1, 1, 64000));                /* равенство */
+    CHECK(!hy2_worker_busy(1, 1, 64001));
+    CHECK(hy2_worker_busy(M, 1, M));
+    CHECK(hy2_worker_busy(M, M, 64000));                /* M*64000 >= 64000*M */
+    CHECK(!hy2_worker_busy(M, M, M));
+    CHECK(!hy2_worker_busy(1, M, 1));
+    CHECK(hy2_worker_busy(1, 1, M) == 0);
+    CHECK(hy2_worker_busy(M, 1000, M));
+    CHECK(!hy2_worker_busy(1, M, M));
+    CHECK(hy2_worker_busy(125000, 1, 8000000));
+    CHECK(hy2_worker_busy(125, 1, 8000));
+#ifdef __SIZEOF_INT128__
+    {
+        uint64_t x = 0x9e3779b97f4a7c15ull;
+        static const uint64_t edge[] = { 0, 1, 2, 63999, 64000, 64001, 0xffffffffull,
+                                         0x100000000ull, M - 1, M };
+        for (unsigned i = 0; i < 200000; i++) {
+            uint64_t v[3];
+            for (int k = 0; k < 3; k++) {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                unsigned sh = (unsigned)(x >> 58);          /* разный порядок величин */
+                v[k] = (i % 5 == 0) ? edge[(x >> 20) % 10] : (x >> sh);
+            }
+            int want = v[0] ? (!v[1] ? 1 :
+                       ((unsigned __int128)v[0] * 64000u >= (unsigned __int128)v[2] * v[1])) : 0;
+            CHECK(hy2_worker_busy(v[0], v[1], v[2]) == want);
+        }
+        /* равенство и соседи вокруг него в широком диапазоне */
+        for (unsigned i = 0; i < 20000; i++) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            uint64_t ms = (x >> 40) + 1, sh = (x >> 8) & 0xffffffffffull;
+            unsigned __int128 need = (unsigned __int128)sh * ms;
+            if (need % 64000u) continue;
+            unsigned __int128 b = need / 64000u;
+            if (b >> 64) continue;
+            CHECK(hy2_worker_busy((uint64_t)b, ms, sh));
+            if (b > 1) CHECK(!hy2_worker_busy((uint64_t)b - 1, ms, sh));
+        }
+    }
+#endif
 }
 
 int main(void) {
