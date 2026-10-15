@@ -401,7 +401,7 @@ check "обвязка прогона в образе есть и исполня�
 check "релиз зовёт стенды расширенной части в образе" "1" \
     "$(grep -c 'build/ext-test-image.sh' "$wf")"
 check "обвязка в образе зовёт tests/ext-test.sh" "1" \
-    "$(grep -c 'exec sh tests/ext-test.sh' build/ext-test-image.sh)"
+    "$(grep -c 'BUILD=.*sh tests/ext-test.sh' build/ext-test-image.sh)"
 # Громкий пропуск ext-test.sh выходит НУЛЁМ (так задумано), поэтому шаг обязан проверять
 # признак прохода отдельно — иначе он зелёный, не прогнав ни одного стенда.
 check "релиз отличает пропуск от прохода" "1" \
@@ -1082,6 +1082,14 @@ check "exports-ext.lst: каждый символ экспортируется l
 # выпуск без него не выходит. Поднятая VERSION без раздела ловится здесь, а не на кнопке выпуска.
 check "CHANGELOG.md: есть раздел текущей VERSION" "1" \
     "$(grep -cx "## $(cat VERSION)" CHANGELOG.md 2>/dev/null)"
+
+# ---- владелец каталогов, которые пишет docker (STEER-CORE-895) -------------------------------
+check "build.sh: build/libs/<арх> снимается через docker, а не голым rm -rf \$libs" "0" \
+    "$(grep -c '^ *rm -rf "\$libs"' build.sh)"
+check "build.sh: rm_libs вызывает docker run ... rm" "1" \
+    "$(grep -c 'docker run --rm -v "\$PWD:/src" --entrypoint rm' build.sh)"
+check "ext-test-image.sh: trap EXIT возвращает владельца build" "1" \
+    "$(grep -c "trap 'chown -R \"\$OWNER\"" build/ext-test-image.sh)"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

@@ -53,6 +53,16 @@ fails=0
 # с mbedtls 3.6.2 этой сборке не годится — в нём нет исходников wolfSSL.
 IMAGE="${STEER_BUILDER_IMAGE:-steer-builder:wolfssl}"
 
+# Снять каталог выхода libs. Его создаёт docker (от root), и на машине без root (GitHub Actions)
+# `rm -rf` снаружи падал «Permission denied» — а при set -e это роняло всю сборку. Снимаем внутри
+# контейнера; обычный rm — для каталога, который и так наш. Не вышло — возврат 1, решает вызывающий.
+rm_libs() {
+    rm -rf "$1" 2>/dev/null || true
+    [ -e "$1" ] || return 0
+    docker run --rm -v "$PWD:/src" --entrypoint rm "$IMAGE" -rf "/src/$1" >/dev/null 2>&1 || true
+    [ ! -e "$1" ]
+}
+
 # Собрать образ, если его нет. Иначе первая же сборка на чужой машине упирается в
 # «Unable to find image», и человек ищет, откуда его взять, — а он описан прямо здесь,
 # в build/Dockerfile.
@@ -339,7 +349,12 @@ for spec in $ISAS; do
     # абсолютному пути и обязан совпасть с файлом musl на роутере.
     printf '  %-26s ' "$arch (libs)"
     libs="build/libs/$arch"
-    rm -rf "$libs"
+    if ! rm_libs "$libs"; then
+        echo "FAILED — не удалось снять $libs (владелец root?)"
+        fails=$((fails + 1))
+        rm -f "$OUT"/steer-*_"$arch".apk "$OUT"/steer-*_"$arch".ipk
+        continue
+    fi
     # Объектные файлы снимаются и владелец выхода возвращается ВНУТРИ контейнера: docker пишет от
     # root, и на машине без root (GitHub Actions) `rm -rf obj` снаружи падал «Permission denied».
     if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh \
@@ -351,7 +366,7 @@ for spec in $ISAS; do
         echo "libsteer $(stat -c %s "$libs"/libsteer.so.*) + wolfssl $(stat -c %s "$libs"/libsteer-wolfssl.so.*)" \
              "+ steerd $(stat -c %s "$libs/steerd") bytes"
     else
-        rm -rf "$libs"
+        rm_libs "$libs" || echo "    (не удалось снять $libs)"
         echo "FAILED — $(grep -m1 error "build/$arch-libs.err" || head -1 "build/$arch-libs.err")"
         fails=$((fails + 1))
         # Пакеты этой архитектуры от прошлой сборки — не этой: оставь их в $OUT, и список «packages»
