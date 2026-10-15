@@ -111,16 +111,18 @@ jobs:
             exit 1
           fi
           # Ожидаемое число считается из самого build.sh, а не вписано сюда числом:
-          # список архитектур меняется, и константа разошлась бы с ним молча. На каждую
-          # архитектуру восемь пакетов: steer-core (ядро с общими библиотеками), модули steer-vless,
-          # steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy и мета-пакет
-          # steer-extended — и это в КАЖДОМ из двух форматов. Список архитектур — build/arches.sh.
+          # списки архитектур и пакетов меняются, и константа разошлась бы с ними молча
+          # (так было с steer-warpbox: пакетов стало девять, а барьер ждал восемь). На каждую
+          # архитектуру — все пакеты из OURS в build.sh (ядро, модули, мета-пакет steer-extended),
+          # и это в КАЖДОМ из двух форматов. Список архитектур — build/arches.sh.
           arch_n=$(sed -n '/^ISAS="/,/^"$/p' build/arches.sh | grep -c '^[a-z0-9_.-]*:')
-          want=$((arch_n * 8))
+          pkg_n=$(sed -n 's/^OURS="\(.*\)"$/\1/p' build.sh | wc -w)
+          [ "$pkg_n" -gt 0 ] || { echo "::error::в build.sh не найден список пакетов OURS"; exit 1; }
+          want=$((arch_n * pkg_n))
           for ext in apk ipk; do
             n=$(ls out/*."$ext" 2>/dev/null | wc -l)
             [ "$n" -eq "$want" ] || {
-              echo "::error::пакетов .$ext — $n, а ожидалось $want (архитектур $arch_n × 8)"
+              echo "::error::пакетов .$ext — $n, а ожидалось $want (архитектур $arch_n × пакетов $pkg_n)"
               ls -la out/ 2>/dev/null
               exit 1; }
             echo "собрано .$ext: $n из $want ожидаемых"

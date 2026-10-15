@@ -639,9 +639,22 @@ uint64_t hy2_brutal_share(uint64_t cap, unsigned n) {
     return s ? s : 1;
 }
 
+/* a * b целиком, 128 бит парой слов: на 32-битных целях __int128 нет */
+static void mul64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo) {
+    uint64_t a0 = (uint32_t)a, a1 = a >> 32;
+    uint64_t b0 = (uint32_t)b, b1 = b >> 32;
+    uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+    uint64_t mid = (p00 >> 32) + (uint32_t)p01 + (uint32_t)p10;
+    *lo = (mid << 32) | (uint32_t)p00;
+    *hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+}
+
 int hy2_worker_busy(uint64_t bytes, uint64_t ms, uint64_t share_bps) {
     if (!bytes) return 0;
     if (!ms) return 1;
     /* bytes * 8000 / ms >= share_bps / 8, без деления */
-    return (unsigned __int128)bytes * 64000u >= (unsigned __int128)share_bps * ms;
+    uint64_t lh, ll, rh, rl;
+    mul64(bytes, 64000u, &lh, &ll);
+    mul64(share_bps, ms, &rh, &rl);
+    return lh > rh || (lh == rh && ll >= rl);
 }
