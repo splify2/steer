@@ -16,9 +16,15 @@
 
 /* ---- заглушки ------------------------------------------------------------------------------ */
 
-static unsigned char g_tx[8192];
+static unsigned char g_tx[65536];
 static size_t g_tx_n;
-static const unsigned char *g_rx;     /* ответ сервера: отдаётся кусками по g_rx_chunk */
+/* Окно отправки подменного транспорта (как у HTTP/2): g_win < 0 — предела нет, иначе запись сверх
+ * g_win байт с g_win_base отвечает H2_EWINDOW целиком. */
+static long g_win = -1;
+static size_t g_win_base;
+static unsigned g_body_seals;           /* запечатанных кусков тела (AEAD без aad) */
+static long g_first_cnt = -1;           /* счётчик первого запечатанного куска */
+static const unsigned char *g_rx;    /* ответ сервера: отдаётся кусками по g_rx_chunk */
 static size_t g_rx_n, g_rx_off, g_rx_chunk = 4096;
 
 time_t stack_now_s(void) { return time(NULL); }
@@ -28,9 +34,16 @@ int px_stream_open(const struct px_node *n, struct transport *t, int timeout_s) 
 }
 int transport_write(struct transport *t, const unsigned char *d, size_t n) {
     (void)t;
+    if (g_win >= 0 && (long)(g_tx_n - g_win_base + n) > g_win) return H2_EWINDOW;
     if (g_tx_n + n > sizeof g_tx) return TR_EIO;
     memcpy(g_tx + g_tx_n, d, n); g_tx_n += n;
     return 0;
+}
+long transport_room(struct transport *t) {
+    (void)t;
+    if (g_win < 0) return -1;
+    long r = g_win - (long)(g_tx_n - g_win_base);
+    return r > 0 ? r : 0;
 }
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     (void)t;
@@ -67,7 +80,12 @@ int sc_aead_setkey(struct sc_aead *k, enum sc_aead_alg a, const unsigned char *k
 void sc_aead_free(struct sc_aead *k) { k->alg = 0; }
 int sc_aead_seal(struct sc_aead *k, const unsigned char nonce[12], const void *aad, size_t aad_n,
                  unsigned char *buf, size_t n, unsigned char tag[16]) {
-    (void)k; (void)nonce; (void)aad; (void)aad_n; (void)buf; (void)n; memset(tag, 0, 16); return 0;
+    (void)k; (void)aad_n; (void)buf; (void)n;
+    if (!aad) {
+        if (g_first_cnt < 0) g_first_cnt = (nonce[0] << 8) | nonce[1];
+        g_body_seals++;
+    }
+    memset(tag, 0, 16); return 0;
 }
 int sc_aead_open(struct sc_aead *k, const unsigned char nonce[12], const void *aad, size_t aad_n,
                  unsigned char *buf, size_t n, const unsigned char tag[16]) {
@@ -252,6 +270,67 @@ static void test_vmess_key_fail(void) {
     free(sess);
 }
 
+/* Окно HTTP/2 закрылось (H2_EWINDOW): SEND_AGAIN — «ничего не ушло, повторить те же байты». Счётчик
+ * кусков и маска SHAKE двигаться не вправе, иначе повтор уйдёт со следующим nonce и сервер порвёт поток. */
+static void *vm_open(const struct dialer_ops *ops, struct px_node *n, struct flow_key *k) {
+    void *sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    ops->flow_open(n, sess, k, 0);
+    ops->connect(n, sess, 2);
+    feed_reset(NULL, 0);
+    g_first_cnt = -1; g_body_seals = 0; g_win = -1; g_win_base = 0;
+    return sess;
+}
+
+static void test_vmess_window(void) {
+    const struct dialer_ops *ops = &proxy_vmess_dialer;
+    struct px_node n; memset(&n, 0, sizeof n);
+    n.proto = PX_VMESS; n.vmess_sec = VMESS_AES128_GCM;
+    struct flow_key k; memset(&k, 0, sizeof k);
+    static unsigned char big[40000];
+    memset(big, 'x', sizeof big);
+
+    /* Заголовок уже ушёл; окно закрыто на первой записи тела. */
+    void *sess = vm_open(ops, &n, &k);
+    check("vmess: заголовок и первый кусок", SEND_OK, ops->send(&n, sess, &k, 0, (const unsigned char *)"hello", 5));
+    g_win = 0; g_win_base = g_tx_n; g_body_seals = 0; g_first_cnt = -1;
+    size_t tx0 = g_tx_n;
+    check("vmess: окно закрыто — SEND_AGAIN", SEND_AGAIN, ops->send(&n, sess, &k, 0, (const unsigned char *)"world", 5));
+    check("vmess: SEND_AGAIN — на провод ни байта", 0, (long)(g_tx_n - tx0));
+    check("vmess: SEND_AGAIN — ничего не запечатано", 0, (long)g_body_seals);
+    g_win = -1;
+    check("vmess: повтор после открытия окна", SEND_OK, ops->send(&n, sess, &k, 0, (const unsigned char *)"world", 5));
+    check("vmess: повтор — тот же nonce (счётчик 1)", 1, g_first_cnt);
+    check("vmess: повтор — один кусок 2+5+16", 2 + 5 + 16, (long)(g_tx_n - tx0));
+    ops->close(sess); free(sess);
+
+    /* Тело в несколько кусков (> буфера): окно вмещает часть — отказ целиком, ничего не ушло. */
+    sess = vm_open(ops, &n, &k);
+    check("vmess: заголовок ушёл", SEND_OK, ops->send(&n, sess, &k, 0, (const unsigned char *)"a", 1));
+    tx0 = g_tx_n; g_body_seals = 0; g_first_cnt = -1;
+    g_win = 30000; g_win_base = g_tx_n;
+    check("vmess: окно меньше тела — SEND_AGAIN", SEND_AGAIN, ops->send(&n, sess, &k, 0, big, sizeof big));
+    check("vmess: большое тело — на провод ни байта", 0, (long)(g_tx_n - tx0));
+    check("vmess: большое тело — ничего не запечатано", 0, (long)g_body_seals);
+    g_win = -1;
+    check("vmess: большое тело повтором", SEND_OK, ops->send(&n, sess, &k, 0, big, sizeof big));
+    check("vmess: большое тело — счётчик с 1", 1, g_first_cnt);
+    ops->close(sess); free(sess);
+
+    /* Заголовок ещё не ушёл: SEND_AGAIN, повтор с нуля проходит. */
+    sess = vm_open(ops, &n, &k);
+    g_win = 0; g_win_base = 0;
+    check("vmess: окно закрыто до заголовка — SEND_AGAIN", SEND_AGAIN, ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5));
+    check("vmess: до заголовка — на провод ни байта", 0, (long)g_tx_n);
+    check("vmess: до заголовка — ничего не запечатано", 0, (long)g_body_seals);
+    g_win = -1;
+    check("vmess: повтор запроса с нуля", SEND_OK, ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5));
+    check("vmess: запрос — заголовок и кусок", 16 + 18 + 8 + 49 + 16 + 2 + 5 + 16, (long)g_tx_n);
+    check("vmess: запрос — счётчик с 0", 0, g_first_cnt);
+    ops->close(sess); free(sess);
+    g_win = -1;
+}
+
 /* ---- shadowsocks 2022 ----------------------------------------------------------------------- */
 
 static void test_ss2022_big_chunk(void) {
@@ -429,6 +508,7 @@ int main(void) {
     test_ss_down_room();
     test_vmess_down_room();
     test_vmess_key_fail();
+    test_vmess_window();
     test_http_early_bytes();
     test_trojan_udp();
     test_http_long_auth();
