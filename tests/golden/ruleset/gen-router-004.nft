@@ -22,8 +22,12 @@ table inet steer {
         meta mark and 0x0ff00000 == 0x00000000 return
         meta mark and 0x0ff00000 == 0x00100000 oifname != "wg0" counter drop comment "steer-guard:vpn"
     }
+    chain postrouting_nat4 {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "wg0" meta nfproto ipv4 counter masquerade comment "steer-nat4:vpn"
+    }
     chain prerouting_dns {
-        type nat hook prerouting priority dstnat; policy accept;
+        type nat hook prerouting priority dstnat - 2; policy accept;
         iifname "br-lan" udp dport 53 counter redirect to :5300
         iifname "br-lan" tcp dport 53 counter redirect to :5300
     }

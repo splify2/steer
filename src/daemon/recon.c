@@ -473,9 +473,14 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, cons
         for (size_t i = 0; i < st->n; i++) {
             const struct recon_out *was = &st->out[i];
             const struct recon_out *now = out_find(p->out, p->n, was->name);
+            /* Был awg — больше не awg: устройство снимает проход awg (awg_apply_all), и спрашивать это
+             * надо ДО сверки метки и таблицы. Член kind: warp при смене transport с awg на masque
+             * сохраняет имя, метку и таблицу, и раньше проход awg для него не звался: устройство
+             * AmneziaWG оставалось, а TUN с тем же именем модуль создать не мог («Invalid argument»,
+             * стенд QEMU 2026-10-12). */
+            if (was->awg && (!now || !now->awg)) d->awg = 1;
             if (now && now->mark == was->mark && now->table == was->table) continue;
             drop_add(d, p, was->mark, was->table);
-            if (was->awg && (!now || !now->awg)) d->awg = 1;
         }
     free(rules);
     free(rules6);

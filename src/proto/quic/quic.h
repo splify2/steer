@@ -32,8 +32,14 @@
  * ЧТО ЗДЕСЬ НАМЕРЕННО ПРОСТО. Один путь (без миграции), одна пара адресов, без 0-RTT и билетов
  * сессии, без переупорядочения приёма потоков: данные передаются потребителю сразу, окно
  * приёма продлевается сразу (обратного давления на отправителя нет — потребитель, которому
- * нужно замедлить, закрывает поток). Отправка — по одной датаграмме UDP за системный вызов, без
- * GSO: на роутере узкое место — не вызовы, а шифр. */
+ * нужно замедлить, закрывает поток).
+ *
+ * ПАКЕТНЫЙ ВВОД-ВЫВОД UDP. Приём — recvmmsg (до 32 датаграмм за вызов), с UDP_GRO ядро склеивает
+ * подряд пришедшие датаграммы одного потока в одну, и слой режет их по размеру сегмента. Отправка —
+ * пачка ngtcp2 (ngtcp2_conn_write_aggregate_pkt) уходит одним sendmsg с UDP_SEGMENT, если датаграммы
+ * одного размера, иначе sendmmsg. Нет UDP_GRO или UDP_SEGMENT в ядре — слой молча остаётся на
+ * recvmmsg и sendmmsg; ошибка GSO при отправке (EIO — устройство без контрольной суммы, EINVAL)
+ * выключает GSO для этого сокета. Порядок, пейсинг и Brutal те же: пачку составляет ngtcp2. */
 #ifndef STEER_QUIC_H
 #define STEER_QUIC_H
 #include <stddef.h>
@@ -116,6 +122,14 @@ struct qc_cfg {
      * (как у эталона), а после рукопожатия отпечаток сверяется, и несовпадение закрывает
      * соединение причиной QC_CLOSE_HANDSHAKE. Работает только с готовым cfg.tls == NULL. */
     const uint8_t *pin_sha256;
+    /* Клиентский сертификат (DER) и его ключ (SEC1 ECPrivateKey, DER): сервер узнаёт клиента по ключу
+     * (MASQUE у WARP — ключ, выданный при регистрации). NULL — без сертификата. Только со своим
+     * контекстом (cfg.tls == NULL). Ключ сервера в таком случае сверяет потребитель
+     * (qc_peer_cert в on_handshake, до первого запроса), а цепочку — никто: insecure = 1. */
+    const uint8_t *client_cert;
+    size_t      client_cert_n;
+    const uint8_t *client_key;
+    size_t      client_key_n;
     const uint8_t *ca_pem;
     size_t      ca_pem_n;
     const char *ca_file;
@@ -177,6 +191,7 @@ struct qc_stats {
     int      handshake_done;
     int      brutal;            /* 1 — работает Brutal */
     uint64_t dg_dropped;        /* датаграмм выброшено из очереди (не влезли в пакет) */
+    uint64_t tx_calls, rx_calls;    /* системных вызовов отправки и приёма UDP (sendmsg/sendmmsg/recvmsg/recvmmsg) */
 };
 
 /* Контекст TLS отдельно от соединения: разбор корней (полторы сотни сертификатов) — не то, что
@@ -206,6 +221,8 @@ int  qc_on_timer(struct qc *q);
 int  qc_run(struct qc *q, int timeout_ms);
 
 int  qc_handshake_done(const struct qc *q);
+/* Листовой сертификат сервера (DER) в out[cap] — после рукопожатия: длина или -1. */
+int  qc_peer_cert(struct qc *q, uint8_t *out, size_t cap);
 /* 0-RTT возможен: рукопожатие ещё идёт, но потоки открывать и слать в них уже можно (cfg.early_data и
  * билет с разрешением early data). После рукопожатия — 0. */
 int  qc_early_ready(const struct qc *q);
@@ -220,6 +237,9 @@ int  qc_stream_open_uni(struct qc *q, int64_t *sid);
 ssize_t qc_stream_send(struct qc *q, int64_t sid, const uint8_t *d, size_t n, int fin);
 /* Не отправленное и не подтверждённое в потоке, байт. */
 size_t qc_stream_buffered(const struct qc *q, int64_t sid);
+/* Сколько байт ещё примет qc_stream_send в этом потоке сейчас (send_buf минус неподтверждённое): окно клиента
+ * у hysteria2 — это и есть это место. */
+size_t qc_stream_room(const struct qc *q, int64_t sid);
 /* Отменить поток (RESET_STREAM и STOP_SENDING с кодом). */
 int  qc_stream_reset(struct qc *q, int64_t sid, uint64_t app_err);
 /* Датаграмма: 0 — в очереди; QC_ETOOBIG — больше qc_datagram_max; QC_EAGAIN — очередь полна (64).
@@ -241,6 +261,20 @@ void qc_flush_credit(struct qc *q);
 int  qc_set_cc(struct qc *q, uint64_t brutal_bps);
 
 void qc_stats_get(struct qc *q, struct qc_stats *st);
+
+/* Внутреннее, для стендов (в libsteer.map нет): включить и выключить пакетные пути сокета —
+ * gso: отправка одним вызовом с UDP_SEGMENT; gro: приём склеенных датаграмм (иначе recvmmsg). */
+void qc_io_force(struct qc *q, int gso, int gro);
+/* Сколько датаграмм из начала списка длин уходит одним вызовом с UDP_SEGMENT: первая задаёт размер
+ * сегмента, следующие — того же размера, меньшая — только последней; не больше 64 сегментов и
+ * 65507 байт. n == 0 — 0, иначе не меньше 1. */
+size_t qc_io_gso_run(const size_t *len, size_t n);
+/* Ошибка errno отправки с UDP_SEGMENT, после которой GSO для сокета выключается (ядро без него,
+ * устройство без контрольной суммы), а не обычная потеря (буфер полон). */
+int qc_io_gso_fatal(int err);
+/* Длина следующего куска склеенного приёма (UDP_GRO) длиной total и размером сегмента seg
+ * (0 — не склеен) начиная со смещения off; 0 — конец. */
+size_t qc_io_gro_next(size_t total, size_t seg, size_t off);
 
 #ifdef QC_WITH_SERVER
 /* Сервер ДЛЯ СТЕНДОВ (ключ QC_WITH_SERVER задают tests/qcloop.c и tests/qcserver.c, в libsteer его

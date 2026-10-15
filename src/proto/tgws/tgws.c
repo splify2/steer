@@ -75,6 +75,7 @@
 #include "reality.h"
 #include "spec.h"
 #include "evline.h"
+#include "thrstack.h"
 
 #define LOG_I "steer[info] tgws: "
 #define LOG_W "steer[warn] tgws: "
@@ -1112,7 +1113,7 @@ static void sock_path(int fd, const char *via) {
      * ответа на TLS ко всем доменам пула, и не грузилось всё, что лежит в ДЦ1, 3, 5 и 203.
      * Домены пула для того и подобраны, чтобы открываться без ухищрений; tg-ws-proxy ходит
      * к ним тоже без обхода. Метка — та, по которой zapret пропускает пакет (DESYNC_MARK). */
-    unsigned mk = ZAPRET_SKIP_MARK;
+    unsigned mk = ZAPRET_SKIP_MARK;         /* и на телефоне: мост там тоже бывает рядом с обходом */
     setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
 }
 
@@ -2952,7 +2953,7 @@ int cmd_tgws(const char *spec, const char *name) {
         pthread_attr_t wa;
         pthread_attr_init(&wa);
         pthread_attr_setdetachstate(&wa, PTHREAD_CREATE_DETACHED);
-        pthread_attr_setstacksize(&wa, 320 * 1024);   /* наполнитель дозванивается тем же кодом */
+        pthread_attr_setstacksize(&wa, thread_stack(320 * 1024));   /* наполнитель дозванивается тем же кодом */
         if (pthread_create(&wt, &wa, warm_filler, NULL) != 0)
             fprintf(stderr, LOG_W "запас соединений не заведён (%s)\n", strerror(errno));
         pthread_attr_destroy(&wa);
@@ -2993,7 +2994,7 @@ int cmd_tgws(const char *spec, const char *name) {
          * ничего не стоит, а его отсутствие стоит дорого. */
         /* 384, а не 320: в потоке соединения появилась копия начала клиентского потока
          * (struct earlybuf, 16 КБ) — та, которой откатывают прямой путь в мост. */
-        pthread_attr_setstacksize(&at, 384 * 1024);
+        pthread_attr_setstacksize(&at, thread_stack(384 * 1024));
         if (pthread_create(&t, &at, serve, j) != 0) {
             pthread_mutex_lock(&g_mu);
             g_live--;

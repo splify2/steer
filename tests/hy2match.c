@@ -399,7 +399,25 @@ static void test_limits(void) {
     CHECK(strstr(nd.skip_reason, "диапазонов больше 8") != NULL);
 }
 
+/* Brutal при нескольких рабочих: сумма долей не больше заданной скорости. */
+static void test_brutal_share(void) {
+    CHECK(hy2_brutal_share(100000000, 1) == 100000000);
+    CHECK(hy2_brutal_share(100000000, 0) == 100000000);
+    CHECK(hy2_brutal_share(100000000, 4) == 25000000);
+    CHECK(hy2_brutal_share(0, 4) == 0);                 /* BBR остаётся BBR */
+    CHECK(hy2_brutal_share(3, 8) == 1);                 /* ноль был бы BBR */
+    for (unsigned n = 1; n <= 64; n++)
+        CHECK(hy2_brutal_share(123456789, n) * n <= 123456789);
+    /* занятость: доля 8 Мбит/с = 1 МБ/с, порог — восьмая часть = 125000 Б за секунду */
+    CHECK(!hy2_worker_busy(0, 1000, 8000000));
+    CHECK(!hy2_worker_busy(2000, 1000, 8000000));       /* запросы и подтверждения */
+    CHECK(hy2_worker_busy(125000, 1000, 8000000));
+    CHECK(hy2_worker_busy(500000, 1000, 8000000));
+    CHECK(!hy2_worker_busy(124999, 1000, 8000000));
+}
+
 int main(void) {
+    test_brutal_share();
     test_limits();
     test_varint();
     test_blake2b();

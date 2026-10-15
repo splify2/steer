@@ -49,6 +49,15 @@
  * членах, узнаются по их меткам ещё в цепочке внешней (правила восстановления — по всем листам
  * вниз по вложенности).
  *
+ * ЗАКРЕПЛЕНИЕ (order и latency с именованными членами, group_carded). Та же цепочка, а в карте один
+ * слот (`numgen inc mod 1`) — текущий выбор сторожа. Новое соединение получает его метку, а
+ * метка соединения держит его там и дальше: когда сторож меняет член (по задержке, возврат на
+ * предпочтительный), он переписывает только карту, и установленные соединения доживают на прежнем
+ * члене, пока тот жив. Умер член — его соединения снимает его же проход (выход-член с on_fail, как
+ * любой выход), и следующий их пакет уходит по карте на текущий. Раньше таблица группы перекидывалась
+ * на новое устройство, а записи conntrack группы снимались — и смена члена по задержке рвала все
+ * соединения группы (у WARP — каждые несколько минут, без всякого отказа).
+ *
  * У группы без живых членов карта пуста (так её оставляет сторож), numgen ничего не находит, и
  * пакет получает метку самой группы: её таблицу сторож держит по on_fail группы — запрет или
  * «напрямую». То есть отказ balance выглядит ровно как отказ любого выхода. */
@@ -60,9 +69,9 @@
 #include "ir.h"
 #include "balance.h"
 
+/* Группа с картой: balance и закрепляющие order/latency (group_carded, kinds/group.c). */
 static int is_balance(const struct output *o) {
-    const struct group_cfg *g = out_group(o);
-    return g && g->pick == PICK_BALANCE;
+    return group_carded(o);
 }
 
 /* Цепочка метки выхода o — один раз на дерево. */
@@ -111,12 +120,15 @@ static void build_one(struct nft_table *t, const struct spec *sp, const struct o
     group_mark_chain(g, fall, sizeof(fall));
     const struct group_cfg *gc = out_group(g);
 
-    /* Карта: все члены живы. */
+    /* Карта: все члены живы. У закрепляющей order/latency — все слоты первому члену (его выбрал бы
+     * проход, когда живы все); текущий по факту ставит сверка после загрузки (fog_balance_adopt). */
     struct nft_set *m = ir_map_add(t, ir_strdup(t->rs, map), "mark", "verdict");
     ir_gap(m);
     unsigned char owner[GROUP_BAL_SLOTS];
-    group_balance_slots(gc, NULL, owner);           /* NULL — все члены живы */
-    for (unsigned s = 0; s < GROUP_BAL_SLOTS; s++) {
+    unsigned slots = gc->pick == PICK_BALANCE ? GROUP_BAL_SLOTS : 1;
+    if (gc->pick == PICK_BALANCE) group_balance_slots(gc, NULL, owner);   /* NULL — все члены живы */
+    else owner[0] = 0;
+    for (unsigned s = 0; s < slots; s++) {
         if (owner[s] == 0xff) continue;
         char tgt[32];
         group_bal_target(spec_out(sp, gc->members[owner[s]]), tgt, sizeof(tgt));
@@ -138,7 +150,12 @@ static void build_one(struct nft_table *t, const struct spec *sp, const struct o
     }
     restore_rules(t, c, sp, g, 0);
     struct nft_rule *r;
-    if (gc->by == BY_CONNECTION) {
+    if (gc->pick != PICK_BALANCE) {
+        /* Закрепляющая order/latency: один слот — текущий член. */
+        r = ir_rule(c);
+        ir_x(r, "numgen inc mod 1 vmap @%s", map);
+        ir_comment(r, "steer-pin:%s", g->name);
+    } else if (gc->by == BY_CONNECTION) {
         r = ir_rule(c);
         ir_x(r, "numgen random mod %d vmap @%s", GROUP_BAL_SLOTS, map);
         ir_comment(r, "steer-balance:%s", g->name);

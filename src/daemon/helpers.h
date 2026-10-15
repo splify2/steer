@@ -222,6 +222,9 @@ int supd_dnsd_flush(void);
 /* Состояние помощника выхода out из памяти демона. NULL — демон не супервизор (--supervise нет)
  * или у выхода нет помощника. */
 const struct helper_state *helper_state_of(const struct steerd *d, const char *out);
+/* Приговор члену группы от помощника группы (событие member, supd.c): 0 — мёртв, 1 — жив, -1 — не
+ * сказано (или помощник с тех пор вышел). */
+int supd_member_verdict(const struct steerd *d, const char *out);
 
 /* Сторож оживляет выход: перезапустить помощника cmd выхода out сразу, без паузы (живого — SIGTERM
  * и подъём, как выйдет; ждущего паузы — подъём сейчас). 0 — заказано; -1 — такого помощника у

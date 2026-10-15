@@ -257,6 +257,16 @@ void sc_blake3_hash(unsigned char out[32], const void *in, size_t n);
 void sc_blake3_derive_key(unsigned char *out, size_t out_n, const void *ctx, size_t ctx_n,
                           const void *material, size_t material_n);
 
+/* ---- ECDSA P-256: ключ клиента MASQUE (модуль steer-warpbox) ---------------------------------
+ *
+ * Закрытый ключ — 32 байта скаляра, открытый — 65 байт несжатой точки 04||X||Y. Подпись — над
+ * готовым хешем SHA-256, в DER (SEQUENCE r, s), до SC_P256_SIG_MAX байт. 0 — готово. */
+#define SC_P256_SIG_MAX 72
+int sc_p256_keygen(unsigned char priv[32], unsigned char pub[65]);
+int sc_p256_public(const unsigned char priv[32], unsigned char pub[65]);
+int sc_p256_sign(const unsigned char priv[32], const unsigned char digest[32],
+                 unsigned char *sig, size_t *sig_n);
+
 /* ---- подписи и сертификаты ---------------------------------------------------------------- */
 
 enum sc_sig_alg { SC_SIG_RSA_PKCS1 = 1, SC_SIG_RSA_PSS = 2, SC_SIG_ECDSA = 3 };

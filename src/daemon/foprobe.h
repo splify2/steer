@@ -43,7 +43,7 @@ typedef void (*foprobe_cb)(void *arg, int ok, int ms);
 /* Соединение TCP с host:port через устройство dev. NULL — проба кончилась сразу (сокет не
  * открылся, соединилось мгновенно), итог — в *ok и *ms, обратного вызова не будет. Иначе —
  * идёт, и cb позовётся один раз (если проба не отменена). */
-struct foprobe *foprobe_tcp(struct loop *l, const char *dev, const char *host, int port,
+struct foprobe *foprobe_tcp(struct loop *l, const char *dev, unsigned mark, const char *host, int port,
                             int timeout_ms, foprobe_cb cb, void *arg, int *ok, int *ms);
 
 /* Эхо ICMP к host через устройство dev с адреса src. Договор — как у foprobe_tcp. */

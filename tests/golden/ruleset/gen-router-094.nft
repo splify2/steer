@@ -76,5 +76,6 @@ table ip steer {
     }
     chain postrouting_nat {
         type nat hook postrouting priority srcnat + 1; policy accept;
+        oifname "wg0" counter masquerade comment "steer-nat4:vpn"
     }
 }

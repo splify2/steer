@@ -679,19 +679,33 @@ int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_
     const char *hash = strchr(p, '#');
     const char *hp_end = hash ? hash : p + strlen(p);
     const char *qmark = memchr(p, '?', (size_t)(hp_end - p));
-    const char *colon = memchr(p, ':', (size_t)((qmark ? qmark : hp_end) - p));
-    if (!colon) return -1;
-    sl_set_field(n->host, sizeof(n->host), p, (size_t)(colon - p));
+    const char *hp_stop = qmark ? qmark : hp_end;
+    /* Хост: имя, IPv4 или IPv6 в квадратных скобках (RFC 3986: `[2001:db8::1]:443`). Без скобок
+     * адрес IPv6 от порта не отличить — такая ссылка не разбирается, как и у Xray. Скобки в
+     * поле хоста не попадают: дальше хост идёт в getaddrinfo, а он скобок не знает. */
+    const char *colon, *hs;
+    size_t hl;
+    if (*p == '[') {
+        const char *rb = memchr(p, ']', (size_t)(hp_stop - p));
+        if (!rb || rb + 1 >= hp_stop || rb[1] != ':' || rb == p + 1) return -1;
+        hs = p + 1; hl = (size_t)(rb - hs); colon = rb + 1;
+    } else {
+        colon = memchr(p, ':', (size_t)(hp_stop - p));
+        if (!colon) return -1;
+        hs = p; hl = (size_t)(colon - p);
+    }
+    sl_set_field(n->host, sizeof(n->host), hs, hl);
+    sl_host_zone_decode(n->host);
     {
         /* Порт — только цифры до конца хоста и в диапазоне 1..65535: atoi давал 4464 на
          * «:70000», 65535 на «:-1» и 443 на «:443abc», и узел шёл не туда. */
         char pnum[8];
         const char *pe = colon + 1;
         size_t pl = 0;
-        while (pe < (qmark ? qmark : hp_end) && *pe >= '0' && *pe <= '9' && pl + 1 < sizeof(pnum))
+        while (pe < hp_stop && *pe >= '0' && *pe <= '9' && pl + 1 < sizeof(pnum))
             pnum[pl++] = *pe++;
         pnum[pl] = '\0';
-        if (!pl || pe != (qmark ? qmark : hp_end)) return -1;
+        if (!pl || pe != hp_stop) return -1;
         n->port = sl_port_of(pnum);
     }
     if (!n->port) return -1;
@@ -914,7 +928,7 @@ void sl_skip_note(struct vless_sub_stats *st, const struct vless_node *n, const 
      * и host — тогда пример остаётся пустым, и это честнее выдуманного «узел 3». */
     if (n && n->name[0]) snprintf(s->example, sizeof(s->example), "%s", n->name);
     else if (n && n->host[0]) snprintf(s->example, sizeof(s->example), "%s:%u",
-                                      n->host, n->port);
+                                      vless_host_fmt(n->host).s, n->port);
     s->count = 1;
 }
 

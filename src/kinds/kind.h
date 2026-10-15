@@ -59,6 +59,10 @@ enum kind_cap {
      * по их протоколам; direct маршрута не меняет вовсе. IPv6 правил, ведущих в выход без бита,
      * отвергается (цепочка forward_v6, generate.c), а не уходит напрямую. */
     KC_IPV6         = 1 << 9,
+    /* TCP клиентов завершает ядро Linux: правило nat перенаправляет соединение по метке выхода к
+     * слушателю модуля (порт — out_tcp_port, marks.h), и модуль гонит поток узлу, не разбирая
+     * пакетов TCP сам (R-152, generate.c: build_tcp_redir). Через TUN такого выхода идёт UDP. */
+    KC_TCP_REDIR    = 1 << 10,
 };
 
 /* Ключи спеки, которые принадлежат виду. Разбирает их parse.c — для всех видов, в том числе не
@@ -233,7 +237,10 @@ void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
  * собирает её перевод v1 (model/v1.c) напрямую. Разбор v2 находит её через kind_by_name_v2. */
 extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer, kind_zapret,
                              kind_tgws, kind_awg, kind_group, kind_hysteria2,
-                             kind_trojan, kind_shadowsocks, kind_socks, kind_http, kind_vmess;
+                             kind_trojan, kind_shadowsocks, kind_socks, kind_http, kind_vmess,
+                             kind_warpm, kind_block;
+/* Выход «Блок» (kinds/block.c): резолвер отвечает на имена его правил пустым адресом. */
+int out_is_block(const struct output *o);
 
 /* Вид обнулённого выхода (kind == NULL; так их собирают стенды) — direct, как у нулевого
  * значения прежнего перечня видов. Читает его kind_of в spec.h. */
@@ -317,9 +324,16 @@ void group_balance_slots(const struct group_cfg *g, const unsigned char *alive,
 void group_bal_chain(const struct output *o, char *dst, size_t n);
 void group_bal_map(const struct output *o, char *dst, size_t n);
 void group_mark_chain(const struct output *o, char *dst, size_t n);
-/* Куда ведёт слот карты, отданный члену m: вложенная balance — в её цепочку (её доля делится
- * дальше по её весам), остальные — в цепочку метки члена. */
+/* Куда ведёт слот карты, отданный члену m: вложенная группа с картой (group_carded) — в её цепочку
+ * (balance делит долю дальше по весам, order/latency — на свой текущий член), остальные — в цепочку
+ * метки члена. */
 void group_bal_target(const struct output *m, char *dst, size_t n);
+/* Группа с картой соединений в ядре (compile/balance.c): balance — новые соединения по живым членам;
+ * order и latency с именованными членами — ЗАКРЕПЛЕНИЕ: новое соединение — на текущий член, а
+ * установленное остаётся на том, где началось, пока тот жив (смена члена по задержке или возврат на
+ * предпочтительный не рвут соединений). manual — нет: человек, выбравший член, ждёт, что туда уйдёт
+ * всё. Пул v1 (безымянные члены без своих меток) — нет: закреплять не за что. */
+int group_carded(const struct output *o);
 /* Вес члена balance — 1..GROUP_WEIGHT_MAX (`weights` спеки v2). */
 #define GROUP_WEIGHT_MAX 100
 /* Сколько секунд без трафика через группу urltest не делается — предел `idle_timeout`. */

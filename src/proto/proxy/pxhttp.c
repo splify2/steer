@@ -26,7 +26,7 @@ struct http_sess {
 static const char *ht_peer(const void *ctx) { return ((const struct px_node *)ctx)->vn.host; }
 static void ht_describe(const void *ctx, char *out, size_t n) {
     const struct px_node *nd = ctx;
-    snprintf(out, n, "%s (%s:%u http/%s)", nd->name, nd->vn.host, nd->vn.port, nd->vn.security);
+    snprintf(out, n, "%s (%s:%u http/%s)", nd->name, vless_host_fmt(nd->vn.host).s, nd->vn.port, nd->vn.security);
 }
 
 static void ht_clear(void *sess) {

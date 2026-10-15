@@ -134,7 +134,8 @@ static int proxy_helper(const struct spec *sp, const struct output *o, struct ki
         kind_sig_mix(&h->sig, &o->proxy.nodes[i], sizeof(o->proxy.nodes[i]));
     kind_sig_excl(&h->sig, &o->proxy.excl);
     /* Пул узлов (active, by, interval, silence) клиент читает при старте, как и выбор узлов. */
-    if (o->proxy.pool.active || o->proxy.pool.by || o->proxy.pool.interval_s || o->proxy.pool.silence_s)
+    if (o->proxy.pool.active || o->proxy.pool.by || o->proxy.pool.interval_s || o->proxy.pool.silence_s ||
+        o->proxy.pool.pick || o->proxy.pool.tol_set)
         kind_sig_mix(&h->sig, &o->proxy.pool, sizeof(o->proxy.pool));
     return 0;
 }
@@ -157,7 +158,7 @@ int out_proxy_node_named(const struct output *o) { return o->proxy.nodes_n == 1;
     const struct kind_ops ident = { \
         .name = nm, \
         .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER | \
-                KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP, \
+                KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP | KC_TCP_REDIR, \
         .keys = KK_NODES | KK_SUB, \
         .selfnat_why = "masquerade не нужен: туннель завершает TCP сам, адреса клиентов " \
                        "наружу не уходят", \

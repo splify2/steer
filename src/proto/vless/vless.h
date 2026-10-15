@@ -12,6 +12,21 @@
 #define STEER_VLESS_H
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+
+/* Хост узла для вывода «хост:порт»: адрес IPv6 — в квадратных скобках (`[2001:db8::1]:443`), иначе
+ * порт не отличить от последней группы адреса. Возвращается структурой по значению — буфер живёт
+ * до конца выражения, где вызван: `snprintf(…, vless_host_fmt(n->host).s, n->port)`. В самом поле
+ * host скобок нет (так его ждёт getaddrinfo). */
+struct vless_hostfmt { char s[132]; };
+static inline struct vless_hostfmt vless_host_fmt(const char *host) {
+    struct vless_hostfmt o;
+    size_t n = strlen(host);
+    if (n > 127) n = 127;
+    if (memchr(host, ':', n)) { o.s[0] = '['; memcpy(o.s + 1, host, n); o.s[n + 1] = ']'; o.s[n + 2] = '\0'; }
+    else { memcpy(o.s, host, n); o.s[n] = '\0'; }
+    return o;
+}
 
 /* Узел подписки. Строки, а не разобранные структуры: всё это едет в конфиг как есть, и
  * лишнее преобразование туда-обратно только добавило бы место для расхождения. */

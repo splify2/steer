@@ -156,6 +156,100 @@ static void t_post_max(void) {
     close(fd);
 }
 
+
+/* Тела POST, которые клиент записал на связь выгрузки: сумма DATA по потокам, в порядке появления
+ * потока. Читает всё, что лежит у «сервера», и разбирает кадры HTTP/2 (преамбула, SETTINGS, HEADERS,
+ * DATA). */
+static int srv_posts(unsigned *sizes, int cap) {
+    static unsigned char b[1 << 18];
+    size_t n = 0;
+    ssize_t r;
+    while (n < sizeof(b) && (r = recv(g_srv, b + n, sizeof(b) - n, MSG_DONTWAIT)) > 0) n += (size_t)r;
+    size_t p = 0;
+    if (n >= 24 && !memcmp(b, "PRI ", 4)) p = 24;
+    uint32_t sids[256];
+    int cnt = 0;
+    while (p + 9 <= n) {
+        uint32_t len = ((uint32_t)b[p] << 16) | ((uint32_t)b[p + 1] << 8) | b[p + 2];
+        unsigned char type = b[p + 3];
+        uint32_t sid = (((uint32_t)b[p + 5] << 24) | ((uint32_t)b[p + 6] << 16) |
+                        ((uint32_t)b[p + 7] << 8) | b[p + 8]) & 0x7FFFFFFF;
+        if (p + 9 + len > n) break;
+        if (type == 1 && cnt < cap && cnt < 256) { sids[cnt] = sid; sizes[cnt++] = 0; }
+        if (type == 0)
+            for (int i = 0; i < cnt; i++) if (sids[i] == sid) sizes[i] += len;
+        p += 9 + len;
+    }
+    return cnt;
+}
+
+/* packet-up: размер каждого POST — случайный в [post_min, post_max], как у клиента Xray, и не больше
+ * post_max; куски записи в сумме дают её целиком; окно неотвеченных кусков соблюдается. */
+static void t_post_range(void) {
+    int fd;
+    unsigned sz[256];
+    unsigned char d[30000];
+    memset(d, 'r', sizeof(d));
+
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    struct transport c;
+    conn_init(&c, XH_PACKET_UP, fd);
+    c.xh.post_min = 1000;
+    c.xh.post_max = 3000;
+    int rc = transport_write(&c, d, sizeof(d));
+    int cnt = srv_posts(sz, 256);
+    unsigned sum = 0, big = 0, small_mid = 0, distinct = 0;
+    for (int i = 0; i < cnt; i++) {
+        sum += sz[i];
+        if (sz[i] > 3000) big++;
+        if (i < cnt - 1 && sz[i] < 1000) small_mid++;
+        int seen = 0;
+        for (int j = 0; j < i; j++) if (sz[j] == sz[i]) seen = 1;
+        if (!seen) distinct++;
+    }
+    check(rc == 0 && sum == sizeof(d), "packet-up: куски диапазона в сумме дают запись целиком");
+    check(cnt >= 10 && big == 0, "packet-up: ни один POST не больше post_max (3000)");
+    check(small_mid == 0, "packet-up: все POST, кроме хвоста записи, не меньше post_min (1000)");
+    check(distinct >= 5, "packet-up: размеры POST случайны в диапазоне (разных не меньше пяти)");
+    close(fd);
+
+    /* Запись в один POST, пока диапазон её вмещает: 20000..40000 и 30000 байт — либо один POST, либо
+     * два, но никак не пятнадцать по 2 КБ (прежний потолок сборки). */
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    conn_init(&c, XH_PACKET_UP, fd);
+    c.xh.post_min = 20000;
+    c.xh.post_max = 40000;
+    rc = transport_write(&c, d, sizeof(d));
+    cnt = srv_posts(sz, 256);
+    check(rc == 0 && cnt >= 1 && cnt <= 2, "packet-up: запись в 30000 при 20000-40000 — один-два POST");
+    close(fd);
+
+    /* Окно по seq: когда один неотвеченный POST уже есть, запись, которой нужно больше свободных
+     * мест, чем осталось (сверх PACKET_INFLIGHT), отказывается целиком — H2_EWINDOW и ни байта. */
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    conn_init(&c, XH_PACKET_UP, fd);
+    c.xh.post_min = 1000;
+    c.xh.post_max = 1000;
+    rc = transport_write(&c, d, 100);                 /* один POST остался без ответа */
+    srv_posts(sz, 256);
+    int rc2 = transport_write(&c, d, 20 * 1000);      /* 20 POST: больше свободных мест */
+    cnt = srv_posts(sz, 256);
+    check(rc == 0 && rc2 == H2_EWINDOW && cnt == 0,
+          "packet-up: запись, которой не хватает мест в окне seq, отказана целиком");
+    int rc3 = transport_write(&c, d, 10 * 1000);      /* 10 POST помещаются */
+    cnt = srv_posts(sz, 256);
+    check(rc3 == 0 && cnt == 10, "packet-up: запись, которой мест хватает, уходит");
+    close(fd);
+
+    /* Большие записи принимает только packet-up. */
+    conn_init(&c, XH_PACKET_UP, -1);
+    check(transport_big_write(&c) == 1, "packet-up принимает записи крупнее записи TLS одним вызовом");
+    conn_init(&c, XH_STREAM_UP, -1);
+    check(transport_big_write(&c) == 0, "stream-up: большая запись не обещана");
+    conn_init(&c, XH_STREAM_ONE, -1);
+    check(transport_big_write(&c) == 0, "stream-one: большая запись не обещана");
+}
+
 /* auto решается как у клиента Xray: stream-one при reality, иначе packet-up; названный режим не
  * трогается. Сервер packet-up отвечает на stream-one 400. */
 static void t_auto_mode(void) {
@@ -210,9 +304,10 @@ static void t_room_drains_up_link(void) {
     /* Окно потока у настоящего сервера — мегабайт (SETTINGS); без кадра SETTINGS стенд держит прежние
      * 65535, и они, а не места под куски, оказались бы потолком. */
     c.xh.up.h2.peer_init_win = 1 << 20;
+    c.xh.post_max = 8192;                                   /* место = свободные места × наименьший POST */
     srv_window_update(0);
     room = transport_room(&c);
-    check(rc == 0 && before < 10000 && room == (PACKET_INFLIGHT - 1) * PACKET_SLOT,
+    check(rc == 0 && before < 10000 && room == (PACKET_INFLIGHT - 1) * 8192L,
           "packet-up: место читает WINDOW_UPDATE связи выгрузки (потолок — свободные места под куски)");
     close(fd);
 }
@@ -328,6 +423,7 @@ int main(void) {
     t_stream_up(0x8C, 1, "I-219: stream-up — 400 на выгрузку возвращён отправке");
     t_stream_up(0x88, 0, "I-219: stream-up — 200 на выгрузку отказом не считается");
     t_post_max();
+    t_post_range();
     t_auto_mode();
     t_room_drains_up_link();
     printf(g_fail ? "\nxhupmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");

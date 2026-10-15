@@ -34,6 +34,8 @@
 #include "tls13.h"
 #include "reality.h"
 #include "dupq.h"
+#include "thrstack.h"
+#include "sockmark.h"
 
 /* Контекст TLS соединений DoQ (корни разбираются один раз на процесс) готовит шов dupq.h — здесь,
  * в потоке установки: разбор файла корней блокирует, а цикл резолвера — нет. Корни те же, что у DoT:
@@ -125,7 +127,7 @@ static int boot_ask(const struct sockaddr_storage *srv, unsigned mark, const cha
     q[qn++] = 0; q[qn++] = 1;
     int fd = socket(srv->ss_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
-    if (mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0) { close(fd); return -1; }
+    if (steer_sock_mark(fd, mark) != 0) { close(fd); return -1; }
     int found = -1;
     if (connect(fd, (const struct sockaddr *)srv, (socklen_t)sa_len(srv)) == 0 &&
         send(fd, q, qn, MSG_NOSIGNAL) == (ssize_t)qn) {
@@ -197,7 +199,7 @@ int dup_bootstrap(const char *host, const char (*boot)[46], size_t boot_n, unsig
 static int connect_to(const struct sockaddr_storage *a, unsigned mark, long deadline) {
     int fd = socket(a->ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
-    if (mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0) goto fail;
+    if (steer_sock_mark(fd, mark) != 0) goto fail;
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     if (connect(fd, (const struct sockaddr *)a, (socklen_t)sa_len(a)) != 0) {
@@ -238,6 +240,68 @@ static int write_all(int fd, const unsigned char *p, size_t n) {
         n -= (size_t)w;
     }
     return 0;
+}
+
+/* ---- ClientHello в две записи ------------------------------------------------------------------- */
+
+/* Имя SNI в Hello: смещение первого байта имени и его длина; 0 — нет. Разбор по длинам, с проверкой
+ * границ на каждом шаге: Hello строит наш же код, но функция берёт любые байты. */
+static size_t hello_sni(const unsigned char *h, size_t n, size_t *len) {
+    if (n < 5 + 4 + 2 + 32 + 1 || h[0] != 0x16 || h[5] != 0x01) return 0;
+    size_t o = 5 + 4 + 2 + 32;
+    if (o + 1 > n) return 0;
+    o += 1 + h[o];                                      /* session_id */
+    if (o + 2 > n) return 0;
+    o += 2 + (((size_t)h[o] << 8) | h[o + 1]);          /* cipher_suites */
+    if (o + 1 > n) return 0;
+    o += 1 + h[o];                                      /* compression */
+    if (o + 2 > n) return 0;
+    size_t ext_end = o + 2 + (((size_t)h[o] << 8) | h[o + 1]);
+    o += 2;
+    if (ext_end > n) ext_end = n;
+    while (o + 4 <= ext_end) {
+        size_t type = ((size_t)h[o] << 8) | h[o + 1], l = ((size_t)h[o + 2] << 8) | h[o + 3];
+        o += 4;
+        if (o + l > ext_end) return 0;
+        if (type == 0) {                                /* server_name: список 2, тип 1, длина 2, имя */
+            if (l < 5 || h[o + 2] != 0) return 0;
+            size_t nl = ((size_t)h[o + 3] << 8) | h[o + 4];
+            if (5 + nl > l) return 0;
+            *len = nl;
+            return o + 5;
+        }
+        o += l;
+    }
+    return 0;
+}
+
+size_t dup_hello_split(const unsigned char *h, size_t n, unsigned rnd) {
+    if (n < 5 + 4 || h[0] != 0x16) return 0;
+    size_t nl = 0, at = hello_sni(h, n, &nl);
+    if (at && nl >= 2) return at + 1 + rnd % (nl - 1);          /* внутри имени: обе части непусты */
+    if (n < 5 + 80 + 1) return 0;
+    return 5 + 30 + rnd % 51;                                   /* 30..80 байт сообщения */
+}
+
+int dup_hello_send(int fd, const unsigned char *h, size_t n, int frag) {
+    unsigned rnd = 0;
+    if (frag && getrandom(&rnd, sizeof(rnd), 0) != (ssize_t)sizeof(rnd)) rnd = (unsigned)(rand() ^ time(NULL));
+    size_t at = frag ? dup_hello_split(h, n, rnd) : 0;
+    if (!at || at <= 5 || at >= n) return write_all(fd, h, n);
+    /* Запись как есть режется на две: заголовок (тип, версия) тот же, длина своя. */
+    unsigned char rec[5 + 2048];
+    if (n > sizeof(rec)) return write_all(fd, h, n);
+    size_t p1 = at - 5, p2 = n - at;
+    memcpy(rec, h, 3);
+    rec[3] = (unsigned char)(p1 >> 8); rec[4] = (unsigned char)p1;
+    memcpy(rec + 5, h + 5, p1);
+    if (write_all(fd, rec, 5 + p1) != 0) return -1;
+    struct timespec ts = { 0, 2 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    memcpy(rec, h, 3);
+    rec[3] = (unsigned char)(p2 >> 8); rec[4] = (unsigned char)p2;
+    memcpy(rec + 5, h + at, p2);
+    return write_all(fd, rec, 5 + p2);
 }
 
 static void dial_run(struct dial *d) {
@@ -334,7 +398,7 @@ static void dial_run(struct dial *d) {
     unsigned char hello[2048];
     size_t hello_n = 0;
     if (reality_build_hello_carry(&cfg, &rst, d->doh ? &car : NULL, hello, sizeof(hello), &hello_n) != 0 ||
-        write_all(fd, hello, hello_n) != 0) {
+        dup_hello_send(fd, hello, hello_n, d->u.frag) != 0) {
         snprintf(d->err, sizeof(d->err), "ClientHello не ушёл");
         close(fd);
         return;
@@ -386,7 +450,7 @@ int dial_launch(struct dial *d) {
     int attr_ok = pthread_attr_init(&at) == 0;
     if (attr_ok) {
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-        pthread_attr_setstacksize(&at, 256 * 1024);
+        pthread_attr_setstacksize(&at, thread_stack(256 * 1024));
     }
     pthread_t th;
     int rc = pthread_create(&th, attr_ok ? &at : NULL, dial_thread, d);

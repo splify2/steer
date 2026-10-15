@@ -19,6 +19,7 @@
 #include <time.h>
 
 #include "spec.h"
+#include "platform.h"
 #include "awg.h"
 #include "hwid.h"
 #include "obfs.h"
@@ -125,6 +126,62 @@ int status_fast(FILE *out) {
  *   latency4, latency6 — у группы, меренной по обоим семействам: замеры по IPv4 и IPv6 порознь
  *              (latency тогда — худший из двух у каждого члена); у остальных полей нет;
  *   weights  — balance: веса членов по порядку. */
+/* Группа `kind: warp` (docs/warp.md): что о туннелях знает модуль steer-warpbox — файл состояния
+ * <state>/warp-<группа>/state, который он переписывает каждый проход сторожа (wbmain.c, state_write).
+ * Файл читается как данные: поля разбираются и печатаются здесь своим JSON, а не вставляются текстом.
+ *   warp.mask    — маска первого пакета AmneziaWG (нет поля — обычный WireGuard);
+ *   warp.why     — почему группа не работает (поля нет, пока работает);
+ *   warp.members — по туннелю: out, ip, port, colo (колония Cloudflare), seen (страна, которую видят
+ *                  сайты), ok (последний проход сторожа модуля). Неизвестное — без поля.
+ * Файла нет (модуль не стоит или ещё не прошёл) — поля warp нет. У transport: masque mask нет, а ip
+ * бывает IPv6 (точка MASQUE по API). */
+static int warp_tok_ok(const char *t, const char *set, size_t maxlen) {
+    size_t n = strlen(t);
+    return n && n <= maxlen && strspn(t, set) == n && strcmp(t, "-") != 0;
+}
+
+static void warp_emit(FILE *out, const struct output *o) {
+    char p[512];
+    snprintf(p, sizeof(p), "%s/warp-%s/state", steer_state_dir(), o->name);
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    char line[512];
+    int members = 0;
+    fputs(",\"warp\":{", out);
+    int first = 1;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!strncmp(line, "mask ", 5)) {
+            if (!warp_tok_ok(line + 5, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-", 16)) continue;
+            fprintf(out, "%s\"mask\":\"%s\"", first ? "" : ",", line + 5);
+            first = 0;
+        } else if (!strncmp(line, "why ", 4)) {
+            if (!strcmp(line + 4, "-")) continue;
+            fprintf(out, "%s\"why\":", first ? "" : ",");
+            jsonw_str(out, line + 4);
+            first = 0;
+        } else if (!strncmp(line, "member ", 7)) {
+            char name[64], ip[64], colo[16], seen[16];
+            unsigned port;
+            int ok;
+            if (sscanf(line + 7, "%63s %63s %u %15s %15s %d", name, ip, &port, colo, seen, &ok) != 6) continue;
+            if (!members) fprintf(out, "%s\"members\":[", first ? "" : ",");
+            fprintf(out, "%s{\"out\":", members ? "," : "");
+            first = 0;
+            members++;
+            jsonw_str(out, name);
+            if (warp_tok_ok(ip, "0123456789abcdefABCDEF.:", 45)) fprintf(out, ",\"ip\":\"%s\"", ip);
+            if (port && port < 65536) fprintf(out, ",\"port\":%u", port);
+            if (warp_tok_ok(colo, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 3)) fprintf(out, ",\"colo\":\"%s\"", colo);
+            if (warp_tok_ok(seen, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 2)) fprintf(out, ",\"seen\":\"%s\"", seen);
+            fprintf(out, ",\"ok\":%s}", ok ? "true" : "false");
+        }
+    }
+    fclose(f);
+    if (members) fputc(']', out);
+    fputc('}', out);
+}
+
 static void group_emit(FILE *out, const struct spec *sp, const struct output *o) {
     const struct group_cfg *g = out_group(o);
     if (!g || g->shown) return;
@@ -187,6 +244,7 @@ static void group_emit(FILE *out, const struct spec *sp, const struct output *o)
             fprintf(out, "}");
         }
     }
+    if (g->warp.on) warp_emit(out, o);
     if (g->pick == PICK_BALANCE) {
         fprintf(out, ",\"weights\":[");
         for (size_t k = 0; k < g->members_n; k++)
@@ -236,8 +294,8 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
     fprintf(out, "{\"schema\":1,\"at\":%ld,"
                  "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
                  "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\",\"awg\","
-                 "\"via\",\"failed\",\"groups\",\"balance_by\",\"exclude\",\"active_nodes\","
-                 "\"dns_groups\",\"dns_other\"]",
+                 "\"via\",\"failed\",\"groups\",\"balance_by\",\"exclude\",\"active_nodes\",\"block\",\"spec_json\",\"pool_latency\","
+                 "\"dns_groups\",\"dns_other\",\"dns_fragment\",\"dns_h3\"]",
             (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
@@ -276,11 +334,15 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
         if (sp->out[i].over[0]) fprintf(out, ",\"via\":\"%s\"", sp->out[i].over);
         if (out_has_device(&sp->out[i])) {
             struct fwcheck c = fw_check(sp->out[i].device);
+            /* `nat` — подмена IPv4 есть, кем бы ни была: masq зоны fw4 или своя postrouting_nat4
+             * (out_nat4_by_steer); кем — `nat_by`, как `nat6_by` у IPv6. */
+            int nat4_ours = out_nat4_by_steer(out_for_device(sp, &sp->out[i], sp->out[i].device));
             fprintf(out, ",\"device\":\"%s\",\"up\":%s%s,\"mark\":\"0x%08x\",\"table\":%d"
                    ",\"in_firewall\":%s,\"nat\":%s",
                    sp->out[i].device, up ? "true" : "false", failed ? ",\"failed\":true" : "",
                    sp->out[i].mark, sp->out[i].table,
-                   c.in_firewall ? "true" : "false", c.masqueraded ? "true" : "false");
+                   c.in_firewall ? "true" : "false", c.masqueraded || nat4_ours ? "true" : "false");
+            if (nat4_ours || c.masqueraded) fprintf(out, ",\"nat_by\":\"%s\"", nat4_ours ? "steer" : "fw4");
             /* С 1.10 `nat` — подмена IPv4 (masq зоны), а `nat6` — IPv6 (masq6), отдельно
              * (fw_check по семействам, fwcheck.c): прежде одно поле засчитывало любое правило
              * masquerade за оба. `nat6` — только у выхода, который несёт IPv6 (out_route6): у

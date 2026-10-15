@@ -33,6 +33,11 @@ void *qcssl_new(void *ctx, void *conn_ref, const char *sni, const char *alpn, in
 void  qcssl_free(void *ssl);
 /* SHA-256 листового сертификата сервера (DER) — для pinSHA256 у hysteria2. 0 — есть, -1 — нет. */
 int   qcssl_peer_sha256(void *ssl, uint8_t out[32]);
+/* Листовой сертификат сервера (DER) в out[cap]: длина или -1 (нет или не уместился). */
+int   qcssl_peer_der(void *ssl, uint8_t *out, size_t cap);
+/* Клиентский сертификат (DER) и ключ (SEC1 ECPrivateKey, DER) — для серверов, которые узнают клиента
+ * по ключу (MASQUE у WARP). 0 — поставлены. */
+int   qcssl_ctx_client_cert(void *ctx, const uint8_t *cert, size_t cert_n, const uint8_t *key, size_t key_n);
 
 /* ---- сессии и 0-RTT (клиент) ---------------------------------------------------------------------
  *

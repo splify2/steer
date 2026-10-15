@@ -28,6 +28,7 @@
  * называет только имя параметра, никогда значение. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -53,6 +54,7 @@
 #include "awg.h"
 #include "nlbuf.h"
 #include "run.h"
+#include "sockmark.h"
 
 #define LOG_W "steer[warn] awg: "
 #define LOG_I "steer[info] awg: "
@@ -615,7 +617,10 @@ size_t awg_build_set(uint8_t *buf, size_t cap, uint16_t famid, int famver, int i
     if (c->has_listen_port) nlbuf_put_u16(&b, AD_LISTEN_PORT, c->listen_port);
     /* Метка сокета — всегда, в том числе нулевая: иначе метка прежнего via осталась бы на
      * устройстве после того, как via убрали из спеки. */
-    nlbuf_put_u32(&b, AD_FWMARK, fwmark);
+    /* Внешние пакеты туннеля — мимо общего zapret роутера (sockmark.h): его «рассинхронизация»
+     * по UDP ломала бы рукопожатие WireGuard. И у устройств подбора WARP: их сокет живёт в
+     * пространстве роутера, где они созданы. */
+    nlbuf_put_u32(&b, AD_FWMARK, steer_own_mark(fwmark));
     if (replace_peers) nlbuf_put_u32(&b, AD_FLAGS, AWG_DEV_F_REPLACE_PEERS);
     if (is_awg) {
         for (int k = 0; k < AWG_U16_N; k++)
@@ -976,12 +981,12 @@ int awg_sock_mark(const struct spec *sp, const char *via, uint32_t *mark) {
  * architecture.md, «4б»), но у цели без IPv6 (vless, xsteer) их нет по-прежнему, а собственный
  * пакет туннеля — локальный, и цепочка forward_v6, которая отвергает IPv6 правил таких выходов,
  * его не видит. Отказ оставлен для любой цели: разрешить IPv6 только поверх целей с IPv6 значило
- * бы, что смена вида цели молча уводит туннель мимо неё. Остальные туннели через via этого не
- * требуют вовсе:
- * клиенты vless, xsteer и обфускатор открывают сокеты только AF_INET (адрес узла, Endpoint и
- * сервер обфускации принимаются только как IPv4 или имя, разрешаемое в IPv4), так что их трафик
- * к серверу по IPv6 не уходит ни через цель, ни мимо. Единственный, кто мог так уйти, — awg:
- * адрес пира ядро берёт из настройки как есть. Поэтому здесь: литерал IPv6 при via — отказ с
+ * бы, что смена вида цели молча уводит туннель мимо неё. Остальные туннели через via держат то же
+ * правило своим способом: клиенты vless и прокси (tr_dial, trdial.c) и hysteria2 (qc_open, quic.c)
+ * при обязательной метке адрес IPv6 не пробуют вовсе — имя с записью A идёт по IPv4, адрес только
+ * IPv6 — отказ с причиной в журнале; xsteer и обфускатор открывают сокеты только AF_INET (Endpoint
+ * и сервер обфускации принимаются только как IPv4). Адрес пира awg ядро берёт из настройки как есть,
+ * поэтому ему нужна проверка здесь. Поэтому здесь: литерал IPv6 при via — отказ с
  * понятной причиной (туннель не поднимается), имя при via разрешается только в IPv4
  * (resolve_peers), и тихой отправки мимо цели нет ни в одном случае. */
 int awg_via_check(const struct awg_conf *c, const char *via, char *err, size_t n) {
@@ -1321,12 +1326,23 @@ static void dev_state_drop(const char *dev) {
 
 /* Поднять и настроить устройство выхода. loud — apply (предупреждения о файле печатаются);
  * сторож зовёт тихо, чтобы раз в пять минут не повторять одно и то же. 0 — готово. */
+/* Член группы `kind: warp`, файла которого ещё нет: точку ему подбирает модуль steer-warpbox и
+ * пишет файл сам, а затем просит демон перенастроить член (событие awg, daemon/supd.c). До того
+ * поднимать нечего, и это не ошибка файла — ни apply, ни сторож не шумят о нём. */
+static int warp_waiting(const struct output *o) {
+    return o->warp_of[0] && access(o->awg.conf, F_OK) != 0;
+}
+
+/* awg_refresh: следующий awg_configure снимает пиры и ставит заново (новая сессия). */
+static int g_awg_fresh;
+
 static int awg_configure(const struct spec *sp, const struct output *o, int loud,
                          const struct kind_name *names, size_t nn) {
     static struct awg_conf c;         /* ~20 КБ — не на стек телефона */
     struct awg_secrets s;
     char err[256];
     const char *dev = o->device;
+    if (warp_waiting(o)) return -1;
     if (awg_conf_load(o->awg.conf, &c, &s, err, sizeof err) != 0) {
         fprintf(stderr, LOG_W "выход %s: %s\n", o->name, err);
         return -1;
@@ -1445,8 +1461,8 @@ static int awg_configure(const struct spec *sp, const struct output *o, int loud
     /* Пиры, которых в файле нет, снимаются флагом REPLACE_PEERS. Ставится он ТОЛЬКО когда
      * состав пиров действительно разошёлся: флаг снимает всех и ставит заново, то есть рвёт
      * живые сессии, а повторный apply с тем же файлом не должен рвать ничего. */
-    int replace = 0;
-    if (!created) {
+    int replace = g_awg_fresh && !created;
+    if (!created && !replace) {
         static struct awg_live L;
         if (live_read(dev, kind, &L) == 0) {
             if (L.peer_n != c.peer_n) replace = 1;
@@ -1514,7 +1530,9 @@ int awg_apply_all(const struct spec *sp) {
             bad++;
             continue;
         }
-        if (awg_configure(sp, o, 1, NULL, 0) != 0) bad++;
+        if (warp_waiting(o))
+            fprintf(stderr, LOG_I "выход %s: ждёт точку WARP от модуля steer-warpbox\n", o->name);
+        else if (awg_configure(sp, o, 1, NULL, 0) != 0) bad++;
         /* В реестр — даже при отказе: устройство могло быть создано до отказа настройки, и
          * снять его потом должен кто-то. */
         snprintf(keep[keep_n++], IFNAMSIZ, "%.15s", o->device);
@@ -1542,7 +1560,7 @@ int awg_check_all(const struct spec *sp) {
     int bad = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
-        if (kind_of(o) != &kind_awg) continue;
+        if (kind_of(o) != &kind_awg || warp_waiting(o)) continue;
         static struct awg_conf c;
         struct awg_secrets s;
         char err[256];
@@ -1575,6 +1593,143 @@ void awg_down_all(void) {
     char path[512];
     reg_path(path, sizeof path);
     unlink(path);
+}
+
+/* ---- устройства подбора (steer-warpbox) -----------------------------------------------------
+ *
+ * Модуль warpbox ищет живую точку WARP, пробуя кандидатов на ВРЕМЕННЫХ устройствах, а не на
+ * устройствах выходов: перебор не должен рвать то, что сейчас несёт трафик. Устройство подбора
+ * создаётся здесь же, той же настройкой, что выход (awg_configure: метка подложки, выбор
+ * AmneziaWG/WireGuard), и затем уводится в отдельное пространство имён сети модуля: сокет туннеля
+ * WireGuard остаётся там, где устройство родилось (в основном пространстве, с меткой подложки, —
+ * датаграммы идут к Cloudflare обычным путём роутера), а адрес, маршрут по умолчанию и проверки
+ * через туннель живут в пространстве подбора. Так проверка не видит ни правил steer, ни маршрутов
+ * выходов, а правила steer не видят её: ни в фаервол, ни в таблицы ничего не добавляется.
+ *
+ * В реестр устройств (reg_write) они не попадают: снимает их сам подбор (awg_scan_down), а
+ * пространство имён модуля, умирая вместе с ним, уносит и всё, что в нём осталось. */
+
+/* Сменить пространство сети потока на ns; old — куда вернуться. 0 — сменили. */
+static int ns_enter(int ns, int *old) {
+    *old = open("/proc/thread-self/ns/net", O_RDONLY | O_CLOEXEC);
+    if (*old < 0) *old = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+    if (*old < 0) return errno;
+    if (setns(ns, CLONE_NEWNET) != 0) { int e = errno; close(*old); *old = -1; return e; }
+    return 0;
+}
+
+static void ns_leave(int old) {
+    if (old < 0) return;
+    if (setns(old, CLONE_NEWNET) != 0)
+        fprintf(stderr, LOG_W "подбор: не вернуться в своё пространство сети: %s\n", strerror(errno));
+    close(old);
+}
+
+static int link_to_ns(int index, int ns) {
+    uint8_t buf[128];
+    struct nlbuf b;
+    struct ifinfomsg ifi = { .ifi_family = AF_UNSPEC, .ifi_index = index };
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK,
+                                    ++g_seq, &ifi, sizeof ifi);
+    nlbuf_put_u32(&b, IFLA_NET_NS_FD, (uint32_t)ns);
+    return rtnl_simple(buf, msg_end(&b, nh));
+}
+
+/* Маршрут по умолчанию IPv4 через устройство index (в таблице main пространства подбора). */
+static int route_default(int index) {
+    uint8_t buf[128];
+    struct nlbuf b;
+    struct rtmsg rt = { .rtm_family = AF_INET, .rtm_table = RT_TABLE_MAIN, .rtm_protocol = RTPROT_STATIC,
+                        .rtm_scope = RT_SCOPE_LINK, .rtm_type = RTN_UNICAST };
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, RTM_NEWROUTE,
+                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE, ++g_seq, &rt, sizeof rt);
+    nlbuf_put_u32(&b, RTA_OIF, (uint32_t)index);
+    return rtnl_simple(buf, msg_end(&b, nh));
+}
+
+int awg_scan_up(const struct spec *sp, const char *dev, const char *conf, const char *over, int ns,
+                char *err, size_t en) {
+    static struct output t;
+    memset(&t, 0, sizeof t);
+    t.kind = &kind_awg;
+    snprintf(t.name, sizeof t.name, "%s", dev);
+    snprintf(t.device, sizeof t.device, "%s", dev);
+    snprintf(t.awg.conf, sizeof t.awg.conf, "%s", conf);
+    if (over) snprintf(t.over, sizeof t.over, "%s", over);
+    if (awg_configure(sp, &t, 0, NULL, 0) != 0) {
+        snprintf(err, en, "устройство подбора %s не поднялось (журнал выше)", dev);
+        link_delete(dev);
+        dev_state_drop(dev);
+        return -1;
+    }
+    if (ns < 0) return 0;
+    int index = 0, e = link_query(dev, NULL, 0, &index);
+    if (!e) e = link_to_ns(index, ns);
+    if (e) {
+        snprintf(err, en, "%s в пространство подбора не ушло: %s", dev, strerror(e));
+        link_delete(dev);
+        dev_state_drop(dev);
+        return -1;
+    }
+    dev_state_drop(dev);
+    static struct awg_conf c;
+    struct awg_secrets s;
+    char cerr[128];
+    int rc = -1, old = -1;
+    if (awg_conf_load(conf, &c, &s, cerr, sizeof cerr) != 0) { snprintf(err, en, "%s", cerr); goto gone; }
+    if ((e = ns_enter(ns, &old)) != 0) { snprintf(err, en, "пространство подбора: %s", strerror(e)); goto gone; }
+    e = link_query(dev, NULL, 0, &index);
+    for (size_t k = 0; !e && k < c.addr_n; k++) {
+        int ae = addr_msg(1, &c.addr[k], index);
+        if (ae && ae != EEXIST) e = ae;
+    }
+    if (!e) e = link_set_up(index, c.mtu ? c.mtu : 1420);
+    if (!e) e = route_default(index);
+    if (e) snprintf(err, en, "%s в пространстве подбора не настроено: %s", dev, strerror(e));
+    else rc = 0;
+    if (rc) link_delete(dev);
+    ns_leave(old);
+    awg_secrets_wipe(&s);
+    awg_conf_free(&c);
+    return rc;
+gone:
+    awg_secrets_wipe(&s);
+    awg_conf_free(&c);
+    if (ns_enter(ns, &old) == 0) { link_delete(dev); ns_leave(old); }
+    return -1;
+}
+
+void awg_scan_down(const char *dev, int ns) {
+    int old = -1;
+    if (ns >= 0 && ns_enter(ns, &old) != 0) return;
+    char kind[32] = "";
+    if (link_query(dev, kind, sizeof kind, NULL) == 0 && is_our_kind(kind)) link_delete(dev);
+    if (ns >= 0) ns_leave(old);
+    else dev_state_drop(dev);
+}
+
+int awg_scan_stat(const char *dev, int ns, int64_t *hs, uint64_t *rx, uint64_t *tx) {
+    int old = -1;
+    if (ns >= 0 && ns_enter(ns, &old) != 0) return -1;
+    char kind[32] = "";
+    static struct awg_live L;
+    int rc = link_query(dev, kind, sizeof kind, NULL) == 0 && is_our_kind(kind) && live_read(dev, kind, &L) == 0
+             ? 0 : -1;
+    if (ns >= 0) ns_leave(old);
+    *hs = 0;
+    *rx = *tx = 0;
+    for (size_t i = 0; !rc && i < L.peer_n; i++) {
+        if (L.peer[i].hs > *hs) *hs = L.peer[i].hs;
+        *rx += L.peer[i].rx;
+        *tx += L.peer[i].tx;
+    }
+    return rc;
+}
+
+int awg_kernel_has_awg(void) {
+    uint16_t id;
+    int ver;
+    return genl_family(AWG_GENL_NAME, &id, &ver) == 0;
 }
 
 /* ---- здоровье ------------------------------------------------------------------------------
@@ -1671,12 +1826,22 @@ int awg_revive(const struct spec *sp, const struct output *o, const char *dev,
      * после ручного `ip link del`. Предупреждение о молчащем пире в этом случае — ложная
      * тревога, которую человек видит в журнале приложения, поэтому причины разведены. */
     char kb[32];
+    if (warp_waiting(o)) return 0;
     if (!live_kind_of(dev, kb, sizeof kb))
         fprintf(stderr, LOG_I "%s: устройства нет — поднимаю\n", dev);
     else
         fprintf(stderr, LOG_W "%s: туннель молчит — заново разрешаю Endpoint и перенастраиваю\n", dev);
     if (awg_configure(sp, o, 0, names, n) != 0) return 0;
     return awg_healthy(o, dev);
+}
+
+int awg_refresh(const struct spec *sp, const struct output *o) {
+    if (warp_waiting(o)) return -1;
+    g_awg_fresh = 1;
+    int rc = awg_configure(sp, o, 0, NULL, 0);
+    g_awg_fresh = 0;
+    if (rc == 0) fprintf(stderr, LOG_I "%s: новая точка — туннель перенастроен с новой сессией\n", o->device);
+    return rc;
 }
 
 /* Имена Endpoint, которые починка разрешит, — чтобы сторож разрешил их заранее, не останавливая

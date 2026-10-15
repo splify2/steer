@@ -229,8 +229,8 @@ int xs_link_parse(const char *s, enum xs_role role, struct xs_conf *c, struct xs
     *colon = '\0';
     struct in_addr hip;
     if (ipv4_lit(hostport, &hip) != 0)
-        LFAIL("хост «%s» — нужен адрес IPv4 литералом: имя разрешает тот, кто пишет ссылку, "
-             "иначе туннель может зависеть от DNS внутри себя", hostport);
+        LFAIL("хост «%s» — нужен адрес IPv4 литералом (снаружи хаб xsteer ходит только по "
+             "IPv4); имя разрешает тот, кто пишет ссылку, иначе туннель может зависеть от DNS внутри себя", hostport);
     char *pend = NULL;
     long port = strtol(colon + 1, &pend, 10);
     if (!pend || *pend || pend == colon + 1 || port < 1 || port > 65535)

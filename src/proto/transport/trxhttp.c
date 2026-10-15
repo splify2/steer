@@ -112,22 +112,9 @@ static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
      *
      * ЖДАТЬ ЗДЕСЬ НЕЛЬЗЯ. Слив ответов делается попутно с отправкой, и блокирующее чтение
      * остановило бы выгрузку до прихода ответа — то есть превратило бы поток в череду
-     * «отправил и жду». Поверх TLS ожидания и нет: tls13_read опрашивает сокет с нулевым
-     * сроком и отдаёт ноль байт, когда записи ещё нет. На голом сокете (security=none)
-     * такого поведения нет, и опрос приходится ставить самим — поэтому чтение этой связи
-     * своё, а не tr_link_read основной. */
-    if (u->link.plain) {
-        struct pollfd p = { .fd = u->link.fd, .events = POLLIN };
-        if (poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN)) { *got = 0; return 0; }
-        ssize_t r = read(u->link.fd, d, cap);
-        if (r == 0) return TR_ECLOSED;
-        if (r < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { *got = 0; return 0; }
-            return TR_EIO;
-        }
-        *got = (size_t)r;
-        return 0;
-    }
+     * «отправил и жду». Ожидания нет ни поверх TLS, ни на голом сокете (security=none): оба
+     * чтения не ждут (recv с MSG_DONTWAIT) и отдают ноль байт, когда записи ещё нет. */
+    if (u->link.plain) return tr_sock_read(u->link.fd, d, cap, got);
     return tls13_read(&u->link.tls, d, cap, got);
 }
 
@@ -237,6 +224,9 @@ static int up_open(struct transport *t, const struct tr_node *n, int timeout_s) 
 
 /* ---- транспорт ------------------------------------------------------------------------ */
 
+/* scMaxEachPostBytes, когда узел его не объявил: умолчание Xray и клиента, и сервера. */
+#define XH_POST_DEFAULT 1000000u
+
 static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     struct xh_state *x = &t->xh;
     struct h2_io io = { .ctx = &t->link, .write = tr_link_write, .read = tr_link_read };
@@ -245,6 +235,11 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
      * :authority и на любое другое имя отвечает 404 (hub.go). */
     const char *authority = n->http_host && n->http_host[0] ? n->http_host
                           : n->sni[0] ? n->sni : n->host;
+    char abuf[136];
+    if (authority == n->host && strchr(authority, ':')) {   /* адрес IPv6 в :authority — в скобках */
+        snprintf(abuf, sizeof(abuf), "[%s]", authority);
+        authority = abuf;
+    }
     char path[320];
 
     /* Режим определяется ЗДЕСЬ, один раз: дальше он читается и при открытии потоков, и при
@@ -255,13 +250,13 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
     x->pad_from = n->pad_from;
     x->pad_to = n->pad_to;
     x->pad_set = n->pad_set;
-    /* Одно значение на соединение из диапазона узла, как выбирает клиент Xray (dialer.go). */
-    x->post_max = 0;
-    if (n->post_to) {
-        uint32_t r = 0;
-        if (getrandom(&r, sizeof r, 0) != (ssize_t)sizeof r) r = 0;
-        x->post_max = n->post_from + r % (n->post_to - n->post_from + 1);
-    }
+    /* Предел тела POST: диапазон scMaxEachPostBytes узла; не объявлен — умолчание Xray, 1000000
+     * (сервер на тело больше своего предела отвечает 413). Размер каждого POST выбирается при его
+     * отправке (post_pick). */
+    x->post_min = n->post_to ? n->post_from : XH_POST_DEFAULT;
+    x->post_max = n->post_to ? n->post_to : XH_POST_DEFAULT;
+    if (getrandom(&x->post_rng, sizeof x->post_rng, 0) != (ssize_t)sizeof x->post_rng)
+        x->post_rng = (uint64_t)(uintptr_t)t ^ 0x9E3779B97F4A7C15ull;
 
     /* __thread: буфер живёт между вызовами, но потоков теперь несколько, и один общий
      * массив они переписывали бы друг под другом. Своя копия на поток — 1,4 КБ. */
@@ -296,6 +291,33 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
     return up_open(t, n, timeout_s);
 }
 
+/* packet-up: нижняя граница размера POST — меньшее из post_min и окна потока (окно каждого нового
+ * потока — peer_init_win, и POST больше него не уйдёт), см. post_pick. До первого запроса окно —
+ * умолчательные 65535. 0 — предела нет. */
+static size_t post_floor(const struct xh_state *x) {
+    if (!x->post_max) return 0;
+    size_t lo = x->post_min && x->post_min < x->post_max ? x->post_min : x->post_max;
+    long win = x->up.started ? x->up.h2.peer_init_win : 65535;
+    if (win > 0 && (size_t)win < lo) lo = (size_t)win;
+    return lo;
+}
+
+/* packet-up: размер очередного POST — равномерно в [post_min, post_max], как делает клиент Xray
+ * (RandomRange на каждый запрос), но не больше окна потока. xorshift64*: на каждый POST системный
+ * вызов getrandom не нужен, а случайность здесь — не секрет, а форма трафика. 0 — предела нет. */
+static size_t post_pick(struct xh_state *x) {
+    if (!x->post_max) return 0;
+    size_t lo = post_floor(x);
+    size_t hi = x->post_max;
+    long win = x->up.started ? x->up.h2.peer_init_win : 65535;
+    if (win > 0 && (size_t)win < hi) hi = (size_t)win;
+    if (hi <= lo) return lo;
+    uint64_t r = x->post_rng ? x->post_rng : 0x9E3779B97F4A7C15ull;
+    r ^= r >> 12; r ^= r << 25; r ^= r >> 27;
+    x->post_rng = r;
+    return lo + (size_t)((r * 0x2545F4914F6CDD1Dull) >> 11) % (hi - lo + 1);
+}
+
 /* packet-up: сколько все куски записи могут нести вместе (окно соединения). */
 static long packet_conn_room(const struct xh_up *u) {
     if (!u->started) return 65535;
@@ -312,7 +334,6 @@ static long packet_conn_room(const struct xh_up *u) {
  * дальше PACKET_INFLIGHT от самого старого неотвеченного. Восемь — с большим запасом до умолчания
  * сервера и ниже даже сниженного. */
 #define PACKET_INFLIGHT 16
-#define PACKET_SLOT 8192
 
 /* Сколько кусков ещё можно послать, пока окно по seq не заполнено (см. PACKET_INFLIGHT). Номера
  * потоков растут на два за кусок. */
@@ -362,12 +383,15 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
              * честная плата за режим, который выбирают тогда, когда другие не
              * проходят вовсе.
              *
-             * Сервер отвечает 413 на тело POST больше своего scMaxEachPostBytes: запись больше
-             * post_max уходит несколькими кусками. «Всё или ничего» по-прежнему верно (контракт
-             * h2_write, на который опирается Vision выше): окна проверяются для всей записи до
-             * открытия первого куска, окно соединения — для суммы, окно каждого нового потока — для
-             * одного куска. */
-            size_t piece = x->post_max && x->post_max < n ? x->post_max : n;
+             * Сервер отвечает 413 на тело POST больше своего scMaxEachPostBytes: запись уходит кусками,
+             * каждый — случайного размера в [post_min, post_max] узла (post_pick), как у клиента Xray.
+             * «Всё или ничего» по-прежнему верно (контракт h2_write, на который опирается Vision
+             * выше): окна проверяются для всей записи до открытия первого куска, окно соединения —
+             * для суммы, окно каждого нового потока — для одного куска. Число кусков заранее
+             * неизвестно (размеры случайны), поэтому места считаются по худшему: все куски
+             * наименьшего размера. */
+            size_t floor_sz = post_floor(x);
+            size_t piece = floor_sz && floor_sz < n ? floor_sz : n;
             /* Куски этой записи обязаны уместиться среди неотвеченных; запись, которой одной нужно
              * больше PACKET_INFLIGHT (крошечный scMaxEachPostBytes), никого не ждёт. */
             int pieces = (int)((n + piece - 1) / piece);
@@ -378,12 +402,14 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
             if (!PACKET_FITS()) return H2_EWINDOW;
 #undef PACKET_FITS
             int rc = 0;
-            for (size_t off = 0; off < n && !rc; off += piece) {
-                size_t m = n - off < piece ? n - off : piece;
+            for (size_t off = 0; off < n && !rc; ) {
+                size_t m = post_pick(x);
+                if (!m || m > n - off) m = n - off;
                 rc = up_request(t, (long long)x->seq);
                 if (!rc) rc = h2_write(&x->up.h2, d + off, m);
                 if (!rc) rc = h2_end_stream(&x->up.h2);
                 if (!rc) x->seq++;
+                off += m;
             }
             int dr = up_drain(&x->up);
             return rc ? rc : dr;
@@ -440,14 +466,15 @@ static long xhttp_room(struct transport *t) {
             /* В БАЙТАХ, которые несут свободные места под куски, а не окно HTTP/2: окно бывает в
              * мегабайты, а неотвеченных кусков может быть лишь PACKET_INFLIGHT. Получив окно, клиент
              * слал куда больше, чем брали места, и каждый отказанный сегмент ждал таймаута повторной
-             * передачи (11 МБ выгружено за 20 с). Место считается по PACKET_SLOT байт, меньше того, что
-             * стек собирает в одну отправку (до 16 КБ), так что выданное окно заполняет куски целиком;
-             * post_max — когда предел узла меньше. */
+             * передачи (11 МБ выгружено за 20 с). Место считается по наименьшему куску диапазона
+             * (post_floor): запись не больше места занимает не больше свободных мест, как бы ни
+             * выпали случайные размеры; без предела у узла — по 64 КБ, окну по умолчанию. */
             if (packet_room(&x->up) < UP_ROOM_LOW || packet_slots(&x->up) <= PACKET_INFLIGHT / 2)
                 up_drain(&x->up);
             long r = packet_room(&x->up);
             long slots = packet_slots(&x->up);
-            long per = x->post_max && x->post_max < PACKET_SLOT ? (long)x->post_max : PACKET_SLOT;
+            size_t fl = post_floor(x);
+            long per = fl ? (long)fl : 65536;
             if (slots < 0) slots = 0;
             if (r > slots * per) r = slots * per;
             if (r > packet_conn_room(&x->up)) r = packet_conn_room(&x->up);
@@ -483,10 +510,17 @@ static int xhttp_aux_drain(struct transport *t) {
     return 0;
 }
 
+/* Одним вызовом принимает любую запись только packet-up: режет её на POST сам. У stream-up и
+ * stream-one запись — это DATA в одном потоке с окном, и стек собирает для них не больше записи TLS.
+ * Vision (flow) сюда не доходит: узел xhttp с flow отсеивается при разборе ссылки, а у дайлера
+ * VLESS узел с flow большой записи не получает в любом случае (vl_up_max). */
+static int xhttp_big_write(const struct transport *t) { return t->xh.mode == XH_PACKET_UP; }
+
 const struct transport_ops tr_xhttp = {
     .name = "xhttp", .alpn = "h2", .zc = 0,
     .open = xhttp_open, .write = xhttp_write, .read = xhttp_read,
     .moved = xhttp_moved, .close = xhttp_close, .pending = xhttp_pending,
     .room = xhttp_room,
     .aux_fd = xhttp_aux_fd, .aux_drain = xhttp_aux_drain,
+    .big_write = xhttp_big_write,
 };

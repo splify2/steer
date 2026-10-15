@@ -63,6 +63,10 @@ build/xswirematch
 build/xsstreammatch
 build/xsepochmatch
 build/tungromatch
+build/spscmatch
+build/spscmatch-tsan
+build/tunsteermatch
+build/.tsanprobe
 build/tunnelmatch
 build/xhupmatch
 build/grpcmatch
@@ -95,6 +99,7 @@ build/ngtcp2-host/
 build/qcbench
 build/qcbrutal
 build/qcloop
+build/qcbatch
 build/qcserver
 # Архивы wolfSSL под цели сборки (build/build-ext.sh, build/bench.sh, рецепт SDK)
 build/wolfssl-obj/
@@ -102,6 +107,8 @@ build/bench-*
 build/xsbench-*
 build/ext-sym
 build/scryptomatch
+build/scryptomatch-own
+build/cpmatch
 build/xsepochmatch
 build/steer-hub-native
 build/asan-probe*
@@ -143,4 +150,5 @@ build/subpq
 build/vencprobe
 build/xudpprobe
 build/trdialmatch
+build/warpmatch
 build/urltlsmatch

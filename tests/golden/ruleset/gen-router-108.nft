@@ -102,6 +102,8 @@ table ip steer {
     }
     chain postrouting_nat {
         type nat hook postrouting priority srcnat + 1; policy accept;
+        oifname "wg1" counter masquerade comment "steer-nat4:host"
+        oifname "wg2" counter masquerade comment "steer-nat4:other"
     }
 }
 table ip6 steer {

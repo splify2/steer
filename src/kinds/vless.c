@@ -134,7 +134,8 @@ static int vless_helper(const struct spec *sp, const struct output *o, struct ki
     /* И исключение узлов: клиент отбирает кандидатов при старте. */
     kind_sig_excl(&h->sig, &o->vless.excl);
     /* И пул узлов: active, by, interval, silence клиент тоже читает при старте. */
-    if (o->vless.pool.active || o->vless.pool.by || o->vless.pool.interval_s || o->vless.pool.silence_s)
+    if (o->vless.pool.active || o->vless.pool.by || o->vless.pool.interval_s || o->vless.pool.silence_s ||
+        o->vless.pool.pick || o->vless.pool.tol_set)
         kind_sig_mix(&h->sig, &o->vless.pool, sizeof(o->vless.pool));
     return 0;
 }
@@ -162,7 +163,7 @@ int out_node_named(const struct output *o) {
 const struct kind_ops kind_vless = {
     .name = "vless",
     .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER |
-            KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP,
+            KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP | KC_TCP_REDIR,
     .keys = KK_NODES | KK_SUB,
     /* Сюда попадает выход без masquerade, которому он и не нужен, — для него это норма
      * (см. out_self_natting и проверку «output» в diag.c). */

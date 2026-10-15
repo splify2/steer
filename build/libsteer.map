@@ -1,5 +1,5 @@
 /* Экспорт libsteer.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится.
- * Символы, которые steerd и модули (steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy) берут
+ * Символы, которые steerd и модули (steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy, steer-warpbox) берут
  * из библиотеки, и программный интерфейс QUIC (qc_*), который берёт стенд QUIC_STAND_SRC, пока
  * настоящих потребителей нет; остальное скрыто (local: *). Проверка: check. */
 LIBSTEER_1 {
@@ -8,6 +8,12 @@ LIBSTEER_1 {
     awg_check_all;
     awg_down_all;
     awg_hs_memory;
+    awg_kernel_has_awg;
+    awg_refresh;
+    awg_revive;
+    awg_scan_down;
+    awg_scan_stat;
+    awg_scan_up;
     b64_decode;
     chello_parse;
     cli_help;
@@ -34,6 +40,7 @@ LIBSTEER_1 {
     dupq_prepare;
     dupq_ready;
     dupq_stream_open;
+    dupq_stream_open_uni;
     dupq_stream_reset;
     dupq_stream_send;
     dupq_timeout_ms;
@@ -54,6 +61,7 @@ LIBSTEER_1 {
     group_bal_chain;
     group_bal_map;
     group_bal_target;
+    group_carded;
     group_hysteresis;
     group_interval_s;
     group_latency_keep;
@@ -112,14 +120,17 @@ LIBSTEER_1 {
     ir_table_add;
     ir_table_find;
     ir_x;
+    js_lit;
     jsonw_str;
     jsonw_str_ascii;
+    js_ws;
     kind_at;
     kind_by_name;
     kind_count;
     kind_direct;
     kind_emit_all;
     kind_sig_mix;
+    kind_warpm;
     l4_box_text;
     l4_from_text;
     l4match_same;
@@ -158,6 +169,7 @@ LIBSTEER_1 {
     out_hy2_node_list;
     out_hy2_node_named;
     out_hysteria2;
+    out_is_block;
     out_kind_name;
     out_member;
     out_members_n;
@@ -192,16 +204,20 @@ LIBSTEER_1 {
     qc_on_readable;
     qc_on_timer;
     qc_open;
+    qc_peer_cert;
     qc_run;
     qc_set_cc;
     qc_stats_get;
+    qc_stream_buffered;
     qc_stream_consumed;
     qc_stream_open;
     qc_stream_open_uni;
     qc_stream_reset;
+    qc_stream_room;
     qc_stream_send;
     qc_timeout_ms;
-    reality_build_hello;
+    qc_tls_free;
+    qc_tls_new;
     reality_build_hello_carry;
     registry_assign;
     rtnl_addrs6;
@@ -238,6 +254,9 @@ LIBSTEER_1 {
     sc_hkdf_expand;
     sc_hkdf_extract;
     sc_hmac;
+    sc_p256_keygen;
+    sc_p256_public;
+    sc_p256_sign;
     sc_shake128_free;
     sc_shake128_init;
     sc_shake128_read;
@@ -274,6 +293,7 @@ LIBSTEER_1 {
     spec_line_is_addr;
     spec_list_all;
     spec_print_v2;
+    spec_print_v2_json;
     srs_clause;
     srs_clause_n;
     srs_open;
@@ -283,8 +303,13 @@ LIBSTEER_1 {
     srs_skipped;
     srs_sniff;
     srs_walk;
+    stack_loop_watch;
+    stack_now_ns;
     stack_now_s;
     stack_run;
+    stack_sess_ready;
+    stack_sess_room;
+    stack_sess_rx;
     steer_cmd_module;
     steer_dev_model;
     steer_dev_os;
@@ -316,6 +341,7 @@ LIBSTEER_1 {
     tls_cert_roots;
     transport_aux_drain;
     transport_aux_fd;
+    transport_big_write;
     transport_close;
     transport_direct;
     transport_has_data;
@@ -342,6 +368,9 @@ LIBSTEER_1 {
     xc_random;
     xc_x25519_keypair;
     xc_x25519_public;
+    ydoc_free;
+    ydoc_parse_buf;
+    ydoc_root;
     zapret_instances;
     zapret_present;
     zapret_running;

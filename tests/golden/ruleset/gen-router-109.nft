@@ -66,8 +66,13 @@ table inet steer {
         meta mark and 0x0ff00000 == 0x00100000 oifname != "wg1" counter drop comment "steer-guard:host"
         meta mark and 0x0ff00000 == 0x00200000 oifname != "wg2" counter drop comment "steer-guard:other"
     }
+    chain postrouting_nat4 {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "wg1" meta nfproto ipv4 counter masquerade comment "steer-nat4:host"
+        oifname "wg2" meta nfproto ipv4 counter masquerade comment "steer-nat4:other"
+    }
     chain prerouting_dns {
-        type nat hook prerouting priority dstnat; policy accept;
+        type nat hook prerouting priority dstnat - 2; policy accept;
         iifname "steer-nolan0" udp dport 53 counter redirect to :5300
         iifname "steer-nolan0" tcp dport 53 counter redirect to :5300
     }

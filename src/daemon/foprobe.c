@@ -18,6 +18,7 @@
 
 #include "loop.h"
 #include "foprobe.h"
+#include "sockmark.h"
 
 #define LOG_W "steer[warn] failover: "
 
@@ -104,7 +105,7 @@ static void tcp_ready(struct loop *l, int fd, uint32_t ev, void *arg) {
     probe_finish(p, ok, ok ? elapsed_ms(p->t0) : -1);
 }
 
-struct foprobe *foprobe_tcp(struct loop *l, const char *dev, const char *host, int port,
+struct foprobe *foprobe_tcp(struct loop *l, const char *dev, unsigned mark, const char *host, int port,
                             int timeout_ms, foprobe_cb cb, void *arg, int *ok, int *ms) {
     *ok = 0;
     *ms = -1;
@@ -113,7 +114,10 @@ struct foprobe *foprobe_tcp(struct loop *l, const char *dev, const char *host, i
     if (inet_aton(host, &a) == 0) return NULL;
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return NULL;
-    if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, dev, (socklen_t)strlen(dev) + 1) != 0) {
+    /* С меткой — путь трафика клиентов выхода (R-152: TCP выхода с KC_TCP_REDIR перенаправляется к
+     * слушателю модуля по метке, через устройство он не идёт); без метки — через устройство. */
+    if (mark ? steer_sock_mark(fd, mark) != 0
+             : setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, dev, (socklen_t)strlen(dev) + 1) != 0) {
         close(fd);
         return NULL;
     }

@@ -59,6 +59,20 @@
  * таймеру: флеш телефона.
  *
  * Без демона трубы нет, а слежка всё равно идёт: замена узла и сброс соединений нужны и там.
+ *
+ * САМЫЕ БЫСТРЫЕ (`pick: latency`, решение владельца 2026-10-12 — «самый быстрый, не держа кучу
+ * интерфейсов»). Узлы подписки — в одном туннеле и одном устройстве, выбор — замером, как у url-test
+ * sing-box и Mihomo: раз в `interval` (умолчание POOL_LAT_INTERVAL_S) отдельный поток меряет всех
+ * кандидатов той же проверкой узла (соединение, рукопожатие, запрос через узел, первый байт ответа —
+ * время проверки целиком), по PL_LAT_PAR разом. Соединение проверки разовое: в покое к узлам ничего
+ * не открыто. Слоты затем пересаживаются на самых быстрых: узел слота меняется, только если свободный
+ * кандидат быстрее его больше чем на допуск (`tolerance`, умолчание 50 мс) или узел слота не ответил.
+ * Сброс соединений привязан к смерти УЗЛА, а не к смене узла слота (pl_stale, dead_at): при пересадке
+ * соединения прежнего узла доживают на нём (сессия держит свой узел), а новые идут на быстрый —
+ * пересадка соединений не рвёт. Поколение слота при пересадке новое: запасные связи, серии отказов и
+ * обрывы прежнего узла новому не приписываются (match, seen, lost).
+ * Замена мёртвого узла берёт кандидатов по последнему замеру (быстрые первыми, без замера — по
+ * порядку, не ответившие — последними).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -75,6 +89,7 @@
 #include "jsonw.h"
 #include "platform.h"
 #include "transport.h"
+#include "thrstack.h"
 
 #define PL_LOG_W "steer[warn]: "
 #define PL_LOG_I "steer[info]: "
@@ -90,12 +105,16 @@
 /* Обрыв соединения зовёт проверку не чаще, чем раз в столько: обрывы приходят пачкой (все соединения
  * умершего узла рвутся по одному сроку), а проверке хватает одной. */
 #define PL_LOST_GAP_MS 5000
+/* pick: latency — проверок кандидатов разом. */
+#define PL_LAT_PAR     4
 
 /* Шапка сессии пула; за ней, с отступом PL_HDR, — сессия протокола. */
 struct pl_sess {
     const void *node;           /* узел соединения; NULL — запасная, ещё ничья */
     unsigned gen;               /* поколение слота на момент выбора */
+    unsigned ep;                /* счёт смертей узлов на момент выбора (pl_stale) */
     int slot;                   /* -1 — нет */
+    int nidx;                   /* индекс узла node; -1 — нет */
     uint8_t udp, opened;        /* flow_open был, k — его ключ */
     struct flow_key k;
 };
@@ -131,10 +150,22 @@ static struct {
     char why[256];              /* причина последней неудачной проверки — для down */
     char dev[16];
     char sig[512];              /* последний опубликованный состав — писать только на перемене */
+    int *lat;                   /* pick: latency — последний замер узла, мс; -1 не ответил, -2 не мерили */
+    size_t lat_n;               /* по индексу узла: наибольший кандидат + 1 */
+    size_t lat_next;            /* следующий кандидат замера (sel) — общий для потоков замера */
+    unsigned *dead_at;          /* по индексу узла (lat_n): счёт deaths, когда узел признан мёртвым */
+    unsigned deaths;            /* смертей узлов всего */
+    unsigned lat_round;         /* кругов замера: файл состояния переписывается и по ним */
+    unsigned sig_round;         /* круг замера, уже записанный в файл */
 } g_pl = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 static const void *pl_node(int i) {
     return (const unsigned char *)g_pl.cf.nodes + (size_t)i * g_pl.cf.stride;
+}
+
+/* Последний замер узла, мс; -1 — не ответил, -2 — не мерили. Под замком. */
+static int pl_lat_of(int node) {
+    return node >= 0 && (size_t)node < g_pl.lat_n ? g_pl.lat[node] : -2;
 }
 
 static uint64_t pl_now_ms(void) {
@@ -193,6 +224,8 @@ static void pl_bind(struct pl_sess *s, int slot) {
     s->slot = slot;
     s->node = slot >= 0 ? pl_node(g_pl.slot[slot].node) : NULL;
     s->gen = slot >= 0 ? g_pl.slot[slot].gen : 0;
+    s->nidx = slot >= 0 ? g_pl.slot[slot].node : -1;
+    s->ep = g_pl.deaths;
 }
 
 /* ---- слежка: события и файл состояния -------------------------------------------------------- */
@@ -249,11 +282,17 @@ static void pl_publish(void) {
     }
     char sig[512];
     snprintf(sig, sizeof sig, "%d|%s", any, nodes);
-    if (!strcmp(sig, g_pl.sig)) return;
-    snprintf(g_pl.sig, sizeof g_pl.sig, "%s", sig);
-    evline_emit("active", "nodes", EVLINE_STR, nodes, (const char *)NULL);
+    unsigned round = __atomic_load_n(&g_pl.lat_round, __ATOMIC_RELAXED);
+    int moved = strcmp(sig, g_pl.sig) != 0;
+    if (!moved && round == g_pl.sig_round) return;      /* файл — и по новому кругу замера */
+    g_pl.sig_round = round;
+    if (moved) {
+        snprintf(g_pl.sig, sizeof g_pl.sig, "%s", sig);
+        evline_emit("active", "nodes", EVLINE_STR, nodes, (const char *)NULL);
+    }
 
     /* Файл состояния одной строкой: {"pid","up","node","want","slots","by","active":[{"index","name"}]}
+     * (pick: latency — ещё "pick" и "latency")
      * и поля протокола (extra). up — есть живой узел; node — имя первого активного (прежнее поле
      * файла proxy-*: один узел); want — сколько просили (active), slots — сколько держим (не больше
      * кандидатов). Верен, пока жив pid (как у hy2-*): kill -9 убрать за собой не даст. */
@@ -273,7 +312,23 @@ static void pl_publish(void) {
         jsonw_str(f, g_pl.cf.proto->name(pl_node(idx[i])));
         fputc('}', f);
     }
-    fputs("]}\n", f);
+    fputc(']', f);
+    if (g_pl.cf.pick == POOL_PICK_LATENCY) {
+        /* Последний замер кандидатов: {"<индекс узла>": мс}, -1 — не ответил; не мерили — нет.
+         * Объект, а не список с "index": по "index" diag считает активные узлы (tunpool.h). */
+        fputs(",\"pick\":\"latency\",\"latency\":{", f);
+        int first = 1;
+        pthread_mutex_lock(&g_pl.mu);
+        for (size_t k = 0; k < g_pl.cf.sel_n; k++) {
+            int c = g_pl.cf.sel[k], l = pl_lat_of(c);
+            if (l == -2) continue;
+            fprintf(f, "%s\"%d\":%d", first ? "" : ",", c, l);
+            first = 0;
+        }
+        pthread_mutex_unlock(&g_pl.mu);
+        fputc('}', f);
+    }
+    fputs("}\n", f);
     if (fclose(f) != 0 || rename(tmp, path) != 0) unlink(tmp);
 }
 
@@ -281,6 +336,14 @@ static void pl_publish(void) {
 
 static int pl_probe(int node, char *why, size_t n) {
     return g_pl.cf.proto->probe(pl_node(node), PL_TIMEOUT_S, why, n);
+}
+
+static void pl_order(int *out);
+
+/* Узел признан мёртвым: соединения, выбравшие его раньше, — в сброс (pl_stale). Под замком. */
+static void pl_mark_dead(int node) {
+    unsigned d = ++g_pl.deaths;
+    if (node >= 0 && (size_t)node < g_pl.lat_n) __atomic_store_n(&g_pl.dead_at[node], d, __ATOMIC_RELEASE);
 }
 
 /* Занят ли кандидат c другим слотом (живым или мёртвым, который его ещё ждёт). Под замком. */
@@ -300,6 +363,7 @@ static int pl_refill(int i, int own) {
         if (pl_probe(prev, why, sizeof why) == 0) {
             pthread_mutex_lock(&g_pl.mu);
             struct pl_slot *sl = &g_pl.slot[i];
+            if (sl->node != prev) { pthread_mutex_unlock(&g_pl.mu); return 1; }
             sl->up = 1;
             sl->fails = sl->streak = sl->kick = sl->lost = 0;
             if (!sl->unproven) sl->retry = PL_RETRY_S;     /* оживал без соединений — пауза не сбрасывается */
@@ -313,8 +377,14 @@ static int pl_refill(int i, int own) {
         snprintf(g_pl.why, sizeof g_pl.why, "%s", why);
         pl_publish();
     }
+    int *ord = malloc(g_pl.cf.sel_n * sizeof(*ord));
+    if (ord) {
+        pthread_mutex_lock(&g_pl.mu);
+        pl_order(ord);
+        pthread_mutex_unlock(&g_pl.mu);
+    }
     for (size_t k = 0; k < g_pl.cf.sel_n; k++) {
-        int c = g_pl.cf.sel[k];
+        int c = ord ? ord[k] : g_pl.cf.sel[k];
         pthread_mutex_lock(&g_pl.mu);
         int busy = c == prev || pl_taken(c, i);
         pthread_mutex_unlock(&g_pl.mu);
@@ -325,8 +395,9 @@ static int pl_refill(int i, int own) {
             continue;
         }
         pthread_mutex_lock(&g_pl.mu);
-        if (pl_taken(c, i)) { pthread_mutex_unlock(&g_pl.mu); continue; }
         struct pl_slot *sl = &g_pl.slot[i];
+        if (sl->node != prev) { pthread_mutex_unlock(&g_pl.mu); free(ord); return 1; }  /* занял замер */
+        if (pl_taken(c, i)) { pthread_mutex_unlock(&g_pl.mu); continue; }
         sl->node = c;
         sl->up = 1;
         __atomic_add_fetch(&sl->gen, 1, __ATOMIC_RELEASE);  /* pl_stale читает без замка */
@@ -344,8 +415,10 @@ static int pl_refill(int i, int own) {
         /* Узел слота сменился: соединения прежнего (если они ещё были) — в сброс. */
         stack_nodes_changed();
         pl_publish();
+        free(ord);
         return 1;
     }
+    free(ord);
     pthread_mutex_lock(&g_pl.mu);
     struct pl_slot *sl = &g_pl.slot[i];
     sl->due = pl_now_ms() + sl->retry * 1000ull;
@@ -367,6 +440,7 @@ static void pl_check(int i) {
     char why[256];
     int rc = pl_probe(node, why, sizeof why);
     pthread_mutex_lock(&g_pl.mu);
+    if (sl->node != node) { pthread_mutex_unlock(&g_pl.mu); return; }   /* пересел, пока проверялся */
     sl->checked_at = pl_now_ms();
     /* Проверку позвала серия отказов установления, а она прошла: узел принимает проверку и не несёт
      * соединения (сервер с ограничением соединений отвечает на одиночный запрос и молчит на
@@ -394,6 +468,7 @@ static void pl_check(int i) {
     sl->up = 0;
     sl->fails = 0;
     __atomic_add_fetch(&sl->gen, 1, __ATOMIC_RELEASE);
+    pl_mark_dead(node);
     /* Узел, который оживал и снова не нёс соединения, ищется всё реже, а не заново с 15 с. */
     if (!unproven) sl->retry = PL_RETRY_S;
     pthread_mutex_unlock(&g_pl.mu);
@@ -437,6 +512,147 @@ static void *pl_thread(void *arg) {
 static void pl_kick(int i) {
     g_pl.slot[i].kick = 1;
     pthread_cond_signal(&g_pl.cv);
+}
+
+/* ---- самые быстрые (pick: latency) ------------------------------------------------------------- */
+
+/* Поток замера: берёт следующего кандидата, пока они есть. Время — проверка целиком: соединение,
+ * рукопожатие, запрос через узел и первый байт ответа (у url-test sing-box без unified-delay — так же). */
+static void *pl_lat_worker(void *arg) {
+    (void)arg;
+    char why[256];
+    for (;;) {
+        size_t k = __atomic_fetch_add(&g_pl.lat_next, 1, __ATOMIC_RELAXED);
+        if (k >= g_pl.cf.sel_n) break;
+        int node = g_pl.cf.sel[k];
+        uint64_t t0 = pl_now_ms();
+        int rc = pl_probe(node, why, sizeof why);
+        int ms = rc == 0 ? (int)(pl_now_ms() - t0) : -1;
+        pthread_mutex_lock(&g_pl.mu);
+        if ((size_t)node < g_pl.lat_n) g_pl.lat[node] = ms;
+        pthread_mutex_unlock(&g_pl.mu);
+    }
+    return NULL;
+}
+
+static void pl_lat_measure(void) {
+    __atomic_store_n(&g_pl.lat_next, 0, __ATOMIC_RELAXED);
+    pthread_t t[PL_LAT_PAR];
+    int nt = 0;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, thread_stack(512 * 1024));      /* как у слежки: соединение на стеке */
+    for (int i = 0; i < PL_LAT_PAR; i++)
+        if (pthread_create(&t[nt], &a, pl_lat_worker, NULL) == 0) nt++;
+    pthread_attr_destroy(&a);
+    if (!nt) pl_lat_worker(NULL);
+    for (int i = 0; i < nt; i++) pthread_join(t[i], NULL);
+}
+
+/* Пересадить слоты на самых быстрых: худший слот (не отвечающий или пустой — худший всех) получает
+ * лучшего свободного кандидата, если тот быстрее больше чем на допуск. Поколение не меняется —
+ * соединения прежнего узла доживают на нём. */
+static void pl_lat_rebalance(void) {
+    int tol = g_pl.cf.tolerance_ms >= 0 ? g_pl.cf.tolerance_ms : POOL_LAT_TOLERANCE_MS;
+    char msg[4][320];
+    int nmsg = 0, changed = 0;
+    pthread_mutex_lock(&g_pl.mu);
+    for (int round = 0; round < g_pl.n; round++) {
+        int ws = -1;
+        long wms = -1;
+        for (int i = 0; i < g_pl.n; i++) {
+            const struct pl_slot *sl = &g_pl.slot[i];
+            int lm = sl->node >= 0 && sl->up ? pl_lat_of(sl->node) : -1;
+            if (lm == -2) continue;                 /* узел не мерили — сравнить не с чем */
+            long ms = lm < 0 ? 0x7fffffffL : lm;
+            if (ms > wms) { wms = ms; ws = i; }
+        }
+        int best = -1;
+        for (size_t k = 0; k < g_pl.cf.sel_n; k++) {
+            int c = g_pl.cf.sel[k], lc = pl_lat_of(c);
+            if (lc < 0 || pl_taken(c, -1)) continue;
+            if (best < 0 || lc < pl_lat_of(best)) best = c;
+        }
+        if (ws < 0 || best < 0) break;
+        if (wms != 0x7fffffffL && pl_lat_of(best) + tol >= wms) break;
+        struct pl_slot *sl = &g_pl.slot[ws];
+        int old = sl->node;
+        if (nmsg < 4) {
+            if (old >= 0 && wms != 0x7fffffffL)
+                snprintf(msg[nmsg++], sizeof msg[0], "узел %.60s: %ld мс → %.60s: %d мс (новые соединения)",
+                         g_pl.cf.proto->name(pl_node(old)), wms, g_pl.cf.proto->name(pl_node(best)),
+                         pl_lat_of(best));
+            else if (old >= 0)
+                snprintf(msg[nmsg++], sizeof msg[0], "узел %.60s не ответил на замер — новые соединения на "
+                         "%.60s: %d мс", g_pl.cf.proto->name(pl_node(old)), g_pl.cf.proto->name(pl_node(best)),
+                         pl_lat_of(best));
+            else
+                snprintf(msg[nmsg++], sizeof msg[0], "активный узел %d из %d: %.60s, %d мс", ws + 1, g_pl.n,
+                         g_pl.cf.proto->name(pl_node(best)), pl_lat_of(best));
+        }
+        sl->node = best;
+        sl->up = 1;
+        /* Поколение — новое: запасные связи, серии отказов и обрывы прежнего узла этому слоту больше
+         * не счёт (match, seen, lost). Соединения прежнего живого узла не рвутся — pl_stale. */
+        __atomic_add_fetch(&sl->gen, 1, __ATOMIC_RELEASE);
+        sl->fails = sl->streak = sl->kick = sl->lost = sl->unproven = 0;
+        sl->retry = PL_RETRY_S;
+        sl->checked_at = pl_now_ms();
+        sl->due = sl->checked_at + (uint64_t)g_pl.cf.interval_s * 1000ull;
+        changed = 1;
+    }
+    pthread_mutex_unlock(&g_pl.mu);
+    for (int i = 0; i < nmsg; i++) fprintf(stderr, PL_LOG_I "%s\n", msg[i]);
+    if (changed) {
+        stack_nodes_changed();      /* запасные связи к прежнему узлу — выбросить */
+        pl_publish();
+    }
+}
+
+static void *pl_lat_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pl_lat_measure();
+        __atomic_add_fetch(&g_pl.lat_round, 1, __ATOMIC_RELAXED);
+        pl_lat_rebalance();
+        pl_publish();
+        struct timespec ts = { (time_t)g_pl.cf.interval_s, 0 };
+        while (nanosleep(&ts, &ts) != 0) {}
+    }
+    return NULL;
+}
+
+static int pl_lat_start(void) {
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, thread_stack(512 * 1024));      /* без потоков замера проверяет сам */
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    int err = pthread_create(&t, &a, pl_lat_thread, NULL);
+    pthread_attr_destroy(&a);
+    return err;
+}
+
+/* Кандидаты в порядке замены. pick: latency — по последнему замеру (быстрые первыми, без замера — по
+ * порядку предпочтения, не ответившие — последними); иначе — порядок предпочтения. out — sel_n. Под
+ * замком. */
+static void pl_order(int *out) {
+    size_t n = g_pl.cf.sel_n;
+    for (size_t k = 0; k < n; k++) out[k] = g_pl.cf.sel[k];
+    if (g_pl.cf.pick != POOL_PICK_LATENCY) return;
+    for (size_t i = 1; i < n; i++) {                /* вставками: устойчиво, кандидатов десятки */
+        int v = out[i], lv = pl_lat_of(v);
+        long kv = lv >= 0 ? lv : lv == -2 ? 0x7ffffff0L : 0x7fffffffL;
+        size_t j = i;
+        while (j > 0) {
+            int lu = pl_lat_of(out[j - 1]);
+            long ku = lu >= 0 ? lu : lu == -2 ? 0x7ffffff0L : 0x7fffffffL;
+            if (ku <= kv) break;
+            out[j] = out[j - 1];
+            j--;
+        }
+        out[j] = v;
+    }
 }
 
 /* ---- дайлер пула --------------------------------------------------------------------------------- */
@@ -521,11 +737,14 @@ static void pl_take(void *dst, void *src) {
         d->node = s->node;
         d->slot = s->slot;
         d->gen = s->gen;
+        d->ep = s->ep;
+        d->nidx = s->nidx;
         if (d->opened) g_pl.in->flow_open(d->node, INNER(d), &d->k, d->udp);
     }
     g_pl.in->take(INNER(d), INNER(s));
     s->node = NULL;
     s->slot = -1;
+    s->nidx = -1;
 }
 
 static void pl_close(void *sess) { g_pl.in->close(INNER(sess)); }
@@ -534,6 +753,7 @@ static void pl_clear(void *sess) {
     struct pl_sess *s = sess;
     s->node = NULL;
     s->slot = -1;
+    s->nidx = -1;
     s->opened = 0;
     g_pl.in->clear(INNER(s));
 }
@@ -570,6 +790,12 @@ static long pl_room(const void *ctx, void *sess) {
     return g_pl.in->room(s->node, INNER(s));
 }
 
+static size_t pl_up_max(const void *ctx, void *sess) {
+    (void)ctx;
+    struct pl_sess *s = sess;
+    return s->node ? g_pl.in->up_max(s->node, INNER(s)) : 0;
+}
+
 static size_t pl_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
     return g_pl.in->dgram_frame(p, n, out, cap);
 }
@@ -601,8 +827,10 @@ static int pl_match(const void *ctx, const void *dst, const void *src) {
 static int pl_stale(const void *ctx, const void *sess) {
     (void)ctx;
     const struct pl_sess *s = sess;
-    if (s->slot < 0 || !s->node) return 0;
-    return __atomic_load_n(&g_pl.slot[s->slot].gen, __ATOMIC_ACQUIRE) != s->gen;
+    if (s->slot < 0 || !s->node || s->nidx < 0 || (size_t)s->nidx >= g_pl.lat_n) return 0;
+    /* Сбрасывается только узел, признанный мёртвым после выбора. Слот, пересевший на быстрый узел
+     * (pick: latency), соединения прежнего не рвёт: тот жив, они доживают на нём. */
+    return (int)(__atomic_load_n(&g_pl.dead_at[s->nidx], __ATOMIC_ACQUIRE) - s->ep) > 0;
 }
 
 static void pl_lost(const void *ctx, const void *sess) {
@@ -633,7 +861,7 @@ static void pl_ready_cb(void *arg, const char *dev) {
     pthread_attr_t a;
     pthread_attr_init(&a);
     /* Проверка держит соединение (struct transport, ~40 КБ) на своём стеке. */
-    pthread_attr_setstacksize(&a, 512 * 1024);
+    pthread_attr_setstacksize(&a, thread_stack(512 * 1024));
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_t t;
     int err = pthread_create(&t, &a, pl_thread, NULL);
@@ -644,6 +872,8 @@ static void pl_ready_cb(void *arg, const char *dev) {
                         "заметит\n", strerror(err));
         evline_emit("up", "dev", EVLINE_STR, g_pl.dev, (const char *)NULL);
     }
+    if (g_pl.cf.pick == POOL_PICK_LATENCY && pl_lat_start() != 0)
+        fprintf(stderr, PL_LOG_W "поток замера узлов не создался — узлы выбираются по порядку\n");
     if (r->ready) r->ready(r->arg, dev);
 }
 
@@ -658,7 +888,21 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     pthread_condattr_destroy(&ca);
     g_pl.cf = *pc;
     g_pl.in = pc->proto->ops;
-    if (g_pl.cf.interval_s <= 0) g_pl.cf.interval_s = POOL_INTERVAL_S;
+    if (g_pl.cf.interval_s <= 0)
+        g_pl.cf.interval_s = g_pl.cf.pick == POOL_PICK_LATENCY ? POOL_LAT_INTERVAL_S : POOL_INTERVAL_S;
+    if (g_pl.cf.tolerance_ms < 0) g_pl.cf.tolerance_ms = POOL_LAT_TOLERANCE_MS;
+    /* Замер и смерть — по индексу узла: таблицы до наибольшего кандидата. */
+    g_pl.lat_n = 0;
+    for (size_t k = 0; k < pc->sel_n; k++)
+        if (pc->sel[k] >= 0 && (size_t)pc->sel[k] + 1 > g_pl.lat_n) g_pl.lat_n = (size_t)pc->sel[k] + 1;
+    if (pc->first >= 0 && (size_t)pc->first + 1 > g_pl.lat_n) g_pl.lat_n = (size_t)pc->first + 1;
+    free(g_pl.lat);
+    free(g_pl.dead_at);
+    g_pl.lat = malloc((g_pl.lat_n ? g_pl.lat_n : 1) * sizeof *g_pl.lat);
+    g_pl.dead_at = calloc(g_pl.lat_n ? g_pl.lat_n : 1, sizeof *g_pl.dead_at);
+    if (!g_pl.lat || !g_pl.dead_at) { fprintf(stderr, PL_LOG_W "нет памяти под замеры узлов\n"); return NULL; }
+    for (size_t k = 0; k < g_pl.lat_n; k++) g_pl.lat[k] = -2;
+    g_pl.deaths = 0;
     if (g_pl.cf.active < 1) g_pl.cf.active = 1;
     /* Слотов — не больше кандидатов: держать активными больше узлов, чем их есть, нечем. */
     g_pl.n = g_pl.cf.active;
@@ -701,6 +945,7 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.flow_open = pl_flow_open;
     g_pl_ops.send = pl_send;
     g_pl_ops.room = pl_room;
+    g_pl_ops.up_max = g_pl.in->up_max ? pl_up_max : NULL;
     g_pl_ops.dgram_frame = pl_dgram_frame;
     g_pl_ops.read = pl_read;
     g_pl_ops.deliver = pl_deliver;

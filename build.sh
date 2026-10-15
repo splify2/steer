@@ -206,7 +206,7 @@ pkg_deps() {  # ФАЙЛ_БИНАРНИКА ВИД (core|mod|tun) -> "nftables i
 # обновить один, оставив другой (apk — `имя=версия`, opkg — `имя (= версия)`). Чужие пакеты
 # (nftables, kmod-…) остаются без версии. Демон дополнительно проверяет версию при запуске модуля
 # (hello, docs/ctl.md) — на случай установки файлами мимо менеджера.
-OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-proxy steer-extended "
+OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-proxy steer-warpbox steer-extended "
 dep_apk() {  # ИМЕНА через пробел -> "имя=версия ..." для наших
     for _d in $1; do
         case "$OURS" in *" $_d "*) printf '%s=%s-r1 ' "$_d" "$VERSION" ;; *) printf '%s ' "$_d" ;; esac
@@ -419,6 +419,12 @@ for spec in $ISAS; do
     # Файл кладётся В ПОЛЕЗНУЮ НАГРУЗКУ, а не в скрипт установки: он обязан исчезнуть вместе
     # с пакетом и принадлежать ему, как init-скрипт.
     cp files/lib/upgrade/keep.d/steer "$root/lib/upgrade/keep.d/steer"
+    # Вход fw4 для перенаправленных к службам steer соединений (гостевые зоны с input REJECT) —
+    # почему, в самом файле. fw4 подхватывает его при перечитывании; postinst перечитывает.
+    mkdir -p "$root/usr/share/nftables.d/chain-pre/input"
+    cp files/usr/share/nftables.d/chain-pre/input/30-steer.nft \
+       "$root/usr/share/nftables.d/chain-pre/input/30-steer.nft"
+    chmod 0644 "$root/usr/share/nftables.d/chain-pre/input/30-steer.nft"
     chmod 0755 "$root/usr/sbin/steerd" "$root/usr/sbin/steer" "$root/usr/sbin/steer-nfqws" \
                "$root/etc/init.d/steer" "$root/etc/hotplug.d/iface/95-steer"
     chmod 0644 "$root/lib/upgrade/keep.d/steer"
@@ -450,6 +456,7 @@ for spec in $ISAS; do
     cat > build/scripts/steer.postinst <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
+[ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null
 if grep -q steer-box-connector /etc/init.d/sing-box 2>/dev/null || [ -e /var/run/steer-box-installing ]; then
 	/etc/init.d/steer stop 2>/dev/null
 	/etc/init.d/steer disable 2>/dev/null
@@ -481,7 +488,8 @@ EOF
     printf '#!/bin/sh\nexit 0\n' > build/scripts/noop.postinst
     cp build/scripts/noop.postinst build/scripts/noop.prerm
     cp build/scripts/noop.postinst build/scripts/noop.postrm
-    printf '#!/bin/sh\nexit 0\n' > build/scripts/steer.postrm
+    # Включение входа fw4 (usr/share/nftables.d) уходит с пакетом — fw4 перечитывает набор без него.
+    printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n[ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null\nexit 0\n' > build/scripts/steer.postrm
     chmod +x build/scripts/*
 
     # pack ИМЯ КОРЕНЬ ЗАВИСИМОСТИ ОПИСАНИЕ ВИД-СКРИПТОВ [КОНФЛИКТЫ] [ЗАМЕНЯЕТ] — оба формата из одного
@@ -539,9 +547,11 @@ EOF
     # Модули: по одному бинарнику в usr/sbin рядом со steerd, где их находит движок (src/lib/
     # module.c). Зависимость от steer-core — точной версии: ядро и модуль общаются линией событий,
     # формат которой между выпусками не обещан (hello в docs/ctl.md).
-    # steer-hysteria2 и steer-proxy — тоже модули, но в steer-extended они НЕ входят: отдельные
-    # пакеты, которые ставят сознательно (см. мета-пакет ниже).
-    for m in vless xsteer obfs tgws hysteria2 proxy; do
+    # steer-hysteria2, steer-proxy и steer-warpbox — тоже модули, но в steer-extended они НЕ входят:
+    # отдельные пакеты, которые ставят сознательно (см. мета-пакет ниже). У steer-warpbox нет
+    # зависимости от модуля ядра: туннели WARP — выходы awg ядра steer, а им годится и kmod-amneziawg
+    # (сторонний, с обфускацией), и kmod-wireguard из фидов OpenWrt — выбор за человеком.
+    for m in vless xsteer obfs tgws hysteria2 proxy warpbox; do
         mroot="build/pkg/$arch-$m"
         rm -rf "$mroot"
         mkdir -p "$mroot/usr/sbin"
@@ -554,6 +564,7 @@ EOF
             tgws)   md="steer-tgws: мост Telegram для steer (модуль)"; mk=mod ;;
             hysteria2) md="steer-hysteria2: клиент hysteria2 (QUIC, Brutal) для steer (модуль)"; mk=tun ;;
             proxy)  md="steer-proxy: клиенты trojan, shadowsocks, socks, http, vmess для steer (модуль)"; mk=tun ;;
+            warpbox) md="steer-warpbox: Cloudflare WARP для steer — регистрация, подбор точек, замена (модуль)"; mk=mod ;;
         esac
         mdeps="steer-core $(pkg_deps "$mroot/usr/sbin/steer-$m" "$mk")"
         pack "steer-$m" "$mroot" "$mdeps" "$md" mod

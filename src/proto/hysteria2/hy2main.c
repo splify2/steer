@@ -30,6 +30,7 @@
 #include "evline.h"
 #include "jsonw.h"
 #include "probe.h"
+#include "thrstack.h"
 
 #define LOG_W2 "steer[warn]: "
 #define LOG_I2 "steer[info]: "
@@ -254,6 +255,8 @@ static void state_write(void) {
 static void *state_thread(void *arg) {
     (void)arg;
     for (;;) {
+        /* Имя узла разрешается тут, а не в цикле рабочего: getaddrinfo блокирует (hy2conn.c). */
+        hy2c_refresh_addr();
         state_write();
         struct timespec ts = { 3, 0 };
         nanosleep(&ts, NULL);
@@ -415,7 +418,7 @@ static void watch_start(const struct hy2_node *nodes, const int *sel, size_t sel
     g_nw.checked = checked;
     pthread_attr_t a;
     pthread_attr_init(&a);
-    pthread_attr_setstacksize(&a, 512 * 1024);      /* минимум потока включает TLS libsteer (hy2conn.c) */
+    pthread_attr_setstacksize(&a, thread_stack(512 * 1024));
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_t t;
     pthread_mutex_lock(&g_nw.mu);

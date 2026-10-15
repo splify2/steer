@@ -108,13 +108,31 @@ static void registry_snapshot(void) {
 static void cleanup_stale_routing(const struct spec *sp) {
     for (size_t i = 0; i < g_oldreg_n; i++) {
         int live = 0;
+        /* Живое — та же ПАРА «метка, таблица» у выхода с устройством. Одной метки мало: освободившуюся
+         * метку реестр отдаёт другому выходу, и правило прежнего владельца (`fwmark M lookup
+         * <его таблица>`) пережило бы его, уводя трафик нового в мёртвую таблицу. Так было на
+         * стенде QEMU 2026-10-13: WARP с двух туннелей сократили до одного, метку cf.2 получил
+         * kind: block, и его трафик пропадал в таблице steer_cf.2, не доходя до отказа. rule_drop
+         * снимает именно эту пару — правило нового владельца с другой таблицей не задевается. */
         for (size_t k = 0; k < sp->out_n; k++)
-            if (out_needs_mark(&sp->out[k]) && sp->out[k].mark == g_oldreg[i].mark) {
+            if (out_needs_mark(&sp->out[k]) && sp->out[k].mark == g_oldreg[i].mark &&
+                (!out_has_device(&sp->out[k]) ? 0 : sp->out[k].table == g_oldreg[i].table)) {
                 live = 1;
                 break;
             }
         if (live) continue;
-        routing_drop(g_oldreg[i].mark, g_oldreg[i].table);
+        char table[16];
+        snprintf(table, sizeof(table), "%d", g_oldreg[i].table);
+        rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
+        rule_drop6(g_oldreg[i].mark, g_oldreg[i].table);
+        /* Таблицу — только ничью: её номер реестр тоже мог отдать другому выходу. */
+        int tlive = 0;
+        for (size_t k = 0; k < sp->out_n && !tlive; k++)
+            tlive = out_has_device(&sp->out[k]) && sp->out[k].table == g_oldreg[i].table;
+        if (tlive) continue;
+        const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
+        run(flush);
+        route6_flush(g_oldreg[i].table);
     }
 }
 
@@ -387,6 +405,7 @@ static void apply_routing_one(const struct output *o) {
              * прежнее устройство. */
             const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
             run(flush);
+            tcp_redir_sync(o, NULL);
             if (out_route6(o)) {
                 /* IPv6 — тем же путём напрямую: правило на месте, таблица пуста. */
                 rule_ensure6(o->mark, o->table);
@@ -566,6 +585,7 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
      * единственным способом снять их правила из ядра. */
     registry_snapshot();
     if (registry_assign(cfg, &e) < 0) err_die(&e);
+    tcp_redir_learn(cfg);
     if (!full) {
         outputs_adopt_active(cfg);
         return;
@@ -864,6 +884,7 @@ int cmd_apply(const char *spec, int dry) {
     apply_routing(&cfg);
     if (ruleset_load(&cfg, &gr) != 0) return 1;
     failopen_after_load(&cfg);
+    tcp_redir_after_load(&cfg);
     /* Карта balance из набора правил — «все члены живы»; сразу к живым по подхвату, как её
      * поставил бы проход (fog_balance_adopt в fogroup.c). */
     fog_balance_adopt(&cfg);
@@ -1141,6 +1162,7 @@ int cmd_apply_commit(int argc, char **argv) {
          * членами: отметки — по таблицам выходов (и тех, что привязаны выше: их отметку приняла
          * прежняя таблица), карты — к живым, как у подкоманды. */
         failopen_after_load(&cfg);
+        tcp_redir_after_load(&cfg);
         fog_balance_adopt(&cfg);
     }
     for (const char *p = a.drop; p && *p; ) {

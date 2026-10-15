@@ -56,6 +56,7 @@
 #include "loop.h"
 #include "gaiw.h"
 #include "urltest.h"
+#include "sockmark.h"
 
 #ifndef STEER_VERSION
 #define STEER_VERSION "dev"
@@ -330,7 +331,7 @@ static void ut_connect(struct urltest *u, const struct sockaddr_storage *a) {
     int fd = socket(u->dst.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) { ut_why(u, "socket: %s", strerror(errno)); ut_finish(u, -1); return; }
     if (u->mark) {
-        if (setsockopt(fd, SOL_SOCKET, SO_MARK, &u->mark, sizeof(u->mark)) != 0) {
+        if (steer_sock_mark(fd, u->mark) != 0) {
             ut_why(u, "метка члена не поставилась: %s", strerror(errno));
             close(fd);
             ut_finish(u, -1);

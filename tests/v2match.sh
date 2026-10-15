@@ -76,7 +76,7 @@ STEER="$tmp/wrap/router" sh tests/gen.sh >/dev/null 2>&1
 ANDROID="$tmp/wrap/android" sh tests/androidmatch.sh >/dev/null 2>&1
 STEER="$tmp/wrap/router" TGWSSIM="$tmp/wrap/tgws" sh tests/tgwsmark.sh >/dev/null 2>&1
 
-same=0 refused=0 fail=0 total=0
+same=0 refused=0 pinned=0 fail=0 total=0
 for d in "$res"/*/; do
     [ -f "$d/v1.rc" ] || continue
     total=$((total + 1))
@@ -95,6 +95,12 @@ for d in "$res"/*/; do
     fi
     if [ "$(cat "$d/v2.rc")" = "$rc1" ] && cmp -s "$d/v1.out" "$d/v2.out"; then
         same=$((same + 1))
+    elif [ "$(cat "$d/v2.rc")" = "$rc1" ] && grep -q 'comment "steer-pin:' "$d/v2.out" &&
+         ! grep -q 'steer-pin:' "$d/v1.out"; then
+        # Пул v1 (`devices`) переводится группой с именованными членами, а у неё в v2 соединения
+        # закреплены за членом (compile/balance.c, group_carded): v1 так не умеет — у членов пула
+        # нет своих меток. Расхождение намеренное; набор правил такой группы сверяют gen.sh и снимок.
+        pinned=$((pinned + 1))
     else
         fail=$((fail + 1))
         echo "FAIL v2match: ruleset v1 и перевода разошёлся ($(cat "$d/args")), коды $rc1/$(cat "$d/v2.rc")"
@@ -104,7 +110,7 @@ for d in "$res"/*/; do
     fi
 done
 [ "$total" -gt 100 ] || { fail=$((fail + 1)); echo "FAIL v2match: вызовов apply --dry-run всего $total (ждали >100)"; }
-echo "v2match: перевод v1 → v2 — $same спек дали тот же ruleset, $refused отвергнуты обеими, из $total"
+echo "v2match: перевод v1 → v2 — $same спек дали тот же ruleset, $pinned — тот же, но с закреплением соединений группы (v2), $refused отвергнуты обеими, из $total"
 
 # ---- 2. разбор v2 ----------------------------------------------------------------------------
 pass=0
@@ -298,10 +304,53 @@ if [ -x "$XK" ]; then
     printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, active: 2 }\n' > "$tmp/pl6.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl6.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "у kind hysteria2 нет active больше 1"; then ok; else bad "active у hysteria2 — отказ" "$out"; fi
+    # pick: latency и tolerance — самые быстрые узлы подписки (пул туннеля): convert печатает их, у
+    # hysteria2 — отказ, tolerance без pick: latency — отказ; pick и tolerance у прочих видов — ключи группы.
+    printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, pick: latency, tolerance: 0 }\n' > "$tmp/pl8.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl8.yaml --state-dir "$tmp/state" 2>&1)"
+    if [ $? = 0 ]; then ok; else bad "pick: latency, tolerance: 0 у vless — приняты" "$(echo "$out" | head -n 3)"; fi
+    (cd "$tmp" && "$XKA" spec convert --spec pl8.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
+    if grep -q 'pick: latency, tolerance: 0' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+        bad "convert печатает pick и tolerance туннеля (неподвижная точка)" "$(grep -n nl "$tmp/c1.yaml")"; fi
+    plref "pick: balance у туннеля — отказ с местом" "pick: balance" "«balance» — у туннеля нужен order или latency" 3:68
+    plref "tolerance без pick: latency — отказ" "tolerance: 20" "tolerance — допуск смены узла по замеру, он есть только у pick: latency" ""
+    plref "tolerance: 70000 — отказ" "pick: latency, tolerance: 70000" "tolerance — от 0 до 60000" 3:88
+    printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, pick: latency }\n' > "$tmp/pl9.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl9.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "у kind hysteria2 пока нет pick: latency"; then ok; else bad "pick: latency у hysteria2 — отказ" "$out"; fi
+    printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, pick: latency }\n' > "$tmp/pl10.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl10.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "pick есть только у kind: group"; then ok; else
+        bad "pick у interface — прежний отказ «только у kind: group»" "$out"; fi
     printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, active: 2 }\n' > "$tmp/pl7.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl7.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ключ active есть только у kind: tunnel"; then ok; else
         bad "active у interface — отказ «только у kind: tunnel»" "$out"; fi
+    # kind: block — «Блок»: цепочки forward_block/output_block по метке соединения (TCP — RST,
+    # остальное — ICMP запрет), без устройства и таблиц; доменный канал — режим 2 в таблице резолвера.
+    printf 'bad.example\n' > "$tmp/blk.lst"
+    printf '203.0.113.0/24\n' > "$tmp/blk4.lst"
+    printf 'version: 2\noutputs:\n  blk: { kind: block }\nlists:\n  bd: { domains_file: %s/blk.lst }\n  bp: { prefixes_file: %s/blk4.lst }\nrules:\n  - { name: bd, to: [bd], out: blk, resolve: realip }\n  - { name: bp, to: [bp], out: blk }\n' "$tmp" "$tmp" > "$tmp/bk.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec bk.yaml --state-dir "$tmp/state" 2>&1)"
+    if [ $? = 0 ] && echo "$out" | grep -q 'chain forward_block' && echo "$out" | grep -q 'chain output_block' &&
+       echo "$out" | grep -q 'meta l4proto tcp counter reject with tcp reset' &&
+       echo "$out" | grep -q 'reject with icmpx admin-prohibited'; then ok; else
+        bad "kind: block — цепочки отказа по метке соединения" "$(echo "$out" | grep -n 'block\|reject' | head -n 8)"; fi
+    if ! echo "$out" | grep -q 'ip rule.*blk\|table.*blk_'; then ok; else bad "kind: block — без таблиц маршрутизации"; fi
+    tab="$(cd "$tmp" && "$XKA" dnsd-table --spec bk.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$tab" | grep -q '|blk|2|'; then ok; else bad "kind: block — доменный канал с режимом 2 (пустой адрес)" "$tab"; fi
+    # Страж меток пропускает петлю: собственный сокет роутера с меткой туннельного выхода (замер члена
+    # группы, over) перенаправляется к слушателю модуля и уходит в lo — прежде страж его отбрасывал.
+    printf 'version: 2\noutputs:\n  t1: { kind: tunnel, protocol: vless, subscription: sub/t1 }\n  g: { kind: group, pick: latency, members: [t1] }\nlists:\n  bp: { prefixes_file: %s/blk4.lst }\nrules:\n  - { name: bp, to: [bp], out: g }\n' "$tmp" > "$tmp/lo.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec lo.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | sed -n '/chain postrouting_guard/,/^    }/p' | grep -q 'oifname "lo" return'; then ok; else
+        bad "страж меток пропускает lo при перенаправлении TCP к модулю" "$(echo "$out" | sed -n '/chain postrouting_guard/,/^    }/p' | head -n 8)"; fi
+    # spec convert --json: та же спека JSON-объектом; YAML → JSON → YAML — тот же текст, JSON — неподвижная точка,
+    # спека читается и со стандартного ввода (--spec -).
+    (cd "$tmp" && "$XKA" spec convert --spec pl8.yaml > j1.yaml && "$XKA" spec convert --json --spec j1.yaml > j.json &&
+        "$XKA" spec convert --spec - < j.json > j2.yaml && "$XKA" spec convert --json --spec - < j.json > j2.json) 2>/dev/null
+    if cmp -s "$tmp/j1.yaml" "$tmp/j2.yaml" && cmp -s "$tmp/j.json" "$tmp/j2.json" && grep -q '^{"version":2,' "$tmp/j.json" &&
+       grep -q '"tolerance":0' "$tmp/j.json"; then ok; else bad "spec convert --json — круг YAML → JSON → YAML" "$(cat "$tmp/j.json" 2>&1 | head -c 300)"; fi
 else
     bad "не собран $XK (make build/steer-xk)"
 fi
@@ -578,6 +627,31 @@ dns:
     doq: { url: "doq://dns.test", ips: [192.0.2.1] }
 EOF
 refused "doq:// — не схема" "нужен адрес вида" 4
+
+y <<'EOF'
+version: 2
+dns:
+  upstreams:
+    h3: { url: "h3://dns.google/dns-query", ips: [8.8.8.8] }
+    h3p: { url: "h3://1.1.1.1:8443/q" }
+EOF
+accepted "DoH3 (h3://) — принят"
+
+y <<'EOF'
+version: 2
+dns:
+  upstreams:
+    h3: { url: "h3://dns.test" }
+EOF
+refused "имя сервера DoH3 без ips и bootstrap — отказ" "нечем разрешить" 4
+
+y <<'EOF'
+version: 2
+dns:
+  upstreams:
+    q: { url: "quic://dns.test/x", ips: [192.0.2.1] }
+EOF
+refused "путь у quic:// — отказ, и подсказка называет h3://" "только у https:// и h3://" 4
 
 # Адреса IPv6 клиентов и lan законны с 1.9 (docs/architecture.md, «4б»): правило получает
 # v6-двойник, convert печатает адреса как есть.

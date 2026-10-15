@@ -47,15 +47,49 @@ table inet steer {
     chain prerouting_mark {
         type filter hook prerouting priority mangle + 1; policy accept;
         iifname { "br-lan", "tailscale0" } ip daddr @dir_ip counter return comment "steer:dir_ip"
-        ether saddr { aa:bb:cc:dd:ee:01 } meta mark set mark and 0xf00fffff or 0x40300000 ct mark set mark counter return comment "steer:res_all_c1"
-        iifname { "br-lan", "tailscale0" } ip daddr @fast_dom meta mark set mark and 0xf00fffff or 0x40400000 ct mark set mark counter return comment "steer:fast_dom"
-        iifname { "br-lan", "tailscale0" } ip6 daddr @fast_dom6 meta mark set mark and 0xf00fffff or 0x40400000 ct mark set mark counter return comment "steer:fast_dom"
-        ip saddr { 192.168.1.50 } meta l4proto udp th dport 50000-65535 ip daddr @res_ip_c2_p1 meta mark set mark and 0xf00fffff or 0x40300000 ct mark set mark counter return comment "steer:res_ip_c2_p1"
-        ip6 saddr { fd00::50 } meta l4proto udp th dport 50000-65535 ip6 daddr @res_ip_c2_p16 meta mark set mark and 0xf00fffff or 0x40300000 ct mark set mark counter return comment "steer:res_ip_c2_p1"
+        ether saddr { aa:bb:cc:dd:ee:01 } counter goto bal_302 comment "steer:res_all_c1"
+        iifname { "br-lan", "tailscale0" } ip daddr @fast_dom counter goto bal_303 comment "steer:fast_dom"
+        iifname { "br-lan", "tailscale0" } ip6 daddr @fast_dom6 counter goto bal_303 comment "steer:fast_dom"
+        ip saddr { 192.168.1.50 } meta l4proto udp th dport 50000-65535 ip daddr @res_ip_c2_p1 counter goto bal_302 comment "steer:res_ip_c2_p1"
+        ip6 saddr { fd00::50 } meta l4proto udp th dport 50000-65535 ip6 daddr @res_ip_c2_p16 counter goto bal_302 comment "steer:res_ip_c2_p1"
         ip saddr { 192.168.1.50 } counter goto bal_304 comment "steer:bal_all_c2"
         ip6 saddr { fd00::50 } counter goto bal_304 comment "steer:bal_all_c2"
         iifname { "br-lan", "tailscale0" } ip daddr @dpi_ip meta mark set mark and 0xf00fffff or 0x40600000 ct mark set mark counter return comment "steer:dpi_ip"
         iifname { "br-lan", "tailscale0" } ip daddr @tg_ip meta mark set mark and 0xf00fffff or 0x40700000 counter return comment "steer:tg_ip"
+    }
+
+    map balmap_302 {
+        type mark : verdict;
+        elements = { 0 : goto mark_300 }
+    }
+    chain bal_302 {
+        ct mark and 0x0ff00000 == 0x00100000 goto mark_300
+        ct mark and 0x0ff00000 == 0x00200000 goto mark_301
+        numgen inc mod 1 vmap @balmap_302 comment "steer-pin:res"
+        goto mark_302
+    }
+    chain mark_300 {
+        meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark comment "steer-mark:wg0"
+    }
+    chain mark_301 {
+        meta mark set mark and 0xf00fffff or 0x40200000 ct mark set mark comment "steer-mark:wg1"
+    }
+    chain mark_302 {
+        meta mark set mark and 0xf00fffff or 0x40300000 ct mark set mark comment "steer-mark:res"
+    }
+
+    map balmap_303 {
+        type mark : verdict;
+        elements = { 0 : goto mark_300 }
+    }
+    chain bal_303 {
+        ct mark and 0x0ff00000 == 0x00100000 goto mark_300
+        ct mark and 0x0ff00000 == 0x00200000 goto mark_301
+        numgen inc mod 1 vmap @balmap_303 comment "steer-pin:fast"
+        goto mark_303
+    }
+    chain mark_303 {
+        meta mark set mark and 0xf00fffff or 0x40400000 ct mark set mark comment "steer-mark:fast"
     }
 
     map balmap_304 {
@@ -67,12 +101,6 @@ table inet steer {
         ct mark and 0x0ff00000 == 0x00200000 goto mark_301
         numgen random mod 120 vmap @balmap_304 comment "steer-balance:bal"
         goto mark_304
-    }
-    chain mark_300 {
-        meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark comment "steer-mark:wg0"
-    }
-    chain mark_301 {
-        meta mark set mark and 0xf00fffff or 0x40200000 ct mark set mark comment "steer-mark:wg1"
     }
     chain mark_304 {
         meta mark set mark and 0xf00fffff or 0x40500000 ct mark set mark comment "steer-mark:bal"
@@ -99,6 +127,11 @@ table inet steer {
         meta mark and 0x0ff00000 == 0x00300000 oifname != { "wg0", "wg1" } counter drop comment "steer-guard:res"
         meta mark and 0x0ff00000 == 0x00400000 oifname != { "wg0", "wg1" } counter drop comment "steer-guard:fast"
         meta mark and 0x0ff00000 == 0x00500000 oifname != { "wg0", "wg1" } counter drop comment "steer-guard:bal"
+    }
+    chain postrouting_nat4 {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "wg0" meta nfproto ipv4 counter masquerade comment "steer-nat4:wg0"
+        oifname "wg1" meta nfproto ipv4 counter masquerade comment "steer-nat4:wg1"
     }
 
     chain zapret_queue {
@@ -127,7 +160,7 @@ table inet steer {
         meta mark and 0x0ff00000 == 0x00700000 tcp dport { 443, 80, 5222 } counter redirect to :8486 comment "steer:tgws:tg"
     }
     chain prerouting_dns {
-        type nat hook prerouting priority dstnat; policy accept;
+        type nat hook prerouting priority dstnat - 2; policy accept;
         iifname { "br-lan", "tailscale0" } udp dport 53 counter redirect to :5300
         iifname { "br-lan", "tailscale0" } tcp dport 53 counter redirect to :5300
     }

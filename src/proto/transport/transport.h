@@ -177,10 +177,11 @@ struct xh_state {
      * проверяет её у КАЖДОГО запроса, а не только у первого. */
     uint16_t pad_from, pad_to;
     uint8_t pad_set;           /* набивка объявлена узлом (в том числе «0» — отключена) */
-    /* packet-up: сколько самое большее несёт один POST на этом соединении, выбрано при открытии
-     * из диапазона узла (как делает клиент Xray); запись больше уходит несколькими кусками.
-     * 0 — предела нет. */
-    uint32_t post_max;
+    /* packet-up: размер КАЖДОГО POST — случайный в [post_min, post_max] (scMaxEachPostBytes узла,
+     * равномерно, как у клиента Xray); запись больше уходит несколькими кусками. post_max == 0 —
+     * предела нет; post_min == 0 — как post_max. post_rng — состояние выбора размера. */
+    uint32_t post_max, post_min;
+    uint64_t post_rng;
     /* Отказ сервера на кусок выгрузки, прочитанный не записью, а слежкой за второй связью
      * (xhttp_aux_drain): отправка вернёт его первой, как вернула бы, прочитав сама. */
     int drain_err;
@@ -299,6 +300,8 @@ struct transport_ops {
      * NULL — второй связи у транспорта не бывает. */
     int  (*aux_fd)(const struct transport *t);
     int  (*aux_drain)(struct transport *t);
+    /* См. transport_big_write. NULL — нет. */
+    int  (*big_write)(const struct transport *t);
 };
 
 /* Безопасность — поле security= ссылки. Различаются только рукопожатием (см. шапку). */
@@ -344,6 +347,11 @@ int transport_write(struct transport *t, const unsigned char *d, size_t n);
  * по этому числу выбирает окно клиента: клиент шлёт то, что узел может принять, а не узнаёт
  * об этом по таймаутам повторной передачи (см. dialer_ops.room). */
 long transport_room(struct transport *t);
+/* Принимает ли запись ЛЮБОЙ длины одним вызовом, без своих ограничений на неё и без лишней копии
+ * на стороне вызывающего (packet-up: запись режется на POST сама). 1 — да; у stream-up и
+ * stream-one запись упирается в окно одного потока и кадры, у остальных — в запись TLS, и стек
+ * собирает для них не больше TUNNEL_BUF. Шифрование VLESS (enc) переупаковывает записи — для него 0. */
+int transport_big_write(const struct transport *t);
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got);
 
 /* Приём БЕЗ ЛИШНЕЙ КОПИИ там, где транспорт это позволяет (transport_ops.zc).
@@ -473,6 +481,9 @@ int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, i
 /* Ввод-вывод основной связи в форме struct h2_io (ctx — struct tr_link). */
 int tr_link_write(void *ctx, const unsigned char *d, size_t n);
 int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got);
+
+/* Чтение голого сокета без ожидания: нет данных — *got = 0 и 0; конец — TR_ECLOSED; сбой — TR_EIO. */
+int tr_sock_read(int fd, unsigned char *d, size_t cap, size_t *got);
 
 /* Закрыть связь: сокет и, если это был TLS, ключи в куче. */
 void tr_link_close(struct tr_link *l);

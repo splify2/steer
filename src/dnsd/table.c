@@ -218,7 +218,7 @@ int dch_all_v6(chm_t mask) {
  * половина IPv6 (выход сменили на несущий IPv6), требует перезапуска. */
 static void dch_signature(FILE *out) {
     for (size_t i = 0; i < g_dch_n; i++) {
-        fprintf(out, "%s|%d|%s", g_dch[i].set, g_dch[i].realip ? 1 : 0,
+        fprintf(out, "%s|%d|%s", g_dch[i].set, g_dch[i].block ? 2 : g_dch[i].realip ? 1 : 0,
                 (g_dch[i].fam & DCH_V6) ? "46" : "4");
         for (size_t k = 0; k < g_dch[i].rules_n; k++)
             fprintf(out, "|%s", g_dch[i].rules_path[k]);
@@ -505,6 +505,7 @@ static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
         struct dchan *d = dch_slot(set, realip, up, rule_out(sp, c)->name,
                                    dch_fam(sp, c, realip, p->kind == SP_EXTRA));
         if (!d) return;
+        if (out_is_block(rule_out(sp, c))) d->block = 1;
         dch_name_rule(d, c, p->has_dom);
         int composite = p->kind == SP_COMPOSITE;
         if (p->own) {
@@ -707,6 +708,7 @@ void dch_build(const struct spec *sp) {
             snprintf(nd->set, sizeof(nd->set), "%s", set);
             snprintf(nd->out, sizeof(nd->out), "%.31s", rule_out(sp, r)->name);
             nd->realip = realip;
+            nd->block = out_is_block(rule_out(sp, r));
             nd->up = up;
             nd->fam = dch_fam(sp, r, realip, 0);
             k = g_dch_n++;

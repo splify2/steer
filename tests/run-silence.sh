@@ -83,6 +83,8 @@ if ! ip netns exec "$NS" ip link show vl >/dev/null 2>&1; then
     echo "устройство vl не поднялось:"; sed 's/^/  /' "$WORK/tun.log"; exit 1
 fi
 ip netns exec "$NS" ip route replace 203.0.113.0/24 dev vl
+. tests/lib-redir.sh
+redir_dev "$NS" vl   # TCP — к слушателю модуля (R-152), как на роутере
 grep -q "vl -> nodeA" "$WORK/tun.log" || { echo "стенд: туннель не на узле A"; sed 's/^/  /' "$WORK/tun.log"; exit 1; }
 TPID=$(ip netns pids "$NS" | while read -r p; do
     tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q " vless vl " && echo "$p"; done | head -1)

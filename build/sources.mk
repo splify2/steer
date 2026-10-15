@@ -29,7 +29,7 @@ CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src
 # PLATFORM_SRC); остальные — по одному на профиль, у base своего файла нет. Отдельно от ядра и
 # от расширенной части, потому что файл профиля не входит ни в одну сборку, кроме своей.
 PROFILE_DIRS := src/profile
-EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/proto/hysteria2 src/proto/proxy src/modules
+EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/proto/hysteria2 src/proto/proxy src/proto/warp src/modules
 # Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
 CLIENT_DIRS := src/client
 # Сторонний код (src/third_party) — не слой движка: файлы в нём не правятся (см. UPSTREAM в
@@ -42,7 +42,7 @@ INC_DIRS  := $(CORE_DIRS) $(PROFILE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS) $(THIRD_DIR
 # в профиль android не входят, телефон не собирает ни QUIC-клиента, ни модули steer-hysteria2 и
 # steer-proxy). tests/buildmatch.sh сверяет
 # Android.bp с INC_DIRS за вычетом этого списка.
-PHONE_SKIP_DIRS := src/proto/hysteria2 src/proto/proxy
+PHONE_SKIP_DIRS := src/proto/hysteria2 src/proto/proxy src/proto/warp
 # Определения, которых ждёт сторонний код: yaml_private.h подключает config.h (номер версии
 # libyaml) только при HAVE_CONFIG_H. Ключ идёт во ВСЕ пути сборки движка — Makefile, build.sh,
 # build/build-ext*.sh (там он читается отсюда), в Android.bp — флагом библиотеки libsteer_yaml;
@@ -120,7 +120,7 @@ DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
             src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c $(DNSD_TABLE_SRC) \
             src/dnsd/dlog.c src/dnsd/realip.c src/dnsd/adopt.c src/dnsd/proxy.c src/dnsd/main.c \
             src/dnsd/fpseed.c src/dnsd/dcache.c src/dnsd/dup.c src/dnsd/dupgrp.c src/dnsd/dupdial.c \
-            src/dnsd/doq.c src/dnsd/doh2.c
+            src/dnsd/doq.c src/dnsd/doh2.c src/dnsd/doh3.c src/dnsd/dprobe.c
 
 # Виды выхода (src/kinds, docs/architecture.md, раздел 2, правило 1): вид — это файл, и какие виды
 # есть в сборке, решает профиль. Реестр (kind.c) ссылается на записи видов слабо, поэтому вид,
@@ -129,7 +129,7 @@ DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
 # которым нужны TLS и клиенты туннелей, — только в полном пакете (PROFILE_extended и android).
 # tgws — базовый: правила перехвата пишет любой движок, мост живёт своей программой (полный
 # пакет, микропакет stgws). Состав проверяет tests/buildmatch.sh.
-KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/group.c src/kinds/grpurl.c src/kinds/interface.c \
+KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/block.c src/kinds/group.c src/kinds/grpurl.c src/kinds/interface.c \
                   src/kinds/zapret.c src/kinds/tgws.c src/kinds/awg.c
 KINDS_EXT_SRC  := src/kinds/vless.c src/kinds/xsteer.c
 
@@ -281,8 +281,8 @@ QUIC_STAND_SRC := tests/qcbench.c
 # hysteria2 (модуль steer-hysteria2, docs/hysteria2.md). Запись вида — в libsteer, как у vless и
 # xsteer, но НЕ в KINDS_EXT_SRC: тот список входит в статические профили (extended, android), а
 # hysteria2 в них нет — телефон отложен, и вид там отвечает записью отказа (kind.c). Модуль — свой
-# бинарник на libsteer.so: провод и подписка — hy2wire.c, hy2sub.c; соединение QUIC и мультиплексор
-# потоков — hy2conn.c; дайлер стека — hy2dial.c; команды и слежка — hy2main.c.
+# бинарник на libsteer.so: провод и подписка — hy2wire.c, hy2sub.c; соединение QUIC в цикле рабочего
+# и потоки клиента поверх него — hy2conn.c; дайлер стека — hy2dial.c; команды и слежка — hy2main.c.
 KINDS_HY2_SRC := src/kinds/hysteria2.c
 HY2_MOD_SRC := src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2conn.c \
                src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c
@@ -299,6 +299,16 @@ KINDS_PROXY_SRC := src/kinds/proxy.c
 PROXY_MOD_SRC := src/proto/proxy/pxwire.c src/proto/proxy/pxsub.c src/proto/proxy/pxdial.c src/proto/proxy/pxtrojan.c \
                  src/proto/proxy/pxss.c src/proto/proxy/pxsocks.c src/proto/proxy/pxhttp.c \
                  src/proto/proxy/pxvmess.c src/proto/proxy/pxmain.c
+# WARP (модуль steer-warpbox, docs/warp.md): регистрация, подбор точек и замена для группы `kind: warp`.
+# Записи вида нет — группа своя (kinds/group.c), члены — обычные awg; модуль — свой бинарник на
+# libsteer.so, как hysteria2, и тоже не в статических профилях: телефону — позже, вместе с MASQUE.
+# HTTPS — wbhttps.c (TLS 1.3 libsteer), JSON по пути — wbjson.c, регистрация — wbreg.c, файл туннеля и
+# маски I1 — wbconf.c, пространство сети подбора — wbns.c, эхо-запросы — wbping.c, подбор — wbscan.c,
+# сертификат клиента MASQUE и ключ сервера — wbx509.c, туннель MASQUE (QUIC, HTTP/3 CONNECT-IP, TUN) —
+# wbmq.c, команды и сторож — wbmain.c.
+WARP_MOD_SRC := src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/warp/wbreg.c src/proto/warp/wbconf.c \
+                src/proto/warp/wbns.c src/proto/warp/wbping.c src/proto/warp/wbscan.c src/proto/warp/wbx509.c \
+                src/proto/warp/wbmq.c src/proto/warp/wbmain.c
 LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC) $(SUBLINK_SRC) \
                 $(STACK_SRC) $(TRANSPORT_SRC) \
                 src/tunnel/tun.c src/proto/tls/chello.c src/proto/tls/tls13.c \
@@ -315,6 +325,7 @@ OBFS_MODULE_SRC := $(OBFS_MOD_SRC) $(MODCMD_SRC) src/modules/main_obfs.c
 TGWS_MODULE_SRC := src/proto/tgws/tgws.c $(MODCMD_SRC) src/modules/main_tgws.c
 HY2_MODULE_SRC := $(HY2_MOD_SRC) $(MODCMD_SRC) src/modules/main_hysteria2.c
 PROXY_MODULE_SRC := $(PROXY_MOD_SRC) $(MODCMD_SRC) src/modules/main_proxy.c
+WARP_MODULE_SRC := $(WARP_MOD_SRC) $(MODCMD_SRC) src/modules/main_warpbox.c
 
 PROFILE_libsteer   := $(LIBSTEER_SRC)
 PROFILE_steerd     := $(STEERD_DYN_SRC)
@@ -324,6 +335,7 @@ PROFILE_mod_obfs   := $(OBFS_MODULE_SRC)
 PROFILE_mod_tgws   := $(TGWS_MODULE_SRC)
 PROFILE_mod_hysteria2 := $(HY2_MODULE_SRC)
 PROFILE_mod_proxy  := $(PROXY_MODULE_SRC)
+PROFILE_mod_warpbox := $(WARP_MODULE_SRC)
 # steer-box-connector (sing-box для podkop и forkop) живёт в своём репозитории
 # (github.com/splify2/steer-box-connector) и собирается build/ext-build.sh; нужные ему символы
 # libsteer — в build/exports-ext.lst.

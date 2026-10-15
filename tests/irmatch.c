@@ -245,7 +245,10 @@ static void t_mixed_modern(void) {
     r = ir_rule_find(tg, "steer:tgws:tg");
     check("правило моста есть", 1, r != NULL);
     check("и помечено IPv4", 4, r ? r->fam : 0);
-    check("nat-цепочек в inet три (tgws, dns, dnat)", 3, nat_chains(t));
+    check("nat-цепочек в inet четыре (tgws, dns, dnat, подмена IPv4 ядра у interface)", 4, nat_chains(t));
+    struct nft_chain *n4 = ir_chain_find(t, "postrouting_nat4");
+    check("postrouting_nat4: masquerade на устройстве выхода interface", 1,
+          n4 && ir_rule_find(n4, "steer-nat4:vpn") && ir_rule_has(ir_rule_find(n4, "steer-nat4:vpn"), "masquerade"));
     nft_rs_free(&rs);
 }
 
@@ -291,8 +294,11 @@ static void t_mixed_legacy(int nftc) {
           pn && ir_rule_find(pn, "steer-fakeip-nomap") != NULL);
     check("правил DNS в ip — только по подсети (2)", 2, i - 3);
     struct nft_chain *pp = ir_chain_find(t4, "postrouting_nat");
-    check("пустая postrouting_nat на srcnat + 1 = 101", 101, cprio(pp));
-    check("и в ней ни одного правила", 0, (long)ir_rule_count(pp, NULL));
+    check("postrouting_nat на srcnat + 1 = 101", 101, cprio(pp));
+    /* Подмена IPv4 ядра у выхода interface (generate.c, build_nat4) переезжает сюда вместе с прочим
+     * nat; другого в цепочке нет — её смысл прежний (обратная трансляция ответов, шапка legacy.c). */
+    check("и в ней одно правило — подмена IPv4 выхода", 1, (long)ir_rule_count(pp, NULL));
+    check("  masquerade", 1, pp && pp->rules && ir_rule_has(pp->rules, "masquerade"));
 
     struct nft_set *dyn = ir_set_find(in, dg->name);
     char sn[80];
@@ -599,7 +605,8 @@ static void t_balance(int nftc) {
     struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
     const struct output *top = oname("top"), *in = oname("in"), *res = oname("res"),
                         *a = oname("a"), *b = oname("b"), *c = oname("c");
-    char bc[32], bm[32], ic[32], mres[32], ma[32], mb[32], mc[32], mtop[32];
+    char bc[32], bm[32], ic[32], rc[32], mres[32], ma[32], mb[32], mc[32], mtop[32];
+    group_bal_chain(res, rc, sizeof(rc));
     group_bal_chain(top, bc, sizeof(bc));
     group_bal_map(top, bm, sizeof(bm));
     group_bal_chain(in, ic, sizeof(ic));
@@ -618,11 +625,13 @@ static void t_balance(int nftc) {
     check_str("карта: type mark : verdict", "mark verdict",
               m ? ir_printf(&rs, "%s %s", m->key, m->data ? m->data : "-") : "-");
     check("  слотов 120 — все члены живы", GROUP_BAL_SLOTS, (long)nels(m));
-    check("  по весам 2:1:1 — res 60, вложенная in 30, a 30", 603030,
-          els_with(m, cm("goto ", mres)) * 10000L + els_with(m, cm("goto ", ic)) * 100L +
+    /* res — order с именованными членами, то есть закрепляющая (group_carded): её слоты ведут в её
+     * цепочку, как у вложенной balance, и там соединение получает метку её текущего члена. */
+    check("  по весам 2:1:1 — res 60 (в её цепочку), вложенная in 30, a 30", 603030,
+          els_with(m, cm("goto ", rc)) * 10000L + els_with(m, cm("goto ", ic)) * 100L +
           els_with(m, cm("goto ", ma)));
     const struct nft_chain *ch = ir_chain_find(t, bc);
-    check("цепочка группы: восстановление по метке соединения — по листу на правило", 4,
+    check("цепочка группы: восстановление по метке соединения — по листу на правило", 3,
           (long)(ch ? ir_rule_count(ch, NULL) : 0) - 2);
     int rest = 0, numgen = 0, fall = 0;
     for (const struct nft_rule *q = ch ? ch->rules : NULL; q; q = q->next) {
@@ -630,7 +639,7 @@ static void t_balance(int nftc) {
         if (ir_rule_has(q, ir_printf(&rs, "numgen random mod %d vmap @%s", GROUP_BAL_SLOTS, bm))) numgen++;
         if (ir_rule_has(q, cm("goto ", mtop)) && !q->next) fall++;
     }
-    check("  листья: res (одна метка), a, и листья вложенной b, c", 4, rest);
+    check("  листья: a, b, c (листья res и in вглубь, каждый один раз)", 3, rest);
     check("  затем numgen по карте и запасной goto в метку группы", 11, numgen * 10 + fall);
     const struct nft_rule *lr = ch ? ch->rules : NULL;
     int leaf_b = 0;
@@ -644,10 +653,13 @@ static void t_balance(int nftc) {
           mr && ir_expr_find(mr, NFT_X_MARKSET) &&
           ir_rule_has(mr, ir_printf(&rs, "0x%08x", res->mark | ZAPRET_SKIP_MARK)) &&
           ir_rule_has(mr, "ct mark set mark"));
-    /* res (order: a, b) — один член со своей меткой: её таблица ведёт в её текущий лист. Слоты a —
-     * только его собственные 30 (как члена top), а не доля res; b в карте top не бывает вовсе. */
+    /* res (order: a, b) — свой член карты top: её доля уходит в её цепочку, а не раскрывается в
+     * карту top. Слоты a — только его собственные 30 (как члена top); b в карте top не бывает. */
     check("вложенная order — один член: её листья в карту не раскрываются", 1,
           els_with(m, cm("goto ", ma)) == 30 && els_with(m, cm("goto ", mb)) == 0);
+    const struct nft_set *rm = ir_set_find(t, ir_printf(&rs, "balmap_%d", res->table));
+    check("вложенная order — своя карта из одного слота: её первый член", 1,
+          rm && nels(rm) == 1 && els_with(rm, cm("goto ", ma)) == 1);
     const struct nft_set *im = ir_set_find(t, ir_printf(&rs, "balmap_%d", in->table));
     check("вложенная balance — своя карта со своими членами", 1,
           im && els_with(im, cm("goto ", mb)) == 60 && els_with(im, cm("goto ", mc)) == 60);

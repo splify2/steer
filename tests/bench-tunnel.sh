@@ -77,6 +77,8 @@ ip netns exec "$NS" ip link show vl >/dev/null 2>&1 || {
 
 TARGET=203.0.113.7
 ip netns exec "$NS" ip route replace "$TARGET/32" dev vl
+. tests/lib-redir.sh
+redir_dev "$NS" vl   # TCP — к слушателю модуля (R-152), как на роутере
 
 # Молчащие соединения: открыть и держать. Порт 9 — тот, на котором поддельный сервер
 # сознательно молчит (см. fake-vless.py).

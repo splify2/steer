@@ -121,7 +121,10 @@ check "модуль — запасной wireguard (AmneziaWG на машине 
 check "приватный ключ на устройстве — из файла" "$(cat "$tmp/our.key")" "$(wg show nl private-key 2>/dev/null)"
 check "пир и эндпоинт" "192.0.2.2:51820" "$(wg show nl endpoints 2>/dev/null | cut -f2)"
 check "keepalive выключен (батарея)" "off" "$(wg show nl persistent-keepalive 2>/dev/null | cut -f2)"
-check "метка сокета туннеля без via" "${AWG_FWMARK:-off}" "$(wg show nl fwmark 2>/dev/null)"
+# На роутере (zapret есть) у внешних пакетов туннеля всегда бит «не твой» общему обходу, 0x40000000
+# (src/lib/sockmark.h); у сборки телефона его нет.
+zbit=0; [ "${AWG_FWMARK:-off}" = off ] && zbit=$((0x40000000))
+check "метка сокета туннеля без via" "${AWG_FWMARK:-0x40000000}" "$(wg show nl fwmark 2>/dev/null)"
 check "адрес из Address" "1" "$(ip -4 addr show dev nl | grep -c '10.77.0.2/24')"
 check "MTU по умолчанию 1420" "1" "$(ip link show nl | grep -c 'mtu 1420')"
 check "предупреждение про DNS из файла" "1" "$(printf '%s\n' "$err" | grep -c 'DNS из файла не применяется')"
@@ -246,7 +249,7 @@ uxmark="$(omark ux)"; nlmark="$(omark nl)"
 # У Android-сборки к метке цели добавлен бит «собственный трафик туннеля» (STEER_TUNNEL_BIT,
 # 0x10000000): по нему заворот DNS приложений пропускает туннель через via.
 tunbit=0; [ "${AWG_FWMARK:-off}" != off ] && tunbit=$((0x10000000))
-check "via: метка сокета туннеля — метка выхода ux" "$(printf '0x%x' "$((uxmark | tunbit))")" \
+check "via: метка сокета туннеля — метка выхода ux" "$(printf '0x%x' "$((uxmark | tunbit | zbit))")" \
       "$(wg show nl fwmark 2>/dev/null)"
 check "via: status называет цель" "1" "$(st | grep -o '"nl":{[^}]*' | grep -c '"via":"ux"')"
 ping -q -c 3 -W 2 -m "$((nlmark))" -I 10.77.0.2 198.51.100.1 >"$tmp/ping.out" 2>&1
@@ -289,7 +292,7 @@ sed -i 's/^ux .*/ux 500000 304/' "$tmp/state/registry"
 [ "${AWG_FWMARK:-off}" != off ] && sed -i 's/^ux .*/ux 1000000 304/' "$tmp/state/registry"
 "$BIN" apply $S >/dev/null 2>&1
 check "via: новая метка цели — на устройстве тем же apply" \
-      "$(printf '0x%x' "$(($(omark ux) | tunbit))")" "$(wg show nl fwmark 2>/dev/null)"
+      "$(printf '0x%x' "$(($(omark ux) | tunbit | zbit))")" "$(wg show nl fwmark 2>/dev/null)"
 check "  и она не прежняя" "1" "$([ "$(omark ux)" != "$uxmark" ] && echo 1 || echo 0)"
 
 # ---- 6b. сторож по кругу: замеры в памяти, во флеш — только перемены ---------------------

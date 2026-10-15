@@ -334,10 +334,10 @@ int fog_idle_now(const char *group) {
 
 /* ---- balance: карта в ядре --------------------------------------------------------------- */
 
-int fog_balance_sync(const struct spec *sp, const struct output *go, const unsigned char *alive) {
+int fog_balance_sync(const struct spec *sp, const struct output *go, const unsigned char *alive, int cur) {
     static int told;
     const struct group_cfg *g = out_group(go);
-    if (!g || g->pick != PICK_BALANCE) return 0;
+    if (!g || !group_carded(go)) return 0;
     char map[32];
     group_bal_map(go, map, sizeof(map));
     static char have[GROUP_BAL_SLOTS][NFV_CHAIN_MAX], want[GROUP_BAL_SLOTS][NFV_CHAIN_MAX];
@@ -355,7 +355,12 @@ int fog_balance_sync(const struct spec *sp, const struct output *go, const unsig
         return -1;
     }
     unsigned char owner[GROUP_BAL_SLOTS];
-    group_balance_slots(g, alive, owner);
+    if (g->pick == PICK_BALANCE) group_balance_slots(g, alive, owner);
+    else {
+        /* Закрепляющая order/latency: один слот (compile/balance.c) — текущий член. */
+        memset(owner, 0xff, sizeof(owner));
+        if (cur >= 0 && (size_t)cur < g->members_n) owner[0] = (unsigned char)cur;
+    }
     for (unsigned s = 0; s < GROUP_BAL_SLOTS; s++)
         if (owner[s] != 0xff) group_bal_target(spec_out(sp, g->members[owner[s]]), want[s], NFV_CHAIN_MAX);
     if (!memcmp(have, want, sizeof(have))) return 0;
@@ -377,8 +382,8 @@ int fog_balance_sync(const struct spec *sp, const struct output *go, const unsig
 void fog_balance_adopt(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct group_cfg *g = out_group(&sp->out[i]);
-        if (g && g->pick == PICK_BALANCE && group_named(g))
-            fog_balance_sync(sp, &sp->out[i], g->alive);
+        if (g && group_carded(&sp->out[i]) && group_named(g))
+            fog_balance_sync(sp, &sp->out[i], g->alive, g->cur);
     }
 }
 
@@ -664,5 +669,6 @@ int cmd_select(const char *spec, const char *group, const char *member) {
     struct err e = {0};
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    tcp_redir_learn(&cfg);
     return fog_select(&cfg, &fo_store_files, group, member, 1, NULL, NULL, stdout);
 }

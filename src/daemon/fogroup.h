@@ -50,10 +50,12 @@ int fog_idle(const struct spec *sp, const struct output *g, int limit, fo_traffi
  * сторож ещё не встречал. */
 int fog_idle_now(const char *group);
 
-/* balance: привести карту группы в ядре к живым членам alive (байт на члена: 1 — жив). По факту в ядре, а
- * не по памяти: apply ставит карту со всеми членами, и сверка обязана это заметить. 1 — карта
- * переписана; 0 — уже такая; -1 — карты нет или ядро отказало (сказано в журнале один раз). */
-int fog_balance_sync(const struct spec *sp, const struct output *g, const unsigned char *alive);
+/* Группа с картой (group_carded): привести карту в ядре к живым членам alive (balance; байт на члена:
+ * 1 — жив) или к текущему члену cur (закрепляющие order/latency; -1 — никого, карта пуста). По факту в
+ * ядре, а не по памяти: apply ставит карту со всеми членами (у order/latency — на первого), и сверка
+ * обязана это заметить. 1 — карта переписана; 0 — уже такая; -1 — карты нет или ядро отказало
+ * (сказано в журнале один раз). */
+int fog_balance_sync(const struct spec *sp, const struct output *g, const unsigned char *alive, int cur);
 
 /* Запись `groups` прохода: по группе — выбранный член (или «-») и живые члены. Пишется только
  * при изменении текста (тот же довод про флеш, что у active_save). cur[i] — номер члена группы

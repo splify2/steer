@@ -46,5 +46,7 @@ void rulewd_settle(struct rulewd *r);
  * с lo): имена через запятую в list (n байт). Возврат — сколько выходов без правила или запрета;
  * 0 — всё на месте или нечего чинить; -1 — ядро не спросить. */
 int rulewd_missing(const struct spec *sp, char *list, size_t n);
+/* Сколько выходов с устройством держат своё правило IPv4 в ядре Linux; -1 — правил не прочитать. */
+int rulewd_present(const struct spec *sp);
 
 #endif

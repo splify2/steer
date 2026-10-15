@@ -33,6 +33,12 @@ static int hy2_parse(struct output *o, const struct out_keys *k, struct err *e) 
     o->hy2.pool = k->pool;
     /* Несколько узлов сразу — нет: соединение с узлом у hysteria2 одно QUIC на все потоки
      * (hy2conn.c), и узел соединения выбрать нечем. interval и silence — есть. */
+    if (k->pool.pick) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "outputs.%s: у kind hysteria2 пока нет pick: latency — узел у него "
+                 "один, замер кандидатов и смена узла на ходу есть у vless и протоколов прокси", o->name);
+        return err_set(e, "%s", msg);
+    }
     if (k->pool.active > 1 || k->by_set) {
         char msg[320];
         snprintf(msg, sizeof(msg), "outputs.%s: у kind hysteria2 нет %s — соединение с узлом одно на "
@@ -166,7 +172,7 @@ int out_hy2_node_named(const struct output *o) {
 const struct kind_ops kind_hysteria2 = {
     .name = "hysteria2",
     .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER |
-            KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP,
+            KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP | KC_TCP_REDIR,
     .keys = KK_NODES | KK_SUB,
     .selfnat_why = "masquerade не нужен: туннель завершает TCP сам, адреса клиентов "
                    "наружу не уходят",

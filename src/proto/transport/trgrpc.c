@@ -128,6 +128,11 @@ static int grpc_open(struct transport *t, const struct tr_node *n, int timeout_s
     /* Имя хоста в :authority — маскировочный домен, как и в SNI: сервер прикрывается им,
      * и запрос к другому имени выдал бы нас сразу. */
     const char *authority = n->sni[0] ? n->sni : n->host;
+    char abuf[136];
+    if (authority == n->host && strchr(authority, ':')) {   /* адрес IPv6 в :authority — в скобках */
+        snprintf(abuf, sizeof(abuf), "[%s]", authority);
+        authority = abuf;
+    }
     char path[320];
     grpc_path(n, path, sizeof(path));
     memset(&t->de, 0, sizeof(t->de));

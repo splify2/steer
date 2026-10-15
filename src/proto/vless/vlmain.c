@@ -525,7 +525,9 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     pc.checked = !out_node_named(o);
     pc.active = tp->active ? tp->active : 1;
     pc.by = tp->by;
-    pc.interval_s = tp->interval_s ? tp->interval_s : POOL_INTERVAL_S;
+    pc.pick = tp->pick;
+    pc.tolerance_ms = tp->tol_set ? tp->tolerance_ms : -1;
+    pc.interval_s = tp->interval_s;         /* 0 — умолчание пула: у pick: latency своё */
     pc.silence_s = tp->silence_s < 0 ? 0 : tp->silence_s ? tp->silence_s : POOL_SILENCE_S;
     pc.out = out_name;
 

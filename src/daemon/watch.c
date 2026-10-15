@@ -160,6 +160,7 @@ static void fl_pass(struct floop *f) {
         fl_period(f);
         return;
     }
+    tcp_redir_learn(&g_loop_spec);
     f->run = fo_pass_start(f->l, &g_loop_spec, &fo_store_files, f->verbose, NULL, NULL,
                            fl_done, f);
     if (!f->run) fl_period(f);

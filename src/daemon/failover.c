@@ -728,6 +728,8 @@ int table_bind(const struct output *o, const char *dev) {
     /* Без on_fail=drop запасной запрет снимается здесь же: режим мог смениться с drop, а
      * пустая таблица у direct/zapret — обещанное «напрямую», а не утечка. */
     table_prune(o->table, dev, backstop);
+    /* TCP выхода — за маршрутом: к слушателю модуля этого устройства или никуда из карты. */
+    tcp_redir_sync(o, dev);
     return 0;
 }
 
@@ -793,6 +795,130 @@ void failopen_mark(const struct output *o, int on) {
     const char *cmd[] = { "nft", on ? "add" : "delete", "element", "inet", nft_table(),
                           FAILOPEN_SET, el, NULL };
     run_quiet(cmd);
+}
+
+/* ---- TCP клиентов — к слушателю модуля (R-152; правила — build_tcp_redir в generate.c) -------
+ *
+ * Карта TCP_REDIR_MAP: метка выхода → порт слушателя модуля, в чьё устройство таблица выхода
+ * сейчас привязана. Элемент ведётся вместе с маршрутом: таблица выхода в устройство модуля с
+ * KC_TCP_REDIR — элемент с его портом, в другое устройство, в запрет или пуста — элемента нет, и
+ * TCP выхода идёт по маршруту (on_fail решает так же, как прежде). У группы метка своя, а порт —
+ * члена, на котором она стоит, поэтому порт ищется по устройству, а не по выходу.
+ *
+ * Устройство → порт: из спеки этого процесса (tcp_redir_learn зовут там же, где спеку получают
+ * метки реестра: демон, apply, команды сторожа). Копией, а не указателем: спеку демон меняет
+ * целиком (steerd_load), и указатель пережил бы её. */
+struct redir_dev {
+    char dev[sizeof(((struct output *)0)->device)];
+    int port;
+};
+static struct redir_dev *g_redir;
+static size_t g_redir_n;
+/* Что этот процесс поставил в карту: метка → порт. Нужно tcp_redir_dev_gone — снять элементы,
+ * ведущие к слушателю умершего модуля, не перебирая выходы и маршруты. */
+struct redir_el {
+    unsigned mark;
+    int port;
+};
+static struct redir_el *g_rel;
+static size_t g_rel_n, g_rel_cap;
+
+static void rel_note(unsigned mark, int port) {
+    for (size_t i = 0; i < g_rel_n; i++)
+        if (g_rel[i].mark == mark) {
+            if (port) g_rel[i].port = port;
+            else g_rel[i] = g_rel[--g_rel_n];
+            return;
+        }
+    if (!port) return;
+    if (g_rel_n == g_rel_cap) {
+        size_t nc = g_rel_cap ? g_rel_cap * 2 : 8;
+        struct redir_el *v = realloc(g_rel, nc * sizeof(*v));
+        if (!v) return;
+        g_rel = v;
+        g_rel_cap = nc;
+    }
+    g_rel[g_rel_n++] = (struct redir_el){ mark, port };
+}
+
+void tcp_redir_learn(const struct spec *sp) {
+    size_t n = 0;
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (sp->out[i].mark && sp->out[i].device[0] && out_has_cap(&sp->out[i], KC_TCP_REDIR)) n++;
+    struct redir_dev *v = n ? calloc(n, sizeof(*v)) : NULL;
+    if (n && !v) return;                /* прежняя таблица остаётся: лучше старое, чем ничего */
+    size_t k = 0;
+    for (size_t i = 0; i < sp->out_n && k < n; i++) {
+        const struct output *o = &sp->out[i];
+        if (!o->mark || !o->device[0] || !out_has_cap(o, KC_TCP_REDIR)) continue;
+        snprintf(v[k].dev, sizeof(v[k].dev), "%s", o->device);
+        v[k].port = out_tcp_port(o);
+        k++;
+    }
+    free(g_redir);
+    g_redir = v;
+    g_redir_n = k;
+}
+
+static int redir_port(const char *dev) {
+    for (size_t i = 0; dev && i < g_redir_n; i++)
+        if (!strcmp(g_redir[i].dev, dev)) return g_redir[i].port;
+    return 0;
+}
+
+/* Элемент выхода o — под таблицу, привязанную к dev (NULL — к запрету или пустая). Без выходов с
+ * KC_TCP_REDIR в спеке карты нет, и nft не зовётся вовсе. Замена — одной транзакцией (delete и
+ * add в одной команде nft): элемент с другим портом `add` не перепишет, а снятие отдельной
+ * командой оставило бы миг, когда TCP выхода идёт мимо слушателя. Нет элемента — эта транзакция
+ * отказывает целиком, и тогда простой add. */
+static void redir_set(unsigned mark, int port) {
+    char tbl[64], cmd[256];
+    snprintf(tbl, sizeof(tbl), "inet %s " TCP_REDIR_MAP, nft_table());
+    rel_note(mark, port);
+    if (!port) {
+        snprintf(cmd, sizeof(cmd), "delete element %s { 0x%08x }", tbl, mark);
+        const char *del[] = { "nft", cmd, NULL };
+        run_quiet(del);
+        return;
+    }
+    snprintf(cmd, sizeof(cmd), "delete element %s { 0x%08x }; add element %s { 0x%08x : %d }", tbl,
+             mark, tbl, mark, port);
+    const char *swap[] = { "nft", cmd, NULL };
+    if (run_quiet(swap) == 0) return;
+    snprintf(cmd, sizeof(cmd), "add element %s { 0x%08x : %d }", tbl, mark, port);
+    const char *add[] = { "nft", cmd, NULL };
+    run_quiet(add);
+}
+
+void tcp_redir_sync(const struct output *o, const char *dev) {
+    if (!g_redir_n || !o->mark || !out_has_device(o)) return;
+    redir_set(o->mark, redir_port(dev));
+}
+
+/* Модуль устройства dev вышел: его слушателя больше нет. Ядро в тот же миг вычищает маршруты в
+ * исчезнувшее устройство, и таблица выхода пустеет (или держит запасной запрет) до решения
+ * сторожа; элементы карты, ведущие к этому порту, снимаются так же сразу — иначе до прохода
+ * сторожа TCP выхода получал бы сброс от закрытого порта, а не то, что решает on_fail. */
+void tcp_redir_dev_gone(const char *dev) {
+    int port = redir_port(dev);
+    if (!port) return;
+    for (size_t i = g_rel_n; i-- > 0;)
+        if (g_rel[i].port == port) redir_set(g_rel[i].mark, 0);
+}
+
+/* Новый набор правил приходит с пустой картой, а привязка apply идёт до его загрузки: элементы
+ * возвращаются по таблицам выходов, как они стоят в ядре (тот же приём, что failopen_after_load
+ * в apply.c). */
+static struct route_facts route_facts_read(const struct output *o);
+
+void tcp_redir_after_load(const struct spec *sp) {
+    if (!g_redir_n) return;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if (!o->mark || !out_has_device(o)) continue;
+        struct route_facts f = route_facts_read(o);
+        if (f.known && f.table == TBL_DEV) tcp_redir_sync(o, f.dev);
+    }
 }
 
 /* ---- IPv6 от хоста: префикс донора (шаг 8 выпуска 1.10; устройство — spec.h, enum out_ipv6) ---
@@ -953,6 +1079,7 @@ static void apply_failed(const struct output *o, int announce) {
     rule_drop(o->mark, o->table);
     const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
     run_quiet(flush);
+    tcp_redir_sync(o, NULL);
     /* IPv6 — так же: правило снято, таблица пуста, IPv6 выхода идёт напрямую, как и IPv4. */
     if (out_route6(o)) {
         rule_drop6(o->mark, o->table);
@@ -1062,6 +1189,7 @@ void bind_device(struct output *o, const char *dev) {
             const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
             run_quiet(flush);
             if (out_route6(o)) route6_flush(o->table);
+            tcp_redir_sync(o, NULL);
             failopen_mark(o, 1);
         }
     }
@@ -1887,6 +2015,7 @@ struct fo_run {
         int ti, best, rule;
         char src[64];
         struct foprobe *p;
+        unsigned mark;                /* проба TCP: метка выхода с KC_TCP_REDIR (0 — через устройство) */
         const struct output *m;       /* замер: член группы (метка — у именованного) */
         struct folat_m *fm;           /* замер: идущий urltest члена (IPv4 и, если надо, IPv6) */
         int ms6;                      /* замер: итог по IPv6 (-2 — не мерили) */
@@ -1949,7 +2078,7 @@ static void hp_tcp_cb(void *arg, int ok, int ms);
 static int hp_tcp_next(struct fo_run *r) {
     for (; PROBE_TARGETS[r->hp.ti]; r->hp.ti++) {
         int ok = 0, ms = -1;
-        r->hp.p = foprobe_tcp(r->l, r->hp.dev, PROBE_TARGETS[r->hp.ti], TCP_PROBE_PORT,
+        r->hp.p = foprobe_tcp(r->l, r->hp.dev, r->hp.mark, PROBE_TARGETS[r->hp.ti], TCP_PROBE_PORT,
                               TCP_PROBE_TIMEOUT_MS, hp_tcp_cb, r, &ok, &ms);
         if (r->hp.p) return 1;
         if (hp_tcp_take(r, ok, ms)) return 0;
@@ -2037,6 +2166,9 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
     r->res = 0;
     if (!device_present(dev)) return 0;
     o = out_for_device(sp, o, dev);
+    /* TCP выхода с KC_TCP_REDIR завершает ядро и отдаёт слушателю модуля по метке (R-152) — проба идёт тем
+     * же путём, с меткой выхода устройства, а не через TUN. */
+    r->hp.mark = out_has_cap(o, KC_TCP_REDIR) ? o->mark : 0;
     /* Устройство создаёт наш процесс — сначала спросить о нём источник здоровья (fostate.h):
      * «не поднят» — приговор без пробы, «поднят» — дальше прежняя мера устройства, а у
      * помощника, который сам следит за узлом (watch), «поднят» — уже приговор: устройство на
@@ -2471,10 +2603,21 @@ static void out_finish(struct fo_run *r) {
             }
         }
     }
+    /* Закрепляющая order/latency: новые соединения — на выбранный член этого прохода (карта, fogroup.c);
+     * установленные остаются на своих членах. Карта переписана — строка в журнал; событие смены члена
+     * уже ушло выше (FO_EV_SWITCHED). */
+    if (r->named && gcf && gcf->pick != PICK_BALANCE && group_carded(o) &&
+        fog_balance_sync(r->sp, o, r->galive, chosen ? r->pk : -1) == 1) {
+        r->changed = 1;
+        if (r->verbose || (chosen && r->pk >= 0))
+            fprintf(stderr, LOG_I "выход %s: новые соединения — на %s, установленные остаются на своих "
+                            "членах\n", o->name,
+                    chosen && r->pk >= 0 && (size_t)r->pk < r->cand_n ? r->cand[r->pk]->name : "запасной путь группы");
+    }
     /* balance: карта раздачи в ядре — по живым членам этого прохода (fogroup.c: по факту в ядре,
      * запись — только при расхождении). Переписана — событие balance с составом. */
     if (r->named && gcf && gcf->pick == PICK_BALANCE &&
-        fog_balance_sync(r->sp, o, r->galive) == 1) {
+        fog_balance_sync(r->sp, o, r->galive, -1) == 1) {
         /* Список имён — в куче по числу членов (имя ≤ 31 байт и запятая): раньше буфер был на 16. */
         size_t alc = r->cand_n * 33 + 1, l = 0;
         char *al = malloc(alc);
@@ -3230,5 +3373,6 @@ int cmd_failover(const char *spec, int verbose) {
     struct err e = {0};
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    tcp_redir_learn(&cfg);
     return failover_pass(&cfg, &fo_store_files, verbose, NULL, NULL);
 }

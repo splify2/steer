@@ -55,6 +55,7 @@ static int set_hostport(struct vless_node *n, const char *s, size_t len) {
         if (!rb || rb[1] != ':') return -1;
         *rb = '\0';
         sl_set_field(n->host, sizeof(n->host), buf + 1, strlen(buf + 1));
+        sl_host_zone_decode(n->host);
         colon = rb + 1;
     } else {
         colon = strrchr(buf, ':');
@@ -573,7 +574,7 @@ void px_skip_note(struct px_sub_stats *st, const struct px_node *n, const char *
     struct px_skip *s = &st->reasons[st->reasons_n++];
     snprintf(s->reason, sizeof(s->reason), "%s", reason);
     if (n && n->name[0]) snprintf(s->example, sizeof(s->example), "%s", n->name);
-    else if (n && n->vn.host[0]) snprintf(s->example, sizeof(s->example), "%s:%u", n->vn.host, n->vn.port);
+    else if (n && n->vn.host[0]) snprintf(s->example, sizeof(s->example), "%s:%u", vless_host_fmt(n->vn.host).s, n->vn.port);
     s->count = 1;
 }
 

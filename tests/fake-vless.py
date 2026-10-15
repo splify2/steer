@@ -87,6 +87,12 @@ class Handler(socketserver.BaseRequestHandler):
         uuid, cmd, port, addr = req
         if uuid != self.server.uuid:
             return                          # чужой ключ — молчим, как настоящий сервер
+        # Задержка узла (--delay-ms): ответ на каждый запрос — не раньше неё. Стенду самых быстрых
+        # узлов (tests/run-latency.sh): проверка узла меряет время до первого байта ответа.
+        if self.server.delay_ms:
+            time.sleep(self.server.delay_ms / 1000.0)
+        if self.server.log:
+            print("req %s:%d" % (addr, port), flush=True)
 
         if cmd == CMD_UDP:
             if self.server.udp_relay:
@@ -128,6 +134,23 @@ class Handler(socketserver.BaseRequestHandler):
                 sock.shutdown(socket.SHUT_WR)
                 while sock.recv(65536):
                     pass
+            except OSError:
+                pass
+            return
+
+        # Порт 8 — потоковое эхо: каждый принятый байт сразу уходит обратно, пока клиент не закроет
+        # свою половину. Нужен стенду нескольких рабочих потоков (tests/run-tunnel-mt.sh, R-146):
+        # клиент шлёт и читает ОДНОВРЕМЕННО, и проверяется весь объём байт в байт в обе стороны — то есть
+        # и выгрузка (подтверждения клиента доходят до владельца соединения), и скачивание.
+        if port == 8:
+            try:
+                sock.sendall(b"\x00\x00")
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    sock.sendall(chunk)
+                sock.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
             return
@@ -299,21 +322,29 @@ def main():
     # панели пишут туда заглушки, и человеку полезнее внятная причина, чем ошибка TLS.
     # Стенду от этого доставалось заодно — туннель не поднимался вовсе, — поэтому сервер
     # стенда слушает на обычном адресе, который туннель считает законным узлом.
-    ap.add_argument("--bind", default="127.0.0.1", help="адрес слушателя")
+    ap.add_argument("--bind", default="127.0.0.1", help="адрес слушателя (IPv4 или IPv6)")
     ap.add_argument("--kbps", type=int, default=0, help="предел отдачи, КБ/с (0 — без предела)")
+    ap.add_argument("--delay-ms", type=int, default=0, help="задержка ответа на каждый запрос, мс")
+    ap.add_argument("--log", action="store_true", help="печатать каждый принятый запрос")
     ap.add_argument("--udp-relay", action="store_true",
                     help="UDP (команда 2) пересылать по адресу из запроса, а не эхом")
     a = ap.parse_args()
 
+    # Адрес IPv6 (`--bind 2001:db8::1`, issue #7: узел по IPv6) — слушатель IPv6; семейство задаётся
+    # классом до создания сокета.
+    if ":" in a.bind:
+        Server.address_family = socket.AF_INET6
     srv = Server((a.bind, a.port), Handler)
     srv.uuid = bytes.fromhex(a.uuid.replace("-", ""))
     srv.body_n = a.mb * 1024 * 1024
     srv.udp_relay = a.udp_relay
     srv.kbps = a.kbps
+    srv.delay_ms = a.delay_ms
+    srv.log = a.log
     # Наполнитель фиксированный: содержимое стенду безразлично, а генерация 64 КБ на
     # каждую порцию упиралась в питон, а не в туннель.
     srv.filler = bytes(i * 131 % 251 for i in range(64 * 1024))
-    print("fake-vless: %s:%d, отдаёт %d МБ" % (a.bind, a.port, a.mb), flush=True)
+    print("fake-vless: %s:%d, отдаёт %d МБ" % ("[%s]" % a.bind if ":" in a.bind else a.bind, a.port, a.mb), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

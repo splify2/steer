@@ -56,7 +56,7 @@ struct ss_sess {
 static const char *ss_peer(const void *ctx) { return ((const struct px_node *)ctx)->vn.host; }
 static void ss_describe(const void *ctx, char *out, size_t n) {
     const struct px_node *nd = ctx;
-    snprintf(out, n, "%s (%s:%u shadowsocks)", nd->name, nd->vn.host, nd->vn.port);
+    snprintf(out, n, "%s (%s:%u shadowsocks)", nd->name, vless_host_fmt(nd->vn.host).s, nd->vn.port);
 }
 
 static enum sc_aead_alg ss_alg(enum ss_method m) {

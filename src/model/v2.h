@@ -17,6 +17,8 @@ int spec_parse_v2(const struct ydoc *d, struct spec *s, struct err *e);
  * собранная из v1, печатается так, что её разбор даёт тот же набор правил. 0 — напечатано; -1 —
  * модель не выражается спекой v2 (текст в e). */
 int spec_print_v2(FILE *f, const struct spec *s, struct err *e);
+/* Та же печать JSON-объектом (`steer spec convert --json`): ключи и порядок — как у spec_print_v2. */
+int spec_print_v2_json(FILE *f, const struct spec *s, struct err *e);
 
 /* Вид выхода, который спека v2 пишет туннелем (`kind: tunnel, protocol: <имя>`): 1 — да. */
 int v2_tunnel_proto(const char *kind_name);

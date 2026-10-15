@@ -365,4 +365,12 @@ static inline int out_tgws_port(const struct output *o) {
     return TGWS_PORT_BASE + out_mark_slot(o);
 }
 
+/* Порт слушателя TCP модуля этого выхода (KC_TCP_REDIR, R-152): туда правило nat перенаправляет
+ * TCP клиентов, чья метка ведёт в выход. Из метки — по той же причине, что порт моста: модуль и
+ * демон выводят его каждый сам, и второго поля в спеке, которое могло бы разойтись, нет. */
+#define TCP_PORT_BASE (prof()->tcp_port_base)
+static inline int out_tcp_port(const struct output *o) {
+    return TCP_PORT_BASE + out_mark_slot(o);
+}
+
 #endif

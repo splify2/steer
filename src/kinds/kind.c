@@ -80,6 +80,8 @@ static const struct { const struct kind_ops *have, *none; const char *module; } 
     { &kind_socks,       &no_socks,       "steer-proxy" },
     { &kind_http,        &no_http,        "steer-proxy" },
     { &kind_vmess,       &no_vmess,       "steer-proxy" },
+    /* Блок — без модуля и без правил вида до себя: в конце, порядок прежних не меняется. */
+    { &kind_block,       NULL,            NULL },
 };
 #define REG_N (sizeof(REG) / sizeof(REG[0]))
 

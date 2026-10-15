@@ -117,6 +117,7 @@ static void dns_up_flow(FILE *f, const struct spec *s, const struct spec_dns_up 
     if (u->out >= 0) fs(&w, "out", oname_of(oname, (size_t)u->out));
     if (u->ips_n) fseq_s(&w, "ips", u->ips[0], sizeof(u->ips[0]), u->ips_n);
     if (u->boot_n) fseq_s(&w, "bootstrap", u->boot[0], sizeof(u->boot[0]), u->boot_n);
+    if (u->frag) { fk(&w, "fragment"); fputs("true", f); }
     fputs(" }", f);
 }
 
@@ -249,11 +250,51 @@ static const char *on_fail_name(enum on_fail f) {
     return f == FAIL_DIRECT ? "direct" : f == FAIL_ZAPRET ? "zapret" : "drop";
 }
 
-static void output_flow(FILE *f, const struct output *o, const struct onames *oname) {
+/* `kind: warp` — так, как записан (src/model/v2.c, p_warp): туннели «<имя>.<n>» в спеке не пишутся,
+ * а умолчания (count 3, pick latency, допуск 200 мс, интервал 600 с) не печатаются. */
+static void warp_flow(struct flow *w, const struct spec *s, const struct output *o) {
+    const struct group_cfg *g = &o->grp;
+    FILE *f = w->f;
+    fs(w, "kind", "warp");
+    if (g->warp.transport == WARP_MASQUE) fs(w, "transport", "masque");
+    if (g->warp.count != 3) { fk(w, "count"); fprintf(f, "%u", g->warp.count); }
+    if (g->pick != PICK_LATENCY) fs(w, "pick", "order");
+    if (g->pick == PICK_LATENCY && g->lat_tolerance_ms >= 0) {
+        fk(w, "tolerance");
+        fprintf(f, "%d", g->lat_tolerance_ms);
+    }
+    if (g->pick == PICK_LATENCY && g->lat_interval_s && g->lat_interval_s != 600) {
+        fk(w, "interval");
+        fprintf(f, "%d", g->lat_interval_s);
+    }
+    if (g->pick == PICK_LATENCY && g->url[0]) fs(w, "url", g->url);
+    if (g->pick == PICK_LATENCY && g->idle_timeout_s >= 0) {
+        fk(w, "idle_timeout");
+        fprintf(f, "%d", g->idle_timeout_s);
+    }
+    if (g->warp.cc_n) fseq_s(w, "countries", g->warp.cc[0], 3, g->warp.cc_n);
+    if (g->warp.xcc_set) {
+        if (g->warp.xcc_n) fseq_s(w, "exclude_countries", g->warp.xcc[0], 3, g->warp.xcc_n);
+        else { fk(w, "exclude_countries"); fputs("[]", f); }
+    }
+    if (g->members_n) {
+        const struct output *m = spec_out(s, g->members[0]);
+        if (m->over[0]) fs(w, "over", m->over);
+        if (m->ipv6 == OUT_V6_OFF) fs(w, "ipv6", "off");
+    }
+    if (o->on_fail != FAIL_DROP) fs(w, "on_fail", on_fail_name(o->on_fail));
+}
+
+static void output_flow(FILE *f, const struct spec *s, const struct output *o, const struct onames *oname) {
     const struct kind_ops *k = kind_of(o);
     const struct group_cfg *g = out_group(o);
     struct flow w = { f, 0 };
     fputs("{ ", f);
+    if (g && g->warp.on) {
+        warp_flow(&w, s, o);
+        fputs(" }", f);
+        return;
+    }
     if (g) {
         static const char *const PICK[] = { "order", "latency", "manual", "balance" };
         fs(&w, "kind", "group");
@@ -327,6 +368,8 @@ static void output_flow(FILE *f, const struct output *o, const struct onames *on
         if (kk.pool.active > 1) { fk(&w, "active"); fprintf(f, "%d", kk.pool.active); }
         if (kk.pool.by != BY_CONNECTION) fs(&w, "by", group_by_name(kk.pool.by));
         if (kk.pool.interval_s) { fk(&w, "interval"); fprintf(f, "%d", kk.pool.interval_s); }
+        if (kk.pool.pick) fs(&w, "pick", "latency");
+        if (kk.pool.tol_set) { fk(&w, "tolerance"); fprintf(f, "%d", kk.pool.tolerance_ms); }
         if (kk.pool.silence_s) { fk(&w, "silence"); fprintf(f, "%d", kk.pool.silence_s < 0 ? 0 : kk.pool.silence_s); }
         if (kk.conf[0]) fpath(&w, "conf", kk.conf);
         if (kk.stream) { fk(&w, "stream"); fputs("true", f); }
@@ -488,14 +531,15 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
             if (yq_len(oname[anon_order[i]]) > ow) ow = yq_len(oname[anon_order[i]]);
         fputs("\noutputs:\n", f);
         for (size_t i = 0; i < s->out_n; i++) {
+            if (s->out[i].warp_of[0]) continue;         /* туннель kind: warp — часть его записи */
             key_pad(f, oname[i], ow);
-            output_flow(f, &s->out[i], &onm);
+            output_flow(f, s, &s->out[i], &onm);
             fputc('\n', f);
         }
         for (size_t i = 0; i < anon_n; i++) {
             const struct output *m = spec_out(s, SPEC_ANON_BASE + (anon_order[i] - s->out_n));
             key_pad(f, oname[anon_order[i]], ow);
-            output_flow(f, m, &onm);
+            output_flow(f, s, m, &onm);
             fputc('\n', f);
         }
     }
@@ -569,5 +613,100 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
             fputs(" }\n", f);
         }
     }
+    return ferror(f) ? (e ? err_set(e, "не удалось напечатать спеку", NULL) : -1) : 0;
+}
+
+/* ---- та же спека JSON-объектом (`steer spec convert --json`) -------------------------------------
+ *
+ * Зачем: управляющий слой на роутере (splify2: jsonfilter, ucode, ответы ubus) читает JSON, а спека на
+ * диске — YAML (решение владельца 2026-10-13). Печать не вторая, а та же: текст spec_print_v2 разбирается
+ * тем же ynode, и дерево выходит JSON-объектом. Так ключи, порядок и значения у двух печатей одни и не
+ * могут разойтись, а YAML → JSON → YAML даёт тот же текст.
+ *
+ * Тип скаляра — по записи, как читает разбор спеки (YAML 1.2, базовая схема): в кавычках — строка;
+ * без кавычек `true`/`false` — логическое, целое или десятичное число — число, `null`, `~` и пусто —
+ * null; остальное — строка. spec_print_v2 берёт в кавычки всё, что без них прочлось бы не строкой
+ * («NO», «1.0» в имени), поэтому строковые значения спеки здесь строками и остаются. */
+#include <stdlib.h>
+#include "ynode.h"
+
+/* Строка JSON: кавычки, обратная косая и управляющие — экранируются, UTF-8 — как есть. Своя, а не
+ * jsonw_str: модель компонуется и без src/lib/jsonw.c (стенды spec*match). */
+static void json_qstr(FILE *f, const char *s) {
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') { fputc('\\', f); fputc(*p, f); }
+        else if (*p == '\n') fputs("\\n", f);
+        else if (*p == '\t') fputs("\\t", f);
+        else if (*p == '\r') fputs("\\r", f);
+        else if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+        else fputc(*p, f);
+    }
+    fputc('"', f);
+}
+
+static int json_plain_number(const char *s) {
+    const char *p = s;
+    if (*p == '-' || *p == '+') p++;
+    if (!*p) return 0;
+    int digits = 0, dot = 0;
+    for (; *p; p++) {
+        if (*p >= '0' && *p <= '9') digits++;
+        else if (*p == '.' && !dot) dot = 1;
+        else return 0;
+    }
+    if (!digits) return 0;
+    /* Ведущий ноль у целого (`012`) JSON не принимает — пусть будет строкой (так спека его и не пишет). */
+    const char *d = s + (*s == '-' || *s == '+');
+    if (d[0] == '0' && d[1] && d[1] != '.') return 0;
+    return 1;
+}
+
+static void json_node(FILE *f, const struct ynode *n) {
+    if (!n) { fputs("null", f); return; }
+    if (n->kind == YN_MAP) {
+        fputc('{', f);
+        for (size_t i = 0; i < n->len; i++) {
+            if (i) fputc(',', f);
+            json_qstr(f, n->items[2 * i]->str);
+            fputc(':', f);
+            json_node(f, n->items[2 * i + 1]);
+        }
+        fputc('}', f);
+        return;
+    }
+    if (n->kind == YN_SEQ) {
+        fputc('[', f);
+        for (size_t i = 0; i < n->len; i++) {
+            if (i) fputc(',', f);
+            json_node(f, n->items[i]);
+        }
+        fputc(']', f);
+        return;
+    }
+    const char *s = n->str ? n->str : "";
+    if (n->style == YS_PLAIN && !n->tag) {
+        if (!strcmp(s, "true") || !strcmp(s, "false")) { fputs(s, f); return; }
+        if (!*s || !strcmp(s, "null") || !strcmp(s, "~")) { fputs("null", f); return; }
+        if (json_plain_number(s)) { fputs(*s == '+' ? s + 1 : s, f); return; }
+    }
+    json_qstr(f, s);
+}
+
+int spec_print_v2_json(FILE *f, const struct spec *s, struct err *e) {
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *m = open_memstream(&buf, &len);
+    if (!m) return e ? err_set(e, "недостаточно памяти для печати спеки", NULL) : -1;
+    int rc = spec_print_v2(m, s, e);
+    if (fclose(m) != 0 && rc == 0) rc = e ? err_set(e, "недостаточно памяти для печати спеки", NULL) : -1;
+    if (rc != 0) { free(buf); return rc; }
+    struct err pe = { { 0 } };
+    struct ydoc *d = ydoc_parse_buf(buf, len, "spec", &pe);
+    free(buf);
+    if (!d) return e ? err_set(e, "печать спеки не разобралась: %s", pe.msg) : -1;
+    json_node(f, ydoc_root(d));
+    fputc('\n', f);
+    ydoc_free(d);
     return ferror(f) ? (e ? err_set(e, "не удалось напечатать спеку", NULL) : -1) : 0;
 }

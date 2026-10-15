@@ -723,6 +723,21 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
             }
             return 1;
         }
+        /* Старший совпавший канал — «Блок» (kinds/block.c): пустой адрес сразу, апстрим не нужен.
+         * A — 0.0.0.0, AAAA — ::, остальное (HTTPS, SVCB, MX…) — пустой ответ. Соединение к
+         * 0.0.0.0 падает у клиента сразу, без повторных запросов и запасного резолвера. */
+        if (hit >= 0 && g_dch[hit].block) {
+            uint8_t out[512];
+            static const uint8_t zero6[16];
+            size_t len = qtype == DNS_TYPE_A ? build_rewritten_response(buf, qend, out, sizeof(out), 1, 0)
+                       : qtype == DNS_TYPE_AAAA ? build_rewritten_response6(buf, qend, out, sizeof(out), zero6)
+                       : build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
+            if (len) {
+                make_response_flags(out);
+                reply_client(out, len, &from, fromlen, &local, have_local);
+            }
+            return 1;
+        }
         /* AAAA имени под правилом без половины IPv6 (хоть один совпавший канал без DCH_V6) —
          * пустой ответ в любом режиме: клиент с двумя стеками сразу идёт по IPv4. */
         int aaaa_empty = hit >= 0 && qtype == DNS_TYPE_AAAA && !dch_all_v6(sets);

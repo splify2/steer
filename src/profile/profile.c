@@ -19,6 +19,8 @@ const struct profile *prof(void) {
         if (!g_prof.table_base) g_prof.table_base = 300;
         if (!g_prof.rt_tables_file) g_prof.rt_tables_file = "steer.conf";
         if (!g_prof.tgws_port_base) g_prof.tgws_port_base = 8480;
+        /* Слушатели TCP модулей — от 9480: в стороне от ряда моста (8480 плюс место, до 8734). */
+        if (!g_prof.tcp_port_base) g_prof.tcp_port_base = 9480;
         g_prof_ready = 1;
     }
     return &g_prof;

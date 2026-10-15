@@ -88,6 +88,8 @@ for _ in $(seq 40); do
 done
 ip netns exec "$NS" ip link show vl >/dev/null 2>&1 || { echo "vl не поднялся:"; tail -5 "$W/tun.log"; exit 1; }
 ip netns exec "$NS" ip route replace "$TARGET/32" dev vl
+. tests/lib-redir.sh
+redir_dev "$NS" vl   # TCP — к слушателю модуля (R-152), как на роутере
 
 echo "  маскировка $MASK, цель $TARGET"
 ip netns exec "$NS" curl -s -o "$W/dl.bin" \

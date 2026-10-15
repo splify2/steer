@@ -28,6 +28,11 @@ struct pool_proto {
 /* Умолчания ключей выхода (docs/spec-v2.md): период проверки узла и порог молчания, секунды. */
 #define POOL_INTERVAL_S 60
 #define POOL_SILENCE_S  20
+/* pick: latency — период замера всех кандидатов (умолчание `interval` при этом выборе), как у url-test
+ * sing-box, и допуск по умолчанию, мс — как у группы latency. */
+#define POOL_LAT_INTERVAL_S 180
+#define POOL_LAT_TOLERANCE_MS 50
+enum pool_pick { POOL_PICK_ORDER = 0, POOL_PICK_LATENCY = 1 };
 
 struct pool_cfg {
     const struct pool_proto *proto;
@@ -44,6 +49,8 @@ struct pool_cfg {
     int by;             /* enum group_by */
     int interval_s;     /* период проверки каждого узла */
     int silence_s;      /* порог молчания узла на живом соединении (struct dialer), 0 — нет */
+    int pick;           /* enum pool_pick: по порядку предпочтения или самые быстрые */
+    int tolerance_ms;   /* pick: latency — допуск смены узла, мс; < 0 — умолчание */
     const char *out;    /* имя выхода: файл состояния */
 };
 

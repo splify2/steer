@@ -473,6 +473,15 @@ void report_output_deps(const struct spec *sp) {
         else if (out_self_natting(out_for_device(sp, &sp->out[i], sp->out[i].device))) {
             /* нечего проверять */
         }
+        else if (out_nat4_by_steer(out_for_device(sp, &sp->out[i], sp->out[i].device))) {
+            /* подмену IPv4 ставит само ядро (generate.c, build_nat4); IPv6 — ниже, своим вопросом */
+            if (!c.masq6 && out_route6(&sp->out[i]) &&
+                out_ipv6_mode_dev(sp, &sp->out[i], sp->out[i].device) == OUT_V6_KIND &&
+                lan_has_global_v6(sp))
+                fprintf(stderr, LOG_W "output %s: у %s нет masquerade IPv6 — IPv6 клиентов уйдёт "
+                                "в туннель с их адресами, и ответ не вернётся; поставьте выходу "
+                                "ipv6: nat\n", sp->out[i].name, sp->out[i].device);
+        }
         else {
             if (!c.masqueraded)
                 fprintf(stderr, LOG_W "output %s: no masquerade/snat rule found for %s — "

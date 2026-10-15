@@ -156,14 +156,18 @@ struct iface_cfg {
     struct out_obfs obfs;
 };
 
-/* ПУЛ УЗЛОВ туннеля по подписке (ключи `active`, `by`, `interval`, `silence` спеки v2; src/tunnel/
- * pool.c). Ноль — ключа нет, действует умолчание: один активный узел, раздача connection, проверка
- * раз в 60 с, порог молчания 20 с. silence_s -1 — порог выключен явно (`silence: 0`). */
+/* ПУЛ УЗЛОВ туннеля по подписке (ключи `active`, `by`, `interval`, `silence`, `pick`, `tolerance`
+ * спеки v2; src/tunnel/pool.c). Ноль — ключа нет, действует умолчание: один активный узел, раздача
+ * connection, узлы по порядку предпочтения, проверка раз в 60 с (pick: latency — замер раз в 180 с),
+ * порог молчания 20 с. silence_s -1 — порог выключен явно (`silence: 0`). */
 struct tun_pool {
     int active;                 /* сколько узлов кандидатов работают сразу */
     int by;                     /* enum group_by: те же значения, что у by группы balance */
     int interval_s;             /* период проверки каждого активного узла */
     int silence_s;              /* порог молчания узла на живом соединении */
+    int pick;                   /* enum pool_pick (pool.h): 0 — по порядку, 1 — самые быстрые */
+    int tolerance_ms;           /* pick: latency — допуск смены узла, мс (при tol_set) */
+    int tol_set;                /* tolerance задан: 0 — тоже значение (менять на любой более быстрый) */
 };
 
 struct vless_cfg {
@@ -330,6 +334,10 @@ enum group_pick { PICK_ORDER = 0, PICK_LATENCY, PICK_MANUAL, PICK_BALANCE };
  * одного устройства — на одном члене (sticky-sessions). Порядок — как в спеке (group_by_name). */
 enum group_by { BY_CONNECTION = 0, BY_SITE, BY_SITE_CLIENT };
 
+/* Чем выход `kind: warp` ходит к Cloudflare (WARPBOX.md в хабе): AmneziaWG — туннели вида awg ядра
+ * steer; MASQUE — этап 2. */
+enum warp_transport { WARP_AWG = 0, WARP_MASQUE = 1 };
+
 struct group_cfg {
     enum group_pick pick;
     /* Арена спеки (group_members_alloc): members, weight, alive, lat_ms, lat4_ms, lat6_ms — все
@@ -356,6 +364,21 @@ struct group_cfg {
     unsigned char *weight;
     /* balance: чем раздаются новые соединения (enum group_by); 0 — случайно. */
     int by;
+    /* Группа записана в спеке как `kind: warp` (src/model/v2.c, p_warp): её члены — выходы awg
+     * «<имя>.<n>», которые разбор завёл сам, а регистрацию WARP, подбор точек входа и замену ведёт
+     * модуль steer-warpbox (помощник группы, kinds/group.c). cc/xcc — страны выхода (cca2): только
+     * эти / кроме этих; xcc_set — exclude_countries задан явно (convert печатает и пустой). Массивы — в
+     * арене спеки. */
+    struct {
+        unsigned char on;
+        unsigned char transport;        /* enum warp_transport */
+        unsigned char xcc_set;
+        unsigned count;
+        char (*cc)[3];
+        size_t cc_n;
+        char (*xcc)[3];
+        size_t xcc_n;
+    } warp;
     /* СОСТОЯНИЕ, а не настройка (как device и failed у выхода): что сторож выбрал в последнем
      * проходе. Заполняет outputs_adopt_active_st из памяти сторожа, разбор оставляет -1/нулями.
      * У группы с именованными членами cur и alive — решение подхвата по приговорам членов
@@ -478,6 +501,9 @@ struct output {
      * обнулённого выхода — «напрямую», а нулевой номер значил бы первый выход. Смысл, проверки
      * и метка — в блоке «подложка» ниже (out_over, out_underlay_mark). */
     char over[32];
+    /* Выход заведён разбором для группы `kind: warp` (её имя) и в спеке не записан: туннель WARP
+     * N из count (src/model/v2.c, p_warp). Печать спеки его пропускает — он часть записи warp. */
+    char warp_of[32];
     /* Настройка вида — ровно одна из этих, по kind. */
     union {
         struct iface_cfg iface;
@@ -609,13 +635,13 @@ struct spec_rule {
  * (src/dnsd/tabfmt.h), а тот разбирает адрес апстрима тем же dnsurl_parse.
  *
  * Апстрим — это ОДИН сервер и путь до него. Транспорт выводится из схемы адреса: udp://, tcp://,
- * tls:// (DoT), https:// (DoH), quic:// (DoQ, RFC 9250).
+ * tls:// (DoT), https:// (DoH), quic:// (DoQ, RFC 9250), h3:// (DoH по HTTP/3, RFC 9114).
  * Имя сервера в tls:// и https:// разрешается не системным резолвером, а bootstrap: адресами
  * `ips` апстрима либо серверами `bootstrap` (свои у апстрима, иначе общие из `dns`). Запрос к
  * апстриму уходит напрямую (out == -1) или с меткой выхода out: это метка выхода-подложки, та же,
  * что у сокета туннеля `over` (out_underlay_mark), и та же цепочка postrouting_guard не даёт ему
  * уйти мимо устройства выхода. */
-enum dns_proto { DNSP_NONE = 0, DNSP_UDP, DNSP_TCP, DNSP_DOT, DNSP_DOH, DNSP_QUIC };
+enum dns_proto { DNSP_NONE = 0, DNSP_UDP, DNSP_TCP, DNSP_DOT, DNSP_DOH, DNSP_QUIC, DNSP_DOH3 };
 struct spec_dns_up {
     char name[32];
     char url[256];
@@ -630,6 +656,9 @@ struct spec_dns_up {
     size_t ips_n;
     char (*boot)[46];               /* арена спеки, boot_n записей */
     size_t boot_n;
+    /* `fragment: true` (только DoT и DoH): ClientHello уходит двумя записями TLS с разрезом внутри
+     * имени сервера (SNI) и паузой между двумя отправками — против DPI, ищущего SNI в одной записи. */
+    unsigned char frag;
     unsigned char inl;             /* задан в самом правиле (`dns: { url: … }`), а не в dns.upstreams */
     /* ГРУППА СЕРВЕРОВ (`{ servers: [имя, …], mode: race | failover }`): несколько апстримов как
      * один. grp — DNSG_RACE или DNSG_FAILOVER, 0 — это сервер, а не группа. У группы url, out, ips
@@ -1109,6 +1138,19 @@ static inline int out_engine_managed(const struct output *o) { return out_has_ca
  * Отсюда одна функция для решения и разные тексты в сообщениях. */
 static inline int out_self_natting(const struct output *o) { return out_has_cap(o, KC_SELF_NAT); }
 
+/* Подмену IPv4 на устройстве выхода ставит само ядро (compile/generate.c, build_nat4; решение
+ * владельца 2026-10-12 — одна зона steer_zone без masq): у туннеля с устройством, который адреса
+ * клиентов сам не завершает. Проверки фаервола (fwcheck, diag, status) свою таблицу не читают и
+ * спрашивают это условие. Раскладка 4.9 (legacy.c, телефон) цепочки не ставит — там зон fw4 нет. */
+static inline int out_nat4_by_steer(const struct output *o) {
+    /* lo — не туннель: подмена адреса на петле роняет локальные пакеты (EPERM у sendto), а выход на lo
+     * бывает у стендов и у схем, где «туннель» — локальный прокси (стенд tests/dnsgroups.sh). */
+    /* На телефоне (plat()->iptables_masq) подмену выходов и так ставит ядро — правилами iptables при apply
+     * (daemon/apply.c, iptables_masq_sync): своя цепочка nft там была бы второй. */
+    return out_has_device(o) && !out_group(o) && !out_self_natting(o) && o->device[0] &&
+           strcmp(o->device, "lo") != 0 && !plat()->iptables_masq;
+}
+
 /* Выход, трафик которого общий обход DPI трогать НЕ должен.
  *
  * Это все виды, кроме kind=direct, и исключение здесь ровно одно — оно же и есть смысл
@@ -1171,6 +1213,9 @@ static inline int out_skips_zapret(const struct output *o) {
  * ставятся, лишь если в спеке есть такой выход с on_fail не drop, — остальным на каждый
  * пакет лишний поиск ни к чему. */
 #define FAILOPEN_SET "failopen"
+/* Карта «метка выхода → порт слушателя модуля» (R-152): ставит compile (build_tcp_redir), ведёт
+ * демон (tcp_redir_sync в failover.c). */
+#define TCP_REDIR_MAP "tcp_redir"
 /* ВЫХОД, КОТОРЫЙ ВООБЩЕ БЫВАЕТ «ПУЩЕН НАПРЯМУЮ»: с устройством и с on_fail не drop. Отдельно от
  * out_failopen_capable, потому что у набора FAILOPEN_SET после проверки на QEMU 04664a5
  * (docs/architecture.md, раздел 2, «Набор правил») два читателя, а не один:
@@ -1471,6 +1516,16 @@ int table_bind(const struct output *o, const char *dev);
  * up помощника с именем устройства (daemon/supd.c, route_up). До 1.10 её звали и клиенты VLESS и
  * xsteer сами; с шага 3 модули маршрута не трогают (evline.h, поле dev). */
 void bind_device(struct output *o, const char *dev);
+
+/* TCP клиентов — к слушателю модуля (R-152): карта TCP_REDIR_MAP «метка → порт» идёт за
+ * привязкой таблицы выхода (table_bind). learn — устройства модулей с KC_TCP_REDIR и их порты из
+ * спеки этого процесса; sync — элемент выхода под устройство dev (NULL — снять); after_load —
+ * вернуть элементы в карту только что загруженного набора правил. Всё — в failover.c. */
+void tcp_redir_learn(const struct spec *sp);
+void tcp_redir_sync(const struct output *o, const char *dev);
+void tcp_redir_after_load(const struct spec *sp);
+/* Модуль устройства dev вышел — снять элементы, ведущие к его слушателю (supd.c, child_cb). */
+void tcp_redir_dev_gone(const char *dev);
 
 /* ---- IPv6 от хоста: вопросы к выходу и спеке (устройство — у enum out_ipv6 выше) ---------- */
 

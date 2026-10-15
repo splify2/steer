@@ -75,6 +75,9 @@ static int ask_daemon(const char *line, const char *spec, const char *state_dir)
  * вызывающему (die и разбор аргументов) уровня НЕ несут и несут «steer: » — это ответ
  * тому, кто позвал, а не запись в журнал; так и записано в контракте. */
 int dnsd_main(int argc, char **argv);
+/* steer dns-probe — проверка DNS-серверов слоем апстримов резолвера (src/dnsd/dprobe.c). */
+int dns_probe_main(int argc, char **argv);
+void dns_probe_usage_flags(FILE *f);
 
 /* Имя таблицы правил (nft_table) — в spec.h: его спрашивает и сторож, см. failopen_mark в
  * failover.c. */
@@ -201,6 +204,7 @@ int main(int argc, char **argv) {
             if (!strcmp(cmd, "fit")) aggregate_usage_flags(stdout);
             else if (!strcmp(cmd, "daemon") || !strcmp(cmd, "ctl-serve") || !strcmp(cmd, "ctl"))
                 ctl_usage_flags(stdout);
+            else if (!strcmp(cmd, "dns-probe")) dns_probe_usage_flags(stdout);
             else dnsd_usage_flags(stdout);
         }
         return 0;
@@ -215,6 +219,7 @@ int main(int argc, char **argv) {
         if (!strcmp(cmd, "daemon") || !strcmp(cmd, "ctl-serve"))
             return ctl_serve_main(argc - 2, argv + 2);
         if (!strcmp(cmd, "ctl")) return ctl_client_main(argc - 2, argv + 2);
+        if (!strcmp(cmd, "dns-probe")) return dns_probe_main(argc - 2, argv + 2);
         return dnsd_main(argc - 2, argv + 2);
     }
 
@@ -247,7 +252,8 @@ int main(int argc, char **argv) {
         if (strcmp(arg, "convert") != 0)
             die("steer spec понимает только convert, а не «%s»", arg);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
-        if (spec_print_v2(stdout, &cfg, &e) < 0) err_die(&e);
+        if ((a.json ? spec_print_v2_json(stdout, &cfg, &e) : spec_print_v2(stdout, &cfg, &e)) < 0)
+            err_die(&e);
         return fflush(stdout) == 0 ? 0 : 1;
     }
     /* status и diag при живом демоне этой спеки — его ответом (ask_daemon): ход перебора узлов,
@@ -283,7 +289,10 @@ int main(int argc, char **argv) {
          * давал пустой вывод и код 0, а по этому выводу init-скрипт решает, каким выходам
          * поднимать процессы. Тишина вместо отказа означала бы не поднятый туннель без
          * единой строки о причине. */
-        if (a.kind && !kind_by_name(a.kind))
+        /* warp-masque — член kind: warp (TUN модуля steer-warpbox): в реестре видов его нет (руками в
+         * спеке не пишется), но управляющему слою устройства таких членов нужны так же, как awg, — для
+         * зоны фаервола. */
+        if (a.kind && !kind_by_name(a.kind) && strcmp(a.kind, kind_warpm.name) != 0)
             die("--kind: нужен interface, vless, xsteer, zapret или direct, а не %s", a.kind);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         for (size_t i = 0; i < cfg.out_n; i++) {
