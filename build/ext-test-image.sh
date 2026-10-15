@@ -32,4 +32,11 @@ command -v zig >/dev/null 2>&1 || {
 	echo "ext-test-image: в образе нет zig — это не образ сборщика steer" >&2; exit 2; }
 
 cd "$SRC"
-STEER_WOLFSSL="$WSRC" CC="zig cc" BUILD="${BUILD:-build}" exec sh tests/ext-test.sh
+# Стенд пишет в build/ от root (образ). Владелец на выходе возвращается тому, кому принадлежит
+# смонтированное дерево (OWNER=uid:gid задаёт его явно); иначе следующая сборка на машине без
+# root не снимет build/libs-host и соседей. Дерево root-а — ничего не меняем.
+[ -n "${OWNER:-}" ] || OWNER="$(stat -c %u:%g "$SRC")"
+if [ "$OWNER" != "0:0" ]; then
+	trap 'chown -R "$OWNER" "$SRC/${BUILD:-build}" 2>/dev/null || true' EXIT
+fi
+STEER_WOLFSSL="$WSRC" CC="zig cc" BUILD="${BUILD:-build}" sh tests/ext-test.sh
