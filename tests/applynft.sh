@@ -13,7 +13,9 @@
 #     клиентов шёл мимо резолвера. Запуски nft считает обёртка в PATH.
 #  3. Отвергнутый набор оставляет в ядре ПРЕЖНЮЮ таблицу, а не пустоту.
 #  4. Выход с on_fail=direct без устройства: apply ставит его метку в набор failopen, то есть
-#     его трафик, ушедший напрямую, общий обход снова видит как свой.
+#     его трафик, ушедший напрямую, общий обход снова видит как свой. Отметка засевается в
+#     тот же файл, что и таблица (элемент набора failopen в загружаемом тексте), чтобы между
+#     `nft -f` и failopen_after_load трафик выхода не отбрасывался.
 #
 # Нужны root (сетевое пространство и nf_tables), nft и ip. Без них стенд пропускается, а не
 # проваливается — как dnsnft.sh.
@@ -49,6 +51,7 @@ mkdir -p "$tmp/bin"
 cat > "$tmp/bin/nft" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >> "$tmp/nft.log"
+[ "\$1" = -f ] && cp "\$2" "$tmp/loaded.nft"
 exec "$real_nft" "\$@"
 EOF
 chmod +x "$tmp/bin/nft"
@@ -84,6 +87,11 @@ kept="$(printf '%s\n' "$err" | sed -n 's/.*(kept: \(.*\))$/\1/p')"
 printf '203.0.113.0/24\n' > "$tmp/a.lst"
 
 "$BIN" apply $S >/dev/null 2>&1
+# Отметка стоит в самом файле транзакции: окна между `nft -f` и failopen_after_load нет.
+check "отметка выхода засеяна в набор failopen загружаемого файла" "1" \
+    "$(sed -n '/set failopen {/,/^    }/p' "$tmp/loaded.nft" | grep -c 'elements = { 0x00100000 }')"
+check "отметка стоит в новой таблице файла (после delete старой)" "1" \
+    "$(awk '/^delete table inet steer/ {d=1} /elements = \{ 0x00100000 \}/ && d {print "x"; exit}' "$tmp/loaded.nft" | grep -c x)"
 check "выход без устройства при on_fail=direct отмечен «пущен напрямую»" "1" \
     "$(nft list set inet steer failopen 2>/dev/null | grep -c 'elements = { 0x00100000 }')"
 check "цепочка снятия бита стоит" "1" \

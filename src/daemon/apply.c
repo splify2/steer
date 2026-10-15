@@ -675,6 +675,33 @@ static void seed_end(void) {
     fpseed_free();
 }
 
+/* Засев набора failopen: метки выходов, у которых таблица уже без маршрута по умолчанию — тот же
+ * предикат, что у failopen_mark и failopen_after_load. Элементы идут в тот же файл, что и таблица:
+ * между `nft -f` и failopen_after_load (миллисекунды запуска ip и nft) postrouting_guard иначе
+ * отбрасывала бы трафик выхода, пущенного напрямую. Только на загрузке; в --dry-run не зовётся. */
+static unsigned *failopen_seed_buf;
+
+static void failopen_seed_begin(const struct spec *cfg) {
+    if (!cfg->out_n) return;
+    failopen_seed_buf = malloc(cfg->out_n * sizeof(*failopen_seed_buf));
+    if (!failopen_seed_buf) return;   /* без засева: failopen_after_load поставит отметки позже */
+    size_t n = 0;
+    for (size_t i = 0; i < cfg->out_n; i++) {
+        const struct output *o = &cfg->out[i];
+        if (o->mark && out_releasable(o) && out_has_device(o) && !table_has_default(o->table))
+            failopen_seed_buf[n++] = o->mark;
+    }
+    g_failopen_seed = failopen_seed_buf;
+    g_failopen_seed_n = n;
+}
+
+static void failopen_seed_end(void) {
+    g_failopen_seed = NULL;
+    g_failopen_seed_n = 0;
+    free(failopen_seed_buf);
+    failopen_seed_buf = NULL;
+}
+
 /* Одна транзакция: проверка очереди zapret, файл «добавить — удалить — новая таблица», nft -f.
  * 0 — ядро приняло; 1 — отвергло (прежняя таблица стоит, причина в журнале). */
 static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
@@ -749,7 +776,10 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
         }
     }
     seed_begin(cfg, gr, 1);
-    if (generate(cfg, gr, f, &e) < 0) err_die(&e);
+    failopen_seed_begin(cfg);
+    int grc = generate(cfg, gr, f, &e);
+    failopen_seed_end();
+    if (grc < 0) err_die(&e);
     seed_end();
     fclose(f);
 
