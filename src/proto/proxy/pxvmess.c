@@ -18,7 +18,8 @@
 #include "stack.h"
 #include "scrypto.h"
 
-#define VM_CHUNK 0x3FEF                  /* нагрузки в куске: < 0x3FFF - 16 */
+#define VM_REQ_LEN (16 + 18 + 8 + 49 + 16)   /* заголовок запроса целиком (vm_build_request) */
+#define VM_CHUNK 0x3FEF                 /* нагрузки в куске: < 0x3FFF - 16 */
 enum { RH_LEN = 0, RH_HDR, RH_BODY };
 
 struct vmess_sess {
@@ -226,6 +227,29 @@ static int vm_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     struct vmess_sess *s = sess;
     static __thread unsigned char out[TUNNEL_BUF];
     size_t o = 0;
+    /* Сколько байт уйдёт на провод: заголовок запроса (если не ушёл) и куски тела (2 + L каждый).
+     * Считаем до любой правки состояния: счётчик кусков и маска SHAKE двигаются при запечатывании
+     * и назад не откатываются, а повтор после SEND_AGAIN обязан дать те же байты. Окно не вместило
+     * всё — отказ до запечатывания, на провод ничего не ушло. */
+    size_t total = s->header_sent ? 0 : VM_REQ_LEN;
+    if (udp) {
+        const unsigned char *p = data; size_t left = n;
+        while (left >= 2) {
+            size_t dl = ((size_t)p[0] << 8) | p[1];
+            p += 2; left -= 2;
+            if (dl > left || dl > VM_CHUNK) return SEND_FATAL;
+            total += 2 + 16 + dl;
+            p += dl; left -= dl;
+        }
+        if (left) return SEND_FATAL;
+    } else {
+        size_t chunks = (n + VM_CHUNK - 1) / VM_CHUNK;
+        total += n + chunks * (2 + 16);
+    }
+    if (total) {
+        long room = transport_room(&s->t);
+        if (room >= 0 && total > (size_t)room) return SEND_AGAIN;
+    }
     if (!s->header_sent) {
         o = vm_build_request(ctx, s, out, sizeof out);
         if (!o) return SEND_FATAL;
@@ -236,7 +260,6 @@ static int vm_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         while (left >= 2) {
             size_t dl = ((size_t)p[0] << 8) | p[1];
             p += 2; left -= 2;
-            if (dl > left || dl > VM_CHUNK) return SEND_FATAL;
             if (o + 2 + dl + 16 > sizeof out) {
                 if (transport_write(&s->t, out, o)) return SEND_FATAL;
                 o = 0;
@@ -244,7 +267,6 @@ static int vm_send(const void *ctx, void *sess, const struct flow_key *k, int ud
             o += vm_seal_chunk(s, p, dl, out + o);
             p += dl; left -= dl;
         }
-        if (left) return SEND_FATAL;
     } else {
         while (n) {
             size_t t = n > VM_CHUNK ? VM_CHUNK : n;
@@ -257,7 +279,7 @@ static int vm_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         }
     }
     int rc = o ? transport_write(&s->t, out, o) : 0;
-    if (rc == H2_EWINDOW) { if (!s->header_sent) return SEND_AGAIN; return SEND_AGAIN; }
+    if (rc == H2_EWINDOW) return SEND_AGAIN;
     if (rc) return SEND_FATAL;
     s->header_sent = 1;
     return SEND_OK;
