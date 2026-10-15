@@ -277,4 +277,11 @@ struct ir_seed {
 };
 extern size_t (*g_print_seed)(const char *set, int fam, const struct ir_seed **out);
 
+/* Засев набора «пущен напрямую» (failopen): метки выходов, которые на загрузке уже без маршрута
+ * по умолчанию (apply.c, failopen_seed_begin). Элементы идут текстом той же транзакции, что и
+ * таблица, — окна, в котором трафик такого выхода отбрасывается postrouting_guard, нет. NULL/0 —
+ * засева нет (--dry-run, стенды): текст прежний. */
+extern const unsigned *g_failopen_seed;
+extern size_t g_failopen_seed_n;
+
 #endif
