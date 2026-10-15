@@ -44,6 +44,7 @@
 
 #include "scrypto.h"
 #include "blake3.h"
+#include "poly1305_32.h"
 
 /* ---- хранилища против настоящих размеров --------------------------------------------------
  *
@@ -278,6 +279,110 @@ int sc_hkdf(enum sc_hash h, const void *salt, size_t salt_n, const void *ikm, si
 
 /* ---- AEAD ----------------------------------------------------------------------------------- */
 
+/* ---- ChaCha20-Poly1305 своим порядком на 32-битном MIPS --------------------------------------
+ *
+ * Два места, где поставляемая wolfSSL без ассемблера теряет на этих процессорах (MT7621 и родня:
+ * 880 МГц, ни AES, ни SIMD, а ChaCha20-Poly1305 тут единственный быстрый шифр туннеля):
+ *
+ *  1. Poly1305 — основание 2^26 с побайтовой сборкой слов; у нас poly1305_32.h (основание 2^32,
+ *     multu/maddu).
+ *  2. Гамма ChaCha20 накладывается xorbufout(): словами — только когда выход, вход и блок гаммы
+ *     выровнены одинаково, иначе по байту (64 итерации на блок, около 40 % времени самого ChaCha20).
+ *     Запись TLS и xsteer лежит в буфере со сдвигом на 5 байт заголовка, то есть невыровнена
+ *     как правило. Поэтому невыровненные данные идут через выровненный буфер: копия, шифр на месте, копия.
+ *
+ * Порядок тот же, что у wc_ChaCha20Poly1305_Encrypt_ex/_Decrypt_ex: ключ Poly1305 — первые 32 байта
+ * блока 0, данные с блока 1, дополнение нулями до 16, затем длины; при расшифровке сначала тег (по
+ * шифртексту), и только при совпадении — данные, а при несовпадении буфер обнуляется, как у wolfSSL.
+ * Включается на __mips__ без 64 битов; STEER_CP_OWN включает ту же ветку на другом процессоре (стенд
+ * tests/cpmatch.c гоняет её на хосте и сверяет с wolfSSL); STEER_CP_STOCK на MIPS возвращает путь
+ * wolfSSL — для замеров «до и после». */
+#if (defined(__mips__) && !defined(__mips64) && !defined(STEER_CP_STOCK)) || defined(STEER_CP_OWN)
+#define SC_CP_OWN 1
+
+#define CP_BOUNCE 256   /* кратно 64: блоки гаммы не рвутся на границе куска */
+
+/* ChaCha20 над buf на месте; ctx стоит на счётчике 1 и ведёт его дальше. */
+static int cp_stream(ChaCha *ch, unsigned char *buf, size_t n, struct sp32 *mac) {
+    if (((uintptr_t)buf & 3) == 0) {
+        if (wc_Chacha_Process(ch, buf, buf, (word32)n) != 0) return -1;
+        if (mac) sp32_update(mac, buf, n);
+        return 0;
+    }
+    uint32_t bounce[CP_BOUNCE / 4];
+    unsigned char *b = (unsigned char *)bounce;
+    while (n) {
+        size_t k = n < CP_BOUNCE ? n : CP_BOUNCE;
+        memcpy(b, buf, k);
+        if (wc_Chacha_Process(ch, b, b, (word32)k) != 0) { wc_ForceZero(b, sizeof(bounce)); return -1; }
+        if (mac) sp32_update(mac, b, k);
+        memcpy(buf, b, k);
+        buf += k; n -= k;
+    }
+    wc_ForceZero(b, sizeof(bounce));
+    return 0;
+}
+
+static void cp_pad16(struct sp32 *mac, size_t n) {
+    static const uint8_t zero[16];
+    if (n & 15) sp32_update(mac, zero, 16 - (n & 15));
+}
+
+static void cp_lens(struct sp32 *mac, size_t aad_n, size_t n) {
+    uint8_t l[16];
+    memset(l, 0, sizeof l);
+    for (int i = 0; i < 4; i++) { l[i] = (uint8_t)(aad_n >> (8 * i)); l[8 + i] = (uint8_t)(n >> (8 * i)); }
+    sp32_update(mac, l, 16);
+}
+
+/* Ключ Poly1305 и счётчик 1 для данных. */
+static int cp_begin(ChaCha *ch, struct sp32 *mac, const unsigned char nonce[12]) {
+    uint8_t pk[32];
+    memset(pk, 0, sizeof pk);
+    int rc = wc_Chacha_SetIV(ch, nonce, 0);
+    if (rc == 0) rc = wc_Chacha_Process(ch, pk, pk, sizeof pk);
+    if (rc == 0) rc = wc_Chacha_SetIV(ch, nonce, 1);
+    if (rc == 0) sp32_init(mac, pk);
+    wc_ForceZero(pk, sizeof pk);
+    return rc;
+}
+
+static int cp_seal(ChaCha *ch, const unsigned char nonce[12], const void *aad, size_t aad_n,
+                   unsigned char *buf, size_t n, unsigned char tag[16]) {
+    struct sp32 mac;
+    int rc = cp_begin(ch, &mac, nonce);
+    if (rc != 0) { wc_ForceZero(&mac, sizeof mac); return rc; }
+    if (aad_n) { sp32_update(&mac, aad, aad_n); cp_pad16(&mac, aad_n); }
+    if (n && cp_stream(ch, buf, n, &mac) != 0) { wc_ForceZero(&mac, sizeof mac); return -1; }
+    cp_pad16(&mac, n);
+    cp_lens(&mac, aad_n, n);
+    sp32_final(&mac, tag);
+    wc_ForceZero(&mac, sizeof mac);
+    return 0;
+}
+
+/* 0 — тег верен и данные расшифрованы; 1 — тег неверен (буфер обнулён); -1 — ошибка шифра. */
+static int cp_open(ChaCha *ch, const unsigned char nonce[12], const void *aad, size_t aad_n,
+                   unsigned char *buf, size_t n, const unsigned char tag[16]) {
+    struct sp32 mac;
+    unsigned char calc[16];
+    int rc = cp_begin(ch, &mac, nonce);
+    if (rc != 0) { wc_ForceZero(&mac, sizeof mac); return -1; }
+    if (aad_n) { sp32_update(&mac, aad, aad_n); cp_pad16(&mac, aad_n); }
+    if (n) sp32_update(&mac, buf, n);
+    cp_pad16(&mac, n);
+    cp_lens(&mac, aad_n, n);
+    sp32_final(&mac, calc);
+    wc_ForceZero(&mac, sizeof mac);
+    unsigned diff = 0;
+    for (int i = 0; i < 16; i++) diff |= (unsigned)(calc[i] ^ tag[i]);
+    wc_ForceZero(calc, sizeof calc);
+    if (diff) { if (n) wc_ForceZero(buf, n); return 1; }
+    if (n && cp_stream(ch, buf, n, NULL) != 0) { wc_ForceZero(buf, n); return -1; }
+    return 0;
+}
+#endif
+
 size_t sc_aead_key_len(enum sc_aead_alg a) {
     switch (a) {
         case SC_AES128_GCM: return 16;
@@ -322,8 +427,12 @@ int sc_aead_seal(struct sc_aead *k, const unsigned char nonce[12],
     if (n > UINT32_MAX || aad_n > UINT32_MAX) return SC_EINVAL;
     if (k->alg == SC_CHACHA20_POLY1305) {
         struct chachapoly *cp = (struct chachapoly *)k->st;
+#ifdef SC_CP_OWN
+        rc = cp_seal(&cp->chacha, nonce, aad, aad_n, buf, n, tag);
+#else
         rc = wc_ChaCha20Poly1305_Encrypt_ex(&cp->chacha, &cp->poly, buf, buf, (word32)n, nonce,
                                             tag, aad, (word32)aad_n);
+#endif
     } else if (k->alg == SC_AES128_GCM || k->alg == SC_AES256_GCM) {
         rc = wc_AesGcmEncrypt((Aes *)k->st, buf, buf, (word32)n, nonce, 12, tag, 16,
                               aad, (word32)aad_n);
@@ -340,9 +449,14 @@ int sc_aead_open(struct sc_aead *k, const unsigned char nonce[12],
     if (n > UINT32_MAX || aad_n > UINT32_MAX) return SC_EINVAL;
     if (k->alg == SC_CHACHA20_POLY1305) {
         struct chachapoly *cp = (struct chachapoly *)k->st;
+#ifdef SC_CP_OWN
+        rc = cp_open(&cp->chacha, nonce, aad, aad_n, buf, n, tag);
+        if (rc == 1) return SC_EAUTH;
+#else
         rc = wc_ChaCha20Poly1305_Decrypt_ex(&cp->chacha, &cp->poly, buf, buf, (word32)n, nonce,
                                             tag, aad, (word32)aad_n);
         if (rc == WC_NO_ERR_TRACE(MAC_CMP_FAILED_E)) return SC_EAUTH;
+#endif
     } else if (k->alg == SC_AES128_GCM || k->alg == SC_AES256_GCM) {
         rc = wc_AesGcmDecrypt((Aes *)k->st, buf, buf, (word32)n, nonce, 12, tag, 16,
                               aad, (word32)aad_n);

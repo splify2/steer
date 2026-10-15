@@ -73,6 +73,7 @@
 #include "obfs.h"
 #include "run.h"
 #include "evline.h"
+#include "sockmark.h"
 
 #define LOG_W "steer[warn] obfs: "
 #define LOG_I "steer[info] obfs: "
@@ -478,8 +479,7 @@ void obfs_set_sock_mark(uint32_t mark, int required) {
 }
 
 int obfs_mark_sock(int fd) {
-    if (!g_sock_mark) return 0;
-    if (setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) == 0) return 0;
+    if (steer_sock_mark(fd, g_sock_mark) == 0) return 0;
     if (!g_sock_mark_req) return 0;
     /* Одна строка на процесс: повторы соединения идут с нарастающей паузой, и журнал из
      * одинаковых строк ничего не прибавил бы к первой. Причина — почти всегда нет

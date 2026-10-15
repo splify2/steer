@@ -75,6 +75,7 @@
 #include "jsonw.h"
 #include "platform.h"
 #include "transport.h"
+#include "thrstack.h"
 
 #define PL_LOG_W "steer[warn]: "
 #define PL_LOG_I "steer[info]: "
@@ -633,7 +634,7 @@ static void pl_ready_cb(void *arg, const char *dev) {
     pthread_attr_t a;
     pthread_attr_init(&a);
     /* Проверка держит соединение (struct transport, ~40 КБ) на своём стеке. */
-    pthread_attr_setstacksize(&a, 512 * 1024);
+    pthread_attr_setstacksize(&a, thread_stack(512 * 1024));
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_t t;
     int err = pthread_create(&t, &a, pl_thread, NULL);

@@ -108,12 +108,27 @@ static void registry_snapshot(void) {
 static void cleanup_stale_routing(const struct spec *sp) {
     for (size_t i = 0; i < g_oldreg_n; i++) {
         int live = 0;
+        /* Выход с устройством живой только с той же ПАРОЙ «метка, таблица»: освободившуюся метку
+         * реестр отдаёт другому выходу, и правило прежнего владельца (`fwmark M lookup <его
+         * таблица>`) пережило бы его, уводя трафик нового в мёртвую таблицу. Выход без устройства
+         * (таблицы у него нет) — по метке, как прежде. */
         for (size_t k = 0; k < sp->out_n; k++)
-            if (out_needs_mark(&sp->out[k]) && sp->out[k].mark == g_oldreg[i].mark) {
+            if (out_needs_mark(&sp->out[k]) && sp->out[k].mark == g_oldreg[i].mark &&
+                (!out_has_device(&sp->out[k]) || sp->out[k].table == g_oldreg[i].table)) {
                 live = 1;
                 break;
             }
         if (live) continue;
+        /* Таблицу — только ничью: её номер реестр тоже мог отдать другому выходу. Правила снимаются
+         * в любом случае, и IPv4, и IPv6 именно этой пары. */
+        int tlive = 0;
+        for (size_t k = 0; k < sp->out_n && !tlive; k++)
+            tlive = out_has_device(&sp->out[k]) && sp->out[k].table == g_oldreg[i].table;
+        if (tlive) {
+            rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
+            rule_drop6(g_oldreg[i].mark, g_oldreg[i].table);
+            continue;
+        }
         routing_drop(g_oldreg[i].mark, g_oldreg[i].table);
     }
 }

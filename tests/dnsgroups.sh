@@ -117,11 +117,13 @@ P=154
 LOG="$tmp/srv.log"; : > "$LOG"
 python3 "$tmp/srv.py" "$LOG" silent:${P}21:silent servfail:${P}22:servfail slow:${P}23:slow:700:10.0.0.4 \
     oka:${P}24:ok:10.0.0.1 okb:${P}25:ok:10.0.0.5 flaky:${P}26:flag:$tmp/flaky.down:10.0.0.6 \
-    oth:${P}27:flag:$tmp/oth.down:10.0.0.7 sf:${P}28:servfail stub:${P}29:ok:10.0.0.9 > "$tmp/srv.out" 2>&1 &
+    oth:${P}27:flag:$tmp/oth.down:10.0.0.7 sf:${P}28:servfail stub:${P}29:ok:10.0.0.9 \
+    sfa:${P}30:servfail sfb:${P}31:servfail sfd:${P}32:servfail sfe:${P}33:servfail sfc:${P}34:servfail \
+    okc:${P}35:ok:10.0.0.8 > "$tmp/srv.out" 2>&1 &
 echo $! > "$tmp/srv.pid"
 n=0; while ! grep -q ready "$tmp/srv.out" 2>/dev/null && [ $n -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
 
-for l in race1 race2 fo1 fo2 fo3 fail; do printf '%s.test\n' "$l" > "$tmp/$l.lst"; done
+for l in race1 race2 fo1 fo2 fo3 fail sv rs rv; do printf '%s.test\n' "$l" > "$tmp/$l.lst"; done
 cat > "$tmp/spec.yaml" <<EOF
 version: 2
 lan: { addr: [127.0.0.0/8] }
@@ -132,6 +134,9 @@ lists:
   fo2:   { domains_file: $tmp/fo2.lst }
   fo3:   { domains_file: $tmp/fo3.lst }
   fail:  { domains_file: $tmp/fail.lst }
+  sv:    { domains_file: $tmp/sv.lst }
+  rs:    { domains_file: $tmp/rs.lst }
+  rv:    { domains_file: $tmp/rv.lst }
 outputs:
   vpn: { kind: interface, device: lo }
 dns:
@@ -145,6 +150,15 @@ dns:
     okb:      { url: "udp://127.0.0.1:${P}25" }
     flaky:    { url: "udp://127.0.0.1:${P}26" }
     oth:      { url: "udp://127.0.0.1:${P}27" }
+    sfa:      { url: "udp://127.0.0.1:${P}30" }
+    sfb:      { url: "udp://127.0.0.1:${P}31" }
+    sfd:      { url: "udp://127.0.0.1:${P}32" }
+    sfe:      { url: "udp://127.0.0.1:${P}33" }
+    sfc:      { url: "udp://127.0.0.1:${P}34" }
+    okc:      { url: "udp://127.0.0.1:${P}35" }
+    sv: { servers: [sfa, sfb], mode: failover }
+    rs: { servers: [sfc, okc], mode: race }
+    rv: { servers: [sfd, sfe], mode: race }
     race1: { servers: [silent, servfail, slow], mode: race }
     race2: { servers: [servfail, oka, slow], mode: race }
     fo1:   { servers: [silent, oka], mode: failover }
@@ -156,6 +170,9 @@ rules:
   - { name: fo1,   to: [fo1],   out: vpn, dns: fo1 }
   - { name: fo2,   to: [fo2],   out: vpn, dns: fo2 }
   - { name: fo3,   to: [fo3],   out: vpn, dns: fo3 }
+  - { name: sv,    to: [sv],    out: vpn, dns: sv }
+  - { name: rs,    to: [rs],    out: vpn, dns: rs }
+  - { name: rv,    to: [rv],    out: vpn, dns: rv }
   - { name: fail,  to: [fail],  out: vpn, dns: { servers: [silent, servfail], mode: race } }
 EOF
 L=${P}10
@@ -191,6 +208,33 @@ check "failover: SERVFAIL основного — сразу следующий" 
 check "  без ожидания срока" "yes" "$(inr "$(ms "$r")" 0 400)"
 check "  основной спрошен один раз, следующий — один" "1 1" \
     "$(asked servfail q1.fo2.test) $(asked okb q1.fo2.test)"
+
+# ---- 3б. память отказов: выживание и пропуск плохих в race --------------------------------------
+# Все члены на паузе — ровно ОДНА попытка через наименее плохого, а не обход всех (failover) и не
+# веер (race). Пауза 3 с (STEER_DNSD_PAUSE_MS), все вопросы — подряд, внутри неё.
+r="$(ask q1.sv.test)"
+check "failover, оба отказывают: первый вопрос — обоим по очереди, SERVFAIL" "rcode2 1 1" \
+    "$(addr "$r") $(asked sfa q1.sv.test) $(asked sfb q1.sv.test)"
+r="$(ask q2.sv.test)"
+check "failover, все на паузе: ровно одна попытка (не обход всех)" "rcode2 1" \
+    "$(addr "$r") $(( $(asked sfa q2.sv.test) + $(asked sfb q2.sv.test) ))"
+r="$(ask q3.sv.test)"
+check "  следующий вопрос — снова одна попытка" "1" "$(( $(asked sfa q3.sv.test) + $(asked sfb q3.sv.test) ))"
+who() { if [ "$(asked sfa "$1")" = 1 ]; then echo sfa; else echo sfb; fi; }
+check "  и другому серверу: наименее плохой сменился (отказавший ушёл на более долгую паузу)" "sfa sfb" \
+    "$(who q2.sv.test) $(who q3.sv.test)"
+r="$(ask q1.rs.test)"
+check "race: первый вопрос — обоим, ответ годного" "10.0.0.8 1 1" \
+    "$(addr "$r") $(asked sfc q1.rs.test) $(asked okc q1.rs.test)"
+r="$(ask q2.rs.test)"
+check "race: отказавший на паузе не спрашивается, годный отвечает" "10.0.0.8 0 1" \
+    "$(addr "$r") $(asked sfc q2.rs.test) $(asked okc q2.rs.test)"
+r="$(ask q1.rv.test)"
+check "race, оба отказывают: первый вопрос — обоим, SERVFAIL" "rcode2 1 1" \
+    "$(addr "$r") $(asked sfd q1.rv.test) $(asked sfe q1.rv.test)"
+r="$(ask q2.rv.test)"
+check "race, все на паузе: ровно одна попытка (не веер)" "rcode2 1" \
+    "$(addr "$r") $(( $(asked sfd q2.rv.test) + $(asked sfe q2.rv.test) ))"
 
 # ---- 4-6: молчание, пауза, возвращение — параллельно, по одной шкале времени ---------------------
 : > "$tmp/flaky.down"

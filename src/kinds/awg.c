@@ -53,6 +53,7 @@
 #include "awg.h"
 #include "nlbuf.h"
 #include "run.h"
+#include "sockmark.h"
 
 #define LOG_W "steer[warn] awg: "
 #define LOG_I "steer[info] awg: "
@@ -615,7 +616,9 @@ size_t awg_build_set(uint8_t *buf, size_t cap, uint16_t famid, int famver, int i
     if (c->has_listen_port) nlbuf_put_u16(&b, AD_LISTEN_PORT, c->listen_port);
     /* Метка сокета — всегда, в том числе нулевая: иначе метка прежнего via осталась бы на
      * устройстве после того, как via убрали из спеки. */
-    nlbuf_put_u32(&b, AD_FWMARK, fwmark);
+    /* Внешние пакеты туннеля — мимо общего zapret роутера (sockmark.h): его «рассинхронизация»
+     * по UDP ломала бы рукопожатие WireGuard. */
+    nlbuf_put_u32(&b, AD_FWMARK, steer_own_mark(fwmark));
     if (replace_peers) nlbuf_put_u32(&b, AD_FLAGS, AWG_DEV_F_REPLACE_PEERS);
     if (is_awg) {
         for (int k = 0; k < AWG_U16_N; k++)

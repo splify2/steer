@@ -64,6 +64,7 @@
 
 #include "hy2conn.h"
 #include "quic.h"
+#include "thrstack.h"
 
 #define LOG_W2 "steer[warn]: "
 #define LOG_I2 "steer[info]: "
@@ -1359,7 +1360,7 @@ int hy2c_start(const struct hy2_node *node) {
     /* Не меньше минимума потока: в него входит статическая TLS всех загруженных библиотек, а у
      * libsteer она немалая (thread-local буферы стека туннеля) — 256 КБ давали EINVAL. Стек
      * потока — виртуальная память, занятой становится по мере использования. */
-    pthread_attr_setstacksize(&a, 1024 * 1024);
+    pthread_attr_setstacksize(&a, thread_stack(1024 * 1024));
     int err = pthread_create(&E.th, &a, engine, NULL);
     pthread_attr_destroy(&a);
     if (err) {

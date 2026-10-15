@@ -37,6 +37,7 @@
 
 #include "quic.h"
 #include "qcssl.h"
+#include "sockmark.h"
 
 #define QC_TXBUF        (64 * 1024)     /* пачка — до send_quantum, а он не больше 64 КиБ */
 /* Очередь исходящих датаграмм — 64: это защита от накопления, а не размер нагрузки. Датаграммы
@@ -1039,8 +1040,7 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
     q->fd = socket(q->remote.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (q->fd < 0) goto fail;
     sock_tune(q->fd);
-    if (cfg->sock_mark && setsockopt(q->fd, SOL_SOCKET, SO_MARK, &cfg->sock_mark, sizeof cfg->sock_mark) != 0 &&
-        cfg->mark_required) {
+    if (steer_sock_mark(q->fd, cfg->sock_mark) != 0 && cfg->mark_required) {
         rc = QC_ESOCK;
         goto fail;
     }
