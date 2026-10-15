@@ -1033,12 +1033,18 @@ static int has_releasable(const struct spec *sp) {
     return 0;
 }
 
+const unsigned *g_failopen_seed;
+size_t g_failopen_seed_n;
+
 static void build_failopen(struct nft_table *t, const struct spec *sp) {
     int failopen = 0;
     for (size_t i = 0; i < sp->out_n; i++)
         if (out_failopen_capable(&sp->out[i])) failopen = 1;
     if (!failopen && !has_releasable(sp)) return;
-    ir_gap(ir_set_add(t, FAILOPEN_SET, "mark"));
+    struct nft_set *fs = ir_set_add(t, FAILOPEN_SET, "mark");
+    ir_gap(fs);
+    for (size_t i = 0; i < g_failopen_seed_n; i++)
+        ir_set_value(fs, ir_printf(t->rs, "0x%08x", g_failopen_seed[i]));
     if (!failopen) return;
     struct nft_rule *r = ir_rule(ir_base_chain_add(t, "prerouting_failopen", "filter",
                                                    "prerouting", "mangle", 2));
