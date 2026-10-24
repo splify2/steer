@@ -195,7 +195,10 @@
 #define CTL_FILES_MAX   4096
 #define CTL_FILES_TOTAL (128LL * 1024 * 1024)
 #define CTL_FNAME_MAX   64
-#define CTL_OUT_MAX     (1024 * 1024)
+/* Вывод ребёнка и ответ из памяти — до 256 МиБ: это защита от ребёнка, который пишет без
+ * конца, а не рамка для честного ответа. Прежний мегабайт обрезал список соединений и status
+ * большой спеки посреди JSON; ответ сверх предела по-прежнему помечается "truncated". */
+#define CTL_OUT_MAX     (256LL * 1024 * 1024)
 #define CTL_ERR_MAX     (64 * 1024)
 #define CTL_CLIENTS_MAX 4
 #define CTL_REQ_MS      5000
@@ -923,13 +926,13 @@ static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t o
     /* Ход перебора узлов vless из памяти супервизора (--supervise) — ребёнку в окружение: клиенты
      * с трубой событий файлов probe-* не пишут, а подкоманды спрашивают probe_read. Запись
      * потерянного узла несёт причину (закодированной — до пятисот байт на выход), отсюда запас. */
-    char pmem[4096];
-    supd_probe_env(s->d.sup, pmem, sizeof(pmem));
-    if (pipe2(po, O_CLOEXEC) != 0) return -1;
-    if (pipe2(pe, O_CLOEXEC) != 0) { close(po[0]); close(po[1]); return -1; }
+    char *pmem = supd_probe_env(s->d.sup);      /* без предела: строка в куче по числу выходов */
+    if (pipe2(po, O_CLOEXEC) != 0) { free(pmem); return -1; }
+    if (pipe2(pe, O_CLOEXEC) != 0) { close(po[0]); close(po[1]); free(pmem); return -1; }
     pid_t pid = fork();
     if (pid < 0) {
         close(po[0]); close(po[1]); close(pe[0]); close(pe[1]);
+        free(pmem);
         return -1;
     }
     if (pid == 0) {
@@ -943,11 +946,12 @@ static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t o
         /* Сигналы цикла заблокированы, SIGPIPE игнорируется — и то и другое наследуется
          * через exec, а подкоманды рассчитывают на обычное поведение. */
         loop_child_reset();
-        if (pmem[0]) putenv(pmem);
+        if (pmem) putenv(pmem);
         execv(s->cf.exe, argv);
         dprintf(2, LOG_W "не запустить %s: %s\n", s->cf.exe, strerror(errno));
         _exit(127);
     }
+    free(pmem);
     close(po[1]);
     close(pe[1]);
     /* Неблокирующим — только наш конец: у ребёнка stdout обычный. */
@@ -2727,10 +2731,14 @@ static void srv_restored(void *arg, const char *all, const char *rules, const ch
 
 static void st_repair(struct conn *c) {
     struct ctl_srv *s = c->srv;
-    if (!s->on || !s->d.have || rulewd_missing(s->d.sp, c->tmp, sizeof(c->tmp)) <= 0) {
+    char *miss = NULL;
+    if (!s->on || !s->d.have || rulewd_missing(s->d.sp, &miss) <= 0) {
+        free(miss);
         conn_reply(c);
         return;
     }
+    /* Список выходов — своя строка в куче, а не c->tmp на PATH_MAX: на сотнях выходов он
+     * длиннее пути. av[] её только называет, и job_start копирует аргументы до возврата. */
     char *av[12];
     size_t n = 0;
     av[n++] = s->cf.exe;
@@ -2739,13 +2747,14 @@ static void st_repair(struct conn *c) {
     av[n++] = (char *)s->cf.spec;
     if (s->cf.state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)s->cf.state_dir; }
     av[n++] = "--rule";
-    av[n++] = c->tmp;
+    av[n++] = miss;
     av[n++] = "--masq-ensure";
     av[n] = NULL;
     if (job_start(c, av, 60, CTL_ERR_MAX, CTL_ERR_MAX, repair_done) != 0) {
-        fprintf(stderr, LOG_W "правила выходов (%s): не удалось запустить ядро\n", c->tmp);
+        fprintf(stderr, LOG_W "правила выходов (%s): не удалось запустить ядро\n", miss);
         conn_reply(c);
     }
+    free(miss);
 }
 
 /* Обратный вызов стража: поставить починку в очередь изменяющих команд. Уже ждёт или идёт —

@@ -21,6 +21,7 @@
 #include <sys/types.h>
 
 #include "spec.h"
+#include "evline.h"
 
 /* Помощников не «не больше 32»: по одному на выход с собственным процессом плюс резолвер, то есть
  * не больше выходов спеки + 1. Наборы (helper_set, планы) растут по этому числу. */
@@ -75,7 +76,7 @@ struct helper_state {
     /* Клиент туннеля по подписке: номера активных живых узлов пула через запятую (событие active,
      * evline.h; src/tunnel/pool.c), «» — живых нет; active_known — событие было. Сбрасывается с
      * новым процессом. */
-    char active[160];
+    char active[EVLINE_LINE_MAX]; /* событие не длиннее трубы, строка узлов — тем более */
     int active_known;
 };
 
@@ -113,7 +114,7 @@ struct helper {
     /* Демон: труба событий (конец чтения; -1 — нет) и недочитанная строка. */
     int evfd;
     size_t evlen;
-    char evbuf[512];
+    char evbuf[EVLINE_LINE_MAX + 2];   /* строка события и \n: длиннее трубы не бывает */
     struct helper_state st;
 };
 
@@ -237,8 +238,8 @@ int supd_restart(struct supd *s, const char *out, const char *cmd);
 int supd_helper_json(const struct supd *s, const char *name, FILE *out);
 
 /* Ход перебора узлов клиентов vless из памяти демона — в запись окружения для детей демона
- * (`STEER_PROBE_MEM=…`, её читает probe_read вместо файлов probe-*; см. src/model/probe.h). Пусто
- * (buf[0] = 0) — демон не супервизор. */
-void supd_probe_env(const struct supd *s, char *buf, size_t n);
+ * (`STEER_PROBE_MEM=…`, её читает probe_read вместо файлов probe-*; см. src/model/probe.h). Строка
+ * в куче, без предела по числу выходов; освобождает вызывающий. NULL — демон не супервизор. */
+char *supd_probe_env(const struct supd *s);
 
 #endif
