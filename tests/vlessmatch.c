@@ -93,6 +93,7 @@
 #include "client.h"
 
 #include "scrypto.h"
+#include "reality.h"   /* xc_random, xc_x25519_keypair — ключи серверной половины стенда */
 #if defined(STEER_HAVE_X509WRITE)
 # include "certgen.h"
 #endif
