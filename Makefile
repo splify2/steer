@@ -81,7 +81,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/b3match $(BUILD)/subpq
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/b3match $(BUILD)/subpq
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -114,6 +114,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/buildmatch.sh
 	@sh tests/srsmatch.sh
 	@$(BUILD)/srsunit
+	@$(BUILD)/procscanmatch
 	@$(BUILD)/modelmatch
 	@sh tests/srsgen.sh
 	@sh tests/srsnft.sh
@@ -179,6 +180,8 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/urltestmatch
 	@$(BUILD)/urltlsmatch
 	@sh tests/nftvmapmatch.sh
+	@BUILD=$(BUILD) sh tests/rtnlmatch.sh
+	@BUILD=$(BUILD) sh tests/nftdumpmatch.sh
 	@sh tests/groupsmatch.sh
 
 # Перезапись снимка генератора (tests/snapshot.sh). Только когда ruleset меняется
@@ -404,6 +407,11 @@ $(BUILD)/modelmatch: tests/modelmatch.c tests/unit.h $(MODEL_KINDS) src/kinds/aw
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/modelmatch.c $(MODEL_KINDS) src/kinds/awg.c
 
+# Обход /proc (src/lib/procscan.c): хвост длинной командной строки.
+$(BUILD)/procscanmatch: tests/procscanmatch.c tests/unit.h src/lib/procscan.c src/lib/procscan.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/procscanmatch.c src/lib/procscan.c
+
 # Читатель наборов sing-box (src/model/srs.c) и раскладка канала с ними (srsplan.c) — модулями
 # модели, без движка: см. шапку tests/srsunit.c.
 $(BUILD)/srsunit: tests/srsunit.c tests/unit.h $(MODEL_KINDS) $(CORE_HDR)
@@ -467,6 +475,16 @@ $(BUILD)/urltlsmatch: tests/urltlsmatch.c src/proto/tls/urltls.c src/proto/tls/u
 $(BUILD)/nftvmap-tool: tests/nftvmap-tool.c src/lib/nftvmap.c src/lib/nftvmap.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/nftvmap-tool.c src/lib/nftvmap.c
+
+# Дампы ядра по netlink (src/lib/rtnl.c) — инструмент стенда tests/rtnlmatch.sh.
+$(BUILD)/rtnl-tool: tests/rtnl-tool.c src/lib/rtnl.c src/lib/rtnl.h src/lib/nlbuf.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/rtnl-tool.c src/lib/rtnl.c
+
+# Дампы nftables по netlink (src/lib/nftdump.c) — инструмент стенда tests/nftdumpmatch.sh.
+$(BUILD)/nftdump-tool: tests/nftdump-tool.c src/lib/nftdump.c src/lib/nftdump.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/nftdump-tool.c src/lib/nftdump.c
 
 # Зависимость выхода от чужого firewall: fw_check судит о конфигурации по тексту дампа
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
@@ -748,8 +766,8 @@ clean:
 	       $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/b3match $(BUILD)/subpq \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
-	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/yamlmatch $(BUILD)/wolfssl-host \
+	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/yamlmatch $(BUILD)/wolfssl-host \
 	       $(BUILD)/scryptomatch $(BUILD)/vlessmatch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
 	       $(BUILD)/devupmatch $(BUILD)/ndk \
-	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool \
+	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

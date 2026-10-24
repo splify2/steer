@@ -76,9 +76,12 @@ static int fake_domain(uint32_t fake4, char *dst, size_t n) {
         return -1;
     FILE *f = fopen(path, "r");
     if (!f) return -1;
-    char line[1024];
+    /* Строка любой длины (getline): fgets на 1024 байта разрезал бы длинную строку надвое, и вторая
+     * половина разбиралась бы как отдельная запись. */
+    char *line = NULL;
+    size_t cap = 0;
     int found = -1;
-    while (found && fgets(line, sizeof(line), f)) {
+    while (found && getline(&line, &cap, f) >= 0) {
         char *t1 = strchr(line, '\t');
         if (!t1) continue;
         *t1 = '\0';
@@ -92,6 +95,7 @@ static int fake_domain(uint32_t fake4, char *dst, size_t n) {
         dst[l] = '\0';
         found = 0;
     }
+    free(line);
     fclose(f);
     return found;
 }
@@ -116,6 +120,8 @@ const char *explain_set_phrase(const char *addr, int has_files, int has_domains)
  * ровно один сервер, а тянуть resolver-библиотеку в статический бинарь для роутера — это
  * килобайты за то, что укладывается в один буфер.
  */
+static int dns_answer_a(const unsigned char *r, ssize_t rn, char *out, size_t out_n);
+
 static int dns_ask(const char *name, char *out, size_t out_n) {
     unsigned char q[512];
     size_t n = 0;
@@ -156,9 +162,19 @@ static int dns_ask(const char *name, char *out, size_t out_n) {
         return -1;
     }
 
-    unsigned char r[1024];
-    ssize_t rn = recv(fd, r, sizeof r, 0);
+    /* Буфер на самую длинную датаграмму UDP: ответ длиннее прежних 1024 байт приходил усечённым, и
+     * адрес из хвоста списка ответов оставался за краем («ответа нет», хотя он есть). */
+    unsigned char *r = malloc(65535);
+    if (!r) { close(fd); return -1; }
+    ssize_t rn = recv(fd, r, 65535, 0);
     close(fd);
+    int rc = dns_answer_a(r, rn, out, out_n);
+    free(r);
+    return rc;
+}
+
+/* Первый адрес типа A из ответа r (rn байт). 0 — есть; -2 — ответ есть, адреса нет; -1 — не ответ. */
+static int dns_answer_a(const unsigned char *r, ssize_t rn, char *out, size_t out_n) {
     if (rn < 12) return -1;
     unsigned ancount = ((unsigned)r[6] << 8) | r[7];
     if (!ancount) return -2;                       /* ответ есть, адреса нет — NODATA */

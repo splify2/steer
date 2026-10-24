@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -24,14 +25,29 @@ int proc_cmdline_find(const char *needle, int digit_end) {
     struct dirent *dir;
     int found = 0;
     char path[300];
-    char buf[512];
+    char *buf = NULL;
+    size_t cap = 0;
 
     while ((dir = readdir(d)) != NULL && !found) {
         if (!isdigit(dir->d_name[0])) continue;
         snprintf(path, sizeof(path), "/proc/%s/cmdline", dir->d_name);
         int fd = open(path, O_RDONLY | O_CLOEXEC);
         if (fd >= 0) {
-            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            /* До конца, а не первые 511 байт: --qnum=N бывает в хвосте длинной командной строки
+             * (обработчик с длинным списком доменов или путей), и обрезка прятала бы его. */
+            ssize_t n = 0;
+            for (;;) {
+                if ((size_t)n + 1 >= cap) {
+                    size_t nc = cap ? cap * 2 : 4096;
+                    char *g = realloc(buf, nc);
+                    if (!g) { n = -1; break; }
+                    buf = g;
+                    cap = nc;
+                }
+                ssize_t r = read(fd, buf + n, cap - (size_t)n - 1);
+                if (r <= 0) { if (r < 0) n = -1; break; }
+                n += r;
+            }
             if (n > 0) {
                 buf[n] = '\0';
                 for (ssize_t i = 0; i < n; i++) {
@@ -47,6 +63,7 @@ int proc_cmdline_find(const char *needle, int digit_end) {
             close(fd);
         }
     }
+    free(buf);
     closedir(d);
     return found;
 }

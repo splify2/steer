@@ -345,20 +345,24 @@ static void lan6_note(struct lan6 *r, const struct v6pfx *p, const uint8_t *x) {
 static struct lan6 lan6_scan(const struct spec *sp, const struct v6pfx *p) {
     struct lan6 r;
     memset(&r, 0, sizeof(r));
-    static struct rtnl_addr6 av[256];
-    int an = rtnl_addrs6(av, sizeof(av) / sizeof(av[0]));
-    if (an >= 0) {
-        int idx[8];
+    struct rtnl_addr6 *av = NULL;
+    int an = rtnl_addrs6(&av);
+    int *idx = an >= 0 ? calloc(sp->lan_dev_n ? sp->lan_dev_n : 1, sizeof(*idx)) : NULL;
+    if (an >= 0 && idx) {
         size_t ni = 0;
-        for (size_t i = 0; i < sp->lan_dev_n && ni < 8; i++)
+        for (size_t i = 0; i < sp->lan_dev_n; i++)
             if ((idx[ni] = (int)if_nametoindex(sp->lan_dev[i])) > 0) ni++;
         for (int k = 0; k < an; k++) {
             int ours = 0;
             for (size_t i = 0; i < ni && !ours; i++) ours = av[k].ifindex == idx[i];
             if (ours && !(av[k].flags & IFA_F_DEPRECATED)) lan6_note(&r, p, av[k].a);
         }
+        free(idx);
+        free(av);
         return r;
     }
+    free(idx);
+    free(av);
     struct ifaddrs *ifa = NULL;
     if (getifaddrs(&ifa) != 0) return r;
     for (struct ifaddrs *a = ifa; a; a = a->ifa_next) {
@@ -469,9 +473,10 @@ static int lan_ifname(const struct spec *sp, char *name, size_t n, char *assign,
  * накрывающий его или лежащий в нём. В отличие от v6donor_derive адрес LAN из префикса здесь не
  * нужен: вопрос как раз о том, почему его нет. 1 — есть, 0 — нет, -1 — маршруты не прочитать. */
 static int v6_announced(const struct output *o, const struct v6pfx *p) {
-    static struct rtnl_route6 rt[256];
-    int n = rtnl_main6_routes(rt, sizeof(rt) / sizeof(rt[0]));
+    struct rtnl_route6 *rt = NULL;
+    int n = rtnl_main6_routes(&rt);
     if (n < 0) return -1;
+    int res = 0;
     int donor_if = o->device[0] ? (int)if_nametoindex(o->device) : 0;
     for (int i = 0; i < n; i++) {
         if (rt[i].type != RTN_UNREACHABLE || !rt[i].dst_len || rt[i].dst_len > 64) continue;
@@ -489,9 +494,10 @@ static int v6_announced(const struct output *o, const struct v6pfx *p) {
             if ((v6pfx_has(&s, c.a) || v6pfx_has(&c, s.a)) && rt[j].oif && rt[j].oif != donor_if)
                 isp = 1;
         }
-        if (!isp) return 1;
+        if (!isp) { res = 1; break; }
     }
-    return 0;
+    free(rt);
+    return res;
 }
 
 static void diag_v6_host(const struct spec *sp, const struct groups *gr) {

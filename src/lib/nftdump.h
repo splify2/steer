@@ -24,6 +24,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Пределы самого ядра, не наши: имя таблицы, цепочки, набора — до 255 байт (NFT_NAME_MAXLEN 256 с
+ * нулём), значение данных элемента — до 64 (NFT_DATA_VALUE_MAXLEN). Буфер меньше обрезал бы
+ * имя молча, и дамп называл бы чужую цепочку своей. */
+#define NFD_NAME 256
+#define NFD_DATA_MAX 64
+
 /* Семейства — числа NFPROTO_* (linux/netfilter.h): inet 1, ip 2, ip6 10. */
 #define NFD_INET 1
 #define NFD_IP   2
@@ -72,7 +78,7 @@ int nfd_table_fp(const char *table, struct nfd_tfp *out);
  * вызывающий. Один дамп на все семейства, как у nfd_table_fp. 0 — прочитаны; иначе errno. */
 struct nfd_set {
     uint8_t family;
-    char name[64];
+    char name[NFD_NAME];
     uint32_t flags;
     uint32_t klen;
 };

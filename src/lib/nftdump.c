@@ -230,7 +230,7 @@ static void chain_rules_cb(const struct nlmsghdr *h, void *arg) {
     if (!msg_is(h, NFT_MSG_NEWRULE)) return;
     const struct nlattr *tb[NFTA_RULE_MAX + 1];
     msg_attrs(h, tb, NFTA_RULE_MAX);
-    char t[64], ch[64];
+    char t[NFD_NAME], ch[NFD_NAME];
     if (strcmp(nla_cstr(tb[NFTA_RULE_TABLE], t, sizeof(t)), c->table) != 0) return;
     nla_cstr(tb[NFTA_RULE_CHAIN], ch, sizeof(ch));
     size_t k = 0;
@@ -449,7 +449,7 @@ static void tfp_cb(const struct nlmsghdr *m, void *arg) {
      * старое ядро не понимает, поэтому отбор здесь. */
     const struct nlattr *tb[2];
     nfd_parse((const uint8_t *)m + hl, m->nlmsg_len - hl, tb, 1);
-    char t[64];
+    char t[NFD_NAME];
     if (!tb[1] || strcmp(nla_cstr(tb[1], t, sizeof(t)), c->table) != 0) return;
     uint64_t h = NFD_FNV_INIT;
     const uint8_t *q = (const uint8_t *)m + hl;
@@ -506,7 +506,7 @@ static void ttab_cb(const struct nlmsghdr *m, void *arg) {
     if (fi < 0) return;
     const struct nlattr *tb[NFD_TABLE_HANDLE + 1];
     msg_attrs(m, tb, NFD_TABLE_HANDLE);
-    char t[64];
+    char t[NFD_NAME];
     if (strcmp(nla_cstr(tb[NFTA_TABLE_NAME], t, sizeof(t)), c->table) != 0) return;
     c->fams |= 1u << fi;
     if (fi == 0) c->handle = nla_be64(tb[NFD_TABLE_HANDLE]);
@@ -590,7 +590,7 @@ static void sets_list_cb(const struct nlmsghdr *m, void *arg) {
     if (!msg_is(m, NFT_MSG_NEWSET)) return;
     const struct nlattr *tb[NFTA_SET_MAX + 1];
     msg_attrs(m, tb, NFTA_SET_MAX);
-    char t[64];
+    char t[NFD_NAME];
     if (strcmp(nla_cstr(tb[NFTA_SET_TABLE], t, sizeof(t)), c->table) != 0) return;
     struct nfd_set s;
     memset(&s, 0, sizeof(s));
@@ -703,7 +703,7 @@ static void redir_cb(const struct nlmsghdr *h, void *arg) {
     if (c->found || !msg_is(h, NFT_MSG_NEWRULE)) return;
     const struct nlattr *tb[NFTA_RULE_MAX + 1];
     msg_attrs(h, tb, NFTA_RULE_MAX);
-    char t[64];
+    char t[NFD_NAME];
     if (strcmp(nla_cstr(tb[NFTA_RULE_TABLE], t, sizeof(t)), c->table) != 0 ||
         !tb[NFTA_RULE_EXPRESSIONS])
         return;
@@ -789,16 +789,16 @@ static void sb_printf(struct sbuf *s, const char *fmt, ...) {
 }
 
 struct rs_elem {
-    uint8_t key[16];
+    uint8_t key[NFD_DATA_MAX];
     uint8_t klen;
     int verdict;          /* у карты вердиктов: 1 — есть */
     int32_t vcode;
-    char vchain[64];
+    char vchain[NFD_NAME];
 };
 
 struct rs_set {
     uint8_t fam;
-    char table[64], name[64], comment[128];
+    char table[NFD_NAME], name[NFD_NAME], comment[128];
     uint32_t flags;
     struct rs_elem *el;
     size_t el_n, el_cap;
@@ -806,13 +806,13 @@ struct rs_set {
 
 struct rs_obj {           /* таблица, цепочка или flowtable */
     uint8_t fam;
-    char table[64], name[64];
+    char table[NFD_NAME], name[NFD_NAME];
     char *head;           /* строки заголовка (тип, хук, устройства, комментарий), malloc */
 };
 
 struct rs_rule {
     uint8_t fam;
-    char table[64], chain[64];
+    char table[NFD_NAME], chain[NFD_NAME];
     char *text;
 };
 
@@ -1190,7 +1190,7 @@ static void expr_cmp(struct rctx *c, const struct nlattr *data) {
 static void expr_lookup(struct rctx *c, const struct nlattr *data) {
     const struct nlattr *t[NFTA_LOOKUP_MAX + 1];
     nfd_nested(data, t, NFTA_LOOKUP_MAX);
-    char name[64];
+    char name[NFD_NAME];
     nla_cstr(t[NFTA_LOOKUP_SET], name, sizeof(name));
     int sl = reg_slot(nla_be32(t[NFTA_LOOKUP_SREG]));
     enum rk k = sl >= 0 ? c->kind[sl] : RK_NONE;
@@ -1241,7 +1241,7 @@ static void expr_immediate(struct rctx *c, const struct nlattr *data) {
     if (!dt[NFTA_DATA_VERDICT]) return;
     const struct nlattr *vt[NFTA_VERDICT_MAX + 1];
     nfd_nested(dt[NFTA_DATA_VERDICT], vt, NFTA_VERDICT_MAX);
-    char chain[64];
+    char chain[NFD_NAME];
     put_verdict(c->s, (int32_t)nla_be32(vt[NFTA_VERDICT_CODE]),
                 nla_cstr(vt[NFTA_VERDICT_CHAIN], chain, sizeof(chain)));
 }

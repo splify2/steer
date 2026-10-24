@@ -82,6 +82,7 @@ static void routes_show(int table, char *out, size_t n);
 static void rules6_show(char *out, size_t n);
 static void routes6_show(int table, char *out, size_t n);
 static char *rules_dump(int fam);
+static char *routes_dump(int fam, int table);
 
 /* Адрес источника устройства: без него правило пробы не к чему привязать, а само
  * отсутствие адреса уже означает, что устройство не готово нести трафик. */
@@ -547,7 +548,7 @@ static void rule_del_at(int fam, unsigned mark, int table, unsigned long pref) {
 
 /* Правило одного семейства — ровно одной копией (см. rule_ensure ниже). */
 static void rule_ensure_fam(int fam, unsigned mark, int table) {
-    /* Статический и с запасом — по той же причине, что в route_facts_read: это ВСЕ правила
+    /* Дамп в куче любой длины — по той же причине, что в route_facts_read: это ВСЕ правила
      * коробки, и обрезанный дамп значил бы «нашего нет» и лишнюю копию. */
     char *rules = rules_dump(fam);
     if (!rules) return;
@@ -654,11 +655,10 @@ static const char *table_bh_type(int fam) {
 }
 
 static void table_prune_fam(int fam, int table, const char *dev, int backstop) {
-    static char routes[8192];
     char t[16];
     snprintf(t, sizeof(t), "%d", table);
-    if (fam == 6) routes6_show(table, routes, sizeof(routes));
-    else routes_show(table, routes, sizeof(routes));
+    char *routes = routes_dump(fam, table);
+    if (!routes) return;                /* не прочитать — не убираем вслепую */
     unsigned long main_metric = fam == 6 ? RT6_METRIC_DEFAULT : 0;
     int kept = 0;
     for (const char *ln = routes; ln && *ln; ) {
@@ -694,6 +694,7 @@ static void table_prune_fam(int fam, int table, const char *dev, int backstop) {
         argv[k] = NULL;
         run_quiet(argv);
     }
+    free(routes);
 }
 
 /* Поставить запасной запрет (см. STEER_BACKSTOP_METRIC в spec.h). Заменой: стоящий такой же
@@ -947,25 +948,30 @@ void tcp_redir_after_load(const struct spec *sp) {
  * интерфейс туннеля, — часто позже, чем встал движок, — а человек может сменить ip6prefix, не
  * трогая спеку. Проход идёт и по событию адреса IPv6 (watchd слушает RTMGRP_IPV6_IFADDR), так что
  * набор догоняет netifd за секунды. */
-#define V6_LAN_ADDRS 32
-
 int v6donor_derive(const struct spec *sp, const struct output *d, struct v6pfx *p) {
     memset(p, 0, sizeof(*p));
-    static struct rtnl_route6 rt[256];
-    int n = rtnl_main6_routes(rt, sizeof(rt) / sizeof(rt[0]));
-    if (n <= 0) return 0;
-    uint8_t lan[V6_LAN_ADDRS][16];
-    size_t ln = 0;
+    struct rtnl_route6 *rt = NULL;
+    int n = rtnl_main6_routes(&rt);
+    if (n <= 0) { free(rt); return 0; }
+    uint8_t (*lan)[16] = NULL;
+    size_t ln = 0, lcap = 0;
     struct ifaddrs *ifa = NULL;
-    if (getifaddrs(&ifa) != 0) return 0;
-    for (struct ifaddrs *a = ifa; a && ln < V6_LAN_ADDRS; a = a->ifa_next) {
+    if (getifaddrs(&ifa) != 0) { free(rt); return 0; }
+    for (struct ifaddrs *a = ifa; a; a = a->ifa_next) {
         if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET6 || !a->ifa_name) continue;
         const uint8_t *x = ((const struct sockaddr_in6 *)a->ifa_addr)->sin6_addr.s6_addr;
         if ((x[0] & 0xfe) == 0xfc || (x[0] == 0xfe && (x[1] & 0xc0) == 0x80) || x[0] == 0xff)
             continue;                        /* ULA, link-local, multicast */
         int ours = 0;
         for (size_t i = 0; i < sp->lan_dev_n && !ours; i++) ours = !strcmp(a->ifa_name, sp->lan_dev[i]);
-        if (ours) memcpy(lan[ln++], x, 16);
+        if (!ours) continue;
+        if (ln == lcap) {
+            uint8_t (*g)[16] = realloc(lan, (lcap ? lcap * 2 : 16) * sizeof(*lan));
+            if (!g) { free(lan); free(rt); freeifaddrs(ifa); return 0; }
+            lan = g;
+            lcap = lcap ? lcap * 2 : 16;
+        }
+        memcpy(lan[ln++], x, 16);
     }
     freeifaddrs(ifa);
     int donor_if = d->device[0] ? (int)if_nametoindex(d->device) : 0;
@@ -997,6 +1003,8 @@ int v6donor_derive(const struct spec *sp, const struct output *d, struct v6pfx *
         if (fn < 4) found[fn] = c;
         fn++;
     }
+    free(lan);
+    free(rt);
     if (fn == 1) { *p = found[0]; return 1; }
     return fn ? -1 : 0;
 }
@@ -1430,20 +1438,31 @@ int (*g_ip_show)(int table, char *out, size_t n);
 
 static void rules_show(char *out, size_t n) {
     out[0] = '\0';
-    if (g_ip_show) { g_ip_show(-1, out, n); return; }
-    rtnl_rules_text(out, n);
+    if (g_ip_show) g_ip_show(-1, out, n);
 }
 
 static void routes_show(int table, char *out, size_t n) {
     out[0] = '\0';
-    if (g_ip_show) { g_ip_show(table, out, n); return; }
-    rtnl_routes_text(table, out, n);
+    if (g_ip_show) g_ip_show(table, out, n);
+}
+
+/* IPv6 — тем же приёмом. Стенд с g_ip_show без g_ip6_show получает пустой текст («не прочитать»). */
+int (*g_ip6_show)(int table, char *out, size_t n);
+
+static void rules6_show(char *out, size_t n) {
+    out[0] = '\0';
+    if (g_ip6_show) g_ip6_show(-1, out, n);
+}
+
+static void routes6_show(int table, char *out, size_t n) {
+    out[0] = '\0';
+    if (g_ip6_show) g_ip6_show(table, out, n);
 }
 
 /* Дамп правил семейства fam (4 или 6) — строка в куче любой длины, free вызывающему (пустая
  * строка — «не прочитать»). Правил на коробке по одному-два на выход и десятки чужих (mwan3, fw4,
- * чужие туннели); буфер в 16 КиБ обрезал бы дамп на сотне выходов, и «нашего правила нет» вело бы
- * к лишней копии каждый проход. Швы стенда (g_ip_show) отвечают в буфер, для них — мегабайт. */
+ * чужие туннели); обрезанный дамп значил бы «нашего правила нет» и лишнюю копию каждый проход.
+ * Швы стенда (g_ip_show) отвечают в буфер, для них — мегабайт. */
 static char *rules_dump(int fam) {
     if (g_ip_show || g_ip6_show) {
         size_t n = 1u << 20;
@@ -1457,21 +1476,19 @@ static char *rules_dump(int fam) {
     return b ? b : strdup("");
 }
 
-/* IPv6 — тем же приёмом. Стенд с g_ip_show без g_ip6_show получает пустой текст («не прочитать»). */
-int (*g_ip6_show)(int table, char *out, size_t n);
-
-static void rules6_show(char *out, size_t n) {
-    out[0] = '\0';
-    if (g_ip6_show) { g_ip6_show(-1, out, n); return; }
-    if (g_ip_show) return;
-    rtnl_rules_text6(out, n);
-}
-
-static void routes6_show(int table, char *out, size_t n) {
-    out[0] = '\0';
-    if (g_ip6_show) { g_ip6_show(table, out, n); return; }
-    if (g_ip_show) return;
-    rtnl_routes_text6(table, out, n);
+/* Маршруты таблицы выхода — так же: строка в куче любой длины, free вызывающему; пустая — таблица
+ * пуста, NULL — «не прочитать» (ошибка ядра, нехватка памяти): пустой дамп вместо этого сторож
+ * читал бы как опустевшую таблицу и перепривязывал выход. Обрезанный дамп был бы тем же. */
+static char *routes_dump(int fam, int table) {
+    if (g_ip_show || g_ip6_show) {
+        size_t n = 1u << 20;
+        char *b = malloc(n);
+        if (!b) return NULL;
+        if (fam == 6) routes6_show(table, b, n);
+        else routes_show(table, b, n);
+        return b;
+    }
+    return rtnl_routes_dup(table, fam == 6);
 }
 
 /* Включён ли IPv6 на устройстве: /proc/sys/net/ipv6/conf/<dev>/disable_ipv6. Файла нет — IPv6 в
@@ -1495,28 +1512,28 @@ int routing6_live_ok(const struct route_facts *f, const char *dev, int dev_v6) {
 }
 
 static struct route_facts route6_facts_read(const struct output *o) {
-    static char routes[8192];
     char *rules = rules_dump(6);
-    if (!rules) { struct route_facts none; memset(&none, 0, sizeof(none)); return none; }
-    routes6_show(o->table, routes, sizeof(routes));
-    struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+    char *routes = rules ? routes_dump(6, o->table) : NULL;
+    struct route_facts f;
+    if (rules && routes) f = route_facts_of(rules, routes, o->mark, o->table);
+    else memset(&f, 0, sizeof(f));
     free(rules);
+    free(routes);
     return f;
 }
 
 static struct route_facts route_facts_read(const struct output *o) {
-    /* Статические, и с запасом. Вывод `ip rule show` — это ВСЕ правила коробки, а не
-     * только наши: рядом живут mwan3, fw4 и чужие туннели, у которых правил бывают
-     * десятки. Обрезанный дамп означал бы «нашего правила нет» и пересоздание живой
-     * привязки каждую минуту — то есть короткий провал помеченного трафика на ровном
-     * месте. Статические: буферы большие, а проход однопоточный (в демоне — на цикле событий,
-     * по одному шагу за раз), и делить с ними стек незачем. */
-    static char routes[8192];
+    /* Вывод `ip rule show` — это ВСЕ правила коробки, а не только наши: рядом живут mwan3, fw4 и
+     * чужие туннели, у которых правил бывают десятки. Обрезанный дамп означал бы «нашего правила
+     * нет» и пересоздание живой привязки каждую минуту — то есть короткий провал помеченного
+     * трафика на ровном месте. Поэтому дампы в куче и любой длины. */
     char *rules = rules_dump(4);
-    if (!rules) { struct route_facts none; memset(&none, 0, sizeof(none)); return none; }
-    routes_show(o->table, routes, sizeof(routes));
-    struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+    char *routes = rules ? routes_dump(4, o->table) : NULL;
+    struct route_facts f;
+    if (rules && routes) f = route_facts_of(rules, routes, o->mark, o->table);
+    else memset(&f, 0, sizeof(f));
     free(rules);
+    free(routes);
     return f;
 }
 

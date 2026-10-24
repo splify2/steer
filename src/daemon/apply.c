@@ -34,6 +34,7 @@
 #include "fogroup.h"
 #include "fpseed.h"
 #include "recon.h"
+#include "nftdump.h"
 
 static void iptables_masq_drop_all(void);   /* ниже, у apply_routing */
 static int table_has_default(int table);    /* ниже, у apply-commit */
@@ -420,28 +421,13 @@ static void apply_routing(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) apply_routing_one(&sp->out[i]);
 }
 
-/* Стоит ли в ядре таблица «<семейство> <наша таблица>». Один `nft list tables` на процесс:
- * спрашивают о двух семействах подряд, а перечень таблиц за это время не меняется. Не смогли
- * спросить — «нет»: лишний `delete` отверг бы весь набор правил, а пропущенный оставляет
- * только чужую теперь таблицу, о которой скажет diag. */
+/* Стоит ли в ядре таблица «<семейство> <наша таблица>» — вопрос ядру по netlink (nfd_table_exists),
+ * а не разбор текста `nft list tables` в буфере: перечень таблиц на коробке с чужими firewall
+ * длиннее любого буфера, и обрезанный перечень выдавал бы стоящую таблицу за отсутствующую.
+ * Не смогли спросить — «нет»: лишний `delete` отверг бы весь набор правил, а пропущенный
+ * оставляет только чужую теперь таблицу, о которой скажет diag. */
 static int nft_table_exists(const char *fam) {
-    static char list[4096];
-    static int loaded;
-    if (!loaded) {
-        loaded = 1;
-        FILE *p = popen("nft list tables 2>/dev/null", "r");
-        if (p) {
-            size_t n = fread(list, 1, sizeof(list) - 1, p);
-            list[n] = '\0';
-            pclose(p);
-        }
-    }
-    char want[96];
-    snprintf(want, sizeof(want), "table %s %s", fam, nft_table());
-    size_t wn = strlen(want);
-    for (const char *q = list; (q = strstr(q, want)) != NULL; q += wn)
-        if ((q == list || q[-1] == '\n') && (q[wn] == '\n' || q[wn] == '\0')) return 1;
-    return 0;
+    return nfd_table_exists(!strcmp(fam, "ip6") ? NFD_IP6 : NFD_IP, nft_table());
 }
 
 /* ЧЕГО НЕ БУДЕТ НА СТАРОМ ЯДРЕ — вслух, при каждом apply в старой раскладке.
@@ -762,7 +748,7 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
      * отставала бы от резолвера. И наоборот, выход раскладки из ip6 (ядро перестало
      * принимать nat в ip6) не должен оставлять прежнюю таблицу. Отсутствующую таблицу
      * удалять нельзя — `delete` отверг бы весь файл, — поэтому для таблицы вне раскладки
-     * спрашиваем ядро, есть ли она (один `nft list tables` на apply). На роутере, где старой
+     * спрашиваем ядро, есть ли она. На роутере, где старой
      * раскладки не было никогда, файл остаётся прежним, байт в байт. */
     {
         static const char *const fams[2] = { "ip", "ip6" };

@@ -190,9 +190,10 @@ enum { MISS_R4 = 1, MISS_R6 = 2, MISS_BS6 = 4 };
  * «ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo»). rules и rules6 — дампы правил, уже прочитанные (rules6 пуст —
  * ядро без IPv6, и половина IPv6 не сверяется). -1 — ядро не спросить. */
 static int out_missing(const char *rules, const char *rules6, const struct output *o) {
-    static char routes[8192], routes6[8192];
-    if (rtnl_routes_text(o->table, routes, sizeof(routes)) != 0) return -1;
+    char *routes = rtnl_routes_dup(o->table, 0);
+    if (!routes) return -1;
     struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+    free(routes);
     if (!f.known) return -1;
     /* Таблица IPv4 занята — маршрут на устройство, запрет или запасной запрет. Пуста — правило
      * снято вместе с ней, и это наше решение (см. шапку). */
@@ -200,8 +201,10 @@ static int out_missing(const char *rules, const char *rules6, const struct outpu
     int miss = !f.rule && busy4 ? MISS_R4 : 0;
     /* С 1.9 у выхода с маршрутом IPv6 так же сверяется и его половина IPv6. */
     if (!out_route6(o) || !rules6[0]) return miss;
-    if (rtnl_routes_text6(o->table, routes6, sizeof(routes6)) != 0) return miss;
+    char *routes6 = rtnl_routes_dup(o->table, 1);
+    if (!routes6) return miss;
     struct route_facts f6 = route_facts_of(rules6, routes6, o->mark, o->table);
+    free(routes6);
     if (!f6.known) return miss;
     int busy6 = !(f6.table == TBL_EMPTY && !f6.backstop);
     /* Правило IPv6 обязано стоять, если выход ведёт трафик по IPv4 (правило IPv4 стоит или его
@@ -271,13 +274,14 @@ int rulewd_missing(const struct spec *sp, char *list, size_t n) {
 int rulewd_present(const struct spec *sp) {
     char *rules, *rules6;
     if (!sp || rules_read(&rules, &rules6) != 0) return -1;
-    static char routes[8192];
     int cnt = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         if (!out_has_device(o) || !o->mark || !o->table) continue;
-        if (rtnl_routes_text(o->table, routes, sizeof(routes)) != 0) continue;
+        char *routes = rtnl_routes_dup(o->table, 0);
+        if (!routes) continue;
         struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+        free(routes);
         if (f.known && f.rule) cnt++;
     }
     free(rules);

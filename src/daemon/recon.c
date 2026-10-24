@@ -231,9 +231,11 @@ enum { KR_OK, KR_REBIND, KR_WATCH };
 
 static int kernel_route(const struct spec *sp, const struct output *so, struct fo_store *outs,
                         const char *rules, const char *rules6, const char **why) {
-    static char routes[8192];
-    if (rtnl_routes_text(so->table, routes, sizeof(routes)) != 0) return KR_OK;
+    /* Дамп в куче любой длины: обрезанный читался бы как другая таблица выхода. */
+    char *routes = rtnl_routes_dup(so->table, 0);
+    if (!routes) return KR_OK;
     struct route_facts f = route_facts_of(rules, routes, so->mark, so->table);
+    free(routes);
     if (!f.known) return KR_OK;
     char rec[32];
     active_get_st(outs, so->name, rec, sizeof(rec));
@@ -266,9 +268,10 @@ static int kernel_route(const struct spec *sp, const struct output *so, struct f
         return KR_REBIND;
     }
     if (out_route6(so) && rules6[0]) {
-        static char routes6[8192];
-        if (rtnl_routes_text6(so->table, routes6, sizeof(routes6)) != 0) return KR_OK;
+        char *routes6 = rtnl_routes_dup(so->table, 1);
+        if (!routes6) return KR_OK;
         struct route_facts f6 = route_facts_of(rules6, routes6, so->mark, so->table);
+        free(routes6);
         if (!f6.known) return KR_OK;
         if (!f6.rule) { *why = "правила fwmark IPv6 нет"; return KR_REBIND; }
         /* При живом IPv4 половина IPv6 — маршрут в устройство или запрет (IPv6 на устройстве
@@ -657,9 +660,9 @@ static void kel_reset(void *arg) {
 }
 
 struct kel_sets {
-    struct nfd_set v[256];
-    size_t n;
-    int over;
+    struct nfd_set *v;
+    size_t n, cap;
+    int over;                       /* нет памяти под список наборов */
 };
 
 static void kel_set(void *arg, const struct nfd_set *s) {
@@ -669,18 +672,21 @@ static void kel_set(void *arg, const struct nfd_set *s) {
     /* Префикс хоста у донора IPv6: элементы ведёт сторож (v6donor_sync, failover.c) — выведенный
      * префикс меняется без смены спеки, и сверка считала бы каждое такое изменение чужой правкой. */
     if (!strcmp(s->name, V6DONOR_SET)) return;
-    if (c->n == sizeof(c->v) / sizeof(c->v[0])) { c->over = 1; return; }
+    if (c->over) return;
+    if (c->n == c->cap) {
+        size_t cap = c->cap ? c->cap * 2 : 64;
+        struct nfd_set *g = realloc(c->v, cap * sizeof(*g));
+        if (!g) { c->over = 1; return; }
+        c->v = g;
+        c->cap = cap;
+    }
     c->v[c->n++] = *s;
 }
 
-int recon_kernel_elems(uint64_t *sum, uint64_t *n) {
-    *sum = *n = 0;
-    static struct kel_sets sets;
-    memset(&sets, 0, sizeof(sets));
-    if (nfd_sets(nft_table(), kel_set, &sets) != 0 || sets.over) return -1;
+static int kernel_elems_of(const struct kel_sets *sets, uint64_t *sum, uint64_t *n) {
     uint64_t total = 0, total_n = 0;
-    for (size_t i = 0; i < sets.n; i++) {
-        const struct nfd_set *st = &sets.v[i];
+    for (size_t i = 0; i < sets->n; i++) {
+        const struct nfd_set *st = &sets->v[i];
         struct kel_sum s = { (st->flags & KEL_TIMEOUT) != 0, 0, 0 };
         /* Доменный набор пишет и резолвер — дамп, посреди которого прошла транзакция, заново
          * (шапка); три таких подряд — «не прочитать». */
@@ -704,6 +710,17 @@ int recon_kernel_elems(uint64_t *sum, uint64_t *n) {
     *sum = total;
     *n = total_n;
     return 0;
+}
+
+int recon_kernel_elems(uint64_t *sum, uint64_t *n) {
+    *sum = *n = 0;
+    struct kel_sets sets;
+    memset(&sets, 0, sizeof(sets));
+    int rc = nfd_sets(nft_table(), kel_set, &sets) != 0 || sets.over
+                 ? -1 : kernel_elems_of(&sets, sum, n);
+    free(sets.v);
+    if (rc) *sum = *n = 0;
+    return rc;
 }
 
 /* Строка ребёнка apply-commit: `recon-kernel НОМЕР ОТПЕЧАТОК СВОДКА ЧИСЛО` (шестнадцатеричные,
