@@ -912,6 +912,29 @@ rules:
 EOF
 accepted "ipv6: off у группы"
 
+# ---- R-050: «РФ напрямую, всё остальное в туннель» — порядок правил, отдельного ключа нет ------
+# Правило выше сильнее: список РФ в direct встаёт первым и заканчивает разбор пакета без метки,
+# `to: all` ниже получает остальное.
+printf '203.0.113.0/24\n' > "$tmp/ru.lst"
+y <<'EOF'
+version: 2
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+lists:
+  ru: { prefixes_file: TMP/ru.lst }
+outputs:
+  direct: { kind: direct }
+  wg0: { kind: interface, device: wg0 }
+rules:
+  - { name: ru-direct, to: [ru], out: direct }
+  - { name: rest, to: all, out: wg0 }
+EOF
+accepted "инверсный режим: РФ напрямую, остальное в туннель"
+out="$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"
+l1="$(echo "$out" | grep -n 'ip daddr @direct_ip counter return comment "steer:direct_ip"' | head -n 1 | cut -d: -f1)"
+l2="$(echo "$out" | grep -n 'meta mark set .* comment "steer:wg0_all"' | head -n 1 | cut -d: -f1)"
+if [ -n "$l1" ] && [ -n "$l2" ] && [ "$l1" -lt "$l2" ]; then ok; else
+    bad "инверсный режим — direct для РФ раньше метки to: all" "$(echo "$out" | grep -n 'steer:' | head -n 6)"; fi
+
 echo "v2match: разбор v2 — $pass проверок прошли"
 if [ "$fail" -gt 0 ]; then echo "v2match: ПРОВАЛЕНО $fail"; exit 1; fi
 exit 0
