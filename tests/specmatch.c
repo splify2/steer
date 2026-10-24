@@ -821,6 +821,24 @@ int main(void) {
         check("xsteer: базовая сборка отвергает вид", 2, load_from_str(s));
 #endif
     }
+#ifdef SPECMATCH_EXT
+    {
+        /* Число приводилось к int ДО проверки диапазона: 4294967739 (= 2^32 + 443) становилось портом 443,
+         * а 4294967297 — номером узла 1. Отказ обязан быть и на значении за границей long→int. */
+        check("v1 stream_port 443 — принят", 0, load_from_str(SPEC(
+            "\"outputs\":{\"x\":{\"kind\":\"xsteer\",\"stream\":true,\"stream_port\":443}},\"channels\":[]}")));
+        check("v1 stream_port 65536 — отказ", 2, load_from_str(SPEC(
+            "\"outputs\":{\"x\":{\"kind\":\"xsteer\",\"stream\":true,\"stream_port\":65536}},\"channels\":[]}")));
+        check("v1 stream_port 4294967739 — отказ", 2, load_from_str(SPEC(
+            "\"outputs\":{\"x\":{\"kind\":\"xsteer\",\"stream\":true,\"stream_port\":4294967739}},\"channels\":[]}")));
+        check("v1 node 2 — принят", 0, load_from_str(SPEC(
+            "\"outputs\":{\"x\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\",\"node\":2}},\"channels\":[]}")));
+        check("v1 node 4294967297 — отказ", 2, load_from_str(SPEC(
+            "\"outputs\":{\"x\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\",\"node\":4294967297}},\"channels\":[]}")));
+        check("v1 node 2147483648 — отказ", 2, load_from_str(SPEC(
+            "\"outputs\":{\"x\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\",\"node\":2147483648}},\"channels\":[]}")));
+    }
+#endif
     {
         /* То же обещание для vless — до второго бинарника оно не проверялось нигде. */
         const char *s = SPEC(
