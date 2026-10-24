@@ -215,6 +215,10 @@ int transport_aux_drain(struct transport *c) {
     return g_aux_rc;
 }
 long transport_room(struct transport *c) { (void)c; return g_room; }
+/* Живая запись (I-534): у подмены сокета нет — держать нечего. */
+void transport_live(struct transport *c) { (void)c; }
+size_t transport_out_pending(const struct transport *c) { (void)c; return 0; }
+int transport_out_flush(struct transport *c) { (void)c; return 0; }
 /* Принимает ли транспорт запись любой длины (xhttp packet-up). */
 static int g_big_write;
 int transport_big_write(const struct transport *c) { (void)c; return g_big_write; }
@@ -2968,6 +2972,36 @@ static void t_tun_wq(void) {
     dev_drain(NULL);
 }
 
+/* I-534: слушатель при нехватке дескрипторов. accept4 отвечает EMFILE, а слушатель по уровню остаётся готовым —
+ * цикл крутился бы без остановки. kaccept теперь сообщает об этом (-1), и цикл снимает слушателя с epoll на
+ * LST_PAUSE_MS; при обычных исходах (нет соединений) — 0, и слушатель стоит. */
+static void t_accept_emfile(void) {
+    int l = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET };
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (l < 0 || bind(l, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(l, 8) != 0 ||
+        getsockname(l, (struct sockaddr *)&sa, &sl) != 0) { check(0, "I-534: стенд — слушатель"); return; }
+    check(kaccept(l, &g_tun) == 0, "I-534: нет ожидающих соединений — kaccept вернул 0, слушатель остаётся в наборе");
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0 || connect(c, (struct sockaddr *)&sa, sizeof sa) != 0) { check(0, "I-534: стенд — клиент"); return; }
+    struct rlimit old;
+    getrlimit(RLIMIT_NOFILE, &old);
+    struct rlimit lo = old;
+    lo.rlim_cur = 128;
+    int full[128], nfull = 0;
+    if (lo.rlim_cur <= old.rlim_max) {
+        setrlimit(RLIMIT_NOFILE, &lo);
+        for (int fd; nfull < 128 && (fd = dup(0)) >= 0;) full[nfull++] = fd;
+    }
+    int rc = kaccept(l, &g_tun);
+    for (int i = 0; i < nfull; i++) close(full[i]);
+    setrlimit(RLIMIT_NOFILE, &old);
+    check(rc == -1, "I-534: дескрипторов нет (EMFILE) — kaccept вернул -1, соединение остаётся в очереди ядра");
+    close(c);
+    close(l);
+}
+
 /* I-535: проба кандидатов наперегонки. Мёртвые узлы молчат до срока (здесь 2 с — вместо 8), живой отвечает
  * за 50 мс. Последовательный перебор отдал бы 4 × 2 с + 50 мс, гонка — задержку запуска пятого (4 × 250 мс). */
 struct race_t { int alive_from; int alive_ms; int dead_ms; };
@@ -3037,6 +3071,7 @@ int main(void) {
     t_connectors_burst();
     t_race();
     t_tun_wq();
+    t_accept_emfile();
     t_table_grow();
     t_tcp_tun_rst();
     t_bring_up_table();

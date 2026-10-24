@@ -49,6 +49,9 @@ long transport_room(struct transport *t) {
     long r = g_win - (long)(g_tx_n - g_win_base);
     return r > 0 ? r : 0;
 }
+void transport_live(struct transport *t) { (void)t; }
+size_t transport_out_pending(const struct transport *t) { (void)t; return 0; }
+int transport_out_flush(struct transport *t) { (void)t; return 0; }
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     (void)t;
     size_t k = g_rx_n - g_rx_off;
@@ -802,6 +805,51 @@ static void test_big_dgram(void) {
     }
 }
 
+/* I-534: живая запись socks5 TCP. Без неё send ждал сокет узла до срока; теперь, когда узел не читает, данные уходят в
+ * очередь сессии, вызов возвращается сразу, room сужается (обратное давление), а flush дошлёт остаток по порядку. */
+static void test_socks_live(void) {
+    const struct dialer_ops *ops = &proxy_socks_dialer;
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return;
+    unsigned char rep[] = { 5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };   /* метод без авторизации, ответ CONNECT */
+    if (write(sp[1], rep, sizeof rep) != (ssize_t)sizeof rep) return;
+    g_tcp_fd = sp[0];
+    struct px_node n; memset(&n, 0, sizeof n);
+    n.proto = PX_SOCKS; n.socks_ver = 5;
+    void *sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    struct flow_key k; memset(&k, 0, sizeof k);
+    ops->flow_open(&n, sess, &k, 0);
+    int rc = ops->connect(&n, sess, 2);
+    g_tcp_fd = -1;
+    unsigned char first[64];
+    (void)!read(sp[1], first, sizeof first);                     /* приветствие и CONNECT, уже ушедшие */
+    check("socks live: стенд — связь с узлом открыта", 0, rc);
+    int small = 4096;
+    setsockopt(ops->fd(sess), SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    setsockopt(sp[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+    static unsigned char blob[1 << 20];
+    for (size_t i = 0; i < sizeof blob; i++) blob[i] = (unsigned char)(i * 29 + 5);
+    ops->live(sess);
+    check("socks live: до записи очередь пуста, места без предела", 1, ops->out_pending(&n, sess) == 0 && ops->room(&n, sess) == -1);
+    check("socks live: мегабайт принят сразу (SEND_OK), узел не читает", SEND_OK, ops->send(&n, sess, &k, 0, blob, sizeof blob));
+    check("socks live: остаток в очереди сессии", 1, ops->out_pending(&n, sess) > (1 << 20) - 100000);
+    check("socks live: места нет (очередь больше порога) — обратное давление", 0, ops->room(&n, sess));
+    /* Узел читает — слив: байты в том же порядке. */
+    static unsigned char rx[1 << 20];
+    size_t off = 0;
+    for (int round = 0; round < 200000 && off < sizeof rx; round++) {
+        ssize_t r = recv(sp[1], rx + off, sizeof rx - off, MSG_DONTWAIT);
+        if (r > 0) off += (size_t)r;
+        if (ops->out_pending(&n, sess)) ops->out_flush(&n, sess);
+    }
+    check("socks live: слив — все байты, в том же порядке", 1, off == sizeof rx && !memcmp(rx, blob, sizeof rx));
+    check("socks live: очередь пуста, место снова без предела", 1, ops->out_pending(&n, sess) == 0 && ops->room(&n, sess) == -1);
+    ops->close(sess);
+    free(sess);
+    close(sp[1]);
+}
+
 int main(void) {
     test_ss_first_tail();
     test_ss_again_nonce();
@@ -815,6 +863,7 @@ int main(void) {
     test_http_early_bytes();
     test_trojan_udp();
     test_big_dgram();
+    test_socks_live();
     test_http_long_auth();
     return unit_done("pxdialmatch");
 }

@@ -245,6 +245,22 @@ static int tj_deliver(const void *ctx, void *sess, int udp, const unsigned char 
     return got ? tj_udp_down(s, rx, got, emit, arg) : 0;
 }
 
+/* Место у узла: у голого транспорта предела нет, пока очередь живой записи не набралась (обратное давление, I-534). */
+static long tj_room(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_room(&((struct trojan_sess *)sess)->t);
+}
+/* Живая запись (dialer_ops.live, out_pending, out_flush; I-534). */
+static void tj_live(void *sess) { transport_live(&((struct trojan_sess *)sess)->t); }
+static size_t tj_out_pending(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_out_pending(&((struct trojan_sess *)sess)->t);
+}
+static int tj_out_flush(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_out_flush(&((struct trojan_sess *)sess)->t);
+}
+
 const struct dialer_ops proxy_trojan_dialer = {
     .name = "trojan",
     .caps = DC_PRECONNECT,
@@ -254,4 +270,5 @@ const struct dialer_ops proxy_trojan_dialer = {
     .fd = tj_fd, .has_data = tj_has_data,
     .flow_open = tj_flow_open, .send = tj_send, .dgram_frame = tj_dgram_frame, .dgram_max = UDP_DGRAM_ABS,
     .read = tj_read, .deliver = tj_deliver,
+    .room = tj_room, .live = tj_live, .out_pending = tj_out_pending, .out_flush = tj_out_flush,
 };

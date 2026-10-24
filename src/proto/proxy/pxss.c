@@ -528,6 +528,22 @@ static int ss_deliver(const void *ctx, void *sess, int udp, const unsigned char 
     return got ? ss_tcp_down(ctx, s, rx, got, emit, arg) : 0;
 }
 
+/* Место у узла: у голого транспорта предела нет, пока очередь живой записи не набралась (обратное давление, I-534). */
+static long ss_room(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_room(&((struct ss_sess *)sess)->t);
+}
+/* Живая запись (dialer_ops.live, out_pending, out_flush; I-534). */
+static void ss_live(void *sess) { if (((struct ss_sess *)sess)->udpfd < 0) transport_live(&((struct ss_sess *)sess)->t); }
+static size_t ss_out_pending(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_out_pending(&((struct ss_sess *)sess)->t);
+}
+static int ss_out_flush(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_out_flush(&((struct ss_sess *)sess)->t);
+}
+
 const struct dialer_ops proxy_ss_dialer = {
     .name = "shadowsocks",
     .caps = DC_UDP_OWN,
@@ -537,4 +553,5 @@ const struct dialer_ops proxy_ss_dialer = {
     .fd = ss_fd, .has_data = ss_has_data,
     .flow_open = ss_flow_open, .send = ss_send, .dgram_frame = ss_dgram_frame, .dgram_max = SS_DGRAM_MAX,
     .read = ss_read, .deliver = ss_deliver,
+    .room = ss_room, .live = ss_live, .out_pending = ss_out_pending, .out_flush = ss_out_flush,
 };

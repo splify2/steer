@@ -952,6 +952,24 @@ static long pl_room(const void *ctx, void *sess) {
     return g_pl.in->room(s->node, INNER(s));
 }
 
+/* Живая запись (dialer_ops.live/out_pending/out_flush, I-534) — узлу сессии. */
+static void pl_live(void *sess) {
+    struct pl_sess *s = sess;
+    if (s->node) g_pl.in->live(INNER(s));
+}
+
+static size_t pl_out_pending(const void *ctx, void *sess) {
+    (void)ctx;
+    struct pl_sess *s = sess;
+    return s->node ? g_pl.in->out_pending(s->node, INNER(s)) : 0;
+}
+
+static int pl_out_flush(const void *ctx, void *sess) {
+    (void)ctx;
+    struct pl_sess *s = sess;
+    return s->node ? g_pl.in->out_flush(s->node, INNER(s)) : 0;
+}
+
 static size_t pl_up_max(const void *ctx, void *sess) {
     (void)ctx;
     struct pl_sess *s = sess;
@@ -1107,6 +1125,9 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.flow_open = pl_flow_open;
     g_pl_ops.send = pl_send;
     g_pl_ops.room = pl_room;
+    g_pl_ops.live = g_pl.in->live ? pl_live : NULL;
+    g_pl_ops.out_pending = g_pl.in->out_pending ? pl_out_pending : NULL;
+    g_pl_ops.out_flush = g_pl.in->out_flush ? pl_out_flush : NULL;
     g_pl_ops.up_max = g_pl.in->up_max ? pl_up_max : NULL;
     g_pl_ops.dgram_frame = pl_dgram_frame;
     g_pl_ops.read = pl_read;

@@ -241,6 +241,8 @@ void tls13_keys_free(struct tls13_keys *k) {
  * флаг готовности значит «пусто» (sc_hash_free, sc_aead_free ничего не делают), а освобождение
  * этот признак снова обнуляет. */
 void tls13_free(struct tls13 *t) {
+    outq_free(&t->oq);
+    t->live = 0;
     tls13_keys_free(&t->rd);
     tls13_keys_free(&t->wr);
     /* Ключ и iv трафика — секреты на всё время соединения; освободить контекст шифра мало: массивы
@@ -857,6 +859,13 @@ int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) {
                       out + 5 + chunk + 1) != 0)
             return TLS13_ECRYPTO;
         size_t want = 5 + total, sent = 0;
+        if (t->live) {
+            /* Живая связь: сокет не ждём (outq_send), непринятое — в очередь (I-534). */
+            if (outq_send(t->fd, &t->oq, out, want) != 0) return TLS13_EIO;
+            data += chunk;
+            n -= chunk;
+            continue;
+        }
         while (sent < want) {
             ssize_t w = write(t->fd, out + sent, want - sent);
             if (w <= 0) {

@@ -138,6 +138,34 @@ class Handler(socketserver.BaseRequestHandler):
                 pass
             return
 
+        # Порт 10 — узел, который не читает: первые --stall-s секунд данные клиента не забираются (буфер сокета
+        # узла и очередь живой записи туннеля заполняются), потом всё вычитывается. Первые 8 байт данных — число
+        # байт выгрузки (VLESS не передаёт закрытие половины, и конца выгрузки узлу иначе не узнать); в ответ — число
+        # принятых байт и SHA-256 остальных. Нужен стенду tests/run-tunnel-bp.sh (I-534): медленный узел не должен
+        # останавливать остальные соединения процесса, а данные — доходить целиком.
+        if port == 10:
+            import hashlib
+            import struct
+            try:
+                sock.sendall(b"\x00\x00")
+                time.sleep(self.server.stall_s)
+                head = recv_exactly(sock, 8)
+                if head is None:
+                    return
+                want = struct.unpack(">Q", head)[0]
+                total, h = 0, hashlib.sha256()
+                while total < want:
+                    chunk = sock.recv(min(65536, want - total))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    h.update(chunk)
+                sock.sendall(("GOT %d %s\n" % (total, h.hexdigest())).encode())
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            return
+
         # Порт 8 — потоковое эхо: каждый принятый байт сразу уходит обратно, пока клиент не закроет
         # свою половину. Нужен стенду нескольких рабочих потоков (tests/run-tunnel-mt.sh, R-146):
         # клиент шлёт и читает ОДНОВРЕМЕННО, и проверяется весь объём байт в байт в обе стороны — то есть
@@ -325,6 +353,7 @@ def main():
     ap.add_argument("--bind", default="127.0.0.1", help="адрес слушателя (IPv4 или IPv6)")
     ap.add_argument("--kbps", type=int, default=0, help="предел отдачи, КБ/с (0 — без предела)")
     ap.add_argument("--delay-ms", type=int, default=0, help="задержка ответа на каждый запрос, мс")
+    ap.add_argument("--stall-s", type=float, default=3.0, help="порт 10: сколько секунд узел не читает данные клиента")
     ap.add_argument("--log", action="store_true", help="печатать каждый принятый запрос")
     ap.add_argument("--udp-relay", action="store_true",
                     help="UDP (команда 2) пересылать по адресу из запроса, а не эхом")
@@ -340,6 +369,7 @@ def main():
     srv.udp_relay = a.udp_relay
     srv.kbps = a.kbps
     srv.delay_ms = a.delay_ms
+    srv.stall_s = a.stall_s
     srv.log = a.log
     # Наполнитель фиксированный: содержимое стенду безразлично, а генерация 64 КБ на
     # каждую порцию упиралась в питон, а не в туннель.

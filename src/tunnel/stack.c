@@ -93,6 +93,8 @@
 /* Сколько событий epoll забираем за виток: не число соединений, а порция — остальное ядро отдаст
  * следующим вызовом (готовые держатся в списке готовности). */
 #define EV_BATCH 512
+/* На сколько снимается слушатель, когда кончились дескрипторы (kaccept). */
+#define LST_PAUSE_MS 100
 
 /* Сколько секунд соединение должно молчать, чтобы его разрешили вытеснить.
  *
@@ -1593,6 +1595,17 @@ static long conn_room(const struct conn *c) {
     return g_dl->ops->room(g_dl->ctx, SESS(c));
 }
 
+/* Связь соединения отдана циклу: запись узлу больше не ждёт сокета (dialer_ops.live, I-534). */
+static void conn_live(struct conn *c) {
+    if (g_dl->ops->live) g_dl->ops->live(SESS(c));
+}
+
+/* Сколько байт связь ещё не отправила узлу (dialer_ops.out_pending). */
+static size_t conn_out_pending(const struct conn *c) {
+    if (c->fd < 0 || !g_dl->ops->out_pending) return 0;
+    return g_dl->ops->out_pending(g_dl->ctx, SESS(c));
+}
+
 /* Сколько байт клиента соединения c собирается в одну отправку (см. dialer_ops.up_max). Пока
  * соединение не готово или дайлер не называет большего — UP_MAX: место дайлера под заголовок и
  * кадр Vision. */
@@ -2159,6 +2172,7 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
          * (dialer.h). */
         if (g_spare_want > 0 && !(g_dl->ops->caps & DC_UDP_OWN) && spare_checkout(SESS(c)) == 0) {
             c->fd = g_dl->ops->fd(SESS(c));
+            conn_live(c);
             node_sock_silence(c->fd);
             TR("UDP: взята запасная сессия\n");
         } else if ((qr = conn_submit(c)) == 0) {
@@ -2506,6 +2520,7 @@ static int conn_ready(struct conn *c, const struct tun_dev *tun) {
         conn_reset(c, tun);
         return 1;
     }
+    conn_live(c);
     /* Пока шло рукопожатие, узел соединения перестал быть активным (заменён): нести через
      * него нечего, клиент переподключится к живому. */
     if (d->stale && d->stale(g_dl->ctx, SESS(c))) {
@@ -2899,6 +2914,7 @@ static struct conn *conn_accept(int fd, const struct flow_key *k, const struct t
     if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), &key, 0) != 0) { conn_reset(c, tun); return NULL; }
     if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
         c->fd = g_dl->ops->fd(SESS(c));
+        conn_live(c);
         node_sock_silence(c->fd);
         spare_refill();
         return c;
@@ -2923,17 +2939,20 @@ static struct conn *conn_accept(int fd, const struct flow_key *k, const struct t
  * отдаёт сокет почтой: дескриптор общий для процесса, цена — замок и побудка на соединение, а не на байт. */
 static unsigned g_accept_rr;
 
-/* Принять перенаправленные соединения: до 64 за событие, остальные — следующим витком. */
-static void kaccept(int lfd, const struct tun_dev *tun) {
+/* Принять перенаправленные соединения: до 64 за событие, остальные — следующим витком. -1 — кончились
+ * дескрипторы процесса или системы (EMFILE, ENFILE): слушатель по уровню будил бы цикл на каждом витке впустую,
+ * поэтому вызывающий снимает его с epoll на время (I-534), а соединения тем временем ждут в очереди ядра. */
+static int kaccept(int lfd, const struct tun_dev *tun) {
     for (int k = 0; k < 64; k++) {
         int fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (fd < 0) return;
+        if (fd < 0) return errno == EMFILE || errno == ENFILE ? -1 : 0;
         if (g_rw && g_nwork > 1) {
             unsigned t = __atomic_fetch_add(&g_accept_rr, 1, __ATOMIC_RELAXED) % g_nwork;
             if (t != (unsigned)g_worker && xmail_fd(t, fd) == 0) continue;
         }
         kaccept_fd(fd, tun);
     }
+    return 0;
 }
 
 /* Прочитать у клиента и отдать узлу (R-152). Сокет — по фронту: читаем, пока не EAGAIN (тогда CRD снят), или
@@ -3119,6 +3138,7 @@ static void *worker_loop(void *arg) {
     if (rw) rw->ring.efd = efd;
     struct epoll_event evs[EV_BATCH];
     int tun_out = 0;            /* на устройстве стоит EPOLLOUT: в очереди записи (tun.c) есть пакеты */
+    uint64_t lst_paused = 0;    /* слушатель снят с epoll (кончились дескрипторы) с этого момента, нс; 0 — стоит */
     g_ep = ep;
     /* Дайлер встаёт в цикл ДО state: его сокет должен стоять в epoll к первому витку, а соединение с
      * узлом — подниматься, пока рабочий ещё ничего не несёт. */
@@ -3183,7 +3203,7 @@ static void *worker_loop(void *arg) {
              * нечего ставить: события потока приходят из loop_poll (stack_sess_rx). EPOLLOUT (по уровню) — только
              * пока узел не принял данные клиента сокета: SEND_AGAIN у дайлера без своего окна (room -1, сокет
              * узла полон) ждёт записи узла событием, а не опросом (R-152). */
-            unsigned arm = ARM_IN | (c->cfd1 && c->early && conn_room(c) < 0 ? ARM_OUT : 0u);
+            unsigned arm = ARM_IN | (((c->cfd1 && c->early && conn_room(c) < 0) || conn_out_pending(c)) ? ARM_OUT : 0u);
             if (!g_inloop && arm != c->armed) {
                 struct epoll_event e = { .events = EPOLLIN | EPOLLET | (arm & ARM_OUT ? EPOLLOUT : 0u),
                                          .data = { .u32 = (uint32_t)(c - g_conns) } };
@@ -3250,6 +3270,18 @@ static void *worker_loop(void *arg) {
             else if (spsc_sleep_begin(&rw->ring)) sleeping = 1;
             else wait_ms = 0;
         }
+        /* Слушатель, снятый за нехваткой дескрипторов, возвращается через LST_PAUSE_MS: к тому времени
+         * закрытые соединения вернули часть номеров. Пока снят — цикл просыпается к этому сроку. */
+        if (lst_paused) {
+            uint64_t el = (now_ns() - lst_paused) / 1000000ull;
+            if (el >= LST_PAUSE_MS) {
+                struct epoll_event le = { .events = EPOLLIN, .data = { .u32 = TOK_LST } };
+                if (epoll_ctl(ep, EPOLL_CTL_MOD, lfd, &le) == 0) lst_paused = 0;
+                else lst_paused = now_ns();
+            } else if ((int)(LST_PAUSE_MS - el) < wait_ms) {
+                wait_ms = (int)(LST_PAUSE_MS - el);
+            }
+        }
         /* Очередь записи в устройство (tun.c, I-534): датаграмму, которую устройство не приняло, цикл не
          * ждёт, а доставит, когда оно освободится. Пока очередь не пуста — на устройстве стоит EPOLLOUT. */
         if (tun_wq_pending()) tun_wq_flush();
@@ -3315,7 +3347,20 @@ static void *worker_loop(void *arg) {
         int tun_ready = own_tun && tun_buffered(&tun);
         for (int i = 0; i < r; i++) {
             if (evs[i].data.u32 == TUN_TOKEN) tun_ready = 1;
-            else if (evs[i].data.u32 == LST_TOKEN && lfd >= 0) kaccept(lfd, &tun);
+            else if (evs[i].data.u32 == LST_TOKEN && lfd >= 0) {
+                if (kaccept(lfd, &tun) < 0 && !lst_paused) {
+                    /* Снять слушателя с epoll до LST_PAUSE_MS: принимать нечем, а будить цикл незачем. */
+                    struct epoll_event le = { .events = 0, .data = { .u32 = TOK_LST } };
+                    if (epoll_ctl(ep, EPOLL_CTL_MOD, lfd, &le) == 0) lst_paused = g_now_ns;
+                    static __thread time_t said_fd;
+                    if (g_now_s - said_fd >= 10) {
+                        said_fd = g_now_s;
+                        fprintf(stderr, LOG_W "кончились дескрипторы процесса (%zu соединений у потока) — новые "
+                                        "соединения ждут в очереди ядра; поднимите предел открытых файлов (ulimit -n)\n",
+                                g_nslots);
+                    }
+                }
+            }
             else if (evs[i].data.u32 == EFD_TOKEN && efd >= 0) {
                 uint64_t drained;
                 ssize_t rd = read(efd, &drained, sizeof(drained));
@@ -3432,6 +3477,14 @@ static void *worker_loop(void *arg) {
              * чужое событие, читало свежую связь — блокирующую и пока пустую — и весь цикл
              * вставал на срок соединения. */
             if (!c->used || c->pending || c->born_turn == g_turn) continue;
+            /* Узел снова принимает запись: дослать то, что связь держит в очереди (живая запись, I-534). Отказ —
+             * связь сломана, как при отказе send. */
+            if ((evs[i].events & EPOLLOUT) && g_dl->ops->out_flush && c->fd >= 0 &&
+                g_dl->ops->out_flush(g_dl->ctx, SESS(c)) < 0) {
+                conn_node_lost(c);
+                conn_reset(c, &tun);
+                continue;
+            }
             /* Только запись: узел снова принимает — ранние данные досылает проход сроков (conn_deadlines). */
             if (!(evs[i].events & ~(uint32_t)EPOLLOUT)) continue;
             /* Уже прочитанное разбирает второй проход ниже — здесь пропускаем, чтобы одно

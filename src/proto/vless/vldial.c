@@ -711,6 +711,17 @@ static size_t vl_up_max(const void *ctx, void *sess) {
     return transport_big_write(&s->t) ? TUNNEL_GATHER_MAX : 0;
 }
 
+/* Живая запись (dialer_ops.live, out_pending, out_flush; I-534). */
+static void vl_live(void *sess) { transport_live(&((struct vl_sess *)sess)->t); }
+static size_t vl_out_pending(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_out_pending(&((struct vl_sess *)sess)->t);
+}
+static int vl_out_flush(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_out_flush(&((struct vl_sess *)sess)->t);
+}
+
 const struct dialer_ops vless_dialer = {
     .name = "vless",
     .caps = DC_PRECONNECT,
@@ -729,6 +740,9 @@ const struct dialer_ops vless_dialer = {
     .flow_open = vl_flow_open,
     .send = vl_send,
     .room = vl_room,
+    .live = vl_live,
+    .out_pending = vl_out_pending,
+    .out_flush = vl_out_flush,
     .up_max = vl_up_max,
     .dgram_frame = vl_dgram_frame,
     .dgram_max = VL_DGRAM_UP,
