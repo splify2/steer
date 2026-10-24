@@ -16,15 +16,17 @@
 # ни один сокет клиента не должен остаться в LAST-ACK.
 #
 # Использование: tests/run-tunnel-fin.sh   (нужен root: своё сетевое пространство)
-#   STEER=<бинарник>      по умолчанию ./build/steer-ext-check
+#   STEER=<бинарник>      по умолчанию ./build/libs-host/steerd
 #   TRACE=1               журнал разбора пакетов туннеля (печатается при провале)
 #   STEER_PRELOAD=<.so>   подгрузить в движок библиотеку — для сборки на glibc, где потокам
 #                         установщика не хватает стека под __thread-буферы (см. отчёт I-319)
 set -eu
 cd "$(dirname "$0")/.."
 
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${STEER:-./build/libs-host/steerd}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
+# steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
+LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 
 NS=steer-tunfin
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
