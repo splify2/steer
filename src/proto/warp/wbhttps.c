@@ -120,11 +120,24 @@ static int parse_resp(char *buf, size_t n, int *status, size_t *body_off, size_t
         if (r >= n) break;
         char *nl = memchr(buf + r, '\n', n - r);
         if (!nl) break;
-        size_t len = strtoul(buf + r, NULL, 16);
+        /* Размер — шестнадцатеричные цифры без знака (до «;расширения» или CRLF). strtoul принимал «-1» и
+         * ULONG_MAX, а сумма r + len переполнялась и пропускала memmove с размером 2^64-1. Число сверх
+         * длины буфера — заведомо не кусок этого ответа, разбор на этом кончается. */
+        size_t len = 0;
+        int nd = 0, bad = 0;
+        for (const char *p = buf + r; p < nl; p++) {
+            int dv = *p >= '0' && *p <= '9' ? *p - '0' : *p >= 'a' && *p <= 'f' ? *p - 'a' + 10
+                   : *p >= 'A' && *p <= 'F' ? *p - 'A' + 10 : -1;
+            if (dv < 0) break;
+            if (len > n) { bad = 1; break; }
+            len = len * 16 + (size_t)dv;
+            nd++;
+        }
         r = (size_t)(nl - buf) + 1;
-        if (!len || r + len > n) break;
+        if (bad || !nd || !len || len > n - r) break;
         memmove(buf + w, buf + r, len);
         w += len;
+        /* + 2 — CRLF после данных; len <= n - r, поэтому r не уйдёт за n больше чем на 2, а цикл проверяет r >= n. */
         r += len + 2;
     }
     *body_n = w - hoff;
