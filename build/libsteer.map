@@ -195,6 +195,9 @@ LIBSTEER_1 {
     probe_source;
     proc_cmdline_find;
     prof;
+    puff_stream_done;
+    puff_stream_init;
+    puff_stream_read;
     qc_close;
     qc_datagram_max;
     qc_datagram_send;

@@ -53,6 +53,7 @@
 #include "hwid.h"
 #include "jsonw.h"
 #include "run.h"
+#include "puff.h"
 
 /* Уровень в журнале — как в остальных файлах движка. Метка подсистемы «sub»: всё здесь
  * пишется при работе с подпиской. */
@@ -436,6 +437,95 @@ static int have(const char *name) {
 #endif
 #define SUB_UA "steer/" STEER_VERSION
 
+/* GZIP, О КОТОРОМ НЕ ПРОСИЛИ.
+ *
+ * Мы не посылаем Accept-Encoding, и по HTTP это значит «тело как есть». Но панель бывает за
+ * nginx с `gzip_static always` или с прокси, которые сжимают всем подряд: снято на живой
+ * подписке (панель за nginx 1.24) — тело приходит gzip с `Content-Encoding: gzip`
+ * при любом запросе, и curl без --compressed кладёт в файл сжатые байты. Разбор видел в них
+ * ноль узлов, человек — «подписка пустая», хотя Happ и v2rayNG с той же ссылкой работают.
+ *
+ * Распаковываем по сигнатуре в самом файле, а не просим curl (--compressed): uclient-fetch и
+ * busybox wget распаковывать не умеют вовсе, а заголовка ответа у них нет, так что смотреть
+ * больше не на что. Подписка в gzip законной быть не может — base64, ссылки, JSON и YAML
+ * начинаются не с 1f 8b, — поэтому ложного срабатывания на настоящем теле нет.
+ *
+ * Сверяется всё, что даёт обёртка (RFC 1952): метод, длина и CRC-32 распакованного. Битый
+ * gzip — отказ, а не «что распаковалось»: половина подписки означала бы половину узлов. */
+static unsigned long crc32_add(unsigned long c, const unsigned char *p, size_t n) {
+    c = ~c & 0xffffffffUL;
+    while (n--) {
+        c ^= *p++;
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xedb88320UL & (0UL - (c & 1)));
+    }
+    return ~c & 0xffffffffUL;
+}
+
+/* 0 — файл не gzip или распакован на месте; -1 — gzip испорчен или не записался. */
+static int gunzip_inplace(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char sig[3];
+    size_t got = fread(sig, 1, sizeof sig, f);
+    if (got < 3 || sig[0] != 0x1f || sig[1] != 0x8b) { fclose(f); return 0; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 18 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return -1; }
+    unsigned char *z = malloc((size_t)sz);
+    if (!z) { fclose(f); return -1; }
+    size_t n = fread(z, 1, (size_t)sz, f);
+    fclose(f);
+    if (n != (size_t)sz || z[2] != 8) { free(z); return -1; }   /* 8 — deflate, другого нет */
+
+    /* Заголовок: 10 байт и необязательные поля по флагам. */
+    unsigned flg = z[3];
+    size_t off = 10;
+    if (flg & 4) {                                   /* FEXTRA */
+        if (off + 2 > n) { free(z); return -1; }
+        off += 2 + (size_t)(z[off] | (z[off + 1] << 8));
+    }
+    for (unsigned bit = 8; bit <= 16; bit <<= 1)     /* FNAME, FCOMMENT: строки до нуля */
+        if (flg & bit) {
+            while (off < n && z[off]) off++;
+            off++;
+        }
+    if (flg & 2) off += 2;                           /* FHCRC */
+    if (off + 8 > n) { free(z); return -1; }
+
+    struct puff_stream *ps = malloc(sizeof *ps);
+    unsigned char *buf = malloc(16384);
+    char out[520];
+    snprintf(out, sizeof out, "%s.gz", path);
+    FILE *o = (ps && buf) ? fopen(out, "wb") : NULL;
+    int ok = 0;
+    if (o) {
+        puff_stream_init(ps, z + off, (unsigned long)(n - off - 8));
+        unsigned long crc = 0, total = 0;
+        long k;
+        ok = 1;
+        while ((k = puff_stream_read(ps, buf, 16384)) > 0) {
+            crc = crc32_add(crc, buf, (size_t)k);
+            total += (unsigned long)k;
+            if (fwrite(buf, 1, (size_t)k, o) != (size_t)k) { ok = 0; break; }
+        }
+        /* Хвост — сразу за последним байтом потока: CRC-32 и длина по модулю 2^32. */
+        const unsigned char *t = z + off + ps->incnt;
+        if (ok && (k < 0 || !puff_stream_done(ps) || t + 8 > z + n ||
+                   (t[0] | t[1] << 8 | t[2] << 16 | (unsigned long)t[3] << 24) != crc ||
+                   (t[4] | t[5] << 8 | t[6] << 16 | (unsigned long)t[7] << 24) != (total & 0xffffffffUL)))
+            ok = 0;
+        if (fclose(o) != 0) ok = 0;
+        if (ok && rename(out, path) != 0) ok = 0;
+        if (!ok) unlink(out);
+    }
+    free(buf); free(ps); free(z);
+    if (!ok) {
+        fprintf(stderr, LOG_W "панель прислала испорченный gzip: %s\n", path);
+        return -1;
+    }
+    return 0;
+}
+
 /* Один заход к панели.
  *
  * body — куда тело (NULL при HEAD); hdr_path — куда заголовки ответа (NULL — они не нужны
@@ -524,6 +614,7 @@ static int http_get(const char *url, const char *body, const char *hdr_path,
         a[i++] = url;
         a[i] = NULL;
         if (run_quiet(a) == 0) {
+            if (body && gunzip_inplace(body) != 0) return 0;
             *hwid_sent = with_id;
             return 1;
         }

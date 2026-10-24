@@ -579,12 +579,12 @@ $(BUILD)/subpq: tests/subpq.c tests/sub-pq-samples.h src/proto/vless/sub.c src/p
 # run_quiet и поддельный curl в PATH (SHA-256 идентификатора устройства — свой, в hwid.c).
 # Поэтому ни сети, ни криптобиблиотеки, ни docker он не требует и входит в обычный make test —
 # при том что до переноса вся эта работа жила в оболочке объекта rpcd и не проверялась ничем.
-$(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/proto/vless/subfetch.h \
+$(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/proto/vless/subfetch.h src/lib/puff.c src/lib/puff.h \
                   src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h \
                   src/proto/vless/sub.c src/proto/vless/sublink.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
                   src/proto/transport/trpath.c src/proto/transport/trpath.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c src/proto/vless/sublink.c src/proto/transport/trpath.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c src/lib/puff.c src/proto/vless/sublink.c src/proto/transport/trpath.c $(PLATFORM_SRC)
 
 # Провод hysteria2 и узлы (src/proto/hysteria2/hy2wire.c, hy2sub.c): целые QUIC, запрос
 # авторизации QPACK и разбор ответа, TCPRequest/Response, UDPMessage, Salamander и BLAKE2b на
