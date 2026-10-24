@@ -107,6 +107,19 @@ check "и сказано, чем это кончится" "yes" \
 "$STEER" srs-read "$FIX/youtube.srs" --out /dev/null --prefixes-out /dev/null 2>/dev/null
 check "набор без сужения не требует --meta-out" "0" "$?"
 
+# ---- портов больше прежних 32: список в meta растёт по числу, без отказа ----------------------
+python3 - "$T/ports.json" <<'PY'
+import json, sys
+json.dump({"rules": [{"ip_cidr": ["198.51.100.0/24"], "network": ["udp"], "port": [3000 + 2 * i]}
+                     for i in range(100)]}, open(sys.argv[1], "w"))
+PY
+python3 "$FIX/mksrs.py" "$T/ports.json" "$T/ports.srs"
+"$STEER" srs-read "$T/ports.srs" --out /dev/null --prefixes-out /dev/null \
+    --meta-out "$T/ports.meta" 2>"$T/ports.err"
+check "100 портов в наборе: разобран (было отказ на 33-м)" "0" "$?"
+check "… все 100 в meta" "100" "$(grep '^ports=' "$T/ports.meta" | tr ',' '\n' | wc -l)"
+check "… последний на месте" "yes" "$(grep -q '3198$' "$T/ports.meta" && echo yes || echo no)"
+
 # ---- отказы на испорченном ------------------------------------------------------------
 printf 'NOTSRS\0\0\0\0\0\0' > "$T/bad.magic"
 "$STEER" srs-read "$T/bad.magic" >/dev/null 2>"$T/e1"

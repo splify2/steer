@@ -102,26 +102,39 @@ static size_t emit_srs(FILE *f, const char *path, const struct ir_srs *src, size
  *
  * Поэтому элементы собираются в память и раскладываются заново: проход по адресной оси, на
  * каждом отрезке — множество действующих сужений, и оно печатается НЕПЕРЕСЕКАЮЩИМИСЯ ящиками
- * «протокол × порты» (l4_union_boxes). Соседние отрезки с одинаковым множеством сливаются.
+ * «протокол × порты» (l4_union_alloc). Соседние отрезки с одинаковым множеством сливаются.
  * Память — 32 байта на подсеть, и только у составного набора: он бывает лишь у канала со
  * смешанным сужением, а у обычного набора элементы по-прежнему идут потоком. */
-struct mx_ev { uint64_t pos; uint16_t l4; int16_t d; };
+struct mx_ev { uint64_t pos; uint32_t l4; int32_t d; };
 struct mx {
     struct mx_ev *ev;
     size_t n, cap;
-    /* РАЗЛИЧНЫХ сужений в одном составном наборе — не больше 64: множество действующих на
-     * отрезке хранится одним словом uint64_t (по биту на сужение; act ниже). Свойство
-     * представления, а не ресурса; набор с десятками разных сужений на один канал — порядок
-     * больше того, что пишут вручную, и сообщение об отказе называет это число. */
-    const struct l4match *l4s[64];
-    size_t nl4;
-    int over;
+    /* Различные сужения набора — без предела: множество действующих на отрезке — битовая
+     * строка из act_words(nl4) слов (по биту на сужение), её длина известна после сбора. */
+    const struct l4match **l4s;
+    size_t nl4, l4cap;
+    int over;                   /* нет памяти на сужение */
 };
+
+static size_t act_words(size_t nl4) { return (nl4 + 63) / 64 + 1; }
+static void act_flip(uint64_t *act, const int *cnt, size_t l) {
+    if (cnt[l] > 0) act[l >> 6] |= 1ULL << (l & 63); else act[l >> 6] &= ~(1ULL << (l & 63));
+}
+static int act_any(const uint64_t *act, size_t nw) {
+    for (size_t i = 0; i < nw; i++) if (act[i]) return 1;
+    return 0;
+}
 
 static int mx_l4(struct mx *m, const struct l4match *l4) {
     for (size_t i = 0; i < m->nl4; i++)
         if (m->l4s[i] == l4 || l4match_same(m->l4s[i], l4)) return (int)i;
-    if (m->nl4 == 64) { m->over = 1; return -1; }
+    if (m->nl4 == m->l4cap) {
+        size_t cap = m->l4cap ? m->l4cap * 2 : 16;
+        const struct l4match **v = realloc(m->l4s, cap * sizeof(*v));
+        if (!v) { m->over = 1; return -1; }
+        m->l4s = v;
+        m->l4cap = cap;
+    }
     m->l4s[m->nl4] = l4;
     return (int)m->nl4++;
 }
@@ -135,8 +148,8 @@ static int mx_add(struct mx *m, uint32_t lo, uint32_t hi, int l4) {
         m->ev = e;
         m->cap = cap;
     }
-    m->ev[m->n++] = (struct mx_ev){ lo, (uint16_t)l4, 1 };
-    m->ev[m->n++] = (struct mx_ev){ (uint64_t)hi + 1, (uint16_t)l4, -1 };
+    m->ev[m->n++] = (struct mx_ev){ lo, (uint32_t)l4, 1 };
+    m->ev[m->n++] = (struct mx_ev){ (uint64_t)hi + 1, (uint32_t)l4, -1 };
     return 0;
 }
 
@@ -206,19 +219,24 @@ static void addr_text(uint32_t lo, uint32_t hi, char *dst, size_t n) {
 }
 
 /* Один отрезок адресов с множеством сужений act — непересекающимися ящиками. */
-static void mx_print(FILE *f, const struct mx *m, uint64_t lo, uint64_t hi, uint64_t act,
+static void mx_print(FILE *f, const struct mx *m, uint64_t lo, uint64_t hi, const uint64_t *act,
                      size_t *written) {
-    const struct l4match *ms[64];
-    size_t k = 0;
-    for (size_t b = 0; b < m->nl4; b++) if (act & (1ULL << b)) ms[k++] = m->l4s[b];
-    struct l4box box[L4BOX_MAX];
-    size_t nb = l4_union_boxes(ms, k, box);
+    const struct l4match **ms = malloc((m->nl4 ? m->nl4 : 1) * sizeof(*ms));
+    size_t k = 0, nb = 0;
+    struct l4box *box = NULL;
+    if (ms) {
+        for (size_t b = 0; b < m->nl4; b++) if (act[b >> 6] & (1ULL << (b & 63))) ms[k++] = m->l4s[b];
+        box = l4_union_alloc(ms, k, &nb);
+        free(ms);
+    }
+    if (!box) { fprintf(stderr, LOG_W "составной набор: нет памяти на ящики сужений\n"); return; }
     char at[40], bt[48];
     addr_text((uint32_t)lo, (uint32_t)hi, at, sizeof(at));
     for (size_t j = 0; j < nb; j++) {
         l4_box_text(&box[j], bt, sizeof(bt));
         fprintf(f, (*written)++ ? ", %s . %s" : "        elements = { %s . %s", at, bt);
     }
+    free(box);
 }
 
 /* ЗАСЕВ В СОСТАВНОМ НАБОРЕ (g_print_seed, ir.h). Поддельный адрес ложится событиями той же оси
@@ -297,39 +315,49 @@ static void emit_mixed(FILE *f, const struct ir_mixed *mix, const struct ir_seed
     }
     mx_add_seed4(&m, seed, nseed);
     if (m.over)
-        fprintf(stderr, LOG_W "составной набор: вариантов сужения больше 64 — лишние не вошли\n");
+        fprintf(stderr, LOG_W "составной набор: не хватило памяти на варианты сужения\n");
     qsort(m.ev, m.n, sizeof(m.ev[0]), ev_cmp);
-    int cnt[64] = {0};
-    uint64_t act = 0, prev = 0;
-    struct { uint64_t lo, hi, act; int have; } pend = { 0, 0, 0, 0 };
+    size_t nw = act_words(m.nl4);
+    int *cnt = calloc(m.nl4 ? m.nl4 : 1, sizeof(*cnt));
+    uint64_t *act = calloc(2 * nw, sizeof(*act)), *pact = act ? act + nw : NULL;
+    if (!cnt || !act) {
+        fprintf(stderr, LOG_W "составной набор: нет памяти — элементы не напечатаны\n");
+        free(cnt); free(act); free(m.ev); free(m.l4s);
+        return;
+    }
+    uint64_t prev = 0;
+    struct { uint64_t lo, hi; int have; } pend = { 0, 0, 0 };
     size_t written = 0;
     for (size_t i = 0; i <= m.n; ) {
         uint64_t pos = i < m.n ? m.ev[i].pos : ((uint64_t)1 << 32);
         /* Отрезок [prev, pos) с множеством act — к отложенному, если продолжает его (и граница
          * между ними — не край засеянного адреса, см. seed_edge4). */
-        if (pos > prev && act) {
-            if (pend.have && pend.act == act && pend.hi + 1 == prev &&
+        if (pos > prev && act_any(act, nw)) {
+            if (pend.have && !memcmp(pact, act, nw * sizeof(*act)) && pend.hi + 1 == prev &&
                 !(nseed && seed_edge4(seed, nseed, prev))) {
                 pend.hi = pos - 1;
             } else {
-                if (pend.have) mx_print(f, &m, pend.lo, pend.hi, pend.act, &written);
+                if (pend.have) mx_print(f, &m, pend.lo, pend.hi, pact, &written);
                 pend.lo = prev;
                 pend.hi = pos - 1;
-                pend.act = act;
+                memcpy(pact, act, nw * sizeof(*act));
                 pend.have = 1;
             }
         }
         if (i == m.n) break;
         for (; i < m.n && m.ev[i].pos == pos; i++) {
-            int l = m.ev[i].l4;
+            size_t l = m.ev[i].l4;
             cnt[l] += m.ev[i].d;
-            if (cnt[l] > 0) act |= 1ULL << l; else act &= ~(1ULL << l);
+            act_flip(act, cnt, l);
         }
         prev = pos;
     }
-    if (pend.have) mx_print(f, &m, pend.lo, pend.hi, pend.act, &written);
+    if (pend.have) mx_print(f, &m, pend.lo, pend.hi, pact, &written);
     if (written) fprintf(f, " }\n");
+    free(cnt);
+    free(act);
     free(m.ev);
+    free(m.l4s);
 }
 
 /* ---- составной набор IPv6 (ipv6_addr . inet_proto . inet_service) ----------------------------
@@ -340,7 +368,7 @@ static void emit_mixed(FILE *f, const struct ir_mixed *mix, const struct ir_seed
  * чтобы текст IPv4 остался прежним до байта, её не трогаем. Позиция конца отрезка — hi + 1, и у
  * последнего адреса оси она «за краем» (inf). */
 struct a128 { uint64_t hi, lo; };
-struct mx6_ev { struct a128 pos; uint8_t inf; uint16_t l4; int16_t d; };
+struct mx6_ev { struct a128 pos; uint8_t inf; uint32_t l4; int32_t d; };
 struct mx6 { struct mx6_ev *ev; size_t n, cap; struct mx lm; };
 
 static int a128_cmp(struct a128 a, struct a128 b) {
@@ -382,8 +410,8 @@ static int mx6_add(struct mx6 *m, struct a128 lo, struct a128 hi, int l4) {
     struct a128 end = hi;
     uint8_t inf = 0;
     if (++end.lo == 0 && ++end.hi == 0) inf = 1;
-    m->ev[m->n++] = (struct mx6_ev){ lo, 0, (uint16_t)l4, 1 };
-    m->ev[m->n++] = (struct mx6_ev){ end, inf, (uint16_t)l4, -1 };
+    m->ev[m->n++] = (struct mx6_ev){ lo, 0, (uint32_t)l4, 1 };
+    m->ev[m->n++] = (struct mx6_ev){ end, inf, (uint32_t)l4, -1 };
     return 0;
 }
 
@@ -461,19 +489,24 @@ static void addr6_text(struct a128 lo, struct a128 hi, char *dst, size_t n) {
     snprintf(dst, n, "%s-%s", t1, t2);
 }
 
-static void mx6_print(FILE *f, const struct mx *lm, struct a128 lo, struct a128 hi, uint64_t act,
-                      size_t *written) {
-    const struct l4match *ms[64];
-    size_t k = 0;
-    for (size_t b = 0; b < lm->nl4; b++) if (act & (1ULL << b)) ms[k++] = lm->l4s[b];
-    struct l4box box[L4BOX_MAX];
-    size_t nb = l4_union_boxes(ms, k, box);
+static void mx6_print(FILE *f, const struct mx *lm, struct a128 lo, struct a128 hi,
+                      const uint64_t *act, size_t *written) {
+    const struct l4match **ms = malloc((lm->nl4 ? lm->nl4 : 1) * sizeof(*ms));
+    size_t k = 0, nb = 0;
+    struct l4box *box = NULL;
+    if (ms) {
+        for (size_t b = 0; b < lm->nl4; b++) if (act[b >> 6] & (1ULL << (b & 63))) ms[k++] = lm->l4s[b];
+        box = l4_union_alloc(ms, k, &nb);
+        free(ms);
+    }
+    if (!box) { fprintf(stderr, LOG_W "составной набор: нет памяти на ящики сужений\n"); return; }
     char at[2 * INET6_ADDRSTRLEN + 8], bt[48];
     addr6_text(lo, hi, at, sizeof(at));
     for (size_t j = 0; j < nb; j++) {
         l4_box_text(&box[j], bt, sizeof(bt));
         fprintf(f, (*written)++ ? ", %s . %s" : "        elements = { %s . %s", at, bt);
     }
+    free(box);
 }
 
 /* Засев IPv6 — тем же приёмом, что seed_edge4 и mx_add_seed4 у IPv4: засеянный адрес не
@@ -533,19 +566,25 @@ static void emit_mixed6(FILE *f, const struct ir_mixed *mix, const struct ir_see
         for (size_t k = 0; k < seed[i].l4_n; k++) mx6_add(&m, a, a, mx_l4(&m.lm, seed[i].l4[k]));
     }
     if (m.lm.over)
-        fprintf(stderr, LOG_W "составной набор: вариантов сужения больше 64 — лишние не вошли\n");
+        fprintf(stderr, LOG_W "составной набор: не хватило памяти на варианты сужения\n");
     qsort(m.ev, m.n, sizeof(m.ev[0]), ev6_cmp);
-    int cnt[64] = {0};
-    uint64_t act = 0;
+    size_t nw = act_words(m.lm.nl4);
+    int *cnt = calloc(m.lm.nl4 ? m.lm.nl4 : 1, sizeof(*cnt));
+    uint64_t *act = calloc(2 * nw, sizeof(*act)), *pact = act ? act + nw : NULL;
+    if (!cnt || !act) {
+        fprintf(stderr, LOG_W "составной набор: нет памяти — элементы не напечатаны\n");
+        free(cnt); free(act); free(m.ev); free(m.lm.l4s);
+        return;
+    }
     struct a128 prev = { 0, 0 };
-    struct { struct a128 lo, hi; uint64_t act; int have; } pend;
+    struct { struct a128 lo, hi; int have; } pend;
     memset(&pend, 0, sizeof(pend));
     size_t written = 0;
     for (size_t i = 0; i <= m.n; ) {
         /* Позиция следующего события; за последним — край оси (inf). */
         int inf = i == m.n || m.ev[i].inf;
         struct a128 pos = i < m.n ? m.ev[i].pos : prev;
-        if (act && (inf || a128_cmp(pos, prev) > 0)) {
+        if (act_any(act, nw) && (inf || a128_cmp(pos, prev) > 0)) {
             /* Отрезок [prev, pos) — его последний адрес pos - 1 (у края оси — все единицы). */
             struct a128 last;
             if (inf) last.hi = last.lo = ~0ULL;
@@ -553,30 +592,33 @@ static void emit_mixed6(FILE *f, const struct ir_mixed *mix, const struct ir_see
             struct a128 nx = pend.hi;
             int adj = pend.have && !(++nx.lo == 0 && ++nx.hi == 0) && !a128_cmp(nx, prev);
             if (adj && nseed && seed_edge6(seed, nseed, prev)) adj = 0;
-            if (pend.have && pend.act == act && adj) {
+            if (pend.have && !memcmp(pact, act, nw * sizeof(*act)) && adj) {
                 pend.hi = last;
             } else {
-                if (pend.have) mx6_print(f, &m.lm, pend.lo, pend.hi, pend.act, &written);
+                if (pend.have) mx6_print(f, &m.lm, pend.lo, pend.hi, pact, &written);
                 pend.lo = prev;
                 pend.hi = last;
-                pend.act = act;
+                memcpy(pact, act, nw * sizeof(*act));
                 pend.have = 1;
             }
         }
         if (i == m.n) break;
         size_t j = i;
         for (; j < m.n && m.ev[j].inf == m.ev[i].inf && !a128_cmp(m.ev[j].pos, m.ev[i].pos); j++) {
-            int l = m.ev[j].l4;
+            size_t l = m.ev[j].l4;
             cnt[l] += m.ev[j].d;
-            if (cnt[l] > 0) act |= 1ULL << l; else act &= ~(1ULL << l);
+            act_flip(act, cnt, l);
         }
         if (inf) break;          /* событие на краю оси — дальше отрезков нет */
         prev = pos;
         i = j;
     }
-    if (pend.have) mx6_print(f, &m.lm, pend.lo, pend.hi, pend.act, &written);
+    if (pend.have) mx6_print(f, &m.lm, pend.lo, pend.hi, pact, &written);
     if (written) fprintf(f, " }\n");
+    free(cnt);
+    free(act);
     free(m.ev);
+    free(m.lm.l4s);
 }
 
 /* КАРТА ПОДМЕНЫ fake→real ЗАСЕВАЕТСЯ ПРЯМО В НАБОРЕ ПРАВИЛ — из файла состояния резолвера

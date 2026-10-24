@@ -419,37 +419,48 @@ const char *g_fakeip_map = "fakeip";
  * . протокол . порты: имя попадает туда с сужением тех правил канала, с которыми совпало, а
  * если совпало с несколькими — их объединением, разложенным на непересекающиеся ящики (ядро не
  * принимает в составной набор пересекающиеся элементы). */
-static size_t dch_boxes(size_t i, const char *domain, struct nftlk_box *out) {
+static struct nftlk_box *dch_boxes(size_t i, const char *domain, size_t *n) {
     static const struct l4match none;
     const struct dchan *d = &g_dch[i];
-    const struct l4match *ms[64];
+    /* Частей у канала сколько есть — совпавших не больше, чем частей, плюс «без сужения». */
+    const struct l4match **ms = malloc((d->parts_n + 1) * sizeof(*ms));
+    *n = 0;
+    if (!ms) return NULL;
     size_t k = 0;
     if (ruleset_match(&d->rules, domain)) ms[k++] = &none;
-    for (size_t p = 0; p < d->parts_n && k < 64; p++)
+    for (size_t p = 0; p < d->parts_n; p++)
         if (ruleset_match(&d->parts[p].rules, domain) &&
             !(d->parts[p].has_excl && ruleset_match(&d->parts[p].excl, domain)))
             ms[k++] = &d->parts[p].l4;
     /* Правила сменились с тех пор, как адрес туда лёг (удаление после перечитывания): прежнего
      * сужения уже не узнать — берётся полный ящик, лучшее, что можно сделать. */
     if (!k) ms[k++] = &none;
-    struct l4box b[L4BOX_MAX];
-    size_t n = l4_union_boxes(ms, k, b);
-    for (size_t j = 0; j < n; j++) {
+    size_t nb;
+    struct l4box *b = l4_union_alloc(ms, k, &nb);
+    free(ms);
+    if (!b) return NULL;
+    struct nftlk_box *out = malloc((nb ? nb : 1) * sizeof(*out));
+    if (!out) { free(b); return NULL; }
+    for (size_t j = 0; j < nb; j++) {
         out[j].plo = b[j].plo;
         out[j].phi = b[j].phi;
         out[j].lo = b[j].lo;
         out[j].hi = b[j].hi;
     }
-    return n;
+    free(b);
+    *n = nb;
+    return out;
 }
 
 int dch_add(size_t i, const char *domain, uint32_t addr_host, uint32_t ttl) {
     if (!g_dch[i].composite) return nft_add_element(g_dch[i].set, addr_host, ttl);
-    struct nftlk_box b[L4BOX_MAX];
-    size_t n = dch_boxes(i, domain, b);
+    size_t n;
+    struct nftlk_box *b = dch_boxes(i, domain, &n);
+    if (!b) return -1;
     int rc = 0;
     for (size_t j = 0; j < n; j++)
         if (nft_concat_element(1, g_dch[i].set, addr_host, &b[j], ttl) != 0) rc = -1;
+    free(b);
     return rc;
 }
 
@@ -488,9 +499,10 @@ void dch_del(size_t i, const char *domain, uint32_t addr_host) {
             fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n", g_dch[i].set, drc);
         return;
     }
-    struct nftlk_box b[L4BOX_MAX];
-    size_t n = dch_boxes(i, domain, b);
+    size_t n;
+    struct nftlk_box *b = dch_boxes(i, domain, &n);
     for (size_t j = 0; j < n; j++) nft_concat_element(0, g_dch[i].set, addr_host, &b[j], 0);
+    free(b);
 }
 
 /* Адрес IPv6 — в парный набор «<set>6» (компилятор заводит его доменной группе с dom6, тем же
@@ -503,11 +515,13 @@ int dch_add6(size_t i, const char *domain, const uint8_t addr[16], uint32_t ttl)
     char s6[80];
     dch_set6_name(i, s6, sizeof(s6));
     if (!g_dch[i].composite) return nft_add_element6(s6, addr, ttl);
-    struct nftlk_box b[L4BOX_MAX];
-    size_t n = dch_boxes(i, domain, b);
+    size_t n;
+    struct nftlk_box *b = dch_boxes(i, domain, &n);
+    if (!b) return -1;
     int rc = 0;
     for (size_t j = 0; j < n; j++)
         if (nft_concat_element6(1, s6, addr, &b[j], ttl) != 0) rc = -1;
+    free(b);
     return rc;
 }
 
@@ -526,9 +540,10 @@ void dch_del6(size_t i, const char *domain, const uint8_t addr[16]) {
             fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n", s6, drc);
         return;
     }
-    struct nftlk_box b[L4BOX_MAX];
-    size_t n = dch_boxes(i, domain, b);
+    size_t n;
+    struct nftlk_box *b = dch_boxes(i, domain, &n);
     for (size_t j = 0; j < n; j++) nft_concat_element6(0, s6, addr, &b[j], 0);
+    free(b);
 }
 
 /* ---- возврат адресов пула ----------------------------------------------------------------------
