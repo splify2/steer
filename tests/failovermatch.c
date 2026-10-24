@@ -743,6 +743,27 @@ int main(void) {
             "32765:\tfrom all fwmark 0x100000/0xff00000 lookup 305\n"
             "32766:\tfrom all fwmark 0x100000 lookup 300\n", 0x100000, 300);
         check("копии: имя таблицы — наше, чужой номер и форма без маски — нет", c.n, 1);
+        rule_copies_free(&c);
+    }
+    /* Копий больше прежнего предела (8) и правило длиннее прежних 512 байт: считаются все. */
+    {
+        char many[4096] = "";
+        size_t o = 0;
+        for (int i = 0; i < 20; i++)
+            o += (size_t)snprintf(many + o, sizeof(many) - o,
+                "%d:\tfrom all fwmark 0x100000/0xff00000 lookup 300\n", 32000 + i);
+        struct rule_copies c = rule_copies_of(many, 0x100000, 300);
+        check("копии: 20 верных копий — все посчитаны (раньше не больше 8)", c.n, 20);
+        check("копии: приоритет последней копии записан", c.n == 20 ? (int)c.pref[19] : -1, 32019);
+        rule_copies_free(&c);
+        char longl[2048];
+        o = (size_t)snprintf(longl, sizeof(longl), "32764:\tfrom 10.0.0.0/8 ");
+        for (int i = 0; i < 40; i++)
+            o += (size_t)snprintf(longl + o, sizeof(longl) - o, "iif eth%d ", i);
+        snprintf(longl + o, sizeof(longl) - o, "fwmark 0x100000/0xff00000 lookup 300\n");
+        c = rule_copies_of(longl, 0x100000, 300);
+        check("копии: правило длиннее 512 байт — копия найдена", c.n, 1);
+        rule_copies_free(&c);
     }
     /* Отказ при on_fail=drop: запрет — заменой, а не сбросом и добавлением (между ними
      * таблица пуста и помеченное уходит напрямую). */

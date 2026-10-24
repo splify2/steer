@@ -127,9 +127,13 @@
 #include "awg.h"
 
 #define LOG_SW "steer[warn] supervise: "
-/* Таблицы, не забранные резолвером: одна — десятки килобайт; больше мегабайта в очереди —
- * резолвер не читает трубу вовсе, и труба закрывается (он выйдет и поднимется заново). */
-#define SUPD_TABQ_MAX (1024 * 1024)
+/* Таблицы, не забранные резолвером: резолвер, у которого в очереди лежит больше восьми таблиц
+ * сразу (и не меньше мегабайта), трубу не читает вовсе, и она закрывается (он выйдет и
+ * поднимется заново). Предел считается в таблицах, а не в байтах: таблица спеки с большими
+ * списками бывает и в десятки мегабайт, и жёсткий мегабайт закрывал бы трубу на первой же
+ * отдаче. Одна таблица в пустую очередь принимается любой длины. */
+#define SUPD_TABQ_MIN (1024 * 1024)
+#define SUPD_TABQ_TABS 8
 #define SUPD_DNSD_FLAGS 8
 
 struct supd {
@@ -594,8 +598,10 @@ static int tab_send(struct supd *s, int force) {
         s->qn -= s->qoff;
         s->qoff = 0;
     }
-    if (s->qn + n > SUPD_TABQ_MAX) {
-        fprintf(stderr, LOG_SW "резолвер не забирает таблицу — закрываю трубу\n");
+    size_t qmax = n > SUPD_TABQ_MIN / SUPD_TABQ_TABS ? n * SUPD_TABQ_TABS : SUPD_TABQ_MIN;
+    if (s->qn > 0 && s->qn + n > qmax) {
+        fprintf(stderr, LOG_SW "резолвер не забирает таблицу: в очереди %zu байт, ещё %zu, предел %zu — "
+                "закрываю трубу\n", s->qn, n, qmax);
         free(p);
         tab_close(s);
         return 0;
@@ -1551,12 +1557,15 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
     return found ? 0 : -1;
 }
 
-void supd_probe_env(const struct supd *s, char *buf, size_t n) {
-    if (!n) return;
-    buf[0] = '\0';
-    if (!s) return;
-    size_t w = (size_t)snprintf(buf, n, "STEER_PROBE_MEM=");
-    for (size_t i = 0; i < s->set.n && w < n; i++) {
+char *supd_probe_env(const struct supd *s) {
+    if (!s) return NULL;
+    char *buf = NULL;
+    size_t bn = 0;
+    FILE *f = open_memstream(&buf, &bn);
+    if (!f) return NULL;
+    fputs("STEER_PROBE_MEM=", f);
+    long w0 = ftell(f);
+    for (size_t i = 0; i < s->set.n; i++) {
         const struct helper *h = &s->set.h[i];
         if (h->table || h->gone || !cmd_picks_nodes(h->cmd)) continue;
         int node, total;
@@ -1565,16 +1574,15 @@ void supd_probe_env(const struct supd *s, char *buf, size_t n) {
                          : ps == PROBE_NO_SUCH_NODE ? "nonode" : ps == PROBE_ALL_EXCLUDED ? "excluded"
                          : ps == PROBE_LOST ? "lost"
                          : "none";
+        if (ftell(f) > w0) fputc(' ', f);
+        fprintf(f, "%s:%s:%d:%d", h->name, word, node, total);
         /* У lost ещё время и причина — diag ребёнком называет её так же, как status демона. */
-        char tail[600] = "";
         if (ps == PROBE_LOST) {
             char ew[520];
             probe_mem_escape(h->st.why, ew, sizeof(ew));
-            snprintf(tail, sizeof(tail), ":%ld:%s", h->st.since, ew);
+            fprintf(f, ":%ld:%s", h->st.since, ew);
         }
-        int m = snprintf(buf + w, n - w, "%s%s:%s:%d:%d%s", w > 16 ? " " : "", h->name, word,
-                         node, total, tail);
-        if (m < 0 || (size_t)m >= n - w) { buf[w] = '\0'; break; }
-        w += (size_t)m;
     }
+    if (fclose(f) != 0) { free(buf); return NULL; }
+    return buf;
 }

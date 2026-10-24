@@ -487,7 +487,21 @@ void route6_flush(int table) {
  * снимались точно, по приоритету, а не «первая попавшаяся». wrong[] — наше правило на чужом
  * приоритете: осталось от сборки, где приоритет выбирало ядро. Чистая функция — стенд
  * failovermatch. */
-/* struct rule_copies и RULE_COPIES_MAX — в failover_int.h: их читает и стенд failovermatch. */
+/* struct rule_copies — в failover_int.h: их читает и стенд failovermatch. */
+static void copies_add(unsigned long **v, int *n, unsigned long pref, int *oom) {
+    unsigned long *g = realloc(*v, ((size_t)*n + 1) * sizeof(**v));
+    if (!g) { *oom = 1; return; }
+    *v = g;
+    g[(*n)++] = pref;
+}
+
+void rule_copies_free(struct rule_copies *c) {
+    free(c->pref);
+    free(c->wrong);
+    free(c->legacy);
+    memset(c, 0, sizeof(*c));
+}
+
 struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
     struct rule_copies c;
     memset(&c, 0, sizeof c);
@@ -495,13 +509,21 @@ struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
     if (!c.known) return c;
     char want_tbl[16];
     snprintf(want_tbl, sizeof(want_tbl), "%d", table);
+    /* Строка правила копируется целиком в буфер, растущий по самой длинной: правило со многими
+     * условиями не теряет хвост с «lookup» (раньше — 512 байт) и не перестаёт быть копией. */
+    char *line = NULL;
+    size_t lcap = 0;
     for (const char *ln = rules; ln && *ln; ) {
         const char *end = strchr(ln, '\n');
         size_t len = end ? (size_t)(end - ln) : strlen(ln);
-        char line[512];
-        size_t n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
-        memcpy(line, ln, n);
-        line[n] = '\0';
+        if (len + 1 > lcap) {
+            char *g = realloc(line, len + 1);
+            if (!g) { c.oom = 1; break; }
+            line = g;
+            lcap = len + 1;
+        }
+        memcpy(line, ln, len);
+        line[len] = '\0';
         ln = end ? end + 1 : NULL;
 
         char *stop = NULL;
@@ -524,16 +546,16 @@ struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
             if (!isdigit((unsigned char)t[i])) numeric = 0;
         if (numeric && (tl != strlen(want_tbl) || strncmp(t, want_tbl, tl) != 0)) continue;
         if (legacy) {
-            if (c.legacy_n < RULE_COPIES_MAX) c.legacy[c.legacy_n++] = pref;
+            copies_add(&c.legacy, &c.legacy_n, pref, &c.oom);
             continue;
         }
         if (STEER_RULE_PREF && pref != (unsigned long)STEER_RULE_PREF) {
-            if (c.wrong_n < RULE_COPIES_MAX) c.wrong[c.wrong_n++] = pref;
+            copies_add(&c.wrong, &c.wrong_n, pref, &c.oom);
             continue;
         }
-        if (c.n < RULE_COPIES_MAX) c.pref[c.n] = pref;
-        c.n++;
+        copies_add(&c.pref, &c.n, pref, &c.oom);
     }
+    free(line);
     return c;
 }
 
@@ -554,14 +576,16 @@ static void rule_ensure_fam(int fam, unsigned mark, int table) {
     if (!rules) return;
     struct rule_copies c = rule_copies_of(rules, mark, table);
     free(rules);
+    /* Нет памяти под список — копии неполны: добавляем, если верной нет, но ничего не снимаем. */
+    if (c.oom) c.n = c.wrong_n = c.legacy_n = 0;
     /* Прочитать не вышло (нет ip, отказал popen) — добавляем, ничего не снимая: лишняя копия
      * того же правила ничего не меняет в маршрутизации, а снятие вслепую могло бы оставить
      * метку без правила — то есть ту самую утечку, ради которой всё это. */
     if (!c.known || c.n == 0) rule_add_fam(fam, mark, table);
     /* Верная копия есть (или только что добавлена) — теперь можно убирать лишнее. */
-    for (int k = 1; k < c.n && k < RULE_COPIES_MAX; k++) rule_del_at(fam, mark, table, c.pref[k]);
+    for (int k = 1; k < c.n; k++) rule_del_at(fam, mark, table, c.pref[k]);
     for (int k = 0; k < c.wrong_n; k++) rule_del_at(fam, mark, table, c.wrong[k]);
-    if (fam == 6) return;           /* прежней формы без маски у IPv6 не бывало */
+    if (fam == 6) { rule_copies_free(&c); return; }   /* прежней формы без маски у IPv6 не бывало */
     /* Прежняя форма без маски — см. rule_drop. Снимается после того, как форма с маской есть, и
      * ТОЛЬКО с явной маской 0xffffffff (так её хранит ядро) и приоритетом. `ip rule del fwmark X
      * table T` без маски на ядре 4.9 (телефон) снимает ЛЮБОЕ правило с меткой X — и с нашей
@@ -578,6 +602,7 @@ static void rule_ensure_fam(int fam, unsigned mark, int table) {
                                "priority", p, NULL };
         run_quiet(dell);
     }
+    rule_copies_free(&c);
 }
 
 void rule_ensure(unsigned mark, int table) {

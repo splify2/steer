@@ -49,18 +49,21 @@ int routing_live_ok(const struct route_facts *f, const char *dev);
 int routing_failed_ok(const struct route_facts *f, enum on_fail of);
 
 /* ---- лишние копии правила пробы/выхода (rule_copies_of) ---------------------------- */
-#define RULE_COPIES_MAX 8
+/* Приоритеты копий — в куче, сколько нашлось (раньше — не больше восьми каждого вида, и лишние
+ * копии сверх них не снимались никогда). Освобождает rule_copies_free. */
 struct rule_copies {
     int known;                      /* дамп прочитан (пустым он на живой коробке не бывает) */
     int n;                          /* верных копий */
-    unsigned long pref[RULE_COPIES_MAX];
+    unsigned long *pref;            /* их приоритеты, n штук */
     int wrong_n;                    /* копий на чужом приоритете */
-    unsigned long wrong[RULE_COPIES_MAX];
+    unsigned long *wrong;
     int legacy_n;                   /* прежняя форма без маски (см. rule_drop) */
-    unsigned long legacy[RULE_COPIES_MAX];
+    unsigned long *legacy;
+    int oom;                        /* не хватило памяти под список: снимать вслепую нельзя */
 };
 
 struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table);
+void rule_copies_free(struct rule_copies *c);
 
 /* on_fail выхода o — то, что проход делает при отказе (apply_failed с объявлением в журнале).
  * Наружу — ради команды select (fogroup.c): выбранный человеком член не работает, — и ради apply

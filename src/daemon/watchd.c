@@ -155,6 +155,12 @@
  * мёртвых устройств. Прерывается с уборкой (fo_pass_abort). С запасом: восемь выходов по восемь
  * мёртвых устройств с оживлением и замером — это минуты, а не десять. */
 #define WATCHD_PASS_MAX_S 600
+/* Срок растёт с числом выходов: на сервере с сотнями выходов проход честно идёт дольше, и
+ * постоянные десять минут прерывали бы его и записывали бы «проход завис» там, где он жив. */
+#define WATCHD_PASS_PER_OUT_S 10
+static long watchd_pass_max_s(const struct spec *sp) {
+    return WATCHD_PASS_MAX_S + (long)sp->out_n * WATCHD_PASS_PER_OUT_S;
+}
 /* События прохода копятся в растущем массиве (watchd_ev): их столько, сколько решений у выходов
  * за проход, а выходов не 16 (раньше — 64 записи, и события сверх них молча пропадали). */
 
@@ -631,7 +637,7 @@ static void watchd_kill(struct loop *l, struct loop_timer *t, void *arg) {
     (void)l; (void)t;
     struct watchd *w = arg;
     if (!w->run) return;
-    fprintf(stderr, LOG_WW "проход идёт дольше %d с — прерываю\n", WATCHD_PASS_MAX_S);
+    fprintf(stderr, LOG_WW "проход идёт дольше %ld с — прерываю\n", watchd_pass_max_s(w->sp));
     fo_pass_abort(w->run);
     /* Выбор прерванного прохода не записан (active кладётся в конце) — и его события тоже не
      * уходят: следующий проход решит заново и скажет сам. */
@@ -756,7 +762,7 @@ static void watchd_pass_start(struct watchd *w) {
     if (w->lat) fo_pass_lat_extern(w->run);
     if (!w->revive_next) fo_pass_defer_revive(w->run);
     w->revive_next = 0;
-    loop_timer_set(w->kill_tm, WATCHD_PASS_MAX_S * 1000L);
+    loop_timer_set(w->kill_tm, watchd_pass_max_s(w->sp) * 1000L);
 }
 
 /* ---- заведение и уход ------------------------------------------------------------------ */

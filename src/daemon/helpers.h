@@ -238,8 +238,8 @@ int supd_restart(struct supd *s, const char *out, const char *cmd);
 int supd_helper_json(const struct supd *s, const char *name, FILE *out);
 
 /* Ход перебора узлов клиентов vless из памяти демона — в запись окружения для детей демона
- * (`STEER_PROBE_MEM=…`, её читает probe_read вместо файлов probe-*; см. src/model/probe.h). Пусто
- * (buf[0] = 0) — демон не супервизор. */
-void supd_probe_env(const struct supd *s, char *buf, size_t n);
+ * (`STEER_PROBE_MEM=…`, её читает probe_read вместо файлов probe-*; см. src/model/probe.h). Строка
+ * в куче, без предела по числу выходов; освобождает вызывающий. NULL — демон не супервизор. */
+char *supd_probe_env(const struct supd *s);
 
 #endif

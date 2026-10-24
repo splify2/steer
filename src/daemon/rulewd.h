@@ -43,9 +43,10 @@ void rulewd_kick(struct rulewd *r);
 void rulewd_settle(struct rulewd *r);
 
 /* Каких правил выходов спеки sp не хватает (и запасных запретов IPv6, которые ядро снимает вместе
- * с lo): имена через запятую в list (n байт). Возврат — сколько выходов без правила или запрета;
+ * с lo): имена через запятую в *list (malloc, освобождает вызывающий; места — на все имена выходов
+ * спеки, без обрезки). Возврат — сколько выходов без правила или запрета;
  * 0 — всё на месте или нечего чинить; -1 — ядро не спросить. */
-int rulewd_missing(const struct spec *sp, char *list, size_t n);
+int rulewd_missing(const struct spec *sp, char **list);
 /* Сколько выходов с устройством держат своё правило IPv4 в ядре Linux; -1 — правил не прочитать. */
 int rulewd_present(const struct spec *sp);
 

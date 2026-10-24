@@ -654,13 +654,20 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
     }
     /* Запись groups — выбранный член сразу, чтобы status не ждал прохода. */
     char *text = rec_read(st, "groups");
-    char val[700], cur[64] = "-", al[640] = "-";
-    if (text && rec_get(text, go->name, val, sizeof(val))) sscanf(val, "%63s %639s", cur, al);
+    /* Живые члены — в куче по длине записи: у группы balance на сотню членов строка длиннее
+     * любого буфера, а обрезка по слову теряла бы хвост живых молча. */
+    char *val = rec_dup(text, go->name);
     free(text);
-    snprintf(gline, sizeof(gline), "%s %s ", go->name, alive ? mname : "-");
-    char full[800];
-    snprintf(full, sizeof(full), "%s%s", gline, al);
-    rec_set(st, "groups", go->name, full);
+    char *cur = NULL, *al = NULL;
+    if (!val || !groups_split(val, &cur, &al)) al = "-";
+    size_t fl = strlen(go->name) + strlen(alive ? mname : "-") + strlen(al) + 3;
+    char *full = malloc(fl);
+    if (full) {
+        snprintf(full, fl, "%s %s %s", go->name, alive ? mname : "-", al);
+        rec_set(st, "groups", go->name, full);
+        free(full);
+    }
+    free(val);
     return 0;
 }
 
