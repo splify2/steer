@@ -588,6 +588,8 @@ int hy2_gecko_tx(void *user, const uint8_t *src, size_t n,
     return 0;
 }
 
+/* dst вмещает собранный пакет — до 8 кусков по GK_CHUNK (QUIC даёт фильтру свой буфер
+ * QC_FILTER_RX_MAX, а не слот приёма: сборка на месте писала за его границу, I-517). */
 size_t hy2_gecko_rx(void *user, uint8_t *dst, const uint8_t *src, size_t n) {
     struct hy2_gecko *g = user;
     uint8_t buf[2200];

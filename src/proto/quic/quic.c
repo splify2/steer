@@ -166,6 +166,7 @@ struct qc {
      * с датаграмму, поэтому достаточно одной датаграммы с запасом). */
     struct qc_filter filter;
     uint8_t  *obuf;
+    uint8_t  *fbuf;             /* выход фильтра приёма, QC_FILTER_RX_MAX (есть только при filter.rx) */
     uint64_t  tx_calls, rx_calls;
     int       gso_ok;           /* отправка пачкой через UDP_SEGMENT ещё не отказывала */
     int       gro_on;           /* приём склеенных датаграмм (UDP_GRO) включён на сокете */
@@ -1056,8 +1057,9 @@ static int rx_dgram(struct qc *q, uint8_t *buf, size_t n, const struct sockaddr_
         fl = q->remote_len;
     }
     if (q->filter.rx) {
-        size_t m = q->filter.rx(q->filter.user, buf, buf, n);
-        if (!m) return 0;
+        size_t m = q->filter.rx(q->filter.user, q->fbuf, buf, n);
+        if (!m || m > QC_FILTER_RX_MAX) return 0;
+        buf = q->fbuf;
         n = m;
     }
     ngtcp2_path path = {
@@ -1293,6 +1295,7 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
         goto fail;
     }
     if (cfg->filter) q->filter = *cfg->filter;
+    if (q->filter.rx && !(q->fbuf = malloc(QC_FILTER_RX_MAX))) { rc = QC_ENOMEM; goto fail; }
     q->flow_manual = cfg->flow_manual;
     if (cfg->pin_sha256) { memcpy(q->pin, cfg->pin_sha256, 32); q->pin_on = 1; }
     if (cfg->hop_n) {
@@ -1527,6 +1530,7 @@ void qc_free(struct qc *q) {
     free(q->txbuf);
     free(q->rxbuf);
     free(q->obuf);
+    free(q->fbuf);
     free(q->rx);
     free(q);
 }
