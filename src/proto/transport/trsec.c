@@ -23,6 +23,7 @@
 
 #include "transport.h"
 #include "reality.h"
+#include "wipe.h"
 #include "roots.h"
 #include "certverify.h"
 #include "ech.h"
@@ -153,6 +154,9 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
 
     if (eh) auth.ech = &te;
     int hrc = tls13_handshake_auth(&l->tls, l->fd, send_hello, send_n, rst.priv, &auth);
+    /* Эфемерный приватный ключ, общий секрет Reality, ключ аутентификатора и ключ ML-KEM нужны только до
+     * конца рукопожатия: дальше их держит лишь стек, и стираем сразу. */
+    steer_wipe(&rst, sizeof(rst));
     free(eh);
     return hrc;
 }

@@ -73,6 +73,7 @@
 #include "tgws.h"
 #include "tls13.h"
 #include "reality.h"
+#include "wipe.h"
 #include "spec.h"
 #include "evline.h"
 #include "thrstack.h"
@@ -1188,6 +1189,8 @@ static int tls_start(struct upstream *u, const char *sni) {
     if (up_write(u, hello, hello_n) < 0) { g_tls_rc = -102; return -1; }
     memset(&u->tls, 0, sizeof(u->tls));
     g_tls_rc = tls13_handshake(&u->tls, u->fd, hello, hello_n, priv);
+    steer_wipe(priv, sizeof(priv));         /* эфемерный ключ нужен только до конца рукопожатия */
+    steer_wipe(&st, sizeof(st));
     /* На отказе освобождаем здесь, а не у вызывающих: tls_on ещё ноль, и их ветки отказа
      * ключей не трогают. Отказ рукопожатия бывает и после разворота ключа записи (tls13.c:
      * ключ чтения не развернулся), и тогда контекст AEAD оставался бы выделенным (I-197).

@@ -25,6 +25,7 @@
 #include <netinet/in.h>
 
 #include "reality.h"
+#include "wipe.h"
 #include "tls13.h"
 #include "roots.h"
 #include "wbhttps.h"
@@ -183,6 +184,9 @@ int wb_https(const struct wb_req *q, const struct wb_route *rt, struct wb_resp *
     if (!t) { WHY("нет памяти"); goto out; }
     struct tls13_auth auth = { .host = q->host, .roots = tls_cert_roots() };
     int hrc = tls13_handshake_auth(t, fd, hello, hello_n, rst.priv, &auth);
+    /* Эфемерный приватный ключ, общий секрет Reality, ключ аутентификатора и ключ ML-KEM нужны только до
+     * конца рукопожатия: дальше их держит лишь стек, и стираем сразу. */
+    steer_wipe(&rst, sizeof(rst));
     if (hrc != 0) {
         const char *vr = hrc == TLS13_ECERT ? tls13_verify_reason() : NULL;
         if (vr && vr[0]) WHY("сертификат %s не принят: %s", q->host, vr);
