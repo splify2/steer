@@ -412,6 +412,7 @@ void dch_sig_write(void);
 
 /* dlog.c */
 void dlog_note(const char *qname, int hit);
+size_t dlog_count(void);
 void dlog_listen(void);
 void dlog_close(void);
 void dlog_serve(void);
@@ -421,6 +422,7 @@ void dlog_serve(void);
 void realip_note(const char *qname, uint32_t addr_host, uint32_t ttl);
 void realip_note6(const char *qname, const uint8_t addr[16], uint32_t ttl);
 size_t realip_reassert(void);
+size_t realip_count(void);
 
 /* adopt.c — управляющий сокет резолвера на таблице: новый демон забирает живой резолвер
  * (труба таблицы через SCM_RIGHTS). adopt_listen — после того, как epoll заведён. */
@@ -478,6 +480,9 @@ int run_proxy(int listen_port, int upstream_port);
  * значению РОВНО тогда, когда слот шёл по второму кругу. Теперь поколения мало (6 бит), и
  * оно больше не единственная защита — главная проверка в том, что ответ обязан отвечать на
  * наш вопрос (см. question_fp). */
+/* ПРЕДЕЛ ЗДЕСЬ НАСТОЯЩИЙ: номер транзакции DNS — 16 бит, из них PENDING_IDX_BITS идут на слот.
+ * Каждый лишний бит слота — бит поколения меньше (и вдвое ёмче таблица), а ответ на общий сокет
+ * опознаётся именно по номеру. Переполнение не молчит: строка журнала называет число мест. */
 #define MAX_PENDING 1024
 #define PENDING_IDX_BITS 10
 #define PENDING_IDX_MASK ((1u << PENDING_IDX_BITS) - 1u)

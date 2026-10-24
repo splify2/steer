@@ -165,6 +165,18 @@ if what == 'pipeline':
         if r and struct.unpack('>H', r[:2])[0] == 0x3000 + i and r[-4:] == bytes([93, 184, 216, 35]):
             seq += 1
     print(ok, seq)
+elif what == 'many':
+    # Сто соединений одновременно — больше прежних 32 (TCP_MAX_CONN): все открыты до первого
+    # вопроса, значит, места нет ни у кого лишнего, и каждое обязано получить свой ответ.
+    n = 100
+    cs = [conn() for _ in range(n)]
+    for i, c in enumerate(cs): c.sendall(framed(q(0x6000 + i, 'many%d.test' % i)))
+    ok = 0
+    for i, c in enumerate(cs):
+        r = reply(c)
+        if r and struct.unpack('>H', r[:2])[0] == 0x6000 + i and r[-4:] == bytes([93, 184, 216, 35]):
+            ok += 1
+    print(ok)
 elif what == 'big':
     c = conn()
     c.sendall(framed(q(0x4242, 'big.test')))
@@ -220,6 +232,7 @@ ok=$1 bad_id=$2 lost=$3 bad_addr=$4
 tcp_pipe="$(python3 "$tmp/tcpclient.py" "$LPORT" pipeline 2>&1)"
 tcp_big="$(python3 "$tmp/tcpclient.py" "$LPORT" big 2>&1)"
 tcp_slow="$(python3 "$tmp/tcpclient.py" "$LPORT" slow 2>&1)"
+tcp_many="$(python3 "$tmp/tcpclient.py" "$LPORT" many 2>&1)"
 wait "$IDLE"
 tcp_idle="$(cat "$tmp/idle.txt")"
 # Тишина: ожиданий в пути нет, соединения TCP закрыты по простою — резолверу не на что
@@ -262,10 +275,11 @@ check "TCP: конвейер из трёх запросов одной запи�
     "3 5" "$tcp_pipe"
 check "TCP: ответ больше 4 КБ (300 записей) пришёл целиком" "4826 300" "$tcp_big"
 check "TCP: медленный клиент не держит цикл — UDP и другое соединение отвечают" "1 1" "$tcp_slow"
+check "TCP: сто соединений одновременно (прежний предел 32) — все ответы пришли" "100" "$tcp_many"
 check "TCP: соединение без запросов закрыто по простою" "closed" "$tcp_idle"
 check "в тишине резолвер не просыпается (добровольных переключений за 3 с не больше одного)" \
     "ok" "$quiet"
-check "TCP: наверх по TCP ушли ровно вопросы клиентов TCP" "10" \
+check "TCP: наверх по TCP ушли ровно вопросы клиентов TCP" "110" \
     "$(cat "$tmp/up.txt.tcp" 2>/dev/null | wc -l | tr -d ' ')"
 
 # ---- --table-fd: таблица каналов из трубы демона, а не из спеки самим резолвером -----------

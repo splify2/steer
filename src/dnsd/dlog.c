@@ -12,8 +12,10 @@
  * ЧТО ХРАНИТСЯ. По записи на имя: имя (нижним регистром), доменный канал, в который оно попало
  * при последнем запросе, счётчик запросов и время последнего. Ни адреса клиента, ни типа
  * запроса, ни ответа: «без персональных данных сверх имени» — журнал показывает, КУДА ушло
- * имя, а не КТО и что спросил. Записей — DLOG_N (256): это «недавние», а не история; самая
- * давняя запись уступает место новому имени.
+ * имя, а не КТО и что спросил. Записей — не меньше DLOG_MIN (256), и это «недавние», а не
+ * история: самая давняя запись уступает место новому имени, только если она старше DLOG_RECENT_SEC;
+ * пока все записи свежее, таблица растёт — у сервера с сотнями клиентов за десять минут бывают
+ * тысячи имён, и прежние 256 стирали их за секунды, не показывая человеку почти ничего.
  *
  * ГДЕ. Только в памяти резолвера. Никаких периодических записей на диск — флеш телефона и сон
  * устройства дороже истории, которая после перезапуска резолвера никому не нужна. Журнал
@@ -37,11 +39,10 @@
  * типа ему не нужно: подключается к нему только домен движка (steerd), в котором живёт и
  * сервер управляющего сокета. Приложение журнал получает только через управляющий сокет.
  *
- * СТОИМОСТЬ НА ЗАПРОС. Поиск имени — проход по 256 записям со сравнением 32-битного отпечатка
- * (FNV-1a, sidx_hash) и строки только при совпадении отпечатка; вытеснение — ещё один проход,
- * только для нового имени. Против системных вызовов, которых стоит каждый запрос DNS, это
- * незаметно и на роутерном MIPS. */
-#define DLOG_N 256
+ * СТОИМОСТЬ НА ЗАПРОС. Поиск имени — по хэшу (корзины с цепочками, FNV-1a, sidx_hash), давность —
+ * двусвязный список от свежих к давним: поиск, вытеснение и обновление не зависят от числа записей. */
+#define DLOG_MIN 256
+#define DLOG_RECENT_SEC 600
 
 struct dlog_ent {
     char name[MAX_HOSTNAME];
@@ -50,9 +51,14 @@ struct dlog_ent {
     time_t last;                /* CLOCK_MONOTONIC, секунды: часы телефона после загрузки
                                  * переводит NTP, и «когда» по стенным часам прыгало бы */
     int16_t hit;                /* индекс в g_dch; -1 — мимо всех доменных каналов */
+    int32_t chain;              /* следующая запись той же корзины, -1 — конец */
+    int32_t newer, older;       /* список давности: свежее и давнее, -1 — край */
 };
-static struct dlog_ent g_dlog[DLOG_N];
-static size_t g_dlog_n;
+static struct dlog_ent *g_dlog;
+static size_t g_dlog_n, g_dlog_cap;
+static int32_t *g_dlog_bk;      /* головы цепочек; размер — степень двойки, вдвое больше g_dlog_cap */
+static size_t g_dlog_bkn;
+static int32_t g_dlog_head = -1, g_dlog_tail = -1;
 int g_dlog_fd = -1;
 static char g_dlog_path[PATH_MAX];
 static ino_t g_dlog_ino;
@@ -63,6 +69,52 @@ static time_t dlog_mono(void) {
     return t.tv_sec;
 }
 
+static void dlog_unlink_list(int32_t i) {
+    struct dlog_ent *e = &g_dlog[i];
+    if (e->newer >= 0) g_dlog[e->newer].older = e->older; else g_dlog_head = e->older;
+    if (e->older >= 0) g_dlog[e->older].newer = e->newer; else g_dlog_tail = e->newer;
+}
+
+static void dlog_push_head(int32_t i) {
+    struct dlog_ent *e = &g_dlog[i];
+    e->newer = -1;
+    e->older = g_dlog_head;
+    if (g_dlog_head >= 0) g_dlog[g_dlog_head].newer = i; else g_dlog_tail = i;
+    g_dlog_head = i;
+}
+
+static void dlog_unchain(int32_t i) {
+    int32_t *pp = &g_dlog_bk[g_dlog[i].hash & (g_dlog_bkn - 1)];
+    while (*pp != i) pp = &g_dlog[*pp].chain;
+    *pp = g_dlog[i].chain;
+}
+
+static void dlog_chain(int32_t i) {
+    int32_t *b = &g_dlog_bk[g_dlog[i].hash & (g_dlog_bkn - 1)];
+    g_dlog[i].chain = *b;
+    *b = i;
+}
+
+/* Расти вдвое; индексы записей остаются теми же, корзины строятся заново. */
+static int dlog_grow(void) {
+    size_t nc = g_dlog_cap ? g_dlog_cap * 2 : DLOG_MIN;
+    int32_t *nb = malloc(nc * 2 * sizeof(*nb));
+    if (!nb) return -1;
+    struct dlog_ent *ne = realloc(g_dlog, nc * sizeof(*ne));
+    if (!ne) { free(nb); return -1; }
+    g_dlog = ne;
+    free(g_dlog_bk);
+    g_dlog_bk = nb;
+    g_dlog_bkn = nc * 2;
+    for (size_t k = 0; k < g_dlog_bkn; k++) g_dlog_bk[k] = -1;
+    g_dlog_cap = nc;
+    for (size_t i = 0; i < g_dlog_n; i++) dlog_chain((int32_t)i);
+    return 0;
+}
+
+/* Сколько записей сейчас (для проверки). */
+size_t dlog_count(void) { return g_dlog_n; }
+
 /* Отметить запрос имени qname, попавшего в канал hit (-1 — мимо). */
 void dlog_note(const char *qname, int hit) {
     char lname[MAX_HOSTNAME];
@@ -70,24 +122,33 @@ void dlog_note(const char *qname, int hit) {
     str_lower(lname);
     uint32_t h = sidx_hash(lname);
     time_t now = dlog_mono();
-    struct dlog_ent *e = NULL;
-    for (size_t i = 0; i < g_dlog_n; i++)
-        if (g_dlog[i].hash == h && !strcmp(g_dlog[i].name, lname)) { e = &g_dlog[i]; break; }
-    if (!e) {
-        if (g_dlog_n < DLOG_N) {
-            e = &g_dlog[g_dlog_n++];
+    int32_t ix = -1;
+    if (g_dlog_bkn)
+        for (int32_t i = g_dlog_bk[h & (g_dlog_bkn - 1)]; i >= 0; i = g_dlog[i].chain)
+            if (g_dlog[i].hash == h && !strcmp(g_dlog[i].name, lname)) { ix = i; break; }
+    if (ix >= 0) {
+        dlog_unlink_list(ix);
+    } else {
+        int stale = g_dlog_tail >= 0 && now - g_dlog[g_dlog_tail].last > DLOG_RECENT_SEC;
+        if (g_dlog_n >= g_dlog_cap && !stale && dlog_grow() != 0 && g_dlog_tail < 0) return;
+        if (g_dlog_n < g_dlog_cap) {
+            ix = (int32_t)g_dlog_n++;
         } else {
-            e = &g_dlog[0];
-            for (size_t i = 1; i < DLOG_N; i++)
-                if (g_dlog[i].last < e->last) e = &g_dlog[i];
+            ix = g_dlog_tail;                    /* устарела либо расти некуда — самая давняя */
+            dlog_unlink_list(ix);
+            dlog_unchain(ix);
         }
+        struct dlog_ent *e = &g_dlog[ix];
         snprintf(e->name, sizeof(e->name), "%s", lname);
         e->hash = h;
         e->count = 0;
+        dlog_chain(ix);
     }
+    struct dlog_ent *e = &g_dlog[ix];
     e->count++;
     e->last = now;
     e->hit = (int16_t)hit;
+    dlog_push_head(ix);
 }
 
 static int dlog_cmp(const void *a, const void *b) {
@@ -103,11 +164,12 @@ static char *dlog_render(size_t *len) {
     size_t n = 0;
     FILE *f = open_memstream(&mem, &n);
     if (!f) return NULL;
-    struct dlog_ent *ord[DLOG_N];
+    struct dlog_ent **ord = malloc((g_dlog_n ? g_dlog_n : 1) * sizeof(*ord));
+    if (!ord) { fclose(f); free(mem); return NULL; }
     for (size_t i = 0; i < g_dlog_n; i++) ord[i] = &g_dlog[i];
     qsort(ord, g_dlog_n, sizeof(ord[0]), dlog_cmp);
     time_t mono = dlog_mono(), wall = time(NULL);
-    fprintf(f, "{\"schema\":1,\"running\":true,\"size\":%d,\"names\":[", DLOG_N);
+    fprintf(f, "{\"schema\":1,\"running\":true,\"size\":%zu,\"names\":[", g_dlog_cap > DLOG_MIN ? g_dlog_cap : (size_t)DLOG_MIN);
     for (size_t i = 0; i < g_dlog_n; i++) {
         const struct dlog_ent *e = ord[i];
         long ago = (long)(mono - e->last);
@@ -143,6 +205,7 @@ static char *dlog_render(size_t *len) {
     }
     /* Апстримы со своим транспортом и кэш (1.11): состояние, счётчики, последняя ошибка. Ключи
      * добавлены в конец — читатель схемы 1 их не знает и не спотыкается. */
+    free(ord);
     fputs("],\"upstreams\":[", f);
     dup_render(f);
     fputs("],\"cache\":", f);
@@ -274,7 +337,7 @@ int dlog_print(FILE *out) {
         int e = errno;
         close(fd);
         if (e == ENOENT || e == ECONNREFUSED) {
-            fprintf(out, "{\"schema\":1,\"running\":false,\"size\":%d,\"names\":[]}\n", DLOG_N);
+            fprintf(out, "{\"schema\":1,\"running\":false,\"size\":%d,\"names\":[]}\n", DLOG_MIN);
             return 0;
         }
         fprintf(stderr, "steer[warn] dns-log: %s: %s\n", path, strerror(e));

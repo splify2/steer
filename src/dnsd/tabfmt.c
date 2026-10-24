@@ -374,12 +374,17 @@ int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
     if (parse_header(st->buf, nl, &want, &upn, &cc, &other) != 0) return -1;
     want += upn;                 /* строки каналов и строки апстримов идут подряд */
 
-    size_t pos = nl + 1;
-    for (long i = 0; i < want; i++) {
+    size_t pos = st->scan_pos ? st->scan_pos : nl + 1;
+    for (long i = st->scan_pos ? st->scan_lines : 0; i < want; i++) {
         size_t line_end = find_nl(st->buf, st->len, pos);
-        if (line_end >= st->len) return 0; /* строк пока меньше, чем обещал счётчик */
+        if (line_end >= st->len) {
+            st->scan_pos = pos;                 /* досмотрим с этого места, когда придут байты */
+            st->scan_lines = i;
+            return 0;                           /* строк пока меньше, чем обещал счётчик */
+        }
         pos = line_end + 1;
     }
+    st->scan_pos = 0;
     /* pos — конец РОВНО ОДНОЙ таблицы: столько и передаётся в tabfmt_parse, остаток (начало
      * следующей, если демон прислал две таблицы одной записью в трубу) остаётся в буфере. */
     if (tabfmt_parse(st->buf, pos) != 0) return -1;
