@@ -2244,7 +2244,7 @@ int run_proxy(int listen_port, int upstream_port) {
              * backend'а под живым трафиком — страшно вполне. */
             /* Там, где из файла читают, он пишется сразу: перед засевом по просьбе загрузчика
              * и при выходе (fakeip_state_flush, fakeip.c). */
-            if (now - g_fakeip_last_rewrite >= FAKEIP_ANSWER_TTL) fakeip_state_flush();
+            if (now - g_fakeip_last_rewrite >= FAKEIP_ANSWER_TTL) fakeip_state_flush_async();
         }
         /* Тишина — спать до события: сигнал перезагрузки или остановки будит epoll_wait
          * через EINTR. Грязная таблица fake-IP — проснуться к сроку её перезаписи. */
