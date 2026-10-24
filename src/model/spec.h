@@ -1304,6 +1304,8 @@ int label_ok(const char *s);
  * l4 в списке параметров по той же причине, по которой там уже стоят from и realip: это
  * ещё один признак, по которому компилятор РАЗДЕЛЯЕТ группы, а значит и наборы. NULL —
  * «сужения нет», и тогда имя получается прежним, байт в байт. */
+/* Часть имени выхода не длиннее width для составных имён; длинное — с хэшем (parse.c). */
+void name_part(char *dst, size_t n, const char *name, size_t width);
 void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out, const char *kind,
                     const char (*from)[64], size_t from_n, int realip,
                     const struct l4match *l4);

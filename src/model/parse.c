@@ -227,6 +227,21 @@ static int twin_clash(const struct spec *sp, const char *out, int cd, int pd) {
     return 0;
 }
 
+/* Часть имени выхода в составном имени (набор nftables, устройство): не длиннее width. Имя, которое
+ * влезает, идёт как есть — от имени набора зависит перенос счётчиков (counter_find), и короткие
+ * имена меняться не должны. Длинное — начало и шесть шестнадцатеричных знаков FNV-1a полного
+ * имени: голая обрезка сливала выходы с общим началом в один набор (I-518). */
+void name_part(char *dst, size_t n, const char *name, size_t width) {
+    size_t len = strlen(name);
+    if (len <= width || width < 8) {
+        snprintf(dst, n, "%.*s", (int)width, name);
+        return;
+    }
+    uint32_t h = 2166136261u;
+    for (const unsigned char *q = (const unsigned char *)name; *q; q++) h = (h ^ *q) * 16777619u;
+    snprintf(dst, n, "%.*s%06x", (int)(width - 6), name, (unsigned)(h & 0xffffff));
+}
+
 void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out, const char *kind,
                     const char (*from)[64], size_t from_n, int realip,
                     const struct l4match *l4) {
@@ -239,19 +254,25 @@ void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out,
      * роутере — при обновлении движка, которое для человека выглядит как «ничего не менял». */
     if (!pd) {
         if (!rip && from_same(from, from_n, sp->lan.from, sp->lan.from_n)) {
-            snprintf(dst, n, "%.24s_%s", out, kind);
+            char o[32];
+            name_part(o, sizeof o, out, 24);
+            snprintf(dst, n, "%s_%s", o, kind);
             return;
         }
         /* Выход обрезается сильнее, чтобы имя с суффиксом осталось коротким: у наборов
          * nftables на старых ядрах предел длины 32 символа. */
         int cd = from_disc(sp, from, from_n);
-        snprintf(dst, n, "%.18s_%s_c%d%s%s", out, kind, cd, rip ? "r" : "",
+        char o[32];
+        name_part(o, sizeof o, out, 18);
+        snprintf(dst, n, "%s_%s_c%d%s%s", o, kind, cd, rip ? "r" : "",
                  !rip && twin_clash(sp, out, cd, 0) ? "x" : "");
         return;
     }
     /* Выход обрезается ещё сильнее: суффиксов теперь два, а предел в 32 символа тот же. */
     int cd = from_disc(sp, from, from_n);
-    snprintf(dst, n, "%.14s_%s_c%d%s_p%d%s", out, kind, cd, rip ? "r" : "", pd,
+    char o[32];
+    name_part(o, sizeof o, out, 14);
+    snprintf(dst, n, "%s_%s_c%d%s_p%d%s", o, kind, cd, rip ? "r" : "", pd,
              twin_clash(sp, out, cd, pd) ? "x" : "");
 }
 
@@ -262,7 +283,9 @@ void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out,
 void group_set_name_mixed(const struct spec *sp, char *dst, size_t n, const char *out,
                           const char *kind, const char (*from)[64], size_t from_n, int realip) {
     int rip = realip && !strcmp(kind, "dom");
-    snprintf(dst, n, "%.16s_%s_c%d%s_m", out, kind, from_disc(sp, from, from_n), rip ? "r" : "");
+    char o[32];
+    name_part(o, sizeof o, out, 16);
+    snprintf(dst, n, "%s_%s_c%d%s_m", o, kind, from_disc(sp, from, from_n), rip ? "r" : "");
 }
 
 /* Имя доп. группы канала — клауз набора с условиями, которых у канала нет (клиент, приложение,
@@ -272,7 +295,9 @@ void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char
                           const char *kind, const char (*from)[64], size_t from_n, int realip,
                           unsigned id) {
     int rip = realip && !strcmp(kind, "dom");
-    snprintf(dst, n, "%.12s_%s_c%d%s_e%u", out, kind, from_disc(sp, from, from_n),
+    char o[32];
+    name_part(o, sizeof o, out, 12);
+    snprintf(dst, n, "%s_%s_c%d%s_e%u", o, kind, from_disc(sp, from, from_n),
              rip ? "r" : "", id);
 }
 
