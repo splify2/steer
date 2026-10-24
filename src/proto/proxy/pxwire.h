@@ -20,8 +20,8 @@ size_t px_socks_addr(unsigned char *out, uint32_t dst_net, uint16_t dport_host);
 
 /* ---- shadowsocks: вывод ключей ------------------------------------------------------------- */
 
-/* Ключ из пароля (AEAD не-2022): EVP_BytesToKey на MD5, как в shadowsocks-libev. key_n — 16 или 32. */
-void px_ss_evp_key(const char *pass, unsigned char *key, size_t key_n);
+/* Ключ из пароля (AEAD не-2022): EVP_BytesToKey на MD5, как в shadowsocks-libev. key_n — 16 или 32. 0 — готово, -1 — отказ слоя хеширования. */
+int  px_ss_evp_key(const char *pass, unsigned char *key, size_t key_n);
 /* Подключ сессии (AEAD не-2022): HKDF-SHA1(key, salt, "ss-subkey"), длина — key_n. */
 int  px_ss_subkey(const unsigned char *key, size_t key_n, const unsigned char *salt,
                   unsigned char *subkey);

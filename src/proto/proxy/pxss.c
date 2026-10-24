@@ -110,7 +110,7 @@ static int ss_subkey(const struct px_node *n, const unsigned char *salt, unsigne
         return 0;
     }
     unsigned char master[32];
-    px_ss_evp_key(n->pass, master, n->ss_key_n);
+    if (px_ss_evp_key(n->pass, master, n->ss_key_n) != 0) return -1;
     return px_ss_subkey(master, n->ss_key_n, salt, subkey);
 }
 
@@ -150,18 +150,48 @@ static int ss_has_data(const void *sess) {
     return s->out_off < s->out_n || transport_has_data(&s->t);
 }
 
-/* Добавить к out зашифрованный кусок данных (len-кадр + полезная нагрузка). */
+/* Добавить к out зашифрованный кусок данных (len-кадр + полезная нагрузка). 0 — шифр отказал:
+ * возврат sc_aead_seal раньше не смотрели, и кусок с неинициализированным тегом уходил серверу
+ * как годный (I-416). */
 static size_t ss_seal_chunk(struct ss_sess *s, const unsigned char *p, size_t n,
                             unsigned char *out) {
     size_t o = 0;
     unsigned char lb[2] = { (unsigned char)(n >> 8), (unsigned char)n };
     memcpy(out + o, lb, 2);
-    sc_aead_seal(&s->enc, s->snonce, NULL, 0, out + o, 2, out + o + 2); nonce_inc(s->snonce);
+    if (sc_aead_seal(&s->enc, s->snonce, NULL, 0, out + o, 2, out + o + 2) != 0) return 0;
+    nonce_inc(s->snonce);
     o += 2 + 16;
     memcpy(out + o, p, n);
-    sc_aead_seal(&s->enc, s->snonce, NULL, 0, out + o, n, out + o + n); nonce_inc(s->snonce);
+    if (sc_aead_seal(&s->enc, s->snonce, NULL, 0, out + o, n, out + o + n) != 0) return 0;
+    nonce_inc(s->snonce);
     o += n + 16;
     return o;
+}
+
+/* Допечатать куски data[0, dn) в out с позиции *o и отправить всё, что накопилось, когда буфер
+ * полон. Прежде в хвосте первого куска стояло `break` на нехватке места: остаток данных молча
+ * терялся, а отправка возвращала SEND_OK (I-416, I-543) — поток клиента получал дыру. flushed — 1,
+ * если часть записи уже ушла: тогда окно закрыться уже не может «целиком» и отказ — SEND_FATAL.
+ * Возвращает SEND_*. */
+static int ss_seal_rest(struct ss_sess *s, const unsigned char *data, size_t dn, unsigned char *out,
+                        size_t cap, size_t *o, int *flushed) {
+    while (dn) {
+        size_t t = dn > SS_CHUNK ? SS_CHUNK : dn;
+        if (*o + t + 34 > cap) {
+            if (*o) {
+                int rc = transport_write(&s->t, out, *o);
+                if (rc == H2_EWINDOW && !*flushed) return SEND_AGAIN;
+                if (rc) return SEND_FATAL;
+                *flushed = 1;
+                *o = 0;
+            }
+        }
+        size_t k = ss_seal_chunk(s, data, t, out + *o);
+        if (!k) return SEND_FATAL;
+        *o += k;
+        data += t; dn -= t;
+    }
+    return SEND_OK;
 }
 
 /* AEAD-TCP: собрать первый кусок (соль, заголовок, данные) или продолжение. */
@@ -191,6 +221,7 @@ static int ss_send_tcp(const struct px_node *n, struct ss_sess *s, const unsigne
         memset(s->snonce, 0, 12);
         unsigned char addr[8];
         size_t al = px_socks_addr(addr, s->dst, s->dport);
+        int flushed = 0;
         if (s->is2022) {
             /* EIH для многопользовательского (один уровень реле). */
             if (n->ss_ipsk_n) {
@@ -199,26 +230,33 @@ static int ss_send_tcp(const struct px_node *n, struct ss_sess *s, const unsigne
                 /* EIH идёт сразу после соли, в открытую (до фикс-заголовка). */
                 memcpy(out + o, eih, 16); o += 16;
             }
+            /* Данные в var-заголовок берутся не все: длина var — 16 бит, а место в out конечно
+             * (соль, EIH, фикс-заголовок, теги). Остаток идёт обычными кусками следом. */
+            size_t room = sizeof out - o - (11 + 16) - 16 - (al + 2);
+            size_t take = dn;
+            if (take > room) take = room;
+            if (take > 0xFFFF - (al + 2)) take = 0xFFFF - (al + 2);
             /* Фикс-заголовок: type(0) ts(8) varlen(2). */
             unsigned char fixed[11];
             fixed[0] = 0;
             uint64_t ts = (uint64_t)time(NULL);
             for (int i = 0; i < 8; i++) fixed[1 + i] = (unsigned char)(ts >> (56 - 8 * i));
-            size_t varlen = al + 2 + dn;         /* адрес + padlen(2)=0 + данные */
+            size_t varlen = al + 2 + take;       /* адрес + padlen(2)=0 + данные */
             fixed[9] = (unsigned char)(varlen >> 8);
             fixed[10] = (unsigned char)varlen;
             memcpy(out + o, fixed, 11);
-            sc_aead_seal(&s->enc, s->snonce, NULL, 0, out + o, 11, out + o + 11); nonce_inc(s->snonce);
+            if (sc_aead_seal(&s->enc, s->snonce, NULL, 0, out + o, 11, out + o + 11) != 0) return SEND_FATAL;
+            nonce_inc(s->snonce);
             o += 11 + 16;
-            /* var: адрес + padlen(2)=0 + данные. */
-            static __thread unsigned char var[8 + 2 + TUNNEL_BUF];
-            memcpy(var, addr, al);
-            var[al] = 0; var[al + 1] = 0;
-            memcpy(var + al + 2, data, dn);
-            size_t vl = al + 2 + dn;
-            memcpy(out + o, var, vl);
-            sc_aead_seal(&s->enc, s->snonce, NULL, 0, out + o, vl, out + o + vl); nonce_inc(s->snonce);
-            o += vl + 16;
+            /* var: адрес + padlen(2)=0 + данные — собирается прямо в out, на месте. */
+            memcpy(out + o, addr, al);
+            out[o + al] = 0; out[o + al + 1] = 0;
+            memcpy(out + o + al + 2, data, take);
+            if (sc_aead_seal(&s->enc, s->snonce, NULL, 0, out + o, varlen, out + o + varlen) != 0)
+                return SEND_FATAL;
+            nonce_inc(s->snonce);
+            o += varlen + 16;
+            data += take; dn -= take;
         } else {
             /* Первый кусок: адрес + данные одним куском (≤ SS_CHUNK). */
             static __thread unsigned char first[8 + SS_CHUNK];
@@ -226,35 +264,43 @@ static int ss_send_tcp(const struct px_node *n, struct ss_sess *s, const unsigne
             memcpy(first, addr, al);
             size_t take = dn > SS_CHUNK - al ? SS_CHUNK - al : dn;
             memcpy(first + al, data, take); fn += take;
-            o += ss_seal_chunk(s, first, fn, out + o);
+            size_t k = ss_seal_chunk(s, first, fn, out + o);
+            if (!k) return SEND_FATAL;
+            o += k;
             data += take; dn -= take;
-            while (dn) {
-                size_t t = dn > SS_CHUNK ? SS_CHUNK : dn;
-                if (o + t + 34 > sizeof out) break;
-                o += ss_seal_chunk(s, data, t, out + o);
-                data += t; dn -= t;
-            }
         }
         s->header_sent = 1;
+        int sr = ss_seal_rest(s, data, dn, out, sizeof out, &o, &flushed);
+        if (sr == SEND_AGAIN) { s->header_sent = 0; return SEND_AGAIN; }
+        if (sr != SEND_OK) return sr;
         int rc = transport_write(&s->t, out, o);
-        if (rc == H2_EWINDOW) { s->header_sent = 0; return SEND_AGAIN; }
+        if (rc == H2_EWINDOW && !flushed) { s->header_sent = 0; return SEND_AGAIN; }
         return rc ? SEND_FATAL : SEND_OK;
     }
     /* Продолжение: обычные куски. */
     if (n->ss_method == SS_NONE)
         return transport_write(&s->t, data, dn) ? SEND_FATAL : SEND_OK;
-    while (dn) {
-        size_t t = dn > SS_CHUNK ? SS_CHUNK : dn;
-        if (o + t + 34 > sizeof out) {
-            if (transport_write(&s->t, out, o)) return SEND_FATAL;
-            o = 0;
-        }
-        o += ss_seal_chunk(s, data, t, out + o);
-        data += t; dn -= t;
-    }
+    /* SEND_AGAIN значит «ничего не ушло, повторите те же байты»: а счётчик nonce за это время уже
+     * ушёл вперёд — повтор запечатал бы те же данные со следующим номером, и сервер не открыл бы
+     * ни одного куска. Поэтому при отказе без единой записи счётчик возвращается. */
+    unsigned char n0[12];
+    memcpy(n0, s->snonce, 12);
+    int flushed = 0;
+    int sr = ss_seal_rest(s, data, dn, out, sizeof out, &o, &flushed);
+    if (sr == SEND_AGAIN) { memcpy(s->snonce, n0, 12); return SEND_AGAIN; }
+    if (sr != SEND_OK) return sr;
     int rc = o ? transport_write(&s->t, out, o) : 0;
-    if (rc == H2_EWINDOW) return SEND_AGAIN;
+    if (rc == H2_EWINDOW && !flushed) { memcpy(s->snonce, n0, 12); return SEND_AGAIN; }
     return rc ? SEND_FATAL : SEND_OK;
+}
+
+/* Пачка UDP ушла не вся (буфер сокета полон): остаток потерян, о чём раз в десять секунд говорим. */
+static void udp_partial_note(const char *who) {
+    static __thread time_t said;
+    time_t now = stack_now_s();
+    if (now - said < 10) return;
+    said = now;
+    fprintf(stderr, "steer[warn]: %s: буфер UDP полон — остаток пачки датаграмм потерян\n", who);
 }
 
 /* UDP: data — череда [длина(2)][датаграмма] (dgram_frame). Каждую — своим пакетом в сокет. */
@@ -262,6 +308,7 @@ static int ss_send_udp(const struct px_node *n, struct ss_sess *s, const unsigne
                        size_t dn) {
     const unsigned char *p = data;
     size_t left = dn;
+    unsigned sent = 0;                   /* датаграмм этой пачки, уже ушедших в сокет */
     while (left >= 2) {
         size_t dl = ((size_t)p[0] << 8) | p[1];
         p += 2; left -= 2;
@@ -285,13 +332,21 @@ static int ss_send_udp(const struct px_node *n, struct ss_sess *s, const unsigne
             size_t bl = al + dl;
             unsigned char zero[12] = { 0 };
             memcpy(pkt + o, body, bl);
-            sc_aead_seal(&k, zero, NULL, 0, pkt + o, bl, pkt + o + bl);
+            int sr = sc_aead_seal(&k, zero, NULL, 0, pkt + o, bl, pkt + o + bl);
             sc_aead_free(&k);
+            if (sr != 0) return SEND_FATAL;
             o += bl + 16;
         }
         ssize_t w = send(s->udpfd, pkt, o, MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return SEND_AGAIN;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* AGAIN — «ничего не ушло»: повтор пачки послал бы первые датаграммы дважды. Раз
+             * часть ушла, остаток — потеря, как у любого UDP при полном буфере. */
+            if (!sent) return SEND_AGAIN;
+            udp_partial_note("shadowsocks");
+            return SEND_OK;
+        }
         if (w != (ssize_t)o) return SEND_FATAL;
+        sent++;
         p += dl; left -= dl;
     }
     return left ? SEND_FATAL : SEND_OK;
@@ -423,6 +478,13 @@ static int ss_tcp_down(const struct px_node *n, struct ss_sess *s, const unsigne
         if (s->rx == RS_FIXED) {
             /* type(1)=1, ts(8), reqsalt(keylen), varlen(2). */
             if (s->acc[0] != 1 || memcmp(s->acc + 9, s->salt_sent, s->keylen) != 0) return -1;
+            /* SIP022: клиент обязан отвергнуть ответ, чья метка времени ушла от нашей больше чем на
+             * 30 с — это защита сервера от повтора записанного ответа чужим узлом. Раньше метка не
+             * читалась вовсе (I-416). */
+            uint64_t ts = 0;
+            for (int i = 0; i < 8; i++) ts = (ts << 8) | s->acc[1 + i];
+            int64_t skew = (int64_t)ts - (int64_t)time(NULL);
+            if (skew > 30 || skew < -30) return -1;
             size_t varlen = ((size_t)s->acc[9 + s->keylen] << 8) | s->acc[10 + s->keylen];
             s->rx = RS_PAY;
             s->want = varlen + 16;

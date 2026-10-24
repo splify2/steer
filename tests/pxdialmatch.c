@@ -7,6 +7,10 @@
 #include <string.h>
 #include <time.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "proxy.h"
 #include "pxdial.h"
@@ -110,7 +114,7 @@ void px_vmess_authid(const unsigned char cmdkey[16], uint64_t ts, const unsigned
 }
 uint32_t px_fnv1a(const unsigned char *p, size_t n) { (void)p; (void)n; return 0; }
 /* shadowsocks: вывод ключей и UDP — заглушки (AEAD-заглушка выше не шифрует: открытый текст на месте). */
-void px_ss_evp_key(const char *pass, unsigned char *key, size_t key_n) { (void)pass; memset(key, 1, key_n); }
+int px_ss_evp_key(const char *pass, unsigned char *key, size_t key_n) { (void)pass; memset(key, 1, key_n); return 0; }
 int px_ss_subkey(const unsigned char *key, size_t key_n, const unsigned char *salt, unsigned char *subkey) {
     (void)key; (void)salt; memset(subkey, 2, key_n); return 0;
 }
@@ -121,7 +125,22 @@ int px_ss2022_eih(const unsigned char *ipsk, size_t key_n, const unsigned char *
                   const unsigned char *salt, unsigned char out[16]) {
     (void)ipsk; (void)key_n; (void)upsk; (void)salt; memset(out, 4, 16); return 0;
 }
-int tr_dial_udp(const char *host, uint16_t port) { (void)host; (void)port; return -1; }
+/* UDP-сокет узла: g_udp_fd < 0 — не открывается; иначе подменный дескриптор, на который send() ниже
+ * не пишет, а считает вызовы и в g_udp_eagain-й по счёту отвечает EAGAIN (0 — никогда). */
+#define FAKE_UDP_FD 77
+static int g_udp_fd = -1;
+static int g_udp_calls, g_udp_eagain, g_udp_sent;
+int tr_dial_udp(const char *host, uint16_t port) { (void)host; (void)port; return g_udp_fd; }
+/* Голый TCP socks: tr_dial отдаёт свой конец сокетной пары, чужой стенд заполняет ответами заранее. */
+static int g_tcp_fd = -1;
+int tr_dial(const char *host, uint16_t port, int timeout_s) { (void)host; (void)port; (void)timeout_s; return g_tcp_fd; }
+ssize_t send(int fd, const void *buf, size_t n, int flags) {
+    if (fd != FAKE_UDP_FD) return syscall(SYS_sendto, fd, buf, n, flags, NULL, 0);
+    g_udp_calls++;
+    if (g_udp_eagain && g_udp_calls == g_udp_eagain) { errno = EAGAIN; return -1; }
+    g_udp_sent++;
+    return (ssize_t)n;
+}
 
 static unsigned char g_em[8192];
 static size_t g_em_n, g_em_calls;
@@ -333,6 +352,12 @@ static void test_vmess_window(void) {
 
 /* ---- shadowsocks 2022 ----------------------------------------------------------------------- */
 
+/* Метка времени ответа SIP022 — «сейчас»: сервер с часами в пределах 30 с. */
+static void put_ts(unsigned char *o) {
+    uint64_t ts = (uint64_t)time(NULL);
+    for (int i = 0; i < 8; i++) o[i] = (unsigned char)(ts >> (56 - 8 * i));
+}
+
 static void test_ss2022_big_chunk(void) {
     /* SIP022: кусок нагрузки — до 0xFFFF байт (у AEAD до 2022 — 0x3FFF). Ответ сервера с куском в
      * 20480 байт обязан дойти, а не рвать поток. */
@@ -353,7 +378,7 @@ static void test_ss2022_big_chunk(void) {
     static unsigned char rx[16 + (11 + 16 + 16) + (100 + 16) + (2 + 16) + (BIG + 16)];
     size_t o = 0;
     memset(rx + o, 7, 16); o += 16;                                  /* соль ответа */
-    rx[o++] = 1; memset(rx + o, 0, 8); o += 8;                        /* type, timestamp */
+    rx[o++] = 1; put_ts(rx + o); o += 8;                              /* type, timestamp */
     memcpy(rx + o, reqsalt, 16); o += 16;                             /* соль запроса */
     rx[o++] = 0; rx[o++] = 100; memset(rx + o, 0, 16); o += 16;       /* длина первого куска + тег */
     memset(rx + o, 'a', 100); o += 100; memset(rx + o, 0, 16); o += 16;
@@ -420,7 +445,7 @@ static size_t ss_stream(unsigned char *rx, unsigned char *want, size_t *want_n, 
     size_t o = 0; *want_n = 0;
     memset(rx + o, 7, 16); o += 16;
     if (is2022) {
-        rx[o++] = 1; memset(rx + o, 0, 8); o += 8;
+        rx[o++] = 1; put_ts(rx + o); o += 8;
         memcpy(rx + o, reqsalt, 16); o += 16;
         rx[o++] = (unsigned char)(plen >> 8); rx[o++] = (unsigned char)plen;
         memset(rx + o, 0, 16); o += 16;
@@ -503,7 +528,196 @@ static void test_vmess_down_room(void) {
     ops->close(sess); free(sess);
 }
 
+
+/* ---- I-416 / I-543: shadowsocks и socks ------------------------------------------------------- */
+
+/* Нагрузка, найденная в записанном потоке ss AEAD (шифр заглушён): соль, затем куски [длина+тег][данные+тег].
+ * Для 2022 за солью — фикс-заголовок и var-заголовок (адрес, набивка, данные) как первый кусок.
+ * Возвращает сумму нагрузки без адреса, -1 — поток не сходится. */
+static long ss_payload_sum(int is2022, size_t keylen) {
+    size_t p = keylen;
+    long sum = 0;
+    int first = 1;
+    if (is2022) {
+        if (g_tx_n < p + 27) return -1;
+        size_t vl = ((size_t)g_tx[p + 9] << 8) | g_tx[p + 10];
+        p += 27;
+        if (p + vl + 16 > g_tx_n) return -1;
+        sum += (long)vl - 7 - 2;
+        p += vl + 16;
+        first = 0;
+    }
+    while (p < g_tx_n) {
+        if (p + 18 > g_tx_n) return -1;
+        size_t l = ((size_t)g_tx[p] << 8) | g_tx[p + 1];
+        p += 18;
+        if (p + l + 16 > g_tx_n) return -1;
+        sum += (long)l - (first ? 7 : 0);
+        first = 0;
+        p += l + 16;
+    }
+    return sum;
+}
+
+static void *ss_tcp_open(struct px_node *n, int method, size_t keylen, struct flow_key *k) {
+    const struct dialer_ops *ops = &proxy_ss_dialer;
+    memset(n, 0, sizeof *n);
+    n->proto = PX_SS; n->ss_method = method; n->ss_key_n = keylen;
+    void *sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    memset(k, 0, sizeof *k);
+    ops->flow_open(n, sess, k, 0);
+    ops->connect(n, sess, 2);
+    feed_reset(NULL, 0);
+    g_win = -1;
+    return sess;
+}
+
+/* Хвост первого куска не теряется: запись больше места в буфере отправки уходит вся (прежде `break` бросал
+ * остаток, а отправка отвечала SEND_OK). */
+static void test_ss_first_tail(void) {
+    const struct dialer_ops *ops = &proxy_ss_dialer;
+    static unsigned char big[40000];
+    memset(big, 'x', sizeof big);
+    struct px_node n; struct flow_key k;
+    void *sess = ss_tcp_open(&n, SS_AES128_GCM, 16, &k);
+    int rc = ops->send(&n, sess, &k, 0, big, sizeof big);
+    check("ss aead: запись 40000 байт — SEND_OK", SEND_OK, rc);
+    check("ss aead: в поток ушла вся нагрузка, хвост первого куска не потерян", (long)sizeof big,
+          ss_payload_sum(0, 16));
+    ops->close(sess); free(sess);
+
+    sess = ss_tcp_open(&n, SS_2022_AES128, 16, &k);
+    rc = ops->send(&n, sess, &k, 0, big, sizeof big);
+    check("ss 2022: запись 40000 байт — SEND_OK", SEND_OK, rc);
+    check("ss 2022: в поток ушла вся нагрузка", (long)sizeof big, ss_payload_sum(1, 16));
+    ops->close(sess); free(sess);
+}
+
+/* Отказ окна без единой записи не двигает счётчик nonce: повтор тех же байтов запечатывается теми же
+ * номерами, иначе сервер не открыл бы ни одного куска. */
+static void test_ss_again_nonce(void) {
+    const struct dialer_ops *ops = &proxy_ss_dialer;
+    struct px_node n; struct flow_key k;
+    void *sess = ss_tcp_open(&n, SS_AES128_GCM, 16, &k);
+    check("ss: первая запись ушла", SEND_OK, ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5));
+    g_win = 10; g_win_base = g_tx_n;                     /* окно закрыто: запись в 100 байт не влезет */
+    unsigned char d[100]; memset(d, 'd', sizeof d);
+    g_first_cnt = -1;
+    check("ss: окно закрыто — SEND_AGAIN", SEND_AGAIN, ops->send(&n, sess, &k, 0, d, sizeof d));
+    long first = g_first_cnt;
+    g_win = -1;
+    g_first_cnt = -1;
+    check("ss: повтор ушёл", SEND_OK, ops->send(&n, sess, &k, 0, d, sizeof d));
+    check("ss: повтор запечатан теми же номерами nonce, что и отказанная попытка", first, g_first_cnt);
+    ops->close(sess); free(sess);
+}
+
+/* Пачка UDP: AGAIN на первой датаграмме — «ничего не ушло», на следующих — остаток теряется без повтора
+ * (повтор послал бы ушедшие дважды). */
+static void test_udp_partial(const char *who, const struct dialer_ops *ops, struct px_node *n) {
+    char t[160];
+    static unsigned char batch[3 * (2 + 4)];
+    for (int i = 0; i < 3; i++) { batch[i * 6] = 0; batch[i * 6 + 1] = 4; memset(batch + i * 6 + 2, 'u' + i, 4); }
+    struct flow_key k; memset(&k, 0, sizeof k);
+    void *sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    g_udp_fd = FAKE_UDP_FD;
+    int sp[2] = { -1, -1 };
+    if (n->proto == PX_SOCKS) {          /* управляющее TCP: выбор метода и ответ ASSOCIATE (0.0.0.0:0) */
+        unsigned char rep[] = { 5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0 || write(sp[1], rep, sizeof rep) != (ssize_t)sizeof rep) return;
+        g_tcp_fd = sp[0];
+    }
+    ops->flow_open(n, sess, &k, 1);
+    ops->connect(n, sess, 2);
+
+    g_udp_calls = 0; g_udp_sent = 0; g_udp_eagain = 1;
+    snprintf(t, sizeof t, "%s udp: AGAIN на первой датаграмме — SEND_AGAIN, ничего не ушло", who);
+    check(t, SEND_AGAIN, ops->send(n, sess, &k, 1, batch, sizeof batch));
+    check("  ушло датаграмм", 0, g_udp_sent);
+
+    g_udp_calls = 0; g_udp_sent = 0; g_udp_eagain = 2;
+    snprintf(t, sizeof t, "%s udp: AGAIN на второй — SEND_OK (остаток потерян, повтора нет)", who);
+    check(t, SEND_OK, ops->send(n, sess, &k, 1, batch, sizeof batch));
+    check("  ушла одна датаграмма", 1, g_udp_sent);
+
+    g_udp_eagain = 0; g_udp_calls = 0; g_udp_sent = 0;
+    check("  без отказов уходят все три", SEND_OK, ops->send(n, sess, &k, 1, batch, sizeof batch));
+    check("  ушло датаграмм", 3, g_udp_sent);
+    ops->close(sess); free(sess);
+    if (sp[1] >= 0) close(sp[1]);
+    g_tcp_fd = -1;
+    g_udp_fd = -1;
+}
+
+/* socks5: ответ авторизации — версия 1 (RFC 1929), а не 5; пароль принят только при 01 00. */
+static int socks_auth_try(unsigned char ver, unsigned char status) {
+    const struct dialer_ops *ops = &proxy_socks_dialer;
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -999;
+    unsigned char rep[] = { 5, 2, ver, status, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };   /* выбор метода, авторизация, ответ CONNECT */
+    if (write(sp[1], rep, sizeof rep) != (ssize_t)sizeof rep) return -999;
+    g_tcp_fd = sp[0];
+    struct px_node n; memset(&n, 0, sizeof n);
+    n.proto = PX_SOCKS; n.socks_ver = 5;
+    snprintf(n.user, sizeof n.user, "u"); snprintf(n.pass, sizeof n.pass, "p");
+    void *sess = calloc(1, ops->sess_size);
+    ops->clear(sess);
+    struct flow_key k; memset(&k, 0, sizeof k);
+    ops->flow_open(&n, sess, &k, 0);
+    int rc = ops->connect(&n, sess, 2);
+    ops->close(sess); free(sess);
+    close(sp[1]);
+    g_tcp_fd = -1;
+    return rc;
+}
+
+static void test_socks(void) {
+    check("socks5: авторизация 01 00 принята", 0, socks_auth_try(1, 0));
+    check("socks5: ответ авторизации с чужой версией (00 00) — PX_EPROTO", PX_EPROTO, socks_auth_try(0, 0));
+    check("socks5: ответ 01 01 — отказ пароля", PX_EAUTH, socks_auth_try(1, 1));
+    struct px_node n; memset(&n, 0, sizeof n);
+    n.proto = PX_SOCKS; n.socks_ver = 5;
+    test_udp_partial("socks", &proxy_socks_dialer, &n);
+    memset(&n, 0, sizeof n);
+    n.proto = PX_SS; n.ss_method = SS_AES128_GCM; n.ss_key_n = 16;
+    test_udp_partial("ss", &proxy_ss_dialer, &n);
+}
+
+/* SIP022: метка времени ответа сервера — в пределах 30 с от нашей. */
+static void test_ss2022_ts(void) {
+    const struct dialer_ops *ops = &proxy_ss_dialer;
+    long skews[] = { 0, 25, -25, 40, -40 };
+    int want[] = { 0, 0, 0, -1, -1 };
+    for (size_t i = 0; i < sizeof skews / sizeof *skews; i++) {
+        struct px_node n; struct flow_key k;
+        void *sess = ss_tcp_open(&n, SS_2022_AES128, 16, &k);
+        ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5);
+        unsigned char reqsalt[16]; memcpy(reqsalt, g_tx, 16);
+        unsigned char rx[16 + 27 + 16 + 100 + 16];
+        size_t o = 0;
+        memset(rx + o, 7, 16); o += 16;
+        uint64_t ts = (uint64_t)((long)time(NULL) + skews[i]);
+        rx[o++] = 1;
+        for (int b = 0; b < 8; b++) rx[o++] = (unsigned char)(ts >> (56 - 8 * b));
+        memcpy(rx + o, reqsalt, 16); o += 16;
+        rx[o++] = 0; rx[o++] = 100; memset(rx + o, 0, 16); o += 16;
+        memset(rx + o, 'a', 100); o += 100; memset(rx + o, 0, 16); o += 16;
+        g_em_n = 0; g_em_calls = 0;
+        int dr = ops->deliver(&n, sess, 0, rx, o, emit, NULL);
+        char t[120];
+        snprintf(t, sizeof t, "ss 2022: метка времени ответа %+lds от нашей — %s", skews[i], want[i] ? "отказ" : "принята");
+        check(t, want[i], dr);
+        ops->close(sess); free(sess);
+    }
+}
+
 int main(void) {
+    test_ss_first_tail();
+    test_ss_again_nonce();
+    test_socks();
+    test_ss2022_ts();
     test_ss2022_big_chunk();
     test_ss_down_room();
     test_vmess_down_room();
