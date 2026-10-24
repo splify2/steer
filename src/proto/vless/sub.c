@@ -10,6 +10,7 @@
  */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "vless.h"
@@ -866,7 +867,7 @@ static size_t parse_xray(const char *text, struct vless_node *out, size_t max,
                 if (n >= max) {
                     /* Мест больше нет. Считаем как пропущенный, а не теряем молча: то же
                      * обещание, что у списка ссылок — арифметика обязана сходиться. */
-                    sl_skip_note(st, &node, "узлов больше, чем помещается");
+                    sl_skip_note(st, &node, VLESS_SKIP_OVERFLOW);
                     continue;
                 }
                 if (node_usable(&node) == 0) out[n++] = node;
@@ -1170,7 +1171,7 @@ static size_t parse_clash(const char *text, struct vless_node *out, size_t max, 
             p = y_item(f, p, end, dash);
             struct vless_node node;
             if (!clash_node(f, &node)) { if (st) st->foreign++; continue; }
-            if (n >= max) { sl_skip_note(st, &node, "узлов больше, чем помещается"); continue; }
+            if (n >= max) { sl_skip_note(st, &node, VLESS_SKIP_OVERFLOW); continue; }
             if (node_usable(&node) == 0) out[n++] = node;
             else sl_skip_note(st, &node, node.skip_reason);
             continue;
@@ -1420,7 +1421,7 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                  * непрочитанным: то же обещание, что у конфига Xray, — арифметика
                  * usable + skipped + foreign обязана сходиться с числом ссылок. */
                 if (rc == 0 && n < max) out[n++] = node;
-                else if (rc == 0) sl_skip_note(st, &node, "узлов больше, чем помещается");
+                else if (rc == 0) sl_skip_note(st, &node, VLESS_SKIP_OVERFLOW);
                 else sl_skip_note(st, &node, rc > 0 ? node.skip_reason
                                                  : "ссылка не разобрана");
             } else if (strstr(line, "://") && st) {
@@ -1458,8 +1459,12 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
 
 /* Подписка из файла целиком: буферы и массив узлов — в куче по размеру файла и числу узлов в нём.
  * Раньше буферы были статикой в 256 КиБ, а узлов — 128 (статика в 157 КБ): подписка длиннее
- * теряла хвост, узлов больше — «не помещаются». Мест под узлы столько, сколько в тексте ссылок
- * («://») и объектов Xray («"protocol"») — верхняя граница числа узлов; остаток арифметики
+ * теряла хвост, узлов больше — «не помещаются». Места под узлы сначала берутся по подстрокам
+ * («://», «"protocol"»), но это лишь первое приближение: в Clash YAML узел описан ключом `type`,
+ * в sing-box JSON — тоже, и подписка из пяти узлов давала «пригодно 1, пропущено 4». Верное число
+ * знает только сам разбор, поэтому массив расширяется по его собственному счёту: узлы, которым
+ * не хватило места, он считает в st->overflow, и повторный разбор получает ровно столько
+ * дополнительных мест (разбор чистый, повтор даёт тот же результат). Остаток арифметики
  * (usable + skipped + foreign) сходится, как и прежде. Потолок файла — 64 МиБ: защита от файла-
  * не-подписки под этим именем, а не размер подписки (тысяча узлов — сотни килобайт).
  * NULL — файл не открылся, слишком велик или нет памяти; иначе массив (free), *cnt — узлов. */
@@ -1484,8 +1489,22 @@ struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_su
     size_t hint = 1;
     for (const char *q = text; (q = strstr(q, "://")); q += 3) hint++;
     for (const char *q = text; (q = strstr(q, "\"protocol\"")); q += 10) hint++;
-    struct vless_node *nodes = calloc(hint, sizeof(*nodes));
-    if (nodes) *cnt = vless_parse_sub(text, nodes, hint, st);
+    struct vless_node *nodes = NULL;
+    size_t cap = hint;
+    struct vless_sub_stats tmp;
+    for (;;) {
+        free(nodes);
+        nodes = calloc(cap, sizeof(*nodes));
+        if (!nodes) break;
+        *cnt = vless_parse_sub(text, nodes, cap, &tmp);
+        if (!tmp.overflow) break;
+        /* Лишних не больше, чем насчитал разбор: каждый узел сверх cap он считает. Переполнение
+         * размера — отказ по памяти, а не усечение молча. */
+        if (tmp.overflow > SIZE_MAX / sizeof(*nodes) - cap) { free(nodes); nodes = NULL; break; }
+        cap += tmp.overflow;
+    }
+    if (!nodes) *cnt = 0;
+    else if (st) *st = tmp;
     free(raw);
     free(dec);
     return nodes;

@@ -1299,6 +1299,35 @@ int main(void) {
         free(nodes);
     }
 
+    /* ---- Clash YAML и sing-box JSON из файла: узлы описаны ключом `type`, а не «://» и "protocol" ---
+     * Места под узлы сначала считались по подстрокам, и подписка из пяти узлов давала «пригодно 1,
+     * пропущено 4: узлов больше, чем помещается». Теперь массив растёт по счёту самого разбора. */
+    for (int fmt = 0; fmt < 2; fmt++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/submatch-multi%d.%d", fmt, (int)getpid());
+        FILE *f = fopen(path, "w");
+        if (f && fmt == 0) fputs("proxies:\n", f);
+        if (f && fmt == 1) fputs("{\"outbounds\":[", f);
+        for (int i = 0; f && i < 5; i++) {
+            if (fmt == 0)
+                fprintf(f, "  - name: c%d\n    type: vless\n    server: x%d.example\n    port: 443\n"
+                           "    uuid: 11111111-2222-3333-4444-555555555555\n    tls: true\n    servername: s\n", i, i);
+            else
+                fprintf(f, "%s{\"type\":\"vless\",\"tag\":\"n%d\",\"server\":\"x%d.example\",\"server_port\":443,"
+                           "\"uuid\":\"11111111-2222-3333-4444-555555555555\",\"tls\":{\"enabled\":true,\"server_name\":\"s\"}}",
+                        i ? "," : "", i, i);
+        }
+        if (f && fmt == 1) fputs("]}", f);
+        if (f) fclose(f);
+        struct vless_sub_stats st;
+        size_t n = 0;
+        struct vless_node *nodes = vless_load_sub(path, &n, &st);
+        unlink(path);
+        check_n(fmt ? "sing-box JSON, 5 узлов: взяты все" : "Clash YAML, 5 узлов: взяты все", 5, (long)n);
+        check_n("  пропущенных нет", 0, (long)st.skipped);
+        free(nodes);
+    }
+
     /* ---- Vision только поверх голого TCP: Xray отказывает на любом другом транспорте (I-479) ---
      *
      * Xray 26.3.27 на узле с flow=xtls-rprx-vision и network, отличном от raw/tcp, отвечает

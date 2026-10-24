@@ -917,6 +917,7 @@ int sl_link_usable_post(struct vless_node *n) {
 void sl_skip_note(struct vless_sub_stats *st, const struct vless_node *n, const char *reason) {
     if (!st) return;
     st->skipped++;
+    if (!strcmp(reason, VLESS_SKIP_OVERFLOW)) st->overflow++;
     for (size_t i = 0; i < st->reasons_n; i++) {
         if (!strcmp(st->reasons[i].reason, reason)) { st->reasons[i].count++; return; }
     }

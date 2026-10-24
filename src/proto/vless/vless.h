@@ -137,7 +137,13 @@ struct vless_sub_stats {
     size_t reasons_n;                            /* сколько РАЗНЫХ причин собрано */
     size_t reasons_dropped;                      /* узлов, чья причина не влезла */
     struct vless_skip reasons[VLESS_SKIP_REASONS];
+    size_t overflow;                             /* узлов, не поместившихся в `max` разбора */
 };
+
+/* Причина отказа узлу, которому не хватило места в массиве вызывающего. sl_skip_note по ней
+ * ведёт st->overflow: vless_load_sub по этому числу знает, насколько расширить массив. */
+#define VLESS_SKIP_OVERFLOW "узлов больше, чем помещается"
+
 
 /* Ключ `insecure` выхода: подписке разрешено нести узлы с allowInsecure, а клиент не проверяет
  * сертификат узлов security=tls. Ставится процессом выхода ДО разбора подписки; по умолчанию — 0.
