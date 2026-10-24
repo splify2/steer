@@ -91,18 +91,25 @@ for mode in ready early separate silent; do
 import socket, sys, time
 host, mode = sys.argv[1], sys.argv[2]
 line = b"i319-" + mode.encode() + b"-" + b"x" * 3000 + b"\n"
-s = socket.create_connection((host, 9 if mode == "silent" else 7), timeout=10)
-if mode != "early":
-    time.sleep(0.5)                      # поток к узлу успевает открыться
-if mode == "separate":
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    s.sendall(line)
-    time.sleep(0.3)
-else:
-    # CORK: ядро склеивает хвост данных и FIN в один сегмент.
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
-    s.sendall(line)
-s.shutdown(socket.SHUT_WR)
+try:
+    s = socket.create_connection((host, 9 if mode == "silent" else 7), timeout=10)
+    if mode != "early":
+        time.sleep(0.5)                      # поток к узлу успевает открыться
+    if mode == "separate":
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.sendall(line)
+        time.sleep(0.3)
+    else:
+        # CORK: ядро склеивает хвост данных и FIN в один сегмент.
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
+        s.sendall(line)
+    s.shutdown(socket.SHUT_WR)
+except OSError as e:
+    # Сброс соединения до или во время запроса — это ответ туннеля, а не поломка стенда: без этого
+    # исключение (ENOTCONN из shutdown) обрывало скрипт по set -e посреди прогона, без приговора по
+    # случаю и без журнала туннеля.
+    print("соединение оборвано до конца запроса: %r" % e)
+    sys.exit(0)
 buf = b""
 try:
     while True:
@@ -117,7 +124,7 @@ ok = buf == (b"" if mode == "silent" else b"ECHO " + line)
 print("ok" if ok else "нет конца потока за 10 с" if buf is None else
       "получено %d байт вместо %d" % (len(buf), len(line) + 5))
 PY
-)
+) || got="клиент стенда упал"
     after=$(ip netns exec "$NS" nft list chain inet fin out | sed -n 's/.*packets \([0-9]*\).*/\1/p')
     merged=$((after - before))
     echo "  $mode: $got (сегментов FIN+данные: $merged)"
