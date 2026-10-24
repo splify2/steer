@@ -468,7 +468,20 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
     for (size_t i = 0; i < s->client_n; i++)
         if (s->client[i].name[0]) { name_take(cn, s->client[i].name, "lan", cname[i]); cshow[i] = 1; }
     for (size_t i = 0; i < s->list_n; i++)
-        if (s->list[i].name[0]) { name_take(ln, s->list[i].name, "all", lname[i]); lshow[i] = 1; }
+        if (s->list[i].name[0] && !s->list[i].l4.quic_block) {
+            name_take(ln, s->list[i].name, "all", lname[i]);
+            lshow[i] = 1;
+        }
+    /* Копия списка под `quic: block` носит имя оригинала (v2.c, quic_clone) и в спеке не
+     * печатается: правило ссылается на оригинал и пишет `quic: block` само. */
+    for (size_t i = 0; i < s->list_n; i++) {
+        if (!s->list[i].name[0] || !s->list[i].l4.quic_block) continue;
+        for (size_t k = 0; k < s->list_n; k++)
+            if (lshow[k] && !strcmp(s->list[k].name, s->list[i].name)) {
+                memcpy(lname[i], lname[k], sizeof(lname[i]));
+                break;
+            }
+    }
     for (size_t r = 0; r < s->rule_n; r++) {
         const struct spec_rule *ru = &s->rule[r];
         char base[32];
@@ -482,9 +495,9 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
         for (size_t k = 0; k < ru->lists_n; k++) {
             size_t l = ru->lists[k];
             const struct spec_list *li = &s->list[l];
-            if (lshow[l]) continue;
+            if (lshow[l] || lname[l][0]) continue;
             /* «Весь трафик» без сужения — это `to: all`, списка для него не нужно. */
-            if (li->all && l4match_empty(&li->l4) && !li->srs_n && !li->prefixes_n && !li->domains_n)
+            if (li->all && l4match_plain(&li->l4) && !li->srs_n && !li->prefixes_n && !li->domains_n)
                 continue;
             name_take(ln, base, "all", lname[l]);
             lshow[l] = 1;
@@ -593,7 +606,7 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
             if (rn) fseq(&w, "for", refs, rn);
             rn = 0;
             for (size_t k = 0; k < ru->lists_n; k++)
-                if (lshow[ru->lists[k]]) refs[rn++] = lname[ru->lists[k]];
+                if (lshow[ru->lists[k]] || lname[ru->lists[k]][0]) refs[rn++] = lname[ru->lists[k]];
             if (rn) fseq(&w, "to", refs, rn);
             else fs(&w, "to", "all");
             free(refs);
@@ -608,6 +621,7 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
                     fs(&w, "dns", du->name);
                 }
             }
+            if (ru->quic_block) fs(&w, "quic", "block");
             if (ru->dev_scope) fs(&w, "scope", "device");
             if (ru->disabled) { fk(&w, "enabled"); fputs("false", f); }
             fputs(" }\n", f);

@@ -1713,10 +1713,32 @@ static int merge_clients(struct v2 *x, struct spec_rule *r, const struct ynode *
     return 0;
 }
 
+/* `quic: block`: правило получает КОПИЮ своего списка с признаком выключенного QUIC (l4.quic_block).
+ * Копия, а не признак на списке: список в lists общий, им могут пользоваться другие правила, и QUIC
+ * у них остаётся. Массивы файлов копия делит с оригиналом (арена спеки живёт до конца процесса).
+ * Правило «весь трафик» (lists_n == 0) получает безымянный список all, как у перевода v1. */
+static int quic_clone(struct v2 *x, struct spec_rule *r, const struct ynode *qn, const char *rn) {
+    struct spec *s = x->s;
+    if (spec_reserve_list(s, s->list_n + 1) != 0)
+        return fail(x, qn, "правило %s: недостаточно памяти для спеки (списков: %zu)", rn, s->list_n + 1);
+    struct spec_list *m = &s->list[s->list_n];
+    if (r->lists_n) {
+        *m = s->list[r->lists[0]];      /* имя остаётся: печать узнаёт по нему оригинал */
+    } else {
+        memset(m, 0, sizeof(*m));
+        m->all = 1;
+        /* r->lists выделен под число пунктов to (не меньше одного) — место есть. */
+    }
+    m->l4.quic_block = 1;
+    r->lists[0] = (unsigned)s->list_n++;
+    r->lists_n = 1;
+    return 0;
+}
+
 static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     struct spec *s = x->s;
     static const char *const K[] = { "name", "for", "to", "out", "resolve", "dns", "enabled", "scope",
-                                     NULL };
+                                     "quic", NULL };
     if (spec_reserve_rule(s, s->rule_n + 1) != 0)
         return fail(x, n, "rules: недостаточно памяти для спеки (правил: %zu)", s->rule_n + 1);
     struct spec_rule *r = &s->rule[s->rule_n];
@@ -1835,12 +1857,43 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         else if (strcmp(sv, "global") != 0) return fail(x, sn, "%s: «%s» — нужен device или global", w, sv);
     }
 
+    const struct ynode *qn = ynode_get(n, "quic");
+    if (qn) {
+        snprintf(w, sizeof(w), "правило %s: quic", rn);
+        if (str_of(x, qn, w, &sv)) return -1;
+        /* allow — записанное умолчание, как both у proto: QUIC не трогается. */
+        if (!strcmp(sv, "block")) r->quic_block = 1;
+        else if (strcmp(sv, "allow") != 0)
+            return fail(x, qn, "%s: «%s» — нужен block (отвергать UDP/443) или allow", w, sv);
+    }
+
     /* Ссылки на клиентов правила до объединения — для проверок ниже. */
     size_t refs_n = r->clients_n;
     unsigned *refs = refs_n ? (unsigned *)spec_memdup(s, r->clients, refs_n * sizeof(unsigned)) : NULL;
     if (refs_n && !refs) return fail(x, n, "правило %s: недостаточно памяти для спеки", rn);
     if (r->lists_n > 1 && merge_lists(x, r, tn, rn)) return -1;
     if (r->clients_n > 1 && merge_clients(x, r, fn, rn)) return -1;
+    if (r->quic_block) {
+        const struct spec_list *l = r->lists_n ? &s->list[r->lists[0]] : NULL;
+        /* Проверки — и у выключенного правила: это не смысл правила, а применимость ключа. */
+        if (l && l->srs_n) {
+            unsup(x, qn, "правило %s: quic: block со списком srs — пока со списками prefixes_file и "
+                  "domains_file или с to: all", rn);
+        } else if (l && l->l4.proto == CH_PROTO_TCP) {
+            return fail(x, qn, "правило %s: quic: block, а список только tcp — QUIC это UDP", rn);
+        } else if (l && l->l4.ports_n) {
+            int has = 0;
+            for (size_t i = 0; i < l->l4.ports_n; i++)
+                if (l->l4.ports[i].lo <= 443 && 443 <= l->l4.ports[i].hi) has = 1;
+            if (!has)
+                return fail(x, qn, "правило %s: quic: block, а порты списка не содержат 443", rn);
+        }
+        for (size_t i = 0; i < refs_n; i++)
+            if (x->cl[refs[i]].local)
+                return fail(x, qn, "правило %s: quic: block действует на трафик клиентов раздачи, а не "
+                            "самого телефона (uid, self)", rn);
+        if (!(l && l->srs_n) && quic_clone(x, r, qn, rn)) return -1;
+    }
 
     /* Выключенное правило не проверяем по смыслу (довод — в v1.c: иначе сломанное правило нельзя
      * выключить, только удалить). Имена в нём всё равно обязаны существовать: ссылка хранится
