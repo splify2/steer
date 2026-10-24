@@ -29,6 +29,7 @@
 #include "spec.h"
 #include "evline.h"
 #include "jsonw.h"
+#include "pool.h"
 #include "probe.h"
 #include "thrstack.h"
 
@@ -343,6 +344,13 @@ static void nw_down(const char *why) {
     evline_emit("down", "why", EVLINE_STR, w[0] ? w : "узел не отвечает", (const char *)NULL);
 }
 
+/* Проверка узла наперегонки (pool_race_first, I-535). Рукопожатие и авторизацию в мс несёт строка why. */
+static int hy_race_probe(void *arg, int id, char *why, size_t n) {
+    int hs = 0;
+    int rc = hy2_probe(&((const struct hy2_node *)arg)[id], 8, why, n, &hs);
+    if (rc == 0) snprintf(why, n, "рукопожатие и авторизация %d мс", hs);
+    return rc;
+}
 static void *nw_thread(void *arg) {
     (void)arg;
     const struct hy2_node *cur = &g_nw.nodes[g_nw.cur];
@@ -388,13 +396,20 @@ static void *nw_thread(void *arg) {
             due = nw_now_ms() + (uint64_t)g_nw_period_s * 1000ull;
             continue;
         }
-        for (size_t k = 0; k < g_nw.sel_n; k++) {
-            const struct hy2_node *n = &g_nw.nodes[g_nw.sel[k]];
-            if (g_nw.sel[k] == g_nw.cur || hy2_probe(n, NW_TIMEOUT_S, why, sizeof(why), &hs) != 0)
-                continue;
-            fprintf(stderr, LOG_W2 "узел %s не отвечает, а %s отвечает — выхожу, чтобы выбрать "
-                            "узел заново\n", cur->name, n->name);
-            exit(0);
+        {
+            /* Остальные кандидаты — наперегонки: ответил хоть один — выходим, чтобы выбрать узел заново. */
+            int *others = malloc((g_nw.sel_n ? g_nw.sel_n : 1) * sizeof(*others));
+            size_t on = 0;
+            for (size_t k = 0; others && k < g_nw.sel_n; k++)
+                if (g_nw.sel[k] != g_nw.cur) others[on++] = g_nw.sel[k];
+            struct pool_race pr = { .n = on, .ids = others, .probe = hy_race_probe, .arg = (void *)g_nw.nodes };
+            int w = on ? pool_race_first(&pr, why, sizeof(why)) : -1;
+            free(others);
+            if (w >= 0) {
+                fprintf(stderr, LOG_W2 "узел %s не отвечает, а %s отвечает — выхожу, чтобы выбрать "
+                                "узел заново\n", cur->name, g_nw.nodes[w].name);
+                exit(0);
+            }
         }
         retry = retry * 2 > NW_RETRY_MAX_S ? NW_RETRY_MAX_S : retry * 2;
         due = nw_now_ms() + retry * 1000ull;
@@ -462,6 +477,16 @@ static void h2_ready(void *arg, const char *dev) {
                         "таблица выхода не тронута\n", dev);
 }
 
+static const char *g_race_out;
+static void hy_race_start(void *arg, int id, size_t k, size_t n) {
+    (void)arg; (void)id;
+    h2_probe_report(g_race_out, PROBE_RUNNING, (int)k, (int)n);
+    evline_emit("node", "n", EVLINE_INT, (long)k, "total", EVLINE_INT, (long)n, (const char *)NULL);
+}
+static void hy_race_fail(void *arg, int id, const char *why) {
+    fprintf(stderr, LOG_I2 "%s — %s\n", ((const struct hy2_node *)arg)[id].name, why);
+}
+
 int cmd_hysteria2(const char *spec_path, const char *out_name) {
     evline_open();
     struct output *o = NULL;
@@ -510,20 +535,13 @@ int cmd_hysteria2(const char *spec_path, const char *out_name) {
         chosen = sel[0];
         probe_clear(out_name);
     } else {
-        for (size_t i = 0; i < sel_n; i++) {
-            char why[256];
-            int hs = 0;
-            h2_probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)sel_n);
-            evline_emit("node", "n", EVLINE_INT, (long)(i + 1), "total", EVLINE_INT, (long)sel_n,
-                        (const char *)NULL);
-            if (hy2_probe(&nodes[sel[i]], 8, why, sizeof(why), &hs) == 0) {
-                fprintf(stderr, LOG_I2 "выбран %s (рукопожатие и авторизация %d мс)\n",
-                        nodes[sel[i]].name, hs);
-                chosen = sel[i];
-                break;
-            }
-            fprintf(stderr, LOG_I2 "%s — %s\n", nodes[sel[i]].name, why);
-        }
+        /* Кандидаты — наперегонки (pool_race_first, I-535), как у VLESS. */
+        char why[256];
+        g_race_out = out_name;
+        struct pool_race pr = { .n = sel_n, .ids = sel, .probe = hy_race_probe, .arg = nodes,
+                                .on_start = hy_race_start, .on_fail = hy_race_fail };
+        chosen = pool_race_first(&pr, why, sizeof why);
+        if (chosen >= 0) fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[chosen].name, why);
     }
     if (chosen < 0) {
         h2_probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);

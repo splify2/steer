@@ -2920,6 +2920,52 @@ static void t_connectors_burst(void) {
     if (done != N || mx <= CONNECTORS) fprintf(stderr, "  исполнено %d, одновременно до %d, %.2f с\n", done, mx, dt);
 }
 
+/* I-535: проба кандидатов наперегонки. Мёртвые узлы молчат до срока (здесь 2 с — вместо 8), живой отвечает
+ * за 50 мс. Последовательный перебор отдал бы 4 × 2 с + 50 мс, гонка — задержку запуска пятого (4 × 250 мс). */
+struct race_t { int alive_from; int alive_ms; int dead_ms; };
+static int race_probe(void *arg, int id, char *why, size_t n) {
+    const struct race_t *r = arg;
+    int alive = id >= r->alive_from;
+    struct timespec ts = { 0, (long)(alive ? r->alive_ms : r->dead_ms) * 1000000L };
+    nanosleep(&ts, NULL);
+    if (alive) { snprintf(why, n, "жив %d", id); return 0; }
+    snprintf(why, n, "молчит %d", id);
+    return -1;
+}
+static void t_race(void) {
+    static const int ids[6] = { 10, 11, 12, 13, 14, 15 };
+    static struct race_t dead4 = { .alive_from = 14, .alive_ms = 50, .dead_ms = 2000 };
+    char why[64];
+    struct pool_race pr = { .n = 6, .ids = ids, .probe = race_probe, .arg = &dead4 };
+    uint64_t t0 = now_ns();
+    int w = pool_race_first(&pr, why, sizeof why);
+    double dt = (double)(now_ns() - t0) / 1e9;
+    check(w == 14 && !strcmp(why, "жив 14") && dt < 1.6,
+          "I-535: четыре мёртвых узла по 2 с и живой пятый — ответ за ~1 с (последовательно было бы 8 с)");
+    if (w != 14 || dt >= 1.6) fprintf(stderr, "  победитель %d (%s), %.2f с\n", w, why, dt);
+
+    /* Порядок предпочтения: первый живой ответил за 50 мс, второй стартует через 250 — побеждает первый. */
+    static struct race_t both = { .alive_from = 10, .alive_ms = 50, .dead_ms = 0 };
+    pr.arg = &both;
+    w = pool_race_first(&pr, why, sizeof why);
+    check(w == 10, "I-535: живые первый и второй — побеждает первый, порядок предпочтения сохранён");
+
+    /* Не ответил никто: -1 и причина последнего отказа; быстрые отказы не ждут задержки запуска. */
+    static struct race_t none = { .alive_from = 99, .alive_ms = 0, .dead_ms = 100 };
+    pr.arg = &none;
+    t0 = now_ns();
+    w = pool_race_first(&pr, why, sizeof why);
+    dt = (double)(now_ns() - t0) / 1e9;
+    check(w == -1 && !strncmp(why, "молчит", 6) && dt < 1.0,
+          "I-535: ни один не ответил — -1 с причиной, быстрые отказы идут один за другим без задержки запуска");
+    /* Один кандидат и ни одного. */
+    pr.n = 1;
+    pr.arg = &both;
+    check(pool_race_first(&pr, why, sizeof why) == 10, "I-535: один кандидат — проверяется он");
+    pr.n = 0;
+    check(pool_race_first(&pr, why, sizeof why) == -1, "I-535: кандидатов нет — -1");
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -2941,6 +2987,7 @@ int main(void) {
 
     t_no_connectors();
     t_connectors_burst();
+    t_race();
     t_table_grow();
     t_tcp_tun_rst();
     t_bring_up_table();

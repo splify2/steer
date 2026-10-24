@@ -332,6 +332,136 @@ static void pl_publish(void) {
     if (fclose(f) != 0 || rename(tmp, path) != 0) unlink(tmp);
 }
 
+/* ---- проба кандидатов наперегонки (pool.h) ------------------------------------------------------ */
+
+struct race_ctx {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;                  /* на CLOCK_MONOTONIC: ждём срока следующего старта */
+    size_t n, started, finished;
+    int *ids;
+    int (*probe)(void *arg, int id, char *why, size_t why_n);
+    void (*on_fail)(void *arg, int id, const char *why);
+    void *arg;
+    int winner;                         /* id победителя; -1 — пока нет */
+    char why[256];
+    int refs;                           /* вызывающий и каждый поток пробы */
+};
+
+struct race_job { struct race_ctx *rc; size_t k; };
+
+static void race_unref(struct race_ctx *rc) {
+    pthread_mutex_lock(&rc->mu);
+    int last = --rc->refs == 0;
+    pthread_mutex_unlock(&rc->mu);
+    if (!last) return;
+    pthread_cond_destroy(&rc->cv);
+    pthread_mutex_destroy(&rc->mu);
+    free(rc->ids);
+    free(rc);
+}
+
+static void *race_thread(void *p) {
+    struct race_job *j = p;
+    struct race_ctx *rc = j->rc;
+    int id = rc->ids[j->k];
+    free(j);
+    char why[256];
+    why[0] = '\0';
+    int ok = rc->probe(rc->arg, id, why, sizeof why) == 0;
+    pthread_mutex_lock(&rc->mu);
+    rc->finished++;
+    if (ok && rc->winner < 0) {
+        rc->winner = id;
+        snprintf(rc->why, sizeof rc->why, "%s", why);
+    } else if (!ok && rc->winner < 0) {
+        snprintf(rc->why, sizeof rc->why, "%s", why);
+    }
+    pthread_cond_broadcast(&rc->cv);
+    pthread_mutex_unlock(&rc->mu);
+    if (!ok && rc->on_fail) rc->on_fail(rc->arg, id, why);
+    race_unref(rc);
+    return NULL;
+}
+
+static uint64_t race_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+int pool_race_first(const struct pool_race *r, char *why, size_t why_n) {
+    if (why_n) why[0] = '\0';
+    if (!r->n) return -1;
+    struct race_ctx *rc = calloc(1, sizeof(*rc));
+    if (!rc) return -1;
+    rc->ids = malloc(r->n * sizeof(*rc->ids));
+    if (!rc->ids) { free(rc); return -1; }
+    memcpy(rc->ids, r->ids, r->n * sizeof(*rc->ids));
+    pthread_mutex_init(&rc->mu, NULL);
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&rc->cv, &ca);
+    pthread_condattr_destroy(&ca);
+    rc->n = r->n;
+    rc->probe = r->probe;
+    rc->on_fail = r->on_fail;
+    rc->arg = r->arg;
+    rc->winner = -1;
+    rc->refs = 1;
+    int stagger = r->stagger_ms > 0 ? r->stagger_ms : POOL_RACE_STAGGER_MS;
+    size_t par = r->max_par > 0 ? (size_t)r->max_par : POOL_RACE_PAR;
+
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, thread_stack(512 * 1024));      /* как у слежки: соединение на стеке */
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    uint64_t next = 0;
+    pthread_mutex_lock(&rc->mu);
+    while (rc->winner < 0 && rc->finished < rc->n) {
+        size_t running = rc->started - rc->finished;
+        uint64_t now = race_now_ms();
+        if (rc->started < rc->n && running < par && (running == 0 || now >= next)) {
+            size_t k = rc->started++;
+            struct race_job *j = malloc(sizeof(*j));
+            pthread_t t;
+            int err = j ? 0 : -1;
+            if (j) {
+                j->rc = rc;
+                j->k = k;
+                rc->refs++;
+                pthread_mutex_unlock(&rc->mu);
+                if (r->on_start) r->on_start(r->arg, rc->ids[k], k + 1, rc->n);
+                err = pthread_create(&t, &a, race_thread, j);
+                pthread_mutex_lock(&rc->mu);
+            }
+            if (err != 0) {
+                /* Потока нет — кандидат считается отказавшим (память, лимит потоков), гонка идёт дальше. */
+                if (j) { free(j); rc->refs--; }
+                rc->finished++;
+                snprintf(rc->why, sizeof rc->why, "не удалось запустить проверку");
+            }
+            next = race_now_ms() + (uint64_t)stagger;
+            continue;
+        }
+        if (rc->started < rc->n && running < par) {
+            struct timespec ts;
+            uint64_t at = next;
+            ts.tv_sec = (time_t)(at / 1000ull);
+            ts.tv_nsec = (long)(at % 1000ull) * 1000000L;
+            pthread_cond_timedwait(&rc->cv, &rc->mu, &ts);
+        } else {
+            pthread_cond_wait(&rc->cv, &rc->mu);
+        }
+    }
+    pthread_attr_destroy(&a);
+    int w = rc->winner;
+    if (why_n) snprintf(why, why_n, "%s", rc->why);
+    pthread_mutex_unlock(&rc->mu);
+    race_unref(rc);
+    return w;
+}
+
 /* ---- слежка: проверки ---------------------------------------------------------------------------- */
 
 static int pl_probe(int node, char *why, size_t n) {
@@ -339,6 +469,13 @@ static int pl_probe(int node, char *why, size_t n) {
 }
 
 static void pl_order(int *out);
+
+/* Проверка кандидата в потоке гонки (pool_race_first). Отказы в журнал не пишутся: круг повторяется каждые
+ * 15-30 с, и подписка на сотню узлов залила бы его. */
+static int pl_race_probe(void *arg, int c, char *why, size_t n) {
+    (void)arg;
+    return pl_probe(c, why, n);
+}
 
 /* Узел признан мёртвым: соединения, выбравшие его раньше, — в сброс (pl_stale). Под замком. */
 static void pl_mark_dead(int node) {
@@ -383,21 +520,36 @@ static int pl_refill(int i, int own) {
         pl_order(ord);
         pthread_mutex_unlock(&g_pl.mu);
     }
-    for (size_t k = 0; k < g_pl.cf.sel_n; k++) {
+    /* Кандидаты — наперегонки (pool_race_first): мёртвые первые узлы не держат замену по 8 с на каждый.
+     * Победитель может оказаться занятым к моменту записи (другой слот успел раньше) — тогда он
+     * выбывает из списка, и гонка идёт заново среди остальных. */
+    int *cand = malloc((g_pl.cf.sel_n ? g_pl.cf.sel_n : 1) * sizeof(*cand));
+    size_t cn = 0;
+    for (size_t k = 0; cand && k < g_pl.cf.sel_n; k++) {
         int c = ord ? ord[k] : g_pl.cf.sel[k];
         pthread_mutex_lock(&g_pl.mu);
         int busy = c == prev || pl_taken(c, i);
         pthread_mutex_unlock(&g_pl.mu);
-        if (busy) continue;
-        if (pl_probe(c, why, sizeof why) != 0) {
+        if (!busy) cand[cn++] = c;
+    }
+    while (cn) {
+        struct pool_race pr = { .n = cn, .ids = cand, .probe = pl_race_probe, .arg = NULL };
+        int c = pool_race_first(&pr, why, sizeof why);
+        if (c < 0) {
             if (!g_pl.why[0]) snprintf(g_pl.why, sizeof g_pl.why, "%s", why);
             pl_publish();
-            continue;
+            break;
         }
         pthread_mutex_lock(&g_pl.mu);
         struct pl_slot *sl = &g_pl.slot[i];
-        if (sl->node != prev) { pthread_mutex_unlock(&g_pl.mu); free(ord); return 1; }  /* занял замер */
-        if (pl_taken(c, i)) { pthread_mutex_unlock(&g_pl.mu); continue; }
+        if (sl->node != prev) { pthread_mutex_unlock(&g_pl.mu); free(ord); free(cand); return 1; }  /* занял замер */
+        if (pl_taken(c, i)) {
+            pthread_mutex_unlock(&g_pl.mu);
+            size_t w = 0;
+            for (size_t k = 0; k < cn; k++) if (cand[k] != c) cand[w++] = cand[k];
+            cn = w;
+            continue;
+        }
         sl->node = c;
         sl->up = 1;
         __atomic_add_fetch(&sl->gen, 1, __ATOMIC_RELEASE);  /* pl_stale читает без замка */
@@ -416,8 +568,10 @@ static int pl_refill(int i, int own) {
         stack_nodes_changed();
         pl_publish();
         free(ord);
+        free(cand);
         return 1;
     }
+    free(cand);
     free(ord);
     pthread_mutex_lock(&g_pl.mu);
     struct pl_slot *sl = &g_pl.slot[i];
@@ -636,23 +790,31 @@ static int pl_lat_start(void) {
 /* Кандидаты в порядке замены. pick: latency — по последнему замеру (быстрые первыми, без замера — по
  * порядку предпочтения, не ответившие — последними); иначе — порядок предпочтения. out — sel_n. Под
  * замком. */
+struct pl_ordkey { long key; size_t pos; int id; };
+static int pl_order_cmp(const void *a, const void *b) {
+    const struct pl_ordkey *x = a, *y = b;
+    if (x->key != y->key) return x->key < y->key ? -1 : 1;
+    return x->pos < y->pos ? -1 : x->pos > y->pos;
+}
+
 static void pl_order(int *out) {
     size_t n = g_pl.cf.sel_n;
     for (size_t k = 0; k < n; k++) out[k] = g_pl.cf.sel[k];
     if (g_pl.cf.pick != POOL_PICK_LATENCY) return;
-    for (size_t i = 1; i < n; i++) {                /* вставками: устойчиво, кандидатов десятки */
-        int v = out[i], lv = pl_lat_of(v);
-        long kv = lv >= 0 ? lv : lv == -2 ? 0x7ffffff0L : 0x7fffffffL;
-        size_t j = i;
-        while (j > 0) {
-            int lu = pl_lat_of(out[j - 1]);
-            long ku = lu >= 0 ? lu : lu == -2 ? 0x7ffffff0L : 0x7fffffffL;
-            if (ku <= kv) break;
-            out[j] = out[j - 1];
-            j--;
-        }
-        out[j] = v;
+    /* Устойчивая сортировка по ключу (ключ, исходный номер) — n log n: кандидатов может быть тысячи (подписка
+     * на сотни узлов), а порядок считается под замком (I-535; прежде — вставками, n²). Нет памяти — порядок
+     * предпочтения без перестановки. */
+    struct pl_ordkey *kv = malloc((n ? n : 1) * sizeof(*kv));
+    if (!kv) return;
+    for (size_t k = 0; k < n; k++) {
+        int lv = pl_lat_of(out[k]);
+        kv[k].key = lv >= 0 ? lv : lv == -2 ? 0x7ffffff0L : 0x7fffffffL;
+        kv[k].pos = k;
+        kv[k].id = out[k];
     }
+    qsort(kv, n, sizeof(*kv), pl_order_cmp);
+    for (size_t k = 0; k < n; k++) out[k] = kv[k].id;
+    free(kv);
 }
 
 /* ---- дайлер пула --------------------------------------------------------------------------------- */

@@ -373,6 +373,20 @@ static const char *vl_pool_name(const void *node) {
     return ((const struct vless_node *)node)->name;
 }
 
+/* Проверка узла наперегонки (pool_race_first): имя выхода — для строки состояния, номер проверки — «k из n». */
+static const char *out_name_race;
+static int vl_race_probe(void *arg, int id, char *why, size_t n) {
+    return vless_probe(&((const struct vless_node *)arg)[id], 8, why, n);
+}
+static void vl_race_start(void *arg, int id, size_t k, size_t n) {
+    (void)arg; (void)id;
+    vl_probe_report(out_name_race, PROBE_RUNNING, (int)k, (int)n);
+    evline_emit("node", "n", EVLINE_INT, (long)k, "total", EVLINE_INT, (long)n, (const char *)NULL);
+}
+static void vl_race_fail(void *arg, int id, const char *why) {
+    fprintf(stderr, LOG_I2 "%s — %s\n", ((const struct vless_node *)arg)[id].name, why);
+}
+
 int cmd_vless(const char *spec_path, const char *out_name) {
     evline_open();
     struct output *o = NULL;
@@ -480,18 +494,14 @@ int cmd_vless(const char *spec_path, const char *out_name) {
          * Счёт идёт по КАНДИДАТАМ, а не по подписке: при `nodes: [6,7,12]` человек ждёт «2 из
          * 3», а не «2 из 26» — перебираться будут три, и обещать двадцать шесть значило бы
          * назвать чужое ожидание. */
-        for (size_t i = 0; i < sel_n; i++) {
-            char why[256];
-            vl_probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)sel_n);
-            evline_emit("node", "n", EVLINE_INT, (long)(i + 1), "total", EVLINE_INT, (long)sel_n,
-                        (const char *)NULL);
-            if (vless_probe(&nodes[sel[i]], 8, why, sizeof(why)) == 0) {
-                fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[sel[i]].name, why);
-                chosen = sel[i];
-                break;
-            }
-            fprintf(stderr, LOG_I2 "%s — %s\n", nodes[sel[i]].name, why);
-        }
+        /* Кандидаты — наперегонки (pool_race_first, I-535): первый ответивший побеждает, а мёртвые первые
+         * узлы не держат подъём по 8 с на каждый. Порядок предпочтения — порядок запуска. */
+        char why[256];
+        out_name_race = out_name;
+        struct pool_race pr = { .n = sel_n, .ids = sel, .probe = vl_race_probe, .arg = g_nodes,
+                                .on_start = vl_race_start, .on_fail = vl_race_fail };
+        chosen = pool_race_first(&pr, why, sizeof why);
+        if (chosen >= 0) fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[chosen].name, why);
     }
     if (chosen < 0) {
         vl_probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);
