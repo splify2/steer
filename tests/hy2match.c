@@ -309,6 +309,9 @@ static void test_urls(void) {
           !strcmp(n.obfs_pass, "abcd") && !n.gecko_min);
     CHECK(hy2_parse_bandwidth("100") == 12500000 && hy2_parse_bandwidth("1 gbps") == 125000000);
     CHECK(hy2_parse_bandwidth("8mbps") == 1000000 && hy2_parse_bandwidth("abc") == 0);
+    /* I-543: «nan» и «inf» разбираются strtod; NaN не меньше нуля, и приведение его к целому не определено. */
+    CHECK(hy2_parse_bandwidth("nan") == 0 && hy2_parse_bandwidth("-nan mbps") == 0);
+    CHECK(hy2_parse_bandwidth("inf") == 0 && hy2_parse_bandwidth("infinity gbps") == 0);
 }
 
 static void test_sub(void) {

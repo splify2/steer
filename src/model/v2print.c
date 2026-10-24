@@ -135,8 +135,16 @@ static void name_take(struct names *ns, const char *base, const char *reserved, 
     char b[32];
     snprintf(b, sizeof(b), "%.24s", base);
     snprintf(dst, 32, "%s", b);
-    for (int k = 2; name_used(ns, dst) || (reserved && !strcmp(dst, reserved)); k++)
-        snprintf(dst, 32, "%.24s-%d", b, k % 1000);
+    /* Суффикс — полным числом, а не k % 1000: на тысяче занятых имён с общим началом остаток
+     * возвращался к уже занятым, и цикл не кончался (I-543). Основа ужимается ровно настолько,
+     * чтобы с суффиксом в 32 байта (с нулём) помещались все его цифры. */
+    for (int k = 2; name_used(ns, dst) || (reserved && !strcmp(dst, reserved)); k++) {
+        int digits = 1;
+        for (int t = k; t >= 10; t /= 10) digits++;
+        int keep = 30 - digits;                 /* 32 - ноль - дефис - цифры */
+        if (keep > 24) keep = 24;
+        snprintf(dst, 32, "%.*s-%d", keep, b, k);
+    }
     if (ns->n == ns->cap) {
         size_t nc = ns->cap ? ns->cap * 2 : 32;
         char (*nv)[32] = realloc(ns->v, nc * sizeof(*nv));

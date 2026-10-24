@@ -161,6 +161,26 @@ int main(void) {
               VISION_EPROTO, rc2);
     }
 
+    /* I-543: открытый ответ короче 21 байта (UUID и заголовок кадра) отдаётся сразу, а не лежит в
+     * накопителе, пока не придёт ещё что-нибудь. */
+    {
+        struct vision v;
+        memset(&v, 0, sizeof(v));
+        memcpy(v.uuid, UUID, 16);
+        size_t used = 0, pl_n = 0;
+        const unsigned char *pl = NULL;
+        int rc = vision_unwrap(&v, (const unsigned char *)"HTTP/1.1 4", 10, &used, &pl, &pl_n);
+        check("короткий открытый ответ: разбор без ошибки", 0, rc);
+        check("короткий открытый ответ: отдан целиком сразу", 10, (long)pl_n);
+        check("короткий открытый ответ: байты те же", 0, pl_n == 10 ? memcmp(pl, "HTTP/1.1 4", 10) : 1);
+        /* Совпадающее с UUID начало — ещё не решение: ждём, пока видно, что это Vision. */
+        struct vision w;
+        memset(&w, 0, sizeof(w));
+        memcpy(w.uuid, UUID, 16);
+        rc = vision_unwrap(&w, UUID, 8, &used, &pl, &pl_n);
+        check("начало UUID: ждём остальное, ничего не отдаём", 1, rc == 0 && pl_n == 0);
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

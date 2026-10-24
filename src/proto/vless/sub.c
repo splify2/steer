@@ -9,6 +9,7 @@
  * общая, и «в ней 26 узлов, а steer видит 17» должно объясняться цифрой, а не догадкой.
  */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -592,13 +593,35 @@ static int sj_bool(struct sj *j) {
     return 0;
 }
 
-/* Число: либо 123, либо "123". */
+/* Десятичное число из строки без переполнения: atol на длинной строке не определён, а strtol
+ * насыщается молча. -1 — не влезло в long (вызывающие так же понимают «не число»: порт и размер
+ * не бывают отрицательными). */
+static long str_num(const char *s) {
+    char *e;
+    errno = 0;
+    long v = strtol(s, &e, 10);
+    return errno == ERANGE ? -1 : v;
+}
+
+/* Число: либо 123, либо "123". Цифры сверх буфера не бросаются (раньше разбор вставал посреди
+ * числа, и остаток ломал следующее поле), а считаются переполнением; строка, не влезшая в буфер,
+ * — тоже: её 23 первых цифры были бы другим числом (I-543). */
 static long sj_num(struct sj *j) {
     sj_ws(j);
     char b[24] = "";
-    if (*j->p == '"') sj_str(j, b, sizeof b);
-    else { size_t i = 0; while (*j->p >= '0' && *j->p <= '9' && i + 1 < sizeof b) b[i++] = *j->p++; b[i] = 0; if (!i) sj_skip(j); }
-    return atol(b);
+    int over = 0;
+    if (*j->p == '"') {
+        if (sj_str(j, b, sizeof b) != 0 || strlen(b) + 1 >= sizeof b) over = 1;
+    } else {
+        size_t i = 0;
+        while (*j->p >= '0' && *j->p <= '9') {
+            if (i + 1 < sizeof b) b[i++] = *j->p; else over = 1;
+            j->p++;
+        }
+        b[i] = 0;
+        if (!i) sj_skip(j);
+    }
+    return over ? -1 : str_num(b);
 }
 
 struct sb_ws { long ed; char ed_hdr[40]; };
@@ -1120,10 +1143,10 @@ static int clash_node(const struct yflat *f, struct vless_node *n) {
             if (hdr_append(u.headers, sizeof u.headers, k + 16, f->kv[i].v) != 0) u.bad = 1;
         }
         const char *ed = yf_get(f, "ws-opts.max-early-data"), *eh = yf_get(f, "ws-opts.early-data-header-name");
-        if (ed && atol(ed) > 0 && eh && !strcmp(eh, "Sec-WebSocket-Protocol") && !strchr(u.path, '?')) {
+        if (ed && str_num(ed) > 0 && eh && !strcmp(eh, "Sec-WebSocket-Protocol") && !strchr(u.path, '?')) {
             size_t o = strlen(u.path);
             if (!o) { u.path[0] = '/'; u.path[1] = 0; o = 1; }
-            snprintf(u.path + o, sizeof u.path - o, "?ed=%ld", atol(ed));
+            snprintf(u.path + o, sizeof u.path - o, "?ed=%ld", str_num(ed));
         }
         snprintf(n->path, sizeof n->path, "%s", u.path);
         snprintf(n->http_host, sizeof n->http_host, "%s", u.host);

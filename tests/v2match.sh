@@ -195,6 +195,26 @@ if [ -x "$XK" ]; then
     printf 'version: 2\noutputs:\n  hy: { kind: hysteria2, subscription: sub/hy }\n' > "$tmp/hy3.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec hy3.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "туннель пишется kind: tunnel, protocol: hysteria2"; then ok; else bad "kind: hysteria2 в v2 — отказ с подсказкой" "$out"; fi
+    # I-543: тысяча клиентов с длинным общим началом имени — печать v2 даёт каждому своё имя и кончается
+    # (суффикс считался как k % 1000: остаток возвращался к занятым, и цикл не завершался).
+    {
+        printf '10.1.0.0/16\n' > "$tmp/many.lst"
+        {
+            printf 'version: 2\noutputs:\n  vpn: { kind: interface, device: wg0 }\nclients:\n'
+            i=0
+            while [ $i -lt 1005 ]; do
+                printf '  cccccccccccccccccccccccccc%04d: { addr: [192.168.%d.%d] }\n' $i $((i / 250)) $((i % 250 + 1))
+                i=$((i + 1))
+            done
+            printf 'lists:\n  work: { prefixes_file: %s/many.lst }\nrules:\n  - { to: work, out: vpn }\n' "$tmp"
+        } > "$tmp/many.yaml"
+        timeout 30 "$XKA" spec convert --spec "$tmp/many.yaml" > "$tmp/many.out" 2>&1
+        mrc=$?
+        mu=$(sed -n '/^clients:/,/^[a-z]/p' "$tmp/many.out" | grep -c '^  c')
+        if [ "$mrc" = 0 ] && [ "$mu" = 1005 ] &&
+           [ "$(sed -n '/^clients:/,/^[a-z]/p' "$tmp/many.out" | grep '^  c' | sed 's/:.*//' | sort -u | wc -l)" = 1005 ]; then ok; else
+            bad "1005 клиентов с общим началом имени — печать кончается, имена различны" "rc=$mrc клиентов=$mu"; fi
+    }
     # transport: у туннеля (шаг 5 выпуска 1.10) — фильтр транспортов узлов подписки: одно имя или
     # список; convert печатает его обратно (одно — строкой, несколько — списком в порядке имён) и
     # остаётся неподвижной точкой; отказы — с местом.

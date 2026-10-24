@@ -82,6 +82,14 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
     struct reality_state rst;
     unsigned char hello[2560];
     size_t hello_n = 0;
+    int hrc;
+    struct ech_heap {
+        struct ech_cfg cfg;
+        struct ech_state st;
+        unsigned char list[1100];
+        unsigned char outer[6144];
+        size_t outer_n;
+    } *eh = NULL;
     /* ws и httpupgrade просят в ALPN ТОЛЬКО http/1.1 — как Xray (WebsocketHandshakeContext у
      * uTLS переписывает ALPN отпечатка на один http/1.1) и как сам Chrome на соединении
      * веб-сокета. С обычной парой «h2, http/1.1» сервер за TLS вправе выбрать h2, и наш запрос
@@ -91,30 +99,23 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
     const int h11 = alpn && !strcmp(alpn, "http/1.1");
     int rc = h11 ? reality_build_hello_carry(&cfg, &rst, &car, hello, sizeof(hello), &hello_n)
                  : reality_build_hello(&cfg, &rst, hello, sizeof(hello), &hello_n);
-    if (rc) return rc;
+    if (rc) { hrc = rc; goto out; }
 
     /* ECH (security=tls, `ech=` узла): собранный выше Hello с настоящим SNI становится внутренним, по
      * проводу идёт внешний с public_name из ECHConfig (ech.h). Буферы — в куче: внешний Hello вмещает
      * зашифрованную копию внутреннего, то есть вдвое больше обычного, а стек рабочих потоков мал. */
-    struct ech_heap {
-        struct ech_cfg cfg;
-        struct ech_state st;
-        unsigned char list[1100];
-        unsigned char outer[6144];
-        size_t outer_n;
-    } *eh = NULL;
     struct tls13_ech te = { 0 };
     const unsigned char *send_hello = hello;
     size_t send_n = hello_n;
     if (is_tls && n->ech && n->ech[0]) {
         eh = calloc(1, sizeof *eh);
-        if (!eh) return TR_EIO;
+        if (!eh) { hrc = TR_EIO; goto out; }
         int ln = ech_b64_decode(n->ech, eh->list, sizeof eh->list);
         int er = ln <= 0 ? ECH_EPARSE : ech_pick(eh->list, (size_t)ln, &eh->cfg);
         if (er == 0) er = ech_wrap(&eh->cfg, hello, hello_n, eh->outer, sizeof eh->outer, &eh->outer_n, &eh->st);
         if (er != 0) {
-            free(eh);
-            return er;                              /* причина — ECH_E* (transport.c, tr_strerror) */
+            hrc = er;                               /* причина — ECH_E* (transport.c, tr_strerror) */
+            goto out;
         }
         send_hello = eh->outer;
         send_n = eh->outer_n;
@@ -129,8 +130,8 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
         ssize_t w = send(l->fd, send_hello + sent, send_n - sent, MSG_NOSIGNAL);
         if (w <= 0) {
             if (w < 0 && errno == EINTR) continue;
-            free(eh);
-            return TR_EIO;
+            hrc = TR_EIO;
+            goto out;
         }
         sent += (size_t)w;
     }
@@ -153,9 +154,11 @@ static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *
     auth.mldsa_pk = have_pqv ? pqv : NULL;
 
     if (eh) auth.ech = &te;
-    int hrc = tls13_handshake_auth(&l->tls, l->fd, send_hello, send_n, rst.priv, &auth);
+    hrc = tls13_handshake_auth(&l->tls, l->fd, send_hello, send_n, rst.priv, &auth);
+out:
     /* Эфемерный приватный ключ, общий секрет Reality, ключ аутентификатора и ключ ML-KEM нужны только до
-     * конца рукопожатия: дальше их держит лишь стек, и стираем сразу. */
+     * конца рукопожатия: дальше их держит лишь стек, и стираем сразу — на ЛЮБОМ выходе, не только на
+     * удавшемся рукопожатии: отказ сборки Hello, ECH или записи оставлял их на стеке (I-543). */
     steer_wipe(&rst, sizeof(rst));
     free(eh);
     return hrc;

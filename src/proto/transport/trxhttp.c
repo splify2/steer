@@ -493,6 +493,11 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
                 if (!rc) rc = h2_write(&x->up.h2, d + off, m);
                 if (!rc) rc = h2_end_stream(&x->up.h2);
                 if (!rc) x->seq++;
+                /* «Всё или ничего»: окна проверены до первого куска, но если запись всё же
+                 * отказала «окно закрыто» ПОСЛЕ того, как часть кусков ушла, повторять её целиком
+                 * нельзя — первые куски дошли бы дважды, и поток сервера разошёлся бы с клиентским.
+                 * Это уже не «повторите», а обрыв (I-543). */
+                if (rc == H2_EWINDOW && off) rc = H2_EIO;
                 off += m;
             }
             int dr = up_drain(&x->up);

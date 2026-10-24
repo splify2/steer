@@ -122,6 +122,33 @@ static void t_json(void) {
     check_s("  \\u002b раскодирован", "K+=", o);
     check("json: объект в массиве", 0, wb_json_get(d, "result.x.1.q", o, sizeof o));
     check_s("  значение", "z", o);
+    check("json: суррогатная пара — один знак UTF-8 из четырёх байт", 0,
+          wb_json_get("{\"k\":\"a\\ud83d\\ude00b\"}", "k", o, sizeof o));
+    check_s("  эмодзи U+1F600, а не две половины по три байта", "a\xF0\x9F\x98\x80" "b", o);
+    check("json: одиночная верхняя половина", 0, wb_json_get("{\"k\":\"\\ud83dX\"}", "k", o, sizeof o));
+    check_s("  — U+FFFD, не CESU-8", "\xEF\xBF\xBD" "X", o);
+    check("json: одиночная нижняя половина", 0, wb_json_get("{\"k\":\"\\ude00\"}", "k", o, sizeof o));
+    check_s("  — тоже U+FFFD", "\xEF\xBF\xBD", o);
+    {
+        /* I-543: обрыв не принимается за конец ответа. */
+        char r1[] = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcde";
+        int st = 0; size_t off = 0, bl = 0;
+        check("http: тела меньше Content-Length — обрыв, а не короткое тело", -2,
+              wb_http_split(r1, strlen(r1), &st, &off, &bl));
+        char r2[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde";
+        check("http: Content-Length сошёлся", 0, wb_http_split(r2, strlen(r2), &st, &off, &bl));
+        check("  статус и тело", 200 * 100 + 5, st * 100 + (int)bl);
+        char r3[] = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabcde\r\n3\r\nfgh";
+        check("http: chunked без завершающего куска — обрыв", -2, wb_http_split(r3, strlen(r3), &st, &off, &bl));
+        char r4[] = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabcde\r\n3\r\nfgh\r\n0\r\n\r\n";
+        check("http: chunked целиком", 0, wb_http_split(r4, strlen(r4), &st, &off, &bl));
+        check("  тело склеено", 8, (int)bl);
+        check("  и лежит с off", 0, memcmp(r4 + off, "abcdefgh", 8));
+        char r5[] = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nпросто до закрытия";
+        check("http: без длины тело — всё до конца", 0, wb_http_split(r5, strlen(r5), &st, &off, &bl));
+        char r6[] = "garbage";
+        check("http: не HTTP", -1, wb_http_split(r6, strlen(r6), &st, &off, &bl));
+    }
     check("json: \\n — перевод строки", 0, wb_json_get("{\"k\":\"a\\nb\"}", "k", o, sizeof o));
     check_s("  значение", "a\nb", o);
     check("json: true — текстом", 0, wb_json_get(d, "result.warp_enabled", o, sizeof o));

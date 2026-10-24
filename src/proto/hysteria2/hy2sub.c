@@ -68,7 +68,9 @@ uint64_t hy2_parse_bandwidth(const char *s) {
     while (*s == ' ') s++;
     char *end;
     double v = strtod(s, &end);
-    if (end == s || v <= 0) return 0;
+    /* !(v > 0), а не v <= 0: «nan» разбирается strtod и на сравнении с нулём ложен в обе стороны,
+     * то есть проходил, а приведение NaN к целому не определено (I-543). */
+    if (end == s || !(v > 0) || v > 1e300) return 0;   /* «inf» — тоже не скорость */
     while (*end == ' ') end++;
     double mul = 1000000.0;             /* без единицы — Мбит/с (так пишут ссылки) */
     if (*end) {
