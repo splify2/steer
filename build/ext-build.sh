@@ -35,10 +35,17 @@ inside() {  # путь на машине -> путь в контейнере
 mkdir -p "$OUTD"
 apps=""
 for a in "$@"; do apps="$apps ${a%%:*}:$(inside "${a#*:}")"; done
+# Всё, что считается функциями, — ДО docker run, присваиванием: `exit 2` из inside() внутри $(…) в
+# аргументах команды гасится подоболочкой, и docker запускался бы с пустым путём вместо остановки
+# скрипта; у присваивания статус подстановки доходит до set -e.
+steer_in="$(inside "$STEER")"
+outd_in="$(inside "$OUTD")"
+interp="$(interp_of "$target" "$mcpu")"
+owner="$(id -u):$(id -g)"
 # Объектные файлы и владелец выхода — внутри контейнера: docker пишет от root, а снаружи (GitHub
 # Actions — не root) их не удалить.
-docker run --rm -v "$MOUNT:/w" -w "$(inside "$STEER")" --entrypoint sh \
+docker run --rm -v "$MOUNT:/w" -w "$steer_in" --entrypoint sh \
     -e CC="zig cc -target $target -mcpu=$mcpu" -e AR="zig ar" -e ZIG=1 \
-    -e INTERP="$(interp_of "$target" "$mcpu")" -e STEER_EXT_APPS="${apps# }" -e STEER_EXT_ONLY=1 "$IMAGE" -c \
+    -e INTERP="$interp" -e STEER_EXT_APPS="${apps# }" -e STEER_EXT_ONLY=1 "$IMAGE" -c \
     'sh build/build-libs.sh "$1" "$2" "$3"; rc=$?; rm -rf "$1/obj"; chown -R "$4" "$1"; exit $rc' _ \
-    "$(inside "$OUTD")" "$VERSION" "$REV" "$(id -u):$(id -g)"
+    "$outd_in" "$VERSION" "$REV" "$owner"
