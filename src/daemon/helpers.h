@@ -21,6 +21,7 @@
 #include <sys/types.h>
 
 #include "spec.h"
+#include "evline.h"
 
 /* Помощников не «не больше 32»: по одному на выход с собственным процессом плюс резолвер, то есть
  * не больше выходов спеки + 1. Наборы (helper_set, планы) растут по этому числу. */
@@ -75,7 +76,7 @@ struct helper_state {
     /* Клиент туннеля по подписке: номера активных живых узлов пула через запятую (событие active,
      * evline.h; src/tunnel/pool.c), «» — живых нет; active_known — событие было. Сбрасывается с
      * новым процессом. */
-    char active[160];
+    char active[EVLINE_LINE_MAX]; /* событие не длиннее трубы, строка узлов — тем более */
     int active_known;
 };
 
@@ -113,7 +114,7 @@ struct helper {
     /* Демон: труба событий (конец чтения; -1 — нет) и недочитанная строка. */
     int evfd;
     size_t evlen;
-    char evbuf[512];
+    char evbuf[EVLINE_LINE_MAX + 2];   /* строка события и \n: длиннее трубы не бывает */
     struct helper_state st;
 };
 

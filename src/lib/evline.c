@@ -65,10 +65,11 @@ int evline_enabled(void) {
     return g_fd >= 0;
 }
 
-/* С запасом ниже PIPE_BUF (POSIX гарантирует его минимум 512, на Linux 4096): событие с
- * контрактными двумя-тремя полями сюда влезает многократно, а если когда-нибудь не влезло —
- * лучше потерять его целиком, чем отправить обрезанный и невалидный JSON в трубу. */
-#define EVLINE_WRITE_MAX 480
+/* Предел — PIPE_BUF (evline.h, EVLINE_LINE_MAX): до него write в трубу атомарен, а событие
+ * длиннее может пройти частью и оставить в трубе обрубок невалидного JSON. Прежние 480 байт
+ * резали список активных узлов пула уже на сотне узлов — теперь событие, не влезшее и в
+ * четыре килобайта, теряется целиком, но с длиной в журнале (stderr помощника). */
+#define EVLINE_WRITE_MAX EVLINE_LINE_MAX
 
 void evline_emit(const char *ev, ...) {
     evline_ensure_open();
@@ -114,6 +115,9 @@ void evline_emit(const char *ev, ...) {
      * модуль), как у моста tgws и резолвера, и запись возвращает EPIPE. Помощник без демона не
      * нужен (src/daemon/supd.c, «Помощники демона не переживают») — выход тем же SIGTERM, что по
      * PDEATHSIG. Только с меткой демона: у ручного запуска с чужой трубой свои правила. */
+    if (mem && n > EVLINE_WRITE_MAX)
+        fprintf(stderr, "steer[warn] событие %s не влезло в трубу: %zu байт при пределе %d — потеряно\n",
+                ev, n, EVLINE_WRITE_MAX);
     if (mem && n > 0 && n <= EVLINE_WRITE_MAX) {
         ssize_t w = write(g_fd, mem, n);
         if (w < 0 && errno == EPIPE && getenv("STEER_SUPD")) raise(SIGTERM);
