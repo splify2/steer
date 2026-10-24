@@ -1721,6 +1721,9 @@ static int early_reserve(struct conn *c, size_t need) {
 static uint16_t g_ip_id;
 static uint16_t ip_id_next(void) { return __atomic_add_fetch(&g_ip_id, 1, __ATOMIC_RELAXED); }
 
+/* Сколько датаграмм клиента отброшено за размер (больше dgram_max дайлера); читает журнал udp_packet. */
+static unsigned long long g_udp_toobig;
+
 /* Самая большая датаграмма, которую несёт текущий дайлер (dialer_ops.dgram_max). */
 static size_t dgram_limit(void) {
     size_t m = g_dl->ops->dgram_max;
@@ -2119,7 +2122,19 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
     /* Сюда попадают только целые датаграммы: фрагменты собирает udp_defrag ещё до разбора
      * заголовка, и неполной датаграммы здесь быть не может. Проверка всё равно стоит —
      * отправить серверу обрубок под видом целой датаграммы хуже, чем потерять её. */
-    if (k->frag || !dn || dn > dgram_limit()) return;
+    if (k->frag || !dn) return;
+    if (dn > dgram_limit()) {
+        /* Крупнее, чем несёт дайлер, — потеря, и молчать о ней нельзя: снаружи это «QUIC/DNS через туннель
+         * иногда не работает». Счётчик общий (потоков цикла несколько), сообщение — раз в десять секунд. */
+        unsigned long long tot = __atomic_add_fetch(&g_udp_toobig, 1, __ATOMIC_RELAXED);
+        static __thread time_t said_big;
+        if (g_now_s - said_big >= 10) {
+            said_big = g_now_s;
+            fprintf(stderr, LOG_W "датаграмма UDP %zu байт больше предела протокола %s (%zu) — отброшена; "
+                            "всего отброшено %llu\n", dn, g_dl->ops->name, dgram_limit(), tot);
+        }
+        return;
+    }
 
     if (!c) {
         c = conn_new(tun);

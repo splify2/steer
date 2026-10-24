@@ -9,6 +9,7 @@
 #define STEER_PXWIRE_H
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "proxy.h"
 
 /* ---- адрес SOCKS5 (ATYP+ADDR+PORT) --------------------------------------------------------- */
@@ -52,5 +53,22 @@ void px_vmess_authid(const unsigned char cmdkey[16], uint64_t ts, const unsigned
  * ради совместимости структуры; AEAD-заголовок её не проверяет, но v2ray кладёт). */
 uint32_t px_fnv1a(const unsigned char *p, size_t n);
 uint32_t px_crc32(const unsigned char *p, size_t n);
+
+/* Буфер потока цикла под крупную датаграмму UDP (до UDP_DGRAM_ABS): на стеке 64 КБ не держат, а malloc
+ * на каждую датаграмму в цикле лишний. Растёт по требованию и живёт, пока жив поток. Слотов два: 0 — приём,
+ * 1 — сборка или разбор, чтобы одно не затирало другое. Буферы свои у каждого файла протокола (static
+ * inline): общему файлу они не нужны, а стенды дайлеров линкуются без pxwire.c. NULL — памяти нет. */
+static inline unsigned char *px_scratch(int slot, size_t n) {
+    static __thread struct { unsigned char *p; size_t cap; } sc[2];
+    if (slot < 0 || slot > 1) return NULL;
+    if (sc[slot].cap < n) {
+        size_t nc = n < 2048 ? 2048 : n;
+        unsigned char *np = realloc(sc[slot].p, nc);
+        if (!np) return NULL;
+        sc[slot].p = np;
+        sc[slot].cap = nc;
+    }
+    return sc[slot].p;
+}
 
 #endif

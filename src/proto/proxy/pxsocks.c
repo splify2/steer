@@ -236,7 +236,9 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         size_t dl = ((size_t)p[0] << 8) | p[1];
         p += 2; left -= 2;
         if (dl > left) return SEND_FATAL;
-        unsigned char pkt[3 + 7 + UDP_DGRAM_MAX];
+        /* В буфере потока, а не на стеке: датаграмма до SK_DGRAM_MAX (I-528). */
+        unsigned char *pkt = px_scratch(1, 3 + 7 + dl);
+        if (!pkt) return SEND_FATAL;
         size_t o = 0;
         pkt[o++] = 0; pkt[o++] = 0; pkt[o++] = 0;    /* RSV RSV FRAG */
         o += px_socks_addr(pkt + o, s->dst, s->dport);
@@ -256,8 +258,11 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     return left ? SEND_FATAL : SEND_OK;
 }
 
+/* Пакет SOCKS5 UDP — RSV(2), FRAG, адрес IPv4 (7) и данные — целиком в UDP_DGRAM_ABS. */
+#define SK_DGRAM_MAX (UDP_DGRAM_ABS - 10)
+
 static size_t sk_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
-    if (n > UDP_DGRAM_MAX || 2 + n > cap) return 0;
+    if (n > SK_DGRAM_MAX || 2 + n > cap) return 0;
     out[0] = (unsigned char)(n >> 8); out[1] = (unsigned char)n;
     memcpy(out + 2, p, n);
     return 2 + n;
@@ -267,6 +272,11 @@ static int sk_read(void *sess, unsigned char *buf, size_t cap, const unsigned ch
     struct socks_sess *s = sess;
     *data = buf; *got = 0;
     int fd = s->udpfd >= 0 ? s->udpfd : s->cfd;
+    if (s->udpfd >= 0) {
+        /* Датаграмма от узла целиком: буфер стека (cap) её обрезал бы молча. */
+        unsigned char *rb = px_scratch(0, UDP_DGRAM_ABS + 1);
+        if (rb) { buf = rb; cap = UDP_DGRAM_ABS + 1; *data = rb; }
+    }
     ssize_t r = recv(fd, buf, cap, MSG_DONTWAIT);
     if (r > 0) { *got = (size_t)r; return 0; }
     if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
@@ -295,6 +305,6 @@ const struct dialer_ops proxy_socks_dialer = {
     .peer = sk_peer, .describe = sk_describe, .strerror = px_strerror,
     .connect = sk_connect, .take = sk_take, .close = sk_close, .clear = sk_clear,
     .fd = sk_fd, .has_data = sk_has_data,
-    .flow_open = sk_flow_open, .send = sk_send, .dgram_frame = sk_dgram_frame,
+    .flow_open = sk_flow_open, .send = sk_send, .dgram_frame = sk_dgram_frame, .dgram_max = SK_DGRAM_MAX,
     .read = sk_read, .deliver = sk_deliver,
 };

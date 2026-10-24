@@ -285,8 +285,10 @@ static int vm_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     return SEND_OK;
 }
 
+/* Датаграмма vmess едет одним куском тела (vm_send), а кусок — не больше VM_CHUNK: это и есть предел
+ * протокола, а не стека (I-528). */
 static size_t vm_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
-    if (n > UDP_DGRAM_MAX || 2 + n > cap) return 0;
+    if (n > VM_CHUNK || 2 + n > cap) return 0;
     out[0] = (unsigned char)(n >> 8); out[1] = (unsigned char)n;
     memcpy(out + 2, p, n);
     return 2 + n;
@@ -362,6 +364,6 @@ const struct dialer_ops proxy_vmess_dialer = {
     .peer = vm_peer, .describe = vm_describe, .strerror = px_strerror,
     .connect = vm_connect, .take = vm_take, .close = vm_close, .clear = vm_clear,
     .fd = vm_fd, .has_data = vm_has_data,
-    .flow_open = vm_flow_open, .send = vm_send, .dgram_frame = vm_dgram_frame,
+    .flow_open = vm_flow_open, .send = vm_send, .dgram_frame = vm_dgram_frame, .dgram_max = VM_CHUNK,
     .read = vm_read, .deliver = vm_deliver,
 };

@@ -130,6 +130,7 @@ int px_ss2022_eih(const unsigned char *ipsk, size_t key_n, const unsigned char *
 #define FAKE_UDP_FD 77
 static int g_udp_fd = -1;
 static int g_udp_calls, g_udp_eagain, g_udp_sent;
+static size_t g_udp_last;               /* длина последнего пакета, ушедшего в подменный сокет */
 int tr_dial_udp(const char *host, uint16_t port) { (void)host; (void)port; return g_udp_fd; }
 /* Голый TCP socks: tr_dial отдаёт свой конец сокетной пары, чужой стенд заполняет ответами заранее. */
 static int g_tcp_fd = -1;
@@ -139,10 +140,11 @@ ssize_t send(int fd, const void *buf, size_t n, int flags) {
     g_udp_calls++;
     if (g_udp_eagain && g_udp_calls == g_udp_eagain) { errno = EAGAIN; return -1; }
     g_udp_sent++;
+    g_udp_last = n;
     return (ssize_t)n;
 }
 
-static unsigned char g_em[8192];
+static unsigned char g_em[70000];
 static size_t g_em_n, g_em_calls;
 static int emit(void *arg, const unsigned char *p, size_t n) {
     (void)arg;
@@ -713,6 +715,93 @@ static void test_ss2022_ts(void) {
     }
 }
 
+/* I-528: крупные датаграммы у прокси-дайлеров. Прежде каждый резал по UDP_DGRAM_MAX (4096), и датаграмма
+ * больше терялась; теперь предел — у протокола (dgram_max), буферы берутся по размеру. */
+static void test_big_dgram(void) {
+    static unsigned char big[2 + 40000];
+    big[0] = 40000 >> 8; big[1] = 40000 & 255;
+    for (size_t i = 0; i < 40000; i++) big[2 + i] = (unsigned char)(i * 7 + 3);
+    struct flow_key k; memset(&k, 0, sizeof k);
+    static unsigned char fr[UDP_DGRAM_ABS + 64];
+    check("dgram_max: trojan — UDP_DGRAM_ABS", 1, proxy_trojan_dialer.dgram_max == UDP_DGRAM_ABS);
+    check("dgram_max: vmess — один кусок тела (0x3FEF)", 1, proxy_vmess_dialer.dgram_max == 0x3FEF);
+    check("dgram_max: ss и socks — больше 4096, пакет с обрамлением влезает в UDP_DGRAM_ABS", 1,
+          proxy_ss_dialer.dgram_max > UDP_DGRAM_MAX && proxy_ss_dialer.dgram_max < UDP_DGRAM_ABS &&
+          proxy_socks_dialer.dgram_max > UDP_DGRAM_MAX && proxy_socks_dialer.dgram_max < UDP_DGRAM_ABS);
+    check("dgram_frame: trojan берёт 40000 байт, vmess — нет (кусок), socks и ss — берут", 1,
+          proxy_trojan_dialer.dgram_frame(big + 2, 40000, fr, sizeof fr) == 40002 &&
+          proxy_vmess_dialer.dgram_frame(big + 2, 40000, fr, sizeof fr) == 0 &&
+          proxy_socks_dialer.dgram_frame(big + 2, 40000, fr, sizeof fr) == 40002 &&
+          proxy_ss_dialer.dgram_frame(big + 2, 40000, fr, sizeof fr) == 40002);
+    check("dgram_frame: за пределом протокола — отказ",  1,
+          proxy_trojan_dialer.dgram_frame(big + 2, UDP_DGRAM_ABS + 1, fr, sizeof fr) == 0 &&
+          proxy_socks_dialer.dgram_frame(big + 2, proxy_socks_dialer.dgram_max + 1, fr, sizeof fr) == 0);
+
+    /* socks5 и shadowsocks: 40000 байт — ОДИН пакет узлу (раньше буфер на стеке в 4 КБ). */
+    struct px_node n; memset(&n, 0, sizeof n);
+    n.proto = PX_SOCKS; n.socks_ver = 5;
+    for (int who = 0; who < 2; who++) {
+        const struct dialer_ops *ops = who ? &proxy_ss_dialer : &proxy_socks_dialer;
+        if (who) { memset(&n, 0, sizeof n); n.proto = PX_SS; n.ss_method = SS_AES128_GCM; n.ss_key_n = 16; }
+        void *sess = calloc(1, ops->sess_size);
+        ops->clear(sess);
+        g_udp_fd = FAKE_UDP_FD;
+        int sp[2] = { -1, -1 };
+        if (!who) {
+            unsigned char rep[] = { 5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0 || write(sp[1], rep, sizeof rep) != (ssize_t)sizeof rep) return;
+            g_tcp_fd = sp[0];
+        }
+        ops->flow_open(&n, sess, &k, 1);
+        ops->connect(&n, sess, 2);
+        g_udp_calls = 0; g_udp_sent = 0; g_udp_eagain = 0; g_udp_last = 0;
+        int rc = ops->send(&n, sess, &k, 1, big, sizeof big);
+        check(who ? "ss udp: датаграмма 40000 байт ушла одним пакетом" : "socks udp: датаграмма 40000 байт ушла одним пакетом",
+              1, rc == SEND_OK && g_udp_sent == 1 && g_udp_last >= 40000 && g_udp_last < 40000 + 64);
+        ops->close(sess); free(sess);
+        if (sp[1] >= 0) close(sp[1]);
+        g_tcp_fd = -1;
+        g_udp_fd = -1;
+    }
+
+    /* trojan: вверх — один пакет с адресом, длиной и CRLF; вниз — по частям в 1000 байт, отдаётся целиком. */
+    {
+        const struct dialer_ops *ops = &proxy_trojan_dialer;
+        struct px_node tn; memset(&tn, 0, sizeof tn);
+        void *sess = calloc(1, ops->sess_size);
+        ops->clear(sess);
+        ops->flow_open(&tn, sess, &k, 1);
+        g_win = -1;
+        feed_reset(NULL, 0);
+        int rc = ops->send(&tn, sess, &k, 1, big, sizeof big);
+        check("trojan udp: датаграмма 40000 байт ушла целиком (заголовок, адрес, длина, CRLF, данные)", 1,
+              rc == SEND_OK && g_tx_n == 56 + 2 + 1 + 7 + 2 + 7 + 2 + 2 + 2 + 40000 - 2 - 2 + 2 &&
+              !memcmp(g_tx + g_tx_n - 40000, big + 2, 40000));
+        free(sess);
+
+        static unsigned char down[7 + 2 + 2 + 40000];
+        size_t o = 0;
+        down[o++] = 1; memset(down + o, 5, 4); o += 4; down[o++] = 0; down[o++] = 53;
+        down[o++] = 40000 >> 8; down[o++] = 40000 & 255; down[o++] = '\r'; down[o++] = '\n';
+        memcpy(down + o, big + 2, 40000); o += 40000;
+        trojan_deliver_bytes(down, o, 1000);
+        check("trojan udp: датаграмма 40000 байт от узла по частям — одна, целиком", 1,
+              g_em_calls == 1 && g_em_n == 40000 && !memcmp(g_em, big + 2, 40000));
+        /* Больше предела протокола — выброшена по точной длине, следующая жива. */
+        static unsigned char two[7 + 2 + 2 + 65535 + 7 + 2 + 2 + 2];
+        o = 0;
+        two[o++] = 1; memset(two + o, 5, 4); o += 4; two[o++] = 0; two[o++] = 53;
+        two[o++] = 0xff; two[o++] = 0xff; two[o++] = '\r'; two[o++] = '\n';
+        memset(two + o, 'z', 65535); o += 65535;
+        two[o++] = 1; memset(two + o, 5, 4); o += 4; two[o++] = 0; two[o++] = 53;
+        two[o++] = 0; two[o++] = 2; two[o++] = '\r'; two[o++] = '\n';
+        two[o++] = 'o'; two[o++] = 'k';
+        trojan_deliver_bytes(two, o, 4096);
+        check("trojan udp: датаграмма 65535 (больше UDP_DGRAM_ABS) выброшена, следующая жива", 1,
+              g_em_calls == 1 && g_em_n == 2 && !memcmp(g_em, "ok", 2));
+    }
+}
+
 int main(void) {
     test_ss_first_tail();
     test_ss_again_nonce();
@@ -725,6 +814,7 @@ int main(void) {
     test_vmess_window();
     test_http_early_bytes();
     test_trojan_udp();
+    test_big_dgram();
     test_http_long_auth();
     return unit_done("pxdialmatch");
 }

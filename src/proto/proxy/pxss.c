@@ -313,8 +313,11 @@ static int ss_send_udp(const struct px_node *n, struct ss_sess *s, const unsigne
         size_t dl = ((size_t)p[0] << 8) | p[1];
         p += 2; left -= 2;
         if (dl > left) return SEND_FATAL;
-        unsigned char pkt[32 + 8 + UDP_DGRAM_MAX + 16], addr[8];
+        unsigned char addr[8];
         size_t al = px_socks_addr(addr, s->dst, s->dport);
+        /* Пакет собирается в буфере потока, а не на стеке: датаграмма до SS_DGRAM_MAX (I-528). */
+        unsigned char *pkt = px_scratch(1, 32 + al + dl + 16);
+        if (!pkt) return SEND_FATAL;
         size_t o = 0;
         if (n->ss_method == SS_NONE) {
             memcpy(pkt, addr, al); o = al;
@@ -326,12 +329,10 @@ static int ss_send_udp(const struct px_node *n, struct ss_sess *s, const unsigne
             if (ss_subkey(n, salt, subkey) != 0) return SEND_FATAL;
             struct sc_aead k;
             if (sc_aead_setkey(&k, ss_alg(n->ss_method), subkey) != 0) return SEND_FATAL;
-            unsigned char body[8 + UDP_DGRAM_MAX];
-            memcpy(body, addr, al);
-            memcpy(body + al, p, dl);
+            memcpy(pkt + o, addr, al);
+            memcpy(pkt + o + al, p, dl);
             size_t bl = al + dl;
             unsigned char zero[12] = { 0 };
-            memcpy(pkt + o, body, bl);
             int sr = sc_aead_seal(&k, zero, NULL, 0, pkt + o, bl, pkt + o + bl);
             sc_aead_free(&k);
             if (sr != 0) return SEND_FATAL;
@@ -359,8 +360,12 @@ static int ss_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     return udp ? ss_send_udp(ctx, s, data, n) : ss_send_tcp(ctx, s, data, n);
 }
 
+/* Крупнейшая датаграмма клиента: пакет к узлу — соль (до 32), адрес (7), тег (16) и запас на заголовки
+ * SIP022 — обязан уместиться в UDP_DGRAM_ABS. */
+#define SS_DGRAM_MAX (UDP_DGRAM_ABS - 128)
+
 static size_t ss_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
-    if (n > UDP_DGRAM_MAX || 2 + n > cap) return 0;
+    if (n > SS_DGRAM_MAX || 2 + n > cap) return 0;
     out[0] = (unsigned char)(n >> 8); out[1] = (unsigned char)n;
     memcpy(out + 2, p, n);
     return 2 + n;
@@ -391,6 +396,9 @@ static int ss_read(void *sess, unsigned char *buf, size_t cap, const unsigned ch
     struct ss_sess *s = sess;
     *data = buf; *got = 0;
     if (s->udpfd >= 0) {
+        /* Датаграмма от узла целиком, до UDP_DGRAM_ABS: буфер стека (cap) её обрезал бы молча. */
+        unsigned char *rb = px_scratch(0, UDP_DGRAM_ABS + 1);
+        if (rb) { buf = rb; cap = UDP_DGRAM_ABS + 1; *data = rb; }
         ssize_t r = recv(s->udpfd, buf, cap, MSG_DONTWAIT);
         if (r > 0) { *got = (size_t)r; return 0; }
         if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
@@ -419,7 +427,7 @@ static size_t skip_socks_addr(const unsigned char *p, size_t n) {
 /* UDP вниз: датаграмма пришла целиком (recv), снять соль/дешифровать, выкинуть адрес, отдать. */
 static int ss_udp_down(const struct px_node *n, struct ss_sess *s, const unsigned char *d, size_t len,
                        dialer_emit_fn emit, void *arg) {
-    unsigned char plain[UDP_DGRAM_MAX + 32];
+    unsigned char *plain = NULL;
     const unsigned char *body;
     size_t bn;
     if (n->ss_method == SS_NONE) { body = d; bn = len; }
@@ -429,7 +437,8 @@ static int ss_udp_down(const struct px_node *n, struct ss_sess *s, const unsigne
         if (ss_subkey(n, d, subkey) != 0) return 0;
         if (sc_aead_setkey(&k, ss_alg(n->ss_method), subkey) != 0) return 0;
         size_t cl = len - s->keylen - 16;
-        if (cl > sizeof plain) { sc_aead_free(&k); return 0; }
+        plain = px_scratch(1, cl);
+        if (!plain) { sc_aead_free(&k); return 0; }
         memcpy(plain, d + s->keylen, cl);
         int rc = sc_aead_open(&k, zero, NULL, 0, plain, cl, d + len - 16);
         sc_aead_free(&k);
@@ -526,6 +535,6 @@ const struct dialer_ops proxy_ss_dialer = {
     .peer = ss_peer, .describe = ss_describe, .strerror = px_strerror,
     .connect = ss_connect, .take = ss_take, .close = ss_close, .clear = ss_clear,
     .fd = ss_fd, .has_data = ss_has_data,
-    .flow_open = ss_flow_open, .send = ss_send, .dgram_frame = ss_dgram_frame,
+    .flow_open = ss_flow_open, .send = ss_send, .dgram_frame = ss_dgram_frame, .dgram_max = SS_DGRAM_MAX,
     .read = ss_read, .deliver = ss_deliver,
 };
