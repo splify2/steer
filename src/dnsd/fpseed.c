@@ -156,6 +156,7 @@ static void fakeip_table_drop(void) {
     sindex_free(&g_fakeip_idx);
     memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
     g_fakeip_next = 1;
+    fakeip_pool_reset();
 }
 
 void fpseed_free(void) {

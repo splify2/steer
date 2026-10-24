@@ -1,6 +1,12 @@
 #ifndef STEER_EVLINE_H
 #define STEER_EVLINE_H
 #include <stddef.h>
+#include <limits.h>
+
+/* Самое длинное событие в трубе — PIPE_BUF (4096 на Linux): запись до него атомарна, а длиннее
+ * при O_NONBLOCK может пройти частью и оставить в трубе обрубок. Это предел самой трубы, а не
+ * выбранное число; событие длиннее не пишется, и помощник называет его длину в журнале. */
+#define EVLINE_LINE_MAX PIPE_BUF
 
 /* ФОРМАТ СОБЫТИЙ ПОМОЩНИКОВ — контракт между демоном steerd (читает daemon/supd.c, демон с
  * --supervise, docs/architecture.md, «4а», «Дети и здоровье») и
@@ -119,7 +125,9 @@ void evline_hello(const char *module, const char *version);
 
 #define EVLINE_MAXFIELDS 6
 #define EVLINE_KEYLEN 16
-#define EVLINE_VALLEN 200
+/* Строка значения — до длины самого события: список узлов пула и другие длинные поля не
+ * обрезаются при разборе (прежние 200 байт молча отдавали обрубок). Структура живёт на стеке. */
+#define EVLINE_VALLEN EVLINE_LINE_MAX
 
 struct evline_field {
     char key[EVLINE_KEYLEN];

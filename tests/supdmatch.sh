@@ -83,6 +83,11 @@ while :; do
         printf '{"ev":"down","why":"стенд: отказ"}\n' >&9
         exit 3
     fi
+    if [ -e "$tmp/active.\$2" ]; then
+        rm -f "$tmp/active.\$2"
+        # Тысяча узлов — событие в ~3,9 КиБ: прежний предел был 160 символов списка и 480 байт на запись.
+        printf '{"ev":"active","nodes":"%s"}\n' "\$(seq -s, 1 1000)" >&9
+    fi
     if [ -e "$tmp/health.\$2" ]; then
         rm -f "$tmp/health.\$2"
         printf '{"ev":"health","dc":2,"media":1,"domain":"kws2.example","cool":300}\n' >&9
@@ -204,6 +209,14 @@ check "  после клиента (STEER_DAEMON_ASKED) — считает са�
     "$(STEER_DAEMON_ASKED=1 STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/spec.json" --state-dir "$tmp/st" | pdown)"
 check "  чужая спека — считает сам" "-" \
     "$(cp "$tmp/spec.json" "$tmp/other.json"; STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/other.json" --state-dir "$tmp/st" | pdown)"
+
+# active со списком в тысячу узлов (больше прежних 160 символов): список доходит до status целиком.
+touch "$tmp/active.b"
+wait_for 'ctl helper b | grep -q "active"' 5
+check "  active на 1000 узлов — в ответе helper без обрезки (3892 знака списка)" "1000 3892" \
+    "$(ctl helper b | python3 -c 'import json,sys
+d = json.loads(json.load(sys.stdin)["stdout"])
+print(len(d["active"]), len(",".join(map(str, d["active"]))))')"
 
 # Резолвер на таблице: канал swap.test есть — AAAA погашен; чужое имя — ответ апстрима.
 wait_for '[ "$(python3 "$tmp/qaaaa.py" "$LPORT" other.test)" = 1 ]' 5

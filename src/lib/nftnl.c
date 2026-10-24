@@ -485,7 +485,7 @@ int nft_add_element6(const char *set_name, const uint8_t key[16], uint32_t ttl) 
  * ядре 6.8: «076433c6 00000011 000050c3 - 076433c6 00000011 0000ffff».
  *
  * Срок — на самом элементе, как у обычного. Пересекающийся элемент ядро отвергает (EEXIST),
- * поэтому вызывающий кладёт ящики, уже разложенные без пересечений (l4_union_boxes). */
+ * поэтому вызывающий кладёт ящики, уже разложенные без пересечений (l4_union_alloc). */
 static size_t nftlk_concat_build(uint8_t *buf, size_t cap, uint32_t seq, uint16_t nft_msg_type,
                                  const char *table, const char *obj_name,
                                  const uint8_t *key, const uint8_t *key_end, size_t klen,

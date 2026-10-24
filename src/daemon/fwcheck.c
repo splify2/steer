@@ -84,12 +84,28 @@ static void zone_of_chain(const char *tok, char *out, size_t n) {
     if (!strncmp(tok, "srcnat_", 7) && tok[7]) snprintf(out, n, "%s", tok + 7);
 }
 
-#define FWC_CHAINS 16
-static void remember_chain(char tab[FWC_CHAINS][64], size_t *n, const char *name) {
-    if (!*name || *n >= FWC_CHAINS) return;
-    for (size_t i = 0; i < *n; i++)
-        if (!strcmp(tab[i], name)) return;
-    snprintf(tab[(*n)++], 64, "%s", name);
+/* Имена цепочек, растущий список без повторов: у fw4 на роутере с десятками зон их больше
+ * шестнадцати (раньше — таблица на 16, и цепочка сверх неё теряла masquerade выхода). */
+struct fwc_chains { char **v; size_t n, cap; };
+
+static void remember_chain(struct fwc_chains *t, const char *name) {
+    if (!*name) return;
+    for (size_t i = 0; i < t->n; i++)
+        if (!strcmp(t->v[i], name)) return;
+    if (t->n == t->cap) {
+        size_t cap = t->cap ? t->cap * 2 : 16;
+        char **g = realloc(t->v, cap * sizeof(*g));
+        if (!g) return;
+        t->v = g;
+        t->cap = cap;
+    }
+    char *d = strdup(name);
+    if (d) t->v[t->n++] = d;
+}
+
+static void chains_free(struct fwc_chains *t) {
+    for (size_t i = 0; i < t->n; i++) free(t->v[i]);
+    free(t->v);
 }
 
 /* Два дампа набора правил, у каждого свой кэш на процесс.
@@ -219,8 +235,7 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
      * один проход и пересекаются в конце. */
     /* Цепочки с подменой — по семейству отдельно (masq_chain[0] — IPv4, [1] — IPv6): у зоны fw4 в
      * одной цепочке srcnat_<зона> бывает одно правило, другое или оба. */
-    char dev_chain[FWC_CHAINS][64], masq_chain[2][FWC_CHAINS][64];
-    size_t dev_chain_n = 0, masq_chain_n[2] = { 0, 0 };
+    struct fwc_chains dev_chain = {0}, masq_chain[2] = {{0}, {0}};
     unsigned tfams = 3;
     /* Без содержимого именованных наборов (как у `nft -t`): проверка смотрит на имена
      * устройств в правилах и цепочках, а элементы наборов ей не нужны — при этом их бывают
@@ -257,7 +272,7 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
         if (j && strstr(line, "oif") && names_device(line, device)) {
             char t[64];
             chain_token(j + 5, t, sizeof t);
-            remember_chain(dev_chain, &dev_chain_n, t);
+            remember_chain(&dev_chain, t);
         }
         if (strstr(line, "masquerade") || strstr(line, "snat")) {
             unsigned f = rule_fams(line, tfams);
@@ -277,20 +292,23 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
                 char t[64];
                 chain_token(chain, t, sizeof t);
                 for (int k = 0; k < 2; k++)
-                    if (f & (1u << k)) remember_chain(masq_chain[k], &masq_chain_n[k], t);
+                    if (f & (1u << k)) remember_chain(&masq_chain[k], t);
             }
         }
     }
     for (int fam = 0; fam < 2; fam++) {
         int *got = fam ? &r.masq6 : &r.masqueraded;
-        for (size_t i = 0; i < dev_chain_n && !*got; i++)
-            for (size_t k = 0; k < masq_chain_n[fam]; k++)
-                if (!strcmp(dev_chain[i], masq_chain[fam][k])) {
+        for (size_t i = 0; i < dev_chain.n && !*got; i++)
+            for (size_t k = 0; k < masq_chain[fam].n; k++)
+                if (!strcmp(dev_chain.v[i], masq_chain[fam].v[k])) {
                     *got = 1;
-                    if (fam) zone_of_chain(dev_chain[i], r.zone6, sizeof(r.zone6));
+                    if (fam) zone_of_chain(dev_chain.v[i], r.zone6, sizeof(r.zone6));
                     break;
                 }
     }
+    chains_free(&dev_chain);
+    chains_free(&masq_chain[0]);
+    chains_free(&masq_chain[1]);
     return r;
 }
 

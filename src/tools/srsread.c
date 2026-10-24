@@ -21,7 +21,6 @@
 #include "srs.h"
 #include "srsread.h"
 
-#define MAX_META_PORTS 32
 #define META_PORT_LEN  16
 
 struct out {
@@ -74,9 +73,9 @@ static int srs_dump_set(const struct srs_set *s, const char *path, FILE *dom, FI
     /* Что тремя файлами не выражается — решается до печати: половина набора — не набор. */
     const char *why = NULL;
     int tcp = 0, udp = 0;
-    char ports[MAX_META_PORTS][META_PORT_LEN];
-    size_t ports_n = 0;
-    int ports_over = 0;
+    char (*ports)[META_PORT_LEN] = NULL;      /* различные порты набора: растёт по числу */
+    size_t ports_n = 0, ports_cap = 0;
+    int ports_over = 0;                       /* нет памяти */
     for (size_t i = 0; i < srs_clause_n(s) && !why; i++) {
         const struct srs_clause *c = srs_clause(s, i);
         if (c->flags & (SRS_F_XDOM | SRS_F_XCIDR))
@@ -101,13 +100,20 @@ static int srs_dump_set(const struct srs_set *s, const char *path, FILE *dom, FI
             size_t j = 0;
             while (j < ports_n && strcmp(ports[j], b) != 0) j++;
             if (j < ports_n) continue;
-            if (ports_n >= MAX_META_PORTS) { ports_over = 1; break; }
+            if (ports_n == ports_cap) {
+                size_t cap = ports_cap ? ports_cap * 2 : 32;
+                char (*v)[META_PORT_LEN] = realloc(ports, cap * sizeof(*v));
+                if (!v) { ports_over = 1; break; }
+                ports = v;
+                ports_cap = cap;
+            }
             snprintf(ports[ports_n++], META_PORT_LEN, "%s", b);
         }
     }
-    if (!why && ports_over) why = "портов в наборе больше, чем канал может сузить";
+    if (!why && ports_over) why = "нет памяти на список портов";
     if (why) {
         fprintf(stderr, "steer: srs: набор понят, но не выразим списком — %s\n", why);
+        free(ports);
         return 2;
     }
     /* Сужение есть, а печатать его некуда — это ОТКАЗ, а не мелочь. Отдать подсети Cloudflare
@@ -116,12 +122,14 @@ static int srs_dump_set(const struct srs_set *s, const char *path, FILE *dom, FI
     if (!meta && (tcp || udp || ports_n)) {
         fprintf(stderr, "steer: srs: набор сужен по протоколу или портам — нужен --meta-out, "
                         "иначе сужение потеряется, а подсети уедут в туннель целиком\n");
+        free(ports);
         return 2;
     }
     struct out o = { dom, pfx, 0 };
     int rc = srs_walk(s, SRS_EL_DOMAIN | SRS_EL_CIDR, NULL, print_elem, &o, &e);
     if (rc != 0) {
         fprintf(stderr, "steer: %s\n", e.msg);
+        free(ports);
         return 1;
     }
     /* Уровень обязателен: разбор УДАЛСЯ, значит это строка журнала во время работы, а не
@@ -141,6 +149,7 @@ static int srs_dump_set(const struct srs_set *s, const char *path, FILE *dom, FI
             fprintf(meta, "\n");
         }
     }
+    free(ports);
     return 0;
 }
 

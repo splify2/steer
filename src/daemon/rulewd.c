@@ -267,8 +267,21 @@ static int missing_x(const struct rulewd *r, const struct spec *sp, char *list, 
     return cnt;
 }
 
-int rulewd_missing(const struct spec *sp, char *list, size_t n) {
-    return missing_x(NULL, sp, list, n, NULL);
+/* Место под имена всех выходов спеки через запятую: список не обрезается, сколько бы их ни было
+ * (раньше — 512 байт, и имена сверх них молча выпадали из возврата правил и из журнала). */
+static size_t names_cap(const struct spec *sp) {
+    size_t n = 1;
+    for (size_t i = 0; sp && i < sp->out_n; i++) n += strlen(sp->out[i].name) + 1;
+    return n;
+}
+
+int rulewd_missing(const struct spec *sp, char **list) {
+    size_t n = names_cap(sp);
+    *list = malloc(n);
+    if (!*list) return -1;
+    int cnt = missing_x(NULL, sp, *list, n, NULL);
+    if (cnt < 0) { free(*list); *list = NULL; }
+    return cnt;
 }
 
 int rulewd_present(const struct spec *sp) {
@@ -367,6 +380,9 @@ static void rulewd_defer(struct rulewd *r) {
     loop_timer_set(r->tm, RULEWD_BUSY_MS);
 }
 
+static void rulewd_check_in(struct rulewd *r, char *list, char *rl, char *bs, char *left,
+                            size_t nc);
+
 static void rulewd_check(struct rulewd *r) {
     struct steerd *d = r->d;
     r->pending = 0;
@@ -375,16 +391,25 @@ static void rulewd_check(struct rulewd *r) {
      * вышло (-1) — проверяем как обычно. */
     uint64_t h;
     if (recon_table_handle(nft_table(), &h) == 1) return;
-    char list[512];
+    size_t nc = names_cap(d->sp);
+    char *buf = malloc(nc * 4);
+    if (!buf) return;
+    char *list = buf, *rl = buf + nc, *bs = buf + 2 * nc, *left = buf + 3 * nc;
+    rulewd_check_in(r, list, rl, bs, left, nc);
+    free(buf);
+}
+
+static void rulewd_check_in(struct rulewd *r, char *list, char *rl, char *bs, char *left,
+                            size_t nc) {
+    struct steerd *d = r->d;
     int hm = 0;
-    int cnt = missing_x(r, d->sp, list, sizeof(list), &hm);
+    int cnt = missing_x(r, d->sp, list, nc, &hm);
     /* Чего-то не хватает у выхода, которого держит идущая команда, — вернуться к нему, когда она
      * кончится (rulewd_defer): событие снятия не повторится. */
     if (hm) rulewd_defer(r);
     if (cnt <= 0) return;
     if (!r->cf.restored) { r->cf.repair(r->cf.arg); return; }
-    char rl[512], bs[512];
-    int rc = rulewd_restore(r, d->sp, list, rl, bs, sizeof(list));
+    int rc = rulewd_restore(r, d->sp, list, rl, bs, nc);
     /* В счёт шторма — возвраты правил (и неудачные попытки), но не одного запрета IPv6: его
      * снимает ядро вместе с lo, а не тот, кто дерётся за `ip rule`, и на `network restart` он
      * приходит вторым возвратом рядом с правилами — два перезапуска сети за минуту иначе уже
@@ -393,8 +418,7 @@ static void rulewd_check(struct rulewd *r) {
         r->back_at[r->back_i] = loop_now_ms();
         r->back_i = (r->back_i + 1) % (RULEWD_STORM_N + 1);
     }
-    char left[512];
-    if (rc > 0 && missing_x(r, d->sp, left, sizeof(left), NULL) == 0) {
+    if (rc > 0 && missing_x(r, d->sp, left, nc, NULL) == 0) {
         r->cf.restored(r->cf.arg, list, rl, bs);
         return;
     }

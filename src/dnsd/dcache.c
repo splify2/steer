@@ -23,14 +23,17 @@
  *
  * ПАМЯТЬ. Записей не больше dns.cache. Таблица — корзины по четыре места; при переполнении
  * корзины вытесняется запись с ближайшим концом срока. Каждая запись — два malloc (заголовок с
- * именем и сам ответ), ответ до 1232 байт (как принимает EDNS по умолчанию), больше не кладётся.
+ * именем и сам ответ), ответ до DC_MAXWIRE (4096) байт — всё, что проходит датаграммным путём; больше не кладётся.
  * Не потоко-безопасен: цикл резолвера однопоточный. */
 
 #include "dnsd_int.h"
 #include "dup.h"
 
 #define DC_WAYS 4
-#define DC_MAXWIRE 1232
+/* Ответ из кэша выдаётся тем же путём, что ответ апстрима по датаграмме, а он — не длиннее MAX_PKT
+ * (proxy.c): больше в кэш класть нечего, оно не вышло бы обратно. Прежние 1232 резали ответы EDNS
+ * побольше (DNSKEY, длинные TXT, много A) без причины. */
+#define DC_MAXWIRE 4096
 
 struct dent {
     uint32_t h;
@@ -188,7 +191,16 @@ int dcache_put(unsigned up, const uint8_t *ans, size_t n, long now_s) {
     if (qo < 0 || (size_t)qo + 4 > n) return 0;
     unsigned qt = (ans[qo] << 8) | ans[qo + 1], qc = (ans[qo + 2] << 8) | ans[qo + 3];
     int neg = rcode == 3 || (((ans[6] << 8) | ans[7]) == 0);
-    uint8_t tmp[DC_MAXWIRE];
+    /* Черновик для правки сроков — общий и растущий, а не 64 КиБ на стеке ради редкого большого ответа. */
+    static uint8_t *scratch;
+    static size_t scratch_cap;
+    if (n > scratch_cap) {
+        uint8_t *ns = realloc(scratch, n < 2048 ? 2048 : n);
+        if (!ns) return 0;
+        scratch = ns;
+        scratch_cap = n < 2048 ? 2048 : n;
+    }
+    uint8_t *tmp = scratch;
     memcpy(tmp, ans, n);
     uint32_t ttl;
     if (neg) {

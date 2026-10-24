@@ -86,9 +86,9 @@ static long pkg_uid(const char *name) {
 
 /* UID приложений клаузы, которые покрывает «кому» канала на телефоне. */
 static size_t uids_for(const struct spec_client *c, const struct srs_clause *cl, char (*out)[64],
-                       size_t max, int *unknown) {
+                       int *unknown) {
     size_t n = 0;
-    for (size_t i = 0; i < cl->pkg_n && n < max; i++) {
+    for (size_t i = 0; i < cl->pkg_n; i++) {
         long u = pkg_uid(cl->pkg[i]);
         if (u < 0) { (*unknown)++; continue; }
         int in = 0;
@@ -117,7 +117,7 @@ struct item {
     int all, xcidr;
     const struct srs_pfx4 *src;
     size_t src_n;
-    char uid[SRS_MAX_PKG][64];
+    char (*uid)[64];            /* принадлежит раскладке (uidmem ниже), копии указывают туда же */
     size_t uid_n;
     const struct srs_clause *cl;
     int part;                   /* куда попала */
@@ -241,6 +241,8 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
     pl->held = calloc(c->srs_n ? c->srs_n : 1, sizeof(*pl->held));
     size_t nitems = 0, cap = 0;
     struct item *items = NULL;
+    void **uidmem = NULL;       /* массивы UID пакетов клауз: пока жива раскладка */
+    size_t nuidmem = 0;
     struct l4match *var = NULL;
     int rc = -1;
     if (!sets || !pl->held) goto oom;
@@ -293,8 +295,15 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
             }
             if (cl->pkg_n) {
                 if (!local) { pkg_far = 1; continue; }
-                tmp.uid_n = uids_for(w, cl, tmp.uid, SRS_MAX_PKG, &pkg_unknown);
-                if (!tmp.uid_n) continue;
+                char (*ub)[64] = calloc(cl->pkg_n, sizeof(*ub));
+                if (!ub) goto oom;
+                void **um = realloc(uidmem, (nuidmem + 1) * sizeof(*um));
+                if (!um) { free(ub); goto oom; }
+                uidmem = um;
+                uidmem[nuidmem++] = ub;
+                tmp.uid = ub;
+                tmp.uid_n = uids_for(w, cl, ub, &pkg_unknown);
+                if (!tmp.uid_n) { tmp.uid = NULL; continue; }
                 tmp.extra = 1;
             }
             if (cl->kind == SRS_C_ALL) tmp.all = tmp.extra = 1;
@@ -431,7 +440,7 @@ int srs_plan_rule(const struct spec *sp, const struct spec_rule *r, int concat,
             probe.src = p->src;
             probe.src_n = p->src_n;
             probe.uid_n = p->uid_n;
-            for (size_t u = 0; u < p->uid_n; u++) snprintf(probe.uid[u], 64, "%s", p->uid[u]);
+            probe.uid = p->uid;
             probe.eff = p->l4;
             if (extra_same(&probe, it)) break;
         }
@@ -472,6 +481,8 @@ oom:
     err_set(e, "канал %s: не хватило памяти на раскладку наборов", r->name);
 out:
     free(items);
+    for (size_t u = 0; u < nuidmem; u++) free(uidmem[u]);
+    free(uidmem);
     free(sets);
     free(var);
     if (rc != 0) srs_plan_free(pl);

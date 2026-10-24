@@ -1343,6 +1343,13 @@ int dom6_ok(const struct spec *sp, const struct output *o, const char (*from)[64
  * нужен троим: компилятору (правило dnat), резолверу (ответ AAAA) и explain (узнать поддельный). */
 #define FAKEIP6_PREFIX_BYTES 0xfd, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0, 0, 0, 0, 0, 0
 #define FAKEIP6_NET "fdfe:dcba:9876::/96"
+/* Пул fake-IP v4 — 198.18.0.0/15 (RFC 2544), единое место для резолвера, печати карты и разбора.
+ * Диапазон не из спеки: он зашит в правила nft и в пару fdfe:dcba:9876::/96, а возврат адресов
+ * (dnsd/fakeip.c, fakeip_reclaim) делает размер неважным — занятыми остаются только имена,
+ * которые спрашивают или держат соединения. */
+#define FAKEIP_POOL_BASE 0xC6120000u /* 198.18.0.0 */
+#define FAKEIP_POOL_SIZE 131072u     /* 198.18.0.0 - 198.19.255.255 */
+#define FAKEIP_POOL_MASK (~(FAKEIP_POOL_SIZE - 1))
 void fakeip6_of(uint32_t fake4_host, uint8_t out[16]);
 uint32_t fakeip6_to4(const uint8_t a[16]);
 /* Разбор спеки — правило 5 (docs/architecture.md, раздел 2): модель ошибку ВОЗВРАЩАЕТ, а не

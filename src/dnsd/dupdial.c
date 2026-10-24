@@ -145,10 +145,13 @@ static int boot_ask(const struct sockaddr_storage *srv, unsigned mark, const cha
             char qn_[MAX_HOSTNAME];
             uint16_t qt = 0;
             size_t qend = 0;
-            struct answer_ip ips[8];
-            struct answer_ip6 ips6[8];
+            /* Ответ — не больше sizeof(r) байт, а запись A — не меньше 15: больше 99 не будет. */
+            struct answer_ip ips[(sizeof(r) - 12) / 15 + 1];
+            struct answer_ip6 ips6[(sizeof(r) - 12) / 15 + 1];
             int n6 = 0;
-            int na = parse_response(r, (size_t)n, qn_, sizeof(qn_), &qt, &qend, ips, 8, ips6, 8, &n6);
+            int na = parse_response(r, (size_t)n, qn_, sizeof(qn_), &qt, &qend, ips,
+                                    (int)(sizeof(ips) / sizeof(ips[0])), ips6,
+                                    (int)(sizeof(ips6) / sizeof(ips6[0])), &n6);
             if (na < 0) break;
             size_t k = 0;
             if (qtype == 1)

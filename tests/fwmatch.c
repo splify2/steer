@@ -454,6 +454,21 @@ int main(void) {
         check("без masq6 — зоны нет", z.zone6[0] == 0, 1);
     }
 
+    /* 11. Зон больше прежних 16 цепочек: устройство в тридцатой, masquerade в цепочке той же зоны. */
+    {
+        static char rs[16384];
+        size_t o = (size_t)snprintf(rs, sizeof(rs), "table inet fw4 {\n\tchain srcnat {\n");
+        for (int i = 0; i < 40; i++)
+            o += (size_t)snprintf(rs + o, sizeof(rs) - o, "\t\toifname \"dev%d\" jump srcnat_z%d\n", i, i);
+        o += (size_t)snprintf(rs + o, sizeof(rs) - o, "\t}\n");
+        for (int i = 0; i < 40; i++)
+            o += (size_t)snprintf(rs + o, sizeof(rs) - o,
+                "\tchain srcnat_z%d {\n\t\tmeta nfproto ipv4 masquerade\n\t}\n", i);
+        snprintf(rs + o, sizeof(rs) - o, "}\n");
+        probe("30-я из 40 зон (прежний предел 16 цепочек)", rs, "dev29", 1, 1);
+        probe("40-я из 40 зон", rs, "dev39", 1, 1);
+    }
+
     /* ---- чем объясняется совпадение в explain -----------------------------------
      *
      * Фраза выводилась из ИМЕНИ набора, и у группы с доменами она всегда была «domain set».
