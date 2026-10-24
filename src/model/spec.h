@@ -241,7 +241,7 @@ struct hy2_cfg {
     char sub_file[256];
     int *nodes;                 /* арена спеки, nodes_n записей (NULL при 0), как у vless_cfg */
     size_t nodes_n;
-    struct node_exclude excl;   /* exclude, exclude_name — как у vless_cfg */
+    struct node_exclude excl;   /* exclude, exclude_name, only — как у vless_cfg */
     /* Из ключей пула — только interval (период проверки узла) и silence (срок простоя QUIC):
      * соединение с узлом у hysteria2 одно на все потоки, и active/by разбор отвергает. */
     struct tun_pool pool;
@@ -257,7 +257,7 @@ struct proxy_cfg {
     int *nodes;
     size_t nodes_n;
     int insecure;               /* не проверять сертификат узлов security=tls (trojan/vmess/http) */
-    struct node_exclude excl;   /* exclude, exclude_name — как у vless_cfg */
+    struct node_exclude excl;   /* exclude, exclude_name, only — как у vless_cfg */
     struct tun_pool pool;       /* active, by, interval, silence — как у vless */
 };
 
@@ -266,6 +266,8 @@ struct proxy_cfg {
 static inline void kind_sig_excl(unsigned long long *h, const struct node_exclude *x) {
     if (x->cc_n) kind_sig_mix(h, "exclude", 8);
     for (size_t i = 0; i < x->cc_n; i++) kind_sig_mix(h, x->cc[i], 2);
+    if (x->only_n) kind_sig_mix(h, "only", 5);
+    for (size_t i = 0; i < x->only_n; i++) kind_sig_mix(h, x->only[i], 2);
     if (x->names_n) kind_sig_mix(h, "exclude_name", 13);
     for (size_t i = 0; i < x->names_n; i++) kind_sig_mix(h, x->names[i], strlen(x->names[i]) + 1);
 }

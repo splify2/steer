@@ -279,7 +279,11 @@ outputs:
   vl:  { kind: tunnel, protocol: vless, subscription: vl.txt, exclude: RU, exclude_name: мобил }
   all: { kind: tunnel, protocol: vless, subscription: vl.txt, exclude: [RU, NL, DE] }
   pin: { kind: tunnel, protocol: vless, subscription: vl.txt, nodes: [0, 2], exclude: RU }
+  nl:  { kind: tunnel, protocol: vless, subscription: vl.txt, only: [NL, DE] }
+  nlx: { kind: tunnel, protocol: vless, subscription: vl.txt, only: [NL, DE], exclude_name: мобил }
   hy:  { kind: tunnel, protocol: hysteria2, subscription: hy.txt, exclude: RU }
+  hyo: { kind: tunnel, protocol: hysteria2, subscription: hy.txt, only: RU }
+  tjo: { kind: tunnel, protocol: trojan, subscription: px.txt, only: DE }
   tj:  { kind: tunnel, protocol: trojan, subscription: px.txt, exclude: RU }
 SPEC
 SE="--spec $EX/spec.yaml --state-dir $EX/st"
@@ -293,6 +297,21 @@ check "  исключённые — RU по стране и «Мобильный
     "$(printf '%s' "$o" | node_of "$RU Москва")|$(printf '%s' "$o" | node_of "$NL Мобильный" | grep -o '"cc".*')|$(printf '%s' "$o" | node_of "$DE Франкфурт" | grep -o '"cc".*')"
 p="$("$L/steer-vless" vless-probe vl --timeout 1 $SE 2>/dev/null)"
 check "vless-probe выход с exclude: перебор только по неисключённым (номер 2)" "2" \
+    "$(printf '%s' "$p" | grep -o '"index":[0-9]*' | sed 's/.*://' | tr '\n' ' ' | sed 's/ $//')"
+p="$("$L/steer-vless" vless-probe nl --timeout 1 $SE 2>/dev/null)"
+check "vless-probe выход с only: [NL, DE]: перебор по узлам этих стран, порядок подписки (1 2)" "1 2" \
+    "$(printf '%s' "$p" | grep -o '"index":[0-9]*' | sed 's/.*://' | tr '\n' ' ' | sed 's/ $//')"
+o="$("$L/steer-vless" vless-nodes nl $SE 2>/dev/null)"
+check "  vless-nodes: RU помечен исключённым, NL и DE нет" '"cc":"RU","excluded":true}|"cc":"NL"}|"cc":"DE"}' \
+    "$(printf '%s' "$o" | node_of "$RU Москва" | grep -o '"cc".*')|$(printf '%s' "$o" | node_of "$NL Мобильный" | grep -o '"cc".*')|$(printf '%s' "$o" | node_of "$DE Франкфурт" | grep -o '"cc".*')"
+p="$("$L/steer-vless" vless-probe nlx --timeout 1 $SE 2>/dev/null)"
+check "  only вместе с exclude_name — пересечение: «Мобильный» уходит, остаётся 2" "2" \
+    "$(printf '%s' "$p" | grep -o '"index":[0-9]*' | sed 's/.*://' | tr '\n' ' ' | sed 's/ $//')"
+p="$("$L/steer-hysteria2" hysteria2-probe hyo --timeout 1 $SE 2>/dev/null)"
+check "hysteria2-probe выход с only: RU — перебор только по RU (номер 0)" "0" \
+    "$(printf '%s' "$p" | grep -o '"index":[0-9]*' | sed 's/.*://' | tr '\n' ' ' | sed 's/ $//')"
+p="$("$L/steer-proxy" proxy-probe tjo --timeout 1 $SE 2>/dev/null)"
+check "proxy-probe выход с only: DE — перебор только по DE (номер 1)" "1" \
     "$(printf '%s' "$p" | grep -o '"index":[0-9]*' | sed 's/.*://' | tr '\n' ' ' | sed 's/ $//')"
 p="$("$L/steer-vless" vless-probe pin --timeout 1 $SE 2>/dev/null)"
 check "  вместе с nodes — пересечение: из [0, 2] остаётся 2" "2" \

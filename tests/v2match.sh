@@ -284,6 +284,18 @@ if [ -x "$XK" ]; then
     exref "exclude: [RU, RU] — отказ" "exclude: [RU, RU]" "RU указан дважды" 3:74
     exref "exclude_name: [a, a] — отказ" "exclude_name: [a, a]" "«a» указано дважды" 3:78
     exref "exclude_name: \"\" — отказ" 'exclude_name: [""]' "непустая строка" 3:75
+    # only — узлы только этих стран: тот же разбор, печать и неподвижная точка; спор с exclude — отказ.
+    printf 'version: 2\noutputs:\n  t: { kind: tunnel, protocol: vless, subscription: sub/t, only: [NL, DE], exclude_name: lte }\n' > "$tmp/on1.yaml"
+    (cd "$tmp" && "$XKA" spec convert --spec on1.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
+    if grep -q 'only: \[NL, DE\], exclude_name: \[lte\]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+        bad "convert печатает only (неподвижная точка)" "$(grep -n only "$tmp/c1.yaml")"; fi
+    exref "only: nl — отказ с местом" "only: nl" "«nl» — код страны: две заглавные латинские буквы" 3:66
+    exref "only: [NL, NL] — отказ" "only: [NL, NL]" "NL указан дважды" 3:71
+    exref "only и exclude по одной стране — отказ" "only: [NL, DE], exclude: DE" "DE — и в only, и в exclude" 3:66
+    printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, only: [RU] }\n' > "$tmp/on4.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec on4.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "ключ only есть только у kind: tunnel"; then ok; else
+        bad "only у interface — отказ «только у kind: tunnel»" "$out"; fi
     printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, exclude: [RU] }\n' > "$tmp/ex4.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec ex4.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ключ exclude есть только у kind: tunnel"; then ok; else

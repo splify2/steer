@@ -594,6 +594,7 @@ static const struct { const char *key; unsigned bit; const char *owner; } KIND_K
     { "insecure",     KK_SUB,    "kind: tunnel" },
     { "exclude",      KK_SUB,    "kind: tunnel" },
     { "exclude_name", KK_SUB,    "kind: tunnel" },
+    { "only",         KK_SUB,    "kind: tunnel" },
     { "active",       KK_SUB,    "kind: tunnel" },
     { "by",           KK_SUB,    "kind: tunnel" },
     { "interval",     KK_SUB,    "kind: tunnel" },
@@ -936,14 +937,18 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             }
         } else if (!strcmp(ks, "insecure")) {
             if (bool_of(x, v, w, &k.insecure)) return -1;
-        } else if (!strcmp(ks, "exclude")) {
-            /* Страны, узлы которых не брать (флаг в имени узла, src/model/nodesel.h): одно значение
-             * или список. Код — ровно две заглавные латинские буквы, как в флаге: «ru» или «RUS»
-             * не совпали бы ни с одним узлом молча. Пустой список — ничего не исключать. */
+        } else if (!strcmp(ks, "exclude") || !strcmp(ks, "only")) {
+            /* Страны, узлы которых не брать (exclude) или только которых брать (only) — по флагу в
+             * имени узла, src/model/nodesel.h: одно значение или список. Код — ровно две заглавные
+             * латинские буквы, как в флаге: «ru» или «RUS» не совпали бы ни с одним узлом молча.
+             * Пустой список — ключа нет. Одна страна и там и там — отказ, как у warp. */
+            int only = !strcmp(ks, "only");
+            char (**cc)[3] = only ? &k.excl.only : &k.excl.cc;
+            size_t *ccn = only ? &k.excl.only_n : &k.excl.cc_n;
             if (items_ok(x, v, w)) return -1;
             if (n_items(v)) {
-                k.excl.cc = (char (*)[3])spec_alloc(s, n_items(v) * 3);
-                if (!k.excl.cc) return fail(x, v, "%s: недостаточно памяти для спеки", w);
+                *cc = (char (*)[3])spec_alloc(s, n_items(v) * 3);
+                if (!*cc) return fail(x, v, "%s: недостаточно памяти для спеки", w);
             }
             for (size_t i2 = 0; i2 < n_items(v); i2++) {
                 const struct ynode *it = item(v, i2);
@@ -951,9 +956,9 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 if (strlen(c) != 2 || c[0] < 'A' || c[0] > 'Z' || c[1] < 'A' || c[1] > 'Z')
                     return fail(x, it, "%s: «%s» — код страны: две заглавные латинские буквы "
                                 "(ISO 3166-1), например RU", w, c);
-                for (size_t b = 0; b < k.excl.cc_n; b++)
-                    if (!strcmp(k.excl.cc[b], c)) return fail(x, it, "%s: %s указан дважды", w, c);
-                memcpy(k.excl.cc[k.excl.cc_n++], c, 3);
+                for (size_t b = 0; b < *ccn; b++)
+                    if (!strcmp((*cc)[b], c)) return fail(x, it, "%s: %s указан дважды", w, c);
+                memcpy((*cc)[(*ccn)++], c, 3);
             }
         } else if (!strcmp(ks, "exclude_name")) {
             /* Куски имени узла, без учёта регистра (латиница и кириллица): узел, в имени которого
@@ -1016,6 +1021,12 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         if (tunnel && k.pool.tol_set && k.pool.pick != 1)
             return fail(x, ynode_get(val, "tolerance"), "%s: tolerance — допуск смены узла по замеру, он "
                         "есть только у pick: latency", where);
+        /* only и exclude по одной стране — спор с самим собой: узлы страны и берут, и не берут. */
+        for (size_t i2 = 0; tunnel && i2 < k.excl.only_n; i2++)
+            for (size_t b = 0; b < k.excl.cc_n; b++)
+                if (!strcmp(k.excl.only[i2], k.excl.cc[b]))
+                    return fail(x, ynode_get(val, "only"), "%s: %s — и в only, и в exclude", where,
+                                k.excl.cc[b]);
         /* Разбор и проверка ключей — у вида (один разбор на оба формата, kind.h). */
         if (kd->parse && kd->parse(&o, &k, x->e) != 0) return wrap(x, key);
         if (kd->check && kd->check(s, &o, x->e) != 0) return wrap(x, key);

@@ -371,6 +371,7 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
         }
         if (kk.insecure) { fk(&w, "insecure"); fputs("true", f); }
         if (kk.excl.cc_n) fseq_s(&w, "exclude", kk.excl.cc[0], 3, kk.excl.cc_n);
+        if (kk.excl.only_n) fseq_s(&w, "only", kk.excl.only[0], 3, kk.excl.only_n);
         if (kk.excl.names_n) fseq(&w, "exclude_name", kk.excl.names, kk.excl.names_n);
         /* Пул узлов туннеля — только отличное от умолчания (struct tun_pool). */
         if (kk.pool.active > 1) { fk(&w, "active"); fprintf(f, "%d", kk.pool.active); }

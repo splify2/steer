@@ -57,7 +57,7 @@ out="$($BIN status --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>/dev/null)
 # смешанный пул нужнее всего, и именно там старый движок молча уводит канал в blackhole.
 check "перечень умений напечатан" "1" \
       "$(printf '%s' "$out" | grep -c '"features":\[')"
-for f in lan_devices nodes pool active_device groups balance_by active_nodes block spec_json pool_latency dns_groups dns_other dns_fragment dns_h3; do
+for f in lan_devices nodes pool active_device groups balance_by node_only active_nodes block spec_json pool_latency dns_groups dns_other dns_fragment dns_h3; do
     check "умение $f названо" "1" "$(printf '%s' "$out" | grep -c "\"$f\"")"
 done
 # schema остаётся единицей: перечень умений — не новая версия контракта, а рассказ о том, что
