@@ -2082,6 +2082,20 @@ static int warm_take(short dc, short media, struct upstream *u_out, char *sni, s
     return got;
 }
 
+/* Не закрыл ли пир соединение, пока оно лежало в запасе. Запись в сокет, чей пир прислал FIN,
+ * УДАЁТСЯ — ошибка придёт только на следующей, — поэтому одной проверки `ws_send() < 0` мало:
+ * аккуратно закрытое точкой (край Cloudflare закрывает веб-сокеты сам при переработке)
+ * уезжало клиенту как живое и давало молчание мессенджера (I-195). Спрашиваем сокет: на
+ * покое, пока мы ничего не слали, читать там нечего — любой ввод (close-кадр, alert TLS, EOF)
+ * или RDHUP значит, что соединение отдавать нельзя. Лишний ping от точки даст ложное «мертво»
+ * и один повторный дозвон — дешевле, чем отдать мёртвое. */
+static int up_peer_gone(const struct upstream *u) {
+    struct pollfd p = { .fd = u->fd, .events = POLLIN | POLLRDHUP, .revents = 0 };
+    if (u->tls_on && tls13_has_record(&u->tls)) return 1;       /* уже прочитанное в буфере */
+    if (poll(&p, 1, 0) < 0) return 0;                           /* не знаем — решит ws_send */
+    return (p.revents & (POLLIN | POLLRDHUP | POLLHUP | POLLERR)) != 0;
+}
+
 /* ОДИН ПРОХОД наполнителя: убрать тухлые слоты, добрать недостающее. Возвращает число
  * поднятых за проход соединений — по нему наполнитель выбирает паузу.
  *
@@ -2464,7 +2478,7 @@ static void *serve(void *arg) {
     u.fd = -1;
     if (warm_take(dc, media, &u, sni_buf, sizeof(sni_buf))) {
         from_warm = 1;
-        if (ws_send(&u, hs, HS_LEN) < 0) {
+        if (up_peer_gone(&u) || ws_send(&u, hs, HS_LEN) < 0) {
             up_drop(&u);
             from_warm = 0;
         }
