@@ -355,6 +355,10 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             else if (!strcmp(key, "stream_port")) {
                 long v = 0;
                 if (js_num(j, &v, e) != 0) return -1;
+                /* Диапазон — на long, ДО приведения к int: (int)4294967739 даёт 443 и проходил проверку
+                 * вида как законный порт. 0 — «порт хаба как в Endpoint», остальное — 1..65535. */
+                if (v < 0 || v > 65535)
+                    return err_set(e, "outputs.%s: stream_port вне 1..65535", o.name);
                 k.stream_port = (int)v;
             }
             /* `node` — сокращение для списка из одного узла, `nodes` — сам список. Дальше по
@@ -365,6 +369,11 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
                 long v = 0;
                 if (js_num(j, &v, e) != 0) return -1;
                 k.node_one = 1;
+                /* Потолок тот же, что у элементов `nodes` (num_array), и тоже на long до приведения:
+                 * (int)4294967297 давал номер 1. */
+                if (v > 100000)
+                    return err_set(e, "outputs.%s: node — номер узла подписки не больше 100000",
+                        o.name);
                 if (v >= 0) {
                     k.nodes = (int *)spec_alloc(s, sizeof(int));
                     if (!k.nodes) return v1_nomem(e);

@@ -33,6 +33,7 @@
 #include <pthread.h>
 #include "tls13.h"
 #include "reality.h"
+#include "wipe.h"
 #include "dupq.h"
 #include "thrstack.h"
 #include "sockmark.h"
@@ -408,6 +409,9 @@ static void dial_run(struct dial *d) {
     const char *roots = d->ca[0] ? d->ca : (tls_cert_roots ? tls_cert_roots() : NULL);
     struct tls13_auth auth = { .host = d->u.host, .roots = roots };
     int rc = tls13_handshake_auth(t, fd, hello, hello_n, rst.priv, &auth);
+    /* Эфемерный приватный ключ, общий секрет Reality, ключ аутентификатора и ключ ML-KEM нужны только до
+     * конца рукопожатия: дальше их держит лишь стек, и стираем сразу. */
+    steer_wipe(&rst, sizeof(rst));
     if (rc != 0) {
         const char *why = tls13_verify_reason ? tls13_verify_reason() : NULL;
         snprintf(d->err, sizeof(d->err), "рукопожатие TLS с %.50s не удалось (%d%s%.30s)", d->u.host, rc,
