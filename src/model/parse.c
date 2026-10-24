@@ -128,7 +128,8 @@ static int from_disc(const struct spec *sp, const char (*from)[64], size_t from_
 int l4match_same(const struct l4match *a, const struct l4match *b) {
     int ae = l4match_empty(a), be = l4match_empty(b);
     if (ae || be) return ae && be;
-    if (a->proto != b->proto || a->ports_n != b->ports_n || a->override_port != b->override_port)
+    if (a->proto != b->proto || a->ports_n != b->ports_n || a->override_port != b->override_port ||
+        a->quic_block != b->quic_block)
         return 0;
     /* ПОРЯДОК ЗНАЧИМ, и это сознательно. Два канала с одними диапазонами, записанными в
      * разном порядке, дадут разные группы и разные наборы — то есть лишнее правило вместо

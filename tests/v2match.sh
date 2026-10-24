@@ -935,6 +935,101 @@ l2="$(echo "$out" | grep -n 'meta mark set .* comment "steer:wg0_all"' | head -n
 if [ -n "$l1" ] && [ -n "$l2" ] && [ "$l1" -lt "$l2" ]; then ok; else
     bad "инверсный режим — direct для РФ раньше метки to: all" "$(echo "$out" | grep -n 'steer:' | head -n 6)"; fi
 
+# ---- quic: block — UDP/443 к назначениям правила отвергается до разметки той же группы ----------
+printf 'example.org\n' > "$tmp/qd.dom"
+y <<'EOF'
+version: 2
+lan: { devices: [br-lan], addr: [192.168.1.0/24] }
+lists:
+  ru: { prefixes_file: TMP/ru.lst }
+  dm: { domains_file: TMP/qd.dom }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+rules:
+  - { name: ru, to: [ru], out: wg0, quic: block }
+  - { name: dm, to: [dm], out: wg0 }
+  - { name: rest, to: all, out: wg0, quic: block }
+EOF
+accepted "quic: block у правил со списком адресов и «весь трафик»"
+out="$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"
+q1="$(echo "$out" | grep -n 'steer-quic:wg0_ip_c0_p1"' | head -n 1 | cut -d: -f1)"
+m1="$(echo "$out" | grep -n 'comment "steer:wg0_ip_c0_p1"' | head -n 1 | cut -d: -f1)"
+if [ -n "$q1" ] && [ -n "$m1" ] && [ "$q1" -lt "$m1" ] &&
+   echo "$out" | grep -q 'ip daddr @wg0_ip_c0_p1 meta l4proto udp th dport 443 counter reject with icmpx admin-prohibited'; then ok; else
+    bad "quic: block — отказ UDP/443 по набору правила раньше его метки" "$(echo "$out" | grep -n 'quic\|wg0_ip' | head -n 6)"; fi
+if echo "$out" | grep -q 'ip daddr != { 10.0.0.0/8.*th dport 443 counter reject.*steer-quic:wg0_all_c0_p1' &&
+   echo "$out" | grep -q 'ip6 daddr != { ::1, fe80::/10, fc00::/7, ff00::/8 }.*th dport 443 counter reject.*steer-quic:wg0_all_c0_p1'; then ok; else
+    bad "quic: block у «весь трафик» — свои сети не затронуты, оба семейства" "$(echo "$out" | grep 'quic:wg0_all' | head -n 4)"; fi
+# Правило dm без quic — своя группа и свой набор: QUIC к его доменам не трогается.
+if ! echo "$out" | grep -q 'steer-quic:wg0_dom'; then ok; else bad "quic: block не заходит в соседнее правило без ключа" "$(echo "$out" | grep 'steer-quic' | head -n 6)"; fi
+# reject на ingress невозможен — разметка на ingress при таком правиле не ставится.
+if ! echo "$out" | grep -q 'hook ingress'; then ok; else bad "quic: block — без разметки на ingress"; fi
+# Спека без ключа — без правил отказа.
+sed 's/, quic: block//' "$tmp/s.yaml" > "$tmp/s0.yaml"
+out0="$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run --spec "$tmp/s0.yaml" $S 2>&1)"
+if ! echo "$out0" | grep -q 'steer-quic'; then ok; else bad "без quic: block правил steer-quic нет"; fi
+# Домен: резолвер кладёт адреса в тот же набор, что и правило отказа.
+y <<'EOF'
+version: 2
+lists:
+  dm: { domains_file: TMP/qd.dom }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+rules:
+  - { name: dm, to: [dm], out: wg0, quic: block }
+EOF
+out="$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"
+tab="$("$BIN" dnsd-table --spec "$tmp/s.yaml" $S 2>&1)"
+sn="$(echo "$tab" | grep -o 'wg0_dom_c0_p[0-9]*' | head -n 1)"
+if [ -n "$sn" ] && echo "$out" | grep -q "ip daddr @$sn meta l4proto udp th dport 443 counter reject"; then ok; else
+    bad "quic: block у доменов — набор резолвера и набор правила отказа один" "таблица: $tab"; fi
+# convert — неподвижная точка, ключ печатается, оригинальный список не размножается.
+"$BIN" spec convert --spec "$tmp/s.yaml" > "$tmp/c1.yaml" 2>/dev/null
+"$BIN" spec convert --spec "$tmp/c1.yaml" > "$tmp/c2.yaml" 2>/dev/null
+if grep -q 'quic: block' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml" && [ "$(grep -c '^  dm' "$tmp/c1.yaml")" = 1 ]; then ok; else
+    bad "quic: block — spec convert неподвижен и без копий списка" "$(cat "$tmp/c1.yaml")"; fi
+y <<'EOF'
+version: 2
+lists:
+  dm: { domains_file: TMP/qd.dom }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+rules:
+  - { name: dm, to: [dm], out: wg0, quic: off }
+EOF
+refused "quic: неизвестное значение" "«off» — нужен block"
+y <<'EOF'
+version: 2
+lists:
+  t: { domains_file: TMP/qd.dom, proto: tcp }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+rules:
+  - { name: t, to: [t], out: wg0, quic: block }
+EOF
+refused "quic: block у списка только tcp" "список только tcp — QUIC это UDP"
+y <<'EOF'
+version: 2
+lists:
+  t: { domains_file: TMP/qd.dom, proto: udp, ports: [80, 8000-9000] }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+rules:
+  - { name: t, to: [t], out: wg0, quic: block }
+EOF
+refused "quic: block у списка без порта 443" "порты списка не содержат 443"
+y <<'EOF'
+version: 2
+lists:
+  s: { srs: TMP/x.srs }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+rules:
+  - { name: s, to: [s], out: wg0, quic: block }
+EOF
+refused "quic: block у списка srs — ещё не поддерживается" "ещё не поддерживается"
+
+
 echo "v2match: разбор v2 — $pass проверок прошли"
 if [ "$fail" -gt 0 ]; then echo "v2match: ПРОВАЛЕНО $fail"; exit 1; fi
 exit 0

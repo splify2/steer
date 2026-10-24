@@ -268,7 +268,7 @@ static int out_v6_ok(const struct output *o) {
  *
  * reverse — встречный путь: там наш клиент получатель, а порт сервера ИСХОДЯЩИЙ. */
 static void x_l4(struct nft_rule *r, const struct l4match *m, int reverse) {
-    if (l4match_empty(m)) return;
+    if (l4match_plain(m)) return;       /* признак quic трафик не сужает */
     if (m->proto == CH_PROTO_TCP)      ir_x(r, "meta l4proto tcp");
     else if (m->proto == CH_PROTO_UDP) ir_x(r, "meta l4proto udp");
     else                               ir_x(r, "meta l4proto { tcp, udp }");
@@ -697,6 +697,44 @@ static void v6donor_catchall(struct nft_chain *c, const struct spec *sp, enum ma
     ir_comment(r, "steer-v6donor:%s", d->name);
 }
 
+/* QUIC ВЫКЛЮЧЕН у правила (`quic: block`, l4.quic_block группы): UDP/443 к назначениям группы
+ * отвергается ДО правила разметки той же группы — первое совпавшее решает, и правило выше (иное
+ * назначение, иной выход) QUIC своих адресов не теряет. Отказ — тот же ICMP «запрещено», что у
+ * kind=block: браузер узнаёт о нём сразу и уходит на TCP, а не ждёт срока.
+ *
+ * Отвергает цепочка prerouting_mark: на ingress (netdev) reject недоступен, поэтому ingress_devs
+ * при таком правиле разметку на ingress не ставит. «Весь трафик» — это интернет, как у
+ * output_mark: своя сеть (принтер, NAS с HTTP/3) не затрагивается. Адреса домена здесь уже
+ * поддельные (fake-IP): dnat к настоящему стоит позже разметки, и набор группы их и содержит. */
+static void quic_reject(struct nft_chain *c, const struct spec *sp, const struct group *g) {
+    static const char *const LOCAL4 = "ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, "
+        "172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }";
+    static const char *const LOCAL6 = "ip6 daddr != { ::1, fe80::/10, fc00::/7, ff00::/8 }";
+    if (who4_ok(g)) {
+        struct nft_rule *r = ir_rule(c);
+        x_from(r, sp, g);
+        if (g->all) { ir_family(r, 4); ir_x(r, "%s", LOCAL4); }
+        x_dest(r, g, 0, group_has_set(g));
+        ir_x(r, "meta l4proto udp");
+        ir_x(r, "th dport 443");
+        ir_counter(r, 0, 0);
+        ir_x(r, "reject with icmpx admin-prohibited");
+        ir_comment(r, "steer-quic:%s", g->name);
+    }
+    if (g->all ? who6_ok(sp, g) : group_needs6(sp, g)) {
+        struct nft_rule *r = ir_rule(c);
+        ir_rule_fam(r, 6);
+        x_from6(r, sp, g, 0, !group_has_set6(g));
+        if (g->all) ir_x(r, "%s", LOCAL6);
+        x_dest6(r, g, 0);
+        ir_x(r, "meta l4proto udp");
+        ir_x(r, "th dport 443");
+        ir_counter(r, 0, 0);
+        ir_x(r, "reject with icmpx admin-prohibited");
+        ir_comment(r, "steer-quic:%s", g->name);
+    }
+}
+
 static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const struct groups *gr,
                             enum mark_hook mh, struct err *e) {
     for (size_t i = 0; i < gr->n; i++) {
@@ -705,6 +743,7 @@ static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const st
         if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
         /* Каналы на сам телефон — на хуке output, см. nft_emit_output_mark. */
         if (group_is_local(g)) continue;
+        if (g->l4 && g->l4->quic_block && mh != MH_INGRESS) quic_reject(c, sp, g);
         /* ПРАВИЛО У ГРУППЫ ОДНО (в старой раскладке у доменной группы с префиксами их
          * становится два — см. legacy.c, шаг 1), и с 1.9 у него бывает v6-двойник ниже.
          * Клиент из одних адресов IPv6 правила IPv4 не даёт вовсе. */
@@ -901,6 +940,10 @@ static size_t ingress_devs(const struct spec *sp, const struct groups *gr, const
     int any = 0;
     for (size_t i = 0; i < gr->n && !any; i++) any = !group_is_local(&gr->g[i]);
     if (!any) return 0;
+    /* Правило с выключенным QUIC отвергает пакет в prerouting_mark, а на ingress reject нет, и
+     * раньше отказа пакет уже получил бы метку выхода (разметка на ingress решает первой). */
+    for (size_t i = 0; i < gr->n; i++)
+        if (gr->g[i].l4 && gr->g[i].l4->quic_block) return 0;
     size_t n = 0;
     for (size_t i = 0; i < sp->lan_dev_n; i++)
         if (nft_ingress_all_devs() || if_nametoindex(sp->lan_dev[i]))
