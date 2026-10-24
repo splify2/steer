@@ -20,6 +20,8 @@
 
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "reality.h"
 
 /* ---- заглушки TLS и Reality: связь стенда голая, до них дело не доходит ------------ */
@@ -414,7 +416,68 @@ static void t_aux(void) {
     close(fd);
 }
 
+/* GOAWAY(last_stream_id, NO_ERROR) на соединение. */
+static void srv_goaway(uint32_t last) {
+    unsigned char f[17] = { 0, 0, 8, 0x07, 0, 0, 0, 0, 0,
+                            (unsigned char)(last >> 24), (unsigned char)(last >> 16),
+                            (unsigned char)(last >> 8), (unsigned char)last, 0, 0, 0, 0 };
+    if (write(g_srv, f, sizeof(f)) != (ssize_t)sizeof(f)) { perror("write"); exit(2); }
+}
+
+/* I-468: сервер исчерпал предел запросов на связь выгрузки (GOAWAY после ответа на последний кусок).
+ * Следующий кусок прежде получал H2_ERESET и рвал соединение клиента; теперь связь переоткрывается
+ * и кусок уходит по новой. Узел — голый tcp на локальный порт, как у security=none. */
+static void t_packet_up_goaway(void) {
+    int lf = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    socklen_t al = sizeof(a);
+    if (lf < 0 || bind(lf, (struct sockaddr *)&a, sizeof(a)) || listen(lf, 4) ||
+        getsockname(lf, (struct sockaddr *)&a, &al)) { check(0, "локальный слушатель"); return; }
+    struct tr_node n;
+    memset(&n, 0, sizeof(n));
+    n.host = "127.0.0.1"; n.port = ntohs(a.sin_port); n.type = "xhttp"; n.security = "none";
+    n.path = "/xh/";
+
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    struct transport c;
+    conn_init(&c, XH_PACKET_UP, fd);
+    c.xh.open_timeout = 3;
+    check(node_keep(&c.xh, &n) == 0, "I-468: копия узла для переоткрытия снята");
+    n.host = "стёрто";                                  /* узел вызывающего пережить открытие не обязан */
+
+    int rc0 = transport_write(&c, piece, sizeof(piece));     /* кусок 0, поток 1 */
+    srv_drain();
+    srv_headers(1, 0x88, 1);                                 /* ответ на кусок 0 */
+    srv_goaway(1);                                           /* предел запросов: больше потоков нет */
+    int rc1 = transport_write(&c, piece, sizeof(piece));     /* кусок 1: нужна новая связь */
+    struct pollfd pf = { .fd = lf, .events = POLLIN };
+    int accepted = poll(&pf, 1, 1000) > 0;
+    int nfd = accepted ? accept(lf, NULL, NULL) : -1;
+    check(rc0 == 0 && rc1 == 0 && c.xh.seq == 2 && accepted,
+          "I-468: GOAWAY на связи выгрузки — кусок уходит по переоткрытой связи, а не H2_ERESET");
+    check(c.xh.up.link.fd > 0 && !c.xh.up.h2.goaway && nfd >= 0,
+          "I-468: новую связь принял слушатель, состояние HTTP/2 у неё свежее");
+    if (nfd >= 0) close(nfd);
+    xhttp_close(&c);                                    /* закрывает и новую связь, и копию узла */
+
+    /* Неотвеченный кусок и живая связь: ждём, а не переоткрываем (его ответ ещё придёт). */
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    conn_init(&c, XH_PACKET_UP, fd);
+    c.xh.open_timeout = 3;
+    node_keep(&c.xh, &n);
+    n.host = "127.0.0.1";
+    transport_write(&c, piece, sizeof(piece));
+    srv_drain();
+    srv_goaway(1);                                           /* ответа на кусок 0 ещё нет */
+    int rcw = transport_write(&c, piece, sizeof(piece));
+    check(rcw == H2_EWINDOW, "I-468: GOAWAY при неотвеченном куске — ждём ответа, связь не рвётся");
+    xhttp_close(&c);
+    close(lf);
+}
+
 int main(void) {
+    t_packet_up_goaway();
     t_aux();
     t_packet_up_window_over_seq();
     t_packet_up_order();

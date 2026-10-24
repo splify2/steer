@@ -331,6 +331,10 @@ static const unsigned MQ_PORTS[] = { 443, 500, 1701, 4500, 4443, 8443, 8095 };
 /* Включить MASQUE у регистрации члена (новая регистрация, если у прежней нет id и token). */
 static int member_masque(struct member *m) {
     if (wb_reg_has_masque(&m->reg)) return 0;
+    /* Срок после отказа действует и здесь: у члена с готовой регистрацией (id и token есть) до
+     * member_reg дело не доходит, и PATCH к API Cloudflare уходил каждый виток цикла (30 с) вечно,
+     * пока включение не удастся (I-543) — API отвечает на это ограничением, и оно било по всем членам. */
+    if (time(NULL) < m->reg_retry) return -1;
     char why[256] = "";
     if ((!m->reg.id[0] || !m->reg.token[0]) && member_reg(m, 1) != 0) return -1;
     if (wb_enroll_masque(&m->reg, why, sizeof(why)) != 0) {

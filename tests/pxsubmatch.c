@@ -69,15 +69,19 @@ static void test_parse(void) {
     check("vmess tls=reality — негоден", 1, px_parse_url("vmess://eyJ2IjoiMiIsInBzIjoibiIsImFkZCI6ImguZXhhbXBsZSIsInBvcnQiOiI0NDMiLCJpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidGxzIjoicmVhbGl0eSIsInNuaSI6InMuZXhhbXBsZSJ9", &n, 0));
     check_str("vmess tls=reality — причина", "vmess tls=reality не поддержан (нет pbk в JSON v2rayN)", n.skip_reason);
 
-    /* I-414: JSON vmess, не влезший в буфер, — отказ с причиной, а не обрезанный разбор. */
+    /* JSON vmess длиннее прежних 4096 байт разбирается (буфер — по длине ссылки): длинное имя узла безвредно
+     * обрезается, а ключи и id остаются целы. */
     {
         static char big[8192];
         strcpy(big, "vmess://eyJ2IjoiMiIsICAiYWRkIjoiaC5leGFtcGxlIiwicG9ydCI6IjQ0MyIsImlkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwiYWlkIjoiMCIsIm5ldCI6InRjcCIsInBzIjoi");
         for (int i = 0; i < 1500; i++) strcat(big, "eHh4");
         strcat(big, "In0g");
-        check("vmess JSON > 4096 — негоден", 1, px_parse_url(big, &n, 0));
-        check_str("vmess JSON > 4096 — причина", "vmess JSON длиннее 4094 байт", n.skip_reason);
+        check("vmess JSON > 4096 — разобран", 0, px_parse_url(big, &n, 0));
+        check_str("vmess JSON > 4096 — хост цел", "h.example", n.vn.host);
     }
+    /* I-526: поле vmess, не влезшее в узел, — отказ с шириной, а не обрезанный путь. */
+    check("vmess path в 201 знак — негоден", 1, px_parse_url("vmess://eyJ2IjoiMiIsInBzIjoibiIsImFkZCI6ImguZXhhbXBsZSIsInBvcnQiOiI0NDMiLCJpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0Ijoid3MiLCJ0eXBlIjoiIiwiaG9zdCI6InguZXhhbXBsZSIsInBhdGgiOiIvcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAiLCJ0bHMiOiJ0bHMiLCJzbmkiOiJoLmV4YW1wbGUifQ==", &n, 0));
+    check_str("vmess path в 201 знак — причина", "path длиннее 127 байт", n.skip_reason);
 
     /* I-414: пароль длиннее поля — отказ с причиной. */
     {

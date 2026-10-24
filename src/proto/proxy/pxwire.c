@@ -16,22 +16,27 @@ size_t px_socks_addr(unsigned char *out, uint32_t dst_net, uint16_t dport_host) 
 
 /* ---- shadowsocks ---------------------------------------------------------------------------- */
 
-void px_ss_evp_key(const char *pass, unsigned char *key, size_t key_n) {
+int px_ss_evp_key(const char *pass, unsigned char *key, size_t key_n) {
     /* EVP_BytesToKey(MD5, пароль, без соли, 1 итерация): key = MD5(pass) ‖ MD5(MD5(pass) ‖ pass) ‖ …
      * до key_n байт. Так shadowsocks выводит ключ из пароля с первых версий. */
     unsigned char prev[16];
     size_t have = 0, pl = strlen(pass);
     while (have < key_n) {
         struct sc_hash_ctx h;
-        sc_hash_init(&h, SC_MD5);
-        if (have) sc_hash_update(&h, prev, 16);
-        sc_hash_update(&h, pass, pl);
-        sc_hash_final(&h, prev);
+        /* Отказ слоя (в сборке нет MD5, нет памяти) — отказ вывода ключа: прежде ключ тихо оставался
+         * мусором, и узел «не отвечал» без единой причины (I-416). */
+        if (sc_hash_init(&h, SC_MD5) != 0) return -1;
+        int rc = 0;
+        if (have) rc |= sc_hash_update(&h, prev, 16);
+        rc |= sc_hash_update(&h, pass, pl);
+        rc |= sc_hash_final(&h, prev);
         sc_hash_free(&h);
+        if (rc) return -1;
         size_t take = key_n - have < 16 ? key_n - have : 16;
         memcpy(key + have, prev, take);
         have += take;
     }
+    return 0;
 }
 
 int px_ss_subkey(const unsigned char *key, size_t key_n, const unsigned char *salt,

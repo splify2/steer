@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -90,6 +91,9 @@ static int socks5_hello(int fd, const struct px_node *n) {
         buf[o++] = (unsigned char)pl; memcpy(buf + o, n->pass, pl); o += pl;
         if (wr_full(fd, buf, o)) return TR_EIO;
         if (rd_full(fd, buf, 2)) return TR_EIO;
+        /* RFC 1929: версия ответа авторизации — 1, а не версия SOCKS. Сервер, ответивший чужим
+         * (скажем, 5 из-за перепутанных слоёв), не должен считаться принявшим пароль. */
+        if (buf[0] != 1) return PX_EPROTO;
         if (buf[1] != 0) return PX_EAUTH;
     } else if (buf[1] != 0) {
         return PX_EAUTH;
@@ -198,6 +202,15 @@ static int sk_fd(const void *sess) {
 }
 static int sk_has_data(const void *sess) { (void)sess; return 0; }
 
+/* Пачка UDP ушла не вся (буфер сокета полон): остаток потерян, о чём раз в десять секунд говорим. */
+static void udp_partial_note(const char *who) {
+    static __thread time_t said;
+    time_t now = stack_now_s();
+    if (now - said < 10) return;
+    said = now;
+    fprintf(stderr, "steer[warn]: %s: буфер UDP полон — остаток пачки датаграмм потерян\n", who);
+}
+
 static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int udp,
                    const unsigned char *data, size_t n) {
     (void)ctx; (void)k;
@@ -218,6 +231,7 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     /* data — череда [длина(2)][датаграмма]; каждая → пакет socks5 UDP. */
     const unsigned char *p = data;
     size_t left = n;
+    unsigned sent = 0;                   /* датаграмм этой пачки, уже ушедших в сокет */
     while (left >= 2) {
         size_t dl = ((size_t)p[0] << 8) | p[1];
         p += 2; left -= 2;
@@ -228,8 +242,15 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         o += px_socks_addr(pkt + o, s->dst, s->dport);
         memcpy(pkt + o, p, dl); o += dl;
         ssize_t w = send(s->udpfd, pkt, o, MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return SEND_AGAIN;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* AGAIN — «ничего не ушло»: повтор пачки послал бы первые датаграммы дважды. Раз часть
+             * ушла, остаток — потеря, как у любого UDP при полном буфере. */
+            if (!sent) return SEND_AGAIN;
+            udp_partial_note("socks");
+            return SEND_OK;
+        }
         if (w != (ssize_t)o) return SEND_FATAL;
+        sent++;
         p += dl; left -= dl;
     }
     return left ? SEND_FATAL : SEND_OK;

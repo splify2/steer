@@ -69,7 +69,8 @@ struct v2 {
     const struct ynode *un_node;
     char un_what[400];
     int realip_default;             /* dns.mode */
-    char base[1040];                /* каталог файла спеки — для относительных путей */
+    char base[4096];                /* каталог файла спеки — для относительных путей (PATH_MAX) */
+    int base_err;                   /* каталог определить не удалось: относительные пути не разрешить */
     /* Узлы выходов для сообщений и второго прохода. */
     /* Растут вместе с числом выходов (v2_room) — по ним ходит второй проход, и предельного числа
      * выходов у разбора нет: число выходов с меткой ограничивает раскладка метки (check_slots). */
@@ -221,25 +222,44 @@ static int name_of(struct v2 *x, const struct ynode *key, const char *section, c
  * временном файле рядом со спекой, так что каталог тот же. */
 static int path_of(struct v2 *x, const struct ynode *n, const char *where, const char *v, char *dst,
                    size_t cap) {
-    if (v[0] == '/' || !x->base[0]) return copy_to(x, n, where, v, dst, cap);
-    char full[1400];
-    snprintf(full, sizeof(full), "%.1039s/%.300s", x->base, v);
-    return copy_to(x, n, where, full, dst, cap);
+    if (v[0] == '/') return copy_to(x, n, where, v, dst, cap);
+    /* Каталог не определился (слишком длинный путь, нет рабочего каталога): оставить путь
+     * относительным значило бы тихо сменить смысл — от каталога процесса, а не спеки. */
+    if (x->base_err)
+        return fail(x, n, "%s: каталог файла спеки не определить — относительный путь «%s» не разрешить, "
+                    "задайте абсолютный", where, v);
+    if (!x->base[0]) return copy_to(x, n, where, v, dst, cap);
+    /* Склейка без промежуточного буфера и без обрезки: прежняя режет каталог до 1039 и путь до 300
+     * байт молча, и файл спеки искался по другому имени (I-543). Не влезло — отказ с числом. */
+    size_t need = strlen(x->base) + 1 + strlen(v);
+    if (need >= cap) return fail(x, n, "%s: путь с каталогом спеки длиннее %zu байт", where, cap - 1);
+    size_t bl = strlen(x->base);
+    memcpy(dst, x->base, bl);
+    dst[bl] = '/';
+    memcpy(dst + bl + 1, v, strlen(v) + 1);
+    return 0;
 }
 
 static void base_of(struct v2 *x, const char *name) {
     x->base[0] = '\0';
+    x->base_err = 0;
     if (!name || !strcmp(name, "stdin")) return;
     const char *sl = strrchr(name, '/');
-    char dir[512];
-    if (sl) snprintf(dir, sizeof(dir), "%.*s", (int)(sl - name), name);
-    else snprintf(dir, sizeof(dir), ".");
+    char dir[4096], cwd[4096];
+    int k;
+    if (sl) k = snprintf(dir, sizeof(dir), "%.*s", (int)(sl - name), name);
+    else k = snprintf(dir, sizeof(dir), ".");
+    if (k < 0 || (size_t)k >= sizeof(dir)) { x->base_err = 1; return; }
     if (!dir[0]) snprintf(dir, sizeof(dir), "/");
-    if (dir[0] == '/') { snprintf(x->base, sizeof(x->base), "%s", dir); return; }
-    char cwd[512];
-    if (!getcwd(cwd, sizeof(cwd))) return;
-    if (!strcmp(dir, ".")) snprintf(x->base, sizeof(x->base), "%s", cwd);
-    else snprintf(x->base, sizeof(x->base), "%s/%s", cwd, dir);
+    if (dir[0] == '/') {
+        k = snprintf(x->base, sizeof(x->base), "%s", dir);
+        if (k < 0 || (size_t)k >= sizeof(x->base)) { x->base[0] = '\0'; x->base_err = 1; }
+        return;
+    }
+    if (!getcwd(cwd, sizeof(cwd))) { x->base_err = 1; return; }
+    if (!strcmp(dir, ".")) k = snprintf(x->base, sizeof(x->base), "%s", cwd);
+    else k = snprintf(x->base, sizeof(x->base), "%s/%s", cwd, dir);
+    if (k < 0 || (size_t)k >= sizeof(x->base)) { x->base[0] = '\0'; x->base_err = 1; }
 }
 
 /* ---- адреса клиентов ----------------------------------------------------------------------- */

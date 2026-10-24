@@ -346,7 +346,9 @@ struct obfs_state {
     struct qc_filter flt;
 };
 
-static void make_cfg(const struct hy2_node *n, const char *ip, struct qc_cfg *c,
+/* 0 — готово; -1 — настройки обфускации узла негодны (Gecko: min > max или max > 2048): соединение
+ * без неё сервер отверг бы как чужой трафик, и узел «молча не работал» без причины. */
+static int make_cfg(const struct hy2_node *n, const char *ip, struct qc_cfg *c,
                      struct obfs_state *ob, uint32_t mark, int mark_req,
                      unsigned conn_win, unsigned stream_win, struct qc_tls *tls) {
     memset(c, 0, sizeof *c);
@@ -373,7 +375,8 @@ static void make_cfg(const struct hy2_node *n, const char *ip, struct qc_cfg *c,
     c->sock_mark = mark;
     c->mark_required = mark_req;
     memset(ob, 0, sizeof *ob);
-    if (n->obfs == 2 && hy2_gecko_init(&ob->gk, n->obfs_pass, n->gecko_min, n->gecko_max) == 0) {
+    if (n->obfs == 2) {
+        if (hy2_gecko_init(&ob->gk, n->obfs_pass, n->gecko_min, n->gecko_max) != 0) return -1;
         ob->flt.tx_multi = hy2_gecko_tx;
         ob->flt.rx = hy2_gecko_rx;
         ob->flt.user = &ob->gk;
@@ -390,6 +393,7 @@ static void make_cfg(const struct hy2_node *n, const char *ip, struct qc_cfg *c,
         c->hop_ms = n->hop_s * 1000u;
         memcpy(c->hop, n->hop, sizeof c->hop);
     }
+    return 0;
 }
 
 /* ---- авторизация (общая у рабочего и разовой проверки) ------------------------------------------ */
@@ -519,7 +523,11 @@ int hy2_probe(const struct hy2_node *n, int timeout_s, char *why, size_t why_n, 
     }
     struct obfs_state ob;
     struct qc_cfg c;
-    make_cfg(n, ip, &c, &ob, g_mark, g_mark_req, RX_CONN_WIN, RX_STREAM_WIN, NULL);
+    if (make_cfg(n, ip, &c, &ob, g_mark, g_mark_req, RX_CONN_WIN, RX_STREAM_WIN, NULL) != 0) {
+        snprintf(why, why_n, "обфускация Gecko: размеры пакетов заданы неверно (min %u, max %u)",
+                 n->gecko_min, n->gecko_max);
+        return -1;
+    }
     struct probe *pr = calloc(1, sizeof *pr);
     if (!pr) { snprintf(why, why_n, "нет памяти"); return -1; }
     pr->n = n;
@@ -1210,7 +1218,14 @@ static int connect_now(struct hq *h) {
     struct qc_cfg c;
     h->ob = calloc(1, sizeof *h->ob);
     if (!h->ob) { set_err(h, "нет памяти"); h->next_try_ms = now_ms() + RETRY_MS; bg_schedule(h, 1); return -1; }
-    make_cfg(g_node, ip, &c, h->ob, g_mark, g_mark_req, h->conn_win, h->stream_win, h->tls);
+    if (make_cfg(g_node, ip, &c, h->ob, g_mark, g_mark_req, h->conn_win, h->stream_win, h->tls) != 0) {
+        set_err(h, "обфускация Gecko: размеры пакетов заданы неверно (min %u, max %u)",
+                g_node->gecko_min, g_node->gecko_max);
+        ob_drop(h);
+        h->next_try_ms = now_ms() + RETRY_MS;
+        bg_schedule(h, 1);
+        return -1;
+    }
     h->dead = 0;
     h->dead_why[0] = '\0';
     h->hs_start_ms = now_ms();

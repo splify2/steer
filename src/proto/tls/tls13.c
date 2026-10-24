@@ -336,6 +336,8 @@ struct hs_secrets {
     struct tls13_keys c_hk, s_hk;           /* ключи рукопожатия — копии с ключом и iv */
 };
 
+static int write_all_fd(int fd, const unsigned char *p, size_t n);
+
 /* Принимает уже отправленный ClientHello (для транскрипта) и общий секрет.
  *
  * host != NULL включает проверку подлинности сервера по сертификату (security=tls). При
@@ -732,10 +734,15 @@ static int handshake_run(struct hs_secrets *sec, struct tls13 *t, int fd,
     if (sc_hmac(md, sec->cfkey, H, chash, H, cfin) != 0) return TLS13_ECRYPTO;
 
     /* Отправляем: ChangeCipherSpec (совместимость с middlebox, как браузер) и
-     * зашифрованный Finished. */
+     * зашифрованный Finished — ОДНИМ write: браузер шлёт их одним полётом, а два отдельных
+     * write давали два сегмента с мелким первым (6 байт), по которым наш клиент отличался от
+     * него, и короткую запись между ними никто не обрабатывал (I-543). write_all_fd дописывает
+     * то, что ядро приняло не целиком. */
     {
-        unsigned char ccs[6] = { 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
-        if (write(fd, ccs, 6) != 6) return TLS13_EIO;
+        unsigned char out[6 + 160];
+        static const unsigned char ccs[6] = { 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
+        memcpy(out, ccs, 6);
+        unsigned char *rec = out + 6;
 
         unsigned char pt[96];
         size_t pl = 0;
@@ -744,13 +751,13 @@ static int handshake_run(struct hs_secrets *sec, struct tls13 *t, int fd,
         memcpy(pt + pl, cfin, H); pl += H;
         pt[pl++] = 0x16;                        /* inner type */
 
-        unsigned char out[160];
         size_t total = pl + 16;
-        out[0] = 0x17; out[1] = 0x03; out[2] = 0x03;
-        out[3] = (unsigned char)(total >> 8); out[4] = (unsigned char)total;
-        memcpy(out + 5, pt, pl);
-        if (aead_seal_once(&sec->c_hk, 0, out, 5, out + 5, pl, out + 5 + pl) != 0) return TLS13_ECRYPTO;
-        if (write(fd, out, 5 + total) != (ssize_t)(5 + total)) return TLS13_EIO;
+        rec[0] = 0x17; rec[1] = 0x03; rec[2] = 0x03;
+        rec[3] = (unsigned char)(total >> 8); rec[4] = (unsigned char)total;
+        memcpy(rec + 5, pt, pl);
+        if (aead_seal_once(&sec->c_hk, 0, rec, 5, rec + 5, pl, rec + 5 + pl) != 0) return TLS13_ECRYPTO;
+        int wrc = write_all_fd(fd, out, 6 + 5 + total);
+        if (wrc != 0) return wrc;
     }
 
     /* Ключи трафика приложения — от master secret и полного транскрипта. */

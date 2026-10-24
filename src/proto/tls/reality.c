@@ -208,6 +208,13 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
                               unsigned char *out, size_t out_n, size_t *out_len) {
     unsigned char pbk[32], sid[16];
     int sid_n = 0;
+    /* Вызывающие объявляют struct reality_state без инициализации, а authkey (и shared при plain)
+     * заполняются не на каждом пути: носитель (car->fill_sid) считает аутентификатор сам и выходит
+     * раньше. Без обнуления поле оставалось мусором со стека, и вызывающий, который однажды
+     * соединил бы носителя с tls13_handshake_auth, сверял бы HMAC сервера с мусором — «узел не
+     * признал ключ» на исправном узле, случайным образом (I-216). Нулевой authkey — честное
+     * «не выведен». */
+    memset(st, 0, sizeof(*st));
     if (!cfg->plain) {
         int pbk_n = b64url_decode(cfg->pbk, pbk, sizeof(pbk));
         if (pbk_n != 32) return REALITY_EBADKEY;

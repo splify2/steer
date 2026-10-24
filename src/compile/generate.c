@@ -29,7 +29,7 @@
  * надобности: раньше это было 4 КБ «с запасом на 32 адреса», и клиент с сотней адресов терял хвост
  * перечня МОЛЧА — правило применялось, а часть устройств оно не касалось. Освобождается
  * sb_emit (вместе с выдачей выражения в правило) или sb_free. */
-struct sbuf { char *s; size_t n, cap; };
+struct sbuf { char *s; size_t n, cap; int oom; };
 
 static void sb_add(struct sbuf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void sb_add(struct sbuf *b, const char *fmt, ...) {
@@ -45,7 +45,7 @@ static void sb_add(struct sbuf *b, const char *fmt, ...) {
         size_t nc = b->cap ? b->cap : 256;
         while (nc < b->n + (size_t)k + 1) nc *= 2;
         char *p = realloc(b->s, nc);
-        if (!p) { va_end(ap); return; }
+        if (!p) { b->oom = 1; va_end(ap); return; }   /* sb_emit скажет об этом правилам: rs->oom */
         b->s = p;
         b->cap = nc;
     }
@@ -54,10 +54,15 @@ static void sb_add(struct sbuf *b, const char *fmt, ...) {
     b->n += (size_t)k;
 }
 static const char *sb_str(const struct sbuf *b) { return b->s ? b->s : ""; }
-static void sb_free(struct sbuf *b) { free(b->s); b->s = NULL; b->n = b->cap = 0; }
-/* Выражение — в правило, буфер — обратно. */
+static void sb_free(struct sbuf *b) { free(b->s); b->s = NULL; b->n = b->cap = 0; b->oom = 0; }
+/* Выражение — в правило, буфер — обратно. Без памяти на выражение оно НЕ уходит в правило урезанным:
+ * правило без условия сработало бы на весь трафик вместо перечня. Вместо этого rs->oom — общий отказ
+ * сборки (ir.h, «отказ памяти»), и применение спеки не состоится (I-543). */
 static void sb_emit(struct nft_rule *r, struct sbuf *b) {
-    ir_x(r, "%s", sb_str(b));
+    if (b->oom) {
+        if (r && r->chain && r->chain->o.table && r->chain->o.table->rs) r->chain->o.table->rs->oom = 1;
+    } else
+        ir_x(r, "%s", sb_str(b));
     sb_free(b);
 }
 

@@ -177,6 +177,20 @@ int main(void) {
     eq("при полном запасе проход не дозванивается", dials, 0);
     eq("и запас не пострадал", busy_n(), WARM_SLOTS);
 
+    /* ---- отданное закрыто точкой: запись удаётся, а соединение мертво (I-195) ---------- */
+
+    {
+        int sv[2];
+        struct upstream w;
+        memset(&w, 0, sizeof(w));
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        w.fd = sv[0];
+        eq("живое соединение мёртвым не признаётся", up_peer_gone(&w), 0);
+        close(sv[1]);                   /* точка закрыла: у нас FIN, запись пока удастся */
+        eq("закрытое пиром, пока лежало в запасе, — мёртвое", up_peer_gone(&w), 1);
+        close(sv[0]);
+    }
+
     reset();
     if (fails) { printf("\nбрак: %d\n", fails); return 1; }
     printf("\nзапас соединений: все проверки прошли\n");

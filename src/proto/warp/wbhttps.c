@@ -29,6 +29,7 @@
 #include "tls13.h"
 #include "roots.h"
 #include "wbhttps.h"
+#include "wbjson.h"
 #include "sockmark.h"
 
 static long mono_ms(void) {
@@ -91,58 +92,6 @@ static int connect_one(const struct sockaddr *sa, socklen_t sl, const struct wb_
     }
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
     return fd;
-}
-
-/* Разобрать ответ целиком: статус, заголовки, тело (Content-Length, chunked или до закрытия). Тело
- * пишется на место в buf (chunked сжимается). 0 — разобрано. */
-static int parse_resp(char *buf, size_t n, int *status, size_t *body_off, size_t *body_n) {
-    if (n < 12 || strncmp(buf, "HTTP/1.", 7) || buf[8] != ' ') return -1;
-    *status = atoi(buf + 9);
-    char *end = memmem(buf, n, "\r\n\r\n", 4);
-    if (!end) return -1;
-    size_t hoff = (size_t)(end - buf) + 4;
-    int chunked = 0;
-    long clen = -1;
-    for (char *l = memchr(buf, '\n', hoff); l && l < end; l = memchr(l + 1, '\n', (size_t)(end - l))) {
-        const char *h = l + 1;
-        if (!strncasecmp(h, "Transfer-Encoding:", 18) && strstr(h, "chunked") && strstr(h, "chunked") < end)
-            chunked = 1;
-        if (!strncasecmp(h, "Content-Length:", 15)) clen = atol(h + 15);
-    }
-    *body_off = hoff;
-    if (!chunked) {
-        size_t have = n - hoff;
-        *body_n = clen >= 0 && (size_t)clen < have ? (size_t)clen : have;
-        return 0;
-    }
-    /* chunked: <hex>\r\n<data>\r\n ... 0\r\n\r\n — данные сдвигаются к началу тела. */
-    size_t r = hoff, w = hoff;
-    for (;;) {
-        if (r >= n) break;
-        char *nl = memchr(buf + r, '\n', n - r);
-        if (!nl) break;
-        /* Размер — шестнадцатеричные цифры без знака (до «;расширения» или CRLF). strtoul принимал «-1» и
-         * ULONG_MAX, а сумма r + len переполнялась и пропускала memmove с размером 2^64-1. Число сверх
-         * длины буфера — заведомо не кусок этого ответа, разбор на этом кончается. */
-        size_t len = 0;
-        int nd = 0, bad = 0;
-        for (const char *p = buf + r; p < nl; p++) {
-            int dv = *p >= '0' && *p <= '9' ? *p - '0' : *p >= 'a' && *p <= 'f' ? *p - 'a' + 10
-                   : *p >= 'A' && *p <= 'F' ? *p - 'A' + 10 : -1;
-            if (dv < 0) break;
-            if (len > n) { bad = 1; break; }
-            len = len * 16 + (size_t)dv;
-            nd++;
-        }
-        r = (size_t)(nl - buf) + 1;
-        if (bad || !nd || !len || len > n - r) break;
-        memmove(buf + w, buf + r, len);
-        w += len;
-        /* + 2 — CRLF после данных; len <= n - r, поэтому r не уйдёт за n больше чем на 2, а цикл проверяет r >= n. */
-        r += len + 2;
-    }
-    *body_n = w - hoff;
-    return 0;
 }
 
 int wb_https(const struct wb_req *q, const struct wb_route *rt, struct wb_resp *out, char *why, size_t wn) {
@@ -212,7 +161,7 @@ int wb_https(const struct wb_req *q, const struct wb_route *rt, struct wb_resp *
     buf = malloc(bcap + 1);
     if (!buf) { WHY("нет памяти"); goto out; }
     for (;;) {
-        if (set_timeo(fd, deadline)) break;
+        if (set_timeo(fd, deadline)) { WHY("срок ответа вышел"); goto out; }
         size_t got = 0;
         /* Место под целую запись: tls13_read кладёт расшифрованную запись целиком. */
         if (bcap - bn < TLS13_MAX_PLAIN) {
@@ -223,12 +172,17 @@ int wb_https(const struct wb_req *q, const struct wb_route *rt, struct wb_resp *
             bcap *= 2;
         }
         int rrc = tls13_read(t, (unsigned char *)buf + bn, bcap - bn, &got);
-        if (rrc != 0) break;                    /* закрытие (Connection: close) или срок */
+        if (rrc == TLS13_ECLOSED) break;                      /* закрытие (Connection: close) — конец ответа */
+        /* Срок чтения или обрыв — не конец ответа. Прежде любой отказ чтения считался концом, и
+         * усечённое тело принималось за целое: Content-Length не сверялся (I-543). */
+        if (rrc != 0) { WHY("ответ оборван (код %d)", rrc); goto out; }
         bn += got;
     }
     buf[bn] = '\0';
     size_t off = 0, blen = 0;
-    if (parse_resp(buf, bn, &out->status, &off, &blen) != 0) { WHY("ответ не похож на HTTP (%zu байт)", bn); goto out; }
+    int pr = wb_http_split(buf, bn, &out->status, &off, &blen);
+    if (pr == -2) { WHY("ответ оборван: тела меньше объявленного (%zu байт)", bn); goto out; }
+    if (pr != 0) { WHY("ответ не похож на HTTP (%zu байт)", bn); goto out; }
     memmove(buf, buf + off, blen);
     buf[blen] = '\0';
     out->body = buf;
