@@ -1069,11 +1069,33 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
     char qname[MAX_HOSTNAME];
     uint16_t qtype = 0;
     size_t qend = 0;
-    struct answer_ip ips[32];
-    struct answer_ip6 ips6[16];
+    /* Записей в ответе — сколько уместилось в пакет, а не «32 A и 16 AAAA»: меньше записи (имя —
+     * один байт указателя, тип, класс, срок, длина, адрес) не бывает, значит запись A — не
+     * меньше 15 байт, и верхняя граница известна заранее. Черновик общий и растёт до наибольшего
+     * увиденного ответа; цикл однопоточный, а ответ разбирается до следующего. */
+    static struct answer_ip *g_ans4;
+    static struct answer_ip6 *g_ans6;
+    static size_t g_ans_cap;
+    size_t need = (size_t)n > 12 ? ((size_t)n - 12) / 15 + 1 : 1;
+    if (need > g_ans_cap) {
+        size_t nc = need < 64 ? 64 : need;
+        struct answer_ip *a4 = realloc(g_ans4, nc * sizeof(*a4));
+        if (a4) g_ans4 = a4;
+        struct answer_ip6 *a6 = realloc(g_ans6, nc * sizeof(*a6));
+        if (a6) g_ans6 = a6;
+        if (a4 && a6) g_ans_cap = nc;
+    }
+    if (need > g_ans_cap) {
+        /* Нет памяти на разбор — ответ уходит клиенту как есть (как неразобранный). */
+        if (!quiet)
+            reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
+        return 1;
+    }
+    struct answer_ip *ips = g_ans4;
+    struct answer_ip6 *ips6 = g_ans6;
     int n6 = 0;
-    int nips = parse_response(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend, ips, 32,
-                              ips6, 16, &n6);
+    int nips = parse_response(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend, ips,
+                              (int)g_ans_cap, ips6, (int)g_ans_cap, &n6);
     /* В нижний регистр СРАЗУ: дальше это имя — ключ таблицы fake-IP и вход
      * матчинга. Прежде вставка шла в регистре ответа (эхо запроса клиента), и
      * клиент с DNS-0x20 плодил второй fake-IP на тот же домен, а быстрый путь,
@@ -1367,7 +1389,9 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
  * прихода, и ответы уходят в порядке готовности: RFC 7766 это разрешает, клиент сопоставляет
  * ответ с вопросом по номеру транзакции.
  *
- * ЛИМИТЫ. TCP_MAX_CONN соединений клиентов; новое сверх него вытесняет самое давно молчащее из
+ * ЛИМИТЫ. tcp_conn_max() соединений клиентов — не меньше 32, а у процесса с большим RLIMIT_NOFILE
+ * до его четверти (остальное нужно апстримам, сокетам и наборам); места заводятся по мере нужды
+ * и не двигаются (на них смотрит epoll). Новое сверх предела вытесняет самое давно молчащее из
  * тех, у кого нет запросов в пути и кто молчит хотя бы секунду. Секунда — не прихоть: на всплеске
  * соединений вытеснялись бы только что принятые, ещё не успевшие прислать вопрос, и из перегрузки
  * не выигрывал бы никто. Вытеснить некого — новое соединение не принимается вовсе, а ждёт в
@@ -1383,9 +1407,26 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
  * TCP тоже должны его держать — иначе простой не снимется до следующего события. */
 #include <netinet/tcp.h>
 #include <stddef.h>
+#include <sys/resource.h>
 
-#define TCP_MAX_CONN 32
-#define TCP_MAX_UP   64
+#define TCP_MIN_CONN 32
+#define TCP_MIN_UP   64
+#define TCPC_MAGIC 0x54435043u
+#define TCPU_MAGIC 0x54435055u
+/* Предел — ресурс, а не константа: четверть дескрипторов процесса, не меньше прежних 32/64.
+ * Соединению клиента нужен один дескриптор, запросу наверх — один. */
+static int tcp_fd_quarter(void) {
+    static long q;
+    if (!q) {
+        struct rlimit rl;
+        long v = 1024;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) v = (long)rl.rlim_cur;
+        q = v / 4 > 65536 ? 65536 : v / 4;
+    }
+    return (int)q;
+}
+static int tcp_conn_max(void) { int q = tcp_fd_quarter(); return q < TCP_MIN_CONN ? TCP_MIN_CONN : q; }
+static int tcp_up_max(void) { int q = tcp_fd_quarter(); return q < TCP_MIN_UP ? TCP_MIN_UP : q; }
 #define TCP_IDLE_SEC 10
 /* Предел недописанных ответов одного соединения. Ответ — до 64 КБ; клиент, который не читает
  * и четыре таких, больше не клиент, а место в памяти. */
@@ -1395,6 +1436,8 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
  * (MAX_PKT, как у датаграммы): полный запрос в нём помещается всегда, и после его разбора
  * место под следующий есть. Запрос длиннее — не запрос, а мусор, и соединение закрывается. */
 struct tcpc {
+    uint32_t magic;                 /* TCPC_MAGIC — по нему цикл узнаёт место в epoll */
+    int idx;                        /* номер места в g_tcpc */
     int fd;                         /* -1 — место свободно */
     uint32_t gen;                   /* растёт на каждом открытии: так запрос наверху узнаёт,
                                      * что его соединение закрыто и место отдано другому */
@@ -1427,6 +1470,8 @@ struct tcpc {
  * ожидание закрывает соединение, и клиенту уходит SERVFAIL, а не тишина — по TCP он ждал бы
  * своего таймаута с занятым соединением. */
 struct tcpu {
+    uint32_t magic;                 /* TCPU_MAGIC */
+    int idx;                        /* номер места в g_tcpu */
     int fd;                         /* -1 — место свободно */
     int slot;                       /* ожидание в g_pending */
     int conn;                       /* соединение клиента и его поколение */
@@ -1444,11 +1489,16 @@ struct tcpu {
 
 static int g_tcp_lfd = -1;
 static int g_tcp_paused;            /* слушающий сокет снят с epoll: мест нет (см. «ЛИМИТЫ») */
-static struct tcpc g_tcpc[TCP_MAX_CONN];
-static struct tcpu g_tcpu[TCP_MAX_UP];
+/* Места — отдельные выделения, а массив указателей растёт: адрес места не меняется, пока
+ * соединение в epoll. n — сколько заведено (а не лимит), свободное место — с fd < 0. */
+static struct tcpc **g_tcpc;
+static struct tcpu **g_tcpu;
+static int g_tcpc_n, g_tcpc_cap, g_tcpu_n, g_tcpu_cap;
+#define TCPC(i) (g_tcpc[i])
+#define TCPU(i) (g_tcpu[i])
 /* Куда отвечать, когда соединение клиента уже закрыто: ответ сверху всё равно доводится до
  * карты и наборов (они нужны и следующему вопросу), а tcpc_reply на закрытом месте молчит. */
-static struct tcpc g_tcp_dead = { .fd = -1 };
+static struct tcpc g_tcp_dead = { .fd = -1, .idx = -1 };
 
 static void tcpc_set_ev(struct tcpc *c) {
     uint32_t want = (c->eof ? 0u : (uint32_t)EPOLLIN) | (c->out_len ? (uint32_t)EPOLLOUT : 0u);
@@ -1600,7 +1650,7 @@ static void tcp_servfail(struct tcpc *c, const uint8_t *q, size_t qend, uint16_t
 }
 
 static struct tcpc *tcpu_conn(const struct tcpu *u) {
-    struct tcpc *c = &g_tcpc[u->conn];
+    struct tcpc *c = u->conn >= 0 && u->conn < g_tcpc_n ? TCPC(u->conn) : &g_tcp_dead;
     return (c->fd >= 0 && c->gen == u->conn_gen) ? c : &g_tcp_dead;
 }
 
@@ -1622,7 +1672,7 @@ static void tcpu_close(struct tcpu *u) {
 /* Ожидание ещё наше? Протухшее (pending_reap) или отданное другому вопросу — уже нет. */
 static struct pending *tcpu_pending(const struct tcpu *u) {
     struct pending *p = &g_pending[u->slot];
-    return (p->in_use && p->tcp_up == (int)(u - g_tcpu)) ? p : NULL;
+    return (p->in_use && p->tcp_up == u->idx) ? p : NULL;
 }
 
 /* Наверх не вышло (не соединился, оборвал, ответил не то) — SERVFAIL клиенту и конец. */
@@ -1637,10 +1687,30 @@ static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const union 
                      uint16_t tag, size_t qend, uint32_t ctmark, int have_mark) {
     struct tcpc *c = g_tcp_cur;
     struct tcpu *u = NULL;
-    for (int i = 0; i < TCP_MAX_UP; i++)
-        if (g_tcpu[i].fd < 0) { u = &g_tcpu[i]; break; }
+    int ui = -1;
+    for (int i = 0; i < g_tcpu_n; i++)
+        if (TCPU(i)->fd < 0) { u = TCPU(i); break; }
+    if (u) ui = u->idx;
+    if (!u && g_tcpu_n < tcp_up_max()) {
+        if (g_tcpu_n == g_tcpu_cap) {
+            int nc = g_tcpu_cap ? g_tcpu_cap * 2 : 16;
+            struct tcpu **np = realloc(g_tcpu, (size_t)nc * sizeof(*np));
+            if (np) { g_tcpu = np; g_tcpu_cap = nc; }
+        }
+        struct tcpu *nu = g_tcpu_n < g_tcpu_cap ? calloc(1, sizeof(*nu)) : NULL;
+        if (nu) {
+            nu->magic = TCPU_MAGIC;
+            nu->idx = g_tcpu_n;
+            nu->fd = -1;
+            g_tcpu[g_tcpu_n++] = nu;
+            u = nu;
+            ui = nu->idx;
+        }
+    }
     int fd = -1;
-    const char *why = "все соединения наверх заняты";
+    char whyb[192];
+    snprintf(whyb, sizeof(whyb), "все %d соединений наверх заняты — предел (четверть дескрипторов процесса)", tcp_up_max());
+    const char *why = whyb;
     if (u) {
         fd = socket(up->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         why = "сокет не открылся";
@@ -1666,9 +1736,11 @@ static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const union 
             fq[1] = (uint8_t)n;
             memcpy(fq + 2, q, n);
             memset(u, 0, sizeof(*u));
+            u->magic = TCPU_MAGIC;
+            u->idx = ui;
             u->fd = fd;
             u->slot = (int)(p - g_pending);
-            u->conn = (int)(c - g_tcpc);
+            u->conn = c->idx;
             u->conn_gen = c->gen;
             u->tag = tag;
             u->cli_id = p->cli_id;
@@ -1681,7 +1753,7 @@ static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const union 
             ev.data.ptr = u;
             if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
                 c->inflight++;
-                return (int)(u - g_tcpu);
+                return u->idx;
             }
             u->fd = -1;
             u->q = NULL;
@@ -1766,7 +1838,7 @@ static void tcpu_poke(struct tcpu *u) {
 static void sec_bind(struct pending *p) {
     p->sconn = -1;
     if (!g_tcp_cur) return;
-    p->sconn = (int)(g_tcp_cur - g_tcpc);
+    p->sconn = g_tcp_cur->idx;
     p->sgen = g_tcp_cur->gen;
     g_tcp_cur->inflight++;
 }
@@ -1794,7 +1866,7 @@ static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, 
     if (!p->in_use || p->sec != (uint32_t)(v >> PENDING_IDX_BITS)) return;
     struct tcpc *tc = NULL;
     if (p->sconn >= 0) {
-        tc = &g_tcpc[p->sconn];
+        tc = p->sconn < g_tcpc_n ? TCPC(p->sconn) : &g_tcp_dead;
         if (tc->fd < 0 || tc->gen != p->sgen) tc = &g_tcp_dead;
     }
     g_tcp_cur = tc;
@@ -1846,24 +1918,38 @@ static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, 
 static struct tcpc *tcpc_pick(void) {
     struct tcpc *old = NULL;
     time_t now = time(NULL);
-    for (int i = 0; i < TCP_MAX_CONN; i++) {
-        struct tcpc *c = &g_tcpc[i];
+    for (int i = 0; i < g_tcpc_n; i++) {
+        struct tcpc *c = TCPC(i);
         if (c->fd < 0) return c;
         if (!c->inflight && !c->in_len && now - c->last >= 1 && (!old || c->last < old->last))
             old = c;
     }
-    return old;
+    if (old || g_tcpc_n >= tcp_conn_max()) return old;
+    if (g_tcpc_n == g_tcpc_cap) {
+        int nc = g_tcpc_cap ? g_tcpc_cap * 2 : 16;
+        struct tcpc **np = realloc(g_tcpc, (size_t)nc * sizeof(*np));
+        if (!np) return NULL;
+        g_tcpc = np;
+        g_tcpc_cap = nc;
+    }
+    struct tcpc *nc = calloc(1, sizeof(*nc));
+    if (!nc) return NULL;
+    nc->magic = TCPC_MAGIC;
+    nc->idx = g_tcpc_n;
+    nc->fd = -1;
+    g_tcpc[g_tcpc_n++] = nc;
+    return nc;
 }
 
 static void tcp_accept(void) {
-    for (int k = 0; k < TCP_MAX_CONN; k++) {
+    for (int k = 0; k < tcp_conn_max(); k++) {
         struct tcpc *c = tcpc_pick();
         if (!c) {
             static time_t said;
             tcp_listen_pause(1);
             if (warn_due(&said, time(NULL)))
                 fprintf(stderr, "steer dnsd: соединений TCP %d, и все заняты — новые ждут в "
-                                "очереди\n", TCP_MAX_CONN);
+                                "очереди\n", tcp_conn_max());
             return;
         }
         struct sockaddr_storage peer;
@@ -1876,7 +1962,10 @@ static void tcp_accept(void) {
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         uint32_t gen = c->gen + 1;
+        int idx = c->idx;
         memset(c, 0, offsetof(struct tcpc, in));
+        c->magic = TCPC_MAGIC;
+        c->idx = idx;
         c->fd = fd;
         g_live = 1;
         c->gen = gen;
@@ -1935,16 +2024,11 @@ static void tcpc_event(struct tcpc *c, uint32_t evs) {
 
 /* Событие epoll, если оно TCP: 1 — обработано здесь, 0 — не наше. */
 static int tcp_event(void *ptr, uint32_t evs) {
-    uintptr_t a = (uintptr_t)ptr;
     if (ptr == &g_tcp_lfd) { tcp_accept(); return 1; }
-    if (a >= (uintptr_t)g_tcpc && a < (uintptr_t)(g_tcpc + TCP_MAX_CONN)) {
-        tcpc_event((struct tcpc *)ptr, evs);
-        return 1;
-    }
-    if (a >= (uintptr_t)g_tcpu && a < (uintptr_t)(g_tcpu + TCP_MAX_UP)) {
-        tcpu_poke((struct tcpu *)ptr);
-        return 1;
-    }
+    /* Чужие указатели epoll (сокеты апстримов, dtag) тоже начинаются с четырёх байт — их и читаем. */
+    uint32_t m = ptr ? *(const uint32_t *)ptr : 0;
+    if (m == TCPC_MAGIC) { tcpc_event((struct tcpc *)ptr, evs); return 1; }
+    if (m == TCPU_MAGIC) { tcpu_poke((struct tcpu *)ptr); return 1; }
     return 0;
 }
 
@@ -1955,12 +2039,12 @@ static int tcp_reap(time_t now) {
     /* Место могло стать вытесняемым без закрытия (соединение отмолчало секунду) — пусть
      * следующий приём проверит заново; мест нет — tcp_accept снимет сокет снова. */
     tcp_listen_pause(0);
-    for (int i = 0; i < TCP_MAX_UP; i++) {
-        if (g_tcpu[i].fd >= 0 && !tcpu_pending(&g_tcpu[i])) tcpu_fail(&g_tcpu[i]);
-        live |= g_tcpu[i].fd >= 0;
+    for (int i = 0; i < g_tcpu_n; i++) {
+        if (TCPU(i)->fd >= 0 && !tcpu_pending(TCPU(i))) tcpu_fail(TCPU(i));
+        live |= TCPU(i)->fd >= 0;
     }
-    for (int i = 0; i < TCP_MAX_CONN; i++) {
-        struct tcpc *c = &g_tcpc[i];
+    for (int i = 0; i < g_tcpc_n; i++) {
+        struct tcpc *c = TCPC(i);
         if (c->fd >= 0 && !c->inflight && now - c->last >= TCP_IDLE_SEC) tcpc_close(c);
         live |= c->fd >= 0;
     }
@@ -1970,8 +2054,6 @@ static int tcp_reap(time_t now) {
 /* Слушать TCP на том же порту, что и UDP, двойным стеком так же. Не вышло — не отказ: UDP
  * работает, а запросы по TCP пройдут тем путём, каким шли до этого. */
 static void tcp_listen_open(int port) {
-    for (int i = 0; i < TCP_MAX_CONN; i++) g_tcpc[i].fd = -1;
-    for (int i = 0; i < TCP_MAX_UP; i++) g_tcpu[i].fd = -1;
     int on = 1, off = 0;
     int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd >= 0) {
@@ -1997,7 +2079,7 @@ static void tcp_listen_open(int port) {
         if (fd >= 0) setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
         if (fd >= 0 && bind(fd, (struct sockaddr *)&a4, sizeof(a4)) != 0) { close(fd); fd = -1; }
     }
-    if (fd < 0 || listen(fd, TCP_MAX_CONN) != 0) {
+    if (fd < 0 || listen(fd, tcp_conn_max() > SOMAXCONN ? SOMAXCONN : tcp_conn_max()) != 0) {
         fprintf(stderr, "steer dnsd: TCP на :%d не слушается (%s) — запросы по TCP пройдут "
                         "мимо доменных каналов\n", port, strerror(errno));
         if (fd >= 0) close(fd);
@@ -2011,8 +2093,11 @@ static void tcp_listen_open(int port) {
 }
 
 static void tcp_close_all(void) {
-    for (int i = 0; i < TCP_MAX_UP; i++) tcpu_close(&g_tcpu[i]);
-    for (int i = 0; i < TCP_MAX_CONN; i++) tcpc_close(&g_tcpc[i]);
+    for (int i = 0; i < g_tcpu_n; i++) { tcpu_close(TCPU(i)); free(TCPU(i)); }
+    for (int i = 0; i < g_tcpc_n; i++) { tcpc_close(TCPC(i)); free(TCPC(i)); }
+    free(g_tcpu); free(g_tcpc);
+    g_tcpu = NULL; g_tcpc = NULL;
+    g_tcpu_n = g_tcpu_cap = g_tcpc_n = g_tcpc_cap = 0;
     if (g_tcp_lfd >= 0) close(g_tcp_lfd);
     g_tcp_lfd = -1;
     g_tcp_paused = 0;

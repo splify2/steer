@@ -1091,6 +1091,76 @@ int main(void) {
         }
     }
 
+    /* ---- пределы без причины (I-523): больше прежнего предела работает ---- */
+    {
+        /* Журнал имён: 3000 свежих имён — больше прежних 256 — остаются все. */
+        for (int i = 0; i < 3000; i++) {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "Name%d.Example.com", i);
+            dlog_note(nm, -1);
+        }
+        check("журнал имён: 3000 свежих имён хранятся все (прежний предел 256)", 3000, (int)dlog_count());
+        dlog_note("name5.example.com", -1);
+        check("журнал имён: повторный вопрос не плодит запись", 3000, (int)dlog_count());
+
+        /* real-ip: 5000 разных элементов (прежний предел 2048) и повтор без роста. */
+        for (int i = 0; i < 5000; i++) {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "ri%d.example.com", i);
+            realip_note(nm, 0x0a000000u + (uint32_t)i, 300);
+        }
+        realip_note("ri7.example.com", 0x0a000000u + 7u, 600);
+        check("real-ip: 5000 элементов помнятся все (прежний предел 2048)", 5000, (int)realip_count());
+        uint8_t a6[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+        realip_note6("ri7.example.com", a6, 300);
+        check("real-ip: адрес другого семейства — своя запись", 5001, (int)realip_count());
+
+        /* Разбор ответа: 100 записей A и 100 AAAA — прежде собирались 32 и 16. */
+        static uint8_t big[8192];
+        memset(big, 0, sizeof(big));
+        big[0] = 0x12; big[1] = 0x34; big[2] = 0x81; big[3] = 0x80; big[5] = 1;
+        big[7] = 100;
+        memcpy(big + 12, "\3big\4test\0\0\1\0\1", 14);
+        size_t bp = 12 + 14;
+        for (int i = 0; i < 100; i++) {
+            static const uint8_t h[] = { 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4 };
+            memcpy(big + bp, h, sizeof(h)); bp += sizeof(h);
+            big[bp++] = 10; big[bp++] = 0; big[bp++] = 0; big[bp++] = (uint8_t)i;
+        }
+        char bq[MAX_HOSTNAME];
+        uint16_t bt = 0;
+        size_t be = 0;
+        struct answer_ip bips[128];
+        struct answer_ip6 bips6[8];
+        int bn6 = 0;
+        int bn4 = parse_response(big, bp, bq, sizeof(bq), &bt, &be, bips, 128, bips6, 8, &bn6);
+        check("разбор ответа: 100 записей A собраны все (прежний предел 32)", 100, bn4);
+        check("разбор ответа: последняя запись цела", 1, bn4 == 100 && ((bips[99].addr >> 24) & 0xff) == 99);
+
+        /* Кэш ответов: ответ на 3 КБ (больше 1232) кладётся и достаётся. */
+        struct dcache_cfg dc = { 64, 1, 3600, 60 };
+        dcache_config(&dc);
+        int an = 190;
+        static uint8_t cb[8192];
+        memset(cb, 0, sizeof(cb));
+        cb[0] = 0x22; cb[1] = 0x33; cb[2] = 0x81; cb[3] = 0x80; cb[5] = 1; cb[7] = (uint8_t)an;
+        memcpy(cb + 12, "\3big\4test\0\0\1\0\1", 14);
+        size_t cp = 26;
+        for (int i = 0; i < an; i++) {
+            static const uint8_t h[] = { 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 1, 0, 0, 4 };
+            memcpy(cb + cp, h, sizeof(h)); cp += sizeof(h);
+            cb[cp++] = 10; cb[cp++] = 1; cb[cp++] = 0; cb[cp++] = (uint8_t)i;
+        }
+        check("кэш: ответ больше 1232 байт кладётся", 1, cp > 1232 && dcache_put(1, cb, cp, 1000));
+        uint8_t qq[64] = { 0x44, 0x55, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+        memcpy(qq + 12, "\3big\4test\0\0\1\0\1", 14);
+        static uint8_t gb[8192];
+        size_t gn = dcache_get(1, qq, 26, gb, sizeof(gb), 1010);
+        check("кэш: большой ответ выдан целиком, с номером спрашивающего", 1,
+              gn == cp && gb[0] == 0x44 && gb[1] == 0x55);
+        dcache_flush();
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

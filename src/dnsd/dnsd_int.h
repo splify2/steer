@@ -397,6 +397,7 @@ void dch_sig_write(void);
 
 /* dlog.c */
 void dlog_note(const char *qname, int hit);
+size_t dlog_count(void);
 void dlog_listen(void);
 void dlog_close(void);
 void dlog_serve(void);
@@ -406,6 +407,7 @@ void dlog_serve(void);
 void realip_note(const char *qname, uint32_t addr_host, uint32_t ttl);
 void realip_note6(const char *qname, const uint8_t addr[16], uint32_t ttl);
 size_t realip_reassert(void);
+size_t realip_count(void);
 
 /* adopt.c — управляющий сокет резолвера на таблице: новый демон забирает живой резолвер
  * (труба таблицы через SCM_RIGHTS). adopt_listen — после того, как epoll заведён. */
