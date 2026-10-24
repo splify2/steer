@@ -52,6 +52,8 @@ opkg install ./steer-core-<версия>-1_<арх>.ipk ./steer-vless-<верс�
 | `steer-xsteer` | клиент звезды xsteer |
 | `steer-obfs` | WireGuard поверх поддельного TCP |
 | `steer-tgws` | мост Telegram |
+| `steer-warpbox` | Cloudflare WARP выходом `kind: warp` (регистрация, подбор точек, замена). Нужен `kmod-amneziawg` или `kmod-wireguard` |
+| `steer-extended` | устаревший мета-пакет: `steer-core` и первые четыре модуля (без `steer-hysteria2`, `steer-proxy`, `steer-warpbox`) |
 
 ## Быстрый старт
 

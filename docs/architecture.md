@@ -40,6 +40,7 @@ xsteer — [docs/xsteer.md](xsteer.md).
 | `steer-tgws` | `TGWS_MODULE_SRC` | мост Telegram (`tgws.c`); правила перехвата пишет ядро (`kinds/tgws.c`) |
 | `steer-hysteria2` | `HY2_MODULE_SRC` | клиент hysteria2 ([docs/hysteria2.md](hysteria2.md)): провод (`hy2wire`), узлы и подписка (`hy2sub`), соединение QUIC в цикле рабочего стека и потоки клиента поверх него (`hy2conn`), дайлер стека (`hy2dial`), команды и слежка (`hy2main`); запись вида — `kinds/hysteria2.c` в `libsteer` (`KINDS_HY2_SRC`); в статические профили и в телефон не входит |
 | `steer-proxy` | `PROXY_MODULE_SRC` | клиенты прокси ([docs/proxy.md](proxy.md)): trojan, shadowsocks, socks, http, vmess одним бинарником — провод и вывод ключей (`pxwire`), узлы и подписка (`pxsub`), общее дайлеров (`pxdial`), по файлу на протокол (`pxtrojan`, `pxss`, `pxsocks`, `pxhttp`, `pxvmess`), команды (`pxmain`), слежка — пул узлов `src/tunnel/pool.c`; дайлеры — поверх стека `src/tunnel` и транспорта `src/proto/transport`, как vless; записи пяти видов — `kinds/proxy.c` в `libsteer` (`KINDS_PROXY_SRC`); в статические профили и в телефон не входит (как hysteria2) |
+| `steer-warpbox` | `WARP_MODULE_SRC` | WARP для steer ([docs/warp.md](warp.md)): регистрация устройств, подбор и замена точек входа; `src/proto/warp`, `main_warpbox.c`; в статические профили и в телефон не входит, в `steer-extended` не входит |
 
 Каждый модуль — свой `main` (`src/modules/main_<имя>.c`) и `src/cli/modcmd.c`; линкуется он с
 `libsteer.so`, thread-local таблицы туннеля живут в куче потока (раздел «Туннели»). В модуле нет
@@ -55,7 +56,7 @@ xsteer — [docs/xsteer.md](xsteer.md).
 `-ftls-model=initial-exec`; видимость задаёт version-script, а не `-fvisibility=hidden` (пометка
 `visibility("default")` на каждом экспортируемом определении — второй список в исходниках рядом с
 первым). Загрузчик musl задаётся на каждую архитектуру (`-Wl,--dynamic-linker`, `interp_of` в
-`build.sh`): `ld-musl-mipsel-sf.so.1`, `ld-musl-mips-sf.so.1`, `ld-musl-aarch64.so.1`,
+`build/arches.sh`): `ld-musl-mipsel-sf.so.1`, `ld-musl-mips-sf.so.1`, `ld-musl-aarch64.so.1`,
 `ld-musl-armhf.so.1`, `ld-musl-arm.so.1`, `ld-musl-x86_64.so.1`; RPATH нет — библиотеки в
 `/usr/lib`.
 
@@ -63,9 +64,9 @@ xsteer — [docs/xsteer.md](xsteer.md).
 `steer-core` (`steerd`, `steer`, `steer-tools` — ссылка на `steerd`, `steer-nfqws`, обе библиотеки
 в `/usr/lib`, init-скрипт, hotplug, `keep.d`; зависит только от чужих `nftables`, `ip-full`,
 `conntrack`, `kmod-nft-queue`), `steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws`,
-`steer-hysteria2`, `steer-proxy` (по одному бинарнику `usr/sbin/steer-<имя>`; зависят от `steer-core (= версия)`,
+`steer-hysteria2`, `steer-proxy`, `steer-warpbox` (по одному бинарнику `usr/sbin/steer-<имя>`; зависят от `steer-core (= версия)`,
 модули с собственным TUN — ещё от `kmod-tun`) и мета-пакет `steer-extended` (устаревший: ядро и
-первые четыре модуля; `steer-hysteria2` и `steer-proxy` в него не входят). Библиотеки лежат внутри `steer-core`, а
+первые четыре модуля; `steer-hysteria2`, `steer-proxy` и `steer-warpbox` в него не входят). Библиотеки лежат внутри `steer-core`, а
 не в своих пакетах: `steerd` сам ходит по HTTPS (замер групп, `urltls.c`) и по DoH, DoT и DoQ (резолвер),
 поэтому криптография нужна ядру и без модулей. Модули файлов ядра не повторяют — у каждого файла
 один владелец.
@@ -193,7 +194,8 @@ steer-tools <команда>    ссылка на steerd: отвечает то�
   Бинарника модуля нет — в журнале один раз «модуля нет: нужен пакет steer-<имя>», в `last_down` то
   же, повтор запуска по обычной паузе.
 - **Службу держит `/etc/init.d/steer`:** один экземпляр procd с respawn. `reload`, `reload_dnsd`,
-  `reload_zapret` и `reapply` — запрос `reload` демону клиентом; `stop` ждёт выхода демона и зовёт
+  `reload_zapret` и `reapply` — запрос `reload` демону клиентом (без демона `reapply` применяет спеку сам,
+  `steerd apply`; `reload_dnsd` поднимает службу, если автозапуск не снят); `stop` ждёт выхода демона и зовёт
   `steerd down`; hotplug (`files/etc/hotplug.d/iface/95-steer`) шлёт экземпляру SIGHUP. На телефоне
   демона держит init (`init/steerd.rc` в дереве прошивки `vendor/der`, вне этого репозитория).
 
@@ -232,7 +234,7 @@ src/
   client/     main.c — steer, клиент сокета
   cli/        cli.c — таблица команд и разбор командной строки; modcmd.c — команды модулей
               (заглушки в steerd, настоящие ветки в модуле) и main модуля (steer_module_main)
-  modules/    main_vless.c, main_xsteer.c, main_obfs.c, main_tgws.c, main_hysteria2.c, main_proxy.c
+  modules/    main_vless.c, main_xsteer.c, main_obfs.c, main_tgws.c, main_hysteria2.c, main_proxy.c, main_warpbox.c
               — main бинарников модулей (только разделяемая раскладка)
   tools/      aggregate.c (fit), srsread.c, hwid.c
   tunnel/     стек туннеля без протокола: tun.c (TUN: очереди, разгрузка, запись пакетов),
@@ -282,6 +284,7 @@ enum kind_cap {
     KC_DEVICE = 1 << 0,  KC_MARK = 1 << 1,        KC_CTMARK = 1 << 2,   KC_ENGINE_OWNED = 1 << 3,
     KC_SELF_NAT = 1 << 4, KC_OVER = 1 << 5,       KC_SKIP_ZAPRET = 1 << 6,
     KC_TCP_PROBE = 1 << 7, KC_FLOW_UDP = 1 << 8,  KC_IPV6 = 1 << 9,
+    KC_TCP_REDIR = 1 << 10,
 };
 
 struct kind_ops {
@@ -316,7 +319,7 @@ struct kind_ops {
   (`struct vless_cfg`, `struct xsteer_cfg`, …), и заполняет её только разбор его модуля.
   Помощники спрашивают свою настройку у вида (`out_vless`, `out_xsteer`, `out_tgws`).
 - **Реестр** (`kind.c`): `direct`, `interface`, `vless`, `xsteer`, `zapret`, `tgws`, `awg` — в этом
-  порядке идут правила видов в дереве (`kind_emit_all`) и проверки diag. На записи вида, файла
+  порядке идут правила видов в дереве (`kind_emit_all`) и проверки diag; дальше идут `hysteria2` и виды протоколов прокси (правил вида у них нет), в конце — `block`. На записи вида, файла
   которого в сборке нет, стоит запись отказа с `absent`; её текст о VLESS и xsteer содержит
   подстроку `steer-extended` — её читает splify2.
 - **Группа** (`kind: group`, `src/kinds/group.c`) — вид модели v2 и в реестр не входит: спека v1
@@ -338,6 +341,7 @@ struct kind_ops {
 | `prerouting_failopen` | prerouting, `mangle + 2` | снимает бит обхода DPI с трафика выхода, пущенного сторожем напрямую |
 | `prerouting_dns` | nat prerouting | заворот DNS клиентов на порт резолвера |
 | `prerouting_dnat` | nat prerouting | подмена поддельного адреса fake-IP на настоящий по карте; поддельный адрес без подмены отбрасывает правило `steer-fakeip-nomap` |
+| `prerouting_tcp_redir`, `output_tcp_redir` | nat, `dstnat - 1` | перенаправление TCP клиентов выходов с `KC_TCP_REDIR` к слушателю модуля по метке (раздел 2, «Туннели: стек, дайлер, транспорт») |
 | `forward_v6` | forward | отвергает IPv6 правил, ведущих в выход без IPv6, и адрес из префикса хоста мимо донора (раздел 4б) |
 | `postrouting_guard` | postrouting, `filter` | пакет с меткой выхода с устройством уходит только в устройства этого выхода — или отбрасывается |
 | `postrouting_down` | postrouting | счётчики входящего трафика каналов |
@@ -671,7 +675,7 @@ Salamander; `tx_multi` — один пакет в несколько датаг�
 Команда описана строкой таблицы `CMDS[]` в `src/cli/cli.c` (флаги, справка, проверка аргументов), а
 вызывается цепочкой сравнений в `main()` (`src/daemon/main.c`). Команды модулей, которых в сборке
 может не быть, объявлены там же слабыми ссылками и отвечают отказом «нужен пакет …» (правило 3).
-Инструменты, на которые отвечает `steer-tools`, перечислены в `TOOLS[]` того же файла.
+Инструменты, на которые отвечает `steer-tools`, перечислены в `TOOLS[]` в `src/daemon/main.c`.
 
 Файлы ядра (пути платформы — `src/platform/openwrt.c` и `android.c`):
 
