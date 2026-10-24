@@ -228,6 +228,7 @@ LIBSTEER_1 {
     rtnl_main6_routes;
     rtnl_route6_backstop;
     rtnl_route_default_dev;
+    rtnl_routes_dup;
     rtnl_routes_text;
     rtnl_routes_text6;
     rtnl_rule_from;
