@@ -143,12 +143,20 @@ int main(void) {
         check_n("кусок, которого нет", 0, node_name_has("Мобильный #6", "лте"));
         char ru[2][3] = { "RU", "US" };
         const char *names[1] = { "мобил" };
-        struct node_exclude x = { ru, 2, names, 1 };
+        struct node_exclude x = { .cc = ru, .cc_n = 2, .names = names, .names_n = 1 };
         check_n("исключён по стране", 1, node_excluded(&x, "\xF0\x9F\x87\xB7\xF0\x9F\x87\xBA Москва"));
         check_n("исключён по куску имени", 1, node_excluded(&x, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Мобильный"));
         check_n("не исключён", 0, node_excluded(&x, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам"));
         check_n("узел без флага по стране не исключается", 0, node_excluded(&x, "RU Moscow"));
         check_n("пустое исключение — ничего", 0, node_excluded(NULL, "x"));
+        /* only: берутся узлы только этих стран, узел без флага не берётся */
+        char nlde[2][3] = { "NL", "DE" };
+        struct node_exclude o = { .only = nlde, .only_n = 2 };
+        check_n("only: узел страны из списка берётся", 0, node_excluded(&o, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам"));
+        check_n("only: узел другой страны исключён", 1, node_excluded(&o, "\xF0\x9F\x87\xB7\xF0\x9F\x87\xBA Москва"));
+        check_n("only: узел без флага исключён", 1, node_excluded(&o, "NL Amsterdam"));
+        o.names = names; o.names_n = 1;
+        check_n("only вместе с exclude_name — пересечение", 1, node_excluded(&o, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Мобильный"));
     }
 
     /* ---- base64: то, чем подписки реально приходят ------------------------- */
