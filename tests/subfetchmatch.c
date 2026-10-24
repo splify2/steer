@@ -496,6 +496,52 @@ static void t_fetch(void) {
     ck("а без «.txt» — просто рядом", "/etc/steer/subs/second.userinfo", derived);
 }
 
+/* GZIP, О КОТОРОМ НЕ ПРОСИЛИ. Панель за nginx отдаёт тело сжатым при любом запросе, и curl без
+ * --compressed кладёт в файл байты gzip: снято на живой подписке. Сжатие — настоящим gzip, а не
+ * заготовкой: и с именем файла в заголовке (FNAME), и без него, как пишет поток. */
+static void t_gzip(void) {
+    snprintf(g_url, sizeof g_url, "https://panel.example/sub");
+    const char *LINKS =
+        "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?"
+        "type=xhttp&security=reality&sni=a.example&pbk=Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyMDA&"
+        "sid=ab12&mode=stream-one&path=/xhttp#gz\n";
+    char src[512], cmd[2600];
+    snprintf(src, sizeof src, "%s/plain.txt", T);
+    wr(src, LINKS);
+    fixture("main", "hdr", "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n");
+    fixture("main", "rc", NULL);
+
+    snprintf(cmd, sizeof cmd, "gzip -c '%s' > '%s/body.main'", src, T);
+    if (system(cmd) != 0) { printf("  ПРОПУСК gzip: нет gzip на машине стенда\n"); return; }
+    char *out = cap(call_fetch);
+    ck_true("сжатое тело распаковано", has(out, "\"ok\":true") && has(out, "\"usable\":1"));
+    ck("в файле узлов — ссылки, а не gzip", LINKS, rd(g_out));
+
+    snprintf(cmd, sizeof cmd, "gzip -c < '%s' > '%s/body.main'", src, T);
+    if (system(cmd) == 0) {
+        out = cap(call_fetch);
+        ck_true("gzip без имени файла — тоже", has(out, "\"usable\":1"));
+    }
+
+    /* Обрезанный gzip — отказ, и прежняя подписка цела: половина тела — половина узлов. */
+    snprintf(cmd, sizeof cmd, "gzip -c '%s' | head -c 30 > '%s/body.main'", src, T);
+    if (system(cmd) == 0) {
+        wr(g_out, "vless://прежнее\n");
+        out = cap(call_fetch);
+        ck_true("обрезанный gzip — отказ", has(out, "\"ok\":false"));
+        ck_true("прежняя подписка не тронута", strstr(rd(g_out), "прежнее") != NULL);
+    }
+    /* Испорченная сумма в хвосте — тоже отказ. */
+    snprintf(cmd, sizeof cmd,
+             "gzip -c '%s' > '%s/z' && n=$(wc -c < '%s/z') && head -c $((n-8)) '%s/z' > '%s/body.main' && "
+             "printf '\\001\\002\\003\\004' >> '%s/body.main' && tail -c 4 '%s/z' >> '%s/body.main'",
+             src, T, T, T, T, T, T, T);
+    if (system(cmd) == 0) {
+        out = cap(call_fetch);
+        ck_true("неверный CRC-32 — отказ", has(out, "\"ok\":false"));
+    }
+}
+
 static void t_quota_cmd(void) {
     snprintf(g_url, sizeof g_url, "https://panel.example/sub");
     snprintf(g_info, sizeof g_info, "%s/sub.userinfo", T);
@@ -664,6 +710,7 @@ int main(void) {
     t_warn();
     t_quota();
     t_fetch();
+    t_gzip();
     t_quota_cmd();
     t_device_hdrs();
     t_multi();
