@@ -10,7 +10,7 @@
 #   - TCP в устройство не попадал (счётчик «TCP из TUN сброшено» — ноль): всё шло через слушатель.
 #
 # Использование: tests/run-tunnel-mt.sh [рабочих=4] [соединений=32] [МБ_на_соединение=2]
-#   STEER=<бинарник> — по умолчанию ./build/steer-ext-check; STEER_TUN_THREADS здесь не читается,
+#   STEER=<бинарник> — по умолчанию ./build/libs-host/steerd; STEER_TUN_THREADS здесь не читается,
 #   рабочих задаёт первый аргумент.
 # Нужен root: своё сетевое пространство.
 set -eu
@@ -19,8 +19,10 @@ cd "$(dirname "$0")/.."
 THREADS="${1:-4}"
 CONNS="${2:-32}"
 MB="${3:-2}"
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${STEER:-./build/libs-host/steerd}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
+# steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
+LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 
 NS=steer-tunnel-mt
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124

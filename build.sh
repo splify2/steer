@@ -46,6 +46,8 @@ REV="$(git describe --tags --exact-match 2>/dev/null ||
 OUT=out
 # Сколько частей сборки не собралось (FAILED в выводе) — код возврата в конце.
 fails=0
+# Предупреждения компилятора (-Wall -Wextra) удачных сборок — для итоговой строки.
+warns=0
 # Свой образ, а не образ сборщика splify: в том нет исходников криптобиблиотеки, и расширенная
 # сборка в нём падает на ненайденном заголовке, тогда как базовая проходит. Незаметная поломка:
 # `./build.sh` печатает архитектуры, пакеты появляются, и только extended молча отсутствует.
@@ -61,6 +63,18 @@ rm_libs() {
     [ -e "$1" ] || return 0
     docker run --rm -v "$PWD:/src" --entrypoint rm "$IMAGE" -rf "/src/$1" >/dev/null 2>&1 || true
     [ ! -e "$1" ]
+}
+
+# Предупреждения удачной сборки. Файл stderr компилятора раньше читали только при провале
+# (grep error), и на успехе -Wall -Wextra не видел никто: предупреждение жило, пока его не
+# превращали в ошибку. Здесь — число и первые три строки, остальное лежит в самом файле; ничего
+# не печатается, если предупреждений нет, чтобы тихий вывод по строке на архитектуру остался тихим.
+warn_report() {  # ФАЙЛ_STDERR
+    _wn="$(grep -c 'warning:' "$1" 2>/dev/null || true)"
+    [ "${_wn:-0}" -gt 0 ] || return 0
+    warns=$((warns + _wn))
+    printf '    предупреждений: %s (подробно — %s)\n' "$_wn" "$1"
+    grep -m3 'warning:' "$1" | sed 's/^/      /'
 }
 
 # Собрать образ, если его нет. Иначе первая же сборка на чужой машине упирается в
@@ -280,6 +294,7 @@ for spec in $ISAS; do
                -o "build/steerd-$arch" $BASE_INC $THIRD_DEFS $BASE_SRC \
                2>"build/$arch.err"; then
         echo "$(stat -c %s "build/steerd-$arch") bytes"
+        warn_report "build/$arch.err"
     else
         # Старый бинарник обязан исчезнуть: иначе упаковка молча положит в пакет
         # сборку от прошлого раза, и ошибка компиляции превратится в «версия
@@ -298,6 +313,7 @@ for spec in $ISAS; do
                -o "build/steer-client-$arch" $BASE_INC $CLIENT_SRC \
                2>"build/$arch-client.err"; then
         echo "$(stat -c %s "build/steer-client-$arch") bytes"
+        warn_report "build/$arch-client.err"
     else
         rm -f "build/steer-client-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch-client.err" || head -1 "build/$arch-client.err")"
@@ -314,6 +330,7 @@ for spec in $ISAS; do
             "$VERSION" tgws "$REV" \
             2>"build/$arch-tgws.err"; then
         echo "$(stat -c %s "build/steer-tgws-$arch") bytes"
+        warn_report "build/$arch-tgws.err"
     else
         rm -f "build/steer-tgws-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch-tgws.err" || head -1 "build/$arch-tgws.err")"
@@ -331,11 +348,12 @@ for spec in $ISAS; do
     if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
             /src/build/build-ext.sh "$target" "$mcpu" "/src/build/stgws-$arch" \
             "$VERSION" tgws "$REV" \
-            2>"build/$arch-tgws.err"; then
+            2>"build/$arch-stgws.err"; then
         echo "$(stat -c %s "build/stgws-$arch") bytes"
+        warn_report "build/$arch-stgws.err"
     else
         rm -f "build/stgws-$arch"
-        echo "FAILED — $(grep -m1 error "build/$arch-tgws.err" || head -1 "build/$arch-tgws.err")"
+        echo "FAILED — $(grep -m1 error "build/$arch-stgws.err" || head -1 "build/$arch-stgws.err")"
         fails=$((fails + 1))
     fi
 
@@ -365,6 +383,7 @@ for spec in $ISAS; do
             >"build/$arch-libs.log" 2>"build/$arch-libs.err"; then
         echo "libsteer $(stat -c %s "$libs"/libsteer.so.*) + wolfssl $(stat -c %s "$libs"/libsteer-wolfssl.so.*)" \
              "+ steerd $(stat -c %s "$libs/steerd") bytes"
+        warn_report "build/$arch-libs.err"
     else
         rm_libs "$libs" || echo "    (не удалось снять $libs)"
         echo "FAILED — $(grep -m1 error "build/$arch-libs.err" || head -1 "build/$arch-libs.err")"
@@ -701,6 +720,7 @@ for arch in x86_64 aarch64_generic; do
     chmod 0755 "$stage/steer-hub" "$stage/xs_install.sh"
     tar -C "$stage" -czf "$OUT/steer-hub-$uarch.tar.gz" .
     printf '%s bytes\n' "$(stat -c %s "$OUT/steer-hub-$uarch.tar.gz")"
+    warn_report "build/$arch-hub.err"
 done
 
 # Владелец всего, что писал docker (от root): бинарники и архивы wolfSSL в build/, пакеты apk в
@@ -715,6 +735,7 @@ fi
 
 echo "packages:"
 ls -1 "$OUT" 2>/dev/null | sed 's/^/  /'
+[ "$warns" = 0 ] || echo "build.sh: предупреждений компилятора за сборку — $warns (строки выше, полный текст — build/*.err)"
 # Что-то не собралось — код отказа: прежде сборка с FAILED в выводе отвечала 0, и вызывающий (руками,
 # release.yml) узнавал об этом, только читая вывод.
 if [ "$fails" != 0 ]; then

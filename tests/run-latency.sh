@@ -94,6 +94,8 @@ for _ in $(seq 40); do
     grep -q '"active":\[{"index":1,' "$st" 2>/dev/null && { moved=yes; break; }
     sleep 0.5
 done
+# Приговор по состоянию, а не по счётчику кругов: переключение в последние полсекунды — тоже переключение.
+[ "$moved" = yes ] || { grep -q '"active":\[{"index":1,' "$st" 2>/dev/null && moved=yes; }
 
 fail=0
 if [ "$moved" = yes ] && [ "$a_before" -ge 1 ]; then echo "  ok: закачка начата через A, после замера активен B"; else
@@ -133,6 +135,12 @@ for t in $(seq 60); do
     fi
     sleep 1
 done
+# То же для C: переключение, случившееся за последнюю секунду ожидания, не должно считаться провалом.
+if [ -z "$ok_t" ] && grep -q '"active":\[{"index":2,' "$st" 2>/dev/null; then
+    code=$(ip netns exec "$NS" curl -s -o /dev/null --max-time 3 -r 0-1000 -w '%{http_code}' \
+        http://203.0.113.30/p 2>/dev/null || true)
+    case "$code" in 2*) ok_t=60 ;; esac
+fi
 alive=no
 [ -n "$TPID" ] && kill -0 "$TPID" 2>/dev/null && alive=yes
 if [ -n "$ok_t" ] && [ "$alive" = yes ] && grep -q "req 203.0.113.30" "$WORK/srv-C.log"; then

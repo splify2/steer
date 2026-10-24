@@ -47,6 +47,9 @@ check() {
 wait_for() {
     i=0
     while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    # Приговор по фактическому состоянию, а не по счётчику кругов: условие, ставшее истинным в последнюю
+    # десятую секунды, иначе объявлялось бы невыполненным.
+    eval "$1" && return 0
     return 1
 }
 for t in nft ip python3 nsenter unshare openssl pgrep awk ss; do command -v $t >/dev/null 2>&1 || skip "$t нет"; done

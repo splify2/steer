@@ -82,7 +82,10 @@ for _ in range(60):
     try:
         socket.create_connection(("127.0.0.1", int(sys.argv[1])), 0.2).close(); sys.exit(0)
     except OSError: time.sleep(0.2)
-sys.exit(1)
+# Приговор по состоянию, а не по счётчику кругов: сервер, поднявшийся в последние 0,2 с, — поднялся.
+try:
+    socket.create_connection(("127.0.0.1", int(sys.argv[1])), 0.2).close(); sys.exit(0)
+except OSError: sys.exit(1)
 PY
 }
 

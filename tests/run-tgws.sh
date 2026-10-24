@@ -28,8 +28,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (нужна расширенная сборка)"; exit 2; }
+BIN="${STEER:-./build/libs-host/steerd}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
+# steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
+LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 python3 -c "import cryptography" 2>/dev/null || { echo "нет python-cryptography — пропускаю"; exit 0; }
 [ "$(id -u)" = 0 ] || { echo "нужен root (сетевые пространства и nftables)"; exit 2; }
 
@@ -106,7 +108,9 @@ ip netns exec "$NSR" python3 tests/fake-apiws.py --port "$WSPORT" --report "$tmp
     > "$tmp/apiws.log" 2>&1 &
 sleep 1
 
-ip netns exec "$NSR" env STEER_TGWS_PLAIN=1 STEER_TGWS_ENDPOINT="127.0.0.1:$WSPORT" \
+# STEER_TGWS_VERBOSE=1: строку «не наш дата-центр» мост пишет только в подробном журнале (по умолчанию в
+# журнале одни параметры запуска и переключения путей), а проверка ниже ищет именно её.
+ip netns exec "$NSR" env STEER_TGWS_VERBOSE=1 STEER_TGWS_PLAIN=1 STEER_TGWS_ENDPOINT="127.0.0.1:$WSPORT" \
     STEER_TGWS_DCMAP=/dev/null \
     "$BIN" tgws tg --spec "$tmp/spec.json" --state-dir "$tmp/state" > "$tmp/tgws.log" 2>&1 &
 sleep 1

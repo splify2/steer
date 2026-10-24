@@ -21,14 +21,16 @@ set -eu
 cd "$(dirname "$0")/.."
 
 SB="${SINGBOX:-./build/sing-box}"
-BIN="${STEER:-./build/steer-ext-check}"
+BIN="${STEER:-./build/libs-host/steerd}"
 MASK="${MASK:-prod.vkimages.io}"          # маскировочный домен: обязан уметь TLS 1.3 и h2
 TARGET="${TARGET:-205.234.175.175}"       # куда просим сходить через туннель
 TPATH="${TPATH:-/1mb.test}"
 THOST="${THOST:-cachefly.cachefly.net}"
 
 [ -x "$SB" ] || { echo "нет sing-box: $SB (SINGBOX=путь)"; exit 2; }
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN"; exit 2; }
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
+# steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
+LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 
 NS=steer-reality
 W="$(mktemp -d)"

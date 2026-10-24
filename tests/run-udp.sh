@@ -23,8 +23,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${STEER:-./build/libs-host/steerd}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
+# steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
+LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 
 NS=steer-udp
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
