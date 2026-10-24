@@ -262,6 +262,7 @@ LIBSTEER_1 {
     sc_shake128_init;
     sc_shake128_read;
     sc_x25519_base;
+    set_name_famtag;
     sl_add_pins;
     SL_ECH_DNS;
     sl_host_is_name;
