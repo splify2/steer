@@ -258,7 +258,8 @@ static void check(int ok, const char *what) {
  * принимает conn_accept, второй — «клиент», у которого стенд пишет и читает. AF_UNIX — для данных (буфер
  * ядра известен и велик), TCP на петле — когда важно различие RST и FIN (conn_reset закрывает с SO_LINGER 0:
  * по AF_UNIX клиент этого не увидит). Готовность по фронту epoll (CRD) стенд ставит сам, как событие. */
-static int g_cfd[MAX_CONNS];          /* клиентский конец сокета соединения по номеру слота; -1 — нет */
+#define TEST_SLOTS 320                /* потолок слотов стенда: полная таблица достижима за мгновение */
+static int g_cfd[TEST_SLOTS];          /* клиентский конец сокета соединения по номеру слота; -1 — нет */
 
 static int cli_pair_unix(int sv[2]) {
     return socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv);
@@ -690,7 +691,7 @@ static void t_srv_close_drain(void) {
  * сном, результат последнего не спрашивался, и приговор «не доложил за 15 с» ставился по
  * счётчику кругов — таблица при этом намеренно не освобождается. */
 static void t_release_last_sleep(void) {
-    struct conn *c = &g_conns[MAX_CONNS - 1];
+    struct conn *c = &g_conns[g_nslots - 1];
     struct conn save = *c;
     c->used = 1;
     c->pending = 1;
@@ -1181,7 +1182,7 @@ static void t_udp_big(void) {
 static int full_table_gives_udp(uint16_t dport, int idle_s) {
     struct conn *u = NULL;
     int n = 0;
-    while (g_free_n) {
+    while (conn_slot_avail()) {
         struct conn *c = conn_new(&g_tun);
         memset(c, 0, sizeof(*c));
         c->used = 1;
@@ -2713,7 +2714,7 @@ static void t_owner(void) {
             cnt[o]++;
             struct flow_key k;
             size_t off;
-            if (ip_parse(p, n, &k, &off) == 0) used[o][flow_hash(&k)] = 1;
+            if (ip_parse(p, n, &k, &off) == 0) used[o][flow_hash(&k) & (CONN_BUCKETS - 1)] = 1;
         }
         unsigned lo = 8000, hi = 0, minb = CONN_BUCKETS;
         for (unsigned w = 0; w < nw; w++) {
@@ -2818,11 +2819,112 @@ static void t_owner_mail(void) {
     free(rws);
 }
 
+/* I-529: таблица растёт, а не упирается в 320 и не вытесняет живых. Поток свой — таблицы у потока
+ * свои (__thread), и главная таблица стенда с потолком TEST_SLOTS остаётся нетронутой. */
+#define GROW_N 3000
+static void *grow_thread(void *arg) {
+    int *res = arg;     /* [0] ошибка, [1] слотов, [2] найдено, [3] указатель стабилен, [4] вытеснено */
+    g_now_ns = now_ns();
+    g_now_s = (time_t)(g_now_ns / 1000000000ull);
+    size_t save_want = g_slots_want;
+    g_slots_want = 8192;
+    if (conn_table_init() != 0) { res[0] = 1; g_slots_want = save_want; return NULL; }
+    struct conn *first = NULL;
+    uint32_t first_sport = 0;
+    for (int i = 0; i < GROW_N; i++) {
+        struct conn *c = conn_new(&g_tun);
+        if (!c) { res[0] = 2; break; }
+        memset(c, 0, sizeof(*c));
+        c->used = 1;
+        c->fd = -1;
+        c->aux = -1;
+        c->livepos = -1;
+        c->hnext = -1;
+        c->key = cli_key();
+        c->key.src = htonl(0x0a000000u + (uint32_t)(i / 60000));
+        c->key.sport = (uint16_t)(1024 + i % 60000);
+        c->last = g_now_s - 1;           /* свежее: вытеснять нельзя */
+        conn_link(c);
+        if (!first) { first = c; first_sport = c->key.sport; }
+    }
+    res[1] = (int)g_nslots;
+    for (int i = 0; i < GROW_N; i++) {
+        struct flow_key k = cli_key();
+        k.src = htonl(0x0a000000u + (uint32_t)(i / 60000));
+        k.sport = (uint16_t)(1024 + i % 60000);
+        struct conn *c = conn_find(&k);
+        if (c && c->used) res[2]++;
+    }
+    res[3] = first == &g_conns[0] && first->key.sport == first_sport;
+    res[4] = (int)g_live_n;
+    while (g_live_n) conn_drop(&g_conns[g_live[g_live_n - 1]]);
+    res[5] = g_free_n;
+    conn_table_free();
+    g_slots_want = save_want;
+    return NULL;
+}
+
+static void t_table_grow(void) {
+    int res[8] = { 0 };
+    pthread_t t;
+    if (pthread_create(&t, NULL, grow_thread, res) != 0) { check(0, "I-529: стенд — поток"); return; }
+    pthread_join(t, NULL);
+    check(!res[0] && res[1] == GROW_N && res[4] == GROW_N,
+          "I-529: 3000 свежих соединений в одной таблице — все слоты выданы, ни одно не вытеснено (было 320)");
+    check(res[2] == GROW_N, "I-529: все 3000 находятся по хэшу (корзины выросли вместе с таблицей)");
+    check(res[3], "I-529: слот 0 не сдвинулся и сохранил содержимое при росте (указатели установщиков живы)");
+    check(res[5] == GROW_N, "I-529: после закрытия все слоты вернулись в свободные");
+}
+
+/* I-529: очередь установки без предела. Сто заявок разом при медленном узле: ни одна не отклонена, установщиков
+ * заведено сверх постоянных четырёх (иначе 100 заявок по 150 мс на 4 потока — 3,75 с), и все исполнены. */
+static int g_slow_run, g_slow_max, g_slow_done;
+static int slow_connect(const void *ctx, void *sess, int timeout_s) {
+    (void)ctx; (void)sess; (void)timeout_s;
+    int r = __atomic_add_fetch(&g_slow_run, 1, __ATOMIC_RELAXED);
+    int m = __atomic_load_n(&g_slow_max, __ATOMIC_RELAXED);
+    while (r > m && !__atomic_compare_exchange_n(&g_slow_max, &m, r, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    struct timespec ts = { 0, 150 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    __atomic_sub_fetch(&g_slow_run, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_slow_done, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+
+static void t_connectors_burst(void) {
+    enum { N = 100 };
+    static struct conn jobs[N];
+    static struct dialer_ops slow_ops;
+    static struct dialer slow_dl;
+    memset(jobs, 0, sizeof(jobs));
+    slow_ops = *g_dl->ops;
+    slow_ops.connect = slow_connect;
+    slow_dl = *g_dl;
+    slow_dl.ops = &slow_ops;
+    const struct dialer *save = g_dl;
+    g_dl = &slow_dl;
+    g_slow_run = g_slow_max = g_slow_done = 0;
+    uint64_t t0 = now_ns();
+    int refused = 0;
+    for (int i = 0; i < N; i++) {
+        struct connjob j = { .c = &jobs[i], .sess = &jobs[i], .sp = NULL, .efd = -1 };
+        if (connq_push(&j) != 0) refused++;
+    }
+    for (int w = 0; w < 600 && __atomic_load_n(&g_slow_done, __ATOMIC_RELAXED) < N; w++) usleep(10000);
+    double dt = (double)(now_ns() - t0) / 1e9;
+    int done = g_slow_done, mx = g_slow_max;
+    g_dl = save;
+    check(refused == 0, "I-529: сто заявок разом — ни одна не отклонена (очередь была в 32)");
+    check(done == N && mx > CONNECTORS && dt < 3.0,
+          "I-529: установщики заведены по нагрузке — все 100 исполнены быстрее, чем четырьмя потоками");
+    if (done != N || mx <= CONNECTORS) fprintf(stderr, "  исполнено %d, одновременно до %d, %.2f с\n", done, mx, dt);
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
     if (write(g_sess_pipe[1], "x", 1) != 1) return 2;
-    for (int i = 0; i < MAX_CONNS; i++) g_cfd[i] = -1;
+    for (int i = 0; i < TEST_SLOTS; i++) g_cfd[i] = -1;
     memset(&g_tun, 0, sizeof(g_tun));
     g_tun.fd = sp[0];
     g_dev_peer = sp[1];
@@ -2832,11 +2934,14 @@ int main(void) {
      * stack_setup тогда и памяти под него не берёт. */
     g_spare_want = 0;
     stack_setup(&g_dial);
+    g_slots_want = TEST_SLOTS;
     if (conn_table_init() != 0) return 2;
     g_now_ns = now_ns();
     g_now_s = (time_t)(g_now_ns / 1000000000ull);
 
     t_no_connectors();
+    t_connectors_burst();
+    t_table_grow();
     t_tcp_tun_rst();
     t_bring_up_table();
     t_early_wait();
