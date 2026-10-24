@@ -381,6 +381,10 @@ void fakeip_state_rewrite(void);
 /* Файл состояния — сейчас, если в памяти есть незаписанное (g_fakeip_dirty): просьба «flush»
  * загрузчика набора правил (adopt.c), выход резолвера и срок перезаписи в цикле (proxy.c). */
 void fakeip_state_flush(void);
+/* То же, но запись на носитель идёт в фоне (поток; цикл резолвера не ждёт fsync) — для срока перезаписи в цикле.
+ * fakeip_state_wait дожидается фона: перед чтением файла и при выходе. */
+void fakeip_state_flush_async(void);
+void fakeip_state_wait(void);
 /* Сколько подмен последний fakeip_rehydrate нашёл в ядре с другим значением и заменил. */
 extern size_t g_fakeip_fixed;
 uint32_t fakeip_entry_get_real(const char *domain);

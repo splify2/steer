@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
@@ -68,18 +69,32 @@
 #define LOG_W  "steer[warn] tunnel: "
 #define LOG_I  "steer[info] tunnel: "
 
-/* Сколько соединений держим одновременно. Каждое — это сокет к серверу плюс TLS-состояние,
- * то есть около 3 КБ; 64 соединения это ~200 КБ, что для роутера с 15 МБ приемлемо, а для
- * домашней сети более чем достаточно. Упираться в предел лучше заметно (новые соединения
- * получают отказ), чем незаметно съесть память и быть убитым OOM. */
-/* Сколько соединений держим одновременно.
+/* Сколько соединений у потока цикла — предела нет, таблица растёт по нужде (I-529).
  *
- * Шестидесяти четырёх не хватало, и не в теории: браузер держит соединения живыми между
- * запросами, и при широком списке (включённый Cloudflare — это половина интернета) два
- * открытых сайта занимали таблицу целиком. Сто двадцать восемь при кольце в 64 КБ стоят
- * ровно столько же памяти, сколько прежние шестьдесят четыре при 128 КБ, — то есть предел
- * поднят без единого лишнего байта. */
-#define MAX_CONNS 320
+ * Прежде здесь стояло 320 и при заполнении вытеснялись ЖИВЫЕ соединения (RST): число было взято под
+ * память роутера, а на компьютере или сервере браузер с сотней вкладок упирался в него сразу. Теперь
+ * адресное пространство под слоты резервируется один раз (PROT_NONE — ничего не стоит), а память под
+ * них берётся кусками по CONN_CHUNK слотов, когда прежние кончились: стоит соединение ровно столько,
+ * сколько стоит, и указатели на слоты не двигаются (установщики держат их в заявках).
+ *
+ * Резерв — это и есть единственный потолок, и у него настоящая причина: индекс слота влезает в 24
+ * бита метки epoll (SLOTS_IDX_MAX), а адресного пространства на 32-битном ядре не бесконечно, поэтому
+ * резерв уменьшается вдвое, пока отображение не получится. Дойдя до потолка, отказ называет число
+ * (conn_new). Дескрипторов процесса соединению нужно два-три: stack_run поднимает мягкий предел
+ * RLIMIT_NOFILE до жёсткого. */
+#define CONN_CHUNK 64
+#define SLOTS_IDX_MAX (1u << 24)
+/* Метки epoll, не равные номеру слота: слоты — ниже, метки — в верхней части 29 бит. AUX_BIT и SOCK_BIT
+ * (ниже) стоят выше этих меток и друг с другом не пересекаются. */
+#define TOK_TUN   0x1FFFFF00u
+#define TOK_EFD   0x1FFFFF01u
+#define TOK_LST   0x1FFFFF02u
+#define TOK_LOOP  0x1FFFFF03u
+/* Сколько событий epoll забираем за виток: не число соединений, а порция — остальное ядро отдаст
+ * следующим вызовом (готовые держатся в списке готовности). */
+#define EV_BATCH 512
+/* На сколько снимается слушатель, когда кончились дескрипторы (kaccept). */
+#define LST_PAUSE_MS 100
 
 /* Сколько секунд соединение должно молчать, чтобы его разрешили вытеснить.
  *
@@ -193,10 +208,10 @@ struct conn {
      * идут потоком и следующее чтение всё разгребало, а вот ХВОСТ ответа мог простоять до
      * таймаута повтора у клиента. */
     uint8_t rx_ready;
-    /* Место в g_live и следующий в цепочке хэша. Индексы, а не указатели: два байта против
+    /* Место в g_live и следующий в цепочке хэша. Индексы, а не указатели: четыре байта против
      * восьми, и вся горячая запись обязана влезть в две строки кэша. */
-    int16_t livepos;
-    int16_t hnext;
+    int32_t livepos;
+    int32_t hnext;
     /* Недописанное клиенту в сокет: записи узла копятся здесь за проход и уходят одной записью
      * (sock_flush); сокет полон — остаток ждёт EPOLLOUT. Заводится при первых данных и отдаётся системе
      * после простоя (conn_deadlines), растёт до RTX_CAP. У потока UDP не заводится вовсе. */
@@ -259,8 +274,8 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 160 ? 1 : -1];
 /* Биты поля armed. ARM_OUT — только пока узел не принял данные клиента сокета (R-152). */
 #define ARM_IN  1
 #define ARM_OUT 2
-/* Метка события сокета дайлера с DC_INLOOP (stack_loop_watch); TUN и eventfd — MAX_CONNS и MAX_CONNS + 1. */
-#define LOOP_TOKEN (MAX_CONNS + 2)
+/* Метка события сокета дайлера с DC_INLOOP — TOK_LOOP (stack_loop_watch). */
+#define LOOP_TOKEN TOK_LOOP
 #define AUX_BIT 0x40000000u   /* в data события epoll: вторая связь дайлера этого соединения */
 #define SOCK_BIT 0x20000000u  /* в data события epoll: сокет клиента этого соединения (R-152) */
 /* Чтение сокета клиента (sock_read): за вызов, одним read и порция узлу под одну запись TLS с обёртками. */
@@ -435,24 +450,34 @@ static size_t g_sess_stride;
 
 /* Занятые слоты, плотно. Все проходы цикла идут ТОЛЬКО по этому массиву — зачем, написано
  * выше у struct conn. */
-static __thread uint16_t *g_live;
+static __thread uint32_t *g_live;
 static __thread int g_live_n;
 /* Свободные слоты. Без него поиск места был бы перебором таблицы на каждый SYN. */
-static __thread uint16_t *g_freelist;
+static __thread uint32_t *g_freelist;
 static __thread int g_free_n;
 
 /* Хэш потока -> слот. Открытых цепочек, а не проб: удаление из цепочки не оставляет
- * «надгробий», которые при 320 слотах и десятках тысяч соединений в час превратили бы
- * таблицу в линейный перебор.
+ * «надгробий», которые при тысячах соединений и десятках тысяч в час превратили бы таблицу в линейный
+ * перебор.
  *
- * 512 корзин на 320 слотов — заполнение 0,63, то есть средняя цепочка короче полутора
- * записей. Память: 1 КБ, влезает в L1 целиком.
+ * Корзин не меньше, чем живых соединений (степень двойки, растёт вдвое в conn_link): средняя цепочка
+ * короче одной записи, и поиск остаётся одним-двумя обращениями при любом числе соединений. Начало —
+ * 512 корзин, 2 КБ, влезает в L1 целиком.
  *
  * Зачем вообще: conn_find вызывается на КАЖДЫЙ пакет из TUN, а их до семи тысяч в секунду.
- * Перебором это 320 сравнений по записи в 19 КБ — то есть 320 промахов кэша на пакет,
- * 2,2 миллиона в секунду. Хэш даёт одно обращение. */
+ * Перебором это сравнение с каждым слотом по записи в 19 КБ — то есть промах кэша на соединение на
+ * пакет. Хэш даёт одно обращение. */
 #define CONN_BUCKETS 512
-static __thread int16_t *g_bucket;
+static __thread int32_t *g_bucket;
+static __thread uint32_t g_bucket_mask;
+
+/* Слоты потока: сколько зарезервировано (g_slots_cap), сколько памяти под них взято (g_slots_commit) и
+ * сколько уже выдавалось хоть раз (g_nslots, слоты [0, g_nslots) заведены и проходят в обход
+ * connq_release). Резерв задаёт g_slots_want (0 — по умолчанию, см. conn_table_init). */
+static size_t g_slots_want;
+static __thread size_t g_slots_cap, g_slots_commit, g_nslots;
+static __thread unsigned char *g_tab_base;
+static __thread size_t g_tab_off_live, g_tab_off_free, g_tab_off_sess, g_tab_page;
 
 /* Дайлер процесса: таблица протокола и узел. Задаётся в stack_run до запуска потоков и дальше
  * только читается — потому и не __thread: установщикам он нужен тот же, что циклу. */
@@ -682,16 +707,8 @@ static int node_sock_aborted(int fd) {
     return ti.tcpi_state == TCP_CLOSE;
 }
 
-/* Одно отображение на поток цикла: горячая таблица, списки и корзины, за ними — сессии. */
-struct conn_tables {
-    struct conn conns[MAX_CONNS];
-    uint16_t live[MAX_CONNS];
-    uint16_t freelist[MAX_CONNS];
-    int16_t bucket[CONN_BUCKETS];
-};
-/* Начало сессий — с границы строки кэша, как и шаг между ними. */
+/* Шаг между сессиями — с границы строки кэша. */
 #define SESS_ALIGN 64
-#define TABLES_HEAD (((sizeof(struct conn_tables)) + SESS_ALIGN - 1) & ~(size_t)(SESS_ALIGN - 1))
 static __thread size_t g_tables_len;
 
 static inline unsigned flow_hash(const struct flow_key *k) {
@@ -707,7 +724,7 @@ static inline unsigned flow_hash(const struct flow_key *k) {
     h ^= h >> 15;
     h *= 0x2545F491u;
     h ^= h >> 13;
-    return h & (CONN_BUCKETS - 1);
+    return h;
 }
 
 /* Номер потока — только для диагностики: по нему видно, раскладывает ли ядро нагрузку или
@@ -812,16 +829,24 @@ static int g_trace;
  * в потоке-однодневке, этот кэш терялся бы на каждом соединении, и перебор мёртвых адресов
  * начинался бы заново.
  *
- * Очередь короткая СОЗНАТЕЛЬНО. Полная очередь означает «столько одновременных рукопожатий
- * этот процессор не переварит», и честный ответ на это — отказать в SYN: клиент повторит
- * через секунду, к тому времени место освободится. Принять больше, чем можем обслужить,
- * значит вернуться к очереди, только уже невидимой. */
-/* Четыре, а не больше. Восемь проверены и не дали ничего: двенадцатое соединение приходило
- * за 1798 мс против 1693 при четырёх — то есть в пределах разброса. Значит упор уже не в
- * ожидание сети, которое потоки и перекрывают, а в само ядро: X25519 и AEAD рукопожатия.
- * Держать вдвое больше потоков за тот же результат незачем. */
+ * Очередь без предела, потоки — по нагрузке (I-529).
+ *
+ * Прежде очередь была в 32 заявки при четырёх установщиках, и лишний SYN получал RST: «столько
+ * рукопожатий роутер не переварит». На компьютере браузер открывает сотню соединений разом, и отказ
+ * на четвёртой десятке был ложным: узким местом были четыре потока, ждущих сеть, а не процессор.
+ * Теперь заявка принимается всегда (каждая принадлежит соединению, а число соединений ограничено
+ * таблицей), а потоков столько, сколько ждёт: нет свободного установщика — заводится ещё, до
+ * CONNECTORS_MAX; лишние уходят после CONNECTOR_IDLE_S простоя. Постоянные CONNECTORS остаются: у
+ * них живёт кэш адреса узла (см. выше).
+ *
+ * Четыре постоянных — по замеру: восемь не дали ничего, двенадцатое соединение приходило за 1798 мс
+ * против 1693 при четырёх, то есть упор в X25519 и AEAD рукопожатия, а не в ожидание сети. Сверх них
+ * потоки нужны только когда рукопожатия ЖДУТ (медленный или мёртвый узел, 8 с на заявку), — там и
+ * заводятся. Потолок потоков настоящий: каждый держит стек и дескрипторы. STEER_TUN_CONNECTORS
+ * задаёт его вручную. */
 #define CONNECTORS 4
-#define CONNQ 32
+#define CONNECTORS_MAX 64
+#define CONNECTOR_IDLE_S 20
 /* Сколько установщик ждёт связи с узлом. Восемь секунд — прежнее число: его же берёт проверка
  * узла при подъёме, и соединение, которое проверка сочла бы живым, не должно отваливаться здесь
  * по более короткому сроку. */
@@ -903,9 +928,11 @@ static uint64_t g_spare_clock_ns;
  * SYN-ACK (он ушёл сразу), а ранние данные не ждали до 20 мс опроса. Узла в заявке нет: он
  * один на процесс и лежит в дайлере (g_dl). */
 struct connjob { struct conn *c; void *sess; struct spare *sp; int efd; };
+/* Очередь заявок — кольцо, растущее вдвое: q[head .. head+n) по модулю cap. */
 static struct {
-    struct connjob q[CONNQ];
-    unsigned head, n;
+    struct connjob *q;
+    unsigned cap, head, n;
+    unsigned nthreads, idle, max;   /* потоков всего, ждущих заявку, потолок */
     pthread_mutex_t mu;
     pthread_cond_t cv;
     int started;
@@ -927,12 +954,29 @@ static void spare_note(int ok) {
 }
 
 static void *connector(void *arg) {
-    (void)arg;
+    int extra = arg != NULL;        /* сверх постоянных: уходит после простоя */
     for (;;) {
         pthread_mutex_lock(&g_cq.mu);
-        while (g_cq.n == 0) pthread_cond_wait(&g_cq.cv, &g_cq.mu);
+        while (g_cq.n == 0) {
+            g_cq.idle++;
+            if (extra) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += CONNECTOR_IDLE_S;
+                int er = pthread_cond_timedwait(&g_cq.cv, &g_cq.mu, &ts);
+                g_cq.idle--;
+                if (er == ETIMEDOUT && g_cq.n == 0) {
+                    g_cq.nthreads--;
+                    pthread_mutex_unlock(&g_cq.mu);
+                    return NULL;
+                }
+            } else {
+                pthread_cond_wait(&g_cq.cv, &g_cq.mu);
+                g_cq.idle--;
+            }
+        }
         struct connjob j = g_cq.q[g_cq.head];
-        g_cq.head = (g_cq.head + 1) % CONNQ;
+        g_cq.head = (g_cq.head + 1) % g_cq.cap;
         g_cq.n--;
         pthread_mutex_unlock(&g_cq.mu);
 
@@ -976,8 +1020,25 @@ static void *connector(void *arg) {
     return NULL;
 }
 
-/* Поставить заявку в очередь; заводит потоки-установщики при первом вызове.
- * 0 — принята, -1 — очередь полна, -2 — установщиков нет ни одного.
+/* Завести установщика; 0 — встал. Под g_cq.mu. */
+static int connector_spawn(int extra) {
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    /* Стек скромный: рукопожатие держит крупные буферы в __thread, а не на стеке. TLS сверх него —
+     * thread_stack (у glibc она берётся из стека, и 128 КБ без неё — EINVAL). */
+    pthread_attr_setstacksize(&a, thread_stack(128 * 1024));
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    int err = pthread_create(&t, &a, connector, extra ? (void *)&g_cq : NULL);
+    pthread_attr_destroy(&a);
+    if (err != 0) return err;
+    g_cq.nthreads++;
+    return 0;
+}
+
+/* Поставить заявку в очередь; заводит потоки-установщики при первом вызове и по нагрузке.
+ * 0 — принята, -2 — установщиков нет ни одного, -1 — нет памяти под очередь (предела «очередь полна»
+ * больше нет: очередь растёт).
  *
  * Запущенной очередь считается, только если создался хотя бы один установщик (I-322).
  * Прежде started ставился до pthread_create, и при отказе всех созданий заявки копились в
@@ -987,21 +1048,17 @@ static void *connector(void *arg) {
 static int connq_push(const struct connjob *j) {
     pthread_mutex_lock(&g_cq.mu);
     if (!g_cq.started) {
-        pthread_attr_t a;
-        pthread_attr_init(&a);
-        /* Стек скромный: рукопожатие держит крупные буферы в __thread, а не на стеке. TLS сверх него —
-         * thread_stack (у glibc она берётся из стека, и 128 КБ без неё — EINVAL). */
-        pthread_attr_setstacksize(&a, thread_stack(128 * 1024));
-        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-        int made = 0, err = 0;
-        for (int i = 0; i < CONNECTORS; i++) {
-            pthread_t t;
-            err = pthread_create(&t, &a, connector, NULL);
-            if (err != 0) break;
-            made++;
+        if (!g_cq.max) {
+            const char *e = getenv("STEER_TUN_CONNECTORS");
+            int v = e ? atoi(e) : 0;
+            g_cq.max = v >= 1 ? (unsigned)v : CONNECTORS_MAX;
         }
-        pthread_attr_destroy(&a);
-        if (!made) {
+        int err = 0;
+        for (unsigned i = 0; i < CONNECTORS && i < g_cq.max; i++) {
+            err = connector_spawn(0);
+            if (err != 0) break;
+        }
+        if (!g_cq.nthreads) {
             static time_t said;
             if (g_now_s - said >= 5) {
                 said = g_now_s;
@@ -1013,9 +1070,21 @@ static int connq_push(const struct connjob *j) {
         }
         g_cq.started = 1;
     }
-    if (g_cq.n == CONNQ) { pthread_mutex_unlock(&g_cq.mu); return -1; }
-    g_cq.q[(g_cq.head + g_cq.n) % CONNQ] = *j;
+    if (g_cq.n == g_cq.cap) {
+        unsigned nc = g_cq.cap ? g_cq.cap * 2 : 64;
+        struct connjob *nq = malloc((size_t)nc * sizeof(*nq));
+        if (!nq) { pthread_mutex_unlock(&g_cq.mu); return -1; }
+        for (unsigned i = 0; i < g_cq.n; i++) nq[i] = g_cq.q[(g_cq.head + i) % g_cq.cap];
+        free(g_cq.q);
+        g_cq.q = nq;
+        g_cq.cap = nc;
+        g_cq.head = 0;
+    }
+    g_cq.q[(g_cq.head + g_cq.n) % g_cq.cap] = *j;
     g_cq.n++;
+    /* Ждущих меньше, чем заявок, — нужен ещё один установщик (отказ создания не страшен: прежние
+     * разберут очередь, только дольше). */
+    if (g_cq.n > g_cq.idle && g_cq.nthreads < g_cq.max) connector_spawn(1);
     pthread_cond_signal(&g_cq.cv);
     pthread_mutex_unlock(&g_cq.mu);
     return 0;
@@ -1157,7 +1226,7 @@ static void spare_refill(void) {
  *     по прежнему адресу.
  *
  * Необслуженные заявки просто выбрасываем: установщик их ещё не брал, ждать нечего. Ждать
- * приходится только взятых, их не больше CONNECTORS, и каждая ограничена таймаутом connect.
+ * приходится только взятых, их не больше числа установщиков, и каждая ограничена таймаутом connect.
  *
  * Возвращает 0, если отпустили всех, и -1, если кто-то так и не доложил. По -1 таблицу
  * сливать НЕЛЬЗЯ — освобождать её под работающим установщиком это и есть то, от чего мы тут
@@ -1167,12 +1236,12 @@ static int connq_release(struct conn *base) {
     pthread_mutex_lock(&g_cq.mu);
     unsigned kept = 0;
     for (unsigned i = 0; i < g_cq.n; i++) {
-        struct connjob j = g_cq.q[(g_cq.head + i) % CONNQ];
-        if (j.c >= base && j.c < base + MAX_CONNS) {
+        struct connjob j = g_cq.q[(g_cq.head + i) % g_cq.cap];
+        if (j.c >= base && j.c < base + g_nslots) {
             j.c->pending = 0;            /* нашу запись больше никто не тронет */
             continue;
         }
-        g_cq.q[(g_cq.head + kept++) % CONNQ] = j;
+        g_cq.q[(g_cq.head + kept++) % g_cq.cap] = j;
     }
     g_cq.n = kept;
     pthread_mutex_unlock(&g_cq.mu);
@@ -1185,7 +1254,7 @@ static int connq_release(struct conn *base) {
      * по счётчику кругов, и таблица утекала там, где освобождать было уже можно (I-193). */
     for (int spin = 0;; spin++) {
         int busy = 0;
-        for (int i = 0; i < MAX_CONNS; i++)
+        for (size_t i = 0; i < g_nslots; i++)
             if (base[i].used && base[i].pending &&
                 !__atomic_load_n(&base[i].done, __ATOMIC_ACQUIRE)) busy++;
         if (!busy) return 0;
@@ -1202,7 +1271,7 @@ static int connq_release(struct conn *base) {
  * прежний опрос раз в 20 мс. */
 static __thread int g_conn_efd = -1;
 
-/* Поставить заявку. 0 — принята, -1 — очередь полна. */
+/* Поставить заявку. 0 — принята, иначе отказ connq_push (нет памяти или установщиков). */
 static int conn_submit(struct conn *c) {
     if (g_inloop) {
         /* Без установщика: открытие начинает сам дайлер, здесь же, и не ждёт ответа узла. Исход — через
@@ -1220,37 +1289,59 @@ static int conn_submit(struct conn *c) {
     return connq_push(&j);
 }
 
-/* Таблица заводится один раз на поток: свободны все слоты, корзины пусты. 0 — готово, -1 —
- * памяти под неё нет.
+/* Таблица заводится один раз на поток: слотов пока нет, корзины пусты. 0 — готово, -1 — памяти под
+ * неё нет.
  *
- * Одно отображение (mmap), а не malloc: размер — десяток мегабайт, и нужны свежие нулевые
- * страницы, которые ядро выдаёт по факту обращения, — ровно то, что прежде давал TLS потока.
- * Трогаются здесь только горячая таблица и первые байты каждой сессии (dialer_ops.clear), то
- * есть одна страница на слот — столько же, сколько трогала прежняя запись `v.fd = -1`. */
+ * Одно отображение (mmap) на всё, и резерв, а не выделение: PROT_NONE ничего не стоит, и память
+ * (mprotect на чтение-запись, свежие нулевые страницы от ядра) берётся кусками по CONN_CHUNK слотов в
+ * conn_slot_grow. Четыре массива лежат в резерве один за другим, каждый от границы страницы: горячая
+ * таблица, список живых, свободные и — после них — сессии дайлера шагом g_sess_stride. Резерв не
+ * получился — берём вдвое меньше, пока не получится (потолок объяснён у CONN_CHUNK). */
 static int conn_table_init(void) {
     if (!g_conns) {
-        size_t len = TABLES_HEAD + (size_t)MAX_CONNS * g_sess_stride;
-        void *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+        size_t cap = g_slots_want;
+        if (!cap) cap = sizeof(void *) >= 8 ? (size_t)1 << 20 : (size_t)1 << 13;
+        if (cap > SLOTS_IDX_MAX) cap = SLOTS_IDX_MAX;
+        void *m = MAP_FAILED;
+        size_t len = 0, off_live = 0, off_free = 0, off_sess = 0;
+        for (;; cap /= 2) {
+#define PGUP(x) (((x) + pg - 1) & ~(pg - 1))
+            off_live = PGUP(cap * sizeof(struct conn));
+            off_free = off_live + PGUP(cap * sizeof(uint32_t));
+            off_sess = off_free + PGUP(cap * sizeof(uint32_t));
+            len = off_sess + PGUP(cap * g_sess_stride);
+            m = mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (m != MAP_FAILED || cap <= CONN_CHUNK) break;
+        }
         if (m == MAP_FAILED) return -1;
-        struct conn_tables *t = m;
-        g_conns = t->conns;
-        g_live = t->live;
-        g_freelist = t->freelist;
-        g_bucket = t->bucket;
-        g_sess = (unsigned char *)m + TABLES_HEAD;
+        g_conns = m;
+        g_tab_base = m;
+        g_tab_page = pg;
+        g_tab_off_live = off_live;
+        g_tab_off_free = off_free;
+        g_tab_off_sess = off_sess;
+        g_live = (uint32_t *)(g_tab_base + off_live);
+        g_freelist = (uint32_t *)(g_tab_base + off_free);
+        g_sess = g_tab_base + off_sess;
         g_tables_len = len;
+        g_slots_cap = cap;
+        g_slots_commit = g_nslots = 0;
+        g_bucket_mask = CONN_BUCKETS - 1;
+        g_bucket = malloc(CONN_BUCKETS * sizeof(*g_bucket));
+        if (!g_bucket) { munmap(m, len); g_conns = NULL; g_tables_len = 0; return -1; }
     }
     g_live_n = 0;
     g_free_n = 0;
-    for (int i = MAX_CONNS - 1; i >= 0; i--) {
+    for (size_t i = 0; i <= g_bucket_mask; i++) g_bucket[i] = -1;
+    /* Перезапуск таблицы (стенд): уже выданные слоты возвращаются в свободные целиком. */
+    for (size_t i = g_nslots; i-- > 0;) {
         g_conns[i].livepos = -1;
         g_conns[i].hnext = -1;
         g_conns[i].fd = -1;
         g_conns[i].aux = -1;
-        g_dl->ops->clear(SESS(&g_conns[i]));
-        g_freelist[g_free_n++] = (uint16_t)i;
+        g_freelist[g_free_n++] = (uint32_t)i;
     }
-    for (int i = 0; i < CONN_BUCKETS; i++) g_bucket[i] = -1;
     return 0;
 }
 
@@ -1258,16 +1349,63 @@ static int conn_table_init(void) {
  * иначе они писали бы в снятое отображение. */
 static void conn_table_free(void) {
     if (!g_conns) return;
-    munmap(g_conns, g_tables_len);
+    munmap(g_tab_base, g_tables_len);
+    free(g_bucket);
     g_conns = NULL;
+    g_tab_base = NULL;
     g_live = g_freelist = NULL;
     g_bucket = NULL;
     g_sess = NULL;
     g_tables_len = 0;
+    g_slots_cap = g_slots_commit = g_nslots = 0;
+}
+
+/* Взять в работу страницы [from, to) элементов массива с шагом elem от base: страницы целиком, от
+ * границы вниз до границы вверх — соседний массив лежит с границы страницы, и перекрытия нет. */
+static int tab_commit(unsigned char *base, size_t elem, size_t from, size_t to) {
+    size_t pg = g_tab_page;
+    size_t lo = (from * elem) & ~(pg - 1);
+    size_t hi = (to * elem + pg - 1) & ~(pg - 1);
+    return mprotect(base + lo, hi - lo, PROT_READ | PROT_WRITE);
+}
+
+/* Дать таблице ещё CONN_CHUNK слотов памяти. 0 — дано, -1 — резерв кончился или ядро отказало. */
+static int conn_slots_grow(void) {
+    size_t to = g_slots_commit + CONN_CHUNK;
+    if (to > g_slots_cap) to = g_slots_cap;
+    if (to == g_slots_commit) return -1;
+    size_t from = g_slots_commit;
+    if (tab_commit((unsigned char *)g_conns, sizeof(struct conn), from, to) != 0 ||
+        tab_commit(g_tab_base + g_tab_off_live, sizeof(uint32_t), from, to) != 0 ||
+        tab_commit(g_tab_base + g_tab_off_free, sizeof(uint32_t), from, to) != 0 ||
+        tab_commit(g_sess, g_sess_stride, from, to) != 0)
+        return -1;
+    g_slots_commit = to;
+    return 0;
+}
+
+/* Слот под новое соединение: свободный из списка, а если его нет — следующий не выдававшийся (память
+ * под него берётся здесь же). NULL — слотов больше нет (резерв или память). Слот выдаётся обнулённым
+ * ядром, кроме признаков «пусто», которые не нули. */
+static struct conn *conn_slot(void) {
+    if (g_free_n) return &g_conns[g_freelist[--g_free_n]];
+    if (g_nslots == g_slots_commit && conn_slots_grow() != 0) return NULL;
+    struct conn *c = &g_conns[g_nslots++];
+    c->livepos = -1;
+    c->hnext = -1;
+    c->fd = -1;
+    c->aux = -1;
+    g_dl->ops->clear(SESS(c));
+    return c;
+}
+
+/* Есть ли ещё слот, который conn_slot выдаст без вытеснения. */
+static inline int conn_slot_avail(void) {
+    return g_free_n || g_nslots < g_slots_cap;
 }
 
 static struct conn *conn_find(const struct flow_key *k) {
-    for (int16_t i = g_bucket[flow_hash(k)]; i >= 0; i = g_conns[i].hnext) {
+    for (int32_t i = g_bucket[flow_hash(k) & g_bucket_mask]; i >= 0; i = g_conns[i].hnext) {
         struct conn *c = &g_conns[i];
         if (c->key.src == k->src && c->key.dst == k->dst &&
             c->key.sport == k->sport && c->key.dport == k->dport &&
@@ -1277,12 +1415,32 @@ static struct conn *conn_find(const struct flow_key *k) {
     return NULL;
 }
 
+/* Корзин стало меньше, чем живых: вдвое больше, цепочки пересобираются обходом живых. Не вышло с
+ * памятью — цепочки просто длиннее, поиск не ломается. */
+static void conn_buckets_grow(void) {
+    size_t nb = ((size_t)g_bucket_mask + 1) * 2;
+    int32_t *nbk = malloc(nb * sizeof(*nbk));
+    if (!nbk) return;
+    for (size_t i = 0; i < nb; i++) nbk[i] = -1;
+    uint32_t nmask = (uint32_t)nb - 1;
+    for (int li = 0; li < g_live_n; li++) {
+        struct conn *c = &g_conns[g_live[li]];
+        unsigned b = flow_hash(&c->key) & nmask;
+        c->hnext = nbk[b];
+        nbk[b] = (int32_t)g_live[li];
+    }
+    free(g_bucket);
+    g_bucket = nbk;
+    g_bucket_mask = nmask;
+}
+
 /* Внести слот в список живых и в хэш. Вызывается одним местом — рождением соединения. */
 static void conn_link(struct conn *c) {
-    int16_t idx = (int16_t)(c - g_conns);
-    c->livepos = (int16_t)g_live_n;
-    g_live[g_live_n++] = (uint16_t)idx;
-    unsigned b = flow_hash(&c->key);
+    int32_t idx = (int32_t)(c - g_conns);
+    if ((size_t)g_live_n > g_bucket_mask) conn_buckets_grow();
+    c->livepos = g_live_n;
+    g_live[g_live_n++] = (uint32_t)idx;
+    unsigned b = flow_hash(&c->key) & g_bucket_mask;
     c->hnext = g_bucket[b];
     g_bucket[b] = idx;
 }
@@ -1290,16 +1448,16 @@ static void conn_link(struct conn *c) {
 /* Убрать из списка живых и из хэша. Дыра в g_live закрывается последним элементом: порядок
  * обхода никому не важен, а сдвиг хвоста стоил бы тем дороже, чем больше соединений. */
 static void conn_unlink(struct conn *c) {
-    int16_t idx = (int16_t)(c - g_conns);
+    int32_t idx = (int32_t)(c - g_conns);
     if (c->livepos >= 0) {
         int last = --g_live_n;
-        uint16_t moved = g_live[last];
+        uint32_t moved = g_live[last];
         g_live[c->livepos] = moved;
         g_conns[moved].livepos = c->livepos;
         c->livepos = -1;
     }
-    unsigned b = flow_hash(&c->key);
-    int16_t *slot = &g_bucket[b];
+    unsigned b = flow_hash(&c->key) & g_bucket_mask;
+    int32_t *slot = &g_bucket[b];
     while (*slot >= 0) {
         if (*slot == idx) { *slot = c->hnext; break; }
         slot = &g_conns[*slot].hnext;
@@ -1313,28 +1471,20 @@ static void conn_drop(struct conn *c);
  * заголовок и кадр Vision. */
 #define UP_MAX (TUNNEL_BUF - 2048)
 
-/* Свободное место в таблице, а если его нет — освободить самое давнее.
+/* Слот под новое соединение: свободный, а если таблица дошла до потолка (см. CONN_CHUNK) — освободить
+ * простаивающее.
  *
- * Прежде здесь стоял отказ: «предел, клиент повторит SYN». Рассуждение выглядело безобидно
- * и оказалось худшим из возможных. Браузер держит соединения ЖИВЫМИ между запросами
- * (keep-alive), минутами и не посылая ни байта. Убирались такие только по общему правилу
- * «молчит 120 секунд». Значит при широком списке — например, включённом Cloudflare, за
- * которым стоит половина интернета, — шестьдесят четыре слота занимались за два открытых
- * сайта, и дальше ВСЕ новые соединения молча отбрасывались.
+ * Таблица растёт (conn_slot), поэтому вытеснение — крайняя мера у потолка адресного пространства или
+ * памяти, а не обычный путь при сотне вкладок, как было при жёстких 320. Вытесняется ТОЛЬКО то, что
+ * уже ничего не принесёт: закрытое сервером, поток DNS, сделавший своё, и простой дольше
+ * IDLE_EVICT_S. Живое соединение не вытесняется никогда — при отказе клиент повторит SYN, а
+ * вытеснение живого ломало HTTP/2 залпом ERR_CONNECTION_CLOSED.
  *
- * Снаружи это выглядело ровно как «steer завис намертво»: процесс жив, счётчики растут,
- * туннель поднят, в логе тишина, и ни одна страница не открывается. Тишина здесь и была
- * главной ошибкой — отказ, о котором никто не узнаёт.
- *
- * Теперь новое соединение важнее самого давнего простаивающего, и это верный порядок: то,
- * что человек открывает сейчас, нужнее висящего keep-alive к сайту, закрытому пять минут
- * назад. Клиенту вытесненного посылается RST — он поймёт и переоткроет, а молчание оставило
- * бы его ждать ответа, которого не будет.
- *
- * Возвращает NULL только если вытеснять нечего, то есть все соединения свежие. */
+ * Возвращает NULL, если вытеснять нечего: все слоты (названное в журнале число) заняты и активны. */
 static struct conn *conn_new(const struct tun_dev *tun) {
     (void)tun;
-    if (g_free_n) return &g_conns[g_freelist[--g_free_n]];
+    struct conn *fresh = conn_slot();
+    if (fresh) return fresh;
 
     time_t now = g_now_s;
     struct conn *old = NULL;
@@ -1373,8 +1523,8 @@ static struct conn *conn_new(const struct tun_dev *tun) {
         static __thread time_t said;
         if (now != said && now - said >= 2) {
             said = now;
-            fprintf(stderr, LOG_W "все %d соединений заняты и активны, новые "
-                            "отклоняются — список слишком широк для этого роутера\n", MAX_CONNS);
+            fprintf(stderr, LOG_W "все %zu соединений потока заняты и активны, новые "
+                            "отклоняются — потолок слотов (адресное пространство или память)\n", g_nslots);
         }
         return NULL;
     }
@@ -1393,9 +1543,8 @@ static struct conn *conn_new(const struct tun_dev *tun) {
     static __thread time_t said_evict;
     if (now - said_evict >= 10) {
         said_evict = now;
-        fprintf(stderr, LOG_W "таблица полна (%d), вытесняю ещё живые соединения "
-                        "(последнее молчало %lu с) — список слишком широк для этого роутера\n",
-                MAX_CONNS, (unsigned long)(now - old->last));
+        fprintf(stderr, LOG_W "таблица на потолке (%zu слотов), убираю простаивающее "
+                        "(молчало %lu с)\n", g_nslots, (unsigned long)(now - old->last));
     }
     conn_drop(old);
     /* conn_drop вернул слот в список свободных — забираем его оттуда же, а не по прежнему
@@ -1412,7 +1561,7 @@ static void conn_drop(struct conn *c) {
     if (c->used) {
         g_dl->ops->close(SESS(c));
         conn_unlink(c);
-        g_freelist[g_free_n++] = (uint16_t)(c - g_conns);
+        g_freelist[g_free_n++] = (uint32_t)(c - g_conns);
     }
     rtx_done(&c->rtx);
     free(c->early);
@@ -1444,6 +1593,17 @@ static long conn_room(const struct conn *c) {
     if (c->pending) return c->early_n >= EARLY_CAP ? 0 : (long)(EARLY_CAP - c->early_n);
     if (c->fd < 0 || !g_dl->ops->room) return -1;
     return g_dl->ops->room(g_dl->ctx, SESS(c));
+}
+
+/* Связь соединения отдана циклу: запись узлу больше не ждёт сокета (dialer_ops.live, I-534). */
+static void conn_live(struct conn *c) {
+    if (g_dl->ops->live) g_dl->ops->live(SESS(c));
+}
+
+/* Сколько байт связь ещё не отправила узлу (dialer_ops.out_pending). */
+static size_t conn_out_pending(const struct conn *c) {
+    if (c->fd < 0 || !g_dl->ops->out_pending) return 0;
+    return g_dl->ops->out_pending(g_dl->ctx, SESS(c));
 }
 
 /* Сколько байт клиента соединения c собирается в одну отправку (см. dialer_ops.up_max). Пока
@@ -1573,6 +1733,9 @@ static int early_reserve(struct conn *c, size_t need) {
  * MTU — редкость), так что борьбы за строку кэша нет. */
 static uint16_t g_ip_id;
 static uint16_t ip_id_next(void) { return __atomic_add_fetch(&g_ip_id, 1, __ATOMIC_RELAXED); }
+
+/* Сколько датаграмм клиента отброшено за размер (больше dgram_max дайлера); читает журнал udp_packet. */
+static unsigned long long g_udp_toobig;
 
 /* Самая большая датаграмма, которую несёт текущий дайлер (dialer_ops.dgram_max). */
 static size_t dgram_limit(void) {
@@ -1972,7 +2135,19 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
     /* Сюда попадают только целые датаграммы: фрагменты собирает udp_defrag ещё до разбора
      * заголовка, и неполной датаграммы здесь быть не может. Проверка всё равно стоит —
      * отправить серверу обрубок под видом целой датаграммы хуже, чем потерять её. */
-    if (k->frag || !dn || dn > dgram_limit()) return;
+    if (k->frag || !dn) return;
+    if (dn > dgram_limit()) {
+        /* Крупнее, чем несёт дайлер, — потеря, и молчать о ней нельзя: снаружи это «QUIC/DNS через туннель
+         * иногда не работает». Счётчик общий (потоков цикла несколько), сообщение — раз в десять секунд. */
+        unsigned long long tot = __atomic_add_fetch(&g_udp_toobig, 1, __ATOMIC_RELAXED);
+        static __thread time_t said_big;
+        if (g_now_s - said_big >= 10) {
+            said_big = g_now_s;
+            fprintf(stderr, LOG_W "датаграмма UDP %zu байт больше предела протокола %s (%zu) — отброшена; "
+                            "всего отброшено %llu\n", dn, g_dl->ops->name, dgram_limit(), tot);
+        }
+        return;
+    }
 
     if (!c) {
         c = conn_new(tun);
@@ -1997,20 +2172,20 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
          * (dialer.h). */
         if (g_spare_want > 0 && !(g_dl->ops->caps & DC_UDP_OWN) && spare_checkout(SESS(c)) == 0) {
             c->fd = g_dl->ops->fd(SESS(c));
+            conn_live(c);
             node_sock_silence(c->fd);
             TR("UDP: взята запасная сессия\n");
         } else if ((qr = conn_submit(c)) == 0) {
             c->pending = 1;
             TR("UDP: заявка установщику\n");
         } else {
-            /* Очередь установки полна. Сказать об этом надо: снаружи это выглядит как
-             * «QUIC не работает через туннель», а причина — процессор, а не протокол.
-             * Отказ -2 (нет установщиков) connq_push назвал сам. */
+            /* Заявка не встала в очередь (нет памяти). Сказать об этом надо: снаружи это выглядит как
+             * «QUIC не работает через туннель». Отказ -2 (нет установщиков) connq_push назвал сам. */
             static __thread time_t said_q;
             if (qr == -1 && g_now_s - said_q >= 5) {
                 said_q = g_now_s;
-                fprintf(stderr, LOG_W "очередь установки соединений полна (%d), "
-                                "датаграмма отброшена — процессор не успевает\n", CONNQ);
+                fprintf(stderr, LOG_W "нет памяти под очередь установки соединений, "
+                                "датаграмма отброшена\n");
             }
             conn_drop(c);
             return;
@@ -2345,6 +2520,7 @@ static int conn_ready(struct conn *c, const struct tun_dev *tun) {
         conn_reset(c, tun);
         return 1;
     }
+    conn_live(c);
     /* Пока шло рукопожатие, узел соединения перестал быть активным (заменён): нести через
      * него нечего, клиент переподключится к живому. */
     if (d->stale && d->stale(g_dl->ctx, SESS(c))) {
@@ -2738,6 +2914,7 @@ static struct conn *conn_accept(int fd, const struct flow_key *k, const struct t
     if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), &key, 0) != 0) { conn_reset(c, tun); return NULL; }
     if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
         c->fd = g_dl->ops->fd(SESS(c));
+        conn_live(c);
         node_sock_silence(c->fd);
         spare_refill();
         return c;
@@ -2746,7 +2923,7 @@ static struct conn *conn_accept(int fd, const struct flow_key *k, const struct t
         static __thread time_t said_q;
         if (g_now_s - said_q >= 5) {
             said_q = g_now_s;
-            fprintf(stderr, LOG_W "очередь установки соединений полна (%d), соединение сброшено\n", CONNQ);
+            fprintf(stderr, LOG_W "нет памяти под очередь установки соединений, соединение сброшено\n");
         }
         conn_reset(c, tun);
         return NULL;
@@ -2762,17 +2939,20 @@ static struct conn *conn_accept(int fd, const struct flow_key *k, const struct t
  * отдаёт сокет почтой: дескриптор общий для процесса, цена — замок и побудка на соединение, а не на байт. */
 static unsigned g_accept_rr;
 
-/* Принять перенаправленные соединения: до 64 за событие, остальные — следующим витком. */
-static void kaccept(int lfd, const struct tun_dev *tun) {
+/* Принять перенаправленные соединения: до 64 за событие, остальные — следующим витком. -1 — кончились
+ * дескрипторы процесса или системы (EMFILE, ENFILE): слушатель по уровню будил бы цикл на каждом витке впустую,
+ * поэтому вызывающий снимает его с epoll на время (I-534), а соединения тем временем ждут в очереди ядра. */
+static int kaccept(int lfd, const struct tun_dev *tun) {
     for (int k = 0; k < 64; k++) {
         int fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (fd < 0) return;
+        if (fd < 0) return errno == EMFILE || errno == ENFILE ? -1 : 0;
         if (g_rw && g_nwork > 1) {
             unsigned t = __atomic_fetch_add(&g_accept_rr, 1, __ATOMIC_RELAXED) % g_nwork;
             if (t != (unsigned)g_worker && xmail_fd(t, fd) == 0) continue;
         }
         kaccept_fd(fd, tun);
     }
+    return 0;
 }
 
 /* Прочитать у клиента и отдать узлу (R-152). Сокет — по фронту: читаем, пока не EAGAIN (тогда CRD снят), или
@@ -2907,10 +3087,10 @@ static void *worker_loop(void *arg) {
         __atomic_store_n(&w->state, 2, __ATOMIC_RELEASE);
         return NULL;
     }
-    /* Метки TUN и eventfd не могут совпасть с номером соединения: слотов MAX_CONNS,
-     * метки выше. */
-    const uint32_t TUN_TOKEN = MAX_CONNS;
-    const uint32_t EFD_TOKEN = MAX_CONNS + 1;
+    /* Метки TUN, eventfd и слушателя не совпадают с номером соединения: слотов меньше SLOTS_IDX_MAX,
+     * метки выше (TOK_*). */
+    const uint32_t TUN_TOKEN = TOK_TUN;
+    const uint32_t EFD_TOKEN = TOK_EFD;
     /* С читателем (rw) в epoll рабочего устройства нет: пакеты приходят в кольцо, а будит eventfd. */
     if (own_tun) {
         struct epoll_event e = { .events = EPOLLIN, .data = { .u32 = TUN_TOKEN } };
@@ -2935,7 +3115,7 @@ static void *worker_loop(void *arg) {
     /* Слушатель TCP (R-152): у рабочего 0 — открытый в stack_run, у остальных свой (klisten_open).
      * Не встал у рабочего 1+ — соединения разберут остальные рабочие: группа SO_REUSEPORT раздаёт
      * только тем, кто в ней. */
-    const uint32_t LST_TOKEN = MAX_CONNS + 2;
+    const uint32_t LST_TOKEN = TOK_LST;
     int lfd = -1;
     if (g_kport > 0) {
         if (w->id == 0 && g_lfd0 >= 0) {
@@ -2956,7 +3136,9 @@ static void *worker_loop(void *arg) {
      * посмотри», а разбор всего сразу — в витке. Ставится ДО state: читатель не начнёт, пока не доложат
      * все, и увидит дескриптор. */
     if (rw) rw->ring.efd = efd;
-    struct epoll_event evs[MAX_CONNS + 3];
+    struct epoll_event evs[EV_BATCH];
+    int tun_out = 0;            /* на устройстве стоит EPOLLOUT: в очереди записи (tun.c) есть пакеты */
+    uint64_t lst_paused = 0;    /* слушатель снят с epoll (кончились дескрипторы) с этого момента, нс; 0 — стоит */
     g_ep = ep;
     /* Дайлер встаёт в цикл ДО state: его сокет должен стоять в epoll к первому витку, а соединение с
      * узлом — подниматься, пока рабочий ещё ничего не несёт. */
@@ -3021,7 +3203,7 @@ static void *worker_loop(void *arg) {
              * нечего ставить: события потока приходят из loop_poll (stack_sess_rx). EPOLLOUT (по уровню) — только
              * пока узел не принял данные клиента сокета: SEND_AGAIN у дайлера без своего окна (room -1, сокет
              * узла полон) ждёт записи узла событием, а не опросом (R-152). */
-            unsigned arm = ARM_IN | (c->cfd1 && c->early && conn_room(c) < 0 ? ARM_OUT : 0u);
+            unsigned arm = ARM_IN | (((c->cfd1 && c->early && conn_room(c) < 0) || conn_out_pending(c)) ? ARM_OUT : 0u);
             if (!g_inloop && arm != c->armed) {
                 struct epoll_event e = { .events = EPOLLIN | EPOLLET | (arm & ARM_OUT ? EPOLLOUT : 0u),
                                          .data = { .u32 = (uint32_t)(c - g_conns) } };
@@ -3088,7 +3270,30 @@ static void *worker_loop(void *arg) {
             else if (spsc_sleep_begin(&rw->ring)) sleeping = 1;
             else wait_ms = 0;
         }
-        int r = epoll_wait(ep, evs, MAX_CONNS + 3, wait_ms);
+        /* Слушатель, снятый за нехваткой дескрипторов, возвращается через LST_PAUSE_MS: к тому времени
+         * закрытые соединения вернули часть номеров. Пока снят — цикл просыпается к этому сроку. */
+        if (lst_paused) {
+            uint64_t el = (now_ns() - lst_paused) / 1000000ull;
+            if (el >= LST_PAUSE_MS) {
+                struct epoll_event le = { .events = EPOLLIN, .data = { .u32 = TOK_LST } };
+                if (epoll_ctl(ep, EPOLL_CTL_MOD, lfd, &le) == 0) lst_paused = 0;
+                else lst_paused = now_ns();
+            } else if ((int)(LST_PAUSE_MS - el) < wait_ms) {
+                wait_ms = (int)(LST_PAUSE_MS - el);
+            }
+        }
+        /* Очередь записи в устройство (tun.c, I-534): датаграмму, которую устройство не приняло, цикл не
+         * ждёт, а доставит, когда оно освободится. Пока очередь не пуста — на устройстве стоит EPOLLOUT. */
+        if (tun_wq_pending()) tun_wq_flush();
+        int want_out = tun_wq_pending();
+        if (want_out != tun_out) {
+            tun_out = want_out;
+            struct epoll_event oe = { .events = (own_tun ? (uint32_t)EPOLLIN : 0u) | (want_out ? (uint32_t)EPOLLOUT : 0u),
+                                      .data = { .u32 = TUN_TOKEN } };
+            if (own_tun) epoll_ctl(ep, EPOLL_CTL_MOD, tun_fd, &oe);
+            else epoll_ctl(ep, want_out ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, tun_fd, &oe);
+        }
+        int r = epoll_wait(ep, evs, EV_BATCH, wait_ms);
         if (sleeping) spsc_sleep_end(&rw->ring);
         g_turn++;
         uint64_t after_poll = now_ns();
@@ -3142,7 +3347,20 @@ static void *worker_loop(void *arg) {
         int tun_ready = own_tun && tun_buffered(&tun);
         for (int i = 0; i < r; i++) {
             if (evs[i].data.u32 == TUN_TOKEN) tun_ready = 1;
-            else if (evs[i].data.u32 == LST_TOKEN && lfd >= 0) kaccept(lfd, &tun);
+            else if (evs[i].data.u32 == LST_TOKEN && lfd >= 0) {
+                if (kaccept(lfd, &tun) < 0 && !lst_paused) {
+                    /* Снять слушателя с epoll до LST_PAUSE_MS: принимать нечем, а будить цикл незачем. */
+                    struct epoll_event le = { .events = 0, .data = { .u32 = TOK_LST } };
+                    if (epoll_ctl(ep, EPOLL_CTL_MOD, lfd, &le) == 0) lst_paused = g_now_ns;
+                    static __thread time_t said_fd;
+                    if (g_now_s - said_fd >= 10) {
+                        said_fd = g_now_s;
+                        fprintf(stderr, LOG_W "кончились дескрипторы процесса (%zu соединений у потока) — новые "
+                                        "соединения ждут в очереди ядра; поднимите предел открытых файлов (ulimit -n)\n",
+                                g_nslots);
+                    }
+                }
+            }
             else if (evs[i].data.u32 == EFD_TOKEN && efd >= 0) {
                 uint64_t drained;
                 ssize_t rd = read(efd, &drained, sizeof(drained));
@@ -3249,7 +3467,7 @@ static void *worker_loop(void *arg) {
                 if (sock_want_read(c)) sock_read(c, &tun);
                 continue;
             }
-            if (evs[i].data.u32 >= (uint32_t)MAX_CONNS) continue;  /* TUN и eventfd */
+            if (evs[i].data.u32 >= TOK_TUN) continue;  /* TUN, eventfd, слушатель */
             struct conn *c = &g_conns[evs[i].data.u32];
             /* Слот мог освободиться в этом же витке — на FIN или RST от клиента — и даже
              * достаться новому соединению. Пропускаем свободный слот, соединение, ждущее
@@ -3259,6 +3477,14 @@ static void *worker_loop(void *arg) {
              * чужое событие, читало свежую связь — блокирующую и пока пустую — и весь цикл
              * вставал на срок соединения. */
             if (!c->used || c->pending || c->born_turn == g_turn) continue;
+            /* Узел снова принимает запись: дослать то, что связь держит в очереди (живая запись, I-534). Отказ —
+             * связь сломана, как при отказе send. */
+            if ((evs[i].events & EPOLLOUT) && g_dl->ops->out_flush && c->fd >= 0 &&
+                g_dl->ops->out_flush(g_dl->ctx, SESS(c)) < 0) {
+                conn_node_lost(c);
+                conn_reset(c, &tun);
+                continue;
+            }
             /* Только запись: узел снова принимает — ранние данные досылает проход сроков (conn_deadlines). */
             if (!(evs[i].events & ~(uint32_t)EPOLLOUT)) continue;
             /* Уже прочитанное разбирает второй проход ниже — здесь пропускаем, чтобы одно
@@ -3326,6 +3552,7 @@ static void *worker_loop(void *arg) {
         if (g_inloop) g_dl->ops->loop_stop();
         conn_table_free();
     }
+    tun_wq_free();
     if (efd >= 0) close(efd);
     g_conn_efd = -1;
     close(ep);
@@ -3451,8 +3678,8 @@ static void reader_loop(struct tun_dev *t, struct ring_work *rws, int nw) {
  * добавил бы переключений. STEER_TUN_THREADS=N задаёт число вручную, и STEER_TUN_THREADS=1 — это тот
  * самый прежний путь, одной переменной: утверждение «стало быстрее от второго ядра» надо уметь
  * перепроверить на том же железе (тот же довод, что у STEER_TUN_NOGSO). Предела сверху нет: число задаёт
- * человек и ядра, а у каждого рабочего своя таблица в 320 соединений (MAX_CONNS), так что и
- * соединений при N рабочих до 320 N, а не 320. */
+ * человек и ядра, а у каждого рабочего своя растущая таблица (CONN_CHUNK), так что и
+ * соединений у процесса столько, сколько хватит памяти. */
 static int worker_count(void) {
     const char *env = getenv("STEER_TUN_THREADS");
     if (env) {
@@ -3532,6 +3759,14 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
     /* Порт слушателя TCP (R-152): соединения клиентов, перенаправленные правилом nft, принимаются здесь, а не
      * пакетами через TUN. Порт выводится из метки выхода (out_tcp_port) — так же его выводит демон, ставя
      * элемент карты перенаправления; STEER_TUN_TCPPORT — для стендов без демона. */
+    /* Дескрипторы: соединению клиента нужно два-три (сокет клиента, связь с узлом, вторая связь), и при
+     * мягком пределе 1024 таблица без предела упёрлась бы в него на пятой сотне соединений. Мягкий
+     * предел поднимается до жёсткого — права для этого не нужны (I-529). */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
     if (o->mark) g_kport = out_tcp_port(o);
     if (getenv("STEER_TUN_TCPPORT")) {
         int pt = atoi(getenv("STEER_TUN_TCPPORT"));

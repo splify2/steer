@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
+#include "outq.h"
 #include "pxdial.h"
 #include "pxwire.h"
 #include "stack.h"
@@ -25,6 +26,10 @@ struct socks_sess {
     int cfd;                     /* TCP: поток; UDP: управляющее соединение */
     int udpfd;                   /* UDP: сокет к ретранслятору; TCP: -1 */
     uint32_t dst; uint16_t dport;
+    /* Живая запись TCP (dialer_ops.live, I-534): что сокет узла не принял, ждёт в очереди и дослается по
+     * событию записи; до этого send блокирующий. У UDP не используется. */
+    uint8_t live;
+    struct outq oq;
 };
 
 static const char *sk_peer(const void *ctx) { return ((const struct px_node *)ctx)->vn.host; }
@@ -38,6 +43,8 @@ static void sk_clear(void *sess) {
     s->header_sent = 0;
     s->cfd = -1;
     s->udpfd = -1;
+    s->live = 0;
+    memset(&s->oq, 0, sizeof(s->oq));
 }
 
 static int sk_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
@@ -193,6 +200,8 @@ static int sk_connect(const void *ctx, void *sess, int timeout_s) {
 static void sk_take(void *dst, void *src) { (void)dst; (void)src; }   /* пула нет */
 static void sk_close(void *sess) {
     struct socks_sess *s = sess;
+    outq_free(&s->oq);
+    s->live = 0;
     if (s->udpfd >= 0) { close(s->udpfd); s->udpfd = -1; }
     if (s->cfd >= 0) { close(s->cfd); s->cfd = -1; }
 }
@@ -215,6 +224,8 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
                    const unsigned char *data, size_t n) {
     (void)ctx; (void)k;
     struct socks_sess *s = sess;
+    if (!udp && s->live)
+        return outq_send(s->cfd, &s->oq, data, n) == 0 ? SEND_OK : SEND_FATAL;
     if (!udp) {
         /* Кусок — целиком или никак: SEND_AGAIN значит «ничего не ушло», а неблокирующий send
          * при почти полном буфере сокета отдаёт часть, и хвост терялся бы. Поэтому запись
@@ -236,7 +247,9 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         size_t dl = ((size_t)p[0] << 8) | p[1];
         p += 2; left -= 2;
         if (dl > left) return SEND_FATAL;
-        unsigned char pkt[3 + 7 + UDP_DGRAM_MAX];
+        /* В буфере потока, а не на стеке: датаграмма до SK_DGRAM_MAX (I-528). */
+        unsigned char *pkt = px_scratch(1, 3 + 7 + dl);
+        if (!pkt) return SEND_FATAL;
         size_t o = 0;
         pkt[o++] = 0; pkt[o++] = 0; pkt[o++] = 0;    /* RSV RSV FRAG */
         o += px_socks_addr(pkt + o, s->dst, s->dport);
@@ -256,8 +269,11 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     return left ? SEND_FATAL : SEND_OK;
 }
 
+/* Пакет SOCKS5 UDP — RSV(2), FRAG, адрес IPv4 (7) и данные — целиком в UDP_DGRAM_ABS. */
+#define SK_DGRAM_MAX (UDP_DGRAM_ABS - 10)
+
 static size_t sk_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
-    if (n > UDP_DGRAM_MAX || 2 + n > cap) return 0;
+    if (n > SK_DGRAM_MAX || 2 + n > cap) return 0;
     out[0] = (unsigned char)(n >> 8); out[1] = (unsigned char)n;
     memcpy(out + 2, p, n);
     return 2 + n;
@@ -267,6 +283,11 @@ static int sk_read(void *sess, unsigned char *buf, size_t cap, const unsigned ch
     struct socks_sess *s = sess;
     *data = buf; *got = 0;
     int fd = s->udpfd >= 0 ? s->udpfd : s->cfd;
+    if (s->udpfd >= 0) {
+        /* Датаграмма от узла целиком: буфер стека (cap) её обрезал бы молча. */
+        unsigned char *rb = px_scratch(0, UDP_DGRAM_ABS + 1);
+        if (rb) { buf = rb; cap = UDP_DGRAM_ABS + 1; *data = rb; }
+    }
     ssize_t r = recv(fd, buf, cap, MSG_DONTWAIT);
     if (r > 0) { *got = (size_t)r; return 0; }
     if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
@@ -288,6 +309,28 @@ static int sk_deliver(const void *ctx, void *sess, int udp, const unsigned char 
     return emit(arg, rx + o + al, got - o - al);
 }
 
+/* Живая запись TCP: место у узла — пока очередь не набралась (I-534); у UDP записи не ждут и так. */
+static void sk_live(void *sess) {
+    struct socks_sess *s = sess;
+    if (s->udpfd < 0) s->live = 1;
+}
+static long sk_room(const void *ctx, void *sess) {
+    (void)ctx;
+    const struct socks_sess *s = sess;
+    size_t p = outq_pending(&s->oq);
+    if (!p) return -1;
+    return p >= (256 * 1024) ? 0 : (long)((256 * 1024) - p);
+}
+static size_t sk_out_pending(const void *ctx, void *sess) {
+    (void)ctx;
+    return outq_pending(&((struct socks_sess *)sess)->oq);
+}
+static int sk_out_flush(const void *ctx, void *sess) {
+    (void)ctx;
+    struct socks_sess *s = sess;
+    return s->cfd < 0 ? -1 : outq_flush(s->cfd, &s->oq);
+}
+
 const struct dialer_ops proxy_socks_dialer = {
     .name = "socks",
     .caps = DC_UDP_OWN,
@@ -295,6 +338,7 @@ const struct dialer_ops proxy_socks_dialer = {
     .peer = sk_peer, .describe = sk_describe, .strerror = px_strerror,
     .connect = sk_connect, .take = sk_take, .close = sk_close, .clear = sk_clear,
     .fd = sk_fd, .has_data = sk_has_data,
-    .flow_open = sk_flow_open, .send = sk_send, .dgram_frame = sk_dgram_frame,
+    .flow_open = sk_flow_open, .send = sk_send, .dgram_frame = sk_dgram_frame, .dgram_max = SK_DGRAM_MAX,
     .read = sk_read, .deliver = sk_deliver,
+    .room = sk_room, .live = sk_live, .out_pending = sk_out_pending, .out_flush = sk_out_flush,
 };

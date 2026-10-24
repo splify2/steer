@@ -15,6 +15,8 @@
 # из них, качает оно что-нибудь или нет.
 #
 # Использование: tests/bench-tunnel.sh [МБ] [молчащих_соединений] [потоков]
+#   BENCH_CPUS=0,1 BENCH_THREADS=2 — другие ядра и число рабочих потоков туннеля (по умолчанию одно ядро и
+#   один поток); так снимается масштабирование по ядрам (D-S1.2): то же число соединений на 1 и на 2 ядрах.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -66,7 +68,7 @@ sleep 1
 
 # ОДНО ядро и ОДИН поток: на роутере их столько и есть, а на восьми ядрах разница между
 # «цикл дорогой» и «цикл дешёвый» размазывается по свободным ядрам и не видна.
-ip netns exec "$NS" taskset -c 0 env STEER_TUN_THREADS=1 "$BIN" vless vl \
+ip netns exec "$NS" taskset -c "${BENCH_CPUS:-0}" env STEER_TUN_THREADS="${BENCH_THREADS:-1}" "$BIN" vless vl \
     --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 

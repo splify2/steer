@@ -81,7 +81,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/b3match $(BUILD)/subpq
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/b3match $(BUILD)/subpq
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -139,6 +139,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/xhupmatch
 	@$(BUILD)/wsmatch
 	@$(BUILD)/tls13readmatch
+	@$(BUILD)/outqmatch
 	@$(BUILD)/certrootsmatch
 	@$(BUILD)/pqfallbackmatch
 	@$(BUILD)/b3match
@@ -553,6 +554,10 @@ $(BUILD)/certrootsmatch: tests/certrootsmatch.c tests/unit.h src/proto/tls/certv
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Isrc/lib -Isrc/proto/tls -o $@ tests/certrootsmatch.c src/proto/tls/certverify.c -Wl,--unresolved-symbols=ignore-all -lpthread
 
+$(BUILD)/outqmatch: tests/outqmatch.c tests/unit.h src/lib/outq.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc/lib -o $@ tests/outqmatch.c
+
 $(BUILD)/tls13readmatch: tests/tls13readmatch.c tests/unit.h src/proto/tls/tls13.c src/proto/tls/tls13.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Isrc/lib -Isrc/proto/tls -o $@ tests/tls13readmatch.c src/proto/tls/tls13.c \
@@ -629,7 +634,7 @@ $(BUILD)/pxsubmatch: tests/pxsubmatch.c src/proto/proxy/pxsub.c src/proto/proxy/
 # Дайлеры прокси (src/proto/proxy: trojan, http) через таблицы dialer_ops — транспорт и хеш подменены
 # заглушками в стенде, поэтому без сети и криптобиблиотеки.
 $(BUILD)/pxdialmatch: tests/pxdialmatch.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxhttp.c src/proto/proxy/pxvmess.c src/proto/proxy/pxss.c src/proto/proxy/pxsocks.c \
-                    src/proto/proxy/proxy.h src/proto/proxy/pxdial.h src/proto/proxy/pxwire.h
+                    src/proto/proxy/proxy.h src/proto/proxy/pxdial.h src/proto/proxy/pxwire.h src/lib/outq.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests -o $@ tests/pxdialmatch.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxhttp.c src/proto/proxy/pxvmess.c src/proto/proxy/pxss.c src/proto/proxy/pxsocks.c
 

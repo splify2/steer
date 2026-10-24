@@ -187,6 +187,7 @@ LIBSTEER_1 {
     plat_select;
     plat_spec_default;
     plat_spec_resolve;
+    pool_race_first;
     pool_run;
     probe_clear;
     probe_mem_escape;
@@ -346,8 +347,11 @@ LIBSTEER_1 {
     transport_close;
     transport_direct;
     transport_has_data;
+    transport_live;
     transport_moved;
     transport_open;
+    transport_out_flush;
+    transport_out_pending;
     transport_read;
     transport_read_zc;
     transport_room;

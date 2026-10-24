@@ -173,6 +173,22 @@ static int ht_deliver(const void *ctx, void *sess, int udp, const unsigned char 
     return got ? emit(arg, rx, got) : 0;
 }
 
+/* Место у узла: у голого транспорта предела нет, пока очередь живой записи не набралась (обратное давление, I-534). */
+static long ht_room(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_room(&((struct http_sess *)sess)->t);
+}
+/* Живая запись (dialer_ops.live, out_pending, out_flush; I-534). */
+static void ht_live(void *sess) { transport_live(&((struct http_sess *)sess)->t); }
+static size_t ht_out_pending(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_out_pending(&((struct http_sess *)sess)->t);
+}
+static int ht_out_flush(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_out_flush(&((struct http_sess *)sess)->t);
+}
+
 const struct dialer_ops proxy_http_dialer = {
     .name = "http",
     .caps = 0,
@@ -182,4 +198,5 @@ const struct dialer_ops proxy_http_dialer = {
     .fd = ht_fd, .has_data = ht_has_data,
     .flow_open = ht_flow_open, .send = ht_send, .dgram_frame = ht_dgram_frame,
     .read = ht_read, .deliver = ht_deliver,
+    .room = ht_room, .live = ht_live, .out_pending = ht_out_pending, .out_flush = ht_out_flush,
 };

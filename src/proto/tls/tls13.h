@@ -3,6 +3,7 @@
  * стенды `make test`, у которых библиотеки нет по построению (h2match, tunnelmatch…). */
 #ifndef STEER_TLS13_H
 #define STEER_TLS13_H
+#include "outq.h"
 #include <stdint.h>
 #include <stddef.h>
 #include "scrypto.h"
@@ -80,6 +81,10 @@ struct tls13_keys {
 struct tls13 {
     int fd;
     int ready;
+    /* Живой режим записи: связь отдана циклу стека, запись не ждёт сокета (outq). Ставит tr_link_live (transport.c);
+     * при рукопожатии и в пробах записи блокирующие, как прежде. */
+    int live;
+    struct outq oq;
     /* 1 — соединение поднято по TLS 1.2 (tls12_handshake). Записи тогда устроены иначе: у
      * AES-GCM явная часть nonce в начале тела, в AAD номер записи, тип и длина, а внутреннего
      * типа в конце нет. Чтение и запись смотрят на флаг сами — вызывающему всё равно. */
@@ -220,6 +225,8 @@ size_t tls13_buffered(const struct tls13 *t);
 size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap);
 
 int tls13_write(struct tls13 *t, const unsigned char *data, size_t n);
+/* Живая запись (I-534): при t->live tls13_write не ждёт сокета — непринятое остаётся в t->oq (outq.h), его досылают
+ * outq_flush(t->fd, &t->oq) по событию записи. */
 int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got);
 
 /* То же чтение, но БЕЗ КОПИИ: отдаёт указатель внутрь буфера соединения, где запись уже

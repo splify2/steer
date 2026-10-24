@@ -178,6 +178,15 @@ static inline int tun_buffered(const struct tun_dev *d) {
     return d->single != 0 || d->seg_i < d->seg_n;
 }
 
+/* Очередь записи в устройство этого потока (I-534): датаграмма клиенту, которую устройство не приняло
+ * (EAGAIN), ждёт здесь, а цикл не стоит. Поток цикла ставит EPOLLOUT на устройство, пока tun_wq_pending(),
+ * и по готовности зовёт tun_wq_flush: 0 — пусто, 1 — снова занято, -1 — устройство сломано. tun_wq_free —
+ * при выходе потока. Предел очереди — TUN_WQ_MAX (tun.c), дальше отбрасывание со счётчиком. */
+int tun_wq_pending(void);
+int tun_wq_flush(void);
+void tun_wq_free(void);
+unsigned long long tun_wq_dropped(void);
+
 /* Служебный пакет, собранный tcp_build: суммы в нём уже посчитаны. Без повторов —
  * потерянный SYN-ACK или ACK клиент пришлёт заново сам. */
 void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n);

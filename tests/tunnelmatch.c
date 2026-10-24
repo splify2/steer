@@ -215,6 +215,10 @@ int transport_aux_drain(struct transport *c) {
     return g_aux_rc;
 }
 long transport_room(struct transport *c) { (void)c; return g_room; }
+/* Живая запись (I-534): у подмены сокета нет — держать нечего. */
+void transport_live(struct transport *c) { (void)c; }
+size_t transport_out_pending(const struct transport *c) { (void)c; return 0; }
+int transport_out_flush(struct transport *c) { (void)c; return 0; }
 /* Принимает ли транспорт запись любой длины (xhttp packet-up). */
 static int g_big_write;
 int transport_big_write(const struct transport *c) { (void)c; return g_big_write; }
@@ -258,7 +262,8 @@ static void check(int ok, const char *what) {
  * принимает conn_accept, второй — «клиент», у которого стенд пишет и читает. AF_UNIX — для данных (буфер
  * ядра известен и велик), TCP на петле — когда важно различие RST и FIN (conn_reset закрывает с SO_LINGER 0:
  * по AF_UNIX клиент этого не увидит). Готовность по фронту epoll (CRD) стенд ставит сам, как событие. */
-static int g_cfd[MAX_CONNS];          /* клиентский конец сокета соединения по номеру слота; -1 — нет */
+#define TEST_SLOTS 320                /* потолок слотов стенда: полная таблица достижима за мгновение */
+static int g_cfd[TEST_SLOTS];          /* клиентский конец сокета соединения по номеру слота; -1 — нет */
 
 static int cli_pair_unix(int sv[2]) {
     return socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv);
@@ -690,7 +695,7 @@ static void t_srv_close_drain(void) {
  * сном, результат последнего не спрашивался, и приговор «не доложил за 15 с» ставился по
  * счётчику кругов — таблица при этом намеренно не освобождается. */
 static void t_release_last_sleep(void) {
-    struct conn *c = &g_conns[MAX_CONNS - 1];
+    struct conn *c = &g_conns[g_nslots - 1];
     struct conn save = *c;
     c->used = 1;
     c->pending = 1;
@@ -1181,7 +1186,7 @@ static void t_udp_big(void) {
 static int full_table_gives_udp(uint16_t dport, int idle_s) {
     struct conn *u = NULL;
     int n = 0;
-    while (g_free_n) {
+    while (conn_slot_avail()) {
         struct conn *c = conn_new(&g_tun);
         memset(c, 0, sizeof(*c));
         c->used = 1;
@@ -2864,7 +2869,7 @@ static void t_owner(void) {
             cnt[o]++;
             struct flow_key k;
             size_t off;
-            if (ip_parse(p, n, &k, &off) == 0) used[o][flow_hash(&k)] = 1;
+            if (ip_parse(p, n, &k, &off) == 0) used[o][flow_hash(&k) & (CONN_BUCKETS - 1)] = 1;
         }
         unsigned lo = 8000, hi = 0, minb = CONN_BUCKETS;
         for (unsigned w = 0; w < nw; w++) {
@@ -2969,11 +2974,236 @@ static void t_owner_mail(void) {
     free(rws);
 }
 
+/* I-529: таблица растёт, а не упирается в 320 и не вытесняет живых. Поток свой — таблицы у потока
+ * свои (__thread), и главная таблица стенда с потолком TEST_SLOTS остаётся нетронутой. */
+#define GROW_N 3000
+static void *grow_thread(void *arg) {
+    int *res = arg;     /* [0] ошибка, [1] слотов, [2] найдено, [3] указатель стабилен, [4] вытеснено */
+    g_now_ns = now_ns();
+    g_now_s = (time_t)(g_now_ns / 1000000000ull);
+    size_t save_want = g_slots_want;
+    g_slots_want = 8192;
+    if (conn_table_init() != 0) { res[0] = 1; g_slots_want = save_want; return NULL; }
+    struct conn *first = NULL;
+    uint32_t first_sport = 0;
+    for (int i = 0; i < GROW_N; i++) {
+        struct conn *c = conn_new(&g_tun);
+        if (!c) { res[0] = 2; break; }
+        memset(c, 0, sizeof(*c));
+        c->used = 1;
+        c->fd = -1;
+        c->aux = -1;
+        c->livepos = -1;
+        c->hnext = -1;
+        c->key = cli_key();
+        c->key.src = htonl(0x0a000000u + (uint32_t)(i / 60000));
+        c->key.sport = (uint16_t)(1024 + i % 60000);
+        c->last = g_now_s - 1;           /* свежее: вытеснять нельзя */
+        conn_link(c);
+        if (!first) { first = c; first_sport = c->key.sport; }
+    }
+    res[1] = (int)g_nslots;
+    for (int i = 0; i < GROW_N; i++) {
+        struct flow_key k = cli_key();
+        k.src = htonl(0x0a000000u + (uint32_t)(i / 60000));
+        k.sport = (uint16_t)(1024 + i % 60000);
+        struct conn *c = conn_find(&k);
+        if (c && c->used) res[2]++;
+    }
+    res[3] = first == &g_conns[0] && first->key.sport == first_sport;
+    res[4] = (int)g_live_n;
+    while (g_live_n) conn_drop(&g_conns[g_live[g_live_n - 1]]);
+    res[5] = g_free_n;
+    conn_table_free();
+    g_slots_want = save_want;
+    return NULL;
+}
+
+static void t_table_grow(void) {
+    int res[8] = { 0 };
+    pthread_t t;
+    if (pthread_create(&t, NULL, grow_thread, res) != 0) { check(0, "I-529: стенд — поток"); return; }
+    pthread_join(t, NULL);
+    check(!res[0] && res[1] == GROW_N && res[4] == GROW_N,
+          "I-529: 3000 свежих соединений в одной таблице — все слоты выданы, ни одно не вытеснено (было 320)");
+    check(res[2] == GROW_N, "I-529: все 3000 находятся по хэшу (корзины выросли вместе с таблицей)");
+    check(res[3], "I-529: слот 0 не сдвинулся и сохранил содержимое при росте (указатели установщиков живы)");
+    check(res[5] == GROW_N, "I-529: после закрытия все слоты вернулись в свободные");
+}
+
+/* I-529: очередь установки без предела. Сто заявок разом при медленном узле: ни одна не отклонена, установщиков
+ * заведено сверх постоянных четырёх (иначе 100 заявок по 150 мс на 4 потока — 3,75 с), и все исполнены. */
+static int g_slow_run, g_slow_max, g_slow_done;
+static int slow_connect(const void *ctx, void *sess, int timeout_s) {
+    (void)ctx; (void)sess; (void)timeout_s;
+    int r = __atomic_add_fetch(&g_slow_run, 1, __ATOMIC_RELAXED);
+    int m = __atomic_load_n(&g_slow_max, __ATOMIC_RELAXED);
+    while (r > m && !__atomic_compare_exchange_n(&g_slow_max, &m, r, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    struct timespec ts = { 0, 150 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    __atomic_sub_fetch(&g_slow_run, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_slow_done, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+
+static void t_connectors_burst(void) {
+    enum { N = 100 };
+    static struct conn jobs[N];
+    static struct dialer_ops slow_ops;
+    static struct dialer slow_dl;
+    memset(jobs, 0, sizeof(jobs));
+    slow_ops = *g_dl->ops;
+    slow_ops.connect = slow_connect;
+    slow_dl = *g_dl;
+    slow_dl.ops = &slow_ops;
+    const struct dialer *save = g_dl;
+    g_dl = &slow_dl;
+    g_slow_run = g_slow_max = g_slow_done = 0;
+    uint64_t t0 = now_ns();
+    int refused = 0;
+    for (int i = 0; i < N; i++) {
+        struct connjob j = { .c = &jobs[i], .sess = &jobs[i], .sp = NULL, .efd = -1 };
+        if (connq_push(&j) != 0) refused++;
+    }
+    for (int w = 0; w < 600 && __atomic_load_n(&g_slow_done, __ATOMIC_RELAXED) < N; w++) usleep(10000);
+    double dt = (double)(now_ns() - t0) / 1e9;
+    int done = g_slow_done, mx = g_slow_max;
+    g_dl = save;
+    check(refused == 0, "I-529: сто заявок разом — ни одна не отклонена (очередь была в 32)");
+    check(done == N && mx > CONNECTORS && dt < 3.0,
+          "I-529: установщики заведены по нагрузке — все 100 исполнены быстрее, чем четырьмя потоками");
+    if (done != N || mx <= CONNECTORS) fprintf(stderr, "  исполнено %d, одновременно до %d, %.2f с\n", done, mx, dt);
+}
+
+/* I-534: запись в устройство не стоит в цикле. Устройство стенда — пара AF_UNIX/SOCK_DGRAM, и при полной
+ * очереди write отвечает EAGAIN, как у TUN. Прежде udp_write_to_client ждал освобождения до 200 мс (poll по
+ * миллисекунде); теперь датаграмма уходит в очередь потока, вызов возвращается сразу, а после слива всё
+ * доходит по порядку. */
+static void t_tun_wq(void) {
+    dev_drain(NULL);
+    int fl = fcntl(g_tun.fd, F_GETFL);
+    fcntl(g_tun.fd, F_SETFL, fl | O_NONBLOCK);
+    int small = 4096, old_buf = 0;
+    socklen_t ol = sizeof old_buf;
+    getsockopt(g_tun.fd, SOL_SOCKET, SO_SNDBUF, &old_buf, &ol);
+    setsockopt(g_tun.fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    unsigned char payload[600];
+    memset(payload, 'q', sizeof payload);
+    int sent = 0, queued_at = -1;
+    uint64_t t0 = now_ns();
+    for (int i = 0; i < 400; i++) {
+        payload[0] = (unsigned char)i;
+        payload[1] = (unsigned char)(i >> 8);
+        if (udp_write_to_client(&g_tun, SRV_IP, CLI_IP, SRV_PORT, CLI_PORT, payload, sizeof payload, 1) != 0) break;
+        sent++;
+        if (queued_at < 0 && tun_wq_pending()) queued_at = i;
+    }
+    double dt = (double)(now_ns() - t0) / 1e9;
+    check(sent == 400 && queued_at > 0 && tun_wq_pending() && dt < 0.15,
+          "I-534: заполненная очередь устройства — запись не ждёт (400 датаграмм за <150 мс), остаток в очереди потока");
+    if (sent != 400 || queued_at <= 0 || dt >= 0.15) fprintf(stderr, "  ушло %d, очередь с %d, %.3f с\n", sent, queued_at, dt);
+    /* Слив: устройство читают, очередь выпускается по порядку; ни одной потери и ни одной перестановки. */
+    int got = 0, bad = 0, next = 0;
+    for (int round = 0; round < 2000 && (got < 400); round++) {
+        unsigned char p[2000];
+        ssize_t r;
+        while ((r = recv(g_dev_peer, p, sizeof p, MSG_DONTWAIT)) > 0) {
+            int id = p[28] | (p[29] << 8);          /* IPv4 (20) + UDP (8): первые два байта нагрузки */
+            if (id != next) bad++;
+            next = id + 1;
+            got++;
+        }
+        if (tun_wq_pending()) tun_wq_flush();
+        else if (got < 400) usleep(1000);
+    }
+    check(got == 400 && !bad && !tun_wq_pending() && tun_wq_dropped() == 0,
+          "I-534: после слива доставлены все 400 датаграмм по порядку, очередь пуста, отброшенных нет");
+    setsockopt(g_tun.fd, SOL_SOCKET, SO_SNDBUF, &old_buf, sizeof old_buf);   /* дальше стенду нужны прежние буферы */
+    fcntl(g_tun.fd, F_SETFL, fl);
+    dev_drain(NULL);
+}
+
+/* I-534: слушатель при нехватке дескрипторов. accept4 отвечает EMFILE, а слушатель по уровню остаётся готовым —
+ * цикл крутился бы без остановки. kaccept теперь сообщает об этом (-1), и цикл снимает слушателя с epoll на
+ * LST_PAUSE_MS; при обычных исходах (нет соединений) — 0, и слушатель стоит. */
+static void t_accept_emfile(void) {
+    int l = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET };
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (l < 0 || bind(l, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(l, 8) != 0 ||
+        getsockname(l, (struct sockaddr *)&sa, &sl) != 0) { check(0, "I-534: стенд — слушатель"); return; }
+    check(kaccept(l, &g_tun) == 0, "I-534: нет ожидающих соединений — kaccept вернул 0, слушатель остаётся в наборе");
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0 || connect(c, (struct sockaddr *)&sa, sizeof sa) != 0) { check(0, "I-534: стенд — клиент"); return; }
+    struct rlimit old;
+    getrlimit(RLIMIT_NOFILE, &old);
+    struct rlimit lo = old;
+    lo.rlim_cur = 128;
+    int full[128], nfull = 0;
+    if (lo.rlim_cur <= old.rlim_max) {
+        setrlimit(RLIMIT_NOFILE, &lo);
+        for (int fd; nfull < 128 && (fd = dup(0)) >= 0;) full[nfull++] = fd;
+    }
+    int rc = kaccept(l, &g_tun);
+    for (int i = 0; i < nfull; i++) close(full[i]);
+    setrlimit(RLIMIT_NOFILE, &old);
+    check(rc == -1, "I-534: дескрипторов нет (EMFILE) — kaccept вернул -1, соединение остаётся в очереди ядра");
+    close(c);
+    close(l);
+}
+
+/* I-535: проба кандидатов наперегонки. Мёртвые узлы молчат до срока (здесь 2 с — вместо 8), живой отвечает
+ * за 50 мс. Последовательный перебор отдал бы 4 × 2 с + 50 мс, гонка — задержку запуска пятого (4 × 250 мс). */
+struct race_t { int alive_from; int alive_ms; int dead_ms; };
+static int race_probe(void *arg, int id, char *why, size_t n) {
+    const struct race_t *r = arg;
+    int alive = id >= r->alive_from;
+    struct timespec ts = { 0, (long)(alive ? r->alive_ms : r->dead_ms) * 1000000L };
+    nanosleep(&ts, NULL);
+    if (alive) { snprintf(why, n, "жив %d", id); return 0; }
+    snprintf(why, n, "молчит %d", id);
+    return -1;
+}
+static void t_race(void) {
+    static const int ids[6] = { 10, 11, 12, 13, 14, 15 };
+    static struct race_t dead4 = { .alive_from = 14, .alive_ms = 50, .dead_ms = 2000 };
+    char why[64];
+    struct pool_race pr = { .n = 6, .ids = ids, .probe = race_probe, .arg = &dead4 };
+    uint64_t t0 = now_ns();
+    int w = pool_race_first(&pr, why, sizeof why);
+    double dt = (double)(now_ns() - t0) / 1e9;
+    check(w == 14 && !strcmp(why, "жив 14") && dt < 1.6,
+          "I-535: четыре мёртвых узла по 2 с и живой пятый — ответ за ~1 с (последовательно было бы 8 с)");
+    if (w != 14 || dt >= 1.6) fprintf(stderr, "  победитель %d (%s), %.2f с\n", w, why, dt);
+
+    /* Порядок предпочтения: первый живой ответил за 50 мс, второй стартует через 250 — побеждает первый. */
+    static struct race_t both = { .alive_from = 10, .alive_ms = 50, .dead_ms = 0 };
+    pr.arg = &both;
+    w = pool_race_first(&pr, why, sizeof why);
+    check(w == 10, "I-535: живые первый и второй — побеждает первый, порядок предпочтения сохранён");
+
+    /* Не ответил никто: -1 и причина последнего отказа; быстрые отказы не ждут задержки запуска. */
+    static struct race_t none = { .alive_from = 99, .alive_ms = 0, .dead_ms = 100 };
+    pr.arg = &none;
+    t0 = now_ns();
+    w = pool_race_first(&pr, why, sizeof why);
+    dt = (double)(now_ns() - t0) / 1e9;
+    check(w == -1 && !strncmp(why, "молчит", 6) && dt < 1.0,
+          "I-535: ни один не ответил — -1 с причиной, быстрые отказы идут один за другим без задержки запуска");
+    /* Один кандидат и ни одного. */
+    pr.n = 1;
+    pr.arg = &both;
+    check(pool_race_first(&pr, why, sizeof why) == 10, "I-535: один кандидат — проверяется он");
+    pr.n = 0;
+    check(pool_race_first(&pr, why, sizeof why) == -1, "I-535: кандидатов нет — -1");
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
     if (write(g_sess_pipe[1], "x", 1) != 1) return 2;
-    for (int i = 0; i < MAX_CONNS; i++) g_cfd[i] = -1;
+    for (int i = 0; i < TEST_SLOTS; i++) g_cfd[i] = -1;
     memset(&g_tun, 0, sizeof(g_tun));
     g_tun.fd = sp[0];
     g_dev_peer = sp[1];
@@ -2983,11 +3213,17 @@ int main(void) {
      * stack_setup тогда и памяти под него не берёт. */
     g_spare_want = 0;
     stack_setup(&g_dial);
+    g_slots_want = TEST_SLOTS;
     if (conn_table_init() != 0) return 2;
     g_now_ns = now_ns();
     g_now_s = (time_t)(g_now_ns / 1000000000ull);
 
     t_no_connectors();
+    t_connectors_burst();
+    t_race();
+    t_tun_wq();
+    t_accept_emfile();
+    t_table_grow();
     t_tcp_tun_rst();
     t_bring_up_table();
     t_early_wait();

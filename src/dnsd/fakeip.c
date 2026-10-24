@@ -5,6 +5,7 @@
 #include <linux/netlink.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_conntrack.h>
+#include <pthread.h>
 
 /* ---------------------------------------------------------------------- */
 /* fake-IP pool: one stable, exclusive synthetic IPv4 per matched domain    */
@@ -213,17 +214,12 @@ static void fakeip_state_append(const char *path, const char *domain, uint32_t a
  * Called after we learn a fresh real_ip for an already-allocated domain, so
  * the next restart can rehydrate the DNAT map without re-resolving. Best-effort
  * (atomic via rename); a failure just means a later restart re-resolves. */
-void fakeip_state_rewrite(void) {
-    if (!g_fakeip_state_path) return;
-    /* Буфер — по длине ПУТИ, а не имени хоста: путь состояния задаёт снаружи
-     * (--state-file/--state-dir), и обрезка «%s.tmp» на произвольном месте давала
-     * чужое имя — от несуществующего до самого файла состояния или существующего
-     * каталога. Обрезка проверяется явно: писать некуда лучше, чем писать не туда. */
-    char tmp[PATH_MAX];
-    int need = snprintf(tmp, sizeof(tmp), "%s.tmp", g_fakeip_state_path);
-    if (need < 0 || (size_t)need >= sizeof(tmp)) return;
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
+/* Содержимое файла состояния из g_fakeip — в памяти, без ввода-вывода (строки — формат выше). NULL — нет
+ * памяти. Вызывающий освобождает. */
+static char *fakeip_state_serialize(size_t *len) {
+    char *buf = NULL;
+    FILE *f = open_memstream(&buf, len);
+    if (!f) return NULL;
     for (size_t i = 0; i < g_fakeip.n; i++) {
         const struct fakeip_entry *en = &g_fakeip.entries[i];
         struct in_addr fa; fa.s_addr = htonl(en->addr);
@@ -251,6 +247,24 @@ void fakeip_state_rewrite(void) {
         else
             fprintf(f, "%s\t%s\n", en->domain, fstr);
     }
+    if (fclose(f) != 0) { free(buf); return NULL; }
+    return buf;
+}
+
+/* Записать содержимое в файл состояния атомарно: временный файл, fsync, rename. Может стоять на носителе
+ * сотни миллисекунд (флеш), поэтому из цикла резолвера её не зовут — только синхронные места (fakeip_state_flush)
+ * и поток записи (ниже). */
+static void fakeip_state_store(const char *path, const char *buf, size_t len) {
+    /* Буфер — по длине ПУТИ, а не имени хоста: путь состояния задаёт снаружи
+     * (--state-file/--state-dir), и обрезка «%s.tmp» на произвольном месте давала
+     * чужое имя — от несуществующего до самого файла состояния или существующего
+     * каталога. Обрезка проверяется явно: писать некуда лучше, чем писать не туда. */
+    char tmp[PATH_MAX];
+    int need = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (need < 0 || (size_t)need >= sizeof(tmp)) return;
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    if (len && fwrite(buf, 1, len, f) != len) { fclose(f); unlink(tmp); return; }
     /* Данные должны лечь на носитель ДО rename: иначе отключение питания между
      * rename и фактической записью оставляет пустой state-файл — ровно ту
      * потерю всей таблицы, от которой защищается разбор в fakeip_state_load. */
@@ -260,8 +274,93 @@ void fakeip_state_rewrite(void) {
         return;
     }
     fclose(f);
-    if (rename(tmp, g_fakeip_state_path) != 0)
+    if (rename(tmp, path) != 0)
         unlink(tmp);
+}
+
+/* ПОТОК ЗАПИСИ (I-534). Перезапись с fsync в цикле резолвера останавливала все вопросы клиентов на время записи
+ * на носитель — на флеше это десятки и сотни миллисекунд раз в FAKEIP_ANSWER_TTL. Теперь цикл только
+ * сериализует таблицу в память (процессор, без ввода-вывода) и передаёт буфер потоку, который пишет, делает fsync и
+ * rename. Передаётся последний снимок: пока поток занят, следующий просто заменяет ожидающий. Места, где файл
+ * должен лежать на носителе СЕЙЧАС (засев по просьбе загрузчика, выход резолвера), ждут поток
+ * (fakeip_state_wait) и пишут сами. */
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    char *buf;                  /* ожидающий снимок */
+    size_t len;
+    char *path;                 /* копия пути: g_fakeip_state_path меняется только при старте, но поток живёт дольше */
+    int busy;                   /* поток пишет сейчас */
+    int started;
+} g_fw = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+static void *fakeip_writer(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_fw.mu);
+    for (;;) {
+        while (!g_fw.buf) pthread_cond_wait(&g_fw.cv, &g_fw.mu);
+        char *buf = g_fw.buf;
+        size_t len = g_fw.len;
+        char *path = g_fw.path;
+        g_fw.buf = NULL;
+        g_fw.path = NULL;
+        g_fw.busy = 1;
+        pthread_mutex_unlock(&g_fw.mu);
+        fakeip_state_store(path, buf, len);
+        free(buf);
+        free(path);
+        pthread_mutex_lock(&g_fw.mu);
+        g_fw.busy = 0;
+        pthread_cond_broadcast(&g_fw.cv);
+    }
+    return NULL;
+}
+
+/* Дождаться, пока поток записи отдаст то, что принял и что ждёт. */
+void fakeip_state_wait(void) {
+    pthread_mutex_lock(&g_fw.mu);
+    while (g_fw.buf || g_fw.busy) pthread_cond_wait(&g_fw.cv, &g_fw.mu);
+    pthread_mutex_unlock(&g_fw.mu);
+}
+
+/* Перезапись файла в фоне: цикл не ждёт носителя. 0 — снимок передан, -1 — не вышло (нет памяти или потока:
+ * вызывающий оставит таблицу грязной и повторит). */
+int fakeip_state_rewrite_async(void) {
+    if (!g_fakeip_state_path) return 0;
+    size_t len;
+    char *buf = fakeip_state_serialize(&len);
+    if (!buf) return -1;
+    char *path = strdup(g_fakeip_state_path);
+    if (!path) { free(buf); return -1; }
+    pthread_mutex_lock(&g_fw.mu);
+    if (!g_fw.started) {
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        pthread_t t;
+        int er = pthread_create(&t, &a, fakeip_writer, NULL);
+        pthread_attr_destroy(&a);
+        if (er != 0) { pthread_mutex_unlock(&g_fw.mu); free(buf); free(path); return -1; }
+        g_fw.started = 1;
+    }
+    free(g_fw.buf);
+    free(g_fw.path);
+    g_fw.buf = buf;
+    g_fw.len = len;
+    g_fw.path = path;
+    pthread_cond_broadcast(&g_fw.cv);
+    pthread_mutex_unlock(&g_fw.mu);
+    return 0;
+}
+
+void fakeip_state_rewrite(void) {
+    if (!g_fakeip_state_path) return;
+    fakeip_state_wait();                      /* не наперегонки с потоком записи: тот же временный файл */
+    size_t len;
+    char *buf = fakeip_state_serialize(&len);
+    if (!buf) return;
+    fakeip_state_store(g_fakeip_state_path, buf, len);
+    free(buf);
 }
 
 /* ФАЙЛ НЕ ОТСТАЁТ ОТ ПАМЯТИ ТАМ, ГДЕ ИЗ НЕГО ЧИТАЮТ (проверка на QEMU 98b7964, 2026-09-28).
@@ -286,6 +385,14 @@ void fakeip_state_flush(void) {
 static uint32_t *g_free;                 /* свободные адреса пула в порядке выдачи */
 static size_t g_free_n, g_free_i;
 static void fakeip_reclaim_try(time_t now);
+/* То же по сроку в цикле (proxy.c): запись идёт в фоне, цикл не ждёт носителя (I-534). Не вышло передать —
+ * таблица остаётся грязной, и срок придёт снова. */
+void fakeip_state_flush_async(void) {
+    if (!g_fakeip_dirty) return;
+    if (fakeip_state_rewrite_async() != 0) return;
+    g_fakeip_dirty = 0;
+    g_fakeip_last_rewrite = time(NULL);
+}
 
 /* Looks up domain's existing fake IP, or allocates the next free one and
  * persists it. Returns 0 and fills *out_addr (host order) on success; -1 if

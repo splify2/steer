@@ -26,6 +26,7 @@
 int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
     struct tr_link *l = ctx;
     if (l->plain) {
+        if (l->live) return outq_send(l->fd, &l->oq, d, n) == 0 ? 0 : TR_EIO;
         size_t sent = 0;
         while (sent < n) {
             /* send с MSG_NOSIGNAL, а не write: закрытый узлом сокет — отказ записи (EPIPE), а не
@@ -74,7 +75,26 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
     return tls13_read(&l->tls, d, cap, got);
 }
 
+void tr_link_live(struct tr_link *l) {
+    l->live = 1;
+    l->tls.live = 1;
+}
+
+size_t tr_link_pending(const struct tr_link *l) {
+    return outq_pending(l->plain ? &l->oq : &l->tls.oq);
+}
+
+int tr_link_flush(struct tr_link *l) {
+    if (l->fd < 0) return -1;
+    return l->plain ? outq_flush(l->fd, &l->oq) : outq_flush(l->tls.fd, &l->tls.oq);
+}
+
 void tr_link_close(struct tr_link *l) {
+    /* Последнее слово, без ожидания: ws шлёт при закрытии кадр close, и в живом режиме он мог остаться в
+     * очереди. Не ушёл — не страшно, закрытие сокета скажет то же. */
+    if (l->fd >= 0 && l->live && tr_link_pending(l)) (void)tr_link_flush(l);
+    outq_free(&l->oq);
+    l->live = 0;
     if (l->fd >= 0) close(l->fd);
     l->fd = -1;
     /* Контексты шифров живут в куче: без освобождения туннель за час работы утекает на
@@ -189,13 +209,28 @@ int transport_big_write(const struct transport *t) {
 }
 
 long transport_room(struct transport *t) {
-    if (!t->fr || !t->fr->room) return -1;
-    long r = t->fr->room(t);
-    /* Шифрование VLESS оборачивает каждую запись в запись AEAD: длина и метка. Берём запас, а не
-     * точную надбавку: она зависит от того, как данные разбиты на записи. */
-    if (t->enc) r -= r / 32 + 64;
-    return r > 0 ? r : 0;
+    long r = -1;
+    if (t->fr && t->fr->room) {
+        r = t->fr->room(t);
+        /* Шифрование VLESS оборачивает каждую запись в запись AEAD: длина и метка. Берём запас, а не
+         * точную надбавку: она зависит от того, как данные разбиты на записи. */
+        if (t->enc) r -= r / 32 + 64;
+        if (r < 0) r = 0;
+    }
+    /* Обратное давление живой записи (I-534): узел не успевает принимать — очередь связи растёт, и пока
+     * в ней TR_OUT_HIWAT байт и больше, новых данных клиента не берём. Окно клиента от этого сужается само
+     * (conn_room), а чтение его сокета ждёт события записи узла. */
+    size_t p = tr_link_pending(&t->link);
+    if (p) {
+        long cap = p >= TR_OUT_HIWAT ? 0 : (long)(TR_OUT_HIWAT - p);
+        if (r < 0 || cap < r) r = cap;
+    }
+    return r;
 }
+
+void transport_live(struct transport *t) { tr_link_live(&t->link); }
+size_t transport_out_pending(const struct transport *t) { return tr_link_pending(&t->link); }
+int transport_out_flush(struct transport *t) { return tr_link_flush(&t->link); }
 
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     *got = 0;

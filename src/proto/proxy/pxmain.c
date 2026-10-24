@@ -103,6 +103,13 @@ static void node_json(const struct px_node *n, int index, const struct node_excl
 
 /* exclude, exclude_name (proxy_cfg.excl): исключённые уходят из кандидатов, номера не сдвигаются.
  * Одна функция на подъём и на `proxy-probe`. */
+/* Проверка узла наперегонки (pool_race_first, I-535). Рукопожатие в мс несёт строка why. */
+static int px_race_probe(void *arg, int id, char *why, size_t n) {
+    int hs = 0;
+    int rc = px_probe(&((const struct px_node *)arg)[id], 8, why, n, &hs);
+    if (rc == 0) snprintf(why, n, "рукопожатие %d мс", hs);
+    return rc;
+}
 static size_t exclude_filter(const struct output *o, const struct px_node *nodes, int *sel, size_t n) {
     if (!o) return n;
     size_t k = 0;
@@ -237,6 +244,16 @@ static int px_pool_probe(const void *node, int timeout_s, char *why, size_t why_
 }
 static const char *px_pool_name(const void *node) { return ((const struct px_node *)node)->name; }
 
+static const char *g_race_out;
+static void px_race_start(void *arg, int id, size_t k, size_t n) {
+    (void)arg; (void)id;
+    px_probe_report(g_race_out, PROBE_RUNNING, (int)k, (int)n);
+    evline_emit("node", "n", EVLINE_INT, (long)k, "total", EVLINE_INT, (long)n, (const char *)NULL);
+}
+static void px_race_fail(void *arg, int id, const char *why) {
+    fprintf(stderr, LOG_I2 "%s — %s\n", ((const struct px_node *)arg)[id].name, why);
+}
+
 int cmd_proxy(const char *spec_path, const char *out_name) {
     evline_open();
     struct output *o = NULL;
@@ -280,18 +297,13 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
     int chosen = -1;
     if (out_proxy_node_named(o)) { chosen = sel[0]; probe_clear(out_name); }
     else {
-        for (size_t i = 0; i < sel_n; i++) {
-            char why[256];
-            int hs = 0;
-            px_probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)sel_n);
-            evline_emit("node", "n", EVLINE_INT, (long)(i + 1), "total", EVLINE_INT, (long)sel_n, (const char *)NULL);
-            if (px_probe(&nodes[sel[i]], 8, why, sizeof(why), &hs) == 0) {
-                fprintf(stderr, LOG_I2 "выбран %s (рукопожатие %d мс)\n", nodes[sel[i]].name, hs);
-                chosen = sel[i];
-                break;
-            }
-            fprintf(stderr, LOG_I2 "%s — %s\n", nodes[sel[i]].name, why);
-        }
+        /* Кандидаты — наперегонки (pool_race_first, I-535), как у VLESS. */
+        char why[256];
+        g_race_out = out_name;
+        struct pool_race pr = { .n = sel_n, .ids = sel, .probe = px_race_probe, .arg = nodes,
+                                .on_start = px_race_start, .on_fail = px_race_fail };
+        chosen = pool_race_first(&pr, why, sizeof why);
+        if (chosen >= 0) fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[chosen].name, why);
     }
     if (chosen < 0) {
         px_probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);

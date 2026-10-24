@@ -409,6 +409,43 @@ int main(void) {
         g_fakeip_next = 1;
         g_fakeip_live = NULL;
     }
+    /* ---- ФОНОВАЯ ПЕРЕЗАПИСЬ ФАЙЛА СОСТОЯНИЯ (I-534): цикл не ждёт fsync ---------------------------------
+     * fakeip_state_flush_async сериализует таблицу и отдаёт потоку; файл на месте после fakeip_state_wait, а
+     * флаг «грязно» снят сразу. Последний снимок побеждает: два подряд — в файле второй. */
+    {
+        char dirt[] = "/tmp/dnsmatch-fakeip-XXXXXX";
+        char path[128];
+        if (!mkdtemp(dirt)) { perror("mkdtemp"); return 1; }
+        snprintf(path, sizeof(path), "%s/fakeip.state", dirt);
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        g_fakeip_next = 0;
+        g_fakeip_state_path = NULL;
+        uint32_t aa = 0;
+        fakeip_lookup_or_alloc("bg-one.test", &aa);
+        fakeip_lookup_or_alloc("bg-two.test", &aa);
+        g_fakeip_state_path = path;
+        g_fakeip_dirty = 1;
+        fakeip_state_flush_async();
+        check("фон: флаг «грязно» снят сразу после передачи потоку", 0, g_fakeip_dirty);
+        fakeip_lookup_or_alloc("bg-three.test", &aa);
+        g_fakeip_dirty = 1;
+        fakeip_state_flush_async();
+        fakeip_state_wait();
+        char all[2048] = {0};
+        FILE *rf = fopen(path, "r");
+        size_t got = rf ? fread(all, 1, sizeof(all) - 1, rf) : 0;
+        if (rf) fclose(rf);
+        check("фон: файл записан потоком, в нём все три домена (последний снимок)", 1,
+              got > 0 && strstr(all, "bg-one.test") && strstr(all, "bg-two.test") && strstr(all, "bg-three.test"));
+        char tmp[160];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        check("фон: временного файла не осталось", 1, access(tmp, F_OK) != 0);
+        unlink(path);
+        rmdir(dirt);
+        g_fakeip_state_path = NULL;
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        g_fakeip_next = 0;
+    }
 
     /* ---- ГИБРИДНЫЙ СПИСОК: адреса и имена в одном файле -------------------------
      *
