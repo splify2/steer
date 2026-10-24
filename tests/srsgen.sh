@@ -246,6 +246,26 @@ EOF
     check "… и сказано почему" yes "$(has "$(cat "$tmp/big.err")" 'элементов 17001 (больше 16384)')"
 fi
 
+# ---- 9. больше прежних пределов: 300 разных сужений в одном составном наборе ------------------
+# Было: 64 сужения (остальные «не вошли»), 33 ящика на отрезок, 256 сужений в нумерации имён.
+python3 - "$tmp/many.json" <<'PY'
+import json, sys
+rules = [{"ip_cidr": ["198.51.100.0/24"], "network": ["udp"], "port": [20000 + 2 * i]}
+         for i in range(300)]
+json.dump({"rules": rules}, open(sys.argv[1], "w"))
+PY
+python3 "$FIX/mksrs.py" "$tmp/many.json" "$tmp/many.srs"
+run many env STEER_NFT_CONCAT=1 <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"], $OUT,
+  "channels": [ { "name": "many", "match": { "srs_file": "TMP/many.srs" }, "out": "vpn" } ] }
+EOF
+check "300 сужений: принят" 0 "$rc"
+M="$(cat "$tmp/many.nft")"
+check "… первый порт на месте" yes "$(has "$M" '198.51.100.0/24 . 17 . 20000')"
+check "… последний порт на месте" yes "$(has "$M" '198.51.100.0/24 . 17 . 20598')"
+check "… все 300 ящиков" 300 "$(printf '%s' "$M" | grep -o '198.51.100.0/24 \. 17 \. ' | wc -l)"
+check "… без жалоб на пределы" "" "$(grep -E 'больше 64|не вошли' "$tmp/many.err")"
+
 printf '\nsrsgen: %d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\n'

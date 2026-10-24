@@ -159,13 +159,20 @@ static const struct l4match *rule_l4(const struct spec *sp, size_t i) {
 }
 
 /* Различные сужения клауз наборов, которых нет среди сужений правил, — в порядке появления. */
-struct l4seen { const struct spec *sp; struct l4match *v; size_t n; };
+struct l4seen { const struct spec *sp; struct l4match *v; size_t n, cap; };
 static void l4seen_add(void *ctx, const struct l4match *m) {
     struct l4seen *c = ctx;
     for (size_t i = 0; i < c->sp->rule_n; i++)
         if (!l4match_empty(rule_l4(c->sp, i)) && l4match_same(rule_l4(c->sp, i), m)) return;
     for (size_t k = 0; k < c->n; k++) if (l4match_same(&c->v[k], m)) return;
-    if (c->n < 256) c->v[c->n++] = *m;
+    if (c->n == c->cap) {
+        size_t cap = c->cap ? c->cap * 2 : 64;
+        struct l4match *v = realloc(c->v, cap * sizeof(*v));
+        if (!v) return;             /* нет памяти: сужение не нумеруется, ниже вернётся «ничьё» число */
+        c->v = v;
+        c->cap = cap;
+    }
+    c->v[c->n++] = *m;
 }
 
 static int l4_disc(const struct spec *sp, const struct l4match *m) {
@@ -185,14 +192,14 @@ static int l4_disc(const struct spec *sp, const struct l4match *m) {
      * src/model/srsplan.c). Такие нумеруются ПОСЛЕ сужений каналов, в порядке каналов, файлов и
      * клауз: номера каналов тогда не сдвигаются от того, что в спеке появился набор, и имена
      * наборов у прежних каналов — а от них зависит перенос счётчиков — остаются прежними. */
-    static struct l4match seen[256];
-    struct l4seen c = { sp, seen, 0 };
+    struct l4seen c = { sp, NULL, 0, 0 };
     for (size_t i = 0; i < sp->rule_n; i++) {
         const struct spec_list *l = rule_list(sp, &sp->rule[i]);
         if (l->srs_n) srs_list_l4_each(l, l4seen_add, &c);
     }
     for (size_t k = 0; k < c.n; k++)
-        if (l4match_same(&seen[k], m)) return idx + 1 + (int)k;
+        if (l4match_same(&c.v[k], m)) { free(c.v); return idx + 1 + (int)k; }
+    free(c.v);
     /* Недостижимо: сужение приходит из спеки или её наборов. Возвращать здесь нуль значило бы
      * отдать имя без суффикса, то есть ровно то слияние наборов, от которого функция и
      * заведена, — поэтому число, которого ни у кого нет. */
