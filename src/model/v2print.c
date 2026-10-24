@@ -630,6 +630,8 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
                 }
             }
             if (ru->quic_block) fs(&w, "quic", "block");
+            if (ru->family) fs(&w, "family", ru->family == 4 ? "4" : "6");
+            if (ru->fam_block) fs(&w, "on_family_unavailable", "block");
             if (ru->dev_scope) fs(&w, "scope", "device");
             if (ru->disabled) { fk(&w, "enabled"); fputs("false", f); }
             fputs(" }\n", f);

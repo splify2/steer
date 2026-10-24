@@ -407,6 +407,8 @@ chm_t dch_fakeip_only(chm_t mask);
  * ответом. Все, а не первый: канал без IPv6 среди совпавших не забрал бы поддельный IPv6 своих
  * клиентов, и их соединение ушло бы мимо его выхода. Пустой mask — 0. */
 int dch_all_v6(chm_t mask);
+/* Ни у одного канала из mask нет IPv4 (DCH_V4): A такого имени — пустой ответ. Пустой mask — 0. */
+int dch_none_v4(chm_t mask);
 void dch_build(const struct spec *sp);
 void dch_sig_write(void);
 

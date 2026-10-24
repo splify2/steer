@@ -594,9 +594,15 @@ static int from_loopback(const struct sockaddr_storage *a) {
 
 static chm_t match_for(const char *qname, uint16_t qtype) {
     chm_t m = dch_match_mask(qname);
-    if (qtype == DNS_TYPE_A && m)
+    if (qtype == DNS_TYPE_A && m) {
+        /* Канал «только IPv6» (family: 6 у правила) A не забирает; но если все каналы имени такие,
+         * маску не сужаем: имя под правилом и A его — пустой ответ (dch_none_v4), а не настоящий
+         * адрес мимо правила. */
+        chm_t k = m;
         for (size_t i = 0; i < g_dch_n; i++)
-            if (!(g_dch[i].fam & DCH_V4) && chm_has(m, i)) m = chm_andn(m, chm_one(i));
+            if (!(g_dch[i].fam & DCH_V4) && chm_has(k, i)) k = chm_andn(k, chm_one(i));
+        if (k) m = k;
+    }
     return m;
 }
 
@@ -740,7 +746,8 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
         }
         /* AAAA имени под правилом без половины IPv6 (хоть один совпавший канал без DCH_V6) —
          * пустой ответ в любом режиме: клиент с двумя стеками сразу идёт по IPv4. */
-        int aaaa_empty = hit >= 0 && qtype == DNS_TYPE_AAAA && !dch_all_v6(sets);
+        int aaaa_empty = hit >= 0 && ((qtype == DNS_TYPE_AAAA && !dch_all_v6(sets)) ||
+                                      (qtype == DNS_TYPE_A && dch_none_v4(sets)));
         if (hit >= 0 && (aaaa_empty || (!g_dch[hit].realip &&
                                         (qtype == DNS_TYPE_HTTPS || qtype == DNS_TYPE_SVCB)))) {
             /* Подавление — свойство правила, а не данных из ответа: NODATA
@@ -1145,7 +1152,8 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
      *   carries ECH keys and ALPN tied to the real endpoint, and a browser that finds no
      *   HTTPS record simply falls back to A/AAAA — which we already answer correctly. */
     if (qtype == DNS_TYPE_HTTPS || qtype == DNS_TYPE_SVCB ||
-        (qtype == DNS_TYPE_AAAA && !dch_all_v6(sets))) {
+        (qtype == DNS_TYPE_AAAA && !dch_all_v6(sets)) ||
+        (qtype == DNS_TYPE_A && dch_none_v4(sets))) {
         if (!quiet) {
             uint8_t out[512];
             size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);

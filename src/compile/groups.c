@@ -96,6 +96,7 @@ static struct group *group_new(struct groups *gr, struct err *e) {
     }
     struct group *g = &gr->g[gr->n++];
     memset(g, 0, sizeof(*g));
+    g->fam = 3;
     return g;
 }
 
@@ -173,6 +174,7 @@ static int add_srs_channel(const struct spec *sp, struct groups *gr, const struc
                 if (h->composite != composite) continue;
                 if (domains && h->domains && h->realip != c->realip) continue;
                 if (!same_from(sp, c, h)) continue;
+                if (h->famreq != c->family || h->famblk != c->fam_block) continue;
                 if (!composite && !l4match_same(h->l4, l4)) continue;
                 g = h;
             }
@@ -180,6 +182,8 @@ static int add_srs_channel(const struct spec *sp, struct groups *gr, const struc
             g = group_new(gr, e);
             if (!g) return -1;
             g->out = out;
+            g->famreq = c->family;
+            g->famblk = c->fam_block;
             g->realip = c->realip;
             g->from = from;
             g->from_n = from_n;
@@ -208,6 +212,7 @@ static int add_srs_channel(const struct spec *sp, struct groups *gr, const struc
                 group_set_name(sp, g->name, sizeof(g->name), g->out, domains ? "dom" : "ip",
                                from, from_n, c->realip, l4);
             }
+            set_name_famtag(g->name, sizeof(g->name), rule_famtag(c));
         }
         if (domains) {
             if (!g->domains) g->realip = c->realip;
@@ -267,6 +272,9 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
              * Разделение по виду было следствием запрета смешивать, а не требованием ядра. */
             if (domains && g->domains && g->realip != c->realip) continue;
             if (!same_from(sp, c, g)) continue;
+            /* Политика семейства IP — тоже ключ: «только IPv4» и «оба» — разные половины набора и
+             * разные правила (R-154), слить их значило бы дать одним клиентам политику других. */
+            if (g->famreq != c->family || g->famblk != c->fam_block) continue;
             /* СУЖЕНИЕ ПО ПРОТОКОЛУ И ПОРТАМ РАЗДЕЛЯЕТ ГРУППЫ так же, как выход и клиенты.
              *
              * Слить их было бы молчаливой потерей смысла в обе стороны сразу: набор у группы
@@ -283,6 +291,8 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
             struct group *g = group_new(gr, e);
             if (!g) return -1;
             g->out = out;
+            g->famreq = c->family;
+            g->famblk = c->fam_block;
             g->domains = 0;
             g->all = all;
             g->realip = c->realip;
@@ -294,6 +304,7 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
              * (он вычисляет имя сам, той же функцией group_set_name). */
             group_set_name(sp, g->name, sizeof(g->name), g->out, all ? "all" : domains ? "dom" : "ip",
                            g->from, g->from_n, g->realip, g->l4);
+            set_name_famtag(g->name, sizeof(g->name), fam_tag_of(g->famreq, g->famblk));
         }
         struct group *g = &gr->g[k];
         /* Домены только помечаем: их файлы читает резолвер. Режим берём у первого доменного
@@ -312,6 +323,17 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
      * набора нет вовсе. */
     for (size_t i = 0; i < gr->n; i++) {
         struct group *g = &gr->g[i];
+        /* Половины по политике семейства (R-154) — у каждой группы, и у «весь трафик» тоже: ей
+         * нужно знать, оставлять ли правилу IPv4 или IPv6 и отвергать ли IPv6 клиентов. Тем же
+         * решением, что у резолвера (dom6_ok): набор «весь трафик» и адресный от nat не зависят,
+         * поэтому для них раскладка nat не спрашивается (realip=1). */
+        {
+            const struct output *fo = out_by_name(sp, g->out);
+            int v6 = fo && dom6_ok(sp, fo, g->from, g->from_n, g->domains ? g->realip : 1,
+                                   g_nftc);
+            struct spec_rule fr = { .family = g->famreq, .fam_block = g->famblk };
+            g->fam = rule_fam_eff(&fr, v6, &g->blocked);
+        }
         if (!g->files_n && !g->srs_n && !g->domains) continue;
         /* Доп. группа названа при заведении — её «кому» бывает UID приложений, а имя считается
          * по «кому» канала; дописываться в неё некому. */
@@ -322,10 +344,11 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
         else
             group_set_name(sp, g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
                            g->from, g->from_n, g->realip, g->l4);
+        set_name_famtag(g->name, sizeof(g->name), fam_tag_of(g->famreq, g->famblk));
         /* Половина IPv6 доменной группы — тем же решением, что у резолвера (dom6_ok): он
          * кладёт адреса в «<имя>6», только если у группы есть набор и правило IPv6. */
         const struct output *o = out_by_name(sp, g->out);
-        g->dom6 = g->domains && o && dom6_ok(sp, o, g->from, g->from_n, g->realip, g_nftc);
+        g->dom6 = g->domains && o && (g->fam & 2) && dom6_ok(sp, o, g->from, g->from_n, g->realip, g_nftc);
     }
     /* Страховка, а не проверка входа: имя обязано быть уникальным по построению, и если
      * оно всё-таки повторилось — значит различитель не различил (например, два имени

@@ -234,6 +234,11 @@ static int twin_clash(const struct spec *sp, const char *out, int cd, int pd) {
     return 0;
 }
 
+void set_name_famtag(char *name, size_t n, char tag) {
+    size_t l = strlen(name);
+    if (tag && l + 1 < n) { name[l] = tag; name[l + 1] = '\0'; }
+}
+
 /* Часть имени выхода в составном имени (набор nftables, устройство): не длиннее width. Имя, которое
  * влезает, идёт как есть — от имени набора зависит перенос счётчиков (counter_find), и короткие
  * имена меняться не должны. Длинное — начало и шесть шестнадцатеричных знаков FNV-1a полного
