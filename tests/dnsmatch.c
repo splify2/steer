@@ -563,6 +563,22 @@ int main(void) {
 
                 check("формат таблицы: разбор принял текст", 0,
                       tabfmt_parse(text, textlen));
+                /* Приёмник из трубы: та же таблица кусками по 7 байт — собирается ровно на последнем,
+                 * а досмотр строк идёт с места остановки (tabfmt_feed), а не с начала. */
+                {
+                    struct tabfmt_feed fd = {0};
+                    int done = -1, early = 0;
+                    for (size_t o = 0; o < textlen; o += 7) {
+                        size_t cn = textlen - o < 7 ? textlen - o : 7;
+                        int fr = tabfmt_feed(&fd, text + o, cn);
+                        if (fr == 1 && o + cn < textlen) early = 1;
+                        if (fr == 1) done = 1;
+                        if (fr < 0) done = -2;
+                    }
+                    check("приёмник таблицы: кусками по 7 байт собралась целиком, не раньше конца", 1,
+                          done == 1 && !early && fd.len == 0);
+                    free(fd.buf);
+                }
                 check("формат таблицы: то же число каналов после разбора",
                       (int)snap_n, (int)g_dch_n);
                 for (size_t i = 0; i < snap_n && i < g_dch_n; i++) {

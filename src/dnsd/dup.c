@@ -110,7 +110,7 @@ static int dup_conn_limit(void) {
     if (lim) return lim;
     struct rlimit rl;
     long v = 1024;
-    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) v = (long)rl.rlim_cur;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) v = rl.rlim_cur == RLIM_INFINITY ? 262144 : (long)rl.rlim_cur;
     v /= 4;
     lim = v < 3 ? 3 : v > 65536 ? 65536 : (int)v;
     return lim;
@@ -163,10 +163,20 @@ static size_t g_dups_cap;
 /* Вопросы в полёте — блоками по DUP_REQ_BLOCK: адрес вопроса стабилен (его держат вызовы
  * обратной связи), рост — новый блок. */
 static struct dreq **g_reqb;
-int g_req_cap;                      /* dupint.h */
-               /* всего мест: кратно DUP_REQ_BLOCK */
+int g_req_cap;                      /* dupint.h: всего мест, кратно DUP_REQ_BLOCK */
+/* Верхняя граница занятых мест: все занятые — ниже g_req_hi (проходы по вопросам идут до неё, а
+ * не до пика за всё время работы), а новый вопрос берёт самое нижнее свободное (g_req_free — с
+ * него и ищем), поэтому граница держится у числа вопросов в полёте. */
+static int g_req_hi, g_req_free;
 struct dreq *req_ref(int k) { return &g_reqb[k / DUP_REQ_BLOCK][k % DUP_REQ_BLOCK]; }
 #define RQ(k) (*req_ref(k))
+/* Занятое место освободить: номер в апстриме снова свободен, границы подтянуть. */
+static void req_release(struct dreq *r) {
+    if (r->up && r->up->wid_used) r->up->wid_used[r->wid >> 3] &= (uint8_t)~(1u << (r->wid & 7));
+    r->used = 0;
+    if (r->slot < g_req_free) g_req_free = r->slot;
+    while (g_req_hi > 0 && !RQ(g_req_hi - 1).used) g_req_hi--;
+}
 static int req_grow(void) {
     struct dreq **nb = realloc(g_reqb, (size_t)(g_req_cap / DUP_REQ_BLOCK + 1) * sizeof(*nb));
     if (!nb) return -1;
@@ -280,7 +290,7 @@ static void req_finish(struct dreq *r, uint8_t *ans, size_t n) {
     }
     uint8_t *rx = r->rx;            /* ans при DoQ и DoH/h2 лежит внутри него: освободить после обратного вызова */
     r->rx = NULL;
-    r->used = 0;
+    req_release(r);
     if (ans) {
         ans[0] = (uint8_t)(r->oid >> 8);
         ans[1] = (uint8_t)r->oid;
@@ -345,7 +355,7 @@ static void conn_close(struct dconn *c, const char *why) {
     c->hbn = 0;
     conn_free_bufs(c);
     int had = 0;
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used || r->up != up || r->ci != i) continue;
         had = 1;
@@ -542,13 +552,13 @@ static int up_want_conns(const struct dup *up) {
     /* DoH по http/1.1: по соединению на ожидающий вопрос, но не больше предела дескрипторов (dup_conn_limit),
      * и уже идущие не считаются. */
     int waiting = 0, lim = dup_conn_limit();
-    for (int k = 0; k < g_req_cap; k++)
+    for (int k = 0; k < g_req_hi; k++)
         if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) waiting++;
     return waiting > lim ? lim : (waiting ? waiting : 1);
 }
 
 static void fail_waiting(struct dup *up) {
-    for (int k = 0; k < g_req_cap; k++)
+    for (int k = 0; k < g_req_hi; k++)
         if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) req_finish(&RQ(k), NULL, 0);
 }
 
@@ -759,7 +769,7 @@ static void q_on_early_rej(void *u) { ((struct dconn *)u)->qerej = 1; }
 static void q_on_data(void *u, int64_t sid, const uint8_t *d, size_t n, int fin) {
     struct dconn *c = u;
     struct dup *up = c->up;
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used || r->up != up || r->ci != cidx(c) || r->sid != sid) continue;
         /* Потолок буфера ответа — формат: длина сообщения 16 бит, значит кадр не больше 2 + 65535
@@ -787,7 +797,7 @@ static void q_on_data(void *u, int64_t sid, const uint8_t *d, size_t n, int fin)
 
 static void q_on_sclose(void *u, int64_t sid, uint64_t app_err) {
     struct dconn *c = u;
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used || r->up != c->up || r->ci != cidx(c) || r->sid != sid) continue;
         r->rxfin = 1;
@@ -807,7 +817,7 @@ static void q_on_closed(void *u, int reason, const char *why) {
  * обратных вызовов (см. struct dconn). */
 static void quic_reap(struct dconn *c) {
     struct dup *up = c->up;
-    for (int k = 0; k < g_req_cap && c->qc; k++) {
+    for (int k = 0; k < g_req_hi && c->qc; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used || r->up != up || r->ci != cidx(c) || r->sid < 0) continue;
         const uint8_t *m = NULL;
@@ -879,7 +889,7 @@ static void quic_after(struct dconn *c) {
              * уходят заново на этом же соединении, ставшем готовым; попытка не тратится, это не сбой
              * вопроса. Ответа на них не будет, поэтому ждать его нельзя. */
             int i = cidx(c);
-            for (int k = 0; k < g_req_cap; k++) {
+            for (int k = 0; k < g_req_hi; k++) {
                 struct dreq *r = &RQ(k);
                 if (!r->used || r->up != up || r->ci != i) continue;
                 r->ci = -1;
@@ -1051,7 +1061,7 @@ static struct dconn *pick_conn(struct dup *up) {
 }
 
 static void up_kick(struct dup *up) {
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used || r->up != up || r->ci != -1) continue;
         struct dconn *c = pick_conn(up);
@@ -1069,7 +1079,7 @@ static void up_kick(struct dup *up) {
         else if (c->qc && c->qclosed) { quic_after(c); k = -1; }  /* соединение умерло при отправке */
     }
     int waiting = 0;
-    for (int k = 0; k < g_req_cap; k++) if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) waiting++;
+    for (int k = 0; k < g_req_hi; k++) if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) waiting++;
     if (!waiting) return;
     /* Соединение есть, вопросы ждут потоков, а не второго соединения (DoQ; DoH по h2). */
     if ((quic_proto(up) || (up->cfg.u.proto == DNSP_DOH && up->hproto == 2)) && pick_conn(up)) return;
@@ -1087,7 +1097,7 @@ static void up_kick(struct dup *up) {
 /* ---- чтение ---------------------------------------------------------------------------------- */
 
 static struct dreq *find_by_wid(struct dup *up, int ci, uint16_t wid) {
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (r->used && r->up == up && r->ci == ci && r->wid == wid) return r;
     }
@@ -1222,7 +1232,7 @@ static void h2_rst(struct dconn *c, uint32_t sid, uint32_t code) {
 }
 
 static struct dreq *find_by_sid(struct dup *up, int ci, uint32_t sid) {
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (r->used && r->up == up && r->ci == ci && r->sid == (int64_t)sid) return r;
     }
@@ -1346,7 +1356,7 @@ static int h2_frames(struct dconn *c) {
             c->h2_go = 1;
             /* Потоки за last_stream_id сервер не обрабатывал: их вопросы уходят на новое соединение,
              * попытка не считается. Остальные дорабатывают на этом. */
-            for (int k = 0; k < g_req_cap; k++) {
+            for (int k = 0; k < g_req_hi; k++) {
                 struct dreq *r = &RQ(k);
                 if (r->used && r->up == up && r->ci == cidx(c) && r->sid > (int64_t)last) h2_requeue(c, r);
             }
@@ -1622,13 +1632,13 @@ static void up_retire(struct dup *up) {
         if (c->dial) { c->dial->cancel = 1; c->dial = NULL; }
         if (c->st != CS_FREE && c->st != CS_DIAL) {
             /* Вопросы без повтора: апстрима больше нет. */
-            for (int k = 0; k < g_req_cap; k++)
+            for (int k = 0; k < g_req_hi; k++)
                 if (RQ(k).used && RQ(k).up == up && RQ(k).ci == i) RQ(k).tries = 2;
             conn_close(c, NULL);
         }
         c->st = CS_FREE;
     }
-    for (int k = 0; k < g_req_cap; k++)
+    for (int k = 0; k < g_req_hi; k++)
         if (RQ(k).used && RQ(k).up == up) req_finish(&RQ(k), NULL, 0);
     if (up->ufd >= 0) {
         epoll_ctl(g_epfd, EPOLL_CTL_DEL, up->ufd, NULL);
@@ -1682,6 +1692,8 @@ void dup_apply(const struct dup_cfg *c, size_t n) {
             g_store[g_store_n++] = up;
         }
         unsigned gen = up->gen;
+        uint8_t *keepw = up->wid_used;          /* карта номеров вопросов — тоже; без вопросов она пуста */
+        if (keepw) memset(keepw, 0, 8192);
         struct dconn **keepc = up->c;           /* соединения (их блоки) переживают переназначение */
         int keep_n = up->c_n, keep_cap = up->c_cap;
         free(up->ips_own);                      /* личные копии адресов прежней настройки */
@@ -1689,6 +1701,7 @@ void dup_apply(const struct dup_cfg *c, size_t n) {
         free(up->gm_own);                       /* и номеров членов группы, их паузы */
         free(up->gp);
         memset(up, 0, sizeof(*up));
+        up->wid_used = keepw;
         up->c = keepc;
         up->c_n = keep_n;
         up->c_cap = keep_cap;
@@ -1777,7 +1790,7 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
         return -1;
     }
     struct dreq *r = NULL;
-    for (int k = 0; k < g_req_cap; k++) if (!RQ(k).used) { r = &RQ(k); break; }
+    for (int k = g_req_free; k < g_req_cap; k++) if (!RQ(k).used) { r = &RQ(k); break; }
     if (!r) {
         /* Мест нет — новый блок; растёт до нехватки памяти, а число вопросов в полёте держит
          * очередь ожидающих резолвера (MAX_PENDING). */
@@ -1788,6 +1801,8 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
     int slot = r->slot;
     memset(r, 0, offsetof(struct dreq, q));
     r->slot = slot;
+    g_req_free = slot + 1;
+    if (slot >= g_req_hi) g_req_hi = slot + 1;
     r->sid = -1;                                        /* DoQ: поток ещё не открыт */
     memcpy(r->q, q, n);
     r->qn = (uint16_t)n;
@@ -1795,13 +1810,15 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
     r->up = up;
     r->up_gen = up->gen;
     r->oid = (uint16_t)((q[0] << 8) | q[1]);
-    for (;;) {                                          /* номер, не занятый другим вопросом апстрима */
+    /* Номер, не занятый другим вопросом апстрима: занятые помнит битовая карта на 65536 номеров —
+     * 8 КиБ на апстрим вместо прохода по всем вопросам на каждый новый. */
+    if (!up->wid_used) up->wid_used = calloc(8192, 1);
+    for (int tries = 0;; tries++) {
         r->wid = up->next_id++;
-        int taken = 0;
-        for (int k = 0; k < g_req_cap; k++)
-            if (&RQ(k) != r && RQ(k).used && RQ(k).up == up && RQ(k).wid == r->wid) taken = 1;
-        if (!taken) break;
+        if (!up->wid_used || !(up->wid_used[r->wid >> 3] & (1u << (r->wid & 7)))) break;
+        if (tries >= 65536) break;                      /* заняты все 65536 — невозможно: вопросов меньше */
     }
+    if (up->wid_used) up->wid_used[r->wid >> 3] |= (uint8_t)(1u << (r->wid & 7));
     r->q[0] = (uint8_t)(r->wid >> 8);
     r->q[1] = (uint8_t)r->wid;
     r->cb = cb;
@@ -1813,13 +1830,13 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
         r->ci = -2;
         if (udp_send(up, r) != 0) {
             up_err(up, "UDP: %s", strerror(errno));
-            r->used = 0;
+            req_release(r);
             return -1;
         }
         return 0;
     }
     if (now_ms() < up->retry_at_ms && !pick_conn(up)) {
-        r->used = 0;
+        req_release(r);
         return -1;                                     /* пауза после неудачи: отказ сразу */
     }
     up_kick(up);
@@ -1857,7 +1874,7 @@ int dup_event(void *ptr, uint32_t evs) {
 
 void dup_tick(void) {
     long now = now_ms();
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used) continue;
         struct dup *up = r->up;
@@ -1930,7 +1947,7 @@ void dup_tick(void) {
 
 int dup_wait_ms(void) {
     long now = now_ms(), best = grp_deadline();
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         if (!RQ(k).used) continue;
         long t = RQ(k).deadline;
         if (RQ(k).ci == -2 && RQ(k).tries == 0 && RQ(k).t0 + DUP_UDP_RETRY_MS < t)
@@ -1965,7 +1982,7 @@ int dup_wait_ms(void) {
 }
 
 int dup_busy(void) {
-    for (int k = 0; k < g_req_cap; k++) if (RQ(k).used) return 1;
+    for (int k = 0; k < g_req_hi; k++) if (RQ(k).used) return 1;
     return grp_busy();
 }
 
@@ -2011,7 +2028,7 @@ void dup_render(FILE *f) {
         const struct dup *up = g_dups[i];
         int conns = 0, queued = 0;
         for (int k = 0; k < up->c_n; k++) conns += CN(up, k)->st == CS_READY;
-        for (int k = 0; k < g_req_cap; k++) queued += RQ(k).used && RQ(k).up == up;
+        for (int k = 0; k < g_req_hi; k++) queued += RQ(k).used && RQ(k).up == up;
         if (up->cfg.grp) {
             /* Группа серверов: свои поля (dupgrp.c), имя и пустой url — как у сервера. */
             fprintf(f, "%s{\"name\":\"%s\",\"url\":\"\",", i ? "," : "", up->cfg.u.name);
