@@ -209,7 +209,8 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
 #                  годность): половина разбора sub.c, которую с ним делит модуль steer-proxy
 #                  (trojan://, vmess://), — в libsteer, как и сам транспорт.
 SUBLINK_SRC := src/proto/vless/sublink.c
-STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/pool.c
+STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/pool.c src/tunnel/geo.c \
+             src/proto/warp/wbhttps.c src/proto/warp/wbjson.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/tls/ech.c src/proto/transport/trgrpc.c \
                  src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c \
@@ -302,11 +303,12 @@ PROXY_MOD_SRC := src/proto/proxy/pxwire.c src/proto/proxy/pxsub.c src/proto/prox
 # WARP (модуль steer-warpbox, docs/warp.md): регистрация, подбор точек и замена для группы `kind: warp`.
 # Записи вида нет — группа своя (kinds/group.c), члены — обычные awg; модуль — свой бинарник на
 # libsteer.so, как hysteria2, и тоже не в статических профилях: телефону — позже, вместе с MASQUE.
-# HTTPS — wbhttps.c (TLS 1.3 libsteer), JSON по пути — wbjson.c, регистрация — wbreg.c, файл туннеля и
+# HTTPS — wbhttps.c (TLS 1.3 libsteer) и JSON по пути — wbjson.c живут в libsteer (STACK_SRC): их же зовёт
+# проверка страны выхода туннелей (src/tunnel/geo.c); модуль берёт их оттуда. Регистрация — wbreg.c, файл туннеля и
 # маски I1 — wbconf.c, пространство сети подбора — wbns.c, эхо-запросы — wbping.c, подбор — wbscan.c,
 # сертификат клиента MASQUE и ключ сервера — wbx509.c, туннель MASQUE (QUIC, HTTP/3 CONNECT-IP, TUN) —
 # wbmq.c, команды и сторож — wbmain.c.
-WARP_MOD_SRC := src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/warp/wbreg.c src/proto/warp/wbconf.c \
+WARP_MOD_SRC := src/proto/warp/wbreg.c src/proto/warp/wbconf.c \
                 src/proto/warp/wbns.c src/proto/warp/wbping.c src/proto/warp/wbscan.c src/proto/warp/wbx509.c \
                 src/proto/warp/wbmq.c src/proto/warp/wbmain.c
 LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC) $(SUBLINK_SRC) \

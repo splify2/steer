@@ -57,6 +57,7 @@ LIBSTEER_1 {
     fakeip6_to4;
     from_is_local;
     from_uid_range;
+    geo_trace;
     group_balance_slots;
     group_bal_chain;
     group_bal_map;
@@ -366,6 +367,10 @@ LIBSTEER_1 {
     urltest_url_parse;
     vless_insecure;
     vless_set_insecure;
+    wb_http_split;
+    wb_https;
+    wb_json_get;
+    wb_resp_free;
     x25519_shared_ext;
     xc_cpu_has_aes;
     xc_random;

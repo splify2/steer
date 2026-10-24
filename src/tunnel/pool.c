@@ -73,6 +73,18 @@
  * обрывы прежнего узла новому не приписываются (match, seen, lost).
  * Замена мёртвого узла берёт кандидатов по последнему замеру (быстрые первыми, без замера — по
  * порядку, не ответившие — последними).
+ *
+ * ОЦЕНКА УЗЛА — НЕ ОДИН ЗАМЕР. Узел мерится PL_LAT_SAMPLES раз, все пробы круга идут разом (потоков
+ * PL_LAT_PAR на каждую пробу), поэтому круг по времени прежний: самая долгая проба — те же восемь
+ * секунд. Из ответивших считаются среднее, джиттер (среднее отклонение от среднего) и доля потерь, а
+ * оценка — среднее + 2 · джиттер + 1000 мс · доля потерь (latscore.h, docs/spec-v2.md). Допуск
+ * `tolerance` — в единицах оценки. Узел, не ответивший ни разу, — мёртв (-1), как прежде.
+ *
+ * СТРАНА УЗЛА. В файл состояния — заявленная страна первого активного узла (флаг в имени, поле
+ * node_cc) и, после проверки выхода (geo.c), фактическая (geo_cc). Проверка — один запрос через
+ * устройство туннеля на подъём и на смену узла, поток pl_geo_thread; у пула с несколькими
+ * активными узлами её нет: запрос ушёл бы на любой из них. Эти поля читает сторож групп
+ * (daemon/fogroup.c) для only и exclude группы.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -90,6 +102,13 @@
 #include "platform.h"
 #include "transport.h"
 #include "thrstack.h"
+#include "nodesel.h"
+#include "geo.h"
+#include "latscore.h"
+
+/* geo.c — только там, где есть TLS (libsteer, телефон): стенды пула без него собираются, и проверки
+ * страны у них нет. */
+int geo_trace(const char *dev, char cc[3], char *why, size_t wn) __attribute__((weak));
 
 #define PL_LOG_W "steer[warn]: "
 #define PL_LOG_I "steer[info]: "
@@ -105,8 +124,12 @@
 /* Обрыв соединения зовёт проверку не чаще, чем раз в столько: обрывы приходят пачкой (все соединения
  * умершего узла рвутся по одному сроку), а проверке хватает одной. */
 #define PL_LOST_GAP_MS 5000
-/* pick: latency — проверок кандидатов разом. */
+/* pick: latency — проверок кандидатов разом (на каждую пробу круга) и проб на узел за круг (latscore.h). */
 #define PL_LAT_PAR     4
+#define PL_LAT_SAMPLES LAT_SAMPLES
+/* Повтор проверки страны после неудачи, с (переменная — стенд ставит ноль). */
+#define PL_GEO_RETRY_S 20
+static int g_geo_retry_s = PL_GEO_RETRY_S;
 
 /* Шапка сессии пула; за ней, с отступом PL_HDR, — сессия протокола. */
 struct pl_sess {
@@ -150,13 +173,21 @@ static struct {
     char why[256];              /* причина последней неудачной проверки — для down */
     char dev[16];
     char sig[512];              /* последний опубликованный состав — писать только на перемене */
-    int *lat;                   /* pick: latency — последний замер узла, мс; -1 не ответил, -2 не мерили */
+    int *lat;                   /* pick: latency — оценка узла по последнему кругу, мс; -1 не ответил, -2 не мерили */
+    int *smp;                   /* пробы круга: lat_n * PL_LAT_SAMPLES, мс; -1 — проба не прошла */
+    struct pl_lstat { int ms, jitter, loss; } *lst;    /* среднее, джиттер (мс) и потери (%) узла */
     size_t lat_n;               /* по индексу узла: наибольший кандидат + 1 */
     size_t lat_next;            /* следующий кандидат замера (sel) — общий для потоков замера */
     unsigned *dead_at;          /* по индексу узла (lat_n): счёт deaths, когда узел признан мёртвым */
     unsigned deaths;            /* смертей узлов всего */
     unsigned lat_round;         /* кругов замера: файл состояния переписывается и по ним */
     unsigned sig_round;         /* круг замера, уже записанный в файл */
+    /* Проверка страны выхода (geo.c): для какого узла сделана и что вышло. */
+    int geo_busy;               /* поток проверки жив */
+    int geo_node;               /* узел, для которого результат; -1 — нет */
+    int geo_state;              /* 0 — нет, 1 — страна получена, 2 — не вышло */
+    char geo_cc[3];
+    unsigned geo_ver, sig_geo;  /* результат менялся / уже записан в файл */
 } g_pl = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 static const void *pl_node(int i) {
@@ -259,6 +290,13 @@ static void pl_down_event(const char *why) {
     evline_emit("down", "why", EVLINE_STR, w[0] ? w : "узел не отвечает", (const char *)NULL);
 }
 
+static void pl_geo_kick(void);
+
+/* Страна узла по флагу в его имени: 1 — есть (cc — две буквы). */
+static int pl_node_cc(int node, char cc[3]) {
+    return node_cc(g_pl.cf.proto->name(pl_node(node)), cc);
+}
+
 /* Состав и здоровье выхода — демону и в файл состояния, только на перемене. Не под замком: читает
  * слоты под ним сам. */
 static void pl_publish(void) {
@@ -284,8 +322,13 @@ static void pl_publish(void) {
     snprintf(sig, sizeof sig, "%d|%s", any, nodes);
     unsigned round = __atomic_load_n(&g_pl.lat_round, __ATOMIC_RELAXED);
     int moved = strcmp(sig, g_pl.sig) != 0;
-    if (!moved && round == g_pl.sig_round) return;      /* файл — и по новому кругу замера */
+    /* Страна выхода проверяется на перемене состава, и только когда активный узел один: запрос
+     * ушёл бы на любой из нескольких. */
+    if (moved && any && ni == 1) pl_geo_kick();
+    unsigned gver = __atomic_load_n(&g_pl.geo_ver, __ATOMIC_ACQUIRE);
+    if (!moved && round == g_pl.sig_round && gver == g_pl.sig_geo) return;   /* файл — и по кругу замера, и по стране */
     g_pl.sig_round = round;
+    g_pl.sig_geo = gver;
     if (moved) {
         snprintf(g_pl.sig, sizeof g_pl.sig, "%s", sig);
         evline_emit("active", "nodes", EVLINE_STR, nodes, (const char *)NULL);
@@ -304,12 +347,32 @@ static void pl_publish(void) {
     if (!f) return;
     fprintf(f, "{\"pid\":%ld,\"up\":%s,\"node\":", (long)getpid(), any ? "true" : "false");
     jsonw_str(f, ni ? g_pl.cf.proto->name(pl_node(idx[0])) : "");
+    /* Страна первого активного узла: node_cc — по флагу в имени (обещание продавца), geo_cc — какую
+     * видят сайты через выход (проверка geo.c; для этого узла, а не для прежнего), geo_failed —
+     * проверка не вышла, geo_mismatch — они разошлись. Поля аддитивны: прежний читатель их пропускает. */
+    if (ni) {
+        char ncc[3];
+        int has = pl_node_cc(idx[0], ncc);
+        if (has) fprintf(f, ",\"node_cc\":\"%s\"", ncc);
+        pthread_mutex_lock(&g_pl.mu);
+        int gs = g_pl.geo_node == idx[0] ? g_pl.geo_state : 0;
+        char gcc[3] = { g_pl.geo_cc[0], g_pl.geo_cc[1], 0 };
+        pthread_mutex_unlock(&g_pl.mu);
+        if (gs == 1) {
+            fprintf(f, ",\"geo_cc\":\"%s\"", gcc);
+            if (has && strcmp(ncc, gcc) != 0) fputs(",\"geo_mismatch\":true", f);
+        } else if (gs == 2) {
+            fputs(",\"geo_failed\":true", f);
+        }
+    }
     if (g_pl.cf.proto->extra) fprintf(f, ",%s", g_pl.cf.proto->extra);
     fprintf(f, ",\"want\":%d,\"slots\":%d,\"by\":\"%s\",\"active\":[", g_pl.cf.active, g_pl.n,
             group_by_name(g_pl.cf.by));
     for (int i = 0; i < ni; i++) {
         fprintf(f, "%s{\"index\":%d,\"name\":", i ? "," : "", idx[i]);
         jsonw_str(f, g_pl.cf.proto->name(pl_node(idx[i])));
+        char acc[3];
+        if (pl_node_cc(idx[i], acc)) fprintf(f, ",\"cc\":\"%s\"", acc);
         fputc('}', f);
     }
     fputc(']', f);
@@ -327,6 +390,20 @@ static void pl_publish(void) {
         }
         pthread_mutex_unlock(&g_pl.mu);
         fputc('}', f);
+        /* Из чего сложена оценка: среднее и джиттер ответивших проб (мс) и потери (%) по узлам;
+         * samples — проб на узел за круг. */
+        fprintf(f, ",\"lat_stat\":{\"samples\":%d,\"nodes\":{", PL_LAT_SAMPLES);
+        first = 1;
+        pthread_mutex_lock(&g_pl.mu);
+        for (size_t k = 0; k < g_pl.cf.sel_n; k++) {
+            int c = g_pl.cf.sel[k];
+            if (pl_lat_of(c) == -2) continue;
+            fprintf(f, "%s\"%d\":{\"ms\":%d,\"jitter\":%d,\"loss\":%d}", first ? "" : ",", c,
+                    g_pl.lst[c].ms, g_pl.lst[c].jitter, g_pl.lst[c].loss);
+            first = 0;
+        }
+        pthread_mutex_unlock(&g_pl.mu);
+        fputs("}}", f);
     }
     fputs("}\n", f);
     if (fclose(f) != 0 || rename(tmp, path) != 0) unlink(tmp);
@@ -514,39 +591,143 @@ static void pl_kick(int i) {
     pthread_cond_signal(&g_pl.cv);
 }
 
+/* ---- страна выхода ---------------------------------------------------------------------------- */
+
+/* Единственный активный узел и устройство туннеля; -1 — узла нет или их несколько. Под замком. */
+static int pl_geo_target(char *dev, size_t n) {
+    int node = -1, cnt = 0;
+    for (int i = 0; i < g_pl.n; i++)
+        if (g_pl.slot[i].node >= 0 && g_pl.slot[i].up) { node = g_pl.slot[i].node; cnt++; }
+    snprintf(dev, n, "%s", g_pl.dev);
+    return cnt == 1 && dev[0] ? node : -1;
+}
+
+/* Проверка страны выхода: один запрос через устройство на узел. Узел сменился, пока шёл запрос, —
+ * результат ему не приписывается, и проверка идёт заново для нового. Не вышло — одна повторная
+ * попытка через PL_GEO_RETRY_S, дальше поле geo_failed до следующей смены узла. */
+static void *pl_geo_thread(void *arg) {
+    (void)arg;
+    int retried = 0, rnode = -1;
+    for (;;) {
+        char dev[16], cc[3] = "", why[200];
+        pthread_mutex_lock(&g_pl.mu);
+        int node = pl_geo_target(dev, sizeof dev);
+        if (node != rnode) { rnode = node; retried = 0; }
+        /* Конец — только здесь и под замком: перемена узла после публикации результата либо уже видна
+         * этой проверке, либо позовёт новый поток (busy снят вместе с проверкой). */
+        if (node < 0 || (g_pl.geo_node == node && (g_pl.geo_state == 1 || (g_pl.geo_state == 2 && retried)))) {
+            g_pl.geo_busy = 0;
+            pthread_mutex_unlock(&g_pl.mu);
+            return NULL;
+        }
+        pthread_mutex_unlock(&g_pl.mu);
+        int rc = geo_trace(dev, cc, why, sizeof why);
+        char nd[16];
+        pthread_mutex_lock(&g_pl.mu);
+        if (pl_geo_target(nd, sizeof nd) != node) {         /* узел сменился во время запроса */
+            pthread_mutex_unlock(&g_pl.mu);
+            continue;
+        }
+        g_pl.geo_node = node;
+        g_pl.geo_state = rc == 0 ? 1 : 2;
+        if (rc == 0) memcpy(g_pl.geo_cc, cc, 3);
+        pthread_mutex_unlock(&g_pl.mu);
+        __atomic_add_fetch(&g_pl.geo_ver, 1, __ATOMIC_RELEASE);
+        if (rc == 0) {
+            char ncc[3];
+            if (pl_node_cc(node, ncc) && strcmp(ncc, cc) != 0)
+                fprintf(stderr, PL_LOG_W "узел %s назван страной %s, а выход виден из %s\n",
+                        g_pl.cf.proto->name(pl_node(node)), ncc, cc);
+        } else {
+            fprintf(stderr, PL_LOG_I "страна выхода не определилась: %s\n", why);
+        }
+        pl_publish();
+        if (rc != 0 && !retried) {
+            retried = 1;
+            struct timespec ts = { g_geo_retry_s, 0 };
+            while (nanosleep(&ts, &ts) != 0) {}
+            pthread_mutex_lock(&g_pl.mu);
+            g_pl.geo_state = 0;                 /* повтор: «не вышло» до результата не показывается */
+            pthread_mutex_unlock(&g_pl.mu);
+        }
+    }
+}
+
+/* Позвать проверку страны на перемене узла. Поток один: идущий сам перепроверит, если узел сменился. */
+static void pl_geo_kick(void) {
+    if (!geo_trace) return;                         /* сборка без TLS */
+    pthread_mutex_lock(&g_pl.mu);
+    int run = !g_pl.geo_busy;
+    g_pl.geo_busy = 1;
+    pthread_mutex_unlock(&g_pl.mu);
+    if (!run) return;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, thread_stack(512 * 1024));      /* HTTPS-клиент держит буферы на стеке */
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    int err = pthread_create(&t, &a, pl_geo_thread, NULL);
+    pthread_attr_destroy(&a);
+    if (err) {
+        pthread_mutex_lock(&g_pl.mu);
+        g_pl.geo_busy = 0;
+        pthread_mutex_unlock(&g_pl.mu);
+    }
+}
+
 /* ---- самые быстрые (pick: latency) ------------------------------------------------------------- */
 
-/* Поток замера: берёт следующего кандидата, пока они есть. Время — проверка целиком: соединение,
- * рукопожатие, запрос через узел и первый байт ответа (у url-test sing-box без unified-delay — так же). */
+/* Поток замера: берёт следующую пробу (кандидат × номер пробы), пока они есть. Время — проверка
+ * целиком: соединение, рукопожатие, запрос через узел и первый байт ответа (у url-test sing-box без
+ * unified-delay — так же). */
 static void *pl_lat_worker(void *arg) {
     (void)arg;
     char why[256];
     for (;;) {
         size_t k = __atomic_fetch_add(&g_pl.lat_next, 1, __ATOMIC_RELAXED);
-        if (k >= g_pl.cf.sel_n) break;
-        int node = g_pl.cf.sel[k];
+        if (k >= g_pl.cf.sel_n * PL_LAT_SAMPLES) break;
+        int node = g_pl.cf.sel[k / PL_LAT_SAMPLES];
         uint64_t t0 = pl_now_ms();
         int rc = pl_probe(node, why, sizeof why);
         int ms = rc == 0 ? (int)(pl_now_ms() - t0) : -1;
         pthread_mutex_lock(&g_pl.mu);
-        if ((size_t)node < g_pl.lat_n) g_pl.lat[node] = ms;
+        if ((size_t)node < g_pl.lat_n) g_pl.smp[(size_t)node * PL_LAT_SAMPLES + k % PL_LAT_SAMPLES] = ms;
         pthread_mutex_unlock(&g_pl.mu);
     }
     return NULL;
 }
 
+/* Оценка узла из его проб круга (latscore.h): среднее, джиттер, потери и сама оценка — в g_pl.lat.
+ * Под замком. */
+static void pl_lat_score(int node) {
+    struct pl_lstat *st = &g_pl.lst[node];
+    g_pl.lat[node] = lat_score(g_pl.smp + (size_t)node * PL_LAT_SAMPLES, PL_LAT_SAMPLES, &st->ms,
+                               &st->jitter, &st->loss);
+}
+
 static void pl_lat_measure(void) {
     __atomic_store_n(&g_pl.lat_next, 0, __ATOMIC_RELAXED);
-    pthread_t t[PL_LAT_PAR];
-    int nt = 0;
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    pthread_attr_setstacksize(&a, thread_stack(512 * 1024));      /* как у слежки: соединение на стеке */
-    for (int i = 0; i < PL_LAT_PAR; i++)
-        if (pthread_create(&t[nt], &a, pl_lat_worker, NULL) == 0) nt++;
-    pthread_attr_destroy(&a);
+    /* Пробы круга разом: потоков PL_LAT_PAR на каждую пробу узла — круг идёт столько же, сколько шёл
+     * с одной пробой. Потоков не больше проб. */
+    size_t want = (size_t)PL_LAT_PAR * PL_LAT_SAMPLES, items = g_pl.cf.sel_n * PL_LAT_SAMPLES;
+    if (want > items) want = items;
+    pthread_t *t = malloc((want ? want : 1) * sizeof *t);
+    size_t nt = 0;
+    if (t) {
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setstacksize(&a, thread_stack(512 * 1024));      /* как у слежки: соединение на стеке */
+        for (size_t i = 0; i < want; i++)
+            if (pthread_create(&t[nt], &a, pl_lat_worker, NULL) == 0) nt++;
+        pthread_attr_destroy(&a);
+    }
     if (!nt) pl_lat_worker(NULL);
-    for (int i = 0; i < nt; i++) pthread_join(t[i], NULL);
+    for (size_t i = 0; i < nt; i++) pthread_join(t[i], NULL);
+    free(t);
+    pthread_mutex_lock(&g_pl.mu);
+    for (size_t k = 0; k < g_pl.cf.sel_n; k++)
+        if ((size_t)g_pl.cf.sel[k] < g_pl.lat_n) pl_lat_score(g_pl.cf.sel[k]);
+    pthread_mutex_unlock(&g_pl.mu);
 }
 
 /* Пересадить слоты на самых быстрых: худший слот (не отвечающий или пустой — худший всех) получает
@@ -900,8 +1081,17 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     free(g_pl.dead_at);
     g_pl.lat = malloc((g_pl.lat_n ? g_pl.lat_n : 1) * sizeof *g_pl.lat);
     g_pl.dead_at = calloc(g_pl.lat_n ? g_pl.lat_n : 1, sizeof *g_pl.dead_at);
-    if (!g_pl.lat || !g_pl.dead_at) { fprintf(stderr, PL_LOG_W "нет памяти под замеры узлов\n"); return NULL; }
+    free(g_pl.smp);
+    free(g_pl.lst);
+    g_pl.smp = malloc((g_pl.lat_n ? g_pl.lat_n : 1) * PL_LAT_SAMPLES * sizeof *g_pl.smp);
+    g_pl.lst = calloc(g_pl.lat_n ? g_pl.lat_n : 1, sizeof *g_pl.lst);
+    if (!g_pl.lat || !g_pl.dead_at || !g_pl.smp || !g_pl.lst) {
+        fprintf(stderr, PL_LOG_W "нет памяти под замеры узлов\n");
+        return NULL;
+    }
     for (size_t k = 0; k < g_pl.lat_n; k++) g_pl.lat[k] = -2;
+    for (size_t k = 0; k < g_pl.lat_n * PL_LAT_SAMPLES; k++) g_pl.smp[k] = -1;
+    g_pl.geo_node = -1;
     g_pl.deaths = 0;
     if (g_pl.cf.active < 1) g_pl.cf.active = 1;
     /* Слотов — не больше кандидатов: держать активными больше узлов, чем их есть, нечем. */

@@ -273,7 +273,8 @@ $CC -O2 -w $STEER_INC -o "$BUILD/hubmatch" tests/hubmatch.c \
 echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/tun.c \
-	src/proto/vless/vldial.c src/tunnel/pool.c src/proto/vless/client.c \
+	src/proto/vless/vldial.c src/tunnel/pool.c src/tunnel/geo.c src/proto/warp/wbhttps.c src/proto/warp/wbjson.c \
+	src/proto/vless/client.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/vless/sub.c src/proto/vless/sublink.c \
 	src/proto/transport/transport.c src/proto/transport/trdial.c src/proto/transport/trsec.c src/proto/tls/ech.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/roots.c \
