@@ -331,6 +331,13 @@ check "у разворота fake-IP есть счётчик" "1" \
     "$(printf '%s\n' "$dout" | grep -c 'counter dnat ip to ip daddr map @fakeip')"
 check "DNS redirect covers IPv6 too" "1" \
     "$(printf '%s\n' "$dout" | grep -c 'nfproto ipv6 iifname "br-lan" udp dport 53')"
+# Пакет к пулу fake-IP не выходит в mesh-VPN и в устройства клиентов: Tailscale уводил такой пакет в
+# tailscale0, пир возвращал его, и очередь установщиков стека туннеля забивалась кругом (I-558).
+check "пул fake-IP не уходит в tailscale и в устройство клиентов" "1" \
+    "$(printf '%s\n' "$dout" | grep -c 'ip daddr 198.18.0.0/15 oifname { "tailscale\*", "zt\*", "br-lan" } counter drop')"
+check "… у охранной цепочки хук postrouting" "1" \
+    "$(printf '%s\n' "$dout" | grep -A1 'chain postrouting_fakeguard' | grep -c 'hook postrouting')"
+check "без доменных каналов охраны пула нет" "0" "$(printf '%s\n' "$out" | grep -c 'fakeguard')"
 # No domain channel means none of that plumbing should exist at all.
 check "no fake-IP plumbing without domain channels" "0" \
     "$(printf '%s\n' "$out" | grep -c 'fakeip')"

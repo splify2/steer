@@ -44,6 +44,10 @@ table inet steer {
         meta mark and 0x0fc00000 == 0x00000000 return
         meta mark and 0x0fc00000 == 0x00400000 oifname != "wg0" counter drop comment "steer-guard:vpn"
     }
+    chain postrouting_fakeguard {
+        type filter hook postrouting priority filter; policy accept;
+        ip daddr 198.18.0.0/15 oifname { "tailscale*", "zt*", "rndis0" } counter drop comment "steer-fakeip-guard"
+    }
 }
 table ip steer {
     map fakeip {

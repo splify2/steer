@@ -53,6 +53,11 @@ table inet steer {
         ip daddr 198.18.0.0/15 counter drop comment "steer-fakeip-nomap"
         ip6 daddr fdfe:dcba:9876::/96 counter drop comment "steer-fakeip-nomap"
     }
+    chain postrouting_fakeguard {
+        type filter hook postrouting priority filter; policy accept;
+        ip daddr 198.18.0.0/15 oifname { "tailscale*", "zt*", "br-lan" } counter drop comment "steer-fakeip-guard"
+        ip6 daddr fdfe:dcba:9876::/96 oifname { "tailscale*", "zt*", "br-lan" } counter drop comment "steer-fakeip-guard"
+    }
     chain prerouting_raw {
         type filter hook prerouting priority raw; policy accept;
         meta l4proto icmp icmp type time-exceeded counter notrack comment "steer:traceroute-hops"

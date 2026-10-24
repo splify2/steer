@@ -1576,6 +1576,39 @@ static void port_override_rules(struct nft_chain *c, const struct groups *gr, co
     }
 }
 
+/* ПОДДЕЛЬНЫЙ АДРЕС НЕ ВЫХОДИТ В УСТРОЙСТВА КЛИЕНТОВ И В MESH-VPN (I-558).
+ *
+ * Пул fake-IP — адреса, которых настоящими не бывает, и дороги из него наружу нет нигде, кроме
+ * подмены в ядре steer (fakeip_nomap_drop держит первый пакет, но не остальные и не свой трафик
+ * роутера). Tailscale же ставит свои маршруты в таблицу 52 по правилу 5270 и при узле выхода или
+ * объявленной кем-то подсети 198.18.0.0/15 уводит пакет к пулу в tailscale0; пир возвращает его
+ * роутеру, и пакет идёт по кругу. Снято у пользователя: очередь установщиков стека туннеля
+ * (CONNQ) забита соединениями к поддельным адресам, лишние SYN получают RST, сайты не открываются.
+ *
+ * Поэтому пакет к пулу, которому остаётся выйти в устройство клиентов спеки или в сеть mesh-VPN
+ * (имена tailscale*, zt* — их демоны создают устройство позже сети, поэтому по имени, как iifname
+ * у x_ifs), отбрасывается. Клиентов Tailscale это не задевает: их пакеты ПРИХОДЯТ с tailscale0, а
+ * ответ роутера идёт на адрес клиента, не на пул. Подмена fake→real делается в prerouting, до
+ * postrouting, поэтому законный пакет несёт здесь уже настоящий адрес. Счётчик — чтобы петлю было
+ * видно (diag и человек). */
+static void build_fakeip_guard(struct nft_table *t, const struct spec *sp, int v6) {
+    struct nft_chain *c = ir_base_chain_add(t, "postrouting_fakeguard", "filter", "postrouting",
+                                            "filter", 0);
+    for (int fam = 4; fam <= (v6 ? 6 : 4); fam += 2) {
+        struct nft_rule *r = ir_rule(c);
+        ir_rule_fam(r, fam);
+        ir_x(r, "%s", fam == 4 ? "ip daddr 198.18.0.0/15" : "ip6 daddr " FAKEIP6_NET);
+        struct sbuf b = { .n = 0 };
+        sb_add(&b, "oifname { \"tailscale*\", \"zt*\"");
+        for (size_t i = 0; i < sp->lan_dev_n; i++) sb_add(&b, ", \"%s\"", sp->lan_dev[i]);
+        sb_add(&b, " }");
+        sb_emit(r, &b);
+        ir_counter(r, 0, 0);
+        ir_x(r, "drop");
+        ir_comment(r, "steer-fakeip-guard");
+    }
+}
+
 static void build_fakeip(struct nft_table *t, const struct groups *gr, int v6) {
     struct nft_set *m = ir_map_add(t, "fakeip", "ipv4_addr", "ipv4_addr");
     ir_gap(m);
@@ -2163,7 +2196,10 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
      * по СТОИМОСТИ, а не по смыслу, и переворачиваться он может свободно — ни один
      * чужой ключ от него не зависит. */
     if (has_domains(gr)) {
-        if (has_fakeip(gr)) build_fakeip(t, gr, has_fakeip6(gr));
+        if (has_fakeip(gr)) {
+            build_fakeip(t, gr, has_fakeip6(gr));
+            build_fakeip_guard(t, sp, has_fakeip6(gr));
+        }
         if (plat()->local_channels && has_local_domains(gr)) nft_emit_output_dns(rs, sp, gr);
         if (sp->traceroute_hops) build_traceroute_raw(t);
     }
