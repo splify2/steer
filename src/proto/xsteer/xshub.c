@@ -1689,9 +1689,13 @@ static void *worker_loop(void *arg) {
                 if (dst && d != dst) {
                     /* Пакет другому пиру закрывает набор. Его самого переносим в начало и делаем
                      * первым кадром следующей записи: откладывать его до следующего круга значило
-                     * бы менять порядок пакетов в потоке. */
+                     * бы менять порядок пакетов в потоке. Убираем его в сторону ДО отправки:
+                     * send_to запечатывает запись на месте и пишет тег сразу за ней — ровно на
+                     * длину и начало этого пакета (I-516). */
+                    uint8_t hold[XS_MTU_DEF];
+                    memcpy(hold, pay + off + 2, (size_t)r);
                     hub_send_frames(w, dst, pay, off, frames);
-                    memmove(pay + XS_BATCH_HDR + 2, pay + off + 2, (size_t)r);
+                    memcpy(pay + XS_BATCH_HDR + 2, hold, (size_t)r);
                     off = XS_BATCH_HDR;
                     frames = 0;
                 }
