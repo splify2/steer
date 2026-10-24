@@ -231,13 +231,9 @@ LIBSTEER_1 {
     rtnl_route6_backstop;
     rtnl_route_default_dev;
     rtnl_routes_dup;
-    rtnl_routes_text;
-    rtnl_routes_text6;
     rtnl_rule_from;
     rtnl_rule_fwmark;
     rtnl_rules_dup;
-    rtnl_rules_text;
-    rtnl_rules_text6;
     rtnl_table_flush;
     run;
     run_quiet;
@@ -351,8 +347,11 @@ LIBSTEER_1 {
     transport_close;
     transport_direct;
     transport_has_data;
+    transport_live;
     transport_moved;
     transport_open;
+    transport_out_flush;
+    transport_out_pending;
     transport_read;
     transport_read_zc;
     transport_room;
