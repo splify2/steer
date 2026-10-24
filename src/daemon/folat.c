@@ -47,6 +47,7 @@
 #include "fogroup.h"
 #include "folat.h"
 #include "urltest.h"
+#include "latscore.h"
 #include "grpurl.h"
 #include "failover_int.h"
 
@@ -131,8 +132,19 @@ void folat_score(const int *ms4, const int *ms6, size_t n, int v6, int *score) {
     for (size_t k = 0; k < n; k++) score[k] = ms4[k] >= 0 ? ms4[k] : -1;
 }
 
+struct folat_m;
+/* Одна проба замера: чья она (обратный вызов urltest получает только arg), семейство и номер. */
+struct fm_arg {
+    struct folat_m *fm;
+    int fam, i;
+};
+
+/* Член мерится LAT_SAMPLES раз по каждому семейству, пробы идут разом — время круга то же, что с одной
+ * пробой. Итог — оценка (latscore.h: среднее + 2 · джиттер + потери), а не одно время. */
 struct folat_m {
-    struct urltest *u4, *u6;
+    struct urltest *u[2][LAT_SAMPLES];          /* [0] — IPv4, [1] — IPv6 */
+    int s[2][LAT_SAMPLES];
+    struct fm_arg a[2][LAT_SAMPLES];
     int ms4, ms6, left;
     folat_m_cb cb;
     void *arg;
@@ -192,23 +204,18 @@ static void fm_done(struct folat_m *fm) {
     if (--fm->left > 0) return;
     folat_m_cb cb = fm->cb;
     void *arg = fm->arg;
-    int a = fm->ms4, b = fm->ms6;
+    int a = lat_score(fm->s[0], LAT_SAMPLES, NULL, NULL, NULL);
+    int b = fm->ms6 == -2 ? -2 : lat_score(fm->s[1], LAT_SAMPLES, NULL, NULL, NULL);
     free(fm);
     cb(arg, a, b);
 }
 
-static void fm_cb4(void *arg, int ms) {
-    struct folat_m *fm = arg;
-    fm->u4 = NULL;
-    fm->ms4 = ms;
-    fm_note(fm, 4, ms);
-    fm_done(fm);
-}
-
-static void fm_cb6(void *arg, int ms) {
-    struct folat_m *fm = arg;
-    fm->u6 = NULL;
-    fm->ms6 = ms;
+static void fm_cb(void *arg, int ms) {
+    struct fm_arg *a = arg;
+    struct folat_m *fm = a->fm;
+    fm->u[a->fam][a->i] = NULL;
+    fm->s[a->fam][a->i] = ms;
+    if (a->fam == 0) fm_note(fm, 4, ms);
     fm_done(fm);
 }
 
@@ -242,21 +249,25 @@ struct folat_m *folat_member(struct loop *l, const struct spec *sp, const struct
     snprintf(fm->grp, sizeof(fm->grp), "%s", go->name);
     snprintf(fm->key, sizeof(fm->key), "%s", m ? fog_lat_key(m) : dev);
     snprintf(fm->url, sizeof(fm->url), "%s", url);
-    int r;
-    fm->u4 = urltest_start(l, url, AF_INET, mark, mark ? NULL : dev, FOLAT_TIMEOUT_MS, fm_cb4, fm, &r);
-    if (fm->u4) fm->left++;
-    else {
-        fm->ms4 = r;
-        fm_note(fm, 4, r);            /* итог сразу: причина — у urltest_why, пока не начат другой замер */
-    }
-    if (v6) {
-        fm->u6 = urltest_start(l, url, AF_INET6, mark, NULL, FOLAT_TIMEOUT_MS, fm_cb6, fm, &r);
-        if (fm->u6) fm->left++;
-        else fm->ms6 = r;
-    }
+    for (int fam = 0; fam < (v6 ? 2 : 1); fam++)
+        for (int i = 0; i < LAT_SAMPLES; i++) {
+            int r;
+            struct fm_arg *a = &fm->a[fam][i];
+            a->fm = fm;
+            a->fam = fam;
+            a->i = i;
+            fm->s[fam][i] = -1;
+            fm->u[fam][i] = urltest_start(l, url, fam ? AF_INET6 : AF_INET, mark, fam || mark ? NULL : dev,
+                                          FOLAT_TIMEOUT_MS, fm_cb, a, &r);
+            if (fm->u[fam][i]) fm->left++;
+            else {
+                fm->s[fam][i] = r;
+                if (!fam) fm_note(fm, 4, r);    /* итог сразу: причина — у urltest_why, пока не начат другой замер */
+            }
+        }
     if (!fm->left) {
-        *ms4 = fm->ms4;
-        *ms6 = fm->ms6;
+        *ms4 = lat_score(fm->s[0], LAT_SAMPLES, NULL, NULL, NULL);
+        *ms6 = v6 ? lat_score(fm->s[1], LAT_SAMPLES, NULL, NULL, NULL) : -2;
         free(fm);
         return NULL;
     }
@@ -265,8 +276,8 @@ struct folat_m *folat_member(struct loop *l, const struct spec *sp, const struct
 
 void folat_member_cancel(struct folat_m *fm) {
     if (!fm) return;
-    urltest_cancel(fm->u4);
-    urltest_cancel(fm->u6);
+    for (int fam = 0; fam < 2; fam++)
+        for (int i = 0; i < LAT_SAMPLES; i++) urltest_cancel(fm->u[fam][i]);
     free(fm);
 }
 

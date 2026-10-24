@@ -329,6 +329,8 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
             fk(&w, "idle_timeout");
             fprintf(f, "%d", g->idle_timeout_s);
         }
+        if (g->ccsel.only_n) fseq_s(&w, "only", g->ccsel.only[0], 3, g->ccsel.only_n);
+        if (g->ccsel.cc_n) fseq_s(&w, "exclude", g->ccsel.cc[0], 3, g->ccsel.cc_n);
         int weighted = 0;
         for (size_t i = 0; i < g->members_n; i++)
             if (g->weight[i] > 1) weighted = 1;
@@ -371,6 +373,7 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
         }
         if (kk.insecure) { fk(&w, "insecure"); fputs("true", f); }
         if (kk.excl.cc_n) fseq_s(&w, "exclude", kk.excl.cc[0], 3, kk.excl.cc_n);
+        if (kk.excl.only_n) fseq_s(&w, "only", kk.excl.only[0], 3, kk.excl.only_n);
         if (kk.excl.names_n) fseq(&w, "exclude_name", kk.excl.names, kk.excl.names_n);
         /* Пул узлов туннеля — только отличное от умолчания (struct tun_pool). */
         if (kk.pool.active > 1) { fk(&w, "active"); fprintf(f, "%d", kk.pool.active); }

@@ -1618,7 +1618,7 @@ static void t_sock_chunks(void) {
 
 /* ---- поддельный протокол: узел и связь ------------------------------------------------------ */
 
-struct fnode { char name[16]; char host[16]; int alive; int delay_ms; };
+struct fnode { char name[16]; char host[16]; int alive; int delay_ms; int flaky; int calls; };
 static struct fnode g_fn[80];
 
 struct fsess { int fd; const struct fnode *node; int flow_opens; };
@@ -1713,12 +1713,15 @@ static const struct dialer_ops f_ops = {
 
 static int f_probe(const void *node, int t, char *why, size_t n) {
     (void)t;
-    int dl = ((const struct fnode *)node)->delay_ms;
+    struct fnode *fn = (struct fnode *)node;
+    int dl = fn->delay_ms;
+    /* flaky — каждая третья проба узла не проходит (потери 33 % при трёх пробах круга). */
+    int lost = fn->flaky && __atomic_add_fetch(&fn->calls, 1, __ATOMIC_RELAXED) % 3 == 0;
     if (dl > 0) {
         struct timespec ts = { dl / 1000, (long)(dl % 1000) * 1000000L };
         nanosleep(&ts, NULL);
     }
-    if (((const struct fnode *)node)->alive) return 0;
+    if (fn->alive && !lost) return 0;
     snprintf(why, n, "узел стенда молчит");
     return -1;
 }
@@ -2305,7 +2308,7 @@ static void t_pool_latency(void) {
         buf[r] = '\0';
         int idx = 0;
         for (const char *q = buf; (q = strstr(q, "\"index\":")); q++) idx++;
-        check(strstr(buf, "\"pick\":\"latency\",\"latency\":{\"0\":120,\"1\":10,\"2\":-1}}") && idx == 1,
+        check(strstr(buf, "\"pick\":\"latency\",\"latency\":{\"0\":120,\"1\":10,\"2\":-1},\"lat_stat\":{\"samples\":3,\"nodes\":{") && idx == 1,
               "файл состояния: замер кандидатов, не мерянный узел не назван, активный — один \"index\"");
         unlink(path);
         rmdir(dir);
@@ -2316,6 +2319,152 @@ out:
     for (int i = 0; i < 5; i++) { g_fn[i].alive = 1; g_fn[i].delay_ms = 0; }
     g_pick = 0;
     g_tol = -1;
+}
+
+/* Оценка узла по нескольким пробам: среднее + 2 · джиттер + 1000 мс · доля потерь. Потери и джиттер
+ * делают узел хуже, узел без ответов мёртв, а круг по времени не растёт (пробы идут разом). */
+static void t_pool_score(void) {
+    for (int i = 0; i < 5; i++) { g_fn[i].alive = 1; g_fn[i].delay_ms = 0; g_fn[i].flaky = 0; g_fn[i].calls = 0; }
+    g_pick = POOL_PICK_LATENCY;
+    g_tol = -1;
+    pool_new(1, BY_CONNECTION, 4, NULL);
+    int *s = g_pl.smp;
+    s[0] = 100; s[1] = 100; s[2] = 100;                 /* узел 0: ровно, без потерь */
+    s[3] = 100; s[4] = -1; s[5] = 130;                  /* узел 1: потеря и разброс */
+    s[6] = -1; s[7] = -1; s[8] = -1;                    /* узел 2: молчит */
+    s[9] = 70; s[10] = 130; s[11] = 100;                /* узел 3: джиттер при том же среднем */
+    pthread_mutex_lock(&g_pl.mu);
+    for (int k = 0; k < 4; k++) pl_lat_score(k);
+    pthread_mutex_unlock(&g_pl.mu);
+    check(g_pl.lat[0] == 100 && g_pl.lst[0].loss == 0 && g_pl.lst[0].jitter == 0,
+          "оценка: ровные пробы без потерь — оценка равна среднему");
+    check(g_pl.lst[1].ms == 115 && g_pl.lst[1].jitter == 15 && g_pl.lst[1].loss == 33 && g_pl.lat[1] == 478,
+          "оценка: среднее 115 + 2 × джиттер 15 + потеря 1/3 × 1000 = 478");
+    check(g_pl.lat[2] == -1 && g_pl.lst[2].loss == 100, "оценка: ни одной ответившей пробы — узел мёртв (-1)");
+    check(g_pl.lat[3] == 100 + 2 * 20 && g_pl.lat[3] > g_pl.lat[0], "оценка: джиттер при том же среднем — хуже");
+
+    /* Круг целиком: узел с каждой третьей потерянной пробой проигрывает более медленному ровному. */
+    g_fn[0].delay_ms = 10; g_fn[0].flaky = 1;
+    g_fn[1].delay_ms = 120;
+    pool_new(1, BY_CONNECTION, 2, NULL);
+    uint64_t t0 = pl_now_ms();
+    pl_lat_measure();
+    uint64_t took = pl_now_ms() - t0;
+    check(g_pl.lst[0].loss == 33 && g_pl.lat[0] > g_pl.lat[1] && g_pl.lat[1] >= 120,
+          "круг: узел с потерями (быстрый) хуже ровного (медленного)");
+    pl_lat_rebalance();
+    check(g_pl.slot[0].node == 1, "пересадка по оценке: слот уходит с узла с потерями");
+    check(took < 400, "круг: три пробы на узел идут разом — время круга не втрое");
+    for (int i = 0; i < 5; i++) { g_fn[i].alive = 1; g_fn[i].delay_ms = 0; g_fn[i].flaky = 0; }
+    g_pick = 0;
+}
+
+/* Проверка страны выхода: заявленная по флагу в имени и фактическая из geo_trace; расхождение — флаг. */
+static char g_geo_cc[3] = "DE";
+static int g_geo_rc, g_geo_calls;
+int geo_trace(const char *dev, char cc[3], char *why, size_t wn) {
+    (void)dev;
+    __atomic_add_fetch(&g_geo_calls, 1, __ATOMIC_RELAXED);
+    if (g_geo_rc) { snprintf(why, wn, "стенд: нет ответа"); return -1; }
+    memcpy(cc, g_geo_cc, 3);
+    return 0;
+}
+
+static void geo_wait(void) {
+    for (int i = 0; i < 2000; i++) {
+        pthread_mutex_lock(&g_pl.mu);
+        int busy = g_pl.geo_busy;
+        pthread_mutex_unlock(&g_pl.mu);
+        if (!busy) return;
+        struct timespec ts = { 0, 1000000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
+static char *geo_state_file(const char *dir, const char *out) {
+    static char buf[2048];
+    char path[200];
+    snprintf(path, sizeof path, "%s/pm-%s", dir, out);
+    FILE *f = fopen(path, "r");
+    size_t r = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+    if (f) fclose(f);
+    buf[r] = '\0';
+    unlink(path);
+    return buf;
+}
+
+static void t_pool_geo(void) {
+    char dir[] = "/tmp/poolmatch.XXXXXX";
+    if (!mkdtemp(dir)) return;
+    steer_set_state_dir(dir);
+    for (int i = 0; i < 5; i++) { g_fn[i].alive = 1; g_fn[i].delay_ms = 0; g_fn[i].flaky = 0; }
+    g_geo_retry_s = 0;
+    /* Имя узла 0 — флаг Нидерландов (U+1F1F3 U+1F1F1) и буква. */
+    snprintf(g_fn[0].name, sizeof g_fn[0].name, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1x");
+    g_pick = 0;
+
+    g_geo_rc = 0; g_geo_calls = 0;
+    pool_new(1, BY_CONNECTION, 3, "geo");
+    snprintf(g_pl.dev, sizeof g_pl.dev, "tun9");
+    pl_publish();
+    geo_wait();
+    pl_publish();
+    char *b = geo_state_file(dir, "geo");
+    check(strstr(b, "\"node_cc\":\"NL\"") && strstr(b, "\"geo_cc\":\"DE\"") && strstr(b, "\"geo_mismatch\":true") &&
+          strstr(b, "\"active\":[{\"index\":0,\"name\":\"\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1x\",\"cc\":\"NL\"}]"),
+          "страна: заявленная NL, фактическая DE, расхождение — флаг; у активного узла cc");
+    check(g_geo_calls == 1, "страна: один запрос на подъём, а не опрос");
+    pl_publish();
+    pl_publish();
+    check(g_geo_calls == 1, "страна: без смены узла проверка не повторяется");
+
+    /* Совпала — флага расхождения нет. */
+    memcpy(g_geo_cc, "NL", 3);
+    pool_new(1, BY_CONNECTION, 3, "geo");
+    snprintf(g_pl.dev, sizeof g_pl.dev, "tun9");
+    pl_publish();
+    geo_wait();
+    pl_publish();
+    b = geo_state_file(dir, "geo");
+    check(strstr(b, "\"geo_cc\":\"NL\"") && !strstr(b, "geo_mismatch"), "страна: совпала — расхождения нет");
+
+    /* Смена узла — новая проверка, чужой результат прежнему не приписывается. */
+    memcpy(g_geo_cc, "FR", 3);
+    g_geo_calls = 0;
+    pthread_mutex_lock(&g_pl.mu);
+    g_pl.slot[0].node = 1;
+    pthread_mutex_unlock(&g_pl.mu);
+    pl_publish();
+    geo_wait();
+    pl_publish();
+    b = geo_state_file(dir, "geo");
+    check(g_geo_calls == 1 && strstr(b, "\"geo_cc\":\"FR\"") && !strstr(b, "node_cc"),
+          "страна: смена узла — новая проверка; у узла без флага нет node_cc и расхождения");
+
+    /* Не вышло: одна повторная попытка и geo_failed. */
+    g_geo_rc = -1; g_geo_calls = 0;
+    pool_new(1, BY_CONNECTION, 3, "geo");
+    snprintf(g_pl.dev, sizeof g_pl.dev, "tun9");
+    pl_publish();
+    geo_wait();
+    pl_publish();
+    b = geo_state_file(dir, "geo");
+    check(g_geo_calls == 2 && strstr(b, "\"geo_failed\":true") && !strstr(b, "geo_cc"),
+          "страна: не вышло — одна повторная попытка и geo_failed");
+
+    /* Несколько активных узлов — проверки нет: запрос ушёл бы на любой. */
+    g_geo_rc = 0; g_geo_calls = 0;
+    pool_new(2, BY_CONNECTION, 3, "geo");
+    snprintf(g_pl.dev, sizeof g_pl.dev, "tun9");
+    g_pl.slot[1].node = 1;
+    g_pl.slot[1].up = 1;
+    pl_publish();
+    geo_wait();
+    check(g_geo_calls == 0, "страна: активных узлов два — проверки нет");
+    geo_state_file(dir, "geo");
+    g_geo_retry_s = PL_GEO_RETRY_S;
+    snprintf(g_fn[0].name, sizeof g_fn[0].name, "n0");
+    rmdir(dir);
 }
 
 /* ---- дайлер в цикле рабочего (DC_INLOOP) ------------------------------------------------------- */
@@ -2551,6 +2700,8 @@ static int pool_part(void) {
     t_pool_retry_cap();
     t_pool_state();
     t_pool_latency();
+    t_pool_score();
+    t_pool_geo();
     t_inloop();
     return 0;
 }

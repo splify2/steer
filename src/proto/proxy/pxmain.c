@@ -183,7 +183,7 @@ int cmd_proxy_probe(const char *spec_path, const char *out_name, int node, int t
         if (!sel_n) { printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, пригодных всего %zu\"}\n", cnt); return 1; }
         sel_n = exclude_filter(o, g_nodes, sel, sel_n);
         if (!sel_n) {
-            printf("{\"ok\":false,\"error\":\"все выбранные узлы исключены exclude или exclude_name\"}\n");
+            printf("{\"ok\":false,\"error\":\"все выбранные узлы исключены exclude, exclude_name или only\"}\n");
             return 1;
         }
     }
@@ -273,7 +273,7 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
         px_probe_report(out_name, PROBE_ALL_EXCLUDED, 0, (int)before);
         evline_emit("excluded", "total", EVLINE_INT, (long)before, (const char *)NULL);
         evline_emit("down", "why", EVLINE_STR, "все узлы-кандидаты исключены exclude", (const char *)NULL);
-        fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude или exclude_name — проверьте "
+        fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude, exclude_name или only — проверьте "
                         "исключение и подписку\n", before);
         return 1;
     }

@@ -126,6 +126,7 @@ static long fake_step(void) { g_slept++; return 0; }
 #include "../src/model/spec.h"
 #include "daemon.h"
 #include "failover_int.h"
+#include "fogroup.h"
 
 /* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): один экземпляр
  * на весь стенд, ровно как в других стендах модели. load_spec/registry_assign здесь мокнуты —
@@ -1399,6 +1400,59 @@ int main(void) {
 
         g_latency_probe = NULL;
         g_health_probe = NULL;
+    }
+
+    /* ---- only и exclude группы: страна ЖИВОГО узла члена из файла состояния его туннеля ---- */
+    {
+        char d[] = "/tmp/failovermatch-cc-XXXXXX";
+        if (!mkdtemp(d)) { perror("mkdtemp"); return 1; }
+        steer_set_state_dir(d);
+        struct { const char *tag, *out, *body; } F[] = {
+            { "vless", "nl", "\"node_cc\":\"NL\"" },                        /* только заявленная */
+            { "vless", "ru", "\"node_cc\":\"NL\",\"geo_cc\":\"RU\"" },      /* выход виден из другой страны */
+            { "hy2", "de", "\"node_cc\":\"DE\"" },
+            { "proxy", "nf", "\"up\":true" },                               /* страны у узла нет */
+        };
+        for (size_t i = 0; i < sizeof(F) / sizeof(F[0]); i++) {
+            char path[200];
+            snprintf(path, sizeof(path), "%s/%s-%s", d, F[i].tag, F[i].out);
+            FILE *f = fopen(path, "w");
+            fprintf(f, "{\"pid\":%ld,%s}\n", (long)getpid(), F[i].body);
+            fclose(f);
+        }
+        struct output m[5], go;
+        memset(m, 0, sizeof(m));
+        const char *mn[5] = { "nl", "ru", "de", "nf", "gone" };
+        for (int i = 0; i < 5; i++) snprintf(m[i].name, sizeof(m[i].name), "%s", mn[i]);
+        memset(&go, 0, sizeof(go));
+        go.kind = OUT_GROUP;
+        group_cfg_init(&go.grp);
+        char cc[3];
+        check("страна члена: заявленная по имени узла", fog_member_cc(&m[0], cc) && !strcmp(cc, "NL"), 1);
+        check("страна члена: фактическая важнее заявленной", fog_member_cc(&m[1], cc) && !strcmp(cc, "RU"), 1);
+        check("страна члена: у hysteria2 тот же ключ", fog_member_cc(&m[2], cc) && !strcmp(cc, "DE"), 1);
+        check("страна члена: у узла страны нет — нет", fog_member_cc(&m[3], cc), 0);
+        check("страна члена: файла нет — нет", fog_member_cc(&m[4], cc), 0);
+        int all = 1;
+        for (int i = 0; i < 5; i++) all &= fog_cc_allowed(&go, &m[i]);
+        check("без only и exclude группа берёт всех", all, 1);
+        char only[2][3] = { "NL", "DE" }, ex[1][3] = { "RU" };
+        go.grp.ccsel.only = only;
+        go.grp.ccsel.only_n = 2;
+        check("only [NL, DE]: берутся nl, de; ru (фактически RU), без страны и без файла — нет",
+              fog_cc_allowed(&go, &m[0]) && !fog_cc_allowed(&go, &m[1]) && fog_cc_allowed(&go, &m[2]) &&
+              !fog_cc_allowed(&go, &m[3]) && !fog_cc_allowed(&go, &m[4]), 1);
+        go.grp.ccsel.only_n = 0;
+        go.grp.ccsel.cc = ex;
+        go.grp.ccsel.cc_n = 1;
+        check("exclude [RU]: нет только ru; без страны и без файла — берутся",
+              fog_cc_allowed(&go, &m[0]) && !fog_cc_allowed(&go, &m[1]) && fog_cc_allowed(&go, &m[2]) &&
+              fog_cc_allowed(&go, &m[3]) && fog_cc_allowed(&go, &m[4]), 1);
+        char pth[200];
+        const char *rm[] = { "vless-nl", "vless-ru", "hy2-de", "proxy-nf", NULL };
+        for (int i = 0; rm[i]; i++) { snprintf(pth, sizeof(pth), "%s/%s", d, rm[i]); unlink(pth); }
+        rmdir(d);
+        steer_set_state_dir(g_dir);
     }
 
     /* ---- via: отказ цели делает нерабочим и зависящий выход ------------------------------ */

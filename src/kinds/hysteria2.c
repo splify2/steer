@@ -110,13 +110,13 @@ static void hy2_status(FILE *out, const struct spec *sp, const struct output *o)
     for (size_t d = 0; d < o->hy2.nodes_n; d++)
         fprintf(out, "%s%d", d ? "," : "", o->hy2.nodes[d]);
     fprintf(out, "]");
-    char buf[512];
+    char buf[1024];
     if (state_read(o->name, buf, sizeof(buf)) == 0) fprintf(out, ",\"hysteria2\":%s", buf);
 }
 
 static void hy2_diag(kind_diag_fn *put, const struct spec *sp, const struct output *o) {
     (void)sp;
-    char buf[512], what[200];
+    char buf[1024], what[200];
     if (state_read(o->name, buf, sizeof(buf)) != 0) {
         snprintf(what, sizeof(what), "выход %.40s: клиент hysteria2 не запущен", o->name);
         put("hysteria2", "fail", what, "перезапустите ядро steer: /etc/init.d/steer restart");

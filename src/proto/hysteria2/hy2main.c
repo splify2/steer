@@ -197,7 +197,7 @@ int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node, i
         }
         sel_n = exclude_filter(o, g_nodes, sel, sel_n);
         if (!sel_n) {
-            printf("{\"ok\":false,\"error\":\"все выбранные узлы исключены exclude или exclude_name\"}\n");
+            printf("{\"ok\":false,\"error\":\"все выбранные узлы исключены exclude, exclude_name или only\"}\n");
             return 1;
         }
     }
@@ -230,6 +230,34 @@ int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node, i
 static char g_state_out[64];
 static const struct hy2_node *g_cur;
 
+/* СТРАНА ВЫХОДА. node_cc — по флагу в имени узла, geo_cc — какую видят сайты через выход (одна проверка
+ * geo.c после подъёма: узел у hysteria2 на ходу не меняется — клиент перезапускается). Поля состояния
+ * читает сторож групп (only и exclude группы, daemon/fogroup.c) и status. geo.c — только в libsteer
+ * (слабая ссылка): без него проверки нет. */
+int geo_trace(const char *dev, char cc[3], char *why, size_t wn) __attribute__((weak));
+static int g_geo_state;             /* 0 — нет, 1 — страна получена, 2 — не вышло (атомарно) */
+static char g_geo_cc[3];
+
+static void *geo_thread(void *arg) {
+    char dev[16], why[200];
+    snprintf(dev, sizeof(dev), "%s", (const char *)arg);
+    for (int tries = 0; tries < 2; tries++) {
+        char cc[3];
+        if (geo_trace(dev, cc, why, sizeof(why)) == 0) {
+            memcpy(g_geo_cc, cc, 3);
+            __atomic_store_n(&g_geo_state, 1, __ATOMIC_RELEASE);
+            if (node_cc(g_cur->name, cc) && strcmp(cc, g_geo_cc) != 0)
+                fprintf(stderr, LOG_W2 "узел %s назван страной %s, а выход виден из %s\n", g_cur->name, cc,
+                        g_geo_cc);
+            return NULL;
+        }
+        if (tries == 0) sleep(20);
+    }
+    fprintf(stderr, LOG_I2 "страна выхода не определилась: %s\n", why);
+    __atomic_store_n(&g_geo_state, 2, __ATOMIC_RELEASE);
+    return NULL;
+}
+
 static void state_write(void) {
     char path[300], tmp[320];
     snprintf(path, sizeof(path), "%s/hy2-%.32s", steer_state_dir(), g_state_out);
@@ -240,6 +268,14 @@ static void state_write(void) {
     if (!f) return;
     fprintf(f, "{\"pid\":%ld,\"node\":", (long)getpid());
     jsonw_str(f, g_cur->name);
+    char ncc[3];
+    int has = node_cc(g_cur->name, ncc);
+    if (has) fprintf(f, ",\"node_cc\":\"%s\"", ncc);
+    int gs = __atomic_load_n(&g_geo_state, __ATOMIC_ACQUIRE);
+    if (gs == 1) {
+        fprintf(f, ",\"geo_cc\":\"%s\"", g_geo_cc);
+        if (has && strcmp(ncc, g_geo_cc) != 0) fputs(",\"geo_mismatch\":true", f);
+    } else if (gs == 2) fputs(",\"geo_failed\":true", f);
     fprintf(f, ",\"up\":%s,\"hs_ms\":%u,\"cc\":\"%s\",\"brutal_bps\":%llu,\"udp\":%s,\"obfs\":\"%s\","
                "\"hop\":%s,\"rtt_ms\":%llu,\"flows\":%u,\"error\":",
             s.up ? "true" : "false", s.hs_ms, s.brutal ? "brutal" : "bbr",
@@ -457,6 +493,12 @@ static void h2_ready(void *arg, const char *dev) {
     pthread_create(&st, NULL, state_thread, NULL);
     pthread_detach(st);
     watch_start(ra->nodes, ra->sel, ra->sel_n, ra->cur, ra->checked, dev);
+    if (geo_trace && dev && dev[0]) {
+        static char gdev[16];
+        static pthread_t gt;
+        snprintf(gdev, sizeof(gdev), "%s", dev);
+        if (pthread_create(&gt, NULL, geo_thread, gdev) == 0) pthread_detach(gt);
+    }
     if (!evline_enabled())
         fprintf(stderr, LOG_I2 "%s поднят; маршрут выхода к нему ставит демон — без демона "
                         "таблица выхода не тронута\n", dev);
@@ -501,7 +543,7 @@ int cmd_hysteria2(const char *spec_path, const char *out_name) {
         h2_probe_report(out_name, PROBE_ALL_EXCLUDED, 0, (int)before);
         evline_emit("excluded", "total", EVLINE_INT, (long)before, (const char *)NULL);
         evline_emit("down", "why", EVLINE_STR, "все узлы-кандидаты исключены exclude", (const char *)NULL);
-        fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude или exclude_name — проверьте "
+        fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude, exclude_name или only — проверьте "
                         "исключение и подписку\n", before);
         return 1;
     }
