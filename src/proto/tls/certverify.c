@@ -30,37 +30,47 @@
 
 /* ---- хранилище корней ---------------------------------------------------------------
  *
- * Разбирается ОДИН РАЗ на процесс. Файл ca-bundle — 182 КБ и полторы сотни сертификатов;
- * разбирать его на каждое соединение значило бы полсекунды и треть мегабайта на КАЖДУЮ
- * попытку узла, а сторож перебирает узлы пачками. Отсюда pthread_once: соединители работают
- * в нескольких потоках (tunnel.c), и два одновременных первых обращения иначе разобрали бы
- * хранилище дважды, причём второе легло бы поверх первого.
+ * Каждый ПУТЬ разбирается один раз на процесс. Файл ca-bundle — 182 КБ и полторы сотни
+ * сертификатов; разбирать его на каждое соединение значило бы полсекунды и треть мегабайта на
+ * КАЖДУЮ попытку узла, а сторож перебирает узлы пачками. Соединители работают в нескольких
+ * потоках (tunnel.c), поэтому поиск и первая загрузка — под замком: два одновременных первых
+ * обращения иначе разобрали бы хранилище дважды.
+ *
+ * ОДНИМ ХРАНИЛИЩЕМ НА ПРОЦЕСС оно было прежде (pthread_once и путь в глобале): путь первого
+ * вызова действовал навсегда, а запись пути в общий указатель была гонкой данных (I-217). Путь —
+ * шов для стенда («нужен свой набор, а на роутере это файл пакета ca-bundle»), и стенд, передавший
+ * своё хранилище после одного соединения с умолчанием, молча проверял бы системными корнями.
+ * Теперь ключ хранилища — сам путь; разные пути живут рядом. Список не ограничен: путей в
+ * процессе столько, сколько их передали (умолчание и, у стенда, пара своих).
  *
  * Освобождения нет намеренно: хранилище живёт столько же, сколько процесс, и «освободить перед
  * выходом» здесь означало бы код, который исполняется ровно в момент, когда его результат уже
- * никому не нужен. */
-static struct sc_roots *g_roots;
-static int g_roots_rc = CERTV_ENOROOTS;
-static pthread_once_t g_roots_once = PTHREAD_ONCE_INIT;
-static const char *g_roots_path;
+ * никому не нужен. Это же делает безопасным отдавать указатель вызывающему без счётчика ссылок:
+ * запись списка не исчезает и не меняется после вставки. */
+struct roots_ent {
+    char *path;
+    struct sc_roots *store;
+    int rc;                    /* 0 — загружено; иначе CERTV_ENOROOTS (и так же навсегда, как раньше) */
+    struct roots_ent *next;
+};
+static struct roots_ent *g_roots_list;
+static pthread_mutex_t g_roots_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static void roots_load(void) {
-    const char *path = (g_roots_path && g_roots_path[0]) ? g_roots_path : CERTV_DEFAULT_ROOTS;
-
+static int roots_read(const char *path, struct sc_roots **out) {
     FILE *f = fopen(path, "rb");
-    if (!f) return;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
     long sz = ftell(f);
     /* Верхняя граница — не паранойя: путь приходит из настройки, и указать им, скажем,
      * /dev/zero не должно означать «съесть всю память роутера». Нынешний ca-bundle весит
      * 182 КБ, восьми мегабайт хватит любому разумному хранилищу. */
-    if (sz <= 0 || sz > 8 * 1024 * 1024) { fclose(f); return; }
+    if (sz <= 0 || sz > 8 * 1024 * 1024) { fclose(f); return -1; }
     rewind(f);
 
     /* +1 байт под ноль: разбору PEM он не нужен, но текст, который где-то дальше прочтут как
      * строку, без терминатора — ловушка, и байт за неё — не цена. */
     unsigned char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return; }
+    if (!buf) { fclose(f); return -1; }
     size_t got = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     buf[got] = '\0';
@@ -69,10 +79,34 @@ static void roots_load(void) {
      * алгоритмами, которых нет в нашей сборке wolfSSL (и истёкшие), и требовать идеального
      * разбора значило бы остаться без корней целиком из-за одного экзотического. Отказ здесь —
      * только когда не разобралось НИЧЕГО. */
-    int rc = sc_roots_load(&g_roots, buf, got);
+    int rc = sc_roots_load(out, buf, got);
     free(buf);
-    if (rc != 0) return;
-    g_roots_rc = 0;
+    return rc == 0 ? 0 : -1;
+}
+
+/* Хранилище по пути (NULL/"" — умолчание). 0 — готово, *out указывает на хранилище; иначе
+ * CERTV_ENOROOTS. */
+static int roots_get(const char *roots, struct sc_roots **out) {
+    const char *path = roots && roots[0] ? roots : CERTV_DEFAULT_ROOTS;
+    pthread_mutex_lock(&g_roots_mu);
+    struct roots_ent *e = g_roots_list;
+    while (e && strcmp(e->path, path)) e = e->next;
+    if (!e) {
+        e = calloc(1, sizeof(*e));
+        if (e) e->path = strdup(path);
+        if (!e || !e->path) {                   /* память: запись не заводим, повтор при следующем вызове */
+            free(e);
+            pthread_mutex_unlock(&g_roots_mu);
+            return CERTV_ENOROOTS;
+        }
+        e->rc = roots_read(path, &e->store) == 0 ? 0 : CERTV_ENOROOTS;
+        e->next = g_roots_list;
+        g_roots_list = e;
+    }
+    int rc = e->rc;
+    if (rc == 0) *out = e->store;
+    pthread_mutex_unlock(&g_roots_mu);
+    return rc;
 }
 
 /* ---- разбор сообщения Certificate (RFC 8446 §4.4.2) ---------------------------------
@@ -307,10 +341,7 @@ int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
     if (!leaf_pinned) {
         struct sc_roots *store = pinned_ca;
         if (!store) {
-            g_roots_path = roots;
-            pthread_once(&g_roots_once, roots_load);
-            if (g_roots_rc != 0) return CERTV_ENOROOTS;
-            store = g_roots;
+            if (roots_get(roots, &store) != 0) return CERTV_ENOROOTS;
         }
         /* ИМЯ ПРОВЕРЯЕТСЯ ЗДЕСЬ ЖЕ, вместе с цепочкой: отдельной проверкой оно оказалось бы
          * вторым местом, где живёт разбор SAN, и разошлось бы с библиотечным. */
