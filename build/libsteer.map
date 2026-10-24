@@ -133,9 +133,9 @@ LIBSTEER_1 {
     kind_warpm;
     l4_box_text;
     l4_from_text;
+    l4_union_alloc;
     l4match_same;
     l4_to_text;
-    l4_union_boxes;
     load_spec;
     nfd_chain_exists;
     nfd_chain_rules;
