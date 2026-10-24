@@ -144,6 +144,7 @@ LIBSTEER_1 {
     nfd_set_count;
     nfd_set_elems;
     nfd_sets;
+    nfd_table_exists;
     nfd_table_fp;
     nft_compat;
     nft_compat_seen;
