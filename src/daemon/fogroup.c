@@ -39,6 +39,7 @@
 #include "nftvmap.h"
 #include "nftdump.h"
 #include "failover_int.h"
+#include "tunpool.h"
 
 #define LOG_W "steer[warn] failover: "
 
@@ -231,6 +232,50 @@ int fog_pick_known(const struct spec *sp, struct fo_store *st, const struct outp
         if (p >= 0) return p;
     }
     return first;
+}
+
+/* ---- страна члена (only и exclude группы) ------------------------------------------------------- */
+
+/* Значение строкового поля "key":"XX" файла состояния туннеля — две заглавные латинские буквы. */
+static int state_cc(const char *st, const char *key, char cc[3]) {
+    char pat[32];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(st, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    if (p[0] < 'A' || p[0] > 'Z' || p[1] < 'A' || p[1] > 'Z' || p[2] != '"') return 0;
+    cc[0] = p[0];
+    cc[1] = p[1];
+    cc[2] = '\0';
+    return 1;
+}
+
+int fog_member_cc(const struct output *m, char cc[3]) {
+    /* Чей файл — по имени выхода: у выхода один процесс, а файл мёртвого процесса tun_state_load не
+     * отдаёт. Тег по виду не выбирается, потому что у прокси один тег на пять протоколов. */
+    static const char *const TAGS[] = { "vless", "hy2", "proxy" };
+    for (size_t i = 0; i < sizeof(TAGS) / sizeof(TAGS[0]); i++) {
+        char *st = tun_state_load(TAGS[i], m->name);
+        if (!st) continue;
+        /* Фактическая страна (geo_cc, проверка выхода) — важнее заявленной именем узла. */
+        int ok = state_cc(st, "geo_cc", cc) || state_cc(st, "node_cc", cc);
+        free(st);
+        return ok;
+    }
+    return 0;
+}
+
+int fog_cc_allowed(const struct output *go, const struct output *m) {
+    const struct group_cfg *g = out_group(go);
+    if (!g || (!g->ccsel.only_n && !g->ccsel.cc_n)) return 1;
+    char cc[3];
+    if (!fog_member_cc(m, cc)) return !g->ccsel.only_n;     /* страны нет: only не берёт, exclude — берёт */
+    for (size_t i = 0; i < g->ccsel.cc_n; i++)
+        if (!strcmp(g->ccsel.cc[i], cc)) return 0;
+    if (!g->ccsel.only_n) return 1;
+    for (size_t i = 0; i < g->ccsel.only_n; i++)
+        if (!strcmp(g->ccsel.only[i], cc)) return 1;
+    return 0;
 }
 
 /* ---- состояние «замера нет» (журнал) -------------------------------------------------------- */

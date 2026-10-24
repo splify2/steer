@@ -300,6 +300,31 @@ if [ -x "$XK" ]; then
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec ex4.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ключ exclude есть только у kind: tunnel"; then ok; else
         bad "exclude у interface — отказ «только у kind: tunnel»" "$out"; fi
+    # only и exclude у группы (pick: latency, order): страна живого узла члена. convert печатает их
+    # обратно неподвижной точкой; у manual и balance, при споре и у не-группы — отказ с местом.
+    gy() {   # имя, pick, лишние ключи
+        printf 'version: 2\noutputs:\n  a: { kind: tunnel, protocol: vless, subscription: sub/a }\n  b: { kind: tunnel, protocol: vless, subscription: sub/b }\n  g: { kind: group, pick: %s, members: [a, b]%s }\nrules:\n  - { to: all, out: g }\n' "$2" "$3" > "$tmp/$1.yaml"
+    }
+    gy gc1 latency ', only: [NL, DE], exclude: RU'
+    (cd "$tmp" && "$XKA" spec convert --spec gc1.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
+    if grep -q 'only: \[NL, DE\], exclude: \[RU\]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+        bad "convert печатает only и exclude группы (неподвижная точка)" "$(cat "$tmp/c1.yaml")"; fi
+    gy gc2 order ', exclude: US'
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec gc2.yaml --state-dir "$tmp/state" 2>&1)"
+    if [ $? = 0 ]; then ok; else bad "exclude у группы order — принят" "$out"; fi
+    gy gc3 manual ', only: NL'
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec gc3.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "выбор члена по стране, он есть только у pick: latency и order"; then ok; else
+        bad "only у группы manual — отказ" "$out"; fi
+    gy gc4 balance ', exclude: RU'
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec gc4.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "выбор члена по стране"; then ok; else bad "exclude у группы balance — отказ" "$out"; fi
+    gy gc5 latency ', only: [NL, DE], exclude: DE'
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec gc5.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "DE — и в only, и в exclude"; then ok; else bad "only и exclude группы по одной стране — отказ" "$out"; fi
+    gy gc6 latency ', only: nl'
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec gc6.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -qF "«nl» — код страны"; then ok; else bad "only: nl у группы — отказ" "$out"; fi
     # Пул узлов туннеля (src/tunnel/pool.c): active, by, interval, silence — у vless и протоколов
     # прокси; convert печатает отличное от умолчания и остаётся неподвижной точкой; у hysteria2 — только
     # interval и silence; отказы — с местом.

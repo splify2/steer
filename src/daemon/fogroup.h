@@ -33,6 +33,15 @@ int fog_manual_pick(const struct spec *sp, struct fo_store *st, const struct out
 int fog_pick_known(const struct spec *sp, struct fo_store *st, const struct output *g,
                    const unsigned char *alive, int cur);
 
+/* СТРАНА ЧЛЕНА ГРУППЫ: фактическая (geo_cc) или, пока проверки выхода не было, заявленная именем узла
+ * (node_cc) из файла состояния туннеля-члена, то есть страна ЖИВОГО узла — она меняется вместе с
+ * узлом. 1 — известна, cc — две буквы; 0 — члена нет среди туннелей, его процесс не жив или у узла
+ * страны нет. */
+int fog_member_cc(const struct output *m, char cc[3]);
+/* Берёт ли страна члена `only` и `exclude` группы go: без этих ключей — всегда; член без известной
+ * страны не берётся при `only` и берётся при одном `exclude`. */
+int fog_cc_allowed(const struct output *go, const struct output *m);
+
 /* balance: привести карты всех групп pick: balance в ядре к живым членам по состоянию подхвата
  * (group_cfg.alive, outputs_adopt_active_st). Зовёт apply после загрузки набора правил: тот
  * ставит карту «все члены живы». */

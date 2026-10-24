@@ -380,6 +380,10 @@ struct group_cfg {
     unsigned char *weight;
     /* balance: чем раздаются новые соединения (enum group_by); 0 — случайно. */
     int by;
+    /* `only` и `exclude` группы (pick: latency и order): какие члены брать по стране их ЖИВОГО узла —
+     * её читает сторож из файла состояния туннеля-члена (fogroup.c, fog_member_cc). names не
+     * используется. Массивы — в арене спеки. */
+    struct node_exclude ccsel;
     /* Группа записана в спеке как `kind: warp` (src/model/v2.c, p_warp): её члены — выходы awg
      * «<имя>.<n>», которые разбор завёл сам, а регистрацию WARP, подбор точек входа и замену ведёт
      * модуль steer-warpbox (помощник группы, kinds/group.c). cc/xcc — страны выхода (cca2): только

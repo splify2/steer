@@ -329,6 +329,8 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
             fk(&w, "idle_timeout");
             fprintf(f, "%d", g->idle_timeout_s);
         }
+        if (g->ccsel.only_n) fseq_s(&w, "only", g->ccsel.only[0], 3, g->ccsel.only_n);
+        if (g->ccsel.cc_n) fseq_s(&w, "exclude", g->ccsel.cc[0], 3, g->ccsel.cc_n);
         int weighted = 0;
         for (size_t i = 0; i < g->members_n; i++)
             if (g->weight[i] > 1) weighted = 1;

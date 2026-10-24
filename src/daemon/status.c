@@ -196,6 +196,27 @@ static void group_emit(FILE *out, const struct spec *sp, const struct output *o)
     for (size_t k = 0; k < g->members_n; k++)
         if (g->alive[k]) fprintf(out, "%s\"%s\"", n++ ? "," : "", spec_out(sp, g->members[k])->name);
     fprintf(out, "]");
+    if (g->ccsel.only_n || g->ccsel.cc_n) {
+        /* Выбор по стране (only, exclude): заданные списки, страна каждого члена с известной страной
+         * (фактическая, иначе по имени узла) и члены, которых выбор не берёт. */
+        fprintf(out, ",\"countries\":{\"only\":[");
+        for (size_t i = 0; i < g->ccsel.only_n; i++) fprintf(out, "%s\"%s\"", i ? "," : "", g->ccsel.only[i]);
+        fprintf(out, "],\"exclude\":[");
+        for (size_t i = 0; i < g->ccsel.cc_n; i++) fprintf(out, "%s\"%s\"", i ? "," : "", g->ccsel.cc[i]);
+        fprintf(out, "],\"members\":{");
+        n = 0;
+        for (size_t k = 0; k < g->members_n; k++) {
+            char cc[3];
+            if (fog_member_cc(spec_out(sp, g->members[k]), cc))
+                fprintf(out, "%s\"%s\":\"%s\"", n++ ? "," : "", spec_out(sp, g->members[k])->name, cc);
+        }
+        fprintf(out, "},\"skipped\":[");
+        n = 0;
+        for (size_t k = 0; k < g->members_n; k++)
+            if (!fog_cc_allowed(o, spec_out(sp, g->members[k])))
+                fprintf(out, "%s\"%s\"", n++ ? "," : "", spec_out(sp, g->members[k])->name);
+        fprintf(out, "]}");
+    }
     if (g->pick == PICK_MANUAL && g->sel >= 0 && (size_t)g->sel < g->members_n)
         fprintf(out, ",\"select\":\"%s\"", spec_out(sp, g->members[g->sel])->name);
     if (g->pick == PICK_LATENCY) {
@@ -294,7 +315,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
     fprintf(out, "{\"schema\":1,\"at\":%ld,"
                  "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
                  "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\",\"awg\","
-                 "\"via\",\"failed\",\"groups\",\"balance_by\",\"exclude\",\"node_only\",\"active_nodes\",\"block\",\"spec_json\",\"pool_latency\","
+                 "\"via\",\"failed\",\"groups\",\"balance_by\",\"exclude\",\"node_only\",\"group_only\",\"node_geo\",\"lat_score\",\"active_nodes\",\"block\",\"spec_json\",\"pool_latency\","
                  "\"dns_groups\",\"dns_other\",\"dns_fragment\",\"dns_h3\"]",
             (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и

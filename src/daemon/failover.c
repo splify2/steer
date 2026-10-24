@@ -1777,7 +1777,7 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
              * тридцатью двумя членами. */
             unsigned char *alive = g->alive;
             for (size_t k = 0; k < mn; k++)
-                alive[k] = !M(k)->failed && device_present(M(k)->device);
+                alive[k] = !M(k)->failed && device_present(M(k)->device) && fog_cc_allowed(o, M(k));
             /* Несущий член — как у прохода: по записи groups, пока группа не в отказе; записи
              * groups нет — по устройству из active. */
             int cur = -1;
@@ -2780,7 +2780,8 @@ static void fo_step(struct fo_run *r) {
             /* Группа v2: живые члены — все сразу, без проб (приговоры их проходов уже есть). */
             for (size_t k = 0; r->named && k < r->cand_n; k++) {
                 size_t m = spec_out_idx(sp, r->cand[k]);
-                if (m != (size_t)-1 && r->alive[m]) r->galive[k] = 1;
+                if (m != (size_t)-1 && r->alive[m] && fog_cc_allowed(o, r->cand[k]))
+                    r->galive[k] = 1;
             }
             /* manual — член, выбранный человеком (select), или default. Не отвечает — отказ группы
              * с её on_fail: переключиться на другого значило бы решить за человека.
