@@ -14,6 +14,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
+#include <poll.h>
 
 #include "spec.h"
 #include "platform.h"
@@ -316,15 +318,71 @@ const char *helper_argv0(const char *exe, char *buf, size_t n) {
     return buf;
 }
 
-/* Дождаться выхода pid до срока (монотонные мс). 1 — вышел (пожат). */
+/* Дескриптор процесса (pidfd, ядро ≥ 5.3): ждать выхода можно poll без опроса waitpid. -1 — ядро не умеет или
+ * процесса уже нет. */
+static int pidfd_of(pid_t pid) {
+#ifdef SYS_pidfd_open
+    return (int)syscall(SYS_pidfd_open, pid, 0);
+#else
+    (void)pid;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+/* Дождаться выхода pid до срока (монотонные мс). 1 — вышел (пожат).
+ *
+ * По pidfd — проснуться ровно в миг выхода, а не на очередном шаге опроса в 50 мс: остановка службы с десятком
+ * помощников копила эти шаги (I-534). Ядро без pidfd — прежний опрос. */
 static int wait_until(pid_t pid, long deadline) {
+    int pfd = pidfd_of(pid);
     for (;;) {
         pid_t w = waitpid(pid, NULL, WNOHANG);
-        if (w == pid || (w < 0 && errno == ECHILD)) return 1;
-        if (helpers_now_ms() >= deadline) return 0;
-        struct timespec ts = { 0, 50000000L };
-        nanosleep(&ts, NULL);
+        if (w == pid || (w < 0 && errno == ECHILD)) { if (pfd >= 0) close(pfd); return 1; }
+        long left = deadline - helpers_now_ms();
+        if (left <= 0) { if (pfd >= 0) close(pfd); return 0; }
+        if (pfd >= 0) {
+            struct pollfd p = { .fd = pfd, .events = POLLIN };
+            poll(&p, 1, left > 1000 ? 1000 : (int)left);
+        } else {
+            struct timespec ts = { 0, 50000000L };
+            nanosleep(&ts, NULL);
+        }
     }
+}
+
+/* Дождаться выхода всех pid из h[0..n) до срока: один poll по всем pidfd вместо шага опроса в 100 мс на каждого.
+ * У вышедших h[i].pid обнуляется. */
+static void wait_all(struct helper *h, size_t n, long deadline) {
+    struct pollfd *pf = calloc(n ? n : 1, sizeof(*pf));
+    for (;;) {
+        size_t left = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (!h[i].pid) continue;
+            if (waitpid(h[i].pid, NULL, WNOHANG) == h[i].pid) h[i].pid = 0;
+            else left++;
+        }
+        long ms = deadline - helpers_now_ms();
+        if (!left || ms <= 0) break;
+        size_t k = 0;
+        int ok = pf != NULL;
+        for (size_t i = 0; ok && i < n; i++) {
+            if (!h[i].pid) continue;
+            int fd = pidfd_of(h[i].pid);
+            if (fd < 0) { ok = 0; break; }
+            pf[k].fd = fd;
+            pf[k].events = POLLIN;
+            pf[k].revents = 0;
+            k++;
+        }
+        if (ok) poll(pf, (nfds_t)k, ms > 1000 ? 1000 : (int)ms);
+        for (size_t i = 0; i < k; i++) close(pf[i].fd);
+        if (!ok) {                       /* ядро без pidfd: прежний шаг опроса */
+            struct timespec ts = { 0, 100000000L };
+            nanosleep(&ts, NULL);
+        }
+    }
+    free(pf);
 }
 
 void helpers_stop(struct helper_set *s, int ordered) {
@@ -332,21 +390,10 @@ void helpers_stop(struct helper_set *s, int ordered) {
     size_t n = s->n;
     if (!ordered) {
         for (size_t i = 0; i < n; i++) if (h[i].pid) kill(h[i].pid, SIGTERM);
-        for (int t = 0; t < 31; t++) {
-            /* Три секунды на уборку, дальше — SIGKILL: супервизор не выходит, оставив
-             * помощника жить без присмотра. */
-            if (t == 30)
-                for (size_t i = 0; i < n; i++) if (h[i].pid) kill(h[i].pid, SIGKILL);
-            int left = 0;
-            for (size_t i = 0; i < n; i++) {
-                if (!h[i].pid) continue;
-                if (waitpid(h[i].pid, NULL, WNOHANG) == h[i].pid) h[i].pid = 0;
-                else left = 1;
-            }
-            if (!left) break;
-            struct timespec ts = { 0, 100000000L };
-            nanosleep(&ts, NULL);
-        }
+        /* Три секунды на уборку, дальше — SIGKILL: супервизор не выходит, оставив помощника жить без присмотра. */
+        wait_all(h, n, helpers_now_ms() + 3000L);
+        for (size_t i = 0; i < n; i++) if (h[i].pid) kill(h[i].pid, SIGKILL);
+        wait_all(h, n, helpers_now_ms() + 1000L);
         return;
     }
     /* По одному, в обратном порядке подъёма: внешний туннель гаснет раньше того, через кого он

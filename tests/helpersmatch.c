@@ -7,6 +7,9 @@
  * слов растёт по-прежнему до 300 с. */
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #include "helpers.h"
 
@@ -29,6 +32,30 @@ static long exits(struct helper_set *s, int n, int said_down) {
         wait = h->next_ms - helpers_now_ms();
     }
     return wait;
+}
+
+/* Остановка службы (helpers_stop): помощники, вышедшие на SIGTERM, пожинаются в тот же миг, а не на очередном шаге
+ * опроса в 50 и 100 мс (I-534). Восемь процессов, умирающих по SIGTERM сразу: порядком и без порядка остановка
+ * укладывается в доли шага опроса (прежде — шаг на каждого, до 400 мс). */
+static long stop_ms(int ordered) {
+    struct helper_set st;
+    memset(&st, 0, sizeof st);
+    if (helpers_reserve(&st, 8) != 0) return -1;
+    st.n = 8;
+    for (int i = 0; i < 8; i++) {
+        memset(&st.h[i], 0, sizeof st.h[i]);
+        pid_t p = fork();
+        if (p == 0) { for (;;) pause(); }
+        st.h[i].pid = p;
+        st.h[i].evfd = -1;
+    }
+    usleep(20000);                       /* дети дошли до pause */
+    long t0 = helpers_now_ms();
+    helpers_stop(&st, ordered);
+    long dt = helpers_now_ms() - t0;
+    int alive = 0;
+    for (int i = 0; i < 8; i++) if (st.h[i].pid) alive++;
+    return alive ? -2 : dt;
 }
 
 int main(void) {
@@ -55,6 +82,11 @@ int main(void) {
     /* Пауза уже выросла до 300 с (упал молча), а затем помощник сообщил down и вышел: обрезается. */
     w = exits(&s, 1, 1);
     check(w <= 30000, "после роста паузы до 300 с выход со словом down обрезает её до 30 с");
+
+    long u = stop_ms(0), o = stop_ms(1);
+    check(u >= 0 && u < 90, "остановка без порядка: восемь помощников, вышедших на SIGTERM, убраны быстрее шага опроса (90 мс)");
+    check(o >= 0 && o < 150, "остановка по порядку: восемь помощников убраны быстрее 150 мс (прежде шаг опроса на каждого)");
+    if (u >= 90 || o >= 150) printf("  без порядка %ld мс, по порядку %ld мс\n", u, o);
 
     printf(g_fail ? "\nhelpersmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;
