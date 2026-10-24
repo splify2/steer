@@ -1,6 +1,10 @@
 #include "dnsd_int.h"
 #include "nftnl.h"
 #include "srs.h"
+#include "ctnl.h"
+#include <linux/netlink.h>
+#include <linux/netfilter/nfnetlink.h>
+#include <linux/netfilter/nfnetlink_conntrack.h>
 
 /* ---------------------------------------------------------------------- */
 /* fake-IP pool: one stable, exclusive synthetic IPv4 per matched domain    */
@@ -88,6 +92,7 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
     t->entries[t->n].domain = strdup(domain);
     if (!t->entries[t->n].domain) return -1;
     t->entries[t->n].addr = addr;
+    t->entries[t->n].last_used = time(NULL);
     t->entries[t->n].real_host = 0;
     t->entries[t->n].real_saved = 0;
     t->entries[t->n].has_real6_saved = 0;
@@ -277,6 +282,11 @@ void fakeip_state_flush(void) {
     g_fakeip_last_rewrite = time(NULL);
 }
 
+/* Возврат адресов — ниже, после работы с наборами каналов (ей нужны dch_del и карта). */
+static uint32_t *g_free;                 /* свободные адреса пула в порядке выдачи */
+static size_t g_free_n, g_free_i;
+static void fakeip_reclaim_try(time_t now);
+
 /* Looks up domain's existing fake IP, or allocates the next free one and
  * persists it. Returns 0 and fills *out_addr (host order) on success; -1 if
  * the pool is exhausted (caller falls back to relaying the real answer
@@ -288,24 +298,38 @@ int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr) {
     snprintf(domain, sizeof(domain), "%s", domain_in);
     str_lower(domain);
     long at = fakeip_find(domain);
+    time_t now = time(NULL);
     if (at >= 0) {
+        g_fakeip.entries[at].last_used = now;
         *out_addr = g_fakeip.entries[at].addr;
         return 0;
     }
-    if (g_fakeip_next >= FAKEIP_POOL_SIZE - 1) {   /* последний — широковещательный пула */
-        /* Пул кончился: домен уйдёт клиенту реальным адресом, то есть МИМО канала, в
-         * который его положил человек. Молчать об этом нельзя — снаружи это «правило
-         * перестало работать», и связать это с пулом нечем. */
-        static time_t said_pool;
-        time_t now = time(NULL);
-        if (warn_due(&said_pool, now))
-            fprintf(stderr, "steer dnsd: пул fake-IP исчерпан (%u адресов, занято %zu): "
-                            "новые домены идут мимо каналов\n",
-                    (unsigned)FAKEIP_POOL_SIZE, g_fakeip.n);
-        return -1;
+    uint32_t addr;
+    int from_free = 0;
+    if (g_fakeip_next < FAKEIP_POOL_SIZE - 1) {    /* последний — широковещательный пула */
+        addr = fakeip_index_to_addr(g_fakeip_next);
+    } else {
+        /* Выдача дошла до края пула: возвращаем адреса простоявших имён. Свободные берутся по
+         * кругу от места последней выдачи, а не сразу заново: клиент с кэшем DNS успевает
+         * отпустить прежний адрес. */
+        if (g_free_i >= g_free_n) fakeip_reclaim_try(now);
+        if (g_free_i >= g_free_n) {
+            /* Пул кончился по-настоящему: домен уйдёт клиенту реальным адресом, то есть МИМО
+             * канала, в который его положил человек. Молчать об этом нельзя — снаружи это
+             * «правило перестало работать», и связать это с пулом нечем. */
+            static time_t said_pool;
+            if (warn_due(&said_pool, now))
+                fprintf(stderr, "steer dnsd: пул fake-IP исчерпан (%u адресов, занято %zu: все "
+                                "спрошены в последние %d с или держат соединения): новые "
+                                "домены идут мимо каналов\n",
+                        (unsigned)FAKEIP_POOL_SIZE, g_fakeip.n, g_fakeip_idle);
+            return -1;
+        }
+        addr = g_free[g_free_i];
+        from_free = 1;
     }
-    uint32_t addr = fakeip_index_to_addr(g_fakeip_next);
     if (fakeip_table_add(&g_fakeip, domain, addr) != 0) return -1;
+    if (from_free) g_free_i++;
     if (g_fakeip_state_path) fakeip_state_append(g_fakeip_state_path, domain, addr);
     *out_addr = addr;
     return 0;
@@ -505,6 +529,173 @@ void dch_del6(size_t i, const char *domain, const uint8_t addr[16]) {
     struct nftlk_box b[L4BOX_MAX];
     size_t n = dch_boxes(i, domain, b);
     for (size_t j = 0; j < n; j++) nft_concat_element6(0, s6, addr, &b[j], 0);
+}
+
+/* ---- возврат адресов пула ----------------------------------------------------------------------
+ *
+ * ЗАЧЕМ. Пул — 131070 адресов, и раньше они только выдавались: имя получало адрес навсегда, и на
+ * устройстве, которое живёт месяцами и ходит на десятки тысяч разных имён (сервер, компьютер),
+ * пул кончался, а новые имена шли мимо каналов до перезапуска. Теперь у записи есть время
+ * последнего вопроса (last_used), и когда выдача доходит до края пула, имена, которых не
+ * спрашивали дольше g_fakeip_idle секунд, отдают адрес.
+ *
+ * КОГДА ЗАПИСЬ ВОЗВРАЩАЕТ АДРЕС. Только если её не спрашивали g_fakeip_idle секунд (клиент с
+ * кэшем DNS приходит за адресом заново раньше: поддельный ответ живёт FAKEIP_ANSWER_TTL) И к
+ * адресу нет живых соединений в conntrack: сеанс, открытый часы назад, держит адрес, пока идёт
+ * (пересдать его другому имени значило бы увести сеанс на чужой сайт). Не удалось спросить
+ * conntrack — решает один срок простоя, а не «никогда»: иначе пул без conntrack кончался бы
+ * по-прежнему.
+ *
+ * ЧТО СНИМАЕТСЯ. Адрес — из наборов каналов (v4 и v6), элементы карт fakeip и fakeip6, запись —
+ * из таблицы, индекса и файла состояния (перезаписывается сразу: иначе в файле у одного адреса
+ * два имени до следующей перезаписи). Размер пула не из спеки: диапазон 198.18.0.0/15 зашит в
+ * правила (метка, nat), в разбор спеки и в пару fdfe:dcba:9876::/96, и менять его значит менять
+ * все три места; число адресов называет сообщение об исчерпании. */
+int g_fakeip_idle = FAKEIP_IDLE_DEFAULT;
+
+/* Живые адреса по conntrack: записи с исходным назначением в пуле (подмена переписывает только
+ * кортеж ответа, так что поддельный адрес стоит в исходном кортеже — как у ct_origdst и
+ * ctnl_evict_mark_keep). */
+static int fakeip_live_rec(const uint8_t *a, const uint8_t *end, uint8_t family, void *ctx) {
+    uint8_t *bits = ctx;
+    const struct nlattr *orig = ct_attr(a, end, CTA_TUPLE_ORIG);
+    const struct nlattr *tip = ct_attr_in(orig, CTA_TUPLE_IP);
+    int v6 = family == AF_INET6;
+    const struct nlattr *da = ct_attr_in(tip, v6 ? CTA_IP_V6_DST : CTA_IP_V4_DST);
+    size_t alen = v6 ? 16 : 4;
+    if (!da || da->nla_len < NLA_HDRLEN + alen) return 0;
+    uint32_t h;
+    if (v6) {
+        h = fakeip6_to4((const uint8_t *)da + NLA_HDRLEN);
+        if (!h) return 0;
+    } else {
+        uint32_t n;
+        memcpy(&n, (const uint8_t *)da + NLA_HDRLEN, 4);
+        h = ntohl(n);
+    }
+    if (h < FAKEIP_POOL_BASE || h >= FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE) return 0;
+    uint32_t i = h - FAKEIP_POOL_BASE;
+    bits[i >> 3] |= (uint8_t)(1u << (i & 7));
+    return 0;
+}
+
+static int fakeip_live_ct(uint8_t *bits) {
+    int dfd = ctnl_socket();
+    uint8_t *buf = malloc(CTNL_RCVBUF);
+    if (dfd < 0 || !buf) {
+        if (dfd >= 0) close(dfd);
+        free(buf);
+        return -1;
+    }
+    uint32_t seq = (uint32_t)time(NULL);
+    int rc = 0;
+    static const uint8_t fam[] = { AF_INET, AF_INET6 };
+    for (size_t i = 0; i < sizeof(fam) && rc == 0; i++)
+        rc = ctnl_dump(dfd, fam[i], 0, 0, 0, &seq, buf, fakeip_live_rec, bits);
+    close(dfd);
+    free(buf);
+    return rc == 0 ? 0 : -1;
+}
+
+int (*g_fakeip_live)(uint8_t *bits) = fakeip_live_ct;
+
+/* Снять всё, что ядро держит под записью: адрес в наборах каналов и подмену в картах. ENOENT —
+ * желаемое состояние. */
+static void fakeip_entry_unroute(const struct fakeip_entry *e) {
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(e->sets, i)) dch_del(i, e->domain, e->addr);
+    uint8_t f6[16];
+    fakeip6_of(e->addr, f6);
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(e->sets6, i)) dch_del6(i, e->domain, f6);
+    if (e->real_host || e->real_saved) {
+        uint32_t k = htonl(e->addr);
+        nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_map_table, g_fakeip_map, &k, 0, NULL, 0);
+    }
+    if (e->has_real6 || e->has_real6_saved)
+        nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_map6_table, g_fakeip6_map, f6, 0, NULL, 0);
+}
+
+void fakeip_pool_reset(void) {
+    free(g_free);
+    g_free = NULL;
+    g_free_n = g_free_i = 0;
+}
+
+size_t fakeip_reclaim(time_t now) {
+    size_t bytes = FAKEIP_POOL_SIZE / 8;
+    uint8_t *live = calloc(1, bytes), *used = calloc(1, bytes);
+    if (!live || !used) {
+        free(live);
+        free(used);
+        return 0;
+    }
+    int known = g_fakeip_live && g_fakeip_live(live) == 0;
+    static time_t said_ct;
+    if (!known && warn_due(&said_ct, now))
+        fprintf(stderr, "steer dnsd: conntrack недоступен — адреса пула fake-IP возвращаются "
+                        "только по сроку простоя (%d с)\n", g_fakeip_idle);
+    size_t w = 0;
+    for (size_t r = 0; r < g_fakeip.n; r++) {
+        struct fakeip_entry *e = &g_fakeip.entries[r];
+        uint32_t i = e->addr - FAKEIP_POOL_BASE;
+        int in_pool = e->addr >= FAKEIP_POOL_BASE && e->addr < FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE;
+        if (in_pool && now - e->last_used >= g_fakeip_idle &&
+            !(known && (live[i >> 3] & (1u << (i & 7))))) {
+            fakeip_entry_unroute(e);
+            free(e->domain);
+            continue;
+        }
+        if (in_pool) used[i >> 3] |= (uint8_t)(1u << (i & 7));
+        if (w != r) g_fakeip.entries[w] = *e;
+        w++;
+    }
+    size_t freed = g_fakeip.n - w;
+    if (freed) {
+        g_fakeip.n = w;
+        /* Номера записей сдвинулись — индекс строится заново (один проход; случай редкий: пул
+         * кончается раз в много часов). */
+        sindex_free(&g_fakeip_idx);
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        for (size_t k = 0; k < g_fakeip.n; k++)
+            if (sindex_put(&g_fakeip_idx, &g_fakeip, fakeip_key, g_fakeip.entries[k].domain,
+                           (uint32_t)k, 0) != 0)
+                fprintf(stderr, "steer dnsd: индекс fake-IP не пересобран (нет памяти)\n");
+        fakeip_state_rewrite();
+        g_fakeip_dirty = 0;
+        g_fakeip_last_rewrite = now;
+    }
+    /* Свободные адреса — все, что не заняты (и дыры от прежних запусков: файл состояния уплотнял
+     * пул не сам), по кругу от последней выдачи. Первый и последний адрес пула не выдаются. */
+    uint32_t start = g_free_i ? g_free[g_free_i - 1] - FAKEIP_POOL_BASE + 1 : 1;
+    if (start >= FAKEIP_POOL_SIZE - 1) start = 1;
+    size_t cnt = 0;
+    for (uint32_t i = 1; i < FAKEIP_POOL_SIZE - 1; i++)
+        if (!(used[i >> 3] & (1u << (i & 7)))) cnt++;
+    uint32_t *nf = cnt ? malloc(cnt * sizeof(*nf)) : NULL;
+    fakeip_pool_reset();
+    if (nf) {
+        size_t k = 0;
+        for (uint32_t j = 0; j < FAKEIP_POOL_SIZE - 2; j++) {
+            uint32_t i = 1 + (start - 1 + j) % (FAKEIP_POOL_SIZE - 2);
+            if (!(used[i >> 3] & (1u << (i & 7)))) nf[k++] = FAKEIP_POOL_BASE + i;
+        }
+        g_free = nf;
+        g_free_n = k;
+    }
+    free(live);
+    free(used);
+    return freed;
+}
+
+/* С дросселем: пул полон занятыми — каждое новое имя заново обходило бы таблицу и дампило бы
+ * conntrack; раз в 10 с достаточно (срок простоя — минуты). */
+static void fakeip_reclaim_try(time_t now) {
+    static time_t last;
+    if (last && now - last < WARN_EVERY_SEC) return;
+    last = now;
+    fakeip_reclaim(now);
+    if (g_free_i < g_free_n) last = 0;      /* вернулось — следующий край пула без ожидания */
 }
 
 void fakeip_route_set(const char *domain, chm_t want) {

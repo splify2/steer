@@ -407,7 +407,7 @@ uint32_t fakeip6_to4(const uint8_t a[16]) {
     static const uint8_t pfx[12] = { FAKEIP6_PREFIX_BYTES };
     if (memcmp(a, pfx, 12) != 0) return 0;
     uint32_t v = ((uint32_t)a[12] << 24) | ((uint32_t)a[13] << 16) | ((uint32_t)a[14] << 8) | a[15];
-    return (v & 0xfffe0000u) == 0xc6120000u ? v : 0;
+    return (v & FAKEIP_POOL_MASK) == FAKEIP_POOL_BASE ? v : 0;
 }
 
 /* «адрес:порт» → адрес и порт. Живёт здесь, а не в obfs.c, потому что нужен обоим:

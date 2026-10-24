@@ -601,7 +601,7 @@ static void emit_mixed6(FILE *f, const struct ir_mixed *mix, const struct ir_see
 static void emit_fakeip_elements(FILE *f, const char *path, int fam) {
     FILE *s = fopen(path, "r");
     if (!s) return;
-    static uint8_t seen[131072 / 8];       /* 198.18.0.0/15 — бит на адрес */
+    static uint8_t seen[FAKEIP_POOL_SIZE / 8];   /* бит на адрес пула */
     memset(seen, 0, sizeof(seen));
     char line[1024];
     int n = 0;
@@ -619,8 +619,8 @@ static void emit_fakeip_elements(FILE *f, const char *path, int fam) {
         struct in_addr a, b;
         if (inet_aton(fake, &a) == 0) continue;
         uint32_t fh = ntohl(a.s_addr);
-        if ((fh & 0xfffe0000u) != 0xc6120000u) continue;   /* вне 198.18.0.0/15 — не наше */
-        uint32_t idx = fh - 0xc6120000u;
+        if ((fh & FAKEIP_POOL_MASK) != FAKEIP_POOL_BASE) continue;   /* вне 198.18.0.0/15 — не наше */
+        uint32_t idx = fh - FAKEIP_POOL_BASE;
         if (fam == 6) {
             if (!real6) continue;
             real6[strcspn(real6, "\t\r\n")] = '\0';

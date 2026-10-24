@@ -139,6 +139,10 @@ struct dnsd_local { int af; struct in_addr v4; struct in6_addr v6; };
 struct fakeip_entry {
     char *domain; /* lowercased, matches the ruleset's own lowercasing */
     uint32_t addr;      /* host byte order */
+    /* Когда имя спрашивали в последний раз (или когда запись загружена из файла): по нему пул
+     * возвращает адреса (fakeip_reclaim, fakeip.c). Не пишется в файл — после перезапуска у всех
+     * записей срок простоя начинается заново. */
+    time_t last_used;
     uint32_t real_host; /* last-seen real backend, host order; 0 if unknown */
     /* НАСТОЯЩИЙ АДРЕС, КОТОРЫЙ ЗНАЕМ, — отдельно от того, что стоит в ядре (проверка на QEMU
      * 04664a5). real_host — это «подмена в карте ядра стоит»: на
@@ -281,10 +285,21 @@ extern const char *g_fakeip_map;
 /* Пул 198.18.0.0/15 (RFC 2544) — см. шапку fakeip.c. Индекс домен->запись и «следующий
  * свободный» — static в fakeip.c для всех, кроме tests/dnsmatch.c: стенду нужно сбрасывать
  * их между случаями, изображая свежий процесс. */
-#define FAKEIP_POOL_BASE 0xC6120000u /* 198.18.0.0 */
-#define FAKEIP_POOL_SIZE 131072u     /* 198.18.0.0 - 198.19.255.255 */
+/* FAKEIP_POOL_BASE/SIZE — в spec.h. */
 extern struct sindex g_fakeip_idx;
 extern size_t g_fakeip_next;
+/* Возврат адресов пула (fakeip.c): запись, которую не спрашивали дольше g_fakeip_idle секунд и
+ * на чей адрес нет живых соединений, отдаёт адрес заново — пул кончается только тогда, когда
+ * все 131070 адресов заняты именами, которые спрашивают или держат соединения. Жив ли адрес,
+ * говорит g_fakeip_live (по умолчанию — conntrack; стенд подставляет свой): 0 — биты живых
+ * адресов (бит на индекс пула) заполнены, -1 — узнать нельзя, тогда решает один срок простоя.
+ * fakeip_reclaim — сколько адресов вернулось. fakeip_pool_reset — забыть список свободных
+ * (таблицу сбросили целиком, fpseed.c). */
+#define FAKEIP_IDLE_DEFAULT 1800
+extern int g_fakeip_idle;
+extern int (*g_fakeip_live)(uint8_t *bits);
+size_t fakeip_reclaim(time_t now);
+void fakeip_pool_reset(void);
 
 /* каналы: таблица «канал → набор» (table.c) */
 extern struct dchan *g_dch;     /* куча, растёт по числу доменных каналов */
