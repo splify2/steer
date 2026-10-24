@@ -1705,8 +1705,21 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun, size_t *rx
      * равно потом нарезали, — а стоило это копии всего трафика и предела «не влезло». */
     struct emit_ctx e = { .c = c, .tun = tun, .total = 0 };
     if (g_dl->ops->deliver(g_dl->ctx, s, c->is_udp, rx, got,
-                           c->is_udp ? emit_dgram : emit_stream, &e) != 0)
+                           c->is_udp ? emit_dgram : emit_stream, &e) != 0) {
+        /* Прочитанное от узла клиенту не легло (кольцо полно — нарушен договор deliver — или
+         * поток не разобрался). Вернуть его некуда: поток уже обрезан, и закрыть его FIN значило
+         * бы выдать обрубок за штатный конец (I-520). Клиенту — RST из общего прохода. */
+        if (!c->is_udp) {
+            static __thread time_t said;
+            c->aborted = 1;
+            if (g_now_s - said >= 10) {
+                said = g_now_s;
+                fprintf(stderr, LOG_W "conn#%ld: данные узла не переданы клиенту (дайлер %s) — "
+                        "соединение сброшено\n", (long)(c - g_conns), g_dl->ops->name);
+            }
+        }
         return -1;
+    }
     if (c->is_udp) return 0;
 
     /* Договор дайлера (dialer.h, deliver): за проход — не больше, чем стек проверил в кольце повтора
