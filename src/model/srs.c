@@ -150,7 +150,6 @@ enum {
 #define LBL_ADG_OPEN 0x08  /* '\b' — adguard_domain без «^»: дальше целые метки     */
 
 #define MAX_KEY     512    /* ключ дерева: домен плюс метка; с запасом на UTF-8 */
-#define MAX_DEPTH   512    /* глубина обхода не больше длины ключа              */
 #define MAX_STR     4096   /* строка элемента (keyword, regex, пакет): длиннее — не наш файл */
 
 /* ---- причины снять правило ------------------------------------------------------------ */
@@ -1664,10 +1663,14 @@ typedef int (*key_emit)(struct walk *w, uint32_t target, const unsigned char *ke
 
 static int succinct_walk(struct walk *w, uint32_t target, const struct succinct *s, key_emit emit) {
     size_t nbits = s->nbitmap * 64;
-    struct swalk *stack = malloc(MAX_DEPTH * sizeof(*stack));
+    /* Стек растёт по потребности: в него ложатся ВСЕ дети узла, и у корня большого набора их
+     * тысячи (метки первого уровня, TLD) — это ширина, а не глубина, и фиксированным числом её не
+     * ограничить. Глубину держит проверка e.plen >= MAX_KEY ниже. */
+    size_t cap = 1024;
+    struct swalk *stack = malloc(cap * sizeof(*stack));
     unsigned char key[MAX_KEY];
     if (!stack) return -1;
-    int sp = 0;
+    size_t sp = 0;
     stack[sp].node = 0; stack[sp].bm = 0; stack[sp].plen = 0; stack[sp].label = 0;
     sp++;
     int rc = 0;
@@ -1680,7 +1683,13 @@ static int succinct_walk(struct walk *w, uint32_t target, const struct succinct 
             if (zeros >= s->nlabels) { rc = -1; break; }        /* карта врёт про метки */
             uint32_t child = (uint32_t)zeros + 1;
             if ((size_t)child > s->nones) { rc = -1; break; }   /* нет позиции для узла */
-            if (sp >= MAX_DEPTH || e.plen >= MAX_KEY) { rc = -1; break; }
+            if (e.plen >= MAX_KEY) { rc = -1; break; }
+            if (sp >= cap) {
+                struct swalk *g = cap > SIZE_MAX / 2 / sizeof(*stack) ? NULL : realloc(stack, cap * 2 * sizeof(*stack));
+                if (!g) { rc = -1; break; }
+                stack = g;
+                cap *= 2;
+            }
             size_t pos = select1(s, child - 1);
             if (pos == (size_t)-1) { rc = -1; break; }
             stack[sp].node  = child;

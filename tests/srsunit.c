@@ -218,6 +218,19 @@ static void t_idn(void) {
     coll_free(&c);
 }
 
+/* Обход кладёт на стек всех детей узла сразу: на глубине 20 при 35 братьях на уровне это 700
+ * записей, а стек был на 512 — ширина вдоль пути объявлялась «не разобран» (I-519). Набор собран
+ * mksrs.py --big 1 --kind wide. */
+static void t_wide(void) {
+    struct coll c;
+    check("35 братьев на 20 уровнях: обход цел", 0, walk(FIX "wide.srs", SRS_EL_DOMAIN, NULL, &c));
+    size_t lines = 0;
+    for (const char *q = S(&c.dom); *q; q++) lines += *q == '\n';
+    check("… все ключи отданы", 700, (long)lines);
+    check("… глубокий ключ на месте", 1, strstr(S(&c.dom), "=azzzzzzzzzzzzzzzzzzz\n") != NULL);
+    coll_free(&c);
+}
+
 static void t_v1(void) {
     struct coll c, o;
     check("версия 1: разобран", 0, walk(FIX "telegram-v1.srs", SRS_EL_DOMAIN | SRS_EL_CIDR, NULL, &c));
@@ -542,6 +555,7 @@ int main(void) {
     t_discord_clauses();
     t_want();
     t_idn();
+    t_wide();
     t_v1();
     t_logic();
     t_v6();
