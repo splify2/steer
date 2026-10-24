@@ -158,6 +158,8 @@ start_vless() {
         inA ip route show table all | grep -q '^default dev vl ' && return 0
         sleep 0.2
     done
+    # Приговор по состоянию, а не по счётчику кругов.
+    inA ip route show table all | grep -q '^default dev vl ' && return 0
     return 1
 }
 stop_vless() {

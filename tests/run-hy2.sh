@@ -123,6 +123,8 @@ start_server() {
         nss ss -ulnH 2>/dev/null | grep -q ":4433 " && return 0
         sleep 0.1
     done
+    # Приговор по состоянию, а не по счётчику кругов: сервер, поднявшийся в последнюю десятую, — поднялся.
+    nss ss -ulnH 2>/dev/null | grep -q ":4433 " && return 0
     echo "  сервер не поднялся:"; sed 's/^/    /' "$WORK/server.log" | head -5
     return 1
 }

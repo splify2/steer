@@ -94,6 +94,10 @@ wait_elem() { # 1 — ждать появления, 0 — исчезновен�
         if [ "$want" = 0 ] && [ -z "$e" ]; then return 0; fi
         sleep 0.1; i=$((i + 1))
     done
+    # Приговор по состоянию, а не по счётчику кругов.
+    e="$(elem)"
+    if [ "$want" = 1 ] && [ -n "$e" ]; then return 0; fi
+    if [ "$want" = 0 ] && [ -z "$e" ]; then return 0; fi
     return 1
 }
 redir_count() {
