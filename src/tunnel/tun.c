@@ -25,6 +25,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -514,23 +515,100 @@ static uint32_t tcp_pseudo_sum(uint32_t src, uint32_t dst, size_t tcp_len) {
     return csum_add(pseudo, 12, 0);
 }
 
-/* Дождаться, пока в очереди устройства освободится место, и повторить запись.
+/* Очередь записи в устройство (I-534). Раньше при EAGAIN поток цикла стоял в poll по миллисекунде, до 200
+ * раз: заполненная очередь устройства останавливала ВСЕ соединения потока на срок до 200 мс, хотя клиенту
+ * нужна была одна датаграмма. Теперь не доставшаяся датаграмма уходит в очередь потока, а цикл идёт дальше:
+ * когда устройство снова принимает (EPOLLOUT, stack.c), очередь сливается по порядку — порядок пакетов
+ * сохраняется, запись в обход очереди его бы переставила.
  *
- * Очередь заполняется на любом пике скорости, и write отвечает EAGAIN — устройство у нас
- * неблокирующее (иначе последнее чтение в цикле засыпало бы). Считать это отказом
- * соединения нельзя: очередь разгружается за микросекунды, а первая версия так и делала —
- * скачивание пропадало совсем.
- *
- * Ожидание миллисекунда, а не десять: замерено, что десять превращались в потолок скорости
- * (110 проходов цикла в секунду при простое poll в 0%). */
-static int tun_writev(const struct tun_dev *d, struct iovec *iov, int n) {
-    for (int attempts = 0;;) {
-        if (writev(d->fd, iov, n) >= 0) return 0;
-        if (errno == EINTR) continue;
-        if ((errno != EAGAIN && errno != EWOULDBLOCK) || ++attempts > 200) return -1;
-        struct pollfd wp = { .fd = d->fd, .events = POLLOUT };
-        poll(&wp, 1, 1);
+ * Предел очереди — TUN_WQ_MAX байт на поток: это та же очередь, что ядро держит у устройства
+ * (txqueuelen 500 пакетов — три четверти мегабайта), только пережидающая пики, и память у неё не должна
+ * расти без счёта. Дальше датаграмма отбрасывается и считается — как у любого UDP при перегрузке; у
+ * соединения конца это не вызывает. Отбрасывание обратным давлением не лечится: UDP клиента отправителя
+ * не слышит. */
+#define TUN_WQ_MAX (4u << 20)
+
+struct tun_wq_pkt {
+    struct tun_wq_pkt *next;
+    int fd;
+    size_t n;
+    unsigned char d[];
+};
+static __thread struct {
+    struct tun_wq_pkt *head, *tail;
+    size_t bytes;
+    unsigned long long dropped;
+} g_wq;
+
+int tun_wq_pending(void) { return g_wq.head != NULL; }
+unsigned long long tun_wq_dropped(void) { return g_wq.dropped; }
+
+/* Слить очередь, пока устройство принимает. 0 — пусто, 1 — устройство снова занято (ждать EPOLLOUT),
+ * -1 — устройство сломано (очередь брошена). */
+int tun_wq_flush(void) {
+    while (g_wq.head) {
+        struct tun_wq_pkt *p = g_wq.head;
+        ssize_t w = write(p->fd, p->d, p->n);
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 1;
+        /* Записано или отказано насовсем (устройство закрыто, пакет не принят ядром): пакет уходит из
+         * очереди — повтор того, что ядро отвергло, не имеет смысла, а хвост ждать не должен. */
+        g_wq.head = p->next;
+        if (!g_wq.head) g_wq.tail = NULL;
+        g_wq.bytes -= p->n;
+        free(p);
     }
+    return 0;
+}
+
+void tun_wq_free(void) {
+    while (g_wq.head) {
+        struct tun_wq_pkt *p = g_wq.head;
+        g_wq.head = p->next;
+        free(p);
+    }
+    g_wq.tail = NULL;
+    g_wq.bytes = 0;
+}
+
+/* Записать пакет (iov — заголовок vnet и сам пакет). 0 — записан или в очереди (и отброшенный по
+ * пределу очереди — тоже 0: потеря UDP не рвёт соединение), -1 — устройство отказало насовсем. */
+static int tun_writev(const struct tun_dev *d, struct iovec *iov, int n) {
+    if (g_wq.head && tun_wq_flush() < 0) return -1;
+    if (!g_wq.head) {
+        for (;;) {
+            if (writev(d->fd, iov, n) >= 0) return 0;
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+    }
+    size_t len = 0;
+    for (int i = 0; i < n; i++) len += iov[i].iov_len;
+    if (g_wq.bytes + len > TUN_WQ_MAX) {
+        static __thread time_t said;
+        time_t now = time(NULL);
+        if (!g_wq.dropped++ || now - said >= 10) {
+            said = now;
+            fprintf(stderr, "steer[warn] tunnel: очередь записи в устройство полна (%u КиБ) — датаграммы "
+                            "клиенту отбрасываются; всего отброшено %llu\n", TUN_WQ_MAX >> 10, g_wq.dropped);
+        }
+        return 0;
+    }
+    struct tun_wq_pkt *p = malloc(sizeof(*p) + len);
+    if (!p) { g_wq.dropped++; return 0; }
+    p->next = NULL;
+    p->fd = d->fd;
+    p->n = len;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        memcpy(p->d + off, iov[i].iov_base, iov[i].iov_len);
+        off += iov[i].iov_len;
+    }
+    if (g_wq.tail) g_wq.tail->next = p; else g_wq.head = p;
+    g_wq.tail = p;
+    g_wq.bytes += len;
+    return 0;
 }
 
 void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n) {

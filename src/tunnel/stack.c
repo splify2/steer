@@ -3118,6 +3118,7 @@ static void *worker_loop(void *arg) {
      * все, и увидит дескриптор. */
     if (rw) rw->ring.efd = efd;
     struct epoll_event evs[EV_BATCH];
+    int tun_out = 0;            /* на устройстве стоит EPOLLOUT: в очереди записи (tun.c) есть пакеты */
     g_ep = ep;
     /* Дайлер встаёт в цикл ДО state: его сокет должен стоять в epoll к первому витку, а соединение с
      * узлом — подниматься, пока рабочий ещё ничего не несёт. */
@@ -3248,6 +3249,17 @@ static void *worker_loop(void *arg) {
             else if (efd < 0) { if (wait_ms > 1) wait_ms = 1; }
             else if (spsc_sleep_begin(&rw->ring)) sleeping = 1;
             else wait_ms = 0;
+        }
+        /* Очередь записи в устройство (tun.c, I-534): датаграмму, которую устройство не приняло, цикл не
+         * ждёт, а доставит, когда оно освободится. Пока очередь не пуста — на устройстве стоит EPOLLOUT. */
+        if (tun_wq_pending()) tun_wq_flush();
+        int want_out = tun_wq_pending();
+        if (want_out != tun_out) {
+            tun_out = want_out;
+            struct epoll_event oe = { .events = (own_tun ? (uint32_t)EPOLLIN : 0u) | (want_out ? (uint32_t)EPOLLOUT : 0u),
+                                      .data = { .u32 = TUN_TOKEN } };
+            if (own_tun) epoll_ctl(ep, EPOLL_CTL_MOD, tun_fd, &oe);
+            else epoll_ctl(ep, want_out ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, tun_fd, &oe);
         }
         int r = epoll_wait(ep, evs, EV_BATCH, wait_ms);
         if (sleeping) spsc_sleep_end(&rw->ring);
@@ -3487,6 +3499,7 @@ static void *worker_loop(void *arg) {
         if (g_inloop) g_dl->ops->loop_stop();
         conn_table_free();
     }
+    tun_wq_free();
     if (efd >= 0) close(efd);
     g_conn_efd = -1;
     close(ep);

@@ -2920,6 +2920,54 @@ static void t_connectors_burst(void) {
     if (done != N || mx <= CONNECTORS) fprintf(stderr, "  исполнено %d, одновременно до %d, %.2f с\n", done, mx, dt);
 }
 
+/* I-534: запись в устройство не стоит в цикле. Устройство стенда — пара AF_UNIX/SOCK_DGRAM, и при полной
+ * очереди write отвечает EAGAIN, как у TUN. Прежде udp_write_to_client ждал освобождения до 200 мс (poll по
+ * миллисекунде); теперь датаграмма уходит в очередь потока, вызов возвращается сразу, а после слива всё
+ * доходит по порядку. */
+static void t_tun_wq(void) {
+    dev_drain(NULL);
+    int fl = fcntl(g_tun.fd, F_GETFL);
+    fcntl(g_tun.fd, F_SETFL, fl | O_NONBLOCK);
+    int small = 4096, old_buf = 0;
+    socklen_t ol = sizeof old_buf;
+    getsockopt(g_tun.fd, SOL_SOCKET, SO_SNDBUF, &old_buf, &ol);
+    setsockopt(g_tun.fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    unsigned char payload[600];
+    memset(payload, 'q', sizeof payload);
+    int sent = 0, queued_at = -1;
+    uint64_t t0 = now_ns();
+    for (int i = 0; i < 400; i++) {
+        payload[0] = (unsigned char)i;
+        payload[1] = (unsigned char)(i >> 8);
+        if (udp_write_to_client(&g_tun, SRV_IP, CLI_IP, SRV_PORT, CLI_PORT, payload, sizeof payload, 1) != 0) break;
+        sent++;
+        if (queued_at < 0 && tun_wq_pending()) queued_at = i;
+    }
+    double dt = (double)(now_ns() - t0) / 1e9;
+    check(sent == 400 && queued_at > 0 && tun_wq_pending() && dt < 0.15,
+          "I-534: заполненная очередь устройства — запись не ждёт (400 датаграмм за <150 мс), остаток в очереди потока");
+    if (sent != 400 || queued_at <= 0 || dt >= 0.15) fprintf(stderr, "  ушло %d, очередь с %d, %.3f с\n", sent, queued_at, dt);
+    /* Слив: устройство читают, очередь выпускается по порядку; ни одной потери и ни одной перестановки. */
+    int got = 0, bad = 0, next = 0;
+    for (int round = 0; round < 2000 && (got < 400); round++) {
+        unsigned char p[2000];
+        ssize_t r;
+        while ((r = recv(g_dev_peer, p, sizeof p, MSG_DONTWAIT)) > 0) {
+            int id = p[28] | (p[29] << 8);          /* IPv4 (20) + UDP (8): первые два байта нагрузки */
+            if (id != next) bad++;
+            next = id + 1;
+            got++;
+        }
+        if (tun_wq_pending()) tun_wq_flush();
+        else if (got < 400) usleep(1000);
+    }
+    check(got == 400 && !bad && !tun_wq_pending() && tun_wq_dropped() == 0,
+          "I-534: после слива доставлены все 400 датаграмм по порядку, очередь пуста, отброшенных нет");
+    setsockopt(g_tun.fd, SOL_SOCKET, SO_SNDBUF, &old_buf, sizeof old_buf);   /* дальше стенду нужны прежние буферы */
+    fcntl(g_tun.fd, F_SETFL, fl);
+    dev_drain(NULL);
+}
+
 /* I-535: проба кандидатов наперегонки. Мёртвые узлы молчат до срока (здесь 2 с — вместо 8), живой отвечает
  * за 50 мс. Последовательный перебор отдал бы 4 × 2 с + 50 мс, гонка — задержку запуска пятого (4 × 250 мс). */
 struct race_t { int alive_from; int alive_ms; int dead_ms; };
@@ -2988,6 +3036,7 @@ int main(void) {
     t_no_connectors();
     t_connectors_burst();
     t_race();
+    t_tun_wq();
     t_table_grow();
     t_tcp_tun_rst();
     t_bring_up_table();
