@@ -64,6 +64,13 @@ static void set_str(char *dst, size_t cap, const char *src, size_t len) {
     utf8_trim(dst);
 }
 
+/* Поле узла без молчаливой обрезки: не влезло — узел помечается, node_check его отвергнет (hy2wire.h
+ * обещает именно это: «пароль длиннее обрезается: узел с таким паролем отвергает разбор»). */
+static void set_fld(struct hy2_node *n, const char *what, char *dst, size_t cap, const char *src, size_t len) {
+    if (len >= cap && !n->trunc_what) { n->trunc_what = what; n->trunc_cap = (uint16_t)(cap - 1); }
+    set_str(dst, cap, src, len);
+}
+
 uint64_t hy2_parse_bandwidth(const char *s) {
     while (*s == ' ') s++;
     char *end;
@@ -145,6 +152,10 @@ static void finish_name(struct hy2_node *n) {
 
 /* Итоговая проверка узла: 0 — годен, 1 — негоден (skip_reason). */
 static int node_check(struct hy2_node *n) {
+    if (n->trunc_what) {
+        snprintf(n->skip_reason, sizeof n->skip_reason, "%s длиннее %u байт", n->trunc_what, (unsigned)n->trunc_cap);
+        return 1;
+    }
     if (!n->host[0] || !n->port) { snprintf(n->skip_reason, sizeof n->skip_reason, "нет адреса или порта"); return 1; }
     if (n->obfs && !n->obfs_pass[0]) {
         snprintf(n->skip_reason, sizeof n->skip_reason, "salamander без пароля");
@@ -199,20 +210,20 @@ static int parse_url_buf(char *buf, struct hy2_node *n) {
         *at = '\0';
         host = at + 1;
         pct_decode(buf);
-        set_str(n->auth, sizeof n->auth, buf, strlen(buf));
+        set_fld(n, "auth", n->auth, sizeof n->auth, buf, strlen(buf));
     }
     const char *ports = NULL;
     if (host[0] == '[') {
         char *rb = strchr(host, ']');
         if (!rb) { snprintf(n->skip_reason, sizeof n->skip_reason, "адрес в скобках не закрыт"); return 1; }
         *rb = '\0';
-        set_str(n->host, sizeof n->host, host + 1, strlen(host + 1));
+        set_fld(n, "host", n->host, sizeof n->host, host + 1, strlen(host + 1));
         if (rb[1] == ':') ports = rb + 2;
     } else {
         char *colon = strchr(host, ':');
         if (colon) { *colon = '\0'; ports = colon + 1; }
         pct_decode(host);
-        set_str(n->host, sizeof n->host, host, strlen(host));
+        set_fld(n, "host", n->host, sizeof n->host, host, strlen(host));
     }
     if (ports && *ports) {
         int prc = hy2_parse_ports(ports, &n->port, n->hop, &n->hop_n);
@@ -232,10 +243,12 @@ static int parse_url_buf(char *buf, struct hy2_node *n) {
         char *eq = strchr(kv, '=');
         const char *k = kv, *v = "";
         if (eq) { *eq = '\0'; v = eq + 1; }
-        char val[512];
-        set_str(val, sizeof val, v, strlen(v));
+        /* Значение раскодируется на месте: копия в 512 байт обрезала длинный obfs-password молча (узел с
+         * чужим ключом обфускации), хотя рабочая копия ссылки и так наша. */
+        char none[1] = "";
+        char *val = eq ? (char *)v : none;      /* v у ссылки без «=» — литерал: писать в него нельзя */
         pct_decode(val);
-        if (!strcasecmp(k, "sni")) set_str(n->sni, sizeof n->sni, val, strlen(val));
+        if (!strcasecmp(k, "sni")) set_fld(n, "sni", n->sni, sizeof n->sni, val, strlen(val));
         else if (!strcasecmp(k, "insecure")) n->insecure = truthy(val);
         else if (!strcasecmp(k, "pinSHA256")) {
             if (val[0]) {
@@ -245,9 +258,9 @@ static int parse_url_buf(char *buf, struct hy2_node *n) {
                 }
                 n->has_pin = 1;
             }
-        } else if (!strcasecmp(k, "obfs")) set_str(obfs, sizeof obfs, val, strlen(val));
+        } else if (!strcasecmp(k, "obfs")) set_str(obfs, sizeof obfs, val, strlen(val));   /* имя вида: длинное — «не поддержан» */
         else if (!strcasecmp(k, "obfs-password") || !strcasecmp(k, "obfs_password"))
-            set_str(n->obfs_pass, sizeof n->obfs_pass, val, strlen(val));
+            set_fld(n, "obfs-password", n->obfs_pass, sizeof n->obfs_pass, val, strlen(val));
         else if (!strcasecmp(k, "up")) n->up_bps = hy2_parse_bandwidth(val);
         else if (!strcasecmp(k, "down")) n->down_bps = hy2_parse_bandwidth(val);
         else if (!strcasecmp(k, "mport")) {
@@ -292,7 +305,9 @@ struct js {
 
 static int jt_new(struct js *j, int type, int start) {
     if (j->n == j->cap) {
-        if (j->cap >= (1 << 17)) return -1;
+        /* Числа токенов не ограничивает константа (было 131072: подписка крупнее давала ноль узлов
+         * без слова причины); растёт, пока хватает памяти. */
+        if (j->cap >= (1 << 28)) return -1;
         int nc = j->cap ? j->cap * 2 : 1024;
         struct jt *nt = realloc(j->t, (size_t)nc * sizeof *nt);
         if (!nt) return -1;
@@ -369,10 +384,14 @@ static int j_get(const struct js *j, int obj, const char *key) {
 
 /* Строка или примитив → текст (escape-последовательности JSON раскрываются в объёме, нужном
  * ссылкам и паролям: \" \\ \/ \n \t \uXXXX). */
+/* Строка не влезла в out (j_str): флаг на поток, сбрасывает и читает j_fld. */
+static __thread int g_jcut;
+
 static int j_str(const struct js *j, int i, char *out, size_t cap) {
     if (i < 0 || (j->t[i].type != J_STR && j->t[i].type != J_PRIM)) return -1;
     size_t o = 0;
-    for (int p = j->t[i].start; p < j->t[i].end && o + 4 < cap; p++) {
+    int p;
+    for (p = j->t[i].start; p < j->t[i].end && o + 4 < cap; p++) {
         char c = j->s[p];
         if (c == '\\' && j->t[i].type == J_STR && p + 1 < j->t[i].end) {
             c = j->s[++p];
@@ -403,6 +422,7 @@ static int j_str(const struct js *j, int i, char *out, size_t cap) {
         }
         out[o++] = c;
     }
+    if (p < j->t[i].end) g_jcut = 1;
     out[o] = '\0';
     return 0;
 }
@@ -412,6 +432,14 @@ static int j_get_str(const struct js *j, int obj, const char *key, char *out, si
     return j_str(j, j_get(j, obj, key), out, cap);
 }
 
+/* Поле узла из конфига Xray без молчаливой обрезки (как set_fld у ссылки). */
+static void j_fld(const struct js *j, int obj, const char *key, struct hy2_node *n, char *dst, size_t cap) {
+    g_jcut = 0;
+    j_get_str(j, obj, key, dst, cap);
+    if (g_jcut && !n->trunc_what) { n->trunc_what = key; n->trunc_cap = (uint16_t)(cap - 1); }
+    g_jcut = 0;
+}
+
 /* outbound Xray → узел. 0 — годен, 1 — негоден, -1 — не hysteria. */
 static int xray_outbound(const struct js *j, int ob, struct hy2_node *n) {
     char tmp[256];
@@ -419,7 +447,7 @@ static int xray_outbound(const struct js *j, int ob, struct hy2_node *n) {
     memset(n, 0, sizeof *n);
     n->hop_s = 30;
     int st = j_get(j, ob, "settings");
-    j_get_str(j, st, "address", n->host, sizeof n->host);
+    j_fld(j, st, "address", n, n->host, sizeof n->host);
     j_get_str(j, st, "port", tmp, sizeof tmp);
     n->port = (uint16_t)atoi(tmp);
     j_get_str(j, st, "version", tmp, sizeof tmp);
@@ -429,9 +457,9 @@ static int xray_outbound(const struct js *j, int ob, struct hy2_node *n) {
 
     int ss = j_get(j, ob, "streamSettings");
     int hs = j_get(j, ss, "hysteriaSettings");
-    j_get_str(j, hs, "auth", n->auth, sizeof n->auth);
+    j_fld(j, hs, "auth", n, n->auth, sizeof n->auth);
     int tls = j_get(j, ss, "tlsSettings");
-    j_get_str(j, tls, "serverName", n->sni, sizeof n->sni);
+    j_fld(j, tls, "serverName", n, n->sni, sizeof n->sni);
     char pins[400];
     if (j_get_str(j, tls, "pinnedPeerCertSha256", pins, sizeof pins) == 0 && pins[0]) {
         /* Список через запятую; сверяется отпечаток листа — берём первый (подмена цепочки из
@@ -451,7 +479,7 @@ static int xray_outbound(const struct js *j, int ob, struct hy2_node *n) {
             int set = j_get(j, k, "settings");
             if (!strcasecmp(type, "salamander")) {
                 n->obfs = 1;
-                j_get_str(j, set, "password", n->obfs_pass, sizeof n->obfs_pass);
+                j_fld(j, set, "password", n, n->obfs_pass, sizeof n->obfs_pass);
                 /* packetSize у маски salamander в Xray-core — это Gecko (transport_finalmask.go:
                  * To > 0 даёт GeckoConfig): та же Salamander плюс нарезка пакетов рукопожатия. */
                 char rng[48];
@@ -526,7 +554,17 @@ static void parse_xray_doc(const char *text, struct hy2_node *out, size_t max, s
                            struct hy2_sub_stats *st) {
     struct js j = { text, NULL, 0, 0 };
     const char *p = text, *e = text + strlen(text);
-    if (j_value(&j, &p, e, 0) < 0) { free(j.t); return; }
+    if (j_value(&j, &p, e, 0) < 0) {
+        /* Конфиг не разобрался (оборван, глубже 24 уровней, нет памяти): прежде это был ноль узлов
+         * без единого слова. Теперь — одна запись о пропуске с причиной. */
+        struct hy2_node bad;
+        memset(&bad, 0, sizeof bad);
+        snprintf(bad.skip_reason, sizeof bad.skip_reason, "конфиг подписки не разобран");
+        snprintf(bad.name, sizeof bad.name, "JSON, %zu байт", (size_t)(e - text));
+        skip_note(st, &bad);
+        free(j.t);
+        return;
+    }
     /* Корень — объект конфига (outbounds внутри), массив конфигов или массив outbound. Обходим
      * оба уровня. */
     for (int i = 0; i < j.n; i++) {

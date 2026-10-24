@@ -54,14 +54,14 @@ static int set_hostport(struct vless_node *n, const char *s, size_t len) {
         char *rb = strchr(buf, ']');
         if (!rb || rb[1] != ':') return -1;
         *rb = '\0';
-        sl_set_field(n->host, sizeof(n->host), buf + 1, strlen(buf + 1));
+        SL_SET(n, host, buf + 1, strlen(buf + 1));
         sl_host_zone_decode(n->host);
         colon = rb + 1;
     } else {
         colon = strrchr(buf, ':');
         if (!colon) return -1;
         *colon = '\0';
-        sl_set_field(n->host, sizeof(n->host), buf, strlen(buf));
+        SL_SET(n, host, buf, strlen(buf));
     }
     n->port = sl_port_of(colon + 1);
     return (n->host[0] && n->port) ? 0 : -1;
@@ -415,7 +415,8 @@ static int http_parse(const char *url, struct px_node *n, int tls) {
 
 /* ---- vmess (v2rayN base64 JSON) -------------------------------------------------------------- */
 
-/* Плоский JSON-объект: значение ключа key в строку out (строки и числа). 1 — нашли. */
+/* Плоский JSON-объект: значение ключа key в строку out (строки и числа). 1 — нашли; 2 — нашли, но оно
+ * не влезло в cap и обрезано (вызывающий решает, годится ли обрезанное); 0 — нет. */
 static int vj_get(const char *json, const char *key, char *out, size_t cap) {
     char pat[48];
     int kl = snprintf(pat, sizeof(pat), "\"%s\"", key);
@@ -427,6 +428,7 @@ static int vj_get(const char *json, const char *key, char *out, size_t cap) {
         c++;
         while (*c == ' ' || *c == '\t') c++;
         size_t o = 0;
+        int cut = 0;
         if (*c == '"') {
             c++;
             /* Экранирование раскрывается (sl_unescape): v2rayN на Windows пишет ps как \uXXXX с
@@ -436,15 +438,18 @@ static int vj_get(const char *json, const char *key, char *out, size_t cap) {
                 size_t el = 1;
                 if (*c == '\\' && c[1]) c += sl_unescape(c + 1, 0, e, &el);
                 c++;
-                if (o + el >= cap) break;
+                if (o + el >= cap) { cut = 1; break; }
                 memcpy(out + o, e, el);
                 o += el;
             }
         } else {
-            while (*c && *c != ',' && *c != '}' && *c != ' ' && o + 1 < cap) out[o++] = *c++;
+            while (*c && *c != ',' && *c != '}' && *c != ' ') {
+                if (o + 1 >= cap) { cut = 1; break; }
+                out[o++] = *c++;
+            }
         }
         out[o] = '\0';
-        return 1;
+        return cut ? 2 : 1;
     }
     out[0] = '\0';
     return 0;
@@ -463,19 +468,31 @@ const char *px_vmess_sec_name(enum vmess_sec v) {
     return "";
 }
 
+/* Поле узла из JSON vmess без молчаливой обрезки: не влезло — узел помечен (sl_link_usable_pre). */
+static void vj_set(struct vless_node *vn, const char *json, const char *key, char *dst, size_t cap) {
+    if (vj_get(json, key, dst, cap) == 2) sl_mark_cut(vn, key, cap);
+}
+
+static int vmess_body(const char *json, struct px_node *n);
+
 static int vmess_parse(const char *url, struct px_node *n) {
     n->proto = PX_VMESS;
     const char *b = url + 8;             /* после vmess:// */
-    char json[4096];
-    size_t jn = b64_decode(b, strlen(b), json, sizeof(json));
-    json[jn < sizeof(json) ? jn : sizeof(json) - 1] = '\0';
-    if (json[0] != '{') return -1;
-    if (jn + 1 >= sizeof(json)) {       /* декодер встал на краю буфера: хвост JSON потерян */
-        snprintf(n->skip_reason, sizeof(n->skip_reason), "vmess JSON длиннее %zu байт", sizeof(json) - 2);
-        return 1;
-    }
+    /* Буфер — по длине ссылки: base64 даёт не больше 3/4 длины. Прежние 4096 байт отвергали ссылку
+     * с длинным путём или заголовками «JSON длиннее 4094», хотя узел был исправен. */
+    size_t bl = strlen(b);
+    char *json = malloc(bl + 4);
+    if (!json) { snprintf(n->skip_reason, sizeof(n->skip_reason), "нет памяти под vmess JSON"); return 1; }
+    size_t jn = b64_decode(b, bl, json, bl + 4);
+    json[jn < bl + 4 ? jn : bl + 3] = '\0';
+    int rc = json[0] == '{' ? vmess_body(json, n) : -1;
+    free(json);
+    return rc;
+}
+
+static int vmess_body(const char *json, struct px_node *n) {
     char v[256];
-    vj_get(json, "add", n->vn.host, sizeof(n->vn.host));
+    vj_set(&n->vn, json, "add", n->vn.host, sizeof(n->vn.host));
     if (vj_get(json, "port", v, sizeof(v))) n->vn.port = sl_port_of(v);
     vj_get(json, "id", v, sizeof(v));
     if (sl_uuid_parse(v, n->vmess_id) != 0) {
@@ -505,8 +522,8 @@ static int vmess_parse(const char *url, struct px_node *n) {
     char htype[16] = "";
     vj_get(json, "type", htype, sizeof(htype));
     if (!strcmp(htype, "http")) n->vn.tcp_http = 1;
-    vj_get(json, "path", n->vn.path, sizeof(n->vn.path));
-    vj_get(json, "host", n->vn.http_host, sizeof(n->vn.http_host));
+    vj_set(&n->vn, json, "path", n->vn.path, sizeof(n->vn.path));
+    vj_set(&n->vn, json, "host", n->vn.http_host, sizeof(n->vn.http_host));
     if (!strcmp(net, "grpc")) sl_set_field(n->vn.service, sizeof(n->vn.service), n->vn.path, strlen(n->vn.path));
     char tls[16] = "";
     vj_get(json, "tls", tls, sizeof(tls));
@@ -516,7 +533,7 @@ static int vmess_parse(const char *url, struct px_node *n) {
         return 1;
     }
     snprintf(n->vn.security, sizeof(n->vn.security), !strcasecmp(tls, "tls") ? "tls" : "none");
-    vj_get(json, "sni", n->vn.sni, sizeof(n->vn.sni));
+    vj_set(&n->vn, json, "sni", n->vn.sni, sizeof(n->vn.sni));
     vj_get(json, "fp", n->vn.fp, sizeof(n->vn.fp));
     vj_get(json, "ps", n->vn.name, sizeof(n->vn.name));
     sl_set_field(n->name, sizeof(n->name), n->vn.name, strlen(n->vn.name));

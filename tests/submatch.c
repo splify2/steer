@@ -88,6 +88,26 @@ static void on_alarm(int sig) {
 }
 
 int main(void) {
+    /* ---- таблица длинных значений без предела (I-526) ------------------------------------------ */
+    {
+        enum { N = 1500 };
+        static const char *ptr[N];
+        char v[32];
+        int full = 0, dup = 0;
+        for (int i = 0; i < N; i++) {
+            snprintf(v, sizeof v, "value-%05d", i);
+            ptr[i] = sl_intern(v, strlen(v));
+            if (ptr[i] == SL_FULL) full++;
+        }
+        for (int i = 0; i < N; i += 7) {
+            snprintf(v, sizeof v, "value-%05d", i);
+            if (sl_intern(v, strlen(v)) != ptr[i]) dup++;
+        }
+        check_n("intern: полторы тысячи различных значений — ни одно не «таблица полна»", 0, full);
+        check_n("intern: то же значение — тот же экземпляр", 0, dup);
+        check("intern: значение сохранено как есть", "value-00777", ptr[777]);
+    }
+
     /* ---- числа JSON без переполнения (I-543) ---------------------------------------------- */
     {
         struct sj j = { .p = "443," };
@@ -435,26 +455,118 @@ int main(void) {
                 5, (long)(n + st.skipped + st.foreign));
     }
 
-    /* Ссылка длиннее буфера строки тоже исчезала бесследно: ветка длины отбрасывала
-     * её раньше разбора. Считается как непригодная — она и есть непригодная. */
+    /* Ссылка длиннее прежнего буфера строки (8192) разбирается как любая: предела длины ссылки нет. Узел с
+     * длинным НЕИЗВЕСТНЫМ параметром пригоден; узел, у которого длинное значение — поле, не влезающее в
+     * узел (здесь SNI), — непригоден с названной шириной поля, а не с «ссылка длиннее» и не с молча
+     * обрезанным SNI (I-526). */
     {
         struct vless_node nodes[4];
         struct vless_sub_stats st;
-        char big[16384];
-        int k = snprintf(big, sizeof(big), "vless://u@h:443?sni=");
+        static char big[16384];
+        int k = snprintf(big, sizeof(big), "vless://11111111-2222-3333-4444-555555555555@h.example:443?sni=h.example&zzz=");
         memset(big + k, 'x', 9000);
         big[k + 9000] = '\0';
         size_t n = vless_parse_sub(big, nodes, 4, &st);
-        check_n("слишком длинная ссылка: не взята", 0, (long)n);
-        check_n("слишком длинная ссылка: учтена как непригодная", 1, (long)st.skipped);
-        check("слишком длинная ссылка: причина названа", "ссылка длиннее 8191 байт",
+        check_n("ссылка 9000+ байт с длинным неизвестным параметром: взята", 1, (long)n);
+
+        k = snprintf(big, sizeof(big), "vless://11111111-2222-3333-4444-555555555555@h.example:443?sni=");
+        memset(big + k, 'x', 9000);
+        big[k + 9000] = '\0';
+        n = vless_parse_sub(big, nodes, 4, &st);
+        check_n("SNI в 9000 знаков: не взят", 0, (long)n);
+        check_n("SNI в 9000 знаков: учтён как непригодный", 1, (long)st.skipped);
+        check("SNI в 9000 знаков: причина называет поле и ширину", "sni длиннее 127 байт",
               st.reasons[0].reason);
-        /* Пример у этой причины — длина и начало адреса узла (I-209): по одной причине
-         * нельзя отличить ссылку чуть длиннее предела от блоба на десятки килобайт, а
-         * починки у них разные. Начало берётся после '@': до него идентификатор, которому
-         * в журнале, пересылаемом в трекер, не место. */
-        check("слишком длинная ссылка: пример — длина и начало адреса",
-              "9020 байт: …@h:443?sni=xxxxxxxxxxxxxxxxxxxxxx", st.reasons[0].example);
+    }
+
+    /* I-526: у каждого поля узла, которое раньше обрезалось молча, — отказ с названием и шириной. */
+    {
+        struct vless_node nd;
+        static char url[2048];
+        char fld[400];
+        memset(fld, 'p', sizeof fld - 1);
+        fld[sizeof fld - 1] = '\0';
+        static const struct { const char *param; const char *reason; } cases[] = {
+            { "path", "path длиннее 127 байт" },
+            { "host", "http_host длиннее 127 байт" },
+            { "pbk",  "pbk длиннее 63 байт" },
+            { "sid",  "sid длиннее 31 байт" },
+            { "serviceName", "service длиннее 63 байт" },
+            { "mode", "mode длиннее 15 байт" },
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+            snprintf(url, sizeof url, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&type=ws&sni=h.example&%s=%s",
+                     cases[i].param, fld);
+            int rc = vless_parse_url(url, &nd);
+            char what[96];
+            snprintf(what, sizeof what, "%s в 399 знаков: узел не взят", cases[i].param);
+            check_n(what, 1, rc);
+            snprintf(what, sizeof what, "%s в 399 знаков: причина", cases[i].param);
+            check(what, cases[i].reason, nd.skip_reason);
+        }
+        /* fp — имя отпечатка: длинное незнакомое не отказ (хелло берёт умолчание), как и прежде. */
+        snprintf(url, sizeof url, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&type=ws&sni=h.example&fp=%s", fld);
+        check_n("fp в 399 знаков: узел взят, отпечаток — умолчание", 0, vless_parse_url(url, &nd));
+        /* Хост и uuid. */
+        snprintf(url, sizeof url, "vless://11111111-2222-3333-4444-555555555555@%s:443", fld);
+        int rc = vless_parse_url(url, &nd);
+        check_n("host в 399 знаков: узел не взят", 1, rc);
+        check("host в 399 знаков: причина", "host длиннее 127 байт", nd.skip_reason);
+        /* Влезающее значение — как прежде. */
+        snprintf(url, sizeof url, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&type=ws&sni=h.example&path=%%2Fa%%2Fb");
+        check_n("path в процентной форме, влезает: узел взят", 0, vless_parse_url(url, &nd));
+        /* Процентная форма РАСКОДИРУЕТСЯ до проверки ширины: 160 знаков — это 120 байт пути, он влезает в 127. */
+        char enc[300] = "";
+        for (int i = 0; i < 40; i++) strcat(enc, "%2Fab");
+        snprintf(url, sizeof url, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&type=ws&sni=h.example&path=%s", enc);
+        check_n("path: 160 знаков в процентной форме = 120 байт, узел взят", 0, vless_parse_url(url, &nd));
+    }
+
+    /* Строка JSON, не влезшая в поле узла, — отказ узла, а не обрезанное значение (sing-box). */
+    {
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+        static char js[4096];
+        char longpbk[200];
+        memset(longpbk, 'k', sizeof longpbk - 1);
+        longpbk[sizeof longpbk - 1] = '\0';
+        snprintf(js, sizeof js,
+                 "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"sb\",\"server\":\"h.example\",\"server_port\":443,"
+                 "\"uuid\":\"11111111-2222-3333-4444-555555555555\",\"tls\":{\"enabled\":true,\"server_name\":\"h.example\","
+                 "\"reality\":{\"enabled\":true,\"public_key\":\"%s\",\"short_id\":\"ab\"}}}]}", longpbk);
+        size_t n = vless_parse_sub(js, nodes, 4, &st);
+        check_n("sing-box: public_key в 199 знаков — узел не взят", 0, (long)n);
+        check_n("sing-box: учтён как непригодный", 1, (long)st.skipped);
+        check("sing-box: причина называет ширину", "значение длиннее 63 байт", st.reasons[0].reason);
+    }
+
+    /* Clash: больше 96 пар и 12 КБ в одном узле не теряют поля после лимита. */
+    {
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+        static char y[40000];
+        int k = snprintf(y, sizeof y,
+                         "proxies:\n  - name: big\n    type: vless\n    server: h.example\n    port: 443\n"
+                         "    uuid: 11111111-2222-3333-4444-555555555555\n    network: ws\n    tls: true\n    servername: h.example\n"
+                         "    ws-opts:\n      headers:\n");
+        for (int i = 0; i < 200; i++)
+            k += snprintf(y + k, sizeof y - (size_t)k, "        X-H%03d: value-%03d-%0100d\n", i, i, 7);
+        k += snprintf(y + k, sizeof y - (size_t)k, "      path: /tail-path\n");
+        size_t n = vless_parse_sub(y, nodes, 4, &st);
+        /* Заголовков больше, чем влезает в headers узла, — узел непригоден, а не «берёт что успел». Главное
+         * здесь — path, лежащий ПОСЛЕ двухсот пар: прежде он пропадал молча, и узел шёл с путём «». */
+        check_n("clash: 200 заголовков — узел не взят (headers не влезли)", 0, (long)n);
+        check("clash: причина — негодные headers", "негодные headers у ws", st.reasons[0].reason);
+        k = snprintf(y, sizeof y,
+                     "proxies:\n  - name: big\n    type: vless\n    server: h.example\n    port: 443\n"
+                     "    uuid: 11111111-2222-3333-4444-555555555555\n    network: ws\n    tls: true\n    servername: h.example\n"
+                     "    ws-opts:\n");
+        for (int i = 0; i < 150; i++)
+            k += snprintf(y + k, sizeof y - (size_t)k, "      x-unused-%03d: v\n", i);
+        k += snprintf(y + k, sizeof y - (size_t)k, "      path: /tail-path\n");
+        n = vless_parse_sub(y, nodes, 4, &st);
+        check_n("clash: 150 лишних ключей перед path — узел взят", 1, (long)n);
+        check("clash: path после лимита пар не потерян", "/tail-path", n ? nodes[0].path : "");
     }
 
     /* Ссылка постквантового Reality. Длина взята с живой подписки: Xray-core 25.9+ кладёт

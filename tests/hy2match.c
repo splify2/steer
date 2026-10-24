@@ -370,6 +370,55 @@ static void test_sub(void) {
     n = hy2_parse_sub(t, nodes, 8, &st);
     CHECK(n == 1 && !strcmp(nodes[0].name, "name"));
     CHECK(hy2_sub_text(txt, strlen(txt), dec, sizeof dec) == txt);
+
+    /* I-526: поле, не влезшее в узел, — отказ с названием и шириной, а не обрезанное значение. hy2wire.h
+     * обещает это для obfs-password; Auth (191) и SNI раньше резались молча. */
+    {
+        static char url[2048];
+        char lg[400];
+        memset(lg, 'q', sizeof lg - 1);
+        lg[sizeof lg - 1] = '\0';
+        snprintf(url, sizeof url, "hysteria2://%s@h.example:443/?sni=h.example", lg);
+        n = hy2_parse_sub(url, nodes, 8, &st);
+        CHECK(n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "auth длиннее 191 байт"));
+        snprintf(url, sizeof url, "hysteria2://pw@h.example:443/?obfs=salamander&obfs-password=%s", lg);
+        n = hy2_parse_sub(url, nodes, 8, &st);
+        CHECK(n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "obfs-password длиннее 128 байт"));
+        snprintf(url, sizeof url, "hysteria2://pw@h.example:443/?sni=%s", lg);
+        n = hy2_parse_sub(url, nodes, 8, &st);
+        CHECK(n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "sni длиннее 127 байт"));
+        /* Пароль obfs в 300 знаков: прежняя копия значения в 512 байт его всё же вмещала, но поле — 128. */
+        snprintf(url, sizeof url, "hysteria2://pw@h.example:443/?obfs=salamander&obfs-password=okpass1");
+        n = hy2_parse_sub(url, nodes, 8, &st);
+        CHECK(n == 1 && !strcmp(nodes[0].obfs_pass, "okpass1"));
+        /* Конфиг Xray: то же самое. */
+        static char js[2048];
+        snprintf(js, sizeof js,
+                 "{\"outbounds\":[{\"protocol\":\"hysteria\",\"tag\":\"x\",\"settings\":{\"version\":2,\"address\":\"h.example\",\"port\":443},"
+                 "\"streamSettings\":{\"hysteriaSettings\":{\"version\":2,\"auth\":\"%s\"}}}]}", lg);
+        n = hy2_parse_sub(js, nodes, 8, &st);
+        CHECK(n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "auth длиннее 191 байт"));
+        /* Параметр без «=» (obfs) не роняет разбор: значение — пустая строка, писать в неё нельзя. */
+        n = hy2_parse_sub("hysteria2://pw@h.example:443/?insecure&obfs", nodes, 8, &st);
+        CHECK(n == 1);
+    }
+
+    /* Конфиг Xray крупнее 131072 токенов: узел после большого массива находится (прежде — ноль узлов и тишина). */
+    {
+        size_t cap = 8 * 1024 * 1024;
+        char *big = malloc(cap);
+        size_t o = (size_t)snprintf(big, cap, "{\"junk\":[");
+        for (int i = 0; i < 150000; i++) o += (size_t)snprintf(big + o, cap - o, "%s1", i ? "," : "");
+        o += (size_t)snprintf(big + o, cap - o,
+             "],\"outbounds\":[{\"protocol\":\"hysteria\",\"tag\":\"late\",\"settings\":{\"version\":2,\"address\":\"h.example\",\"port\":443},"
+             "\"streamSettings\":{\"hysteriaSettings\":{\"version\":2,\"auth\":\"a\"}}}]}");
+        n = hy2_parse_sub(big, nodes, 8, &st);
+        CHECK(n == 1 && !strcmp(nodes[0].name, "late"));
+        free(big);
+        /* Оборванный конфиг — не тишина, а запись о пропуске. */
+        n = hy2_parse_sub("{\"outbounds\":[{\"protocol\":\"hyst", nodes, 8, &st);
+        CHECK(n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "конфиг подписки не разобран"));
+    }
 }
 
 /* Пределы: подписка на 500 узлов из файла, ссылка длиннее стекового буфера, диапазонов портов
