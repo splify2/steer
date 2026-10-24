@@ -1050,6 +1050,79 @@ EOF
 refused "quic: block у списка srs — ещё не поддерживается" "ещё не поддерживается"
 
 
+# ---- family / on_family_unavailable — политика семейства IP правила (R-154) ----------------------
+printf 'example.com\n' > "$tmp/fd.dom"
+printf '203.0.113.0/24\n2001:db8:5::/48\n' > "$tmp/fp.lst"
+y <<'EOF'
+version: 2
+lan: { devices: [br-lan] }
+lists:
+  web: { domains_file: TMP/fd.dom }
+  nets: { prefixes_file: TMP/fp.lst }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  off: { kind: interface, device: wg1, ipv6: off }
+rules:
+  - { name: r4, to: [web], out: wg0, family: 4 }
+  - { name: r6, to: [nets], out: wg0, family: 6 }
+  - { name: rf, to: [web], out: off, family: 6 }
+  - { name: rb, to: [web], out: off, family: 6, on_family_unavailable: block }
+  - { name: ra, to: all, out: wg0, family: 4 }
+EOF
+accepted "family и on_family_unavailable — принимаются"
+out="$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"
+tab="$("$BIN" dnsd-table --spec "$tmp/s.yaml" $S 2>&1)"
+# Хвост имени набора: v — только IPv4, w — только IPv6 с запасом, k — без запаса; наборы разные.
+if echo "$out" | grep -q 'set wg0_domv {' && echo "$out" | grep -q 'set wg0_ipw {' &&
+   echo "$out" | grep -q 'set off_domw {' && echo "$out" | grep -q 'set off_domk {'; then ok; else bad "политика семейства — наборы с хвостом v/w/k" "$(echo "$out" | grep 'set ')"; fi
+# family: 4 — правила IPv6 у набора нет; family: 6 — правила IPv4 нет, только поиск в наборе IPv6.
+if ! echo "$out" | grep -q 'ip6 daddr @wg0_domv6' && echo "$out" | grep -q 'ip6 daddr @wg0_ipw6.*steer:wg0_ipw"' &&
+   ! echo "$out" | grep -q 'ip daddr @wg0_ipw '; then ok; else
+    bad "family: 4 без IPv6-правила, family: 6 без IPv4-правила" "$(echo "$out" | grep 'steer:wg0')"; fi
+# «весь трафик» с family: 4 — правило только для IPv4 и отказ IPv6 клиентов (не утечка), без ingress.
+if echo "$out" | grep -q 'meta nfproto ipv4 meta mark set .*steer:wg0_allv"' &&
+   echo "$out" | grep -q 'meta nfproto ipv6 ip6 daddr != .*reject with icmpx type admin-prohibited comment "steer-v6fam:wg0_allv"'; then ok; else
+    bad "to: all, family: 4 — IPv4 в выход, IPv6 отвергнут" "$(echo "$out" | grep 'allv')"; fi
+if ! echo "$out" | grep -q 'hook ingress'; then ok; else bad "отказ IPv6 по политике — без разметки на ingress"; fi
+# Резолвер: семейства канала — 4 / 4 (запас) / блок (режим 2, семейство 6).
+if echo "$tab" | grep -q '^wg0_domv|wg0|0|4|r4|' && echo "$tab" | grep -q '^off_domw|off|0|4|rf|' &&
+   echo "$tab" | grep -q '^off_domk|off|2|6|rb|'; then ok; else bad "таблица резолвера: family, fallback, block" "$tab"; fi
+# convert неподвижен и печатает оба ключа.
+"$BIN" spec convert --spec "$tmp/s.yaml" > "$tmp/c1.yaml" 2>/dev/null
+"$BIN" spec convert --spec "$tmp/c1.yaml" > "$tmp/c2.yaml" 2>/dev/null
+if grep -q 'family: 4' "$tmp/c1.yaml" && grep -q 'family: 6, on_family_unavailable: block' "$tmp/c1.yaml" &&
+   ! grep -q 'family: both' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+    bad "family — spec convert неподвижен, умолчание не печатается" "$(grep family "$tmp/c1.yaml")"; fi
+# Спека без ключей — ни хвостов, ни отказа steer-v6fam.
+sed -e 's/, family: [46]//' -e 's/, on_family_unavailable: block//' "$tmp/s.yaml" > "$tmp/s0.yaml"
+out0="$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run --spec "$tmp/s0.yaml" $S 2>&1)"
+if ! echo "$out0" | grep -q 'steer-v6fam'; then ok; else bad "без family правил steer-v6fam нет"; fi
+y <<'EOF'
+version: 2
+lists:
+  d: { domains_file: TMP/fd.dom }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+rules:
+  - { name: d, to: [d], out: wg0, family: 5 }
+EOF
+refused "family: 5 — отказ" "нужен 4, 6 или both"
+sed -i 's/family: 5/on_family_unavailable: maybe/' "$tmp/s.yaml"
+refused "on_family_unavailable: maybe — отказ" "нужен block или fallback"
+sed -i 's/on_family_unavailable: maybe/family: 4, on_family_unavailable: block/' "$tmp/s.yaml"
+refused "block без family: 6 — отказ" "действует только при family: 6"
+y <<'EOF'
+version: 2
+lists:
+  s: { srs: TMP/x.srs }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+rules:
+  - { name: s, to: [s], out: wg0, family: 6 }
+EOF
+refused "family: 6 у списка srs — ещё не поддерживается" "ещё не поддерживается"
+
+
 echo "v2match: разбор v2 — $pass проверок прошли"
 if [ "$fail" -gt 0 ]; then echo "v2match: ПРОВАЛЕНО $fail"; exit 1; fi
 exit 0

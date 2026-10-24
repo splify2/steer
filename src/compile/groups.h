@@ -77,6 +77,13 @@ struct group {
      * вызывающий задаёт до build_groups. Набору тогда нужен флаг timeout (адреса real-ip — со
      * сроком ответа). */
     int dom6;
+    /* Политика семейства IP (R-154; struct spec_rule). famreq/famblk — как записаны у правил группы
+     * (входят в ключ слияния и в хвост имени набора: правила с разной политикой — разные наборы).
+     * fam — какие половины остаются по итогу (rule_fam_eff: биты 1 — IPv4, 2 — IPv6; считает
+     * build_groups по выходу и клиентам группы), blocked — IPv6 нужен, а его нет, и запаса нет:
+     * правило не ведёт ничего. У группы без политики fam — 3, и всё, как до неё. */
+    int famreq, famblk;
+    int fam, blocked;
     /* Which channels fed it — reported so a counter still has names behind it. */
     const char **members;       /* куча, растёт по числу каналов группы (member_add) */
     size_t members_n, members_cap;
@@ -121,7 +128,7 @@ static inline int group_has_set(const struct group *g) {
  * Набора без элементов не заводится: пустой поиск на каждом пакете IPv6 ничего бы не дал. У
  * доменной группы с dom6 набор есть всегда — его наполняет резолвер (fake-IP v6, real-ip v6). */
 static inline int group_has_set6(const struct group *g) {
-    return !g->extra && (g->addrs6 || g->srs_addrs6 || g->dom6);
+    return !g->extra && (g->fam & 2) && (g->addrs6 || g->srs_addrs6 || g->dom6);
 }
 
 /* Имя парного набора IPv6: имя группы и «6». Имена групп рассчитаны на 31 символ старых ядер

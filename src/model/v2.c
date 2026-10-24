@@ -1758,7 +1758,7 @@ static int quic_clone(struct v2 *x, struct spec_rule *r, const struct ynode *qn,
 static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     struct spec *s = x->s;
     static const char *const K[] = { "name", "for", "to", "out", "resolve", "dns", "enabled", "scope",
-                                     "quic", NULL };
+                                     "quic", "family", "on_family_unavailable", NULL };
     if (spec_reserve_rule(s, s->rule_n + 1) != 0)
         return fail(x, n, "rules: недостаточно памяти для спеки (правил: %zu)", s->rule_n + 1);
     struct spec_rule *r = &s->rule[s->rule_n];
@@ -1887,12 +1887,44 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
             return fail(x, qn, "%s: «%s» — нужен block (отвергать UDP/443) или allow", w, sv);
     }
 
+    /* Политика семейства IP (R-154). both — записанное умолчание, как allow у quic. */
+    const struct ynode *fyn = ynode_get(n, "family");
+    if (fyn) {
+        snprintf(w, sizeof(w), "правило %s: family", rn);
+        if (str_of(x, fyn, w, &sv)) return -1;
+        if (!strcmp(sv, "4")) r->family = 4;
+        else if (!strcmp(sv, "6")) r->family = 6;
+        else if (strcmp(sv, "both") != 0) return fail(x, fyn, "%s: «%s» — нужен 4, 6 или both", w, sv);
+    }
+    const struct ynode *ufn = ynode_get(n, "on_family_unavailable");
+    if (ufn) {
+        snprintf(w, sizeof(w), "правило %s: on_family_unavailable", rn);
+        if (str_of(x, ufn, w, &sv)) return -1;
+        if (!strcmp(sv, "block")) r->fam_block = 1;
+        else if (strcmp(sv, "fallback") != 0)
+            return fail(x, ufn, "%s: «%s» — нужен block или fallback", w, sv);
+        /* Недоступным бывает только IPv6, и только у правила, которое просит именно его: у 4
+         * семейство есть всегда, а у both правило без IPv6 остаётся по IPv4, как до политики. */
+        if (r->fam_block && r->family != 6)
+            return fail(x, ufn, "правило %s: on_family_unavailable: block действует только при "
+                        "family: 6 — IPv4 у выхода есть всегда, а при both без IPv6 правило "
+                        "остаётся по IPv4", rn);
+    }
+
     /* Ссылки на клиентов правила до объединения — для проверок ниже. */
     size_t refs_n = r->clients_n;
     unsigned *refs = refs_n ? (unsigned *)spec_memdup(s, r->clients, refs_n * sizeof(unsigned)) : NULL;
     if (refs_n && !refs) return fail(x, n, "правило %s: недостаточно памяти для спеки", rn);
     if (r->lists_n > 1 && merge_lists(x, r, tn, rn)) return -1;
     if (r->clients_n > 1 && merge_clients(x, r, fn, rn)) return -1;
+    if (r->family == 6) {
+        /* Доп. группа набора .srs (клиент, приложение, исключения) половины IPv6 не имеет
+         * (group_has_set6), и IPv6-правило из неё получилось бы пустым — отказ, а не молчание. */
+        for (size_t k = 0; k < r->lists_n; k++)
+            if (s->list[r->lists[k]].srs_n)
+                unsup(x, fyn, "правило %s: family: 6 со списком srs — пока со списками prefixes_file "
+                      "и domains_file или с to: all", rn);
+    }
     if (r->quic_block) {
         const struct spec_list *l = r->lists_n ? &s->list[r->lists[0]] : NULL;
         /* Проверки — и у выключенного правила: это не смысл правила, а применимость ключа. */

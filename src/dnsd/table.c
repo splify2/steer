@@ -182,6 +182,14 @@ chm_t dch_fakeip_only(chm_t mask) {
     return mask;
 }
 
+/* У всех ли каналов маски нет половины IPv4 (правила family: 6): тогда A имени — пустой ответ. */
+int dch_none_v4(chm_t mask) {
+    if (!mask) return 0;
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(mask, i) && (g_dch[i].fam & DCH_V4)) return 0;
+    return 1;
+}
+
 int dch_all_v6(chm_t mask) {
     if (!mask) return 0;
     for (size_t i = 0; i < g_dch_n; i++)
@@ -273,6 +281,7 @@ static void dch_name(const struct spec *sp, char *dst, size_t n, const struct sp
     const struct spec_client *w = rule_who(sp, c);
     group_set_name(sp, dst, n, rule_out(sp, c)->name, "dom", w->from, w->from_n, realip,
                    &rule_list(sp, c)->l4);
+    set_name_famtag(dst, n, rule_famtag(c));       /* политика семейства (R-154) — как у компилятора */
 }
 
 /* ---- каналы с наборами sing-box -----------------------------------------------------------
@@ -287,7 +296,7 @@ static size_t g_plan_cap;
 
 static void unit_name(const struct spec *sp, const struct spec_rule *c, const struct srs_part *p,
                       int realip, char *dst, size_t n) {
-    if (!p) { dch_name(sp, dst, n, c, realip); return; }
+    if (!p) { dch_name(sp, dst, n, c, realip); return; }   /* хвост политики — внутри */
     const struct spec_client *w = rule_who(sp, c);
     const struct spec_list *l = rule_list(sp, c);
     const char *out = rule_out(sp, c)->name;
@@ -298,6 +307,7 @@ static void unit_name(const struct spec *sp, const struct spec_rule *c, const st
     else
         group_set_name(sp, dst, n, out, "dom", w->from, w->from_n, realip,
                        l4match_same(&p->l4, &l->l4) ? &l->l4 : &p->l4);
+    set_name_famtag(dst, n, rule_famtag(c));
 }
 
 /* Строки источников, собранные здесь (выбор клауз), живут до следующей сборки таблицы. */
@@ -437,10 +447,21 @@ static int dch_join_domain_group(const struct spec *sp, const struct spec_rule *
  * ответ, как до 1.9, хотя компилятор набор «<имя>6» и двойника заводит. Доводы — у поля в
  * spec.h. Таблица демону несёт это полем семейства «4», и резолверу номер формата спеки знать не
  * нужно. */
-static int dch_fam(const struct spec *sp, const struct spec_rule *r, int realip, int extra) {
+static int dch_fam(const struct spec *sp, const struct spec_rule *r, int realip, int extra,
+                   int *blocked) {
+    *blocked = 0;
     if (extra || sp->dns.names_v4) return DCH_V4;
     const struct spec_client *w = rule_who(sp, r);
     const struct output *o = rule_out(sp, r);
+    /* Политика семейства правила (R-154): половины и «блок» считает та же rule_fam_eff, что у
+     * компилятора (groups.c), по тому же ответу dom6_ok. Блок — канал отвечает пустым адресом
+     * (kinds/block.c) на A и AAAA: имя правила не открывается, а не уходит напрямую. */
+    if (r->family) {
+        int v6 = dom6_ok(sp, o, w->from, w->from_n, realip, 0) &&
+                 (realip || dom6_ok(sp, o, w->from, w->from_n, realip, nft_compat_seen6()));
+        int e = rule_fam_eff(r, v6, blocked);
+        return (e & 1 ? DCH_V4 : 0) | (e & 2 ? DCH_V6 : 0);
+    }
     if (!dom6_ok(sp, o, w->from, w->from_n, realip, 0)) return DCH_V4;
     if (!realip && !dom6_ok(sp, o, w->from, w->from_n, realip, nft_compat_seen6())) return DCH_V4;
     return DCH_V4 | DCH_V6;
@@ -502,10 +523,11 @@ static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
         else if (!(p->own && l->prefixes_n && p->kind != SP_EXTRA) ||
                  !dch_join_domain_group(sp, c, p, set, sizeof(set), &realip, &up))
             continue;
-        struct dchan *d = dch_slot(set, realip, up, rule_out(sp, c)->name,
-                                   dch_fam(sp, c, realip, p->kind == SP_EXTRA));
+        int blk;
+        int fam = dch_fam(sp, c, realip, p->kind == SP_EXTRA, &blk);
+        struct dchan *d = dch_slot(set, realip, up, rule_out(sp, c)->name, fam);
         if (!d) return;
-        if (out_is_block(rule_out(sp, c))) d->block = 1;
+        if (out_is_block(rule_out(sp, c)) || blk) d->block = 1;
         dch_name_rule(d, c, p->has_dom);
         int composite = p->kind == SP_COMPOSITE;
         if (p->own) {
@@ -708,9 +730,10 @@ void dch_build(const struct spec *sp) {
             snprintf(nd->set, sizeof(nd->set), "%s", set);
             snprintf(nd->out, sizeof(nd->out), "%.31s", rule_out(sp, r)->name);
             nd->realip = realip;
-            nd->block = out_is_block(rule_out(sp, r));
+            int blk;
+            nd->fam = dch_fam(sp, r, realip, 0, &blk);
+            nd->block = out_is_block(rule_out(sp, r)) || blk;
             nd->up = up;
-            nd->fam = dch_fam(sp, r, realip, 0);
             k = g_dch_n++;
         }
         if (!g_dch[k].chan[0] || (!g_dch[k].chan_dom && l->domains_n)) {

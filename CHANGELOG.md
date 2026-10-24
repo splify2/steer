@@ -46,6 +46,7 @@
 ✅ `steer spec convert --json` выводит спеку v2 JSON-объектом  
 ✅ `status` показывает состояние WARP-туннелей, а также колонию и страну живого туннеля  
 ✅ `status` показывает, поддерживаются ли деление ClientHello и DoH3
+✅ Семейство IP по правилам: `family: 4 | 6 | both` и `on_family_unavailable: block | fallback` — IPv6 без утечек, управление по сервисам
 
 ## 2.0.5
 

@@ -473,6 +473,70 @@ check "спека v1: AAAA real-ip в выход с IPv6 — пустой отв
 check "спека v1: AAAA fake-IP в выход с IPv6 — пустой ответ" "0" "$v1_f6"
 check "спека v1: имя вне правил — настоящий адрес" "1" "$v1_out"
 
+# ---- политика семейства правила (R-154, docs/spec-v2.md: family, on_family_unavailable) -------
+# Тот же апстрим (на всё — настоящая запись), четыре правила real-ip (ядро резолверу не нужно):
+#   p4 — family: 4, выход с IPv6:       AAAA пуст, A — настоящий (ANCOUNT 1);
+#   p6 — family: 6, выход с IPv6:       AAAA настоящий, A пуст — не настоящий адрес мимо правила;
+#   pf — family: 6, выход без IPv6, запас (fallback): работает по IPv4 — AAAA пуст, A настоящий;
+#   pk — family: 6, выход без IPv6, block: имя не открывается — A и AAAA нулевые адреса.
+cat > "$tmp/qrr.py" <<'PY'
+import socket, struct, sys
+port, name, qtype = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+q = struct.pack('>HHHHHH', 0x7b7b, 0x0100, 1, 0, 0, 0)
+for l in name.split('.'): q += bytes([len(l)]) + l.encode()
+q += b'\x00' + struct.pack('>HH', qtype, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(q, ('127.0.0.1', port))
+try:
+    d, _ = s.recvfrom(2048)
+    n = struct.unpack('>H', d[6:8])[0]
+    qe = 12
+    while d[qe]: qe += 1 + d[qe]
+    qe += 5                                     # конец вопроса; дальше первая запись ответа
+    rd = b''
+    if n:
+        rl = struct.unpack('>H', d[qe + 10:qe + 12])[0]
+        rd = d[qe + 12:qe + 12 + rl]
+    print(n, 'zero' if n and not any(rd) else 'real' if n else '-')
+except socket.timeout:
+    print('timeout')
+PY
+for n in p4 p6 pf pk; do printf '%s.test\n' "$n" > "$tmp/$n.lst"; done
+printf '{"version":2,"lan":{"addr":["127.0.0.0/8"]},'\
+'"lists":{"p4":{"domains_file":"%s/p4.lst"},"p6":{"domains_file":"%s/p6.lst"},'\
+'"pf":{"domains_file":"%s/pf.lst"},"pk":{"domains_file":"%s/pk.lst"}},'\
+'"outputs":{"vpn":{"kind":"interface","device":"lo"},"tg":{"kind":"tgws","domain":"example.com"}},'\
+'"rules":[{"name":"p4","to":"p4","out":"vpn","resolve":"realip","family":"4"},'\
+'{"name":"p6","to":"p6","out":"vpn","resolve":"realip","family":"6"},'\
+'{"name":"pf","to":"pf","out":"tg","resolve":"realip","family":"6"},'\
+'{"name":"pk","to":"pk","out":"tg","resolve":"realip","family":"6","on_family_unavailable":"block"}]}' \
+    "$tmp" "$tmp" "$tmp" "$tmp" > "$tmp/specfam.json"
+tabfam="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/specfam.json" 2>/dev/null)"
+LPORT5=15304
+python3 "$tmp/upstream-aaaa.py" "$UPORT3" & UPID5=$!
+sleep 1
+STEER_NFT_COMPAT=modern "$BIN" dnsd --spec "$tmp/specfam.json" --state-dir "$tmp/state5" \
+    --listen-port "$LPORT5" --upstream-port "$UPORT3" > "$tmp/log5" 2>&1 & DPID5=$!
+sleep 1
+if ! kill -0 "$DPID5" 2>/dev/null; then
+    echo "FAIL резолвер (семейство) не поднялся:"; cat "$tmp/log5"; exit 1
+fi
+fq() { python3 "$tmp/qrr.py" "$LPORT5" "$1" "$2"; }
+fam_p4="$(fq p4.test 1) / $(fq p4.test 28)"
+fam_p6="$(fq p6.test 1) / $(fq p6.test 28)"
+fam_pf="$(fq pf.test 1) / $(fq pf.test 28)"
+fam_pk="$(fq pk.test 1) / $(fq pk.test 28)"
+kill "$DPID5" 2>/dev/null; wait "$DPID5" 2>/dev/null
+kill "$UPID5" 2>/dev/null; wait "$UPID5" 2>/dev/null
+
+check "таблица: семейства правил с политикой — 4, 6, 4 (запас), 6 с блоком (режим 2); режим real-ip — 1" \
+    "p4:4:1 p6:6:1 pf:4:1 pk:6:2" \
+    "$(printf '%s\n' "$tabfam" | awk -F'|' 'NF > 4 { printf "%s%s:%s:%s", s, $5, $4, $3; s = " " }')"
+check "family: 4 — A настоящий, AAAA пуст" "1 real / 0 -" "$fam_p4"
+check "family: 6 — A пуст (не настоящий адрес мимо правила), AAAA настоящий" "0 - / 1 real" "$fam_p6"
+check "family: 6, выход без IPv6, fallback — по IPv4: A настоящий, AAAA пуст" "1 real / 0 -" "$fam_pf"
+check "family: 6, выход без IPv6, block — A и AAAA нулевые" "1 zero / 1 zero" "$fam_pk"
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'

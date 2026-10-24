@@ -197,17 +197,30 @@ static int who6_ok(const struct spec *sp, const struct group *g) {
 
 /* Есть ли у группы правило IPv4: «кто» из одних адресов IPv6 его не даёт. */
 static int who4_ok(const struct group *g) {
+    if (!(g->fam & 1)) return 0;               /* family: 6 — IPv4 не наше дело (R-154) */
     return who_any_family(g) || who_count(g, 4);
 }
 
 /* Правило IPv4 группы ловит и IPv6: «кто» без адресов и назначение без набора («весь трафик»). */
 static int group_v4_agn(const struct group *g) {
-    return who_any_family(g) && !group_has_set(g) && !g->xsrc_n;
+    /* С политикой семейства правило IPv4 семейство называет само (ir_family в build_mark_rule4), и
+     * двойник у группы свой — «оба семейства одним правилом» остаётся только у группы без неё. */
+    return !g->famreq && who_any_family(g) && !group_has_set(g) && !g->xsrc_n;
+}
+
+/* IPv6 клиентов группы «весь трафик» с политикой семейства, оставившей её без половины IPv6, —
+ * отвергается правилом в prerouting_mark: иначе при family: 4 (или запасном IPv4) он шёл бы
+ * напрямую мимо выхода, а правило «весь трафик» именно это и обещает не делать. Выходу без метки
+ * (direct) нечего охранять — его трафик и так идёт обычным путём. */
+static int group_v6_guard(const struct spec *sp, const struct group *g, const struct output *o) {
+    return g->famreq && g->all && !g->xsrc_n && !(g->fam & 2) && out_needs_mark(o) &&
+           who6_ok(sp, g);
 }
 
 /* Нужен ли группе v6-двойник: есть набор IPv6 или это «весь трафик» (не доп. группа с «ip saddr»
  * из набора — ограничение по клиенту у неё только IPv4), и правило IPv4 IPv6 не ловит. */
 static int group_needs6(const struct spec *sp, const struct group *g) {
+    if (!(g->fam & 2)) return 0;               /* family: 4 или IPv6 недоступен с запасом (R-154) */
     if (group_v4_agn(g)) return 0;
     if (!group_has_set6(g) && !(g->all && !g->xsrc_n)) return 0;
     return who6_ok(sp, g);
@@ -757,6 +770,17 @@ static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const st
             carried = 1;
             build_mark_rule4(c, sp, g, o, mh);
         }
+        /* Политика семейства: IPv6 «весь трафик» без половины IPv6 — отказ, не утечка. */
+        if (mh != MH_INGRESS && group_v6_guard(sp, g, o)) {
+            struct nft_rule *rg = ir_rule(c);
+            ir_rule_fam(rg, 6);
+            x_from6(rg, sp, g, 0, 1);
+            x_l4(rg, g->l4, 0);
+            ir_x(rg, "ip6 daddr != { ::1, fe80::/10, fc00::/7, ff00::/8 }");
+            ir_counter(rg, 0, 0);
+            ir_x(rg, "reject with icmpx type admin-prohibited");
+            ir_comment(rg, "steer-v6fam:%s", g->name);
+        }
         if (group_needs6(sp, g)) {
             struct nft_rule *r6 = ir_rule(c);
             ir_rule_fam(r6, 6);
@@ -791,6 +815,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
     {
         struct nft_rule *r = ir_rule(c);
         x_from(r, sp, g);
+        if (g->famreq && !group_has_set(g) && who_any_family(g)) ir_family(r, 4);
         x_dest(r, g, 0, group_has_set(g));
         /* НАШИ биты, а не всё слово: `mark and ~маска or метка`. Перезапись стирала метку
          * mwan3/pbr/sqm молча, а их перезапись — нашу, и тогда помеченный пакет уходил по
@@ -949,6 +974,11 @@ static size_t ingress_devs(const struct spec *sp, const struct groups *gr, const
      * раньше отказа пакет уже получил бы метку выхода (разметка на ingress решает первой). */
     for (size_t i = 0; i < gr->n; i++)
         if (gr->g[i].l4 && gr->g[i].l4->quic_block) return 0;
+    /* То же у отказа IPv6 «весь трафик» по политике семейства (group_v6_guard). */
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct output *go = out_by_name(sp, gr->g[i].out);
+        if (go && !group_is_local(&gr->g[i]) && group_v6_guard(sp, &gr->g[i], go)) return 0;
+    }
     size_t n = 0;
     for (size_t i = 0; i < sp->lan_dev_n; i++)
         if (nft_ingress_all_devs() || if_nametoindex(sp->lan_dev[i]))
@@ -1875,7 +1905,7 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
         if (!group_is_local(g)) continue;
         struct output *o = out_by_name(sp, g->out);
         if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
-        if (g->all && out_needs_mark(o) && !out_v6_ok(o)) {
+        if (g->all && out_needs_mark(o) && (!out_v6_ok(o) || (g->famreq && !(g->fam & 2)))) {
             /* С тем же сужением по протоколу и портам, что и канал: канал «UDP 50000-65535»
              * не вправе отнимать у приложения весь IPv6. Своя сеть (петля, link-local, ULA,
              * мультикаст) — не наружу и не мимо туннеля, её не трогаем. */
@@ -1889,27 +1919,30 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
             ir_x(r, "reject");
             ir_comment(r, "steer-v6:%s", g->name);
         }
-        struct nft_rule *r = ir_rule(c);
-        if (local_who(r, g, e) != 0) return -1;
-        /* «Весь трафик» — это интернет, а не своя сеть: принтер, NAS и Chromecast в Wi-Fi
-         * через туннель не видны. Только IPv4 — IPv6 такой группы отвергнут правилом выше
-         * (выход без IPv6) или уведён двойником ниже. */
-        if (g->all) {
-            ir_family(r, 4);
-            ir_x(r, "ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, "
-                    "192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }");
-        } else {
-            ir_rule_fam(r, 4);          /* поиск в наборе IPv4 — только IPv4 */
+        struct nft_rule *r;
+        if (g->fam & 1) {
+            r = ir_rule(c);
+            if (local_who(r, g, e) != 0) return -1;
+            /* «Весь трафик» — это интернет, а не своя сеть: принтер, NAS и Chromecast в Wi-Fi
+             * через туннель не видны. Только IPv4 — IPv6 такой группы отвергнут правилом выше
+             * (выход без IPv6) или уведён двойником ниже. */
+            if (g->all) {
+                ir_family(r, 4);
+                ir_x(r, "ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, "
+                        "192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }");
+            } else {
+                ir_rule_fam(r, 4);          /* поиск в наборе IPv4 — только IPv4 */
+            }
+            x_dest(r, g, 0, group_has_set(g));
+            x_mark(r, o, o->mark);
+            x_counter_carried(r, g->name, 0);
+            ir_x(r, "return");
+            ir_comment(r, "steer:%s", g->name);
         }
-        x_dest(r, g, 0, group_has_set(g));
-        x_mark(r, o, o->mark);
-        x_counter_carried(r, g->name, 0);
-        ir_x(r, "return");
-        ir_comment(r, "steer:%s", g->name);
         /* v6-двойник (docs/architecture.md, «4б»). «Весь трафик» в выход с IPv6 (или direct) —
          * интернет IPv6 мимо своей сети, как у IPv4 выше; с набором IPv6 — поиск в нём. Выход без
          * IPv6: у «весь трафик» отказ стоит выше, у набора — отказ здесь же, тем же текстом. */
-        int all6 = g->all && out_v6_ok(o);
+        int all6 = g->all && out_v6_ok(o) && (g->fam & 2);
         if (!all6 && !group_has_set6(g)) continue;
         r = ir_rule(c);
         if (local_who(r, g, e) != 0) return -1;
