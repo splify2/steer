@@ -121,10 +121,8 @@ LIBSTEER_1 {
     ir_table_add;
     ir_table_find;
     ir_x;
-    js_lit;
     jsonw_str;
     jsonw_str_ascii;
-    js_ws;
     kind_at;
     kind_by_name;
     kind_count;
@@ -366,7 +364,6 @@ LIBSTEER_1 {
     urltest_url_parse;
     vless_insecure;
     vless_set_insecure;
-    wb_http_split;
     wb_https;
     wb_json_get;
     wb_resp_free;
