@@ -40,9 +40,9 @@
  * живут в сокете, а не в записи соединения), и угадывать его по порту значило бы показывать
  * человеку неправду.
  *
- * СЧЁТЧИКИ (packets/bytes, reply_packets/reply_bytes) — только если ядро их ведёт: у 4.9 и у
- * свежих ядер это sysctl net.netfilter.nf_conntrack_acct, по умолчанию выключенный, и запись,
- * заведённая без него, счётчиков не получает и потом. Нет атрибута — нет поля: ноль означал бы
+ * СЧЁТЧИКИ (packets/bytes, reply_packets/reply_bytes) — только если ядро их ведёт: это sysctl
+ * net.netfilter.nf_conntrack_acct, по умолчанию выключенный, и запись, заведённая без него,
+ * счётчиков не получает и потом. Нет атрибута — нет поля: ноль означал бы
  * «ничего не передано», а это неправда.
  *
  * ПРЕДЕЛА ЧИСЛА ЗАПИСЕЙ НЕТ: в ответе все подошедшие соединения (раньше — первые 2000, остальные
@@ -83,10 +83,9 @@ static const char *ct_tcp_state(uint8_t st) {
     return st < sizeof(N) / sizeof(N[0]) ? N[st] : NULL;
 }
 
-/* Число из атрибута счётчика: be64 у свежих ядер и у 4.9, be32 у очень старых (CTA_COUNTERS32_*).
- * Атрибут be64 в сообщении выровнен только на 4 байта — поэтому чтение по байтам, а не
- * разыменование. */
-static int ct_counter(const struct nlattr *nest, int t64, int t32, unsigned long long *v) {
+/* Число из атрибута счётчика (be64). Атрибут в сообщении выровнен только на 4 байта — поэтому
+ * чтение по байтам, а не разыменование. */
+static int ct_counter(const struct nlattr *nest, int t64, unsigned long long *v) {
     const struct nlattr *x = ct_attr_in(nest, t64);
     if (x && x->nla_len >= NLA_HDRLEN + 8) {
         /* По байтам, старший первым: так одинаково верно и на little-endian телефоне, и на
@@ -97,22 +96,15 @@ static int ct_counter(const struct nlattr *nest, int t64, int t32, unsigned long
         *v = r;
         return 1;
     }
-    x = ct_attr_in(nest, t32);
-    if (x && x->nla_len >= NLA_HDRLEN + 4) {
-        uint32_t b;
-        memcpy(&b, (const uint8_t *)x + NLA_HDRLEN, 4);
-        *v = ntohl(b);
-        return 1;
-    }
     return 0;
 }
 
 static void ct_print_counters(FILE *out, const struct nlattr *nest, const char *pfx) {
     unsigned long long v;
     if (!nest) return;
-    if (ct_counter(nest, CTA_COUNTERS_PACKETS, CTA_COUNTERS32_PACKETS, &v))
+    if (ct_counter(nest, CTA_COUNTERS_PACKETS, &v))
         fprintf(out, ",\"%spackets\":%llu", pfx, v);
-    if (ct_counter(nest, CTA_COUNTERS_BYTES, CTA_COUNTERS32_BYTES, &v))
+    if (ct_counter(nest, CTA_COUNTERS_BYTES, &v))
         fprintf(out, ",\"%sbytes\":%llu", pfx, v);
 }
 
