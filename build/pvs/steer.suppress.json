@@ -138,14 +138,6 @@
    "Message": "Expression 'n < _' is always false."
   },
   {
-   "CodeCurrent": 6373195,
-   "CodeNext": 2437535737,
-   "CodePrev": 339077957,
-   "ErrorCode": "V522",
-   "FileName": "legacy.c",
-   "Message": "There might be dereferencing of a potential null pointer 'c'."
-  },
-  {
    "CodeCurrent": 3180389549,
    "CodeNext": 3114853549,
    "CodePrev": 2114075824,
@@ -1306,14 +1298,6 @@
    "Message": "The 'strcmp' function returns _ if corresponding strings are equal. Consider examining the condition for mistakes."
   },
   {
-   "CodeCurrent": 6373195,
-   "CodeNext": 2437535737,
-   "CodePrev": 14979,
-   "ErrorCode": "V522",
-   "FileName": "legacy.c",
-   "Message": "There might be dereferencing of a potential null pointer 'c'."
-  },
-  {
    "CodeCurrent": 3193692641,
    "CodeNext": 125,
    "CodePrev": 149977,
@@ -1752,14 +1736,6 @@
    "ErrorCode": "V658",
    "FileName": "urltls.c",
    "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the 'got < sizeof (line) - ln' expression."
-  },
-  {
-   "CodeCurrent": 161756011,
-   "CodeNext": 2828984675,
-   "CodePrev": 1619,
-   "ErrorCode": "V756",
-   "FileName": "legacy.c",
-   "Message": "The 'i' counter is not used inside a nested loop. Consider inspecting usage of 'k' counter."
   },
   {
    "CodeCurrent": 3850270379,
@@ -2730,14 +2706,6 @@
    "Message": "A value is being subtracted from the unsigned variable. This can result in an overflow. In such a case, the '<' comparison operation can potentially behave unexpectedly. Consider inspecting the '(size_t) nw - off < gso' expression."
   },
   {
-   "CodeCurrent": 2065824530,
-   "CodeNext": 125,
-   "CodePrev": 489968298,
-   "ErrorCode": "V522",
-   "FileName": "legacy.c",
-   "Message": "There might be dereferencing of a potential null pointer 'c'."
-  },
-  {
    "CodeCurrent": 3386705835,
    "CodeNext": 1113598978,
    "CodePrev": 3092497,
@@ -2768,14 +2736,6 @@
    "ErrorCode": "V566",
    "FileName": "xsclient.c",
    "Message": "The integer constant is converted to pointer. Possibly an error or a bad coding style: (void *) _"
-  },
-  {
-   "CodeCurrent": 1868839813,
-   "CodeNext": 125,
-   "CodePrev": 489968298,
-   "ErrorCode": "V522",
-   "FileName": "legacy.c",
-   "Message": "There might be dereferencing of a potential null pointer 'c'."
   },
   {
    "CodeCurrent": 764881773,
