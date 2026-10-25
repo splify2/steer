@@ -1,5 +1,5 @@
-/* Управляющий сокет движка: демон `steer daemon` (он же `steer ctl-serve` — прежнее имя, под
- * которым его запускает сервис телефона) и `steer ctl` (клиент для отладки).
+/* Управляющий сокет движка: демон `steer daemon` (он же `steer ctl-serve` — прежнее имя) и
+ * `steer ctl` (клиент для отладки).
  *
  * ЗАЧЕМ. На роутере управляющий слой splify2 зовёт движок как программу: rpcd исполняет
  * `steer status`, кладёт спеку в /etc/steer и зовёт `steer apply`. На телефоне так нельзя.
@@ -165,8 +165,6 @@
 #include "ynode.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
-/* Выключатель движка — то же свойство, за которым следит init (vendor/der/init/steerd.rc). */
-#define STEER_CTL_PROP "persist.der.steer.enabled"
 
 #define CTL_LINE_MAX    512
 /* ТЕЛО СПЕКИ (check, apply) — защита демона от запроса, который просит памяти без меры (тело
@@ -407,6 +405,9 @@ static void ctl_refuse_now(int c, const char *err, const char *msg) {
 /* ---- выключатель движка ---------------------------------------------------------------- */
 
 #ifdef __BIONIC__
+/* Выключатель движка — то же свойство, за которым следит init (vendor/der/init/steerd.rc). */
+#define STEER_CTL_PROP "persist.der.steer.enabled"
+
 static void ctl_prop_cb(void *cookie, const char *name, const char *value, uint32_t serial) {
     (void)name; (void)serial;
     snprintf((char *)cookie, PROP_VALUE_MAX, "%s", value);
@@ -1096,7 +1097,7 @@ static void mem_status(struct conn *c, struct cbuf *r) {
     } else {
         memcpy(d->view, d->sp, sizeof(*d->view));
         /* Выбор устройств — из памяти сторожа, если сторож — сам демон (--watch); иначе из
-         * файла, который пишет `failover --loop`. */
+         * файла, который пишет `steer failover`. */
         outputs_adopt_active_st(d->view, d->outs ? d->outs : &fo_store_files);
         /* Дамп ruleset для fw_check — один на процесс подкоманды; у демона процесс один на
          * всё время, и дамп берётся заново на каждый ответ. */

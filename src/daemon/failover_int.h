@@ -80,8 +80,8 @@ void active_get_st(struct fo_store *st, const char *out, char *dev, size_t n);
 int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose);
 void cleanup_probe_rule(void);
 int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev);
-/* Швы здоровья/задержки: NULL в бою, стенд подставляет свою пробу — см. health_of в
- * failover.c. */
+/* Швы здоровья/задержки: NULL в бою, стенд подставляет свою пробу — см. hp_start в
+ * failover.c и folat_member в folat.c. */
 extern int (*g_health_probe)(const struct spec *, const struct output *, const char *);
 extern int (*g_latency_probe)(const struct spec *, const struct output *, const char *);
 /* Порог гистерезиса читает переменную окружения один раз и кэширует ответ — стенду нужно

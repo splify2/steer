@@ -94,8 +94,7 @@ int ipv4_span(const char *t, uint32_t *lo, uint32_t *hi) {
 }
 
 /* То же для IPv6 (адрес, префикс, диапазон): границы — 16 байт в порядке сети, сравниваются
- * memcmp. Нужна explain: адрес IPv6 ищется в парных наборах «<группа>6» дампом там, где
- * одиночного запроса элемента нет (старое ядро, составной набор). */
+ * memcmp. Нужна explain: в составном наборе адрес ищется дампом (set_scan_mixed). */
 int ipv6_span(const char *t, uint8_t lo[16], uint8_t hi[16]) {
     char buf[96];
     size_t n = strlen(t);

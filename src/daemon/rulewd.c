@@ -102,7 +102,7 @@
  * Отказ сторожа (apply_failed: снять правило, сбросить таблицу) идёт в цикле демона одним
  * синхронным куском — событие своего снятия страж читает уже после сброса таблицы. `steer down`
  * снимает таблицы nftables раньше правил — проверка видит «таблицы движка нет» и молчит.
- * Сверка — два дампа rtnetlink в процессе (rtnl_rules_text, rtnl_routes_text) и разбор тем же
+ * Сверка — два дампа rtnetlink в процессе (rtnl_rules_dup, rtnl_routes_dup) и разбор тем же
  * route_facts_of, которым сверяет маршрутизацию сторож, — без единого процесса. Пока идёт своя
  * команда, которая сама снимает правила (посреди apply-commit с --drop или --route правило бывает
  * уже снято, а таблица ещё не сброшена), проверка не трогает только выходы, которых команда держит
@@ -468,15 +468,14 @@ static int rule_is_ours(const struct nlmsghdr *h, int *fam, uint32_t *markp, uin
 }
 
 /* Снят ли запасной запрет IPv6 (см. шапку, «ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo»): маршрут IPv6
- * `prohibit default` (или `blackhole default` прежней версии — его заменяет первая же привязка) с
- * метрикой STEER_BACKSTOP_METRIC. Чья это таблица, событие не решает — это
+ * `prohibit default` с метрикой STEER_BACKSTOP_METRIC. Чья это таблица, событие не решает — это
  * сверка по спеке (out_missing): так чужой запрет с той же метрикой стоит лишь одной проверки. */
 static int route_is_backstop6(const struct nlmsghdr *h) {
     const struct rtmsg *rt = NLMSG_DATA(h);
     size_t hl = NLMSG_ALIGN(sizeof(*rt));
     if (h->nlmsg_len < NLMSG_HDRLEN + hl) return 0;
     if (rt->rtm_family != AF_INET6 || rt->rtm_dst_len ||
-        (rt->rtm_type != RTN_PROHIBIT && rt->rtm_type != RTN_BLACKHOLE))
+        rt->rtm_type != RTN_PROHIBIT)
         return 0;
     const char *p = (const char *)rt + hl, *e = (const char *)h + h->nlmsg_len;
     while (p + sizeof(struct rtattr) <= e) {

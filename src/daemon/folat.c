@@ -310,7 +310,6 @@ struct folat {
     struct folat_conf c;
     struct fl_grp **g;
     size_t g_n, g_cap;
-    unsigned long rounds;
 };
 
 /* Массивы замера на n членов. 0 — есть; -1 — нет памяти. */
@@ -391,7 +390,6 @@ static int fl_same(const struct fl_grp *g, const struct output *const *cand, siz
 static void fl_finish(struct fl_grp *g) {
     struct folat *f = g->f;
     g->running = 0;
-    f->rounds++;
     const struct spec *sp = f->c.spec(f->c.arg);
     const struct output *go = fl_group(sp, g->name);
     size_t cn = 0;
@@ -636,8 +634,4 @@ void folat_stop(struct folat *f) {
     free(f->g);
     f->g = NULL;
     f->g_n = f->g_cap = 0;
-}
-
-unsigned long folat_rounds(const struct folat *f) {
-    return f ? f->rounds : 0;
 }

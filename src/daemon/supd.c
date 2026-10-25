@@ -76,10 +76,8 @@
  *      каталога состояния, чьего демона с тем pid и тем временем старта больше нет. Нужно это
  *      не на случай, что PDEATHSIG не сработал, а потому что SIGTERM помощник исполняет не
  *      мгновенно: клиент vless закрывает соединения, обфускатор — сокеты, и новый демон,
- *      поднятый procd через секунду, иначе ещё мог бы застать устройство занятым. Сирот
- *      прежней версии (без STEER_SUPD) узнаём по STEER_EVENT_FD, родителю init и --state-dir в
- *      командной строке — их после обновления поверх упавшего демона тоже некому гасить.
- *      Чужих не трогает: без STEER_EVENT_FD (помощники под procd, `steer supervise`) процесс не
+ *      поднятый procd через секунду, иначе ещё мог бы застать устройство занятым.
+ *      Чужих не трогает: без STEER_EVENT_FD или без STEER_SUPD (помощники под procd, `steer supervise`) процесс не
  *      наш, с меткой другого каталога состояния — чужой демон, с меткой живого демона —
  *      помощник живого демона (второй демон на том же каталоге — не наш случай, и гасить у
  *      него помощников этот демон не берётся).
@@ -262,7 +260,7 @@ static void route_up(struct supd *s, struct helper *h, const char *dev) {
 /* health (мост tgws): путь до ДЦ отставлен — оценка пути, а не помощника целиком, поэтому
  * здоровья выхода она не меняет и сторожа не будит (выход моста сторож не выбирает: устройства у
  * него нет). Демон её помнит — status выхода показывает отставленные пути, пока их срок не
- * вышел (paths_down, supd_status_fields), — и шлёт подписчикам событием health. Тот же путь
+ * вышел (paths_down, status_fields), — и шлёт подписчикам событием health. Тот же путь
  * повторно — запись обновляется на месте; мест нет — вытесняется самая старая. */
 static void ev_health(struct supd *s, struct helper *h, const struct evline *e) {
     long dc, media = 0, cool = 0;
@@ -655,10 +653,10 @@ static void child_arm(struct supd *s) {
 
 /* ---- помощники, пережившие прежний демон --------------------------------------------------- */
 
-/* Время старта процесса (поле 22 /proc/<pid>/stat, тики от загрузки) и его родитель. 0 — процесса
+/* Время старта процесса (поле 22 /proc/<pid>/stat, тики от загрузки). 0 — процесса
  * нет или он зомби: вышел и ждёт только, пока его приберут, — для нас это «вышел». Пара «pid и
  * время старта» и есть имя процесса: pid, занятый заново, даст другое время. */
-static unsigned long long proc_start(pid_t pid, pid_t *ppid) {
+static unsigned long long proc_start(pid_t pid) {
     char path[64], b[1024];
     snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -672,15 +670,13 @@ static unsigned long long proc_start(pid_t pid, pid_t *ppid) {
     if (!p || p[1] != ' ') return 0;
     p += 2;
     char st = 0;
-    int pp = 0;
-    if (sscanf(p, "%c %d", &st, &pp) != 2 || st == 'Z' || st == 'X') return 0;
+    if (sscanf(p, "%c", &st) != 1 || st == 'Z' || st == 'X') return 0;
     for (int f = 3; f < 22; f++) {
         p = strchr(p, ' ');
         if (!p) return 0;
         p++;
     }
     unsigned long long t = strtoull(p, NULL, 10);
-    if (ppid) *ppid = (pid_t)pp;
     return t ? t : 1;
 }
 
@@ -719,34 +715,20 @@ static const char *nul_env(const char *b, size_t n, const char *key) {
 static int orphan_of(pid_t pid, char *what, size_t wn) {
     static char env[32768];
     char cl[PATH_MAX + 256];
-    pid_t ppid = 0;
-    if (!proc_start(pid, &ppid)) return 0;
+    if (!proc_start(pid)) return 0;
     size_t n = proc_read(pid, "environ", env, sizeof(env));
     if (!n || !nul_env(env, n, "STEER_EVENT_FD")) return 0;
     size_t cn = proc_read(pid, "cmdline", cl, sizeof(cl));
-    const char *dir = plat()->state_dir;
     const char *tag = nul_env(env, n, "STEER_SUPD");
-    if (tag) {
-        char *end = NULL;
-        long dp = strtol(tag, &end, 10);
-        if (end == tag || *end != ':' || dp <= 0) return 0;
-        const char *t = end + 1;
-        unsigned long long st = strtoull(t, &end, 10);
-        if (end == t || *end != ':') return 0;
-        dir = end + 1;
-        if (strcmp(dir, steer_state_dir()) != 0) return 0;
-        if (proc_start((pid_t)dp, NULL) == st) return 0;         /* его демон жив */
-    } else {
-        /* Сирота версии без метки: демон мёртв — значит, родитель уже init; каталог состояния —
-         * из --state-dir командной строки (helper_argv), без него — каталог платформы. */
-        if (ppid != 1) return 0;
-        for (size_t i = 0; i < cn;) {
-            size_t l = strnlen(cl + i, cn - i);
-            if (!strcmp(cl + i, "--state-dir") && i + l + 1 < cn) { dir = cl + i + l + 1; break; }
-            i += l + 1;
-        }
-        if (strcmp(dir, steer_state_dir()) != 0) return 0;
-    }
+    if (!tag) return 0;
+    char *end = NULL;
+    long dp = strtol(tag, &end, 10);
+    if (end == tag || *end != ':' || dp <= 0) return 0;
+    const char *t = end + 1;
+    unsigned long long st = strtoull(t, &end, 10);
+    if (end == t || *end != ':') return 0;
+    if (strcmp(end + 1, steer_state_dir()) != 0) return 0;
+    if (proc_start((pid_t)dp) == st) return 0;                   /* его демон жив */
     /* argv[1] и argv[2] — «vless vr», «obfs a»; у помощника-программы — её имя и первый флаг. */
     const char *a1 = cn ? cl + strnlen(cl, cn) + 1 : cl;
     const char *a2 = a1 < cl + cn ? a1 + strlen(a1) + 1 : a1;
@@ -779,7 +761,7 @@ static int orphans_stop(const char *who) {
         if (!end || *end || p <= 1 || p == me) continue;
         char what[128];
         if (!orphan_of((pid_t)p, what, sizeof(what))) continue;
-        unsigned long long started = proc_start((pid_t)p, NULL);
+        unsigned long long started = proc_start((pid_t)p);
         if (!started) continue;
         if (n == cap) {
             size_t nc = cap ? cap * 2 : 16;
@@ -803,7 +785,7 @@ static int orphans_stop(const char *who) {
         size_t left = 0;
         for (size_t i = 0; i < n; i++) {
             if (!pid[i]) continue;
-            if (proc_start(pid[i], NULL) != st[i]) pid[i] = 0;
+            if (proc_start(pid[i]) != st[i]) pid[i] = 0;
             else left++;
         }
         if (!left) break;
@@ -882,8 +864,7 @@ static void dnsd_kill(int fd, pid_t pid) {
 /* Попросить резолвер этого каталога состояния выйти, если хозяина у него нет (просьба «down»,
  * src/dnsd/adopt.c): решает сам резолвер, потому что только он знает, открыта ли его труба
  * таблицы. «ok» — ждать его выхода (закрытие соединения), по сроку SIGKILL; «busy» — хозяин жив,
- * не трогать. Ответа нет вовсе — резолвер прежней версии (просьбы не знает и закрывает
- * соединение) или не отвечает: гасить сигналом, как прежде. 1 — погашен, pid в *pid; 0 —
+ * не трогать. Ответа нет — резолвер не отвечает: гасить сигналом. 1 — погашен, pid в *pid; 0 —
  * резолвера нет или у него живой хозяин. */
 static int dnsd_down(pid_t *pid) {
     int fd = dnsd_connect(pid);
@@ -944,8 +925,7 @@ int supd_orphan_down(void) {
  * Ответ ждётся недолго (500 мс): резолвер отвечает из своего цикла, и если он в этот миг
  * перечитывает списки, просьба дождётся очереди и без нас — загрузчику незачем стоять. 1 —
  * резолвер ответил; 0 — резолвера нет (сокета нет: без демона и без пережившего его резолвера)
- * или ответ не пришёл вовремя; -1 — резолвер прежней версии, просьбы не знает (закрыл
- * соединение молча): тогда элементы вернёт таблица от демона, как прежде. */
+ * или ответ не пришёл вовремя: тогда элементы вернёт таблица от демона. */
 static int dnsd_ask(const char *req, int ms) {
     pid_t pid;
     int fd = dnsd_connect(&pid);
@@ -962,8 +942,7 @@ static int dnsd_ask(const char *req, int ms) {
     while ((r = poll(&p, 1, ms)) < 0 && errno == EINTR) {}
     if (r > 0) m = recv(fd, b, sizeof(b), MSG_DONTWAIT);
     close(fd);
-    if (m >= 3 && !memcmp(b, "ok\n", 3)) return 1;
-    return m == 0 ? -1 : 0;
+    return m >= 3 && !memcmp(b, "ok\n", 3);
 }
 
 int supd_dnsd_reassert(void) {
@@ -1375,7 +1354,7 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     if (!s->tm || !s->ad_tm) { free(s); return NULL; }
     s->me = getpid();
     snprintf(s->tag, sizeof(s->tag), "STEER_SUPD=%d:%llu:%s", (int)s->me,
-             proc_start(s->me, NULL), steer_state_dir());
+             proc_start(s->me), steer_state_dir());
     /* Раньше первого запуска своих: сирота прежнего демона держит устройство или порт, и свой
      * помощник на них не встал бы (шапка, «Помощники демона не переживают»). */
     orphans_stop("supervise");
