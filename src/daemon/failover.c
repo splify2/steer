@@ -1744,6 +1744,8 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
     for (size_t oi = 0; oi < on; oi++) {
         struct output *o = &sp->out[ord[oi]];
         if (!out_has_device(o)) continue;
+        /* Вид недоступен (нет плагина): устройства нет и не будет, выход живёт по on_fail. */
+        if (o->unavail) { o->failed = 1; continue; }
         char rec[32];
         active_get_st(st, o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
         /* «-» — сторож признал выход неработающим и поставил on_fail (out_finish): и у группы, и

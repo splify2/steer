@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "spec.h"
+#include "plugin.h"
 
 extern const struct kind_ops kind_interface __attribute__((weak));
 extern const struct kind_ops kind_vless __attribute__((weak));
@@ -83,7 +84,9 @@ static const struct { const struct kind_ops *have, *none; const char *module; } 
 };
 #define REG_N (sizeof(REG) / sizeof(REG[0]))
 
-size_t kind_count(void) { return REG_N; }
+/* Виды плагинов идут после видов ядра, по id плагина и порядку манифеста (plugin.c): порядок
+ * kind_emit_all и проверок diag не зависит от порядка установки. */
+size_t kind_count(void) { return REG_N + plugin_kinds_n(); }
 
 #ifdef STEER_LIBSTEER
 #include <time.h>
@@ -115,11 +118,13 @@ static int module_ok(size_t i) { (void)i; return 1; }
 #endif
 
 const struct kind_ops *kind_at(size_t i) {
-    if (i >= REG_N) return NULL;
+    if (i >= REG_N) return plugin_kind_ops_at(i - REG_N);
     if (REG[i].have && (!REG[i].module || module_ok(i))) return REG[i].have;
     return REG[i].none;
 }
 
+/* Только виды ядра: спека v1 плагинных видов не знает (spec-fields.md, раздел 7). Вид плагина
+ * спека v2 ищет сама — по имени манифеста (plugin_kind_find). */
 const struct kind_ops *kind_by_name(const char *name) {
     for (size_t i = 0; i < REG_N; i++) {
         const struct kind_ops *k = kind_at(i);
@@ -135,13 +140,15 @@ const struct kind_ops *kind_by_name(const char *name) {
  * зависит от того, в каком порядке человек перечислил выходы разных видов в спеке. До
  * переноса на emit это обеспечивали два ЖЁСТКО заказанных прохода в generate.c (сначала все
  * одного вида, потом другого); порядок реестра даёт то же самое без знания имён видов. */
-void kind_emit_all(struct nft_rs *rs, const struct spec *sp) {
+int kind_emit_all(struct nft_rs *rs, const struct spec *sp, struct err *e) {
     for (size_t ki = 0; ki < REG_N; ki++) {
         const struct kind_ops *k = kind_at(ki);
         if (!k->emit) continue;
         for (size_t i = 0; i < sp->out_n; i++)
             if (kind_of(&sp->out[i]) == k) k->emit(rs, sp, &sp->out[i]);
     }
+    /* Файлы и шаблоны nft плагинов — после видов ядра (plugin.c). */
+    return plugin_emit_all(rs, sp, e);
 }
 
 void kind_sig_mix(unsigned long long *h, const void *p, size_t n) {
@@ -174,6 +181,7 @@ int kind_helper_cmd(struct kind_helper *h, const char *cmd) { return kh_str(&h->
 int kind_helper_prog(struct kind_helper *h, const char *prog) { return kh_str(&h->prog, prog); }
 int kind_helper_arg(struct kind_helper *h, const char *arg) { return kh_add(&h->arg, &h->arg_n, arg); }
 int kind_helper_env(struct kind_helper *h, const char *var) { return kh_add(&h->env, &h->env_n, var); }
+int kind_helper_conf(struct kind_helper *h, const char *path) { return kh_str(&h->conf_path, path); }
 
 void kind_helper_free(struct kind_helper *h) {
     free(h->cmd);
@@ -182,6 +190,8 @@ void kind_helper_free(struct kind_helper *h) {
     free(h->arg);
     for (size_t i = 0; i < h->env_n; i++) free(h->env[i]);
     free(h->env);
+    free(h->conf_path);
+    h->conf_path = NULL;
     h->cmd = h->prog = NULL;
     h->arg = h->env = NULL;
     h->arg_n = h->env_n = 0;

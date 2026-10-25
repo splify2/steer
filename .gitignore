@@ -58,6 +58,7 @@ build/awgmatch-android
 build/irmatch
 build/srsunit
 build/modelmatch
+build/pluginmodel
 build/irmatch-android
 build/xswirematch
 build/xsstreammatch

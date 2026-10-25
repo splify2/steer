@@ -1330,7 +1330,7 @@ static void dev_state_drop(const char *dev) {
  * пишет файл сам, а затем просит демон перенастроить член (событие awg, daemon/supd.c). До того
  * поднимать нечего, и это не ошибка файла — ни apply, ни сторож не шумят о нём. */
 static int warp_waiting(const struct output *o) {
-    return o->warp_of[0] && access(o->awg.conf, F_OK) != 0;
+    return out_owned_by(o, NULL, NULL) && o->owner_out && access(o->awg.conf, F_OK) != 0;
 }
 
 /* awg_refresh: следующий awg_configure снимает пиры и ставит заново (новая сессия). */

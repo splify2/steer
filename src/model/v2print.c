@@ -23,6 +23,9 @@
 #include <unistd.h>
 
 #include "spec.h"
+#include "awg.h"
+#include "plugin.h"
+#include "ynode.h"
 #include "v2.h"
 
 /* ---- скаляры ------------------------------------------------------------------------------- */
@@ -293,6 +296,62 @@ static void warp_flow(struct flow *w, const struct spec *s, const struct output 
     if (o->on_fail != FAIL_DROP) fs(w, "on_fail", on_fail_name(o->on_fail));
 }
 
+static void json_qstr(FILE *f, const char *s);
+
+/* Узел JSON ключей вида плагина — потоковым YAML: простой скаляр как есть, остальные строки в
+ * кавычках (строка «5» не должна стать числом). */
+static void flow_node(FILE *f, const struct ynode *n) {
+    if (n->kind == YN_SCALAR) {
+        /* Простой скаляр — как есть; строка в кавычках — без них, если читается обратно строкой
+         * (не числом и не словом YAML): «abc», «sub/x» — так, «5» и «true» — в кавычках. */
+        int plain_str = n->style != YS_PLAIN && plain_ok(n->str) &&
+                        !((n->str[0] >= '0' && n->str[0] <= '9') || n->str[0] == '+');
+        if (n->style == YS_PLAIN || plain_str) fputs(n->str, f);
+        else json_qstr(f, n->str);
+    } else if (n->kind == YN_SEQ) {
+        fputc('[', f);
+        for (size_t i = 0; i < n->len; i++) {
+            if (i) fputs(", ", f);
+            flow_node(f, ynode_at(n, i));
+        }
+        fputc(']', f);
+    } else {
+        fputs("{ ", f);
+        for (size_t i = 0; i < ynode_len(n); i++) {
+            if (i) fputs(", ", f);
+            json_qstr(f, ynode_key_at(n, i)->str);
+            fputs(": ", f);
+            flow_node(f, ynode_val_at(n, i));
+        }
+        fputs(" }", f);
+    }
+}
+
+/* Выход вида плагина (и недоступного вида — его ключи записаны как есть): вид и ключи из keys_json.
+ * Имя вида — как в манифесте: «tunnel:vless» пишется kind: tunnel, protocol: vless. */
+static void plugin_flow(struct flow *w, const struct output *o) {
+    const struct kind_ops *k = kind_of(o);
+    const char *name = k == &kind_unavail ? (o->plg.shown ? o->plg.shown : "unavail")
+                                          : k->plugin->name;
+    if (!strncmp(name, "tunnel:", 7)) {
+        fs(w, "kind", "tunnel");
+        fs(w, "protocol", name + 7);
+    } else fs(w, "kind", name);
+    char dflt[32];
+    awg_default_ifname(o->name, dflt, sizeof(dflt));
+    if (out_has_device(o) && o->device[0] && strcmp(o->device, dflt) != 0) fs(w, "device", o->device);
+    if (!o->plg.keys_json) return;
+    struct err pe = { { 0 } };
+    struct ydoc *d = ydoc_parse_buf(o->plg.keys_json, strlen(o->plg.keys_json), "keys", &pe);
+    if (!d) return;
+    const struct ynode *r = ydoc_root(d);
+    for (size_t i = 0; i < ynode_len(r); i++) {
+        fk(w, ynode_key_at(r, i)->str);
+        flow_node(w->f, ynode_val_at(r, i));
+    }
+    ydoc_free(d);
+}
+
 static void output_flow(FILE *f, const struct spec *s, const struct output *o, const struct onames *oname) {
     const struct kind_ops *k = kind_of(o);
     const struct group_cfg *g = out_group(o);
@@ -342,6 +401,8 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
             fputc(']', f);
         }
         if (g->pick == PICK_BALANCE && g->by != BY_CONNECTION) fs(&w, "by", group_by_name(g->by));
+    } else if (k->plugin || k == &kind_unavail) {
+        plugin_flow(&w, o);
     } else {
         struct out_keys kk;
         memset(&kk, 0, sizeof(kk));
@@ -554,7 +615,7 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
             if (yq_len(oname[anon_order[i]]) > ow) ow = yq_len(oname[anon_order[i]]);
         fputs("\noutputs:\n", f);
         for (size_t i = 0; i < s->out_n; i++) {
-            if (s->out[i].warp_of[0]) continue;         /* туннель kind: warp — часть его записи */
+            if (out_owned_by(&s->out[i], NULL, NULL)) continue;     /* выход плагина (туннель kind: warp) — часть его записи */
             key_pad(f, oname[i], ow);
             output_flow(f, s, &s->out[i], &onm);
             fputc('\n', f);

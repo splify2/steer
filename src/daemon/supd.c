@@ -342,12 +342,12 @@ static void mod_hello(struct supd *s, struct helper *h, const struct evline *e) 
 /* awg (модуль steer-warpbox, evline.h): файл члена группы `kind: warp` переписан — перенастроить его
  * устройство сейчас, тем же awg_revive, что зовёт сторож, а не ждать прохода; fresh 1 — живой туннель
  * пересел на более быструю точку, и сессия нужна новая (awg_refresh). Только член группы этого
- * помощника (warp_of): чужим выходом помощник распоряжаться не вправе. */
+ * помощника (out_owned_by): чужим выходом помощник распоряжаться не вправе. */
 static void ev_awg(struct supd *s, struct helper *h, const struct evline *e) {
     const char *name = evline_str(e, "out");
     if (!name || !s->d->have) return;
     const struct output *o = out_by_name(s->d->sp, name);
-    if (!o || strcmp(o->warp_of, h->name) != 0) {
+    if (!o || !out_owned_by(o, NULL, h->name)) {
         fprintf(stderr, LOG_SW "%s %s просит перенастроить %s — это не член его группы\n", h->cmd, h->name, name);
         return;
     }
@@ -393,7 +393,7 @@ static void ev_member(struct supd *s, struct helper *h, const struct evline *e) 
     long v;
     if (!name || !evline_int(e, "ok", &v) || v < -1 || v > 1 || !s->d->have) return;
     const struct output *o = out_by_name(s->d->sp, name);
-    if (!o || strcmp(o->warp_of, h->name) != 0) return;
+    if (!o || !out_owned_by(o, NULL, h->name)) return;
     char who[96];
     snprintf(who, sizeof who, "%s %s", h->cmd, h->name);
     mverdict_set(s, h->name, who, name, (int)v);

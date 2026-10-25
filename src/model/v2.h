@@ -20,6 +20,9 @@ int spec_print_v2(FILE *f, const struct spec *s, struct err *e);
 /* Та же печать JSON-объектом (`steer spec convert --json`): ключи и порядок — как у spec_print_v2. */
 int spec_print_v2_json(FILE *f, const struct spec *s, struct err *e);
 
+/* Каталог файла спеки для относительных путей ключей (см. определение). */
+int v2_base_dir(const char *name, char *buf, size_t n);
+
 /* Вид выхода, который спека v2 пишет туннелем (`kind: tunnel, protocol: <имя>`): 1 — да. */
 int v2_tunnel_proto(const char *kind_name);
 

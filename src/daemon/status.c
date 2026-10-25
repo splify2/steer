@@ -21,6 +21,7 @@
 #include "spec.h"
 #include "platform.h"
 #include "awg.h"
+#include "plugin.h"
 #include "hwid.h"
 #include "obfs.h"
 #include "cli.h"
@@ -354,6 +355,26 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
          * повторяется: она видна у самой цели в этом же ответе, а второй источник того же
          * ответа однажды разошёлся бы с первым. */
         if (sp->out[i].over[0]) fprintf(out, ",\"via\":\"%s\"", sp->out[i].over);
+        /* Кто завёл выход (хук плагина) и недоступен ли его вид (spec-fields.md, раздел 8). Полей нет у
+         * выхода человека с доступным видом — status прежний до байта. */
+        if (out_owner_plugin(&sp->out[i])) {
+            fputs(",\"owner\":{\"plugin\":", out);
+            jsonw_str(out, sp->out[i].owner_plugin);
+            if (sp->out[i].owner_out) {
+                fputs(",\"out\":", out);
+                jsonw_str(out, sp->out[i].owner_out);
+            }
+            fputc('}', out);
+        }
+        if (out_unavail(&sp->out[i])) {
+            fputs(",\"unavail\":{\"why\":", out);
+            jsonw_str(out, sp->out[i].unavail);
+            if (sp->out[i].unavail_plugin) {
+                fputs(",\"plugin\":", out);
+                jsonw_str(out, sp->out[i].unavail_plugin);
+            }
+            fputc('}', out);
+        }
         if (out_has_device(&sp->out[i])) {
             struct fwcheck c = fw_check(sp->out[i].device);
             /* `nat` — подмена IPv4 есть, кем бы ни была: masq зоны fw4 или своя postrouting_nat4
@@ -468,7 +489,25 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
         plugso_status_out(out, sp->out[i].name);
         fprintf(out, "}");
     }
-    fprintf(out, "},\"channels\":[");
+    fprintf(out, "}");
+    /* Плагины ядра: id, версия, состояние и причина (spec-fields.md, раздел 8). Поля нет, пока ни
+     * одного плагина на машине нет — status прежний до байта. */
+    if (plugin_n()) {
+        fputs(",\"plugins\":[", out);
+        for (size_t pi = 0; pi < plugin_n(); pi++) {
+            const struct plugin *pl = plugin_at(pi);
+            fprintf(out, "%s{\"id\":", pi ? "," : "");
+            jsonw_str(out, pl->id);
+            fputs(",\"version\":", out);
+            jsonw_str(out, pl->version ? pl->version : "");
+            fprintf(out, ",\"state\":\"%s\",\"why\":", pl->enabled ? "enabled" : "failed");
+            if (pl->why) jsonw_str(out, pl->why);
+            else fputs("null", out);
+            fputc('}', out);
+        }
+        fputc(']', out);
+    }
+    fprintf(out, ",\"channels\":[");
 
     counters_load();
     for (size_t i = 0; i < gr->n; i++) {

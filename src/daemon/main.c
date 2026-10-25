@@ -34,6 +34,7 @@
 
 #include "spec.h"
 #include "awg.h"
+#include "plugin.h"
 #include "hwid.h"
 #include "obfs.h"
 #include "cli.h"
@@ -157,6 +158,13 @@ int main(int argc, char **argv) {
      * раньше получал «unknown command: --help» с кодом 2. */
     if (!strcmp(cmd, "help") || !strcmp(cmd, "--help") || !strcmp(cmd, "-h")) {
         if (argc > 2) {
+            const struct plugin_cmd *pc = plugin_cmd_find(argv[2]);
+            if (pc) {
+                printf("steer %s — %s\n", pc->name, pc->help ? pc->help : "команда плагина");
+                if (pc->usage) printf("\nИспользование:\n  steer %s %s\n", pc->name, pc->usage);
+                printf("\nКоманда плагина %s.\n", pc->owner->id);
+                return 0;
+            }
             const struct cli_cmd *c = cli_lookup(argv[2]);
             if (!c) cli_unknown(argv[2]);
             cli_help(stdout, c);
@@ -166,7 +174,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(cmd, "version") || !strcmp(cmd, "--version") || !strcmp(cmd, "-V")) {
-        cli_version(stdout);
+        if (argc > 2 && !strcmp(argv[2], "--json")) cli_version_json(stdout);
+        else cli_version(stdout);
         return 0;
     }
     /* Флаг вместо команды. Отдельная строка, потому что «нет такой команды: --spec»
@@ -182,6 +191,14 @@ int main(int argc, char **argv) {
      * демон, в справке и таблице команд их нет, и слова у них свои. */
     if (!strcmp(cmd, "apply-plan")) return cmd_apply_plan(argc - 2, argv + 2);
     if (!strcmp(cmd, "apply-commit")) return cmd_apply_commit(argc - 2, argv + 2);
+
+    /* Подкоманда плагина (манифест, steer.commands): исполняется вместо этого процесса. Раньше
+     * команд ядра — плагин может взять имя команды модуля, которая ещё в дереве steer (vless, warp),
+     * но не имя команды ядра (plugin.c, resolve_conflicts). */
+    {
+        const struct plugin_cmd *pc = plugin_cmd_find(cmd);
+        if (pc) return plugin_cmd_exec(pc, argc - 2, argv + 2);
+    }
 
     const struct cli_cmd *c = cli_lookup(cmd);
     if (!c) cli_unknown(cmd);
@@ -230,6 +247,11 @@ int main(int argc, char **argv) {
     const char *spec = a.spec, *arg = a.npos ? a.pos[0] : NULL;
 
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, a.dry_run);
+    /* Карта nft для плагинов: таблица, базовые цепочки с приоритетами числом, слоты (steer-api.md, 5.1). */
+    if (!strcmp(cmd, "nft-map")) {
+        plugin_nft_map(stdout, a.json);
+        return fflush(stdout) == 0 ? 0 : 1;
+    }
     /* Эти две исполняет демон, а посылает клиент steer (src/client/main.c). Сюда они доходят,
      * только если движок позвали напрямую или клиент не нашёл демона своей спеки. */
     if (!strcmp(cmd, "reload") || !strcmp(cmd, "subscribe")) {
@@ -242,7 +264,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "spec")) {
         if (strcmp(arg, "convert") != 0)
             die("steer spec понимает только convert, а не «%s»", arg);
-        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        /* Спека человека, не подготовленная: выходы, заведённые хуками плагинов, в ней не печатаются. */
+        if (load_spec_mode(spec, &cfg, &e, LOAD_HUMAN) < 0) err_die(&e);
         if ((a.json ? spec_print_v2_json(stdout, &cfg, &e) : spec_print_v2(stdout, &cfg, &e)) < 0)
             err_die(&e);
         return fflush(stdout) == 0 ? 0 : 1;
@@ -280,10 +303,11 @@ int main(int argc, char **argv) {
          * давал пустой вывод и код 0, а по этому выводу init-скрипт решает, каким выходам
          * поднимать процессы. Тишина вместо отказа означала бы не поднятый туннель без
          * единой строки о причине. */
-        /* warp-masque — член kind: warp (TUN модуля steer-warpbox): в реестре видов его нет (руками в
-         * спеке не пишется), но управляющему слою устройства таких членов нужны так же, как awg, — для
+        /* plugin-device — член выхода плагина (kind: warp): в реестре видов его нет (руками в спеке
+         * не пишется), но управляющему слою устройства таких членов нужны так же, как awg, — для
          * зоны фаервола. */
-        if (a.kind && !kind_by_name(a.kind) && strcmp(a.kind, kind_warpm.name) != 0)
+        if (a.kind && !kind_by_name(a.kind) && strcmp(a.kind, kind_plugin_device.name) != 0 &&
+            strcmp(a.kind, kind_unavail.name) != 0)
             die("--kind: нужен вид выхода (direct, block, interface, awg, vless, hysteria2, trojan, shadowsocks, socks, http, vmess, xsteer, tgws, group), а не %s", a.kind);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         for (size_t i = 0; i < cfg.out_n; i++) {

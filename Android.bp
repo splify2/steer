@@ -72,6 +72,7 @@ cc_defaults {
         "src/model/v2print.c",
         "src/model/registry.c",
         "src/model/probe.c",
+        "src/model/plugprep.c",
         "src/compile/nftcompat.c",
         "src/lib/puff.c",
         "src/lib/gz.c",
@@ -131,6 +132,8 @@ cc_defaults {
         "src/kinds/interface.c",
         "src/kinds/tgws.c",
         "src/kinds/awg.c",
+        "src/kinds/plugin.c",
+        "src/kinds/plugalloc.c",
         // YAML_SRC in build/sources.mk: the engine's wrapper here, libyaml itself in
         // libsteer_yaml below (its own flags, like wolfSSL).
         "src/lib/ynode.c",

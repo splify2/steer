@@ -20,6 +20,7 @@
 
 #include "spec.h"
 #include "awg.h"
+#include "plugin.h"
 #include "hwid.h"
 #include "obfs.h"
 #include "cli.h"
@@ -469,12 +470,22 @@ static void report_v6_host(const struct spec *sp) {
  * готовую — её демон запомнил с первого плана и пробы ядра не повторяет. report — сказать вслух о
  * том, что спека просит сверх возможного. */
 static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr, int full,
-                          int nftc, int report) {
+                          int nftc, int report, int strict) {
     /* Разбор спеки и компиляция возвращают отказ, а не завершают процесс сами (правило 5,
      * docs/architecture.md, раздел 2) — err_die здесь, в точке входа, довершает то же самое:
      * код 2, тот же текст, что раньше печатал die() изнутри load_spec/build_groups/generate. */
     struct err e = {0};
-    if (load_spec(spec, cfg, &e) < 0) err_die(&e);
+    /* ШАГ ПОДГОТОВКИ (kinds/plugprep.c): хуки плагинов check, expand, pre_apply — над спекой человека,
+     * до разбора. strict — apply и check из интерфейса: отказ хука — отказ всей спеки, и выход вида
+     * без плагина тоже отказ (LOAD_STRICT). Без strict — запуск и перезагрузка: сбой подготовки не
+     * роняет остальное, выходы, которые не подготовлены, уходят в on_fail как недоступные. Подготовка
+     * нужна и разбору без хуков — ничего не делает, пока хуков нет ни у одного плагина. */
+    if (full && spec_prepare(spec, &e) < 0) {
+        if (strict) err_die(&e);
+        fprintf(stderr, "steer[warn] подготовка спеки: %s\n", e.msg);
+        e.msg[0] = '\0';
+    }
+    if (load_spec_mode(spec, cfg, &e, strict ? LOAD_STRICT : LOAD_PREPARED) < 0) err_die(&e);
     /* Снимок реестра — строго до registry_assign: тот перезапишет файл текущими
      * выходами, и метки удалённых/переименованных будут потеряны вместе с
      * единственным способом снять их правила из ядра. */
@@ -739,7 +750,8 @@ int cmd_apply(const char *spec, int dry) {
     static struct spec cfg;
     static struct groups gr;
     struct err e = {0};
-    apply_prepare(spec, &cfg, &gr, 1, -1, 1);
+    /* `apply --dry-run` — та же проверка, что check интерфейса: строгая. Просто `apply` — запуск. */
+    apply_prepare(spec, &cfg, &gr, 1, -1, 1, dry);
     /* Снять накопленное ДО генерации: она вписывает эти значения в новые правила, иначе
      * каждый apply обнулял бы объёмы. Читаем и при --dry-run — так печатаемый текст остаётся
      * тем, что реально применится, а на машине без таблицы вывод не меняется вовсе. */
@@ -941,7 +953,7 @@ int cmd_apply_plan(int argc, char **argv) {
     static struct spec cfg;
     static struct groups gr;
     struct err e = {0};
-    apply_prepare(a.spec, &cfg, &gr, 1, a.nftc, 1);
+    apply_prepare(a.spec, &cfg, &gr, 1, a.nftc, 1, 1);
     awg_check_all(&cfg);
     unsigned long long h = 14695981039346656037ULL;
     /* Поток-отпечаток: fopencookie есть в glibc и musl, но в bionic его нет вовсе (даже с
@@ -1043,7 +1055,7 @@ int cmd_apply_commit(int argc, char **argv) {
     recon_args_parse(argc, argv, &a, "apply-commit");
     static struct spec cfg;
     static struct groups gr;
-    apply_prepare(a.spec, &cfg, &gr, a.ruleset, a.nftc, a.ruleset);
+    apply_prepare(a.spec, &cfg, &gr, a.ruleset, a.nftc, a.ruleset, 0);
     /* Порядок — как у подкоманды (cmd_apply, «ПОРЯДОК»): устройства kind=awg, привязка выходов,
      * и только потом набор правил — чтобы новая метка не существовала без своего правила. Этим
      * путём идёт и старт демона (--apply: первый apply применяет всё). */

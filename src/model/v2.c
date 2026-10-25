@@ -42,6 +42,8 @@
 #include "check.h"
 #include "grpurl.h"
 #include "v2.h"
+#include "plugin.h"
+#include "awg.h"
 
 /* Протоколы вида `tunnel` (раздел 3: `kind: tunnel, protocol: vless`). Сегодня протокол и есть
  * вид выхода движка (kinds/vless.c); общий помощник steer-tunnel с дайлерами — выпуск 1.10, и
@@ -84,7 +86,7 @@ struct v2 {
     struct v2_client *cl;
     size_t cl_cap;
     size_t clients_named, lists_named;
-    int warp_synth;                 /* разбор разворачивает kind: warp — вид warp-masque допустим */
+    int warp_synth;                 /* разбор разворачивает kind: warp — вид plugin-device допустим */
 };
 
 /* ---- отказы -------------------------------------------------------------------------------- */
@@ -240,26 +242,33 @@ static int path_of(struct v2 *x, const struct ynode *n, const char *where, const
     return 0;
 }
 
-static void base_of(struct v2 *x, const char *name) {
-    x->base[0] = '\0';
-    x->base_err = 0;
-    if (!name || !strcmp(name, "stdin")) return;
+/* Каталог файла спеки — от него считаются относительные пути ключей (x-path: etc у видов плагинов
+ * считает тот же каталог). 0 — определён (в buf; пусто — stdin, пути остаются как есть); -1 — не
+ * определить (слишком длинный путь, нет рабочего каталога). */
+int v2_base_dir(const char *name, char *buf, size_t n) {
+    buf[0] = '\0';
+    if (!name || !strcmp(name, "stdin")) return 0;
     const char *sl = strrchr(name, '/');
     char dir[4096], cwd[4096];
     int k;
     if (sl) k = snprintf(dir, sizeof(dir), "%.*s", (int)(sl - name), name);
     else k = snprintf(dir, sizeof(dir), ".");
-    if (k < 0 || (size_t)k >= sizeof(dir)) { x->base_err = 1; return; }
+    if (k < 0 || (size_t)k >= sizeof(dir)) return -1;
     if (!dir[0]) snprintf(dir, sizeof(dir), "/");
     if (dir[0] == '/') {
-        k = snprintf(x->base, sizeof(x->base), "%s", dir);
-        if (k < 0 || (size_t)k >= sizeof(x->base)) { x->base[0] = '\0'; x->base_err = 1; }
-        return;
+        k = snprintf(buf, n, "%s", dir);
+        if (k < 0 || (size_t)k >= n) { buf[0] = '\0'; return -1; }
+        return 0;
     }
-    if (!getcwd(cwd, sizeof(cwd))) { x->base_err = 1; return; }
-    if (!strcmp(dir, ".")) k = snprintf(x->base, sizeof(x->base), "%s", cwd);
-    else k = snprintf(x->base, sizeof(x->base), "%s/%s", cwd, dir);
-    if (k < 0 || (size_t)k >= sizeof(x->base)) { x->base[0] = '\0'; x->base_err = 1; }
+    if (!getcwd(cwd, sizeof(cwd))) return -1;
+    if (!strcmp(dir, ".")) k = snprintf(buf, n, "%s", cwd);
+    else k = snprintf(buf, n, "%s/%s", cwd, dir);
+    if (k < 0 || (size_t)k >= n) { buf[0] = '\0'; return -1; }
+    return 0;
+}
+
+static void base_of(struct v2 *x, const char *name) {
+    x->base_err = v2_base_dir(name, x->base, sizeof(x->base)) != 0;
 }
 
 /* ---- адреса клиентов ----------------------------------------------------------------------- */
@@ -341,9 +350,28 @@ static int p_lan(struct v2 *x, const struct ynode *n) {
 
 /* ---- clients ------------------------------------------------------------------------------ */
 
+/* owner: {plugin} у клиента, списка и правила — добавлено хуком pre_apply (steer-api.md, 3.4). Пишет
+ * только подготовленная спека. */
+static int owner_of(struct v2 *x, const struct ynode *val, const char *where, const char **dst) {
+    const struct ynode *ow = ynode_get(val, "owner");
+    if (!ow) return 0;
+    if (!x->s->prepared)
+        return fail(x, ow, "%s: owner пишет только плагин — в спеке человека его нет", where);
+    static const char *const OK[] = { "plugin", NULL };
+    char w[160];
+    snprintf(w, sizeof(w), "%s.owner", where);
+    const char *pl;
+    if (want_map(x, ow, w) || keys_known(x, ow, w, OK)) return -1;
+    if (!ynode_get(ow, "plugin")) return fail(x, ow, "%s: нет plugin", w);
+    snprintf(w, sizeof(w), "%s.owner.plugin", where);
+    if (str_of(x, ynode_get(ow, "plugin"), w, &pl)) return -1;
+    *dst = spec_strdup(x->s, pl);
+    return *dst ? 0 : fail(x, ow, "%s: недостаточно памяти для спеки", w);
+}
+
 static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
-    static const char *const K[] = { "addr", "mac", "uid", "self", "app", NULL };
+    static const char *const K[] = { "addr", "mac", "uid", "self", "app", "owner", NULL };
     if (spec_reserve_client(s, s->client_n + 1) != 0 ||
         spec_grow((void **)&x->cl, &x->cl_cap, s->client_n + 1, sizeof(*x->cl)) != 0)
         return fail(x, key, "недостаточно памяти для спеки (клиентов: %zu)", s->client_n + 1);
@@ -360,6 +388,7 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
     char where[64];
     snprintf(where, sizeof(where), "clients.%s", c->name);
     if (want_map(x, val, where) || keys_known(x, val, where, K)) return -1;
+    if (owner_of(x, val, where, &c->owner_plugin)) return -1;
     f->hosts = 1;
     const struct ynode *ad = ynode_get(val, "addr"), *mc = ynode_get(val, "mac"),
                        *ud = ynode_get(val, "uid"), *sf = ynode_get(val, "self"),
@@ -473,7 +502,7 @@ static int files_of(struct v2 *x, const struct ynode *n, const char *where, cons
 static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
     static const char *const K[] = { "srs", "prefixes_file", "domains_file", "domains", "prefixes",
-                                     "proto", "ports", "all", "override_port", NULL };
+                                     "proto", "ports", "all", "override_port", "owner", NULL };
     if (spec_reserve_list(s, s->list_n + 1) != 0)
         return fail(x, key, "недостаточно памяти для спеки (списков: %zu)", s->list_n + 1);
     struct spec_list *l = &s->list[s->list_n];
@@ -487,6 +516,7 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
     char where[64], w[96];
     snprintf(where, sizeof(where), "lists.%s", l->name);
     if (want_map(x, val, where) || keys_known(x, val, where, K)) return -1;
+    if (owner_of(x, val, where, &l->owner_plugin)) return -1;
     const struct ynode *n;
     if ((n = ynode_get(val, "srs"))) {
         snprintf(w, sizeof(w), "%s.srs", where);
@@ -712,6 +742,25 @@ static int v2_room(struct v2 *x, size_t n) {
     return 0;
 }
 
+static struct ynode *yn_new(struct v2 *x, const struct ynode *at, enum ynode_kind kind, size_t len);
+
+/* Вид выхода недоступен (плагина нет или он отключён): при чтении для apply и check — отказ всей
+ * спеки с причиной, при старте и reload — выход вида unavail, остальное работает (steer-api.md, 3.5).
+ * Только когда на машине есть плагинная раскладка (plugin_layout_present): без неё ядро ведёт себя
+ * как до плагинов, и вид без модуля отказывает спеке (kind.c, absent). Возврат: 1 — недоступный
+ * выход (why, id заполнены); 0 — раскладки нет или вид никому не известен (отказ прежним текстом);
+ * -1 — отказ с причиной уже записан. */
+static int kind_unavailable(struct v2 *x, const struct ynode *at, const char *where, const char *vname,
+                            char *why, size_t wn, const char **id) {
+    *id = NULL;
+    if (!plugin_layout_present() || !plugin_kind_why(vname, why, wn, id)) return 0;
+    if (x->s->load_flags & LOAD_STRICT) {
+        fail(x, at, "%s: %s", where, why);
+        return -1;
+    }
+    return 1;
+}
+
 /* Первый проход по выходу: вид, общие поля, ключи вида (разбор — у вида), настройка группы.
  * Ссылки на другие выходы (over, members, default) — во втором проходе: цель может стоять ниже. */
 static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *val) {
@@ -734,31 +783,70 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
     snprintf(w, sizeof(w), "%s.kind", where);
     if (!kn) return fail(x, val, "%s: нет kind", where);
     if (str_of(x, kn, w, &kname)) return -1;
-    const struct kind_ops *kd;
+    const struct kind_ops *kd = NULL;
+    const struct plugin_kind *pk = NULL;
+    char uwhy[400], full[96] = "";
+    const char *uid = NULL, *uname = NULL;
+    int unav = 0;
     int tunnel = !strcmp(kname, "tunnel");
     if (tunnel) {
         snprintf(w, sizeof(w), "%s.protocol", where);
         if (!pn) return fail(x, val, "%s: kind: tunnel нужен protocol (сейчас есть vless, hysteria2, trojan, shadowsocks, socks, http, vmess)", where);
         if (str_of(x, pn, w, &proto)) return -1;
-        if (!v2_tunnel_proto(proto))
-            return fail(x, pn, "%s: протокол «%s» не знаю (сейчас есть vless, hysteria2, trojan, shadowsocks, socks, http, vmess)", w, proto);
-        kd = kind_by_name(proto);
-    } else if (v2_tunnel_proto(kname)) {
+        snprintf(full, sizeof(full), "tunnel:%s", proto);
+        /* Протокол плагина — из его манифеста; встроенный стоит рядом, пока протоколы не вынесены. */
+        pk = plugin_kind_find(full);
+        if (pk) kd = &pk->ops;
+        else if (v2_tunnel_proto(proto)) kd = kind_by_name(proto);
+        else {
+            int u = kind_unavailable(x, pn, where, full, uwhy, sizeof(uwhy), &uid);
+            if (u < 0) return -1;
+            if (!u)
+                return fail(x, pn, "%s: протокол «%s» не знаю (сейчас есть vless, hysteria2, trojan, shadowsocks, socks, http, vmess)", w, proto);
+            unav = 1;
+            uname = full;
+        }
+    } else if (v2_tunnel_proto(kname) && !plugin_kind_find(kname)) {
         return fail(x, kn, "%s: в спеке v2 туннель пишется kind: tunnel, protocol: %s", where, kname);
-    } else if (!strcmp(kname, "warp-masque")) {
-        /* Член WARP с транспортом MASQUE — только из разворота kind: warp (p_warp). */
-        if (!x->warp_synth)
-            return fail(x, kn, "%s: kind warp-masque заводит только kind: warp (transport: masque)", where);
-        kd = &kind_warpm;
+    } else if (!strcmp(kname, kind_plugin_device.name)) {
+        /* Устройство держит процесс плагина-владельца: вид заводит разворот (p_warp для kind: warp, хук
+         * expand плагина — в подготовленной спеке, с owner). Человек его не пишет. */
+        if (!x->warp_synth && !(s->prepared && ynode_get(val, "owner")))
+            return fail(x, kn, "%s: kind %s заводит только плагин — в подготовленной спеке и с owner", where,
+                        kname);
+        kd = &kind_plugin_device;
     } else {
         if (!strcmp(kname, "zapret"))
             return fail(x, kn, "%s: kind zapret убран из ядра steer: обход DPI — отдельный модуль recheck, без обхода выход заменяет kind: direct", where);
-        kd = kind_by_name_v2(kname);
-        if (!kd)
-            return fail(x, kn, "%s: неизвестный kind «%s» (есть direct, block, interface, tunnel, xsteer, "
-                        "awg, tgws, group, warp)", where, kname);
+        pk = plugin_kind_find(kname);
+        kd = pk ? &pk->ops : kind_by_name_v2(kname);
+        if (!kd) {
+            int u = kind_unavailable(x, kn, where, kname, uwhy, sizeof(uwhy), &uid);
+            if (u < 0) return -1;
+            if (!u) {
+                char names[300] = "";
+                size_t l = 0;
+                for (size_t pi = 0; pi < plugin_kinds_n() && l + 40 < sizeof(names); pi++)
+                    l += (size_t)snprintf(names + l, sizeof(names) - l, ", %s", plugin_kind_ops_at(pi)->plugin->name);
+                return fail(x, kn, "%s: неизвестный kind «%s» (есть direct, block, interface, tunnel, xsteer, "
+                            "awg, tgws, group, warp%s)", where, kname, names);
+            }
+            unav = 1;
+            uname = kname;
+        }
     }
-    if (kd->absent) return fail(x, tunnel ? pn : kn, "%s: %s", where, kd->absent);
+    if (kd && kd->absent && !pk) {
+        int u = kind_unavailable(x, tunnel ? pn : kn, where, tunnel ? full : kname, uwhy, sizeof(uwhy), &uid);
+        if (u < 0) return -1;
+        if (!u) return fail(x, tunnel ? pn : kn, "%s: %s", where, kd->absent);
+        unav = 1;
+        uname = tunnel ? full : kname;
+    }
+    if (unav) {
+        if (out_make_unavail(s, &o, uwhy, uid, uname) != 0)
+            return fail(x, kn, "%s: недостаточно памяти для спеки", where);
+        kd = &kind_unavail;
+    }
     o.kind = kd;
     int group = out_group(&o) != NULL;
     unsigned caps = kd->caps;
@@ -770,6 +858,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
     /* Ключи группы, у которых свой pick: tolerance, interval, url, idle_timeout — latency; weights —
      * balance. Какой pick, известно только после всех ключей (pick может стоять последним). */
     const struct ynode *lat_key = NULL, *w_key = NULL, *by_key = NULL, *cc_key = NULL;
+    struct ynode *pm = NULL;            /* ключи вида плагина: отображение из узлов спеки */
     for (size_t i = 0; i < ynode_len(val); i++) {
         const struct ynode *kk = ynode_key_at(val, i), *v = ynode_val_at(val, i);
         const char *ks = kk->str, *sv;
@@ -777,6 +866,40 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         if (!strcmp(ks, "kind")) continue;
         if (!strcmp(ks, "protocol")) {
             if (!tunnel) return fail(x, kk, "%s: protocol есть только у kind: tunnel", where);
+            continue;
+        }
+        if (!strcmp(ks, "owner")) {
+            /* Кто завёл выход: пишет только подготовленная спека (spec_prepare), человек — нет. */
+            if (!s->prepared) return fail(x, kk, "%s: owner пишет только плагин — в спеке человека его нет", where);
+            if (want_map(x, v, w)) return -1;
+            static const char *const OK[] = { "plugin", "out", NULL };
+            if (keys_known(x, v, w, OK)) return -1;
+            const char *op, *oo = NULL;
+            char w2[160];
+            snprintf(w2, sizeof(w2), "%s.plugin", w);
+            if (!ynode_get(v, "plugin")) return fail(x, v, "%s: нет plugin", w);
+            if (str_of(x, ynode_get(v, "plugin"), w2, &op)) return -1;
+            if (ynode_get(v, "out")) {
+                snprintf(w2, sizeof(w2), "%s.out", w);
+                if (str_of(x, ynode_get(v, "out"), w2, &oo)) return -1;
+            }
+            o.owner_plugin = spec_strdup(s, op);
+            o.owner_out = oo ? spec_strdup(s, oo) : NULL;
+            if (!o.owner_plugin || (oo && !o.owner_out))
+                return fail(x, v, "%s: недостаточно памяти для спеки", w);
+            continue;
+        }
+        /* Выход недоступного вида: ключи вида проверить нечем — пропускаются; on_fail и device
+         * читаются, остальное общее (ipv6, prefix, over) без устройства ничего не значит. */
+        if (unav && strcmp(ks, "on_fail") && strcmp(ks, "device")) {
+            if (!pm) {
+                pm = yn_new(x, val, YN_MAP, ynode_len(val));
+                if (!pm) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+                pm->len = 0;
+            }
+            pm->items[2 * pm->len] = (struct ynode *)kk;
+            pm->items[2 * pm->len + 1] = (struct ynode *)v;
+            pm->len++;
             continue;
         }
         if (!strcmp(ks, "on_fail")) {
@@ -846,6 +969,19 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             if (str_of(x, v, w, &sv)) return -1;
             if (!name_ok(sv)) return fail(x, v, "%s: «%s» — имя устройства негодного состава", w, sv);
             if (copy_to(x, v, w, sv, o.device, sizeof(o.device))) return -1;
+            continue;
+        }
+        /* Ключи вида плагина — всё, что не общее: по схеме из манифеста (plugin_keys_check). Раньше
+         * пула туннеля и группы: interval, by, pick у протокола плагина — его собственные ключи. */
+        if (pk) {
+            if (!pm) {
+                pm = yn_new(x, val, YN_MAP, ynode_len(val));
+                if (!pm) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+                pm->len = 0;
+            }
+            pm->items[2 * pm->len] = (struct ynode *)kk;
+            pm->items[2 * pm->len + 1] = (struct ynode *)v;
+            pm->len++;
             continue;
         }
         /* Ключи пула туннеля — до ключей группы: interval и by есть и там, с другим смыслом. */
@@ -1024,6 +1160,14 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         }
     }
 
+    /* Недоступный вид: ключи записаны как есть — печать спеки (spec convert) их не теряет. */
+    if (unav && pm) {
+        char *raw;
+        if (plugin_keys_raw(pm, &raw) != 0) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+        o.plg.keys_json = spec_strdup(s, raw);
+        free(raw);
+        if (!o.plg.keys_json) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+    }
     if (x->out_prefix[idx] && o.ipv6 != OUT_V6_ROUTED)
         return fail(x, x->out_prefix[idx], "%s: prefix — префикс хоста, он есть только у ipv6: routed",
                     where);
@@ -1055,6 +1199,37 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 if (!strcmp(k.excl.only[i2], k.excl.cc[b]))
                     return fail(x, ynode_get(val, "only"), "%s: %s — и в only, и в exclude", where,
                                 k.excl.cc[b]);
+        if (pk) {
+            char conf[2 * 256], etc[256], *json;
+            const struct ynode *at = NULL;
+            plugin_etc(etc, sizeof(etc));
+            snprintf(conf, sizeof(conf), "%s/conf/%s", etc, pk->owner->id);
+            if (plugin_keys_check(pk, pm, x->base, conf, &json, &at, x->e) != 0) {
+                char m[sizeof(x->e->msg)];
+                snprintf(m, sizeof(m), "%s", x->e->msg);
+                x->e->msg[0] = '\0';
+                return fail(x, at ? at : val, "%s: %s", where, m);
+            }
+            o.plg.pk = pk;
+            o.plg.keys_json = spec_strdup(s, json);
+            free(json);
+            if (!o.plg.keys_json) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+            /* Ресурсы выхода (порты, очереди) — выданные при подготовке, alloc.json. */
+            if (s->prepared && (pk->res_ports || pk->res_queues) &&
+                plugin_alloc_lookup(s, pk, o.name, &o.plg.ports, &o.plg.ports_n, &o.plg.queues,
+                                    &o.plg.queues_n) != 0)
+                return fail(x, val, "%s: ресурсы выхода не выданы (alloc.json) — нужен reload", where);
+            /* Выход вида с разворотом или ресурсами в неподготовленной спеке не готов: хук ещё не
+             * исполнен, номера не выданы. Спека человека (LOAD_HUMAN) читается как написана. */
+            if ((pk->expand.prog || pk->res_ports || pk->res_queues) && !s->prepared &&
+                !(s->load_flags & LOAD_HUMAN)) {
+                if (s->load_flags & LOAD_STRICT)
+                    return fail(x, val, "%s: спека не подготовлена — нужен reload", where);
+                if (out_make_unavail(s, &o, "спека не подготовлена — нужен reload", pk->owner->id, pk->name) != 0)
+                    return fail(x, val, "%s: недостаточно памяти для спеки", where);
+                kd = &kind_unavail;
+            }
+        }
         /* Разбор и проверка ключей — у вида (один разбор на оба формата, kind.h). */
         if (kd->parse && kd->parse(&o, &k, x->e) != 0) return wrap(x, key);
         if (kd->check && kd->check(s, &o, x->e) != 0) return wrap(x, key);
@@ -1235,7 +1410,7 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
     }
     const struct ynode *ov = ynode_get(val, "over");
     /* Члены: awg — файл туннеля {etc}/warp/<имя>-<n>.conf (его пишет модуль); masque — TUN модуля,
-     * своих ключей у вида нет (kinds/group.c, kind_warpm). */
+     * своих ключей у вида нет (kinds/group.c, kind_plugin_device). */
     int mq = transport == WARP_MASQUE;
     for (long n = 1; n <= count; n++) {
         size_t pairs = (mq ? 2 : 3) + (ov ? 1 : 0), it = 0;
@@ -1244,7 +1419,7 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
         snprintf(conf, sizeof(conf), "%s/warp/%s-%ld.conf", plat()->etc_dir, name, n);
         if (!m) return fail(x, val, "%s: недостаточно памяти", where);
         m->items[it++] = yn_str(x, val, "kind");
-        m->items[it++] = yn_str(x, val, mq ? "warp-masque" : "awg");
+        m->items[it++] = yn_str(x, val, mq ? kind_plugin_device.name : "awg");
         if (!mq) {
             m->items[it++] = yn_str(x, val, "conf");
             m->items[it++] = yn_str(x, val, conf);
@@ -1259,7 +1434,12 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
         int prc = p_output(x, mem->items[n - 1], m);
         x->warp_synth = 0;
         if (prc) return -1;
-        snprintf(x->s->out[midx].warp_of, sizeof(x->s->out[midx].warp_of), "%s", name);
+        /* Член развёрнут из выхода `name` плагина warpbox (переходный шаг: разворот в ядре; его
+         * хук expand плагина придёт на то же место, spec-fields.md, раздел 2). */
+        x->s->out[midx].owner_plugin = spec_strdup(x->s, "warpbox");
+        x->s->out[midx].owner_out = spec_strdup(x->s, name);
+        if (!x->s->out[midx].owner_plugin || !x->s->out[midx].owner_out)
+            return fail(x, val, "%s: недостаточно памяти для спеки", where);
     }
     return 0;
 }
@@ -1799,7 +1979,7 @@ static int quic_clone(struct v2 *x, struct spec_rule *r, const struct ynode *qn,
 static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     struct spec *s = x->s;
     static const char *const K[] = { "name", "for", "to", "out", "resolve", "dns", "enabled", "scope",
-                                     "quic", "family", "on_family_unavailable", NULL };
+                                     "quic", "family", "on_family_unavailable", "owner", NULL };
     if (spec_reserve_rule(s, s->rule_n + 1) != 0)
         return fail(x, n, "rules: недостаточно памяти для спеки (правил: %zu)", s->rule_n + 1);
     struct spec_rule *r = &s->rule[s->rule_n];
@@ -1807,6 +1987,7 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     char where[64];
     snprintf(where, sizeof(where), "rules[%zu]", no);
     if (want_map(x, n, where) || keys_known(x, n, "правиле", K)) return -1;
+    if (owner_of(x, n, where, &r->owner_plugin)) return -1;
     const struct ynode *v;
     const char *sv;
     /* Подпись, а не идентификатор: по-русски можно, кавычку нельзя (label_ok). Без имени —
@@ -2074,7 +2255,10 @@ static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e) {
         if (want_map(&x, v, "outputs")) return -1;
         for (size_t i = 0; i < ynode_len(v); i++) {
             const struct ynode *ov = ynode_val_at(v, i), *kn = ov ? ynode_get(ov, "kind") : NULL;
-            int warp = kn && kn->kind == YN_SCALAR && kn->str && !strcmp(kn->str, "warp");
+            /* kind: warp разворачивает ядро (p_warp), пока плагина warpbox с видом warp нет; плагин стоит —
+             * разворот его хук expand, а здесь выход идёт обычным путём. */
+            int warp = kn && kn->kind == YN_SCALAR && kn->str && !strcmp(kn->str, "warp") &&
+                       !plugin_kind_find("warp");
             if (warp ? p_warp(&x, ynode_key_at(v, i), ov) : p_output(&x, ynode_key_at(v, i), ov)) return -1;
         }
         if (p_outputs_links(&x)) return -1;

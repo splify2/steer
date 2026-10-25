@@ -30,6 +30,7 @@ struct hy2_cfg;
 struct xsteer_cfg;
 struct tgws_cfg;
 struct group_cfg;
+struct plugin_kind;
 /* Дерево ruleset (src/lib/ir.h). Объявлено ради поля emit ниже: заголовок дерева подключают
  * сами виды, которые его строят (tgws.c). */
 struct nft_rs;
@@ -106,6 +107,12 @@ struct kind_helper {
      * procd_set_param env (STEER_TUN_STATS у vless). В подпись не входят: это отладка. */
     char **env;
     size_t env_n;
+    /* Помощник — программа плагина (kinds/plugin.c): plugin — id плагина (строка реестра, не
+     * освобождается), prog — ПОЛНЫЙ путь, arg — весь argv после него с уже раскрытыми подстановками
+     * ({out}, {conf}…), conf_path — путь файла настройки выхода {conf} (куча), который ядро кладёт до
+     * запуска. У помощника ядра plugin NULL и всё остальное как выше. */
+    const char *plugin;
+    char *conf_path;
     /* Помощнику нужны метки реестра (номер очереди выводится из метки): супервизор,
      * который иначе реестр не трогает (supervise.c), назначает их перед подсчётом состава. */
     int marks;
@@ -118,6 +125,7 @@ int kind_helper_cmd(struct kind_helper *h, const char *cmd);
 int kind_helper_prog(struct kind_helper *h, const char *prog);
 int kind_helper_arg(struct kind_helper *h, const char *arg);
 int kind_helper_env(struct kind_helper *h, const char *var);
+int kind_helper_conf(struct kind_helper *h, const char *path);
 void kind_helper_free(struct kind_helper *h);
 
 /* Имя, которое починка вида разрешила бы getaddrinfo (Endpoint у awg). Разрешение имени
@@ -141,6 +149,9 @@ typedef void kind_diag_fn(const char *id, const char *verdict, const char *what,
 
 struct kind_ops {
     const char *name;           /* как пишется в спеке */
+    /* Не NULL — вид плагина: запись создана реестром из манифеста (kinds/plugin.c), живёт в куче
+     * до plugin-reload; настройка выхода — struct plugin_out в output. NULL — вид ядра. */
+    const struct plugin_kind *plugin;
     unsigned caps;              /* enum kind_cap */
     unsigned keys;              /* enum kind_key */
     /* Не NULL — вида в этой сборке нет, и разбор отвечает ровно этой строкой (после
@@ -235,8 +246,10 @@ void kind_sig_mix(unsigned long long *h, const void *p, size_t n);
 
 /* Дописать в дерево rs правила всех видов, у которых есть emit: по видам в порядке реестра,
  * внутри вида — по выходам в порядке спеки (см. kind_ops.emit выше). Одна точка входа вместо
- * ручного прохода по видам в generate.c — новый вид с emit не требует правки компилятора. */
-void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
+ * ручного прохода по видам в generate.c — новый вид с emit не требует правки компилятора. После
+ * видов ядра — наборы, слоты и шаблоны плагинов (plugin_emit_all): 0 — готово, -1 — отказ с
+ * причиной в e (имя плагина и строка файла nft). */
+int kind_emit_all(struct nft_rs *rs, const struct spec *sp, struct err *e);
 
 /* Записи видов. Определены в src/kinds/<вид>.c; реестр ссылается на них слабо (kind.c), поэтому
  * вид, файла которого нет в сборке, у реестра есть — записью отказа.
@@ -249,7 +262,7 @@ void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
 extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer,
                              kind_tgws, kind_awg, kind_group, kind_hysteria2,
                              kind_trojan, kind_shadowsocks, kind_socks, kind_http, kind_vmess,
-                             kind_warpm, kind_block;
+                             kind_plugin_device, kind_unavail, kind_block;
 /* Выход «Блок» (kinds/block.c): резолвер отвечает на имена его правил пустым адресом. */
 int out_is_block(const struct output *o);
 
