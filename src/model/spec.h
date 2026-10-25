@@ -1174,7 +1174,7 @@ static inline int out_self_natting(const struct output *o) { return out_has_cap(
 /* Подмену IPv4 на устройстве выхода ставит само ядро (compile/generate.c, build_nat4; решение
  * владельца 2026-10-12 — одна зона steer_zone без masq): у туннеля с устройством, который адреса
  * клиентов сам не завершает. Проверки фаервола (fwcheck, diag, status) свою таблицу не читают и
- * спрашивают это условие. Раскладка 4.9 (legacy.c, телефон) цепочки не ставит — там зон fw4 нет. */
+ * спрашивают это условие. */
 static inline int out_nat4_by_steer(const struct output *o) {
     /* lo — не туннель: подмена адреса на петле роняет локальные пакеты (EPERM у sendto), а выход на lo
      * бывает у стендов и у схем, где «туннель» — локальный прокси (стенд tests/dnsgroups.sh). */

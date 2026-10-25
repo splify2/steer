@@ -252,8 +252,8 @@ int dnsd_main(int argc, char **argv) {
         }
     }
 
-    /* Наборы и карты fake-IP — в таблице inet движка (раскладки для Linux 4.9 с картой в ip больше
-     * нет, I-541). Имя таблицы — своё у сборки (nft_table), как у всего остального движка. */
+    /* Наборы и карты fake-IP — в таблице inet движка. Имя таблицы — своё у сборки (nft_table), как
+     * у всего остального движка. */
     {
         static char sets_tbl[64];
         snprintf(sets_tbl, sizeof(sets_tbl), "inet %s", nft_table());

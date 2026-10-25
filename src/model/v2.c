@@ -2011,8 +2011,8 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
                 return fail(x, outn, "правило %s: выход kind=%s работает только для клиентов раздачи — %s",
                             rn, out_kind_name(o), kind_of(o)->lan_only);
         /* balance у правил на сам телефон: разметка там — на хуке output в цепочке type route, и
-         * на ядре 4.9 (раскладка legacy.c) перемаршрутизацию после метки члена из перехода по карте
-         * пришлось бы переносить в каждую цепочку члена. Пока — честный отказ. */
+         * перемаршрутизация после метки члена из перехода по карте на телефоне не проверена. Пока —
+         * честный отказ. */
         for (size_t i = 0; i < refs_n; i++)
             if (x->cl[refs[i]].local && reaches_balance(s, o, 0)) {
                 unsup(x, outn, "правило %s: pick: balance для трафика самого телефона (uid, self)", rn);
