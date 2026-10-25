@@ -151,7 +151,7 @@ mkdir -p "$OUT" build/pkg
 # заметить это можно было бы только на роутере. Отличаются они только метаданными.
 #
 # ipkg-build — родной скрипт OpenWrt, тот же, что собирает пакеты в их SDK. Берётся из
-# сети один раз и кладётся в build/ (см. .gitignore): переписывать его своими руками
+# сети один раз, закреплённой версией (коммит и sha256 ниже), и кладётся в build/ (см. .gitignore): переписывать его своими руками
 # значило бы получить .ipk, который opkg принимает не везде, — ровно та ошибка, на
 # которой в splify обжигались с po2lmo.
 IPKG=build/ipkg-build
@@ -163,22 +163,34 @@ if [ ! -x "$IPKG" ]; then
     # заголовком `Accept: application/vnd.github.raw` отдаёт тот же файл байтами, никуда не
     # перенаправляя. Это машина сборщика, а не роутер, но человек с закрытым доменом не мог
     # собрать пакеты вовсе, и сообщение об этом ничем не отличалось от «сеть отвалилась».
-    RAW=https://raw.githubusercontent.com/openwrt/openwrt/master/scripts/ipkg-build
-    API='https://api.github.com/repos/openwrt/openwrt/contents/scripts/ipkg-build?ref=master'
+    # ВЕРСИЯ ЗАКРЕПЛЕНА (I-540): коммит openwrt/openwrt и сумма файла. Скрипт из ветки master
+    # менялся бы под сборкой без нашего ведома, а чужой код в цепочке выпуска без суммы — дыра:
+    # сумма проверяется ПОСЛЕ скачивания, и несошедшийся файл не кладётся в build/.
+    IPKG_COMMIT=e36c2946b7b574504335ff517b19b7c1eedf1bd8
+    IPKG_SHA256=5a85d59b6656074015bc20add788993143f7b51f371f977b5286af9ed5f22f5b
+    RAW=https://raw.githubusercontent.com/openwrt/openwrt/$IPKG_COMMIT/scripts/ipkg-build
+    API="https://api.github.com/repos/openwrt/openwrt/contents/scripts/ipkg-build?ref=$IPKG_COMMIT"
     ACCEPT='Accept: application/vnd.github.raw'
+    IPKG_TMP="$IPKG.part"
     # curl или wget: на машине сборщика бывает любой из двух, а требовать конкретный
     # значит уронить сборку там, где всё для неё есть.
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$RAW" -o "$IPKG" ||
-        curl -fsSL -H "$ACCEPT" "$API" -o "$IPKG" ||
+        curl -fsSL "$RAW" -o "$IPKG_TMP" ||
+        curl -fsSL -H "$ACCEPT" "$API" -o "$IPKG_TMP" ||
             { echo "не удалось скачать ipkg-build ни из $RAW, ни из $API"; exit 1; }
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$IPKG" "$RAW" ||
-        wget -qO "$IPKG" --header="$ACCEPT" "$API" ||
+        wget -qO "$IPKG_TMP" "$RAW" ||
+        wget -qO "$IPKG_TMP" --header="$ACCEPT" "$API" ||
             { echo "не удалось скачать ipkg-build ни из $RAW, ни из $API"; exit 1; }
     else
         echo "нужен curl или wget, чтобы взять ipkg-build"; exit 1
     fi
+    got="$(sha256sum "$IPKG_TMP" | cut -d' ' -f1)"
+    if [ "$got" != "$IPKG_SHA256" ]; then
+        rm -f "$IPKG_TMP"
+        echo "ipkg-build: сумма $got, ожидалась $IPKG_SHA256 (коммит $IPKG_COMMIT)"; exit 1
+    fi
+    mv "$IPKG_TMP" "$IPKG"
     chmod +x "$IPKG"
 fi
 

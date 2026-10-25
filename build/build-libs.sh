@@ -169,8 +169,8 @@ $CC -shared -o "$SO" "$OBJ"/lib/*.o "$NGLIB" "$WSO" \
     -Wl,-Bsymbolic -Wl,--gc-sections $ZDEFS -Wl,-z,relro -s $LIBS
 
 # ---- steerd и модули ------------------------------------------------------------------------------
-# steerd: -Os, как базовый движок всегда (пакет ядра весит меньше, а горячих циклов в нём нет).
-# Модули: -O2 — в xsteer через xsclient.c идёт поток пакетов звезды.
+# steerd и модули: -O2 (I-540) — размер пакета больше не главная цель, а в steerd работают разбор
+# спеки, сторож и резолвер; в xsteer через xsclient.c идёт поток пакетов звезды.
 link_app() {  # ИМЯ КЛАСС-ФЛАГИ СПИСОК-ПРОФИЛЯ
     _n="$1"; _f="$2"; _p="$3"
     _od="$OBJ/$_n"
@@ -192,11 +192,11 @@ link_app() {  # ИМЯ КЛАСС-ФЛАГИ СПИСОК-ПРОФИЛЯ
 
 # shellcheck disable=SC2086
 MODCMD="$(profile_var MODCMD_SRC)"
-$CC -Os $APPF -c "$MODCMD" -o "$OBJ/modcmd.o"
+$CC -O2 $APPF -c "$MODCMD" -o "$OBJ/modcmd.o"
 # STEER_EXT_ONLY=1 (build/ext-build.sh) — только библиотеки и внешние модули: steerd и модули steer
 # внешнему модулю не нужны, их пакеты собирает build.sh steer.
 if [ -z "${STEER_EXT_ONLY:-}" ]; then
-link_app steerd "-Os $APPF" PROFILE_steerd
+link_app steerd "-O2 $APPF" PROFILE_steerd
 link_app steer-vless "-O2 $APPF" PROFILE_mod_vless
 link_app steer-xsteer "-O2 $APPF" PROFILE_mod_xsteer
 link_app steer-obfs "-O2 $APPF" PROFILE_mod_obfs
