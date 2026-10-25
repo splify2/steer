@@ -156,10 +156,129 @@ chm_t chm_upto(chm_t m, size_t n) {
  * второго остаются с поддельным адресом, которого нет ни в одном правиле. Кто из
  * правил заберёт пакет, решает порядок цепочки — тот же порядок, в котором правила
  * стоят у человека на экране. */
+/* ПОДБОР КАНАЛОВ ПО ИМЕНИ — один индекс на все каналы, а не проход по каналам.
+ *
+ * Прежде имя проверялось против каждого канала по очереди (dch_matches): у каждого свой индекс по
+ * суффиксам, и запрос стоил «число каналов × число меток». Каналов у человека с десятком
+ * правил бывает десятки, и это на каждый вопрос клиента и на каждую запись fake-IP при засеве.
+ * Теперь суффиксы всех каналов лежат в ОДНОЙ таблице: запись — шаблон и два набора каналов (у кого
+ * он доменный, у кого точный). Имя «a.b.c» спрашивает таблицу про «a.b.c», «b.c» и «c» — столько
+ * поисков, сколько меток, — и получает набор каналов сразу, независимо от их числа.
+ *
+ * Не в индекс идут каналы, правила которых по суффиксу не найти: шаблоны и регулярные выражения
+ * (fancy) и части с исключениями. Их единицы; они проверяются прежним dch_matches. Результат
+ * тот же, что у прохода по всем каналам: набор всех, кому имя принадлежит.
+ *
+ * Индекс строится лениво, при первом подборе после любой смены правил: ruleset_add и ruleset_free
+ * ставят g_dch_stale (rules.c), число каналов сверяется само. Ключи — указатели на шаблоны в
+ * правилах каналов, не копии: правила живут до следующей смены, которая и сбросит индекс. */
+struct dix_ent { const char *pat; chm_t ns, ex; };
+static struct {
+    struct sindex ix;
+    struct dix_ent *e;
+    size_t n, cap;
+    size_t *slow, slow_n;       /* каналы без индекса: подбор прежним dch_matches */
+    size_t built;               /* g_dch_n при сборке */
+    int ok;
+} g_dix;
+
+static const char *dix_key(const void *owner, uint32_t idx) {
+    return ((const struct dix_ent *)owner)[idx].pat;
+}
+
+static void dix_reset(void) {
+    sindex_free(&g_dix.ix);
+    free(g_dix.e);
+    free(g_dix.slow);
+    memset(&g_dix, 0, sizeof(g_dix));
+}
+
+static int dix_add(const struct ruleset *rs, size_t ch, chm_t one) {
+    for (size_t k = 0; k < rs->n; k++) {
+        const struct rule *r = &rs->rules[k];
+        if (r->type != RULE_EXACT && r->type != RULE_NAMESPACE) continue;
+        uint32_t hit = sindex_get(&g_dix.ix, g_dix.e, dix_key, r->pattern);
+        struct dix_ent *en;
+        if (hit) {
+            en = &g_dix.e[(hit & SIDX_IDX_MASK) - 1];
+        } else {
+            if (g_dix.n == g_dix.cap) {
+                size_t nc = g_dix.cap ? g_dix.cap * 2 : 1024;
+                struct dix_ent *ne = realloc(g_dix.e, nc * sizeof(*ne));
+                if (!ne) return -1;
+                g_dix.e = ne;
+                g_dix.cap = nc;
+            }
+            en = &g_dix.e[g_dix.n];
+            en->pat = r->pattern;
+            en->ns = en->ex = 0;
+            if (sindex_put(&g_dix.ix, g_dix.e, dix_key, r->pattern, (uint32_t)g_dix.n, 1) != 0) return -1;
+            g_dix.n++;
+        }
+        chm_t *m = r->type == RULE_EXACT ? &en->ex : &en->ns;
+        if (!chm_has(*m, ch)) *m = chm_or(*m, one);
+    }
+    return 0;
+}
+
+static int dix_build(void) {
+    dix_reset();
+    for (size_t i = 0; i < g_dch_n; i++) {
+        const struct dchan *d = &g_dch[i];
+        int slow = d->rules.fancy_n > 0;
+        for (size_t p = 0; p < d->parts_n && !slow; p++)
+            slow = d->parts[p].has_excl || d->parts[p].rules.fancy_n > 0;
+        if (slow) {
+            size_t *ns = realloc(g_dix.slow, (g_dix.slow_n + 1) * sizeof(*ns));
+            if (!ns) goto fail;
+            g_dix.slow = ns;
+            g_dix.slow[g_dix.slow_n++] = i;
+            continue;
+        }
+        chm_t one = chm_one(i);
+        if (dix_add(&d->rules, i, one) != 0) goto fail;
+        for (size_t p = 0; p < d->parts_n; p++)
+            if (dix_add(&d->parts[p].rules, i, one) != 0) goto fail;
+    }
+    g_dix.built = g_dch_n;
+    g_dix.ok = 1;
+    g_dch_stale = 0;
+    return 0;
+fail:
+    dix_reset();
+    return -1;
+}
+
 chm_t dch_match_mask(const char *host) {
     chm_t m = 0;
-    for (size_t i = 0; i < g_dch_n; i++)
+    if (g_dch_stale || !g_dix.ok || g_dix.built != g_dch_n) {
+        if (dix_build() != 0) {                 /* нет памяти: прежний проход по каналам */
+            for (size_t i = 0; i < g_dch_n; i++)
+                if (dch_matches(&g_dch[i], host)) m = chm_or(m, chm_one(i));
+            return m;
+        }
+    }
+    char lower[MAX_HOSTNAME];
+    size_t n = strlen(host);
+    if (n >= sizeof(lower)) n = sizeof(lower) - 1;
+    memcpy(lower, host, n);
+    lower[n] = '\0';
+    str_lower(lower);
+    for (const char *suf = lower;;) {
+        uint32_t hit = sindex_get(&g_dix.ix, g_dix.e, dix_key, suf);
+        if (hit) {
+            const struct dix_ent *en = &g_dix.e[(hit & SIDX_IDX_MASK) - 1];
+            m = chm_or(m, en->ns);
+            if (suf == lower) m = chm_or(m, en->ex);
+        }
+        const char *dot = strchr(suf, '.');
+        if (!dot) break;
+        suf = dot + 1;
+    }
+    for (size_t k = 0; k < g_dix.slow_n; k++) {
+        size_t i = g_dix.slow[k];
         if (dch_matches(&g_dch[i], host)) m = chm_or(m, chm_one(i));
+    }
     return m;
 }
 

@@ -109,7 +109,7 @@ struct dconn {
     uint8_t *rb;
     size_t rn, rcap;
     uint8_t *wb;
-    size_t wn, woff;
+    size_t wn, woff, wcap;      /* очередь записи: занято [woff, wn), выделено wcap */
     /* DoH по HTTP/2 (h2 — сервер выбрал h2 в ALPN). Вопрос — поток, номер потока в dreq.sid, число
      * открытых потоков — busy. Окна отправки ведутся только по данным: заголовки в окно не входят
      * (RFC 9113, 6.9), а тело вопроса — до килобайта. */
@@ -179,6 +179,8 @@ struct dreq {
     uint8_t tries;
     uint16_t wid, oid;
     long t0, deadline;
+    uint32_t hseq;              /* номер вопроса за всё время: записи кучи сроков чужого вопроса на этом месте не годятся */
+    long hkey;                  /* срок его действующей записи в куче сроков; 0 — записи нет */
     dup_done_fn cb;
     void *ctx;
     /* DoQ: поток вопроса (-1 — ещё не открыт) и накопленный ответ (rxn байт из rxcap, куча). rxfin —
@@ -205,5 +207,8 @@ extern struct dup **g_dups;             /* текущие апстримы, по
 extern size_t g_dups_n;
 extern int g_req_cap;                   /* мест в таблице вопросов */
 struct dreq *req_ref(int k);            /* место k, 0 <= k < g_req_cap */
+/* Пересчитать срок вопроса в куче: после того, как у него поменялось то, от чего срок зависит (стенд,
+ * правящий deadline руками, зовёт это сам). */
+void req_rekey(struct dreq *r);
 
 #endif

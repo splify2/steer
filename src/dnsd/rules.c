@@ -9,7 +9,11 @@ static const char *ruleset_key(const void *owner, uint32_t idx) {
     return ((const struct ruleset *)owner)->rules[idx].pattern;
 }
 
+/* Правила каналов сменились — индекс подбора по имени (dch_match_mask, table.c) собрать заново. */
+int g_dch_stale = 1;
+
 void ruleset_free(struct ruleset *rs) {
+    g_dch_stale = 1;
     for (size_t i = 0; i < rs->n; i++) {
         free(rs->rules[i].pattern);
         if (rs->rules[i].re_valid)
@@ -42,6 +46,7 @@ static int clean_line(char *line) {
 }
 
 int ruleset_add(struct ruleset *rs, const char *raw) {
+    g_dch_stale = 1;
     if (rs->n == rs->cap) {                 /* число правил набора — память, не константа */
         size_t newcap = rs->cap ? rs->cap * 2 : 64;
         struct rule *nr = realloc(rs->rules, newcap * sizeof(*nr));

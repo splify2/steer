@@ -327,6 +327,7 @@ extern int g_epfd;
 /* ---------------------------------------------------------------------- */
 
 /* rules.c */
+extern int g_dch_stale;   /* ruleset_add/ruleset_free: индекс подбора каналов устарел */
 int ruleset_add(struct ruleset *rs, const char *raw);
 void ruleset_free(struct ruleset *rs);
 int ruleset_match(const struct ruleset *rs, const char *host);
