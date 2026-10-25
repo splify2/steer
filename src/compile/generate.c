@@ -1,8 +1,6 @@
 /* ---- генератор: спека и группы каналов → дерево набора правил -----------------------------
  *
- * С 1.7 генератор строит дерево (ir.h), а не печатает текст: печатает print.c, раскладку
- * старого ядра делает legacy.c преобразованием этого же дерева, и здесь про неё не знают
- * ничего — всё, что ниже, это набор правил современного ядра.
+ * Генератор строит дерево (ir.h), а не печатает текст: печатает print.c.
  *
  * Части, которые зависят от вида выхода, — kind_ops.emit модулей видов (tgws_emit в
  * kinds/tgws.c, docs/architecture.md, «Вид выхода»): их зовёт
@@ -172,7 +170,7 @@ static void x_to(struct nft_rule *r, const struct spec *sp, const struct group *
  * Правило группы в таблице inet смотрит в набор ipv4_addr, и пакет IPv6 его не касается. С 1.9
  * у группы есть v6-двойник: то же «кто», то же сужение, поиск в парном наборе «<имя>6» (или
  * «весь трафик»), та же метка — и тот же комментарий, поэтому счётчик канала остаётся одним
- * числом (counters_load складывает правила с одним именем, как у половин набора старого ядра).
+ * числом (counters_load складывает правила с одним именем).
  *
  * «Кто» у двойника:
  *   устройства (iifname) и MAC (ether saddr) — одно выражение на оба семейства. У группы «весь
@@ -385,9 +383,8 @@ static void ctr_take(void *arg, const char *comment, int has_counter,
     struct ctr *arr = *arrp;
     size_t *n = down ? &g_ctr_down_n : &g_ctr_up_n;
     size_t *cap = down ? &g_ctr_down_cap : &g_ctr_up_cap;
-    /* Одно имя — одно число. С 1.9 у правила группы бывает v6-двойник под тем же именем
-     * (docs/architecture.md, «4б»), а в старой раскладке у доменной группы с префиксами правил
-     * два (по одному на половину набора, см. legacy.c): объём канала — их сумма. */
+    /* Одно имя — одно число. У правила группы бывает v6-двойник под тем же именем
+     * (docs/architecture.md, «4б»): объём канала — их сумма. */
     size_t k = 0;
     while (k < *n && strcmp(arr[k].name, c) != 0) k++;
     if (k < *n) {
@@ -583,8 +580,7 @@ static void build_group_sets(struct nft_table *t, const struct groups *gr) {
         /* Парный набор IPv6 (docs/architecture.md, «4б»): строки IPv6 тех же файлов и подсети
          * IPv6 тех же наборов .srs. У доменной группы с половиной IPv6 (dom6) его наполняет и
          * резолвер — поддельными адресами IPv6 (навсегда) и настоящими из ответов AAAA (со
-         * сроком ответа), поэтому флаг timeout, как у набора IPv4 доменной группы. На старом
-         * ядре такой набор делится надвое тем же шагом, что набор IPv4 (legacy.c). Без dom6
+         * сроком ответа), поэтому флаг timeout, как у набора IPv4 доменной группы. Без dom6
          * элементы в нём только постоянные, и флага нет. */
         if (group_has_set6(g)) {
             struct nft_set *s6 = ir_set_add(t, n6, "ipv6_addr");
@@ -762,8 +758,7 @@ static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const st
         /* Каналы на сам телефон — на хуке output, см. nft_emit_output_mark. */
         if (group_is_local(g)) continue;
         if (g->l4 && g->l4->quic_block && mh != MH_INGRESS) quic_reject(c, sp, g);
-        /* ПРАВИЛО У ГРУППЫ ОДНО (в старой раскладке у доменной группы с префиксами их
-         * становится два — см. legacy.c, шаг 1), и с 1.9 у него бывает v6-двойник ниже.
+        /* ПРАВИЛО У ГРУППЫ ОДНО, и у него бывает v6-двойник ниже.
          * Клиент из одних адресов IPv6 правила IPv4 не даёт вовсе. */
         int carried = 0;
         if (who4_ok(g)) {
@@ -1359,9 +1354,7 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
  * «лучше не работает заметно, чем работает не туда». Пересылаемый IPv6 такого выхода отвергает ещё
  * forward_v6 выше, раньше и с ответом клиенту.
  *
- * Старая раскладка (legacy.c) цепочку не трогает: filter на postrouting в inet есть и на 4.9, и в
- * ней нет ни nat, ни notrack. Счётчик на правиле — чтобы diag и человек видели, что пакеты
- * отбрасывались. */
+ * Счётчик на правиле — чтобы diag и человек видели, что пакеты отбрасывались. */
 struct guard_list { const char **v; size_t n, cap; int oom; };
 
 static void guard_devs(const struct spec *sp, const struct output *o, struct guard_list *d,
@@ -1714,9 +1707,8 @@ static void build_fakeip(struct nft_table *t, const struct groups *gr, int v6) {
  *
  * ПОЧЕМУ ЗДЕСЬ. Цепочка nat видит только первый пакет соединения — правило ничего не стоит
  * остальному трафику, — и стоит там же, где решается подмена, поэтому не зависит от того, где и
- * когда ставится метка (цепочка разметки, хук ingress): метку оно не читает вовсе. В старой
- * раскладке оно уезжает вместе с dnat в таблицы ip и ip6 (legacy.c, шаг 4) — ссылок на наборы
- * inet у него нет. Счётчик — чтобы diag и человек видели, что такие пакеты были. */
+ * когда ставится метка (цепочка разметки, хук ingress): метку оно не читает вовсе. Счётчик —
+ * чтобы diag и человек видели, что такие пакеты были. */
 static void fakeip_nomap_drop(struct nft_chain *c, int v6, const char *comment) {
     struct nft_rule *r = ir_rule(c);
     ir_rule_fam(r, 4);
@@ -1823,7 +1815,8 @@ static void local_dns_redirect(struct nft_chain *c, const struct spec *sp) {
 
 /* Заворот DNS приложений и перевод поддельных адресов для соединений самого телефона —
  * цепочка nat на хуке output. */
-void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct groups *gr) {
+static void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp,
+                                const struct groups *gr) {
     struct nft_chain *c = ir_base_chain_add(inet_table(rs), "output_dns", "nat", "output",
                                             "dstnat", 0);
     if (plat()->local_dns) local_dns_redirect(c, sp);
@@ -1835,8 +1828,7 @@ void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct 
     ir_counter(r, 0, 0);
     ir_dnat(r, "ip daddr", "fakeip");
     ir_comment(r, "steer-fakeip-local");
-    /* Поддельные IPv6 — тем же правилом по карте fakeip6 (только когда она есть; на старом ядре
-     * без nat в ip6 её нет — dom6_ok). */
+    /* Поддельные IPv6 — тем же правилом по карте fakeip6 (только когда она есть — dom6_ok). */
     int v6 = has_fakeip6(gr);
     if (v6) {
         r = ir_rule(c);
@@ -1898,15 +1890,14 @@ static int local_who(struct nft_rule *r, const struct group *g, struct err *e) {
  * решает», одно правило на группу, метка — наши биты с маской, метка соединения — как там.
  *
  * Тип цепочки — route, прямо в inet, где и наборы: смена метки в ней сама заставляет ядро
- * искать маршрут заново. В старой раскладке route в inet нет — там её переделывает legacy.c
- * (шаг 2: filter и бит перемаршрутизации).
+ * искать маршрут заново.
  *
  * IPv6 (docs/architecture.md, «4б»). У группы — v6-двойник: с набором IPv6 «<имя>6» или, у «весь
  * трафик», интернет IPv6 мимо своей сети. Выход с IPv6 ведёт его своей таблицей IPv6. Выходу без
  * IPv6 двойник отвечает отказом — приложения переходят на IPv4 (так устроен выбор адреса у
  * любого клиента с двумя стеками), и ничего не утекает напрямую. */
-int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
-                         struct err *e) {
+static int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp,
+                                const struct groups *gr, struct err *e) {
     struct nft_table *t = inet_table(rs);
     struct nft_chain *c = ir_base_chain_add(t, "output_mark", "route", "output", "mangle", 1);
     ir_gap(c);
@@ -2085,7 +2076,7 @@ static void build_v6donor_set(struct nft_table *t, const struct spec *sp) {
  *
  * По устройству, а не по метке: в устройство выхода IPv6 клиентов уводит только наша метка, а
  * свой трафик роутер шлёт с адреса этого же устройства — masquerade ему ничего не меняет. Цепочка
- * nat в inet; старая раскладка (legacy.c) переносит правило в ip6 по его семейству. */
+ * nat в inet. */
 static void build_nat6(struct nft_table *t, const struct spec *sp) {
     struct nft_chain *c = NULL;
     for (size_t i = 0; i < sp->out_n; i++) {
