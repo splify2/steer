@@ -37,12 +37,16 @@ CLIENT_DIRS := src/client
 # <yaml.h>, поэтому её каталог — в -I у всех; обёртка движка над ней называется ynode.h, а не
 # yaml.h, ровно чтобы имена заголовков оставались уникальными (tests/buildmatch.sh).
 THIRD_DIRS := src/third_party/libyaml
-INC_DIRS  := $(CORE_DIRS) $(PROFILE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS) $(THIRD_DIRS)
+# Менеджер плагинов (src/pluginmgr, `steer plugin …`): только в steerd пакета steer-core (PLUGMGR_SRC ниже) —
+# ему нужны HTTPS и проверка подписи из libsteer. В статических сборках его нет (команда отвечает отказом,
+# src/daemon/main.c), на телефоне плагинов в 2.1 нет вовсе (plugin-sdk, open.md, О-13).
+PLUGMGR_DIRS := src/pluginmgr
+INC_DIRS  := $(CORE_DIRS) $(PROFILE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS) $(THIRD_DIRS) $(PLUGMGR_DIRS)
 # Каталоги, которых нет в сборке телефона (Android.bp их не подключает: hysteria2 и протоколы прокси
 # в профиль android не входят, телефон не собирает ни QUIC-клиента, ни модули steer-hysteria2 и
 # steer-proxy). tests/buildmatch.sh сверяет
 # Android.bp с INC_DIRS за вычетом этого списка.
-PHONE_SKIP_DIRS := src/proto/hysteria2 src/proto/proxy src/proto/warp
+PHONE_SKIP_DIRS := src/proto/hysteria2 src/proto/proxy src/proto/warp src/pluginmgr
 # Определения, которых ждёт сторонний код: yaml_private.h подключает config.h (номер версии
 # libyaml) только при HAVE_CONFIG_H. Ключ идёт во ВСЕ пути сборки движка — Makefile, build.sh,
 # build/build-ext*.sh (там он читается отсюда), в Android.bp — флагом библиотеки libsteer_yaml;
@@ -323,7 +327,11 @@ LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_P
                 src/tunnel/tun.c src/proto/tls/chello.c src/proto/tls/tls13.c \
                 src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c $(CRYPTO_SRC) \
                 $(QUIC_SRC)
-STEERD_DYN_SRC := $(DAEMON_SRC) src/proto/tls/urltls.c
+# Менеджер плагинов: команда `steer plugin …` в steerd (src/pluginmgr/pm.h). Стоит на libsteer: HTTP-клиент
+# (httpc.c), подпись (sigverify.c), распаковка (untar.c), хеши (scrypto.c), разбор JSON (ynode.c).
+PLUGMGR_SRC := src/pluginmgr/pmutil.c src/pluginmgr/pmver.c src/pluginmgr/pmstate.c src/pluginmgr/pmindex.c \
+               src/pluginmgr/pminst.c src/pluginmgr/pmmain.c
+STEERD_DYN_SRC := $(DAEMON_SRC) src/proto/tls/urltls.c $(PLUGMGR_SRC)
 VLESS_MODULE_SRC := $(VLESS_MOD_SRC) src/proto/vless/sub.c src/proto/vless/subfetch.c \
                     src/proto/tls/tlsprobe.c $(MODCMD_SRC) src/modules/main_vless.c
 XSTEER_MODULE_SRC := src/proto/xsteer/xsclient.c src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c \

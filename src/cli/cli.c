@@ -173,6 +173,19 @@ static const struct cli_cmd CMDS[] = {
  "есть, одной строкой JSON; код 0 — команда выполнилась с кодом 0.",
  "", 0, 1, 0, 0, 0},
 
+{"plugin", "Плагины", "<действие> [слово...]",
+ "поставить, обновить, снять, включить плагин; каталог и репозитории",
+ "Менеджер плагинов ядра (plugin-sdk: s2p.md, index.md). Действия:\n"
+ "  list | search [слово] | status [id]\n"
+ "  install <id> [версия] | install --file x.s2p [--unsigned]\n"
+ "  update [id] [--auto] | remove <id> [--force] [--purge] | enable <id> | disable <id>\n"
+ "  autoupdate <id> on|off | ensure <id>... | job <номер>\n"
+ "  repo list | repo add <url> <номер ключа> (ключ — со стандартного ввода или --key-file) | repo del <имя>\n"
+ "--json — ответ объектом JSON (отказ — {\"ok\":false,\"error\":…}); --job — install, update и ensure\n"
+ "заданием: ответ {\"job\":…} сразу, ход и итог — steer plugin job <номер>.\n"
+ "Плагины лежат в /usr/lib/steer/plugins, состояние — /etc/steer/plugins/state.json.",
+ "", 0, 1, 0, 0, 0},
+
 {"spec", "Маршрутизация", "convert",
  "перевести спеку в формат v2 и напечатать",
  "steer spec convert читает спеку (v1 — JSON со schema, или уже v2) и печатает её\n"
@@ -847,6 +860,18 @@ void cli_usage_short(FILE *out) {
 
 void cli_version(FILE *out) {
     fprintf(out, "steer %s (%s, ревизия %s)\n", STEER_VERSION, prof()->build, STEER_REV);
+}
+
+/* Версия ядра для оси compat steer-core (менеджер плагинов) и `steer version --json`. */
+const char *cli_core_version(void) {
+    return STEER_VERSION;
+}
+
+/* `steer version --json`: что ядро даёт плагинам (manifest.md, «compat»): версия ядра, steer-api,
+ * steer-abi. Версии осей — в src/pluginmgr/pm.h; здесь — те же числа, сверяет стенд pluginmgrmatch. */
+void cli_version_json(FILE *out) {
+    fprintf(out, "{\"core\":\"%s\",\"api\":\"%s\",\"abi\":\"%s\",\"build\":\"%s\",\"rev\":\"%s\"}\n",
+            STEER_VERSION, CLI_STEER_API, CLI_STEER_ABI, prof()->build, STEER_REV);
 }
 
 /* ---- подсказка по опечатке -------------------------------------------------- */

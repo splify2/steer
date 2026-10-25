@@ -459,6 +459,15 @@ for spec in $ISAS; do
     # Файл кладётся В ПОЛЕЗНУЮ НАГРУЗКУ, а не в скрипт установки: он обязан исчезнуть вместе
     # с пакетом и принадлежать ему, как init-скрипт.
     cp files/lib/upgrade/keep.d/steer "$root/lib/upgrade/keep.d/steer"
+    # Плагины (src/pluginmgr): каталог, официальный репозиторий и что из них переживает sysupgrade.
+    # keep.d/steer-plugins менеджер переписывает при каждой установке и снятии (дописывает keep
+    # плагинов); в пакете — основа: оба каталога целиком (plugin-sdk, s2p.md, «sysupgrade»).
+    # Ключи официального репозитория (/usr/share/steer/keys/<роль>/) и семя (/usr/share/steer/seed)
+    # кладёт конвейер выпуска, когда они есть; без ключа индекс официального репозитория не принимается.
+    mkdir -p "$root/usr/lib/steer/plugins" "$root/etc/steer/plugins/repos.d"
+    cp files/lib/upgrade/keep.d/steer-plugins "$root/lib/upgrade/keep.d/steer-plugins"
+    cp files/etc/steer/plugins/repos.d/splify2.json "$root/etc/steer/plugins/repos.d/splify2.json"
+    chmod 0644 "$root/lib/upgrade/keep.d/steer-plugins" "$root/etc/steer/plugins/repos.d/splify2.json"
     # Вход fw4 для перенаправленных к службам steer соединений (гостевые зоны с input REJECT) —
     # почему, в самом файле. fw4 подхватывает его при перечитывании; postinst перечитывает.
     mkdir -p "$root/usr/share/nftables.d/chain-pre/input"

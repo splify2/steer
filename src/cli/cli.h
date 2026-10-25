@@ -113,6 +113,11 @@ const struct cli_cmd *cli_lookup(const char *name);
 void cli_help(FILE *out, const struct cli_cmd *cmd);
 void cli_usage_short(FILE *out);
 void cli_version(FILE *out);
+/* Версии осей совместимости плагинов, которые даёт это ядро (manifest.md, «compat»). */
+#define CLI_STEER_API "1.0"
+#define CLI_STEER_ABI "1.0"
+void cli_version_json(FILE *out);
+const char *cli_core_version(void);
 
 /* Есть ли среди аргументов просьба о справке. Проверяется до разбора: у `fit` и `dnsd`
  * свои парсеры, и --help должен работать одинаково во всех командах. */

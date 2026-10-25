@@ -111,6 +111,16 @@ static int no_hub(void) {
 
 int aggregate_main(int argc, char **argv);
 
+/* Менеджер плагинов (src/pluginmgr) — в steerd пакета steer-core, где есть HTTPS и проверка подписи.
+ * Статическим сборкам без криптобиблиотеки (базовая, мини-сборка tgws, хаб, телефон) его не дают:
+ * там команда отвечает отказом. */
+int pm_main(int argc, char **argv) __attribute__((weak));
+
+static int no_plugin_mgr(void) {
+    fprintf(stderr, "steer: менеджера плагинов в этой сборке нет — он в пакете steer-core\n");
+    return 2;
+}
+
 /* Роль steer-tools (docs/architecture.md, раздел 2, «Процессы»): ссылка на steerd, и под этим
  * именем движок отвечает только на инструменты — то, что не трогает ни правил, ни демона и
  * нужно человеку и управляющему слою отдельно от движка. Отличается argv[0], а не сборкой: файл
@@ -166,7 +176,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(cmd, "version") || !strcmp(cmd, "--version") || !strcmp(cmd, "-V")) {
-        cli_version(stdout);
+        if (argc > 2 && !strcmp(argv[2], "--json")) cli_version_json(stdout);
+        else cli_version(stdout);
         return 0;
     }
     /* Флаг вместо команды. Отдельная строка, потому что «нет такой команды: --spec»
@@ -191,7 +202,7 @@ int main(int argc, char **argv) {
         cli_help(stdout, c);
         /* У команд со своим разбором список флагов знает только их парсер, поэтому
          * справка склеивается из двух половин. */
-        if (c->passthru) {
+        if (c->passthru && strcmp(cmd, "plugin") != 0) {
             fputs("\nФлаги:\n", stdout);
             if (!strcmp(cmd, "fit")) aggregate_usage_flags(stdout);
             else if (!strcmp(cmd, "daemon") || !strcmp(cmd, "ctl-serve") || !strcmp(cmd, "ctl"))
@@ -211,6 +222,7 @@ int main(int argc, char **argv) {
             return ctl_serve_main(argc - 2, argv + 2);
         if (!strcmp(cmd, "ctl")) return ctl_client_main(argc - 2, argv + 2);
         if (!strcmp(cmd, "dns-probe")) return dns_probe_main(argc - 2, argv + 2);
+        if (!strcmp(cmd, "plugin")) return pm_main ? pm_main(argc - 2, argv + 2) : no_plugin_mgr();
         return dnsd_main(argc - 2, argv + 2);
     }
 

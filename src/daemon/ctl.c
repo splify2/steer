@@ -457,6 +457,15 @@ enum ctl_argkind {
     CA_INT,       /* целое в [lo, hi] */
     CA_LIT,       /* ровно слово lit; уходит в argv одним флагом без значения */
     CA_FILE,      /* имя файла списка: [A-Za-z0-9_.-], до 64 знаков, не с «-»/«.», без «..» */
+    /* Слова команд плагинов (plugin-*, src/pluginmgr): */
+    CA_PLUGIN,    /* id плагина: [a-z0-9][a-z0-9-]*, до 64 знаков (manifest.md) */
+    CA_VER,       /* версия: semver, [0-9A-Za-z.+~-], начинается с цифры, до 64 знаков */
+    CA_WORD,      /* слово поиска: печатное без пробелов, не с «-», до 64 знаков */
+    CA_URL,       /* адрес репозитория: http(s)://, печатное без пробелов, до 400 знаков */
+    CA_KEYID,     /* номер ключа usign: ровно 16 знаков hex */
+    CA_REPO,      /* имя репозитория: [A-Za-z0-9_.-], не с «-»/«.», до 64 знаков */
+    CA_ONOFF,     /* on или off */
+    CA_JOBID,     /* номер задания менеджера: [0-9-], до 32 знаков */
 };
 
 struct ctl_arg {
@@ -621,6 +630,9 @@ static void st_reload(struct conn *c);
 static void st_sub_check(struct conn *c);
 static void st_subscribe(struct conn *c);
 static void st_repair(struct conn *c);
+static void st_plugin(struct conn *c);
+static void st_plugin_reload(struct conn *c);
+static void mem_plugin_event(struct conn *c, struct cbuf *r);
 
 /* ТАБЛИЦА — единственное, что сервер умеет. Команда, которой здесь нет, не исполняется ни в
  * каком виде: слова запроса никогда не становятся именем подкоманды, в argv идут только
@@ -662,6 +674,38 @@ static const struct ctl_cmd CTL_CMDS[] = {
      * одной с apply и reload (они пишут те же таблицы). */
     {"select",      NULL, mem_select, NULL, 0, 2, 2,
         {{CA_NAME, NULL, NULL, 0, 0}, {CA_NAME, NULL, NULL, 0, 0}}, 0, 0, 1},
+    /* МЕНЕДЖЕР ПЛАГИНОВ (steer-api.md, 4.2; src/pluginmgr): ребёнок `steerd plugin <действие> … --json`,
+     * тот же, что у человека в shell. Изменяющие идут под СВОЕЙ блокировкой менеджера (flock), а не в
+     * очереди apply: установка ждёт сеть и проверку здоровья до десяти минут, а проверке здоровья
+     * нужен plugin-reload — изменяющая команда демона; в общей очереди они ждали бы друг друга.
+     * Занятый менеджер отвечает «busy: …» кодом 1. Сам plugin-reload — в очереди apply.
+     * Тело plugin-repo-add — открытый ключ, plugin-install-file — архив .s2p, plugin-ensure — id
+     * плагинов через пробел (их может быть сколько угодно, а слов в строке запроса — пять). */
+    {"plugin-list",         "list", NULL, st_plugin, 0, 0, 0, {{0}}, 60, 0, 0},
+    {"plugin-search",       "search", NULL, st_plugin, 0, 0, 1, {{CA_WORD, NULL, NULL, 0, 0}}, 180, 0, 0},
+    {"plugin-status",       "status", NULL, st_plugin, 0, 0, 1, {{CA_PLUGIN, NULL, NULL, 0, 0}}, 60, 0, 0},
+    {"plugin-install",      "install", NULL, st_plugin, 0, 1, 2,
+        {{CA_PLUGIN, NULL, NULL, 0, 0}, {CA_VER, NULL, NULL, 0, 0}}, 600, 0, 0},
+    {"plugin-install-file", "install", NULL, st_plugin, 64L * 1024 * 1024, 0, 1,
+        {{CA_LIT, "--unsigned", "unsigned", 0, 0}}, 600, 0, 0},
+    {"plugin-update",       "update", NULL, st_plugin, 0, 0, 1, {{CA_PLUGIN, NULL, NULL, 0, 0}}, 3600, 0, 0},
+    {"plugin-remove",       "remove", NULL, st_plugin, 0, 1, 3,
+        {{CA_PLUGIN, NULL, NULL, 0, 0}, {CA_LIT, "--force", "force", 0, 0}, {CA_LIT, "--purge", "purge", 0, 0}}, 300, 0, 0},
+    {"plugin-enable",       "enable", NULL, st_plugin, 0, 1, 1, {{CA_PLUGIN, NULL, NULL, 0, 0}}, 300, 0, 0},
+    {"plugin-disable",      "disable", NULL, st_plugin, 0, 1, 1, {{CA_PLUGIN, NULL, NULL, 0, 0}}, 300, 0, 0},
+    {"plugin-autoupdate",   "autoupdate", NULL, st_plugin, 0, 2, 2,
+        {{CA_PLUGIN, NULL, NULL, 0, 0}, {CA_ONOFF, NULL, NULL, 0, 0}}, 30, 0, 0},
+    {"plugin-ensure",       "ensure", NULL, st_plugin, 64 * 1024, 0, 0, {{0}}, 3600, 0, 0},
+    {"plugin-job",          "job", NULL, st_plugin, 0, 1, 1, {{CA_JOBID, NULL, NULL, 0, 0}}, 10, 0, 0},
+    {"plugin-repo-list",    "repo list", NULL, st_plugin, 0, 0, 0, {{0}}, 30, 0, 0},
+    {"plugin-repo-add",     "repo add", NULL, st_plugin, 64 * 1024, 2, 2,
+        {{CA_URL, NULL, NULL, 0, 0}, {CA_KEYID, NULL, NULL, 0, 0}}, 120, 0, 0},
+    {"plugin-repo-del",     "repo del", NULL, st_plugin, 0, 1, 1, {{CA_REPO, NULL, NULL, 0, 0}}, 30, 0, 0},
+    /* Перечитать плагины (реестр ядра, kinds/plugin.c) и спеку — как reload; зовёт менеджер после
+     * каждого изменения. Изменяющая: в очереди с apply. */
+    {"plugin-reload",       NULL, NULL, st_plugin_reload, 0, 0, 0, {{0}}, 0, 1, 1},
+    /* Событие `plugin` подписчикам: менеджер сообщает, что сделал (тело — объект JSON). */
+    {"plugin-event",        NULL, mem_plugin_event, NULL, 64 * 1024, 0, 0, {{0}}, 0, 0, 0},
 };
 
 static const struct ctl_cmd *ctl_lookup(const char *name) {
@@ -717,6 +761,48 @@ static const char *ctl_arg_bad(const struct ctl_arg *a, const char *w) {
         }
         return NULL;
     }
+    case CA_PLUGIN:
+        if (!n || n > 64) return "недопустимое имя плагина";
+        if (!((w[0] >= 'a' && w[0] <= 'z') || (w[0] >= '0' && w[0] <= '9'))) return "недопустимое имя плагина";
+        for (size_t i = 0; i < n; i++)
+            if (!((w[i] >= 'a' && w[i] <= 'z') || (w[i] >= '0' && w[i] <= '9') || w[i] == '-'))
+                return "недопустимое имя плагина";
+        return NULL;
+    case CA_VER:
+        if (!n || n > 64 || !(w[0] >= '0' && w[0] <= '9')) return "недопустимая версия";
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)w[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '.' || c == '+' || c == '~' || c == '-'))
+                return "недопустимая версия";
+        }
+        return NULL;
+    case CA_WORD:
+    case CA_URL:
+        if (!n || n > (a->kind == CA_URL ? 400u : 64u)) return "слишком длинное или пустое слово";
+        if (w[0] == '-') return "слово не может начинаться с «-»";
+        for (size_t i = 0; i < n; i++)
+            if ((unsigned char)w[i] <= ' ' || w[i] == 0x7f) return "недопустимый знак";
+        if (a->kind == CA_URL && strncmp(w, "https://", 8) && strncmp(w, "http://", 7))
+            return "адрес репозитория — https://…";
+        return NULL;
+    case CA_KEYID:
+        if (n != 16 || strspn(w, "0123456789abcdefABCDEF") != 16) return "номер ключа — 16 знаков hex";
+        return NULL;
+    case CA_REPO:
+        if (!n || n > 64 || w[0] == '-' || w[0] == '.') return "недопустимое имя репозитория";
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)w[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '.' || c == '-'))
+                return "недопустимое имя репозитория";
+        }
+        return NULL;
+    case CA_ONOFF:
+        return strcmp(w, "on") && strcmp(w, "off") ? "нужно on или off" : NULL;
+    case CA_JOBID:
+        if (!n || n > 32 || strspn(w, "0123456789-") != n || w[0] == '-') return "недопустимый номер задания";
+        return NULL;
     default:
         return "лишнее слово";
     }
@@ -2190,6 +2276,215 @@ static void st_subscribe(struct conn *c) {
     conn_flush(c);
 }
 
+/* ---- менеджер плагинов ---------------------------------------------------------------------------
+ *
+ * Команды plugin-* — дети `steerd plugin <действие> … --json` (src/pluginmgr/pmmain.c): ответ — их код,
+ * stdout (объект JSON) и stderr (ход). Тело, если есть, — во временный файл каталога состояния, путь —
+ * флагом (--file, --key-file); у plugin-ensure тело — id плагинов, они идут словами. */
+
+/* Реестр плагинов ядра (src/kinds/plugin.c): слабо — в сборке без него plugin-reload просто
+ * перечитывает спеку. */
+int plugin_reload(const char *root) __attribute__((weak));
+
+static void plugin_done(struct conn *c, int code) {
+    if (c->tmp[0]) { unlink(c->tmp); c->tmp[0] = '\0'; }
+    sub_done(c, code);
+}
+
+static int plugin_id_ok(const char *w, size_t n) {
+    if (!n || n > 64 || !((w[0] >= 'a' && w[0] <= 'z') || (w[0] >= '0' && w[0] <= '9'))) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!((w[i] >= 'a' && w[i] <= 'z') || (w[i] >= '0' && w[i] <= '9') || w[i] == '-')) return 0;
+    return 1;
+}
+
+static void st_plugin(struct conn *c) {
+    const struct ctl_req *q = &c->q;
+    const char *name = q->cmd->name;
+    c->tmp[0] = '\0';
+    /* Слова тела plugin-ensure — сколько угодно; argv — в куче по их числу. */
+    size_t nwords = 0;
+    if (!strcmp(name, "plugin-ensure")) {
+        for (size_t i = 0; i < q->body_n; ) {
+            while (i < q->body_n && (q->body[i] == ' ' || q->body[i] == '\n' || q->body[i] == '\t' || q->body[i] == '\r')) i++;
+            size_t st = i;
+            while (i < q->body_n && !(q->body[i] == ' ' || q->body[i] == '\n' || q->body[i] == '\t' || q->body[i] == '\r')) i++;
+            if (i == st) continue;
+            if (!plugin_id_ok(q->body + st, i - st)) {
+                resp_error(&c->resp, "bad-request", "недопустимое имя плагина в теле");
+                conn_reply(c);
+                return;
+            }
+            nwords++;
+        }
+        if (!nwords) { resp_error(&c->resp, "bad-request", "тело — id плагинов через пробел"); conn_reply(c); return; }
+    }
+    size_t cap = nwords + 16;
+    char **av = calloc(cap, sizeof(char *));
+    char *words = NULL;
+    if (!av) { resp_error(&c->resp, "internal", "нет памяти"); conn_reply(c); return; }
+    size_t n = 0;
+    av[n++] = (char *)q->cf->exe;
+    av[n++] = "plugin";
+    char sub[32];
+    snprintf(sub, sizeof(sub), "%s", q->cmd->sub);
+    char *sp = strchr(sub, ' ');
+    if (sp) { *sp = '\0'; av[n++] = sub; av[n++] = sp + 1; }
+    else av[n++] = sub;
+    for (int i = 0; i < q->argc; i++) {
+        const struct ctl_arg *a = &q->cmd->args[i];
+        if (a->flag) av[n++] = (char *)a->flag;
+        if (a->kind != CA_LIT || !a->flag) av[n++] = (char *)q->argv[i];
+    }
+    if (nwords) {
+        words = malloc(q->body_n + 1);
+        if (!words) { free(av); resp_error(&c->resp, "internal", "нет памяти"); conn_reply(c); return; }
+        memcpy(words, q->body, q->body_n);
+        words[q->body_n] = '\0';
+        for (char *t = strtok(words, " \t\r\n"); t; t = strtok(NULL, " \t\r\n")) av[n++] = t;
+    } else if (q->cmd->body) {
+        const char *flag = !strcmp(name, "plugin-repo-add") ? "--key-file" : "--file";
+        char final[PATH_MAX];
+        snprintf(final, sizeof(final), "%s/plugin-%s", ctl_state_dir(q->cf),
+                 !strcmp(name, "plugin-repo-add") ? "key.pub" : "upload.s2p");
+        if (ctl_write_tmp(final, q->body ? q->body : "", q->body_n, c->tmp, sizeof(c->tmp)) != 0) {
+            free(av);
+            c->tmp[0] = '\0';
+            resp_error(&c->resp, "internal", "не записать тело во временный файл");
+            conn_reply(c);
+            return;
+        }
+        av[n++] = (char *)flag;
+        av[n++] = c->tmp;
+    }
+    av[n++] = "--json";
+    av[n] = NULL;
+    int rc = job_start(c, av, q->cmd->timeout_s, CTL_OUT_MAX, CTL_ERR_MAX, plugin_done);
+    free(av);
+    free(words);
+    if (rc != 0) {
+        if (c->tmp[0]) { unlink(c->tmp); c->tmp[0] = '\0'; }
+        resp_error(&c->resp, "internal", "не удалось запустить ядро");
+        conn_reply(c);
+    }
+}
+
+/* plugin-reload: реестр плагинов ядра заново, затем то же, что reload (спека, помощники, правила). */
+static void st_plugin_reload(struct conn *c) {
+    if (plugin_reload) plugin_reload(NULL);
+    st_reload(c);
+}
+
+/* plugin-event: тело — объект JSON от менеджера; подписчикам уходит событие `plugin` с полями id,
+ * state, version, from, why, by (steer-api.md, 4.1). Прочие поля тела не пересылаются. */
+static void mem_plugin_event(struct conn *c, struct cbuf *r) {
+    struct err e = {{0}};
+    struct ydoc *d = c->q.body_n ? ydoc_parse_buf(c->q.body, c->q.body_n, "plugin-event", &e) : NULL;
+    const struct ynode *root = d ? ydoc_root(d) : NULL;
+    const struct ynode *id = ynode_get(root, "id"), *st = ynode_get(root, "state");
+    if (!root || root->kind != YN_MAP || !id || id->kind != YN_SCALAR || !st || st->kind != YN_SCALAR) {
+        if (d) ydoc_free(d);
+        resp_error(r, "bad-request", "тело — объект JSON с id и state");
+        return;
+    }
+    struct cbuf f = {0};
+    static const char *const keys[] = {"id", "state", "version", "from", "why", "by", NULL};
+    for (int i = 0; keys[i]; i++) {
+        const struct ynode *v = ynode_get(root, keys[i]);
+        cb_fmt(&f, ",\"%s\":", keys[i]);
+        if (v && v->kind == YN_SCALAR && !(v->style == YS_PLAIN && ynode_is_null(v))) cb_jstr(&f, v->str);
+        else cb_str(&f, "null");
+    }
+    cb_put(&f, "", 0);
+    fprintf(stderr, LOG_I "плагин %s: %s\n", id->str, st->str);
+    steerd_emit(&c->srv->d, "plugin", f.p);
+    free(f.p);
+    ydoc_free(d);
+    cb_str(r, ",\"code\":0,\"stdout\":\"\",\"stderr\":\"\"");
+}
+
+/* ---- автообновление плагинов (s2p.md, «Фоновое автообновление») ----------------------------------
+ *
+ * Таймер в цикле демона, без cron и отдельного сторожа: по сроку — ребёнок `steerd plugin update
+ * --auto`, демон его не ждёт (только подбирает по выходу). Когда звать в следующий раз, решает сам
+ * менеджер: он пишет срок в state.json (auto.next — раз в сутки со сдвигом до часа, раньше — к
+ * началу ночного окна, если есть обновления, и повтор плагинов pending). Демон этот срок читает
+ * после каждого прохода. Нет каталога плагинов — таймера нет (стенды, телефон). */
+#define PLUGAUTO_FIRST_MS (5L * 60 * 1000)
+
+static const char *plugauto_root(void) {
+    const char *v = getenv("STEER_PLUGIN_DIR");
+    return v && *v ? v : "/usr/lib/steer/plugins";
+}
+
+static long plugauto_delay_ms(void) {
+    const char *etc = getenv("STEER_PLUGIN_ETC");
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/state.json", etc && *etc ? etc : "/etc/steer/plugins");
+    struct cbuf b = {0};
+    long ms = 24L * 3600 * 1000;
+    if (ctl_read_file(p, &b, 64L * 1024 * 1024) == 1) {
+        struct err e = {{0}};
+        struct ydoc *d = ydoc_parse_buf(b.p, b.n, "state.json", &e);
+        const struct ynode *nx = d ? ynode_get(ynode_get(ydoc_root(d), "auto"), "next") : NULL;
+        if (nx && nx->kind == YN_SCALAR) {
+            struct tm tm = {0};
+            if (strptime(nx->str, "%Y-%m-%dT%H:%M:%SZ", &tm)) {
+                time_t t = timegm(&tm), now = time(NULL);
+                ms = t > now ? (long)(t - now) * 1000L : 1000L;
+            }
+        } else {
+            ms = PLUGAUTO_FIRST_MS;
+        }
+        if (d) ydoc_free(d);
+    } else {
+        ms = PLUGAUTO_FIRST_MS;
+    }
+    free(b.p);
+    if (ms < 1000) ms = 1000;
+    return ms;
+}
+
+static struct loop_timer *g_plugauto_tm;
+static pid_t g_plugauto_pid;
+
+static void plugauto_exit(struct loop *l, pid_t pid, int status, void *arg) {
+    (void)l; (void)pid; (void)arg;
+    g_plugauto_pid = 0;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        fprintf(stderr, LOG_W "фоновое обновление плагинов не прошло (код %d) — подробности в steer plugin status\n",
+                WIFEXITED(status) ? WEXITSTATUS(status) : 128);
+    if (g_plugauto_tm) loop_timer_set(g_plugauto_tm, plugauto_delay_ms());
+}
+
+static void plugauto_fire(struct loop *l, struct loop_timer *t, void *arg) {
+    struct ctl_srv *s = arg;
+    (void)t;
+    if (g_plugauto_pid) return;
+    pid_t pid = fork();
+    if (pid < 0) { loop_timer_set(g_plugauto_tm, 600000L); return; }
+    if (pid == 0) {
+        setpgid(0, 0);
+        int nul = open("/dev/null", O_RDWR);
+        if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); }
+        loop_child_reset();
+        char *av[] = { s->cf.exe, "plugin", "update", "--auto", NULL };
+        execv(s->cf.exe, av);
+        _exit(127);
+    }
+    g_plugauto_pid = pid;
+    loop_child(l, pid, plugauto_exit, s);
+}
+
+static void plugauto_start(struct ctl_srv *s) {
+    const char *off = getenv("STEER_PLUGIN_AUTO");
+    if (off && !strcmp(off, "0")) return;
+    struct stat st;
+    if (stat(plugauto_root(), &st) != 0 || !S_ISDIR(st.st_mode)) return;
+    g_plugauto_tm = loop_timer_new(s->l, plugauto_fire, s);
+    if (g_plugauto_tm) loop_timer_set(g_plugauto_tm, plugauto_delay_ms());
+}
+
 /* ---- запрос ------------------------------------------------------------------------------------ */
 
 /* Строка запроса пришла целиком: разобрать слова, проверить их по таблице, завести тело.
@@ -3182,6 +3477,7 @@ int ctl_serve_main(int argc, char **argv) {
     }
     /* .so-плагины (steer-abi): после супервизора, чтобы host_v1 видел и спеку, и сторожа, и помощников. */
     plugso_boot(&S.d);
+    plugauto_start(&S);
     fprintf(stderr, LOG_I "слушаю %s%s%s\n", cf->sock, cf->watch ? ", сторожу выходы" : "",
             cf->supervise ? ", держу помощников" : "");
     if (cf->apply) {
