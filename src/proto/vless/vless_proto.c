@@ -156,10 +156,10 @@ int vless_uuid_parse(const char *s, unsigned char out[16]) {
 /* Заголовок запроса. Адрес передаётся ИМЕНЕМ, когда оно известно: так разрешение имени
  * делает сервер, и запрос не утекает наружу через локальный DNS. Для трафика из TUN имени
  * нет — там уже адрес, и передаётся он как адрес. */
-size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
-                           const char *host, const unsigned char ip4[4],
-                           uint16_t port, const char *flow,
-                           unsigned char *out, size_t cap) {
+size_t vless_build_request_a(const unsigned char uuid[16], enum vless_cmd cmd,
+                             const char *host, const unsigned char *ip, size_t ip_n,
+                             uint16_t port, const char *flow,
+                             unsigned char *out, size_t cap) {
     size_t i = 0;
     if (cap < 24) return 0;
     out[i++] = 0;                       /* версия протокола */
@@ -201,11 +201,19 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
         out[i++] = (unsigned char)hl;
         memcpy(out + i, host, hl); i += hl;
     } else {
-        if (i + 5 > cap) return 0;
-        out[i++] = VLESS_ADDR_IPV4;
-        memcpy(out + i, ip4, 4); i += 4;
+        if (ip_n != 4 && ip_n != 16) return 0;
+        if (i + 1 + ip_n > cap) return 0;
+        out[i++] = ip_n == 4 ? VLESS_ADDR_IPV4 : VLESS_ADDR_IPV6;
+        memcpy(out + i, ip, ip_n); i += ip_n;
     }
     return i;
+}
+
+size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
+                           const char *host, const unsigned char ip4[4],
+                           uint16_t port, const char *flow,
+                           unsigned char *out, size_t cap) {
+    return vless_build_request_a(uuid, cmd, host, ip4, 4, port, flow, out, cap);
 }
 
 /* Ответ: версия + длина доп. Возвращает число байт, которые надо отбросить перед

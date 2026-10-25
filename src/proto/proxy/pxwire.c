@@ -6,12 +6,13 @@
 #include "pxwire.h"
 #include "scrypto.h"
 
-size_t px_socks_addr(unsigned char *out, uint32_t dst_net, uint16_t dport_host) {
-    out[0] = 0x01;                       /* ATYP IPv4 */
-    memcpy(out + 1, &dst_net, 4);        /* уже сетевой порядок (flow_key, tun.h) */
-    out[5] = (unsigned char)(dport_host >> 8);
-    out[6] = (unsigned char)dport_host;
-    return 7;
+size_t px_socks_addr(unsigned char *out, int v6, const unsigned char *dst_net, uint16_t dport_host) {
+    size_t al = v6 ? 16 : 4;
+    out[0] = v6 ? 0x04 : 0x01;           /* ATYP IPv6 или IPv4 */
+    memcpy(out + 1, dst_net, al);        /* уже сетевой порядок (flow_key, tun.h) */
+    out[1 + al] = (unsigned char)(dport_host >> 8);
+    out[2 + al] = (unsigned char)dport_host;
+    return 3 + al;
 }
 
 /* ---- shadowsocks ---------------------------------------------------------------------------- */

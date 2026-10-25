@@ -32,7 +32,13 @@ int vless_uuid_form(const char *s);
 /* 16 байт идентификатора из текстовой формы. 0 — вышло, -1 — форма непригодна. */
 int vless_uuid_parse(const char *s, unsigned char out[16]);
 
-/* flow — имя потока (xtls-rprx-vision) или NULL/"" для обычного VLESS. */
+/* flow — имя потока (xtls-rprx-vision) или NULL/"" для обычного VLESS. ip — адрес байтами: четыре (IPv4) или
+ * шестнадцать (IPv6), ip_n — сколько; без имени (host) он и едет в заголовке. */
+size_t vless_build_request_a(const unsigned char uuid[16], enum vless_cmd cmd,
+                             const char *host, const unsigned char *ip, size_t ip_n,
+                             uint16_t port, const char *flow,
+                             unsigned char *out, size_t cap);
+/* То же с адресом IPv4 (ip4 — четыре байта). */
 size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
                            const char *host, const unsigned char ip4[4],
                            uint16_t port, const char *flow,

@@ -40,7 +40,7 @@ struct ss_sess {
     struct sc_aead enc, dec;
     unsigned char snonce[12], rnonce[12];
     unsigned char salt_sent[32];
-    uint32_t dst; uint16_t dport;
+    uint8_t dst[16]; uint8_t v6; uint16_t dport;
 
     size_t acc_n, want;          /* накопитель и сколько байт ждём на стадии */
     /* Расшифрованный кусок, который за один проход не влез в место стека, лежит в acc
@@ -87,7 +87,8 @@ static int ss_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
     const struct px_node *n = ctx;
     struct ss_sess *s = sess;
     s->udp = (uint8_t)udp;
-    s->dst = k->dst;
+    s->v6 = k->v6;
+    memcpy(s->dst, flow_dst_bytes(k), flow_alen(k));
     s->dport = k->dport;
     s->keylen = n->ss_key_n ? n->ss_key_n : 16;
     s->is2022 = n->ss_method >= SS_2022_AES128;
@@ -208,7 +209,7 @@ static int ss_send_tcp(const struct px_node *n, struct ss_sess *s, const unsigne
         if (n->ss_method == SS_NONE) {
             /* none: соль не нужна, но адрес и данные идут в открытую. Перепишем: без соли. */
             o = 0;
-            o += px_socks_addr(out + o, s->dst, s->dport);
+            o += px_socks_addr(out + o, s->v6, s->dst, s->dport);
             if (o + dn > sizeof out) return SEND_FATAL;
             memcpy(out + o, data, dn); o += dn;
             s->header_sent = 1;
@@ -219,8 +220,8 @@ static int ss_send_tcp(const struct px_node *n, struct ss_sess *s, const unsigne
         if (sc_aead_setkey(&s->enc, ss_alg(n->ss_method), subkey) != 0) return SEND_FATAL;
         s->has_enc = 1;
         memset(s->snonce, 0, 12);
-        unsigned char addr[8];
-        size_t al = px_socks_addr(addr, s->dst, s->dport);
+        unsigned char addr[PX_ADDR_MAX];
+        size_t al = px_socks_addr(addr, s->v6, s->dst, s->dport);
         int flushed = 0;
         if (s->is2022) {
             /* EIH для многопользовательского (один уровень реле). */
@@ -313,8 +314,8 @@ static int ss_send_udp(const struct px_node *n, struct ss_sess *s, const unsigne
         size_t dl = ((size_t)p[0] << 8) | p[1];
         p += 2; left -= 2;
         if (dl > left) return SEND_FATAL;
-        unsigned char addr[8];
-        size_t al = px_socks_addr(addr, s->dst, s->dport);
+        unsigned char addr[PX_ADDR_MAX];
+        size_t al = px_socks_addr(addr, s->v6, s->dst, s->dport);
         /* Пакет собирается в буфере потока, а не на стеке: датаграмма до SS_DGRAM_MAX (I-528). */
         unsigned char *pkt = px_scratch(1, 32 + al + dl + 16);
         if (!pkt) return SEND_FATAL;

@@ -72,10 +72,11 @@ void transport_close(struct transport *t) { t->link.fd = -1; }
 int sc_hash(enum sc_hash h, const void *d, size_t n, unsigned char *out) {
     (void)h; (void)d; (void)n; memset(out, 0xab, 28); return 0;
 }
-size_t px_socks_addr(unsigned char *out, uint32_t dst_net, uint16_t dport_host) {
-    out[0] = 1; memcpy(out + 1, &dst_net, 4);
-    out[5] = (unsigned char)(dport_host >> 8); out[6] = (unsigned char)dport_host;
-    return 7;
+size_t px_socks_addr(unsigned char *out, int v6, const unsigned char *dst_net, uint16_t dport_host) {
+    size_t al = v6 ? 16 : 4;
+    out[0] = v6 ? 4 : 1; memcpy(out + 1, dst_net, al);
+    out[1 + al] = (unsigned char)(dport_host >> 8); out[2 + al] = (unsigned char)dport_host;
+    return 3 + al;
 }
 
 /* vmess: слой scrypto и вывод ключей (pxwire.c) — заглушки; g_shake_fail — отказ SHAKE128. */
@@ -850,6 +851,141 @@ static void test_socks_live(void) {
     close(sp[1]);
 }
 
+/* ---- адрес назначения IPv6 (D-S3.1, I-566) --------------------------------------------------- */
+
+static const unsigned char V6D[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
+static void v6_key(struct flow_key *k) {
+    memset(k, 0, sizeof *k);
+    k->v6 = 1;
+    memcpy(k->dst6, V6D, 16);
+    inet_pton(AF_INET6, "2001:db8::2", k->src6);
+    k->dport = 443;
+    k->sport = 5000;
+}
+
+static void test_v6_dial(void) {
+    struct flow_key k;
+    v6_key(&k);
+
+    /* http: CONNECT и Host с адресом в скобках. */
+    {
+        const struct dialer_ops *ops = &proxy_http_dialer;
+        struct px_node n;
+        http_node(&n, "", "");
+        void *sess = calloc(1, ops->sess_size);
+        ops->clear(sess);
+        ops->flow_open(&n, sess, &k, 0);
+        static const char ok[] = "HTTP/1.1 200 Connection established\r\n\r\n";
+        feed_reset((const unsigned char *)ok, sizeof ok - 1);
+        int rc = ops->connect(&n, sess, 2);
+        g_tx[g_tx_n < sizeof g_tx ? g_tx_n : sizeof g_tx - 1] = 0;
+        check("http IPv6: CONNECT прошёл", 0, rc);
+        check("http IPv6: CONNECT [адрес]:порт и Host в скобках", 1,
+              strstr((const char *)g_tx, "CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n") == (const char *)g_tx);
+        free(sess);
+    }
+
+    /* socks5: CONNECT с ATYP 4. */
+    {
+        const struct dialer_ops *ops = &proxy_socks_dialer;
+        int sp[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) { check("socks5 IPv6: пара сокетов", 0, 1); return; }
+        unsigned char rep[] = { 5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };   /* метод без авторизации, ответ CONNECT */
+        if (write(sp[1], rep, sizeof rep) != (ssize_t)sizeof rep) return;
+        g_tcp_fd = sp[0];
+        struct px_node n; memset(&n, 0, sizeof n);
+        n.proto = PX_SOCKS; n.socks_ver = 5;
+        void *sess = calloc(1, ops->sess_size);
+        ops->clear(sess);
+        ops->flow_open(&n, sess, &k, 0);
+        int rc = ops->connect(&n, sess, 2);
+        unsigned char got[64];
+        ssize_t gn = read(sp[1], got, sizeof got);
+        static const unsigned char want[] = { 5, 1, 0, 4, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x01, 0xbb };
+        int has = 0;
+        for (ssize_t i = 0; gn > 0 && i + (ssize_t)sizeof want <= gn; i++)
+            if (!memcmp(got + i, want, sizeof want)) has = 1;
+        check("socks5 IPv6: CONNECT принят", 0, rc);
+        check("socks5 IPv6: запрос 05 01 00 04 + 16 байт адреса + порт", 1, has);
+        ops->close(sess); free(sess);
+        close(sp[1]);
+        g_tcp_fd = -1;
+    }
+
+    /* socks4: адресов IPv6 нет — отказ, а не усечённый адрес. */
+    {
+        const struct dialer_ops *ops = &proxy_socks_dialer;
+        int sp[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0) {
+            unsigned char rep[] = { 0, 0x5a, 0, 0, 0, 0, 0, 0 };
+            if (write(sp[1], rep, sizeof rep) != (ssize_t)sizeof rep) return;
+            g_tcp_fd = sp[0];
+            struct px_node n; memset(&n, 0, sizeof n);
+            n.proto = PX_SOCKS; n.socks_ver = 4;
+            void *sess = calloc(1, ops->sess_size);
+            ops->clear(sess);
+            ops->flow_open(&n, sess, &k, 0);
+            int rc = ops->connect(&n, sess, 2);
+            unsigned char got[64];
+            ssize_t gn = read(sp[1], got, sizeof got);
+            check("socks4 IPv6: отказ PX_EADDR, на провод запроса не ушло", 1, rc == PX_EADDR && gn <= 0);
+            ops->close(sess); free(sess);
+            close(sp[1]);
+            g_tcp_fd = -1;
+        }
+    }
+
+    /* trojan: после пароля CRLF, команда, ATYP 4, адрес, порт, CRLF. */
+    {
+        const struct dialer_ops *ops = &proxy_trojan_dialer;
+        struct px_node n; memset(&n, 0, sizeof n);
+        n.proto = PX_TROJAN;
+        void *sess = calloc(1, ops->sess_size);
+        ops->clear(sess);
+        ops->flow_open(&n, sess, &k, 0);
+        ops->connect(&n, sess, 2);
+        feed_reset(NULL, 0);
+        int sr = ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5);
+        check("trojan IPv6: запрос ушёл", SEND_OK, sr);
+        check("trojan IPv6: заголовок — команда 1, ATYP 4, адрес, порт, CRLF, затем данные", 1,
+              g_tx_n == 56 + 2 + 1 + 19 + 2 + 5 && g_tx[58] == 1 && g_tx[59] == 4 &&
+              !memcmp(g_tx + 60, V6D, 16) && g_tx[76] == 0x01 && g_tx[77] == 0xbb &&
+              g_tx[78] == '\r' && g_tx[79] == '\n' && !memcmp(g_tx + 80, "GET /", 5));
+        ops->close(sess); free(sess);
+    }
+
+    /* shadowsocks без шифра: адрес и данные идут открыто — ATYP 4. */
+    {
+        const struct dialer_ops *ops = &proxy_ss_dialer;
+        struct px_node n; memset(&n, 0, sizeof n);
+        n.proto = PX_SS; n.ss_method = SS_NONE; n.ss_key_n = 16;
+        void *sess = calloc(1, ops->sess_size);
+        ops->clear(sess);
+        ops->flow_open(&n, sess, &k, 0);
+        ops->connect(&n, sess, 2);
+        feed_reset(NULL, 0);
+        g_win = -1;
+        int sr = ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5);
+        check("shadowsocks IPv6: первый кусок — ATYP 4, адрес, порт, данные", 1,
+              sr == SEND_OK && g_tx_n == 19 + 5 && g_tx[0] == 4 && !memcmp(g_tx + 1, V6D, 16) &&
+              g_tx[17] == 0x01 && g_tx[18] == 0xbb && !memcmp(g_tx + 19, "GET /", 5));
+        ops->close(sess); free(sess);
+    }
+
+    /* vmess: заголовок с адресом IPv6 длиннее на двенадцать байт. */
+    {
+        const struct dialer_ops *ops = &proxy_vmess_dialer;
+        struct px_node n; memset(&n, 0, sizeof n);
+        n.proto = PX_VMESS; n.vmess_sec = VMESS_AES128_GCM;
+        void *sess = vm_open(ops, &n, &k);
+        int sr = ops->send(&n, sess, &k, 0, (const unsigned char *)"GET /", 5);
+        check("vmess IPv6: запрос — заголовок на 12 байт длиннее (61 вместо 49) и кусок", 1,
+              sr == SEND_OK && g_tx_n == 16 + 18 + 8 + 61 + 16 + 2 + 5 + 16);
+        ops->close(sess); free(sess);
+    }
+}
+
 int main(void) {
     test_ss_first_tail();
     test_ss_again_nonce();
@@ -865,5 +1001,6 @@ int main(void) {
     test_big_dgram();
     test_socks_live();
     test_http_long_auth();
+    test_v6_dial();
     return unit_done("pxdialmatch");
 }
