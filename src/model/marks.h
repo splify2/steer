@@ -81,11 +81,9 @@
  * лестницы netd (почему — src/platform/android.c). */
 #define STEER_RULE_PREF  (plat()->rule_pref)
 #define STEER_PROBE_PREF (plat()->probe_pref)
-/* Бит перемаршрутизации каналов на сам телефон в старой раскладке, метка собственного трафика
- * движка, бит собственного трафика туннеля через via и первый UID приложений — всё это есть
- * только у платформы с каналами на само устройство (подробно — у значений в
- * src/platform/android.c). На роутере все четыре — ноль: «нет такого». */
-#define STEER_REROUTE_BIT (plat()->reroute_bit)
+/* Метка собственного трафика движка, бит собственного трафика туннеля через via и первый UID
+ * приложений — всё это есть только у платформы с каналами на само устройство (подробно — у
+ * значений в src/platform/android.c). На роутере все три — ноль: «нет такого». */
 #define STEER_SELF_MARK   (plat()->self_mark)
 #define STEER_TUNNEL_BIT  (plat()->tunnel_bit)
 #define STEER_APP_UID_MIN (plat()->app_uid_min)

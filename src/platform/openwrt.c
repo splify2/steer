@@ -81,9 +81,8 @@ const struct platform_ops plat_openwrt = {
      * с первого выпуска. */
     .rule_pref = 0,
     .probe_pref = 29999,
-    /* Цепочек route на output (каналов на сам роутер) нет, собственный трафик движка не
-     * метится: каналы роутера — на prerouting, трафик самого роутера они не трогают. */
-    .reroute_bit = 0,
+    /* Собственный трафик движка не метится: каналы роутера — на prerouting, трафик самого
+     * роутера они не трогают. */
     .self_mark = 0,
     .tunnel_bit = 0,
     .app_uid_min = 0,
@@ -100,7 +99,6 @@ const struct platform_ops plat_openwrt = {
     .lan_devs_persist = 1,
     /* IPv6 в LAN раздают netifd (ip6prefix, ip6assign) и odhcpd — ipv6: routed и nat действуют. */
     .lan_ipv6_host = 1,
-    .warn_iptables_nat = 1,
     .dnsd_origdst = 0,                /* наверх — dnsmasq роутера на петле */
     .ctl_allow_domain = NULL,
 

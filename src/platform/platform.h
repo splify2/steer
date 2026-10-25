@@ -51,7 +51,6 @@ struct platform_ops {
     uint32_t mark_mask;               /* маска поля — PLAT_MARK_MASK(база, ширина) */
     unsigned rule_pref;               /* приоритет ip rule выходов; 0 — не передавать pref */
     unsigned probe_pref;              /* приоритет правила пробы сторожа */
-    uint32_t reroute_bit;             /* бит перемаршрутизации в старой раскладке; 0 — нет */
     uint32_t self_mark;               /* метка собственного трафика движка; 0 — не метится */
     uint32_t tunnel_bit;              /* бит собственного трафика туннеля через via; 0 — нет */
     unsigned app_uid_min;             /* первый UID приложений (канал «self») */
@@ -81,7 +80,6 @@ struct platform_ops {
      * nat` у выхода (шаг 8 выпуска 1.10, spec.h: out_ipv6_mode). На телефоне раздачей IPv6
      * владеет Tethering Android, и эти режимы там — отсутствие ключа с предупреждением. */
     unsigned lan_ipv6_host : 1;
-    unsigned warn_iptables_nat : 1;   /* старое ядро: предупреждать о живом nat iptables */
     unsigned dnsd_origdst : 1;        /* резолвер переспрашивает того, к кому шёл запрос (умолчание) */
     const char *ctl_allow_domain;     /* SELinux-домен клиента сокета; NULL — проверки нет */
     /* Таблица «пакет → UID» (package_name из наборов sing-box, src/model/srsplan.c); NULL —

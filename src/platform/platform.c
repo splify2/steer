@@ -14,13 +14,6 @@
 #include "platform.h"
 #include "profile.h"
 
-/* Прежний ключ сборки телефона. Код его больше не читает, и сборка с ним молча стала бы
- * бинарником без умолчания — на машине без признаков Android (стенды на обычном Linux) это
- * роутер. Громкий отказ дешевле. */
-#ifdef STEER_ANDROID
-#error "-DSTEER_ANDROID снят: платформа выбирается при запуске, умолчание — -DSTEER_DEFAULT_PLATFORM=android"
-#endif
-
 static const struct platform_ops *const PLATFORMS[] = { &plat_openwrt, &plat_android };
 #define PLATFORMS_N (sizeof PLATFORMS / sizeof PLATFORMS[0])
 
