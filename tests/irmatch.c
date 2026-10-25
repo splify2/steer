@@ -59,6 +59,51 @@ static int load(const char *tmpl) {
     return 0;
 }
 
+/* ---- поиск в дереве (только стендам) ---- */
+static struct nft_set *ir_set_find(const struct nft_table *t, const char *name) {
+    for (struct nft_obj *o = t ? t->objs : NULL; o; o = o->next)
+        if (o->k == NFT_OBJ_SET && o->name && !strcmp(o->name, name)) return ir_obj_set(o);
+    return NULL;
+}
+
+static int comment_is(const struct nft_rule *r, const char *comment) {
+    return !comment || (r->comment && !strcmp(r->comment, comment));
+}
+
+/* Первое правило с таким комментарием и сколько их (comment == NULL — все правила). */
+static struct nft_rule *ir_rule_find(const struct nft_chain *c, const char *comment) {
+    for (struct nft_rule *r = c ? c->rules : NULL; r; r = r->next)
+        if (comment_is(r, comment)) return r;
+    return NULL;
+}
+
+static size_t ir_rule_count(const struct nft_chain *c, const char *comment) {
+    size_t n = 0;
+    for (struct nft_rule *r = c ? c->rules : NULL; r; r = r->next)
+        if (comment_is(r, comment)) n++;
+    return n;
+}
+
+/* Первое выражение этого вида в правиле или NULL. */
+static struct nft_expr *ir_expr_find(const struct nft_rule *r, enum nft_xk k) {
+    for (struct nft_expr *x = r ? r->x : NULL; x; x = x->next)
+        if (x->k == k) return x;
+    return NULL;
+}
+
+/* Приоритет числом (mangle + 1 = -149); именованные — по таблице nft (doc/nft.txt, «PRIORITY»). */
+static int ir_prio_value(const struct nft_chain *c) {
+    static const struct { const char *name; int v; } names[] = {
+        { "raw", -300 }, { "mangle", -150 }, { "dstnat", -100 }, { "filter", 0 },
+        { "security", 50 }, { "srcnat", 100 },
+    };
+    int base = 0;
+    if (c->prio_name)
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+            if (!strcmp(names[i].name, c->prio_name)) base = names[i].v;
+    return base + c->prio_off;
+}
+
 static int build(struct nft_rs *rs) {
     struct err e = {0};
     nft_rs_init(rs);
@@ -129,8 +174,7 @@ static void t_router_basic(void) {
     struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
     check("есть таблица inet", 1, t != NULL);
     check_str("имя таблицы — nft_table()", nft_table(), t ? t->name : "");
-    check("таблиц ip/ip6 нет", 0, ir_table_find(&rs, NFT_FAM_IP, NULL) ||
-                                  ir_table_find(&rs, NFT_FAM_IP6, NULL));
+    check("таблица одна", 1, rs.tables != NULL && rs.tables->next == NULL);
 
     struct nft_set *s = ir_set_find(t, "vpn_ip");
     check("набор vpn_ip есть", 1, s != NULL);
@@ -263,7 +307,6 @@ static void t_phone(void) {
     check("и у двойника", 0, ir_rule_has(r6, "mark or 0x00200000"));
     check("скачанное — в input_down", 1,
           ir_rule_find(ir_chain_find(in, "input_down"), cm("steer-down:", all->name)) != NULL);
-    struct nft_table *t4 = ir_table_find(&rs, NFT_FAM_IP, NULL);
     {
         struct nft_chain *od = ir_chain_find(in, "output_dns");
         check_str("заворот DNS приложений — nat output", "output", chook(od));
@@ -271,7 +314,7 @@ static void t_phone(void) {
         check("udp, tcp, fakeip и fakeip6 (с правилами без подмены)", 6,
               (long)ir_rule_count(od, NULL));
         check("  правил без подмены — два", 2, (long)ir_rule_count(od, "steer-fakeip-local-nomap"));
-        check("таблицы ip нет", 0, t4 != NULL);
+        check("таблица одна", 1, rs.tables->next == NULL);
     }
     /* Доменная группа приложения: парный набор IPv6 и v6-двойник — там же, где fake-IP v6. */
     char d6[80];
@@ -552,7 +595,7 @@ static void t_balance_by(void) {
 }
 
 static void t_tree(void) {
-    printf("\n-- дерево: поиск и переделка --\n");
+    printf("\n-- дерево: построение и арена --\n");
     struct nft_rs rs;
     nft_rs_init(&rs);
     struct nft_table *t = ir_table_add(&rs, NFT_FAM_INET, "x");
@@ -561,21 +604,20 @@ static void t_tree(void) {
     ir_x(r, "tcp dport %d", 22);
     ir_counter(r, 7, 700);
     ir_comment(r, "k");
-    struct nft_rule *n = ir_rule_clone(NULL, r);
-    check("клон встал сразу за оригиналом", 1, r->next == n && n->next == NULL);
-    check("и у него свои выражения", 1, n->x != r->x && !strcmp(n->x->text, r->x->text));
-    check("счётчик копируется", 700, n ? (long)n->bytes : 0);
     ir_rule(c);
-    check("хвост цепочки после клона верен", 3, (long)ir_rule_count(c, NULL));
-    check("по комментарию — два", 2, (long)ir_rule_count(c, "k"));
+    check("правил два", 2, (long)ir_rule_count(c, NULL));
+    check("по комментарию — одно", 1, (long)ir_rule_count(c, "k"));
+    check("выражения по порядку", 1, r->x && r->x->k == NFT_X_RAW && r->x->next &&
+                                     r->x->next->k == NFT_X_COUNTER && r->x_tail == &r->x->next->next);
+    check("счётчик в правиле", 700, (long)r->bytes);
     char p[32];
     ir_prio_str(c, p, sizeof(p));
     check_str("приоритет словами", "filter - 5", p);
     struct nft_set *s1 = ir_set_add(t, "s1", "ipv4_addr");
     struct nft_set *s2 = ir_set_add(t, "s2", "ipv4_addr");
-    ir_obj_unlink(&s2->o);
-    ir_obj_insert_after(&c->o, &s2->o);
-    check("вставка после объекта", 1, c->o.next == &s2->o && s2->o.next == &s1->o);
+    check("объекты в порядке добавления", 1, c->o.next == &s1->o && s1->o.next == &s2->o &&
+                                             t->objs_tail == &s2->o.next);
+    check("поиск набора", 1, ir_set_find(t, "s2") == s2);
     check("наборов два, цепочка одна", 21, nobjs(t, NFT_OBJ_SET) * 10 + nobjs(t, NFT_OBJ_CHAIN));
     /* Строка длиннее куска арены — свой кусок, а не отказ. */
     char big[10000];

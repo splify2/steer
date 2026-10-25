@@ -12,9 +12,7 @@
  * (эта библиотека) и горячий путь proxy.c спрашивают его же. */
 int dbg(void);
 
-extern const char *g_nft_table;      /* "<family> <table>" — наборы (см. nftnl.c) */
-extern const char *g_nft_map_table;  /* "<family> <table>" — карта fakeip (может отличаться) */
-extern int g_nft_sets_interval;      /* 1 — наборы принимают "начало + конец диапазона" */
+extern const char *g_nft_table;      /* "<family> <table>" — наборы и карты fakeip (см. nftnl.c) */
 extern int g_nlk_fd;                 /* долгоживущий сокет nfnetlink, -1 — не открыт */
 
 int nftlk_open(void);
@@ -38,9 +36,7 @@ int nft_map_set_element(const char *map_name, uint32_t fake_host,
                          uint32_t real_host, uint32_t known_real);
 
 /* IPv6 (fake-IP v6 и real-ip v6, docs/architecture.md, «4б»): те же операции с адресами из 16
- * байт в порядке сети. known_real — установленное значение карты или NULL («не знаем»).
- * g_nft_map6_table — таблица карты fakeip6 ("<семейство> <таблица>"). */
-extern const char *g_nft_map6_table;
+ * байт в порядке сети. known_real — установленное значение карты или NULL («не знаем»). */
 int nftlk_elem_msg6(uint16_t nft_msg_type, const char *table,
                      const char *obj_name, const uint8_t key[16],
                      int interval, const uint8_t *data, uint64_t timeout_ms);

@@ -1,10 +1,9 @@
-/* Печать дерева набора правил (ir.h) в текст nftables — один печатник на обе раскладки.
+/* Печать дерева набора правил (ir.h) в текст nftables.
  *
  * Печатник знает только синтаксис nft и раскладку текста: отступы в четыре пробела, пустые
- * строки там, где их поставил строитель (obj->gap), «dnat ip to» в inet и «dnat to» в
- * таблице одного семейства. Что стоит в ядре, решают генератор (generate.c) и раскладка
- * старого ядра (legacy.c). Текст обязан совпадать с тем, что печатал прежний генератор, до
- * байта: на этом держится снимок tests/golden/ruleset. */
+ * строки там, где их поставил строитель (obj->gap), «dnat ip to»/«dnat ip6 to» по семейству
+ * правила. Что стоит в ядре, решают генератор (generate.c) и модули видов. Текст обязан
+ * совпадать со снимком tests/golden/ruleset до байта. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
@@ -747,9 +746,7 @@ static void emit_fakeip_elements(FILE *f, const char *path, int fam) {
  * auto-merge сольёт соседние поддельные адреса одного канала в отрезок; резолвер, которому потом
  * понадобится снять из набора один адрес, делит такой отрезок сам (dch_del, fakeip.c).
  * Составной — событиями той же раскладки, что списки (emit_mixed), и засеянный адрес там не
- * сливается с соседями (seed_edge4). Набор старой раскладки — hash (legacy.c, шаг 1): засев идёт в
- * динамическую половину, чьё имя — имя группы; составной hash засева не получает — ящиков
- * «протоколы × порты» hash не держит, и такой элемент отверг бы весь набор правил.
+ * сливается с соседями (seed_edge4).
  *
  * Чего в тексте нет по-прежнему: элементов real-ip. Их память — только у резолвера (realip.c), а
  * ложиться текстом со сроком в набор с auto-merge они не могут: nft сливает соседние элементы в
@@ -768,14 +765,11 @@ static void print_elements(FILE *f, const struct nft_set *s) {
      * «4б») берёт из тех же файлов и наборов .srs строки IPv6, обычный — IPv4. */
     int fam = s->key && !strncmp(s->key, "ipv6_addr", 9) ? 6 : 4;
     /* Засев набора канала fake-IP (g_print_seed): спрашивается только у набора со сроками — такие
-     * заводит генератор доменной группе (и динамической половине старой раскладки), — и только
-     * при засеве вообще. Составной набор без интервалов (hash старой раскладки) засева не
-     * получает: ящики «протоколы × порты» — интервалы. */
+     * заводит генератор доменной группе, — и только при засеве вообще. */
     int composite = s->key && strstr(s->key, " . ") != NULL;
     const struct ir_seed *seed = NULL;
     size_t nseed = 0;
-    if (g_print_state_seed && g_print_seed && !s->data && (s->flags & NFT_SET_TIMEOUT) &&
-        (!composite || (s->flags & NFT_SET_INTERVAL)))
+    if (g_print_state_seed && g_print_seed && !s->data && (s->flags & NFT_SET_TIMEOUT))
         nseed = g_print_seed(s->o.name, fam, &seed);
     const struct ir_mixed *mix = NULL;
     int list = 0;
@@ -836,13 +830,11 @@ static void print_set(FILE *f, const struct nft_set *s) {
     fprintf(f, "    }\n");
 }
 
-static void print_expr(FILE *f, const struct nft_table *t, const struct nft_rule *r,
-                       const struct nft_expr *x) {
+static void print_expr(FILE *f, const struct nft_rule *r, const struct nft_expr *x) {
     switch (x->k) {
     case NFT_X_RAW:
     case NFT_X_MARKSET:
     case NFT_X_NOTRACK:
-    case NFT_X_FRAG6:
         fputs(x->text, f);
         break;
     case NFT_X_FAMILY:
@@ -858,32 +850,25 @@ static void print_expr(FILE *f, const struct nft_table *t, const struct nft_rule
         else fputs("counter", f);
         break;
     case NFT_X_DNAT:
-        /* В таблице одного семейства семейство и так известно, и слово ip после dnat там
-         * лишнее; в inet без него nft не знает, адрес какого семейства подставлять. */
-        fprintf(f, "dnat %sto %s map @%s",
-                t->fam != NFT_FAM_INET ? "" : r->fam == 6 ? "ip6 " : "ip ", x->text, x->arg);
-        break;
-    case NFT_X_JUMP:
-        fprintf(f, "jump %s", x->arg);
+        /* В inet без семейства nft не знает, адрес какого семейства подставлять. */
+        fprintf(f, "dnat %s to %s map @%s", r->fam == 6 ? "ip6" : "ip", x->text, x->arg);
         break;
     }
 }
 
-static void print_rule(FILE *f, const struct nft_table *t, const struct nft_rule *r) {
+static void print_rule(FILE *f, const struct nft_rule *r) {
     fputs("        ", f);
     int first = 1;
     for (const struct nft_expr *x = r->x; x; x = x->next) {
-        /* «meta nfproto ipvN» в таблице ip/ip6 ничего не сужает — семейство задала таблица. */
-        if (x->k == NFT_X_FAMILY && t->fam != NFT_FAM_INET) continue;
         if (!first) fputc(' ', f);
-        print_expr(f, t, r, x);
+        print_expr(f, r, x);
         first = 0;
     }
     if (r->comment) fprintf(f, "%scomment \"%s\"", first ? "" : " ", r->comment);
     fputc('\n', f);
 }
 
-static void print_chain(FILE *f, const struct nft_table *t, const struct nft_chain *c) {
+static void print_chain(FILE *f, const struct nft_chain *c) {
     fprintf(f, "%s    chain %s {\n", c->o.gap ? "\n" : "", c->o.name);
     if (c->type) {
         char prio[48];
@@ -893,25 +878,16 @@ static void print_chain(FILE *f, const struct nft_table *t, const struct nft_cha
                 c->type, c->hook, c->devices ? " " : "", c->devices ? c->devices : "", prio,
                 c->policy ? c->policy : "accept");
     }
-    for (const struct nft_rule *r = c->rules; r; r = r->next) print_rule(f, t, r);
+    for (const struct nft_rule *r = c->rules; r; r = r->next) print_rule(f, r);
     fprintf(f, "    }\n");
-}
-
-static const char *fam_name(enum nft_family fam) {
-    switch (fam) {
-    case NFT_FAM_IP: return "ip";
-    case NFT_FAM_IP6: return "ip6";
-    case NFT_FAM_INET: break;
-    }
-    return "inet";
 }
 
 void nft_print(const struct nft_rs *rs, FILE *f) {
     for (const struct nft_table *t = rs->tables; t; t = t->next) {
-        fprintf(f, "table %s %s {\n", fam_name(t->fam), t->name);
+        fprintf(f, "table inet %s {\n", t->name);
         for (struct nft_obj *o = t->objs; o; o = o->next) {
             if (o->k == NFT_OBJ_SET) print_set(f, (const struct nft_set *)o);
-            else print_chain(f, t, (const struct nft_chain *)o);
+            else print_chain(f, (const struct nft_chain *)o);
         }
         fprintf(f, "}\n");
     }

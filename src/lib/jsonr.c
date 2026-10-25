@@ -19,7 +19,7 @@ int js_lit(struct js *j, char c) {
     return 0;
 }
 /* Четыре шестнадцатеричные цифры после \u. -1 — если их нет. */
-long js_hex4(const char *p) {
+static long js_hex4(const char *p) {
     long v = 0;
     for (int k = 0; k < 4; k++) {
         char c = p[k];
@@ -39,7 +39,7 @@ long js_hex4(const char *p) {
  * (буква «u» и дальше как есть), с предупреждением. Не раскодируются управляющие знаки —
  * в имени, пути или адресе им смысла нет, а грузилась такая спека и до правки, — одинокие
  * суррогаты и недописанное \u. */
-size_t js_uesc(const char **pp, char out[4]) {
+static size_t js_uesc(const char **pp, char out[4]) {
     const char *p = *pp;                              /* указывает на 'u' */
     long cp = js_hex4(p + 1);
     size_t used = 5;

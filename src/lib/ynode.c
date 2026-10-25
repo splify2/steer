@@ -401,47 +401,6 @@ struct ydoc *ydoc_parse_buf(const char *buf, size_t len, const char *name, struc
     return d;
 }
 
-/* Файл читается целиком и не больше предела + 1 байт: сам предел проверяет ydoc_parse_buf, а
- * лишний байт отличает «ровно предел» от «больше» без stat (спека может прийти и из трубы). */
-struct ydoc *ydoc_parse_file(const char *path, struct err *e) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        yfail(e, path, 0, 0, "не открывается: %s", strerror(errno));
-        return NULL;
-    }
-    size_t cap = 0, len = 0;
-    char *buf = NULL;
-    for (;;) {
-        if (len == cap) {
-            size_t ncap = cap ? cap * 2 : 16384;
-            if (ncap > (size_t)YDOC_MAX_BYTES + 1) ncap = (size_t)YDOC_MAX_BYTES + 1;
-            if (ncap == cap) break;                  /* предел + 1 прочитан — хватит */
-            char *nb = realloc(buf, ncap);
-            if (!nb) {
-                free(buf);
-                fclose(f);
-                yfail(e, path, 0, 0, "не хватило памяти на чтение", NULL);
-                return NULL;
-            }
-            buf = nb;
-            cap = ncap;
-        }
-        size_t got = fread(buf + len, 1, cap - len, f);
-        len += got;
-        if (got == 0) break;
-    }
-    int bad = ferror(f);
-    fclose(f);
-    if (bad) {
-        free(buf);
-        yfail(e, path, 0, 0, "не читается: %s", strerror(errno ? errno : EIO));
-        return NULL;
-    }
-    struct ydoc *d = ydoc_parse_buf(buf, len, path, e);
-    free(buf);
-    return d;
-}
-
 /* ---- доступ ------------------------------------------------------------------------------ */
 const struct ynode *ydoc_root(const struct ydoc *d) { return d ? d->root : NULL; }
 const char *ydoc_name(const struct ydoc *d) { return d ? d->name : NULL; }
@@ -469,10 +428,6 @@ const struct ynode *ynode_get(const struct ynode *map, const char *key) {
     for (size_t i = 0; i < map->len; i++)
         if (strcmp(map->items[2 * i]->str, key) == 0) return map->items[2 * i + 1];
     return NULL;
-}
-
-const char *ynode_str(const struct ynode *n) {
-    return n && n->kind == YN_SCALAR ? n->str : NULL;
 }
 
 int ynode_is_null(const struct ynode *n) {

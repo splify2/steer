@@ -19,8 +19,6 @@ struct js { const char *p; };
 
 void js_ws(struct js *j);
 int js_lit(struct js *j, char c);
-long js_hex4(const char *p);
-size_t js_uesc(const char **pp, char out[4]);
 int js_str(struct js *j, char *buf, size_t n, struct err *e);
 int js_num(struct js *j, long *out, struct err *e);
 int js_skip(struct js *j, struct err *e);
