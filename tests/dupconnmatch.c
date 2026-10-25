@@ -268,6 +268,7 @@ int main(void) {
         add_conn(up, CS_READY, 1);
         c0->qrx_ms = now_ms() - 10000;
         r1->deadline = now_ms() - 1;
+        req_rekey(r1);
         dup_tick();
         check("  первый вопрос — отказ по сроку", 1, g_fail);
         check("  молчащее соединение закрыто", CS_FREE, c0->st);
@@ -285,13 +286,41 @@ int main(void) {
         dup_ask(0, g_qbuf, qn, on_done, NULL);
         c->qrx_ms = now_ms() + 1;                 /* после ухода вопросов от сервера что-то пришло */
         nth_req(up, 0)->deadline = now_ms() - 1;
+        req_rekey(nth_req(up, 0));
         dup_tick();
         check("DoT: вопрос просрочен, но сервер отвечает — соединение живо", CS_READY, c->st);
         check("  отказ получил только просроченный", 1, g_fail);
         c->qrx_ms = now_ms() - 10000;
         nth_req(up, 0)->deadline = now_ms() - 1;
+        req_rekey(nth_req(up, 0));
         dup_tick();
         check("  вопрос просрочен на молчащем соединении — соединение закрыто", CS_FREE, c->st);
+    }
+
+    /* 6а. Сроки вопросов — куча (I-536): каскад из тысячи просроченных вопросов снимается одним
+     *     тиком, каждый получает отказ ровно один раз; живой вопрос с далёким сроком не тронут, и
+     *     сон цикла (dup_wait_ms) считается по его сроку, а не по просроченным. */
+    {
+        struct dup *up = mk_up("tls://127.0.0.1");
+        struct dconn *c = add_conn(up, CS_READY, 0);
+        c->qrx_ms = now_ms() + 1;                  /* сервер отвечает: соединение при отказах не рвётся */
+        enum { N = 1000 };
+        for (int i = 0; i < N + 1; i++) dup_ask(0, g_qbuf, qn, on_done, NULL);
+        int ok = 1;
+        for (int i = 0; i < N; i++) {
+            struct dreq *r = nth_req(up, i);
+            if (!r) { ok = 0; break; }
+            r->deadline = now_ms() - 1 - (i * 7919) % 500;      /* сроки вперемешку */
+            req_rekey(r);
+        }
+        check("куча: все вопросы поставлены", 1, ok);
+        dup_tick();
+        check("куча: просроченные получили отказ все и по одному разу", N, g_fail);
+        check("куча: живой вопрос остался", 1, dup_busy());
+        int w = dup_wait_ms();
+        check("куча: сон цикла — по сроку живого вопроса, не ноль", 1, w > 1000);
+        dup_tick();
+        check("куча: повторный тик ничего не добавил", N, g_fail);
     }
 
     /* 7. tcp://: соединение, которое не устанавливается (SYN уходит в никуда), держит место

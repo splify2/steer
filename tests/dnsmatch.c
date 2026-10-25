@@ -1294,6 +1294,87 @@ int main(void) {
         dcache_flush();
     }
 
+    /* ---- ОБЩИЙ ИНДЕКС КАНАЛОВ (I-536) ---------------------------------------------
+     *
+     * dch_match_mask ищет имя по одной таблице суффиксов всех каналов, а не проходом по каналам.
+     * Сверка с прежним проходом (dch_matches по каждому каналу) на каналах всех видов правил:
+     * доменные, точные, шаблоны, регулярные выражения, части с исключениями и без; на именах
+     * из совпадающих, чужих и граничных (подстрока без точки, регистр, глубокие поддомены). */
+    {
+        static const char *const c0[] = { "youtube.com", "=exact.example.org", "Deep.Sub.Example.NET", NULL };
+        static const char *const c1[] = { "youtube.com", "example.net", "=only.here.io", NULL };
+        static const char *const c2[] = { "*.wild.example.com", "re:^r[0-9]+\\.regex\\.io$", "plain.org", NULL };
+        static const char *const c3[] = { "partA.com", "shared.test", NULL };
+        static const char *const c3x[] = { "bad.partA.com", NULL };
+        static const char *const c4[] = { "shared.test", "last.example", NULL };
+        dch_zero(5);
+        g_dch_n = 5;
+        for (size_t i = 0; i < 5; i++) snprintf(g_dch[i].set, sizeof(g_dch[i].set), "ch%zu", i);
+        build(&g_dch[0].rules, c0);
+        build(&g_dch[1].rules, c1);
+        build(&g_dch[2].rules, c2);
+        g_dch[3].parts = calloc(1, sizeof(struct dpart));
+        g_dch[3].parts_n = 1;
+        build(&g_dch[3].parts[0].rules, c3);
+        build(&g_dch[3].parts[0].excl, c3x);
+        g_dch[3].parts[0].has_excl = 1;
+        build(&g_dch[4].rules, c4);
+        static const char *const names[] = {
+            "youtube.com", "www.youtube.com", "notyoutube.com", "ube.com", "YOUTUBE.COM", "a.b.c.youtube.com",
+            "exact.example.org", "x.exact.example.org", "only.here.io", "a.only.here.io", "example.net",
+            "deep.sub.example.net", "x.deep.sub.example.net", "sub.example.net", "q.wild.example.com",
+            "wild.example.com", "r12.regex.io", "xr12.regex.io", "plain.org", "a.plain.org", "partA.com",
+            "x.partA.com", "bad.partA.com", "y.bad.partA.com", "shared.test", "a.shared.test", "last.example",
+            "unknown.invalid", "com", "", "a", NULL };
+        int same = 1, any = 0;
+        for (size_t i = 0; names[i]; i++) {
+            chm_t want = 0;
+            for (size_t c = 0; c < g_dch_n; c++)
+                if (dch_matches(&g_dch[c], names[i])) want = chm_or(want, chm_one(c));
+            chm_t got = dch_match_mask(names[i]);
+            if (got != want) { same = 0; printf("  расхождение на «%s»: %u против %u\n", names[i], got, want); }
+            if (want) any++;
+        }
+        check("общий индекс: набор каналов тот же, что у прохода по каждому", 1, same);
+        check("общий индекс: сверка не пустая (совпавших имён > 10)", 1, any > 10);
+        check("общий индекс: shared.test — оба канала (часть и обычный)", 1,
+              dch_match_mask("a.shared.test") == chm2(3, 4));
+        check("общий индекс: исключение части работает (bad.partA.com — мимо)", 0,
+              (int)dch_match_mask("bad.partA.com"));
+        check("общий индекс: точное — только само имя", 1,
+              dch_match_mask("exact.example.org") != 0 && dch_match_mask("x.exact.example.org") == 0);
+
+        /* Смена правил сбрасывает индекс: имя, добавленное после первого подбора, находится. */
+        check("общий индекс: имени ещё нет", 0, (int)dch_match_mask("late.added.test"));
+        ruleset_add(&g_dch[1].rules, (char[]){ "added.test" });
+        check("общий индекс: правило добавлено — имя находится", 1,
+              dch_match_mask("late.added.test") == chm_one(1));
+        ruleset_free(&g_dch[1].rules);
+        check("общий индекс: набор освобождён — имя не находится", 0, (int)dch_match_mask("late.added.test"));
+
+        /* Много каналов и много правил: счёт тот же, что у прохода (число каналов не ограничено). */
+        dch_zero(300);
+        g_dch_n = 300;
+        int ok300 = 1;
+        for (size_t i = 0; i < 300; i++) {
+            char nm[64];
+            snprintf(g_dch[i].set, sizeof(g_dch[i].set), "c%zu", i);
+            memset(&g_dch[i].rules, 0, sizeof(g_dch[i].rules));
+            snprintf(nm, sizeof nm, "d%zu.big.test", i);
+            ruleset_add(&g_dch[i].rules, nm);
+            snprintf(nm, sizeof nm, "common.big.test");
+            ruleset_add(&g_dch[i].rules, nm);
+        }
+        for (size_t i = 0; i < 300; i += 37) {
+            char nm[64];
+            snprintf(nm, sizeof nm, "www.d%zu.big.test", i);
+            if (dch_match_mask(nm) != chm_one(i)) ok300 = 0;
+        }
+        chm_t allm = dch_match_mask("x.common.big.test");
+        for (size_t i = 0; i < 300; i++) if (!chm_has(allm, i)) ok300 = 0;
+        check("общий индекс: 300 каналов, имя в каждом — набор из 300", 1, ok300);
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

@@ -206,6 +206,8 @@ struct xh_state {
     struct tr_node node;
     char *node_mem;
     int open_timeout;
+    /* Живая запись включена (xhttp_live): вторая связь, поднятая позже (up_reopen), пишет так же. */
+    int live;
 };
 
 /* Разбор кадров WebSocket от сервера (RFC 6455, раздел 5) — потоком, по кускам любой длины.
@@ -323,6 +325,8 @@ struct transport_ops {
     int  (*aux_drain)(struct transport *t);
     /* См. transport_big_write. NULL — нет. */
     int  (*big_write)(const struct transport *t);
+    /* Основная связь отдана циклу (transport_live): включить живую запись у второй связи. NULL — нет. */
+    void (*live)(struct transport *t);
 };
 
 /* Безопасность — поле security= ссылки. Различаются только рукопожатием (см. шапку). */

@@ -515,12 +515,83 @@ static void test_brutal_share(void) {
 #endif
 }
 
+/* Сборка фрагментов: несколько датаграмм одного потока вперемешку, крупнейшая датаграмма, разные
+ * размеры кусков, повтор фрагмента, срок недособранной (I-528). */
+static void rasm_msg(struct hy2_udp_msg *m, uint16_t pkt, unsigned fi, unsigned nf, const uint8_t *d, size_t n) {
+    memset(m, 0, sizeof *m);
+    m->sid = 1; m->pkt = pkt; m->frag = (uint8_t)fi; m->nfrag = (uint8_t)nf; m->data = d; m->n = n;
+}
+
+static void test_rasm(void) {
+    static uint8_t A[65507], B[40000];
+    for (size_t i = 0; i < sizeof A; i++) A[i] = (uint8_t)(i * 31 + 7);
+    for (size_t i = 0; i < sizeof B; i++) B[i] = (uint8_t)(i * 17 + 3);
+    struct hy2_rasm *ras = NULL;
+    struct hy2_udp_msg m;
+    size_t tot = 0, pre = 16;
+    uint8_t *got;
+    /* А — 65507 байт кусками по 1200 (55 штук), Б — 40000 кусками по 1100; куски идут вперемешку,
+     * Б — в обратном порядке. */
+    unsigned na = (sizeof A + 1199) / 1200, nb = (sizeof B + 1099) / 1100;
+    unsigned ia = 0, ib = nb;
+    int done_a = 0, done_b = 0, bad = 0;
+    while (ia < na || ib > 0) {
+        if (ia < na) {
+            size_t off = (size_t)ia * 1200, n = sizeof A - off < 1200 ? sizeof A - off : 1200;
+            rasm_msg(&m, 100, ia, na, A + off, n);
+            got = hy2_rasm_feed(&ras, &m, 1000, pre, &tot);
+            ia++;
+            if (got) { done_a = tot == sizeof A && !memcmp(got + pre, A, tot); free(got); }
+        }
+        if (ib > 0) {
+            ib--;
+            size_t off = (size_t)ib * 1100, n = sizeof B - off < 1100 ? sizeof B - off : 1100;
+            rasm_msg(&m, 200, ib, nb, B + off, n);
+            got = hy2_rasm_feed(&ras, &m, 1000, pre, &tot);
+            if (got) { done_b = tot == sizeof B && !memcmp(got + pre, B, tot); free(got); }
+        }
+    }
+    (void)bad;
+    CHECK(done_a);                                                    /* 65507 байт собраны */
+    CHECK(done_b);                                                    /* вторая сборка параллельно, куски наоборот */
+    CHECK(ras == NULL);                                               /* обе сняты по готовности */
+    /* Повтор фрагмента не портит сборку и не завершает её раньше срока. */
+    static const uint8_t p1[] = "aaaa", p2[] = "bbbbbb", p3[] = "cc";
+    rasm_msg(&m, 7, 0, 3, p1, 4); CHECK(!hy2_rasm_feed(&ras, &m, 1000, 0, &tot));
+    CHECK(!hy2_rasm_feed(&ras, &m, 1000, 0, &tot));                   /* тот же фрагмент ещё раз */
+    rasm_msg(&m, 7, 2, 3, p3, 2); CHECK(!hy2_rasm_feed(&ras, &m, 1000, 0, &tot));
+    rasm_msg(&m, 7, 1, 3, p2, 6);
+    got = hy2_rasm_feed(&ras, &m, 1000, 0, &tot);
+    CHECK(got && tot == 12 && !memcmp(got, "aaaabbbbbbcc", 12));
+    free(got);
+    /* Недособранная живёт срок: к следующему фрагменту после него — снята, и новая с тем же id начинается заново. */
+    rasm_msg(&m, 9, 0, 2, p1, 4); CHECK(!hy2_rasm_feed(&ras, &m, 1000, 0, &tot));
+    rasm_msg(&m, 10, 0, 2, p1, 4); CHECK(!hy2_rasm_feed(&ras, &m, 1000 + HY2_RASM_TTL_MS + 1, 0, &tot));
+    rasm_msg(&m, 9, 1, 2, p3, 2);
+    CHECK(!hy2_rasm_feed(&ras, &m, 1000 + HY2_RASM_TTL_MS + 2, 0, &tot));   /* первой половины уже нет */
+    /* Больше 65507 байт — брак, молча. */
+    static uint8_t big[1500];
+    rasm_msg(&m, 11, 0, 2, big, sizeof big); CHECK(!hy2_rasm_feed(&ras, &m, 2000000, 0, &tot));
+    hy2_rasm_free(&ras);
+    CHECK(ras == NULL);
+    struct hy2_rasm *r2 = NULL;
+    static uint8_t huge[1400];
+    int toobig = 0;
+    for (unsigned i = 0; i < 48; i++) {
+        rasm_msg(&m, 12, i, 48, huge, sizeof huge);
+        if (hy2_rasm_feed(&r2, &m, 5, 0, &tot)) toobig = 1;
+    }
+    CHECK(!toobig);                                                   /* 48 × 1400 = 67200 > 65507 */
+    hy2_rasm_free(&r2);
+}
+
 int main(void) {
     test_brutal_share();
     test_limits();
     test_varint();
     test_blake2b();
     test_udp();
+    test_rasm();
     test_salamander();
     test_gecko();
     test_auth_response();

@@ -136,6 +136,11 @@ static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
  * а обрыв связи назовёт следующая запись. */
 static int up_drain(struct xh_up *u) {
     if (!u->started) return 0;
+    /* Живая запись (I-534): то, что сокет не принял сразу, лежит в очереди связи и уходит здесь — слив
+     * зовётся перед каждой отправкой, при каждом ответе сервера и при низком месте. Сам сокет выгрузки
+     * цикл на запись не ждёт: пока очередь не пуста, сервер не дочитал, и его ответ или WINDOW_UPDATE
+     * придёт по этой же связи и разбудит слив. */
+    if (u->link.live && tr_link_pending(&u->link) && tr_link_flush(&u->link) < 0) return H2_EIO;
     static __thread unsigned char sink[H2_MIN_READ_CAP];
     /* Пока связь не опустеет, но с пределом, чтобы один вызов не крутился вечно. НЕ пока чтение не
      * вернёт данных: на этой связи оно не вернёт их никогда (ответы — пустые 200), и остановка
@@ -204,6 +209,8 @@ static int up_connect(struct transport *t, const struct tr_node *n, int timeout_
         tls13_free(&u->link.tls); close(u->link.fd); u->link.fd = -1;
         return TR_ENOH2;
     }
+    /* Основная связь уже отдана циклу (xhttp_live) — вторая пишет так же, без ожидания сокета. */
+    if (t->xh.live) tr_link_live(&u->link);
     return 0;
 }
 
@@ -413,6 +420,7 @@ static int up_reopen(struct transport *t) {
     struct xh_up *u = &x->up;
     if (u->link.fd > 0) close(u->link.fd);
     u->link.fd = -1;
+    outq_free(&u->link.oq);
     if (!u->link.plain) tls13_free(&u->link.tls);
     u->link.tls.ready = 0;
     u->started = 0;
@@ -526,6 +534,7 @@ static void xhttp_close(struct transport *t) {
     struct xh_up *u = &t->xh.up;
     if (u->link.fd > 0) close(u->link.fd);
     u->link.fd = -1;
+    outq_free(&u->link.oq);
     if (!u->link.plain) tls13_free(&u->link.tls);
     u->link.tls.ready = 0;
     u->started = 0;
@@ -546,7 +555,19 @@ static int xhttp_pending(const struct transport *t) { return t->h2.done || t->h2
  * записей», то есть «нет чтений», и место оставалось закрытым: выгрузка stream-up падала с 3 ГБ до
  * 14 МБ за 20 с. Поэтому низкое место сначала сливает связь выгрузки, а потом сообщается. */
 #define UP_ROOM_LOW 65536
+static long xhttp_room_win(struct transport *t);
 static long xhttp_room(struct transport *t) {
+    long r = xhttp_room_win(t);
+    /* Обратное давление второй связи (живая запись): очередь выгрузки не растёт выше TR_OUT_HIWAT. */
+    size_t p = t->xh.up.started ? tr_link_pending(&t->xh.up.link) : 0;
+    if (p) {
+        long cap = p >= TR_OUT_HIWAT ? 0 : (long)(TR_OUT_HIWAT - p);
+        if (cap < r) r = cap;
+    }
+    return r;
+}
+
+static long xhttp_room_win(struct transport *t) {
     struct xh_state *x = &t->xh;
     switch (x->mode) {
         case XH_STREAM_ONE: return h2_room(&t->h2);
@@ -614,6 +635,13 @@ static int xhttp_aux_drain(struct transport *t) {
  * stream-one запись — это DATA в одном потоке с окном, и стек собирает для них не больше записи TLS.
  * Vision (flow) сюда не доходит: узел xhttp с flow отсеивается при разборе ссылки, а у дайлера
  * VLESS узел с flow большой записи не получает в любом случае (vl_up_max). */
+/* Основная связь отдана циклу (transport_live): вторая — тоже, и поднятая позже — тоже. */
+static void xhttp_live(struct transport *t) {
+    t->xh.live = 1;
+    if (t->xh.mode != XH_STREAM_ONE && t->xh.up.started && t->xh.up.link.fd > 0)
+        tr_link_live(&t->xh.up.link);
+}
+
 static int xhttp_big_write(const struct transport *t) { return t->xh.mode == XH_PACKET_UP; }
 
 const struct transport_ops tr_xhttp = {
@@ -622,5 +650,5 @@ const struct transport_ops tr_xhttp = {
     .moved = xhttp_moved, .close = xhttp_close, .pending = xhttp_pending,
     .room = xhttp_room,
     .aux_fd = xhttp_aux_fd, .aux_drain = xhttp_aux_drain,
-    .big_write = xhttp_big_write,
+    .big_write = xhttp_big_write, .live = xhttp_live,
 };

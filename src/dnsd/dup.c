@@ -310,12 +310,75 @@ static struct dreq *req_at(int i) { return (i >= 0 && i < g_req_cap && RQ(i).use
 static void conn_free_bufs(struct dconn *c) {
     free(c->rb); free(c->wb);
     c->rb = c->wb = NULL;
-    c->rn = c->rcap = c->wn = c->woff = 0;
+    c->rn = c->rcap = c->wn = c->woff = c->wcap = 0;
 }
 
 static int cidx(const struct dconn *c) { return c->idx; }
 
 static void up_kick(struct dup *up);
+
+/* ---- сроки вопросов: куча, а не проход по всем -------------------------------------------------
+ *
+ * Прежде dup_tick и dup_wait_ms на каждом витке цикла обходили ВСЕ вопросы в полёте: при каскаде
+ * таймаутов (апстрим лёг, вопросов тысячи) каждый виток стоил O(R), и весь каскад — O(R²). Теперь
+ * у каждого вопроса одна живая запись в куче по ближайшему из его сроков (req_due): общий срок
+ * ответа, повтор по UDP, подозрение на мёртвое соединение QUIC. Тик берёт из кучи только те, чей
+ * срок пришёл, и каждому делает то же, что прежний проход (tick_req); ближайший срок для сна цикла —
+ * корень кучи. Запись может быть РАНЬШЕ нужного (состояние вопроса изменилось, срок отодвинулся) —
+ * тогда при срабатывании срок пересчитывается и вопрос ложится в кучу заново; позже нужного она быть
+ * не должна, поэтому req_rekey зовётся там, где срок приближается: при постановке вопроса, при
+ * открытии потока QUIC (срок «сервер молчит») и после каждого срабатывания. */
+struct hent { long due; int slot; uint32_t seq; };
+static struct hent *g_heap;
+static size_t g_heap_n, g_heap_cap;
+static uint32_t g_req_seq;
+
+static int heap_push(long due, int slot, uint32_t seq) {
+    if (g_heap_n == g_heap_cap) {
+        size_t nc = g_heap_cap ? g_heap_cap * 2 : 256;
+        struct hent *nh = realloc(g_heap, nc * sizeof(*nh));
+        if (!nh) return -1;
+        g_heap = nh;
+        g_heap_cap = nc;
+    }
+    size_t i = g_heap_n++;
+    while (i) {
+        size_t p = (i - 1) / 2;
+        if (g_heap[p].due <= due) break;
+        g_heap[i] = g_heap[p];
+        i = p;
+    }
+    g_heap[i] = (struct hent){ due, slot, seq };
+    return 0;
+}
+
+static void heap_pop(void) {
+    struct hent last = g_heap[--g_heap_n];
+    size_t i = 0;
+    while (g_heap_n) {
+        size_t c = 2 * i + 1;
+        if (c >= g_heap_n) break;
+        if (c + 1 < g_heap_n && g_heap[c + 1].due < g_heap[c].due) c++;
+        if (g_heap[c].due >= last.due) break;
+        g_heap[i] = g_heap[c];
+        i = c;
+    }
+    if (g_heap_n) g_heap[i] = last;
+}
+
+static long req_due(const struct dreq *r);
+
+/* Запись в кучу не удалась (нет памяти): вопросы без записи подбирает следующий тик проходом по
+ * таблице (dup_tick), пока память не появится, а цикл просыпается раз в 100 мс (dup_wait_ms). */
+static int g_heap_lost;
+
+void req_rekey(struct dreq *r) {
+    if (!r->used) return;
+    long due = req_due(r);
+    if (r->hkey && r->hkey <= due) return;             /* уже стоит раньше или тогда же */
+    if (heap_push(due, r->slot, r->hseq) == 0) r->hkey = due;
+    else g_heap_lost = 1;
+}
 
 /* Закрыть соединение: вопросы на нём переставляются в ожидание (один раз) или получают отказ. */
 static void conn_close(struct dconn *c, const char *why) {
@@ -422,9 +485,22 @@ static int conn_write(struct dconn *c, const uint8_t *b, size_t n) {
     }
     if (c->wn - c->woff + (n - done) > 256 * 1024) return -1;
     if (c->woff == c->wn) c->wn = c->woff = 0;
-    uint8_t *nb = realloc(c->wb, c->wn + (n - done));
-    if (!nb) return -1;
-    c->wb = nb;
+    /* Ёмкость растёт вдвое, а не ровно на добавку: очередь, к которой дописывают по кусочку (медленный
+     * сервер), иначе перевыделялась бы на каждую запись — квадрат от числа записей. Ушедшее с головы
+     * (woff) вытесняется сдвигом, а не ростом. */
+    if (c->woff && c->wn + (n - done) > c->wcap) {
+        memmove(c->wb, c->wb + c->woff, c->wn - c->woff);
+        c->wn -= c->woff;
+        c->woff = 0;
+    }
+    if (c->wn + (n - done) > c->wcap) {
+        size_t nc = c->wcap ? c->wcap : 4096;
+        while (nc < c->wn + (n - done)) nc *= 2;
+        uint8_t *nb = realloc(c->wb, nc);
+        if (!nb) return -1;
+        c->wb = nb;
+        c->wcap = nc;
+    }
     memcpy(c->wb + c->wn, b + done, n - done);
     c->wn += n - done;
     conn_ev(c, EPOLLIN | EPOLLOUT);
@@ -465,6 +541,7 @@ static int conn_send(struct dup *up, struct dconn *c, struct dreq *r) {
         }
         r->ci = cidx(c);
         r->sid = sid;
+        req_rekey(r);                           /* появился срок «сервер молчит» (DUP_QUIC_DEAD_MS) */
         c->busy++;
         c->last_ms = now_ms();
         up->q_sent++;
@@ -1826,8 +1903,10 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
     r->t0 = now_ms();
     r->deadline = r->t0 + DUP_REQ_MS;
     r->ci = -1;
+    r->hseq = ++g_req_seq;
     if (up->cfg.u.proto == DNSP_UDP) {
         r->ci = -2;
+        req_rekey(r);
         if (udp_send(up, r) != 0) {
             up_err(up, "UDP: %s", strerror(errno));
             req_release(r);
@@ -1839,6 +1918,7 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
         req_release(r);
         return -1;                                     /* пауза после неудачи: отказ сразу */
     }
+    req_rekey(r);
     up_kick(up);
     if (!r->used) return 0;                             /* отказ уже отдан обратным вызовом */
     return 0;
@@ -1872,51 +1952,97 @@ int dup_event(void *ptr, uint32_t evs) {
     return 1;
 }
 
+/* Ближайший срок вопроса: общий срок ответа, а раньше него — повтор по UDP или проверка мёртвого
+ * соединения QUIC, пока они ещё возможны (условия те же, что в tick_req). */
+static long req_due(const struct dreq *r) {
+    const struct dup *up = r->up;
+    long t = r->deadline;
+    if (up->cfg.u.proto == DNSP_UDP && r->ci == -2 && r->tries == 0 && r->t0 + DUP_UDP_RETRY_MS < t)
+        t = r->t0 + DUP_UDP_RETRY_MS;
+    if (quic_proto(up) && r->sid >= 0 && r->tries == 0 && r->ci >= 0 && r->t0 + DUP_QUIC_DEAD_MS < t &&
+        CN(up, r->ci)->st == CS_READY && CN(up, r->ci)->qrx_ms <= r->t0)
+        t = r->t0 + DUP_QUIC_DEAD_MS;
+    return t;
+}
+
+/* Что делает срок с вопросом r в момент now: повтор по UDP, закрытие мёртвого соединения QUIC или
+ * отказ по сроку ответа. Тело прежнего прохода dup_tick. */
+static void tick_req(struct dreq *r, long now) {
+    struct dup *up = r->up;
+    if (up->cfg.u.proto == DNSP_UDP && r->ci == -2 && r->tries == 0 && now - r->t0 >= DUP_UDP_RETRY_MS &&
+        now < r->deadline) {
+        r->tries = 1;
+        udp_send(up, r);
+        return;
+    }
+    if (quic_proto(up) && r->sid >= 0 && r->tries == 0 && r->ci >= 0 && now - r->t0 >= DUP_QUIC_DEAD_MS &&
+        now < r->deadline && CN(up, r->ci)->st == CS_READY && CN(up, r->ci)->qrx_ms <= r->t0) {
+        /* Ни пакета от сервера с тех пор, как ушёл вопрос: соединение мертво (DUP_QUIC_DEAD_MS).
+         * conn_close переставит этот вопрос и остальные в ожидание, up_kick заведёт соединение. */
+        struct dconn *dc = CN(up, r->ci);
+        up_err(up, "%s: сервер молчит %d мс — соединение пересоздаётся", qname(up), DUP_QUIC_DEAD_MS);
+        conn_close(dc, NULL);
+        up_kick(up);
+        return;
+    }
+    if (now < r->deadline) return;
+    int ci = r->ci;
+    /* Причина, названная сервером или соединением после ухода вопроса (HTTP 505, сброс потока,
+     * отказ TLS), полезнее общего «нет ответа»: её и оставляем в last_error. */
+    if (!(up->err[0] && up->err_ms >= r->t0)) up_err(up, "нет ответа за %d мс", DUP_REQ_MS);
+    int silent = ci >= 0 && ci < up->c_n && CN(up, ci)->qrx_ms <= r->t0;
+    req_finish(r, NULL, 0);
+    if (ci >= 0 && CN(up, ci)->st == CS_READY) {
+        /* HTTP/2, DoT и TCP: остальные вопросы соединения живы (поток брошенного вопроса h2
+         * req_finish сбросил); соединение рвём, только если с ухода вопроса от сервера не пришло
+         * ни байта (мёртвый путь). Иначе мёртвое DoT-соединение принимало бы все вопросы апстрима,
+         * пока ядро не бросит повторы TCP (tcp_retries2 — десятки минут). */
+        int closed = 1;
+        if (up->cfg.u.proto == DNSP_DOH && CN(up, ci)->h2) { if (silent) conn_close(CN(up, ci), NULL); else closed = 0; }
+        else if (up->cfg.u.proto == DNSP_DOH) conn_close(CN(up, ci), NULL);
+        else if (!quic_proto(up)) {                                            /* у DoQ — req_finish */
+            if (CN(up, ci)->busy > 0) CN(up, ci)->busy--;
+            if (silent) conn_close(CN(up, ci), NULL); else closed = 0;
+        } else closed = 0;
+        /* Вопросы закрытого соединения conn_close переставил в ожидание — отправить их сейчас (по
+         * другому соединению или новому), а не в следующий раз, когда кто-нибудь спросит апстрим. */
+        if (closed) up_kick(up);
+    }
+}
+
+/* Убрать с вершины кучи записи, которых уже нет в живых: вопрос закончен, место занято другим
+ * вопросом, срок отодвинут новой записью. */
+static void heap_clean(void) {
+    while (g_heap_n) {
+        const struct hent *e = &g_heap[0];
+        const struct dreq *r = e->slot < g_req_cap ? &RQ(e->slot) : NULL;
+        if (r && r->used && r->hseq == e->seq && r->hkey == e->due) return;
+        heap_pop();
+    }
+}
+
 void dup_tick(void) {
     long now = now_ms();
-    for (int k = 0; k < g_req_hi; k++) {
-        struct dreq *r = &RQ(k);
-        if (!r->used) continue;
-        struct dup *up = r->up;
-        if (up->cfg.u.proto == DNSP_UDP && r->ci == -2 && r->tries == 0 && now - r->t0 >= DUP_UDP_RETRY_MS &&
-            now < r->deadline) {
-            r->tries = 1;
-            udp_send(up, r);
-            continue;
-        }
-        if (quic_proto(up) && r->sid >= 0 && r->tries == 0 && r->ci >= 0 && now - r->t0 >= DUP_QUIC_DEAD_MS &&
-            now < r->deadline && CN(up, r->ci)->st == CS_READY && CN(up, r->ci)->qrx_ms <= r->t0) {
-            /* Ни пакета от сервера с тех пор, как ушёл вопрос: соединение мертво (DUP_QUIC_DEAD_MS).
-             * conn_close переставит этот вопрос и остальные в ожидание, up_kick заведёт соединение. */
-            struct dconn *dc = CN(up, r->ci);
-            up_err(up, "%s: сервер молчит %d мс — соединение пересоздаётся", qname(up), DUP_QUIC_DEAD_MS);
-            conn_close(dc, NULL);
-            up_kick(up);
-            k = -1;                                     /* таблицу вопросов сдвинули: с начала */
-            continue;
-        }
-        if (now < r->deadline) continue;
-        int ci = r->ci;
-        /* Причина, названная сервером или соединением после ухода вопроса (HTTP 505, сброс потока,
-         * отказ TLS), полезнее общего «нет ответа»: её и оставляем в last_error. */
-        if (!(up->err[0] && up->err_ms >= r->t0)) up_err(up, "нет ответа за %d мс", DUP_REQ_MS);
-        int silent = ci >= 0 && ci < up->c_n && CN(up, ci)->qrx_ms <= r->t0;
-        req_finish(r, NULL, 0);
-        if (ci >= 0 && CN(up, ci)->st == CS_READY) {
-            /* HTTP/2, DoT и TCP: остальные вопросы соединения живы (поток брошенного вопроса h2
-             * req_finish сбросил); соединение рвём, только если с ухода вопроса от сервера не пришло
-             * ни байта (мёртвый путь). Иначе мёртвое DoT-соединение принимало бы все вопросы апстрима,
-             * пока ядро не бросит повторы TCP (tcp_retries2 — десятки минут). */
-            int closed = 1;
-            if (up->cfg.u.proto == DNSP_DOH && CN(up, ci)->h2) { if (silent) conn_close(CN(up, ci), NULL); else closed = 0; }
-            else if (up->cfg.u.proto == DNSP_DOH) conn_close(CN(up, ci), NULL);
-            else if (!quic_proto(up)) {                                            /* у DoQ — req_finish */
-                if (CN(up, ci)->busy > 0) CN(up, ci)->busy--;
-                if (silent) conn_close(CN(up, ci), NULL); else closed = 0;
-            } else closed = 0;
-            /* Вопросы закрытого соединения conn_close переставил в ожидание — отправить их сейчас (по
-             * другому соединению или новому), а не в следующий раз, когда кто-нибудь спросит апстрим. */
-            if (closed) { up_kick(up); k = -1; }
+    if (g_heap_lost) {
+        g_heap_lost = 0;
+        for (int k = 0; k < g_req_hi; k++)
+            if (RQ(k).used && !RQ(k).hkey) req_rekey(&RQ(k));
+    }
+    for (;;) {
+        heap_clean();
+        if (!g_heap_n || g_heap[0].due > now) break;
+        struct hent e = g_heap[0];
+        heap_pop();
+        struct dreq *r = &RQ(e.slot);
+        r->hkey = 0;
+        tick_req(r, now);
+        if (r->used && r->hseq == e.seq) {
+            /* Срок не наступил или действие его не сняло — не раньше следующей миллисекунды: иначе
+             * вопрос, чей срок «уже» и который ничего не сдвинул, крутил бы этот цикл вечно. */
+            long due = req_due(r);
+            if (due <= now) due = now + 1;
+            if (heap_push(due, r->slot, r->hseq) == 0) r->hkey = due;
+            else g_heap_lost = 1;
         }
     }
     for (size_t i = 0; i < g_dups_n; i++) {
@@ -1947,16 +2073,9 @@ void dup_tick(void) {
 
 int dup_wait_ms(void) {
     long now = now_ms(), best = grp_deadline();
-    for (int k = 0; k < g_req_hi; k++) {
-        if (!RQ(k).used) continue;
-        long t = RQ(k).deadline;
-        if (RQ(k).ci == -2 && RQ(k).tries == 0 && RQ(k).t0 + DUP_UDP_RETRY_MS < t)
-            t = RQ(k).t0 + DUP_UDP_RETRY_MS;
-        if (RQ(k).sid >= 0 && RQ(k).tries == 0 && RQ(k).ci >= 0 && quic_proto(RQ(k).up) &&
-            CN(RQ(k).up, RQ(k).ci)->qrx_ms <= RQ(k).t0 && RQ(k).t0 + DUP_QUIC_DEAD_MS < t)
-            t = RQ(k).t0 + DUP_QUIC_DEAD_MS;
-        if (best < 0 || t < best) best = t;
-    }
+    heap_clean();
+    if (g_heap_n && (best < 0 || g_heap[0].due < best)) best = g_heap[0].due;
+    if (g_heap_lost && (best < 0 || now + 100 < best)) best = now + 100;
     /* Соединения DoQ живут и без вопросов: проснуться к таймеру QUIC (потерянный пакет, конец
      * рукопожатия, простой) и к сроку нашего закрытия простаивающего соединения. */
     for (size_t i = 0; i < g_dups_n; i++) {

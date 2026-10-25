@@ -139,6 +139,7 @@ int run_quiet(const char *const argv[]) {
 
 static int g_sess_pipe[2] = { -1, -1 };
 static int g_send_rc;                 /* что вернёт transport_write: 0 или H2_EWINDOW */
+static int g_send_pass;               /* столько первых записей принять, прежде чем отказывать окном */
 static int g_send_again_n;            /* столько раз подряд вернуть H2_EWINDOW, потом 0 */
 static int g_send_calls;              /* сколько раз вызван transport_write */
 static size_t g_send_last_n;          /* длина последнего transport_write */
@@ -167,14 +168,15 @@ int vless_connect(const struct vless_node *node, struct transport *conn, int tim
     return 0;
 }
 /* Что ушло узлу, подряд — ради стенда переупорядочивания: байты обязаны уйти в порядке потока. */
-static unsigned char g_sent[65536];
+static unsigned char g_sent[1 << 18];
 static size_t g_sent_n;
 int transport_write(struct transport *c, const unsigned char *d, size_t n) {
     (void)c;
     g_send_calls++;
     g_send_last_n = n;
     if (n > g_send_max_n) g_send_max_n = n;
-    if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
+    if (g_send_pass > 0) g_send_pass--;
+    else if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
     if (g_send_rc == 0 && g_sent_n + n <= sizeof(g_sent)) { memcpy(g_sent + g_sent_n, d, n); g_sent_n += n; }
     return g_send_rc;
 }
@@ -1130,10 +1132,10 @@ static void t_udp_big(void) {
     g_dl = save;
     conn_drop(e);
     dev_drain(NULL);
-    check(vless_dialer.dgram_max == TUNNEL_BUF - 2048 - 512 && vless_dialer.dgram_frame(dg, vless_dialer.dgram_max,
-          g_fr_out, sizeof g_fr_out) != 0 &&
-          vless_dialer.dgram_frame(dg, vless_dialer.dgram_max + 1, g_fr_out, sizeof g_fr_out) == 0,
-          "VLESS: вверх несёт датаграмму до TUNNEL_BUF - 2560 байт, на байт больше — не берётся");
+    check(vless_dialer.dgram_max == UDP_DGRAM_ABS && vless_dialer.dgram_frame(dg, UDP_DGRAM_ABS,
+          g_fr_out, sizeof g_fr_out) == 2 + UDP_DGRAM_ABS && g_fr_out[0] == 0xFF && g_fr_out[1] == 0xE3 &&
+          vless_dialer.dgram_frame(dg, UDP_DGRAM_ABS + 1, g_fr_out, sizeof g_fr_out) == 0,
+          "VLESS: вверх несёт датаграмму до 65507 байт с длиной в два байта, на байт больше — не берётся");
 
     /* Запись клиенту: 60000 байт нарезаются под MTU, и собранное совпадает с исходным. */
     fr_make(60000, 24);
@@ -3199,6 +3201,65 @@ static void t_race(void) {
     check(pool_race_first(&pr, why, sizeof why) == -1, "I-535: кандидатов нет — -1");
 }
 
+/* Исходящая датаграмма VLESS до 65507 байт (I-528): раньше крупнее ~14,8 КБ ломала сессию (буфер записи
+ * TUNNEL_BUF), теперь она собирается целиком и уходит кусками записи; окно h2, закрывшееся посреди
+ * датаграммы, не теряет её середину — остаток досылается раньше следующей. */
+static void test_vless_big_up(void) {
+    struct vl_sess *vs = calloc(1, vless_dialer.sess_size);
+    struct flow_key key = cli_key();
+    key.proto = 17;
+    static unsigned char d1[UDP_DGRAM_ABS + 2], d2[3002], want[1 << 17];
+    for (size_t i = 0; i < UDP_DGRAM_ABS; i++) d1[2 + i] = (unsigned char)(i * 13 + 5);
+    d1[0] = UDP_DGRAM_ABS >> 8; d1[1] = UDP_DGRAM_ABS & 255;
+    for (size_t i = 0; i < 3000; i++) d2[2 + i] = (unsigned char)(i + 77);
+    d2[0] = 3000 >> 8; d2[1] = 3000 & 255;
+    struct vless_node node;
+    memset(&node, 0, sizeof node);
+    snprintf(node.uuid, sizeof node.uuid, "8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124");
+    memcpy(vs->uuid, (unsigned char[16]){ 0x8f, 0x7d, 0x3b, 0x1a, 0x2c, 0x4e, 0x4f, 0x60,
+                                          0x9a, 0x81, 0xb5, 0xd7, 0xe6, 0xc3, 0x01, 0x24 }, 16);
+
+    /* 1. 65509 байт с обрамлением — целиком, кусками не больше 16 КиБ. */
+    g_sent_n = 0; g_send_calls = 0; g_send_max_n = 0; g_send_rc = 0; g_send_again_n = 0; g_send_pass = 0;
+    int r1 = vless_dialer.send(&node, vs, &key, 1, d1, sizeof d1);
+    size_t hdr = g_sent_n - sizeof d1;
+    check(r1 == SEND_OK && g_sent_n > sizeof d1 && hdr < 64 && !memcmp(g_sent + hdr, d1, sizeof d1) &&
+          g_send_calls >= 4 && g_send_max_n <= 16384,
+          "VLESS вверх: 65507 байт уходят целиком (заголовок, длина, данные), кусками не больше 16 КиБ");
+
+    /* 2. Окно закрылось ПОСЛЕ первого куска второй датаграммы: остаток принят сессией. */
+    size_t base = g_sent_n;
+    g_send_calls = 0; g_send_pass = 1; g_send_again_n = 1;
+    int r2 = vless_dialer.send(&node, vs, &key, 1, d1, sizeof d1);
+    check(r2 == SEND_OK && vs->utail && g_sent_n - base == 16384,
+          "VLESS вверх: окно закрылось посреди датаграммы — датаграмма принята, остаток у сессии");
+    /* Следующая датаграмма сперва дошлёт хвост, и порядок байт в потоке сохранится. */
+    int r3 = vless_dialer.send(&node, vs, &key, 1, d2, sizeof d2);
+    memcpy(want, d1, sizeof d1);
+    memcpy(want + sizeof d1, d2, sizeof d2);
+    check(r3 == SEND_OK && !vs->utail && g_sent_n - base == sizeof d1 + sizeof d2 &&
+          !memcmp(g_sent + base, want, sizeof d1 + sizeof d2),
+          "VLESS вверх: хвост ушёл раньше следующей датаграммы, байты в порядке потока");
+
+    /* 3. Окно закрыто на первом же куске: ничего не ушло — отказ без потери состояния. */
+    base = g_sent_n;
+    g_send_pass = 0; g_send_again_n = 1;
+    int r4 = vless_dialer.send(&node, vs, &key, 1, d1, sizeof d1);
+    check(r4 == SEND_AGAIN && g_sent_n == base && !vs->utail,
+          "VLESS вверх: окно закрыто на первом куске — SEND_AGAIN, ничего не ушло");
+    /* 4. Хвост при ещё закрытом окне: новая датаграмма отказывается, порядок не нарушается. */
+    g_send_pass = 1; g_send_again_n = 1;
+    int r5 = vless_dialer.send(&node, vs, &key, 1, d1, sizeof d1);
+    g_send_again_n = 1;
+    int r6 = vless_dialer.send(&node, vs, &key, 1, d2, sizeof d2);
+    check(r5 == SEND_OK && vs->utail && r6 == SEND_AGAIN,
+          "VLESS вверх: пока хвост не ушёл, новая датаграмма — SEND_AGAIN");
+    g_send_again_n = 0;
+    free(vs->utail);
+    free(vs);
+    g_send_again_n = 0; g_send_pass = 0;
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -3249,6 +3310,7 @@ int main(void) {
     t_owner();
     t_owner_mail();
     t_udp_big();
+    test_vless_big_up();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
