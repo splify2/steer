@@ -98,6 +98,9 @@ static void vl_clear(void *sess) {
     s->lenb_n = 0;
     s->xs = 0;
     s->xdiscard = 0;
+    free(s->utail);
+    s->utail = NULL;
+    s->utail_n = s->utail_off = 0;
     free(s->dgbig);
     s->dgbig = NULL;
 }
@@ -249,13 +252,58 @@ static size_t xudp_frames(const struct flow_key *k, int first, const unsigned ch
     return o;
 }
 
-/* Самая большая датаграмма клиента, которую мы несём узлу. Отправка склеивает заголовок запроса,
- * кадр Vision или рамку XUDP и саму датаграмму в ОДИН буфер записи TUNNEL_BUF — одним куском
- * обязательно, окно h2 принимает либо всё, либо ничего, — и обёртки не должны его переполнить:
- * иначе датаграмма крупнее ломала бы поток (SEND_FATAL), а не терялась. Запас тот же, что у
- * TCP (TUNNEL_BUF - 2048 в стеке: заголовок и обёртка Vision), и ещё 512 под рамку XUDP и длину.
- * В обратную сторону предел шире — UDP_DGRAM_ABS: приём собирает датаграмму в куче по её длине. */
-#define VL_DGRAM_UP (TUNNEL_BUF - 2048 - 512)
+/* Самая большая датаграмма клиента, которую мы несём узлу: всё, что бывает в UDP по IPv4.
+ *
+ * Формат провода предела не ставит: и команда 2, и рамка XUDP несут длину двумя байтами (до 65535),
+ * как у Xray (proxy/vless/encoding: PacketWriter, common/xudp). Предел старого кода был не в формате,
+ * а в буфере записи TUNNEL_BUF — «одним куском обязательно, окно h2 принимает либо всё, либо ничего» —
+ * и датаграмма крупнее ~14,8 КБ давала SEND_FATAL и рвала сессию. Теперь буферы сборки рассчитаны на
+ * датаграмму целиком (VL_WBUF), а запись крупнее VL_PIECE уходит кусками (vl_write): окно h2
+ * закрылось посреди неё — остаток держит сессия (utail) и дошлёт при следующей отправке или чтении,
+ * потому что окно сервера может быть меньше датаграммы вовсе (у Go-серверов 64 КБ) и «всё или
+ * ничего» не прошло бы никогда. Кусок записи — не больше записи TLS и сообщения gRPC. */
+#define VL_DGRAM_UP UDP_DGRAM_ABS
+#define VL_WBUF (UDP_DGRAM_ABS + 1024)  /* датаграмма, заголовок запроса, рамка XUDP, кадр Vision */
+#define VL_PIECE 16384
+
+/* Остаток записи, не вошедший в окно. 0 — ушёл или нечего слать; H2_EWINDOW — окно всё ещё закрыто;
+ * иначе — ошибка транспорта. */
+static int vl_tail_flush(struct vl_sess *s) {
+    while (s->utail_off < s->utail_n) {
+        size_t m = s->utail_n - s->utail_off;
+        if (m > VL_PIECE) m = VL_PIECE;
+        int rc = transport_write(&s->t, s->utail + s->utail_off, m);
+        if (rc) return rc;
+        s->utail_off += m;
+    }
+    free(s->utail);
+    s->utail = NULL;
+    s->utail_n = s->utail_off = 0;
+    return 0;
+}
+
+/* Запись узлу. Датаграмма крупнее VL_PIECE уходит кусками; первый кусок — всё или ничего (H2_EWINDOW —
+ * ушло НИЧЕГО, вызывающий откатывает Vision и возвращает SEND_AGAIN), а остаток при закрытом окне
+ * принимает сессия: датаграмма уже пошла, её середина не может потеряться. */
+static int vl_write(struct vl_sess *s, const unsigned char *b, size_t n, int udp) {
+    if (!udp || n <= VL_PIECE) return transport_write(&s->t, b, n);
+    size_t off = 0;
+    while (off < n) {
+        size_t m = n - off < VL_PIECE ? n - off : VL_PIECE;
+        int rc = transport_write(&s->t, b + off, m);
+        if (rc == H2_EWINDOW && off) {
+            s->utail = malloc(n - off);
+            if (!s->utail) return TR_EIO;
+            memcpy(s->utail, b + off, n - off);
+            s->utail_n = n - off;
+            s->utail_off = 0;
+            return 0;
+        }
+        if (rc) return rc;
+        off += m;
+    }
+    return 0;
+}
 
 /* Куда собирать датаграмму длиной want: в dg, а крупнее — в кучу. NULL — памяти нет; вызывающий
  * тогда выбрасывает датаграмму по длине, как слишком крупную (поток остаётся). Размер кучи —
@@ -357,15 +405,21 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
      * Когда клеить нечего — а это обычный случай, потому что заголовок уходит один раз на
      * соединение, а Vision заканчивает набивку первым же кадром, — данные отдаются прямо из
      * пакета, без копии вовсе. */
-    static __thread unsigned char out[TUNNEL_BUF];
+    static __thread unsigned char out[VL_WBUF];
     const unsigned char *body = data;
     size_t len = 0;
 
     /* UDP к узлу с flow: рамки XUDP вместо датаграмм с длиной, см. блок XUDP выше. Данные, которые
      * пришли обрамлёнными dgram_frame, переупаковываются в xb; дальше путь общий с TCP — Vision, запись. */
+    if (udp && s->utail) {
+        /* Хвост прошлой датаграммы обязан уйти первым: новая внутри него разрезала бы кадр. */
+        int tr = vl_tail_flush(s);
+        if (tr == H2_EWINDOW) return SEND_AGAIN;
+        if (tr) return SEND_FATAL;
+    }
     const int xudp = udp && node->flow[0];
     if (xudp) {
-        static __thread unsigned char xb[TUNNEL_BUF];
+        static __thread unsigned char xb[VL_WBUF];
         size_t xn = xudp_frames(k, !s->header_sent, data, n, xb, sizeof xb);
         if (!xn) return SEND_FATAL;
         data = xb;
@@ -419,9 +473,17 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
      * Шестьдесят четыре байта копии против невоспроизводимой поломки протокола. */
     struct vision vis_before = s->vis;
     if (node->flow[0] && !s->vis.sent_end && n) {
-        size_t fn = vision_wrap(&s->vis, data, n, out + len, sizeof(out) - len);
+        /* Длина кадра Vision — два байта: что не влезло (рамка XUDP крупной датаграммы), идёт следом
+         * без обёртки, потому что после первого кадра end поток чистый. */
+        size_t wn = n > 0xFFFF ? 0xFFFF : n;
+        size_t fn = vision_wrap(&s->vis, data, wn, out + len, sizeof(out) - len);
         if (!fn) return SEND_FATAL;
         len += fn;
+        if (wn < n) {
+            if (len + n - wn > sizeof(out)) return SEND_FATAL;
+            memcpy(out + len, data + wn, n - wn);
+            len += n - wn;
+        }
         body = out;
     } else if (len) {
         /* Заголовок уже лежит в out — данные приклеиваем к нему. */
@@ -434,7 +496,7 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     }
 
     /* Через транспорт: упаковку (tcp, grpc, xhttp) знает он, а не дайлер. */
-    int rc = transport_write(&s->t, body, len);
+    int rc = vl_write(s, body, len, udp);
     if (rc == H2_EWINDOW) {
         /* Окно HTTP/2 закрыто: сервер не успевает принимать. Это НЕ отказ — это то, для
          * чего управление потоком и существует. Ничего не ушло (h2_write либо отправляет
@@ -488,6 +550,11 @@ static size_t vl_dgram_frame(const unsigned char *p, size_t n, unsigned char *ou
 static int vl_read(void *sess, unsigned char *buf, size_t cap, const unsigned char **data,
                    size_t *got) {
     struct vl_sess *s = sess;
+    if (s->utail) {
+        /* Окно могло открыться тем, что мы сейчас прочтём; хвост — до чтения, чтобы порядок не менялся. */
+        int tr = vl_tail_flush(s);
+        if (tr && tr != H2_EWINDOW) return tr;
+    }
     return transport_read_zc(&s->t, buf, cap, data, got);
 }
 
