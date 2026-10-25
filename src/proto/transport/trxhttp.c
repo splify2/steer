@@ -631,6 +631,14 @@ static int xhttp_aux_drain(struct transport *t) {
     return 0;
 }
 
+/* Что связь выгрузки не успела отдать сокету (живая запись): цикл ставит на неё EPOLLOUT, иначе остаток ждал бы
+ * ответа сервера, а сервер ждёт этот остаток. */
+static size_t xhttp_aux_pending(const struct transport *t) {
+    const struct xh_state *x = &t->xh;
+    if (x->mode == XH_STREAM_ONE || !x->up.started || x->up.link.fd <= 0) return 0;
+    return tr_link_pending(&x->up.link);
+}
+
 /* Одним вызовом принимает любую запись только packet-up: режет её на POST сам. У stream-up и
  * stream-one запись — это DATA в одном потоке с окном, и стек собирает для них не больше записи TLS.
  * Vision (flow) сюда не доходит: узел xhttp с flow отсеивается при разборе ссылки, а у дайлера
@@ -651,6 +659,6 @@ const struct transport_ops tr_xhttp = {
     .open = xhttp_open, .write = xhttp_write, .read = xhttp_read,
     .moved = xhttp_moved, .close = xhttp_close, .pending = xhttp_pending,
     .room = xhttp_room,
-    .aux_fd = xhttp_aux_fd, .aux_drain = xhttp_aux_drain,
+    .aux_fd = xhttp_aux_fd, .aux_drain = xhttp_aux_drain, .aux_pending = xhttp_aux_pending,
     .big_write = xhttp_big_write, .live = xhttp_live,
 };

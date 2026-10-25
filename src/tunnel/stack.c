@@ -196,6 +196,8 @@ struct conn {
     /* Вторая связь дайлера (dialer_ops.aux_fd), стоящая в epoll: её дескриптор; -1 — нет; -2 —
      * слушать больше нечего (aux_drain отказал), заново не ставить. */
     int aux;
+    /* На нём стоит EPOLLOUT: в очереди второй связи (dialer_ops.aux_pending) есть байты. */
+    uint8_t aux_out;
     /* В буфере записей уже лежит ЦЕЛАЯ запись, а мы прервались (упёрлись в предел порции
      * или в окно клиента).
      *
@@ -2513,12 +2515,25 @@ void tun_bring_up(const char *dev, int table) {
 static void aux_sync(int ep, struct conn *c) {
     if (!g_dl->ops->aux_fd || c->aux == -2) return;
     int af = g_dl->ops->aux_fd(SESS(c));
-    if (af == c->aux) return;
-    if (c->aux >= 0) epoll_ctl(ep, EPOLL_CTL_DEL, c->aux, NULL);
-    c->aux = -1;
-    if (af < 0) return;
-    struct epoll_event e = { .events = EPOLLIN, .data = { .u32 = AUX_BIT | (uint32_t)(c - g_conns) } };
-    if (epoll_ctl(ep, EPOLL_CTL_ADD, af, &e) == 0) c->aux = af;
+    if (af != c->aux) {
+        if (c->aux >= 0) epoll_ctl(ep, EPOLL_CTL_DEL, c->aux, NULL);
+        c->aux = -1;
+        c->aux_out = 0;
+        if (af < 0) return;
+        struct epoll_event e = { .events = EPOLLIN, .data = { .u32 = AUX_BIT | (uint32_t)(c - g_conns) } };
+        if (epoll_ctl(ep, EPOLL_CTL_ADD, af, &e) == 0) c->aux = af;
+    }
+    /* Живая запись второй связи (I-534): что сокет не принял, лежит в её очереди, и сервер, ждущий остаток, ничего
+     * не пришлёт, пока он не уйдёт, — без EPOLLOUT остаток ждал бы ответа, которого не будет. Событие записи (по
+     * уровню) будит aux_event, и aux_drain досылает очередь; опустела — EPOLLOUT снимается. */
+    if (c->aux >= 0 && g_dl->ops->aux_pending) {
+        int want = g_dl->ops->aux_pending(SESS(c)) > 0;
+        if (want != c->aux_out) {
+            struct epoll_event e = { .events = EPOLLIN | (want ? (uint32_t)EPOLLOUT : 0u),
+                                     .data = { .u32 = AUX_BIT | (uint32_t)(c - g_conns) } };
+            if (epoll_ctl(ep, EPOLL_CTL_MOD, c->aux, &e) == 0) c->aux_out = (uint8_t)want;
+        }
+    }
 }
 
 /* Событие второй связи: слить пришедшее (место у дайлера могло вырасти — недочитанное у клиента дочитает

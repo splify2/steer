@@ -287,6 +287,11 @@ int transport_aux_drain(struct transport *t) {
     return t->fr->aux_drain(t);
 }
 
+size_t transport_aux_pending(const struct transport *t) {
+    if (!t->fr || !t->fr->aux_pending) return 0;
+    return t->fr->aux_pending(t);
+}
+
 void transport_moved(struct transport *t) {
     if (t->fr && t->fr->moved) t->fr->moved(t);
 }

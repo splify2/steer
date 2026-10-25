@@ -217,6 +217,9 @@ int transport_aux_drain(struct transport *c) {
     if (g_room_on_aux != -2) { g_room = g_room_on_aux; g_room_on_aux = -2; }
     return g_aux_rc;
 }
+/* Очередь второй связи (живая запись): сколько байт в ней ждёт отправки. */
+static size_t g_aux_pending;
+size_t transport_aux_pending(const struct transport *c) { (void)c; return g_aux_pending; }
 long transport_room(struct transport *c) { (void)c; return g_room; }
 /* Живая запись (I-534): у подмены сокета нет — держать нечего. */
 void transport_live(struct transport *c) { (void)c; }
@@ -1476,6 +1479,34 @@ static void t_tx_batch(void) {
     check(g_overemit == 1, "договор дайлера: проход отдал 36000 байт при запасе 19472 — нарушение сосчитано и названо");
     (void)cli_get(cli_fd(c), b, sizeof b);                  /* поток испорчен намеренно — только вычерпать сокет */
     g_recv_rep = 0;
+    conn_drop(c);
+}
+
+/* Живая запись второй связи (I-534): пока в её очереди есть байты, на дескрипторе стоит EPOLLOUT — иначе остаток
+ * ждал бы ответа сервера, а сервер ждёт остаток. Опустела — EPOLLOUT снят. */
+static void t_aux_out(void) {
+    struct conn *c = open_conn();
+    int sp[2], ep = epoll_create1(0);
+    if (!c || socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0 || ep < 0) {
+        check(0, "вторая связь, очередь: тестовое соединение, пара или epoll");
+        return;
+    }
+    struct epoll_event ev[4];
+    g_aux_fd = sp[0];
+    g_aux_pending = 100;
+    aux_sync(ep, c);
+    int n = epoll_wait(ep, ev, 4, 0);
+    check(c->aux == sp[0] && n == 1 && (ev[0].events & EPOLLOUT) && (ev[0].data.u32 & AUX_BIT),
+          "вторая связь, очередь: есть неотправленное — на связи стоит EPOLLOUT и будит цикл");
+    g_aux_pending = 0;
+    aux_sync(ep, c);
+    check(c->aux_out == 0 && epoll_wait(ep, ev, 4, 0) == 0,
+          "вторая связь, очередь: очередь опустела — EPOLLOUT снят, цикл не будят");
+    g_aux_fd = -1;
+    aux_sync(ep, c);
+    close(ep);
+    close(sp[0]);
+    close(sp[1]);
     conn_drop(c);
 }
 
@@ -3676,6 +3707,7 @@ int main(void) {
     t_server_first();
     t_room_window();
     t_aux_wake();
+    t_aux_out();
     t_tx_batch();
     t_empty_read();
     t_sock_chunks();

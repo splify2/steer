@@ -1114,6 +1114,7 @@ static int pl_fd(const void *sess) { return g_pl.in->fd(CINNER(sess)); }
 static int pl_has_data(const void *sess) { return g_pl.in->has_data(CINNER(sess)); }
 static int pl_aux_fd(const void *sess) { return g_pl.in->aux_fd ? g_pl.in->aux_fd(CINNER(sess)) : -1; }
 static int pl_aux_drain(void *sess) { return g_pl.in->aux_drain ? g_pl.in->aux_drain(INNER(sess)) : -1; }
+static size_t pl_aux_pending(const void *sess) { return g_pl.in->aux_pending ? g_pl.in->aux_pending(CINNER(sess)) : 0; }
 
 static int pl_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
     (void)ctx;
@@ -1321,6 +1322,7 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.has_data = pl_has_data;
     g_pl_ops.aux_fd = g_pl.in->aux_fd ? pl_aux_fd : NULL;
     g_pl_ops.aux_drain = g_pl.in->aux_drain ? pl_aux_drain : NULL;
+    g_pl_ops.aux_pending = g_pl.in->aux_pending ? pl_aux_pending : NULL;
     g_pl_ops.flow_open = pl_flow_open;
     g_pl_ops.send = pl_send;
     g_pl_ops.room = pl_room;

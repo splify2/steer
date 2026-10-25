@@ -323,6 +323,9 @@ struct transport_ops {
      * NULL — второй связи у транспорта не бывает. */
     int  (*aux_fd)(const struct transport *t);
     int  (*aux_drain)(struct transport *t);
+    /* Сколько байт ждёт отправки в очереди второй связи (живая запись): пока они есть, цикл ждёт её записи
+     * (EPOLLOUT) и сливает через aux_drain. NULL — нет. */
+    size_t (*aux_pending)(const struct transport *t);
     /* См. transport_big_write. NULL — нет. */
     int  (*big_write)(const struct transport *t);
     /* Основная связь отдана циклу (transport_live): включить живую запись у второй связи. NULL — нет. */
@@ -413,6 +416,7 @@ static inline int transport_fd(const struct transport *t) { return t->link.fd; }
  * (transport_ops.aux_drain). Подробности — в transport.c. */
 int transport_aux_fd(const struct transport *t);
 int transport_aux_drain(struct transport *t);
+size_t transport_aux_pending(const struct transport *t);
 
 /* Закрыть всё: дескрипторы обеих связей и контексты шифров в куче. Годится и для структуры,
  * которую transport_open не довёл до конца или не открывал вовсе (fd -1). */

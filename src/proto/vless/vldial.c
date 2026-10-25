@@ -125,6 +125,11 @@ static int vl_aux_drain(void *sess) {
     return transport_aux_drain(&s->t);
 }
 
+static size_t vl_aux_pending(const void *sess) {
+    const struct vl_sess *s = sess;
+    return transport_aux_pending(&s->t);
+}
+
 /* ---- поток ----------------------------------------------------------------------------- */
 
 /* Идентификатор узла не разобрался, и соединение закрывается. Причина известна здесь и
@@ -804,6 +809,7 @@ const struct dialer_ops vless_dialer = {
     .has_data = vl_has_data,
     .aux_fd = vl_aux_fd,
     .aux_drain = vl_aux_drain,
+    .aux_pending = vl_aux_pending,
     .flow_open = vl_flow_open,
     .send = vl_send,
     .room = vl_room,
