@@ -42,6 +42,7 @@
 #include "check.h"
 #include "grpurl.h"
 #include "v2.h"
+#include "v2keys.h"
 #include "plugin.h"
 #include "awg.h"
 
@@ -160,6 +161,17 @@ static int long_of(struct v2 *x, const struct ynode *n, const char *where, long 
     return 0;
 }
 
+/* То же, но границы — из таблицы ключей (v2keys.c): их же показывает схема. */
+static int long_k(struct v2 *x, const struct ynode *n, const char *where, const struct v2key *k,
+                  long *out) {
+    return long_of(x, n, where, k->lo, k->hi, out);
+}
+
+static int long_sk(struct v2 *x, const struct ynode *n, const char *where, enum v2_scope sc,
+                   const char *key, long *out) {
+    return long_k(x, n, where, v2key_find(sc, key), out);
+}
+
 /* Перечень: список скаляров или один скаляр — сокращение для списка из одного (`to: youtube` и
  * `to: [youtube]` значат одно). Пустое значение — пустой перечень. */
 static size_t n_items(const struct ynode *n) {
@@ -187,9 +199,10 @@ static int items_ok(struct v2 *x, const struct ynode *n, const char *where) {
     return 0;
 }
 
-/* Ключи отображения — только из перечня. */
-static int keys_known(struct v2 *x, const struct ynode *map, const char *where,
-                      const char *const *allowed) {
+/* Ключи отображения — только из перечня. Перечень раздела — в таблице ключей (v2keys.c), общей с
+ * схемой `steer spec-schema`; keys_in берёт перечень словами (owner плагина — не ключ схемы). */
+static int keys_in(struct v2 *x, const struct ynode *map, const char *where,
+                   const char *const *allowed) {
     for (size_t i = 0; i < ynode_len(map); i++) {
         const char *k = ynode_key_at(map, i)->str;
         size_t a = 0;
@@ -200,6 +213,17 @@ static int keys_known(struct v2 *x, const struct ynode *map, const char *where,
         list[0] = '\0';
         for (a = 0; allowed[a] && l < sizeof(list); a++)
             l += (size_t)snprintf(list + l, sizeof(list) - l, "%s%s", a ? ", " : "", allowed[a]);
+        return fail(x, ynode_key_at(map, i), "неизвестный ключ «%s» в %s (есть: %s)", k, where, list);
+    }
+    return 0;
+}
+
+static int keys_known(struct v2 *x, const struct ynode *map, const char *where, enum v2_scope sc) {
+    for (size_t i = 0; i < ynode_len(map); i++) {
+        const char *k = ynode_key_at(map, i)->str;
+        if (v2key_known(sc, k)) continue;
+        char list[256];
+        v2keys_list(sc, list, sizeof(list));
         return fail(x, ynode_key_at(map, i), "неизвестный ключ «%s» в %s (есть: %s)", k, where, list);
     }
     return 0;
@@ -310,8 +334,7 @@ static int from_push(struct v2 *x, const struct ynode *n, const char *where, str
 
 static int p_lan(struct v2 *x, const struct ynode *n) {
     struct spec *s = x->s;
-    static const char *const K[] = { "devices", "addr", NULL };
-    if (want_map(x, n, "lan") || keys_known(x, n, "lan", K)) return -1;
+    if (want_map(x, n, "lan") || keys_known(x, n, "lan", V2S_LAN)) return -1;
     const struct ynode *dv = ynode_get(n, "devices"), *ad = ynode_get(n, "addr");
     if (dv) {
         if (items_ok(x, dv, "lan.devices")) return -1;
@@ -361,7 +384,7 @@ static int owner_of(struct v2 *x, const struct ynode *val, const char *where, co
     char w[160];
     snprintf(w, sizeof(w), "%s.owner", where);
     const char *pl;
-    if (want_map(x, ow, w) || keys_known(x, ow, w, OK)) return -1;
+    if (want_map(x, ow, w) || keys_in(x, ow, w, OK)) return -1;
     if (!ynode_get(ow, "plugin")) return fail(x, ow, "%s: нет plugin", w);
     snprintf(w, sizeof(w), "%s.owner.plugin", where);
     if (str_of(x, ynode_get(ow, "plugin"), w, &pl)) return -1;
@@ -371,7 +394,6 @@ static int owner_of(struct v2 *x, const struct ynode *val, const char *where, co
 
 static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
-    static const char *const K[] = { "addr", "mac", "uid", "self", "app", "owner", NULL };
     if (spec_reserve_client(s, s->client_n + 1) != 0 ||
         spec_grow((void **)&x->cl, &x->cl_cap, s->client_n + 1, sizeof(*x->cl)) != 0)
         return fail(x, key, "недостаточно памяти для спеки (клиентов: %zu)", s->client_n + 1);
@@ -387,7 +409,7 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
             return fail(x, key, "clients: клиент %s описан дважды", c->name);
     char where[64];
     snprintf(where, sizeof(where), "clients.%s", c->name);
-    if (want_map(x, val, where) || keys_known(x, val, where, K)) return -1;
+    if (want_map(x, val, where) || keys_known(x, val, where, V2S_CLIENT)) return -1;
     if (owner_of(x, val, where, &c->owner_plugin)) return -1;
     f->hosts = 1;
     const struct ynode *ad = ynode_get(val, "addr"), *mc = ynode_get(val, "mac"),
@@ -501,8 +523,6 @@ static int files_of(struct v2 *x, const struct ynode *n, const char *where, cons
 
 static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
-    static const char *const K[] = { "srs", "prefixes_file", "domains_file", "domains", "prefixes",
-                                     "proto", "ports", "all", "override_port", "owner", NULL };
     if (spec_reserve_list(s, s->list_n + 1) != 0)
         return fail(x, key, "недостаточно памяти для спеки (списков: %zu)", s->list_n + 1);
     struct spec_list *l = &s->list[s->list_n];
@@ -515,7 +535,7 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
             return fail(x, key, "lists: список %s описан дважды", l->name);
     char where[64], w[96];
     snprintf(where, sizeof(where), "lists.%s", l->name);
-    if (want_map(x, val, where) || keys_known(x, val, where, K)) return -1;
+    if (want_map(x, val, where) || keys_known(x, val, where, V2S_LIST)) return -1;
     if (owner_of(x, val, where, &l->owner_plugin)) return -1;
     const struct ynode *n;
     if ((n = ynode_get(val, "srs"))) {
@@ -591,7 +611,7 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
     if ((n = ynode_get(val, "override_port"))) {
         long v;
         snprintf(w, sizeof(w), "%s.override_port", where);
-        if (long_of(x, n, w, 1, 65535, &v)) return -1;
+        if (long_sk(x, n, w, V2S_LIST, "override_port", &v)) return -1;
         /* Подмена делается по карте fake-IP (поддельный адрес → настоящий с этим портом), то есть
          * только для имён. Список с подсетями или наборами .srs (у них свои адреса и свои
          * сужения в составном наборе) подменой не владеет. */
@@ -637,43 +657,17 @@ static int cc_list(struct v2 *x, struct spec *s, const struct ynode *v, const ch
 
 /* ---- outputs ------------------------------------------------------------------------------ */
 
-/* Ключ вида и чей он: бит kind_ops.keys и кому принадлежит — для отказа «ключ чужого вида». */
-static const struct { const char *key; unsigned bit; const char *owner; } KIND_KEYS[] = {
-    { "obfs",         KK_OBFS,   "kind: interface" },
-    { "conf",         KK_CONF,   "kind: xsteer и kind: awg" },
-    { "subscription", KK_SUB,    "kind: tunnel" },
-    { "nodes",        KK_NODES,  "kind: tunnel" },
-    { "transport",    KK_SUB,    "kind: tunnel" },
-    { "insecure",     KK_SUB,    "kind: tunnel" },
-    { "exclude",      KK_SUB,    "kind: tunnel" },
-    { "exclude_name", KK_SUB,    "kind: tunnel" },
-    { "only",         KK_SUB,    "kind: tunnel" },
-    { "active",       KK_SUB,    "kind: tunnel" },
-    { "by",           KK_SUB,    "kind: tunnel" },
-    { "interval",     KK_SUB,    "kind: tunnel" },
-    { "silence",      KK_SUB,    "kind: tunnel" },
-    { "pick",         KK_SUB,    "kind: tunnel" },
-    { "tolerance",    KK_SUB,    "kind: tunnel" },
-    { "stream",       KK_STREAM, "kind: xsteer" },
-    { "stream_port",  KK_STREAM, "kind: xsteer" },
-    { "strategy",     KK_OPTS,   "kind: recheck" },
-    { "domain",       KK_DOMAIN, "kind: tgws" },
-};
-#define KIND_KEYS_N (sizeof(KIND_KEYS) / sizeof(KIND_KEYS[0]))
-
-static const char *const GROUP_KEYS[] = { "pick", "members", "default", "tolerance", "interval",
-                                          "url", "idle_timeout", "weights", "by", NULL };
-
 static int p_obfs(struct v2 *x, const struct ynode *n, const char *name, struct out_obfs *ob) {
-    static const char *const K[] = { "mode", "server", "listen", NULL };
     char where[64];
     snprintf(where, sizeof(where), "outputs.%s.obfs", name);
-    if (want_map(x, n, where) || keys_known(x, n, where, K)) return -1;
+    if (want_map(x, n, where) || keys_known(x, n, where, V2S_OBFS)) return -1;
     const char *v[3] = { "", "", "" };
-    for (size_t i = 0; K[i]; i++) {
-        const struct ynode *it = ynode_get(n, K[i]);
+    /* mode, server, listen — в порядке таблицы ключей (obfs_set берёт их в этом порядке). */
+    for (size_t i = 0; i < 3; i++) {
+        const char *kn = v2key_name_at(V2S_OBFS, i);
+        const struct ynode *it = ynode_get(n, kn);
         char w[96];
-        snprintf(w, sizeof(w), "%s.%s", where, K[i]);
+        snprintf(w, sizeof(w), "%s.%s", where, kn);
         if (it && str_of(x, it, w, &v[i])) return -1;
         if (strlen(v[i]) > 79) return fail(x, it, "%s: длиннее 79 байт", w);
     }
@@ -690,7 +684,7 @@ static int p_tun_pool(struct v2 *x, const struct ynode *v, const char *w, const 
     const char *sv;
     if (!strcmp(ks, "active")) {
         /* Предел сверху — номера узлов (0..65535 у nodes): больше узлов в выборе не бывает. */
-        if (long_of(x, v, w, 1, 65536, &lv)) return -1;
+        if (long_k(x, v, w, v2key_out_find("active", W_KK), &lv)) return -1;
         k->pool.active = (int)lv;
     } else if (!strcmp(ks, "by")) {
         if (str_of(x, v, w, &sv)) return -1;
@@ -700,7 +694,7 @@ static int p_tun_pool(struct v2 *x, const struct ynode *v, const char *w, const 
         k->pool.by = b;
         k->by_set = 1;
     } else if (!strcmp(ks, "interval")) {
-        if (long_of(x, v, w, GROUP_INT_MIN_S, GROUP_INT_MAX_S, &lv)) return -1;
+        if (long_k(x, v, w, v2key_out_find("interval", W_KK), &lv)) return -1;
         k->pool.interval_s = (int)lv;
     } else if (!strcmp(ks, "pick")) {
         /* order — узлы по порядку предпочтения (прежнее); latency — самые быстрые по замеру. */
@@ -709,14 +703,14 @@ static int p_tun_pool(struct v2 *x, const struct ynode *v, const char *w, const 
         else if (!strcmp(sv, "latency")) k->pool.pick = 1;
         else return fail(x, v, "%s: «%s» — у туннеля нужен order или latency", w, sv);
     } else if (!strcmp(ks, "tolerance")) {
-        if (long_of(x, v, w, 0, GROUP_TOL_MAX_MS, &lv)) return -1;
+        if (long_k(x, v, w, v2key_out_find("tolerance", W_KK), &lv)) return -1;
         k->pool.tolerance_ms = (int)lv;
         k->pool.tol_set = 1;
     } else {
         /* silence: 0 — порога нет (сроки ядра). Снизу 5 с: короче нескольких кругов повторной
          * передачи на медленной линии порог обрывал бы живые соединения. Сверху — предел ядра для
          * TCP_KEEPIDLE (32767 с). */
-        if (long_of(x, v, w, 0, 32767, &lv)) return -1;
+        if (long_k(x, v, w, v2key_out_find("silence", W_KK), &lv)) return -1;
         if (lv > 0 && lv < 5)
             return fail(x, v, "%s: %ld с — меньше 5 с: столько длится повторная передача на медленной "
                         "линии, и живые соединения обрывались бы; 0 — порога нет", w, lv);
@@ -873,7 +867,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             if (!s->prepared) return fail(x, kk, "%s: owner пишет только плагин — в спеке человека его нет", where);
             if (want_map(x, v, w)) return -1;
             static const char *const OK[] = { "plugin", "out", NULL };
-            if (keys_known(x, v, w, OK)) return -1;
+            if (keys_in(x, v, w, OK)) return -1;
             const char *op, *oo = NULL;
             char w2[160];
             snprintf(w2, sizeof(w2), "%s.plugin", w);
@@ -905,7 +899,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         if (!strcmp(ks, "on_fail")) {
             /* Что делать, когда выход не работает, — у выхода с устройством, у группы и у видов
              * с меткой (tgws, модуль DPI). У direct отказывать нечему. */
-            if (!group && !(caps & (KC_DEVICE | KC_MARK)))
+            if (!v2key_applies(v2key_out_find("on_fail", W_FAIL), kd, group))
                 return fail(x, kk, "%s: у kind: %s нет on_fail — он не может отказать", where, kd->name);
             if (str_of(x, v, w, &sv)) return -1;
             if (!strcmp(sv, "drop")) o.on_fail = FAIL_DROP;
@@ -928,7 +922,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             else if (!strcmp(sv, "nat")) m = OUT_V6_NAT;
             else if (!strcmp(sv, "off")) m = OUT_V6_OFF;
             else return fail(x, v, "%s: «%s» — нужен routed, nat или off", w, sv);
-            if (!group && !(caps & KC_IPV6))
+            if (!v2key_applies(v2key_out_find("ipv6", W_IPV6), kd, group))
                 return fail(x, kk, "%s: kind: %s IPv6 не несёт — его правила IPv6 и так отвергаются, "
                             "ключ ipv6 ему не нужен", where, kd->name);
             if (m != OUT_V6_OFF && group)
@@ -963,7 +957,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         if (!strcmp(ks, "device")) {
             if (group)
                 return fail(x, kk, "%s: у группы нет своего устройства — оно у членов (members)", where);
-            if (!(caps & KC_DEVICE))
+            if (!v2key_applies(v2key_out_find("device", W_DEVICE), kd, group))
                 return fail(x, kk, "%s: у kind: %s нет устройства — трафик никуда не уводится", where,
                             kd->name);
             if (str_of(x, v, w, &sv)) return -1;
@@ -985,14 +979,14 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             continue;
         }
         /* Ключи пула туннеля — до ключей группы: interval и by есть и там, с другим смыслом. */
-        if (tunnel && (!strcmp(ks, "active") || !strcmp(ks, "by") || !strcmp(ks, "interval") ||
-                       !strcmp(ks, "silence") || !strcmp(ks, "pick") || !strcmp(ks, "tolerance"))) {
+        const struct v2key *kkey = v2key_out_find(ks, W_KK), *gkey = v2key_out_find(ks, W_GROUP);
+        if (tunnel && kkey && (kkey->flags & VF_POOL)) {
             if (p_tun_pool(x, v, w, ks, &k)) return -1;
             continue;
         }
         /* Страна члена группы: exclude и only — у группы с выбором по порядку или задержке
          * (проверка после цикла). У туннеля эти же ключи — отбор узлов подписки (ниже). */
-        if (group && (!strcmp(ks, "exclude") || !strcmp(ks, "only"))) {
+        if (group && gkey && (gkey->flags & VF_NOMSG)) {
             int only = !strcmp(ks, "only");
             if (cc_list(x, s, v, w, only ? &o.grp.ccsel.only : &o.grp.ccsel.cc,
                         only ? &o.grp.ccsel.only_n : &o.grp.ccsel.cc_n))
@@ -1000,9 +994,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             cc_key = kk;
             continue;
         }
-        size_t gk = 0;
-        while (GROUP_KEYS[gk] && strcmp(GROUP_KEYS[gk], ks)) gk++;
-        if (GROUP_KEYS[gk]) {
+        if (gkey && !(gkey->flags & VF_NOMSG)) {
             if (!group) return fail(x, kk, "%s: %s есть только у kind: group", where, ks);
             long lv;
             if (!strcmp(ks, "pick")) {
@@ -1020,11 +1012,11 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 if (str_of(x, v, w, &sv)) return -1;
                 x->out_default[idx] = v;
             } else if (!strcmp(ks, "tolerance")) {
-                if (long_of(x, v, w, 0, GROUP_TOL_MAX_MS, &lv)) return -1;
+                if (long_k(x, v, w, v2key_out_find("tolerance", W_GROUP), &lv)) return -1;
                 o.grp.lat_tolerance_ms = (int)lv;
                 lat_key = kk;
             } else if (!strcmp(ks, "interval")) {
-                if (long_of(x, v, w, GROUP_INT_MIN_S, GROUP_INT_MAX_S, &lv)) return -1;
+                if (long_k(x, v, w, v2key_out_find("interval", W_GROUP), &lv)) return -1;
                 o.grp.lat_interval_s = (int)lv;
                 lat_key = kk;
             } else if (!strcmp(ks, "url")) {
@@ -1043,7 +1035,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 if (copy_to(x, v, w, sv, o.grp.url, sizeof(o.grp.url))) return -1;
                 lat_key = kk;
             } else if (!strcmp(ks, "idle_timeout")) {
-                if (long_of(x, v, w, 0, GROUP_IDLE_MAX_S, &lv)) return -1;
+                if (long_k(x, v, w, v2key_out_find("idle_timeout", W_GROUP), &lv)) return -1;
                 o.grp.idle_timeout_s = (int)lv;
                 lat_key = kk;
             } else if (!strcmp(ks, "by")) {
@@ -1060,32 +1052,20 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                  * известно во втором проходе — там и сверяется длина. */
                 if (items_ok(x, v, w)) return -1;
                 for (size_t i2 = 0; i2 < n_items(v); i2++)
-                    if (long_of(x, item(v, i2), w, 1, GROUP_WEIGHT_MAX, &lv)) return -1;
+                    if (long_k(x, item(v, i2), w, v2key_out_find("weights", W_GROUP), &lv)) return -1;
                 x->out_weights[idx] = v;         /* веса ложатся в группу во втором проходе */
                 w_key = kk;
             }
             continue;
         }
-        size_t a = 0;
-        while (a < KIND_KEYS_N && strcmp(KIND_KEYS[a].key, ks)) a++;
-        if (a == KIND_KEYS_N) {
-            /* Подсказка — ключи, которые у этого вида есть. */
-            char list[200];
-            size_t l = (size_t)snprintf(list, sizeof(list), "kind%s%s%s", tunnel ? ", protocol" : "",
-                                        group || (caps & (KC_DEVICE | KC_MARK)) ? ", on_fail" : "",
-                                        !group && (caps & KC_DEVICE) ? ", device, over" : "");
-            if (group || (caps & KC_IPV6))
-                l += (size_t)snprintf(list + l, sizeof(list) - l, ", ipv6%s",
-                                      !group && (caps & KC_DEVICE) ? ", prefix" : "");
-            for (size_t b = 0; b < KIND_KEYS_N && l < sizeof(list); b++)
-                if (!group && (kd->keys & KIND_KEYS[b].bit))
-                    l += (size_t)snprintf(list + l, sizeof(list) - l, ", %s", KIND_KEYS[b].key);
-            for (size_t b = 0; group && GROUP_KEYS[b] && l < sizeof(list); b++)
-                l += (size_t)snprintf(list + l, sizeof(list) - l, ", %s", GROUP_KEYS[b]);
+        if (!kkey) {
+            /* Подсказка — ключи, которые у этого вида есть (таблица ключей, v2keys.c). */
+            char list[300];
+            v2keys_out_list(kd, group, tunnel, proto, list, sizeof(list));
             return fail(x, kk, "неизвестный ключ «%s» в %s (есть: %s)", ks, where, list);
         }
-        if (group || !(kd->keys & KIND_KEYS[a].bit))
-            return fail(x, kk, "%s: ключ %s есть только у %s", where, ks, KIND_KEYS[a].owner);
+        if (!v2key_applies(kkey, kd, group))
+            return fail(x, kk, "%s: ключ %s есть только у %s", where, ks, kkey->owner);
         if (!strcmp(ks, "obfs")) {
             if (p_obfs(x, v, o.name, &k.obfs)) return -1;
         } else if (!strcmp(ks, "conf")) {
@@ -1138,7 +1118,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             if (bool_of(x, v, w, &k.stream)) return -1;
         } else if (!strcmp(ks, "stream_port")) {
             long lv;
-            if (long_of(x, v, w, 1, 65535, &lv)) return -1;
+            if (long_k(x, v, w, v2key_out_find("stream_port", W_KK), &lv)) return -1;
             k.stream_port = (int)lv;
         } else if (!strcmp(ks, "nodes")) {
             /* Номера — среди ПРИГОДНЫХ узлов подписки, как печатает `steer vless-nodes`. */
@@ -1150,7 +1130,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             for (size_t i2 = 0; i2 < n_items(v); i2++) {
                 const struct ynode *it = item(v, i2);
                 long lv;
-                if (long_of(x, it, w, 0, 65535, &lv)) return -1;
+                if (long_k(x, it, w, v2key_out_find("nodes", W_KK), &lv)) return -1;
                 for (size_t b = 0; b < k.nodes_n; b++)
                     if (k.nodes[b] == (int)lv)
                         return fail(x, it, "%s: узел %ld указан дважды", w, lv);
@@ -1299,17 +1279,13 @@ static int warp_countries(struct v2 *x, const struct ynode *v, const char *w, ch
     return 0;
 }
 
-static const char *const WARP_KEYS[] = { "kind", "transport", "count", "pick", "tolerance", "interval",
-                                         "url", "idle_timeout", "countries", "exclude_countries",
-                                         "on_fail", "over", "ipv6", NULL };
-
 static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *val);
 
 static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     char name[32], where[64], w[128];
     if (name_of(x, key, "outputs", name)) return -1;
     snprintf(where, sizeof(where), "outputs.%s", name);
-    if (keys_known(x, val, where, WARP_KEYS)) return -1;
+    if (keys_known(x, val, where, V2S_WARP)) return -1;
     const struct ynode *v;
     unsigned char transport = WARP_AWG;
     if ((v = ynode_get(val, "transport"))) {
@@ -1327,7 +1303,7 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
         snprintf(w, sizeof(w), "%s.count", where);
         /* Предел — не константа: столько туннелей, сколько выходов с меткой даёт поле метки
          * (check_slots); 255 — его наибольшее значение. */
-        if (long_of(x, v, w, 1, 255, &count)) return -1;
+        if (long_sk(x, v, w, V2S_WARP, "count", &count)) return -1;
     }
     char (*cc)[3] = NULL, (*xcc)[3] = NULL;
     size_t cc_n = 0, xcc_n = 0;
@@ -1636,13 +1612,12 @@ static int ips_of(struct v2 *x, const struct ynode *n, const char *where,
 static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, const char *name,
                     struct spec_dns_up *u) {
     struct spec *s = x->s;
-    static const char *const U[] = { "url", "out", "ips", "bootstrap", "fragment", NULL };
     char w[96];
     const char *sv;
     memset(u, 0, sizeof(*u));
     u->out = -1;
     snprintf(u->name, sizeof(u->name), "%s", name);
-    if (want_map(x, val, where) || keys_known(x, val, where, U)) return -1;
+    if (want_map(x, val, where) || keys_known(x, val, where, V2S_DNS_UP)) return -1;
     const struct ynode *un = ynode_get(val, "url"), *on = ynode_get(val, "out");
     snprintf(w, sizeof(w), "%s.url", where);
     if (!un) return fail(x, val, "%s: нет url", where);
@@ -1699,7 +1674,6 @@ static int up_named(const struct spec *s, const char *name) {
 static int p_dns_grp(struct v2 *x, const struct ynode *val, const char *where, const char *name,
                      struct spec_dns_up *u) {
     struct spec *s = x->s;
-    static const char *const G[] = { "servers", "mode", NULL };
     char w[96], nm[32];
     const char *sv;
     snprintf(nm, sizeof(nm), "%s", name);      /* name бывает самим u->name: memset ниже его стёр бы */
@@ -1712,7 +1686,7 @@ static int p_dns_grp(struct v2 *x, const struct ynode *val, const char *where, c
     if (ynode_get(val, "url"))
         return fail(x, val, "%s: url и servers вместе — это либо сервер (url), либо группа серверов "
                     "(servers)", where);
-    if (keys_known(x, val, where, G)) return -1;
+    if (keys_known(x, val, where, V2S_DNS_GRP)) return -1;
     const struct ynode *mn = ynode_get(val, "mode"), *sn = ynode_get(val, "servers");
     if (mn) {
         snprintf(w, sizeof(w), "%s.mode", where);
@@ -1755,9 +1729,7 @@ static int up_has_way(const struct spec *s, const struct spec_dns_up *u) {
 
 static int p_dns(struct v2 *x, const struct ynode *n) {
     struct spec *s = x->s;
-    static const char *const K[] = { "mode", "cache", "cache_ttl", "upstream", "upstreams", "other",
-                                     "bootstrap", "traceroute_hops", "mesh_clients", NULL };
-    if (want_map(x, n, "dns") || keys_known(x, n, "dns", K)) return -1;
+    if (want_map(x, n, "dns") || keys_known(x, n, "dns", V2S_DNS)) return -1;
     const struct ynode *v;
     const char *sv;
     s->dns.ttl_min = 10;
@@ -1772,15 +1744,14 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
         return -1;
     if ((v = ynode_get(n, "traceroute_hops")) && bool_of(x, v, "dns.traceroute_hops", &s->traceroute_hops))
         return -1;
-    if ((v = ynode_get(n, "cache")) && long_of(x, v, "dns.cache", 0, 100000, &s->dns.cache)) return -1;
+    if ((v = ynode_get(n, "cache")) && long_sk(x, v, "dns.cache", V2S_DNS, "cache", &s->dns.cache)) return -1;
     if ((v = ynode_get(n, "cache_ttl"))) {
-        static const char *const T[] = { "min", "max", "negative", NULL };
-        if (want_map(x, v, "dns.cache_ttl") || keys_known(x, v, "dns.cache_ttl", T)) return -1;
+        if (want_map(x, v, "dns.cache_ttl") || keys_known(x, v, "dns.cache_ttl", V2S_CACHE_TTL)) return -1;
         const struct ynode *t;
-        if ((t = ynode_get(v, "min")) && long_of(x, t, "dns.cache_ttl.min", 0, 86400, &s->dns.ttl_min)) return -1;
-        if ((t = ynode_get(v, "max")) && long_of(x, t, "dns.cache_ttl.max", 1, 604800, &s->dns.ttl_max)) return -1;
+        if ((t = ynode_get(v, "min")) && long_sk(x, t, "dns.cache_ttl.min", V2S_CACHE_TTL, "min", &s->dns.ttl_min)) return -1;
+        if ((t = ynode_get(v, "max")) && long_sk(x, t, "dns.cache_ttl.max", V2S_CACHE_TTL, "max", &s->dns.ttl_max)) return -1;
         if ((t = ynode_get(v, "negative")) &&
-            long_of(x, t, "dns.cache_ttl.negative", 0, 86400, &s->dns.ttl_neg)) return -1;
+            long_sk(x, t, "dns.cache_ttl.negative", V2S_CACHE_TTL, "negative", &s->dns.ttl_neg)) return -1;
         if (s->dns.ttl_min > s->dns.ttl_max)
             return fail(x, v, "dns.cache_ttl: min (%ld) больше max (%ld)", s->dns.ttl_min, s->dns.ttl_max);
     }
@@ -1978,15 +1949,13 @@ static int quic_clone(struct v2 *x, struct spec_rule *r, const struct ynode *qn,
 
 static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     struct spec *s = x->s;
-    static const char *const K[] = { "name", "for", "to", "out", "resolve", "dns", "enabled", "scope",
-                                     "quic", "family", "on_family_unavailable", "owner", NULL };
     if (spec_reserve_rule(s, s->rule_n + 1) != 0)
         return fail(x, n, "rules: недостаточно памяти для спеки (правил: %zu)", s->rule_n + 1);
     struct spec_rule *r = &s->rule[s->rule_n];
     memset(r, 0, sizeof(*r));
     char where[64];
     snprintf(where, sizeof(where), "rules[%zu]", no);
-    if (want_map(x, n, where) || keys_known(x, n, "правиле", K)) return -1;
+    if (want_map(x, n, where) || keys_known(x, n, "правиле", V2S_RULE)) return -1;
     if (owner_of(x, n, where, &r->owner_plugin)) return -1;
     const struct ynode *v;
     const char *sv;
@@ -2229,9 +2198,7 @@ static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e) {
     x.e = e;
     base_of(&x, ydoc_name(d));
     const struct ynode *root = ydoc_root(d), *v;
-    static const char *const TOP[] = { "version", "lan", "clients", "lists", "outputs", "dns", "rules",
-                                       NULL };
-    if (want_map(&x, root, "спека v2") || keys_known(&x, root, "спеке", TOP)) return -1;
+    if (want_map(&x, root, "спека v2") || keys_known(&x, root, "спеке", V2S_TOP)) return -1;
     long ver = 0;
     v = ynode_get(root, "version");
     if (!v) return fail(&x, root, "нет version: 2");

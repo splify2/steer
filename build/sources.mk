@@ -97,7 +97,7 @@ YAML_SRC := src/lib/ynode.c $(LIBYAML_SRC)
 # его зовут реестр видов (kinds/kind.c, kinds/tgws.c) и справка (cli/cli.c), а они идут со всякой
 # моделью, поэтому файл здесь же.
 MODEL_SRC := $(PLATFORM_SRC) src/lib/module.c src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/lib/ir.c src/model/parse.c src/model/v1.c \
-             src/model/check.c src/model/v2.c src/model/v2print.c src/model/registry.c \
+             src/model/check.c src/model/v2.c src/model/v2keys.c src/model/v2schema.c src/model/v2print.c src/model/registry.c \
              src/model/probe.c src/model/plugprep.c src/compile/nftcompat.c src/lib/puff.c src/lib/gz.c src/model/srs.c src/model/srsplan.c \
              src/lib/nftdump.c src/lib/rtnl.c src/lib/procscan.c $(YAML_SRC)
 

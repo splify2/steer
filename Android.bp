@@ -69,6 +69,8 @@ cc_defaults {
         "src/model/v1.c",
         "src/model/check.c",
         "src/model/v2.c",
+        "src/model/v2keys.c",
+        "src/model/v2schema.c",
         "src/model/v2print.c",
         "src/model/registry.c",
         "src/model/probe.c",
