@@ -9,11 +9,14 @@
  * vless и так далее) сверяется с профилями статических сборок, а точка входа существует только у
  * разделяемой раскладки (build/sources.mk, PROFILE_mod_*). */
 #include "modcmd.h"
+#include "plugconf.h"
 
 #ifndef STEER_VERSION
 #define STEER_VERSION "dev"
 #endif
 
 int main(int argc, char **argv) {
+    /* --conf {conf} помощника плагина — в прежние --spec и --state-dir (plugconf.h). */
+    argv = plugconf_argv(&argc, argv);
     return steer_module_main(argc, argv, "vless", STEER_VERSION);
 }

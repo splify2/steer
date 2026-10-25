@@ -1,0 +1,67 @@
+{
+  "type": "object",
+  "properties": {
+    "count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 255
+    },
+    "transport": {
+      "enum": [
+        "awg",
+        "masque"
+      ]
+    },
+    "countries": {
+      "type": [
+        "string",
+        "array"
+      ],
+      "pattern": "^[A-Z]{2}$",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z]{2}$"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "exclude_countries": {
+      "type": [
+        "string",
+        "array"
+      ],
+      "pattern": "^[A-Z]{2}$",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z]{2}$"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "pick": {
+      "enum": [
+        "latency",
+        "order"
+      ]
+    },
+    "tolerance": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 60000
+    },
+    "interval": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 86400
+    },
+    "url": {
+      "type": "string",
+      "minLength": 1
+    },
+    "idle_timeout": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false
+}

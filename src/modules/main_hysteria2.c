@@ -7,11 +7,14 @@
  * Модуль есть только в раскладке с libsteer.so (build/sources.mk, PROFILE_mod_hysteria2): ни в
  * статических сборках, ни в профиле телефона его нет. */
 #include "modcmd.h"
+#include "plugconf.h"
 
 #ifndef STEER_VERSION
 #define STEER_VERSION "dev"
 #endif
 
 int main(int argc, char **argv) {
+    /* --conf {conf} помощника плагина — в прежние --spec и --state-dir (plugconf.h). */
+    argv = plugconf_argv(&argc, argv);
     return steer_module_main(argc, argv, "hysteria2", STEER_VERSION);
 }

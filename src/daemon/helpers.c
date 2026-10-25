@@ -414,9 +414,13 @@ const char **helper_argv(const struct helper *h, const char *exe, const char *se
         /* Бинарник модуля — рядом с движком (steer_module_dir: каталог исполняемого файла или
          * STEER_MODULE_DIR стенда) и принимает те же слова, что подкоманда steerd: разбор у них
          * один (cli/modcmd.c). */
-        char dir[PATH_MAX];
-        steer_module_dir(dir, sizeof(dir));
-        snprintf(progbuf, pbn, "%s/%s", dir, h->prog);
+        /* Путь — у module.c: плагин протокола (каталог плагинов) или прежний модуль рядом. Нет ни
+         * того, ни другого — прежний путь рядом с движком: о «нет модуля» скажет супервизор. */
+        if (steer_module_path(h->prog, progbuf, pbn) != 0) {
+            char dir[PATH_MAX];
+            steer_module_dir(dir, sizeof(dir));
+            snprintf(progbuf, pbn, "%s/%s", dir, h->prog);
+        }
         av[n++] = progbuf;
     } else {
         av[n++] = exe;

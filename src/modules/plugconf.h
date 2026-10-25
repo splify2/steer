@@ -1,0 +1,17 @@
+/* Файл настройки выхода {conf} у программ протоколов (plugin-sdk/docs/steer-api.md, 1.4).
+ *
+ * Помощник плагина запускается по манифесту как `<prog> <cmd> {out} --conf {conf}`. Пока помощники
+ * протоколов читают спеку сами (раскладка 2.1 первого шага: разбор спеки вкомпилирован в плагин,
+ * build/sources.mk, PLUGIN_BASE_SRC), --conf переводится в прежние слова: `--spec` — путь спеки
+ * (`paths.spec`, если ядро его положило, иначе spec.yaml или spec.json в `paths.etc`) и `--state-dir`
+ * (`paths.state`). Остальной разбор команд не меняется (cli/modcmd.c). Когда помощник начнёт брать
+ * ключи выхода из самого {conf}, перевод уйдёт. */
+#ifndef STEER_PLUGCONF_H
+#define STEER_PLUGCONF_H
+
+/* Переписать argv: `--conf ФАЙЛ` → `--spec … [--state-dir …]`. Возвращает новый argv (в куче, живёт
+ * до конца процесса) и число слов в *argc; без --conf — прежний argv. Файл не читается или в нём нет
+ * paths.etc — отказ кодом 2 со словами (steer-api.md, 1.5). */
+char **plugconf_argv(int *argc, char **argv);
+
+#endif
