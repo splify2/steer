@@ -49,8 +49,6 @@ struct dial {
     struct sockaddr_storage res[DIAL_MAXADDR];  /* заново найденные адреса (bootstrap) */
     int res_n;
     long res_ttl;                       /* секунд */
-    int peer_i;                         /* к какому адресу подключились: индекс в res/cached */
-    int peer_from_res;
     struct sockaddr_storage addr[DIAL_MAXADDR];  /* DoQ: все адреса сервера по порядку выдачи */
     int addr_n;
 };
@@ -100,7 +98,6 @@ struct dconn {
     int qhs;                    /* on_handshake сработал */
     int qerej;                  /* on_early_rejected сработал: вопросы, ушедшие до рукопожатия, потеряны */
     int qclosed;                /* on_closed сработал: qc больше не пригоден, только qc_free */
-    int qreason;                /* QC_CLOSE_* */
     char qwhy[64];
     uint64_t qerr;              /* код приложения при нашем закрытии (DOQ_*) */
     int fd, st;

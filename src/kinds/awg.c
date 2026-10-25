@@ -720,8 +720,8 @@ static int nl_talk(int fd, void *msg, size_t len, nl_cb cb, void *ctx) {
     return rc;
 }
 
-/* Разбор атрибутов в [p, p+len): table[type] = атрибут. Тип без флагов (вложенность у 4.9
- * иногда без NLA_F_NESTED). */
+/* Разбор атрибутов в [p, p+len): table[type] = атрибут. Тип без флагов: NLA_F_NESTED ставят не
+ * все отвечающие. */
 static void attrs_parse(const void *p, size_t len, const struct nlattr **tb, int max) {
     for (int i = 0; i <= max; i++) tb[i] = NULL;
     const uint8_t *q = p, *end = q + len;

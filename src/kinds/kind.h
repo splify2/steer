@@ -246,17 +246,15 @@ int out_is_block(const struct output *o);
  * значения прежнего перечня видов. Читает его kind_of в spec.h. */
 #define KIND_ZERO (&kind_direct)
 
-/* ПРЕЖНИЕ ИМЕНА ВИДОВ — только для стендов (tests/specmatch.c, tests/failovermatch.c), которым
+/* ИМЕНА ВИДОВ ДЛЯ СТЕНДОВ — только для стендов (tests/specmatch.c, tests/failovermatch.c), которым
  * нужно собрать выход конкретного вида, не читая спеку: `g_spec.out[0].kind = OUT_XSTEER`.
  * Общий код вида не сравнивает — он спрашивает kind_of(o)->caps или конкретную функцию вида
- * (tgws_present, out_tgws и соседи ниже). Вне src/kinds и стендов эти имена ловит
+ * (out_tgws и соседи ниже). Вне src/kinds и стендов эти имена ловит
  * tests/buildmatch.sh. */
 #define OUT_DIRECT    (&kind_direct)
 #define OUT_INTERFACE (&kind_interface)
 #define OUT_VLESS     (&kind_vless)
 #define OUT_XSTEER    (&kind_xsteer)
-#define OUT_TGWS      (&kind_tgws)
-#define OUT_AWG       (&kind_awg)
 #define OUT_GROUP     (&kind_group)
 
 /* ---- вопросы к отдельным видам ------------------------------------------------------------
@@ -451,9 +449,5 @@ const struct xsteer_cfg *out_xsteer(const struct output *o);
 const struct tgws_cfg *out_tgws(const struct output *o);
 /* `steer tgws-instances`: что поднимать init-скрипту. Код — как у команды. */
 int tgws_instances(const struct spec *sp);
-/* Есть ли в спеке хоть один выход kind=tgws — нужно раскладке старого ядра (legacy.c): в ней
- * заводится своя таблица `ip`, только когда моста есть куда перехватывать. Тот же довод и та
- * же замена, что у zapret_present. */
-int tgws_present(const struct spec *sp);
 
 #endif

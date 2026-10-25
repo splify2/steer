@@ -86,13 +86,6 @@ int tgws_instances(const struct spec *sp) {
     return n ? 0 : 1;
 }
 
-/* Есть ли в спеке хоть один выход kind=tgws (kind.h). */
-int tgws_present(const struct spec *sp) {
-    for (size_t i = 0; i < sp->out_n; i++)
-        if (kind_of(&sp->out[i]) == &kind_tgws) return 1;
-    return 0;
-}
-
 /* ---- перехват Telegram у выходов kind=tgws ------------------------------------
  *
  * ПЕРЕХВАТ, А НЕ МАРШРУТ. Приложению ничего не настраивают: соединение с дата-центром
@@ -118,9 +111,7 @@ int tgws_present(const struct spec *sp) {
  * пришёл пакет, и обратный путь ядро собирает само. Исходный адрес назначения мост
  * узнаёт у ядра через SO_ORIGINAL_DST — из него же выводится номер дата-центра.
  *
- * Правило помечено как IPv4 (дата-центры Telegram — IPv4-адреса): в старой раскладке оно
- * уходит только в таблицу ip. Построитель (kind_ops.emit) — на один выход, цепочку заводит
- * первый вызов. */
+ * Построитель (kind_ops.emit) — на один выход, цепочку заводит первый вызов. */
 static void tgws_emit(struct nft_rs *rs, const struct spec *sp, const struct output *o) {
     (void)sp;
     struct nft_table *t = ir_table_find(rs, NFT_FAM_INET, NULL);
@@ -130,7 +121,6 @@ static void tgws_emit(struct nft_rs *rs, const struct spec *sp, const struct out
         ir_gap(c);
     }
     struct nft_rule *r = ir_rule(c);
-    ir_rule_fam(r, 4);
     ir_x(r, "meta mark and 0x%08x == 0x%08x", STEER_MARK_MASK, o->mark);
     ir_x(r, "tcp dport { 443, 80, 5222 }");
     ir_counter(r, 0, 0);

@@ -130,7 +130,7 @@ static int fakeip_table_has(const struct fakeip_table *t, const char *domain) {
 }
 
 /* State file format: one entry per line.
- *   domain\tfake_ip            (legacy / --fakeip CLI output)
+ *   domain\tfake_ip            (real backend unknown; also what --fakeip writes)
  *   domain\tfake_ip\treal_ip   (extended: real backend, for post-restart rehydrate)
  *   domain\tfake_ip\treal_ip\treal_ip6
  *   domain\tfake_ip\t-\treal_ip6
@@ -139,8 +139,7 @@ static int fakeip_table_has(const struct fakeip_table *t, const char *domain) {
  *                               он выводится из fake_ip, см. шапку файла)
  * Missing file -> empty table, not an error (first run). A malformed line is
  * skipped, not fatal — the domain simply gets re-allocated (a fresh index) on
- * the next match. The legacy 2-field form is parsed identically to before, so
- * an existing state file upgrades transparently. Испорченное четвёртое поле строку не
+ * the next match. Испорченное четвёртое поле строку не
  * отвергает: пропадает только настоящий IPv6, и первый AAAA спросит его заново. */
 void fakeip_state_load(const char *path) {
     FILE *f = fopen(path, "r");

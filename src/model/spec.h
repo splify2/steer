@@ -405,7 +405,7 @@ struct group_cfg {
      * по которой выбирает сторож (-1 — не измерен); lat4_ms, lat6_ms — замеры по IPv4 и IPv6,
      * когда группа мерилась по обоим (-2 — по семействам не мерили: lat_ms и есть замер IPv4). */
     int cur;
-    unsigned char *alive;               /* по байту на члена: 1 — жив (раньше маска в 32 бита) */
+    unsigned char *alive;               /* по байту на члена: 1 — жив */
     int sel;
     int *lat_ms;
     int *lat4_ms, *lat6_ms;
@@ -1174,7 +1174,7 @@ static inline int out_self_natting(const struct output *o) { return out_has_cap(
 /* Подмену IPv4 на устройстве выхода ставит само ядро (compile/generate.c, build_nat4; решение
  * владельца 2026-10-12 — одна зона steer_zone без masq): у туннеля с устройством, который адреса
  * клиентов сам не завершает. Проверки фаервола (fwcheck, diag, status) свою таблицу не читают и
- * спрашивают это условие. Раскладка 4.9 (legacy.c, телефон) цепочки не ставит — там зон fw4 нет. */
+ * спрашивают это условие. */
 static inline int out_nat4_by_steer(const struct output *o) {
     /* lo — не туннель: подмена адреса на петле роняет локальные пакеты (EPERM у sendto), а выход на lo
      * бывает у стендов и у схем, где «туннель» — локальный прокси (стенд tests/dnsgroups.sh). */

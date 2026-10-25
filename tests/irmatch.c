@@ -260,7 +260,6 @@ static void t_mixed_modern(void) {
     check("после трансляции адресов: dstnat + 1 = -99", -99, cprio(tg));
     r = ir_rule_find(tg, "steer:tgws:tg");
     check("правило моста есть", 1, r != NULL);
-    check("и помечено IPv4", 4, r ? r->fam : 0);
     check("nat-цепочек в inet четыре (tgws, dns, dnat, подмена IPv4 ядра у interface)", 4, nat_chains(t));
     struct nft_chain *n4 = ir_chain_find(t, "postrouting_nat4");
     check("postrouting_nat4: masquerade на устройстве выхода interface", 1,

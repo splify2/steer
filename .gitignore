@@ -6,7 +6,6 @@ build/steer
 build/steer-*
 build/steerd
 build/steerd-*
-build/libmbed-*.a
 # Разделяемая раскладка (шаг 4 выпуска 1.10): выход build/build-libs.sh по архитектурам, временные
 # объекты списков экспорта и хостовая сборка стенда tests/libs-test.sh.
 build/libs/
@@ -20,10 +19,6 @@ build/scripts/
 out/
 build/sing-box
 build/bench-*
-build/cstorm-*
-build/hget-*
-build/res-*
-build/tmo-*
 build/tun-gso-*
 build/gcm-size
 # Собранные стенды `make test`, которым Makefile велит лежать в build/. Один из них
@@ -128,6 +123,9 @@ build/platmatch
 build/ndk/
 build/ndk-*.log
 build/nftvmap-tool
+build/nftdump-tool
+build/rtnl-tool
+build/procscanmatch
 build/urltestmatch
 build/nftvmapmatch
 build/groupsmatch
@@ -136,7 +134,6 @@ build/groupsmatch
 # с d278b90).
 build/hub-*/
 build/obfs-*/
-build/uprobe-*
 build/xsconnmatch
 build/xslinkmatch
 # Стенды make test и ext-test, которых в списке не было (дерево после прогона оставалось грязным).

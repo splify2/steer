@@ -293,8 +293,7 @@ check "в src/model, src/compile и src/lib (кроме err.c) нет die()/exit
 # (src/kinds/group.c), а перевод v1 собирает её group_of_devices. Комментарии не в счёт.
 #
 # src/compile здесь наравне с остальным движком: построители видов (tgws) переехали в
-# kind_ops.emit (src/kinds), а has_tgws — в tgws_present там же;
-# генератор зовёт их через kind_emit_all, не зная имён видов.
+# kind_ops.emit (src/kinds); генератор зовёт их через kind_emit_all, не зная имён видов.
 kindbad=""
 for f in $(find src -name '*.c' -o -name '*.h' | sort); do
     case "$f" in src/kinds/*) continue ;; esac
@@ -973,19 +972,18 @@ check "src/proto/obfs/obfs.c: SYN с голым MSS не осталось" "0" "
 # --platform переопределяет выбор для стендов. #ifdef STEER_ANDROID в общем коде нет.» До этого
 # шага развилка по STEER_ANDROID стояла в двух десятках файлов, и третья платформа превратила бы
 # каждую в развилку на три ветки. Теперь общий код спрашивает признак у plat(), а умолчание
-# выбора задаёт ключ -DSTEER_DEFAULT_PLATFORM (Makefile, Android.bp). Условная компиляция по
-# STEER_ANDROID — в любом виде (#ifdef, #ifndef, defined(…)) — законна разве что в src/platform.
+# выбора задаёт ключ -DSTEER_DEFAULT_PLATFORM (Makefile, Android.bp). Условной компиляции по
+# STEER_ANDROID — в любом виде (#ifdef, #ifndef, defined(…)) — нет нигде в src.
 # Комментарии не в счёт — тот же приём, что у правил 5 и 6.
 platbad=""
-for f in $(find src \( -name '*.c' -o -name '*.h' \) ! -path 'src/platform/*'); do
+for f in $(find src \( -name '*.c' -o -name '*.h' \)); do
     n=$(grep -vE '^[[:space:]]*(\*|//|/\*)' "$f" | \
         grep -cE '^[[:space:]]*#[[:space:]]*(if|ifdef|ifndef|elif)\>.*\<STEER_ANDROID\>')
     [ -n "$n" ] || n=0
     [ "$n" -gt 0 ] && platbad="$platbad$f:$n "
 done
-check "в src нет условной компиляции по STEER_ANDROID вне src/platform (правило 2)" "" "$platbad"
-# Сборки задают платформу умолчанием, а не старым ключом, который больше никто не читает (и на
-# который src/platform/platform.c отвечает #error).
+check "в src нет условной компиляции по STEER_ANDROID (правило 2)" "" "$platbad"
+# Сборки задают платформу умолчанием, а не старым ключом, который больше никто не читает.
 # Два места: общие флаги движка (steer_defaults) и клиент — пути по умолчанию у него те же.
 check "Android.bp: умолчание платформы — телефон" "2" \
     "$(grep -c '"-DSTEER_DEFAULT_PLATFORM=android"' Android.bp)"
