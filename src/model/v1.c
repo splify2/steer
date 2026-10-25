@@ -454,8 +454,8 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
         /* Группы (kind: group) в реестре нет — спека v1 её не знает, и `"kind": "group"` здесь
          * остаётся неизвестным видом, как было (см. kind.h). */
         if (!strcmp(kind, "zapret"))
-            return err_set(e, "outputs.%s: kind zapret убран из ядра steer: обход DPI даёт модуль recheck "
-                       "(kind: recheck), а без обхода выход заменяет kind: direct", o.name);
+            return err_set(e, "outputs.%s: kind zapret убран из ядра steer: обход DPI — отдельный модуль "
+                       "recheck, без обхода выход заменяет kind: direct", o.name);
         const struct kind_ops *kd = kind_by_name(kind);
         if (!kd) return err_set(e, "outputs.%s: неизвестный kind "
                    "(нужен direct, interface, vless, xsteer, tgws или awg)", o.name);

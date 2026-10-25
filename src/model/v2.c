@@ -752,7 +752,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         kd = &kind_warpm;
     } else {
         if (!strcmp(kname, "zapret"))
-            return fail(x, kn, "%s: kind zapret убран из ядра steer: обход DPI даёт модуль recheck (kind: recheck), а без обхода выход заменяет kind: direct", where);
+            return fail(x, kn, "%s: kind zapret убран из ядра steer: обход DPI — отдельный модуль recheck, без обхода выход заменяет kind: direct", where);
         kd = kind_by_name_v2(kname);
         if (!kd)
             return fail(x, kn, "%s: неизвестный kind «%s» (есть direct, block, interface, tunnel, xsteer, "

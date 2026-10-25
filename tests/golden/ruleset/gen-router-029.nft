@@ -1,4 +1,4 @@
 # args: apply --dry-run --spec TMP/zap.json --state-dir TMP/state-z
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: outputs.yt: kind zapret убран из ядра steer: обход DPI даёт модуль recheck (kind: recheck), а без обхода выход заменяет kind: direct
+# stderr: steer: outputs.yt: kind zapret убран из ядра steer: обход DPI — отдельный модуль recheck, без обхода выход заменяет kind: direct
