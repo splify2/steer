@@ -500,6 +500,8 @@ static int v6_announced(const struct output *o, const struct v6pfx *p) {
 }
 
 static void diag_v6_host(const struct spec *sp, const struct groups *gr) {
+    int want6 = 0;
+    for (size_t i = 0; i < sp->rule_n && !want6; i++) want6 = sp->rule[i].family == 6;
     char what[200], why[400];
     int ra_said = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
@@ -608,8 +610,10 @@ static void diag_v6_host(const struct spec *sp, const struct groups *gr) {
                 continue;
             }
             /* У LAN только ULA: маршрут по умолчанию в RA odhcpd объявляет без глобального префикса,
-             * только если ra_default у секции dhcp этой сети не 0. */
-            if (l.ula && !l.gua && have_uci && lname[0] && !ra_said) {
+             * только если ra_default у секции dhcp этой сети не 0. Говорится лишь при правиле
+             * «только IPv6»: без него IPv6 клиентам не нужен, и у кого IPv6 в интернет не работает,
+             * предупреждение висело бы всегда. */
+            if (l.ula && !l.gua && have_uci && lname[0] && !ra_said && want6) {
                 ra_said = 1;            /* это про LAN, а не про выход: один раз на отчёт */
                 char rd[16] = "", sec[64] = "";
                 int r = uci_find("dhcp", "dhcp", "interface", lname, "ra_default", rd, sizeof(rd),
