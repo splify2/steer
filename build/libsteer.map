@@ -22,6 +22,7 @@ LIBSTEER_1 {
     cli_unknown;
     cli_usage_short;
     cli_version;
+    cli_version_json;
     cli_wants_help;
     cmd_dev_id;
     cmd_sub_hwid;
@@ -123,14 +124,16 @@ LIBSTEER_1 {
     kind_direct;
     kind_emit_all;
     kind_helper_free;
+    kind_plugin_device;
     kind_sig_mix;
-    kind_warpm;
+    kind_unavail;
     l4_box_text;
     l4_from_text;
     l4_union_alloc;
     l4match_same;
     l4_to_text;
     load_spec;
+    load_spec_mode;
     nfd_chain_exists;
     nfd_chain_rules;
     nfd_ruleset_text;
@@ -178,6 +181,12 @@ LIBSTEER_1 {
     plat_select;
     plat_spec_default;
     plat_spec_resolve;
+    plugin_at;
+    plugin_cmd_exec;
+    plugin_cmd_find;
+    plugin_n;
+    plugin_nft_map;
+    plugin_refresh;
     pool_race_first;
     pool_run;
     probe_clear;
@@ -285,6 +294,8 @@ LIBSTEER_1 {
     spec_line_family;
     spec_line_is_addr;
     spec_list_all;
+    spec_prepare;
+    spec_prepare_report;
     spec_print_v2;
     spec_print_v2_json;
     srs_clause;

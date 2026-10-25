@@ -222,6 +222,8 @@ while read -r n p; do
 done < "$tmp/real.txt"
 check "nft-map: приоритеты цепочек ядра совпадают с набором правил" "" "$miss"
 
+has "version --json: версия steer-api, по которой плагины сверяют compat" "$("$BIN" version --json 2>&1)" '"api":"1.0","abi":"1.0"'
+
 # ================= 5. подкоманда из манифеста ===========================================================
 check "подкоманда плагина исполняется" "hello from plugin: hello a b" "$("$BIN" fake-hello a b 2>&1)"
 has "справка называет подкоманду плагина" "$("$BIN" help 2>&1)" "fake-hello"
@@ -271,7 +273,7 @@ cat > "$ROOT/clash/plugin.json" <<'EOF'
   "steer": { "commands": [{ "name": "apply", "prog": "bin/x" }, { "name": "fake-hello", "prog": "bin/x" }] } }
 EOF
 st="$(stat ok)"
-has "несовместимый steer-api: плагин выключен с числами" "$st" 'плагин 1.0.0 требует steer-api ^2.0, у ядра 1.0'
+has "несовместимый steer-api: плагин выключен с числами" "$st" 'oldapi 1.0.0 требует steer-api ^2.0, у ядра 1.0'
 has "имя команды ядра плагину не даётся" "$st" 'подкоманда apply — команда ядра'
 check "  команда ядра осталась ядру" "table" "$("$BIN" apply --dry-run --spec "$tmp/ok.yaml" 2>&1 | head -1 | cut -d' ' -f1)"
 rm -rf "$ROOT/oldapi" "$ROOT/clash"

@@ -866,6 +866,14 @@ void cli_usage_short(FILE *out) {
           "список команд: steer help\n", out);
 }
 
+/* `steer version --json`: версии для менеджера плагинов и интерфейса — ядро, steer-api (протокол
+ * программ плагина, steer-api.md), steer-abi (`.so` в процессе steerd: 1.0, steer-abi.md), ревизия и
+ * вариант сборки. Теги compat плагина сверяются с api и abi отсюда. */
+void cli_version_json(FILE *out) {
+    fprintf(out, "{\"core\":\"%s\",\"api\":\"%s\",\"abi\":\"1.0\",\"rev\":\"%s\",\"build\":\"%s\"}\n", STEER_VERSION,
+            STEER_API_VERSION, STEER_REV, prof()->build);
+}
+
 void cli_version(FILE *out) {
     fprintf(out, "steer %s (%s, ревизия %s)\n", STEER_VERSION, prof()->build, STEER_REV);
 }

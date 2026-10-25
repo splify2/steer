@@ -88,6 +88,7 @@ struct plugin {
     struct plugin_prog pre_apply;       /* prog NULL — хука нет */
     int has_hooks;              /* есть check, expand, pre_apply или ресурсы видов: от них зависит подготовка спеки */
     unsigned res_ports, res_queues, res_marks;   /* resources манифеста: сколько на весь плагин */
+    char **kind_names;  size_t kind_names_n;    /* имена видов манифеста — и у выключенного плагина: для отказа «плагин X отключён» */
     char **requires;  size_t requires_n;    /* requires.plugins: id плагинов, раньше которых идут хуки */
     char **nft;  size_t nft_n;  /* steer.nft[]: файлы плагина с наборами и цепочками слотов */
     struct pnft **nftp;
@@ -153,6 +154,18 @@ int plugin_emit_all(struct nft_rs *rs, const struct spec *sp, struct err *e);
 /* `steer nft-map`: карта ядра для плагинов — таблица, базовые цепочки с хуком и приоритетом числом,
  * поле метки, слоты. json — JSON, иначе текст для человека. */
 void plugin_nft_map(FILE *out, int json);
+
+/* Вид, чей помощник ведёт выход: вид самого выхода или — у развёрнутой группы — вид плагина с
+ * разворотом и помощником. NULL — помощника у выхода нет. */
+const struct plugin_kind *plugin_helper_kind(const struct output *o);
+/* Содержимое файла настройки выхода {conf} (steer-api.md, 1.4) — JSON в куче. */
+char *plugin_conf_json(const struct spec *sp, const struct output *o, const struct plugin_kind *pk);
+/* Записать {conf} выхода атомарно (0600) в <state>/plugin/<id>/<выход>.json до запуска помощника.
+ * 0 / -1 (причина — errno). */
+int plugin_conf_write(const struct spec *sp, const struct output *o);
+/* Перечитать реестр плагинов, если каталог плагинов или state.json изменились с прошлого чтения
+ * (1 — перечитан). Зовёт загрузка спеки в демоне, чтобы смена плагинов подхватывалась на reload. */
+int plugin_refresh(void);
 
 /* Помощник развёрнутого выхода (хук expand вернул helper: true): kind_ops.helper группы зовёт его. */
 int plugin_owner_helper(const struct spec *sp, const struct output *o, struct kind_helper *h);

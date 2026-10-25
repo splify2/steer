@@ -113,6 +113,7 @@ const struct cli_cmd *cli_lookup(const char *name);
 void cli_help(FILE *out, const struct cli_cmd *cmd);
 void cli_usage_short(FILE *out);
 void cli_version(FILE *out);
+void cli_version_json(FILE *out);
 
 /* Есть ли среди аргументов просьба о справке. Проверяется до разбора: у `fit` и `dnsd`
  * свои парсеры, и --help должен работать одинаково во всех командах. */

@@ -385,7 +385,7 @@ static int group_helper(const struct spec *sp, const struct output *o, struct ki
 
 /* ---- plugin-device: общий вид «устройство держит процесс владельца» ---------------------------
  *
- * Прежний warp-masque: член WARP с TUN модуля steer-warpbox (поток туннеля MASQUE, src/proto/warp/
+ * Прежнее имя — warp-masque: член WARP с TUN модуля steer-warpbox (поток туннеля MASQUE, src/proto/warp/
  * wbmq.c). Теперь вид общий (spec-fields.md, раздел 3): устройство создаёт и держит процесс плагина,
  * который завёл выход (owner), как у xsteer; маршрут, метку, таблицу и подмену адресов ведёт ядро,
  * как у любого выхода с устройством. Своих ключей у вида нет, руками в спеке он не пишется:

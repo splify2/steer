@@ -100,4 +100,52 @@ static inline int vec_add(char ***v, size_t *n, const char *s) {
 }
 
 
+/* ---- файлы ---- */
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+/* Каталог со всеми родителями (0755). Путь длиннее PATH_MAX — отказ ENAMETOOLONG: ядро такого не откроет. */
+static inline int pu_mkdir_p(const char *path) {
+    char tmp[PATH_MAX];
+    size_t l = strlen(path);
+    if (!l || l >= sizeof(tmp)) { errno = ENAMETOOLONG; return -1; }
+    memcpy(tmp, path, l + 1);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+        *p = '/';
+    }
+    return mkdir(tmp, 0755) != 0 && errno != EEXIST ? -1 : 0;
+}
+
+/* Файл целиком, атомарно: временный рядом и rename. */
+static inline int pu_write_atomic(const char *path, const char *data, size_t n, mode_t mode) {
+    char tmp[PATH_MAX + 32];
+    size_t pl = strlen(path);
+    if (pl >= PATH_MAX) { errno = ENAMETOOLONG; return -1; }
+    memcpy(tmp, path, pl);
+    snprintf(tmp + pl, sizeof(tmp) - pl, ".tmp.%d", (int)getpid());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) return -1;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, data + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            unlink(tmp);
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    if (close(fd) != 0) { unlink(tmp); return -1; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
 #endif

@@ -174,7 +174,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(cmd, "version") || !strcmp(cmd, "--version") || !strcmp(cmd, "-V")) {
-        cli_version(stdout);
+        if (argc > 2 && !strcmp(argv[2], "--json")) cli_version_json(stdout);
+        else cli_version(stdout);
         return 0;
     }
     /* Флаг вместо команды. Отдельная строка, потому что «нет такой команды: --spec»

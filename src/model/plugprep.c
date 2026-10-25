@@ -50,6 +50,7 @@
 #include "plugutil.h"
 #include "ynode.h"
 #include "v2.h"
+#include "plugalloc.h"
 
 extern void steer_sha256(const unsigned char *in, size_t n, unsigned char out[32]) __attribute__((weak));
 
@@ -60,40 +61,6 @@ static int sha_hex(const void *d, size_t n, char hex[65]) {
     if (!steer_sha256) return -1;
     steer_sha256(d, n, h);
     for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", h[i]);
-    return 0;
-}
-
-static int mkdir_p(const char *path) {
-    char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p != '/') continue;
-        *p = '\0';
-        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
-        *p = '/';
-    }
-    return mkdir(tmp, 0755) != 0 && errno != EEXIST ? -1 : 0;
-}
-
-/* Файл целиком, атомарно: временный рядом и rename. */
-static int write_atomic(const char *path, const char *data, size_t n) {
-    char tmp[PATH_MAX + 16];
-    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
-    size_t off = 0;
-    while (off < n) {
-        ssize_t w = write(fd, data + off, n - off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            close(fd);
-            unlink(tmp);
-            return -1;
-        }
-        off += (size_t)w;
-    }
-    if (close(fd) != 0) { unlink(tmp); return -1; }
-    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
     return 0;
 }
 
@@ -168,6 +135,20 @@ int spec_prepare_report(const char *path, char **json) {
     prepared_path(pp, sizeof(pp), key, ".report.json");
     *json = slurp(pp, NULL);
     return *json ? 0 : -1;
+}
+
+/* {conf} выхода — перед запуском его помощника (steer-api.md, 1.4). */
+int plugin_conf_write(const struct spec *sp, const struct output *o) {
+    const struct plugin_kind *pk = plugin_helper_kind(o);
+    if (!pk) return -1;
+    char *json = plugin_conf_json(sp, o, pk);
+    if (!json) return -1;
+    char dir[PATH_MAX], path[PATH_MAX + 64];
+    snprintf(dir, sizeof(dir), "%s/plugin/%s", steer_state_dir(), pk->owner->id);
+    snprintf(path, sizeof(path), "%s/%s.json", dir, o->name);
+    int rc = pu_mkdir_p(dir) == 0 ? pu_write_atomic(path, json, strlen(json), 0600) : -1;
+    free(json);
+    return rc;
 }
 
 /* ---- запуск программы хука ------------------------------------------------------------------ */
@@ -325,7 +306,7 @@ static int hook_run(const struct plugin *pl, const struct plugin_prog *p, const 
         if (have_key) {
             char sub[PATH_MAX + 16];
             snprintf(sub, sizeof(sub), "%s/%s", cdir, pl->id);
-            if (mkdir_p(sub) == 0) write_atomic(cfile, *stdout_txt, strlen(*stdout_txt));
+            if (pu_mkdir_p(sub) == 0) pu_write_atomic(cfile, *stdout_txt, strlen(*stdout_txt), 0644);
         }
         hrun_free(&r);
         return 0;
@@ -348,314 +329,6 @@ static int hook_run(const struct plugin *pl, const struct plugin_prog *p, const 
     }
     hrun_free(&r);
     return err_set(e, "%s", m);
-}
-
-/* ---- ресурсы: alloc.json ---------------------------------------------------------------------- */
-
-/* Выданные номера хранятся в <данные менеджера>/alloc.json:
- *   {"schema":1,"outputs":{"<плагин>/<выход>":{"ports":[…],"queues":[…]}}}
- * и постоянны между перезагрузками и обновлениями плагина (steer-api.md, 6). */
-struct al_ent { char *owner; uint32_t *ports; size_t pn; uint32_t *queues; size_t qn; uint32_t *bits; size_t bn; };
-struct al { struct al_ent *e; size_t n; };
-
-static void al_free(struct al *a) {
-    for (size_t i = 0; i < a->n; i++) { free(a->e[i].owner); free(a->e[i].ports); free(a->e[i].queues); free(a->e[i].bits); }
-    free(a->e);
-    memset(a, 0, sizeof(*a));
-}
-
-static void alloc_path(char *buf, size_t n) {
-    char etc[PATH_MAX];
-    plugin_etc(etc, sizeof(etc));
-    snprintf(buf, n, "%s/alloc.json", etc);
-}
-
-static int al_nums(const struct ynode *l, uint32_t **dst, size_t *n, long lo) {
-    *dst = NULL;
-    *n = 0;
-    for (size_t i = 0; l && l->kind == YN_SEQ && i < l->len; i++) {
-        long v;
-        if (ynode_long(ynode_at(l, i), &v) != 0 || v < lo || v > 65535) continue;
-        uint32_t *nd = realloc(*dst, (*n + 1) * sizeof(uint32_t));
-        if (!nd) return -1;
-        *dst = nd;
-        (*dst)[(*n)++] = (uint32_t)v;
-    }
-    return 0;
-}
-
-static int al_load(struct al *a) {
-    memset(a, 0, sizeof(*a));
-    char p[PATH_MAX + 16];
-    alloc_path(p, sizeof(p));
-    size_t n;
-    char *t = slurp(p, &n);
-    if (!t) return 0;
-    struct err e;
-    memset(&e, 0, sizeof(e));
-    struct ydoc *d = ydoc_parse_buf(t, n, p, &e);
-    free(t);
-    if (!d) return 0;
-    const struct ynode *o = ynode_get(ydoc_root(d), "outputs");
-    for (size_t i = 0; o && o->kind == YN_MAP && i < ynode_len(o); i++) {
-        struct al_ent *ne = realloc(a->e, (a->n + 1) * sizeof(*ne));
-        if (!ne) { ydoc_free(d); al_free(a); return -1; }
-        a->e = ne;
-        struct al_ent *en = &a->e[a->n];
-        memset(en, 0, sizeof(*en));
-        en->owner = strdup(ynode_key_at(o, i)->str);
-        const struct ynode *v = ynode_val_at(o, i);
-        if (!en->owner || al_nums(ynode_get(v, "ports"), &en->ports, &en->pn, 1) != 0 ||
-            al_nums(ynode_get(v, "queues"), &en->queues, &en->qn, 1) != 0 ||
-            al_nums(ynode_get(v, "mark_bits"), &en->bits, &en->bn, 0) != 0) {
-            ydoc_free(d);
-            a->n++;
-            al_free(a);
-            return -1;
-        }
-        a->n++;
-    }
-    ydoc_free(d);
-    return 0;
-}
-
-static int al_save(const struct al *a) {
-    struct sbuf b = { 0 };
-    sb_str(&b, "{\"schema\":1,\"outputs\":{");
-    for (size_t i = 0; i < a->n; i++) {
-        sb_printf(&b, "%s", i ? ",\n" : "\n");
-        sb_json(&b, a->e[i].owner);
-        sb_str(&b, ":{\"ports\":[");
-        for (size_t k = 0; k < a->e[i].pn; k++) sb_printf(&b, "%s%u", k ? "," : "", a->e[i].ports[k]);
-        sb_str(&b, "],\"queues\":[");
-        for (size_t k = 0; k < a->e[i].qn; k++) sb_printf(&b, "%s%u", k ? "," : "", a->e[i].queues[k]);
-        sb_str(&b, "]");
-        if (a->e[i].bn) {
-            sb_str(&b, ",\"mark_bits\":[");
-            for (size_t k = 0; k < a->e[i].bn; k++) sb_printf(&b, "%s%u", k ? "," : "", a->e[i].bits[k]);
-            sb_str(&b, "]");
-        }
-        sb_str(&b, "}");
-    }
-    sb_str(&b, "\n}}\n");
-    int rc = -1;
-    if (!b.oom && b.p) {
-        char p[PATH_MAX + 16], etc[PATH_MAX];
-        plugin_etc(etc, sizeof(etc));
-        mkdir_p(etc);
-        alloc_path(p, sizeof(p));
-        rc = write_atomic(p, b.p, b.n);
-    }
-    free(b.p);
-    return rc;
-}
-
-static struct al_ent *al_find(struct al *a, const char *owner) {
-    for (size_t i = 0; i < a->n; i++) if (!strcmp(a->e[i].owner, owner)) return &a->e[i];
-    return NULL;
-}
-
-/* Порты и очереди, занятые у ядра: сокеты /proc/net/{tcp,udp}{,6}. */
-static void sockets_used(unsigned char *used /* 65536 */) {
-    static const char *const F[] = { "/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6", NULL };
-    for (size_t i = 0; F[i]; i++) {
-        FILE *f = fopen(F[i], "r");
-        if (!f) continue;
-        char line[512];
-        if (!fgets(line, sizeof(line), f)) { fclose(f); continue; }
-        while (fgets(line, sizeof(line), f)) {
-            const char *c = strchr(line, ':');          /* «  0: 0100007F:1F90 …»: после номера записи */
-            if (!c) continue;
-            c = strchr(c + 1, ':');                     /* порт — после двоеточия адреса */
-            if (!c) continue;
-            unsigned long p = strtoul(c + 1, NULL, 16);
-            if (p < 65536) used[p] = 1;
-        }
-        fclose(f);
-    }
-}
-
-#define PORT_FIRST  10480
-#define QUEUE_FIRST 4300
-
-/* Выдать выходу owner n портов и m очередей (сколько уже есть — остаётся). 0 — готово; -1 — отказ,
- * называющий число свободных и занятых (steer-api.md, 6: «ресурс кончается только вместе с номерами»). */
-static int al_ensure(struct al *a, const char *owner, size_t n, size_t m, int *changed, struct err *e) {
-    struct al_ent *en = al_find(a, owner);
-    if (!en) {
-        struct al_ent *ne = realloc(a->e, (a->n + 1) * sizeof(*ne));
-        if (!ne) return err_set(e, "%s", "недостаточно памяти для выдачи ресурсов");
-        a->e = ne;
-        en = &a->e[a->n++];
-        memset(en, 0, sizeof(*en));
-        en->owner = strdup(owner);
-        if (!en->owner) return err_set(e, "%s", "недостаточно памяти для выдачи ресурсов");
-        *changed = 1;
-    }
-    unsigned char *used = NULL;
-    while (en->pn < n) {
-        if (!used) {
-            used = calloc(65536, 1);
-            if (!used) return err_set(e, "%s", "недостаточно памяти для выдачи ресурсов");
-            sockets_used(used);
-            for (size_t i = 0; i < a->n; i++)
-                for (size_t k = 0; k < a->e[i].pn; k++) used[a->e[i].ports[k]] = 1;
-        }
-        unsigned p = PORT_FIRST;
-        while (p < 65536 && used[p]) p++;
-        if (p >= 65536) {
-            size_t taken = 0;
-            for (size_t i = 0; i < a->n; i++) taken += a->e[i].pn;
-            free(used);
-            char msg[300];
-            snprintf(msg, sizeof(msg), "порты: свободных нет — от %d до 65535 занято сокетами и выдано %zu "
-                     "портов выходам плагинов", PORT_FIRST, taken);
-            return err_set(e, "%s", msg);
-        }
-        uint32_t *np = realloc(en->ports, (en->pn + 1) * sizeof(uint32_t));
-        if (!np) { free(used); return err_set(e, "%s", "недостаточно памяти для выдачи ресурсов"); }
-        en->ports = np;
-        en->ports[en->pn++] = p;
-        used[p] = 1;
-        *changed = 1;
-    }
-    free(used);
-    while (en->qn < m) {
-        unsigned q = QUEUE_FIRST;
-        for (;;) {
-            int busy = 0;
-            for (size_t i = 0; i < a->n && !busy; i++)
-                for (size_t k = 0; k < a->e[i].qn; k++) if (a->e[i].queues[k] == q) busy = 1;
-            if (!busy) break;
-            q++;
-        }
-        if (q > 65535) return err_set(e, "%s", "очереди NFQUEUE: свободных нет — выдано всё от 4300 до 65535");
-        uint32_t *nq = realloc(en->queues, (en->qn + 1) * sizeof(uint32_t));
-        if (!nq) return err_set(e, "%s", "недостаточно памяти для выдачи ресурсов");
-        en->queues = nq;
-        en->queues[en->qn++] = q;
-        *changed = 1;
-    }
-    return 0;
-}
-
-/* Биты метки, которые плагину нельзя отдавать: поле метки steer, бит 28 мини-сборки tgws, 29 и 30 —
- * zapret (DESYNC и пропуск), 16–23 — Tailscale и pbr, 8–13 — mwan3 (marks.h; steer-api.md, 6). */
-static uint32_t bits_excluded(void) {
-    return plat()->mark_mask | (1u << 28) | 0x60000000u | 0x00ff0000u | 0x00003f00u;
-}
-
-/* «29–31 у recheck, 0–7 у foo» — кто какие биты держит: для отказа «свободных нет». */
-static void bits_holders(const struct al *a, struct sbuf *b) {
-    size_t put = 0;
-    for (size_t i = 0; i < a->n; i++) {
-        if (!a->e[i].bn) continue;
-        uint32_t m = 0;
-        for (size_t k = 0; k < a->e[i].bn; k++) m |= 1u << a->e[i].bits[k];
-        for (int lo = 0; lo < 32; lo++) {
-            if (!(m >> lo & 1u)) continue;
-            int hi = lo;
-            while (hi + 1 < 32 && (m >> (hi + 1) & 1u)) hi++;
-            if (put++) sb_str(b, ", ");
-            if (hi > lo) sb_printf(b, "%d–%d", lo, hi); else sb_printf(b, "%d", lo);
-            sb_printf(b, " у %s", a->e[i].owner);
-            lo = hi;
-        }
-    }
-}
-
-/* Выдать плагину запрошенное (resources манифеста): порты, очереди, биты метки. Ключ — «plugin:<id>». */
-static int al_ensure_plugin(struct al *a, const struct plugin *pl, int *changed, struct err *e) {
-    char owner[200];
-    snprintf(owner, sizeof(owner), "plugin:%s", pl->id);
-    if (al_ensure(a, owner, pl->res_ports, pl->res_queues, changed, e) != 0) return -1;
-    struct al_ent *en = al_find(a, owner);
-    while (en->bn < pl->res_marks) {
-        uint32_t held = bits_excluded();
-        for (size_t i = 0; i < a->n; i++)
-            for (size_t k = 0; k < a->e[i].bn; k++) held |= 1u << a->e[i].bits[k];
-        int bit = 31;
-        while (bit >= 0 && (held >> bit & 1u)) bit--;
-        if (bit < 0) {
-            struct sbuf b = { 0 };
-            bits_holders(a, &b);
-            char m[600];
-            snprintf(m, sizeof(m), "бит метки: свободных нет — %s", b.p ? b.p : "все заняты соседями и полем метки steer");
-            free(b.p);
-            return err_set(e, "%s", m);
-        }
-        uint32_t *nb = realloc(en->bits, (en->bn + 1) * sizeof(uint32_t));
-        if (!nb) return err_set(e, "%s", "недостаточно памяти для выдачи ресурсов");
-        en->bits = nb;
-        en->bits[en->bn++] = (uint32_t)bit;
-        *changed = 1;
-    }
-    return 0;
-}
-
-/* Ресурсы плагина для подстановок ({mark}, {queue0}, {port0}): один разбор alloc.json на файл
- * (по размеру и времени), а не на каждое слово argv и правило nft. */
-static struct al g_res_cache;
-static struct timespec g_res_mtime;
-static off_t g_res_size = -1;
-static int g_res_have;
-
-int plugin_res_get(const struct plugin *pl, struct plugin_res *r) {
-    memset(r, 0, sizeof(*r));
-    char p[PATH_MAX + 16];
-    alloc_path(p, sizeof(p));
-    struct stat st;
-    if (stat(p, &st) != 0) { if (g_res_have) al_free(&g_res_cache); g_res_have = 0; g_res_size = -1; return -1; }
-    if (!g_res_have || st.st_size != g_res_size || st.st_mtim.tv_sec != g_res_mtime.tv_sec ||
-        st.st_mtim.tv_nsec != g_res_mtime.tv_nsec) {
-        if (g_res_have) al_free(&g_res_cache);
-        g_res_have = al_load(&g_res_cache) == 0;
-        g_res_size = st.st_size;
-        g_res_mtime = st.st_mtim;
-        if (!g_res_have) return -1;
-    }
-    char owner[200];
-    snprintf(owner, sizeof(owner), "plugin:%s", pl->id);
-    const struct al_ent *en = al_find(&g_res_cache, owner);
-    if (!en || en->pn < pl->res_ports || en->qn < pl->res_queues || en->bn < pl->res_marks) return -1;
-    r->ports = en->pn ? malloc(en->pn * sizeof(uint32_t)) : NULL;
-    r->queues = en->qn ? malloc(en->qn * sizeof(uint32_t)) : NULL;
-    r->bits = en->bn ? malloc(en->bn * sizeof(uint32_t)) : NULL;
-    if ((en->pn && !r->ports) || (en->qn && !r->queues) || (en->bn && !r->bits)) { plugin_res_free(r); return -1; }
-    if (en->pn) memcpy(r->ports, en->ports, en->pn * sizeof(uint32_t));
-    if (en->qn) memcpy(r->queues, en->queues, en->qn * sizeof(uint32_t));
-    if (en->bn) memcpy(r->bits, en->bits, en->bn * sizeof(uint32_t));
-    r->ports_n = en->pn; r->queues_n = en->qn; r->bits_n = en->bn;
-    return 0;
-}
-
-void plugin_res_free(struct plugin_res *r) {
-    free(r->ports); free(r->queues); free(r->bits);
-    memset(r, 0, sizeof(*r));
-}
-
-int plugin_alloc_lookup(struct spec *sp, const struct plugin_kind *pk, const char *out,
-                        uint32_t **ports, size_t *pn, uint32_t **queues, size_t *qn) {
-    *ports = *queues = NULL;
-    *pn = *qn = 0;
-    if (!pk->res_ports && !pk->res_queues) return 0;
-    struct al a;
-    if (al_load(&a) != 0) return -1;
-    char owner[200];
-    snprintf(owner, sizeof(owner), "%s/%s", pk->owner->id, out);
-    const struct al_ent *en = al_find(&a, owner);
-    int rc = -1;
-    if (en && en->pn >= pk->res_ports && en->qn >= pk->res_queues) {
-        if (en->pn) *ports = spec_memdup(sp, en->ports, en->pn * sizeof(uint32_t));
-        if (en->qn) *queues = spec_memdup(sp, en->queues, en->qn * sizeof(uint32_t));
-        if ((!en->pn || *ports) && (!en->qn || *queues)) {
-            *pn = en->pn;
-            *qn = en->qn;
-            rc = 0;
-        }
-    }
-    al_free(&a);
-    return rc;
 }
 
 /* ---- подготовка ---------------------------------------------------------------------------- */
@@ -738,7 +411,7 @@ struct prep {
     size_t out_put;             /* сколько членов уже записано */
     const char **names;         /* имена выходов спеки человека — вход хуков */
     size_t names_n;
-    struct al al;
+    struct pal al;
     int al_changed;
     /* Выходы, заведённые хуками: имя → плагин и из какого выхода — для сообщений об ошибках. */
     struct { char *name, *plugin, *from; } *made;
@@ -748,7 +421,7 @@ struct prep {
 static void prep_free(struct prep *p) {
     free(p->members.p); free(p->rep_expand.p); free(p->rep_warn.p); free(p->rep_pre.p);
     free(p->names);
-    al_free(&p->al);
+    pal_free(&p->al);
     for (size_t i = 0; i < p->made_n; i++) { free(p->made[i].name); free(p->made[i].plugin); free(p->made[i].from); }
     free(p->made);
 }
@@ -874,7 +547,7 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
     if (pk->res_ports || pk->res_queues) {
         char owner[200];
         snprintf(owner, sizeof(owner), "%s/%s", pl->id, name);
-        if (al_ensure(&p->al, owner, pk->res_ports, pk->res_queues, &p->al_changed, e) != 0) { free(kjson); return -1; }
+        if (pal_ensure(&p->al, owner, pk->res_ports, pk->res_queues, &p->al_changed, e) != 0) { free(kjson); return -1; }
     }
     if (!pk->expand.prog) {
         free(kjson);
@@ -1230,11 +903,11 @@ int spec_prepare(const char *path, struct err *e) {
             }
         }
     }
-    if (al_load(&p.al) != 0) { err_set(e, "%s", "недостаточно памяти для подготовки"); goto done; }
+    if (pal_load(&p.al) != 0) { err_set(e, "%s", "недостаточно памяти для подготовки"); goto done; }
     for (size_t i = 0; i < plugin_n(); i++) {
         const struct plugin *pl = plugin_at(i);
         if (pl->enabled && (pl->res_ports || pl->res_queues || pl->res_marks) &&
-            al_ensure_plugin(&p.al, pl, &p.al_changed, e) != 0)
+            pal_ensure_plugin(&p.al, pl, &p.al_changed, e) != 0)
             goto done;
     }
     for (size_t i = 0; outs && outs->kind == YN_MAP && i < ynode_len(outs); i++)
@@ -1313,7 +986,7 @@ int spec_prepare(const char *path, struct err *e) {
         char cdir[PATH_MAX], pdir[PATH_MAX + 16];
         cache_dir(cdir, sizeof(cdir));
         snprintf(pdir, sizeof(pdir), "%s/prepared", cdir);
-        if (mkdir_p(pdir) != 0 || write_atomic(pp, text, strlen(text)) != 0) {
+        if (pu_mkdir_p(pdir) != 0 || pu_write_atomic(pp, text, strlen(text), 0644) != 0) {
             char m[PATH_MAX + 120];
             snprintf(m, sizeof(m), "не записать подготовленную спеку в %s: %s", pdir, strerror(errno));
             err_set(e, "%s", m);
@@ -1338,10 +1011,10 @@ int spec_prepare(const char *path, struct err *e) {
                   p.rep_expand.p ? p.rep_expand.p : "", p.rep_warn.p ? p.rep_warn.p : "");
         char rp[PATH_MAX + 100];
         prepared_path(rp, sizeof(rp), key, ".report.json");
-        if (!rep.oom && rep.p) write_atomic(rp, rep.p, rep.n);
+        if (!rep.oom && rep.p) pu_write_atomic(rp, rep.p, rep.n, 0644);
         free(rep.p);
         prune_old(pdir, key);
-        if (p.al_changed) al_save(&p.al);
+        if (p.al_changed) pal_save(&p.al);
     }
     rc = 0;
 done:

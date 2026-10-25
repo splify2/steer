@@ -202,13 +202,26 @@ static void plugin_free(struct plugin *p) {
     free(p->kind);
     prog_free(&p->pre_apply);
     vec_free(p->requires, p->requires_n);
+    vec_free(p->kind_names, p->kind_names_n);
     free(p->manifest);
 }
 
+/* Прежние реестры не освобождаются: выходы живых спек (плагинный вид, plugin_out.pk) указывают в
+ * записи видов, и спека, читаемая сторожем или status в этот миг, пережила бы reload. Реестр —
+ * килобайты, а перечитывается он только при смене плагинов (plugin_refresh), поэтому «прежние
+ * живут до конца процесса» дешевле счётчика ссылок на каждой спеке. */
+struct retired { struct plugin *pl; size_t n; struct plugin_kind **kind; };
+static struct retired *g_old;
+static size_t g_old_n;
+
 static void registry_clear(void) {
-    for (size_t i = 0; i < g_pl_n; i++) plugin_free(&g_pl[i]);
-    free(g_pl);
-    free(g_kind);
+    if (g_pl || g_kind) {
+        struct retired *nr = realloc(g_old, (g_old_n + 1) * sizeof(*nr));
+        if (nr) {
+            g_old = nr;
+            g_old[g_old_n++] = (struct retired){ g_pl, g_pl_n, g_kind };
+        }                           /* нет памяти — прежний реестр просто остаётся висеть, как и был */
+    }
     g_pl = NULL; g_kind = NULL;
     g_pl_n = g_kind_n = 0;
 }
@@ -431,6 +444,14 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
     p->version = strdup(ver);
     p->name = xdup(m_str(root_n, "name"));
     const struct ynode *st = ynode_get(root_n, "steer");
+    /* Имена видов — до всех проверок: у плагина, выключенного ниже, их помнит отказ вида. */
+    {
+        const struct ynode *kn0 = ynode_get(st, "kinds");
+        for (size_t i = 0; kn0 && kn0->kind == YN_SEQ && i < kn0->len; i++) {
+            const char *nm0 = m_str(ynode_at(kn0, i), "name");
+            if (nm0 && vec_add(&p->kind_names, &p->kind_names_n, nm0) != 0) { ydoc_free(d); return -1; }
+        }
+    }
     const struct ynode *compat = ynode_get(ynode_get(root_n, "compat"), "steer-api");
     if (st && st->kind == YN_MAP && ynode_len(st)) {
         if (!compat || compat->kind != YN_SCALAR) {
@@ -441,7 +462,7 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
         int r = range_ok(compat->str, STEER_API_VERSION);
         if (r < 0) { snprintf(why, sizeof(why), "compat.steer-api: «%s» — диапазон не разобран", compat->str); ydoc_free(d); goto bad; }
         if (!r) {
-            snprintf(why, sizeof(why), "плагин %s требует steer-api %s, у ядра %s", ver, compat->str, STEER_API_VERSION);
+            snprintf(why, sizeof(why), "%s %s требует steer-api %s, у ядра %s", id, ver, compat->str, STEER_API_VERSION);
             ydoc_free(d);
             goto bad;
         }
@@ -612,9 +633,26 @@ static void resolve_conflicts(void) {
     }
 }
 
+/* Отпечаток того, из чего собран реестр: каталог плагинов (менеджер подменяет <id> переименованием,
+ * и время каталога меняется) и state.json (его пишет менеджер атомарно). */
+static int stamp_of(struct timespec *a, struct timespec *b, off_t *sz) {
+    struct stat st;
+    char etc[PATH_MAX], sp[PATH_MAX + 16];
+    memset(a, 0, sizeof(*a)); memset(b, 0, sizeof(*b)); *sz = -1;
+    int have = 0;
+    if (stat(plugin_root(), &st) == 0) { *a = st.st_mtim; have = 1; }
+    plugin_etc(etc, sizeof(etc));
+    snprintf(sp, sizeof(sp), "%s/state.json", etc);
+    if (stat(sp, &st) == 0) { *b = st.st_mtim; *sz = st.st_size; have = 1; }
+    return have;
+}
+static struct timespec g_stamp_a, g_stamp_b;
+static off_t g_stamp_sz = -1;
+
 int plugin_reload(const char *root) {
     registry_clear();
     g_loaded = 1;
+    stamp_of(&g_stamp_a, &g_stamp_b, &g_stamp_sz);
     if (!root) root = plugin_root();
     DIR *d = opendir(root);
     if (!d) return 0;
@@ -670,6 +708,17 @@ int plugin_reload(const char *root) {
     return rc;
 }
 
+int plugin_refresh(void) {
+    struct timespec a, b;
+    off_t sz;
+    stamp_of(&a, &b, &sz);
+    if (g_loaded && a.tv_sec == g_stamp_a.tv_sec && a.tv_nsec == g_stamp_a.tv_nsec &&
+        b.tv_sec == g_stamp_b.tv_sec && b.tv_nsec == g_stamp_b.tv_nsec && sz == g_stamp_sz)
+        return 0;
+    plugin_reload(NULL);
+    return 1;
+}
+
 static void ensure(void) { if (!g_loaded) plugin_reload(NULL); }
 
 size_t plugin_n(void) { ensure(); return g_pl_n; }
@@ -716,8 +765,8 @@ const char *plugin_kind_why(const char *name, char *buf, size_t n, const char **
     ensure();
     if (id) *id = NULL;
     for (size_t i = 0; i < g_pl_n; i++)
-        for (size_t j = 0; j < g_pl[i].kind_n; j++)
-            if (!strcmp(g_pl[i].kind[j]->name, name)) {
+        for (size_t j = 0; j < g_pl[i].kind_names_n; j++)
+            if (!strcmp(g_pl[i].kind_names[j], name)) {
                 if (id) *id = g_pl[i].id;
                 if (g_pl[i].enabled) snprintf(buf, n, "плагин %s не отдал вид %s", g_pl[i].id, name);
                 else snprintf(buf, n, "плагин %s отключён: %s", g_pl[i].id, g_pl[i].why ? g_pl[i].why : "—");
@@ -1222,6 +1271,70 @@ static void plg_keys_of(const struct output *o, struct out_keys *k) {
     (void)o; (void)k;           /* ключи вида печатает v2print из keys_json */
 }
 
+/* ---- файл настройки выхода {conf} (steer-api.md, 1.4) ------------------------------------------
+ *
+ * Помощник плагина спеку не читает и с libsteer не связан: всё, что ему нужно знать о своём выходе
+ * (ключи по схеме, устройство, метка, таблица, подложка, метка сокетов, порты и очереди), ядро кладёт
+ * в этот файл перед запуском. Хеш его содержимого — часть подписи перезапуска помощника: сменилось
+ * что-то из этого — помощник гасится и поднимается сразу. */
+const struct plugin_kind *plugin_helper_kind(const struct output *o) {
+    const struct plugin_kind *pk = out_plugin_kind(o);
+    if (pk) return pk->helper.prog ? pk : NULL;
+    if (!o->owner_plugin || !o->owner_out || strcmp(o->owner_out, o->name) != 0) return NULL;
+    const struct plugin *pl = plugin_find(o->owner_plugin);
+    for (size_t i = 0; pl && pl->enabled && i < pl->kind_n; i++)
+        if (pl->kind[i]->expand.prog && pl->kind[i]->helper.prog) return pl->kind[i];
+    return NULL;
+}
+
+char *plugin_conf_json(const struct spec *sp, const struct output *o, const struct plugin_kind *pk) {
+    const struct plugin *pl = pk->owner;
+    struct sbuf b = { 0 };
+    char etc[PATH_MAX];
+    plugin_etc(etc, sizeof(etc));
+    sb_str(&b, "{\"api\":\"" STEER_API_VERSION "\",\"plugin\":{\"id\":");
+    sb_json(&b, pl->id);
+    sb_str(&b, ",\"version\":");
+    sb_json(&b, pl->version);
+    sb_str(&b, "},\"output\":{\"name\":");
+    sb_json(&b, o->name);
+    sb_str(&b, ",\"kind\":");
+    sb_json(&b, out_plugin_kind(o) ? pk->name : kind_of(o)->name);
+    sb_str(&b, ",\"keys\":");
+    const char *kj = out_plugin_keys(o);
+    sb_str(&b, kj ? kj : "{}");
+    sb_str(&b, ",\"device\":");
+    sb_json(&b, out_has_device(o) ? o->device : "");
+    sb_printf(&b, ",\"mark\":\"0x%08x\",\"mark_mask\":\"0x%08x\",\"table\":%d,\"ipv6\":%s", o->mark,
+              plat()->mark_mask, o->table, out_route6(o) ? "true" : "false");
+    sb_printf(&b, ",\"on_fail\":\"%s\"", o->on_fail == FAIL_DROP ? "drop" : o->on_fail == FAIL_ZAPRET ? "zapret" : "direct");
+    const struct output *over = o->over[0] ? out_over(sp, o) : NULL;
+    if (over) {
+        sb_str(&b, ",\"over\":{\"name\":");
+        sb_json(&b, over->name);
+        sb_printf(&b, ",\"mark\":\"0x%08x\"}", over->mark);
+    } else sb_str(&b, ",\"over\":null");
+    sb_printf(&b, ",\"sock_mark\":\"0x%08x\",\"sock_mark_required\":%s,\"tcp_port\":%d", out_underlay_mark(sp, o),
+              o->over[0] ? "true" : "false", (out_caps(o) & KC_TCP_REDIR) ? out_tcp_port(o) : 0);
+    sb_str(&b, ",\"ports\":[");
+    for (size_t i = 0; out_plugin_kind(o) && i < o->plg.ports_n; i++) sb_printf(&b, "%s%u", i ? "," : "", o->plg.ports[i]);
+    sb_str(&b, "],\"queues\":[");
+    for (size_t i = 0; out_plugin_kind(o) && i < o->plg.queues_n; i++) sb_printf(&b, "%s%u", i ? "," : "", o->plg.queues[i]);
+    sb_str(&b, "]},\"paths\":{\"etc\":");
+    sb_json(&b, plat()->etc_dir);
+    sb_str(&b, ",\"state\":");
+    sb_json(&b, steer_state_dir());
+    sb_str(&b, ",\"lists\":");
+    sb_json(&b, plat()->lists_dir);
+    sb_str(&b, ",\"plugin\":");
+    sb_json(&b, pl->dir);
+    sb_printf(&b, ",\"conf\":\"%s/conf/%s\",\"plugin_state\":\"%s/plugin/%s\"},\"platform\":", etc, pl->id, steer_state_dir(), pl->id);
+    sb_json(&b, plat()->name);
+    sb_str(&b, "}\n");
+    if (b.oom) { free(b.p); return NULL; }
+    return b.p;
+}
+
 /* Помощник выхода: программа плагина с раскрытым argv. Подпись перезапуска — версия плагина и
  * ключи вида (а когда {conf} пишет демон — хеш его содержимого, steer-api.md, 1.4). */
 static int plg_helper_for(const struct plugin_kind *pk, const struct spec *sp, const struct output *o,
@@ -1252,9 +1365,11 @@ static int plg_helper_for(const struct plugin_kind *pk, const struct spec *sp, c
     for (size_t i = 0; i < pk->helper.envc; i++)
         if (kind_helper_env(h, pk->helper.env[i]) != 0) return -1;
     kind_sig_mix(&h->sig, pl->version, strlen(pl->version));
-    const char *kj = out_plugin_keys(o);
-    if (!kj) kj = "";
-    kind_sig_mix(&h->sig, kj, strlen(kj));
+    /* Подпись перезапуска — версия плагина и всё содержимое {conf} (steer-api.md, 1.4). */
+    char *cj = plugin_conf_json(sp, o, pk);
+    if (!cj) return -1;
+    kind_sig_mix(&h->sig, cj, strlen(cj));
+    free(cj);
     return 0;
 }
 
