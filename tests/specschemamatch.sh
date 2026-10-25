@@ -73,7 +73,12 @@ cat > "$ROOT/fakeplug/kinds/fakekind.schema.json" <<'EOP'
     "file":  { "type": "string", "x-path": "etc" },
     "mode":  { "enum": ["a", "b"], "default": "a" },
     "level": { "type": "integer", "minimum": 0, "maximum": 9 },
-    "flag":  { "type": "boolean" }
+    "flag":  { "type": "boolean" },
+    "via":   { "type": "string", "x-ref": { "section": "outputs", "also": ["direct"] }, "x-example": "wg0" },
+    "feeds": { "type": "array", "items": { "type": "string", "x-ref": { "section": "lists", "also": ["all"] } },
+               "minItems": 1, "x-one-or-list": true, "x-example": ["work"] },
+    "scope": { "enum": ["device", "global"], "default": "global", "x-needs": { "device": ["flag"] } },
+    "tol":   { "type": "integer", "minimum": 0, "x-when": { "mode": ["b"] }, "x-when-set": ["level"] }
   },
   "required": ["token"], "additionalProperties": false }
 EOP

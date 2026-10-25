@@ -83,6 +83,7 @@ struct v2 {
     const struct ynode **out_default;
     const struct ynode **out_weights;
     const struct ynode **out_ipv6, **out_prefix;
+    const struct ynode **out_pm;    /* ключи вида плагина как записаны (проверка x-ref после всей спеки) */
     size_t out_cap;
     struct v2_client *cl;
     size_t cl_cap;
@@ -725,7 +726,7 @@ static int v2_room(struct v2 *x, size_t n) {
     size_t nc = x->out_cap ? x->out_cap * 2 : 8;
     while (nc < n) nc *= 2;
     const struct ynode ***f[] = { &x->out_key, &x->out_over, &x->out_members, &x->out_default,
-                                  &x->out_weights, &x->out_ipv6, &x->out_prefix };
+                                  &x->out_weights, &x->out_ipv6, &x->out_prefix, &x->out_pm };
     for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) {
         const struct ynode **p = realloc(*f[i], nc * sizeof(*p));
         if (!p) return -1;
@@ -1215,6 +1216,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         if (kd->check && kd->check(s, &o, x->e) != 0) return wrap(x, key);
     }
     x->out_key[idx] = key;
+    x->out_pm[idx] = pm;
     s->out[s->out_n++] = o;
     return 0;
 }
@@ -2175,6 +2177,33 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
 
 /* ---- документ ----------------------------------------------------------------------------- */
 
+/* Есть ли в разделе спеки запись с таким именем — для x-ref ключей вида плагина. Спека разобрана
+ * целиком: именованные клиенты и списки — первые *_named записей, остальные — безымянные вставки. */
+static int plugin_ref_has(void *ctx, const char *section, const char *name) {
+    struct v2 *xx = ctx;
+    const struct spec *s = xx->s;
+    if (!strcmp(section, "outputs")) return out_idx(s, name) >= 0;
+    if (!strcmp(section, "lists")) return list_idx(s, xx->lists_named, name) >= 0;
+    if (!strcmp(section, "clients")) return client_idx(s, xx->clients_named, name) >= 0;
+    if (!strcmp(section, "dns.upstreams")) return up_named(s, name) >= 0;
+    return 0;
+}
+
+static int plugin_refs_pass(struct v2 *xx) {
+    for (size_t i = 0; i < xx->s->out_n; i++) {
+        const struct plugin_kind *pk = xx->s->out[i].plg.pk;
+        const struct ynode *at = NULL;
+        if (!pk || !xx->out_pm[i]) continue;
+        if (plugin_keys_refs(pk, xx->out_pm[i], plugin_ref_has, xx, &at, xx->e) != 0) {
+            char m[sizeof(xx->e->msg)];
+            snprintf(m, sizeof(m), "%s", xx->e->msg);
+            xx->e->msg[0] = '\0';
+            return fail(xx, at ? at : xx->out_key[i], "outputs.%s: %s", xx->s->out[i].name, m);
+        }
+    }
+    return 0;
+}
+
 static struct v2 x;
 static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e);
 
@@ -2183,7 +2212,7 @@ int spec_parse_v2(const struct ydoc *d, struct spec *s, struct err *e) {
     /* Рабочие массивы разбора (узлы выходов, признаки клиентов) — по числу записей спеки; отдаются
      * здесь, на любом из выходов с отказом. */
     free(x.out_key); free(x.out_over); free(x.out_members); free(x.out_default);
-    free(x.out_weights); free(x.out_ipv6); free(x.out_prefix); free(x.cl);
+    free(x.out_weights); free(x.out_ipv6); free(x.out_prefix); free(x.out_pm); free(x.cl);
     memset(&x, 0, sizeof(x));
     if (rc == 0) rc = check_mark_slots(s, e);
     return rc;
@@ -2237,6 +2266,7 @@ static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e) {
         for (size_t i = 0; i < ynode_len(v); i++)
             if (p_rule(&x, ynode_at(v, i), i)) return -1;
     }
+    if (plugin_refs_pass(&x)) return -1;
     /* Петля в локальную сеть, устройство дважды в группе, подложка — общие с v1 (check.c). */
     int bad = -1;
     if (spec_check_outputs(s, "over", &bad, e) != 0)

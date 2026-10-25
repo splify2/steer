@@ -142,6 +142,16 @@ int plugin_cmd_exec(const struct plugin_cmd *c, int argc, char **argv);
 int plugin_keys_check(const struct plugin_kind *pk, const struct ynode *keys, const char *etc,
                       const char *conf, char **json, const struct ynode **at, struct err *e);
 
+/* Проверка x-ref: есть ли в разделе спеки (outputs, lists, clients, dns.upstreams) запись с таким
+ * именем. Спрашивает plugin_keys_refs, когда спека разобрана целиком. */
+typedef int (*plugin_ref_fn)(void *ctx, const char *section, const char *name);
+
+/* Ссылки x-ref в ключах вида (сырой узел keys, как в plugin_keys_check): имя обязано быть записью
+ * раздела или словом also. 0 — годится; -1 — отказ, текст в e («путь: «имя» — …», без места), *at —
+ * узел значения. */
+int plugin_keys_refs(const struct plugin_kind *pk, const struct ynode *keys, plugin_ref_fn has, void *ctx,
+                     const struct ynode **at, struct err *e);
+
 /* ---- nft: слоты и шаблоны (steer-api.md, раздел 5) ---- */
 
 struct nft_rs;

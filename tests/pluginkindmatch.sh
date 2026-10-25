@@ -376,5 +376,100 @@ printf 'chain forward {\n  meta mark & {mark} != 0 return\n}\n' > "$ROOT/nores/n
 has "{mark} у плагина без resources — отказ с именем плагина и строкой файла" "$(dry ok)" "плагин nores: $ROOT/nores/nft/n.nft:2:"
 rm -rf "$ROOT/nores"
 
+# ================= 5. слова схемы спеки в схеме ключей вида ===============================================
+# refplug — вид refkind со словами x-ref, x-one-or-list, x-needs, x-when, x-when-set, x-example (как у
+# схемы спеки ядра, docs/spec-schema.md): разбор ссылок, одно значение вместо списка, соседи, подсказки.
+mkdir -p "$ROOT/refplug/kinds"
+cat > "$ROOT/refplug/plugin.json" <<'EOF'
+{ "schema": 1, "id": "refplug", "version": "1.0.0", "compat": { "steer-api": "^1.0" }, "arch": "all",
+  "steer": { "kinds": [{ "name": "refkind", "keys": "kinds/refkind.schema.json", "caps": ["mark"] }] } }
+EOF
+cat > "$ROOT/refplug/kinds/refkind.schema.json" <<'EOF'
+{ "type": "object",
+  "properties": {
+    "via":   { "type": "string", "x-ref": { "section": "outputs", "also": ["direct"] }, "x-example": "wg0" },
+    "to":    { "type": "array", "items": { "type": "string", "x-ref": { "section": "lists", "also": ["all"] } },
+               "minItems": 1, "x-one-or-list": true, "x-example": ["work"] },
+    "who":   { "type": "array", "items": { "type": "string", "x-ref": { "section": "clients", "also": ["lan"] } },
+               "x-one-or-list": true },
+    "dns":   { "type": "string", "x-ref": { "section": "dns.upstreams" } },
+    "scope": { "enum": ["device", "global"], "default": "global", "x-needs": { "device": ["for"] } },
+    "for":   { "type": "string", "x-when": { "scope": ["device"] } },
+    "pick":  { "enum": ["order", "latency"], "x-example": "order" },
+    "tol":   { "type": "integer", "minimum": 0, "x-when": { "pick": ["latency"] }, "x-when-set": ["pick"] },
+    "by":    { "type": "string", "x-needs": { "*": ["pick"] } }
+  },
+  "additionalProperties": false }
+EOF
+rspec() {   # rspec имя "ключи выхода r1" — спека с выходом wg0, списком work, клиентом kid и апстримом dns1
+    cat > "$tmp/$1.yaml" <<EOS
+version: 2
+clients:
+  kid: { addr: 192.168.1.50 }
+lists:
+  work: { domains_file: work.txt }
+dns:
+  upstreams:
+    dns1: { url: "udp://1.1.1.1" }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+  r1: { kind: refkind, $2 }
+rules: []
+EOS
+}
+printf "example.org\n" > "$tmp/work.txt"
+oneline() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ $//'; }
+rspec rok 'via: wg0, to: work'
+check "x-ref: имя из раздела — разбор принял" "wg0 r1" "$(oneline "$(outs rok)")"
+rspec rone 'to: work'
+has "x-one-or-list: одно значение стало списком" "$("$BIN" spec convert --spec "$tmp/rone.yaml" 2>&1)" 'to: [work]'
+rspec rlist 'to: [work, all]'
+has "x-one-or-list: список с also принят как есть" "$("$BIN" spec convert --spec "$tmp/rlist.yaml" 2>&1)" 'to: [work, all]'
+rspec ralso 'via: direct, who: [lan, kid], dns: dns1'
+check "x-ref.also и остальные разделы — принято" "wg0 r1" "$(oneline "$(outs ralso)")"
+rspec rbad1 'via: nope'
+out="$(dry rbad1)"
+has "x-ref: чужое имя — отказ" "$out" "via: «nope» — в разделе outputs такой записи нет (и это не direct)"
+has "  с выходом и местом в спеке" "$out" "outputs.r1:"
+has "  и строкой спеки" "$out" "rbad1.yaml:"
+rspec rbad2 'to: [work, ghost]'
+has "x-ref у items: ключ с номером и имя" "$(dry rbad2)" "to[1]: «ghost» — в разделе lists такой записи нет (и это не all)"
+rspec rbad3 'to: ghost'
+has "x-ref при одном значении вместо списка" "$(dry rbad3)" "to: «ghost»"
+rspec rbad4 'who: wg0'
+has "x-ref: раздел clients" "$(dry rbad4)" "who: «wg0» — в разделе clients такой записи нет (и это не lan)"
+rspec rbad5 'dns: wg0'
+has "x-ref: раздел dns.upstreams" "$(dry rbad5)" "dns: «wg0» — в разделе dns.upstreams такой записи нет"
+rspec rbad6 'to: []'
+has "minItems при x-one-or-list держится" "$(dry rbad6)" "нужно не меньше 1"
+rspec rn1 'scope: device'
+has "x-needs: значение без соседа — отказ" "$(dry rn1)" "scope: device — без ключа for он не разобран"
+rspec rn2 'scope: device, for: kid'
+check "x-needs: с соседом принято" "wg0 r1" "$(oneline "$(outs rn2)")"
+rspec rn3 'scope: global'
+check "x-needs: другое значение соседа не требует" "wg0 r1" "$(oneline "$(outs rn3)")"
+rspec rn4 'by: x'
+has "x-needs «*»: при любом значении" "$(dry rn4)" "by: при любом значении — без ключа pick он не разобран"
+rspec rw1 'tol: 5'
+check "x-when и x-when-set — подсказки: ключ вне условия законен" "wg0 r1" "$(oneline "$(outs rw1)")"
+rspec rw2 'for: kid'
+check "x-when: сосед не записан — разбор не отказывает" "wg0 r1" "$(oneline "$(outs rw2)")"
+# слова схемы спеки доходят до `steer spec-schema` как есть
+sch="$("$BIN" spec-schema --json 2>&1 | tr -d ' \n')"
+for w in '"x-ref":{"section":"outputs","also":["direct"]}' '"x-one-or-list":true' '"x-needs":{"device":["for"]}' \
+         '"x-when":{"pick":["latency"]}' '"x-when-set":["pick"]'; do
+    has "spec-schema: ключ плагина со словом $w" "$sch" "$w"
+done
+# схема с неверным видом слова отвергается при разборе
+cat > "$ROOT/refplug/kinds/refkind.schema.json" <<'EOF'
+{ "type": "object", "properties": { "via": { "type": "string", "x-ref": { "section": "nowhere" } } } }
+EOF
+has "x-ref с чужим разделом — ошибка схемы" "$(dry rok)" "x-ref — {section: outputs, lists, clients или dns.upstreams}"
+cat > "$ROOT/refplug/kinds/refkind.schema.json" <<'EOF'
+{ "type": "object", "properties": { "via": { "type": "string", "x-one-or-list": true } } }
+EOF
+has "x-one-or-list у не-массива — ошибка схемы" "$(dry rok)" "x-one-or-list — у массива"
+rm -rf "$ROOT/refplug"
+
 printf '\npluginkindmatch: %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

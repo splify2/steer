@@ -787,8 +787,10 @@ const char *plugin_kind_why(const char *name, char *buf, size_t n, const char **
  *
  * Подмножество JSON Schema (schema/kind-keys.schema.json плагинной документации): type, enum, const,
  * default, pattern (POSIX ERE), minLength/maxLength, minimum/maximum, items, minItems/maxItems,
- * uniqueItems, properties, required, additionalProperties (false/true) и два расширения —
- * x-secret и x-path. Ядро проверяет само, без сторонней библиотеки. Ключевое слово вне списка —
+ * uniqueItems, properties, required, additionalProperties (false/true) и расширения — x-secret,
+ * x-path и слова схемы спеки ядра (docs/spec-schema.md): x-ref и x-needs (проверяет разбор),
+ * x-one-or-list (одно значение вместо списка), x-when, x-when-set, x-example (подсказки форме,
+ * разбор их не применяет; x-plugin ставит само ядро, автор не пишет). Ядро проверяет само, без сторонней библиотеки. Ключевое слово вне списка —
  * ошибка схемы, а не молчаливый пропуск: схему пишет автор плагина, и «не действует» хуже отказа.
  *
  * Результат — keys_json: JSON-объект ключей с умолчаниями схемы, значения напечатаны по типу СХЕМЫ
@@ -808,8 +810,12 @@ struct sch {
 static const char *const SCH_WORDS[] = {
     "$schema", "$id", "title", "description", "type", "enum", "const", "default", "pattern",
     "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems", "uniqueItems", "items",
-    "properties", "required", "additionalProperties", "x-secret", "x-path", NULL
+    "properties", "required", "additionalProperties", "x-secret", "x-path",
+    "x-ref", "x-one-or-list", "x-when", "x-when-set", "x-needs", "x-example", NULL
 };
+
+/* Разделы спеки, на которые может указывать x-ref (те же, что у ключей ядра, v2keys.h: ref). */
+static const char *const REF_SECTIONS[] = { "outputs", "lists", "clients", "dns.upstreams", NULL };
 
 __attribute__((format(printf, 4, 5)))
 static int sch_fail(struct sch *c, const struct ynode *at, const char *path, const char *fmt, ...) {
@@ -866,6 +872,25 @@ static int scalar_eq(const struct ynode *a, const struct ynode *b) {
     return a->kind == YN_SCALAR && b->kind == YN_SCALAR && !strcmp(a->str, b->str);
 }
 
+/* Список строк: x-when-set, значения x-when и x-needs, also у x-ref. */
+static int str_list_ok(const struct ynode *n, int nonempty) {
+    if (!n || n->kind != YN_SEQ || (nonempty && !ynode_len(n))) return 0;
+    for (size_t i = 0; i < ynode_len(n); i++)
+        if (ynode_at(n, i)->kind != YN_SCALAR) return 0;
+    return 1;
+}
+
+/* Отображение «значение → [соседи]»: x-when и x-needs. */
+static int word_map_ok(struct sch *c, const struct ynode *w, const char *path, const char *word) {
+    if (!w || w->kind != YN_MAP)
+        return sch_fail(c, w, path, "%s в схеме вида — отображение «значение: [ключи]»", word);
+    for (size_t i = 0; i < ynode_len(w); i++)
+        if (!str_list_ok(ynode_val_at(w, i), 1))
+            return sch_fail(c, ynode_val_at(w, i), path, "%s: у «%s» нужен список строк", word,
+                            ynode_key_at(w, i)->str);
+    return 0;
+}
+
 static int sch_words_ok(struct sch *c, const struct ynode *sch, const char *path) {
     for (size_t i = 0; i < ynode_len(sch); i++) {
         const char *k = ynode_key_at(sch, i)->str;
@@ -874,6 +899,33 @@ static int sch_words_ok(struct sch *c, const struct ynode *sch, const char *path
         if (!SCH_WORDS[w])
             return sch_fail(c, ynode_key_at(sch, i), path, "в схеме вида ключевое слово «%s» не поддерживается", k);
     }
+    const struct ynode *xr = ynode_get(sch, "x-ref");
+    if (xr) {
+        const struct ynode *sec = xr->kind == YN_MAP ? ynode_get(xr, "section") : NULL;
+        const struct ynode *also = xr->kind == YN_MAP ? ynode_get(xr, "also") : NULL;
+        size_t w = 0;
+        while (sec && sec->kind == YN_SCALAR && REF_SECTIONS[w] && strcmp(REF_SECTIONS[w], sec->str)) w++;
+        if (!sec || sec->kind != YN_SCALAR || !REF_SECTIONS[w])
+            return sch_fail(c, xr, path, "x-ref — {section: outputs, lists, clients или dns.upstreams}");
+        if (also && !str_list_ok(also, 0))
+            return sch_fail(c, also, path, "x-ref.also — список слов");
+        for (size_t i = 0; i < ynode_len(xr); i++) {
+            const char *k = ynode_key_at(xr, i)->str;
+            if (strcmp(k, "section") && strcmp(k, "also"))
+                return sch_fail(c, ynode_key_at(xr, i), path, "в x-ref ключа «%s» нет (есть: section, also)", k);
+        }
+    }
+    const struct ynode *ol = ynode_get(sch, "x-one-or-list");
+    int olv;
+    if (ol && ynode_bool(ol, &olv) != 0)
+        return sch_fail(c, ol, path, "x-one-or-list — true или false");
+    if (ol && olv && !type_has(ynode_get(sch, "type"), "array"))
+        return sch_fail(c, ol, path, "x-one-or-list — у массива (type: array)");
+    const struct ynode *wh = ynode_get(sch, "x-when"), *ws = ynode_get(sch, "x-when-set");
+    if (wh && word_map_ok(c, wh, path, "x-when")) return -1;
+    if (ws && !str_list_ok(ws, 1)) return sch_fail(c, ws, path, "x-when-set — список ключей-соседей");
+    const struct ynode *nd = ynode_get(sch, "x-needs");
+    if (nd && word_map_ok(c, nd, path, "x-needs")) return -1;
     return 0;
 }
 
@@ -914,6 +966,22 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
         for (size_t i = 0; req && i < ynode_len(req); i++)
             if (!ynode_get(v, ynode_at(req, i)->str))
                 return sch_fail(c, v, path, "нет обязательного ключа %s", ynode_at(req, i)->str);
+        /* x-needs: при этом значении ключа без этих соседей разбор отказывает; "*" — при любом. Условия
+         * x-when и x-when-set разбор не применяет — это подсказки форме. */
+        for (size_t i = 0; i < ynode_len(v); i++) {
+            const struct ynode *k = ynode_key_at(v, i), *val = ynode_val_at(v, i);
+            const struct ynode *nd = ynode_get(ynode_get(props, k->str), "x-needs");
+            if (!nd || val->kind != YN_SCALAR) continue;
+            const struct ynode *need = ynode_get(nd, val->str);
+            if (!need) need = ynode_get(nd, "*");
+            for (size_t j = 0; need && j < ynode_len(need); j++) {
+                const char *nb = ynode_at(need, j)->str;
+                if (ynode_get(v, nb)) continue;
+                snprintf(np, sizeof(np), "%s%s%s", path, *path ? "." : "", k->str);
+                return sch_fail(c, val, np, "%s: %s — без ключа %s он не разобран", k->str,
+                                !ynode_get(nd, val->str) ? "при любом значении" : val->str, nb);
+            }
+        }
         sb_str(c->out, "{");
         size_t put = 0;
         for (size_t i = 0; i < ynode_len(v); i++) {
@@ -986,6 +1054,24 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
         sb_str(c->out, "]");
         return 0;
     }
+    /* x-one-or-list: одно значение вместо списка из одного элемента (как у ключей ядра). */
+    if (v->kind == YN_SCALAR) {
+        const struct ynode *ol = ynode_get(sch, "x-one-or-list");
+        int olv = 0;
+        if (ol && ynode_bool(ol, &olv) == 0 && olv) {
+            const struct ynode *mn = ynode_get(sch, "minItems");
+            long l;
+            if (mn && ynode_long(mn, &l) == 0 && l > 1)
+                return sch_fail(c, v, path, "в списке 1 элемент, а нужно не меньше %ld", l);
+            const struct ynode *items = ynode_get(sch, "items");
+            snprintf(np, sizeof(np), "%s[0]", path);
+            sb_str(c->out, "[");
+            if (items) { if (sch_node(c, items, v, np)) return -1; }
+            else sch_scalar_json(c->out, v, scalar_infer(v));
+            sb_str(c->out, "]");
+            return 0;
+        }
+    }
     /* скаляр */
     const char *want = NULL;          /* тип, которым скаляр печатается */
     if (ty) {
@@ -1052,6 +1138,72 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
         return sch_path(c, sch, v, path, c->out);
     }
     sch_scalar_json(c->out, v, want);
+    return 0;
+}
+
+/* ---- x-ref: имена из разделов спеки ---------------------------------------------------------
+ * Разделы читаются после всей спеки (ключ выхода может назвать выход, список или апстрим, что ниже
+ * по тексту), поэтому проверка ссылок — отдельный проход: plugin_keys_refs, его зовёт разбор спеки,
+ * когда все разделы уже есть. Слова also из x-ref законны вместо имени. */
+struct refw {
+    plugin_ref_fn has;
+    void *ctx;
+    struct err *e;
+    const struct ynode *at;
+};
+
+static int refs_node(struct refw *r, const struct ynode *sch, const struct ynode *v, const char *path) {
+    if (!sch || sch->kind != YN_MAP) return 0;
+    char np[256];
+    if (v->kind == YN_MAP) {
+        const struct ynode *props = ynode_get(sch, "properties");
+        for (size_t i = 0; props && i < ynode_len(v); i++) {
+            const struct ynode *ps = ynode_get(props, ynode_key_at(v, i)->str);
+            if (!ps) continue;
+            snprintf(np, sizeof(np), "%s%s%s", path, *path ? "." : "", ynode_key_at(v, i)->str);
+            if (refs_node(r, ps, ynode_val_at(v, i), np)) return -1;
+        }
+        return 0;
+    }
+    if (v->kind == YN_SEQ) {
+        const struct ynode *items = ynode_get(sch, "items");
+        for (size_t i = 0; items && i < ynode_len(v); i++) {
+            snprintf(np, sizeof(np), "%s[%zu]", path, i);
+            if (refs_node(r, items, ynode_at(v, i), np)) return -1;
+        }
+        return 0;
+    }
+    const struct ynode *xr = ynode_get(sch, "x-ref");
+    if (!xr) {      /* одно значение вместо списка: ссылка стоит на items */
+        const struct ynode *items = ynode_get(sch, "items");
+        if (items && v->kind == YN_SCALAR) return refs_node(r, items, v, path);
+        return 0;
+    }
+    const char *sec = m_str(xr, "section");
+    const struct ynode *also = ynode_get(xr, "also");
+    for (size_t i = 0; also && i < ynode_len(also); i++)
+        if (!strcmp(ynode_at(also, i)->str, v->str)) return 0;
+    if (sec && r->has(r->ctx, sec, v->str)) return 0;
+    char list[200] = "";
+    size_t l = 0;
+    for (size_t i = 0; also && i < ynode_len(also) && l + 40 < sizeof(list); i++)
+        l += (size_t)snprintf(list + l, sizeof(list) - l, "%s%s", i ? ", " : "", ynode_at(also, i)->str);
+    r->at = v;
+    char msg[600];
+    snprintf(msg, sizeof(msg), "%s: «%s» — в разделе %s такой записи нет%s%s%s", path, v->str,
+             sec ? sec : "?", list[0] ? " (и это не " : "", list, list[0] ? ")" : "");
+    return err_set(r->e, "%s", msg);
+}
+
+int plugin_keys_refs(const struct plugin_kind *pk, const struct ynode *keys, plugin_ref_fn has, void *ctx,
+                     const struct ynode **at, struct err *e) {
+    struct refw r = { .has = has, .ctx = ctx, .e = e };
+    if (at) *at = NULL;
+    if (!pk->schema || !keys) return 0;
+    if (refs_node(&r, pk->schema, keys, "") != 0) {
+        if (at) *at = r.at;
+        return -1;
+    }
     return 0;
 }
 
