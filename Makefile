@@ -86,6 +86,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
 	@sh tests/v2match.sh
+	@sh tests/specschemamatch.sh
 	@sh tests/tgwsmark.sh
 	@BUILD=$(BUILD) sh tests/noforward.sh
 	@BUILD=$(BUILD) sh tests/boxenv.sh

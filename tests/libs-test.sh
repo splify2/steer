@@ -488,6 +488,13 @@ case "$o" in
        printf '%s\n' "$o" | grep -q ', 0 failed$' || printf '%s\n' "$full" | sed 's/^/    nodev6: /' ;;
 esac
 
+# Схема спеки (`steer spec-schema`) по видам модулей раскладки: vless, hysteria2, прокси, xsteer — их
+# ключи и ограничения по протоколам сверяет с разбором tests/specschemamatch.sh (в `make test` их нет:
+# там видов расширенной части в сборке нет).
+SPECSCHEMA_ONLY_EXT=1 STEERD_EXT="$L/steerd" sh tests/specschemamatch.sh > "$L.schema" 2>&1
+check "схема спеки: виды модулей раскладки, стенд tests/specschemamatch.sh" "0" "$?"
+[ -s "$L.schema" ] && grep -q FAIL "$L.schema" && sed 's/^/    specschemamatch: /' "$L.schema" | head -20
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'
