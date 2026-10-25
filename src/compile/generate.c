@@ -2184,7 +2184,6 @@ static int has_tcp_redir(const struct spec *sp) {
 /* Несёт ли хоть один выход с перенаправлением TCP IPv6 (KC_IPV6 стоит у видов, а `ipv6: off` его снимает):
  * только тогда метка в карте может прийти от пакета IPv6, и правилу для IPv6 есть что ловить. */
 static int has_tcp_redir6(const struct spec *sp) {
-    if (g_nftc & NFTC_LEGACY) return 0;
     for (size_t i = 0; i < sp->out_n; i++)
         if (sp->out[i].mark && out_has_cap(&sp->out[i], KC_TCP_REDIR) &&
             out_has_cap(&sp->out[i], KC_IPV6)) return 1;
