@@ -570,8 +570,9 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
 
     size_t named_up = 0;
     for (size_t i = 0; i < s->dns.up_n; i++) named_up += !s->dns.up[i].inl;
-    if (s->traceroute_hops || s->dns.cache || named_up || s->dns.boot_n) {
+    if (s->traceroute_hops || s->dns.mesh_clients || s->dns.cache || named_up || s->dns.boot_n) {
         fputs("\ndns:\n", f);
+        if (s->dns.mesh_clients) fputs("  mesh_clients: true\n", f);
         if (s->traceroute_hops) fputs("  traceroute_hops: true\n", f);
         if (s->dns.cache) {
             fprintf(f, "  cache: %ld\n", s->dns.cache);

@@ -1159,6 +1159,41 @@ rules:
 EOF
 refused "family: 6 у списка srs — ещё не поддерживается" "ещё не поддерживается"
 
+# ---- dns.mesh_clients (I-273): заворот DNS клиентов mesh-VPN — только по просьбе ----------------
+printf 'a.example\n' > "$tmp/mesh.dom"
+y <<'EOF'
+version: 2
+lists:
+  m: { domains_file: TMP/mesh.dom }
+outputs:
+  wg0: { kind: interface, device: wg0 }
+dns:
+  mesh_clients: true
+rules:
+  - { name: m, to: [m], out: wg0 }
+EOF
+accepted "dns.mesh_clients: true — принимается"
+out="$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"
+if echo "$out" | grep -q 'iifname { "tailscale\*", "zt\*" } udp dport 53 counter redirect to :5300' &&
+   echo "$out" | grep -q 'iifname { "tailscale\*", "zt\*" } tcp dport 53 counter redirect to :5300'; then ok; else
+    bad "mesh_clients: true — заворот UDP и TCP :53 с tailscale*/zt*" "$(echo "$out" | grep -A8 'chain prerouting_dns')"; fi
+"$BIN" spec convert --spec "$tmp/s.yaml" > "$tmp/c1.yaml" 2>/dev/null
+"$BIN" spec convert --spec "$tmp/c1.yaml" > "$tmp/c2.yaml" 2>/dev/null
+if grep -q 'mesh_clients: true' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+    bad "mesh_clients — spec convert печатает поле и неподвижен" "$(grep -n mesh "$tmp/c1.yaml")"; fi
+sed -i 's/mesh_clients: true/mesh_clients: false/' "$tmp/s.yaml"
+out="$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"
+if ! echo "$out" | grep -q 'tailscale\*" } udp dport 53'; then ok; else bad "mesh_clients: false — завората нет"; fi
+sed -i '/mesh_clients/d;/^dns:/d' "$tmp/s.yaml"
+out="$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"
+if ! echo "$out" | grep -q 'tailscale\*" } udp dport 53'; then ok; else bad "без mesh_clients завората нет (умолчание)"; fi
+y <<'EOF'
+version: 2
+dns:
+  mesh_clients: maybe
+EOF
+refused "dns.mesh_clients: maybe — отказ" "mesh_clients"
+
 
 echo "v2match: разбор v2 — $pass проверок прошли"
 if [ "$fail" -gt 0 ]; then echo "v2match: ПРОВАЛЕНО $fail"; exit 1; fi

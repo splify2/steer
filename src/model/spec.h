@@ -731,6 +731,9 @@ struct spec_dns_up {
 };
 enum { DNSG_NONE = 0, DNSG_RACE = 1, DNSG_FAILOVER = 2 };
 struct spec_dns {
+    /* `dns.mesh_clients` (I-273): заворачивать на резолвер и запросы DNS клиентов mesh-VPN
+     * (устройства tailscale*, zt*) к порту 53. По умолчанию 0: чужую сеть без просьбы не трогаем. */
+    int mesh_clients;
     long cache;                     /* записей кэша; 0 — кэша нет */
     /* Пределы срока жизни записи кэша, секунд: ответ живёт не меньше ttl_min и не дольше
      * ttl_max, отрицательный (NXDOMAIN, пустой ответ) — ttl_neg. Умолчания ставит разбор. */

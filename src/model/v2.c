@@ -1572,7 +1572,7 @@ static int up_has_way(const struct spec *s, const struct spec_dns_up *u) {
 static int p_dns(struct v2 *x, const struct ynode *n) {
     struct spec *s = x->s;
     static const char *const K[] = { "mode", "cache", "cache_ttl", "upstream", "upstreams", "other",
-                                     "bootstrap", "traceroute_hops", NULL };
+                                     "bootstrap", "traceroute_hops", "mesh_clients", NULL };
     if (want_map(x, n, "dns") || keys_known(x, n, "dns", K)) return -1;
     const struct ynode *v;
     const char *sv;
@@ -1584,6 +1584,8 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
         if (!strcmp(sv, "realip")) x->realip_default = 1;
         else if (strcmp(sv, "fakeip") != 0) return fail(x, v, "dns.mode: «%s» — нужен fakeip или realip", sv);
     }
+    if ((v = ynode_get(n, "mesh_clients")) && bool_of(x, v, "dns.mesh_clients", &s->dns.mesh_clients))
+        return -1;
     if ((v = ynode_get(n, "traceroute_hops")) && bool_of(x, v, "dns.traceroute_hops", &s->traceroute_hops))
         return -1;
     if ((v = ynode_get(n, "cache")) && long_of(x, v, "dns.cache", 0, 100000, &s->dns.cache)) return -1;

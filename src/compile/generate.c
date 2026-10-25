@@ -1561,6 +1561,21 @@ static void build_dns_redirect(struct nft_table *t, const struct spec *sp) {
         ir_counter(r, 0, 0);
         ir_x(r, "redirect to :%d", DNS_PORT);
     }
+    /* `dns.mesh_clients: true` (I-273): клиенты mesh-VPN. У клиента Tailscale резолвер — свой
+     * (MagicDNS, 100.100.100.100), и до нашего он доходит, только если сеть Tailscale отдаёт
+     * клиентам адрес роутера как сервер имён; тогда запрос приходит на tailscale0 или zt*, и без
+     * этого правила его обслуживает dnsmasq — настоящим адресом, мимо fake-IP. Имя устройства —
+     * шаблоном по тем же причинам, что у x_ifs (демон создаёт устройство позже сети). Только по
+     * явной просьбе: чужой сети без просьбы не касаемся. */
+    if (sp->dns.mesh_clients) {
+        for (int k = 0; k < 2; k++) {
+            struct nft_rule *r = ir_rule(c);
+            ir_x(r, "iifname { \"tailscale*\", \"zt*\" }");
+            ir_x(r, "%s dport 53", protos[k]);
+            ir_counter(r, 0, 0);
+            ir_x(r, "redirect to :%d", DNS_PORT);
+        }
+    }
 }
 
 /* Карта подмены fake→real и её правило dnat. Элементы карты — из файла состояния резолвера,
