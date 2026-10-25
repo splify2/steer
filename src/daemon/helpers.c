@@ -84,50 +84,172 @@ size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *
              * сборке, мост tgws — там же (kinds/tgws.c). */
             const struct kind_ops *kd = kind_of(o);
             struct kind_helper hp = { .sig = KIND_SIG_INIT };
-            if (!kd->helper || kd->helper(sp, o, &hp) != 0) continue;
+            if (!kd->helper) continue;
+            if (kd->helper(sp, o, &hp) != 0) { kind_helper_free(&hp); continue; }
             if (hp.marks && need_marks) *need_marks = 1;
-            if (k >= max) continue;
-            struct helper *h = &out[k++];
+            if (k >= max) { kind_helper_free(&hp); continue; }
+            struct helper *h = &out[k];
             memset(h, 0, sizeof(*h));
-            snprintf(h->cmd, sizeof(h->cmd), "%s", hp.cmd);
+            if (!hp.cmd || helper_launch_set(h, &hp) != 0) {
+                helper_launch_free(h);
+                kind_helper_free(&hp);
+                continue;
+            }
+            k++;
             snprintf(h->name, sizeof(h->name), "%s", o->name);
-            memcpy(h->prog, hp.prog, sizeof(h->prog));
-            memcpy(h->arg, hp.arg, sizeof(h->arg));
-            memcpy(h->env, hp.env, sizeof(h->env));
             /* Команда помощника — команда модуля, а в этом steerd её нет: помощника исполняет
              * бинарник модуля (steer-vless и остальные), который лежит рядом. Статическая
              * сборка (телефон, стенды) несёт модуль в себе — modcmd_builtin говорит «да», и
              * помощник остаётся подкомандой steerd, как всегда. Стенд, собравший помощников
              * без modcmd.c, читается как статическая сборка: прежнее поведение. */
-            const char *mod = hp.prog[0] ? NULL : steer_cmd_module(hp.cmd);
+            const char *mod = hp.prog && hp.prog[0] ? NULL : steer_cmd_module(hp.cmd);
             if (mod && modcmd_builtin && !modcmd_builtin(hp.cmd)) {
-                snprintf(h->prog, sizeof(h->prog), "%s", mod);
-                h->module = 1;
+                char *mp = strdup(mod);
+                if (mp) { free(h->prog); h->prog = mp; h->module = 1; }
             }
             h->sig = helper_sig(sp, o, &hp);
             h->delay_ms = HELPERS_DELAY_MS;
             h->evfd = -1;
+            kind_helper_free(&hp);
         }
     }
     return k;
 }
 
 /* Как назвать помощника в журнале: «obfs a»; у резолвера имени выхода нет — «dnsd». */
+/* ---- поля запуска ------------------------------------------------------------------------- */
+
+static char **vec_dup(char *const *v, size_t n) {
+    if (!n) return NULL;
+    char **c = calloc(n, sizeof(*c));
+    if (!c) return NULL;
+    for (size_t i = 0; i < n; i++)
+        if (!(c[i] = strdup(v[i]))) {
+            for (size_t j = 0; j < i; j++) free(c[j]);
+            free(c);
+            return NULL;
+        }
+    return c;
+}
+
+static void vec_free(char **v, size_t n) {
+    for (size_t i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
+
+void helper_launch_free(struct helper *h) {
+    free(h->cmd);
+    free(h->prog);
+    vec_free(h->arg, h->arg_n);
+    vec_free(h->env, h->env_n);
+    h->cmd = h->prog = NULL;
+    h->arg = h->env = NULL;
+    h->arg_n = h->env_n = 0;
+}
+
+void helpers_launch_free(struct helper *v, size_t n) {
+    for (size_t i = 0; i < n; i++) helper_launch_free(&v[i]);
+}
+
+static int launch_copy(struct helper *dst, const char *cmd, const char *prog, char *const *arg,
+                       size_t arg_n, char *const *env, size_t env_n) {
+    char *c = cmd ? strdup(cmd) : NULL;
+    char *p = prog ? strdup(prog) : NULL;
+    char **a = vec_dup(arg, arg_n), **e = vec_dup(env, env_n);
+    if ((cmd && !c) || (prog && !p) || (arg_n && !a) || (env_n && !e)) {
+        free(c); free(p);
+        if (a) vec_free(a, arg_n);
+        if (e) vec_free(e, env_n);
+        return -1;
+    }
+    helper_launch_free(dst);
+    dst->cmd = c; dst->prog = p;
+    dst->arg = a; dst->arg_n = arg_n;
+    dst->env = e; dst->env_n = env_n;
+    return 0;
+}
+
+int helper_launch_set(struct helper *h, const struct kind_helper *hp) {
+    return launch_copy(h, hp->cmd, hp->prog, hp->arg, hp->arg_n, hp->env, hp->env_n);
+}
+
+int helper_set_cmd(struct helper *h, const char *cmd) {
+    return launch_copy(h, cmd, NULL, NULL, 0, NULL, 0);
+}
+
+int helper_clone(struct helper *dst, const struct helper *src) {
+    *dst = *src;
+    dst->cmd = dst->prog = NULL;
+    dst->arg = dst->env = NULL;
+    dst->arg_n = dst->env_n = 0;
+    if (launch_copy(dst, src->cmd, src->prog, src->arg, src->arg_n, src->env, src->env_n) != 0) {
+        memset(dst, 0, sizeof(*dst));
+        return -1;
+    }
+    return 0;
+}
+
+/* Строка по трубе: длина (size_t; ~0 — NULL) и байты. */
+static int wstr(FILE *w, const char *s) {
+    size_t n = s ? strlen(s) : (size_t)-1;
+    if (fwrite(&n, sizeof(n), 1, w) != 1) return -1;
+    return s && n && fwrite(s, 1, n, w) != n ? -1 : 0;
+}
+
+static int rstr(FILE *r, char **out) {
+    size_t n;
+    *out = NULL;
+    if (fread(&n, sizeof(n), 1, r) != 1) return -1;
+    if (n == (size_t)-1) return 0;
+    char *s = malloc(n + 1);
+    if (!s) return -1;
+    if (n && fread(s, 1, n, r) != n) { free(s); return -1; }
+    s[n] = '\0';
+    *out = s;
+    return 0;
+}
+
+int helper_write(FILE *w, const struct helper *h) {
+    if (fwrite(h, sizeof(*h), 1, w) != 1) return -1;
+    if (wstr(w, h->cmd) || wstr(w, h->prog)) return -1;
+    for (size_t i = 0; i < h->arg_n; i++) if (wstr(w, h->arg[i])) return -1;
+    for (size_t i = 0; i < h->env_n; i++) if (wstr(w, h->env[i])) return -1;
+    return 0;
+}
+
+int helper_read(FILE *r, struct helper *h) {
+    if (fread(h, sizeof(*h), 1, r) != 1) return -1;
+    size_t an = h->arg_n, en = h->env_n;
+    h->cmd = h->prog = NULL;
+    h->arg = h->env = NULL;
+    h->arg_n = h->env_n = 0;
+    if (rstr(r, &h->cmd) || rstr(r, &h->prog)) goto bad;
+    if (an && !(h->arg = calloc(an, sizeof(*h->arg)))) goto bad;
+    h->arg_n = an;
+    for (size_t i = 0; i < an; i++) if (rstr(r, &h->arg[i])) goto bad;
+    if (en && !(h->env = calloc(en, sizeof(*h->env)))) goto bad;
+    h->env_n = en;
+    for (size_t i = 0; i < en; i++) if (rstr(r, &h->env[i])) goto bad;
+    return 0;
+bad:
+    helper_launch_free(h);
+    return -1;
+}
+
 static const char *hname(const struct helper *h, char *buf, size_t n) {
-    snprintf(buf, n, "%s%s%s", h->cmd, h->name[0] ? " " : "", h->name);
+    snprintf(buf, n, "%s%s%s", h->cmd ? h->cmd : "", h->name[0] ? " " : "", h->name);
     return buf;
 }
 
 static int same_helper(const struct helper *a, const struct helper *b) {
-    return !strcmp(a->cmd, b->cmd) && !strcmp(a->name, b->name);
+    return !strcmp(a->cmd ? a->cmd : "", b->cmd ? b->cmd : "") && !strcmp(a->name, b->name);
 }
 
 /* Параметры запуска — из нового состава: у помощника-программы они в аргументах (очередь,
  * файл ключей zapret), и перезапуск ради новой подписи обязан взять новые. */
 static void take_params(struct helper *h, const struct helper *f) {
-    memcpy(h->prog, f->prog, sizeof(h->prog));
-    memcpy(h->arg, f->arg, sizeof(h->arg));
-    memcpy(h->env, f->env, sizeof(h->env));
+    /* Нет памяти — параметры остаются прежними: следующая сверка возьмёт новые. */
+    launch_copy(h, f->cmd, f->prog, f->arg, f->arg_n, f->env, f->env_n);
     h->module = f->module;
 }
 
@@ -184,7 +306,7 @@ void helpers_merge(struct helper_set *s, const struct helper *fresh, size_t fn) 
             take_params(&h[i], &fresh[k]);
             have = 1;
         }
-        if (!have) h[s->n++] = fresh[k];
+        if (!have && helper_clone(&h[s->n], &fresh[k]) == 0) s->n++;
     }
     /* Спеку исправили — упавшему незачем досиживать растущую паузу до пяти минут. */
     for (size_t i = 0; i < s->n; i++)
@@ -238,6 +360,8 @@ void helpers_compact(struct helper_set *s) {
         if (!(s->h[i].gone && !s->h[i].pid)) {
             if (w != i) s->h[w] = s->h[i];
             w++;
+        } else {
+            helper_launch_free(&s->h[i]);
         }
     s->n = w;
 }
@@ -263,10 +387,13 @@ void helper_started(struct helper *h, pid_t pid) {
             (int)pid);
 }
 
-void helper_argv(const struct helper *h, const char *exe, const char *self, int seam,
-                 const char *spec, char *progbuf, size_t pbn, const char **av) {
+const char **helper_argv(const struct helper *h, const char *exe, const char *self, int seam,
+                         const char *spec, char *progbuf, size_t pbn) {
+    /* Слов: до трёх своих, аргументы программы, пять у подкоманды (--spec, --state-dir) и NULL. */
+    const char **av = malloc((h->arg_n + 10) * sizeof(*av));
+    if (!av) return NULL;
     size_t n = 0;
-    if (h->prog[0] && !h->module) {
+    if (h->prog && h->prog[0] && !h->module) {
         /* Помощник-программа (steer-nfqws) лежит рядом с движком — как /usr/sbin у init.d.
          * Шов стенда подменяет и её, получая имя помощника и выход первыми словами. */
         if (seam) {
@@ -279,10 +406,9 @@ void helper_argv(const struct helper *h, const char *exe, const char *self, int 
             snprintf(progbuf, pbn, "%.*s/%s", dl, sl ? self : ".", h->prog);
             av[n++] = progbuf;
         }
-        for (size_t i = 0; i < sizeof(h->arg) / sizeof(h->arg[0]) && h->arg[i][0]; i++)
-            av[n++] = h->arg[i];
+        for (size_t i = 0; i < h->arg_n; i++) av[n++] = h->arg[i];
         av[n] = NULL;
-        return;
+        return av;
     }
     if (h->module && !seam) {
         /* Бинарник модуля — рядом с движком (steer_module_dir: каталог исполняемого файла или
@@ -307,6 +433,11 @@ void helper_argv(const struct helper *h, const char *exe, const char *self, int 
         av[n++] = steer_state_dir();
     }
     av[n] = NULL;
+    return av;
+}
+
+void helper_putenv(const struct helper *h) {
+    for (size_t i = 0; i < h->env_n; i++) putenv(h->env[i]);
 }
 
 const char *helper_argv0(const char *exe, char *buf, size_t n) {

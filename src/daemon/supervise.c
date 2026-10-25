@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -82,7 +83,8 @@ static int sup_list(const char *spec, struct helper **outp, size_t *n) {
             if (registry_assign(&cfg, &e) < 0) err_die(&e);
             k = helpers_plan(&cfg, h, cfg.out_n + 1, NULL);
         }
-        if (fwrite(&k, sizeof(k), 1, w) != 1 || (k && fwrite(h, sizeof(h[0]), k, w) != k)) _exit(1);
+        if (fwrite(&k, sizeof(k), 1, w) != 1) _exit(1);
+        for (size_t i = 0; i < k; i++) if (helper_write(w, &h[i]) != 0) _exit(1);
         if (fclose(w) != 0) _exit(1);
         _exit(0);
     }
@@ -90,12 +92,13 @@ static int sup_list(const char *spec, struct helper **outp, size_t *n) {
     FILE *r = fdopen(pfd[0], "r");
     size_t k = 0;
     struct helper *out = NULL;
-    /* Число записей приходит первым; место под них — по нему (не по константе). Потолок числа —
-     * разумная защита от испорченной трубы: записей больше миллиона быть не может. */
-    int ok = r && fread(&k, sizeof(k), 1, r) == 1 && k <= (1u << 20);
+    /* Число записей приходит первым; место под них — по нему (не по константе). */
+    int ok = r && fread(&k, sizeof(k), 1, r) == 1;
     if (ok && k) {
         out = calloc(k, sizeof(*out));
-        ok = out && fread(out, sizeof(out[0]), k, r) == k;
+        ok = out != NULL;
+        for (size_t i = 0; ok && i < k; i++) ok = helper_read(r, &out[i]) == 0;
+        if (!ok && out) { helpers_launch_free(out, k); }
     }
     if (r) fclose(r); else close(pfd[0]);
     int st = 0;
@@ -114,26 +117,27 @@ struct sup_run {
 
 static int sup_start(struct helper *h, void *arg) {
     const struct sup_run *r = arg;
-    const char *av[12];
-    char prog[600];
-    helper_argv(h, r->exe, r->self, r->seam, r->spec, prog, sizeof(prog), av);
+    char prog[PATH_MAX + 32];
+    const char **av = helper_argv(h, r->exe, r->self, r->seam, r->spec, prog, sizeof(prog));
+    if (!av) return -1;
     const char *path = av[0];
-    char a0[600];
+    char a0[PATH_MAX + 8];
     av[0] = helper_argv0(path, a0, sizeof(a0));
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) { free(av); return -1; }
     if (pid == 0) {
         sigprocmask(SIG_UNBLOCK, r->blocked, NULL);
-        if (h->env[0]) putenv(h->env);
+        helper_putenv(h);
         execv(path, (char *const *)av);
         _exit(127);
     }
+    free(av);
     helper_started(h, pid);
     return 0;
 }
 
 int cmd_supervise(const char *spec) {
-    char exe[512], self[512];
+    char exe[PATH_MAX], self[PATH_MAX];
     ssize_t el = readlink("/proc/self/exe", self, sizeof(self) - 1);
     if (el <= 0) die("supervise: не найти свой исполняемый файл (%s)", strerror(errno));
     self[el] = '\0';
@@ -157,6 +161,7 @@ int cmd_supervise(const char *spec) {
         if (sup_list(spec, &first, &fn0) != 0)
             die("supervise: спека %s не разобралась — поднимать нечего", spec);
         if (fn0 && helpers_reserve(&hs, fn0) != 0) die("supervise: нет памяти под помощников", NULL);
+        /* Записи из трубы — свои, со своими строками: набор забирает их как есть. */
         if (fn0) memcpy(hs.h, first, fn0 * sizeof(*first));
         hs.n = fn0;
         free(first);
@@ -187,6 +192,7 @@ int cmd_supervise(const char *spec) {
                 continue;
             }
             helpers_merge(&hs, fresh, fn);
+            helpers_launch_free(fresh, fn);
             free(fresh);
             helpers_compact(&hs);
         } else {                                       /* SIGTERM, SIGINT */

@@ -98,8 +98,8 @@
  * не даёт вторичным пользователям настройки сети устройства.
  *
  * ПРЕДЕЛЫ. Не больше четырёх запросов одновременно (пятому — busy сразу, не очередь: очередь
- * держала бы соединения открытыми на неопределённое время); подписчиков — не больше восьми, и
- * они в четыре запроса не входят. Строка 512 байт, тело 1 МиБ (файл списка — 16 МиБ); пять
+ * держала бы соединения открытыми на неопределённое время); подписчиков — сколько позволит RLIMIT_NOFILE
+ * процесса, и они в четыре запроса не входят. Строка 512 байт, тело 1 МиБ (файл списка — 16 МиБ); пять
  * секунд на запрос; у каждой команды через ребёнка свой срок, по истечении — SIGKILL всей
  * группе процессов команды (nft и ip, которых она запустила, тоже). Медленный или молчащий
  * клиент демон не держит: чтение и запись неблокирующие, со сроками, а очередь событий
@@ -142,6 +142,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #ifdef __BIONIC__
 #include <sys/system_properties.h>
@@ -204,8 +205,10 @@
  * дочитывать непрочитанный остаток запроса после ответа (см. conn_drain). */
 #define CTL_SEND_MS     5000
 #define CTL_DRAIN_MS    1000
-/* ПОДПИСЧИКИ. Восемь — с запасом на приложение (экран и фоновая служба) и отладку из adb;
- * больше незачем, а каждый — открытый дескриптор и очередь в памяти демона.
+/* ПОДПИСЧИКИ. Число не ограничено: подписчики — приложение, отладка из adb и плагины (у
+ * каждого свой), а каждый — открытый дескриптор и очередь в памяти демона. Предел у числа один —
+ * RLIMIT_NOFILE процесса: мягкий предел при старте поднимается до жёсткого (ctl_serve_main), а
+ * упёршись, accept ждёт освободившегося дескриптора (accept_tm).
  *
  * Очередь событий подписчика — 32 КиБ поверх буфера сокета (его демон уменьшает до 16 КиБ,
  * чтобы очередь, которую он видит, и была той, что ограничена). Событие — сотня байт, и
@@ -213,10 +216,8 @@
  * держать для него память дальше значило бы дать одному зависшему клиенту расти в демоне без
  * предела. Переполнение — отключить: подписчик переподключится и спросит status заново, это
  * честнее, чем тихо выбрасывать события из середины потока. */
-#define CTL_SUBS_MAX    8
 #define CTL_SUBQ_MAX    (32 * 1024)
 #define CTL_SUB_SNDBUF  (16 * 1024)
-#define CTL_ALLOW_UIDS  8
 #define CTL_AID_SYSTEM  1000
 #define CTL_USER_RANGE  100000   /* AID_USER_OFFSET: uid = пользователь * 100000 + приложение */
 
@@ -231,13 +232,13 @@ struct ctl_conf {
     const char *state_dir;       /* NULL — умолчание движка, флаг подкомандам не передаётся */
     const char *lists_dir;       /* куда put-file кладёт файлы (lists_dir платформы, --lists-dir) */
     const char *allow_domain;    /* NULL или "" — по домену не пускать */
-    uid_t allow_uid[CTL_ALLOW_UIDS];
+    uid_t *allow_uid;            /* куча: --allow-uid столько раз, сколько дано */
     int allow_uid_n;
     int watch;                   /* --watch: демон — сторож выходов (watchd.c) */
     int watch_period;            /* --watch-period, секунд */
     int supervise;               /* --supervise: помощники и резолвер — дети демона (supd.c) */
     int apply;                   /* --apply: применить спеку при старте (как reload) */
-    const char *dnsd_flags[9];   /* --dnsd-flag: лишние флаги резолверу-ребёнку, NULL в конце */
+    const char **dnsd_flags;     /* --dnsd-flag: лишние флаги резолверу-ребёнку, NULL в конце (куча) */
     int dnsd_flag_n;
     char exe[PATH_MAX];
 };
@@ -527,7 +528,7 @@ struct conn {
     struct ctl_srv *srv;
     int fd;
     enum conn_state st;
-    int counted;              /* входит в четыре одновременных запроса */
+    int counted;              /* занимает одно из четырёх мест (CTL_CLIENTS_MAX) */
     int hup;                  /* собеседник ушёл, пока команда шла: ответ отдавать некому */
     int eof;                  /* подписчик закрыл свою половину — читать больше нечего */
     struct loop_timer *tm;    /* срок запроса, отдачи или дочитывания */
@@ -2172,11 +2173,6 @@ static void sub_push(struct steerd_sub *sb, const char *line, size_t n) {
 
 static void st_subscribe(struct conn *c) {
     struct ctl_srv *s = c->srv;
-    if (s->subs >= CTL_SUBS_MAX) {
-        resp_error(&c->resp, "busy", "подписчиков уже восемь — повторите позже");
-        conn_reply(c);
-        return;
-    }
     if (c->counted) { c->counted = 0; s->active--; }
     s->subs++;
     c->st = C_SUB;
@@ -2213,6 +2209,13 @@ static int conn_parse(struct conn *c) {
     const struct ctl_cmd *cmd = ctl_lookup(tok[0]);
     if (!cmd) { conn_refuse(c, NULL, "unknown-command", "такой команды нет"); return -1; }
 
+    if (!c->counted) {
+        if (!strcmp(cmd->name, "subscribe")) { /* не занимает место */ }
+        else if (c->srv->active >= CTL_CLIENTS_MAX) {
+            conn_refuse(c, cmd->name, "busy", "сервер занят другими запросами — повторите позже");
+            return -1;
+        } else { c->counted = 1; c->srv->active++; }
+    }
     memset(&c->q, 0, sizeof(c->q));
     c->q.cmd = cmd;
     c->q.cf = &c->srv->cf;
@@ -2489,10 +2492,6 @@ static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
             ctl_refuse_now(c, "denied", "этому процессу управлять ядром steer нельзя");
             continue;
         }
-        if (s->active >= CTL_CLIENTS_MAX) {
-            ctl_refuse_now(c, "busy", "сервер занят другими запросами — повторите позже");
-            continue;
-        }
         struct conn *n = calloc(1, sizeof(*n));
         if (n) {
             n->srv = s;
@@ -2507,8 +2506,11 @@ static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
             continue;
         }
         n->st = C_REQ;
-        n->counted = 1;
-        s->active++;
+        /* Четыре запроса — это ИДУЩИЕ команды. Соединение, которое ещё не прислало строку,
+         * место занимает, пока оно есть; сверх четырёх оно принимается без места и получает его
+         * по строке (conn_parse) — или busy, если это не subscribe: подписчики, которых плагины
+         * поднимают разом, в четыре запроса не входят и не упираются в них. */
+        if (s->active < CTL_CLIENTS_MAX) { n->counted = 1; s->active++; }
         n->next = s->conns;
         s->conns = n;
         loop_timer_set(n->tm, CTL_REQ_MS);
@@ -3000,7 +3002,7 @@ void ctl_usage_flags(FILE *out) {
           "  --spec ФАЙЛ         daemon: спека, которую читают и заменяют команды\n"
           "                      (по умолчанию %s)\n"
           "  --state-dir КАТАЛОГ daemon: каталог состояния (по умолчанию %s)\n"
-          "  --allow-uid N       daemon: пускать и этот uid (до восьми раз); root и system\n"
+          "  --allow-uid N       daemon: пускать и этот uid (сколько угодно раз); root и system\n"
           "                      пускаются всегда\n"
           "  --allow-domain ИМЯ  daemon: пускать процессы этого домена SELinux у владельца\n"
           "                      устройства (по умолчанию splify2_app на платформе Android;\n"
@@ -3011,7 +3013,7 @@ void ctl_usage_flags(FILE *out) {
           "  --watch-period СЕК  daemon: период прохода сторожа в тишине (по умолчанию 60)\n"
           "  --supervise         daemon: держать помощников выходов и резолвер самому (вместо\n"
           "                      procd или steer supervise; оба сразу не запускать)\n"
-          "  --dnsd-flag ФЛАГ    daemon: передать резолверу ещё и этот флаг (до восьми раз)\n"
+          "  --dnsd-flag ФЛАГ    daemon: передать резолверу ещё и этот флаг (сколько угодно раз)\n"
           "  --apply             daemon: применить спеку при старте (сверкой, как reload)\n",
           p->ctl_sock, p->spec_path, p->state_dir, p->lists_dir);
 }
@@ -3067,6 +3069,13 @@ int ctl_serve_main(int argc, char **argv) {
     cf->spec = plat_spec_default();
     cf->lists_dir = plat()->lists_dir;
     cf->allow_domain = plat()->ctl_allow_domain;
+    /* Дескрипторы: каждый подписчик и каждый запрос — по одному, а плагинов и подписчиков
+     * не ограничено. Мягкий предел поднимается до жёсткого — права для этого не нужны. */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
     for (int i = 0; i < argc; i++) {
         const char *f = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -3084,7 +3093,9 @@ int ctl_serve_main(int argc, char **argv) {
                 char *e = NULL;
                 unsigned long u = strtoul(v, &e, 10);
                 if (!*v || *e || u > 0xfffffffful) ctl_bad_flag("daemon", "--allow-uid: нужно число", v);
-                if (cf->allow_uid_n >= CTL_ALLOW_UIDS) ctl_bad_flag("daemon", "--allow-uid больше восьми раз", NULL);
+                uid_t *nu = realloc(cf->allow_uid, ((size_t)cf->allow_uid_n + 1) * sizeof(*nu));
+                if (!nu) ctl_bad_flag("daemon", "нет памяти", NULL);
+                cf->allow_uid = nu;
                 cf->allow_uid[cf->allow_uid_n++] = (uid_t)u;
             }
             continue;
@@ -3095,8 +3106,12 @@ int ctl_serve_main(int argc, char **argv) {
         if (!strcmp(f, "--dnsd-flag")) {
             if (!v) ctl_bad_flag("daemon", "у флага нет значения", f);
             i++;
-            if (cf->dnsd_flag_n >= 8) ctl_bad_flag("daemon", "--dnsd-flag больше восьми раз", NULL);
+            /* Место и под закрывающий NULL. */
+            const char **nf = realloc(cf->dnsd_flags, ((size_t)cf->dnsd_flag_n + 2) * sizeof(*nf));
+            if (!nf) ctl_bad_flag("daemon", "нет памяти", NULL);
+            cf->dnsd_flags = nf;
             cf->dnsd_flags[cf->dnsd_flag_n++] = v;
+            cf->dnsd_flags[cf->dnsd_flag_n] = NULL;
             continue;
         }
         if (!strcmp(f, "--watch-period")) {

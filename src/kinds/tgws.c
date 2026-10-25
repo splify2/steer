@@ -67,7 +67,7 @@ static int tgws_helper(const struct spec *sp, const struct output *o, struct kin
     /* Полный пакет — статическая сборка с профилем extended, либо модуль steer-tgws рядом с
      * движком (1.10, шаг 4): без обоих моста нет, и помощник не называется. */
     if (!prof()->extended && !steer_module_present("steer-tgws")) return -1;
-    snprintf(h->cmd, sizeof(h->cmd), "tgws");
+    if (kind_helper_cmd(h, "tgws") != 0) return -1;
     kind_sig_mix(&h->sig, o->tg.domain, strlen(o->tg.domain));
     return 0;
 }

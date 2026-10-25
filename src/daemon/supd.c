@@ -132,16 +132,16 @@
  * отдаче. Одна таблица в пустую очередь принимается любой длины. */
 #define SUPD_TABQ_MIN (1024 * 1024)
 #define SUPD_TABQ_TABS 8
-#define SUPD_DNSD_FLAGS 8
 
 struct supd {
     struct steerd *d;
     struct loop *l;
     int (*enabled)(void);
-    const char *dnsd_flags[SUPD_DNSD_FLAGS + 1];
+    const char **dnsd_flags;        /* куча, NULL в конце; число флагов не ограничено */
+    size_t dnsd_flag_n;
     struct helper_set set;
     struct helper *fresh;          /* план сверки: по выходу спеки + резолвер (supd_plan) */
-    size_t fresh_cap;
+    size_t fresh_cap, fresh_n;
     struct loop_timer *tm;
     char exe[PATH_MAX];       /* движок или шов STEER_SUPERVISE_EXE */
     char self[PATH_MAX];      /* настоящий файл движка: резолвер и помощники-программы */
@@ -405,9 +405,8 @@ int supd_member_verdict(const struct steerd *d, const char *out) {
     return -1;
 }
 
-static void ev_line(struct supd *s, struct helper *h, const char *line) {
-    struct evline e;
-    if (evline_parse(line, &e) != 0) return;
+static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *ep) {
+    const struct evline e = *ep;
     struct helper_state *st = &h->st;
     long v, t;
     /* Шов стенда (STEER_SUPERVISE_EXE) подменяет модуль заглушкой движка: она про hello не знает. */
@@ -470,6 +469,13 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
         snprintf(st->active, sizeof(st->active), "%s", nodes);
         st->active_known = 1;
     }
+}
+
+static void ev_line(struct supd *s, struct helper *h, const char *line) {
+    struct evline e;
+    if (evline_parse(line, &e) != 0) return;
+    ev_dispatch(s, h, &e);
+    evline_free(&e);
 }
 
 /* Дочитать трубу помощника. 1 — открыта, 0 — конец (закрыта здесь же). */
@@ -681,20 +687,31 @@ static unsigned long long proc_start(pid_t pid) {
 }
 
 /* Файл /proc/<pid>/<what> целиком (environ, cmdline — строки через NUL) до n-1 байт; длина. */
-static size_t proc_read(pid_t pid, const char *what, char *b, size_t n) {
+static size_t proc_read(pid_t pid, const char *what, char **out) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/%s", (int)pid, what);
+    *out = NULL;
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;
-    size_t got = 0;
-    while (got < n - 1) {
-        ssize_t m = read(fd, b + got, n - 1 - got);
+    /* Окружение с плагинами бывает любым по размеру: читаем, пока не кончится. */
+    char *b = NULL;
+    size_t got = 0, cap = 0;
+    for (;;) {
+        if (got + 4097 > cap) {
+            size_t nc = cap ? cap * 2 : 8192;
+            char *nb = realloc(b, nc);
+            if (!nb) { free(b); close(fd); return 0; }
+            b = nb;
+            cap = nc;
+        }
+        ssize_t m = read(fd, b + got, cap - 1 - got);
         if (m < 0 && errno == EINTR) continue;
         if (m <= 0) break;
         got += (size_t)m;
     }
     close(fd);
     b[got] = '\0';
+    *out = b;
     return got;
 }
 
@@ -712,13 +729,22 @@ static const char *nul_env(const char *b, size_t n, const char *key) {
 
 /* Помощник ли pid демона этого каталога состояния, оставшийся без демона (шапка, признак 3). В
  * what — «команда выход» из командной строки, для журнала. */
+static int orphan_check(pid_t pid, char *what, size_t wn, char **envp, char **clp);
 static int orphan_of(pid_t pid, char *what, size_t wn) {
-    static char env[32768];
-    char cl[PATH_MAX + 256];
+    char *env = NULL, *cl = NULL;
+    int rc = orphan_check(pid, what, wn, &env, &cl);
+    free(env);
+    free(cl);
+    return rc;
+}
+
+static int orphan_check(pid_t pid, char *what, size_t wn, char **envp, char **clp) {
     if (!proc_start(pid)) return 0;
-    size_t n = proc_read(pid, "environ", env, sizeof(env));
+    size_t n = proc_read(pid, "environ", envp);
+    char *env = *envp;
     if (!n || !nul_env(env, n, "STEER_EVENT_FD")) return 0;
-    size_t cn = proc_read(pid, "cmdline", cl, sizeof(cl));
+    size_t cn = proc_read(pid, "cmdline", clp);
+    char *cl = *clp ? *clp : (char *)"";
     const char *tag = nul_env(env, n, "STEER_SUPD");
     if (!tag) return 0;
     char *end = NULL;
@@ -1129,7 +1155,8 @@ static int adopt_dnsd(struct supd *s, struct helper *h) {
 static int dnsd_spawn(struct supd *s, struct helper *h) {
     int p[2];
     if (pipe2(p, O_CLOEXEC) != 0) return -1;
-    const char *av[8 + SUPD_DNSD_FLAGS];
+    const char **av = malloc((8 + s->dnsd_flag_n) * sizeof(*av));
+    if (!av) { close(p[0]); close(p[1]); return -1; }
     size_t n = 0;
     av[n++] = s->self;
     av[n++] = "dnsd";
@@ -1144,13 +1171,14 @@ static int dnsd_spawn(struct supd *s, struct helper *h) {
     char a0[PATH_MAX + 8];
     av[0] = helper_argv0(s->self, a0, sizeof(a0));
     pid_t pid = fork();
-    if (pid < 0) { close(p[0]); close(p[1]); return -1; }
+    if (pid < 0) { free(av); close(p[0]); close(p[1]); return -1; }
     if (pid == 0) {
         loop_child_reset();
         child_fd3(p[0]);
         execv(s->self, (char *const *)av);
         _exit(127);
     }
+    free(av);
     close(p[0]);
     fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL) | O_NONBLOCK);
     tab_close(s);
@@ -1199,23 +1227,24 @@ static int start_one(struct helper *h, void *arg) {
         h->mver[0] = '\0';
         int p[2];
         if (pipe2(p, O_CLOEXEC) != 0) return -1;
-        const char *av[12];
         char prog[PATH_MAX + 32];
-        helper_argv(h, s->exe, s->self, s->seam, s->d->spec_path, prog, sizeof(prog), av);
+        const char **av = helper_argv(h, s->exe, s->self, s->seam, s->d->spec_path, prog, sizeof(prog));
+        if (!av) { close(p[0]); close(p[1]); return -1; }
         const char *path = av[0];
         char a0[PATH_MAX + 8];
         av[0] = helper_argv0(path, a0, sizeof(a0));
         pid_t pid = fork();
-        if (pid < 0) { close(p[0]); close(p[1]); return -1; }
+        if (pid < 0) { free(av); close(p[0]); close(p[1]); return -1; }
         if (pid == 0) {
             loop_child_reset();
             child_arm(s);
             child_fd3(p[1]);
             putenv("STEER_EVENT_FD=3");
-            if (h->env[0]) putenv(h->env);
+            helper_putenv(h);
             execv(path, (char *const *)av);
             _exit(127);
         }
+        free(av);
         close(p[1]);
         fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
         h->evfd = p[0];
@@ -1309,6 +1338,9 @@ int dnsd_wanted(void) {
 
 static size_t supd_plan(struct supd *s) {
     size_t n = 0;
+    /* Прежний план отдан сверке и больше не нужен: его строки — свои у каждой записи. */
+    helpers_launch_free(s->fresh, s->fresh_n);
+    s->fresh_n = 0;
     if (!s->d->have || (s->enabled && !s->enabled())) return 0;
     /* Помощников не больше выходов спеки + резолвер. */
     size_t need = s->d->sp->out_n + 1;
@@ -1322,13 +1354,13 @@ static size_t supd_plan(struct supd *s) {
     if (dnsd_wanted()) {
         struct helper *h = &s->fresh[n++];
         memset(h, 0, sizeof(*h));
-        snprintf(h->cmd, sizeof(h->cmd), "dnsd");
+        if (helper_set_cmd(h, "dnsd") != 0) { n--; return s->fresh_n = n; }
         h->table = 1;
         h->sig = KIND_SIG_INIT;
         h->delay_ms = HELPERS_DELAY_MS;
         h->evfd = -1;
     }
-    return n;
+    return s->fresh_n = n;
 }
 
 struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
@@ -1340,8 +1372,12 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     s->dn_fd = -1;
     s->dn_conn = -1;
     s->ad_p1 = -1;
-    for (size_t i = 0; c->dnsd_flags && c->dnsd_flags[i] && i < SUPD_DNSD_FLAGS; i++)
-        s->dnsd_flags[i] = c->dnsd_flags[i];
+    size_t nfl = 0;
+    while (c->dnsd_flags && c->dnsd_flags[nfl]) nfl++;
+    s->dnsd_flags = calloc(nfl + 1, sizeof(*s->dnsd_flags));
+    if (!s->dnsd_flags) { free(s); return NULL; }
+    for (size_t i = 0; i < nfl; i++) s->dnsd_flags[i] = c->dnsd_flags[i];
+    s->dnsd_flag_n = nfl;
     ssize_t el = readlink("/proc/self/exe", s->self, sizeof(s->self) - 1);
     if (el <= 0) { free(s); return NULL; }
     s->self[el] = '\0';
@@ -1365,8 +1401,9 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     status_extra_source(status_fields);
     size_t fn = supd_plan(s);
     if (fn && helpers_reserve(&s->set, fn) != 0) { free(s->fresh); free(s); return NULL; }
-    if (fn) memcpy(s->set.h, s->fresh, fn * sizeof(s->fresh[0]));
-    s->set.n = fn;
+    for (size_t i = 0; i < fn; i++)
+        if (helper_clone(&s->set.h[s->set.n], &s->fresh[i]) == 0) s->set.n++;
+    fn = s->set.n;
     if (d->have && fn == (size_t)(dnsd_wanted() && (!s->enabled || s->enabled())))
         fprintf(stderr, "steer[info] supervise: выходов со своим процессом в спеке нет\n");
     int dn = 0;

@@ -119,7 +119,7 @@ static void proxy_diag(kind_diag_fn *put, const struct spec *sp, const struct ou
 
 static int proxy_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
-    snprintf(h->cmd, sizeof(h->cmd), "proxy");
+    if (kind_helper_cmd(h, "proxy") != 0) return -1;
     kind_sig_mix(&h->sig, o->proxy.sub_file, strlen(o->proxy.sub_file));
     kind_sig_mix(&h->sig, &o->proxy.proto, sizeof(o->proxy.proto));
     if (o->proxy.insecure) kind_sig_mix(&h->sig, "insecure", 8);

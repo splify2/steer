@@ -100,7 +100,7 @@ static int xsteer_latency(const struct spec *sp, const struct output *o, const c
  * daemon/helpers.c). */
 static int xsteer_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
-    snprintf(h->cmd, sizeof(h->cmd), "xsteer");
+    if (kind_helper_cmd(h, "xsteer") != 0) return -1;
     kind_sig_mix(&h->sig, o->xs.conf, strlen(o->xs.conf));
     kind_sig_mix(&h->sig, &o->xs.stream, sizeof(o->xs.stream));
     kind_sig_mix(&h->sig, &o->xs.stream_port, sizeof(o->xs.stream_port));

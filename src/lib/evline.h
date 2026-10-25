@@ -123,34 +123,32 @@ void evline_hello(const char *module, const char *version);
 
 /* ---- разбор строки, для читателя (демон) --------------------------------------------- */
 
-#define EVLINE_MAXFIELDS 6
-#define EVLINE_KEYLEN 16
-/* Строка значения — до длины самого события: список узлов пула и другие длинные поля не
- * обрезаются при разборе (прежние 200 байт молча отдавали обрубок). Структура живёт на стеке. */
-#define EVLINE_VALLEN EVLINE_LINE_MAX
-
+/* Поля, ключи и строки разбора живут в куче и не ограничены ни числом, ни длиной (событие плагина
+ * может нести сколько угодно полей с любыми именами; сама строка — не длиннее трубы,
+ * EVLINE_LINE_MAX). Разобранное освобождает evline_free. */
 struct evline_field {
-    char key[EVLINE_KEYLEN];
+    char *key;
     enum evline_type type;
     union {
         long i;
-        char s[EVLINE_VALLEN];
+        char *s;
     } v;
 };
 
 struct evline {
-    char ev[EVLINE_KEYLEN];
+    char *ev;
     int n;                              /* сколько полей в f, помимо самого ev */
-    struct evline_field f[EVLINE_MAXFIELDS];
+    struct evline_field *f;
+    int cap;
 };
 
 /* Разобрать ОДНУ строку (конечный \n, если есть, игнорируется). 0 — разобралось и есть
  * строковое поле "ev"; -1 — не похоже на нашу строку (не объект JSON, нет "ev", "ev" не
- * строка). Полей сверх EVLINE_MAXFIELDS — отбрасываются молча: контракт версии 1 не носит
- * больше двух-трёх полей на событие (таблица выше), а вырасти он может только вместе с
- * этим числом. Разбирает ТОЛЬКО то, что сама evline_emit и печатает (плоский объект,
- * строки и целые числа) — это не общий разбор JSON. */
+ * строка) или нет памяти. Все поля попадают в разбор, ни одно не отбрасывается. Разбирает
+ * ТОЛЬКО то, что сама evline_emit и печатает (плоский объект, строки и целые числа) — это не
+ * общий разбор JSON. После вызова out освобождается evline_free — и при отказе тоже. */
 int evline_parse(const char *line, struct evline *out);
+void evline_free(struct evline *e);
 
 /* Найти поле по имени. NULL/0, если поля нет или оно другого типа. */
 const char *evline_str(const struct evline *e, const char *key);

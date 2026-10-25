@@ -22,6 +22,7 @@
  * Строки отказа базовых видов (interface, tgws, awg) в настоящей сборке недостижимы —
  * эти файлы входят в каждый профиль. Они нужны стендам, которые компонуют модель с частью видов,
  * и там отказ честнее падения. */
+#include <stdlib.h>
 #include <string.h>
 
 #include "spec.h"
@@ -147,4 +148,41 @@ void kind_sig_mix(unsigned long long *h, const void *p, size_t n) {
     const unsigned char *b = p;
     for (size_t i = 0; i < n; i++) { *h ^= b[i]; *h *= 1099511628211ULL; }
     *h ^= 0xff; *h *= 1099511628211ULL;   /* граница поля: «ab»+«c» не равно «a»+«bc» */
+}
+
+/* ---- поля помощника (kind_helper) --------------------------------------------------------- */
+
+static int kh_str(char **dst, const char *v) {
+    char *c = strdup(v);
+    if (!c) return -1;
+    free(*dst);
+    *dst = c;
+    return 0;
+}
+
+static int kh_add(char ***vec, size_t *n, const char *v) {
+    char *c = strdup(v);
+    if (!c) return -1;
+    char **nv = realloc(*vec, (*n + 1) * sizeof(*nv));
+    if (!nv) { free(c); return -1; }
+    nv[(*n)++] = c;
+    *vec = nv;
+    return 0;
+}
+
+int kind_helper_cmd(struct kind_helper *h, const char *cmd) { return kh_str(&h->cmd, cmd); }
+int kind_helper_prog(struct kind_helper *h, const char *prog) { return kh_str(&h->prog, prog); }
+int kind_helper_arg(struct kind_helper *h, const char *arg) { return kh_add(&h->arg, &h->arg_n, arg); }
+int kind_helper_env(struct kind_helper *h, const char *var) { return kh_add(&h->env, &h->env_n, var); }
+
+void kind_helper_free(struct kind_helper *h) {
+    free(h->cmd);
+    free(h->prog);
+    for (size_t i = 0; i < h->arg_n; i++) free(h->arg[i]);
+    free(h->arg);
+    for (size_t i = 0; i < h->env_n; i++) free(h->env[i]);
+    free(h->env);
+    h->cmd = h->prog = NULL;
+    h->arg = h->env = NULL;
+    h->arg_n = h->env_n = 0;
 }

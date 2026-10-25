@@ -362,7 +362,7 @@ static unsigned group_caps_of(const struct output *o) {
 static int group_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     const struct group_cfg *g = &o->grp;
     if (!g->warp.on) return -1;
-    snprintf(h->cmd, sizeof(h->cmd), "warp");
+    if (kind_helper_cmd(h, "warp") != 0) return -1;
     h->marks = 1;
     kind_sig_mix(&h->sig, &g->warp.transport, sizeof(g->warp.transport));
     kind_sig_mix(&h->sig, &g->warp.xcc_set, sizeof(g->warp.xcc_set));

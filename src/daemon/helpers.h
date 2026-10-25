@@ -82,11 +82,17 @@ struct helper_state {
 
 struct helper {
     /* Состав — из вида выхода (kind_ops.helper). */
-    char cmd[16];               /* «hysteria2» — девять знаков: восьми уже не хватало */
-    char name[32];
-    char prog[16];
-    char arg[2][256];
-    char env[32];
+    /* Как запустить — строки в куче, без пределов по длине и числу (плагины ставят свои
+     * программы, аргументы и переменные): helper_launch_set, helper_clone, helper_launch_free.
+     * prog — NULL или пусто, если помощник — подкоманда движка; arg — аргументы программы;
+     * env — «ИМЯ=значение», по одной на переменную. */
+    char *cmd;
+    char name[32];               /* имя выхода: спека v2 держит его в 32 байтах */
+    char *prog;
+    char **arg;
+    size_t arg_n;
+    char **env;
+    size_t env_n;
     /* prog — бинарник модуля (steer-vless и остальные, src/lib/module.h), а не своя программа
      * вроде steer-nfqws: ему передаются те же слова, что подкоманде (`<cmd> <выход> --spec …`),
      * он присылает hello с версией (evline.h), и демон сверяет её со своей. Ставится
@@ -126,6 +132,23 @@ struct helper_set {
 /* Место в наборе на n помощников. 0 — есть; -1 — нет памяти. */
 int helpers_reserve(struct helper_set *s, size_t n);
 
+/* Поля запуска (cmd, prog, arg, env) — из описания вида; прежние освобождаются. 0 или -1 (нет
+ * памяти: поля остаются пустыми). */
+struct kind_helper;
+int helper_launch_set(struct helper *h, const struct kind_helper *hp);
+/* cmd — одной строкой (резолвер dnsd: описания вида у него нет). */
+int helper_set_cmd(struct helper *h, const char *cmd);
+/* Копия помощника целиком: dst получает свои строки. 0 или -1 (dst обнулён). */
+int helper_clone(struct helper *dst, const struct helper *src);
+/* Освободить поля запуска помощника (сам он остаётся: набор владеет массивом). */
+void helper_launch_free(struct helper *h);
+/* ...у n помощников подряд. */
+void helpers_launch_free(struct helper *v, size_t n);
+/* Запись и чтение помощника по трубе (supervise.c: состав считает дочерний процесс). Чтение
+ * ждёт записи того же процесса: раскладка структуры одна, а строки идут следом с длинами. */
+int helper_write(FILE *w, const struct helper *h);
+int helper_read(FILE *r, struct helper *h);
+
 /* Состав помощников по разобранной спеке — в порядке зависимостей via: цель раньше того, чей
  * туннель через неё идёт. Метки выходов с via (и модуль DPI) уже должны быть назначены реестром;
  * *need_marks (может быть NULL) — 1, если кому-то из помощников нужны метки. */
@@ -152,10 +175,14 @@ long helpers_due(struct helper_set *s, helper_start_fn start, void *arg);
 void helper_started(struct helper *h, pid_t pid);
 
 /* argv помощника: exe — движок (или шов STEER_SUPERVISE_EXE), self — настоящий файл движка (у
- * помощника-программы она лежит рядом с ним), seam — exe подменён швом. av — не меньше 10
- * мест. Помощник-подкоманда получает --state-dir, если каталог состояния не путь платформы. */
-void helper_argv(const struct helper *h, const char *exe, const char *self, int seam,
-                 const char *spec, char *progbuf, size_t pbn, const char **av);
+ * помощника-программы она лежит рядом с ним), seam — exe подменён швом. Возвращает массив из
+ * кучи, закрытый NULL (число слов не ограничено; освобождает free вызвавший), NULL — нет
+ * памяти. Строки массива — в h, в spec и в progbuf: пока массив нужен, они должны жить.
+ * Помощник-подкоманда получает --state-dir, если каталог состояния не путь платформы. */
+const char **helper_argv(const struct helper *h, const char *exe, const char *self, int seam,
+                         const char *spec, char *progbuf, size_t pbn);
+/* Поставить переменные окружения помощника (в дочернем процессе перед exec). */
+void helper_putenv(const struct helper *h);
 
 /* argv[0] ребёнка, которого запускают файлом exe: «<каталог>/steer», если exe — steerd или
  * бинарник модуля (steer-vless и остальные), иначе сам exe. Процесс помощника в списке процессов

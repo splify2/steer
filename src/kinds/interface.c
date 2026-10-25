@@ -151,7 +151,7 @@ static int iface_helper(const struct spec *sp, const struct output *o, struct ki
     (void)sp;
     const struct out_obfs *ob = &o->iface.obfs;
     if (!ob->on) return -1;
-    snprintf(h->cmd, sizeof(h->cmd), "obfs");
+    if (kind_helper_cmd(h, "obfs") != 0) return -1;
     kind_sig_mix(&h->sig, ob->server, strlen(ob->server));
     kind_sig_mix(&h->sig, &ob->server_port, sizeof(ob->server_port));
     kind_sig_mix(&h->sig, ob->listen, strlen(ob->listen));

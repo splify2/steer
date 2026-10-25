@@ -133,7 +133,7 @@ static void hy2_diag(kind_diag_fn *put, const struct spec *sp, const struct outp
  * читает узлы при старте, и обновлённая подписка без перезапуска не заработала бы (см. vless.c). */
 static int hy2_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
-    snprintf(h->cmd, sizeof(h->cmd), "hysteria2");
+    if (kind_helper_cmd(h, "hysteria2") != 0) return -1;
     kind_sig_mix(&h->sig, o->hy2.sub_file, strlen(o->hy2.sub_file));
     FILE *f = fopen(o->hy2.sub_file, "r");
     if (f) {

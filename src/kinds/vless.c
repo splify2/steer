@@ -111,11 +111,11 @@ static void vless_diag(kind_diag_fn *put, const struct spec *sp, const struct ou
  * reload, SIGHUP — перезапускает клиент ровно того выхода, чья подписка изменилась. */
 static int vless_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
-    snprintf(h->cmd, sizeof(h->cmd), "vless");
+    if (kind_helper_cmd(h, "vless") != 0) return -1;
     /* Счётчики туннеля — по файлу-выключателю, как у init.d/steer (procd_set_param env). */
     char st[256];
     if (access(plat_etc_path(st, sizeof(st), "stats"), F_OK) == 0)
-        snprintf(h->env, sizeof(h->env), "STEER_TUN_STATS=1");
+        if (kind_helper_env(h, "STEER_TUN_STATS=1") != 0) return -1;
     kind_sig_mix(&h->sig, o->vless.sub_file, strlen(o->vless.sub_file));
     FILE *f = fopen(o->vless.sub_file, "r");
     if (f) {

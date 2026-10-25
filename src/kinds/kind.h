@@ -94,20 +94,31 @@ enum kind_key {
  * старте: супервизор кладёт в неё начальное значение FNV, вид подмешивает свои поля
  * (kind_sig_mix), общий код — цель `via`. */
 struct kind_helper {
-    char cmd[16];               /* «hysteria2» — девять знаков */
+    char *cmd;                  /* куча; пишет kind_helper_cmd */
     unsigned long long sig;
     /* Помощник — не подкоманда движка, а своя программа рядом с ним (внешний модуль вроде
-     * recheck). prog — имя файла в каталоге движка, arg — её аргументы
-     * (пустой — конец). prog пуст — `<движок> <cmd> <выход> --spec …`, как у остальных. */
-    char prog[16];
-    char arg[2][256];
-    /* Переменная окружения помощнику («ИМЯ=значение»; пусто — нет) — то, что init.d ставит
-     * procd_set_param env (STEER_TUN_STATS у vless). В подпись не входит: это отладка. */
-    char env[32];
+     * recheck). prog — имя файла в каталоге движка, arg — её аргументы (arg_n штук). prog
+     * пуст (NULL) — `<движок> <cmd> <выход> --spec …`, как у остальных. */
+    char *prog;
+    char **arg;
+    size_t arg_n;
+    /* Переменные окружения помощнику («ИМЯ=значение») — то, что init.d ставит
+     * procd_set_param env (STEER_TUN_STATS у vless). В подпись не входят: это отладка. */
+    char **env;
+    size_t env_n;
     /* Помощнику нужны метки реестра (номер очереди выводится из метки): супервизор,
      * который иначе реестр не трогает (supervise.c), назначает их перед подсчётом состава. */
     int marks;
 };
+
+/* Поля помощника живут в куче и без пределов по длине и числу: вид задаёт их этими вызовами,
+ * а тот, кто получил kind_helper от kind_ops.helper, освобождает его kind_helper_free. Все
+ * четыре — 0 или -1 (нет памяти); строки копируются. */
+int kind_helper_cmd(struct kind_helper *h, const char *cmd);
+int kind_helper_prog(struct kind_helper *h, const char *prog);
+int kind_helper_arg(struct kind_helper *h, const char *arg);
+int kind_helper_env(struct kind_helper *h, const char *var);
+void kind_helper_free(struct kind_helper *h);
 
 /* Имя, которое починка вида разрешила бы getaddrinfo (Endpoint у awg). Разрешение имени
  * блокирует — DNS может отвечать секунды или не отвечать вовсе, — а сторож в демоне работает на

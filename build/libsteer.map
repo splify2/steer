@@ -48,6 +48,7 @@ LIBSTEER_1 {
     err_set;
     evline_emit;
     evline_enabled;
+    evline_free;
     evline_hello;
     evline_int;
     evline_open;
@@ -121,6 +122,7 @@ LIBSTEER_1 {
     kind_count;
     kind_direct;
     kind_emit_all;
+    kind_helper_free;
     kind_sig_mix;
     kind_warpm;
     l4_box_text;
