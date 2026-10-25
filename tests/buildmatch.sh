@@ -219,9 +219,9 @@ for f in src/daemon/main.c src/cli/modcmd.c src/daemon/failover.c src/lib/sindex
     n=$(grep -c 'fprintf(stderr, "steer: ' "$f" 2>/dev/null); [ -n "$n" ] || n=0
     [ "$n" -gt 0 ] && bare="$bare$f:$n "
 done
-# main.c: три законные строки — отказ «хаб xsteer этой сборки нет» (хаб — архив для VPS, а не
-# модуль), «флаги идут после команды» и отказ reload/subscribe движком (их исполняет демон, а
-# посылает клиент steer). Остальные шесть строк, что были здесь до 1.10, переехали вместе с
+# main.c: четыре законные строки — отказ «хаб xsteer этой сборки нет» (хаб — архив для VPS, а не
+# модуль), «менеджера плагинов в этой сборке нет» (он только в steerd пакета steer-core), «флаги
+# идут после команды» и отказ reload/subscribe движком (их исполняет демон, а посылает клиент steer). Остальные шесть строк, что были здесь до 1.10, переехали вместе с
 # командами модулей в cli/modcmd.c.
 #
 # modcmd.c: шесть законных строк — «команды модуля нет в этой сборке, нужен пакет» (одна, общая
@@ -240,7 +240,7 @@ done
 # (src/model/srs.c, srsplan.c) в stderr не пишет вовсе — он возвращает отказ и текст снятого.
 # Две строки srsread.c печатаются при УДАВШЕМСЯ разборе — снятые правила и пропущенные подсети
 # IPv6, — и у них уровень есть; проверка ниже сторожит именно это различие.
-check "голых «steer: » ровно столько, сколько отказов вызывающему" "src/daemon/main.c:3 src/cli/modcmd.c:6 src/tools/srsread.c:10 " "$bare"
+check "голых «steer: » ровно столько, сколько отказов вызывающему" "src/daemon/main.c:4 src/cli/modcmd.c:6 src/tools/srsread.c:10 " "$bare"
 # Строки, которые печатаются при успехе, обязаны иметь уровень: разбор удался, значит это
 # журнал во время работы, а не отказ вызывающему.
 check "предупреждения srs-read при удавшемся разборе идут с уровнем" "2" \
@@ -577,7 +577,7 @@ check "и не тащит его файлы поимённо" "0" \
 check "но свои списки объявлены" "1" \
     "$(grep -cx '/etc/steer/lists/custom' "$KEEP")"
 check "build.sh кладёт keep.d в пакет ядра" "1" \
-    "$(grep -c 'cp files/lib/upgrade/keep.d/steer' build.sh)"
+    "$(grep -c 'cp files/lib/upgrade/keep.d/steer "' build.sh)"
 
 # Серверная половина. Установщик обязан уметь работать БЕЗ компилятора — ради этого архив
 # и собирается; проверка ловит откат к «всегда собираем из исходников».
@@ -730,7 +730,8 @@ fi
 missing=""
 twice=""
 for f in $(find files -type f | sort); do
-    n=$(grep -c -- "$f" build.sh)
+    # Имя целиком: keep.d/steer — не часть keep.d/steer-plugins.
+    n=$(grep -cE -- "$f([^-A-Za-z0-9_.]|\$)" build.sh)
     if [ "$n" -eq 0 ]; then missing="$missing$f "
     elif [ "$n" -gt 1 ]; then twice="$twice$f "
     fi
@@ -899,7 +900,7 @@ cat "$sd/libsteer" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" 
 check "раскладка покрывает расширенный профиль (кроме файла профиля)" "src/profile/extended.c " \
     "$(comm -23 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # (Обёртка QUIC src/proto/quic — в libsteer, в статическом профиле её нет: потребителя нет, телефону — шаг 6.)
-check "  и добавляет только точки входа модулей, обёртку QUIC и модули hysteria2, proxy (с их видами) и warpbox" "src/kinds/hysteria2.c src/kinds/proxy.c src/modules/main_hysteria2.c src/modules/main_obfs.c src/modules/main_proxy.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_warpbox.c src/modules/main_xsteer.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/proxy/pxdial.c src/proto/proxy/pxhttp.c src/proto/proxy/pxmain.c src/proto/proxy/pxsocks.c src/proto/proxy/pxss.c src/proto/proxy/pxsub.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxvmess.c src/proto/proxy/pxwire.c src/proto/quic/qcdoq.c src/proto/quic/qcssl.c src/proto/quic/quic.c src/proto/warp/wbconf.c src/proto/warp/wbmain.c src/proto/warp/wbmq.c src/proto/warp/wbns.c src/proto/warp/wbping.c src/proto/warp/wbreg.c src/proto/warp/wbscan.c src/proto/warp/wbx509.c " \
+check "  и добавляет только точки входа модулей, обёртку QUIC, менеджер плагинов (steerd) и модули hysteria2, proxy (с их видами) и warpbox" "src/kinds/hysteria2.c src/kinds/proxy.c src/modules/main_hysteria2.c src/modules/main_obfs.c src/modules/main_proxy.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_warpbox.c src/modules/main_xsteer.c src/pluginmgr/pmindex.c src/pluginmgr/pminst.c src/pluginmgr/pmmain.c src/pluginmgr/pmstate.c src/pluginmgr/pmutil.c src/pluginmgr/pmver.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/proxy/pxdial.c src/proto/proxy/pxhttp.c src/proto/proxy/pxmain.c src/proto/proxy/pxsocks.c src/proto/proxy/pxss.c src/proto/proxy/pxsub.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxvmess.c src/proto/proxy/pxwire.c src/proto/quic/qcdoq.c src/proto/quic/qcssl.c src/proto/quic/quic.c src/proto/warp/wbconf.c src/proto/warp/wbmain.c src/proto/warp/wbmq.c src/proto/warp/wbns.c src/proto/warp/wbping.c src/proto/warp/wbreg.c src/proto/warp/wbscan.c src/proto/warp/wbx509.c " \
     "$(comm -13 "$sd/extended" "$sd/all" | tr '\n' ' ')"
 # Точка входа — единственный main() модуля; steerd свой main держит в daemon/main.c.
 for a in vless xsteer obfs tgws hysteria2 proxy; do

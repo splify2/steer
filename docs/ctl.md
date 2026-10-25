@@ -122,6 +122,22 @@ put-file yt.lst 52311\n<байты списка>
 | `subscribe` | — | оставить соединение открытым и получать события (ниже) | в процессе | — |
 | `select` | `<группа> <член>` | выбрать член группы `pick: manual` без apply (ниже); изменяющая — ждёт своей очереди за `apply`/`reload` | в процессе | — |
 | `helper` | `<выход>` | живое состояние помощников выхода из памяти демона (`--supervise`), строка JSON на помощника (ниже); помощника нет — код 1 | в процессе | — |
+| `plugin-list` | — | `steer plugin list --json`: стоящие плагины (ниже, «Плагины») | ребёнок | 60 с |
+| `plugin-search` | `[слово]` | `steer plugin search`: каталог всех репозиториев | ребёнок | 180 с |
+| `plugin-status` | `[id]` | `steer plugin status` (с id — ещё сверка файлов плагина с MANIFEST) | ребёнок | 60 с |
+| `plugin-install` | `<id> [версия]` | `steer plugin install` | ребёнок | 600 с |
+| `plugin-install-file` | `[unsigned]`, тело — `.s2p` до 64 МиБ | `steer plugin install --file` | ребёнок | 600 с |
+| `plugin-update` | `[id]` | `steer plugin update` | ребёнок | 3600 с |
+| `plugin-remove` | `<id> [force] [purge]` | `steer plugin remove` | ребёнок | 300 с |
+| `plugin-enable`, `plugin-disable` | `<id>` | `steer plugin enable`/`disable` | ребёнок | 300 с |
+| `plugin-autoupdate` | `<id> on\|off` | `steer plugin autoupdate` | ребёнок | 30 с |
+| `plugin-ensure` | тело — id через пробел | `steer plugin ensure` | ребёнок | 3600 с |
+| `plugin-job` | `<номер>` | `steer plugin job`: ход и итог задания `--job` | ребёнок | 10 с |
+| `plugin-repo-list` | — | `steer plugin repo list` | ребёнок | 30 с |
+| `plugin-repo-add` | `<url> <номер ключа>`, тело — открытый ключ | `steer plugin repo add` | ребёнок | 120 с |
+| `plugin-repo-del` | `<имя>` | `steer plugin repo del` | ребёнок | 30 с |
+| `plugin-reload` | — | перечитать плагины, затем как `reload`; изменяющая — в очереди `apply` | ребёнок (как `reload`) | как `reload` |
+| `plugin-event` | тело — объект JSON | разослать подписчикам событие `plugin` (его шлёт менеджер) | в процессе | — |
 
 Детям демон сам добавляет `--spec` и `--state-dir` — те, с которыми запущен.
 
@@ -604,6 +620,27 @@ Unix; 0 — ни разу), `started`, `restarts` (перезапусков с �
 не повторяются.
 
 Из adb root shell: `steer ctl subscribe` печатает события по мере прихода.
+
+## Плагины
+
+Команды `plugin-*` исполняет ребёнок `steerd plugin <действие> … --json` — тот же менеджер плагинов,
+что у человека в shell (`steer plugin help`). В `stdout` ответа — объект JSON менеджера: при успехе
+`{"ok":true,…}`, при отказе `{"ok":false,"error":"…"}` и код 1; ход установки — строками в `stderr`.
+
+- **Очередь.** Изменяющие действия менеджера идут под его собственной блокировкой (`flock` на
+  `/usr/lib/steer/plugins/.lock`), а не в очереди `apply`: установка ждёт сеть и проверку здоровья до
+  десяти минут, а самой проверке нужен `plugin-reload`. Пока менеджер занят, другой изменяющий запрос
+  получает отказ, начинающийся с `busy:`. `plugin-reload` — изменяющая команда демона и ждёт своей
+  очереди за `apply` и `reload`.
+- **Событие `plugin`.** После каждой установки, обновления, отката, снятия, включения и выключения
+  менеджер шлёт `plugin-event`, и подписчики получают
+  `{"v":1,"ev":"plugin","id":"vless","state":"enabled","version":"2.1.1","from":"2.1.0","why":null,"by":"human"}`;
+  `state` — `installed`, `enabled`, `disabled`, `failed`, `removed`, `updated`, `rolled-back`, `by` —
+  `human` или `auto`.
+- **Фоновое обновление.** Если каталог `/usr/lib/steer/plugins` есть, демон раз в сутки (срок пишет сам
+  менеджер в `/etc/steer/plugins/state.json`, поле `auto.next`) запускает `steerd plugin update --auto`
+  и его не ждёт. Обновления ставятся в ночном окне (`auto_window`, умолчание 03:00–05:00), отозванная по
+  безопасности версия меняется сразу; не прошедшая проверку здоровья версия откатывается.
 
 ## Сторож выходов (`--watch`)
 

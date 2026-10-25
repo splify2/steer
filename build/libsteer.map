@@ -16,6 +16,7 @@ LIBSTEER_1 {
     awg_scan_up;
     b64_decode;
     chello_parse;
+    cli_core_version;
     cli_help;
     cli_lookup;
     cli_parse;
@@ -27,6 +28,9 @@ LIBSTEER_1 {
     cmd_dev_id;
     cmd_sub_hwid;
     ctlcall_forward;
+    ctlcall_parse;
+    ctlcall_resp_free;
+    ctlcall_roundtrip;
     ctlcall_socket;
     die;
     dnsurl_parse;
@@ -192,6 +196,7 @@ LIBSTEER_1 {
     plugin_n;
     plugin_nft_map;
     plugin_refresh;
+    plugin_reload;
     plugso_http_get;
     pool_race_first;
     pool_run;
@@ -266,6 +271,11 @@ LIBSTEER_1 {
     sc_shake128_read;
     sc_x25519_base;
     set_name_famtag;
+    sigv_keynum_hex;
+    sigv_parse_key;
+    sigv_parse_sigs;
+    sigv_sigs_free;
+    sigv_verify_blocks;
     sl_add_pins;
     SL_ECH_DNS;
     sl_host_is_name;
@@ -368,6 +378,7 @@ LIBSTEER_1 {
     tun_gro_push;
     tun_open;
     tun_read_packet;
+    untar_gz_file;
     urltest_reader_only;
     urltest_url_parse;
     vless_insecure;
@@ -383,6 +394,14 @@ LIBSTEER_1 {
     ydoc_free;
     ydoc_parse_buf;
     ydoc_root;
+    ynode_at;
+    ynode_bool;
+    ynode_get;
+    ynode_is_null;
+    ynode_key_at;
+    ynode_len;
+    ynode_long;
+    ynode_val_at;
   local:
     *;
 };

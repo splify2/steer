@@ -20,6 +20,7 @@
 #   tests/devupmatch.c — подъём устройства туннеля: каждый отказ `ip` обязан быть назван (I-114).
 #   tests/sigmatch.c   — подпись Ed25519 в формате usign (векторы tests/sigvec, выпущены usign);
 #   tests/tarmatch.c   — распаковка ustar+gzip с настоящим SHA-256 слоя (в make test — со своим);
+#   tests/pluginmgrmatch.sh — менеджер плагинов: установка, подпись, место, откат, семя (архивы из s2p);
 #   tests/httpsmatch.sh — HTTPS клиента libsteer: настоящий TLS 1.3 против python-сервера со своим корнем.
 #   tests/probe.sh     — активное зондирование хаба настоящим openssl s_client (нужен root).
 #
@@ -108,6 +109,10 @@ echo "ext-test: собираю и прогоняю tarmatch (SHA-256 слоя sc
 $CC -O2 -g -w $STEER_INC -Itests -o "$BUILD/tarmatch-real" tests/tarmatch.c src/lib/untar.c src/lib/gz.c src/lib/puff.c \
 	src/tools/hwid.c src/lib/jsonw.c $(profile_var PLATFORM_SRC) $CRYPTO -lpthread
 "$BUILD/tarmatch-real" | tail -1
+# Менеджер плагинов (src/pluginmgr) на архивах, индексах и ключах из s2p (plugin-sdk), настоящей подписи и
+# сети на localhost: стенд собирает steerd с менеджером сам из того же wolfSSL; нет s2p — громкий пропуск внутри.
+echo "ext-test: прогоняю pluginmgrmatch..."
+BUILD="$BUILD" CC="$CC" sh tests/pluginmgrmatch.sh
 echo "ext-test: собираю и прогоняю httpsmatch..."
 $CC -O2 -g -w $STEER_INC -o "$BUILD/httpsget" tests/httpsget.c src/proto/tls/httpc.c src/proto/tls/reality.c \
 	src/proto/tls/chello.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/proto/tls/roots.c \
