@@ -111,7 +111,9 @@ xsteer — [docs/xsteer.md](xsteer.md).
 
 **Чужие пакеты — настройка человека.** `dnsmasq`, `https-dns-proxy`, `netifd`, `odhcpd` и зоны
 fw4 ядро не настраивает: оно маршрутизирует само и говорит в `diag`, чего не хватает. Исключение
-одно — masquerade IPv6 по ключу `ipv6: nat` у выхода (раздел 4б), и то в своей таблице.
+одно — подмена адреса в своей таблице: masquerade IPv4 у устройств выходов, которые адреса клиентов
+сами не завершают (`interface`, `awg`, члены WARP; цепочка `postrouting_nat4`), и masquerade IPv6 по
+ключу `ipv6: nat` у выхода (раздел 4б).
 
 **Один разбор спеки.** Спеку читает одна функция `load_spec` (`src/model/parse.c`), а таблицу
 доменных каналов для резолвера строит код модели (`dch_build`, `src/dnsd/table.c`); имя набора
@@ -344,6 +346,7 @@ struct kind_ops {
 | `forward_v6` | forward | отвергает IPv6 правил, ведущих в выход без IPv6, и адрес из префикса хоста мимо донора (раздел 4б) |
 | `postrouting_guard` | postrouting, `filter` | пакет с меткой выхода с устройством уходит только в устройства этого выхода — или отбрасывается |
 | `postrouting_down` | postrouting | счётчики входящего трафика каналов |
+| `postrouting_nat4` | nat postrouting | masquerade IPv4 на устройстве выхода, которому нужна подмена (`interface`, `awg`, члены WARP) |
 | `postrouting_nat6` | nat postrouting | masquerade IPv6 у выхода с `ipv6: nat` |
 | `output_mark`, `output_dns` | output | каналы на сам телефон и заворот его DNS |
 | `zapret_*`, `tgws_redirect` | — | правила видов `zapret` и `tgws` (`kind_ops.emit`) |
