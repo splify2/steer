@@ -1,0 +1,2 @@
+plugin manifest v1
+line two

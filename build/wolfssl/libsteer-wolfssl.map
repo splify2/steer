@@ -32,6 +32,10 @@
     wc_EccPublicKeyDecode;
     wc_ecc_sign_hash;
     wc_ecc_verify_hash;
+    wc_ed25519_free;
+    wc_ed25519_import_public;
+    wc_ed25519_init;
+    wc_ed25519_verify_msg;
     wc_EncodeSignature;
     wc_ForceZero;
     wc_FreeRng;
