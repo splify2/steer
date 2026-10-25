@@ -24,6 +24,12 @@ const char *cli_core_version(void);
 
 /* ---- цель ---- */
 
+/* Каталог данных панели splify2: версии её осей совместимости (compat/<ось>), host-api. Стенды подменяют. */
+static const char *panel_dir(void) {
+    const char *d = getenv("STEER_PLUGIN_PANEL_DIR");
+    return d && *d ? d : "/usr/share/splify2";
+}
+
 static char *first_line(const char *path) {
     char *b = pm_read(path, NULL);
     if (!b) return NULL;
@@ -68,7 +74,14 @@ void pm_target_load(struct pm_target *t) {
     t->abi = pm_strdup(PM_STEER_ABI);
     const char *h = getenv("STEER_PLUGIN_HOST_API");
     if (h) t->host = *h ? pm_strdup(h) : NULL;
-    else t->host = first_line("/usr/share/splify2/host-api");
+    else {
+        char path[512];
+        snprintf(path, sizeof path, "%s/compat/host-api", panel_dir());
+        if (!(t->host = first_line(path))) {
+            snprintf(path, sizeof path, "%s/host-api", panel_dir());
+            t->host = first_line(path);
+        }
+    }
     const char *sv = getenv("STEER_PLUGIN_SPLIFY2");
     if (sv) t->splify2 = *sv ? pm_strdup(sv) : NULL;
     else t->splify2 = first_line("/usr/share/splify2/version");
@@ -76,6 +89,9 @@ void pm_target_load(struct pm_target *t) {
     if (a && *a) t->arch = pm_strdup(a);
     else if (!(t->arch = first_line("/etc/apk/arch"))) t->arch = opkg_arch();
 }
+
+/* Версия последней прочитанной оси панели: держится до следующего вызова pm_compat_why, как buf. */
+static char *axis_have;
 
 const char *pm_compat_why(const struct pm_target *t, const struct ynode *compat, char *buf, size_t n) {
     for (size_t i = 0; i < ynode_len(compat); i++) {
@@ -88,7 +104,21 @@ const char *pm_compat_why(const struct pm_target *t, const struct ynode *compat,
         else if (!strcmp(axis, "steer-core")) have = t->core;
         else if (!strcmp(axis, "host-api")) { have = t->host; who = "у панели"; if (!have) continue; }
         else if (!strcmp(axis, "splify2")) { have = t->splify2; who = "у панели"; if (!have) continue; }
-        else {
+        else if (!strncmp(axis, "splify2-", 8)) {
+            /* Оси панели (splify2-api, splify2-luci и будущие) ядро не перечисляет: их версии панель кладёт
+             * файлами в <каталог панели>/compat/<ось>. Панели нет — ось не про этот роутер, как host-api. */
+            char path[512];
+            snprintf(path, sizeof path, "%s/compat/%s", panel_dir(), axis);
+            free(axis_have);
+            axis_have = first_line(path);
+            if (!axis_have) {
+                if (access(panel_dir(), F_OK) != 0) continue;
+                snprintf(buf, n, "неизвестная ось совместимости %s — обновите панель splify2", axis);
+                return buf;
+            }
+            have = axis_have;
+            who = "у панели";
+        } else {
             snprintf(buf, n, "неизвестная ось совместимости %s — обновите ядро", axis);
             return buf;
         }

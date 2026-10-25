@@ -149,7 +149,7 @@ printf '{"id":"splify2","url":"http://127.0.0.1:%s/","official":true,"priority":
 
 export STEER_PLUGIN_DIR="$T/root" STEER_PLUGIN_ETC="$T/etc" STEER_PLUGIN_KEYS="$T/keys" STEER_PLUGIN_SEED="$T/seed"
 export STEER_PLUGIN_RUN="$T/run" STEER_PLUGIN_TMP="$T/tmp" STEER_PLUGIN_KEEPD="$T/keepd" STEER_PLUGIN_ARCH=x86_64
-export STEER_SOCKET="$T/none.sock" STEER_PLUGIN_SPEC="$T/spec.yaml" STEER_PLUGIN_HOST_API="" STEER_PLUGIN_SPLIFY2=""
+export STEER_SOCKET="$T/none.sock" STEER_PLUGIN_SPEC="$T/spec.yaml" STEER_PLUGIN_HOST_API="" STEER_PLUGIN_SPLIFY2="" STEER_PLUGIN_PANEL_DIR="$T/nopanel"
 export STEER_PLUGIN_AUTO=0
 P() { "$BIN" plugin "$@"; }
 
