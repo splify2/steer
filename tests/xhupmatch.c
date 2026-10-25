@@ -476,7 +476,21 @@ static void t_packet_up_goaway(void) {
     close(lf);
 }
 
+/* I-534: основная связь отдана циклу (transport_live) — связь выгрузки, уже открытая, но без первого
+ * запроса (packet-up открывает запрос с первым куском), тоже переходит на запись без ожидания сокета. */
+static void t_live_before_first_request(void) {
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "сокетная пара"); return; }
+    struct transport c;
+    conn_init(&c, XH_PACKET_UP, fd);
+    xhttp_live(&c);
+    check(c.xh.live && c.xh.up.link.live,
+          "I-534: packet-up — связь выгрузки без первого запроса переходит в живую запись");
+    close(fd);
+}
+
 int main(void) {
+    t_live_before_first_request();
     t_packet_up_goaway();
     t_aux();
     t_packet_up_window_over_seq();

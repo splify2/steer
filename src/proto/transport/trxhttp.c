@@ -638,7 +638,9 @@ static int xhttp_aux_drain(struct transport *t) {
 /* Основная связь отдана циклу (transport_live): вторая — тоже, и поднятая позже — тоже. */
 static void xhttp_live(struct transport *t) {
     t->xh.live = 1;
-    if (t->xh.mode != XH_STREAM_ONE && t->xh.up.started && t->xh.up.link.fd > 0)
+    /* По открытой связи, а не по started: packet-up открывает связь заранее, а первый запрос — с первым куском,
+     * и связь без запроса оставалась бы с блокирующей записью. */
+    if (t->xh.mode != XH_STREAM_ONE && t->xh.up.link.fd > 0)
         tr_link_live(&t->xh.up.link);
 }
 
