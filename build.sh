@@ -293,7 +293,11 @@ mk_ipk() {
     rm -rf "$ipk_root/CONTROL"
 }
 
-echo "steer $VERSION"
+# Раскладка роутера: 2.1 (умолчание) — ядро без стека протоколов, net1 и протоколы плагинами (.s2p и семя
+# в steer-core, build/pack-s2p.sh); 2.0 — прежние пакеты steer-<m> на libsteer (STEER_LAYOUT=2.0).
+LAYOUT="${STEER_LAYOUT:-2.1}"
+PLUGS="$(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC)"
+echo "steer $VERSION (раскладка $LAYOUT)"
 for spec in $ISAS; do
     arch=${spec%%:*}; rest=${spec#*:}
     target=${rest%%:*}; mcpu=${rest#*:}
@@ -387,12 +391,17 @@ for spec in $ISAS; do
     # root, и на машине без root (GitHub Actions) `rm -rf obj` снаружи падал «Permission denied».
     if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh \
             -e CC="zig cc -target $target -mcpu=$mcpu" -e AR="zig ar" -e ZIG=1 \
-            -e INTERP="$(interp_of "$target" "$mcpu")" "$IMAGE" -c \
+            -e INTERP="$(interp_of "$target" "$mcpu")" -e STEER_LAYOUT="$LAYOUT" "$IMAGE" -c \
             'sh /src/build/build-libs.sh "$1" "$2" "$3"; rc=$?; rm -rf "$1/obj"; chown -R "$4" "$1"; exit $rc' _ \
             "/src/$libs" "$VERSION" "$REV" "$(id -u):$(id -g)" \
             >"build/$arch-libs.log" 2>"build/$arch-libs.err"; then
         echo "libsteer $(stat -c %s "$libs"/libsteer.so.*) + wolfssl $(stat -c %s "$libs"/libsteer-wolfssl.so.*)" \
              "+ steerd $(stat -c %s "$libs/steerd") bytes"
+        if [ "$LAYOUT" = 2.1 ]; then
+            printf '  %-26s net1 %s' "" "$(stat -c %s "$libs/plugins/net1/lib/libs2p-net.so.1")"
+            for _p in $PLUGS; do printf ' + %s %s' "$_p" "$(stat -L -c %s "$libs/plugins/$_p/bin/$_p")"; done
+            echo " bytes"
+        fi
         warn_report "build/$arch-libs.err"
     else
         rm_libs "$libs" || echo "    (не удалось снять $libs)"
@@ -480,6 +489,22 @@ for spec in $ISAS; do
     mkdir -p "$root/usr/share/steer"
     printf 'steer-abi %s\n' "$(sh build/abi.sh)" > "$root/usr/share/steer/steer-abi"
     chmod 0644 "$root/usr/share/steer/steer-abi"
+    # Семя (раскладка 2.1, plugin-sdk/docs/migration-2.1.md, раздел 5): подписанные .s2p протоколов и net1
+    # под эту архитектуру и index.json с подписью — переход и первая установка без сети. Архивы же
+    # кладутся в $OUT рядом с пакетами (их публикует репозиторий плагинов).
+    if [ "$LAYOUT" = 2.1 ]; then
+        _seedrc=0
+        sh build/pack-s2p.sh "$libs" "$arch" "$VERSION" "$OUT" "$root/usr/share/steer/seed" \
+            > "build/$arch-s2p.log" 2>&1 || _seedrc=$?
+        case "$_seedrc" in
+            0) printf '  %-26s семя %s байт (%s архивов)\n' "" "$(du -sb "$root/usr/share/steer/seed" | cut -f1)" \
+                   "$(find "$root/usr/share/steer/seed" -name '*.s2p' | wc -l)"
+               grep -h 'ТЕСТОВЫМ' "build/$arch-s2p.log" | sed 's/^/    /' || true ;;
+            3) echo "    семя пропущено: $(tail -1 "build/$arch-s2p.log")" ;;
+            *) echo "    FAILED — .s2p: $(grep -m1 -i 'error\|ошиб\|отказ' "build/$arch-s2p.log" || tail -1 "build/$arch-s2p.log")"
+               fails=$((fails + 1)) ;;
+        esac
+    fi
     chmod 0755 "$root/usr/sbin/steerd" "$root/usr/sbin/steer" \
                "$root/etc/init.d/steer" "$root/etc/hotplug.d/iface/95-steer"
     chmod 0644 "$root/lib/upgrade/keep.d/steer"
@@ -561,9 +586,12 @@ EOF
         _ipkx=""
         [ -n "$_cf" ] && _ipkx="$(printf 'Conflicts: %s' "$(echo $_cf | sed 's/ /, /g')")"
         if [ -n "$_rp" ]; then
-            _pv="${_rp%% *}"
-            _dinfo="$_dinfo --info replaces:'$_rp' --info provides:'$_pv=$VERSION-r1'"
-            _ipkx="$(printf '%s\nReplaces: %s\nProvides: %s' "$_ipkx" "$(echo $_rp | sed 's/ /, /g')" "$_pv")"
+            # provides — на КАЖДОЕ имя «заменяет», а не на первое (plugin-sdk/docs/open.md, О-23):
+            # steer-core 2.1 закрывает собой все прежние пакеты модулей (migration-2.1.md, раздел 2).
+            _pv=""
+            for _n1 in $_rp; do _pv="$_pv${_pv:+ }$_n1=$VERSION-r1"; done
+            _dinfo="$_dinfo --info replaces:'$_rp' --info provides:'$_pv'"
+            _ipkx="$(printf '%s\nReplaces: %s\nProvides: %s' "$_ipkx" "$(echo $_rp | sed 's/ /, /g')" "$(echo $_rp | sed 's/ /, /g')")"
             _ipkx="$(printf '%s' "$_ipkx" | sed '/^$/d')"
         fi
         # apk: скрипты — четыре хука. post-deinstall нужен модулям (перезапуск после удаления).
@@ -596,8 +624,13 @@ EOF
     # steer, libsteer и libsteer-wolfssl — конфликтуют и заменяются (миграция, см. выше). Имя
     # `steer` идёт первым в ЗАМЕНЯЕТ: pack берёт первое как provides.
     deps="$(pkg_deps "$root/usr/sbin/steerd" core)"
+    # Раскладка 2.1: протоколы — плагины, steer-core берёт на себя имена прежних пакетов модулей (кроме
+    # steer-tgws: мост ещё модуль) и мета-пакета (migration-2.1.md, раздел 2).
+    _old="steer libsteer libsteer-wolfssl"
+    _mods=""
+    [ "$LAYOUT" = 2.0 ] || _mods="steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-extended"
     pack steer-core "$root" "$deps" "steer-core: ядро маршрутизации по политике (каналы на входе, nftables на выходе) и общая крипта" \
-        steer "steer libsteer libsteer-wolfssl" "steer libsteer libsteer-wolfssl"
+        steer "$_old" "$_old $_mods"
 
     # Модули: по одному бинарнику в usr/sbin рядом со steerd, где их находит движок (src/lib/
     # module.c). Зависимость от steer-core — точной версии: ядро и модуль общаются линией событий,
@@ -606,7 +639,9 @@ EOF
     # отдельные пакеты, которые ставят сознательно (см. мета-пакет ниже). У steer-warpbox нет
     # зависимости от модуля ядра: туннели WARP — выходы awg ядра steer, а им годится и kmod-amneziawg
     # (сторонний, с обфускацией), и kmod-wireguard из фидов OpenWrt — выбор за человеком.
-    for m in vless xsteer obfs tgws hysteria2 proxy warpbox; do
+    _modlist="tgws"
+    [ "$LAYOUT" = 2.0 ] && _modlist="vless xsteer obfs tgws hysteria2 proxy warpbox"
+    for m in $_modlist; do
         mroot="build/pkg/$arch-$m"
         rm -rf "$mroot"
         mkdir -p "$mroot/usr/sbin"
@@ -630,6 +665,7 @@ EOF
     # Мета-пакет steer-extended (устарел, оставлен на переход): ядро и модули vless, xsteer, obfs,
     # tgws; hysteria2 не входит. Пустой пакет менеджеры не любят, поэтому в нём один маленький
     # файл-метка. Имя сохранено ради splify2, который ставит его по имени.
+    [ "$LAYOUT" = 2.0 ] || continue
     xroot="build/pkg/$arch-extended"
     rm -rf "$xroot"
     mkdir -p "$xroot/usr/lib/steer"
