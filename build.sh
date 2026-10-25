@@ -277,6 +277,11 @@ mk_ipk() {
         echo "Description: $ipk_desc"
     } > "$ipk_root/CONTROL/control"
     cp "build/scripts/$ipk_scr.postinst" "$ipk_root/CONTROL/postinst"
+    # preinst — только у ядра: запомнить пакеты модулей до того, как менеджер их снимет.
+    if [ -f "build/scripts/$ipk_scr.preinst" ]; then
+        cp "build/scripts/$ipk_scr.preinst" "$ipk_root/CONTROL/preinst"
+        chmod 0755 "$ipk_root/CONTROL/preinst"
+    fi
     cp "build/scripts/$ipk_scr.prerm" "$ipk_root/CONTROL/prerm"
     cp "build/scripts/$ipk_scr.postrm" "$ipk_root/CONTROL/postrm"
     chmod 0755 "$ipk_root/CONTROL/postinst" "$ipk_root/CONTROL/prerm" "$ipk_root/CONTROL/postrm"
@@ -533,10 +538,36 @@ for spec in $ISAS; do
     # установки: в одной транзакции ядро встаёт раньше коннектора, и /etc/init.d/sing-box ещё
     # чужой; метку ставит install.sh тестового набора на время установки.
     mkdir -p build/scripts
+    # preinst/pre-upgrade ядра: какие модули стояли пакетами (steer-vless…, раскладка 2.0). Решатель
+    # apk снимает их РАНЬШЕ, чем зовёт pre-upgrade нового ядра (проверено на 3.0.5: «Purging steer-vless»
+    # идёт первым), так что бинарников уже нет — остаётся /etc/apk/world: имена пакетов в нём стоят,
+    # их закрывает provides ядра. У opkg preinst идёт до снятия, там виден и бинарник. Список отдаёт
+    # `steer plugin migrate` в postinst (migration-2.1.md, 3.1), и тот ставит плагины из семени. tgws
+    # пакетом остаётся и в список не входит. После первого перехода (есть migrate.done.json) имена в
+    # world остаются навсегда и решать ими уже нельзя: человек мог снять плагин. Пишется в
+    # /etc/steer/plugins: keep.d переносит его через sysupgrade.
+    cat > build/scripts/steer.preinst <<'EOF'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+[ -e /etc/steer/plugins/migrate.done.json ] && exit 0
+_pk=""
+for _m in vless hysteria2 proxy xsteer obfs warpbox; do
+	if [ -e "/usr/sbin/steer-$_m" ] || grep -Eq "^steer-$_m(><.*)?\$" /etc/apk/world 2>/dev/null; then
+		_pk="$_pk${_pk:+,}\"steer-$_m\""
+	fi
+done
+[ -n "$_pk" ] || exit 0
+mkdir -p /etc/steer/plugins
+printf '{"packages":[%s]}\n' "$_pk" > /etc/steer/plugins/migrate.json
+exit 0
+EOF
     cat > build/scripts/steer.postinst <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 [ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null
+# Плагины протоколов — по спеке и по прежним пакетам модулей, из семени без сети (раскладка 2.1);
+# в прежней раскладке команды нет — отказ молчит. До перезапуска службы: демон встаёт с плагинами.
+/usr/sbin/steer plugin migrate 2>&1 | sed 's/^/steer: /'
 if grep -q steer-box-connector /etc/init.d/sing-box 2>/dev/null || [ -e /var/run/steer-box-installing ]; then
 	/etc/init.d/steer stop 2>/dev/null
 	/etc/init.d/steer disable 2>/dev/null
@@ -578,13 +609,15 @@ EOF
     # в depends; opkg: Conflicts). ЗАМЕНЯЕТ — пакеты, чьи файлы этот вправе занять и чьё имя он
     # берёт на себя (apk: replaces + provides имя=версия; opkg: Replaces + Provides).
     pack() {
-        _n="$1"; _r="$2"; _dp="$3"; _ds="$4"; _sk="$5"; _cf="${6:-}"; _rp="${7:-}"
+        _n="$1"; _r="$2"; _dp="$3"; _ds="$4"; _sk="$5"; _cf="${6:-}"; _rp="${7:-}"; _cfi="${8:-}"
         _dinfo=""
         _dall="$(dep_apk "$_dp")"
         for _c in $_cf; do _dall="$_dall !$_c"; done
         [ -n "$_dall" ] && _dinfo="--info depends:'$_dall'"
         _ipkx=""
-        [ -n "$_cf" ] && _ipkx="$(printf 'Conflicts: %s' "$(echo $_cf | sed 's/ /, /g')")"
+        # opkg снимает установленный пакет только при Conflicts вместе с Replaces (проверено на opkg 24.10:
+        # одних Provides/Replaces мало — модули 2.0.5 остаются стоять); для apk то же делает provides.
+        [ -n "$_cf$_cfi" ] && _ipkx="$(printf 'Conflicts: %s' "$(echo $_cf $_cfi | sed 's/ /, /g')")"
         if [ -n "$_rp" ]; then
             # provides — на КАЖДОЕ имя «заменяет», а не на первое (plugin-sdk/docs/open.md, О-23):
             # steer-core 2.1 закрывает собой все прежние пакеты модулей (migration-2.1.md, раздел 2).
@@ -611,6 +644,7 @@ EOF
                --info name:$_n --info version:$VERSION-r1 \
                --info description:'$_ds' \
                --info arch:$arch $_dinfo \
+               $( [ -f build/scripts/$_sk.preinst ] && echo "--script pre-install:build/scripts/$_sk.preinst --script pre-upgrade:build/scripts/$_sk.preinst") \
                --script post-install:build/scripts/$_sk.postinst \
                --script post-upgrade:build/scripts/$_sk.postinst \
                --script pre-deinstall:build/scripts/$_sk.prerm \
@@ -624,13 +658,18 @@ EOF
     # steer, libsteer и libsteer-wolfssl — конфликтуют и заменяются (миграция, см. выше). Имя
     # `steer` идёт первым в ЗАМЕНЯЕТ: pack берёт первое как provides.
     deps="$(pkg_deps "$root/usr/sbin/steerd" core)"
+    # kmod-tun держит само ядро: протоколы-плагины (vless, hysteria2, xsteer) создают TUN, а прежние пакеты
+    # модулей тянули kmod-tun и при переходе снимаются в той же транзакции — apk тут же удаляет и
+    # осиротевший kmod-tun (проверено на apk 3.0.5), а менеджер плагинов из postinst пакет поставить не
+    # может: база заперта. Без этой зависимости плагины встали бы без TUN (migration-2.1.md, раздел 4).
+    [ "$LAYOUT" = 2.0 ] || deps="$deps $(pkg_deps "" tun)"
     # Раскладка 2.1: протоколы — плагины, steer-core берёт на себя имена прежних пакетов модулей (кроме
     # steer-tgws: мост ещё модуль) и мета-пакета (migration-2.1.md, раздел 2).
     _old="steer libsteer libsteer-wolfssl"
     _mods=""
     [ "$LAYOUT" = 2.0 ] || _mods="steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-extended"
     pack steer-core "$root" "$deps" "steer-core: ядро маршрутизации по политике (каналы на входе, nftables на выходе) и общая крипта" \
-        steer "$_old" "$_old $_mods"
+        steer "$_old" "$_old $_mods" "$_mods"
 
     # Модули: по одному бинарнику в usr/sbin рядом со steerd, где их находит движок (src/lib/
     # module.c). Зависимость от steer-core — точной версии: ядро и модуль общаются линией событий,

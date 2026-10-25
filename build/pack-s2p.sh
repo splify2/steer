@@ -55,6 +55,13 @@ for _p in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do
     stage "$_p" "plugins/$_p/bin/$_p" "bin/$_p"
 done
 ls "$DIST"/*-"$ARCH".s2p >/dev/null
+# awg — плагин без файлов: допуск вида awg (код вида в ядре, impl: core), зависимости и модули ядра Linux.
+# warpbox требует его (requires.plugins), так что без него в семени WARP не встанет.
+_d="$ST/awg"
+mkdir -p "$_d"
+cp -R plugins/awg/. "$_d/"
+sed -i "s/\"@VERSION@\"/\"$VERSION\"/" "$_d/plugin.json"
+"$S2P_BIN" build "$_d" --arch all --key "$KEY" -o "$DIST" >/dev/null 2>&1
 
 # Семя: индекс тех же архивов (migration-2.1.md, раздел 5). Срок индекса семени — десять лет
 # (S2P_SEED_EXPIRES): семя читают без сети спустя месяцы после выпуска, обычные 30 дней сделали бы его
@@ -67,6 +74,7 @@ if [ -n "$SEED" ]; then
     {
         printf '{'
         printf '"net1":{"key_role":"protocols","tags":["library"]}'
+        printf ',"awg":{"key_role":"protocols","tags":["library"]}'
         for _p in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do
             printf ',"%s":{"default":true,"key_role":"protocols","tags":["protocol"]}' "$_p"
         done
@@ -74,7 +82,7 @@ if [ -n "$SEED" ]; then
     } > "$_meta"
     _in="$ST/seed-in"
     mkdir -p "$_in"
-    cp "$DIST/net1-$N1VER-$ARCH.s2p" "$_in/"
+    cp "$DIST/net1-$N1VER-$ARCH.s2p" "$DIST/awg-$VERSION-all.s2p" "$_in/"
     for _p in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do cp "$DIST/$_p-$VERSION-$ARCH.s2p" "$_in/"; done
     "$S2P_BIN" index "$_in" -o "$SEED" --repo splify2 --name splify2 --meta "$_meta" \
         --pub "${KEY%.sec}.pub" --key "$IKEY" --mirror https://splify2.github.io/plugins/ --expires "${S2P_SEED_EXPIRES:-3650d}" >/dev/null

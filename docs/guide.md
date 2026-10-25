@@ -60,6 +60,16 @@ apk add --allow-untrusted ./steer-core-<версия>-1_<арх>.apk ./steer-vle
 opkg install ./steer-core-<версия>-1_<арх>.ipk ./steer-vless-<версия>-1_<арх>.ipk
 ```
 
+### Обновление с 2.0.x на 2.1
+
+`steer-core` 2.1.0 сам снимает пакеты `steer-vless`, `steer-hysteria2`, `steer-proxy`, `steer-xsteer`,
+`steer-obfs`, `steer-warpbox` и `steer-extended`: протоколы теперь плагины, они ставятся из семени в самом
+пакете ядра, без сети, по видам выходов вашей спеки. Мост `steer-tgws` остаётся пакетом и обновляется
+вместе с ядром — ставьте оба в одной команде (`apk add --allow-untrusted ./steer-core-….apk ./steer-tgws-….apk`;
+с одним ядром при стоящем `steer-tgws` 2.0.x apk откажет). Если прежние пакеты ставились файлами и apk отвечает
+`breaks: world[steer-core><Q1…]`, назовите прежние модули в той же команде
+(`… steer-vless steer-xsteer`) или уберите закрепления способом ниже.
+
 ### Если после неудачной установки apk отказывает во всём
 
 `apk add` локального файла записывает в `/etc/apk/world` не просто имя пакета, а имя с контрольной

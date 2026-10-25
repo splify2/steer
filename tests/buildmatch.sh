@@ -365,7 +365,7 @@ check "модуль не несёт библиотек ядра" "0" \
 # Миграция со старых пакетов: provides и replaces имени steer, конфликт с steer, libsteer и
 # libsteer-wolfssl — в обоих форматах (apk: `!имя` в depends, opkg: Conflicts).
 check "steer-core заменяет и вытесняет steer, libsteer, libsteer-wolfssl" "1 1" \
-    "$(grep -c '^    _old="steer libsteer libsteer-wolfssl"$' build.sh) $(grep -c 'steer "\$_old" "\$_old \$_mods"$' build.sh)"
+    "$(grep -c '^    _old="steer libsteer libsteer-wolfssl"$' build.sh) $(grep -c 'steer "\$_old" "\$_old \$_mods" "\$_mods"$' build.sh)"
 # Раскладка 2.1: steer-core берёт имена прежних пакетов протоколов и мета-пакета (migration-2.1.md, 2);
 # steer-tgws остаётся пакетом (мост — ещё модуль) и в список не входит.
 check "steer-core 2.1 заменяет пакеты протоколов и steer-extended, но не steer-tgws" "1 0" \
@@ -375,6 +375,18 @@ check "pack: provides на каждое имя «заменяет» (О-23)" "1 
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c 'for _n1 in \$_rp; do _pv=') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c '_pv="\${_rp%% \*}"')"
 check "steer-core 2.1 несёт семя из build/pack-s2p.sh" "1" \
     "$(grep -c 'sh build/pack-s2p.sh "\$libs" "\$arch" "\$VERSION" "\$OUT" "\$root/usr/share/steer/seed"' build.sh)"
+# Переход 2.0.5 → 2.1.0 на настоящем apk (migration-2.1.md, разделы 2-4): ядро держит kmod-tun (apk снимает
+# осиротевшую зависимость прежних модулей), preinst запоминает пакеты модулей по world, postinst ставит плагины.
+check "steer-core 2.1 держит kmod-tun (иначе apk снимает его вместе с модулями)" "1" \
+    "$(grep -c '^    \[ "\$LAYOUT" = 2.0 \] || deps="\$deps \$(pkg_deps "" tun)"$' build.sh)"
+check "steer.preinst читает /etc/apk/world и пропускает уже сделанный переход" "1 1" \
+    "$(grep -c 'grep -Eq "^steer-\$_m(><.\*)?\\\$" /etc/apk/world' build.sh) $(grep -c 'migrate.done.json \] && exit 0' build.sh)"
+check "steer.postinst зовёт steer plugin migrate до перезапуска службы" "yes" \
+    "$(awk '/plugin migrate/ { m = NR } /init.d\/steer enable/ { if (!r) r = NR } END { print (m && r && m < r) ? "yes" : "no" }' build.sh)"
+check "pack передаёт pre-install и pre-upgrade, если есть preinst" "1" \
+    "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c -- '--script pre-install:build/scripts/\$_sk.preinst --script pre-upgrade:')"
+check "pack-s2p кладёт в семя awg (плагин без файлов, нужен warpbox)" "1 1" \
+    "$(grep -c 'awg-\$VERSION-all.s2p' build/pack-s2p.sh) $(grep -c '"awg": *"\^2' plugins/warpbox/plugin.json)"
 check "pack пишет конфликты как !имя (apk) и Conflicts (opkg)" "1 1" \
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c '_dall="\$_dall !\$_c"') $(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c "Conflicts: ")"
 check "pack пишет Replaces и Provides в обоих форматах" "1 1 1 1" \

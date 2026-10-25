@@ -424,6 +424,25 @@ check "ensure без сети: из семени" "0 net1:seed,foo:seed" "$rc $(
 check "  стоит версия семени" "foo 1.3.0" "$(root/foo/bin/foo)"
 o="$(P ensure foo net1 --json 2>/dev/null)"
 check "ensure уже стоящих — ничего не ставит" "[] ['foo', 'net1']" "$(printf '%s\n' "$o" | jq_ 'str(d["installed"])+" "+str(d["present"])')"
+# migrate (переход 2.0.x → 2.1, migration-2.1.md, 3.3): плагины — по видам выходов спеки и по прежним пакетам модулей
+# (migrate.json), из семени без сети; `steer-tgws` пакетом остаётся и плагином не ставится; готовый переход
+# получает имя migrate.done.json.
+P remove foo --force --json >/dev/null 2>&1; P remove net1 --force --json >/dev/null 2>&1
+printf 'version: 2\noutputs:\n  d: { kind: direct }\n  f: { kind: tunnel, protocol: foo, subscription: /x }\n' > mspec.yaml
+o="$(STEER_SPEC="$T/mspec.yaml" P migrate --json 2>err.txt)"; rc=$?
+check "migrate по спеке: плагин вида tunnel:foo и его net1 — из семени" "0 net1:seed,foo:seed" \
+    "$rc $(printf '%s\n' "$o" | jq_ '",".join(x["id"]+":"+x["from"] for x in d["installed"])')"
+P remove foo --force --json >/dev/null 2>&1; P remove net1 --force --json >/dev/null 2>&1
+printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > mspec0.yaml
+printf '{"packages":["steer-foo","steer-tgws"]}\n' > etc/migrate.json
+o="$(STEER_SPEC="$T/mspec0.yaml" P migrate --json 2>err.txt)"; rc=$?
+check "migrate по прежним пакетам: steer-foo → плагин foo, steer-tgws пропущен" "0 net1:seed,foo:seed" \
+    "$rc $(printf '%s\n' "$o" | jq_ '",".join(x["id"]+":"+x["from"] for x in d["installed"])')"
+check "  готовый переход: migrate.done.json есть, migrate.json нет" "yes no" \
+    "$([ -f etc/migrate.done.json ] && echo yes || echo no) $([ -f etc/migrate.json ] && echo yes || echo no)"
+o="$(STEER_SPEC="$T/mspec.yaml" P migrate --json 2>/dev/null)"
+check "повторный migrate ничего не ставит" "[] ['foo', 'net1']" "$(printf '%s\n' "$o" | jq_ 'str(d["installed"])+" "+str(d["present"])')"
+rm -f etc/migrate.done.json
 printf 'X' | dd of=seed/foo-1.3.0-all.s2p bs=1 seek=200 conv=notrunc 2>/dev/null
 P remove foo --force --json >/dev/null 2>&1
 o="$(P ensure foo --json 2>/dev/null)"; rc=$?

@@ -12,6 +12,7 @@
  *   autoupdate <id> on|off
  *   repo list | repo add <url> <номер ключа> [--key-file F] (иначе ключ — stdin) | repo del <имя>
  *   ensure <id>…                     поставить недостающие (без сети — из семени)
+ *   migrate                          плагины по спеке и по прежним пакетам модулей, из семени (переход на 2.1)
  *   job <номер>                      ход и итог задания (install/update с --job)
  *
  * Ответ с --json — объект в stdout; отказ — {"ok":false,"error":…} в stdout, те же слова в stderr, код 1.
@@ -30,6 +31,7 @@
 #include <sys/stat.h>
 
 #include "pm.h"
+#include "err.h"
 #include "sigverify.h"
 
 static const char *g_job_log;     /* в задании: ход — ещё и в файл */
@@ -64,7 +66,7 @@ static int usage(void) {
     fputs("steer plugin list | search [слово] | status [id] | install <id> [версия] | install --file F [--unsigned]\n"
           "             | update [id] [--auto] | remove <id> [--force] [--purge] | enable <id> | disable <id>\n"
           "             | autoupdate <id> on|off | repo list | repo add <url> <номер ключа> | repo del <имя>\n"
-          "             | ensure <id>... | job <номер>      (--json — ответ JSON; --job — install/update заданием)\n",
+          "             | ensure <id>... | migrate | job <номер>      (--json — ответ JSON; --job — install/update заданием)\n",
           stderr);
     return 2;
 }
@@ -835,55 +837,197 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
     return rc;
 }
 
+/* Один плагин: стоит — в present; нет — из сети, не вышло — из семени той же подписью
+ * (migration-2.1.md, 3.3). 0 — готов; иначе причина в e. */
+static int ensure_one(struct pm_ctx *x, const char *id, struct pm_result *all, char ***present, size_t *np,
+                      struct pm_err *e) {
+    struct pm_inst *p = pm_state_find(&x->st, id);
+    char *d = pm_path(pm_root(), id);
+    int here = pm_is_dir(d);
+    free(d);
+    if (p && here && (!p->state || strcmp(p->state, "failed"))) {
+        *present = pm_realloc(*present, sizeof(char *) * (*np + 1));
+        (*present)[(*np)++] = (char *)id;
+        return 0;
+    }
+    struct pm_req rq = { id, NULL };
+    struct pm_opts o = {0};
+    o.allow_seed = 1;
+    struct pm_result res;
+    int rc = pm_install(x, &rq, 1, &o, &res, e);
+    if (rc != 0 && pm_seed_repo()) {
+        struct pm_err se = {{0}};
+        pm_result_free(&res);
+        o.seed_only = 1;
+        pm_progress(x, "%s из сети не встал (%s) — ставлю из семени", id, e->msg);
+        rc = pm_install(x, &rq, 1, &o, &res, &se);
+        if (rc != 0) {
+            char *net = pm_strdup(e->msg);
+            pm_errf(e, "%s; из семени: %s", net, se.msg);
+            free(net);
+        }
+    }
+    if (rc != 0) {
+        pm_result_free(&res);
+        return -1;
+    }
+    for (size_t k = 0; k < res.n; k++) {
+        all->v = pm_realloc(all->v, sizeof(*all->v) * (all->n + 1));
+        all->v[all->n++] = res.v[k];
+    }
+    free(res.v);
+    return 0;
+}
+
 static int cmd_ensure(struct pm_ctx *x, char **ids, size_t n) {
     struct pm_result all = {0};
     char **present = NULL;
     size_t np = 0;
     for (size_t i = 0; i < n; i++) {
-        struct pm_inst *p = pm_state_find(&x->st, ids[i]);
-        char *d = pm_path(pm_root(), ids[i]);
-        int here = pm_is_dir(d);
-        free(d);
-        if (p && here && (!p->state || strcmp(p->state, "failed"))) {
-            present = pm_realloc(present, sizeof(char *) * (np + 1));
-            present[np++] = ids[i];
-            continue;
-        }
-        struct pm_req rq = { ids[i], NULL };
-        struct pm_opts o = {0};
-        o.allow_seed = 1;
-        struct pm_result res;
         struct pm_err e = {{0}};
-        int rc = pm_install(x, &rq, 1, &o, &res, &e);
-        if (rc != 0 && pm_seed_repo()) {
-            /* Скачивание из сети не вышло — из семени той же подписью (migration-2.1.md, 3.3). */
-            struct pm_err se = {{0}};
-            pm_result_free(&res);
-            o.seed_only = 1;
-            pm_progress(x, "%s из сети не встал (%s) — ставлю из семени", ids[i], e.msg);
-            rc = pm_install(x, &rq, 1, &o, &res, &se);
-            if (rc != 0) {
-                char *net = pm_strdup(e.msg);
-                pm_errf(&e, "%s; из семени: %s", net, se.msg);
-                free(net);
-            }
-        }
-        if (rc != 0) {
-            pm_result_free(&res);
+        if (ensure_one(x, ids[i], &all, &present, &np, &e) != 0) {
             free(present);
             pm_result_free(&all);
             return fail(x, e.msg);
         }
-        for (size_t k = 0; k < res.n; k++) {
-            all.v = pm_realloc(all.v, sizeof(*all.v) * (all.n + 1));
-            all.v[all.n++] = res.v[k];
-        }
-        free(res.v);
     }
     emit_result(x, &all, "present", present, np);
     free(present);
     pm_result_free(&all);
     return 0;
+}
+
+/* ---- переход с пакетов модулей 2.0.x (migration-2.1.md, 3.3) ---- */
+
+struct idset { char **v; size_t n; };
+static void idset_add(struct idset *s, const char *id) {
+    for (size_t i = 0; i < s->n; i++) if (!strcmp(s->v[i], id)) return;
+    s->v = pm_realloc(s->v, sizeof(char *) * (s->n + 1));
+    s->v[s->n++] = pm_strdup(id);
+}
+
+/* Виды из выходов спеки: `tunnel` — по протоколу (`tunnel:vless`), остальные — по имени вида. */
+static void spec_kinds(const char *path, struct idset *kinds, int *have) {
+    size_t n = 0;
+    char *buf = pm_read(path, &n);
+    if (!buf) return;
+    *have = 1;
+    struct err ye = {{0}};
+    struct ydoc *d = ydoc_parse_buf(buf, n, path, &ye);
+    if (d) {
+        const struct ynode *outs = ynode_get(ydoc_root(d), "outputs");
+        for (size_t i = 0; i < ynode_len(outs); i++) {
+            const struct ynode *o = ynode_val_at(outs, i);
+            const char *k = yn_str(o, "kind");
+            if (!k) continue;
+            if (!strcmp(k, "tunnel")) {
+                const char *pr = yn_str(o, "protocol");
+                char *kn = pm_fmt("tunnel:%s", pr ? pr : "vless");
+                idset_add(kinds, kn);
+                free(kn);
+            } else {
+                idset_add(kinds, k);
+                if (ynode_get(o, "obfs")) idset_add(kinds, "obfs-key");
+            }
+        }
+        ydoc_free(d);
+    }
+    free(buf);
+}
+
+/* Какой плагин даёт вид по индексу семени (provides.kinds). */
+static const char *seed_plugin_for(const struct ynode *plugins, const char *kind) {
+    for (size_t i = 0; i < ynode_len(plugins); i++) {
+        const struct ynode *vs = ynode_get(ynode_val_at(plugins, i), "versions");
+        for (size_t j = 0; j < ynode_len(vs); j++) {
+            const struct ynode *ks = ynode_get(ynode_get(ynode_at(vs, j), "provides"), "kinds");
+            for (size_t k = 0; k < ynode_len(ks); k++) {
+                const struct ynode *c = ynode_at(ks, k);
+                if (yn_is_str(c) && !strcmp(c->str, kind)) return ynode_key_at(plugins, i)->str;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* `steer plugin migrate`: плагины, которых требует спека человека, и те, что стояли пакетами
+ * (migrate.json, его пишет pre-upgrade/preinst steer-core 2.1); при первой установке — все `default: true`
+ * индекса семени. Работает без демона; неудача одного плагина остальные не останавливает. */
+static int cmd_migrate(struct pm_ctx *x) {
+    struct pm_err e = {{0}};
+    struct idset kinds = {0}, want = {0};
+    int have_spec = 0;
+    const char *sp = getenv("STEER_SPEC");
+    if (sp) spec_kinds(sp, &kinds, &have_spec);
+    else {
+        spec_kinds("/etc/steer/spec.yaml", &kinds, &have_spec);
+        spec_kinds("/etc/steer/spec.json", &kinds, &have_spec);
+    }
+    char *mj = pm_path(pm_etc(), "migrate.json");
+    int have_mj = 0;
+    struct ydoc *md = pm_json_load(mj, &e);
+    if (md) {
+        have_mj = 1;
+        const struct ynode *pk = ynode_get(ydoc_root(md), "packages");
+        for (size_t i = 0; i < ynode_len(pk); i++) {
+            const struct ynode *c = ynode_at(pk, i);
+            if (!yn_is_str(c) || strncmp(c->str, "steer-", 6)) continue;
+            const char *m = c->str + 6;
+            if (!strcmp(m, "extended")) { idset_add(&want, "vless"); idset_add(&want, "xsteer"); idset_add(&want, "obfs"); }
+            else if (strcmp(m, "tgws") && strcmp(m, "core") && strcmp(m, "box-connector")) idset_add(&want, m);
+        }
+        ydoc_free(md);
+    }
+    char *ip = pm_path(pm_seed(), "index.json");
+    struct ydoc *idx = pm_json_load(ip, &e);
+    free(ip);
+    const struct ynode *plugins = idx ? ynode_get(ydoc_root(idx), "plugins") : NULL;
+    if (!plugins) {
+        free(mj);
+        return fail(x, "в семени нет индекса: нечего ставить");
+    }
+    for (size_t i = 0; i < kinds.n; i++) {
+        const char *id = seed_plugin_for(plugins, kinds.v[i]);
+        /* Виды без записи в provides.kinds: warp ведёт warpbox (он тянет awg), obfs у interface — ключ. */
+        if (!id && !strcmp(kinds.v[i], "warp")) id = "warpbox";
+        if (!id && !strcmp(kinds.v[i], "awg")) id = "awg";
+        if (!id && !strcmp(kinds.v[i], "obfs-key")) id = "obfs";
+        if (id) idset_add(&want, id);
+    }
+    if (!have_spec && !have_mj)
+        for (size_t i = 0; i < ynode_len(plugins); i++)
+            if (yn_bool(ynode_val_at(plugins, i), "default", 0)) idset_add(&want, ynode_key_at(plugins, i)->str);
+    /* Только то, что есть в индексе семени (tgws и прочие пакеты — не наши). */
+    struct pm_result all = {0};
+    char **present = NULL;
+    size_t np = 0, nfail = 0;
+    struct idset bad = {0};
+    for (size_t i = 0; i < want.n; i++) {
+        if (!ynode_get(plugins, want.v[i])) continue;
+        struct pm_err ee = {{0}};
+        if (ensure_one(x, want.v[i], &all, &present, &np, &ee) != 0) {
+            char *m = pm_fmt("%s: %s", want.v[i], ee.msg);
+            idset_add(&bad, m);
+            free(m);
+            nfail++;
+        }
+    }
+    if (!x->json) {
+        emit_result(x, &all, NULL, NULL, 0);
+        for (size_t i = 0; i < bad.n; i++) fprintf(stderr, "не удалось: %s\n", bad.v[i]);
+    } else {
+        emit_result(x, &all, "present", present, np);
+    }
+    if (have_mj && !nfail) {
+        char *dn = pm_path(pm_etc(), "migrate.done.json");
+        rename(mj, dn);
+        free(dn);
+    }
+    free(mj);
+    free(present);
+    pm_result_free(&all);
+    ydoc_free(idx);
+    return nfail ? 1 : 0;
 }
 
 /* ---- задания ---- */
@@ -1062,7 +1206,7 @@ int pm_main(int argc, char **argv) {
                 ((!strcmp(act, "enable") || !strcmp(act, "disable")) && npos == 2) ||
                 (!strcmp(act, "autoupdate") && npos == 3) ||
                 (!strcmp(act, "repo") && npos >= 2 && ((!strcmp(pos[1], "add") && npos == 4) || (!strcmp(pos[1], "del") && npos == 3))) ||
-                (!strcmp(act, "ensure") && npos >= 2);
+                (!strcmp(act, "ensure") && npos >= 2) || (!strcmp(act, "migrate") && npos == 1);
     if (!known) { rc = usage(); goto out; }
     if (!(!strcmp(act, "repo"))) {
         for (size_t i = 1; i < npos; i++) {
@@ -1082,6 +1226,7 @@ int pm_main(int argc, char **argv) {
     if (!strcmp(act, "install")) rc = cmd_install(&x, file ? NULL : pos[1], npos == 3 ? pos[2] : NULL, file, unsigned_ok);
     else if (!strcmp(act, "update")) rc = cmd_update(&x, npos == 2 ? pos[1] : NULL, auto_, if_stale);
     else if (!strcmp(act, "ensure")) rc = cmd_ensure(&x, ens + 1, nens - 1);
+    else if (!strcmp(act, "migrate")) rc = cmd_migrate(&x);
     else if (!strcmp(act, "remove")) {
         rc = pm_remove(&x, pos[1], force, purge, &e) == 0 ? 0 : fail(&x, e.msg);
         if (!rc && x.json) printf("{\"ok\":true,\"id\":\"%s\"}\n", pos[1]);

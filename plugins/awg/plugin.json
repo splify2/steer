@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "awg",
+  "version": "@VERSION@",
+  "type": "plugin",
+  "name": "AmneziaWG",
+  "description": "Туннели WireGuard и AmneziaWG: допуск вида awg, системные пакеты и ядерные модули (код вида — в ядре)",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/splify2/steer",
+  "compat": {
+    "steer-api": "^1.0"
+  },
+  "arch": "all",
+  "requires": {
+    "system": [
+      "kmod-amneziawg|kmod-wireguard"
+    ],
+    "kernel": [
+      "/sys/module/wireguard|/sys/module/amneziawg"
+    ]
+  },
+  "permissions": [
+    "system-packages"
+  ],
+  "steer": {
+    "kinds": [
+      {
+        "name": "awg",
+        "impl": "core"
+      }
+    ]
+  }
+}
