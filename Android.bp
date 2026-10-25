@@ -165,7 +165,7 @@ cc_defaults {
         "-DSTEER_DEFAULT_PLATFORM=android",
         // Keep in step with VERSION (build.sh and the Makefile read it from
         // there; Soong cannot read a file into a define).
-        "-DSTEER_VERSION=\"1.5.8\"",
+        "-DSTEER_VERSION=\"2.0.5\"",
     ],
     // No binary with steer's name should linger in a symbol table either.
     strip: {
