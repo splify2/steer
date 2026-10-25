@@ -1322,6 +1322,10 @@ char *plugin_conf_json(const struct spec *sp, const struct output *o, const stru
     for (size_t i = 0; out_plugin_kind(o) && i < o->plg.queues_n; i++) sb_printf(&b, "%s%u", i ? "," : "", o->plg.queues[i]);
     sb_str(&b, "]},\"paths\":{\"etc\":");
     sb_json(&b, plat()->etc_dir);
+    /* Спека, которую читает демон (может быть не в etc: --spec): помощник протокола 2.1 разбирает её сам
+     * (src/modules/plugconf.c) и обязан читать ту же. Поле сверх steer-api 1.0 — читатели его пропускают. */
+    sb_str(&b, ",\"spec\":");
+    sb_json(&b, steer_spec_path());
     sb_str(&b, ",\"state\":");
     sb_json(&b, steer_state_dir());
     sb_str(&b, ",\"lists\":");

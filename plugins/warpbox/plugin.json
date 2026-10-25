@@ -34,35 +34,9 @@
   "permissions": [
     "net.admin",
     "http",
-    "ctl",
-    "spec.transform"
+    "ctl"
   ],
   "steer": {
-    "kinds": [
-      {
-        "name": "warp",
-        "keys": "kinds/warp.schema.json",
-        "caps": [
-          "device",
-          "mark",
-          "ctmark",
-          "engine-owned",
-          "over",
-          "ipv6"
-        ],
-        "helper": {
-          "prog": "bin/warpbox",
-          "cmd": "warp",
-          "argv": [
-            "warp",
-            "{out}",
-            "--conf",
-            "{conf}"
-          ]
-        },
-        "health": "events"
-      }
-    ],
     "commands": [
       {
         "name": "warp-reg",

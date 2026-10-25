@@ -985,7 +985,9 @@ if command -v python3 >/dev/null 2>&1; then
     # (src/lib/module.c) кроме помощника, помощник вида — команда модуля, --conf {conf}.
     for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do
         mf="plugins/$q/plugin.json"
-        want="$(grep -o "{ \"[a-z0-9-]*\", *\"steer-$q\" *}" src/lib/module.c | sed 's/{ "\([^"]*\)".*/\1/' | sort | tr '\n' ' ')"
+        # warp — помощник встроенного вида warp (разворот группы — в ядре, v2.c, пока у warpbox нет
+        # хука expand): его вид плагин не объявляет, помощник ядро находит по CMD_MOD (module.c).
+        want="$(grep -o "{ \"[a-z0-9-]*\", *\"steer-$q\" *}" src/lib/module.c | sed 's/{ "\([^"]*\)".*/\1/' | grep -vx 'warp' | sort | tr '\n' ' ')"
         have="$(jget "$mf" '" ".join(sorted([c["name"] for c in d["steer"].get("commands",[])] + list({k["helper"]["cmd"] for k in d["steer"].get("kinds",[])})))') "
         check "plugins/$q: подкоманды и помощник — команды модуля steer-$q из CMD_MOD" "$want" "$have"
         case " $(profile_var PLUGINS_NET1) " in

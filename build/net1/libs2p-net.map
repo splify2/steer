@@ -118,6 +118,7 @@ LIBS2P_NET_1 {
     s2p_steer_rt_tables_dir;
     s2p_steer_set_keep_dir_of;
     s2p_steer_set_state_dir;
+    s2p_steer_spec_path;
     s2p_steer_state_dir;
     s2p_str_array;
     s2p_str_list;

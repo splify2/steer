@@ -20,6 +20,7 @@
 #include "spec.h"
 #include "platform.h"
 #include "helpers.h"
+#include "plugin.h"
 #include "module.h"
 
 /* Есть ли команда в самом steerd (cli/modcmd.c). Слабая: стенд, собравший помощников без
@@ -86,6 +87,11 @@ size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *
             struct kind_helper hp = { .sig = KIND_SIG_INIT };
             if (!kd->helper) continue;
             if (kd->helper(sp, o, &hp) != 0) { kind_helper_free(&hp); continue; }
+            /* Помощник плагина читает {conf} (steer-api.md, 1.4): файл кладётся здесь, до запуска, при
+             * каждом сборе помощников — его содержимое входит и в подпись перезапуска (plugin.c). */
+            if (hp.conf_path && plugin_conf_write(sp, o) != 0)
+                fprintf(stderr, "steer[warn] %s: файл настройки выхода %s не записан: %s\n", o->name,
+                        hp.conf_path, strerror(errno));
             if (hp.marks && need_marks) *need_marks = 1;
             if (k >= max) { kind_helper_free(&hp); continue; }
             struct helper *h = &out[k];
@@ -400,6 +406,10 @@ const char **helper_argv(const struct helper *h, const char *exe, const char *se
             av[n++] = exe;
             av[n++] = h->cmd;
             av[n++] = h->name;
+        } else if (h->prog[0] == '/') {
+            /* Программа плагина: реестр (kinds/plugin.c) отдаёт полный путь в каталоге плагина. */
+            snprintf(progbuf, pbn, "%s", h->prog);
+            av[n++] = progbuf;
         } else {
             const char *sl = strrchr(self, '/');
             int dl = sl ? (int)(sl - self) : 1;

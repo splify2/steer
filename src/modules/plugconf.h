@@ -5,7 +5,10 @@
  * build/sources.mk, PLUGIN_BASE_SRC), --conf переводится в прежние слова: `--spec` — путь спеки
  * (`paths.spec`, если ядро его положило, иначе spec.yaml или spec.json в `paths.etc`) и `--state-dir`
  * (`paths.state`). Остальной разбор команд не меняется (cli/modcmd.c). Когда помощник начнёт брать
- * ключи выхода из самого {conf}, перевод уйдёт. */
+ * ключи выхода из самого {conf}, перевод уйдёт.
+ *
+ * Заодно выключает в процессе помощника реестр плагинов (plugconf.c, registry_off): свой вид помощник
+ * берёт из встроенной записи своей копии модели. */
 #ifndef STEER_PLUGCONF_H
 #define STEER_PLUGCONF_H
 

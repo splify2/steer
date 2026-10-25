@@ -72,7 +72,26 @@ static char *slurp(const char *path) {
     return b;
 }
 
+/* Реестр плагинов ВНУТРИ помощника протокола (kinds/plugin.c) пуст. Помощник разбирает спеку своей
+ * копией модели, и его собственный вид (tunnel:vless…) обязан быть встроенным видом этой копии: если бы
+ * реестр прочёл каталог плагинов, вид выхода взялся бы из манифеста этого же плагина, и помощник не
+ * узнал бы своего выхода («выход не vless»). Виды других плагинов в спеке помощнику не нужны — их выходы
+ * в его разборе недоступны (kind_unavail), а не отказ всей спеке. Корень реестра — каталог самой
+ * программы: в нём нет подкаталогов с plugin.json, и реестр выходит пустым, но «раскладка есть». */
+static void registry_off(void) {
+    static char dir[4096];
+    ssize_t l = readlink("/proc/self/exe", dir, sizeof(dir) - 1);
+    if (l <= 0) return;
+    dir[l] = '\0';
+    char *sl = strrchr(dir, '/');
+    if (!sl || sl == dir) return;
+    *sl = '\0';
+    setenv("STEER_PLUGINS_ROOT", dir, 1);
+    setenv("STEER_PLUGIN_DIR", dir, 1);
+}
+
 char **plugconf_argv(int *argc, char **argv) {
+    registry_off();
     int at = -1;
     for (int i = 1; i + 1 < *argc; i++)
         if (!strcmp(argv[i], "--conf")) { at = i; break; }
