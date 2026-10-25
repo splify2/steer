@@ -1123,6 +1123,7 @@ int main(void) {
         free(many);
         registry_assign(&g_spec, &e);
 
+        int no_mark = 0, off_mask = 0, dup_mark = 0, dup_table = 0;
         int bad_table = 0;
         for (size_t i = 0; i < g_spec.out_n; i++) {
             if (!g_spec.out[i].mark) { no_mark++; continue; }
