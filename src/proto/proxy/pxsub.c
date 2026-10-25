@@ -24,23 +24,7 @@ const char *px_proto_name(enum px_proto p) {
     return "";
 }
 
-enum px_proto px_proto_by_name(const char *s) {
-    if (!strcmp(s, "trojan")) return PX_TROJAN;
-    if (!strcmp(s, "shadowsocks") || !strcmp(s, "ss")) return PX_SS;
-    if (!strcmp(s, "socks")) return PX_SOCKS;
-    if (!strcmp(s, "http")) return PX_HTTP;
-    if (!strcmp(s, "vmess")) return PX_VMESS;
-    return 0;
-}
-
 /* ---- мелочи ---------------------------------------------------------------------------------- */
-
-static int hexv(int c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    c |= 32;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
 
 /* Разобрать host[:port] (host — имя, IPv4 или [IPv6]) в узел; порт обязателен и в 1..65535. 0 —
  * ок, -1 — нет. */

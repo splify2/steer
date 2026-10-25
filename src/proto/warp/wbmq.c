@@ -44,8 +44,6 @@
 #define MQ_AUTH  "cloudflareaccess.com"
 #define MQ_PROTO "cf-connect-ip"
 
-#define LOG(...) fprintf(stderr, "steer-warpbox: " __VA_ARGS__)
-
 static long mono_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);

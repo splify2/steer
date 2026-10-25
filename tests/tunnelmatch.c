@@ -1187,6 +1187,11 @@ static void t_udp_big(void) {
     free(vs);
 }
 
+/* Есть ли ещё слот, который conn_slot выдаст без вытеснения. */
+static int conn_slot_avail(void) {
+    return g_free_n || g_nslots < g_slots_cap;
+}
+
 /* Заполнить таблицу целиком свежими TCP, кроме одного потока UDP с заданными портом и
  * возрастом, и спросить conn_new о новом месте. Возвращает, отдали ли место этого потока. */
 static int full_table_gives_udp(uint16_t dport, int idle_s) {

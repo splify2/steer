@@ -100,7 +100,6 @@ struct px_node *px_load_sub(const char *path, enum px_proto want, size_t *cnt,
 
 /* Имя протокола для спеки и ссылки, и обратно. */
 const char *px_proto_name(enum px_proto p);
-enum px_proto px_proto_by_name(const char *s);
 
 /* Имена шифров для вывода узла (proxy-nodes): метод shadowsocks и шифр тела vmess. */
 const char *px_ss_method_name(enum ss_method m);

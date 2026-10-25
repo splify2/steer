@@ -1,6 +1,6 @@
 /* Транспорт ws: поток протокола в кадрах WebSocket (RFC 6455) после запроса Upgrade.
  *
- * Верхний ярус транспорта (transport.h), шаг 5 выпуска 1.10. Запрос Upgrade и ответ 101 — общие с
+ * Верхний ярус транспорта (transport.h). Запрос Upgrade и ответ 101 — общие с
  * httpupgrade (trupgrade.c); здесь — только кадры.
  *
  * ОТПРАВКА — КАК У XRAY. Клиент Xray пишет в gorilla/websocket одним WriteMessage(BinaryMessage)

@@ -99,7 +99,6 @@ struct tcp_hdr {
     uint16_t win, sum, urp;
 };
 
-#define TH_FIN 0x01
 #define TH_SYN 0x02
 #define TH_RST 0x04
 #define TH_PSH 0x08

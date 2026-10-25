@@ -30,8 +30,6 @@ int sl_host_leads_nowhere(const char *h);
 int sl_host_is_name(const char *h);
 void sl_pct_decode(char *s);
 void sl_set_field(char *dst, size_t n, const char *src, size_t len);
-/* Поле в процентной форме: раскодировать, потом обрезать по полю. */
-void sl_set_pct(char *dst, size_t n, const char *src, size_t len);
 
 /* Поле узла, которое не обрезается молча: не влезло — узел помечается (vless_node.trunc_what), и
  * sl_link_usable_pre отвергает его с названием поля и шириной. Обрезанный пароль, путь или SNI —
