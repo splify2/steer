@@ -465,6 +465,12 @@ for spec in $ISAS; do
     cp files/usr/share/nftables.d/chain-pre/input/30-steer.nft \
        "$root/usr/share/nftables.d/chain-pre/input/30-steer.nft"
     chmod 0644 "$root/usr/share/nftables.d/chain-pre/input/30-steer.nft"
+    # Версия steer-abi ядра — для .so-плагинов (steerd динамический и грузит их сам: src/daemon/plugso.c). Загрузчик внутри
+    # steerd, отдельной libsteer-plugin.so в пакете нет; файл — то, что читает менеджер плагинов
+    # (compat.steer-abi), не запуская steerd.
+    mkdir -p "$root/usr/share/steer"
+    printf 'steer-abi %s\n' "$(sh build/abi.sh)" > "$root/usr/share/steer/steer-abi"
+    chmod 0644 "$root/usr/share/steer/steer-abi"
     chmod 0755 "$root/usr/sbin/steerd" "$root/usr/sbin/steer" \
                "$root/etc/init.d/steer" "$root/etc/hotplug.d/iface/95-steer"
     chmod 0644 "$root/lib/upgrade/keep.d/steer"

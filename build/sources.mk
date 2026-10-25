@@ -160,7 +160,7 @@ DAEMON_SRC := src/compile/groups.c src/compile/generate.c src/compile/balance.c 
               src/tools/srsread.c src/daemon/ctl.c \
               src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c \
               src/daemon/foprobe.c src/daemon/gaiw.c src/daemon/urltest.c src/daemon/fogroup.c src/lib/nftvmap.c \
-              src/daemon/folat.c $(MODCMD_SRC)
+              src/daemon/folat.c src/daemon/plugso.c $(MODCMD_SRC)
 LIBSTEER_BASE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c $(MODEL_SRC) src/proto/obfs/obfs.c \
                      src/cli/cli.c src/tools/hwid.c src/lib/ctlcall.c $(KINDS_BASE_SRC)
 OBFS_MOD_SRC := src/proto/obfs/obfsmain.c
@@ -211,7 +211,7 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
 #                  (trojan://, vmess://), — в libsteer, как и сам транспорт.
 SUBLINK_SRC := src/proto/vless/sublink.c
 STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/pool.c src/tunnel/geo.c \
-             src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/tls/httpc.c
+             src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/tls/httpc.c src/proto/tls/plughttp.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/tls/ech.c src/proto/transport/trgrpc.c \
                  src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c \

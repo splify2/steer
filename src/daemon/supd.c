@@ -357,16 +357,9 @@ static void ev_awg(struct supd *s, struct helper *h, const struct evline *e) {
     if (s->d->watch) watchd_helper_changed(s->d->watch);
 }
 
-/* member (модуль steer-warpbox, evline.h): приговор члену его группы — ok 0 (мёртв: трафик группы
- * уходит с него сразу), 1 (жив) или -1 (не знаю: решает сторож по своим признакам). Только член
- * группы этого помощника. Смена приговора будит сторожа: проход уводит группу с мёртвого члена, не
- * дожидаясь, пока рукопожатие устареет (у awg это до трёх минут). */
-static void ev_member(struct supd *s, struct helper *h, const struct evline *e) {
-    const char *name = evline_str(e, "out");
-    long v;
-    if (!name || !evline_int(e, "ok", &v) || v < -1 || v > 1 || !s->d->have) return;
-    const struct output *o = out_by_name(s->d->sp, name);
-    if (!o || strcmp(o->warp_of, h->name) != 0) return;
+/* Записать приговор v члену name группы grp; who — кто его вынес (для журнала). Общее у события member
+ * помощника и у .so-плагина (host->member_verdict, plugso.c). */
+static void mverdict_set(struct supd *s, const char *grp, const char *who, const char *name, int v) {
     struct mverdict *m = NULL;
     for (size_t i = 0; i < s->mv_n; i++)
         if (!strcmp(s->mv[i].out, name)) m = &s->mv[i];
@@ -381,14 +374,29 @@ static void ev_member(struct supd *s, struct helper *h, const struct evline *e) 
         }
         m = &s->mv[s->mv_n++];
         snprintf(m->out, sizeof(m->out), "%s", name);
-        snprintf(m->grp, sizeof(m->grp), "%s", h->name);
+        snprintf(m->grp, sizeof(m->grp), "%s", grp);
         m->v = -1;
     }
     if (m->v == (signed char)v) return;
     m->v = (signed char)v;
-    if (v == 0) fprintf(stderr, "steer[info] supervise: %s %s: член %s не отвечает — увожу группу с него\n",
-                        h->cmd, h->name, name);
+    if (v == 0) fprintf(stderr, "steer[info] supervise: %s: член %s не отвечает — увожу группу с него\n",
+                        who, name);
     if (s->d->watch) watchd_helper_changed(s->d->watch);
+}
+
+/* member (модуль steer-warpbox, evline.h): приговор члену его группы — ok 0 (мёртв: трафик группы
+ * уходит с него сразу), 1 (жив) или -1 (не знаю: решает сторож по своим признакам). Только член
+ * группы этого помощника. Смена приговора будит сторожа: проход уводит группу с мёртвого члена, не
+ * дожидаясь, пока рукопожатие устареет (у awg это до трёх минут). */
+static void ev_member(struct supd *s, struct helper *h, const struct evline *e) {
+    const char *name = evline_str(e, "out");
+    long v;
+    if (!name || !evline_int(e, "ok", &v) || v < -1 || v > 1 || !s->d->have) return;
+    const struct output *o = out_by_name(s->d->sp, name);
+    if (!o || strcmp(o->warp_of, h->name) != 0) return;
+    char who[96];
+    snprintf(who, sizeof who, "%s %s", h->cmd, h->name);
+    mverdict_set(s, h->name, who, name, (int)v);
 }
 
 static void mv_drop_group(struct supd *s, const char *grp) {
@@ -1685,4 +1693,12 @@ char *supd_probe_env(const struct supd *s) {
     }
     if (fclose(f) != 0) { free(buf); return NULL; }
     return buf;
+}
+
+/* Приговор члену группы от .so-плагина (host->member_verdict): grp — id плагина. */
+void supd_member_set(struct supd *s, const char *grp, const char *out, int v) {
+    if (!s || !s->d->have || !out_by_name(s->d->sp, out)) return;
+    char who[96];
+    snprintf(who, sizeof who, "plugin %s", grp);
+    mverdict_set(s, grp, who, out, v);
 }

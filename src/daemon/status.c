@@ -32,6 +32,7 @@
 #include "generate.h"
 #include "grpurl.h"
 #include "jsonw.h"
+#include "plugso.h"
 
 
 /* ---- status --------------------------------------------------------------- */
@@ -464,6 +465,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
         /* То, что о помощнике выхода знает демон по его событиям (у моста tgws — отставленные
          * пути, paths_down): только в ответе демона-супервизора, подкоманда о них не знает. */
         if (g_status_extra) g_status_extra(out, sp->out[i].name);
+        plugso_status_out(out, sp->out[i].name);
         fprintf(out, "}");
     }
     fprintf(out, "},\"channels\":[");
@@ -488,7 +490,9 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
             fprintf(out, "%s\"%s\"", m ? "," : "", gr->g[i].members[m]);
         fprintf(out, "]}");
     }
-    fprintf(out, "]}\n");
+    fprintf(out, "]");
+    plugso_status_print(out);
+    fprintf(out, "}\n");
 }
 
 /* Полный ответ: посчитать, запомнить и напечатать в out.

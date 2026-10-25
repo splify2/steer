@@ -215,6 +215,8 @@ struct supd_conf {
 
 /* Поднять детей по спеке в памяти демона: помощников и резолвер на таблице. NULL — нет памяти. */
 struct supd *supd_start(struct steerd *d, const struct supd_conf *c);
+/* Приговор члену группы от .so-плагина (host->member_verdict): ok -1, 0, 1; grp — id плагина. */
+void supd_member_set(struct supd *s, const char *grp, const char *out, int ok);
 /* Что тронула сверка (apply-сверка, docs/ctl.md, поле changed): выходы, чей помощник поднят,
  * перезапущен ради новых параметров или погашен; написана ли резолверу новая таблица. */
 struct supd_changes {

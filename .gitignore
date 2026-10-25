@@ -156,3 +156,5 @@ build/xudpprobe
 build/trdialmatch
 build/warpmatch
 build/urltlsmatch
+build/abihost
+build/abihost-static

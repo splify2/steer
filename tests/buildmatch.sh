@@ -1080,6 +1080,25 @@ for sym in $(grep -v '^#' build/exports-ext.lst | grep -v '^$'); do
 done
 check "exports-ext.lst: каждый символ экспортируется libsteer.map" "" "$ext_missing"
 
+# ---- .so-плагины: загрузчик в steerd (steer-abi, src/daemon/plugso.c) -------------------------------
+# Загрузчик — часть демона: ему нужны цикл, спека и сторож steerd, и в libsteer или модули он не входит
+# (плагин не связан ни с какой libsteer*, всё ему даёт таблица в init). Статические профили берут его
+# вместе с ядром (CORE_SRC) и отказывают сообщением, а не заглушкой libc. HTTPS-вход для плагинов
+# (plughttp.c) — слой TLS: в libsteer, в базовых сборках его нет.
+check "plugso.c — в steerd и в статическом ядре" "2" \
+    "$( { profile_src steerd | words | grep -c '^src/daemon/plugso\.c$'; profile_src base | words | grep -c '^src/daemon/plugso\.c$'; } | awk '{s+=$1} END {print s}')"
+check "plugso.c — не в libsteer и не в модулях" "0" \
+    "$(for p in libsteer mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox; do profile_src "$p" | words | grep '^src/daemon/plugso\.c$'; done | wc -l | tr -d ' ')"
+check "plughttp.c — в libsteer, не в базовом ядре" "1:0" \
+    "$(profile_src libsteer | words | grep -c '^src/proto/tls/plughttp\.c$'):$(profile_src base | words | grep -c '^src/proto/tls/plughttp\.c$')"
+# Версия ABI одна — в plugabi.h; build/abi.sh её читает, build.sh кладёт файл в steer-core.
+check "build/abi.sh называет версию steer-abi из plugabi.h" "1" "$(sh build/abi.sh | grep -cE '^[0-9]+\.[0-9]+$')"
+check "build.sh кладёт usr/share/steer/steer-abi в steer-core" "1" \
+    "$(grep -q 'usr/share/steer/steer-abi' build.sh && echo 1 || echo 0)"
+check "plugabi.h: охранный макрос не совпадает с kinds/plugin.h" "" \
+    "$(grep -h '^#ifndef ' src/daemon/plugabi.h src/kinds/plugin.h 2>/dev/null | sort | uniq -d)"
+check "tests/abimatch.sh в списке make test" "1" "$(grep -c 'sh tests/abimatch.sh' Makefile)"
+
 # ---- список изменений выпуска ---------------------------------------------------------------
 # release.yml берёт текст «что нового» из раздела «## <VERSION>» файла CHANGELOG.md, и стабильный
 # выпуск без него не выходит. Поднятая VERSION без раздела ловится здесь, а не на кнопке выпуска.

@@ -164,6 +164,7 @@
 #include "nftcompat.h"
 #include "ctl.h"
 #include "ynode.h"
+#include "plugso.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
 
@@ -3179,13 +3180,17 @@ int ctl_serve_main(int argc, char **argv) {
         struct supd_conf sc = { ctl_enabled, cf->dnsd_flags };
         if (!supd_start(&S.d, &sc)) { fprintf(stderr, LOG_W "супервизор: нет памяти\n"); return 1; }
     }
+    /* .so-плагины (steer-abi): после супервизора, чтобы host_v1 видел и спеку, и сторожа, и помощников. */
+    plugso_boot(&S.d);
     fprintf(stderr, LOG_I "слушаю %s%s%s\n", cf->sock, cf->watch ? ", сторожу выходы" : "",
             cf->supervise ? ", держу помощников" : "");
     if (cf->apply) {
         if (!S.d.have) fprintf(stderr, LOG_W "спеки нет — применять при старте нечего\n");
         else if (boot_apply(&S) != 0) watchd_release(S.watch);
     }
-    return loop_run(S.l);
+    int rc = loop_run(S.l);
+    plugso_fini_all();
+    return rc;
 }
 
 /* ---- клиент ------------------------------------------------------------------------------------ */

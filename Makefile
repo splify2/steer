@@ -81,7 +81,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/b3match $(BUILD)/subpq
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/b3match $(BUILD)/subpq $(BUILD)/abihost $(BUILD)/abihost-static $(BUILD)/steerd-static
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -112,6 +112,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/diagmatch.sh
 	@sh tests/statusmatch.sh
 	@sh tests/buildmatch.sh
+	@sh tests/abimatch.sh
 	@sh tests/srsmatch.sh
 	@$(BUILD)/srsunit
 	@$(BUILD)/procscanmatch
@@ -410,6 +411,22 @@ FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_E
 $(BUILD)/modelmatch: tests/modelmatch.c tests/unit.h $(MODEL_KINDS) src/kinds/awg.c $(CORE_HDR)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/modelmatch.c $(MODEL_KINDS) src/kinds/awg.c
+
+# Хост стенда tests/abimatch.sh: настоящий загрузчик .so-плагинов (src/daemon/plugso.c) с циклом, подписчиками
+# и моделью спеки, без демона (шапка tests/abihost.c). Плагины стенда собирает сам стенд из tests/abi/plugin.c.
+# Те же исходники статически (-static): статическая сборка обязана честно отказывать (abimatch.sh, п. 9);
+# steerd-static — весь движок статически, как телефон и мини-сборки.
+$(BUILD)/abihost-static: tests/abihost.c src/daemon/plugso.c src/daemon/loop.c src/daemon/gaiw.c src/daemon/state.c $(MODEL_KINDS) src/kinds/awg.c $(CORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -static -o $@ tests/abihost.c src/daemon/plugso.c src/daemon/loop.c src/daemon/gaiw.c src/daemon/state.c $(MODEL_KINDS) src/kinds/awg.c 2>/dev/null
+
+$(BUILD)/steerd-static: $(CORE_SRC) $(CORE_HDR) VERSION
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(DEFS) -static -o $@ $(CORE_SRC) 2>/dev/null
+
+$(BUILD)/abihost: tests/abihost.c src/daemon/plugso.c src/daemon/loop.c src/daemon/gaiw.c src/daemon/state.c $(MODEL_KINDS) src/kinds/awg.c $(CORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/abihost.c src/daemon/plugso.c src/daemon/loop.c src/daemon/gaiw.c src/daemon/state.c $(MODEL_KINDS) src/kinds/awg.c -rdynamic
 
 # Обход /proc (src/lib/procscan.c): хвост длинной командной строки.
 $(BUILD)/procscanmatch: tests/procscanmatch.c tests/unit.h src/lib/procscan.c src/lib/procscan.h
