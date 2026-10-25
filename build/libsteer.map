@@ -331,6 +331,7 @@ LIBSTEER_1 {
     tls_cert_roots;
     transport_aux_drain;
     transport_aux_fd;
+    transport_aux_pending;
     transport_big_write;
     transport_close;
     transport_direct;
