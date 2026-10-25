@@ -34,6 +34,7 @@
 #include <wolfssl/wolfcrypt/poly1305.h>
 #include <wolfssl/wolfcrypt/chacha20_poly1305.h>
 #include <wolfssl/wolfcrypt/curve25519.h>
+#include <wolfssl/wolfcrypt/ed25519.h>
 #include <wolfssl/wolfcrypt/rsa.h>
 #include <wolfssl/wolfcrypt/ecc.h>
 #include <wolfssl/wolfcrypt/random.h>
@@ -614,6 +615,27 @@ int sc_x25519_base(unsigned char pub[32], const unsigned char scalar[32]) {
     int rc = wc_curve25519_make_pub(32, pub, 32, s);
     wc_ForceZero(s, sizeof(s));
     return rc == 0 ? 0 : SC_ECRYPTO;
+}
+
+/* ---- Ed25519: только проверка --------------------------------------------------------------- */
+
+/* Ключ заводится на время вызова в куче: структура ed25519_key не входит в ABI между libsteer и
+ * libsteer-wolfssl — её размер знает только этот файл (как у ML-DSA ниже). */
+int sc_ed25519_verify(const unsigned char pk[SC_ED25519_PK], const unsigned char *msg, size_t msg_n,
+                      const unsigned char sig[SC_ED25519_SIG]) {
+    if (msg_n > 0xffffffffu) return SC_EINVAL;
+    ed25519_key *k = (ed25519_key *)calloc(1, sizeof(*k));
+    if (!k) return SC_ENOMEM;
+    int rc = SC_EPARSE, res = 0;
+    if (wc_ed25519_init(k) == 0) {
+        if (wc_ed25519_import_public(pk, SC_ED25519_PK, k) == 0) {
+            int vr = wc_ed25519_verify_msg(sig, SC_ED25519_SIG, msg, (word32)msg_n, &res, k);
+            rc = (vr == 0 && res == 1) ? 0 : SC_ESIG;
+        }
+        wc_ed25519_free(k);
+    }
+    free(k);
+    return rc;
 }
 
 /* ---- подписи -------------------------------------------------------------------------------- */

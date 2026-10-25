@@ -94,7 +94,7 @@ YAML_SRC := src/lib/ynode.c $(LIBYAML_SRC)
 # моделью, поэтому файл здесь же.
 MODEL_SRC := $(PLATFORM_SRC) src/lib/module.c src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/lib/ir.c src/model/parse.c src/model/v1.c \
              src/model/check.c src/model/v2.c src/model/v2print.c src/model/registry.c \
-             src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/model/srs.c src/model/srsplan.c \
+             src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/lib/gz.c src/model/srs.c src/model/srsplan.c \
              src/lib/nftdump.c src/lib/rtnl.c src/lib/procscan.c $(YAML_SRC)
 
 # Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,
@@ -211,15 +211,21 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
 #                  (trojan://, vmess://), — в libsteer, как и сам транспорт.
 SUBLINK_SRC := src/proto/vless/sublink.c
 STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/pool.c src/tunnel/geo.c \
-             src/proto/warp/wbhttps.c src/proto/warp/wbjson.c
+             src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/tls/httpc.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/tls/ech.c src/proto/transport/trgrpc.c \
                  src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c \
                  src/proto/transport/trws.c src/proto/transport/trpath.c src/proto/tls/roots.c \
                  src/proto/transport/trvenc.c
+# Примитивы менеджера плагинов (PLUGINS.md, раздел 3), каждый отдельно от формата плагина:
+#   httpc.c    HTTP/1.1-клиент (GET/HEAD, https, переадресации, поток, сроки, ETag) — в STACK_SRC выше;
+#   sigverify.c проверка подписи Ed25519 в формате usign/signify (слой scrypto.h);
+#   untar.c    распаковка ustar+gzip в каталог с защитой путей и SHA-256 файлов (gz.c, scrypto.h).
+# Два последних — каталог src/lib, но им нужна криптобиблиотека, поэтому не в базовом профиле.
+PLUGIN_PRIM_SRC := src/lib/sigverify.c src/lib/untar.c
 VLESS_MOD_SRC := src/proto/vless/vlmain.c src/proto/vless/vldial.c \
                  src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c
-EXT_ROUTER_SRC := src/proto/vless/sub.c $(SUBLINK_SRC) $(VLESS_MOD_SRC) $(STACK_SRC) $(TRANSPORT_SRC) \
+EXT_ROUTER_SRC := src/proto/vless/sub.c $(SUBLINK_SRC) $(VLESS_MOD_SRC) $(STACK_SRC) $(TRANSPORT_SRC) $(PLUGIN_PRIM_SRC) \
                   src/proto/xsteer/xsclient.c src/proto/vless/subfetch.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c \
                   src/proto/tls/urltls.c
 EXT_SERVER_SRC := src/proto/xsteer/xshub.c
@@ -313,7 +319,7 @@ WARP_MOD_SRC := src/proto/warp/wbreg.c src/proto/warp/wbconf.c \
                 src/proto/warp/wbns.c src/proto/warp/wbping.c src/proto/warp/wbscan.c src/proto/warp/wbx509.c \
                 src/proto/warp/wbmq.c src/proto/warp/wbmain.c
 LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC) $(SUBLINK_SRC) \
-                $(STACK_SRC) $(TRANSPORT_SRC) \
+                $(STACK_SRC) $(TRANSPORT_SRC) $(PLUGIN_PRIM_SRC) \
                 src/tunnel/tun.c src/proto/tls/chello.c src/proto/tls/tls13.c \
                 src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c $(CRYPTO_SRC) \
                 $(QUIC_SRC)

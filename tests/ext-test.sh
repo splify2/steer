@@ -18,6 +18,9 @@
 #   tests/hubmatch.c   — арифметика записи в хабе: правило набора кадров в пачку против
 #                        объявленной строки воркера (I-070).
 #   tests/devupmatch.c — подъём устройства туннеля: каждый отказ `ip` обязан быть назван (I-114).
+#   tests/sigmatch.c   — подпись Ed25519 в формате usign (векторы tests/sigvec, выпущены usign);
+#   tests/tarmatch.c   — распаковка ustar+gzip с настоящим SHA-256 слоя (в make test — со своим);
+#   tests/httpsmatch.sh — HTTPS клиента libsteer: настоящий TLS 1.3 против python-сервера со своим корнем.
 #   tests/probe.sh     — активное зондирование хаба настоящим openssl s_client (нужен root).
 #
 # В обычный `make test` они НЕ входят: там библиотеки нет по построению (R-014, см. ext-syntax в
@@ -95,6 +98,21 @@ CERTGEN="$BUILD/wolfssl-host/certgen-$CCTAG.o"
 echo "ext-test: собираю и прогоняю scryptomatch..."
 $CC -O2 -g -w $STEER_INC -Itests -o "$BUILD/scryptomatch" tests/scryptomatch.c $CRYPTO -lpthread
 "$BUILD/scryptomatch"
+
+# Ed25519 (подпись пакетов плагинов, формат usign), распаковка ustar+gzip с настоящим SHA-256 слоя и
+# HTTPS клиента libsteer с настоящим TLS против python-сервера со своим корнем.
+echo "ext-test: собираю и прогоняю sigmatch..."
+$CC -O2 -g -w $STEER_INC -Itests -o "$BUILD/sigmatch" tests/sigmatch.c src/lib/sigverify.c $CRYPTO -lpthread
+"$BUILD/sigmatch" | tail -1
+echo "ext-test: собираю и прогоняю tarmatch (SHA-256 слоя scrypto)..."
+$CC -O2 -g -w $STEER_INC -Itests -o "$BUILD/tarmatch-real" tests/tarmatch.c src/lib/untar.c src/lib/gz.c src/lib/puff.c \
+	src/tools/hwid.c src/lib/jsonw.c $(profile_var PLATFORM_SRC) $CRYPTO -lpthread
+"$BUILD/tarmatch-real" | tail -1
+echo "ext-test: собираю и прогоняю httpsmatch..."
+$CC -O2 -g -w $STEER_INC -o "$BUILD/httpsget" tests/httpsget.c src/proto/tls/httpc.c src/proto/tls/reality.c \
+	src/proto/tls/chello.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/proto/tls/roots.c \
+	$(profile_var PLATFORM_SRC) src/lib/err.c $CRYPTO -lpthread
+sh tests/httpsmatch.sh "$BUILD/httpsget"
 
 # cpmatch — ветка ChaCha20-Poly1305 для 32-битного MIPS (scrypto.c, SC_CP_OWN; poly1305_32.h) на хосте,
 # с переносимой арифметикой вместо multu/maddu, против wolfSSL; сама scryptomatch на этой же ветке — по векторам RFC 8439.

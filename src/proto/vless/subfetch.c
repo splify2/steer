@@ -28,14 +28,14 @@
  * ссылается. Это учёт настройки управляющего слоя, а не работа с подпиской: движку про uci
  * знать нечего, и он про него ничего и не знает.
  *
- * ПОЧЕМУ БАЙТЫ ВСЁ ЕЩЁ ТАСКАЕТ СИСТЕМНЫЙ КАЧАЛЬЩИК (curl или uclient-fetch), а не движок
- * сам. Подписка живёт на https, а у нас нет клиента https общего назначения: свой стек TLS
- * 1.3 (tls13.c) написан под Reality и узлы VLESS (с security=tls он проверяет цепочку, но HTTP
- * поверх него — только то, что нужно транспортам туннеля), а хранилище корней на роутере
- * ставит отдельный пакет ca-bundle. Качальщик эту работу уже делает и уже делал в оболочке.
- * (Прежний довод «X.509 в mbedtls выключен» устарел: цепочку теперь проверяет wolfSSL за
- * слоем src/lib/scrypto.h.) Поэтому байты по-прежнему таскает он, но ЗАПУСКАЕТ его
- * движок, без оболочки и без подстановки строк: аргументы уезжают массивом в execvp.
+ * БАЙТЫ ТАСКАЕТ HTTP-КЛИЕНТ libsteer (src/proto/tls/httpc.c), а не curl или uclient-fetch. Раньше
+ * подписку качал системный качальщик, который запускал движок (execvp), потому что своего клиента
+ * https общего назначения не было. Теперь он есть: тот же TLS 1.3 с проверкой цепочки до корней
+ * (ca-bundle на роутере, склейка каталога на телефоне), что у узлов и замеров. Цена внешнего
+ * качальщика была платой за три разных поведения: curl умел заголовки запроса и ответа, busybox wget —
+ * только запроса, uclient-fetch — ни того ни другого; поэтому были два прохода (с заголовками
+ * устройства и без) и «качать нечем». Теперь заголовки умеют оба направления всегда, cookie-проверка
+ * панели проходится в любой сборке, а «нет качальщика» перестало быть отказом.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -52,8 +52,8 @@
 #include "subfetch.h"
 #include "hwid.h"
 #include "jsonw.h"
-#include "run.h"
-#include "puff.h"
+#include "httpc.h"
+#include "gz.h"
 
 /* Уровень в журнале — как в остальных файлах движка. Метка подсистемы «sub»: всё здесь
  * пишется при работе с подпиской. */
@@ -375,46 +375,22 @@ static void quota_json(const struct quota *q) {
 
 /* ---- скачивание ------------------------------------------------------------------- */
 
-/* Есть ли такая команда. Тем же обходом PATH, что делает `command -v`: различать «качальщика
- * нет» и «качальщик отказал» обязательно — первое означает «нечем послать заголовок», и об
- * этом человеку говорится отдельно. */
-static int have(const char *name) {
-    const char *path = steer_env_or("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
-    for (const char *p = path; *p; ) {
-        const char *e = strchr(p, ':');
-        size_t l = e ? (size_t)(e - p) : strlen(p);
-        if (l) {
-            char full[512];
-            snprintf(full, sizeof full, "%.*s/%s", (int)l, p, name);
-            if (access(full, X_OK) == 0) return 1;
-        }
-        if (!e) break;
-        p = e + 1;
-    }
-    return 0;
-}
+/* Сроки прежние: подписка — минута на всё (curl --max-time 60), проба заголовков — двадцать секунд. */
+#define FETCH_TIMEOUT_MS 60000
+#define HEAD_TIMEOUT_MS  20000
 
-#define FETCH_TIMEOUT "60"
-#define HEAD_TIMEOUT  "20"
-
-/* СВОЁ ИМЯ В User-Agent, и это не вежливость.
+/* СВОЁ ИМЯ В User-Agent — то, которое ставит клиент (httpc.c: «steer/<версия>»), и это не вежливость.
  *
- * Панели и защита перед ними разбирают клиента по этой строке, и клиент по имени `curl`
- * для них — не клиент. Снято на двух живых подписках: DDoS-Guard перед панелью отвечает
- * `curl/…` и `Wget/…` кодом 200 с ПУСТЫМ телом (то есть отказ, который не выглядит
- * отказом), а любому другому имени — той же ссылкой vless://, что и браузеру. Своё имя
- * проходит: проверено `steer/1.5.0` — 282 байта и ссылка, `curl/8.5.0` — ноль байт.
+ * Панели и защита перед ними разбирают клиента по этой строке, и клиент по имени `curl` для них — не
+ * клиент. Снято на двух живых подписках: DDoS-Guard перед панелью отвечает `curl/…` и `Wget/…` кодом
+ * 200 с ПУСТЫМ телом (то есть отказ, который не выглядит отказом), а любому другому имени — той же
+ * ссылкой vless://, что и браузеру. Своё имя проходит: проверено `steer/1.5.0` — 282 байта и ссылка,
+ * `curl/8.5.0` — ноль байт.
  *
- * ЧУЖИМ КЛИЕНТОМ ПРИ ЭТОМ НЕ ПРЕДСТАВЛЯЕМСЯ (см. «повтор за другим форматом» ниже): назвать
- * себя v2rayNG значило бы получать конфиг Xray в JSON вместо списка ссылок и вдобавок врать
- * панели, которая считает устройства. Мы называем себя тем, что мы есть.
- *
- * Версия в строке — чтобы у поддержки панели был адрес вопроса, если ответ вдруг зависит от
- * неё. Умолчание нужно только сборке без -DSTEER_VERSION (стенды). */
-#ifndef STEER_VERSION
-#define STEER_VERSION "dev"
-#endif
-#define SUB_UA "steer/" STEER_VERSION
+ * ЧУЖИМ КЛИЕНТОМ ПРИ ЭТОМ НЕ ПРЕДСТАВЛЯЕМСЯ (см. «повтор за другим форматом» ниже): назвать себя
+ * v2rayNG значило бы получать конфиг Xray в JSON вместо списка ссылок и вдобавок врать панели,
+ * которая считает устройства. Мы называем себя тем, что мы есть. Заголовок User-Agent отсюда в
+ * запрос не кладётся — иначе имя разошлось бы с клиентом. */
 
 /* GZIP, О КОТОРОМ НЕ ПРОСИЛИ.
  *
@@ -431,15 +407,6 @@ static int have(const char *name) {
  *
  * Сверяется всё, что даёт обёртка (RFC 1952): метод, длина и CRC-32 распакованного. Битый
  * gzip — отказ, а не «что распаковалось»: половина подписки означала бы половину узлов. */
-static unsigned long crc32_add(unsigned long c, const unsigned char *p, size_t n) {
-    c = ~c & 0xffffffffUL;
-    while (n--) {
-        c ^= *p++;
-        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xedb88320UL & (0UL - (c & 1)));
-    }
-    return ~c & 0xffffffffUL;
-}
-
 /* 0 — файл не gzip или распакован на месте; -1 — gzip испорчен или не записался. */
 static int gunzip_inplace(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -454,50 +421,26 @@ static int gunzip_inplace(const char *path) {
     if (!z) { fclose(f); return -1; }
     size_t n = fread(z, 1, (size_t)sz, f);
     fclose(f);
-    if (n != (size_t)sz || z[2] != 8) { free(z); return -1; }   /* 8 — deflate, другого нет */
-
-    /* Заголовок: 10 байт и необязательные поля по флагам. */
-    unsigned flg = z[3];
-    size_t off = 10;
-    if (flg & 4) {                                   /* FEXTRA */
-        if (off + 2 > n) { free(z); return -1; }
-        off += 2 + (size_t)(z[off] | (z[off + 1] << 8));
-    }
-    for (unsigned bit = 8; bit <= 16; bit <<= 1)     /* FNAME, FCOMMENT: строки до нуля */
-        if (flg & bit) {
-            while (off < n && z[off]) off++;
-            off++;
-        }
-    if (flg & 2) off += 2;                           /* FHCRC */
-    if (off + 8 > n) { free(z); return -1; }
-
-    struct puff_stream *ps = malloc(sizeof *ps);
-    unsigned char *buf = malloc(16384);
+    struct gz *g = n == (size_t)sz ? gz_open(z, n) : NULL;
+    unsigned char *buf = g ? malloc(16384) : NULL;
     char out[520];
     snprintf(out, sizeof out, "%s.gz", path);
-    FILE *o = (ps && buf) ? fopen(out, "wb") : NULL;
+    FILE *o = buf ? fopen(out, "wb") : NULL;
     int ok = 0;
     if (o) {
-        puff_stream_init(ps, z + off, (unsigned long)(n - off - 8));
-        unsigned long crc = 0, total = 0;
         long k;
         ok = 1;
-        while ((k = puff_stream_read(ps, buf, 16384)) > 0) {
-            crc = crc32_add(crc, buf, (size_t)k);
-            total += (unsigned long)k;
+        /* gz_read сверяет метод, длину и CRC-32 и на конце отвечает 0, а на любом изъяне — -1. */
+        while ((k = gz_read(g, buf, 16384)) > 0)
             if (fwrite(buf, 1, (size_t)k, o) != (size_t)k) { ok = 0; break; }
-        }
-        /* Хвост — сразу за последним байтом потока: CRC-32 и длина по модулю 2^32. */
-        const unsigned char *t = z + off + ps->incnt;
-        if (ok && (k < 0 || !puff_stream_done(ps) || t + 8 > z + n ||
-                   (t[0] | t[1] << 8 | t[2] << 16 | (unsigned long)t[3] << 24) != crc ||
-                   (t[4] | t[5] << 8 | t[6] << 16 | (unsigned long)t[7] << 24) != (total & 0xffffffffUL)))
-            ok = 0;
+        if (k < 0) ok = 0;
         if (fclose(o) != 0) ok = 0;
         if (ok && rename(out, path) != 0) ok = 0;
         if (!ok) unlink(out);
     }
-    free(buf); free(ps); free(z);
+    free(buf);
+    if (g) gz_close(g);
+    free(z);
     if (!ok) {
         fprintf(stderr, LOG_W "панель прислала испорченный gzip: %s\n", path);
         return -1;
@@ -507,96 +450,51 @@ static int gunzip_inplace(const char *path) {
 
 /* Один заход к панели.
  *
- * body — куда тело (NULL при HEAD); hdr_path — куда заголовки ответа (NULL — они не нужны
- * или качальщик их не умеет). *hwid_sent — ушёл ли идентификатор устройства.
+ * body — куда тело (NULL при HEAD); hdr_path — куда заголовки ответа (NULL — не нужны). *hwid_sent —
+ * ушёл ли идентификатор устройства.
  *
- * Заголовки умеют посылать curl и busybox wget; uclient-fetch, которым `wget` на OpenWrt
- * бывает по факту, не умеет вовсе. Поэтому попытка с заголовками, а при отказе — попытка
- * без них, и об этом ГОВОРИТСЯ: подписка, скачанная без HWID, может оказаться заглушкой.
+ * Сначала с заголовками устройства, а при отказе — без них, и об этом ГОВОРИТСЯ: подписка, скачанная
+ * без HWID, может оказаться заглушкой. Отказ — сбой клиента или статус >= 400 (как `curl -f`).
+ * Повтор без заголовков остался от времён, когда их умели не все качальщики, но и теперь он нужен: панель
+ * может ответить отказом именно на них (лишний заголовок режет защита), а подписка без них лучше никакой.
  *
- * ЗАГОЛОВКИ ОТВЕТА читает только curl (-D): у busybox wget их дампить нечем. Тогда ни
- * названия подписки, ни остатка трафика мы не узнаём — и это честно отличается от «панель
- * промолчала» (см. quota_save и его `keep`). */
-static int http_get(const char *url, const char *body, const char *hdr_path,
-                    const char *id, int head, int *hwid_sent) {
+ * Заголовки ответа пишутся в hdr_path как есть: статусная строка и поля, по строке на поле. */
+static int sub_get(const char *url, const char *body, const char *hdr_path,
+                   const char *id, int head, int *hwid_sent) {
     char os[80], model[80];
     steer_dev_os(os, sizeof os);
     steer_dev_model(model, sizeof model);
-    char h_id[128], h_os[128], h_ver[128], h_model[128];
-    snprintf(h_id, sizeof h_id, "x-hwid: %s", id ? id : "");
-    snprintf(h_os, sizeof h_os, "x-device-os: %s", os);
-    snprintf(h_ver, sizeof h_ver, "x-ver-os: %s", os);
-    snprintf(h_model, sizeof h_model, "x-device-model: %s", model);
+    char hdrs[512];
+    snprintf(hdrs, sizeof hdrs, "x-hwid: %s\r\nx-device-os: %s\r\nx-ver-os: %s\r\nx-device-model: %s\r\n",
+             id ? id : "", os, os, model);
 
     *hwid_sent = 0;
     /* Два прохода: первый с заголовками устройства, второй без. При пустом id первый
      * пропускается — посылать «x-hwid: » значило бы назвать себя пустым именем. */
     for (int with_id = (id && *id) ? 1 : 0; ; with_id--) {
-        const char *a[32];
-        int i = 0;
-        if (have("curl")) {
-            a[i++] = "curl";
-            a[i++] = head ? "-fsSI" : "-fsSL";
-            a[i++] = "--max-time"; a[i++] = head ? HEAD_TIMEOUT : FETCH_TIMEOUT;
-            a[i++] = "-A"; a[i++] = SUB_UA;
-            /* COOKIE-ДВИЖОК В ПАМЯТИ (`-b ""` включает его, ничего не читая с диска).
-             *
-             * Панель бывает за проверкой, которая отвечает 302 НА ТОТ ЖЕ адрес и ставит
-             * cookie: клиент, который её вернёт, получает подписку, остальные ходят по
-             * кругу. Без движка curl шёл по этому кругу до предела редиректов и падал с
-             * кодом 47 — а человек читал «подписка не скачалась» (снято на живой подписке:
-             * с `-b ""` тот же адрес отдаёт 2400 байт с первого раза).
-             *
-             * В памяти, а не файлом: cookie этой проверки живёт минуты и нужна ровно на
-             * время редиректа. Файл на overlay означал бы запись во флеш на каждое
-             * обновление подписки ради значения, которое к следующему разу протухнет.
-             *
-             * Предел редиректов сбит с 50 (умолчание curl) до 10: круг, из которого cookie
-             * не выводит, должен кончаться отказом за секунды, а не за минуту. */
-            a[i++] = "-b"; a[i++] = "";
-            a[i++] = "--max-redirs"; a[i++] = "10";
-            if (hdr_path) { a[i++] = "-D"; a[i++] = hdr_path; }
-            a[i++] = "-o"; a[i++] = body ? body : "/dev/null";
-            if (with_id) {
-                a[i++] = "-H"; a[i++] = h_id;
-                a[i++] = "-H"; a[i++] = h_os;
-                a[i++] = "-H"; a[i++] = h_ver;
-                a[i++] = "-H"; a[i++] = h_model;
+        struct http_req q = {
+            .url = url,
+            .method = head ? "HEAD" : "GET",
+            .headers = with_id ? hdrs : NULL,
+            .dest_path = head ? NULL : body,
+            .total_ms = head ? HEAD_TIMEOUT_MS : FETCH_TIMEOUT_MS,
+        };
+        struct http_resp r;
+        char why[200];
+        int rc = http_get(&q, &r, why, sizeof why);
+        int ok = rc == 0 && r.status >= 200 && r.status < 300;
+        if (ok) {
+            if (hdr_path && r.headers) {
+                FILE *f = fopen(hdr_path, "w");
+                if (f) { fwrite(r.headers, 1, r.headers_n, f); fclose(f); }
             }
-        } else if (!head && have("wget")) {
-            /* busybox wget: заголовки посылать умеет, дампить ответные — нет. HEAD у него
-             * тоже нет, поэтому проба заголовков сюда не приходит вовсе. */
-            a[i++] = "wget";
-            a[i++] = "-q";
-            a[i++] = "-U"; a[i++] = SUB_UA;
-            a[i++] = "-O"; a[i++] = body ? body : "/dev/null";
-            a[i++] = "--timeout=" FETCH_TIMEOUT;
-            if (with_id) {
-                a[i++] = "--header"; a[i++] = h_id;
-                a[i++] = "--header"; a[i++] = h_os;
-                a[i++] = "--header"; a[i++] = h_ver;
-                a[i++] = "--header"; a[i++] = h_model;
-            }
-        } else if (!head && have("uclient-fetch")) {
-            if (with_id) continue;   /* заголовков не умеет — сразу второй проход */
-            a[i++] = "uclient-fetch";
-            a[i++] = "-q";
-            /* `-U` понимают и busybox wget, и uclient-fetch (проверено на роутере). Cookie
-             * не умеет ни тот, ни другой: подписка за cookie-проверкой достанется только
-             * там, где есть curl. */
-            a[i++] = "-U"; a[i++] = SUB_UA;
-            a[i++] = "-T"; a[i++] = FETCH_TIMEOUT;
-            a[i++] = "-O"; a[i++] = body ? body : "/dev/null";
-        } else {
-            return 0;   /* качать нечем */
-        }
-        a[i++] = url;
-        a[i] = NULL;
-        if (run_quiet(a) == 0) {
+            http_resp_free(&r);
             if (body && gunzip_inplace(body) != 0) return 0;
             *hwid_sent = with_id;
             return 1;
         }
+        if (body) unlink(body);
+        http_resp_free(&r);
         if (!with_id) return 0;
     }
 }
@@ -681,7 +579,7 @@ int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) 
     unlink(tmp); unlink(hdrp);
 
     int sent = 0;
-    if (!http_get(url, tmp, hdrp, have_id ? id : NULL, 0, &sent)) {
+    if (!sub_get(url, tmp, hdrp, have_id ? id : NULL, 0, &sent)) {
         unlink(tmp); unlink(hdrp);
         printf("{\"ok\":false,\"error\":\"подписка не скачалась\",\"url\":");
         jsonw_str(stdout, url);
@@ -735,7 +633,7 @@ int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) 
             snprintf(tmp2, sizeof tmp2, "%s.json.tmp", out_path);
             snprintf(hdr2, sizeof hdr2, "%s.json.hdr", out_path);
             int sent2 = 0;
-            if (http_get(jurl, tmp2, hdr2, have_id ? id : NULL, 0, &sent2)) {
+            if (sub_get(jurl, tmp2, hdr2, have_id ? id : NULL, 0, &sent2)) {
                 struct vless_sub_stats st2;
                 size_t u2 = usable_nodes(tmp2, &st2);
                 if (u2 > 0) {
@@ -811,16 +709,16 @@ int cmd_sub_quota(const char *url, const char *info_path) {
     memset(&q, 0, sizeof q);
     int asked = 0;
 
-    /* HEAD там, где есть curl: тело нам не нужно, а подписка на десятки узлов — это десятки
-     * килобайт на каждое открытие обзора, и качать их ради двух чисел незачем. Часть панелей
-     * на HEAD отвечает отказом (405) — тогда обычная загрузка, но в ВЫБРОСНЫЙ файл: сама
-     * подписка не меняется, поэтому и перечитывать клиента незачем. */
-    if (have("curl")) {
+    /* Сначала HEAD: тело нам не нужно, а подписка на десятки узлов — это десятки килобайт на
+     * каждое открытие обзора, и качать их ради двух чисел незачем. Часть панелей на HEAD
+     * отвечает отказом (405) — тогда обычная загрузка, но в ВЫБРОСНЫЙ файл: сама подписка не
+     * меняется, поэтому и перечитывать клиента незачем. */
+    {
         char hdrp[512];
         snprintf(hdrp, sizeof hdrp, "%s.head", info_path);
         unlink(hdrp);
         int sent = 0;
-        if (http_get(url, NULL, hdrp, have_id ? id : NULL, 1, &sent)) {
+        if (sub_get(url, NULL, hdrp, have_id ? id : NULL, 1, &sent)) {
             hdrs_load(hdrp, hdrs, sizeof hdrs);
             unlink(hdrp);
             asked = 1;
@@ -842,7 +740,7 @@ int cmd_sub_quota(const char *url, const char *info_path) {
     snprintf(hdrp, sizeof hdrp, "%s.probe.hdr", info_path);
     unlink(probe); unlink(hdrp);
     int sent = 0;
-    if (http_get(url, probe, hdrp, have_id ? id : NULL, 0, &sent)) {
+    if (sub_get(url, probe, hdrp, have_id ? id : NULL, 0, &sent)) {
         asked = 1;
         hdrs_load(hdrp, hdrs, sizeof hdrs);
         quota_save(info_path, hdrs, 0, &q);

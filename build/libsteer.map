@@ -79,12 +79,17 @@ LIBSTEER_1 {
     group_set_name_mixed;
     group_tolerance_ms;
     group_why_name;
+    gz_close;
+    gz_open;
+    gz_read;
     h2_end_stream;
     h2_next;
     h2_read;
     h2_start_ex;
     h2_strerror;
     h2_write;
+    http_get;
+    http_resp_free;
     iface_obfs;
     ir_base_chain_add;
     ir_chain_add;
@@ -187,9 +192,6 @@ LIBSTEER_1 {
     probe_source;
     proc_cmdline_find;
     prof;
-    puff_stream_done;
-    puff_stream_init;
-    puff_stream_read;
     qc_close;
     qc_datagram_max;
     qc_datagram_send;
@@ -307,7 +309,6 @@ LIBSTEER_1 {
     steer_dev_model;
     steer_dev_os;
     steer_engine_version;
-    steer_env_or;
     steer_hwid;
     steer_keep_dir;
     steer_module_dir;

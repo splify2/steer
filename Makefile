@@ -81,7 +81,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/b3match $(BUILD)/subpq
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/b3match $(BUILD)/subpq
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -146,6 +146,8 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/subpq
 	@$(BUILD)/submatch
 	@$(BUILD)/subfetchmatch
+	@$(BUILD)/httpmatch
+	@$(BUILD)/tarmatch
 	@$(BUILD)/hy2match
 	@$(BUILD)/pxsubmatch
 	@$(BUILD)/pxdialmatch
@@ -608,11 +610,29 @@ $(BUILD)/subpq: tests/subpq.c tests/sub-pq-samples.h src/proto/vless/sub.c src/p
 # Поэтому ни сети, ни криптобиблиотеки, ни docker он не требует и входит в обычный make test —
 # при том что до переноса вся эта работа жила в оболочке объекта rpcd и не проверялась ничем.
 $(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/proto/vless/subfetch.h src/lib/puff.c src/lib/puff.h \
+                  src/lib/gz.c src/lib/gz.h src/proto/tls/httpc.h \
                   src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h \
                   src/proto/vless/sub.c src/proto/vless/sublink.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
                   src/proto/transport/trpath.c src/proto/transport/trpath.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c src/lib/puff.c src/proto/vless/sublink.c src/proto/transport/trpath.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c src/lib/puff.c src/lib/gz.c src/proto/vless/sublink.c src/proto/transport/trpath.c $(PLATFORM_SRC)
+
+# HTTP/1.1-клиент libsteer (src/proto/tls/httpc.c) против настоящего сервера на сокете в самом стенде:
+# Content-Length, chunked, переадресации, cookie, ETag, сроки, обрывы, тела в десятки мегабайт потоком.
+# TLS подменён заглушками (криптобиблиотеки в make test нет); настоящий HTTPS — tests/httpsmatch.sh в
+# make ext-test. Потоки сервера — -lpthread.
+$(BUILD)/httpmatch: tests/httpmatch.c tests/unit.h src/proto/tls/httpc.c src/proto/tls/httpc.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests -o $@ tests/httpmatch.c src/proto/tls/httpc.c -lpthread
+
+# Распаковка ustar+gzip (src/lib/untar.c, gz.c) на настоящих архивах tests/tarvec. SHA-256 файлов в
+# распаковщике — sc_hash_* слоя scrypto; здесь (без криптобиблиотеки) стенд подставляет свои
+# (TAR_STUB_HASH, считают независимым steer_sha256), в make ext-test он собирается с настоящим слоем.
+$(BUILD)/tarmatch: tests/tarmatch.c tests/unit.h src/lib/untar.c src/lib/untar.h src/lib/gz.c src/lib/gz.h \
+                   src/lib/puff.c src/tools/hwid.c src/tools/hwid.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests -DTAR_STUB_HASH -o $@ tests/tarmatch.c src/lib/untar.c src/lib/gz.c src/lib/puff.c \
+		src/tools/hwid.c src/lib/jsonw.c $(PLATFORM_SRC)
 
 # Провод hysteria2 и узлы (src/proto/hysteria2/hy2wire.c, hy2sub.c): целые QUIC, запрос
 # авторизации QPACK и разбор ответа, TCPRequest/Response, UDPMessage, Salamander и BLAKE2b на
@@ -773,11 +793,11 @@ $(BUILD)/yamlmatch: tests/yamlmatch.c tests/unit.h $(YAML_SRC) src/lib/ynode.h s
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steerd $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
-	       $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/b3match $(BUILD)/subpq \
+	       $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/b3match $(BUILD)/subpq \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/yamlmatch $(BUILD)/wolfssl-host \
-	       $(BUILD)/scryptomatch $(BUILD)/vlessmatch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
+	       $(BUILD)/scryptomatch $(BUILD)/sigmatch $(BUILD)/vlessmatch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
 	       $(BUILD)/devupmatch $(BUILD)/ndk \
 	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

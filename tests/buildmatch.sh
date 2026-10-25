@@ -47,11 +47,11 @@ words() { tr ' ' '\n' | grep -v '^$'; }
 # Виды выхода расширенной части (KINDS_EXT_SRC) лежат в src/kinds рядом с базовыми, но в профиль
 # base не входят — их отсутствие и есть отказ «требует пакет steer-extended» (src/kinds/kind.c).
 # Поэтому с каталогами ядра сверяется base вместе с ними, а их место — ниже, отдельной проверкой.
-# Тот же расклад у слоя примитивов (CRYPTO_SRC, src/lib/scrypto.c): лежит в каталоге ядра, в base не
+# Тот же расклад у слоя примитивов (CRYPTO_SRC, src/lib/scrypto.c) и у PLUGIN_PRIM_SRC (sigverify.c, untar.c): лежит в каталоге ядра, в base не
 # входит — базовой сборке криптография не нужна, и wolfSSL в ней нет.
 # Вид hysteria2 (KINDS_HY2_SRC) — того же рода, но только для раскладки с libsteer.so: в статические
 # профили он не входит (телефон отложен), запись вида есть в libsteer, а модуль — steer-hysteria2.
-m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_var KINDS_HY2_SRC; echo; profile_var KINDS_PROXY_SRC; echo; profile_var CRYPTO_SRC; } | words | names)"
+m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_var KINDS_HY2_SRC; echo; profile_var KINDS_PROXY_SRC; echo; profile_var CRYPTO_SRC; echo; profile_var PLUGIN_PRIM_SRC; } | words | names)"
 # Профили разделяемой раскладки (шаг 4 выпуска 1.10: libsteer, steerd, четыре модуля) — тоже
 # профили: точки входа модулей (src/modules/main_*.c) существуют только в них.
 m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; echo

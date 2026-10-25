@@ -55,6 +55,7 @@ filegroup {
         "wolfcrypt/src/cpuid.c",
         "wolfcrypt/src/curve25519.c",
         "wolfcrypt/src/ecc.c",
+        "wolfcrypt/src/ed25519.c",
         "wolfcrypt/src/error.c",
         "wolfcrypt/src/fe_operations.c",
         "wolfcrypt/src/ge_operations.c",
