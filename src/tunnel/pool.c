@@ -131,7 +131,7 @@ int geo_trace(const char *dev, char cc[3], char *why, size_t wn) __attribute__((
 #define PL_GEO_RETRY_S 20
 static int g_geo_retry_s = PL_GEO_RETRY_S;
 
-/* Шапка сессии пула; за ней, с отступом PL_HDR, — сессия протокола. */
+/* Шапка сессии пула; за ней, с отступом PL_HDR, — сессия протокола. 128: ключ потока несёт адреса IPv6. */
 struct pl_sess {
     const void *node;           /* узел соединения; NULL — запасная, ещё ничья */
     unsigned gen;               /* поколение слота на момент выбора */
@@ -141,7 +141,7 @@ struct pl_sess {
     uint8_t udp, opened;        /* flow_open был, k — его ключ */
     struct flow_key k;
 };
-#define PL_HDR 64
+#define PL_HDR 128
 _Static_assert(sizeof(struct pl_sess) <= PL_HDR, "шапка сессии пула больше отступа");
 #define INNER(s) ((void *)((unsigned char *)(s) + PL_HDR))
 #define CINNER(s) ((const void *)((const unsigned char *)(s) + PL_HDR))
@@ -241,7 +241,16 @@ static int pl_pick(const struct flow_key *k) {
     }
     if (!nl) return any;
     if (g_pl.cf.by == BY_CONNECTION || !k) return live[pl_rand() % (unsigned)nl];
-    uint32_t h = g_pl.cf.by == BY_SITE_CLIENT ? pl_mix(k->src * 0x9e3779b1u) ^ k->dst : k->dst;
+    /* IPv6: слова адреса сворачиваются исключением в одно число, дальше хэш тот же. */
+    uint32_t sa = k->src, da = k->dst;
+    if (k->v6) {
+        uint32_t w[8];
+        memcpy(w, k->src6, 16);
+        memcpy(w + 4, k->dst6, 16);
+        sa = w[0] ^ w[1] ^ w[2] ^ w[3];
+        da = w[4] ^ w[5] ^ w[6] ^ w[7];
+    }
+    uint32_t h = g_pl.cf.by == BY_SITE_CLIENT ? pl_mix(sa * 0x9e3779b1u) ^ da : da;
     int at = (int)(pl_mix(h) % (uint32_t)g_pl.n);
     /* Слот сайта мёртв или пуст — следующий живой по кругу: сайты живых слотов остаются на месте. */
     for (int d = 0; d < g_pl.n; d++) {

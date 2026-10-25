@@ -2181,6 +2181,16 @@ static int has_tcp_redir(const struct spec *sp) {
     return 0;
 }
 
+/* Несёт ли хоть один выход с перенаправлением TCP IPv6 (KC_IPV6 стоит у видов, а `ipv6: off` его снимает):
+ * только тогда метка в карте может прийти от пакета IPv6, и правилу для IPv6 есть что ловить. */
+static int has_tcp_redir6(const struct spec *sp) {
+    if (g_nftc & NFTC_LEGACY) return 0;
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (sp->out[i].mark && out_has_cap(&sp->out[i], KC_TCP_REDIR) &&
+            out_has_cap(&sp->out[i], KC_IPV6)) return 1;
+    return 0;
+}
+
 static void build_tcp_redir(struct nft_table *t, const struct spec *sp) {
     if (!has_tcp_redir(sp)) return;
     ir_gap(ir_map_add(t, TCP_REDIR_MAP, "mark", "inet_service"));
@@ -2192,7 +2202,6 @@ static void build_tcp_redir(struct nft_table *t, const struct spec *sp) {
         struct nft_chain *c = ir_base_chain_add(t, names[k], "nat", hooks[k], "dstnat", -1);
         if (!k) ir_gap(c);
         struct nft_rule *r = ir_rule(c);
-        /* Только IPv4: стек модуля и ключ его потока — IPv4 (tun.h, flow_key). */
         ir_x(r, "ip protocol tcp");
         /* Метка — в карте: счётчик правила считает перенаправленные соединения, а не весь TCP. */
         ir_setref(r, m, TCP_REDIR_MAP);
@@ -2204,6 +2213,20 @@ static void build_tcp_redir(struct nft_table *t, const struct spec *sp) {
         ir_counter(r, 0, 0);
         ir_x(r, "redirect to :meta mark and 0x%08x map @%s", STEER_MARK_MASK, TCP_REDIR_MAP);
         ir_comment(r, "steer-tcp-redir");
+        /* IPv6: то же правилом своего семейства (в таблице inet `ip protocol` смотрит только IPv4), тот же порт
+         * и та же карта — слушатель модуля двойного стека (stack.c, klisten_open), исходное назначение у него
+         * IP6T_SO_ORIGINAL_DST. Комментарий тот же: считает перенаправленное, а не семейство. */
+        if (has_tcp_redir6(sp)) {
+            r = ir_rule(c);
+            ir_family(r, 6);
+            ir_x(r, "meta l4proto tcp");
+            ir_setref(r, m, TCP_REDIR_MAP);
+            ir_x(r, "fib daddr type != local");
+            if (k == 1 && plat()->local_dns) ir_x(r, "tcp dport != 53");
+            ir_counter(r, 0, 0);
+            ir_x(r, "redirect to :meta mark and 0x%08x map @%s", STEER_MARK_MASK, TCP_REDIR_MAP);
+            ir_comment(r, "steer-tcp-redir");
+        }
     }
 }
 

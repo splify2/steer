@@ -376,7 +376,10 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
              * интерфейсу это читалось как поломка. Кем — отдельным полем `nat6_by` («steer» —
              * своя цепочка, она ставится всегда, когда ключ есть; иначе «fw4»), только при
              * `nat6: true`. */
-            if (out_route6(&sp->out[i])) {
+            /* У выхода, что завершает соединения сам (vless, hysteria2, прокси: KC_SELF_NAT), подмены нет ни по
+             * IPv4, ни по IPv6 — адреса клиентов наружу не уходят, и вопрос не стоит. */
+            if (out_route6(&sp->out[i]) &&
+                !out_self_natting(out_for_device(sp, &sp->out[i], sp->out[i].device))) {
                 int ours = out_ipv6_mode_dev(sp, &sp->out[i], sp->out[i].device) == OUT_V6_NAT;
                 fprintf(out, ",\"nat6\":%s", ours || c.masq6 ? "true" : "false");
                 if (ours || c.masq6) fprintf(out, ",\"nat6_by\":\"%s\"", ours ? "steer" : "fw4");

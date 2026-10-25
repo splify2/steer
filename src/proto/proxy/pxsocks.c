@@ -25,7 +25,7 @@ struct socks_sess {
     uint8_t udp;
     int cfd;                     /* TCP: поток; UDP: управляющее соединение */
     int udpfd;                   /* UDP: сокет к ретранслятору; TCP: -1 */
-    uint32_t dst; uint16_t dport;
+    uint8_t dst[16]; uint8_t v6; uint16_t dport;
     /* Живая запись TCP (dialer_ops.live, I-534): что сокет узла не принял, ждёт в очереди и дослается по
      * событию записи; до этого send блокирующий. У UDP не используется. */
     uint8_t live;
@@ -51,7 +51,8 @@ static int sk_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
     const struct px_node *n = ctx;
     struct socks_sess *s = sess;
     s->udp = (uint8_t)udp;
-    s->dst = k->dst;
+    s->v6 = k->v6;
+    memcpy(s->dst, flow_dst_bytes(k), flow_alen(k));
     s->dport = k->dport;
     if (udp && n->socks_ver != 5) {
         static __thread time_t said;
@@ -133,13 +134,13 @@ static int socks5_skip_reply_addr(int fd, char *bnd, size_t bnd_n, uint16_t *bnd
     return 0;
 }
 
-static int socks5_request(int fd, uint8_t cmd, uint32_t dst, uint16_t dport,
+static int socks5_request(int fd, uint8_t cmd, int v6, const unsigned char *dst, uint16_t dport,
                           char *bnd, size_t bnd_n, uint16_t *bnd_port) {
-    unsigned char req[10], rep[3];
+    unsigned char req[3 + PX_ADDR_MAX], rep[3];
     req[0] = 5; req[1] = cmd; req[2] = 0;
-    req[3] = 1; memcpy(req + 4, &dst, 4);
-    req[8] = (unsigned char)(dport >> 8); req[9] = (unsigned char)dport;
-    if (wr_full(fd, req, 10)) return TR_EIO;
+    /* ATYP, адрес и порт — как в UDP-пакете SOCKS5 (RFC 1928, 4 и 7). */
+    size_t rl = 3 + px_socks_addr(req + 3, v6, dst, dport);
+    if (wr_full(fd, req, rl)) return TR_EIO;
     if (rd_full(fd, rep, 3)) return TR_EIO;
     if (rep[0] != 5) return PX_EPROTO;
     if (rep[1] != 0) return PX_EADDR;
@@ -147,12 +148,13 @@ static int socks5_request(int fd, uint8_t cmd, uint32_t dst, uint16_t dport,
     return 0;
 }
 
-static int socks4_request(int fd, uint32_t dst, uint16_t dport, const char *user) {
+static int socks4_request(int fd, int v6, const unsigned char *dst, uint16_t dport, const char *user) {
     unsigned char req[9 + PX_USER_MAX], rep[8];
     size_t o = 0;
+    if (v6) return PX_EADDR;             /* в SOCKS4 адресов IPv6 нет */
     req[o++] = 4; req[o++] = 1;
     req[o++] = (unsigned char)(dport >> 8); req[o++] = (unsigned char)dport;
-    memcpy(req + o, &dst, 4); o += 4;
+    memcpy(req + o, dst, 4); o += 4;
     size_t ul = user[0] ? strlen(user) : 0;
     if (ul) { memcpy(req + o, user, ul); o += ul; }
     req[o++] = 0;
@@ -172,12 +174,12 @@ static int sk_connect(const void *ctx, void *sess, int timeout_s) {
         rc = socks5_hello(fd, n);
         if (rc == 0) {
             if (!s->udp) {
-                rc = socks5_request(fd, 1, s->dst, s->dport, NULL, 0, NULL);
+                rc = socks5_request(fd, 1, s->v6, s->dst, s->dport, NULL, 0, NULL);
             } else {
                 char bnd[INET6_ADDRSTRLEN] = "";
                 uint16_t bport = 0;
                 /* UDP ASSOCIATE: адрес/порт отправителя неизвестны — 0.0.0.0:0. */
-                rc = socks5_request(fd, 3, 0, 0, bnd, sizeof bnd, &bport);
+                rc = socks5_request(fd, 3, 0, (const unsigned char[4]){ 0 }, 0, bnd, sizeof bnd, &bport);
                 if (rc == 0) {
                     /* Ретранслятор: его порт, адрес — названный (IPv4 или IPv6), если не
                      * неуказанный 0.0.0.0/::, иначе адрес узла. */
@@ -188,7 +190,7 @@ static int sk_connect(const void *ctx, void *sess, int timeout_s) {
             }
         }
     } else {
-        rc = s->udp ? PX_EPROTO : socks4_request(fd, s->dst, s->dport, n->user);
+        rc = s->udp ? PX_EPROTO : socks4_request(fd, s->v6, s->dst, s->dport, n->user);
     }
     if (rc != 0) { close(fd); return rc; }
     /* Сокет остаётся блокирующим со сроком SO_SNDTIMEO (tr_dial), как связь транспорта у
@@ -248,11 +250,11 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         p += 2; left -= 2;
         if (dl > left) return SEND_FATAL;
         /* В буфере потока, а не на стеке: датаграмма до SK_DGRAM_MAX (I-528). */
-        unsigned char *pkt = px_scratch(1, 3 + 7 + dl);
+        unsigned char *pkt = px_scratch(1, 3 + PX_ADDR_MAX + dl);
         if (!pkt) return SEND_FATAL;
         size_t o = 0;
         pkt[o++] = 0; pkt[o++] = 0; pkt[o++] = 0;    /* RSV RSV FRAG */
-        o += px_socks_addr(pkt + o, s->dst, s->dport);
+        o += px_socks_addr(pkt + o, s->v6, s->dst, s->dport);
         memcpy(pkt + o, p, dl); o += dl;
         ssize_t w = send(s->udpfd, pkt, o, MSG_DONTWAIT | MSG_NOSIGNAL);
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {

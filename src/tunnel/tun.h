@@ -10,7 +10,13 @@
 #define TUN_ESETUP (-41)
 
 struct flow_key {
-    uint32_t src, dst;      /* в сетевом порядке, как в пакете: так и уходят в tcp_build */
+    /* Семейство адресов: 0 — IPv4 (src и dst — четыре байта), 1 — IPv6 (src6 и dst6 — шестнадцать).
+     * Адреса лежат в union: код IPv4 читает src и dst, как и прежде, а у IPv6 те же места занимают
+     * шестнадцать байт. Сравнивать, хэшировать и копировать ключ — через flow_same_addr и flow_hash
+     * (stack.c): голое сравнение src у IPv6 посмотрело бы только на первые четыре байта. */
+    uint8_t v6;
+    union { uint32_t src; uint8_t src6[16]; };    /* в сетевом порядке, как в пакете: так и уходят в tcp_build */
+    union { uint32_t dst; uint8_t dst6[16]; };
     /* Порты в ХОСТОВОМ порядке: ip_parse собирает их из байт вручную, то есть
      * преобразование уже сделано. Применять к ним ntohs — значит перевернуть дважды:
      * порт 80 превращался в 20480, соединение уходило не туда, и выглядело это как
@@ -37,6 +43,16 @@ struct flow_key {
     uint8_t frag;
 };
 
+/* Адреса ключа как байты пакета: указатель на источник и назначение и их длина (4 или 16). Для кода, который
+ * кладёт адрес в заголовок протокола узла (SOCKS, VLESS, hysteria2) и не должен знать про union. */
+static inline const unsigned char *flow_src_bytes(const struct flow_key *k) {
+    return k->v6 ? k->src6 : (const unsigned char *)&k->src;
+}
+static inline const unsigned char *flow_dst_bytes(const struct flow_key *k) {
+    return k->v6 ? k->dst6 : (const unsigned char *)&k->dst;
+}
+static inline size_t flow_alen(const struct flow_key *k) { return k->v6 ? 16 : 4; }
+
 /* Флаги TCP, которые нас интересуют. */
 #define TCP_FIN 0x01
 #define TCP_SYN 0x02
@@ -61,6 +77,8 @@ struct flow_key {
 /* Заголовок IP+TCP без опций. Данные к нему не приклеиваются: они уходят отдельным
  * элементом writev, и лишнего копирования потока не остаётся вовсе. */
 #define TUN_HDR_LEN 40
+/* То же для IPv6: заголовок IP 40 байт и TCP без опций. */
+#define TUN6_HDR_LEN 60
 
 /* MTU устройства. Не спрашивается у ядра, а задаётся здесь: устройство поднимаем мы сами и
  * MTU ему не меняем, а TUN_MSS выше посчитан от этого же числа (1500 - 20 - 20). Два
@@ -71,6 +89,8 @@ struct flow_key {
 /* Сколько данных IP-уровня влезает в один пакет: MTU минус заголовок IPv4. Датаграмма
  * больше этого нарезается на фрагменты (см. udp_write_to_client). */
 #define UDP_MTU_PAYLOAD (TUN_MTU - 20)
+/* То же у IPv6: заголовок 40 байт; у фрагмента ещё восемь на заголовок фрагментации (udp_write_to_client6). */
+#define UDP6_MTU_PAYLOAD (TUN_MTU - 40)
 
 /* Самая большая датаграмма UDP, какую вообще можно доставить по IPv4: 65535 минус заголовки IP
  * (20) и UDP (8). Предел протокола, а не наш: сборка фрагментов, запись клиенту и буфер
@@ -131,7 +151,8 @@ struct tun_dev {
      * не проверить.
      *
      * Просим ТОЛЬКО TUN_F_CSUM и TUN_F_TSO4. TSO6 не просим намеренно: разбор склеенного здесь
-     * IPv4-только, как и всё остальное в этом движке, и принять кадр, который мы не умеем
+     * только IPv4 (TCP в устройство не несётся ни по одному из семейств — его завершает ядро, TCP IPv6
+     * получает лишь сброс, и склеенный кадр IPv6 нам не нужен), и принять кадр, который мы не умеем
      * разложить, значило бы отбросить его со счётчиком вместо того, чтобы получить сорок пять
      * обычных пакетов. */
     int rx_gso;
@@ -164,7 +185,17 @@ struct tun_dev {
  *
  * Ядро без IFF_MULTI_QUEUE не ошибка: тогда открывается одна очередь, ровно как раньше. */
 int tun_open(struct tun_dev *d, int max_queues, const char *name);
+/* Разобрать пакет IPv4 или IPv6 (по версии в первом байте). У IPv6 принимается заголовок, за которым
+ * сразу идёт TCP, UDP или заголовок фрагментации (дальше — TCP или UDP); прочие расширения (hop-by-hop,
+ * маршрутизация, параметры получателя) у пользовательского трафика не встречаются, и такой пакет не
+ * разбирается (-1). Продолжение фрагмента не разбирается ни у IPv4, ни у IPv6. */
 int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *payload_off);
+
+/* Смещение заголовка фрагментации у пакета IPv6 (сразу за фиксированным заголовком): 40, если он есть
+ * (следующий заголовок 44) и пакет достаточно длинный; иначе 0. */
+static inline size_t ip6_frag_off(const unsigned char *p, size_t n) {
+    return n >= 48 && (p[0] >> 4) == 6 && p[6] == 44 ? 40 : 0;
+}
 
 /* Прочитать один пакет, сняв заголовок разгрузки, если устройство его добавляет. */
 ssize_t tun_read_packet(struct tun_dev *d, unsigned char *buf, size_t cap);
@@ -260,6 +291,11 @@ void tun_gro_flush(const struct tun_dev *d, struct tun_gro *g);
 int udp_write_to_client(const struct tun_dev *d, uint32_t src, uint32_t dst,
                         uint16_t sport, uint16_t dport,
                         const unsigned char *data, size_t n, uint16_t ip_id);
+/* То же для IPv6: адреса — по шестнадцать байт в сетевом порядке, датаграмма больше MTU нарезается
+ * заголовком фрагментации (RFC 8200), frag_id — его 32-битный номер. */
+int udp_write_to_client6(const struct tun_dev *d, const uint8_t src[16], const uint8_t dst[16],
+                         uint16_t sport, uint16_t dport,
+                         const unsigned char *data, size_t n, uint32_t frag_id);
 
 /* ICMP «порт недостижим» в ответ на пакет, который туннель нести не умеет: теперь это не
  * UDP (он поддержан), а всё остальное — ICMP, ESP и прочее. Нужен, чтобы клиент получил
@@ -275,12 +311,18 @@ size_t tcp_build(unsigned char *out, size_t cap,
                  uint32_t seq, uint32_t ack, unsigned char flags,
                  const unsigned char *data, size_t data_n, uint16_t window,
                  unsigned mss, int wscale);
+/* То же для IPv6 (заголовок 40 байт). */
+size_t tcp_build6(unsigned char *out, size_t cap,
+                  const uint8_t src[16], const uint8_t dst[16], uint16_t sport, uint16_t dport,
+                  uint32_t seq, uint32_t ack, unsigned char flags,
+                  const unsigned char *data, size_t data_n, uint16_t window,
+                  unsigned mss, int wscale);
 /* ---- раздача пакетов по рабочим потокам (R-146) ----------------------------------------------
  *
  * Хэш пакета клиента -> номер рабочего потока. Ключ: источник, назначение, протокол и порты (TCP и UDP
  * без фрагментации). Фрагмент — по адресам и протоколу: в продолжении портов нет, а у первого куска
  * они есть и дали бы ДРУГОЙ рабочий, чем у остальных, — хэш обязан быть одним на всю датаграмму. Не
- * IPv4 — рабочий 0 (разберёт и откажет любой).
+ * IPv4 и не IPv6 — рабочий 0 (разберёт и откажет любой). IPv6: адреса сворачиваются исключением по четырём словам.
  *
  * ЧИТАЕТСЯ В СЕТЕВОМ ПОРЯДКЕ, явно по байтам, а не memcpy в uint32: ровно так же поля видит программа
  * раздачи в ядре (tun_steer_attach, загрузки LD_ABS отдают число в порядке хоста из сетевого), и хэш
@@ -299,7 +341,20 @@ static inline uint32_t tun_be32(const unsigned char *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 static inline unsigned tun_flow_owner(const unsigned char *p, size_t n, unsigned nw) {
-    if (nw <= 1 || n < 20 || (p[0] >> 4) != 4) return 0;
+    if (nw <= 1 || n < 20) return 0;
+    if ((p[0] >> 4) == 6) {
+        /* IPv6: адреса сворачиваются исключением по четырём словам, дальше та же формула, что у IPv4
+         * (протокол — поле «следующий заголовок»). Порты — только когда за заголовком сразу TCP или UDP:
+         * у фрагмента следующий заголовок 44, и все куски датаграммы (порты есть лишь у первого) дают
+         * один хэш, как у IPv4. */
+        if (n < 40) return 0;
+        uint32_t sf = tun_be32(p + 8) ^ tun_be32(p + 12) ^ tun_be32(p + 16) ^ tun_be32(p + 20);
+        uint32_t df = tun_be32(p + 24) ^ tun_be32(p + 28) ^ tun_be32(p + 32) ^ tun_be32(p + 36);
+        uint32_t h6 = tun_mix32(sf ^ tun_mix32(df + p[6]));
+        if ((p[6] == 6 || p[6] == 17) && n >= 44) h6 = tun_mix32(h6 ^ tun_be32(p + 40));
+        return (unsigned)(((uint64_t)h6 * nw) >> 32);
+    }
+    if ((p[0] >> 4) != 4) return 0;
     size_t ihl = (size_t)(p[0] & 0x0F) * 4;
     uint32_t h = tun_mix32(tun_be32(p + 12) ^ tun_mix32(tun_be32(p + 16) + p[9]));
     int frag = (((p[6] << 8) | p[7]) & 0x3FFF) != 0;

@@ -133,9 +133,11 @@ static int lines_with(const char *log, const char *level) {
 int main(void) {
     printf("== подъём устройства туннеля: порядок команд не тронут ==\n");
     const char *log = bring_up_with("");
-    check("команд ровно три", 3, g_cmd_n);
+    check("команд ровно четыре", 4, g_cmd_n);
     check("адрес ставится из таблицы выхода (198.51.100.<1+N%200>/32)", 1,
           cmd_seen("ip addr replace 198.51.100." "101" "/32 dev " DEV));
+    check("адрес IPv6 (ULA) — тоже из таблицы выхода", 1,
+          cmd_seen("ip -6 addr replace fd73:7465:6572::65/128 dev " DEV));
     check("устройство поднимается", 1, cmd_seen("ip link set dev " DEV " up"));
     check("очередь передачи запрашивается в 4096", 1,
           cmd_seen("ip link set dev " DEV " txqueuelen 4096"));
@@ -151,6 +153,12 @@ int main(void) {
           strstr(log, "198.51.100.101") != NULL);
     check("остальные две команды всё равно выполнены", 1,
           cmd_seen("link set dev " DEV " up") && cmd_seen("txqueuelen"));
+
+    log = bring_up_with("-6 addr replace");
+    check("отказ адреса IPv6 — не предупреждение (IPv6 может быть выключен)", 0, lines_with(log, "steer[warn]"));
+    check("но назван, с устройством и адресом", 1,
+          strstr(log, DEV) != NULL && strstr(log, "fd73:7465:6572::65") != NULL);
+    check("остальные команды выполнены", 1, cmd_seen("link set dev " DEV " up") && cmd_seen("txqueuelen"));
 
     log = bring_up_with(" up");
     check("отказ подъёма — предупреждение", 1, lines_with(log, "steer[warn]") > 0);

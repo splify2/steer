@@ -36,6 +36,7 @@
 #include <sys/uio.h>
 #include <sys/stat.h>
 #include <linux/netfilter_ipv4.h>
+#include <linux/netfilter_ipv6/ip6_tables.h>
 #include <linux/netlink.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nf_tables.h>
@@ -267,9 +268,10 @@ struct conn {
 /* Горячая запись обязана оставаться маленькой — в этом весь смысл разделения. Проверка
  * сборкой, а не обещанием в комментарии: буфер, добавленный сюда «на время отладки», иначе
  * вернёт таблицу к 5,8 МБ, и заметить это можно будет только по скорости на роутере. */
-/* 160 байт (R-152, шаг 5): поля собственного приёмника TCP (номера, окно, кольцо повтора, отложенные
- * сегменты) ушли вместе с ним; было 192. */
-typedef char conn_hot_size_check[sizeof(struct conn) <= 160 ? 1 : -1];
+/* 192 байта: было 160 (R-152, шаг 5 — поля собственного приёмника TCP ушли вместе с ним) и 192 до него;
+ * ключ потока (flow_key) несёт теперь и адреса IPv6 (по 16 байт), это на 24 байта больше. Ключ лежит ЗА
+ * первой строкой кэша — той, что читает проход цикла, — и горячий путь не удлиняет. */
+typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
 
 /* Биты поля armed. ARM_OUT — только пока узел не принял данные клиента сокета (R-152). */
 #define ARM_IN  1
@@ -297,20 +299,39 @@ static int g_lfd0 = -1;
 /* Слушатель на g_kport. SO_REUSEPORT — свой у каждого рабочего, ядро само раскладывает соединения
  * по ним, и каждое целиком у того, кто его принял. -1 — не встал (errno). */
 static int klisten_open(void) {
-    int lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (lfd < 0) return -1;
-    int one = 1;
-    struct sockaddr_in la = { .sin_family = AF_INET, .sin_port = htons((uint16_t)g_kport),
-                              .sin_addr.s_addr = htonl(INADDR_ANY) };
-    if (setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
-        setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0 ||
-        bind(lfd, (struct sockaddr *)&la, sizeof(la)) != 0 || listen(lfd, 4096) != 0) {
-        int er = errno;
-        close(lfd);
-        errno = er;
-        return -1;
+    /* Двойной стек: сокет IPv6 с IPV6_V6ONLY=0 принимает и IPv6, и IPv4 (клиент IPv4 приходит
+     * адресом вида ::ffff:a.b.c.d, kaccept_fd его сворачивает). Правило nat для IPv6 перенаправляет TCP
+     * IPv6 на этот же порт. Ядро без IPv6 (сокет не создаётся или не привязывается) — слушатель только
+     * IPv4, как прежде: выход IPv6 тогда не несёт, и правила IPv6 к нему сторож не ведёт. */
+    for (int v6 = 1; v6 >= 0; v6--) {
+        int lfd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (lfd < 0) { if (v6) continue; return -1; }
+        int one = 1, zero = 0;
+        struct sockaddr_in6 l6;
+        struct sockaddr_in l4;
+        memset(&l6, 0, sizeof(l6));
+        memset(&l4, 0, sizeof(l4));
+        l6.sin6_family = AF_INET6;
+        l6.sin6_port = htons((uint16_t)g_kport);
+        l6.sin6_addr = in6addr_any;
+        l4.sin_family = AF_INET;
+        l4.sin_port = htons((uint16_t)g_kport);
+        l4.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
+            setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0 ||
+            (v6 && setsockopt(lfd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero)) != 0) ||
+            (v6 ? bind(lfd, (struct sockaddr *)&l6, sizeof(l6)) : bind(lfd, (struct sockaddr *)&l4, sizeof(l4))) != 0 ||
+            listen(lfd, 4096) != 0) {
+            int er = errno;
+            close(lfd);
+            errno = er;
+            /* Порт занят — его не обойти и IPv4; нет самого IPv6 — пробуем IPv4. */
+            if (v6 && (er == EAFNOSUPPORT || er == EADDRNOTAVAIL || er == ENOPROTOOPT)) continue;
+            return -1;
+        }
+        return lfd;
     }
-    return lfd;
+    return -1;
 }
 
 /* Сколько ждём подтверждений после закрытия сервером. Секунды, а не «сколько понадобится»:
@@ -719,7 +740,19 @@ static inline unsigned flow_hash(const struct flow_key *k) {
      * правильность: пятёрка «адреса, порты» без протокола у TCP-соединения и у потока UDP
      * может совпасть буква в букву (клиент вправе взять один и тот же исходный порт для
      * того и другого), и тогда датаграмма попала бы в TCP-соединение или наоборот. */
-    uint32_t h = k->src ^ (k->dst * 0x9E3779B1u) ^
+    uint32_t a, b;
+    if (k->v6) {
+        /* IPv6: слова адреса сворачиваются исключением (порядок байт хэшу безразличен — он внутри процесса). */
+        uint32_t s[4], d[4];
+        memcpy(s, k->src6, 16);
+        memcpy(d, k->dst6, 16);
+        a = s[0] ^ s[1] ^ s[2] ^ s[3];
+        b = d[0] ^ d[1] ^ d[2] ^ d[3];
+    } else {
+        a = k->src;
+        b = k->dst;
+    }
+    uint32_t h = a ^ (b * 0x9E3779B1u) ^
                  ((uint32_t)k->sport << 16) ^ (uint32_t)k->dport ^ ((uint32_t)k->proto << 8);
     h ^= h >> 15;
     h *= 0x2545F491u;
@@ -1404,10 +1437,17 @@ static inline int conn_slot_avail(void) {
     return g_free_n || g_nslots < g_slots_cap;
 }
 
+/* Один ли адрес у двух ключей: семейство и сами адреса (четыре байта у IPv4, шестнадцать у IPv6). */
+static inline int flow_same_addr(const struct flow_key *a, const struct flow_key *b) {
+    if (a->v6 != b->v6) return 0;
+    if (a->v6) return !memcmp(a->src6, b->src6, 16) && !memcmp(a->dst6, b->dst6, 16);
+    return a->src == b->src && a->dst == b->dst;
+}
+
 static struct conn *conn_find(const struct flow_key *k) {
     for (int32_t i = g_bucket[flow_hash(k) & g_bucket_mask]; i >= 0; i = g_conns[i].hnext) {
         struct conn *c = &g_conns[i];
-        if (c->key.src == k->src && c->key.dst == k->dst &&
+        if (flow_same_addr(&c->key, k) &&
             c->key.sport == k->sport && c->key.dport == k->dport &&
             c->key.proto == k->proto)
             return c;
@@ -1733,6 +1773,9 @@ static int early_reserve(struct conn *c, size_t need) {
  * MTU — редкость), так что борьбы за строку кэша нет. */
 static uint16_t g_ip_id;
 static uint16_t ip_id_next(void) { return __atomic_add_fetch(&g_ip_id, 1, __ATOMIC_RELAXED); }
+/* Номер заголовка фрагментации IPv6 — 32 бита, свой счётчик (RFC 8200: один на пару адресов за срок сборки). */
+static uint32_t g_ip6_id;
+static uint32_t ip6_id_next(void) { return __atomic_add_fetch(&g_ip6_id, 1, __ATOMIC_RELAXED); }
 
 /* Сколько датаграмм клиента отброшено за размер (больше dgram_max дайлера); читает журнал udp_packet. */
 static unsigned long long g_udp_toobig;
@@ -1781,9 +1824,11 @@ struct emit_ctx {
 static int emit_dgram(void *arg, const unsigned char *p, size_t n) {
     struct emit_ctx *e = arg;
     struct conn *c = e->c;
-    if (udp_write_to_client(e->tun, c->key.dst, c->key.src, c->key.dport, c->key.sport,
-                            p, n, ip_id_next()) != 0)
-        return -1;
+    int wr = c->key.v6 ? udp_write_to_client6(e->tun, c->key.dst6, c->key.src6, c->key.dport, c->key.sport,
+                                              p, n, ip6_id_next())
+                       : udp_write_to_client(e->tun, c->key.dst, c->key.src, c->key.dport, c->key.sport,
+                                             p, n, ip_id_next());
+    if (wr != 0) return -1;
     TR("клиенту датаграмма %zu байт\n", n);
     /* Метка времени двигается на КАЖДОЙ датаграмме, а не только на пакетах клиента:
      * поток, по которому идёт только приём (а таких у UDP полно — те же обновления от
@@ -1917,9 +1962,8 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun, size_t *rx
  * первой. Не по порядку куски приходят и при нескольких очередях TUN.
  *
  * Ключ сборки — (источник, получатель, номер) для UDP: RFC 791 добавляет протокол, но
- * сюда попадает только UDP. IPv6 стек не обслуживает вовсе (ip_parse), поэтому заголовка
- * фрагментации IPv6 здесь нет и его правил (RFC 8200, 5722) применять не к чему; когда
- * IPv6 появится, он добавится ключом сюда же.
+ * сюда попадает только UDP. У IPv6 — тот же ключ с 32-битным номером заголовка
+ * фрагментации (RFC 8200, 4.5); правило «наложение — отбросить всё» то же (RFC 5722).
  *
  * Пределы и их причины:
  *  - DEFRAG_SLOTS = 16 одновременных сборок на поток обработки. Каждая держит до
@@ -1953,8 +1997,11 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun, size_t *rx
 #define DEFRAG_BLOCKS ((DEFRAG_MAXLEN + 7) / 8)
 
 struct frag_slot {
-    uint32_t src, dst;
-    uint16_t id;
+    /* Ключ сборки: семейство, адреса (IPv4 — первые четыре байта, остальные нули) и номер (IPv4 — 16 бит,
+     * заголовок фрагментации IPv6 — 32). */
+    uint8_t v6;
+    uint8_t src[16], dst[16];
+    uint32_t id;
     uint64_t at;                                     /* когда пришёл первый кусок */
     uint32_t total;                                  /* длина целиком; 0 — последний ещё не пришёл */
     uint32_t got;                                    /* сколько байт уже лежит */
@@ -1986,21 +2033,41 @@ static void frag_free(int i) { free(g_frag[i]); g_frag[i] = NULL; }
 /* Собрать датаграмму из фрагментов. Возвращает длину готового пакета в out (то есть
  * собранная датаграмма выглядит как обычный нефрагментированный пакет и разбирается тем же
  * ip_parse), 0 — ждём следующий фрагмент, и 0 же при отказе: для UDP это одно и то же —
- * датаграммы не будет. */
+ * датаграммы не будет. IPv6 — заголовок фрагментации сразу за фиксированным (ip_parse другого не
+ * принимает): расширения до него в собранный пакет не переходят, они относятся к «нефрагментируемой»
+ * части и стеку не нужны. */
 static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
                          size_t out_cap) {
-    size_t ihl = (size_t)(pkt[0] & 0x0F) * 4;
-    if (ihl < 20 || n < ihl) return 0;
-    size_t total = (size_t)((pkt[2] << 8) | pkt[3]);
-    if (total > n || total < ihl) return 0;           /* заявленная длина больше пришедшей */
-    size_t len = total - ihl;
-    unsigned frag = (unsigned)((pkt[6] << 8) | pkt[7]);
-    size_t off = (size_t)(frag & 0x1FFF) * 8;
-    int more = (frag & 0x2000) != 0;
-    uint16_t id = (uint16_t)((pkt[4] << 8) | pkt[5]);
-    uint32_t src, dst;
-    memcpy(&src, pkt + 12, 4);
-    memcpy(&dst, pkt + 16, 4);
+    int v6 = (pkt[0] >> 4) == 6;
+    size_t ihl, len, off;
+    int more;
+    uint32_t id;
+    uint8_t src[16] = { 0 }, dst[16] = { 0 };
+    if (v6) {
+        if (n < 48 || pkt[6] != 44 || pkt[40] != 17) return 0;
+        size_t plen = ((size_t)pkt[4] << 8) | pkt[5];
+        if (plen + 40 > n || plen < 8) return 0;
+        ihl = 48;
+        len = plen - 8;
+        unsigned fo = (unsigned)((pkt[42] << 8) | pkt[43]);
+        off = fo & 0xFFF8;
+        more = fo & 1;
+        id = ((uint32_t)pkt[44] << 24) | ((uint32_t)pkt[45] << 16) | ((uint32_t)pkt[46] << 8) | pkt[47];
+        memcpy(src, pkt + 8, 16);
+        memcpy(dst, pkt + 24, 16);
+    } else {
+        ihl = (size_t)(pkt[0] & 0x0F) * 4;
+        if (ihl < 20 || n < ihl) return 0;
+        size_t total = (size_t)((pkt[2] << 8) | pkt[3]);
+        if (total > n || total < ihl) return 0;           /* заявленная длина больше пришедшей */
+        len = total - ihl;
+        unsigned frag = (unsigned)((pkt[6] << 8) | pkt[7]);
+        off = (size_t)(frag & 0x1FFF) * 8;
+        more = (frag & 0x2000) != 0;
+        id = (uint16_t)((pkt[4] << 8) | pkt[5]);
+        memcpy(src, pkt + 12, 4);
+        memcpy(dst, pkt + 16, 4);
+    }
 
     /* Просроченные сборки — прочь. Каждый приём: слотов шестнадцать, обход дешёвый. */
     for (int i = 0; i < DEFRAG_SLOTS; i++)
@@ -2012,7 +2079,8 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
 
     int si = -1;
     for (int i = 0; i < DEFRAG_SLOTS; i++)
-        if (g_frag[i] && g_frag[i]->src == src && g_frag[i]->dst == dst && g_frag[i]->id == id) {
+        if (g_frag[i] && g_frag[i]->v6 == v6 && g_frag[i]->id == id &&
+            !memcmp(g_frag[i]->src, src, 16) && !memcmp(g_frag[i]->dst, dst, 16)) {
             si = i;
             break;
         }
@@ -2041,8 +2109,9 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
         }
         g_frag[si] = calloc(1, sizeof(struct frag_slot));
         if (!g_frag[si]) return 0;                   /* памяти нет — датаграммы нет */
-        g_frag[si]->src = src;
-        g_frag[si]->dst = dst;
+        g_frag[si]->v6 = (uint8_t)v6;
+        memcpy(g_frag[si]->src, src, 16);
+        memcpy(g_frag[si]->dst, dst, 16);
         g_frag[si]->id = id;
         g_frag[si]->at = g_now_ns;
     }
@@ -2079,7 +2148,8 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
 
     /* Собрали. Отдаём как обычный пакет: заголовок IP на 20 байт, длина по факту, флагов
      * фрагментации нет — дальше его разбирает тот же путь, что и всё остальное. */
-    size_t asm_total = 20 + s->total;
+    size_t iph = v6 ? 40 : 20;
+    size_t asm_total = iph + s->total;
     /* Длина в заголовке UDP обязана совпасть с собранной: сервер читает именно её, и
      * фрагмент, потерянный ядром клиента, дал бы здесь короткую датаграмму с чужой длиной. */
     size_t udp_len = (size_t)((s->buf[4] << 8) | s->buf[5]);
@@ -2089,17 +2159,27 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
         defrag_say("длина в заголовке UDP не равна собранной");
         return 0;
     }
-    memset(out, 0, 20);
-    out[0] = 0x45;
-    out[2] = (unsigned char)(asm_total >> 8);
-    out[3] = (unsigned char)asm_total;
-    out[4] = (unsigned char)(id >> 8);
-    out[5] = (unsigned char)id;
-    out[8] = 64;
-    out[9] = 17;
-    memcpy(out + 12, &src, 4);
-    memcpy(out + 16, &dst, 4);
-    memcpy(out + 20, s->buf, s->total);
+    memset(out, 0, iph);
+    if (v6) {
+        out[0] = 0x60;
+        out[4] = (unsigned char)(s->total >> 8);
+        out[5] = (unsigned char)s->total;
+        out[6] = 17;
+        out[7] = 64;
+        memcpy(out + 8, src, 16);
+        memcpy(out + 24, dst, 16);
+    } else {
+        out[0] = 0x45;
+        out[2] = (unsigned char)(asm_total >> 8);
+        out[3] = (unsigned char)asm_total;
+        out[4] = (unsigned char)(id >> 8);
+        out[5] = (unsigned char)id;
+        out[8] = 64;
+        out[9] = 17;
+        memcpy(out + 12, src, 4);
+        memcpy(out + 16, dst, 4);
+    }
+    memcpy(out + iph, s->buf, s->total);
     frag_free(si);
     g_dfs.done++;
     return asm_total;
@@ -2255,9 +2335,9 @@ static void handle_packet_one(const struct tun_dev *tun, const unsigned char *pk
     /* Фрагменты UDP собираем ДО разбора: у продолжения нет заголовка UDP, и разбирать в нём
      * нечего — ip_parse такой пакет и не примет. Собранное выглядит обычным пакетом и идёт
      * дальше общим путём, поэтому знать про фрагменты больше никому не нужно. */
-    if (n >= 20 && (pkt[0] >> 4) == 4 && pkt[9] == 17 &&
-        (((pkt[6] << 8) | pkt[7]) & 0x3FFF)) {
-        static __thread unsigned char asm_pkt[20 + 8 + UDP_DGRAM_ABS];
+    if ((n >= 20 && (pkt[0] >> 4) == 4 && pkt[9] == 17 && (((pkt[6] << 8) | pkt[7]) & 0x3FFF)) ||
+        (ip6_frag_off(pkt, n) && pkt[40] == 17)) {
+        static __thread unsigned char asm_pkt[40 + 8 + UDP_DGRAM_ABS];
         size_t an = udp_defrag(pkt, n, asm_pkt, sizeof(asm_pkt));
         if (!an) { TR("фрагмент UDP: %s\n", "ждём продолжения или отказ"); return; }
         TR("датаграмма собрана из фрагментов: %zu байт\n", an);
@@ -2273,10 +2353,13 @@ static void handle_packet_one(const struct tun_dev *tun, const unsigned char *pk
     }
 
     if (ip_parse(pkt, n, &k, &off) != 0) { TR("пакет не разобран (%zu байт)\n", n); return; }
-    TR("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto=%u flags=0x%02x len=%zu\n",
-       k.src&255,(k.src>>8)&255,(k.src>>16)&255,(k.src>>24)&255, k.sport,
-       k.dst&255,(k.dst>>8)&255,(k.dst>>16)&255,(k.dst>>24)&255, k.dport,
-       k.proto, k.tcp_flags, n - off);
+    if (g_trace) {
+        char sa[INET6_ADDRSTRLEN], da[INET6_ADDRSTRLEN];
+        inet_ntop(k.v6 ? AF_INET6 : AF_INET, flow_src_bytes(&k), sa, sizeof(sa));
+        inet_ntop(k.v6 ? AF_INET6 : AF_INET, flow_dst_bytes(&k), da, sizeof(da));
+        TR("%s:%u -> %s:%u proto=%u flags=0x%02x len=%zu\n", sa, k.sport, da, k.dport,
+           k.proto, k.tcp_flags, n - off);
+    }
 
     /* Всё, что не TCP и не UDP, туннель нести не умеет: это ICMP, ESP и прочее, для чего
      * у VLESS (и у любого дайлера потоков) команды нет вовсе.
@@ -2313,8 +2396,10 @@ static void handle_packet_one(const struct tun_dev *tun, const unsigned char *pk
         uint32_t ack = k.seq + (uint32_t)data_n + ((k.tcp_flags & TCP_SYN) ? 1u : 0u) +
                        ((k.tcp_flags & TCP_FIN) ? 1u : 0u);
         unsigned char rp[64];
-        size_t rl = tcp_build(rp, sizeof(rp), k.dst, k.src, k.dport, k.sport,
-                              (k.tcp_flags & TCP_ACK) ? k.ack : 0, ack, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
+        size_t rl = k.v6 ? tcp_build6(rp, sizeof(rp), k.dst6, k.src6, k.dport, k.sport,
+                                      (k.tcp_flags & TCP_ACK) ? k.ack : 0, ack, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1)
+                         : tcp_build(rp, sizeof(rp), k.dst, k.src, k.dport, k.sport,
+                                     (k.tcp_flags & TCP_ACK) ? k.ack : 0, ack, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
         if (rl) tun_write_ctl(tun, rp, rl);
         g_tcp_tun_rst++;
         static __thread time_t said;
@@ -2366,6 +2451,15 @@ void tun_bring_up(const char *dev, int table) {
         fprintf(stderr, LOG_W "%s: адрес %s не встал — ядро сочтёт маршрут на это "
                         "устройство непригодным для локально порождённых пакетов\n",
                 dev, addr);
+    /* Адрес IPv6 (ULA, один на таблицу): без него у локально порождённых пакетов IPv6 через устройство нет
+     * адреса источника (пробы выхода, подложка `over`), как без адреса IPv4 выше. Тон осведомляющий: IPv6 на
+     * машине может быть выключен вовсе, а клиенты LAN ходят через устройство со своими адресами. */
+    char addr6[48];
+    snprintf(addr6, sizeof(addr6), "fd73:7465:6572::%x/128", 1u + ((unsigned)table % 200u));
+    const char *a6[] = { "ip", "-6", "addr", "replace", addr6, "dev", dev, NULL };
+    if (run_quiet(a6) != 0)
+        fprintf(stderr, LOG_I "%s: адрес IPv6 %s не встал — IPv6 локальных пакетов через это устройство "
+                        "не пойдёт (IPv6 выключен?)\n", dev, addr6);
     const char *u[] = { "ip", "link", "set", "dev", dev, "up", NULL };
     if (run_quiet(u) != 0)
         fprintf(stderr, LOG_W "%s: устройство не поднялось — через него не пойдёт "
@@ -2693,7 +2787,14 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
  * без настоящего в fakeip.state» на свежем выходе, когда запись была раз в минуту). */
 #define FAKE4_BASE 0xC6120000u              /* 198.18.0.0/15 — пул резолвера (dnsd_int.h) */
 #define FAKE4_SIZE 0x00020000u
-struct fake_pair { uint32_t fake, real; };  /* хостовый порядок у fake, сетевой у real */
+/* Пул IPv6 — fdfe:dcba:9876::/96, поддельный IPv6 = префикс и поддельный IPv4 той же записи в младших 32
+ * битах (fakeip6_of в spec.h, резолвер): по IPv6 находится запись IPv4, а у неё — настоящий IPv6. */
+static const uint8_t FAKE6_PREFIX[12] = { 0xfd, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0, 0, 0, 0, 0, 0 };
+struct fake_pair {
+    uint32_t fake, real;        /* хостовый порядок у fake, сетевой у real (0 — настоящего IPv4 нет) */
+    uint8_t has6;               /* настоящий IPv6 записи известен (четвёртое поле файла) */
+    uint8_t real6[16];
+};
 static __thread struct fake_pair *g_fp;
 static __thread size_t g_fp_n;
 static __thread time_t g_fp_mtime;
@@ -2715,24 +2816,38 @@ static void fake_load(void) {
     struct fake_pair *a = malloc(cap * sizeof(*a));
     char line[512];
     while (a && fgets(line, sizeof(line), f)) {
+        /* «домен \t поддельный \t настоящий IPv4 или - [\t настоящий IPv6]» */
         char *t1 = strchr(line, '\t');
         if (!t1) continue;
         char *t2 = strchr(t1 + 1, '\t');
         if (!t2) continue;
         *t2 = 0;
-        char *t3 = strpbrk(t2 + 1, "\t\n");
-        if (t3) *t3 = 0;
+        char *r4 = t2 + 1, *r6 = NULL;
+        char *t3 = strpbrk(r4, "\t\n");
+        if (t3) {
+            char c3 = *t3;
+            *t3 = 0;
+            if (c3 == '\t') {
+                r6 = t3 + 1;
+                char *e6 = strpbrk(r6, "\t\n");
+                if (e6) *e6 = 0;
+            }
+        }
         struct in_addr fk, rl;
-        if (inet_pton(AF_INET, t1 + 1, &fk) != 1 || inet_pton(AF_INET, t2 + 1, &rl) != 1) continue;
+        struct fake_pair x;
+        memset(&x, 0, sizeof(x));
+        if (inet_pton(AF_INET, t1 + 1, &fk) != 1) continue;
+        if (inet_pton(AF_INET, r4, &rl) == 1) x.real = rl.s_addr;
+        if (r6 && inet_pton(AF_INET6, r6, x.real6) == 1) x.has6 = 1;
+        if (!x.real && !x.has6) continue;
         if (n == cap) {
-            struct fake_pair *b = realloc(a, cap * 2 * sizeof(*a));
-            if (!b) break;
-            a = b;
+            struct fake_pair *b2 = realloc(a, cap * 2 * sizeof(*a));
+            if (!b2) break;
+            a = b2;
             cap *= 2;
         }
-        a[n].fake = ntohl(fk.s_addr);
-        a[n].real = rl.s_addr;
-        n++;
+        x.fake = ntohl(fk.s_addr);
+        a[n++] = x;
     }
     fclose(f);
     if (!a) return;
@@ -2773,9 +2888,11 @@ static const struct nlattr *fk_find(const unsigned char *p, size_t len, uint16_t
 #define FK_PAY(a) ((const unsigned char *)(a) + NLA_HDRLEN)
 #define FK_PLEN(a) ((size_t)(a)->nla_len - NLA_HDRLEN)
 
-/* Настоящий адрес из карты @fakeip таблицы inet steer — запросом GETSETELEM (не транзакция: доли
- * миллисекунды), сокет netlink на поток. 0 — элемента нет или ответа нет (тогда — файл). */
-static uint32_t fake_real_kernel(uint32_t fake_be) {
+/* Настоящий адрес из карты таблицы inet steer — запросом GETSETELEM (не транзакция: доли
+ * миллисекунды), сокет netlink на поток. set — карта (fakeip или fakeip6), key — поддельный адрес
+ * (klen байт, сетевой порядок), в out (olen байт) ложится настоящий. 1 — нашёлся, 0 — элемента нет или
+ * ответа нет (тогда — файл). */
+static int fake_kernel_lookup(const char *set, const void *key_p, size_t klen, void *out_p, size_t olen) {
     static __thread int fd = -2;
     static __thread uint32_t seq;
     if (fd == -2) {
@@ -2786,6 +2903,7 @@ static uint32_t fake_real_kernel(uint32_t fake_be) {
         if (fd >= 0) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
     if (fd < 0) return 0;
+    int found = 0;
     _Alignas(8) unsigned char buf[256];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nh = (struct nlmsghdr *)buf;
@@ -2793,11 +2911,11 @@ static uint32_t fake_real_kernel(uint32_t fake_be) {
     size_t n = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(*nfg));
     const char *tbl = nft_table();
     fk_attr(buf, &n, NFTA_SET_ELEM_LIST_TABLE, tbl, strlen(tbl) + 1);
-    fk_attr(buf, &n, NFTA_SET_ELEM_LIST_SET, "fakeip", 7);
+    fk_attr(buf, &n, NFTA_SET_ELEM_LIST_SET, set, strlen(set) + 1);
     size_t els = fk_attr(buf, &n, NLA_F_NESTED | NFTA_SET_ELEM_LIST_ELEMENTS, NULL, 0);
     size_t el = fk_attr(buf, &n, NLA_F_NESTED | NFTA_LIST_ELEM, NULL, 0);
     size_t key = fk_attr(buf, &n, NLA_F_NESTED | NFTA_SET_ELEM_KEY, NULL, 0);
-    fk_attr(buf, &n, NFTA_DATA_VALUE, &fake_be, 4);
+    fk_attr(buf, &n, NFTA_DATA_VALUE, key_p, klen);
     fk_end(buf, n, key);
     fk_end(buf, n, el);
     fk_end(buf, n, els);
@@ -2809,15 +2927,14 @@ static uint32_t fake_real_kernel(uint32_t fake_be) {
     nfg->version = NFNETLINK_V0;
     struct sockaddr_nl dst = { .nl_family = AF_NETLINK };
     if (sendto(fd, buf, n, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) return 0;
-    uint32_t real = 0;
     _Alignas(8) unsigned char rb[2048];
     for (;;) {
         ssize_t r = recv(fd, rb, sizeof(rb), 0);
-        if (r < (ssize_t)NLMSG_HDRLEN) return real;
+        if (r < (ssize_t)NLMSG_HDRLEN) return found;
         size_t left = (size_t)r;
         for (struct nlmsghdr *h = (struct nlmsghdr *)rb; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
             if (h->nlmsg_seq != seq) continue;                  /* хвост прежнего запроса */
-            if (h->nlmsg_type == NLMSG_ERROR) return real;
+            if (h->nlmsg_type == NLMSG_ERROR) return found;
             if (h->nlmsg_type != ((NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWSETELEM)) continue;
             size_t hl = NLMSG_ALIGN(sizeof(struct nfgenmsg));
             if (h->nlmsg_len < NLMSG_HDRLEN + hl) continue;
@@ -2827,19 +2944,41 @@ static uint32_t fake_real_kernel(uint32_t fake_be) {
             const struct nlattr *e1 = es ? fk_find(FK_PAY(es), FK_PLEN(es), NFTA_LIST_ELEM) : NULL;
             const struct nlattr *da = e1 ? fk_find(FK_PAY(e1), FK_PLEN(e1), NFTA_SET_ELEM_DATA) : NULL;
             const struct nlattr *dv = da ? fk_find(FK_PAY(da), FK_PLEN(da), NFTA_DATA_VALUE) : NULL;
-            if (dv && FK_PLEN(dv) == 4) memcpy(&real, FK_PAY(dv), 4);
+            if (dv && FK_PLEN(dv) == olen) { memcpy(out_p, FK_PAY(dv), olen); found = 1; }
         }
     }
 }
 
 /* Настоящий адрес для поддельного (сетевой порядок) или 0 — не знаем: карта ядра, затем файл. */
 static uint32_t fake_real(uint32_t fake_be) {
-    uint32_t k = fake_real_kernel(fake_be);
-    if (k) return k;
-    struct fake_pair key = { ntohl(fake_be), 0 };
+    uint32_t k = 0;
+    if (fake_kernel_lookup("fakeip", &fake_be, 4, &k, 4) && k) return k;
+    struct fake_pair key;
+    memset(&key, 0, sizeof(key));
+    key.fake = ntohl(fake_be);
     for (int pass = 0; pass < 2; pass++) {
         struct fake_pair *hit = g_fp_n ? bsearch(&key, g_fp, g_fp_n, sizeof(*g_fp), fp_cmp) : NULL;
         if (hit && hit->real) return hit->real;
+        if (pass == 0) fake_load();
+    }
+    return 0;
+}
+
+/* Поддельный IPv6 из пула? Тогда в младших четырёх байтах — поддельный IPv4 той же записи. */
+static int fake6_is(const uint8_t a[16]) { return !memcmp(a, FAKE6_PREFIX, 12); }
+
+/* То же для IPv6: настоящий адрес в real (16 байт). 1 — найден. Сначала карта fakeip6 в ядре (её резолвер
+ * ставит до ответа клиенту, как fakeip), затем файл: запись IPv4 с тем же младшим словом и её IPv6. */
+static int fake_real6(const uint8_t fake[16], uint8_t real[16]) {
+    if (fake_kernel_lookup("fakeip6", fake, 16, real, 16)) return 1;
+    struct fake_pair key;
+    memset(&key, 0, sizeof(key));
+    uint32_t lo;
+    memcpy(&lo, fake + 12, 4);
+    key.fake = ntohl(lo);
+    for (int pass = 0; pass < 2; pass++) {
+        struct fake_pair *hit = g_fp_n ? bsearch(&key, g_fp, g_fp_n, sizeof(*g_fp), fp_cmp) : NULL;
+        if (hit && hit->has6) { memcpy(real, hit->real6, 16); return 1; }
         if (pass == 0) fake_load();
     }
     return 0;
@@ -2855,40 +2994,94 @@ static void sock_rst_close(int fd) {
 static struct conn *conn_accept(int fd, const struct flow_key *k, const struct tun_dev *tun);
 
 static void kaccept_fd(int fd, const struct tun_dev *tun) {
-    struct sockaddr_in peer, od, me;
-    socklen_t pl = sizeof(peer), ol = sizeof(od), ml = sizeof(me);
-    if (getpeername(fd, (struct sockaddr *)&peer, &pl) != 0) { close(fd); return; }
-    if (getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, &od, &ol) != 0 ||
-        getsockname(fd, (struct sockaddr *)&me, &ml) != 0 ||
-        (od.sin_addr.s_addr == me.sin_addr.s_addr && od.sin_port == me.sin_port)) {
-        close(fd);                      /* не перенаправленное — прямо к порту модуля */
-        return;
-    }
-    uint32_t dst = od.sin_addr.s_addr;
-    uint32_t dh = ntohl(dst);
-    if (dh - FAKE4_BASE < FAKE4_SIZE) {
-        uint32_t real = fake_real(dst);
-        if (!real) {
-            static __thread time_t said;
-            if (g_now_s - said >= 10) {
-                said = g_now_s;
-                char a[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &dst, a, sizeof(a));
-                fprintf(stderr, LOG_W "поддельный адрес %s без настоящего в fakeip.state — соединение "
-                                "сброшено\n", a);
-            }
-            sock_rst_close(fd);
-            return;
-        }
-        dst = real;
-    }
+    struct sockaddr_storage peer, me;
+    socklen_t pl = sizeof(peer), ml = sizeof(me);
+    if (getpeername(fd, (struct sockaddr *)&peer, &pl) != 0 ||
+        getsockname(fd, (struct sockaddr *)&me, &ml) != 0) { close(fd); return; }
     struct flow_key key;
     memset(&key, 0, sizeof(key));
-    key.src = peer.sin_addr.s_addr;
-    key.dst = dst;
-    key.sport = ntohs(peer.sin_port);
-    key.dport = ntohs(od.sin_port);
     key.proto = 6;
+    /* Клиент IPv4 на сокете двойного стека приходит как ::ffff:a.b.c.d: это соединение IPv4, и назначение у
+     * него спрашивается по SOL_IP (ядро отдаёт его и для такого сокета). Настоящее IPv6 — IP6T_SO_ORIGINAL_DST. */
+    const struct sockaddr_in6 *p6 = (const struct sockaddr_in6 *)&peer;
+    int is4 = peer.ss_family == AF_INET || (peer.ss_family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&p6->sin6_addr));
+    if (is4) {
+        struct sockaddr_in od, me4;
+        socklen_t ol = sizeof(od);
+        if (getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, &od, &ol) != 0) { close(fd); return; }
+        uint32_t psrc, mip;
+        uint16_t pport, mport;
+        if (peer.ss_family == AF_INET) {
+            memcpy(&me4, &me, sizeof(me4));
+            psrc = ((const struct sockaddr_in *)&peer)->sin_addr.s_addr;
+            pport = ((const struct sockaddr_in *)&peer)->sin_port;
+            mip = me4.sin_addr.s_addr;
+            mport = me4.sin_port;
+        } else {
+            memcpy(&psrc, p6->sin6_addr.s6_addr + 12, 4);
+            pport = p6->sin6_port;
+            memcpy(&mip, ((const struct sockaddr_in6 *)&me)->sin6_addr.s6_addr + 12, 4);
+            mport = ((const struct sockaddr_in6 *)&me)->sin6_port;
+        }
+        if (od.sin_addr.s_addr == mip && od.sin_port == mport) {
+            close(fd);                  /* не перенаправленное — прямо к порту модуля */
+            return;
+        }
+        uint32_t dst = od.sin_addr.s_addr;
+        uint32_t dh = ntohl(dst);
+        if (dh - FAKE4_BASE < FAKE4_SIZE) {
+            uint32_t real = fake_real(dst);
+            if (!real) {
+                static __thread time_t said;
+                if (g_now_s - said >= 10) {
+                    said = g_now_s;
+                    char a[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &dst, a, sizeof(a));
+                    fprintf(stderr, LOG_W "поддельный адрес %s без настоящего в fakeip.state — соединение "
+                                    "сброшено\n", a);
+                }
+                sock_rst_close(fd);
+                return;
+            }
+            dst = real;
+        }
+        key.src = psrc;
+        key.dst = dst;
+        key.sport = ntohs(pport);
+        key.dport = ntohs(od.sin_port);
+    } else {
+        struct sockaddr_in6 od;
+        socklen_t ol = sizeof(od);
+        const struct sockaddr_in6 *m6 = (const struct sockaddr_in6 *)&me;
+        if (getsockopt(fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, &od, &ol) != 0 ||
+            (!memcmp(&od.sin6_addr, &m6->sin6_addr, 16) && od.sin6_port == m6->sin6_port)) {
+            close(fd);                  /* не перенаправленное — прямо к порту модуля */
+            return;
+        }
+        uint8_t dst[16];
+        memcpy(dst, &od.sin6_addr, 16);
+        if (fake6_is(dst)) {
+            uint8_t real[16];
+            if (!fake_real6(dst, real)) {
+                static __thread time_t said6;
+                if (g_now_s - said6 >= 10) {
+                    said6 = g_now_s;
+                    char a[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, dst, a, sizeof(a));
+                    fprintf(stderr, LOG_W "поддельный адрес %s без настоящего в карте fakeip6 и fakeip.state — "
+                                    "соединение сброшено\n", a);
+                }
+                sock_rst_close(fd);
+                return;
+            }
+            memcpy(dst, real, 16);
+        }
+        key.v6 = 1;
+        memcpy(key.src6, &p6->sin6_addr, 16);
+        memcpy(key.dst6, dst, 16);
+        key.sport = ntohs(p6->sin6_port);
+        key.dport = ntohs(od.sin6_port);
+    }
     conn_accept(fd, &key, tun);
 }
 

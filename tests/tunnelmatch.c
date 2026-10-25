@@ -132,6 +132,7 @@ int run_quiet(const char *const argv[]) {
 #include "jsonw.h"
 #include "../src/tunnel/stack.c"
 #include "vldial.h"
+#include "vless_proto.h"
 #include "client.h"
 #include "../src/tunnel/pool.c"
 
@@ -2976,6 +2977,316 @@ static void t_owner_mail(void) {
     free(rws);
 }
 
+/* ---- IPv6 через туннель (D-S3.1, I-566) -------------------------------------------------------
+ * Ключ потока с адресами в шестнадцать байт, разбор пакета IPv6, сброс TCP, UDP клиенту с нарезкой
+ * заголовком фрагментации и сборка обратно, раздача по рабочим, таблица соединений. Всё без ядра:
+ * пакеты собираются и разбираются здесь же, суммы проверяются независимым подсчётом. */
+static const uint8_t V6_CLI[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10 };
+static const uint8_t V6_SRV[16] = { 0x2a, 0x00, 0x14, 0x50, 0x40, 0x01, 0x08, 0x0b, 0, 0, 0, 0, 0, 0, 0x20, 0x0e };
+
+/* Сумма верхнего уровня пакета IPv6 с псевдозаголовком — независимо от tun.c: по слову за раз. Верна — 0xffff. */
+static int l4_sum_ok6(const unsigned char *p, size_t n, unsigned nh) {
+    size_t l4 = n - 40;
+    unsigned long acc = 0;
+    for (int i = 8; i < 40; i += 2) acc += (unsigned long)((p[i] << 8) | p[i + 1]);
+    acc += l4 >> 16;
+    acc += l4 & 0xFFFF;
+    acc += nh;
+    for (size_t i = 0; i + 1 < l4; i += 2) acc += (unsigned long)((p[40 + i] << 8) | p[40 + i + 1]);
+    if (l4 & 1) acc += (unsigned long)(p[n - 1] << 8);
+    while (acc >> 16) acc = (acc & 0xFFFF) + (acc >> 16);
+    return acc == 0xFFFF;
+}
+
+/* Пакет IPv6 UDP или TCP без опций с нагрузкой pay байт (суммы не считаются: нужны разбору и хэшу). */
+static size_t pkt6(unsigned char *p, const uint8_t *src, const uint8_t *dst, unsigned nh, unsigned sport,
+                   unsigned dport, size_t pay) {
+    size_t l4 = nh == 6 ? 20 : 8;
+    memset(p, 0, 40 + l4 + pay);
+    p[0] = 0x60;
+    p[4] = (unsigned char)((l4 + pay) >> 8); p[5] = (unsigned char)(l4 + pay);
+    p[6] = (unsigned char)nh; p[7] = 64;
+    memcpy(p + 8, src, 16); memcpy(p + 24, dst, 16);
+    p[40] = (unsigned char)(sport >> 8); p[41] = (unsigned char)sport;
+    p[42] = (unsigned char)(dport >> 8); p[43] = (unsigned char)dport;
+    if (nh == 17) { p[44] = (unsigned char)((8 + pay) >> 8); p[45] = (unsigned char)(8 + pay); }
+    if (nh == 6) p[52] = 0x50;
+    return 40 + l4 + pay;
+}
+
+static void t_v6(void) {
+    unsigned char p[2048];
+    struct flow_key k;
+    size_t off = 0;
+
+    /* Разбор: TCP (SYN с MSS и масштабом окна), UDP; адреса — в ключ, семейство отмечено. */
+    size_t l = tcp_build6(p, sizeof p, V6_CLI, V6_SRV, 40000, 443, 1000, 0, TCP_SYN, NULL, 0, 65535, 1460, 7);
+    memset(&k, 0, sizeof k);
+    check(l == 40 + 20 + 8 && ip_parse(p, l, &k, &off) == 0 && k.v6 && k.proto == 6 &&
+          !memcmp(k.src6, V6_CLI, 16) && !memcmp(k.dst6, V6_SRV, 16) && k.sport == 40000 && k.dport == 443 &&
+          (k.tcp_flags & TCP_SYN) && k.seq == 1000 && k.wscale == 7 && k.ws_seen && off == 40 + 28,
+          "IPv6: SYN разобран — семейство, 16-байтовые адреса, порты, номер, масштаб окна");
+    check(l4_sum_ok6(p, l, 6), "IPv6: сумма TCP из tcp_build6 сходится (псевдозаголовок из 16-байтовых адресов)");
+
+    l = pkt6(p, V6_CLI, V6_SRV, 17, 5353, 53, 40);
+    memset(&k, 0, sizeof k);
+    check(ip_parse(p, l, &k, &off) == 0 && k.v6 && k.proto == 17 && k.sport == 5353 && k.dport == 53 &&
+          off == 48 && !k.frag, "IPv6: UDP разобран, нагрузка с 48-го байта, не фрагмент");
+    /* IPv4 после IPv6 в той же переменной: семейство сбрасывается. */
+    l = own_pkt(p, CLI_IP, SRV_IP, 17, 1, 2, 10, 0);
+    check(ip_parse(p, l, &k, &off) == 0 && !k.v6 && k.src == CLI_IP && k.dst == SRV_IP,
+          "IPv4 после IPv6: семейство снято, адреса прежние");
+
+    /* Отказы: короткий пакет, длина в заголовке больше пришедшего, расширение, не первый фрагмент. */
+    l = pkt6(p, V6_CLI, V6_SRV, 17, 1, 2, 10);
+    int bad_short = ip_parse(p, 39, &k, &off) != 0;
+    int bad_len = ip_parse(p, l - 1, &k, &off) != 0;                 /* заявлено больше, чем пришло */
+    p[6] = 0;                                                          /* hop-by-hop: не разбирается */
+    int bad_ext = ip_parse(p, l, &k, &off) != 0;
+    check(bad_short && bad_len && bad_ext, "IPv6: короткий пакет, лишняя длина и расширение (hop-by-hop) не разбираются");
+
+    /* Хэш и таблица: два адреса, у которых первые четыре байта одни, — разные потоки. */
+    struct flow_key a = cli_key(), b;
+    a.v6 = 1; a.proto = 17; a.sport = 5000; a.dport = 53;
+    memcpy(a.src6, V6_CLI, 16); memcpy(a.dst6, V6_SRV, 16);
+    b = a;
+    b.src6[12] ^= 0x01;                                                /* отличие — за первыми четырьмя байтами */
+    struct flow_key c4 = cli_key();
+    c4.proto = 17; c4.sport = 5000; c4.dport = 53;
+    memcpy(&c4.src, V6_CLI, 4); memcpy(&c4.dst, V6_SRV, 4);           /* IPv4 с теми же четырьмя байтами */
+    struct conn *ca = conn_new(&g_tun);
+    memset(ca, 0, sizeof(*ca));
+    ca->used = 1; ca->fd = -1; ca->key = a; ca->is_udp = 1;
+    conn_link(ca);
+    check(conn_find(&a) == ca && !conn_find(&b) && !conn_find(&c4),
+          "таблица: поток IPv6 находится по всем 16 байтам; иной адрес и IPv4 с теми же четырьмя байтами — не он");
+    struct conn *cb = conn_new(&g_tun);
+    memset(cb, 0, sizeof(*cb));
+    cb->used = 1; cb->fd = -1; cb->key = b; cb->is_udp = 1;
+    conn_link(cb);
+    check(conn_find(&a) == ca && conn_find(&b) == cb && flow_hash(&a) != flow_hash(&b),
+          "таблица: два потока IPv6, различимые только в хвосте адреса, живут рядом");
+    conn_drop(ca);
+    conn_drop(cb);
+
+    /* RST на TCP, пришедший в устройство: от имени назначения, с номером подтверждения ISN + 1. */
+    dev_drain(NULL);
+    int live0 = g_live_n;
+    unsigned long long rst0 = g_tcp_tun_rst;
+    l = tcp_build6(p, sizeof p, V6_CLI, V6_SRV, 40000, 443, 1000, 0, TCP_SYN, NULL, 0, 65535, 1460, -1);
+    handle_packet(&g_tun, p, l);
+    unsigned char r[2048];
+    ssize_t rn = recv(g_dev_peer, r, sizeof r, MSG_DONTWAIT);
+    memset(&k, 0, sizeof k);
+    check(rn > 0 && ip_parse(r, (size_t)rn, &k, &off) == 0 && k.v6 && (k.tcp_flags & TCP_RST) &&
+          (k.tcp_flags & TCP_ACK) && k.ack == 1001 && !memcmp(k.src6, V6_SRV, 16) && !memcmp(k.dst6, V6_CLI, 16) &&
+          k.sport == 443 && k.dport == 40000 && l4_sum_ok6(r, (size_t)rn, 6) && g_tcp_tun_rst == rst0 + 1 &&
+          g_live_n == live0,
+          "IPv6: SYN в устройстве получает RST+ACK от имени сервера, сумма верна, соединения нет");
+
+    /* ICMPv6 «порт недостижим» на UDP: тип 1 код 4, от назначения клиенту, сумма с псевдозаголовком. */
+    l = pkt6(p, V6_CLI, V6_SRV, 17, 5353, 53, 20);
+    size_t ul = icmp_unreach_build(r, sizeof r, p, l);
+    check(ul == 40 + 8 + l && r[0] >> 4 == 6 && r[6] == 58 && r[40] == 1 && r[41] == 4 &&
+          !memcmp(r + 8, V6_SRV, 16) && !memcmp(r + 24, V6_CLI, 16) && !memcmp(r + 48, p, l) &&
+          l4_sum_ok6(r, ul, 58), "IPv6: ICMPv6 port unreachable — от назначения клиенту, с цитатой и верной суммой");
+
+    /* UDP клиенту: короткая — одним пакетом без заголовка фрагментации. */
+    dev_drain(NULL);
+    static unsigned char dg[60000];
+    for (size_t i = 0; i < sizeof dg; i++) dg[i] = (unsigned char)(i * 13 + 5);
+    int w = udp_write_to_client6(&g_tun, V6_SRV, V6_CLI, 443, 40000, dg, 1200, 5);
+    rn = recv(g_dev_peer, r, sizeof r, MSG_DONTWAIT);
+    memset(&k, 0, sizeof k);
+    check(w == 0 && rn == 40 + 8 + 1200 && ip_parse(r, (size_t)rn, &k, &off) == 0 && k.v6 && k.proto == 17 &&
+          k.sport == 443 && k.dport == 40000 && !memcmp(r + off, dg, 1200) && l4_sum_ok6(r, (size_t)rn, 17) &&
+          recv(g_dev_peer, r, sizeof r, MSG_DONTWAIT) < 0,
+          "IPv6: датаграмма 1200 байт — одним пакетом, суммой UDP по псевдозаголовку IPv6");
+    /* Ровно в MTU (1452 данных) — ещё без нарезки; на байт больше — две части. */
+    w = udp_write_to_client6(&g_tun, V6_SRV, V6_CLI, 443, 40000, dg, 1452, 6);
+    rn = recv(g_dev_peer, r, sizeof r, MSG_DONTWAIT);
+    int one = w == 0 && rn == 1500 && recv(g_dev_peer, r, sizeof r, MSG_DONTWAIT) < 0;
+    w = udp_write_to_client6(&g_tun, V6_SRV, V6_CLI, 443, 40000, dg, 1453, 7);
+    int two = 0;
+    while (recv(g_dev_peer, r, sizeof r, MSG_DONTWAIT) > 0) two++;
+    check(one && w == 0 && two == 2, "IPv6: 1452 байт данных — предел одного пакета в MTU 1500, 1453 — уже два фрагмента");
+
+    /* Нарезка 60000 байт заголовком фрагментации и сборка обратно через udp_defrag. */
+    w = udp_write_to_client6(&g_tun, V6_SRV, V6_CLI, 443, 40000, dg, 60000, 0x01020304u);
+    static unsigned char out[48 + 8 + 70000];
+    size_t pk = 0, got = 0, maxlen = 0, expect_off = 0;
+    int shape = 1;
+    while ((rn = recv(g_dev_peer, r, sizeof r, MSG_DONTWAIT)) > 0) {
+        pk++;
+        if ((size_t)rn > maxlen) maxlen = (size_t)rn;
+        unsigned fo = (unsigned)((r[42] << 8) | r[43]);
+        uint32_t id = ((uint32_t)r[44] << 24) | ((uint32_t)r[45] << 16) | ((uint32_t)r[46] << 8) | r[47];
+        /* Заголовок фрагментации: следом идёт UDP, смещение подряд, в последнем нет M, номер один на все. */
+        if (r[6] != 44 || r[40] != 17 || (fo & 0xFFF8) != expect_off || id != 0x01020304u ||
+            ((fo & 1) != 0) != (expect_off + (size_t)rn - 48 < 60008))
+            shape = 0;
+        expect_off += (size_t)rn - 48;
+        got = udp_defrag(r, (size_t)rn, out, sizeof out);
+    }
+    check(w == 0 && shape && maxlen <= TUN_MTU && pk == (60008 + 1447) / 1448 && got == 40 + 8 + 60000 &&
+          memcmp(out + 48, dg, 60000) == 0 && l4_sum_ok6(out, got, 17),
+          "IPv6: 60000 байт нарезаны заголовком фрагментации не больше MTU и собираются обратно (сумма верна)");
+    if (!shape || pk != (60008 + 1447) / 1448 || got != 40 + 8 + 60000)
+        fprintf(stderr, "  форма %d, пакетов %zu, собрано %zu\n", shape, pk, got);
+    /* Первый фрагмент: ip_parse помечает его фрагментом (датаграмма неполна); продолжение не разбирается. */
+    dev_drain(NULL);
+    udp_write_to_client6(&g_tun, V6_SRV, V6_CLI, 443, 40000, dg, 3000, 9);
+    int first_ok = 0, rest_bad = 0, nfr = 0;
+    while ((rn = recv(g_dev_peer, r, sizeof r, MSG_DONTWAIT)) > 0) {
+        memset(&k, 0, sizeof k);
+        int rc = ip_parse(r, (size_t)rn, &k, &off);
+        if (!nfr++) first_ok = rc == 0 && k.frag && k.sport == 443 && k.proto == 17;
+        else rest_bad += rc != 0;
+    }
+    check(first_ok && nfr == 3 && rest_bad == 2, "IPv6: первый фрагмент разобран с флагом frag, два продолжения — нет");
+
+    /* Сборка вперемешку и по порядку у двух отправителей с одним номером. */
+    {
+        unsigned char f[3][2048];
+        size_t fl[3];
+        udp_write_to_client6(&g_tun, V6_SRV, V6_CLI, 443, 40000, dg, 3000, 77);
+        for (int i = 0; i < 3; i++) fl[i] = (size_t)recv(g_dev_peer, f[i], sizeof f[i], MSG_DONTWAIT);
+        unsigned char s2[16];
+        memcpy(s2, V6_SRV, 16);
+        s2[15] ^= 0x40;
+        static unsigned char dg2[3000];
+        for (size_t i = 0; i < sizeof dg2; i++) dg2[i] = (unsigned char)(i * 3 + 1);
+        udp_write_to_client6(&g_tun, s2, V6_CLI, 443, 40000, dg2, 3000, 77);   /* тот же номер, другой адрес */
+        unsigned char g2[3][2048];
+        size_t gl[3];
+        for (int i = 0; i < 3; i++) gl[i] = (size_t)recv(g_dev_peer, g2[i], sizeof g2[i], MSG_DONTWAIT);
+        g_now_ns = 9000ull * 1000000000ull;
+        size_t x0 = udp_defrag(f[2], fl[2], out, sizeof out);
+        size_t y0 = udp_defrag(g2[0], gl[0], out, sizeof out);
+        size_t x1 = udp_defrag(f[0], fl[0], out, sizeof out);
+        size_t y1 = udp_defrag(g2[2], gl[2], out, sizeof out);
+        size_t x2 = udp_defrag(f[1], fl[1], out, sizeof out);
+        int x_ok = x2 == 48 + 3000 && !memcmp(out + 48, dg, 3000);
+        size_t y2 = udp_defrag(g2[1], gl[1], out, sizeof out);
+        int y_ok = y2 == 48 + 3000 && !memcmp(out + 48, dg2, 3000);
+        check(!x0 && !y0 && !x1 && !y1 && x_ok && y_ok,
+              "IPv6: куски двух датаграмм с одним номером и разными адресами не смешиваются, порядок любой");
+    }
+
+    /* Раздача по рабочим: тот же IPv6-поток всегда у одного рабочего, куски одной датаграммы — тоже. */
+    int same = 1, spread = 0;
+    unsigned seen[8] = { 0 };
+    for (unsigned nw = 2; nw <= 8; nw++) {
+        l = pkt6(p, V6_CLI, V6_SRV, 6, 40001, 443, 0);
+        unsigned o = stack_owner(p, l, nw);
+        for (unsigned fl = 0; fl < 256; fl += 17) {
+            p[53] = (unsigned char)fl; p[44] = (unsigned char)fl; p[48] = (unsigned char)(fl * 5);
+            if (stack_owner(p, l, nw) != o) same = 0;
+        }
+        if (o >= nw) same = 0;
+    }
+    for (unsigned i = 0; i < 4000; i++) {
+        uint8_t s[16];
+        memcpy(s, V6_CLI, 16);
+        s[14] = (unsigned char)(i >> 8); s[15] = (unsigned char)i;
+        l = pkt6(p, s, V6_SRV, 17, 30000 + i, 443, 0);
+        seen[stack_owner(p, l, 8)]++;
+    }
+    for (int i = 0; i < 8; i++) spread += seen[i] > 4000 / 8 * 70 / 100 && seen[i] < 4000 / 8 * 130 / 100;
+    check(same && spread == 8, "IPv6: владелец потока постоянен, 4000 потоков делятся на 8 рабочих поровну (±30%)");
+    /* Куски одной датаграммы — первый с заголовком фрагментации и портами внутри, остальные без — у одного. */
+    unsigned char fr1[1600], fr2[1600];
+    int fsame = 1;
+    for (unsigned nw = 2; nw <= 9; nw++) {
+        udp_write_to_client6(&g_tun, V6_CLI, V6_SRV, 40000, 443, dg, 3000, 5);
+        size_t n1 = (size_t)recv(g_dev_peer, fr1, sizeof fr1, MSG_DONTWAIT);
+        size_t n2 = (size_t)recv(g_dev_peer, fr2, sizeof fr2, MSG_DONTWAIT);
+        dev_drain(NULL);
+        if (stack_owner(fr1, n1, nw) != stack_owner(fr2, n2, nw)) fsame = 0;
+    }
+    check(fsame, "IPv6: фрагменты одной датаграммы — у одного рабочего (хэш без портов)");
+    check(stack_owner(p, 39, 4) == 0, "IPv6: короткий заголовок — рабочий 0, без чтения за границей");
+
+    /* Запрос VLESS с адресом IPv6: тип адреса 3 и шестнадцать байт (IPv4 — тип 1 и четыре, как прежде). */
+    {
+        unsigned char uuid[16] = { 1, 2, 3 }, req[64];
+        size_t rn6 = vless_build_request_a(uuid, VLESS_CMD_TCP, NULL, V6_SRV, 16, 443, NULL, req, sizeof req);
+        check(rn6 == 1 + 16 + 1 + 1 + 2 + 1 + 16 && req[19] == 0x01 && req[20] == 0xbb && req[21] == VLESS_ADDR_IPV6 &&
+              !memcmp(req + 22, V6_SRV, 16), "VLESS: запрос с адресом IPv6 — тип 3, шестнадцать байт, порт перед адресом");
+        const unsigned char a4[4] = { 1, 2, 3, 4 };
+        size_t rn4 = vless_build_request(uuid, VLESS_CMD_UDP, NULL, a4, 53, NULL, req, sizeof req);
+        check(rn4 == 1 + 16 + 1 + 1 + 2 + 1 + 4 && req[21] == VLESS_ADDR_IPV4 && !memcmp(req + 22, a4, 4),
+              "VLESS: запрос с адресом IPv4 прежний (тип 1, четыре байта)");
+        check(vless_build_request_a(uuid, VLESS_CMD_TCP, NULL, V6_SRV, 7, 443, NULL, req, sizeof req) == 0,
+              "VLESS: адрес не из четырёх и не из шестнадцати байт — отказ");
+    }
+
+    /* Поддельный IPv6 (fdfe:dcba:9876::/96, младшие 32 бита — поддельный IPv4 той же записи): настоящий адрес
+     * из fakeip.state, четвёртое поле. Карты ядра у стенда нет — работает запасной путь. */
+    {
+        char dir[] = "/tmp/tunnelmatch-fake6.XXXXXX";
+        if (mkdtemp(dir)) {
+            char path[128];
+            snprintf(path, sizeof path, "%s/fakeip.state", dir);
+            FILE *f = fopen(path, "w");
+            if (f) {
+                fputs("a.test\t198.18.0.5\t104.20.1.1\t2606:4700::1111\n"
+                      "b.test\t198.18.0.6\t-\t2606:4700::2222\n"
+                      "c.test\t198.18.0.7\t1.2.3.4\n", f);
+                fclose(f);
+            }
+            steer_set_state_dir(dir);
+            uint8_t f6[16], r6[16], want[16];
+            check(!fake6_is(V6_SRV), "IPv6: обычный адрес не из пула fake-IP");
+            inet_pton(AF_INET6, "fdfe:dcba:9876::c612:5", f6);
+            inet_pton(AF_INET6, "2606:4700::1111", want);
+            check(fake6_is(f6) && fake_real6(f6, r6) && !memcmp(r6, want, 16),
+                  "fake-IP IPv6: поддельный fdfe:dcba:9876::c612:5 → настоящий IPv6 из четвёртого поля fakeip.state");
+            inet_pton(AF_INET6, "fdfe:dcba:9876::c612:6", f6);
+            inet_pton(AF_INET6, "2606:4700::2222", want);
+            check(fake_real6(f6, r6) && !memcmp(r6, want, 16),
+                  "fake-IP IPv6: запись без настоящего IPv4 («-») тоже даёт настоящий IPv6");
+            inet_pton(AF_INET6, "fdfe:dcba:9876::c612:7", f6);
+            check(!fake_real6(f6, r6), "fake-IP IPv6: у записи без IPv6 (три поля) настоящего IPv6 нет");
+            inet_pton(AF_INET6, "fdfe:dcba:9876::c612:99", f6);
+            check(!fake_real6(f6, r6), "fake-IP IPv6: неизвестный поддельный адрес — не найден");
+            uint32_t fk5, fk6, fk7;
+            inet_pton(AF_INET, "198.18.0.5", &fk5);
+            inet_pton(AF_INET, "198.18.0.6", &fk6);
+            inet_pton(AF_INET, "198.18.0.7", &fk7);
+            uint32_t rl5, rl7;
+            inet_pton(AF_INET, "104.20.1.1", &rl5);
+            inet_pton(AF_INET, "1.2.3.4", &rl7);
+            check(fake_real(fk5) == rl5 && fake_real(fk7) == rl7 && fake_real(fk6) == 0,
+                  "fake-IP IPv4 с четырёхпольным файлом: настоящие адреса прежние, у записи «-» его нет");
+            unlink(path);
+            rmdir(dir);
+        }
+    }
+
+    /* Целый путь пакета: UDP IPv6 из устройства создаёт поток с ключом IPv6 (дайлер подменён). */
+    l = pkt6(p, V6_CLI, V6_SRV, 17, 5353, 53, 40);
+    g_now_ns = now_ns();
+    g_now_s = (time_t)(g_now_ns / 1000000000ull);
+    handle_packet(&g_tun, p, l);
+    struct flow_key uk;
+    memset(&uk, 0, sizeof uk);
+    uk.v6 = 1; uk.proto = 17; uk.sport = 5353; uk.dport = 53;
+    memcpy(uk.src6, V6_CLI, 16); memcpy(uk.dst6, V6_SRV, 16);
+    struct conn *uc = conn_find(&uk);
+    check(uc && uc->is_udp && uc->key.v6 && !memcmp(uc->key.dst6, V6_SRV, 16),
+          "IPv6: UDP из устройства завёл поток с ключом IPv6 (handle_packet → udp_packet)");
+    /* Второй пакет того же потока находит его, а не заводит новый. */
+    int lv = g_live_n;
+    handle_packet(&g_tun, p, l);
+    check(uc && g_live_n == lv && conn_find(&uk) == uc, "IPv6: следующая датаграмма — в тот же поток");
+    if (uc) {
+        if (uc->pending) wait_ready(uc, 2000);
+        conn_drop(uc);
+    }
+    dev_drain(NULL);
+}
+
 /* I-529: таблица растёт, а не упирается в 320 и не вытесняет живых. Поток свой — таблицы у потока
  * свои (__thread), и главная таблица стенда с потолком TEST_SLOTS остаётся нетронутой. */
 #define GROW_N 3000
@@ -3155,6 +3466,68 @@ static void t_accept_emfile(void) {
     close(l);
 }
 
+/* IPv6 (I-566): слушатель модуля — сокет двойного стека. На петле приходят и клиент IPv6 (::1), и клиент IPv4
+ * (127.0.0.1, адрес ::ffff:127.0.0.1); назначение у ядра (conntrack) стенду недоступно, поэтому проверяется то, что
+ * видит kaccept_fd до этого: семейство клиента и разбор адреса. Без IPv6 на петле — пропуск вслух. */
+static void t_listen_dual(void) {
+    int save_port = g_kport;
+    int probe = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in pa = { .sin_family = AF_INET };
+    pa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t pl = sizeof pa;
+    if (probe < 0 || bind(probe, (struct sockaddr *)&pa, sizeof pa) != 0 ||
+        getsockname(probe, (struct sockaddr *)&pa, &pl) != 0) { check(0, "двойной стек: стенд — порт"); return; }
+    g_kport = ntohs(pa.sin_port);
+    close(probe);
+    int l = klisten_open();
+    if (l < 0) { check(0, "двойной стек: слушатель встал"); g_kport = save_port; return; }
+    struct sockaddr_in6 sa6 = { .sin6_family = AF_INET6, .sin6_port = htons((uint16_t)g_kport), .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    int c6 = socket(AF_INET6, SOCK_STREAM, 0);
+    if (c6 < 0 || connect(c6, (struct sockaddr *)&sa6, sizeof sa6) != 0) {
+        printf("%-72s %s\n", "двойной стек: на петле нет IPv6 — проверка клиента IPv6 пропущена", "пропуск");
+        if (c6 >= 0) close(c6);
+        c6 = -1;
+    }
+    struct sockaddr_in sa4 = { .sin_family = AF_INET, .sin_port = htons((uint16_t)g_kport) };
+    sa4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int c4 = socket(AF_INET, SOCK_STREAM, 0);
+    int ok4 = c4 >= 0 && connect(c4, (struct sockaddr *)&sa4, sizeof sa4) == 0;
+    check(ok4, "двойной стек: клиент IPv4 (127.0.0.1) подключился к слушателю IPv6");
+    int got4 = 0, got6 = 0;
+    for (int i = 0; i < 2; i++) {
+        struct pollfd pf = { .fd = l, .events = POLLIN };
+        int a = poll(&pf, 1, 500) > 0 ? accept(l, NULL, NULL) : -1;   /* очередь ядра пополняется не мгновенно */
+        if (a < 0) break;
+        struct sockaddr_storage ps;
+        socklen_t psl = sizeof ps;
+        getpeername(a, (struct sockaddr *)&ps, &psl);
+        const struct sockaddr_in6 *p6 = (const struct sockaddr_in6 *)&ps;
+        if (ps.ss_family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&p6->sin6_addr)) got4++;
+        else if (ps.ss_family == AF_INET6 && IN6_IS_ADDR_LOOPBACK(&p6->sin6_addr)) got6++;
+        close(a);
+        if (c6 < 0) break;
+    }
+    check(got4 == 1 && (c6 < 0 || got6 == 1),
+          "двойной стек: клиент IPv4 приходит адресом ::ffff:127.0.0.1, клиент IPv6 — своим адресом ::1");
+    /* kaccept_fd без перенаправления (назначения у ядра нет) закрывает соединение и не падает — для обоих. */
+    if (c6 >= 0) close(c6);
+    close(c4);
+    int c4b = socket(AF_INET, SOCK_STREAM, 0);
+    if (c4b >= 0 && connect(c4b, (struct sockaddr *)&sa4, sizeof sa4) == 0) {
+        int live0 = g_live_n;
+        struct pollfd pf = { .fd = l, .events = POLLIN };
+        poll(&pf, 1, 500);
+        kaccept(l, &g_tun);
+        char b;
+        ssize_t rd = recv(c4b, &b, 1, 0);
+        check(g_live_n == live0 && rd == 0,
+              "двойной стек: прямое подключение к порту модуля (без перенаправления) закрывается сразу, соединения нет");
+        close(c4b);
+    }
+    close(l);
+    g_kport = save_port;
+}
+
 /* I-535: проба кандидатов наперегонки. Мёртвые узлы молчат до срока (здесь 2 с — вместо 8), живой отвечает
  * за 50 мс. Последовательный перебор отдал бы 4 × 2 с + 50 мс, гонка — задержку запуска пятого (4 × 250 мс). */
 struct race_t { int alive_from; int alive_ms; int dead_ms; };
@@ -3284,6 +3657,7 @@ int main(void) {
     t_race();
     t_tun_wq();
     t_accept_emfile();
+    t_listen_dual();
     t_table_grow();
     t_tcp_tun_rst();
     t_bring_up_table();
@@ -3309,6 +3683,7 @@ int main(void) {
     t_udp_defrag();
     t_owner();
     t_owner_mail();
+    t_v6();
     t_udp_big();
     test_vless_big_up();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");

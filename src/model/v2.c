@@ -809,7 +809,9 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             if (m != OUT_V6_OFF && group)
                 return fail(x, v, "%s: %s — свойство туннеля на том конце, у группы его нет: "
                             "задайте его у члена", w, sv);
-            if (m != OUT_V6_OFF && !(caps & KC_DEVICE))
+            /* Туннель, завершающий соединения у себя (vless, hysteria2, прокси: KC_TCP_REDIR), IPv6 несёт, но
+             * хоста с префиксом на том конце у него нет, и подмены он не просит: ему доступен только off. */
+            if (m != OUT_V6_OFF && (!(caps & KC_DEVICE) || (caps & KC_TCP_REDIR)))
                 return fail(x, v, "%s: %s — только у выхода с туннелем (kind: interface, awg); "
                             "у kind: %s есть только off", w, sv, kd->name);
             o.ipv6 = m;

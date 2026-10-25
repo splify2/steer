@@ -89,12 +89,12 @@ static int tj_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
 /* Собрать заголовок запроса (hex пароля + CRLF + CMD + адрес + CRLF). */
 static size_t tj_header(struct trojan_sess *s, const struct flow_key *k, int udp,
                         unsigned char *out, size_t cap) {
-    if (cap < 56 + 2 + 1 + 7 + 2) return 0;
+    if (cap < 56 + 2 + 1 + PX_ADDR_MAX + 2) return 0;
     size_t o = 0;
     memcpy(out, s->pwhex, 56); o += 56;
     out[o++] = '\r'; out[o++] = '\n';
     out[o++] = udp ? 3 : 1;
-    o += px_socks_addr(out + o, k->dst, k->dport);
+    o += px_socks_addr(out + o, k->v6, flow_dst_bytes(k), k->dport);
     out[o++] = '\r'; out[o++] = '\n';
     return o;
 }
@@ -110,7 +110,7 @@ static int tj_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     unsigned char *heap = NULL;
     /* Крупная датаграмма UDP не влезает в буфер записи: на неё берётся буфер по размеру (I-528). */
     if (udp && n + 64 + 2 * 16 > cap) {
-        cap = n + 64 + 7 + 2 + 2 + 56 + 16;
+        cap = n + 64 + PX_ADDR_MAX + 2 + 2 + 56 + 16;
         heap = out = malloc(cap);
         if (!out) return SEND_FATAL;
     }
@@ -136,9 +136,9 @@ static int tj_send(const void *ctx, void *sess, const struct flow_key *k, int ud
             size_t dl = ((size_t)p[0] << 8) | p[1];
             p += 2; left -= 2;
             if (dl > left) { free(heap); return SEND_FATAL; }
-            size_t need = 7 + 2 + 2 + dl;       /* адрес + длина + CRLF + данные */
+            size_t need = PX_ADDR_MAX + 2 + 2 + dl;       /* адрес + длина + CRLF + данные */
             if (len + need > cap) { free(heap); return SEND_FATAL; }
-            len += px_socks_addr(out + len, k->dst, k->dport);
+            len += px_socks_addr(out + len, k->v6, flow_dst_bytes(k), k->dport);
             out[len++] = (unsigned char)(dl >> 8);
             out[len++] = (unsigned char)dl;
             out[len++] = '\r'; out[len++] = '\n';

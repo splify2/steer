@@ -41,7 +41,8 @@ static int h2_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
     struct hy2_flow *f = sess;
     memset(f, 0, sizeof *f);
     f->udp = (uint8_t)udp;
-    f->dst = k->dst;
+    f->v6 = k->v6;
+    memcpy(f->dst, flow_dst_bytes(k), flow_alen(k));
     f->dport = k->dport;
     return 0;
 }

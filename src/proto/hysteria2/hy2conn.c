@@ -142,7 +142,7 @@ struct udg {
 
 /* Что нужно только потоку UDP: адрес назначения для заголовка, счётчик пакетов и сборки фрагментов. */
 struct hy2_udpx {
-    char addr[48];              /* «хост:порт» назначения */
+    char addr[64];              /* «хост:порт» назначения, у IPv6 «[хост]:порт» */
     uint16_t pkt;               /* счётчик пакетов UDP */
     struct hy2_rasm *ras;         /* сборки фрагментов от сервера (hy2wire.h) */
 };
@@ -923,14 +923,14 @@ static void bg_schedule(struct hq *h, int failed);
 
 static void start_flow(struct hy2_flow *f) {
     struct hq *h = f->q;
-    char host[INET_ADDRSTRLEN];
-    struct in_addr a = { .s_addr = f->dst };
-    inet_ntop(AF_INET, &a, host, sizeof host);
+    char host[INET6_ADDRSTRLEN];
+    inet_ntop(f->v6 ? AF_INET6 : AF_INET, f->dst, host, sizeof host);
     if (f->udp) {
         if (!h->st.udp_ok) { flow_fail(f, HY2E_NOUDP, NULL, 0); return; }
         f->ux = calloc(1, sizeof *f->ux);
         if (!f->ux) { flow_fail(f, HY2E_BUSY, NULL, 0); return; }
-        snprintf(f->ux->addr, sizeof f->ux->addr, "%s:%u", host, f->dport);
+        /* IPv6 — в скобках: «[::1]:443», как и в запросе TCP (hy2_tcp_request). */
+        snprintf(f->ux->addr, sizeof f->ux->addr, f->v6 ? "[%s]:%u" : "%s:%u", host, f->dport);
         /* Идентификатор сессии — случайный, свободный в таблице. */
         for (int tries = 0; tries < 16; tries++) {
             uint32_t u;
