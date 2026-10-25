@@ -489,6 +489,19 @@ struct v6pfx {
     unsigned char len;
 };
 
+/* Настройка выхода вида плагина (kinds/plugin.h; docs плагинов — spec-fields.md). Строки и массивы —
+ * в арене спеки. Ядро ключей вида не разбирает: оно проверяет их по схеме из манифеста плагина и
+ * отдаёт помощнику как keys_json. */
+struct plugin_kind;
+struct plugin_out {
+    const struct plugin_kind *pk;   /* запись реестра: плагин, схема, caps, помощник, хуки */
+    const char *keys_json;          /* ключи вида после схемы, пути x-path — абсолютные */
+    uint32_t *ports;  size_t ports_n;   /* ресурсы выхода (alloc.json) */
+    uint32_t *queues; size_t queues_n;
+    /* Выход вида unavail: прежнее имя вида — ради status и отказов; у остальных NULL. */
+    const char *shown;
+};
+
 struct output {
     /* Пусто — безымянный выход, член группы, рождённый переводом v1 из `devices` (лежит в
      * sp->out за именованными, см. struct spec). */
@@ -518,9 +531,20 @@ struct output {
      * обнулённого выхода — «напрямую», а нулевой номер значил бы первый выход. Смысл, проверки
      * и метка — в блоке «подложка» ниже (out_over, out_underlay_mark). */
     char over[32];
-    /* Выход заведён разбором для группы `kind: warp` (её имя) и в спеке не записан: туннель WARP
-     * N из count (src/model/v2.c, p_warp). Печать спеки его пропускает — он часть записи warp. */
-    char warp_of[32];
+    /* ВЛАДЕЛЕЦ: выход завёл плагин, а не человек (в спеке человека такого нет — `owner` пишет только
+     * подготовленная спека, spec_prepare). owner_plugin — id плагина; owner_out — выход плагина,
+     * развёрнутый его хуком expand (имя выхода человека, который стал группой), NULL у выхода,
+     * добавленного хуком pre_apply. NULL у обоих — выход человека. Строки — в арене спеки. Читать —
+     * out_owned_by и соседи ниже, не поля. Печать спеки человека такой выход пропускает: он часть
+     * записи своего владельца (kind: warp). */
+    const char *owner_plugin;
+    const char *owner_out;
+    /* НЕДОСТУПНОСТЬ: вид выхода не работает здесь и сейчас — нужен плагин, плагин отключён, спека не
+     * подготовлена. Причина для человека; NULL — доступен. У такого выхода вид unavail (kind.h),
+     * он `failed` и живёт по своему on_fail, остальные выходы работают. unavail_plugin — id плагина,
+     * если он известен (поставить или включить его). */
+    const char *unavail;
+    const char *unavail_plugin;
     /* Настройка вида — ровно одна из этих, по kind. */
     union {
         struct iface_cfg iface;
@@ -532,6 +556,7 @@ struct output {
         struct zapret_cfg zp;
         struct tgws_cfg tg;
         struct group_cfg grp;
+        struct plugin_out plg;
     };
     uint32_t mark;      /* 0 for direct: claiming a packet needs no mark */
     int table;
@@ -832,6 +857,13 @@ struct spec {
     size_t lan_dev_n;
     int traceroute_hops;
     struct spec_dns dns;
+    /* Спека прочитана из ПОДГОТОВЛЕННОЙ (spec.prepared.json с совпавшим ключом: хуки плагинов
+     * исполнены, выходы видов с разворотом заведены) — а не из спеки человека. Только в
+     * подготовленной спеке разбор принимает `owner` и вид plugin-device. */
+    int prepared;
+    /* Ключ подготовки: sha256 (hex) спеки человека, версий и манифестов плагинов с хуками. Длина —
+     * свойство sha256 (64 знака и нуль), а не выбранный предел. */
+    char prepared_key[65];
 };
 
 /* ---- память спеки --------------------------------------------------------------------------
@@ -1109,6 +1141,33 @@ static inline unsigned out_caps(const struct output *o) {
 }
 static inline int out_has_cap(const struct output *o, unsigned cap) { return (out_caps(o) & cap) != 0; }
 
+/* ---- выход и плагин (spec-fields.md, раздел 1) ----------------------------------------------
+ *
+ * Поля владельца и недоступности читают только эти функции: как хранится «выход завёл плагин»,
+ * знает один заголовок, и перенос строк из арены в иное место не потребует правки читателей
+ * (supd, status, v2print, awg, помощник warpbox). */
+
+/* Выход принадлежит плагину plugin (NULL — любому) и развёрнут из его выхода out (NULL — любому
+ * выходу плагина, в том числе добавленному pre_apply). Выход человека не принадлежит никому. */
+static inline int out_owned_by(const struct output *o, const char *plugin, const char *out) {
+    if (!o || !o->owner_plugin) return 0;
+    if (plugin && strcmp(o->owner_plugin, plugin) != 0) return 0;
+    if (out && (!o->owner_out || strcmp(o->owner_out, out) != 0)) return 0;
+    return 1;
+}
+/* id плагина-владельца; NULL — выход человека. */
+static inline const char *out_owner_plugin(const struct output *o) { return o->owner_plugin; }
+/* Причина недоступности для человека; NULL — выход доступен. */
+static inline const char *out_unavail(const struct output *o) { return o->unavail; }
+/* Запись реестра вида плагина; NULL — вид ядра (и недоступный выход: записи у него нет). */
+static inline const struct plugin_kind *out_plugin_kind(const struct output *o) {
+    return kind_of(o)->plugin ? o->plg.pk : NULL;
+}
+/* Ключи вида плагина после проверки по схеме (JSON-объект); NULL — не плагинный выход. */
+static inline const char *out_plugin_keys(const struct output *o) {
+    return kind_of(o)->plugin ? o->plg.keys_json : NULL;
+}
+
 /* Выход, у которого есть устройство и своя таблица маршрутизации. vless сюда входит:
  * его TUN — такое же устройство, и вся логика меток, маршрутов и проверок к нему
  * применима без изменений. Одна функция вместо повторения условия в пяти местах —
@@ -1368,6 +1427,16 @@ uint32_t fakeip6_to4(const uint8_t a[16]);
  * отказ, текст в e->msg. Завершает процесс только вызывающий, дошедший до точки входа:
  * `static struct spec spec; struct err e; if (load_spec(path, &spec, &e) < 0) err_die(&e);`. */
 int load_spec(const char *path, struct spec *s, struct err *e);
+/* Как читать спеку (flags у load_spec_mode):
+ *   LOAD_PREPARED — умолчание, все места чтения (status, diag, сторож, супервизор): берётся
+ *     подготовленная спека, если её ключ совпал; нет — спека человека, а выходы видов с разворотом
+ *     читаются недоступными («спека не подготовлена — нужен reload»). Хуков load_spec не исполняет.
+ *   LOAD_HUMAN — только спека человека, как написана: `steer spec convert`, печать, v2print.
+ *   LOAD_STRICT — выход вида, которого нет (плагин не стоит или отключён), — отказ всей спеки, а не
+ *     недоступный выход: так читают apply и check из интерфейса (решение владельца: при старте и
+ *     reload остальное работает, при apply — отказ с причиной). */
+enum { LOAD_PREPARED = 0, LOAD_HUMAN = 1, LOAD_STRICT = 2 };
+int load_spec_mode(const char *path, struct spec *s, struct err *e, int flags);
 struct output *out_by_name(const struct spec *sp, const char *n);
 
 /* Кому ПРИНАДЛЕЖИТ устройство: выход, чей процесс его создал (vless, xsteer). NULL, если

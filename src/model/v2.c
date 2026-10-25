@@ -84,7 +84,7 @@ struct v2 {
     struct v2_client *cl;
     size_t cl_cap;
     size_t clients_named, lists_named;
-    int warp_synth;                 /* разбор разворачивает kind: warp — вид warp-masque допустим */
+    int warp_synth;                 /* разбор разворачивает kind: warp — вид plugin-device допустим */
 };
 
 /* ---- отказы -------------------------------------------------------------------------------- */
@@ -745,11 +745,13 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         kd = kind_by_name(proto);
     } else if (v2_tunnel_proto(kname)) {
         return fail(x, kn, "%s: в спеке v2 туннель пишется kind: tunnel, protocol: %s", where, kname);
-    } else if (!strcmp(kname, "warp-masque")) {
-        /* Член WARP с транспортом MASQUE — только из разворота kind: warp (p_warp). */
-        if (!x->warp_synth)
-            return fail(x, kn, "%s: kind warp-masque заводит только kind: warp (transport: masque)", where);
-        kd = &kind_warpm;
+    } else if (!strcmp(kname, kind_plugin_device.name)) {
+        /* Устройство держит процесс плагина-владельца: вид заводит разворот (p_warp для kind: warp, хук
+         * expand плагина — в подготовленной спеке, с owner). Человек его не пишет. */
+        if (!x->warp_synth && !(s->prepared && ynode_get(val, "owner")))
+            return fail(x, kn, "%s: kind %s заводит только плагин — в подготовленной спеке и с owner", where,
+                        kname);
+        kd = &kind_plugin_device;
     } else {
         if (!strcmp(kname, "zapret"))
             return fail(x, kn, "%s: kind zapret убран из ядра steer: обход DPI — отдельный модуль recheck, без обхода выход заменяет kind: direct", where);
@@ -1235,7 +1237,7 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
     }
     const struct ynode *ov = ynode_get(val, "over");
     /* Члены: awg — файл туннеля {etc}/warp/<имя>-<n>.conf (его пишет модуль); masque — TUN модуля,
-     * своих ключей у вида нет (kinds/group.c, kind_warpm). */
+     * своих ключей у вида нет (kinds/group.c, kind_plugin_device). */
     int mq = transport == WARP_MASQUE;
     for (long n = 1; n <= count; n++) {
         size_t pairs = (mq ? 2 : 3) + (ov ? 1 : 0), it = 0;
@@ -1244,7 +1246,7 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
         snprintf(conf, sizeof(conf), "%s/warp/%s-%ld.conf", plat()->etc_dir, name, n);
         if (!m) return fail(x, val, "%s: недостаточно памяти", where);
         m->items[it++] = yn_str(x, val, "kind");
-        m->items[it++] = yn_str(x, val, mq ? "warp-masque" : "awg");
+        m->items[it++] = yn_str(x, val, mq ? kind_plugin_device.name : "awg");
         if (!mq) {
             m->items[it++] = yn_str(x, val, "conf");
             m->items[it++] = yn_str(x, val, conf);
@@ -1259,7 +1261,12 @@ static int p_warp(struct v2 *x, const struct ynode *key, const struct ynode *val
         int prc = p_output(x, mem->items[n - 1], m);
         x->warp_synth = 0;
         if (prc) return -1;
-        snprintf(x->s->out[midx].warp_of, sizeof(x->s->out[midx].warp_of), "%s", name);
+        /* Член развёрнут из выхода `name` плагина warpbox (переходный шаг: разворот в ядре; его
+         * хук expand плагина придёт на то же место, spec-fields.md, раздел 2). */
+        x->s->out[midx].owner_plugin = spec_strdup(x->s, "warpbox");
+        x->s->out[midx].owner_out = spec_strdup(x->s, name);
+        if (!x->s->out[midx].owner_plugin || !x->s->out[midx].owner_out)
+            return fail(x, val, "%s: недостаточно памяти для спеки", where);
     }
     return 0;
 }

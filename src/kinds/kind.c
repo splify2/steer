@@ -174,6 +174,7 @@ int kind_helper_cmd(struct kind_helper *h, const char *cmd) { return kh_str(&h->
 int kind_helper_prog(struct kind_helper *h, const char *prog) { return kh_str(&h->prog, prog); }
 int kind_helper_arg(struct kind_helper *h, const char *arg) { return kh_add(&h->arg, &h->arg_n, arg); }
 int kind_helper_env(struct kind_helper *h, const char *var) { return kh_add(&h->env, &h->env_n, var); }
+int kind_helper_conf(struct kind_helper *h, const char *path) { return kh_str(&h->conf_path, path); }
 
 void kind_helper_free(struct kind_helper *h) {
     free(h->cmd);
@@ -182,6 +183,8 @@ void kind_helper_free(struct kind_helper *h) {
     free(h->arg);
     for (size_t i = 0; i < h->env_n; i++) free(h->env[i]);
     free(h->env);
+    free(h->conf_path);
+    h->conf_path = NULL;
     h->cmd = h->prog = NULL;
     h->arg = h->env = NULL;
     h->arg_n = h->env_n = 0;

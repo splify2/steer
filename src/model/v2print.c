@@ -554,7 +554,7 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
             if (yq_len(oname[anon_order[i]]) > ow) ow = yq_len(oname[anon_order[i]]);
         fputs("\noutputs:\n", f);
         for (size_t i = 0; i < s->out_n; i++) {
-            if (s->out[i].warp_of[0]) continue;         /* туннель kind: warp — часть его записи */
+            if (out_owned_by(&s->out[i], NULL, NULL)) continue;     /* выход плагина (туннель kind: warp) — часть его записи */
             key_pad(f, oname[i], ow);
             output_flow(f, s, &s->out[i], &onm);
             fputc('\n', f);

@@ -653,7 +653,7 @@ static int load(struct wb *w, const char *spec_path, const char *group) {
     }
     for (size_t k = 0; k < w->g->grp.members_n; k++) {
         const struct output *o = spec_out(w->sp, w->g->grp.members[k]);
-        if (!o || strcmp(o->warp_of, group) != 0) continue;
+        if (!o || !out_owned_by(o, NULL, group)) continue;
         struct member *m = &w->m[w->n++];
         m->o = o;
         m->said = 2;

@@ -60,6 +60,8 @@ const struct kind_ops *out_kind_shown(const struct output *o) {
 }
 
 const char *out_kind_name(const struct output *o) {
+    /* Недоступный выход называется прежним видом (vless у туннеля, у которого нет плагина). */
+    if (kind_of(o) == &kind_unavail && o->plg.shown) return o->plg.shown;
     return out_kind_shown(o)->name;
 }
 
@@ -378,30 +380,32 @@ static int group_helper(const struct spec *sp, const struct output *o, struct ki
     return 0;
 }
 
-/* ---- член группы `kind: warp, transport: masque` ------------------------------------------------
+/* ---- plugin-device: общий вид «устройство держит процесс владельца» ---------------------------
  *
- * Устройство — TUN, который держит модуль steer-warpbox (поток туннеля MASQUE, src/proto/warp/wbmq.c),
- * как у xsteer; маршрут, метку, таблицу и подмену адресов ведёт ядро, как у любого выхода с
- * устройством. Своих ключей у вида нет, руками в спеке он не пишется — его заводит только разворот
- * `kind: warp` (model/v2.c, p_warp), поэтому в реестре видов (kind.c) его нет: разбор находит его сам.
- * Имя устройства — то же правило, что у awg (awg_default_ifname): имя не должно выдавать туннель. */
-static int warpm_parse(struct output *o, const struct out_keys *k, struct err *e) {
+ * Прежний warp-masque: член WARP с TUN модуля steer-warpbox (поток туннеля MASQUE, src/proto/warp/
+ * wbmq.c). Теперь вид общий (spec-fields.md, раздел 3): устройство создаёт и держит процесс плагина,
+ * который завёл выход (owner), как у xsteer; маршрут, метку, таблицу и подмену адресов ведёт ядро,
+ * как у любого выхода с устройством. Своих ключей у вида нет, руками в спеке он не пишется:
+ * принимается только в подготовленной спеке и только с `owner` (разворот хука expand, model/v2.c) —
+ * поэтому в реестре видов (kind.c) его нет: разбор находит его сам. Имя устройства — ключ `device`
+ * или выведенное по правилу awg (awg_default_ifname): имя не должно выдавать туннель. */
+static int pdev_parse(struct output *o, const struct out_keys *k, struct err *e) {
     if (k->devices_n)
-        return err_set(e, "outputs.%s: устройство члена WARP выбирает ядро steer", o->name);
-    awg_default_ifname(o->name, o->device, sizeof(o->device));
+        return err_set(e, "outputs.%s: устройство выхода плагина выбирает ядро steer", o->name);
+    if (!o->device[0]) awg_default_ifname(o->name, o->device, sizeof(o->device));
     return 0;
 }
 
-static void warpm_keys_of(const struct output *o, struct out_keys *k) {
+static void pdev_keys_of(const struct output *o, struct out_keys *k) {
     (void)o;
     (void)k;
 }
 
-const struct kind_ops kind_warpm = {
-    .name = "warp-masque",
+const struct kind_ops kind_plugin_device = {
+    .name = "plugin-device",
     .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_OVER | KC_SKIP_ZAPRET | KC_IPV6,
-    .parse = warpm_parse,
-    .keys_of = warpm_keys_of,
+    .parse = pdev_parse,
+    .keys_of = pdev_keys_of,
 };
 
 const struct kind_ops kind_group = {

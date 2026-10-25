@@ -70,7 +70,10 @@ static void t_spec(void) {
     const struct output *m = out_by_name(&sp, "cf.2");
     check("warp: член cf.2 — awg", 1, m && kind_of(m) == &kind_awg);
     if (m) {
-        check_s("warp: член знает группу", "cf", m->warp_of);
+        check_s("warp: член знает группу", "cf", m->owner_out);
+        check_s("warp: член принадлежит плагину warpbox", "warpbox", m->owner_plugin);
+        check("warp: out_owned_by по группе", 1, out_owned_by(m, "warpbox", "cf"));
+        check("warp: out_owned_by чужой группы", 0, out_owned_by(m, "warpbox", "zz"));
         char want[512];
         snprintf(want, sizeof want, "%s/warp/cf-2.conf", plat()->etc_dir);
         check_s("warp: файл члена — {etc}/warp/<группа>-<n>.conf", want, m->awg.conf);
@@ -85,11 +88,13 @@ static void t_spec(void) {
     check("warp: masque — принят", 0,
           spec_load("version: 2\noutputs:\n  mq: { kind: warp, transport: masque, count: 2 }\n", &sp, msg, sizeof msg) < 0);
     m = out_by_name(&sp, "mq.2");
-    check("  член — вид warp-masque", 1, m && kind_of(m) == &kind_warpm);
+    check("  член — вид plugin-device", 1, m && kind_of(m) == &kind_plugin_device);
     check("  у члена устройство, IPv6 nat", 1, m && !strcmp(m->device, "mq.2") && m->ipv6 == OUT_V6_NAT);
-    check_s("  член знает группу", "mq", m ? m->warp_of : "");
+    check_s("  член знает группу", "mq", m ? m->owner_out : "");
     check("warp-masque руками — отказ", 1,
           spec_load("version: 2\noutputs:\n  x: { kind: warp-masque }\n", &sp, msg, sizeof msg) < 0);
+    check("plugin-device руками — отказ", 1,
+          spec_load("version: 2\noutputs:\n  x: { kind: plugin-device }\n", &sp, msg, sizeof msg) < 0);
     check("неизвестный transport — отказ", 1,
           spec_load("version: 2\noutputs:\n  cf: { kind: warp, transport: wireguard }\n", &sp, msg, sizeof msg) < 0);
     check("warp: страна и в countries, и в exclude_countries — отказ", 1,
