@@ -20,8 +20,12 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "kind.h"
+
+/* Версия steer-api этого ядра (steer-api.md): плагин `^1.x` исполняется, если x не больше минора. */
+#define STEER_API_VERSION "1.0"
 
 struct err;
 struct spec;
@@ -40,6 +44,7 @@ struct plugin_prog {
 };
 
 struct plugin;
+struct pnft;                    /* разобранный файл nft плагина (plugin.c) */
 
 /* Подкоманда из манифеста: `steer <name> <слова человека…>` исполняет prog с argv. */
 struct plugin_cmd {
@@ -59,16 +64,17 @@ struct plugin_kind {
     unsigned caps;              /* enum kind_cap из имён манифеста */
     struct ydoc *schema_doc;    /* схема ключей (kinds/<вид>.schema.json); NULL — ключей нет */
     const struct ynode *schema;
+    char *schema_path;          /* файл схемы — для отказов */
     struct plugin_prog helper;  /* prog NULL — помощника нет */
     char *helper_cmd;           /* имя помощника в журнале и status */
     int helper_argv_set;        /* argv задан манифестом; иначе умолчание [cmd, {out}, --conf, {conf}] */
     struct plugin_prog check;   /* prog NULL — хука нет */
     struct plugin_prog expand;
     char **nft;  size_t nft_n;  /* шаблоны nft на выход: полные пути файлов */
+    struct pnft **nftp;         /* их разбор, по одному на файл */
     unsigned res_ports, res_queues;     /* kinds[].resources: сколько на каждый выход */
     char *lan_only, *novia, *selfnat_why;
     struct kind_ops ops;        /* запись вида: её и возвращает реестр видов (kind_by_name) */
-    struct plugin_kind *next;
 };
 
 /* Плагин из реестра. */
@@ -78,8 +84,11 @@ struct plugin {
     int enabled;                /* включён и совместим: его виды и команды зарегистрированы */
     char *why;                  /* почему не включён (для status и отказов); NULL — включён */
     struct plugin_cmd *cmd;  size_t cmd_n;
+    struct plugin_kind **kind;  size_t kind_n;   /* в порядке манифеста */
     struct plugin_prog pre_apply;       /* prog NULL — хука нет */
     int has_hooks;              /* есть check, expand или pre_apply: от них зависит подготовка спеки */
+    char **nft;  size_t nft_n;  /* steer.nft[]: файлы плагина с наборами и цепочками слотов */
+    struct pnft **nftp;
     char *manifest;             /* байты plugin.json — в ключ подготовки */
     size_t manifest_len;
 };
@@ -111,6 +120,10 @@ const struct plugin_kind *plugin_kind_of_ops(const struct kind_ops *k);
  * известен. Текст — в buf. */
 const char *plugin_kind_why(const char *name, char *buf, size_t n, const char **id);
 
+/* Виды плагинов в порядке реестра — после видов ядра (kind.c: kind_count, kind_at). */
+size_t plugin_kinds_n(void);
+const struct kind_ops *plugin_kind_ops_at(size_t i);
+
 /* Подкоманда плагина по имени; NULL — такой нет у включённого плагина. */
 const struct plugin_cmd *plugin_cmd_find(const char *name);
 /* Исполнить подкоманду плагина вместо этого процесса: argv — слова человека. Возвращает только
@@ -125,6 +138,23 @@ int plugin_cmd_exec(const struct plugin_cmd *c, int argc, char **argv);
  * вызывающего (free); -1 — отказ, текст в e (без места: его добавляет вызывающий по узлу *at). */
 int plugin_keys_check(const struct plugin_kind *pk, const struct ynode *keys, const char *etc,
                       const char *conf, char **json, const struct ynode **at, struct err *e);
+
+/* ---- nft: слоты и шаблоны (steer-api.md, раздел 5) ---- */
+
+struct nft_rs;
+/* Дописать в дерево rs наборы, цепочки слотов и правила видов всех включённых плагинов: файлы
+ * steer.nft[] и шаблоны kinds[].nft на каждый выход вида. Порядок — по id плагина, затем по порядку
+ * манифеста, поэтому текст набора правил не зависит от порядка установки. Слот занят — ядро заводит
+ * базовую цепочку plugin_<слот> и пишет в неё `jump plugin_<id>_<слот>`. 0 — готово; -1 — отказ,
+ * причина с именем плагина и строкой файла в e. */
+int plugin_emit_all(struct nft_rs *rs, const struct spec *sp, struct err *e);
+/* `steer nft-map`: карта ядра для плагинов — таблица, базовые цепочки с хуком и приоритетом числом,
+ * поле метки, слоты. json — JSON, иначе текст для человека. */
+void plugin_nft_map(FILE *out, int json);
+
+/* Ключи выхода как есть, без схемы — JSON-объект (недоступный вид: ключи проверить нечем, но
+ * печать спеки не должна их терять). 0 / -1 (нет памяти). */
+int plugin_keys_raw(const struct ynode *keys, char **json);
 
 /* ---- вид unavail и plugin-device ---- */
 extern const struct kind_ops kind_unavail;

@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include "spec.h"
+#include "plugin.h"
 #include "srsplan.h"
 #include "obfs.h"
 #include "ynode.h"
@@ -510,10 +511,15 @@ static int spec_pick_default(const char **path, struct err *e) {
 static int load_text(char *buf, size_t n, const char *path, struct spec *s, struct err *e);
 
 int load_spec(const char *path, struct spec *s, struct err *e) {
+    return load_spec_mode(path, s, e, LOAD_PREPARED);
+}
+
+int load_spec_mode(const char *path, struct spec *s, struct err *e, int flags) {
     /* Спека — значение (правило 6): экземпляр обнуляется здесь, а не оставляется на
      * совести вызывающего, и получает те же умолчания, что раньше стояли инициализаторами
      * глобалов — один br-lan клиентским устройством, всё остальное пусто/нуль. */
     if (spec_defaults(s) != 0) return err_set(e, "%s", "недостаточно памяти для спеки");
+    s->load_flags = flags;
     if (spec_pick_default(&path, e) != 0) return -1;
     FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
     if (!f) return err_set(e, "%s: cannot open", path);
@@ -541,6 +547,26 @@ int load_spec(const char *path, struct spec *s, struct err *e) {
     }
     buf[n] = '\0';
     if (f != stdin) fclose(f);
+    /* ПОДГОТОВЛЕННАЯ СПЕКА (kinds/plugprep.c, steer-api.md 3.1): если хуки плагинов исполнены над
+     * этой спекой и ключ совпал (байты спеки, версии и манифесты плагинов), читается она: выходы
+     * видов с разворотом заведены, номера ресурсов выданы. Хуков load_spec не исполняет. Имя и
+     * каталог для путей остаются спеки человека. */
+    if (!(flags & LOAD_HUMAN)) {
+        char *pt = NULL, key[65];
+        size_t pn = 0;
+        int pr = spec_prepared_text(path, buf, n, &pt, &pn, key);
+        if (pr < 0) {
+            free(buf);
+            return err_set(e, "%s", "недостаточно памяти для спеки");
+        }
+        if (pr > 0) {
+            free(buf);
+            buf = pt;
+            n = pn;
+            s->prepared = 1;
+            memcpy(s->prepared_key, key, sizeof(key));
+        }
+    }
     int rc = load_text(buf, n, path, s, e);
     free(buf);
     return rc;
@@ -568,7 +594,13 @@ static int load_text(char *buf, size_t n, const char *path, struct spec *s, stru
         if (!ver) {
             int rc = spec_parse_v1(buf, s, e);
             if (rc == 0 || sch || !strstr(buf, "version")) return rc;
+            int lf = s->load_flags, pr = s->prepared;
+            char pk[65];
+            memcpy(pk, s->prepared_key, sizeof(pk));
             if (spec_defaults(s) != 0) return err_set(e, "%s", "недостаточно памяти для спеки");
+            s->load_flags = lf;
+            s->prepared = pr;
+            memcpy(s->prepared_key, pk, sizeof(pk));
             e->msg[0] = '\0';
         }
     }

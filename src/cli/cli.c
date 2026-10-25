@@ -10,6 +10,7 @@
 #include "spec.h"
 #include "profile.h"
 #include "module.h"
+#include "plugin.h"
 
 /* Версию подставляет сборка (-DSTEER_VERSION) из файла VERSION. Умолчание нужно
  * потому, что исходники движка компилируют ещё и стенды из tests/: им до версии дела
@@ -221,6 +222,13 @@ static const struct cli_cmd CMDS[] = {
  "Спрашивать ядро надёжнее, чем искать ключ в спеке grep-ом, — переименование поля\n"
  "ломает grep молча, а вместе с ним и запуск.",
  "--spec --state-dir --kind --obfs --devices --via", 0, 0, 0, 0, 0},
+
+{"nft-map", "Диагностика", "",
+ "карта nft ядра для плагинов: цепочки, приоритеты, слоты",
+ "Таблица ядра, её базовые цепочки с хуком и приоритетом числом, поле метки steer и слоты, в\n"
+ "которые плагин кладёт свои правила (plugin_<слот>). Плагин со своей таблицей встаёт «до разметки\n"
+ "steer» или «после» по этой карте, а не угадывая числа. --json — для программ.",
+ "--json", 0, 0, 0, 0, 0},
 
 {"dnsd-sig", "Диагностика", "",
  "подпись таблицы доменных каналов — хватит ли резолверу SIGHUP",
@@ -762,6 +770,8 @@ static void print_flags(FILE *out, const char *list) {
 /* Есть ли команда в этой установке: профиль extended несёт всё в себе (статическая сборка), иначе
  * команду модуля ведёт его бинарник рядом с движком (lib/module.c). */
 static int cmd_here(const struct cli_cmd *c) {
+    /* Подкоманду с этим именем ведёт включённый плагин (манифест) — она есть. */
+    if (plugin_cmd_find(c->name)) return 1;
     if (prof()->extended) return 1;
     const char *m = steer_cmd_module(c->name);
     return m && steer_module_present(m);
@@ -795,6 +805,17 @@ static void help_all(FILE *out) {
             if (CMDS[i].srv) { fputs(" [steer-hub]", out); missing = 1; }
         }
         fputc('\n', out);
+    }
+    /* Подкоманды плагинов (манифесты): своей строкой по плагину, как у команд ядра. */
+    int pl_head = 0;
+    for (size_t pi = 0; pi < plugin_n(); pi++) {
+        const struct plugin *pl = plugin_at(pi);
+        if (!pl->enabled) continue;
+        for (size_t ci = 0; ci < pl->cmd_n; ci++) {
+            if (cli_lookup(pl->cmd[ci].name)) continue;      /* команда модуля ядра — уже в списке выше */
+            if (!pl_head++) fputs("\nКоманды плагинов:\n", out);
+            fprintf(out, "  %-13s %s [%s]\n", pl->cmd[ci].name, pl->cmd[ci].help ? pl->cmd[ci].help : "", pl->id);
+        }
     }
     fprintf(out, "\nСправка и версия:\n"
           "  help [команда]  подробности: что делает команда и какие у неё флаги\n"

@@ -61,7 +61,8 @@ const struct kind_ops *out_kind_shown(const struct output *o) {
 
 const char *out_kind_name(const struct output *o) {
     /* Недоступный выход называется прежним видом (vless у туннеля, у которого нет плагина). */
-    if (kind_of(o) == &kind_unavail && o->plg.shown) return o->plg.shown;
+    if (kind_of(o) == &kind_unavail && o->plg.shown)
+        return !strncmp(o->plg.shown, "tunnel:", 7) ? o->plg.shown + 7 : o->plg.shown;
     return out_kind_shown(o)->name;
 }
 

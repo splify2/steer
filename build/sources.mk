@@ -131,7 +131,7 @@ DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
 # tgws — базовый: правила перехвата пишет любой движок, мост живёт своей программой (полный
 # пакет, микропакет stgws). Состав проверяет tests/buildmatch.sh.
 KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/block.c src/kinds/group.c src/kinds/grpurl.c src/kinds/interface.c \
-                  src/kinds/tgws.c src/kinds/awg.c src/kinds/plugin.c
+                  src/kinds/tgws.c src/kinds/awg.c src/kinds/plugin.c src/kinds/plugprep.c
 KINDS_EXT_SRC  := src/kinds/vless.c src/kinds/xsteer.c
 
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
