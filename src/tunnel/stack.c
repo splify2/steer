@@ -3891,13 +3891,11 @@ static int worker_count(void) {
     }
     long on = sysconf(_SC_NPROCESSORS_ONLN);
     int n = on < 1 ? 1 : (int)on;
-#ifdef CPU_COUNT
     cpu_set_t cs;
     if (sched_getaffinity(0, sizeof(cs), &cs) == 0) {
         int a = CPU_COUNT(&cs);
         if (a >= 1 && a < n) n = a;
     }
-#endif
     return n;
 }
 

@@ -1236,12 +1236,6 @@ int udp_write_to_client6(const struct tun_dev *d, const uint8_t src[16], const u
 #include <sys/syscall.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
-#ifndef TUNSETSTEERINGEBPF
-#define TUNSETSTEERINGEBPF _IOR('T', 224, int)
-#endif
-#ifndef SKF_NET_OFF
-#define SKF_NET_OFF (-0x100000)
-#endif
 
 struct bpf_prog_buf {
     struct bpf_insn in[192];

@@ -1465,13 +1465,9 @@ struct pump_stat {
 static void keepalive_on(int fd) {
     int one = 1, idle = 240, intvl = 30, cnt = 4;
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-#ifdef TCP_KEEPIDLE
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
-#else
-    (void)idle; (void)intvl; (void)cnt;
-#endif
 }
 
 /* Монотонные миллисекунды: срок затишья не должен сдвигаться от перевода часов роутера —

@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/udp.h>   /* SOL_UDP, UDP_SEGMENT, UDP_GRO */
 #include <sys/epoll.h>
 #include <sys/random.h>
 #include <sys/socket.h>
@@ -64,15 +65,6 @@
  * пишет ровно столько, сколько пришло, остальное страниц не занимает (RSS не растёт). */
 #define QC_RX_GRO_BATCH 16
 #define QC_RXBUF_GRO    (QC_RX_GRO_BATCH * 65536)
-#ifndef SOL_UDP
-#define SOL_UDP         17
-#endif
-#ifndef UDP_SEGMENT
-#define UDP_SEGMENT     103
-#endif
-#ifndef UDP_GRO
-#define UDP_GRO         104
-#endif
 /* Длина нашего идентификатора соединения. Была 17; против сервера эталона (quic-go) это стоило
  * потери датаграмм: он режет фрагменты UDP по предельному размеру датаграммы, посчитанному
  * без учёта длинного CID адресата, и первый (самый большой) фрагмент не влезал в пакет и молча
