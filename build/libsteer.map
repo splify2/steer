@@ -183,6 +183,7 @@ LIBSTEER_1 {
     plat_select;
     plat_spec_default;
     plat_spec_resolve;
+    plugso_http_get;
     pool_race_first;
     pool_run;
     probe_clear;
