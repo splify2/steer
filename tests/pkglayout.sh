@@ -64,8 +64,17 @@ T=/tmp/pl
 rm -rf "$T"; mkdir -p "$T"
 core_apk="$(ls out/steer-core-*_"$A".apk | head -1)"
 V="${core_apk#out/steer-core-}"; V="${V%%-1_*}"     # версия без ревизии сборки
-MODS="vless xsteer obfs tgws hysteria2"
-PKGS="steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-extended"
+# Раскладка 2.1 (умолчание build.sh): протоколы — плагины (.s2p и семя в steer-core), пакетом остаётся
+# только мост steer-tgws; 2.0 (STEER_LAYOUT=2.0) — прежние пакеты модулей и мета-пакет.
+if ls out/steer-vless-"$V"-1_"$A".apk >/dev/null 2>&1; then LAYOUT=2.0; else LAYOUT=2.1; fi
+if [ "$LAYOUT" = 2.0 ]; then
+    MODS="vless xsteer obfs tgws hysteria2"
+    PKGS="steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-extended"
+else
+    MODS="tgws"
+    PKGS="steer-core steer-tgws"
+fi
+echo "pkglayout: раскладка $LAYOUT"
 
 # Разворачиваем каждый пакет в обоих форматах.
 for p in $PKGS; do
@@ -90,10 +99,20 @@ check "steer-core содержит libsteer-wolfssl.so.<версия wolfSSL>" "
     "$(printf '%s\n' "$core_files" | grep -c '^/usr/lib/libsteer-wolfssl\.so\.[0-9.]*$')"
 check "steer-tools — ссылка на steerd" "steerd" "$(readlink "$T/apk/steer-core/usr/sbin/steer-tools")"
 check "у steer-core нет других файлов" "0" \
-    "$(printf '%s\n' "$core_files" | grep -vcE '^/(usr/sbin/(steerd|steer|steer-tools|steer-nfqws)|usr/lib/libsteer(-wolfssl)?\.so\.[0-9.]+|etc/init\.d/steer|etc/hotplug\.d/iface/95-steer|lib/upgrade/keep\.d/steer)$')"
+    "$(printf '%s\n' "$core_files" | grep -vcE '^/(usr/sbin/(steerd|steer|steer-tools|steer-nfqws)|usr/lib/libsteer(-wolfssl)?\.so\.[0-9.]+|etc/init\.d/steer|etc/hotplug\.d/iface/95-steer|lib/upgrade/keep\.d/steer|usr/share/steer/steer-abi|usr/share/nftables\.d/chain-pre/input/30-steer\.nft|usr/share/steer/seed/.*)$')"
+if [ "$LAYOUT" = 2.1 ]; then
+    # Семя (plugin-sdk/docs/migration-2.1.md, раздел 5): подписанный индекс и архивы протоколов и net1.
+    check "steer-core 2.1: семя — index.json и подпись" "1 1" \
+        "$(printf '%s\n' "$core_files" | grep -c '^/usr/share/steer/seed/index\.json$') $(printf '%s\n' "$core_files" | grep -c '^/usr/share/steer/seed/index\.json\.sig$')"
+    for q in net1 vless hysteria2 proxy xsteer warpbox obfs; do
+        check "  в семени архив $q под $A" "1" \
+            "$(printf '%s\n' "$core_files" | grep -c "^/usr/share/steer/seed/$q/[0-9.]*/$q-[0-9.]*-$A\.s2p$")"
+    done
+fi
 for m in $MODS; do
     check "steer-$m — ровно свой бинарник" "/usr/sbin/steer-$m" "$(files_of "$T/apk/steer-$m" | tr '\n' ' ' | sed 's/ $//')"
 done
+[ "$LAYOUT" = 2.1 ] ||
 check "steer-extended — только метка" "/usr/lib/steer/extended" "$(files_of "$T/apk/steer-extended" | tr '\n' ' ' | sed 's/ $//')"
 allf=""
 for p in $PKGS; do allf="$allf$(files_of "$T/apk/$p")
@@ -112,13 +131,14 @@ has() { grep -cFx -- "$2" "$T/dump.$1" | tr -d ' '; }   # ИМЯ СТРОКА ->
 for p in $PKGS; do dump "$p" > "$T/dump.$p"; done
 ctl() { sed -n "s/^$2: //p" "$T/ctl/$1/control"; }
 
-for m in vless xsteer obfs tgws hysteria2; do
+for m in $MODS; do
     check "steer-$m (apk) зависит от steer-core точной версии" "1" "$(has steer-$m "    - steer-core=$V-r1")"
     check "steer-$m (ipk) зависит от steer-core точной версии" "1" \
         "$(ctl steer-$m Depends | tr ',' '\n' | grep -c "^ *steer-core (= $V-1)\$")"
     check "steer-$m не зависит от libsteer и libsteer-wolfssl" "0" \
         "$(grep -c 'libsteer' "$T/dump.steer-$m")"
 done
+if [ "$LAYOUT" = 2.0 ]; then
 for m in vless xsteer hysteria2; do
     check "steer-$m требует kmod-tun (создаёт TUN сам)" "1" "$(has steer-$m "    - kmod-tun")"
 done
@@ -129,6 +149,7 @@ check "steer-extended (ipk): ядро и четыре модуля" "5" \
 check "steer-extended не тянет steer-hysteria2 (apk и ipk)" "0 0" \
     "$(grep -c hysteria2 "$T/dump.steer-extended") $(ctl steer-extended Depends | grep -c hysteria2)"
 check "steer-extended помечен устаревшим" "1" "$(ctl steer-extended Description | grep -c 'устарел')"
+fi
 check "steer-core не зависит от наших пакетов (только конфликты со старыми)" "0" \
     "$(sed -n '/^  depends:/,/^  [a-z]*:/p' "$T/dump.steer-core" | grep -E -- '^    - .?(steer|libsteer)' | grep -vcE "^    - '!(steer|libsteer|libsteer-wolfssl)'$")"
 # Миграция, метаданные. apk: provides + replaces и `!имя` в depends.
@@ -139,7 +160,16 @@ for old in steer libsteer libsteer-wolfssl; do
     check "steer-core (ipk) Replaces/Conflicts $old" "1 1" \
         "$(ctl steer-core Replaces | tr ',' '\n' | grep -c "^ *$old\$") $(ctl steer-core Conflicts | tr ',' '\n' | grep -c "^ *$old\$")"
 done
-check "steer-core (ipk) Provides steer" "steer" "$(ctl steer-core Provides)"
+# provides — на каждое имя «заменяет» (plugin-sdk/docs/open.md, О-23); в 2.1 — и на пакеты протоколов и
+# steer-extended (migration-2.1.md, раздел 2), кроме steer-tgws: он пакетом остаётся.
+OLDN="steer libsteer libsteer-wolfssl"
+[ "$LAYOUT" = 2.1 ] && OLDN="$OLDN steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-extended"
+for old in $OLDN; do
+    check "steer-core (apk) provides $old=$V-r1 и replaces $old" "1 1" "$(has steer-core "    - $old=$V-r1") $(has steer-core "    - $old")"
+    check "steer-core (ipk) Provides и Replaces $old" "1 1" \
+        "$(ctl steer-core Provides | tr ',' '\n' | grep -c "^ *$old\$") $(ctl steer-core Replaces | tr ',' '\n' | grep -c "^ *$old\$")"
+done
+check "steer-core не берёт имя steer-tgws (мост — свой пакет)" "0" "$(grep -c 'steer-tgws' "$T/dump.steer-core")"
 # Скрипты ядра: прежнее поведение — включить и перезапустить при установке, остановить и выключить при удалении.
 check "steer-core (ipk): postinst включает и перезапускает службу" "2" \
     "$(grep -cE '/etc/init\.d/steer (enable|restart)' "$T/ctl/steer-core/postinst")"
@@ -164,6 +194,48 @@ check "сумма установленных файлов без hysteria2 — �
     "$([ "$nohy_inst" -le 5242880 ] && echo yes || echo "no ($nohy_inst)")"
 
 # ---- 4. миграция apk на настоящем менеджере ---------------------------------------------------
+if [ "$LAYOUT" = 2.1 ]; then
+    # 2.0.x с модулями и мета-пакетом → steer-core 2.1 (migration-2.1.md, раздел 2): старые пакеты модулей
+    # требуют steer-core ТОЧНОЙ версии, а новый steer-core закрывает их имена provides. Снимет ли решатель
+    # apk их сам — то, что проверяется здесь (open.md, О-23; запасной путь — migrate --remove-old).
+    R0="$T/repo21"; mkdir -p "$R0/old/$A" "$R0/new/$A" "$R0/sys/$A" "$T/empty" "$T/nokeys" "$T/o21"
+    for d in nftables ip-full conntrack kmod-nft-queue kmod-tun; do
+        apk mkpkg --info "name:$d" --info "version:1-r0" --info "arch:$A" -F "$T/empty" \
+            -o "$R0/sys/$A/$d-1-r0.apk" >/dev/null 2>&1
+    done
+    for f in out/*_"$A".apk; do b="${f##*/}"; cp "$f" "$R0/new/$A/${b%%-$V-1_*}-$V-r1.apk"; done
+    OV=2.0.5-r1
+    mko() {  # ИМЯ ЗАВИСИМОСТИ — пустой пакет прежней версии
+        mkdir -p "$T/o21/$1/usr/lib/o21"; echo "$1" > "$T/o21/$1/usr/lib/o21/$1"
+        apk mkpkg --info "name:$1" --info "version:$OV" --info "arch:$A" ${2:+--info "depends:$2"} \
+            -F "$T/o21/$1" -o "$R0/old/$A/$1-$OV.apk" >/dev/null 2>&1
+    }
+    mko steer-core "nftables ip-full conntrack kmod-nft-queue"
+    for m in vless xsteer obfs tgws hysteria2 proxy warpbox; do mko "steer-$m" "steer-core=$OV kmod-tun"; done
+    mko steer-extended "steer-core=$OV steer-vless=$OV steer-xsteer=$OV steer-obfs=$OV steer-tgws=$OV"
+    for r in old new sys; do apk mkndx --allow-untrusted -o "$R0/$r/$A/APKINDEX.tar.gz" "$R0/$r/$A"/*.apk >/dev/null 2>&1; done
+    apkr21() { _root="$1"; shift; apk --root "$_root" --arch "$A" --allow-untrusted --no-network --no-cache \
+        --keys-dir "$T/nokeys" --repositories-file /dev/null -X "$R0/sys" -X "$R0/old" -X "$R0/new" "$@"; }
+    for sc in "ext:steer-extended:upgrade" "ext-add:steer-extended:add steer-core" "mods:steer-core steer-vless steer-hysteria2 steer-warpbox:upgrade"; do
+        _n="${sc%%:*}"; _rest="${sc#*:}"; _w="${_rest%%:*}"; _cmd="${_rest#*:}"
+        _r="$T/r21-$_n"; rm -rf "$_r"; mkdir -p "$_r"
+        apk --root "$_r" --arch "$A" --allow-untrusted --no-network --no-cache --keys-dir "$T/nokeys" \
+            --repositories-file /dev/null -X "$R0/sys" -X "$R0/old" --initdb add $_w >/dev/null 2>&1
+        # shellcheck disable=SC2086
+        apkr21 "$_r" $_cmd > "$T/out21-$_n" 2>&1; _rc=$?
+        _inst="$(apk --root "$_r" list -I 2>/dev/null | sed 's/ .*//' | sort | tr '\n' ' ')"
+        printf '  [2.1 %s] %s → %s\n' "$_n" "$_w" "$_inst"
+        check "[2.1 $_n] команда менеджера прошла" "0" "$_rc"
+        [ "$_rc" = 0 ] || sed 's/^/    /' "$T/out21-$_n" | head -8
+        check "[2.1 $_n] steer-core новой версии" "1" "$(printf '%s\n' $_inst | grep -c "^steer-core-$V-r1\$")"
+        check "[2.1 $_n] прежних пакетов протоколов и мета-пакета не осталось" "" \
+            "$(printf '%s\n' $_inst | grep -E '^steer-(vless|xsteer|obfs|hysteria2|proxy|warpbox|extended)-' | tr '\n' ' ')"
+    done
+    printf '\n%d проверок пройдено' "$pass"
+    if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
+    printf '\nвсе проверки прошли\n'
+    exit 0
+fi
 R0="$T/repo"
 mkdir -p "$R0/old/$A" "$R0/new/$A" "$R0/sys/$A" "$T/oldroot/steer" "$T/oldroot/libsteer" "$T/oldroot/wolf" \
          "$T/oldroot/vless" "$T/oldroot/ext" "$T/empty" "$T/nokeys"
@@ -276,7 +348,7 @@ check "удаление: служба остановлена и выключен
 # бинарником `(deleted)`, пока службу не перезапускали руками. Старые пакеты — те же имена
 # (steer-core, steer-vless) заведомо меньшей версии; скрипты новых берутся из настоящих .apk.
 check "steer-core (apk) несёт post-upgrade" "1" "$(grep -c 'post-upgrade' "$T/dump.steer-core")"
-for m in vless xsteer obfs tgws hysteria2; do
+for m in $MODS; do
     check "steer-$m (apk) несёт post-upgrade" "1" "$(grep -c 'post-upgrade' "$T/dump.steer-$m")"
 done
 _r="$T/r-upg"

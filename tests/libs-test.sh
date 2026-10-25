@@ -57,7 +57,10 @@ if ! CC="$CC" LIBS="-lpthread -ldl -lm" WOLFSSL_DIR="$WSRC" NGTCP2_DIR="$NSRC" J
     echo "libs-test: сборка не удалась:"; grep -m10 -i "error\|undefined" "$L.log"
     exit 1
 fi
-LD_LIBRARY_PATH="$L"; export LD_LIBRARY_PATH
+# Каталог net1 — для копий плагинов вне раскладки (заглушки STEER_MODULE_DIR ниже): у самих плагинов
+# в раскладке библиотека находится по RUNPATH $ORIGIN/../../net1/lib.
+LD_LIBRARY_PATH="$L:$L/plugins/net1/lib"; export LD_LIBRARY_PATH
+N1SO="$L/plugins/net1/lib/libs2p-net.so.1"
 SO="$L/libsteer.so.$VER"; WSO="$L/libsteer-wolfssl.so.$WVER"
 
 # ---- списки экспорта и таблица символов -----------------------------------------------------
@@ -73,11 +76,19 @@ if command -v nm >/dev/null 2>&1; then
     wwant="$(sed -n 's/^ *\([A-Za-z_0-9]*\);$/\1/p' build/wolfssl/libsteer-wolfssl.map | sort)"
     whave="$(nm -D --defined-only "$WSO" | awk '$2 ~ /^[TDBRVW]$/ {sub(/@.*/, "", $3); print $3}' | sort)"
     check "в .dynsym libsteer-wolfssl — ровно список её карты" "$wwant" "$whave"
-    for m in steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2; do
-        check "$m: в модуле нет failover.c (маршрут ставит демон)" "0" \
-            "$(nm "$L/$m" 2>/dev/null | grep -c ' bind_device$\| table_bind$')"
-        check "$m: в модуле нет разбора спеки (модель — в libsteer)" "0" \
-            "$(nm "$L/$m" 2>/dev/null | grep -c ' load_spec$\| v2_parse')"
+    # Раскладка 2.1: стек протоколов ушёл из ядра в net1 (build/sources.mk, «РАСКЛАДКА 2.1»).
+    check "в libsteer нет стека TUN, транспортов и разбора ссылок узлов" "0" \
+        "$(printf '%s\n' "$have" | grep -c '^pool_run$\|^stack_run$\|^transport_open$\|^tun_open$\|^sl_link_parse$')"
+    check "  а TLS, QUIC и HTTP/2 для себя ядро держит" "4" \
+        "$(printf '%s\n' "$have" | grep -c '^tls13_read$\|^qc_open$\|^h2_read$\|^tls_cert_roots$')"
+    n1want="$(sed -n 's/^ *\([A-Za-z_0-9]*\);$/\1/p' build/net1/libs2p-net.map | sort)"
+    n1have="$(nm -D --defined-only "$N1SO" | awk '$2 ~ /^[TDBRVW]$/ {sub(/@.*/, "", $3); print $3}' | sort)"
+    check "в .dynsym net1 — ровно карта build/net1/libs2p-net.map" "$n1want" "$n1have"
+    check "  и все имена — s2p_*: ни wolfSSL, ни ngtcp2, ни имён ядра" "0" \
+        "$(printf '%s\n' "$n1have" | grep -vc '^s2p_')"
+    for m in vless hysteria2 proxy xsteer warpbox obfs; do
+        check "плагин $m: в нём нет failover.c (маршрут ставит демон)" "0" \
+            "$(nm "$L/plugins/$m/bin/$m" 2>/dev/null | grep -c ' bind_device$\| table_bind$')"
     done
 else
     echo "libs-test: nm нет — таблицы символов не проверены (ПРОПУСК этих проверок)"
@@ -89,10 +100,19 @@ if command -v readelf >/dev/null 2>&1; then
         "$(readelf -d "$WSO" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')"
     check "libsteer зависит от libsteer-wolfssl" "libsteer-wolfssl.so.$WVER" \
         "$(readelf -d "$SO" | sed -n 's/.*Shared library: \[\(libsteer[^]]*\)\]/\1/p')"
-    for m in steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steerd; do
-        check "$m: из нашего только libsteer.so.$VER" "libsteer.so.$VER" \
-            "$(readelf -d "$L/$m" | sed -n 's/.*Shared library: \[\(libsteer[^]]*\)\]/\1/p')"
+    ours() { readelf -d "$1" | sed -n 's/.*Shared library: \[\(lib\(steer\|s2p\)[^]]*\)\]/\1/p' | tr '\n' ' ' | sed 's/ $//'; }
+    for m in steer-tgws steerd; do
+        check "$m: из нашего только libsteer.so.$VER" "libsteer.so.$VER" "$(ours "$L/$m")"
     done
+    check "SONAME net1 — по major ABI" "libs2p-net.so.1" \
+        "$(readelf -d "$N1SO" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')"
+    check "  net1 ни с чем нашим не связан" "" "$(ours "$N1SO")"
+    for m in vless hysteria2 proxy xsteer warpbox; do
+        check "плагин $m: из нашего только libs2p-net.so.1, RUNPATH \$ORIGIN/../../net1/lib" \
+            'libs2p-net.so.1|$ORIGIN/../../net1/lib' \
+            "$(ours "$L/plugins/$m/bin/$m")|$(readelf -d "$L/plugins/$m/bin/$m" | sed -n 's/.*R[UN]*PATH.*\[\(.*\)\]/\1/p')"
+    done
+    check "плагин obfs ни с чем нашим не связан" "" "$(ours "$L/plugins/obfs/bin/obfs")"
 fi
 
 # ---- команды модулей через steerd ----------------------------------------------------------
@@ -371,13 +391,41 @@ $CC -shared -fPIC -o "$bad/libsteer-wolfssl.so.$WVER" "$bad/abi.c" \
     -Wl,--whole-archive "$WLIB" -Wl,--no-whole-archive -Wl,-soname,"libsteer-wolfssl.so.$WVER" \
     -Wl,--version-script=build/wolfssl/libsteer-wolfssl.map -Wl,--gc-sections \
     -lpthread -lm > "$bad/build.log" 2>&1
-o="$(LD_LIBRARY_PATH="$bad" "$L/steer-vless" vless x --spec /nonexistent 2>&1)"; r=$?
+# Протоколы с libsteer больше не связаны — сверку показывает модуль steer-tgws (мост ещё модуль).
+o="$(LD_LIBRARY_PATH="$bad" "$L/steer-tgws" tgws x --spec /nonexistent 2>&1)"; r=$?
 check "libsteer-wolfssl другой сборки: процесс не стартует, код 3" "3" "$r"
 check "  и строка называет причину и лечение" "1" \
     "$(printf '%s' "$o" | grep -c 'другой сборки.*обновите пакеты libsteer и libsteer-wolfssl вместе')"
 # Настоящая библиотека — проходит (модуль отвечает своим отказом про спеку, а не про библиотеку).
-o="$("$L/steer-vless" vless x --spec /nonexistent 2>&1)"
+o="$("$L/steer-tgws" tgws x --spec /nonexistent 2>&1)"
 check "настоящая libsteer-wolfssl: сверка молчит" "0" "$(printf '%s' "$o" | grep -c 'другой сборки')"
+
+# ---- ABI net1 (src/net1/s2pnet.h, s2pcheck.c) ------------------------------------------------------
+# Плагин сверяет net1 при запуске: minor не меньше своего и тот же отпечаток раскладки структур.
+# Подмена — LD_PRELOAD с другой s2p_net_abi (ссылка плагина берёт первую в порядке поиска).
+mkdir -p "$L/n1abi"
+n1fake() {  # ИМЯ MINOR ДОБАВКА-К-ОТПЕЧАТКУ
+    printf '%s\n' '#include "s2pnet.h"' \
+        'const struct s2p_net_abi *s2p_net_abi(void) {' \
+        '    static struct s2p_net_abi a;' \
+        "    a.size = sizeof(a); a.major = S2P_NET_ABI_MAJOR; a.minor = $2;" \
+        "    a.fingerprint = s2p_net_fingerprint_calc() + $3; a.version = \"0.0.0-$1\";" \
+        '    return &a;' '}' > "$L/n1abi/$1.c"
+    # shellcheck disable=SC2046
+    $CC -shared -fPIC -w $(for d in $(profile_var INC_DIRS); do printf -- '-I%s ' "$d"; done) \
+        -o "$L/n1abi/$1.so" "$L/n1abi/$1.c" > "$L/n1abi/$1.log" 2>&1
+}
+. build/sources.sh
+n1fake minor "S2P_NET_ABI_MINOR - 1" 0
+n1fake fp S2P_NET_ABI_MINOR 1
+o="$(LD_PRELOAD="$L/n1abi/minor.so" "$L/steer-vless" vless-nodes /nonexistent 2>&1)"; r=$?
+check "net1 меньшего minor: плагин не стартует, код 2 и «обновите net1»" "2 1" \
+    "$r $(printf '%s' "$o" | grep -c 'net1 0.0.0-minor (ABI 1\.[0-9]*), а плагин собран для ABI .*обновите net1')"
+o="$(LD_PRELOAD="$L/n1abi/fp.so" "$L/steer-hysteria2" hysteria2-nodes /nonexistent 2>&1)"; r=$?
+check "net1 с другой раскладкой структур: код 2 и «другой раскладкой»" "2 1" \
+    "$r $(printf '%s' "$o" | grep -c 'другой раскладкой структур')"
+o="$("$L/steer-vless" vless-nodes /nonexistent 2>&1)"
+check "настоящая net1: сверка молчит" "0" "$(printf '%s' "$o" | grep -c 'net1')"
 
 # ---- QUIC в раскладке пакета (шаг 7) ---------------------------------------------------------------
 # Клиент замера (tests/qcbench.c — он же «потребитель», чьи символы дали qc_* в списке экспорта)
