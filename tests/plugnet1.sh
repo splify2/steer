@@ -157,6 +157,10 @@ if [ "${QEMU:-0}" = 1 ]; then
         mkdir -p "$W/q/core" "$W/q/plugins"
         cp "$ML/steerd" "$ML"/libsteer.so.* "$ML"/libsteer-wolfssl.so.* "$W/q/core/"
         cp -R "$ML/plugins/." "$W/q/plugins/"
+        for q in $(ls "$W/q/plugins"); do
+            cp -R "plugins/$q/." "$W/q/plugins/$q/"
+            sed -i "s/\"@VERSION@\"/\"$VER\"/" "$W/q/plugins/$q/plugin.json"
+        done
         cp "$W/sub.txt" "$W/hy.txt" "$W/q/"
         sed "s#$W/#/tmp/plugnet1/#g" "$W/etc/spec.yaml" > "$W/q/spec.yaml"
         tar -C "$W/q" -czf "$W/q.tgz" .
@@ -164,14 +168,14 @@ if [ "${QEMU:-0}" = 1 ]; then
         sh "$VMR" put "$W/q.tgz" /tmp/plugnet1/q.tgz >/dev/null 2>&1
         R="$(sh "$VMR" ssh 'cd /tmp/plugnet1 && tar -xzf q.tgz && Q=/tmp/plugnet1 &&
             echo "direct:$(plugins/vless/bin/vless vless-nodes $Q/sub.txt 2>&1 | grep -c "\"name\":\"B\"")" &&
-            echo "core:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGIN_DIR=$Q/plugins core/steerd vless-nodes $Q/sub.txt 2>&1 | grep -c "\"name\":\"B\"")" &&
-            echo "none:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGIN_DIR=/nonexistent core/steerd vless-nodes $Q/sub.txt 2>&1 | grep -c "нужен пакет steer-vless")" &&
-            echo "apply:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGIN_DIR=$Q/plugins core/steerd apply --dry-run --spec $Q/spec.yaml --state-dir $Q/st 2>&1 | grep -c "требует пакет\|нужен плагин")" &&
+            echo "core:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGIN_DIR=$Q/plugins STEER_PLUGINS_ROOT=$Q/plugins STEER_PLUGINS_ETC=$Q/petc core/steerd vless-nodes $Q/sub.txt 2>&1 | grep -c "\"name\":\"B\"")" &&
+            echo "none:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGIN_DIR=/nonexistent STEER_PLUGINS_ROOT=/nonexistent core/steerd vless-nodes $Q/sub.txt 2>&1 | grep -c "нужен пакет steer-vless\|нужен плагин vless")" &&
+            echo "apply:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGIN_DIR=$Q/plugins STEER_PLUGINS_ROOT=$Q/plugins STEER_PLUGINS_ETC=$Q/petc core/steerd apply --dry-run --spec $Q/spec.yaml --state-dir $Q/st 2>&1 | grep -c "требует пакет\|нужен плагин")" &&
             echo "hy2:$(plugins/hysteria2/bin/hysteria2 hysteria2-nodes $Q/hy.txt 2>&1 | grep -c "\"name\":\"H\"")" &&
             echo "ldd:$(ldd plugins/vless/bin/vless 2>&1 | grep -c "net1/lib/libs2p-net.so.1")"' 2>&1)"
         for k in "direct:1:плагин vless на OpenWrt: перечень узлов, net1 по RUNPATH (musl \$ORIGIN)" \
                  "core:1:steerd на OpenWrt исполняет плагин из каталога плагинов" \
-                 "none:1:без каталога плагинов — «нужен пакет steer-vless»" \
+                 "none:1:без каталога плагинов — «нужен пакет/плагин vless»" \
                  "apply:0:спека с vless и hysteria2 принимается ядром с плагинами (без «нужен плагин»)" \
                  "hy2:1:плагин hysteria2 на OpenWrt: перечень узлов" \
                  "ldd:1:загрузчик musl берёт net1 из каталога плагинов"; do
