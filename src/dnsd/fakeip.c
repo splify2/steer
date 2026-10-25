@@ -611,8 +611,8 @@ void dch_del(size_t i, const char *domain, uint32_t addr_host) {
     if (!g_dch[i].composite) {
         uint32_t k_net = htonl(addr_host);
         int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_dch[i].set,
-                                 &k_net, g_nft_sets_interval, NULL, 0);
-        if (drc == -ENOENT && g_nft_sets_interval) {
+                                 &k_net, 1, NULL, 0);
+        if (drc == -ENOENT) {
             uint8_t lo[4], hi[4];
             pool_bounds4(lo, hi);
             drc = nft_elem_carve(g_dch[i].set, (const uint8_t *)&k_net, 4, lo, hi);
@@ -651,9 +651,8 @@ void dch_del6(size_t i, const char *domain, const uint8_t addr[16]) {
     char s6[80];
     dch_set6_name(i, s6, sizeof(s6));
     if (!g_dch[i].composite) {
-        int drc = nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_table, s6, addr,
-                                  g_nft_sets_interval, NULL, 0);
-        if (drc == -ENOENT && g_nft_sets_interval) {
+        int drc = nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_table, s6, addr, 1, NULL, 0);
+        if (drc == -ENOENT) {
             uint8_t lo[16], hi[16];
             pool_bounds6(lo, hi);
             drc = nft_elem_carve(s6, addr, 16, lo, hi);
@@ -747,10 +746,10 @@ static void fakeip_entry_unroute(const struct fakeip_entry *e) {
         if (chm_has(e->sets6, i)) dch_del6(i, e->domain, f6);
     if (e->real_host || e->real_saved) {
         uint32_t k = htonl(e->addr);
-        nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_map_table, g_fakeip_map, &k, 0, NULL, 0);
+        nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_fakeip_map, &k, 0, NULL, 0);
     }
     if (e->has_real6 || e->has_real6_saved)
-        nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_map6_table, g_fakeip6_map, f6, 0, NULL, 0);
+        nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_table, g_fakeip6_map, f6, 0, NULL, 0);
 }
 
 void fakeip_pool_reset(void) {
