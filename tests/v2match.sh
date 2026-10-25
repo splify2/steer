@@ -167,20 +167,41 @@ if [ -x "$XK" ]; then
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec arch2.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "ещё не поддерживается в этой версии ядра steer"; then ok; else
         bad "пример раздела 3 — отказ «ещё не поддерживается»" "$out"; fi
-    # balance и IPv6: член без IPv6 (VLESS) — группа без IPv6; её IPv6 первым правилом цепочки
-    # уходит в метку группы, а forward_v6 его отвергает (отказ, а не часть соединений мимо туннеля).
-    printf 'version: 2\noutputs:\n  a: { kind: interface, device: wg0 }\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl }\n  bal: { kind: group, pick: balance, members: [a, nl] }\nrules:\n  - { to: all, out: bal }\n' > "$tmp/bal6.yaml"
+    # balance и IPv6: член без IPv6 (VLESS с `ipv6: off`; сам VLESS IPv6 несёт) — группа без IPv6; её IPv6
+    # первым правилом цепочки уходит в метку группы, а forward_v6 его отвергает (отказ, а не часть
+    # соединений мимо туннеля).
+    printf 'version: 2\noutputs:\n  a: { kind: interface, device: wg0 }\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, ipv6: off }\n  bal: { kind: group, pick: balance, members: [a, nl] }\nrules:\n  - { to: all, out: bal }\n' > "$tmp/bal6.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec bal6.yaml --state-dir "$tmp/state" 2>&1)"
     bm="$(echo "$out" | grep -o 'goto bal_[0-9]*' | head -n 1 | cut -d_ -f2)"
     if [ -n "$bm" ] && echo "$out" | grep -q "meta nfproto ipv6 goto mark_$bm comment \"steer-balance-v6:bal\"" &&
        echo "$out" | grep -q 'reject with icmpx type admin-prohibited comment "steer-v6drop:bal"'; then ok; else
         bad "balance с членом без IPv6 — IPv6 группы в отказ" "$(echo "$out" | grep -E 'bal_|v6' | head -n 8)"; fi
     # by: site с членом без IPv6 — хеш только по IPv4, IPv6 группы — тот же отказ.
-    printf 'version: 2\noutputs:\n  a: { kind: interface, device: wg0 }\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl }\n  bal: { kind: group, pick: balance, by: site, members: [a, nl] }\nrules:\n  - { to: all, out: bal }\n' > "$tmp/bal6s.yaml"
+    printf 'version: 2\noutputs:\n  a: { kind: interface, device: wg0 }\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, ipv6: off }\n  bal: { kind: group, pick: balance, by: site, members: [a, nl] }\nrules:\n  - { to: all, out: bal }\n' > "$tmp/bal6s.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec bal6s.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -q 'steer-balance-v6:bal' && echo "$out" | grep -q 'jhash ip daddr mod 120' &&
        ! echo "$out" | grep -q 'jhash ip6'; then ok; else
         bad "by: site с членом без IPv6 — jhash только IPv4" "$(echo "$out" | grep -E 'bal_|jhash|v6' | head -n 8)"; fi
+    # IPv6 через туннель (I-566): VLESS несёт IPv6 — группа balance из интерфейса и VLESS раздаёт и IPv6
+    # (карта v6, без отказа), jhash по ip6 daddr; TCP IPv6 перенаправляется своим правилом.
+    printf 'version: 2\noutputs:\n  a: { kind: interface, device: wg0 }\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl }\n  bal: { kind: group, pick: balance, by: site, members: [a, nl] }\nrules:\n  - { to: all, out: bal }\n' > "$tmp/bal6t.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec bal6t.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -q 'jhash ip6 daddr mod 120' && ! echo "$out" | grep -q 'steer-v6drop:bal'; then ok; else
+        bad "balance из интерфейса и VLESS (оба несут IPv6): IPv6 раздаётся картой, отказа нет" "$(echo "$out" | grep -E 'bal_|jhash|v6' | head -n 8)"; fi
+    printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl }\nlists:\n  p: { prefixes_file: [lists/dc.lst] }\nrules:\n  - { to: [p], out: nl }\n' > "$tmp/redir6.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec redir6.yaml --state-dir "$tmp/state" 2>&1)"
+    n4="$(echo "$out" | grep 'steer-tcp-redir' | grep -c 'ip protocol tcp meta mark and 0x0ff00000 @tcp_redir fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
+    n6="$(echo "$out" | grep 'steer-tcp-redir' | grep -c 'meta nfproto ipv6 meta l4proto tcp meta mark and 0x0ff00000 @tcp_redir fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
+    if [ "$n4 $n6" = "2 2" ]; then ok; else
+        bad "VLESS: перенаправление TCP — правило IPv4 и правило IPv6 на prerouting и output" "$n4 $n6"; fi
+    printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, ipv6: off }\nlists:\n  p: { prefixes_file: [lists/dc.lst] }\nrules:\n  - { to: [p], out: nl }\n' > "$tmp/redir6off.yaml"
+    out="$(cd "$tmp" && "$XKA" apply --dry-run --spec redir6off.yaml --state-dir "$tmp/state" 2>&1)"
+    if echo "$out" | grep -q 'steer-tcp-redir' && ! echo "$out" | grep 'steer-tcp-redir' | grep -q 'nfproto ipv6'; then ok; else
+        bad "VLESS с ipv6: off: правила перенаправления IPv6 нет" "$(echo "$out" | grep 'steer-tcp-redir' | head -n 4)"; fi
+    printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, ipv6: nat }\n' > "$tmp/s.yaml"
+    out="$("$XKA" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"; rc=$?
+    if [ "$rc" = 2 ] && echo "$out" | grep -qF "у kind: vless есть только off"; then ok; else
+        bad "ipv6: nat у туннеля — отказ «есть только off»" "код $rc: $out"; fi
     # hysteria2 (модуль steer-hysteria2): туннель по подписке, ключи как у vless, но без transport;
     # convert — неподвижная точка; `kind: hysteria2` в v2 — отказ с подсказкой.
     printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, nodes: [1, 0] }\n' > "$tmp/hy1.yaml"

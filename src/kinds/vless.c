@@ -163,7 +163,7 @@ int out_node_named(const struct output *o) {
 const struct kind_ops kind_vless = {
     .name = "vless",
     .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER |
-            KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP | KC_TCP_REDIR,
+            KC_SKIP_ZAPRET | KC_TCP_PROBE | KC_FLOW_UDP | KC_TCP_REDIR | KC_IPV6,
     .keys = KK_NODES | KK_SUB,
     /* Сюда попадает выход без masquerade, которому он и не нужен, — для него это норма
      * (см. out_self_natting и проверку «output» в diag.c). */

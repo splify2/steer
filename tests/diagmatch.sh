@@ -152,13 +152,13 @@ check "список без резолверов: молчим" "" "$(printf '%s'
 # проверок у них ОДИНАКОВ — то есть vless больше не порождает заметок про самого себя.
 check "отчёт с vless разбираем" "1" \
       "$([ "$(printf '%s' "$outv" | count)" -gt 0 ] && echo 1 || echo 0)"
-# Единственное, что у vless своё, — заметка ipv6_output (1.9): IPv6 его правил отбрасывается, а не
-# идёт напрямую. Это свойство вида, а не заметка про самого себя, и она совет (note), а не warn.
-check "vless не добавляет своих заметок (кроме ipv6_output)" \
-      "$(printf '%s' "$out" | count)" "$(($(printf '%s' "$outv" | count) - 1))"
-check "  ipv6_output у vless — совет, а не предупреждение" "note" \
-      "$(printf '%s' "$outv" | verdict ipv6_output)"
-check "  у интерфейса (IPv6 есть) её нет" "" "$(printf '%s' "$out" | verdict ipv6_output)"
+# У vless своих заметок нет. Была ipv6_output (1.9: IPv6 его правил отбрасывается, а не идёт напрямую), но
+# с 2.1.0 туннель несёт IPv6 (стек src/tunnel, D-S3.1), и заметка у него не печатается: она — про выход,
+# который IPv6 не несёт (xsteer, tgws, `ipv6: off`).
+check "vless не добавляет своих заметок" \
+      "$(printf '%s' "$out" | count)" "$(printf '%s' "$outv" | count)"
+check "  ipv6_output у vless нет — IPv6 он несёт" "" "$(printf '%s' "$outv" | verdict ipv6_output)"
+check "  у интерфейса её тоже нет" "" "$(printf '%s' "$out" | verdict ipv6_output)"
 
 # ---- подъём выхода vless: перебор узлов больше не выглядит отказом (I-100) ----
 # Устройство туннеля vless появляется только ПОСЛЕ выбора узла, а при `node: -1` выбор — это
