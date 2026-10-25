@@ -3219,6 +3219,49 @@ static void t_v6(void) {
               "VLESS: адрес не из четырёх и не из шестнадцати байт — отказ");
     }
 
+    /* Поддельный IPv6 (fdfe:dcba:9876::/96, младшие 32 бита — поддельный IPv4 той же записи): настоящий адрес
+     * из fakeip.state, четвёртое поле. Карты ядра у стенда нет — работает запасной путь. */
+    {
+        char dir[] = "/tmp/tunnelmatch-fake6.XXXXXX";
+        if (mkdtemp(dir)) {
+            char path[128];
+            snprintf(path, sizeof path, "%s/fakeip.state", dir);
+            FILE *f = fopen(path, "w");
+            if (f) {
+                fputs("a.test\t198.18.0.5\t104.20.1.1\t2606:4700::1111\n"
+                      "b.test\t198.18.0.6\t-\t2606:4700::2222\n"
+                      "c.test\t198.18.0.7\t1.2.3.4\n", f);
+                fclose(f);
+            }
+            steer_set_state_dir(dir);
+            uint8_t f6[16], r6[16], want[16];
+            check(!fake6_is(V6_SRV), "IPv6: обычный адрес не из пула fake-IP");
+            inet_pton(AF_INET6, "fdfe:dcba:9876::c612:5", f6);
+            inet_pton(AF_INET6, "2606:4700::1111", want);
+            check(fake6_is(f6) && fake_real6(f6, r6) && !memcmp(r6, want, 16),
+                  "fake-IP IPv6: поддельный fdfe:dcba:9876::c612:5 → настоящий IPv6 из четвёртого поля fakeip.state");
+            inet_pton(AF_INET6, "fdfe:dcba:9876::c612:6", f6);
+            inet_pton(AF_INET6, "2606:4700::2222", want);
+            check(fake_real6(f6, r6) && !memcmp(r6, want, 16),
+                  "fake-IP IPv6: запись без настоящего IPv4 («-») тоже даёт настоящий IPv6");
+            inet_pton(AF_INET6, "fdfe:dcba:9876::c612:7", f6);
+            check(!fake_real6(f6, r6), "fake-IP IPv6: у записи без IPv6 (три поля) настоящего IPv6 нет");
+            inet_pton(AF_INET6, "fdfe:dcba:9876::c612:99", f6);
+            check(!fake_real6(f6, r6), "fake-IP IPv6: неизвестный поддельный адрес — не найден");
+            uint32_t fk5, fk6, fk7;
+            inet_pton(AF_INET, "198.18.0.5", &fk5);
+            inet_pton(AF_INET, "198.18.0.6", &fk6);
+            inet_pton(AF_INET, "198.18.0.7", &fk7);
+            uint32_t rl5, rl7;
+            inet_pton(AF_INET, "104.20.1.1", &rl5);
+            inet_pton(AF_INET, "1.2.3.4", &rl7);
+            check(fake_real(fk5) == rl5 && fake_real(fk7) == rl7 && fake_real(fk6) == 0,
+                  "fake-IP IPv4 с четырёхпольным файлом: настоящие адреса прежние, у записи «-» его нет");
+            unlink(path);
+            rmdir(dir);
+        }
+    }
+
     /* Целый путь пакета: UDP IPv6 из устройства создаёт поток с ключом IPv6 (дайлер подменён). */
     l = pkt6(p, V6_CLI, V6_SRV, 17, 5353, 53, 40);
     g_now_ns = now_ns();
@@ -3421,6 +3464,68 @@ static void t_accept_emfile(void) {
     close(l);
 }
 
+/* IPv6 (I-566): слушатель модуля — сокет двойного стека. На петле приходят и клиент IPv6 (::1), и клиент IPv4
+ * (127.0.0.1, адрес ::ffff:127.0.0.1); назначение у ядра (conntrack) стенду недоступно, поэтому проверяется то, что
+ * видит kaccept_fd до этого: семейство клиента и разбор адреса. Без IPv6 на петле — пропуск вслух. */
+static void t_listen_dual(void) {
+    int save_port = g_kport;
+    int probe = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in pa = { .sin_family = AF_INET };
+    pa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t pl = sizeof pa;
+    if (probe < 0 || bind(probe, (struct sockaddr *)&pa, sizeof pa) != 0 ||
+        getsockname(probe, (struct sockaddr *)&pa, &pl) != 0) { check(0, "двойной стек: стенд — порт"); return; }
+    g_kport = ntohs(pa.sin_port);
+    close(probe);
+    int l = klisten_open();
+    if (l < 0) { check(0, "двойной стек: слушатель встал"); g_kport = save_port; return; }
+    struct sockaddr_in6 sa6 = { .sin6_family = AF_INET6, .sin6_port = htons((uint16_t)g_kport), .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    int c6 = socket(AF_INET6, SOCK_STREAM, 0);
+    if (c6 < 0 || connect(c6, (struct sockaddr *)&sa6, sizeof sa6) != 0) {
+        printf("%-72s %s\n", "двойной стек: на петле нет IPv6 — проверка клиента IPv6 пропущена", "пропуск");
+        if (c6 >= 0) close(c6);
+        c6 = -1;
+    }
+    struct sockaddr_in sa4 = { .sin_family = AF_INET, .sin_port = htons((uint16_t)g_kport) };
+    sa4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int c4 = socket(AF_INET, SOCK_STREAM, 0);
+    int ok4 = c4 >= 0 && connect(c4, (struct sockaddr *)&sa4, sizeof sa4) == 0;
+    check(ok4, "двойной стек: клиент IPv4 (127.0.0.1) подключился к слушателю IPv6");
+    int got4 = 0, got6 = 0;
+    for (int i = 0; i < 2; i++) {
+        struct pollfd pf = { .fd = l, .events = POLLIN };
+        int a = poll(&pf, 1, 500) > 0 ? accept(l, NULL, NULL) : -1;   /* очередь ядра пополняется не мгновенно */
+        if (a < 0) break;
+        struct sockaddr_storage ps;
+        socklen_t psl = sizeof ps;
+        getpeername(a, (struct sockaddr *)&ps, &psl);
+        const struct sockaddr_in6 *p6 = (const struct sockaddr_in6 *)&ps;
+        if (ps.ss_family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&p6->sin6_addr)) got4++;
+        else if (ps.ss_family == AF_INET6 && IN6_IS_ADDR_LOOPBACK(&p6->sin6_addr)) got6++;
+        close(a);
+        if (c6 < 0) break;
+    }
+    check(got4 == 1 && (c6 < 0 || got6 == 1),
+          "двойной стек: клиент IPv4 приходит адресом ::ffff:127.0.0.1, клиент IPv6 — своим адресом ::1");
+    /* kaccept_fd без перенаправления (назначения у ядра нет) закрывает соединение и не падает — для обоих. */
+    if (c6 >= 0) close(c6);
+    close(c4);
+    int c4b = socket(AF_INET, SOCK_STREAM, 0);
+    if (c4b >= 0 && connect(c4b, (struct sockaddr *)&sa4, sizeof sa4) == 0) {
+        int live0 = g_live_n;
+        struct pollfd pf = { .fd = l, .events = POLLIN };
+        poll(&pf, 1, 500);
+        kaccept(l, &g_tun);
+        char b;
+        ssize_t rd = recv(c4b, &b, 1, 0);
+        check(g_live_n == live0 && rd == 0,
+              "двойной стек: прямое подключение к порту модуля (без перенаправления) закрывается сразу, соединения нет");
+        close(c4b);
+    }
+    close(l);
+    g_kport = save_port;
+}
+
 /* I-535: проба кандидатов наперегонки. Мёртвые узлы молчат до срока (здесь 2 с — вместо 8), живой отвечает
  * за 50 мс. Последовательный перебор отдал бы 4 × 2 с + 50 мс, гонка — задержку запуска пятого (4 × 250 мс). */
 struct race_t { int alive_from; int alive_ms; int dead_ms; };
@@ -3491,6 +3596,7 @@ int main(void) {
     t_race();
     t_tun_wq();
     t_accept_emfile();
+    t_listen_dual();
     t_table_grow();
     t_tcp_tun_rst();
     t_bring_up_table();

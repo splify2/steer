@@ -14,11 +14,21 @@ table inet steer_stand_redir {
 }
 NFT
 }
+# IPv6 — правилом своего семейства, как у демона (generate.c: build_tcp_redir): в таблице inet `ip protocol` смотрит
+# только IPv4. Правило IPv6 безвредно там, где IPv6 нет, поэтому ставится всегда.
 redir_dev() {
     redir_table "$1" && ip netns exec "$1" nft add rule inet steer_stand_redir out oifname "\"$2\"" \
-        ip protocol tcp counter redirect to :"${3:-9480}"
+        ip protocol tcp counter redirect to :"${3:-9480}" &&
+    ip netns exec "$1" nft add rule inet steer_stand_redir out oifname "\"$2\"" \
+        meta nfproto ipv6 meta l4proto tcp counter redirect to :"${3:-9480}"
 }
+# Подсеть IPv6 (в записи есть «:») ловится правилом IPv6, иначе IPv4.
 redir_dst() {
-    redir_table "$1" && ip netns exec "$1" nft add rule inet steer_stand_redir pre ip daddr "$2" \
-        ip protocol tcp counter redirect to :"${3:-9480}"
+    redir_table "$1" || return 1
+    case "$2" in
+    *:*) ip netns exec "$1" nft add rule inet steer_stand_redir pre ip6 daddr "$2" \
+             meta l4proto tcp counter redirect to :"${3:-9480}" ;;
+    *)   ip netns exec "$1" nft add rule inet steer_stand_redir pre ip daddr "$2" \
+             ip protocol tcp counter redirect to :"${3:-9480}" ;;
+    esac
 }
