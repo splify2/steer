@@ -660,3 +660,65 @@ int hy2_worker_busy(uint64_t bytes, uint64_t ms, uint64_t share_bps) {
     mul64(share_bps, ms, &rh, &rl);
     return lh > rh || (lh == rh && ll >= rl);
 }
+
+/* ---- сборка фрагментов ---- */
+
+struct hy2_rasm {
+    struct hy2_rasm *next;
+    uint64_t t;                 /* когда пришёл первый фрагмент */
+    uint32_t total;             /* сумма длин пришедших */
+    uint16_t pkt;
+    uint8_t n, got;
+    struct { uint8_t *p; uint16_t len; } fr[];
+};
+
+static void rasm_free_one(struct hy2_rasm *r) {
+    for (unsigned i = 0; i < r->n; i++) free(r->fr[i].p);
+    free(r);
+}
+
+void hy2_rasm_free(struct hy2_rasm **head) {
+    while (*head) {
+        struct hy2_rasm *r = *head;
+        *head = r->next;
+        rasm_free_one(r);
+    }
+}
+
+uint8_t *hy2_rasm_feed(struct hy2_rasm **head, const struct hy2_udp_msg *m, uint64_t now_ms, size_t pre,
+                       size_t *total) {
+    if (!m->nfrag || m->frag >= m->nfrag) return NULL;
+    struct hy2_rasm *r = NULL, **pp = head;
+    while (*pp) {
+        struct hy2_rasm *c = *pp;
+        if (c->pkt == m->pkt && c->n == m->nfrag) { r = c; pp = &c->next; continue; }
+        if (now_ms - c->t > HY2_RASM_TTL_MS) { *pp = c->next; rasm_free_one(c); continue; }
+        pp = &c->next;
+    }
+    if (!r) {
+        r = calloc(1, sizeof *r + (size_t)m->nfrag * sizeof r->fr[0]);
+        if (!r) return NULL;
+        r->t = now_ms;
+        r->pkt = m->pkt;
+        r->n = m->nfrag;
+        r->next = *head;
+        *head = r;
+    }
+    if (r->fr[m->frag].p) return NULL;                  /* повтор фрагмента */
+    r->fr[m->frag].p = malloc(m->n ? m->n : 1);
+    if (!r->fr[m->frag].p) return NULL;
+    memcpy(r->fr[m->frag].p, m->data, m->n);
+    r->fr[m->frag].len = (uint16_t)m->n;
+    r->total += (uint32_t)m->n;
+    if (++r->got < r->n) return NULL;
+    for (pp = head; *pp != r; pp = &(*pp)->next) {}
+    *pp = r->next;
+    uint8_t *blk = r->total <= 65507 ? malloc(pre + r->total) : NULL;   /* больше датаграммы UDP по IPv4 не бывает */
+    if (blk) {
+        size_t t = pre;
+        for (unsigned i = 0; i < r->n; i++) { memcpy(blk + t, r->fr[i].p, r->fr[i].len); t += r->fr[i].len; }
+        *total = r->total;
+    }
+    rasm_free_one(r);
+    return blk;
+}

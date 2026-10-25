@@ -73,6 +73,7 @@
 #include "dialer.h"
 #include "hy2conn.h"
 #include "quic.h"
+#include "tun.h"
 
 #define LOG_W2 "steer[warn]: "
 #define LOG_I2 "steer[info]: "
@@ -115,11 +116,6 @@
  * нарушителя закрывает ngtcp2, и если очередь всё же вышла за окно, это ошибка счёта кредита —
  * такой поток закрывается с числами в журнале, а не растит память. */
 #define PEND_MAX(h)    ((h)->stream_win + (1u << 20))
-#define RSLOT       1400        /* место под фрагмент UDP при сборке */
-/* Фрагментов одной датаграммы UDP от сервера — не больше 64: датаграмма UDP не длиннее 65535
- * байт, а фрагмент несёт до RSLOT байт, так что 64 покрывают протокол целиком; заявленное
- * сервером большее число — испорченный кадр, он отбрасывается (on_datagram). Свойство протокола. */
-#define RFRAG_MAX   64
 #define AUTH_S      10          /* срок ответа на авторизацию */
 #define RETRY_MS    1000
 #define BG_MAX_MS   30000       /* потолок паузы между попытками поднять упавшее соединение */
@@ -144,16 +140,17 @@ struct udg {
     uint8_t d[];
 };
 
-/* Что нужно только потоку UDP: адрес назначения для заголовка, счётчик пакетов и сборка фрагментов. */
+/* Что нужно только потоку UDP: адрес назначения для заголовка, счётчик пакетов и сборки фрагментов. */
 struct hy2_udpx {
     char addr[48];              /* «хост:порт» назначения */
     uint16_t pkt;               /* счётчик пакетов UDP */
-    uint16_t rpkt;
-    uint8_t rgot, rn;
-    uint16_t rlen[RFRAG_MAX];
-    uint8_t rseen[RFRAG_MAX];
-    uint8_t *rbuf;
+    struct hy2_rasm *ras;         /* сборки фрагментов от сервера (hy2wire.h) */
 };
+
+static void udpx_free(struct hy2_udpx *x) {
+    hy2_rasm_free(&x->ras);
+    free(x);
+}
 
 /* Соединение рабочего потока. Всё, кроме pub (под g_mu) и атомарных полей, — только поток рабочего. */
 struct hq {
@@ -721,7 +718,7 @@ static void flow_release(struct hy2_flow *f, int reset) {
     if (f->opening) { f->opening = 0; h->nopen--; }
     free(f->hbuf);
     free(f->up);
-    if (f->ux) { free(f->ux->rbuf); free(f->ux); }
+    if (f->ux) udpx_free(f->ux);
     pend_free(h, f);
     f->hbuf = NULL;
     f->up = NULL;
@@ -1147,29 +1144,16 @@ static void on_datagram(void *u, const uint8_t *d, size_t n) {
     struct hy2_flow *f = usid_find(h, m.sid);
     if (!f || f->state != FL_OPEN) return;
     if (m.nfrag == 1) { udg_push(f, m.data, m.n); return; }
-    if (m.nfrag > RFRAG_MAX || m.n > RSLOT) return;
-    struct hy2_udpx *x = f->ux;
-    if (x->rn != m.nfrag || x->rpkt != m.pkt || !x->rbuf) {
-        if (!x->rbuf) x->rbuf = malloc((size_t)RFRAG_MAX * RSLOT);
-        if (!x->rbuf) return;
-        x->rn = m.nfrag;
-        x->rpkt = m.pkt;
-        x->rgot = 0;
-        memset(x->rseen, 0, sizeof x->rseen);
-    }
-    if (x->rseen[m.frag]) return;
-    memcpy(x->rbuf + (size_t)m.frag * RSLOT, m.data, m.n);
-    x->rlen[m.frag] = (uint16_t)m.n;
-    x->rseen[m.frag] = 1;
-    if (++x->rgot < x->rn) return;
-    /* Собрано: кусочки подряд в один буфер (слоты фиксированные, длины разные). */
+    /* Фрагмент датаграммы: сборка ведётся по packet id, их может идти несколько вперемешку (hy2wire.c). */
     size_t tot = 0;
-    for (unsigned i = 0; i < x->rn; i++) {
-        memmove(x->rbuf + tot, x->rbuf + (size_t)i * RSLOT, x->rlen[i]);
-        tot += x->rlen[i];
-    }
-    x->rn = 0;
-    if (tot <= 65000) udg_push(f, x->rbuf, tot);
+    uint8_t *blk = hy2_rasm_feed(&f->ux->ras, &m, now_ms(), offsetof(struct udg, d), &tot);
+    if (!blk) return;
+    struct udg *ug = (struct udg *)blk;
+    ug->next = NULL;
+    ug->len = (uint32_t)tot;
+    if (f->ut) f->ut->next = ug; else f->uh = ug;
+    f->ut = ug;
+    stack_sess_rx(f);
 }
 
 static void on_closed(void *u, int reason, const char *why) {
