@@ -419,10 +419,9 @@ $(BUILD)/srsunit: tests/srsunit.c tests/unit.h $(MODEL_KINDS) $(CORE_HDR)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/srsunit.c $(MODEL_KINDS)
 
-# Дерево набора правил (src/lib/ir.h): генератор и раскладка старого ядра проверяются
-# запросами к дереву, а не текстом — см. шапку tests/irmatch.c. Модули компилятора линкуются
-# с моделью отдельными объектами (само дерево приходит с моделью, MODEL_SRC). Дважды — роутер
-# и телефон (цепочки на output).
+# Дерево набора правил (src/lib/ir.h): генератор проверяется запросами к дереву, а не текстом —
+# см. шапку tests/irmatch.c. Модули компилятора линкуются с моделью отдельными объектами (само
+# дерево приходит с моделью, MODEL_SRC). Дважды — роутер и телефон (цепочки на output).
 COMPILE_SRC := $(filter-out $(MODEL_SRC),$(filter src/compile/%,$(CORE_SRC)))
 $(BUILD)/irmatch: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KINDS) $(CORE_HDR)
 	@mkdir -p $(BUILD)
