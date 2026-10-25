@@ -246,7 +246,7 @@ int out_is_block(const struct output *o);
  * значения прежнего перечня видов. Читает его kind_of в spec.h. */
 #define KIND_ZERO (&kind_direct)
 
-/* ПРЕЖНИЕ ИМЕНА ВИДОВ — только для стендов (tests/specmatch.c, tests/failovermatch.c), которым
+/* ИМЕНА ВИДОВ ДЛЯ СТЕНДОВ — только для стендов (tests/specmatch.c, tests/failovermatch.c), которым
  * нужно собрать выход конкретного вида, не читая спеку: `g_spec.out[0].kind = OUT_XSTEER`.
  * Общий код вида не сравнивает — он спрашивает kind_of(o)->caps или конкретную функцию вида
  * (out_tgws и соседи ниже). Вне src/kinds и стендов эти имена ловит

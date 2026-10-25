@@ -132,8 +132,7 @@ static int parse_chan_line(const char *buf, size_t from, size_t line_end, struct
                     break;
                 }
                 {
-                    /* Путей у канала — сколько прислал демон (раньше — не больше 64, остальные
-                     * молча отбрасывались). */
+                    /* Путей у канала — сколько прислал демон. */
                     char *p = malloc(flen + 1);
                     if (!p) return -1;
                     memcpy(p, buf + pos, flen);
@@ -201,7 +200,7 @@ static size_t split_fields(const char *buf, size_t from, size_t end, size_t (*f)
     return n;
 }
 
-/* Список адресов через запятую — в кучу по числу записей (раньше — не больше четырёх). */
+/* Список адресов через запятую — в кучу по числу записей. */
 static int list_into(const char *s, size_t n, char (**dst)[46], size_t *cnt) {
     *cnt = 0;
     *dst = NULL;

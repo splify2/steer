@@ -171,7 +171,7 @@ static const struct ynode *item(const struct ynode *n, size_t i) {
 }
 
 /* Число элементов перечня константой не ограничено: массивы под них берутся из арены спеки
- * ровно по n_items (раньше здесь стояло «больше N элементов» с предельным N на каждый ключ). */
+ * ровно по n_items. */
 static int items_ok(struct v2 *x, const struct ynode *n, const char *where) {
     if (n && n->kind == YN_MAP)
         return fail(x, n, "%s — список [a, b] или одно значение, а не отображение", where);
@@ -229,8 +229,8 @@ static int path_of(struct v2 *x, const struct ynode *n, const char *where, const
         return fail(x, n, "%s: каталог файла спеки не определить — относительный путь «%s» не разрешить, "
                     "задайте абсолютный", where, v);
     if (!x->base[0]) return copy_to(x, n, where, v, dst, cap);
-    /* Склейка без промежуточного буфера и без обрезки: прежняя режет каталог до 1039 и путь до 300
-     * байт молча, и файл спеки искался по другому имени (I-543). Не влезло — отказ с числом. */
+    /* Склейка без промежуточного буфера и без обрезки: обрезанный путь молча искал бы файл спеки
+     * по другому имени (I-543). Не влезло — отказ с числом. */
     size_t need = strlen(x->base) + 1 + strlen(v);
     if (need >= cap) return fail(x, n, "%s: путь с каталогом спеки длиннее %zu байт", where, cap - 1);
     size_t bl = strlen(x->base);

@@ -405,7 +405,7 @@ struct group_cfg {
      * по которой выбирает сторож (-1 — не измерен); lat4_ms, lat6_ms — замеры по IPv4 и IPv6,
      * когда группа мерилась по обоим (-2 — по семействам не мерили: lat_ms и есть замер IPv4). */
     int cur;
-    unsigned char *alive;               /* по байту на члена: 1 — жив (раньше маска в 32 бита) */
+    unsigned char *alive;               /* по байту на члена: 1 — жив */
     int sel;
     int *lat_ms;
     int *lat4_ms, *lat6_ms;

@@ -78,7 +78,7 @@ static void fseq(struct flow *w, const char *key, const char *const *v, size_t n
 }
 
 /* Перечень из массива строк одинаковой ширины (`char (*)[stride]` спеки): без промежуточного
- * массива указателей — раньше он лежал на стеке под предельное число записей. */
+ * массива указателей. */
 static void fseq_s(struct flow *w, const char *key, const char *base, size_t stride, size_t n) {
     fk(w, key);
     fputc('[', w->f);
@@ -417,8 +417,7 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
 }
 
 /* Рабочие таблицы печати: имена всех сущностей модели — выходы (именованные и безымянные члены),
- * клиенты, списки. По числу сущностей спеки, а не на предельное число (раньше — статические
- * массивы под 16 + 64 + 64 + 64 имён). */
+ * клиенты, списки. По числу сущностей спеки, а не на предельное число. */
 struct pv2 {
     char (*oname)[32], (*cname)[32], (*lname)[32];
     unsigned char *cshow, *lshow;
