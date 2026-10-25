@@ -40,6 +40,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -202,9 +203,17 @@ static int hook_exec(const struct plugin *pl, const struct plugin_prog *p, const
         dup2(pin[0], 0);
         dup2(pout[1], 1);
         dup2(perr[1], 2);
-        long mx = sysconf(_SC_OPEN_MAX);
-        if (mx < 0 || mx > 65536) mx = 65536;
-        for (int fd = 3; fd < mx; fd++) close(fd);
+        /* Хуку нужны только его три дескриптора: остальные (сокеты демона, файлы) закрываются разом
+         * close_range (ядро 5.9+), а на старом — перебором до RLIMIT_NOFILE. */
+        int closed = 0;
+#ifdef SYS_close_range
+        closed = syscall(SYS_close_range, 3u, ~0u, 0) == 0;
+#endif
+        if (!closed) {
+            long mx = sysconf(_SC_OPEN_MAX);
+            if (mx < 0 || mx > 1048576) mx = 1048576;
+            for (int fd = 3; fd < mx; fd++) close(fd);
+        }
         signal(SIGPIPE, SIG_DFL);
         plugin_env_set(pl, p);
         execv(p->prog, av);
