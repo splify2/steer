@@ -293,7 +293,7 @@ int main(int argc, char **argv) {
          * спеке не пишется), но управляющему слою устройства таких членов нужны так же, как awg, — для
          * зоны фаервола. */
         if (a.kind && !kind_by_name(a.kind) && strcmp(a.kind, kind_warpm.name) != 0)
-            die("--kind: нужен interface, vless, xsteer, zapret или direct, а не %s", a.kind);
+            die("--kind: нужен вид выхода (direct, block, interface, awg, vless, hysteria2, trojan, shadowsocks, socks, http, vmess, xsteer, zapret, tgws, group), а не %s", a.kind);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         for (size_t i = 0; i < cfg.out_n; i++) {
             const char *k = out_kind_name(&cfg.out[i]);
