@@ -63,9 +63,8 @@ struct ynode {
 
 struct ydoc;
 
-/* Разбор файла целиком. NULL — отказ, текст в e->msg (e зануляет вызывающий, как у load_spec). */
-struct ydoc *ydoc_parse_file(const char *path, struct err *e);
-/* Разбор буфера (не обязан кончаться нулём). name — для сообщений, копируется. */
+/* Разбор буфера (не обязан кончаться нулём). name — для сообщений, копируется. NULL — отказ,
+ * текст в e->msg (e зануляет вызывающий, как у load_spec). */
 struct ydoc *ydoc_parse_buf(const char *buf, size_t len, const char *name, struct err *e);
 void ydoc_free(struct ydoc *d);
 
@@ -79,7 +78,6 @@ const struct ynode *ynode_at(const struct ynode *seq, size_t i);
 const struct ynode *ynode_get(const struct ynode *map, const char *key);
 const struct ynode *ynode_key_at(const struct ynode *map, size_t i);     /* в порядке текста */
 const struct ynode *ynode_val_at(const struct ynode *map, size_t i);
-const char *ynode_str(const struct ynode *n);                            /* скаляр, иначе NULL */
 
 /* Толкование скаляра по базовой схеме YAML 1.2 — только для скаляров без кавычек (YS_PLAIN):
  * `"5"` и `'true'` — строки, так же, как в JSON.
