@@ -216,7 +216,8 @@ src/
               module.c (какая команда чья, установлен ли модуль),
               scrypto.c (слой криптографических примитивов — только в сборках с TLS)
   model/      spec.h (struct spec, struct output с union видов, правила, клиенты, списки),
-              parse.c (выбор формата), v2.c и v2print.c (спека v2), v1.c (перевод спеки v1),
+              parse.c (выбор формата), v2.c и v2print.c (спека v2), v2keys.c (таблицы ключей спеки v2:
+              их берут разбор и схема), v2schema.c (`steer spec-schema`), v1.c (перевод спеки v1),
               check.c (сквозные проверки), registry.c (реестр меток и таблиц), marks.h, probe.c,
               srs.c, srsplan.c (наборы sing-box)
   kinds/      kind.h и kind.c (struct kind_ops, биты свойств, реестр),
@@ -777,6 +778,8 @@ rules:                                # сверху вниз, выше — си
   `{etc}`), а не от рабочего каталога процесса.
 - `steer spec convert` печатает спеку v2 из спеки v1 (`src/model/v2print.c`); напечатанное даёт тот
   же набор правил до байта.
+- `steer spec-schema [--json]` печатает схему спеки v2 (`src/model/v2schema.c`) по таблицам ключей
+  разбора (`src/model/v2keys.c`), реестру видов и реестру плагинов — [spec-schema.md](spec-schema.md).
 
 Во что спека разбирается — раздел 4в.
 

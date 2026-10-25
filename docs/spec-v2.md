@@ -5,6 +5,9 @@
 [docs/architecture.md](architecture.md); здесь — все ключи, умолчания и отказы. Разбор — `src/model/v2.c`, печать (`steer spec convert`; `--json` — та же спека JSON-объектом с теми же ключами, `--spec -` — со стандартного ввода) — `src/model/v2print.c`,
 стенд — `tests/v2match.sh`.
 
+Те же ключи в машиночитаемом виде отдаёт `steer spec-schema [--json]` ([spec-schema.md](spec-schema.md)):
+типы, значения, умолчания, подсказки, условия и ключи каждого вида выхода, включая виды плагинов.
+
 ## Формат и файл
 
 - **YAML** (читается libyaml из дерева, `src/third_party/libyaml`) или **JSON**: JSON — это тоже
