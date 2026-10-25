@@ -200,7 +200,13 @@ void fakeip_state_load(const char *path) {
     fclose(f);
 }
 
+static int fakeip_writer_active(void);
+
 static void fakeip_state_append(const char *path, const char *domain, uint32_t addr) {
+    /* Поток записи (ниже) держит снимок, снятый ДО этого имени, и его rename затёр бы дописанную строку:
+     * имя пропало бы из файла, а флаг «грязно» уже снят. Строка не дописывается — таблица грязная, и ближайшая
+     * перезапись (по сроку, по просьбе загрузчика, при выходе) унесёт имя в файл вместе со всеми. */
+    if (fakeip_writer_active()) { g_fakeip_dirty = 1; return; }
     FILE *f = fopen(path, "a");
     if (!f) return;
     struct in_addr a; a.s_addr = htonl(addr);
@@ -316,6 +322,14 @@ static void *fakeip_writer(void *arg) {
     return NULL;
 }
 
+/* Занят ли поток записи или ждёт ли его снимок. */
+static int fakeip_writer_active(void) {
+    pthread_mutex_lock(&g_fw.mu);
+    int a = g_fw.buf != NULL || g_fw.busy;
+    pthread_mutex_unlock(&g_fw.mu);
+    return a;
+}
+
 /* Дождаться, пока поток записи отдаст то, что принял и что ждёт. */
 void fakeip_state_wait(void) {
     pthread_mutex_lock(&g_fw.mu);
@@ -373,6 +387,9 @@ void fakeip_state_rewrite(void) {
  * события, а не трафик: по просьбе загрузчика прямо перед засевом («flush», adopt.c) и при выходе
  * резолвера (proxy.c, после цикла). Ничего не менялось — ничего и не пишется. */
 void fakeip_state_flush(void) {
+    /* Флаг чист, но снимок может быть ещё у потока записи (fakeip_state_flush_async снял его при передаче):
+     * файл нужен на носителе к возврату — загрузчик прочтёт его сразу, а резолвер сейчас выйдет. */
+    fakeip_state_wait();
     if (!g_fakeip_dirty) return;
     fakeip_state_rewrite();
     g_fakeip_dirty = 0;

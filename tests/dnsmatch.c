@@ -447,6 +447,60 @@ int main(void) {
         g_fakeip_next = 0;
     }
 
+    /* ---- ФОН И СИНХРОННЫЕ МЕСТА ЧТЕНИЯ ФАЙЛА (I-534): flush ждёт поток, append не теряется ------------------
+     * Снимок уже у потока, флаг «грязно» снят. Просьба загрузчика («flush») и выход резолвера зовут
+     * fakeip_state_flush: файл обязан лежать на носителе к её возврату, хотя флаг чист. И имя, выданное, пока
+     * поток пишет, не пропадает из файла: дописанная строка не должна затираться более старым снимком. */
+    {
+        char dirt[] = "/tmp/dnsmatch-fakeip-XXXXXX";
+        char path[128];
+        if (!mkdtemp(dirt)) { perror("mkdtemp"); return 1; }
+        snprintf(path, sizeof(path), "%s/fakeip.state", dirt);
+        int lost_flush = 0, lost_append = 0;
+        for (int round = 0; round < 40; round++) {
+            fakeip_pool_reset();
+            memset(&g_fakeip, 0, sizeof(g_fakeip));
+            memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+            g_fakeip_next = 1;
+            g_fakeip_state_path = NULL;
+            uint32_t aa = 0;
+            char nm[64];
+            for (int i = 0; i < 3000; i++) {
+                snprintf(nm, sizeof(nm), "r%d-%d.flushwait.test", round, i);
+                fakeip_lookup_or_alloc(nm, &aa);
+            }
+            unlink(path);
+            g_fakeip_state_path = path;
+            g_fakeip_dirty = 1;
+            fakeip_state_flush_async();
+            fakeip_state_flush();               /* чисто: но поток ещё пишет, и файл нужен сейчас */
+            if (access(path, F_OK) != 0) lost_flush++;
+            fakeip_state_wait();
+            /* Имя, выданное во время записи снимка, в котором его нет. */
+            g_fakeip_dirty = 1;
+            fakeip_state_flush_async();
+            fakeip_lookup_or_alloc("during-write.flushwait.test", &aa);
+            fakeip_state_flush();
+            fakeip_state_wait();
+            char *all = calloc(1, 1 << 20);
+            FILE *rf = fopen(path, "r");
+            size_t got = rf && all ? fread(all, 1, (1 << 20) - 1, rf) : 0;
+            if (rf) fclose(rf);
+            if (!got || !strstr(all, "during-write.flushwait.test")) lost_append++;
+            free(all);
+        }
+        check("фон: flush при чистом флаге дожидается потока (файл на месте)", 0, lost_flush);
+        check("фон: имя, выданное во время записи снимка, остаётся в файле", 0, lost_append);
+        unlink(path);
+        char tmp[160];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        unlink(tmp);
+        rmdir(dirt);
+        g_fakeip_state_path = NULL;
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        g_fakeip_next = 0;
+    }
+
     /* ---- ГИБРИДНЫЙ СПИСОК: адреса и имена в одном файле -------------------------
      *
      * Проверяется не ruleset_add, а load_rules_into — то есть путь ЧТЕНИЯ ФАЙЛА, потому
