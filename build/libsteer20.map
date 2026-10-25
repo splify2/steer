@@ -382,6 +382,7 @@ LIBSTEER_1 {
     untar_gz_file;
     urltest_reader_only;
     urltest_url_parse;
+    v2_schema_print;
     vless_insecure;
     vless_set_insecure;
     wb_https;
