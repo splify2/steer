@@ -218,15 +218,6 @@ int looks_like_name(const char *s) {
 
 
 
-/* Лежит ли адрес (или весь префикс) в наборе — по его дампу, без `nft get element`.
- *
- * Нужна ядру 4.9: NFT_MSG_GETSETELEM там отвечает только на дамп, а на запрос одного элемента
- * — -EOPNOTSUPP (одиночный get появился в 4.15). Без этой ветки explain на телефоне отвечал бы
- * «ни один канал не забирает» про каждый адрес, в том числе про те, что прямо в списке.
- *
- * Разбирается не формат nft целиком, а слова из цифр, точек, дробей и дефисов после
- * «elements = {»: адрес, префикс, диапазон. Прочее (timeout 1h, expires 59m) адресом не
- * читается и пропускается само. */
 /* Покрывает ли элемент набора tok (адрес, префикс или диапазон) весь спрошенный адрес addr —
  * у обоих семейств (1.9: адрес IPv6 ищется в парном наборе «<группа>6»). Семейство — по addr:
  * элемент другого семейства просто не разбирается. */
@@ -292,8 +283,7 @@ static int set_scan_mixed(const char *set, const char *addr, char *desc, size_t 
 }
 
 /* Есть ли адрес в наборе: одиночным `nft get element`. */
-static int set_lookup(const char *set, const char *elem, const char *addr) {
-    (void)addr;
+static int set_lookup(const char *set, const char *elem) {
     const char *q[] = { "nft", "get", "element", "inet", nft_table(), set, elem, NULL };
     return run(q) == 0;
 }
@@ -434,13 +424,13 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
             if (gr->g[i].composite)
                 hit = set_scan_mixed(setname, addr, mdesc, sizeof(mdesc), &mnarrow);
             else
-                hit = set_lookup(setname, elem, addr);
+                hit = set_lookup(setname, elem);
             /* Исключения-подсети доп. группы (набор «x.com, но не эти адреса»): адрес в них —
              * значит этот канал его не берёт, смотрим следующий. Они только IPv4. */
             if (hit && gr->g[i].xcidr && !v6) {
                 char xn[80];
                 snprintf(xn, sizeof(xn), "%.63s_x", gr->g[i].name);
-                if (set_lookup(xn, elem, addr)) hit = 0;
+                if (set_lookup(xn, elem)) hit = 0;
             }
         }
         if (!hit) continue;

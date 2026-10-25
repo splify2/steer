@@ -1,41 +1,17 @@
 #define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 #include <errno.h>
 #include <unistd.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
+#include <time.h>
+#include <sys/socket.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
-#include <sys/epoll.h>
-#include <signal.h>
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/time.h>
-#include <time.h>
 
-#include "spec.h"
-#include "awg.h"
-#include "hwid.h"
-#include "obfs.h"
-#include "cli.h"
-#include "srs.h"
-#include "ctl.h"
 #include "daemon.h"
-#include "loop.h"
-#include "fostate.h"
 
-
-/* Общее для сторожа в демоне (watchd.c): сокет событий сети и решение «вернуть ли masquerade».
- * Отдельного сторожа по кругу (`steer failover --loop`) больше нет (I-541): его работу целиком
- * делает демон с --watch — тот же автомат прохода на цикле событий, с памятью выходов в процессе
- * и событиями сети. Одиночный `steer failover` остаётся: один проход и выход. */
+/* Общее для сторожа в демоне (watchd.c): сокет событий сети и решение «вернуть ли masquerade». */
 /* Сокет событий ядра для сторожа: смена состояния интерфейса и его адресов. -1 — не
- * открылся, и сторож живёт одним периодом, как раньше.
+ * открылся, и сторож живёт одним периодом.
  *
  * ИНТЕРФЕЙСЫ И АДРЕСА, НО НЕ МАРШРУТЫ. Маршруты в таблицах выходов меняет сам сторож (и apply)
  * — подписка на них будила бы его собственными действиями по кругу. А то, ради чего события и

@@ -12,10 +12,8 @@ struct loop;
 
 /* Срок одного запроса проверки — на весь замер члена, с DNS. */
 #define FOLAT_TIMEOUT_MS 5000
-/* Умолчания группы без tolerance и interval — числа sing-box (interval 3m, tolerance 50); значения
- * — у группы (kind.h), здесь прежние имена. Допуск и интервал группы с умолчаниями —
- * group_tolerance_ms и group_interval_s. */
-#define FOLAT_TOLERANCE_MS GROUP_TOL_DEFAULT_MS
+/* Интервал группы без interval — число sing-box (3m); значение — у группы (kind.h). Допуск и
+ * интервал группы с умолчаниями — group_tolerance_ms и group_interval_s. */
 #define FOLAT_INTERVAL_S   GROUP_INT_DEFAULT_S
 /* Первый повтор замера, когда у живого члена он не удался (DNS ещё не поднялся, туннель только
  * встал, часы без NTP у HTTPS): не ждать целого interval, а повторить через столько секунд, дальше
@@ -85,7 +83,5 @@ struct folat *folat_new(const struct folat_conf *c);
 void folat_sync(struct folat *f);
 /* Сторож уснул (движок выключен): все таймеры и замеры сняты. folat_sync заводит их заново. */
 void folat_stop(struct folat *f);
-/* Сколько замеров групп сделано с начала (стенд и журнал). */
-unsigned long folat_rounds(const struct folat *f);
 
 #endif

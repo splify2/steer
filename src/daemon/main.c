@@ -70,20 +70,12 @@ static int ask_daemon(const char *line, const char *spec, const char *state_dir)
     return ctlcall_forward(line, spec, state_dir, 10);
 }
 
-/* Уровень в журнале — см. одноимённые макросы в failover.c и obfs.c. Метка подсистемы
- * здесь «apply»: все строки ниже пишутся при компиляции и применении спеки. Отказы
- * вызывающему (die и разбор аргументов) уровня НЕ несут и несут «steer: » — это ответ
- * тому, кто позвал, а не запись в журнал; так и записано в контракте. */
 int dnsd_main(int argc, char **argv);
 /* steer dns-probe — проверка DNS-серверов слоем апстримов резолвера (src/dnsd/dprobe.c). */
 int dns_probe_main(int argc, char **argv);
 void dns_probe_usage_flags(FILE *f);
 
-/* Имя таблицы правил (nft_table) — в spec.h: его спрашивает и сторож, см. failopen_mark в
- * failover.c. */
-
 int cmd_failover(const char *spec, int verbose);
-void probe_rule_cleanup(void);   /* failover.c */
 /* Свои флаги эти двое печатают сами — см. комментарии у объявлений. Справка по ним
  * склеивается из таблицы (что команда делает) и этих строк (чем ей управляют). */
 void dnsd_usage_flags(FILE *out);
@@ -214,8 +206,7 @@ int main(int argc, char **argv) {
      * Такие команды помечены в таблице как passthru и получают argv как есть. */
     if (c->passthru) {
         if (!strcmp(cmd, "fit")) return aggregate_main(argc - 1, argv + 1);
-        /* ctl-serve — прежнее имя демона: под ним его запускает сервис телефона
-         * (vendor/der, init/steerd.rc), и оно остаётся синонимом. */
+        /* ctl-serve — прежнее имя демона, синоним daemon (таблица команд, src/cli/cli.c). */
         if (!strcmp(cmd, "daemon") || !strcmp(cmd, "ctl-serve"))
             return ctl_serve_main(argc - 2, argv + 2);
         if (!strcmp(cmd, "ctl")) return ctl_client_main(argc - 2, argv + 2);
