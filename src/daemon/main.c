@@ -259,6 +259,11 @@ int main(int argc, char **argv) {
 
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, a.dry_run);
     /* Карта nft для плагинов: таблица, базовые цепочки с приоритетами числом, слоты (steer-api.md, 5.1). */
+    /* Схема спеки v2 (docs/spec-schema.md): таблицы ключей разбора, реестры видов и плагинов. */
+    if (!strcmp(cmd, "spec-schema")) {
+        if (v2_schema_print(stdout, a.json, &e) < 0) err_die(&e);
+        return fflush(stdout) == 0 ? 0 : 1;
+    }
     if (!strcmp(cmd, "nft-map")) {
         plugin_nft_map(stdout, a.json);
         return fflush(stdout) == 0 ? 0 : 1;
