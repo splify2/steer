@@ -97,9 +97,9 @@ int main(void) {
         check("ruleset_add при отказе strdup: набор пуст", 0, (int)rs.n);
         ruleset_free(&rs);
     }
-    /* Раскладка ядра — современная, без пробы nft: от неё зависит половина IPv6 каналов
-     * fake-IP (dom6_ok), и стенд не должен зависеть от машины. */
-    setenv("STEER_NFT_COMPAT", "modern", 1);
+    /* Ответы проб ядра заданы явно, без `nft -c`: стенд не должен зависеть от машины. */
+    setenv("STEER_NFT_INGRESS", "1", 1);
+    setenv("STEER_NFT_CONCAT", "1", 1);
     {
         static const char *const lines[] = { "youtube.com", "=exact.example", NULL };
         struct ruleset rs;
@@ -611,8 +611,8 @@ int main(void) {
             fputs("web.example\n", w1); fclose(w1);
             fputs("srv.example\nother.example\n", w2); fclose(w2);
 
-            /* Спека v2 (JSON с `version`): поле семейства «46» бывает только у неё — у спеки v1
-             * имена правил только IPv4 (sp->dns.names_v4, проверка ниже). */
+            /* Спека v2 (JSON с `version`): поле семейства «46» — у выхода с IPv6; те же каналы
+             * спекой v1 (ниже) дают то же семейство. */
             char sp[] = "/tmp/dnsmatch-tab-spec.XXXXXX";
             int sf = mkstemp(sp);
             if (sf >= 0) {
@@ -779,10 +779,8 @@ int main(void) {
                 unlink(sp);
             }
 
-            /* Те же два канала спекой v1: выход тот же, клиенты те же, — а семейство только
-             * IPv4 у обоих, и в строке таблицы «4». До 1.9 резолвер на AAAA имён под правилом
-             * отвечал пустым ответом, и спека v1 это поведение сохраняет (sp->dns.names_v4,
-             * spec.h); поддельный и настоящий IPv6 на AAAA — только у спеки v2. */
+            /* Те же два канала спекой v1: выход тот же, клиенты те же — и семейство то же, что у
+             * v2, «46» у обоих (перевод v1 → v2 IPv6 не отнимает). */
             char sp1[] = "/tmp/dnsmatch-tab-v1.XXXXXX";
             int sf1 = mkstemp(sp1);
             if (sf1 >= 0) {
@@ -799,7 +797,6 @@ int main(void) {
                 static struct spec cfg1;
                 struct err e = {0};
                 if (load_spec(sp1, &cfg1, &e) < 0) err_die(&e);
-                check("спека v1: имена правил только IPv4", 1, cfg1.dns.names_v4);
                 char *text = NULL;
                 size_t textlen = 0;
                 FILE *mem = open_memstream(&text, &textlen);
@@ -807,9 +804,9 @@ int main(void) {
                 fclose(mem);
                 check("спека v1: два канала", 2, (int)g_dch_n);
                 for (size_t i = 0; i < g_dch_n; i++)
-                    check("спека v1: канал выхода с IPv6 — только IPv4", DCH_V4, g_dch[i].fam);
-                check("спека v1: строки каналов несут «|4|» (fake-IP и real-ip)", 1,
-                      text && strstr(text, "|0|4|web") != NULL && strstr(text, "|1|4|srv") != NULL);
+                    check("спека v1: канал выхода с IPv6 — IPv4 и IPv6", DCH_V4 | DCH_V6, g_dch[i].fam);
+                check("спека v1: строки каналов несут «|46|» (fake-IP и real-ip)", 1,
+                      text && strstr(text, "|0|46|web") != NULL && strstr(text, "|1|46|srv") != NULL);
                 free(text);
                 /* g_dch держит указатели внутрь cfg1 — обнулить руками, как перед разбором
                  * выше, чтобы следующий tabfmt_parse не освобождал чужие строки. */

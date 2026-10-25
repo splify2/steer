@@ -425,24 +425,16 @@ void conntrack_evict(unsigned mark) {
 }
 
 void rule_drop(unsigned mark, int table) {
-    char m[32], legacy[24], t[16];
+    char m[32], t[16];
     snprintf(m, sizeof(m), "0x%08x/0x%08x", mark, STEER_MARK_MASK);
-    snprintf(legacy, sizeof(legacy), "0x%08x", mark);
     snprintf(t, sizeof(t), "%d", table);
     /* В цикле, потому что `ip rule add` дубликаты не проверяет и копий может быть
      * несколько; до отказа — он и означает «больше таких нет». */
     const char *del[] = { "ip", "rule", "del", "fwmark", m, "table", t, NULL };
     while (run_quiet(del) == 0) ;
-    /* Прежняя форма БЕЗ маски: она осталась в ядре от версии до R-094. Снять её обязан
-     * тот же вызов — иначе на одну метку легли бы два правила, и какое из них поймает
-     * пакет, решал бы приоритет, а не замысел. Через несколько версий строку можно
-     * убрать; пока роутеры обновляются, она и есть весь механизм перехода. */
-    const char *dell[] = { "ip", "rule", "del", "fwmark", legacy, "table", t, NULL };
-    while (run_quiet(dell) == 0) ;
 }
 
-/* Правило IPv6 выхода — снять все копии. Прежней формы без маски у IPv6 не бывало: правила IPv6
- * движок ставит только с 1.9, сразу с маской. */
+/* Правило IPv6 выхода — снять все копии. */
 void rule_drop6(unsigned mark, int table) {
     char mk[16];
     snprintf(mk, sizeof(mk), "0x%08x", STEER_MARK_MASK);
@@ -474,7 +466,7 @@ void route6_flush(int table) {
  * месте (и тип тоже: blackhole на устройство и обратно, проверено на 6.8 и 4.9), поэтому
  * таблица не бывает пустой ни на миг; всё лишнее, что в ней было, снимается ПОСЛЕ. Правило не
  * снимается вовсе, если оно уже стоит: недостающее добавляется, а лишние копии и прежние формы
- * (без маски, не на своём приоритете) снимаются после того, как верная копия есть. Одинаковые
+ * (не на своём приоритете) снимаются после того, как верная копия есть. Одинаковые
  * правила в ядре ничего не решают друг за друга, так что «сначала добавить, потом снять» —
  * это и есть «ровно одна копия без мгновения, когда нет ни одной».
  *
@@ -498,7 +490,6 @@ static void copies_add(unsigned long **v, int *n, unsigned long pref, int *oom) 
 void rule_copies_free(struct rule_copies *c) {
     free(c->pref);
     free(c->wrong);
-    free(c->legacy);
     memset(c, 0, sizeof(*c));
 }
 
@@ -533,10 +524,8 @@ struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
         if (!fm) continue;
         unsigned long got = strtoul(fm + 7, &stop, 16);
         if (!stop || (uint32_t)got != mark) continue;
-        /* Без маски — прежняя форма (ядро печатает маску 0xffffffff никак). Её снимают, но не
-         * считают верной копией — см. rule_ensure. */
-        int legacy = *stop != '/';
-        if (!legacy && (uint32_t)strtoul(stop + 1, NULL, 16) != STEER_MARK_MASK) continue;
+        /* Без маски — не наше правило (прежнюю форму без маски движок не ставит с R-094). */
+        if (*stop != '/' || (uint32_t)strtoul(stop + 1, NULL, 16) != STEER_MARK_MASK) continue;
         const char *lk = strstr(line, "lookup ");
         if (!lk) continue;
         const char *t = lk + 7;
@@ -545,10 +534,6 @@ struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
         for (size_t i = 0; i < tl; i++)
             if (!isdigit((unsigned char)t[i])) numeric = 0;
         if (numeric && (tl != strlen(want_tbl) || strncmp(t, want_tbl, tl) != 0)) continue;
-        if (legacy) {
-            copies_add(&c.legacy, &c.legacy_n, pref, &c.oom);
-            continue;
-        }
         if (STEER_RULE_PREF && pref != (unsigned long)STEER_RULE_PREF) {
             copies_add(&c.wrong, &c.wrong_n, pref, &c.oom);
             continue;
@@ -577,7 +562,7 @@ static void rule_ensure_fam(int fam, unsigned mark, int table) {
     struct rule_copies c = rule_copies_of(rules, mark, table);
     free(rules);
     /* Нет памяти под список — копии неполны: добавляем, если верной нет, но ничего не снимаем. */
-    if (c.oom) c.n = c.wrong_n = c.legacy_n = 0;
+    if (c.oom) c.n = c.wrong_n = 0;
     /* Прочитать не вышло (нет ip, отказал popen) — добавляем, ничего не снимая: лишняя копия
      * того же правила ничего не меняет в маршрутизации, а снятие вслепую могло бы оставить
      * метку без правила — то есть ту самую утечку, ради которой всё это. */
@@ -585,23 +570,6 @@ static void rule_ensure_fam(int fam, unsigned mark, int table) {
     /* Верная копия есть (или только что добавлена) — теперь можно убирать лишнее. */
     for (int k = 1; k < c.n; k++) rule_del_at(fam, mark, table, c.pref[k]);
     for (int k = 0; k < c.wrong_n; k++) rule_del_at(fam, mark, table, c.wrong[k]);
-    if (fam == 6) { rule_copies_free(&c); return; }   /* прежней формы без маски у IPv6 не бывало */
-    /* Прежняя форма без маски — см. rule_drop. Снимается после того, как форма с маской есть, и
-     * ТОЛЬКО с явной маской 0xffffffff (так её хранит ядро) и приоритетом. `ip rule del fwmark X
-     * table T` без маски на ядре 4.9 (телефон) снимает ЛЮБОЕ правило с меткой X — и с нашей
-     * маской тоже: маска там сравнивается, только если её назвали. rule_drop это не задевало
-     * (он снимает обе формы по замыслу), а здесь сняло бы только что поставленное верное правило
-     * — то есть метка осталась бы без правила, а трафик ушёл бы напрямую; поймал стенд legacy49
-     * на ядре 4.9. Не прочитав дамп, прежнюю форму не трогаем вовсе. */
-    char legacy[40], t[16], p[24];
-    snprintf(legacy, sizeof(legacy), "0x%08x/0xffffffff", mark);
-    snprintf(t, sizeof(t), "%d", table);
-    for (int k = 0; k < c.legacy_n; k++) {
-        snprintf(p, sizeof(p), "%lu", c.legacy[k]);
-        const char *dell[] = { "ip", "rule", "del", "fwmark", legacy, "table", t,
-                               "priority", p, NULL };
-        run_quiet(dell);
-    }
     rule_copies_free(&c);
 }
 

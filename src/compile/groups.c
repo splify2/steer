@@ -26,7 +26,7 @@
 #include "srs.h"
 #include "ctl.h"
 #include "groups.h"
-#include "legacy.h"
+#include "nftcompat.h"
 #include "daemon.h"
 
 /* Дописать адресный список в группу, растя вектор вдвое. Отказ памяти здесь — это «правила
@@ -325,12 +325,10 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
         struct group *g = &gr->g[i];
         /* Половины по политике семейства (R-154) — у каждой группы, и у «весь трафик» тоже: ей
          * нужно знать, оставлять ли правилу IPv4 или IPv6 и отвергать ли IPv6 клиентов. Тем же
-         * решением, что у резолвера (dom6_ok): набор «весь трафик» и адресный от nat не зависят,
-         * поэтому для них раскладка nat не спрашивается (realip=1). */
+         * решением, что у резолвера (dom6_ok). */
         {
             const struct output *fo = out_by_name(sp, g->out);
-            int v6 = fo && dom6_ok(sp, fo, g->from, g->from_n, g->domains ? g->realip : 1,
-                                   g_nftc);
+            int v6 = fo && dom6_ok(sp, fo, g->from, g->from_n);
             struct spec_rule fr = { .family = g->famreq, .fam_block = g->famblk };
             g->fam = rule_fam_eff(&fr, v6, &g->blocked);
         }
@@ -348,7 +346,7 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
         /* Половина IPv6 доменной группы — тем же решением, что у резолвера (dom6_ok): он
          * кладёт адреса в «<имя>6», только если у группы есть набор и правило IPv6. */
         const struct output *o = out_by_name(sp, g->out);
-        g->dom6 = g->domains && o && (g->fam & 2) && dom6_ok(sp, o, g->from, g->from_n, g->realip, g_nftc);
+        g->dom6 = g->domains && o && (g->fam & 2) && dom6_ok(sp, o, g->from, g->from_n);
     }
     /* Страховка, а не проверка входа: имя обязано быть уникальным по построению, и если
      * оно всё-таки повторилось — значит различитель не различил (например, два имени

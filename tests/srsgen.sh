@@ -18,7 +18,7 @@ FIX="$(pwd)/tests/srs"
 pass=0 fail=0
 tmp="$(mktemp -d /tmp/srsgen.XXXXXX)"
 trap '[ -n "${KEEP:-}" ] || rm -rf "$tmp"' EXIT INT TERM
-STEER_NFT_COMPAT=modern; export STEER_NFT_COMPAT
+STEER_NFT_CONCAT=1; STEER_NFT_INGRESS=1; export STEER_NFT_CONCAT STEER_NFT_INGRESS
 
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
@@ -207,25 +207,14 @@ check "«весь трафик приложения» — правило без 
 check "… и набора у него нет" no "$(has "$P" 'set vpn_all_c0_e')"
 check "клиенты (source_ip_cidr) у канала на телефон сняты" yes "$(has "$(cat "$tmp/phone.err")" 'source_ip_cidr) сняты')"
 
-# ---- 10. старая раскладка ядра ---------------------------------------------------------------
-run legacy env STEER_NFT_COMPAT=legacy-min <<EOF
-{ "schema": 1, "from_default": ["192.168.1.0/24"], $OUT,
-  "channels": [ { "name": "mixed", "match": { "srs_file": "FIX/mixed.srs" }, "out": "vpn" } ] }
-EOF
-G="$(cat "$tmp/legacy.nft")"
-check "старое ядро: принят" 0 "$rc"
-check "… составного набора нет" no "$(has "$G" 'inet_proto')"
-check "… деление по сужению" yes "$(has "$G" 'meta l4proto udp th dport 19000-20000 ip daddr @vpn_ip_c0_p2')"
-check "… подсети набора — в статической половине доменного набора" yes "$(has "$G" 'set vpn_dom_n {')"
-
 # ---- 11. таблица резолвера: выбор клауз и сужение -------------------------------------------
-# Семейство «4»: спеки здесь v1, а у них имена правил только IPv4 (sp->dns.names_v4, spec.h).
+# Семейство «46»: выход-интерфейс несёт IPv6, перевод v1 в модель его не отнимает.
 tab="$(STEER_NFT_CONCAT=1 "$BIN" dnsd-table --spec "$tmp/mx_comp.json" 2>/dev/null)"
-check "таблица резолвера: составной набор — клаузы с сужением" yes "$(has "$tab" "vpn_dom_c0_m|vpn|0|4|mixed|srs:0=-:$FIX/mixed.srs")"
+check "таблица резолвера: составной набор — клаузы с сужением" yes "$(has "$tab" "vpn_dom_c0_m|vpn|0|46|mixed|srs:0=-:$FIX/mixed.srs")"
 tab="$(STEER_NFT_CONCAT=1 "$BIN" dnsd-table --spec "$tmp/mx_own.json" 2>/dev/null)"
 check "… свои списки канала — с его сужением (cl:)" yes "$(has "$tab" "cl:-:$tmp/own.pfx")"
 tab="$("$BIN" dnsd-table --spec "$tmp/tg_srs.json" 2>/dev/null)"
-check "обычный набор — номера клауз имён" yes "$(has "$tab" "vpn_dom|vpn|0|4|tg|srs:0:$FIX/telegram.srs")"
+check "обычный набор — номера клауз имён" yes "$(has "$tab" "vpn_dom|vpn|0|46|tg|srs:0:$FIX/telegram.srs")"
 
 # ---- 12. большой список со смешанным сужением — деление вместо составного набора -------------
 if command -v python3 >/dev/null 2>&1; then

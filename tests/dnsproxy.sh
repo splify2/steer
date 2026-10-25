@@ -428,7 +428,7 @@ check "table-fd: нового демона нет за срок — резолв
 #        а её здесь нет — ответ пустой, а не настоящий AAAA мимо выхода (сам fake6 — dnsnft.sh);
 #   t4 — выход без IPv6 (tgws): пустой ответ сразу, клиент идёт по IPv4;
 # имя вне правил — настоящий AAAA как есть. Всё это — спека v2; та же спека записью v1 отвечает на
-# AAAA всех трёх пустым ответом, как до 1.9 (sp->dns.names_v4, spec.h), — проверка в конце.
+# AAAA тем же, что у v2 (перевод v1 → v2 IPv6 не отнимает) — проверка в конце.
 LPORT3=15302
 UPORT3=15365
 for n in r6 f6 t4; do printf '%s.test\n' "$n" > "$tmp/$n.lst"; done
@@ -446,10 +446,10 @@ printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
 '{"name":"f6","match":{"domains_files":["%s/f6.lst"]},"out":"vpn"},'\
 '{"name":"t4","match":{"domains_files":["%s/t4.lst"]},"out":"tg"}]}' \
     "$tmp" "$tmp" "$tmp" > "$tmp/spec6v1.json"
-tab6="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/spec6.json" 2>/dev/null)"
+tab6="$(STEER_NFT_INGRESS=1 "$BIN" dnsd-table --spec "$tmp/spec6.json" 2>/dev/null)"
 python3 "$tmp/upstream-aaaa.py" "$UPORT3" & UPID3=$!
 sleep 1
-STEER_NFT_COMPAT=modern "$BIN" dnsd --spec "$tmp/spec6.json" --state-dir "$tmp/state3" \
+STEER_NFT_INGRESS=1 "$BIN" dnsd --spec "$tmp/spec6.json" --state-dir "$tmp/state3" \
     --listen-port "$LPORT3" --upstream-port "$UPORT3" > "$tmp/log3" 2>&1 & DPID3=$!
 sleep 1
 if ! kill -0 "$DPID3" 2>/dev/null; then
@@ -460,11 +460,10 @@ a_f6="$(python3 "$tmp/qaaaa.py" "$LPORT3" f6.test)"
 a_t4="$(python3 "$tmp/qaaaa.py" "$LPORT3" t4.test)"
 a_out="$(python3 "$tmp/qaaaa.py" "$LPORT3" out.test)"
 kill "$DPID3" 2>/dev/null; wait "$DPID3" 2>/dev/null
-# Спека v1 с теми же каналами — тот же апстрим, свой резолвер. real-ip — главный случай: у спеки v2
-# он отдаёт настоящий AAAA и без ядра, у v1 ответ пустой.
+# Спека v1 с теми же каналами — тот же апстрим, свой резолвер: ответы те же, что у спеки v2.
 LPORT4=15303
-tab6v1="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/spec6v1.json" 2>/dev/null)"
-STEER_NFT_COMPAT=modern "$BIN" dnsd --spec "$tmp/spec6v1.json" --state-dir "$tmp/state4" \
+tab6v1="$(STEER_NFT_INGRESS=1 "$BIN" dnsd-table --spec "$tmp/spec6v1.json" 2>/dev/null)"
+STEER_NFT_INGRESS=1 "$BIN" dnsd --spec "$tmp/spec6v1.json" --state-dir "$tmp/state4" \
     --listen-port "$LPORT4" --upstream-port "$UPORT3" > "$tmp/log4" 2>&1 & DPID4=$!
 sleep 1
 v1_r6="$(python3 "$tmp/qaaaa.py" "$LPORT4" r6.test)"
@@ -481,10 +480,11 @@ check "AAAA: real-ip в выход с IPv6 — настоящий адрес (AN
 check "AAAA: fake-IP без карты fakeip6 в ядре — пустой ответ, не настоящий AAAA" "0" "$a_f6"
 check "AAAA: правило в выход без IPv6 — пустой ответ" "0" "$a_t4"
 check "AAAA: имя вне правил — настоящий адрес" "1" "$a_out"
-check "спека v1: в таблице все три — только 4" "4 4 4" \
+check "спека v1: семейства в таблице те же, что у v2" \
+    "$(printf '%s\n' "$tab6" | awk -F'|' 'NF > 4 { printf "%s%s", s, $4; s = " " }')" \
     "$(printf '%s\n' "$tab6v1" | awk -F'|' 'NF > 4 { printf "%s%s", s, $4; s = " " }')"
-check "спека v1: AAAA real-ip в выход с IPv6 — пустой ответ, как до 1.9" "0" "$v1_r6"
-check "спека v1: AAAA fake-IP в выход с IPv6 — пустой ответ" "0" "$v1_f6"
+check "спека v1: AAAA real-ip в выход с IPv6 — как у v2 (настоящий адрес)" "$a_r6" "$v1_r6"
+check "спека v1: AAAA fake-IP без карты fakeip6 — как у v2 (пустой ответ)" "$a_f6" "$v1_f6"
 check "спека v1: имя вне правил — настоящий адрес" "1" "$v1_out"
 
 # ---- политика семейства правила (R-154, docs/spec-v2.md: family, on_family_unavailable) -------
@@ -525,11 +525,11 @@ printf '{"version":2,"lan":{"addr":["127.0.0.0/8"]},'\
 '{"name":"pf","to":"pf","out":"tg","resolve":"realip","family":"6"},'\
 '{"name":"pk","to":"pk","out":"tg","resolve":"realip","family":"6","on_family_unavailable":"block"}]}' \
     "$tmp" "$tmp" "$tmp" "$tmp" > "$tmp/specfam.json"
-tabfam="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/specfam.json" 2>/dev/null)"
+tabfam="$(STEER_NFT_INGRESS=1 "$BIN" dnsd-table --spec "$tmp/specfam.json" 2>/dev/null)"
 LPORT5=15304
 python3 "$tmp/upstream-aaaa.py" "$UPORT3" & UPID5=$!
 sleep 1
-STEER_NFT_COMPAT=modern "$BIN" dnsd --spec "$tmp/specfam.json" --state-dir "$tmp/state5" \
+STEER_NFT_INGRESS=1 "$BIN" dnsd --spec "$tmp/specfam.json" --state-dir "$tmp/state5" \
     --listen-port "$LPORT5" --upstream-port "$UPORT3" > "$tmp/log5" 2>&1 & DPID5=$!
 sleep 1
 if ! kill -0 "$DPID5" 2>/dev/null; then

@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/ing.yaml --state-dir TMP/st-ing
+# args: apply --dry-run --spec TMP/ing-nodev.yaml --state-dir TMP/st-ing
 # exit: 0
 # env: STEER_NFT_INGRESS=0
 table inet steer {
@@ -46,16 +46,16 @@ table inet steer {
     }
     chain prerouting_mark {
         type filter hook prerouting priority mangle + 1; policy accept;
-        iifname { "br-lan", "tailscale0" } ip daddr @dir_ip counter return comment "steer:dir_ip"
+        iifname "nosuch-steer0" ip daddr @dir_ip counter return comment "steer:dir_ip"
         ether saddr { aa:bb:cc:dd:ee:01 } counter goto bal_302 comment "steer:res_all_c1"
-        iifname { "br-lan", "tailscale0" } ip daddr @fast_dom counter goto bal_303 comment "steer:fast_dom"
-        iifname { "br-lan", "tailscale0" } ip6 daddr @fast_dom6 counter goto bal_303 comment "steer:fast_dom"
+        iifname "nosuch-steer0" ip daddr @fast_dom counter goto bal_303 comment "steer:fast_dom"
+        iifname "nosuch-steer0" ip6 daddr @fast_dom6 counter goto bal_303 comment "steer:fast_dom"
         ip saddr { 192.168.1.50 } meta l4proto udp th dport 50000-65535 ip daddr @res_ip_c2_p1 counter goto bal_302 comment "steer:res_ip_c2_p1"
         ip6 saddr { fd00::50 } meta l4proto udp th dport 50000-65535 ip6 daddr @res_ip_c2_p16 counter goto bal_302 comment "steer:res_ip_c2_p1"
         ip saddr { 192.168.1.50 } counter goto bal_304 comment "steer:bal_all_c2"
         ip6 saddr { fd00::50 } counter goto bal_304 comment "steer:bal_all_c2"
-        iifname { "br-lan", "tailscale0" } ip daddr @dpi_ip meta mark set mark and 0xf00fffff or 0x40600000 ct mark set mark counter return comment "steer:dpi_ip"
-        iifname { "br-lan", "tailscale0" } ip daddr @tg_ip meta mark set mark and 0xf00fffff or 0x40700000 counter return comment "steer:tg_ip"
+        iifname "nosuch-steer0" ip daddr @dpi_ip meta mark set mark and 0xf00fffff or 0x40600000 ct mark set mark counter return comment "steer:dpi_ip"
+        iifname "nosuch-steer0" ip daddr @tg_ip meta mark set mark and 0xf00fffff or 0x40700000 counter return comment "steer:tg_ip"
     }
 
     map balmap_302 {
@@ -108,16 +108,16 @@ table inet steer {
 
     chain postrouting_down {
         type filter hook postrouting priority srcnat + 10; policy accept;
-        oifname { "br-lan", "tailscale0" } ip saddr @dir_ip counter comment "steer-down:dir_ip"
+        oifname "nosuch-steer0" ip saddr @dir_ip counter comment "steer-down:dir_ip"
         ether daddr { aa:bb:cc:dd:ee:01 } counter comment "steer-down:res_all_c1"
-        oifname { "br-lan", "tailscale0" } ip saddr @fast_dom counter comment "steer-down:fast_dom"
-        oifname { "br-lan", "tailscale0" } ip6 saddr @fast_dom6 counter comment "steer-down:fast_dom"
+        oifname "nosuch-steer0" ip saddr @fast_dom counter comment "steer-down:fast_dom"
+        oifname "nosuch-steer0" ip6 saddr @fast_dom6 counter comment "steer-down:fast_dom"
         ip daddr { 192.168.1.50 } meta l4proto udp th sport 50000-65535 ip saddr @res_ip_c2_p1 counter comment "steer-down:res_ip_c2_p1"
         ip6 daddr { fd00::50 } meta l4proto udp th sport 50000-65535 ip6 saddr @res_ip_c2_p16 counter comment "steer-down:res_ip_c2_p1"
         ip daddr { 192.168.1.50 } counter comment "steer-down:bal_all_c2"
         ip6 daddr { fd00::50 } counter comment "steer-down:bal_all_c2"
-        oifname { "br-lan", "tailscale0" } ip saddr @dpi_ip counter comment "steer-down:dpi_ip"
-        oifname { "br-lan", "tailscale0" } ip saddr @tg_ip counter comment "steer-down:tg_ip"
+        oifname "nosuch-steer0" ip saddr @dpi_ip counter comment "steer-down:dpi_ip"
+        oifname "nosuch-steer0" ip saddr @tg_ip counter comment "steer-down:tg_ip"
     }
     chain postrouting_guard {
         type filter hook postrouting priority filter; policy accept;
@@ -161,8 +161,8 @@ table inet steer {
     }
     chain prerouting_dns {
         type nat hook prerouting priority dstnat - 2; policy accept;
-        iifname { "br-lan", "tailscale0" } udp dport 53 counter redirect to :5300
-        iifname { "br-lan", "tailscale0" } tcp dport 53 counter redirect to :5300
+        iifname "nosuch-steer0" udp dport 53 counter redirect to :5300
+        iifname "nosuch-steer0" tcp dport 53 counter redirect to :5300
     }
 
     map fakeip {
@@ -180,7 +180,7 @@ table inet steer {
     }
     chain postrouting_fakeguard {
         type filter hook postrouting priority filter; policy accept;
-        ip daddr 198.18.0.0/15 oifname { "tailscale*", "zt*", "br-lan", "tailscale0" } counter drop comment "steer-fakeip-guard"
-        ip6 daddr fdfe:dcba:9876::/96 oifname { "tailscale*", "zt*", "br-lan", "tailscale0" } counter drop comment "steer-fakeip-guard"
+        ip daddr 198.18.0.0/15 oifname { "tailscale*", "zt*", "nosuch-steer0" } counter drop comment "steer-fakeip-guard"
+        ip6 daddr fdfe:dcba:9876::/96 oifname { "tailscale*", "zt*", "nosuch-steer0" } counter drop comment "steer-fakeip-guard"
     }
 }

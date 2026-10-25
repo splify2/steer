@@ -951,7 +951,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
  *   (conntrack выключен) фрагменты шли по отдельности и без ingress — prerouting тоже видел их
  *   без портов.
  *
- * ГДЕ INGRESS НЕ СТАВИТСЯ (ingress_devs): старое ядро и ядро без inet ingress (NFTC_INGRESS,
+ * ГДЕ INGRESS НЕ СТАВИТСЯ (ingress_devs): ядро без inet ingress (NFTC_INGRESS,
  *   проба nft_ingress_ok), платформа, где устройства раздачи появляются по требованию
  *   (lan_devs_persist — телефон), поле метки без места под «разобран» (мини-сборка tgws), спека
  *   без правил для раздачи, и ни одного существующего устройства раздачи. Каналы на сам телефон (from self, uid) —
@@ -965,7 +965,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
  *   перекрываются; TCP на veth с GRO — в пределах разброса.
  *   Устройство — docs/architecture.md, раздел 2, «Набор правил», «Разметка на ingress». */
 static size_t ingress_devs(const struct spec *sp, const struct groups *gr, const char **devs) {
-    if (!(g_nftc & NFTC_INGRESS) || (g_nftc & NFTC_LEGACY)) return 0;
+    if (!(g_nftc & NFTC_INGRESS)) return 0;
     if (!plat()->lan_devs_persist || !steer_ingress_seen_ok()) return 0;
     int any = 0;
     for (size_t i = 0; i < gr->n && !any; i++) any = !group_is_local(&gr->g[i]);
@@ -1781,9 +1781,7 @@ static void build_traceroute_raw(struct nft_table *t) {
  *
  * ОБА СЕМЕЙСТВА. Запрос по IPv6 (сервер сети из RDNSS, в том числе link-local) заворачивается
  * так же: резолвер ищет исходное назначение и в AF_INET6 и переспрашивает тот же IPv6-сервер
- * (см. g_origdst в dnsd/proxy.c). В современной раскладке это одно правило в inet, в старой — по
- * цепочке nat output в ip и ip6 (legacy.c разносит его по семействам); на старом ядре без nat в
- * ip6 (NFTC_IP6NAT) IPv6-половины нет — там такого правила не поставить, и apply об этом говорит. */
+ * (см. g_origdst в dnsd/proxy.c). Это одно правило в inet. */
 
 /* Само правило заворота — одно на всех раскладках и семействах (по правилу на протокол).
  *
@@ -2176,11 +2174,8 @@ static void build_nat4(struct nft_table *t, const struct spec *sp) {
  * выхода (over) несёт метку цели и попадает к её слушателю так же, как трафик клиента. На
  * платформе с заворотом DNS приложений (output_dns на dstnat) запрос к 53-му порту в выход не
  * уводится — его забирает тот заворот, как и прежде.
- *
- * Старая раскладка (Linux 4.9, legacy.c) складывает nat в таблицы ip и ip6, а карту демон ведёт
- * в inet: там перенаправления нет, и TCP идёт через TUN, как до R-152. */
+ */
 static int has_tcp_redir(const struct spec *sp) {
-    if (g_nftc & NFTC_LEGACY) return 0;
     for (size_t i = 0; i < sp->out_n; i++)
         if (sp->out[i].mark && out_has_cap(&sp->out[i], KC_TCP_REDIR)) return 1;
     return 0;
@@ -2260,13 +2255,12 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     return 0;
 }
 
-/* Текст набора правил этого запуска: дерево, раскладка ядра (g_nftc) и печать. На отказе в f
+/* Текст набора правил этого запуска: дерево и печать. На отказе в f
  * не пишется ничего — дерево строится целиком до печати. */
 int generate(const struct spec *sp, const struct groups *gr, FILE *f, struct err *e) {
     struct nft_rs rs;
     nft_rs_init(&rs);
     int rc = nft_build(&rs, sp, gr, e);
-    if (rc == 0) rc = legacy_rewrite(&rs, sp, g_nftc, e);
     if (rc == 0) nft_print(&rs, f);
     nft_rs_free(&rs);
     return rc;

@@ -545,12 +545,10 @@ int main(void) {
     tick(RULES_LEGACY, "default dev lo scope link\n");
     check("снятое правило fwmark — возвращено",
           cmd_seen("ip rule add fwmark 0x00100000/0x0ff00000 table 300"), 1);
-    /* И снимается прежняя форма тоже: иначе после обновления в ядре лежали бы два правила
-     * на одну метку, и порядок между ними определялся бы приоритетом, а не замыслом. Снимается
-     * она с ЯВНОЙ маской 0xffffffff и приоритетом: `ip rule del fwmark X` без маски на ядре 4.9
-     * снимает любое правило с меткой X, в том числе только что поставленное с маской. */
-    check("прежняя форма без маски снимается — с явной маской",
-          cmd_seen("ip rule del fwmark 0x00100000/0xffffffff table 300 priority 32764"), 1);
+    /* Прежняя форма без маски (до R-094) больше не снимается (I-541): её не ставит ни одна
+     * версия давно, а вслепую снимать правило по метке без маски нельзя. */
+    check("прежняя форма без маски не трогается",
+          cmd_seen("ip rule del fwmark 0x00100000/0xffffffff"), 0);
     check("  и никогда без маски", cmd_seen("ip rule del fwmark 0x00100000 table"), 0);
 
     /* 3. Таблица пуста: ядро вычистило маршрут вместе с TUN умершего процесса. */
@@ -704,8 +702,7 @@ int main(void) {
     check("перепривязка: стоящее правило не снимается",
           cmd_seen("ip rule del fwmark 0x00100000/0x0ff00000"), 0);
     check("перепривязка: стоящее правило не дублируется", rule_added, 0);
-    /* Правила нет (прежний отказ в режиме direct) — добавляется, и снимается только прежняя
-     * форма без маски, и только после. */
+    /* Правила нет (прежний отказ в режиме direct) — добавляется. */
     out_set("lo", FAIL_DROP);
     state_write("active", "vl old0\n");
     tick(RULES_LEGACY, "default dev old0 scope link \n");
@@ -716,9 +713,8 @@ int main(void) {
     check("правила нет — маршрут раньше правила",
           cmd_at("ip route replace default dev lo table 300") <
           cmd_at("ip rule add fwmark 0x00100000/0x0ff00000 table 300"), 1);
-    check("прежняя форма без маски снимается после добавления",
-          cmd_at("ip rule add fwmark 0x00100000/0x0ff00000 table 300") <
-          cmd_at("ip rule del fwmark 0x00100000/0xffffffff table 300"), 1);
+    check("прежняя форма без маски не снимается",
+          cmd_seen("ip rule del fwmark 0x00100000/0xffffffff"), 0);
     /* Прежней формы в дампе нет — снимать нечего, и вслепую ничего не снимается. */
     out_set("lo", FAIL_DROP);
     state_write("active", "vl old0\n");

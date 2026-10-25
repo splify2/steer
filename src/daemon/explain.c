@@ -240,49 +240,6 @@ static int span_covers(const char *tok, const char *addr) {
     return ipv4_span(addr, &qlo, &qhi) && ipv4_span(tok, &lo, &hi) && lo <= qlo && qhi <= hi;
 }
 
-/* Знак слова элемента в дампе: у IPv6 — ещё шестнадцатеричные буквы и двоеточие. */
-static int elem_char(int c, int v6) {
-    if ((c >= '0' && c <= '9') || c == '.' || c == '/' || c == '-') return 1;
-    return v6 && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == ':');
-}
-
-static int set_scan(const char *set, const char *addr) {
-    for (const char *q = set; *q; q++)
-        if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
-              (*q >= '0' && *q <= '9') || *q == '_' || *q == '-'))
-            return 0;
-    int v6 = strchr(addr, ':') != NULL;
-    if (!span_covers(addr, addr)) return 0;
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "nft list set inet %s %.64s 2>/dev/null", nft_table(), set);
-    FILE *p = popen(cmd, "r");
-    if (!p) return 0;
-    int in = 0, hit = 0, c;
-    char tok[96];
-    size_t tn = 0;
-    const char *key = "elements = {";
-    size_t kpos = 0;
-    while (!hit && (c = fgetc(p)) != EOF) {
-        if (!in) {
-            kpos = (c == key[kpos]) ? kpos + 1 : (c == key[0] ? 1 : 0);
-            if (!key[kpos]) in = 1;
-            continue;
-        }
-        if (elem_char(c, v6)) {
-            if (tn + 1 < sizeof(tok)) tok[tn++] = (char)c;
-            continue;
-        }
-        if (tn) {
-            tok[tn] = '\0';
-            tn = 0;
-            if (span_covers(tok, addr)) hit = 1;
-        }
-        if (c == '}') in = 0;
-    }
-    pclose(p);
-    return hit;
-}
-
 /* Составной набор (адрес . протокол . порты, канал со смешанным сужением): запрос одного
  * элемента требует протокол и порт, а спрошен только адрес, поэтому — дамп набора, и из каждого
  * элемента первое поле сравнивается с адресом. В desc — что именно совпало («udp 50000-65535»
@@ -334,12 +291,11 @@ static int set_scan_mixed(const char *set, const char *addr, char *desc, size_t 
     return hit;
 }
 
-/* Есть ли адрес в наборе: одиночным `nft get element`, а на старом ядре, где его нет, —
- * разбором дампа (set_scan). На современном ядре путь прежний, один запуск nft. */
+/* Есть ли адрес в наборе: одиночным `nft get element`. */
 static int set_lookup(const char *set, const char *elem, const char *addr) {
+    (void)addr;
     const char *q[] = { "nft", "get", "element", "inet", nft_table(), set, elem, NULL };
-    if (run(q) == 0) return 1;
-    return NFT_LEGACY && set_scan(set, addr);
+    return run(q) == 0;
 }
 
 /* КАКИМ СЕРВЕРОМ DNS ОТВЕТИЛ РЕЗОЛВЕР НА ИМЯ — поле `dns` его записи в журнале имён (dns-log, dlog.c):
@@ -420,7 +376,6 @@ int cmd_explain(const char *spec, const char *what) {
 /* Сам ответ — в поток out, по спеке и группам вызывающего: подкоманда читает спеку сама,
  * демон отдаёт свою из памяти. Код — тот, с которым кончается подкоманда. */
 int explain_emit(const struct spec *cfg, const struct groups *gr, const char *what, FILE *out) {
-    g_nftc = nft_compat_seen();
 
     /* Имя сначала превращаем в адрес — и печатаем, во что именно. Без этой строки человек
      * видел бы вердикт по адресу, которого не спрашивал, и не мог бы понять, тот ли это
@@ -486,13 +441,6 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
                 char xn[80];
                 snprintf(xn, sizeof(xn), "%.63s_x", gr->g[i].name);
                 if (set_lookup(xn, elem, addr)) hit = 0;
-            }
-            /* Старая раскладка: у доменной группы вторая половина набора, с префиксами. */
-            if (!hit && legacy_may_have_static(&gr->g[i])) {
-                char base[72];
-                snprintf(base, sizeof(base), "%s", setname);
-                nft_static_set_name(setname, sizeof(setname), base);
-                hit = set_lookup(setname, elem, addr);
             }
         }
         if (!hit) continue;

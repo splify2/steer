@@ -152,8 +152,8 @@ static void cleanup_stale_routing(const struct spec *sp) {
  * разрешаться вовсе. То же с on_fail=drop: blackhole в таблице выхода пережил бы выключение
  * и держал трафик закрытым без всякой видимой причины.
  *
- * Все таблицы — в каждой раскладке: inet (обычное ядро), ip/ip6 (nat старого ядра, см.
- * nft_compat) и steer_obfs (правила обфускаторов). Какой таблицы нет — отказ nft молча
+ * Все таблицы: inet, ip и ip6 (остатки прежней раскладки для ядра 4.9) и steer_obfs (правила
+ * обфускаторов). Какой таблицы нет — отказ nft молча
  * значит «нечего снимать». Спека не читается: снимать надо и то, что поставила прежняя
  * спека, а реестр в состоянии — это и есть список того, что стоит в ядре. */
 int cmd_down(void) {
@@ -430,56 +430,6 @@ static int nft_table_exists(const char *fam) {
     return nfd_table_exists(!strcmp(fam, "ip6") ? NFD_IP6 : NFD_IP, nft_table());
 }
 
-/* ЧЕГО НЕ БУДЕТ НА СТАРОМ ЯДРЕ — вслух, при каждом apply в старой раскладке.
- *
- * Раскладка для 4.9 собирает всё, что ядро умеет, а без чего-то приходится обходиться. Молча
- * выбросить правило значило бы, что человек узнает о нём по симптому, — поэтому каждое
- * выброшенное называется здесь вместе с последствием. Строки идут в stderr и в журнал, как
- * остальные предупреждения apply. */
-static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
-    if (!NFT_LEGACY) return;
-    fprintf(stderr, "steer[info] apply: ядро без nat в семействе inet — правила собраны для "
-                    "nftables старого ядра: таблицы inet и ip%s\n",
-            legacy_has_ip6(sp) ? " и ip6" : "");
-    if (zapret_present(sp) && !(g_nftc & NFTC_NOTRACK))
-        fprintf(stderr, LOG_W "ядро не знает notrack: порождённые обработчиком zapret пакеты "
-                        "(подделки, куски разрезанного) остаются на учёте conntrack. Где "
-                        "firewall отбрасывает ct state invalid, обход выходов kind=zapret "
-                        "может не срабатывать\n");
-    if (sp->traceroute_hops && has_domains(gr) && !(g_nftc & NFTC_NOTRACK))
-        fprintf(stderr, LOG_W "ядро не знает notrack: traceroute_hops на нём не действует, "
-                        "промежуточные узлы будут видны как прежде\n");
-    if (!prof()->no_resolver && !(g_nftc & NFTC_IP6NAT))
-        fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут "
-                        "мимо резолвера ядра steer, и доменные каналы видят только тех, кто "
-                        "спрашивает по IPv4\n");
-    /* fake-IP v6 держится на dnat в ip6 (карта fakeip6): без него у доменных правил fake-IP
-     * половины IPv6 нет (dom6_ok), и AAAA их имён резолвер гасит. */
-    if (!(g_nftc & NFTC_IP6NAT) && has_fakeip(gr))
-        fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: у доменных правил fake-IP нет IPv6 — "
-                        "на запросы AAAA их имён ответ пустой, и клиенты ходят к этим сайтам по "
-                        "IPv4\n");
-    if (plat()->local_channels && !(g_nftc & NFTC_IP6NAT) && has_local_domains(gr))
-        fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS приложений телефона по "
-                        "IPv6 идут мимо резолвера ядра steer, и доменные каналы телефона их не "
-                        "видят\n");
-    /* На Android таблица nat iptables есть всегда, но PREROUTING в ней у netd — пустая
-     * oem_nat_pre, и предупреждать там не о чем (plat()->warn_iptables_nat). Почему это вообще
-     * важно — у legacy.c (шаг 4, «почему dstnat - 1»). */
-    FILE *t = plat()->warn_iptables_nat ? fopen("/proc/net/ip_tables_names", "r") : NULL;
-    if (t) {
-        char line[64];
-        int nat = 0;
-        while (fgets(line, sizeof(line), t)) if (!strncmp(line, "nat", 3)) nat = 1;
-        fclose(t);
-        if (nat)
-            fprintf(stderr, LOG_W "на этом ядре работает и nat iptables: для соединений, "
-                            "которые не забрало ядро steer, его правила PREROUTING (пробросы "
-                            "портов) не сработают — старое ядро не даёт двум таблицам nat "
-                            "поделить один хук\n");
-    }
-}
-
 /* Умеет ли ЯДРО отдавать пакеты в очередь nfqueue.
  *
  * ЗАЧЕМ ОТДЕЛЬНАЯ ПРОВЕРКА. Без модуля nft_queue правило `queue num N` не отвергается
@@ -556,9 +506,9 @@ static void report_v6_host(const struct spec *sp) {
 
 /* Общее начало: разбор, реестр, группы, проверки, раскладка. full=0 — только разбор, реестр и
  * выбор устройств (apply-commit без новых правил: ему нужны метки и таблицы выходов, а групп и
- * списков он не касается). nftc < 0 — раскладку спросить у ядра (nft_compat); иначе взять
- * готовую — её демон запомнил с первого плана и пробы ядра не повторяет. report — сказать о
- * том, чего не будет на старом ядре. */
+ * списков он не касается). nftc < 0 — раскладку (хук ingress) спросить у ядра; иначе взять
+ * готовую — её демон запомнил с первого плана и пробы ядра не повторяет. report — сказать вслух о
+ * том, что спека просит сверх возможного. */
 static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr, int full,
                           int nftc, int report) {
     /* Разбор спеки и компиляция возвращают отказ, а не завершают процесс сами (правило 5,
@@ -577,14 +527,13 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
         return;
     }
     /* Раскладка набора правил — до генерации и до dry-run: интерфейс проверяет спеку именно
-     * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. И до build_groups:
-     * от неё зависит половина IPv6 доменных групп (fake-IP v6 — только где есть nat в ip6). */
-    g_nftc = nftc >= 0 ? nftc : nft_compat();
+     * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. */
+    g_nftc = nftc >= 0 ? nftc : 0;
     /* Хук ingress (NFTC_INGRESS) — тем же разом, что раскладка, и ходит вместе с ней (--nftc):
      * проба `nft -c` на каждый apply была бы процессом на каждое сохранение настройки. Где
      * ingress не будет всё равно — телефон с устройствами раздачи по требованию, поле метки без
      * места под «разобран на ingress» (мини-сборка tgws), — ядро не спрашивается вовсе. */
-    if (nftc < 0 && !(g_nftc & NFTC_LEGACY) && plat()->lan_devs_persist &&
+    if (nftc < 0 && plat()->lan_devs_persist &&
         steer_ingress_seen_ok() && nft_ingress_ok())
         g_nftc |= NFTC_INGRESS;
     if (build_groups(cfg, gr, &e) < 0) err_die(&e);
@@ -615,7 +564,6 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
      * Значит человек узнает про не тот список сразу при сохранении, а не потом, когда
      * apply молча не подействует. */
     if (check_address_lists(gr, &e) < 0) err_die(&e);
-    if (report) report_legacy_gaps(cfg, gr);
 }
 
 /* ЗАСЕВ НАБОРОВ КАНАЛОВ fake-IP — вокруг печати текста для ядра (доводы — в шапке
@@ -741,25 +689,16 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
      * В --dry-run эти две строки не печатаются: там выводится сам набор правил (его сверяют
      * стенды и интерфейс), а замена — дело применения. */
     fprintf(f, "table inet %s\ndelete table inet %s\n", nft_table(), nft_table());
-    /* Таблицы ip и ip6 — тем же приёмом и в той же транзакции. Их создаёт только старая
-     * раскладка (legacy.c), но УДАЛЯТЬ их обязана любая: ядро телефона обновится
-     * до нового (Android 17 — ядра новее 5.2), apply выберет современную раскладку, и
-     * оставшаяся от старой цепочка nat заворачивала бы DNS второй раз, а карта fakeip в ней
-     * отставала бы от резолвера. И наоборот, выход раскладки из ip6 (ядро перестало
-     * принимать nat в ip6) не должен оставлять прежнюю таблицу. Отсутствующую таблицу
-     * удалять нельзя — `delete` отверг бы весь файл, — поэтому для таблицы вне раскладки
-     * спрашиваем ядро, есть ли она. На роутере, где старой
-     * раскладки не было никогда, файл остаётся прежним, байт в байт. */
+    /* Таблицы ip и ip6 движка — остатки раскладки для Linux 4.9 (убрана, I-541): прежний apply
+     * мог поставить их на телефоне, и оставшаяся там цепочка nat заворачивала бы DNS второй раз, а
+     * карта fakeip в ней отставала бы от резолвера. Отсутствующую таблицу удалять нельзя —
+     * `delete` отверг бы весь файл, — поэтому спрашиваем ядро, есть ли она. Где остатков нет
+     * (роутер), файл остаётся прежним, байт в байт. */
     {
         static const char *const fams[2] = { "ip", "ip6" };
-        int want[2] = { legacy_has_ip(cfg), legacy_has_ip6(cfg) };
-        for (int k = 0; k < 2; k++) {
-            if (want[k])
-                fprintf(f, "table %s %s\ndelete table %s %s\n",
-                        fams[k], nft_table(), fams[k], nft_table());
-            else if (nft_table_exists(fams[k]))
+        for (int k = 0; k < 2; k++)
+            if (nft_table_exists(fams[k]))
                 fprintf(f, "delete table %s %s\n", fams[k], nft_table());
-        }
     }
     seed_begin(cfg, gr, 1);
     failopen_seed_begin(cfg);

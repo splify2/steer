@@ -37,11 +37,6 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 out="$tmp/out"
 mkdir -p "$out" "$tmp/wrap"
-# Пробы старого ядра (nat в ip6, notrack) идут через `nft -c` и без root отвечают «не умеет»: в
-# Actions снимки разъезжались с записанными от root. Ответ проб задаётся здесь — одинаково везде;
-# в заголовок снимка эти две переменные не пишутся.
-export STEER_NFT_IP6NAT=1 STEER_NFT_NOTRACK=1
-
 # Обёртка на каждый бинарник. Метка (router, android, tgws) входит в имя файла снимка.
 wrap() {
     real="$(abs "$1")"
@@ -62,7 +57,7 @@ rc=\$?
 {
     printf '# args: %s\n' "\$*"
     printf '# exit: %s\n' "\$rc"
-    env | grep '^STEER_' | grep -v '^STEER_NFT_IP6NAT=\|^STEER_NFT_NOTRACK=' | LC_ALL=C sort | sed 's/^/# env: /'
+    env | grep '^STEER_' | LC_ALL=C sort | sed 's/^/# env: /'
     sed 's/^/# stderr: /' "\$buf.err"
     cat "\$buf"
 } | sed -E 's#/[A-Za-z0-9_./-]*/tmp\.[A-Za-z0-9]+#TMP#g' > "$out/\$(printf '%s-%03d.nft' "\$tag" "\$n")"

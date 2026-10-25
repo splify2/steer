@@ -270,7 +270,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "down")) return cmd_down();
     if (!strcmp(cmd, "supervise")) return cmd_supervise(spec);
     if (!strcmp(cmd, "failover"))
-        return a.loop ? failover_loop(spec, a.verbose, a.loop) : cmd_failover(spec, a.verbose);
+        return cmd_failover(spec, a.verbose);
     /* Без демона (клиент его не нашёл или движок позван напрямую): то же, что делает демон, но с
      * памятью сторожа в файлах каталога состояния (src/daemon/fogroup.c). */
     if (!strcmp(cmd, "select")) return cmd_select(spec, a.pos[0], a.pos[1]);

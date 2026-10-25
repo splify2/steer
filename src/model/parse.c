@@ -317,10 +317,8 @@ void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char
  * которым компилятор даёт группе v6-двойника (generate.c: out_v6_ok, who6_ok): выход несёт IPv6
  * или метки не ставит вовсе (direct), а «кто» выражается для IPv6 — устройством, MAC, адресом
  * IPv6, клиентами по умолчанию или владельцем сокета на телефоне («uid:N» — тоже с двоеточием,
- * как адрес IPv6, и у generate.c считается так же). Режим fake-IP ещё требует nat в семействе
- * IPv6: на старом ядре без NFTC_IP6NAT карты fakeip6 и её dnat поставить негде. */
-int dom6_ok(const struct spec *sp, const struct output *o, const char (*from)[64], size_t from_n,
-            int realip, int nftc) {
+ * как адрес IPv6, и у generate.c считается так же). */
+int dom6_ok(const struct spec *sp, const struct output *o, const char (*from)[64], size_t from_n) {
     if (out_needs_mark(o) && !out_has_cap(o, KC_IPV6)) return 0;
     /* IPv6 выхода снят (spec_v6_resolve): `ipv6: off` или выход рядом с донором. Отдельной
      * строкой ради direct — у него метки нет, и строка выше его не касается, а рядом с донором
@@ -329,7 +327,6 @@ int dom6_ok(const struct spec *sp, const struct output *o, const char (*from)[64
     int who = !from_n || spec_is_mac(from[0]) || from_same(from, from_n, sp->lan.from, sp->lan.from_n);
     for (size_t i = 0; i < from_n && !who; i++) who = strchr(from[i], ':') != NULL;
     if (!who) return 0;
-    if (!realip && (nftc & NFTC_LEGACY) && !(nftc & NFTC_IP6NAT)) return 0;
     return 1;
 }
 

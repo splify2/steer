@@ -47,7 +47,6 @@ cc_defaults {
         "src/compile/balance.c",
         "src/lib/ir.c",
         "src/compile/print.c",
-        "src/compile/legacy.c",
         "src/daemon/fwcheck.c",
         "src/daemon/apply.c",
         "src/daemon/status.c",

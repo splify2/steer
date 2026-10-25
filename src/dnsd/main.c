@@ -252,22 +252,15 @@ int dnsd_main(int argc, char **argv) {
         }
     }
 
-    /* Раскладка — та же проба, что у apply, и тем же ответом: наборы и карту резолвер находит
-     * по именам, и искать их не в той таблице значило бы наполнять пустоту. Спрашивается у
-     * ядра, а не у файла, который оставил apply: резолвер поднимается и раньше первого apply
-     * (загрузка), и ответ ядра от порядка запуска не зависит. Имя таблицы — своё у сборки
-     * (nft_table), как у всего остального движка. Спеки эта проба не касается вовсе — делается
-     * до ветки ниже и одинаково для обоих источников таблицы каналов. */
+    /* Наборы и карты fake-IP — в таблице inet движка (раскладки для Linux 4.9 с картой в ip больше
+     * нет, I-541). Имя таблицы — своё у сборки (nft_table), как у всего остального движка. */
     {
-        static char sets_tbl[64], map_tbl[64], map6_tbl[64];
-        int legacy = nft_compat() & NFTC_LEGACY;
+        static char sets_tbl[64];
         snprintf(sets_tbl, sizeof(sets_tbl), "inet %s", nft_table());
-        snprintf(map_tbl, sizeof(map_tbl), "%s %s", legacy ? "ip" : "inet", nft_table());
-        snprintf(map6_tbl, sizeof(map6_tbl), "%s %s", legacy ? "ip6" : "inet", nft_table());
         g_nft_table = sets_tbl;
-        g_nft_map_table = map_tbl;
-        g_nft_map6_table = map6_tbl;
-        g_nft_sets_interval = !legacy;
+        g_nft_map_table = sets_tbl;
+        g_nft_map6_table = sets_tbl;
+        g_nft_sets_interval = 1;
     }
 
     /* --table-fd: демон уже прочитал спеку и построил таблицу каналов сам (docs/architecture.md,

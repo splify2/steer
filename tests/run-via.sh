@@ -19,8 +19,7 @@
 #
 # В режиме android то же самое делает приложение самого телефона: wget под UID 10050, канал
 # `from: uid:10050` на хуке output, Android-сборка движка (поле метки 22-27, ip rule 9000,
-# masquerade у выхода-интерфейса правилом iptables). Раскладка правил — STEER_NFT_COMPAT
-# (modern или legacy-min: та, что на ядре 4.9 телефона, с битом перемаршрутизации).
+# masquerade у выхода-интерфейса правилом iptables).
 #
 # Затем — отказ цели (vx0 лёг — сторож объявляет нерабочим и vl, ожил — возвращает тем же
 # проходом) и контроль, без которого первая часть ничего не доказывает: тот же выход без via
@@ -37,7 +36,7 @@
 #
 # Использование:
 #   STEER=<расширенный движок> sh tests/run-via.sh router
-#   STEER=<расширенный движок, собранный с -DSTEER_DEFAULT_PLATFORM=android> STEER_NFT_COMPAT=legacy-min \
+#   STEER=<расширенный движок, собранный с -DSTEER_DEFAULT_PLATFORM=android>
 #       sh tests/run-via.sh android
 # Нужны root, ip netns, nft, python3, wget; в режиме android — iptables и setpriv.
 set -eu
@@ -186,7 +185,7 @@ fetch() {
     [ "$got" = $((MB * 1024 * 1024)) ]
 }
 
-echo "run-via: режим $MODE, раскладка ${STEER_NFT_COMPAT:-по пробе}"
+echo "run-via: режим $MODE"
 
 # ---- 1. vl через vx -----------------------------------------------------------------
 spec ',"via":"vx"'

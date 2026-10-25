@@ -640,8 +640,7 @@ tdout="$("$BIN" apply --dry-run --spec "$tmp/threedom.json" --state-dir "$tmp/st
 check "fakeip, realip и свои клиенты — три разных набора" "3" \
     "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*\) .*/\1/p' | grep -v '6$' | sort -u | wc -l)"
 # Половина IPv6 в наборе правил — у fakeip и realip клиентов по умолчанию, но не у клиента из
-# одного адреса IPv4: его IPv6 правилом не узнать. (Спека здесь v1, и на AAAA резолвер отвечает
-# пустым ответом у всех трёх — sp->dns.names_v4; набор правил от этого не меняется.)
+# одного адреса IPv4: его IPv6 правилом не узнать.
 check "  пары IPv6 — у fakeip и realip, у клиента из адреса IPv4 — нет" "vpn_dom6 vpn_dom_c0r6" \
     "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*6\) .*/\1/p' | sort | paste -sd' ')"
 
@@ -1437,10 +1436,9 @@ spec <<'EOF'
       "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
   ] }
 EOF
-# Семейство в подписи — «4»: спека v1, и на AAAA её имён резолвер отвечает пустым ответом, как до
-# 1.9 (sp->dns.names_v4, spec.h), хотя набор vpn_dom6 компилятор заводит (проверка ниже).
+# Семейство в подписи — «46»: у выхода-интерфейса есть IPv6, и набор vpn_dom6 компилятор заводит.
 hsig="$("$BIN" dnsd-sig --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
-check "гибридный канал в доменной группе соседа" "vpn_dom|0|4|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
+check "гибридный канал в доменной группе соседа" "vpn_dom|0|46|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
 hout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
 check "и компилятор завёл ровно эти наборы" "set vpn_dom {|set vpn_dom6 {|set vpn_ip_c0_p1 {" \
     "$(printf '%s\n' "$hout" | grep -o 'set [a-z0-9_]* {' | paste -sd'|')"
@@ -1681,10 +1679,7 @@ check "dry-run без строк замены таблицы" "0" \
     "$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-fo-drop" 2>/dev/null |
        grep -c '^delete table')"
 
-# ---- раскладка для старого ядра (Linux 4.9) -------------------------------------------------
-# Текстом, без ядра: legacy-min не спрашивает ядро ни о чём, поэтому вывод один и тот же на
-# любой машине и под любым пользователем. Загрузку в ядро проверяет applynft-legacy.sh, а
-# настоящее 4.9 — стенд tools/vm49 в хабе. Здесь — то, без чего 4.9 отвергнет весь файл.
+# ---- раскладка одна: nat в inet (раскладку для Linux 4.9 убрали, I-541) ---------------------
 printf '198.51.100.0/24\n' > "$tmp/lp.lst"
 cat > "$tmp/legacy.json" <<EOF
 { "schema": 2, "traceroute_hops": true, "from_default": ["192.168.1.0/24"],
@@ -1696,36 +1691,13 @@ cat > "$tmp/legacy.json" <<EOF
                 { "name": "z", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "yt" },
                 { "name": "t", "match": { "prefixes_file": "$tmp/b.lst" }, "out": "tg" } ] }
 EOF
-lout="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/legacy.json" \
-        --state-dir "$tmp/st-legacy" 2>"$tmp/legacy.err")"
-check "legacy: спека компилируется" "0" "$?"
-# Всё, что до таблицы ip, — это таблица inet: nat там 4.9 не принимает вовсе.
-check "legacy: в inet нет ни одной цепочки nat" "0" \
-    "$(printf '%s\n' "$lout" | sed '/^table ip /,$d' | grep -c 'type nat')"
-check "legacy: nat — одна цепочка на prerouting в ip" "1" \
-    "$(printf '%s\n' "$lout" | grep -c 'type nat hook prerouting priority dstnat - 1')"
-check "legacy: и пустая на postrouting — для обратной трансляции ответов" "1" \
-    "$(printf '%s\n' "$lout" | grep -c 'type nat hook postrouting priority srcnat + 1')"
-check "legacy: интервального набора со сроками нет" "0" \
-    "$(printf '%s\n' "$lout" | grep -c 'interval,timeout')"
-check "legacy: доменный набор — hash со сроками, префиксы — в _n" "2" \
-    "$(printf '%s\n' "$lout" | grep -c 'set vpn_dom {\|set vpn_dom_n {')"
-check "legacy: notrack без пробы ядра не ставится" "0" "$(printf '%s\n' "$lout" | grep -c notrack)"
-check "legacy: exthdr exists не ставится (4.9 грузит вместо него другое правило)" "0" \
-    "$(printf '%s\n' "$lout" | grep -c 'exthdr')"
-check "legacy: dnat по карте без слова ip" "1" \
-    "$(printf '%s\n' "$lout" | grep -c 'dnat to ip daddr map @fakeip')"
-check "legacy: ip6 без пробы не собирается" "0" "$(printf '%s\n' "$lout" | grep -c '^table ip6 ')"
-# Четвёртая строка (1.9) — у доменных правил fake-IP без nat в ip6 нет IPv6: AAAA гасится.
-check "legacy: сказано, чего не будет (notrack дважды, IPv6 и fake-IP v6)" "4" \
-    "$(grep -c 'не знает notrack\|nat для IPv6' "$tmp/legacy.err")"
-check "legacy: про fake-IP v6 — отдельной строкой" "1" \
-    "$(grep -c 'у доменных правил fake-IP нет IPv6' "$tmp/legacy.err")"
-# Современная раскладка той же спеки — прежний текст: ни одной строки старой раскладки.
-mout="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/legacy.json" \
-        --state-dir "$tmp/st-legacy" 2>/dev/null)"
-check "modern: одна таблица inet" "1" "$(printf '%s\n' "$mout" | grep -c '^table ')"
-check "modern: exthdr frag exists на месте" "1" "$(printf '%s\n' "$mout" | grep -c 'exthdr frag exists')"
+mout="$("$BIN" apply --dry-run --spec "$tmp/legacy.json" --state-dir "$tmp/st-legacy" 2>"$tmp/legacy.err")"
+check "спека компилируется" "0" "$?"
+check "одна таблица inet" "1" "$(printf '%s\n' "$mout" | grep -c '^table ')"
+check "exthdr frag exists на месте" "1" "$(printf '%s\n' "$mout" | grep -c 'exthdr frag exists')"
+check "интервальный набор со сроками — один доменный набор" "1" \
+    "$(printf '%s\n' "$mout" | grep -c 'set vpn_dom {')"
+check "про старое ядро ни слова" "0" "$(grep -c 'старого ядра\|не знает notrack' "$tmp/legacy.err")"
 
 # ---- разметка на ingress (compile/generate.c, «разметка на ingress») -----------------------
 # STEER_NFT_INGRESS=all — ядро «принимает» inet ingress, и устройства раздачи «есть»: текст не
@@ -1848,8 +1820,6 @@ sed 's/devices: \[br-lan, tailscale0\]/devices: [nosuch-steer0]/' "$tmp/ing.yaml
 check "ingress: устройства раздачи нет — ingress не ставится, текст прежний" \
     "$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run --spec "$tmp/ing-nodev.yaml" --state-dir "$tmp/st-ing" 2>/dev/null)" \
     "$(STEER_NFT_INGRESS=1 "$BIN" apply --dry-run --spec "$tmp/ing-nodev.yaml" --state-dir "$tmp/st-ing" 2>/dev/null)"
-check "ingress: старое ядро (legacy-min) — ingress нет" "0" \
-    "$(STEER_NFT_INGRESS=all STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run $IS 2>/dev/null | grep -c 'hook ingress')"
 sed 's/tolerance: 50 }/tolerance: 50, idle_timeout: 600 }/' "$tmp/ing.yaml" > "$tmp/ing-idle.yaml"
 check "ingress: группа latency с idle_timeout — тоже на ingress (сторож считает трафик и в ingress_mark)" "1" \
     "$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run --spec "$tmp/ing-idle.yaml" --state-dir "$tmp/st-ing" 2>/dev/null |
@@ -1938,9 +1908,6 @@ check "ipv6 nat: masquerade IPv6 своей цепочкой — на оба в�
 check "ipv6 nat: цепочка — nat на srcnat" "1" \
     "$(chain_of "$h6n" postrouting_nat6 | grep -c 'type nat hook postrouting priority srcnat; policy accept;')"
 check "ipv6 nat: набора v6donor и отказов по источнику нет" "0" "$(printf '%s\n' "$h6n" | grep -c 'v6donor')"
-h6nl="$(STEER_NFT_COMPAT=legacy STEER_NFT_IP6NAT=1 "$BIN" apply --dry-run --spec "$tmp/h6n.yaml" $H6 2>/dev/null)"
-check "ipv6 nat, старое ядро: masquerade — в ip6 postrouting_nat" "2" \
-    "$(printf '%s\n' "$h6nl" | sed -n '/^table ip6 /,/^}/p' | grep -c 'oifname "wg[12]" counter masquerade comment "steer-nat6:')"
 h6spec "$tmp/h6o.yaml" ', ipv6: off' ''
 h6o="$("$BIN" apply --dry-run --spec "$tmp/h6o.yaml" $H6 2>/dev/null)"
 check "ipv6 off: IPv6 правил выхода — отказ по метке" "1" \

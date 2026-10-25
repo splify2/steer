@@ -31,7 +31,6 @@
 #include "groups.h"
 #include "generate.h"
 #include "nftquery.h"
-#include "nftcompat.h"
 #include "procscan.h"
 #include "rtnl.h"
 
@@ -723,10 +722,6 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
     g_diag_out = out;
     g_diag_first = 1;
     g_diag_warn = g_diag_fail = 0;
-    /* Раскладка — та, что стоит в ядре: искать правила там, где их поставил apply (цепочки и
-     * наборы ниже). Проба `nft -c`, которой её узнаёт компилятор, здесь не нужна: отчёт читает
-     * применённое, а не решает, что применять. */
-    g_nftc = nft_compat_seen();
     fprintf(out, "{\"schema\":1,\"checks\":[");
 
     /* 1. Таблица. Без неё всё остальное бессмысленно: apply не применялся или его снесли. */
@@ -750,14 +745,6 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
         const struct group *g = &gr->g[i];
         if (!g->files_n && !g->srs_n && !g->domains) continue;
         long n = set_count(g->name);
-        /* Старая раскладка: префиксы доменной группы лежат во второй половине набора (<имя>_n,
-         * см. generate). Адресов у канала — сумма обеих. */
-        if (n >= 0 && legacy_may_have_static(g)) {
-            char sn[80];
-            nft_static_set_name(sn, sizeof(sn), g->name);
-            long m = set_count(sn);
-            if (m > 0) n += m;
-        }
         char what[160], why[240];
         if (n < 0) {
             snprintf(what, sizeof(what), "канал %.48s: набора в ядре нет", g->name);
@@ -856,9 +843,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
     /* 4. Резолвер и редирект. Доменные каналы держатся на обоих: без редиректа клиент
      *    спрашивает не нас, без процесса спрашивать некого. */
     if (has_domains(gr)) {
-        /* В старой раскладке у заворота нет своей цепочки — он правило общей цепочки nat
-         * (legacy.c, шаг 4), и узнаётся по самому правилу. */
-        int redir = NFT_LEGACY ? nft_redirect_here(DNS_PORT) : nft_chain_here("prerouting_dns");
+        int redir = nft_chain_here("prerouting_dns");
         diag("dns_redirect", redir ? "ok" : "fail",
              redir ? "запросы DNS заворачиваются на ядро steer"
                    : "запросы DNS на ядро steer не заворачиваются",

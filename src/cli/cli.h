@@ -103,10 +103,6 @@ struct cli_args {
      * `insecure: true`, и номера узлов совпадают с его номерами. С именем выхода — отказ (modcmd.c):
      * там решает ключ insecure самого выхода. */
     int insecure;
-    /* --loop СЕК: повторять проход сторожа раз в СЕК секунд, не завершаясь. 0 — один проход,
-     * как всегда. Нужен там, где нет procd со строкой `while :; do …; sleep; done`: у init
-     * Android такой строки нет без /system/bin/sh в домене движка (см. failover_loop). */
-    int loop;
 };
 
 const struct cli_cmd *cli_lookup(const char *name);

@@ -439,31 +439,20 @@ static int dch_join_domain_group(const struct spec *sp, const struct spec_rule *
 
 /* Семейства набора канала: IPv4 всегда, IPv6 — если компилятор даёт этой доменной группе парный
  * набор и v6-двойника (dom6_ok — одно решение на обоих; доп. группа набора .srs половины IPv6 не
- * имеет, как и у компилятора, group_has_set6). Раскладка ядра — та, что стоит (nft_compat_seen6:
- * по netlink, без пробы `nft -c` — таблицу собирает и демон в своём процессе), и спрашивается
- * только когда от неё что-то зависит: fake-IP с выходом и клиентами, которые IPv6 допускают.
- *
- * Спека v1 (sp->dns.names_v4 — ставит перевод v1) — всегда только IPv4: на AAAA её имён пустой
- * ответ, как до 1.9, хотя компилятор набор «<имя>6» и двойника заводит. Доводы — у поля в
- * spec.h. Таблица демону несёт это полем семейства «4», и резолверу номер формата спеки знать не
- * нужно. */
-static int dch_fam(const struct spec *sp, const struct spec_rule *r, int realip, int extra,
-                   int *blocked) {
+ * имеет, как и у компилятора, group_has_set6). */
+static int dch_fam(const struct spec *sp, const struct spec_rule *r, int extra, int *blocked) {
     *blocked = 0;
-    if (extra || sp->dns.names_v4) return DCH_V4;
+    if (extra) return DCH_V4;
     const struct spec_client *w = rule_who(sp, r);
     const struct output *o = rule_out(sp, r);
     /* Политика семейства правила (R-154): половины и «блок» считает та же rule_fam_eff, что у
      * компилятора (groups.c), по тому же ответу dom6_ok. Блок — канал отвечает пустым адресом
      * (kinds/block.c) на A и AAAA: имя правила не открывается, а не уходит напрямую. */
     if (r->family) {
-        int v6 = dom6_ok(sp, o, w->from, w->from_n, realip, 0) &&
-                 (realip || dom6_ok(sp, o, w->from, w->from_n, realip, nft_compat_seen6()));
-        int e = rule_fam_eff(r, v6, blocked);
+        int e = rule_fam_eff(r, dom6_ok(sp, o, w->from, w->from_n), blocked);
         return (e & 1 ? DCH_V4 : 0) | (e & 2 ? DCH_V6 : 0);
     }
-    if (!dom6_ok(sp, o, w->from, w->from_n, realip, 0)) return DCH_V4;
-    if (!realip && !dom6_ok(sp, o, w->from, w->from_n, realip, nft_compat_seen6())) return DCH_V4;
+    if (!dom6_ok(sp, o, w->from, w->from_n)) return DCH_V4;
     return DCH_V4 | DCH_V6;
 }
 
@@ -524,7 +513,7 @@ static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
                  !dch_join_domain_group(sp, c, p, set, sizeof(set), &realip, &up))
             continue;
         int blk;
-        int fam = dch_fam(sp, c, realip, p->kind == SP_EXTRA, &blk);
+        int fam = dch_fam(sp, c, p->kind == SP_EXTRA, &blk);
         struct dchan *d = dch_slot(set, realip, up, rule_out(sp, c)->name, fam);
         if (!d) return;
         if (out_is_block(rule_out(sp, c)) || blk) d->block = 1;
@@ -731,7 +720,7 @@ void dch_build(const struct spec *sp) {
             snprintf(nd->out, sizeof(nd->out), "%.31s", rule_out(sp, r)->name);
             nd->realip = realip;
             int blk;
-            nd->fam = dch_fam(sp, r, realip, 0, &blk);
+            nd->fam = dch_fam(sp, r, 0, &blk);
             nd->block = out_is_block(rule_out(sp, r)) || blk;
             nd->up = up;
             k = g_dch_n++;

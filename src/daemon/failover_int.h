@@ -57,8 +57,6 @@ struct rule_copies {
     unsigned long *pref;            /* их приоритеты, n штук */
     int wrong_n;                    /* копий на чужом приоритете */
     unsigned long *wrong;
-    int legacy_n;                   /* прежняя форма без маски (см. rule_drop) */
-    unsigned long *legacy;
     int oom;                        /* не хватило памяти под список: снимать вслепую нельзя */
 };
 

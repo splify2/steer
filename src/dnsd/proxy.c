@@ -1139,9 +1139,6 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
      * - AAAA: since 1.9 the resolver answers it for a rule whose group carries IPv6 (dom6_ok:
      *   the output routes IPv6 and the clients are expressible for IPv6) — with a fake IPv6
      *   (fake-IP) or with the real addresses put into the `<set>6` set (real-ip), see below.
-     *   A v1 spec keeps the pre-1.9 empty answer everywhere: its channels come in as family
-     *   «4» (dch_fam, table.c; the reasons are at names_v4 in spec.h), so nothing here asks
-     *   which spec format it was.
      *   If ANY matched channel lacks the IPv6 half, a real AAAA would hand a dual-stack client
      *   an address no rule of that channel catches, bypassing its output; a fake IPv6 would
      *   be DNATed and go the same way. Empty answer: the client goes over IPv4 at once.
@@ -2329,22 +2326,18 @@ int run_proxy(int listen_port, int upstream_port) {
             last_reap = now;
         }
         if (g_fakeip_dirty) {
-            /* Перезапись — O(таблица) и с fsync, то есть настоящая запись на
-             * носитель. Раз в TTL ответа достаточно: файл — best-effort
-             * подсказка для rehydrate после рестарта, и потерять последние
-             * секунды изменений при жёстком отключении не страшно (домен
-             * просто ре-резолвится), а вот молотить носитель на каждый переезд
-             * backend'а под живым трафиком — страшно вполне. */
-            /* Там, где из файла читают, он пишется сразу: перед засевом по просьбе загрузчика
-             * и при выходе (fakeip_state_flush, fakeip.c). */
-            if (now - g_fakeip_last_rewrite >= FAKEIP_ANSWER_TTL) fakeip_state_flush_async();
+            /* Перезапись — O(таблица) и с fsync, но в фоновом потоке (fakeip.c): цикл её не
+             * ждёт. Не чаще раза в FAKEIP_STATE_DEBOUNCE_S — пачка новых имён ложится одной
+             * записью. Там, где из файла читают, он пишется сразу: перед засевом по просьбе
+             * загрузчика и при выходе (fakeip_state_flush, fakeip.c). */
+            if (now - g_fakeip_last_rewrite >= FAKEIP_STATE_DEBOUNCE_S) fakeip_state_flush_async();
         }
         /* Тишина — спать до события: сигнал перезагрузки или остановки будит epoll_wait
          * через EINTR. Грязная таблица fake-IP — проснуться к сроку её перезаписи. */
         int timeout = -1;
         if (g_live) timeout = 1000;
         else if (g_fakeip_dirty) {
-            time_t left = g_fakeip_last_rewrite + FAKEIP_ANSWER_TTL - now;
+            time_t left = g_fakeip_last_rewrite + FAKEIP_STATE_DEBOUNCE_S - now;
             timeout = left > 0 ? (int)left * 1000 : 0;
         }
         /* Вопросы к апстримам со своим транспортом: проснуться к ближайшему сроку (dup.h). */

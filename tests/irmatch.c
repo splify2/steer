@@ -59,10 +59,10 @@ static int load(const char *tmpl) {
     return 0;
 }
 
-static int build(struct nft_rs *rs, int nftc) {
+static int build(struct nft_rs *rs) {
     struct err e = {0};
     nft_rs_init(rs);
-    if (nft_build(rs, &g_spec, &g_gr, &e) < 0 || legacy_rewrite(rs, &g_spec, nftc, &e) < 0) {
+    if (nft_build(rs, &g_spec, &g_gr, &e) < 0) {
         printf("дерево не построено: %s\n", e.msg);
         return -1;
     }
@@ -106,16 +106,6 @@ static struct nft_rule *rule_fam(const struct nft_chain *c, const char *comment,
     return NULL;
 }
 
-/* Сколько правил с этим комментарием у семейства fam (как у rule_fam; comment NULL — все). */
-static long count_fam(const struct nft_chain *c, const char *comment, int fam) {
-    long n = 0;
-    for (struct nft_rule *r = c ? c->rules : NULL; r; r = r->next) {
-        if (comment && (!r->comment || strcmp(r->comment, comment) != 0)) continue;
-        n += (r->fam ? r->fam : 4) == fam;
-    }
-    return n;
-}
-
 static const char *ctype(const struct nft_chain *c) { return c && c->type ? c->type : "-"; }
 static const char *chook(const struct nft_chain *c) { return c && c->hook ? c->hook : "-"; }
 static int cprio(const struct nft_chain *c) { return c ? ir_prio_value(c) : 9999; }
@@ -135,7 +125,7 @@ static void t_router_basic(void) {
         return;
     }
     struct nft_rs rs;
-    if (build(&rs, 0)) { check("дерево построено", 0, 1); return; }
+    if (build(&rs)) { check("дерево построено", 0, 1); return; }
     struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
     check("есть таблица inet", 1, t != NULL);
     check_str("имя таблицы — nft_table()", nft_table(), t ? t->name : "");
@@ -207,7 +197,7 @@ static void t_mixed_modern(void) {
     check("доменная группа есть", 1, dg != NULL);
     if (!dg) return;
     struct nft_rs rs;
-    if (build(&rs, 0)) { check("дерево построено", 0, 1); return; }
+    if (build(&rs)) { check("дерево построено", 0, 1); return; }
     struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
     struct nft_set *s = ir_set_find(t, dg->name);
     check("доменный набор — interval,timeout", NFT_SET_INTERVAL | NFT_SET_TIMEOUT,
@@ -252,97 +242,6 @@ static void t_mixed_modern(void) {
     nft_rs_free(&rs);
 }
 
-static void t_mixed_legacy(int nftc) {
-    printf("\n-- домены, zapret и tgws, раскладка 4.9 (%s) --\n",
-           nftc & NFTC_IP6NAT ? "nat в ip6, notrack" : "legacy-min");
-    /* Раскладка — до групп, как у apply: от неё зависит половина IPv6 доменной группы fake-IP
-     * (dom6_ok — без nat в ip6 её нет). */
-    g_nftc = nftc;
-    int load_rc = load(mixed);
-    g_nftc = 0;
-    if (load_rc) { check("спека разобрана", 0, 1); return; }
-    const struct group *dg = group_of("vpn", 1);
-    if (!dg) { check("доменная группа есть", 0, 1); return; }
-    struct nft_rs rs;
-    if (build(&rs, nftc)) { check("дерево построено", 0, 1); return; }
-    struct nft_table *in = ir_table_find(&rs, NFT_FAM_INET, NULL);
-    struct nft_table *t4 = ir_table_find(&rs, NFT_FAM_IP, nft_table());
-    struct nft_table *t6 = ir_table_find(&rs, NFT_FAM_IP6, nft_table());
-    check("в inet nat не осталось", 0, nat_chains(in));
-    check("карта fakeip ушла из inet", 0, ir_set_find(in, "fakeip") != NULL);
-    check("есть таблица ip", 1, t4 != NULL);
-    check("и карта fakeip в ней", 1, ir_set_find(t4, "fakeip") != NULL);
-    check("таблица ip6 — только при nat в ip6", !!(nftc & NFTC_IP6NAT), t6 != NULL);
-
-    struct nft_chain *pn = ir_chain_find(t4, "prerouting_nat");
-    check_str("prerouting_nat в ip — nat", "nat", ctype(pn));
-    check("на dstnat - 1 = -101", -101, cprio(pn));
-    check("в таблице ip ровно две цепочки nat (prerouting, postrouting)", 2, nat_chains(t4));
-    /* Порядок: DNS (dstnat), fakeip (dstnat), мост (dstnat + 1) — по приоритету прежних цепочек. */
-    struct nft_rule *r = ir_rule_find(pn, NULL);
-    check("первым — заворот DNS", 1, ir_rule_has(r, "dport 53"));
-    int dnat_at = -1, tg_at = -1, i = 0;
-    for (r = pn ? pn->rules : NULL; r; r = r->next, i++) {
-        if (ir_expr_find(r, NFT_X_DNAT)) dnat_at = i;
-        if (r->comment && !strcmp(r->comment, "steer:tgws:tg")) tg_at = i;
-    }
-    check("dnat fakeip есть", 1, dnat_at >= 0);
-    check("мост — после fakeip", 1, tg_at > dnat_at);
-    /* Кроме DNS — dnat fakeip, правило «без подмены — drop» за ним (steer-fakeip-nomap,
-     * generate.c) и мост. */
-    check("правило без подмены — в той же цепочке", 1,
-          pn && ir_rule_find(pn, "steer-fakeip-nomap") != NULL);
-    check("правил DNS в ip — только по подсети (2)", 2, i - 3);
-    struct nft_chain *pp = ir_chain_find(t4, "postrouting_nat");
-    check("postrouting_nat на srcnat + 1 = 101", 101, cprio(pp));
-    /* Подмена IPv4 ядра у выхода interface (generate.c, build_nat4) переезжает сюда вместе с прочим
-     * nat; другого в цепочке нет — её смысл прежний (обратная трансляция ответов, шапка legacy.c). */
-    check("и в ней одно правило — подмена IPv4 выхода", 1, (long)ir_rule_count(pp, NULL));
-    check("  masquerade", 1, pp && pp->rules && ir_rule_has(pp->rules, "masquerade"));
-
-    struct nft_set *dyn = ir_set_find(in, dg->name);
-    char sn[80];
-    nft_static_set_name(sn, sizeof(sn), dg->name);
-    struct nft_set *st = ir_set_find(in, sn);
-    check("динамическая половина — только timeout", NFT_SET_TIMEOUT, dyn ? (long)dyn->flags : -1);
-    check("без элементов и без auto-merge", 0, dyn ? (dyn->els != NULL) + dyn->auto_merge : -1);
-    check("статическая половина _n — interval", NFT_SET_INTERVAL, st ? (long)st->flags : -1);
-    check("с элементами из списка", NFT_EL_ADDR_FILE, st && st->els ? (long)st->els->k : -1);
-    check("и стоит сразу за динамической", 1, dyn && dyn->o.next == &st->o);
-    struct nft_chain *pm = ir_chain_find(in, "prerouting_mark");
-    check("правил канала — по одному на половину", 2, count_fam(pm, cm("steer:", dg->name), 4));
-    /* Половина IPv6 доменной группы fake-IP — только при nat в ip6: v6-двойник по «<имя>6»
-     * (hash со сроками; без строк IPv6 в списках статической половины у неё нет). */
-    check("v6-двойник — только при nat в ip6", !!(nftc & NFTC_IP6NAT),
-          count_fam(pm, cm("steer:", dg->name), 6));
-    r = ir_rule_find(pm, cm("steer:", dg->name));
-    check_str("первое — в статическую", sn, setref(r));
-    check_str("второе — в динамическую", dg->name, r ? setref(r->next) : "");
-    check("встречных правил тоже два", 2,
-          count_fam(ir_chain_find(in, "postrouting_down"), cm("steer-down:", dg->name), 4));
-
-    struct nft_chain *nq = ir_chain_find(in, "zapret_predefrag_nfqws");
-    if (nftc & NFTC_NOTRACK) {
-        check("с notrack predefrag остаётся", 1, nq != NULL);
-        check("фрагмент IPv6 — frag frag-off >= 0", 1,
-              nq && ir_rule_has(ir_rule_find(nq, NULL)->next, "frag frag-off >= 0"));
-        struct nft_chain *p6 = ir_chain_find(t6, "prerouting_nat");
-        /* У карты fakeip6 в ip6 — два своих правила: dnat и «без подмены — drop». */
-        check("в ip6 заворот DNS по устройству (udp, tcp)", 2,
-              (long)ir_rule_count(p6, NULL) - 2 * (ir_set_find(t6, "fakeip6") != NULL));
-        /* fake-IP v6: карта fakeip6 и её dnat переехали в ip6 вместе. */
-        check("в ip6 — карта fakeip6", 1, ir_set_find(t6, "fakeip6") != NULL);
-        check("и её нет в inet", 0, ir_set_find(in, "fakeip6") != NULL);
-        check("без правил моста и fakeip", 0, ir_rule_find(p6, "steer:tgws:tg") != NULL);
-        check("и своя пустая postrouting_nat", 1, ir_chain_find(t6, "postrouting_nat") != NULL);
-    } else {
-        check("без notrack predefrag_nfqws нет", 0, nq != NULL);
-        check("и прыгающей в неё predefrag тоже", 0, ir_chain_find(in, "zapret_predefrag") != NULL);
-        check("очередь при этом стоит", 1, ir_chain_find(in, "zapret_queue") != NULL);
-    }
-    nft_rs_free(&rs);
-}
-
 /* ---- 2б. emit вида подключён, и порядок в тексте не зависит от порядка выходов в спеке --- */
 static const char *mixed_rev =
     "{ \"schema\": 2, \"from_default\": [\"192.168.1.0/24\"],"
@@ -365,7 +264,7 @@ static void t_mixed_order(void) {
      * цепочки моста так же, как в t_mixed_modern. */
     if (load(mixed_rev)) { check("спека разобрана", 0, 1); return; }
     struct nft_rs rs;
-    if (build(&rs, 0)) { check("дерево построено", 0, 1); return; }
+    if (build(&rs)) { check("дерево построено", 0, 1); return; }
     struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
     int zi = -1, ti = -1, i = 0;
     for (struct nft_obj *o = t ? t->objs : NULL; o; o = o->next, i++) {
@@ -391,25 +290,20 @@ static const char *phone =
     "    { \"name\": \"s\", \"from\": [\"self\"], \"match\": { \"any\": true, \"allow_all\": true, \"proto\": \"udp\", \"ports\": [\"50000-65535\"] }, \"out\": \"vpn\" },"
     "    { \"name\": \"d\", \"from\": [\"uid:10124\"], \"match\": { \"domains_files\": [\"TMP/d.lst\"] }, \"out\": \"vpn\" } ] }";
 
-static void t_phone(int nftc) {
-    printf("\n-- каналы на сам телефон (%s) --\n", !nftc ? "современная" :
-           nftc & NFTC_IP6NAT ? "раскладка 4.9, nat в ip6" : "раскладка 4.9");
-    g_nftc = nftc;                  /* до групп, как у apply (половина IPv6 fake-IP) */
-    int load_rc = load(phone);
-    g_nftc = 0;
-    if (load_rc) { check("спека разобрана", 0, 1); return; }
-    /* Поддельные IPv6 (fake-IP v6) — там, где есть nat в ip6: в современной раскладке всегда. */
-    int f6 = !nftc || (nftc & NFTC_IP6NAT);
+static void t_phone(void) {
+    printf("\n-- каналы на сам телефон --\n");
+    if (load(phone)) { check("спека разобрана", 0, 1); return; }
+    /* Поддельные IPv6 (fake-IP v6) — всегда: nat в inet один на оба семейства. */
+    const int f6 = 1;
     const struct group *all = NULL, *dom = group_of("vpn", 1);
     for (size_t i = 0; i < g_gr.n; i++) if (g_gr.g[i].all) all = &g_gr.g[i];
     if (!all || !dom) { check("группы телефона есть", 0, 1); return; }
     struct nft_rs rs;
-    if (build(&rs, nftc)) { check("дерево построено", 0, 1); return; }
+    if (build(&rs)) { check("дерево построено", 0, 1); return; }
     struct nft_table *in = ir_table_find(&rs, NFT_FAM_INET, NULL);
     struct nft_chain *om = ir_chain_find(in, "output_mark");
     check_str("output_mark на хуке output", "output", chook(om));
-    check_str(nftc ? "в 4.9 — filter" : "в современной — route", nftc ? "filter" : "route",
-              ctype(om));
+    check_str("в современной — route", "route", ctype(om));
     /* Выход interface несёт IPv6 (KC_IPV6, 1.9): IPv6 «весь трафик» не отвергается, а метится
      * v6-двойником правила — под тем же именем, со своей сетью мимо. */
     check("отказа IPv6 у выхода с IPv6 нет", 0,
@@ -423,12 +317,12 @@ static void t_phone(int nftc) {
     check("двойник метит меткой выхода", 1, r6 && ir_expr_find(r6, NFT_X_MARKSET) != NULL);
     check("своя сеть IPv6 — мимо", 1, ir_rule_has(r6, "fe80::/10"));
     check("правило разметки группы есть", 1, r != NULL);
-    check("бит перемаршрутизации — только в 4.9", !!nftc, ir_rule_has(r, "mark or 0x00200000"));
-    check("и у двойника", !!nftc, ir_rule_has(r6, "mark or 0x00200000"));
+    check("бита перемаршрутизации нет", 0, ir_rule_has(r, "mark or 0x00200000"));
+    check("и у двойника", 0, ir_rule_has(r6, "mark or 0x00200000"));
     check("скачанное — в input_down", 1,
           ir_rule_find(ir_chain_find(in, "input_down"), cm("steer-down:", all->name)) != NULL);
     struct nft_table *t4 = ir_table_find(&rs, NFT_FAM_IP, NULL);
-    if (!nftc) {
+    {
         struct nft_chain *od = ir_chain_find(in, "output_dns");
         check_str("заворот DNS приложений — nat output", "output", chook(od));
         /* И по правилу «без подмены — drop» на семейство (steer-fakeip-local-nomap, generate.c). */
@@ -436,24 +330,6 @@ static void t_phone(int nftc) {
               (long)ir_rule_count(od, NULL));
         check("  правил без подмены — два", 2, (long)ir_rule_count(od, "steer-fakeip-local-nomap"));
         check("таблицы ip нет", 0, t4 != NULL);
-    } else {
-        struct nft_chain *rr = ir_chain_find(t4, "output_reroute");
-        check_str("в ip — output_reroute типа route", "route", ctype(rr));
-        check("на mangle + 2 = -148", -148, cprio(rr));
-        struct nft_chain *on = ir_chain_find(t4, "output_nat");
-        check("output_nat в ip: udp, tcp, fakeip и без подмены", 4, (long)ir_rule_count(on, NULL));
-        check("output_dns в inet не осталось", 0, ir_chain_find(in, "output_dns") != NULL);
-        /* ip6 — и без nat в ip6: IPv6 приложений метится (двойник), и бит перемаршрутизации на
-         * нём снимает только цепочка route в ip6. nat там — только при NFTC_IP6NAT. */
-        struct nft_table *t6 = ir_table_find(&rs, NFT_FAM_IP6, NULL);
-        check("ip6 есть (перемаршрутизация IPv6)", 1, t6 != NULL);
-        struct nft_chain *rr6 = ir_chain_find(t6, "output_reroute");
-        check_str("в ip6 — output_reroute типа route", "route", ctype(rr6));
-        check("output_nat в ip6 — только при nat в ip6: udp, tcp, fakeip6 и без подмены",
-              nftc & NFTC_IP6NAT ? 4 : 0,
-              (long)ir_rule_count(ir_chain_find(t6, "output_nat"), NULL));
-        check("цепочек nat в ip6 без nat в ip6 нет", !!(nftc & NFTC_IP6NAT),
-              ir_chain_find(t6, "prerouting_nat") != NULL);
     }
     /* Доменная группа приложения: парный набор IPv6 и v6-двойник — там же, где fake-IP v6. */
     char d6[80];
@@ -470,8 +346,8 @@ static void t_phone(int nftc) {
  * именем; клиенты по умолчанию из подсетей IPv4 — для IPv6 по устройству; клиент с адресом IPv6 —
  * `ip6 saddr`; direct — двойник без метки; выход без IPv6 (tgws) — двойник метит, а forward_v6
  * отвергает IPv6 с его меткой (fail-closed); список без строк IPv6 — ни набора, ни двойника. */
-static void t_router_v6(int nftc) {
-    printf("\n-- IPv6 правил на роутере (%s) --\n", nftc ? "раскладка 4.9" : "современная");
+static void t_router_v6(void) {
+    printf("\n-- IPv6 правил на роутере --\n");
     put("v6a.lst", "203.0.113.0/24\n2001:db8:1::/48\n2001:db8:2::1-2001:db8:2::9\n");
     put("v6b.lst", "198.51.100.0/24\n");
     put("v6c.lst", "2001:db8:3::/48\n");
@@ -491,7 +367,7 @@ static void t_router_v6(int nftc) {
         return;
     }
     struct nft_rs rs;
-    if (build(&rs, nftc)) { check("дерево построено", 0, 1); return; }
+    if (build(&rs)) { check("дерево построено", 0, 1); return; }
     struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
     struct nft_set *s6 = ir_set_find(t, "vpn_ip6");
     check("парный набор vpn_ip6 есть", 1, s6 != NULL);
@@ -549,8 +425,6 @@ static void t_router_v6(int nftc) {
     struct nft_expr *jx = ir_expr_find(rj, NFT_X_FAMILY);
     check("  только IPv6", 6, jx ? jx->fam : 0);
     check("выходу с IPv6 отказа нет", 0, ir_rule_find(fw, "steer-v6drop:vpn") != NULL);
-    if (nftc) check("в 4.9 на роутере ip6 без nat в ip6 нет", 0,
-                    ir_table_find(&rs, NFT_FAM_IP6, NULL) != NULL);
     nft_rs_free(&rs);
 
     /* Спека без IPv6 и без выходов без IPv6 — ни одного объекта IPv6. */
@@ -559,7 +433,7 @@ static void t_router_v6(int nftc) {
         check("спека без IPv6 разобрана", 0, 1);
         return;
     }
-    if (build(&rs, nftc)) { check("дерево построено", 0, 1); return; }
+    if (build(&rs)) { check("дерево построено", 0, 1); return; }
     t = ir_table_find(&rs, NFT_FAM_INET, NULL);
     check("без IPv6: одно правило разметки", 1,
           (long)ir_rule_count(ir_chain_find(t, "prerouting_mark"), NULL));
@@ -587,8 +461,8 @@ static int els_with(const struct nft_set *s, const char *needle) {
     return n;
 }
 
-static void t_balance(int nftc) {
-    printf("\n-- balance: карта numgen, метка соединения, вложенность (раскладка %d) --\n", nftc);
+static void t_balance(void) {
+    printf("\n-- balance: карта numgen, метка соединения, вложенность --\n");
     put("bal.lst", "203.0.113.0/24\n");
     if (load("version: 2\n"
              "lists:\n  l: { prefixes_file: TMP/bal.lst }\n"
@@ -601,7 +475,7 @@ static void t_balance(int nftc) {
              "  top: { kind: group, pick: balance, members: [res, in, a], weights: [2, 1, 1] }\n"
              "rules:\n  - { name: t, to: [l], out: top }\n") < 0) return;
     struct nft_rs rs;
-    if (build(&rs, nftc) < 0) return;
+    if (build(&rs) < 0) return;
     struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
     const struct output *top = oname("top"), *in = oname("in"), *res = oname("res"),
                         *a = oname("a"), *b = oname("b"), *c = oname("c");
@@ -670,8 +544,8 @@ static void t_balance(int nftc) {
 /* by: site, site_client — слот по хешу адресов вместо numgen: по правилу на семейство, семя —
  * номер таблицы группы (своё у каждой группы, постоянное между apply), карта и восстановление по
  * метке соединения — те же. */
-static void t_balance_by(int nftc) {
-    printf("\n-- balance by: site и site_client — jhash по адресам (раскладка %d) --\n", nftc);
+static void t_balance_by(void) {
+    printf("\n-- balance by: site и site_client — jhash по адресам --\n");
     put("bal.lst", "203.0.113.0/24\n");
     if (load("version: 2\n"
              "lists:\n  l: { prefixes_file: TMP/bal.lst }\n  m: { prefixes_file: TMP/bal.lst }\n"
@@ -684,7 +558,7 @@ static void t_balance_by(int nftc) {
              "  sc:  { kind: group, pick: balance, by: site_client, members: [a, b], weights: [1, 3] }\n"
              "rules:\n  - { name: t, to: [l], out: st }\n  - { name: u, to: [m], out: sc }\n") < 0) return;
     struct nft_rs rs;
-    if (build(&rs, nftc) < 0) return;
+    if (build(&rs) < 0) return;
     struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
     const struct output *st = oname("st"), *in = oname("in"), *sc = oname("sc");
     char c_st[32], m_st[32], c_in[32], m_in[32], c_sc[32], m_sc[32];
@@ -781,19 +655,12 @@ int main(void) {
     t_router_basic();
     if (!plat()->local_channels) {
         t_mixed_modern();
-        t_mixed_legacy(NFTC_LEGACY);
-        t_mixed_legacy(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
         t_mixed_order();
-        t_balance(0);
-        t_balance(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
-        t_balance_by(0);
-        t_balance_by(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
-        t_router_v6(0);
-        t_router_v6(NFTC_LEGACY);
+        t_balance();
+        t_balance_by();
+        t_router_v6();
     } else {
-        t_phone(0);
-        t_phone(NFTC_LEGACY);
-        t_phone(NFTC_LEGACY | NFTC_IP6NAT);
+        t_phone();
     }
     groups_free(&g_gr);
     char cmd[300];

@@ -67,7 +67,7 @@ cat > "$tmp/spec.json" <<EOF
   "channels": [ { "name": "mixed", "match": { "srs_file": "$FIX/mixed.srs" }, "out": "vpn" } ] }
 EOF
 # Проба ядра — без подсказок окружения: движок сам спрашивает, примет ли ядро составной набор.
-env -u STEER_NFT_CONCAT -u STEER_NFT_COMPAT "$BIN" apply --dry-run --spec "$tmp/spec.json" \
+env -u STEER_NFT_CONCAT "$BIN" apply --dry-run --spec "$tmp/spec.json" \
     --state-dir "$tmp/st" > "$tmp/rs.nft" 2> "$tmp/rs.err"
 check "проба ядра: составной набор выбран сам" yes \
     "$(grep -q 'type ipv4_addr . inet_proto . inet_service' "$tmp/rs.nft" && echo yes || echo no)"
