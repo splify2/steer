@@ -1,6 +1,6 @@
 /* .SO-ПЛАГИНЫ В ПРОЦЕССЕ steerd (steer-abi v1): загрузчик, таблица функций ядра, журнал виновного.
  *
- * Контракт — plugabi.h (копия include/steer/plugin.h из plugin-sdk), описание — docs/plugin-abi.md.
+ * Контракт — plugabi.h (копия include/steer/plugin.h из plugin-sdk), описание — plugin-sdk/docs/steer-abi.md.
  * Загрузчик живёт внутри steerd (plugso.c), а не отдельной библиотекой libsteer-plugin.so.1: таблице
  * host_v1 нужны цикл демона, спека, подписчики и сторож — то есть внутренности steerd, и
  * библиотеке пришлось бы получать их второй таблицей от того же steerd. Плагину разницы нет: он не
