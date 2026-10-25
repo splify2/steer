@@ -1,8 +1,8 @@
-/* Экспорт libsteer.so раскладки 2.0 (модули steer-<m> на libsteer) — ЗАМОРОЖЕН: снимок
- * build/libsteer.map до выноса стека в net1. Его берёт только build/build-libs.sh при STEER_LAYOUT=2.0
- * (откат и сверка); build/libs-exports.sh его не порождает и не сверяет. */
+/* Экспорт libsteer.so раскладки 2.0 (STEER_LAYOUT=2.0: модули steer-<m> на libsteer со стеком) —
+ * ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится. */
 LIBSTEER_1 {
   global:
+    SL_ECH_DNS;
     awg_apply_all;
     awg_check_all;
     awg_down_all;
@@ -15,16 +15,21 @@ LIBSTEER_1 {
     awg_scan_up;
     b64_decode;
     chello_parse;
+    cli_core_version;
     cli_help;
     cli_lookup;
     cli_parse;
     cli_unknown;
     cli_usage_short;
     cli_version;
+    cli_version_json;
     cli_wants_help;
     cmd_dev_id;
     cmd_sub_hwid;
     ctlcall_forward;
+    ctlcall_parse;
+    ctlcall_resp_free;
+    ctlcall_roundtrip;
     ctlcall_socket;
     die;
     dnsurl_parse;
@@ -59,10 +64,10 @@ LIBSTEER_1 {
     from_uid_range;
     g_nftc;
     geo_trace;
-    group_balance_slots;
     group_bal_chain;
     group_bal_map;
     group_bal_target;
+    group_balance_slots;
     group_carded;
     group_hysteresis;
     group_interval_s;
@@ -112,9 +117,9 @@ LIBSTEER_1 {
     ir_set_fakeip_state;
     ir_set_file;
     ir_set_mixed;
-    ir_setref;
     ir_set_srs;
     ir_set_value;
+    ir_setref;
     ir_strdup;
     ir_table_add;
     ir_table_find;
@@ -127,14 +132,16 @@ LIBSTEER_1 {
     kind_direct;
     kind_emit_all;
     kind_helper_free;
+    kind_plugin_device;
     kind_sig_mix;
-    kind_warpm;
+    kind_unavail;
     l4_box_text;
     l4_from_text;
+    l4_to_text;
     l4_union_alloc;
     l4match_same;
-    l4_to_text;
     load_spec;
+    load_spec_mode;
     nfd_chain_exists;
     nfd_chain_rules;
     nfd_ruleset_text;
@@ -182,9 +189,18 @@ LIBSTEER_1 {
     plat_select;
     plat_spec_default;
     plat_spec_resolve;
+    plugin_at;
+    plugin_cmd_exec;
+    plugin_cmd_find;
+    plugin_conf_write;
+    plugin_n;
+    plugin_nft_map;
+    plugin_refresh;
+    plugin_reload;
     plugso_http_get;
     pool_race_first;
     pool_run;
+    pool_set_status_path;
     probe_clear;
     probe_mem_escape;
     probe_read;
@@ -256,8 +272,12 @@ LIBSTEER_1 {
     sc_shake128_read;
     sc_x25519_base;
     set_name_famtag;
+    sigv_keynum_hex;
+    sigv_parse_key;
+    sigv_parse_sigs;
+    sigv_sigs_free;
+    sigv_verify_blocks;
     sl_add_pins;
-    SL_ECH_DNS;
     sl_host_is_name;
     sl_host_leads_nowhere;
     sl_intern;
@@ -287,6 +307,8 @@ LIBSTEER_1 {
     spec_line_family;
     spec_line_is_addr;
     spec_list_all;
+    spec_prepare;
+    spec_prepare_report;
     spec_print_v2;
     spec_print_v2_json;
     srs_clause;
@@ -305,6 +327,7 @@ LIBSTEER_1 {
     stack_sess_ready;
     stack_sess_room;
     stack_sess_rx;
+    stack_set_fakeip_path;
     steer_cmd_module;
     steer_dev_model;
     steer_dev_os;
@@ -332,6 +355,8 @@ LIBSTEER_1 {
     tls13_verify_reason;
     tls13_write;
     tls_cert_roots;
+    tr_dial;
+    tr_dial_udp;
     transport_aux_drain;
     transport_aux_fd;
     transport_aux_pending;
@@ -350,12 +375,11 @@ LIBSTEER_1 {
     transport_set_sock_mark;
     transport_strerror;
     transport_write;
-    tr_dial;
-    tr_dial_udp;
     tun_gro_flush;
     tun_gro_push;
     tun_open;
     tun_read_packet;
+    untar_gz_file;
     urltest_reader_only;
     urltest_url_parse;
     vless_insecure;
@@ -371,6 +395,14 @@ LIBSTEER_1 {
     ydoc_free;
     ydoc_parse_buf;
     ydoc_root;
+    ynode_at;
+    ynode_bool;
+    ynode_get;
+    ynode_is_null;
+    ynode_key_at;
+    ynode_len;
+    ynode_long;
+    ynode_val_at;
   local:
     *;
 };

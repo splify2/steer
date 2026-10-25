@@ -36,7 +36,8 @@
   "permissions": [
     "net.admin",
     "http",
-    "ctl"
+    "ctl",
+    "system-packages"
   ],
   "steer": {
     "kinds": [

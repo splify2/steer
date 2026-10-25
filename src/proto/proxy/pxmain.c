@@ -18,6 +18,16 @@
 #include "probe.h"
 #include "pool.h"
 
+/* {conf} помощника плагина (src/modules/plugout.h): есть только в программе протокола; в статических
+ * сборках (телефон, стенды) ссылки пустые, и выход берётся из спеки, как всегда. */
+#include "plugout.h"
+#pragma weak plugconf_get
+#pragma weak plugconf_out
+static const struct plugconf *pconf(void) {
+    const struct plugconf *pc = plugconf_get ? plugconf_get() : NULL;
+    return pc && pc->active ? pc : NULL;
+}
+
 #define LOG_W2 "steer[warn]: "
 #define LOG_I2 "steer[info]: "
 
@@ -69,6 +79,8 @@ static void underlay_setup(struct spec *sp, const struct output *o) {
         struct err e = {0};
         if (registry_assign(sp, &e) < 0) err_die(&e);
     }
+    const struct plugconf *pc = pconf();
+    if (pc) { transport_set_sock_mark(pc->sock_mark, pc->sock_mark_required); return; }
     transport_set_sock_mark(out_underlay_mark(sp, o ? o : &none), o && o->over[0]);
 }
 
@@ -340,5 +352,6 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
     pc.out = out_name;
     struct err e = {0};
     if (registry_assign(sp, &e) < 0) err_die(&e);
+    if (plugconf_out) plugconf_out(o);    /* метка и таблица — из {conf}, а не из своей копии реестра */
     return px_tunnel_run(o, &pc, px_ready, NULL);
 }

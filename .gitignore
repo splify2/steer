@@ -166,3 +166,7 @@ build/*-s2p.log
 build/libs-host20/
 build/libs-host20.log
 build/libs-test-*.log
+build/libs-plug/
+build/libs20-*/
+build/libs20-*.log
+build/build-*.log

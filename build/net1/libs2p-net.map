@@ -35,6 +35,7 @@ LIBS2P_NET_1 {
     s2p_plat_spec_yaml;
     s2p_pool_race_first;
     s2p_pool_run;
+    s2p_pool_set_status_path;
     s2p_prof;
     s2p_qc_close;
     s2p_qc_datagram_max;
@@ -115,10 +116,10 @@ LIBS2P_NET_1 {
     s2p_stack_sess_ready;
     s2p_stack_sess_room;
     s2p_stack_sess_rx;
+    s2p_stack_set_fakeip_path;
     s2p_steer_rt_tables_dir;
     s2p_steer_set_keep_dir_of;
     s2p_steer_set_state_dir;
-    s2p_steer_spec_path;
     s2p_steer_state_dir;
     s2p_str_array;
     s2p_str_list;

@@ -88,7 +88,8 @@ files_of() { (cd "$1" && find . -mindepth 1 \( -type f -o -type l \) | sed 's|^\
 
 # ---- 1. состав ----------------------------------------------------------------------------
 core_files="$(files_of "$T/apk/steer-core")"
-for want in /usr/sbin/steerd /usr/sbin/steer /usr/sbin/steer-tools /usr/sbin/steer-nfqws \
+# steer-nfqws ушёл из ядра вместе с zapret (2.1.0, docs/spec-v2.md: kind zapret убран).
+for want in /usr/sbin/steerd /usr/sbin/steer /usr/sbin/steer-tools \
             /etc/init.d/steer /etc/hotplug.d/iface/95-steer /lib/upgrade/keep.d/steer; do
     check "steer-core содержит $want (всё, что было в прежнем пакете steer)" "1" \
         "$(printf '%s\n' "$core_files" | grep -cx "$want")"
@@ -99,7 +100,7 @@ check "steer-core содержит libsteer-wolfssl.so.<версия wolfSSL>" "
     "$(printf '%s\n' "$core_files" | grep -c '^/usr/lib/libsteer-wolfssl\.so\.[0-9.]*$')"
 check "steer-tools — ссылка на steerd" "steerd" "$(readlink "$T/apk/steer-core/usr/sbin/steer-tools")"
 check "у steer-core нет других файлов" "0" \
-    "$(printf '%s\n' "$core_files" | grep -vcE '^/(usr/sbin/(steerd|steer|steer-tools|steer-nfqws)|usr/lib/libsteer(-wolfssl)?\.so\.[0-9.]+|etc/init\.d/steer|etc/hotplug\.d/iface/95-steer|lib/upgrade/keep\.d/steer|usr/share/steer/steer-abi|usr/share/nftables\.d/chain-pre/input/30-steer\.nft|usr/share/steer/seed/.*)$')"
+    "$(printf '%s\n' "$core_files" | grep -vcE '^/(usr/sbin/(steerd|steer|steer-tools|steer-nfqws)|usr/lib/libsteer(-wolfssl)?\.so\.[0-9.]+|etc/init\.d/steer|etc/hotplug\.d/iface/95-steer|lib/upgrade/keep\.d/steer|usr/share/steer/steer-abi|usr/share/nftables\.d/chain-pre/input/30-steer\.nft|usr/share/steer/seed/.*|usr/share/steer/keys/.*|etc/steer/plugins/.*|lib/upgrade/keep\.d/steer-plugins|etc/init\.d/steer-plugins)$')"
 if [ "$LAYOUT" = 2.1 ]; then
     # Семя (plugin-sdk/docs/migration-2.1.md, раздел 5): подписанный индекс и архивы протоколов и net1.
     check "steer-core 2.1: семя — index.json и подпись" "1 1" \
@@ -123,7 +124,7 @@ for p in $PKGS; do
     check "$p: состав .apk и .ipk одинаков" "$(files_of "$T/apk/$p")" "$(files_of "$T/ipk/$p")"
 done
 check "steer-core: init.d, hotplug и бинарники исполняемы" "" \
-    "$(for f in usr/sbin/steerd usr/sbin/steer usr/sbin/steer-nfqws etc/init.d/steer etc/hotplug.d/iface/95-steer; do [ -x "$T/apk/steer-core/$f" ] || printf '%s ' "$f"; done)"
+    "$(for f in usr/sbin/steerd usr/sbin/steer etc/init.d/steer etc/hotplug.d/iface/95-steer; do [ -x "$T/apk/steer-core/$f" ] || printf '%s ' "$f"; done)"
 
 # ---- 2. зависимости и миграция: метаданные ----------------------------------------------------
 dump() { apk adbdump --allow-untrusted "out/$1-$V-1_$A.apk"; }
@@ -204,7 +205,7 @@ if [ "$LAYOUT" = 2.1 ]; then
             -o "$R0/sys/$A/$d-1-r0.apk" >/dev/null 2>&1
     done
     for f in out/*_"$A".apk; do b="${f##*/}"; cp "$f" "$R0/new/$A/${b%%-$V-1_*}-$V-r1.apk"; done
-    OV=2.0.5-r1
+    OV=0.9-r1   # заведомо старше любой сборки
     mko() {  # ИМЯ ЗАВИСИМОСТИ — пустой пакет прежней версии
         mkdir -p "$T/o21/$1/usr/lib/o21"; echo "$1" > "$T/o21/$1/usr/lib/o21/$1"
         apk mkpkg --info "name:$1" --info "version:$OV" --info "arch:$A" ${2:+--info "depends:$2"} \
@@ -216,9 +217,12 @@ if [ "$LAYOUT" = 2.1 ]; then
     for r in old new sys; do apk mkndx --allow-untrusted -o "$R0/$r/$A/APKINDEX.tar.gz" "$R0/$r/$A"/*.apk >/dev/null 2>&1; done
     apkr21() { _root="$1"; shift; apk --root "$_root" --arch "$A" --allow-untrusted --no-network --no-cache \
         --keys-dir "$T/nokeys" --repositories-file /dev/null -X "$R0/sys" -X "$R0/old" -X "$R0/new" "$@"; }
-    for sc in "ext:steer-extended:upgrade" "ext-add:steer-extended:add steer-core" "mods:steer-core steer-vless steer-hysteria2 steer-warpbox:upgrade"; do
+    for sc in "ext:steer-extended:upgrade" "ext-add:steer-extended:add steer-core=$V-r1" "mods:steer-core steer-vless steer-hysteria2 steer-warpbox:upgrade"; do
         _n="${sc%%:*}"; _rest="${sc#*:}"; _w="${_rest%%:*}"; _cmd="${_rest#*:}"
-        _r="$T/r21-$_n"; rm -rf "$_r"; mkdir -p "$_r"
+        _r="$T/r21-$_n"; rm -rf "$_r"; mkdir -p "$_r/bin" "$_r/lib" "$_r/etc"
+        # Скриптам пакетов нужна оболочка; init.d — заглушкой (как mkroot ниже).
+        cp /bin/busybox "$_r/bin/"; ln -s busybox "$_r/bin/sh"; cp /lib/ld-musl-*.so.1 "$_r/lib/"
+        printf 'echo "RC $2" >> /order.log\n' > "$_r/etc/rc.common"
         apk --root "$_r" --arch "$A" --allow-untrusted --no-network --no-cache --keys-dir "$T/nokeys" \
             --repositories-file /dev/null -X "$R0/sys" -X "$R0/old" --initdb add $_w >/dev/null 2>&1
         # shellcheck disable=SC2086

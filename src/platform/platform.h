@@ -132,8 +132,6 @@ const char *plat_etc_path(char *buf, size_t n, const char *name);
  * платформы); зовут точки входа, разобравшие --spec (main.c, демон). */
 const char *steer_keep_dir(void);
 void steer_set_keep_dir_of(const char *spec_path);
-/* Путь спеки этого запуска (тот, что дан steer_set_keep_dir_of), иначе умолчание платформы. */
-const char *steer_spec_path(void);
 
 /* СПЕКА ПО УМОЛЧАНИЮ — spec.json или spec.yaml рядом (docs/spec-v2.md, «Файл спеки»).
  * plat_spec_yaml — путь spec.yaml рядом с spec_path. plat_spec_default — какую из двух читать:

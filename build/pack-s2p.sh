@@ -56,7 +56,9 @@ for _p in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do
 done
 ls "$DIST"/*-"$ARCH".s2p >/dev/null
 
-# Семя: индекс тех же архивов (migration-2.1.md, раздел 5). default — протоколы (их ставит migrate при
+# Семя: индекс тех же архивов (migration-2.1.md, раздел 5). Срок индекса семени — десять лет
+# (S2P_SEED_EXPIRES): семя читают без сети спустя месяцы после выпуска, обычные 30 дней сделали бы его
+# негодным раньше, чем им воспользуются. default — протоколы (их ставит migrate при
 # первой установке), net1 тянется по requires.plugins.
 if [ -n "$SEED" ]; then
     rm -rf "$SEED"
@@ -75,7 +77,7 @@ if [ -n "$SEED" ]; then
     cp "$DIST/net1-$N1VER-$ARCH.s2p" "$_in/"
     for _p in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do cp "$DIST/$_p-$VERSION-$ARCH.s2p" "$_in/"; done
     "$S2P_BIN" index "$_in" -o "$SEED" --repo splify2 --name splify2 --meta "$_meta" \
-        --pub "${KEY%.sec}.pub" --key "$IKEY" --mirror https://splify2.github.io/plugins/ >/dev/null
+        --pub "${KEY%.sec}.pub" --key "$IKEY" --mirror https://splify2.github.io/plugins/ --expires "${S2P_SEED_EXPIRES:-3650d}" >/dev/null
 fi
 [ -z "$TESTKEY" ] || echo "pack-s2p: $ARCH — подписано ТЕСТОВЫМ ключом build/s2p-testkey/test.sec" >&2
 echo "pack-s2p: $ARCH — $(ls "$DIST"/*-"$ARCH".s2p | wc -l) архивов${SEED:+, семя $SEED}"

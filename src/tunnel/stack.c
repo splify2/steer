@@ -2809,9 +2809,17 @@ static int fp_cmp(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
+static char *g_fakeip_path;   /* задан помощником плагина из {conf}; живёт до конца процесса */
+
+void stack_set_fakeip_path(const char *path) {
+    free(g_fakeip_path);
+    g_fakeip_path = path && *path ? strdup(path) : NULL;
+}
+
 static void fake_load(void) {
-    char path[512];
-    if (snprintf(path, sizeof(path), "%s/fakeip.state", steer_state_dir()) >= (int)sizeof(path)) return;
+    char path[4096];
+    if (g_fakeip_path) snprintf(path, sizeof(path), "%s", g_fakeip_path);
+    else if (snprintf(path, sizeof(path), "%s/fakeip.state", steer_state_dir()) >= (int)sizeof(path)) return;
     struct stat st;
     if (stat(path, &st) != 0 || st.st_mtime == g_fp_mtime) return;
     FILE *f = fopen(path, "r");

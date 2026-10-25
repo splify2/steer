@@ -33,6 +33,16 @@
 #include "probe.h"
 #include "thrstack.h"
 
+/* {conf} помощника плагина (src/modules/plugout.h): есть только в программе протокола; в статических
+ * сборках (телефон, стенды) ссылки пустые, и выход берётся из спеки, как всегда. */
+#include "plugout.h"
+#pragma weak plugconf_get
+#pragma weak plugconf_out
+static const struct plugconf *pconf(void) {
+    const struct plugconf *pc = plugconf_get ? plugconf_get() : NULL;
+    return pc && pc->active ? pc : NULL;
+}
+
 #define LOG_W2 "steer[warn]: "
 #define LOG_I2 "steer[info]: "
 
@@ -87,6 +97,8 @@ static void underlay_setup(struct spec *sp, const struct output *o) {
         struct err e = {0};
         if (registry_assign(sp, &e) < 0) err_die(&e);
     }
+    const struct plugconf *pc = pconf();
+    if (pc) { hy2c_set_mark(pc->sock_mark, pc->sock_mark_required); return; }
     hy2c_set_mark(out_underlay_mark(sp, o ? o : &none), o && o->over[0]);
 }
 
@@ -260,8 +272,10 @@ static void *geo_thread(void *arg) {
 }
 
 static void state_write(void) {
-    char path[300], tmp[320];
-    snprintf(path, sizeof(path), "%s/hy2-%.32s", steer_state_dir(), g_state_out);
+    char path[4096], tmp[4200];
+    const struct plugconf *pc = pconf();
+    if (pc) snprintf(path, sizeof(path), "%s", pc->status_path);   /* файл плагина для status (steer-api.md, 2.2) */
+    else snprintf(path, sizeof(path), "%s/hy2-%.32s", steer_state_dir(), g_state_out);
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     struct hy2c_status s;
     hy2c_status(&s);
@@ -603,6 +617,7 @@ int cmd_hysteria2(const char *spec_path, const char *out_name) {
 
     struct err e = {0};
     if (registry_assign(sp, &e) < 0) err_die(&e);
+    if (plugconf_out) plugconf_out(o);    /* метка и таблица — из {conf}, а не из своей копии реестра */
     /* Ключи пула, которые у hysteria2 есть: период проверки узла и срок простоя QUIC. */
     if (o->hy2.pool.interval_s) g_nw_period_s = o->hy2.pool.interval_s;
     hy2c_set_idle(o->hy2.pool.silence_s);

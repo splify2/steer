@@ -109,6 +109,14 @@
 /* Имя раздачи `by` для status и описания. Своя копия трёх строк kinds/group.c (group_by_name), а не
  * вызов: стек живёт и в библиотеке-плагине net1, которая с реестром видов ядра не связана
  * (build/sources.mk, «РАСКЛАДКА 2.1»). Порядок — enum раздачи группы (spec.h). */
+/* Файл состояния, заданный помощником плагина (pool_set_status_path); NULL — прежнее место. */
+static char *g_status_path;
+
+void pool_set_status_path(const char *path) {
+    free(g_status_path);
+    g_status_path = path && *path ? strdup(path) : NULL;
+}
+
 static const char *pl_by_name(int b) {
     static const char *const N[] = { "connection", "site", "site_client" };
     return b >= 0 && (size_t)b < sizeof(N) / sizeof(N[0]) ? N[b] : "connection";
@@ -357,8 +365,9 @@ static void pl_publish(void) {
      * файла proxy-*: один узел); want — сколько просили (active), slots — сколько держим (не больше
      * кандидатов). Верен, пока жив pid (как у hy2-*): kill -9 убрать за собой не даст. */
     if (!g_pl.cf.out || !g_pl.cf.proto->tag) return;
-    char path[320], tmp[340];
-    snprintf(path, sizeof path, "%s/%s-%.32s", steer_state_dir(), g_pl.cf.proto->tag, g_pl.cf.out);
+    char path[4096], tmp[4200];
+    if (g_status_path) snprintf(path, sizeof path, "%s", g_status_path);
+    else snprintf(path, sizeof path, "%s/%s-%.32s", steer_state_dir(), g_pl.cf.proto->tag, g_pl.cf.out);
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (!f) return;
@@ -423,7 +432,9 @@ static void pl_publish(void) {
         fputs("}}", f);
     }
     fputs("}\n", f);
-    if (fclose(f) != 0 || rename(tmp, path) != 0) unlink(tmp);
+    if (fclose(f) != 0 || rename(tmp, path) != 0) { unlink(tmp); return; }
+    /* Помощник плагина говорит ядру, что файл состояния переписан (событие state, steer-api.md 2.2). */
+    if (g_status_path) evline_emit("state", (const char *)NULL);
 }
 
 /* ---- проба кандидатов наперегонки (pool.h) ------------------------------------------------------ */

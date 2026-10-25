@@ -197,17 +197,7 @@ const char *steer_keep_dir(void) {
     return g_keep_dir[0] ? g_keep_dir : plat()->etc_dir;
 }
 
-/* Путь спеки этого запуска целиком (куча, любой длины): его кладёт в {conf} помощника плагина
- * (paths.spec, kinds/plugin.c), чтобы помощник читал ту же спеку, что демон, а не умолчание. */
-static char *g_spec_path;
-
-const char *steer_spec_path(void) {
-    return g_spec_path ? g_spec_path : plat_spec_default();
-}
-
 void steer_set_keep_dir_of(const char *spec_path) {
-    free(g_spec_path);
-    g_spec_path = spec_path && *spec_path ? strdup(spec_path) : NULL;
     g_keep_dir[0] = '\0';
     if (!spec_path || !*spec_path) return;
     const char *sl = strrchr(spec_path, '/');

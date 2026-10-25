@@ -36,7 +36,7 @@
 #
 # Плагины ищут net1 по RUNPATH $ORIGIN/../../net1/lib — раскладка каталога плагинов на роутере
 # (/usr/lib/steer/plugins/<id>/bin) та же, что здесь. STEER_LAYOUT=2.0 — прежняя раскладка: libsteer со
-# стеком (PROFILE_libsteer20, замороженная карта build/libsteer20.map) и модули steer-<m> на ней.
+# стеком (PROFILE_libsteer20, карта build/libsteer20.map, её тоже порождает build/libs-exports.sh) и модули steer-<m> на ней.
 set -eu
 
 OUT="${1:?нужен выходной каталог}"

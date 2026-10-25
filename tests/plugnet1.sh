@@ -97,16 +97,36 @@ check "без net1 плагин не стартует, загрузчик наз
 mv "$W/net1.away" "$P/net1"
 
 # ---- --conf {conf} -------------------------------------------------------------------------------
+mkdir -p "$W/pst"
 cat > "$W/vl.json" <<CONF
-{"api":"1.0","plugin":{"id":"vless","version":"x"},"output":{"name":"vl","kind":"tunnel:vless","keys":{}},
- "paths":{"etc":"$W/etc","state":"$W/st2","lists":"$W/etc/lists","plugin":"$P/vless"},"platform":"openwrt"}
+{"api":"1.0","plugin":{"id":"vless","version":"x"},
+ "output":{"name":"vl","kind":"tunnel:vless","keys":{"subscription":"$W/sub.txt"},"device":"","mark":"0x00300000",
+           "mark_mask":"0x0ff00000","table":302,"ipv6":true,"on_fail":"drop","over":null,"sock_mark":"0x00000000",
+           "sock_mark_required":false,"tcp_port":0,"ports":[],"queues":[]},
+ "paths":{"etc":"$W/nonexistent-etc","state":"$W/nonexistent-state","plugin":"$P/vless","plugin_state":"$W/pst"},
+ "platform":"openwrt"}
 CONF
 a="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes vl --conf "$W/vl.json" 2>&1; echo "rc=$?")"
 b="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes vl --spec "$W/etc/spec.yaml" --state-dir "$W/st2" 2>&1; echo "rc=$?")"
-check "--conf {conf} даёт то же, что --spec и --state-dir" "$b" "$a"
+# Помощник знает о выходе только {conf}: спеки человека и каталогов ядра (их в {conf} нарочно нет на
+# диске) он не читает — перечень тот же, что по спеке.
+check "--conf {conf}: выход только из {conf}, без спеки человека — то же, что --spec" "$b" "$a"
 check "  и это перечень узлов выхода" "1" "$(printf '%s' "$a" | grep -c '"name":"A"')"
 o="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes vl --conf "$W/nope.json" 2>&1)"; r=$?
 check "--conf без файла — код 2 со словами" "2 1" "$r $(printf '%s' "$o" | grep -c 'файл настройки выхода не читается')"
+
+# hysteria2 по {conf}: ключи пула (silence) и снятый IPv6 доходят до разбора, узел честно не отвечает.
+cat > "$W/pst/hy.json" <<CONF
+{"api":"1.0","plugin":{"id":"hysteria2","version":"x"},
+ "output":{"name":"hy","kind":"tunnel:hysteria2","keys":{"subscription":"$W/hy.txt","silence":30},"device":"",
+           "mark":"0x00300000","table":302,"ipv6":false,"sock_mark":"0x00000000","sock_mark_required":false,"tcp_port":0},
+ "paths":{"plugin_state":"$W/pst"},"platform":"openwrt"}
+CONF
+o="$(timeout 30 env -u LD_LIBRARY_PATH "$P/hysteria2/bin/hysteria2" hysteria2 hy --conf "$W/pst/hy.json" 2>&1)"
+check "hysteria2 --conf: выход из {conf} разобран, узлы подписки перебраны" "1 1" \
+    "$(printf '%s' "$o" | grep -c 'узлов 1 (пропущено 0') $(printf '%s' "$o" | grep -c 'ни один узел подписки не отвечает')"
+check "  спека из одного выхода — в каталоге плагина, с ipv6: off и ключами вида" "1" \
+    "$(grep -c '"protocol":"hysteria2","ipv6":"off","subscription":"[^"]*","silence":30' "$W/pst/hy.spec.json")"
 
 # ---- настоящий туннель под root -------------------------------------------------------------------
 if [ "$(id -u)" = 0 ] && command -v python3 >/dev/null 2>&1; then
