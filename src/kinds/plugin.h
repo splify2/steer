@@ -86,7 +86,9 @@ struct plugin {
     struct plugin_cmd *cmd;  size_t cmd_n;
     struct plugin_kind **kind;  size_t kind_n;   /* в порядке манифеста */
     struct plugin_prog pre_apply;       /* prog NULL — хука нет */
-    int has_hooks;              /* есть check, expand или pre_apply: от них зависит подготовка спеки */
+    int has_hooks;              /* есть check, expand, pre_apply или ресурсы видов: от них зависит подготовка спеки */
+    unsigned res_ports, res_queues, res_marks;   /* resources манифеста: сколько на весь плагин */
+    char **requires;  size_t requires_n;    /* requires.plugins: id плагинов, раньше которых идут хуки */
     char **nft;  size_t nft_n;  /* steer.nft[]: файлы плагина с наборами и цепочками слотов */
     struct pnft **nftp;
     char *manifest;             /* байты plugin.json — в ключ подготовки */
@@ -151,6 +153,34 @@ int plugin_emit_all(struct nft_rs *rs, const struct spec *sp, struct err *e);
 /* `steer nft-map`: карта ядра для плагинов — таблица, базовые цепочки с хуком и приоритетом числом,
  * поле метки, слоты. json — JSON, иначе текст для человека. */
 void plugin_nft_map(FILE *out, int json);
+
+/* Помощник развёрнутого выхода (хук expand вернул helper: true): kind_ops.helper группы зовёт его. */
+int plugin_owner_helper(const struct spec *sp, const struct output *o, struct kind_helper *h);
+
+/* Окружение программы плагина (steer-api.md, 1.2) — в процесс, который сейчас запустит exec: хуки
+ * (plugprep.c), помощники, подкоманды. p — env из манифеста программы или NULL. */
+void plugin_env_set(const struct plugin *pl, const struct plugin_prog *p);
+/* Подстановки {out}, {plugin_dir}… в слове argv хука; NULL — отказ с причиной в why. */
+char *plugin_subst(const struct plugin *pl, const char *out_name, const char *s, char *why, size_t wn);
+/* Узел YAML/JSON → текст JSON по записи значения (тип — как читает YAML 1.2: число, true/false, null,
+ * иначе строка). */
+struct sbuf;
+void plugin_node_json(struct sbuf *b, const struct ynode *n);
+
+/* Ресурсы плагина целиком (resources манифеста): порты, очереди NFQUEUE, биты метки — выданные при
+ * подготовке. bits — номера битов вне поля метки steer. 0 — выданы; -1 — нет записи. */
+struct plugin_res { uint32_t *ports; size_t ports_n; uint32_t *queues; size_t queues_n; uint32_t *bits; size_t bits_n; };
+int plugin_res_get(const struct plugin *pl, struct plugin_res *r);
+void plugin_res_free(struct plugin_res *r);
+
+/* Ресурсы выхода вида плагина — порты и очереди, выданные при подготовке (alloc.json в каталоге
+ * данных менеджера). 0 — выданы; -1 — нет записи (спека не подготовлена). Массивы в арене sp. */
+int plugin_alloc_lookup(struct spec *sp, const struct plugin_kind *pk, const char *out,
+                        uint32_t **ports, size_t *pn, uint32_t **queues, size_t *qn);
+
+/* Отчёт последней подготовки спеки path (JSON: что изменили хуки pre_apply и expand, предупреждения)
+ * в кучу; -1 — отчёта нет. Ответ apply кладёт его в поле plugins. */
+int spec_prepare_report(const char *path, char **json);
 
 /* Ключи выхода как есть, без схемы — JSON-объект (недоступный вид: ключи проверить нечем, но
  * печать спеки не должна их терять). 0 / -1 (нет памяти). */

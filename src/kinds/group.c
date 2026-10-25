@@ -43,6 +43,7 @@
 
 #include "spec.h"
 #include "awg.h"
+#include "plugin.h"
 
 /* Спека v2 знает группу по имени; спека v1 — нет (kind_by_name её не находит, см. kind.h). */
 const struct kind_ops *kind_by_name_v2(const char *name) {
@@ -364,7 +365,8 @@ static unsigned group_caps_of(const struct output *o) {
  * при старте: транспорт, страны и состав членов (имена и over — туннели подбора идут тем же путём). */
 static int group_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     const struct group_cfg *g = &o->grp;
-    if (!g->warp.on) return -1;
+    /* Группа, которую развернул плагин (его хук expand вернул helper: true) — помощник плагина. */
+    if (!g->warp.on) return plugin_owner_helper(sp, o, h);
     if (kind_helper_cmd(h, "warp") != 0) return -1;
     h->marks = 1;
     kind_sig_mix(&h->sig, &g->warp.transport, sizeof(g->warp.transport));

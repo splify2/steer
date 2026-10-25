@@ -514,39 +514,52 @@ int load_spec(const char *path, struct spec *s, struct err *e) {
     return load_spec_mode(path, s, e, LOAD_PREPARED);
 }
 
-int load_spec_mode(const char *path, struct spec *s, struct err *e, int flags) {
-    /* Спека — значение (правило 6): экземпляр обнуляется здесь, а не оставляется на
-     * совести вызывающего, и получает те же умолчания, что раньше стояли инициализаторами
-     * глобалов — один br-lan клиентским устройством, всё остальное пусто/нуль. */
-    if (spec_defaults(s) != 0) return err_set(e, "%s", "недостаточно памяти для спеки");
-    s->load_flags = flags;
+/* Текст спеки по пути (с выбором между spec.json и spec.yaml, spec_pick_default) в кучу; "-" — stdin.
+ * 0 — прочитан, *buf с нулём в конце, *n — длина; -1 — отказ в e. Тем же читают load_spec_mode и
+ * шаг подготовки (plugprep.c): байты, по которым считается ключ, — ровно те, что разбирает ядро. */
+int spec_read_text(const char *path, char **buf, size_t *n, struct err *e) {
     if (spec_pick_default(&path, e) != 0) return -1;
     FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
     if (!f) return err_set(e, "%s: cannot open", path);
     /* Текст читается в кучу по мере надобности. Потолок — 16 МиБ: столько же,
      * сколько принимает ctl (CTL_FILE_MAX), — защита от файла-невпопад (лог вместо спеки), а не
      * размер спеки: спека на тысячи правил — сотни килобайт. */
-    size_t cap = 16384, n = 0;
-    char *buf = malloc(cap);
-    if (!buf) { if (f != stdin) fclose(f); return err_set(e, "%s", "недостаточно памяти для спеки"); }
+    size_t cap = 16384, len = 0;
+    char *b = malloc(cap);
+    if (!b) { if (f != stdin) fclose(f); return err_set(e, "%s", "недостаточно памяти для спеки"); }
     for (;;) {
-        if (n + 1 >= cap) {
+        if (len + 1 >= cap) {
             if (cap >= SPEC_TEXT_MAX) {
-                free(buf);
+                free(b);
                 if (f != stdin) fclose(f);
                 return err_set(e, "%s", "spec too large (max 16 MiB)");
             }
-            char *nb = realloc(buf, cap * 2);
-            if (!nb) { free(buf); if (f != stdin) fclose(f); return err_set(e, "%s", "недостаточно памяти для спеки"); }
-            buf = nb;
+            char *nb = realloc(b, cap * 2);
+            if (!nb) { free(b); if (f != stdin) fclose(f); return err_set(e, "%s", "недостаточно памяти для спеки"); }
+            b = nb;
             cap *= 2;
         }
-        size_t got = fread(buf + n, 1, cap - 1 - n, f);
+        size_t got = fread(b + len, 1, cap - 1 - len, f);
         if (!got) break;
-        n += got;
+        len += got;
     }
-    buf[n] = '\0';
+    b[len] = '\0';
     if (f != stdin) fclose(f);
+    *buf = b;
+    *n = len;
+    return 0;
+}
+
+int load_spec_mode(const char *path, struct spec *s, struct err *e, int flags) {
+    /* Спека — значение (правило 6): экземпляр обнуляется здесь, а не оставляется на
+     * совести вызывающего, и получает те же умолчания, что раньше стояли инициализаторами
+     * глобалов — один br-lan клиентским устройством, всё остальное пусто/нуль. */
+    if (spec_defaults(s) != 0) return err_set(e, "%s", "недостаточно памяти для спеки");
+    s->load_flags = flags;
+    char *buf = NULL;
+    size_t n = 0;
+    if (spec_pick_default(&path, e) != 0) return -1;
+    if (spec_read_text(path, &buf, &n, e) != 0) return -1;
     /* ПОДГОТОВЛЕННАЯ СПЕКА (kinds/plugprep.c, steer-api.md 3.1): если хуки плагинов исполнены над
      * этой спекой и ключ совпал (байты спеки, версии и манифесты плагинов), читается она: выходы
      * видов с разворотом заведены, номера ресурсов выданы. Хуков load_spec не исполняет. Имя и

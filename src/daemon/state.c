@@ -10,6 +10,7 @@
 #include "state.h"
 #include "err.h"
 #include "registry.h"
+#include "plugin.h"
 
 int steerd_init(struct steerd *d, struct loop *l, const char *spec_path, const char *state_dir) {
     memset(d, 0, sizeof(*d));
@@ -47,6 +48,12 @@ int steerd_load(struct steerd *d) {
         free(ng);
         snprintf(d->err, sizeof(d->err), "нет памяти под спеку");
         return -1;
+    }
+    /* Подготовка спеки (хуки плагинов, kinds/plugprep.c) — при старте и reload; сбой не роняет
+     * остальное: выходы, которым подготовка нужна, остаются недоступными и живут по on_fail. */
+    if (spec_prepare(d->spec_path, &e) < 0) {
+        fprintf(stderr, "steer[warn] подготовка спеки: %s\n", e.msg);
+        e.msg[0] = '\0';
     }
     /* Тот же порядок, что у cmd_status: разбор, метки из реестра, группы. */
     if (load_spec(d->spec_path, ns, &e) < 0 || registry_assign(ns, &e) < 0 ||

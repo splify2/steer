@@ -102,6 +102,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/supervisematch.sh
 	@sh tests/ctlmatch.sh
 	@sh tests/pluginlimits.sh
+	@sh tests/pluginkindmatch.sh
 	@sh tests/reroutematch.sh
 	@sh tests/supdmatch.sh
 	@sh tests/modhello.sh
@@ -399,8 +400,9 @@ $(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/
 # Виды — объектами (без awg.c и без парсера: стенд подменяет load_spec своей спекой). С
 # src/lib/ir.c — тем же доводом, что у MODEL_KINDS: tgws_emit зовёт ir_* на
 # компоновке, даже когда стенд их не вызывает (модели стенд не компонует, поэтому отдельно). И с
-# src/lib/module.c: kinds/tgws.c спрашивает, установлен ли модуль моста (шаг 4 выпуска 1.10).
-FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC) src/lib/ir.c src/lib/module.c
+# src/lib/module.c: kinds/tgws.c спрашивает, установлен ли модуль моста (шаг 4 выпуска 1.10). И с
+# YAML_SRC: реестр плагинов (kinds/plugin.c) читает манифесты и схемы тем же разбором, что спеку.
+FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC) src/lib/ir.c src/lib/module.c $(YAML_SRC)
 
 # Модель v2 и перевод спеки v1 (src/model/v1.c, src/kinds/group.c): каналы → правила, списки,
 # клиенты; пул devices → группа — модулями модели, без движка: см. шапку tests/modelmatch.c. С

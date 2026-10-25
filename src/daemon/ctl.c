@@ -151,6 +151,7 @@
 #include "platform.h"
 #include "spec.h"
 #include "groups.h"
+#include "plugin.h"
 #include "cli.h"
 #include "daemon.h"
 #include "loop.h"
@@ -1606,6 +1607,18 @@ static void apply_committed(struct conn *c, int code) {
     resp_bool(&c->resp, "saved", 1);
     resp_bool(&c->resp, "applied", 1);
     resp_bool(&c->resp, "enabled", 1);
+    /* Что изменили хуки плагинов при подготовке спеки (pre_apply, expand): отчёт шага
+     * подготовки (model/plugprep.c) — поле plugins. Нет хуков, нет и поля. */
+    {
+        char *rep = NULL;
+        if (spec_prepare_report(spec, &rep) == 0) {
+            size_t rl = strlen(rep);
+            while (rl && (rep[rl - 1] == '\n' || rep[rl - 1] == ' ')) rep[--rl] = '\0';
+            cb_str(&c->resp, ",\"plugins\":");      /* отчёт любой длины: cb_fmt режет на 1 КиБ */
+            cb_str(&c->resp, rep);
+            free(rep);
+        }
+    }
     c->after_reload = apply_finish;
     reload_begin(c);
 }

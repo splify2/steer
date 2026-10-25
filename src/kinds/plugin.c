@@ -201,6 +201,7 @@ static void plugin_free(struct plugin *p) {
     for (size_t i = 0; i < p->kind_n; i++) kind_free(p->kind[i]);
     free(p->kind);
     prog_free(&p->pre_apply);
+    vec_free(p->requires, p->requires_n);
     free(p->manifest);
 }
 
@@ -445,6 +446,18 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
             goto bad;
         }
     }
+    const struct ynode *res = ynode_get(root_n, "resources");
+    long rv;
+    if (res && res->kind == YN_MAP) {
+        const struct ynode *r;
+        if ((r = ynode_get(res, "ports")) && ynode_long(r, &rv) == 0 && rv > 0) p->res_ports = (unsigned)rv;
+        if ((r = ynode_get(res, "queues")) && ynode_long(r, &rv) == 0 && rv > 0) p->res_queues = (unsigned)rv;
+        if ((r = ynode_get(res, "mark_bits")) && ynode_long(r, &rv) == 0 && rv > 0) p->res_marks = (unsigned)rv;
+        if (p->res_ports || p->res_queues || p->res_marks) p->has_hooks = 1;
+    }
+    const struct ynode *rq = ynode_get(ynode_get(root_n, "requires"), "plugins");
+    for (size_t i = 0; rq && rq->kind == YN_MAP && i < ynode_len(rq); i++)
+        if (vec_add(&p->requires, &p->requires_n, ynode_key_at(rq, i)->str) != 0) { ydoc_free(d); return -1; }
     const struct ynode *kinds = ynode_get(st, "kinds");
     for (size_t i = 0; kinds && kinds->kind == YN_SEQ && i < kinds->len; i++) {
         struct plugin_kind *k = kind_load(p, ynode_at(kinds, i), why, sizeof(why));
@@ -993,7 +1006,7 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
     return 0;
 }
 
-static void raw_node(struct sbuf *b, const struct ynode *n) {
+void plugin_node_json(struct sbuf *b, const struct ynode *n) {
     if (n->kind == YN_SCALAR) {
         const char *t = scalar_infer(n);
         if (!strcmp(t, "integer") || !strcmp(t, "number")) sb_str(b, n->str);
@@ -1002,7 +1015,7 @@ static void raw_node(struct sbuf *b, const struct ynode *n) {
         else sb_json(b, n->str);
     } else if (n->kind == YN_SEQ) {
         sb_str(b, "[");
-        for (size_t i = 0; i < n->len; i++) { if (i) sb_str(b, ","); raw_node(b, ynode_at(n, i)); }
+        for (size_t i = 0; i < n->len; i++) { if (i) sb_str(b, ","); plugin_node_json(b, ynode_at(n, i)); }
         sb_str(b, "]");
     } else {
         sb_str(b, "{");
@@ -1010,7 +1023,7 @@ static void raw_node(struct sbuf *b, const struct ynode *n) {
             if (i) sb_str(b, ",");
             sb_json(b, ynode_key_at(n, i)->str);
             sb_str(b, ":");
-            raw_node(b, ynode_val_at(n, i));
+            plugin_node_json(b, ynode_val_at(n, i));
         }
         sb_str(b, "}");
     }
@@ -1018,7 +1031,7 @@ static void raw_node(struct sbuf *b, const struct ynode *n) {
 
 int plugin_keys_raw(const struct ynode *keys, char **json) {
     struct sbuf b = { 0 };
-    raw_node(&b, keys);
+    plugin_node_json(&b, keys);
     if (b.oom || !b.p) { free(b.p); return -1; }
     *json = b.p;
     return 0;
@@ -1056,9 +1069,18 @@ int plugin_keys_check(const struct plugin_kind *pk, const struct ynode *keys, co
     return 0;
 }
 
+/* ---- подстановки для хуков ---- */
+static char *subst(const struct plugin *pl, const struct spec *sp, const struct output *o,
+                   const char *oname, const char *s, char *why, size_t wn);
+char *plugin_subst(const struct plugin *pl, const char *out_name, const char *s, char *why, size_t wn) {
+    return subst(pl, NULL, NULL, out_name, s, why, wn);
+}
+
 /* ---- окружение программ плагина (steer-api.md, 1.2) --------------------------------------------- */
 
 static void env_put(const char *k, const char *v) { setenv(k, v, 1); }
+static void plugin_env(const struct plugin *pl, const struct plugin_prog *p);
+void plugin_env_set(const struct plugin *pl, const struct plugin_prog *p) { plugin_env(pl, p); }
 
 /* Окружение каждой программы плагина: версии, каталоги, платформа. Переменные из env манифеста
  * ставятся после и не заменяют эти. */
@@ -1093,11 +1115,12 @@ static void plugin_env(const struct plugin *pl, const struct plugin_prog *p) {
 /* ---- подстановки (steer-api.md, 1.3) ------------------------------------------------------- */
 
 /* Подстановки в строке s: {out}, {conf}, {plugin_dir}, {plugin_conf}, {plugin_state}, {out_mark},
- * {out_table}, {steer_mask}, {tcp_port}, {port<N>}/{queue<N>} (ресурсы плагина), {out_port<N>} (порты
- * выхода); {{ и }} — буквальные скобки. o может быть NULL (подстановки выхода тогда — отказ).
+ * {out_table}, {steer_mask}, {tcp_port}, {mark}/{mark<N>}/{port<N>}/{queue<N>} (ресурсы плагина),
+ * {out_port<N>} и {out_queue<N>} (ресурсы выхода); {{ и }} — буквальные скобки. o может быть NULL (подстановки выхода тогда — отказ).
  * Возврат — строка в куче или NULL с причиной в why. */
-static char *subst(const struct plugin *pl, const struct spec *sp, const struct output *o, const char *s,
-                   char *why, size_t wn) {
+static char *subst(const struct plugin *pl, const struct spec *sp, const struct output *o,
+                   const char *oname, const char *s, char *why, size_t wn) {
+    if (o) oname = o->name;
     struct sbuf b = { 0 };
     char etc[PATH_MAX];
     plugin_etc(etc, sizeof(etc));
@@ -1120,8 +1143,8 @@ static char *subst(const struct plugin *pl, const struct spec *sp, const struct 
         else if (!strcmp(name, "plugin_conf")) sb_printf(&b, "%s/conf/%s", etc, pl->id);
         else if (!strcmp(name, "plugin_state")) sb_printf(&b, "%s/plugin/%s", steer_state_dir(), pl->id);
         else if (!strcmp(name, "steer_mask")) sb_printf(&b, "0x%08x", plat()->mark_mask);
-        else if (o && !strcmp(name, "out")) sb_str(&b, o->name);
-        else if (o && !strcmp(name, "conf")) sb_printf(&b, "%s/plugin/%s/%s.json", steer_state_dir(), pl->id, o->name);
+        else if (oname && !strcmp(name, "out")) sb_str(&b, oname);
+        else if (oname && !strcmp(name, "conf")) sb_printf(&b, "%s/plugin/%s/%s.json", steer_state_dir(), pl->id, oname);
         else if (o && !strcmp(name, "out_mark")) sb_printf(&b, "0x%08x", o->mark);
         else if (o && !strcmp(name, "out_table")) sb_printf(&b, "%d", o->table);
         else if (o && !strcmp(name, "tcp_port")) sb_printf(&b, "%d", out_tcp_port(o));
@@ -1133,22 +1156,42 @@ static char *subst(const struct plugin *pl, const struct spec *sp, const struct 
                 return NULL;
             }
             sb_printf(&b, "%u", o->plg.ports[i]);
-        } else if (o && !strncmp(name, "queue", 5) && isdigit((unsigned char)name[5])) {
-            size_t i = (size_t)atoi(name + 5);
+        } else if (o && !strncmp(name, "out_queue", 9) && isdigit((unsigned char)name[9])) {
+            size_t i = (size_t)atoi(name + 9);
             if (!kind_of(o)->plugin || i >= o->plg.queues_n) {
                 snprintf(why, wn, "{%s}: у выхода %s нет очереди с номером %zu", name, o->name, i);
                 free(b.p);
                 return NULL;
             }
             sb_printf(&b, "%u", o->plg.queues[i]);
-        } else if (o && !strncmp(name, "port", 4) && isdigit((unsigned char)name[4])) {
-            size_t i = (size_t)atoi(name + 4);
-            if (!kind_of(o)->plugin || i >= o->plg.ports_n) {
-                snprintf(why, wn, "{%s}: у выхода %s нет порта с номером %zu", name, o->name, i);
+        } else if (!strcmp(name, "mark") || ((!strncmp(name, "mark", 4) || !strncmp(name, "queue", 5) ||
+                                              !strncmp(name, "port", 4)) && isdigit((unsigned char)name[strlen(name) - 1]))) {
+            /* Ресурсы плагина (resources манифеста): выданы при подготовке спеки, alloc.json. */
+            struct plugin_res r;
+            if (plugin_res_get(pl, &r) != 0) {
+                snprintf(why, wn, "{%s}: ресурсы плагина не выданы — нужен reload", name);
                 free(b.p);
                 return NULL;
             }
-            sb_printf(&b, "%u", o->plg.ports[i]);
+            int bad = 0;
+            if (!strcmp(name, "mark")) {
+                uint32_t m = 0;
+                for (size_t i = 0; i < r.bits_n; i++) m |= 1u << r.bits[i];
+                if (!r.bits_n) bad = 1;
+                else sb_printf(&b, "0x%08x", m);
+            } else {
+                int dl = !strncmp(name, "mark", 4) ? 4 : !strncmp(name, "queue", 5) ? 5 : 4;
+                size_t i = (size_t)atoi(name + dl);
+                if (!strncmp(name, "mark", 4)) { if (i >= r.bits_n) bad = 1; else sb_printf(&b, "0x%08x", 1u << r.bits[i]); }
+                else if (!strncmp(name, "queue", 5)) { if (i >= r.queues_n) bad = 1; else sb_printf(&b, "%u", r.queues[i]); }
+                else { if (i >= r.ports_n) bad = 1; else sb_printf(&b, "%u", r.ports[i]); }
+            }
+            plugin_res_free(&r);
+            if (bad) {
+                snprintf(why, wn, "{%s}: у плагина %s нет такого ресурса (resources манифеста)", name, pl->id);
+                free(b.p);
+                return NULL;
+            }
         } else {
             snprintf(why, wn, "неизвестная подстановка {%s}", name);
             free(b.p);
@@ -1181,8 +1224,8 @@ static void plg_keys_of(const struct output *o, struct out_keys *k) {
 
 /* Помощник выхода: программа плагина с раскрытым argv. Подпись перезапуска — версия плагина и
  * ключи вида (а когда {conf} пишет демон — хеш его содержимого, steer-api.md, 1.4). */
-static int plg_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
-    const struct plugin_kind *pk = o->plg.pk;
+static int plg_helper_for(const struct plugin_kind *pk, const struct spec *sp, const struct output *o,
+                          struct kind_helper *h) {
     if (!pk || !pk->helper.prog) return -1;
     const struct plugin *pl = pk->owner;
     char why[256];
@@ -1197,7 +1240,7 @@ static int plg_helper(const struct spec *sp, const struct output *o, struct kind
     size_t n = pk->helper_argv_set ? pk->helper.argc : 3;
     if (!pk->helper_argv_set && kind_helper_arg(h, pk->helper_cmd ? pk->helper_cmd : pk->name) != 0) return -1;
     for (size_t i = 0; i < n; i++) {
-        char *a = subst(pl, sp, o, pk->helper_argv_set ? pk->helper.argv[i] : DEF[i], why, sizeof(why));
+        char *a = subst(pl, sp, o, NULL, pk->helper_argv_set ? pk->helper.argv[i] : DEF[i], why, sizeof(why));
         if (!a) {
             fprintf(stderr, "steer[warn] плагин %s: помощник %s: %s\n", pl->id, o->name, why);
             return -1;
@@ -1209,16 +1252,34 @@ static int plg_helper(const struct spec *sp, const struct output *o, struct kind
     for (size_t i = 0; i < pk->helper.envc; i++)
         if (kind_helper_env(h, pk->helper.env[i]) != 0) return -1;
     kind_sig_mix(&h->sig, pl->version, strlen(pl->version));
-    const char *kj = o->plg.keys_json ? o->plg.keys_json : "";
+    const char *kj = out_plugin_keys(o);
+    if (!kj) kj = "";
     kind_sig_mix(&h->sig, kj, strlen(kj));
     return 0;
+}
+
+static int plg_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
+    return plg_helper_for(o->plg.pk, sp, o, h);
+}
+
+/* Помощник РАЗВЁРНУТОГО выхода: хук expand вернул helper: true, и выход (группа вида ядра под своим
+ * прежним именем) помечен владельцем — owner = {плагин, он сам}. Помощник — тот, что у вида плагина с
+ * разворотом (steer-api.md, 3.3: он ведёт членов, member и revive), как steer-warpbox ведёт группу
+ * `kind: warp`. -1 — у выхода такого помощника нет. */
+int plugin_owner_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
+    if (!o->owner_plugin || !o->owner_out || strcmp(o->owner_out, o->name) != 0) return -1;
+    const struct plugin *pl = plugin_find(o->owner_plugin);
+    if (!pl || !pl->enabled) return -1;
+    for (size_t i = 0; i < pl->kind_n; i++)
+        if (pl->kind[i]->expand.prog && pl->kind[i]->helper.prog) return plg_helper_for(pl->kind[i], sp, o, h);
+    return -1;
 }
 
 /* status: `"plugin":{id, version, state}` (spec-fields.md, раздел 8); state — файл состояния,
  * который помощник пишет в <state>/plugin/<id>/<выход>.status.json, как есть, если это JSON. */
 static void plg_status(FILE *out, const struct spec *sp, const struct output *o) {
     (void)sp;
-    const struct plugin_kind *pk = o->plg.pk;
+    const struct plugin_kind *pk = out_plugin_kind(o);
     if (!pk) return;
     fprintf(out, ",\"plugin\":{\"id\":\"%s\",\"version\":\"%s\"", pk->owner->id, pk->owner->version);
     char path[PATH_MAX];
@@ -1266,7 +1327,7 @@ int plugin_cmd_exec(const struct plugin_cmd *c, int argc, char **argv) {
     av[k++] = c->run.prog;
     char why[256];
     for (size_t i = 0; i < c->run.argc; i++) {
-        av[k] = subst(c->owner, NULL, NULL, c->run.argv[i], why, sizeof(why));
+        av[k] = subst(c->owner, NULL, NULL, NULL, c->run.argv[i], why, sizeof(why));
         if (!av[k]) { fprintf(stderr, "steer: подкоманда %s: %s\n", c->name, why); return 2; }
         k++;
     }
@@ -1581,7 +1642,7 @@ static void pn_setname(const struct plugin *pl, const char *x, char *dst, size_t
  * этого файла (имена); @lan_dev и @wan_dev — наборы ядра, остаются. */
 static char *pn_rule_text(const struct plugin *pl, const struct spec *sp, const struct output *o,
                           const struct pnft *f, const char *rule, char *why, size_t wn) {
-    char *sub = subst(pl, sp, o, rule, why, wn);
+    char *sub = subst(pl, sp, o, NULL, rule, why, wn);
     if (!sub) return NULL;
     struct sbuf b = { 0 };
     for (const char *p = sub; *p; p++) {

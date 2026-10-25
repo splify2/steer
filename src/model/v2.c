@@ -242,26 +242,33 @@ static int path_of(struct v2 *x, const struct ynode *n, const char *where, const
     return 0;
 }
 
-static void base_of(struct v2 *x, const char *name) {
-    x->base[0] = '\0';
-    x->base_err = 0;
-    if (!name || !strcmp(name, "stdin")) return;
+/* Каталог файла спеки — от него считаются относительные пути ключей (x-path: etc у видов плагинов
+ * считает тот же каталог). 0 — определён (в buf; пусто — stdin, пути остаются как есть); -1 — не
+ * определить (слишком длинный путь, нет рабочего каталога). */
+int v2_base_dir(const char *name, char *buf, size_t n) {
+    buf[0] = '\0';
+    if (!name || !strcmp(name, "stdin")) return 0;
     const char *sl = strrchr(name, '/');
     char dir[4096], cwd[4096];
     int k;
     if (sl) k = snprintf(dir, sizeof(dir), "%.*s", (int)(sl - name), name);
     else k = snprintf(dir, sizeof(dir), ".");
-    if (k < 0 || (size_t)k >= sizeof(dir)) { x->base_err = 1; return; }
+    if (k < 0 || (size_t)k >= sizeof(dir)) return -1;
     if (!dir[0]) snprintf(dir, sizeof(dir), "/");
     if (dir[0] == '/') {
-        k = snprintf(x->base, sizeof(x->base), "%s", dir);
-        if (k < 0 || (size_t)k >= sizeof(x->base)) { x->base[0] = '\0'; x->base_err = 1; }
-        return;
+        k = snprintf(buf, n, "%s", dir);
+        if (k < 0 || (size_t)k >= n) { buf[0] = '\0'; return -1; }
+        return 0;
     }
-    if (!getcwd(cwd, sizeof(cwd))) { x->base_err = 1; return; }
-    if (!strcmp(dir, ".")) k = snprintf(x->base, sizeof(x->base), "%s", cwd);
-    else k = snprintf(x->base, sizeof(x->base), "%s/%s", cwd, dir);
-    if (k < 0 || (size_t)k >= sizeof(x->base)) { x->base[0] = '\0'; x->base_err = 1; }
+    if (!getcwd(cwd, sizeof(cwd))) return -1;
+    if (!strcmp(dir, ".")) k = snprintf(buf, n, "%s", cwd);
+    else k = snprintf(buf, n, "%s/%s", cwd, dir);
+    if (k < 0 || (size_t)k >= n) { buf[0] = '\0'; return -1; }
+    return 0;
+}
+
+static void base_of(struct v2 *x, const char *name) {
+    x->base_err = v2_base_dir(name, x->base, sizeof(x->base)) != 0;
 }
 
 /* ---- адреса клиентов ----------------------------------------------------------------------- */
@@ -343,9 +350,28 @@ static int p_lan(struct v2 *x, const struct ynode *n) {
 
 /* ---- clients ------------------------------------------------------------------------------ */
 
+/* owner: {plugin} у клиента, списка и правила — добавлено хуком pre_apply (steer-api.md, 3.4). Пишет
+ * только подготовленная спека. */
+static int owner_of(struct v2 *x, const struct ynode *val, const char *where, const char **dst) {
+    const struct ynode *ow = ynode_get(val, "owner");
+    if (!ow) return 0;
+    if (!x->s->prepared)
+        return fail(x, ow, "%s: owner пишет только плагин — в спеке человека его нет", where);
+    static const char *const OK[] = { "plugin", NULL };
+    char w[160];
+    snprintf(w, sizeof(w), "%s.owner", where);
+    const char *pl;
+    if (want_map(x, ow, w) || keys_known(x, ow, w, OK)) return -1;
+    if (!ynode_get(ow, "plugin")) return fail(x, ow, "%s: нет plugin", w);
+    snprintf(w, sizeof(w), "%s.owner.plugin", where);
+    if (str_of(x, ynode_get(ow, "plugin"), w, &pl)) return -1;
+    *dst = spec_strdup(x->s, pl);
+    return *dst ? 0 : fail(x, ow, "%s: недостаточно памяти для спеки", w);
+}
+
 static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
-    static const char *const K[] = { "addr", "mac", "uid", "self", "app", NULL };
+    static const char *const K[] = { "addr", "mac", "uid", "self", "app", "owner", NULL };
     if (spec_reserve_client(s, s->client_n + 1) != 0 ||
         spec_grow((void **)&x->cl, &x->cl_cap, s->client_n + 1, sizeof(*x->cl)) != 0)
         return fail(x, key, "недостаточно памяти для спеки (клиентов: %zu)", s->client_n + 1);
@@ -362,6 +388,7 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
     char where[64];
     snprintf(where, sizeof(where), "clients.%s", c->name);
     if (want_map(x, val, where) || keys_known(x, val, where, K)) return -1;
+    if (owner_of(x, val, where, &c->owner_plugin)) return -1;
     f->hosts = 1;
     const struct ynode *ad = ynode_get(val, "addr"), *mc = ynode_get(val, "mac"),
                        *ud = ynode_get(val, "uid"), *sf = ynode_get(val, "self"),
@@ -475,7 +502,7 @@ static int files_of(struct v2 *x, const struct ynode *n, const char *where, cons
 static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
     static const char *const K[] = { "srs", "prefixes_file", "domains_file", "domains", "prefixes",
-                                     "proto", "ports", "all", "override_port", NULL };
+                                     "proto", "ports", "all", "override_port", "owner", NULL };
     if (spec_reserve_list(s, s->list_n + 1) != 0)
         return fail(x, key, "недостаточно памяти для спеки (списков: %zu)", s->list_n + 1);
     struct spec_list *l = &s->list[s->list_n];
@@ -489,6 +516,7 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
     char where[64], w[96];
     snprintf(where, sizeof(where), "lists.%s", l->name);
     if (want_map(x, val, where) || keys_known(x, val, where, K)) return -1;
+    if (owner_of(x, val, where, &l->owner_plugin)) return -1;
     const struct ynode *n;
     if ((n = ynode_get(val, "srs"))) {
         snprintf(w, sizeof(w), "%s.srs", where);
@@ -1186,6 +1214,11 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             o.plg.keys_json = spec_strdup(s, json);
             free(json);
             if (!o.plg.keys_json) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+            /* Ресурсы выхода (порты, очереди) — выданные при подготовке, alloc.json. */
+            if (s->prepared && (pk->res_ports || pk->res_queues) &&
+                plugin_alloc_lookup(s, pk, o.name, &o.plg.ports, &o.plg.ports_n, &o.plg.queues,
+                                    &o.plg.queues_n) != 0)
+                return fail(x, val, "%s: ресурсы выхода не выданы (alloc.json) — нужен reload", where);
             /* Выход вида с разворотом или ресурсами в неподготовленной спеке не готов: хук ещё не
              * исполнен, номера не выданы. Спека человека (LOAD_HUMAN) читается как написана. */
             if ((pk->expand.prog || pk->res_ports || pk->res_queues) && !s->prepared &&
@@ -1946,7 +1979,7 @@ static int quic_clone(struct v2 *x, struct spec_rule *r, const struct ynode *qn,
 static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     struct spec *s = x->s;
     static const char *const K[] = { "name", "for", "to", "out", "resolve", "dns", "enabled", "scope",
-                                     "quic", "family", "on_family_unavailable", NULL };
+                                     "quic", "family", "on_family_unavailable", "owner", NULL };
     if (spec_reserve_rule(s, s->rule_n + 1) != 0)
         return fail(x, n, "rules: недостаточно памяти для спеки (правил: %zu)", s->rule_n + 1);
     struct spec_rule *r = &s->rule[s->rule_n];
@@ -1954,6 +1987,7 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     char where[64];
     snprintf(where, sizeof(where), "rules[%zu]", no);
     if (want_map(x, n, where) || keys_known(x, n, "правиле", K)) return -1;
+    if (owner_of(x, n, where, &r->owner_plugin)) return -1;
     const struct ynode *v;
     const char *sv;
     /* Подпись, а не идентификатор: по-русски можно, кавычку нельзя (label_ok). Без имени —

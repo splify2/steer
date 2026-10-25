@@ -302,7 +302,11 @@ static void json_qstr(FILE *f, const char *s);
  * кавычках (строка «5» не должна стать числом). */
 static void flow_node(FILE *f, const struct ynode *n) {
     if (n->kind == YN_SCALAR) {
-        if (n->style == YS_PLAIN) fputs(n->str, f);
+        /* Простой скаляр — как есть; строка в кавычках — без них, если читается обратно строкой
+         * (не числом и не словом YAML): «abc», «sub/x» — так, «5» и «true» — в кавычках. */
+        int plain_str = n->style != YS_PLAIN && plain_ok(n->str) &&
+                        !((n->str[0] >= '0' && n->str[0] <= '9') || n->str[0] == '+');
+        if (n->style == YS_PLAIN || plain_str) fputs(n->str, f);
         else json_qstr(f, n->str);
     } else if (n->kind == YN_SEQ) {
         fputc('[', f);

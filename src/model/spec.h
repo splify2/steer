@@ -589,6 +589,7 @@ struct output {
 /* КТО: клиенты правила. */
 struct spec_client {
     char name[32];                  /* пусто — безымянный (перевод v1) */
+    const char *owner_plugin;       /* добавлен хуком pre_apply плагина (арена спеки); NULL — клиент человека */
     /* Адреса, подсети и MAC — как на роутере; на телефоне ещё «self» и «uid:N[-M]» (см.
      * from_is_local). Адреса и MAC в одном клиенте нельзя: nft не умеет «или» внутри правила. */
     char (*from)[64];               /* арена спеки, from_n записей (NULL при 0) */
@@ -598,6 +599,7 @@ struct spec_client {
 /* ЧТО: назначения правила. */
 struct spec_list {
     char name[32];                  /* пусто — безымянный (перевод v1) */
+    const char *owner_plugin;       /* добавлен хуком pre_apply плагина (арена спеки); NULL — список человека */
     /* Пути — указатели на копии строк в арене спеки, а сами массивы указателей — тоже куски
      * арены ровно на *_n записей: число файлов в списке константой не ограничено. */
     const char **prefixes_files;
@@ -620,6 +622,7 @@ struct spec_list {
 /* КТО → ЧТО → КУДА. Порядок правил в спеке — приоритет: при пересечении побеждает то, что выше
  * (с поправкой на правила на устройство, dev_scope). */
 struct spec_rule {
+    const char *owner_plugin;       /* добавлено хуком pre_apply плагина (арена спеки); NULL — правило человека */
     /* Подпись, а не идентификатор: у канала v1 — его имя, и по-русски можно (label_ok). Уходит в
      * status, в журнал резолвера и в сообщения. */
     char name[32];
@@ -1430,6 +1433,8 @@ uint32_t fakeip6_to4(const uint8_t a[16]);
  * отказ, текст в e->msg. Завершает процесс только вызывающий, дошедший до точки входа:
  * `static struct spec spec; struct err e; if (load_spec(path, &spec, &e) < 0) err_die(&e);`. */
 int load_spec(const char *path, struct spec *s, struct err *e);
+/* Текст спеки в кучу (spec_read_text): тот же выбор файла и те же пределы, что у load_spec. */
+int spec_read_text(const char *path, char **buf, size_t *n, struct err *e);
 /* Как читать спеку (flags у load_spec_mode):
  *   LOAD_PREPARED — умолчание, все места чтения (status, diag, сторож, супервизор): берётся
  *     подготовленная спека, если её ключ совпал; нет — спека человека, а выходы видов с разворотом
