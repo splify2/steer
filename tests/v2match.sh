@@ -124,6 +124,17 @@ bad()  { fail=$((fail + 1)); printf 'FAIL v2match: %s\n' "$1"; [ -n "${2:-}" ] &
 
 y() { sed "s|TMP|$tmp|g" > "$tmp/s.yaml"; }
 
+# warp: count печатается всегда, кроме умолчания 1 — прежде пропускалось 3 (старое умолчание), и выбор
+# «3 туннеля» после круга записи и чтения становился 1.
+for n in 1 2 3 5; do
+    printf 'version: 2\noutputs:\n  w: { kind: warp, count: %s }\n' "$n" > "$tmp/w1.yaml"
+    "$BIN" spec convert --spec "$tmp/w1.yaml" > "$tmp/w2.yaml" 2>&1
+    "$BIN" spec convert --spec "$tmp/w2.yaml" > "$tmp/w3.yaml" 2>&1
+    want="count: $n"; [ "$n" = 1 ] && want=""
+    got="$(grep -o 'count: [0-9]*' "$tmp/w3.yaml")"
+    if [ "$got" = "$want" ]; then ok; else bad "warp count: $n — после двух кругов convert «$got»"; fi
+done
+
 # Принято: код 0.
 accepted() {
     if out="$("$BIN" apply --dry-run --spec "$tmp/s.yaml" $S 2>&1)"; then ok; else bad "$1" "$(echo "$out" | head -n 3)"; fi
