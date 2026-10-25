@@ -166,8 +166,6 @@ void groups_free(struct groups *gr);
 /* Отдать и сами массивы групп и раскладок (groups_free оставляет их на повторный разбор). */
 void groups_release(struct groups *gr);
 int has_domains(const struct groups *gr);
-/* Есть ли в спеке выход tgws — вопрос к виду (kind.h: tgws_present),
- * не к группам; здесь не живут (общий код кроме src/kinds вид не сравнивает). */
 int has_fakeip(const struct groups *gr);
 /* Есть ли группа fake-IP с половиной IPv6 — тогда нужны карта fakeip6 и её dnat. */
 int has_fakeip6(const struct groups *gr);
