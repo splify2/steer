@@ -161,6 +161,15 @@ struct supd {
     /* Резолвер забран у прежнего демона (adopt_dnsd): соединение с его управляющим сокетом —
      * его закрытие и есть выход резолвера; -1 — резолвер свой ребёнок (или его нет). */
     int dn_conn;
+    /* Забор резолвера (adopt_dnsd) идёт без ожидания в цикле демона: ad_ph — что ждём (0 — ничего;
+     * 1 — ответ «ok» на «adopt»; 2 — выхода резолвера после SIGTERM; 3 — после SIGKILL), ad_ans/ad_an —
+     * принятая часть ответа, ad_pid — резолвер, ad_p1 — конец записи новой трубы таблицы (до «ok» — не
+     * s->dn_fd), ad_tm — срок ожидания. */
+    int ad_ph, ad_p1;
+    char ad_ans[16];
+    size_t ad_an;
+    pid_t ad_pid;
+    struct loop_timer *ad_tm;
     /* Метка помощников «чей я» (шапка, «Помощники демона не переживают»): «STEER_SUPD=…» для
      * putenv в ребёнке, и pid демона — для проверки getppid() там же. */
     char tag[PATH_MAX + 64];
@@ -980,11 +989,93 @@ static void dn_conn_close(struct supd *s) {
     s->dn_conn = -1;
 }
 
-/* Соединение с забранным резолвером стало читаемым: он ничего не пишет после «ok», так что это
+static int dnsd_spawn(struct supd *s, struct helper *h);
+
+/* Забор не удался или резолвер погашен: поднять свой ребёнок вместо него. Зовётся из событий цикла,
+ * поэтому за start_one докладывает сам — loop_child и повторный подъём по паузе. */
+static void ad_spawn_own(struct supd *s) {
+    pid_t old = s->ad_pid;
+    s->ad_ph = 0;
+    loop_timer_stop(s->ad_tm);
+    dn_conn_close(s);
+    if (s->ad_p1 >= 0) { close(s->ad_p1); s->ad_p1 = -1; }
+    if (s->stopping) return;
+    for (size_t i = 0; i < s->set.n; i++) {
+        struct helper *h = &s->set.h[i];
+        if (!h->table || h->pid != old) continue;
+        h->pid = 0;
+        if (dnsd_spawn(s, h) == 0) loop_child(s->l, h->pid, child_cb, s);
+        break;
+    }
+    supd_kick(s);
+}
+
+/* Погасить резолвер, не ответивший на «adopt»: SIGTERM, три секунды на выход, дальше SIGKILL и ещё
+ * секунда. Выход — закрытие соединения (ad_conn_cb) или срок (ad_timer). */
+static void ad_kill_begin(struct supd *s) {
+    fprintf(stderr, LOG_SW "резолвер прежнего демона (pid %d) не отдался — гашу\n", (int)s->ad_pid);
+    kill(s->ad_pid, SIGTERM);
+    s->ad_ph = 2;
+    loop_timer_set(s->ad_tm, 3000);
+}
+
+static void ad_timer(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l; (void)t;
+    struct supd *s = arg;
+    if (s->ad_ph == 1) { ad_kill_begin(s); return; }
+    if (s->ad_ph == 2) {
+        kill(s->ad_pid, SIGKILL);
+        s->ad_ph = 3;
+        loop_timer_set(s->ad_tm, 1000);
+        return;
+    }
+    if (s->ad_ph == 3) ad_spawn_own(s);
+}
+
+/* Соединение с резолвером читаемо в ходе забора: ответ на «adopt» или его закрытие. */
+static void ad_conn_cb(struct supd *s) {
+    char b[64];
+    ssize_t m = recv(s->dn_conn, b, sizeof(b), MSG_DONTWAIT);
+    if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
+    if (m <= 0) {                         /* закрыл: ответа не будет (прежняя версия) или он вышел */
+        if (s->ad_ph == 1) kill(s->ad_pid, SIGTERM);
+        ad_spawn_own(s);
+        return;
+    }
+    if (s->ad_ph != 1) return;            /* гасим: ждём закрытия, лишнее не нужно */
+    size_t take = (size_t)m < sizeof(s->ad_ans) - 1 - s->ad_an ? (size_t)m : sizeof(s->ad_ans) - 1 - s->ad_an;
+    memcpy(s->ad_ans + s->ad_an, b, take);
+    s->ad_an += take;
+    s->ad_ans[s->ad_an] = '\0';
+    if (!memchr(s->ad_ans, '\n', s->ad_an) && s->ad_an < sizeof(s->ad_ans) - 1) return;
+    if (!strcmp(s->ad_ans, "ok\n")) {
+        fcntl(s->ad_p1, F_SETFL, fcntl(s->ad_p1, F_GETFL) | O_NONBLOCK);
+        tab_close(s);
+        s->dn_fd = s->ad_p1;
+        s->ad_p1 = -1;
+        s->ad_ph = 0;
+        loop_timer_stop(s->ad_tm);
+        fprintf(stderr, "steer[info] supervise: dnsd подхвачен (pid %d) — резолвер пережил прежний "
+                        "демон\n", (int)s->ad_pid);
+        tab_send(s, 1);
+        return;
+    }
+    if (!strcmp(s->ad_ans, "busy\n")) {
+        /* Труба у резолвера открыта — у него живой хозяин, второй демон на том же каталоге
+         * состояния. Не наш случай, и гасить чужой резолвер этот демон не берётся. */
+        fprintf(stderr, LOG_SW "у резолвера (pid %d) живой демон — поднимаю свой\n", (int)s->ad_pid);
+        ad_spawn_own(s);
+        return;
+    }
+    ad_kill_begin(s);
+}
+
+/* Соединение с резолвером стало читаемым. После забора он ничего не пишет после «ok», так что это
  * его выход — то же, что loop_child у своего ребёнка (код выхода неизвестен: не наш ребёнок). */
 static void dn_conn_cb(struct loop *l, int fd, uint32_t events, void *arg) {
     (void)l; (void)events;
     struct supd *s = arg;
+    if (s->ad_ph) { ad_conn_cb(s); return; }
     char b[64];
     ssize_t m = recv(fd, b, sizeof(b), MSG_DONTWAIT);
     if (m > 0 || (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))) return;
@@ -997,10 +1088,13 @@ static void dn_conn_cb(struct loop *l, int fd, uint32_t events, void *arg) {
 }
 
 /* Забрать резолвер, переживший прежний демон: отдать ему новую трубу таблицы (конец чтения) и
- * свой stderr через SCM_RIGHTS, дождаться «ok». 1 — забран; 0 — живого нет (или не отдался), и
- * запускать надо свой. Живой, но не ответивший, гасится: свой резолвер на его порту не встал бы. */
+ * свой stderr через SCM_RIGHTS. Ответ «ok» ждёт цикл (ad_conn_cb, срок — ad_timer), а не эта
+ * функция: резолвер, занятый перечитыванием списков, отвечает не сразу, и демон на это время не
+ * замирал бы. 1 — забор начат, резолвер считается принадлежащим помощнику (h->pid), и если не
+ * отдастся — цикл сам поднимет свой (ad_spawn_own); 0 — живого нет, запускать надо свой. */
 static int adopt_dnsd(struct supd *s, struct helper *h) {
     pid_t pid;
+    if (s->ad_ph) return 1;               /* забор уже идёт */
     int c = dnsd_connect(&pid);
     if (c < 0) return 0;
     int p[2];
@@ -1024,56 +1118,36 @@ static int adopt_dnsd(struct supd *s, struct helper *h) {
     memcpy(CMSG_DATA(ch), fds, nfd * sizeof(int));
     ssize_t w = sendmsg(c, &mh, MSG_NOSIGNAL);
     close(p[0]);
-    char ans[16] = "";
-    size_t an = 0;
-    if (w == 6) {
-        struct timeval tv = { 2, 0 };
-        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        while (an < sizeof(ans) - 1 && !memchr(ans, '\n', an)) {
-            ssize_t m = recv(c, ans + an, sizeof(ans) - 1 - an, 0);
-            if (m < 0 && errno == EINTR) continue;
-            if (m <= 0) break;
-            an += (size_t)m;
-        }
-        ans[an] = '\0';
-    }
-    if (strcmp(ans, "ok\n") != 0) {
+    if (w != 6 || !s->ad_tm) {
+        fprintf(stderr, LOG_SW "резолвер прежнего демона (pid %d) не отдался — гашу\n", (int)pid);
         close(p[1]);
-        if (!strcmp(ans, "busy\n")) {
-            /* Труба у резолвера открыта — у него живой хозяин, второй демон на том же каталоге
-             * состояния. Не наш случай, и гасить чужой резолвер этот демон не берётся. */
-            fprintf(stderr, LOG_SW "у резолвера (pid %d) живой демон — поднимаю свой\n", (int)pid);
-            close(c);
-        } else {
-            fprintf(stderr, LOG_SW "резолвер прежнего демона (pid %d) не отдался — гашу\n", (int)pid);
-            dnsd_kill(c, pid);
-        }
-        return 0;
-    }
-    fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL) | O_NONBLOCK);
-    fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK);
-    tab_close(s);
-    dn_conn_close(s);
-    s->dn_fd = p[1];
-    s->dn_conn = c;
-    if (loop_fd_add(s->l, c, EPOLLIN, dn_conn_cb, s) != 0) {
-        /* Без соединения в цикле выхода резолвера не узнать: погасить и поднять свой. */
-        s->dn_conn = -1;
-        tab_close(s);
         dnsd_kill(c, pid);
         return 0;
     }
+    fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK);
+    tab_close(s);
+    dn_conn_close(s);
+    s->dn_conn = c;
+    if (loop_fd_add(s->l, c, EPOLLIN, dn_conn_cb, s) != 0) {
+        /* Без соединения в цикле ответа не узнать: погасить и поднять свой. */
+        s->dn_conn = -1;
+        close(p[1]);
+        dnsd_kill(c, pid);
+        return 0;
+    }
+    s->ad_ph = 1;
+    s->ad_p1 = p[1];
+    s->ad_an = 0;
+    s->ad_ans[0] = '\0';
+    s->ad_pid = pid;
+    loop_timer_set(s->ad_tm, 2000);
     h->pid = pid;
     h->started_ms = helpers_now_ms();
-    fprintf(stderr, "steer[info] supervise: dnsd подхвачен (pid %d) — резолвер пережил прежний "
-                    "демон\n", (int)pid);
-    tab_send(s, 1);
     return 1;
 }
 
 /* 0 — запущен свой ребёнок, 1 — забран живой (loop_child ему не нужен), -1 — не вышло. */
-static int start_dnsd(struct supd *s, struct helper *h) {
-    if (adopt_dnsd(s, h)) return 1;
+static int dnsd_spawn(struct supd *s, struct helper *h) {
     int p[2];
     if (pipe2(p, O_CLOEXEC) != 0) return -1;
     const char *av[8 + SUPD_DNSD_FLAGS];
@@ -1105,6 +1179,11 @@ static int start_dnsd(struct supd *s, struct helper *h) {
     helper_started(h, pid);
     tab_send(s, 1);
     return 0;
+}
+
+static int start_dnsd(struct supd *s, struct helper *h) {
+    if (adopt_dnsd(s, h)) return 1;
+    return dnsd_spawn(s, h);
 }
 
 static void child_cb(struct loop *l, pid_t pid, int status, void *arg);
@@ -1281,6 +1360,7 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     s->enabled = c->enabled;
     s->dn_fd = -1;
     s->dn_conn = -1;
+    s->ad_p1 = -1;
     for (size_t i = 0; c->dnsd_flags && c->dnsd_flags[i] && i < SUPD_DNSD_FLAGS; i++)
         s->dnsd_flags[i] = c->dnsd_flags[i];
     ssize_t el = readlink("/proc/self/exe", s->self, sizeof(s->self) - 1);
@@ -1291,7 +1371,8 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     s->seam = seam && *seam;
     snprintf(s->exe, sizeof(s->exe), "%s", s->seam ? seam : s->self);
     s->tm = loop_timer_new(s->l, supd_timer, s);
-    if (!s->tm) { free(s); return NULL; }
+    s->ad_tm = loop_timer_new(s->l, ad_timer, s);
+    if (!s->tm || !s->ad_tm) { free(s); return NULL; }
     s->me = getpid();
     snprintf(s->tag, sizeof(s->tag), "STEER_SUPD=%d:%llu:%s", (int)s->me,
              proc_start(s->me, NULL), steer_state_dir());
@@ -1375,6 +1456,9 @@ void supd_stop(struct supd *s) {
     if (!s || s->stopping) return;
     s->stopping = 1;
     loop_timer_stop(s->tm);
+    loop_timer_stop(s->ad_tm);
+    s->ad_ph = 0;
+    if (s->ad_p1 >= 0) { close(s->ad_p1); s->ad_p1 = -1; }
     /* Резолвер гасится явно: закрытую трубу он пережил бы — для него это «демон пропал» (adopt.c).
      * Сигнал — раньше, чем конец трубы: тогда EOF он и не примет за пропажу. Свой ребёнок
      * дожидается ниже, в helpers_stop, вместе с помощниками; забранный — здесь, по закрытию его

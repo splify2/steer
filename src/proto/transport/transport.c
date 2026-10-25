@@ -228,7 +228,10 @@ long transport_room(struct transport *t) {
     return r;
 }
 
-void transport_live(struct transport *t) { tr_link_live(&t->link); }
+void transport_live(struct transport *t) {
+    tr_link_live(&t->link);
+    if (t->fr && t->fr->live) t->fr->live(t);
+}
 size_t transport_out_pending(const struct transport *t) { return tr_link_pending(&t->link); }
 int transport_out_flush(struct transport *t) { return tr_link_flush(&t->link); }
 
