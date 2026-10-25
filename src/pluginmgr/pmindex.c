@@ -252,7 +252,7 @@ int pm_index_get(struct pm_repo *r, int refresh, struct pm_err *e) {
         if (etag) etag[strcspn(etag, "\r\n")] = '\0';
     }
     char *net_err = NULL;
-    if (refresh || !pm_exists(etag_p)) {
+    if (refresh) {
         size_t nb = 1 + r->nmirrors;
         for (size_t i = 0; i < nb; i++) {
             const char *base = i == 0 ? r->url : r->mirrors[i - 1];

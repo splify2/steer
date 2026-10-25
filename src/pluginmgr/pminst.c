@@ -197,6 +197,10 @@ void pm_event(struct pm_ctx *x, const char *id, const char *state, const char *v
     free(buf);
 }
 
+/* Демон отвечает status с кодом 0 — спека прочитана. Нет — отказ plugin-reload не вина плагина:
+ * спека была негодной и до него. */
+static int daemon_spec_ok(struct pm_ctx *x);
+
 /* Выходы видов плагина, которые сейчас подняты (по status демона). */
 struct outs { char **v; size_t n; };
 
@@ -226,6 +230,13 @@ static struct ydoc *daemon_status(struct pm_ctx *x) {
     ctlcall_resp_free(&rp);
     free(r);
     return d;
+}
+
+static int daemon_spec_ok(struct pm_ctx *x) {
+    struct ydoc *d = daemon_status(x);
+    if (!d) return 0;
+    ydoc_free(d);
+    return 1;
 }
 
 static void outs_up(struct pm_ctx *x, const struct ynode *kinds, struct outs *o) {
@@ -422,7 +433,7 @@ static int resolve(struct pm_ctx *x, struct plan *p, const char *id, const char 
         return 0;
     struct pm_repos *rs = o->seed_only ? seedrs : &x->repos;
     /* Обновление — только из репозитория, из которого плагин поставлен (index.md). */
-    if (!o->seed_only && inst && inst->repo && (o->update || is_root)) {
+    if (!o->seed_only && inst && inst->repo) {
         struct pm_repo *own = pm_repo_find(rs, inst->repo);
         if (!own) return pm_errf(e, "репозиторий %s, из которого поставлен %s, отключён", inst->repo, id);
         struct pm_err ie = {{0}};
@@ -1069,6 +1080,7 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         if (!ynode_len(k) && oldman) k = ynode_get(ynode_get(ydoc_root(oldman), "steer"), "kinds");
         outs_up(x, k, &before);
     }
+    int spec_ok = x->no_daemon ? 1 : daemon_spec_ok(x);
     if (oldman) {
         struct pm_err pe = {{0}};
         if (run_script(id, dir, ydoc_root(oldman), "prerm", mver, &pe) != 0)
@@ -1124,8 +1136,11 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     pm_keepd_write(x);
     if (healthy && !was_disabled) {
         pm_progress(x, "проверка здоровья %s", id);
-        if (pm_daemon_reload(x, &he) != 0) healthy = 0;
-        else {
+        if (pm_daemon_reload(x, &he) != 0) {
+            if (spec_ok) healthy = 0;
+            else pm_progress(x, "спека не читалась и до установки — %s", he.msg);
+        }
+        if (healthy) {
             long t = yn_long(ynode_get(m, "health"), "timeout_s", 60);
             if (wait_outs(x, &before, (int)t, &he) != 0) healthy = 0;
         }
@@ -1193,6 +1208,10 @@ out:
 static int space_check(struct pm_ctx *x, const struct plan *p, struct pm_err *e) {
     unsigned long long need = 0, need_tmp = 0;
     for (size_t i = 0; i < p->n; i++) {
+        const struct pm_inst *have = pm_state_find(&x->st, p->v[i].c.id);
+        if (have && have->version && !strcmp(have->version, p->v[i].c.version) &&
+            (!have->variant || !strcmp(have->variant, p->v[i].c.variant)))
+            continue;
         long in = yn_long(p->v[i].c.asset, "installed", 0), sz = yn_long(p->v[i].c.asset, "size", 0);
         need += in > 0 ? (unsigned long long)in : 0;
         if (!p->v[i].c.repo->seed) need_tmp += sz > 0 ? (unsigned long long)sz : 0;
@@ -1210,7 +1229,6 @@ static int space_check(struct pm_ctx *x, const struct plan *p, struct pm_err *e)
         pm_human(ft, b, sizeof(b));
         return pm_errf(e, "нет места во временном каталоге (%s): нужно %s, свободно %s", pm_tmp(), a, b);
     }
-    (void)x;
     return 0;
 }
 
@@ -1408,13 +1426,14 @@ int pm_set_enabled(struct pm_ctx *x, const char *id, int on, struct pm_err *e) {
         }
         ydoc_free(man);
     }
+    int spec_ok = x->no_daemon ? 1 : daemon_spec_ok(x);
     pm_inst_set(&inst->state, on ? "enabled" : "disabled");
     pm_inst_set(&inst->why, NULL);
     struct pm_err se = {{0}};
     if (pm_state_save(&x->st, &se) != 0) { *e = se; return -1; }
     struct pm_err re = {{0}};
     if (pm_daemon_reload(x, &re) != 0) {
-        if (on) {
+        if (on && spec_ok) {
             inst = pm_state_find(&x->st, id);
             pm_inst_set(&inst->state, "failed");
             pm_inst_set(&inst->why, re.msg);

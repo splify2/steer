@@ -243,6 +243,7 @@ cp repo.bak etc/repos.d/splify2.json
 mk foo 1.1.0 ',"requires":{"plugins":{"net1":"^1.2"}},"steer":{"commands":[{"name":"foo-hello","prog":"bin/foo"}],"kinds":[{"name":"tunnel:foo","helper":{"prog":"bin/foo"}}]},"scripts":{"postinst":"scripts/postinst"},"keep":["/etc/foo"],"permissions":["fs:/etc/foo"]' 3
 build src/foo-1.1.0 proto.sec
 index
+P search --json >/dev/null 2>&1   # list берёт только кэш индекса; search освежает его
 check "list: доступно обновление 1.1.0" "1.1.0" "$(P list --json | jq_ '[p["update"] for p in d["plugins"] if p["id"]=="foo"][0]')"
 : > postinst.log
 o="$(P update foo --json 2>err.txt)"; rc=$?
@@ -287,6 +288,7 @@ o="$(P update --auto --if-stale --json 2>/dev/null)"
 has "--if-stale: проверка была только что — пропуск" "skipped" "$o"
 "$S2P" index dist -o repo --repo splify2 --pub proto.pub --pub plg.pub --key idx.sec --mirror https://mirror.invalid/ \
     --meta meta.json --yank foo@1.2.0 --why "уязвимость" --security >/dev/null 2>&1
+P search --json >/dev/null 2>&1
 check "list: стоящая отозвана по безопасности" "уязвимость True" \
     "$(P list --json | jq_ '[str(p.get("yanked"))+" "+str(p.get("update_security")) for p in d["plugins"] if p["id"]=="foo"][0]')"
 o="$(P update --auto --json 2>/dev/null)"

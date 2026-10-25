@@ -722,6 +722,7 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
             if (m) ydoc_free(m);
             if ((pass == 0) != lib) continue;
             if (!p->repo || p->unsigned_) continue;
+            if (!id && p->pinned) continue;
             if (auto_ && (!p->auto_update || p->pinned || (p->state && !strcmp(p->state, "failed")))) continue;
             struct pm_repo *r = pm_repo_find(&x->repos, p->repo);
             if (!r || (auto_ && !r->auto_update)) continue;
