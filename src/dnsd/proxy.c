@@ -1929,7 +1929,9 @@ static struct tcpc *tcpc_pick(void) {
         if (!c->inflight && !c->in_len && now - c->last >= 1 && (!old || c->last < old->last))
             old = c;
     }
-    if (old || g_tcpc_n >= tcp_conn_max()) return old;
+    /* Вытесняют только когда таблица упёрлась в предел: пока места растут, молчащее соединение
+     * живёт до своего простоя (иначе первый же новый клиент закрывал бы любое, молчавшее секунду). */
+    if (g_tcpc_n >= tcp_conn_max()) return old;
     if (g_tcpc_n == g_tcpc_cap) {
         int nc = g_tcpc_cap ? g_tcpc_cap * 2 : 16;
         struct tcpc **np = realloc(g_tcpc, (size_t)nc * sizeof(*np));
