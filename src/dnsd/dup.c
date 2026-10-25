@@ -885,8 +885,8 @@ static void q_on_sclose(void *u, int64_t sid, uint64_t app_err) {
 
 static void q_on_closed(void *u, int reason, const char *why) {
     struct dconn *c = u;
+    (void)reason;
     c->qclosed = 1;
-    c->qreason = reason;
     snprintf(c->qwhy, sizeof(c->qwhy), "%s", why ? why : "");
 }
 

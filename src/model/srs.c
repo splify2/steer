@@ -1480,12 +1480,7 @@ size_t srs_clause_n(const struct srs_set *s) { return s->cl_n; }
 const struct srs_clause *srs_clause(const struct srs_set *s, size_t i) {
     return i < s->cl_n ? &s->cl[i] : NULL;
 }
-const char *srs_path(const struct srs_set *s) { return s->path; }
 const char *srs_skipped(const struct srs_set *s) { return s->skipped[0] ? s->skipped : NULL; }
-int srs_any_kind(const struct srs_set *s, unsigned kind) {
-    for (size_t i = 0; i < s->cl_n; i++) if (s->cl[i].kind == kind) return 1;
-    return 0;
-}
 int srs_any_flag(const struct srs_set *s, unsigned flag) {
     for (size_t i = 0; i < s->cl_n; i++) if (s->cl[i].flags & flag) return 1;
     return 0;

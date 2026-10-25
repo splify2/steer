@@ -40,7 +40,6 @@
 #define H3D_E_QPACK_DECOMPRESSION   0x200
 
 #define H3D_ALPN "h3"
-#define H3D_DEFAULT_PORT 443
 
 /* Наибольшее тело ответа: сообщение DNS в 16 бит длины (RFC 1035, 4.2.2). Предел формата, не наш. */
 #define H3D_MSG_MAX 65535u

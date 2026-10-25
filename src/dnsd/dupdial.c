@@ -319,7 +319,7 @@ static void dial_run(struct dial *d) {
     }
     /* 1. Адреса. */
     struct sockaddr_storage list[DIAL_MAXADDR];
-    int ln = 0, from_res = 0;
+    int ln = 0;
     struct sockaddr_storage lit;
     if (sa_from(d->u.host, d->u.port, &lit) == 0) {
         list[ln++] = lit;
@@ -343,7 +343,6 @@ static void dial_run(struct dial *d) {
                     list[ln++] = a;
                 }
                 d->res_ttl = ttl < 60 ? 60 : ttl > 3600 ? 3600 : ttl;
-                from_res = 1;
             } else if (d->cached_n) {
                 for (int i = 0; i < d->cached_n; i++) list[ln++] = d->cached[i];      /* устаревшие */
             } else {
@@ -367,7 +366,7 @@ static void dial_run(struct dial *d) {
         return;
     }
     /* 2. connect. */
-    int fd = -1, at = -1;
+    int fd = -1;
     for (int i = 0; i < ln && fd < 0; i++) {
         long left = deadline - mono_ms();
         if (left <= 0) break;
@@ -375,14 +374,11 @@ static void dial_run(struct dial *d) {
         long slice = left / (ln - i);
         if (slice < 500 && left > 500) slice = 500;
         fd = connect_to(&list[i], d->mark, mono_ms() + slice);
-        if (fd >= 0) at = i;
     }
     if (fd < 0) {
         snprintf(d->err, sizeof(d->err), "нет соединения с %.60s:%u", d->u.host, d->u.port);
         return;
     }
-    d->peer_i = at;
-    d->peer_from_res = from_res;
     /* 3. TLS. */
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
     set_timeo(fd, deadline);

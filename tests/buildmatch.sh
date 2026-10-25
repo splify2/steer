@@ -293,8 +293,7 @@ check "в src/model, src/compile и src/lib (кроме err.c) нет die()/exit
 # (src/kinds/group.c), а перевод v1 собирает её group_of_devices. Комментарии не в счёт.
 #
 # src/compile здесь наравне с остальным движком: построители видов (tgws) переехали в
-# kind_ops.emit (src/kinds), а has_tgws — в tgws_present там же;
-# генератор зовёт их через kind_emit_all, не зная имён видов.
+# kind_ops.emit (src/kinds); генератор зовёт их через kind_emit_all, не зная имён видов.
 kindbad=""
 for f in $(find src -name '*.c' -o -name '*.h' | sort); do
     case "$f" in src/kinds/*) continue ;; esac
