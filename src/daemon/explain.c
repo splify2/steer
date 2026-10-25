@@ -448,7 +448,7 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
         /* Не бывает: build_groups сверил каждый канал с выходами. Но исполняет это и демон, и
          * die() здесь завершил бы его целиком — поэтому отказ возвращается. */
         if (!o) {
-            fprintf(stderr, "steer: group %s points at a missing output\n", gr->g[i].name);
+            fprintf(stderr, "steer: группа %s ведёт в несуществующий выход\n", gr->g[i].name);
             return 2;
         }
         fprintf(out, "%s -> %s \"%s\" -> output \"%s\"", addr,

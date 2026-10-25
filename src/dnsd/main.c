@@ -58,7 +58,7 @@
 static int cmd_match(const char *path, const char *host) {
     struct ruleset rs = {0};
     if (load_rules(path, &rs) != 0) {
-        fprintf(stderr, "cannot read rules file: %s\n", path);
+        fprintf(stderr, "не прочитать файл правил: %s\n", path);
         return 2;
     }
     int m = ruleset_match(&rs, host);
@@ -318,16 +318,16 @@ int dnsd_main(int argc, char **argv) {
     if (!g_dch_n) {
         if (g_table_fd >= 0)
             fprintf(stderr, "steer dnsd: таблица от демона без доменных каналов — "
-                            "forwarding only, no domain routing\n");
+                            "только пересылка, домены по правилам не разбираются\n");
         else
-            fprintf(stderr, "steer dnsd: no channel in %s matches domains — "
-                            "forwarding only, no domain routing\n", spec);
+            fprintf(stderr, "steer dnsd: в %s нет доменных каналов — "
+                            "только пересылка, домены по правилам не разбираются\n", spec);
     }
     if (!g_fakeip_state_path) {
         static char st[PATH_MAX];
         int need = snprintf(st, sizeof(st), "%s/fakeip.state", steer_state_dir());
         if (need < 0 || (size_t)need >= sizeof(st)) {
-            fprintf(stderr, "steer dnsd: --state-dir too long, no room for fakeip.state\n");
+            fprintf(stderr, "steer dnsd: путь --state-dir слишком длинный, fakeip.state не поместится\n");
             return 1;
         }
         g_fakeip_state_path = st;

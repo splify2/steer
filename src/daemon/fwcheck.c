@@ -320,10 +320,10 @@ void report_traceroute_dep(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
         if (!out_has_device(&sp->out[i])) continue;
         if (fw_check(sp->out[i].device).masqueraded) {
-            fprintf(stderr, LOG_W "traceroute_hops cannot work for output %s: %s "
-                            "masquerades, so ICMP errors come addressed to the router "
-                            "and only conntrack can route them to the client — "
-                            "untracking them drops the hops entirely\n",
+            fprintf(stderr, LOG_W "traceroute_hops не сработает для выхода %s: %s "
+                            "подменяет адрес, поэтому ошибки ICMP приходят на адрес роутера "
+                            "и вернуть их клиенту может только conntrack — "
+                            "если их не отслеживать, узлы пропадут совсем\n",
                     sp->out[i].name, sp->out[i].device);
             return;
         }
@@ -335,11 +335,10 @@ void report_traceroute_dep(const struct spec *sp) {
     while ((pos = dump_line(pos, line, sizeof(line))) != NULL)
         if (strstr(line, "untracked") && strstr(line, "accept")) ok = 1;
     if (!ok)
-        fprintf(stderr, LOG_W "traceroute_hops is on but no rule accepting untracked "
-                        "packets was found — ICMP time-exceeded will be dropped by the "
-                        "firewall and hops will show as asterisks. Needed once, in the "
-                        "firewall (not here): accept ct state untracked icmp type "
-                        "time-exceeded towards %s\n", sp->lan_dev[0]);
+        fprintf(stderr, LOG_W "traceroute_hops включён, но правила, принимающего неотслеживаемые "
+                        "пакеты, нет — фаервол отбросит ICMP time-exceeded, и узлы в traceroute "
+                        "будут звёздочками. Нужно один раз, в фаерволе (не здесь): "
+                        "accept ct state untracked icmp type time-exceeded в сторону %s\n", sp->lan_dev[0]);
 }
 
 /* ЧУЖИЕ ПРАВИЛА НА БИТАХ 16-23 — предупреждение, а не отказ.
@@ -467,8 +466,8 @@ void report_output_deps(const struct spec *sp) {
         if (!out_has_device(&sp->out[i])) continue;
         struct fwcheck c = fw_check(sp->out[i].device);
         if (!c.in_firewall)
-            fprintf(stderr, LOG_W "output %s: %s is not mentioned by the firewall at all — "
-                            "traffic steered there will not come back until it is in a zone\n",
+            fprintf(stderr, LOG_W "выход %s: фаервол не знает устройства %s — "
+                            "трафик, ушедший туда, не вернётся, пока оно не окажется в зоне\n",
                     sp->out[i].name, sp->out[i].device);
         /* Выходу vless NAT не нужен, и предупреждать о нём — значит посылать человека
          * настраивать то, чему нечего транслировать: клиент завершает TCP у себя и
@@ -502,9 +501,9 @@ void report_output_deps(const struct spec *sp) {
         }
         else {
             if (!c.masqueraded)
-                fprintf(stderr, LOG_W "output %s: no masquerade/snat rule found for %s — "
-                                "if that path needs NAT, packets leave with LAN addresses and "
-                                "the channel goes quiet while its counter still rises\n",
+                fprintf(stderr, LOG_W "выход %s: для %s нет правила masquerade/snat — "
+                                "если этому пути нужна подмена адреса, пакеты уйдут с адресами LAN, "
+                                "и канал замолчит, хотя его счётчик растёт\n",
                         sp->out[i].name, sp->out[i].device);
             /* IPv6 — своим вопросом (fw_check по семействам, шаг 8 выпуска 1.10): masq6 зоны. */
             /* У `ipv6: nat` подмену ставит сам движок, у `ipv6: routed` её не нужно вовсе. */

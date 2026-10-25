@@ -2161,7 +2161,7 @@ int run_proxy(int listen_port, int upstream_port) {
             perror("bind");
             return 1;
         }
-        fprintf(stderr, "steer dnsd: no IPv6 on this kernel — listening on IPv4 only\n");
+        fprintf(stderr, "steer dnsd: в ядре Linux нет IPv6 — слушаю только IPv4\n");
     }
     /* Неблокирующий: цикл событий дочитывает очередь датаграмм до EAGAIN, и
      * готовность от epoll перестаёт быть обещанием, что recvfrom не повиснет. */

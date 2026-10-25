@@ -385,7 +385,7 @@ static void apply_routing_one(const struct output *o) {
         fprintf(stderr, LOG_W "output %s: маршрут IPv6 в %s не встал (IPv6 на устройстве "
                         "выключен?) — IPv6 правил выхода остановлен\n", o->name, o->device);
     if (rc != 0) {
-        fprintf(stderr, LOG_W "output %s: cannot route via %s — is the device up?\n",
+        fprintf(stderr, LOG_W "выход %s: не проложить маршрут через %s — устройство поднято?\n",
                 o->name, o->device);
         /* Пустая таблица — это не «нет маршрута», а «ищи дальше»: помеченный
          * пакет провалится в следующую таблицу и уйдёт напрямую, то есть ровно
@@ -652,7 +652,7 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
     char tmp[256];
     steer_tmp_template(tmp, sizeof(tmp), "steer-ruleset");
     int fd = mkstemp(tmp);
-    if (fd < 0) die("cannot create a temporary ruleset", NULL);
+    if (fd < 0) die("не создать временный файл набора правил", NULL);
     FILE *f = fdopen(fd, "w");
     /* Крупный буфер на чисто дозаписывающий поток: musl по умолчанию даёт
      * BUFSIZ в 1 КБ, и набор на сотни тысяч элементов дробился на тысячи
@@ -711,7 +711,7 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
     const char *load[] = { "nft", "-f", tmp, NULL };
     int rc = run(load);
     if (rc != 0) {
-        fprintf(stderr, LOG_W "nft refused the ruleset, the previous one stays (kept: %s)\n",
+        fprintf(stderr, LOG_W "nft отверг набор правил, прежний остаётся (файл набора: %s)\n",
                 tmp);
         const char *check[] = { "nft", "-c", "-f", tmp, NULL };
         run(check);
@@ -1003,7 +1003,7 @@ int cmd_apply_plan(int argc, char **argv) {
     cookie_io_functions_t io = { .write = fnv_write };
     FILE *f = fopencookie(&h, "w", io);
 #endif
-    if (!f) die("cannot open a stream for the ruleset fingerprint", NULL);
+    if (!f) die("не открыть поток для отпечатка набора правил", NULL);
     static char buf[65536];
     setvbuf(f, buf, _IOFBF, sizeof(buf));
     /* Отпечаток — без засева карты fake-IP из файла состояния резолвера: файл растёт с каждым

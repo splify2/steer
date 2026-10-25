@@ -452,8 +452,8 @@ static int add_element(const char *set_name, const void *key_net, size_t alen, u
          * доезжала до интерфейса вовсе: журнал там собирается как `logread | grep steer`,
          * а подстроки steer в ней не было. При этом сообщение важное — доменная
          * маршрутизация не наполняется. */
-        fprintf(stderr, "steer[warn] dnsd: %s rejected an interval element (-EINVAL) — "
-                        "is it declared without `flags interval`?\n", set_name);
+        fprintf(stderr, "steer[warn] dnsd: %s не принял элемент-интервал (-EINVAL) — "
+                        "набор объявлен без `flags interval`?\n", set_name);
     nft_last_add_rc = rc;
     /* Already there = already in the desired state. (A refreshed timeout would be
      * nicer, but the element only has to outlive the client's cached answer, and
