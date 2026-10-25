@@ -271,8 +271,8 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     return left ? SEND_FATAL : SEND_OK;
 }
 
-/* Пакет SOCKS5 UDP — RSV(2), FRAG, адрес IPv4 (7) и данные — целиком в UDP_DGRAM_ABS. */
-#define SK_DGRAM_MAX (UDP_DGRAM_ABS - 10)
+/* Пакет SOCKS5 UDP — RSV(2), FRAG, адрес (до 19 байт, IPv6) и данные — целиком в UDP_DGRAM_ABS. */
+#define SK_DGRAM_MAX (UDP_DGRAM_ABS - 3 - PX_ADDR_MAX)
 
 static size_t sk_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
     if (n > SK_DGRAM_MAX || 2 + n > cap) return 0;

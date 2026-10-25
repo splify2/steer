@@ -986,6 +986,52 @@ static void test_v6_dial(void) {
     }
 }
 
+/* Крайние размеры датаграммы с адресом IPv6: обрамление длиннее, чем у IPv4, и запас на нём не должен кончаться. */
+static void test_v6_edge(void) {
+    struct flow_key k;
+    v6_key(&k);
+    /* trojan: первая датаграмма потока (заголовок 80 байт) чуть меньше порога кучи — раньше SEND_FATAL. */
+    {
+        const struct dialer_ops *ops = &proxy_trojan_dialer;
+        struct px_node tn; memset(&tn, 0, sizeof tn);
+        void *sess = calloc(1, ops->sess_size);
+        static unsigned char d[2 + 18346];
+        d[0] = 18346 >> 8; d[1] = 18346 & 255;
+        ops->clear(sess);
+        ops->flow_open(&tn, sess, &k, 1);
+        g_win = -1;
+        feed_reset(NULL, 0);
+        int rc = ops->send(&tn, sess, &k, 1, d, sizeof d);
+        check("trojan udp IPv6: первая датаграмма 18346 байт (у порога буфера) ушла", SEND_OK, rc);
+        free(sess);
+    }
+    /* socks5: пакет с адресом IPv6 (22 байта обрамления) при самой крупной датаграмме — не больше UDP_DGRAM_ABS. */
+    {
+        const struct dialer_ops *ops = &proxy_socks_dialer;
+        size_t dl = ops->dgram_max;
+        static unsigned char d[2 + UDP_DGRAM_ABS];
+        d[0] = (unsigned char)(dl >> 8); d[1] = (unsigned char)dl;
+        struct px_node n; memset(&n, 0, sizeof n);
+        n.proto = PX_SOCKS; n.socks_ver = 5;
+        void *sess = calloc(1, ops->sess_size);
+        int sp[2];
+        unsigned char rep[] = { 5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0 || write(sp[1], rep, sizeof rep) != (ssize_t)sizeof rep) return;
+        g_tcp_fd = sp[0];
+        g_udp_fd = FAKE_UDP_FD;
+        ops->clear(sess);
+        ops->flow_open(&n, sess, &k, 1);
+        ops->connect(&n, sess, 2);
+        g_udp_calls = 0; g_udp_sent = 0; g_udp_eagain = 0; g_udp_last = 0;
+        int rc = ops->send(&n, sess, &k, 1, d, 2 + dl);
+        check("socks udp IPv6: самая крупная датаграмма — пакет не больше UDP_DGRAM_ABS", 1,
+              rc == SEND_OK && g_udp_last <= UDP_DGRAM_ABS);
+        ops->close(sess); free(sess);
+        close(sp[1]);
+        g_tcp_fd = -1; g_udp_fd = -1;
+    }
+}
+
 int main(void) {
     test_ss_first_tail();
     test_ss_again_nonce();
@@ -1002,5 +1048,6 @@ int main(void) {
     test_socks_live();
     test_http_long_auth();
     test_v6_dial();
+    test_v6_edge();
     return unit_done("pxdialmatch");
 }

@@ -109,7 +109,8 @@ static int tj_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     size_t len = 0;
     unsigned char *heap = NULL;
     /* Крупная датаграмма UDP не влезает в буфер записи: на неё берётся буфер по размеру (I-528). */
-    if (udp && n + 64 + 2 * 16 > cap) {
+    /* Запас — заголовок (до 80 байт при IPv6) и по 21 байту обрамления на датаграмму: 160 покрывает первую. */
+    if (udp && n + 160 > cap) {
         cap = n + 64 + PX_ADDR_MAX + 2 + 2 + 56 + 16;
         heap = out = malloc(cap);
         if (!out) return SEND_FATAL;
