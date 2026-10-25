@@ -418,7 +418,10 @@ static int up_reopen(struct transport *t) {
     struct xh_state *x = &t->xh;
     if (!x->node_mem) return H2_ERESET;             /* узла нет — переоткрывать нечем */
     struct xh_up *u = &x->up;
-    if (u->link.fd > 0) close(u->link.fd);
+    /* Прежний дескриптор остаётся открытым, пока не поднята новая связь, и закрывается позже (zombie_fd). */
+    if (x->zombie_fd > 0) close(x->zombie_fd);
+    x->zombie_fd = u->link.fd > 0 ? u->link.fd : 0;
+    x->zombie_seen = 0;
     u->link.fd = -1;
     outq_free(&u->link.oq);
     if (!u->link.plain) tls13_free(&u->link.tls);
@@ -532,6 +535,8 @@ static void xhttp_moved(struct transport *t) {
  * нулю после memset, поэтому проверка на «больше нуля», а не «не -1». */
 static void xhttp_close(struct transport *t) {
     struct xh_up *u = &t->xh.up;
+    if (t->xh.zombie_fd > 0) close(t->xh.zombie_fd);
+    t->xh.zombie_fd = 0;
     if (u->link.fd > 0) close(u->link.fd);
     u->link.fd = -1;
     outq_free(&u->link.oq);
@@ -604,7 +609,11 @@ static long xhttp_room_win(struct transport *t) {
  * своего таймера: выгрузка packet-up шла кусками «окно, пауза» (8-10 Мбит/с при 150 у stream-up).
  * Теперь ответ будит цикл сам: он сливает связь и, если место выросло, шлёт клиенту окно. */
 static int xhttp_aux_fd(const struct transport *t) {
-    const struct xh_state *x = &t->xh;
+    struct xh_state *x = &((struct transport *)t)->xh;
+    if (x->zombie_fd > 0) {
+        if (x->zombie_seen) { close(x->zombie_fd); x->zombie_fd = 0; }
+        else x->zombie_seen = 1;
+    }
     if (x->mode == XH_STREAM_ONE || !x->up.started || x->up.link.fd <= 0) return -1;
     return x->up.link.fd;
 }

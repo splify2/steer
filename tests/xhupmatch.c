@@ -18,6 +18,7 @@
  * живёт в `make test`. */
 #include "../src/proto/transport/trxhttp.c"
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -450,7 +451,26 @@ static void t_packet_up_goaway(void) {
     srv_drain();
     srv_headers(1, 0x88, 1);                                 /* ответ на кусок 0 */
     srv_goaway(1);                                           /* предел запросов: больше потоков нет */
+    int oldfd = c.xh.up.link.fd;
+    /* Занять все свободные номера ниже старой связи: закрытая, она иначе стала бы наименьшим свободным, и
+     * новый сокет получил бы её номер (в живом демоне так бывает, когда внизу дыр нет). */
+    int fill[4096], nfill = 0;
+    for (;;) {
+        int f = open("/dev/null", O_RDONLY);
+        if (f < 0 || nfill >= 4096) break;
+        fill[nfill++] = f;
+        if (f > oldfd) break;
+    }
     int rc1 = transport_write(&c, piece, sizeof(piece));     /* кусок 1: нужна новая связь */
+    /* Номер новой связи — другой: цикл туннеля держит вторую связь в epoll по номеру, и новая связь с
+     * номером только что закрытой выглядела бы прежней — без записи в epoll, то есть не слушаемой. */
+    check(c.xh.up.link.fd > 0 && c.xh.up.link.fd != oldfd,
+          "переоткрытая связь выгрузки получает другой номер дескриптора, чем закрытая");
+    for (int i = 0; i < nfill; i++) close(fill[i]);
+    check(transport_aux_fd(&c) == c.xh.up.link.fd, "aux_fd называет новую связь");
+    transport_aux_fd(&c);                                    /* второй обход цикла: прежняя связь закрыта */
+    check(c.xh.zombie_fd == 0, "прежняя связь закрыта не позже второго обхода цикла");
+    transport_aux_fd(&c);                                    /* второй обход цикла: старая связь закрыта */
     struct pollfd pf = { .fd = lf, .events = POLLIN };
     int accepted = poll(&pf, 1, 1000) > 0;
     int nfd = accepted ? accept(lf, NULL, NULL) : -1;
