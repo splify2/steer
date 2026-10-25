@@ -307,7 +307,7 @@ static int extract(struct ctx *c, int type, const char *rawpath, const char *raw
         int sk = rd_skip(c->r, (size + 511) / 512 * 512);
         return sk < 0 ? UNTAR_EGZ : sk ? UNTAR_EFORMAT : 0;
     }
-    struct untar_entry e = { .path = rel, .type = type, .mode = mode & 0777 };
+    struct untar_entry e = { .path = rel, .type = type, .mode = mode & 0777, .rawmode = mode & 07777 };
     char *work = strdup(rel);
     if (!work) { free(rel); return UNTAR_ENOMEM; }
     const char *leaf = NULL;
@@ -475,7 +475,14 @@ static int run(struct rd *r, const char *dest, const struct untar_opts *o, char 
             type = (nlen && name[nlen - 1] == '/' && size == 0) ? UNTAR_DIR : UNTAR_FILE;   /* старые tar: каталог без типа 5 */
             break;
         case '5': type = UNTAR_DIR; break;
-        case '2': type = UNTAR_SYMLINK; break;
+        case '2':
+            if (o && (o->flags & UNTAR_NO_LINKS)) {
+                WHY("запись «%.100s»: символьные ссылки в пакете недопустимы", name);
+                rc = UNTAR_ETYPE;
+                goto done;
+            }
+            type = UNTAR_SYMLINK;
+            break;
         default:
             WHY("запись «%.100s»: тип %c не поддержан (жёсткие ссылки и устройства в пакете недопустимы)", name, (tf >= 32 && tf < 127) ? tf : '?');
             rc = UNTAR_ETYPE;
@@ -500,8 +507,14 @@ done:
     if (!rc && ended && r->g) {
         unsigned char sink[4096];
         long k;
-        while ((k = gz_read(r->g, sink, sizeof sink)) > 0) {}
+        int strict = o && (o->flags & UNTAR_STRICT_END);
+        while ((k = gz_read(r->g, sink, sizeof sink)) > 0)
+            if (strict && !all_zero(sink, (size_t)k)) { WHY("после конца tar лежат данные"); rc = UNTAR_EFORMAT; break; }
         if (k < 0) rc = UNTAR_EGZ;
+        else if (!rc && strict && gz_trailing(r->g)) { WHY("после gzip лежат лишние байты"); rc = UNTAR_EGZ; }
+    } else if (!rc && ended && !r->g && o && (o->flags & UNTAR_STRICT_END) && !all_zero(r->mem + r->pos, r->memn - r->pos)) {
+        WHY("после конца tar лежат данные");
+        rc = UNTAR_EFORMAT;
     }
     /* Права каталогов — от глубоких к мелким, после того как всё лежит на месте. */
     if (!rc)

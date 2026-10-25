@@ -103,6 +103,51 @@ int main(void) {
     m2[0] ^= 1;
     check("набор {A}: испорченное сообщение", SIGV_EBAD, sigv_verify_any(&ka, 1, &sa, m2, mn));
 
+    /* Подпись из нескольких блоков (ротация): склейка подписей B и A, A и B, три блока, порча. */
+    {
+        char *two = malloc(sbn + sn + 8);
+        memcpy(two, sigB, sbn);
+        memcpy(two + sbn, sigA, sn);
+        struct sigv_sigs ss;
+        check("два блока (B, затем A): разбор", 0, sigv_parse_sigs(two, sbn + sn, &ss));
+        check("  блоков два", 2, (long)ss.n);
+        size_t ki = 99;
+        check("  набор {A}: годится второй блок", 1, sigv_verify_blocks(&ka, 1, &ss, msg, mn, &ki));
+        check("  ключ — индекс 0", 0, (long)ki);
+        check("  набор {B,A}: годится первый блок (B)", 0, sigv_verify_blocks(set, 2, &ss, msg, mn, &ki));
+        check("  его ключ — индекс 0 набора", 0, (long)ki);
+        struct sigv_key kc = kb;
+        kc.keynum[0] ^= 1;
+        check("  набор без обоих ключей: чужие номера", SIGV_EKEYNUM, sigv_verify_blocks(&kc, 1, &ss, msg, mn, NULL));
+        memcpy(m2, msg, mn);
+        m2[0] ^= 1;
+        check("  испорченное сообщение: ни один не годится", SIGV_EBAD, sigv_verify_blocks(set, 2, &ss, m2, mn, NULL));
+        char hx[17];
+        sigv_keynum_hex(ss.v[0].keynum, hx);
+        check("  номер ключа первого блока (B) — hex как у usign -F", 0, memcmp(hx, "24df5d4f", 0) | (int)(strlen(hx) != 16));
+        sigv_keynum_hex(ka.keynum, hx);
+        check("  номер ключа A — 8cdafa7f8d811d1c, как в «signed by key» у usign", 0, strcmp(hx, "8cdafa7f8d811d1c"));
+        sigv_sigs_free(&ss);
+        char *three = malloc(sbn + sn + sbn);
+        memcpy(three, sigA, sn);
+        memcpy(three + sn, sigB, sbn);
+        memcpy(three + sn + sbn, sigA, sn);
+        check("три блока (A, B, A)", 0, sigv_parse_sigs(three, sn + sbn + sn, &ss));
+        check("  блоков три", 3, (long)ss.n);
+        sigv_sigs_free(&ss);
+        /* Испорченный второй блок отвергает весь файл. */
+        memcpy(two, sigA, sn);
+        memcpy(two + sn, sigB, sbn);
+        two[sn + (size_t)(strchr(sigB, '\n') - sigB) + 11] = '!';
+        check("порча во втором блоке — отказ всего файла", SIGV_EFORMAT, sigv_parse_sigs(two, sn + sbn, &ss));
+        check("пустой файл подписей", SIGV_EFORMAT, sigv_parse_sigs("", 0, &ss));
+        check("один блок разбирается и как набор", 0, sigv_parse_sigs(sigA, sn, &ss));
+        check("  и это один блок", 1, (long)ss.n);
+        sigv_sigs_free(&ss);
+        free(two);
+        free(three);
+    }
+
     /* Файлом. */
     check("sigv_check_file: msg.txt", 0, sigv_check_file(&ka, &sa, "tests/sigvec/msg.txt"));
     check("sigv_check_file: другой файл", SIGV_EBAD, sigv_check_file(&ka, &sa, "tests/sigvec/a.pub"));

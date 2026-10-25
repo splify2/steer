@@ -1,6 +1,7 @@
-/* HTTP/1.1-клиент libsteer: GET и HEAD по http:// и https://, переадресации, потоковое тело, сроки,
- * If-None-Match/ETag (подробности — в httpc.c). Один клиент на всё: подписки (subfetch.c), пакеты
- * плагинов, каталоги. Формата того, что качают, он не знает. */
+/* HTTP/1.1-клиент libsteer: GET, HEAD и запросы с телом (POST, PUT, PATCH, DELETE) по http:// и https://,
+ * переадресации, потоковое тело ответа, сроки, If-None-Match/ETag (подробности — в httpc.c). Один клиент
+ * на всё: подписки (subfetch.c), пакеты плагинов, каталоги, API WARP (wbhttps.c — тонкая обёртка).
+ * Формата того, что качают, он не знает. */
 #ifndef STEER_HTTPC_H
 #define STEER_HTTPC_H
 #include <stddef.h>
@@ -8,14 +9,20 @@
 
 struct http_req {
     const char *url;            /* http://… или https://… (userinfo в ссылке — отказ) */
-    const char *method;         /* "GET" (NULL) или "HEAD" */
+    const char *method;         /* "GET" (NULL), "HEAD", "POST", "PUT", "PATCH" или "DELETE" */
+    const void *body;           /* тело запроса (Content-Length ставится само; тип — в headers); NULL — нет */
+    size_t body_n;
     const char *headers;        /* добавочные «Имя: значение\r\n…» или NULL; User-Agent и Accept отсюда
                                  * заменяют свои. Уходят и на переадресованные адреса — Cookie и
                                  * Authorization туда класть не надо */
     const char *etag;           /* значение If-None-Match («"abc"» с кавычками) или NULL */
+    const char *addr;           /* соединиться с этим адресом (имя или IP) вместо разрешения хоста ссылки; Host, SNI
+                                 * и проверка сертификата остаются по ссылке. Только для хоста первой ссылки,
+                                 * не для переадресаций на другие хосты */
+    int any_status;             /* отдавать тело и при статусе не 2xx (4xx/5xx: API присылает в нём причину) */
 
     /* Куда тело. Оба нуля — тело отбрасывается (HEAD, проверка статуса). Тело отдаётся только при
-     * статусе 2xx; у 3xx без Location, 4xx и 5xx оно не читается (см. status в http_resp). */
+     * статусе 2xx (с any_status — при любом, кроме 204 и 304); у 3xx без Location оно не читается. */
     const char *dest_path;      /* файл: создаётся с нуля (O_TRUNC), при отказе удаляется */
     int (*body_cb)(void *arg, const void *data, size_t n);   /* порция тела; ненулевой ответ — прервать (HTTPC_ESINK) */
     void *cb_arg;
@@ -25,7 +32,8 @@ struct http_req {
     int connect_ms;             /* соединение и рукопожатие TLS на каждый адрес; умолчание 10000 */
     int idle_ms;                /* молчание сервера между порциями; умолчание 30000 */
     int total_ms;               /* на весь вызов, со всеми переадресациями; 0 — без предела */
-    int max_redirects;          /* 0 — 10; отрицательное — не следовать (3xx отдаётся как ответ) */
+    int max_redirects;          /* 0 — 10; отрицательное — не следовать (3xx отдаётся как ответ). 301/302/303 у метода с
+                                 * телом превращают запрос в GET без тела, 307/308 повторяют его как есть */
 
     /* Путь сокета (как wb_route у warpbox): метка выхода steer или устройство; оба нуля — обычный маршрут. */
     uint32_t mark;

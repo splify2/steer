@@ -106,3 +106,9 @@ put("badlen.tar.gz", bytes(g))
 g = gz(raw)
 put("cut-gz.tar.gz", g[: len(g) // 2])
 put("notgz.tar.gz", b"this is not a gzip file at all, just some text\n" * 3)
+
+# Строгий конец (UNTAR_STRICT_END): мусор после нулевых блоков tar, лишние байты после gzip, два члена gzip.
+ok = tgz("t", [("a.txt", "f", b"x", 0o644)], raw=True)
+put("trail-tar.tar.gz", gz(ok + b"garbage after the end"))
+put("trail-gz.tar.gz", gz(ok) + b"junk")
+put("two-members.tar.gz", gz(ok) + gz(b"more"))

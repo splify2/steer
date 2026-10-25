@@ -84,6 +84,20 @@ static void *serve(void *arg) {
         req[n] = 0;
         if (strstr(req, "\r\n\r\n")) break;
     }
+    /* Тело запроса: дочитываем по Content-Length (оно уже может лежать в req целиком). */
+    {
+        char *cl = strcasestr(req, "\r\nContent-Length:");
+        char *he = strstr(req, "\r\n\r\n");
+        if (cl && he) {
+            size_t want = (size_t)(he + 4 - req) + (size_t)atol(cl + 17);
+            while (n < want && n < sizeof req - 1) {
+                ssize_t r = recv(fd, req + n, sizeof req - 1 - n, 0);
+                if (r <= 0) break;
+                n += (size_t)r;
+            }
+            req[n] = 0;
+        }
+    }
     char method[16], path[512];
     if (sscanf(req, "%15s %511s", method, path) != 2) { close(fd); return NULL; }
     int head = !strcmp(method, "HEAD");
@@ -117,6 +131,15 @@ static void *serve(void *arg) {
             sends(fd, "\r\n");
         }
         sends(fd, "0\r\n\r\n");
+    } else if (!strcmp(path, "/post")) {
+        R("HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", n);
+        sendall(fd, req, n);
+    } else if (!strcmp(path, "/err400")) {
+        sends(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 16\r\n\r\n{\"error\":\"nope\"}");
+    } else if (!strcmp(path, "/r303")) {
+        sends(fd, "HTTP/1.1 303 See Other\r\nLocation: /echo\r\nContent-Length: 0\r\n\r\n");
+    } else if (!strcmp(path, "/r307post")) {
+        sends(fd, "HTTP/1.1 307 Temporary\r\nLocation: /post\r\nContent-Length: 0\r\n\r\n");
     } else if (!strcmp(path, "/r1")) {
         sends(fd, "HTTP/1.1 302 Found\r\nLocation: /ok\r\nContent-Length: 0\r\n\r\n");
     } else if (!strcmp(path, "/r2")) {
@@ -298,6 +321,71 @@ int main(void) {
         check("  X-HWID дошёл", 1, strstr((char *)a.b, "X-HWID: abc\r\n") != NULL);
         check("  свой Accept вместо нашего", 1, strstr((char *)a.b, "Accept: text/x\r\n") && !strstr((char *)a.b, "Accept: */*"));
         check("  If-None-Match", 1, strstr((char *)a.b, "If-None-Match: \"v9\"\r\n") != NULL);
+        DONE();
+    }
+
+    /* ---- запросы с телом, any_status, addr -------------------------------------------------------------- */
+    {
+        NEW();
+        struct http_req q = { .url = url("/post"), .method = "POST", .body = "{\"a\":1}", .body_n = 7,
+                              .headers = "Content-Type: application/json\r\n", .body_cb = collect, .cb_arg = &a, .idle_ms = 2000 };
+        check("POST с телом", 0, http_get(&q, &r, why, sizeof why));
+        a.b[a.n] = 0;
+        check("  метод и путь", 1, !strncmp((char *)a.b, "POST /post HTTP/1.1\r\n", 21));
+        check("  Content-Length: 7", 1, strstr((char *)a.b, "Content-Length: 7\r\n") != NULL);
+        check("  Content-Type из заголовков", 1, strstr((char *)a.b, "Content-Type: application/json\r\n") != NULL);
+        check("  тело дошло", 1, strstr((char *)a.b, "\r\n\r\n{\"a\":1}") != NULL);
+        DONE();
+        NEW();
+        q.method = "PATCH";
+        q.url = url("/post");
+        check("PATCH", 0, http_get(&q, &r, why, sizeof why));
+        a.b[a.n] = 0;
+        check("  метод PATCH", 1, !strncmp((char *)a.b, "PATCH /post", 11));
+        DONE();
+        NEW();
+        q.method = "POST";
+        q.body = NULL;
+        q.body_n = 0;
+        check("POST без тела: Content-Length: 0", 0, http_get(&q, &r, why, sizeof why));
+        a.b[a.n] = 0;
+        check("  Content-Length: 0", 1, strstr((char *)a.b, "Content-Length: 0\r\n") != NULL);
+        DONE();
+        NEW();
+        q.body = "xy";
+        q.body_n = 2;
+        q.url = url("/r303");
+        check("303 у POST: дальше GET без тела", 0, http_get(&q, &r, why, sizeof why));
+        a.b[a.n] = 0;
+        check("  GET /echo", 1, !strncmp((char *)a.b, "GET /echo", 9) && !strstr((char *)a.b, "Content-Length"));
+        DONE();
+        NEW();
+        q.url = url("/r307post");
+        check("307 у POST: тот же метод и тело", 0, http_get(&q, &r, why, sizeof why));
+        a.b[a.n] = 0;
+        check("  POST /post с телом", 1, !strncmp((char *)a.b, "POST /post", 10) && strstr((char *)a.b, "\r\n\r\nxy") != NULL);
+        DONE();
+        NEW();
+        q.method = "GET";
+        q.body = NULL;
+        q.body_n = 0;
+        q.url = url("/err400");
+        check("400 без any_status: ответ, тела нет", 0, http_get(&q, &r, why, sizeof why));
+        check("  статус 400, тело не отдано", 1, r.status == 400 && a.cnt == 0);
+        DONE();
+        NEW();
+        q.any_status = 1;
+        check("400 с any_status: тело есть", 0, http_get(&q, &r, why, sizeof why));
+        check("  статус 400 и причина в теле", 1, r.status == 400 && is_text(&a, "{\"error\":\"nope\"}"));
+        DONE();
+        NEW();
+        char ua[100];
+        snprintf(ua, sizeof ua, "http://api.invalid:%d/ok", g_port);
+        q.any_status = 0;
+        q.url = ua;
+        q.addr = "127.0.0.1";
+        check("addr: имя из ссылки не разрешается, соединение — на addr", 0, http_get(&q, &r, why, sizeof why));
+        check("  тело", 1, is_text(&a, "hello world"));
         DONE();
     }
 
@@ -493,8 +581,8 @@ int main(void) {
         check("  X-Quota: 42", 1, v && vn == 2 && !memcmp(v, "42", 2));
         DONE();
         NEW();
-        q.method = "POST";
-        check("метод POST не поддержан", HTTPC_EURL, http_get(&q, &r, why, sizeof why));
+        q.method = "TRACE";
+        check("метод TRACE не поддержан", HTTPC_EURL, http_get(&q, &r, why, sizeof why));
         DONE();
         NEW();
         q.method = NULL;

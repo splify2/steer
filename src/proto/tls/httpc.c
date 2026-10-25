@@ -19,7 +19,7 @@
  * трейлеры пропускаются). Обрыв ловится: Content-Length — по счёту, chunked — по отсутствию
  * нулевого куска; закрытие без длины — конец, но для TLS только close_notify (обрыв TCP — ETRUNC).
  *
- * ЧТО НЕ СДЕЛАНО: keep-alive, POST, Range, сжатие (Accept-Encoding не посылается — тело как есть),
+ * ЧТО НЕ СДЕЛАНО: keep-alive, Range, сжатие (Accept-Encoding не посылается — тело как есть),
  * прокси, куки по правилам RFC 6265 (хватает того, что нужно панелям подписок: имя=значение на
  * тот же хост на время вызова — без Domain, Path и срока). Cookie-проверка перед панелью подписки
  * отвечает 302 на тот же адрес с Set-Cookie; без возврата cookie клиент ходил бы по кругу (subfetch.c). */
@@ -303,6 +303,7 @@ struct ctx {
     long end_ms;                    /* общий срок (mono_ms), 0 — нет */
     int sink_fd;
     struct jar jar;
+    const char *addr_host;          /* (копия) хост первой ссылки — только для него действует q->addr */
 };
 
 /* Сколько ждать: want мс, но не дольше общего срока. 0 — срок вышел. */
@@ -379,8 +380,9 @@ static int conn_open(struct ctx *c, const struct url *u, struct conn *k) {
     char port[12];
     snprintf(port, sizeof port, "%u", u->port);
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM }, *res = NULL;
-    int gr = getaddrinfo(u->host, port, &hints, &res);
-    if (gr != 0 || !res) { WHY("имя %s не разрешилось: %s", u->host, gr ? gai_strerror(gr) : "нет адресов"); return HTTPC_ERESOLVE; }
+    const char *rname = c->q->addr && c->q->addr[0] && c->addr_host && !strcasecmp(u->host, c->addr_host) ? c->q->addr : u->host;
+    int gr = getaddrinfo(rname, port, &hints, &res);
+    if (gr != 0 || !res) { WHY("имя %s не разрешилось: %s", rname, gr ? gai_strerror(gr) : "нет адресов"); return HTTPC_ERESOLVE; }
     int fd = -1, timed = 0;
     /* Сначала IPv4: у роутера без глобального IPv6 попытка по AAAA отваливается сразу, но в сети со
      * «сломанным» IPv6 она ждала бы весь срок. */
@@ -666,7 +668,7 @@ static int read_head(struct ctx *c, struct conn *k, struct reply *y) {
 
 /* ---- запрос --------------------------------------------------------------------------------------- */
 
-static int send_request(struct ctx *c, struct conn *k, const struct url *u, const char *method) {
+static int send_request(struct ctx *c, struct conn *k, const struct url *u, const char *method, const void *body, size_t body_n) {
     char *hh = host_header(u);
     if (!hh) return HTTPC_ENOMEM;
     struct sb b = {0};
@@ -698,12 +700,19 @@ static int send_request(struct ctx *c, struct conn *k, const struct url *u, cons
     if (!first) sb_str(&b, "\r\n");
     if (extra) sb_str(&b, extra);
     if (extra && *extra && (b.n < 2 || b.p[b.n - 1] != '\n')) sb_str(&b, "\r\n");
+    if (body || !strcasecmp(method, "POST") || !strcasecmp(method, "PUT") || !strcasecmp(method, "PATCH")) {
+        char cl[48];
+        snprintf(cl, sizeof cl, "Content-Length: %zu\r\n", body ? body_n : 0);
+        sb_str(&b, cl);
+    }
     sb_str(&b, "\r\n");
     if (b.oom) { free(b.p); return HTTPC_ENOMEM; }
     int rc = 0;
     if (k->t) {
         if (tls13_write(k->t, (const unsigned char *)b.p, b.n) != 0) rc = HTTPC_EIO;
+        else if (body && body_n && tls13_write(k->t, body, body_n) != 0) rc = HTTPC_EIO;
     } else if (write_all(k->fd, (const unsigned char *)b.p, b.n) != 0) rc = HTTPC_EIO;
+    else if (body && body_n && write_all(k->fd, body, body_n) != 0) rc = HTTPC_EIO;
     free(b.p);
     if (rc && c->why && c->wn) snprintf(c->why, c->wn, "запрос не отправился");
     return rc;
@@ -716,7 +725,12 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
     if (why && wn) why[0] = 0;
     const char *method = q->method && *q->method ? q->method : "GET";
     int head = !strcasecmp(method, "HEAD");
-    if (!head && strcasecmp(method, "GET")) { WHY("метод %s не поддержан (только GET и HEAD)", method); return HTTPC_EURL; }
+    static const char *const known[] = { "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE" };
+    int ok_method = 0;
+    for (size_t i = 0; i < sizeof known / sizeof known[0]; i++) if (!strcasecmp(method, known[i])) ok_method = 1;
+    if (!ok_method) { WHY("метод %s не поддержан", method); return HTTPC_EURL; }
+    const void *body = q->body;
+    size_t body_n = q->body ? q->body_n : 0;
     struct ctx c = { .q = q, .r = r, .why = why, .wn = wn, .sink_fd = -1 };
     if (q->total_ms > 0) c.end_ms = mono_ms() + q->total_ms;
     int max_redir = q->max_redirects == 0 ? 10 : q->max_redirects;
@@ -724,6 +738,7 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
     int rc = url_parse(q->url ? q->url : "", &u);
     if (rc) { WHY(rc == HTTPC_ENOMEM ? "нет памяти" : "ссылка не http:// и не https:// или разобрана не до конца: %.200s", q->url ? q->url : ""); return rc; }
     int ims = q->idle_ms > 0 ? q->idle_ms : 30000;
+    c.addr_host = strdup(u.host);                     /* u.host меняется на переадресациях */
 
     for (;;) {
         struct conn k;
@@ -731,7 +746,7 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
         struct body b = {0};
         rc = conn_open(&c, &u, &k);
         if (rc) goto out;
-        rc = send_request(&c, &k, &u, method);
+        rc = send_request(&c, &k, &u, method, body, body_n);
         if (!rc) rc = read_head(&c, &k, &y);
         if (rc) { conn_close(&k); reply_free(&y); goto out; }
 
@@ -773,6 +788,12 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
                 free(nu);
                 url_free(&u);
                 u = nx;
+                /* 301/302/303 у метода с телом — GET без тела (как у браузеров и curl -L); 307/308 как есть. */
+                if (y.status != 307 && y.status != 308 && !head && strcasecmp(method, "GET")) {
+                    method = "GET";
+                    body = NULL;
+                    body_n = 0;
+                }
                 r->redirects++;
                 conn_close(&k);
                 reply_free(&y);
@@ -796,7 +817,8 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
             if (r->url && hh) snprintf(r->url, ul, "%s://%s%s", u.tls ? "https" : "http", hh, u.target);
             free(hh);
         }
-        int want_body = !head && y.status / 100 == 2 && y.status != 204 && (q->dest_path || q->body_cb);
+        int want_body = !head && (y.status / 100 == 2 || (q->any_status && y.status >= 200)) && y.status != 204 &&
+                       y.status != 304 && (q->dest_path || q->body_cb);
         if (!want_body) { conn_close(&k); reply_free(&y); rc = 0; goto out; }
 
         /* Как кончается тело. */
@@ -852,5 +874,6 @@ out:
     }
     jar_free(&c.jar);
     url_free(&u);
+    free((char *)c.addr_host);
     return rc;
 }

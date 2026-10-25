@@ -79,6 +79,11 @@ long gz_read(struct gz *g, void *dstv, size_t cap) {
     return 0;
 }
 
+size_t gz_trailing(const struct gz *g) {
+    size_t used = g->off + g->ps.incnt + 8;
+    return g->state == 1 && used <= g->n ? g->n - used : 0;
+}
+
 void gz_close(struct gz *g) {
     free(g);
 }

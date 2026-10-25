@@ -52,8 +52,10 @@ static int b64dec(const char *s, size_t n, unsigned char *out, size_t cap) {
     return (int)o;
 }
 
-/* Вторая строка файла (после «untrusted comment: …») без перевода строки; false — формат не тот. */
-static int body_line(const char *t, size_t n, const char **b, size_t *bn) {
+/* Блок файла с начала t: строка комментария и строка base64. *b, *bn — вторая строка без перевода
+ * строки, *used — сколько байт занял весь блок (с переводом строки после второй, если он есть).
+ * false — формат не тот. */
+static int block_line(const char *t, size_t n, const char **b, size_t *bn, size_t *used) {
     size_t cl = strlen(COMMENT);
     if (n < cl || memcmp(t, COMMENT, cl) != 0) return 0;
     const char *nl = memchr(t, '\n', n);
@@ -62,14 +64,19 @@ static int body_line(const char *t, size_t n, const char **b, size_t *bn) {
     size_t left = n - (size_t)(p - t);
     const char *e = memchr(p, '\n', left);
     size_t l = e ? (size_t)(e - p) : left;
-    /* После второй строки допустим только её перевод строки. */
-    size_t rest = e ? left - l - 1 : 0;
-    if (rest) return 0;
+    *used = (size_t)(p - t) + l + (e ? 1 : 0);
     if (l && p[l - 1] == '\r') l--;
     if (!l) return 0;
     *b = p;
     *bn = l;
     return 1;
+}
+
+/* Вторая строка файла из одного блока; после неё допустим только её перевод строки. */
+static int body_line(const char *t, size_t n, const char **b, size_t *bn) {
+    size_t used;
+    if (!block_line(t, n, b, bn, &used)) return 0;
+    return used == n;
 }
 
 /* Общая часть: base64 → "Ed" ‖ keynum ‖ тело (len байт). */
@@ -93,6 +100,57 @@ int sigv_parse_key(const char *text, size_t n, struct sigv_key *k) {
 
 int sigv_parse_sig(const char *text, size_t n, struct sigv_sig *s) {
     return parse_common(text, n, s->keynum, s->sig, sizeof s->sig);
+}
+
+int sigv_parse_sigs(const char *text, size_t n, struct sigv_sigs *out) {
+    out->v = NULL;
+    out->n = 0;
+    size_t cap = 0, off = 0;
+    while (off < n) {
+        const char *b;
+        size_t bn, used;
+        if (!block_line(text + off, n - off, &b, &bn, &used)) { sigv_sigs_free(out); return SIGV_EFORMAT; }
+        if (out->n == cap) {
+            size_t nc = cap ? cap * 2 : 2;
+            struct sigv_sig *nv = realloc(out->v, nc * sizeof *nv);
+            if (!nv) { sigv_sigs_free(out); return SIGV_ENOMEM; }
+            out->v = nv;
+            cap = nc;
+        }
+        int rc = sigv_parse_sig(text + off, used, &out->v[out->n]);
+        if (rc) { sigv_sigs_free(out); return rc; }
+        out->n++;
+        off += used;
+    }
+    if (!out->n) return SIGV_EFORMAT;
+    return 0;
+}
+
+void sigv_sigs_free(struct sigv_sigs *s) {
+    free(s->v);
+    s->v = NULL;
+    s->n = 0;
+}
+
+int sigv_verify_blocks(const struct sigv_key *keys, size_t nkeys, const struct sigv_sigs *s,
+                       const void *msg, size_t msg_n, size_t *key_idx) {
+    int worst = SIGV_EKEYNUM;
+    for (size_t i = 0; i < s->n; i++) {
+        int rc = sigv_verify_any(keys, nkeys, &s->v[i], msg, msg_n);
+        if (rc >= 0) {
+            if (key_idx) *key_idx = (size_t)rc;
+            return (int)i;
+        }
+        if (rc == SIGV_EBAD) worst = SIGV_EBAD;
+        else if (rc != SIGV_EKEYNUM) return rc;
+    }
+    return worst;
+}
+
+void sigv_keynum_hex(const unsigned char keynum[8], char out[17]) {
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < 8; i++) { out[2 * i] = hx[keynum[i] >> 4]; out[2 * i + 1] = hx[keynum[i] & 15]; }
+    out[16] = 0;
 }
 
 int sigv_verify(const struct sigv_key *k, const struct sigv_sig *s, const void *msg, size_t msg_n) {

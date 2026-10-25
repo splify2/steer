@@ -41,6 +41,27 @@ int sigv_verify(const struct sigv_key *k, const struct sigv_sig *s, const void *
 int sigv_verify_any(const struct sigv_key *keys, size_t nkeys, const struct sigv_sig *s,
                     const void *msg, size_t msg_n);
 
+/* ПОДПИСЬ ИЗ НЕСКОЛЬКИХ БЛОКОВ (ротация ключей, s2p.md): файл — один или больше блоков по две строки,
+ * по одному на ключ издателя. Число блоков не ограничено. sigv_parse_sigs разбирает файл целиком; блок
+ * с чужим алгоритмом или испорченным base64 — отказ всего файла. */
+struct sigv_sigs {
+    struct sigv_sig *v;
+    size_t n;
+};
+int sigv_parse_sigs(const char *text, size_t n, struct sigv_sigs *out);
+void sigv_sigs_free(struct sigv_sigs *s);
+
+/* Годится любой блок, для которого в наборе есть ключ с тем же keynum и подпись сходится: возвращает
+ * индекс ПОДПИСАВШЕГО блока в s->v (>= 0); *key_idx (если не NULL) — индекс его ключа в keys. Ни один
+ * не годится: SIGV_EKEYNUM, если ни у одного блока нет ключа в наборе (вызывающий назовёт номера из
+ * s->v[i].keynum — sigv_keynum_hex), иначе SIGV_EBAD. Роль ключа и отозванные номера — дело вызывающего:
+ * он собирает в keys только годные ключи. */
+int sigv_verify_blocks(const struct sigv_key *keys, size_t nkeys, const struct sigv_sigs *s,
+                       const void *msg, size_t msg_n, size_t *key_idx);
+
+/* Номер ключа строчными hex-знаками (16 знаков и ноль) — так его пишет usign -F. */
+void sigv_keynum_hex(const unsigned char keynum[8], char out[17]);
+
 /* То же над файлом целиком (читается в память: Ed25519 хеширует сообщение до подписи, потоком его
  * не проверить). */
 int sigv_check_file(const struct sigv_key *k, const struct sigv_sig *s, const char *path);

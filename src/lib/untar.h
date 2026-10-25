@@ -27,7 +27,8 @@
 struct untar_entry {
     const char *path;               /* нормализованный путь внутри dest: без «./», «//», «..» */
     int type;                       /* UNTAR_FILE, UNTAR_DIR, UNTAR_SYMLINK */
-    unsigned mode;                  /* mode & 0777 из архива */
+    unsigned mode;                  /* mode & 0777 из архива — с этими правами файл лёг на диск */
+    unsigned rawmode;               /* режим из архива целиком (с setuid/setgid/sticky) — для политики вызывающего */
     unsigned long long size;        /* размер файла; у каталога и ссылки 0 */
     unsigned char sha256[32];       /* SHA-256 содержимого файла; у остальных нули */
     const char *link;               /* цель символьной ссылки, иначе NULL */
@@ -40,7 +41,13 @@ struct untar_opts {
     untar_cb cb;                    /* может быть NULL */
     void *arg;
     unsigned long long max_bytes;   /* предел суммы размеров файлов; 0 — без предела */
+    unsigned flags;                 /* UNTAR_NO_LINKS, UNTAR_STRICT_END */
 };
+
+/* Политика строгого читателя (пакеты плагинов, s2p.md): */
+#define UNTAR_NO_LINKS   1u         /* символьные ссылки — отказ UNTAR_ETYPE, до создания */
+#define UNTAR_STRICT_END 2u         /* после конца tar только нули (добивка), у gzip — один член и ничего после
+                                     * хвоста; иначе UNTAR_EFORMAT/UNTAR_EGZ */
 
 #define UNTAR_EFORMAT (-1)          /* не tar: заголовок, контрольная сумма, обрыв посреди записи */
 #define UNTAR_EPATH   (-2)          /* путь или ссылка выходит за dest, либо идёт сквозь ссылку */

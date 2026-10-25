@@ -110,7 +110,7 @@ static int content_is(const char *rel, const void *want, size_t wn) {
 
 
 #define MAXE 64
-static struct { char path[300]; int type; unsigned mode; unsigned long long size; unsigned char sha[32]; char link[300]; } g_e[MAXE];
+static struct { char path[300]; int type; unsigned mode, rawmode; unsigned long long size; unsigned char sha[32]; char link[300]; } g_e[MAXE];
 static int g_n, g_abort_at = -1;
 
 static int cb(void *arg, const struct untar_entry *e) {
@@ -119,6 +119,7 @@ static int cb(void *arg, const struct untar_entry *e) {
         snprintf(g_e[g_n].path, sizeof g_e[g_n].path, "%s", e->path);
         g_e[g_n].type = e->type;
         g_e[g_n].mode = e->mode;
+        g_e[g_n].rawmode = e->rawmode;
         g_e[g_n].size = e->size;
         memcpy(g_e[g_n].sha, e->sha256, 32);
         snprintf(g_e[g_n].link, sizeof g_e[g_n].link, "%s", e->link ? e->link : "");
@@ -190,6 +191,7 @@ static void check_good(const char *label) {
     C("корень «./» не запись", -1, find(""));
     C("нет путей с «./»", -1, find("./plugin.json"));
     C("setuid.sh: режим в вызове без бита", 0755, (int)g_e[find("setuid.sh")].mode);
+    C("setuid.sh: rawmode несёт setuid для политики вызывающего", 04755, (int)g_e[find("setuid.sh")].rawmode);
     C("всего записей (родители файлов — не записи)", 11, g_n);
     #undef C
 }
@@ -297,6 +299,20 @@ int main(void) {
     {
         run_file("link-then-file.tar.gz", &o, why, sizeof why);
         check("link-then-file: real/f.txt не создан", 0, exists("real/f.txt"));
+    }
+
+    /* ---- политика строгого читателя ---------------------------------------------------------------- */
+    {
+        struct untar_opts st = { .flags = UNTAR_NO_LINKS | UNTAR_STRICT_END };
+        check("NO_LINKS: архив со ссылками — отказ", UNTAR_ETYPE, run_file("good.tar.gz", &st, why, sizeof why));
+        check("  и ссылка не создана", 0, exists("link-to-file"));
+        check("STRICT_END: чистый архив проходит", 0, run_file("long-pax.tar.gz", &st, why, sizeof why));
+        check("STRICT_END: данные после нулевых блоков tar", UNTAR_EFORMAT, run_file("trail-tar.tar.gz", &st, why, sizeof why));
+        check("STRICT_END: байты после хвоста gzip", UNTAR_EGZ, run_file("trail-gz.tar.gz", &st, why, sizeof why));
+        check("STRICT_END: два члена gzip", UNTAR_EGZ, run_file("two-members.tar.gz", &st, why, sizeof why));
+        check("без STRICT_END те же три архива читаются", 0,
+              run_file("trail-tar.tar.gz", NULL, why, sizeof why) | run_file("trail-gz.tar.gz", NULL, why, sizeof why) |
+              run_file("two-members.tar.gz", NULL, why, sizeof why));
     }
 
     /* ---- прерывание вызывающим, предел, существующий файл ---------------------------------------- */

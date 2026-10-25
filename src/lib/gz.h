@@ -16,6 +16,10 @@ struct gz *gz_open(const void *z, size_t n);
  * оборван или не сошёлся. Конец без хвоста — тоже -1: половина файла не «конец». */
 long gz_read(struct gz *g, void *dst, size_t cap);
 
+/* Сколько байт входа осталось после хвоста gzip (после gz_read, вернувшего 0): склеенный второй член
+ * или мусор. Для строгих читателей; остальные его не спрашивают. */
+size_t gz_trailing(const struct gz *g);
+
 void gz_close(struct gz *g);
 
 #endif
