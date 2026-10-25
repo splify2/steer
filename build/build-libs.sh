@@ -25,6 +25,18 @@
 # архитектуру по имени загрузчика musl (ld-musl-mipsel-sf.so.1 для mipsel soft-float,
 # ld-musl-armhf.so.1 для hard-float ARM, и т. д.). RPATH не нужен: библиотеки лежат в /usr/lib,
 # где musl ищет по умолчанию.
+#
+# РАСКЛАДКА 2.1 (умолчание; build/sources.mk, «РАСКЛАДКА 2.1»): libsteer без стека протоколов,
+# steerd, модуль steer-tgws (мост ещё не плагин), плагин-библиотека net1 и плагины протоколов:
+#
+#     ВЫХОД/libsteer.so.<версия> libsteer-wolfssl.so.<версия> steerd steer-tgws
+#     ВЫХОД/plugins/net1/lib/libs2p-net.so.1
+#     ВЫХОД/plugins/<id>/bin/<id>          vless hysteria2 proxy xsteer warpbox obfs
+#     ВЫХОД/steer-<id> -> plugins/<id>/bin/<id>   ссылки для стендов 2.0 (их зовут по прежнему пути)
+#
+# Плагины ищут net1 по RUNPATH $ORIGIN/../../net1/lib — раскладка каталога плагинов на роутере
+# (/usr/lib/steer/plugins/<id>/bin) та же, что здесь. STEER_LAYOUT=2.0 — прежняя раскладка: libsteer со
+# стеком (PROFILE_libsteer20, замороженная карта build/libsteer20.map) и модули steer-<m> на ней.
 set -eu
 
 OUT="${1:?нужен выходной каталог}"
@@ -120,8 +132,14 @@ compile() {
 CRYPTO="$(profile_var CRYPTO_SRC)"
 QUIC_ALL="$(profile_var QUIC_SRC)"
 QUIC_SSL="$(profile_var QUIC_SSL_SRC)"
+LAYOUT="${STEER_LAYOUT:-2.1}"
+case "$LAYOUT" in
+    2.1) LIB_PROFILE=PROFILE_libsteer; LIB_MAP=build/libsteer.map ;;
+    2.0) LIB_PROFILE=PROFILE_libsteer20; LIB_MAP=build/libsteer20.map ;;
+    *) echo "build-libs: STEER_LAYOUT — 2.1 или 2.0, а не «$LAYOUT»" >&2; exit 2 ;;
+esac
 LIB_SRC=""
-for f in $(profile_var PROFILE_libsteer); do
+for f in $(profile_var "$LIB_PROFILE"); do
     case " $CRYPTO $QUIC_ALL " in *" $f "*) ;; *) LIB_SRC="$LIB_SRC $f" ;; esac
 done
 # shellcheck disable=SC2086
@@ -165,7 +183,7 @@ $CC -shared -o "$WSO" "$OBJ/abi.o" -Wl,--whole-archive "$WLIB" -Wl,--no-whole-ar
 SO="$OUT/libsteer.so.$VERSION"
 # shellcheck disable=SC2086
 $CC -shared -o "$SO" "$OBJ"/lib/*.o "$NGLIB" "$WSO" \
-    -Wl,-soname,"libsteer.so.$VERSION" -Wl,--version-script=build/libsteer.map \
+    -Wl,-soname,"libsteer.so.$VERSION" -Wl,--version-script="$LIB_MAP" \
     -Wl,-Bsymbolic -Wl,--gc-sections $ZDEFS -Wl,-z,relro -s $LIBS
 
 # ---- steerd и модули ------------------------------------------------------------------------------
@@ -197,13 +215,84 @@ $CC -O2 $APPF -c "$MODCMD" -o "$OBJ/modcmd.o"
 # внешнему модулю не нужны, их пакеты собирает build.sh steer.
 if [ -z "${STEER_EXT_ONLY:-}" ]; then
 link_app steerd "-O2 $APPF" PROFILE_steerd
+link_app steer-tgws "-O2 $APPF" PROFILE_mod_tgws
+if [ "$LAYOUT" = 2.0 ]; then
 link_app steer-vless "-O2 $APPF" PROFILE_mod_vless
 link_app steer-xsteer "-O2 $APPF" PROFILE_mod_xsteer
 link_app steer-obfs "-O2 $APPF" PROFILE_mod_obfs
-link_app steer-tgws "-O2 $APPF" PROFILE_mod_tgws
 link_app steer-hysteria2 "-O2 $APPF" PROFILE_mod_hysteria2
 link_app steer-proxy "-O2 $APPF" PROFILE_mod_proxy
 link_app steer-warpbox "-O2 $APPF" PROFILE_mod_warpbox
+fi
+fi
+
+# ---- net1 и плагины протоколов (раскладка 2.1) ----------------------------------------------------
+if [ "$LAYOUT" = 2.1 ] && [ -z "${STEER_EXT_ONLY:-}" ]; then
+    N1MAP=build/net1/libs2p-net.map
+    # Заголовок переименования: по строке `#define имя s2p_имя` на каждое имя карты, кроме родных
+    # s2p_net_* (src/net1/s2pnet.h). Подключается ключом -include и к net1, и к плагинам на ней: те и
+    # другие видят одни и те же имена, а исходники не меняются.
+    N1H="$OBJ/s2p-names.h"
+    {
+        echo "/* Порождён build/build-libs.sh из $N1MAP — не править. */"
+        sed -n 's/^ *s2p_\([A-Za-z0-9_]*\);$/\1/p' "$N1MAP" | grep -v '^net_' |
+            awk '{print "#define " $1 " s2p_" $1}'
+    } > "$N1H"
+    N1DIR="$OUT/plugins/net1/lib"
+    mkdir -p "$N1DIR" "$OBJ/net1"
+    # Флаги — как у libsteer (тот же стек, тот же горячий путь), без STEER_LIBSTEER: реестра видов в
+    # net1 нет. Видимость задаёт карта (local: *), поэтому и wolfSSL, и ngtcp2 из архивов остаются
+    # внутри библиотеки.
+    # -Wno-address: src/lib/sockmark.h спрашивает слабую `plat` (стенды без платформы), а под
+    # переименованием это уже сильная s2p_plat — проверка верна, но gcc предупреждает о ней.
+    N1F="-Wno-address -O2 -fPIC -fno-semantic-interposition -ftls-model=initial-exec -ffunction-sections -fdata-sections \
+         -Wall -Wextra -include $OBJ/steer_version.h -include $N1H $STEER_INC $THIRD_DEFS"
+    N1_PLAIN=""
+    for f in $(profile_var PROFILE_net1); do
+        case " $CRYPTO $QUIC_ALL " in *" $f "*) ;; *) N1_PLAIN="$N1_PLAIN $f" ;; esac
+    done
+    # shellcheck disable=SC2086
+    compile "$N1F" "$OBJ/net1" $N1_PLAIN
+    # shellcheck disable=SC2086
+    $CC $N1F $WCFLAGS -c "$CRYPTO" -o "$OBJ/net1/$(echo "$CRYPTO" | tr / _).o"
+    for f in $(profile_var NET1_QUIC_SRC); do
+        case " $QUIC_SSL " in *" $f "*) _wc="$WCFLAGS" ;; *) _wc="" ;; esac
+        # shellcheck disable=SC2086
+        $CC $N1F $NGCFLAGS $_wc -c "$f" -o "$OBJ/net1/$(echo "$f" | tr / _).o"
+    done
+    N1SO="$N1DIR/libs2p-net.so.1"
+    # wolfSSL — архивом целиком (--whole-archive не нужен: тянется только то, что зовут scrypto.c,
+    # qcssl.c и ngtcp2), ngtcp2 — тоже архивом. -z defs: у net1 нет ни одной ссылки наружу, кроме libc.
+    # shellcheck disable=SC2086
+    $CC -shared -o "$N1SO" "$OBJ"/net1/*.o "$NGLIB" "$WLIB" \
+        -Wl,-soname,libs2p-net.so.1 -Wl,--version-script="$N1MAP" \
+        -Wl,-Bsymbolic -Wl,--gc-sections $ZDEFS -Wl,-z,relro -s $LIBS
+
+    # plug ИМЯ — плагин протокола: код протокола и разбор спеки статически, стек — из net1.
+    # RUNPATH ставит компоновщик ($ORIGIN/../../net1/lib, plugin-sdk/docs/manifest.md, «libs»).
+    _ldi=""
+    [ -z "$INTERP" ] || _ldi="-Wl,--dynamic-linker=$INTERP"
+    plug() {
+        _n="$1"; _net="$2"
+        _od="$OBJ/plug-$_n"; _pd="$OUT/plugins/$_n/bin"
+        mkdir -p "$_od" "$_pd"
+        if [ "$_net" = 1 ]; then _pf="-O2 $APPF -Wno-address -include $N1H"; else _pf="-O2 $APPF"; fi
+        # shellcheck disable=SC2046,SC2086
+        compile "$_pf" "$_od" $(profile_var "PROFILE_plug_$_n")
+        if [ "$_net" = 1 ]; then
+            # shellcheck disable=SC2086
+            $CC -o "$_pd/$_n" "$_od"/*.o "$N1SO" '-Wl,-rpath,$ORIGIN/../../net1/lib' $_ldi \
+                -Wl,--gc-sections -Wl,--as-needed -s $LIBS
+        else
+            # shellcheck disable=SC2086
+            $CC -o "$_pd/$_n" "$_od"/*.o $_ldi -Wl,--gc-sections -s $LIBS
+        fi
+        # Ссылка по прежнему имени модуля — для стендов и для поиска ядром рядом с собой (src/lib/
+        # module.c ищет сначала каталог плагинов, затем steer-<m> рядом со steerd).
+        ln -sfn "plugins/$_n/bin/$_n" "$OUT/steer-$_n"
+    }
+    for _p in $(profile_var PLUGINS_NET1); do plug "$_p" 1; done
+    for _p in $(profile_var PLUGINS_STATIC); do plug "$_p" 0; done
 fi
 
 # Внешние модули (STEER_EXT_APPS="имя:каталог …"): бинарники из исходников ВНЕ этого дерева —
@@ -224,4 +313,8 @@ for _ea in ${STEER_EXT_APPS:-}; do
 done
 
 # Клиент сокета `steer` — по-прежнему статический, один на все раскладки (build.sh собирает его сам).
-echo "libs: готово в $OUT (libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy, steer-warpbox${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"
+if [ "$LAYOUT" = 2.1 ]; then
+    echo "libs: готово в $OUT (раскладка 2.1: libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-tgws, net1, плагины $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC)${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"
+else
+    echo "libs: готово в $OUT (раскладка 2.0: libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy, steer-warpbox${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"
+fi

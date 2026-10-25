@@ -159,3 +159,10 @@ build/warpmatch
 build/urltlsmatch
 build/abihost
 build/abihost-static
+# Раскладка 2.1: стадии архивов .s2p, тестовый ключ подписи (build/pack-s2p.sh) и журналы.
+build/s2p-stage/
+build/s2p-testkey/
+build/*-s2p.log
+build/libs-host20/
+build/libs-host20.log
+build/libs-test-*.log

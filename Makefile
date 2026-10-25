@@ -24,7 +24,7 @@ include build/sources.mk
 CORE_HDR := $(wildcard $(addsuffix /*.h,$(CORE_DIRS) $(PROFILE_DIRS) $(THIRD_DIRS)))
 # Точки входа модулей (src/modules, шаг 4 выпуска 1.10) — тоже расширенная часть: их main живёт
 # только в разделяемой раскладке, и ни один статический профиль их не компилирует.
-EXT_ALL_SRC := $(sort $(PLUGMGR_SRC) $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC) $(HY2_MOD_SRC) $(KINDS_HY2_SRC) $(PROXY_MOD_SRC) $(KINDS_PROXY_SRC) $(WARP_MOD_SRC) $(wildcard src/modules/*.c))
+EXT_ALL_SRC := $(sort $(PLUGMGR_SRC) $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC) $(HY2_MOD_SRC) $(KINDS_HY2_SRC) $(PROXY_MOD_SRC) $(KINDS_PROXY_SRC) $(WARP_MOD_SRC) $(wildcard src/modules/*.c) $(wildcard src/net1/*.c))
 # Модель для стендов, которые компонуют её отдельным списком: разбор спрашивает вид у реестра, поэтому
 # вместе с моделью идут виды (src/kinds). Без awg.c: он тянет run_quiet из lib/run.c, а стенды
 # подменяют run_quiet своим — awg.c берут только те, кому нужен сам вид awg (specmatch, awgmatch).

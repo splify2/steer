@@ -106,6 +106,14 @@
 #include "geo.h"
 #include "latscore.h"
 
+/* Имя раздачи `by` для status и описания. Своя копия трёх строк kinds/group.c (group_by_name), а не
+ * вызов: стек живёт и в библиотеке-плагине net1, которая с реестром видов ядра не связана
+ * (build/sources.mk, «РАСКЛАДКА 2.1»). Порядок — enum раздачи группы (spec.h). */
+static const char *pl_by_name(int b) {
+    static const char *const N[] = { "connection", "site", "site_client" };
+    return b >= 0 && (size_t)b < sizeof(N) / sizeof(N[0]) ? N[b] : "connection";
+}
+
 /* geo.c — только там, где есть TLS (libsteer, телефон): стенды пула без него собираются, и проверки
  * страны у них нет. */
 int geo_trace(const char *dev, char cc[3], char *why, size_t wn) __attribute__((weak));
@@ -376,7 +384,7 @@ static void pl_publish(void) {
     }
     if (g_pl.cf.proto->extra) fprintf(f, ",%s", g_pl.cf.proto->extra);
     fprintf(f, ",\"want\":%d,\"slots\":%d,\"by\":\"%s\",\"active\":[", g_pl.cf.active, g_pl.n,
-            group_by_name(g_pl.cf.by));
+            pl_by_name(g_pl.cf.by));
     for (int i = 0; i < ni; i++) {
         fprintf(f, "%s{\"index\":%d,\"name\":", i ? "," : "", idx[i]);
         jsonw_str(f, g_pl.cf.proto->name(pl_node(idx[i])));
@@ -1036,7 +1044,7 @@ static void pl_describe(const void *ctx, char *out, size_t n) {
     }
     pthread_mutex_unlock(&g_pl.mu);
     if (g_pl.cf.active > 1 && w < n)
-        snprintf(out + w, n - w, " — активных %d, раздача %s", g_pl.cf.active, group_by_name(g_pl.cf.by));
+        snprintf(out + w, n - w, " — активных %d, раздача %s", g_pl.cf.active, pl_by_name(g_pl.cf.by));
 }
 
 static const char *pl_strerror(int rc) { return g_pl.in->strerror(rc); }
