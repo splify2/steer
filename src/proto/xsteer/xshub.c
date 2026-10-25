@@ -251,6 +251,7 @@ struct sess {
      * применился к половине пакетов пачки» здесь возможно. Порт правки из реализации на Go
      * (I-093), где то же место помечал детектор гонок. */
     int      batch_max;
+    int      peer_split;           /* пир объявил сборку разрезанных записей (XS_FLAG_SPLIT) */
     xsh_ms   cool_until;
     long long last_report, last_grow, keep_next;
     int16_t  peer;                 /* индекс пира или -1, пока не опознан */
@@ -1187,6 +1188,8 @@ static void hs_confirm(struct worker *w, struct sess *s, const struct obfs_seg *
     int conn_id = s->hs.peer.flags & 0x07;
     if (conn_id >= XS_CONNS_MAX) conn_id = 0;
     s->conn_id = (int8_t)conn_id;
+    /* Бит FLAG_SPLIT — тоже из подписанной части, и тоже до xs_hs_wipe. */
+    s->peer_split = xs_peer_splits(&s->hs.peer);
     xs_hs_wipe(&s->hs);
     xs_win_reset(&s->win);
     xs_reasm_reset(&s->reasm);
@@ -1195,8 +1198,11 @@ static void hs_confirm(struct worker *w, struct sess *s, const struct obfs_seg *
      *
      * STEER_XS_COMPAT=1 оставляет один кадр навсегда: это аварийный выключатель нового формата на
      * время обновления, когда к хабу ещё приходят пиры предыдущей версии. Сборку Hello из
-     * сегментов выключать не нужно — короткий Hello старого пира она разбирает сразу. */
-    XSH_STORE(s->batch_max, g_compat ? 1 : 2);
+     * сегментов выключать не нужно — короткий Hello старого пира она разбирает сразу.
+     *
+     * Пир, не объявивший бит XS_FLAG_SPLIT (прежняя версия, I-556), получает по одному кадру в
+     * записи и без роста — то же, что STEER_XS_COMPAT, только само и для него одного. */
+    XSH_STORE(s->batch_max, (g_compat || !s->peer_split) ? 1 : 2);
     XSH_STORE(s->cool_until, 0);
     s->last_drops = s->reasm.dropped;
     s->phase = PH_EST;
@@ -1809,7 +1815,7 @@ static void *worker_loop(void *arg) {
             }
             /* Рост пачки на чистом пути: медленно вверх, мгновенно вниз (см. hub_frame). */
             int bm = XSH_LOAD(s->batch_max);
-            if (!g_compat && s->phase == PH_EST && now >= XSH_LOAD(s->cool_until) &&
+            if (!g_compat && s->peer_split && s->phase == PH_EST && now >= XSH_LOAD(s->cool_until) &&
                 now - s->last_grow >= XSH_REASM_GROW_MS && bm < XS_BATCH_FRAMES_MAX) {
                 bm *= 2;
                 if (bm > XS_BATCH_FRAMES_MAX) bm = XS_BATCH_FRAMES_MAX;

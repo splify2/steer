@@ -169,6 +169,7 @@ struct spoke {
      * запись гибнет целиком при потере любого сегмента, поэтому на рваном пути пачка обязана
      * схлопываться до одного кадра. Растёт по чистой обратной связи, падает мгновенно. */
     int batch_max;
+    int peer_split;               /* хаб объявил сборку разрезанных записей (XS_FLAG_SPLIT, I-556) */
     long long cool_until, last_report, last_grow, keep_next;
 
     /* Приём и отправка: свои у каждого воркера (см. выше). */
@@ -218,7 +219,7 @@ static struct xs_secrets g_sc;
  * опрашивают раз в пять секунд. */
 static void state_write(struct spoke *s) {
     /* Ребёнок демона с --supervise (труба событий есть): здоровье демон знает из up/down, и файл
-     * для сторожа не пишется — раз в две секунды на флеш телефона (evline.h). `steer
+     * для сторожа не пишется — второго канала к тому же знанию заводить незачем (evline.h). `steer
      * xsteer-peers` у такого выхода берёт живое состояние у демона (команда сокета helper) —
      * без счётчиков и рукопожатия: их знает только этот процесс. Клиент, поднятый netifd или
      * руками, трубы не имеет и пишет файл, как раньше. */
@@ -467,6 +468,7 @@ static int do_handshake(struct spoke *s) {
     rc = xs_hs_client_confirm(&hs, &s->tx, s->txb, sizeof(s->txb), &fn);
     if (rc == 0) rc = xs_conn_send(&s->conn, 0x18, s->txb, fn, 0);
     int peer_mtu = hs.peer.mtu;
+    s->peer_split = xs_peer_splits(&hs.peer);   /* до xs_hs_wipe: он затирает рукопожатие целиком */
     xs_hs_wipe(&hs);
     if (rc != 0) return rc;
 
@@ -490,7 +492,7 @@ static int do_handshake(struct spoke *s) {
      * ни разбирать контейнер пачки, и пока он где-то работает, туннель к нему поднимается только
      * так. Переменной, а не настройкой в конфигурации: это временная мера на один рабочий день, а
      * не свойство выхода, и в spec.json ей места нет. */
-    s->batch_max = getenv("STEER_XS_COMPAT") ? 1 : 2;
+    s->batch_max = (getenv("STEER_XS_COMPAT") || !s->peer_split) ? 1 : 2;
     s->cool_until = 0;
     s->last_drops = s->reasm.dropped;
     s->up = 1;
@@ -1834,7 +1836,7 @@ static void *worker_main(void *arg) {
             }
         }
         /* Рост пачки на чистом пути: медленно вверх, мгновенно вниз (см. spoke_frame). */
-        if (!getenv("STEER_XS_COMPAT") && now >= s->cool_until &&
+        if (!getenv("STEER_XS_COMPAT") && s->peer_split && now >= s->cool_until &&
             now - s->last_grow >= XSC_REASM_GROW_MS && s->batch_max < XS_BATCH_FRAMES_MAX) {
             s->batch_max *= 2;
             if (s->batch_max > XS_BATCH_FRAMES_MAX) s->batch_max = XS_BATCH_FRAMES_MAX;
