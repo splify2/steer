@@ -13,12 +13,10 @@
 #include "xsconn.h"
 #include "reality.h"     /* xc_random */
 
-#define TH_FIN 0x01
 #define TH_SYN 0x02
 #define TH_RST 0x04
 #define TH_PSH 0x08
 #define TH_ACK 0x10
-#define XSC_WIN 65535
 
 /* Своя структура заголовка, а не системная: имена полей в <netinet/tcp.h> зависят от libc и
  * от feature-макросов, и один и тот же файл собирался бы по-разному под glibc и musl. Тот же

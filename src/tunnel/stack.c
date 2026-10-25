@@ -1434,11 +1434,6 @@ static struct conn *conn_slot(void) {
     return c;
 }
 
-/* Есть ли ещё слот, который conn_slot выдаст без вытеснения. */
-static inline int conn_slot_avail(void) {
-    return g_free_n || g_nslots < g_slots_cap;
-}
-
 /* Один ли адрес у двух ключей: семейство и сами адреса (четыре байта у IPv4, шестнадцать у IPv6). */
 static inline int flow_same_addr(const struct flow_key *a, const struct flow_key *b) {
     if (a->v6 != b->v6) return 0;

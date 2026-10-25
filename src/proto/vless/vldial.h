@@ -56,9 +56,6 @@ struct vl_sess {
 
 extern const struct dialer_ops vless_dialer;
 
-/* Трассировка разбора (STEER_TUN_TRACE) — та же, что у стека, и в тот же поток журнала. */
-void vl_set_trace(int on);
-
 /* Поднять туннель выхода на пуле узлов pc (src/tunnel/pool.h; узлы — struct vless_node, первый
  * активный — pc->first): проверка узла, которую нельзя отложить до первого соединения, и стек с
  * дайлером VLESS под пулом (pool_run). ready — как у stack_run (stack.h, stack_ready_fn): устройство

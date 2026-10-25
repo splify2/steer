@@ -38,8 +38,6 @@ _Static_assert(TUNNEL_BUF >= VLESS_MIN_RECV_CAP + 2048,
 static int g_trace;
 #define TR(...) do { if (g_trace) fprintf(stderr, "tun: " __VA_ARGS__); } while (0)
 
-void vl_set_trace(int on) { g_trace = on; }
-
 /* ---- узел ------------------------------------------------------------------------------ */
 
 static const char *vl_peer(const void *ctx) {
