@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/s3.json --state-dir TMP/state
+# args: apply --dry-run --spec TMP/s2.json --state-dir TMP/state
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: channel blocked points at an output that does not exist
+# stderr: steer: spec schema 3 is not supported (this build speaks 1 and 2)

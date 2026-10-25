@@ -39,7 +39,7 @@ trap 'rm -rf "$tmp"' EXIT
 cat > "$tmp/cmp" <<'EOW'
 #!/bin/sh
 case "${1:-}" in
-    apply|help|needs-dnsd|dnsd-sig|zapret-instances|tgws-instances|explain) ;;
+    apply|help|needs-dnsd|dnsd-sig|tgws-instances|explain) ;;
     *) exec "$CMP_REAL" "$@" ;;
 esac
 d="$CMP_DIR/call.$$"

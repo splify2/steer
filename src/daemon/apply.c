@@ -430,47 +430,6 @@ static int nft_table_exists(const char *fam) {
     return nfd_table_exists(!strcmp(fam, "ip6") ? NFD_IP6 : NFD_IP, nft_table());
 }
 
-/* Умеет ли ЯДРО отдавать пакеты в очередь nfqueue.
- *
- * ЗАЧЕМ ОТДЕЛЬНАЯ ПРОВЕРКА. Без модуля nft_queue правило `queue num N` не отвергается
- * разбором — оно отвергается ядром, и nft говорит об этом так: «Could not process rule: No
- * such file or directory» с указателем на слово queue. Дословно проверено на роутере
- * (OpenWrt 25.12, nftables 1.1.6, kmod-nft-queue не установлен). Прочитать в этом «нет
- * пакета kmod-nft-queue» невозможно, а последствие — отказ ВСЕЙ транзакции: `nft -f`
- * атомарен, поэтому вместе с очередью не встают ни наборы, ни метки, ни перенаправление
- * DNS. То есть один незнакомый роутеру вид выхода снимает маршрутизацию целиком.
- *
- * Зависимость пакета этого не закрывает, и это главный довод. Движок ставят файлом из
- * GitHub Releases (install.sh), а файл зависимостей не разрешает — их проверяет только
- * менеджер пакетов. Объявить kmod-nft-queue в .apk нужно (и объявлено), но полагаться на
- * это как на единственную защиту значит защитить не тот путь установки.
- *
- * ПРОБА, А НЕ ПОИСК МОДУЛЯ. Спросить у ядра «есть ли nft_queue» нечем: /proc/modules врёт о
- * встроенном в ядро (=y вместо =m), а перечня поддерживаемых выражений nftables не отдаёт.
- * Поэтому спрашивается ровно то, что нам нужно: примет ли ядро правило с queue. Стоит это
- * одного запуска nft и только когда в спеке есть выход kind=zapret. */
-static int nfqueue_supported(void) {
-    char tmp[256];
-    steer_tmp_template(tmp, sizeof(tmp), "steer-qprobe");
-    int fd = mkstemp(tmp);
-    if (fd < 0) return 1;   /* не смогли проверить — не мешаем: решать будет сам nft */
-    FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); unlink(tmp); return 1; }
-    /* Своё имя таблицы: `nft -c` ничего не создаёт, но столкнуться именем с чужой живой
-     * таблицей всё равно нельзя — проверка тогда проверяла бы её содержимое. */
-    fprintf(f, "table inet %s_qprobe {\n"
-               "    chain c {\n"
-               "        type filter hook output priority mangle + 10; policy accept;\n"
-               "        meta mark and 0x%08x == 0x%08x queue num %d bypass\n"
-               "    }\n}\n", nft_table(), STEER_MARK_MASK, STEER_MARK_BASE, ZAPRET_QUEUE_BASE);
-    fclose(f);
-    const char *check[] = { "nft", "-c", "-f", tmp, NULL };
-    int rc = run_quiet(check);
-    unlink(tmp);
-    return rc == 0;
-}
-
-
 /* IPv6 ОТ ХОСТА — что не так, вслух при apply (подробно и с приговором — diag, `ipv6_host`).
  * Ключ routed/nat там, где он не действует (телефон), и донор, префикс которого не узнать: без
  * префикса правила в донора ведут IPv6 по меткам, но «всё несовпавшее из префикса — в донора» и
@@ -636,19 +595,10 @@ static void failopen_seed_end(void) {
     failopen_seed_buf = NULL;
 }
 
-/* Одна транзакция: проверка очереди zapret, файл «добавить — удалить — новая таблица», nft -f.
+/* Одна транзакция: файл «добавить — удалить — новая таблица», nft -f.
  * 0 — ядро приняло; 1 — отвергло (прежняя таблица стоит, причина в журнале). */
 static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
     struct err e = {0};
-    /* Отказываем ДО транзакции и НАЗЫВАЕМ причину: иначе человек получит отказ всей
-     * маршрутизации с сообщением про несуществующий файл. Пакет назван прямо — его же
-     * тянет за собой zapret, поэтому у тех, кто обходом уже пользуется, он стоит. */
-    if (zapret_present(cfg) && !nfqueue_supported())
-        die("в спеке есть выход kind=zapret, а ядро не принимает правило queue — "
-            "нужен пакет kmod-nft-queue (его ставит и сам zapret). Правила НЕ применены: "
-            "nft грузит набор целиком, и отказ на очереди снял бы заодно наборы, метки и "
-            "перенаправление DNS", NULL);
-
     char tmp[256];
     steer_tmp_template(tmp, sizeof(tmp), "steer-ruleset");
     int fd = mkstemp(tmp);

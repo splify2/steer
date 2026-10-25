@@ -1,3 +1,3 @@
 # args: apply --dry-run --spec TMP/z.json --state-dir TMP/state
 # exit: 2
-# stderr: steer: outputs.direct: kind zapret — на телефоне zapret нет
+# stderr: steer: outputs.direct: kind zapret убран из ядра steer: обход DPI даёт модуль recheck (kind: recheck), а без обхода выход заменяет kind: direct

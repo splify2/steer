@@ -31,7 +31,7 @@ struct xsteer_cfg;
 struct tgws_cfg;
 struct group_cfg;
 /* Дерево ruleset (src/lib/ir.h). Объявлено ради поля emit ниже: заголовок дерева подключают
- * сами виды, которые его строят (zapret.c, tgws.c). */
+ * сами виды, которые его строят (tgws.c). */
 struct nft_rs;
 
 /* Свойства вида — то, о чём спрашивает общий код. Были предикатами со списком видов внутри
@@ -90,21 +90,21 @@ enum kind_key {
 
 /* Помощник выхода — процесс, который поднимает супервизор (daemon/helpers.c: `steer supervise` и
  * демон с --supervise). cmd — подкоманда движка («vless», «xsteer», «obfs», «tgws») или имя
- * помощника-программы («nfqws»), sig — подпись того, что помощник читает из спеки при
+ * помощника-программы, sig — подпись того, что помощник читает из спеки при
  * старте: супервизор кладёт в неё начальное значение FNV, вид подмешивает свои поля
  * (kind_sig_mix), общий код — цель `via`. */
 struct kind_helper {
     char cmd[16];               /* «hysteria2» — девять знаков */
     unsigned long long sig;
-    /* Помощник — не подкоманда движка, а своя программа рядом с ним (zapret: обработчик
-     * steer-nfqws, init.d/steer). prog — имя файла в каталоге движка, arg — её аргументы
+    /* Помощник — не подкоманда движка, а своя программа рядом с ним (внешний модуль вроде
+     * recheck). prog — имя файла в каталоге движка, arg — её аргументы
      * (пустой — конец). prog пуст — `<движок> <cmd> <выход> --spec …`, как у остальных. */
     char prog[16];
     char arg[2][256];
     /* Переменная окружения помощнику («ИМЯ=значение»; пусто — нет) — то, что init.d ставит
      * procd_set_param env (STEER_TUN_STATS у vless). В подпись не входит: это отладка. */
     char env[32];
-    /* Помощнику нужны метки реестра (номер очереди zapret выводится из метки): супервизор,
+    /* Помощнику нужны метки реестра (номер очереди выводится из метки): супервизор,
      * который иначе реестр не трогает (supervise.c), назначает их перед подсчётом состава. */
     int marks;
 };
@@ -170,15 +170,14 @@ struct kind_ops {
 
     /* ---- правила ---- */
     /* Свои правила nft: дописывает в дерево (lib/ir.h) то, что нужно ОДНОМУ выходу этого
-     * вида. Цепочки, общие для всех выходов вида (например, zapret_queue — своя очередь на
-     * каждый выход, но цепочка одна), заводит первый вызов на пустом дереве — тот же приём,
+     * вида. Цепочки, общие для всех выходов вида (своя очередь на каждый выход, но цепочка одна), заводит первый вызов на пустом дереве — тот же приём,
      * что у build_group_sets и соседей. NULL — виду в дереве сказать нечего (direct, group и
      * виды с устройством: их правила пишет общий код по caps, а не per-kind emit).
      *
      * Порядок вызовов — kind_emit_all (kind.c): по ВИДАМ, в порядке реестра (kind_at), а
      * внутри вида — по выходам в порядке спеки. Так текст ruleset не зависит от того, в каком
      * порядке человек перечислил выходы разных видов: все правила одного вида ложатся в дерево
-     * подряд, одним блоком, как было при отдельных построителях nft_emit_zapret/nft_emit_tgws
+     * подряд, одним блоком, как было при отдельных построителях nft_emit_tgws
      * (docs/architecture.md, «Вид выхода»). Тот же приём и с тем же доводом уже применяется в
      * kind_ops.diag (daemon/diag.c). */
     void (*emit)(struct nft_rs *rs, const struct spec *sp, const struct output *o);
@@ -216,7 +215,7 @@ struct kind_ops {
 const struct kind_ops *kind_by_name(const char *name);
 /* То же для спеки v2: реестр и группа (kind: group — её в реестре нет, см. ниже). */
 const struct kind_ops *kind_by_name_v2(const char *name);
-/* Все виды по порядку реестра: direct, interface, vless, xsteer, zapret, tgws, awg. */
+/* Все виды по порядку реестра: direct, interface, vless, xsteer, tgws, awg. */
 size_t kind_count(void);
 const struct kind_ops *kind_at(size_t i);
 /* Шаг FNV-1a подписи помощника (с границей поля: «ab»+«c» не равно «a»+«bc»). */
@@ -236,7 +235,7 @@ void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
  * спека v1 её не знает (`"kind": "group"` в v1 обязан остаться неизвестным видом, иначе спека,
  * принятая с ним, значила бы то, чего v1 не обещал), своих правил и проверок у неё нет, а
  * собирает её перевод v1 (model/v1.c) напрямую. Разбор v2 находит её через kind_by_name_v2. */
-extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer, kind_zapret,
+extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer,
                              kind_tgws, kind_awg, kind_group, kind_hysteria2,
                              kind_trojan, kind_shadowsocks, kind_socks, kind_http, kind_vmess,
                              kind_warpm, kind_block;
@@ -250,13 +249,12 @@ int out_is_block(const struct output *o);
 /* ПРЕЖНИЕ ИМЕНА ВИДОВ — только для стендов (tests/specmatch.c, tests/failovermatch.c), которым
  * нужно собрать выход конкретного вида, не читая спеку: `g_spec.out[0].kind = OUT_XSTEER`.
  * Общий код вида не сравнивает — он спрашивает kind_of(o)->caps или конкретную функцию вида
- * (zapret_present, out_tgws и соседи ниже). Вне src/kinds и стендов эти имена ловит
+ * (tgws_present, out_tgws и соседи ниже). Вне src/kinds и стендов эти имена ловит
  * tests/buildmatch.sh. */
 #define OUT_DIRECT    (&kind_direct)
 #define OUT_INTERFACE (&kind_interface)
 #define OUT_VLESS     (&kind_vless)
 #define OUT_XSTEER    (&kind_xsteer)
-#define OUT_ZAPRET    (&kind_zapret)
 #define OUT_TGWS      (&kind_tgws)
 #define OUT_AWG       (&kind_awg)
 #define OUT_GROUP     (&kind_group)
@@ -448,19 +446,6 @@ int out_node_named(const struct output *o);
 
 /* xsteer */
 const struct xsteer_cfg *out_xsteer(const struct output *o);
-
-/* zapret */
-/* Жив ли обработчик очереди nfqueue с этим номером — то есть работает ли выход kind=zapret. */
-int nfqws_on_queue(int queue);
-/* Работает ли системный обход (любой nfqws) — нужен on_fail=zapret у выходов с устройством. */
-int zapret_running(void);
-/* `steer zapret-instances`: что поднимать init-скрипту. Код — как у команды. */
-int zapret_instances(const struct spec *sp);
-/* Есть ли в спеке хоть один выход kind=zapret — общему коду (apply.c) это нужно знать про
- * ядро: без notrack порождённые обработчиком пакеты остаются на учёте conntrack, а без
- * kmod-nft-queue правило очереди не встанет вовсе. Раньше жила в compile/groups.c как
- * has_zapret и сравнивала kind напрямую; здесь то же самое — вопрос вида, а не общего кода. */
-int zapret_present(const struct spec *sp);
 
 /* tgws */
 const struct tgws_cfg *out_tgws(const struct output *o);

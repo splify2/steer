@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/lanbad.json --state-dir TMP/state-lan
+# args: apply --dry-run --spec TMP/landup.json --state-dir TMP/state-lan
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: lan_devices: негодный состав имени (br lan)
+# stderr: steer: lan_devices: устройство br-lan указано дважды

@@ -440,7 +440,7 @@ int main(void) {
         check("неизвестный kind: отказ", 2,
               load_from_str(SPEC("\"outputs\":{\"x\":{\"kind\":\"magic\"}}")));
 
-        /* Неизвестное on_fail: drop/direct/zapret — закрытое множество. */
+        /* Неизвестное on_fail: drop/direct/zapret (системный обход) — закрытое множество. */
         check("неизвестный on_fail: отказ", 2,
               load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\","
                                  "\"on_fail\":\"teleport\"}}")));
@@ -714,58 +714,12 @@ int main(void) {
         check("без obfs: признак выключен", 0, g_spec.out[0].iface.obfs.on);
     }
 
-    /* ---- kind=zapret: выход без устройства, но с меткой -------------------------
-     *
-     * Проверяется в ОБЕИХ сборках, в отличие от vless и xsteer: обход DPI делает чужой
-     * процесс (nfqws), криптографии движка тут не нужно, и отказывать базовой сборке было
-     * бы отказом без причины. */
+    /* ---- kind=zapret убран из ядра: отказ называет замену ---------------------------- */
     {
         const char *s = SPEC(
             "\"outputs\":{\"yt\":{\"kind\":\"zapret\"}},"
             "\"channels\":[]}");
-        check("zapret: спека принята", 0, load_from_str(s));
-        check("zapret: вид zapret", 1, kind_of(&g_spec.out[0]) == OUT_ZAPRET);
-        /* Главное различие этого вида: устройства нет, а метка есть. Пока условие было
-         * одно на две надобности, такой выход получил бы правило канала и не получил
-         * метки — то есть в очередь не попал бы ни один пакет. */
-        check("zapret: устройства нет", 0, out_has_device(&g_spec.out[0]));
-        check("zapret: метка нужна", 1, out_needs_mark(&g_spec.out[0]));
-        check("zapret: устройство не названо", 0, g_spec.out[0].device[0]);
-        check_str("zapret: opts_file по умолчанию из имени выхода",
-                  "/etc/steer/zapret/yt.opts", g_spec.out[0].zp.opts);
-        /* Умолчание on_fail общее для всех выходов — drop, и здесь оно значит «нет обхода
-         * — нет трафика», то есть очередь без bypass. */
-        check("zapret: on_fail по умолчанию drop", FAIL_DROP, g_spec.out[0].on_fail);
-    }
-    {
-        const char *s = SPEC(
-            "\"outputs\":{\"yt\":{\"kind\":\"zapret\",\"opts_file\":\"/etc/y.opts\"}},"
-            "\"channels\":[]}");
-        check("zapret: явный opts_file принят", 0, load_from_str(s));
-        check_str("zapret: явный opts_file сохранён", "/etc/y.opts", g_spec.out[0].zp.opts);
-    }
-    {
-        /* Относительный путь «работал бы из шелла» и не работал бы у службы: процесс
-         * запускает procd со своим рабочим каталогом. Тот же барьер, что у conf у xsteer. */
-        const char *s = SPEC(
-            "\"outputs\":{\"yt\":{\"kind\":\"zapret\",\"opts_file\":\"y.opts\"}},"
-            "\"channels\":[]}");
-        check("zapret: относительный opts_file — отказ", 2, load_from_str(s));
-    }
-    {
-        /* Названное устройство — почти наверняка описка при копировании выхода-туннеля.
-         * Принять его молча значило бы обещать маршрутизацию, которой не будет. */
-        const char *s = SPEC(
-            "\"outputs\":{\"yt\":{\"kind\":\"zapret\",\"device\":\"wg0\"}},"
-            "\"channels\":[]}");
-        check("zapret: device — отказ", 2, load_from_str(s));
-    }
-    {
-        /* «При отказе обхода включить обход» — круг, который ничего не значит. */
-        const char *s = SPEC(
-            "\"outputs\":{\"yt\":{\"kind\":\"zapret\",\"on_fail\":\"zapret\"}},"
-            "\"channels\":[]}");
-        check("zapret: on_fail zapret у себя же — отказ", 2, load_from_str(s));
+        check("zapret: kind убран — отказ", 2, load_from_str(s));
     }
     {
         /* Поле, принятое молча у чужого вида выхода, — это «настроено», сказанное о том,
@@ -775,21 +729,6 @@ int main(void) {
             "\"opts_file\":\"/etc/y.opts\"}},"
             "\"channels\":[]}");
         check("opts_file у kind=interface — отказ", 2, load_from_str(s));
-    }
-    {
-        /* Номер очереди выводится из метки, а не задаётся человеком: второй источник
-         * правды о том, какой процесс какой трафик разбирает, разошёлся бы молча.
-         * Проверяется именно ВЫВОД: первый недирект-выход получает младший бит. */
-        const char *s = SPEC(
-            "\"outputs\":{\"a\":{\"kind\":\"zapret\"},\"b\":{\"kind\":\"zapret\"}},"
-            "\"channels\":[]}");
-        check("zapret: две очереди, спека принята", 0, load_from_str(s));
-        g_spec.out[0].mark = STEER_MARK_BASE;
-        g_spec.out[1].mark = STEER_MARK_BASE << 1;
-        check("zapret: очередь первого выхода", ZAPRET_QUEUE_BASE,
-              out_zapret_queue(&g_spec.out[0]));
-        check("zapret: очередь второго выхода", ZAPRET_QUEUE_BASE + 1,
-              out_zapret_queue(&g_spec.out[1]));
     }
 
     /* ---- виды выходов, существующие только в расширенной сборке ------------------
@@ -1184,7 +1123,6 @@ int main(void) {
         free(many);
         registry_assign(&g_spec, &e);
 
-        int no_mark = 0, off_mask = 0, dup_mark = 0, dup_table = 0, dup_queue = 0;
         int bad_table = 0;
         for (size_t i = 0; i < g_spec.out_n; i++) {
             if (!g_spec.out[i].mark) { no_mark++; continue; }
@@ -1195,7 +1133,6 @@ int main(void) {
             for (size_t j = 0; j < i; j++) {
                 if (g_spec.out[j].mark == g_spec.out[i].mark) dup_mark++;
                 if (g_spec.out[j].table == g_spec.out[i].table) dup_table++;
-                if (out_zapret_queue(&g_spec.out[j]) == out_zapret_queue(&g_spec.out[i])) dup_queue++;
             }
         }
         check("метку получили все выходы (места метки заняты целиком)", 0, no_mark);
@@ -1203,7 +1140,6 @@ int main(void) {
         check("метки не повторяются", 0, dup_mark);
         check("номера таблиц не повторяются", 0, dup_table);
         check("номера таблиц в своём ряду (300.., без 316)", 0, bad_table);
-        check("номера очередей обхода не повторяются", 0, dup_queue);
 
         /* РЕЕСТР С ПРЕЖНЕЙ СБОРКИ. Там метки одинокими битами, и старший из них — база,
          * умноженная на 128, — новой раздачей не выдаётся никому. Выход обязан сохранить
@@ -1600,9 +1536,6 @@ int main(void) {
     check("via: на direct — отказ", 2, load_from_str(SPEC(
         "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"d\"},"
         "\"d\":{\"kind\":\"direct\"}},\"channels\":[]}")));
-    check("via: на zapret — отказ", 2, load_from_str(SPEC(
-        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"z\"},"
-        "\"z\":{\"kind\":\"zapret\"}},\"channels\":[]}")));
     check("via: на tgws — отказ", 2, load_from_str(SPEC(
         "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"t\"},"
         "\"t\":{\"kind\":\"tgws\",\"domain\":\"example.com\"}},\"channels\":[]}")));

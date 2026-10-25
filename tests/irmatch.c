@@ -12,7 +12,7 @@
  *
  * Модули линкуются (Makefile: MODEL_SRC и COMPILE_SRC), не подключаются #include.
  * Собирается дважды: роутер и телефон (-DSTEER_DEFAULT_PLATFORM=android — платформа телефона,
- * цепочки на output; выходов zapret и tgws у телефона нет, поэтому случаи с ними — только на
+ * цепочки на output; выхода tgws у телефона нет, поэтому случаи с ним — только на
  * роутере). Какие случаи гонять, решает выбранная платформа, а не ключ сборки. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,11 +166,10 @@ static void t_router_basic(void) {
     check_str("заворот DNS — nat", "nat", ctype(dns));
     check("четыре правила: udp/tcp по подсети и по устройству", 4, (long)ir_rule_count(dns, NULL));
     check("карта fakeip без доменов не строится", 0, ir_set_find(t, "fakeip") != NULL);
-    check("цепочек zapret без выходов zapret нет", 0, ir_chain_find(t, "zapret_queue") != NULL);
     nft_rs_free(&rs);
 }
 
-/* ---- 2. домены, zapret, tgws: обе раскладки -------------------------------------------- */
+/* ---- 2. домены, tgws: обе раскладки -------------------------------------------- */
 static int nat_chains(const struct nft_table *t) {
     int n = 0;
     for (struct nft_obj *o = t ? t->objs : NULL; o; o = o->next) {
@@ -183,15 +182,13 @@ static int nat_chains(const struct nft_table *t) {
 static const char *mixed =
     "{ \"schema\": 2, \"from_default\": [\"192.168.1.0/24\"],"
     "  \"outputs\": { \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" },"
-    "               \"yt\": { \"kind\": \"zapret\" },"
     "               \"tg\": { \"kind\": \"tgws\", \"domain\": \"ex.co.uk\" } },"
     "  \"channels\": ["
     "    { \"name\": \"dom\", \"match\": { \"domains_files\": [\"TMP/d.lst\"], \"prefixes_files\": [\"TMP/a.lst\"] }, \"out\": \"vpn\" },"
-    "    { \"name\": \"z\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"yt\" },"
     "    { \"name\": \"t\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"tg\" } ] }";
 
 static void t_mixed_modern(void) {
-    printf("\n-- домены, zapret и tgws, современная раскладка --\n");
+    printf("\n-- домены и tgws, современная раскладка --\n");
     if (load(mixed)) { check("спека разобрана", 0, 1); return; }
     const struct group *dg = group_of("vpn", 1);
     check("доменная группа есть", 1, dg != NULL);
@@ -214,21 +211,6 @@ static void t_mixed_modern(void) {
     check("правило fakeip — dnat по карте", 1, ir_expr_find(r, NFT_X_DNAT) != NULL);
     check("и помечено IPv4", 4, r ? r->fam : 0);
 
-    struct nft_chain *zq = ir_chain_find(t, "zapret_queue");
-    check_str("zapret_queue на postrouting", "postrouting", chook(zq));
-    check("приоритет srcnat + 2 = 102", 102, cprio(zq));
-    check("своё правило первым", 1, ir_rule_find(zq, NULL) == ir_rule_find(zq, "steer:zapret-own"));
-    check("правило очереди выхода yt", 1, ir_rule_find(zq, "steer:zapret:yt") != NULL);
-    check("ответы — в zapret_queue_in", 1,
-          ir_rule_find(ir_chain_find(t, "zapret_queue_in"), "steer:zapret-reply:yt") != NULL);
-    struct nft_chain *nq = ir_chain_find(t, "zapret_predefrag_nfqws");
-    check("predefrag_nfqws — обычная цепочка без хука", 1, nq && !nq->type);
-    check("три правила notrack", 3, (long)ir_rule_count(nq, NULL));
-    check("predefrag прыгает в неё", 1,
-          ir_expr_find(ir_rule_find(ir_chain_find(t, "zapret_predefrag"), NULL), NFT_X_JUMP) != NULL);
-    check("фрагмент IPv6 — exthdr frag exists", 1,
-          ir_rule_has(ir_rule_find(nq, NULL)->next, "exthdr frag exists"));
-
     struct nft_chain *tg = ir_chain_find(t, "tgws_redirect");
     check_str("перехват Telegram — nat", "nat", ctype(tg));
     check("после трансляции адресов: dstnat + 1 = -99", -99, cprio(tg));
@@ -239,46 +221,6 @@ static void t_mixed_modern(void) {
     struct nft_chain *n4 = ir_chain_find(t, "postrouting_nat4");
     check("postrouting_nat4: masquerade на устройстве выхода interface", 1,
           n4 && ir_rule_find(n4, "steer-nat4:vpn") && ir_rule_has(ir_rule_find(n4, "steer-nat4:vpn"), "masquerade"));
-    nft_rs_free(&rs);
-}
-
-/* ---- 2б. emit вида подключён, и порядок в тексте не зависит от порядка выходов в спеке --- */
-static const char *mixed_rev =
-    "{ \"schema\": 2, \"from_default\": [\"192.168.1.0/24\"],"
-    "  \"outputs\": { \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" },"
-    "               \"tg\": { \"kind\": \"tgws\", \"domain\": \"ex.co.uk\" },"
-    "               \"yt\": { \"kind\": \"zapret\" } },"
-    "  \"channels\": ["
-    "    { \"name\": \"dom\", \"match\": { \"domains_files\": [\"TMP/d.lst\"], \"prefixes_files\": [\"TMP/a.lst\"] }, \"out\": \"vpn\" },"
-    "    { \"name\": \"t\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"tg\" },"
-    "    { \"name\": \"z\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"yt\" } ] }";
-
-static void t_mixed_order(void) {
-    printf("\n-- emit вида подключён; порядок выходов в спеке текст не меняет --\n");
-    check("kind zapret даёт emit", 1, kind_by_name("zapret") && kind_by_name("zapret")->emit != NULL);
-    check("kind tgws даёт emit", 1, kind_by_name("tgws") && kind_by_name("tgws")->emit != NULL);
-
-    /* Та же спека, что у mixed, но tg (tgws) объявлен ПЕРЕД yt (zapret) — и в outputs, и в
-     * channels. kind_emit_all зовёт виды в порядке реестра (zapret раньше tgws), а не в
-     * порядке их появления в спеке, поэтому в дереве цепочки zapret обязаны стоять раньше
-     * цепочки моста так же, как в t_mixed_modern. */
-    if (load(mixed_rev)) { check("спека разобрана", 0, 1); return; }
-    struct nft_rs rs;
-    if (build(&rs)) { check("дерево построено", 0, 1); return; }
-    struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
-    int zi = -1, ti = -1, i = 0;
-    for (struct nft_obj *o = t ? t->objs : NULL; o; o = o->next, i++) {
-        if (!strcmp(o->name, "zapret_queue")) zi = i;
-        if (!strcmp(o->name, "tgws_redirect")) ti = i;
-    }
-    check("цепочка zapret_queue построена", 1, zi >= 0);
-    check("цепочка tgws_redirect построена", 1, ti >= 0);
-    check("правило очереди выхода yt на месте", 1,
-          ir_rule_find(ir_chain_find(t, "zapret_queue"), "steer:zapret:yt") != NULL);
-    check("правило моста выхода tg на месте", 1,
-          ir_rule_find(ir_chain_find(t, "tgws_redirect"), "steer:tgws:tg") != NULL);
-    check("zapret в тексте раньше моста, хоть в спеке он объявлен вторым", 1,
-          zi >= 0 && ti >= 0 && zi < ti);
     nft_rs_free(&rs);
 }
 
@@ -655,8 +597,7 @@ int main(void) {
     t_router_basic();
     if (!plat()->local_channels) {
         t_mixed_modern();
-        t_mixed_order();
-        t_balance();
+            t_balance();
         t_balance_by();
         t_router_v6();
     } else {

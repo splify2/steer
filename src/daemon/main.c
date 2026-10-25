@@ -293,7 +293,7 @@ int main(int argc, char **argv) {
          * спеке не пишется), но управляющему слою устройства таких членов нужны так же, как awg, — для
          * зоны фаервола. */
         if (a.kind && !kind_by_name(a.kind) && strcmp(a.kind, kind_warpm.name) != 0)
-            die("--kind: нужен вид выхода (direct, block, interface, awg, vless, hysteria2, trojan, shadowsocks, socks, http, vmess, xsteer, zapret, tgws, group), а не %s", a.kind);
+            die("--kind: нужен вид выхода (direct, block, interface, awg, vless, hysteria2, trojan, shadowsocks, socks, http, vmess, xsteer, tgws, group), а не %s", a.kind);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         for (size_t i = 0; i < cfg.out_n; i++) {
             const char *k = out_kind_name(&cfg.out[i]);
@@ -321,13 +321,12 @@ int main(int argc, char **argv) {
      * находиться — резолвер не поднимался, а apply при этом ставил перенаправление
      * DNS, и каждый запрос из LAN уходил в закрытый порт. Что будет сгенерировано,
      * знает только движок, поэтому отвечает он. */
-    /* Что поднимать init-скрипту для выходов kind=zapret и kind=tgws: по строке на выход, код 0,
-     * если поднимать есть что. Что печатается и почему, — у самих видов (kinds/zapret.c,
-     * kinds/tgws.c). */
-    if (!strcmp(cmd, "zapret-instances") || !strcmp(cmd, "tgws-instances")) {
+    /* Что поднимать init-скрипту для выходов kind=tgws: по строке на выход, код 0, если поднимать
+     * есть что. Что печатается и почему, — kinds/tgws.c. */
+    if (!strcmp(cmd, "tgws-instances")) {
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         if (registry_assign(&cfg, &e) < 0) err_die(&e);
-        return !strcmp(cmd, "zapret-instances") ? zapret_instances(&cfg) : tgws_instances(&cfg);
+        return tgws_instances(&cfg);
     }
     /* ХВАТИТ ЛИ РЕЗОЛВЕРУ SIGHUP. Печатает подпись таблицы каналов по текущей спеке; сам
      * резолвер положил такую же в каталог состояния при запуске. Совпали — init-скрипт
@@ -335,7 +334,7 @@ int main(int argc, char **argv) {
      * нужен перезапуск, потому что состав каналов HUP не пересобирает.
      *
      * Отдельной командой, а не полем status: её читает оболочка построчно и сравнивает
-     * целиком, а не разбирает. Тот же довод, что у zapret-instances и needs-dnsd. */
+     * целиком, а не разбирает. Тот же довод, что у tgws-instances и needs-dnsd. */
     if (!strcmp(cmd, "dnsd-sig")) return dnsd_sig_print(spec, stdout);
     /* Та же таблица, которую резолвер получил бы трубой --table-fd — текстом в stdout, для
      * стендов (труба вместо файла спеки) и ручной отладки. Формат — src/dnsd/tabfmt.h. */

@@ -201,15 +201,13 @@ fi
 # неработающей половине.
 #
 #   nftables, ip-full  — правила и `ip rule`; объявлены с самого начала.
-#   kmod-nft-queue     — выражение `queue` в наборе правил: им выход kind=zapret отдаёт
-#                        помеченный трафик своему обработчику nfqws. Без модуля ядро
+#   kmod-nft-queue     — выражение `queue` в наборе правил: им модуль DPI (recheck)
+#                        отдаёт помеченный трафик своему обработчику. Без модуля ядро
 #                        отвергает правило, а `nft -f` атомарен — то есть один такой выход
 #                        снимает маршрутизацию ЦЕЛИКОМ, сообщением «No such file or
 #                        directory» с указателем на слово queue (проверено на роутере,
 #                        OpenWrt 25.12 / nftables 1.1.6). Модуль весит единицы килобайт;
 #                        цена объявить его всем несравнимо меньше цены такого отказа.
-#                        Движок при этом ещё и проверяет ядро сам (nfqueue_supported в
-#                        src/daemon/apply.c) — установке файлом из релиза зависимости не помогают.
 #   conntrack          — снятие установленных соединений выхода при смене маршрута
 #                        (src/daemon/failover.c, conntrack_evict). Снимает их сам движок, через
 #                        ctnetlink, а инструмент — запасной путь на случай, когда ядро по
@@ -449,10 +447,6 @@ for spec in $ISAS; do
     cp "$libs/steerd" "$root/usr/sbin/steerd"
     cp "build/steer-client-$arch" "$root/usr/sbin/steer"
     ln -sf steerd "$root/usr/sbin/steer-tools"
-    # Обработчик обхода DPI: его запускает procd для каждого выхода kind=zapret, и читает он
-    # файл стратегии при КАЖДОМ запуске (см. его шапку). Обработчик — часть ядра, а не модуль:
-    # правила очереди пишет ядро, а kind=zapret входит в каждый профиль.
-    cp files/usr/sbin/steer-nfqws "$root/usr/sbin/steer-nfqws"
     cp files/etc/init.d/steer "$root/etc/init.d/steer"
     # Реакция на события сети: подъём и падение интерфейса доходят до сторожа сразу, а не
     # через минуту опроса. Файл невелик, но без него правка I-137 существует только в дереве.
@@ -471,7 +465,7 @@ for spec in $ISAS; do
     cp files/usr/share/nftables.d/chain-pre/input/30-steer.nft \
        "$root/usr/share/nftables.d/chain-pre/input/30-steer.nft"
     chmod 0644 "$root/usr/share/nftables.d/chain-pre/input/30-steer.nft"
-    chmod 0755 "$root/usr/sbin/steerd" "$root/usr/sbin/steer" "$root/usr/sbin/steer-nfqws" \
+    chmod 0755 "$root/usr/sbin/steerd" "$root/usr/sbin/steer" \
                "$root/etc/init.d/steer" "$root/etc/hotplug.d/iface/95-steer"
     chmod 0644 "$root/lib/upgrade/keep.d/steer"
 

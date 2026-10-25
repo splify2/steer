@@ -127,7 +127,7 @@ struct helper_set {
 int helpers_reserve(struct helper_set *s, size_t n);
 
 /* Состав помощников по разобранной спеке — в порядке зависимостей via: цель раньше того, чей
- * туннель через неё идёт. Метки выходов с via (и zapret) уже должны быть назначены реестром;
+ * туннель через неё идёт. Метки выходов с via (и модуль DPI) уже должны быть назначены реестром;
  * *need_marks (может быть NULL) — 1, если кому-то из помощников нужны метки. */
 size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *need_marks);
 

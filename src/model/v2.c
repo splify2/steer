@@ -214,9 +214,9 @@ static int name_of(struct v2 *x, const struct ynode *key, const char *section, c
 /* ---- пути ----------------------------------------------------------------------------------
  *
  * ОТНОСИТЕЛЬНЫЙ ПУТЬ — ОТ КАТАЛОГА ФАЙЛА СПЕКИ. Пример раздела 3 пишет `srs: lists/youtube.srs`,
- * `subscription: sub/nl`, `strategy: zapret/yt.opts` — то есть файлы рядом со спекой, в {etc}. От
+ * `subscription: sub/nl`, `strategy: recheck/yt.conf` — то есть файлы рядом со спекой, в {etc}. От
  * рабочего каталога такой путь значил бы разное у разных процессов (procd, клиент в шелле, init
- * телефона), а виды zapret, xsteer и awg по той же причине требуют абсолютного пути. Поэтому
+ * телефона), а виды recheck, xsteer и awg по той же причине требуют абсолютного пути. Поэтому
  * разбор делает путь абсолютным сам, и вид получает уже готовый; в модель, status и diag уходит
  * абсолютный. Спека со стандартного ввода — от рабочего каталога. ctl apply проверяет тело во
  * временном файле рядом со спекой, так что каталог тот же. */
@@ -626,7 +626,7 @@ static const struct { const char *key; unsigned bit; const char *owner; } KIND_K
     { "tolerance",    KK_SUB,    "kind: tunnel" },
     { "stream",       KK_STREAM, "kind: xsteer" },
     { "stream_port",  KK_STREAM, "kind: xsteer" },
-    { "strategy",     KK_OPTS,   "kind: zapret" },
+    { "strategy",     KK_OPTS,   "kind: recheck" },
     { "domain",       KK_DOMAIN, "kind: tgws" },
 };
 #define KIND_KEYS_N (sizeof(KIND_KEYS) / sizeof(KIND_KEYS[0]))
@@ -751,10 +751,12 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             return fail(x, kn, "%s: kind warp-masque заводит только kind: warp (transport: masque)", where);
         kd = &kind_warpm;
     } else {
+        if (!strcmp(kname, "zapret"))
+            return fail(x, kn, "%s: kind zapret убран из ядра steer: обход DPI даёт модуль recheck (kind: recheck), а без обхода выход заменяет kind: direct", where);
         kd = kind_by_name_v2(kname);
         if (!kd)
             return fail(x, kn, "%s: неизвестный kind «%s» (есть direct, block, interface, tunnel, xsteer, "
-                        "awg, zapret, tgws, group, warp)", where, kname);
+                        "awg, tgws, group, warp)", where, kname);
     }
     if (kd->absent) return fail(x, tunnel ? pn : kn, "%s: %s", where, kd->absent);
     o.kind = kd;
@@ -779,7 +781,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         }
         if (!strcmp(ks, "on_fail")) {
             /* Что делать, когда выход не работает, — у выхода с устройством, у группы и у видов
-             * с меткой (zapret, tgws). У direct отказывать нечему. */
+             * с меткой (tgws, модуль DPI). У direct отказывать нечему. */
             if (!group && !(caps & (KC_DEVICE | KC_MARK)))
                 return fail(x, kk, "%s: у kind: %s нет on_fail — он не может отказать", where, kd->name);
             if (str_of(x, v, w, &sv)) return -1;
@@ -794,7 +796,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         }
         if (!strcmp(ks, "ipv6")) {
             /* IPv6 от хоста (шаг 8 выпуска 1.10, spec.h: enum out_ipv6). off — любому выходу, чей
-             * вид IPv6 несёт (interface, awg, zapret), и группе; routed и nat — только туннелю с
+             * вид IPv6 несёт (interface, awg, модуль DPI), и группе; routed и nat — только туннелю с
              * устройством (interface, awg): это свойство пира на том конце, а у группы его нет —
              * его пишут у члена. */
             if (str_of(x, v, w, &sv)) return -1;
@@ -1475,7 +1477,7 @@ static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, co
             return fail(x, on, "%s: выхода «%s» нет в outputs (или слово direct — напрямую)", w, sv);
         if (oi >= 0 && !out_over_target_ok(&s->out[oi])) {
             /* Выход без устройства (kind=direct) — то же «напрямую»; прочие без устройства
-             * (zapret, tgws, группа) метке некуда вести. */
+             * (tgws, группа) метке некуда вести. */
             if (strcmp(out_kind_name(&s->out[oi]), "direct") != 0)
                 return fail(x, on, "%s: выход «%s» (kind=%s) без своего устройства — запрос "
                             "к DNS нельзя направить через него; нужен interface, awg, tunnel или "

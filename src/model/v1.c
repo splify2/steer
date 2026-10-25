@@ -329,10 +329,9 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             else if (!strcmp(key, "obfs")) { if (parse_obfs(j, o.name, &k.obfs, e) != 0) return -1; }
             else if (!strcmp(key, "sub_file")) { if (js_str(j, k.sub_file, sizeof(k.sub_file), e) != 0 && e->msg[0]) return -1; }
             else if (!strcmp(key, "conf")) { if (js_str(j, k.conf, sizeof(k.conf), e) != 0 && e->msg[0]) return -1; }
-            /* Файл ключей nfqws у kind=zapret. Отдельным ключом, а не переиспользованным
-             * `conf`: у xsteer там конфигурация в стиле wg с приватным ключом, здесь —
-             * список ключей командной строки, и одно имя для двух разных вещей однажды
-             * привело бы к попытке поднять туннель по стратегии обхода. */
+            /* Файл настройки внешнего модуля DPI (recheck). Отдельным ключом, а не переиспользованным
+             * `conf`: у xsteer там конфигурация в стиле wg с приватным ключом, и одно имя для
+             * двух разных вещей однажды привело бы к попытке поднять туннель по настройке обхода. */
             else if (!strcmp(key, "opts_file")) { if (js_str(j, k.opts_file, sizeof(k.opts_file), e) != 0 && e->msg[0]) return -1; }
             else if (!strcmp(key, "domain")) { if (js_str(j, k.domain, sizeof(k.domain), e) != 0 && e->msg[0]) return -1; }
             /* Через какой выход идёт трафик самого туннеля (подложка `over` модели — см. блок
@@ -454,9 +453,12 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
          * молча никуда не ведёт. */
         /* Группы (kind: group) в реестре нет — спека v1 её не знает, и `"kind": "group"` здесь
          * остаётся неизвестным видом, как было (см. kind.h). */
+        if (!strcmp(kind, "zapret"))
+            return err_set(e, "outputs.%s: kind zapret убран из ядра steer: обход DPI даёт модуль recheck "
+                       "(kind: recheck), а без обхода выход заменяет kind: direct", o.name);
         const struct kind_ops *kd = kind_by_name(kind);
         if (!kd) return err_set(e, "outputs.%s: неизвестный kind "
-                   "(нужен direct, interface, vless, xsteer, zapret, tgws или awg)", o.name);
+                   "(нужен direct, interface, vless, xsteer, tgws или awg)", o.name);
         if (kd->absent) {
             static char msg[256];
             snprintf(msg, sizeof(msg), "outputs.%s: %s", o.name, kd->absent);
@@ -477,11 +479,10 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
         if ((k.stream || k.stream_port) && !(kd->keys & KK_STREAM))
             return err_set(e, "outputs.%s: stream есть только у kind=xsteer", o.name);
         if (k.opts_file[0] && !(kd->keys & KK_OPTS))
-            return err_set(e, "outputs.%s: opts_file есть только у kind=zapret", o.name);
+            return err_set(e, "outputs.%s: opts_file есть только у kind=recheck", o.name);
         if (k.domain[0] && !(kd->keys & KK_DOMAIN))
             return err_set(e, "outputs.%s: domain есть только у kind=tgws", o.name);
-        /* Своя проверка вида после общих — то, что зависит от общих полей (on_fail у zapret и
-         * tgws). */
+        /* Своя проверка вида после общих — то, что зависит от общих полей (on_fail у tgws). */
         if (kd->check && kd->check(s, &o, e) != 0) return -1;
         /* Какой из двух форм записан выбор узлов. Нужно, чтобы отличить «поля нет» от «поле
          * задано» и поймать выход, где заданы обе: молча взять одну значило бы, что половина
@@ -1116,14 +1117,9 @@ static int v1_parse(const char *text, struct spec *s, struct err *e) {
          * ДО всего, что касается выхода.
          *
          * Проверка стояла ниже, за `continue` по «у выхода нет устройства», и из-за этого не
-         * срабатывала там, где последствие самое тяжёлое. У выхода kind=zapret устройства нет
-         * по определению (движок его прямо запрещает), значит канал `any` на обход DPI
-         * проезжал молча — и весь трафик локальной сети уходил в nfqws, а при on_fail=drop
-         * умирал целиком. То же с kind=tgws и kind=direct.
-         *
-         * Воспроизведено на стенде в QEMU: спека с `{"any": true}` и выходом kind=zapret
-         * принимается, правило выходит без `ip daddr @набор`, и счётчик растёт на ЛЮБОМ
-         * трафике клиента (59 -> 97 пакетов, пока клиент ходил на два несвязанных сайта).
+         * срабатывала там, где последствие самое тяжёлое. У выхода без устройства (tgws, direct, модуль DPI)
+         * канал `any` проезжал молча — и весь трафик локальной сети уходил в этот выход, а при
+         * on_fail=drop умирал целиком.
          *
          * Условие от выхода не зависит вовсе: «весь трафик вместо списка» — это свойство
          * КАНАЛА, и место ему здесь, до поиска выхода. У правила на устройство согласия

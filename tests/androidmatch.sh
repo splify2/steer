@@ -65,7 +65,7 @@ check "и ни слова про /etc/steer" "0" "$(printf '%s\n' "$help" | grep
 sed 's/"kind": "direct" }/"kind": "zapret" }/' "$tmp/spec.json" > "$tmp/z.json"
 "$BIN" apply --dry-run --spec "$tmp/z.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/z.err"
 check "kind zapret — отказ спеки" "2" "$?"
-check "  и причина названа" "1" "$(grep -c 'на телефоне zapret нет' "$tmp/z.err")"
+check "  и причина названа" "1" "$(grep -c 'recheck' "$tmp/z.err")"
 sed 's/"on_fail": "direct"/"on_fail": "zapret"/' "$tmp/spec.json" > "$tmp/zf.json"
 "$BIN" apply --dry-run --spec "$tmp/zf.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/zf.err"
 check "on_fail zapret — отказ спеки" "2" "$?"

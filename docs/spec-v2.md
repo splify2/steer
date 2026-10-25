@@ -33,7 +33,7 @@
 - **Неизвестный ключ — отказ**, на любом уровне, с подсказкой, какие ключи там есть. v1 незнакомые
   ключи пропускал (совместимость вперёд внутри мажора), и опечатка в ключе молча не действовала;
   у v2 совместимость вперёд держит `version`.
-- **Ключ чужого вида — отказ** («ключ strategy есть только у kind: zapret»).
+- **Ключ чужого вида — отказ** («ключ strategy есть только у kind: recheck»).
 - **Каждый отказ — с местом:** `файл:строка:столбец: что не так`.
 - **Перечень** — список `[a, b]` или одно значение: `to: youtube` и `to: [youtube]` значат одно.
 - **Строка** — скаляр в любом стиле записи (`wg0`, `"wg0"`). **Число** и **true/false** — только
@@ -75,7 +75,7 @@ outputs:
   fast: { kind: group, pick: latency, members: [nl, wg1], tolerance: 50 }
   eu:   { kind: group, pick: manual, members: [nl, res], default: nl }
   bal:  { kind: group, pick: balance, members: [nl, wg1], weights: [2, 1] }
-  dpi:  { kind: zapret }
+  dpi:  { kind: block }
 
 dns:
   mode: fakeip
@@ -161,10 +161,10 @@ rules:
 | Ключ | У кого | Значение | Умолчание |
 |---|---|---|---|
 | `kind` | у всех | вид выхода (ниже) | обязателен |
-| `on_fail` | у выхода с устройством, группы, zapret, tgws | `drop`, `direct`, `zapret` (не на телефоне) | `drop` |
+| `on_fail` | у выхода с устройством, группы, tgws | `drop`, `direct`, `zapret` (не на телефоне) | `drop` |
 | `over` | у выхода со своим соединением с сервером | выход-подложка, через который идёт трафик самого туннеля (в v1 — `via`) | напрямую |
 | `device` | interface, tunnel, xsteer, awg | устройство | у interface обязательно; у остальных выводится из имени |
-| `ipv6` | `routed`, `nat` — interface, awg; `off` — ещё tunnel, zapret и группа | IPv6 от хоста на том конце туннеля (ниже, «IPv6 от хоста») | ключа нет — выход несёт IPv6, если его несёт вид |
+| `ipv6` | `routed`, `nat` — interface, awg; `off` — ещё tunnel и группа | IPv6 от хоста на том конце туннеля (ниже, «IPv6 от хоста») | ключа нет — выход несёт IPv6, если его несёт вид |
 | `prefix` | выход с `ipv6: routed` | префикс хоста, `2001:db8:1::/56` (длина 1..64, без битов хоста) | выводится из адресов LAN |
 
 Виды и их ключи (проверяет ключи сам вид — `kind_ops.parse`, один разбор на оба формата):
@@ -177,7 +177,7 @@ rules:
 | `tunnel` | `protocol: vless`, `hysteria2`, `trojan`, `shadowsocks`, `socks`, `http` или `vmess`; `subscription`, `nodes`, `device`, `transport`, `insecure`, `exclude`, `exclude_name`, `only`, `active`, `by`, `interval`, `silence`, `pick`, `tolerance` | туннель по подписке; `subscription` — файл подписки (v1: `sub_file`), `nodes` — номера пригодных узлов по предпочтению (пусто — первый рабочий); `transport` — какими транспортами узлов ходить (ниже; только у vless); `exclude`, `exclude_name` — какие узлы не брать, `only` — узлы каких стран брать (ниже; у всех протоколов); `active`, `by`, `interval`, `silence`, `pick`, `tolerance` — сколько узлов работают сразу, как делятся соединения, как выбираются узлы и как клиент следит за ними (ниже, «Пул узлов туннеля») |
 | `xsteer` | `conf`, `stream`, `stream_port`, `device` | xsteer; `conf` — файл в стиле wg (умолчание `{etc}/xsteer/<имя>.conf`) |
 | `awg` | `conf`, `device` | AmneziaWG, устройство заводит ядро; `conf` — умолчание `{etc}/awg/<имя>.conf` |
-| `zapret` | `strategy` | обход DPI через nfqws; `strategy` — файл ключей nfqws (v1: `opts_file`, умолчание `{etc}/zapret/<имя>.opts`); не на телефоне |
+| `zapret` | — | убран в 2.1.0: отказ с названием замены (модуль DPI `recheck` или `kind: direct`) |
 | `tgws` | `domain` | мост Telegram; `domain` обязателен; `on_fail` — только `drop` |
 | `group` | `members`, `pick`, `default`, `tolerance`, `interval`, `url`, `idle_timeout`, `weights` | группа выходов (ниже) |
 | `warp` | `count`, `transport`, `countries`, `exclude_countries`, `pick`, `tolerance`, `interval`, `url`, `idle_timeout`, `on_fail`, `over`, `ipv6` (`nat` или `off`) | Cloudflare WARP: группа из `count` туннелей «<имя>.<n>» (по умолчанию один: самую быструю точку входа модуль держит у того же устройства) — `awg` или, с `transport: masque`, MASQUE (TUN модуля); `count` — 1..255; `transport` — `awg` (умолчание) или `masque`; `pick` — `latency` (умолчание) или `order`; `interval` по умолчанию 600 с; `ipv6` по умолчанию `nat`; имя выхода не длиннее 27 знаков. Регистрацию и точки ведёт модуль `steer-warpbox` ([docs/warp.md](warp.md)) |
@@ -446,7 +446,7 @@ latency` и `order`; `manual` (человек выбрал сам) и `balance` 
 всех `balance` на пути; хеш у каждой группы свой, поэтому вложенная группа делит сайты своей доли
 по всем своим членам.
 
-Отказы: члена нет; группа в себе самой; член дважды; член без устройства (direct, zapret, tgws);
+Отказы: члена нет; группа в себе самой; член дважды; член без устройства (direct, tgws);
 круг групп; `default` не из членов или не у `manual`; `tolerance`/`interval`/`url`/`idle_timeout` не
 у `latency`; `url` не `http(s)://хост[:порт][/путь]`, `https://` в сборке без TLS; `weights` не у
 `balance` или не по числу членов; `by` не у `balance` или не `connection`/`site`/`site_client`; группа `balance` членом группы `order`/`latency`/`manual` (у такой
@@ -559,7 +559,7 @@ DoH3 не используются. Вторая сторона GOAWAY (серв
 соединение, закрытое сервером, пересоздаётся вопросом.
 
 - `out` — выход, через который уходит запрос к серверу (выход со своим устройством: `interface`,
-  `awg`, `tunnel` любого протокола, `xsteer`; группа, zapret и tgws не годятся); нет ключа, или выход `direct`, или слово `direct` — напрямую. Запрос уходит с меткой выхода, так что
+  `awg`, `tunnel` любого протокола, `xsteer`; группа и tgws не годятся); нет ключа, или выход `direct`, или слово `direct` — напрямую. Запрос уходит с меткой выхода, так что
   может идти по отдельному стабильному выходу, не тому, что у трафика правила. Выход лёг —
   запрос не уходит мимо него (набор правил не выпускает помеченный пакет в другое устройство), а
   клиент получает SERVFAIL, не прежний путь наверх.

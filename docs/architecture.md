@@ -15,7 +15,7 @@ xsteer — [docs/xsteer.md](xsteer.md).
 
 | Профиль | Состав | Что в сборке |
 |---|---|---|
-| `base` | `CORE_SRC` | ядро: модель спеки, компилятор, демон, резолвер, виды `direct`, `interface`, `zapret`, `tgws` (правила перехвата), `awg` и группы, обфускатор; криптографии нет |
+| `base` | `CORE_SRC` | ядро: модель спеки, компилятор, демон, резолвер, виды `direct`, `interface`, `tgws` (правила перехвата), `awg` и группы, обфускатор; криптографии нет |
 | `extended` | ядро, `XS_COMMON_SRC`, `EXT_ROUTER_SRC`, `KINDS_EXT_SRC` | статическая полная сборка (телефон, стенды): ещё клиент VLESS/Reality со стеком туннеля, клиент xsteer, мост tgws, подписка, TLS на wolfSSL; на роутере те же файлы разложены по пакетам (ниже) |
 | `server` | ядро, `XS_COMMON_SRC`, `EXT_SERVER_SRC` | хаб xsteer |
 | `tgws` | ядро, `EXT_TGWS_SRC` | мини-сборка моста Telegram: своё поле метки, свой ряд таблиц и портов моста (docs/contract-v1.md, §7), без резолвера |
@@ -61,7 +61,7 @@ xsteer — [docs/xsteer.md](xsteer.md).
 `/usr/lib`.
 
 Пакеты (`build.sh`, функция `pack`; оба формата — `.apk` и `.ipk` — из одного дерева файлов):
-`steer-core` (`steerd`, `steer`, `steer-tools` — ссылка на `steerd`, `steer-nfqws`, обе библиотеки
+`steer-core` (`steerd`, `steer`, `steer-tools` — ссылка на `steerd`, обе библиотеки
 в `/usr/lib`, init-скрипт, hotplug, `keep.d`; зависит только от чужих `nftables`, `ip-full`,
 `conntrack`, `kmod-nft-queue`), `steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws`,
 `steer-hysteria2`, `steer-proxy`, `steer-warpbox` (по одному бинарнику `usr/sbin/steer-<имя>`; зависят от `steer-core (= версия)`,
@@ -164,7 +164,6 @@ procd
        ├─ steer vless|xsteer|obfs|tgws <выход>     ребёнок: бинарник модуля (steer-vless,
        │                                            steer-xsteer, steer-obfs, steer-tgws),
        │                                            argv[0] «…/steer»
-       └─ steer-nfqws <очередь> <файл ключей>      ребёнок: обёртка nfqws
 steer <команда>          клиент: команды демона — в сокет; остальное и всё без демона — execv steerd
 steer-tools <команда>    ссылка на steerd: отвечает только на инструменты
 ```
@@ -181,8 +180,8 @@ steer-tools <команда>    ссылка на steerd: отвечает то�
   у прежних помощников. argv[0] у всех «…/steer» (`helper_argv0`): в списке процессов они
   выглядят как `steer dnsd`, `steer vless <выход>`, и поиск по командной строке (diag — обходом
   /proc) их находит. В статической сборке (телефон, стенды) модули слинкованы в `steerd`
-  (`modcmd_builtin`), и помощник — подкоманда, как раньше. Обработчик zapret — своя программа рядом
-  с ядром (`files/usr/sbin/steer-nfqws`).
+  (`modcmd_builtin`), и помощник — подкоманда, как раньше. Обработчик внешнего модуля DPI — своя
+  программа рядом с ядром (`kind_helper.prog`).
 - **У модулей SIGPIPE выключен** (`modcmd_run`, для всех модульных команд). Запись в сокет узла,
   который узел уже закрыл, — ошибка EPIPE, как ECONNRESET: стек закрывает ровно это соединение
   (RST клиенту) и освобождает его, а процесс продолжает нести остальные. С SIGPIPE по умолчанию такая
@@ -221,7 +220,7 @@ src/
               check.c (сквозные проверки), registry.c (реестр меток и таблиц), marks.h, probe.c,
               srs.c, srsplan.c (наборы sing-box)
   kinds/      kind.h и kind.c (struct kind_ops, биты свойств, реестр),
-              direct.c interface.c awg.c vless.c xsteer.c zapret.c tgws.c group.c grpurl.c
+              direct.c interface.c awg.c vless.c xsteer.c tgws.c group.c grpurl.c
               hysteria2.c proxy.c (записи видов модулей steer-hysteria2 и steer-proxy)
   platform/   platform.h, platform.c, openwrt.c, android.c
   profile/    profile.h, profile.c (умолчания), extended.c, server.c, tgws.c — данные профиля
@@ -320,7 +319,7 @@ struct kind_ops {
 - **Настройки видов — `union`** внутри `struct output`: у каждого вида своя структура
   (`struct vless_cfg`, `struct xsteer_cfg`, …), и заполняет её только разбор его модуля.
   Помощники спрашивают свою настройку у вида (`out_vless`, `out_xsteer`, `out_tgws`).
-- **Реестр** (`kind.c`): `direct`, `interface`, `vless`, `xsteer`, `zapret`, `tgws`, `awg` — в этом
+- **Реестр** (`kind.c`): `direct`, `interface`, `vless`, `xsteer`, `tgws`, `awg` — в этом
   порядке идут правила видов в дереве (`kind_emit_all`) и проверки diag; дальше идут `hysteria2` и виды протоколов прокси (правил вида у них нет), в конце — `block`. На записи вида, файла
   которого в сборке нет, стоит запись отказа с `absent`; её текст о VLESS и xsteer содержит
   подстроку `steer-extended` — её читает splify2.
@@ -349,7 +348,7 @@ struct kind_ops {
 | `postrouting_nat4` | nat postrouting | masquerade IPv4 на устройстве выхода, которому нужна подмена (`interface`, `awg`, члены WARP) |
 | `postrouting_nat6` | nat postrouting | masquerade IPv6 у выхода с `ipv6: nat` |
 | `output_mark`, `output_dns` | output | каналы на сам телефон и заворот его DNS |
-| `zapret_*`, `tgws_redirect` | — | правила видов `zapret` и `tgws` (`kind_ops.emit`) |
+| `tgws_redirect` | — | правила вида `tgws` (`kind_ops.emit`) |
 
 **Разметка на ingress.** Цепочка `ingress_mark` стоит на тех устройствах из `lan_devices`, что есть
 при `apply`, с приоритетом `filter + 10` — после flowtable fw4 на том же хуке. Первое правило даёт
@@ -744,7 +743,7 @@ outputs:                              # куда
   wg1:  { kind: interface, device: wg1 }
   nl:   { kind: tunnel, protocol: vless, subscription: sub/nl, nodes: [3, 5],
           transport: ws, over: wg0 }
-  dpi:  { kind: zapret, strategy: zapret/yt.opts }
+  dpi:  { kind: block }
   res:  { kind: group, pick: order,   members: [wg0, wg1], on_fail: drop }
   eu:   { kind: group, pick: manual,  members: [nl, res], default: nl }
   bal:  { kind: group, pick: balance, members: [nl, wg1] }
@@ -771,7 +770,7 @@ rules:                                # сверху вниз, выше — си
   именам проверяются, круг в группах и в `over` — отказ.
 - **Ключи видов** разбирает сам вид (`kind_ops.parse` над `struct out_keys` — один разбор на оба
   формата): `kind: tunnel, protocol: vless` (`kind: vless` — отказ с подсказкой) с `subscription`
-  (v1 `sub_file`), `nodes` и `transport`; `strategy` у zapret (v1 `opts_file`); `conf`, `stream`,
+  (v1 `sub_file`), `nodes` и `transport`; `strategy` у модуля DPI (v1 `opts_file`); `conf`, `stream`,
   `stream_port` у xsteer; `conf` у awg; `obfs: { mode, server, listen }` у interface; `domain` у
   tgws; `ipv6` и `prefix` у выходов с IPv6 (раздел 4б).
 - **Относительный путь — от каталога файла спеки** (`lists/youtube.srs` рядом со спекой в
@@ -888,7 +887,7 @@ JSON (`src/daemon/ctl.c`). `status`, `diag`, `explain`, `conns`, `dns-log` де�
 ## 4б. IPv6
 
 Семейство — свойство строки списка и адреса клиента; у выхода и группы — бит `KC_IPV6`. Его несут
-`interface`, `awg`, `zapret` и туннели ядра с протоколом (`vless`, `hysteria2`, прокси: стек `src/tunnel` несёт
+`interface`, `awg` и туннели ядра с протоколом (`vless`, `hysteria2`, прокси: стек `src/tunnel` несёт
 IPv6 и по TCP, и по UDP) и группа, все члены которой его несут; у `xsteer` и `tgws` его нет.
 
 - **Списки.** Строка списка классифицируется по семейству (`spec_line_family`: 4, 6 или 0 — имя).

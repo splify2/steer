@@ -127,7 +127,6 @@ cc_defaults {
         "src/kinds/group.c",
         "src/kinds/grpurl.c",
         "src/kinds/interface.c",
-        "src/kinds/zapret.c",
         "src/kinds/tgws.c",
         "src/kinds/awg.c",
         // YAML_SRC in build/sources.mk: the engine's wrapper here, libyaml itself in

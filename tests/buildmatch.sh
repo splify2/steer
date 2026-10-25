@@ -292,14 +292,14 @@ check "в src/model, src/compile и src/lib (кроме err.c) нет die()/exit
 # другой одежде. Группа (kind_group, OUT_GROUP) — тоже вид: «это группа?» спрашивают out_group
 # (src/kinds/group.c), а перевод v1 собирает её group_of_devices. Комментарии не в счёт.
 #
-# src/compile здесь наравне с остальным движком: построители видов (zapret, tgws) переехали в
-# kind_ops.emit (src/kinds), а has_zapret/has_tgws — в zapret_present/tgws_present там же;
+# src/compile здесь наравне с остальным движком: построители видов (tgws) переехали в
+# kind_ops.emit (src/kinds), а has_tgws — в tgws_present там же;
 # генератор зовёт их через kind_emit_all, не зная имён видов.
 kindbad=""
 for f in $(find src -name '*.c' -o -name '*.h' | sort); do
     case "$f" in src/kinds/*) continue ;; esac
     n=$(grep -vE '^[[:space:]]*(\*|//|/\*)' "$f" |
-        grep -cE '\<OUT_(DIRECT|INTERFACE|VLESS|XSTEER|ZAPRET|TGWS|AWG|GROUP)\>|\<kind_(direct|interface|vless|xsteer|zapret|tgws|awg|group)\>|(->|\.)kind *[!=]= *&|kind_of\([^)]*\)->name *, *"|"(direct|interface|vless|xsteer|zapret|tgws|awg|group)" *, *kind_of')
+        grep -cE '\<OUT_(DIRECT|INTERFACE|VLESS|XSTEER|TGWS|AWG|GROUP)\>|\<kind_(direct|interface|vless|xsteer|tgws|awg|group)\>|(->|\.)kind *[!=]= *&|kind_of\([^)]*\)->name *, *"|"(direct|interface|vless|xsteer|tgws|awg|group)" *, *kind_of')
     [ -n "$n" ] || n=0
     [ "$n" -gt 0 ] && kindbad="$kindbad$f:$n "
 done
@@ -546,7 +546,7 @@ check "файл keep.d есть в репозитории" "yes" "$([ -f "$KEEP"
 # туннеля, которые человек положил сам; без каталога в списке обновление прошивки оставляло выход
 # без конфига.
 for f in /etc/steer/spec.json /etc/steer/spec.yaml /etc/steer/select /etc/steer/sub.txt /etc/steer/sub.userinfo \
-         /etc/steer/subs /etc/steer/lists/custom /etc/steer/awg /etc/steer/xsteer /etc/steer/zapret; do
+         /etc/steer/subs /etc/steer/lists/custom /etc/steer/awg /etc/steer/xsteer; do
     check "keep.d объявляет $f" "1" "$(grep -cx "$f" "$KEEP")"
 done
 # Ни комментариев, ни пустых строк, ни относительных путей: файл читает не человек, а

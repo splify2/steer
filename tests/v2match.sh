@@ -477,7 +477,7 @@ version: 2
 outputs:
   vpn: { kind: interface, device: wg0, strategy: /etc/x.opts }
 EOF
-refused "чужой ключ вида" "ключ strategy есть только у kind: zapret" 3:40
+refused "чужой ключ вида" "ключ strategy есть только у kind: recheck" 3:40
 
 y <<'EOF'
 version: 2
@@ -839,17 +839,6 @@ rules:
   - { name: a, for: [kids, tv], to: a, out: vpn }
 EOF
 refused "клиенты разных видов в одном for — ещё не поддерживается" "клиенты разных видов" 10:21
-
-y <<'EOF'
-version: 2
-lists:
-  a: { prefixes_file: TMP/a.lst }
-outputs:
-  z: { kind: zapret, strategy: '/etc/steer/zapret/y"t.opts' }
-rules:
-  - { to: a, out: z }
-EOF
-refused "проверка вида — его текст с ключом v2 и местом выхода" "strategy должен быть абсолютным путём" 5:3
 
 y <<'EOF'
 version: 2

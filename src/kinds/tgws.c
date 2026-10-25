@@ -32,7 +32,7 @@ static int tgws_parse(struct output *o, const struct out_keys *k, struct err *e)
         return err_set(e, "outputs.%s: kind tgws нужен domain — имя за Cloudflare, у которого "
             "kwsN.<domain> ведёт на веб-точку Telegram: web.telegram.org обслуживает "
             "только ДЦ2 и ДЦ4", o->name);
-    /* Устройства нет по той же причине, что у zapret: маршрут не меняется, меняется
+    /* Устройства нет по той же причине, что у модуля DPI: маршрут не меняется, меняется
      * то, куда уводится перехваченное соединение. Названное устройство — почти
      * наверняка описка, и принять её молча значило бы обещать маршрутизацию,
      * которой не будет. */
@@ -73,7 +73,7 @@ static int tgws_helper(const struct spec *sp, const struct output *o, struct kin
 }
 
 /* `steer tgws-instances` — что поднимать для выходов kind=tgws: имя и порт, по строке на выход.
- * Тот же довод, что у zapret-instances (kinds/zapret.c), включая главный: порт выводит движок
+ * Главный довод: порт выводит движок
  * (out_tgws_port), а не считает init-скрипт — второй расчёт того же в shell разошёлся бы при
  * первой правке, и мост слушал бы порт, на который ядро ничего не заворачивает. */
 int tgws_instances(const struct spec *sp) {

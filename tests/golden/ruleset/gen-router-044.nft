@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/dup.json --state-dir TMP/state-g
+# args: apply --dry-run --spec TMP/loop.json --state-dir TMP/state-g
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: выход o: устройство wg0 указано дважды
+# stderr: steer: выход o ведёт в br-lan — это локальная сеть, трафик закольцуется

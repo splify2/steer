@@ -45,6 +45,7 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include "spec.h"
+#include "procscan.h"
 #include "awg.h"
 #include "run.h"
 #include "rtnl.h"
@@ -314,8 +315,8 @@ const struct output *out_for_device(const struct spec *sp, const struct output *
  * остальное — пробой ICMP. */
 int (*g_health_probe)(const struct spec *, const struct output *, const char *);
 
-/* Работает ли обход (zapret_running) и жив ли обработчик очереди (nfqws_on_queue) — вопросы к
- * процессам nfqws, они в kinds/zapret.c. */
+/* Работает ли системный обход (любой nfqws) — нужен on_fail=zapret у выходов с устройством. */
+static int zapret_running(void) { return proc_cmdline_find("nfqws", 0); }
 
 /* Куда направить таблицу выхода, когда живых устройств нет.
  *

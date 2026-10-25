@@ -456,7 +456,7 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
         }
         /* Свои поля вида (kind_ops.status): у vless — выбранные узлы подписки, у interface —
          * обфускация, у awg — рукопожатие и счётчики из ядра (все три — после on_fail, в объекте
-         * выхода с устройством), у zapret — очередь, файл стратегии и живость обработчика. */
+         * выхода с устройством), у модуля DPI — очередь, файл настройки и живость обработчика. */
         {
             const struct kind_ops *k = kind_of(&sp->out[i]);
             if (k->status) k->status(out, sp, &sp->out[i]);

@@ -368,9 +368,6 @@ LIBSTEER_1 {
     ydoc_free;
     ydoc_parse_buf;
     ydoc_root;
-    zapret_instances;
-    zapret_present;
-    zapret_running;
   local:
     *;
 };

@@ -146,7 +146,7 @@ static const char spec_v2[] =
 "  wg1:  { kind: interface, device: wg1 }\n"
 "  nl:   { kind: tunnel, protocol: vless, subscription: sub/nl, nodes: [3, 5],\n"
 "          transport: ws, over: wg0 }\n"
-"  dpi:  { kind: zapret, strategy: zapret/yt.opts }\n"
+"  dpi:  { kind: block }\n"
 "  res:  { kind: group, pick: order,   members: [wg0, wg1], on_fail: drop }\n"
 "  eu:   { kind: group, pick: manual,  members: [nl, res], default: nl }\n"
 "  bal:  { kind: group, pick: balance, members: [nl, wg1] }\n"

@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/tgws-alien.json --state-dir TMP/state-ta
+# args: apply --dry-run --spec TMP/tgws-nd.json --state-dir TMP/state-tn
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: outputs.d: domain есть только у kind=tgws
+# stderr: steer: outputs.tg: kind tgws нужен domain — имя за Cloudflare, у которого kwsN.<domain> ведёт на веб-точку Telegram: web.telegram.org обслуживает только ДЦ2 и ДЦ4

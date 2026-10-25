@@ -1,4 +1,4 @@
 # args: apply --dry-run --spec TMP/pp.json --state-dir TMP/st-pp
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: channels.p: ports: висящая запятая (ожидалась строка)
+# stderr: steer: channels.p: ports: диапазон пишется СТРОКОЙ ("443", а не 443)

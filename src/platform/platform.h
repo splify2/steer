@@ -64,7 +64,7 @@ struct platform_ops {
      * podkop и forkop спрашивает 127.0.0.42, то есть коннектор, который сам спрашивает dnsd; заворот
      * отправил бы вопрос dnsmasq в dnsd, а имя вне правил — обратно в dnsmasq, по кругу. */
     unsigned local_dns : 1;
-    unsigned zapret : 1;              /* kind zapret и on_fail zapret */
+    unsigned zapret : 1;              /* системный zapret: бит пропуска и on_fail zapret */
     unsigned fw4 : 1;                 /* firewall4: проверки зоны и masquerade после apply */
     unsigned netifd : 1;              /* сторож оживляет интерфейс ifdown/ifup и procd */
     unsigned iptables_masq : 1;       /* masquerade выходов — правилом nat iptables движка */

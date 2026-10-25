@@ -29,7 +29,7 @@ EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT
 # вместе с моделью идут виды (src/kinds). Без awg.c: он тянет run_quiet из lib/run.c, а стенды
 # подменяют run_quiet своим — awg.c берут только те, кому нужен сам вид awg (specmatch, awgmatch).
 # Вид, которого в списке нет, у реестра остаётся записью отказа (см. src/kinds/kind.c).
-# Дерево ruleset (src/lib/ir.c), которое kind_ops.emit видов zapret и tgws строит напрямую, уже
+# Дерево ruleset (src/lib/ir.c), которое kind_ops.emit вида tgws строит напрямую, уже
 # в MODEL_SRC (build/sources.mk): без него компоновка падала бы на ir_rule/ir_x и соседях, даже
 # если стенд emit не зовёт вовсе, — символ нужен компоновщику.
 MODEL_KINDS := $(MODEL_SRC) $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC))
@@ -396,7 +396,7 @@ $(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/
 	$(CC) $(CFLAGS) -DSTEER_DEFAULT_PLATFORM=android -o $@ tests/awgmatch.c $(MODEL_KINDS)
 
 # Виды — объектами (без awg.c и без парсера: стенд подменяет load_spec своей спекой). С
-# src/lib/ir.c — тем же доводом, что у MODEL_KINDS: zapret_emit/tgws_emit зовут ir_* на
+# src/lib/ir.c — тем же доводом, что у MODEL_KINDS: tgws_emit зовёт ir_* на
 # компоновке, даже когда стенд их не вызывает (модели стенд не компонует, поэтому отдельно). И с
 # src/lib/module.c: kinds/tgws.c спрашивает, установлен ли модуль моста (шаг 4 выпуска 1.10).
 FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC) src/lib/ir.c src/lib/module.c

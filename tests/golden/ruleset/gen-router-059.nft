@@ -1,4 +1,4 @@
-# args: apply --dry-run --spec TMP/s4.json --state-dir TMP/state
+# args: apply --dry-run --spec TMP/s3.json --state-dir TMP/state
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: outputs.vpn: kind interface needs a device
+# stderr: steer: channel blocked points at an output that does not exist

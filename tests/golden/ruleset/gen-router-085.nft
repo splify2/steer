@@ -1,4 +1,4 @@
 # args: apply --dry-run --spec TMP/pp.json --state-dir TMP/st-pp
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: channels.p: ports: диапазоны 443-443 и 443-443 пересекаются — сложите их в один
+# stderr: steer: channels.p: ports: висящая запятая (ожидалась строка)

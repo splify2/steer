@@ -4,8 +4,8 @@
  * старого ядра делает legacy.c преобразованием этого же дерева, и здесь про неё не знают
  * ничего — всё, что ниже, это набор правил современного ядра.
  *
- * Части, которые зависят от вида выхода, — kind_ops.emit модулей видов (zapret_emit в
- * kinds/zapret.c, tgws_emit в kinds/tgws.c, docs/architecture.md, «Вид выхода»): их зовёт
+ * Части, которые зависят от вида выхода, — kind_ops.emit модулей видов (tgws_emit в
+ * kinds/tgws.c, docs/architecture.md, «Вид выхода»): их зовёт
  * kind_emit_all (kind.c) двумя проходами по видам в порядке реестра, поэтому здесь про них не
  * знают ничего, кроме самого вызова в nft_build. Части, которые есть только на телефоне
  * (разметка на выходе, счёт скачанного на входе, заворот DNS приложений, «кто» по владельцу
@@ -67,7 +67,7 @@ static void sb_emit(struct nft_rule *r, struct sbuf *b) {
 }
 
 /* Единственные оставшиеся в этом файле пользователи — построители цепочек output для каналов
- * на само устройство ниже (plat()->local_channels): kind_ops.emit видов zapret/tgws берёт
+ * на само устройство ниже (plat()->local_channels): kind_ops.emit вида tgws берёт
  * таблицу так же, но своим вызовом ir_table_find в src/kinds. */
 static struct nft_table *inet_table(struct nft_rs *rs) {
     return ir_table_find(rs, NFT_FAM_INET, NULL);
@@ -837,10 +837,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
          * тот, которым системный zapret узнаёт «этот пакет не мой» (ZAPRET_SKIP_MARK,
          * см. spec.h; кому именно и почему — out_skips_zapret там же).
          *
-         * У kind=zapret без него трафик разбирали бы двое: сначала общий обход своей
-         * стратегией, потом наш экземпляр своей, — и вышло бы не то, что выбрал
-         * человек, ни в одном из двух смыслов. У туннельных выходов причина другая и
-         * не менее веская: обход стал бы рассинхронизировать ВНЕШНИЕ пакеты туннеля,
+         * У туннельных выходов обход стал бы рассинхронизировать ВНЕШНИЕ пакеты туннеля,
          * до полезной нагрузки не добираясь вовсе.
          *
          * Ставится ЗДЕСЬ, в prerouting, потому что цепочки zapret висят на
@@ -891,7 +888,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
  *
  * ЧТО НЕ ПЕРЕЕЗЖАЕТ И ПОЧЕМУ. На ingress нет записи conntrack — её заводит conntrack на
  * prerouting (-200). Значит там нельзя ни поставить метку соединения (`ct mark set mark`: на неё
- * опираются снятие соединений выхода сторожем, очередь kind=zapret и счёт телефона), ни
+ * опираются снятие соединений выхода сторожем, очередь модуля DPI и счёт телефона), ни
  * прочитать её (память выбора группы balance, balance.c). Эти две вещи остаются в
  * prerouting_mark, и делает их там правило ingress_trust ниже по готовой метке пакета. Заворот
  * DNS, dnat fake-IP и перехват моста — цепочки nat, на ingress их нет вовсе; они на месте.
@@ -1048,7 +1045,7 @@ static void ingress_trust(struct nft_table *t, struct nft_chain *pm, const struc
     sb_emit(r, &b);
     ir_comment(r, "steer-ingress");
     /* «Разобран, выхода нет» — снять значение: дальше пакет идёт с тем же пустым полем, что без
-     * ingress (его видят чужие правила postrouting, сторож, очередь zapret). */
+     * ingress (его видят чужие правила postrouting, сторож, очередь модуля DPI). */
     ir_markset(ir_rule(ir_chain_add(t, "ingress_seen")), "meta mark set mark and 0x%08x",
                ~STEER_MARK_MASK);
     if (ct) ir_x(ir_rule(ir_chain_add(t, "ingress_ct")), "ct mark set mark");
@@ -1324,8 +1321,8 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
  * вернули — никуда». TCP клиента повторит SYN через секунду и найдёт правило на месте.
  *
  * КАКИЕ МЕТКИ. Только выходов с устройством и своей таблицей (out_has_device, метка и таблица):
- *   - direct метки нет вовсе; kind=zapret и tgws метку имеют, но таблицы у них нет, и их трафик
- *     законно идёт обычным маршрутом (zapret — в очередь на postrouting, tgws — в мост на самом
+ *   - direct метки нет вовсе; tgws и модуль DPI метку имеют, но таблицы у них нет, и их трафик
+ *     законно идёт обычным маршрутом (модуль DPI — в очередь на postrouting, tgws — в мост на самом
  *     роутере, через input, сюда не доходит);
  *   - «пущен напрямую» (набор FAILOPEN_SET: сторож при on_fail=direct/zapret снял правило нарочно)
  *     — законно идёт по main: первым проверяется набор (out_releasable в spec.h — почему набор
@@ -2256,7 +2253,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     build_nat6(t, sp);
     build_nat4(t, sp);
     /* Построители видов (kind_ops.emit): по видам, в порядке реестра, поэтому все цепочки
-     * zapret в тексте стоят раньше цепочки моста, в каком бы порядке выходы ни шли в спеке
+     * видов в тексте стоят раньше цепочки моста, в каком бы порядке выходы ни шли в спеке
      * (kind.c: kind_emit_all). */
     kind_emit_all(rs, sp);
     if (!prof()->no_resolver) build_dns_redirect(t, sp);

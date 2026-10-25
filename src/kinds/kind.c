@@ -19,7 +19,7 @@
  * direct — единственный вид со СИЛЬНОЙ ссылкой: обнулённый выход читается как direct (kind_of
  * в spec.h), то есть без этой записи движок не значит ничего.
  *
- * Строки отказа базовых видов (interface, zapret, tgws, awg) в настоящей сборке недостижимы —
+ * Строки отказа базовых видов (interface, tgws, awg) в настоящей сборке недостижимы —
  * эти файлы входят в каждый профиль. Они нужны стендам, которые компонуют модель с частью видов,
  * и там отказ честнее падения. */
 #include <string.h>
@@ -29,7 +29,6 @@
 extern const struct kind_ops kind_interface __attribute__((weak));
 extern const struct kind_ops kind_vless __attribute__((weak));
 extern const struct kind_ops kind_xsteer __attribute__((weak));
-extern const struct kind_ops kind_zapret __attribute__((weak));
 extern const struct kind_ops kind_tgws __attribute__((weak));
 extern const struct kind_ops kind_awg __attribute__((weak));
 extern const struct kind_ops kind_hysteria2 __attribute__((weak));
@@ -48,7 +47,6 @@ extern const struct kind_ops kind_vmess __attribute__((weak));
 static const struct kind_ops no_interface = { .name = "interface", .absent = "kind interface в этой сборке нет" };
 static const struct kind_ops no_vless     = { .name = "vless",  .absent = "kind vless требует пакет steer-vless (входит в steer-extended)" };
 static const struct kind_ops no_xsteer    = { .name = "xsteer", .absent = "kind xsteer требует пакет steer-xsteer (входит в steer-extended)" };
-static const struct kind_ops no_zapret    = { .name = "zapret", .absent = "kind zapret в этой сборке нет" };
 static const struct kind_ops no_tgws      = { .name = "tgws",   .absent = "kind tgws в этой сборке нет" };
 static const struct kind_ops no_awg       = { .name = "awg",    .absent = "kind awg в этой сборке нет" };
 /* hysteria2 — единственный вид, которого нет в steer-extended: у него свой пакет, и текст не
@@ -69,7 +67,6 @@ static const struct { const struct kind_ops *have, *none; const char *module; } 
     { &kind_interface, &no_interface, NULL },
     { &kind_vless,     &no_vless,     "steer-vless" },
     { &kind_xsteer,    &no_xsteer,    "steer-xsteer" },
-    { &kind_zapret,    &no_zapret,    NULL },
     { &kind_tgws,      &no_tgws,      NULL },
     { &kind_awg,       &no_awg,       NULL },
     /* Последними: порядок реестра — порядок правил видов и проверок diag, а у hysteria2 и
@@ -136,7 +133,7 @@ const struct kind_ops *kind_by_name(const char *name) {
  * довод: правила одного вида ложатся в дерево подряд, одним блоком, и текст ruleset не
  * зависит от того, в каком порядке человек перечислил выходы разных видов в спеке. До
  * переноса на emit это обеспечивали два ЖЁСТКО заказанных прохода в generate.c (сначала все
- * zapret, потом все tgws); порядок реестра даёт то же самое без знания имён видов. */
+ * одного вида, потом другого); порядок реестра даёт то же самое без знания имён видов. */
 void kind_emit_all(struct nft_rs *rs, const struct spec *sp) {
     for (size_t ki = 0; ki < REG_N; ki++) {
         const struct kind_ops *k = kind_at(ki);
