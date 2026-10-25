@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "id": "warpbox",
+  "version": "@VERSION@",
+  "type": "plugin",
+  "name": "WARP",
+  "description": "Cloudflare WARP: регистрация, подбор точек входа, замена",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/splify2/steer",
+  "compat": {
+    "steer-api": "^1.0"
+  },
+  "arch": [
+    "aarch64_cortex-a53",
+    "aarch64_cortex-a72",
+    "aarch64_generic",
+    "arm_cortex-a7_neon-vfpv4",
+    "arm_cortex-a9",
+    "arm_cortex-a9_neon",
+    "arm_cortex-a9_vfpv3-d16",
+    "mipsel_24kc",
+    "mips_24kc",
+    "x86_64"
+  ],
+  "requires": {
+    "plugins": {
+      "net1": "^1.2",
+      "awg": "^2.1"
+    },
+    "system": [
+      "kmod-tun"
+    ]
+  },
+  "permissions": [
+    "net.admin",
+    "http",
+    "ctl",
+    "system-packages"
+  ],
+  "steer": {
+    "commands": [
+      {
+        "name": "warp-reg",
+        "prog": "bin/warpbox",
+        "help": "зарегистрировать устройство WARP"
+      },
+      {
+        "name": "warp-scan",
+        "prog": "bin/warpbox",
+        "help": "подобрать точки входа WARP"
+      }
+    ]
+  }
+}

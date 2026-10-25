@@ -144,7 +144,8 @@ ping_tunnel $TLS; check "туннель TLS отвечает до нагрузк
 ping_tunnel $NONE; check "туннель без шифрования отвечает до нагрузки" "0" "$?"
 
 # Модули — дети демона по имени бинарника; резолвер — тоже ребёнок, `steerd dnsd`.
-kids() { pgrep -P "$D" -x "$1" | sort -n | tr '\n' ' ' | sed 's/ $//'; }
+# Модуль раскладки 2.0 зовётся steer-vless, помощник плагина 2.1 по манифесту — своим именем (vless).
+kids() { { pgrep -P "$D" -x "$1"; pgrep -P "$D" -x "${1#steer-}"; } | sort -n | tr '\n' ' ' | sed 's/ $//'; }
 mods="$(kids steer-vless)"
 check "демон поднял два модуля vless" "2" "$(printf '%s\n' $mods | wc -l)"
 set -- $mods; M1="$1"; M2="${2:-0}"

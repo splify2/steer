@@ -20,6 +20,9 @@ typedef void (*stack_ready_fn)(void *arg, const char *dev);
  *
  * Возвращает всегда 1: успешного выхода у цикла нет (см. конец stack_run). */
 int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, void *arg);
+/* Таблица fake-IP резолвера (только чтение): помощнику плагина путь даёт ядро в {conf}
+ * (paths.fakeip, steer-api.md 1.4); NULL или не задан — <каталог состояния>/fakeip.state, как в 2.0. */
+void stack_set_fakeip_path(const char *path);
 
 /* Набор активных узлов изменился (пул узлов, pool.c): соединения, чей узел больше не активен
  * (dialer_ops.stale), стек сбрасывает — RST клиенту, — чтобы приложения переподключались сразу, а не

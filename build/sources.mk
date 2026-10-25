@@ -29,7 +29,7 @@ CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src
 # PLATFORM_SRC); остальные — по одному на профиль, у base своего файла нет. Отдельно от ядра и
 # от расширенной части, потому что файл профиля не входит ни в одну сборку, кроме своей.
 PROFILE_DIRS := src/profile
-EXT_DIRS  := src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/proto/hysteria2 src/proto/proxy src/proto/warp src/modules
+EXT_DIRS  := src/net1 src/tunnel src/proto/tls src/proto/transport src/proto/vless src/proto/xsteer src/proto/tgws src/proto/quic src/proto/hysteria2 src/proto/proxy src/proto/warp src/modules
 # Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
 CLIENT_DIRS := src/client
 # Сторонний код (src/third_party) — не слой движка: файлы в нём не правятся (см. UPSTREAM в
@@ -46,7 +46,7 @@ INC_DIRS  := $(CORE_DIRS) $(PROFILE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS) $(THIRD_DIR
 # в профиль android не входят, телефон не собирает ни QUIC-клиента, ни модули steer-hysteria2 и
 # steer-proxy). tests/buildmatch.sh сверяет
 # Android.bp с INC_DIRS за вычетом этого списка.
-PHONE_SKIP_DIRS := src/proto/hysteria2 src/proto/proxy src/proto/warp src/pluginmgr
+PHONE_SKIP_DIRS := src/net1 src/proto/hysteria2 src/proto/proxy src/proto/warp src/pluginmgr
 # Определения, которых ждёт сторонний код: yaml_private.h подключает config.h (номер версии
 # libyaml) только при HAVE_CONFIG_H. Ключ идёт во ВСЕ пути сборки движка — Makefile, build.sh,
 # build/build-ext*.sh (там он читается отсюда), в Android.bp — флагом библиотеки libsteer_yaml;
@@ -96,10 +96,15 @@ YAML_SRC := src/lib/ynode.c $(LIBYAML_SRC)
 # lib/module.c — какая команда чья и установлен ли модуль (шаг 4 выпуска 1.10, src/lib/module.h):
 # его зовут реестр видов (kinds/kind.c, kinds/tgws.c) и справка (cli/cli.c), а они идут со всякой
 # моделью, поэтому файл здесь же.
-MODEL_SRC := $(PLATFORM_SRC) src/lib/module.c src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/lib/ir.c src/model/parse.c src/model/v1.c \
-             src/model/check.c src/model/v2.c src/model/v2keys.c src/model/v2schema.c src/model/v2print.c src/model/registry.c \
-             src/model/probe.c src/model/plugprep.c src/compile/nftcompat.c src/lib/puff.c src/lib/gz.c src/model/srs.c src/model/srsplan.c \
-             src/lib/nftdump.c src/lib/rtnl.c src/lib/procscan.c $(YAML_SRC)
+#
+# MODEL_SPEC_SRC — модель без платформы, lib/err.c и lib/jsonr.c: эти куски плагины протоколов берут у
+# библиотеки net1 (NET1_BASE_SRC ниже), а сам разбор спеки — к себе (PLUGIN_BASE_SRC). Множество
+# MODEL_SRC от разреза не изменилось.
+MODEL_SPEC_SRC := src/lib/module.c src/lib/tmpfile.c src/lib/ir.c src/model/parse.c src/model/v1.c \
+                  src/model/check.c src/model/v2.c src/model/v2keys.c src/model/v2schema.c src/model/v2print.c src/model/registry.c \
+                  src/model/probe.c src/model/plugprep.c src/compile/nftcompat.c src/lib/puff.c src/lib/gz.c src/model/srs.c src/model/srsplan.c \
+                  src/lib/nftdump.c src/lib/rtnl.c src/lib/procscan.c $(YAML_SRC)
+MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c $(MODEL_SPEC_SRC)
 
 # Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,
 # lib/ctnl.c родились из того же файла (хеш-индекс строк, транзакции nf_tables по netlink,
@@ -332,19 +337,24 @@ LIBSTEER_SRC := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_P
 PLUGMGR_SRC := src/pluginmgr/pmutil.c src/pluginmgr/pmver.c src/pluginmgr/pmstate.c src/pluginmgr/pmindex.c \
                src/pluginmgr/pminst.c src/pluginmgr/pmmain.c
 STEERD_DYN_SRC := $(DAEMON_SRC) src/proto/tls/urltls.c $(PLUGMGR_SRC)
+# Перевод --conf {conf} помощника плагина в прежние --spec/--state-dir (src/modules/plugconf.h) — у
+# каждой точки входа модуля и плагина.
+PLUGCONF_SRC := src/modules/plugconf.c
 VLESS_MODULE_SRC := $(VLESS_MOD_SRC) src/proto/vless/sub.c src/proto/vless/subfetch.c \
-                    src/proto/tls/tlsprobe.c $(MODCMD_SRC) src/modules/main_vless.c
+                    src/proto/tls/tlsprobe.c $(MODCMD_SRC) $(PLUGCONF_SRC) src/modules/main_vless.c
 XSTEER_MODULE_SRC := src/proto/xsteer/xsclient.c src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c \
                      src/proto/xsteer/xslink.c src/proto/xsteer/xsroute.c src/proto/xsteer/xsconn.c \
                      src/proto/xsteer/xsstream.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xshake.c \
-                     src/proto/xsteer/xsadmin.c $(MODCMD_SRC) src/modules/main_xsteer.c
-OBFS_MODULE_SRC := $(OBFS_MOD_SRC) $(MODCMD_SRC) src/modules/main_obfs.c
-TGWS_MODULE_SRC := src/proto/tgws/tgws.c $(MODCMD_SRC) src/modules/main_tgws.c
-HY2_MODULE_SRC := $(HY2_MOD_SRC) $(MODCMD_SRC) src/modules/main_hysteria2.c
-PROXY_MODULE_SRC := $(PROXY_MOD_SRC) $(MODCMD_SRC) src/modules/main_proxy.c
-WARP_MODULE_SRC := $(WARP_MOD_SRC) $(MODCMD_SRC) src/modules/main_warpbox.c
+                     src/proto/xsteer/xsadmin.c $(MODCMD_SRC) $(PLUGCONF_SRC) src/modules/main_xsteer.c
+OBFS_MODULE_SRC := $(OBFS_MOD_SRC) $(MODCMD_SRC) $(PLUGCONF_SRC) src/modules/main_obfs.c
+TGWS_MODULE_SRC := src/proto/tgws/tgws.c $(MODCMD_SRC) $(PLUGCONF_SRC) src/modules/main_tgws.c
+HY2_MODULE_SRC := $(HY2_MOD_SRC) $(MODCMD_SRC) $(PLUGCONF_SRC) src/modules/main_hysteria2.c
+PROXY_MODULE_SRC := $(PROXY_MOD_SRC) $(MODCMD_SRC) $(PLUGCONF_SRC) src/modules/main_proxy.c
+WARP_MODULE_SRC := $(WARP_MOD_SRC) $(MODCMD_SRC) $(PLUGCONF_SRC) src/modules/main_warpbox.c
 
-PROFILE_libsteer   := $(LIBSTEER_SRC)
+# PROFILE_libsteer20 — libsteer раскладки 2.0 (модули steer-<m> на libsteer). Собирается только по
+# STEER_LAYOUT=2.0 (build/build-libs.sh) — на откат и сверку; главная раскладка — 2.1 ниже.
+PROFILE_libsteer20 := $(LIBSTEER_SRC)
 PROFILE_steerd     := $(STEERD_DYN_SRC)
 PROFILE_mod_vless  := $(VLESS_MODULE_SRC)
 PROFILE_mod_xsteer := $(XSTEER_MODULE_SRC)
@@ -353,6 +363,69 @@ PROFILE_mod_tgws   := $(TGWS_MODULE_SRC)
 PROFILE_mod_hysteria2 := $(HY2_MODULE_SRC)
 PROFILE_mod_proxy  := $(PROXY_MODULE_SRC)
 PROFILE_mod_warpbox := $(WARP_MODULE_SRC)
+
+# ---- РАСКЛАДКА 2.1: ЯДРО, БИБЛИОТЕКА-ПЛАГИН net1 И ПРОТОКОЛЫ-ПЛАГИНЫ ------------------------------
+#
+# Решения владельца (plugin-sdk/docs/steer-abi.md, «Сервисы протоколам»; open.md, О-1): протоколы —
+# плагины, обновляются отдельно от ядра; общий для них сетевой стек — один плагин-библиотека `net1`
+# с одной libs2p-net.so.1, а не копия в каждом. Ядро держит свою копию TLS/QUIC и wolfSSL: резолвер
+# (DoH, DoH3, DoQ), замер групп (urltls.c), менеджер плагинов (httpc.c, wbhttps.c, подпись, untar) и
+# коннектор (exports-ext.lst) работают и без единого плагина, а обновление net1 в фоне не должно
+# ронять DNS роутера.
+#
+#   libsteer.so.<версия>  PROFILE_libsteer: модель, виды, разбор команд, линия событий, TLS 1.3,
+#                         REALITY, HTTP/2, ECH, корни, HTTP-клиент, слой примитивов, QUIC (+DoQ).
+#                         Стека TUN, транспортов и разбора ссылок узлов в ядре больше нет;
+#   libs2p-net.so.1       PROFILE_net1: стек TUN, пул узлов, гео, транспорты, разбор ссылок, та же
+#                         TLS/REALITY/HTTP/2/QUIC (второй экземпляр тех же исходников) и wolfSSL с
+#                         ngtcp2 внутри, скрытые. Наружу — только имена s2p_* (build/net1/
+#                         libs2p-net.map, LIBS2P_NET_1): имена исходников переименовывает заголовок,
+#                         порождённый из карты (build/build-libs.sh), так что ни один символ net1
+#                         не совпадает с libsteer и libsteer-wolfssl в процессе steerd;
+#   plugins/<id>/bin/<id> протоколы: код протокола + разбор спеки (PLUGIN_BASE_SRC, статически) +
+#                         DT_NEEDED libs2p-net.so.1 с RUNPATH $ORIGIN/../../net1/lib. С libsteer не
+#                         связаны. obfs стека не берёт и собирается целиком статически.
+#
+# NET1_BASE_SRC — то немногое из основы, что нужно самому стеку: платформа (пути, устройство TUN,
+# каталоги корней), профиль, линия событий, запуск ip, JSON и отказ (err.c). Оно живёт в net1 в ОДНОМ экземпляре
+# на процесс помощника и отдаётся наружу (s2p_plat, s2p_evline_emit…): иначе у плагина и у net1 было
+# бы по своей платформе, и выбор --platform или каталог состояния расходились бы между ними.
+NET1_BASE_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/run.c src/lib/jsonw.c src/lib/evline.c
+TUNNEL_SRC := src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/pool.c src/tunnel/geo.c src/tunnel/tun.c
+TRANSPORT_ONLY_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
+                      src/proto/transport/trsec.c src/proto/transport/trgrpc.c \
+                      src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c \
+                      src/proto/transport/trws.c src/proto/transport/trpath.c src/proto/transport/trvenc.c
+# TLS и всё, на чём он стоит, — ДВАЖДЫ: в ядре (для себя) и в net1 (для протоколов). Исходник один.
+TLS_CORE_SRC := src/proto/tls/chello.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
+                src/proto/tls/reality.c src/proto/tls/h2.c src/proto/tls/ech.c src/proto/tls/roots.c \
+                src/proto/tls/httpc.c src/proto/warp/wbhttps.c src/proto/warp/wbjson.c $(CRYPTO_SRC)
+NET1_QUIC_SRC := src/proto/quic/quic.c src/proto/quic/qcssl.c
+# Свой файл net1: версия ABI и отпечаток раскладки (src/net1/s2pnet.h).
+NET1_OWN_SRC := src/net1/s2pnet.c
+PROFILE_net1 := $(TUNNEL_SRC) $(TRANSPORT_ONLY_SRC) $(SUBLINK_SRC) $(TLS_CORE_SRC) $(NET1_QUIC_SRC) \
+                $(NET1_BASE_SRC) $(NET1_OWN_SRC)
+# Ядро 2.1. Множество — прежний LIBSTEER_SRC без стека, транспортов и sublink.c (tests/buildmatch.sh).
+PROFILE_libsteer := $(LIBSTEER_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC) \
+                    $(TLS_CORE_SRC) src/proto/tls/plughttp.c $(PLUGIN_PRIM_SRC) $(QUIC_SRC)
+# Основа плагина протокола: разбор спеки со всеми видами (помощник 2.0 читает спеку сам, steer-api
+# 1.4 — файл {conf} — придёт с реестром плагинов), разбор команд, обфускатор (его зовёт xsteer).
+# Множество NET1_BASE_SRC + PLUGIN_BASE_SRC без видов протоколов — ровно LIBSTEER_BASE_SRC.
+PLUGIN_BASE_SRC := $(MODEL_SPEC_SRC) src/proto/obfs/obfs.c src/cli/cli.c src/tools/hwid.c src/lib/ctlcall.c \
+                   $(KINDS_BASE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC)
+# Проверка ABI net1 при запуске помощника (src/net1/s2pcheck.c) — в каждом плагине на net1.
+NET1_CHECK_SRC := src/net1/s2pcheck.c
+PROFILE_plug_vless     := $(VLESS_MODULE_SRC) $(PLUGIN_BASE_SRC) $(NET1_CHECK_SRC)
+PROFILE_plug_hysteria2 := $(HY2_MODULE_SRC) $(PLUGIN_BASE_SRC) $(NET1_CHECK_SRC)
+PROFILE_plug_proxy     := $(PROXY_MODULE_SRC) $(PLUGIN_BASE_SRC) $(NET1_CHECK_SRC)
+PROFILE_plug_xsteer    := $(XSTEER_MODULE_SRC) $(PLUGIN_BASE_SRC) $(NET1_CHECK_SRC)
+PROFILE_plug_warpbox   := $(WARP_MODULE_SRC) $(PLUGIN_BASE_SRC) $(NET1_CHECK_SRC)
+# obfs: стек ему не нужен — статическая программа, основа net1 вкомпилирована своя.
+PROFILE_plug_obfs      := $(OBFS_MODULE_SRC) $(PLUGIN_BASE_SRC) $(NET1_BASE_SRC)
+# Плагины протоколов на net1 и без него (build/build-libs.sh, build.sh, tests/buildmatch.sh).
+PLUGINS_NET1 := vless hysteria2 proxy xsteer warpbox
+PLUGINS_STATIC := obfs
+
 # steer-box-connector (sing-box для podkop и forkop) живёт в своём репозитории
 # (github.com/splify2/steer-box-connector) и собирается build/ext-build.sh; нужные ему символы
 # libsteer — в build/exports-ext.lst.

@@ -1,0 +1,101 @@
+{
+  "schema": 1,
+  "id": "hysteria2",
+  "version": "@VERSION@",
+  "type": "plugin",
+  "name": "hysteria2",
+  "description": "Туннели hysteria2 (QUIC, Brutal)",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/splify2/steer",
+  "compat": {
+    "steer-api": "^1.0"
+  },
+  "arch": [
+    "aarch64_cortex-a53",
+    "aarch64_cortex-a72",
+    "aarch64_generic",
+    "arm_cortex-a7_neon-vfpv4",
+    "arm_cortex-a9",
+    "arm_cortex-a9_neon",
+    "arm_cortex-a9_vfpv3-d16",
+    "mipsel_24kc",
+    "mips_24kc",
+    "x86_64"
+  ],
+  "requires": {
+    "system": [
+      "kmod-tun"
+    ],
+    "kernel": [
+      "/dev/net/tun"
+    ],
+    "plugins": {
+      "net1": "^1.2"
+    }
+  },
+  "permissions": [
+    "net.admin",
+    "ctl",
+    "system-packages"
+  ],
+  "steer": {
+    "kinds": [
+      {
+        "name": "tunnel:hysteria2",
+        "keys": "kinds/hysteria2.schema.json",
+        "caps": [
+          "device",
+          "mark",
+          "ctmark",
+          "engine-owned",
+          "self-nat",
+          "over",
+          "tcp-probe",
+          "flow-udp",
+          "tcp-redir",
+          "ipv6"
+        ],
+        "helper": {
+          "prog": "bin/hysteria2",
+          "cmd": "hysteria2",
+          "argv": [
+            "hysteria2",
+            "{out}",
+            "--conf",
+            "{conf}"
+          ]
+        },
+        "health": "events"
+      }
+    ],
+    "commands": [
+      {
+        "name": "hysteria2-nodes",
+        "prog": "bin/hysteria2",
+        "help": "узлы подписки выхода",
+        "ctl": {
+          "timeout_s": 15,
+          "args": [
+            "name"
+          ],
+          "spec": true
+        }
+      },
+      {
+        "name": "hysteria2-probe",
+        "prog": "bin/hysteria2",
+        "help": "проверить узлы выхода",
+        "ctl": {
+          "timeout_s": 180,
+          "args": [
+            "name",
+            "int",
+            "int"
+          ],
+          "optional": 2,
+          "spec": true
+        }
+      }
+    ]
+  }
+}

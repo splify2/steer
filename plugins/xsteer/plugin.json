@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "id": "xsteer",
+  "version": "@VERSION@",
+  "type": "plugin",
+  "name": "xsteer",
+  "description": "Звезда xsteer: клиент хаба",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/splify2/steer",
+  "compat": {
+    "steer-api": "^1.0"
+  },
+  "arch": [
+    "aarch64_cortex-a53",
+    "aarch64_cortex-a72",
+    "aarch64_generic",
+    "arm_cortex-a7_neon-vfpv4",
+    "arm_cortex-a9",
+    "arm_cortex-a9_neon",
+    "arm_cortex-a9_vfpv3-d16",
+    "mipsel_24kc",
+    "mips_24kc",
+    "x86_64"
+  ],
+  "requires": {
+    "system": [
+      "kmod-tun"
+    ],
+    "kernel": [
+      "/dev/net/tun"
+    ],
+    "plugins": {
+      "net1": "^1.2"
+    }
+  },
+  "permissions": [
+    "net.admin",
+    "ctl",
+    "system-packages"
+  ],
+  "steer": {
+    "kinds": [
+      {
+        "name": "xsteer",
+        "keys": "kinds/xsteer.schema.json",
+        "caps": [
+          "device",
+          "mark",
+          "ctmark",
+          "engine-owned",
+          "self-nat",
+          "over"
+        ],
+        "helper": {
+          "prog": "bin/xsteer",
+          "cmd": "xsteer",
+          "argv": [
+            "xsteer",
+            "{out}",
+            "--conf",
+            "{conf}"
+          ]
+        },
+        "health": "events"
+      }
+    ],
+    "commands": [
+      {
+        "name": "xsteer-peers",
+        "prog": "bin/xsteer",
+        "help": "узлы звезды выхода"
+      },
+      {
+        "name": "xsteer-key",
+        "prog": "bin/xsteer",
+        "help": "новый ключ клиента"
+      },
+      {
+        "name": "xsteer-check",
+        "prog": "bin/xsteer",
+        "help": "проверить файл настройки"
+      },
+      {
+        "name": "xsteer-link",
+        "prog": "bin/xsteer",
+        "help": "ссылка на настройку"
+      }
+    ]
+  }
+}

@@ -23,6 +23,16 @@
 #include "evline.h"
 #include "jsonw.h"
 
+/* {conf} помощника плагина (src/modules/plugout.h): есть только в программе протокола; в статических
+ * сборках (телефон, стенды) ссылки пустые, и выход берётся из спеки, как всегда. */
+#include "plugout.h"
+#pragma weak plugconf_get
+#pragma weak plugconf_out
+static const struct plugconf *pconf(void) {
+    const struct plugconf *pc = plugconf_get ? plugconf_get() : NULL;
+    return pc && pc->active ? pc : NULL;
+}
+
 /* Без слова tunnel: подъём выхода и разбор подписки — это ещё не туннель. */
 #define LOG_W2 "steer[warn]: "
 #define LOG_I2 "steer[info]: "
@@ -101,6 +111,8 @@ static void underlay_setup(struct spec *sp, const struct output *o) {
         struct err e = {0};
         if (registry_assign(sp, &e) < 0) err_die(&e);
     }
+    const struct plugconf *pc = pconf();
+    if (pc) { transport_set_sock_mark(pc->sock_mark, pc->sock_mark_required); return; }
     transport_set_sock_mark(out_underlay_mark(sp, o ? o : &none), o && o->over[0]);
 }
 
@@ -544,5 +556,6 @@ int cmd_vless(const char *spec_path, const char *out_name) {
      * изнутри registry_assign. */
     struct err e = {0};
     if (registry_assign(sp, &e) < 0) err_die(&e);
+    if (plugconf_out) plugconf_out(o);    /* метка и таблица — из {conf}, а не из своей копии реестра */
     return vless_tunnel_run(o, &pc, vl_ready, NULL);
 }

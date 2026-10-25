@@ -82,7 +82,33 @@ const char *steer_module_dir(char *buf, size_t n) {
     return buf;
 }
 
+/* Каталог плагинов (plugin-sdk/docs/s2p.md, «Раскладка на роутере»). Имя переменной у менеджера
+ * (ветка plugin-mgr) — STEER_PLUGIN_DIR, у реестра видов (plugin-kind) — STEER_PLUGINS_ROOT; до их
+ * сведения годятся обе. */
+static const char *plugin_root(void) {
+    const char *e = getenv("STEER_PLUGIN_DIR");
+    if (e && *e) return e;
+    e = getenv("STEER_PLUGINS_ROOT");
+    if (e && *e) return e;
+    return "/usr/lib/steer/plugins";
+}
+
+/* Плагин протокола вместо модуля (раскладка 2.1, build/sources.mk): команды модуля steer-<id> ведёт
+ * программа <каталог плагинов>/<id>/bin/<id> — та же таблица команд, тот же разбор (cli/modcmd.c).
+ * Шов до реестра плагинов (ветка plugin-kind): там помощник и подкоманды берутся из манифеста. */
+static int plugin_path(const char *mod, char *buf, size_t n) {
+    if (strncmp(mod, "steer-", 6) != 0 || !mod[6]) return -1;
+    const char *id = mod + 6;
+    snprintf(buf, n, "%s/%s/bin/%s", plugin_root(), id, id);
+    return access(buf, X_OK) == 0 ? 0 : -1;
+}
+
 int steer_module_path(const char *mod, char *buf, size_t n) {
+    /* Каталог модулей, заданный стендом (STEER_MODULE_DIR), — первым: стенд подменяет модуль
+     * заглушкой и не должен получить настоящий плагин, если тот стоит на машине. Затем плагин, затем
+     * прежний модуль рядом с исполняемым файлом (раскладка 2.0 и ссылки steer-<id> сборки 2.1). */
+    const char *e = getenv("STEER_MODULE_DIR");
+    if (!(e && *e) && plugin_path(mod, buf, n) == 0) return 0;
     char dir[PATH_MAX];
     steer_module_dir(dir, sizeof(dir));
     snprintf(buf, n, "%s/%s", dir, mod);

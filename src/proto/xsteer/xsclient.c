@@ -49,6 +49,11 @@
 #include "evline.h"
 #include "ctlcall.h"
 
+/* {conf} помощника плагина (src/modules/plugout.h): только в программе протокола. */
+#include "plugout.h"
+#pragma weak plugconf_get
+#pragma weak plugconf_out
+
 #define LOG_W "steer[warn] xsteer: "
 #define LOG_I "steer[info] xsteer: "
 
@@ -737,7 +742,13 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
     /* Метка соединения с хабом — out_underlay_mark: метка выхода-цели при `via`, иначе обычное
      * «мимо каналов» (см. «вложенные выходы» в spec.h). После registry_assign — у цели метка
      * появляется там. Ставят её obfs_raw_open (поддельный TCP) и stream_dial (поток). */
-    obfs_set_sock_mark(out_underlay_mark(&cfg, o), o->over[0] != 0);
+    const struct plugconf *pcf = plugconf_get ? plugconf_get() : NULL;
+    if (pcf && pcf->active) {
+        /* Метка и таблица выхода, метка сокетов — из {conf}: своя копия реестра видит одну спеку
+         * из одного выхода, а не спеку ядра. */
+        if (plugconf_out) plugconf_out(o);
+        obfs_set_sock_mark(pcf->sock_mark, pcf->sock_mark_required);
+    } else obfs_set_sock_mark(out_underlay_mark(&cfg, o), o->over[0] != 0);
 
     static struct spoke s;
     s.out_name = o->name;

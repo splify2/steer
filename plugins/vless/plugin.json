@@ -1,0 +1,120 @@
+{
+  "schema": 1,
+  "id": "vless",
+  "version": "@VERSION@",
+  "type": "plugin",
+  "name": "VLESS",
+  "description": "Туннели VLESS и Reality",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/splify2/steer",
+  "compat": {
+    "steer-api": "^1.0"
+  },
+  "arch": [
+    "aarch64_cortex-a53",
+    "aarch64_cortex-a72",
+    "aarch64_generic",
+    "arm_cortex-a7_neon-vfpv4",
+    "arm_cortex-a9",
+    "arm_cortex-a9_neon",
+    "arm_cortex-a9_vfpv3-d16",
+    "mipsel_24kc",
+    "mips_24kc",
+    "x86_64"
+  ],
+  "requires": {
+    "system": [
+      "kmod-tun"
+    ],
+    "kernel": [
+      "/dev/net/tun"
+    ],
+    "plugins": {
+      "net1": "^1.2"
+    }
+  },
+  "permissions": [
+    "net.admin",
+    "http",
+    "ctl",
+    "system-packages"
+  ],
+  "steer": {
+    "kinds": [
+      {
+        "name": "tunnel:vless",
+        "keys": "kinds/vless.schema.json",
+        "caps": [
+          "device",
+          "mark",
+          "ctmark",
+          "engine-owned",
+          "self-nat",
+          "over",
+          "tcp-probe",
+          "flow-udp",
+          "tcp-redir",
+          "ipv6"
+        ],
+        "helper": {
+          "prog": "bin/vless",
+          "cmd": "vless",
+          "argv": [
+            "vless",
+            "{out}",
+            "--conf",
+            "{conf}"
+          ]
+        },
+        "health": "events",
+        "texts": {
+          "selfnat_why": "masquerade не нужен: туннель завершает TCP сам"
+        }
+      }
+    ],
+    "commands": [
+      {
+        "name": "vless-nodes",
+        "prog": "bin/vless",
+        "help": "узлы подписки выхода",
+        "ctl": {
+          "timeout_s": 15,
+          "args": [
+            "name"
+          ],
+          "spec": true
+        }
+      },
+      {
+        "name": "vless-probe",
+        "prog": "bin/vless",
+        "help": "проверить узлы выхода",
+        "ctl": {
+          "timeout_s": 180,
+          "args": [
+            "name",
+            "int",
+            "int"
+          ],
+          "optional": 2,
+          "spec": true
+        }
+      },
+      {
+        "name": "sub-fetch",
+        "prog": "bin/vless",
+        "help": "скачать подписку"
+      },
+      {
+        "name": "sub-quota",
+        "prog": "bin/vless",
+        "help": "остаток трафика подписки"
+      },
+      {
+        "name": "tls-probe",
+        "prog": "bin/vless",
+        "help": "проверить TLS узла"
+      }
+    ]
+  }
+}
