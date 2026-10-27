@@ -71,6 +71,14 @@ struct plugin_cmd {
     int ctl_lock;               /* изменяющая: в очереди с apply */
 };
 
+/* Служба из манифеста (steer.services[], manifest.md): один помощник на роутер, а не на выход. Поднимается
+ * тем же супервизором, что помощники выходов, пока плагин включён. */
+struct plugin_svc {
+    char *name;
+    const struct plugin *owner;
+    struct plugin_prog run;     /* prog, argv (умолчание — [<name>]), env, timeout_s — срок hello */
+};
+
 struct plugin_kind {
     const struct plugin *owner;
     char *name;                 /* как в манифесте: «warp», «xsteer», «tunnel:vless» */
@@ -116,6 +124,7 @@ struct plugin {
     char *why;                  /* почему не включён (для status и отказов); NULL — включён */
     struct plugin_cmd *cmd;  size_t cmd_n;
     struct plugin_kind **kind;  size_t kind_n;   /* в порядке манифеста */
+    struct plugin_svc *svc;  size_t svc_n;       /* steer.services[], в порядке манифеста */
     struct plugin_prog pre_apply;       /* prog NULL — хука нет */
     int has_hooks;              /* есть check, expand, pre_apply или ресурсы видов: от них зависит подготовка спеки */
     unsigned res_ports, res_queues, res_marks;   /* resources манифеста: сколько на весь плагин */
@@ -218,6 +227,13 @@ int plugin_kind_helper(const struct plugin_kind *pk, const struct spec *sp, cons
 /* Помощник, которого плагин даёт виду ЯДРА (kinds[] с impl: core и helper.when, manifest.md): запись
  * включённого плагина для вида kind и ключа key; NULL — такого плагина нет. */
 const struct plugin_kind *plugin_core_ext(const char *kind, const char *key);
+
+/* Службы включённых плагинов в порядке реестра (по id плагина, затем по порядку манифеста). */
+size_t plugin_svc_n(void);
+const struct plugin_svc *plugin_svc_at(size_t i);
+/* Помощник службы: программа плагина с раскрытым argv и подпись перезапуска (версия плагина, argv с
+ * выданными ресурсами, env). cmd помощника — имя службы. 0 / -1 (причина — в stderr). */
+int plugin_svc_helper(const struct plugin_svc *sv, const struct spec *sp, struct kind_helper *h);
 
 /* Помощник развёрнутого выхода (хук expand вернул helper: true): kind_ops.helper группы зовёт его. */
 int plugin_owner_helper(const struct spec *sp, const struct output *o, struct kind_helper *h);

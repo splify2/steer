@@ -68,7 +68,7 @@ static int sup_list(const char *spec, struct helper **outp, size_t *n) {
         struct err e = {0};
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         /* Помощников не больше выходов спеки (по одному на выход со своим процессом). */
-        struct helper *h = calloc(cfg.out_n + 1, sizeof(*h));
+        struct helper *h = calloc(helpers_max(&cfg), sizeof(*h));
         if (!h) _exit(1);
         /* Метки выходов — из реестра: без них out_underlay_mark в подписи вернул бы «мимо
          * каналов» при любой цели, и смена метки цели не была бы видна. Только при via (и у
@@ -78,10 +78,10 @@ static int sup_list(const char *spec, struct helper **outp, size_t *n) {
         int marks = 0, need = 0;
         for (size_t i = 0; i < cfg.out_n; i++)
             if (cfg.out[i].over[0]) { if (registry_assign(&cfg, &e) < 0) err_die(&e); marks = 1; break; }
-        size_t k = helpers_plan(&cfg, h, cfg.out_n + 1, &need);
+        size_t k = helpers_plan(&cfg, h, helpers_max(&cfg), &need);
         if (need && !marks) {
             if (registry_assign(&cfg, &e) < 0) err_die(&e);
-            k = helpers_plan(&cfg, h, cfg.out_n + 1, NULL);
+            k = helpers_plan(&cfg, h, helpers_max(&cfg), NULL);
         }
         if (fwrite(&k, sizeof(k), 1, w) != 1) _exit(1);
         for (size_t i = 0; i < k; i++) if (helper_write(w, &h[i]) != 0) _exit(1);

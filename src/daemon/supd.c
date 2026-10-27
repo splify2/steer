@@ -197,11 +197,13 @@ static struct helper *by_fd(struct supd *s, int fd) {
 static void emit_state(struct supd *s, const struct helper *h, const char *ev, const char *why) {
     char out[80], w[512], f[700];
     steerd_json_str(out, sizeof(out), h->name);
+    /* Служба плагина — не выход: подписчик, ждущий выход по "out", её за выход не примет. */
+    const char *key = h->service ? "service" : "out";
     if (why) {
         steerd_json_str(w, sizeof(w), why);
-        snprintf(f, sizeof(f), ",\"out\":%s,\"helper\":\"%s\",\"why\":%s", out, h->cmd, w);
+        snprintf(f, sizeof(f), ",\"%s\":%s,\"helper\":\"%s\",\"why\":%s", key, out, h->cmd, w);
     } else {
-        snprintf(f, sizeof(f), ",\"out\":%s,\"helper\":\"%s\"", out, h->cmd);
+        snprintf(f, sizeof(f), ",\"%s\":%s,\"helper\":\"%s\"", key, out, h->cmd);
     }
     steerd_emit(s->d, ev, f);
 }
@@ -210,7 +212,7 @@ static void emit_state(struct supd *s, const struct helper *h, const char *ev, c
  * устройство выхода создаёт наш процесс (vless, xsteer). Обфускатор и мост сторож о здоровье не
  * спрашивает — будить его их событиями незачем. */
 static void wake_watch(struct supd *s, const struct helper *h) {
-    if (!s->d->watch || !s->d->have) return;
+    if (!s->d->watch || !s->d->have || h->service) return;
     const struct output *o = out_by_name(s->d->sp, h->name);
     if (o && out_engine_managed(o)) watchd_helper_changed(s->d->watch);
 }
@@ -458,7 +460,11 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
         }
         if (!strcmp(e.ev, "hello")) return;
     }
-    if (!strcmp(e.ev, "up")) {
+    /* Служба говорит о себе: up/down — готова ли, state — переписан её файл состояния, ready — поднялась.
+     * Узлы, устройства, приговоры выходам и health у неё не бывают: чужое по смыслу пропускается. */
+    if (h->service && strcmp(e.ev, "up") && strcmp(e.ev, "down") && strcmp(e.ev, "state") && strcmp(e.ev, "ready"))
+        return;
+    if (!strcmp(e.ev, "up") || (h->service && !strcmp(e.ev, "ready"))) {
         st->up = 1;
         st->known = 1;
         st->said_down = 0;
@@ -466,7 +472,7 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
         st->since = (long)time(NULL);
         st->why[0] = '\0';
         const char *dev = evline_str(&e, "dev");
-        if (dev) route_up(s, h, dev);
+        if (dev && !h->service) route_up(s, h, dev);
         emit_state(s, h, "helper-up", NULL);
         wake_watch(s, h);
     } else if (!strcmp(e.ev, "down")) {
@@ -505,7 +511,7 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
         char out[80], id[96], f[200];
         steerd_json_str(out, sizeof(out), h->name);
         steerd_json_str(id, sizeof(id), h->plugin[0] ? h->plugin : "");
-        snprintf(f, sizeof(f), ",\"id\":%s,\"out\":%s", id, out);
+        snprintf(f, sizeof(f), ",\"id\":%s,\"%s\":%s", id, h->service ? "service" : "out", out);
         steerd_emit(s->d, "plugin-state", f);
     } else if (!strcmp(e.ev, "member")) {
         ev_member(s, h, &e);
@@ -1303,6 +1309,8 @@ static int start_one(struct helper *h, void *arg) {
             child_arm(s);
             child_fd3(p[1]);
             putenv("STEER_EVENT_FD=3");
+            /* Программа плагина — своё окружение (steer-api.md, 1.2): версии, id, каталоги; env манифеста после. */
+            if (h->plugin[0] && plugin_find(h->plugin)) plugin_env_set(plugin_find(h->plugin), NULL);
             helper_putenv(h);
             execv(path, (char *const *)av);
             _exit(127);
@@ -1353,7 +1361,7 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         if (h->evfd >= 0) { loop_fd_del(s->l, h->evfd); close(h->evfd); h->evfd = -1; }
         int was_up = h->st.up;
         /* Приговоры членам от этого процесса больше не правда (ev_member). */
-        if (h->name[0]) mv_drop_group(s, h->name);
+        if (h->name[0] && !h->service) mv_drop_group(s, h->name);
         /* Слушатель TCP модуля ушёл вместе с процессом (R-152): перенаправление к нему — снять. */
         if (h->st.bound[0]) tcp_redir_dev_gone(h->st.bound);
         h->st.running = 0;
@@ -1405,8 +1413,8 @@ static size_t supd_plan(struct supd *s) {
     helpers_launch_free(s->fresh, s->fresh_n);
     s->fresh_n = 0;
     if (!s->d->have || (s->enabled && !s->enabled())) return 0;
-    /* Помощников не больше выходов спеки + резолвер. */
-    size_t need = s->d->sp->out_n + 1;
+    /* Помощников не больше выходов спеки, служб плагинов и резолвера. */
+    size_t need = helpers_max(s->d->sp);
     if (need > s->fresh_cap) {
         struct helper *nf = realloc(s->fresh, need * sizeof(*nf));
         if (!nf) return 0;
@@ -1571,7 +1579,7 @@ const struct helper_state *helper_state_of(const struct steerd *d, const char *o
     if (!s || !out) return NULL;
     for (size_t i = 0; i < s->set.n; i++) {
         const struct helper *h = &s->set.h[i];
-        if (!h->table && !h->gone && !strcmp(h->name, out)) return &h->st;
+        if (!h->table && !h->service && !h->gone && !strcmp(h->name, out)) return &h->st;
     }
     return NULL;
 }
@@ -1580,7 +1588,7 @@ int supd_restart(struct supd *s, const char *out, const char *cmd) {
     if (!s || s->stopping || !out || !cmd) return -1;
     for (size_t i = 0; i < s->set.n; i++) {
         struct helper *h = &s->set.h[i];
-        if (h->table || h->gone || strcmp(h->name, out) || strcmp(h->cmd, cmd)) continue;
+        if (h->table || h->service || h->gone || strcmp(h->name, out) || strcmp(h->cmd, cmd)) continue;
         if (h->pid) {
             /* Уже гасится (новые параметры или прошлая просьба) — поднимется сразу и так. */
             if (!h->restart) {
@@ -1627,7 +1635,7 @@ static int probe_mem(const char *out, struct probe_status *ps) {
         const struct helper *h = &s->set.h[i];
         /* Помощник, который перебирает узлы, говорит о переборе событиями node/nonode/excluded/down
          * (evline.h) — по ним он и узнаётся, а не по имени команды. */
-        if (h->table || h->gone || strcmp(h->name, out) || !h->picks) continue;
+        if (h->table || h->service || h->gone || strcmp(h->name, out) || !h->picks) continue;
         ps->state = probe_of(h, &ps->node, &ps->total);
         ps->since = 0;
         ps->why[0] = '\0';
@@ -1683,8 +1691,8 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
         const struct helper_state *st = &h->st;
         char nj[80], wj[512];
         steerd_json_str(nj, sizeof(nj), h->name);
-        fprintf(out, "{\"schema\":1,\"out\":%s,\"helper\":\"%s\",\"running\":%s,\"up\":%s",
-                nj, h->cmd, st->running ? "true" : "false", st->up ? "true" : "false");
+        fprintf(out, "{\"schema\":1,\"%s\":%s,\"helper\":\"%s\",\"running\":%s,\"up\":%s",
+                h->service ? "service" : "out", nj, h->cmd, st->running ? "true" : "false", st->up ? "true" : "false");
         fprintf(out, ",\"since\":%ld,\"started\":%ld,\"restarts\":%u", st->since, st->started,
                 st->restarts);
         if (st->why[0]) {

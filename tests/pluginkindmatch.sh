@@ -80,7 +80,10 @@ set private4 {
 }
 chain postrouting-post {
   ip daddr @private4 return
-  iifname @lan_dev counter
+  iifname @lan_dev oifname @wan_dev counter
+}
+chain output-raw {
+  meta mark & 0x00000001 == 0x00000001 notrack
 }
 EOF
 printf '#!/bin/sh\necho "hello from plugin: $*"\n' > "$ROOT/fakeplug/bin/hello"
@@ -183,6 +186,10 @@ has "  ссылка @набор переименована" "$rs" "ip daddr @p_f
 has "  набор ядра lan_dev заведён" "$rs" "set lan_dev {"
 has "  слот postrouting-post — после NAT" "$rs" "chain plugin_postrouting-post {"
 has "  с приоритетом srcnat + 20" "$rs" "priority srcnat + 20"
+has "  набор ядра wan_dev заведён" "$rs" "set wan_dev {"
+has "  слот output-raw — до conntrack" "$rs" "chain plugin_output-raw {"
+has "  с хуком output и приоритетом raw + 1" "$rs" "type filter hook output priority raw + 1"
+has "  notrack в слоте" "$rs" "notrack"
 if command -v unshare >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 && unshare -rn true 2>/dev/null; then
     printf '%s\n' "$rs" > "$tmp/rules.nft"
     nout="$(unshare -rn nft -c -f "$tmp/rules.nft" 2>&1)"
@@ -197,6 +204,7 @@ has "nft-map: таблица" "$map" '"table":"steer","family":"inet"'
 has "nft-map: поле метки" "$map" '"mask":"0x0ff00000"'
 has "nft-map: цепочка ядра с приоритетом числом" "$map" '{"name":"prerouting_mark","type":"filter","hook":"prerouting","priority":-149}'
 has "nft-map: слот" "$map" '{"name":"prerouting-pre","chain":"plugin_prerouting-pre","type":"filter","hook":"prerouting","priority":-150}'
+has "nft-map: слот output-raw — до conntrack (-200)" "$map" '"name":"output-raw","chain":"plugin_output-raw","type":"filter","hook":"output","priority":-299'
 has "nft-map: слот после NAT" "$map" '"name":"postrouting-post","chain":"plugin_postrouting-post","type":"filter","hook":"postrouting","priority":120'
 # Карта не должна расходиться с настоящим набором правил: приоритет каждой цепочки, которую печатает
 # компилятор, равен числу из карты.
@@ -222,7 +230,7 @@ while read -r n p; do
 done < "$tmp/real.txt"
 check "nft-map: приоритеты цепочек ядра совпадают с набором правил" "" "$miss"
 
-has "version --json: версия steer-api, по которой плагины сверяют compat" "$("$BIN" version --json 2>&1)" '"api":"1.1","abi":"1.0"'
+has "version --json: версия steer-api, по которой плагины сверяют compat" "$("$BIN" version --json 2>&1)" '"api":"1.2","abi":"1.0"'
 
 # ================= 5. подкоманда из манифеста ===========================================================
 check "подкоманда плагина исполняется" "hello from plugin: hello a b" "$("$BIN" fake-hello a b 2>&1)"
@@ -279,7 +287,7 @@ cat > "$ROOT/clash/plugin.json" <<'EOF'
   "steer": { "commands": [{ "name": "apply", "prog": "bin/x" }, { "name": "fake-hello", "prog": "bin/x" }] } }
 EOF
 st="$(stat ok)"
-has "несовместимый steer-api: плагин выключен с числами" "$st" 'oldapi 1.0.0 требует steer-api ^2.0, у ядра 1.1'
+has "несовместимый steer-api: плагин выключен с числами" "$st" 'oldapi 1.0.0 требует steer-api ^2.0, у ядра 1.2'
 has "имя команды ядра плагину не даётся" "$st" 'подкоманда apply — команда ядра'
 check "  команда ядра осталась ядру" "table" "$("$BIN" apply --dry-run --spec "$tmp/ok.yaml" 2>&1 | head -1 | cut -d' ' -f1)"
 rm -rf "$ROOT/oldapi" "$ROOT/clash"
