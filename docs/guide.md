@@ -63,10 +63,10 @@ opkg install ./steer-core-<версия>-1_<арх>.ipk ./steer-vless-<верс�
 ### Обновление с 2.0.x на 2.1
 
 `steer-core` 2.1.0 сам снимает пакеты `steer-vless`, `steer-hysteria2`, `steer-proxy`, `steer-xsteer`,
-`steer-obfs`, `steer-warpbox` и `steer-extended`: протоколы теперь плагины, они ставятся из семени в самом
-пакете ядра, без сети, по видам выходов вашей спеки. Мост `steer-tgws` остаётся пакетом и обновляется
-вместе с ядром — ставьте оба в одной команде (`apk add --allow-untrusted ./steer-core-….apk ./steer-tgws-….apk`;
-с одним ядром при стоящем `steer-tgws` 2.0.x apk откажет). Если прежние пакеты ставились файлами и apk отвечает
+`steer-obfs`, `steer-warpbox`, `steer-tgws` и `steer-extended`: протоколы теперь плагины, они ставятся из семени
+в самом пакете ядра, без сети, по видам выходов вашей спеки. Мост Telegram — тоже плагин (`tgws`), но из
+репозитория `splify2-extended-plugins`: в семени ядра его нет, ставьте его из вкладки «Плагины» splify2 или
+`steer plugin install tgws` (выход `kind: tgws` до этого — недоступен). Если прежние пакеты ставились файлами и apk отвечает
 `breaks: world[steer-core><Q1…]`, назовите прежние модули в той же команде
 (`… steer-vless steer-xsteer`) или уберите закрепления способом ниже.
 
@@ -104,7 +104,6 @@ awk 'FILENAME==ARGV[1]{if($0~/^C:/){c=substr($0,3);if(p!="")i[p]=c}else if($0~/^
 | `steer-vless` | Клиент VLESS/Reality: если туннель должен поднимать само ядро — ссылка подписки или отдельные ссылки `vless://`. |
 | `steer-xsteer` | Клиент звезды xsteer. |
 | `steer-obfs` | Обфускатор: WireGuard поверх поддельного TCP. |
-| `steer-tgws` | Мост Telegram. |
 | `steer-hysteria2` | Клиент hysteria2 (QUIC, Brutal, Salamander, прыжки по портам): ссылки `hysteria2://` или конфиг Xray-core в подписке ([docs/hysteria2.md](hysteria2.md)). В `steer-extended` не входит — ставится отдельно. |
 | `steer-proxy` | Клиенты trojan, shadowsocks, socks, http и vmess ([docs/proxy.md](proxy.md)). В `steer-extended` не входит — ставится отдельно. |
 | `steer-warpbox` | Cloudflare WARP выходом `kind: warp`: регистрация, подбор точек, замена ([docs/warp.md](warp.md)). Нужен модуль ядра `kmod-amneziawg` или `kmod-wireguard`. В `steer-extended` не входит — ставится отдельно. |
@@ -340,8 +339,8 @@ sing-box». `steer srs-read` печатает набор нашим синтак
 Протоколы приходят плагинами (`/usr/lib/steer/plugins/<id>/`, ставит `steer plugin`): помощников их
 выходов демон поднимает программой плагина, а команды протоколов (`vless-nodes`, `sub-fetch`,
 `xsteer-key`, `obfs-server` и другие) объявляет манифест плагина — `steerd` запускает его программу с
-теми же словами, выводом и кодом возврата; нет плагина — нет и команды. Мост Telegram — модуль
-`steer-tgws` рядом с `steerd`. `steer` — маленький клиент: команды, на которые отвечает демон
+теми же словами, выводом и кодом возврата; нет плагина — нет и команды. Мост Telegram — тоже плагин
+(`tgws`, репозиторий `splify2-extended-plugins`). `steer` — маленький клиент: команды, на которые отвечает демон
 (`status`, `diag`, `explain`, `conns`, `dns-log`, `apply`, `reload`, `subscribe`), он посылает в
 сокет демона и печатает ответ с тем же выводом и кодом возврата, что у одноимённой подкоманды ядра; всё
 остальное — и любую команду, когда демон не запущен, — исполняет `steerd`. `steer-tools` —
