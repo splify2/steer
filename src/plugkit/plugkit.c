@@ -47,8 +47,12 @@ static void cpy(char *dst, size_t n, const char *s) { snprintf(dst, n, "%s", s ?
 
 int pk_conf_load(const char *path, struct pk_out *o, char *err, size_t errn) {
     memset(o, 0, sizeof(*o));
-    o->doc = pkj_load(path, err, errn);
-    if (!o->doc) return -1;
+    char e2[256];
+    o->doc = pkj_load(path, e2, sizeof e2);
+    if (!o->doc) {
+        snprintf(err, errn, "файл настройки выхода не читается — %s", e2);
+        return -1;
+    }
     const struct pkj *out = pkj_get(o->doc, "output"), *paths = pkj_get(o->doc, "paths");
     const char *name = pkj_str(pkj_get(out, "name")), *kind = pkj_str(pkj_get(out, "kind"));
     if (!name || !kind) {

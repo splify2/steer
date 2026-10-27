@@ -84,5 +84,11 @@
         "conf": true
       }
     ]
+  },
+  "i18n": {
+    "languages": [
+      "ru",
+      "en"
+    ]
   }
 }

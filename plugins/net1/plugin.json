@@ -28,5 +28,11 @@
       "file": "lib/libs2p-net.so.1",
       "abi": "1.3"
     }
-  ]
+  ],
+  "i18n": {
+    "languages": [
+      "ru",
+      "en"
+    ]
+  }
 }

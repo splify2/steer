@@ -162,7 +162,27 @@ static const struct plugin_embed_file f_vless[] = {
     "        \"usage\": \"ХОСТ[:ПОРТ] [--out АДРЕС] [--node ПОРТ]\"\n"
     "      }\n"
     "    ]\n"
+    "  },\n"
+    "  \"i18n\": {\n"
+    "    \"languages\": [\n"
+    "      \"ru\",\n"
+    "      \"en\"\n"
+    "    ]\n"
     "  }\n"
+    "}\n"
+    },
+    { "i18n/en.json",
+    ""
+    "{\n"
+    "  \"plugin.name\": \"VLESS\",\n"
+    "  \"plugin.description\": \"VLESS and REALITY tunnels\"\n"
+    "}\n"
+    },
+    { "i18n/ru.json",
+    ""
+    "{\n"
+    "  \"plugin.name\": \"VLESS\",\n"
+    "  \"plugin.description\": \"Туннели VLESS и REALITY\"\n"
     "}\n"
     },
     { "kinds/vless.schema.json",
@@ -401,7 +421,27 @@ static const struct plugin_embed_file f_xsteer[] = {
     "        \"usage\": \"[<файл|ссылка|->] [--config ФАЙЛ] [--name ИМЯ]\"\n"
     "      }\n"
     "    ]\n"
+    "  },\n"
+    "  \"i18n\": {\n"
+    "    \"languages\": [\n"
+    "      \"ru\",\n"
+    "      \"en\"\n"
+    "    ]\n"
     "  }\n"
+    "}\n"
+    },
+    { "i18n/en.json",
+    ""
+    "{\n"
+    "  \"plugin.name\": \"xsteer\",\n"
+    "  \"plugin.description\": \"xsteer star: hub client\"\n"
+    "}\n"
+    },
+    { "i18n/ru.json",
+    ""
+    "{\n"
+    "  \"plugin.name\": \"xsteer\",\n"
+    "  \"plugin.description\": \"Звезда xsteer: клиент хаба\"\n"
     "}\n"
     },
     { "kinds/xsteer.schema.json",
@@ -485,7 +525,27 @@ static const struct plugin_embed_file f_obfs[] = {
     "        }\n"
     "      }\n"
     "    ]\n"
+    "  },\n"
+    "  \"i18n\": {\n"
+    "    \"languages\": [\n"
+    "      \"ru\",\n"
+    "      \"en\"\n"
+    "    ]\n"
     "  }\n"
+    "}\n"
+    },
+    { "i18n/en.json",
+    ""
+    "{\n"
+    "  \"plugin.name\": \"WireGuard obfuscator\",\n"
+    "  \"plugin.description\": \"WireGuard over fake TCP for interface outputs\"\n"
+    "}\n"
+    },
+    { "i18n/ru.json",
+    ""
+    "{\n"
+    "  \"plugin.name\": \"Обфускатор WireGuard\",\n"
+    "  \"plugin.description\": \"WireGuard поверх поддельного TCP для выходов interface\"\n"
     "}\n"
     },
     { NULL, NULL },

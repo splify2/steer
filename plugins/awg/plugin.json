@@ -29,5 +29,11 @@
         "impl": "core"
       }
     ]
+  },
+  "i18n": {
+    "languages": [
+      "ru",
+      "en"
+    ]
   }
 }

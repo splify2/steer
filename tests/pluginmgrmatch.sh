@@ -154,7 +154,7 @@ export STEER_PLUGIN_AUTO=0
 P() { "$BIN" plugin "$@"; }
 
 # ---- версия ядра для оси compat ----
-check "steer version --json: core, api, abi" "2.1.0 1.0 1.0" \
+check "steer version --json: core, api, abi" "2.1.0 1.1 1.0" \
     "$("$BIN" version --json | jq_ 'd["core"]+" "+d["api"]+" "+d["abi"]')"
 
 # ---- каталог ----

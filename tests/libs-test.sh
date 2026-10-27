@@ -444,6 +444,21 @@ else
     echo "libs-test: нет $BUILD/abihost (make build/abihost) — net1 в процессе steerd не проверена"
 fi
 
+# ---- тест совместимости SDK со стороной ядра (plugin-sdk: tests/compat/steer-2.1) ---------------------
+# Заглушка ядра steer-api 1.1 гоняет каждый протокольный плагин раскладки: compat, хуки check/expand, hello
+# помощника, --conf у подкоманд. SDK — рядом с деревом (PLUGIN_SDK, ../plugin-sdk) или в хабе; нет — пропуск.
+SDK="${PLUGIN_SDK:-../plugin-sdk}"
+[ -f "$SDK/tests/compat/steer-2.1/host.py" ] || SDK=/home/yo1nk/splicicd/plugin-sdk
+if [ -f "$SDK/tests/compat/steer-2.1/host.py" ] && command -v python3 >/dev/null 2>&1; then
+    for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do
+        o="$(sh "$SDK/tests/compat/run.sh" --steer "$L/plugins/$q" 2>&1)"; r=$?
+        check "SDK steer-2.1: плагин $q совместим с ядром (tests/compat/run.sh --steer)" "0" "$r"
+        [ "$r" = 0 ] || printf '%s\n' "$o" | grep -A1 '^FAIL' | sed 's/^/    /'
+    done
+else
+    echo "libs-test: SDK с tests/compat/steer-2.1 не найден — тест совместимости плагинов пропущен"
+fi
+
 # ---- QUIC в раскладке пакета (шаг 7) ---------------------------------------------------------------
 # Клиент замера (tests/qcbench.c — он же «потребитель», чьи символы дали qc_* в списке экспорта)
 # линкуется с настоящей libsteer.so и ходит через настоящую libsteer-wolfssl.so, то есть на ту

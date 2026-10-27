@@ -3,12 +3,13 @@
 #
 # Ядро — каталог, в котором ТОЛЬКО steerd и его библиотеки (ни steer-vless, ни ссылок рядом), плагины —
 # отдельный каталог в раскладке роутера (<корень>/<id>/bin/<id>, <корень>/net1/lib/libs2p-net.so.1),
-# STEER_PLUGIN_DIR указывает на него (src/lib/module.c). Проверяется:
-#   • без плагина команда протокола и вид в спеке отвечают отказом «нужен пакет», с плагином — работают,
-#     и steerd отдаёт команду программе плагина (hello называет её);
+# STEER_PLUGINS_ROOT указывает на него (src/kinds/plugin.c). Проверяется:
+#   • без плагина команды протокола нет («нет такой команды»), вид в спеке — отказ «нужен плагин» (имя —
+#     из индекса семени), с плагином — работают, и steerd отдаёт команду программе плагина;
 #   • программа плагина находит net1 сама (RUNPATH $ORIGIN/../../net1/lib, без LD_LIBRARY_PATH) и не
 #     связана с libsteer;
-#   • `--conf {conf}` помощника (src/modules/plugconf.h) даёт то же, что `--spec`;
+#   • программа знает выход только из {conf} (`--conf`, src/plugkit): `--spec` она не принимает, а
+#     подкоманду по имени выхода ядро исполняет с {conf} этого выхода — то же, что программа с {conf};
 #   • под root — настоящий туннель VLESS (tests/run-tunnel.sh) с ядром из этого каталога и плагином
 #     из каталога плагинов;
 #   • QEMU=1 — то же на стенде OpenWrt (tools/vmrouter хаба: VMR=путь к vmrouter.sh) сборкой musl
@@ -42,7 +43,7 @@ for d in plugins/*/; do
 done
 CORE="$W/core/steerd"
 P="$W/plugins"
-run_core() { _d="$1"; shift; env -u STEER_MODULE_DIR LD_LIBRARY_PATH="$W/core" STEER_PLUGIN_DIR="$_d" STEER_PLUGINS_ROOT="$_d" STEER_PLUGINS_ETC="$W/petc" "$CORE" "$@"; }
+run_core() { _d="$1"; shift; env -u STEER_MODULE_DIR LD_LIBRARY_PATH="$W/core" STEER_PLUGINS_ROOT="$_d" STEER_PLUGINS_ETC="$W/petc" "$CORE" "$@"; }
 
 U=11111111-2222-3333-4444-555555555555
 printf 'vless://%s@192.0.2.1:443?security=tls&sni=a.test#A\nvless://%s@192.0.2.2:443?security=none&type=tcp#B\n' "$U" "$U" > "$W/sub.txt"
@@ -57,11 +58,13 @@ SPEC
 
 # ---- без плагина -------------------------------------------------------------------------------
 o="$(run_core "$W/none" vless-nodes "$W/sub.txt" 2>&1)"; r=$?
-check "без плагина: steerd vless-nodes — код 2 и «нужен пакет steer-vless»" "2 1" \
-    "$r $(printf '%s' "$o" | grep -c 'нужен пакет steer-vless')"
-o="$(run_core "$W/none" apply --dry-run --spec "$W/etc/spec.yaml" --state-dir "$W/st0" 2>&1)"
-# Раскладка плагинов есть, плагина нет — apply отказывает словами «нужен плагин» (реестр видов,
-# src/kinds/plugin.c; при старте демона такой выход живёт по on_fail).
+check "без плагина: steerd vless-nodes — код 2 и «нет такой команды»" "2 1" \
+    "$r $(printf '%s' "$o" | grep -c 'нет такой команды')"
+mkdir -p "$W/seed"
+printf '{"plugins":{"vless":{"versions":[{"version":"%s","provides":{"kinds":["tunnel:vless"]}}]}}}\n' "$VER" > "$W/seed/index.json"
+o="$(STEER_PLUGIN_SEED="$W/seed" run_core "$W/none" apply --dry-run --spec "$W/etc/spec.yaml" --state-dir "$W/st0" 2>&1)"
+# Плагина нет — apply отказывает словами «нужен плагин» (кто даёт вид — из provides.kinds индекса семени;
+# при старте демона такой выход живёт по on_fail).
 check "  спека с vless — отказ «нужен плагин vless»" "1" \
     "$(printf '%s' "$o" | grep -c 'нужен плагин vless')"
 
@@ -71,10 +74,9 @@ b="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes "$W/sub.txt" 2>&1; 
 check "с плагином: steerd vless-nodes отвечает как программа плагина (вывод и код)" "$b" "$a"
 check "  и это перечень узлов, а не отказ" "1 0" \
     "$(printf '%s' "$a" | grep -c '"name":"B"') $(printf '%s' "$a" | grep -c 'нужен пакет')"
-h="$(STEER_EVENT_FD=3 env -u STEER_MODULE_DIR LD_LIBRARY_PATH="$W/core" STEER_PLUGIN_DIR="$P" STEER_PLUGINS_ROOT="$P" STEER_PLUGINS_ETC="$W/petc" \
-    "$CORE" hysteria2 x --spec /nonexistent 3>&1 >/dev/null 2>&1 | head -1)"
-check "steerd hysteria2 исполняет плагин: hello от программы плагина" "1" \
-    "$(printf '%s' "$h" | grep -c '"ev":"hello".*"mod":"hysteria2"')"
+a="$(run_core "$P" vless-nodes vl --spec "$W/etc/spec.yaml" --state-dir "$W/st1" 2>&1; echo "rc=$?")"
+check "steerd vless-nodes <выход>: ядро даёт программе {conf} выхода — перечень его узлов" "1 rc=0" \
+    "$(printf '%s' "$a" | grep -c '"output":"vl".*"name":"B"') $(printf '%s' "$a" | tail -1)"
 o="$(run_core "$P" apply --dry-run --spec "$W/etc/spec.yaml" --state-dir "$W/st1" 2>&1)"
 check "  спека с vless и hysteria2 принимается: виды плагинов, без «нужен плагин»" "0 0" \
     "$(printf '%s' "$o" | grep -c 'требует пакет') $(printf '%s' "$o" | grep -c 'нужен плагин')"
@@ -99,7 +101,7 @@ mv "$W/net1.away" "$P/net1"
 # ---- --conf {conf} -------------------------------------------------------------------------------
 mkdir -p "$W/pst"
 cat > "$W/vl.json" <<CONF
-{"api":"1.0","plugin":{"id":"vless","version":"x"},
+{"api":"1.1","plugin":{"id":"vless","version":"x"},
  "output":{"name":"vl","kind":"tunnel:vless","keys":{"subscription":"$W/sub.txt"},"device":"","mark":"0x00300000",
            "mark_mask":"0x0ff00000","table":302,"ipv6":true,"on_fail":"drop","over":null,"sock_mark":"0x00000000",
            "sock_mark_required":false,"tcp_port":0,"ports":[],"queues":[]},
@@ -107,17 +109,19 @@ cat > "$W/vl.json" <<CONF
  "platform":"openwrt"}
 CONF
 a="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes vl --conf "$W/vl.json" 2>&1; echo "rc=$?")"
-b="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes vl --spec "$W/etc/spec.yaml" --state-dir "$W/st2" 2>&1; echo "rc=$?")"
-# Помощник знает о выходе только {conf}: спеки человека и каталогов ядра (их в {conf} нарочно нет на
-# диске) он не читает — перечень тот же, что по спеке.
-check "--conf {conf}: выход только из {conf}, без спеки человека — то же, что --spec" "$b" "$a"
+b="$(run_core "$P" vless-nodes vl --spec "$W/etc/spec.yaml" --state-dir "$W/st2" 2>&1; echo "rc=$?")"
+# Программа знает о выходе только {conf}: спеки человека и каталогов ядра (их в {conf} нарочно нет на
+# диске) она не читает — перечень тот же, что у ядра, давшего ей {conf} по спеке.
+check "--conf {conf}: выход только из {conf}, без спеки человека — то же, что через ядро" "$b" "$a"
+o="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes vl --spec "$W/etc/spec.yaml" 2>&1)"; r=$?
+check "  --spec программа плагина не принимает (код 2)" "2 1" "$r $(printf '%s' "$o" | grep -c -- '--spec')"
 check "  и это перечень узлов выхода" "1" "$(printf '%s' "$a" | grep -c '"name":"A"')"
 o="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes vl --conf "$W/nope.json" 2>&1)"; r=$?
-check "--conf без файла — код 2 со словами" "2 1" "$r $(printf '%s' "$o" | grep -c 'файл настройки выхода не читается')"
+check "--conf без файла — код 2 со словами" "2 1" "$r $(printf '%s' "$o" | grep -c 'не читается')"
 
 # hysteria2 по {conf}: ключи пула (silence) и снятый IPv6 доходят до разбора, узел честно не отвечает.
 cat > "$W/pst/hy.json" <<CONF
-{"api":"1.0","plugin":{"id":"hysteria2","version":"x"},
+{"api":"1.1","plugin":{"id":"hysteria2","version":"x"},
  "output":{"name":"hy","kind":"tunnel:hysteria2","keys":{"subscription":"$W/hy.txt","silence":30},"device":"",
            "mark":"0x00300000","table":302,"ipv6":false,"sock_mark":"0x00000000","sock_mark_required":false,"tcp_port":0},
  "paths":{"plugin_state":"$W/pst"},"platform":"openwrt"}
@@ -125,12 +129,12 @@ CONF
 o="$(timeout 30 env -u LD_LIBRARY_PATH "$P/hysteria2/bin/hysteria2" hysteria2 hy --conf "$W/pst/hy.json" 2>&1)"
 check "hysteria2 --conf: выход из {conf} разобран, узлы подписки перебраны" "1 1" \
     "$(printf '%s' "$o" | grep -c 'узлов 1 (пропущено 0') $(printf '%s' "$o" | grep -c 'ни один узел подписки не отвечает')"
-check "  спека из одного выхода — в каталоге плагина, с ipv6: off и ключами вида" "1" \
-    "$(grep -c '"protocol":"hysteria2","ipv6":"off","subscription":"[^"]*","silence":30' "$W/pst/hy.spec.json")"
+check "  модели спеки ядра у программы нет: ничего, кроме файла состояния, она не пишет" "hy.json hy.status.json" \
+    "$(ls "$W/pst" | grep '^hy' | tr '\n' ' ' | sed 's/ $//')"
 
 # ---- настоящий туннель под root -------------------------------------------------------------------
 if [ "$(id -u)" = 0 ] && command -v python3 >/dev/null 2>&1; then
-    o="$(STEER="$CORE" LD_LIBRARY_PATH="$W/core" STEER_PLUGIN_DIR="$P" STEER_PLUGINS_ROOT="$P" STEER_PLUGINS_ETC="$W/petc" sh tests/run-tunnel.sh 2>&1)"; r=$?
+    o="$(STEER="$CORE" LD_LIBRARY_PATH="$W/core" STEER_PLUGINS_ROOT="$P" STEER_PLUGINS_ETC="$W/petc" sh tests/run-tunnel.sh 2>&1)"; r=$?
     check "туннель VLESS: ядро без модулей рядом, плагин из каталога плагинов (tests/run-tunnel.sh)" "0" "$r"
     [ "$r" = 0 ] || printf '%s\n' "$o" | tail -15 | sed 's/^/    /'
     # Демон с супервизором: виды tunnel:vless — из манифеста плагина (реестр, src/kinds/plugin.c),
@@ -138,8 +142,8 @@ if [ "$(id -u)" = 0 ] && command -v python3 >/dev/null 2>&1; then
     # (два выхода vless, закрытие соединений узлом на скорости) — на ядре без модулей рядом.
     mkdir -p "$W/sp"
     cp "$W/core/"* "$W/sp/"
-    ln -s "$P/vless/bin/vless" "$W/sp/steer-vless"      # sigpipe.sh проверяет, что раскладка есть
-    o="$(LIBS="$W/sp" STEER_PLUGINS_ROOT="$P" STEER_PLUGIN_DIR="$P" STEER_PLUGINS_ETC="$W/petc" sh tests/sigpipe.sh 2>&1)"; r=$?
+    cp -R "$P" "$W/sp/plugins"
+    o="$(LIBS="$W/sp" STEER_PLUGINS_ETC="$W/petc" sh tests/sigpipe.sh 2>&1)"; r=$?
     check "демон: выходы вида плагина vless, помощник по манифесту с {conf} (tests/sigpipe.sh)" "0 1" \
         "$r $(printf '%s\n' "$o" | tail -1 | grep -c ', 0 fail$')"
     [ "$r" = 0 ] || printf '%s\n' "$o" | grep -v '^ *ok\|^узел' | tail -15 | sed 's/^/    /'
@@ -168,14 +172,14 @@ if [ "${QEMU:-0}" = 1 ]; then
         sh "$VMR" put "$W/q.tgz" /tmp/plugnet1/q.tgz >/dev/null 2>&1
         R="$(sh "$VMR" ssh 'cd /tmp/plugnet1 && tar -xzf q.tgz && Q=/tmp/plugnet1 &&
             echo "direct:$(plugins/vless/bin/vless vless-nodes $Q/sub.txt 2>&1 | grep -c "\"name\":\"B\"")" &&
-            echo "core:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGIN_DIR=$Q/plugins STEER_PLUGINS_ROOT=$Q/plugins STEER_PLUGINS_ETC=$Q/petc core/steerd vless-nodes $Q/sub.txt 2>&1 | grep -c "\"name\":\"B\"")" &&
-            echo "none:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGIN_DIR=/nonexistent STEER_PLUGINS_ROOT=/nonexistent core/steerd vless-nodes $Q/sub.txt 2>&1 | grep -c "нужен пакет steer-vless\|нужен плагин vless")" &&
-            echo "apply:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGIN_DIR=$Q/plugins STEER_PLUGINS_ROOT=$Q/plugins STEER_PLUGINS_ETC=$Q/petc core/steerd apply --dry-run --spec $Q/spec.yaml --state-dir $Q/st 2>&1 | grep -c "требует пакет\|нужен плагин")" &&
+            echo "core:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGINS_ROOT=$Q/plugins STEER_PLUGINS_ETC=$Q/petc core/steerd vless-nodes $Q/sub.txt 2>&1 | grep -c "\"name\":\"B\"")" &&
+            echo "none:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGINS_ROOT=/nonexistent core/steerd vless-nodes $Q/sub.txt 2>&1 | grep -c "нет такой команды")" &&
+            echo "apply:$(LD_LIBRARY_PATH=$Q/core STEER_PLUGINS_ROOT=$Q/plugins STEER_PLUGINS_ETC=$Q/petc core/steerd apply --dry-run --spec $Q/spec.yaml --state-dir $Q/st 2>&1 | grep -c "требует пакет\|нужен плагин")" &&
             echo "hy2:$(plugins/hysteria2/bin/hysteria2 hysteria2-nodes $Q/hy.txt 2>&1 | grep -c "\"name\":\"H\"")" &&
             echo "ldd:$(ldd plugins/vless/bin/vless 2>&1 | grep -c "net1/lib/libs2p-net.so.1")"' 2>&1)"
         for k in "direct:1:плагин vless на OpenWrt: перечень узлов, net1 по RUNPATH (musl \$ORIGIN)" \
                  "core:1:steerd на OpenWrt исполняет плагин из каталога плагинов" \
-                 "none:1:без каталога плагинов — «нужен пакет/плагин vless»" \
+                 "none:1:без каталога плагинов — команды vless-nodes нет" \
                  "apply:0:спека с vless и hysteria2 принимается ядром с плагинами (без «нужен плагин»)" \
                  "hy2:1:плагин hysteria2 на OpenWrt: перечень узлов" \
                  "ldd:1:загрузчик musl берёт net1 из каталога плагинов"; do

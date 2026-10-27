@@ -1,0 +1,4 @@
+{
+  "plugin.name": "AmneziaWG",
+  "plugin.description": "WireGuard and AmneziaWG tunnels: the awg output kind, system packages and kernel modules"
+}

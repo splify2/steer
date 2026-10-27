@@ -1,0 +1,4 @@
+{
+  "plugin.name": "Tunnel network stack",
+  "plugin.description": "Shared library for protocol plugins: TLS 1.3 and REALITY, HTTP/2, QUIC, transports, TUN stack"
+}

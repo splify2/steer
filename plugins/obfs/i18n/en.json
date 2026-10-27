@@ -1,0 +1,4 @@
+{
+  "plugin.name": "WireGuard obfuscator",
+  "plugin.description": "WireGuard over fake TCP for interface outputs"
+}

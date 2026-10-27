@@ -1,0 +1,4 @@
+{
+  "plugin.name": "AmneziaWG",
+  "plugin.description": "Туннели WireGuard и AmneziaWG: вид выхода awg, системные пакеты и модули ядра Linux"
+}
