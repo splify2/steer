@@ -35,9 +35,7 @@ cc_defaults {
         "src/lib/run.c",
         "src/lib/jsonw.c",
         "src/lib/evline.c",
-        // Step 4 of 1.10 (module split): which command belongs to which module and whether the
-        // module is installed, the module commands themselves (the phone keeps them all in
-        // steerd, so the stubs never fire) and the obfuscator entry point.
+        // The core version (src/lib/module.h) and the --platform flag (src/cli/modcmd.c).
         "src/lib/module.c",
         "src/cli/modcmd.c",
         "src/lib/err.c",
@@ -130,7 +128,6 @@ cc_defaults {
         "src/kinds/group.c",
         "src/kinds/grpurl.c",
         "src/kinds/interface.c",
-        "src/kinds/tgws.c",
         "src/kinds/awg.c",
         "src/kinds/plugin.c",
         "src/kinds/plugalloc.c",
@@ -283,13 +280,14 @@ cc_binary {
         "src/proto/xsteer/xsclient.c",
         "src/proto/vless/subfetch.c",
         "src/proto/tgws/tgws.c",
+        "src/proto/tgws/tghook.c",
         "src/proto/tls/tlsprobe.c",
         "src/proto/tls/urltls.c",
         // The profile file of the full package (src/profile/profile.h): the build's name and the
         // [steer-extended] marks in help. Profiles are sets of files, not defines.
         "src/profile/extended.c",
         // Plugin programs compiled in (PK_STATIC_SRC) and their manifests (PKEMBED_SRC, written by
-        // build/pkembed.sh): the core registry sees vless, xsteer and obfs without a plugins directory.
+        // build/pkembed.sh): the core registry sees vless, xsteer, obfs and tgws without a plugins directory.
         "src/plugkit/plugkit.c",
         "src/plugkit/pkjson.c",
         "src/plugkit/pktun.c",
@@ -298,6 +296,7 @@ cc_binary {
         "src/proto/xsteer/xshook.c",
         "src/proto/obfs/obfsmain.c",
         "src/modules/main_obfs.c",
+        "src/modules/main_tgws.c",
         "src/proto/obfs/obfs.c",
         "src/plugkit/pkembed.c",
     ],

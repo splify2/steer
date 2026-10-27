@@ -43,13 +43,6 @@ int sc_aesctr_init(struct sc_aesctr *c, const unsigned char key[32], const unsig
 int sc_aesctr_xor(struct sc_aesctr *c, const unsigned char *in, unsigned char *out, size_t n)
                                         { (void)c; memmove(out, in, n); return 0; }
 void sc_aesctr_free(struct sc_aesctr *c) { c->ready = 0; }
-/* Мосту (cmd_tgws) эти две функции нужны на этапе разбора спеки — этот стенд его ни разу не
- * зовёт (проверяются dc_of/dc_add напрямую), но символы обязаны разрешиться на линковке: спека
- * — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2), поэтому здесь больше
- * нет и мока g_out/g_out_n — cmd_tgws с этого шага держит свой static struct spec сам. */
-int load_spec(const char *path, struct spec *s, struct err *e) { (void)path; (void)s; (void)e; return 0; }
-int registry_assign(struct spec *s, struct err *e) { (void)s; (void)e; return 0; }
-const struct tgws_cfg *out_tgws(const struct output *o) { (void)o; return NULL; }
 
 static int fails;
 
@@ -76,7 +69,7 @@ static void eq(const char *ip, short want_dc, short want_media, const char *what
 }
 
 int main(void) {
-    dc_table_init();
+    dc_table_init(NULL, 0);
 
     /* Ровно тот случай, из-за которого Telegram не работал на живом роутере. */
     eq("149.154.167.41",  2, 0, "соседний адрес подсети — тот же ДЦ");
@@ -132,22 +125,18 @@ int main(void) {
      * вовсе. До неё домен был один на все дата-центры, и домен с пятью живыми точками из
      * шести не работал ровно у того ДЦ, где лежит ключ авторизации человека. */
     {
-        char path[] = "/tmp/tgws-route.XXXXXX";
-        int fd = mkstemp(path);
-        FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
-        if (!f) { printf("не создать временный файл\n"); return 2; }
-        fputs("# карта\n"
-              "2   ws      dva.example.org\n"
-              "2m  direct\n"
-              "4   ws      chetyre.example.org\n"
-              "5   direct\n"
-              "9   ws\n"            /* без домена — строка негодная, молча пропускается */
-              "77  direct\n",       /* номера такого ДЦ нет */
-              f);
-        fclose(f);
-        setenv("STEER_TGWS_ROUTE", path, 1);
-        route_init();
-        unlink(path);
+        /* Настройка routes плагина — строки как есть. */
+        static const char *const lines[] = {
+            "# карта",
+            "2   ws      dva.example.org",
+            "2m  direct",
+            "4   ws      chetyre.example.org",
+            "5   direct",
+            "9   ws",                /* без домена — строка негодная, называется и пропускается */
+            "77  direct",            /* номера такого ДЦ нет */
+            "4 ws a.example b",      /* лишнее слово — негодная */
+        };
+        route_init(lines, sizeof(lines) / sizeof(lines[0]));
 
         yes(route_domain(2, 0) && !strcmp(route_domain(2, 0), "dva.example.org"),
             "у ДЦ2 свой домен");

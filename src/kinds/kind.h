@@ -25,7 +25,6 @@ struct spec;
 struct err;
 struct out_keys;
 struct out_obfs;
-struct tgws_cfg;
 struct group_cfg;
 struct plugin_kind;
 /* Дерево ruleset (src/lib/ir.h). Объявлено ради поля emit ниже: заголовок дерева подключают
@@ -74,7 +73,6 @@ enum kind_key {
     KK_OBFS   = 1 << 0,
     KK_STREAM = 1 << 1,
     KK_OPTS   = 1 << 2,
-    KK_DOMAIN = 1 << 3,
     KK_NODES  = 1 << 4,
     /* `devices` спеки v1 — пул кандидатов. Принимает его только interface: пул устройств — это
      * группа (kind: group), и собирает её перевод v1 (model/v1.c) из безымянных интерфейсов. */
@@ -259,7 +257,7 @@ int kind_emit_all(struct nft_rs *rs, const struct spec *sp, struct err *e);
  * спека v1 её не знает (`"kind": "group"` в v1 обязан остаться неизвестным видом, иначе спека,
  * принятая с ним, значила бы то, чего v1 не обещал), своих правил и проверок у неё нет, а
  * собирает её перевод v1 (model/v1.c) напрямую. Разбор v2 находит её через kind_by_name_v2. */
-extern const struct kind_ops kind_direct, kind_interface, kind_tgws, kind_awg, kind_group,
+extern const struct kind_ops kind_direct, kind_interface, kind_awg, kind_group,
                              kind_plugin_device, kind_unavail, kind_block;
 /* Выход «Блок» (kinds/block.c): резолвер отвечает на имена его правил пустым адресом. */
 int out_is_block(const struct output *o);
@@ -271,7 +269,7 @@ int out_is_block(const struct output *o);
 /* ИМЕНА ВИДОВ ДЛЯ СТЕНДОВ — только для стендов (tests/specmatch.c, tests/failovermatch.c), которым
  * нужно собрать выход конкретного вида, не читая спеку: `g_spec.out[0].kind = OUT_INTERFACE`.
  * Общий код вида не сравнивает — он спрашивает kind_of(o)->caps или конкретную функцию вида
- * (out_tgws и соседи ниже). Вне src/kinds и стендов эти имена ловит
+ * (iface_obfs и соседи ниже). Вне src/kinds и стендов эти имена ловит
  * tests/buildmatch.sh. */
 #define OUT_DIRECT    (&kind_direct)
 #define OUT_INTERFACE (&kind_interface)
@@ -279,9 +277,9 @@ int out_is_block(const struct output *o);
 
 /* ---- вопросы к отдельным видам ------------------------------------------------------------
  *
- * Помощнику вида (мосту tgws) нужна настройка своего выхода, и спросить её он должен у вида: «это мой
- * выход?» — NULL, если выход другого вида. Помощники видов плагинов спрашивают не вид, а свой файл
- * настройки выхода {conf} (steer-api.md, 1.4). */
+ * Коду ядра нужна настройка выхода своего вида, и спросить её он должен у вида: «это мой выход?» — NULL,
+ * если выход другого вида. Помощники видов плагинов спрашивают не вид, а свой файл настройки выхода
+ * {conf} (steer-api.md, 1.4). */
 
 /* Вид, которым выход виден снаружи: в status, в `steer outputs --kind`, в подписях сверки и в
  * отказах разбора. У группы из перевода v1 — вид прежнего выхода (interface), см.
@@ -423,10 +421,5 @@ const char *group_why_name(int why);
 
 /* interface: обфускация транспорта или NULL, если её нет (или выход не interface). */
 const struct out_obfs *iface_obfs(const struct output *o);
-
-/* tgws */
-const struct tgws_cfg *out_tgws(const struct output *o);
-/* `steer tgws-instances`: что поднимать init-скрипту. Код — как у команды. */
-int tgws_instances(const struct spec *sp);
 
 #endif

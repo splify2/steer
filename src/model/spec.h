@@ -165,7 +165,7 @@ struct out_obfs {
  * «Вид выхода»). Прежде все поля всех видов лежали рядом, и поле одного вида читал другой (путь
  * `conf` у awg жил в поле xsteer): у каждого вида теперь своё, и заполняет его только разбор его
  * модуля (src/kinds/<вид>.c). Читать поле чужого вида нельзя — там настройка того, чей это выход;
- * помощники спрашивают свою настройку у вида (out_tgws в kind.h). Вид плагина держит ключи по схеме
+ * помощники видов ядра спрашивают свою настройку у вида (iface_obfs в kind.h). Вид плагина держит ключи по схеме
  * манифеста (struct plugin_out), а его помощник читает их из {conf}. */
 struct iface_cfg {
     struct out_obfs obfs;
@@ -184,12 +184,6 @@ struct zapret_cfg {
      * печатается целиком в status, в diag и в резервную копию. Путь по умолчанию выводит модуль
      * из имени выхода. */
     char opts[256];
-};
-
-struct tgws_cfg {
-    /* Домен точек веб-сокета: `kwsN.<домен>`. Чужой по природе (домен владельца
-     * роутера за Cloudflare либо общественный), поэтому поле, а не константа — см. tgws.c. */
-    char domain[128];
 };
 
 /* ГРУППА ВЫХОДОВ (kind: group, src/kinds/group.c; docs/architecture.md, «4в»).
@@ -394,7 +388,6 @@ struct output {
         struct iface_cfg iface;
         struct awg_cfg awg;
         struct zapret_cfg zp;
-        struct tgws_cfg tg;
         struct group_cfg grp;
         struct plugin_out plg;
     };

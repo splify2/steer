@@ -21,11 +21,6 @@
 #include "platform.h"
 #include "helpers.h"
 #include "plugin.h"
-#include "module.h"
-
-/* Есть ли команда в самом steerd (cli/modcmd.c). Слабая: стенд, собравший помощников без
- * modcmd.c, оставляет нулевой адрес — для него команды не модульные. */
-int modcmd_builtin(const char *cmd) __attribute__((weak));
 
 long helpers_now_ms(void) {
     struct timespec t;
@@ -104,16 +99,6 @@ size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *
             k++;
             snprintf(h->name, sizeof(h->name), "%s", o->name);
             if (hp.plugin) snprintf(h->plugin, sizeof(h->plugin), "%s", hp.plugin);
-            /* Команда помощника — команда модуля, а в этом steerd её нет: помощника исполняет
-             * бинарник модуля (steer-vless и остальные), который лежит рядом. Статическая
-             * сборка (телефон, стенды) несёт модуль в себе — modcmd_builtin говорит «да», и
-             * помощник остаётся подкомандой steerd, как всегда. Стенд, собравший помощников
-             * без modcmd.c, читается как статическая сборка: прежнее поведение. */
-            const char *mod = hp.prog && hp.prog[0] ? NULL : steer_cmd_module(hp.cmd);
-            if (mod && modcmd_builtin && !modcmd_builtin(hp.cmd)) {
-                char *mp = strdup(mod);
-                if (mp) { free(h->prog); h->prog = mp; h->module = 1; }
-            }
             h->sig = helper_sig(sp, o, &hp);
             h->delay_ms = HELPERS_DELAY_MS;
             h->evfd = -1;
@@ -257,7 +242,6 @@ static int same_helper(const struct helper *a, const struct helper *b) {
 static void take_params(struct helper *h, const struct helper *f) {
     /* Нет памяти — параметры остаются прежними: следующая сверка возьмёт новые. */
     launch_copy(h, f->cmd, f->prog, f->arg, f->arg_n, f->env, f->env_n);
-    h->module = f->module;
 }
 
 int helpers_reserve(struct helper_set *s, size_t n) {
@@ -400,7 +384,7 @@ const char **helper_argv(const struct helper *h, const char *exe, const char *se
     const char **av = malloc((h->arg_n + 10) * sizeof(*av));
     if (!av) return NULL;
     size_t n = 0;
-    if (h->prog && h->prog[0] && !h->module) {
+    if (h->prog && h->prog[0]) {
         /* Помощник-программа (steer-nfqws) лежит рядом с движком — как /usr/sbin у init.d.
          * Шов стенда подменяет и её, получая имя помощника и выход первыми словами. */
         if (seam) {
@@ -421,21 +405,7 @@ const char **helper_argv(const struct helper *h, const char *exe, const char *se
         av[n] = NULL;
         return av;
     }
-    if (h->module && !seam) {
-        /* Бинарник модуля — рядом с движком (steer_module_dir: каталог исполняемого файла или
-         * STEER_MODULE_DIR стенда) и принимает те же слова, что подкоманда steerd: разбор у них
-         * один (cli/modcmd.c). */
-        /* Путь — у module.c: плагин протокола (каталог плагинов) или прежний модуль рядом. Нет ни
-         * того, ни другого — прежний путь рядом с движком: о «нет модуля» скажет супервизор. */
-        if (steer_module_path(h->prog, progbuf, pbn) != 0) {
-            char dir[PATH_MAX];
-            steer_module_dir(dir, sizeof(dir));
-            snprintf(progbuf, pbn, "%s/%s", dir, h->prog);
-        }
-        av[n++] = progbuf;
-    } else {
-        av[n++] = exe;
-    }
+    av[n++] = exe;
     av[n++] = h->cmd;
     av[n++] = h->name;
     av[n++] = "--spec";
@@ -458,7 +428,7 @@ void helper_putenv(const struct helper *h) {
 const char *helper_argv0(const char *exe, char *buf, size_t n) {
     const char *sl = strrchr(exe, '/');
     const char *base = sl ? sl + 1 : exe;
-    if (strcmp(base, "steerd") != 0 && !steer_module_is(base)) return exe;
+    if (strcmp(base, "steerd") != 0) return exe;
     snprintf(buf, n, "%.*ssteer", (int)(base - exe), exe);
     return buf;
 }

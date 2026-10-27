@@ -15,11 +15,11 @@ const struct profile *prof(void) {
     if (!g_prof_ready) {
         if (&steer_profile) g_prof = steer_profile;
         if (!g_prof.build) g_prof.build = "базовая сборка";
-        /* Полный движок берёт таблицы с 300 (300 плюс место в реестре, model/registry.c), мост — порты от 8480. */
+        /* Полный движок берёт таблицы с 300 (300 плюс место в реестре, model/registry.c). */
         if (!g_prof.table_base) g_prof.table_base = 300;
         if (!g_prof.rt_tables_file) g_prof.rt_tables_file = "steer.conf";
-        if (!g_prof.tgws_port_base) g_prof.tgws_port_base = 8480;
-        /* Слушатели TCP модулей — от 9480: в стороне от ряда моста (8480 плюс место, до 8734). */
+        /* Слушатели TCP модулей — от 9480 (ряд 8480… занимал прежний мост tgws ядра; плагины берут порты
+         * от 10480, src/kinds/plugalloc.c). */
         if (!g_prof.tcp_port_base) g_prof.tcp_port_base = 9480;
         g_prof_ready = 1;
     }

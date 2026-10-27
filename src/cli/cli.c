@@ -9,7 +9,6 @@
 #include "cli.h"
 #include "spec.h"
 #include "profile.h"
-#include "module.h"
 #include "plugin.h"
 
 /* Версию подставляет сборка (-DSTEER_VERSION) из файла VERSION. Умолчание нужно
@@ -50,11 +49,10 @@ static const struct cli_flag FLAGS[] = {
     {"--state-dir", NULL, "КАТАЛОГ",    "каталог состояния (по умолчанию {state})"},
     {"--dry-run",   NULL, NULL,         "напечатать готовый ruleset и ничего не применять"},
     {"--verbose",   "-v", NULL,         "рассказывать по шагам, что проверяется"},
-    {"--kind",      NULL, "ВИД",        "только выходы этого вида: direct, block, interface, awg, tgws, group или вид плагина (vless для tunnel:vless)"},
+    {"--kind",      NULL, "ВИД",        "только выходы этого вида: direct, block, interface, awg, group или вид плагина (vless для tunnel:vless, tgws)"},
     {"--obfs",      NULL, NULL,         "только выходы, у которых настроена обфускация"},
     {"--devices",   NULL, NULL,         "печатать имена устройств, а не имена выходов"},
     {"--via",       NULL, NULL,         "только выходы с via: имя и выход, через который идёт туннель"},
-    {"--direct",    NULL, NULL,         "проверять путь НАПРЯМУЮ, минуя обход"},
     {"--fast",      NULL, NULL,         "отдать запомненный ответ немедленно, не пересчитывая"},
     {"--json",      NULL, NULL,         "печатать спеку JSON-объектом, а не YAML"},
     {"--node",      NULL, "N",          "номер узла подписки, с нуля; -1 — первый рабочий (по умолчанию)"},
@@ -352,42 +350,6 @@ static const struct cli_cmd CMDS[] = {
  "меняется никогда. Пустая строка — не из чего считать.",
  "", 0, 0, 0, 0, 0},
 
-{"tgws", "Telegram", "<выход>",
- "поднять мост Telegram → веб-сокет для выхода kind=tgws",
- "Принимает перехваченные соединения приложения с дата-центрами Telegram и уводит их\n"
- "веб-сокетом wss://kwsN.<домен>/apiws: ДЦ2 и ДЦ4 — сначала к самому web.telegram.org,\n"
- "остальные — через домен за Cloudflare из спеки. В самом приложении при этом ничего\n"
- "настраивать не надо — этим мост и отличается от прокси MTProto.\n"
- "Заворачивает соединения правило nat, которое ставит apply; номер дата-центра мост\n"
- "берёт из адреса назначения, неизвестный адрес переливает как есть, не перехватывая.\n"
- "Звонки сюда не попадают: голос идёт по UDP мимо MTProto.\n"
- "Работает на переднем плане, процессом управляет procd.",
- "--spec --state-dir", 1, 0, 1, 0, 0},
-
-{"tgws-probe", "Telegram", "[media]",
- "проверить путь до Telegram: TLS, веб-сокет, ответ дата-центра",
- "Проходит весь путь моста до настоящего Telegram и печатает, где он оборвался:\n"
- "соединение, TLS, апгрейд WebSocket, обмен MTProto. Ответом считается не апгрейд —\n"
- "его отдаст и посторонний веб-сервер, — а resPQ на req_pq_multi: ответить на него\n"
- "может только дата-центр.\n"
- "Номер дата-центра задаётся флагом --node: 1..5 или 203 (по умолчанию 2); слово media\n"
- "проверяет медийную точку. Спека не нужна: проверяется путь, а не настройка.\n"
- "С флагом --direct проверяется ПРЯМОЙ путь в дата-центр — без веб-сокета и TLS, как\n"
- "ходит сам клиент Telegram. Так подбор узнаёт, какие ДЦ у этого провайдера открыты:\n"
- "перехватывать их незачем, а медийный трафик через мост стоит дороже всего.\n"
- "Флаг --timeout задаёт срок ожидания (по умолчанию 5 секунд): подбор гоняет пробу\n"
- "десятками раз подряд, и молчащая точка не должна стоить ему полминуты.",
- "--node --direct --timeout", 0, 0, 1, 0, 1},
-
-{"tgws-instances", "Telegram", "",
- "выходы kind=tgws и их порты, по строке на выход",
- "Печатает `имя<TAB>порт` для каждого выхода kind=tgws. Для init-скрипта: по этому\n"
- "списку он поднимает мосты. Порт выводит ядро steer, а не считает скрипт, — второй\n"
- "расчёт того же разошёлся бы, и мост слушал бы порт, на который ядро ничего не\n"
- "заворачивает.\n"
- "Код возврата: 0 — поднимать есть что, 1 — таких выходов нет.",
- "--spec --state-dir", 0, 0, 0, 0, 0},
-
 {"srs-read", "Списки", "<файл.srs>",
  "прочитать скомпилированный набор правил sing-box в наш список",
  "Наборы `.srs` — то, чем публикуются списки доменов и подсетей: в релизе\n"
@@ -552,14 +514,11 @@ static void print_flags(FILE *out, const char *list) {
     }
 }
 
-/* Есть ли команда в этой установке: профиль extended несёт всё в себе (статическая сборка), иначе
- * команду модуля ведёт его бинарник рядом с движком (lib/module.c). */
+/* Есть ли команда в этой установке: профиль extended несёт всё в себе (статическая сборка); подкоманду
+ * с этим именем может вести и включённый плагин (манифест). */
 static int cmd_here(const struct cli_cmd *c) {
-    /* Подкоманду с этим именем ведёт включённый плагин (манифест) — она есть. */
     if (plugin_cmd_find(c->name)) return 1;
-    if (prof()->extended) return 1;
-    const char *m = steer_cmd_module(c->name);
-    return m && steer_module_present(m);
+    return prof()->extended;
 }
 
 static void help_all(FILE *out) {
@@ -575,16 +534,8 @@ static void help_all(FILE *out) {
         }
         fprintf(out, "  %-13s %s", CMDS[i].name, CMDS[i].brief);
         if (!cmd_here(&CMDS[i])) {
-            /* Команда названа даже там, где её нет. «Неизвестная команда» на steer vless
-             * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет. */
-            /* Пакет — модуль, в котором команда живёт (steer-vless, steer-hysteria2…), а не
-             * прежний steer-extended: с 2.0 ядро и модули — отдельные пакеты. */
-            if (CMDS[i].ext && !CMDS[i].srv) {
-                const char *m = steer_cmd_module(CMDS[i].name);
-                fprintf(out, " [%s]", m ? m : "steer-extended");
-                missing = 1;
-            }
-            /* Хаб — не «другой пакет для роутера», а другой артефакт: архив для VPS. Маркер
+            /* Команда названа даже там, где её нет: «неизвестная команда» заставила бы искать опечатку.
+             * Хаб — не «другой пакет для роутера», а другой артефакт: архив для VPS. Маркер
              * поэтому свой, иначе человека послали бы ставить steer-extended туда, где он не
              * поможет. */
             if (CMDS[i].srv) { fputs(" [steer-hub]", out); missing = 1; }
@@ -612,9 +563,7 @@ static void help_all(FILE *out) {
           "Подробности по команде: steer help apply   (то же самое: steer apply --help)\n",
           plat()->name, plat_names());
     if (missing)
-        fputs("\nКоманды с пометкой [steer-…] живут в модулях ядра: заработают, когда рядом встанет\n"
-              "пакет этого модуля той же версии, что steer-core.\n"
-              "Помеченное [steer-hub] живёт в архиве для VPS: на роутере хабу делать нечего.\n", out);
+        fputs("\nПомеченное [steer-hub] живёт в архиве для VPS: на роутере хабу делать нечего.\n", out);
 }
 
 static void help_cmd(FILE *out, const struct cli_cmd *c) {
@@ -633,11 +582,6 @@ static void help_cmd(FILE *out, const struct cli_cmd *c) {
     if (cmd_here(c)) return;
     if (c->srv)
         fputs("\nВ этой сборке команды нет: хаб ставится на VPS из архива steer-hub.\n", out);
-    else if (c->ext) {
-        const char *m = steer_cmd_module(c->name);
-        fprintf(out, "\nКоманда живёт в модуле: нужен пакет %s той же версии, что steer-core.\n",
-                m ? m : "steer-extended");
-    }
 }
 
 void cli_help(FILE *out, const struct cli_cmd *cmd) {
@@ -776,7 +720,6 @@ void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
         else if (!strcmp(f->name, "--obfs"))       out->obfs = 1;
         else if (!strcmp(f->name, "--devices"))    out->devices = 1;
         else if (!strcmp(f->name, "--via"))        out->via = 1;
-        else if (!strcmp(f->name, "--direct"))     out->direct = 1;
         else if (!strcmp(f->name, "--fast"))      out->fast = 1;
         else if (!strcmp(f->name, "--json"))      out->json = 1;
         else if (!strcmp(f->name, "--insecure"))   out->insecure = 1;

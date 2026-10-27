@@ -829,9 +829,8 @@ static int manifest_checks(struct pm_ctx *x, const char *id, const struct ynode 
         for (size_t i = 0; i < ynode_len(list); i++) {
             const char *nm = yn_str(ynode_at(list, i), "name");
             if (!nm) continue;
-            /* Команды модулей, что ещё в дереве steer (vless-nodes…), плагин переопределяет — их вынос и есть цель;
-             * тот же отбор, что в реестре (kinds/plugin.c). */
-            if (s == 1 && cli_lookup(nm) && !steer_cmd_module(nm)) return pm_errf(e, "подкоманда %s — команда ядра, плагину её не дать", nm);
+            /* Имя подкоманды ядра плагину не даётся — тот же отбор, что в реестре (kinds/plugin.c). */
+            if (s == 1 && cli_lookup(nm)) return pm_errf(e, "подкоманда %s — команда ядра, плагину её не дать", nm);
             for (size_t j = 0; j < x->st.n; j++) {
                 const struct pm_inst *o = &x->st.v[j];
                 if (!strcmp(o->id, id)) continue;

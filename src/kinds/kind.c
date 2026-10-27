@@ -19,11 +19,9 @@
 #include "plugin.h"
 
 extern const struct kind_ops kind_interface __attribute__((weak));
-extern const struct kind_ops kind_tgws __attribute__((weak));
 extern const struct kind_ops kind_awg __attribute__((weak));
 
 static const struct kind_ops no_interface = { .name = "interface", .absent = "kind interface в этой сборке нет" };
-static const struct kind_ops no_tgws      = { .name = "tgws",   .absent = "kind tgws в этой сборке нет" };
 static const struct kind_ops no_awg       = { .name = "awg",    .absent = "kind awg в этой сборке нет" };
 
 /* Порядок — прежний порядок видов (им же печатается справка о видах и идут проверки diag по
@@ -31,7 +29,6 @@ static const struct kind_ops no_awg       = { .name = "awg",    .absent = "kind 
 static const struct { const struct kind_ops *have, *none; } REG[] = {
     { &kind_direct,    NULL },
     { &kind_interface, &no_interface },
-    { &kind_tgws,      &no_tgws },
     { &kind_awg,       &no_awg },
     /* Блок — без правил вида до себя: в конце, порядок прежних не меняется. */
     { &kind_block,     NULL },

@@ -26,8 +26,8 @@
 struct profile {
     /* Вариант сборки в `steer version`. */
     const char *build;
-    /* Полный роутерный пакет: клиенты туннелей и мост Telegram в одном бинарнике. Справка тогда
-     * не помечает команды [steer-extended], а мост kind=tgws поднимает супервизор. */
+    /* Полный статический бинарник (телефон): программы плагинов вкомпилированы (PK_PROGRAM), справка
+     * не помечает команды отсутствующими. */
     unsigned extended : 1;
     /* Резолвера нет: заворот DNS не ставится, needs-dnsd отвечает «нет», доменный канал —
      * отказ apply (мини-сборка tgws). */
@@ -38,11 +38,9 @@ struct profile {
     const char *mark_platform;
     uint32_t mark_base;
     unsigned mark_bits;
-    /* Первый номер таблицы маршрутизации (registry.c), имя файла имён таблиц в rt_tables.d и
-     * первый порт моста kind=tgws (marks.h). */
+    /* Первый номер таблицы маршрутизации (registry.c) и имя файла имён таблиц в rt_tables.d. */
     int table_base;
     const char *rt_tables_file;
-    int tgws_port_base;
     /* Первый порт слушателей TCP модулей с KC_TCP_REDIR (marks.h, out_tcp_port). */
     int tcp_port_base;
 };

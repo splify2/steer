@@ -17,7 +17,7 @@
 # Профиль — это набор файлов одной сборки, и больше ничего (docs/architecture.md, раздел 2,
 # правило 3): какие команды и виды есть в бинарнике, решает наличие их файлов (слабые ссылки в
 # src/daemon/main.c и src/kinds/kind.c), а то, что файлом модуля не выражается (имя варианта
-# сборки, раскладка меток и таблиц мини-сборки tgws, резолвер), — файл профиля src/profile/
+# сборки, своя раскладка меток и таблиц, резолвер), — файл профиля src/profile/
 # <профиль>.c. Прежние ключи -DSTEER_EXTENDED/-DSTEER_SERVER/-DSTEER_TGWS сняты; PROFILE_DEFS_*
 # остались ради умолчания платформы телефона и читаются сценариями сборки по-прежнему.
 
@@ -67,7 +67,7 @@ THIRD_DEFS := -DHAVE_CONFIG_H
 # выбирается при запуске, и код обеих есть в каждой сборке. Идёт вместе с моделью, потому что
 # модель её и спрашивает первой: разбор (zapret и каналы на само устройство), реестр (поле
 # метки), пути состояния. Стенды, компонующие модель, получают платформу тем же списком.
-# С ней же — умолчания профиля (src/profile/profile.c): поле метки мини-сборки tgws подменяет
+# С ней же — умолчания профиля (src/profile/profile.c): поле метки профиля подменяет
 # поле роутера в plat(), так что платформа без профиля не компонуется.
 PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/android.c src/profile/profile.c
 
@@ -90,12 +90,11 @@ YAML_SRC := src/lib/ynode.c $(LIBYAML_SRC)
 # виды идут со всякой моделью. Поэтому здесь, а не в CORE_SRC.
 #
 # lib/ir.c — дерево набора правил (lib/ir.h) — здесь по той же причине: его строят не только
-# компилятор (src/compile), но и виды (kind_ops.emit у tgws), а о спеке и видах дерево
+# компилятор (src/compile), но и виды (kind_ops.emit у block) и шаблоны nft плагинов, а о спеке и видах дерево
 # не знает ничего (только libc), то есть это кирпич lib, а не часть компилятора.
 #
-# lib/module.c — какая команда чья и установлен ли модуль (шаг 4 выпуска 1.10, src/lib/module.h):
-# его зовут реестр видов (kinds/kind.c, kinds/tgws.c) и справка (cli/cli.c), а они идут со всякой
-# моделью, поэтому файл здесь же.
+# lib/module.c — версия ядра этой сборки (src/lib/module.h): её зовут реестр плагинов (kinds/plugin.c) и
+# схема спеки (model/v2schema.c), а они идут со всякой моделью, поэтому файл здесь же.
 #
 # MODEL_SPEC_SRC — модель без платформы, lib/err.c и lib/jsonr.c (их net1 берёт себе отдельно,
 # NET1_BASE_SRC ниже). Программам плагинов модель спеки не нужна вовсе: о выходе им говорит {conf}.
@@ -134,10 +133,10 @@ DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
 # Виды выхода ядра (src/kinds, docs/architecture.md, раздел 2, правило 1): вид — это файл. Протоколов
 # среди них нет: виды протоколов (tunnel:vless и соседи, xsteer, warp) приходят только из манифестов
 # плагинов (kinds/plugin.c) — без плагина такой выход недоступен (unavail), остальное работает
-# (plugin-sdk/docs/steer-api.md, 3.5). tgws — пока вид ядра (его вынос в плагин — отдельная работа).
+# (plugin-sdk/docs/steer-api.md, 3.5). Мост Telegram (tgws) — тоже вид плагина (plugins/tgws).
 # Состав проверяет tests/buildmatch.sh.
 KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/block.c src/kinds/group.c src/kinds/grpurl.c src/kinds/interface.c \
-                  src/kinds/tgws.c src/kinds/awg.c src/kinds/awgdev.c src/kinds/plugin.c src/kinds/plugalloc.c
+                  src/kinds/awg.c src/kinds/awgdev.c src/kinds/plugin.c src/kinds/plugalloc.c
 
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
 # компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
@@ -149,7 +148,7 @@ KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/block.c src/kind
 #   LIBSTEER_BASE_SRC то, что нужно и демону, и модулям: модель спеки (с libyaml), платформа,
 #                     реестр и файлы видов, разбор командной строки, линия событий,
 #                     идентификатор роутера. Уходит в libsteer.so (LIBSTEER_SRC ниже);
-# Статические сборки (телефон, стенды, мини-сборка tgws, хаб) по-прежнему берут CORE_SRC целиком:
+# Статические сборки (телефон, стенды, хаб) по-прежнему берут CORE_SRC целиком:
 # один бинарник без разделяемых библиотек, и снимок генератора, стенды и телефон проверяют ровно
 # ту логику, что едет в пакет; отличается только компоновка. Обфускатор (`steer obfs`,
 # `obfs-server`) — программа плагина obfs (OBFS_MOD_SRC), в ядре его подкоманд нет.
@@ -190,7 +189,7 @@ CRYPTO_SRC := src/lib/scrypto.c
 # certverify.c лежит в ОБЩЕЙ половине, хотя проверка цепочки нужна только клиенту: её зовёт
 # tls13.c, и зовёт безусловно, а не под #ifdef. Значит файл обязан быть везде, где
 # компилируется tls13.c, — то есть во всех трёх ролях. Внесённый только в EXT_ROUTER_SRC, он
-# оставил роли server и tgws с неопределёнными ссылками на cert_verify_server: сборка
+# оставил роли server и прежнюю tgws с неопределёнными ссылками на cert_verify_server: сборка
 # роутерного пакета при этом шла как обычно, и заметить это было нечем, кроме релиза.
 XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsroute.c \
                  src/proto/tls/chello.c src/proto/xsteer/xshake.c src/proto/xsteer/xsconn.c \
@@ -229,11 +228,9 @@ PLUGIN_PRIM_SRC := src/lib/sigverify.c src/lib/untar.c
 VLESS_MOD_SRC := src/proto/vless/vlmain.c src/proto/vless/vldial.c \
                  src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c
 EXT_ROUTER_SRC := src/proto/vless/sub.c $(SUBLINK_SRC) $(VLESS_MOD_SRC) $(STACK_SRC) $(TRANSPORT_SRC) $(PLUGIN_PRIM_SRC) \
-                  src/proto/xsteer/xsclient.c src/proto/vless/subfetch.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c \
+                  src/proto/xsteer/xsclient.c src/proto/vless/subfetch.c src/proto/tgws/tgws.c src/proto/tgws/tghook.c src/proto/tls/tlsprobe.c \
                   src/proto/tls/urltls.c
 EXT_SERVER_SRC := src/proto/xsteer/xshub.c
-EXT_TGWS_SRC := src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
-                src/proto/tls/chello.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c $(CRYPTO_SRC)
 
 # PLUGKIT_SRC — сторона плагина в API ядра (src/plugkit): точка входа, {conf}, файл состояния, ключи
 # туннеля по подписке. Модели спеки ядра в программах протоколов нет: всё о выходе — в {conf}. Каждая
@@ -243,8 +240,9 @@ PLUGKIT_SRC := src/plugkit/plugkit.c src/plugkit/pkjson.c src/plugkit/pktun.c
 PKMAIN_SRC := src/plugkit/pkmain.c
 # PLUGINS_EMBED — плагины, вкомпилированные в бинарник телефона вместе с манифестами (PKEMBED_SRC — его
 # пишет build/pkembed.sh из plugins/<id>/): реестр ядра видит их и без каталога плагинов (О-13).
-PLUGINS_EMBED := vless xsteer obfs
-PK_STATIC_SRC := $(PLUGKIT_SRC) src/modules/main_vless.c src/modules/main_xsteer.c src/proto/xsteer/xshook.c $(OBFS_MOD_SRC) src/modules/main_obfs.c
+PLUGINS_EMBED := vless xsteer obfs tgws
+PK_STATIC_SRC := $(PLUGKIT_SRC) src/modules/main_vless.c src/modules/main_xsteer.c src/proto/xsteer/xshook.c $(OBFS_MOD_SRC) src/modules/main_obfs.c \
+                 src/modules/main_tgws.c
 
 PROFILE_base     := $(CORE_SRC)
 # Полный статический профиль (телефон): протоколы vless и xsteer вкомпилированы программами плагинов
@@ -252,7 +250,6 @@ PROFILE_base     := $(CORE_SRC)
 # плагина — этот же бинарник под именем <id> (bin/<id> в каталоге плагина — ссылка на него).
 PROFILE_extended := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(PK_STATIC_SRC) src/profile/extended.c
 PROFILE_server   := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_SERVER_SRC) src/profile/server.c
-PROFILE_tgws     := $(CORE_SRC) $(EXT_TGWS_SRC) src/profile/tgws.c
 # Телефон: тот же состав, что расширенный роутерный (Android.bp, цель steer), и манифесты вкомпилированных
 # плагинов: каталога плагинов на телефоне в 2.1 нет.
 PKEMBED_SRC := src/plugkit/pkembed.c
@@ -279,7 +276,7 @@ PROFILE_android  := $(PROFILE_extended) $(PKEMBED_SRC)
 #   steer-xsteer        клиент звезды xsteer: рукопожатие, конфигурация, маршрутизация, поток,
 #                       служебные команды (ключ, проверка, ссылка).
 #   steer-obfs          помощник обфускатора; сам код obfs.c — в libsteer (его зовёт и xsteer).
-#   steer-tgws          мост Telegram; правила перехвата пишет ядро (kinds/tgws.c в libsteer).
+#   steer-tgws          мост Telegram (с 2.1 — программа плагина tgws, PROFILE_plug_tgws).
 #
 # modcmd.c входит и в steerd (заглушки команд модулей), и в каждый модуль (настоящие ветки): один
 # разбор команд, тот же вывод и код выхода, `steer vless-nodes` для splify2 не меняется.
@@ -337,9 +334,6 @@ WARP_MOD_SRC := src/proto/warp/wbreg.c src/proto/warp/wbconf.c \
 PLUGMGR_SRC := src/pluginmgr/pmutil.c src/pluginmgr/pmver.c src/pluginmgr/pmstate.c src/pluginmgr/pmindex.c \
                src/pluginmgr/pminst.c src/pluginmgr/pmmain.c
 STEERD_DYN_SRC := $(DAEMON_SRC) src/proto/tls/urltls.c $(PLUGMGR_SRC)
-# Перевод --conf {conf} в прежние --spec/--state-dir (src/modules/plugconf.h) — только у модуля моста
-# steer-tgws, пока он не плагин. Протоколы-плагины читают {conf} сами (src/plugkit).
-PLUGCONF_SRC := src/modules/plugconf.c
 VLESS_MODULE_SRC := $(VLESS_MOD_SRC) src/proto/vless/sub.c src/proto/vless/subfetch.c \
                     src/proto/tls/tlsprobe.c src/modules/main_vless.c
 XSTEER_MODULE_SRC := src/proto/xsteer/xsclient.c src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c \
@@ -347,13 +341,16 @@ XSTEER_MODULE_SRC := src/proto/xsteer/xsclient.c src/proto/xsteer/xswire.c src/p
                      src/proto/xsteer/xsstream.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xshake.c \
                      src/proto/xsteer/xsadmin.c src/proto/xsteer/xshook.c src/modules/main_xsteer.c
 OBFS_MODULE_SRC := $(OBFS_MOD_SRC) src/modules/main_obfs.c
-TGWS_MODULE_SRC := src/proto/tgws/tgws.c $(MODCMD_SRC) $(PLUGCONF_SRC) src/modules/main_tgws.c
+# Мост Telegram (плагин tgws): код моста, хук check и TLS 1.3/1.2 с обликом Chrome — своя копия TLS и
+# wolfSSL внутри программы (build/build-libs.sh, plug_tls): net1 не экспортирует TLS-соединение (tls13_*),
+# а тянуть стек туннелей ради одного веб-сокета мосту незачем.
+TGWS_MODULE_SRC := src/proto/tgws/tgws.c src/proto/tgws/tghook.c src/modules/main_tgws.c \
+                   src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/chello.c
 HY2_MODULE_SRC := $(HY2_MOD_SRC) src/modules/main_hysteria2.c
 PROXY_MODULE_SRC := $(PROXY_MOD_SRC) src/modules/main_proxy.c
 WARP_MODULE_SRC := $(WARP_MOD_SRC) src/modules/main_warpbox.c
 
 PROFILE_steerd     := $(STEERD_DYN_SRC)
-PROFILE_mod_tgws   := $(TGWS_MODULE_SRC)
 
 # ---- РАСКЛАДКА 2.1: ЯДРО, БИБЛИОТЕКА-ПЛАГИН net1 И ПРОТОКОЛЫ-ПЛАГИНЫ ------------------------------
 #
@@ -412,9 +409,17 @@ PROFILE_plug_warpbox   := $(WARP_MODULE_SRC) $(PLUGKIT_SRC) $(PKMAIN_SRC) src/ki
 # obfs: стек ему не нужен — статическая программа, основа net1 вкомпилирована своя.
 PROFILE_plug_obfs      := $(OBFS_MODULE_SRC) src/plugkit/plugkit.c src/plugkit/pkjson.c $(PKMAIN_SRC) src/proto/obfs/obfs.c \
                           $(NET1_BASE_SRC)
-# Плагины протоколов на net1 и без него (build/build-libs.sh, build.sh, tests/buildmatch.sh).
+# tgws: без стека, со своим TLS и wolfSSL (TGWS_MODULE_SRC выше; слой примитивов — CRYPTO_SRC).
+PROFILE_plug_tgws      := $(TGWS_MODULE_SRC) src/plugkit/plugkit.c src/plugkit/pkjson.c $(PKMAIN_SRC) $(CRYPTO_SRC) \
+                          $(NET1_BASE_SRC)
+# Плагины протоколов на net1 и без него (build/build-libs.sh, build.sh, tests/buildmatch.sh). PLUGINS_TLS —
+# статические со своим TLS и wolfSSL. PLUGINS_EXTENDED — программы плагинов репозитория
+# splify2-extended-plugins, которые собирает это дерево (исходник плагина — plugins/<id>): в семя
+# steer-core они не входят, архив .s2p собирает и подписывает тот репозиторий.
 PLUGINS_NET1 := vless hysteria2 proxy xsteer warpbox
 PLUGINS_STATIC := obfs
+PLUGINS_TLS := tgws
+PLUGINS_EXTENDED := tgws
 
 # steer-box-connector (sing-box для podkop и forkop) живёт в своём репозитории
 # (github.com/splify2/steer-box-connector) и собирается build/ext-build.sh; нужные ему символы
@@ -431,7 +436,6 @@ CLIENT_SRC := src/client/main.c src/lib/ctlcall.c $(PLATFORM_SRC)
 PROFILE_DEFS_base     :=
 PROFILE_DEFS_extended :=
 PROFILE_DEFS_server   :=
-PROFILE_DEFS_tgws     :=
 # Телефон — не профиль, а платформа (src/platform): код обеих платформ есть в любой сборке, а
 # ключ задаёт только умолчание выбора при запуске — прошивка ведёт себя как телефон, где бы ни
 # запустилась. --platform и STEER_PLATFORM его переопределяют.
