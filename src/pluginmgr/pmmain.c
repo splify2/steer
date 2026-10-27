@@ -846,8 +846,20 @@ static int ensure_one(struct pm_ctx *x, const char *id, struct pm_result *all, c
     int here = pm_is_dir(d);
     free(d);
     if (p && here && (!p->state || strcmp(p->state, "failed"))) {
+        for (size_t k = 0; k < *np; k++)
+            if (!strcmp((*present)[k], id)) return 0;       /* уже учтён (сам или как зависимость) */
         *present = pm_realloc(*present, sizeof(char *) * (*np + 1));
         (*present)[(*np)++] = (char *)id;
+        /* Зависимости стоящего плагина тоже должны стоять: убранную руками библиотеку возвращаем
+         * из семени, а стоящие попадают в present — повторный запуск показывает весь набор. */
+        struct ydoc *m = pm_manifest(id);
+        const struct ynode *deps = m ? ynode_get(ynode_get(ydoc_root(m), "requires"), "plugins") : NULL;
+        for (size_t k = 0; k < ynode_len(deps); k++) {
+            /* имя переживает manifest: present держит указатели до конца команды (команда короткая) */
+            char *dep = pm_strdup(ynode_key_at(deps, k)->str);
+            if (ensure_one(x, dep, all, present, np, e) != 0) { ydoc_free(m); return -1; }
+        }
+        ydoc_free(m);
         return 0;
     }
     struct pm_req rq = { id, NULL };
@@ -950,6 +962,60 @@ static const char *seed_plugin_for(const struct ynode *plugins, const char *kind
     return NULL;
 }
 
+/* Обновление стоящих плагинов из семени (переход на новое ядро): плагин, поставленный из официального
+ * репозитория семени, получает версию семени, если она выше стоящей и подходит этому ядру (compat). Так
+ * библиотека net1 1.2.0 доходит до 1.3.0, а плагин, чей steer-api новое ядро не принимает, — до версии,
+ * которая принимает. Плагины из файла, из чужих репозиториев и более новые, чем в семени, не трогаются. */
+static void migrate_refresh(struct pm_ctx *x, struct pm_result *all, struct idset *bad, size_t *nfail) {
+    struct pm_repo *sr = pm_seed_repo();
+    if (!sr) return;
+    struct pm_err e = {{0}};
+    if (pm_index_get(sr, 0, &e) != 0) goto out;
+    const char *rid = yn_str(ynode_get(sr->iroot, "repo"), "id");
+    if (!rid) goto out;
+    /* Набор для обновления: все, у кого в семени версия выше. Ставятся ОДНОЙ группой (зависимости и
+     * зависимые вместе — новый warpbox без нового net1 не встаёт, и наоборот): одна проверка здоровья
+     * на группу, не прошла — откат всей группы. */
+    struct idset ids = {0};
+    for (size_t i = 0; i < x->st.n; i++) {
+        struct pm_inst *p = &x->st.v[i];
+        if (!p->version || !p->repo || p->unsigned_ || strcmp(p->repo, rid)) continue;
+        if (!pm_index_plugin(sr, p->id)) continue;
+        struct pm_cand c;
+        struct pm_err se = {{0}};
+        if (pm_select(x, sr, p->id, NULL, NULL, p->variant ? p->variant : "full", NULL, &c, &se) != 0) continue;
+        if (pm_ver_cmp(c.version, p->version) <= 0) continue;
+        idset_add(&ids, p->id);
+    }
+    if (ids.n) {
+        struct pm_req *rq = pm_alloc(sizeof(*rq) * ids.n);
+        for (size_t i = 0; i < ids.n; i++) { rq[i].id = ids.v[i]; rq[i].version = NULL; }
+        struct pm_opts o = {0};
+        o.seed_only = 1;
+        o.group = 1;
+        struct pm_result res;
+        struct pm_err ie = {{0}};
+        if (pm_install(x, rq, ids.n, &o, &res, &ie) != 0) {
+            char *m = pm_fmt("обновление из семени: %s", ie.msg);
+            idset_add(bad, m);
+            free(m);
+            (*nfail)++;
+        }
+        for (size_t k = 0; k < res.n; k++) {
+            all->v = pm_realloc(all->v, sizeof(*all->v) * (all->n + 1));
+            all->v[all->n++] = res.v[k];
+        }
+        free(res.v);
+        res.v = NULL; res.n = 0;
+        pm_result_free(&res);
+        free(rq);
+    }
+out:
+    free(sr->name); free(sr->url);
+    if (sr->idx) ydoc_free(sr->idx);
+    free(sr);
+}
+
 /* `steer plugin migrate`: плагины, которых требует спека человека, и те, что стояли пакетами
  * (migrate.json, его пишет pre-upgrade/preinst steer-core 2.1); при первой установке — все `default: true`
  * индекса семени. Работает без демона; неудача одного плагина остальные не останавливает. */
@@ -1012,6 +1078,7 @@ static int cmd_migrate(struct pm_ctx *x) {
             nfail++;
         }
     }
+    migrate_refresh(x, &all, &bad, &nfail);
     if (!x->json) {
         emit_result(x, &all, NULL, NULL, 0);
         for (size_t i = 0; i < bad.n; i++) fprintf(stderr, "не удалось: %s\n", bad.v[i]);

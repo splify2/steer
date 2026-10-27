@@ -442,6 +442,30 @@ check "  готовый переход: migrate.done.json есть, migrate.json
     "$([ -f etc/migrate.done.json ] && echo yes || echo no) $([ -f etc/migrate.json ] && echo yes || echo no)"
 o="$(STEER_SPEC="$T/mspec.yaml" P migrate --json 2>/dev/null)"
 check "повторный migrate ничего не ставит" "[] ['foo', 'net1']" "$(printf '%s\n' "$o" | jq_ 'str(d["installed"])+" "+str(d["present"])')"
+# migrate обновляет стоящие плагины из семени: версия семени выше стоящей — ставится (net1 1.2.0 → 1.3.0), та же —
+# нет; плагин из чужого репозитория не трогается.
+mk net1 1.3.0 ''
+build src/net1-1.3.0 proto.sec
+index
+cp repo/index.json repo/index.json.sig seed/
+cp repo/net1/1.3.0/net1-1.3.0-all.s2p seed/
+python3 - etc/state.json <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); d["plugins"]["net1"]["repo"] = "third"; json.dump(d, open(sys.argv[1], "w"))
+PY
+o="$(STEER_SPEC="$T/mspec.yaml" P migrate --json 2>/dev/null)"
+check "migrate: плагин из чужого репозитория не обновляется" "[] 1.2.0" \
+    "$(printf '%s\n' "$o" | jq_ 'str(d["installed"])+" "+json.load(open("etc/state.json"))["plugins"]["net1"]["version"]')"
+python3 - etc/state.json <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); d["plugins"]["net1"]["repo"] = "splify2"; json.dump(d, open(sys.argv[1], "w"))
+PY
+o="$(STEER_SPEC="$T/mspec.yaml" P migrate --json 2>/dev/null)"; rc=$?
+check "migrate: версия семени выше стоящей — обновление из семени" "0 net1 1.3.0 1.2.0 seed" \
+    "$rc $(printf '%s\n' "$o" | jq_ '" ".join(x["id"]+" "+x["version"]+" "+x["old"]+" "+x["from"] for x in d["installed"])')"
+check "  на месте 1.3.0" "1.3.0" "$(jq_ 'd["version"]' < root/net1/plugin.json)"
+o="$(STEER_SPEC="$T/mspec.yaml" P migrate --json 2>/dev/null)"
+check "migrate: версия та же — ничего не обновляет" "[]" "$(printf '%s\n' "$o" | jq_ 'str(d["installed"])')"
 rm -f etc/migrate.done.json
 printf 'X' | dd of=seed/foo-1.3.0-all.s2p bs=1 seek=200 conv=notrunc 2>/dev/null
 P remove foo --force --json >/dev/null 2>&1
@@ -495,6 +519,64 @@ PY
     i=0; while [ "$(jq_ 'd.get("auto",{}).get("last_check") or ""' < etc/state.json)" = "" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
     check "таймер демона: фоновое обновление прошло по сроку из state.json" "yes" \
         "$([ -n "$(jq_ 'd.get("auto",{}).get("last_check") or ""' < etc/state.json)" ] && echo yes)"
+    # ---- здоровье: откат только если установка УХУДШИЛА состояние; группа — одна проверка и откат целиком ----
+    FOOK=',"requires":{"plugins":{"net1":"^1.2"}},"steer":{"commands":[{"name":"foo-hello","prog":"bin/foo"}],"kinds":[{"name":"tunnel:foo","helper":{"prog":"bin/foo"}}]}'
+    "$BIN" ctl --socket "$T/s.sock" plugin-install foo >/dev/null 2>&1
+    # (а) спека негодна ещё до установки (вид warp без плагина): установка не делает хуже — плагин остаётся.
+    printf 'version: 2\noutputs:\n  a: { kind: warp }\n' > dspec.yaml
+    "$BIN" ctl --socket "$T/s.sock" plugin-reload >/dev/null 2>&1
+    mk foo 1.5.1 "$FOOK"
+    "$S2P" build src/foo-1.5.1 --unsigned -o udist >/dev/null 2>&1
+    o="$(P install --file udist/foo-1.5.1-all.s2p --unsigned --json 2>/dev/null)"; rc=$?
+    check "здоровье: ошибка перечитывания была и до установки — плагин остаётся" "0 1.5.1" "$rc $(jq_ 'd["plugins"]["foo"]["version"]' < etc/state.json)"
+    # Установка УХУДШИЛА: спека была здорова, postinst её испортил — откат.
+    printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > dspec.yaml
+    "$BIN" ctl --socket "$T/s.sock" plugin-reload >/dev/null 2>&1
+    mk foo 1.5.2 "$FOOK"
+    mkdir -p src/foo-1.5.2/scripts
+    printf '#!/bin/sh\n[ "$1" = --check ] && exit 0\nprintf "outputs: [" > %s/dspec.yaml\nexit 0\n' "$T" > src/foo-1.5.2/scripts/postinst
+    chmod 755 src/foo-1.5.2/scripts/postinst
+    sed -i 's/"arch":"all"/"arch":"all","scripts":{"postinst":"scripts\/postinst"}/' src/foo-1.5.2/plugin.json
+    "$S2P" build src/foo-1.5.2 --unsigned -o udist >/dev/null 2>&1
+    o="$(P install --file udist/foo-1.5.2-all.s2p --unsigned --json 2>/dev/null)"; rc=$?
+    check "здоровье: установка ухудшила (перечитывание теперь не удаётся) — откат" "1 1.5.1" "$rc $(jq_ 'd["plugins"]["foo"]["version"]' < etc/state.json)"
+    printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > dspec.yaml
+    P enable foo --json >/dev/null 2>&1
+    # Обновление из семени группой (migrate): новая версия net1 и foo встают вместе, проверка здоровья одна на группу;
+    # не прошла — откатываются обе.
+    P remove foo --force --json >/dev/null 2>&1
+    P ensure foo --json >/dev/null 2>&1
+    check "  до группы: net1 1.3.0, foo 1.3.0 из семени" "1.3.0 1.3.0" "$(jq_ 'd["plugins"]["net1"]["version"]+" "+d["plugins"]["foo"]["version"]' < etc/state.json)"
+    mk net1 1.4.0 ''
+    build src/net1-1.4.0 proto.sec
+    mk foo 1.6.0 "$FOOK"
+    mkdir -p src/foo-1.6.0/scripts
+    printf '#!/bin/sh\n[ "$1" = --check ] && exit 0\nprintf "outputs: [" > %s/dspec.yaml\nexit 0\n' "$T" > src/foo-1.6.0/scripts/postinst
+    chmod 755 src/foo-1.6.0/scripts/postinst
+    sed -i 's/"arch":"all"/"arch":"all","scripts":{"postinst":"scripts\/postinst"}/' src/foo-1.6.0/plugin.json
+    build src/foo-1.6.0 proto.sec
+    index
+    cp repo/index.json repo/index.json.sig seed/
+    cp repo/net1/1.4.0/net1-1.4.0-all.s2p repo/foo/1.6.0/foo-1.6.0-all.s2p seed/
+    o="$(P migrate --json 2>err.txt)"; rc=$?
+    check "группа: foo 1.6.0 портит спеку — откатываются и foo, и net1" "1 1.3.0 1.3.0" \
+        "$rc $(jq_ 'd["plugins"]["net1"]["version"]+" "+d["plugins"]["foo"]["version"]' < etc/state.json)"
+    has "  проверка здоровья одна, на группу" "проверка здоровья группы" "$(cat err.txt)"
+    printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > dspec.yaml
+    "$BIN" ctl --socket "$T/s.sock" plugin-reload >/dev/null 2>&1
+    # Версии, не прошедшие проверку, помечены (bad_versions) и не берутся снова: здоровая группа — новыми версиями.
+    mk net1 1.4.1 ''
+    build src/net1-1.4.1 proto.sec
+    mk foo 1.7.0 "$FOOK"
+    build src/foo-1.7.0 proto.sec
+    index
+    cp repo/index.json repo/index.json.sig seed/
+    cp repo/net1/1.4.1/net1-1.4.1-all.s2p repo/foo/1.7.0/foo-1.7.0-all.s2p seed/
+    o="$(P migrate --json 2>err.txt)"; rc=$?
+    check "группа: здоровая — net1 и foo обновлены" "0 1.4.1 1.7.0" \
+        "$rc $(jq_ 'd["plugins"]["net1"]["version"]+" "+d["plugins"]["foo"]["version"]' < etc/state.json)"
+    check "  проверка здоровья одна на группу, не по плагину" "1 0" \
+        "$(grep -c 'проверка здоровья группы' err.txt) $(grep -c 'проверка здоровья foo\|проверка здоровья net1' err.txt)"
     kill $D 2>/dev/null; wait $D 2>/dev/null; D=""
 else
     echo "pluginmgrmatch: блок с демоном ПРОПУЩЕН — нужен root и unshare (сеть демона и reload)"
