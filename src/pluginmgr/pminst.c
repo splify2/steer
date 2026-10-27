@@ -942,6 +942,79 @@ static void snap_free(struct snap *s) {
     free(s->from); free(s->installed_at);
 }
 
+/* Группа (pm_opts.group): плагины встают подряд без проверки здоровья каждого, потом одна проверка на всю
+ * группу; не здорова — откат всех, в обратном порядке. Запись держит то, что нужно для отката. */
+struct undo {
+    char *id, *dir, *prev, *old_ver, *mver;
+    int had_dir, was_disabled, timeout_s;
+    struct snap old;
+    struct outs before;
+};
+
+static void undo_free(struct undo *u) {
+    free(u->id); free(u->dir); free(u->prev); free(u->old_ver); free(u->mver);
+    snap_free(&u->old);
+    outs_free(&u->before);
+}
+
+static void undo_clear(struct pm_ctx *x) {
+    struct undo *u = x->undo;
+    for (size_t i = 0; i < x->nundo; i++) undo_free(&u[i]);
+    free(u);
+    x->undo = NULL;
+    x->nundo = 0;
+}
+
+/* Откат одной установки: файлы из .prev, состояние из снимка (нет прежнего — запись убирается). */
+static void undo_apply(struct pm_ctx *x, struct undo *u, const char *why) {
+    pm_rmrf(u->dir);
+    int restored = 0;
+    if (u->had_dir && rename(u->prev, u->dir) == 0) restored = 1;
+    struct pm_inst *inst = pm_state_find(&x->st, u->id);
+    char *bad_why = restored ? pm_fmt("%s — возвращена %s", why, u->old_ver ? u->old_ver : "прежняя") : pm_strdup(why);
+    if (restored && inst) {
+        snap_put(&u->old, inst);
+        pm_bad_set(inst, u->mver, bad_why);
+    } else if (inst) {
+        pm_state_del(&x->st, u->id);
+    }
+    pm_event(x, u->id, restored ? "rolled-back" : "failed", restored ? u->old_ver : u->mver, u->mver, bad_why);
+    free(bad_why);
+}
+
+/* Одна проверка здоровья на всю группу. 0 — здорова (прежние каталоги убраны); -1 — всё откатано, причина в e. */
+static int group_finish(struct pm_ctx *x, int before_bad, const char *before_msg, struct pm_err *e) {
+    struct undo *u = x->undo;
+    size_t n = x->nundo;
+    struct pm_err he = {{0}};
+    int healthy = 1;
+    int active = 0;
+    for (size_t i = 0; i < n; i++) if (!u[i].was_disabled) active = 1;
+    if (active && !x->no_daemon) {
+        pm_progress(x, "проверка здоровья группы (%zu)", n);
+        if (pm_daemon_reload(x, &he) != 0) {
+            /* Ошибка, которая была и до группы, — не вина группы: не хуже, чем было. */
+            if (before_bad && !strcmp(before_msg, he.msg)) pm_progress(x, "перечитывание плагинов не удавалось и до установки — %s", he.msg);
+            else healthy = 0;
+        }
+        for (size_t i = 0; healthy && i < n; i++)
+            if (!u[i].was_disabled && wait_outs(x, &u[i].before, u[i].timeout_s, &he) != 0) healthy = 0;
+    }
+    struct pm_err se = {{0}};
+    if (healthy) {
+        for (size_t i = 0; i < n; i++) pm_rmrf(u[i].prev);
+        return 0;
+    }
+    pm_progress(x, "откат группы (%zu): %s", n, he.msg);
+    for (size_t i = n; i-- > 0;) undo_apply(x, &u[i], he.msg);
+    pm_state_save(&x->st, &se);
+    pm_keepd_write(x);
+    struct pm_err re = {{0}};
+    pm_daemon_reload(x, &re);
+    pm_errf(e, "группа плагинов не прошла проверку здоровья: %s — возвращены прежние версии", he.msg);
+    return -1;
+}
+
 /* Источник установки: кандидат индекса или файл. */
 struct src {
     const struct pm_cand *c;     /* NULL — файл */
@@ -1084,6 +1157,8 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         outs_up(x, k, &before);
     }
     int spec_ok = x->no_daemon ? 1 : daemon_spec_ok(x);
+    /* Что говорило ядро о перечитывании плагинов ДО установки: прежняя ошибка — не вина этого плагина. */
+    if (!x->defer) x->before_bad = !x->no_daemon && pm_daemon_reload(x, &x->before_err) != 0;
     if (oldman) {
         struct pm_err pe = {{0}};
         if (run_script(id, dir, ydoc_root(oldman), "prerm", mver, &pe) != 0)
@@ -1137,10 +1212,23 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     struct pm_err se = {{0}};
     pm_state_save(&x->st, &se);
     pm_keepd_write(x);
-    if (healthy && !was_disabled) {
+    if (healthy && x->defer) {
+        /* Группа: проверка здоровья одна, в конце (group_finish); здесь — только запись для отката. */
+        struct undo *u;
+        x->undo = pm_realloc(x->undo, sizeof(struct undo) * (x->nundo + 1));
+        u = &((struct undo *)x->undo)[x->nundo++];
+        memset(u, 0, sizeof(*u));
+        u->id = pm_strdup(id); u->dir = pm_strdup(dir); u->prev = pm_strdup(prev);
+        u->old_ver = s_or_null(old_ver); u->mver = pm_strdup(mver);
+        u->had_dir = had_dir; u->was_disabled = was_disabled;
+        u->timeout_s = (int)yn_long(ynode_get(m, "health"), "timeout_s", 60);
+        u->old = old; memset(&old, 0, sizeof(old));
+        u->before = before; memset(&before, 0, sizeof(before));
+    } else if (healthy && !was_disabled) {
         pm_progress(x, "проверка здоровья %s", id);
         if (pm_daemon_reload(x, &he) != 0) {
-            if (spec_ok) healthy = 0;
+            if (spec_ok && !(x->before_bad && !strcmp(x->before_err.msg, he.msg))) healthy = 0;
+            else if (spec_ok) pm_progress(x, "перечитывание плагинов не удавалось и до установки — %s", he.msg);
             else pm_progress(x, "спека не читалась и до установки — %s", he.msg);
         }
         if (healthy) {
@@ -1178,9 +1266,11 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         free(dir); free(prevd); free(prev); free(old_ver);
         goto out;
     }
-    pm_rmrf(prev);
-    pm_event(x, id, old_ver && strcmp(old_ver, mver) ? "updated" : (was_disabled ? "installed" : "enabled"), mver,
-             old_ver, s->reason);
+    if (!x->defer) {
+        pm_rmrf(prev);
+        pm_event(x, id, old_ver && strcmp(old_ver, mver) ? "updated" : (was_disabled ? "installed" : "enabled"), mver,
+                 old_ver, s->reason);
+    }
     res->v = pm_realloc(res->v, sizeof(*res->v) * (res->n + 1));
     struct pm_done *d = &res->v[res->n++];
     d->id = pm_strdup(id);
@@ -1262,6 +1352,10 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
     struct plan p = {0};
     const char *reason = NULL;
     char *reason_buf = NULL;
+    if (o->group) {
+        x->defer = 1;
+        x->before_bad = !x->no_daemon && pm_daemon_reload(x, &x->before_err) != 0;
+    }
     int rc = plan_build(x, &p, req, nreq, "full", o, &seedrs, e);
     if (rc == 0 && space_check(x, &p, e) != 0) {
         /* На полный вариант нет места: облегчённый, если он есть и помещается (manifest.md). */
@@ -1280,6 +1374,7 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
         free(full_why);
     }
     if (rc != 0) {
+        x->defer = 0;
         free(p.v);
         free(reason_buf);
         if (sr) { free(sr->name); free(sr->url); if (sr->idx) ydoc_free(sr->idx); free(sr); }
@@ -1307,6 +1402,31 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
     free(p.v);
     free(reason_buf);
     if (sr) { free(sr->name); free(sr->url); if (sr->idx) ydoc_free(sr->idx); free(sr); }
+    if (o->group) {
+        x->defer = 0;
+        struct undo *u = x->undo;
+        if (rc != 0) {
+            /* Одна из группы не встала: откат всех, что уже стоят. */
+            struct pm_err se = {{0}};
+            for (size_t i = x->nundo; i-- > 0;) undo_apply(x, &u[i], e->msg);
+            if (x->nundo) { pm_state_save(&x->st, &se); pm_keepd_write(x); pm_daemon_reload(x, &se); }
+            pm_result_free(res);
+            memset(res, 0, sizeof(*res));
+        } else if (x->nundo) {
+            struct pm_err ge = {{0}};
+            if (group_finish(x, x->before_bad, x->before_err.msg, &ge) != 0) {
+                *e = ge;
+                pm_result_free(res);
+                memset(res, 0, sizeof(*res));
+                rc = -1;
+            } else {
+                for (size_t i = 0; i < x->nundo; i++)
+                    pm_event(x, u[i].id, u[i].old_ver && strcmp(u[i].old_ver, u[i].mver) ? "updated" : (u[i].was_disabled ? "installed" : "enabled"),
+                             u[i].mver, u[i].old_ver, NULL);
+            }
+        }
+        undo_clear(x);
+    }
     return rc;
 }
 

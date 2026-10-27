@@ -210,6 +210,11 @@ struct pm_ctx {
     int quiet;
     int no_daemon;               /* не звать демон (без сокета) */
     int allow_bad;               /* отбор берёт и версии из bad_versions (явная версия) */
+    int defer;                   /* группа: проверка здоровья откладывается до конца группы (pm_opts.group) */
+    void *undo;                  /* записи отката группы (pminst.c) */
+    size_t nundo;
+    struct pm_err before_err;    /* ошибка plugin-reload до установки (before_bad) */
+    int before_bad;
 };
 void pm_progress(struct pm_ctx *x, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
@@ -223,6 +228,7 @@ struct pm_opts {
     int unsigned_ok;             /* --unsigned */
     int update;                  /* обновление: только из своего репозитория */
     int auto_;                   /* фоновое */
+    int group;                   /* весь план одной группой: одна проверка здоровья, откат всей группы */
 };
 struct pm_done { char *id, *version, *from, *old; int updated; };
 struct pm_result { struct pm_done *v; size_t n; char **failed; size_t nfailed; };
