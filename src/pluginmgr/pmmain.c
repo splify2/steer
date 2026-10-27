@@ -846,8 +846,20 @@ static int ensure_one(struct pm_ctx *x, const char *id, struct pm_result *all, c
     int here = pm_is_dir(d);
     free(d);
     if (p && here && (!p->state || strcmp(p->state, "failed"))) {
+        for (size_t k = 0; k < *np; k++)
+            if (!strcmp((*present)[k], id)) return 0;       /* уже учтён (сам или как зависимость) */
         *present = pm_realloc(*present, sizeof(char *) * (*np + 1));
         (*present)[(*np)++] = (char *)id;
+        /* Зависимости стоящего плагина тоже должны стоять: убранную руками библиотеку возвращаем
+         * из семени, а стоящие попадают в present — повторный запуск показывает весь набор. */
+        struct ydoc *m = pm_manifest(id);
+        const struct ynode *deps = m ? ynode_get(ynode_get(ydoc_root(m), "requires"), "plugins") : NULL;
+        for (size_t k = 0; k < ynode_len(deps); k++) {
+            /* имя переживает manifest: present держит указатели до конца команды (команда короткая) */
+            char *dep = pm_strdup(ynode_key_at(deps, k)->str);
+            if (ensure_one(x, dep, all, present, np, e) != 0) { ydoc_free(m); return -1; }
+        }
+        ydoc_free(m);
         return 0;
     }
     struct pm_req rq = { id, NULL };
