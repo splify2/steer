@@ -10,7 +10,10 @@
 # ВЫХОД и ИСХОДНИКИ — пути на этой машине внутри каталога MOUNT (умолчание — родитель дерева steer:
 # так steer подмодулем в репозитории модуля виден вместе с его исходниками).
 set -eu
-[ $# -ge 3 ] || { echo "usage: $0 АРХ ВЫХОД ИМЯ:ИСХОДНИКИ [ИМЯ:ИСХОДНИКИ…]" >&2; exit 2; }
+# --static — программа плагина: без libsteer, со своей копией TLS и wolfSSL (build/sources.mk, EXT_TLS_SRC).
+STATIC=""
+[ "${1:-}" = "--static" ] && { STATIC=1; shift; }
+[ $# -ge 3 ] || { echo "usage: $0 [--static] АРХ ВЫХОД ИМЯ:ИСХОДНИКИ [ИМЯ:ИСХОДНИКИ…]" >&2; exit 2; }
 ARCH="$1"; OUTD="$2"; shift 2
 STEER="$(cd "$(dirname "$0")/.." && pwd -P)"
 MOUNT="$(cd "${MOUNT:-$STEER/..}" && pwd -P)"
@@ -46,6 +49,6 @@ owner="$(id -u):$(id -g)"
 # Actions — не root) их не удалить.
 docker run --rm -v "$MOUNT:/w" -w "$steer_in" --entrypoint sh \
     -e CC="zig cc -target $target -mcpu=$mcpu" -e AR="zig ar" -e ZIG=1 \
-    -e INTERP="$interp" -e STEER_EXT_APPS="${apps# }" -e STEER_EXT_ONLY=1 "$IMAGE" -c \
+    -e INTERP="$interp" -e STEER_EXT_APPS="${apps# }" -e STEER_EXT_ONLY=1 -e STEER_EXT_STATIC="$STATIC" "$IMAGE" -c \
     'sh build/build-libs.sh "$1" "$2" "$3"; rc=$?; rm -rf "$1/obj"; chown -R "$4" "$1"; exit $rc' _ \
     "$outd_in" "$VERSION" "$REV" "$owner"

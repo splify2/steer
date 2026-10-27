@@ -311,12 +311,30 @@ fi
 # build/ext-build.sh.
 _eldi=""
 [ -z "$INTERP" ] || _eldi="-Wl,--dynamic-linker=$INTERP"
+# STEER_EXT_STATIC=1 (ext-build.sh --static) — программа плагина без libsteer: свои исходники, EXT_TLS_SRC
+# дерева steer и wolfSSL статически (как tgws, PLUGINS_TLS), от системы — только libc. Так собирается плагин
+# box-connector: связь с libsteer.so.<версия> привязала бы его к одной версии ядра.
+if [ -n "${STEER_EXT_STATIC:-}" ] && [ -n "${STEER_EXT_APPS:-}" ]; then
+    _xod="$OBJ/ext-tls"
+    mkdir -p "$_xod"
+    _xs=""
+    for f in $(profile_var EXT_TLS_SRC); do [ "$f" = "$CRYPTO" ] || _xs="$_xs $f"; done
+    # shellcheck disable=SC2086
+    compile "-O2 $APPF" "$_xod" $_xs
+    # shellcheck disable=SC2086
+    $CC -O2 $APPF $WCFLAGS -c "$CRYPTO" -o "$_xod/$(echo "$CRYPTO" | tr / _).o"
+fi
 for _ea in ${STEER_EXT_APPS:-}; do
     _en="${_ea%%:*}"; _ed="${_ea#*:}"
     _eod="$OBJ/ext-$_en"
     mkdir -p "$_eod"
     # shellcheck disable=SC2046,SC2086
     compile "-O2 $APPF -I$_ed" "$_eod" $(ls "$_ed"/*.c)
+    if [ -n "${STEER_EXT_STATIC:-}" ]; then
+        # shellcheck disable=SC2086
+        $CC -o "$OUT/$_en" "$_eod"/*.o "$_xod"/*.o "$WLIB" $_eldi -Wl,--gc-sections -s $LIBS
+        continue
+    fi
     # shellcheck disable=SC2086
     $CC -o "$OUT/$_en" "$_eod"/*.o "$OBJ/modcmd.o" "$SO" $_eldi $RPL \
         -Wl,--gc-sections -Wl,--as-needed -s $LIBS

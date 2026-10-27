@@ -58,6 +58,7 @@ const char *pm_seed(void);      /* /usr/share/steer/seed             STEER_PLUGI
 const char *pm_run(void);       /* /var/run/steer/plugins            STEER_PLUGIN_RUN */
 const char *pm_tmp(void);       /* /tmp/steer-plugins                STEER_PLUGIN_TMP */
 const char *pm_keepd(void);     /* /lib/upgrade/keep.d/steer-plugins STEER_PLUGIN_KEEPD */
+const char *pm_sysroot(void);   /* ""  — корень путей steer.links     STEER_PLUGIN_SYSROOT */
 /* Путь «a/b» в куче (die при нехватке памяти — это точка входа команды). */
 char *pm_path(const char *a, const char *b);
 char *pm_strdup(const char *s);
@@ -233,6 +234,8 @@ struct pm_ctx {
     size_t nundo;
     struct pm_err before_err;    /* ошибка plugin-reload до установки (before_bad) */
     int before_bad;
+    const char *pkg_tx;          /* --pkg ИМЯ: менеджер зовёт скрипт этого системного пакета изнутри
+                                    транзакции apk/opkg — пакет считается стоящим, база заперта */
 };
 void pm_progress(struct pm_ctx *x, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
@@ -256,6 +259,9 @@ int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_
 int pm_set_enabled(struct pm_ctx *x, const char *id, int on, struct pm_err *e);
 void pm_result_free(struct pm_result *r);
 int pm_keepd_write(struct pm_ctx *x);
+/* steer.links (steer-api 1.3): пути в системе, которые менеджер ведёт, пока плагин стоит. Восстановить
+ * недостающие у стоящего плагина (ensure). 0 — на месте; -1 — путь занят чужим, причина в e. */
+int pm_links_repair(struct pm_ctx *x, const char *id, struct pm_err *e);
 int pm_file_sha256(const char *path, unsigned char out[32], unsigned long long *size);
 /* Скачать url в память (pmindex.c). 0 — ответ 2xx; why — причина отказа. */
 int pm_http_mem(const char *url, char **body, size_t *n, char *why, size_t wn);
