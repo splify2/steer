@@ -57,7 +57,7 @@ static int load(const char *name, const char *text, struct spec *sp, char *msg, 
     FILE *f = fopen(path, "w");
     fputs(text, f);
     fclose(f);
-    struct err e = { { 0 } };
+    struct err e = {0};
     int rc = load_spec(path, sp, &e);
     snprintf(msg, n, "%s", e.msg);
     return rc;

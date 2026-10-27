@@ -114,15 +114,13 @@ int group_named(const struct group_cfg *g) {
 
 int group_seal(struct spec *sp, struct output *go, struct err *e) {
     struct group_cfg *g = &go->grp;
-    if (!g->members_n) return err_set(e, "outputs.%s: у группы нет членов", go->name);
+    if (!g->members_n) return err_setc(e, "spec.group_no_members_name", "outputs.%s: у группы нет членов", go->name);
     /* Единственный предел числа членов, и он — свойство карты balance (kind.h, GROUP_BAL_SLOTS):
      * у члена без слота доли нет. Остальные pick пределов по числу членов не имеют. */
     if (g->pick == PICK_BALANCE && g->members_n > GROUP_BAL_SLOTS) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "outputs.%.31s: у группы pick: balance членов не больше %d "
+        return err_setf(e, "spec.balance_members", "outputs.%.31s: у группы pick: balance членов не больше %d "
                  "(в карте ядра %d слотов, у каждого члена нужен хотя бы один), а их %zu",
                  go->name, GROUP_BAL_SLOTS, GROUP_BAL_SLOTS, g->members_n);
-        return err_set(e, "%s", msg);
     }
     unsigned caps = ~0u;
     for (size_t i = 0; i < g->members_n; i++) {
@@ -132,15 +130,13 @@ int group_seal(struct spec *sp, struct output *go, struct err *e) {
          * одно устройство нечем (см. шапку, «ВЛОЖЕННОСТЬ»). */
         const struct group_cfg *mg = out_group(m);
         if (mg && mg->pick == PICK_BALANCE && g->pick != PICK_BALANCE) {
-            char msg[400];
-            snprintf(msg, sizeof(msg), "outputs.%s: %s — группа pick: balance, а членом группы pick: %s "
+            return err_setf(e, "spec.balance_nested", "outputs.%s: %s — группа pick: balance, а членом группы pick: %s "
                      "она быть не может: у такой группы трафик идёт в одно устройство, а у balance "
                      "устройство на каждое соединение своё", go->name, m->name,
                      group_pick_name(g->pick));
-            return err_set(e, "%s", msg);
         }
         if (!out_has_device(m))
-            return err_set(e, "outputs.%s: член группы без устройства", go->name);
+            return err_setc(e, "spec.member_no_device_name", "outputs.%s: член группы без устройства", go->name);
         caps &= out_caps(m);
     }
     /* Своего сокета наверх и своего процесса у группы нет: KC_OVER и KC_ENGINE_OWNED — свойства

@@ -528,7 +528,7 @@ static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) 
      * список здесь означал бы устройства, которые никто не создаст. */
     if (k->devices_n > 1 ||
         (k->devices_n == 1 && o->device[0] && strcmp(o->device, k->devices[0]) != 0))
-        return err_set(e, "outputs.%s: у kind awg одно устройство — его заводит ядро steer; пул "
+        return err_setc(e, "spec.awg_one_device", "outputs.%s: у kind awg одно устройство — его заводит ядро steer; пул "
             "собирается выходом kind=interface", o->name);
     if (k->devices_n == 1 && !o->device[0])
         snprintf(o->device, sizeof(o->device), "%s", k->devices[0]);
@@ -538,9 +538,9 @@ static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) 
      * владелец просил не оставлять. */
     if (o->device[0]) {
         if (strlen(o->device) > 15)
-            return err_set(e, "outputs.%s: имя устройства длиннее 15 символов", o->name);
+            return err_setc(e, "spec.device_name_long", "outputs.%s: имя устройства длиннее 15 символов", o->name);
         if (awg_ifname_conspicuous(o->device))
-            return err_set(e, "outputs.%s: имя устройства выдаёт туннель (tun, wg, awg, ppp, vpn…) — "
+            return err_setc(e, "spec.device_name_tunnel", "outputs.%s: имя устройства выдаёт туннель (tun, wg, awg, ppp, vpn…) — "
                 "уберите device, и ядро steer выберет имя само", o->name);
     } else awg_default_ifname(o->name, o->device, sizeof(o->device));
     /* Путь к файлу — тем же порядком, что у xsteer: по умолчанию из имени выхода, иначе
@@ -548,7 +548,7 @@ static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) 
     if (!o->awg.conf[0])
         snprintf(o->awg.conf, sizeof(o->awg.conf), "%s/awg/%.200s.conf", plat()->etc_dir, o->name);
     else if (o->awg.conf[0] != '/' || !label_ok(o->awg.conf))
-        return err_set(e, "outputs.%s: conf должен быть абсолютным путём без кавычек", o->name);
+        return err_setc(e, "spec.awg_conf_path", "outputs.%s: conf должен быть абсолютным путём без кавычек", o->name);
     return 0;
 }
 

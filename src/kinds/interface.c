@@ -27,7 +27,7 @@ static int iface_parse(struct output *o, const struct out_keys *k, struct err *e
      * работает сейчас, devices — из чего выбирать. Задан только список — устройство выводится
      * из первого; сам список (если в нём есть из чего выбирать) станет группой у перевода v1. */
     if (!o->device[0] && k->devices_n) snprintf(o->device, sizeof(o->device), "%s", k->devices[0]);
-    if (!o->device[0]) return err_set(e, "outputs.%s: kind interface needs a device", o->name);
+    if (!o->device[0]) return err_setc(e, "spec.interface_needs_device", "outputs.%s: kind interface needs a device", o->name);
     o->iface.obfs = k->obfs;
     return 0;
 }

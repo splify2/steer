@@ -43,7 +43,9 @@ LIBSTEER_1 {
     dupq_stream_reset;
     dupq_stream_send;
     dupq_timeout_ms;
+    err_args_add;
     err_die;
+    err_json;
     err_set;
     evline_free;
     evline_int;
