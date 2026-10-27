@@ -115,6 +115,10 @@ echo "v2match: перевод v1 → v2 — $same спек дали тот же 
 # ---- 2. разбор v2 ----------------------------------------------------------------------------
 pass=0
 BIN="$STEER_BIN"
+# Виды протоколов (tunnel:vless, xsteer, warp…) ядро берёт только из манифестов плагинов: дальше
+# стенд идёт с каталогом плагинов дерева (tests/plugroot.sh — манифесты и программа хуков build/pkhooks).
+sh tests/plugroot.sh "$tmp/plugins" "$(dirname "$STEER_BIN")" || { echo "v2match: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 S="--state-dir $tmp/state"
 printf '203.0.113.0/24\n' > "$tmp/a.lst"
 printf 'example.com\n' > "$tmp/d.lst"
@@ -124,13 +128,13 @@ bad()  { fail=$((fail + 1)); printf 'FAIL v2match: %s\n' "$1"; [ -n "${2:-}" ] &
 
 y() { sed "s|TMP|$tmp|g" > "$tmp/s.yaml"; }
 
-# warp: count печатается всегда, кроме умолчания 1 — прежде пропускалось 3 (старое умолчание), и выбор
-# «3 туннеля» после круга записи и чтения становился 1.
+# warp (вид плагина warpbox): ключи вида печатаются как записаны — count переживает круг записи и
+# чтения при любом значении (прежде, у вида в ядре, пропускалось умолчание, и выбор менялся молча).
 for n in 1 2 3 5; do
     printf 'version: 2\noutputs:\n  w: { kind: warp, count: %s }\n' "$n" > "$tmp/w1.yaml"
     "$BIN" spec convert --spec "$tmp/w1.yaml" > "$tmp/w2.yaml" 2>&1
     "$BIN" spec convert --spec "$tmp/w2.yaml" > "$tmp/w3.yaml" 2>&1
-    want="count: $n"; [ "$n" = 1 ] && want=""
+    want="count: $n"
     got="$(grep -o 'count: [0-9]*' "$tmp/w3.yaml")"
     if [ "$got" = "$want" ]; then ok; else bad "warp count: $n — после двух кругов convert «$got»"; fi
 done
@@ -150,9 +154,9 @@ refused() {
     fi
 }
 
-# Примеры из документов — движком с видами расширенной части (vless, xsteer): build/steer-xk,
-# базовая сборка с файлами видов (Makefile). Пути в примерах относительные — от каталога стенда.
-XK="${XK:-./build/steer-xk}"
+# Примеры из документов — с видами протоколов из манифестов плагинов (каталог выше). Пути в примерах
+# относительные — от каталога стенда.
+XK="$BIN"
 if [ -x "$XK" ]; then
     XKA="$(abs "$XK")"
     mkdir -p "$tmp/lists" "$tmp/sub"
@@ -223,7 +227,7 @@ if [ -x "$XK" ]; then
         bad "convert печатает hysteria2 с nodes (неподвижная точка)" "$(grep -n hy "$tmp/c1.yaml")"; fi
     printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, transport: ws }\n' > "$tmp/hy2.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec hy2.yaml --state-dir "$tmp/state" 2>&1)"
-    if echo "$out" | grep -qF "у kind hysteria2 нет transport"; then ok; else bad "hysteria2 с transport — отказ" "$out"; fi
+    if echo "$out" | grep -qF "неизвестный ключ «transport»"; then ok; else bad "hysteria2 с transport — отказ" "$out"; fi
     printf 'version: 2\noutputs:\n  hy: { kind: hysteria2, subscription: sub/hy }\n' > "$tmp/hy3.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec hy3.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "туннель пишется kind: tunnel, protocol: hysteria2"; then ok; else bad "kind: hysteria2 в v2 — отказ с подсказкой" "$out"; fi
@@ -247,19 +251,19 @@ if [ -x "$XK" ]; then
            [ "$(sed -n '/^clients:/,/^[a-z]/p' "$tmp/many.out" | grep '^  c' | sed 's/:.*//' | sort -u | wc -l)" = 1005 ]; then ok; else
             bad "1005 клиентов с общим началом имени — печать кончается, имена различны" "rc=$mrc клиентов=$mu"; fi
     }
-    # transport: у туннеля (шаг 5 выпуска 1.10) — фильтр транспортов узлов подписки: одно имя или
-    # список; convert печатает его обратно (одно — строкой, несколько — списком в порядке имён) и
-    # остаётся неподвижной точкой; отказы — с местом.
+    # transport: у туннеля vless — фильтр транспортов узлов подписки: одно имя или список (схема вида
+    # плагина, x-one-or-list); convert печатает его списком, как записан, и остаётся неподвижной точкой;
+    # отказы — по схеме, с местом.
     printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, transport: ws }\n' > "$tmp/tr1.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec tr1.yaml --state-dir "$tmp/state" 2>&1)"
     if [ $? = 0 ]; then ok; else bad "transport: ws — принят" "$(echo "$out" | head -n 3)"; fi
     (cd "$tmp" && "$XKA" spec convert --spec tr1.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
-    if grep -q 'transport: ws[,} ]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+    if grep -q 'transport: \[ws\]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
         bad "convert печатает transport: ws (неподвижная точка)" "$(grep -n transport "$tmp/c1.yaml")"; fi
     printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, transport: [httpupgrade, ws] }\n' > "$tmp/tr2.yaml"
     (cd "$tmp" && "$XKA" spec convert --spec tr2.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
-    if grep -q 'transport: \[ws, httpupgrade\]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
-        bad "convert печатает список транспортов в порядке имён" "$(grep -n transport "$tmp/c1.yaml")"; fi
+    if grep -q 'transport: \[httpupgrade, ws\]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
+        bad "convert печатает список транспортов как записан" "$(grep -n transport "$tmp/c1.yaml")"; fi
     trref() {   # имя, значение transport, строка отказа, место
         printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, transport: %s }\n' "$2" > "$tmp/tr3.yaml"
         out="$(cd "$tmp" && "$XKA" apply --dry-run --spec tr3.yaml --state-dir "$tmp/state" 2>&1)"
@@ -267,13 +271,13 @@ if [ -x "$XK" ]; then
         if [ "$rc" = 2 ] && echo "$out" | grep -qF -- "$3" && echo "$out" | grep -qF "tr3.yaml:$4:"; then ok; else
             bad "$1" "код $rc: $out"; fi
     }
-    trref "transport: kcp — отказ с местом" kcp "«kcp» — нужен tcp, grpc, xhttp, ws или httpupgrade" 3:73
-    trref "transport: [ws, ws] — отказ" "[ws, ws]" "ws указан дважды" 3:78
-    trref "transport: [] — отказ" "[]" "пустой список" 3:73
+    trref "transport: kcp — отказ с местом" kcp "«kcp» — нужно одно из: tcp, grpc, xhttp, ws, httpupgrade" 3:73
+    trref "transport: [ws, ws] — отказ" "[ws, ws]" "«ws» уже есть в списке" 3:78
+    trref "transport: [] — отказ" "[]" "нужно не меньше 1" 3:73
     printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, transport: ws }\n' > "$tmp/tr4.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec tr4.yaml --state-dir "$tmp/state" 2>&1)"
-    if echo "$out" | grep -qF "ключ transport есть только у kind: tunnel"; then ok; else
-        bad "transport у interface — отказ «только у kind: tunnel»" "$out"; fi
+    if echo "$out" | grep -qF "неизвестный ключ «transport» в outputs.wg"; then ok; else
+        bad "transport у interface — отказ «неизвестный ключ»" "$out"; fi
     # insecure: у туннеля vless — явный отказ от проверки сертификата узлов TLS; convert печатает его
     # обратно и остаётся неподвижной точкой; у hysteria2 (там insecure — параметр ссылки) и у прочих
     # видов — отказ.
@@ -285,11 +289,11 @@ if [ -x "$XK" ]; then
         bad "convert печатает insecure: true (неподвижная точка)" "$(grep -n insecure "$tmp/c1.yaml")"; fi
     printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, insecure: true }\n' > "$tmp/in2.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec in2.yaml --state-dir "$tmp/state" 2>&1)"
-    if echo "$out" | grep -qF "у kind hysteria2 нет insecure"; then ok; else bad "insecure у hysteria2 — отказ" "$out"; fi
+    if echo "$out" | grep -qF "неизвестный ключ «insecure»"; then ok; else bad "insecure у hysteria2 — отказ" "$out"; fi
     printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, insecure: true }\n' > "$tmp/in3.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec in3.yaml --state-dir "$tmp/state" 2>&1)"
-    if echo "$out" | grep -qF "ключ insecure есть только у kind: tunnel"; then ok; else
-        bad "insecure у interface — отказ «только у kind: tunnel»" "$out"; fi
+    if echo "$out" | grep -qF "неизвестный ключ «insecure» в outputs.wg"; then ok; else
+        bad "insecure у interface — отказ «неизвестный ключ»" "$out"; fi
     # exclude и exclude_name: у туннеля любого протокола — исключение узлов по стране (флаг в имени) и
     # по куску имени. convert печатает их обратно и остаётся неподвижной точкой; отказы — с местом.
     for p in "protocol: vless" "protocol: hysteria2" "protocol: trojan"; do
@@ -311,27 +315,27 @@ if [ -x "$XK" ]; then
         if [ "$rc" = 2 ] && echo "$out" | grep -qF -- "$3" && echo "$out" | grep -qF "ex3.yaml:$4:"; then ok; else
             bad "$1" "код $rc: $out"; fi
     }
-    exref "exclude: ru — отказ с местом" "exclude: ru" "«ru» — код страны: две заглавные латинские буквы" 3:69
-    exref "exclude: RUS — отказ" "exclude: [RUS]" "«RUS» — код страны: две заглавные латинские буквы" 3:70
-    exref "exclude: [RU, RU] — отказ" "exclude: [RU, RU]" "RU указан дважды" 3:74
-    exref "exclude_name: [a, a] — отказ" "exclude_name: [a, a]" "«a» указано дважды" 3:78
-    exref "exclude_name: \"\" — отказ" 'exclude_name: [""]' "непустая строка" 3:75
+    exref "exclude: ru — отказ с местом" "exclude: ru" "«ru» не подходит под ^[A-Z]{2}$" 3:69
+    exref "exclude: RUS — отказ" "exclude: [RUS]" "«RUS» не подходит под ^[A-Z]{2}$" 3:70
+    exref "exclude: [RU, RU] — отказ" "exclude: [RU, RU]" "«RU» уже есть в списке" 3:74
+    exref "exclude_name: [a, a] — отказ" "exclude_name: [a, a]" "«a» уже есть в списке" 3:78
+    exref "exclude_name: \"\" — отказ" 'exclude_name: [""]' "короче 1 знаков" 3:75
     # only — узлы только этих стран: тот же разбор, печать и неподвижная точка; спор с exclude — отказ.
     printf 'version: 2\noutputs:\n  t: { kind: tunnel, protocol: vless, subscription: sub/t, only: [NL, DE], exclude_name: lte }\n' > "$tmp/on1.yaml"
     (cd "$tmp" && "$XKA" spec convert --spec on1.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
     if grep -q 'only: \[NL, DE\], exclude_name: \[lte\]' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
         bad "convert печатает only (неподвижная точка)" "$(grep -n only "$tmp/c1.yaml")"; fi
-    exref "only: nl — отказ с местом" "only: nl" "«nl» — код страны: две заглавные латинские буквы" 3:66
-    exref "only: [NL, NL] — отказ" "only: [NL, NL]" "NL указан дважды" 3:71
-    exref "only и exclude по одной стране — отказ" "only: [NL, DE], exclude: DE" "DE — и в only, и в exclude" 3:66
+    exref "only: nl — отказ с местом" "only: nl" "«nl» не подходит под ^[A-Z]{2}$" 3:66
+    exref "only: [NL, NL] — отказ" "only: [NL, NL]" "«NL» уже есть в списке" 3:71
+    exref "only и exclude по одной стране — отказ" "only: [NL, DE], exclude: DE" "DE — и в only, и в exclude" 3:6
     printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, only: [RU] }\n' > "$tmp/on4.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec on4.yaml --state-dir "$tmp/state" 2>&1)"
-    if echo "$out" | grep -qF "ключ only есть только у kind: tunnel"; then ok; else
-        bad "only у interface — отказ «только у kind: tunnel»" "$out"; fi
+    if echo "$out" | grep -qF "неизвестный ключ «only» в outputs.wg"; then ok; else
+        bad "only у interface — отказ «неизвестный ключ»" "$out"; fi
     printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, exclude: [RU] }\n' > "$tmp/ex4.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec ex4.yaml --state-dir "$tmp/state" 2>&1)"
-    if echo "$out" | grep -qF "ключ exclude есть только у kind: tunnel"; then ok; else
-        bad "exclude у interface — отказ «только у kind: tunnel»" "$out"; fi
+    if echo "$out" | grep -qF "неизвестный ключ «exclude» в outputs.wg"; then ok; else
+        bad "exclude у interface — отказ «неизвестный ключ»" "$out"; fi
     # only и exclude у группы (pick: latency, order): страна живого узла члена. convert печатает их
     # обратно неподвижной точкой; у manual и balance, при споре и у не-группы — отказ с местом.
     gy() {   # имя, pick, лишние ключи
@@ -378,9 +382,9 @@ if [ -x "$XK" ]; then
             bad "$1" "код $rc: $out"; fi
     }
     plref "active: 0 — отказ с местом" "active: 0" "active" 3:70
-    plref "by: random — отказ с местом" "active: 2, by: random" "«random» — нужен connection, site или site_client" 3:77
+    plref "by: random — отказ с местом" "active: 2, by: random" "«random» — нужно одно из: connection, site, site_client" 3:77
     plref "interval: 2 — отказ" "interval: 2" "interval" 3:72
-    plref "silence: 3 — отказ с причиной" "silence: 3" "меньше 5 с" 3:71
+    plref "silence: 3 — отказ с причиной" "silence: 3" "меньше 5 с" 3:7
     plref "silence: 40000 — отказ" "silence: 40000" "silence" 3:71
     plref "active больше узлов в nodes — отказ" "nodes: [0, 1], active: 3" "active 3, а узлов в nodes 2" ""
     printf 'version: 2\noutputs:\n  tj: { kind: tunnel, protocol: trojan, subscription: sub/tj, active: 2, by: site_client }\n' > "$tmp/pl4.yaml"
@@ -392,7 +396,7 @@ if [ -x "$XK" ]; then
     if [ $? = 0 ]; then ok; else bad "interval/silence у hysteria2 — приняты" "$(echo "$out" | head -n 3)"; fi
     printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, active: 2 }\n' > "$tmp/pl6.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl6.yaml --state-dir "$tmp/state" 2>&1)"
-    if echo "$out" | grep -qF "у kind hysteria2 нет active больше 1"; then ok; else bad "active у hysteria2 — отказ" "$out"; fi
+    if echo "$out" | grep -qF "неизвестный ключ «active»"; then ok; else bad "active у hysteria2 — отказ" "$out"; fi
     # pick: latency и tolerance — самые быстрые узлы подписки (пул туннеля): convert печатает их, у
     # hysteria2 — отказ, tolerance без pick: latency — отказ; pick и tolerance у прочих видов — ключи группы.
     printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, pick: latency, tolerance: 0 }\n' > "$tmp/pl8.yaml"
@@ -401,20 +405,20 @@ if [ -x "$XK" ]; then
     (cd "$tmp" && "$XKA" spec convert --spec pl8.yaml > c1.yaml 2>&1 && "$XKA" spec convert --spec c1.yaml > c2.yaml 2>&1)
     if grep -q 'pick: latency, tolerance: 0' "$tmp/c1.yaml" && cmp -s "$tmp/c1.yaml" "$tmp/c2.yaml"; then ok; else
         bad "convert печатает pick и tolerance туннеля (неподвижная точка)" "$(grep -n nl "$tmp/c1.yaml")"; fi
-    plref "pick: balance у туннеля — отказ с местом" "pick: balance" "«balance» — у туннеля нужен order или latency" 3:68
+    plref "pick: balance у туннеля — отказ с местом" "pick: balance" "«balance» — нужно одно из: order, latency" 3:68
     plref "tolerance без pick: latency — отказ" "tolerance: 20" "tolerance — допуск смены узла по замеру, он есть только у pick: latency" ""
-    plref "tolerance: 70000 — отказ" "pick: latency, tolerance: 70000" "tolerance — от 0 до 60000" 3:88
+    plref "tolerance: 70000 — отказ" "pick: latency, tolerance: 70000" "tolerance: 70000 — больше допустимого 60000" 3:88
     printf 'version: 2\noutputs:\n  hy: { kind: tunnel, protocol: hysteria2, subscription: sub/hy, pick: latency }\n' > "$tmp/pl9.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl9.yaml --state-dir "$tmp/state" 2>&1)"
-    if echo "$out" | grep -qF "у kind hysteria2 пока нет pick: latency"; then ok; else bad "pick: latency у hysteria2 — отказ" "$out"; fi
+    if echo "$out" | grep -qF "неизвестный ключ «pick»"; then ok; else bad "pick: latency у hysteria2 — отказ" "$out"; fi
     printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, pick: latency }\n' > "$tmp/pl10.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl10.yaml --state-dir "$tmp/state" 2>&1)"
     if echo "$out" | grep -qF "pick есть только у kind: group"; then ok; else
         bad "pick у interface — прежний отказ «только у kind: group»" "$out"; fi
     printf 'version: 2\noutputs:\n  wg: { kind: interface, device: wg0, active: 2 }\n' > "$tmp/pl7.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec pl7.yaml --state-dir "$tmp/state" 2>&1)"
-    if echo "$out" | grep -qF "ключ active есть только у kind: tunnel"; then ok; else
-        bad "active у interface — отказ «только у kind: tunnel»" "$out"; fi
+    if echo "$out" | grep -qF "неизвестный ключ «active» в outputs.wg"; then ok; else
+        bad "active у interface — отказ «неизвестный ключ»" "$out"; fi
     # kind: block — «Блок»: цепочки forward_block/output_block по метке соединения (TCP — RST,
     # остальное — ICMP запрет), без устройства и таблиц; доменный канал — режим 2 в таблице резолвера.
     printf 'bad.example\n' > "$tmp/blk.lst"

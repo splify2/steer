@@ -126,6 +126,11 @@ static int load_from_str(const char *spec) {
     "{\"schema\":2,\"from_default\":[\"192.168.1.0/24\"]," body "}"
 
 int main(void) {
+#ifdef SPECMATCH_EXT
+    /* Виды протоколов — из манифестов плагинов дерева (plugins/: стенд идёт из корня репозитория). */
+    setenv("STEER_PLUGINS_ROOT", "plugins", 1);
+    setenv("STEER_PLUGINS_ETC", "/nonexistent-steer-plugins-etc", 1);
+#endif
     /* Общий на все проверки ниже: registry_assign и прямые вызовы js_str не проверяют этот
      * стенд на отказ (тесты правила 5 — про load_spec, см. load_from_str), им нужен просто
      * struct err, чтобы позвать функцию новой сигнатуры. */
@@ -731,33 +736,29 @@ int main(void) {
         check("opts_file у kind=interface — отказ", 2, load_from_str(s));
     }
 
-    /* ---- виды выходов, существующие только в расширенной сборке ------------------
+    /* ---- виды протоколов в спеке v1: только из манифестов плагинов -------------------
      *
-     * Этот же файл собирается ДВАЖДЫ: build/specmatch без видов расширенной части и
-     * build/specmatch-ext с ними (и с ключом стенда SPECMATCH_EXT). Иначе положительные
-     * случаи kind=vless и kind=xsteer недостижимы вовсе — базовая сборка отвергает такую
-     * спеку реестром видов, — и до появления второго бинарника vless не был проверен здесь
-     * ни одной строкой. Прецедент тот же, что у build/diagsim: один исходник, два бинарника. */
+     * Этот же файл собирается ДВАЖДЫ: build/specmatch без плагинов и build/specmatch-ext (ключ
+     * SPECMATCH_EXT), которому стенд называет каталог манифестов дерева (plugins/, STEER_PLUGINS_ROOT).
+     * Видов vless и xsteer в ядре нет: спека v1 переводит их в виды плагинов tunnel:vless и xsteer
+     * (model/v1.c, V1_PLUGIN_KIND) с ключами по схеме манифеста. Без плагинов — отказ парсером, а не
+     * при подъёме: иначе правила и метки встают, устройства не создаёт никто. */
     {
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\"}},"
             "\"channels\":[]}");
 #ifdef SPECMATCH_EXT
         check("xsteer: спека принята", 0, load_from_str(s));
-        check("xsteer: вид xsteer", 1, kind_of(&g_spec.out[0]) == OUT_XSTEER);
-        /* Устройство и путь к конфигурации выводятся из имени выхода: держать их
-         * отдельными полями значило бы позволить двум именам разойтись. */
-        check_str("xsteer: устройство из имени выхода", "vpn", g_spec.out[0].device);
+        check("xsteer: вид плагина xsteer", 1, kind_of(&g_spec.out[0])->plugin != NULL &&
+              !strcmp(kind_of(&g_spec.out[0])->name, "xsteer"));
         check("xsteer: один кандидат в devices", 1, cand_n(&g_spec.out[0]));
-        check_str("xsteer: conf по умолчанию", "/etc/steer/xsteer/vpn.conf", g_spec.out[0].xs.conf);
         check("xsteer: считается выходом с устройством", 1, out_has_device(&g_spec.out[0]));
         check("xsteer: устройство создаёт наш процесс", 1, out_engine_managed(&g_spec.out[0]));
         check("xsteer: masquerade не нужен", 1, out_self_natting(&g_spec.out[0]));
+        /* Умолчание conf ({etc}/xsteer/<выход>.conf) — у программы плагина, а не в ключах. */
+        check_str("xsteer: ключи вида пусты", "{}", out_plugin_keys(&g_spec.out[0]));
 #else
-        /* Базовая сборка обязана отказать ПАРСЕРОМ, а не при подъёме: иначе правила и
-         * метки встают, устройства не создаёт никто, и человек видит рабочую с виду
-         * конфигурацию, из которой не выходит ни один пакет. */
-        check("xsteer: базовая сборка отвергает вид", 2, load_from_str(s));
+        check("xsteer: без плагинов — отказ парсером", 2, load_from_str(s));
 #endif
     }
 #ifdef SPECMATCH_EXT
@@ -766,6 +767,8 @@ int main(void) {
          * а 4294967297 — номером узла 1. Отказ обязан быть и на значении за границей long→int. */
         check("v1 stream_port 443 — принят", 0, load_from_str(SPEC(
             "\"outputs\":{\"x\":{\"kind\":\"xsteer\",\"stream\":true,\"stream_port\":443}},\"channels\":[]}")));
+        check_str("v1 stream и stream_port — в ключах вида", "{\"stream\":true,\"stream_port\":443}",
+                  out_plugin_keys(&g_spec.out[0]));
         check("v1 stream_port 65536 — отказ", 2, load_from_str(SPEC(
             "\"outputs\":{\"x\":{\"kind\":\"xsteer\",\"stream\":true,\"stream_port\":65536}},\"channels\":[]}")));
         check("v1 stream_port 4294967739 — отказ", 2, load_from_str(SPEC(
@@ -779,75 +782,20 @@ int main(void) {
     }
 #endif
     {
-        /* То же обещание для vless — до второго бинарника оно не проверялось нигде. */
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\"}},"
             "\"channels\":[]}");
 #ifdef SPECMATCH_EXT
         check("vless: спека принята", 0, load_from_str(s));
-        check("vless: вид vless", 1, kind_of(&g_spec.out[0]) == OUT_VLESS);
+        check("vless: вид плагина tunnel:vless", 1, kind_of(&g_spec.out[0])->plugin != NULL &&
+              !strcmp(kind_of(&g_spec.out[0])->name, "vless"));
         check("vless: устройство создаёт наш процесс", 1, out_engine_managed(&g_spec.out[0]));
+        check_str("vless: sub_file — ключ subscription", "{\"subscription\":\"/tmp/sub.txt\"}",
+                  out_plugin_keys(&g_spec.out[0]));
 #else
-        check("vless: базовая сборка отвергает вид", 2, load_from_str(s));
+        check("vless: без плагинов — отказ парсером", 2, load_from_str(s));
 #endif
     }
-
-    /* ---- выбор узлов подписки: список кандидатов, а не один номер ---------------------
-     *
-     * У выхода kind=vless был ровно один `node`, и выбрать три локации из двадцати шести
-     * было нечем: либо зашитый номер, либо -1 «первый рабочий среди всех». Просьба
-     * интерфейса — то же самое, что `devices` у kind=interface, только кандидаты называются
-     * номерами узлов, поэтому и форма та же: `nodes` списком, `node` — сокращение для одного,
-     * пустой список — прежнее умолчание.
-     *
-     * Проверяется здесь и разбор, и ЗНАЧЕНИЕ поля (out_node_list): порядок перебора решает,
-     * через какую страну пойдёт трафик, а стенда на подъём туннеля нет — он требует и
-     * криптобиблиотеки, и сети. Функции живут в src/kinds/vless.c, то есть только в
-     * расширенной сборке. */
-#ifdef SPECMATCH_EXT
-    {
-        /* Развёртка выбора в порядок перебора. Собирается прямо в структуре: это чистая
-         * функция от поля спеки и размера подписки, спека для неё не нужна. */
-        struct output o = {0};
-        int dst[16];
-        check("nodes пуст: перебирается вся подписка", 4,
-              (int)out_node_list(&o, 4, dst, 16));
-        check("nodes пуст: порядок подписки", 1, dst[0] == 0 && dst[3] == 3);
-
-        int sel3[3] = { 6, 7, 12 };
-        o.vless.nodes = sel3;
-        o.vless.nodes_n = 3;
-        check("выбор из трёх: кандидатов трое", 3, (int)out_node_list(&o, 26, dst, 16));
-        check("выбор из трёх: порядок предпочтения сохранён", 1,
-              dst[0] == 6 && dst[1] == 7 && dst[2] == 12);
-        /* Подписка обновилась и стала короче: устаревший номер пропускается, а не выключает
-         * локации, которые на месте. */
-        check("номер вне подписки пропущен", 2, (int)out_node_list(&o, 8, dst, 16));
-        check("после пропуска остались выбранные", 1, dst[0] == 6 && dst[1] == 7);
-        /* А вот когда за пределы уехали ВСЕ, перебирать вместо выбранного что попало нельзя:
-         * это увело бы трафик в локацию, которую человек не выбирал, и молча. Ноль здесь —
-         * приговор для клиента, а не «значит, перебираем всё». */
-        check("выбор целиком вне подписки — кандидатов нет", 0,
-              (int)out_node_list(&o, 3, dst, 16));
-    }
-    /* ---- нужен ли перебор: кто назвал узел, а не сколько кандидатов осталось ----------
-     *
-     * Клиент vless пропускал проверку узла, когда кандидат оставался один, — а один он
-     * остаётся и без всякого выбора человека: подписка из единственного узла, или из трёх
-     * выбранных уцелел один после её обновления. Туннель поднимался на непроверенном узле, и
-     * вместо приговора «ни один узел подписки не отвечает» человек получал обратно то самое
-     * «устройства нет», ради снятия которого перебор и стал виден (I-100). */
-    {
-        struct output o = {0};
-        check("подписка из одного узла: узел никем не назван", 0, out_node_named(&o));
-        int sel3b[3] = { 6, 7, 12 }, sel1[1] = { 4 };
-        o.vless.nodes = sel3b; o.vless.nodes_n = 3;
-        check("из трёх выбранных уцелел один: выбор всё равно не именной", 0,
-              out_node_named(&o));
-        o.vless.nodes = sel1; o.vless.nodes_n = 1;
-        check("номер написан в спеке: узел назван", 1, out_node_named(&o));
-    }
-#endif
     {
         /* Выбор узлов есть только у подписки. У kind=interface кандидаты — устройства, и
          * принять здесь `nodes` молча значило бы сказать «настроено», не настроив ничего. */
@@ -858,56 +806,51 @@ int main(void) {
         check("nodes на kind=interface — отказ", 2, load_from_str(s));
     }
 #ifdef SPECMATCH_EXT
+    /* ---- выбор узлов подписки v1: node и nodes → ключ nodes вида плагина ---------------------
+     *
+     * Значение поля (порядок перебора, «назван ли узел») — у программы плагина (src/plugkit/pktun.c,
+     * стенд tests/pkmatch.c); здесь — перевод формата v1 и его отказы. */
     {
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
             "\"nodes\":[6,7,12]}},"
             "\"channels\":[]}");
         check("nodes: спека принята", 0, load_from_str(s));
-        check("nodes: кандидатов трое", 3, (int)g_spec.out[0].vless.nodes_n);
-        check("nodes: порядок как написан", 1,
-              g_spec.out[0].vless.nodes[0] == 6 && g_spec.out[0].vless.nodes[1] == 7 && g_spec.out[0].vless.nodes[2] == 12);
+        check_str("nodes: порядок как написан", "{\"subscription\":\"/tmp/sub.txt\",\"nodes\":[6,7,12]}",
+                  out_plugin_keys(&g_spec.out[0]));
     }
     {
-        /* Одиночная форма — сокращение для списка из одного, дальше по коду путь один. */
+        /* Одиночная форма — сокращение для списка из одного. */
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
             "\"node\":4}},"
             "\"channels\":[]}");
         check("node: спека принята", 0, load_from_str(s));
-        check("node: один кандидат", 1, (int)g_spec.out[0].vless.nodes_n);
-        check("node: номер сохранён", 4, g_spec.out[0].vless.nodes[0]);
+        check_str("node: один кандидат", "{\"subscription\":\"/tmp/sub.txt\",\"nodes\":[4]}",
+                  out_plugin_keys(&g_spec.out[0]));
     }
     {
-        /* Прежнее «первый рабочий» записывается пустым списком: спека, написанная до
-         * появления перечня, обязана значить ровно то, что значила. */
+        /* Прежнее «первый рабочий» — без выбора: спека, написанная до появления перечня, обязана
+         * значить ровно то, что значила. */
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
             "\"node\":-1}},"
             "\"channels\":[]}");
         check("node -1: спека принята", 0, load_from_str(s));
-        check("node -1: кандидатов не выбрано", 0, (int)g_spec.out[0].vless.nodes_n);
+        check_str("node -1: кандидатов не выбрано", "{\"subscription\":\"/tmp/sub.txt\"}",
+                  out_plugin_keys(&g_spec.out[0]));
     }
     {
-        const char *s = SPEC(
-            "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\"}},"
-            "\"channels\":[]}");
-        check("без node: спека принята", 0, load_from_str(s));
-        check("без node: кандидатов не выбрано", 0, (int)g_spec.out[0].vless.nodes_n);
-    }
-    {
-        /* Пустой список — та же «вся подписка», а не «узлов нет»: отказывать на нём значило бы
-         * запретить интерфейсу писать поле всегда, в том числе когда человек ничего не выбрал. */
+        /* Пустой список — та же «вся подписка», а не «узлов нет». */
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
             "\"nodes\":[]}},"
             "\"channels\":[]}");
         check("nodes пустой список принят", 0, load_from_str(s));
-        check("nodes пустой список: кандидатов не выбрано", 0, (int)g_spec.out[0].vless.nodes_n);
+        check_str("nodes пустой список: кандидатов не выбрано", "{\"subscription\":\"/tmp/sub.txt\"}",
+                  out_plugin_keys(&g_spec.out[0]));
     }
     {
-        /* Обе формы сразу — отказ, ровно как lan_device вместе с lan_devices: взять одну молча
-         * значило бы, что половина написанного человеком не действует. */
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
             "\"node\":4,\"nodes\":[6,7]}},"
@@ -915,7 +858,6 @@ int main(void) {
         check("node вместе с nodes — отказ", 2, load_from_str(s));
     }
     {
-        /* Дубликат делает перебор бессмысленным так же, как дубликат устройства в devices. */
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
             "\"nodes\":[6,7,6]}},"
@@ -923,7 +865,7 @@ int main(void) {
         check("узел в nodes дважды — отказ", 2, load_from_str(s));
     }
     {
-        /* Выбранных узлов — сколько написано (раньше «не больше 16»). */
+        /* Выбранных узлов — сколько написано. */
         char *many = malloc(16384);
         int mn = snprintf(many, 16384,
                           "%s\"outputs\":{\"vpn\":{\"kind\":\"vless\","
@@ -932,14 +874,11 @@ int main(void) {
             mn += snprintf(many + mn, 16384 - (size_t)mn, "%s%d", i ? "," : "", i);
         snprintf(many + mn, 16384 - (size_t)mn, "]}},\"channels\":[]}");
         check("500 номеров в nodes: принимается", 0, load_from_str(many));
-        const struct vless_cfg *vc = out_vless(&g_spec.out[0]);
-        check("500 номеров в nodes: сосчитаны все", 500, vc ? (int)vc->nodes_n : -1);
-        check("500 номеров в nodes: последний цел", 499, vc && vc->nodes_n == 500 ? vc->nodes[499] : -1);
+        const char *kj = out_plugin_keys(&g_spec.out[0]);
+        check("500 номеров в nodes: последний цел", 1, kj && strstr(kj, ",498,499]") != NULL);
         free(many);
     }
     {
-        /* Отрицательный номер здесь не «первый рабочий»: в списке кандидатов он не значит
-         * ничего, а прочитанный молча дал бы пропущенного кандидата. */
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
             "\"nodes\":[6,-1]}},"
@@ -947,8 +886,6 @@ int main(void) {
         check("отрицательный номер в nodes — отказ", 2, load_from_str(s));
     }
     {
-        /* Номер строкой: js_num на не-числе не продвигает указатель, и цикл без этой проверки
-         * встал бы навсегда — то же семейство, что trailing comma в str_list. */
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
             "\"nodes\":[\"6\"]}},"
@@ -962,26 +899,17 @@ int main(void) {
             "\"channels\":[]}");
         check("хвостовая запятая в nodes — отказ", 2, load_from_str(s));
     }
-#endif
-#ifdef SPECMATCH_EXT
     {
-        /* Явный conf побеждает умолчание, но обязан быть абсолютным: процесс запускает
-         * procd со своим рабочим каталогом, и относительный путь «работал бы из шелла». */
+        /* Явный conf — в ключах вида; относительный — от каталога спеки ядра (x-path: etc). */
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\",\"conf\":\"/etc/hub.conf\"}},"
             "\"channels\":[]}");
         check("xsteer: явный conf принят", 0, load_from_str(s));
-        check_str("xsteer: явный conf сохранён", "/etc/hub.conf", g_spec.out[0].xs.conf);
+        check_str("xsteer: явный conf сохранён", "{\"conf\":\"/etc/hub.conf\"}", out_plugin_keys(&g_spec.out[0]));
     }
     {
-        const char *s = SPEC(
-            "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\",\"conf\":\"hub.conf\"}},"
-            "\"channels\":[]}");
-        check("xsteer: относительный conf — отказ", 2, load_from_str(s));
-    }
-    {
-        /* У xsteer свой транспорт и своя маскировка внутри движка: obfs здесь означал бы
-         * обфускацию поверх обфускации, то есть «настроено», не настроив ничего. */
+        /* У xsteer свой транспорт и своя маскировка: obfs здесь означал бы обфускацию поверх
+         * обфускации, то есть «настроено», не настроив ничего. */
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\","
             "\"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
@@ -1011,11 +939,11 @@ int main(void) {
             "\"outputs\":{\"vpn\":{\"kind\":\"xsteerr\"}},"
             "\"channels\":[]}");
         check("неизвестный kind — отказ", 2, load_from_str(s));
-        /* Реестр знает вид и тогда, когда его нет в сборке (запись отказа): `--kind xsteer` в
-         * базовой сборке — пустой список, а не «нет такого вида». */
-        check("kind_by_name: xsteer известен", 1, kind_by_name("xsteer") != NULL);
+        /* Реестр видов ядра знает только виды ядра: xsteer — вид плагина (манифест), не ядра. */
+        check("kind_by_name: awg известен", 1, kind_by_name("awg") != NULL);
+        check("kind_by_name: xsteer — не вид ядра", 1, kind_by_name("xsteer") == NULL);
         check("kind_by_name: опечатка неизвестна", 1, kind_by_name("xsteerr") == NULL);
-        check_str("kind_by_name: имя xsteer", "xsteer", kind_by_name("xsteer")->name);
+        check_str("kind_by_name: имя awg", "awg", kind_by_name("awg")->name);
         check_str("kind_of: имя interface", "interface", kind_of(&(struct output){ .kind = OUT_INTERFACE })->name);
     }
 

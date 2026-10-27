@@ -767,7 +767,7 @@ static void syn_bad(void *arg) {
 
 static int g_run_rc;
 static void run_bad(void *arg) {
-    struct output o;
+    struct tun_out o;
     memset(&o, 0, sizeof(o));
     /* Имя длиннее 15 символов: tun_open откажет и сам, так что устройство не появится ни до
      * правки, ни после — различается только названа ли причина. */
@@ -2250,8 +2250,11 @@ static void t_pool_state(void) {
     buf[r] = '\0';
     char want[300];
     snprintf(want, sizeof want, "\"want\":3,\"slots\":3,\"by\":\"site\",\"active\":[{\"index\":0,\"name\":\"n0\"},"
-             "{\"index\":1,\"name\":\"n1\"},{\"index\":2,\"name\":\"n2\"}]}");
+             "{\"index\":1,\"name\":\"n1\"},{\"index\":2,\"name\":\"n2\"}]");
     check(strstr(buf, want) != NULL && strstr(buf, "\"pid\":"), "файл состояния — активные узлы с номерами и именами");
+    /* diag выхода (steer-api.md, 2.3) — в том же файле: ядро печатает его в `steer diag`. */
+    check(strstr(buf, "\"diag\":[{\"id\":\"nodes\",\"verdict\":\"ok\",\"what\":\"выход vl: активных узлов 3 из 3\"") != NULL,
+          "  и diag: активных узлов столько, сколько просили");
     unlink(path);
     rmdir(dir);
 }

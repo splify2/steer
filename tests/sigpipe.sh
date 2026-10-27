@@ -34,10 +34,12 @@
 set -u
 LIBS="$(cd "${LIBS:-build/libs-host}" 2>/dev/null && pwd)"
 skip() { echo "sigpipe: $1 — пропуск"; exit 0; }
-[ -x "$LIBS/steerd" ] && [ -x "$LIBS/steer-vless" ] || skip "нет раскладки libs ($LIBS, tests/libs-test.sh)"
+[ -x "$LIBS/steerd" ] && [ -x "$LIBS/plugins/vless/bin/vless" ] || skip "нет раскладки libs ($LIBS, tests/libs-test.sh)"
 BIN="$LIBS/steerd"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LD_LIBRARY_PATH="$LIBS"; export LD_LIBRARY_PATH
+# Протоколы — плагины раскладки (программы build-libs.sh, манифесты кладёт tests/libs-test.sh).
+STEER_PLUGINS_ROOT="$LIBS/plugins"; export STEER_PLUGINS_ROOT
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else

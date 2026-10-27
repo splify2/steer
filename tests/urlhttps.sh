@@ -31,6 +31,8 @@ skip() { echo "urlhttps: $1 — пропуск"; exit 0; }
 [ -x "$LIBS/steerd" ] || skip "нет раскладки libs ($LIBS, tests/libs-test.sh)"
 BIN="$LIBS/steerd"
 LD_LIBRARY_PATH="$LIBS"; export LD_LIBRARY_PATH
+# Протоколы — плагины раскладки (программы build-libs.sh, манифесты кладёт tests/libs-test.sh).
+STEER_PLUGINS_ROOT="$LIBS/plugins"; export STEER_PLUGINS_ROOT
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else

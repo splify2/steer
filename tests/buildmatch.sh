@@ -44,22 +44,19 @@ disk_ext="$(in_dirs "$(profile_var EXT_DIRS)" | names)"
 # файл, не попавший ни в один профиль, не соберётся в релизе — и только в релизе, на чужой
 # машине. Снять проверку нельзя, она стоит на этой поломке.
 words() { tr ' ' '\n' | grep -v '^$'; }
-# Виды выхода расширенной части (KINDS_EXT_SRC) лежат в src/kinds рядом с базовыми, но в профиль
-# base не входят — их отсутствие и есть отказ «требует пакет steer-extended» (src/kinds/kind.c).
-# Поэтому с каталогами ядра сверяется base вместе с ними, а их место — ниже, отдельной проверкой.
-# Тот же расклад у слоя примитивов (CRYPTO_SRC, src/lib/scrypto.c) и у PLUGIN_PRIM_SRC (sigverify.c, untar.c): лежит в каталоге ядра, в base не
-# входит — базовой сборке криптография не нужна, и wolfSSL в ней нет.
-# Вид hysteria2 (KINDS_HY2_SRC) — того же рода, но только для раскладки с libsteer.so: в статические
-# профили он не входит (телефон отложен), запись вида есть в libsteer, а модуль — steer-hysteria2.
-m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; echo; profile_var KINDS_HY2_SRC; echo; profile_var KINDS_PROXY_SRC; echo; profile_var CRYPTO_SRC; echo; profile_var PLUGIN_PRIM_SRC; } | words | names)"
-# Профили разделяемой раскладки (шаг 4 выпуска 1.10: libsteer, steerd, четыре модуля) — тоже
-# профили: точки входа модулей (src/modules/main_*.c) существуют только в них.
-m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; echo
-            for p in libsteer libsteer20 net1 steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox \
+# Слой примитивов (CRYPTO_SRC, src/lib/scrypto.c) и PLUGIN_PRIM_SRC (sigverify.c, untar.c) лежат в каталоге
+# ядра, но в base не входят — базовой сборке криптография не нужна, и wolfSSL в ней нет. Видов протоколов в
+# ядре нет вовсе (они — в манифестах плагинов), поэтому с каталогами ядра сверяется base с ними двумя.
+m_base="$( { profile_src base; echo; profile_var CRYPTO_SRC; echo; profile_var PLUGIN_PRIM_SRC; } | words | names)"
+# Профили разделяемой раскладки (libsteer, net1, steerd, мост tgws и программы плагинов plug_<id>) — тоже
+# профили: точки входа программ (src/modules/main_*.c) существуют только в них и в статических профилях;
+# телефон (android) добавляет манифесты вкомпилированных плагинов (PKEMBED_SRC).
+m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; echo; profile_src android; echo
+            for p in libsteer net1 steerd mod_tgws \
                      $(for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do printf 'plug_%s ' "$q"; done); do
                 profile_src "$p"; echo; done; } |
           words | grep -E "^($(profile_var EXT_DIRS | tr ' ' '|'))/" | names)"
-check "sources.mk: профиль base (с видами расширенной части) — это все каталоги ядра"  "$disk_base" "$m_base"
+check "sources.mk: профиль base (с примитивами) — это все каталоги ядра"  "$disk_base" "$m_base"
 check "sources.mk: профили покрывают всю расширенную часть" "$disk_ext" "$m_ext"
 
 # Каталог вне манифеста: файл в нём не попадёт ни в одну сборку и ни в одну проверку выше.
@@ -119,18 +116,24 @@ for p in extended server; do
     check "sources.mk: общая часть xsteer входит в профиль $p" "" \
         "$(missing_in "$p" "$(profile_var XS_COMMON_SRC)")"
 done
-# Виды выхода — файлы, и реестр ссылается на них слабо (src/kinds/kind.c): вид, выпавший из
-# профиля, не ломает компоновку, а тихо становится отказом разбора. Поэтому состав сверяется
-# здесь. Базовые виды входят в CORE_SRC (то есть в каждый профиль — проверка «несёт всё ядро»
-# выше), виды расширенной части — в полный пакет и в прошивку телефона, и ни в какой другой.
+# Видов протоколов в ядре нет: они приходят манифестами плагинов (src/kinds/plugin.c). Статические сборки
+# несут программы плагинов vless, xsteer и obfs (PK_STATIC_SRC, PK_PROGRAM) — полный пакет и прошивка
+# телефона, и никакая другая; манифесты в бинарнике (PKEMBED_SRC) — только у телефона: каталога плагинов
+# на нём в 2.1 нет (plugin-sdk, open.md, О-13), а у роутера манифесты лежат в каталоге плагинов.
 for p in extended android; do
-    check "sources.mk: виды расширенной части входят в профиль $p" "" \
-        "$(missing_in "$p" "$(profile_var KINDS_EXT_SRC)")"
+    check "sources.mk: программы плагинов входят в профиль $p" "" \
+        "$(missing_in "$p" "$(profile_var PK_STATIC_SRC)")"
 done
 for p in base server tgws; do
-    check "sources.mk: видов расширенной части нет в профиле $p" "$(profile_var KINDS_EXT_SRC)" \
-        "$(missing_in "$p" "$(profile_var KINDS_EXT_SRC)" | sed 's/ $//')"
+    check "sources.mk: программ плагинов нет в профиле $p" "$(profile_var PK_STATIC_SRC | words | tr '\n' ' ' | sed 's/ $//')" \
+        "$(missing_in "$p" "$(profile_var PK_STATIC_SRC)" | sed 's/ $//')"
 done
+check "sources.mk: манифесты вкомпилированных плагинов — только у телефона" "android" \
+    "$(for p in base extended server tgws android; do missing_in "$p" "$(profile_var PKEMBED_SRC)" | grep -q . || printf '%s' "$p"; done)"
+check "src/plugkit/pkembed.c — плод build/pkembed.sh из plugins/ (не устарел)" "" \
+    "$(sh build/pkembed.sh | cmp -s - src/plugkit/pkembed.c || echo 'устарел: sh build/pkembed.sh > src/plugkit/pkembed.c')"
+check "вкомпилированы манифесты ровно тех плагинов, чьи программы вкомпилированы" "$(profile_var PLUGINS_EMBED)" \
+    "$(for f in $(profile_var PK_STATIC_SRC); do sed -n 's/^PK_PROGRAM("\([a-z0-9]*\)".*/\1/p' "$f"; done | tr '\n' ' ' | sed 's/ $//')"
 
 # ---- правило 3 (docs/architecture.md, раздел 2): сборка — набор модулей, а не набор макросов ----
 #
@@ -226,11 +229,11 @@ done
 # идут после команды» и отказ reload/subscribe движком (их исполняет демон, а посылает клиент steer). Остальные шесть строк, что были здесь до 1.10, переехали вместе с
 # командами модулей в cli/modcmd.c.
 #
-# modcmd.c: шесть законных строк — «команды модуля нет в этой сборке, нужен пакет» (одна, общая
+# modcmd.c: пять законных строк — «команды модуля нет в этой сборке, нужен пакет» (одна, общая
 # для всех модулей: текст с контрактной подстрокой steer-extended живёт в одном месте), «не
-# удалось запустить модуль», неизвестное слово у tgws-probe (I-316), --insecure у *-nodes и
-# *-probe с именем выхода вместо файла подписки и два отказа флага --platform (без значения,
-# нет такой платформы) — разбор аргументов. Все они
+# удалось запустить модуль», неизвестное слово у tgws-probe (I-316) и два отказа флага --platform
+# (без значения, нет такой платформы) — разбор аргументов. (--insecure у *-nodes и *-probe
+# разбирают сами программы плагинов, src/modules/main_<id>.c.) Все они
 # заканчиваются кодом 2 и до журнала не доходят, о чём сказано в контракте §5. Больше ни в
 # одном файле голых быть не должно.
 #
@@ -242,7 +245,7 @@ done
 # (src/model/srs.c, srsplan.c) в stderr не пишет вовсе — он возвращает отказ и текст снятого.
 # Две строки srsread.c печатаются при УДАВШЕМСЯ разборе — снятые правила и пропущенные подсети
 # IPv6, — и у них уровень есть; проверка ниже сторожит именно это различие.
-check "голых «steer: » ровно столько, сколько отказов вызывающему" "src/daemon/main.c:4 src/cli/modcmd.c:6 src/tools/srsread.c:10 " "$bare"
+check "голых «steer: » ровно столько, сколько отказов вызывающему" "src/daemon/main.c:4 src/cli/modcmd.c:5 src/tools/srsread.c:10 " "$bare"
 # Строки, которые печатаются при успехе, обязаны иметь уровень: разбор удался, значит это
 # журнал во время работы, а не отказ вызывающему.
 check "предупреждения srs-read при удавшемся разборе идут с уровнем" "2" \
@@ -722,15 +725,19 @@ done
 check "все пакеты build.sh есть в таблице docs/guide.md" "" "$no_pkg"
 
 # Команды, обещанные в README и docs/guide.md (таблица команд живёт там), обязаны существовать в
-# ядре: их читают раньше, чем `steer help`, и несуществующая команда там — отказ на первом же шаге.
-if [ -x ./build/steer ]; then
+# ядре или в официальном плагине: их читают раньше, чем `steer help`, и несуществующая команда там —
+# отказ на первом же шаге. Команды протоколов — из манифестов плагинов (каталог плагинов стенда).
+if [ -x ./build/steer ] && [ -x ./build/pkhooks ]; then
     bad_cmd=""
-    for c in apply status diag explain outputs needs-dnsd dnsd failover fit vless \
-             vless-nodes vless-probe obfs obfs-server; do
+    pr="$(mktemp -d)"
+    sh tests/plugroot.sh "$pr/plugins" build >/dev/null
+    for c in apply status diag explain outputs needs-dnsd dnsd failover fit \
+             vless-nodes vless-probe sub-fetch sub-quota hysteria2-nodes proxy-nodes warp-scan warp-reg obfs-server; do
         cat README.md docs/guide.md | grep -q "\`$c" || continue
-        ./build/steer help "$c" >/dev/null 2>&1 || bad_cmd="$bad_cmd$c "
+        STEER_PLUGINS_ROOT="$pr/plugins" ./build/steer help "$c" >/dev/null 2>&1 || bad_cmd="$bad_cmd$c "
     done
-    check "все команды из README существуют" "" "$bad_cmd"
+    rm -rf "$pr"
+    check "все команды из README существуют (в ядре или в плагине)" "" "$bad_cmd"
 fi
 
 # ---- workflow вообще пригоден к запуску ---------------------------------------
@@ -879,80 +886,37 @@ for f in $(find src/tunnel src/proto \( -name '*.c' -o -name '*.h' \)); do
 done
 check "src/tunnel и src/proto не зовут маршрутизацию демона (шаг 3 выпуска 1.10)" "" "$modroute"
 
-# ---- разделяемая раскладка роутера (1.10, шаг 4) -------------------------------
+# ---- раскладка роутера 2.1: ядро, net1, плагины (build/sources.mk, «РАСКЛАДКА 2.1») --------------
 #
-# libsteer.so, steerd и четыре модуля собираются из непересекающихся списков (build/sources.mk),
-# и вместе они дают те же файлы, что статический расширенный профиль: файл, выпавший из всех, не
-# соберётся только в релизе, а файл в двух местах дал бы два экземпляра одного кода в разных
-# процессах (глобальные таблицы модели, реестр меток) и молчаливое расхождение. Общее у steerd и
-# модулей одно — cli/modcmd.c: он входит в каждый бинарник, потому что слабые ссылки на cmd_*
-# решаются компоновкой, а не загрузчиком.
+# libsteer.so, steerd, мост tgws (модуль), net1 и программы плагинов собираются из своих списков
+# (build/sources.mk), и вместе они дают те же файлы, что статический расширенный профиль: файл, выпавший
+# из всех, не соберётся только в релизе. Новые слои: libsteer без стека протоколов; net1 — отдельная
+# библиотека, не связанная с ядром; плагины протоколов — с net1, но не с libsteer. В ОДНОМ процессе
+# помощника — плагин и net1: у них не должно быть общих файлов (иначе два экземпляра одного кода и его
+# глобалов в процессе). TLS/QUIC в ядре и в net1 — дважды нарочно (ядру свои DoH/DoQ, замер и менеджер),
+# но это РАЗНЫЕ процессы и разные имена.
 sd="$(mktemp -d)"
-# Раскладка 2.0 (STEER_LAYOUT=2.0): libsteer со стеком (PROFILE_libsteer20) и модули на ней — прежние
-# проверки, только libsteer — её профиль 2.0. plugconf.c (перевод --conf, src/modules/plugconf.h) —
-# второй общий файл точек входа, как modcmd.c.
-for p in libsteer20 libsteer net1 steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox extended; do
+for p in libsteer net1 steerd mod_tgws extended; do
     profile_src "$p" | words | sort -u > "$sd/$p"
 done
-modcmd="$(profile_var MODCMD_SRC) $(profile_var PLUGCONF_SRC)"
-for a in steerd mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox; do
-    check "раскладка 2.0: в libsteer и $a нет общих файлов" "" \
-        "$(comm -12 "$sd/libsteer20" "$sd/$a" | tr '\n' ' ')"
-done
-for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox; do
-    check "раскладка: у steerd и $a общий один файл — modcmd.c" "$(profile_var MODCMD_SRC) " \
-        "$(comm -12 "$sd/steerd" "$sd/$a" | tr '\n' ' ')"
-done
-set -- mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox
-while [ $# -gt 1 ]; do
-    a="$1"; shift
-    for b in "$@"; do
-        check "раскладка: у модулей $a и $b общие только modcmd.c и plugconf.c" "$(printf '%s\n' $modcmd | sort | tr '\n' ' ')" \
-            "$(comm -12 "$sd/$a" "$sd/$b" | tr '\n' ' ')"
-    done
-done
-# Модуль не несёт ни демона, ни модели: демон (failover.c, supd.c, dnsd…) — в steerd, модель и виды —
-# в libsteer. В списках модулей нет ничего из каталогов демона, резолвера, компилятора и моделей.
-for a in mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox; do
-    check "раскладка: в $a нет файлов демона, компилятора, резолвера и модели" "" \
-        "$(grep -E '^src/(daemon|dnsd|compile|model|kinds|platform)/' "$sd/$a" | tr '\n' ' ')"
-done
+check "раскладка: у steerd и mod_tgws общий один файл — modcmd.c" "$(profile_var MODCMD_SRC) " \
+    "$(comm -12 "$sd/steerd" "$sd/mod_tgws" | tr '\n' ' ')"
+check "раскладка: в mod_tgws нет файлов демона, компилятора, резолвера и модели" "" \
+    "$(grep -E '^src/(daemon|dnsd|compile|model|kinds|platform)/' "$sd/mod_tgws" | tr '\n' ' ')"
 # (compile/nftcompat.c — раскладка по ядру, часть модели, а не компилятора: его зовёт реестр видов.)
-for l in libsteer libsteer20; do
-    check "раскладка: $l не несёт демона, компилятора и резолвера" "" \
-        "$(grep -E '^src/(daemon|dnsd|compile)/' "$sd/$l" | grep -v 'src/compile/nftcompat.c' | tr '\n' ' ')"
-done
-cat "$sd/libsteer20" "$sd/steerd" "$sd/mod_vless" "$sd/mod_xsteer" "$sd/mod_obfs" "$sd/mod_tgws" "$sd/mod_hysteria2" "$sd/mod_proxy" "$sd/mod_warpbox" | sort -u > "$sd/all"
-check "раскладка 2.0 покрывает расширенный профиль (кроме файла профиля)" "src/profile/extended.c " \
-    "$(comm -23 "$sd/extended" "$sd/all" | tr '\n' ' ')"
-# (Обёртка QUIC src/proto/quic — в libsteer, в статическом профиле её нет: потребителя нет, телефону — шаг 6.)
-EXTRA_20="src/kinds/hysteria2.c src/kinds/proxy.c src/modules/main_hysteria2.c src/modules/main_obfs.c src/modules/main_proxy.c src/modules/main_tgws.c src/modules/main_vless.c src/modules/main_warpbox.c src/modules/main_xsteer.c src/modules/plugconf.c src/pluginmgr/pmindex.c src/pluginmgr/pminst.c src/pluginmgr/pmmain.c src/pluginmgr/pmstate.c src/pluginmgr/pmutil.c src/pluginmgr/pmver.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/proxy/pxdial.c src/proto/proxy/pxhttp.c src/proto/proxy/pxmain.c src/proto/proxy/pxsocks.c src/proto/proxy/pxss.c src/proto/proxy/pxsub.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxvmess.c src/proto/proxy/pxwire.c src/proto/quic/qcdoq.c src/proto/quic/qcssl.c src/proto/quic/quic.c src/proto/warp/wbconf.c src/proto/warp/wbmain.c src/proto/warp/wbmq.c src/proto/warp/wbns.c src/proto/warp/wbping.c src/proto/warp/wbreg.c src/proto/warp/wbscan.c src/proto/warp/wbx509.c "
-# Точка входа — единственный main() модуля; steerd свой main держит в daemon/main.c.
-for a in vless xsteer obfs tgws hysteria2 proxy; do
-    check "src/modules/main_$a.c зовёт steer_module_main с именем модуля" "1" \
-        "$(grep -c "steer_module_main(argc, argv, \"$a\", STEER_VERSION)" src/modules/main_$a.c)"
-done
-check "  и добавляет только точки входа модулей, обёртку QUIC, менеджер плагинов (steerd) и модули hysteria2, proxy (с их видами) и warpbox" \
-    "$EXTRA_20" "$(comm -13 "$sd/extended" "$sd/all" | tr '\n' ' ')"
-
-# ---- раскладка 2.1: ядро, net1, плагины (build/sources.mk, «РАСКЛАДКА 2.1») -------------------------
-# Новые слои: libsteer без стека протоколов; net1 — отдельная библиотека, не связанная с ядром; плагины
-# протоколов — с net1, но не с libsteer. В ОДНОМ процессе помощника — плагин и net1: у них не должно
-# быть общих файлов (иначе два экземпляра одного кода и его глобалов в процессе). TLS/QUIC в ядре и в
-# net1 — дважды нарочно (ядру свои DoH/DoQ, замер и менеджер), но это РАЗНЫЕ процессы и разные имена.
-check "2.1: в libsteer нет стека TUN, транспортов и разбора ссылок узлов" "" \
-    "$(grep -E '^src/(tunnel|proto/transport)/|^src/proto/vless/sublink\.c$' "$sd/libsteer" | tr '\n' ' ')"
-check "2.1: libsteer — это libsteer 2.0 без стека (и ничего сверх)" "" \
-    "$(comm -13 "$sd/libsteer20" "$sd/libsteer" | tr '\n' ' ')"
+check "раскладка: libsteer не несёт демона, компилятора и резолвера" "" \
+    "$(grep -E '^src/(daemon|dnsd|compile)/' "$sd/libsteer" | grep -v 'src/compile/nftcompat.c' | tr '\n' ' ')"
+check "2.1: в libsteer нет стека TUN, транспортов, разбора ссылок узлов и программ плагинов" "" \
+    "$(grep -E '^src/(tunnel|proto/transport|plugkit|modules)/|^src/proto/vless/sublink\.c$' "$sd/libsteer" | tr '\n' ' ')"
 check "2.1: в net1 нет демона, компилятора, резолвера, модели, видов и разбора команд" "" \
     "$(grep -E '^src/(daemon|dnsd|compile|model|kinds|cli|tools)/' "$sd/net1" | tr '\n' ' ')"
 check "2.1: у net1 и steerd нет общих файлов" "" "$(comm -12 "$sd/net1" "$sd/steerd" | tr '\n' ' ')"
+# Программа плагина говорит с ядром только через API (src/plugkit): ни модели спеки, ни видов, ни демона,
+# ни разбора команд ядра в ней нет — о выходе она знает из {conf}. С steerd у неё общих файлов нет вовсе.
 for q in $(profile_var PLUGINS_NET1); do
     profile_src "plug_$q" | words | sort -u > "$sd/plug_$q"
     check "2.1: плагин $q и net1 без общих файлов (один процесс — один экземпляр)" "" \
         "$(comm -12 "$sd/plug_$q" "$sd/net1" | tr '\n' ' ')"
-    check "2.1: плагин $q не несёт демона и резолвера; с steerd общий только modcmd.c" "|$(profile_var MODCMD_SRC) " \
-        "$(grep -E '^src/(daemon|dnsd)/' "$sd/plug_$q" | tr '\n' ' ')|$(comm -12 "$sd/plug_$q" "$sd/steerd" | tr '\n' ' ')"
     check "2.1: плагин $q сверяет ABI net1 при запуске" "1" "$(grep -c '^src/net1/s2pcheck\.c$' "$sd/plug_$q")"
 done
 for q in $(profile_var PLUGINS_STATIC); do
@@ -960,11 +924,25 @@ for q in $(profile_var PLUGINS_STATIC); do
     check "2.1: плагин $q без net1 несёт основу сам (NET1_BASE_SRC)" "" \
         "$(for f in $(profile_var NET1_BASE_SRC); do grep -qx "$f" "$sd/plug_$q" || printf '%s ' "$f"; done)"
 done
+# Исключение одно: слой устройства AmneziaWG (src/kinds/awgdev.c — разбор файла, netlink, подбор точки; без
+# спеки) — общий у вида awg ядра и у плагина warpbox, который ведёт устройства членов своей группы.
+for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do
+    check "2.1: плагин $q без модели спеки, видов, демона и разбора команд ядра; с steerd общих файлов нет" "|" \
+        "$(grep -E '^src/(daemon|dnsd|compile|model|kinds|cli)/' "$sd/plug_$q" | grep -vx 'src/kinds/awgdev.c' | tr '\n' ' ')|$(comm -12 "$sd/plug_$q" "$sd/steerd" | tr '\n' ' ')"
+    check "2.1: плагин $q — программа на plugkit (PK_PROGRAM \"$q\" в src/modules/main_$q.c)" "1 1" \
+        "$(grep -c '^src/plugkit/plugkit\.c$' "$sd/plug_$q") $(grep -c "^PK_PROGRAM(\"$q\", CMDS);" "src/modules/main_$q.c")"
+done
+check "мост tgws — модуль: src/modules/main_tgws.c зовёт steer_module_main с именем модуля" "1" \
+    "$(grep -c 'steer_module_main(argc, argv, "tgws", STEER_VERSION)' src/modules/main_tgws.c)"
 cat "$sd/libsteer" "$sd/net1" "$sd/steerd" "$sd/mod_tgws" "$sd"/plug_* | sort -u > "$sd/all21"
 check "раскладка 2.1 покрывает расширенный профиль (кроме файла профиля)" "src/profile/extended.c " \
     "$(comm -23 "$sd/extended" "$sd/all21" | tr '\n' ' ')"
-check "  и добавляет то же, что 2.0, и файлы net1" \
-    "$(printf '%s\n' $EXTRA_20 $(profile_var NET1_CHECK_SRC) $(profile_var NET1_OWN_SRC) | LC_ALL=C sort | tr '\n' ' ')" \
+# Сверх статического профиля — точки входа программ (main_* плагинов, которых в нём нет, pkmain.c, мост),
+# обёртка QUIC (в статическом профиле её нет: потребителя нет, телефону — шаг 6), менеджер плагинов
+# (steerd), протоколы hysteria2, proxy и warpbox (только плагинами) и файлы net1.
+EXTRA_21="src/modules/main_hysteria2.c src/modules/main_proxy.c src/modules/main_tgws.c src/modules/main_warpbox.c src/modules/plugconf.c src/pluginmgr/pmindex.c src/pluginmgr/pminst.c src/pluginmgr/pmmain.c src/pluginmgr/pmstate.c src/pluginmgr/pmutil.c src/pluginmgr/pmver.c src/plugkit/pkmain.c src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2main.c src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2wire.c src/proto/proxy/pxdial.c src/proto/proxy/pxhttp.c src/proto/proxy/pxmain.c src/proto/proxy/pxsocks.c src/proto/proxy/pxss.c src/proto/proxy/pxsub.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxvmess.c src/proto/proxy/pxwire.c src/proto/quic/qcdoq.c src/proto/quic/qcssl.c src/proto/quic/quic.c src/proto/warp/wbconf.c src/proto/warp/wbexpand.c src/proto/warp/wbmain.c src/proto/warp/wbmq.c src/proto/warp/wbns.c src/proto/warp/wbping.c src/proto/warp/wbreg.c src/proto/warp/wbscan.c src/proto/warp/wbx509.c"
+check "  и добавляет только точки входа программ, обёртку QUIC, менеджер плагинов, протоколы-плагины и файлы net1" \
+    "$(printf '%s\n' $EXTRA_21 $(profile_var NET1_CHECK_SRC) $(profile_var NET1_OWN_SRC) | LC_ALL=C sort | tr '\n' ' ')" \
     "$(comm -13 "$sd/extended" "$sd/all21" | LC_ALL=C sort | tr '\n' ' ')"
 # Сборка: net1 и плагины линкуются без libsteer ($SO), плагины — с RUNPATH к net1.
 bl="$(grep -v '^[[:space:]]*#' build/build-libs.sh)"
@@ -993,15 +971,13 @@ if command -v python3 >/dev/null 2>&1; then
     check "  libs: libs2p-net.so.$n1maj, abi $n1maj.$n1min, файл lib/" "libs2p-net.so.$n1maj $n1maj.$n1min lib/libs2p-net.so.$n1maj" \
         "$(jget plugins/net1/plugin.json '" ".join([d["libs"][0]["soname"], d["libs"][0]["abi"], d["libs"][0]["file"]])')"
     check "  SONAME в сборке тот же" "1" "$(grep -c "soname,libs2p-net.so.$n1maj" build/build-libs.sh)"
-    # Манифест протокола: requires.plugins.net1 по ABI, подкоманды — все команды модуля из CMD_MOD
-    # (src/lib/module.c) кроме помощника, помощник вида — команда модуля, --conf {conf}.
+    # Манифест протокола: requires.plugins.net1 по ABI; подкоманды, помощник и хуки манифеста — ровно
+    # команды программы плагина (таблица CMDS у PK_PROGRAM в src/modules/main_<id>.c), а не список ядра.
     for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do
         mf="plugins/$q/plugin.json"
-        # warp — помощник встроенного вида warp (разворот группы — в ядре, v2.c, пока у warpbox нет
-        # хука expand): его вид плагин не объявляет, помощник ядро находит по CMD_MOD (module.c).
-        want="$(grep -o "{ \"[a-z0-9-]*\", *\"steer-$q\" *}" src/lib/module.c | sed 's/{ "\([^"]*\)".*/\1/' | grep -vx 'warp' | sort | tr '\n' ' ')"
-        have="$(jget "$mf" '" ".join(sorted([c["name"] for c in d["steer"].get("commands",[])] + list({k["helper"]["cmd"] for k in d["steer"].get("kinds",[])})))') "
-        check "plugins/$q: подкоманды и помощник — команды модуля steer-$q из CMD_MOD" "$want" "$have"
+        want="$(sed -n '/static const struct pk_cmd CMDS/,/^};/p' "src/modules/main_$q.c" | grep -oE '^ *\{ "[a-z0-9-]+"' | grep -oE '"[^"]+"' | tr -d '"' | sort | tr '\n' ' ')"
+        have="$(jget "$mf" '" ".join(sorted({(c.get("argv") or [c["name"]])[0] for c in d["steer"].get("commands",[])} | {k["helper"].get("cmd", k["name"]) for k in d["steer"].get("kinds",[]) if k.get("helper")} | {k[h]["argv"][0] for k in d["steer"].get("kinds",[]) for h in ("check","expand") if k.get(h)}))') "
+        check "plugins/$q: подкоманды, помощник и хуки — команды программы плагина (PK_PROGRAM)" "$want" "$have"
         case " $(profile_var PLUGINS_NET1) " in
             *" $q "*) check "plugins/$q: requires.plugins.net1 = ^$n1maj.$n1min" "^$n1maj.$n1min" "$(jget "$mf" 'd["requires"]["plugins"]["net1"]')" ;;
             *) check "plugins/$q: без net1 (стек ему не нужен)" "None" "$(jget "$mf" 'd.get("requires",{}).get("plugins",{}).get("net1")')" ;;
@@ -1196,8 +1172,8 @@ check "exports-ext.lst: каждый символ экспортируется l
 # (plughttp.c) — слой TLS: в libsteer, в базовых сборках его нет.
 check "plugso.c — в steerd и в статическом ядре" "2" \
     "$( { profile_src steerd | words | grep -c '^src/daemon/plugso\.c$'; profile_src base | words | grep -c '^src/daemon/plugso\.c$'; } | awk '{s+=$1} END {print s}')"
-check "plugso.c — не в libsteer и не в модулях" "0" \
-    "$(for p in libsteer mod_vless mod_xsteer mod_obfs mod_tgws mod_hysteria2 mod_proxy mod_warpbox; do profile_src "$p" | words | grep '^src/daemon/plugso\.c$'; done | wc -l | tr -d ' ')"
+check "plugso.c — не в libsteer, не в мосте tgws и не в программах плагинов" "0" \
+    "$(for p in libsteer mod_tgws $(for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do printf 'plug_%s ' "$q"; done); do profile_src "$p" | words | grep '^src/daemon/plugso\.c$'; done | wc -l | tr -d ' ')"
 check "plughttp.c — в libsteer, не в базовом ядре" "1:0" \
     "$(profile_src libsteer | words | grep -c '^src/proto/tls/plughttp\.c$'):$(profile_src base | words | grep -c '^src/proto/tls/plughttp\.c$')"
 # Версия ABI одна — в plugabi.h; build/abi.sh её читает, build.sh кладёт файл в steer-core.

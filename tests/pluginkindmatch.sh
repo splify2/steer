@@ -222,7 +222,7 @@ while read -r n p; do
 done < "$tmp/real.txt"
 check "nft-map: приоритеты цепочек ядра совпадают с набором правил" "" "$miss"
 
-has "version --json: версия steer-api, по которой плагины сверяют compat" "$("$BIN" version --json 2>&1)" '"api":"1.0","abi":"1.0"'
+has "version --json: версия steer-api, по которой плагины сверяют compat" "$("$BIN" version --json 2>&1)" '"api":"1.1","abi":"1.0"'
 
 # ================= 5. подкоманда из манифеста ===========================================================
 check "подкоманда плагина исполняется" "hello from plugin: hello a b" "$("$BIN" fake-hello a b 2>&1)"
@@ -231,6 +231,10 @@ has "  и плагин" "$("$BIN" help 2>&1)" "[fakeplug]"
 has "help <подкоманда>" "$("$BIN" help fake-hello 2>&1)" "приветствие плагина"
 
 # ================= 6. вид без плагина ====================================================================
+# Какой плагин даёт протокол vless, ядро узнаёт из индекса семени (provides.kinds), а не из своего списка.
+mkdir -p "$tmp/seed"
+printf '{"plugins":{"vless":{"versions":[{"version":"2.1.0","provides":{"kinds":["tunnel:vless"]}}]}}}\n' > "$tmp/seed/index.json"
+export STEER_PLUGIN_SEED="$tmp/seed"
 spec nov '  f1: { kind: fakekind, token: abc }
   v:  { kind: tunnel, protocol: vless, subscription: sub/x, nodes: [1], on_fail: direct }'
 spec novonly '  v:  { kind: tunnel, protocol: vless, subscription: sub/x, nodes: [1], on_fail: direct }'
@@ -256,9 +260,11 @@ has "  плагин в сводке с причиной" "$st" '{"id":"fakeplug"
 has "  apply — отказ с причиной" "$(dry ok)" "плагин fakeplug отключён: отключён человеком"
 check "  подкоманда отключённого плагина не регистрируется" "1" "$("$BIN" fake-hello >/dev/null 2>&1; echo $(( $? > 0 )))"
 rm -f "$ETC/state.json"
-# без плагинной раскладки (нет каталога плагинов) ядро ведёт себя, как до плагинов
+# без каталога плагинов протокол из семени — тот же отказ «нужен плагин», без семени — «не знаю»
 out="$(STEER_PLUGINS_ROOT="$tmp/none" "$BIN" apply --dry-run --spec "$tmp/novonly.yaml" 2>&1)"
-has "без раскладки плагинов: вид без модуля — прежний отказ" "$out" "kind vless требует пакет steer-vless"
+has "без каталога плагинов: протокол по семени — «нужен плагин»" "$out" "outputs.v: нужен плагин vless — поставить"
+out="$(STEER_PLUGIN_SEED="$tmp/none" STEER_PLUGINS_ROOT="$tmp/none" "$BIN" apply --dry-run --spec "$tmp/novonly.yaml" 2>&1)"
+has "без каталога и семени: протокол неизвестен" "$out" "протокол «vless» не знаю"
 out="$(STEER_PLUGINS_ROOT="$tmp/none" "$BIN" apply --dry-run --spec "$tmp/ok.yaml" 2>&1)"
 has "без раскладки плагинов: вид плагина неизвестен" "$out" "неизвестный kind «fakekind»"
 
@@ -273,7 +279,7 @@ cat > "$ROOT/clash/plugin.json" <<'EOF'
   "steer": { "commands": [{ "name": "apply", "prog": "bin/x" }, { "name": "fake-hello", "prog": "bin/x" }] } }
 EOF
 st="$(stat ok)"
-has "несовместимый steer-api: плагин выключен с числами" "$st" 'oldapi 1.0.0 требует steer-api ^2.0, у ядра 1.0'
+has "несовместимый steer-api: плагин выключен с числами" "$st" 'oldapi 1.0.0 требует steer-api ^2.0, у ядра 1.1'
 has "имя команды ядра плагину не даётся" "$st" 'подкоманда apply — команда ядра'
 check "  команда ядра осталась ядру" "table" "$("$BIN" apply --dry-run --spec "$tmp/ok.yaml" 2>&1 | head -1 | cut -d' ' -f1)"
 rm -rf "$ROOT/oldapi" "$ROOT/clash"
