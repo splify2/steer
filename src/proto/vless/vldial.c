@@ -734,7 +734,7 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
 
 /* ---- подъём ---------------------------------------------------------------------------- */
 
-int vless_tunnel_run(struct output *o, const struct pool_cfg *pc,
+int vless_tunnel_run(const struct tun_out *o, const struct pool_cfg *pc,
                      void (*ready)(void *arg, const char *dev), void *arg) {
     /* Идентификатор узла — ДО устройства и потоков, пока узел ещё можно назвать. Дальше он
      * разбирается заново на каждое соединение (vl_flow_open), и отказ там означал бы туннель,

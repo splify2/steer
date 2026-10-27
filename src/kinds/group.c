@@ -360,33 +360,17 @@ static unsigned group_caps_of(const struct output *o) {
     return o->grp.caps;
 }
 
-/* Помощник группы `kind: warp` — модуль steer-warpbox (src/proto/warp/wbmain.c): регистрация WARP,
- * подбор точек и замена у членов. У обычной группы помощника нет. В подпись — то, что модуль читает
- * при старте: транспорт, страны и состав членов (имена и over — туннели подбора идут тем же путём). */
+/* Помощник группы — только у группы, которую развернул плагин (его хук expand вернул helper: true,
+ * steer-api.md, 3.3): помощник вида плагина ведёт её членов (member, revive). У обычной группы
+ * помощника нет. */
 static int group_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
-    const struct group_cfg *g = &o->grp;
-    /* Группа, которую развернул плагин (его хук expand вернул helper: true) — помощник плагина. */
-    if (!g->warp.on) return plugin_owner_helper(sp, o, h);
-    if (kind_helper_cmd(h, "warp") != 0) return -1;
-    h->marks = 1;
-    kind_sig_mix(&h->sig, &g->warp.transport, sizeof(g->warp.transport));
-    kind_sig_mix(&h->sig, &g->warp.xcc_set, sizeof(g->warp.xcc_set));
-    for (size_t i = 0; i < g->warp.cc_n; i++) kind_sig_mix(&h->sig, g->warp.cc[i], 2);
-    kind_sig_mix(&h->sig, "|", 1);
-    for (size_t i = 0; i < g->warp.xcc_n; i++) kind_sig_mix(&h->sig, g->warp.xcc[i], 2);
-    for (size_t k = 0; k < g->members_n; k++) {
-        const struct output *m = spec_out(sp, g->members[k]);
-        if (!m) continue;
-        kind_sig_mix(&h->sig, m->name, strlen(m->name));
-        kind_sig_mix(&h->sig, m->over, strlen(m->over));
-    }
-    return 0;
+    return plugin_owner_helper(sp, o, h);
 }
 
 /* ---- plugin-device: общий вид «устройство держит процесс владельца» ---------------------------
  *
- * Прежнее имя — warp-masque: член WARP с TUN модуля steer-warpbox (поток туннеля MASQUE, src/proto/warp/
- * wbmq.c). Теперь вид общий (spec-fields.md, раздел 3): устройство создаёт и держит процесс плагина,
+ * Прежнее имя — warp-masque: член WARP с TUN плагина warpbox (поток туннеля MASQUE). Вид общий
+ * (spec-fields.md, раздел 3): устройство создаёт и держит процесс плагина,
  * который завёл выход (owner), как у xsteer; маршрут, метку, таблицу и подмену адресов ведёт ядро,
  * как у любого выхода с устройством. Своих ключей у вида нет, руками в спеке он не пишется:
  * принимается только в подготовленной спеке и только с `owner` (разворот хука expand, model/v2.c) —

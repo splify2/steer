@@ -11,7 +11,7 @@
  * с libsteer и libsteer-wolfssl — musl версий символов не различает.
  *
  * ABI. SONAME несёт major (libs2p-net.so.1), карта — узел LIBS2P_NET_1. minor добавляет экспорт, major
- * ломает. Типы на границе — структуры исходников (struct output, pool_cfg, platform_ops, transport…):
+ * ломает. Типы на границе — структуры исходников (struct tun_out, pool_cfg, platform_ops, transport…):
  * плагин и net1 обязаны видеть их одинаково. Это ловит ОТПЕЧАТОК — размеры структур границы,
  * разрядность и порядок байт; помощник сверяет его при запуске (s2pcheck.c) и отказывает строкой,
  * а не портит память. Изменилась раскладка структуры границы — это major net1 (net2), а не minor. */
@@ -21,8 +21,8 @@
 #include <stdint.h>
 #include <time.h>
 
-#include "spec.h"
 #include "platform.h"
+#include "stack.h"
 #include "profile.h"
 #include "pool.h"
 #include "dialer.h"
@@ -31,9 +31,9 @@
 #include "quic.h"
 
 #define S2P_NET_ABI_MAJOR 1
-#define S2P_NET_ABI_MINOR 2
+#define S2P_NET_ABI_MINOR 3
 /* Версия плагина net1 (plugins/net1/plugin.json, сверяет tests/buildmatch.sh): major = номер в id. */
-#define S2P_NET_VERSION "1.2.0"
+#define S2P_NET_VERSION "1.3.0"
 
 struct s2p_net_abi {
     uint32_t size;           /* sizeof(struct s2p_net_abi) — новые поля только в конец */
@@ -51,8 +51,7 @@ static inline uint64_t s2p_net_fingerprint_calc(void) {
     S2P_FP_MIX(h, sizeof(long));
     S2P_FP_MIX(h, sizeof(time_t));
     S2P_FP_MIX(h, (uint16_t)0x0102 == *(const uint8_t *)&(const uint16_t){0x0102} ? 1 : 2);
-    S2P_FP_MIX(h, sizeof(struct output));
-    S2P_FP_MIX(h, sizeof(struct spec));
+    S2P_FP_MIX(h, sizeof(struct tun_out));
     S2P_FP_MIX(h, sizeof(struct platform_ops));
     S2P_FP_MIX(h, sizeof(struct profile));
     S2P_FP_MIX(h, sizeof(struct pool_cfg));

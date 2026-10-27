@@ -8,7 +8,7 @@
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/splify2/steer",
   "compat": {
-    "steer-api": "^1.0"
+    "steer-api": "^1.1"
   },
   "arch": [
     "aarch64_cortex-a53",
@@ -24,7 +24,7 @@
   ],
   "requires": {
     "plugins": {
-      "net1": "^1.2",
+      "net1": "^1.3",
       "awg": "^2.1"
     },
     "system": [
@@ -32,22 +32,56 @@
     ]
   },
   "permissions": [
-    "net.admin",
-    "http",
     "ctl",
+    "http",
+    "net.admin",
+    "spec.transform",
     "system-packages"
   ],
   "steer": {
+    "kinds": [
+      {
+        "name": "warp",
+        "description": "Cloudflare WARP одной строкой: группа из count туннелей.",
+        "keys": "kinds/warp.schema.json",
+        "caps": [
+          "device",
+          "mark",
+          "ctmark",
+          "over",
+          "ipv6"
+        ],
+        "expand": {
+          "prog": "bin/warpbox",
+          "argv": [
+            "warp-expand"
+          ]
+        },
+        "helper": {
+          "prog": "bin/warpbox",
+          "cmd": "warp",
+          "argv": [
+            "warp",
+            "{out}",
+            "--conf",
+            "{conf}"
+          ]
+        }
+      }
+    ],
     "commands": [
       {
         "name": "warp-reg",
         "prog": "bin/warpbox",
-        "help": "зарегистрировать устройство WARP"
+        "help": "зарегистрировать устройство WARP",
+        "usage": "<файл>"
       },
       {
         "name": "warp-scan",
         "prog": "bin/warpbox",
-        "help": "подобрать точки входа WARP"
+        "help": "подобрать точки входа WARP для выхода",
+        "usage": "<выход>",
+        "conf": true
       }
     ]
   }

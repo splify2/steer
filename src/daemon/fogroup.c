@@ -39,7 +39,7 @@
 #include "nftvmap.h"
 #include "nftdump.h"
 #include "failover_int.h"
-#include "tunpool.h"
+#include "plugin.h"
 
 #define LOG_W "steer[warn] failover: "
 
@@ -251,18 +251,13 @@ static int state_cc(const char *st, const char *key, char cc[3]) {
 }
 
 int fog_member_cc(const struct output *m, char cc[3]) {
-    /* Чей файл — по имени выхода: у выхода один процесс, а файл мёртвого процесса tun_state_load не
-     * отдаёт. Тег по виду не выбирается, потому что у прокси один тег на пять протоколов. */
-    static const char *const TAGS[] = { "vless", "hy2", "proxy" };
-    for (size_t i = 0; i < sizeof(TAGS) / sizeof(TAGS[0]); i++) {
-        char *st = tun_state_load(TAGS[i], m->name);
-        if (!st) continue;
-        /* Фактическая страна (geo_cc, проверка выхода) — важнее заявленной именем узла. */
-        int ok = state_cc(st, "geo_cc", cc) || state_cc(st, "node_cc", cc);
-        free(st);
-        return ok;
-    }
-    return 0;
+    /* Файл состояния выхода плагина (steer-api.md, 2.2: поля geo_cc и node_cc). Фактическая страна
+     * (geo_cc, проверка выхода) — важнее заявленной именем узла. */
+    char *st = plugin_out_state(m);
+    if (!st) return 0;
+    int ok = state_cc(st, "geo_cc", cc) || state_cc(st, "node_cc", cc);
+    free(st);
+    return ok;
 }
 
 int fog_cc_allowed(const struct output *go, const struct output *m) {

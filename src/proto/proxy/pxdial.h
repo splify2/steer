@@ -7,7 +7,7 @@
 #include "transport.h"
 #include "proxy.h"
 
-struct output;
+struct tun_out;
 
 extern const struct dialer_ops proxy_trojan_dialer, proxy_ss_dialer, proxy_socks_dialer,
                                proxy_http_dialer, proxy_vmess_dialer;
@@ -39,7 +39,7 @@ int px_probe(const struct px_node *n, int timeout_s, char *why, size_t why_n, in
  * Исход открытия потока слежке за узлами докладывает пул — дайлерам протоколов об этом думать не
  * нужно. */
 struct pool_cfg;
-int px_tunnel_run(struct output *o, const struct pool_cfg *pc,
+int px_tunnel_run(const struct tun_out *o, const struct pool_cfg *pc,
                   void (*ready)(void *arg, const char *dev), void *arg);
 
 #endif

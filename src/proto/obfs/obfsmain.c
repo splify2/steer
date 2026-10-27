@@ -1,44 +1,58 @@
-/* Модуль обфускатора: подкоманды `steer obfs` и `steer obfs-server`.
+/* Программа плагина obfs: помощник обфускатора для выхода `interface` с ключом obfs и сервер обфускации
+ * для VPS (`obfs-server`).
  *
- * Клиент и сервер сами (obfs.c) — общий код: их зовёт и клиент xsteer в режиме потока (поддельный
- * TCP), поэтому файл obfs.c остаётся в libsteer. Здесь — только точка входа помощника obfs,
- * которой раньше была ветка в src/daemon/main.c, и она же — main бинарника steer-obfs
- * (src/proto/obfs/modmain.c): демон запускает его ребёнком для каждого выхода `interface` с
- * обфускацией. В статических сборках (телефон, стенды) файл входит в сам steerd, и подкоманды
- * живут там, как жили. */
+ * Клиент и сервер сами (obfs.c) — общий код: их зовёт и клиент xsteer (поддельный TCP). Здесь —
+ * только подкоманды. Помощника ядро запускает по манифесту плагина: вид ядра interface (impl: core),
+ * helper.when: obfs — у выхода с этим ключом (plugin-sdk/docs/manifest.md). О выходе программа знает
+ * только из {conf}: ключ obfs, метка своих сокетов. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-#include "spec.h"
 #include "obfs.h"
-#include "registry.h"
+#include "plugkit.h"
 
-int cmd_obfs(const char *spec_path, const char *out_name) {
-    /* Спека — значение, а не глобал (правило 6): выделяется по требованию и живёт до конца
-     * процесса. struct spec — под 300 КБ, на стеке ему не место. */
-    struct spec *cfg = calloc(1, sizeof(*cfg));
-    if (!cfg) die("нет памяти под спеку", NULL);
-    struct err e = {0};
-    if (load_spec(spec_path, cfg, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(cfg, out_name);
-    if (!o) die("нет такого выхода: %s", out_name);
-    const struct out_obfs *ob = iface_obfs(o);
-    if (!ob) die("у выхода %s не настроен obfs", out_name);
-    /* Метка сокета к серверу обфускации — out_underlay_mark (см. «вложенные выходы» в
-     * spec.h). При via она — метка выхода-цели, а та появляется только в реестре: без
-     * registry_assign функция вернула бы ноль, то есть «напрямую», молча. Без via реестр
-     * не нужен и не трогается — у этого процесса его прежде не было. */
-    if (o->over[0] && registry_assign(cfg, &e) < 0) err_die(&e);
-    obfs_set_sock_mark(out_underlay_mark(cfg, o), o->over[0] != 0);
-    return obfs_client(o->name, ob->server, ob->server_port, ob->listen, ob->listen_port);
+/* «адрес:порт» → адрес и порт 1..65535. Ядро уже проверило запись при разборе спеки (obfs_set). */
+static int hostport(const char *v, char *host, size_t hn, int *port) {
+    const char *c = v ? strrchr(v, ':') : NULL;
+    if (!c || c == v || (size_t)(c - v) >= hn) return -1;
+    char *e;
+    long p = strtol(c + 1, &e, 10);
+    if (e == c + 1 || *e || p < 1 || p > 65535) return -1;
+    memcpy(host, v, (size_t)(c - v));
+    host[c - v] = '\0';
+    *port = (int)p;
+    return 0;
+}
+
+static int split(const char *v, const char *what, char *host, size_t hn, int *port) {
+    if (!v || hostport(v, host, hn, port) != 0) {
+        fprintf(stderr, "steer: obfs.%s — адрес:порт, а не «%s»\n", what, v ? v : "");
+        return -1;
+    }
+    return 0;
+}
+
+int cmd_obfs(const struct pk_out *o) {
+    const struct pkj *ob = pkj_get(o->keys, "obfs");
+    if (!ob) pk_fail("у выхода %s не настроен obfs", o->tun.name);
+    char sh[80], lh[80];
+    int sp = 0, lp = 0;
+    if (split(pkj_str(pkj_get(ob, "server")), "server", sh, sizeof sh, &sp) != 0 ||
+        split(pkj_str(pkj_get(ob, "listen")), "listen", lh, sizeof lh, &lp) != 0)
+        return 2;
+    /* Метка сокета к серверу обфускации — из {conf}: метка выхода-подложки при over, иначе «мимо
+     * каналов». Обязательна при over: без неё сокет ушёл бы напрямую, мимо подложки. */
+    obfs_set_sock_mark(pk_sock_mark(o), o->sock_mark_required);
+    return obfs_client(o->tun.name, sh, sp, lh, lp);
 }
 
 int cmd_obfs_server(int listen_port, const char *forward) {
-    if (!listen_port) die("нужен --listen ПОРТ (порт поддельного TCP)", NULL);
-    if (!forward) die("нужен --forward АДРЕС:ПОРТ (куда отдавать датаграммы)", NULL);
+    if (!listen_port) pk_fail("нужен --listen ПОРТ (порт поддельного TCP)");
+    if (!forward) pk_fail("нужен --forward АДРЕС:ПОРТ (куда отдавать датаграммы)");
     char host[80];
     int fport = 0;
-    if (obfs_split_hostport(forward, host, sizeof(host), &fport) != 0)
-        die("--forward должен быть вида адрес:порт, а не %s", forward);
+    if (hostport(forward, host, sizeof(host), &fport) != 0)
+        pk_fail("--forward должен быть вида адрес:порт, а не %s", forward);
     return obfs_server(listen_port, host, fport);
 }

@@ -5,7 +5,6 @@
 #include <stddef.h>
 #include "wbreg.h"
 
-struct spec;
 
 /* Класс точки: чем меньше, тем лучше. Негодные (нет рукопожатия, туннель молчит или рвётся) в
  * итог не попадают вовсе. */
@@ -28,7 +27,7 @@ struct wb_pt {
 };
 
 struct wb_scan {
-    const struct spec *sp;
+    uint32_t fwmark;                /* метка сокета туннелей подбора: подложка группы или «мимо каналов» */
     int ns;                         /* пространство подбора (wb_ns_new) */
     const char *over;               /* туннель через этот выход (over группы) или NULL */
     const struct wb_reg *reg;       /* ключ, которым пробуются точки */

@@ -4,7 +4,8 @@
     "subscription": {
       "type": "string",
       "minLength": 1,
-      "x-path": "etc"
+      "x-path": "etc",
+      "x-watch": true
     },
     "nodes": {
       "type": [
@@ -17,7 +18,8 @@
         "minimum": 0
       },
       "minItems": 1,
-      "uniqueItems": true
+      "uniqueItems": true,
+      "x-one-or-list": true
     },
     "exclude": {
       "type": [
@@ -30,7 +32,8 @@
       },
       "minItems": 1,
       "uniqueItems": true,
-      "pattern": "^[A-Z]{2}$"
+      "pattern": "^[A-Z]{2}$",
+      "x-one-or-list": true
     },
     "exclude_name": {
       "type": [
@@ -43,7 +46,8 @@
         "minLength": 1
       },
       "minItems": 1,
-      "uniqueItems": true
+      "uniqueItems": true,
+      "x-one-or-list": true
     },
     "only": {
       "type": [
@@ -56,19 +60,8 @@
       },
       "minItems": 1,
       "uniqueItems": true,
-      "pattern": "^[A-Z]{2}$"
-    },
-    "active": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65536
-    },
-    "by": {
-      "enum": [
-        "connection",
-        "site",
-        "site_client"
-      ]
+      "pattern": "^[A-Z]{2}$",
+      "x-one-or-list": true
     },
     "interval": {
       "type": "integer",
@@ -79,16 +72,6 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 32767
-    },
-    "pick": {
-      "enum": [
-        "order"
-      ]
-    },
-    "tolerance": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 60000
     }
   },
   "required": [

@@ -12,7 +12,8 @@
 # /opt/wolfssl), JOBS (параллельность). Зовут этот скрипт build.sh (внутри образа сборщика, по разу
 # на архитектуру) и tests/libs-test.sh (на хосте, gcc).
 #
-# ЧТО В КАКОМ ФАЙЛЕ — build/sources.mk (PROFILE_libsteer, PROFILE_steerd, PROFILE_mod_*); здесь
+# ЧТО В КАКОМ ФАЙЛЕ — build/sources.mk (PROFILE_libsteer, PROFILE_steerd, PROFILE_mod_tgws,
+# PROFILE_net1, PROFILE_plug_*); здесь
 # только рецепт. Файлы на выходе называются по SONAME, а не по «libсteer.so»: у libsteer версия
 # движка (ABI между версиями не обещается, и бинарник, слинкованный с чужой версией, должен не
 # запуститься с понятной ошибкой загрузчика, а не молча взять несовместимую), у libsteer-wolfssl —
@@ -26,17 +27,16 @@
 # ld-musl-armhf.so.1 для hard-float ARM, и т. д.). RPATH не нужен: библиотеки лежат в /usr/lib,
 # где musl ищет по умолчанию.
 #
-# РАСКЛАДКА 2.1 (умолчание; build/sources.mk, «РАСКЛАДКА 2.1»): libsteer без стека протоколов,
+# РАСКЛАДКА 2.1 (единственная; build/sources.mk, «РАСКЛАДКА 2.1»): libsteer без стека протоколов,
 # steerd, модуль steer-tgws (мост ещё не плагин), плагин-библиотека net1 и плагины протоколов:
 #
 #     ВЫХОД/libsteer.so.<версия> libsteer-wolfssl.so.<версия> steerd steer-tgws
 #     ВЫХОД/plugins/net1/lib/libs2p-net.so.1
 #     ВЫХОД/plugins/<id>/bin/<id>          vless hysteria2 proxy xsteer warpbox obfs
-#     ВЫХОД/steer-<id> -> plugins/<id>/bin/<id>   ссылки для стендов 2.0 (их зовут по прежнему пути)
 #
 # Плагины ищут net1 по RUNPATH $ORIGIN/../../net1/lib — раскладка каталога плагинов на роутере
-# (/usr/lib/steer/plugins/<id>/bin) та же, что здесь. STEER_LAYOUT=2.0 — прежняя раскладка: libsteer со
-# стеком (PROFILE_libsteer20, карта build/libsteer20.map, её тоже порождает build/libs-exports.sh) и модули steer-<m> на ней.
+# (/usr/lib/steer/plugins/<id>/bin) та же, что здесь. Прежней раскладки 2.0 (модули steer-<m> на
+# libsteer со стеком) больше нет: виды и подкоманды протоколов ядро берёт только у плагинов.
 set -eu
 
 OUT="${1:?нужен выходной каталог}"
@@ -135,8 +135,7 @@ QUIC_SSL="$(profile_var QUIC_SSL_SRC)"
 LAYOUT="${STEER_LAYOUT:-2.1}"
 case "$LAYOUT" in
     2.1) LIB_PROFILE=PROFILE_libsteer; LIB_MAP=build/libsteer.map ;;
-    2.0) LIB_PROFILE=PROFILE_libsteer20; LIB_MAP=build/libsteer20.map ;;
-    *) echo "build-libs: STEER_LAYOUT — 2.1 или 2.0, а не «$LAYOUT»" >&2; exit 2 ;;
+    *) echo "build-libs: STEER_LAYOUT — только 2.1 (раскладка 2.0 с модулями протоколов снята), а не «$LAYOUT»" >&2; exit 2 ;;
 esac
 LIB_SRC=""
 for f in $(profile_var "$LIB_PROFILE"); do
@@ -216,18 +215,10 @@ $CC -O2 $APPF -c "$MODCMD" -o "$OBJ/modcmd.o"
 if [ -z "${STEER_EXT_ONLY:-}" ]; then
 link_app steerd "-O2 $APPF" PROFILE_steerd
 link_app steer-tgws "-O2 $APPF" PROFILE_mod_tgws
-if [ "$LAYOUT" = 2.0 ]; then
-link_app steer-vless "-O2 $APPF" PROFILE_mod_vless
-link_app steer-xsteer "-O2 $APPF" PROFILE_mod_xsteer
-link_app steer-obfs "-O2 $APPF" PROFILE_mod_obfs
-link_app steer-hysteria2 "-O2 $APPF" PROFILE_mod_hysteria2
-link_app steer-proxy "-O2 $APPF" PROFILE_mod_proxy
-link_app steer-warpbox "-O2 $APPF" PROFILE_mod_warpbox
-fi
 fi
 
 # ---- net1 и плагины протоколов (раскладка 2.1) ----------------------------------------------------
-if [ "$LAYOUT" = 2.1 ] && [ -z "${STEER_EXT_ONLY:-}" ]; then
+if [ -z "${STEER_EXT_ONLY:-}" ]; then
     N1MAP=build/net1/libs2p-net.map
     # Заголовок переименования: по строке `#define имя s2p_имя` на каждое имя карты, кроме родных
     # s2p_net_* (src/net1/s2pnet.h). Подключается ключом -include и к net1, и к плагинам на ней: те и
@@ -245,7 +236,15 @@ if [ "$LAYOUT" = 2.1 ] && [ -z "${STEER_EXT_ONLY:-}" ]; then
     # внутри библиотеки.
     # -Wno-address: src/lib/sockmark.h спрашивает слабую `plat` (стенды без платформы), а под
     # переименованием это уже сильная s2p_plat — проверка верна, но gcc предупреждает о ней.
-    N1F="-Wno-address -O2 -fPIC -fno-semantic-interposition -ftls-model=initial-exec -ffunction-sections -fdata-sections \
+    # TLS — модель по умолчанию (global-dynamic), а НЕ initial-exec, как у libsteer: net1 грузят не
+    # только программы протоколов при запуске (DT_NEEDED), но и steerd dlopen'ом — вместе с .so-плагином
+    # ядра, которому net1 нужен (steer-abi). У библиотеки, загруженной dlopen, места в статическом блоке
+    # TLS процесса нет (__thread net1 — десятки КиБ: буферы рукопожатия TLS), и initial-exec там — отказ
+    # загрузчика «cannot allocate memory in static TLS block» (glibc) или порча (musl). Цена невелика:
+    # __thread в net1 — static, и для них компилятор берёт local-dynamic (одна база модуля на функцию,
+    # дальше смещения), а таблицы потока стека и без того — указатели в куче (src/tunnel/stack.c).
+    # Проверка — tests/libs-test.sh, «net1 в процессе steerd».
+    N1F="-Wno-address -O2 -fPIC -fno-semantic-interposition -ffunction-sections -fdata-sections \
          -Wall -Wextra -include $OBJ/steer_version.h -include $N1H $STEER_INC $THIRD_DEFS"
     N1_PLAIN=""
     for f in $(profile_var PROFILE_net1); do
@@ -287,9 +286,6 @@ if [ "$LAYOUT" = 2.1 ] && [ -z "${STEER_EXT_ONLY:-}" ]; then
             # shellcheck disable=SC2086
             $CC -o "$_pd/$_n" "$_od"/*.o $_ldi -Wl,--gc-sections -s $LIBS
         fi
-        # Ссылка по прежнему имени модуля — для стендов и для поиска ядром рядом с собой (src/lib/
-        # module.c ищет сначала каталог плагинов, затем steer-<m> рядом со steerd).
-        ln -sfn "plugins/$_n/bin/$_n" "$OUT/steer-$_n"
     }
     for _p in $(profile_var PLUGINS_NET1); do plug "$_p" 1; done
     for _p in $(profile_var PLUGINS_STATIC); do plug "$_p" 0; done
@@ -312,9 +308,5 @@ for _ea in ${STEER_EXT_APPS:-}; do
         -Wl,--gc-sections -Wl,--as-needed -s $LIBS
 done
 
-# Клиент сокета `steer` — по-прежнему статический, один на все раскладки (build.sh собирает его сам).
-if [ "$LAYOUT" = 2.1 ]; then
-    echo "libs: готово в $OUT (раскладка 2.1: libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-tgws, net1, плагины $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC)${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"
-else
-    echo "libs: готово в $OUT (раскладка 2.0: libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy, steer-warpbox${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"
-fi
+# Клиент сокета `steer` — по-прежнему статический (build.sh собирает его сам).
+echo "libs: готово в $OUT (раскладка 2.1: libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-tgws, net1, плагины $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC)${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"

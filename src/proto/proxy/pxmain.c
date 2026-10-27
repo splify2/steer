@@ -12,39 +12,24 @@
 #include "proxy.h"
 #include "pxdial.h"
 #include "sublink.h"
-#include "spec.h"
 #include "evline.h"
 #include "jsonw.h"
-#include "probe.h"
 #include "pool.h"
 
-/* {conf} помощника плагина (src/modules/plugout.h): есть только в программе протокола; в статических
- * сборках (телефон, стенды) ссылки пустые, и выход берётся из спеки, как всегда. */
-#include "plugout.h"
-#pragma weak plugconf_get
-#pragma weak plugconf_out
-static const struct plugconf *pconf(void) {
-    const struct plugconf *pc = plugconf_get ? plugconf_get() : NULL;
-    return pc && pc->active ? pc : NULL;
-}
+#include "pktun.h"
+#include "pxcmd.h"
 
 #define LOG_W2 "steer[warn]: "
 #define LOG_I2 "steer[info]: "
 
 static struct px_node *g_nodes;
 
-static struct spec *spec_new(void) {
-    struct spec *sp = calloc(1, sizeof(*sp));
-    if (!sp) die("нет памяти под спеку", NULL);
-    return sp;
-}
-
-static int *sel_alloc(const struct output *o, size_t cnt, size_t *cap) {
+static int *sel_alloc(const struct pk_tun *o, size_t cnt, size_t *cap) {
     size_t c = cnt;
-    if (o && o->proxy.nodes_n > c) c = o->proxy.nodes_n;
+    if (o && o->nodes_n > c) c = o->nodes_n;
     *cap = c;
     int *s = calloc(c + 1, sizeof(*s));
-    if (!s) die("нет памяти под список узлов", NULL);
+    if (!s) pk_fail("нет памяти под список узлов");
     return s;
 }
 
@@ -55,33 +40,37 @@ static int load_nodes_file(const char *path, enum px_proto want, size_t *cnt, st
     return 0;
 }
 
-static int load_nodes(struct spec *sp, const char *spec_path, const char *out_name,
-                      struct output **out, size_t *cnt, struct px_sub_stats *st) {
-    struct err e = {0};
-    if (load_spec(spec_path, sp, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(sp, out_name);
-    if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
-    const struct proxy_cfg *pc = out_proxy(o);
-    if (!pc) { fprintf(stderr, LOG_W2 "выход %s не протокол прокси (kind другой)\n", out_name); return 2; }
-    *out = o;
-    /* insecure выхода — до разбора подписки: от него зависит пригодность узлов с allowInsecure
-     * (общий ключ sublink.c, как у vless). */
-    vless_set_insecure(pc->insecure);
-    if (pc->insecure)
-        fprintf(stderr, LOG_W2 "выход %s: insecure — сертификат узлов security=tls НЕ проверяется\n", out_name);
-    return load_nodes_file(pc->sub_file, (enum px_proto)pc->proto, cnt, st);
+/* Вид выхода → протокол: «tunnel:trojan» и соседи. 0 — не протокол прокси. */
+static enum px_proto proto_of_kind(const char *kind) {
+    static const struct { const char *k; enum px_proto p; } K[] = {
+        { "tunnel:trojan", PX_TROJAN }, { "tunnel:shadowsocks", PX_SS }, { "tunnel:socks", PX_SOCKS },
+        { "tunnel:http", PX_HTTP }, { "tunnel:vmess", PX_VMESS } };
+    for (size_t i = 0; i < sizeof(K) / sizeof(K[0]); i++) if (!strcmp(K[i].k, kind)) return K[i].p;
+    return 0;
 }
 
-/* Метка сокетов к узлам — до соединения (как у vless): проба и туннель идут одним путём (via). */
-static void underlay_setup(struct spec *sp, const struct output *o) {
-    static const struct output none;
-    if (o && o->over[0]) {
-        struct err e = {0};
-        if (registry_assign(sp, &e) < 0) err_die(&e);
+/* Выход — из {conf}: ключи вида проверены схемой манифеста, сочетания — pk_tun_check. */
+static struct pk_tun g_t;
+
+static int load_nodes(const struct pk_out *o, size_t *cnt, struct px_sub_stats *st) {
+    char err[400];
+    enum px_proto want = proto_of_kind(o->kind);
+    if (!want) { fprintf(stderr, LOG_W2 "выход %s не протокол прокси (kind %s)\n", o->tun.name, o->kind); return 2; }
+    if (pk_tun_load(o, &g_t, err, sizeof err) != 0 || pk_tun_check(&g_t, err, sizeof err) != 0) {
+        fprintf(stderr, LOG_W2 "outputs.%s: %s\n", o->tun.name, err);
+        return 2;
     }
-    const struct plugconf *pc = pconf();
-    if (pc) { transport_set_sock_mark(pc->sock_mark, pc->sock_mark_required); return; }
-    transport_set_sock_mark(out_underlay_mark(sp, o ? o : &none), o && o->over[0]);
+    /* insecure выхода — до разбора подписки: от него зависит пригодность узлов с allowInsecure
+     * (общий ключ sublink.c, как у vless). */
+    vless_set_insecure(g_t.insecure);
+    if (g_t.insecure)
+        fprintf(stderr, LOG_W2 "выход %s: insecure — сертификат узлов security=tls НЕ проверяется\n", o->tun.name);
+    return load_nodes_file(g_t.sub_file, want, cnt, st);
+}
+
+/* Метка сокетов к узлам — до соединения (как у vless): проба и туннель идут одним путём (over). */
+static void underlay_setup(const struct pk_out *o) {
+    transport_set_sock_mark(pk_sock_mark(o), o && o->sock_mark_required);
 }
 
 /* x — исключение выхода; NULL — перечень по файлу. cc и excluded — как у vless (vlmain.c). */
@@ -122,11 +111,11 @@ static int px_race_probe(void *arg, int id, char *why, size_t n) {
     if (rc == 0) snprintf(why, n, "рукопожатие %d мс", hs);
     return rc;
 }
-static size_t exclude_filter(const struct output *o, const struct px_node *nodes, int *sel, size_t n) {
+static size_t exclude_filter(const struct pk_tun *o, const struct px_node *nodes, int *sel, size_t n) {
     if (!o) return n;
     size_t k = 0;
     for (size_t i = 0; i < n; i++)
-        if (!node_excluded(&o->proxy.excl, nodes[sel[i]].name)) sel[k++] = sel[i];
+        if (!node_excluded(&o->excl, nodes[sel[i]].name)) sel[k++] = sel[i];
     return k;
 }
 
@@ -144,8 +133,8 @@ static void skipped_json(const struct px_sub_stats *st) {
     if (st->reasons_dropped) printf(",\"skipped_other\":%zu", st->reasons_dropped);
 }
 
-int cmd_proxy_nodes(const char *spec_path, const char *out_name, int insecure) {
-    struct output *o = NULL;
+int cmd_proxy_nodes(const struct pk_out *po, const char *out_name, int insecure) {
+    const struct pk_tun *o = NULL;
     size_t cnt = 0;
     struct px_sub_stats st;
     int by_file = out_name && out_name[0] == '/';
@@ -154,36 +143,37 @@ int cmd_proxy_nodes(const char *spec_path, const char *out_name, int insecure) {
      * с флагом поэтому совпадают с номерами выхода с `insecure: true` (у файла — сквозные по пяти
      * протоколам, у выхода — внутри его протокола: порядок внутри протокола один и тот же). */
     if (by_file) vless_set_insecure(insecure);
-    int rc = by_file ? load_nodes_file(out_name, 0, &cnt, &st)
-                     : load_nodes(spec_new(), spec_path, out_name, &o, &cnt, &st);
+    if (!by_file && !po) { fprintf(stderr, LOG_W2 "выход %s: нужен --conf (steer proxy-nodes зовёт ядро)\n", out_name); return 2; }
+    int rc = by_file ? load_nodes_file(out_name, 0, &cnt, &st) : load_nodes(po, &cnt, &st);
     if (rc) return rc;
+    if (!by_file) o = &g_t;
     printf("{\"output\":");
     jsonw_str(stdout, by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    jsonw_str(stdout, by_file ? out_name : o->proxy.sub_file);
-    size_t chosen_n = o ? o->proxy.nodes_n : 0;
-    printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->proxy.nodes[0] : -1);
-    for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->proxy.nodes[i]);
+    jsonw_str(stdout, by_file ? out_name : o->sub_file);
+    size_t chosen_n = o ? o->nodes_n : 0;
+    printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->nodes[0] : -1);
+    for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->nodes[i]);
     printf("],\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[", cnt, st.skipped, st.foreign);
-    for (size_t i = 0; i < cnt; i++) { if (i) putchar(','); node_json(&g_nodes[i], (int)i, o ? &o->proxy.excl : NULL); }
+    for (size_t i = 0; i < cnt; i++) { if (i) putchar(','); node_json(&g_nodes[i], (int)i, o ? &o->excl : NULL); }
     printf("]");
     skipped_json(&st);
     printf("}\n");
     return 0;
 }
 
-int cmd_proxy_probe(const char *spec_path, const char *out_name, int node, int timeout_s,
+int cmd_proxy_probe(const struct pk_out *po, const char *out_name, int node, int timeout_s,
                     int insecure) {
-    struct output *o = NULL;
+    const struct pk_tun *o = NULL;
     size_t cnt = 0;
     struct px_sub_stats st;
     int by_file = out_name && out_name[0] == '/';
     if (by_file) vless_set_insecure(insecure);         /* как у proxy-nodes: номера те же */
-    struct spec *sp = spec_new();
-    int rc = by_file ? load_nodes_file(out_name, 0, &cnt, &st)
-                     : load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
+    if (!by_file && !po) { fprintf(stderr, LOG_W2 "выход %s: нужен --conf (steer proxy-probe зовёт ядро)\n", out_name); return 2; }
+    int rc = by_file ? load_nodes_file(out_name, 0, &cnt, &st) : load_nodes(po, &cnt, &st);
     if (rc) return rc;
-    underlay_setup(sp, o);
+    if (!by_file) o = &g_t;
+    underlay_setup(by_file ? NULL : po);
     if (!cnt) {
         printf("{\"ok\":false,\"error\":\"в подписке нет пригодных узлов\",\"skipped\":%zu,\"foreign\":%zu",
                st.skipped, st.foreign);
@@ -198,7 +188,7 @@ int cmd_proxy_probe(const char *spec_path, const char *out_name, int node, int t
     if (node >= 0) { sel[0] = node; sel_n = 1; }
     else if (by_file) { for (size_t i = 0; i < cnt; i++) sel[sel_n++] = (int)i; }
     else {
-        sel_n = out_proxy_node_list(o, cnt, sel, cap);
+        sel_n = pk_node_list(o, cnt, sel, cap);
         if (!sel_n) { printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, пригодных всего %zu\"}\n", cnt); return 1; }
         sel_n = exclude_filter(o, g_nodes, sel, sel_n);
         if (!sel_n) {
@@ -210,7 +200,7 @@ int cmd_proxy_probe(const char *spec_path, const char *out_name, int node, int t
     printf("{\"output\":");
     jsonw_str(stdout, by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    jsonw_str(stdout, by_file ? out_name : o->proxy.sub_file);
+    jsonw_str(stdout, by_file ? out_name : o->sub_file);
     printf(",\"results\":[");
     for (size_t k = 0; k < sel_n; k++) {
         size_t i = (size_t)sel[k];
@@ -238,8 +228,12 @@ int cmd_proxy_probe(const char *spec_path, const char *out_name, int node, int t
 
 /* ---- подъём -------------------------------------------------------------------------------- */
 
-static void px_probe_report(const char *out_name, enum probe_state st, int node, int total) {
-    if (!evline_enabled()) probe_report(out_name, st, node, total);
+/* Ход перебора — в файл состояния выхода, пока его не переписал пул (как у vless). */
+static void px_probe_report(const char *state, int node, int total) {
+    char j[160];
+    snprintf(j, sizeof j, "{\"pid\":%ld,\"up\":false,\"probe\":{\"state\":\"%s\",\"node\":%d,\"total\":%d}}",
+             (long)getpid(), state, node, total);
+    pk_status_write(pk_out(), j);
 }
 
 /* Устройство поднято: up демону и слежку завёл пул; здесь — только строка о маршруте без демона. */
@@ -259,25 +253,34 @@ static const char *px_pool_name(const void *node) { return ((const struct px_nod
 static const char *g_race_out;
 static void px_race_start(void *arg, int id, size_t k, size_t n) {
     (void)arg; (void)id;
-    px_probe_report(g_race_out, PROBE_RUNNING, (int)k, (int)n);
+    px_probe_report("running", (int)k, (int)n);
     evline_emit("node", "n", EVLINE_INT, (long)k, "total", EVLINE_INT, (long)n, (const char *)NULL);
 }
 static void px_race_fail(void *arg, int id, const char *why) {
     fprintf(stderr, LOG_I2 "%s — %s\n", ((const struct px_node *)arg)[id].name, why);
 }
 
-int cmd_proxy(const char *spec_path, const char *out_name) {
+int cmd_proxy(const struct pk_out *po) {
     evline_open();
-    struct output *o = NULL;
+    const char *out_name = po->tun.name;
     size_t cnt = 0;
     struct px_sub_stats st;
-    struct spec *sp = spec_new();
-    int rc = load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
+    int rc = load_nodes(po, &cnt, &st);
     if (rc) return rc;
-    underlay_setup(sp, o);
+    const struct pk_tun *o = &g_t;
+    underlay_setup(po);
+    /* insecure — в diag ядра, как у vless (main_vless.c). */
+    static char *diag;
+    if (g_t.insecure) {
+        char what[160];
+        snprintf(what, sizeof(what), "выход %.40s: сертификат узла не проверяется", out_name);
+        pk_diag_json(&diag, "insecure", "warn", what,
+                     "у выхода стоит insecure: цепочку, имя и срок сертификата узла (security=tls) никто не "
+                     "сверяет — уберите ключ");
+    }
     struct px_node *nodes = g_nodes;
     if (!cnt) {
-        px_probe_report(out_name, PROBE_FAILED, 0, 0);
+        px_probe_report("failed", 0, 0);
         evline_emit("down", "why", EVLINE_STR, "в подписке нет пригодных узлов", (const char *)NULL);
         fprintf(stderr, LOG_W2 "в подписке нет пригодных узлов (пропущено %zu, чужих %zu)\n", st.skipped, st.foreign);
         for (size_t i = 0; i < st.reasons_n; i++)
@@ -288,10 +291,10 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
     fprintf(stderr, LOG_I2 "узлов %zu (пропущено %zu, чужих %zu)\n", cnt, st.skipped, st.foreign);
     size_t cap;
     int *sel = sel_alloc(o, cnt, &cap);
-    size_t sel_n = out_proxy_node_list(o, cnt, sel, cap);
+    size_t sel_n = pk_node_list(o, cnt, sel, cap);
     if (!sel_n) {
-        px_probe_report(out_name, PROBE_NO_SUCH_NODE, o->proxy.nodes_n ? o->proxy.nodes[0] : -1, (int)cnt);
-        evline_emit("nonode", "node", EVLINE_INT, (long)(o->proxy.nodes_n ? o->proxy.nodes[0] : -1),
+        px_probe_report("no_such_node", o->nodes_n ? o->nodes[0] : -1, (int)cnt);
+        evline_emit("nonode", "node", EVLINE_INT, (long)(o->nodes_n ? o->nodes[0] : -1),
                     "total", EVLINE_INT, (long)cnt, (const char *)NULL);
         fprintf(stderr, LOG_W2 "выбранных узлов нет в подписке (пригодных всего %zu) — проверьте nodes\n", cnt);
         return 1;
@@ -299,7 +302,7 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
     size_t before = sel_n;
     sel_n = exclude_filter(o, nodes, sel, sel_n);
     if (!sel_n) {
-        px_probe_report(out_name, PROBE_ALL_EXCLUDED, 0, (int)before);
+        px_probe_report("all_excluded", 0, (int)before);
         evline_emit("excluded", "total", EVLINE_INT, (long)before, (const char *)NULL);
         evline_emit("down", "why", EVLINE_STR, "все узлы-кандидаты исключены exclude", (const char *)NULL);
         fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude, exclude_name или only — проверьте "
@@ -307,7 +310,7 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
         return 1;
     }
     int chosen = -1;
-    if (out_proxy_node_named(o)) { chosen = sel[0]; probe_clear(out_name); }
+    if (pk_node_named(o)) chosen = sel[0];
     else {
         /* Кандидаты — наперегонки (pool_race_first, I-535), как у VLESS. */
         char why[256];
@@ -318,12 +321,11 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
         if (chosen >= 0) fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[chosen].name, why);
     }
     if (chosen < 0) {
-        px_probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);
+        px_probe_report("failed", 0, (int)sel_n);
         evline_emit("down", "why", EVLINE_STR, "ни один узел подписки не отвечает", (const char *)NULL);
         fprintf(stderr, LOG_W2 "ни один узел подписки не отвечает\n");
         return 1;
     }
-    probe_clear(out_name);
     /* Пул узлов (src/tunnel/pool.c), как у vless: первый активный — выбранный здесь, остальные
      * `active - 1` пул найдёт среди кандидатов сам. */
     static struct pool_proto proto;
@@ -335,14 +337,14 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
     proto.tag = "proxy";
     proto.extra = extra;
     static struct pool_cfg pc;
-    const struct tun_pool *tp = &o->proxy.pool;
+    const struct pk_pool *tp = &o->pool;
     pc.proto = &proto;
     pc.nodes = nodes;
     pc.stride = sizeof(*nodes);
     pc.sel = sel;
     pc.sel_n = sel_n;
     pc.first = chosen;
-    pc.checked = !out_proxy_node_named(o);
+    pc.checked = !pk_node_named(o);
     pc.active = tp->active ? tp->active : 1;
     pc.by = tp->by;
     pc.pick = tp->pick;
@@ -350,8 +352,7 @@ int cmd_proxy(const char *spec_path, const char *out_name) {
     pc.interval_s = tp->interval_s;         /* 0 — умолчание пула: у pick: latency своё */
     pc.silence_s = tp->silence_s < 0 ? 0 : tp->silence_s ? tp->silence_s : POOL_SILENCE_S;
     pc.out = out_name;
-    struct err e = {0};
-    if (registry_assign(sp, &e) < 0) err_die(&e);
-    if (plugconf_out) plugconf_out(o);    /* метка и таблица — из {conf}, а не из своей копии реестра */
-    return px_tunnel_run(o, &pc, px_ready, NULL);
+    pc.diag = diag;
+    /* Метка, таблица и порт слушателя — из {conf}. */
+    return px_tunnel_run(&po->tun, &pc, px_ready, NULL);
 }

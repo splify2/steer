@@ -165,146 +165,10 @@ struct out_obfs {
  * «Вид выхода»). Прежде все поля всех видов лежали рядом, и поле одного вида читал другой (путь
  * `conf` у awg жил в поле xsteer): у каждого вида теперь своё, и заполняет его только разбор его
  * модуля (src/kinds/<вид>.c). Читать поле чужого вида нельзя — там настройка того, чей это выход;
- * помощники спрашивают свою настройку у вида (out_vless, out_xsteer, out_tgws в kind.h). */
+ * помощники спрашивают свою настройку у вида (out_tgws в kind.h). Вид плагина держит ключи по схеме
+ * манифеста (struct plugin_out), а его помощник читает их из {conf}. */
 struct iface_cfg {
     struct out_obfs obfs;
-};
-
-/* ПУЛ УЗЛОВ туннеля по подписке (ключи `active`, `by`, `interval`, `silence`, `pick`, `tolerance`
- * спеки v2; src/tunnel/pool.c). Ноль — ключа нет, действует умолчание: один активный узел, раздача
- * connection, узлы по порядку предпочтения, проверка раз в 60 с (pick: latency — замер раз в 180 с),
- * порог молчания 20 с. silence_s -1 — порог выключен явно (`silence: 0`). */
-struct tun_pool {
-    int active;                 /* сколько узлов кандидатов работают сразу */
-    int by;                     /* enum group_by: те же значения, что у by группы balance */
-    int interval_s;             /* период проверки каждого активного узла */
-    int silence_s;              /* порог молчания узла на живом соединении */
-    int pick;                   /* enum pool_pick (pool.h): 0 — по порядку, 1 — самые быстрые */
-    int tolerance_ms;           /* pick: latency — допуск смены узла, мс (при tol_set) */
-    int tol_set;                /* tolerance задан: 0 — тоже значение (менять на любой более быстрый) */
-};
-
-struct vless_cfg {
-    /* Откуда брать узлы. Подписка, а не один узел, потому что
-     * failover между узлами — то же самое, что между устройствами, и списком он и
-     * выражается. Файл, а не URL: скачивание это дело управляющего слоя, движок читает
-     * то, что ему положили — см. правило про списки в README. */
-    char sub_file[256];
-    /* Какие узлы подписки брать и в каком порядке предпочтения. ПУСТОЙ список (умолчание)
-     * означает «первый рабочий среди всех пригодных»: тогда выбор делает проверка при
-     * подъёме, а не человек, угадывающий номер.
-     *
-     * Список, а не один номер, потому что между узлами подписки нужен ровно тот же перебор,
-     * что между устройствами выхода: человек выбирает три локации из двадцати шести и
-     * ставит их в порядке предпочтения, а живого выбирает движок. Одиночное `node` осталось
-     * сокращением для списка из одного элемента — той же парой, что `device`/`devices`.
-     *
-     * Номера — среди ПРИГОДНЫХ узлов, то есть те же, что печатает `steer vless-nodes`. Одно
-     * значение слова «номер узла» на весь проект (см. cmd_vless_nodes). */
-    int *nodes;                 /* арена спеки, nodes_n записей (NULL при 0) */
-    size_t nodes_n;
-    /* Ключ `transport:` спеки v2 — какими транспортами узлов подписки туннелю ходить: биты
-     * TT_* ниже, 0 — любыми (ключа нет; v1 его не знает).
-     *
-     * ФИЛЬТР, А НЕ ЗАМЕНА. Транспорт — свойство входа на сервере (inbound у Xray): сервер
-     * слушает ws или tcp, и клиент, пришедший к tcp-входу с кадрами WebSocket, получит
-     * отказ. Узлы с транспортом приходят из подписки — ссылкой (`type=`) или конфигом
-     * (`network`), — поэтому `transport:` у выхода может только ВЫБРАТЬ среди них, а не
-     * переделать чужие. Нужен он тому, у кого панель отдаёт один сервер в нескольких видах
-     * («NL reality», «NL ws через CDN»): `transport: ws` держит туннель на узлах, идущих через
-     * CDN, и при обновлении подписки, когда номера узлов уехали, — без правки `nodes`.
-     *
-     * Вместе с `nodes` — пересечение: из выбранных номеров берутся узлы с этими транспортами;
-     * ни одного не осталось — туннель не поднимается и называет причину (vlmain.c), а не
-     * уходит на узел, которого человек не выбирал. Номера при этом не сдвигаются: они по-прежнему
-     * среди всех пригодных узлов, как печатает `steer vless-nodes`. */
-    unsigned transports;
-    /* Ключ `insecure:` спеки v2 — не проверять сертификат узлов security=tls этого выхода. Явный
-     * отказ от проверки, по одному на выход и по умолчанию выключенный: подписка выключить её
-     * не может (узел с allowInsecure в подписке без этого ключа пропускается, sub.c). Значит
-     * ответственность за «мне всё равно, кто на том конце» лежит на человеке, а не на панели
-     * продавца. Диагностика (`steer diag`) и status предупреждают, пока ключ включён; подпись
-     * Reality он не затрагивает. */
-    int insecure;
-    /* Ключи `exclude:` и `exclude_name:` спеки v2 — какие узлы подписки не брать в кандидаты
-     * (страна по флагу в имени, кусок имени; src/model/nodesel.h). Только отбор: номера `nodes`
-     * от него не сдвигаются, вместе с `nodes` и `transport` — пересечение. */
-    struct node_exclude excl;
-    struct tun_pool pool;       /* active, by, interval, silence */
-};
-
-/* hysteria2 (kind: tunnel, protocol: hysteria2). Узлы берутся из подписки так же, как у vless, —
- * файл и выбор кандидатов с тем же смыслом (см. vless_cfg), — а вот транспорта нет: hysteria2 это
- * QUIC целиком, и выбирать между tcp и ws ему нечем. Ключ `transport` у такого выхода — ошибка
- * разбора, а не молча проглоченное слово. */
-struct hy2_cfg {
-    char sub_file[256];
-    int *nodes;                 /* арена спеки, nodes_n записей (NULL при 0), как у vless_cfg */
-    size_t nodes_n;
-    struct node_exclude excl;   /* exclude, exclude_name, only — как у vless_cfg */
-    /* Из ключей пула — только interval (период проверки узла) и silence (срок простоя QUIC):
-     * соединение с узлом у hysteria2 одно на все потоки, и active/by разбор отвергает. */
-    struct tun_pool pool;
-};
-
-/* Протоколы прокси (kind: tunnel, protocol: trojan|shadowsocks|socks|http|vmess) — модуль
- * steer-proxy. Узлы из подписки, как у vless; транспорт берётся из ссылки узла (у trojan/vmess он
- * есть, у ss/socks/http — голый tcp), поэтому ключа `transport` у выхода нет. proto — enum px_proto
- * (хранится числом: spec.h не знает proxy.h). Пять видов делят одну настройку. */
-struct proxy_cfg {
-    int proto;                  /* enum px_proto */
-    char sub_file[256];
-    int *nodes;
-    size_t nodes_n;
-    int insecure;               /* не проверять сертификат узлов security=tls (trojan/vmess/http) */
-    struct node_exclude excl;   /* exclude, exclude_name, only — как у vless_cfg */
-    struct tun_pool pool;       /* active, by, interval, silence — как у vless */
-};
-
-/* Исключение узлов — в подпись помощника (kind_helper.sig): клиент отбирает кандидатов при старте,
- * и смена exclude без перезапуска не вступила бы в силу. Пусто — подпись прежняя. */
-static inline void kind_sig_excl(unsigned long long *h, const struct node_exclude *x) {
-    if (x->cc_n) kind_sig_mix(h, "exclude", 8);
-    for (size_t i = 0; i < x->cc_n; i++) kind_sig_mix(h, x->cc[i], 2);
-    if (x->only_n) kind_sig_mix(h, "only", 5);
-    for (size_t i = 0; i < x->only_n; i++) kind_sig_mix(h, x->only[i], 2);
-    if (x->names_n) kind_sig_mix(h, "exclude_name", 13);
-    for (size_t i = 0; i < x->names_n; i++) kind_sig_mix(h, x->names[i], strlen(x->names[i]) + 1);
-}
-
-/* Транспорты узла туннеля — имена как в ссылке узла (type=) и биты для vless_cfg.transports. */
-enum { TT_TCP = 1u << 0, TT_GRPC = 1u << 1, TT_XHTTP = 1u << 2, TT_WS = 1u << 3,
-       TT_HTTPUPGRADE = 1u << 4, TT_COUNT = 5 };
-static inline const char *tunnel_transport_name(unsigned i) {
-    switch (i) {
-    case 0: return "tcp";
-    case 1: return "grpc";
-    case 2: return "xhttp";
-    case 3: return "ws";
-    case 4: return "httpupgrade";
-    default: return "";
-    }
-}
-/* Бит транспорта по имени; 0 — такого нет. */
-static inline unsigned tunnel_transport_bit(const char *s) {
-    for (unsigned i = 0; i < TT_COUNT; i++)
-        if (!strcmp(s, tunnel_transport_name(i))) return 1u << i;
-    return 0;
-}
-
-struct xsteer_cfg {
-    /* Путь к конфигурации в стиле wg. ПУТЬ, а не сами ключи, и
-     * это принципиально: спеку читает и печатает целиком управляющий слой, она уходит в
-     * status (его опрашивают раз в пять секунд), в diag и в резервную копию. Приватный
-     * ключ в ней означал бы ключ, уже покинувший коробку. По умолчанию выводится из
-     * имени выхода — держать два имени, которым позволено разойтись, незачем (то же
-     * решение, что с device). */
-    char conf[256];
-    /* Режим потока: записи по НАСТОЯЩЕМУ TCP вместо поддельного (см.
-     * src/proto/xsteer/xsstream.h). Нужен там, где сырой сокет недоступен — у провайдера, который его
-     * режет, в контейнере без CAP_NET_RAW, — и там, где хаб держит только этот режим.
-     * stream_port — порт хаба для потока; 0 означает «тот же, что в Endpoint». */
-    int stream, stream_port;
 };
 
 struct awg_cfg {
@@ -347,10 +211,6 @@ enum group_pick { PICK_ORDER = 0, PICK_LATENCY, PICK_MANUAL, PICK_BALANCE };
  * одного устройства — на одном члене (sticky-sessions). Порядок — как в спеке (group_by_name). */
 enum group_by { BY_CONNECTION = 0, BY_SITE, BY_SITE_CLIENT };
 
-/* Чем выход `kind: warp` ходит к Cloudflare (WARPBOX.md в хабе): AmneziaWG — туннели вида awg ядра
- * steer; MASQUE — этап 2. */
-enum warp_transport { WARP_AWG = 0, WARP_MASQUE = 1 };
-
 struct group_cfg {
     enum group_pick pick;
     /* Арена спеки (group_members_alloc): members, weight, alive, lat_ms, lat4_ms, lat6_ms — все
@@ -381,21 +241,6 @@ struct group_cfg {
      * её читает сторож из файла состояния туннеля-члена (fogroup.c, fog_member_cc). names не
      * используется. Массивы — в арене спеки. */
     struct node_exclude ccsel;
-    /* Группа записана в спеке как `kind: warp` (src/model/v2.c, p_warp): её члены — выходы awg
-     * «<имя>.<n>», которые разбор завёл сам, а регистрацию WARP, подбор точек входа и замену ведёт
-     * модуль steer-warpbox (помощник группы, kinds/group.c). cc/xcc — страны выхода (cca2): только
-     * эти / кроме этих; xcc_set — exclude_countries задан явно (convert печатает и пустой). Массивы — в
-     * арене спеки. */
-    struct {
-        unsigned char on;
-        unsigned char transport;        /* enum warp_transport */
-        unsigned char xcc_set;
-        unsigned count;
-        char (*cc)[3];
-        size_t cc_n;
-        char (*xcc)[3];
-        size_t xcc_n;
-    } warp;
     /* СОСТОЯНИЕ, а не настройка (как device и failed у выхода): что сторож выбрал в последнем
      * проходе. Заполняет outputs_adopt_active_st из памяти сторожа, разбор оставляет -1/нулями.
      * У группы с именованными членами cur и alive — решение подхвата по приговорам членов
@@ -434,11 +279,6 @@ struct out_keys {
     size_t nodes_n, nodes_cap;  /* nodes_cap ведёт spec_push у читателя формата */
     /* Какой из двух форм записан выбор узлов: `node` (сокращение) или `nodes` (список). */
     int node_one, node_many;
-    unsigned transports;        /* `transport:` спеки v2 (vless_cfg.transports) */
-    int insecure;               /* `insecure:` спеки v2 (vless_cfg.insecure) */
-    struct node_exclude excl;   /* `exclude:`, `exclude_name:` спеки v2 (vless_cfg.excl) */
-    struct tun_pool pool;       /* `active`, `by`, `interval`, `silence` спеки v2 (struct tun_pool) */
-    int by_set;                 /* `by` записан (у него ноль — значение connection) */
     /* `devices` спеки v1 — кандидаты в порядке предпочтения. В модели поля нет: пул устройств —
      * это группа (kind: group), её собирает перевод v1 (model/v1.c), а вид выхода только
      * решает, принимает ли он такой список вообще (KK_DEVICES — у interface). */
@@ -539,6 +379,10 @@ struct output {
      * записи своего владельца (kind: warp). */
     const char *owner_plugin;
     const char *owner_out;
+    /* Выход, развёрнутый с помощником (owner_out — он сам): вид плагина, которым он был записан, и его
+     * ключи по схеме (JSON) — для {conf} помощника (steer-api.md, 1.4). NULL у остальных. */
+    const char *owner_kind;
+    const char *owner_keys;
     /* НЕДОСТУПНОСТЬ: вид выхода не работает здесь и сейчас — нужен плагин, плагин отключён, спека не
      * подготовлена. Причина для человека; NULL — доступен. У такого выхода вид unavail (kind.h),
      * он `failed` и живёт по своему on_fail, остальные выходы работают. unavail_plugin — id плагина,
@@ -548,10 +392,6 @@ struct output {
     /* Настройка вида — ровно одна из этих, по kind. */
     union {
         struct iface_cfg iface;
-        struct vless_cfg vless;
-        struct hy2_cfg hy2;
-        struct proxy_cfg proxy;
-        struct xsteer_cfg xs;
         struct awg_cfg awg;
         struct zapret_cfg zp;
         struct tgws_cfg tg;

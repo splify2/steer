@@ -17,6 +17,9 @@ struct out_obfs;
  * говорит вызывающий: только он знает, где она стоит). */
 int port_range_parse(const char *s, struct port_range *r);
 
+/* «адрес:порт» → адрес и порт (model/parse.c; его же зовёт обфускатор плагина obfs). 0 — разобрано. */
+int obfs_split_hostport(const char *s, char *host, size_t hn, int *port);
+
 /* Обфускация выхода из трёх строк спеки: режим (пусто — wg-over-tcp), «адрес:порт» сервера и
  * «адрес:порт», на который смотрит Endpoint пира WireGuard. name — имя выхода для сообщений.
  * 0 — ob заполнен и ob->on = 1; -1 — отказ, текст в e. */

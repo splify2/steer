@@ -103,6 +103,7 @@ size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *
             }
             k++;
             snprintf(h->name, sizeof(h->name), "%s", o->name);
+            if (hp.plugin) snprintf(h->plugin, sizeof(h->plugin), "%s", hp.plugin);
             /* Команда помощника — команда модуля, а в этом steerd её нет: помощника исполняет
              * бинарник модуля (steer-vless и остальные), который лежит рядом. Статическая
              * сборка (телефон, стенды) несёт модуль в себе — modcmd_builtin говорит «да», и

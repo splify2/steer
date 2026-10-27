@@ -132,7 +132,7 @@ const struct dialer_ops hy2_dialer = {
     .aborted = h2_aborted,
 };
 
-int hy2_tunnel_run(struct output *o, const struct hy2_node *node,
+int hy2_tunnel_run(const struct tun_out *o, const struct hy2_node *node,
                    void (*ready)(void *arg, const char *dev), void *arg) {
     if (hy2c_init(node) != 0) {
         fprintf(stderr, "steer[warn]: hysteria2: соединение с узлом %s не запустилось\n", node->name);

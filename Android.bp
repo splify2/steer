@@ -40,7 +40,6 @@ cc_defaults {
         // steerd, so the stubs never fire) and the obfuscator entry point.
         "src/lib/module.c",
         "src/cli/modcmd.c",
-        "src/proto/obfs/obfsmain.c",
         "src/lib/err.c",
         "src/compile/groups.c",
         "src/compile/generate.c",
@@ -108,7 +107,6 @@ cc_defaults {
         "src/dnsd/main.c",
         "src/daemon/failover.c",
         "src/tools/aggregate.c",
-        "src/proto/obfs/obfs.c",
         "src/cli/cli.c",
         "src/tools/srsread.c",
         "src/tools/hwid.c",
@@ -139,6 +137,7 @@ cc_defaults {
         // YAML_SRC in build/sources.mk: the engine's wrapper here, libyaml itself in
         // libsteer_yaml below (its own flags, like wolfSSL).
         "src/lib/ynode.c",
+        "src/kinds/awgdev.c",
     ],
     static_libs: ["libsteer_yaml"],
     // Каталоги слоёв — те же, что INC_DIRS в build/sources.mk (сверяет tests/buildmatch.sh).
@@ -152,8 +151,11 @@ cc_defaults {
         "src/cli",
         "src/dnsd",
         "src/tools",
-        "src/proto/obfs",
         "src/profile",
+        // The plugin side of the core API (PK_STATIC_SRC): the vless, xsteer and obfs plugin programs
+        // are compiled into the phone binary together with their manifests (src/plugkit/pkembed.c).
+        "src/plugkit",
+        "src/proto/obfs",
         "src/tunnel",
         "src/proto/tls",
         "src/proto/transport",
@@ -172,7 +174,7 @@ cc_defaults {
         "-DSTEER_DEFAULT_PLATFORM=android",
         // Keep in step with VERSION (build.sh and the Makefile read it from
         // there; Soong cannot read a file into a define).
-        "-DSTEER_VERSION=\"2.0.5\"",
+        "-DSTEER_VERSION=\"2.1.0\"",
     ],
     // No binary with steer's name should linger in a symbol table either.
     strip: {
@@ -283,13 +285,21 @@ cc_binary {
         "src/proto/tgws/tgws.c",
         "src/proto/tls/tlsprobe.c",
         "src/proto/tls/urltls.c",
-        // Kinds of the full package (KINDS_EXT_SRC in build/sources.mk); without them the
-        // registry answers "requires steer-extended" — see src/kinds/kind.c.
-        "src/kinds/vless.c",
-        "src/kinds/xsteer.c",
         // The profile file of the full package (src/profile/profile.h): the build's name and the
         // [steer-extended] marks in help. Profiles are sets of files, not defines.
         "src/profile/extended.c",
+        // Plugin programs compiled in (PK_STATIC_SRC) and their manifests (PKEMBED_SRC, written by
+        // build/pkembed.sh): the core registry sees vless, xsteer and obfs without a plugins directory.
+        "src/plugkit/plugkit.c",
+        "src/plugkit/pkjson.c",
+        "src/plugkit/pktun.c",
+        "src/modules/main_vless.c",
+        "src/modules/main_xsteer.c",
+        "src/proto/xsteer/xshook.c",
+        "src/proto/obfs/obfsmain.c",
+        "src/modules/main_obfs.c",
+        "src/proto/obfs/obfs.c",
+        "src/plugkit/pkembed.c",
     ],
     cflags: [
         // For src/lib/scrypto.c: wolfSSL reads its options from user_settings.h (exported by

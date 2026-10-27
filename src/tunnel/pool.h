@@ -33,6 +33,8 @@ struct pool_proto {
 #define POOL_LAT_INTERVAL_S 180
 #define POOL_LAT_TOLERANCE_MS 50
 enum pool_pick { POOL_PICK_ORDER = 0, POOL_PICK_LATENCY = 1 };
+/* Раздача новых соединений между активными узлами (ключ `by`): те же значения, что у by группы. */
+enum pool_by { POOL_BY_CONNECTION = 0, POOL_BY_SITE = 1, POOL_BY_SITE_CLIENT = 2 };
 
 struct pool_cfg {
     const struct pool_proto *proto;
@@ -52,12 +54,16 @@ struct pool_cfg {
     int pick;           /* enum pool_pick: по порядку предпочтения или самые быстрые */
     int tolerance_ms;   /* pick: latency — допуск смены узла, мс; < 0 — умолчание */
     const char *out;    /* имя выхода: файл состояния */
+    /* Строки diag протокола для файла состояния (steer-api.md, 2.3): объекты {"id","verdict","what",
+     * "why"} через запятую, без скобок; NULL — своих нет. К ним пул добавляет свою — «активных узлов
+     * k из n», когда узлов держать нужно больше одного. */
+    const char *diag;
 };
 
 /* Поднять туннель выхода o на пуле узлов: стек с дайлером пула (stack_run), слежка за узлами, когда
  * устройство поднято, и ready модуля после неё (может быть NULL). Код выхода процесса — как у
  * stack_run. */
-int pool_run(struct output *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg);
+int pool_run(const struct tun_out *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg);
 /* Файл состояния пула для status. Помощник плагина пишет <state>/plugin/<id>/<выход>.status.json и
  * говорит ядру событием state (steer-api.md, 2.2); не задан — <каталог состояния>/<tag>-<выход>, как в 2.0. */
 void pool_set_status_path(const char *path);

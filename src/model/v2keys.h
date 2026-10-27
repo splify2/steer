@@ -21,7 +21,6 @@ enum v2_scope {
     V2S_LIST,           /* запись lists.<имя> */
     V2S_OUT,            /* запись outputs.<имя>: общие ключи и ключи видов (кому — who) */
     V2S_OBFS,           /* outputs.<имя>.obfs */
-    V2S_WARP,           /* outputs.<имя> при kind: warp (его разворачивает ядро, пока нет плагина) */
     V2S_DNS,
     V2S_CACHE_TTL,      /* dns.cache_ttl */
     V2S_DNS_UP,         /* dns.upstreams.<имя> — сервер */

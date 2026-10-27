@@ -8,7 +8,7 @@
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/splify2/steer",
   "compat": {
-    "steer-api": "^1.0"
+    "steer-api": "^1.1"
   },
   "arch": [
     "aarch64_cortex-a53",
@@ -28,14 +28,27 @@
   "steer": {
     "commands": [
       {
-        "name": "obfs",
-        "prog": "bin/obfs",
-        "help": "клиент обфускатора выхода"
-      },
-      {
         "name": "obfs-server",
         "prog": "bin/obfs",
-        "help": "сервер обфускатора (VPS)"
+        "help": "сервер обфускации (VPS)",
+        "usage": "--listen ПОРТ --forward АДРЕС:ПОРТ"
+      }
+    ],
+    "kinds": [
+      {
+        "name": "interface",
+        "impl": "core",
+        "helper": {
+          "prog": "bin/obfs",
+          "cmd": "obfs",
+          "when": "obfs",
+          "argv": [
+            "obfs",
+            "{out}",
+            "--conf",
+            "{conf}"
+          ]
+        }
       }
     ]
   }

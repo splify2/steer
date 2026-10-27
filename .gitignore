@@ -170,3 +170,5 @@ build/libs-plug/
 build/libs20-*/
 build/libs20-*.log
 build/build-*.log
+build/pkhooks
+build/pkmatch

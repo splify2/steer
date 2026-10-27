@@ -27,9 +27,11 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include "spec.h"
-#include "obfs.h"
 #include "check.h"
 #include "v1.h"
+#include "plugin.h"
+#include "plugutil.h"
+#include "ynode.h"
 
 /* Канал спеки v1 — ровно то, что в нём написано, до перевода в правило. Живёт только на время
  * разбора одного канала (на стеке): модель хранит правило, список и клиента. */
@@ -261,6 +263,90 @@ static int parse_obfs(struct js *j, const char *name, struct out_obfs *ob, struc
     return obfs_set(name, mode, server, listen, ob, e);
 }
 
+/* ВИДЫ ПРОТОКОЛОВ В СПЕКЕ v1. Формат v1 заморожен (kind.h), и в нём два вида протоколов — `vless`
+ * (ключи sub_file, node, nodes) и `xsteer` (conf, stream, stream_port). Виды протоколов ядро держит
+ * только из манифестов плагинов, поэтому v1 переводит такой выход в вид плагина спеки v2 — tunnel:vless
+ * или xsteer — с ключами, переименованными по таблице ниже, и дальше выход живёт как любой выход вида
+ * плагина: схема ключей манифеста, его помощник, {conf}. Таблица — знание о ФОРМАТЕ v1 (какие имена
+ * он писал), а не о плагинах: вид берётся у того плагина, который его объявил. Плагина нет — тот же
+ * путь, что у v2 (steer-api.md, 3.5): при старте выход недоступен, при apply и check — отказ. */
+static const struct { const char *v1, *v2; } V1_PLUGIN_KIND[] = {
+    { "vless", "tunnel:vless" },
+    { "xsteer", "xsteer" },
+};
+
+static int v1_plugin_kind(struct spec *s, struct output *o, const char *kind, const struct out_keys *k,
+                          struct err *e) {
+    const char *v2 = NULL;
+    for (size_t i = 0; i < sizeof(V1_PLUGIN_KIND) / sizeof(V1_PLUGIN_KIND[0]); i++)
+        if (!strcmp(V1_PLUGIN_KIND[i].v1, kind)) v2 = V1_PLUGIN_KIND[i].v2;
+    if (!v2) return 1;
+    struct sbuf b = { 0 };
+    sb_str(&b, "{");
+    int n = 0;
+    if (k->sub_file[0]) { sb_str(&b, "\"subscription\":"); sb_json(&b, k->sub_file); n++; }
+    if (k->nodes_n) {
+        sb_str(&b, n++ ? ",\"nodes\":[" : "\"nodes\":[");
+        for (size_t i = 0; i < k->nodes_n; i++) sb_printf(&b, "%s%d", i ? "," : "", k->nodes[i]);
+        sb_str(&b, "]");
+    }
+    if (k->conf[0]) { sb_str(&b, n++ ? ",\"conf\":" : "\"conf\":"); sb_json(&b, k->conf); }
+    if (k->stream) { sb_str(&b, n++ ? ",\"stream\":true" : "\"stream\":true"); }
+    if (k->stream_port) { sb_printf(&b, "%s\"stream_port\":%d", n++ ? "," : "", k->stream_port); }
+    sb_str(&b, "}");
+    if (b.oom) { free(b.p); return v1_nomem(e); }
+    const struct plugin_kind *pk = plugin_kind_find(v2);
+    if (!pk) {
+        char why[400];
+        const char *id = NULL;
+        int known = plugin_kind_why(v2, why, sizeof why, &id) != NULL;
+        if (!known || (s->load_flags & LOAD_STRICT)) {
+            free(b.p);
+            if (!known) snprintf(why, sizeof why, "вид %s даёт плагин, а такого плагина ядро не знает", v2);
+            char m[sizeof(why) + 64];
+            snprintf(m, sizeof m, "outputs.%s: %s", o->name, why);
+            return err_set(e, "%s", m);
+        }
+        int rc = out_make_unavail(s, o, why, id, v2);
+        if (rc == 0) {
+            o->plg.keys_json = spec_strdup(s, b.p);
+            if (!o->plg.keys_json) rc = -1;
+        }
+        free(b.p);
+        if (rc) return v1_nomem(e);
+        o->kind = &kind_unavail;
+        return 0;
+    }
+    struct err pe;
+    memset(&pe, 0, sizeof(pe));
+    struct ydoc *d = ydoc_parse_buf(b.p, b.n, "spec v1", &pe);
+    free(b.p);
+    if (!d) {
+        char m[sizeof(pe.msg) + 64];
+        snprintf(m, sizeof m, "outputs.%s: %s", o->name, pe.msg);
+        return err_set(e, "%s", m);
+    }
+    char conf[2 * PATH_MAX], etc[PATH_MAX], *json = NULL;
+    const struct ynode *at = NULL;
+    plugin_etc(etc, sizeof(etc));
+    snprintf(conf, sizeof(conf), "%s/conf/%s", etc, pk->owner->id);
+    struct err ke;
+    memset(&ke, 0, sizeof(ke));
+    int rc = plugin_keys_check(pk, ydoc_root(d), plat()->etc_dir, conf, &json, &at, &ke);
+    ydoc_free(d);
+    if (rc != 0) {
+        char m[sizeof(ke.msg) + 64];
+        snprintf(m, sizeof m, "outputs.%s: %s", o->name, ke.msg);
+        return err_set(e, "%s", m);
+    }
+    o->kind = &pk->ops;
+    o->plg.pk = pk;
+    o->plg.keys_json = spec_strdup(s, json);
+    free(json);
+    if (!o->plg.keys_json) return v1_nomem(e);
+    return 0;
+}
+
 static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
     if (js_lit(j, '{') != 0) return err_set(e, "outputs: expected an object", NULL);
     js_ws(j);
@@ -457,14 +543,27 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             return err_set(e, "outputs.%s: kind zapret убран из ядра steer: обход DPI — отдельный модуль "
                        "recheck, без обхода выход заменяет kind: direct", o.name);
         const struct kind_ops *kd = kind_by_name(kind);
-        if (!kd) return err_set(e, "outputs.%s: неизвестный kind "
-                   "(нужен direct, interface, vless, xsteer, tgws или awg)", o.name);
+        int legacy = 0;
+        if (!kd) {
+            int lr = v1_plugin_kind(s, &o, kind, &k, e);
+            if (lr < 0) return -1;
+            if (lr) return err_set(e, "outputs.%s: неизвестный kind "
+                       "(нужен direct, interface, vless, xsteer, tgws или awg)", o.name);
+            kd = o.kind;
+            legacy = 1;
+        }
         if (kd->absent) {
             static char msg[256];
             snprintf(msg, sizeof(msg), "outputs.%s: %s", o.name, kd->absent);
             return err_set(e, "%s", msg);
         }
         o.kind = kd;
+        /* Ключи протокола уже ушли в ключи вида плагина (v1_plugin_kind): вид их не видит. */
+        if (legacy) {
+            k.sub_file[0] = k.conf[0] = '\0';
+            k.stream = k.stream_port = 0;
+            k.nodes_n = 0;
+        }
         if (kd->parse && kd->parse(&o, &k, e) != 0) return -1;
         /* КЛЮЧ ЧУЖОГО ВИДА — отказ. Поле, принятое молча у чужого вида выхода, — это
          * «настроено», сказанное о том, что не настроено. Проверки стоят ПОСЛЕ разбора вида,
@@ -476,7 +575,7 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
          * него, у direct транспорта нет вовсе. Режим потока — свойство транспорта xsteer. */
         if (k.obfs.on && !(kd->keys & KK_OBFS))
             return err_set(e, "outputs.%s: obfs есть только у kind=interface", o.name);
-        if ((k.stream || k.stream_port) && !(kd->keys & KK_STREAM))
+        if (!legacy && (k.stream || k.stream_port) && !(kd->keys & KK_STREAM))
             return err_set(e, "outputs.%s: stream есть только у kind=xsteer", o.name);
         if (k.opts_file[0] && !(kd->keys & KK_OPTS))
             return err_set(e, "outputs.%s: opts_file есть только у kind=recheck", o.name);
@@ -494,7 +593,7 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
          * может стоять в спеке, написанной до этой версии, а `node` там стоять мог — и у
          * чужого вида выхода он и раньше ничего не делал. Отказать на нём сейчас значило бы
          * сломать применение спеки, которая работала, ради поля, которое ничего не меняет. */
-        if (k.node_many && !(kd->keys & KK_NODES))
+        if (k.node_many && !legacy && !(kd->keys & KK_NODES))
             return err_set(e, "outputs.%s: nodes есть только у kind=vless — это номера узлов подписки",
                 o.name);
         /* Дубликат номера делает перебор бессмысленным ровно так же, как дубликат устройства

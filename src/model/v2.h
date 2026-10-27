@@ -28,7 +28,4 @@ int v2_schema_print(FILE *f, int json, struct err *e);
 /* Каталог файла спеки для относительных путей ключей (см. определение). */
 int v2_base_dir(const char *name, char *buf, size_t n);
 
-/* Вид выхода, который спека v2 пишет туннелем (`kind: tunnel, protocol: <имя>`): 1 — да. */
-int v2_tunnel_proto(const char *kind_name);
-
 #endif

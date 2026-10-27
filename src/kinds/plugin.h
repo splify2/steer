@@ -7,10 +7,11 @@
  * вида плагина нет своего kind_*.c, его struct kind_ops собирает реестр (plugin_kind.ops) и общий
  * код спрашивает его так же, как вид ядра.
  *
- * ВИД ПЛАГИНА И ВИД ЯДРА СОСУЩЕСТВУЮТ. Пока протоколы не вынесены из дерева steer, у `tunnel:vless`
- * есть встроенная запись (kinds/vless.c): если плагин того же имени стоит и включён, вид берётся у
- * плагина, иначе — встроенный. Вид, которого нет ни там, ни там, — «недоступный» (kind_unavail):
- * его выход живёт по on_fail, остальное работает (steer-api.md, 3.5).
+ * ВИДОВ ПРОТОКОЛОВ В ЯДРЕ НЕТ. tunnel:vless, xsteer, warp и соседи приходят только из манифестов. Вид,
+ * которого нет, — «недоступный» (kind_unavail): его выход живёт по on_fail, остальное работает
+ * (steer-api.md, 3.5); apply и check отказывают с причиной «нужен плагин X» (X — из индекса семени).
+ * Виды ядра (interface, awg…) плагин может дополнить: допуск (impl: core) и помощник по ключу вида
+ * (helper.when — обфускатор у interface с obfs).
  *
  * Реестр один на процесс и неизменяем между plugin_reload: записи видов живут в куче, указатели из
  * выходов спеки (plugin_out.pk) остаются годными, пока не вызван plugin_reload — его зовут при
@@ -22,10 +23,12 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "cli.h"
 #include "kind.h"
 
-/* Версия steer-api этого ядра (steer-api.md): плагин `^1.x` исполняется, если x не больше минора. */
-#define STEER_API_VERSION "1.0"
+/* Версия steer-api этого ядра (steer-api.md): плагин `^1.x` исполняется, если x не больше минора.
+ * Число одно — CLI_STEER_API (cli/cli.h). */
+#define STEER_API_VERSION CLI_STEER_API
 
 struct err;
 struct spec;
@@ -54,6 +57,18 @@ struct plugin_cmd {
     char *help, *usage;
     int ctl;                    /* есть строка `ctl` в манифесте: доступна и через сокет */
     int ctl_timeout_s;
+    /* conf (manifest.md, commands[]): первое слово — имя выхода вида этого плагина (не путь с «/»);
+     * ядро кладёт его файл настройки {conf} и передаёт программе `--conf <файл>`, а --spec и
+     * --state-dir человека забирает себе (steer-api.md, 1.4, 4.3). */
+    int conf;
+    /* ctl.args — слова запроса сокета по порядку: вид (name, int, target, file, word) и флаг, которым
+     * слово уходит программе (NULL — позиционное); у int — пределы. ctl.optional — сколько последних
+     * слов можно опустить. ctl.body — тело запроса файлом: путь — последним словом программе. */
+    struct plugin_ctl_arg { char *kind; char *flag; long lo, hi; } *ctl_args;
+    size_t ctl_args_n;
+    int ctl_optional;
+    long ctl_body_max;          /* 0 — тела нет */
+    int ctl_lock;               /* изменяющая: в очереди с apply */
 };
 
 struct plugin_kind {
@@ -74,13 +89,29 @@ struct plugin_kind {
     struct pnft **nftp;         /* их разбор, по одному на файл */
     unsigned res_ports, res_queues;     /* kinds[].resources: сколько на каждый выход */
     char *lan_only, *novia, *selfnat_why;
+    char *desc;                 /* kinds[].description, иначе description плагина; NULL — нет */
+    int health_events;          /* health: events — здоровье и задержку судит помощник (up/down), а не проба */
+    char *helper_when;          /* helper.when — помощник только у выходов с этим ключом (вид ядра impl: core) */
+    char **watch;  size_t watch_n;  /* ключи x-watch: содержимое их файлов — в подпись перезапуска */
     struct kind_ops ops;        /* запись вида: её и возвращает реестр видов (kind_by_name) */
 };
 
 /* Плагин из реестра. */
+/* ПЛАГИНЫ, ВКОМПИЛИРОВАННЫЕ В СТАТИЧЕСКУЮ СБОРКУ (телефон; plugin-sdk, open.md, О-13). Каталога плагинов
+ * там нет, а протоколы нужны: манифест и файлы официального плагина (plugins/<id>/) лежат в бинарнике
+ * строками (src/plugkit/pkembed.c — его пишет build/pkembed.sh, сверяет tests/buildmatch.sh), программа —
+ * сам бинарник (PK_PROGRAM, src/plugkit). Реестр читает их, как каталог «@builtin/<id>»; плагин того же
+ * id в настоящем каталоге плагинов главнее. files[0] — plugin.json; @VERSION@ — версия ядра. */
+#define PLUGIN_BUILTIN_DIR "@builtin"
+struct plugin_embed_file { const char *path, *text; };
+struct plugin_embed { const char *id; const struct plugin_embed_file *files; };
+extern const struct plugin_embed steer_plugin_embed[] __attribute__((weak));
+
 struct plugin {
     char *id, *version, *dir;
+    int builtin;                /* вкомпилирован (PLUGIN_BUILTIN_DIR): программа — этот бинарник */
     char *name;
+    char *desc;                 /* description манифеста */
     int enabled;                /* включён и совместим: его виды и команды зарегистрированы */
     char *why;                  /* почему не включён (для status и отказов); NULL — включён */
     struct plugin_cmd *cmd;  size_t cmd_n;
@@ -98,13 +129,10 @@ struct plugin {
 
 /* ---- реестр ---- */
 
-/* Каталог плагинов: STEER_PLUGIN_DIR (стенды), иначе /usr/lib/steer/plugins. */
+/* Каталог плагинов: STEER_PLUGINS_ROOT (стенды), иначе /usr/lib/steer/plugins. */
 const char *plugin_root(void);
 /* Каталог данных менеджера (state.json, conf/, cache/): STEER_PLUGIN_ETC, иначе <etc платформы>/plugins. */
 const char *plugin_etc(char *buf, size_t n);
-/* Каталог плагинной раскладки есть на этой машине. Нет — ядро ведёт себя как до плагинов: виды без
- * модуля отказывают всей спеке, как прежде (kind.c, absent). */
-int plugin_layout_present(void);
 /* Прочитать манифесты заново и перестроить реестр. root NULL — plugin_root(). 0 — готово (в том
  * числе без единого плагина); -1 — нет памяти. Манифест, который не читается, не роняет реестр:
  * плагин записывается выключенным с причиной (plugin_at(i)->why). */
@@ -176,6 +204,20 @@ int plugin_conf_write(const struct spec *sp, const struct output *o);
 /* Перечитать реестр плагинов, если каталог плагинов или state.json изменились с прошлого чтения
  * (1 — перечитан). Зовёт загрузка спеки в демоне, чтобы смена плагинов подхватывалась на reload. */
 int plugin_refresh(void);
+
+/* Файл состояния выхода плагина (steer-api.md, 2.2): <state>/plugin/<id>/<выход>.status.json —
+ * выхода вида плагина или развёрнутого выхода с помощником (owner). Текст в куче (free); NULL — файла
+ * нет, он не объект JSON или называет мёртвый процесс (поле pid). */
+char *plugin_out_state(const struct output *o);
+/* status развёрнутого выхода с помощником (owner — он сам): поле plugin, как у вида плагина. */
+void plugin_owner_status(FILE *out, const struct output *o);
+
+/* Помощник выхода от вида плагина pk: программа плагина с раскрытым argv, {conf} и подпись. 0 / -1. */
+int plugin_kind_helper(const struct plugin_kind *pk, const struct spec *sp, const struct output *o,
+                       struct kind_helper *h);
+/* Помощник, которого плагин даёт виду ЯДРА (kinds[] с impl: core и helper.when, manifest.md): запись
+ * включённого плагина для вида kind и ключа key; NULL — такого плагина нет. */
+const struct plugin_kind *plugin_core_ext(const char *kind, const char *key);
 
 /* Помощник развёрнутого выхода (хук expand вернул helper: true): kind_ops.helper группы зовёт его. */
 int plugin_owner_helper(const struct spec *sp, const struct output *o, struct kind_helper *h);

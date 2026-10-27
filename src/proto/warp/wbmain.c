@@ -1,26 +1,31 @@
-/* Команды модуля steer-warpbox: помощник группы `kind: warp` и служебные warp-reg, warp-scan.
+/* Программа плагина warpbox: вид `warp` (plugins/warpbox/plugin.json) — его разворот (хук expand),
+ * помощник развёрнутого выхода и служебные warp-reg, warp-scan.
  *
- * ПОМОЩНИК (cmd_warp). Демон поднимает его для группы `kind: warp` (kinds/group.c, helper). Члены
- * группы — обычные выходы awg «<группа>.<n>», заведённые разбором (model/v2.c, p_warp): устройство,
- * метку, таблицу, здоровье и подхват ведёт ядро steer, как у любого awg. Модуль делает то, чего
- * ядро не знает:
+ * РАЗВОРОТ (cmd_warp_expand, steer-api.md, 3.3). Выход `kind: warp` одной строкой становится группой
+ * с его именем и count членами «<имя>.<n>»: awg с файлом {etc}/warp/<имя>-<n>.conf (его пишет
+ * помощник) или plugin-device (MASQUE: TUN держит помощник). Устройство, метку, таблицу, здоровье и
+ * смену точки на живом устройстве членам awg даёт вид awg ядра. Ответ — helper: true: помощник вида
+ * ведёт группу.
+ *
+ * ПОМОЩНИК (cmd_warp). Ядро поднимает его для развёрнутой группы; о ней он знает только из {conf}:
+ * ключи вида warp, как их записал человек, и members — устройства, метки и таблицы членов. Делает то,
+ * чего ядро не знает:
  *   1. регистрация WARP на каждого члена (wbreg.c), кэш — {etc}/warp/<группа>-<n>.reg;
  *   2. подбор точек входа (wbscan.c) — разными колониями, если их хватает;
- *   3. файл члена {etc}/warp/<группа>-<n>.conf и событие `awg` демону: «перенастрой член» —
- *      демон перечитывает файл тем же awg_revive, что и сторож (daemon/supd.c);
+ *   3. файл члена {etc}/warp/<группа>-<n>.conf и событие `revive` демону: «перенастрой член»;
  *   4. сторож: член без рукопожатия и без HTTPS через себя дважды подряд — замена точки; третья
- *      замена подряд — новые ключи (у апстрима ZM так лечится ключ, который Cloudflare перестал
- *      принимать); все точки рвёт DPI — следующая маска I1 для всей группы.
- * Интерфейсов (netifd) и правил фаервола модуль не заводит: устройства членов — выходы ядра, а
- * подбор идёт в своём пространстве сети (wbns.c).
- *
- * Состояние для человека — события up/down с причиной (status показывает их у группы) и журнал. */
+ *      замена подряд — новые ключи; все точки рвёт DPI — следующая маска I1 для всей группы.
+ * Интерфейсов (netifd) и правил фаервола помощник не заводит: устройства членов — выходы ядра, а
+ * подбор идёт в своём пространстве сети (wbns.c). Состояние для человека — файл состояния выхода
+ * (steer-api.md, 2.2: маска, причина, точки членов) и журнал. */
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -28,21 +33,18 @@
 #include "err.h"
 #include "evline.h"
 #include "jsonw.h"
-#include "kind.h"
 #include "platform.h"
-#include "registry.h"
-#include "spec.h"
+#include "plugkit.h"
 #include "awg.h"
 #include "wbconf.h"
 #include "wbns.h"
 #include "wbmq.h"
-#include "marks.h"
 #include <pthread.h>
 #include "wbping.h"
 #include "wbreg.h"
 #include "wbscan.h"
 
-#define LOG(...) fprintf(stderr, "steer-warpbox: " __VA_ARGS__)
+#define LOG(...) fprintf(stderr, "steer[warpbox]: " __VA_ARGS__)
 
 #define WB_CHECK_S 30           /* проход сторожа: отказ туннеля ядро узнаёт отсюда (событие member) */
 #define WB_FAILS 2              /* столько проходов подряд без признаков жизни — замена */
@@ -72,8 +74,10 @@ static int mkdir_p(const char *d, mode_t m) {
 }
 
 struct member {
-    const struct output *o;
-    char reg_path[512], conf_path[512];
+    char name[32], device[32], over[32];
+    uint32_t sock_mark;         /* метка сокетов туннеля члена (подложка или «мимо каналов») */
+    int sock_req;               /* при подложке метка обязательна */
+    char reg_path[600], conf_path[600];
     struct wb_reg reg;
     int have_reg;
     char ip[48];
@@ -95,8 +99,10 @@ struct member {
 };
 
 struct wb {
-    struct spec *sp;
-    const struct output *g;
+    const struct pk_out *po;    /* {conf} развёрнутой группы */
+    char (*cc)[3], (*xcc)[3];   /* countries, exclude_countries */
+    size_t cc_n, xcc_n;
+    int tol_ms, interval_s;     /* tolerance, interval (-1 / 0 — не заданы) */
     struct member *m;
     size_t n;
     struct member scan;         /* своя регистрация замера awg: точки мерятся не ключом живого туннеля */
@@ -135,20 +141,20 @@ static int member_reg(struct member *m, int fresh) {
     char why[256] = "";
     if (!fresh && wb_reg_load(m->reg_path, &m->reg) == 0) { m->have_reg = 1; return 0; }
     if (time(NULL) < m->reg_retry) return -1;
-    LOG("%s: регистрация устройства WARP\n", m->o->name);
+    LOG("%s: регистрация устройства WARP\n", m->name);
     struct wb_reg r;
     if (wb_register(&r, why, sizeof(why)) != 0) {
-        LOG("%s: регистрация не удалась — %s; повтор через %d с\n", m->o->name, why, WB_REG_RETRY_S);
+        LOG("%s: регистрация не удалась — %s; повтор через %d с\n", m->name, why, WB_REG_RETRY_S);
         m->reg_retry = time(NULL) + WB_REG_RETRY_S;
         return -1;
     }
     if (wb_reg_save(m->reg_path, &r) != 0)
-        LOG("%s: регистрацию не сохранить в %s: %s — после перезапуска будет новая\n", m->o->name, m->reg_path, strerror(errno));
+        LOG("%s: регистрацию не сохранить в %s: %s — после перезапуска будет новая\n", m->name, m->reg_path, strerror(errno));
     wb_reg_wipe(&m->reg);
     m->reg = r;
     wb_reg_wipe(&r);
     m->have_reg = 1;
-    LOG("%s: зарегистрировано (%s)\n", m->o->name, m->reg.api);
+    LOG("%s: зарегистрировано (%s)\n", m->name, m->reg.api);
     return 0;
 }
 
@@ -158,13 +164,13 @@ static int member_reg(struct member *m, int fresh) {
 static void member_say(struct member *m, int v) {
     if (m->said == v) return;
     m->said = v;
-    evline_emit("member", "out", EVLINE_STR, m->o->name, "ok", EVLINE_INT, (long)v, (const char *)NULL);
+    evline_emit("member", "out", EVLINE_STR, m->name, "ok", EVLINE_INT, (long)v, (const char *)NULL);
 }
 
 /* Колония и страна точки члена — в каталоге состояния: после перезапуска модуля точка берётся из
  * файла туннеля, а колонию из него не узнать, и разнесение туннелей по колониям потеряло бы её. */
 static void pt_path(const struct wb *w, const struct member *m, char *p, size_t n) {
-    snprintf(p, n, "%s/%s.pt", w->st, m->o->name);
+    snprintf(p, n, "%s/%s.pt", w->st, m->name);
 }
 
 static void pt_save(const struct wb *w, const struct member *m) {
@@ -194,37 +200,36 @@ static int member_set(struct wb *w, struct member *m, const struct wb_pt *p, int
     snprintf(ep, sizeof(ep), "%s:%u", p->ip, p->port);
     struct wb_conf c = { .reg = &m->reg, .endpoint = ep, .i1 = w->i1, .obfs = w->obfs, .addr = 1, .keepalive = 25 };
     if (wb_conf_write(m->conf_path, &c) != 0) {
-        LOG("%s: файл %s не записан: %s\n", m->o->name, m->conf_path, strerror(errno));
+        LOG("%s: файл %s не записан: %s\n", m->name, m->conf_path, strerror(errno));
         return -1;
     }
     snprintf(m->ip, sizeof(m->ip), "%s", p->ip);
     m->port = p->port;
     snprintf(m->colo, sizeof(m->colo), "%s", p->colo);
     snprintf(m->seen, sizeof(m->seen), "%s", p->seen);
-    LOG("%s: точка %s (колония %s%s%s)\n", m->o->name, ep, p->colo, p->seen[0] ? ", сайты видят " : "", p->seen);
+    LOG("%s: точка %s (колония %s%s%s)\n", m->name, ep, p->colo, p->seen[0] ? ", сайты видят " : "", p->seen);
     pt_save(w, m);
     m->pt_saved = 1;
     member_say(m, -1);
-    evline_emit("awg", "out", EVLINE_STR, m->o->name, "fresh", EVLINE_INT, (long)(fresh != 0), (const char *)NULL);
+    evline_emit("revive", "out", EVLINE_STR, m->name, "fresh", EVLINE_INT, (long)(fresh != 0), (const char *)NULL);
     return 0;
 }
 
 static void scan_setup(struct wb *w, struct wb_scan *s, const struct wb_reg *reg) {
-    const struct group_cfg *gc = &w->g->grp;
     memset(s, 0, sizeof(*s));
-    s->sp = w->sp;
+    s->fwmark = w->m[0].sock_mark;
     s->ns = w->ns;
-    s->over = w->m[0].o->over[0] ? w->m[0].o->over : NULL;
+    s->over = w->m[0].over[0] ? w->m[0].over : NULL;
     s->reg = reg;
     s->i1 = w->i1[0] ? w->i1 : NULL;
     s->obfs = w->obfs;
     s->dir = w->st;
-    s->cc = (const char (*)[3])gc->warp.cc;
-    s->cc_n = gc->warp.cc_n;
+    s->cc = (const char (*)[3])w->cc;
+    s->cc_n = w->cc_n;
     /* Без countries и exclude_countries — любые страны (решение владельца 2026-10-13: «сами
      * разберутся»); прежде здесь молча исключалась Россия. */
-    s->xcc = (const char (*)[3])gc->warp.xcc;
-    s->xcc_n = gc->warp.xcc_n;
+    s->xcc = (const char (*)[3])w->xcc;
+    s->xcc_n = w->xcc_n;
 }
 
 /* Подобрать точки членам с нужда[i]. Остальные — занятые колонии и адреса. */
@@ -304,13 +309,13 @@ static int member_alive(struct member *m) {
     uint64_t rx, tx;
     /* Устройство есть? У awg — спросом WireGuard (оно же «наше по виду»), у MASQUE — TUN модуля,
      * который держит сам поток туннеля (mq_alive зовёт сюда, только когда туннель поднят). */
-    if (m->awg && awg_scan_stat(m->o->device, -1, &hs, &rx, &tx) != 0) return -1;
+    if (m->awg && awg_scan_stat(m->device, -1, &hs, &rx, &tx) != 0) return -1;
     struct wb_ping pg;
-    int echo = wb_ping_dev(m->o->device, "1.1.1.1", 3, 200, 1500, &pg) == 0 && pg.got > 0;
+    int echo = wb_ping_dev(m->device, "1.1.1.1", 3, 200, 1500, &pg) == 0 && pg.got > 0;
     if (echo && m->colo[0] && m->seen[0]) return 1;
     struct wb_pt p;
     memset(&p, 0, sizeof(p));
-    if (wb_trace_dev(m->o->device, &p) == 0) {
+    if (wb_trace_dev(m->device, &p) == 0) {
         if (p.colo[0]) snprintf(m->colo, sizeof(m->colo), "%s", p.colo);
         if (p.seen[0]) snprintf(m->seen, sizeof(m->seen), "%s", p.seen);
         return 1;
@@ -338,13 +343,13 @@ static int member_masque(struct member *m) {
     char why[256] = "";
     if ((!m->reg.id[0] || !m->reg.token[0]) && member_reg(m, 1) != 0) return -1;
     if (wb_enroll_masque(&m->reg, why, sizeof(why)) != 0) {
-        LOG("%s: MASQUE не включился — %s\n", m->o->name, why);
+        LOG("%s: MASQUE не включился — %s\n", m->name, why);
         m->reg_retry = time(NULL) + WB_REG_RETRY_S;
         return -1;
     }
     if (wb_reg_save(m->reg_path, &m->reg) != 0)
-        LOG("%s: регистрацию не сохранить в %s: %s\n", m->o->name, m->reg_path, strerror(errno));
-    LOG("%s: MASQUE включён (точка %s%s%s)\n", m->o->name, m->reg.mq_ep4, m->reg.mq_ep6[0] ? ", " : "", m->reg.mq_ep6);
+        LOG("%s: регистрацию не сохранить в %s: %s\n", m->name, m->reg_path, strerror(errno));
+    LOG("%s: MASQUE включён (точка %s%s%s)\n", m->name, m->reg.mq_ep4, m->reg.mq_ep6[0] ? ", " : "", m->reg.mq_ep6);
     return 0;
 }
 
@@ -354,18 +359,19 @@ static int member_masque(struct member *m) {
 static int member_wireguard(struct member *m) {
     char why[256] = "";
     if (wb_enroll_wireguard(&m->reg, why, sizeof(why)) != 0) {
-        LOG("%s: ключ WireGuard не вернулся — %s\n", m->o->name, why);
+        LOG("%s: ключ WireGuard не вернулся — %s\n", m->name, why);
         return -1;
     }
     if (wb_reg_save(m->reg_path, &m->reg) != 0)
-        LOG("%s: регистрацию не сохранить в %s: %s\n", m->o->name, m->reg_path, strerror(errno));
-    LOG("%s: устройству WARP возвращён ключ WireGuard\n", m->o->name);
+        LOG("%s: регистрацию не сохранить в %s: %s\n", m->name, m->reg_path, strerror(errno));
+    LOG("%s: устройству WARP возвращён ключ WireGuard\n", m->name);
     return 0;
 }
 
 static int mq_cfg(const struct wb *w, const struct member *m, struct wb_mq_cfg *c) {
+    (void)w;
     memset(c, 0, sizeof(*c));
-    snprintf(c->dev, sizeof(c->dev), "%s", m->o->device);
+    snprintf(c->dev, sizeof(c->dev), "%s", m->device);
     unsigned char b[128];
     if (wb_b64_decode(m->reg.mq_priv, b, sizeof(b)) != 32) return -1;
     memcpy(c->priv, b, 32);
@@ -374,7 +380,7 @@ static int mq_cfg(const struct wb *w, const struct member *m, struct wb_mq_cfg *
     memset(b, 0, sizeof(b));
     snprintf(c->v4, sizeof(c->v4), "%s", m->reg.v4);
     snprintf(c->v6, sizeof(c->v6), "%s", m->reg.v6);
-    c->mark = out_underlay_mark(w->sp, m->o);
+    c->mark = m->sock_mark;
     return 0;
 }
 
@@ -468,12 +474,12 @@ static int mq_assign(struct wb *w, const int *need) {
         if (best < 0) continue;
         t[best].used = 1;
         struct wb_mq_cfg c;
-        if (mq_cfg(w, m, &c) != 0) { LOG("%s: ключи MASQUE не разобраны\n", m->o->name); continue; }
+        if (mq_cfg(w, m, &c) != 0) { LOG("%s: ключи MASQUE не разобраны\n", m->name); continue; }
         snprintf(c.ep, sizeof(c.ep), "%s", t[best].c.ep);
         c.port = t[best].c.port;
         char why[200] = "";
         if (!m->mq) {
-            if (wb_mq_start(&c, &m->mq, why, sizeof(why)) != 0) { LOG("%s: туннель не поднят — %s\n", m->o->name, why); continue; }
+            if (wb_mq_start(&c, &m->mq, why, sizeof(why)) != 0) { LOG("%s: туннель не поднят — %s\n", m->name, why); continue; }
         } else
             wb_mq_retarget(m->mq, c.ep, c.port);
         memset(c.priv, 0, sizeof(c.priv));
@@ -483,7 +489,7 @@ static int mq_assign(struct wb *w, const int *need) {
         m->pt_saved = 0;
         m->mq_set_ms = (long)time(NULL);
         member_say(m, -1);
-        LOG("%s: точка MASQUE %s:%u\n", m->o->name, m->ip, m->port);
+        LOG("%s: точка MASQUE %s:%u\n", m->name, m->ip, m->port);
     }
     mq_tries_free(t);
     return rc;
@@ -496,7 +502,7 @@ static int mq_alive(struct member *m) {
     char why[160] = "";
     if (!wb_mq_up(m->mq, why, sizeof(why))) {
         if ((long)time(NULL) - m->mq_set_ms < WB_MQ_GRACE_S) return -1;
-        if (why[0] && m->ok) LOG("%s: туннель MASQUE не работает — %s\n", m->o->name, why);
+        if (why[0] && m->ok) LOG("%s: туннель MASQUE не работает — %s\n", m->name, why);
         return 0;
     }
     return member_alive(m) == 1;
@@ -518,12 +524,15 @@ static int mq_alive(struct member *m) {
  * потерям и быстрее больше чем на tolerance. Член, который сейчас не работает, сюда не попадает: его
  * точку меняет сторож. */
 
+/* Умолчание допуска — как у группы ядра (50 мс, числа sing-box). */
+#define WB_TOL_DEFAULT_MS 50
+
 static int opt_tol(const struct wb *w) {
-    return w->g->grp.lat_tolerance_ms >= 0 ? w->g->grp.lat_tolerance_ms : GROUP_TOL_DEFAULT_MS;
+    return w->tol_ms >= 0 ? w->tol_ms : WB_TOL_DEFAULT_MS;
 }
 
 static int opt_interval(const struct wb *w) {
-    return w->g->grp.lat_interval_s > 0 ? w->g->grp.lat_interval_s : WB_OPT_S;
+    return w->interval_s > 0 ? w->interval_s : WB_OPT_S;
 }
 
 /* Лучше ли точка b текущей a (потери в процентах, задержка в мс) с допуском tol. */
@@ -562,7 +571,7 @@ static void opt_awg(struct wb *w, size_t i) {
     int tol = opt_tol(w);
     if (b && sc.also_ok && opt_better(sc.also.loss, sc.also.rtt, b->loss, b->rtt, tol)) {
         LOG("%s: точка быстрее — %s:%u (%d мс, потери %d%%, колония %s) вместо %s:%u (%d мс, потери %d%%)\n",
-            m->o->name, b->ip, b->port, b->rtt, b->loss, b->colo, m->ip, m->port, sc.also.rtt, sc.also.loss);
+            m->name, b->ip, b->port, b->rtt, b->loss, b->colo, m->ip, m->port, sc.also.rtt, sc.also.loss);
         member_set(w, m, b, 1);
     }
     wb_scan_free(&sc);
@@ -585,7 +594,7 @@ static void opt_masque(struct wb *w, size_t i) {
     }
     int tol = opt_tol(w);
     if (cur >= 0 && best >= 0 && opt_better(0, t[cur].rtt, 0, t[best].rtt, tol)) {
-        LOG("%s: точка MASQUE быстрее — %s:%u (%d мс) вместо %s:%u (%d мс)\n", m->o->name, t[best].c.ep,
+        LOG("%s: точка MASQUE быстрее — %s:%u (%d мс) вместо %s:%u (%d мс)\n", m->name, t[best].c.ep,
             t[best].c.port, t[best].rtt, m->ip, m->port, t[cur].rtt);
         wb_mq_retarget(m->mq, t[best].c.ep, t[best].c.port);
         snprintf(m->ip, sizeof(m->ip), "%.47s", t[best].c.ep);
@@ -610,74 +619,110 @@ static void opt_pass(struct wb *w) {
     }
 }
 
-/* Состояние группы для `steer status` (поле warp у группы, daemon/status.c): строками в каталоге
- * состояния, запись заменой. Ядро читает его как данные — разбирает по полям и печатает своим JSON,
- * сырого текста модуля в ответ не вставляет.
- *     mask <имя>          маска I1 (или «-» без AmneziaWG)
- *     why <текст>         почему группа сейчас не работает (или «-»)
- *     member <выход> <адрес> <порт> <колония> <страна сайтов> <жив 0|1>   «-» — неизвестно */
+/* Состояние группы — файл состояния выхода (steer-api.md, 2.2): status ядра вкладывает его в
+ * outputs.<группа>.plugin.state. Поля: mask — маска I1 (нет — обычный WireGuard), why — почему группа
+ * не работает (нет — работает), members — по туннелю: out, ip, port, colo (колония Cloudflare), seen
+ * (страна, которую видят сайты), ok (последний проход сторожа). Неизвестное — без поля. Файл и событие
+ * state — только когда что-то изменилось. */
+static char *g_state_last;
+
 static void state_write(const struct wb *w, const char *why) {
-    char p[600], t[620];
-    snprintf(p, sizeof(p), "%s/state", w->st);
-    snprintf(t, sizeof(t), "%s.tmp", p);
-    FILE *f = fopen(t, "w");
+    char *buf = NULL;
+    size_t bn = 0;
+    FILE *f = open_memstream(&buf, &bn);
     if (!f) return;
-    fprintf(f, "mask %s\nwhy %s\n", w->obfs ? wb_mask_name(w->mask) : "-", why && why[0] ? why : "-");
+    fprintf(f, "{\"pid\":%ld", (long)getpid());
+    if (w->obfs) fprintf(f, ",\"mask\":\"%s\"", wb_mask_name(w->mask));
+    if (why && why[0]) { fputs(",\"why\":", f); jsonw_str(f, why); }
+    fputs(",\"members\":[", f);
     for (size_t i = 0; i < w->n; i++) {
         const struct member *m = &w->m[i];
-        fprintf(f, "member %s %s %u %s %s %d\n", m->o->name, m->ip[0] ? m->ip : "-", m->ip[0] ? m->port : 0,
-                m->colo[0] ? m->colo : "-", m->seen[0] ? m->seen : "-", m->ok);
+        fprintf(f, "%s{\"out\":", i ? "," : "");
+        jsonw_str(f, m->name);
+        if (m->ip[0]) { fputs(",\"ip\":", f); jsonw_str(f, m->ip); fprintf(f, ",\"port\":%u", m->port); }
+        if (m->colo[0]) { fputs(",\"colo\":", f); jsonw_str(f, m->colo); }
+        if (m->seen[0]) { fputs(",\"seen\":", f); jsonw_str(f, m->seen); }
+        fprintf(f, ",\"ok\":%s}", m->ok ? "true" : "false");
     }
-    if (fclose(f) == 0) rename(t, p);
-    else unlink(t);
+    fputs("]}", f);
+    fclose(f);
+    if (!buf) return;
+    if (!g_state_last || strcmp(g_state_last, buf) != 0) {
+        pk_status_write(w->po, buf);
+        free(g_state_last);
+        g_state_last = buf;
+    } else free(buf);
 }
 
-static int load(struct wb *w, const char *spec_path, const char *group) {
-    struct err e = { 0 };
-    w->sp = calloc(1, sizeof(*w->sp));
-    if (!w->sp) return 2;
-    if (load_spec(spec_path, w->sp, &e) < 0) err_die(&e);
-    if (registry_assign(w->sp, &e) < 0) err_die(&e);
-    w->g = out_by_name(w->sp, group);
-    if (!w->g || !out_group(w->g) || !w->g->grp.warp.on) {
-        LOG("группы kind: warp с именем %s нет в спеке\n", group);
+/* Страны ключа (countries, exclude_countries) — заглавными: схема пропустила две латинские буквы. */
+static int cc_load(const struct pk_out *po, const char *key, char (**out)[3], size_t *n) {
+    const char **v;
+    if (pk_key_strs(po, key, &v, n) != 0) return -1;
+    *out = *n ? calloc(*n, 3) : NULL;
+    if (*n && !*out) { free(v); return -1; }
+    for (size_t i = 0; i < *n; i++) {
+        (*out)[i][0] = (char)toupper((unsigned char)v[i][0]);
+        (*out)[i][1] = (char)toupper((unsigned char)v[i][1]);
+    }
+    free(v);
+    return 0;
+}
+
+static int load(struct wb *w, const struct pk_out *po) {
+    if (strcmp(po->kind, "warp") != 0) {
+        LOG("выход %s не kind: warp (kind %s)\n", po->tun.name, po->kind);
         return 2;
     }
-    w->m = calloc(w->g->grp.members_n ? w->g->grp.members_n : 1, sizeof(*w->m));
+    w->po = po;
+    const char *group = po->tun.name;
+    const char *tr = pk_key_str(po, "transport");
+    w->mq = tr && !strcmp(tr, "masque");
+    w->tol_ms = (int)pk_key_long(po, "tolerance", -1);
+    w->interval_s = (int)pk_key_long(po, "interval", 0);
+    if (cc_load(po, "countries", &w->cc, &w->cc_n) != 0 || cc_load(po, "exclude_countries", &w->xcc, &w->xcc_n) != 0)
+        return 2;
+    const struct pkj *mem = pkj_get(po->output, "members");
+    w->m = calloc(pkj_len(mem) ? pkj_len(mem) : 1, sizeof(*w->m));
     if (!w->m) return 2;
-    snprintf(w->etc, sizeof(w->etc), "%s/warp", plat()->etc_dir);
-    snprintf(w->st, sizeof(w->st), "%s/warp-%s", steer_state_dir(), group);
+    snprintf(w->etc, sizeof(w->etc), "%s/warp", po->etc ? po->etc : plat()->etc_dir);
+    snprintf(w->st, sizeof(w->st), "%s/warp-%s", po->plugin_state ? po->plugin_state : steer_state_dir(), group);
     if (mkdir_p(w->etc, 0700) || mkdir_p(w->st, 0700)) {
         LOG("каталоги %s и %s не создать: %s\n", w->etc, w->st, strerror(errno));
         return 2;
     }
-    for (size_t k = 0; k < w->g->grp.members_n; k++) {
-        const struct output *o = spec_out(w->sp, w->g->grp.members[k]);
-        if (!o || !out_owned_by(o, NULL, group)) continue;
+    for (size_t k = 0; k < pkj_len(mem); k++) {
+        const struct pkj *mj = pkj_at(mem, k);
+        const char *nm = pkj_str(pkj_get(mj, "name"));
+        if (!nm) continue;
         struct member *m = &w->m[w->n++];
-        m->o = o;
+        snprintf(m->name, sizeof m->name, "%s", nm);
+        snprintf(m->device, sizeof m->device, "%s", pkj_str(pkj_get(mj, "device")) ? pkj_str(pkj_get(mj, "device")) : "");
+        snprintf(m->over, sizeof m->over, "%s", pkj_str(pkj_get(mj, "over")) ? pkj_str(pkj_get(mj, "over")) : "");
+        const char *sm = pkj_str(pkj_get(mj, "sock_mark"));
+        m->sock_mark = sm ? (uint32_t)strtoul(sm, NULL, 0) : 0;
+        int b = 0;
+        if (pkj_bool(pkj_get(mj, "sock_mark_required"), &b) == 0) m->sock_req = b;
         m->said = 2;
-        /* Файл регистрации — по имени группы и номеру члена, как файл туннеля awg ({etc}/warp/<группа>-<n>):
-         * у члена MASQUE файла туннеля нет, и выводить путь из него нельзя. */
-        m->awg = w->g->grp.warp.transport == WARP_AWG;
-        if (m->awg) snprintf(m->conf_path, sizeof(m->conf_path), "%s", o->awg.conf);
-        snprintf(m->reg_path, sizeof(m->reg_path), "%s/%s-%zu.reg", w->etc, group, w->n);
+        /* Файлы члена — по имени группы и номеру члена ({etc}/warp/<группа>-<n>): у члена MASQUE файла
+         * туннеля нет, и выводить путь из него нельзя. Тот же путь пишет разворот (cmd_warp_expand). */
+        m->awg = !w->mq;
+        if (m->awg) snprintf(m->conf_path, sizeof(m->conf_path), "%.500s/%.31s-%zu.conf", w->etc, group, w->n);
+        snprintf(m->reg_path, sizeof(m->reg_path), "%.500s/%.31s-%zu.reg", w->etc, group, w->n);
     }
-    w->scan.o = w->g;
+    snprintf(w->scan.name, sizeof w->scan.name, "%s", group);
     w->scan.said = 2;
-    snprintf(w->scan.reg_path, sizeof(w->scan.reg_path), "%s/%s-scan.reg", w->etc, group);
+    snprintf(w->scan.reg_path, sizeof(w->scan.reg_path), "%.500s/%.31s-scan.reg", w->etc, group);
     return w->n ? 0 : 2;
 }
 
-int cmd_warp(const char *spec_path, const char *group) {
+int cmd_warp(const struct pk_out *po) {
     evline_open();
     signal(SIGTERM, on_term);
     signal(SIGINT, on_term);
     struct wb w;
     memset(&w, 0, sizeof(w));
-    int rc = load(&w, spec_path, group);
+    int rc = load(&w, po);
     if (rc) return rc;
-    w.mq = w.g->grp.warp.transport == WARP_MASQUE;
     w.ns = w.mq ? -1 : wb_ns_new();
     if (!w.mq && w.ns < 0) {
         char why[160];
@@ -723,13 +768,13 @@ int cmd_warp(const char *spec_path, const char *group) {
             }
             int al = w.mq ? mq_alive(m) : member_alive(m);
             if (al < 0) {
-                if (!w.mq) evline_emit("awg", "out", EVLINE_STR, m->o->name, (const char *)NULL);
+                if (!w.mq) evline_emit("revive", "out", EVLINE_STR, m->name, (const char *)NULL);
                 continue;
             }
             if (al) {
                 member_say(m, 1);
                 if (m->colo[0] && m->seen[0] && !m->pt_saved) { pt_save(&w, m); m->pt_saved = 1; }
-                if (!m->ok) LOG("%s: работает (%s%s%s)\n", m->o->name, m->ip, m->colo[0] ? ", колония " : "", m->colo);
+                if (!m->ok) LOG("%s: работает (%s%s%s)\n", m->name, m->ip, m->colo[0] ? ", колония " : "", m->colo);
                 m->ok = 1;
                 m->fails = 0;
                 m->replaced = 0;
@@ -741,7 +786,7 @@ int cmd_warp(const char *spec_path, const char *group) {
             if (++m->fails < WB_FAILS) continue;
             m->fails = 0;
             if (++m->replaced >= WB_REKEY_AT && time(NULL) >= m->rekey_at) {
-                LOG("%s: %d замены подряд не помогли — новые ключи\n", m->o->name, m->replaced - 1);
+                LOG("%s: %d замены подряд не помогли — новые ключи\n", m->name, m->replaced - 1);
                 m->rekey_at = time(NULL) + WB_REKEY_MIN_S;
                 m->replaced = 0;
                 if (member_reg(m, 1) != 0) continue;
@@ -752,7 +797,7 @@ int cmd_warp(const char *spec_path, const char *group) {
                     if (member_masque(m) != 0) continue;
                 }
             } else
-                LOG("%s: точка %s не отвечает — подбираю другую\n", m->o->name, m->ip);
+                LOG("%s: точка %s не отвечает — подбираю другую\n", m->name, m->ip);
             snprintf(m->bad_ip, sizeof(m->bad_ip), "%s", m->ip);
             m->bad_port = m->port;
             m->bad_until = time(NULL) + WB_BAD_S;
@@ -803,12 +848,12 @@ int cmd_warp_reg(const char *path) {
     return sv ? 1 : 0;
 }
 
-int cmd_warp_scan(const char *spec_path, const char *group) {
+int cmd_warp_scan(const struct pk_out *po) {
     struct wb w;
     memset(&w, 0, sizeof(w));
-    int rc = load(&w, spec_path, group);
+    int rc = load(&w, po);
     if (rc) return rc;
-    if (w.g->grp.warp.transport == WARP_MASQUE) {
+    if (w.mq) {
         /* MASQUE: пробы всех пар адрес:порт, без туннелей. */
         if (member_reg(&w.m[0], 0) != 0 || member_masque(&w.m[0]) != 0) {
             printf("{\"ok\":false,\"error\":\"регистрации MASQUE нет\"}\n");
@@ -868,3 +913,4 @@ int cmd_warp_scan(const char *spec_path, const char *group) {
     wb_reg_wipe(&w.m[0].reg);
     return rc ? 1 : 0;
 }
+

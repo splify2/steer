@@ -22,7 +22,6 @@
 #include "spec.h"
 #include "awg.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "ctl.h"

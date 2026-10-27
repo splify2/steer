@@ -22,7 +22,6 @@
 #include "awg.h"
 #include "plugin.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "ctl.h"

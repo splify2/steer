@@ -1,0 +1,96 @@
+{
+  "type": "object",
+  "properties": {
+    "transport": {
+      "enum": [
+        "awg",
+        "masque"
+      ],
+      "default": "awg",
+      "description": "Транспорт туннелей: awg или MASQUE."
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 255,
+      "description": "Сколько туннелей держать: запасные для мгновенного переключения.",
+      "x-example": 2
+    },
+    "pick": {
+      "enum": [
+        "latency",
+        "order"
+      ],
+      "description": "Как выбирается туннель: latency — самый быстрый, order — по порядку.",
+      "x-when": {
+        "latency": [
+          "tolerance",
+          "interval",
+          "url",
+          "idle_timeout"
+        ]
+      }
+    },
+    "tolerance": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 60000,
+      "description": "Допуск смены туннеля, мс."
+    },
+    "interval": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 86400,
+      "description": "Интервал замера, секунды (умолчание 600)."
+    },
+    "url": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^https?://",
+      "description": "Адрес проверки http:// или https://.",
+      "x-example": "http://cp.cloudflare.com/generate_204"
+    },
+    "idle_timeout": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 86400,
+      "description": "Сколько секунд без трафика замер не делается; 0 — мерить всегда."
+    },
+    "countries": {
+      "type": [
+        "string",
+        "array"
+      ],
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z]{2}$"
+      },
+      "pattern": "^[A-Za-z]{2}$",
+      "minItems": 1,
+      "uniqueItems": true,
+      "x-one-or-list": true,
+      "description": "Страны (ISO 3166-1) точек входа.",
+      "x-example": [
+        "NL"
+      ]
+    },
+    "exclude_countries": {
+      "type": [
+        "string",
+        "array"
+      ],
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z]{2}$"
+      },
+      "pattern": "^[A-Za-z]{2}$",
+      "uniqueItems": true,
+      "x-one-or-list": true,
+      "description": "Страны (ISO 3166-1), точки которых не брать.",
+      "x-example": [
+        "RU"
+      ]
+    }
+  },
+  "additionalProperties": false
+}
