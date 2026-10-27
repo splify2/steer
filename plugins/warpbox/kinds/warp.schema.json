@@ -6,8 +6,7 @@
         "awg",
         "masque"
       ],
-      "default": "awg",
-      "description": "Транспорт туннелей: awg или MASQUE."
+      "description": "Транспорт туннелей: awg (умолчание) или MASQUE."
     },
     "count": {
       "type": "integer",
