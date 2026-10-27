@@ -22,6 +22,12 @@ check() {
     fi
 }
 
+# Мост Telegram (kind: tgws) — вид плагина tgws (plugins/tgws): стенд идёт с каталогом плагинов дерева
+# (tests/plugroot.sh — манифесты и программа хуков build/pkhooks). Сам вид проверяет tests/tgwsmatch.sh;
+# здесь tgws — просто выход без устройства.
+sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" || { echo "gen: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
+
 printf '203.0.113.0/24\n198.51.100.5\n' > "$tmp/a.lst"
 
 printf '198.51.100.5\n' > "$tmp/b.lst"
@@ -680,7 +686,7 @@ check "и это правило безусловное — набор оно н�
 # обязан работать.
 #
 # Выходов в фикстуре ТРИ, и мост Telegram здесь не для полноты: у него вид выхода без
-# устройства, и забытым `case` он оказался бы первым.
+# устройства (вид плагина tgws), и забытым `case` он оказался бы первым.
 # kind=vless и kind=xsteer базовая сборка не принимает вовсе, поэтому их доля правила
 # проверяется по самой функции — см. out_skips_zapret в tests/specmatch.c.
 printf '203.0.113.0/24\n' > "$tmp/p.lst"
@@ -787,62 +793,7 @@ zout="$("$BIN" apply --dry-run --spec "$tmp/zap2.yaml" --state-dir "$tmp/state-z
 check "kind zapret в v2 отвергается" "2" "$?"
 check "с номером строки и колонки и заменой" "1" "$(printf '%s\n' "$zout" | grep -c '3:.*recheck.*kind: direct')"
 
-# ---- перехват Telegram (kind=tgws) --------------------------------------------------------
-# Правило стоит в nat prerouting, то есть ловит трафик КЛИЕНТОВ. Приоритет и хук проверяются
-# здесь, а работу целиком — tests/run-tgws.sh на двух сетевых пространствах: на одном
-# пространстве соединение идёт через output и правило не срабатывает вовсе.
-cat > "$tmp/tgws.json" <<EOF
-{ "schema": 1, "lan_devices": ["br-lan"],
-  "outputs": { "direct": { "kind": "direct" }, "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
-  "channels": [ { "name": "тг", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "tg" } ] }
-EOF
-tout="$("$BIN" apply --dry-run --spec "$tmp/tgws.json" --state-dir "$tmp/state-t" 2>&1)"
-check "tgws: спека компилируется" "0" "$?"
-check "цепочка перехвата появилась" "1" \
-    "$(printf '%s\n' "$tout" | grep -c 'chain tgws_redirect')"
-# dstnat + 1, а не dstnat: сначала наша же цепочка fakeip обязана вернуть настоящий адрес,
-# и только потом решается, наш ли он. И не mangle: метку канала ставят раньше, на mangle + 1.
-check "перехват идёт после трансляции адресов" "1" \
-    "$(printf '%s\n' "$tout" | grep -c 'hook prerouting priority dstnat + 1')"
-check "заворачивает по метке выхода на его порт" "1" \
-    "$(printf '%s\n' "$tout" | grep -c 'meta mark and 0x0ff00000 == 0x00100000 tcp dport { 443, 80, 5222 } counter redirect to :8480')"
-# Таблицы маршрутизации у такого выхода нет — маршрут не меняется, меняется адресат.
-check "маршрутной таблицы у выхода tgws нет" "0" \
-    "$(printf '%s\n' "$tout" | grep -c 'ip route')"
-check "без выходов tgws цепочки нет" "0" "$(printf '%s\n' "$out" | grep -c 'tgws_redirect')"
-# Порт печатает движок: второй расчёт того же в init-скрипте разошёлся бы молча.
-ti="$("$BIN" tgws-instances --spec "$tmp/tgws.json" --state-dir "$tmp/state-t" 2>&1)"
-check "tgws-instances: код 0, когда поднимать есть что" "0" "$?"
-check "имя и порт по строке на выход" "tg	8480" "$ti"
-"$BIN" tgws-instances --spec "$tmp/spec.json" --state-dir "$tmp/state-z" >/dev/null 2>&1
-check "без таких выходов код 1" "1" "$?"
-# Устройство у такого выхода — почти наверняка описка, и молча принять её значит обещать
-# маршрутизацию, которой не будет.
-cat > "$tmp/tgws-bad.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk", "device": "eth0" } }, "channels": [] }
-EOF
-"$BIN" apply --dry-run --spec "$tmp/tgws-bad.json" --state-dir "$tmp/state-tb" >/dev/null 2>&1
-check "устройство у tgws отвергается" "2" "$?"
-# on_fail у него не выражается ничем: правило перехвата стоит в ядре всегда.
-cat > "$tmp/tgws-of.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk", "on_fail": "direct" } }, "channels": [] }
-EOF
-"$BIN" apply --dry-run --spec "$tmp/tgws-of.json" --state-dir "$tmp/state-to" >/dev/null 2>&1
-check "on_fail=direct у tgws отвергается" "2" "$?"
-# Домена нет — выход отвергается: прямые точки Telegram отвечают только TLS 1.2 и стоят на
-# телеграмовских адресах, то есть на тех самых, которые режут. Подставить их молча значило бы
-# завести выход, который выглядит настроенным и не работает никогда.
-cat > "$tmp/tgws-nd.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws" } }, "channels": [] }
-EOF
-"$BIN" apply --dry-run --spec "$tmp/tgws-nd.json" --state-dir "$tmp/state-tn" >/dev/null 2>&1
-check "tgws без domain отвергается" "2" "$?"
-# И наоборот: domain у чужого вида выхода — поле, принятое молча там, где оно ничего не значит.
-cat > "$tmp/tgws-alien.json" <<EOF
-{ "schema": 1, "outputs": { "d": { "kind": "direct", "domain": "ex.co.uk" } }, "channels": [] }
-EOF
-"$BIN" apply --dry-run --spec "$tmp/tgws-alien.json" --state-dir "$tmp/state-ta" >/dev/null 2>&1
-check "domain у чужого вида выхода отвергается" "2" "$?"
+# ---- перехват Telegram (kind: tgws) — tests/tgwsmatch.sh ---------------------------------------
 
 # ---- `any` без списков: согласие требуется независимо от вида выхода -----------------------
 #

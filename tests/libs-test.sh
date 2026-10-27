@@ -1,6 +1,6 @@
 #!/bin/sh
 # Разделяемая раскладка роутера на хосте (build/build-libs.sh): собирается то же, что кладёт в пакеты
-# build.sh, — libsteer-wolfssl.so, libsteer.so, steerd, мост steer-tgws, net1 и программы плагинов, —
+# build.sh, — libsteer-wolfssl.so, libsteer.so, steerd, net1 и программы плагинов (с мостом tgws), —
 # только хостовым компилятором, и проверяется как устроенное целое:
 #
 #   • списки экспорта (build/libsteer.map, build/wolfssl/libsteer-wolfssl.map, build/net1/libs2p-net.map)
@@ -99,9 +99,8 @@ if command -v readelf >/dev/null 2>&1; then
     check "libsteer зависит от libsteer-wolfssl" "libsteer-wolfssl.so.$WVER" \
         "$(readelf -d "$SO" | sed -n 's/.*Shared library: \[\(libsteer[^]]*\)\]/\1/p')"
     ours() { readelf -d "$1" | sed -n 's/.*Shared library: \[\(lib\(steer\|s2p\)[^]]*\)\]/\1/p' | tr '\n' ' ' | sed 's/ $//'; }
-    for m in steer-tgws steerd; do
-        check "$m: из нашего только libsteer.so.$VER" "libsteer.so.$VER" "$(ours "$L/$m")"
-    done
+    check "steerd: из нашего только libsteer.so.$VER" "libsteer.so.$VER" "$(ours "$L/steerd")"
+    check "модуля steer-tgws в раскладке нет (мост — плагин tgws)" "no" "$([ -e "$L/steer-tgws" ] && echo yes || echo no)"
     check "SONAME net1 — по major ABI" "libs2p-net.so.1" \
         "$(readelf -d "$N1SO" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')"
     check "  net1 ни с чем нашим не связан" "" "$(ours "$N1SO")"
@@ -127,13 +126,11 @@ done
 P() { STEER_PLUGINS_ROOT="$L/plugins" STEER_PLUGINS_ETC="$L/plugetc" "$L/steerd" "$@"; }
 empty="$L/nomods"
 mkdir -p "$empty"
-for c in "vless-nodes v" "sub-fetch http://x --out /dev/null" "tls-probe x" "xsteer-key" "hysteria2-nodes x" "obfs-server"; do
+for c in "vless-nodes v" "sub-fetch http://x --out /dev/null" "tls-probe x" "xsteer-key" "hysteria2-nodes x" "obfs-server" "tgws-probe media"; do
     o="$(STEER_PLUGINS_ROOT="$empty" "$L/steerd" $c 2>&1)"; r=$?
     check "без плагина: steerd $c — код 2, «нет такой команды»" "2 1" \
         "$r $(printf '%s' "$o" | grep -c 'нет такой команды')"
 done
-o="$(STEER_MODULE_DIR="$empty" "$L/steerd" tgws-probe 2>&1)"
-check "мост tgws — ещё модуль: без него «нужен пакет steer-tgws»" "1" "$(printf '%s' "$o" | grep -c 'нужен пакет steer-tgws')"
 mkdir -p "$L/hy2spec/seed"
 printf 'hysteria2://p@h.example:443/?sni=h.example#n\n' > "$L/hy2spec/sub.txt"
 printf '{"plugins":{"hysteria2":{"versions":[{"version":"%s","provides":{"kinds":["tunnel:hysteria2"]}}]}}}\n' "$VER" > "$L/hy2spec/seed/index.json"
@@ -366,13 +363,18 @@ check "steerd vless-nodes /файл отвечает как сама прогр�
 
 # ---- hello ------------------------------------------------------------------------------------
 # Первое сообщение программы плагина — hello с её steer-api, версией сборки и id (steer-api.md, 2.1).
-for m in vless obfs hysteria2; do
+for m in vless obfs hysteria2 tgws; do
     h="$(STEER_EVENT_FD=3 "$L/plugins/$m/bin/$m" "$m" x --conf /nonexistent 3>&1 >/dev/null 2>&1 | head -1)"
     check "первое сообщение программы $m — hello с api, версией и id" \
         "{\"ev\":\"hello\",\"api\":\"1.1\",\"ver\":\"$VER\",\"mod\":\"$m\"}" "$h"
 done
 out="$("$L/plugins/obfs/bin/obfs" vless x 2>&1)"
 check "программа плагина чужой команды не берёт" "steer: obfs: подкоманды vless нет" "$out"
+# Мост Telegram (плагин tgws — статическая программа со своим TLS): стенд вида и программы — tests/tgwsmatch.sh.
+o="$(TGWS_PROG="$L/plugins/tgws/bin/tgws" BUILD="$BUILD" sh tests/tgwsmatch.sh 2>&1 | tail -1)"
+check "плагин tgws: стенд tests/tgwsmatch.sh с программой раскладки" "1" "$(printf '%s' "$o" | grep -c ' 0 fail$')"
+[ "$(printf '%s' "$o" | grep -c ' 0 fail$')" = 1 ] || printf '    %s\n' "$o"
+check "плагин tgws ни с чем нашим не связан (статически со своим TLS)" "" "$(ours "$L/plugins/tgws/bin/tgws")"
 
 # ---- ABI между библиотеками ---------------------------------------------------------------------
 # Подложная libsteer-wolfssl.so с чужим отпечатком: то же имя (SONAME) и те же символы (иначе
@@ -390,13 +392,13 @@ $CC -shared -fPIC -o "$bad/libsteer-wolfssl.so.$WVER" "$bad/abi.c" \
     -Wl,--whole-archive "$WLIB" -Wl,--no-whole-archive -Wl,-soname,"libsteer-wolfssl.so.$WVER" \
     -Wl,--version-script=build/wolfssl/libsteer-wolfssl.map -Wl,--gc-sections \
     -lpthread -lm > "$bad/build.log" 2>&1
-# Протоколы с libsteer больше не связаны — сверку показывает модуль steer-tgws (мост ещё модуль).
-o="$(LD_LIBRARY_PATH="$bad" "$L/steer-tgws" tgws x --spec /nonexistent 2>&1)"; r=$?
+# Протоколы и мост с libsteer не связаны — сверку показывает сам steerd.
+o="$(LD_LIBRARY_PATH="$bad" "$L/steerd" version 2>&1)"; r=$?
 check "libsteer-wolfssl другой сборки: процесс не стартует, код 3" "3" "$r"
 check "  и строка называет причину и лечение" "1" \
     "$(printf '%s' "$o" | grep -c 'другой сборки.*обновите пакеты libsteer и libsteer-wolfssl вместе')"
-# Настоящая библиотека — проходит (модуль отвечает своим отказом про спеку, а не про библиотеку).
-o="$("$L/steer-tgws" tgws x --spec /nonexistent 2>&1)"
+# Настоящая библиотека — проходит.
+o="$("$L/steerd" version 2>&1)"
 check "настоящая libsteer-wolfssl: сверка молчит" "0" "$(printf '%s' "$o" | grep -c 'другой сборки')"
 
 # ---- ABI net1 (src/net1/s2pnet.h, s2pcheck.c) ------------------------------------------------------
@@ -450,7 +452,7 @@ fi
 SDK="${PLUGIN_SDK:-../plugin-sdk}"
 [ -f "$SDK/tests/compat/steer-2.1/host.py" ] || SDK=/home/yo1nk/splicicd/plugin-sdk
 if [ -f "$SDK/tests/compat/steer-2.1/host.py" ] && command -v python3 >/dev/null 2>&1; then
-    for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do
+    for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC) $(profile_var PLUGINS_TLS); do
         o="$(sh "$SDK/tests/compat/run.sh" --steer "$L/plugins/$q" 2>&1)"; r=$?
         check "SDK steer-2.1: плагин $q совместим с ядром (tests/compat/run.sh --steer)" "0" "$r"
         [ "$r" = 0 ] || printf '%s\n' "$o" | grep -A1 '^FAIL' | sed 's/^/    /'
@@ -489,7 +491,7 @@ fi
 # собой, а модули ищутся рядом с движком): это пакет ядра без модулей, то есть та же база, что у
 # статического build/steerd, и снимок обязан совпасть до байта. Переменную STEER_MODULE_DIR для
 # этого не ставим — снимок записывает в заголовок все STEER_*, и она разошлась бы с эталоном.
-if [ -x "$BUILD/steer" ] && [ -x "$BUILD/steer-android" ] && [ -x "$BUILD/tgwssim" ]; then
+if [ -x "$BUILD/steer" ] && [ -x "$BUILD/steer-android" ]; then
     core="$L/core"
     mkdir -p "$core"
     cp "$L/steerd" "$L"/libsteer.so.* "$L"/libsteer-wolfssl.so.* "$core/"
@@ -498,7 +500,7 @@ if [ -x "$BUILD/steer" ] && [ -x "$BUILD/steer-android" ] && [ -x "$BUILD/tgwssi
     o="$(env -u STEER_WOLFSSL -u STEER_NGTCP2 LD_LIBRARY_PATH="$core" STEER="$core/steer" sh tests/snapshot.sh 2>&1 | tail -1)"
     check "снимок генератора динамическим steerd: совпал" "1" "$(printf '%s' "$o" | grep -c 'снимков совпали')"
 else
-    echo "libs-test: нет build/steer, steer-android или tgwssim — снимок динамическим steerd пропущен (make)"
+    echo "libs-test: нет build/steer или steer-android — снимок динамическим steerd пропущен (make)"
 fi
 
 # ---- hysteria2 против настоящего сервера (apernet/hysteria) ----------------------------------------

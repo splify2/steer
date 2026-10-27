@@ -1,4 +1,6 @@
-# args: apply --dry-run --spec TMP/pp.json --state-dir TMP/st-pp
+# args: apply --dry-run --spec TMP/pr.json --state-dir TMP/st-pr
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: channels.p: ports: диапазон пишется СТРОКОЙ ("443", а не 443)
+# env: STEER_PLUGINS_ETC=TMP/plugetc
+# env: STEER_PLUGINS_ROOT=TMP/plugins
+# stderr: steer: channels.p: неизвестный proto «sctp» (нужен tcp, udp или both)

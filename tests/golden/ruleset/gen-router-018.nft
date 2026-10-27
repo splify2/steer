@@ -1,6 +1,8 @@
 # args: apply --dry-run --spec TMP/dashspec.json --state-dir TMP/state-dash
 # exit: 0
 # env: STEER_NFT_INGRESS=0
+# env: STEER_PLUGINS_ETC=TMP/plugetc
+# env: STEER_PLUGINS_ROOT=TMP/plugins
 # stderr: steer[warn] apply: TMP/dash.lst: адресов нет вовсе, только имена (1) — канал «дефис» ничего не поймает: имена резолвер берёт у каналов с доменными списками, а у этого их нет. Подключите файл доменным списком (domains_files). Первая строка: «my-site.example»
 table inet steer {
     set vpn_ip {

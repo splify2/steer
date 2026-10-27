@@ -1,3 +1,5 @@
 # args: apply --dry-run --spec TMP/sb.json --state-dir TMP/state
 # exit: 2
-# stderr: steer: канал t: выход kind=tgws работает только для клиентов раздачи — у трафика самого телефона моста нет
+# env: STEER_PLUGINS_ETC=TMP/plugetc
+# env: STEER_PLUGINS_ROOT=TMP/plugins
+# stderr: steer: канал t: выход kind=tgws работает только для клиентов раздачи — у трафика самого устройства моста нет

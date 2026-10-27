@@ -1,0 +1,7 @@
+# args: apply --dry-run --spec TMP/one.yaml --state-dir TMP/st0
+# exit: 2
+# env: STEER_NFT_INGRESS=0
+# env: STEER_PLUGINS_ETC=TMP/plugetc
+# env: STEER_PLUGINS_ROOT=TMP/empty
+# env: STEER_PLUGIN_SEED=TMP/empty
+# stderr: steer: TMP/one.yaml:6:15: outputs.tg: неизвестный kind «tgws» (есть direct, block, interface, tunnel, awg, group)

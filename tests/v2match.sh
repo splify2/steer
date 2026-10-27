@@ -3,7 +3,7 @@
 #
 # 1. ПЕРЕВОД v1 → v2 ДАЁТ ТОТ ЖЕ RULESET. Спеки v1 берутся не из своего набора, а из всех
 #    вызовов `apply --dry-run`, которые делают стенды генератора (gen.sh, androidmatch.sh,
-#    tgwsmark.sh), — тем же приёмом, что у снимка (tests/snapshot.sh): вместо бинарника стендам
+#    tgwsmatch.sh), — тем же приёмом, что у снимка (tests/snapshot.sh): вместо бинарника стендам
 #    подставлена обёртка. На каждый такой вызов обёртка делает `spec convert` той же спеки и
 #    `apply --dry-run` по напечатанному v2 с теми же флагами и окружением, и ruleset (stdout) и
 #    код обязаны совпасть до байта. Спеку, которую v1 отвергает, convert обязан отвергнуть тоже.
@@ -14,8 +14,7 @@
 set -u
 STEER_BIN="${STEER:-./build/steer}"
 ANDROID_BIN="${ANDROID:-./build/steer-android}"
-TGWSSIM_BIN="${TGWSSIM:-./build/tgwssim}"
-for b in "$STEER_BIN" "$ANDROID_BIN" "$TGWSSIM_BIN"; do
+for b in "$STEER_BIN" "$ANDROID_BIN"; do
     [ -x "$b" ] || { echo "v2match: не собран $b (make)"; exit 2; }
 done
 
@@ -70,11 +69,10 @@ EOF
 }
 wrap "$STEER_BIN" router
 wrap "$ANDROID_BIN" android
-wrap "$TGWSSIM_BIN" tgws
 
 STEER="$tmp/wrap/router" sh tests/gen.sh >/dev/null 2>&1
 ANDROID="$tmp/wrap/android" sh tests/androidmatch.sh >/dev/null 2>&1
-STEER="$tmp/wrap/router" TGWSSIM="$tmp/wrap/tgws" sh tests/tgwsmark.sh >/dev/null 2>&1
+STEER="$tmp/wrap/router" sh tests/tgwsmatch.sh >/dev/null 2>&1
 
 same=0 refused=0 pinned=0 fail=0 total=0
 for d in "$res"/*/; do

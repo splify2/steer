@@ -13,11 +13,15 @@
  * Модули линкуются (Makefile: MODEL_SRC и COMPILE_SRC), не подключаются #include.
  * Собирается дважды: роутер и телефон (-DSTEER_DEFAULT_PLATFORM=android — платформа телефона,
  * цепочки на output; выхода tgws у телефона нет, поэтому случаи с ним — только на
- * роутере). Какие случаи гонять, решает выбранная платформа, а не ключ сборки. */
+ * роутере). Какие случаи гонять, решает выбранная платформа, а не ключ сборки.
+ *
+ * Мост Telegram (kind tgws) — вид плагина tgws: стенд кладёт себе каталог плагинов с манифестом, схемой
+ * ключей и шаблоном nft из plugins/tgws дерева (без программы — хуков спека v1 не зовёт). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "spec.h"
 #include "groups.h"
@@ -35,6 +39,41 @@ static void put(const char *name, const char *text) {
     if (!f) { perror(p); exit(2); }
     fputs(text, f);
     fclose(f);
+}
+
+/* Файл дерева src в каталог стенда dst (относительно g_tmp); «@VERSION@» — версией стенда. */
+static void copy_in(const char *src, const char *dst) {
+    FILE *in = fopen(src, "r");
+    if (!in) { perror(src); exit(2); }
+    char p[512];
+    snprintf(p, sizeof(p), "%s/%s", g_tmp, dst);
+    FILE *out = fopen(p, "w");
+    if (!out) { perror(p); exit(2); }
+    char line[1024];
+    while (fgets(line, sizeof(line), in)) {
+        char *v = strstr(line, "@VERSION@");
+        if (v) { fwrite(line, 1, (size_t)(v - line), out); fputs("2.1.0", out); fputs(v + 9, out); }
+        else fputs(line, out);
+    }
+    fclose(in);
+    fclose(out);
+}
+
+/* Каталог плагинов стенда: плагин tgws дерева (манифест, схема ключей, шаблон nft). */
+static void plugroot(void) {
+    char p[512];
+    const char *dirs[] = { "plugins", "plugins/tgws", "plugins/tgws/kinds", "plugins/tgws/nft", "plugetc" };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        snprintf(p, sizeof(p), "%s/%s", g_tmp, dirs[i]);
+        if (mkdir(p, 0755) != 0) { perror(p); exit(2); }
+    }
+    copy_in("plugins/tgws/plugin.json", "plugins/tgws/plugin.json");
+    copy_in("plugins/tgws/kinds/tgws.schema.json", "plugins/tgws/kinds/tgws.schema.json");
+    copy_in("plugins/tgws/nft/tgws.nft", "plugins/tgws/nft/tgws.nft");
+    snprintf(p, sizeof(p), "%s/plugins", g_tmp);
+    setenv("STEER_PLUGINS_ROOT", p, 1);
+    snprintf(p, sizeof(p), "%s/plugetc", g_tmp);
+    setenv("STEER_PLUGINS_ETC", p, 1);
 }
 
 /* Спека из текста: «TMP» заменяется каталогом стенда. Разбор, метки выходов, группы и
@@ -255,12 +294,14 @@ static void t_mixed_modern(void) {
     check("правило fakeip — dnat по карте", 1, ir_expr_find(r, NFT_X_DNAT) != NULL);
     check("и помечено IPv4", 4, r ? r->fam : 0);
 
-    struct nft_chain *tg = ir_chain_find(t, "tgws_redirect");
-    check_str("перехват Telegram — nat", "nat", ctype(tg));
+    struct nft_chain *tg = ir_chain_find(t, "plugin_prerouting-dnat");
+    check_str("перехват Telegram — слот плагина prerouting-dnat, nat", "nat", ctype(tg));
     check("после трансляции адресов: dstnat + 1 = -99", -99, cprio(tg));
-    r = ir_rule_find(tg, "steer:tgws:tg");
+    check("в слоте — переход в цепочку плагина", 1, ir_rule_has(ir_rule_find(tg, NULL), "jump plugin_tgws_prerouting-dnat"));
+    r = ir_rule_find(ir_chain_find(t, "plugin_tgws_prerouting-dnat"), "steer:plugin:tgws:tg");
     check("правило моста есть", 1, r != NULL);
-    check("nat-цепочек в inet четыре (tgws, dns, dnat, подмена IPv4 ядра у interface)", 4, nat_chains(t));
+    check("  по метке выхода на порт моста", 1, ir_rule_has(r, "tcp dport { 443, 80, 5222 } counter redirect to :10480"));
+    check("nat-цепочек в inet четыре (слот tgws, dns, dnat, подмена IPv4 ядра у interface)", 4, nat_chains(t));
     struct nft_chain *n4 = ir_chain_find(t, "postrouting_nat4");
     check("postrouting_nat4: masquerade на устройстве выхода interface", 1,
           n4 && ir_rule_find(n4, "steer-nat4:vpn") && ir_rule_has(ir_rule_find(n4, "steer-nat4:vpn"), "masquerade"));
@@ -633,6 +674,7 @@ int main(void) {
     snprintf(g_tmp, sizeof(g_tmp), "%s/irmatch.XXXXXX", td ? td : "/tmp");
     if (!mkdtemp(g_tmp)) { perror("mkdtemp"); return 2; }
     steer_set_state_dir(g_tmp);
+    plugroot();
     put("d.lst", "example.com\n");
     t_tree();
     t_router_basic();

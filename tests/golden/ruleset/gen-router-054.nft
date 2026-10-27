@@ -1,4 +1,6 @@
-# args: apply --dry-run --spec TMP/lanboth2.json --state-dir TMP/state-lan
+# args: apply --dry-run --spec TMP/s3.json --state-dir TMP/state
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: клиенты описаны дважды: и from_default, и несколько lan_devices. Уберите from_default — устройства опишут клиентов точнее
+# env: STEER_PLUGINS_ETC=TMP/plugetc
+# env: STEER_PLUGINS_ROOT=TMP/plugins
+# stderr: steer: channel blocked points at an output that does not exist

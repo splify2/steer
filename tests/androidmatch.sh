@@ -147,6 +147,9 @@ spec_bad() {   # spec_bad ИМЯ ТЕКСТ — спека из stdin отвер
     check "$1" "2" "$?"
     check "  причина: $2" "1" "$(grep -c "$2" "$tmp/sb.err")"
 }
+# Мост Telegram — вид плагина tgws: стенду — каталог плагинов дерева (tests/plugroot.sh).
+sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" || { echo "androidmatch: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins" STEER_PLUGINS_ETC="$tmp/plugetc" \
 spec_bad "канал телефона с выходом tgws — отказ" 'только для клиентов раздачи' <<EOF2
 { "schema": 2, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
   "channels": [ { "name": "t", "from": ["uid:10123"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "tg" } ] }

@@ -1,4 +1,6 @@
-# args: apply --dry-run --spec TMP/spec.json --state-dir TMP/st-o
+# args: apply --dry-run --spec TMP/pp.json --state-dir TMP/st-pp
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: канал discord: proto и ports появились в schema 2, а в спеке schema 1. Поднимите "schema": 2 — иначе ядро постарше поймёт спеку наполовину и канал заберёт больше, чем вы написали
+# env: STEER_PLUGINS_ETC=TMP/plugetc
+# env: STEER_PLUGINS_ROOT=TMP/plugins
+# stderr: steer: channels.p: ports: негодная запись «0» — нужно «443» или «50000-65535», числа от 1 до 65535, начало не больше конца

@@ -1,4 +1,6 @@
-# args: apply --dry-run --spec TMP/spec.json --state-dir TMP/st-n
+# args: apply --dry-run --spec TMP/pp.json --state-dir TMP/st-pp
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: channel только порты matches nothing (want prefixes_files, domains_files or any)
+# env: STEER_PLUGINS_ETC=TMP/plugetc
+# env: STEER_PLUGINS_ROOT=TMP/plugins
+# stderr: steer: channels.p: ports: негодная запись «9-1» — нужно «443» или «50000-65535», числа от 1 до 65535, начало не больше конца

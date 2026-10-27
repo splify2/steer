@@ -13,8 +13,8 @@
 #   пространство tgws-c (клиент)          пространство tgws-r (роутер)
 #   veth-c 10.99.0.2  ──────────────────  veth-r 10.99.0.1   (маршрут по умолчанию туда)
 #                                          dc0 149.154.167.51/32  ← «адрес дата-центра»
-#                                          правила steer: перехват → :8480
-#                                          мост steer tgws
+#                                          правила steer: перехват → :<порт выхода>
+#                                          мост — программа плагина tgws
 #                                          поддельная точка apiws на 127.0.0.1:8443
 #
 # Клиент соединяется с 149.154.167.51:443 (это ДЦ2 по встроенной таблице моста), пакет
@@ -30,6 +30,11 @@ cd "$(dirname "$0")/.."
 
 BIN="${STEER:-./build/libs-host/steerd}"
 [ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
+# Мост — плагин tgws: манифест и шаблон nft — каталог плагинов раскладки (libs-test кладёт туда манифесты
+# дерева рядом с программами), программа — его bin/tgws.
+PLUGROOT="${STEER_PLUGINS_ROOT:-$(dirname "$BIN")/plugins}"
+PROG="$PLUGROOT/tgws/bin/tgws"
+[ -x "$PROG" ] && [ -f "$PLUGROOT/tgws/plugin.json" ] || { echo "нет плагина tgws в $PLUGROOT (make libs-test)"; exit 2; }
 # steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
 LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 python3 -c "import cryptography" 2>/dev/null || { echo "нет python-cryptography — пропускаю"; exit 0; }
@@ -40,8 +45,8 @@ NSC=tgws-c
 DCIP=149.154.167.51          # ДЦ2 по встроенной таблице моста
 DCPORT=443
 WSPORT=8443                  # поддельная точка apiws
-PORT=8480                    # TGWS_PORT_BASE + 0 — первый выход в реестре
 tmp="$(mktemp -d /tmp/tgws-stand.XXXXXX)"
+STEER_PLUGINS_ROOT="$PLUGROOT"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 fail=0
 
 check() {  # ЧТО ОЖИДАЛОСЬ ПОЛУЧЕНО
@@ -96,9 +101,11 @@ EOF
 out="$(ip netns exec "$NSR" "$BIN" apply --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>&1)" || {
     echo "apply не прошёл:"; echo "$out"; exit 1; }
 rules="$(ip netns exec "$NSR" nft list table inet steer 2>/dev/null || true)"
-check "цепочка перехвата встала в ядро" "1" \
-      "$(printf '%s\n' "$rules" | grep -c 'chain tgws_redirect')"
-check "она висит после трансляции адресов" "1" \
+PORT="$(sed -n 's/.*"tgws\/tg":{"ports":\[\([0-9]*\)\].*/\1/p' "$tmp/plugetc/alloc.json" 2>/dev/null)"
+check "порт моста выдан ресурсом выхода" "1" "$(printf '%s' "$PORT" | grep -c '^[0-9][0-9]*$')"
+check "цепочка перехвата плагина встала в ядро" "1" \
+      "$(printf '%s\n' "$rules" | grep -c 'chain plugin_tgws_prerouting-dnat')"
+check "слот висит после трансляции адресов" "1" \
       "$(printf '%s\n' "$rules" | grep -c 'hook prerouting priority dstnat + 1')"
 check "заворачивает на порт выхода" "1" \
       "$(printf '%s\n' "$rules" | grep -c "redirect to :$PORT")"
@@ -110,9 +117,18 @@ sleep 1
 
 # STEER_TGWS_VERBOSE=1: строку «не наш дата-центр» мост пишет только в подробном журнале (по умолчанию в
 # журнале одни параметры запуска и переключения путей), а проверка ниже ищет именно её.
+# {conf} выхода — то, что кладёт ядро помощнику (steer-api.md, 1.4): ключ domain и порт выхода; настройки
+# плагина — пусто (свой каталог). Демона стенд не поднимает — программа запускается так же, как её запустил
+# бы супервизор.
+mkdir -p "$tmp/pconf" "$tmp/pstate"
+cat > "$tmp/tg.conf" <<CONF
+{"api":"1.1","plugin":{"id":"tgws","version":"stand"},"output":{"name":"tg","kind":"tgws","keys":{"domain":"stand.invalid"},
+ "device":"","mark":"0x00100000","mark_mask":"0x0ff00000","table":300,"ipv6":false,"on_fail":"drop","over":null,
+ "sock_mark":"0x00000000","sock_mark_required":false,"tcp_port":0,"ports":[$PORT],"queues":[]},
+ "paths":{"etc":"$tmp","state":"$tmp/state","plugin":"$PLUGROOT/tgws","conf":"$tmp/pconf","plugin_state":"$tmp/pstate"},"platform":"openwrt"}
+CONF
 ip netns exec "$NSR" env STEER_TGWS_VERBOSE=1 STEER_TGWS_PLAIN=1 STEER_TGWS_ENDPOINT="127.0.0.1:$WSPORT" \
-    STEER_TGWS_DCMAP=/dev/null \
-    "$BIN" tgws tg --spec "$tmp/spec.json" --state-dir "$tmp/state" > "$tmp/tgws.log" 2>&1 &
+    "$PROG" tgws tg --conf "$tmp/tg.conf" > "$tmp/tgws.log" 2>&1 &
 sleep 1
 check "мост поднялся и слушает" "1" \
       "$(grep -c "жду перехваченные соединения на :$PORT" "$tmp/tgws.log" || true)"

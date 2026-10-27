@@ -63,8 +63,6 @@ for k in direct interface tgws awg плагина; do
     check "help outputs: --kind знает вид $k" "1" \
         "$("$BIN" help outputs 2>/dev/null | grep -c "только выходы этого вида:.*\b$k\b")"
 done
-check "help tgws-probe: срок по умолчанию назван верно" "1" \
-    "$("$BIN" help tgws-probe 2>/dev/null | grep -c 'по умолчанию 5 секунд')"
 check "КОМАНДА -h — то же самое" "$a" "$c"
 check "справка по команде показывает синопсис" "1" \
     "$(printf '%s' "$a" | grep -c 'steer explain <адрес|имя>')"
@@ -108,7 +106,6 @@ code "чужой флаг команде — отказ" 2 -- "$BIN" status --dr
 code "флаг без значения — отказ" 2 -- "$BIN" apply --spec
 code "значение, съеденное флагом, — отказ" 2 -- "$BIN" apply --spec --dry-run
 code "лишний позиционный — отказ" 2 -- "$BIN" apply лишнее
-code "не-число там, где ждали число" 2 -- "$BIN" tgws-probe --node abc
 code "флаг вместо команды — отказ" 2 -- "$BIN" --spec /etc/steer/spec.json apply
 code "обязательный аргумент пропущен" 2 -- "$BIN" explain
 
@@ -235,21 +232,13 @@ code "status не принимает --out" 2 -- "$BIN" status --out /dev/null
 accepted "splify2: fit --budget --report ФАЙЛ" -- \
     "$BIN" fit --budget 100 --report "$tmp/rep.json" /dev/null
 
-# tgws-probe понимает одно слово — media. Любое другое молча проверяло ОБЫЧНУЮ точку, и
-# «steer tgws-probe medai» отвечал «ок» про другую (I-316). Опечатка — отказ разбора с
-# названием того, что есть, раньше, чем команда куда-либо пойдёт.
-# Мост tgws — пока модуль ядра (steer-tgws рядом со steerd): без него отказ называет пакет.
-ext_marker() { # ИМЯ -- команда...
-    name="$1"; shift 2
-    out="$("$@" 2>&1 >/dev/null)"
-    check "$name" "1" "$(printf '%s' "$out" | grep -c 'steer-tgws')"
-}
-ext_marker "tgws-probe media доходит до команды" -- "$BIN" tgws-probe media
-code "tgws-probe medai: отказ" 2 -- "$BIN" tgws-probe medai
-check "tgws-probe medai: отказ разбора, а не команды" "0" \
-    "$("$BIN" tgws-probe medai 2>&1 >/dev/null | grep -c 'steer-extended')"
-check "tgws-probe medai: названо, что есть" "1" \
-    "$("$BIN" tgws-probe medai 2>&1 >/dev/null | grep -c '«media»')"
+# Мост Telegram — плагин tgws (plugins/tgws): у ядра своей команды tgws-probe нет. Без плагина — неизвестная
+# команда; с плагином она в справке под его именем и доходит до его программы (разбор её слов и отказы —
+# tests/tgwsmatch.sh, программа плагина).
+code "без плагина tgws команды tgws-probe нет" 2 -- "$BIN" tgws-probe media
+check "  и ядро не называет пакет модуля" "0" "$("$BIN" tgws-probe media 2>&1 | grep -c 'steer-tgws\|steer-extended')"
+check "с плагином tgws-probe — команда плагина в справке" "1" \
+    "$($WITHP "$BIN" help 2>/dev/null | grep -c '^  tgws-probe .*\[tgws\]$')"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
