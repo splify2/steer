@@ -41,6 +41,7 @@
 #include "ir.h"
 #include "marks.h"
 #include "jsonw.h"
+#include "rtnl.h"
 
 extern const struct cli_cmd *cli_lookup(const char *name) __attribute__((weak));
 
@@ -223,6 +224,8 @@ static void plugin_free(struct plugin *p) {
         free(p->cmd[i].ctl_args);
     }
     free(p->cmd);
+    for (size_t i = 0; i < p->svc_n; i++) { free(p->svc[i].name); prog_free(&p->svc[i].run); }
+    free(p->svc);
     vec_free(p->nft, p->nft_n);
     for (size_t i = 0; i < p->nft_n; i++) pnft_free(p->nftp ? p->nftp[i] : NULL);
     free(p->nftp);
@@ -652,6 +655,35 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
             }
         }
     }
+    const struct ynode *svcs = ynode_get(st, "services");
+    for (size_t i = 0; svcs && svcs->kind == YN_SEQ && i < svcs->len; i++) {
+        const struct ynode *sn = ynode_at(svcs, i);
+        const char *nm = m_str(sn, "name");
+        if (!nm || !*nm) { snprintf(why, sizeof(why), "служба без имени"); ydoc_free(d); goto bad; }
+        for (size_t j = 0; j < p->svc_n; j++)
+            if (!strcmp(p->svc[j].name, nm)) {
+                snprintf(why, sizeof(why), "служба %s названа дважды", nm);
+                ydoc_free(d);
+                goto bad;
+            }
+        struct plugin_svc *ns = realloc(p->svc, (p->svc_n + 1) * sizeof(*ns));
+        if (!ns) { ydoc_free(d); return -1; }
+        p->svc = ns;
+        struct plugin_svc *sv = &p->svc[p->svc_n];
+        memset(sv, 0, sizeof(*sv));
+        p->svc_n++;
+        sv->name = strdup(nm);
+        sv->owner = p;
+        char w2[256] = "";
+        if (!sv->name || m_prog(p->dir, sn, nm, &sv->run, w2, sizeof(w2)) != 0) {
+            snprintf(why, sizeof(why), "служба %s: %s", nm, w2);
+            ydoc_free(d);
+            goto bad;
+        }
+        if (!sv->run.argc && vec_add(&sv->run.argv, &sv->run.argc, nm) != 0) { ydoc_free(d); return -1; }
+        /* Ресурсы службы (очередь, метка) выдаются при подготовке спеки — ей нужен проход шага. */
+        p->has_hooks = 1;
+    }
     const struct ynode *hooks = ynode_get(st, "hooks");
     {
         char w2[256] = "";
@@ -752,6 +784,19 @@ static void resolve_conflicts(void) {
                         break;
                     }
         }
+        for (size_t j = 0; j < i && p->enabled; j++) {
+            const struct plugin *q = &g_pl[j];
+            if (!q->enabled) continue;
+            for (size_t a = 0; a < p->svc_n && p->enabled; a++)
+                for (size_t b = 0; b < q->svc_n; b++)
+                    if (!strcmp(p->svc[a].name, q->svc[b].name)) {
+                        char w[300];
+                        snprintf(w, sizeof(w), "служба %s уже есть у плагина %s", p->svc[a].name, q->id);
+                        p->enabled = 0;
+                        p->why = strdup(w);
+                        break;
+                    }
+        }
         /* Имена подкоманд ядра плагину не даются (steer-api.md, 4.3). Команды модулей, которые
          * ещё в дереве steer (vless, warp…), плагин переопределяет — их вынос и есть цель. */
         for (size_t a = 0; a < p->cmd_n && p->enabled; a++)
@@ -839,6 +884,7 @@ int plugin_reload(const char *root) {
     for (size_t i = 0; i < g_pl_n; i++) {
         for (size_t j = 0; j < g_pl[i].kind_n; j++) g_pl[i].kind[j]->owner = &g_pl[i];
         for (size_t j = 0; j < g_pl[i].cmd_n; j++) g_pl[i].cmd[j].owner = &g_pl[i];
+        for (size_t j = 0; j < g_pl[i].svc_n; j++) g_pl[i].svc[j].owner = &g_pl[i];
     }
     resolve_conflicts();
     for (size_t i = 0; i < g_pl_n; i++) {
@@ -886,6 +932,24 @@ const struct plugin_kind *plugin_kind_find(const char *name) {
 
 const struct plugin_kind *plugin_kind_of_ops(const struct kind_ops *k) {
     return k ? k->plugin : NULL;
+}
+
+size_t plugin_svc_n(void) {
+    ensure();
+    size_t n = 0;
+    for (size_t i = 0; i < g_pl_n; i++)
+        if (g_pl[i].enabled) n += g_pl[i].svc_n;
+    return n;
+}
+
+const struct plugin_svc *plugin_svc_at(size_t k) {
+    ensure();
+    for (size_t i = 0; i < g_pl_n; i++) {
+        if (!g_pl[i].enabled) continue;
+        if (k < g_pl[i].svc_n) return &g_pl[i].svc[k];
+        k -= g_pl[i].svc_n;
+    }
+    return NULL;
 }
 
 const struct plugin_cmd *plugin_cmd_find(const char *name) {
@@ -1770,6 +1834,51 @@ int plugin_kind_helper(const struct plugin_kind *pk, const struct spec *sp, cons
     return 0;
 }
 
+int plugin_svc_helper(const struct plugin_svc *sv, const struct spec *sp, struct kind_helper *h) {
+    if (!sv || !sv->run.prog) return -1;
+    const struct plugin *pl = sv->owner;
+    char why[256];
+    if (kind_helper_cmd(h, sv->name) != 0) return -1;
+    if (kind_helper_prog(h, sv->run.prog) != 0) return -1;
+    h->plugin = pl->id;
+    /* Каталоги плагина (steer-api.md, 1.2): настройки и состояние создаются до запуска, пишутся программой. */
+    {
+        char d[2 * PATH_MAX], etc[PATH_MAX];
+        plugin_etc(etc, sizeof(etc));
+        snprintf(d, sizeof(d), "%s/conf", etc);
+        mkdir(d, 0755);
+        snprintf(d, sizeof(d), "%s/conf/%s", etc, pl->id);
+        mkdir(d, 0755);
+        snprintf(d, sizeof(d), "%s/plugin", steer_state_dir());
+        mkdir(d, 0755);
+        snprintf(d, sizeof(d), "%s/plugin/%s", steer_state_dir(), pl->id);
+        mkdir(d, 0700);
+    }
+    kind_sig_mix(&h->sig, pl->version, strlen(pl->version));
+    for (size_t i = 0; i < sv->run.argc; i++) {
+        char *a = subst(pl, sp, NULL, NULL, sv->run.argv[i], why, sizeof(why));
+        if (!a) {
+            fprintf(stderr, "steer[warn] плагин %s: служба %s: %s\n", pl->id, sv->name, why);
+            return -1;
+        }
+        /* Слова с выданными ресурсами ({queue0}, {mark}) входят в подпись: сменился номер — служба перезапускается. */
+        kind_sig_mix(&h->sig, a, strlen(a));
+        int rc = kind_helper_arg(h, a);
+        free(a);
+        if (rc != 0) return -1;
+    }
+    for (size_t i = 0; i < sv->run.envc; i++) {
+        kind_sig_mix(&h->sig, sv->run.env[i], strlen(sv->run.env[i]));
+        if (kind_helper_env(h, sv->run.env[i]) != 0) return -1;
+    }
+    if (pl->builtin) {
+        char be[96];
+        snprintf(be, sizeof(be), "STEER_PK_BUILTIN=%s", pl->id);
+        if (kind_helper_env(h, be) != 0) return -1;
+    }
+    return 0;
+}
+
 const struct plugin_kind *plugin_core_ext(const char *kind, const char *key) {
     ensure();
     for (size_t i = 0; i < g_pl_n; i++) {
@@ -1947,6 +2056,7 @@ static const struct { const char *name, *type, *hook, *prio; int off; } SLOTS[] 
     { "prerouting-dnat",  "nat",    "prerouting",  "dstnat", 1 },
     { "forward",          "filter", "forward",     "filter", -5 },
     { "input",            "filter", "input",       "filter", 0 },
+    { "output-raw",       "filter", "output",      "raw",    1 },
     { "output-pre",       "route",  "output",      "mangle", 0 },
     { "output-post",      "route",  "output",      "mangle", 2 },
     { "postrouting-pre",  "filter", "postrouting", "filter", -5 },
@@ -2274,9 +2384,20 @@ static struct nft_chain *pn_slot_chain(struct pn_emit *pe, const struct plugin *
     return own;
 }
 
+struct wan_ctx { struct nft_set *s; char **seen; size_t n; };
+
+static void wan_dev_add(const char *dev, void *arg) {
+    struct wan_ctx *c = arg;
+    for (size_t i = 0; i < c->n; i++)
+        if (!strcmp(c->seen[i], dev)) return;
+    if (vec_add(&c->seen, &c->n, dev) != 0) return;
+    char q[96];
+    snprintf(q, sizeof(q), "\"%s\"", dev);
+    ir_set_value(c->s, q);
+}
+
 /* Наборы ядра, которые читает плагин: @lan_dev — устройства раздачи спеки; @wan_dev — устройства
- * маршрутов по умолчанию (его ведёт ядро по netlink, open.md О-9: пока набор заведён пустым, и
- * правила по нему не совпадают — плагин не падает, но и не действует по WAN). */
+ * маршрутов по умолчанию таблицы main, v4 и v6 (open.md О-9; steer-api 1.2). */
 static void pn_kernel_sets(struct pn_emit *pe, const char *text) {
     for (const char *p = text; (p = strchr(p, '@')); p++) {
         if (!strncmp(p + 1, "lan_dev", 7) && !nm_ch((unsigned char)p[8]) && !pe->lan_set) {
@@ -2293,7 +2414,14 @@ static void pn_kernel_sets(struct pn_emit *pe, const char *text) {
         } else if (!strncmp(p + 1, "wan_dev", 7) && !nm_ch((unsigned char)p[8]) && !pe->wan_set) {
             pe->wan_set = 1;
             struct nft_set *s = ir_set_add(pe->t, "wan_dev", "ifname");
-            if (s) ir_gap(s);
+            if (s) {
+                ir_gap(s);
+                /* Устройства маршрутов по умолчанию main, как они лежат сейчас. Сменился WAN — событие сети будит демон
+                 * (hotplug 95-steer, сторож), reload печатает набор заново, и текст правил меняется. */
+                struct wan_ctx wc = { .s = s };
+                rtnl_default_devs(wan_dev_add, &wc);
+                vec_free(wc.seen, wc.n);
+            }
         }
     }
 }

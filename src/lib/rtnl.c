@@ -472,6 +472,33 @@ int rtnl_default6(void) {
     return found;
 }
 
+struct defdev_ctx { void (*cb)(const char *dev, void *ctx); void *ctx; };
+
+static void defdev_cb(const struct nlmsghdr *h, void *ctx) {
+    struct defdev_ctx *c = ctx;
+    if (h->nlmsg_type != RTM_NEWROUTE) return;
+    const struct rtmsg *rt = NLMSG_DATA(h);
+    size_t hl = NLMSG_ALIGN(sizeof(*rt));
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl || (rt->rtm_family != AF_INET && rt->rtm_family != AF_INET6)) return;
+    if ((rt->rtm_flags & RTM_F_CLONED) || rt->rtm_dst_len != 0 || rt->rtm_type != RTN_UNICAST) return;
+    const struct rtattr *tb[RTA_MAX + 1];
+    attrs_parse((const uint8_t *)rt + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, RTA_MAX);
+    uint32_t table = tb[RTA_TABLE] ? rta_u32(tb[RTA_TABLE]) : rt->rtm_table;
+    char name[IF_NAMESIZE];
+    if (table == RT_TABLE_MAIN && tb[RTA_OIF] && if_indextoname(rta_u32(tb[RTA_OIF]), name)) c->cb(name, c->ctx);
+}
+
+int rtnl_default_devs(void (*cb)(const char *dev, void *ctx), void *ctx) {
+    uint8_t buf[64];
+    struct nlbuf b;
+    struct rtmsg rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rtm_family = AF_UNSPEC;
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
+    struct defdev_ctx c = { cb, ctx };
+    return rtnl_talk(buf, msg_end(&b, nh), defdev_cb, &c) == 0 ? 0 : -1;
+}
+
 struct route_dev_ctx { char *dev; size_t n; };
 
 static void route_dev_cb(const struct nlmsghdr *h, void *ctx) {

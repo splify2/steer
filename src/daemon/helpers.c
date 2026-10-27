@@ -69,6 +69,10 @@ static unsigned long long helper_sig(const struct spec *sp, const struct output 
     return h;
 }
 
+size_t helpers_max(const struct spec *sp) {
+    return sp->out_n + plugin_svc_n() + 1;
+}
+
 size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *need_marks) {
     size_t k = 0;
     if (need_marks) *need_marks = 0;
@@ -119,6 +123,29 @@ size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *
             h->evfd = -1;
             kind_helper_free(&hp);
         }
+    }
+    /* Службы плагинов (steer.services[]): по одной на роутер, после помощников выходов. Служба не
+     * ведёт выход — name повторяет её имя, а service отделяет её от помощника выхода с тем же именем. */
+    for (size_t i = 0, sn = plugin_svc_n(); i < sn; i++) {
+        const struct plugin_svc *sv = plugin_svc_at(i);
+        struct kind_helper hp = { .sig = KIND_SIG_INIT };
+        if (!sv || plugin_svc_helper(sv, sp, &hp) != 0) { kind_helper_free(&hp); continue; }
+        if (k >= max) { kind_helper_free(&hp); continue; }
+        struct helper *h = &out[k];
+        memset(h, 0, sizeof(*h));
+        if (!hp.cmd || helper_launch_set(h, &hp) != 0) {
+            helper_launch_free(h);
+            kind_helper_free(&hp);
+            continue;
+        }
+        k++;
+        snprintf(h->name, sizeof(h->name), "%.31s", sv->name);
+        snprintf(h->plugin, sizeof(h->plugin), "%s", hp.plugin);
+        h->service = 1;
+        h->sig = hp.sig;
+        h->delay_ms = HELPERS_DELAY_MS;
+        h->evfd = -1;
+        kind_helper_free(&hp);
     }
     return k;
 }
@@ -249,7 +276,8 @@ static const char *hname(const struct helper *h, char *buf, size_t n) {
 }
 
 static int same_helper(const struct helper *a, const struct helper *b) {
-    return !strcmp(a->cmd ? a->cmd : "", b->cmd ? b->cmd : "") && !strcmp(a->name, b->name);
+    return a->service == b->service && !strcmp(a->cmd ? a->cmd : "", b->cmd ? b->cmd : "") &&
+           !strcmp(a->name, b->name);
 }
 
 /* Параметры запуска — из нового состава: у помощника-программы они в аргументах (очередь,
