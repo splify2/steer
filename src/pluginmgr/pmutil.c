@@ -22,7 +22,54 @@ int pm_errf(struct pm_err *e, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(e->msg, sizeof(e->msg), fmt, ap);
     va_end(ap);
+    e->code[0] = 0;
+    e->args[0] = 0;
     return -1;
+}
+
+void pm_err_arg(struct pm_err *e, const char *name, const char *val) {
+    err_args_add(e->args, sizeof(e->args), name, val);
+}
+
+int pm_errc(struct pm_err *e, const char *code, const char *const *kv, const char *fmt, ...) {
+    if (!e) return -1;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(e->msg, sizeof(e->msg), fmt, ap);
+    va_end(ap);
+    snprintf(e->code, sizeof(e->code), "%s", code);
+    e->args[0] = 0;
+    for (size_t i = 0; kv && kv[i] && kv[i + 1]; i += 2) pm_err_arg(e, kv[i], kv[i + 1]);
+    return -1;
+}
+
+int pm_errcopy(struct pm_err *dst, const struct pm_err *src) {
+    if (dst != src) *dst = *src;
+    return -1;
+}
+
+const char *pm_itoa(long long v) {
+    static char b[8][24];
+    static unsigned n;
+    char *r = b[n++ & 7];
+    snprintf(r, 24, "%lld", v);
+    return r;
+}
+
+const char *pm_oct(unsigned v) {
+    static char b[8][16];
+    static unsigned n;
+    char *r = b[n++ & 7];
+    snprintf(r, 16, "%03o", v);
+    return r;
+}
+
+void pm_err_json(const struct pm_err *e, char *buf, size_t cap) {
+    struct err t;
+    snprintf(t.msg, sizeof(t.msg), "%s", e->msg);
+    snprintf(t.code, sizeof(t.code), "%s", e->code);
+    snprintf(t.args, sizeof(t.args), "%s", e->args);
+    if (err_json(&t, buf, cap) < 0 && cap) buf[0] = 0;
 }
 
 void *pm_alloc(size_t n) {
@@ -269,10 +316,10 @@ void pm_time_str(time_t t, char *out, size_t n) {
 /* ---- JSON: чтение ---- */
 
 struct ydoc *pm_json_parse(const char *buf, size_t n, const char *name, struct pm_err *e) {
-    struct err ye = {{0}};
+    struct err ye = {0};
     struct ydoc *d = ydoc_parse_buf(buf, n, name, &ye);
-    if (!d) { pm_errf(e, "%s", ye.msg[0] ? ye.msg : "JSON не разобрался"); return NULL; }
-    if (!ydoc_root(d)) { ydoc_free(d); pm_errf(e, "%s: пустой документ", name); return NULL; }
+    if (!d) { pm_errc(e, "plugin.json_invalid", PMA("why", ye.msg[0] ? ye.msg : "JSON не разобрался"), "%s", ye.msg[0] ? ye.msg : "JSON не разобрался"); return NULL; }
+    if (!ydoc_root(d)) { ydoc_free(d); pm_errc(e, "plugin.json_empty", PMA("name", name), "%s: пустой документ", name); return NULL; }
     return d;
 }
 
@@ -347,6 +394,7 @@ void jw_str(struct jw *w, const char *s) {
 void jw_int(struct jw *w, long long v) { jw_sep(w); fprintf(w->f, "%lld", v); w->comma = 1; }
 void jw_bool(struct jw *w, int v) { jw_sep(w); fputs(v ? "true" : "false", w->f); w->comma = 1; }
 void jw_null(struct jw *w) { jw_sep(w); fputs("null", w->f); w->comma = 1; }
+void jw_raw(struct jw *w, const char *json) { jw_sep(w); fputs(json, w->f); w->comma = 1; }
 
 /* Скаляр без кавычек, похожий на число JSON. */
 static int json_number(const char *s) {

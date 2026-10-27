@@ -124,7 +124,7 @@ static int run_script(const char *id, const char *dir, const struct ynode *man, 
                       const char *arg, struct pm_err *e) {
     const char *rel = yn_str(ynode_get(man, "scripts"), name);
     if (!rel) return 0;
-    if (rel[0] == '/' || strstr(rel, "..")) return pm_errf(e, "у %s путь scripts.%s вне каталога плагина", id, name);
+    if (rel[0] == '/' || strstr(rel, "..")) return pm_errc(e, "plugin.script_path", PMA("id", id, "name", name), "у %s путь scripts.%s вне каталога плагина", id, name);
     char *prog = pm_path(dir, rel);
     char *conf = pm_fmt("%s/conf/%s", pm_etc(), id);
     pm_mkdirs(conf);
@@ -138,7 +138,7 @@ static int run_script(const char *id, const char *dir, const struct ynode *man, 
     free(prog);
     if (rc != 0) {
         char *last = trim_out(out);
-        pm_errf(e, "scripts/%s плагина %s %s (код %d)%s%s", name, id,
+        pm_errc(e, !strcmp(arg, "--check") ? "plugin.script_check_refused" : "plugin.script_failed", PMA("name", name, "id", id, "rc", pm_itoa(rc), "sep", *last ? ": " : "", "last", last), "scripts/%s плагина %s %s (код %d)%s%s", name, id,
                 !strcmp(arg, "--check") ? "отказал в проверке" : "не прошёл", rc, *last ? ": " : "", last);
         free(last);
         return -1;
@@ -158,12 +158,12 @@ static int reload_once(struct pm_ctx *x, struct pm_err *e) {
     memset(&rp, 0, sizeof(rp));
     int ok = ctlcall_parse(r, &rp) == 0;
     free(r);
-    if (!ok) return pm_errf(e, "демон ответил не по форме на plugin-reload");
+    if (!ok) return pm_errc(e, "plugin.reload_bad_reply", NULL, "демон ответил не по форме на plugin-reload");
     if (rp.error.p && !strcmp(rp.error.p, "unknown-command")) { ctlcall_resp_free(&rp); return 0; }
     if (!rp.has_code || rp.code != 0) {
         const char *why = rp.err.n ? rp.err.p : rp.message.p ? rp.message.p : "без причины";
         char *w = trim_out(pm_strdup(why));
-        pm_errf(e, "ядро не перечитало плагины: %s", w);
+        pm_errc(e, "plugin.reload_failed", PMA("why", w), "ядро не перечитало плагины: %s", w);
         free(w);
         ctlcall_resp_free(&rp);
         return -1;
@@ -178,7 +178,7 @@ static int reload_once(struct pm_ctx *x, struct pm_err *e) {
 int pm_daemon_reload(struct pm_ctx *x, struct pm_err *e) {
     if (reload_once(x, e) == 0) return 0;
     if (!strstr(e->msg, "нужен reload")) return -1;
-    struct pm_err again = {{0}};
+    struct pm_err again = {0};
     if (reload_once(x, &again) == 0) return 0;
     *e = again;
     return -1;
@@ -288,7 +288,7 @@ static int wait_outs(struct pm_ctx *x, const struct outs *o, int timeout_s, stru
             if (!down) { ydoc_free(d); return 0; }
         }
         if ((long)time(NULL) >= until) {
-            pm_errf(e, "выход %s не поднялся за %d с", down ? down : "?", timeout_s);
+            pm_errc(e, "plugin.output_not_up", PMA("name", down ? down : "?", "seconds", pm_itoa(timeout_s)), "выход %s не поднялся за %d с", down ? down : "?", timeout_s);
             if (d) ydoc_free(d);
             return -1;
         }
@@ -349,7 +349,7 @@ static int pkg_add(const char *name, struct pm_err *e) {
     }
     if (rc != 0) {
         char *last = trim_out(out);
-        pm_errf(e, "пакет %s не поставился%s%s", name, *last ? ": " : "", last);
+        pm_errc(e, "plugin.package_failed", PMA("name", name, "sep", *last ? ": " : "", "last", last), "пакет %s не поставился%s%s", name, *last ? ": " : "", last);
         free(last);
         return -1;
     }
@@ -379,10 +379,10 @@ static int resolve_in(struct pm_ctx *x, struct plan *p, struct pm_repo *r, const
                       struct pm_repos *seedrs, struct pm_err *e) {
     const char *below = NULL;
     char *below_buf = NULL;
-    struct pm_err first = {{0}};
+    struct pm_err first = {0};
     for (;;) {
         struct pm_cand c;
-        struct pm_err se = {{0}};
+        struct pm_err se = {0};
         if (pm_select(x, r, id, range, exact, variant, below, &c, &se) != 0) {
             if (!first.msg[0]) first = se;
             break;
@@ -394,10 +394,10 @@ static int resolve_in(struct pm_ctx *x, struct plan *p, struct pm_repo *r, const
         for (size_t i = 0; i < ynode_len(deps) && ok; i++) {
             const char *did = ynode_key_at(deps, i)->str;
             const struct ynode *dr = ynode_val_at(deps, i);
-            struct pm_err de = {{0}};
+            struct pm_err de = {0};
             if (resolve(x, p, did, yn_is_str(dr) ? dr->str : NULL, NULL, r, "full", &me, 0, o, seedrs, &de) != 0) {
                 ok = 0;
-                if (!first.msg[0]) pm_errf(&first, "%s %s: %s", c.id, c.version, de.msg);
+                if (!first.msg[0]) pm_errc(&first, "plugin.dependency_failed", PMA("id", c.id, "version", c.version, "why", de.msg), "%s %s: %s", c.id, c.version, de.msg);
             }
         }
         if (ok) {
@@ -414,7 +414,7 @@ static int resolve_in(struct pm_ctx *x, struct plan *p, struct pm_repo *r, const
     }
     free(below_buf);
     *e = first;
-    if (!e->msg[0]) pm_errf(e, "нет годной версии %s", id);
+    if (!e->msg[0]) pm_errc(e, "plugin.no_suitable_version", PMA("id", id), "нет годной версии %s", id);
     return -1;
 }
 
@@ -430,14 +430,14 @@ static int resolve(struct pm_ctx *x, struct plan *p, const char *id, const char 
             chain = n;
             if (!strcmp(t->id, id)) break;
         }
-        pm_errf(e, "цикл зависимостей: %s", chain);
+        pm_errc(e, "plugin.dependency_cycle", PMA("chain", chain), "цикл зависимостей: %s", chain);
         free(chain);
         return -1;
     }
     struct item *have = plan_find(p, id);
     if (have) {
         if (range && pm_range_match(range, have->c.version) <= 0)
-            return pm_errf(e, "нужен %s %s, а план уже берёт %s", id, range, have->c.version);
+            return pm_errc(e, "plugin.version_conflict", PMA("id", id, "range", range, "have", have->c.version), "нужен %s %s, а план уже берёт %s", id, range, have->c.version);
         return 0;
     }
     struct pm_inst *inst = pm_state_find(&x->st, id);
@@ -448,32 +448,32 @@ static int resolve(struct pm_ctx *x, struct plan *p, const char *id, const char 
     /* Обновление — только из репозитория, из которого плагин поставлен (index.md). */
     if (!o->seed_only && inst && inst->repo) {
         struct pm_repo *own = pm_repo_find(rs, inst->repo);
-        if (!own) return pm_errf(e, "репозиторий %s, из которого поставлен %s, отключён", inst->repo, id);
-        struct pm_err ie = {{0}};
-        if (pm_index_get(own, 1, &ie) != 0) return pm_errf(e, "%s", ie.msg);
+        if (!own) return pm_errc(e, "plugin.repo_disabled", PMA("repo", inst->repo, "id", id), "репозиторий %s, из которого поставлен %s, отключён", inst->repo, id);
+        struct pm_err ie = {0};
+        if (pm_index_get(own, 1, &ie) != 0) return pm_errcopy(e, &ie);
         return resolve_in(x, p, own, id, range, exact, variant, up, o, seedrs, e);
     }
-    struct pm_err best = {{0}};
+    struct pm_err best = {0};
     int tried = 0;
     for (int pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < rs->n; i++) {
             struct pm_repo *r = &rs->v[i];
             if ((pass == 0) != (r == prefer)) continue;
-            struct pm_err ie = {{0}};
+            struct pm_err ie = {0};
             if (pm_index_get(r, !o->seed_only, &ie) != 0) {
                 if (!best.msg[0]) best = ie;
                 continue;
             }
             if (!pm_index_plugin(r, id)) continue;
             tried = 1;
-            struct pm_err re = {{0}};
+            struct pm_err re = {0};
             if (resolve_in(x, p, r, id, range, exact, variant, up, o, seedrs, &re) == 0) return 0;
             if (!best.msg[0] || tried == 1) best = re;
             if (exact) break;
         }
     }
-    if (!tried && !best.msg[0]) return pm_errf(e, "плагина %s нет ни в одном репозитории", id);
-    if (!tried) return pm_errf(e, "плагина %s нет ни в одном доступном репозитории (%s)", id, best.msg);
+    if (!tried && !best.msg[0]) return pm_errc(e, "plugin.not_in_any_repo", PMA("id", id), "плагина %s нет ни в одном репозитории", id);
+    if (!tried) return pm_errc(e, "plugin.not_in_any_available_repo", PMA("id", id, "why", best.msg), "плагина %s нет ни в одном доступном репозитории (%s)", id, best.msg);
     *e = best;
     return -1;
 }
@@ -542,7 +542,7 @@ static char *fetch_asset(struct pm_ctx *x, const struct pm_cand *c, int *tmp, st
             }
         }
         free(cands[0]); free(cands[1]);
-        pm_errf(e, "архива %s %s в семени нет%s%s", c->id, c->version, why[0] ? " или он испорчен: " : "", why);
+        pm_errc(e, why[0] ? "plugin.seed_archive_broken" : "plugin.seed_archive_missing", PMA("id", c->id, "version", c->version, "why", why), "архива %s %s в семени нет%s%s", c->id, c->version, why[0] ? " или он испорчен: " : "", why);
         return NULL;
     }
     pm_mkdirs(pm_tmp());
@@ -603,8 +603,8 @@ static char *fetch_asset(struct pm_ctx *x, const struct pm_cand *c, int *tmp, st
     for (size_t i = 0; i < nu; i++) free(urls[i]);
     free(urls);
     if (!res) {
-        if (!nu) pm_errf(e, "у архива %s %s в индексе нет адреса", c->id, c->version);
-        else pm_errf(e, "%s", last ? last : "архив не скачался");
+        if (!nu) pm_errc(e, "plugin.no_archive_url", PMA("id", c->id, "version", c->version), "у архива %s %s в индексе нет адреса", c->id, c->version);
+        else pm_errc(e, "plugin.archive_download", PMA("why", last ? last : "архив не скачался"), "%s", last ? last : "архив не скачался");
         free(dest);
     }
     free(last);
@@ -645,7 +645,7 @@ static int manifest_parse(struct uv *u, char *text) {
     char *save = NULL;
     char *l = strtok_r(text, "\n", &save);
     if (!l || sscanf(l, "s2p 1 %127s %127s %127s", u->hdr_id, u->hdr_ver, u->hdr_arch) != 3)
-        return pm_errf(u->e, "MANIFEST %s: заголовок не «s2p 1 <id> <версия> <арх>»", u->id);
+        return pm_errc(u->e, "plugin.manifest_header", PMA("id", u->id), "MANIFEST %s: заголовок не «s2p 1 <id> <версия> <арх>»", u->id);
     for (l = strtok_r(NULL, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {
         struct mline m = {0};
         unsigned long long sz;
@@ -653,7 +653,7 @@ static int manifest_parse(struct uv *u, char *text) {
         int off = 0;
         if (strlen(l) < 66 || unhex(l, m.sha, 32) != 0 ||
             sscanf(l + 65, "%llu %o %n", &sz, &mode, &off) < 2 || !off || !l[65 + off])
-            return pm_errf(u->e, "MANIFEST %s: строка не разбирается: %.80s", u->id, l);
+            return pm_errc(u->e, "plugin.manifest_line", PMA("id", u->id, "line", l), "MANIFEST %s: строка не разбирается: %.80s", u->id, l);
         m.size = sz;
         m.mode = mode;
         m.path = pm_strdup(l + 65 + off);
@@ -663,7 +663,7 @@ static int manifest_parse(struct uv *u, char *text) {
     qsort(u->m, u->nm, sizeof(*u->m), mline_cmp);
     for (size_t i = 1; i < u->nm; i++)
         if (!strcmp(u->m[i - 1].path, u->m[i].path))
-            return pm_errf(u->e, "MANIFEST %s: файл %s назван дважды", u->id, u->m[i].path);
+            return pm_errc(u->e, "plugin.manifest_file_twice", PMA("id", u->id, "path", u->m[i].path), "MANIFEST %s: файл %s назван дважды", u->id, u->m[i].path);
     return 0;
 }
 
@@ -676,13 +676,13 @@ static int uv_cb(void *arg, const struct untar_entry *en) {
     struct uv *u = arg;
     int idx = u->count++;
     unsigned special = en->rawmode & 07000;
-    if (special) return pm_errf(u->e, "запись %s: setuid, setgid или sticky", en->path);
+    if (special) return pm_errc(u->e, "plugin.entry_special", PMA("path", en->path), "запись %s: setuid, setgid или sticky", en->path);
     static const char *first[3] = { "plugin.json", "MANIFEST", "MANIFEST.sig" };
     if (idx < 3) {
         if (en->type != UNTAR_FILE || strcmp(en->path, first[idx]))
-            return pm_errf(u->e, "архив %s: запись %d должна быть %s, а это %s", u->id, idx + 1, first[idx], en->path);
+            return pm_errc(u->e, "plugin.entry_order", PMA("id", u->id, "index", pm_itoa(idx + 1), "want", first[idx], "path", en->path), "архив %s: запись %d должна быть %s, а это %s", u->id, idx + 1, first[idx], en->path);
         if ((en->rawmode & 0777) != 0644)
-            return pm_errf(u->e, "запись %s: режим %03o, а нужен 0644", en->path, en->rawmode & 0777);
+            return pm_errc(u->e, "plugin.entry_mode_file", PMA("path", en->path, "mode", pm_oct(en->rawmode & 0777)), "запись %s: режим %03o, а нужен 0644", en->path, en->rawmode & 0777);
         if (idx == 0) { memcpy(u->pj_sha, en->sha256, 32); u->pj_size = en->size; }
         if (idx < 2) return 0;
         /* Третья запись — подпись: проверить MANIFEST до остального. */
@@ -690,9 +690,9 @@ static int uv_cb(void *arg, const struct untar_entry *en) {
         size_t mn = 0, sn = 0;
         char *mt = pm_read(mp, &mn), *st = pm_read(sp, &sn);
         free(mp); free(sp);
-        if (!mt || !st) { free(mt); free(st); return pm_errf(u->e, "MANIFEST %s не читается", u->id); }
+        if (!mt || !st) { free(mt); free(st); return pm_errc(u->e, "plugin.manifest_unreadable", PMA("id", u->id), "MANIFEST %s не читается", u->id); }
         if (sn == 0) {
-            if (!u->unsigned_ok) { free(mt); free(st); return pm_errf(u->e, "архив %s не подписан", u->id); }
+            if (!u->unsigned_ok) { free(mt); free(st); return pm_errc(u->e, "plugin.archive_unsigned", PMA("id", u->id), "архив %s не подписан", u->id); }
             u->is_unsigned = 1;
         } else {
             char *what = pm_fmt("MANIFEST %s", u->id);
@@ -706,27 +706,27 @@ static int uv_cb(void *arg, const struct untar_entry *en) {
         if (r != 0) return -1;
         struct mline *pj = mline_find(u, "plugin.json");
         if (!pj || pj->size != u->pj_size || memcmp(pj->sha, u->pj_sha, 32))
-            return pm_errf(u->e, "plugin.json %s не совпадает с MANIFEST — подмена", u->id);
+            return pm_errc(u->e, "plugin.json_manifest_mismatch", PMA("id", u->id), "plugin.json %s не совпадает с MANIFEST — подмена", u->id);
         pj->seen = 1;
         return 0;
     }
     if (en->type == UNTAR_DIR) {
         if ((en->rawmode & 0777) != 0755)
-            return pm_errf(u->e, "каталог %s: режим %03o, а нужен 0755", en->path, en->rawmode & 0777);
+            return pm_errc(u->e, "plugin.dir_mode", PMA("path", en->path, "mode", pm_oct(en->rawmode & 0777)), "каталог %s: режим %03o, а нужен 0755", en->path, en->rawmode & 0777);
         u->dirs = pm_realloc(u->dirs, sizeof(char *) * (u->ndirs + 1));
         u->dirs[u->ndirs++] = pm_strdup(en->path);
         return 0;
     }
-    if (en->type != UNTAR_FILE) return pm_errf(u->e, "запись %s: не файл и не каталог", en->path);
+    if (en->type != UNTAR_FILE) return pm_errc(u->e, "plugin.entry_not_file", PMA("path", en->path), "запись %s: не файл и не каталог", en->path);
     if (!strcmp(en->path, "MANIFEST") || !strcmp(en->path, "MANIFEST.sig") || !strcmp(en->path, "plugin.json"))
-        return pm_errf(u->e, "архив %s: запись %s повторена", u->id, en->path);
+        return pm_errc(u->e, "plugin.entry_twice", PMA("id", u->id, "path", en->path), "архив %s: запись %s повторена", u->id, en->path);
     struct mline *m = mline_find(u, en->path);
-    if (!m) return pm_errf(u->e, "в архиве %s лишний файл %s, которого нет в MANIFEST — подмена", u->id, en->path);
+    if (!m) return pm_errc(u->e, "plugin.extra_file", PMA("id", u->id, "path", en->path), "в архиве %s лишний файл %s, которого нет в MANIFEST — подмена", u->id, en->path);
     unsigned mode = en->rawmode & 0777;
-    if (mode != 0644 && mode != 0755) return pm_errf(u->e, "файл %s: режим %03o, а нужен 0644 или 0755", en->path, mode);
+    if (mode != 0644 && mode != 0755) return pm_errc(u->e, "plugin.file_mode", PMA("path", en->path, "mode", pm_oct(mode)), "файл %s: режим %03o, а нужен 0644 или 0755", en->path, mode);
     if (m->size != en->size || memcmp(m->sha, en->sha256, 32))
-        return pm_errf(u->e, "файл %s архива %s не совпадает с MANIFEST — подмена", en->path, u->id);
-    if (m->mode != mode) return pm_errf(u->e, "файл %s: режим %03o, а в MANIFEST %03o", en->path, mode, m->mode);
+        return pm_errc(u->e, "plugin.file_mismatch", PMA("path", en->path, "id", u->id), "файл %s архива %s не совпадает с MANIFEST — подмена", en->path, u->id);
+    if (m->mode != mode) return pm_errc(u->e, "plugin.file_mode_mismatch", PMA("path", en->path, "mode", pm_oct(mode), "want", pm_oct(m->mode)), "файл %s: режим %03o, а в MANIFEST %03o", en->path, mode, m->mode);
     m->seen = 1;
     return 0;
 }
@@ -757,22 +757,22 @@ static int unpack_verified(const char *archive, const char *stage, const char *i
     char why[512] = "";
     int rc = untar_gz_file(archive, stage, &uo, why, sizeof(why));
     if (rc != 0) {
-        if (!e->msg[0]) pm_errf(e, "архив %s не распаковался: %s", id, why);
+        if (!e->msg[0]) pm_errc(e, "plugin.unpack_failed", PMA("id", id, "why", why), "архив %s не распаковался: %s", id, why);
         uv_free(&u);
         pm_rmrf(stage);
         return -1;
     }
-    if (u.count < 3) { pm_errf(e, "архив %s: нет plugin.json, MANIFEST и MANIFEST.sig", id); goto bad; }
+    if (u.count < 3) { pm_errc(e, "plugin.archive_incomplete", PMA("id", id), "архив %s: нет plugin.json, MANIFEST и MANIFEST.sig", id); goto bad; }
     for (size_t i = 0; i < u.nm; i++)
-        if (!u.m[i].seen) { pm_errf(e, "в архиве %s нет файла %s из MANIFEST — подмена", id, u.m[i].path); goto bad; }
+        if (!u.m[i].seen) { pm_errc(e, "plugin.archive_file_missing", PMA("id", id, "path", u.m[i].path), "в архиве %s нет файла %s из MANIFEST — подмена", id, u.m[i].path); goto bad; }
     for (size_t i = 0; i < u.ndirs; i++) {
         size_t dl = strlen(u.dirs[i]);
         int used = 0;
         for (size_t j = 0; j < u.nm && !used; j++)
             if (!strncmp(u.m[j].path, u.dirs[i], dl) && u.m[j].path[dl] == '/') used = 1;
-        if (!used) { pm_errf(e, "в архиве %s лишний каталог %s", id, u.dirs[i]); goto bad; }
+        if (!used) { pm_errc(e, "plugin.extra_dir", PMA("id", id, "path", u.dirs[i]), "в архиве %s лишний каталог %s", id, u.dirs[i]); goto bad; }
     }
-    if (id && strcmp(u.hdr_id, id)) { pm_errf(e, "архив назван %s, а ждали %s — подмена", u.hdr_id, id); goto bad; }
+    if (id && strcmp(u.hdr_id, id)) { pm_errc(e, "plugin.archive_name", PMA("got", u.hdr_id, "want", id), "архив назван %s, а ждали %s — подмена", u.hdr_id, id); goto bad; }
     *is_unsigned = u.is_unsigned;
     snprintf(hdr_id, hn, "%s", u.hdr_id);
     snprintf(hdr_ver, hn, "%s", u.hdr_ver);
@@ -810,20 +810,20 @@ static int manifest_checks(struct pm_ctx *x, const char *id, const struct ynode 
         const char *impl = yn_str(k, "impl");
         if (impl && !strcmp(impl, "core")) {
             const char *kn = yn_str(k, "name");
-            if (!official) return pm_errf(e, "%s: impl: core принимается только из официального репозитория", id);
-            if (!kn || strcmp(kn, "awg")) return pm_errf(e, "%s: вида %s ядро не знает — impl: core для него нельзя", id, kn ? kn : "?");
+            if (!official) return pm_errc(e, "plugin.core_impl_official", PMA("id", id), "%s: impl: core принимается только из официального репозитория", id);
+            if (!kn || strcmp(kn, "awg")) return pm_errc(e, "plugin.core_impl_kind", PMA("id", id, "kind", kn ? kn : "?"), "%s: вида %s ядро не знает — impl: core для него нельзя", id, kn ? kn : "?");
         }
     }
-    if (nft && !has_perm(man, "nft")) return pm_errf(e, "%s: файлы nft без права nft", id);
-    if (transform && !has_perm(man, "spec.transform")) return pm_errf(e, "%s: хуки pre_apply/expand без права spec.transform", id);
-    if (nonempty(ynode_get(steer, "so")) && !has_perm(man, "so")) return pm_errf(e, "%s: steer.so без права so", id);
+    if (nft && !has_perm(man, "nft")) return pm_errc(e, "plugin.perm_nft", PMA("id", id), "%s: файлы nft без права nft", id);
+    if (transform && !has_perm(man, "spec.transform")) return pm_errc(e, "plugin.perm_transform", PMA("id", id), "%s: хуки pre_apply/expand без права spec.transform", id);
+    if (nonempty(ynode_get(steer, "so")) && !has_perm(man, "so")) return pm_errc(e, "plugin.perm_so", PMA("id", id), "%s: steer.so без права so", id);
     if (nonempty(ynode_get(ynode_get(man, "requires"), "system")) && !has_perm(man, "system-packages"))
-        return pm_errf(e, "%s: requires.system без права system-packages", id);
-    if (nonempty(ynode_get(man, "standalone")) && !official) return pm_errf(e, "%s: standalone разрешён только официальному репозиторию", id);
+        return pm_errc(e, "plugin.perm_system", PMA("id", id), "%s: requires.system без права system-packages", id);
+    if (nonempty(ynode_get(man, "standalone")) && !official) return pm_errc(e, "plugin.standalone_official", PMA("id", id), "%s: standalone разрешён только официальному репозиторию", id);
     const struct ynode *keep = ynode_get(man, "keep");
     for (size_t i = 0; i < ynode_len(keep); i++) {
         const char *k = yn_is_str(ynode_at(keep, i)) ? ynode_at(keep, i)->str : NULL;
-        if (!k || k[0] != '/' || strstr(k, "..")) return pm_errf(e, "%s: путь keep «%s» не абсолютный", id, k ? k : "");
+        if (!k || k[0] != '/' || strstr(k, "..")) return pm_errc(e, "plugin.keep_path", PMA("id", id, "path", k ? k : ""), "%s: путь keep «%s» не абсолютный", id, k ? k : "");
         int ok = 0;
         const struct ynode *perms = ynode_get(man, "permissions");
         for (size_t j = 0; j < ynode_len(perms) && !ok; j++) {
@@ -832,7 +832,7 @@ static int manifest_checks(struct pm_ctx *x, const char *id, const struct ynode 
             size_t pl = strlen(p + 3);
             if (pl && !strncmp(k, p + 3, pl) && (k[pl] == '\0' || k[pl] == '/' || p[3 + pl - 1] == '/')) ok = 1;
         }
-        if (!ok) return pm_errf(e, "%s: путь keep %s без права fs:", id, k);
+        if (!ok) return pm_errc(e, "plugin.keep_perm", PMA("id", id, "path", k), "%s: путь keep %s без права fs:", id, k);
     }
     /* Имена глобальны: вид, подкоманда, служба, занятые другим плагином или ядром. */
     struct { const char *sect, *what; } names[] = { {"kinds", "вид"}, {"commands", "подкоманда"}, {"services", "служба"} };
@@ -842,7 +842,7 @@ static int manifest_checks(struct pm_ctx *x, const char *id, const struct ynode 
             const char *nm = yn_str(ynode_at(list, i), "name");
             if (!nm) continue;
             /* Имя подкоманды ядра плагину не даётся — тот же отбор, что в реестре (kinds/plugin.c). */
-            if (s == 1 && cli_lookup(nm)) return pm_errf(e, "подкоманда %s — команда ядра, плагину её не дать", nm);
+            if (s == 1 && cli_lookup(nm)) return pm_errc(e, "plugin.subcommand_core", PMA("name", nm), "подкоманда %s — команда ядра, плагину её не дать", nm);
             for (size_t j = 0; j < x->st.n; j++) {
                 const struct pm_inst *o = &x->st.v[j];
                 if (!strcmp(o->id, id)) continue;
@@ -855,7 +855,12 @@ static int manifest_checks(struct pm_ctx *x, const char *id, const struct ynode 
                     if (on && !strcmp(on, nm)) hit = 1;
                 }
                 ydoc_free(om);
-                if (hit) return pm_errf(e, "%s %s уже есть у %s из %s", names[s].what, nm, o->id, o->repo ? o->repo : "файла");
+                if (hit) {
+                    static const char *const wk[] = { "kind", "command", "service" };
+                    char tc[64];
+                    snprintf(tc, sizeof(tc), "plugin.name_taken_%s%s", wk[s], o->repo ? "" : "_file");
+                    return pm_errc(e, tc, PMA("name", nm, "owner", o->id, "repo", o->repo ? o->repo : ""), "%s %s уже есть у %s из %s", names[s].what, nm, o->id, o->repo ? o->repo : "файла");
+                }
             }
         }
     }
@@ -899,7 +904,7 @@ static int system_deps(struct pm_ctx *x, const char *id, const struct ynode *man
         free(copy);
         if (!have) {
             const char *pk = ynode_len(sys) ? (yn_is_str(ynode_at(sys, 0)) ? ynode_at(sys, 0)->str : NULL) : NULL;
-            return pm_errf(e, "%s не встаёт: нет %s%s%s", id, alt, pk ? " (нужен пакет " : "", pk ? pk : "");
+            return pm_errc(e, pk ? "plugin.system_missing_pkg" : "plugin.system_missing", PMA("id", id, "alt", alt, "package", pk ? pk : ""), "%s не встаёт: нет %s%s%s", id, alt, pk ? " (нужен пакет " : "", pk ? pk : "");
         }
     }
     return 0;
@@ -997,7 +1002,7 @@ static void undo_apply(struct pm_ctx *x, struct undo *u, const char *why) {
 static int group_finish(struct pm_ctx *x, int before_bad, const char *before_msg, struct pm_err *e) {
     struct undo *u = x->undo;
     size_t n = x->nundo;
-    struct pm_err he = {{0}};
+    struct pm_err he = {0};
     int healthy = 1;
     int active = 0;
     for (size_t i = 0; i < n; i++) if (!u[i].was_disabled) active = 1;
@@ -1011,7 +1016,7 @@ static int group_finish(struct pm_ctx *x, int before_bad, const char *before_msg
         for (size_t i = 0; healthy && i < n; i++)
             if (!u[i].was_disabled && wait_outs(x, &u[i].before, u[i].timeout_s, &he) != 0) healthy = 0;
     }
-    struct pm_err se = {{0}};
+    struct pm_err se = {0};
     if (healthy) {
         for (size_t i = 0; i < n; i++) pm_rmrf(u[i].prev);
         return 0;
@@ -1020,9 +1025,9 @@ static int group_finish(struct pm_ctx *x, int before_bad, const char *before_msg
     for (size_t i = n; i-- > 0;) undo_apply(x, &u[i], he.msg);
     pm_state_save(&x->st, &se);
     pm_keepd_write(x);
-    struct pm_err re = {{0}};
+    struct pm_err re = {0};
     pm_daemon_reload(x, &re);
-    pm_errf(e, "группа плагинов не прошла проверку здоровья: %s — возвращены прежние версии", he.msg);
+    pm_errc(e, "plugin.group_health_failed", PMA("why", he.msg), "группа плагинов не прошла проверку здоровья: %s — возвращены прежние версии", he.msg);
     return -1;
 }
 
@@ -1079,30 +1084,30 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         goto out;
     {
         char *pj = pm_path(stage, "plugin.json");
-        struct pm_err je = {{0}};
+        struct pm_err je = {0};
         man = pm_json_load(pj, &je);
         free(pj);
-        if (!man) { pm_errf(e, "plugin.json не разбирается: %s", je.msg); goto out_stage; }
+        if (!man) { pm_errc(e, "plugin.json_unparsable", PMA("why", je.msg), "plugin.json не разбирается: %s", je.msg); goto out_stage; }
     }
     const struct ynode *m = ydoc_root(man);
-    if (yn_long(m, "schema", -1) != 1) { pm_errf(e, "манифест %s нового формата (schema) — обновите ядро", yn_str(m, "id") ? yn_str(m, "id") : "?"); goto out_stage; }
+    if (yn_long(m, "schema", -1) != 1) { pm_errc(e, "plugin.manifest_new_schema", PMA("id", yn_str(m, "id") ? yn_str(m, "id") : "?"), "манифест %s нового формата (schema) — обновите ядро", yn_str(m, "id") ? yn_str(m, "id") : "?"); goto out_stage; }
     mid = yn_str(m, "id");
     const char *mver = yn_str(m, "version");
-    if (!mid || !mver) { pm_errf(e, "в plugin.json нет id или version"); goto out_stage; }
+    if (!mid || !mver) { pm_errc(e, "plugin.no_id_version", NULL, "в plugin.json нет id или version"); goto out_stage; }
     if (!s->c) {
         /* Файл: заголовок MANIFEST и id из plugin.json должны совпасть (проверка в unpack шла с пустым id). */
         char *real = pm_fmt("%s/.stage/%s-%s", pm_root(), mid, mver);
         pm_rmrf(real);
-        if (rename(stage, real) != 0) { free(real); pm_errf(e, "не переложить распаковку"); goto out_stage; }
+        if (rename(stage, real) != 0) { free(real); pm_errc(e, "plugin.stage_move_failed", NULL, "не переложить распаковку"); goto out_stage; }
         free(stage);
         stage = real;
-        if (strcmp(hid, mid)) { pm_errf(e, "plugin.json (%s) не совпадает с MANIFEST (%s) — подмена", mid, hid); goto out_stage; }
+        if (strcmp(hid, mid)) { pm_errc(e, "plugin.json_id_mismatch", PMA("id", mid, "header", hid), "plugin.json (%s) не совпадает с MANIFEST (%s) — подмена", mid, hid); goto out_stage; }
         id = mid;
         struct pm_inst *ex = pm_state_find(&x->st, mid);
         repo = is_unsigned ? NULL : ex && ex->repo ? ex->repo : NULL;
     }
     if (strcmp(mid, id) || strcmp(mver, hver) || (s->c && strcmp(mver, s->c->version))) {
-        pm_errf(e, "plugin.json (%s %s) не совпадает с MANIFEST и индексом — подмена", mid, mver);
+        pm_errc(e, "plugin.json_index_mismatch", PMA("id", mid, "version", mver), "plugin.json (%s %s) не совпадает с MANIFEST и индексом — подмена", mid, mver);
         goto out_stage;
     }
     {
@@ -1115,10 +1120,10 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         } else {
             snprintf(want, sizeof(want), "%s", strcmp(harch, "all") ? (x->tg.arch ? x->tg.arch : "") : "all");
         }
-        if (strcmp(harch, want)) { pm_errf(e, "архив %s собран под %s, а нужен %s", id, harch, want); goto out_stage; }
+        if (strcmp(harch, want)) { pm_errc(e, "plugin.wrong_arch", PMA("id", id, "got", harch, "want", want), "архив %s собран под %s, а нужен %s", id, harch, want); goto out_stage; }
         const char *variant = yn_str(m, "variant");
         if (s->c && strcmp(variant ? variant : "full", s->c->variant)) {
-            pm_errf(e, "вариант архива %s (%s) не тот, что в индексе (%s)", id, variant ? variant : "full", s->c->variant);
+            pm_errc(e, "plugin.wrong_variant", PMA("id", id, "got", variant ? variant : "full", "want", s->c->variant), "вариант архива %s (%s) не тот, что в индексе (%s)", id, variant ? variant : "full", s->c->variant);
             goto out_stage;
         }
     }
@@ -1126,20 +1131,20 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         static const char *same[] = { "compat", "requires", "conflicts", NULL };
         for (int i = 0; same[i]; i++)
             if (!yn_equal(ynode_get(m, same[i]), ynode_get(s->c->ver, same[i]))) {
-                pm_errf(e, "индекс и архив %s %s не совпадают (%s)", id, mver, same[i]);
+                pm_errc(e, "plugin.index_archive_mismatch", PMA("id", id, "version", mver, "field", same[i]), "индекс и архив %s %s не совпадают (%s)", id, mver, same[i]);
                 goto out_stage;
             }
     } else {
         char cb[512];
         const char *cw = pm_compat_why(&x->tg, ynode_get(m, "compat"), cb, sizeof(cb));
-        if (cw) { pm_errf(e, "%s %s %s", id, mver, cw); goto out_stage; }
+        if (cw) { pm_compat_err(e, id, mver, cw); goto out_stage; }
         const struct ynode *deps = ynode_get(ynode_get(m, "requires"), "plugins");
         for (size_t i = 0; i < ynode_len(deps); i++) {
             const char *did = ynode_key_at(deps, i)->str;
             const struct ynode *dr = ynode_val_at(deps, i);
             struct pm_inst *d = pm_state_find(&x->st, did);
             if (!d || !d->version || (yn_is_str(dr) && pm_range_match(dr->str, d->version) <= 0)) {
-                pm_errf(e, "%s требует плагин %s %s — поставьте его", id, did, yn_is_str(dr) ? dr->str : "");
+                pm_errc(e, "plugin.needs_plugin", PMA("id", id, "dep", did, "range", yn_is_str(dr) ? dr->str : ""), "%s требует плагин %s %s — поставьте его", id, did, yn_is_str(dr) ? dr->str : "");
                 goto out_stage;
             }
         }
@@ -1171,18 +1176,18 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     /* Что говорило ядро о перечитывании плагинов ДО установки: прежняя ошибка — не вина этого плагина. */
     if (!x->defer) x->before_bad = !x->no_daemon && pm_daemon_reload(x, &x->before_err) != 0;
     if (oldman) {
-        struct pm_err pe = {{0}};
+        struct pm_err pe = {0};
         if (run_script(id, dir, ydoc_root(oldman), "prerm", mver, &pe) != 0)
             pm_progress(x, "%s", pe.msg);
         ydoc_free(oldman);
     }
     if (had_dir && rename(dir, prev) != 0) {
-        pm_errf(e, "не убрать прежнюю версию %s в .prev: %s", id, strerror(errno));
+        pm_errc(e, "plugin.prev_move_failed", PMA("id", id, "why", strerror(errno)), "не убрать прежнюю версию %s в .prev: %s", id, strerror(errno));
         free(dir); free(prevd); free(prev); free(old_ver);
         goto out_stage;
     }
     if (rename(stage, dir) != 0) {
-        pm_errf(e, "не поставить %s на место: %s", id, strerror(errno));
+        pm_errc(e, "plugin.place_failed", PMA("id", id, "why", strerror(errno)), "не поставить %s на место: %s", id, strerror(errno));
         if (had_dir) rename(prev, dir);
         free(dir); free(prevd); free(prev); free(old_ver);
         goto out_stage;
@@ -1214,13 +1219,13 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         }
         pm_sys_ours_add(&x->st, sys[i]);
     }
-    struct pm_err he = {{0}};
+    struct pm_err he = {0};
     int healthy = 1;
     /* Скрипты: migrate при смене major, затем postinst <старая>. */
     if (old_ver && pm_ver_major(old_ver) != pm_ver_major(mver) &&
         run_script(id, dir, m, "migrate", old_ver, &he) != 0) healthy = 0;
     if (healthy && run_script(id, dir, m, "postinst", old_ver ? old_ver : "", &he) != 0) healthy = 0;
-    struct pm_err se = {{0}};
+    struct pm_err se = {0};
     pm_state_save(&x->st, &se);
     pm_keepd_write(x);
     if (healthy && x->defer) {
@@ -1264,14 +1269,14 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         }
         pm_state_save(&x->st, &se);
         pm_keepd_write(x);
-        struct pm_err re = {{0}};
+        struct pm_err re = {0};
         if (restored && pm_daemon_reload(x, &re) != 0 && inst) {
             /* И откат не здоров: плагин failed, его выходы — в on_fail. */
             inst = pm_state_find(&x->st, id);
             if (inst) { pm_inst_set(&inst->state, "failed"); pm_inst_set(&inst->why, re.msg); pm_state_save(&x->st, &se); }
         }
         pm_event(x, id, restored ? "rolled-back" : "failed", restored ? old_ver : mver, mver, bad_why);
-        pm_errf(e, "%s %s не прошёл проверку здоровья: %s%s", id, mver, he.msg,
+        pm_errc(e, restored ? "plugin.health_failed_restored" : "plugin.health_failed", PMA("id", id, "version", mver, "why", he.msg), "%s %s не прошёл проверку здоровья: %s%s", id, mver, he.msg,
                 restored ? " — возвращена прежняя версия" : "");
         free(bad_why);
         free(dir); free(prevd); free(prev); free(old_ver);
@@ -1325,13 +1330,13 @@ static int space_check(struct pm_ctx *x, const struct plan *p, struct pm_err *e)
     if (need > fr) {
         pm_human(need, a, sizeof(a));
         pm_human(fr, b, sizeof(b));
-        return pm_errf(e, "нет места на разделе плагинов (%s): нужно %s, свободно %s", pm_root(), a, b);
+        return pm_errc(e, "plugin.no_space_root", PMA("path", pm_root(), "need", a, "free", b), "нет места на разделе плагинов (%s): нужно %s, свободно %s", pm_root(), a, b);
     }
     unsigned long long ft = pm_free(pm_tmp(), 1);
     if (need_tmp > ft) {
         pm_human(need_tmp, a, sizeof(a));
         pm_human(ft, b, sizeof(b));
-        return pm_errf(e, "нет места во временном каталоге (%s): нужно %s, свободно %s", pm_tmp(), a, b);
+        return pm_errc(e, "plugin.no_space_tmp", PMA("path", pm_tmp(), "need", a, "free", b), "нет места во временном каталоге (%s): нужно %s, свободно %s", pm_tmp(), a, b);
     }
     return 0;
 }
@@ -1356,7 +1361,7 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
     struct pm_repo *sr = NULL;
     if (o->seed_only) {
         sr = pm_seed_repo();
-        if (!sr) return pm_errf(e, "семени нет (%s)", pm_seed());
+        if (!sr) return pm_errc(e, "plugin.no_seed_at", PMA("path", pm_seed()), "семени нет (%s)", pm_seed());
         seedrs.v = sr;
         seedrs.n = 1;
     }
@@ -1370,7 +1375,7 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
     int rc = plan_build(x, &p, req, nreq, "full", o, &seedrs, e);
     if (rc == 0 && space_check(x, &p, e) != 0) {
         /* На полный вариант нет места: облегчённый, если он есть и помещается (manifest.md). */
-        struct pm_err le = {{0}};
+        struct pm_err le = {0};
         struct plan lp = {0};
         char *full_why = pm_strdup(e->msg);
         if (plan_build(x, &lp, req, nreq, "lite", o, &seedrs, &le) == 0 && space_check(x, &lp, &le) == 0) {
@@ -1418,13 +1423,13 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
         struct undo *u = x->undo;
         if (rc != 0) {
             /* Одна из группы не встала: откат всех, что уже стоят. */
-            struct pm_err se = {{0}};
+            struct pm_err se = {0};
             for (size_t i = x->nundo; i-- > 0;) undo_apply(x, &u[i], e->msg);
             if (x->nundo) { pm_state_save(&x->st, &se); pm_keepd_write(x); pm_daemon_reload(x, &se); }
             pm_result_free(res);
             memset(res, 0, sizeof(*res));
         } else if (x->nundo) {
-            struct pm_err ge = {{0}};
+            struct pm_err ge = {0};
             if (group_finish(x, x->before_bad, x->before_err.msg, &ge) != 0) {
                 *e = ge;
                 pm_result_free(res);
@@ -1484,7 +1489,7 @@ static char *spec_needs(const struct ynode *kinds) {
 int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_err *e) {
     struct pm_inst *inst = pm_state_find(&x->st, id);
     char *dir = pm_path(pm_root(), id);
-    if (!inst && !pm_is_dir(dir)) { free(dir); return pm_errf(e, "плагин %s не установлен", id); }
+    if (!inst && !pm_is_dir(dir)) { free(dir); return pm_errc(e, "plugin.not_installed", PMA("id", id), "плагин %s не установлен", id); }
     struct ydoc *man = pm_manifest(id);
     const struct ynode *m = man ? ydoc_root(man) : NULL;
     if (!force) {
@@ -1502,14 +1507,14 @@ int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_
             ydoc_free(om);
         }
         if (users) {
-            pm_errf(e, "плагин %s нужен плагинам %s; снять всё равно — с --force", id, users);
+            pm_errc(e, "plugin.needed_by_plugins", PMA("id", id, "users", users), "плагин %s нужен плагинам %s; снять всё равно — с --force", id, users);
             free(users); free(dir);
             if (man) ydoc_free(man);
             return -1;
         }
         char *needs = spec_needs(ynode_get(ynode_get(m, "steer"), "kinds"));
         if (needs) {
-            pm_errf(e, "плагин %s нужен выходам: %s; снять всё равно — с --force", id, needs);
+            pm_errc(e, "plugin.needed_by_outputs", PMA("id", id, "outputs", needs), "плагин %s нужен выходам: %s; снять всё равно — с --force", id, needs);
             free(needs); free(dir);
             if (man) ydoc_free(man);
             return -1;
@@ -1518,11 +1523,11 @@ int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_
     const char *ver = inst && inst->version ? inst->version : m ? yn_str(m, "version") : NULL;
     char *verc = s_or_null(ver);
     if (m) {
-        struct pm_err pe = {{0}};
+        struct pm_err pe = {0};
         if (run_script(id, dir, m, "prerm", "", &pe) != 0) pm_progress(x, "%s", pe.msg);
     }
     if (man) ydoc_free(man);
-    if (pm_rmrf(dir) != 0) { pm_errf(e, "не удалить %s: %s", dir, strerror(errno)); free(dir); free(verc); return -1; }
+    if (pm_rmrf(dir) != 0) { pm_errc(e, "plugin.remove_failed", PMA("path", dir, "why", strerror(errno)), "не удалить %s: %s", dir, strerror(errno)); free(dir); free(verc); return -1; }
     char *prev = pm_fmt("%s/.prev/%s", pm_root(), id);
     pm_rmrf(prev);
     free(prev);
@@ -1532,10 +1537,10 @@ int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_
         free(conf);
     }
     pm_state_del(&x->st, id);
-    struct pm_err se = {{0}};
+    struct pm_err se = {0};
     if (pm_state_save(&x->st, &se) != 0) { *e = se; free(dir); free(verc); return -1; }
     pm_keepd_write(x);
-    struct pm_err re = {{0}};
+    struct pm_err re = {0};
     if (pm_daemon_reload(x, &re) != 0) pm_progress(x, "%s", re.msg);
     pm_event(x, id, "removed", verc, NULL, NULL);
     free(dir);
@@ -1545,15 +1550,15 @@ int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_
 
 int pm_set_enabled(struct pm_ctx *x, const char *id, int on, struct pm_err *e) {
     struct pm_inst *inst = pm_state_find(&x->st, id);
-    if (!inst) return pm_errf(e, "плагин %s не установлен", id);
+    if (!inst) return pm_errc(e, "plugin.not_installed", PMA("id", id), "плагин %s не установлен", id);
     if (on) {
         struct ydoc *man = pm_manifest(id);
-        if (!man) return pm_errf(e, "файлов плагина %s нет — поставьте его заново", id);
+        if (!man) return pm_errc(e, "plugin.files_missing", PMA("id", id), "файлов плагина %s нет — поставьте его заново", id);
         char cb[512];
         const char *cw = pm_compat_why(&x->tg, ynode_get(ydoc_root(man), "compat"), cb, sizeof(cb));
         if (cw) {
             char *w = pm_fmt("%s %s", id, cw);
-            pm_errf(e, "%s", w);
+            pm_compat_err(e, id, NULL, cw);
             free(w);
             ydoc_free(man);
             return -1;
@@ -1563,9 +1568,9 @@ int pm_set_enabled(struct pm_ctx *x, const char *id, int on, struct pm_err *e) {
     int spec_ok = x->no_daemon ? 1 : daemon_spec_ok(x);
     pm_inst_set(&inst->state, on ? "enabled" : "disabled");
     pm_inst_set(&inst->why, NULL);
-    struct pm_err se = {{0}};
+    struct pm_err se = {0};
     if (pm_state_save(&x->st, &se) != 0) { *e = se; return -1; }
-    struct pm_err re = {{0}};
+    struct pm_err re = {0};
     if (pm_daemon_reload(x, &re) != 0) {
         if (on && spec_ok) {
             inst = pm_state_find(&x->st, id);
@@ -1573,7 +1578,7 @@ int pm_set_enabled(struct pm_ctx *x, const char *id, int on, struct pm_err *e) {
             pm_inst_set(&inst->why, re.msg);
             pm_state_save(&x->st, &se);
             pm_event(x, id, "failed", inst->version, NULL, re.msg);
-            return pm_errf(e, "%s", re.msg);
+            return pm_errcopy(e, &re);
         }
         pm_progress(x, "%s", re.msg);
     }

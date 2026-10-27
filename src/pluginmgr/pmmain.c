@@ -48,18 +48,36 @@ void pm_progress(struct pm_ctx *x, const char *fmt, ...) {
 
 /* ---- ответы ---- */
 
-static int fail(struct pm_ctx *x, const char *msg) {
-    fprintf(stderr, "steer plugin: %s\n", msg);
+/* Поля отказа в открытый объект: error, code, args (docs/errors.md). Подстановки уже лежат в args как объект JSON. */
+static void jw_fail_fields(struct jw *w, const char *msg, const char *code, const char *args) {
+    jw_kstr(w, "error", msg);
+    if (code && *code) {
+        jw_kstr(w, "code", code);
+        jw_key(w, "args");
+        jw_raw(w, args && *args ? args : "{}");
+    }
+}
+
+/* Отказ с готовым pm_err: текст, код, подстановки. */
+static int fail_e(struct pm_ctx *x, const struct pm_err *e) {
+    fprintf(stderr, "steer plugin: %s\n", e->msg);
     if (x->json) {
         struct jw w;
         jw_init(&w, stdout);
         jw_obj(&w);
         jw_kbool(&w, "ok", 0);
-        jw_kstr(&w, "error", msg);
+        jw_fail_fields(&w, e->msg, e->code, e->args);
         jw_end(&w);
         fputc('\n', stdout);
     }
     return 1;
+}
+
+/* Отказ с кодом и уже собранным текстом; kv — пары «имя, значение» подстановок (PMA или NULL). */
+static int failc(struct pm_ctx *x, const char *code, const char *const *kv, const char *msg) {
+    struct pm_err e = {0};
+    pm_errc(&e, code, kv, "%s", msg);
+    return fail_e(x, &e);
 }
 
 static int usage(void) {
@@ -298,7 +316,7 @@ static int cmd_list(struct pm_ctx *x, const char *only, int deep) {
             for (size_t i = 0; i < n; i++) free(ids[i]);
             free(ids);
             char *m = pm_fmt("плагин %s не установлен", only);
-            int r = fail(x, m);
+            int r = failc(x, "plugin.not_installed", PMA("id", only), m);
             free(m);
             return r;
         }
@@ -361,7 +379,7 @@ static int cmd_search(struct pm_ctx *x, const char *q) {
     char *errs = NULL;
     for (size_t i = 0; i < x->repos.n; i++) {
         struct pm_repo *r = &x->repos.v[i];
-        struct pm_err e = {{0}};
+        struct pm_err e = {0};
         if (pm_index_get(r, 1, &e) != 0) {
             char *t = pm_fmt("%s%s%s", errs ? errs : "", errs ? "; " : "", e.msg);
             free(errs);
@@ -381,7 +399,7 @@ static int cmd_search(struct pm_ctx *x, const char *q) {
                 if (!tag) continue;
             }
             struct pm_cand c;
-            struct pm_err se = {{0}};
+            struct pm_err se = {0};
             int ok = pm_select(x, r, id, NULL, NULL, "full", NULL, &c, &se) == 0;
             /* Самая новая версия вообще — для показа несовместимых. */
             const struct ynode *vs = ynode_get(pl, "versions"), *latest = NULL;
@@ -490,8 +508,8 @@ static int name_ok(const char *s) {
 }
 
 static int cmd_repo_add(struct pm_ctx *x, const char *url, const char *keyid, const char *keyfile) {
-    if (strncmp(url, "https://", 8) && strncmp(url, "http://", 7)) return fail(x, "адрес репозитория — https://…");
-    if (strpbrk(url, " \t\r\n")) return fail(x, "в адресе репозитория недопустимые знаки");
+    if (strncmp(url, "https://", 8) && strncmp(url, "http://", 7)) return failc(x, "plugin.repo_url_scheme", NULL, "адрес репозитория — https://…");
+    if (strpbrk(url, " \t\r\n")) return failc(x, "plugin.repo_url_chars", NULL, "в адресе репозитория недопустимые знаки");
     size_t kn = 0;
     char *kt = NULL;
     if (keyfile) kt = pm_read(keyfile, &kn);
@@ -508,16 +526,16 @@ static int cmd_repo_add(struct pm_ctx *x, const char *url, const char *keyid, co
         kt[kn] = '\0';
     }
     struct sigv_key k;
-    if (!kt || sigv_parse_key(kt, kn, &k) != 0) { free(kt); return fail(x, "ключ не распознан"); }
+    if (!kt || sigv_parse_key(kt, kn, &k) != 0) { free(kt); return failc(x, "plugin.key_unreadable", NULL, "ключ не распознан"); }
     char hex[17];
     sigv_keynum_hex(k.keynum, hex);
     if (strcasecmp(hex, keyid)) {
         char *m = pm_fmt("номер ключа %s не совпадает с ключом (%s)", keyid, hex);
-        int r = fail(x, m);
+        int r = failc(x, "plugin.key_mismatch", PMA("keyid", keyid, "hex", hex), m);
         free(m); free(kt);
         return r;
     }
-    if (pm_key_revoked(hex)) { free(kt); return fail(x, "этот ключ отозван"); }
+    if (pm_key_revoked(hex)) { free(kt); return failc(x, "plugin.key_revoked", NULL, "этот ключ отозван"); }
     /* Индекс — по адресу, подпись — этим ключом; имя репозитория — из индекса. */
     char *iu = pm_path(url, "index.json"), *su = pm_path(url, "index.json.sig");
     char *body = NULL, *sig = NULL;
@@ -525,13 +543,13 @@ static int cmd_repo_add(struct pm_ctx *x, const char *url, const char *keyid, co
     char why[256] = "";
     if (pm_http_mem(iu, &body, &bn, why, sizeof(why)) != 0) {
         char *m = pm_fmt("индекс %s не скачался: %s", iu, why);
-        int r = fail(x, m);
+        int r = failc(x, "plugin.index_url_download", PMA("url", iu, "why", why), m);
         free(m); free(iu); free(su); free(kt);
         return r;
     }
     if (pm_http_mem(su, &sig, &sn, why, sizeof(why)) != 0) {
         char *m = pm_fmt("подпись индекса %s не скачалась: %s", su, why);
-        int r = fail(x, m);
+        int r = failc(x, "plugin.index_sig_download", PMA("url", su, "why", why), m);
         free(m); free(iu); free(su); free(kt); free(body);
         return r;
     }
@@ -539,32 +557,32 @@ static int cmd_repo_add(struct pm_ctx *x, const char *url, const char *keyid, co
     struct pm_keyset ks = {0};
     ks.k = &k;
     ks.n = 1;
-    struct pm_err e = {{0}};
+    struct pm_err e = {0};
     int vr = pm_sig_check(&ks, sig, sn, body, bn, "индекс репозитория", &e);
     free(sig);
-    if (vr != 0) { free(body); free(kt); return fail(x, e.msg); }
+    if (vr != 0) { free(body); free(kt); return fail_e(x, &e); }
     struct ydoc *d = pm_json_parse(body, bn, "index.json", &e);
     free(body);
-    if (!d) { free(kt); return fail(x, e.msg); }
+    if (!d) { free(kt); return fail_e(x, &e); }
     const struct ynode *root = ydoc_root(d);
     const char *name = yn_str(ynode_get(root, "repo"), "id");
-    if (yn_long(root, "schema", -1) != 1) { ydoc_free(d); free(kt); return fail(x, "индекс нового формата — обновите ядро"); }
-    if (!name_ok(name)) { ydoc_free(d); free(kt); return fail(x, "индекс не называет репозиторий (repo.id)"); }
+    if (yn_long(root, "schema", -1) != 1) { ydoc_free(d); free(kt); return failc(x, "plugin.index_new_format_url", NULL, "индекс нового формата — обновите ядро"); }
+    if (!name_ok(name)) { ydoc_free(d); free(kt); return failc(x, "plugin.index_no_name", NULL, "индекс не называет репозиторий (repo.id)"); }
     struct pm_repo *ex = pm_repo_find(&x->repos, name);
     if (ex && ex->official) {
         char *m = pm_fmt("репозиторий %s — официальный, сторонний под этим именем не подключается", name);
-        int r = fail(x, m);
+        int r = failc(x, "plugin.repo_official_name", PMA("name", name), m);
         free(m); ydoc_free(d); free(kt);
         return r;
     }
     if (ex && (!ex->url || strcmp(ex->url, url))) {
         char *m = pm_fmt("репозиторий %s уже подключён с адресом %s", name, ex->url ? ex->url : "");
-        int r = fail(x, m);
+        int r = failc(x, "plugin.repo_exists", PMA("name", name, "url", ex->url ? ex->url : ""), m);
         free(m); ydoc_free(d); free(kt);
         return r;
     }
     char *kp = pm_fmt("%s/keys/%s/%s.pub", pm_etc(), name, hex);
-    if (pm_write_atomic(kp, kt, kn, 0644) != 0) { free(kp); ydoc_free(d); free(kt); return fail(x, "не записать ключ"); }
+    if (pm_write_atomic(kp, kt, kn, 0644) != 0) { free(kp); ydoc_free(d); free(kt); return failc(x, "plugin.key_write_failed", NULL, "не записать ключ"); }
     free(kp);
     free(kt);
     struct pm_repo nr = {0};
@@ -578,7 +596,7 @@ static int cmd_repo_add(struct pm_ctx *x, const char *url, const char *keyid, co
     nr.nkeys = 1;
     nr.auto_update = 1;
     nr.last_generated = (char *)yn_str(root, "generated");
-    if (pm_repo_save(&nr, &e) != 0) { ydoc_free(d); return fail(x, e.msg); }
+    if (pm_repo_save(&nr, &e) != 0) { ydoc_free(d); return fail_e(x, &e); }
     if (x->json) {
         struct jw w;
         jw_init(&w, stdout);
@@ -598,8 +616,8 @@ static int cmd_repo_add(struct pm_ctx *x, const char *url, const char *keyid, co
 
 static int cmd_repo_del(struct pm_ctx *x, const char *name) {
     struct pm_repo *r = pm_repo_find(&x->repos, name);
-    if (!r) { char *m = pm_fmt("репозитория %s нет", name); int rc = fail(x, m); free(m); return rc; }
-    if (r->official) return fail(x, "официальный репозиторий не отключается");
+    if (!r) { char *m = pm_fmt("репозитория %s нет", name); int rc = failc(x, "plugin.repo_not_found", PMA("name", name), m); free(m); return rc; }
+    if (r->official) return failc(x, "plugin.repo_official_keep", NULL, "официальный репозиторий не отключается");
     if (r->file) unlink(r->file);
     char *kd = pm_fmt("%s/keys/%s", pm_etc(), name);
     pm_rmrf(kd);
@@ -667,9 +685,9 @@ static int cmd_install(struct pm_ctx *x, const char *id, const char *ver, const 
     o.allow_bad = ver != NULL;
     o.allow_seed = 1;
     struct pm_result res;
-    struct pm_err e = {{0}};
+    struct pm_err e = {0};
     int rc = pm_install(x, &rq, file ? 0 : 1, &o, &res, &e);
-    if (rc != 0) { pm_result_free(&res); return fail(x, e.msg); }
+    if (rc != 0) { pm_result_free(&res); return fail_e(x, &e); }
     emit_result(x, &res, NULL, NULL, 0);
     pm_result_free(&res);
     return 0;
@@ -711,6 +729,7 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
     struct pm_result all = {0};
     char **errs = NULL;
     size_t nerr = 0;
+    struct pm_err first_err = {0};     /* первый отказ целиком — его код и подстановки уходят в ответ */
     int waiting = 0, security_now = 0;
     const char *window = x->st.auto_window ? x->st.auto_window : "03:00-05:00";
     int inwin = in_window(window, now, NULL);
@@ -728,8 +747,9 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
             if (auto_ && (!p->auto_update || p->pinned || (p->state && !strcmp(p->state, "failed")))) continue;
             struct pm_repo *r = pm_repo_find(&x->repos, p->repo);
             if (!r || (auto_ && !r->auto_update)) continue;
-            struct pm_err e = {{0}};
+            struct pm_err e = {0};
             if (pm_index_get(r, 1, &e) != 0) {
+                if (!nerr) first_err = e;
                 errs = pm_realloc(errs, sizeof(char *) * (nerr + 1));
                 errs[nerr++] = pm_strdup(e.msg);
                 continue;
@@ -749,6 +769,7 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
             struct pm_result res;
             char *pid = pm_strdup(p->id);
             if (pm_install(x, &rq, 1, &o, &res, &e) != 0) {
+                if (!nerr) first_err = e;
                 errs = pm_realloc(errs, sizeof(char *) * (nerr + 1));
                 errs[nerr++] = pm_strdup(e.msg);
             }
@@ -764,7 +785,7 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
     }
     if (id && !pm_state_find(&x->st, id)) {
         char *m = pm_fmt("плагин %s не установлен", id);
-        int r = fail(x, m);
+        int r = failc(x, "plugin.not_installed", PMA("id", id), m);
         free(m);
         pm_result_free(&all);
         return r;
@@ -797,7 +818,7 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
     int rc = 0;
     if (nerr && !all.n && !auto_) {
         char *m = pm_strdup(errs[0]);
-        rc = fail(x, m);
+        rc = fail_e(x, &first_err);
         free(m);
     } else if (x->json) {
         struct jw w;
@@ -816,7 +837,7 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
         jw_aend(&w);
         if (auto_) { jw_kint(&w, "waiting", waiting); jw_kint(&w, "security", security_now); jw_kstr(&w, "next", x->st.next_check); }
         if (nerr) {
-            jw_kstr(&w, "error", errs[0]);
+            jw_fail_fields(&w, errs[0], first_err.code, first_err.args);
             jw_key(&w, "errors");
             jw_arr(&w);
             for (size_t i = 0; i < nerr; i++) jw_str(&w, errs[i]);
@@ -868,14 +889,14 @@ static int ensure_one(struct pm_ctx *x, const char *id, struct pm_result *all, c
     struct pm_result res;
     int rc = pm_install(x, &rq, 1, &o, &res, e);
     if (rc != 0 && pm_seed_repo()) {
-        struct pm_err se = {{0}};
+        struct pm_err se = {0};
         pm_result_free(&res);
         o.seed_only = 1;
         pm_progress(x, "%s из сети не встал (%s) — ставлю из семени", id, e->msg);
         rc = pm_install(x, &rq, 1, &o, &res, &se);
         if (rc != 0) {
             char *net = pm_strdup(e->msg);
-            pm_errf(e, "%s; из семени: %s", net, se.msg);
+            pm_errc(e, "plugin.net_and_seed", PMA("net", net, "seed", se.msg), "%s; из семени: %s", net, se.msg);
             free(net);
         }
     }
@@ -896,11 +917,11 @@ static int cmd_ensure(struct pm_ctx *x, char **ids, size_t n) {
     char **present = NULL;
     size_t np = 0;
     for (size_t i = 0; i < n; i++) {
-        struct pm_err e = {{0}};
+        struct pm_err e = {0};
         if (ensure_one(x, ids[i], &all, &present, &np, &e) != 0) {
             free(present);
             pm_result_free(&all);
-            return fail(x, e.msg);
+            return fail_e(x, &e);
         }
     }
     emit_result(x, &all, "present", present, np);
@@ -924,7 +945,7 @@ static void spec_kinds(const char *path, struct idset *kinds, int *have) {
     char *buf = pm_read(path, &n);
     if (!buf) return;
     *have = 1;
-    struct err ye = {{0}};
+    struct err ye = {0};
     struct ydoc *d = ydoc_parse_buf(buf, n, path, &ye);
     if (d) {
         const struct ynode *outs = ynode_get(ydoc_root(d), "outputs");
@@ -969,7 +990,7 @@ static const char *seed_plugin_for(const struct ynode *plugins, const char *kind
 static void migrate_refresh(struct pm_ctx *x, struct pm_result *all, struct idset *bad, size_t *nfail) {
     struct pm_repo *sr = pm_seed_repo();
     if (!sr) return;
-    struct pm_err e = {{0}};
+    struct pm_err e = {0};
     if (pm_index_get(sr, 0, &e) != 0) goto out;
     const char *rid = yn_str(ynode_get(sr->iroot, "repo"), "id");
     if (!rid) goto out;
@@ -982,7 +1003,7 @@ static void migrate_refresh(struct pm_ctx *x, struct pm_result *all, struct idse
         if (!p->version || !p->repo || p->unsigned_ || strcmp(p->repo, rid)) continue;
         if (!pm_index_plugin(sr, p->id)) continue;
         struct pm_cand c;
-        struct pm_err se = {{0}};
+        struct pm_err se = {0};
         if (pm_select(x, sr, p->id, NULL, NULL, p->variant ? p->variant : "full", NULL, &c, &se) != 0) continue;
         if (pm_ver_cmp(c.version, p->version) <= 0) continue;
         idset_add(&ids, p->id);
@@ -994,7 +1015,7 @@ static void migrate_refresh(struct pm_ctx *x, struct pm_result *all, struct idse
         o.seed_only = 1;
         o.group = 1;
         struct pm_result res;
-        struct pm_err ie = {{0}};
+        struct pm_err ie = {0};
         if (pm_install(x, rq, ids.n, &o, &res, &ie) != 0) {
             char *m = pm_fmt("обновление из семени: %s", ie.msg);
             idset_add(bad, m);
@@ -1020,7 +1041,7 @@ out:
  * (migrate.json, его пишет pre-upgrade/preinst steer-core 2.1); при первой установке — все `default: true`
  * индекса семени. Работает без демона; неудача одного плагина остальные не останавливает. */
 static int cmd_migrate(struct pm_ctx *x) {
-    struct pm_err e = {{0}};
+    struct pm_err e = {0};
     /* Новое ядро — новая проверка: пометки «ядро не перечитало плагины» прежних версий снимаются. */
     if (pm_bad_clear_reload(&x->st)) pm_state_save(&x->st, &e);
     struct idset kinds = {0}, want = {0};
@@ -1052,7 +1073,7 @@ static int cmd_migrate(struct pm_ctx *x) {
     const struct ynode *plugins = idx ? ynode_get(ydoc_root(idx), "plugins") : NULL;
     if (!plugins) {
         free(mj);
-        return fail(x, "в семени нет индекса: нечего ставить");
+        return failc(x, "plugin.seed_no_index", NULL, "в семени нет индекса: нечего ставить");
     }
     for (size_t i = 0; i < kinds.n; i++) {
         const char *id = seed_plugin_for(plugins, kinds.v[i]);
@@ -1072,7 +1093,7 @@ static int cmd_migrate(struct pm_ctx *x) {
     struct idset bad = {0};
     for (size_t i = 0; i < want.n; i++) {
         if (!ynode_get(plugins, want.v[i])) continue;
-        struct pm_err ee = {{0}};
+        struct pm_err ee = {0};
         if (ensure_one(x, want.v[i], &all, &present, &np, &ee) != 0) {
             char *m = pm_fmt("%s: %s", want.v[i], ee.msg);
             idset_add(&bad, m);
@@ -1130,11 +1151,11 @@ static int job_fork(struct pm_ctx *x, int *rc) {
     char *jd = jobs_dir();
     char *dir = pm_path(jd, id);
     free(jd);
-    if (pm_mkdirs(dir) != 0) { free(dir); *rc = fail(x, "не завести задание"); return 0; }
+    if (pm_mkdirs(dir) != 0) { free(dir); *rc = failc(x, "plugin.job_start_failed", NULL, "не завести задание"); return 0; }
     fflush(stdout);
     fflush(stderr);
     pid_t pid = fork();
-    if (pid < 0) { free(dir); *rc = fail(x, "не завести задание"); return 0; }
+    if (pid < 0) { free(dir); *rc = failc(x, "plugin.job_start_failed", NULL, "не завести задание"); return 0; }
     if (pid > 0) {
         printf(x->json ? "{\"ok\":true,\"job\":\"%s\"}\n" : "задание %s\n", id);
         free(dir);
@@ -1173,11 +1194,11 @@ static void job_finish(int rc) {
 }
 
 static int cmd_job(struct pm_ctx *x, const char *id) {
-    if (!id || strchr(id, '/') || id[0] == '.') return fail(x, "такого задания нет");
+    if (!id || strchr(id, '/') || id[0] == '.') return failc(x, "plugin.job_not_found", NULL, "такого задания нет");
     char *jd = jobs_dir();
     char *dir = pm_path(jd, id);
     free(jd);
-    if (!pm_is_dir(dir)) { free(dir); return fail(x, "такого задания нет"); }
+    if (!pm_is_dir(dir)) { free(dir); return failc(x, "plugin.job_not_found", NULL, "такого задания нет"); }
     char *rcp = pm_path(dir, "rc"), *outp = pm_path(dir, "out"), *logp = pm_path(dir, "log"), *pidp = pm_path(dir, "pid");
     char *rcs = pm_read(rcp, NULL), *out = pm_read(outp, NULL), *log = pm_read(logp, NULL), *pids = pm_read(pidp, NULL);
     /* Последняя строка хода. */
@@ -1206,7 +1227,11 @@ static int cmd_job(struct pm_ctx *x, const char *id) {
         if (!strcmp(state, "failed")) {
             const char *er = d ? yn_str(ydoc_root(d), "error") : NULL;
             jw_kstr(&w, "error", er ? er : rcs ? (progress && *progress ? progress : "задание не удалось") : "задание оборвано");
-            jw_kstr(&w, "code", "failed");
+            /* Код и подстановки — те, что менеджер записал в итог задания; нет итога — общий код. */
+            const char *cd = d ? yn_str(ydoc_root(d), "code") : NULL;
+            const struct ynode *ar = d ? ynode_get(ydoc_root(d), "args") : NULL;
+            jw_kstr(&w, "code", cd ? cd : "plugin.job_failed");
+            if (ar) jw_knode(&w, "args", ar);
         }
         if (d) { jw_knode(&w, "result", ydoc_root(d)); ydoc_free(d); }
     }
@@ -1253,14 +1278,14 @@ int pm_main(int argc, char **argv) {
     const char *act = pos[0];
     if (auto_) x.by = "auto";
     int rc = 2;
-    struct pm_err e = {{0}};
-    if (pm_state_load(&x.st, &e) != 0 || pm_repos_load(&x.repos, &e) != 0) { rc = fail(&x, e.msg); goto out; }
+    struct pm_err e = {0};
+    if (pm_state_load(&x.st, &e) != 0 || pm_repos_load(&x.repos, &e) != 0) { rc = fail_e(&x, &e); goto out; }
     pm_target_load(&x.tg);
     if (!x.tg.arch) x.tg.arch = pm_strdup("");
     /* Только чтение — без блокировки. */
     if (!strcmp(act, "list") && npos == 1) { rc = cmd_list(&x, NULL, 0); goto out; }
     if (!strcmp(act, "status") && npos <= 2) {
-        if (npos == 2 && !id_ok(pos[1])) { rc = fail(&x, "недопустимое имя плагина"); goto out; }
+        if (npos == 2 && !id_ok(pos[1])) { rc = failc(&x, "plugin.bad_name", NULL, "недопустимое имя плагина"); goto out; }
         rc = cmd_list(&x, npos == 2 ? pos[1] : NULL, 1);
         goto out;
     }
@@ -1279,15 +1304,15 @@ int pm_main(int argc, char **argv) {
     if (!known) { rc = usage(); goto out; }
     if (!(!strcmp(act, "repo"))) {
         for (size_t i = 1; i < npos; i++) {
-            if (!strcmp(act, "install") && i == 2) { if (!pm_ver_ok(pos[i])) { rc = fail(&x, "недопустимая версия"); goto out; } continue; }
+            if (!strcmp(act, "install") && i == 2) { if (!pm_ver_ok(pos[i])) { rc = failc(&x, "plugin.bad_version", NULL, "недопустимая версия"); goto out; } continue; }
             if (!strcmp(act, "autoupdate") && i == 2) continue;
-            if (!id_ok(pos[i])) { rc = fail(&x, "недопустимое имя плагина"); goto out; }
+            if (!id_ok(pos[i])) { rc = failc(&x, "plugin.bad_name", NULL, "недопустимое имя плагина"); goto out; }
         }
     }
-    if (pm_lock() != 0) { rc = fail(&x, "busy: менеджер плагинов занят другим запросом — повторите позже"); goto out; }
+    if (pm_lock() != 0) { rc = failc(&x, "plugin.busy", NULL, "busy: менеджер плагинов занят другим запросом — повторите позже"); goto out; }
     /* Состояние — заново под блокировкой: прочитанное до неё могло устареть. */
     pm_state_free(&x.st);
-    if (pm_state_load(&x.st, &e) != 0) { rc = fail(&x, e.msg); goto out; }
+    if (pm_state_load(&x.st, &e) != 0) { rc = fail_e(&x, &e); goto out; }
     if (job && (!strcmp(act, "install") || !strcmp(act, "update") || !strcmp(act, "ensure"))) {
         int prc = 0;
         if (!job_fork(&x, &prc)) { rc = prc; goto out_nojob; }
@@ -1297,28 +1322,28 @@ int pm_main(int argc, char **argv) {
     else if (!strcmp(act, "ensure")) rc = cmd_ensure(&x, ens + 1, nens - 1);
     else if (!strcmp(act, "migrate")) rc = cmd_migrate(&x);
     else if (!strcmp(act, "remove")) {
-        rc = pm_remove(&x, pos[1], force, purge, &e) == 0 ? 0 : fail(&x, e.msg);
+        rc = pm_remove(&x, pos[1], force, purge, &e) == 0 ? 0 : fail_e(&x, &e);
         if (!rc && x.json) printf("{\"ok\":true,\"id\":\"%s\"}\n", pos[1]);
     } else if (!strcmp(act, "enable") || !strcmp(act, "disable")) {
-        rc = pm_set_enabled(&x, pos[1], !strcmp(act, "enable"), &e) == 0 ? 0 : fail(&x, e.msg);
+        rc = pm_set_enabled(&x, pos[1], !strcmp(act, "enable"), &e) == 0 ? 0 : fail_e(&x, &e);
         if (!rc && x.json) printf("{\"ok\":true,\"id\":\"%s\"}\n", pos[1]);
     } else if (!strcmp(act, "autoupdate")) {
         struct pm_inst *p = pm_state_find(&x.st, pos[1]);
         int on = !strcmp(pos[2], "on");
-        if (!on && strcmp(pos[2], "off")) rc = fail(&x, "нужно on или off");
-        else if (!p) { char *m = pm_fmt("плагин %s не установлен", pos[1]); rc = fail(&x, m); free(m); }
-        else if (on && p->unsigned_) rc = fail(&x, "у плагина без подписи автообновления нет");
+        if (!on && strcmp(pos[2], "off")) rc = failc(&x, "plugin.on_off", NULL, "нужно on или off");
+        else if (!p) { char *m = pm_fmt("плагин %s не установлен", pos[1]); rc = failc(&x, "plugin.not_installed", PMA("id", pos[1]), m); free(m); }
+        else if (on && p->unsigned_) rc = failc(&x, "plugin.no_autoupdate_unsigned", NULL, "у плагина без подписи автообновления нет");
         else {
             p->auto_update = on;
-            rc = pm_state_save(&x.st, &e) == 0 ? 0 : fail(&x, e.msg);
+            rc = pm_state_save(&x.st, &e) == 0 ? 0 : fail_e(&x, &e);
             if (!rc && x.json) printf("{\"ok\":true,\"id\":\"%s\",\"auto_update\":%s}\n", pos[1], on ? "true" : "false");
         }
     } else if (!strcmp(act, "repo")) {
         if (!strcmp(pos[1], "add")) {
-            if (strlen(pos[3]) != 16 || strspn(pos[3], "0123456789abcdefABCDEF") != 16) rc = fail(&x, "номер ключа — 16 знаков hex");
+            if (strlen(pos[3]) != 16 || strspn(pos[3], "0123456789abcdefABCDEF") != 16) rc = failc(&x, "plugin.key_number_form", NULL, "номер ключа — 16 знаков hex");
             else rc = cmd_repo_add(&x, pos[2], pos[3], keyfile);
         } else {
-            if (!name_ok(pos[2])) rc = fail(&x, "недопустимое имя репозитория");
+            if (!name_ok(pos[2])) rc = failc(&x, "plugin.repo_bad_name", NULL, "недопустимое имя репозитория");
             else rc = cmd_repo_del(&x, pos[2]);
         }
     }

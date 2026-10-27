@@ -32,8 +32,23 @@
 #define PM_STEER_ABI CLI_STEER_ABI
 
 /* ---- ошибка ---- */
-struct pm_err { char msg[4096]; };
+/* Отказ менеджера: текст (русский, для журнала и командной строки) и машинная часть — code (стабильное слово,
+ * docs/errors.md) и args (объект JSON со строковыми подстановками). У pm_errf кода нет. */
+struct pm_err { char msg[4096]; char code[64]; char args[1024]; };
 int pm_errf(struct pm_err *e, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+/* Отказ с кодом: kv — пары «имя, значение» (PMA("id", id, …) или NULL), по порядку подстановок fmt. */
+#define PMA(...) ((const char *const[]){ __VA_ARGS__, NULL })
+int pm_errc(struct pm_err *e, const char *code, const char *const *kv, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+/* Перенести отказ целиком (текст, код, подстановки) из src в dst. */
+int pm_errcopy(struct pm_err *dst, const struct pm_err *src);
+/* Добавить подстановку к отказу. */
+void pm_err_arg(struct pm_err *e, const char *name, const char *val);
+/* Число и восьмеричный режим строкой для подстановок (буферы по кругу, живут до восьми вызовов). */
+const char *pm_itoa(long long v);
+const char *pm_oct(unsigned v);
+/* Отказ как объект JSON одной строкой с ok:false, error, code, args. */
+void pm_err_json(const struct pm_err *e, char *buf, size_t cap);
 
 /* ---- пути (pmutil.c). Подмены — переменные окружения STEER_PLUGIN_* (стенды). ---- */
 const char *pm_root(void);      /* /usr/lib/steer/plugins            STEER_PLUGIN_DIR */
@@ -92,6 +107,7 @@ void jw_str(struct jw *w, const char *s);   /* NULL — null */
 void jw_int(struct jw *w, long long v);
 void jw_bool(struct jw *w, int v);
 void jw_null(struct jw *w);
+void jw_raw(struct jw *w, const char *json);   /* готовое значение JSON как есть */
 void jw_node(struct jw *w, const struct ynode *n);   /* NULL — null */
 void jw_kstr(struct jw *w, const char *k, const char *s);
 void jw_kint(struct jw *w, const char *k, long long v);
@@ -198,6 +214,7 @@ int pm_select(struct pm_ctx *x, struct pm_repo *r, const char *id, const char *r
               const char *exact, const char *variant, const char *below, struct pm_cand *c,
               struct pm_err *e);
 /* Причина несовместимости версии ver (NULL — совместима). */
+void pm_compat_err(struct pm_err *e, const char *id, const char *ver, const char *cw);
 const char *pm_compat_why(const struct pm_target *t, const struct ynode *compat, char *buf,
                           size_t n);
 

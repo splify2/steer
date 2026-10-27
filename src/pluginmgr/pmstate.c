@@ -36,10 +36,10 @@ int pm_state_load(struct pm_state *s, struct pm_err *e) {
     memset(s, 0, sizeof(*s));
     s->retry_s = 0;
     char *p = state_path();
-    struct pm_err le = {{0}};
+    struct pm_err le = {0};
     struct ydoc *d = pm_json_load(p, &le);
     if (!d) {
-        if (le.msg[0]) { pm_errf(e, "%s не читается: %s", p, le.msg); free(p); return -1; }
+        if (le.msg[0]) { pm_errc(e, "plugin.file_unreadable", PMA("path", p, "why", le.msg), "%s не читается: %s", p, le.msg); free(p); return -1; }
         free(p);
         return 0;
     }
@@ -81,7 +81,7 @@ int pm_state_save(const struct pm_state *s, struct pm_err *e) {
     char *buf = NULL;
     size_t n = 0;
     FILE *f = open_memstream(&buf, &n);
-    if (!f) return pm_errf(e, "нет памяти");
+    if (!f) return pm_errc(e, "plugin.no_memory", NULL, "нет памяти");
     struct jw w;
     jw_init(&w, f);
     jw_obj(&w);
@@ -130,11 +130,11 @@ int pm_state_save(const struct pm_state *s, struct pm_err *e) {
     }
     jw_end(&w);
     fputc('\n', f);
-    if (fclose(f) != 0) { free(buf); return pm_errf(e, "нет памяти"); }
+    if (fclose(f) != 0) { free(buf); return pm_errc(e, "plugin.no_memory", NULL, "нет памяти"); }
     char *p = state_path();
     int r = pm_write_atomic(p, buf, n, 0644);
     free(buf);
-    if (r != 0) { pm_errf(e, "не записать %s", p); free(p); return -1; }
+    if (r != 0) { pm_errc(e, "plugin.write_failed", PMA("path", p), "не записать %s", p); free(p); return -1; }
     free(p);
     return 0;
 }
@@ -251,11 +251,11 @@ int pm_repos_load(struct pm_repos *rs, struct pm_err *e) {
         size_t l = strlen(de->d_name);
         if (de->d_name[0] == '.' || l < 6 || strcmp(de->d_name + l - 5, ".json")) continue;
         char *p = pm_path(dir, de->d_name);
-        struct pm_err le = {{0}};
+        struct pm_err le = {0};
         struct ydoc *doc = pm_json_load(p, &le);
         if (!doc) {
             closedir(d);
-            pm_errf(e, "репозиторий %s не читается: %s", p, le.msg);
+            pm_errc(e, "plugin.repo_unreadable", PMA("path", p, "why", le.msg), "репозиторий %s не читается: %s", p, le.msg);
             free(p); free(dir);
             return -1;
         }
@@ -297,7 +297,7 @@ int pm_repo_save(const struct pm_repo *x, struct pm_err *e) {
     char *buf = NULL;
     size_t n = 0;
     FILE *f = open_memstream(&buf, &n);
-    if (!f) return pm_errf(e, "нет памяти");
+    if (!f) return pm_errc(e, "plugin.no_memory", NULL, "нет памяти");
     struct jw w;
     jw_init(&w, f);
     jw_obj(&w);
@@ -321,7 +321,7 @@ int pm_repo_save(const struct pm_repo *x, struct pm_err *e) {
     char *p = x->file ? pm_strdup(x->file) : pm_fmt("%s/repos.d/%s.json", pm_etc(), x->name);
     int r = pm_write_atomic(p, buf, n, 0644);
     free(buf);
-    if (r != 0) { pm_errf(e, "не записать %s", p); free(p); return -1; }
+    if (r != 0) { pm_errc(e, "plugin.write_failed", PMA("path", p), "не записать %s", p); free(p); return -1; }
     free(p);
     return 0;
 }
@@ -451,8 +451,8 @@ void pm_keys_free(struct pm_keyset *ks) {
 int pm_sig_check(const struct pm_keyset *ks, const char *sig, size_t sig_n, const void *msg,
                  size_t msg_n, const char *what, struct pm_err *e) {
     struct sigv_sigs ss = {0};
-    if (!sig || !sig_n) return pm_errf(e, "%s не подписан", what);
-    if (sigv_parse_sigs(sig, sig_n, &ss) != 0) return pm_errf(e, "подпись %s не разбирается", what);
+    if (!sig || !sig_n) return pm_errc(e, "plugin.unsigned", PMA("what", what), "%s не подписан", what);
+    if (sigv_parse_sigs(sig, sig_n, &ss) != 0) return pm_errc(e, "plugin.signature_unreadable", PMA("what", what), "подпись %s не разбирается", what);
     int r = sigv_verify_blocks(ks->k, ks->n, &ss, msg, msg_n, NULL);
     if (r >= 0) { sigv_sigs_free(&ss); return 0; }
     if (r == SIGV_EKEYNUM) {
@@ -468,12 +468,12 @@ int pm_sig_check(const struct pm_keyset *ks, const char *sig, size_t sig_n, cons
         }
         sigv_sigs_free(&ss);
         if (revoked)
-            pm_errf(e, "%s подписан отозванным ключом %s", what, names);
+            pm_errc(e, "plugin.signed_revoked_key", PMA("what", what, "keys", names), "%s подписан отозванным ключом %s", what, names);
         else
-            pm_errf(e, "%s подписан ключом %s, такого ключа у ядра нет", what, names);
+            pm_errc(e, "plugin.signed_unknown_key", PMA("what", what, "keys", names), "%s подписан ключом %s, такого ключа у ядра нет", what, names);
         free(names);
         return -1;
     }
     sigv_sigs_free(&ss);
-    return pm_errf(e, "подпись %s не сходится — файл подменён или испорчен", what);
+    return pm_errc(e, "plugin.signature_mismatch", PMA("what", what), "подпись %s не сходится — файл подменён или испорчен", what);
 }
