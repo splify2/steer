@@ -183,29 +183,31 @@ rules:
 | `zapret` | — | убран в 2.1.0: отказ с названием замены (модуль DPI `recheck` или `kind: direct`) |
 | `tgws` | `domain` | мост Telegram; `domain` обязателен; `on_fail` — только `drop` |
 | `group` | `members`, `pick`, `default`, `tolerance`, `interval`, `url`, `idle_timeout`, `weights` | группа выходов (ниже) |
-| `warp` | `count`, `transport`, `countries`, `exclude_countries`, `pick`, `tolerance`, `interval`, `url`, `idle_timeout`, `on_fail`, `over`, `ipv6` (`nat` или `off`) | Cloudflare WARP: группа из `count` туннелей «<имя>.<n>» (по умолчанию один: самую быструю точку входа модуль держит у того же устройства) — `awg` или, с `transport: masque`, MASQUE (TUN модуля); `count` — 1..255; `transport` — `awg` (умолчание) или `masque`; `pick` — `latency` (умолчание) или `order`; `interval` по умолчанию 600 с; `ipv6` по умолчанию `nat`; имя выхода не длиннее 27 знаков. Регистрацию и точки ведёт модуль `steer-warpbox` ([docs/warp.md](warp.md)) |
+| `warp` | `count`, `transport`, `countries`, `exclude_countries`, `pick`, `tolerance`, `interval`, `url`, `idle_timeout`, `on_fail`, `over`, `ipv6` (`nat` или `off`) | Cloudflare WARP: группа из `count` туннелей «<имя>.<n>» (по умолчанию один: самую быструю точку входа модуль держит у того же устройства) — `awg` или, с `transport: masque`, MASQUE (TUN модуля); `count` — 1..255; `transport` — `awg` (умолчание) или `masque`; `pick` — `latency` (умолчание) или `order`; `interval` по умолчанию 600 с; `ipv6` по умолчанию `nat`; имя выхода не длиннее 27 знаков. Регистрацию и точки ведёт плагин warpbox ([docs/warp.md](warp.md)) |
 
 Почему VLESS пишется `kind: tunnel, protocol: vless`, а не `kind: vless`: туннель поверх потоков —
 общий стек, а протокол — его дайлер (docs/architecture.md, «Туннели: стек, дайлер, транспорт»).
 `kind: vless` в v2 — отказ с подсказкой. xsteer туннелем в этом смысле не является (везёт пакеты,
 а не потоки) и остаётся своим видом.
 
-`protocol: hysteria2` — клиент hysteria2 (QUIC), только с пакетом `steer-hysteria2` (в `steer-extended`
-он не входит; без него спека отвергается словами «kind hysteria2 требует пакет steer-hysteria2»).
-Ключи те же, что у vless, кроме `transport`: у hysteria2 транспорта нет, и ключ — ошибка разбора.
+`protocol: hysteria2` — клиент hysteria2 (QUIC), только с плагином hysteria2 (без него —
+«нужен плагин hysteria2 — поставить»).
+Ключи — `subscription`, `nodes`, `exclude`, `exclude_name`, `only`, `interval`, `silence` (схема вида
+плагина): транспорта, `insecure` (у hysteria2 это параметр ссылки узла) и пула из нескольких узлов у
+него нет, и такой ключ — ошибка разбора «неизвестный ключ».
 Узлы подписки — ссылки `hysteria2://` / `hy2://` либо конфиг Xray-core
 ([docs/hysteria2.md](hysteria2.md)). В v1 тот же выход пишется `kind: hysteria2`.
 
-`kind: warp` — выход через Cloudflare WARP одной строкой, только с пакетом `steer-warpbox`. Разбор
-разворачивает его в группу с именем выхода и члены `<имя>.1` … `<имя>.<count>`: вида `awg` с файлами
-`{etc}/warp/<имя>-<n>.conf` (файлы пишет модуль, а до первого файла член ждёт и ошибкой apply не
+`kind: warp` — выход через Cloudflare WARP одной строкой, только с плагином warpbox. Подготовка спеки
+(хук `expand` плагина) разворачивает его в группу с именем выхода и члены `<имя>.1` … `<имя>.<count>`: вида `awg` с файлами
+`{etc}/warp/<имя>-<n>.conf` (файлы пишет плагин, а до первого файла член ждёт и ошибкой apply не
 считается) или, с `transport: masque`, вида `plugin-device` — устройство TUN, которое держит процесс плагина-владельца
 (руками этот вид в спеке не пишется: его принимает только подготовленная спека и только с `owner`). Подмену IPv4 на устройствах членов ставит само ядро (`postrouting_nat4`). Имена членов заняты: выход с таким именем рядом — отказ разбора. `steer spec convert`
 печатает выход обратно одной строкой `kind: warp`. Ключи и поведение — [docs/warp.md](warp.md).
 
 `protocol: trojan`, `shadowsocks`, `socks`, `http`, `vmess` — клиенты протоколов прокси
-(podkop/forkop поверх steer через коннектор sing-box), только с пакетом `steer-proxy` (в
-`steer-extended` он не входит; без него — «kind … требует пакет steer-proxy»). Узлы из подписки:
+(podkop/forkop поверх steer через коннектор sing-box), только с плагином proxy (без него —
+«нужен плагин proxy — поставить»). Узлы из подписки:
 стандартные share-ссылки `trojan://`, `ss://`, `socks*://`, `http(s)://`, `vmess://`
 ([docs/proxy.md](proxy.md)). Ключа `transport` нет (транспорт берётся из ссылки узла); `insecure`
 есть у trojan, vmess и http (есть TLS), у ss и socks его нет.
@@ -218,8 +220,8 @@ rules:
 подписки, когда номера уехали. Вместе с `nodes` — пересечение, номера при этом те же (среди всех
 пригодных, как печатает `steer vless-nodes`); не осталось ни одного узла — туннель не
 поднимается и говорит «среди выбранных узлов нет ни одного с транспортом из transport», а не
-уходит на узел другого транспорта. `steer spec convert` печатает одно имя строкой, несколько —
-списком в порядке имён выше. Отказы: незнакомое имя, имя дважды, пустой список, ключ у другого
+уходит на узел другого транспорта. `steer spec convert` печатает список так, как он записан (одно имя — списком из
+одного). Отказы (по схеме вида): незнакомое имя, имя дважды, пустой список, ключ у другого
 вида. Параметры самих транспортов (`path`, `host`, заголовки) — у узла в подписке
 ([docs/vless.md](vless.md), «ws и httpupgrade»). Постквантовые поля узла — `encryption` (шифрование
 VLESS) и `pqv` (ключ проверки подписи ML-DSA-65 у Reality) — тоже приходят из подписки

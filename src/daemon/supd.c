@@ -115,6 +115,7 @@
 #include "platform.h"
 #include "spec.h"
 #include "evline.h"
+#include "plugin.h"
 #include "tabfmt.h"
 #include "daemon.h"
 #include "loop.h"
@@ -305,15 +306,16 @@ static void ev_health(struct supd *s, struct helper *h, const struct evline *e) 
  * обычной паузе — обновили пакет, и следующий запуск пройдёт. */
 static void mod_reject(struct supd *s, struct helper *h, const char *why) {
     struct helper_state *st = &h->st;
-    char reason[200];
-    snprintf(reason, sizeof(reason), "модуль %s %s", h->prog, why);
+    char reason[240];
+    if (h->plugin[0]) snprintf(reason, sizeof(reason), "плагин %s %s", h->plugin, why);
+    else snprintf(reason, sizeof(reason), "модуль %s %s", h->prog, why);
     fprintf(stderr, LOG_SW "%s %s — %s: отвергнут\n", h->cmd, h->name, reason);
     h->rejected = 1;
     st->up = 0;
     st->known = 1;
     st->said_down = 1;
     st->since = (long)time(NULL);
-    snprintf(st->why, sizeof(st->why), "%s", reason);
+    snprintf(st->why, sizeof(st->why), "%.199s", reason);
     emit_state(s, h, "helper-down", st->why);
     wake_watch(s, h);
     if (h->pid > 0) kill(h->pid, SIGTERM);
@@ -339,7 +341,32 @@ static void mod_hello(struct supd *s, struct helper *h, const struct evline *e) 
     h->hello = 1;
 }
 
-/* awg (модуль steer-warpbox, evline.h): файл члена группы `kind: warp` переписан — перенастроить его
+/* hello программы плагина (steer-api.md, 2.1): api — версия steer-api, которой она говорит: major — как
+ * у ядра, minor — не больше; mod — id плагина, чья это программа. Версию плагина (ver) с версией ядра
+ * не сверяем: плагины обновляются отдельно. Не так — процесс гасится, причина — в status и журнал. */
+static void plug_hello(struct supd *s, struct helper *h, const struct evline *e) {
+    const char *api = evline_str(e, "api"), *ver = evline_str(e, "ver"), *mod = evline_str(e, "mod");
+    if (ver) snprintf(h->mver, sizeof(h->mver), "%s", ver);
+    char why[200];
+    if (!api) {
+        mod_reject(s, h, "прислал hello без версии steer-api (api)");
+        return;
+    }
+    unsigned pa = 0, pi = 0, ka = 0, ki = 0;
+    if (sscanf(api, "%u.%u", &pa, &pi) != 2 || sscanf(STEER_API_VERSION, "%u.%u", &ka, &ki) != 2 || pa != ka || pi > ki) {
+        snprintf(why, sizeof(why), "говорит steer-api %.16s, ядро — %s", api, STEER_API_VERSION);
+        mod_reject(s, h, why);
+        return;
+    }
+    if (mod && strcmp(mod, h->plugin) != 0) {
+        snprintf(why, sizeof(why), "представился плагином %.32s, а запущен как %.32s", mod, h->plugin);
+        mod_reject(s, h, why);
+        return;
+    }
+    h->hello = 1;
+}
+
+/* revive (прежнее имя — awg; плагин warpbox, evline.h): файл члена развёрнутой группы переписан — перенастроить его
  * устройство сейчас, тем же awg_revive, что зовёт сторож, а не ждать прохода; fresh 1 — живой туннель
  * пересел на более быструю точку, и сессия нужна новая (awg_refresh). Только член группы этого
  * помощника (out_owned_by): чужим выходом помощник распоряжаться не вправе. */
@@ -418,12 +445,15 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
     struct helper_state *st = &h->st;
     long v, t;
     /* Шов стенда (STEER_SUPERVISE_EXE) подменяет модуль заглушкой движка: она про hello не знает. */
-    if (h->module && !s->seam) {
+    if ((h->module || h->plugin[0]) && !s->seam) {
         if (h->rejected) return;         /* процесс уже приговорён, его словам не верим */
         if (!h->hello) {
-            if (!strcmp(e.ev, "hello")) mod_hello(s, h, &e);
-            else mod_reject(s, h, "не назвал версию (первое сообщение — не hello): "
-                                  "нужен модуль того же выпуска, что ядро");
+            if (!strcmp(e.ev, "hello")) {
+                if (h->plugin[0]) plug_hello(s, h, &e);
+                else mod_hello(s, h, &e);
+            } else mod_reject(s, h, h->plugin[0] ? "не назвал версию (первое сообщение — не hello, steer-api.md 2.1)"
+                                                    : "не назвал версию (первое сообщение — не hello): "
+                                                      "нужен модуль того же выпуска, что ядро");
             return;
         }
         if (!strcmp(e.ev, "hello")) return;
@@ -450,6 +480,7 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
         wake_watch(s, h);
     } else if (!strcmp(e.ev, "node")) {
         if (!evline_int(&e, "n", &v) || !evline_int(&e, "total", &t)) return;
+        h->picks = 1;
         st->node = v;
         st->total = t;
         char out[80], f[160];
@@ -457,15 +488,25 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
         snprintf(f, sizeof(f), ",\"out\":%s,\"n\":%ld,\"total\":%ld", out, v, t);
         steerd_emit(s->d, "node", f);
     } else if (!strcmp(e.ev, "nonode")) {
+        h->picks = 1;
         if (evline_int(&e, "node", &v)) st->nonode = v;
         if (evline_int(&e, "total", &t)) st->total = t;
     } else if (!strcmp(e.ev, "excluded")) {
+        h->picks = 1;
         st->excluded = 1;
         if (evline_int(&e, "total", &t)) st->total = t;
     } else if (!strcmp(e.ev, "health")) {
         ev_health(s, h, &e);
-    } else if (!strcmp(e.ev, "awg")) {
+    } else if (!strcmp(e.ev, "revive") || !strcmp(e.ev, "awg")) {
+        /* revive — имя API 1.x; awg — прежнее, принимается до API 2.0 (steer-api.md, 2.2). */
         ev_awg(s, h, &e);
+    } else if (!strcmp(e.ev, "state")) {
+        /* Помощник переписал свой файл состояния (steer-api.md, 2.2): интерфейс перечитает status выхода. */
+        char out[80], id[96], f[200];
+        steerd_json_str(out, sizeof(out), h->name);
+        steerd_json_str(id, sizeof(id), h->plugin[0] ? h->plugin : "");
+        snprintf(f, sizeof(f), ",\"id\":%s,\"out\":%s", id, out);
+        steerd_emit(s->d, "plugin-state", f);
     } else if (!strcmp(e.ev, "member")) {
         ev_member(s, h, &e);
     } else if (!strcmp(e.ev, "active")) {
@@ -1231,6 +1272,20 @@ static int start_one(struct helper *h, void *arg) {
             }
             h->nomod_logged = 0;
         }
+        /* Программы плагина нет (каталог плагина повреждён или снят вручную): так же — одна строка в
+         * журнал, причина в status, повтор по паузе; переставят плагин — следующая попытка запустит. */
+        if (h->plugin[0] && !s->seam && h->prog && *h->prog && access(h->prog, X_OK) != 0) {
+            snprintf(h->st.why, sizeof(h->st.why), "нет программы плагина %s — переставить плагин", h->plugin);
+            h->st.known = 1;
+            h->st.said_down = 1;
+            if (!h->nomod_logged) {
+                fprintf(stderr, LOG_SW "%s %s — нет программы плагина %s (%s): переставить плагин\n", h->cmd,
+                        h->name, h->plugin, h->prog);
+                h->nomod_logged = 1;
+            }
+            return -1;
+        }
+        if (h->plugin[0]) h->nomod_logged = 0;
         h->hello = h->rejected = 0;
         h->mver[0] = '\0';
         int p[2];
@@ -1544,13 +1599,7 @@ int supd_restart(struct supd *s, const char *out, const char *cmd) {
     return -1;
 }
 
-/* ---- ход перебора узлов vless из памяти (probe.h) ---------------------------------------- */
-
-/* Помощник перебирает узлы подписки и рассказывает о переборе событиями node/nonode/down: vless и
- * hysteria2 говорят одним языком, и память демона отвечает про обоих одинаково. */
-static int cmd_picks_nodes(const char *cmd) {
-    return !strcmp(cmd, "vless") || !strcmp(cmd, "hysteria2") || !strcmp(cmd, "proxy");
-}
+/* ---- ход перебора узлов из памяти (probe.h) --------------------------------------------- */
 
 /* То же, что записал бы клиент (probe_report в src/proto/vless/vlmain.c), — по его событиям:
  * nonode — номер вне подписки (живёт до следующего запуска, как запись — пока свежа); node без
@@ -1576,7 +1625,9 @@ static int probe_mem(const char *out, struct probe_status *ps) {
     if (!s || !out) return -1;
     for (size_t i = 0; i < s->set.n; i++) {
         const struct helper *h = &s->set.h[i];
-        if (h->table || h->gone || strcmp(h->name, out) || !cmd_picks_nodes(h->cmd)) continue;
+        /* Помощник, который перебирает узлы, говорит о переборе событиями node/nonode/excluded/down
+         * (evline.h) — по ним он и узнаётся, а не по имени команды. */
+        if (h->table || h->gone || strcmp(h->name, out) || !h->picks) continue;
         ps->state = probe_of(h, &ps->node, &ps->total);
         ps->since = 0;
         ps->why[0] = '\0';
@@ -1650,7 +1701,17 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
             }
             if (h->rejected) fputs(",\"rejected\":true", out);
         }
-        if (cmd_picks_nodes(h->cmd) && (st->node || st->nonode))
+        /* Программа плагина: чья и какой версии (hello); отвергнутая — помечена, причина в last_down. */
+        if (h->plugin[0]) {
+            steerd_json_str(wj, sizeof(wj), h->plugin);
+            fprintf(out, ",\"plugin\":%s", wj);
+            if (h->mver[0]) {
+                steerd_json_str(wj, sizeof(wj), h->mver);
+                fprintf(out, ",\"plugin_ver\":%s", wj);
+            }
+            if (h->rejected) fputs(",\"rejected\":true", out);
+        }
+        if (h->picks && (st->node || st->nonode))
             fprintf(out, ",\"node\":%ld,\"total\":%ld", st->nonode ? st->nonode : st->node,
                     st->total);
         /* Активные узлы пула (номера среди пригодных, как у vless-nodes) — когда клиент сказал. */
@@ -1675,7 +1736,7 @@ char *supd_probe_env(const struct supd *s) {
     long w0 = ftell(f);
     for (size_t i = 0; i < s->set.n; i++) {
         const struct helper *h = &s->set.h[i];
-        if (h->table || h->gone || !cmd_picks_nodes(h->cmd)) continue;
+        if (h->table || h->gone || !h->picks) continue;
         int node, total;
         enum probe_state ps = probe_of(h, &node, &total);
         const char *word = ps == PROBE_RUNNING ? "probing" : ps == PROBE_FAILED ? "failed"

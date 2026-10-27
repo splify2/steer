@@ -25,9 +25,6 @@ struct spec;
 struct err;
 struct out_keys;
 struct out_obfs;
-struct vless_cfg;
-struct hy2_cfg;
-struct xsteer_cfg;
 struct tgws_cfg;
 struct group_cfg;
 struct plugin_kind;
@@ -229,6 +226,9 @@ struct kind_ops {
     /* ---- помощник ---- */
     /* 0 — выходу нужен помощник, h заполнен; -1 — не нужен. */
     int (*helper)(const struct spec *sp, const struct output *o, struct kind_helper *h);
+    /* Ключи вида объектом JSON — для {conf} помощника, которого виду ядра даёт плагин (impl: core,
+     * steer-api.md, 1.4: output.keys). NULL — ключей в {conf} нет. */
+    void (*conf_keys)(FILE *f, const struct output *o);
 };
 
 /* ---- реестр (kind.c) ---- */
@@ -259,9 +259,7 @@ int kind_emit_all(struct nft_rs *rs, const struct spec *sp, struct err *e);
  * спека v1 её не знает (`"kind": "group"` в v1 обязан остаться неизвестным видом, иначе спека,
  * принятая с ним, значила бы то, чего v1 не обещал), своих правил и проверок у неё нет, а
  * собирает её перевод v1 (model/v1.c) напрямую. Разбор v2 находит её через kind_by_name_v2. */
-extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer,
-                             kind_tgws, kind_awg, kind_group, kind_hysteria2,
-                             kind_trojan, kind_shadowsocks, kind_socks, kind_http, kind_vmess,
+extern const struct kind_ops kind_direct, kind_interface, kind_tgws, kind_awg, kind_group,
                              kind_plugin_device, kind_unavail, kind_block;
 /* Выход «Блок» (kinds/block.c): резолвер отвечает на имена его правил пустым адресом. */
 int out_is_block(const struct output *o);
@@ -271,20 +269,19 @@ int out_is_block(const struct output *o);
 #define KIND_ZERO (&kind_direct)
 
 /* ИМЕНА ВИДОВ ДЛЯ СТЕНДОВ — только для стендов (tests/specmatch.c, tests/failovermatch.c), которым
- * нужно собрать выход конкретного вида, не читая спеку: `g_spec.out[0].kind = OUT_XSTEER`.
+ * нужно собрать выход конкретного вида, не читая спеку: `g_spec.out[0].kind = OUT_INTERFACE`.
  * Общий код вида не сравнивает — он спрашивает kind_of(o)->caps или конкретную функцию вида
  * (out_tgws и соседи ниже). Вне src/kinds и стендов эти имена ловит
  * tests/buildmatch.sh. */
 #define OUT_DIRECT    (&kind_direct)
 #define OUT_INTERFACE (&kind_interface)
-#define OUT_VLESS     (&kind_vless)
-#define OUT_XSTEER    (&kind_xsteer)
 #define OUT_GROUP     (&kind_group)
 
 /* ---- вопросы к отдельным видам ------------------------------------------------------------
  *
- * Помощнику вида (клиенту vless, xsteer, мосту tgws) нужна настройка своего выхода, и спросить
- * её он должен у вида: «это мой выход?» — NULL, если выход другого вида. */
+ * Помощнику вида (мосту tgws) нужна настройка своего выхода, и спросить её он должен у вида: «это мой
+ * выход?» — NULL, если выход другого вида. Помощники видов плагинов спрашивают не вид, а свой файл
+ * настройки выхода {conf} (steer-api.md, 1.4). */
 
 /* Вид, которым выход виден снаружи: в status, в `steer outputs --kind`, в подписях сверки и в
  * отказах разбора. У группы из перевода v1 — вид прежнего выхода (interface), см.
@@ -426,48 +423,6 @@ const char *group_why_name(int why);
 
 /* interface: обфускация транспорта или NULL, если её нет (или выход не interface). */
 const struct out_obfs *iface_obfs(const struct output *o);
-
-/* vless */
-const struct vless_cfg *out_vless(const struct output *o);
-/* Развернуть выбор узлов выхода в порядок перебора при подписке из `usable` пригодных узлов.
- * Пишет в dst номера кандидатов по предпочтению и возвращает, сколько написал.
- *
- * Живёт рядом с разбором выхода, а не в клиенте vless: это ЗНАЧЕНИЕ поля `nodes`, а не деталь
- * подъёма туннеля, и проверить его стендом надо там, где стенд не требует ни криптобиблиотеки, ни
- * сети. Клиент и `vless-probe` зовут одну и ту же функцию — иначе диагностика показывала бы
- * перебор, отличный от настоящего.
- *
- * Номер вне подписки ПРОПУСКАЕТСЯ, а не роняет выход: подписка обновляется, узлов в ней
- * становится меньше, и устаревший номер не повод выключить локации, которые на месте.
- * Возврат 0 при непустом `nodes` означает, что не осталось ни одного, — вот это уже отказ,
- * потому что перебирать вместо выбранного что попало значит увести трафик в локацию,
- * которую человек не выбирал. */
-size_t out_node_list(const struct output *o, size_t usable, int *dst, size_t max);
-/* hysteria2: настройка выхода, порядок перебора узлов и «назван ли узел» — те же вопросы, что у
- * vless выше, с тем же смыслом (kinds/hysteria2.c). */
-const struct hy2_cfg *out_hysteria2(const struct output *o);
-size_t out_hy2_node_list(const struct output *o, size_t usable, int *dst, size_t max);
-int out_hy2_node_named(const struct output *o);
-/* Протоколы прокси (trojan, shadowsocks, socks, http, vmess): те же вопросы, с тем же смыслом
- * (kinds/proxy.c). out_proxy — настройка любого из пяти видов, иначе NULL. */
-const struct proxy_cfg *out_proxy(const struct output *o);
-size_t out_proxy_node_list(const struct output *o, size_t usable, int *dst, size_t max);
-int out_proxy_node_named(const struct output *o);
-/* Назван ли узел ЧЕЛОВЕКОМ — то есть выбирать не из чего и перебор не нужен.
- *
- * Отдельным вопросом, а не длиной списка кандидатов, потому что это разные вещи. Кандидат
- * остаётся один и тогда, когда его никто не называл: в подписке единственный узел, или из
- * трёх выбранных в ней уцелел один. Клиент решал по длине — и на подписке из одного узла
- * переставал его проверять вовсе: туннель поднимался на молчащем узле, а вместо «ни один
- * узел подписки не отвечает» человек снова видел «устройства нет» (I-100, ради снятия
- * которого перебор и стал виден).
- *
- * Пропускать проверку можно ровно в одном случае — номер написан в спеке: там человек уже
- * решил, и сообщать ему «выбран единственный выбранный» нечего. */
-int out_node_named(const struct output *o);
-
-/* xsteer */
-const struct xsteer_cfg *out_xsteer(const struct output *o);
 
 /* tgws */
 const struct tgws_cfg *out_tgws(const struct output *o);

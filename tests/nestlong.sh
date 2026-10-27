@@ -23,12 +23,14 @@
 set -u
 LIBS="$(cd "${LIBS:-build/libs-host}" 2>/dev/null && pwd)"
 skip() { echo "nestlong: $1 — пропуск"; exit 0; }
-[ -x "$LIBS/steerd" ] && [ -x "$LIBS/steer-hysteria2" ] || skip "нет раскладки libs ($LIBS, tests/libs-test.sh)"
+[ -x "$LIBS/steerd" ] && [ -x "$LIBS/plugins/hysteria2/bin/hysteria2" ] || skip "нет раскладки libs ($LIBS, tests/libs-test.sh)"
 BIN="$LIBS/steerd"
 CLI="${STEER_CLIENT:-./build/steer}"
 CLI="$(cd "$(dirname "$CLI")" 2>/dev/null && pwd)/$(basename "$CLI")"
 [ -x "$CLI" ] || skip "нет клиента $CLI (make)"
 LD_LIBRARY_PATH="$LIBS"; export LD_LIBRARY_PATH
+# Протоколы — плагины раскладки (программы build-libs.sh, манифесты кладёт tests/libs-test.sh).
+STEER_PLUGINS_ROOT="$LIBS/plugins"; export STEER_PLUGINS_ROOT
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else

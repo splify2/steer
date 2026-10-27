@@ -1,0 +1,4 @@
+{
+  "plugin.name": "Hysteria 2",
+  "plugin.description": "Hysteria 2 tunnels over QUIC with Brutal congestion control"
+}

@@ -128,6 +128,31 @@ static long fake_step(void) { g_slept++; return 0; }
 #include "failover_int.h"
 #include "fogroup.h"
 
+/* Виды туннелей стенда. В ядре видов протоколов нет — они приходят из манифестов плагинов (kinds/plugin.c);
+ * сторожу важны только их свойства, и стенд держит записи с теми же свойствами, что у манифестов
+ * xsteer (health: events — здоровье и задержку судит помощник) и tunnel:vless. */
+static int owned_health(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp; (void)o; (void)dev;
+    return 1;
+}
+static int owned_latency(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp; (void)o; (void)dev;
+    return -1;
+}
+static const struct kind_ops kind_t_xsteer = {
+    .name = "xsteer",
+    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER | KC_SKIP_ZAPRET,
+    .health = owned_health,
+    .latency = owned_latency,
+};
+static const struct kind_ops kind_t_vless = {
+    .name = "vless",
+    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER | KC_SKIP_ZAPRET |
+            KC_TCP_PROBE | KC_FLOW_UDP | KC_TCP_REDIR | KC_IPV6,
+};
+#define OUT_XSTEER (&kind_t_xsteer)
+#define OUT_VLESS (&kind_t_vless)
+
 /* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): один экземпляр
  * на весь стенд, ровно как в других стендах модели. load_spec/registry_assign здесь мокнуты —
  * они его не заполняют, наполняют его сами тестовые блоки ниже, напрямую полями g_spec.out[]. */
@@ -1398,7 +1423,9 @@ int main(void) {
         g_health_probe = NULL;
     }
 
-    /* ---- only и exclude группы: страна ЖИВОГО узла члена из файла состояния его туннеля ---- */
+    /* ---- only и exclude группы: страна ЖИВОГО узла члена из файла состояния его туннеля ----
+     * Файл — состояния выхода плагина (steer-api.md, 2.2): <state>/plugin/<id>/<выход>.status.json.
+     * Члены здесь — выходы, которые ведёт помощник плагина (owner — они сами, plugin_out_state). */
     {
         char d[] = "/tmp/failovermatch-cc-XXXXXX";
         if (!mkdtemp(d)) { perror("mkdtemp"); return 1; }
@@ -1406,12 +1433,16 @@ int main(void) {
         struct { const char *tag, *out, *body; } F[] = {
             { "vless", "nl", "\"node_cc\":\"NL\"" },                        /* только заявленная */
             { "vless", "ru", "\"node_cc\":\"NL\",\"geo_cc\":\"RU\"" },      /* выход виден из другой страны */
-            { "hy2", "de", "\"node_cc\":\"DE\"" },
+            { "hysteria2", "de", "\"node_cc\":\"DE\"" },
             { "proxy", "nf", "\"up\":true" },                               /* страны у узла нет */
         };
         for (size_t i = 0; i < sizeof(F) / sizeof(F[0]); i++) {
-            char path[200];
-            snprintf(path, sizeof(path), "%s/%s-%s", d, F[i].tag, F[i].out);
+            char path[300];
+            snprintf(path, sizeof(path), "%s/plugin", d);
+            mkdir(path, 0755);
+            snprintf(path, sizeof(path), "%s/plugin/%s", d, F[i].tag);
+            mkdir(path, 0755);
+            snprintf(path, sizeof(path), "%s/plugin/%s/%s.status.json", d, F[i].tag, F[i].out);
             FILE *f = fopen(path, "w");
             fprintf(f, "{\"pid\":%ld,%s}\n", (long)getpid(), F[i].body);
             fclose(f);
@@ -1419,7 +1450,12 @@ int main(void) {
         struct output m[5], go;
         memset(m, 0, sizeof(m));
         const char *mn[5] = { "nl", "ru", "de", "nf", "gone" };
-        for (int i = 0; i < 5; i++) snprintf(m[i].name, sizeof(m[i].name), "%s", mn[i]);
+        const char *mp[5] = { "vless", "vless", "hysteria2", "proxy", "vless" };
+        for (int i = 0; i < 5; i++) {
+            snprintf(m[i].name, sizeof(m[i].name), "%s", mn[i]);
+            m[i].owner_plugin = mp[i];
+            m[i].owner_out = mn[i];
+        }
         memset(&go, 0, sizeof(go));
         go.kind = OUT_GROUP;
         group_cfg_init(&go.grp);

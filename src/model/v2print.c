@@ -261,41 +261,6 @@ static const char *on_fail_name(enum on_fail f) {
     return f == FAIL_DIRECT ? "direct" : f == FAIL_ZAPRET ? "zapret" : "drop";
 }
 
-/* `kind: warp` — так, как записан (src/model/v2.c, p_warp): туннели «<имя>.<n>» в спеке не пишутся,
- * а умолчания (count 3, pick latency, допуск 200 мс, интервал 600 с) не печатаются. */
-static void warp_flow(struct flow *w, const struct spec *s, const struct output *o) {
-    const struct group_cfg *g = &o->grp;
-    FILE *f = w->f;
-    fs(w, "kind", "warp");
-    if (g->warp.transport == WARP_MASQUE) fs(w, "transport", "masque");
-    if (g->warp.count != 1) { fk(w, "count"); fprintf(f, "%u", g->warp.count); }
-    if (g->pick != PICK_LATENCY) fs(w, "pick", "order");
-    if (g->pick == PICK_LATENCY && g->lat_tolerance_ms >= 0) {
-        fk(w, "tolerance");
-        fprintf(f, "%d", g->lat_tolerance_ms);
-    }
-    if (g->pick == PICK_LATENCY && g->lat_interval_s && g->lat_interval_s != 600) {
-        fk(w, "interval");
-        fprintf(f, "%d", g->lat_interval_s);
-    }
-    if (g->pick == PICK_LATENCY && g->url[0]) fs(w, "url", g->url);
-    if (g->pick == PICK_LATENCY && g->idle_timeout_s >= 0) {
-        fk(w, "idle_timeout");
-        fprintf(f, "%d", g->idle_timeout_s);
-    }
-    if (g->warp.cc_n) fseq_s(w, "countries", g->warp.cc[0], 3, g->warp.cc_n);
-    if (g->warp.xcc_set) {
-        if (g->warp.xcc_n) fseq_s(w, "exclude_countries", g->warp.xcc[0], 3, g->warp.xcc_n);
-        else { fk(w, "exclude_countries"); fputs("[]", f); }
-    }
-    if (g->members_n) {
-        const struct output *m = spec_out(s, g->members[0]);
-        if (m->over[0]) fs(w, "over", m->over);
-        if (m->ipv6 == OUT_V6_OFF) fs(w, "ipv6", "off");
-    }
-    if (o->on_fail != FAIL_DROP) fs(w, "on_fail", on_fail_name(o->on_fail));
-}
-
 static void json_qstr(FILE *f, const char *s);
 
 /* Узел JSON ключей вида плагина — потоковым YAML: простой скаляр как есть, остальные строки в
@@ -356,12 +321,8 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
     const struct kind_ops *k = kind_of(o);
     const struct group_cfg *g = out_group(o);
     struct flow w = { f, 0 };
+    (void)s;
     fputs("{ ", f);
-    if (g && g->warp.on) {
-        warp_flow(&w, s, o);
-        fputs(" }", f);
-        return;
-    }
     if (g) {
         static const char *const PICK[] = { "order", "latency", "manual", "balance" };
         fs(&w, "kind", "group");
@@ -408,44 +369,9 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
         memset(&kk, 0, sizeof(kk));
         kk.v2 = 1;
         if (k->keys_of) k->keys_of(o, &kk);
-        if (v2_tunnel_proto(k->name)) {
-            fs(&w, "kind", "tunnel");
-            fs(&w, "protocol", k->name);
-        } else fs(&w, "kind", k->name);
+        fs(&w, "kind", k->name);
         if (out_has_device(o) && o->device[0] && !kk.device_derived) fs(&w, "device", o->device);
-        if (kk.sub_file[0]) fpath(&w, "subscription", kk.sub_file);
-        if (kk.nodes_n) {
-            fk(&w, "nodes");
-            fputc('[', f);
-            for (size_t i = 0; i < kk.nodes_n; i++) fprintf(f, "%s%d", i ? ", " : "", kk.nodes[i]);
-            fputc(']', f);
-        }
-        if (kk.transports) {
-            /* Одно имя — строкой, как в примере раздела 3 (`transport: ws`), несколько — списком
-             * в порядке имён (tcp, grpc, xhttp, ws, httpupgrade), не в порядке записи: это
-             * множество, и печать обязана быть неподвижной точкой convert. */
-            unsigned c = 0;
-            for (unsigned i = 0; i < TT_COUNT; i++) c += (kk.transports >> i) & 1u;
-            fk(&w, "transport");
-            if (c > 1) fputc('[', f);
-            for (unsigned i = 0, m = 0; i < TT_COUNT; i++)
-                if (kk.transports & (1u << i)) fprintf(f, "%s%s", m++ ? ", " : "", tunnel_transport_name(i));
-            if (c > 1) fputc(']', f);
-        }
-        if (kk.insecure) { fk(&w, "insecure"); fputs("true", f); }
-        if (kk.excl.cc_n) fseq_s(&w, "exclude", kk.excl.cc[0], 3, kk.excl.cc_n);
-        if (kk.excl.only_n) fseq_s(&w, "only", kk.excl.only[0], 3, kk.excl.only_n);
-        if (kk.excl.names_n) fseq(&w, "exclude_name", kk.excl.names, kk.excl.names_n);
-        /* Пул узлов туннеля — только отличное от умолчания (struct tun_pool). */
-        if (kk.pool.active > 1) { fk(&w, "active"); fprintf(f, "%d", kk.pool.active); }
-        if (kk.pool.by != BY_CONNECTION) fs(&w, "by", group_by_name(kk.pool.by));
-        if (kk.pool.interval_s) { fk(&w, "interval"); fprintf(f, "%d", kk.pool.interval_s); }
-        if (kk.pool.pick) fs(&w, "pick", "latency");
-        if (kk.pool.tol_set) { fk(&w, "tolerance"); fprintf(f, "%d", kk.pool.tolerance_ms); }
-        if (kk.pool.silence_s) { fk(&w, "silence"); fprintf(f, "%d", kk.pool.silence_s < 0 ? 0 : kk.pool.silence_s); }
         if (kk.conf[0]) fpath(&w, "conf", kk.conf);
-        if (kk.stream) { fk(&w, "stream"); fputs("true", f); }
-        if (kk.stream_port) { fk(&w, "stream_port"); fprintf(f, "%d", kk.stream_port); }
         if (kk.opts_file[0]) fpath(&w, "strategy", kk.opts_file);
         if (kk.domain[0]) fs(&w, "domain", kk.domain);
         if (kk.obfs.on) {
@@ -615,7 +541,7 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
             if (yq_len(oname[anon_order[i]]) > ow) ow = yq_len(oname[anon_order[i]]);
         fputs("\noutputs:\n", f);
         for (size_t i = 0; i < s->out_n; i++) {
-            if (out_owned_by(&s->out[i], NULL, NULL)) continue;     /* выход плагина (туннель kind: warp) — часть его записи */
+            if (out_owned_by(&s->out[i], NULL, NULL)) continue;     /* выход плагина (разворот его хука expand) — часть записи владельца */
             key_pad(f, oname[i], ow);
             output_flow(f, s, &s->out[i], &onm);
             fputc('\n', f);

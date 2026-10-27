@@ -48,6 +48,7 @@
 
 #include "spec.h"
 #include "plugin.h"
+#include "registry.h"
 #include "plugutil.h"
 #include "ynode.h"
 #include "v2.h"
@@ -150,6 +151,100 @@ int plugin_conf_write(const struct spec *sp, const struct output *o) {
     int rc = pu_mkdir_p(dir) == 0 ? pu_write_atomic(path, json, strlen(json), 0600) : -1;
     free(json);
     return rc;
+}
+
+/* ---- подкоманды плагинов (steer-api.md, 4.3; manifest.md, commands[]) ------------------------------ */
+
+/* Файл настройки выхода для подкоманды с conf (manifest.md, commands[].conf): выход name — вид этого
+ * плагина или развёрнутый им выход; {conf} — тот же, что у помощника (plugin_conf_json), в memfd без
+ * CLOEXEC, чтобы его увидела программа после exec («/proc/self/fd/N»). Нет memfd — файл помощника в
+ * каталоге плагина. Путь — в path; 0 — готово, иначе 2 и причина в stderr. */
+static int cmd_conf(const struct plugin_cmd *c, const char *name, const char *spec_path, const char *state_dir,
+                    char *path, size_t pn) {
+    if (state_dir) steer_set_state_dir(state_dir);
+    struct spec *sp = calloc(1, sizeof(*sp));
+    if (!sp) { fprintf(stderr, "steer: нет памяти\n"); return 2; }
+    struct err e;
+    memset(&e, 0, sizeof(e));
+    if (load_spec(plat_spec_resolve(spec_path), sp, &e) < 0 || registry_assign(sp, &e) < 0) {
+        fprintf(stderr, "steer: %s\n", e.msg[0] ? e.msg : "спека не прочитана");
+        return 2;
+    }
+    const struct output *o = out_by_name(sp, name);
+    if (!o) { fprintf(stderr, "steer: %s: выхода %s нет в спеке\n", c->name, name); return 2; }
+    const struct plugin_kind *pk = out_plugin_kind(o);
+    if (!pk) pk = plugin_helper_kind(o);
+    if (!pk || pk->owner != c->owner) {
+        fprintf(stderr, "steer: %s: выход %s — не выход плагина %s (kind %s)\n", c->name, name, c->owner->id,
+                out_kind_name(o));
+        return 2;
+    }
+    char *json = plugin_conf_json(sp, o, pk);
+    if (!json) { fprintf(stderr, "steer: нет памяти\n"); return 2; }
+    int fd = (int)syscall(SYS_memfd_create, "steer-conf", 0);
+    if (fd >= 0) {
+        size_t len = strlen(json), off = 0;
+        while (off < len) {
+            ssize_t w = write(fd, json + off, len - off);
+            if (w <= 0) break;
+            off += (size_t)w;
+        }
+        snprintf(path, pn, "/proc/self/fd/%d", fd);
+        free(json);
+        return off == len ? 0 : 2;
+    }
+    free(json);
+    if (plugin_conf_write(sp, o) != 0) {
+        fprintf(stderr, "steer: %s: файл настройки выхода %s не записан: %s\n", c->name, name, strerror(errno));
+        return 2;
+    }
+    snprintf(path, pn, "%s/plugin/%s/%s.json", steer_state_dir(), pk->owner->id, o->name);
+    return 0;
+}
+
+int plugin_cmd_exec(const struct plugin_cmd *c, int argc, char **argv) {
+    /* conf: --spec и --state-dir человека — ядру (по ним выход и его {conf}); программе — --conf. */
+    const char *spec_path = NULL, *state_dir = NULL;
+    char confp[PATH_MAX] = "";
+    if (c->conf) {
+        int k = 0;
+        for (int i = 0; i < argc; i++) {
+            if ((!strcmp(argv[i], "--spec") || !strcmp(argv[i], "--state-dir")) && i + 1 < argc) {
+                if (argv[i][2] == 's' && argv[i][3] == 'p') spec_path = argv[i + 1];
+                else state_dir = argv[i + 1];
+                i++;
+                continue;
+            }
+            argv[k++] = argv[i];
+        }
+        argc = k;
+        if (argc >= 1 && argv[0][0] != '/' && argv[0][0] != '-') {
+            int rc = cmd_conf(c, argv[0], spec_path, state_dir, confp, sizeof(confp));
+            if (rc) return rc;
+        }
+    }
+    size_t n = c->run.argc + (size_t)argc + 4;
+    char **av = calloc(n, sizeof(*av));
+    if (!av) { fprintf(stderr, "steer: нет памяти\n"); return 2; }
+    size_t k = 0;
+    av[k++] = c->run.prog;
+    char why[256];
+    for (size_t i = 0; i < c->run.argc; i++) {
+        av[k] = plugin_subst(c->owner, NULL, c->run.argv[i], why, sizeof(why));
+        if (!av[k]) { fprintf(stderr, "steer: подкоманда %s: %s\n", c->name, why); return 2; }
+        k++;
+    }
+    for (int i = 0; i < argc; i++) av[k++] = argv[i];
+    if (confp[0]) {
+        av[k++] = "--conf";
+        av[k++] = confp;
+    }
+    av[k] = NULL;
+    plugin_env_set(c->owner, &c->run);
+    execv(c->run.prog, av);
+    fprintf(stderr, "steer: не удалось запустить %s (плагин %s): %s\n", c->run.prog, c->owner->id,
+            strerror(errno));
+    return 2;
 }
 
 /* ---- запуск программы хука ------------------------------------------------------------------ */
@@ -395,6 +490,21 @@ static char *owner_json_of(const char *plugin, const char *out) {
     return b.oom ? NULL : b.p;
 }
 
+/* Владелец развёрнутого выхода с помощником: {plugin, out, kind, keys}. */
+static char *owner_self_json(const char *plugin, const char *out, const char *kind, const char *keys_json) {
+    struct sbuf b = { 0 };
+    sb_str(&b, "{\"plugin\":");
+    sb_json(&b, plugin);
+    sb_str(&b, ",\"out\":");
+    sb_json(&b, out);
+    sb_str(&b, ",\"kind\":");
+    sb_json(&b, kind);
+    sb_str(&b, ",\"keys\":");
+    sb_str(&b, keys_json && *keys_json ? keys_json : "{}");
+    sb_str(&b, "}");
+    return b.oom ? NULL : b.p;
+}
+
 /* Имя выхода из фрагмента expand: [A-Za-z0-9_.-], не длиннее 31 знака (предел имени выхода в сокете,
  * ctl.md) — число называет отказ. */
 static int fragment_name_ok(const char *n, char *why, size_t wn) {
@@ -463,8 +573,10 @@ static void warn_collect(struct prep *p, const struct plugin *pl, const char *ou
     ydoc_free(d);
 }
 
-/* Вход check и expand (steer-api.md, 3.2). */
-static char *hook_input(struct prep *p, const char *name, const char *kind, const char *keys_json) {
+/* Вход check и expand (steer-api.md, 3.2): ключи вида по схеме и общие ключи записи (on_fail, ipv6,
+ * over, device — как записаны): разворот переносит их на то, во что превращает выход. */
+static char *hook_input(struct prep *p, const char *name, const char *kind, const char *keys_json,
+                        const struct ynode *rec) {
     struct sbuf b = { 0 };
     char etc[PATH_MAX];
     sb_str(&b, "{\"api\":\"" STEER_API_VERSION "\",\"output\":{\"name\":");
@@ -473,7 +585,16 @@ static char *hook_input(struct prep *p, const char *name, const char *kind, cons
     sb_json(&b, kind);
     sb_str(&b, ",\"keys\":");
     sb_str(&b, keys_json);
-    sb_str(&b, "},\"spec\":{\"etc\":");
+    sb_str(&b, ",\"common\":{");
+    size_t cn = 0;
+    for (size_t i = 0; rec && i < ynode_len(rec); i++) {
+        const char *k = ynode_key_at(rec, i)->str;
+        if (!is_common_key(k) || !strcmp(k, "kind") || !strcmp(k, "protocol") || !strcmp(k, "owner")) continue;
+        if (cn++) sb_str(&b, ",");
+        json_member_key(&b, k);
+        plugin_node_json(&b, ynode_val_at(rec, i));
+    }
+    sb_str(&b, "}},\"spec\":{\"etc\":");
     snprintf(etc, sizeof(etc), "%s", plat()->etc_dir);
     sb_json(&b, etc);
     sb_str(&b, ",\"outputs\":[");
@@ -536,7 +657,7 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
     int rc = 0;
     char *out_txt = NULL, *why = NULL;
     if (pk->check.prog) {
-        char *in = hook_input(p, name, kname, kjson);
+        char *in = hook_input(p, name, kname, kjson, rec);
         if (!in) { free(kjson); return err_set(e, "%s", "недостаточно памяти"); }
         int hr = hook_run(pl, &pk->check, "check", name, 10, in, &out_txt, &why, e);
         free(in);
@@ -563,18 +684,18 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
         return member_put(p, name, rec, NULL, NULL) == 0 ? 0 : err_set(e, "%s", "недостаточно памяти");
     }
     /* expand: self и новые выходы (steer-api.md, 3.3). */
-    char *in = hook_input(p, name, kname, kjson);
-    free(kjson);
-    if (!in) return err_set(e, "%s", "недостаточно памяти");
+    char *in = hook_input(p, name, kname, kjson, rec);
+    if (!in) { free(kjson); return err_set(e, "%s", "недостаточно памяти"); }
     int hr = hook_run(pl, &pk->expand, "expand", name, 10, in, &out_txt, &why, e);
     free(in);
     if (hr == 2) {
         char m[900];
         snprintf(m, sizeof(m), "плагин %s: разворот %s — %s", pl->id, name, why);
         free(why);
+        free(kjson);
         return err_set(e, "%s", m);
     }
-    if (hr != 0) return -1;
+    if (hr != 0) { free(kjson); return -1; }
     struct err pe;
     memset(&pe, 0, sizeof(pe));
     struct ydoc *fd = ydoc_parse_buf(out_txt, strlen(out_txt), "ответ expand", &pe);
@@ -582,6 +703,7 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
         char m[900];
         snprintf(m, sizeof(m), "плагин %s: разворот %s — ответ не разобран: %s", pl->id, name, pe.msg);
         free(out_txt);
+        free(kjson);
         return err_set(e, "%s", m);
     }
     free(out_txt);
@@ -593,7 +715,7 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
     char msg[900];
     if (!self || self->kind != YN_MAP) {
         snprintf(msg, sizeof(msg), "плагин %s: разворот %s — в ответе нет self", pl->id, name);
-        ydoc_free(fd);
+        ydoc_free(fd); free(kjson);
         return err_set(e, "%s", msg);
     }
     {
@@ -602,7 +724,7 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
             plugin_kind_find(sk)->expand.prog) {
             snprintf(msg, sizeof(msg), "плагин %s: разворот %s — self сам вида с разворотом (%s): разворот однократный",
                      pl->id, name, sk);
-            ydoc_free(fd);
+            ydoc_free(fd); free(kjson);
             return err_set(e, "%s", msg);
         }
     }
@@ -612,26 +734,28 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
         char w2[300];
         if (!fragment_name_ok(nn, w2, sizeof(w2))) {
             snprintf(msg, sizeof(msg), "плагин %s: разворот %s — outputs.%s: %s", pl->id, name, nn, w2);
-            ydoc_free(fd);
+            ydoc_free(fd); free(kjson);
             return err_set(e, "%s", msg);
         }
         for (size_t k = 0; k < p->names_n; k++)
             if (!strcmp(p->names[k], nn)) {
                 snprintf(msg, sizeof(msg), "плагин %s: разворот %s — outputs.%s: такой выход уже есть в спеке", pl->id, name, nn);
-                ydoc_free(fd);
+                ydoc_free(fd); free(kjson);
                 return err_set(e, "%s", msg);
             }
         for (size_t k = 0; k < p->made_n; k++)
             if (!strcmp(p->made[k].name, nn)) {
                 snprintf(msg, sizeof(msg), "плагин %s: разворот %s — outputs.%s: уже заведён плагином %s", pl->id, name, nn, p->made[k].plugin);
-                ydoc_free(fd);
+                ydoc_free(fd); free(kjson);
                 return err_set(e, "%s", msg);
             }
     }
     /* self — выход под прежним именем; с помощником — помечен владельцем (помощник вида ведёт
      * членов, а ядру нужно знать, чей он). */
-    char *oj_self = helper ? owner_json_of(pl->id, name) : NULL;
-    if (member_put(p, name, self, oj_self, NULL) != 0) { free(oj_self); ydoc_free(fd); return err_set(e, "%s", "недостаточно памяти"); }
+    /* Владелец self с помощником несёт и вид с ключами, как их получил разворот: {conf} помощника
+     * развёрнутого выхода говорит ему вид плагина и его ключи (steer-api.md, 1.4), а не «group». */
+    char *oj_self = helper ? owner_self_json(pl->id, name, pk->name, kjson) : NULL;
+    if (member_put(p, name, self, oj_self, NULL) != 0) { free(oj_self); ydoc_free(fd); free(kjson); return err_set(e, "%s", "недостаточно памяти"); }
     free(oj_self);
     if (p->rep_expand.n) sb_str(&p->rep_expand, ",");
     sb_printf(&p->rep_expand, "{\"id\":");
@@ -644,7 +768,7 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
         char *oj = owner_json_of(pl->id, name);
         if (!oj || member_put(p, nn, ynode_val_at(outs, i), oj, NULL) != 0 || prep_made(p, nn, pl->id, name) != 0) {
             free(oj);
-            ydoc_free(fd);
+            ydoc_free(fd); free(kjson);
             return err_set(e, "%s", "недостаточно памяти");
         }
         free(oj);
@@ -652,7 +776,7 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
         sb_json(&p->rep_expand, nn);
     }
     sb_str(&p->rep_expand, "]}");
-    ydoc_free(fd);
+    ydoc_free(fd); free(kjson);
     return rc;
 }
 

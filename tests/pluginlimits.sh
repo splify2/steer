@@ -22,6 +22,9 @@ fi
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/st"
+# Помощника obfs выходу interface даёт плагин obfs (каталог плагинов стенда, tests/plugroot.sh).
+sh tests/plugroot.sh "$tmp/plugins" "$(dirname "$BIN")" || { echo "pluginlimits: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 D="" SUBS=""
 trap 'kill $D $SUBS 2>/dev/null; rm -rf "$tmp"' EXIT
 pass=0 fail=0

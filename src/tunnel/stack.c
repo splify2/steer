@@ -3956,7 +3956,7 @@ static void stack_setup(const struct dialer *d) {
     for (int i = 0; i < SPARE_MAX; i++) g_spares[i].sess = m + (size_t)i * g_sess_stride;
 }
 
-int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
+int stack_run(const struct tun_out *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
     const char *dev = o->device;
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     g_stats = getenv("STEER_TUN_STATS") != NULL;
@@ -3971,7 +3971,7 @@ int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, vo
         rl.rlim_cur = rl.rlim_max;
         setrlimit(RLIMIT_NOFILE, &rl);
     }
-    if (o->mark) g_kport = out_tcp_port(o);
+    if (o->mark) g_kport = o->tcp_port;
     if (getenv("STEER_TUN_TCPPORT")) {
         int pt = atoi(getenv("STEER_TUN_TCPPORT"));
         if (pt > 0 && pt < 65536) g_kport = pt;

@@ -8,7 +8,7 @@
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/splify2/steer",
   "compat": {
-    "steer-api": "^1.0"
+    "steer-api": "^1.1"
   },
   "arch": [
     "aarch64_cortex-a53",
@@ -30,7 +30,7 @@
       "/dev/net/tun"
     ],
     "plugins": {
-      "net1": "^1.2"
+      "net1": "^1.3"
     }
   },
   "permissions": [
@@ -65,7 +65,17 @@
             "{conf}"
           ]
         },
-        "health": "events"
+        "health": "tcp",
+        "description": "Туннель Trojan по подписке.",
+        "check": {
+          "prog": "bin/proxy",
+          "argv": [
+            "check"
+          ]
+        },
+        "texts": {
+          "selfnat_why": "masquerade не нужен: туннель завершает TCP сам, адреса клиентов наружу не уходят"
+        }
       },
       {
         "name": "tunnel:shadowsocks",
@@ -92,7 +102,17 @@
             "{conf}"
           ]
         },
-        "health": "events"
+        "health": "tcp",
+        "description": "Туннель Shadowsocks по подписке.",
+        "check": {
+          "prog": "bin/proxy",
+          "argv": [
+            "check"
+          ]
+        },
+        "texts": {
+          "selfnat_why": "masquerade не нужен: туннель завершает TCP сам, адреса клиентов наружу не уходят"
+        }
       },
       {
         "name": "tunnel:socks",
@@ -119,7 +139,17 @@
             "{conf}"
           ]
         },
-        "health": "events"
+        "health": "tcp",
+        "description": "Туннель через прокси SOCKS по подписке.",
+        "check": {
+          "prog": "bin/proxy",
+          "argv": [
+            "check"
+          ]
+        },
+        "texts": {
+          "selfnat_why": "masquerade не нужен: туннель завершает TCP сам, адреса клиентов наружу не уходят"
+        }
       },
       {
         "name": "tunnel:http",
@@ -146,7 +176,17 @@
             "{conf}"
           ]
         },
-        "health": "events"
+        "health": "tcp",
+        "description": "Туннель через прокси HTTP по подписке.",
+        "check": {
+          "prog": "bin/proxy",
+          "argv": [
+            "check"
+          ]
+        },
+        "texts": {
+          "selfnat_why": "masquerade не нужен: туннель завершает TCP сам, адреса клиентов наружу не уходят"
+        }
       },
       {
         "name": "tunnel:vmess",
@@ -173,37 +213,65 @@
             "{conf}"
           ]
         },
-        "health": "events"
+        "health": "tcp",
+        "description": "Туннель VMess по подписке.",
+        "check": {
+          "prog": "bin/proxy",
+          "argv": [
+            "check"
+          ]
+        },
+        "texts": {
+          "selfnat_why": "masquerade не нужен: туннель завершает TCP сам, адреса клиентов наружу не уходят"
+        }
       }
     ],
     "commands": [
       {
         "name": "proxy-nodes",
         "prog": "bin/proxy",
-        "help": "узлы подписки выхода",
+        "help": "узлы подписки выхода или файла подписки (путь с «/»)",
+        "usage": "<выход|/файл> [--insecure]",
+        "conf": true,
         "ctl": {
           "timeout_s": 15,
           "args": [
             "name"
-          ],
-          "spec": true
+          ]
         }
       },
       {
         "name": "proxy-probe",
         "prog": "bin/proxy",
-        "help": "проверить узлы выхода",
+        "help": "проверить узел выхода и измерить задержку",
+        "usage": "<выход|/файл> [--node N] [--timeout СЕК] [--insecure]",
+        "conf": true,
         "ctl": {
           "timeout_s": 180,
           "args": [
             "name",
-            "int",
-            "int"
+            {
+              "kind": "int",
+              "flag": "--node",
+              "min": -1,
+              "max": 9999
+            },
+            {
+              "kind": "int",
+              "flag": "--timeout",
+              "min": 1,
+              "max": 30
+            }
           ],
-          "optional": 2,
-          "spec": true
+          "optional": 2
         }
       }
+    ]
+  },
+  "i18n": {
+    "languages": [
+      "ru",
+      "en"
     ]
   }
 }

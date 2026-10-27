@@ -577,6 +577,7 @@ struct conn {
      * (srv_lan). */
     int resync;
     struct recon_kernel kern; /* ядро после nft -f apply-commit (строка recon-kernel) */
+    struct ctl_cmd pcmd;      /* строка команды плагина (plugin_ctl_cmd): её адрес — в q.cmd */
 };
 
 struct ctl_srv {
@@ -628,7 +629,8 @@ static void mem_helper(struct conn *c, struct cbuf *r);
 static void st_apply(struct conn *c);
 static void st_check(struct conn *c);
 static void st_reload(struct conn *c);
-static void st_sub_check(struct conn *c);
+static void st_plugcmd_body(struct conn *c);
+static int plugin_ctl_cmd(const char *name, struct ctl_cmd *k);
 static void st_subscribe(struct conn *c);
 static void st_repair(struct conn *c);
 static void st_plugin(struct conn *c);
@@ -648,18 +650,18 @@ static void mem_plugin_event(struct conn *c, struct cbuf *r);
  * с каталогом, которую делает сам демон, и подкоманда ради неё была бы вторым путём записи в
  * каталог, которым никто, кроме сервера, не пользуется.
  *
- * Сроки детей: vless-probe без номера узла перебирает узлы подписки по очереди, каждый со своим --timeout;
- * check и apply — свои (см. st_check, st_apply). */
+ * Сроки детей — у строк; check и apply — свои (см. st_check, st_apply).
+ *
+ * КОМАНДЫ ПЛАГИНОВ (steer-api.md, 4.3). Подкоманда из манифеста с `ctl` получает строку здесь же,
+ * собранную из манифеста (plugin_ctl_cmd): слова — по видам ctl.args, срок — ctl.timeout_s, тело —
+ * файлом (ctl.body: file). Исполняет её ребёнок `steerd <команда> <слова…>` — тот же путь, что у
+ * человека в shell (plugin_cmd_exec), с --spec и --state-dir демона: у команды с conf по ним ядро
+ * кладёт {conf} выхода. Имён команд плагинов ядро не знает; команда ядра с тем же именем — первая. */
 static const struct ctl_cmd CTL_CMDS[] = {
     {"version",     NULL, mem_version, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
     {"status",      NULL, mem_status, NULL, 0, 0, 1, {{CA_LIT, "--fast", "fast", 0, 0}}, 0, 0, 0},
     {"diag",        NULL, mem_diag, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
     {"explain",     NULL, mem_explain, NULL, 0, 1, 1, {{CA_TARGET, NULL, NULL, 0, 0}}, 0, 0, 0},
-    {"vless-nodes", "vless-nodes", NULL, NULL, 0, 1, 1, {{CA_NAME, NULL, NULL, 0, 0}}, 15, 1, 0},
-    {"vless-probe", "vless-probe", NULL, NULL, 0, 1, 3,
-        {{CA_NAME, NULL, NULL, 0, 0},
-         {CA_INT, "--node", NULL, -1, 9999},
-         {CA_INT, "--timeout", NULL, 1, 30}}, 180, 1, 0},
     {"check",       NULL, NULL, st_check,  CTL_BODY_MAX, 0, 0, {{0}}, 0, 1, 1},
     {"apply",       NULL, NULL, st_apply,  CTL_BODY_MAX, 0, 0, {{0}}, 0, 1, 1},
     {"reload",      NULL, NULL, st_reload, 0, 0, 0, {{0}}, 0, 1, 1},
@@ -669,7 +671,6 @@ static const struct ctl_cmd CTL_CMDS[] = {
     {"put-file",    NULL, ctl_do_put_file, NULL, CTL_FILE_MAX, 1, 1, {{CA_FILE, NULL, NULL, 0, 0}}, 0, 0, 0},
     {"list-files",  NULL, ctl_do_list_files, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
     {"rm-file",     NULL, ctl_do_rm_file, NULL, 0, 1, 1, {{CA_FILE, NULL, NULL, 0, 0}}, 0, 0, 1},
-    {"sub-check",   NULL, NULL, st_sub_check, CTL_FILE_MAX, 0, 0, {{0}}, 0, 0, 0},
     {"subscribe",   NULL, NULL, st_subscribe, 0, 0, 0, {{0}}, 0, 0, 0},
     /* Выбор члена группы pick: manual (docs/ctl.md): в процессе, без apply — изменяющая, идёт по
      * одной с apply и reload (они пишут те же таблицы). */
@@ -2206,36 +2207,62 @@ static void ctl_do_rm_file(struct conn *c, struct cbuf *r) {
     free(spec.p);
 }
 
-static void sub_check_done(struct conn *c, int code) {
+/* ---- команды плагинов (steer-api.md, 4.3) --------------------------------------------------------- */
+
+/* Строка таблицы для подкоманды плагина name из манифеста. 0 — есть; -1 — такой подкоманды с ctl нет
+ * или слов у неё больше, чем держит строка таблицы (args). */
+static int plugin_ctl_cmd(const char *name, struct ctl_cmd *k) {
+    const struct plugin_cmd *pc = plugin_cmd_find(name);
+    if (!pc || !pc->ctl || pc->ctl_args_n > sizeof(k->args) / sizeof(k->args[0])) return -1;
+    memset(k, 0, sizeof(*k));
+    k->name = pc->name;
+    k->sub = pc->name;
+    k->start = pc->ctl_body_max ? st_plugcmd_body : NULL;
+    k->body = pc->ctl_body_max;
+    k->argmax = (int)pc->ctl_args_n;
+    k->argmin = k->argmax - pc->ctl_optional < 0 ? 0 : k->argmax - pc->ctl_optional;
+    for (size_t i = 0; i < pc->ctl_args_n; i++) {
+        const struct plugin_ctl_arg *a = &pc->ctl_args[i];
+        struct ctl_arg *t = &k->args[i];
+        t->kind = !strcmp(a->kind, "name") ? CA_NAME : !strcmp(a->kind, "int") ? CA_INT :
+                  !strcmp(a->kind, "target") ? CA_TARGET : !strcmp(a->kind, "file") ? CA_FILE : CA_WORD;
+        t->flag = a->flag;
+        t->lo = a->lo;
+        t->hi = a->hi;
+    }
+    k->timeout_s = pc->ctl_timeout_s > 0 ? pc->ctl_timeout_s : 60;
+    k->spec = pc->conf;
+    k->lock = pc->ctl_lock;
+    return 0;
+}
+
+static void plugcmd_body_done(struct conn *c, int code) {
     unlink(c->tmp);
     if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться ядра"); conn_reply(c); return; }
     resp_run(&c->resp, code, &c->job.out, &c->job.err);
-    if (c->job.timed_out) resp_error(&c->resp, "timeout", "разбор подписки не уложился в свой срок и остановлен");
+    if (c->job.timed_out) resp_error(&c->resp, "timeout", "команда не уложилась в свой срок и остановлена");
     conn_reply(c);
 }
 
-/* sub-check <длина> + тело — разобрать присланный файл подписки, ничего не сохраняя: сколько
- * узлов пригодно, сколько пропущено и почему. Нужно приложению ДО того, как подписка станет
- * файлом выхода: скачав её, логика показывает человеку «пригодно 12, пропущено 3 — ws не
- * поддерживается» и решает, заливать ли (put-file).
- *
- * Разбирает не демон, а `steer vless-nodes <файл>` ребёнком — та же подкоманда, тем же
- * разбором (vless_parse_sub), что и подъём выхода: второй разбор «для проверки» разошёлся бы с
- * тем, которым узлы потом поднимаются. Тело кладётся во временный файл каталога времянок
- * движка (путь абсолютный — по нему vless-nodes отличает файл от имени выхода) и удаляется
- * сразу после разбора. В ответе — код и вывод подкоманды как есть; поле sub_file в её JSON —
- * имя этого временного файла, для приложения оно ничего не значит. В базовой сборке (без
- * VLESS) подкоманда честно отказывает кодом 2, как vless-nodes. */
-static void st_sub_check(struct conn *c) {
+/* Команда плагина с телом (ctl.body: file): тело — во временный файл каталога времянок движка, его путь
+ * (абсолютный) — последним словом подкоманды; файл удаляется, когда она кончится. Так `sub-check`
+ * плагина vless разбирает присланную подписку, ничего не сохраняя. */
+static void st_plugcmd_body(struct conn *c) {
     char stem[PATH_MAX];
-    snprintf(stem, sizeof stem, "%s/sub-check", plat()->tmp_dir);
+    snprintf(stem, sizeof stem, "%s/%s", plat()->tmp_dir, c->q.cmd->name);
     if (ctl_write_tmp(stem, c->q.body, c->q.body_n, c->tmp, sizeof(c->tmp)) != 0) {
-        resp_error(&c->resp, "internal", "не удалось записать временный файл подписки");
+        resp_error(&c->resp, "internal", "не удалось записать временный файл тела");
         conn_reply(c);
         return;
     }
-    char *av[4] = { c->srv->cf.exe, "vless-nodes", c->tmp, NULL };
-    if (job_start(c, av, 15, CTL_OUT_MAX, CTL_ERR_MAX, sub_check_done) != 0) {
+    char *av[20];
+    size_t n = ctl_argv(&c->q, c->q.cmd->sub, av, sizeof(av) / sizeof(av[0]) - 1);
+    /* Путь тела — после слов, до --spec (ctl_argv кладёт его последним). */
+    size_t at = n;
+    for (size_t i = 2; i < n; i++) if (!strcmp(av[i], "--spec")) { at = i; break; }
+    memmove(&av[at + 1], &av[at], (n - at + 1) * sizeof(*av));
+    av[at] = c->tmp;
+    if (job_start(c, av, c->q.cmd->timeout_s, CTL_OUT_MAX, CTL_ERR_MAX, plugcmd_body_done) != 0) {
         unlink(c->tmp);
         resp_error(&c->resp, "internal", "не удалось запустить ядро");
         conn_reply(c);
@@ -2516,6 +2543,7 @@ static int conn_parse(struct conn *c) {
     for (int i = 0; i < nt; i++)
         if (!tok[i][0]) { conn_refuse(c, NULL, "bad-request", "пустое слово: слова разделяются одним пробелом"); return -1; }
     const struct ctl_cmd *cmd = ctl_lookup(tok[0]);
+    if (!cmd && plugin_ctl_cmd(tok[0], &c->pcmd) == 0) cmd = &c->pcmd;
     if (!cmd) { conn_refuse(c, NULL, "unknown-command", "такой команды нет"); return -1; }
 
     if (!c->counted) {
@@ -3524,6 +3552,8 @@ int ctl_client_main(int argc, char **argv) {
     if (i >= argc) ctl_bad_flag("ctl", "нужна команда", NULL);
     struct cbuf req = {0}, body = {0};
     const struct ctl_cmd *cmd = ctl_lookup(argv[i]);
+    static struct ctl_cmd pk;
+    if (!cmd && plugin_ctl_cmd(argv[i], &pk) == 0) cmd = &pk;      /* команда плагина: тело — по её манифесту */
     int words = argc, from_fd = 0;
     if (cmd && cmd->body && !strcmp(cmd->name, "put-file")) {
         if (argc - i != 3) ctl_bad_flag("ctl", "put-file: нужны имя и файл (или «-»)", NULL);

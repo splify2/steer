@@ -96,7 +96,6 @@
 #include <sys/random.h>
 
 #include "pool.h"
-#include "kind.h"
 #include "evline.h"
 #include "jsonw.h"
 #include "platform.h"
@@ -256,7 +255,7 @@ static int pl_pick(const struct flow_key *k) {
         if (g_pl.slot[i].up) live[nl++] = i;
     }
     if (!nl) return any;
-    if (g_pl.cf.by == BY_CONNECTION || !k) return live[pl_rand() % (unsigned)nl];
+    if (g_pl.cf.by == POOL_BY_CONNECTION || !k) return live[pl_rand() % (unsigned)nl];
     /* IPv6: слова адреса сворачиваются исключением в одно число, дальше хэш тот же. */
     uint32_t sa = k->src, da = k->dst;
     if (k->v6) {
@@ -266,7 +265,7 @@ static int pl_pick(const struct flow_key *k) {
         sa = w[0] ^ w[1] ^ w[2] ^ w[3];
         da = w[4] ^ w[5] ^ w[6] ^ w[7];
     }
-    uint32_t h = g_pl.cf.by == BY_SITE_CLIENT ? pl_mix(sa * 0x9e3779b1u) ^ da : da;
+    uint32_t h = g_pl.cf.by == POOL_BY_SITE_CLIENT ? pl_mix(sa * 0x9e3779b1u) ^ da : da;
     int at = (int)(pl_mix(h) % (uint32_t)g_pl.n);
     /* Слот сайта мёртв или пуст — следующий живой по кругу: сайты живых слотов остаются на месте. */
     for (int d = 0; d < g_pl.n; d++) {
@@ -431,7 +430,27 @@ static void pl_publish(void) {
         pthread_mutex_unlock(&g_pl.mu);
         fputs("}}", f);
     }
-    fputs("}\n", f);
+    /* diag ядра для этого выхода (steer-api.md, 2.3): строки протокола и своя — сколько узлов держим. */
+    fputs(",\"diag\":[", f);
+    int dn = 0;
+    if (g_pl.cf.diag && *g_pl.cf.diag) { fputs(g_pl.cf.diag, f); dn = 1; }
+    if (g_pl.cf.active > 1) {
+        char what[160], hint[400];
+        snprintf(what, sizeof what, "выход %.40s: активных узлов %d из %d", g_pl.cf.out, ni, g_pl.cf.active);
+        if (g_pl.n < g_pl.cf.active)
+            snprintf(hint, sizeof hint, "кандидатов в подписке всего %d — больше узлов сразу держать нечем; "
+                     "уменьшите active или расширьте nodes", g_pl.n);
+        else
+            snprintf(hint, sizeof hint, "остальные кандидаты не отвечают — клиент ищет им замену сам; какие "
+                     "узлы живы, покажет steer %s-probe %.40s", g_pl.cf.proto->tag, g_pl.cf.out);
+        fprintf(f, "%s{\"id\":\"nodes\",\"verdict\":\"%s\",\"what\":", dn ? "," : "",
+                ni >= g_pl.cf.active ? "ok" : "warn");
+        jsonw_str(f, what);
+        fputs(",\"why\":", f);
+        jsonw_str(f, ni >= g_pl.cf.active ? "" : hint);
+        fputc('}', f);
+    }
+    fputs("]}\n", f);
     if (fclose(f) != 0 || rename(tmp, path) != 0) { unlink(tmp); return; }
     /* Помощник плагина говорит ядру, что файл состояния переписан (событие state, steer-api.md 2.2). */
     if (g_status_path) evline_emit("state", (const char *)NULL);
@@ -1210,7 +1229,7 @@ static int pl_match(const void *ctx, const void *dst, const void *src) {
     int live = sl->gen == s->gen && sl->up;
     pthread_mutex_unlock(&g_pl.mu);
     if (!live) return -1;
-    if (g_pl.cf.by == BY_CONNECTION) return 1;
+    if (g_pl.cf.by == POOL_BY_CONNECTION) return 1;
     return d->slot == s->slot;
 }
 
@@ -1365,7 +1384,7 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     return &d;
 }
 
-int pool_run(struct output *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg) {
+int pool_run(const struct tun_out *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg) {
     const struct dialer *d = pool_setup(pc);
     if (!d) return 1;
     static struct pl_ready r;

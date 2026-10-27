@@ -154,7 +154,7 @@ export STEER_PLUGIN_AUTO=0
 P() { "$BIN" plugin "$@"; }
 
 # ---- версия ядра для оси compat ----
-check "steer version --json: core, api, abi" "2.1.0 1.0 1.0" \
+check "steer version --json: core, api, abi" "2.1.0 1.1 1.0" \
     "$("$BIN" version --json | jq_ 'd["core"]+" "+d["api"]+" "+d["abi"]')"
 
 # ---- каталог ----
@@ -191,7 +191,7 @@ o="$(P install neu --json 2>/dev/null)"
 check "install neu: взята совместимая 1.0.0 (2.0.0 требует steer-api ^9)" "1.0.0" "$(printf '%s\n' "$o" | jq_ 'd["version"]')"
 o="$(P install neu 2.0.0 --json 2>/dev/null)"; rc=$?
 check "install neu 2.0.0: отказ" "1" "$rc"
-has "  причина с числами" "требует steer-api ^9.0, у ядра 1.0" "$o"
+has "  причина с числами" "требует steer-api ^9.0, у ядра 1.1" "$o"
 
 # ---- место ----
 o="$(STEER_PLUGIN_FREE=1000 P install big --json 2>/dev/null)"; rc=$?

@@ -27,75 +27,32 @@ xsteer — [docs/xsteer.md](xsteer.md).
 **Пакет роутера — разделяемая раскладка**, а не один статический файл. Профили выше остаются для
 статических сборок (телефон, стенды, микропакет tgws, хаб на VPS); роутер получает те же файлы,
 разложенные по бинарникам и библиотекам (списки — те же `build/sources.mk`, рецепт —
-`build/build-libs.sh`):
+`build/build-libs.sh`), — раскладка 2.1 ниже. Видов протоколов в ядре нет: виды `tunnel:<протокол>` и
+`xsteer` приходят манифестами плагинов (`src/kinds/plugin.c`). Без плагина выход такого вида — `unavail` с
+причиной «нужен плагин X — поставить» (кто даёт вид — из `provides.kinds` индекса семени
+`/usr/share/steer/seed`; своего списка «вид → плагин» у ядра нет), а при `apply` — отказ с той же причиной;
+команды протоколов без плагина — «нет такой команды». Модулем остался только мост `steer-tgws`
+(`src/cli/modcmd.c`, `src/lib/module.c`).
 
-| Файл | Список | Что в нём |
-|---|---|---|
-| `libsteer-wolfssl.so.<версия wolfSSL>` | `build/wolfssl/build.sh` | наша сборка wolfSSL (`build/wolfssl/user_settings.h`, QUIC включён) — только достижимое от экспорта; в `libsteer.so` — ещё ngtcp2 с патчем Brutal и обёртка `src/proto/quic` |
-| `libsteer.so.<версия ядра steer>` | `LIBSTEER_SRC` | модель спеки с libyaml, платформа, реестр и файлы видов, разбор командной строки, линия событий, обфускатор (`obfs.c`), слой примитивов, TLS 1.3, REALITY, h2, транспорты, стек TUN и `tun.c` |
-| `steerd` | `STEERD_DYN_SRC` = `DAEMON_SRC` + `urltls.c` | демон, компилятор правил, apply, сторож, супервизор, резолвер, заглушки команд модулей (`src/cli/modcmd.c`) |
-| `steer-vless` | `VLESS_MODULE_SRC` | клиент VLESS: `vlmain`, `vldial`, `client`, `vless_proto`, `vision`, разбор и скачивание подписки, проба TLS; пул узлов и слежка (`src/tunnel/pool.c`) — в `libsteer`, со стеком |
-| `steer-xsteer` | `XSTEER_MODULE_SRC` | клиент звезды: `xsclient` и общая часть формата (`xswire`, `xsconf`, `xslink`, `xsroute`, `xsconn`, `xsstream`, `xsepoch`, `xshake`), служебные команды `xsadmin` |
-| `steer-obfs` | `OBFS_MODULE_SRC` | точка входа обфускатора (`obfsmain.c`); сам `obfs.c` — в `libsteer`, его зовёт и xsteer |
-| `steer-tgws` | `TGWS_MODULE_SRC` | мост Telegram (`tgws.c`); правила перехвата пишет ядро (`kinds/tgws.c`) |
-| `steer-hysteria2` | `HY2_MODULE_SRC` | клиент hysteria2 ([docs/hysteria2.md](hysteria2.md)): провод (`hy2wire`), узлы и подписка (`hy2sub`), соединение QUIC в цикле рабочего стека и потоки клиента поверх него (`hy2conn`), дайлер стека (`hy2dial`), команды и слежка (`hy2main`); запись вида — `kinds/hysteria2.c` в `libsteer` (`KINDS_HY2_SRC`); в статические профили и в телефон не входит |
-| `steer-proxy` | `PROXY_MODULE_SRC` | клиенты прокси ([docs/proxy.md](proxy.md)): trojan, shadowsocks, socks, http, vmess одним бинарником — провод и вывод ключей (`pxwire`), узлы и подписка (`pxsub`), общее дайлеров (`pxdial`), по файлу на протокол (`pxtrojan`, `pxss`, `pxsocks`, `pxhttp`, `pxvmess`), команды (`pxmain`), слежка — пул узлов `src/tunnel/pool.c`; дайлеры — поверх стека `src/tunnel` и транспорта `src/proto/transport`, как vless; записи пяти видов — `kinds/proxy.c` в `libsteer` (`KINDS_PROXY_SRC`); в статические профили и в телефон не входит (как hysteria2) |
-| `steer-warpbox` | `WARP_MODULE_SRC` | WARP для steer ([docs/warp.md](warp.md)): регистрация устройств, подбор и замена точек входа; `src/proto/warp`, `main_warpbox.c`; в статические профили и в телефон не входит, в `steer-extended` не входит |
-
-Каждый модуль — свой `main` (`src/modules/main_<имя>.c`) и `src/cli/modcmd.c`; линкуется он с
-`libsteer.so`, thread-local таблицы туннеля живут в куче потока (раздел «Туннели»). В модуле нет
-`failover.c` и модели: маршрут выхода ставит демон по событию `up` (раздел 4а). Списки
-непересекающиеся, `modcmd.c` — общий; это сверяет `tests/buildmatch.sh`.
-
-Экспорт `libsteer.so` — version-script `build/libsteer.map` (только то, что берут `steerd` и
-модули; порождён из кода `build/libs-exports.sh`, проверка — `make libs-test`), SONAME
-`libsteer.so.<версия ядра steer>`; ABI между версиями не обещается, поэтому модуль той же версии, что
-ядро (зависимость пакета `steer-core (= версия)`; демон дополнительно проверяет версию из `hello`
-модуля, `docs/ctl.md`). Экспорт `libsteer-wolfssl.so` — `build/wolfssl/libsteer-wolfssl.map`:
-символы wolfSSL, которые зовёт слой примитивов, и отпечаток сборки. Библиотеки собираются `-fPIC` и
-`-ftls-model=initial-exec`; видимость задаёт version-script, а не `-fvisibility=hidden` (пометка
-`visibility("default")` на каждом экспортируемом определении — второй список в исходниках рядом с
-первым). Загрузчик musl задаётся на каждую архитектуру (`-Wl,--dynamic-linker`, `interp_of` в
-`build/arches.sh`): `ld-musl-mipsel-sf.so.1`, `ld-musl-mips-sf.so.1`, `ld-musl-aarch64.so.1`,
-`ld-musl-armhf.so.1`, `ld-musl-arm.so.1`, `ld-musl-x86_64.so.1`; RPATH нет — библиотеки в
-`/usr/lib`.
-
-Пакеты (`build.sh`, функция `pack`; оба формата — `.apk` и `.ipk` — из одного дерева файлов):
-`steer-core` (`steerd`, `steer`, `steer-tools` — ссылка на `steerd`, обе библиотеки
-в `/usr/lib`, init-скрипт, hotplug, `keep.d`; зависит только от чужих `nftables`, `ip-full`,
-`conntrack`, `kmod-nft-queue`), `steer-vless`, `steer-xsteer`, `steer-obfs`, `steer-tgws`,
-`steer-hysteria2`, `steer-proxy`, `steer-warpbox` (по одному бинарнику `usr/sbin/steer-<имя>`; зависят от `steer-core (= версия)`,
-модули с собственным TUN — ещё от `kmod-tun`) и мета-пакет `steer-extended` (устаревший: ядро и
-первые четыре модуля; `steer-hysteria2`, `steer-proxy` и `steer-warpbox` в него не входят). Библиотеки лежат внутри `steer-core`, а
-не в своих пакетах: `steerd` сам ходит по HTTPS (замер групп, `urltls.c`) и по DoH, DoT и DoQ (резолвер),
-поэтому криптография нужна ядру и без модулей. Модули файлов ядра не повторяют — у каждого файла
-один владелец.
-
-`steer-core` заменяет пакеты прежней раскладки — `steer`, `libsteer`, `libsteer-wolfssl`: он
-объявляет `provides steer`, `replaces` и конфликт с ними (apk: `provides`, `replaces` и `!имя` в
-`depends`; opkg: поля `Provides`, `Replaces`, `Conflicts`), поэтому установка и обновление снимают
-старые пакеты, а `/usr/sbin/steerd` принадлежит одному пакету. Проверка на настоящем менеджере apk —
-`tests/pkglayout.sh`; для opkg проверяются только поля метаданных.
-
-Модуль, которого нет в системе, — не отсутствие команды. Вид выхода `vless` или `xsteer` при
-разборе спеки отвечает «kind vless требует пакет steer-vless (входит в steer-extended)» —
-единственное место текста, `src/kinds/kind.c`; команда модуля (`steer vless …`, `sub-fetch`,
-`tls-probe`, `xsteer-key`…) без модуля отвечает так же, с кодом 2, а при установленном модуле
-`steerd` запускает его с той же командной строкой (`src/cli/modcmd.c`). Есть ли модуль, решает
-файл `steer-<имя>` рядом с исполняемым файлом (`src/lib/module.c`; каталог подменяет
-`STEER_MODULE_DIR`).
+Экспорт `libsteer.so` — version-script `build/libsteer.map` (только то, что берут `steerd` и мост;
+порождён из кода `build/libs-exports.sh`, проверка — `make libs-test`), SONAME
+`libsteer.so.<версия ядра steer>`. Экспорт `libsteer-wolfssl.so` — `build/wolfssl/libsteer-wolfssl.map`.
+Ядро и `libsteer` собираются `-fPIC` и `-ftls-model=initial-exec`; `net1` — без него (модель
+global-dynamic): её загружают и dlopen'ом, вслед за .so-плагином `steerd`, а места в статическом блоке TLS
+процесса для неё нет. Видимость задаёт version-script. Загрузчик musl задаётся на каждую архитектуру
+(`interp_of` в `build/arches.sh`).
 
 ### Раскладка 2.1: ядро, `net1` и протоколы-плагины
 
 С 2.1 протоколы — плагины, обновляются отдельно от ядра, а общий для них сетевой стек — один
 плагин-библиотека `net1` (plugin-sdk: `docs/steer-abi.md`, «Сервисы протоколам»; `docs/open.md`, О-1).
-Раскладка 2.1 — умолчание `build/build-libs.sh` и `build.sh`; прежняя собирается по `STEER_LAYOUT=2.0`.
+Раскладка 2.1 — единственная у `build/build-libs.sh`.
 
 | Файл | Список | Что в нём |
 |---|---|---|
 | `libsteer.so.<версия>` | `PROFILE_libsteer` | модель, виды, разбор команд, линия событий, обфускатор, слой примитивов, TLS 1.3, REALITY, HTTP/2, ECH, корни, HTTP-клиент (`httpc.c`, `wbhttps.c`), подпись и распаковка плагинов, QUIC с ngtcp2 и DoQ. Стека TUN (`src/tunnel`), транспортов (`src/proto/transport`) и разбора ссылок узлов (`sublink.c`) нет |
 | `plugins/net1/lib/libs2p-net.so.1` | `PROFILE_net1` | стек TUN, пул узлов, гео, транспорты, разбор ссылок, вторая копия TLS/REALITY/HTTP/2/QUIC, основа стека (платформа, профиль, линия событий, `run`, JSON, `err`); wolfSSL и ngtcp2 вкомпилированы и скрыты |
-| `plugins/<id>/bin/<id>` | `PROFILE_plug_<id>` | `vless`, `hysteria2`, `proxy`, `xsteer`, `warpbox` — код протокола, разбор спеки (`PLUGIN_BASE_SRC`, статически) и `DT_NEEDED libs2p-net.so.1` с `RUNPATH $ORIGIN/../../net1/lib`; `obfs` стека не берёт и с библиотеками steer не связан |
+| `plugins/<id>/bin/<id>` | `PROFILE_plug_<id>` | `vless`, `hysteria2`, `proxy`, `xsteer`, `warpbox` — код протокола на `src/plugkit` (сторона плагина в API: {conf}, точка входа, файл состояния; модели спеки ядра нет) и `DT_NEEDED libs2p-net.so.1` с `RUNPATH $ORIGIN/../../net1/lib`; `obfs` стека не берёт и с библиотеками steer не связан |
 | `steerd`, `steer-tgws` | как раньше | мост остаётся модулем на `libsteer` до своего плагина |
 
 **Что ядро держит само и почему.** TLS/QUIC и wolfSSL у ядра свои: резолвер ходит по DoH, DoH3 и
@@ -114,14 +71,16 @@ DoQ, замер групп — по HTTPS (`urltls.c`), менеджер пла�
 раскладки (`src/net1/s2pnet.h`): плагин сверяет его и minor ABI при запуске (`src/net1/s2pcheck.c`) и
 отказывает строкой, а не портит память. Смена раскладки структуры границы — major (`net2`).
 
-**Где ядро ищет протокол.** Команды и помощники модуля `steer-<id>` ведёт программа
-`<каталог плагинов>/<id>/bin/<id>` (`STEER_PLUGIN_DIR`, иначе `/usr/lib/steer/plugins`), а если её нет —
-прежний `steer-<id>` рядом со `steerd` (`src/lib/module.c`). Это шов до реестра плагинов, где помощник и
-подкоманды берутся из манифеста. Помощник по манифесту запускается с `--conf {conf}` и о своём выходе
-знает только {conf} (файл кладёт демон, `src/daemon/helpers.c`): `src/modules/plugconf.c` строит из него
-спеку из одного выхода в каталоге плагина, метку, таблицу и метку сокетов берёт из {conf}, состояние пишет
-в `<state>/plugin/<id>/<выход>.status.json` (событие `state`), fake-IP читает по `paths.fakeip`. Реестр
-плагинов в процессе помощника пуст: свой вид он берёт из встроенной записи своей копии модели.
+**Где ядро ищет протокол.** Только в манифесте плагина: вид (`steer.kinds[]`, ключи — по схеме вида),
+помощник выхода (`helper`), хуки `check` и `expand`, подкоманды и команды сокета (`steer.commands[]`).
+Программа плагина `<каталог плагинов>/<id>/bin/<id>` (`STEER_PLUGINS_ROOT`, иначе `/usr/lib/steer/plugins`)
+о выходе знает только {conf} — файл, который пишет ядро (`plugin_conf_json`: ключи вида, устройство,
+метка, таблица, метка сокетов, подложка, члены развёрнутой группы, каталоги); спеку человека она не читает
+(`--spec` у команд протоколов нет). Подкоманда с `conf: true` получает {conf} названного выхода через
+memfd. Состояние программа пишет в `<state>/plugin/<id>/<выход>.status.json` (событие `state`), ядро
+печатает его в `status` полем `plugin.state` (и прежним полем протокола, `"vless": {…}`), а строки
+`diag` из него — в `steer diag`. Таблица подкоманд программы — `PK_PROGRAM` в `src/modules/main_<id>.c`;
+её же вкомпилированный вариант — в бинарнике телефона вместе с манифестом (`src/plugkit/pkembed.c`).
 
 **Упаковка.** Манифесты и схемы ключей — `plugins/<id>/` дерева; `build/pack-s2p.sh` собирает `.s2p` под
 архитектуру (`s2p build`, подпись — ключ `S2P_KEY`, без него тестовый) и семя
@@ -204,9 +163,9 @@ procd
        ├─ сторож                                   на цикле событий, без fork на проход
        ├─ супервизор детей
        ├─ steer dnsd --table-fd 3                  ребёнок: файл steerd, argv[0] «…/steer»
-       ├─ steer vless|xsteer|obfs|tgws <выход>     ребёнок: бинарник модуля (steer-vless,
-       │                                            steer-xsteer, steer-obfs, steer-tgws),
-       │                                            argv[0] «…/steer»
+       ├─ <id> <выход> --conf {conf}               ребёнок: программа плагина
+       │                                            (plugins/<id>/bin/<id>: vless, xsteer, obfs…)
+       ├─ steer tgws <выход>                       ребёнок: модуль моста steer-tgws
 steer <команда>          клиент: команды демона — в сокет; остальное и всё без демона — execv steerd
 steer-tools <команда>    ссылка на steerd: отвечает только на инструменты
 ```
@@ -215,17 +174,16 @@ steer-tools <команда>    ссылка на steerd: отвечает то�
   выходов, резолвер, инструменты; `steerd <подкоманда>` — то же, что подкоманда ядра. `steer` —
   отдельный маленький клиент сокета (`src/client/main.c`). `steer-tools` — ссылка на `steerd`, под
   этим именем ядро отвечает только на инструменты (раздел 4а, «Бинарники»).
-- **Помощники: резолвер — подкоманда `steerd`, туннели, обфускатор и мост — модули.** Резолвер
-  демон запускает тем же файлом `steerd`, помощников выходов — бинарником модуля из каталога
-  ядра (`kind_helper.prog`, `helpers_plan` в `src/daemon/helpers.c`): `steer-vless`,
-  `steer-xsteer`, `steer-obfs`, `steer-tgws`, `steer-hysteria2`. Слова у них те же, что у подкоманды
-  (`<команда> <выход> --spec … [--state-dir …]`), окружение — `STEER_EVENT_FD` и `STEER_SUPD`, как
-  у прежних помощников. argv[0] у всех «…/steer» (`helper_argv0`): в списке процессов они
-  выглядят как `steer dnsd`, `steer vless <выход>`, и поиск по командной строке (diag — обходом
-  /proc) их находит. В статической сборке (телефон, стенды) модули слинкованы в `steerd`
-  (`modcmd_builtin`), и помощник — подкоманда, как раньше. Обработчик внешнего модуля DPI — своя
-  программа рядом с ядром (`kind_helper.prog`).
-- **У модулей SIGPIPE выключен** (`modcmd_run`, для всех модульных команд). Запись в сокет узла,
+- **Помощники: резолвер — подкоманда `steerd`, протоколы — программы плагинов, мост — модуль.** Резолвер
+  демон запускает тем же файлом `steerd`, помощников выходов видов плагинов — программой плагина по
+  манифесту (`helper`: `<id> <выход> --conf {conf}`; `plugin_kind_helper` в `src/kinds/plugin.c`), мост —
+  бинарником `steer-tgws`. Окружение — `STEER_EVENT_FD`, `STEER_SUPD` и переменные steer-api
+  (`STEER_PLUGIN_ID`, `STEER_PLUGIN_STATE`…). Первое сообщение программы — `hello` с её steer-api и id:
+  чужой major или minor новее ядра, чужое имя или не `hello` — процесс гасится, причина — в `last_down`.
+  В статической сборке телефона программы плагинов слинкованы в сам бинарник (`PK_PROGRAM`), а манифесты —
+  в `src/plugkit/pkembed.c`: ядро запускает тот же бинарник с `STEER_PK_BUILTIN=<id>`. Обработчик
+  внешнего модуля DPI — своя программа рядом с ядром (`kind_helper.prog`).
+- **У программ плагинов и модулей SIGPIPE выключен** (`pk_main`, `modcmd_run`). Запись в сокет узла,
   который узел уже закрыл, — ошибка EPIPE, как ECONNRESET: стек закрывает ровно это соединение
   (RST клиенту) и освобождает его, а процесс продолжает нести остальные. С SIGPIPE по умолчанию такая
   запись убивала модуль целиком: выгрузка в несколько потоков на высокой скорости (iperf3 -P 8
@@ -264,8 +222,8 @@ src/
               check.c (сквозные проверки), registry.c (реестр меток и таблиц), marks.h, probe.c,
               srs.c, srsplan.c (наборы sing-box)
   kinds/      kind.h и kind.c (struct kind_ops, биты свойств, реестр),
-              direct.c interface.c awg.c vless.c xsteer.c tgws.c group.c grpurl.c
-              hysteria2.c proxy.c (записи видов модулей steer-hysteria2 и steer-proxy)
+              direct.c interface.c awg.c awgdev.c (устройство AmneziaWG: его же берёт плагин warpbox)
+              tgws.c group.c grpurl.c, plugin.c (реестр плагинов: виды, команды и хуки из манифестов)
   platform/   platform.h, platform.c, openwrt.c, android.c
   profile/    profile.h, profile.c (умолчания), extended.c, server.c, tgws.c — данные профиля
   compile/    groups.c, balance.c, generate.c, print.c,
@@ -277,10 +235,14 @@ src/
   dnsd/       main.c, proxy.c, wire.c, rules.c, fakeip.c, realip.c, origdst.c, table.c, tabfmt.c,
               fpseed.c, adopt.c, dlog.c
   client/     main.c — steer, клиент сокета
-  cli/        cli.c — таблица команд и разбор командной строки; modcmd.c — команды модулей
-              (заглушки в steerd, настоящие ветки в модуле) и main модуля (steer_module_main)
-  modules/    main_vless.c, main_xsteer.c, main_obfs.c, main_tgws.c, main_hysteria2.c, main_proxy.c, main_warpbox.c
-              — main бинарников модулей (только разделяемая раскладка)
+  cli/        cli.c — таблица команд и разбор командной строки; modcmd.c — команды моста tgws
+              (единственного модуля: заглушки в steerd, настоящие ветки в модуле) и steer_module_main
+  plugkit/    сторона плагина в API ядра (steer-api 1.1): plugkit.c — {conf} выхода, точка входа
+              программы (pk_main, PK_PROGRAM), файл состояния и событие state; pktun.c — ключи туннеля
+              по подписке; pkjson.c — разбор JSON; pkembed.c — манифесты плагинов, вкомпилированных в
+              бинарник телефона (порождает build/pkembed.sh). Модели спеки ядра в программах плагинов нет
+  modules/    main_vless.c, main_xsteer.c, main_obfs.c, main_hysteria2.c, main_proxy.c, main_warpbox.c —
+              таблицы подкоманд программ плагинов (PK_PROGRAM); main_tgws.c — main модуля моста
   tools/      aggregate.c (fit), srsread.c, hwid.c
   tunnel/     стек туннеля без протокола: tun.c (TUN: очереди, разгрузка, запись пакетов),
               rtx.c (кольцо недописанного клиенту), stack.c и stack.h (сокеты TCP и UDP из TUN ↔ потоки к узлу, таблица

@@ -16,7 +16,6 @@
 #include "spec.h"
 #include "plugin.h"
 #include "srsplan.h"
-#include "obfs.h"
 #include "ynode.h"
 #include "v1.h"
 #include "v2.h"
@@ -573,11 +572,22 @@ int load_spec_mode(const char *path, struct spec *s, struct err *e, int flags) {
             return err_set(e, "%s", "недостаточно памяти для спеки");
         }
         if (pr > 0) {
-            free(buf);
-            buf = pt;
-            n = pn;
+            /* Отказ по подготовленной спеке называл бы место в ней, а не в спеке человека (её ключ —
+             * байты спеки, а не платформа: подготовленная телефоном спека с uid на роутере не
+             * годится). Поэтому при отказе отвечает разбор спеки человека, если отказывает и он. */
             s->prepared = 1;
             memcpy(s->prepared_key, key, sizeof(key));
+            int rc = load_text(pt, pn, path, s, e);
+            free(pt);
+            if (rc == 0) { free(buf); return 0; }
+            struct err he;
+            memset(&he, 0, sizeof(he));
+            if (spec_defaults(s) != 0) { free(buf); return err_set(e, "%s", "недостаточно памяти для спеки"); }
+            s->load_flags = flags;
+            int hr = load_text(buf, n, path, s, &he);
+            free(buf);
+            if (hr != 0) *e = he;
+            return -1;
         }
     }
     int rc = load_text(buf, n, path, s, e);

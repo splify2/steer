@@ -8,8 +8,7 @@
 # запирает возможности, которые есть, — или, что дороже, считает новым и пишет в спеку поле,
 # которое будет пропущено молча (трафик через узел, которого никто не выбирал).
 #
-# Бинарник — build/diagsim: спеку с `kind: vless` базовая сборка отвергает парсером (и обязана
-# отвергать), а именно у такого выхода печатается `nodes`. Тот же довод, что в diagmatch.sh.
+# Бинарник — build/diagsim (тот же довод, что в diagmatch.sh); вид vless — из манифеста плагина.
 set -u
 BIN="${DIAG:-./build/diagsim}"
 [ -x "$BIN" ] || { echo "not built: $BIN (make test)"; exit 2; }
@@ -24,6 +23,9 @@ pass=0 fail=0
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/state"
+# Вид vless — из манифеста плагина vless (каталог плагинов стенда, tests/plugroot.sh).
+sh tests/plugroot.sh "$tmp/plugins" "$(dirname "$BIN")" || { echo "statusmatch: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
@@ -73,11 +75,23 @@ check "schema не тронута" "1" \
 check "lan_devices отданы списком" "1" \
       "$(printf '%s' "$out" | grep -c '"lan_devices":\["tailscale0","zt7bcxxxxx"\]')"
 
-# ---- выбранные узлы подписки -------------------------------------------------
-# Печатается всегда, в том числе пустым списком: пустой `nodes` значит «первый рабочий среди
-# всех пригодных», и отличить его от «поля нет» обязано быть можно.
-check "nodes у выхода подписки печатаются пустыми" "1" \
-      "$(printf '%s' "$out" | grep -c '"nodes":\[\]')"
+# ---- выход вида плагина: плагин и его состояние ----------------------------------
+# Ключи вида (nodes и прочие) ядро не печатает: оно их не знает, их знает плагин (поколение ядра —
+# по перечню умений выше). Выход называет плагин и версию, а файл состояния помощника
+# (<state>/plugin/<id>/<выход>.status.json) идёт полем plugin.state и прежним полем протокола.
+check "выход вида плагина называет плагин" "1" \
+      "$(printf '%s' "$out" | grep -c '"loc":{"kind":"vless".*"plugin":{"id":"vless","version":"[^"]*"}')"
+mkdir -p "$tmp/state/plugin/vless"
+printf '{"pid":%d,"active":[{"n":2,"name":"nl-2"}],"want":1}\n' "$$" > "$tmp/state/plugin/vless/loc.status.json"
+outp="$($BIN status --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>/dev/null)"
+check "  состояние помощника — полем plugin.state" "1" \
+      "$(printf '%s' "$outp" | grep -c '"state":{"pid":[0-9]*,"active":\[{"n":2,"name":"nl-2"}\],"want":1}}')"
+check "  и прежним полем протокола (vless)" "1" \
+      "$(printf '%s' "$outp" | grep -c '}},"vless":{"pid":[0-9]*,"active":\[{"n":2,"name":"nl-2"}\],"want":1}')"
+printf '{"pid":999999999,"active":[]}\n' > "$tmp/state/plugin/vless/loc.status.json"
+outp="$($BIN status --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>/dev/null)"
+check "  файл мёртвого процесса не печатается" "0" "$(printf '%s' "$outp" | grep -c '"vless":{')"
+rm -rf "$tmp/state/plugin"
 
 # ---- устройство выхода: то, что несёт трафик СЕЙЧАС ---------------------------
 # Сторож увёл пул на запасное устройство и записал это в active. Без чтения записи status

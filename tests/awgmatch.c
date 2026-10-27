@@ -14,9 +14,9 @@
  *
  * Парсер спеки (MODEL_SRC) линкуется отдельным объектом (Makefile): load_spec() возвращает
  * отказ, а не зовёт exit() сама (правило 5, docs/architecture.md, раздел 2), и spec_str ниже
- * читает код возврата напрямую — перехватывать больше нечего. src/kinds/awg.c — вне пяти
- * каталогов правила юнит-стендов (раздел 4), поэтому остаётся #include: awg_conf_free и другие его
- * статические помощники стенду нужны как есть. run_quiet — заглушка: до команд ip стенд не
+ * читает код возврата напрямую — перехватывать больше нечего. src/kinds/awg.c и слой устройства под
+ * ним src/kinds/awgdev.c — #include: их статические помощники (разбор ключа, сборка сообщений, подпись
+ * параметров) стенду нужны как есть. run_quiet — заглушка: до команд ip стенд не
  * доходит. */
 /* awg.c ниже — #include, а ему нужен _GNU_SOURCE (setns, устройства подбора) до первого заголовка. */
 #define _GNU_SOURCE
@@ -29,6 +29,7 @@
 
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 
+#include "../src/kinds/awgdev.c"
 #include "../src/kinds/awg.c"
 
 static int fails, passes;

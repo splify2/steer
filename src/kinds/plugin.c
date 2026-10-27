@@ -8,8 +8,8 @@
  * ynode, что спеку v2: JSON — подмножество YAML, второго разборщика ядру не нужно.
  *
  * НИЧЕГО ЗАШИТОГО. Перечня видов плагинов в ядре нет: вид приходит из манифеста вместе со схемой,
- * свойствами, помощником и шаблонами. Единственное зашитое — подсказки «какой плагин даёт вид» для
- * отказа «нужен плагин vless» (HINTS ниже, семя до появления индекса).
+ * свойствами, помощником и шаблонами. Какой плагин даёт вид, которого нет, ядро узнаёт из индекса семени
+ * (provides.kinds, seed_kind_plugin), а не из своего списка.
  *
  * ОТКАЗЫ НЕ ВАЛЯТ РЕЕСТР. Манифест, который не читается, несовместим по steer-api, конфликтует по
  * имени или назван в state.json отключённым, превращает свой плагин в выключенный с причиной
@@ -40,12 +40,41 @@
 #include "ynode.h"
 #include "ir.h"
 #include "marks.h"
+#include "jsonw.h"
 
 extern const struct cli_cmd *cli_lookup(const char *name) __attribute__((weak));
 
 /* ---- мелочи ------------------------------------------------------------------------------- */
 
 /* ---- пути --------------------------------------------------------------------------------- */
+
+/* Файл плагина: настоящий — с диска, вкомпилированного (PLUGIN_BUILTIN_DIR/<id>/<путь>) — из
+ * steer_plugin_embed, с версией ядра вместо @VERSION@. NULL — нет файла. */
+static char *pl_read(const char *path, size_t *n) {
+    static const char pre[] = PLUGIN_BUILTIN_DIR "/";
+    if (strncmp(path, pre, sizeof(pre) - 1) != 0) return slurp(path, n);
+    if (!steer_plugin_embed) return NULL;
+    const char *id = path + sizeof(pre) - 1, *sl = strchr(id, '/');
+    if (!sl) return NULL;
+    for (const struct plugin_embed *e = steer_plugin_embed; e->id; e++) {
+        if (strlen(e->id) != (size_t)(sl - id) || strncmp(e->id, id, (size_t)(sl - id)) != 0) continue;
+        for (const struct plugin_embed_file *f = e->files; f->path; f++) {
+            if (strcmp(f->path, sl + 1) != 0) continue;
+            struct sbuf b = { 0 };
+            const char *t = f->text, *v;
+            while ((v = strstr(t, "@VERSION@"))) {
+                sb_put(&b, t, (size_t)(v - t));
+                sb_str(&b, steer_engine_version());
+                t = v + 9;
+            }
+            sb_str(&b, t);
+            if (b.oom || !b.p) { free(b.p); return NULL; }
+            if (n) *n = b.n;
+            return b.p;
+        }
+    }
+    return NULL;
+}
 
 const char *plugin_root(void) {
     const char *e = getenv("STEER_PLUGINS_ROOT");
@@ -57,11 +86,6 @@ const char *plugin_etc(char *buf, size_t n) {
     if (e && *e) snprintf(buf, n, "%s", e);
     else snprintf(buf, n, "%s/plugins", plat()->etc_dir);
     return buf;
-}
-
-int plugin_layout_present(void) {
-    struct stat st;
-    return stat(plugin_root(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 /* Путь внутри каталога плагина: не абсолютный и без «..» (manifest.md, «Общие правила»). */
@@ -183,16 +207,20 @@ static void kind_free(struct plugin_kind *k) {
     for (size_t i = 0; i < k->nft_n; i++) pnft_free(k->nftp ? k->nftp[i] : NULL);
     free(k->nftp);
     free(k->lan_only); free(k->novia); free(k->selfnat_why);
+    free(k->desc); free(k->helper_when);
+    vec_free(k->watch, k->watch_n);
     free(k);
 }
 
 static void plugin_free(struct plugin *p) {
-    free(p->id); free(p->version); free(p->dir); free(p->name); free(p->why);
+    free(p->id); free(p->version); free(p->dir); free(p->name); free(p->desc); free(p->why);
     for (size_t i = 0; i < p->cmd_n; i++) {
         free(p->cmd[i].name);
         prog_free(&p->cmd[i].run);
         free(p->cmd[i].help);
         free(p->cmd[i].usage);
+        for (size_t j = 0; j < p->cmd[i].ctl_args_n; j++) { free(p->cmd[i].ctl_args[j].kind); free(p->cmd[i].ctl_args[j].flag); }
+        free(p->cmd[i].ctl_args);
     }
     free(p->cmd);
     vec_free(p->nft, p->nft_n);
@@ -256,10 +284,16 @@ static int m_prog(const char *dir, const struct ynode *node, const char *what, s
     const char *prog = m_str(node, "prog");
     if (!prog) { snprintf(why, wn, "%s: нет prog", what); return -1; }
     if (!relpath_ok(prog)) { snprintf(why, wn, "%s: путь %s выходит за каталог плагина", what, prog); return -1; }
-    size_t l = strlen(dir) + strlen(prog) + 2;
-    p->prog = malloc(l);
+    if (!strncmp(dir, PLUGIN_BUILTIN_DIR "/", sizeof(PLUGIN_BUILTIN_DIR))) {
+        /* Вкомпилированный плагин: программа — этот же бинарник; какая из вкомпилированных — по
+         * STEER_PK_BUILTIN (plugin_env, plugin_kind_helper; src/daemon/main.c). */
+        p->prog = strdup("/proc/self/exe");
+    } else {
+        size_t l = strlen(dir) + strlen(prog) + 2;
+        p->prog = malloc(l);
+        if (p->prog) snprintf(p->prog, l, "%s/%s", dir, prog);
+    }
     if (!p->prog) { snprintf(why, wn, "нет памяти"); return -1; }
-    snprintf(p->prog, l, "%s/%s", dir, prog);
     if (m_strs(ynode_get(node, "argv"), what, &p->argv, &p->argc, why, wn) != 0) return -1;
     const struct ynode *env = ynode_get(node, "env");
     if (env && env->kind == YN_MAP) {
@@ -332,6 +366,15 @@ static struct plugin_kind *kind_load(const struct plugin *pl, const struct ynode
         const char *cmd = m_str(hn, "cmd");
         k->helper_cmd = strdup(cmd ? cmd : name);
         k->helper_argv_set = ynode_get(hn, "argv") != NULL;
+        /* helper.when (manifest.md, kinds[]): помощник только у выходов, где записан этот ключ вида —
+         * так плагин даёт помощника виду ядра (impl: core): обфускатор выходу interface с obfs. */
+        k->helper_when = xdup(m_str(hn, "when"));
+        if (k->helper_when && !k->impl_core) {
+            snprintf(why, wn, "вид %s: helper.when — только у вида ядра (impl: core); у своего вида помощник "
+                     "нужен всякому выходу", name);
+            kind_free(k);
+            return NULL;
+        }
     }
     const char *keys = m_str(kn, "keys");
     if (keys) {
@@ -343,7 +386,7 @@ static struct plugin_kind *kind_load(const struct plugin *pl, const struct ynode
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s", pl->dir, keys);
         size_t n;
-        char *txt = slurp(path, &n);
+        char *txt = pl_read(path, &n);
         if (!txt) {
             snprintf(why, wn, "вид %s: схема ключей %s не читается", name, keys);
             kind_free(k);
@@ -360,6 +403,27 @@ static struct plugin_kind *kind_load(const struct plugin *pl, const struct ynode
         }
         k->schema = ydoc_root(k->schema_doc);
         k->schema_path = strdup(path);
+        /* x-watch (manifest.md, «Слова схемы»): ключ-путь (x-path), содержимое файла которого помощник
+         * читает при старте — подпись перезапуска берёт и его (подписка обновилась — клиент
+         * перезапускается с новыми узлами). */
+        const struct ynode *props = ynode_get(k->schema, "properties");
+        for (size_t i = 0; props && props->kind == YN_MAP && i < ynode_len(props); i++) {
+            const struct ynode *pv = ynode_val_at(props, i);
+            int on = 0;
+            if (ynode_get(pv, "x-watch") && ynode_bool(ynode_get(pv, "x-watch"), &on) == 0 && on) {
+                if (!ynode_get(pv, "x-path")) {
+                    snprintf(why, wn, "вид %s: x-watch у ключа %s — только у пути (x-path)", name,
+                             ynode_key_at(props, i)->str);
+                    kind_free(k);
+                    return NULL;
+                }
+                if (vec_add(&k->watch, &k->watch_n, ynode_key_at(props, i)->str) != 0) {
+                    snprintf(why, wn, "нет памяти");
+                    kind_free(k);
+                    return NULL;
+                }
+            }
+        }
     }
     const struct ynode *nft = ynode_get(kn, "nft");
     char **nl = NULL;
@@ -402,6 +466,18 @@ static struct plugin_kind *kind_load(const struct plugin *pl, const struct ynode
         if ((r = ynode_get(res, "ports")) && ynode_long(r, &rv) == 0 && rv >= 0) k->res_ports = (unsigned)rv;
         if ((r = ynode_get(res, "queues")) && ynode_long(r, &rv) == 0 && rv >= 0) k->res_queues = (unsigned)rv;
     }
+    k->desc = xdup(m_str(kn, "description"));
+    if (!k->desc) k->desc = xdup(pl->desc);
+    /* health (manifest.md, kinds[]): events — здоровье и задержку выхода судит помощник своими up и
+     * down (клиент звезды xsteer: проба через устройство проверила бы интернет у хаба, а не туннель);
+     * tcp, icmp, probe и отсутствие ключа — общая проба ядра по свойствам вида. */
+    const char *hl = m_str(kn, "health");
+    if (hl && !strcmp(hl, "events")) k->health_events = 1;
+    else if (hl && strcmp(hl, "tcp") && strcmp(hl, "icmp") && strcmp(hl, "probe")) {
+        snprintf(why, wn, "вид %s: health — events, tcp, icmp или probe, а не «%s»", name, hl);
+        kind_free(k);
+        return NULL;
+    }
     const struct ynode *tx = ynode_get(kn, "texts");
     if (tx && tx->kind == YN_MAP) {
         k->lan_only = xdup(m_str(tx, "lan_only"));
@@ -419,7 +495,7 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
     memset(p, 0, sizeof(*p));
     snprintf(path, sizeof(path), "%s/%s/plugin.json", root, dirname);
     size_t n;
-    char *txt = slurp(path, &n);
+    char *txt = pl_read(path, &n);
     if (!txt) { *skip = 1; return 0; }
     p->id = strdup(dirname);
     char dir[PATH_MAX];
@@ -443,6 +519,7 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
     }
     p->version = strdup(ver);
     p->name = xdup(m_str(root_n, "name"));
+    p->desc = xdup(m_str(root_n, "description"));
     const struct ynode *st = ynode_get(root_n, "steer");
     /* Имена видов — до всех проверок: у плагина, выключенного ниже, их помнит отказ вида. */
     {
@@ -514,11 +591,65 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
         }
         c->help = xdup(m_str(cn, "help"));
         c->usage = xdup(m_str(cn, "usage"));
+        int cf = 0;
+        if (ynode_get(cn, "conf") && ynode_bool(ynode_get(cn, "conf"), &cf) == 0) c->conf = cf;
         const struct ynode *ctl = ynode_get(cn, "ctl");
         if (ctl && ctl->kind == YN_MAP) {
             long tv = 0;
             c->ctl = 1;
             if (ynode_get(ctl, "timeout_s") && ynode_long(ynode_get(ctl, "timeout_s"), &tv) == 0) c->ctl_timeout_s = (int)tv;
+            if (ynode_get(ctl, "optional") && ynode_long(ynode_get(ctl, "optional"), &tv) == 0) c->ctl_optional = (int)tv;
+            int lk = 0;
+            if (ynode_get(ctl, "lock") && ynode_bool(ynode_get(ctl, "lock"), &lk) == 0) c->ctl_lock = lk;
+            const char *body = m_str(ctl, "body");
+            if (body && !strcmp(body, "file")) {
+                c->ctl_body_max = 16L * 1024 * 1024;
+                if (ynode_get(ctl, "body_max") && ynode_long(ynode_get(ctl, "body_max"), &tv) == 0 && tv > 0)
+                    c->ctl_body_max = tv;
+            } else if (body && strcmp(body, "none") != 0) {
+                snprintf(why, sizeof(why), "подкоманда %s: ctl.body — none или file, а не «%s»", nm, body);
+                ydoc_free(d);
+                goto bad;
+            }
+            if (ynode_get(ctl, "spec")) {
+                snprintf(why, sizeof(why), "подкоманда %s: ctl.spec снят — спеку программа плагина не читает; "
+                         "выход ей даёт conf: true ({conf}, steer-api.md 1.4)", nm);
+                ydoc_free(d);
+                goto bad;
+            }
+            static const char *const KINDS[] = { "name", "int", "target", "file", "word", NULL };
+            const struct ynode *args = ynode_get(ctl, "args");
+            for (size_t ai = 0; args && args->kind == YN_SEQ && ai < args->len; ai++) {
+                const struct ynode *an = ynode_at(args, ai);
+                const char *k = an->kind == YN_SCALAR ? an->str : m_str(an, "kind");
+                size_t ki = 0;
+                while (KINDS[ki] && strcmp(KINDS[ki], k ? k : "")) ki++;
+                if (!KINDS[ki]) {
+                    snprintf(why, sizeof(why), "подкоманда %s: ctl.args — name, int, target, file или word, а не «%s»",
+                             nm, k ? k : "?");
+                    ydoc_free(d);
+                    goto bad;
+                }
+                struct plugin_ctl_arg *na = realloc(c->ctl_args, (c->ctl_args_n + 1) * sizeof(*na));
+                if (!na) { ydoc_free(d); return -1; }
+                c->ctl_args = na;
+                struct plugin_ctl_arg *ca = &c->ctl_args[c->ctl_args_n++];
+                memset(ca, 0, sizeof(*ca));
+                ca->kind = strdup(KINDS[ki]);
+                ca->lo = -2147483647L;
+                ca->hi = 2147483647L;
+                if (an->kind == YN_MAP) {
+                    ca->flag = xdup(m_str(an, "flag"));
+                    long v;
+                    if (ynode_get(an, "min") && ynode_long(ynode_get(an, "min"), &v) == 0) ca->lo = v;
+                    if (ynode_get(an, "max") && ynode_long(ynode_get(an, "max"), &v) == 0) ca->hi = v;
+                    if (ca->flag && strncmp(ca->flag, "--", 2) != 0) {
+                        snprintf(why, sizeof(why), "подкоманда %s: ctl.args: флаг «%s» — с «--»", nm, ca->flag);
+                        ydoc_free(d);
+                        goto bad;
+                    }
+                }
+            }
         }
     }
     const struct ynode *hooks = ynode_get(st, "hooks");
@@ -655,7 +786,6 @@ int plugin_reload(const char *root) {
     stamp_of(&g_stamp_a, &g_stamp_b, &g_stamp_sz);
     if (!root) root = plugin_root();
     DIR *d = opendir(root);
-    if (!d) return 0;
     char etc[PATH_MAX], sp[PATH_MAX + 16];
     plugin_etc(etc, sizeof(etc));
     snprintf(sp, sizeof(sp), "%s/state.json", etc);
@@ -669,12 +799,28 @@ int plugin_reload(const char *root) {
     }
     struct dirent *de;
     int rc = 0;
-    while ((de = readdir(d))) {
-        if (de->d_name[0] == '.') continue;
+    /* Сначала каталог плагинов, затем вкомпилированные — те, чьего id в каталоге нет. */
+    const struct plugin_embed *emb = steer_plugin_embed;
+    for (;;) {
+        const char *r, *nm;
+        if (d && (de = readdir(d))) {
+            if (de->d_name[0] == '.') continue;
+            r = root;
+            nm = de->d_name;
+        } else {
+            if (d) { closedir(d); d = NULL; }
+            if (!emb || !emb->id) break;
+            nm = (emb++)->id;
+            r = PLUGIN_BUILTIN_DIR;
+            int have = 0;
+            for (size_t i = 0; i < g_pl_n && !have; i++) have = !strcmp(g_pl[i].id, nm);
+            if (have) continue;
+        }
         struct plugin p;
         int skip;
-        if (plugin_load(root, de->d_name, &p, &skip) != 0) { plugin_free(&p); rc = -1; break; }
+        if (plugin_load(r, nm, &p, &skip) != 0) { plugin_free(&p); rc = -1; break; }
         if (skip) { plugin_free(&p); continue; }
+        p.builtin = r != root;
         if (p.enabled) {
             char *why;
             if (!state_enabled(p.id, sd != NULL, sd, &why)) { p.enabled = 0; p.why = why; }
@@ -684,7 +830,7 @@ int plugin_reload(const char *root) {
         g_pl = np;
         g_pl[g_pl_n++] = p;
     }
-    closedir(d);
+    if (d) closedir(d);
     ydoc_free(sd);
     free(stxt);
     if (g_pl_n > 1) qsort(g_pl, g_pl_n, sizeof(*g_pl), pl_cmp);
@@ -752,14 +898,35 @@ const struct plugin_cmd *plugin_cmd_find(const char *name) {
     return NULL;
 }
 
-/* Подсказки «какой плагин даёт вид» — семя, пока у ядра нет индекса (steer-api.md, 3.5: плагин
- * находят по provides.kinds индекса или семени). */
-static const struct { const char *kind, *plugin; } HINTS[] = {
-    { "tunnel:vless", "vless" }, { "tunnel:hysteria2", "hysteria2" },
-    { "tunnel:trojan", "proxy" }, { "tunnel:shadowsocks", "proxy" }, { "tunnel:socks", "proxy" },
-    { "tunnel:http", "proxy" }, { "tunnel:vmess", "proxy" },
-    { "xsteer", "xsteer" }, { "warp", "warpbox" }, { "tgws", "tgws" }, { "awg", "awg" },
-};
+/* Какой плагин даёт вид, которого нет: индекс семени (steer-core кладёт его в /usr/share/steer/seed,
+ * STEER_PLUGIN_SEED — стендам), поле provides.kinds версий (plugin-sdk/docs/index.md). Своего перечня
+ * «вид → плагин» у ядра нет: имя плагина приходит из индекса, как и сам плагин. id — в куче (free);
+ * NULL — индекса нет или вид в нём не назван. */
+static char *seed_kind_plugin(const char *kind) {
+    const char *dir = getenv("STEER_PLUGIN_SEED");
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/index.json", dir && *dir ? dir : "/usr/share/steer/seed");
+    size_t n;
+    char *txt = slurp(path, &n);
+    if (!txt) return NULL;
+    struct err e;
+    memset(&e, 0, sizeof(e));
+    struct ydoc *d = ydoc_parse_buf(txt, n, path, &e);
+    free(txt);
+    char *id = NULL;
+    const struct ynode *pls = d ? ynode_get(ydoc_root(d), "plugins") : NULL;
+    for (size_t i = 0; !id && pls && pls->kind == YN_MAP && i < ynode_len(pls); i++) {
+        const struct ynode *vs = ynode_get(ynode_val_at(pls, i), "versions");
+        for (size_t j = 0; !id && vs && vs->kind == YN_SEQ && j < ynode_len(vs); j++) {
+            const struct ynode *ks = ynode_get(ynode_get(ynode_at(vs, j), "provides"), "kinds");
+            for (size_t k = 0; !id && ks && ks->kind == YN_SEQ && k < ynode_len(ks); k++)
+                if (ynode_at(ks, k)->kind == YN_SCALAR && !strcmp(ynode_at(ks, k)->str, kind))
+                    id = strdup(ynode_key_at(pls, i)->str);
+        }
+    }
+    ydoc_free(d);
+    return id;
+}
 
 const char *plugin_kind_why(const char *name, char *buf, size_t n, const char **id) {
     ensure();
@@ -772,15 +939,17 @@ const char *plugin_kind_why(const char *name, char *buf, size_t n, const char **
                 else snprintf(buf, n, "плагин %s отключён: %s", g_pl[i].id, g_pl[i].why ? g_pl[i].why : "—");
                 return buf;
             }
-    for (size_t i = 0; i < sizeof(HINTS) / sizeof(HINTS[0]); i++)
-        if (!strcmp(HINTS[i].kind, name)) {
-            if (id) *id = HINTS[i].plugin;
-            const struct plugin *p = plugin_find(HINTS[i].plugin);
-            if (p && !p->enabled) snprintf(buf, n, "плагин %s отключён: %s", p->id, p->why ? p->why : "—");
-            else snprintf(buf, n, "нужен плагин %s — поставить", HINTS[i].plugin);
-            return buf;
-        }
-    return NULL;
+    char *sid = seed_kind_plugin(name);
+    if (!sid) return NULL;
+    /* id — строка реестра, если плагин стоит; иначе — своя копия на время процесса (её отдают вызывающим). */
+    const struct plugin *p = plugin_find(sid);
+    static char *g_seed_id;
+    if (p) { if (id) *id = p->id; }
+    else { free(g_seed_id); g_seed_id = sid; sid = NULL; if (id) *id = g_seed_id; }
+    if (p && !p->enabled) snprintf(buf, n, "плагин %s отключён: %s", p->id, p->why ? p->why : "—");
+    else snprintf(buf, n, "нужен плагин %s — поставить", p ? p->id : g_seed_id);
+    free(sid);
+    return buf;
 }
 
 /* ---- ключи вида по схеме -------------------------------------------------------------------
@@ -811,7 +980,7 @@ static const char *const SCH_WORDS[] = {
     "$schema", "$id", "title", "description", "type", "enum", "const", "default", "pattern",
     "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems", "uniqueItems", "items",
     "properties", "required", "additionalProperties", "x-secret", "x-path",
-    "x-ref", "x-one-or-list", "x-when", "x-when-set", "x-needs", "x-example", NULL
+    "x-ref", "x-one-or-list", "x-when", "x-when-set", "x-needs", "x-example", "x-watch", NULL
 };
 
 /* Разделы спеки, на которые может указывать x-ref (те же, что у ключей ядра, v2keys.h: ref). */
@@ -1301,6 +1470,8 @@ static void plugin_env(const struct plugin *pl, const struct plugin_prog *p) {
     env_put("STEER_STATE_DIR", steer_state_dir());
     env_put("STEER_CTL_SOCK", plat()->ctl_sock);
     env_put("STEER_PLATFORM", plat()->name);
+    if (pl->builtin) env_put("STEER_PK_BUILTIN", pl->id);
+    else unsetenv("STEER_PK_BUILTIN");
     for (size_t i = 0; p && i < p->envc; i++) {
         const char *eq = strchr(p->env[i], '=');
         if (!eq) continue;
@@ -1450,11 +1621,24 @@ char *plugin_conf_json(const struct spec *sp, const struct output *o, const stru
     sb_json(&b, pl->version);
     sb_str(&b, "},\"output\":{\"name\":");
     sb_json(&b, o->name);
+    /* Развёрнутый выход с помощником (owner — он сам): вид и ключи — те, с которыми его записал
+     * человек и получил разворот (owner.kind, owner.keys), а не группа, которой он стал. */
+    int self_owned = !out_plugin_kind(o) && o->owner_out && !strcmp(o->owner_out, o->name);
     sb_str(&b, ",\"kind\":");
-    sb_json(&b, out_plugin_kind(o) ? pk->name : kind_of(o)->name);
+    sb_json(&b, out_plugin_kind(o) ? pk->name : self_owned && o->owner_kind ? o->owner_kind : kind_of(o)->name);
     sb_str(&b, ",\"keys\":");
     const char *kj = out_plugin_keys(o);
-    sb_str(&b, kj ? kj : "{}");
+    if (!kj && self_owned) kj = o->owner_keys;
+    char *ck = NULL;
+    size_t ckn = 0;
+    /* У выхода вида ядра (помощник от плагина, impl: core) ключи вида печатает сам вид. */
+    if (!kj && kind_of(o)->conf_keys) {
+        FILE *m = open_memstream(&ck, &ckn);
+        if (m) { kind_of(o)->conf_keys(m, o); fclose(m); }
+        kj = ck;
+    }
+    sb_str(&b, kj && *kj ? kj : "{}");
+    free(ck);
     sb_str(&b, ",\"device\":");
     sb_json(&b, out_has_device(o) ? o->device : "");
     sb_printf(&b, ",\"mark\":\"0x%08x\",\"mark_mask\":\"0x%08x\",\"table\":%d,\"ipv6\":%s", o->mark,
@@ -1472,7 +1656,35 @@ char *plugin_conf_json(const struct spec *sp, const struct output *o, const stru
     for (size_t i = 0; out_plugin_kind(o) && i < o->plg.ports_n; i++) sb_printf(&b, "%s%u", i ? "," : "", o->plg.ports[i]);
     sb_str(&b, "],\"queues\":[");
     for (size_t i = 0; out_plugin_kind(o) && i < o->plg.queues_n; i++) sb_printf(&b, "%s%u", i ? "," : "", o->plg.queues[i]);
-    sb_str(&b, "]},\"paths\":{\"etc\":");
+    sb_str(&b, "]");
+    /* Члены развёрнутого выхода (steer-api.md, 1.4: output.members) — выходы, которые завёл его
+     * разворот: помощник ведёт их (member, revive) и должен знать их устройства, метки и таблицы. */
+    if (self_owned) {
+        sb_str(&b, ",\"members\":[");
+        size_t mn = 0;
+        for (size_t i = 0; sp && i < sp->out_n; i++) {
+            const struct output *m = &sp->out[i];
+            if (m == o || !m->owner_plugin || !m->owner_out || strcmp(m->owner_plugin, o->owner_plugin) != 0 ||
+                strcmp(m->owner_out, o->name) != 0)
+                continue;
+            if (mn++) sb_str(&b, ",");
+            sb_str(&b, "{\"name\":");
+            sb_json(&b, m->name);
+            sb_str(&b, ",\"kind\":");
+            sb_json(&b, kind_of(m)->name);
+            sb_str(&b, ",\"device\":");
+            sb_json(&b, out_has_device(m) ? m->device : "");
+            sb_printf(&b, ",\"mark\":\"0x%08x\",\"table\":%d,\"ipv6\":%s", m->mark, m->table,
+                      out_route6(m) ? "true" : "false");
+            sb_str(&b, ",\"over\":");
+            if (m->over[0]) sb_json(&b, m->over);
+            else sb_str(&b, "null");
+            sb_printf(&b, ",\"sock_mark\":\"0x%08x\",\"sock_mark_required\":%s}", out_underlay_mark(sp, m),
+                      m->over[0] ? "true" : "false");
+        }
+        sb_str(&b, "]");
+    }
+    sb_str(&b, "},\"paths\":{\"etc\":");
     sb_json(&b, plat()->etc_dir);
     /* Таблица fake-IP резолвера (только чтение): по ней туннель плагина узнаёт имя за поддельным адресом
      * (steer-api.md, 1.4, paths.fakeip). Файл пишет резолвер ядра; формат — там же. */
@@ -1497,14 +1709,16 @@ char *plugin_conf_json(const struct spec *sp, const struct output *o, const stru
 
 /* Помощник выхода: программа плагина с раскрытым argv. Подпись перезапуска — версия плагина и
  * ключи вида (а когда {conf} пишет демон — хеш его содержимого, steer-api.md, 1.4). */
-static int plg_helper_for(const struct plugin_kind *pk, const struct spec *sp, const struct output *o,
-                          struct kind_helper *h) {
+int plugin_kind_helper(const struct plugin_kind *pk, const struct spec *sp, const struct output *o,
+                       struct kind_helper *h) {
     if (!pk || !pk->helper.prog) return -1;
     const struct plugin *pl = pk->owner;
     char why[256];
     if (kind_helper_cmd(h, pk->helper_cmd ? pk->helper_cmd : pk->name) != 0) return -1;
     if (kind_helper_prog(h, pk->helper.prog) != 0) return -1;
     h->plugin = pl->id;
+    /* {conf} несёт метки и таблицы — супервизор без демона назначает их до сбора (kind.h, marks). */
+    h->marks = 1;
     char conf[PATH_MAX];
     snprintf(conf, sizeof(conf), "%s/plugin/%s/%s.json", steer_state_dir(), pl->id, o->name);
     if (kind_helper_conf(h, conf) != 0) return -1;
@@ -1524,17 +1738,54 @@ static int plg_helper_for(const struct plugin_kind *pk, const struct spec *sp, c
     }
     for (size_t i = 0; i < pk->helper.envc; i++)
         if (kind_helper_env(h, pk->helper.env[i]) != 0) return -1;
+    if (pl->builtin) {
+        char be[96];
+        snprintf(be, sizeof(be), "STEER_PK_BUILTIN=%s", pl->id);
+        if (kind_helper_env(h, be) != 0) return -1;
+    }
     kind_sig_mix(&h->sig, pl->version, strlen(pl->version));
-    /* Подпись перезапуска — версия плагина и всё содержимое {conf} (steer-api.md, 1.4). */
+    /* Подпись перезапуска — версия плагина, всё содержимое {conf} (steer-api.md, 1.4) и содержимое
+     * файлов ключей x-watch. */
     char *cj = plugin_conf_json(sp, o, pk);
     if (!cj) return -1;
     kind_sig_mix(&h->sig, cj, strlen(cj));
     free(cj);
+    const char *kj = out_plugin_keys(o);
+    if (pk->watch_n && kj) {
+        struct err e;
+        memset(&e, 0, sizeof(e));
+        struct ydoc *d = ydoc_parse_buf(kj, strlen(kj), "keys", &e);
+        for (size_t i = 0; d && i < pk->watch_n; i++) {
+            const struct ynode *v = ynode_get(ydoc_root(d), pk->watch[i]);
+            if (!v || v->kind != YN_SCALAR) continue;
+            FILE *f = fopen(v->str, "r");
+            if (!f) { kind_sig_mix(&h->sig, "-", 1); continue; }
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) kind_sig_mix(&h->sig, buf, n);
+            fclose(f);
+        }
+        ydoc_free(d);
+    }
     return 0;
 }
 
+const struct plugin_kind *plugin_core_ext(const char *kind, const char *key) {
+    ensure();
+    for (size_t i = 0; i < g_pl_n; i++) {
+        if (!g_pl[i].enabled) continue;
+        for (size_t j = 0; j < g_pl[i].kind_n; j++) {
+            const struct plugin_kind *k = g_pl[i].kind[j];
+            if (k->impl_core && k->helper.prog && k->helper_when && !strcmp(k->name, kind) &&
+                !strcmp(k->helper_when, key))
+                return k;
+        }
+    }
+    return NULL;
+}
+
 static int plg_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
-    return plg_helper_for(o->plg.pk, sp, o, h);
+    return plugin_kind_helper(o->plg.pk, sp, o, h);
 }
 
 /* Помощник РАЗВЁРНУТОГО выхода: хук expand вернул helper: true, и выход (группа вида ядра под своим
@@ -1546,33 +1797,92 @@ int plugin_owner_helper(const struct spec *sp, const struct output *o, struct ki
     const struct plugin *pl = plugin_find(o->owner_plugin);
     if (!pl || !pl->enabled) return -1;
     for (size_t i = 0; i < pl->kind_n; i++)
-        if (pl->kind[i]->expand.prog && pl->kind[i]->helper.prog) return plg_helper_for(pl->kind[i], sp, o, h);
+        if (pl->kind[i]->expand.prog && pl->kind[i]->helper.prog) return plugin_kind_helper(pl->kind[i], sp, o, h);
     return -1;
 }
 
-/* status: `"plugin":{id, version, state}` (spec-fields.md, раздел 8); state — файл состояния,
- * который помощник пишет в <state>/plugin/<id>/<выход>.status.json, как есть, если это JSON. */
+/* status: `"plugin":{id, version, state}` (spec-fields.md, раздел 8); state — файл состояния, который
+ * помощник пишет в <state>/plugin/<id>/<выход>.status.json, как есть, если это объект JSON.
+ *
+ * У туннеля (`tunnel:<протокол>`) то же состояние идёт и прежним полем `"<протокол>"` — так его
+ * печатали виды протоколов, пока жили в ядре (`"vless":{"active":…}`), и так его читают панели; имя
+ * поля — из имени вида манифеста, своего списка протоколов у ядра нет. */
+static int state_is_object(const char *txt) {
+    struct err e;
+    memset(&e, 0, sizeof(e));
+    struct ydoc *d = ydoc_parse_buf(txt, strlen(txt), "state", &e);
+    int ok = d && ydoc_root(d)->kind == YN_MAP;
+    ydoc_free(d);
+    return ok;
+}
+
+static void state_emit(FILE *out, const struct plugin *pl, const struct output *o, const char *proto) {
+    struct sbuf b = { 0 };
+    sb_str(&b, ",\"plugin\":{\"id\":");
+    sb_json(&b, pl->id);
+    sb_str(&b, ",\"version\":");
+    sb_json(&b, pl->version);
+    if (b.p) fputs(b.p, out);
+    free(b.p);
+    char *txt = plugin_out_state(o);
+    if (txt && !state_is_object(txt)) { free(txt); txt = NULL; }
+    if (txt) fprintf(out, ",\"state\":%s", txt);
+    fputc('}', out);
+    if (txt && proto && *proto) {
+        struct sbuf b = { 0 };
+        sb_str(&b, ",");
+        sb_json(&b, proto);
+        sb_str(&b, ":");
+        if (b.p && !b.oom) fprintf(out, "%s%s", b.p, txt);
+        free(b.p);
+    }
+    free(txt);
+}
+
 static void plg_status(FILE *out, const struct spec *sp, const struct output *o) {
     (void)sp;
     const struct plugin_kind *pk = out_plugin_kind(o);
-    if (!pk) return;
-    fprintf(out, ",\"plugin\":{\"id\":\"%s\",\"version\":\"%s\"", pk->owner->id, pk->owner->version);
+    if (pk) state_emit(out, pk->owner, o, pk->proto);
+}
+
+void plugin_owner_status(FILE *out, const struct output *o) {
+    if (!o->owner_plugin || !o->owner_out || strcmp(o->owner_out, o->name) != 0) return;
+    const struct plugin *pl = plugin_find(o->owner_plugin);
+    if (pl) state_emit(out, pl, o, NULL);
+}
+
+char *plugin_out_state(const struct output *o) {
+    const struct plugin_kind *pk = out_plugin_kind(o);
+    const char *id = pk ? pk->owner->id : o->owner_plugin && o->owner_out && !strcmp(o->owner_out, o->name)
+                                             ? o->owner_plugin : NULL;
+    if (!id) return NULL;
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/plugin/%s/%s.status.json", steer_state_dir(), pk->owner->id, o->name);
+    snprintf(path, sizeof(path), "%s/plugin/%s/%s.status.json", steer_state_dir(), id, o->name);
     size_t n;
     char *txt = slurp(path, &n);
-    if (txt) {
-        struct err e;
-        memset(&e, 0, sizeof(e));
-        struct ydoc *d = ydoc_parse_buf(txt, n, path, &e);
-        if (d && ydoc_root(d)->kind == YN_MAP) {
-            while (n && (txt[n - 1] == '\n' || txt[n - 1] == ' ')) txt[--n] = '\0';
-            fprintf(out, ",\"state\":%s", txt);
-        }
-        ydoc_free(d);
+    if (!txt) return NULL;
+    while (n && (txt[n - 1] == '\n' || txt[n - 1] == ' ')) txt[--n] = '\0';
+    if (txt[0] != '{') { free(txt); return NULL; }
+    /* Файл мёртвого процесса правды не говорит: kill -9 убрать за собой не даст. */
+    const char *p = strstr(txt, "\"pid\":");
+    long pid = 0;
+    if (p && sscanf(p + 6, "%ld", &pid) == 1 && pid > 0 && kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
         free(txt);
+        return NULL;
     }
-    fputc('}', out);
+    return txt;
+}
+
+/* health: events — приговор здоровью выносит помощник (up/down, supd.c); ядро не пробует устройство и
+ * не меряет задержку: проба через устройство проверила бы не туннель (у звезды xsteer — интернет у хаба,
+ * и сторож уронил бы исправный выход). Устройство сторож проверил до вопроса виду. */
+static int plg_health_events(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp; (void)o; (void)dev;
+    return 1;
+}
+static int plg_latency_events(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp; (void)o; (void)dev;
+    return -1;
 }
 
 static void plugin_kind_ops_init(struct plugin_kind *k) {
@@ -1580,40 +1890,25 @@ static void plugin_kind_ops_init(struct plugin_kind *k) {
     memset(o, 0, sizeof(*o));
     o->name = k->proto ? k->proto : k->name;
     o->plugin = k;
-    o->caps = k->caps;
+    /* Общий обход DPI (zapret системы) трафик вида плагина не трогает — как у всякого вида ядра, кроме
+     * direct: бит ставит ядро, плагин его не выбирает (manifest.md, caps). */
+    o->caps = k->caps | KC_SKIP_ZAPRET;
     o->novia = k->novia;
     o->selfnat_why = k->selfnat_why;
     o->lan_only = k->lan_only;
     o->parse = plg_parse;
     o->keys_of = plg_keys_of;
     o->status = plg_status;
+    if (k->health_events) {
+        o->health = plg_health_events;
+        o->latency = plg_latency_events;
+    }
     /* Шаблоны nft вида ядро раскладывает само (plugin_emit_all): порядок правил по плагинам задаёт
      * реестр, а не порядок видов, и общий отказ с именем файла не помещается в void emit. */
     if (k->helper.prog) o->helper = plg_helper;
 }
 
 /* ---- подкоманды ---------------------------------------------------------------------------- */
-
-int plugin_cmd_exec(const struct plugin_cmd *c, int argc, char **argv) {
-    size_t n = c->run.argc + (size_t)argc + 2;
-    char **av = calloc(n, sizeof(*av));
-    if (!av) { fprintf(stderr, "steer: нет памяти\n"); return 2; }
-    size_t k = 0;
-    av[k++] = c->run.prog;
-    char why[256];
-    for (size_t i = 0; i < c->run.argc; i++) {
-        av[k] = subst(c->owner, NULL, NULL, NULL, c->run.argv[i], why, sizeof(why));
-        if (!av[k]) { fprintf(stderr, "steer: подкоманда %s: %s\n", c->name, why); return 2; }
-        k++;
-    }
-    for (int i = 0; i < argc; i++) av[k++] = argv[i];
-    av[k] = NULL;
-    plugin_env(c->owner, &c->run);
-    execv(c->run.prog, av);
-    fprintf(stderr, "steer: не удалось запустить %s (плагин %s): %s\n", c->run.prog, c->owner->id,
-            strerror(errno));
-    return 2;
-}
 
 /* ---- nft: слоты и шаблоны плагинов ---------------------------------------------------------
  *

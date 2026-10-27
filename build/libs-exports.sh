@@ -138,44 +138,9 @@ emit_net1() {
     echo "};"
 }
 
-# ---- libsteer раскладки 2.0 (STEER_LAYOUT=2.0): тот же расчёт для прежнего состава ------------------
-# libsteer со стеком (PROFILE_libsteer20), потребители — steerd и все модули steer-<m>.
-mkdir -p "$W/lib20" "$W/app20"
-L20=""
-for f in $(profile_var PROFILE_libsteer20); do
-    case " $QUIC_ALL " in *" $f "*) ;; *) L20="$L20 $f" ;; esac
-done
-comp "$W/lib20" $L20
-for f in $QUIC_ALL; do
-    # shellcheck disable=SC2086
-    $CC $F $NGCFLAGS -c "$f" -o "$W/lib20/$(echo "$f" | tr / _).o"
-done
-for p in PROFILE_steerd PROFILE_mod_vless PROFILE_mod_xsteer PROFILE_mod_obfs PROFILE_mod_tgws PROFILE_mod_hysteria2 PROFILE_mod_proxy PROFILE_mod_warpbox; do
-    profile_var "$p"
-done | tr ' ' '\n' | sort -u | grep -v '^$' > "$W/app20.lst"
-comp "$W/app20" $(cat "$W/app20.lst")
-for f in $QUIC_STAND; do
-    # shellcheck disable=SC2086
-    $CC $F $NGCFLAGS -Itests -c "$f" -o "$W/app20/$(echo "$f" | tr / _).o"
-done
-nm -g --defined-only "$W"/lib20/*.o | awk 'NF==3 {print $3}' | sort -u > "$W/defs20"
-nm -u "$W"/app20/*.o | awk '$1=="U" || $1=="w" {print $2}' | sort -u > "$W/undef20"
-comm -12 "$W/defs20" "$W/undef20" > "$W/need20"
-[ ! -f "$W/ext" ] || sort -u "$W/need20" "$W/ext" -o "$W/need20"
-emit_libsteer20() {
-    echo "/* Экспорт libsteer.so раскладки 2.0 (STEER_LAYOUT=2.0: модули steer-<m> на libsteer со стеком) —"
-    echo " * ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится. */"
-    echo "LIBSTEER_1 {"
-    echo "  global:"
-    sed 's/$/;/; s/^/    /' "$W/need20"
-    echo "  local:"
-    echo "    *;"
-    echo "};"
-}
-
 emit_libsteer() {
     echo "/* Экспорт libsteer.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится."
-    echo " * Символы, которые steerd и модули (steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy, steer-warpbox) берут"
+    echo " * Символы, которые steerd и модуль ядра steer-tgws берут"
     echo " * из библиотеки, и программный интерфейс QUIC (qc_*), который берёт стенд QUIC_STAND_SRC, пока"
     echo " * настоящих потребителей нет; остальное скрыто (local: *). Проверка: check. */"
     echo "LIBSTEER_1 {"
@@ -201,7 +166,6 @@ emit_wolfssl() {
 emit_libsteer > "$W/libsteer.map"
 emit_wolfssl > "$W/libsteer-wolfssl.map"
 emit_net1 > "$W/libs2p-net.map"
-emit_libsteer20 > "$W/libsteer20.map"
 
 case "$MODE" in
 gen)
@@ -209,12 +173,11 @@ gen)
     cp "$W/libsteer-wolfssl.map" build/wolfssl/libsteer-wolfssl.map
     mkdir -p build/net1
     cp "$W/libs2p-net.map" build/net1/libs2p-net.map
-    cp "$W/libsteer20.map" build/libsteer20.map
     echo "libs-exports: libsteer.map — $(wc -l < "$W/need") символов, libsteer-wolfssl.map — $(wc -l < "$W/wneed"), libs2p-net.map — $(($(wc -l < "$W/n1need") + 1))"
     ;;
 check)
     bad=0
-    for pair in libsteer.map:build/libsteer.map libsteer-wolfssl.map:build/wolfssl/libsteer-wolfssl.map libs2p-net.map:build/net1/libs2p-net.map libsteer20.map:build/libsteer20.map; do
+    for pair in libsteer.map:build/libsteer.map libsteer-wolfssl.map:build/wolfssl/libsteer-wolfssl.map libs2p-net.map:build/net1/libs2p-net.map; do
         gen="$W/${pair%%:*}"; have="${pair#*:}"
         if ! diff -u "$have" "$gen" > "$W/diff" 2>&1; then
             echo "libs-exports: $have разошёлся с кодом (sh build/libs-exports.sh gen):"

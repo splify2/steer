@@ -8,7 +8,7 @@
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/splify2/steer",
   "compat": {
-    "steer-api": "^1.0"
+    "steer-api": "^1.1"
   },
   "arch": [
     "aarch64_cortex-a53",
@@ -30,7 +30,7 @@
       "/dev/net/tun"
     ],
     "plugins": {
-      "net1": "^1.2"
+      "net1": "^1.3"
     }
   },
   "permissions": [
@@ -61,14 +61,26 @@
             "{conf}"
           ]
         },
-        "health": "events"
+        "health": "events",
+        "description": "Туннель xsteer: клиент звезды.",
+        "check": {
+          "prog": "bin/xsteer",
+          "argv": [
+            "check"
+          ]
+        },
+        "texts": {
+          "selfnat_why": "masquerade не нужен и вреден: адреса клиентов уходят к хабу, а NAT скрыл бы, от какой пиры пришёл пакет"
+        }
       }
     ],
     "commands": [
       {
         "name": "xsteer-peers",
         "prog": "bin/xsteer",
-        "help": "узлы звезды выхода"
+        "help": "узлы звезды выхода и его живое состояние",
+        "usage": "<выход> [--config ФАЙЛ]",
+        "conf": true
       },
       {
         "name": "xsteer-key",
@@ -78,13 +90,21 @@
       {
         "name": "xsteer-check",
         "prog": "bin/xsteer",
-        "help": "проверить файл настройки"
+        "help": "проверить файл настройки",
+        "usage": "[--config ФАЙЛ]"
       },
       {
         "name": "xsteer-link",
         "prog": "bin/xsteer",
-        "help": "ссылка на настройку"
+        "help": "ссылка на настройку",
+        "usage": "[<файл|ссылка|->] [--config ФАЙЛ] [--name ИМЯ]"
       }
+    ]
+  },
+  "i18n": {
+    "languages": [
+      "ru",
+      "en"
     ]
   }
 }

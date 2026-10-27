@@ -61,9 +61,9 @@ extern const struct dialer_ops vless_dialer;
  * дайлером VLESS под пулом (pool_run). ready — как у stack_run (stack.h, stack_ready_fn): устройство
  * поднято; up демону говорит пул, модуль — только своё; NULL — ничего. Возвращает код выхода
  * процесса, всегда ненулевой — успешного выхода у цикла нет. */
-struct output;
+struct tun_out;
 struct pool_cfg;
-int vless_tunnel_run(struct output *o, const struct pool_cfg *pc,
+int vless_tunnel_run(const struct tun_out *o, const struct pool_cfg *pc,
                      void (*ready)(void *arg, const char *dev), void *arg);
 
 #endif

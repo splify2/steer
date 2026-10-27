@@ -36,7 +36,6 @@
 #include "awg.h"
 #include "plugin.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "srsread.h"
@@ -127,10 +126,16 @@ static int no_plugin_mgr(void) {
  * нужно человеку и управляющему слою отдельно от движка. Отличается argv[0], а не сборкой: файл
  * один, и расходиться инструментам с движком негде. */
 static const char *const TOOLS[] = {
-    "fit", "srs-read", "obfs-server", "sub-fetch", "sub-quota", "sub-hwid", "dev-id",
-    "tls-probe", "tgws-probe", "vless-nodes", "proxy-nodes", "xsteer-key", "xsteer-link", "xsteer-check",
-    "xsteer-hub", "dnsd-table", NULL,
+    "fit", "srs-read", "sub-hwid", "dev-id", "tgws-probe", "xsteer-hub", "dnsd-table", NULL,
 };
+
+/* Программы плагинов, вкомпилированные в статический бинарник (телефон; src/plugkit, PK_PROGRAM): ядро
+ * запускает их этим же бинарником с STEER_PK_BUILTIN=<id> (вкомпилированный плагин, kinds/plugin.h), а
+ * под именем <id> (ссылка bin/<id> на бинарник) он — та же программа. В раскладке пакета их нет вовсе
+ * (ссылки слабые). Имён протоколов ядро не знает: только раздел. */
+struct pk_prog;
+const struct pk_prog *pk_prog_find(const char *id) __attribute__((weak));
+int pk_prog_run(const struct pk_prog *p, int argc, char **argv) __attribute__((weak));
 
 static int tools_role(const char *argv0) {
     const char *b = strrchr(argv0, '/');
@@ -144,6 +149,17 @@ static int is_tool(const char *cmd) {
 }
 
 int main(int argc, char **argv) {
+    if (pk_prog_find && pk_prog_run && argv[0]) {
+        const char *bi = getenv("STEER_PK_BUILTIN");
+        const struct pk_prog *p = bi && *bi ? pk_prog_find(bi) : NULL;
+        /* Детям программы (ctl, steer) имя не передаётся: они — не она. */
+        unsetenv("STEER_PK_BUILTIN");
+        if (!p) {
+            const char *b = strrchr(argv[0], '/');
+            p = pk_prog_find(b ? b + 1 : argv[0]);
+        }
+        if (p) return pk_prog_run(p, argc, argv);
+    }
     /* Платформа (src/platform/platform.h) — до всего остального (modcmd_platform_args, общая с
      * модулями): от неё зависят пути по умолчанию, справка и раскладка меток. */
     if (modcmd_platform_args(&argc, argv) != 0) return 2;
@@ -153,7 +169,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *cmd = argv[1];
-    if (tools_role(argv[0]) && !is_tool(cmd) && strcmp(cmd, "help") && strcmp(cmd, "--help") &&
+    /* Подкоманды плагинов — свои программы, правил и демона не трогают: steer-tools их отдаёт тоже. */
+    if (tools_role(argv[0]) && !is_tool(cmd) && !plugin_cmd_find(cmd) && strcmp(cmd, "help") && strcmp(cmd, "--help") &&
         strcmp(cmd, "-h") && strcmp(cmd, "version") && strcmp(cmd, "--version") &&
         strcmp(cmd, "-V")) {
         fprintf(stderr, "steer-tools: %s — не инструмент, а команда ядра: steer %s\n"
@@ -203,8 +220,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "apply-commit")) return cmd_apply_commit(argc - 2, argv + 2);
 
     /* Подкоманда плагина (манифест, steer.commands): исполняется вместо этого процесса. Раньше
-     * команд ядра — плагин может взять имя команды модуля, которая ещё в дереве steer (vless, warp),
-     * но не имя команды ядра (plugin.c, resolve_conflicts). */
+     * команд ядра — плагин может взять имя команды модуля ядра (мост tgws), но не имя команды
+     * ядра (plugin.c, resolve_conflicts). */
     {
         const struct plugin_cmd *pc = plugin_cmd_find(cmd);
         if (pc) return plugin_cmd_exec(pc, argc - 2, argv + 2);
@@ -321,10 +338,13 @@ int main(int argc, char **argv) {
          * единой строки о причине. */
         /* plugin-device — член выхода плагина (kind: warp): в реестре видов его нет (руками в спеке
          * не пишется), но управляющему слою устройства таких членов нужны так же, как awg, — для
-         * зоны фаервола. */
-        if (a.kind && !kind_by_name(a.kind) && strcmp(a.kind, kind_plugin_device.name) != 0 &&
-            strcmp(a.kind, kind_unavail.name) != 0)
-            die("--kind: нужен вид выхода (direct, block, interface, awg, vless, hysteria2, trojan, shadowsocks, socks, http, vmess, xsteer, tgws, group), а не %s", a.kind);
+         * зоны фаервола. Виды плагинов — по имени записи реестра (vless для tunnel:vless). */
+        int kind_ok = !a.kind || kind_by_name_v2(a.kind) || !strcmp(a.kind, kind_plugin_device.name) ||
+                      !strcmp(a.kind, kind_unavail.name);
+        for (size_t pi = 0; !kind_ok && pi < plugin_kinds_n(); pi++)
+            kind_ok = !strcmp(plugin_kind_ops_at(pi)->name, a.kind);
+        if (!kind_ok)
+            die("--kind: нужен вид выхода (direct, block, interface, awg, tgws, group или вид плагина), а не %s", a.kind);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         for (size_t i = 0; i < cfg.out_n; i++) {
             const char *k = out_kind_name(&cfg.out[i]);

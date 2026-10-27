@@ -403,18 +403,9 @@ static const struct { const char *name, *hint; } KIND_HINT[] = {
     { "direct", "Не маршрутизировать: трафик идёт обычным путём." },
     { "block", "Блок: трафик правила не пропускается." },
     { "interface", "Устройство системы: WireGuard, PPPoE и другие." },
-    { "xsteer", "Туннель xsteer." },
     { "awg", "AmneziaWG: устройство заводит ядро." },
     { "tgws", "Мост Telegram." },
     { "group", "Группа выходов: выбор члена по порядку, задержке, вручную или балансом." },
-    { "warp", "Cloudflare WARP одной строкой: группа из count туннелей." },
-    { "tunnel:vless", "Туннель VLESS по подписке." },
-    { "tunnel:hysteria2", "Туннель Hysteria2 (QUIC) по подписке." },
-    { "tunnel:trojan", "Туннель Trojan по подписке." },
-    { "tunnel:shadowsocks", "Туннель Shadowsocks по подписке." },
-    { "tunnel:socks", "Туннель через прокси SOCKS по подписке." },
-    { "tunnel:http", "Туннель через прокси HTTP по подписке." },
-    { "tunnel:vmess", "Туннель VMess по подписке." },
 };
 
 static const char *kind_hint(const char *variant) {
@@ -423,10 +414,9 @@ static const char *kind_hint(const char *variant) {
     return NULL;
 }
 
-/* Видимый в спеке вид и протокол: «vless» — это kind: tunnel, protocol: vless. */
+/* Видимый в спеке вид и протокол: «tunnel:vless» — это kind: tunnel, protocol: vless. */
 static void spec_names(const char *kname, const char **kind, const char **proto) {
-    if (v2_tunnel_proto(kname)) { *kind = "tunnel"; *proto = kname; }
-    else if (!strncmp(kname, "tunnel:", 7)) { *kind = "tunnel"; *proto = kname + 7; }
+    if (!strncmp(kname, "tunnel:", 7)) { *kind = "tunnel"; *proto = kname + 7; }
     else { *kind = kname; *proto = NULL; }
 }
 
@@ -588,6 +578,8 @@ static struct jn *plugin_variant(const struct plugin_kind *pk) {
     spec_names(pk->name, &kind, &proto);
     struct jn *v = variant_node(&pk->ops, 0, kind, proto);
     struct jn *props = jget(v, "properties"), *req = jget(v, "required");
+    /* Описание вида — из манифеста (kinds[].description, иначе описание плагина). */
+    if (!jget(v, "description") && pk->desc) jset_str(v, "description", pk->desc);
     struct jn *pl = jobj();
     jset_str(pl, "id", pk->owner->id);
     jset_str(pl, "version", pk->owner->version ? pk->owner->version : "");
@@ -627,7 +619,7 @@ static struct jn *outputs_entity(void) {
     size_t reg = kind_count() - plugin_kinds_n();
     jset_str(ent, "type", "object");
 
-    /* Виды ядра в порядке реестра, затем группа и warp. */
+    /* Виды ядра в порядке реестра, затем группа; виды протоколов — только у установленных плагинов. */
     for (size_t i = 0; i < reg; i++) {
         const struct kind_ops *kd = kind_at(i);
         if (!kd) continue;
@@ -651,27 +643,6 @@ static struct jn *outputs_entity(void) {
         variant_add(vars, vname, v);
     }
     variant_add(vars, "group", variant_node(kind_by_name_v2("group"), 1, "group", NULL));
-    if (!plugin_kind_find("warp")) {
-        struct jn *w = jobj(), *props = jobj(), *req = jarr(), *sp = jobj();
-        size_t cnt;
-        const struct v2key *t = v2keys_all(&cnt);
-        jset_str(w, "type", "object");
-        jset_str(w, "description", kind_hint("warp"));
-        jset_str(sp, "kind", "warp");
-        jset(w, "x-spec", sp);
-        for (size_t i = 0; i < cnt; i++) {
-            if (t[i].scope != V2S_WARP) continue;
-            struct jn *n = key_node(&t[i]);
-            if (!strcmp(t[i].key, "kind")) jset_str(n, "const", "warp");
-            jset(props, t[i].key, n);
-            if (t[i].flags & VF_REQUIRED) jpush_str(req, t[i].key);
-        }
-        jset(w, "properties", props);
-        jset(w, "required", req);
-        jset_raw(w, "additionalProperties", "false");
-        variant_add(vars, "warp", w);
-    }
-
     /* Виды установленных плагинов: заменяют одноимённый вид ядра на его месте. */
     for (size_t pi = 0; pi < plugin_n(); pi++) {
         const struct plugin *pl = plugin_at(pi);

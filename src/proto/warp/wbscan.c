@@ -35,7 +35,6 @@
 #include <sys/random.h>
 #include <sys/stat.h>
 
-#include "spec.h"
 #include "awg.h"
 #include "wbconf.h"
 #include "wbhttps.h"
@@ -105,7 +104,7 @@ static int dev_up(struct wb_scan *s, const char *dev, const char *ip, unsigned p
                          .keepalive = keepalive };
     if (wb_conf_write(conf, &c) != 0) { LOG("файл %s не записан: %s\n", conf, strerror(errno)); return -1; }
     char err[256];
-    int rc = awg_scan_up(s->sp, dev, conf, s->over, s->ns, err, sizeof(err));
+    int rc = awg_scan_up(dev, conf, s->fwmark, s->over, s->ns, err, sizeof(err));
     unlink(conf);
     if (rc) LOG("%s\n", err);
     return rc;

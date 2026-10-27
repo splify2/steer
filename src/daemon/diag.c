@@ -23,7 +23,6 @@
 #include "spec.h"
 #include "awg.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "ctl.h"
@@ -1016,7 +1015,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
                 else
                     snprintf(why, sizeof(why),
                              "подписка скачана, но узлов нужного вида в ней нет; проверьте "
-                             "ссылку и поддержку vless/reality у поставщика");
+                             "ссылку и протокол узлов у поставщика");
                 diag("output", "fail", what, why);
                 continue;
             }

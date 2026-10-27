@@ -197,13 +197,14 @@ echo "ext-test: собираю и прогоняю spokematch (ASan: ${ASAN:-н�
 # то есть весь ext-test не доходит даже до первой проверки — а именно в нём и живёт ASan.
 # ctlcall.c — по той же причине: `steer xsteer-peers` под демоном отдаёт запрос в сокет
 # (cmd_xsteer_peers → ctlcall_forward), и с тех пор, как xsclient.c зовёт его, стенд без этого
-# файла не компоновался — ext-test падал здесь, не дойдя ни до одной проверки.
+# файла не компоновался — ext-test падал здесь, не дойдя ни до одной проверки. plugkit.c и pkjson.c —
+# {conf} выхода и отказ программы плагина (xsclient.c — программа плагина xsteer, src/plugkit).
 $CC -O1 -g -w $STEER_INC $ASAN -o "$BUILD/spokematch" \
 	tests/spokematch.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
-	src/lib/jsonw.c src/lib/evline.c src/lib/ctlcall.c \
+	src/lib/jsonw.c src/lib/evline.c src/lib/ctlcall.c src/plugkit/plugkit.c src/plugkit/pkjson.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 "$BUILD/spokematch"
 
@@ -296,7 +297,7 @@ $CC -O2 -w $STEER_INC -o "$BUILD/hubmatch" tests/hubmatch.c \
 echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/tun.c \
-	src/proto/vless/vldial.c src/tunnel/pool.c src/tunnel/geo.c src/proto/warp/wbhttps.c src/proto/warp/wbjson.c \
+	src/proto/vless/vldial.c src/tunnel/pool.c src/tunnel/geo.c src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/tls/httpc.c \
 	src/proto/vless/client.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/vless/sub.c src/proto/vless/sublink.c \
 	src/proto/transport/transport.c src/proto/transport/trdial.c src/proto/transport/trsec.c src/proto/tls/ech.c \

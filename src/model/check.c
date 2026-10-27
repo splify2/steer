@@ -11,7 +11,6 @@
 #include <arpa/inet.h>
 
 #include "spec.h"
-#include "obfs.h"
 #include "check.h"
 
 /* ---- порты ---------------------------------------------------------------------------------
@@ -174,7 +173,7 @@ static int over_check_run(const struct spec *sp, const char *w, int *bad, struct
         if (!out_over_capable(o)) {
             snprintf(msg, sizeof(msg),
                      "выход %.31s: %s есть только у выходов со своим соединением с сервером — "
-                     "vless, xsteer, awg и interface с obfs; у kind=%s соединение открывает не ядро steer, "
+                     "туннели со своим сокетом, awg и interface с obfs; у kind=%s соединение открывает не ядро steer, "
                      "и пустить его через другой выход нечем", o->name, w,
                      out_kind_shown(o)->novia ? out_kind_shown(o)->novia : out_kind_name(o));
             return err_set(e, "%s", msg);
@@ -193,7 +192,7 @@ static int over_check_run(const struct spec *sp, const char *w, int *bad, struct
         if (!out_over_target_ok(v)) {
             snprintf(msg, sizeof(msg),
                      "выход %.31s: %s «%.31s» — это kind=%s, у него нет устройства, в которое "
-                     "можно пустить туннель (нужен выход с устройством: interface, vless, xsteer, awg)",
+                     "можно пустить туннель (нужен выход с устройством: interface, awg или туннель)",
                      o->name, w, v->name, out_kind_name(v));
             return err_set(e, "%s", msg);
         }

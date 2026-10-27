@@ -38,6 +38,7 @@
 #include <netinet/in.h>
 
 struct output;
+struct spec;
 
 #define AWG_KEY_LEN   32
 /* Пиров в одном файле. У клиента пир почти всегда один (сервер); несколько бывает у
@@ -208,12 +209,12 @@ int awg_refresh(const struct spec *sp, const struct output *o);
  * идёт в этом же процессе, на его цикле событий). Без круга (один проход, круг shell на
  * роутере) — как прежде, файлом. */
 void awg_hs_memory(int on);
-/* Устройства подбора (steer-warpbox; подробности — в awg.c, «устройства подбора»). awg_scan_up —
- * создать и настроить dev по файлу conf, как выход без спеки (over — через какой выход идёт туннель,
- * как `over` членов группы), и (ns >= 0) увести в пространство сети
- * ns с адресами файла, подъёмом и маршрутом по умолчанию там; 0 — готово, иначе причина в err.
- * awg_scan_stat — последнее рукопожатие (секунды эпохи, 0 — не было) и счётчики. */
-int awg_scan_up(const struct spec *sp, const char *dev, const char *conf, const char *over, int ns,
+/* Устройства подбора (плагин warpbox; подробности — в src/kinds/awgdev.c, «устройства подбора»).
+ * awg_scan_up — создать и настроить dev по файлу conf с меткой сокета fwmark (over — имя подложки,
+ * через которую идёт туннель, NULL — напрямую), и (ns >= 0) увести в пространство сети ns с адресами
+ * файла, подъёмом и маршрутом по умолчанию там; 0 — готово, иначе причина в err. awg_scan_stat —
+ * последнее рукопожатие (секунды эпохи, 0 — не было) и счётчики. */
+int awg_scan_up(const char *dev, const char *conf, uint32_t fwmark, const char *over, int ns,
                 char *err, size_t en);
 void awg_scan_down(const char *dev, int ns);
 int awg_scan_stat(const char *dev, int ns, int64_t *hs, uint64_t *rx, uint64_t *tx);

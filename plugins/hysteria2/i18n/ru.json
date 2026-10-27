@@ -1,0 +1,4 @@
+{
+  "plugin.name": "Hysteria 2",
+  "plugin.description": "Туннели Hysteria 2 по QUIC с управлением потоком Brutal"
+}

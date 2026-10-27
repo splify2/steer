@@ -25,6 +25,8 @@ command -v ip >/dev/null 2>&1 && command -v unshare >/dev/null 2>&1 && command -
 [ -x "$LIBS/steerd" ] || skip "нет $LIBS/steerd (раскладку собирает tests/libs-test.sh)"
 LIBS="$(cd "$LIBS" && pwd)"
 LD_LIBRARY_PATH="$LIBS"; export LD_LIBRARY_PATH
+# Протоколы — плагины раскладки (программы build-libs.sh, манифесты кладёт tests/libs-test.sh).
+STEER_PLUGINS_ROOT="$LIBS/plugins"; export STEER_PLUGINS_ROOT
 STEERD="$LIBS/steerd"
 
 NS=steer-nodev6

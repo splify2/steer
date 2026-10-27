@@ -81,8 +81,8 @@ outputs:
 имени; [spec-v2.md](spec-v2.md)), `interval` и `silence` (период проверки узла и срок простоя QUIC —
 ниже, «Слежка за узлом»). Ключа `transport` у hysteria2 нет — это ошибка разбора, как и `active`
 больше 1 и `by`. В v1 — `kind: hysteria2`,
-`sub_file`, `node`/`nodes`. Без пакета `steer-hysteria2` спека отвергается словами «kind hysteria2
-требует пакет steer-hysteria2».
+`sub_file`, `node`/`nodes`. Без плагина hysteria2 выход недоступен («нужен плагин hysteria2 —
+поставить»), а `apply` с ним отказывает теми же словами.
 
 ## Подъём и перебор узлов
 

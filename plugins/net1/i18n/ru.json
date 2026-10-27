@@ -1,0 +1,4 @@
+{
+  "plugin.name": "Сетевой стек туннелей",
+  "plugin.description": "Общая библиотека протоколов: TLS 1.3 и REALITY, HTTP/2, QUIC, транспорты, стек TUN"
+}

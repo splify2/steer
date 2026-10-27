@@ -1,14 +1,14 @@
 {
   "schema": 1,
   "id": "net1",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "type": "library",
   "name": "Сетевой стек туннелей",
   "description": "Общая библиотека протоколов: wolfSSL (внутри, скрыт), TLS 1.3 и REALITY, HTTP/2, QUIC, транспорты, стек TUN",
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/splify2/steer",
   "compat": {
-    "steer-api": "^1.0"
+    "steer-api": "^1.1"
   },
   "arch": [
     "aarch64_cortex-a53",
@@ -26,7 +26,13 @@
     {
       "soname": "libs2p-net.so.1",
       "file": "lib/libs2p-net.so.1",
-      "abi": "1.2"
+      "abi": "1.3"
     }
-  ]
+  ],
+  "i18n": {
+    "languages": [
+      "ru",
+      "en"
+    ]
+  }
 }

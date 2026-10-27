@@ -1,0 +1,4 @@
+{
+  "plugin.name": "Обфускатор WireGuard",
+  "plugin.description": "WireGuard поверх поддельного TCP для выходов interface"
+}

@@ -1,9 +1,9 @@
-/* Модуль steer-warpbox без сети: группа `kind: warp` в спеке, ответ API по пути, файл туннеля и маски.
+/* Плагин warpbox без сети: разворот `kind: warp` (хук expand), ответ API по пути, файл туннеля и маски.
  *
  * ЧТО И ПОЧЕМУ ЗДЕСЬ. Сеть и ядро у модуля проверяются вживую (регистрация в API Cloudflare, подбор на
  * устройствах подбора — стенд QEMU, журнал в хабе, WARPBOX.md); здесь — то, что ломается тихо:
- *   - разбор `kind: warp` заводит группу и члены awg с путями файлов, которые модуль потом пишет, —
- *     разойдись они, модуль писал бы файлы, которых ядро не читает;
+ *   - разворот `kind: warp` (wbexpand.c) заводит группу и члены awg с путями файлов, которые помощник
+ *     потом пишет, — разойдись они, помощник писал бы файлы, которых ядро не читает;
  *   - поиск по пути в ответе API: поле внутри массива, экранированный ключ, отсутствующий путь;
  *   - файл туннеля, который пишет модуль, обязан приниматься разбором awg ядра (awg_conf_parse) —
  *     со всеми масками I1, включая собранные заново DNS, STUN и SIP: маска, которую разбор не
@@ -25,6 +25,8 @@ int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 #include "platform.h"
 #include "wbconf.h"
 #include "wbjson.h"
+#include "wbexpand.h"
+#include "pkjson.h"
 
 static int fails, passes;
 
@@ -40,80 +42,73 @@ static void check_s(const char *what, const char *want, const char *got) {
     printf("FAIL %s\n  expected: %s\n  actual:   %s\n", what, want, got);
 }
 
-static int spec_load(const char *text, struct spec *sp, char *msg, size_t mn) {
-    char path[] = "/tmp/warpmatch-XXXXXX";
-    int fd = mkstemp(path);
-    if (fd < 0) return -1;
-    if (write(fd, text, strlen(text)) < 0) { close(fd); return -1; }
-    close(fd);
-    struct err e = { 0 };
-    memset(sp, 0, sizeof(*sp));
-    int rc = load_spec(path, sp, &e);
-    unlink(path);
-    snprintf(msg, mn, "%s", e.msg);
-    return rc;
+/* Разворот хуком expand (src/proto/warp/wbexpand.c): вход — как его даёт ядро, ответ — фрагмент JSON. */
+static struct pkj *expand(const char *keys, const char *common, int *rc) {
+    char in[1024];
+    snprintf(in, sizeof in, "{\"api\":\"1.1\",\"output\":{\"name\":\"%s\",\"kind\":\"warp\",\"keys\":%s,\"common\":%s},"
+             "\"spec\":{\"etc\":\"/etc/steer\",\"outputs\":[]},\"platform\":\"openwrt\"}",
+             strstr(keys, "\"__name\"") ? "x" : "cf", keys, common);
+    char err[200];
+    struct pkj *d = pkj_parse(in, strlen(in), err, sizeof err);
+    if (!d) { *rc = -1; return NULL; }
+    char *buf = NULL;
+    size_t bn = 0;
+    FILE *f = open_memstream(&buf, &bn);
+    *rc = warp_expand(d, f);
+    fclose(f);
+    pkj_free(d);
+    struct pkj *o = *rc ? NULL : pkj_parse(buf, strlen(buf), err, sizeof err);
+    free(buf);
+    return o;
 }
 
-static void t_spec(void) {
-    static struct spec sp;
-    char msg[1024];
-    check("warp: спека принята", 0,
-          spec_load("version: 2\noutputs:\n  cf: { kind: warp, count: 3, countries: [de, nl] }\n", &sp, msg, sizeof msg) < 0);
-    const struct output *g = out_by_name(&sp, "cf");
-    check("warp: группа есть", 1, g && out_group(g) && g->grp.warp.on);
-    if (!g) return;
-    check("warp: членов — count", 3, (long)g->grp.members_n);
-    check("warp: pick по умолчанию — latency", PICK_LATENCY, g->grp.pick);
-    check("warp: две страны", 2, (long)g->grp.warp.cc_n);
-    check_s("warp: страны в верхнем регистре", "DE", g->grp.warp.cc[0]);
-    check("warp: exclude_countries не задан", 0, g->grp.warp.xcc_set);
-    const struct output *m = out_by_name(&sp, "cf.2");
-    check("warp: член cf.2 — awg", 1, m && kind_of(m) == &kind_awg);
-    if (m) {
-        check_s("warp: член знает группу", "cf", m->owner_out);
-        check_s("warp: член принадлежит плагину warpbox", "warpbox", m->owner_plugin);
-        check("warp: out_owned_by по группе", 1, out_owned_by(m, "warpbox", "cf"));
-        check("warp: out_owned_by чужой группы", 0, out_owned_by(m, "warpbox", "zz"));
-        char want[512];
-        snprintf(want, sizeof want, "%s/warp/cf-2.conf", plat()->etc_dir);
-        check_s("warp: файл члена — {etc}/warp/<группа>-<n>.conf", want, m->awg.conf);
-        check("warp: IPv6 члена — nat по умолчанию", OUT_V6_NAT, m->ipv6);
+static void t_expand(void) {
+    int rc;
+    struct pkj *o = expand("{\"count\":3,\"countries\":[\"de\",\"nl\"]}", "{}", &rc);
+    check("warp: разворот принят", 0, rc);
+    if (!o) return;
+    check_s("warp: self — группа", "group", pkj_str(pkj_path(o, "self.kind")));
+    check("warp: членов — count", 3, (long)pkj_len(pkj_path(o, "self.members")));
+    check_s("warp: pick по умолчанию — latency", "latency", pkj_str(pkj_path(o, "self.pick")));
+    long iv = 0;
+    pkj_long(pkj_path(o, "self.interval"), &iv);
+    check("warp: интервал замера по умолчанию — 600 с", 600, iv);
+    int helper = 0;
+    pkj_bool(pkj_get(o, "helper"), &helper);
+    check("warp: помощник ведёт группу (helper: true)", 1, helper);
+    const struct pkj *outs = pkj_get(o, "outputs");
+    check("warp: член cf.2 — awg", 1, pkj_str(pkj_path(pkj_get(outs, "cf.2"), "kind")) &&
+          !strcmp(pkj_str(pkj_path(pkj_get(outs, "cf.2"), "kind")), "awg"));
+    check_s("warp: файл члена — {etc}/warp/<группа>-<n>.conf", "/etc/steer/warp/cf-2.conf",
+            pkj_str(pkj_path(pkj_get(outs, "cf.2"), "conf")));
+    check_s("warp: IPv6 члена — nat по умолчанию", "nat", pkj_str(pkj_path(pkj_get(outs, "cf.1"), "ipv6")));
+    pkj_free(o);
+    o = expand("{}", "{\"ipv6\":\"off\",\"over\":\"wg0\",\"on_fail\":\"direct\"}", &rc);
+    check("warp: ipv6: off, over, on_fail — приняты", 0, rc);
+    if (o) {
+        const struct pkj *m = pkj_get(pkj_get(o, "outputs"), "cf.1");
+        check_s("  у членов off", "off", pkj_str(pkj_get(m, "ipv6")));
+        check_s("  over — у членов", "wg0", pkj_str(pkj_get(m, "over")));
+        check_s("  on_fail — у группы", "direct", pkj_str(pkj_path(o, "self.on_fail")));
+        check("warp: count по умолчанию — один туннель", 1, (long)pkj_len(pkj_path(o, "self.members")));
+        pkj_free(o);
     }
-    check("warp: ipv6: off — принят", 0,
-          spec_load("version: 2\noutputs:\n  cf: { kind: warp, ipv6: off }\n", &sp, msg, sizeof msg) < 0);
-    m = out_by_name(&sp, "cf.1");
-    check("  у членов off", OUT_V6_OFF, m ? (long)m->ipv6 : -1);
-    check("warp: ipv6: routed — отказ", 1,
-          spec_load("version: 2\noutputs:\n  cf: { kind: warp, ipv6: routed }\n", &sp, msg, sizeof msg) < 0);
-    check("warp: masque — принят", 0,
-          spec_load("version: 2\noutputs:\n  mq: { kind: warp, transport: masque, count: 2 }\n", &sp, msg, sizeof msg) < 0);
-    m = out_by_name(&sp, "mq.2");
-    check("  член — вид plugin-device", 1, m && kind_of(m) == &kind_plugin_device);
-    check("  у члена устройство, IPv6 nat", 1, m && !strcmp(m->device, "mq.2") && m->ipv6 == OUT_V6_NAT);
-    check_s("  член знает группу", "mq", m ? m->owner_out : "");
-    check("warp-masque руками — отказ", 1,
-          spec_load("version: 2\noutputs:\n  x: { kind: warp-masque }\n", &sp, msg, sizeof msg) < 0);
-    check("plugin-device руками — отказ", 1,
-          spec_load("version: 2\noutputs:\n  x: { kind: plugin-device }\n", &sp, msg, sizeof msg) < 0);
-    check("неизвестный transport — отказ", 1,
-          spec_load("version: 2\noutputs:\n  cf: { kind: warp, transport: wireguard }\n", &sp, msg, sizeof msg) < 0);
-    check("warp: страна и в countries, и в exclude_countries — отказ", 1,
-          spec_load("version: 2\noutputs:\n  cf: { kind: warp, countries: [RU], exclude_countries: [ru] }\n", &sp, msg, sizeof msg) < 0);
-    check("warp: count 0 — отказ", 1,
-          spec_load("version: 2\noutputs:\n  cf: { kind: warp, count: 0 }\n", &sp, msg, sizeof msg) < 0);
-    check("warp: чужой ключ — отказ", 1,
-          spec_load("version: 2\noutputs:\n  cf: { kind: warp, members: [a] }\n", &sp, msg, sizeof msg) < 0);
-    check("warp: без count — спека принята", 0,
-          spec_load("version: 2\noutputs:\n  one: { kind: warp }\n", &sp, msg, sizeof msg) < 0);
-    g = out_by_name(&sp, "one");
-    check("warp: count по умолчанию — один туннель (самая быстрая точка — у него же)", 1,
-          g ? (long)g->grp.members_n : -1);
-    check("  и второго члена нет", 1, out_by_name(&sp, "one.2") == NULL);
-    check("warp: exclude_countries: [] — исключений нет, задан явно", 0,
-          spec_load("version: 2\noutputs:\n  cf: { kind: warp, exclude_countries: [] }\n", &sp, msg, sizeof msg) < 0);
-    g = out_by_name(&sp, "cf");
-    check("  xcc_set", 1, g && g->grp.warp.xcc_set);
-    check("  xcc_n", 0, g ? (long)g->grp.warp.xcc_n : -1);
+    expand("{}", "{\"ipv6\":\"routed\"}", &rc);
+    check("warp: ipv6: routed — отказ", 2, rc);
+    o = expand("{\"transport\":\"masque\",\"count\":2}", "{}", &rc);
+    check("warp: masque — принят", 0, rc);
+    if (o) {
+        const struct pkj *m = pkj_get(pkj_get(o, "outputs"), "cf.2");
+        check_s("  член — вид plugin-device", "plugin-device", pkj_str(pkj_get(m, "kind")));
+        check("  файла туннеля у члена MASQUE нет", 1, pkj_get(m, "conf") == NULL);
+        pkj_free(o);
+    }
+    expand("{\"countries\":[\"RU\"],\"exclude_countries\":[\"ru\"]}", "{}", &rc);
+    check("warp: страна и в countries, и в exclude_countries — отказ", 2, rc);
+    expand("{\"pick\":\"order\",\"tolerance\":5}", "{}", &rc);
+    check("warp: tolerance без pick: latency — отказ", 2, rc);
+    expand("{}", "{\"device\":\"wg9\"}", &rc);
+    check("warp: device — отказ (имена туннелей выбирает ядро)", 2, rc);
 }
 
 static void t_json(void) {
@@ -236,7 +231,7 @@ static void t_conf(void) {
 }
 
 int main(void) {
-    t_spec();
+    t_expand();
     t_json();
     t_conf();
     printf("warpmatch: %d passed, %d failed\n", passes, fails);

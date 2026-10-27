@@ -1,5 +1,5 @@
 /* Экспорт libsteer.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится.
- * Символы, которые steerd и модули (steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy, steer-warpbox) берут
+ * Символы, которые steerd и модуль ядра steer-tgws берут
  * из библиотеки, и программный интерфейс QUIC (qc_*), который берёт стенд QUIC_STAND_SRC, пока
  * настоящих потребителей нет; остальное скрыто (local: *). Проверка: check. */
 LIBSTEER_1 {
@@ -57,10 +57,10 @@ LIBSTEER_1 {
     from_is_local;
     from_uid_range;
     g_nftc;
-    group_balance_slots;
     group_bal_chain;
     group_bal_map;
     group_bal_target;
+    group_balance_slots;
     group_carded;
     group_hysteresis;
     group_interval_s;
@@ -107,9 +107,9 @@ LIBSTEER_1 {
     ir_set_fakeip_state;
     ir_set_file;
     ir_set_mixed;
-    ir_setref;
     ir_set_srs;
     ir_set_value;
+    ir_setref;
     ir_strdup;
     ir_table_add;
     ir_table_find;
@@ -117,7 +117,7 @@ LIBSTEER_1 {
     jsonw_str;
     jsonw_str_ascii;
     kind_at;
-    kind_by_name;
+    kind_by_name_v2;
     kind_count;
     kind_direct;
     kind_emit_all;
@@ -127,9 +127,9 @@ LIBSTEER_1 {
     kind_unavail;
     l4_box_text;
     l4_from_text;
+    l4_to_text;
     l4_union_alloc;
     l4match_same;
-    l4_to_text;
     load_spec;
     load_spec_mode;
     nfd_chain_exists;
@@ -161,8 +161,12 @@ LIBSTEER_1 {
     plugin_cmd_exec;
     plugin_cmd_find;
     plugin_conf_write;
+    plugin_kind_ops_at;
+    plugin_kinds_n;
     plugin_n;
     plugin_nft_map;
+    plugin_out_state;
+    plugin_owner_status;
     plugin_refresh;
     plugin_reload;
     plugso_http_get;

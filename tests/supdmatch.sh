@@ -45,6 +45,9 @@ fi
 [ "${SUPD_INNER:-}" = 1 ] && ip link set lo up 2>/dev/null
 
 tmp="$(mktemp -d)"
+# Помощника obfs выходу interface даёт плагин obfs (вид interface, helper.when obfs): каталог плагинов стенда.
+sh tests/plugroot.sh "$tmp/plugins" "$(dirname "$BIN")" || { echo "supdmatch: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 mkdir -p "$tmp/st"
 D="" SUB="" UP="" WD="" DN5="" Q5="" SL="" CAT="" DO6=""
 trap 'kill $D $SUB $UP $WD $DN5 $Q5 $SL $CAT $DO6 2>/dev/null; rm -rf "$tmp"' EXIT

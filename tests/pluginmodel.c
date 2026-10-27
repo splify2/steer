@@ -79,23 +79,23 @@ int main(void) {
 
     /* ---- совместимость ---- */
     compat_plugin("c-caret", "^1.0");
-    compat_plugin("c-tilde", "~1.0");
+    compat_plugin("c-tilde", "~1.1");
     compat_plugin("c-ge", ">=1.0 <2");
     compat_plugin("c-or", "^2.0 || ^1.0");
-    compat_plugin("c-exact", "1.0");
-    compat_plugin("c-newer", "^1.1");
+    compat_plugin("c-exact", "1.1");
+    compat_plugin("c-newer", "^1.2");
     compat_plugin("c-major", "^2.0");
     compat_plugin("c-lt", "<1.0");
     compat_plugin("c-zero", "^0.9");
     compat_plugin("c-junk", "abc");
     plugin_reload(NULL);
-    check("^1.0 — совместим с steer-api 1.0", 1, plugin_find("c-caret")->enabled);
-    check("~1.0 — совместим", 1, plugin_find("c-tilde")->enabled);
+    check("^1.0 — совместим с steer-api 1.1", 1, plugin_find("c-caret")->enabled);
+    check("~1.1 — совместим", 1, plugin_find("c-tilde")->enabled);
     check(">=1.0 <2 — совместим", 1, plugin_find("c-ge")->enabled);
     check("^2.0 || ^1.0 — совместим", 1, plugin_find("c-or")->enabled);
-    check("1.0 — совместим", 1, plugin_find("c-exact")->enabled);
-    check("^1.1 — не совместим (ядро 1.0)", 0, plugin_find("c-newer")->enabled);
-    check_str("  причина называет числа", "c-newer 1.0.0 требует steer-api ^1.1, у ядра 1.0", why_of("c-newer"));
+    check("1.1 — совместим", 1, plugin_find("c-exact")->enabled);
+    check("^1.2 — не совместим (ядро 1.1)", 0, plugin_find("c-newer")->enabled);
+    check_str("  причина называет числа", "c-newer 1.0.0 требует steer-api ^1.2, у ядра 1.1", why_of("c-newer"));
     check("^2.0 — не совместим", 0, plugin_find("c-major")->enabled);
     check("<1.0 — не совместим", 0, plugin_find("c-lt")->enabled);
     check("^0.9 — не совместим", 0, plugin_find("c-zero")->enabled);
@@ -109,8 +109,18 @@ int main(void) {
           plugin_kind_why("k-c-newer", buf, sizeof(buf), &id) != NULL && id && !strcmp(id, "c-newer"));
     check("вид, которого нет ни у кого, — без причины (неизвестный kind)", 1,
           plugin_kind_why("nosuchkind", buf, sizeof(buf), &id) == NULL);
-    check_str("нужен плагин — по семени", "нужен плагин vless — поставить",
-              plugin_kind_why("tunnel:vless", buf, sizeof(buf), &id));
+    /* Своего списка «вид → плагин» у ядра нет: имя плагина — из индекса семени (provides.kinds). Семени
+     * нет — причины нет (неизвестный протокол). */
+    check("нет семени — причины нет", 1, plugin_kind_why("tunnel:vless", buf, sizeof(buf), &id) == NULL);
+    put("../seed/index.json", "{\"plugins\":{\"vless\":{\"versions\":[{\"version\":\"2.1.0\","
+        "\"provides\":{\"kinds\":[\"tunnel:vless\"]}}]}}}");
+    char seed[300];
+    snprintf(seed, sizeof(seed), "%s/../seed", g_root);
+    setenv("STEER_PLUGIN_SEED", seed, 1);
+    const char *nw = plugin_kind_why("tunnel:vless", buf, sizeof(buf), &id);
+    check_str("нужен плагин — по семени", "нужен плагин vless — поставить", nw ? nw : "(нет)");
+    check_str("  и плагин назван", "vless", id ? id : "(нет)");
+    unsetenv("STEER_PLUGIN_SEED");
 
     /* ---- вид с помощником ---- */
     put("hp/plugin.json",
@@ -166,7 +176,7 @@ int main(void) {
     char *cj = plugin_conf_json(&sp, o, pk);
     check("{conf} собран", 1, cj != NULL);
     if (cj) {
-        check("  api ядра", 1, strstr(cj, "\"api\":\"1.0\"") != NULL);
+        check("  api ядра", 1, strstr(cj, "\"api\":\"" STEER_API_VERSION "\"") != NULL);
         check("  плагин и версия", 1, strstr(cj, "\"plugin\":{\"id\":\"hp\",\"version\":\"3.1.4\"}") != NULL);
         check("  вид и ключи", 1, strstr(cj, "\"kind\":\"hpkind\",\"keys\":{\"token\":\"aaa\"}") != NULL);
         check("  устройство выведено из имени", 1, strstr(cj, "\"device\":\"h1\"") != NULL);
