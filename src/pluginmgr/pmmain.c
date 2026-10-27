@@ -1021,6 +1021,8 @@ out:
  * индекса семени. Работает без демона; неудача одного плагина остальные не останавливает. */
 static int cmd_migrate(struct pm_ctx *x) {
     struct pm_err e = {{0}};
+    /* Новое ядро — новая проверка: пометки «ядро не перечитало плагины» прежних версий снимаются. */
+    if (pm_bad_clear_reload(&x->st)) pm_state_save(&x->st, &e);
     struct idset kinds = {0}, want = {0};
     int have_spec = 0;
     const char *sp = getenv("STEER_SPEC");
