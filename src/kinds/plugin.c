@@ -1049,16 +1049,21 @@ static const char *const SCH_WORDS[] = {
 /* Разделы спеки, на которые может указывать x-ref (те же, что у ключей ядра, v2keys.h: ref). */
 static const char *const REF_SECTIONS[] = { "outputs", "lists", "clients", "dns.upstreams", NULL };
 
-__attribute__((format(printf, 4, 5)))
-static int sch_fail(struct sch *c, const struct ynode *at, const char *path, const char *fmt, ...) {
-    char msg[800], tail[640];
+__attribute__((format(printf, 5, 6)))
+static int sch_fail(struct sch *c, const struct ynode *at, const char *path, const char *code, const char *fmt, ...) {
+    char msg[800];
+    struct err t;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(tail, sizeof(tail), fmt, ap);
+    err_vsetc(&t, code, fmt, ap);
     va_end(ap);
-    snprintf(msg, sizeof(msg), "%s%s%s", path, *path ? ": " : "", tail);
+    snprintf(msg, sizeof(msg), "%s%s%.700s", path, *path ? ": " : "", t.msg);
     c->at = at;
-    return err_set(c->e, "%s", msg);
+    err_set(c->e, "%s", msg);
+    snprintf(c->e->code, sizeof(c->e->code), "%s", code);
+    snprintf(c->e->args, sizeof(c->e->args), "%s", t.args);
+    if (*path) err_args_add(c->e->args, sizeof(c->e->args), "path", path);
+    return -1;
 }
 
 static int type_has(const struct ynode *ty, const char *name) {
@@ -1115,10 +1120,10 @@ static int str_list_ok(const struct ynode *n, int nonempty) {
 /* Отображение «значение → [соседи]»: x-when и x-needs. */
 static int word_map_ok(struct sch *c, const struct ynode *w, const char *path, const char *word) {
     if (!w || w->kind != YN_MAP)
-        return sch_fail(c, w, path, "%s в схеме вида — отображение «значение: [ключи]»", word);
+        return sch_fail(c, w, path, "schema.word_map", "%s в схеме вида — отображение «значение: [ключи]»", word);
     for (size_t i = 0; i < ynode_len(w); i++)
         if (!str_list_ok(ynode_val_at(w, i), 1))
-            return sch_fail(c, ynode_val_at(w, i), path, "%s: у «%s» нужен список строк", word,
+            return sch_fail(c, ynode_val_at(w, i), path, "schema.word_list", "%s: у «%s» нужен список строк", word,
                             ynode_key_at(w, i)->str);
     return 0;
 }
@@ -1129,7 +1134,7 @@ static int sch_words_ok(struct sch *c, const struct ynode *sch, const char *path
         size_t w = 0;
         while (SCH_WORDS[w] && strcmp(SCH_WORDS[w], k)) w++;
         if (!SCH_WORDS[w])
-            return sch_fail(c, ynode_key_at(sch, i), path, "в схеме вида ключевое слово «%s» не поддерживается", k);
+            return sch_fail(c, ynode_key_at(sch, i), path, "schema.unsupported_word", "в схеме вида ключевое слово «%s» не поддерживается", k);
     }
     const struct ynode *xr = ynode_get(sch, "x-ref");
     if (xr) {
@@ -1138,24 +1143,24 @@ static int sch_words_ok(struct sch *c, const struct ynode *sch, const char *path
         size_t w = 0;
         while (sec && sec->kind == YN_SCALAR && REF_SECTIONS[w] && strcmp(REF_SECTIONS[w], sec->str)) w++;
         if (!sec || sec->kind != YN_SCALAR || !REF_SECTIONS[w])
-            return sch_fail(c, xr, path, "x-ref — {section: outputs, lists, clients или dns.upstreams}");
+            return sch_fail(c, xr, path, "schema.xref_form", "x-ref — {section: outputs, lists, clients или dns.upstreams}");
         if (also && !str_list_ok(also, 0))
-            return sch_fail(c, also, path, "x-ref.also — список слов");
+            return sch_fail(c, also, path, "schema.xref_also", "x-ref.also — список слов");
         for (size_t i = 0; i < ynode_len(xr); i++) {
             const char *k = ynode_key_at(xr, i)->str;
             if (strcmp(k, "section") && strcmp(k, "also"))
-                return sch_fail(c, ynode_key_at(xr, i), path, "в x-ref ключа «%s» нет (есть: section, also)", k);
+                return sch_fail(c, ynode_key_at(xr, i), path, "schema.xref_key", "в x-ref ключа «%s» нет (есть: section, also)", k);
         }
     }
     const struct ynode *ol = ynode_get(sch, "x-one-or-list");
     int olv;
     if (ol && ynode_bool(ol, &olv) != 0)
-        return sch_fail(c, ol, path, "x-one-or-list — true или false");
+        return sch_fail(c, ol, path, "schema.one_or_list_bool", "x-one-or-list — true или false");
     if (ol && olv && !type_has(ynode_get(sch, "type"), "array"))
-        return sch_fail(c, ol, path, "x-one-or-list — у массива (type: array)");
+        return sch_fail(c, ol, path, "schema.one_or_list_array", "x-one-or-list — у массива (type: array)");
     const struct ynode *wh = ynode_get(sch, "x-when"), *ws = ynode_get(sch, "x-when-set");
     if (wh && word_map_ok(c, wh, path, "x-when")) return -1;
-    if (ws && !str_list_ok(ws, 1)) return sch_fail(c, ws, path, "x-when-set — список ключей-соседей");
+    if (ws && !str_list_ok(ws, 1)) return sch_fail(c, ws, path, "schema.when_set_list", "x-when-set — список ключей-соседей");
     const struct ynode *nd = ynode_get(sch, "x-needs");
     if (nd && word_map_ok(c, nd, path, "x-needs")) return -1;
     return 0;
@@ -1167,7 +1172,7 @@ static int sch_path(struct sch *c, const struct ynode *sch, const struct ynode *
     char abs[PATH_MAX];
     const char *s = v->str;
     if (!strcmp(xp, "abs")) {
-        if (s[0] != '/') return sch_fail(c, v, path, "«%s» — нужен абсолютный путь файла", s);
+        if (s[0] != '/') return sch_fail(c, v, path, "schema.abs_path", "«%s» — нужен абсолютный путь файла", s);
         snprintf(abs, sizeof(abs), "%s", s);
     } else if (s[0] == '/') {
         snprintf(abs, sizeof(abs), "%s", s);
@@ -1176,20 +1181,20 @@ static int sch_path(struct sch *c, const struct ynode *sch, const struct ynode *
     } else if (!strcmp(xp, "conf")) {
         snprintf(abs, sizeof(abs), "%s/%s", c->conf, s);
     } else {
-        return sch_fail(c, sch, path, "x-path — etc, conf или abs, а не «%s»", xp);
+        return sch_fail(c, sch, path, "schema.xpath_word", "x-path — etc, conf или abs, а не «%s»", xp);
     }
     sb_json(dst, abs);
     return 0;
 }
 
 static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *v, const char *path) {
-    if (!sch || sch->kind != YN_MAP) return sch_fail(c, sch, path, "схема вида: нужен объект");
+    if (!sch || sch->kind != YN_MAP) return sch_fail(c, sch, path, "schema.object_needed", "схема вида: нужен объект");
     if (sch_words_ok(c, sch, path)) return -1;
     const struct ynode *ty = ynode_get(sch, "type");
     char np[256];
     /* ---- тип и значение ---- */
     if (v->kind == YN_MAP) {
-        if (ty && !type_has(ty, "object")) return sch_fail(c, v, path, "здесь нужно значение, а не отображение");
+        if (ty && !type_has(ty, "object")) return sch_fail(c, v, path, "schema.value_not_map", "здесь нужно значение, а не отображение");
         const struct ynode *props = ynode_get(sch, "properties");
         const struct ynode *ap = ynode_get(sch, "additionalProperties");
         int extra_ok = 1, abv;
@@ -1197,7 +1202,7 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
         const struct ynode *req = ynode_get(sch, "required");
         for (size_t i = 0; req && i < ynode_len(req); i++)
             if (!ynode_get(v, ynode_at(req, i)->str))
-                return sch_fail(c, v, path, "нет обязательного ключа %s", ynode_at(req, i)->str);
+                return sch_fail(c, v, path, "schema.required_key", "нет обязательного ключа %s", ynode_at(req, i)->str);
         /* x-needs: при этом значении ключа без этих соседей разбор отказывает; "*" — при любом. Условия
          * x-when и x-when-set разбор не применяет — это подсказки форме. */
         for (size_t i = 0; i < ynode_len(v); i++) {
@@ -1210,7 +1215,7 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
                 const char *nb = ynode_at(need, j)->str;
                 if (ynode_get(v, nb)) continue;
                 snprintf(np, sizeof(np), "%s%s%s", path, *path ? "." : "", k->str);
-                return sch_fail(c, val, np, "%s: %s — без ключа %s он не разобран", k->str,
+                return sch_fail(c, val, np, "schema.needs_key", "%s: %s — без ключа %s он не разобран", k->str,
                                 !ynode_get(nd, val->str) ? "при любом значении" : val->str, nb);
             }
         }
@@ -1226,8 +1231,10 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
                     size_t l = 0;
                     for (size_t j = 0; j < ynode_len(props) && l + 40 < sizeof(list); j++)
                         l += (size_t)snprintf(list + l, sizeof(list) - l, "%s%s", j ? ", " : "", ynode_key_at(props, j)->str);
-                    return sch_fail(c, k, *path ? path : "", "неизвестный ключ «%s»%s%s%s", k->str,
-                                    list[0] ? " (есть: " : "", list, list[0] ? ")" : "");
+                    if (list[0])
+                        return sch_fail(c, k, *path ? path : "", "schema.unknown_key_list", "неизвестный ключ «%s» (есть: %s)",
+                                        k->str, list);
+                    return sch_fail(c, k, *path ? path : "", "schema.unknown_key", "неизвестный ключ «%s»", k->str);
                 }
             }
             if (put++) sb_str(c->out, ",");
@@ -1236,7 +1243,7 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
             if (ps) { if (sch_node(c, ps, val, np)) return -1; }
             else {
                 /* Ключ без схемы при additionalProperties: true — как записан. */
-                if (val->kind != YN_SCALAR) return sch_fail(c, val, np, "для ключа без схемы нужно простое значение");
+                if (val->kind != YN_SCALAR) return sch_fail(c, val, np, "schema.simple_value", "для ключа без схемы нужно простое значение");
                 sch_scalar_json(c->out, val, scalar_infer(val));
             }
         }
@@ -1260,13 +1267,13 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
         return 0;
     }
     if (v->kind == YN_SEQ) {
-        if (ty && !type_has(ty, "array")) return sch_fail(c, v, path, "здесь нужно значение, а не список");
+        if (ty && !type_has(ty, "array")) return sch_fail(c, v, path, "schema.value_not_list", "здесь нужно значение, а не список");
         const struct ynode *mn = ynode_get(sch, "minItems"), *mx = ynode_get(sch, "maxItems");
         long l;
         if (mn && ynode_long(mn, &l) == 0 && (long)v->len < l)
-            return sch_fail(c, v, path, "в списке %zu элементов, а нужно не меньше %ld", v->len, l);
+            return sch_fail(c, v, path, "schema.list_min", "в списке %zu элементов, а нужно не меньше %ld", v->len, l);
         if (mx && ynode_long(mx, &l) == 0 && (long)v->len > l)
-            return sch_fail(c, v, path, "в списке %zu элементов, а можно не больше %ld", v->len, l);
+            return sch_fail(c, v, path, "schema.list_max", "в списке %zu элементов, а можно не больше %ld", v->len, l);
         const struct ynode *items = ynode_get(sch, "items");
         const struct ynode *uq = ynode_get(sch, "uniqueItems");
         int uniq = 0;
@@ -1277,11 +1284,11 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
             snprintf(np, sizeof(np), "%s[%zu]", path, i);
             if (uniq)
                 for (size_t j = 0; j < i; j++)
-                    if (scalar_eq(it, ynode_at(v, j))) return sch_fail(c, it, np, "«%s» уже есть в списке", it->str);
+                    if (scalar_eq(it, ynode_at(v, j))) return sch_fail(c, it, np, "schema.list_dup", "«%s» уже есть в списке", it->str);
             if (i) sb_str(c->out, ",");
             if (items) { if (sch_node(c, items, it, np)) return -1; }
             else if (it->kind == YN_SCALAR) sch_scalar_json(c->out, it, scalar_infer(it));
-            else return sch_fail(c, it, np, "для списка без схемы нужны простые значения");
+            else return sch_fail(c, it, np, "schema.list_simple", "для списка без схемы нужны простые значения");
         }
         sb_str(c->out, "]");
         return 0;
@@ -1294,7 +1301,7 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
             const struct ynode *mn = ynode_get(sch, "minItems");
             long l;
             if (mn && ynode_long(mn, &l) == 0 && l > 1)
-                return sch_fail(c, v, path, "в списке 1 элемент, а нужно не меньше %ld", l);
+                return sch_fail(c, v, path, "schema.list_min_one", "в списке 1 элемент, а нужно не меньше %ld", l);
             const struct ynode *items = ynode_get(sch, "items");
             snprintf(np, sizeof(np), "%s[0]", path);
             sb_str(c->out, "[");
@@ -1321,7 +1328,7 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
             const char *what = !strcmp(t, "integer") ? "целое число" : !strcmp(t, "number") ? "число" :
                                !strcmp(t, "boolean") ? "true или false" : !strcmp(t, "string") ? "строка" :
                                !strcmp(t, "null") ? "пусто" : "значение";
-            return sch_fail(c, v, path, "«%s» — нужно: %s", v->str, what);
+            return sch_fail(c, v, path, "schema.need_what", "«%s» — нужно: %s", v->str, what);
         }
     } else want = scalar_infer(v);
     /* ---- ограничения ---- */
@@ -1334,39 +1341,39 @@ static int sch_node(struct sch *c, const struct ynode *sch, const struct ynode *
             size_t l = 0;
             for (size_t i = 0; i < ynode_len(en) && l + 40 < sizeof(list); i++)
                 l += (size_t)snprintf(list + l, sizeof(list) - l, "%s%s", i ? ", " : "", ynode_at(en, i)->str);
-            return sch_fail(c, v, path, "«%s» — нужно одно из: %s", v->str, list);
+            return sch_fail(c, v, path, "schema.need_one_of", "«%s» — нужно одно из: %s", v->str, list);
         }
     }
     const struct ynode *cs = ynode_get(sch, "const");
-    if (cs && !scalar_eq(v, cs)) return sch_fail(c, v, path, "«%s» — нужно «%s»", v->str, cs->str);
+    if (cs && !scalar_eq(v, cs)) return sch_fail(c, v, path, "schema.need_const", "«%s» — нужно «%s»", v->str, cs->str);
     long lim;
     const struct ynode *l;
     if ((!strcmp(want, "string")) ) {
         size_t len = 0;
         for (const char *q = v->str; *q; q++) if (((unsigned char)*q & 0xC0) != 0x80) len++;
         if ((l = ynode_get(sch, "minLength")) && ynode_long(l, &lim) == 0 && (long)len < lim)
-            return sch_fail(c, v, path, "короче %ld знаков", lim);
+            return sch_fail(c, v, path, "schema.too_short", "короче %ld знаков", lim);
         if ((l = ynode_get(sch, "maxLength")) && ynode_long(l, &lim) == 0 && (long)len > lim)
-            return sch_fail(c, v, path, "длиннее %ld знаков", lim);
+            return sch_fail(c, v, path, "schema.too_long", "длиннее %ld знаков", lim);
         const char *pat = m_str(sch, "pattern");
         if (pat) {
             regex_t re;
             int rc = regcomp(&re, pat, REG_EXTENDED | REG_NOSUB);
-            if (rc != 0) return sch_fail(c, sch, path, "pattern «%s» схемы не разобран", pat);
+            if (rc != 0) return sch_fail(c, sch, path, "schema.bad_pattern", "pattern «%s» схемы не разобран", pat);
             rc = regexec(&re, v->str, 0, NULL, 0);
             regfree(&re);
-            if (rc != 0) return sch_fail(c, v, path, "«%s» не подходит под %s", v->str, pat);
+            if (rc != 0) return sch_fail(c, v, path, "schema.pattern_mismatch", "«%s» не подходит под %s", v->str, pat);
         }
     }
     if (!strcmp(want, "integer") || !strcmp(want, "number")) {
         double dv = strtod(v->str, NULL);
         if ((l = ynode_get(sch, "minimum")) && dv < strtod(l->str, NULL))
-            return sch_fail(c, v, path, "%s — меньше допустимого %s", v->str, l->str);
+            return sch_fail(c, v, path, "schema.below_min", "%s — меньше допустимого %s", v->str, l->str);
         if ((l = ynode_get(sch, "maximum")) && dv > strtod(l->str, NULL))
-            return sch_fail(c, v, path, "%s — больше допустимого %s", v->str, l->str);
+            return sch_fail(c, v, path, "schema.above_max", "%s — больше допустимого %s", v->str, l->str);
     }
     if (ynode_get(sch, "x-path")) {
-        if (strcmp(want, "string")) return sch_fail(c, sch, path, "x-path — у строки");
+        if (strcmp(want, "string")) return sch_fail(c, sch, path, "schema.xpath_string", "x-path — у строки");
         return sch_path(c, sch, v, path, c->out);
     }
     sch_scalar_json(c->out, v, want);
@@ -1421,10 +1428,19 @@ static int refs_node(struct refw *r, const struct ynode *sch, const struct ynode
     for (size_t i = 0; also && i < ynode_len(also) && l + 40 < sizeof(list); i++)
         l += (size_t)snprintf(list + l, sizeof(list) - l, "%s%s", i ? ", " : "", ynode_at(also, i)->str);
     r->at = v;
-    char msg[600];
-    snprintf(msg, sizeof(msg), "%s: «%s» — в разделе %s такой записи нет%s%s%s", path, v->str,
-             sec ? sec : "?", list[0] ? " (и это не " : "", list, list[0] ? ")" : "");
-    return err_set(r->e, "%s", msg);
+    if (list[0])
+        err_setf(r->e, "schema.ref_missing_also", "«%s» — в разделе %s такой записи нет (и это не %s)", v->str,
+                 sec ? sec : "?", list);
+    else
+        err_setf(r->e, "schema.ref_missing", "«%s» — в разделе %s такой записи нет", v->str, sec ? sec : "?");
+    /* Путь ключа — спереди, как у отказов схемы (подстановка "path"). */
+    {
+        char msg[sizeof(r->e->msg)];
+        snprintf(msg, sizeof(msg), "%s: %.900s", path, r->e->msg);
+        snprintf(r->e->msg, sizeof(r->e->msg), "%s", msg);
+        if (*path) err_args_add(r->e->args, sizeof(r->e->args), "path", path);
+    }
+    return -1;
 }
 
 int plugin_keys_refs(const struct plugin_kind *pk, const struct ynode *keys, plugin_ref_fn has, void *ctx,
@@ -1481,9 +1497,8 @@ int plugin_keys_check(const struct plugin_kind *pk, const struct ynode *keys, co
         /* Схемы нет — у вида нет ключей: любой — отказ, как у вида ядра без ключа. */
         if (keys && ynode_len(keys)) {
             c.at = ynode_key_at(keys, 0);
-            char m[300];
-            snprintf(m, sizeof(m), "неизвестный ключ «%s» — у вида %s ключей нет", ynode_key_at(keys, 0)->str, pk->name);
-            rc = err_set(e, "%s", m);
+            rc = err_setf(e, "schema.kind_has_no_keys", "неизвестный ключ «%s» — у вида %s ключей нет",
+                          ynode_key_at(keys, 0)->str, pk->name);
             if (at) *at = c.at;
             return rc;
         }

@@ -476,11 +476,19 @@ static int load_v2(const char *buf, size_t n, const char *name, struct spec *s, 
     const struct ynode *root = ydoc_root(d);
     int rc;
     if (root && root->kind == YN_MAP && !ynode_get(root, "version") && ynode_get(root, "schema"))
-        rc = ynode_err(e, d, ynode_get(root, "schema"), "%s", "спека v1 пишется JSON-объектом "
-                       "({\"schema\": 1, …}); спека YAML — это v2, и начинается она с version: 2");
+        {
+            struct err t;
+            err_setc(&t, "spec.v1_in_yaml", "%s", "спека v1 пишется JSON-объектом "
+                     "({\"schema\": 1, …}); спека YAML — это v2, и начинается она с version: 2");
+            rc = ynode_errc(e, d, ynode_get(root, "schema"), &t);
+        }
     else if (root && root->kind == YN_MAP && !ynode_get(root, "version"))
-        rc = ynode_err(e, d, root, "%s", "нет version: 2 — спека YAML — это спека v2 "
-                       "(docs/spec-v2.md); спека v1 — JSON-объект со schema");
+        {
+            struct err t;
+            err_setc(&t, "spec.no_version_yaml", "%s", "нет version: 2 — спека YAML — это спека v2 "
+                     "(docs/spec-v2.md); спека v1 — JSON-объект со schema");
+            rc = ynode_errc(e, d, root, &t);
+        }
     else
         rc = spec_parse_v2(d, s, e);
     ydoc_free(d);
@@ -612,7 +620,7 @@ static int load_text(char *buf, size_t n, const char *path, struct spec *s, stru
     if (*p == '{' || !*p) {
         int ver = json_top_key(p, "version"), sch = json_top_key(p, "schema");
         if (ver && sch)
-            return err_set(e, "в спеке и version, и schema — это два формата (version: 2 — спека v2, "
+            return err_setc(e, "spec.both_formats", "в спеке и version, и schema — это два формата (version: 2 — спека v2, "
                            "schema — v1); оставьте одно", NULL);
         if (!ver) {
             int rc = spec_parse_v1(buf, s, e);

@@ -81,6 +81,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@BUILD=$(BUILD) sh tests/noforward.sh
 	@BUILD=$(BUILD) sh tests/boxenv.sh
 	@sh tests/climatch.sh
+	@sh tests/errcodematch.sh
 	@sh tests/dnsproxy.sh
 	@sh tests/dnsgroups.sh
 	@sh tests/dnsnft.sh

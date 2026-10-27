@@ -93,7 +93,33 @@ void pm_target_load(struct pm_target *t) {
 /* Версия последней прочитанной оси панели: держится до следующего вызова pm_compat_why, как buf. */
 static char *axis_have;
 
+/* Причина несовместимости в машинном виде — для той же фразы, что вернул pm_compat_why: код и подстановки без id и
+ * версии плагина (их добавляет pm_compat_err). */
+static char cw_code[64], cw_args[512];
+static void cw_set(const char *code, const char *k1, const char *v1, const char *k2, const char *v2,
+                   const char *k3, const char *v3) {
+    snprintf(cw_code, sizeof(cw_code), "%s", code);
+    cw_args[0] = 0;
+    if (k1) err_args_add(cw_args, sizeof(cw_args), k1, v1);
+    if (k2) err_args_add(cw_args, sizeof(cw_args), k2, v2);
+    if (k3) err_args_add(cw_args, sizeof(cw_args), k3, v3);
+}
+
+/* Отказ «id версия + причина совместимости» по последнему pm_compat_why (cw — его фраза). */
+void pm_compat_err(struct pm_err *e, const char *id, const char *ver, const char *cw) {
+    pm_errc(e, cw_code[0] ? cw_code : "plugin.incompatible", PMA("id", id, "version", ver ? ver : ""),
+            ver ? "%s %s %s" : "%s%s %s", id, ver ? ver : "", cw);
+    /* подстановки причины — следом за id и version */
+    if (cw_args[0]) {
+        const char *p = cw_args + 1;       /* без «{» */
+        size_t l = strlen(e->args);
+        if (l && strlen(p) + l + 2 < sizeof(e->args)) { e->args[l - 1] = ','; memcpy(e->args + l, p, strlen(p) + 1); }
+    }
+    if (!cw_code[0]) pm_err_arg(e, "why", cw);
+}
+
 const char *pm_compat_why(const struct pm_target *t, const struct ynode *compat, char *buf, size_t n) {
+    cw_code[0] = 0;
     for (size_t i = 0; i < ynode_len(compat); i++) {
         const char *axis = ynode_key_at(compat, i)->str;
         const struct ynode *rv = ynode_val_at(compat, i);
@@ -114,22 +140,29 @@ const char *pm_compat_why(const struct pm_target *t, const struct ynode *compat,
             if (!axis_have) {
                 if (access(panel_dir(), F_OK) != 0) continue;
                 snprintf(buf, n, "неизвестная ось совместимости %s — обновите панель splify2", axis);
+                cw_set("plugin.compat_unknown_axis_panel", "axis", axis, NULL, NULL, NULL, NULL);
                 return buf;
             }
             have = axis_have;
             who = "у панели";
         } else {
             snprintf(buf, n, "неизвестная ось совместимости %s — обновите ядро", axis);
+            cw_set("plugin.compat_unknown_axis_core", "axis", axis, NULL, NULL, NULL, NULL);
             return buf;
         }
-        if (!range) { snprintf(buf, n, "ось %s без диапазона", axis); return buf; }
+        if (!range) { snprintf(buf, n, "ось %s без диапазона", axis); cw_set("plugin.compat_no_range", "axis", axis, NULL, NULL, NULL, NULL); return buf; }
         if (!strcmp(axis, "steer-core") && strncmp(range, ">=", 2) != 0) {
             snprintf(buf, n, "ось steer-core принимает только «>=», а не «%s»", range);
+            cw_set("plugin.compat_core_op", "range", range, NULL, NULL, NULL, NULL);
             return buf;
         }
         int m = pm_range_match(range, have);
-        if (m < 0) { snprintf(buf, n, "диапазон %s «%s» не разобрался", axis, range); return buf; }
-        if (!m) { snprintf(buf, n, "требует %s %s, %s %s", axis, range, who, have ? have : "нет"); return buf; }
+        if (m < 0) { snprintf(buf, n, "диапазон %s «%s» не разобрался", axis, range); cw_set("plugin.compat_bad_range", "axis", axis, "range", range, NULL, NULL); return buf; }
+        if (!m) {
+            snprintf(buf, n, "требует %s %s, %s %s", axis, range, who, have ? have : "нет");
+            cw_set(!strcmp(who, "у ядра") ? "plugin.compat_needs_core" : "plugin.compat_needs_panel", "axis", axis, "range", range, "have", have ? have : "none");
+            return buf;
+        }
     }
     return NULL;
 }
@@ -162,13 +195,13 @@ static struct ydoc *idx_verify(struct pm_repo *r, const char *body, size_t bn, c
     const struct ynode *root = ydoc_root(d);
     if (yn_long(root, "schema", -1) != 1) {
         ydoc_free(d);
-        pm_errf(e, "индекс репозитория %s нового формата — обновите ядро", r->name);
+        pm_errc(e, "plugin.index_new_format", PMA("name", r->name), "индекс репозитория %s нового формата — обновите ядро", r->name);
         return NULL;
     }
     const char *rid = yn_str(ynode_get(root, "repo"), "id");
     if (!seed && (!rid || strcmp(rid, r->name))) {
         ydoc_free(d);
-        pm_errf(e, "индекс репозитория %s назван «%s» — это чужой индекс", r->name, rid ? rid : "");
+        pm_errc(e, "plugin.index_foreign", PMA("name", r->name, "id", rid ? rid : ""), "индекс репозитория %s назван «%s» — это чужой индекс", r->name, rid ? rid : "");
         return NULL;
     }
     if (check_time) {
@@ -176,7 +209,7 @@ static struct ydoc *idx_verify(struct pm_repo *r, const char *body, size_t bn, c
         time_t ex = pm_parse_time(yn_str(root, "expires"));
         if (ex >= 0 && ex < now) {
             ydoc_free(d);
-            pm_errf(e, "индекс репозитория %s просрочен (%s) — зеркало отдаёт старый индекс", r->name,
+            pm_errc(e, "plugin.index_expired", PMA("name", r->name, "expires", yn_str(root, "expires")), "индекс репозитория %s просрочен (%s) — зеркало отдаёт старый индекс", r->name,
                     yn_str(root, "expires"));
             return NULL;
         }
@@ -184,7 +217,7 @@ static struct ydoc *idx_verify(struct pm_repo *r, const char *body, size_t bn, c
         time_t seen = pm_parse_time(r->last_generated);
         if (gen >= 0 && seen >= 0 && gen < seen) {
             ydoc_free(d);
-            pm_errf(e, "индекс репозитория %s старее уже виденного (%s < %s) — откат индекса отвергнут",
+            pm_errc(e, "plugin.index_rollback", PMA("name", r->name, "generated", yn_str(root, "generated"), "seen", r->last_generated), "индекс репозитория %s старее уже виденного (%s < %s) — откат индекса отвергнут",
                     r->name, yn_str(root, "generated"), r->last_generated);
             return NULL;
         }
@@ -255,12 +288,12 @@ static int idx_from_seed(struct pm_repo *r, struct pm_err *e) {
     size_t bn = 0, sn = 0;
     char *b = pm_read(ip, &bn), *s = pm_read(sp, &sn);
     free(ip); free(sp);
-    if (!b) { free(s); return pm_errf(e, "семени нет"); }
+    if (!b) { free(s); return pm_errc(e, "plugin.no_seed", NULL, "семени нет"); }
     struct ydoc *d = idx_verify(r, b, bn, s, sn, 0, 1, e);
     free(b); free(s);
     if (!d) return -1;
     const char *rid = yn_str(ynode_get(ydoc_root(d), "repo"), "id");
-    if (!r->seed && (!rid || strcmp(rid, r->name))) { ydoc_free(d); return pm_errf(e, "семя — индекс другого репозитория"); }
+    if (!r->seed && (!rid || strcmp(rid, r->name))) { ydoc_free(d); return pm_errc(e, "plugin.seed_other_repo", NULL, "семя — индекс другого репозитория"); }
     idx_set(r, d);
     r->seed = 1;
     free(r->url);
@@ -271,7 +304,7 @@ static int idx_from_seed(struct pm_repo *r, struct pm_err *e) {
 int pm_index_get(struct pm_repo *r, int refresh, struct pm_err *e) {
     if (r->iroot) return 0;
     if (r->seed) return idx_from_seed(r, e);
-    struct pm_err ce = {{0}};
+    struct pm_err ce = {0};
     char *cd = cache_dir(r);
     char *etag_p = pm_path(cd, "etag");
     char *etag = NULL;
@@ -363,9 +396,9 @@ int pm_index_get(struct pm_repo *r, int refresh, struct pm_err *e) {
     }
     if (idx_from_cache(r, &ce) == 0) goto done;
     if (r->official && idx_from_seed(r, &ce) == 0) goto done;
-    if (r->idx_err) pm_errf(e, "%s", r->idx_err);
-    else if (net_err) pm_errf(e, "индекс репозитория %s не скачался: %s", r->name, net_err);
-    else pm_errf(e, "индекса репозитория %s нет: %s", r->name, ce.msg[0] ? ce.msg : "кэш пуст");
+    if (r->idx_err) pm_errc(e, "plugin.index_failed", PMA("name", r->name, "why", r->idx_err), "%s", r->idx_err);
+    else if (net_err) pm_errc(e, "plugin.index_download", PMA("name", r->name, "why", net_err), "индекс репозитория %s не скачался: %s", r->name, net_err);
+    else pm_errc(e, "plugin.index_missing", PMA("name", r->name, "why", ce.msg[0] ? ce.msg : "кэш пуст"), "индекса репозитория %s нет: %s", r->name, ce.msg[0] ? ce.msg : "кэш пуст");
     free(net_err); free(etag); free(etag_p); free(cd);
     return -1;
 done:
@@ -430,52 +463,54 @@ static const char *key_of(const struct ynode *map, const char *id) {
 int pm_select(struct pm_ctx *x, struct pm_repo *r, const char *id, const char *range, const char *exact,
               const char *variant, const char *below, struct pm_cand *c, struct pm_err *e) {
     const struct ynode *pl = pm_index_plugin(r, id);
-    if (!pl) return pm_errf(e, "плагина %s нет в репозитории %s", id, r->name);
+    if (!pl) return pm_errc(e, "plugin.not_in_repo", PMA("id", id, "name", r->name), "плагина %s нет в репозитории %s", id, r->name);
     const struct ynode *vs = ynode_get(pl, "versions");
     size_t n = ynode_len(vs);
-    if (!n) return pm_errf(e, "у плагина %s нет версий", id);
+    if (!n) return pm_errc(e, "plugin.no_versions", PMA("id", id), "у плагина %s нет версий", id);
     const struct ynode **sorted = pm_alloc(sizeof(*sorted) * n);
     for (size_t i = 0; i < n; i++) sorted[i] = ynode_at(vs, i);
     qsort(sorted, n, sizeof(*sorted), ver_desc);
     struct pm_inst *inst = pm_state_find(&x->st, id);
-    char reason[1024] = "";
+    struct pm_err reason_e = {0}, why_e = {0};   /* почему версия не подошла: текст, код и подстановки */
     int found = 0;
     for (size_t i = 0; i < n && !found; i++) {
         const struct ynode *v = sorted[i];
         const char *ver = yn_str(v, "version");
-        char why[512] = "";
+        why_e.msg[0] = 0;
         if (!ver || !pm_ver_ok(ver)) continue;
         if (exact && strcmp(exact, ver)) continue;
         if (below && pm_ver_cmp(ver, below) >= 0) continue;
         if (range) {
             int m = pm_range_match(range, ver);
             if (m <= 0) {
-                if (!reason[0]) snprintf(reason, sizeof(reason), "нет версии %s в диапазоне %s", id, range);
+                if (!reason_e.msg[0]) pm_errc(&reason_e, "plugin.no_version_in_range", PMA("id", id, "range", range), "нет версии %s в диапазоне %s", id, range);
                 continue;
             }
         }
         const struct ynode *y = ynode_get(v, "yanked");
         if (y && y->kind == YN_MAP) {
-            snprintf(why, sizeof(why), "%s %s отозвана: %s", id, ver, yn_str(y, "why") ? yn_str(y, "why") : "без причины");
+            pm_errc(&why_e, "plugin.version_yanked", PMA("id", id, "version", ver, "why", yn_str(y, "why") ? yn_str(y, "why") : "без причины"), "%s %s отозвана: %s", id, ver, yn_str(y, "why") ? yn_str(y, "why") : "без причины");
             goto skip;
         }
         const char *bw = pm_bad_why(inst, ver);
         if (bw && !exact && !x->allow_bad) {
-            snprintf(why, sizeof(why), "%s %s уже не прошла проверку здоровья: %s", id, ver, bw);
+            pm_errc(&why_e, "plugin.version_unhealthy", PMA("id", id, "version", ver, "why", bw), "%s %s уже не прошла проверку здоровья: %s", id, ver, bw);
             goto skip;
         }
         char key[96];
         const struct ynode *asset = asset_for(ynode_get(v, "assets"), x->tg.arch, variant, key, sizeof(key));
         if (!asset) {
-            snprintf(why, sizeof(why), "у %s %s нет сборки под %s%s%s", id, ver, x->tg.arch ? x->tg.arch : "эту архитектуру",
+            char vb[80];
+            snprintf(vb, sizeof(vb), "%s%s", variant && strcmp(variant, "full") ? "@" : "", variant && strcmp(variant, "full") ? variant : "");
+            pm_errc(&why_e, "plugin.version_no_build", PMA("id", id, "version", ver, "arch", x->tg.arch ? x->tg.arch : "?", "variant", vb), "у %s %s нет сборки под %s%s%s", id, ver, x->tg.arch ? x->tg.arch : "эту архитектуру",
                      variant && strcmp(variant, "full") ? "@" : "", variant && strcmp(variant, "full") ? variant : "");
             goto skip;
         }
         char cb[512];
         const char *cw = pm_compat_why(&x->tg, ynode_get(v, "compat"), cb, sizeof(cb));
-        if (cw) { snprintf(why, sizeof(why), "%s %s %s", id, ver, cw); goto skip; }
+        if (cw) { pm_compat_err(&why_e, id, ver, cw); goto skip; }
         const char *cf = conflict_with(x, id, ynode_get(v, "conflicts"));
-        if (cf) { snprintf(why, sizeof(why), "%s %s не ставится рядом с установленным %s", id, ver, cf); goto skip; }
+        if (cf) { pm_errc(&why_e, "plugin.version_conflict_installed", PMA("id", id, "version", ver, "other", cf), "%s %s не ставится рядом с установленным %s", id, ver, cf); goto skip; }
         memset(c, 0, sizeof(*c));
         c->repo = r;
         c->id = key_of(ynode_get(r->iroot, "plugins"), id);
@@ -488,10 +523,11 @@ int pm_select(struct pm_ctx *x, struct pm_repo *r, const char *id, const char *r
         found = 1;
         break;
     skip:
-        if (!reason[0] || (exact && why[0])) snprintf(reason, sizeof(reason), "%s", why);
+        if (!reason_e.msg[0] || (exact && why_e.msg[0])) reason_e = why_e;
     }
     free(sorted);
     if (found) return 0;
-    if (exact && !reason[0]) return pm_errf(e, "версии %s %s нет в репозитории %s", id, exact, r->name);
-    return pm_errf(e, "%s", reason[0] ? reason : "нет годной версии");
+    if (exact && !reason_e.msg[0]) return pm_errc(e, "plugin.version_not_in_repo", PMA("id", id, "version", exact, "name", r->name), "версии %s %s нет в репозитории %s", id, exact, r->name);
+    if (reason_e.msg[0]) return pm_errcopy(e, &reason_e);
+    return pm_errc(e, "plugin.no_suitable_version", PMA("id", id), "нет годной версии");
 }

@@ -308,11 +308,18 @@ check "enable" "enabled" "$(jq_ 'd["plugins"]["foo"]["state"]' < etc/state.json)
 o="$(P remove net1 --json 2>/dev/null)"; rc=$?
 check "remove net1, нужный foo: отказ" "1" "$rc"
 has "  называет зависимого" "нужен плагинам foo" "$o"
+check "  машинная часть: code и args (docs/errors.md)" "plugin.needed_by_plugins plugin=net1 users=foo" \
+    "$(printf '%s' "$o" | jq_ 'd["code"]+" id="+d["args"]["id"]+" users="+d["args"]["users"]' | sed 's/ id=/ plugin=/')"
 printf 'outputs:\n  nl: { kind: tunnel, protocol: foo, subscription: sub/nl }\n  de: { kind: tunnel, protocol: foo }\n' > spec.yaml
 mkdir -p etc/conf/foo && echo 1 > etc/conf/foo/x
 o="$(P remove foo --json 2>/dev/null)"; rc=$?
 check "remove foo, чей вид в спеке: отказ" "1" "$rc"
 has "  называет выходы" "выходы nl, de — вида tunnel:foo" "$o"
+check "  машинная часть: plugin.needed_by_outputs, outputs в args" "plugin.needed_by_outputs" "$(printf '%s' "$o" | jq_ 'd["code"]')"
+o="$(P remove nosuch --json 2>/dev/null)"
+check "remove неустановленного: plugin.not_installed и id" "plugin.not_installed nosuch" "$(printf '%s' "$o" | jq_ 'd["code"]+" "+d["args"]["id"]')"
+o="$(P install 'a b' --json 2>/dev/null)"
+check "install с негодным именем: plugin.bad_name, args пуст" "plugin.bad_name {}" "$(printf '%s' "$o" | jq_ 'd["code"]+" "+str(d["args"])')"
 o="$(P remove foo --force --json 2>/dev/null)"; rc=$?
 check "remove --force" "0" "$rc"
 check "  каталог и запись убраны, настройки остались" "no no yes" \

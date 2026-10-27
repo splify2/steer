@@ -8,6 +8,9 @@ LIBS2P_NET_1 {
     s2p_SL_ECH_DNS;
     s2p_b64_decode;
     s2p_chello_parse;
+    s2p_err_args_add;
+    s2p_err_print;
+    s2p_err_setc;
     s2p_evline_emit;
     s2p_evline_enabled;
     s2p_evline_open;

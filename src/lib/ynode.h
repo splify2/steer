@@ -93,4 +93,8 @@ int ynode_long(const struct ynode *n, long *out);
 int ynode_err(struct err *e, const struct ydoc *d, const struct ynode *n,
               const char *fmt, const char *a);
 
+/* То же с готовым отказом `in` (текст, code, args — как собрал err_vsetc): место добавляется к тексту
+ * спереди, а в args — подстановкой "at" («имя:строка:столбец»; без строки — только имя). */
+int ynode_errc(struct err *e, const struct ydoc *d, const struct ynode *n, const struct err *in);
+
 #endif

@@ -83,20 +83,69 @@ void ydoc_free(struct ydoc *d) {
 /* err_set берёт формат с одним %s, а здесь их больше (имя, строка, столбец, текст): сообщение
  * собирается в буфер и уходит через "%s". Буфер меньше struct err нарочно — с запасом под то,
  * что вызывающий, пробрасывая отказ, добавит спереди. */
-static int yfail(struct err *e, const char *name, unsigned line, unsigned col,
-                 const char *fmt, const char *a) {
+/* Место отказа в подстановках: "at" («имя:строка:столбец»), "line", "col». */
+static void yat(struct err *e, const char *name, unsigned line, unsigned col) {
+    char at[400];
+    if (line) snprintf(at, sizeof(at), "%s:%u:%u", name, line, col);
+    else snprintf(at, sizeof(at), "%s", name);
+    err_args_add(e->args, sizeof(e->args), "at", at);
+    if (line) {
+        char nb[16];
+        snprintf(nb, sizeof(nb), "%u", line);
+        err_args_add(e->args, sizeof(e->args), "line", nb);
+        snprintf(nb, sizeof(nb), "%u", col);
+        err_args_add(e->args, sizeof(e->args), "col", nb);
+    }
+}
+
+static int yfailc(const char *code, struct err *e, const char *name, unsigned line, unsigned col,
+                  const char *fmt, const char *a) {
     char buf[900];
     int off = line ? snprintf(buf, sizeof(buf), "%s:%u:%u: ", name, line, col)
                    : snprintf(buf, sizeof(buf), "%s: ", name);
     if (off < 0) off = 0;
     if ((size_t)off >= sizeof(buf)) off = sizeof(buf) - 1;
     snprintf(buf + off, sizeof(buf) - off, fmt, a);
-    return err_set(e, "%s", buf);
+    err_set(e, "%s", buf);
+    if (code && *code) {
+        snprintf(e->code, sizeof(e->code), "%s", code);
+        if (a && strcmp(fmt, "%s")) err_args_add(e->args, sizeof(e->args), "1", a);
+        yat(e, name, line, col);
+    }
+    return -1;
 }
+
+#define yfail(e, name, line, col, fmt, a) yfailc("", e, name, line, col, fmt, a)
 
 int ynode_err(struct err *e, const struct ydoc *d, const struct ynode *n,
               const char *fmt, const char *a) {
     return yfail(e, d ? d->name : "?", n ? n->line : 0, n ? n->col : 0, fmt, a);
+}
+
+int ynode_errc(struct err *e, const struct ydoc *d, const struct ynode *n, const struct err *in) {
+    const char *name = d ? d->name : "?";
+    unsigned line = n ? n->line : 0, col = n ? n->col : 0;
+    char msg[sizeof(in->msg)], code[sizeof(in->code)], args[sizeof(in->args)];
+    snprintf(msg, sizeof(msg), "%s", in->msg);
+    snprintf(code, sizeof(code), "%s", in->code);
+    snprintf(args, sizeof(args), "%s", in->args);
+    yfail(e, name, line, col, "%s", msg);
+    snprintf(e->code, sizeof(e->code), "%s", code);
+    snprintf(e->args, sizeof(e->args), "%s", args);
+    if (code[0]) {
+        char at[400];
+        if (line) snprintf(at, sizeof(at), "%s:%u:%u", name, line, col);
+        else snprintf(at, sizeof(at), "%s", name);
+        err_args_add(e->args, sizeof(e->args), "at", at);
+        if (line) {
+            char nb[16];
+            snprintf(nb, sizeof(nb), "%u", line);
+            err_args_add(e->args, sizeof(e->args), "line", nb);
+            snprintf(nb, sizeof(nb), "%u", col);
+            err_args_add(e->args, sizeof(e->args), "col", nb);
+        }
+    }
+    return -1;
 }
 
 /* Строка и столбец (с единицы) по смещению в буфере — для ошибок чтения, у которых libyaml
@@ -120,12 +169,14 @@ static int ylib_fail(struct err *e, const char *name, const yaml_parser_t *p,
     unsigned line, col;
     switch (p->error) {
     case YAML_MEMORY_ERROR:
-        return yfail(e, name, 0, 0, "не хватило памяти на разбор YAML", NULL);
+        return yfailc("spec.no_memory", e, name, 0, 0, "не хватило памяти на разбор YAML", NULL);
     case YAML_READER_ERROR:
         ypos(buf, len, p->problem_offset, &line, &col);
         snprintf(msg, sizeof(msg), "текст не читается как UTF-8/UTF-16: %s",
                  p->problem ? p->problem : "?");
-        return yfail(e, name, line, col, "%s", msg);
+        yfailc("yaml.reader", e, name, line, col, "%s", msg);
+        err_args_add(e->args, sizeof(e->args), "problem", p->problem ? p->problem : "?");
+        return -1;
     default:
         line = (unsigned)p->problem_mark.line + 1;
         col = (unsigned)p->problem_mark.column + 1;
@@ -142,7 +193,16 @@ static int ylib_fail(struct err *e, const char *name, const yaml_parser_t *p,
             size_t m = strlen(msg);
             snprintf(msg + m, sizeof(msg) - m, "; табуляция: отступ в YAML — только пробелы");
         }
-        return yfail(e, name, line, col, "%s", msg);
+        int tab = strstr(msg, "табуляция") != NULL;
+        yfailc(tab ? "yaml.tab" : "yaml.syntax", e, name, line, col, "%s", msg);
+        err_args_add(e->args, sizeof(e->args), "problem", p->problem ? p->problem : "?");
+        if (p->context) {
+            char nb[16];
+            err_args_add(e->args, sizeof(e->args), "context", p->context);
+            snprintf(nb, sizeof(nb), "%u", (unsigned)p->context_mark.line + 1);
+            err_args_add(e->args, sizeof(e->args), "context_line", nb);
+        }
+        return -1;
     }
 }
 
@@ -167,12 +227,12 @@ static struct ynode *ynew(struct ybuild *b, enum ynode_kind kind, const yaml_eve
     if (++b->d->nodes > YDOC_MAX_NODES) {
         char lim[24];
         snprintf(lim, sizeof(lim), "%u", YDOC_MAX_NODES);
-        yfail(b->e, b->d->name, (unsigned)ev->start_mark.line + 1,
+        yfailc("yaml.too_many_nodes", b->e, b->d->name, (unsigned)ev->start_mark.line + 1,
               (unsigned)ev->start_mark.column + 1, "в документе больше %s узлов", lim);
         return NULL;
     }
     struct ynode *n = yalloc(b->d, sizeof(*n));
-    if (!n) { yfail(b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL); return NULL; }
+    if (!n) { yfailc("spec.no_memory", b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL); return NULL; }
     memset(n, 0, sizeof(*n));
     n->kind = kind;
     n->style = YS_PLAIN;
@@ -185,12 +245,12 @@ static struct ynode *ynew(struct ybuild *b, enum ynode_kind kind, const yaml_eve
 static int yanchor_tag(struct ybuild *b, struct ynode *n, const yaml_char_t *anchor,
                        const yaml_char_t *tag) {
     if (anchor)
-        return yfail(b->e, b->d->name, n->line, n->col,
+        return yfailc("yaml.anchor", b->e, b->d->name, n->line, n->col,
                      "якорь &%s: якоря и алиасы в спеке не поддерживаются — повторяющееся "
                      "задаётся именем и ссылкой на него", (const char *)anchor);
     if (tag) {
         n->tag = ystrdup(b->d, (const char *)tag, strlen((const char *)tag));
-        if (!n->tag) return yfail(b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL);
+        if (!n->tag) return yfailc("spec.no_memory", b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL);
     }
     return 0;
 }
@@ -204,12 +264,12 @@ static int yattach(struct ybuild *b, struct ynode *n) {
     }
     struct yframe *f = &b->st[b->depth - 1];
     if (f->node->kind == YN_MAP && f->n % 2 == 0 && n->kind != YN_SCALAR)
-        return yfail(b->e, b->d->name, n->line, n->col,
+        return yfailc("yaml.key_not_string", b->e, b->d->name, n->line, n->col,
                      "ключ отображения — не строка (составные ключи не поддерживаются)", NULL);
     if (f->n == f->cap) {
         size_t cap = f->cap ? f->cap * 2 : 8;
         struct ynode **v = realloc(f->v, cap * sizeof(*v));
-        if (!v) return yfail(b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL);
+        if (!v) return yfailc("spec.no_memory", b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL);
         f->v = v;
         f->cap = cap;
     }
@@ -221,7 +281,7 @@ static int ypush(struct ybuild *b, struct ynode *n) {
     if (b->depth >= YDOC_MAX_DEPTH) {
         char lim[16];
         snprintf(lim, sizeof(lim), "%d", YDOC_MAX_DEPTH);
-        return yfail(b->e, b->d->name, n->line, n->col, "вложенность глубже %s уровней", lim);
+        return yfailc("yaml.too_deep", b->e, b->d->name, n->line, n->col, "вложенность глубже %s уровней", lim);
     }
     struct yframe *f = &b->st[b->depth++];
     f->node = n;
@@ -245,7 +305,7 @@ static int ydupkeys(struct ybuild *b, struct ynode *map) {
     size_t n = map->len;
     if (n < 2) return 0;
     struct ynode **k = malloc(n * sizeof(*k));
-    if (!k) return yfail(b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL);
+    if (!k) return yfailc("spec.no_memory", b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL);
     for (size_t i = 0; i < n; i++) k[i] = map->items[2 * i];
     qsort(k, n, sizeof(*k), ykey_cmp);
     int rc = 0;
@@ -254,7 +314,13 @@ static int ydupkeys(struct ybuild *b, struct ynode *map) {
         char msg[600];
         snprintf(msg, sizeof(msg), "ключ \"%.400s\" повторяется (первый раз — строка %u)",
                  k[i]->str, k[i - 1]->line);
-        rc = yfail(b->e, b->d->name, k[i]->line, k[i]->col, "%s", msg);
+        rc = yfailc("yaml.duplicate_key", b->e, b->d->name, k[i]->line, k[i]->col, "%s", msg);
+        err_args_add(b->e->args, sizeof(b->e->args), "1", k[i]->str);
+        {
+            char nb[16];
+            snprintf(nb, sizeof(nb), "%u", k[i - 1]->line);
+            err_args_add(b->e->args, sizeof(b->e->args), "2", nb);
+        }
         break;
     }
     free(k);
@@ -267,7 +333,7 @@ static int ypop(struct ybuild *b) {
     int rc = 0;
     if (f->n) {
         n->items = yalloc(b->d, f->n * sizeof(*n->items));
-        if (!n->items) rc = yfail(b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL);
+        if (!n->items) rc = yfailc("spec.no_memory", b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL);
         else memcpy(n->items, f->v, f->n * sizeof(*n->items));
     }
     n->len = n->kind == YN_MAP ? f->n / 2 : f->n;
@@ -284,7 +350,7 @@ static int yscalar(struct ybuild *b, const yaml_event_t *ev) {
     const char *v = (const char *)ev->data.scalar.value;
     size_t len = ev->data.scalar.length;
     if (memchr(v, 0, len))
-        return yfail(b->e, b->d->name, n->line, n->col,
+        return yfailc("yaml.nul_byte", b->e, b->d->name, n->line, n->col,
                      "в строке нулевой байт — такое значение обрезалось бы молча", NULL);
     switch (ev->data.scalar.style) {
     case YAML_SINGLE_QUOTED_SCALAR_STYLE: n->style = YS_SINGLE; break;
@@ -294,7 +360,7 @@ static int yscalar(struct ybuild *b, const yaml_event_t *ev) {
     default:                              n->style = YS_PLAIN; break;
     }
     n->str = ystrdup(b->d, v, len);
-    if (!n->str) return yfail(b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL);
+    if (!n->str) return yfailc("spec.no_memory", b->e, b->d->name, 0, 0, "не хватило памяти на дерево YAML", NULL);
     n->len = len;
     return yattach(b, n);
 }
@@ -318,12 +384,12 @@ static int yevent(struct ybuild *b, const yaml_event_t *ev, int *docs) {
         return 1;
     case YAML_DOCUMENT_START_EVENT:
         if ((*docs)++)
-            return yfail(b->e, b->d->name, (unsigned)ev->start_mark.line + 1,
+            return yfailc("yaml.second_document", b->e, b->d->name, (unsigned)ev->start_mark.line + 1,
                          (unsigned)ev->start_mark.column + 1,
                          "второй документ в потоке: ожидался один документ", NULL);
         return 0;
     case YAML_ALIAS_EVENT:
-        return yfail(b->e, b->d->name, (unsigned)ev->start_mark.line + 1,
+        return yfailc("yaml.alias", b->e, b->d->name, (unsigned)ev->start_mark.line + 1,
                      (unsigned)ev->start_mark.column + 1,
                      "алиас *%s: якоря и алиасы в спеке не поддерживаются — повторяющееся "
                      "задаётся именем и ссылкой на него", (const char *)ev->data.alias.anchor);
@@ -346,22 +412,22 @@ struct ydoc *ydoc_parse_buf(const char *buf, size_t len, const char *name, struc
     if (len > YDOC_MAX_BYTES) {
         char lim[24];
         snprintf(lim, sizeof(lim), "%u", YDOC_MAX_BYTES);
-        yfail(e, name, 0, 0, "документ больше %s байт", lim);
+        yfailc("yaml.too_big", e, name, 0, 0, "документ больше %s байт", lim);
         return NULL;
     }
     struct ydoc *d = calloc(1, sizeof(*d));
-    if (!d) { yfail(e, name, 0, 0, "не хватило памяти на разбор YAML", NULL); return NULL; }
+    if (!d) { yfailc("spec.no_memory", e, name, 0, 0, "не хватило памяти на разбор YAML", NULL); return NULL; }
     d->name = ystrdup(d, name, strlen(name));
     if (!d->name) {
         ydoc_free(d);
-        yfail(e, name, 0, 0, "не хватило памяти на разбор YAML", NULL);
+        yfailc("spec.no_memory", e, name, 0, 0, "не хватило памяти на разбор YAML", NULL);
         return NULL;
     }
 
     yaml_parser_t p;
     if (!yaml_parser_initialize(&p)) {
         ydoc_free(d);
-        yfail(e, name, 0, 0, "не хватило памяти на разбор YAML", NULL);
+        yfailc("spec.no_memory", e, name, 0, 0, "не хватило памяти на разбор YAML", NULL);
         return NULL;
     }
     /* Пустой буфер — законный пустой поток; libyaml указателя при нулевой длине не читает, но
@@ -369,7 +435,7 @@ struct ydoc *ydoc_parse_buf(const char *buf, size_t len, const char *name, struc
     yaml_parser_set_input_string(&p, (const unsigned char *)(buf ? buf : ""), len);
 
     struct ybuild *b = calloc(1, sizeof(*b));
-    int rc = b ? 0 : yfail(e, name, 0, 0, "не хватило памяти на разбор YAML", NULL);
+    int rc = b ? 0 : yfailc("spec.no_memory", e, name, 0, 0, "не хватило памяти на разбор YAML", NULL);
     int docs = 0;
     if (b) {
         b->d = d;
@@ -394,7 +460,7 @@ struct ydoc *ydoc_parse_buf(const char *buf, size_t len, const char *name, struc
         return NULL;
     }
     if (!d->root) {
-        yfail(e, d->name, 0, 0, "документ пуст", NULL);
+        yfailc("yaml.empty", e, d->name, 0, 0, "документ пуст", NULL);
         ydoc_free(d);
         return NULL;
     }

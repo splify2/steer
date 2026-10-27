@@ -70,7 +70,7 @@ struct v2 {
     struct err *e;
     /* Первое «ещё не поддерживается»: место и что именно. */
     const struct ynode *un_node;
-    char un_what[400];
+    struct err un;    /* что не поддерживается (текст, код и подстановки) */
     int realip_default;             /* dns.mode */
     char base[4096];                /* каталог файла спеки — для относительных путей (PATH_MAX) */
     int base_err;                   /* каталог определить не удалось: относительные пути не разрешить */
@@ -92,29 +92,63 @@ struct v2 {
 
 /* ---- отказы -------------------------------------------------------------------------------- */
 
-__attribute__((format(printf, 3, 4)))
-static int fail(struct v2 *x, const struct ynode *n, const char *fmt, ...) {
-    char msg[900];
+/* Слова-виды узла в подстановках отказа — английскими (текст отказа остаётся русским, а подстановка уходит
+ * каркасу, который переводит текст по коду). */
+static void shape_args_fix(struct err *t) {
+    static const char *const ru[] = { "ничего", "отображение", "список", "пустое значение", "строка", "пустая строка" };
+    static const char *const en[] = { "nothing", "a mapping", "a list", "an empty value", "a string", "an empty string" };
+    for (size_t i = 0; i < sizeof(ru) / sizeof(*ru); i++) {
+        char pat[64];
+        snprintf(pat, sizeof(pat), "\":\"%s\"", ru[i]);
+        char *h = strstr(t->args, pat);
+        if (!h) continue;
+        char rest[sizeof(t->args)];
+        snprintf(rest, sizeof(rest), "%s", h + strlen(pat));
+        snprintf(h, sizeof(t->args) - (size_t)(h - t->args), "\":\"%s\"%s", en[i], rest);
+    }
+}
+
+/* Отказ с кодом (docs/errors.md): fmt — прежний русский текст, подстановки уходят в args по порядку ("1", "2", …),
+ * «имя:строка:столбец» узла — подстановкой "at". */
+__attribute__((format(printf, 4, 5)))
+static int fail(struct v2 *x, const struct ynode *n, const char *code, const char *fmt, ...) {
+    struct err t;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
+    err_vsetc(&t, code, fmt, ap);
     va_end(ap);
-    return ynode_err(x->e, x->d, n, "%s", msg);
+    shape_args_fix(&t);
+    return ynode_errc(x->e, x->d, n, &t);
 }
 
 /* Отказ, который уже сформулирован без места (вид, группа, сквозная проверка), — с местом. */
 static int wrap(struct v2 *x, const struct ynode *n) {
-    char msg[sizeof(x->e->msg)];
-    snprintf(msg, sizeof(msg), "%s", x->e->msg);
-    return ynode_err(x->e, x->d, n, "%s", msg);
+    struct err t = *x->e;
+    return ynode_errc(x->e, x->d, n, &t);
 }
 
-__attribute__((format(printf, 3, 4)))
-static void unsup(struct v2 *x, const struct ynode *n, const char *fmt, ...) {
+/* Отказ внутреннего разбора (ключи вида плагина) с путём «where: » спереди. Есть у него свой код — он остаётся, а путь
+ * уходит подстановкой "in"; нет — код spec.key_rejected с подстановками «путь» и «причина». */
+static int wrap_in(struct v2 *x, const struct ynode *n, const char *where) {
+    struct err t = *x->e;
+    snprintf(t.msg, sizeof(t.msg), "%s: %.900s", where, x->e->msg);
+    if (t.code[0]) {
+        err_args_add(t.args, sizeof(t.args), "in", where);
+    } else {
+        snprintf(t.code, sizeof(t.code), "spec.key_rejected");
+        t.args[0] = 0;
+        err_args_add(t.args, sizeof(t.args), "1", where);
+        err_args_add(t.args, sizeof(t.args), "2", x->e->msg);
+    }
+    return ynode_errc(x->e, x->d, n, &t);
+}
+
+__attribute__((format(printf, 4, 5)))
+static void unsup(struct v2 *x, const struct ynode *n, const char *code, const char *fmt, ...) {
     if (x->un_node) return;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(x->un_what, sizeof(x->un_what), fmt, ap);
+    err_vsetc(&x->un, code, fmt, ap);
     va_end(ap);
     x->un_node = n;
 }
@@ -130,34 +164,34 @@ static const char *shape(const struct ynode *n) {
 
 static int want_map(struct v2 *x, const struct ynode *n, const char *where) {
     if (n && n->kind == YN_MAP) return 0;
-    return fail(x, n, "%s — отображение «ключ: значение», а не %s", where, shape(n));
+    return fail(x, n, "spec.want_map", "%s — отображение «ключ: значение», а не %s", where, shape(n));
 }
 
 /* Строка: скаляр в любом стиле записи, но не пустое значение. */
 static int str_of(struct v2 *x, const struct ynode *n, const char *where, const char **out) {
     if (!n || n->kind != YN_SCALAR || ynode_is_null(n))
-        return fail(x, n, "%s — строка, а не %s", where, shape(n));
-    if (!n->str[0]) return fail(x, n, "%s: пустая строка", where);
+        return fail(x, n, "spec.want_string", "%s — строка, а не %s", where, shape(n));
+    if (!n->str[0]) return fail(x, n, "spec.empty_string", "%s: пустая строка", where);
     *out = n->str;
     return 0;
 }
 
 static int copy_to(struct v2 *x, const struct ynode *n, const char *where, const char *v, char *dst,
                    size_t cap) {
-    if (strlen(v) >= cap) return fail(x, n, "%s: длиннее %zu байт", where, cap - 1);
+    if (strlen(v) >= cap) return fail(x, n, "spec.too_long", "%s: длиннее %zu байт", where, cap - 1);
     memcpy(dst, v, strlen(v) + 1);
     return 0;
 }
 
 static int bool_of(struct v2 *x, const struct ynode *n, const char *where, int *out) {
     if (ynode_bool(n, out) == 0) return 0;
-    return fail(x, n, "%s — true или false", where);
+    return fail(x, n, "spec.want_bool", "%s — true или false", where);
 }
 
 static int long_of(struct v2 *x, const struct ynode *n, const char *where, long lo, long hi,
                    long *out) {
-    if (ynode_long(n, out) != 0) return fail(x, n, "%s — целое число без кавычек", where);
-    if (*out < lo || *out > hi) return fail(x, n, "%s — от %ld до %ld", where, lo, hi);
+    if (ynode_long(n, out) != 0) return fail(x, n, "spec.want_int", "%s — целое число без кавычек", where);
+    if (*out < lo || *out > hi) return fail(x, n, "spec.int_range", "%s — от %ld до %ld", where, lo, hi);
     return 0;
 }
 
@@ -188,12 +222,12 @@ static const struct ynode *item(const struct ynode *n, size_t i) {
  * ровно по n_items. */
 static int items_ok(struct v2 *x, const struct ynode *n, const char *where) {
     if (n && n->kind == YN_MAP)
-        return fail(x, n, "%s — список [a, b] или одно значение, а не отображение", where);
+        return fail(x, n, "spec.want_list", "%s — список [a, b] или одно значение, а не отображение", where);
     size_t k = n_items(n);
     for (size_t i = 0; i < k; i++) {
         const struct ynode *it = item(n, i);
         if (it->kind != YN_SCALAR || ynode_is_null(it) || !it->str[0])
-            return fail(x, it, "%s: элемент — непустая строка, а не %s", where,
+            return fail(x, it, "spec.list_item", "%s: элемент — непустая строка, а не %s", where,
                         it->kind == YN_SCALAR && !ynode_is_null(it) ? "пустая строка" : shape(it));
     }
     return 0;
@@ -213,7 +247,7 @@ static int keys_in(struct v2 *x, const struct ynode *map, const char *where,
         list[0] = '\0';
         for (a = 0; allowed[a] && l < sizeof(list); a++)
             l += (size_t)snprintf(list + l, sizeof(list) - l, "%s%s", a ? ", " : "", allowed[a]);
-        return fail(x, ynode_key_at(map, i), "неизвестный ключ «%s» в %s (есть: %s)", k, where, list);
+        return fail(x, ynode_key_at(map, i), "spec.unknown_key", "неизвестный ключ «%s» в %s (есть: %s)", k, where, list);
     }
     return 0;
 }
@@ -224,7 +258,7 @@ static int keys_known(struct v2 *x, const struct ynode *map, const char *where, 
         if (v2key_known(sc, k)) continue;
         char list[256];
         v2keys_list(sc, list, sizeof(list));
-        return fail(x, ynode_key_at(map, i), "неизвестный ключ «%s» в %s (есть: %s)", k, where, list);
+        return fail(x, ynode_key_at(map, i), "spec.unknown_key", "неизвестный ключ «%s» в %s (есть: %s)", k, where, list);
     }
     return 0;
 }
@@ -233,7 +267,7 @@ static int keys_known(struct v2 *x, const struct ynode *map, const char *where, 
 static int name_of(struct v2 *x, const struct ynode *key, const char *section, char *dst) {
     const char *v = key->str;
     if (!name_ok(v))
-        return fail(x, key, "%s: имя «%s» — только буквы, цифры, _ - и точка", section, v);
+        return fail(x, key, "spec.bad_name", "%s: имя «%s» — только буквы, цифры, _ - и точка", section, v);
     return copy_to(x, key, section, v, dst, 32);
 }
 
@@ -252,13 +286,13 @@ static int path_of(struct v2 *x, const struct ynode *n, const char *where, const
     /* Каталог не определился (слишком длинный путь, нет рабочего каталога): оставить путь
      * относительным значило бы тихо сменить смысл — от каталога процесса, а не спеки. */
     if (x->base_err)
-        return fail(x, n, "%s: каталог файла спеки не определить — относительный путь «%s» не разрешить, "
+        return fail(x, n, "spec.no_spec_dir", "%s: каталог файла спеки не определить — относительный путь «%s» не разрешить, "
                     "задайте абсолютный", where, v);
     if (!x->base[0]) return copy_to(x, n, where, v, dst, cap);
     /* Склейка без промежуточного буфера и без обрезки: обрезанный путь молча искал бы файл спеки
      * по другому имени (I-543). Не влезло — отказ с числом. */
     size_t need = strlen(x->base) + 1 + strlen(v);
-    if (need >= cap) return fail(x, n, "%s: путь с каталогом спеки длиннее %zu байт", where, cap - 1);
+    if (need >= cap) return fail(x, n, "spec.path_too_long", "%s: путь с каталогом спеки длиннее %zu байт", where, cap - 1);
     size_t bl = strlen(x->base);
     memcpy(dst, x->base, bl);
     dst[bl] = '/';
@@ -314,7 +348,7 @@ static int mac_ok(const char *s) {
  * смесь семейств в одном клиенте допустима. */
 static int addr_check(struct v2 *x, const struct ynode *n, const char *where, const char *v) {
     if (!spec_line_is_addr(v))
-        return fail(x, n, "%s: «%s» — не адрес IPv4 или IPv6, не подсеть и не диапазон", where, v);
+        return fail(x, n, "spec.bad_address", "%s: «%s» — не адрес IPv4 или IPv6, не подсеть и не диапазон", where, v);
     return 0;
 }
 
@@ -322,7 +356,7 @@ static int addr_check(struct v2 *x, const struct ynode *n, const char *where, co
 static int from_reserve(struct v2 *x, const struct ynode *n, struct spec_client *c, size_t cnt) {
     if (!cnt) return 0;
     c->from = (char (*)[64])spec_alloc(x->s, cnt * sizeof(*c->from));
-    return c->from ? 0 : fail(x, n, "недостаточно памяти для спеки (%zu записей клиента)", cnt);
+    return c->from ? 0 : fail(x, n, "spec.no_memory", "недостаточно памяти для спеки (%zu записей клиента)", cnt);
 }
 
 static int from_push(struct v2 *x, const struct ynode *n, const char *where, struct spec_client *c,
@@ -338,17 +372,17 @@ static int p_lan(struct v2 *x, const struct ynode *n) {
     const struct ynode *dv = ynode_get(n, "devices"), *ad = ynode_get(n, "addr");
     if (dv) {
         if (items_ok(x, dv, "lan.devices")) return -1;
-        if (!n_items(dv)) return fail(x, dv, "lan.devices: пустой список — некому адресовать правила");
+        if (!n_items(dv)) return fail(x, dv, "spec.lan_devices_empty", "lan.devices: пустой список — некому адресовать правила");
         s->lan_dev_n = 0;
         s->lan_dev = (char (*)[64])spec_alloc(s, n_items(dv) * sizeof(*s->lan_dev));
-        if (!s->lan_dev) return fail(x, dv, "недостаточно памяти для спеки (lan.devices)");
+        if (!s->lan_dev) return fail(x, dv, "spec.no_memory", "недостаточно памяти для спеки (lan.devices)");
         for (size_t i = 0; i < n_items(dv); i++) {
             const struct ynode *it = item(dv, i);
             if (!name_ok(it->str))
-                return fail(x, it, "lan.devices: «%s» — имя устройства негодного состава", it->str);
+                return fail(x, it, "spec.lan_device_name", "lan.devices: «%s» — имя устройства негодного состава", it->str);
             for (size_t k = 0; k < s->lan_dev_n; k++)
                 if (!strcmp(s->lan_dev[k], it->str))
-                    return fail(x, it, "lan.devices: устройство %s указано дважды", it->str);
+                    return fail(x, it, "spec.lan_device_twice", "lan.devices: устройство %s указано дважды", it->str);
             if (copy_to(x, it, "lan.devices", it->str, s->lan_dev[s->lan_dev_n], sizeof(s->lan_dev[0])))
                 return -1;
             s->lan_dev_n++;
@@ -366,7 +400,7 @@ static int p_lan(struct v2 *x, const struct ynode *n) {
      * v1.c (from_default рядом с несколькими lan_devices). Одно устройство рядом с адресами —
      * законно: адреса выбирают клиентов, устройство тогда не участвует. */
     if (s->lan.from_n && s->lan_dev_n > 1)
-        return fail(x, ad, "lan: клиенты описаны дважды — и addr, и несколько devices. Уберите "
+        return fail(x, ad, "spec.lan_addr_and_devices", "lan: клиенты описаны дважды — и addr, и несколько devices. Уберите "
                     "addr — устройства опишут клиентов точнее");
     return 0;
 }
@@ -379,34 +413,34 @@ static int owner_of(struct v2 *x, const struct ynode *val, const char *where, co
     const struct ynode *ow = ynode_get(val, "owner");
     if (!ow) return 0;
     if (!x->s->prepared)
-        return fail(x, ow, "%s: owner пишет только плагин — в спеке человека его нет", where);
+        return fail(x, ow, "spec.owner_plugin_only", "%s: owner пишет только плагин — в спеке человека его нет", where);
     static const char *const OK[] = { "plugin", NULL };
     char w[160];
     snprintf(w, sizeof(w), "%s.owner", where);
     const char *pl;
     if (want_map(x, ow, w) || keys_in(x, ow, w, OK)) return -1;
-    if (!ynode_get(ow, "plugin")) return fail(x, ow, "%s: нет plugin", w);
+    if (!ynode_get(ow, "plugin")) return fail(x, ow, "spec.no_plugin", "%s: нет plugin", w);
     snprintf(w, sizeof(w), "%s.owner.plugin", where);
     if (str_of(x, ynode_get(ow, "plugin"), w, &pl)) return -1;
     *dst = spec_strdup(x->s, pl);
-    return *dst ? 0 : fail(x, ow, "%s: недостаточно памяти для спеки", w);
+    return *dst ? 0 : fail(x, ow, "spec.no_memory", "%s: недостаточно памяти для спеки", w);
 }
 
 static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
     if (spec_reserve_client(s, s->client_n + 1) != 0 ||
         spec_grow((void **)&x->cl, &x->cl_cap, s->client_n + 1, sizeof(*x->cl)) != 0)
-        return fail(x, key, "недостаточно памяти для спеки (клиентов: %zu)", s->client_n + 1);
+        return fail(x, key, "spec.no_memory", "недостаточно памяти для спеки (клиентов: %zu)", s->client_n + 1);
     struct spec_client *c = &s->client[s->client_n];
     struct v2_client *f = &x->cl[s->client_n];
     memset(c, 0, sizeof(*c));
     memset(f, 0, sizeof(*f));
     if (name_of(x, key, "clients", c->name)) return -1;
     if (!strcmp(c->name, "lan"))
-        return fail(x, key, "clients: имя lan занято — так называются клиенты по умолчанию (раздел lan)");
+        return fail(x, key, "spec.client_lan_reserved", "clients: имя lan занято — так называются клиенты по умолчанию (раздел lan)");
     for (size_t i = 0; i < s->client_n; i++)
         if (!strcmp(s->client[i].name, c->name))
-            return fail(x, key, "clients: клиент %s описан дважды", c->name);
+            return fail(x, key, "spec.client_twice", "clients: клиент %s описан дважды", c->name);
     char where[64];
     snprintf(where, sizeof(where), "clients.%s", c->name);
     if (want_map(x, val, where) || keys_known(x, val, where, V2S_CLIENT)) return -1;
@@ -435,7 +469,7 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
         for (size_t i = 0; i < n_items(mc); i++) {
             const struct ynode *it = item(mc, i);
             if (!mac_ok(it->str))
-                return fail(x, it, "%s: «%s» — не MAC-адрес (шесть пар шестнадцатеричных цифр через "
+                return fail(x, it, "spec.bad_mac", "%s: «%s» — не MAC-адрес (шесть пар шестнадцатеричных цифр через "
                             "двоеточие)", w, it->str);
             if (from_push(x, it, w, c, it->str)) return -1;
             f->mac = 1;
@@ -446,7 +480,7 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
     if (ud) {
         snprintf(w, sizeof(w), "%s.uid", where);
         if (!plat()->local_channels)
-            return fail(x, ud, "%s: приложения (uid) — только на телефоне", w);
+            return fail(x, ud, "spec.phone_only_uid", "%s: приложения (uid) — только на телефоне", w);
         if (items_ok(x, ud, w)) return -1;
         for (size_t i = 0; i < n_items(ud); i++) {
             const struct ynode *it = item(ud, i);
@@ -454,9 +488,9 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
             unsigned lo, hi;
             snprintf(one, sizeof(one), "uid:%.50s", it->str);
             if (from_uid_range(one, &lo, &hi) != 0)
-                return fail(x, it, "%s: «%s» — не UID приложения (нужно N или N-M)", w, it->str);
+                return fail(x, it, "spec.bad_uid", "%s: «%s» — не UID приложения (нужно N или N-M)", w, it->str);
             if (lo == 0)
-                return fail(x, it, "%s: uid 0 — это root, то есть само ядро steer и системные демоны; их "
+                return fail(x, it, "spec.uid_root", "%s: uid 0 — это root, то есть само ядро steer и системные демоны; их "
                             "трафик правилом не маршрутизируется", w);
             if (lo != hi) f->hosts = 0;
             if (from_push(x, it, w, c, one)) return -1;
@@ -469,7 +503,7 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
         if (bool_of(x, sf, w, &on)) return -1;
         if (on) {
             if (!plat()->local_channels)
-                return fail(x, sf, "%s: трафик самого устройства — только на телефоне", w);
+                return fail(x, sf, "spec.phone_only_self", "%s: трафик самого устройства — только на телефоне", w);
             if (from_push(x, sf, w, c, "self")) return -1;
             f->local = f->self = 1;
         }
@@ -477,22 +511,22 @@ static int p_client(struct v2 *x, const struct ynode *key, const struct ynode *v
     if (ap) {
         snprintf(w, sizeof(w), "%s.app", where);
         if (!plat()->local_channels)
-            return fail(x, ap, "%s: приложения — только на телефоне", w);
+            return fail(x, ap, "spec.phone_only_apps", "%s: приложения — только на телефоне", w);
         if (items_ok(x, ap, w)) return -1;
-        unsup(x, ap, "%s — имена пакетов приложений; пока пишите uid", w);
+        unsup(x, ap, "spec.unsup_app_names", "%s — имена пакетов приложений; пока пишите uid", w);
     }
     if (!c->from_n && !ap)
-        return fail(x, val, "%s: пустой клиент — нужен addr, mac, uid или self", where);
+        return fail(x, val, "spec.client_empty", "%s: пустой клиент — нужен addr, mac, uid или self", where);
     /* nft не умеет «или» внутри правила: смешанный клиент пришлось бы разбить на два правила
      * (порядок и приоритет разошлись бы с написанным) или взять половину молча. */
     if (f->addr && f->mac)
-        return fail(x, val, "%s: и addr, и mac в одном клиенте — nft не умеет «или» внутри правила; "
+        return fail(x, val, "spec.client_addr_and_mac", "%s: и addr, и mac в одном клиенте — nft не умеет «или» внутри правила; "
                     "заведите два клиента", where);
     if (f->local && (f->addr || f->mac))
-        return fail(x, val, "%s: сам телефон (uid, self) и клиенты раздачи (addr, mac) — разные пути "
+        return fail(x, val, "spec.client_phone_and_lan", "%s: сам телефон (uid, self) и клиенты раздачи (addr, mac) — разные пути "
                     "пакета; заведите два клиента", where);
     if (f->self && c->from_n > 1)
-        return fail(x, sf, "%s: self уже включает все приложения — уберите uid", where);
+        return fail(x, sf, "spec.self_and_uid", "%s: self уже включает все приложения — уберите uid", where);
     s->client_n++;
     return 0;
 }
@@ -507,13 +541,13 @@ static int files_of(struct v2 *x, const struct ynode *n, const char *where, cons
     /* Массив путей и сами пути — в арене спеки: число файлов в списке не ограничено, и всё это
      * отдаётся вместе со спекой. */
     const char **a = (const char **)spec_alloc(x->s, k * sizeof(*a));
-    if (!a) return fail(x, n, "%s: недостаточно памяти для спеки (%zu путей)", where, k);
+    if (!a) return fail(x, n, "spec.no_memory", "%s: недостаточно памяти для спеки (%zu путей)", where, k);
     for (size_t i = 0; i < k; i++) {
         const struct ynode *it = item(n, i);
         char p[256];
         if (path_of(x, it, where, it->str, p, sizeof(p))) return -1;
         const char *kept = spec_strdup(x->s, p);
-        if (!kept) return fail(x, it, "%s: недостаточно памяти для спеки", where);
+        if (!kept) return fail(x, it, "spec.no_memory", "%s: недостаточно памяти для спеки", where);
         a[i] = kept;
     }
     *dst = a;
@@ -524,15 +558,15 @@ static int files_of(struct v2 *x, const struct ynode *n, const char *where, cons
 static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
     if (spec_reserve_list(s, s->list_n + 1) != 0)
-        return fail(x, key, "недостаточно памяти для спеки (списков: %zu)", s->list_n + 1);
+        return fail(x, key, "spec.no_memory", "недостаточно памяти для спеки (списков: %zu)", s->list_n + 1);
     struct spec_list *l = &s->list[s->list_n];
     memset(l, 0, sizeof(*l));
     if (name_of(x, key, "lists", l->name)) return -1;
     if (!strcmp(l->name, "all"))
-        return fail(x, key, "lists: имя all занято — to: all значит весь трафик");
+        return fail(x, key, "spec.list_all_reserved", "lists: имя all занято — to: all значит весь трафик");
     for (size_t i = 0; i < s->list_n; i++)
         if (!strcmp(s->list[i].name, l->name))
-            return fail(x, key, "lists: список %s описан дважды", l->name);
+            return fail(x, key, "spec.list_twice", "lists: список %s описан дважды", l->name);
     char where[64], w[96];
     snprintf(where, sizeof(where), "lists.%s", l->name);
     if (want_map(x, val, where) || keys_known(x, val, where, V2S_LIST)) return -1;
@@ -563,12 +597,12 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
         for (size_t i = 0; i < n_items(n); i++) {
             const struct ynode *it = item(n, i);
             if (a == 1 && !spec_line_is_addr(it->str))
-                return fail(x, it, "%s: «%s» — не адрес, не подсеть и не диапазон", w, it->str);
+                return fail(x, it, "spec.list_bad_prefix", "%s: «%s» — не адрес, не подсеть и не диапазон", w, it->str);
             if (a == 0 && spec_line_is_addr(it->str))
-                return fail(x, it, "%s: «%s» — адрес, а не домен; ему место в prefixes", w, it->str);
+                return fail(x, it, "spec.list_address_in_domains", "%s: «%s» — адрес, а не домен; ему место в prefixes", w, it->str);
         }
         inl += n_items(n);
-        unsup(x, n, "встроенные %s у списка — пока только файлами: prefixes_file, domains_file, srs",
+        unsup(x, n, "spec.unsup_inline_list", "встроенные %s у списка — пока только файлами: prefixes_file, domains_file, srs",
               INL[a]);
     }
     if ((n = ynode_get(val, "all"))) {
@@ -583,7 +617,7 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
         if (!strcmp(v, "tcp")) l->l4.proto = CH_PROTO_TCP;
         else if (!strcmp(v, "udp")) l->l4.proto = CH_PROTO_UDP;
         else if (!strcmp(v, "both")) l->l4.proto = CH_PROTO_ANY;
-        else return fail(x, n, "%s: «%s» — нужен tcp, udp или both", w, v);
+        else return fail(x, n, "spec.list_bad_proto", "%s: «%s» — нужен tcp, udp или both", w, v);
     }
     if ((n = ynode_get(val, "ports"))) {
         snprintf(w, sizeof(w), "%s.ports", where);
@@ -591,19 +625,19 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
         /* Один из оставленных пределов (L4_PORTS_MAX, spec.h): порты размножают адреса списка в
          * составном наборе ядра, поэтому число диапазонов ограничено, и отказ называет причину. */
         if (n_items(n) > L4_PORTS_MAX)
-            return fail(x, n, "%s: диапазонов портов %zu, а не больше %d — каждый диапазон размножает "
+            return fail(x, n, "spec.list_ports_many", "%s: диапазонов портов %zu, а не больше %d — каждый диапазон размножает "
                         "все адреса списка в составном наборе nftables (адрес . протокол . порт), и "
                         "память роутера кончилась бы раньше", w, n_items(n), L4_PORTS_MAX);
         for (size_t i = 0; i < n_items(n); i++) {
             const struct ynode *it = item(n, i);
             struct port_range *r = &l->l4.ports[l->l4.ports_n];
             if (port_range_parse(it->str, r) != 0)
-                return fail(x, it, "%s: «%s» — нужно 443 или 50000-65535, числа от 1 до 65535, начало "
+                return fail(x, it, "spec.list_bad_ports", "%s: «%s» — нужно 443 или 50000-65535, числа от 1 до 65535, начало "
                             "не больше конца", w, it->str);
             /* Пересечения ядро в множестве интервалов не примет, и отвергнет весь набор правил. */
             for (size_t k = 0; k < l->l4.ports_n; k++)
                 if (l->l4.ports[k].lo <= r->hi && r->lo <= l->l4.ports[k].hi)
-                    return fail(x, it, "%s: диапазоны %u-%u и %u-%u пересекаются — сложите их в один",
+                    return fail(x, it, "spec.list_ports_overlap", "%s: диапазоны %u-%u и %u-%u пересекаются — сложите их в один",
                                 w, l->l4.ports[k].lo, l->l4.ports[k].hi, r->lo, r->hi);
             l->l4.ports_n++;
         }
@@ -616,17 +650,17 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
          * только для имён. Список с подсетями или наборами .srs (у них свои адреса и свои
          * сужения в составном наборе) подменой не владеет. */
         if (!l->domains_n || l->prefixes_n || l->srs_n || l->all)
-            return fail(x, n, "%s: подмена порта — только у списка имён (domains_file) без "
+            return fail(x, n, "spec.list_override_port", "%s: подмена порта — только у списка имён (domains_file) без "
                         "prefixes_file, srs и all", w);
         l->l4.override_port = (uint16_t)v;
     }
     int files = l->srs_n || l->prefixes_n || l->domains_n;
     if (l->all && (files || inl))
-        return fail(x, val, "%s: all — весь трафик; источники рядом с ним ничего не значат", where);
+        return fail(x, val, "spec.list_all_alone", "%s: all — весь трафик; источники рядом с ним ничего не значат", where);
     /* Порты источником совпадения не являются (довод — у той же проверки в v1.c): правило без
      * набора адресов безусловно, и «udp 50000-65535» ко всему интернету уехало бы в выход. */
     if (!l->all && !files && !inl)
-        return fail(x, val, "%s: у списка нет источника — нужен srs, prefixes_file, domains_file или "
+        return fail(x, val, "spec.list_no_source", "%s: у списка нет источника — нужен srs, prefixes_file, domains_file или "
                     "all: true", where);
     s->list_n++;
     return 0;
@@ -640,16 +674,16 @@ static int cc_list(struct v2 *x, struct spec *s, const struct ynode *v, const ch
     if (items_ok(x, v, w)) return -1;
     if (n_items(v)) {
         *cc = (char (*)[3])spec_alloc(s, n_items(v) * 3);
-        if (!*cc) return fail(x, v, "%s: недостаточно памяти для спеки", w);
+        if (!*cc) return fail(x, v, "spec.no_memory", "%s: недостаточно памяти для спеки", w);
     }
     for (size_t i2 = 0; i2 < n_items(v); i2++) {
         const struct ynode *it = item(v, i2);
         const char *c = it->str;
         if (strlen(c) != 2 || c[0] < 'A' || c[0] > 'Z' || c[1] < 'A' || c[1] > 'Z')
-            return fail(x, it, "%s: «%s» — код страны: две заглавные латинские буквы "
+            return fail(x, it, "spec.bad_country", "%s: «%s» — код страны: две заглавные латинские буквы "
                         "(ISO 3166-1), например RU", w, c);
         for (size_t b = 0; b < *ccn; b++)
-            if (!strcmp((*cc)[b], c)) return fail(x, it, "%s: %s указан дважды", w, c);
+            if (!strcmp((*cc)[b], c)) return fail(x, it, "spec.country_twice", "%s: %s указан дважды", w, c);
         memcpy((*cc)[(*ccn)++], c, 3);
     }
     return 0;
@@ -669,7 +703,7 @@ static int p_obfs(struct v2 *x, const struct ynode *n, const char *name, struct 
         char w[96];
         snprintf(w, sizeof(w), "%s.%s", where, kn);
         if (it && str_of(x, it, w, &v[i])) return -1;
-        if (strlen(v[i]) > 79) return fail(x, it, "%s: длиннее 79 байт", w);
+        if (strlen(v[i]) > 79) return fail(x, it, "spec.too_long_79", "%s: длиннее 79 байт", w);
     }
     if (obfs_set(name, v[0], v[1], v[2], ob, x->e) != 0) return wrap(x, n);
     return 0;
@@ -719,7 +753,7 @@ static int kind_unavailable(struct v2 *x, const struct ynode *at, const char *wh
     *id = NULL;
     if (!plugin_kind_why(vname, why, wn, id)) return 0;
     if (x->s->load_flags & LOAD_STRICT) {
-        fail(x, at, "%s: %s", where, why);
+        fail(x, at, "spec.key_rejected", "%s: %s", where, why);
         return -1;
     }
     return 1;
@@ -730,14 +764,14 @@ static int kind_unavailable(struct v2 *x, const struct ynode *at, const char *wh
 static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *val) {
     struct spec *s = x->s;
     if (v2_room(x, s->out_n + 1) != 0 || spec_reserve_out(s, s->out_n + 1) != 0)
-        return fail(x, key, "недостаточно памяти для спеки (выходов: %zu)", s->out_n + 1);
+        return fail(x, key, "spec.no_memory", "недостаточно памяти для спеки (выходов: %zu)", s->out_n + 1);
     size_t idx = s->out_n;
     struct output o;
     memset(&o, 0, sizeof(o));
     if (name_of(x, key, "outputs", o.name)) return -1;
     for (size_t i = 0; i < s->out_n; i++)
         if (!strcmp(s->out[i].name, o.name))
-            return fail(x, key, "outputs: выход %s описан дважды", o.name);
+            return fail(x, key, "spec.output_twice", "outputs: выход %s описан дважды", o.name);
     char where[64], w[128];
     snprintf(where, sizeof(where), "outputs.%s", o.name);
     if (want_map(x, val, where)) return -1;
@@ -745,7 +779,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
     const struct ynode *kn = ynode_get(val, "kind"), *pn = ynode_get(val, "protocol");
     const char *kname, *proto = NULL;
     snprintf(w, sizeof(w), "%s.kind", where);
-    if (!kn) return fail(x, val, "%s: нет kind", where);
+    if (!kn) return fail(x, val, "spec.no_kind", "%s: нет kind", where);
     if (str_of(x, kn, w, &kname)) return -1;
     const struct kind_ops *kd = NULL;
     const struct plugin_kind *pk = NULL;
@@ -757,7 +791,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         snprintf(w, sizeof(w), "%s.protocol", where);
         char pl[300];
         tunnel_protos(pl, sizeof pl);
-        if (!pn) return fail(x, val, "%s: kind: tunnel нужен protocol (протоколы: %s)", where, pl);
+        if (!pn) return fail(x, val, "spec.tunnel_needs_protocol", "%s: kind: tunnel нужен protocol (протоколы: %s)", where, pl);
         if (str_of(x, pn, w, &proto)) return -1;
         snprintf(full, sizeof(full), "tunnel:%s", proto);
         /* Протокол — только из манифеста плагина. */
@@ -766,23 +800,23 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         else {
             int u = kind_unavailable(x, pn, where, full, uwhy, sizeof(uwhy), &uid);
             if (u < 0) return -1;
-            if (!u) return fail(x, pn, "%s: протокол «%s» не знаю (протоколы: %s)", w, proto, pl);
+            if (!u) return fail(x, pn, "spec.unknown_protocol", "%s: протокол «%s» не знаю (протоколы: %s)", w, proto, pl);
             unav = 1;
             uname = full;
         }
     } else if (!plugin_kind_find(kname) && strcmp(kname, "tunnel") != 0 &&
                (snprintf(full, sizeof(full), "tunnel:%s", kname), plugin_kind_find(full) || plugin_kind_why(full, uwhy, sizeof uwhy, &uid))) {
-        return fail(x, kn, "%s: в спеке v2 туннель пишется kind: tunnel, protocol: %s", where, kname);
+        return fail(x, kn, "spec.tunnel_kind_v2", "%s: в спеке v2 туннель пишется kind: tunnel, protocol: %s", where, kname);
     } else if (!strcmp(kname, kind_plugin_device.name)) {
         /* Устройство держит процесс плагина-владельца: вид заводит разворот (хук expand плагина — в
          * подготовленной спеке, с owner). Человек его не пишет. */
         if (!(s->prepared && ynode_get(val, "owner")))
-            return fail(x, kn, "%s: kind %s заводит только плагин — в подготовленной спеке и с owner", where,
+            return fail(x, kn, "spec.kind_plugin_only", "%s: kind %s заводит только плагин — в подготовленной спеке и с owner", where,
                         kname);
         kd = &kind_plugin_device;
     } else {
         if (!strcmp(kname, "zapret"))
-            return fail(x, kn, "%s: kind zapret убран из ядра steer: обход DPI — отдельный модуль recheck, без обхода выход заменяет kind: direct", where);
+            return fail(x, kn, "spec.kind_zapret_removed", "%s: kind zapret убран из ядра steer: обход DPI — отдельный модуль recheck, без обхода выход заменяет kind: direct", where);
         pk = plugin_kind_find(kname);
         kd = pk ? &pk->ops : kind_by_name_v2(kname);
         if (!kd) {
@@ -793,7 +827,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 size_t l = 0;
                 for (size_t pi = 0; pi < plugin_kinds_n() && l + 40 < sizeof(names); pi++)
                     l += (size_t)snprintf(names + l, sizeof(names) - l, ", %s", plugin_kind_ops_at(pi)->plugin->name);
-                return fail(x, kn, "%s: неизвестный kind «%s» (есть direct, block, interface, tunnel, "
+                return fail(x, kn, "spec.unknown_kind", "%s: неизвестный kind «%s» (есть direct, block, interface, tunnel, "
                             "awg, group%s)", where, kname, names);
             }
             unav = 1;
@@ -803,13 +837,13 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
     if (kd && kd->absent && !pk) {
         int u = kind_unavailable(x, tunnel ? pn : kn, where, tunnel ? full : kname, uwhy, sizeof(uwhy), &uid);
         if (u < 0) return -1;
-        if (!u) return fail(x, tunnel ? pn : kn, "%s: %s", where, kd->absent);
+        if (!u) return fail(x, tunnel ? pn : kn, "spec.kind_absent", "%s: %s", where, kd->absent);
         unav = 1;
         uname = tunnel ? full : kname;
     }
     if (unav) {
         if (out_make_unavail(s, &o, uwhy, uid, uname) != 0)
-            return fail(x, kn, "%s: недостаточно памяти для спеки", where);
+            return fail(x, kn, "spec.no_memory", "%s: недостаточно памяти для спеки", where);
         kd = &kind_unavail;
     }
     o.kind = kd;
@@ -830,19 +864,19 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         snprintf(w, sizeof(w), "%s.%s", where, ks);
         if (!strcmp(ks, "kind")) continue;
         if (!strcmp(ks, "protocol")) {
-            if (!tunnel) return fail(x, kk, "%s: protocol есть только у kind: tunnel", where);
+            if (!tunnel) return fail(x, kk, "spec.protocol_tunnel_only", "%s: protocol есть только у kind: tunnel", where);
             continue;
         }
         if (!strcmp(ks, "owner")) {
             /* Кто завёл выход: пишет только подготовленная спека (spec_prepare), человек — нет. */
-            if (!s->prepared) return fail(x, kk, "%s: owner пишет только плагин — в спеке человека его нет", where);
+            if (!s->prepared) return fail(x, kk, "spec.owner_plugin_only", "%s: owner пишет только плагин — в спеке человека его нет", where);
             if (want_map(x, v, w)) return -1;
             static const char *const OK[] = { "plugin", "out", "kind", "keys", NULL };
             if (keys_in(x, v, w, OK)) return -1;
             const char *op, *oo = NULL;
             char w2[160];
             snprintf(w2, sizeof(w2), "%s.plugin", w);
-            if (!ynode_get(v, "plugin")) return fail(x, v, "%s: нет plugin", w);
+            if (!ynode_get(v, "plugin")) return fail(x, v, "spec.no_plugin", "%s: нет plugin", w);
             if (str_of(x, ynode_get(v, "plugin"), w2, &op)) return -1;
             if (ynode_get(v, "out")) {
                 snprintf(w2, sizeof(w2), "%s.out", w);
@@ -851,13 +885,13 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             o.owner_plugin = spec_strdup(s, op);
             o.owner_out = oo ? spec_strdup(s, oo) : NULL;
             if (!o.owner_plugin || (oo && !o.owner_out))
-                return fail(x, v, "%s: недостаточно памяти для спеки", w);
+                return fail(x, v, "spec.no_memory", "%s: недостаточно памяти для спеки", w);
             /* Вид и ключи, с которыми выход развернул плагин (plugprep.c, owner_self_json). */
             const struct ynode *okn = ynode_get(v, "kind"), *okk = ynode_get(v, "keys");
             if (okn && okn->kind == YN_SCALAR) o.owner_kind = spec_strdup(s, okn->str);
             if (okk) {
                 char *kj;
-                if (plugin_keys_raw(okk, &kj) != 0) return fail(x, v, "%s: недостаточно памяти для спеки", w);
+                if (plugin_keys_raw(okk, &kj) != 0) return fail(x, v, "spec.no_memory", "%s: недостаточно памяти для спеки", w);
                 o.owner_keys = spec_strdup(s, kj);
                 free(kj);
             }
@@ -868,7 +902,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         if (unav && strcmp(ks, "on_fail") && strcmp(ks, "device")) {
             if (!pm) {
                 pm = yn_new(x, val, YN_MAP, ynode_len(val));
-                if (!pm) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+                if (!pm) return fail(x, val, "spec.no_memory", "%s: недостаточно памяти для спеки", where);
                 pm->len = 0;
             }
             pm->items[2 * pm->len] = (struct ynode *)kk;
@@ -880,15 +914,15 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             /* Что делать, когда выход не работает, — у выхода с устройством, у группы и у видов
              * с меткой (tgws, модуль DPI). У direct отказывать нечему. */
             if (!v2key_applies(v2key_out_find("on_fail", W_FAIL), kd, group))
-                return fail(x, kk, "%s: у kind: %s нет on_fail — он не может отказать", where, kd->name);
+                return fail(x, kk, "spec.no_on_fail", "%s: у kind: %s нет on_fail — он не может отказать", where, kd->name);
             if (str_of(x, v, w, &sv)) return -1;
             if (!strcmp(sv, "drop")) o.on_fail = FAIL_DROP;
             else if (!strcmp(sv, "direct")) o.on_fail = FAIL_DIRECT;
             else if (!strcmp(sv, "zapret") && plat()->zapret) o.on_fail = FAIL_ZAPRET;
             else if (!strcmp(sv, "zapret"))
-                return fail(x, v, "%s: zapret на телефоне нет — нужен drop или direct", w);
-            else if (!plat()->zapret) return fail(x, v, "%s: «%s» — нужен drop или direct", w, sv);
-            else return fail(x, v, "%s: «%s» — нужен drop, direct или zapret", w, sv);
+                return fail(x, v, "spec.on_fail_phone", "%s: zapret на телефоне нет — нужен drop или direct", w);
+            else if (!plat()->zapret) return fail(x, v, "spec.on_fail_bad", "%s: «%s» — нужен drop или direct", w, sv);
+            else return fail(x, v, "spec.on_fail_bad_zapret", "%s: «%s» — нужен drop, direct или zapret", w, sv);
             continue;
         }
         if (!strcmp(ks, "ipv6")) {
@@ -901,17 +935,17 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             if (!strcmp(sv, "routed")) m = OUT_V6_ROUTED;
             else if (!strcmp(sv, "nat")) m = OUT_V6_NAT;
             else if (!strcmp(sv, "off")) m = OUT_V6_OFF;
-            else return fail(x, v, "%s: «%s» — нужен routed, nat или off", w, sv);
+            else return fail(x, v, "spec.ipv6_bad", "%s: «%s» — нужен routed, nat или off", w, sv);
             if (!v2key_applies(v2key_out_find("ipv6", W_IPV6), kd, group))
-                return fail(x, kk, "%s: kind: %s IPv6 не несёт — его правила IPv6 и так отвергаются, "
+                return fail(x, kk, "spec.ipv6_not_carried", "%s: kind: %s IPv6 не несёт — его правила IPv6 и так отвергаются, "
                             "ключ ipv6 ему не нужен", where, kd->name);
             if (m != OUT_V6_OFF && group)
-                return fail(x, v, "%s: %s — свойство туннеля на том конце, у группы его нет: "
+                return fail(x, v, "spec.ipv6_group", "%s: %s — свойство туннеля на том конце, у группы его нет: "
                             "задайте его у члена", w, sv);
             /* Туннель, завершающий соединения у себя (vless, hysteria2, прокси: KC_TCP_REDIR), IPv6 несёт, но
              * хоста с префиксом на том конце у него нет, и подмены он не просит: ему доступен только off. */
             if (m != OUT_V6_OFF && (!(caps & KC_DEVICE) || (caps & KC_TCP_REDIR)))
-                return fail(x, v, "%s: %s — только у выхода с туннелем (kind: interface, awg); "
+                return fail(x, v, "spec.ipv6_tunnel_only", "%s: %s — только у выхода с туннелем (kind: interface, awg); "
                             "у kind: %s есть только off", w, sv, kd->name);
             o.ipv6 = m;
             x->out_ipv6[idx] = v;
@@ -922,26 +956,26 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
              * стоит без routed — проверка после всех ключей (ipv6 может стоять и после). */
             if (str_of(x, v, w, &sv)) return -1;
             char why[200];
-            if (v6pfx_parse(sv, &o.v6pfx, why, sizeof(why)) != 0) return fail(x, v, "%s: %s", w, why);
+            if (v6pfx_parse(sv, &o.v6pfx, why, sizeof(why)) != 0) return fail(x, v, "spec.ipv6_rejected", "%s: %s", w, why);
             o.v6pfx_given = 1;
             x->out_prefix[idx] = v;
             continue;
         }
         if (!strcmp(ks, "over")) {
             if (str_of(x, v, w, &sv)) return -1;
-            if (!name_ok(sv)) return fail(x, v, "%s: «%s» — имя другого выхода", w, sv);
+            if (!name_ok(sv)) return fail(x, v, "spec.over_name", "%s: «%s» — имя другого выхода", w, sv);
             if (copy_to(x, v, w, sv, o.over, sizeof(o.over))) return -1;
             x->out_over[idx] = v;
             continue;
         }
         if (!strcmp(ks, "device")) {
             if (group)
-                return fail(x, kk, "%s: у группы нет своего устройства — оно у членов (members)", where);
+                return fail(x, kk, "spec.group_no_device", "%s: у группы нет своего устройства — оно у членов (members)", where);
             if (!v2key_applies(v2key_out_find("device", W_DEVICE), kd, group))
-                return fail(x, kk, "%s: у kind: %s нет устройства — трафик никуда не уводится", where,
+                return fail(x, kk, "spec.kind_no_device", "%s: у kind: %s нет устройства — трафик никуда не уводится", where,
                             kd->name);
             if (str_of(x, v, w, &sv)) return -1;
-            if (!name_ok(sv)) return fail(x, v, "%s: «%s» — имя устройства негодного состава", w, sv);
+            if (!name_ok(sv)) return fail(x, v, "spec.device_bad_name", "%s: «%s» — имя устройства негодного состава", w, sv);
             if (copy_to(x, v, w, sv, o.device, sizeof(o.device))) return -1;
             continue;
         }
@@ -950,7 +984,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
         if (pk) {
             if (!pm) {
                 pm = yn_new(x, val, YN_MAP, ynode_len(val));
-                if (!pm) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+                if (!pm) return fail(x, val, "spec.no_memory", "%s: недостаточно памяти для спеки", where);
                 pm->len = 0;
             }
             pm->items[2 * pm->len] = (struct ynode *)kk;
@@ -970,7 +1004,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             continue;
         }
         if (gkey && !(gkey->flags & VF_NOMSG)) {
-            if (!group) return fail(x, kk, "%s: %s есть только у kind: group", where, ks);
+            if (!group) return fail(x, kk, "spec.group_only_key", "%s: %s есть только у kind: group", where, ks);
             long lv;
             if (!strcmp(ks, "pick")) {
                 if (str_of(x, v, w, &sv)) return -1;
@@ -978,10 +1012,10 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 else if (!strcmp(sv, "latency")) o.grp.pick = PICK_LATENCY;
                 else if (!strcmp(sv, "manual")) o.grp.pick = PICK_MANUAL;
                 else if (!strcmp(sv, "balance")) o.grp.pick = PICK_BALANCE;
-                else return fail(x, v, "%s: «%s» — нужен order, latency, manual или balance", w, sv);
+                else return fail(x, v, "spec.pick_bad", "%s: «%s» — нужен order, latency, manual или balance", w, sv);
             } else if (!strcmp(ks, "members")) {
                 if (items_ok(x, v, w)) return -1;
-                if (!n_items(v)) return fail(x, v, "%s: у группы нет членов", w);
+                if (!n_items(v)) return fail(x, v, "spec.group_no_members", "%s: у группы нет членов", w);
                 x->out_members[idx] = v;
             } else if (!strcmp(ks, "default")) {
                 if (str_of(x, v, w, &sv)) return -1;
@@ -1003,9 +1037,9 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 char why[160];
                 if (str_of(x, v, w, &sv)) return -1;
                 if (urltest_url_parse(sv, &u, why, sizeof(why)) != 0)
-                    return fail(x, v, "%s: %s", w, why);
+                    return fail(x, v, "spec.key_rejected", "%s: %s", w, why);
                 if (u.https && urltest_https_refused())
-                    return fail(x, v, "%s: https:// в этой сборке нет (сборка без TLS) — нужен пакет "
+                    return fail(x, v, "spec.no_tls_build", "%s: https:// в этой сборке нет (сборка без TLS) — нужен пакет "
                                 "steer-core или адрес http://", w);
                 if (copy_to(x, v, w, sv, o.grp.url, sizeof(o.grp.url))) return -1;
                 lat_key = kk;
@@ -1019,7 +1053,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 int b = BY_CONNECTION;
                 while (b <= BY_SITE_CLIENT && strcmp(group_by_name(b), sv)) b++;
                 if (b > BY_SITE_CLIENT)
-                    return fail(x, v, "%s: «%s» — нужен connection, site или site_client", w, sv);
+                    return fail(x, v, "spec.by_bad", "%s: «%s» — нужен connection, site или site_client", w, sv);
                 o.grp.by = b;
                 by_key = kk;
             } else {
@@ -1037,10 +1071,10 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             /* Подсказка — ключи, которые у этого вида есть (таблица ключей, v2keys.c). */
             char list[300];
             v2keys_out_list(kd, group, tunnel, proto, list, sizeof(list));
-            return fail(x, kk, "неизвестный ключ «%s» в %s (есть: %s)", ks, where, list);
+            return fail(x, kk, "spec.unknown_key", "неизвестный ключ «%s» в %s (есть: %s)", ks, where, list);
         }
         if (!v2key_applies(kkey, kd, group))
-            return fail(x, kk, "%s: ключ %s есть только у %s", where, ks, kkey->owner);
+            return fail(x, kk, "spec.key_owner_only", "%s: ключ %s есть только у %s", where, ks, kkey->owner);
         if (!strcmp(ks, "obfs")) {
             if (p_obfs(x, v, o.name, &k.obfs)) return -1;
         } else if (!strcmp(ks, "conf")) {
@@ -1053,31 +1087,31 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
     /* Недоступный вид: ключи записаны как есть — печать спеки (spec convert) их не теряет. */
     if (unav && pm) {
         char *raw;
-        if (plugin_keys_raw(pm, &raw) != 0) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+        if (plugin_keys_raw(pm, &raw) != 0) return fail(x, val, "spec.no_memory", "%s: недостаточно памяти для спеки", where);
         o.plg.keys_json = spec_strdup(s, raw);
         free(raw);
-        if (!o.plg.keys_json) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+        if (!o.plg.keys_json) return fail(x, val, "spec.no_memory", "%s: недостаточно памяти для спеки", where);
     }
     if (x->out_prefix[idx] && o.ipv6 != OUT_V6_ROUTED)
-        return fail(x, x->out_prefix[idx], "%s: prefix — префикс хоста, он есть только у ipv6: routed",
+        return fail(x, x->out_prefix[idx], "spec.prefix_routed_only", "%s: prefix — префикс хоста, он есть только у ipv6: routed",
                     where);
     if (group) {
-        if (!x->out_members[idx]) return fail(x, val, "%s: у группы нужен members", where);
+        if (!x->out_members[idx]) return fail(x, val, "spec.group_needs_members", "%s: у группы нужен members", where);
         if (lat_key && o.grp.pick != PICK_LATENCY)
-            return fail(x, lat_key, "%s: %s — замер задержки, он есть только у pick: latency", where,
+            return fail(x, lat_key, "spec.latency_only", "%s: %s — замер задержки, он есть только у pick: latency", where,
                         lat_key->str);
         if (cc_key && o.grp.pick != PICK_LATENCY && o.grp.pick != PICK_ORDER)
-            return fail(x, cc_key, "%s: %s — выбор члена по стране, он есть только у pick: latency "
+            return fail(x, cc_key, "spec.country_pick_only", "%s: %s — выбор члена по стране, он есть только у pick: latency "
                         "и order", where, cc_key->str);
         for (size_t i2 = 0; i2 < o.grp.ccsel.only_n; i2++)
             for (size_t b = 0; b < o.grp.ccsel.cc_n; b++)
                 if (!strcmp(o.grp.ccsel.only[i2], o.grp.ccsel.cc[b]))
-                    return fail(x, ynode_get(val, "only"), "%s: %s — и в only, и в exclude", where,
+                    return fail(x, ynode_get(val, "only"), "spec.country_both", "%s: %s — и в only, и в exclude", where,
                                 o.grp.ccsel.cc[b]);
         if (w_key && o.grp.pick != PICK_BALANCE)
-            return fail(x, w_key, "%s: weights — доли соединений, они есть только у pick: balance", where);
+            return fail(x, w_key, "spec.weights_balance_only", "%s: weights — доли соединений, они есть только у pick: balance", where);
         if (by_key && o.grp.pick != PICK_BALANCE)
-            return fail(x, by_key, "%s: by — как раздавать соединения, он есть только у pick: balance",
+            return fail(x, by_key, "spec.by_balance_only", "%s: by — как раздавать соединения, он есть только у pick: balance",
                         where);
     } else {
         if (pk) {
@@ -1086,28 +1120,25 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             plugin_etc(etc, sizeof(etc));
             snprintf(conf, sizeof(conf), "%s/conf/%s", etc, pk->owner->id);
             if (plugin_keys_check(pk, pm, x->base, conf, &json, &at, x->e) != 0) {
-                char m[sizeof(x->e->msg)];
-                snprintf(m, sizeof(m), "%s", x->e->msg);
-                x->e->msg[0] = '\0';
-                return fail(x, at ? at : val, "%s: %s", where, m);
+                return wrap_in(x, at ? at : val, where);
             }
             o.plg.pk = pk;
             o.plg.keys_json = spec_strdup(s, json);
             free(json);
-            if (!o.plg.keys_json) return fail(x, val, "%s: недостаточно памяти для спеки", where);
+            if (!o.plg.keys_json) return fail(x, val, "spec.no_memory", "%s: недостаточно памяти для спеки", where);
             /* Ресурсы выхода (порты, очереди) — выданные при подготовке, alloc.json. */
             if (s->prepared && (pk->res_ports || pk->res_queues) &&
                 plugin_alloc_lookup(s, pk, o.name, &o.plg.ports, &o.plg.ports_n, &o.plg.queues,
                                     &o.plg.queues_n) != 0)
-                return fail(x, val, "%s: ресурсы выхода не выданы (alloc.json) — нужен reload", where);
+                return fail(x, val, "spec.resources_not_allocated", "%s: ресурсы выхода не выданы (alloc.json) — нужен reload", where);
             /* Выход вида с разворотом или ресурсами в неподготовленной спеке не готов: хук ещё не
              * исполнен, номера не выданы. Спека человека (LOAD_HUMAN) читается как написана. */
             if ((pk->expand.prog || pk->res_ports || pk->res_queues) && !s->prepared &&
                 !(s->load_flags & LOAD_HUMAN)) {
                 if (s->load_flags & LOAD_STRICT)
-                    return fail(x, val, "%s: спека не подготовлена — нужен reload", where);
+                    return fail(x, val, "spec.not_prepared", "%s: спека не подготовлена — нужен reload", where);
                 if (out_make_unavail(s, &o, "спека не подготовлена — нужен reload", pk->owner->id, pk->name) != 0)
-                    return fail(x, val, "%s: недостаточно памяти для спеки", where);
+                    return fail(x, val, "spec.no_memory", "%s: недостаточно памяти для спеки", where);
                 kd = &kind_unavail;
             }
         }
@@ -1150,23 +1181,23 @@ static int p_outputs_links(struct v2 *x) {
     for (size_t i = 0; i < s->out_n; i++) {
         struct output *o = &s->out[i];
         if (x->out_over[i] && out_idx(s, o->over) < 0)
-            return fail(x, x->out_over[i], "outputs.%s.over: выхода «%s» нет в outputs", o->name,
+            return fail(x, x->out_over[i], "spec.over_missing", "outputs.%s.over: выхода «%s» нет в outputs", o->name,
                         o->over);
         if (!out_group(o)) continue;
         const struct ynode *mn = x->out_members[i];
         /* Массивы группы (члены, веса, «жив», замеры) — из арены ровно на число членов. */
         if (group_members_alloc(s, &o->grp, n_items(mn)) != 0)
-            return fail(x, mn, "outputs.%s.members: недостаточно памяти для спеки (%zu членов)",
+            return fail(x, mn, "spec.no_memory", "outputs.%s.members: недостаточно памяти для спеки (%zu членов)",
                         o->name, n_items(mn));
         for (size_t k = 0; k < n_items(mn); k++) {
             const struct ynode *it = item(mn, k);
             int m = out_idx(s, it->str);
-            if (m < 0) return fail(x, it, "outputs.%s.members: выхода «%s» нет в outputs", o->name, it->str);
+            if (m < 0) return fail(x, it, "spec.member_missing", "outputs.%s.members: выхода «%s» нет в outputs", o->name, it->str);
             if (m == (int)i)
-                return fail(x, it, "outputs.%s.members: группа не может быть членом самой себя", o->name);
+                return fail(x, it, "spec.member_self", "outputs.%s.members: группа не может быть членом самой себя", o->name);
             for (size_t b = 0; b < o->grp.members_n; b++)
                 if (o->grp.members[b] == (unsigned)m)
-                    return fail(x, it, "outputs.%s.members: %s указан дважды", o->name, it->str);
+                    return fail(x, it, "spec.member_twice", "outputs.%s.members: %s указан дважды", o->name, it->str);
             o->grp.members[o->grp.members_n++] = (unsigned)m;
         }
         const struct ynode *dn = x->out_default[i];
@@ -1174,13 +1205,13 @@ static int p_outputs_links(struct v2 *x) {
             for (size_t b = 0; b < o->grp.members_n; b++)
                 if (!strcmp(spec_out(s, o->grp.members[b])->name, dn->str)) o->grp.def = (int)b;
             if (o->grp.def < 0)
-                return fail(x, dn, "outputs.%s.default: «%s» — не член группы", o->name, dn->str);
+                return fail(x, dn, "spec.default_not_member", "outputs.%s.default: «%s» — не член группы", o->name, dn->str);
             if (o->grp.pick != PICK_MANUAL)
-                return fail(x, dn, "outputs.%s.default: default есть только у pick: manual", o->name);
+                return fail(x, dn, "spec.default_manual_only", "outputs.%s.default: default есть только у pick: manual", o->name);
         }
         const struct ynode *wn = x->out_weights[i];
         if (wn && n_items(wn) != o->grp.members_n)
-            return fail(x, wn, "outputs.%s.weights: весов %zu, а членов %zu — по весу на каждого члена, "
+            return fail(x, wn, "spec.weights_count", "outputs.%s.weights: весов %zu, а членов %zu — по весу на каждого члена, "
                         "по порядку members", o->name, n_items(wn), o->grp.members_n);
         for (size_t k = 0; wn && k < n_items(wn); k++) {
             long lv = 0;
@@ -1193,7 +1224,7 @@ static int p_outputs_links(struct v2 *x) {
     unsigned char *sealed = calloc(s->out_n ? s->out_n : 1, 1);
     if (!state || !path || !sealed) {
         free(state); free(path); free(sealed);
-        return fail(x, NULL, "недостаточно памяти для проверки спеки");
+        return fail(x, NULL, "spec.no_memory", "недостаточно памяти для проверки спеки");
     }
     int rc = p_outputs_links_tail(x, state, path, sealed);
     free(state); free(path); free(sealed);
@@ -1216,7 +1247,7 @@ static int p_outputs_links_tail(struct v2 *x, int *state, int *path, unsigned ch
             for (int k = start; k < len && pl < sizeof(p); k++)
                 pl += (size_t)snprintf(p + pl, sizeof(p) - pl, "%s%s", k > start ? " → " : "",
                                        s->out[path[k]].name);
-            return fail(x, x->out_members[path[start]], "группы замыкаются в круг (%s) — выбор члена "
+            return fail(x, x->out_members[path[start]], "spec.group_cycle", "группы замыкаются в круг (%s) — выбор члена "
                         "не кончился бы никогда", p);
         }
     }
@@ -1229,7 +1260,7 @@ static int p_outputs_links_tail(struct v2 *x, int *state, int *path, unsigned ch
         for (size_t k = 0; k < o->grp.members_n; k++) {
             const struct output *m = spec_out(s, o->grp.members[k]);
             if (!out_group(m) && !out_has_device(m))
-                return fail(x, item(mn, k), "outputs.%s.members: %s — kind: %s, у него нет устройства, "
+                return fail(x, item(mn, k), "spec.member_no_device", "outputs.%s.members: %s — kind: %s, у него нет устройства, "
                             "выбирать группе нечего", o->name, m->name, out_kind_name(m));
         }
     }
@@ -1241,7 +1272,7 @@ static int p_outputs_links_tail(struct v2 *x, int *state, int *path, unsigned ch
     for (size_t i = 0; i < s->out_n; i++) {
         if (s->out[i].ipv6 != OUT_V6_ROUTED) continue;
         if (donor >= 0)
-            return fail(x, x->out_ipv6[i], "outputs.%s.ipv6: routed уже у выхода %s — донор IPv6 в "
+            return fail(x, x->out_ipv6[i], "spec.ipv6_donor_twice", "outputs.%s.ipv6: routed уже у выхода %s — донор IPv6 в "
                         "спеке один: адрес из префикса одного хоста другой хост не пропустит",
                         s->out[i].name, s->out[donor].name);
         donor = (int)i;
@@ -1293,13 +1324,13 @@ static int ips_of(struct v2 *x, const struct ynode *n, const char *where,
     if (items_ok(x, n, where)) return -1;
     size_t k = n_items(n);
     char (*dst)[46] = k ? (char (*)[46])spec_alloc(x->s, k * sizeof(*dst)) : NULL;
-    if (k && !dst) return fail(x, n, "%s: недостаточно памяти для спеки", where);
+    if (k && !dst) return fail(x, n, "spec.no_memory", "%s: недостаточно памяти для спеки", where);
     for (size_t i = 0; i < k; i++) {
         const struct ynode *it = item(n, i);
         struct in6_addr a;
         if (inet_pton(AF_INET, it->str, &a) != 1 && inet_pton(AF_INET6, it->str, &a) != 1)
-            return fail(x, it, "%s: «%s» — нужен адрес IPv4 или IPv6", where, it->str);
-        if (strlen(it->str) >= 46) return fail(x, it, "%s: адрес слишком длинный", where);
+            return fail(x, it, "spec.need_ip", "%s: «%s» — нужен адрес IPv4 или IPv6", where, it->str);
+        if (strlen(it->str) >= 46) return fail(x, it, "spec.address_too_long", "%s: адрес слишком длинный", where);
         snprintf(dst[i], 46, "%s", it->str);
     }
     *dstp = dst;
@@ -1321,21 +1352,21 @@ static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, co
     if (want_map(x, val, where) || keys_known(x, val, where, V2S_DNS_UP)) return -1;
     const struct ynode *un = ynode_get(val, "url"), *on = ynode_get(val, "out");
     snprintf(w, sizeof(w), "%s.url", where);
-    if (!un) return fail(x, val, "%s: нет url", where);
+    if (!un) return fail(x, val, "spec.no_url", "%s: нет url", where);
     if (str_of(x, un, w, &sv) || copy_to(x, un, w, sv, u->url, sizeof(u->url))) return -1;
     char why[160];
-    if (dnsurl_parse(sv, u, why, sizeof(why)) != 0) return fail(x, un, "%s: «%s» — %s", w, sv, why);
+    if (dnsurl_parse(sv, u, why, sizeof(why)) != 0) return fail(x, un, "spec.url_rejected", "%s: «%s» — %s", w, sv, why);
     if (on) {
         snprintf(w, sizeof(w), "%s.out", where);
         if (str_of(x, on, w, &sv)) return -1;
         int oi = out_idx(s, sv);
         if (oi < 0 && strcmp(sv, "direct") != 0)
-            return fail(x, on, "%s: выхода «%s» нет в outputs (или слово direct — напрямую)", w, sv);
+            return fail(x, on, "spec.output_missing_direct", "%s: выхода «%s» нет в outputs (или слово direct — напрямую)", w, sv);
         if (oi >= 0 && !out_over_target_ok(&s->out[oi])) {
             /* Выход без устройства (kind=direct) — то же «напрямую»; прочие без устройства
              * (tgws, группа) метке некуда вести. */
             if (strcmp(out_kind_name(&s->out[oi]), "direct") != 0)
-                return fail(x, on, "%s: выход «%s» (kind=%s) без своего устройства — запрос "
+                return fail(x, on, "spec.dns_output_no_device", "%s: выход «%s» (kind=%s) без своего устройства — запрос "
                             "к DNS нельзя направить через него; нужен interface, awg, tunnel или "
                             "xsteer, либо direct", w, sv, out_kind_name(&s->out[oi]));
             oi = -1;
@@ -1353,7 +1384,7 @@ static int p_dns_up(struct v2 *x, const struct ynode *val, const char *where, co
         snprintf(w, sizeof(w), "%s.fragment", where);
         if (bool_of(x, fn, w, &fv)) return -1;
         if (fv && u->proto != DNSP_DOT && u->proto != DNSP_DOH)
-            return fail(x, fn, "%s: делить ClientHello можно только у DoT (tls://) и DoH (https://); "
+            return fail(x, fn, "spec.split_needs_tls", "%s: делить ClientHello можно только у DoT (tls://) и DoH (https://); "
                         "у этого сервера нет TLS поверх TCP", w);
         u->frag = fv ? 1 : 0;
     }
@@ -1385,7 +1416,7 @@ static int p_dns_grp(struct v2 *x, const struct ynode *val, const char *where, c
     name = nm;
     if (want_map(x, val, where)) return -1;
     if (ynode_get(val, "url"))
-        return fail(x, val, "%s: url и servers вместе — это либо сервер (url), либо группа серверов "
+        return fail(x, val, "spec.url_and_servers", "%s: url и servers вместе — это либо сервер (url), либо группа серверов "
                     "(servers)", where);
     if (keys_known(x, val, where, V2S_DNS_GRP)) return -1;
     const struct ynode *mn = ynode_get(val, "mode"), *sn = ynode_get(val, "servers");
@@ -1394,25 +1425,25 @@ static int p_dns_grp(struct v2 *x, const struct ynode *val, const char *where, c
         if (str_of(x, mn, w, &sv)) return -1;
         if (!strcmp(sv, "race")) u->grp = DNSG_RACE;
         else if (strcmp(sv, "failover") != 0)
-            return fail(x, mn, "%s: «%s» — нужен race (все сразу) или failover (по очереди)", w, sv);
+            return fail(x, mn, "spec.group_mode_bad", "%s: «%s» — нужен race (все сразу) или failover (по очереди)", w, sv);
     }
     snprintf(w, sizeof(w), "%s.servers", where);
     if (items_ok(x, sn, w)) return -1;
     size_t k = n_items(sn);
-    if (!k) return fail(x, sn ? sn : val, "%s: пустой список — нужен хотя бы один сервер", w);
+    if (!k) return fail(x, sn ? sn : val, "spec.servers_empty", "%s: пустой список — нужен хотя бы один сервер", w);
     u->mem = (unsigned *)spec_alloc(s, k * sizeof(*u->mem));
-    if (!u->mem) return fail(x, sn, "%s: недостаточно памяти для спеки", w);
+    if (!u->mem) return fail(x, sn, "spec.no_memory", "%s: недостаточно памяти для спеки", w);
     for (size_t i = 0; i < k; i++) {
         const struct ynode *it = item(sn, i);
         int m = up_named(s, it->str);
-        if (m < 0) return fail(x, it, "%s: сервера «%s» нет в dns.upstreams", w, it->str);
+        if (m < 0) return fail(x, it, "spec.upstream_missing", "%s: сервера «%s» нет в dns.upstreams", w, it->str);
         if (!strcmp(it->str, name) && !s->dns.up[m].inl && s->dns.up[m].grp)
-            return fail(x, it, "%s: группа не может входить сама в себя", w);
+            return fail(x, it, "spec.upstream_self", "%s: группа не может входить сама в себя", w);
         if (s->dns.up[m].grp)
-            return fail(x, it, "%s: «%s» — группа; группа в группе не поддерживается — перечислите "
+            return fail(x, it, "spec.upstream_group_nested", "%s: «%s» — группа; группа в группе не поддерживается — перечислите "
                         "её серверы", w, it->str);
         for (size_t j = 0; j < u->mem_n; j++)
-            if (u->mem[j] == (unsigned)m) return fail(x, it, "%s: сервер «%s» указан дважды", w, it->str);
+            if (u->mem[j] == (unsigned)m) return fail(x, it, "spec.upstream_twice", "%s: сервер «%s» указан дважды", w, it->str);
         u->mem[u->mem_n++] = (unsigned)m;
     }
     return 0;
@@ -1439,7 +1470,7 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
     if ((v = ynode_get(n, "mode"))) {
         if (str_of(x, v, "dns.mode", &sv)) return -1;
         if (!strcmp(sv, "realip")) x->realip_default = 1;
-        else if (strcmp(sv, "fakeip") != 0) return fail(x, v, "dns.mode: «%s» — нужен fakeip или realip", sv);
+        else if (strcmp(sv, "fakeip") != 0) return fail(x, v, "spec.dns_mode_bad", "dns.mode: «%s» — нужен fakeip или realip", sv);
     }
     if ((v = ynode_get(n, "mesh_clients")) && bool_of(x, v, "dns.mesh_clients", &s->dns.mesh_clients))
         return -1;
@@ -1454,7 +1485,7 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
         if ((t = ynode_get(v, "negative")) &&
             long_sk(x, t, "dns.cache_ttl.negative", V2S_CACHE_TTL, "negative", &s->dns.ttl_neg)) return -1;
         if (s->dns.ttl_min > s->dns.ttl_max)
-            return fail(x, v, "dns.cache_ttl: min (%ld) больше max (%ld)", s->dns.ttl_min, s->dns.ttl_max);
+            return fail(x, v, "spec.cache_ttl", "dns.cache_ttl: min (%ld) больше max (%ld)", s->dns.ttl_min, s->dns.ttl_max);
     }
     if ((v = ynode_get(n, "bootstrap")) && ips_of(x, v, "dns.bootstrap", &s->dns.boot, &s->dns.boot_n))
         return -1;
@@ -1463,13 +1494,13 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
         for (size_t i = 0; i < ynode_len(v); i++) {
             const struct ynode *key = ynode_key_at(v, i), *val = ynode_val_at(v, i);
             if (spec_reserve_up(s, s->dns.up_n + 1))
-                return fail(x, key, "dns.upstreams: недостаточно памяти для спеки (%zu апстримов)",
+                return fail(x, key, "spec.no_memory", "dns.upstreams: недостаточно памяти для спеки (%zu апстримов)",
                             s->dns.up_n + 1);
             char nm[32], where[64];
             if (name_of(x, key, "dns.upstreams", nm)) return -1;
             for (size_t k = 0; k < s->dns.up_n; k++)
                 if (!strcmp(s->dns.up[k].name, nm))
-                    return fail(x, key, "dns.upstreams: имя «%s» повторяется", nm);
+                    return fail(x, key, "spec.upstream_name_twice", "dns.upstreams: имя «%s» повторяется", nm);
             snprintf(where, sizeof(where), "dns.upstreams.%s", nm);
             struct spec_dns_up *u = &s->dns.up[s->dns.up_n];
             if (val && val->kind == YN_MAP && ynode_get(val, "servers")) {
@@ -1483,7 +1514,7 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
             }
             if (p_dns_up(x, val, where, nm, u)) return -1;
             if (!up_has_way(s, u))
-                return fail(x, val, "%s: имя «%s» нечем разрешить — задайте ips (адреса сервера) или "
+                return fail(x, val, "spec.dns_host_unresolvable", "%s: имя «%s» нечем разрешить — задайте ips (адреса сервера) или "
                             "bootstrap", where, u->host);
             s->dns.up_n++;
         }
@@ -1507,7 +1538,7 @@ static int p_dns(struct v2 *x, const struct ynode *n) {
         if (!(v = ynode_get(n, R[r].key))) continue;
         if (str_of(x, v, w, &sv)) return -1;
         int u = up_named(s, sv);
-        if (u < 0) return fail(x, v, "%s: апстрима «%s» нет в dns.upstreams", w, sv);
+        if (u < 0) return fail(x, v, "spec.upstream_missing", "%s: апстрима «%s» нет в dns.upstreams", w, sv);
         *(unsigned *)((char *)&s->dns + R[r].off) = (unsigned)(u + 1);
     }
     return 0;
@@ -1538,12 +1569,12 @@ static int merge_lists(struct v2 *x, struct spec_rule *r, const struct ynode *tn
         if (b->all || !l4match_same(&a->l4, &b->l4)) same = 0;
     }
     if (!same) {
-        unsup(x, tn, "правило %s: списки с разными proto/ports или с all в одном to — разнесите их по "
+        unsup(x, tn, "spec.unsup_mixed_lists", "правило %s: списки с разными proto/ports или с all в одном to — разнесите их по "
               "правилам", rn);
         return 0;
     }
     if (spec_reserve_list(s, s->list_n + 1) != 0)
-        return fail(x, tn, "правило %s: недостаточно памяти для спеки (списков: %zu)", rn, s->list_n + 1);
+        return fail(x, tn, "spec.no_memory", "правило %s: недостаточно памяти для спеки (списков: %zu)", rn, s->list_n + 1);
     a = &s->list[r->lists[0]];      /* массив мог переехать при росте */
     struct spec_list *m = &s->list[s->list_n];
     memset(m, 0, sizeof(*m));
@@ -1560,7 +1591,7 @@ static int merge_lists(struct v2 *x, struct spec_rule *r, const struct ynode *tn
     m->prefixes_files = np ? (const char **)spec_alloc(s, np * sizeof(*m->prefixes_files)) : NULL;
     m->domains_files = nd ? (const char **)spec_alloc(s, nd * sizeof(*m->domains_files)) : NULL;
     if ((ns && !m->srs_files) || (np && !m->prefixes_files) || (nd && !m->domains_files))
-        return fail(x, tn, "правило %s: недостаточно памяти для спеки", rn);
+        return fail(x, tn, "spec.no_memory", "правило %s: недостаточно памяти для спеки", rn);
     for (size_t i = 0; i < r->lists_n; i++) {
         const struct spec_list *b = &s->list[r->lists[i]];
         if (b->srs_n) memcpy(m->srs_files + m->srs_n, b->srs_files, b->srs_n * sizeof(b->srs_files[0]));
@@ -1590,13 +1621,13 @@ static int merge_clients(struct v2 *x, struct spec_rule *r, const struct ynode *
         if (b->addr != a->addr || b->mac != a->mac || b->local != a->local || b->self) same = 0;
     }
     if (!same) {
-        unsup(x, fn, "правило %s: клиенты разных видов (адреса, MAC, телефон) в одном for — разнесите "
+        unsup(x, fn, "spec.unsup_mixed_clients", "правило %s: клиенты разных видов (адреса, MAC, телефон) в одном for — разнесите "
               "их по правилам", rn);
         return 0;
     }
     if (spec_reserve_client(s, s->client_n + 1) != 0 ||
         spec_grow((void **)&x->cl, &x->cl_cap, s->client_n + 1, sizeof(*x->cl)) != 0)
-        return fail(x, fn, "правило %s: недостаточно памяти для спеки (клиентов: %zu)", rn,
+        return fail(x, fn, "spec.no_memory", "правило %s: недостаточно памяти для спеки (клиентов: %zu)", rn,
                     s->client_n + 1);
     a = &x->cl[r->clients[0]];      /* массив мог переехать при росте */
     struct spec_client *m = &s->client[s->client_n];
@@ -1609,7 +1640,7 @@ static int merge_clients(struct v2 *x, struct spec_rule *r, const struct ynode *
     for (size_t i = 0; i < r->clients_n; i++) total += s->client[r->clients[i]].from_n;
     if (total) {
         m->from = (char (*)[64])spec_alloc(s, total * sizeof(*m->from));
-        if (!m->from) return fail(x, fn, "правило %s: недостаточно памяти для спеки", rn);
+        if (!m->from) return fail(x, fn, "spec.no_memory", "правило %s: недостаточно памяти для спеки", rn);
     }
     for (size_t i = 0; i < r->clients_n; i++) {
         const struct spec_client *b = &s->client[r->clients[i]];
@@ -1633,7 +1664,7 @@ static int merge_clients(struct v2 *x, struct spec_rule *r, const struct ynode *
 static int quic_clone(struct v2 *x, struct spec_rule *r, const struct ynode *qn, const char *rn) {
     struct spec *s = x->s;
     if (spec_reserve_list(s, s->list_n + 1) != 0)
-        return fail(x, qn, "правило %s: недостаточно памяти для спеки (списков: %zu)", rn, s->list_n + 1);
+        return fail(x, qn, "spec.no_memory", "правило %s: недостаточно памяти для спеки (списков: %zu)", rn, s->list_n + 1);
     struct spec_list *m = &s->list[s->list_n];
     if (r->lists_n) {
         *m = s->list[r->lists[0]];      /* имя остаётся: печать узнаёт по нему оригинал */
@@ -1651,7 +1682,7 @@ static int quic_clone(struct v2 *x, struct spec_rule *r, const struct ynode *qn,
 static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     struct spec *s = x->s;
     if (spec_reserve_rule(s, s->rule_n + 1) != 0)
-        return fail(x, n, "rules: недостаточно памяти для спеки (правил: %zu)", s->rule_n + 1);
+        return fail(x, n, "spec.no_memory", "rules: недостаточно памяти для спеки (правил: %zu)", s->rule_n + 1);
     struct spec_rule *r = &s->rule[s->rule_n];
     memset(r, 0, sizeof(*r));
     char where[64];
@@ -1665,37 +1696,37 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     if ((v = ynode_get(n, "name"))) {
         if (str_of(x, v, "name", &sv)) return -1;
         if (!label_ok(sv))
-            return fail(x, v, "имя правила «%s»: нельзя кавычку, обратную косую и управляющие символы", sv);
+            return fail(x, v, "spec.rule_name_chars", "имя правила «%s»: нельзя кавычку, обратную косую и управляющие символы", sv);
         if (copy_to(x, v, "имя правила", sv, r->name, sizeof(r->name))) return -1;
     } else snprintf(r->name, sizeof(r->name), "rule-%zu", no + 1);
     const char *rn = r->name;
     char w[96];
 
     snprintf(w, sizeof(w), "правило %s: out", rn);
-    if (!(v = ynode_get(n, "out"))) return fail(x, n, "правило %s: нет out — куда вести трафик", rn);
+    if (!(v = ynode_get(n, "out"))) return fail(x, n, "spec.rule_no_out", "правило %s: нет out — куда вести трафик", rn);
     if (str_of(x, v, w, &sv)) return -1;
-    if ((r->out = out_idx(s, sv)) < 0) return fail(x, v, "правило %s: выхода «%s» нет в outputs", rn, sv);
+    if ((r->out = out_idx(s, sv)) < 0) return fail(x, v, "spec.rule_output_missing", "правило %s: выхода «%s» нет в outputs", rn, sv);
     const struct ynode *outn = v;
 
     snprintf(w, sizeof(w), "правило %s: to", rn);
     const struct ynode *tn = ynode_get(n, "to");
-    if (!tn) return fail(x, n, "правило %s: нет to — списки из lists или all (весь трафик)", rn);
+    if (!tn) return fail(x, n, "spec.rule_no_to", "правило %s: нет to — списки из lists или all (весь трафик)", rn);
     if (items_ok(x, tn, w)) return -1;
-    if (!n_items(tn)) return fail(x, tn, "правило %s: to пустой — списки из lists или all", rn);
+    if (!n_items(tn)) return fail(x, tn, "spec.rule_to_empty", "правило %s: to пустой — списки из lists или all", rn);
     r->lists = (unsigned *)spec_alloc(s, n_items(tn) * sizeof(unsigned));
-    if (!r->lists) return fail(x, tn, "правило %s: недостаточно памяти для спеки", rn);
+    if (!r->lists) return fail(x, tn, "spec.no_memory", "правило %s: недостаточно памяти для спеки", rn);
     int all = 0;
     for (size_t i = 0; i < n_items(tn); i++) {
         const struct ynode *it = item(tn, i);
         if (!strcmp(it->str, "all")) { all = 1; continue; }
         int li = list_idx(s, x->lists_named, it->str);
-        if (li < 0) return fail(x, it, "правило %s: списка «%s» нет в lists", rn, it->str);
+        if (li < 0) return fail(x, it, "spec.rule_list_missing", "правило %s: списка «%s» нет в lists", rn, it->str);
         for (size_t b = 0; b < r->lists_n; b++)
-            if ((int)r->lists[b] == li) return fail(x, it, "правило %s: список %s указан дважды", rn, it->str);
+            if ((int)r->lists[b] == li) return fail(x, it, "spec.rule_list_twice", "правило %s: список %s указан дважды", rn, it->str);
         r->lists[r->lists_n++] = (unsigned)li;
     }
     if (all && n_items(tn) > 1)
-        return fail(x, tn, "правило %s: all — весь трафик; другие списки рядом с ним ничего не значат", rn);
+        return fail(x, tn, "spec.rule_all_alone", "правило %s: all — весь трафик; другие списки рядом с ним ничего не значат", rn);
 
     const struct ynode *fn = ynode_get(n, "for");
     int lan = 0;
@@ -1704,20 +1735,20 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         if (items_ok(x, fn, w)) return -1;
         if (n_items(fn)) {
             r->clients = (unsigned *)spec_alloc(s, n_items(fn) * sizeof(unsigned));
-            if (!r->clients) return fail(x, fn, "правило %s: недостаточно памяти для спеки", rn);
+            if (!r->clients) return fail(x, fn, "spec.no_memory", "правило %s: недостаточно памяти для спеки", rn);
         }
         for (size_t i = 0; i < n_items(fn); i++) {
             const struct ynode *it = item(fn, i);
             if (!strcmp(it->str, "lan")) { lan = 1; continue; }
             int ci = client_idx(s, x->clients_named, it->str);
-            if (ci < 0) return fail(x, it, "правило %s: клиента «%s» нет в clients", rn, it->str);
+            if (ci < 0) return fail(x, it, "spec.rule_client_missing", "правило %s: клиента «%s» нет в clients", rn, it->str);
             for (size_t b = 0; b < r->clients_n; b++)
                 if ((int)r->clients[b] == ci)
-                    return fail(x, it, "правило %s: клиент %s указан дважды", rn, it->str);
+                    return fail(x, it, "spec.rule_client_twice", "правило %s: клиент %s указан дважды", rn, it->str);
             r->clients[r->clients_n++] = (unsigned)ci;
         }
         if (lan && n_items(fn) > 1)
-            return fail(x, fn, "правило %s: lan — клиенты по умолчанию; с другими клиентами в одном for "
+            return fail(x, fn, "spec.rule_lan_alone", "правило %s: lan — клиенты по умолчанию; с другими клиентами в одном for "
                         "не сочетается", rn);
     }
 
@@ -1727,7 +1758,7 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         if (str_of(x, v, w, &sv)) return -1;
         if (!strcmp(sv, "realip")) r->realip = 1;
         else if (!strcmp(sv, "fakeip")) r->realip = 0;
-        else return fail(x, v, "%s: «%s» — нужен fakeip или realip", w, sv);
+        else return fail(x, v, "spec.dns_mode_bad_at", "%s: «%s» — нужен fakeip или realip", w, sv);
     }
     if ((v = ynode_get(n, "dns"))) {
         snprintf(w, sizeof(w), "правило %s: dns", rn);
@@ -1735,7 +1766,7 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
             /* Свой сервер прямо в правиле: тот же набор ключей, что у dns.upstreams, — сервер или
              * группа серверов. Имя ему даёт правило (для status и журнала). */
             if (spec_reserve_up(s, s->dns.up_n + 1))
-                return fail(x, v, "%s: недостаточно памяти для спеки (%zu апстримов)", w,
+                return fail(x, v, "spec.no_memory", "%s: недостаточно памяти для спеки (%zu апстримов)", w,
                             s->dns.up_n + 1);
             struct spec_dns_up *u = &s->dns.up[s->dns.up_n];
             if (ynode_get(v, "servers")) {
@@ -1743,7 +1774,7 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
             } else {
                 if (p_dns_up(x, v, w, rn, u)) return -1;
                 if (!up_has_way(s, u))
-                    return fail(x, v, "%s: имя «%s» нечем разрешить — задайте ips или bootstrap", w, u->host);
+                    return fail(x, v, "spec.dns_host_unresolvable_ips", "%s: имя «%s» нечем разрешить — задайте ips или bootstrap", w, u->host);
             }
             u->inl = 1;
             r->dns = (unsigned)(++s->dns.up_n);
@@ -1751,7 +1782,7 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
             if (str_of(x, v, w, &sv)) return -1;
             size_t u = 0;
             while (u < s->dns.up_n && strcmp(s->dns.up[u].name, sv)) u++;
-            if (u == s->dns.up_n) return fail(x, v, "правило %s: апстрима «%s» нет в dns.upstreams", rn, sv);
+            if (u == s->dns.up_n) return fail(x, v, "spec.rule_upstream_missing", "правило %s: апстрима «%s» нет в dns.upstreams", rn, sv);
             r->dns = (unsigned)(u + 1);
         }
     }
@@ -1766,7 +1797,7 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         snprintf(w, sizeof(w), "правило %s: scope", rn);
         if (str_of(x, sn, w, &sv)) return -1;
         if (!strcmp(sv, "device")) r->dev_scope = 1;
-        else if (strcmp(sv, "global") != 0) return fail(x, sn, "%s: «%s» — нужен device или global", w, sv);
+        else if (strcmp(sv, "global") != 0) return fail(x, sn, "spec.scope_bad", "%s: «%s» — нужен device или global", w, sv);
     }
 
     const struct ynode *qn = ynode_get(n, "quic");
@@ -1776,7 +1807,7 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         /* allow — записанное умолчание, как both у proto: QUIC не трогается. */
         if (!strcmp(sv, "block")) r->quic_block = 1;
         else if (strcmp(sv, "allow") != 0)
-            return fail(x, qn, "%s: «%s» — нужен block (отвергать UDP/443) или allow", w, sv);
+            return fail(x, qn, "spec.quic_bad", "%s: «%s» — нужен block (отвергать UDP/443) или allow", w, sv);
     }
 
     /* Политика семейства IP (R-154). both — записанное умолчание, как allow у quic. */
@@ -1786,7 +1817,7 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         if (str_of(x, fyn, w, &sv)) return -1;
         if (!strcmp(sv, "4")) r->family = 4;
         else if (!strcmp(sv, "6")) r->family = 6;
-        else if (strcmp(sv, "both") != 0) return fail(x, fyn, "%s: «%s» — нужен 4, 6 или both", w, sv);
+        else if (strcmp(sv, "both") != 0) return fail(x, fyn, "spec.family_bad", "%s: «%s» — нужен 4, 6 или both", w, sv);
     }
     const struct ynode *ufn = ynode_get(n, "on_family_unavailable");
     if (ufn) {
@@ -1794,11 +1825,11 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         if (str_of(x, ufn, w, &sv)) return -1;
         if (!strcmp(sv, "block")) r->fam_block = 1;
         else if (strcmp(sv, "fallback") != 0)
-            return fail(x, ufn, "%s: «%s» — нужен block или fallback", w, sv);
+            return fail(x, ufn, "spec.family_unavailable_bad", "%s: «%s» — нужен block или fallback", w, sv);
         /* Недоступным бывает только IPv6, и только у правила, которое просит именно его: у 4
          * семейство есть всегда, а у both правило без IPv6 остаётся по IPv4, как до политики. */
         if (r->fam_block && r->family != 6)
-            return fail(x, ufn, "правило %s: on_family_unavailable: block действует только при "
+            return fail(x, ufn, "spec.family_unavailable_v6", "правило %s: on_family_unavailable: block действует только при "
                         "family: 6 — IPv4 у выхода есть всегда, а при both без IPv6 правило "
                         "остаётся по IPv4", rn);
     }
@@ -1806,7 +1837,7 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
     /* Ссылки на клиентов правила до объединения — для проверок ниже. */
     size_t refs_n = r->clients_n;
     unsigned *refs = refs_n ? (unsigned *)spec_memdup(s, r->clients, refs_n * sizeof(unsigned)) : NULL;
-    if (refs_n && !refs) return fail(x, n, "правило %s: недостаточно памяти для спеки", rn);
+    if (refs_n && !refs) return fail(x, n, "spec.no_memory", "правило %s: недостаточно памяти для спеки", rn);
     if (r->lists_n > 1 && merge_lists(x, r, tn, rn)) return -1;
     if (r->clients_n > 1 && merge_clients(x, r, fn, rn)) return -1;
     if (r->family == 6) {
@@ -1814,27 +1845,27 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
          * (group_has_set6), и IPv6-правило из неё получилось бы пустым — отказ, а не молчание. */
         for (size_t k = 0; k < r->lists_n; k++)
             if (s->list[r->lists[k]].srs_n)
-                unsup(x, fyn, "правило %s: family: 6 со списком srs — пока со списками prefixes_file "
+                unsup(x, fyn, "spec.unsup_family6_srs", "правило %s: family: 6 со списком srs — пока со списками prefixes_file "
                       "и domains_file или с to: all", rn);
     }
     if (r->quic_block) {
         const struct spec_list *l = r->lists_n ? &s->list[r->lists[0]] : NULL;
         /* Проверки — и у выключенного правила: это не смысл правила, а применимость ключа. */
         if (l && l->srs_n) {
-            unsup(x, qn, "правило %s: quic: block со списком srs — пока со списками prefixes_file и "
+            unsup(x, qn, "spec.unsup_quic_srs", "правило %s: quic: block со списком srs — пока со списками prefixes_file и "
                   "domains_file или с to: all", rn);
         } else if (l && l->l4.proto == CH_PROTO_TCP) {
-            return fail(x, qn, "правило %s: quic: block, а список только tcp — QUIC это UDP", rn);
+            return fail(x, qn, "spec.quic_tcp_list", "правило %s: quic: block, а список только tcp — QUIC это UDP", rn);
         } else if (l && l->l4.ports_n) {
             int has = 0;
             for (size_t i = 0; i < l->l4.ports_n; i++)
                 if (l->l4.ports[i].lo <= 443 && 443 <= l->l4.ports[i].hi) has = 1;
             if (!has)
-                return fail(x, qn, "правило %s: quic: block, а порты списка не содержат 443", rn);
+                return fail(x, qn, "spec.quic_no_443", "правило %s: quic: block, а порты списка не содержат 443", rn);
         }
         for (size_t i = 0; i < refs_n; i++)
             if (x->cl[refs[i]].local)
-                return fail(x, qn, "правило %s: quic: block действует на трафик клиентов раздачи, а не "
+                return fail(x, qn, "spec.quic_phone", "правило %s: quic: block действует на трафик клиентов раздачи, а не "
                             "самого телефона (uid, self)", rn);
         if (!(l && l->srs_n) && quic_clone(x, r, qn, rn)) return -1;
     }
@@ -1846,11 +1877,11 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         /* Правило на устройство — приоритет ОДНОМУ хозяину, см. dev_scope в spec.h. */
         if (r->dev_scope) {
             if (!refs_n)
-                return fail(x, sn, "правило %s объявлено правилом на устройство (scope: device), но в "
+                return fail(x, sn, "spec.scope_device_no_clients", "правило %s объявлено правилом на устройство (scope: device), но в "
                             "for нет клиентов — назовите клиента с адресом или MAC", rn);
             for (size_t i = 0; i < refs_n; i++)
                 if (!x->cl[refs[i]].hosts)
-                    return fail(x, fn, "правило %s: правило на устройство принимает только одиночных "
+                    return fail(x, fn, "spec.scope_device_subnet", "правило %s: правило на устройство принимает только одиночных "
                                 "хозяев, а у клиента %s подсеть или диапазон — приоритет достался бы не "
                                 "одному устройству, а всем в нём", rn, s->client[refs[i]].name);
         }
@@ -1859,14 +1890,14 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
         const struct output *o = &s->out[r->out];
         for (size_t i = 0; i < refs_n; i++)
             if (x->cl[refs[i]].local && kind_of(o)->lan_only)
-                return fail(x, outn, "правило %s: выход kind=%s работает только для клиентов раздачи — %s",
+                return fail(x, outn, "spec.kind_lan_only", "правило %s: выход kind=%s работает только для клиентов раздачи — %s",
                             rn, out_kind_name(o), kind_of(o)->lan_only);
         /* balance у правил на сам телефон: разметка там — на хуке output в цепочке type route, и
          * перемаршрутизация после метки члена из перехода по карте на телефоне не проверена. Пока —
          * честный отказ. */
         for (size_t i = 0; i < refs_n; i++)
             if (x->cl[refs[i]].local && reaches_balance(s, o, 0)) {
-                unsup(x, outn, "правило %s: pick: balance для трафика самого телефона (uid, self)", rn);
+                unsup(x, outn, "spec.unsup_balance_phone", "правило %s: pick: balance для трафика самого телефона (uid, self)", rn);
                 break;
             }
     }
@@ -1894,10 +1925,9 @@ static int plugin_refs_pass(struct v2 *xx) {
         const struct ynode *at = NULL;
         if (!pk || !xx->out_pm[i]) continue;
         if (plugin_keys_refs(pk, xx->out_pm[i], plugin_ref_has, xx, &at, xx->e) != 0) {
-            char m[sizeof(xx->e->msg)];
-            snprintf(m, sizeof(m), "%s", xx->e->msg);
-            xx->e->msg[0] = '\0';
-            return fail(xx, at ? at : xx->out_key[i], "outputs.%s: %s", xx->s->out[i].name, m);
+            char w[128];
+            snprintf(w, sizeof(w), "outputs.%s", xx->s->out[i].name);
+            return wrap_in(xx, at ? at : xx->out_key[i], w);
         }
     }
     return 0;
@@ -1929,9 +1959,9 @@ static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e) {
     if (want_map(&x, root, "спека v2") || keys_known(&x, root, "спеке", V2S_TOP)) return -1;
     long ver = 0;
     v = ynode_get(root, "version");
-    if (!v) return fail(&x, root, "нет version: 2");
+    if (!v) return fail(&x, root, "spec.no_version", "нет version: 2");
     if (ynode_long(v, &ver) != 0 || ver != 2)
-        return fail(&x, v, "version %s не поддерживается (эта сборка понимает 2)", v->str ? v->str : "?");
+        return fail(&x, v, "spec.version_unsupported", "version %s не поддерживается (эта сборка понимает 2)", v->str ? v->str : "?");
 
     if ((v = ynode_get(root, "lan")) && p_lan(&x, v)) return -1;
     if ((v = ynode_get(root, "clients"))) {
@@ -1955,7 +1985,7 @@ static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e) {
     if ((v = ynode_get(root, "dns")) && p_dns(&x, v)) return -1;
     if ((v = ynode_get(root, "rules"))) {
         if (!ynode_is_null(v) && v->kind != YN_SEQ)
-            return fail(&x, v, "rules — список правил «- { to: …, out: … }», а не %s", shape(v));
+            return fail(&x, v, "spec.rules_shape", "rules — список правил «- { to: …, out: … }», а не %s", shape(v));
         for (size_t i = 0; i < ynode_len(v); i++)
             if (p_rule(&x, ynode_at(v, i), i)) return -1;
     }
@@ -1965,6 +1995,11 @@ static int v2_parse_doc(const struct ydoc *d, struct spec *s, struct err *e) {
     if (spec_check_outputs(s, "over", &bad, e) != 0)
         return bad >= 0 && (size_t)bad < s->out_n && x.out_key[bad] ? wrap(&x, x.out_key[bad]) : -1;
     if (x.un_node)
-        return fail(&x, x.un_node, "ещё не поддерживается в этой версии ядра steer: %s", x.un_what);
+    {
+        /* Код и подстановки — у самого места, а текст — с общей приставкой. */
+        struct err t = x.un;
+        snprintf(t.msg, sizeof(t.msg), "ещё не поддерживается в этой версии ядра steer: %.900s", x.un.msg);
+        return ynode_errc(e, x.d, x.un_node, &t);
+    }
     return 0;
 }

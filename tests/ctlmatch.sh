@@ -267,6 +267,12 @@ before="$(sum)"
 r="$(ctl check < "$tmp/bad.json")"
 check "check негодной спеки: код 2 и причина" "2 1" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j stderr | grep -c 'kind')"
+printf '{"version":2,"outputs":{"a":{"kind":"bogus"}},"rules":[]}\n' > "$tmp/bad2.json"
+r="$(ctl check < "$tmp/bad2.json")"
+check "check негодной спеки v2: ecode и args ядра (docs/errors.md), code остаётся кодом возврата" "2 spec.unknown_kind outputs.a" \
+    "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j ecode) $(printf '%s' "$r" | j args.1)"
+check "  строка JSON отказа убрана из stderr" "0" "$(printf '%s' "$r" | j stderr | grep -c '^{')"
+check "отказ сервера несёт code и args: unknown-command" "unknown-command ctl.unknown_command" "$(ctl conns-all | j error) $(ctl conns-all | j code)"
 check "check годной спеки: код 0" "0" "$(ctl check < "$tmp/B.json" | j code)"
 check "check ничего не сохраняет" "$before" "$(sum)"
 r="$(ctl apply < "$tmp/bad.json")"

@@ -306,7 +306,7 @@ static void plugin_flow(struct flow *w, const struct output *o) {
     awg_default_ifname(o->name, dflt, sizeof(dflt));
     if (out_has_device(o) && o->device[0] && strcmp(o->device, dflt) != 0) fs(w, "device", o->device);
     if (!o->plg.keys_json) return;
-    struct err pe = { { 0 } };
+    struct err pe = {0};
     struct ydoc *d = ydoc_parse_buf(o->plg.keys_json, strlen(o->plg.keys_json), "keys", &pe);
     if (!d) return;
     const struct ynode *r = ydoc_root(d);
@@ -714,7 +714,7 @@ int spec_print_v2_json(FILE *f, const struct spec *s, struct err *e) {
     int rc = spec_print_v2(m, s, e);
     if (fclose(m) != 0 && rc == 0) rc = e ? err_set(e, "недостаточно памяти для печати спеки", NULL) : -1;
     if (rc != 0) { free(buf); return rc; }
-    struct err pe = { { 0 } };
+    struct err pe = {0};
     struct ydoc *d = ydoc_parse_buf(buf, len, "spec", &pe);
     free(buf);
     if (!d) return e ? err_set(e, "печать спеки не разобралась: %s", pe.msg) : -1;

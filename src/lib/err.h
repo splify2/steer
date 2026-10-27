@@ -1,6 +1,9 @@
 #ifndef STEER_ERR_H
 #define STEER_ERR_H
 
+#include <stdarg.h>
+#include <stddef.h>
+
 /* Правило 5, docs/architecture.md, раздел 2: модели и компилятору die() не нужен. Они
  * возвращают код ошибки и заполняют эту структуру, а завершает процесс только точка входа —
  * command-обработчики в daemon/, cli/, tools/, kinds/awg.c и proto (xsteer, tgws, vless).
@@ -11,7 +14,31 @@
  * над любым из существующих сообщений (самые длинные собираются в буферы по 512, см. parse.c). */
 struct err {
     char msg[1024];
+    /* Машинная часть отказа (docs/errors.md): стабильное слово `code` ("spec.unknown_kind"), по которому каркас
+     * показывает текст на своём языке, и `args` — объект JSON со строковыми подстановками ({"1":"…"}; пусто —
+     * подстановок нет). Текст msg остаётся прежним, русским — для журнала и командной строки. Пустой code —
+     * у отказа слова нет (его пишет err_set), каркас показывает msg как есть. */
+    char code[64];
+    char args[768];
 };
+
+/* То же, что err_set, но с кодом отказа; подстановка a (если не NULL) уходит в args как "1". */
+int err_setc(struct err *e, const char *code, const char *fmt, const char *a);
+
+/* Отказ с кодом и произвольным числом подстановок: формат как у printf (%s %d %u %ld %zu, %.Ns, %.*s) — все
+ * подстановки уходят в args по порядку как "1", "2", … */
+int err_vsetc(struct err *e, const char *code, const char *fmt, va_list ap);
+
+/* err_vsetc с переменным числом аргументов. */
+__attribute__((format(printf, 3, 4)))
+int err_setf(struct err *e, const char *code, const char *fmt, ...);
+
+/* Добавить подстановку в объект args (буфер cap байт; пустая строка — пустой объект). Значение длиннее 240
+ * байт обрезается по границе символа UTF-8; не поместилось — подстановка пропускается. */
+void err_args_add(char *args, size_t cap, const char *name, const char *val);
+
+/* Отказ как объект JSON одной строкой: {"ok":false,"error":…,"code":…,"args":{…}} (code и args — если есть). */
+int err_json(const struct err *e, char *buf, size_t cap);
 
 /* Форматирует ТОЧНО как прежний die(): тот же fmt с ОДНИМ %s. Кладёт результат в e->msg и
  * возвращает -1, чтобы годилось прямо в `return err_set(e, fmt, a);` — ровно там, где раньше
@@ -29,8 +56,12 @@ static inline int err_prop(struct err *e, const char *fmt, const char *a) {
 }
 
 /* Печатает "steer: %s\n" в stderr и завершает процесс кодом 2 — байт в байт то же, что печатал
- * die(). Зовут только точки входа, после того как модель или компилятор вернули -1. */
+ * die(). Если задана переменная окружения STEER_ERR_JSON, следом — одна строка err_json в stderr
+ * (так каркас получает код и подстановки у отказа команды). Зовут только точки входа, после того как модель или компилятор вернули -1. */
 void err_die(const struct err *e);
+
+/* То же без завершения: печатает отказ (и строку JSON при STEER_ERR_JSON), код возврата выбирает вызывающий. */
+void err_print(const struct err *e);
 
 /* Прежний немедленный отказ: печатает "steer: " + fmt%a + "\n" в stderr и exit(2). Остаётся
  * только для точек входа (разбор аргументов командной строки, «такой команды нет» и подобное) —
