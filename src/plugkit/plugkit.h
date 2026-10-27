@@ -120,8 +120,18 @@ struct pk_prog {
 #ifndef STEER_VERSION
 #define STEER_VERSION "dev"
 #endif
+/* retain: компоновщик со сборкой мусора по разделам (lld с -z start-stop-gc, умолчание с lld 13) иначе
+ * выбрасывает раздел, на который ссылаются только __start_/__stop_ — и программа оставалась без подкоманд. */
+#if defined(__has_attribute)
+#if __has_attribute(retain)
+#define PK_RETAIN retain,
+#endif
+#endif
+#ifndef PK_RETAIN
+#define PK_RETAIN
+#endif
 #define PK_PROGRAM(ID, CMDS)                                                                   \
-    __attribute__((used, section("steer_pk"), aligned(sizeof(void *))))                       \
+    __attribute__((PK_RETAIN used, section("steer_pk"), aligned(sizeof(void *))))            \
     static const struct pk_prog pk_prog_entry = { ID, STEER_VERSION, CMDS, sizeof(CMDS) / sizeof((CMDS)[0]) }
 /* Программа плагина id, вкомпилированная в этот бинарник; NULL — нет. id NULL — первая. */
 const struct pk_prog *pk_prog_find(const char *id);

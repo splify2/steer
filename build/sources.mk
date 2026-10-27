@@ -197,7 +197,7 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
                  src/proto/xsteer/xsstream.c src/proto/xsteer/xsepoch.c \
                  src/proto/tls/tls13.c src/proto/tls/certverify.c \
                  src/proto/tls/reality.c src/tunnel/tun.c src/proto/tls/h2.c \
-                 src/proto/xsteer/xsadmin.c $(CRYPTO_SRC)
+                 src/proto/xsteer/xsadmin.c src/proto/obfs/obfs.c $(CRYPTO_SRC)
 # Туннель VLESS — стек отдельно от протокола (шаг 2 выпуска 1.10, docs/architecture.md, «Туннели:
 # стек, дайлер, транспорт»). Три списка — по тому, куда файлы уйдут на шаге 4, когда появятся
 # libsteer.so и бинарники модулей; пока все три входят в расширенный профиль целиком:
@@ -244,8 +244,7 @@ PKMAIN_SRC := src/plugkit/pkmain.c
 # PLUGINS_EMBED — плагины, вкомпилированные в бинарник телефона вместе с манифестами (PKEMBED_SRC — его
 # пишет build/pkembed.sh из plugins/<id>/): реестр ядра видит их и без каталога плагинов (О-13).
 PLUGINS_EMBED := vless xsteer obfs
-PK_STATIC_SRC := $(PLUGKIT_SRC) src/modules/main_vless.c src/modules/main_xsteer.c src/proto/xsteer/xshook.c $(OBFS_MOD_SRC) src/modules/main_obfs.c \
-                 src/proto/obfs/obfs.c
+PK_STATIC_SRC := $(PLUGKIT_SRC) src/modules/main_vless.c src/modules/main_xsteer.c src/proto/xsteer/xshook.c $(OBFS_MOD_SRC) src/modules/main_obfs.c
 
 PROFILE_base     := $(CORE_SRC)
 # Полный статический профиль (телефон): протоколы vless и xsteer вкомпилированы программами плагинов
