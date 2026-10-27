@@ -341,14 +341,100 @@ static void resp_begin(struct cbuf *r, const char *cmd) {
     if (cmd) { cb_str(r, ",\"cmd\":"); cb_jstr(r, cmd); }
 }
 
+/* Код отказа сервера (docs/errors.md): по тексту — для отказов с постоянной фразой, иначе по виду. */
+static const char *ctl_err_code(const char *err, const char *msg) {
+    static const struct { const char *msg, *code; } T[] = {
+        { "слишком много слов в запросе", "ctl.too_many_words" },
+        { "пустое слово: слова разделяются одним пробелом", "ctl.empty_word" },
+        { "такой команды нет", "ctl.unknown_command" },
+        { "сервер занят другими запросами — повторите позже", "ctl.busy" },
+        { "нужна длина тела последним словом", "ctl.need_body_length" },
+        { "длина тела — десятичное число байт", "ctl.bad_body_length" },
+        { "не то число слов у команды", "ctl.wrong_word_count" },
+        { "нет памяти под тело", "ctl.no_memory" },
+        { "нет памяти под ответ", "ctl.no_memory" },
+        { "нет памяти", "ctl.no_memory" },
+        { "тело не пришло целиком за 5 секунд", "ctl.body_timeout" },
+        { "запрос не пришёл целиком за 5 секунд", "ctl.request_timeout" },
+        { "строка запроса длиннее 512 байт", "ctl.line_too_long" },
+        { "этому процессу управлять ядром steer нельзя", "ctl.denied" },
+        { "не удалось начать обработку запроса", "ctl.cannot_start" },
+        { "не удалось дождаться ядра", "ctl.wait_failed" },
+        { "не удалось запустить ядро", "ctl.spawn_failed" },
+        { "команда не уложилась в свой срок и остановлена", "ctl.timeout" },
+        { "проверка не уложилась в свой срок и остановлена", "ctl.timeout" },
+        { "применение не уложилось в свой срок и остановлено", "ctl.timeout" },
+        { "не удалось записать временный файл спеки", "ctl.spec_tmp_failed" },
+        { "не удалось записать временный файл тела", "ctl.body_tmp_failed" },
+        { "не записать тело во временный файл", "ctl.body_tmp_failed" },
+        { "план применения не разобран", "ctl.plan_unreadable" },
+        { "не удалось заменить спеку", "ctl.spec_replace_failed" },
+        { "не удалось создать каталог списков", "ctl.lists_dir_failed" },
+        { "каталог списков — не каталог", "ctl.lists_dir_not_dir" },
+        { "слишком длинный путь каталога списков", "ctl.lists_path_long" },
+        { "не удалось создать временный файл в каталоге списков", "ctl.lists_tmp_failed" },
+        { "не удалось записать файл (нет места?)", "ctl.file_write_failed" },
+        { "файлы списков заняли бы больше 128 МиБ — уберите ненужные (rm-file)", "ctl.lists_total_big" },
+        { "не удалось прочитать сохранённую спеку", "ctl.saved_spec_unreadable" },
+        { "файл упомянут в сохранённой спеке — сначала примените спеку без него", "ctl.file_in_use" },
+        { "не удалось удалить файл", "ctl.file_remove_failed" },
+        { "недопустимое имя плагина в теле", "ctl.bad_plugin_name" },
+        { "тело — id плагинов через пробел", "ctl.body_plugin_ids" },
+        { "тело — объект JSON с id и state", "ctl.body_plugin_event" },
+        { "не удалось прочитать спеку", "ctl.spec_unreadable" },
+    };
+    for (size_t i = 0; i < sizeof(T) / sizeof(*T); i++)
+        if (!strcmp(T[i].msg, msg)) return T[i].code;
+    if (!strcmp(err, "bad-request")) return "ctl.bad_request";
+    if (!strcmp(err, "too-large")) return "ctl.too_large";
+    if (!strcmp(err, "unknown-command")) return "ctl.unknown_command";
+    if (!strcmp(err, "denied")) return "ctl.denied";
+    if (!strcmp(err, "busy")) return "ctl.busy";
+    if (!strcmp(err, "timeout")) return "ctl.timeout";
+    if (!strcmp(err, "in-use")) return "ctl.in_use";
+    return "ctl.internal";
+}
+
+/* error — вид отказа (прежнее слово), message — фраза для журнала и командной строки, code — машинное слово
+ * (docs/errors.md), args — подстановки (у отказов с числами в тексте — они же; у остальных пусто). */
 static void resp_error(struct cbuf *r, const char *err, const char *msg) {
     cb_str(r, ",\"error\":");
     cb_jstr(r, err);
     cb_str(r, ",\"message\":");
     cb_jstr(r, msg);
+    cb_str(r, ",\"code\":");
+    cb_jstr(r, ctl_err_code(err, msg));
+    cb_str(r, ",\"args\":{}");
+}
+
+/* Строка JSON отказа подкоманды (err_json, STEER_ERR_JSON) — последняя строка stderr: вынуть её из stderr и
+ * положить в ответ как ecode и args. Поле code здесь занято кодом возврата подкоманды, поэтому слово — ecode. */
+static void resp_ecode(struct cbuf *r, struct cbuf *err) {
+    if (!err->p || err->n < 16) return;
+    char *end = err->p + err->n;
+    while (end > err->p && (end[-1] == '\n' || end[-1] == ' ')) end--;
+    char *ls = end;
+    while (ls > err->p && ls[-1] != '\n') ls--;
+    if (strncmp(ls, "{\"ok\":false,\"error\":\"", 21) != 0) return;
+    *end = 0;
+    char *c = strstr(ls, ",\"code\":\"");
+    if (c) {
+        c += 9;
+        char *q = strchr(c, '"');
+        char *a = q ? strstr(q, "\"args\":") : NULL;
+        if (q && a && end[-1] == '}') {
+            cb_str(r, ",\"ecode\":\"");
+            cb_put(r, c, (size_t)(q - c));
+            cb_str(r, "\",\"args\":");
+            cb_put(r, a + 7, (size_t)(end - 1 - (a + 7)));
+        }
+    }
+    err->n = (size_t)(ls - err->p);
+    err->p[err->n] = 0;
 }
 
 static void resp_run(struct cbuf *r, int code, struct cbuf *out, struct cbuf *err) {
+    resp_ecode(r, err);
     cb_utf8_trim(out);
     cb_utf8_trim(err);
     cb_fmt(r, ",\"code\":%d,\"stdout\":", code);
@@ -1038,6 +1124,7 @@ static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t o
          * через exec, а подкоманды рассчитывают на обычное поведение. */
         loop_child_reset();
         if (pmem) putenv(pmem);
+        setenv("STEER_ERR_JSON", "1", 1);   /* отказ подкоманды — ещё и строкой JSON с кодом (docs/errors.md) */
         execv(s->cf.exe, argv);
         dprintf(2, LOG_W "не запустить %s: %s\n", s->cf.exe, strerror(errno));
         _exit(127);
@@ -2154,7 +2241,7 @@ static int ctl_spec_mentions(const struct cbuf *spec, const char *path, const ch
     char dir[PATH_MAX] = "";
     const char *sl = spec_path ? strrchr(spec_path, '/') : NULL;
     if (sl && (size_t)(sl - spec_path) < sizeof(dir)) snprintf(dir, sizeof(dir), "%.*s", (int)(sl - spec_path), spec_path);
-    struct err e = { { 0 } };
+    struct err e = {0};
     struct ydoc *d = ydoc_parse_buf(spec->p, strlen(spec->p), "spec", &e);
     if (d) {
         int m = ynode_mentions(ydoc_root(d), path, dir);
@@ -2418,7 +2505,7 @@ static void st_plugin_reload(struct conn *c) {
 /* plugin-event: тело — объект JSON от менеджера; подписчикам уходит событие `plugin` с полями id,
  * state, version, from, why, by (steer-api.md, 4.1). Прочие поля тела не пересылаются. */
 static void mem_plugin_event(struct conn *c, struct cbuf *r) {
-    struct err e = {{0}};
+    struct err e = {0};
     struct ydoc *d = c->q.body_n ? ydoc_parse_buf(c->q.body, c->q.body_n, "plugin-event", &e) : NULL;
     const struct ynode *root = d ? ydoc_root(d) : NULL;
     const struct ynode *id = ynode_get(root, "id"), *st = ynode_get(root, "state");
@@ -2464,7 +2551,7 @@ static long plugauto_delay_ms(void) {
     struct cbuf b = {0};
     long ms = 24L * 3600 * 1000;
     if (ctl_read_file(p, &b, 64L * 1024 * 1024) == 1) {
-        struct err e = {{0}};
+        struct err e = {0};
         struct ydoc *d = ydoc_parse_buf(b.p, b.n, "state.json", &e);
         const struct ynode *nx = d ? ynode_get(ynode_get(ydoc_root(d), "auto"), "next") : NULL;
         if (nx && nx->kind == YN_SCALAR) {
