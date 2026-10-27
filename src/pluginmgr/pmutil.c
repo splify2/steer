@@ -72,6 +72,7 @@ const char *pm_seed(void)  { return envor("STEER_PLUGIN_SEED", "/usr/share/steer
 const char *pm_run(void)   { return envor("STEER_PLUGIN_RUN", "/var/run/steer/plugins"); }
 const char *pm_tmp(void)   { return envor("STEER_PLUGIN_TMP", "/tmp/steer-plugins"); }
 const char *pm_keepd(void) { return envor("STEER_PLUGIN_KEEPD", "/lib/upgrade/keep.d/steer-plugins"); }
+const char *pm_sysroot(void) { const char *v = getenv("STEER_PLUGIN_SYSROOT"); return v ? v : ""; }
 
 /* ---- файлы ---- */
 

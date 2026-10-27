@@ -66,7 +66,8 @@ static int usage(void) {
     fputs("steer plugin list | search [слово] | status [id] | install <id> [версия] | install --file F [--unsigned]\n"
           "             | update [id] [--auto] | remove <id> [--force] [--purge] | enable <id> | disable <id>\n"
           "             | autoupdate <id> on|off | repo list | repo add <url> <номер ключа> | repo del <имя>\n"
-          "             | ensure <id>... | migrate | job <номер>      (--json — ответ JSON; --job — install/update заданием)\n",
+          "             | ensure <id>... [--pkg ИМЯ] | migrate | job <номер>      (--json — ответ JSON; --job — install/update заданием)\n"
+          "  --pkg ИМЯ — зовёт скрипт системного пакета ИМЯ изнутри транзакции apk/opkg: пакет считается стоящим\n",
           stderr);
     return 2;
 }
@@ -848,6 +849,9 @@ static int ensure_one(struct pm_ctx *x, const char *id, struct pm_result *all, c
     if (p && here && (!p->state || strcmp(p->state, "failed"))) {
         for (size_t k = 0; k < *np; k++)
             if (!strcmp((*present)[k], id)) return 0;       /* уже учтён (сам или как зависимость) */
+        /* Ссылки в системе (steer.links): убранную руками или снятую пакетом (файл прежнего пакета на том же
+         * пути) возвращаем. */
+        if (pm_links_repair(x, id, e) != 0) return -1;
         *present = pm_realloc(*present, sizeof(char *) * (*np + 1));
         (*present)[(*np)++] = (char *)id;
         /* Зависимости стоящего плагина тоже должны стоять: убранную руками библиотеку возвращаем
@@ -1241,6 +1245,7 @@ int pm_main(int argc, char **argv) {
         else if (!strcmp(a, "--file") && i + 1 < argc) file = argv[++i];
         else if (!strcmp(a, "--key-file") && i + 1 < argc) keyfile = argv[++i];
         else if (!strcmp(a, "--by") && i + 1 < argc) x.by = argv[++i];
+        else if (!strcmp(a, "--pkg") && i + 1 < argc) x.pkg_tx = argv[++i];
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) return usage();
         else if (a[0] == '-' && a[1]) { fprintf(stderr, "steer plugin: неизвестный флаг %s\n", a); return usage(); }
         else {

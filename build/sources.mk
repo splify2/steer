@@ -422,8 +422,15 @@ PLUGINS_TLS := tgws
 PLUGINS_EXTENDED := tgws
 
 # steer-box-connector (sing-box для podkop и forkop) живёт в своём репозитории
-# (github.com/splify2/steer-box-connector) и собирается build/ext-build.sh; нужные ему символы
-# libsteer — в build/exports-ext.lst.
+# (github.com/splify2/steer-box-connector) и собирается build/ext-build.sh. С 2.1 он — плагин ядра
+# `box-connector` (plugin-sdk/docs/migration-2.1.md, раздел 6): программа статическая, как tgws, со своей
+# копией TLS 1.3, REALITY, HTTP/2, корней, разбора .srs и wolfSSL, — плагину нельзя быть связанным с
+# libsteer.so.<версия>: тег «=версия ядра» снят (решение В10). EXT_TLS_SRC — то из дерева steer, что
+# вкомпилировано в такую программу (ext-build.sh --static); прежний экспорт для внешнего модуля на
+# libsteer — build/exports-ext.lst.
+EXT_TLS_SRC := src/proto/tls/chello.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
+               src/proto/tls/h2.c src/proto/tls/ech.c src/proto/tls/roots.c src/model/srs.c src/lib/gz.c src/lib/puff.c \
+               $(CRYPTO_SRC) $(NET1_BASE_SRC)
 
 # Два бинарника на пакет (docs/architecture.md, раздел 4а, «Бинарники»): профиль — это движок
 # steerd (демон, компилятор, apply, помощники, инструменты; ссылка steer-tools на него же), а

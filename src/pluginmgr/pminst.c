@@ -23,6 +23,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
@@ -299,7 +300,10 @@ static int wait_outs(struct pm_ctx *x, const struct outs *o, int timeout_s, stru
 
 /* ---- системные пакеты ---- */
 
-static int pkg_installed(const char *name) {
+static int pkg_installed(const struct pm_ctx *x, const char *name) {
+    /* --pkg ИМЯ: менеджер зовёт скрипт этого пакета изнутри его транзакции — в базе его ещё нет (apk и opkg
+     * пишут базу в конце транзакции, после скриптов). */
+    if (x && x->pkg_tx && !strcmp(x->pkg_tx, name)) return 1;
     const char *pk = getenv("STEER_PLUGIN_PKG");
     if (pk && *pk) {
         char *argv[] = { (char *)pk, "installed", (char *)name, NULL };
@@ -797,6 +801,18 @@ static int nonempty(const struct ynode *n) {
     return n->len > 0;
 }
 
+/* Путь вне каталогов плагина разрешён правом fs:<путь> (каталог — с «/» на конце или любой путь под ним). */
+static int fs_allowed(const struct ynode *man, const char *k) {
+    const struct ynode *perms = ynode_get(man, "permissions");
+    for (size_t j = 0; j < ynode_len(perms); j++) {
+        const char *p = yn_is_str(ynode_at(perms, j)) ? ynode_at(perms, j)->str : "";
+        if (strncmp(p, "fs:", 3)) continue;
+        size_t pl = strlen(p + 3);
+        if (pl && !strncmp(k, p + 3, pl) && (k[pl] == '\0' || k[pl] == '/' || p[3 + pl - 1] == '/')) return 1;
+    }
+    return 0;
+}
+
 /* Права, impl: core, standalone, занятые имена (manifest.md, «Проверки при установке»). */
 static int manifest_checks(struct pm_ctx *x, const char *id, const struct ynode *man, int official,
                            const char *repo, struct pm_err *e) {
@@ -824,15 +840,7 @@ static int manifest_checks(struct pm_ctx *x, const char *id, const struct ynode 
     for (size_t i = 0; i < ynode_len(keep); i++) {
         const char *k = yn_is_str(ynode_at(keep, i)) ? ynode_at(keep, i)->str : NULL;
         if (!k || k[0] != '/' || strstr(k, "..")) return pm_errf(e, "%s: путь keep «%s» не абсолютный", id, k ? k : "");
-        int ok = 0;
-        const struct ynode *perms = ynode_get(man, "permissions");
-        for (size_t j = 0; j < ynode_len(perms) && !ok; j++) {
-            const char *p = yn_is_str(ynode_at(perms, j)) ? ynode_at(perms, j)->str : "";
-            if (strncmp(p, "fs:", 3)) continue;
-            size_t pl = strlen(p + 3);
-            if (pl && !strncmp(k, p + 3, pl) && (k[pl] == '\0' || k[pl] == '/' || p[3 + pl - 1] == '/')) ok = 1;
-        }
-        if (!ok) return pm_errf(e, "%s: путь keep %s без права fs:", id, k);
+        if (!fs_allowed(man, k)) return pm_errf(e, "%s: путь keep %s без права fs:", id, k);
     }
     /* Имена глобальны: вид, подкоманда, служба, занятые другим плагином или ядром. */
     struct { const char *sect, *what; } names[] = { {"kinds", "вид"}, {"commands", "подкоманда"}, {"services", "служба"} };
@@ -876,7 +884,12 @@ static int system_deps(struct pm_ctx *x, const char *id, const struct ynode *man
         for (char *p = strtok_r(copy, "|", &save); p && !have; p = strtok_r(NULL, "|", &save)) {
             while (*p == ' ') p++;
             if (!firstp) firstp = p;
-            if (pkg_installed(p)) have = 1;
+            if (pkg_installed(x, p)) have = 1;
+        }
+        if (!have && firstp && x->pkg_tx) {
+            /* Изнутри транзакции apk/opkg база заперта: поставить пакет нельзя. */
+            free(copy);
+            return pm_errf(e, "%s не встаёт: нужен пакет %s — поставьте его после установки %s", id, firstp, x->pkg_tx);
         }
         if (!have && firstp) {
             pm_progress(x, "пакет %s для %s", firstp, id);
@@ -919,12 +932,227 @@ int pm_keepd_write(struct pm_ctx *x) {
         const struct ynode *keep = ynode_get(ydoc_root(m), "keep");
         for (size_t j = 0; j < ynode_len(keep); j++)
             if (yn_is_str(ynode_at(keep, j))) fprintf(f, "%s\n", ynode_at(keep, j)->str);
+        /* Копии настроек steer.links (mode: conf) — то же, что conffiles пакета: переживают sysupgrade. */
+        const struct ynode *links = ynode_get(ynode_get(ydoc_root(m), "steer"), "links");
+        for (size_t j = 0; j < ynode_len(links); j++) {
+            const char *lm = yn_str(ynode_at(links, j), "mode"), *lp = yn_str(ynode_at(links, j), "path");
+            if (lp && lm && !strcmp(lm, "conf")) fprintf(f, "%s\n", lp);
+        }
         ydoc_free(m);
     }
     fclose(f);
     int r = pm_write_atomic(pm_keepd(), buf, n, 0644);
     free(buf);
     return r;
+}
+
+/* ---- steer.links (steer-api 1.3; manifest.md, «steer.links») ----
+ *
+ * Пути в системе, которые плагин занимает, пока стоит: то, что чужая программа ищет по известному адресу, а
+ * плагин держит у себя в каталоге (box-connector: /usr/bin/sing-box и /etc/init.d/sing-box для podkop и forkop,
+ * страница LuCI). Код у плагина — только в его каталоге; в системе — ссылки, которые ведёт менеджер:
+ *   link (умолчание) — символическая ссылка path → <каталог плагина>/<target>. Каталог плагина при обновлении и
+ *        откате меняется rename(2) под тем же именем, так что ссылка переживает и то и другое; снимается вместе
+ *        с плагином;
+ *   conf — копия target, если файла path нет: настройки, которые правит чужая программа (uci). Не
+ *        перезаписывается, переживает снятие (как conffiles пакета) и sysupgrade (keep.d); --purge убирает.
+ * Каждый path — под правом fs:, у одного плагина; путь, занятый не менеджером (файл пакета), — отказ, который
+ * называет пакет. Ссылки живут, пока плагин стоит, включён он или выключен: чужая программа ищет их всегда. */
+
+/* Пакет, которому принадлежит path (NULL — ничей или базы нет). Заглушка стенда — STEER_PLUGIN_PKG owner. */
+static char *pkg_owner(const char *path) {
+    const char *pk = getenv("STEER_PLUGIN_PKG");
+    if (pk && *pk) {
+        char *argv[] = { (char *)pk, "owner", (char *)path, NULL };
+        char *out = NULL;
+        if (run_prog(argv, NULL, NULL, &out, 60) != 0) { free(out); return NULL; }
+        char *r = trim_out(out);
+        if (!*r) { free(r); return NULL; }
+        return r;
+    }
+    size_t n = 0;
+    char *db = pm_read("/lib/apk/db/installed", &n);
+    const char *rel = path[0] == '/' ? path + 1 : path;
+    if (db) {
+        /* P:пакет, F:каталог, R:файл каталога — путь без начального «/». */
+        char *pkg = NULL, *hit = NULL;
+        const char *dir = "";
+        for (char *l = strtok(db, "\n"); l && !hit; l = strtok(NULL, "\n")) {
+            if (l[0] == 'P' && l[1] == ':') { pkg = l + 2; dir = ""; }
+            else if (l[0] == 'F' && l[1] == ':') dir = l + 2;
+            else if (l[0] == 'R' && l[1] == ':' && pkg) {
+                size_t dl = strlen(dir);
+                if (dl ? (!strncmp(rel, dir, dl) && rel[dl] == '/' && !strcmp(rel + dl + 1, l + 2)) : !strcmp(rel, l + 2))
+                    hit = pm_strdup(pkg);
+            }
+        }
+        free(db);
+        return hit;
+    }
+    /* opkg: /usr/lib/opkg/info/<пакет>.list — по пути на строку. */
+    char *hit = NULL;
+    DIR *dd = opendir("/usr/lib/opkg/info");
+    if (!dd) return NULL;
+    struct dirent *de;
+    while (!hit && (de = readdir(dd))) {
+        size_t nl = strlen(de->d_name);
+        if (nl < 6 || strcmp(de->d_name + nl - 5, ".list")) continue;
+        char *lp = pm_fmt("/usr/lib/opkg/info/%s", de->d_name);
+        char *lst = pm_read(lp, &n);
+        free(lp);
+        if (!lst) continue;
+        for (char *l = strtok(lst, "\n"); l && !hit; l = strtok(NULL, "\n"))
+            if (!strcmp(l, path)) hit = pm_fmt("%.*s", (int)(nl - 5), de->d_name);
+        free(lst);
+    }
+    closedir(dd);
+    return hit;
+}
+
+/* Ссылка ли path менеджера на каталог плагина id (любой target). */
+static int link_ours(const char *full, const char *id) {
+    char buf[4096];
+    ssize_t r = readlink(full, buf, sizeof(buf) - 1);
+    if (r < 0) return 0;
+    buf[r] = '\0';
+    char *pre = pm_fmt("%s/%s/", pm_root(), id);
+    int ours = !strncmp(buf, pre, strlen(pre));
+    free(pre);
+    return ours;
+}
+
+static const char *link_mode(const struct ynode *l) {
+    const char *m = yn_str(l, "mode");
+    return m ? m : "link";
+}
+
+static const struct ynode *links_of(const struct ynode *man) {
+    return man ? ynode_get(ynode_get(man, "steer"), "links") : NULL;
+}
+
+static int links_has(const struct ynode *links, const char *path) {
+    for (size_t i = 0; i < ynode_len(links); i++) {
+        const char *p = yn_str(ynode_at(links, i), "path");
+        if (p && !strcmp(p, path)) return 1;
+    }
+    return 0;
+}
+
+/* Проверка steer.links до подмены: форма, права, цели в base (каталог плагина или распаковка), чужие плагины,
+ * занятые пути. */
+static int links_validate(struct pm_ctx *x, const char *id, const struct ynode *man, const char *base,
+                          struct pm_err *e) {
+    const struct ynode *links = links_of(man);
+    for (size_t i = 0; i < ynode_len(links); i++) {
+        const struct ynode *l = ynode_at(links, i);
+        const char *path = yn_str(l, "path"), *target = yn_str(l, "target"), *mode = link_mode(l);
+        if (!path || path[0] != '/' || strstr(path, "..") || strlen(path) < 2 || path[strlen(path) - 1] == '/')
+            return pm_errf(e, "%s: путь ссылки «%s» не абсолютный путь файла", id, path ? path : "");
+        if (!target || target[0] == '/' || strstr(target, ".."))
+            return pm_errf(e, "%s: цель ссылки %s вне каталога плагина", id, path);
+        if (strcmp(mode, "link") && strcmp(mode, "conf")) return pm_errf(e, "%s: ссылка %s — неизвестный mode «%s»", id, path, mode);
+        if (!strncmp(path, "/usr/lib/steer/", 15) || !strncmp(path, "/etc/steer/", 11) || !strncmp(path, "/usr/sbin/steer", 15) ||
+            !strcmp(path, "/etc/init.d/steer"))
+            return pm_errf(e, "%s: ссылка %s — путь ядра steer, плагину его не дать", id, path);
+        if (!fs_allowed(man, path)) return pm_errf(e, "%s: ссылка %s без права fs:", id, path);
+        char *src = pm_path(base, target);
+        struct stat st;
+        int okf = stat(src, &st) == 0 && S_ISREG(st.st_mode);
+        free(src);
+        if (!okf) return pm_errf(e, "%s: цели ссылки %s (%s) нет в плагине", id, path, target);
+        for (size_t j = 0; j < x->st.n; j++) {
+            const struct pm_inst *o = &x->st.v[j];
+            if (!strcmp(o->id, id)) continue;
+            struct ydoc *om = pm_manifest(o->id);
+            if (!om) continue;
+            int hit = links_has(links_of(ydoc_root(om)), path);
+            ydoc_free(om);
+            if (hit) return pm_errf(e, "путь %s уже занят плагином %s из %s", path, o->id, o->repo ? o->repo : "файла");
+        }
+        if (!strcmp(mode, "conf")) continue;           /* стоящий файл настроек остаётся как есть */
+        char *full = pm_fmt("%s%s", pm_sysroot(), path);
+        struct stat ls;
+        int busy = lstat(full, &ls) == 0 && !(S_ISLNK(ls.st_mode) && link_ours(full, id));
+        free(full);
+        if (busy) {
+            char *own = pkg_owner(path);
+            if (own) pm_errf(e, "%s не встаёт: %s принадлежит пакету %s", id, path, own);
+            else pm_errf(e, "%s не встаёт: %s уже есть, и поставил его не менеджер плагинов", id, path);
+            free(own);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Привести ссылки плагина id к манифесту want: убрать те из drop, которых в want нет (только свои ссылки; копии
+ * conf — только с purge), поставить недостающие из want. want NULL — снять всё. */
+static int links_apply(const char *id, const struct ynode *want, const struct ynode *drop, int purge, struct pm_err *e) {
+    const struct ynode *wl = links_of(want), *dl = links_of(drop);
+    for (size_t i = 0; i < ynode_len(dl); i++) {
+        const struct ynode *l = ynode_at(dl, i);
+        const char *path = yn_str(l, "path");
+        if (!path || links_has(wl, path)) continue;
+        char *full = pm_fmt("%s%s", pm_sysroot(), path);
+        if (!strcmp(link_mode(l), "conf")) { if (purge) unlink(full); }
+        else if (link_ours(full, id)) unlink(full);
+        free(full);
+    }
+    int rc = 0;
+    for (size_t i = 0; i < ynode_len(wl); i++) {
+        const struct ynode *l = ynode_at(wl, i);
+        const char *path = yn_str(l, "path"), *target = yn_str(l, "target");
+        if (!path || !target) continue;
+        char *full = pm_fmt("%s%s", pm_sysroot(), path);
+        char *src = pm_fmt("%s/%s/%s", pm_root(), id, target);
+        char *parent = pm_strdup(full);
+        char *sl = strrchr(parent, '/');
+        if (sl && sl != parent) { *sl = '\0'; pm_mkdirs(parent); }
+        free(parent);
+        if (!strcmp(link_mode(l), "conf")) {
+            struct stat st;
+            if (lstat(full, &st) != 0) {
+                size_t n = 0;
+                char *d = pm_read(src, &n);
+                struct stat ss;
+                unsigned mode = stat(src, &ss) == 0 && (ss.st_mode & 0111) ? 0755 : 0644;
+                if (!d || pm_write_atomic(full, d, n, mode) != 0) rc = pm_errf(e, "не записать %s: %s", path, strerror(errno));
+                free(d);
+            }
+        } else {
+            char buf[4096];
+            ssize_t r = readlink(full, buf, sizeof(buf) - 1);
+            if (r >= 0) buf[r] = '\0';
+            if (r < 0 || strcmp(buf, src)) {
+                struct stat st;
+                if (lstat(full, &st) == 0 && !(S_ISLNK(st.st_mode) && link_ours(full, id))) {
+                    rc = pm_errf(e, "%s уже есть, и поставил его не менеджер плагинов", path);
+                } else {
+                    char *tmp = pm_fmt("%s.steer-plugin.%d", full, (int)getpid());
+                    unlink(tmp);
+                    if (symlink(src, tmp) != 0 || rename(tmp, full) != 0) {
+                        rc = pm_errf(e, "не поставить ссылку %s: %s", path, strerror(errno));
+                        unlink(tmp);
+                    }
+                    free(tmp);
+                }
+            }
+        }
+        free(full);
+        free(src);
+    }
+    return rc;
+}
+
+int pm_links_repair(struct pm_ctx *x, const char *id, struct pm_err *e) {
+    struct ydoc *m = pm_manifest(id);
+    if (!m) return 0;
+    char *dir = pm_path(pm_root(), id);
+    int rc = links_validate(x, id, ydoc_root(m), dir, e);
+    if (rc == 0) rc = links_apply(id, ydoc_root(m), NULL, 0, e);
+    free(dir);
+    ydoc_free(m);
+    return rc;
 }
 
 /* ---- одна установка ---- */
@@ -978,9 +1206,18 @@ static void undo_clear(struct pm_ctx *x) {
 
 /* Откат одной установки: файлы из .prev, состояние из снимка (нет прежнего — запись убирается). */
 static void undo_apply(struct pm_ctx *x, struct undo *u, const char *why) {
+    struct ydoc *nm = pm_manifest(u->id);
     pm_rmrf(u->dir);
     int restored = 0;
     if (u->had_dir && rename(u->prev, u->dir) == 0) restored = 1;
+    {
+        /* Ссылки (steer.links) — к восстановленной версии. */
+        struct ydoc *rd = restored ? pm_manifest(u->id) : NULL;
+        struct pm_err le = {{0}};
+        links_apply(u->id, rd ? ydoc_root(rd) : NULL, nm ? ydoc_root(nm) : NULL, 0, &le);
+        if (rd) ydoc_free(rd);
+        if (nm) ydoc_free(nm);
+    }
     struct pm_inst *inst = pm_state_find(&x->st, u->id);
     char *bad_why = restored ? pm_fmt("%s — возвращена %s", why, u->old_ver ? u->old_ver : "прежняя") : pm_strdup(why);
     if (restored && inst) {
@@ -1145,6 +1382,7 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         }
     }
     if (manifest_checks(x, id, m, official, repo, e) != 0) goto out_stage;
+    if (links_validate(x, id, m, stage, e) != 0) goto out_stage;
     if (system_deps(x, id, m, &sys, &nsys, e) != 0) goto out_stage;
     if (run_script(id, stage, m, "postinst", "--check", e) != 0) goto out_stage;
 
@@ -1216,8 +1454,18 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     }
     struct pm_err he = {{0}};
     int healthy = 1;
+    /* Ссылки в системе (steer.links) — до скриптов: postinst видит плагин на своих путях. Прежняя версия лежит
+     * в .prev: её ссылки, которых в новой нет, снимаются. */
+    {
+        char *pp = pm_path(prev, "plugin.json");
+        struct pm_err le = {{0}};
+        struct ydoc *pd = had_dir ? pm_json_load(pp, &le) : NULL;
+        free(pp);
+        if (links_apply(id, m, pd ? ydoc_root(pd) : NULL, 0, &he) != 0) healthy = 0;
+        if (pd) ydoc_free(pd);
+    }
     /* Скрипты: migrate при смене major, затем postinst <старая>. */
-    if (old_ver && pm_ver_major(old_ver) != pm_ver_major(mver) &&
+    if (healthy && old_ver && pm_ver_major(old_ver) != pm_ver_major(mver) &&
         run_script(id, dir, m, "migrate", old_ver, &he) != 0) healthy = 0;
     if (healthy && run_script(id, dir, m, "postinst", old_ver ? old_ver : "", &he) != 0) healthy = 0;
     struct pm_err se = {{0}};
@@ -1253,6 +1501,13 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         pm_rmrf(dir);
         int restored = 0;
         if (had_dir && rename(prev, dir) == 0) restored = 1;
+        {
+            /* Ссылки — к восстановленной версии; новые пути без неё снимаются. */
+            struct ydoc *rd = restored ? pm_manifest(id) : NULL;
+            struct pm_err le = {{0}};
+            links_apply(id, rd ? ydoc_root(rd) : NULL, m, 0, &le);
+            if (rd) ydoc_free(rd);
+        }
         inst = pm_state_find(&x->st, id);
         char *bad_why = restored ? pm_fmt("%s — возвращена %s", he.msg, old_ver ? old_ver : "прежняя")
                                  : pm_strdup(he.msg);
@@ -1520,6 +1775,8 @@ int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_
     if (m) {
         struct pm_err pe = {{0}};
         if (run_script(id, dir, m, "prerm", "", &pe) != 0) pm_progress(x, "%s", pe.msg);
+        /* Ссылки в системе — вместе с плагином; копии настроек (mode: conf) — только с --purge. */
+        if (links_apply(id, NULL, m, purge, &pe) != 0) pm_progress(x, "%s", pe.msg);
     }
     if (man) ydoc_free(man);
     if (pm_rmrf(dir) != 0) { pm_errf(e, "не удалить %s: %s", dir, strerror(errno)); free(dir); free(verc); return -1; }

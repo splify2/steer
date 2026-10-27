@@ -154,7 +154,7 @@ export STEER_PLUGIN_AUTO=0
 P() { "$BIN" plugin "$@"; }
 
 # ---- версия ядра для оси compat ----
-check "steer version --json: core, api, abi" "2.1.0 1.2 1.0" \
+check "steer version --json: core, api, abi" "2.1.0 1.3 1.0" \
     "$("$BIN" version --json | jq_ 'd["core"]+" "+d["api"]+" "+d["abi"]')"
 
 # ---- каталог ----
@@ -191,7 +191,7 @@ o="$(P install neu --json 2>/dev/null)"
 check "install neu: взята совместимая 1.0.0 (2.0.0 требует steer-api ^9)" "1.0.0" "$(printf '%s\n' "$o" | jq_ 'd["version"]')"
 o="$(P install neu 2.0.0 --json 2>/dev/null)"; rc=$?
 check "install neu 2.0.0: отказ" "1" "$rc"
-has "  причина с числами" "требует steer-api ^9.0, у ядра 1.2" "$o"
+has "  причина с числами" "требует steer-api ^9.0, у ядра 1.3" "$o"
 
 # ---- место ----
 o="$(STEER_PLUGIN_FREE=1000 P install big --json 2>/dev/null)"; rc=$?
@@ -338,6 +338,90 @@ check "  записан в system_ours и system плагина" "kmod-test kmod
 o="$(P install kern --json 2>/dev/null)"; rc=$?
 check "requires.kernel: пути нет — отказ" "1" "$rc"
 has "  называет путь" "нет /nonexistent/steer-test-path" "$o"
+
+# ---- steer.links (steer-api 1.3): пути в системе, которые ведёт менеджер ----
+# Корень путей — STEER_PLUGIN_SYSROOT; владелец пути в базе пакетов — STEER_PLUGIN_PKG owner.
+export STEER_PLUGIN_SYSROOT="$T/sys"
+mkdir -p sys/usr/bin
+python3 - meta.json <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for i in ("ln", "lnbad", "lnocc", "lndup", "lnsys"): d["plugins"][i] = {"key_role": "plugins"}
+json.dump(d, open(sys.argv[1], "w"))
+PY
+LNF='"steer":{"links":[{"path":"/usr/bin/lnprog","target":"bin/ln"},{"path":"/etc/config/lnconf","target":"defaults/lnconf","mode":"conf"}]},"permissions":["fs:/usr/bin/lnprog","fs:/etc/config/lnconf"]'
+mkln() {  # ВЕРСИЯ ДОП_ПОЛЯ [postinst-код]
+    mk ln "$1" ",$2" ${3:-}
+    mkdir -p "src/ln-$1/defaults"; echo "option x default" > "src/ln-$1/defaults/lnconf"
+    [ -f "src/ln-$1/bin/lnextra" ] || cp "src/ln-$1/bin/ln" "src/ln-$1/bin/lnextra"
+    build "src/ln-$1" plg.sec
+}
+mkln 1.0.0 "$LNF"
+mk lnbad 1.0.0 ',"steer":{"links":[{"path":"/usr/bin/lnbad","target":"bin/lnbad"}]}'
+mk lnocc 1.0.0 ',"steer":{"links":[{"path":"/usr/bin/occ","target":"bin/lnocc"}]},"permissions":["fs:/usr/bin/occ"]'
+mk lndup 1.0.0 ',"steer":{"links":[{"path":"/usr/bin/lnprog","target":"bin/lndup"}]},"permissions":["fs:/usr/bin/lnprog"]'
+mk lnsys 1.0.0 ',"requires":{"system":["standin-pkg"]},"permissions":["system-packages"]'
+for p in lnbad lnocc lndup lnsys; do build "src/$p-1.0.0" plg.sec; done
+index
+P search --json >/dev/null 2>&1
+o="$(P install ln --json 2>err.txt)"; rc=$?
+check "links: install ln" "0" "$rc"
+check "  ссылка ведёт в каталог плагина" "$T/root/ln/bin/ln" "$(readlink sys/usr/bin/lnprog)"
+check "  программа запускается по системному пути" "ln 1.0.0" "$(sys/usr/bin/lnprog)"
+check "  копия настроек (mode: conf) на месте" "option x default" "$(cat sys/etc/config/lnconf)"
+has "  копия настроек — в keep.d" "/etc/config/lnconf" "$(cat keepd)"
+echo "option x mine" > sys/etc/config/lnconf
+mkln 1.1.0 "$LNF"
+index
+P search --json >/dev/null 2>&1
+o="$(P update ln --json 2>/dev/null)"; rc=$?
+check "links: обновление ln 1.1.0" "0 ln 1.1.0" "$rc $(sys/usr/bin/lnprog)"
+check "  правленые настройки не перезаписаны" "option x mine" "$(cat sys/etc/config/lnconf)"
+# 1.2.0 добавляет путь и падает в postinst: откат возвращает 1.1.0, новый путь снят, прежний цел.
+mkln 1.2.0 '"steer":{"links":[{"path":"/usr/bin/lnprog","target":"bin/ln"},{"path":"/usr/bin/lnextra","target":"bin/lnextra"},{"path":"/etc/config/lnconf","target":"defaults/lnconf","mode":"conf"}]},"permissions":["fs:/usr/bin/","fs:/etc/config/lnconf"],"scripts":{"postinst":"scripts/postinst"}' 3
+index
+P search --json >/dev/null 2>&1
+o="$(P update ln --json 2>/dev/null)"; rc=$?
+check "links: обновление с упавшим postinst — откат" "1 ln 1.1.0" "$rc $(sys/usr/bin/lnprog)"
+has "  откат — по postinst, а не по проверке манифеста" "возвращена прежняя версия" "$o"
+check "  путь новой версии снят при откате" "no" "$([ -e sys/usr/bin/lnextra ] || [ -L sys/usr/bin/lnextra ] && echo yes || echo no)"
+o="$(P install lnbad --json 2>/dev/null)"; rc=$?
+check "links: путь без права fs: — отказ" "1" "$rc"
+has "  причина" "ссылка /usr/bin/lnbad без права fs:" "$o"
+o="$(P install lndup --json 2>/dev/null)"; rc=$?
+check "links: путь чужого плагина — отказ" "1" "$rc"
+has "  называет плагин" "путь /usr/bin/lnprog уже занят плагином ln" "$o"
+echo real > sys/usr/bin/occ
+cat > pkgo.sh <<E
+#!/bin/sh
+case "\$1" in
+owner) [ "\$2" = /usr/bin/occ ] && echo real-pkg ;;
+installed) false ;;
+*) exit 1 ;;
+esac
+E
+chmod 755 pkgo.sh
+o="$(STEER_PLUGIN_PKG="$T/pkgo.sh" P install lnocc --json 2>/dev/null)"; rc=$?
+check "links: путь занят файлом пакета — отказ" "1" "$rc"
+has "  называет пакет" "/usr/bin/occ принадлежит пакету real-pkg" "$o"
+check "  чужой файл цел" "real" "$(cat sys/usr/bin/occ)"
+rm -f sys/usr/bin/lnprog
+o="$(P ensure ln --json 2>/dev/null)"; rc=$?
+check "links: ensure стоящего плагина возвращает убранную ссылку" "0 ln 1.1.0" "$rc $(sys/usr/bin/lnprog)"
+o="$(P remove ln --json 2>/dev/null)"; rc=$?
+check "links: снятие убирает ссылку, настройки остаются" "0 no option x mine" \
+    "$rc $([ -L sys/usr/bin/lnprog ] && echo yes || echo no) $(cat sys/etc/config/lnconf)"
+P install ln 1.1.0 --json >/dev/null 2>&1
+P remove ln --purge --json >/dev/null 2>&1
+check "  --purge убирает и копию настроек" "no" "$([ -e sys/etc/config/lnconf ] && echo yes || echo no)"
+# requires.system изнутри транзакции пакета (скрипт пакета standin-pkg зовёт ensure --pkg standin-pkg):
+# пакета ещё нет в базе, и звать apk нельзя — пакет считается стоящим.
+o="$(STEER_PLUGIN_PKG="$T/pkgo.sh" P install lnsys --json 2>/dev/null)"; rc=$?
+check "requires.system: пакета нет, поставить нечем — отказ" "1" "$rc"
+o="$(STEER_PLUGIN_PKG="$T/pkgo.sh" P ensure lnsys --pkg standin-pkg --json 2>/dev/null)"; rc=$?
+check "  --pkg standin-pkg: пакет этой транзакции считается стоящим" "0" "$rc"
+P remove lnsys --json >/dev/null 2>&1
+unset STEER_PLUGIN_SYSROOT
 
 # ---- busy ----
 python3 - "$T/root/.lock" > lock.ready <<'PY' &
