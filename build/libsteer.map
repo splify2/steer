@@ -161,6 +161,8 @@ LIBSTEER_1 {
     plugin_cmd_exec;
     plugin_cmd_find;
     plugin_conf_write;
+    plugin_env_set;
+    plugin_find;
     plugin_kind_ops_at;
     plugin_kinds_n;
     plugin_n;
@@ -169,6 +171,9 @@ LIBSTEER_1 {
     plugin_owner_status;
     plugin_refresh;
     plugin_reload;
+    plugin_svc_at;
+    plugin_svc_helper;
+    plugin_svc_n;
     plugso_http_get;
     probe_mem_escape;
     probe_read;
