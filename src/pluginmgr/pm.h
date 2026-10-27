@@ -135,6 +135,7 @@ struct pm_inst *pm_state_add(struct pm_state *s, const char *id);
 void pm_state_del(struct pm_state *s, const char *id);
 const char *pm_bad_why(const struct pm_inst *p, const char *ver);
 void pm_bad_set(struct pm_inst *p, const char *ver, const char *why);
+size_t pm_bad_clear_reload(struct pm_state *s);
 void pm_sys_ours_add(struct pm_state *s, const char *pkg);
 void pm_inst_set(char **field, const char *v);
 

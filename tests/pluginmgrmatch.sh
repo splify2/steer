@@ -466,6 +466,17 @@ check "migrate: версия семени выше стоящей — обнов
 check "  на месте 1.3.0" "1.3.0" "$(jq_ 'd["version"]' < root/net1/plugin.json)"
 o="$(STEER_SPEC="$T/mspec.yaml" P migrate --json 2>/dev/null)"
 check "migrate: версия та же — ничего не обновляет" "[]" "$(printf '%s\n' "$o" | jq_ 'str(d["installed"])')"
+# Пометка «ядро не перечитало плагины» (прежнее поведение метило версию и при ошибке, бывшей до установки) снимается при
+# переходе на новое ядро; прочие пометки остаются.
+python3 - etc/state.json <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["plugins"]["foo"]["bad_versions"] = {"9.9.9": "ядро не перечитало плагины: spec.yaml:3: outputs.w: нужен reload", "9.9.8": "postinst вернул 3"}
+json.dump(d, open(sys.argv[1], "w"))
+PY
+STEER_SPEC="$T/mspec.yaml" P migrate --json >/dev/null 2>&1
+check "migrate: пометка с ошибкой перечитывания снята, чужая осталась" "['9.9.8']" \
+    "$(jq_ 'str(sorted(d["plugins"]["foo"].get("bad_versions", {})))' < etc/state.json)"
 rm -f etc/migrate.done.json
 printf 'X' | dd of=seed/foo-1.3.0-all.s2p bs=1 seek=200 conv=notrunc 2>/dev/null
 P remove foo --force --json >/dev/null 2>&1
@@ -484,6 +495,8 @@ if [ "${PM_INNER:-}" = 1 ]; then
 import json, sys
 d = json.load(open(sys.argv[1])); d["auto"] = {"next": "2000-01-01T00:00:00Z"}; json.dump(d, open(sys.argv[1], "w"))
 PY
+    # Демон читает плагины по своим переменным (реестр ядра): те же каталоги, что у менеджера.
+    export STEER_PLUGINS_ROOT="$T/root" STEER_PLUGINS_ETC="$T/etc"
     STEER_PLUGIN_AUTO=1 "$BIN" daemon --socket "$T/s.sock" --spec "$T/dspec.yaml" --state-dir "$T/st" 2>d.err &
     D=$!
     i=0; while [ ! -S s.sock ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
@@ -542,6 +555,27 @@ PY
     check "здоровье: установка ухудшила (перечитывание теперь не удаётся) — откат" "1 1.5.1" "$rc $(jq_ 'd["plugins"]["foo"]["version"]' < etc/state.json)"
     printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > dspec.yaml
     P enable foo --json >/dev/null 2>&1
+    # Плагин с хуком expand, которого требует спека: установка перечитывает плагины и заново готовит спеку
+    # (а не требует reload), проверка здоровья проходит, выход разворачивается.
+    mk xpw 1.0.0 ',"permissions":["spec.transform"],"steer":{"kinds":[{"name":"xpw","caps":["mark"],"resources":{"ports":1},"expand":{"prog":"bin/expand","argv":["{out}"]}}]}'
+    printf '#!/bin/sh\ncat >/dev/null\nn="$1"\nprintf %s "{\\"self\\":{\\"kind\\":\\"group\\",\\"pick\\":\\"order\\",\\"members\\":[\\"$n.1\\"],\\"on_fail\\":\\"drop\\"},\\"outputs\\":{\\"$n.1\\":{\\"kind\\":\\"interface\\",\\"device\\":\\"lo\\"}},\\"helper\\":true}"\n' "'%s\\n'" > src/xpw-1.0.0/bin/expand
+    printf '#!/bin/sh\nexit 0\n' > src/xpw-1.0.0/bin/xpwh
+    chmod 755 src/xpw-1.0.0/bin/expand src/xpw-1.0.0/bin/xpwh
+    "$S2P" build src/xpw-1.0.0 --unsigned -o udist >/dev/null 2>&1
+    # Старая версия того же плагина — без хука expand (так стоял warpbox до 2.1.0).
+    mk xpw 0.9.0 ',"steer":{"kinds":[{"name":"xpw","caps":["mark"]}]}'
+    "$S2P" build src/xpw-0.9.0 --unsigned -o udist >/dev/null 2>&1
+    P install --file udist/xpw-0.9.0-all.s2p --unsigned --json >/dev/null 2>&1
+    printf 'version: 2\noutputs:\n  w1: { kind: xpw }\n' > dspec.yaml
+    "$BIN" ctl --socket "$T/s.sock" plugin-reload >/dev/null 2>&1
+    o="$(P install --file udist/xpw-1.0.0-all.s2p --unsigned --json 2>err.txt)"; rc=$?
+    check "плагин с expand, которого требует спека: установка проходит" "0" "$rc"
+    o="$("$BIN" ctl --socket "$T/s.sock" status)"
+    check "  выход развёрнут: подготовленная спека, группа с членом" "group lo" \
+        "$(printf '%s\n' "$o" | jq_ 'json.loads(d["stdout"])["outputs"]["w1"]["kind"]+" "+json.loads(d["stdout"])["outputs"]["w1"]["device"]')"
+    P remove xpw --force --json >/dev/null 2>&1
+    printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > dspec.yaml
+    "$BIN" ctl --socket "$T/s.sock" plugin-reload >/dev/null 2>&1
     # Обновление из семени группой (migrate): новая версия net1 и foo встают вместе, проверка здоровья одна на группу;
     # не прошла — откатываются обе.
     P remove foo --force --json >/dev/null 2>&1

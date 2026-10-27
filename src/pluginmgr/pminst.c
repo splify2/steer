@@ -149,7 +149,7 @@ static int run_script(const char *id, const char *dir, const struct ynode *man, 
 
 /* ---- демон ---- */
 
-int pm_daemon_reload(struct pm_ctx *x, struct pm_err *e) {
+static int reload_once(struct pm_ctx *x, struct pm_err *e) {
     if (x->no_daemon) return 0;
     ctlcall_socket(NULL);
     char *r = ctlcall_roundtrip("plugin-reload\n", NULL, 0, 300);
@@ -170,6 +170,18 @@ int pm_daemon_reload(struct pm_ctx *x, struct pm_err *e) {
     }
     ctlcall_resp_free(&rp);
     return 0;
+}
+
+/* plugin-reload. Отказ «нужен reload» — подготовка спеки не поспела за сменой плагинов (кэш подготовленной
+ * спеки ключуется версиями и манифестами, и первая подготовка могла упереться в то, что ещё не лежало на
+ * диске): перечитывание повторяется один раз, а не оставляется человеку. */
+int pm_daemon_reload(struct pm_ctx *x, struct pm_err *e) {
+    if (reload_once(x, e) == 0) return 0;
+    if (!strstr(e->msg, "нужен reload")) return -1;
+    struct pm_err again = {{0}};
+    if (reload_once(x, &again) == 0) return 0;
+    *e = again;
+    return -1;
 }
 
 void pm_event(struct pm_ctx *x, const char *id, const char *state, const char *version, const char *from,

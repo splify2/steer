@@ -198,6 +198,27 @@ void pm_bad_set(struct pm_inst *p, const char *ver, const char *why) {
     p->nbad++;
 }
 
+/* Пометки «не прошла проверку здоровья» с ошибкой перечитывания плагинов ядром снимаются: прежнее
+ * поведение метило версию и тогда, когда ошибка была и до установки (спека сломана чем-то другим), и
+ * версия застревала. Зовётся при переходе на новое ядро (migrate). Возвращает, сколько снято. */
+size_t pm_bad_clear_reload(struct pm_state *s) {
+    size_t gone = 0;
+    for (size_t i = 0; i < s->n; i++) {
+        struct pm_inst *p = &s->v[i];
+        size_t k = 0;
+        for (size_t j = 0; j < p->nbad; j++) {
+            if (p->bad[j].why && strstr(p->bad[j].why, "ядро не перечитало плагины")) {
+                free(p->bad[j].ver); free(p->bad[j].why);
+                gone++;
+                continue;
+            }
+            p->bad[k++] = p->bad[j];
+        }
+        p->nbad = k;
+    }
+    return gone;
+}
+
 void pm_sys_ours_add(struct pm_state *s, const char *pkg) {
     for (size_t j = 0; j < s->nsys; j++)
         if (!strcmp(s->system_ours[j], pkg)) return;
