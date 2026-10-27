@@ -894,7 +894,7 @@ static int system_deps(struct pm_ctx *x, const char *id, const struct ynode *man
         if (!have && firstp && x->pkg_tx) {
             /* Изнутри транзакции apk/opkg база заперта: поставить пакет нельзя. */
             free(copy);
-            return pm_errf(e, "%s не встаёт: нужен пакет %s — поставьте его после установки %s", id, firstp, x->pkg_tx);
+            return pm_errc(e, "plugin.needs_package_after", PMA("id", id, "pkg", firstp, "tx", x->pkg_tx), "%s не встаёт: нужен пакет %s — поставьте его после установки %s", id, firstp, x->pkg_tx);
         }
         if (!have && firstp) {
             pm_progress(x, "пакет %s для %s", firstp, id);
@@ -1052,19 +1052,19 @@ static int links_validate(struct pm_ctx *x, const char *id, const struct ynode *
         const struct ynode *l = ynode_at(links, i);
         const char *path = yn_str(l, "path"), *target = yn_str(l, "target"), *mode = link_mode(l);
         if (!path || path[0] != '/' || strstr(path, "..") || strlen(path) < 2 || path[strlen(path) - 1] == '/')
-            return pm_errf(e, "%s: путь ссылки «%s» не абсолютный путь файла", id, path ? path : "");
+            return pm_errc(e, "plugin.link_path", PMA("id", id, "path", path ? path : ""), "%s: путь ссылки «%s» не абсолютный путь файла", id, path ? path : "");
         if (!target || target[0] == '/' || strstr(target, ".."))
-            return pm_errf(e, "%s: цель ссылки %s вне каталога плагина", id, path);
-        if (strcmp(mode, "link") && strcmp(mode, "conf")) return pm_errf(e, "%s: ссылка %s — неизвестный mode «%s»", id, path, mode);
+            return pm_errc(e, "plugin.link_target_outside", PMA("id", id, "path", path), "%s: цель ссылки %s вне каталога плагина", id, path);
+        if (strcmp(mode, "link") && strcmp(mode, "conf")) return pm_errc(e, "plugin.link_mode", PMA("id", id, "path", path, "mode", mode), "%s: ссылка %s — неизвестный mode «%s»", id, path, mode);
         if (!strncmp(path, "/usr/lib/steer/", 15) || !strncmp(path, "/etc/steer/", 11) || !strncmp(path, "/usr/sbin/steer", 15) ||
             !strcmp(path, "/etc/init.d/steer"))
-            return pm_errf(e, "%s: ссылка %s — путь ядра steer, плагину его не дать", id, path);
-        if (!fs_allowed(man, path)) return pm_errf(e, "%s: ссылка %s без права fs:", id, path);
+            return pm_errc(e, "plugin.link_core_path", PMA("id", id, "path", path), "%s: ссылка %s — путь ядра steer, плагину его не дать", id, path);
+        if (!fs_allowed(man, path)) return pm_errc(e, "plugin.link_perm", PMA("id", id, "path", path), "%s: ссылка %s без права fs:", id, path);
         char *src = pm_path(base, target);
         struct stat st;
         int okf = stat(src, &st) == 0 && S_ISREG(st.st_mode);
         free(src);
-        if (!okf) return pm_errf(e, "%s: цели ссылки %s (%s) нет в плагине", id, path, target);
+        if (!okf) return pm_errc(e, "plugin.link_target_missing", PMA("id", id, "path", path, "target", target), "%s: цели ссылки %s (%s) нет в плагине", id, path, target);
         for (size_t j = 0; j < x->st.n; j++) {
             const struct pm_inst *o = &x->st.v[j];
             if (!strcmp(o->id, id)) continue;
@@ -1072,7 +1072,7 @@ static int links_validate(struct pm_ctx *x, const char *id, const struct ynode *
             if (!om) continue;
             int hit = links_has(links_of(ydoc_root(om)), path);
             ydoc_free(om);
-            if (hit) return pm_errf(e, "путь %s уже занят плагином %s из %s", path, o->id, o->repo ? o->repo : "файла");
+            if (hit) return pm_errc(e, "plugin.link_taken", PMA("path", path, "other", o->id, "repo", o->repo ? o->repo : "файла"), "путь %s уже занят плагином %s из %s", path, o->id, o->repo ? o->repo : "файла");
         }
         if (!strcmp(mode, "conf")) continue;           /* стоящий файл настроек остаётся как есть */
         char *full = pm_fmt("%s%s", pm_sysroot(), path);
@@ -1081,8 +1081,8 @@ static int links_validate(struct pm_ctx *x, const char *id, const struct ynode *
         free(full);
         if (busy) {
             char *own = pkg_owner(path);
-            if (own) pm_errf(e, "%s не встаёт: %s принадлежит пакету %s", id, path, own);
-            else pm_errf(e, "%s не встаёт: %s уже есть, и поставил его не менеджер плагинов", id, path);
+            if (own) pm_errc(e, "plugin.link_owned_by_package", PMA("id", id, "path", path, "pkg", own), "%s не встаёт: %s принадлежит пакету %s", id, path, own);
+            else pm_errc(e, "plugin.link_busy", PMA("id", id, "path", path), "%s не встаёт: %s уже есть, и поставил его не менеджер плагинов", id, path);
             free(own);
             return -1;
         }
@@ -1121,7 +1121,7 @@ static int links_apply(const char *id, const struct ynode *want, const struct yn
                 char *d = pm_read(src, &n);
                 struct stat ss;
                 unsigned mode = stat(src, &ss) == 0 && (ss.st_mode & 0111) ? 0755 : 0644;
-                if (!d || pm_write_atomic(full, d, n, mode) != 0) rc = pm_errf(e, "не записать %s: %s", path, strerror(errno));
+                if (!d || pm_write_atomic(full, d, n, mode) != 0) rc = pm_errc(e, "plugin.link_write", PMA("path", path, "why", strerror(errno)), "не записать %s: %s", path, strerror(errno));
                 free(d);
             }
         } else {
@@ -1131,12 +1131,12 @@ static int links_apply(const char *id, const struct ynode *want, const struct yn
             if (r < 0 || strcmp(buf, src)) {
                 struct stat st;
                 if (lstat(full, &st) == 0 && !(S_ISLNK(st.st_mode) && link_ours(full, id))) {
-                    rc = pm_errf(e, "%s уже есть, и поставил его не менеджер плагинов", path);
+                    rc = pm_errc(e, "plugin.link_exists", PMA("path", path), "%s уже есть, и поставил его не менеджер плагинов", path);
                 } else {
                     char *tmp = pm_fmt("%s.steer-plugin.%d", full, (int)getpid());
                     unlink(tmp);
                     if (symlink(src, tmp) != 0 || rename(tmp, full) != 0) {
-                        rc = pm_errf(e, "не поставить ссылку %s: %s", path, strerror(errno));
+                        rc = pm_errc(e, "plugin.link_create", PMA("path", path, "why", strerror(errno)), "не поставить ссылку %s: %s", path, strerror(errno));
                         unlink(tmp);
                     }
                     free(tmp);

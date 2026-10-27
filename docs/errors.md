@@ -357,6 +357,18 @@
 | `plugin.key_revoked` | — | этот ключ отозван |
 | `plugin.key_unreadable` | — | ключ не распознан |
 | `plugin.key_write_failed` | — | не записать ключ |
+| `plugin.link_busy` | `id`, `path` | {id} не встаёт: {path} уже есть, и поставил его не менеджер плагинов |
+| `plugin.link_core_path` | `id`, `path` | {id}: ссылка {path} — путь ядра steer, плагину его не дать |
+| `plugin.link_create` | `path`, `why` | не поставить ссылку {path}: {why} |
+| `plugin.link_exists` | `path` | {path} уже есть, и поставил его не менеджер плагинов |
+| `plugin.link_mode` | `id`, `path`, `mode` | {id}: ссылка {path} — неизвестный mode «{mode}» |
+| `plugin.link_owned_by_package` | `id`, `path`, `pkg` | {id} не встаёт: {path} принадлежит пакету {pkg} |
+| `plugin.link_path` | `id`, `path` | {id}: путь ссылки «{path}» не абсолютный путь файла |
+| `plugin.link_perm` | `id`, `path` | {id}: ссылка {path} без права fs: |
+| `plugin.link_taken` | `path`, `other`, `repo` | путь {path} уже занят плагином {other} из {repo} |
+| `plugin.link_target_missing` | `id`, `path`, `target` | {id}: цели ссылки {path} ({target}) нет в плагине |
+| `plugin.link_target_outside` | `id`, `path` | {id}: цель ссылки {path} вне каталога плагина |
+| `plugin.link_write` | `path`, `why` | не записать {path}: {why} |
 | `plugin.manifest_file_twice` | `id`, `path` | MANIFEST {id}: файл {path} назван дважды |
 | `plugin.manifest_header` | `id` | MANIFEST {id}: заголовок не «s2p 1 <id> <версия> <арх>» |
 | `plugin.manifest_line` | `id`, `line` | MANIFEST {id}: строка не разбирается: {line} |
@@ -370,6 +382,7 @@
 | `plugin.name_taken_service_file` | `name`, `owner` | служба {name} уже есть у {owner} из файла |
 | `plugin.needed_by_outputs` | `id`, `outputs` | плагин {id} нужен выходам: {outputs}; снять всё равно — с --force |
 | `plugin.needed_by_plugins` | `id`, `users` | плагин {id} нужен плагинам {users}; снять всё равно — с --force |
+| `plugin.needs_package_after` | `id`, `pkg`, `tx` | {id} не встаёт: нужен пакет {pkg} — поставьте его после установки {tx} |
 | `plugin.needs_plugin` | `id`, `dep`, `range` | {id} требует плагин {dep} {range} — поставьте его |
 | `plugin.net_and_seed` | `net`, `seed` | {net}; из семени: {seed} |
 | `plugin.no_archive_url` | `id`, `version` | у архива {id} {version} в индексе нет адреса |
