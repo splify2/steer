@@ -40,6 +40,9 @@ cleanup() {
     [ -n "$tmp" ] && rm -rf "$tmp"
 }
 trap cleanup EXIT
+# Выход без IPv6 в фикстурах — мост Telegram (kind: tgws), вид плагина tgws: каталог плагинов дерева.
+sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" >/dev/null || { echo "v6ns: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else

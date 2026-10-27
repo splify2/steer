@@ -1,5 +1,5 @@
 /* Экспорт libsteer.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится.
- * Символы, которые steerd и модуль ядра steer-tgws берут
+ * Символы, которые steerd берёт
  * из библиотеки, и программный интерфейс QUIC (qc_*), который берёт стенд QUIC_STAND_SRC, пока
  * настоящих потребителей нет; остальное скрыто (local: *). Проверка: check. */
 LIBSTEER_1 {
@@ -45,11 +45,8 @@ LIBSTEER_1 {
     dupq_timeout_ms;
     err_die;
     err_set;
-    evline_emit;
     evline_free;
-    evline_hello;
     evline_int;
-    evline_open;
     evline_parse;
     evline_str;
     fakeip6_of;
@@ -150,9 +147,7 @@ LIBSTEER_1 {
     out_kind_name;
     out_member;
     out_members_n;
-    out_tgws;
     plat;
-    plat_etc_path;
     plat_names;
     plat_select;
     plat_spec_default;
@@ -201,9 +196,6 @@ LIBSTEER_1 {
     rtnl_table_flush;
     run;
     run_quiet;
-    sc_aesctr_free;
-    sc_aesctr_init;
-    sc_aesctr_xor;
     sc_hash_final;
     sc_hash_free;
     sc_hash_init;
@@ -233,20 +225,13 @@ LIBSTEER_1 {
     srs_skipped;
     srs_sniff;
     srs_walk;
-    steer_cmd_module;
     steer_engine_version;
     steer_keep_dir;
-    steer_module_dir;
-    steer_module_is;
-    steer_module_path;
     steer_set_keep_dir_of;
     steer_set_state_dir;
     steer_state_dir;
     steer_tmp_template;
-    tgws_instances;
-    tls12_handshake;
     tls13_free;
-    tls13_handshake;
     tls13_handshake_auth;
     tls13_has_record;
     tls13_read;
@@ -254,11 +239,8 @@ LIBSTEER_1 {
     tls13_write;
     tls_cert_roots;
     untar_gz_file;
-    urltest_reader_only;
     urltest_url_parse;
     v2_schema_print;
-    xc_random;
-    xc_x25519_keypair;
     ydoc_free;
     ydoc_parse_buf;
     ydoc_root;

@@ -404,7 +404,6 @@ static const struct { const char *name, *hint; } KIND_HINT[] = {
     { "block", "Блок: трафик правила не пропускается." },
     { "interface", "Устройство системы: WireGuard, PPPoE и другие." },
     { "awg", "AmneziaWG: устройство заводит ядро." },
-    { "tgws", "Мост Telegram." },
     { "group", "Группа выходов: выбор члена по порядку, задержке, вручную или балансом." },
 };
 
@@ -425,7 +424,6 @@ static void spec_names(const char *kname, const char **kind, const char **proto)
  * видом, он скажет, какой ключ принят вопреки схеме или отвергнут вопреки ей. */
 static const struct { const char *variant, *key, *en; int required; } KIND_RULE[] = {
     { "interface", "device", NULL, 1 },         /* kind interface needs a device */
-    { "tgws", "on_fail", "drop", 0 },           /* у tgws on_fail только drop */
 };
 
 /* Пример записи вида: обязательные ключи с их примерами — годная запись, с которой начинает форма

@@ -1,0 +1,6 @@
+{
+  "plugin.name": "Мост Telegram",
+  "plugin.description": "Telegram через Cloudflare, без настройки в приложении",
+  "kind.tgws.label": "Мост Telegram",
+  "command.tgws-probe.help": "проверить путь до дата-центра Telegram и его ответ"
+}

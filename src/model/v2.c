@@ -794,7 +794,7 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
                 for (size_t pi = 0; pi < plugin_kinds_n() && l + 40 < sizeof(names); pi++)
                     l += (size_t)snprintf(names + l, sizeof(names) - l, ", %s", plugin_kind_ops_at(pi)->plugin->name);
                 return fail(x, kn, "%s: неизвестный kind «%s» (есть direct, block, interface, tunnel, "
-                            "awg, tgws, group%s)", where, kname, names);
+                            "awg, group%s)", where, kname, names);
             }
             unav = 1;
             uname = kname;
@@ -1047,8 +1047,6 @@ static int p_output(struct v2 *x, const struct ynode *key, const struct ynode *v
             if (str_of(x, v, w, &sv) || path_of(x, v, w, sv, k.conf, sizeof(k.conf))) return -1;
         } else if (!strcmp(ks, "strategy")) {
             if (str_of(x, v, w, &sv) || path_of(x, v, w, sv, k.opts_file, sizeof(k.opts_file))) return -1;
-        } else if (!strcmp(ks, "domain")) {
-            if (str_of(x, v, w, &sv) || copy_to(x, v, w, sv, k.domain, sizeof(k.domain))) return -1;
         }
     }
 

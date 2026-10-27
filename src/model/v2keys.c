@@ -125,8 +125,6 @@ static const struct v2key T[] = {
       "\"awg/x.conf\"", .who = W_KK, .kk = KK_CONF, .owner = "kind: awg" },
     { V2S_OUT, "strategy", VT_STR, VF_PATH, "Файл стратегии обхода DPI.", NULL, "\"recheck/strategy.json\"",
       .who = W_KK, .kk = KK_OPTS, .owner = "kind: recheck" },
-    { V2S_OUT, "domain", VT_STR, VF_REQUIRED, "Имя за Cloudflare, у которого kwsN.<domain> ведёт на веб-точку Telegram.",
-      NULL, "\"tg.example\"", .who = W_KK, .kk = KK_DOMAIN, .owner = "kind: tgws" },
 
     /* ---- obfs --------------------------------------------------------------------------- */
     { V2S_OBFS, "mode", VT_STR, 0, "Режим: WireGuard поверх поддельного TCP.", "\"wg-over-tcp\"", "\"wg-over-tcp\"",

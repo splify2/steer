@@ -122,7 +122,6 @@
 #include "state.h"
 #include "watchd.h"
 #include "helpers.h"
-#include "module.h"
 #include "awg.h"
 
 #define LOG_SW "steer[warn] supervise: "
@@ -299,18 +298,14 @@ static void ev_health(struct supd *s, struct helper *h, const struct evline *e) 
     steerd_emit(s->d, "health", f);
 }
 
-/* ОТВЕРГНУТЬ МОДУЛЬ (шаг 4 выпуска 1.10, evline.h: hello). Модуль — отдельный бинарник со своим
- * пакетом, и на роутере он легко оказывается другой версии, чем движок: пакеты обновили не
- * все. Формат событий между выпусками не обещан, поэтому чужой версии демон не верит ни в чём —
- * ни в up, ни в устройство, к которому пришлось бы привязывать маршрут. Процесс гасится
- * (SIGTERM), причина остаётся в журнале и в status (last_down, поле rejected) до нового запуска:
- * человек видит не «помощник упал», а «поставьте модуль той же версии». Перезапуск идёт по
- * обычной паузе — обновили пакет, и следующий запуск пройдёт. */
+/* ОТВЕРГНУТЬ ПРОГРАММУ ПЛАГИНА (steer-api.md, 2.1: hello). Программе с чужим API демон не верит ни в
+ * чём — ни в up, ни в устройство, к которому пришлось бы привязывать маршрут. Процесс гасится (SIGTERM),
+ * причина остаётся в журнале и в status (last_down, поле rejected) до нового запуска: человек видит не
+ * «помощник упал», а «обновите плагин». Перезапуск идёт по обычной паузе. */
 static void mod_reject(struct supd *s, struct helper *h, const char *why) {
     struct helper_state *st = &h->st;
     char reason[240];
-    if (h->plugin[0]) snprintf(reason, sizeof(reason), "плагин %s %s", h->plugin, why);
-    else snprintf(reason, sizeof(reason), "модуль %s %s", h->prog, why);
+    snprintf(reason, sizeof(reason), "плагин %s %s", h->plugin, why);
     fprintf(stderr, LOG_SW "%s %s — %s: отвергнут\n", h->cmd, h->name, reason);
     h->rejected = 1;
     st->up = 0;
@@ -321,26 +316,6 @@ static void mod_reject(struct supd *s, struct helper *h, const char *why) {
     emit_state(s, h, "helper-down", st->why);
     wake_watch(s, h);
     if (h->pid > 0) kill(h->pid, SIGTERM);
-}
-
-/* Первое сообщение модуля обязано быть hello с версией движка. */
-static void mod_hello(struct supd *s, struct helper *h, const struct evline *e) {
-    const char *ver = evline_str(e, "ver");
-    if (!ver) {
-        mod_reject(s, h, "прислал hello без версии");
-        return;
-    }
-    /* Версия, которой модуль представился, запоминается и у отвергнутого: по ней человек видит в
-     * helper, какой модуль стоит, а не только «отвергнут» (docs/ctl.md, module_ver). */
-    snprintf(h->mver, sizeof(h->mver), "%s", ver);
-    if (strcmp(ver, steer_engine_version()) != 0) {
-        char why[160];
-        snprintf(why, sizeof(why), "версии %.16s, а ядро %.16s — обновите пакеты steer вместе",
-                 ver, steer_engine_version());
-        mod_reject(s, h, why);
-        return;
-    }
-    h->hello = 1;
 }
 
 /* hello программы плагина (steer-api.md, 2.1): api — версия steer-api, которой она говорит: major — как
@@ -446,16 +421,12 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
     const struct evline e = *ep;
     struct helper_state *st = &h->st;
     long v, t;
-    /* Шов стенда (STEER_SUPERVISE_EXE) подменяет модуль заглушкой движка: она про hello не знает. */
-    if ((h->module || h->plugin[0]) && !s->seam) {
+    /* Шов стенда (STEER_SUPERVISE_EXE) подменяет программу заглушкой движка: она про hello не знает. */
+    if (h->plugin[0] && !s->seam) {
         if (h->rejected) return;         /* процесс уже приговорён, его словам не верим */
         if (!h->hello) {
-            if (!strcmp(e.ev, "hello")) {
-                if (h->plugin[0]) plug_hello(s, h, &e);
-                else mod_hello(s, h, &e);
-            } else mod_reject(s, h, h->plugin[0] ? "не назвал версию (первое сообщение — не hello, steer-api.md 2.1)"
-                                                    : "не назвал версию (первое сообщение — не hello): "
-                                                      "нужен модуль того же выпуска, что ядро");
+            if (!strcmp(e.ev, "hello")) plug_hello(s, h, &e);
+            else mod_reject(s, h, "не назвал версию (первое сообщение — не hello, steer-api.md 2.1)");
             return;
         }
         if (!strcmp(e.ev, "hello")) return;
@@ -1258,26 +1229,6 @@ static int start_one(struct helper *h, void *arg) {
         if (rc < 0) return -1;
         if (rc == 1) return 0;          /* забран живой: о его выходе скажет dn_conn */
     } else {
-        /* Бинарника модуля нет (пакет не поставлен или удалён): не запускать вслепую, а сказать
-         * прямо — один раз в журнал, дальше в status (last_down), — и повторять по обычной паузе:
-         * поставят пакет, следующая попытка запустит. */
-        if (h->module && !s->seam) {
-            char mp[PATH_MAX + 64];
-            if (steer_module_path(h->prog, mp, sizeof(mp)) != 0) {
-                snprintf(h->st.why, sizeof(h->st.why), "нужен пакет %s", h->prog);
-                h->st.known = 1;
-                h->st.said_down = 1;
-                if (!h->nomod_logged) {
-                    /* steer-extended ставит остальные модули, но не hysteria2 и не proxy: у них свои пакеты. */
-                    int in_ext = strcmp(h->prog, "steer-hysteria2") != 0 && strcmp(h->prog, "steer-proxy") != 0;
-                    fprintf(stderr, LOG_SW "%s %s — модуля нет: нужен пакет %s%s\n", h->cmd, h->name,
-                            h->prog, in_ext ? " (входит в steer-extended)" : "");
-                    h->nomod_logged = 1;
-                }
-                return -1;
-            }
-            h->nomod_logged = 0;
-        }
         /* Программы плагина нет (каталог плагина повреждён или снят вручную): так же — одна строка в
          * журнал, причина в status, повтор по паузе; переставят плагин — следующая попытка запустит. */
         if (h->plugin[0] && !s->seam && h->prog && *h->prog && access(h->prog, X_OK) != 0) {
@@ -1698,16 +1649,6 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
         if (st->why[0]) {
             steerd_json_str(wj, sizeof(wj), st->why);
             fprintf(out, ",\"last_down\":%s", wj);
-        }
-        /* Модуль (отдельный бинарник): чей и какой версии, если он представился; отвергнутый за
-         * чужую версию помечен — причина в last_down. */
-        if (h->module) {
-            fprintf(out, ",\"module\":\"%s\"", h->prog);
-            if (h->mver[0]) {
-                steerd_json_str(wj, sizeof(wj), h->mver);
-                fprintf(out, ",\"module_ver\":%s", wj);
-            }
-            if (h->rejected) fputs(",\"rejected\":true", out);
         }
         /* Программа плагина: чья и какой версии (hello); отвергнутая — помечена, причина в last_down. */
         if (h->plugin[0]) {

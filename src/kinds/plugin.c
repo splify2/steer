@@ -797,10 +797,9 @@ static void resolve_conflicts(void) {
                         break;
                     }
         }
-        /* Имена подкоманд ядра плагину не даются (steer-api.md, 4.3). Команды модулей, которые
-         * ещё в дереве steer (vless, warp…), плагин переопределяет — их вынос и есть цель. */
+        /* Имена подкоманд ядра плагину не даются (steer-api.md, 4.3). */
         for (size_t a = 0; a < p->cmd_n && p->enabled; a++)
-            if (cli_lookup && cli_lookup(p->cmd[a].name) && !steer_cmd_module(p->cmd[a].name)) {
+            if (cli_lookup && cli_lookup(p->cmd[a].name)) {
                 char w[300];
                 snprintf(w, sizeof(w), "подкоманда %s — команда ядра", p->cmd[a].name);
                 p->enabled = 0;

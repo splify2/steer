@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Telegram bridge",
+  "type": "object",
+  "properties": {
+    "domains": {
+      "type": "array",
+      "title": "Spare domains",
+      "description": "Domains behind Cloudflare that lead to Telegram, best first. Used when the domain of the output does not answer.",
+      "items": {
+        "type": "string",
+        "maxLength": 127,
+        "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$"
+      },
+      "uniqueItems": true,
+      "x-example": ["tg.example"],
+      "default": []
+    },
+    "routes": {
+      "type": "array",
+      "title": "Paths of data centers",
+      "description": "One line per data center: «2 ws domain» - through this domain, «4 direct» - not intercepted. «m» after the number is the media data center: «2m direct».",
+      "items": {
+        "type": "string",
+        "pattern": "^(1|2|3|4|5|203)[mM]? +(direct|ws +[A-Za-z0-9.-]+)$"
+      },
+      "x-example": ["2 ws tg.example"],
+      "default": []
+    },
+    "dc_addresses": {
+      "type": "array",
+      "title": "More data center addresses",
+      "description": "Addresses of Telegram data centers in addition to the built-in table: «address[/mask] number [media]».",
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9]{1,3}([.][0-9]{1,3}){3}(/[0-9]{1,2})? +(1|2|3|4|5|203)( +media)?$"
+      },
+      "x-example": ["149.154.167.220 2"],
+      "default": []
+    },
+    "warp": {
+      "type": "array",
+      "title": "WARP tunnels",
+      "description": "Interfaces of WARP tunnels with an exit abroad, best first. The bridge tries them before other paths and leaves a tunnel that does not connect.",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_.-]{1,15}$"
+      },
+      "uniqueItems": true,
+      "x-example": ["warp0"],
+      "default": []
+    },
+    "verbose": {
+      "type": "boolean",
+      "title": "Log every connection",
+      "description": "Off - the log keeps the start parameters and path changes only.",
+      "default": false
+    }
+  },
+  "additionalProperties": false
+}

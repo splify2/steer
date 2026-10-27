@@ -373,7 +373,6 @@ static void output_flow(FILE *f, const struct spec *s, const struct output *o, c
         if (out_has_device(o) && o->device[0] && !kk.device_derived) fs(&w, "device", o->device);
         if (kk.conf[0]) fpath(&w, "conf", kk.conf);
         if (kk.opts_file[0]) fpath(&w, "strategy", kk.opts_file);
-        if (kk.domain[0]) fs(&w, "domain", kk.domain);
         if (kk.obfs.on) {
             char sv[96], lv[96];
             snprintf(sv, sizeof(sv), "%s:%d", kk.obfs.server, kk.obfs.server_port);

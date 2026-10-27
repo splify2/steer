@@ -41,13 +41,6 @@ int sc_aesctr_init(struct sc_aesctr *c, const unsigned char key[32], const unsig
 int sc_aesctr_xor(struct sc_aesctr *c, const unsigned char *in, unsigned char *out, size_t n)
                                         { (void)c; memmove(out, in, n); return 0; }
 void sc_aesctr_free(struct sc_aesctr *c) { c->ready = 0; }
-/* Мосту (cmd_tgws) эти две функции нужны на этапе разбора спеки — этот стенд его не зовёт, но
- * символы обязаны разрешиться на линковке: спека — значение, а не глобалы (правило 6,
- * docs/architecture.md, раздел 2), поэтому здесь больше нет и мока g_out/g_out_n — cmd_tgws с
- * этого шага держит свой static struct spec сам. */
-int load_spec(const char *path, struct spec *s, struct err *e) { (void)path; (void)s; (void)e; return 0; }
-int registry_assign(struct spec *s, struct err *e) { (void)s; (void)e; return 0; }
-const struct tgws_cfg *out_tgws(const struct output *o) { (void)o; return NULL; }
 
 static int fails;
 

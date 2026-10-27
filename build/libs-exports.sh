@@ -67,9 +67,9 @@ for f in $QUIC_STAND; do
     $CC $F $NGCFLAGS -Itests -c "$f" -o "$W/app/$(echo "$f" | tr / _).o"
 done
 {
-    # Раскладка 2.1: из libsteer берут steerd и модуль steer-tgws (мост ещё не плагин); протоколы —
-    # плагины на net1 и с libsteer не связаны (их нужды — карта net1 ниже).
-    for p in PROFILE_steerd PROFILE_mod_tgws; do
+    # Раскладка 2.1: из libsteer берёт только steerd; протоколы и мост Telegram — плагины (на net1 или
+    # статические) и с libsteer не связаны (нужды плагинов на net1 — карта net1 ниже).
+    for p in PROFILE_steerd; do
         profile_var "$p"
     done
 } | tr ' ' '\n' | sort -u | grep -v '^$' > "$W/app.lst"
@@ -140,7 +140,7 @@ emit_net1() {
 
 emit_libsteer() {
     echo "/* Экспорт libsteer.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится."
-    echo " * Символы, которые steerd и модуль ядра steer-tgws берут"
+    echo " * Символы, которые steerd берёт"
     echo " * из библиотеки, и программный интерфейс QUIC (qc_*), который берёт стенд QUIC_STAND_SRC, пока"
     echo " * настоящих потребителей нет; остальное скрыто (local: *). Проверка: check. */"
     echo "LIBSTEER_1 {"

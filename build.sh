@@ -240,7 +240,7 @@ pkg_deps() {  # ФАЙЛ_БИНАРНИКА ВИД (core|mod|tun) -> "nftables i
 # обновить один, оставив другой (apk — `имя=версия`, opkg — `имя (= версия)`). Чужие пакеты
 # (nftables, kmod-…) остаются без версии. Демон дополнительно проверяет версию при запуске модуля
 # (hello, docs/ctl.md) — на случай установки файлами мимо менеджера.
-OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-proxy steer-warpbox steer-extended "
+OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-hysteria2 steer-proxy steer-warpbox steer-extended "
 dep_apk() {  # ИМЕНА через пробел -> "имя=версия ..." для наших
     for _d in $1; do
         case "$OURS" in *" $_d "*) printf '%s=%s-r1 ' "$_d" "$VERSION" ;; *) printf '%s ' "$_d" ;; esac
@@ -301,7 +301,7 @@ mk_ipk() {
 # Раскладка роутера: 2.1 (умолчание) — ядро без стека протоколов, net1 и протоколы плагинами (.s2p и семя
 # в steer-core, build/pack-s2p.sh); 2.0 — прежние пакеты steer-<m> на libsteer (STEER_LAYOUT=2.0).
 LAYOUT="${STEER_LAYOUT:-2.1}"
-PLUGS="$(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC)"
+PLUGS="$(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC) $(profile_var PLUGINS_TLS)"
 echo "steer $VERSION (раскладка $LAYOUT)"
 for spec in $ISAS; do
     arch=${spec%%:*}; rest=${spec#*:}
@@ -340,44 +340,8 @@ for spec in $ISAS; do
         continue
     fi
 
-    # Мини-вариант для микропакета tgws: только перехват Telegram и то, на чём он стоит.
-    # Нужен потому, что тот пакет носит бинарник внутри себя, и три четверти мегабайта там
-    # заметны: на 4/32 разница между «ставится» и «места нет».
-    printf '  %-26s ' "$arch (tgws)"
-    if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
-            /src/build/build-ext.sh "$target" "$mcpu" "/src/build/steer-tgws-$arch" \
-            "$VERSION" tgws "$REV" \
-            2>"build/$arch-tgws.err"; then
-        echo "$(stat -c %s "build/steer-tgws-$arch") bytes"
-        warn_report "build/$arch-tgws.err"
-    else
-        rm -f "build/steer-tgws-$arch"
-        echo "FAILED — $(grep -m1 error "build/$arch-tgws.err" || head -1 "build/$arch-tgws.err")"
-        fails=$((fails + 1))
-    fi
-
-    # Мини-вариант для микропакета tgws: только перехват Telegram и то, на чём он стоит.
-    # Нужен потому, что тот пакет носит бинарник внутри себя, и три четверти мегабайта там
-    # заметны: на 4/32 разница между «ставится» и «места нет».
-    #
-    # ИМЯ ДРУГОЕ — stgws, а не steer. Микропакет ставится и туда, где полный движок уже стоит
-    # (его ставит splify2 или сам brb), и один путь на два разных бинарника означал бы, что
-    # установка микропакета молча подменяет полный движок урезанным.
-    printf '  %-26s ' "$arch (stgws)"
-    if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
-            /src/build/build-ext.sh "$target" "$mcpu" "/src/build/stgws-$arch" \
-            "$VERSION" tgws "$REV" \
-            2>"build/$arch-stgws.err"; then
-        echo "$(stat -c %s "build/stgws-$arch") bytes"
-        warn_report "build/$arch-stgws.err"
-    else
-        rm -f "build/stgws-$arch"
-        echo "FAILED — $(grep -m1 error "build/$arch-stgws.err" || head -1 "build/$arch-stgws.err")"
-        fails=$((fails + 1))
-    fi
-
-    # Разделяемая раскладка роутера (шаг 4 выпуска 1.10): libsteer-wolfssl.so, libsteer.so, steerd и
-    # модули steer-vless, steer-xsteer, steer-obfs, steer-tgws. Логика — build/build-libs.sh (одна
+    # Разделяемая раскладка роутера (шаг 4 выпуска 1.10): libsteer-wolfssl.so, libsteer.so, steerd, net1 и
+    # программы плагинов (с 2.1 — и мост tgws, плагин репозитория splify2-extended-plugins). Логика — build/build-libs.sh (одна
     # для этого цикла и для tests/libs-test.sh), списки файлов — build/sources.mk. Статического
     # расширенного бинарника роутера больше нет: его место — steerd + модули на общих библиотеках
     # (статическая сборка расширенной части остаётся у телефона, шаг 6, и у стендов).
@@ -421,19 +385,17 @@ for spec in $ISAS; do
 
     # ---- пакеты ---------------------------------------------------------------------------
     #
-    # Пять пакетов модулей, ядро и один мета-пакет на архитектуру (docs/architecture.md, «Сборки»):
+    # Раскладка 2.1 — один пакет на архитектуру (docs/architecture.md, «Сборки»):
     #
     #   steer-core         ядро и общая крипта: steerd на общих библиотеках, клиент steer,
-    #                      libsteer.so.<версия> (модель, виды, TLS, транспорты, стек, слой
-    #                      криптографии), libsteer-wolfssl.so.<версия wolfSSL> (наша wolfSSL,
-    #                      QUIC включён заранее, см. build/wolfssl), init-скрипт, обработчик обхода,
-    #                      hotplug, keep.d. dnsd — подкоманда steerd, своего файла у него нет;
-    #   steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2
-    #                      по одному бинарнику модуля; зависят от steer-core ТОЧНОЙ версии и ничего
-    #                      из файлов ядра не повторяют;
-    #   steer-extended     мета-пакет на переход: ядро и модули vless, xsteer, obfs, tgws (без
-    #                      hysteria2). Его по имени ставит splify2 (`steer_install`); уйдёт,
-    #                      когда splify2 начнёт ставить steer-core и модули сам.
+    #                      libsteer.so.<версия> (модель, виды, TLS, слой криптографии),
+    #                      libsteer-wolfssl.so.<версия wolfSSL> (наша wolfSSL, QUIC включён заранее,
+    #                      см. build/wolfssl), init-скрипт, обработчик обхода, hotplug, keep.d, семя
+    #                      плагинов протоколов. dnsd — подкоманда steerd, своего файла у него нет.
+    #
+    # Протоколы и мост Telegram — плагины (.s2p), пакетов steer-<модуль> больше нет: steer-core 2.1
+    # заменяет их все (steer-tgws в том числе). Прежняя раскладка 2.0 (пакеты модулей и мета-пакет
+    # steer-extended) ниже осталась под LAYOUT=2.0, но build/build-libs.sh её уже не собирает.
     #
     # Библиотеки лежат в steer-core, отдельных пакетов libsteer и libsteer-wolfssl нет. Довод:
     # ядру крипта нужна и без модулей — steerd сам ходит по HTTPS (замер групп, urltls) и
@@ -542,8 +504,8 @@ for spec in $ISAS; do
     # apk снимает их РАНЬШЕ, чем зовёт pre-upgrade нового ядра (проверено на 3.0.5: «Purging steer-vless»
     # идёт первым), так что бинарников уже нет — остаётся /etc/apk/world: имена пакетов в нём стоят,
     # их закрывает provides ядра. У opkg preinst идёт до снятия, там виден и бинарник. Список отдаёт
-    # `steer plugin migrate` в postinst (migration-2.1.md, 3.1), и тот ставит плагины из семени. tgws
-    # пакетом остаётся и в список не входит. После первого перехода (есть migrate.done.json) имена в
+    # `steer plugin migrate` в postinst (migration-2.1.md, 3.1), и тот ставит плагины из семени. tgws в
+    # список не входит: плагин моста — из репозитория splify2-extended-plugins, в семени его нет. После первого перехода (есть migrate.done.json) имена в
     # world остаются навсегда и решать ими уже нельзя: человек мог снять плагин. Пишется в
     # /etc/steer/plugins: keep.d переносит его через sysupgrade.
     cat > build/scripts/steer.preinst <<'EOF'
@@ -663,11 +625,12 @@ EOF
     # осиротевший kmod-tun (проверено на apk 3.0.5), а менеджер плагинов из postinst пакет поставить не
     # может: база заперта. Без этой зависимости плагины встали бы без TUN (migration-2.1.md, раздел 4).
     [ "$LAYOUT" = 2.0 ] || deps="$deps $(pkg_deps "" tun)"
-    # Раскладка 2.1: протоколы — плагины, steer-core берёт на себя имена прежних пакетов модулей (кроме
-    # steer-tgws: мост ещё модуль) и мета-пакета (migration-2.1.md, раздел 2).
+    # Раскладка 2.1: протоколы и мост Telegram — плагины, steer-core берёт на себя имена всех прежних пакетов
+    # модулей (с steer-tgws: мост — плагин tgws) и мета-пакета (migration-2.1.md, раздел 2) — конфликтует с
+    # ними и заменяет, так что установка ядра 2.1 снимает их в той же транзакции.
     _old="steer libsteer libsteer-wolfssl"
     _mods=""
-    [ "$LAYOUT" = 2.0 ] || _mods="steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-extended"
+    [ "$LAYOUT" = 2.0 ] || _mods="steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-tgws steer-extended"
     pack steer-core "$root" "$deps" "steer-core: ядро маршрутизации по политике (каналы на входе, nftables на выходе) и общая крипта" \
         steer "$_old" "$_old $_mods" "$_mods"
 
@@ -678,8 +641,8 @@ EOF
     # отдельные пакеты, которые ставят сознательно (см. мета-пакет ниже). У steer-warpbox нет
     # зависимости от модуля ядра: туннели WARP — выходы awg ядра steer, а им годится и kmod-amneziawg
     # (сторонний, с обфускацией), и kmod-wireguard из фидов OpenWrt — выбор за человеком.
-    _modlist="tgws"
-    [ "$LAYOUT" = 2.0 ] && _modlist="vless xsteer obfs tgws hysteria2 proxy warpbox"
+    _modlist=""
+    [ "$LAYOUT" = 2.0 ] && _modlist="vless xsteer obfs hysteria2 proxy warpbox"
     for m in $_modlist; do
         mroot="build/pkg/$arch-$m"
         rm -rf "$mroot"
@@ -690,7 +653,6 @@ EOF
             vless)  md="steer-vless: клиент VLESS/Reality для steer (модуль)"; mk=tun ;;
             xsteer) md="steer-xsteer: клиент звезды xsteer для steer (модуль)"; mk=tun ;;
             obfs)   md="steer-obfs: обфускатор WireGuard для steer (модуль)"; mk=mod ;;
-            tgws)   md="steer-tgws: мост Telegram для steer (модуль)"; mk=mod ;;
             hysteria2) md="steer-hysteria2: клиент hysteria2 (QUIC, Brutal) для steer (модуль)"; mk=tun ;;
             proxy)  md="steer-proxy: клиенты trojan, shadowsocks, socks, http, vmess для steer (модуль)"; mk=tun ;;
             warpbox) md="steer-warpbox: Cloudflare WARP для steer — регистрация, подбор точек, замена (модуль)"; mk=mod ;;
@@ -701,14 +663,14 @@ EOF
 
     # steer-box-connector — свой репозиторий (github.com/splify2/steer-box-connector).
 
-    # Мета-пакет steer-extended (устарел, оставлен на переход): ядро и модули vless, xsteer, obfs,
-    # tgws; hysteria2 не входит. Пустой пакет менеджеры не любят, поэтому в нём один маленький
+    # Мета-пакет steer-extended (устарел, оставлен на переход): ядро и модули vless, xsteer, obfs;
+    # hysteria2 не входит. Пустой пакет менеджеры не любят, поэтому в нём один маленький
     # файл-метка. Имя сохранено ради splify2, который ставит его по имени.
     [ "$LAYOUT" = 2.0 ] || continue
     xroot="build/pkg/$arch-extended"
     rm -rf "$xroot"
     mkdir -p "$xroot/usr/lib/steer"
-    printf 'steer-extended %s: мета-пакет — steer-core, steer-vless, steer-xsteer, steer-obfs, steer-tgws\n' \
+    printf 'steer-extended %s: мета-пакет — steer-core, steer-vless, steer-xsteer, steer-obfs\n' \
         "$VERSION" > "$xroot/usr/lib/steer/extended"
     # Системные зависимости 1.5.x (nftables ip-full conntrack kmod-nft-queue kmod-tun) мета-пакет
     # повторяет нарочно. opkg (OpenWrt 24.10 и старше) при обновлении steer-extended 1.5.x до этого
@@ -716,8 +678,8 @@ EOF
     # и снимает: после `opkg install ./*-2.0.0-1_<арх>.ipk` на роутере не оставалось ip-full,
     # conntrack, kmod-nft-queue и (без hysteria2) kmod-tun. apk решает транзакцию целиком и этого
     # не делает, но зависимости общие для обоих форматов.
-    pack steer-extended "$xroot" "steer-core steer-vless steer-xsteer steer-obfs steer-tgws $(pkg_deps "" core) $(pkg_deps "" tun)" \
-        "steer-extended (устарел, взамен — steer-core и нужные модули): ядро, VLESS/Reality, xsteer, обфускатор, мост Telegram" noop
+    pack steer-extended "$xroot" "steer-core steer-vless steer-xsteer steer-obfs $(pkg_deps "" core) $(pkg_deps "" tun)" \
+        "steer-extended (устарел, взамен — steer-core и нужные модули): ядро, VLESS/Reality, xsteer, обфускатор" noop
 done
 
 # ---- серверная половина обфускации: архив для VPS -----------------------------

@@ -1465,9 +1465,10 @@ int main(void) {
     check("via: на direct — отказ", 2, load_from_str(SPEC(
         "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"d\"},"
         "\"d\":{\"kind\":\"direct\"}},\"channels\":[]}")));
-    check("via: на tgws — отказ", 2, load_from_str(SPEC(
+    /* Цель без устройства (block; прежде здесь стоял мост tgws, с 2.1 — вид плагина). */
+    check("via: на выход без устройства — отказ", 2, load_from_str(SPEC(
         "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"t\"},"
-        "\"t\":{\"kind\":\"tgws\",\"domain\":\"example.com\"}},\"channels\":[]}")));
+        "\"t\":{\"kind\":\"block\"}},\"channels\":[]}")));
     check("via: круг a → b → a — отказ", 2, load_from_str(SPEC(
         "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b\"},"
         "\"b\":" OBFS("wg1") ",\"via\":\"a\"}},\"channels\":[]}")));

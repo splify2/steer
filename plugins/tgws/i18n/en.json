@@ -1,0 +1,6 @@
+{
+  "plugin.name": "Telegram bridge",
+  "plugin.description": "Telegram through Cloudflare, nothing to set up in the app",
+  "kind.tgws.label": "Telegram bridge",
+  "command.tgws-probe.help": "check the path to a Telegram data center and its answer"
+}

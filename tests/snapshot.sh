@@ -3,7 +3,7 @@
 #
 # Зачем. Пересборка ядра (выпуски 1.6-1.7; docs/architecture.md, раздел 4) переносит генератор по
 # модулям и переводит его на промежуточное дерево, и всё это время ruleset обязан оставаться
-# ТЕМ ЖЕ до байта. Стенды генератора (gen.sh, androidmatch.sh, tgwsmark.sh) такого не
+# ТЕМ ЖЕ до байта. Стенды генератора (gen.sh, androidmatch.sh, tgwsmatch.sh) такого не
 # обещают: они ищут в выводе нужные строки (`grep -c`), и переставленная цепочка, лишнее
 # правило или пропавший набор проходят их молча, если искомая строка на месте. Снимок
 # сравнивает текст целиком.
@@ -26,8 +26,7 @@ MODE="${1:-check}"
 GOLDEN="tests/golden/ruleset"
 STEER_BIN="${STEER:-./build/steer}"
 ANDROID_BIN="${ANDROID:-./build/steer-android}"
-TGWSSIM_BIN="${TGWSSIM:-./build/tgwssim}"
-for b in "$STEER_BIN" "$ANDROID_BIN" "$TGWSSIM_BIN"; do
+for b in "$STEER_BIN" "$ANDROID_BIN"; do
     [ -x "$b" ] || { echo "snapshot: не собран $b (make)"; exit 2; }
 done
 
@@ -37,7 +36,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 out="$tmp/out"
 mkdir -p "$out" "$tmp/wrap"
-# Обёртка на каждый бинарник. Метка (router, android, tgws) входит в имя файла снимка.
+# Обёртка на каждый бинарник. Метка (router, android) входит в имя файла снимка.
 wrap() {
     real="$(abs "$1")"
     cat > "$tmp/wrap/$2" <<EOF
@@ -70,14 +69,12 @@ EOF
 }
 wrap "$STEER_BIN" router
 wrap "$ANDROID_BIN" android
-wrap "$TGWSSIM_BIN" tgws
 
 # Стенды гоняются молча: свои pass/fail они печатают в make test сами. Упавший стенд
 # обрывается раньше и оставляет меньше файлов — это покажет сверка ниже.
 SNAP_STAGE=gen STEER="$tmp/wrap/router" sh tests/gen.sh >/dev/null 2>&1
 SNAP_STAGE=androidmatch ANDROID="$tmp/wrap/android" sh tests/androidmatch.sh >/dev/null 2>&1
-SNAP_STAGE=tgwsmark STEER="$tmp/wrap/router" TGWSSIM="$tmp/wrap/tgws" \
-    sh tests/tgwsmark.sh >/dev/null 2>&1
+SNAP_STAGE=tgwsmatch STEER="$tmp/wrap/router" sh tests/tgwsmatch.sh >/dev/null 2>&1
 rm -f "$out"/.n-*
 
 n="$(ls "$out" | wc -l | tr -d ' ')"

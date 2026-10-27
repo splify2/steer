@@ -15,26 +15,26 @@ xsteer — [docs/xsteer.md](xsteer.md).
 
 | Профиль | Состав | Что в сборке |
 |---|---|---|
-| `base` | `CORE_SRC` | ядро: модель спеки, компилятор, демон, резолвер, виды `direct`, `interface`, `tgws` (правила перехвата), `awg` и группы, обфускатор; криптографии нет |
-| `extended` | ядро, `XS_COMMON_SRC`, `EXT_ROUTER_SRC`, `KINDS_EXT_SRC` | статическая полная сборка (телефон, стенды): ещё клиент VLESS/Reality со стеком туннеля, клиент xsteer, мост tgws, подписка, TLS на wolfSSL; на роутере те же файлы разложены по пакетам (ниже) |
+| `base` | `CORE_SRC` | ядро: модель спеки, компилятор, демон, резолвер, виды `direct`, `interface`, `awg`, `block` и группы; криптографии нет |
+| `extended` | ядро, `XS_COMMON_SRC`, `EXT_ROUTER_SRC`, `PK_STATIC_SRC` | статическая полная сборка (телефон, стенды): ещё программы плагинов vless, xsteer, obfs и tgws (мост Telegram), стек туннеля, подписка, TLS на wolfSSL; на роутере те же файлы разложены по ядру и плагинам (ниже) |
 | `server` | ядро, `XS_COMMON_SRC`, `EXT_SERVER_SRC` | хаб xsteer |
-| `tgws` | ядро, `EXT_TGWS_SRC` | мини-сборка моста Telegram: своё поле метки, свой ряд таблиц и портов моста (docs/contract-v1.md, §7), без резолвера |
 | `android` | как `extended` | та же сборка с умолчанием платформы «телефон» (`-DSTEER_DEFAULT_PLATFORM=android`) |
 
 Код обеих платформ, роутера и телефона, есть в каждой сборке: платформа выбирается при запуске
 (раздел 2, правило 2).
 
 **Пакет роутера — разделяемая раскладка**, а не один статический файл. Профили выше остаются для
-статических сборок (телефон, стенды, микропакет tgws, хаб на VPS); роутер получает те же файлы,
+статических сборок (телефон, стенды, хаб на VPS); роутер получает те же файлы,
 разложенные по бинарникам и библиотекам (списки — те же `build/sources.mk`, рецепт —
 `build/build-libs.sh`), — раскладка 2.1 ниже. Видов протоколов в ядре нет: виды `tunnel:<протокол>` и
 `xsteer` приходят манифестами плагинов (`src/kinds/plugin.c`). Без плагина выход такого вида — `unavail` с
 причиной «нужен плагин X — поставить» (кто даёт вид — из `provides.kinds` индекса семени
 `/usr/share/steer/seed`; своего списка «вид → плагин» у ядра нет), а при `apply` — отказ с той же причиной;
-команды протоколов без плагина — «нет такой команды». Модулем остался только мост `steer-tgws`
-(`src/cli/modcmd.c`, `src/lib/module.c`).
+команды протоколов без плагина — «нет такой команды». Модулей ядра нет: мост Telegram — тоже плагин
+(`tgws`, вид `tgws`, исходник — `plugins/tgws`, `src/modules/main_tgws.c`, `src/proto/tgws`; выпускает его
+репозиторий `splify2-extended-plugins`).
 
-Экспорт `libsteer.so` — version-script `build/libsteer.map` (только то, что берут `steerd` и мост;
+Экспорт `libsteer.so` — version-script `build/libsteer.map` (только то, что берёт `steerd`;
 порождён из кода `build/libs-exports.sh`, проверка — `make libs-test`), SONAME
 `libsteer.so.<версия ядра steer>`. Экспорт `libsteer-wolfssl.so` — `build/wolfssl/libsteer-wolfssl.map`.
 Ядро и `libsteer` собираются `-fPIC` и `-ftls-model=initial-exec`; `net1` — без него (модель
@@ -52,8 +52,8 @@ global-dynamic): её загружают и dlopen'ом, вслед за .so-п�
 |---|---|---|
 | `libsteer.so.<версия>` | `PROFILE_libsteer` | модель, виды, разбор команд, линия событий, обфускатор, слой примитивов, TLS 1.3, REALITY, HTTP/2, ECH, корни, HTTP-клиент (`httpc.c`, `wbhttps.c`), подпись и распаковка плагинов, QUIC с ngtcp2 и DoQ. Стека TUN (`src/tunnel`), транспортов (`src/proto/transport`) и разбора ссылок узлов (`sublink.c`) нет |
 | `plugins/net1/lib/libs2p-net.so.1` | `PROFILE_net1` | стек TUN, пул узлов, гео, транспорты, разбор ссылок, вторая копия TLS/REALITY/HTTP/2/QUIC, основа стека (платформа, профиль, линия событий, `run`, JSON, `err`); wolfSSL и ngtcp2 вкомпилированы и скрыты |
-| `plugins/<id>/bin/<id>` | `PROFILE_plug_<id>` | `vless`, `hysteria2`, `proxy`, `xsteer`, `warpbox` — код протокола на `src/plugkit` (сторона плагина в API: {conf}, точка входа, файл состояния; модели спеки ядра нет) и `DT_NEEDED libs2p-net.so.1` с `RUNPATH $ORIGIN/../../net1/lib`; `obfs` стека не берёт и с библиотеками steer не связан |
-| `steerd`, `steer-tgws` | как раньше | мост остаётся модулем на `libsteer` до своего плагина |
+| `plugins/<id>/bin/<id>` | `PROFILE_plug_<id>` | `vless`, `hysteria2`, `proxy`, `xsteer`, `warpbox` — код протокола на `src/plugkit` (сторона плагина в API: {conf}, точка входа, файл состояния; модели спеки ядра нет) и `DT_NEEDED libs2p-net.so.1` с `RUNPATH $ORIGIN/../../net1/lib`; `obfs` стека не берёт и с библиотеками steer не связан; `tgws` (мост Telegram, `PLUGINS_TLS`) — статически со своим TLS 1.3/1.2 и wolfSSL: net1 не отдаёт TLS-соединение, а стек туннелей мосту не нужен |
+| `steerd` | `PROFILE_steerd` | демон, компилятор, резолвер, менеджер плагинов на `libsteer` |
 
 **Что ядро держит само и почему.** TLS/QUIC и wolfSSL у ядра свои: резолвер ходит по DoH, DoH3 и
 DoQ, замер групп — по HTTPS (`urltls.c`), менеджер плагинов качает индекс и архивы (`httpc.c`,
@@ -164,8 +164,7 @@ procd
        ├─ супервизор детей
        ├─ steer dnsd --table-fd 3                  ребёнок: файл steerd, argv[0] «…/steer»
        ├─ <id> <выход> --conf {conf}               ребёнок: программа плагина
-       │                                            (plugins/<id>/bin/<id>: vless, xsteer, obfs…)
-       ├─ steer tgws <выход>                       ребёнок: модуль моста steer-tgws
+       │                                            (plugins/<id>/bin/<id>: vless, xsteer, obfs, tgws…)
 steer <команда>          клиент: команды демона — в сокет; остальное и всё без демона — execv steerd
 steer-tools <команда>    ссылка на steerd: отвечает только на инструменты
 ```
@@ -174,10 +173,9 @@ steer-tools <команда>    ссылка на steerd: отвечает то�
   выходов, резолвер, инструменты; `steerd <подкоманда>` — то же, что подкоманда ядра. `steer` —
   отдельный маленький клиент сокета (`src/client/main.c`). `steer-tools` — ссылка на `steerd`, под
   этим именем ядро отвечает только на инструменты (раздел 4а, «Бинарники»).
-- **Помощники: резолвер — подкоманда `steerd`, протоколы — программы плагинов, мост — модуль.** Резолвер
+- **Помощники: резолвер — подкоманда `steerd`, протоколы и мост Telegram — программы плагинов.** Резолвер
   демон запускает тем же файлом `steerd`, помощников выходов видов плагинов — программой плагина по
-  манифесту (`helper`: `<id> <выход> --conf {conf}`; `plugin_kind_helper` в `src/kinds/plugin.c`), мост —
-  бинарником `steer-tgws`. Окружение — `STEER_EVENT_FD`, `STEER_SUPD` и переменные steer-api
+  манифесту (`helper`: `<id> <выход> --conf {conf}`; `plugin_kind_helper` в `src/kinds/plugin.c`). Окружение — `STEER_EVENT_FD`, `STEER_SUPD` и переменные steer-api
   (`STEER_PLUGIN_ID`, `STEER_PLUGIN_STATE`…). Первое сообщение программы — `hello` с её steer-api и id:
   чужой major или minor новее ядра, чужое имя или не `hello` — процесс гасится, причина — в `last_down`.
   В статической сборке телефона программы плагинов слинкованы в сам бинарник (`PK_PROGRAM`), а манифесты —
@@ -223,9 +221,9 @@ src/
               srs.c, srsplan.c (наборы sing-box)
   kinds/      kind.h и kind.c (struct kind_ops, биты свойств, реестр),
               direct.c interface.c awg.c awgdev.c (устройство AmneziaWG: его же берёт плагин warpbox)
-              tgws.c group.c grpurl.c, plugin.c (реестр плагинов: виды, команды и хуки из манифестов)
+              group.c grpurl.c, plugin.c (реестр плагинов: виды, команды и хуки из манифестов)
   platform/   platform.h, platform.c, openwrt.c, android.c
-  profile/    profile.h, profile.c (умолчания), extended.c, server.c, tgws.c — данные профиля
+  profile/    profile.h, profile.c (умолчания), extended.c, server.c — данные профиля
   compile/    groups.c, balance.c, generate.c, print.c,
               nftcompat.c (что умеет nft этого ядра)
   daemon/     main.c, ctl.c (сокет, протокол), apply.c, recon.c (сверка), watch.c и watchd.c
@@ -235,14 +233,14 @@ src/
   dnsd/       main.c, proxy.c, wire.c, rules.c, fakeip.c, realip.c, origdst.c, table.c, tabfmt.c,
               fpseed.c, adopt.c, dlog.c
   client/     main.c — steer, клиент сокета
-  cli/        cli.c — таблица команд и разбор командной строки; modcmd.c — команды моста tgws
-              (единственного модуля: заглушки в steerd, настоящие ветки в модуле) и steer_module_main
+  cli/        cli.c — таблица команд и разбор командной строки; modcmd.c — флаг --platform
   plugkit/    сторона плагина в API ядра (steer-api 1.1): plugkit.c — {conf} выхода, точка входа
               программы (pk_main, PK_PROGRAM), файл состояния и событие state; pktun.c — ключи туннеля
               по подписке; pkjson.c — разбор JSON; pkembed.c — манифесты плагинов, вкомпилированных в
               бинарник телефона (порождает build/pkembed.sh). Модели спеки ядра в программах плагинов нет
   modules/    main_vless.c, main_xsteer.c, main_obfs.c, main_hysteria2.c, main_proxy.c, main_warpbox.c —
-              таблицы подкоманд программ плагинов (PK_PROGRAM); main_tgws.c — main модуля моста
+              main_tgws.c — таблицы подкоманд программ плагинов (PK_PROGRAM); мост tgws — плагин
+              репозитория splify2-extended-plugins, его исходник здесь (plugins/tgws)
   tools/      aggregate.c (fit), srsread.c, hwid.c
   tunnel/     стек туннеля без протокола: tun.c (TUN: очереди, разгрузка, запись пакетов),
               rtx.c (кольцо недописанного клиенту), stack.c и stack.h (сокеты TCP и UDP из TUN ↔ потоки к узлу, таблица
@@ -324,8 +322,8 @@ struct kind_ops {
   проба ICMP или TCP по `KC_TCP_PROBE`, общий замер соединением TCP, правила по свойствам).
 - **Настройки видов — `union`** внутри `struct output`: у каждого вида своя структура
   (`struct vless_cfg`, `struct xsteer_cfg`, …), и заполняет её только разбор его модуля.
-  Помощники спрашивают свою настройку у вида (`out_vless`, `out_xsteer`, `out_tgws`).
-- **Реестр** (`kind.c`): `direct`, `interface`, `vless`, `xsteer`, `tgws`, `awg` — в этом
+  Помощники видов плагинов знают о выходе только свой {conf}.
+- **Реестр** (`kind.c`): `direct`, `interface`, `awg` — в этом
   порядке идут правила видов в дереве (`kind_emit_all`) и проверки diag; дальше идут `hysteria2` и виды протоколов прокси (правил вида у них нет), в конце — `block`. На записи вида, файла
   которого в сборке нет, стоит запись отказа с `absent`; её текст о VLESS и xsteer содержит
   подстроку `steer-extended` — её читает splify2.
@@ -354,7 +352,7 @@ struct kind_ops {
 | `postrouting_nat4` | nat postrouting | masquerade IPv4 на устройстве выхода, которому нужна подмена (`interface`, `awg`, члены WARP) |
 | `postrouting_nat6` | nat postrouting | masquerade IPv6 у выхода с `ipv6: nat` |
 | `output_mark`, `output_dns` | output | каналы на сам телефон и заворот его DNS |
-| `tgws_redirect` | — | правила вида `tgws` (`kind_ops.emit`) |
+| `plugin_<слот>`, `plugin_<id>_<слот>` | слот (nat prerouting у `prerouting-dnat`) | правила плагинов: файлы nft и шаблоны видов (перехват моста tgws — слот `prerouting-dnat`) |
 
 **Разметка на ingress.** Цепочка `ingress_mark` стоит на тех устройствах из `lan_devices`, что есть
 при `apply`, с приоритетом `filter + 10` — после flowtable fw4 на том же хуке. Первое правило даёт

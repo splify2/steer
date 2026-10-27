@@ -263,16 +263,17 @@ static int parse_obfs(struct js *j, const char *name, struct out_obfs *ob, struc
     return obfs_set(name, mode, server, listen, ob, e);
 }
 
-/* ВИДЫ ПРОТОКОЛОВ В СПЕКЕ v1. Формат v1 заморожен (kind.h), и в нём два вида протоколов — `vless`
- * (ключи sub_file, node, nodes) и `xsteer` (conf, stream, stream_port). Виды протоколов ядро держит
- * только из манифестов плагинов, поэтому v1 переводит такой выход в вид плагина спеки v2 — tunnel:vless
- * или xsteer — с ключами, переименованными по таблице ниже, и дальше выход живёт как любой выход вида
+/* ВИДЫ ПЛАГИНОВ В СПЕКЕ v1. Формат v1 заморожен (kind.h), и в нём три вида, которые теперь дают плагины:
+ * `vless` (ключи sub_file, node, nodes), `xsteer` (conf, stream, stream_port) и мост Telegram `tgws`
+ * (domain). Таких видов в ядре нет — только в манифестах плагинов, поэтому v1 переводит такой выход в вид
+ * плагина спеки v2 — tunnel:vless, xsteer или tgws — с ключами, переименованными по таблице ниже, и дальше выход живёт как любой выход вида
  * плагина: схема ключей манифеста, его помощник, {conf}. Таблица — знание о ФОРМАТЕ v1 (какие имена
  * он писал), а не о плагинах: вид берётся у того плагина, который его объявил. Плагина нет — тот же
  * путь, что у v2 (steer-api.md, 3.5): при старте выход недоступен, при apply и check — отказ. */
 static const struct { const char *v1, *v2; } V1_PLUGIN_KIND[] = {
     { "vless", "tunnel:vless" },
     { "xsteer", "xsteer" },
+    { "tgws", "tgws" },
 };
 
 static int v1_plugin_kind(struct spec *s, struct output *o, const char *kind, const struct out_keys *k,
@@ -293,6 +294,7 @@ static int v1_plugin_kind(struct spec *s, struct output *o, const char *kind, co
     if (k->conf[0]) { sb_str(&b, n++ ? ",\"conf\":" : "\"conf\":"); sb_json(&b, k->conf); }
     if (k->stream) { sb_str(&b, n++ ? ",\"stream\":true" : "\"stream\":true"); }
     if (k->stream_port) { sb_printf(&b, "%s\"stream_port\":%d", n++ ? "," : "", k->stream_port); }
+    if (k->domain[0]) { sb_str(&b, n++ ? ",\"domain\":" : "\"domain\":"); sb_json(&b, k->domain); }
     sb_str(&b, "}");
     if (b.oom) { free(b.p); return v1_nomem(e); }
     const struct plugin_kind *pk = plugin_kind_find(v2);
@@ -344,6 +346,14 @@ static int v1_plugin_kind(struct spec *s, struct output *o, const char *kind, co
     o->plg.keys_json = spec_strdup(s, json);
     free(json);
     if (!o->plg.keys_json) return v1_nomem(e);
+    /* Ресурсы выхода (порт моста tgws): подготовки у спеки v1 нет, поэтому номера выдаются здесь — те же
+     * постоянные номера alloc.json, что выдала бы подготовка v2. */
+    if ((pk->res_ports || pk->res_queues) &&
+        plugin_alloc_out(s, pk, o->name, &o->plg.ports, &o->plg.ports_n, &o->plg.queues, &o->plg.queues_n, e) != 0) {
+        char m[sizeof(e->msg) + 64];
+        snprintf(m, sizeof m, "outputs.%s: %s", o->name, e->msg);
+        return err_set(e, "%s", m);
+    }
     return 0;
 }
 
@@ -563,6 +573,7 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             k.sub_file[0] = k.conf[0] = '\0';
             k.stream = k.stream_port = 0;
             k.nodes_n = 0;
+            k.domain[0] = '\0';
         }
         if (kd->parse && kd->parse(&o, &k, e) != 0) return -1;
         /* КЛЮЧ ЧУЖОГО ВИДА — отказ. Поле, принятое молча у чужого вида выхода, — это
@@ -579,7 +590,7 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             return err_set(e, "outputs.%s: stream есть только у kind=xsteer", o.name);
         if (k.opts_file[0] && !(kd->keys & KK_OPTS))
             return err_set(e, "outputs.%s: opts_file есть только у kind=recheck", o.name);
-        if (k.domain[0] && !(kd->keys & KK_DOMAIN))
+        if (k.domain[0])
             return err_set(e, "outputs.%s: domain есть только у kind=tgws", o.name);
         /* Своя проверка вида после общих — то, что зависит от общих полей (on_fail у tgws). */
         if (kd->check && kd->check(s, &o, e) != 0) return -1;

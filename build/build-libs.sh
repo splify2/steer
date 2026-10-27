@@ -1,7 +1,6 @@
 #!/bin/sh
 # Разделяемая раскладка роутера под ОДНУ архитектуру (шаг 4 выпуска 1.10, docs/architecture.md,
-# «Сборки»): libsteer-wolfssl.so, libsteer.so, steerd, модули steer-vless, steer-xsteer, steer-obfs,
-# steer-tgws.
+# «Сборки»): libsteer-wolfssl.so, libsteer.so, steerd, плагин-библиотека net1 и программы плагинов.
 #
 #     sh build/build-libs.sh ВЫХОДНОЙ_КАТАЛОГ ВЕРСИЯ [РЕВИЗИЯ]
 #
@@ -12,8 +11,8 @@
 # /opt/wolfssl), JOBS (параллельность). Зовут этот скрипт build.sh (внутри образа сборщика, по разу
 # на архитектуру) и tests/libs-test.sh (на хосте, gcc).
 #
-# ЧТО В КАКОМ ФАЙЛЕ — build/sources.mk (PROFILE_libsteer, PROFILE_steerd, PROFILE_mod_tgws,
-# PROFILE_net1, PROFILE_plug_*); здесь
+# ЧТО В КАКОМ ФАЙЛЕ — build/sources.mk (PROFILE_libsteer, PROFILE_steerd, PROFILE_net1, PROFILE_plug_*);
+# здесь
 # только рецепт. Файлы на выходе называются по SONAME, а не по «libсteer.so»: у libsteer версия
 # движка (ABI между версиями не обещается, и бинарник, слинкованный с чужой версией, должен не
 # запуститься с понятной ошибкой загрузчика, а не молча взять несовместимую), у libsteer-wolfssl —
@@ -28,11 +27,14 @@
 # где musl ищет по умолчанию.
 #
 # РАСКЛАДКА 2.1 (единственная; build/sources.mk, «РАСКЛАДКА 2.1»): libsteer без стека протоколов,
-# steerd, модуль steer-tgws (мост ещё не плагин), плагин-библиотека net1 и плагины протоколов:
+# steerd, плагин-библиотека net1 и программы плагинов (модулей ядра больше нет):
 #
-#     ВЫХОД/libsteer.so.<версия> libsteer-wolfssl.so.<версия> steerd steer-tgws
+#     ВЫХОД/libsteer.so.<версия> libsteer-wolfssl.so.<версия> steerd
 #     ВЫХОД/plugins/net1/lib/libs2p-net.so.1
-#     ВЫХОД/plugins/<id>/bin/<id>          vless hysteria2 proxy xsteer warpbox obfs
+#     ВЫХОД/plugins/<id>/bin/<id>          vless hysteria2 proxy xsteer warpbox obfs tgws
+#
+# tgws — плагин репозитория splify2-extended-plugins (PLUGINS_EXTENDED): программу собирает это дерево,
+# архив .s2p — тот репозиторий.
 #
 # Плагины ищут net1 по RUNPATH $ORIGIN/../../net1/lib — раскладка каталога плагинов на роутере
 # (/usr/lib/steer/plugins/<id>/bin) та же, что здесь. Прежней раскладки 2.0 (модули steer-<m> на
@@ -214,7 +216,6 @@ $CC -O2 $APPF -c "$MODCMD" -o "$OBJ/modcmd.o"
 # внешнему модулю не нужны, их пакеты собирает build.sh steer.
 if [ -z "${STEER_EXT_ONLY:-}" ]; then
 link_app steerd "-O2 $APPF" PROFILE_steerd
-link_app steer-tgws "-O2 $APPF" PROFILE_mod_tgws
 fi
 
 # ---- net1 и плагины протоколов (раскладка 2.1) ----------------------------------------------------
@@ -271,14 +272,26 @@ if [ -z "${STEER_EXT_ONLY:-}" ]; then
     # RUNPATH ставит компоновщик ($ORIGIN/../../net1/lib, plugin-sdk/docs/manifest.md, «libs»).
     _ldi=""
     [ -z "$INTERP" ] || _ldi="-Wl,--dynamic-linker=$INTERP"
+    # Вид: 1 — на net1; 0 — статически без TLS; tls — статически со своим TLS и wolfSSL (архив с -fPIC тот
+    # же, что у библиотек: лишнего в программу не попадает, --gc-sections).
     plug() {
         _n="$1"; _net="$2"
         _od="$OBJ/plug-$_n"; _pd="$OUT/plugins/$_n/bin"
         mkdir -p "$_od" "$_pd"
         if [ "$_net" = 1 ]; then _pf="-O2 $APPF -Wno-address -include $N1H"; else _pf="-O2 $APPF"; fi
-        # shellcheck disable=SC2046,SC2086
-        compile "$_pf" "$_od" $(profile_var "PROFILE_plug_$_n")
-        if [ "$_net" = 1 ]; then
+        _ps=""
+        for f in $(profile_var "PROFILE_plug_$_n"); do
+            [ "$_net" = tls ] && [ "$f" = "$CRYPTO" ] && continue
+            _ps="$_ps $f"
+        done
+        # shellcheck disable=SC2086
+        compile "$_pf" "$_od" $_ps
+        if [ "$_net" = tls ]; then
+            # shellcheck disable=SC2086
+            $CC $_pf $WCFLAGS -c "$CRYPTO" -o "$_od/$(echo "$CRYPTO" | tr / _).o"
+            # shellcheck disable=SC2086
+            $CC -o "$_pd/$_n" "$_od"/*.o "$WLIB" $_ldi -Wl,--gc-sections -s $LIBS
+        elif [ "$_net" = 1 ]; then
             # shellcheck disable=SC2086
             $CC -o "$_pd/$_n" "$_od"/*.o "$N1SO" '-Wl,-rpath,$ORIGIN/../../net1/lib' $_ldi \
                 -Wl,--gc-sections -Wl,--as-needed -s $LIBS
@@ -289,6 +302,7 @@ if [ -z "${STEER_EXT_ONLY:-}" ]; then
     }
     for _p in $(profile_var PLUGINS_NET1); do plug "$_p" 1; done
     for _p in $(profile_var PLUGINS_STATIC); do plug "$_p" 0; done
+    for _p in $(profile_var PLUGINS_TLS); do plug "$_p" tls; done
 fi
 
 # Внешние модули (STEER_EXT_APPS="имя:каталог …"): бинарники из исходников ВНЕ этого дерева —
@@ -309,4 +323,4 @@ for _ea in ${STEER_EXT_APPS:-}; do
 done
 
 # Клиент сокета `steer` — по-прежнему статический (build.sh собирает его сам).
-echo "libs: готово в $OUT (раскладка 2.1: libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-tgws, net1, плагины $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC)${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"
+echo "libs: готово в $OUT (раскладка 2.1: libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, net1, плагины $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC) $(profile_var PLUGINS_TLS)${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"

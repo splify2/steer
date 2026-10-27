@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "id": "tgws",
+  "version": "@VERSION@",
+  "type": "plugin",
+  "name": "Мост Telegram",
+  "description": "Telegram через Cloudflare, без настройки в приложении",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/splify2/splify2-extended-plugins",
+  "compat": {
+    "steer-api": "^1.1",
+    "splify2-api": "^1.0"
+  },
+  "arch": [
+    "aarch64_cortex-a53",
+    "aarch64_cortex-a72",
+    "aarch64_generic",
+    "arm_cortex-a7_neon-vfpv4",
+    "arm_cortex-a9",
+    "arm_cortex-a9_neon",
+    "arm_cortex-a9_vfpv3-d16",
+    "mipsel_24kc",
+    "mips_24kc",
+    "x86_64"
+  ],
+  "permissions": [
+    "net.admin",
+    "nft",
+    "http"
+  ],
+  "steer": {
+    "kinds": [
+      {
+        "name": "tgws",
+        "keys": "kinds/tgws.schema.json",
+        "caps": [
+          "mark"
+        ],
+        "helper": {
+          "prog": "bin/tgws",
+          "cmd": "tgws",
+          "argv": [
+            "tgws",
+            "{out}",
+            "--conf",
+            "{conf}"
+          ]
+        },
+        "check": {
+          "prog": "bin/tgws",
+          "argv": [
+            "check"
+          ]
+        },
+        "health": "events",
+        "nft": [
+          "nft/tgws.nft"
+        ],
+        "resources": {
+          "ports": 1
+        },
+        "description": "Мост Telegram.",
+        "texts": {
+          "lan_only": "у трафика самого устройства моста нет"
+        }
+      }
+    ],
+    "commands": [
+      {
+        "name": "tgws-probe",
+        "prog": "bin/tgws",
+        "help": "проверить путь до дата-центра Telegram и его ответ",
+        "usage": "[media] [--node N] [--domain ДОМЕН] [--direct] [--timeout СЕК]"
+      }
+    ]
+  },
+  "splify2": {
+    "settings": {
+      "schema": "settings.schema.json"
+    }
+  },
+  "i18n": {
+    "languages": [
+      "ru",
+      "en"
+    ]
+  }
+}

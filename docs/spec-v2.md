@@ -181,7 +181,7 @@ rules:
 | `xsteer` | `conf`, `stream`, `stream_port`, `device` | xsteer; `conf` — файл в стиле wg (умолчание `{etc}/xsteer/<имя>.conf`) |
 | `awg` | `conf`, `device` | AmneziaWG, устройство заводит ядро; `conf` — умолчание `{etc}/awg/<имя>.conf` |
 | `zapret` | — | убран в 2.1.0: отказ с названием замены (модуль DPI `recheck` или `kind: direct`) |
-| `tgws` | `domain` | мост Telegram; `domain` обязателен; `on_fail` — только `drop` |
+| `tgws` | `domain` | мост Telegram — вид плагина `tgws` (репозиторий `splify2-extended-plugins`); `domain` обязателен; `on_fail` — только `drop`; пул доменов, пути дата-центров и туннели WARP — настройки плагина |
 | `group` | `members`, `pick`, `default`, `tolerance`, `interval`, `url`, `idle_timeout`, `weights` | группа выходов (ниже) |
 | `warp` | `count`, `transport`, `countries`, `exclude_countries`, `pick`, `tolerance`, `interval`, `url`, `idle_timeout`, `on_fail`, `over`, `ipv6` (`nat` или `off`) | Cloudflare WARP: группа из `count` туннелей «<имя>.<n>» (по умолчанию один: самую быструю точку входа модуль держит у того же устройства) — `awg` или, с `transport: masque`, MASQUE (TUN модуля); `count` — 1..255; `transport` — `awg` (умолчание) или `masque`; `pick` — `latency` (умолчание) или `order`; `interval` по умолчанию 600 с; `ipv6` по умолчанию `nat`; имя выхода не длиннее 27 знаков. Регистрацию и точки ведёт плагин warpbox ([docs/warp.md](warp.md)) |
 

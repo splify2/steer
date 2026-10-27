@@ -21,6 +21,9 @@ command -v python3 >/dev/null 2>&1 || { echo "dnsproxy: python3 нет — пр�
 
 tmp="$(mktemp -d)"
 trap 'kill ${DPID:-0} ${UPID:-0} ${DPID2:-0} ${DPID3:-0} ${UPID3:-0} 2>/dev/null; exec 3>&- 2>/dev/null; rm -rf "$tmp"' EXIT
+# Выход без IPv6 в фикстурах — мост Telegram (kind: tgws), вид плагина tgws: каталог плагинов дерева.
+sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" >/dev/null || { echo "dnsproxy: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 
 LPORT=15300
 UPORT=15353

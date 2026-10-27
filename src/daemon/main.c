@@ -86,13 +86,11 @@ int dnsd_sig_print(const char *spec, FILE *out);
 /* Та же таблица, которую демон шлёт резолверу трубой --table-fd (docs/architecture.md, раздел
  * 4а) — текстом в stdout, для стендов и ручной отладки. src/dnsd/tabfmt.c. */
 void tabfmt_build(const struct spec *sp, FILE *out);
-/* КОМАНДЫ МОДУЛЕЙ, КОТОРЫХ В СБОРКЕ МОЖЕТ НЕ БЫТЬ (docs/architecture.md, раздел 2, правило 3).
+/* КОМАНДЫ, КОТОРЫХ В СБОРКЕ МОЖЕТ НЕ БЫТЬ (docs/architecture.md, раздел 2, правило 3).
  *
- * Клиенты VLESS и xsteer, подписка, обфускатор, мост Telegram и служебные команды xsteer — команды
- * модулей; что с ними делает steerd (исполняет на месте в статической сборке, запускает
- * бинарник модуля или называет пакет), решает src/cli/modcmd.c, там же слабые ссылки на них и
- * контрактные тексты отказов. Здесь остался один хаб: он не модуль роутера, а отдельный архив
- * для VPS (профиль server).
+ * Модулей ядра больше нет: подкоманды протоколов и моста Telegram — плагинов (манифесты,
+ * plugin_cmd_find). Здесь остался один хаб: он не модуль роутера, а отдельный архив для VPS
+ * (профиль server).
  *
  * ЕДИНСТВЕННАЯ ПОДКОМАНДА «VLESS», КОТОРАЯ ОТВЕЧАЕТ БЕЗ МОДУЛЯ. Идентификатор роутера считает
  * src/tools/hwid.c, входящий в каждую сборку: читателей у него стало двое, и второй (телеметрия
@@ -126,7 +124,7 @@ static int no_plugin_mgr(void) {
  * нужно человеку и управляющему слою отдельно от движка. Отличается argv[0], а не сборкой: файл
  * один, и расходиться инструментам с движком негде. */
 static const char *const TOOLS[] = {
-    "fit", "srs-read", "sub-hwid", "dev-id", "tgws-probe", "xsteer-hub", "dnsd-table", NULL,
+    "fit", "srs-read", "sub-hwid", "dev-id", "xsteer-hub", "dnsd-table", NULL,
 };
 
 /* Программы плагинов, вкомпилированные в статический бинарник (телефон; src/plugkit, PK_PROGRAM): ядро
@@ -160,8 +158,7 @@ int main(int argc, char **argv) {
         }
         if (p) return pk_prog_run(p, argc, argv);
     }
-    /* Платформа (src/platform/platform.h) — до всего остального (modcmd_platform_args, общая с
-     * модулями): от неё зависят пути по умолчанию, справка и раскладка меток. */
+    /* Платформа (src/platform/platform.h) — до всего остального (modcmd_platform_args): от неё зависят пути по умолчанию, справка и раскладка меток. */
     if (modcmd_platform_args(&argc, argv) != 0) return 2;
     plat();
     if (argc < 2) {
@@ -220,8 +217,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "apply-commit")) return cmd_apply_commit(argc - 2, argv + 2);
 
     /* Подкоманда плагина (манифест, steer.commands): исполняется вместо этого процесса. Раньше
-     * команд ядра — плагин может взять имя команды модуля ядра (мост tgws), но не имя команды
-     * ядра (plugin.c, resolve_conflicts). */
+     * команд ядра — имя команды ядра плагин взять не может (plugin.c, resolve_conflicts). */
     {
         const struct plugin_cmd *pc = plugin_cmd_find(cmd);
         if (pc) return plugin_cmd_exec(pc, argc - 2, argv + 2);
@@ -344,7 +340,7 @@ int main(int argc, char **argv) {
         for (size_t pi = 0; !kind_ok && pi < plugin_kinds_n(); pi++)
             kind_ok = !strcmp(plugin_kind_ops_at(pi)->name, a.kind);
         if (!kind_ok)
-            die("--kind: нужен вид выхода (direct, block, interface, awg, tgws, group или вид плагина), а не %s", a.kind);
+            die("--kind: нужен вид выхода (direct, block, interface, awg, group или вид плагина), а не %s", a.kind);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         for (size_t i = 0; i < cfg.out_n; i++) {
             const char *k = out_kind_name(&cfg.out[i]);
@@ -372,20 +368,13 @@ int main(int argc, char **argv) {
      * находиться — резолвер не поднимался, а apply при этом ставил перенаправление
      * DNS, и каждый запрос из LAN уходил в закрытый порт. Что будет сгенерировано,
      * знает только движок, поэтому отвечает он. */
-    /* Что поднимать init-скрипту для выходов kind=tgws: по строке на выход, код 0, если поднимать
-     * есть что. Что печатается и почему, — kinds/tgws.c. */
-    if (!strcmp(cmd, "tgws-instances")) {
-        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
-        if (registry_assign(&cfg, &e) < 0) err_die(&e);
-        return tgws_instances(&cfg);
-    }
     /* ХВАТИТ ЛИ РЕЗОЛВЕРУ SIGHUP. Печатает подпись таблицы каналов по текущей спеке; сам
      * резолвер положил такую же в каталог состояния при запуске. Совпали — init-скрипт
      * посылает HUP, и локальная сеть не теряет разрешение имён ни на секунду; разошлись —
      * нужен перезапуск, потому что состав каналов HUP не пересобирает.
      *
      * Отдельной командой, а не полем status: её читает оболочка построчно и сравнивает
-     * целиком, а не разбирает. Тот же довод, что у tgws-instances и needs-dnsd. */
+     * целиком, а не разбирает. Тот же довод, что у needs-dnsd. */
     if (!strcmp(cmd, "dnsd-sig")) return dnsd_sig_print(spec, stdout);
     /* Та же таблица, которую резолвер получил бы трубой --table-fd — текстом в stdout, для
      * стендов (труба вместо файла спеки) и ручной отладки. Формат — src/dnsd/tabfmt.h. */
@@ -423,13 +412,6 @@ int main(int argc, char **argv) {
     /* Хаб живёт на VPS: спека ему не нужна и не читается — там ни выходов, ни каналов, а
      * есть конфигурация звезды и порт. Прецедент тот же, что у obfs-server. */
     if (!strcmp(cmd, "xsteer-hub")) return cmd_xsteer_hub ? cmd_xsteer_hub(a.config) : no_hub();
-    /* Команды модулей (VLESS и подписка, xsteer, обфускатор, мост Telegram): на месте, если
-     * модуль слинкован в этот бинарник, иначе — запуском steer-<модуль> или отказом «нужен
-     * пакет» (src/cli/modcmd.c). */
-    {
-        int mrc = modcmd_run(cmd, argc, argv, &a, spec, arg, &cfg);
-        if (mrc != MODCMD_NONE) return mrc;
-    }
     /* Сюда попасть нельзя: имя нашлось в таблице, значит ветка для него есть. Если
      * всё-таки попали — в таблицу добавили команду и забыли про диспетчер. */
     die("команда %s объявлена, но не подключена — это ошибка в ядре steer", cmd);

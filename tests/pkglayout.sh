@@ -64,15 +64,15 @@ T=/tmp/pl
 rm -rf "$T"; mkdir -p "$T"
 core_apk="$(ls out/steer-core-*_"$A".apk | head -1)"
 V="${core_apk#out/steer-core-}"; V="${V%%-1_*}"     # версия без ревизии сборки
-# Раскладка 2.1 (умолчание build.sh): протоколы — плагины (.s2p и семя в steer-core), пакетом остаётся
-# только мост steer-tgws; 2.0 (STEER_LAYOUT=2.0) — прежние пакеты модулей и мета-пакет.
+# Раскладка 2.1 (умолчание build.sh): протоколы и мост Telegram — плагины (.s2p и семя в steer-core), пакет
+# один — steer-core; 2.0 (STEER_LAYOUT=2.0) — прежние пакеты модулей и мета-пакет.
 if ls out/steer-vless-"$V"-1_"$A".apk >/dev/null 2>&1; then LAYOUT=2.0; else LAYOUT=2.1; fi
 if [ "$LAYOUT" = 2.0 ]; then
     MODS="vless xsteer obfs tgws hysteria2"
     PKGS="steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-extended"
 else
-    MODS="tgws"
-    PKGS="steer-core steer-tgws"
+    MODS=""
+    PKGS="steer-core"
 fi
 echo "pkglayout: раскладка $LAYOUT"
 
@@ -175,10 +175,10 @@ for old in steer libsteer libsteer-wolfssl; do
     check "steer-core (ipk) Replaces/Conflicts $old" "1 1" \
         "$(ctl steer-core Replaces | tr ',' '\n' | grep -c "^ *$old\$") $(ctl steer-core Conflicts | tr ',' '\n' | grep -c "^ *$old\$")"
 done
-# provides — на каждое имя «заменяет» (plugin-sdk/docs/open.md, О-23); в 2.1 — и на пакеты протоколов и
-# steer-extended (migration-2.1.md, раздел 2), кроме steer-tgws: он пакетом остаётся.
+# provides — на каждое имя «заменяет» (plugin-sdk/docs/open.md, О-23); в 2.1 — и на пакеты протоколов, моста
+# steer-tgws и steer-extended (migration-2.1.md, раздел 2).
 OLDN="steer libsteer libsteer-wolfssl"
-[ "$LAYOUT" = 2.1 ] && OLDN="$OLDN steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-extended"
+[ "$LAYOUT" = 2.1 ] && OLDN="$OLDN steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-tgws steer-extended"
 for old in $OLDN; do
     check "steer-core (apk) provides $old=$V-r1 и replaces $old" "1 1" "$(has steer-core "    - $old=$V-r1") $(has steer-core "    - $old")"
     check "steer-core (ipk) Provides и Replaces $old" "1 1" \
@@ -187,15 +187,13 @@ done
 if [ "$LAYOUT" = 2.1 ]; then
     # opkg 24.10 снимает установленные модули только при Conflicts (с Replaces и Provides): без него после
     # `opkg install steer-core` модули 2.0.x стоят дальше с нарушенной зависимостью от ядра. apk обходится
-    # provides/replaces: `!имя` в depends ему здесь не нужен, и steer-tgws не трогается.
-    for old in steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-extended; do
+    # provides/replaces: `!имя` в depends ему здесь не нужен. steer-tgws — тоже: мост стал плагином tgws.
+    for old in steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-tgws steer-extended; do
         check "steer-core (ipk) конфликтует с прежним пакетом $old" "1" \
             "$(ctl steer-core Conflicts | tr ',' '\n' | grep -c "^ *$old\$")"
         check "steer-core (apk) не пишет !$old (его снимает provides)" "0" "$(has steer-core "    - '!$old'")"
     done
-    check "steer-core (ipk) не конфликтует с steer-tgws" "0" "$(ctl steer-core Conflicts | grep -c tgws)"
 fi
-check "steer-core не берёт имя steer-tgws (мост — свой пакет)" "0" "$(grep -c 'steer-tgws' "$T/dump.steer-core")"
 # Скрипты ядра: прежнее поведение — включить и перезапустить при установке, остановить и выключить при удалении.
 check "steer-core (ipk): postinst включает и перезапускает службу" "2" \
     "$(grep -cE '/etc/init\.d/steer (enable|restart)' "$T/ctl/steer-core/postinst")"
@@ -229,8 +227,8 @@ if [ "$LAYOUT" = 2.1 ]; then
     #     `apk add имя` из фида пишет просто имя, и тогда provides работает. Поэтому сценарии идут
     #     в двух видах — «фид» и «файлы»; в мире стоят ВСЕ модули (в прежней редакции — только steer-core
     #     и пара модулей, мета-пакет — без модулей);
-    #   - steer-tgws остаётся пакетом: прежний 2.0.x требует ядро 2.0.x, так что вместе с ядром идёт
-    #     steer-tgws 2.1 (из фида — сам, файлом — рядом в команде);
+    #   - steer-tgws тоже снимается: мост стал плагином tgws (репозиторий splify2-extended-plugins), ядро 2.1
+    #     заменяет и его пакет;
     #   - kmod-tun: прежние модули тянули его, и apk снимает осиротевшую зависимость в той же транзакции —
     #     плагины vless/hysteria2/xsteer остались бы без TUN, а менеджер плагинов из postinst пакеты
     #     поставить не может (база заперта). Ядро 2.1 держит kmod-tun само.
@@ -251,7 +249,7 @@ if [ "$LAYOUT" = 2.1 ]; then
     mko steer-extended "steer-core=$OV steer-vless=$OV steer-xsteer=$OV steer-obfs=$OV steer-tgws=$OV"
     for r in old new sys; do apk mkndx --allow-untrusted -o "$R0/$r/$A/APKINDEX.tar.gz" "$R0/$r/$A"/*.apk >/dev/null 2>&1; done
     MODW="steer-core steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-tgws"
-    NEWF="$R0/new/$A/steer-core-$V-r1.apk $R0/new/$A/steer-tgws-$V-r1.apk"
+    NEWF="$R0/new/$A/steer-core-$V-r1.apk"
     apkr21() { _root="$1"; shift; apk --root "$_root" --arch "$A" --allow-untrusted --no-network --no-cache \
         --keys-dir "$T/nokeys" --repositories-file /dev/null -X "$R0/sys" "$@"; }
     mkr21() {  # КОРЕНЬ — корень с оболочкой для скриптов пакетов; init.d — заглушкой (как mkroot ниже)
@@ -269,7 +267,7 @@ if [ "$LAYOUT" = 2.1 ]; then
         fi
     }
     heal21() { sed -i 's/><.*//' "$1/etc/apk/world"; }
-    # сценарий: ИМЯ ВИД ПОДГОТОВКА КОМАНДА...  (ОЖИДАНИЕ: прошла, ядро 2.1, tgws 2.1, нет прежних модулей, kmod-tun цел)
+    # сценарий: ИМЯ ВИД ПОДГОТОВКА КОМАНДА...  (ОЖИДАНИЕ: прошла, ядро 2.1, нет прежних модулей и моста, kmod-tun цел)
     sc21() {
         _n="$1"; _k="$2"; _pre="$3"; shift 3
         _r="$T/r21-$_n"
@@ -283,10 +281,10 @@ if [ "$LAYOUT" = 2.1 ]; then
         printf '  [2.1 %s] %s → %s\n' "$_n" "$*" "$_inst"
         check "[2.1 $_n] команда менеджера прошла" "0" "$_rc"
         [ "$_rc" = 0 ] || sed 's/^/    /' "$T/out21-$_n" | head -8
-        check "[2.1 $_n] steer-core и steer-tgws новой версии" "2" \
-            "$(printf '%s\n' $_inst | grep -cE "^steer-(core|tgws)-$V-r1\$")"
-        check "[2.1 $_n] прежних пакетов (модулей, мета-пакета, старого ядра) не осталось" "" \
-            "$(printf '%s\n' $_inst | grep -E "^steer-[a-z0-9]+-$OV\$|^steer-[a-z0-9]+-[0-9.]+-r[0-9]+\$" | grep -vE "^steer-(core|tgws)-$V-r1\$" | tr '\n' ' ')"
+        check "[2.1 $_n] steer-core новой версии" "1" \
+            "$(printf '%s\n' $_inst | grep -cE "^steer-core-$V-r1\$")"
+        check "[2.1 $_n] прежних пакетов (модулей, моста, мета-пакета, старого ядра) не осталось" "" \
+            "$(printf '%s\n' $_inst | grep -E "^steer-[a-z0-9]+-$OV\$|^steer-[a-z0-9]+-[0-9.]+-r[0-9]+\$" | grep -vE "^steer-core-$V-r1\$" | tr '\n' ' ')"
         check "[2.1 $_n] kmod-tun не снят как осиротевший" "1" "$(printf '%s\n' $_inst | grep -c '^kmod-tun-')"
     }
     # 1. из фида с индексом: `apk upgrade` и `apk add` файла ядра — оба
@@ -296,7 +294,7 @@ if [ "$LAYOUT" = 2.1 ]; then
     #    здесь sed по world, тот же смысл
     sc21 file-healed files heal  add $NEWF
     # 3. закрепления остались, но имена модулей названы в той же команде (снимают закрепление транзакции)
-    sc21 file-pinned-named files none add $NEWF steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-extended
+    sc21 file-pinned-named files none add $NEWF steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-tgws steer-extended
     # Информационно: что НЕ работает, чтобы изменение раскладки не прошло молча (ответ — в migration-2.1.md).
     for sc in "pinned-bare:files:none:add $NEWF" "core-only:feed:none:add $R0/new/$A/steer-core-$V-r1.apk"; do
         _n="${sc%%:*}"; _rest="${sc#*:}"; _k="${_rest%%:*}"; _rest="${_rest#*:}"; _pre="${_rest%%:*}"; _cmd="${_rest#*:}"
