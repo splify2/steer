@@ -321,3 +321,19 @@ int plugin_alloc_lookup(struct spec *sp, const struct plugin_kind *pk, const cha
     return rc;
 }
 
+int plugin_alloc_out(struct spec *sp, const struct plugin_kind *pk, const char *out,
+                     uint32_t **ports, size_t *pn, uint32_t **queues, size_t *qn, struct err *e) {
+    if (plugin_alloc_lookup(sp, pk, out, ports, pn, queues, qn) == 0) return 0;
+    struct pal a;
+    if (pal_load(&a) != 0) return err_set(e, "%s", "недостаточно памяти для выдачи ресурсов");
+    char owner[200];
+    snprintf(owner, sizeof(owner), "%s/%s", pk->owner->id, out);
+    int ch = 0;
+    int rc = pal_ensure(&a, owner, pk->res_ports, pk->res_queues, &ch, e);
+    if (rc == 0 && ch && pal_save(&a) != 0) rc = err_set(e, "ресурсы выхода %s не записаны (alloc.json)", out);
+    pal_free(&a);
+    if (rc != 0) return -1;
+    if (plugin_alloc_lookup(sp, pk, out, ports, pn, queues, qn) != 0)
+        return err_set(e, "ресурсы выхода %s не выданы (alloc.json)", out);
+    return 0;
+}

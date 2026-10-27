@@ -1125,6 +1125,11 @@ int spec_prepare(const char *path, struct err *e) {
             err_set(e, "%s", m);
             goto done;
         }
+        /* Выдача ресурсов — на диск ДО пробной загрузки: подготовленную спеку читает разбор ядра, и порты и
+         * очереди выхода вида плагина он берёт из alloc.json (plugin_alloc_lookup). Сохранённая после, она
+         * не находилась при первой подготовке — «ресурсы выхода не выданы — нужен reload», и reload падал
+         * тем же. Номера выданы насовсем (steer-api.md, 6), так что отказ пробы их не отнимает. */
+        if (p.al_changed) { pal_save(&p.al); p.al_changed = 0; }
         struct spec *trial = calloc(1, sizeof(*trial));
         struct err te;
         memset(&te, 0, sizeof(te));

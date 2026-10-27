@@ -242,6 +242,11 @@ void plugin_res_free(struct plugin_res *r);
  * данных менеджера). 0 — выданы; -1 — нет записи (спека не подготовлена). Массивы в арене sp. */
 int plugin_alloc_lookup(struct spec *sp, const struct plugin_kind *pk, const char *out,
                         uint32_t **ports, size_t *pn, uint32_t **queues, size_t *qn);
+/* То же, но с выдачей: ресурсов у выхода ещё нет — выдать (alloc.json) и вернуть. Нужна разбору спеки v1:
+ * её подготовка не идёт (plugprep.c готовит только v2), а вид плагина с ресурсами без номеров не работает.
+ * 0 / -1 (причина в e). */
+int plugin_alloc_out(struct spec *sp, const struct plugin_kind *pk, const char *out,
+                     uint32_t **ports, size_t *pn, uint32_t **queues, size_t *qn, struct err *e);
 
 /* Отчёт последней подготовки спеки path (JSON: что изменили хуки pre_apply и expand, предупреждения)
  * в кучу; -1 — отчёта нет. Ответ apply кладёт его в поле plugins. */
