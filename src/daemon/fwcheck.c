@@ -243,21 +243,47 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
     char line[2048];
     char chain[128] = "";
     int in_steer = 0;
-    while ((pos = dump_line(pos, line, sizeof(line))) != NULL) {
-        /* Our own table mentions the device too; it proves nothing about NAT. */
+    /* Своя таблица — заголовок `table inet <имя> {` с именем ЦЕЛИКОМ. Раньше это был поиск
+     * подстроки «table inet steer» в каждой строке: чужая таблица `inet steerbox` (или любая, чьё
+     * имя начинается с нашего) считалась своей и пропускалась, и выход с masquerade в ней получал
+     * «нет NAT». Строка-образец собиралась snprintf на КАЖДУЮ строку дампа — половина времени
+     * fw_check на большом наборе правил fw4. */
+    char want[80];
+    const int want_n = snprintf(want, sizeof(want), "table inet %s", nft_table());
+    const size_t dev_n = strlen(device);
+    while (pos && *pos) {
+        /* Строка без единого из признаков — ни заголовка таблицы, ни цепочки, ни устройства, ни
+         * подмены — пропускается без копии и без разбора: таких в наборе fw4 почти все (правила
+         * фильтра), а status спрашивает fw_check на каждый выход. Признаки ищутся memmem по
+         * границам строки; длинная строка режется кусками, как у dump_line. */
         {
-            char want[80];
-            snprintf(want, sizeof(want), "table inet %s", nft_table());
-            if (strstr(line, want)) in_steer = 1;
-            else if (!strncmp(line, "table ", 6)) in_steer = 0;
+            const char *nl = strchr(pos, '\n');
+            size_t len = nl ? (size_t)(nl - pos) + 1 : strlen(pos);
+            if (len > sizeof(line) - 1) len = sizeof(line) - 1;
+            if (strncmp(pos, "table ", 6) && !memmem(pos, len, "chain ", 6) &&
+                !memmem(pos, len, "masquerade", 10) && !memmem(pos, len, "snat", 4) &&
+                !(dev_n && memmem(pos, len, device, dev_n))) {
+                pos += len;
+                continue;
+            }
         }
-        if (!strncmp(line, "table ", 6)) tfams = table_fams_of(line);
+        pos = dump_line(pos, line, sizeof(line));
+        /* Our own table mentions the device too; it proves nothing about NAT. */
+        if (!strncmp(line, "table ", 6)) {
+            in_steer = !strncmp(line, want, (size_t)want_n) &&
+                       (line[want_n] == ' ' || line[want_n] == '{' || line[want_n] == '\n' ||
+                        line[want_n] == '\0');
+            tfams = table_fams_of(line);
+        }
         if (in_steer) continue;
 
         const char *c = strstr(line, "chain ");
         if (c) snprintf(chain, sizeof(chain), "%s", c + 6);
 
-        if (names_device(line, device)) r.in_firewall = 1;
+        /* Устройство в строке — один поиск на строку: у большинства строк fw4 его нет, и
+         * дальше им проверять нечего, кроме подмены в цепочке, названной устройством. */
+        const int dev_here = dev_n && strstr(line, device) && names_device(line, device);
+        if (dev_here) r.in_firewall = 1;
         /* fw4 does NOT name the device on the masquerade rule: it emits
          * `chain srcnat_warp0 { meta nfproto ipv4 masquerade comment "...warp0..." }`
          * and matches the device on the jump into that chain. Checking only the rule
@@ -268,20 +294,20 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
          * Требование oif намеренное — masquerade живёт на выходе, и переход по входящему
          * устройству (dstnat) про NAT наружу не говорит ничего. */
         const char *j = strstr(line, "jump ");
-        if (j && strstr(line, "oif") && names_device(line, device)) {
+        if (j && dev_here && strstr(line, "oif")) {
             char t[64];
             chain_token(j + 5, t, sizeof t);
             remember_chain(&dev_chain, t);
         }
         if (strstr(line, "masquerade") || strstr(line, "snat")) {
             unsigned f = rule_fams(line, tfams);
-            if (names_device(line, device) || names_device(chain, device)) {
+            if (dev_here || names_device(chain, device)) {
                 if (f & 1) r.masqueraded = 1;
                 if (f & 2) {
                     r.masq6 = 1;
                     /* Устройство названо именем цепочки (зона зовётся как устройство:
                      * srcnat_wg0) — это и есть зона; названо в самом правиле — зоны нет. */
-                    if (!r.zone6[0] && !names_device(line, device)) {
+                    if (!r.zone6[0] && !dev_here) {
                         char t[64];
                         chain_token(chain, t, sizeof t);
                         zone_of_chain(t, r.zone6, sizeof(r.zone6));

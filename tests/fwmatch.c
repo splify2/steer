@@ -150,6 +150,22 @@ static const char RS_ONLY_STEER[] =
 "	}\n"
 "}\n";
 
+/* Чужая таблица, чьё имя НАЧИНАЕТСЯ с имени нашей (inet steerbox): она не наша, и подмена в ней
+ * засчитывается. Прежде своя таблица узнавалась подстрокой «table inet steer», и такая таблица
+ * пропускалась целиком — выход получал «нет NAT» при работающей подмене. Следом снова наша
+ * таблица — она по-прежнему ничего не доказывает. */
+static const char RS_PREFIX_TABLE[] =
+"table inet steerbox {\n"
+"	chain srcnat {\n"
+"		oifname \"warp0\" masquerade\n"
+"	}\n"
+"}\n"
+"table inet steer {\n"
+"	chain forward {\n"
+"		oifname \"wg9\" masquerade\n"
+"	}\n"
+"}\n";
+
 /* ---- подмена по семействам (с 1.10, шаг 8): masq и masq6 зоны fw4 — разные правила ----------
  *
  * Зона vpn с одним masq6 (`option masq6 '1'` без masq): у fw4 это правило `meta nfproto ipv6
@@ -432,6 +448,8 @@ int main(void) {
 
     /* 8. Собственная таблица движка не доказывает ни зоны, ни NAT. */
     probe("только table inet steer", RS_ONLY_STEER, "warp0", 0, 0);
+    probe("чужая таблица inet steerbox — не наша", RS_PREFIX_TABLE, "warp0", 1, 1);
+    probe("наша таблица после чужой с похожим именем", RS_PREFIX_TABLE, "wg9", 0, 0);
 
     /* 9. Подмена по семействам: masq и masq6 зоны — разные вопросы. */
     probe6("зона только с masq6", RS_MASQ6_ONLY, "wg0", 0, 1);
@@ -563,7 +581,7 @@ int main(void) {
         fprintf(stderr, "fwmatch: провалено проверок: %d\n", g_fail);
         return 1;
     }
-    printf("fwmatch: 16/16 проверок пройдено плюс 7 про объяснение совпадения, 3 про соседей на битах "
+    printf("fwmatch: 18/18 проверок пройдено плюс 7 про объяснение совпадения, 3 про соседей на битах "
            "16-23 и %d проб печати набора правил от ядра\n", g_kernel_n);
     return 0;
 }
