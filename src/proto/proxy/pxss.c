@@ -205,10 +205,15 @@ static int ss_send_tcp(const struct px_node *n, struct ss_sess *s, const unsigne
             uint64_t ts = (uint64_t)time(NULL);
             for (int i = 0; i < 8; i++) fixed[1 + i] = (unsigned char)(ts >> (56 - 8 * i));
             size_t varlen = al + 2 + dn;         /* адрес + padlen(2)=0 + данные */
+            if (varlen > UINT16_MAX || o + 11 + 16 + varlen + 16 > sizeof out)
+                return SEND_FATAL;
             fixed[9] = (unsigned char)(varlen >> 8);
             fixed[10] = (unsigned char)varlen;
             memcpy(out + o, fixed, 11);
-            sc_aead_seal(&s->enc, s->snonce, NULL, 0, out + o, 11, out + o + 11); nonce_inc(s->snonce);
+            if (sc_aead_seal(&s->enc, s->snonce, NULL, 0,
+                             out + o, 11, out + o + 11) != 0)
+                return SEND_FATAL;
+            nonce_inc(s->snonce);
             o += 11 + 16;
             /* var: адрес + padlen(2)=0 + данные. */
             static __thread unsigned char var[8 + 2 + TUNNEL_BUF];
@@ -217,7 +222,10 @@ static int ss_send_tcp(const struct px_node *n, struct ss_sess *s, const unsigne
             memcpy(var + al + 2, data, dn);
             size_t vl = al + 2 + dn;
             memcpy(out + o, var, vl);
-            sc_aead_seal(&s->enc, s->snonce, NULL, 0, out + o, vl, out + o + vl); nonce_inc(s->snonce);
+            if (sc_aead_seal(&s->enc, s->snonce, NULL, 0,
+                             out + o, vl, out + o + vl) != 0)
+                return SEND_FATAL;
+            nonce_inc(s->snonce);
             o += vl + 16;
         } else {
             /* Первый кусок: адрес + данные одним куском (≤ SS_CHUNK). */
@@ -265,7 +273,7 @@ static int ss_send_udp(const struct px_node *n, struct ss_sess *s, const unsigne
     while (left >= 2) {
         size_t dl = ((size_t)p[0] << 8) | p[1];
         p += 2; left -= 2;
-        if (dl > left) return SEND_FATAL;
+        if (dl > left || dl > UDP_DGRAM_MAX) return SEND_FATAL;
         unsigned char pkt[32 + 8 + UDP_DGRAM_MAX + 16], addr[8];
         size_t al = px_socks_addr(addr, s->dst, s->dport);
         size_t o = 0;
