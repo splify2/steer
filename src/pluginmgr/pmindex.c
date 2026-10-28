@@ -427,13 +427,14 @@ static const char *conflict_with(struct pm_ctx *x, const char *id, const struct 
     for (size_t i = 0; i < x->st.n; i++) {
         const char *other = x->st.v[i].id;
         if (!strcmp(other, id)) continue;
-        struct ydoc *m = pm_manifest(other);
+        struct ydoc *own;
+        const struct ynode *m = pm_manifest_ro(x, other, &own);
         if (!m) continue;
-        const struct ynode *oc = ynode_get(ydoc_root(m), "conflicts");
+        const struct ynode *oc = ynode_get(m, "conflicts");
         int hit = 0;
         for (size_t j = 0; j < ynode_len(oc); j++)
             if (yn_is_str(ynode_at(oc, j)) && !strcmp(ynode_at(oc, j)->str, id)) hit = 1;
-        ydoc_free(m);
+        if (own) ydoc_free(own);
         if (hit) return other;
     }
     return NULL;

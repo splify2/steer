@@ -236,6 +236,9 @@ struct pm_ctx {
     int before_bad;
     const char *pkg_tx;          /* --pkg ИМЯ: менеджер зовёт скрипт этого системного пакета изнутри
                                     транзакции apk/opkg — пакет считается стоящим, база заперта */
+    struct pm_mslot *mc;         /* кэш манифестов команд только чтения (pm_mcache_on): хеш по id */
+    size_t mcap, mn;
+    int mcache;
 };
 void pm_progress(struct pm_ctx *x, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
@@ -267,6 +270,13 @@ int pm_file_sha256(const char *path, unsigned char out[32], unsigned long long *
 int pm_http_mem(const char *url, char **body, size_t *n, char *why, size_t wn);
 /* Манифест стоящего плагина (NULL — не читается). */
 struct ydoc *pm_manifest(const char *id);
+/* Манифест для чтения: при включённом кэше (команды без записи — list, status) каждый plugin.json
+ * разбирается один раз за процесс и *own остаётся NULL; без кэша *own — документ, его освобождает
+ * вызывающий. NULL — манифест не читается. */
+struct pm_mslot { char *id; struct ydoc *d; };
+const struct ynode *pm_manifest_ro(struct pm_ctx *x, const char *id, struct ydoc **own);
+void pm_mcache_on(struct pm_ctx *x);
+void pm_mcache_free(struct pm_ctx *x);
 
 /* Демон: перечитать плагины и спеку (plugin-reload). 0 — прошло или демона нет; -1 — отказ, текст в e. */
 int pm_daemon_reload(struct pm_ctx *x, struct pm_err *e);

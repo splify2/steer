@@ -177,8 +177,8 @@ static void emit_names(struct jw *w, const struct ynode *list) {
 }
 
 static void emit_entry(struct pm_ctx *x, struct jw *w, const struct pm_inst *p, const char *id, int deep) {
-    struct ydoc *md = pm_manifest(id);
-    const struct ynode *m = md ? ydoc_root(md) : NULL;
+    struct ydoc *md;
+    const struct ynode *m = pm_manifest_ro(x, id, &md);
     char *dir = pm_path(pm_root(), id);
     jw_obj(w);
     jw_kstr(w, "id", id);
@@ -231,9 +231,10 @@ static void emit_entry(struct pm_ctx *x, struct jw *w, const struct pm_inst *p, 
     jw_arr(w);
     for (size_t i = 0; i < x->st.n; i++) {
         if (!strcmp(x->st.v[i].id, id)) continue;
-        struct ydoc *om = pm_manifest(x->st.v[i].id);
-        if (om && ynode_get(ynode_get(ynode_get(ydoc_root(om), "requires"), "plugins"), id)) jw_str(w, x->st.v[i].id);
-        if (om) ydoc_free(om);
+        struct ydoc *own;
+        const struct ynode *om = pm_manifest_ro(x, x->st.v[i].id, &own);
+        if (om && ynode_get(ynode_get(ynode_get(om, "requires"), "plugins"), id)) jw_str(w, x->st.v[i].id);
+        if (own) ydoc_free(own);
     }
     jw_aend(w);
     jw_key(w, "bad_versions");
@@ -308,6 +309,8 @@ static char **all_ids(struct pm_ctx *x, size_t *n) {
 }
 
 static int cmd_list(struct pm_ctx *x, const char *only, int deep) {
+    /* Без записи: манифесты разбираются по разу (used_by и отбор обновления смотрят манифесты всех). */
+    pm_mcache_on(x);
     size_t n = 0;
     char **ids = all_ids(x, &n);
     if (only && !pm_state_find(&x->st, only)) {
@@ -1357,6 +1360,7 @@ out_nojob:
     pm_unlock();
 out:
     fflush(stdout);
+    pm_mcache_free(&x);
     pm_state_free(&x.st);
     pm_repos_free(&x.repos);
     free(x.tg.core); free(x.tg.api); free(x.tg.abi); free(x.tg.host); free(x.tg.splify2); free(x.tg.arch);
