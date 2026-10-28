@@ -41,6 +41,8 @@ struct ss_sess {
     unsigned char snonce[12], rnonce[12];
     unsigned char salt_sent[32];
     uint32_t dst; uint16_t dport;
+    unsigned char dst6[16];
+    int ipv6;
 
     size_t acc_n, want;          /* накопитель и сколько байт ждём на стадии */
     /* Расшифрованный кусок, который за один проход не влез в место стека, лежит в acc
@@ -88,6 +90,8 @@ static int ss_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
     struct ss_sess *s = sess;
     s->udp = (uint8_t)udp;
     s->dst = k->dst;
+    s->ipv6 = flow_is6(k);
+    memcpy(s->dst6, k->dst6, 16);
     s->dport = k->dport;
     s->keylen = n->ss_key_n ? n->ss_key_n : 16;
     s->is2022 = n->ss_method >= SS_2022_AES128;
@@ -178,7 +182,10 @@ static int ss_send_tcp(const struct px_node *n, struct ss_sess *s, const unsigne
         if (n->ss_method == SS_NONE) {
             /* none: соль не нужна, но адрес и данные идут в открытую. Перепишем: без соли. */
             o = 0;
-            o += px_socks_addr(out + o, s->dst, s->dport);
+            o = px_socks_addr_ip(out, sizeof(out),
+                                 s->ipv6 ? s->dst6 : (const unsigned char *)&s->dst,
+                                 s->ipv6 ? 6 : 4, s->dport);
+            if (!o) return SEND_FATAL;
             if (o + dn > sizeof out) return SEND_FATAL;
             memcpy(out + o, data, dn); o += dn;
             s->header_sent = 1;
@@ -189,8 +196,11 @@ static int ss_send_tcp(const struct px_node *n, struct ss_sess *s, const unsigne
         if (sc_aead_setkey(&s->enc, ss_alg(n->ss_method), subkey) != 0) return SEND_FATAL;
         s->has_enc = 1;
         memset(s->snonce, 0, 12);
-        unsigned char addr[8];
-        size_t al = px_socks_addr(addr, s->dst, s->dport);
+        unsigned char addr[19];
+        size_t al = px_socks_addr_ip(addr, sizeof(addr),
+                                     s->ipv6 ? s->dst6 : (const unsigned char *)&s->dst,
+                                     s->ipv6 ? 6 : 4, s->dport);
+        if (!al) return SEND_FATAL;
         if (s->is2022) {
             /* EIH для многопользовательского (один уровень реле). */
             if (n->ss_ipsk_n) {
@@ -274,8 +284,11 @@ static int ss_send_udp(const struct px_node *n, struct ss_sess *s, const unsigne
         size_t dl = ((size_t)p[0] << 8) | p[1];
         p += 2; left -= 2;
         if (dl > left || dl > UDP_DGRAM_MAX) return SEND_FATAL;
-        unsigned char pkt[32 + 8 + UDP_DGRAM_MAX + 16], addr[8];
-        size_t al = px_socks_addr(addr, s->dst, s->dport);
+        unsigned char pkt[32 + 19 + UDP_DGRAM_MAX + 16], addr[19];
+        size_t al = px_socks_addr_ip(addr, sizeof(addr),
+                                     s->ipv6 ? s->dst6 : (const unsigned char *)&s->dst,
+                                     s->ipv6 ? 6 : 4, s->dport);
+        if (!al) return SEND_FATAL;
         size_t o = 0;
         if (n->ss_method == SS_NONE) {
             memcpy(pkt, addr, al); o = al;

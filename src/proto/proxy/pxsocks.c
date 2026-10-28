@@ -24,6 +24,8 @@ struct socks_sess {
     int cfd;                     /* TCP: поток; UDP: управляющее соединение */
     int udpfd;                   /* UDP: сокет к ретранслятору; TCP: -1 */
     uint32_t dst; uint16_t dport;
+    unsigned char dst6[16];
+    int ipv6;
 };
 
 static const char *sk_peer(const void *ctx) { return ((const struct px_node *)ctx)->vn.host; }
@@ -44,8 +46,10 @@ static int sk_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
     struct socks_sess *s = sess;
     s->udp = (uint8_t)udp;
     s->dst = k->dst;
+    s->ipv6 = flow_is6(k);
+    memcpy(s->dst6, k->dst6, 16);
     s->dport = k->dport;
-    if (udp && n->socks_ver != 5) {
+    if ((udp || s->ipv6) && n->socks_ver != 5) {
         static __thread time_t said;
         time_t now = stack_now_s();
         if (now - said >= 10) { said = now;
@@ -136,6 +140,20 @@ static int socks5_request(int fd, uint8_t cmd, uint32_t dst, uint16_t dport,
     return 0;
 }
 
+static int socks5_request_ip(int fd, uint8_t cmd, const unsigned char *ip, int family,
+                             uint16_t dport, unsigned char *bnd_ip, uint16_t *bnd_port) {
+    unsigned char req[22], rep[3];
+    req[0] = 5; req[1] = cmd; req[2] = 0;
+    size_t al = px_socks_addr_ip(req + 3, sizeof(req) - 3, ip, family, dport);
+    if (!al) return PX_EPROTO;
+    if (wr_full(fd, req, 3 + al)) return TR_EIO;
+    if (rd_full(fd, rep, 3)) return TR_EIO;
+    if (rep[0] != 5) return PX_EPROTO;
+    if (rep[1] != 0) return PX_EADDR;
+    if (socks5_skip_reply_addr(fd, bnd_ip, bnd_port) != 0) return PX_EPROTO;
+    return 0;
+}
+
 static int socks4_request(int fd, uint32_t dst, uint16_t dport, const char *user) {
     unsigned char req[9 + PX_USER_MAX], rep[8];
     size_t o = 0;
@@ -161,7 +179,9 @@ static int sk_connect(const void *ctx, void *sess, int timeout_s) {
         rc = socks5_hello(fd, n);
         if (rc == 0) {
             if (!s->udp) {
-                rc = socks5_request(fd, 1, s->dst, s->dport, NULL, NULL);
+                rc = socks5_request_ip(fd, 1,
+                        s->ipv6 ? s->dst6 : (const unsigned char *)&s->dst,
+                        s->ipv6 ? 6 : 4, s->dport, NULL, NULL);
             } else {
                 unsigned char bnd[4] = { 0 };
                 uint16_t bport = 0;
@@ -227,10 +247,14 @@ static int sk_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         size_t dl = ((size_t)p[0] << 8) | p[1];
         p += 2; left -= 2;
         if (dl > left) return SEND_FATAL;
-        unsigned char pkt[3 + 7 + UDP_DGRAM_MAX];
+        unsigned char pkt[3 + 19 + UDP_DGRAM_MAX];
         size_t o = 0;
         pkt[o++] = 0; pkt[o++] = 0; pkt[o++] = 0;    /* RSV RSV FRAG */
-        o += px_socks_addr(pkt + o, s->dst, s->dport);
+        size_t al = px_socks_addr_ip(pkt + o, sizeof(pkt) - o,
+                                     s->ipv6 ? s->dst6 : (const unsigned char *)&s->dst,
+                                     s->ipv6 ? 6 : 4, s->dport);
+        if (!al) return SEND_FATAL;
+        o += al;
         memcpy(pkt + o, p, dl); o += dl;
         ssize_t w = send(s->udpfd, pkt, o, MSG_DONTWAIT | MSG_NOSIGNAL);
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return SEND_AGAIN;
