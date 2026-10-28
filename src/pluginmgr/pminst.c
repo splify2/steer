@@ -327,7 +327,10 @@ static void outs_free(struct outs *o) {
 /* Ждать, пока выходы, бывшие up, снова up. 0 — дождались; -1 — причина в e. */
 static int wait_outs(struct pm_ctx *x, const struct outs *o, int timeout_s, struct pm_err *e) {
     if (!o->n || x->no_daemon) return 0;
-    long until = (long)time(NULL) + timeout_s;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    long long until_ms = (long long)t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + (long long)timeout_s * 1000;
+    long step_ms = 20;   /* выход помощника встаёт за десятки мс: шаг растёт вдвое до 500 мс, а не секунда сразу */
     for (;;) {
         struct ydoc *d = daemon_status(x);
         const char *down = NULL;
@@ -337,13 +340,20 @@ static int wait_outs(struct pm_ctx *x, const struct outs *o, int timeout_s, stru
                 if (!yn_bool(ynode_get(outs, o->v[i]), "up", 0)) down = o->v[i];
             if (!down) { ydoc_free(d); return 0; }
         }
-        if ((long)time(NULL) >= until) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long long now_ms = (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+        if (now_ms >= until_ms) {
             pm_errc(e, "plugin.output_not_up", PMA("name", down ? down : "?", "seconds", pm_itoa(timeout_s)), "выход %s не поднялся за %d с", down ? down : "?", timeout_s);
             if (d) ydoc_free(d);
             return -1;
         }
         if (d) ydoc_free(d);
-        sleep(1);
+        long left = (long)(until_ms - now_ms);
+        long nap = step_ms < left ? step_ms : left;
+        struct timespec ts = { nap / 1000, (nap % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        if (step_ms < 500) step_ms *= 2;
     }
 }
 
