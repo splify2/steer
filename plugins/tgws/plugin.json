@@ -81,6 +81,9 @@
       "schema": "settings.schema.json"
     }
   },
+  "scripts": {
+    "postinst": "scripts/postinst"
+  },
   "i18n": {
     "languages": [
       "ru",

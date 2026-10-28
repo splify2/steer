@@ -18,6 +18,9 @@
 #   6. мост по {conf}: слушает порт из output.ports, говорит up, читает настройки плагина (settings.json:
 #      пул, пути, адреса ДЦ, WARP) один раз; перезапуск по новым настройкам — подписью ядра (steer-api 1.4).
 #
+#   7. переход со stgws: scripts/postinst переносит пул, адреса ДЦ, WARP и домен по умолчанию микропакета в
+#      настройки плагина и выводит его службу из работы.
+#
 # Мост целиком (перехват в ядре Linux, веб-сокет, поток) — tests/run-tgws.sh (root, сетевые пространства).
 set -u
 BIN="${STEER:-./build/steer}"
@@ -211,6 +214,32 @@ except Exception: print(0)" 2>/dev/null)"
     kill "$bp" 2>/dev/null
     wait "$bp" 2>/dev/null
 fi
+
+# ---- 7. переход со stgws: scripts/postinst переносит настройки микропакета ---------------------------
+PI=plugins/tgws/scripts/postinst
+R="$tmp/mig"
+mkdir -p "$R/etc/stgws" "$R/etc/init.d" "$R/conf"
+printf 'a.example\n# комментарий\nbad_dom\nb.example хвост\n' > "$R/etc/stgws/tgws-domains.lst"
+printf 'z.example\n' > "$R/etc/stgws/domain"
+printf '149.154.167.220 2\n1.2.3.4 9\n149.154.164.250   4 media\n' > "$R/etc/stgws/tgws-dc.conf"
+printf 'zmwarp\n' > "$R/etc/stgws/warp.lst"
+printf '#!/bin/sh\n# служба stgws\necho "$1" >> "%s/svc.log"\n' "$R" > "$R/etc/init.d/tgws"
+chmod +x "$R/etc/init.d/tgws"
+TGWS_MIGRATE_ROOT="$R" STEER_PLUGIN_CONF="$R/conf" sh "$PI" --check >/dev/null 2>&1
+check "postinst --check ничего не пишет" "no" "$([ -e "$R/conf/settings.json" ] && echo yes || echo no)"
+o="$(TGWS_MIGRATE_ROOT="$R" STEER_PLUGIN_CONF="$R/conf" sh "$PI" "" 2>&1)"
+check "postinst первой установки — код 0" "0" "$?"
+check "настройки stgws перенесены (домен по умолчанию первым, негодное пропущено)" \
+    '{"pick":true,"domains":["z.example","a.example","b.example"],"dc_addresses":["149.154.167.220 2","149.154.164.250 4 media"],"warp":["zmwarp"]}' \
+    "$(cat "$R/conf/settings.json" 2>/dev/null)"
+has "  негодная строка названа" "$o" "«1.2.3.4 9» не подходит"
+check "служба stgws остановлена и снята с автозапуска" "stop disable" "$(tr '\n' ' ' < "$R/svc.log" | sed 's/ $//')"
+printf '{"domains":["mine.example"]}\n' > "$R/conf/settings.json"
+TGWS_MIGRATE_ROOT="$R" STEER_PLUGIN_CONF="$R/conf" sh "$PI" "" >/dev/null 2>&1
+check "настройки уже есть — не тронуты" '{"domains":["mine.example"]}' "$(cat "$R/conf/settings.json")"
+rm -f "$R/conf/settings.json"
+TGWS_MIGRATE_ROOT="$R" STEER_PLUGIN_CONF="$R/conf" sh "$PI" "2.1.0" >/dev/null 2>&1
+check "обновление плагина — перехода нет" "no" "$([ -e "$R/conf/settings.json" ] && echo yes || echo no)"
 
 echo "tgwsmatch: $pass ok, $fail fail"
 [ "$fail" -eq 0 ]
