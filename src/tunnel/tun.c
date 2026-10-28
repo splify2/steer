@@ -36,6 +36,7 @@
 #include <sys/uio.h>
 
 #include "tun.h"
+#include "ip6_packet.h"
 #include "platform.h"
 
 /* Заголовок разгрузки virtio, тот самый, который принимает IFF_VNET_HDR.
@@ -391,8 +392,29 @@ ssize_t tun_read_packet(struct tun_dev *d, unsigned char *buf, size_t cap) {
  * разбора нет намеренно — чем меньше кода трогает недоверенные байты из сети, тем меньше
  * места для ошибки в нём. */
 int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *payload_off) {
+    if (!p || !k) return -1;
+    memset(k, 0, sizeof(*k));
+    if (n && (p[0] >> 4) == 6) {
+        struct ip6_packet packet;
+        if (ip6_packet_parse(p, n, &packet) != 0) return -1;
+        k->family = 6;
+        memcpy(k->src6, packet.src, 16);
+        memcpy(k->dst6, packet.dst, 16);
+        k->proto = packet.protocol;
+        k->sport = packet.sport;
+        k->dport = packet.dport;
+        k->tcp_flags = packet.flags;
+        k->window = packet.window;
+        k->seq = packet.seq;
+        k->ack = packet.ack;
+        k->wscale = packet.wscale;
+        k->ws_seen = packet.ws_seen;
+        if (payload_off) *payload_off = packet.payload_offset;
+        return 0;
+    }
     if (n < 20) return -1;
-    if ((p[0] >> 4) != 4) return -1;                 /* IPv6 не поддержан */
+    if ((p[0] >> 4) != 4) return -1;
+    k->family = 4;
     size_t ihl = (size_t)(p[0] & 0x0F) * 4;
     if (ihl < 20 || n < ihl) return -1;
 
@@ -468,6 +490,57 @@ int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *paylo
         return 0;
     }
     return -1;
+}
+
+static int tun_writev(const struct tun_dev *d, struct iovec *iov, int n);
+
+size_t flow_tcp_reply(unsigned char *out, size_t cap, const struct flow_key *key,
+                      uint32_t seq, uint32_t ack, unsigned char flags,
+                      const unsigned char *data, size_t data_n, uint16_t window,
+                      unsigned mss, int wscale) {
+    if (flow_is6(key))
+        return ip6_tcp_build(out, cap, key->dst6, key->src6, key->dport, key->sport,
+                             seq, ack, flags, window, mss, wscale, data, data_n);
+    return tcp_build(out, cap, key->dst, key->src, key->dport, key->sport,
+                     seq, ack, flags, data, data_n, window, mss, wscale);
+}
+
+int flow_write_tcp(const struct tun_dev *dev, const struct flow_key *key,
+                   uint32_t seq, uint32_t ack, unsigned char flags, uint16_t window,
+                   const unsigned char *data, size_t data_n) {
+    if (!flow_is6(key)) {
+        unsigned char hdr[TUN_HDR_LEN];
+        tcp_hdr_build(hdr, key->dst, key->src, key->dport, key->sport,
+                      seq, ack, flags, data_n, window);
+        return tun_write_data(dev, hdr, data, data_n);
+    }
+    unsigned char packet[1500];
+    size_t packet_n = flow_tcp_reply(packet, sizeof(packet), key, seq, ack, flags,
+                                     data, data_n, window, 0, -1);
+    if (!packet_n) return -1;
+    struct iovec iov[2];
+    struct vnet_hdr vh = {0};
+    int count = 0;
+    if (dev->gso) { iov[count].iov_base = &vh; iov[count++].iov_len = sizeof(vh); }
+    iov[count].iov_base = packet; iov[count++].iov_len = packet_n;
+    return tun_writev(dev, iov, count);
+}
+
+int flow_write_udp(const struct tun_dev *dev, const struct flow_key *key,
+                   const unsigned char *data, size_t data_n, uint16_t ip_id) {
+    if (!flow_is6(key))
+        return udp_write_to_client(dev, key->dst, key->src, key->dport, key->sport,
+                                   data, data_n, ip_id);
+    unsigned char packet[1280];
+    size_t packet_n = ip6_udp_build(packet, sizeof(packet), key->dst6, key->src6,
+                                    key->dport, key->sport, data, data_n);
+    if (!packet_n) return -1;
+    struct iovec iov[2];
+    struct vnet_hdr vh = {0};
+    int count = 0;
+    if (dev->gso) { iov[count].iov_base = &vh; iov[count++].iov_len = sizeof(vh); }
+    iov[count].iov_base = packet; iov[count++].iov_len = packet_n;
+    return tun_writev(dev, iov, count);
 }
 
 /* ---- контрольные суммы ----------------------------------------------------- */

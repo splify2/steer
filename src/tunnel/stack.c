@@ -313,7 +313,8 @@ struct conn {
 /* Горячая запись обязана оставаться маленькой — в этом весь смысл разделения. Проверка
  * сборкой, а не обещанием в комментарии: буфер, добавленный сюда «на время отладки», иначе
  * вернёт таблицу к 5,8 МБ, и заметить это можно будет только по скорости на роутере. */
-typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
+_Static_assert(sizeof(struct flow_key) <= 64, "bounded dual-family flow key");
+_Static_assert(sizeof(struct conn) <= 224, "bounded dual-family hot connection record");
 
 /* ---- сегменты клиента не по порядку ------------------------------------------------------------
  *
@@ -838,6 +839,11 @@ static inline unsigned flow_hash(const struct flow_key *k) {
      * того и другого), и тогда датаграмма попала бы в TCP-соединение или наоборот. */
     uint32_t h = k->src ^ (k->dst * 0x9E3779B1u) ^
                  ((uint32_t)k->sport << 16) ^ (uint32_t)k->dport ^ ((uint32_t)k->proto << 8);
+    if (flow_is6(k)) {
+        h ^= 6;
+        for (unsigned i = 0; i < 16; i++)
+            h = (h ^ k->src6[i]) * 16777619u ^ (uint32_t)k->dst6[i];
+    }
     h ^= h >> 15;
     h *= 0x2545F491u;
     h ^= h >> 13;
@@ -1423,7 +1429,7 @@ static void conn_table_free(void) {
 static struct conn *conn_find(const struct flow_key *k) {
     for (int16_t i = g_bucket[flow_hash(k)]; i >= 0; i = g_conns[i].hnext) {
         struct conn *c = &g_conns[i];
-        if (c->key.src == k->src && c->key.dst == k->dst &&
+        if (flow_same_endpoints(&c->key, k) &&
             c->key.sport == k->sport && c->key.dport == k->dport &&
             c->key.proto == k->proto)
             return c;
@@ -1541,8 +1547,7 @@ static struct conn *conn_new(const struct tun_dev *tun) {
      * датаграмму — пакет, которого клиентский стек не поймёт. */
     if (!old->is_udp) {
         unsigned char rst[64];
-        size_t rl = tcp_build(rst, sizeof(rst), old->key.dst, old->key.src,
-                              old->key.dport, old->key.sport,
+        size_t rl = flow_tcp_reply(rst, sizeof(rst), &old->key,
                               old->our_seq, old->client_seq, TCP_RST | TCP_ACK,
                               NULL, 0, 0, 0, -1);
         if (rl) tun_write_ctl(tun, rst, rl);
@@ -1618,11 +1623,10 @@ static int upstream_send(struct conn *c, const unsigned char *data, size_t n) {
  * («следующий байт данных»), поэтому повторная отправка того же SYN-ACK — это буквально
  * тот же пакет, и никакого счётчика двигать не нужно. */
 static void send_synack(struct conn *c, const struct tun_dev *tun) {
-    unsigned char sa[64];
-    size_t sl = tcp_build(sa, sizeof(sa), c->key.dst, c->key.src,
-                          c->key.dport, c->key.sport,
+    unsigned char sa[72];
+    size_t sl = flow_tcp_reply(sa, sizeof(sa), &c->key,
                           1, c->client_seq, TCP_SYN | TCP_ACK,
-                          NULL, 0, c->pending ? EARLY_CAP : RCV_WND_MIN, TUN_MSS,
+                          NULL, 0, c->pending ? EARLY_CAP : RCV_WND_MIN, flow_mss(&c->key),
                           c->ws_on ? (int)g_rcv_shift : -1);
     if (sl) tun_write_ctl(tun, sa, sl);
     TR("SYN-ACK отправлен (ack=%u)\n", c->client_seq);
@@ -1644,12 +1648,11 @@ static void conn_reset(struct conn *c, const struct tun_dev *tun) {
      * (не дошло ничего): сначала RST вторым номером, потом первым. Дошла часть — клиент ответит
      * challenge ACK, а на подтверждение без соединения ответит RST handle_packet. */
     if (c->client_ack != c->our_seq) {
-        size_t rl = tcp_build(rst, sizeof(rst), c->key.dst, c->key.src, c->key.dport, c->key.sport,
+        size_t rl = flow_tcp_reply(rst, sizeof(rst), &c->key,
                               c->client_ack, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
         if (rl) tun_write_ctl(tun, rst, rl);
     }
-    size_t rl = tcp_build(rst, sizeof(rst), c->key.dst, c->key.src,
-                          c->key.dport, c->key.sport,
+    size_t rl = flow_tcp_reply(rst, sizeof(rst), &c->key,
                           c->our_seq, c->client_seq, TCP_RST | TCP_ACK,
                           NULL, 0, 0, 0, -1);
     if (rl) tun_write_ctl(tun, rst, rl);
@@ -1788,8 +1791,7 @@ struct emit_ctx {
 static int emit_dgram(void *arg, const unsigned char *p, size_t n) {
     struct emit_ctx *e = arg;
     struct conn *c = e->c;
-    if (udp_write_to_client(e->tun, c->key.dst, c->key.src, c->key.dport, c->key.sport,
-                            p, n, ++g_ip_id) != 0)
+    if (flow_write_udp(e->tun, &c->key, p, n, ++g_ip_id) != 0)
         return -1;
     TR("клиенту датаграмма %zu байт\n", n);
     /* Метка времени двигается на КАЖДОЙ датаграмме, а не только на пакетах клиента:
@@ -1830,16 +1832,13 @@ static int emit_to_client(struct conn *c, const struct tun_dev *tun,
     if (!c->rtx.len) { c->rtx_at = g_now_ns; c->rto_ms = rto_floor(); }
     rtx_push(&c->rtx, p, (uint32_t)n);
 
-    size_t seg = tun->gso ? (size_t)TUN_GSO_MAX : (size_t)TUN_MSS;
+    size_t seg = !flow_is6(&c->key) && tun->gso ? (size_t)TUN_GSO_MAX : flow_mss(&c->key);
     size_t sent = 0;
     while (sent < n) {
         size_t chunk = n - sent > seg ? seg : n - sent;
-        unsigned char hdr[TUN_HDR_LEN];
-        /* Отвечаем от имени сервера: адреса и порты наоборот. */
-        tcp_hdr_build(hdr, c->key.dst, c->key.src, c->key.dport, c->key.sport,
-                      c->our_seq, c->client_seq, TCP_ACK | TCP_PSH, chunk, rcv_win_field(c));
         uint64_t w0 = g_stats ? now_ns() : 0;
-        if (tun_write_data(tun, hdr, p + sent, chunk) != 0) {
+        if (flow_write_tcp(tun, &c->key, c->our_seq, c->client_seq, TCP_ACK | TCP_PSH,
+                           rcv_win_field(c), p + sent, chunk) != 0) {
             TR("запись в TUN не удалась (%zu байт): %s\n", chunk, strerror(errno));
             return -1;
         }
@@ -1863,17 +1862,15 @@ static int emit_to_client(struct conn *c, const struct tun_dev *tun,
  * шестнадцатикилобайтная порция, и повторять её по 1460 байт значило бы растянуть
  * восстановление на десять таймаутов. */
 static void rtx_resend(struct conn *c, const struct tun_dev *tun, const char *why) {
-    uint32_t seg = tun->gso ? (uint32_t)TUN_GSO_MAX : (uint32_t)TUN_MSS;
+    uint32_t seg = !flow_is6(&c->key) && tun->gso ? (uint32_t)TUN_GSO_MAX : flow_mss(&c->key);
     const unsigned char *body = NULL;
     uint32_t n = rtx_peek(&c->rtx, seg, &body);
     if (!n) return;
 
-    unsigned char hdr[TUN_HDR_LEN];
-    tcp_hdr_build(hdr, c->key.dst, c->key.src, c->key.dport, c->key.sport,
-                  c->client_ack, c->client_seq, TCP_ACK | TCP_PSH, n, rcv_win_field(c));
     TR("повтор conn#%ld: %u байт с seq=%u (%s)\n",
        (long)(c - g_conns), n, c->client_ack, why);
-    if (tun_write_data(tun, hdr, body, n) != 0) return;
+    if (flow_write_tcp(tun, &c->key, c->client_ack, c->client_seq, TCP_ACK | TCP_PSH,
+                       rcv_win_field(c), body, n) != 0) return;
     if (g_stats) { g_st.rtx_sends++; g_st.rtx_bytes += n; }
     c->rtx_at = g_now_ns;
     c->rto_ms = c->rto_ms * 2 > RTO_MAX_MS ? RTO_MAX_MS : c->rto_ms * 2;
@@ -2428,12 +2425,20 @@ static void handle_packet_one(const struct tun_dev *tun, const unsigned char *pk
      * стоит в потоке раньше или относится к другому потоку. */
     if (g_up.c) {
         const struct conn *u = g_up.c;
-        if (k.proto != 6 || k.src != u->key.src || k.dst != u->key.dst ||
+        if (k.proto != 6 || !flow_same_endpoints(&k, &u->key) ||
             k.sport != u->key.sport || k.dport != u->key.dport || n == off ||
             (k.tcp_flags & (TCP_SYN | TCP_RST | TCP_FIN)) || k.seq != u->client_seq + g_up.n)
             up_flush(tun);
     }
-    TR("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto=%u flags=0x%02x len=%zu\n",
+    if (flow_is6(&k)) {
+        if (g_trace) {
+            char from[INET6_ADDRSTRLEN], to[INET6_ADDRSTRLEN];
+            if (inet_ntop(AF_INET6, k.src6, from, sizeof(from)) &&
+                inet_ntop(AF_INET6, k.dst6, to, sizeof(to)))
+                TR("[%s]:%u -> [%s]:%u proto=%u flags=0x%02x len=%zu\n",
+                   from, k.sport, to, k.dport, k.proto, k.tcp_flags, n - off);
+        }
+    } else TR("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto=%u flags=0x%02x len=%zu\n",
        k.src&255,(k.src>>8)&255,(k.src>>16)&255,(k.src>>24)&255, k.sport,
        k.dst&255,(k.dst>>8)&255,(k.dst>>16)&255,(k.dst>>24)&255, k.dport,
        k.proto, k.tcp_flags, n - off);
@@ -2599,7 +2604,7 @@ static void handle_packet_one(const struct tun_dev *tun, const unsigned char *pk
          * TIME_WAIT ничего не ломает. Только при одном потоке цикла (g_one_worker). */
         if (g_one_worker && !(k.tcp_flags & TCP_RST) && (k.tcp_flags & TCP_ACK)) {
             unsigned char rst[64];
-            size_t rl = tcp_build(rst, sizeof(rst), k.dst, k.src, k.dport, k.sport,
+            size_t rl = flow_tcp_reply(rst, sizeof(rst), &k,
                                   k.ack, 0, TCP_RST, NULL, 0, 0, 0, -1);
             if (rl) tun_write_ctl(tun, rst, rl);
             TR("данные без соединения — RST\n");
@@ -2781,8 +2786,7 @@ static void flush_acks(const struct tun_dev *tun) {
             if (r >= 0) c->room_seen = r > 0x7FFFFFFF ? 0x7FFFFFFFu : (uint32_t)r;
         }
         unsigned char ackp[64];
-        size_t al = tcp_build(ackp, sizeof(ackp), c->key.dst, c->key.src,
-                              c->key.dport, c->key.sport,
+        size_t al = flow_tcp_reply(ackp, sizeof(ackp), &c->key,
                               c->our_seq, c->client_seq, TCP_ACK, NULL, 0, rcv_win_field(c), 0, -1);
         if (al) tun_write_ctl(tun, ackp, al);
     }
@@ -3106,8 +3110,7 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
          * ждал бы обновления окна, которое не придёт (сокет навсегда в LAST-ACK,
          * tests/run-tunnel-fin.sh, случай separate). */
         unsigned char fin[64];
-        size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
-                              c->key.dport, c->key.sport,
+        size_t fl = flow_tcp_reply(fin, sizeof(fin), &c->key,
                               c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
                               NULL, 0, rcv_win_field(c), 0, -1);
         if (fl) tun_write_ctl(tun, fin, fl);

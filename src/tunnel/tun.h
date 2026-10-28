@@ -5,12 +5,17 @@
 #include <sys/uio.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include <string.h>
 
 #define TUN_ENODEV (-40)   /* нет узла TUN (tun_dev платформы, platform.h) */
 #define TUN_ESETUP (-41)
 
 struct flow_key {
     uint32_t src, dst;      /* в сетевом порядке, как в пакете: так и уходят в tcp_build */
+    /* family=0 remains compatible with legacy IPv4 callers. IPv6 endpoints
+     * stay in their full-width fields and are never truncated into src/dst. */
+    uint8_t family;
+    uint8_t src6[16], dst6[16];
     /* Порты в ХОСТОВОМ порядке: ip_parse собирает их из байт вручную, то есть
      * преобразование уже сделано. Применять к ним ntohs — значит перевернуть дважды:
      * порт 80 превращался в 20480, соединение уходило не туда, и выглядело это как
@@ -36,6 +41,14 @@ struct flow_key {
      * датаграмма это не «пакет не дойдёт», а «отправим серверу обрубок и не заметим». */
     uint8_t frag;
 };
+
+static inline int flow_is6(const struct flow_key *k) { return k->family == 6; }
+static inline int flow_same_endpoints(const struct flow_key *a, const struct flow_key *b) {
+    if (flow_is6(a) != flow_is6(b)) return 0;
+    return flow_is6(a) ? (!memcmp(a->src6, b->src6, 16) && !memcmp(a->dst6, b->dst6, 16))
+                       : (a->src == b->src && a->dst == b->dst);
+}
+static inline unsigned flow_mss(const struct flow_key *k) { return flow_is6(k) ? 1440u : 1460u; }
 
 /* Флаги TCP, которые нас интересуют. */
 #define TCP_FIN 0x01
@@ -280,4 +293,15 @@ size_t tcp_build(unsigned char *out, size_t cap,
                  uint32_t seq, uint32_t ack, unsigned char flags,
                  const unsigned char *data, size_t data_n, uint16_t window,
                  unsigned mss, int wscale);
+
+/* Family-aware replies always reverse the endpoints of the incoming flow. */
+size_t flow_tcp_reply(unsigned char *out, size_t cap, const struct flow_key *key,
+                      uint32_t seq, uint32_t ack, unsigned char flags,
+                      const unsigned char *data, size_t data_n, uint16_t window,
+                      unsigned mss, int wscale);
+int flow_write_tcp(const struct tun_dev *dev, const struct flow_key *key,
+                   uint32_t seq, uint32_t ack, unsigned char flags, uint16_t window,
+                   const unsigned char *data, size_t data_n);
+int flow_write_udp(const struct tun_dev *dev, const struct flow_key *key,
+                   const unsigned char *data, size_t data_n, uint16_t ip_id);
 #endif

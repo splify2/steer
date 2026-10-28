@@ -209,7 +209,7 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
 #                  годность): половина разбора sub.c, которую с ним делит модуль steer-proxy
 #                  (trojan://, vmess://), — в libsteer, как и сам транспорт.
 SUBLINK_SRC := src/proto/vless/sublink.c
-STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/pool.c
+STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/pool.c src/tunnel/ip6_packet.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/tls/ech.c src/proto/transport/trgrpc.c \
                  src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c \

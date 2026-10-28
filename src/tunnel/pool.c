@@ -100,8 +100,9 @@ struct pl_sess {
     uint8_t udp, opened;        /* flow_open был, k — его ключ */
     struct flow_key k;
 };
-#define PL_HDR 64
-_Static_assert(sizeof(struct pl_sess) <= PL_HDR, "шапка сессии пула больше отступа");
+#define PL_HDR ((sizeof(struct pl_sess) + 15u) & ~(size_t)15u)
+_Static_assert(PL_HDR <= 96u, "bounded dual-family pool session header");
+_Static_assert(PL_HDR % 16u == 0, "inner protocol session alignment");
 #define INNER(s) ((void *)((unsigned char *)(s) + PL_HDR))
 #define CINNER(s) ((const void *)((const unsigned char *)(s) + PL_HDR))
 
