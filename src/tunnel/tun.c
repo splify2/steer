@@ -559,8 +559,15 @@ static uint32_t tcp_pseudo_sum(uint32_t src, uint32_t dst, size_t tcp_len) {
  * Ожидание миллисекунда, а не десять: замерено, что десять превращались в потолок скорости
  * (110 проходов цикла в секунду при простое poll в 0%). */
 static int tun_writev(const struct tun_dev *d, struct iovec *iov, int n) {
+    size_t expected = 0;
+    for (int i = 0; i < n; i++) expected += iov[i].iov_len;
     for (int attempts = 0;;) {
-        if (writev(d->fd, iov, n) >= 0) return 0;
+        ssize_t written = writev(d->fd, iov, n);
+        if (written >= 0) {
+            if ((size_t)written == expected) return 0;
+            errno = EIO;
+            return -1;
+        }
         if (errno == EINTR) continue;
         if ((errno != EAGAIN && errno != EWOULDBLOCK) || ++attempts > 200) return -1;
         struct pollfd wp = { .fd = d->fd, .events = POLLOUT };
