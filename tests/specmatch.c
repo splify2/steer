@@ -1056,8 +1056,8 @@ int main(void) {
         for (size_t i = 0; i < g_spec.out_n; i++) {
             if (!g_spec.out[i].mark) { no_mark++; continue; }
             if (g_spec.out[i].mark & ~STEER_MARK_MASK) off_mask++;
-            /* Ряд: 300.. без 316 (там таблица мини-сборки tgws), места — nslots штук. */
-            if (g_spec.out[i].table < 300 || g_spec.out[i].table > 300 + (int)nslots || g_spec.out[i].table == 316)
+            /* Ряд: 300.. подряд, места — nslots штук. */
+            if (g_spec.out[i].table < 300 || g_spec.out[i].table >= 300 + (int)nslots)
                 bad_table++;
             for (size_t j = 0; j < i; j++) {
                 if (g_spec.out[j].mark == g_spec.out[i].mark) dup_mark++;
@@ -1068,7 +1068,7 @@ int main(void) {
         check("метка каждого внутри маски контракта", 0, off_mask);
         check("метки не повторяются", 0, dup_mark);
         check("номера таблиц не повторяются", 0, dup_table);
-        check("номера таблиц в своём ряду (300.., без 316)", 0, bad_table);
+        check("номера таблиц в своём ряду (300.. подряд)", 0, bad_table);
 
         /* РЕЕСТР С ПРЕЖНЕЙ СБОРКИ. Там метки одинокими битами, и старший из них — база,
          * умноженная на 128, — новой раздачей не выдаётся никому. Выход обязан сохранить

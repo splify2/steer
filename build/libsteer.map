@@ -176,7 +176,6 @@ LIBSTEER_1 {
     probe_read;
     probe_source;
     proc_cmdline_find;
-    prof;
     qc_close;
     qc_free;
     qc_open;

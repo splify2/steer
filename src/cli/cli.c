@@ -55,12 +55,6 @@ static const struct cli_flag FLAGS[] = {
     {"--via",       NULL, NULL,         "только выходы с via: имя и выход, через который идёт туннель"},
     {"--fast",      NULL, NULL,         "отдать запомненный ответ немедленно, не пересчитывая"},
     {"--json",      NULL, NULL,         "печатать спеку JSON-объектом, а не YAML"},
-    {"--node",      NULL, "N",          "номер узла подписки, с нуля; -1 — первый рабочий (по умолчанию)"},
-    {"--timeout",   NULL, "СЕК",        "сколько ждать ответа узла (по умолчанию 5)"},
-    {"--insecure",  NULL, NULL,         "только с файлом подписки: узлы с allowInsecure — в перечень, "
-                                        "с теми же номерами, что у выхода с insecure: true"},
-    {"--listen",    NULL, "ПОРТ",       "порт поддельного TCP, который слушает сервер"},
-    {"--forward",   NULL, "АДРЕС:ПОРТ", "куда отдавать распакованные датаграммы"},
     {"--config",    NULL, "ФАЙЛ",       "конфигурация xsteer в стиле wg "
                                         "(по умолчанию {etc}/xsteer/hub.conf)"},
     {"--device",    NULL, "ИМЯ",        "готовое устройство TUN: им владеет netifd, "
@@ -664,10 +658,6 @@ void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
                struct cli_args *out) {
     memset(out, 0, sizeof *out);
     out->spec = plat_spec_default();
-    /* Умолчание по узлу — «до первого рабочего»: то же решение, что принимает подъём
-     * выхода, поэтому проверка отвечает на вопрос «что будет, если применить». */
-    out->node = -1;
-    out->timeout = 5;
     const char *want_stream = NULL;     /* флаг, которым режим потока запрошен */
     int no_stream = 0;
 
@@ -708,7 +698,6 @@ void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
         else if (!strcmp(f->name, "--state-dir"))  out->state_dir = val;
         else if (!strcmp(f->name, "--name"))       out->name = val;
         else if (!strcmp(f->name, "--kind"))       out->kind = val;
-        else if (!strcmp(f->name, "--forward"))    out->forward = val;
         else if (!strcmp(f->name, "--config"))     out->config = val;
         else if (!strcmp(f->name, "--device"))     out->device = val;
         else if (!strcmp(f->name, "--out"))        out->out_file = val;
@@ -722,13 +711,6 @@ void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
         else if (!strcmp(f->name, "--via"))        out->via = 1;
         else if (!strcmp(f->name, "--fast"))      out->fast = 1;
         else if (!strcmp(f->name, "--json"))      out->json = 1;
-        else if (!strcmp(f->name, "--insecure"))   out->insecure = 1;
-        /* Нижняя граница -1, а не 0: это часовой «первый рабочий», то же умолчание, и
-         * splify2 передаёт его явно (`vless-probe --node -1`). Диапазон с нуля молча
-         * сломал бы проверку выхода в интерфейсе. */
-        else if (!strcmp(f->name, "--node"))       out->node = cli_int(f->name, val, -1, 65535);
-        else if (!strcmp(f->name, "--timeout"))    out->timeout = cli_int(f->name, val, 1, 3600);
-        else if (!strcmp(f->name, "--listen"))     out->listen = cli_int(f->name, val, 1, 65535);
         else if (!strcmp(f->name, "--stream"))     { out->stream = 1; want_stream = f->name; }
         else if (!strcmp(f->name, "--no-stream"))  no_stream = 1;
         /* Порт подразумевает режим: назвать порт потока и остаться на поддельном TCP человек

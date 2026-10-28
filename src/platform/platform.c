@@ -57,9 +57,6 @@ static const struct platform_ops *plat_choose(void) {
     return &plat_openwrt;
 }
 
-/* Поле метки, заданное профилем сборки (src/profile/profile.h): мини-сборка tgws живёт на роутере
- * в своём бите. Таблица платформы — константа, поэтому поправка кладётся в копию, одну на
- * процесс; у платформы, которой профиль не касается, остаётся её собственная таблица. */
 /* ПОЛЕ МЕТКИ ИЗ ОКРУЖЕНИЯ: STEER_MARK_FIELD=<маска> (например 0x000000ff). Нужно экземпляру
  * движка, которого запускает steer-box-connector (sing-box для podkop и forkop): их правила nft
  * ставят метки в битах нашего поля по умолчанию — podkop 0x00100000 и 0x00200000, forkop
@@ -67,8 +64,8 @@ static const struct platform_ops *plat_choose(void) {
  * раньше нашей prerouting_mark. Метка podkop 0x00100000 совпала бы с меткой нашего первого
  * выхода, и пакет, который podkop пометил для своего tproxy, уехал бы в наш туннель. Сдвинуть
  * контракт для всех нельзя (marks.h), поэтому поле задаёт тот, кто знает соседей, — запускающий.
- * Маска — биты подряд, не больше шестнадцати; другое — предупреждение и поле платформы. Поле
- * профиля (мини-сборка tgws) сильнее: у неё один бит, и сдвигать его незачем. */
+ * Маска — биты подряд, не больше шестнадцати; другое — предупреждение и поле платформы. Таблица
+ * платформы — константа, поэтому поправка кладётся в копию, одну на процесс. */
 static int mark_field_env(uint32_t *base, unsigned *bits) {
     const char *e = getenv("STEER_MARK_FIELD");
     if (!e || !*e) return 0;
@@ -123,15 +120,9 @@ static int router_self_env(void) {
 
 static const struct platform_ops *plat_profiled(const struct platform_ops *p) {
     static struct platform_ops copy;
-    const struct profile *pr = prof();
     uint32_t base = 0;
     unsigned bits = 0, pref = 0;
-    int field = 0;
-    if (pr->mark_bits && pr->mark_platform && !strcmp(pr->mark_platform, p->name)) {
-        base = pr->mark_base;
-        bits = pr->mark_bits;
-        field = 1;
-    } else field = mark_field_env(&base, &bits);
+    int field = mark_field_env(&base, &bits);
     int prefd = rule_pref_env(&pref);
     int self = !p->local_channels && router_self_env();
     if (!field && !prefd && !self) return p;
