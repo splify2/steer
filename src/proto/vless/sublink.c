@@ -531,6 +531,10 @@ int vless_insecure(void) { return g_insecure; }
 /* Значение параметра ссылки в куче-буфере: длинные значения (pqv, encryption) не помещаются в
  * узел, а стек рабочих потоков мал. Процентная форма раскрывается. Возвращает NULL при нехватке памяти. */
 char *sl_param_dup(const char *v, size_t vlen) {
+    for (size_t i = 0; i < vlen; i++) {
+        if (!v[i] || (i + 2 < vlen && v[i] == '%' && v[i + 1] == '0' && v[i + 2] == '0'))
+            return NULL;
+    }
     char *c = malloc(vlen + 1);
     if (!c) return NULL;
     memcpy(c, v, vlen);
@@ -679,9 +683,20 @@ int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_
     const char *hash = strchr(p, '#');
     const char *hp_end = hash ? hash : p + strlen(p);
     const char *qmark = memchr(p, '?', (size_t)(hp_end - p));
-    const char *colon = memchr(p, ':', (size_t)((qmark ? qmark : hp_end) - p));
-    if (!colon) return -1;
-    sl_set_field(n->host, sizeof(n->host), p, (size_t)(colon - p));
+    const char *authority_end = qmark ? qmark : hp_end;
+    const char *colon = NULL, *host = p, *host_end = NULL;
+    if (p < authority_end && *p == '[') {
+        host = p + 1;
+        host_end = memchr(host, ']', (size_t)(authority_end - host));
+        if (!host_end || host_end + 1 >= authority_end || host_end[1] != ':') return -1;
+        colon = host_end + 1;
+    } else {
+        colon = memchr(p, ':', (size_t)(authority_end - p));
+        host_end = colon;
+    }
+    if (!colon || !host_end || host_end == host ||
+        (size_t)(host_end - host) >= sizeof(n->host)) return -1;
+    sl_set_field(n->host, sizeof(n->host), host, (size_t)(host_end - host));
     {
         /* Порт — только цифры до конца хоста и в диапазоне 1..65535: atoi давал 4464 на
          * «:70000», 65535 на «:-1» и 443 на «:443abc», и узел шёл не туда. */
