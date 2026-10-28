@@ -396,7 +396,8 @@ int report_mark_overlap(void) {
      * пересекается, и говорить не о чем. */
     if (STEER_MARK_LOBIT > 23) return 0;
     const char *pos = nft_dump();
-    char line[2048], table[96] = "", said[8][96];
+    char line[2048], table[96] = "";
+    struct fwc_chains said = {0};   /* названные таблицы — без предела (прежде — не больше 8) */
     int n_said = 0;
     while ((pos = dump_line(pos, line, sizeof(line))) != NULL) {
         const char *p = line;
@@ -418,10 +419,10 @@ int report_mark_overlap(void) {
             if (v == 0x00ff0000ul || v == 0xff00fffful) { hit = 1; break; }
         }
         if (!hit) continue;
-        int dup = 0;
-        for (int k = 0; k < n_said; k++) if (!strcmp(said[k], table)) dup = 1;
-        if (dup || n_said >= 8) continue;
-        snprintf(said[n_said++], sizeof(said[0]), "%s", table);
+        size_t before = said.n;
+        remember_chain(&said, table);
+        if (said.n == before) continue;   /* уже названа (или нет памяти) */
+        n_said++;
         /* Биты — из базы и ширины поля (STEER_MARK_LOBIT/HIBIT), а не строкой: у сборки под
          * Android поле 22-27, и пересекается оно с 16-23 на двух битах, а не на четырёх. */
         fprintf(stderr, LOG_W "таблица %s метит пакеты маской 0x00ff0000 (биты 16-23, так "
@@ -431,6 +432,7 @@ int report_mark_overlap(void) {
                         "перестанет действовать её политика на этом пакете\n", table,
                 STEER_MARK_LOBIT, STEER_MARK_HIBIT, STEER_MARK_LOBIT);
     }
+    chains_free(&said);
     return n_said;
 }
 

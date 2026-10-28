@@ -573,6 +573,18 @@ int main(void) {
             fwcheck_reset_cache();
             check(t[i].what, report_mark_overlap(), t[i].want);
         }
+        /* Таблиц с такой маской больше прежних восьми — названы все (и каждая по разу). */
+        {
+            static char many[8192];
+            size_t o = 0;
+            for (int i = 0; i < 12; i++)
+                o += (size_t)snprintf(many + o, sizeof(many) - o,
+                    "table inet nb%d {\n\tchain c {\n\t\tmeta mark & 0x00ff0000 == 0x00010000 return\n"
+                    "\t\tmeta mark & 0x00ff0000 == 0x00020000 return\n\t}\n}\n", i);
+            g_ruleset = many;
+            fwcheck_reset_cache();
+            check("12 таблиц с маской 16-23 — названы все 12", report_mark_overlap(), 12);
+        }
     }
 
     kernel_part();
@@ -581,7 +593,7 @@ int main(void) {
         fprintf(stderr, "fwmatch: провалено проверок: %d\n", g_fail);
         return 1;
     }
-    printf("fwmatch: 18/18 проверок пройдено плюс 7 про объяснение совпадения, 3 про соседей на битах "
+    printf("fwmatch: 18/18 проверок пройдено плюс 7 про объяснение совпадения, 4 про соседей на битах "
            "16-23 и %d проб печати набора правил от ядра\n", g_kernel_n);
     return 0;
 }
