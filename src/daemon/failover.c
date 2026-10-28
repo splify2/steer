@@ -334,6 +334,8 @@ static int zapret_running(void) { return proc_cmdline_find("nfqws", 0); }
  * последнего слова (стенд failovermatch сверяет её строкой); fam 6 — `ip -6 rule` (маршрутизация
  * IPv6, docs/architecture.md, «4б»): та же метка, тот же номер таблицы — у IPv6 свой набор таблиц,
  * и номер не пересекается с таблицами IPv4 ничем, кроме числа. */
+int (*g_route_hook)(const char *const argv[]);
+
 static int rule_cmd(int fam, const char *verb, unsigned mark, const char *mask, int table,
                     const char *pref) {
     char m[40], t[16];
@@ -351,7 +353,10 @@ static int rule_cmd(int fam, const char *verb, unsigned mark, const char *mask, 
     argv[k++] = t;
     if (pref) { argv[k++] = "priority"; argv[k++] = pref; }
     argv[k] = NULL;
-    return run_quiet(argv);
+    /* Сообщением rtnetlink, а не процессом ip (route_put ниже); слова команды — шву стенда. */
+    if (g_route_hook) return g_route_hook(argv);
+    return rtnl_rule_mark(!strcmp(verb, "add"), fam, mark, (uint32_t)strtoul(mask, NULL, 0), table,
+                          pref ? atoi(pref) : 0);
 }
 
 static void rule_add_fam(int fam, unsigned mark, int table) {
@@ -425,13 +430,11 @@ void conntrack_evict(unsigned mark) {
 }
 
 void rule_drop(unsigned mark, int table) {
-    char m[32], t[16];
-    snprintf(m, sizeof(m), "0x%08x/0x%08x", mark, STEER_MARK_MASK);
-    snprintf(t, sizeof(t), "%d", table);
-    /* В цикле, потому что `ip rule add` дубликаты не проверяет и копий может быть
-     * несколько; до отказа — он и означает «больше таких нет». */
-    const char *del[] = { "ip", "rule", "del", "fwmark", m, "table", t, NULL };
-    while (run_quiet(del) == 0) ;
+    char mk[16];
+    snprintf(mk, sizeof(mk), "0x%08x", STEER_MARK_MASK);
+    /* В цикле, потому что копий может быть несколько (их ставил прежний `ip rule add` без
+     * проверки дубликатов); до отказа — он и означает «больше таких нет». */
+    while (rule_cmd(4, "del", mark, mk, table, NULL) == 0) ;
 }
 
 /* Правило IPv6 выхода — снять все копии. */
@@ -693,8 +696,6 @@ static void table_prune_fam(int fam, int table, const char *dev, int backstop) {
  * (apply, сторож, помощник поднялся) запускала `ip` на каждый маршрут — до четырёх на выход с IPv6.
  * argv — та же команда словами: её получает шов стенда g_route_hook (failovermatch сверяет команды
  * строкой). Отказ — errno вместо кода `ip`; вызывающие смотрят только на «не 0». */
-int (*g_route_hook)(const char *const argv[]);
-
 static int route_put(const char *const argv[], int fam, int table, int type, const char *dev,
                      int metric) {
     if (g_route_hook) return g_route_hook(argv);
