@@ -460,7 +460,9 @@ printf '{"schema":1,' > "$tmp/spec.json"
 r="$(ctl reload)"
 wait_for 'grep -q "spec-error" "$tmp/sub1.out"' 5
 check "reload негодной спеки: spec-error с причиной" "1" \
-    "$(grep -c '^{"v":1,"ev":"spec-error","by":"reload","message":".\+"}$' "$tmp/sub1.out")"
+    "$(grep -c '^{"v":1,"ev":"spec-error","by":"reload","message":".\+"' "$tmp/sub1.out")"
+check "  и со словом отказа: code spec.v1_error и args" "1" \
+    "$(grep -c '^{"v":1,"ev":"spec-error","by":"reload","message":".\+","code":"spec.v1_error","args":{"1":".\+"}}$' "$tmp/sub1.out")"
 check "  а status отвечает по последней годной" "0 1" \
     "$(ctl status | j code) $(ctl status | j stdout | grep -c '"lists":1')"
 cp "$tmp/spec.good" "$tmp/spec.json"
