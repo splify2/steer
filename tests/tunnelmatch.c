@@ -1465,7 +1465,11 @@ static void t_empty_read(void) {
 static int dup_deliver(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
                        dialer_emit_fn emit, void *arg) {
     (void)ctx; (void)sess; (void)udp;
-    return emit(arg, d, n) != 0 || emit(arg, d, n) != 0 ? -1 : 0;
+    /* Сколько раз отдать прочитанное, чтобы проход вышел за запас кольца (CLIENT_ROOM_RESERVE) при чтении
+     * 18000 байт: запас считается от буфера чтения стека (DOWN_BUF), а не от записи. */
+    for (int k = 0; k < (int)(CLIENT_ROOM_RESERVE / 18000) + 1; k++)
+        if (emit(arg, d, n) != 0) return -1;
+    return 0;
 }
 
 /* Склейка записей клиенту (R-147): порция чтений у узла уходит в сокет клиента ОДНОЙ записью (writev по кольцу
@@ -1496,22 +1500,27 @@ static void t_tx_batch(void) {
     check(c->rtx.len == 0, "склейка: клиент принял всё — кольцо пусто");
     pos += got;
 
-    /* Вторая порция ложится через конец кольца. */
-    uint32_t head = c->rtx.head;
-    g_recv_rep = 10; g_recv_rep_n = 4000;
-    g_writev_calls = 0;
-    drain_conn(c, &g_tun);
-    got = cli_get(cli_fd(c), b, sizeof b);
-    check(got == 40000 && stream_bad(b, got, pos) == 0 && g_writev_calls == 1,
-          "склейка: порция через конец кольца уходит одной записью и без порчи");
-    check(head + 40000 > c->rtx.cap && c->rtx.head < head && c->rtx.cap == 64 * 1024,
+    /* Следующие порции — пока одна не ляжет через конец кольца (кольцо выросло до RTX_CAP). */
+    uint32_t head = 0;
+    int all_ok = 1, wrapped = 0;
+    for (int k = 0; k < 64 && !wrapped; k++) {
+        head = c->rtx.head;
+        wrapped = head + 40000 > c->rtx.cap;
+        g_recv_rep = 10; g_recv_rep_n = 4000;
+        g_writev_calls = 0;
+        drain_conn(c, &g_tun);
+        got = cli_get(cli_fd(c), b, sizeof b);
+        if (got != 40000 || stream_bad(b, got, pos) != 0 || g_writev_calls != 1) all_ok = 0;
+        pos += got;
+    }
+    check(all_ok, "склейка: порция через конец кольца уходит одной записью и без порчи");
+    check(wrapped && c->rtx.head < head && c->rtx.cap == RTX_CAP,
           "склейка: проверка идёт через край кольца");
-    pos += got;
 
     /* Договор дайлера: за проход не больше запаса кольца (CLIENT_ROOM_RESERVE). Верная раздача — тишина,
      * раздача вдвое больше прочитанного (накопитель, как был у ss и vmess) — строка в журнале и счёт. */
     check(g_overemit == 0, "договор дайлера: порция в рамках запаса — нарушений нет");
-    /* Нарушение договора: один проход отдаёт 2 x 18000 при запасе TUNNEL_BUF + 1024. */
+    /* Нарушение договора: один проход отдаёт прочитанные 18000 байт столько раз, что выходит за запас. */
     struct dialer_ops over = *g_dl->ops;
     over.deliver = dup_deliver;
     struct dialer over_dl = *g_dl;
@@ -1521,7 +1530,7 @@ static void t_tx_batch(void) {
     g_recv_rep = 1; g_recv_rep_n = 18000;
     drain_conn(c, &g_tun);
     g_dl = real_dl;
-    check(g_overemit == 1, "договор дайлера: проход отдал 36000 байт при запасе 19472 — нарушение сосчитано и названо");
+    check(g_overemit == 1, "договор дайлера: проход отдал больше запаса кольца — нарушение сосчитано и названо");
     (void)cli_get(cli_fd(c), b, sizeof b);                  /* поток испорчен намеренно — только вычерпать сокет */
     g_recv_rep = 0;
     conn_drop(c);
