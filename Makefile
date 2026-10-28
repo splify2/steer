@@ -181,6 +181,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@$(BUILD)/urltestmatch
 	@$(BUILD)/urltlsmatch
 	@sh tests/nftvmapmatch.sh
+	@STEER=$(BUILD)/steer sh tests/wandevmatch.sh
 	@BUILD=$(BUILD) sh tests/rtnlmatch.sh
 	@BUILD=$(BUILD) sh tests/nftdumpmatch.sh
 	@sh tests/groupsmatch.sh

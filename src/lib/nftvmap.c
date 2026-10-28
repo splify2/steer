@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <net/if.h>
 #include <arpa/inet.h>
 #include <linux/netlink.h>
 #include <linux/netfilter.h>
@@ -414,6 +415,87 @@ static void nfv_put_key16(struct nlbuf *b, const uint8_t k[16], int end) {
     nlbuf_end_nested(b, kk);
     if (end) nlbuf_put_be32(b, NFTA_SET_ELEM_FLAGS, NFT_SET_ELEM_INTERVAL_END);
     nlbuf_end_nested(b, el);
+}
+
+/* Элемент набора без отрезков: только ключ. */
+static void nfv_put_key(struct nlbuf *b, const uint8_t *k, size_t n) {
+    struct nlattr *el = nlbuf_begin_nested(b, NFTA_LIST_ELEM);
+    struct nlattr *kk = nlbuf_begin_nested(b, NFTA_SET_ELEM_KEY);
+    nlbuf_put_data(b, NFTA_DATA_VALUE, k, n);
+    nlbuf_end_nested(b, kk);
+    nlbuf_end_nested(b, el);
+}
+
+/* Транзакция «набор целиком»: сброс (DELSETELEM без списка) и элементы ключами по klen байт. */
+static int nfv_set_replace(uint8_t family, const char *table, const char *set,
+                           const uint8_t *keys, size_t klen, size_t n) {
+    size_t cap = 512 + n * (klen + 32);
+    uint8_t *buf = malloc(cap < NFV_BUF ? NFV_BUF : cap);
+    if (!buf) { errno = ENOMEM; return -1; }
+    if (cap < NFV_BUF) cap = NFV_BUF;
+    struct nlbuf b;
+    nlbuf_init(&b, buf, cap);
+    struct nlmsghdr *bb = nfv_msg_begin(&b, NFNL_MSG_BATCH_BEGIN, NLM_F_REQUEST, AF_UNSPEC,
+                                        NFNL_SUBSYS_NFTABLES);
+    nfv_msg_end(&b, bb);
+    struct nlmsghdr *del = nfv_msg_begin(&b, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_DELSETELEM,
+                                         NLM_F_REQUEST | NLM_F_ACK, family, 0);
+    nlbuf_put_str(&b, NFTA_SET_ELEM_LIST_TABLE, table);
+    nlbuf_put_str(&b, NFTA_SET_ELEM_LIST_SET, set);
+    nfv_msg_end(&b, del);
+    struct nlmsghdr *add = NULL;
+    if (n) {
+        add = nfv_msg_begin(&b, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWSETELEM,
+                            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE, family, 0);
+        nlbuf_put_str(&b, NFTA_SET_ELEM_LIST_TABLE, table);
+        nlbuf_put_str(&b, NFTA_SET_ELEM_LIST_SET, set);
+        struct nlattr *l = nlbuf_begin_nested(&b, NFTA_SET_ELEM_LIST_ELEMENTS);
+        for (size_t i = 0; i < n; i++) nfv_put_key(&b, keys + i * klen, klen);
+        nlbuf_end_nested(&b, l);
+        nfv_msg_end(&b, add);
+    }
+    struct nlmsghdr *be = nfv_msg_begin(&b, NFNL_MSG_BATCH_END, NLM_F_REQUEST, AF_UNSPEC,
+                                        NFNL_SUBSYS_NFTABLES);
+    nfv_msg_end(&b, be);
+    if (b.overflow || !del) { free(buf); errno = EMSGSIZE; return -1; }
+    int fd = nfv_open();
+    if (fd < 0) { int e = errno; free(buf); errno = e; return -1; }
+    if (nfv_send(fd, buf, (size_t)(b.p - b.base)) != 0) {
+        int e = errno; close(fd); free(buf); errno = e; return -1;
+    }
+    uint32_t seq_del = del->nlmsg_seq, seq_add = add ? add->nlmsg_seq : 0;
+    int need = 1 + (add != NULL), got = 0, err = 0;
+    while (got < need && !err) {
+        ssize_t r = recv(fd, buf, cap, 0);
+        if (r < 0) { if (errno == EINTR) continue; err = errno; break; }
+        if (r == 0) { err = EIO; break; }
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (size_t)r);
+             h = NLMSG_NEXT(h, r)) {
+            if (h->nlmsg_type != NLMSG_ERROR) continue;
+            const struct nlmsgerr *e = NLMSG_DATA(h);
+            if (e->error) { err = -e->error; break; }
+            if (h->nlmsg_seq == seq_del || h->nlmsg_seq == seq_add) got++;
+        }
+    }
+    close(fd);
+    free(buf);
+    if (err) { errno = err; return -1; }
+    return 0;
+}
+
+int nfv_ifnames_write(uint8_t family, const char *table, const char *set, const char *const *names, size_t n) {
+    uint8_t *keys = calloc(n ? n : 1, IFNAMSIZ);
+    if (!keys) { errno = ENOMEM; return -1; }
+    for (size_t i = 0; i < n; i++) {
+        size_t l = strlen(names[i]);
+        if (l >= IFNAMSIZ) { free(keys); errno = ENAMETOOLONG; return -1; }
+        memcpy(keys + i * IFNAMSIZ, names[i], l);
+    }
+    int rc = nfv_set_replace(family, table, set, keys, IFNAMSIZ, n);
+    int e = errno;
+    free(keys);
+    errno = e;
+    return rc;
 }
 
 int nfv_ranges6_write(uint8_t family, const char *table, const char *set,

@@ -2430,8 +2430,8 @@ static void pn_kernel_sets(struct pn_emit *pe, const char *text) {
             struct nft_set *s = ir_set_add(pe->t, "wan_dev", "ifname");
             if (s) {
                 ir_gap(s);
-                /* Устройства маршрутов по умолчанию main, как они лежат сейчас. Сменился WAN — событие сети будит демон
-                 * (hotplug 95-steer, сторож), reload печатает набор заново, и текст правил меняется. */
+                /* Устройства маршрутов по умолчанию main, как они лежат сейчас. Дальше набор ведёт демон: сменился
+                 * маршрут по умолчанию — он переписывает элементы по событию rtnetlink (src/daemon/wandev.c). */
                 struct wan_ctx wc = { .s = s };
                 rtnl_default_devs(wan_dev_add, &wc);
                 vec_free(wc.seen, wc.n);
