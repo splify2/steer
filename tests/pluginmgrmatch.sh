@@ -110,7 +110,8 @@ mk foo 1.0.0 ',"requires":{"plugins":{"net1":"^1.2"}},"steer":{"commands":[{"nam
 mk neu 1.0.0 ''
 mk neu 2.0.0 ''
 sed -i 's/"steer-api":"\^1.0"/"steer-api":"^9.0"/' src/neu-2.0.0/plugin.json
-mk bar 1.0.0 ',"steer":{"commands":[{"name":"bar-x","prog":"bin/bar"}]}'
+# Пустые requires и conflicts: s2p index их не пишет — сверка индекса с архивом считает их отсутствием.
+mk bar 1.0.0 ',"requires":{"plugins":{},"system":[]},"conflicts":[],"steer":{"commands":[{"name":"bar-x","prog":"bin/bar"}]}'
 mk big 1.0.0 ''
 head -c 300000 /dev/urandom > src/big-1.0.0/bin/blob
 mk evil 1.0.0 ''
