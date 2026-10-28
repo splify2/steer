@@ -305,10 +305,9 @@ if [ -z "${STEER_EXT_ONLY:-}" ]; then
     for _p in $(profile_var PLUGINS_TLS); do plug "$_p" tls; done
 fi
 
-# Внешние модули (STEER_EXT_APPS="имя:каталог …"): бинарники из исходников ВНЕ этого дерева —
-# steer-box-connector (sing-box). Собираются теми же флагами и с той же libsteer, что модули
-# steer, а нужные им символы библиотека экспортирует по build/exports-ext.lst. Зовёт их сборка
-# build/ext-build.sh.
+# Внешние модули (STEER_EXT_APPS="имя:каталог …"): бинарники из исходников ВНЕ этого дерева.
+# Собираются теми же флагами и с той же libsteer, что модули steer, и берут у неё только то, что
+# она экспортирует модулям дерева. Зовёт их сборка build/ext-build.sh.
 _eldi=""
 [ -z "$INTERP" ] || _eldi="-Wl,--dynamic-linker=$INTERP"
 # STEER_EXT_STATIC=1 (ext-build.sh --static) — программа плагина без libsteer: свои исходники, EXT_TLS_SRC
