@@ -202,12 +202,12 @@ int pal_ensure(struct pal *a, const char *owner, size_t n, size_t m, int *change
     return 0;
 }
 
-/* Биты метки, которые плагину нельзя отдавать: поле метки steer, 29 и 30 — zapret (DESYNC и пропуск),
- * 16–23 — Tailscale и pbr, 8–13 — mwan3 (marks.h; steer-api.md, 6). Бит 28 мини-сборки моста tgws
- * свободен с 2.1: мост — плагин, а прежний микропакет stgws плагин tgws при установке выводит из работы
- * (переход — plugins/tgws/migrate). */
+/* Биты метки, которые плагину нельзя отдавать: поле метки steer, бит туннеля платформы (телефон: бит 28 —
+ * via, platform.h), 29 и 30 — zapret (DESYNC и пропуск), 16–23 — Tailscale и pbr, 8–13 — mwan3 (marks.h;
+ * steer-api.md, 6). Бит 28 мини-сборки моста tgws на роутере свободен с 2.1: мост — плагин, а прежний
+ * микропакет stgws плагин tgws при установке выводит из работы (plugins/tgws/scripts/postinst). */
 static uint32_t bits_excluded(void) {
-    return plat()->mark_mask | 0x60000000u | 0x00ff0000u | 0x00003f00u;
+    return plat()->mark_mask | plat()->tunnel_bit | 0x60000000u | 0x00ff0000u | 0x00003f00u;
 }
 
 /* «29–31 у recheck, 0–7 у foo» — кто какие биты держит: для отказа «свободных нет». */
