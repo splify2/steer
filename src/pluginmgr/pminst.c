@@ -1074,13 +1074,18 @@ static int platform_write(struct pm_ctx *x) {
         /* Поле метки и приоритет процесс ядра берёт при старте: служба ядра поднимается заново. */
         const char *initd = getenv("STEER_PLUGIN_INITD");
         if (!initd) initd = "/etc/init.d/steer";
-        if (r == 0 && !x->no_daemon && *initd && access(initd, X_OK) == 0) {
+        /* Только работающую: выключенную человеком службу менеджер не запускает. */
+        char *rargv[] = { (char *)initd, "running", NULL };
+        char *rout = NULL;
+        if (r == 0 && !x->no_daemon && *initd && access(initd, X_OK) == 0 &&
+            run_prog(rargv, NULL, NULL, &rout, 30) == 0) {
             char *argv[] = { (char *)initd, "restart", NULL };
             char *out = NULL;
             pm_progress(x, "настройки платформы от плагинов сменились — служба ядра поднимается заново");
             if (run_prog(argv, NULL, NULL, &out, 120) != 0) pm_progress(x, "%s restart не удался", initd);
             free(out);
         }
+        free(rout);
     }
     free(path);
     free(buf);
