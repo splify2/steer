@@ -183,7 +183,10 @@ int pm_write_atomic(const char *path, const void *d, size_t n, unsigned mode) {
         p += w;
         left -= (size_t)w;
     }
-    if (fsync(fd) != 0 || close(fd) != 0 || rename(tmp, path) != 0) {
+    /* close — всегда: при сбое fsync дескриптор иначе утекал бы. */
+    int bad = fsync(fd) != 0;
+    if (close(fd) != 0) bad = 1;
+    if (bad || rename(tmp, path) != 0) {
         unlink(tmp);
         free(tmp);
         return -1;

@@ -454,6 +454,7 @@ kill $LP 2>/dev/null; wait $LP 2>/dev/null
 o="$(P install bar --job --json)"
 J="$(printf '%s\n' "$o" | jq_ 'd["job"]')"
 check "install --job: номер задания сразу" "yes" "$([ -n "$J" ] && echo yes)"
+check "  pid задания записан до ответа (job сразу видит его живым)" "yes" "$([ -s "run/jobs/$J/pid" ] && echo yes)"
 i=0; st=running
 while [ "$st" = running ] && [ $i -lt 100 ]; do
     st="$(P job "$J" --json | jq_ 'd["state"]')"; sleep 0.1; i=$((i + 1))

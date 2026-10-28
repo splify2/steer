@@ -1164,25 +1164,29 @@ static int job_fork(struct pm_ctx *x, int *rc) {
     pid_t pid = fork();
     if (pid < 0) { free(dir); *rc = failc(x, "plugin.job_start_failed", NULL, "не завести задание"); return 0; }
     if (pid > 0) {
+        /* pid ребёнка — до ответа: «steer plugin job» сразу после него видит живое задание, а не
+         * «оборвано» (ребёнок мог ещё не дойти до своей записи). */
+        char pb[32];
+        int pn = snprintf(pb, sizeof(pb), "%d\n", (int)pid);
+        char *pidf = pm_path(dir, "pid");
+        pm_write_atomic(pidf, pb, (size_t)pn, 0644);
+        free(pidf);
         printf(x->json ? "{\"ok\":true,\"job\":\"%s\"}\n" : "задание %s\n", id);
         free(dir);
         *rc = 0;
         return 0;
     }
     setsid();
-    char *out = pm_path(dir, "out"), *log = pm_path(dir, "log"), *pidf = pm_path(dir, "pid");
+    char *out = pm_path(dir, "out"), *log = pm_path(dir, "log");
     int fo = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     int fl = open(log, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fo >= 0) { dup2(fo, 1); close(fo); }
     if (fl >= 0) { dup2(fl, 2); close(fl); }
     int nul = open("/dev/null", O_RDONLY);
     if (nul >= 0) { dup2(nul, 0); close(nul); }
-    char pb[32];
-    int n = snprintf(pb, sizeof(pb), "%d\n", (int)getpid());
-    pm_write_atomic(pidf, pb, (size_t)n, 0644);
     g_job_log = log;
     x->json = 1;
-    free(out); free(pidf);
+    free(out);
     setenv("STEER_PLUGIN_JOB_DIR", dir, 1);
     free(dir);
     return 1;
