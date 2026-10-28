@@ -6,6 +6,7 @@
 #include "dialer.h"
 #include "transport.h"
 #include "vision.h"
+#include "vless_proto.h"
 
 /* Сессия VLESS на одно соединение клиента: состояние потока и связь с узлом.
  *
@@ -18,6 +19,7 @@ struct vl_sess {
     /* ---- поток: VLESS и Vision ---- */
     uint8_t header_sent;       /* заголовок запроса VLESS уже ушёл узлу */
     uint8_t established;       /* заголовок ответа VLESS снят */
+    struct vless_response_stream response;
     /* ---- сборка датаграммы UDP (только у потоков UDP) ----
      *
      * VLESS несёт датаграммы потоком: [длина(2)][данные] и снова. Записи TLS про эти
