@@ -54,6 +54,7 @@ cc_defaults {
         "src/daemon/helpers.c",
         "src/daemon/supervise.c",
         "src/daemon/supd.c",
+        "src/daemon/wandev.c",
         "src/daemon/watch.c",
         "src/daemon/main.c",
         "src/lib/jsonr.c",
