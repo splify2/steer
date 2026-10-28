@@ -35,6 +35,7 @@
 #include "fpseed.h"
 #include "recon.h"
 #include "nftdump.h"
+#include "rtnl.h"
 
 static void iptables_masq_drop_all(void);   /* ниже, у apply_routing */
 static int table_has_default(int table);    /* ниже, у apply-commit */
@@ -1002,16 +1003,11 @@ int cmd_apply_plan(int argc, char **argv) {
 /* Есть ли в таблице выхода маршрут по умолчанию (устройство или запрет). Нет — выход пущен
  * напрямую (apply_failed в режиме direct/zapret или неудачная привязка выше). */
 static int table_has_default(int table) {
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "ip -4 route show table %d 2>/dev/null", table);
-    FILE *p = popen(cmd, "r");
-    if (!p) return 1;
-    char line[512];
-    int yes = 0;
-    while (fgets(line, sizeof(line), p))
-        if (!strncmp(line, "default", 7) || strstr(line, " default ")) yes = 1;
-    pclose(p);
-    return yes;
+    /* Вопрос ядру по netlink, а не `ip -4 route show table N` через popen: apply спрашивает это
+     * про каждый выход дважды, и с десятками выходов это были сотни процессов sh и ip на apply.
+     * netlink отказал — как прежде при отказе popen: считаем, что маршрут есть. */
+    int r = rtnl_table_has_default(table);
+    return r < 0 ? 1 : r;
 }
 
 static int name_in_list(const char *list, const char *name) {
