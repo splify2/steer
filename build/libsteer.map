@@ -22,10 +22,10 @@ LIBSTEER_1 {
     cmd_dev_id;
     cmd_sub_hwid;
     ctlcall_forward;
+    ctlcall_open;
     ctlcall_parse;
     ctlcall_resp_free;
     ctlcall_roundtrip;
-    ctlcall_open;
     ctlcall_socket;
     die;
     dnsurl_parse;
@@ -46,8 +46,11 @@ LIBSTEER_1 {
     dupq_timeout_ms;
     err_args_add;
     err_die;
+    err_fallback;
     err_json;
-    err_set;
+    err_print;
+    err_setc;
+    err_setf;
     evline_free;
     evline_int;
     evline_parse;
