@@ -1148,16 +1148,6 @@ check "ngtcp2: патчи (Brutal и смена перегрузки на ход
 check "разбор спеки: единственная слабая ссылка model/kinds на символ urltls — в grpurl.c" "1" \
     "$(grep -rl 'steer_urltls_present' src/model src/kinds src/compile src/cli | wc -l | tr -d ' ')"
 
-# ---- экспорт для модулей вне дерева ----------------------------------------------------------------
-# Символы build/exports-ext.lst (нужды steer-box-connector и других внешних модулей) обязаны стоять в
-# libsteer.map: gen кладёт их туда сам, но правка карты руками или gen без списка молча убрали бы
-# символ, которым ядро само не пользуется, — и внешний модуль перестал бы компоноваться.
-ext_missing=""
-for sym in $(grep -v '^#' build/exports-ext.lst | grep -v '^$'); do
-    grep -qx "    $sym;" build/libsteer.map || ext_missing="$ext_missing $sym"
-done
-check "exports-ext.lst: каждый символ экспортируется libsteer.map" "" "$ext_missing"
-
 # ---- .so-плагины: загрузчик в steerd (steer-abi, src/daemon/plugso.c) -------------------------------
 # Загрузчик — часть демона: ему нужны цикл, спека и сторож steerd, и в libsteer или модули он не входит
 # (плагин не связан ни с какой libsteer*, всё ему даёт таблица в init). Статические профили берут его

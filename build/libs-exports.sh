@@ -81,15 +81,6 @@ nm -g --defined-only "$W"/lib/*.o | awk 'NF==3 {print $3}' | sort -u > "$W/defs"
 # пропадает без единого сообщения. Именно так DoQ мог бы «работать» в стенде и отказывать на роутере.
 nm -u "$W"/app/*.o | awk '$1=="U" || $1=="w" {print $2}' | sort -u > "$W/undef"
 comm -12 "$W/defs" "$W/undef" > "$W/need"
-# Нужды модулей вне дерева (build/exports-ext.lst): их исходников здесь нет. Каждый обязан быть
-# определён в libsteer — иначе это опечатка или символ, который библиотека потеряла.
-EXT=build/exports-ext.lst
-if [ -f "$EXT" ]; then
-    grep -v '^#' "$EXT" | grep -v '^$' | sort -u > "$W/ext"
-    _missing="$(comm -23 "$W/ext" "$W/defs")"
-    [ -z "$_missing" ] || { echo "libs-exports: в $EXT символы, которых нет в libsteer: $_missing" >&2; exit 1; }
-    sort -u "$W/need" "$W/ext" -o "$W/need"
-fi
 # Все, что определено в libsteer, а снаружи не зовётся, остаётся скрытым.
 # wolfSSL, нужная libsteer: слой примитивов, обёртка QUIC (qcssl.c) и криптобэкенд ngtcp2. Из
 # архива берутся все члены, а не достижимые: сборщик выбросит лишнее, а список экспорта от этого
