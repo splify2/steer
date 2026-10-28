@@ -403,45 +403,37 @@ int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio)
     return rc == EEXIST ? 0 : rc;
 }
 
-int rtnl_route_default_dev(int table, int ifindex) {
+int rtnl_route_default(int fam, int table, int type, int ifindex, int metric) {
     uint8_t buf[128];
     struct nlbuf b;
     struct rtmsg rt;
     memset(&rt, 0, sizeof(rt));
-    rt.rtm_family = AF_INET;
+    rt.rtm_family = fam == 6 ? AF_INET6 : AF_INET;
     rt.rtm_table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
     rt.rtm_protocol = RTPROT_BOOT;
-    rt.rtm_scope = RT_SCOPE_LINK;
-    rt.rtm_type = RTN_UNICAST;
+    /* Как у iproute2: маршрут в устройство без шлюза — scope link, запрет — universe. */
+    rt.rtm_scope = type == RTN_UNICAST ? RT_SCOPE_LINK : RT_SCOPE_UNIVERSE;
+    rt.rtm_type = (unsigned char)type;
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWROUTE,
                                     NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
                                     &rt, sizeof(rt));
     nlbuf_put_u32(&b, RTA_TABLE, (uint32_t)table);
-    nlbuf_put_u32(&b, RTA_OIF, (uint32_t)ifindex);
+    if (type == RTN_UNICAST) nlbuf_put_u32(&b, RTA_OIF, (uint32_t)ifindex);
+    if (metric > 0) nlbuf_put_u32(&b, RTA_PRIORITY, (uint32_t)metric);
     return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
 }
 
+int rtnl_route_default_dev(int table, int ifindex) {
+    return rtnl_route_default(4, table, RTN_UNICAST, ifindex, 0);
+}
+
+/* prohibit, а не blackhole: тот же вид, что кладёт table_bind6 (table_bh_type в failover.c —
+ * запрет IPv6 отвечает клиенту ICMPv6 сразу, шаг 8 выпуска 1.10). Замена, как у
+ * `ip -6 route replace` в backstop_set_fam: стоящий запрет той же метрики она не дублирует и
+ * blackhole прежней версии заменяет на месте. Устройства в сообщении нет — ядро само вешает
+ * запрет на lo. */
 int rtnl_route6_backstop(int table, int metric) {
-    uint8_t buf[128];
-    struct nlbuf b;
-    struct rtmsg rt;
-    memset(&rt, 0, sizeof(rt));
-    rt.rtm_family = AF_INET6;
-    rt.rtm_table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
-    rt.rtm_protocol = RTPROT_BOOT;
-    rt.rtm_scope = RT_SCOPE_UNIVERSE;
-    /* prohibit, а не blackhole: тот же вид, что кладёт table_bind6 (table_bh_type в failover.c —
-     * запрет IPv6 отвечает клиенту ICMPv6 сразу, шаг 8 выпуска 1.10). Замена, как у
-     * `ip -6 route replace` в backstop_set_fam: стоящий запрет той же метрики она не дублирует и
-     * blackhole прежней версии заменяет на месте. Устройства в сообщении нет — ядро само вешает
-     * запрет на lo. */
-    rt.rtm_type = RTN_PROHIBIT;
-    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWROUTE,
-                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
-                                    &rt, sizeof(rt));
-    nlbuf_put_u32(&b, RTA_TABLE, (uint32_t)table);
-    nlbuf_put_u32(&b, RTA_PRIORITY, (uint32_t)metric);
-    return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
+    return rtnl_route_default(6, table, RTN_PROHIBIT, 0, metric);
 }
 
 /* ---- вопросы diag ------------------------------------------------------------------------ */

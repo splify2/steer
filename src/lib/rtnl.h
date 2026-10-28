@@ -53,6 +53,11 @@ int rtnl_rule_from(int add, struct in_addr src, int table, int prio);
  * запуска ip (src/daemon/rulewd.c). */
 int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio);
 
+/* `ip [-6] route replace [TYPE] default [dev <ifindex>] [metric METRIC] table TABLE`: fam 4 или 6,
+ * type — RTN_UNICAST (в устройство ifindex, scope link, как у iproute2 без шлюза), RTN_BLACKHOLE
+ * или RTN_PROHIBIT (устройства нет); metric 0 — не передавать (умолчание ядра). 0 или errno. */
+int rtnl_route_default(int fam, int table, int type, int ifindex, int metric);
+
 /* `ip -4 route replace default dev <ifindex> table TABLE` (scope link, как у iproute2 без
  * шлюза). 0 или errno. */
 int rtnl_route_default_dev(int table, int ifindex);
