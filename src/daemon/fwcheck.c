@@ -127,6 +127,45 @@ static void chains_free(struct fwc_chains *t) {
  *
  * Кэш всегда либо NULL, либо получен malloc'ом: tests/fwmatch.c сбрасывает его между
  * пробами через fwcheck_reset_cache(), изображая свежий процесс на каждую пробу. */
+#define FW_LINE_CAP 2048
+struct fwidx { const char *dump; size_t *off; size_t n; };
+
+/* Длина куска строки с позиции p — как у dump_line с буфером FW_LINE_CAP. */
+static size_t chunk_len(const char *p) {
+    const char *nl = strchr(p, '\n');
+    size_t len = nl ? (size_t)(nl - p) + 1 : strlen(p);
+    return len > FW_LINE_CAP - 1 ? FW_LINE_CAP - 1 : len;
+}
+
+static void fwidx_build(struct fwidx *x, const char *dump) {
+    x->dump = dump;
+    x->off = NULL;
+    x->n = 0;
+    size_t cap = 0;
+    for (const char *p = dump; p && *p; ) {
+        size_t len = chunk_len(p);
+        if (!strncmp(p, "table ", 6) || memmem(p, len, "chain ", 6) ||
+            memmem(p, len, "masquerade", 10) || memmem(p, len, "snat", 4)) {
+            if (x->n == cap) {
+                size_t nc = cap ? cap * 2 : 256;
+                size_t *g = realloc(x->off, nc * sizeof(*g));
+                if (!g) { free(x->off); x->off = NULL; x->n = 0; x->dump = NULL; return; }
+                x->off = g;
+                cap = nc;
+            }
+            x->off[x->n++] = (size_t)(p - dump);
+        }
+        p += len;
+    }
+}
+
+static void fwidx_free(struct fwidx *x) {
+    free(x->off);
+    memset(x, 0, sizeof(*x));
+}
+
+static struct fwidx g_nl_idx;
+
 static char *g_nft_dump, *g_nl_dump;
 
 /* Сброс кэша дампа — единственное, что стенду нужно от него самого, а не через fw_check().
@@ -137,6 +176,7 @@ void fwcheck_reset_cache(void) {
     g_nft_dump = NULL;
     free(g_nl_dump);
     g_nl_dump = NULL;
+    fwidx_free(&g_nl_idx);
 }
 
 static const char *nl_dump(void) {
@@ -184,8 +224,24 @@ static const char *dump_line(const char *p, char *line, size_t cap) {
     return p + len;
 }
 
+/* ИНДЕКС ДАМПА — один на дамп, а не проход по всему дампу на каждый выход. status зовёт fw_check
+ * на каждый выход с устройством, и прежде каждый вызов перебирал все строки набора правил: при
+ * десятках выходов и тысячах правил fw4 это было главной ценой ответа. Строки, которые
+ * fw_check_dump читает независимо от устройства, — заголовки таблиц, цепочки, подмена
+ * (masquerade/snat) — собираются один раз (их смещения, по кускам dump_line); строки с самим
+ * устройством находятся поиском имени по всему дампу (strstr), и разбираются только оба множества
+ * по порядку. Ответ тот же, что у полного прохода: состояние разбора (таблица, цепочка) меняют
+ * только строки индекса. */
+static struct fwcheck fw_check_idx(const struct fwidx *x, const char *device);
+
 struct fwcheck fw_check(const char *device) {
-    return fw_check_dump(nl_dump(), device);
+    const char *d = nl_dump();
+    if (g_nl_idx.dump != d) {
+        fwidx_free(&g_nl_idx);
+        fwidx_build(&g_nl_idx, d);
+    }
+    if (g_nl_idx.dump == d) return fw_check_idx(&g_nl_idx, device);
+    return fw_check_dump(d, device);    /* нет памяти под индекс — полным проходом */
 }
 
 /* Семейства правила подмены — битами: 1 — IPv4, 2 — IPv6.
@@ -220,8 +276,31 @@ static unsigned table_fams_of(const char *line) {
 }
 
 struct fwcheck fw_check_dump(const char *dump, const char *device) {
+    struct fwidx x;
+    fwidx_build(&x, dump);
+    struct fwcheck r = fw_check_idx(&x, device);
+    fwidx_free(&x);
+    return r;
+}
+
+/* Следующая строка с устройством от позиции from: начало её куска (как у dump_line) или NULL. */
+static const char *next_dev_chunk(const char *dump, const char *from, const char *device) {
+    const char *q = strstr(from, device);
+    if (!q) return NULL;
+    const char *ls = q;
+    while (ls > dump && ls[-1] != '\n') ls--;
+    for (;;) {
+        size_t len = chunk_len(ls);
+        if (q < ls + len) return ls < from ? from : ls;
+        ls += len;
+    }
+}
+
+static struct fwcheck fw_check_idx(const struct fwidx *x, const char *device) {
+    const char *dump = x->dump;
     struct fwcheck r;
     memset(&r, 0, sizeof(r));
+    if (!dump) return r;   /* дампа нет или нет памяти под индекс — «не видно», как у пустого */
     /* Зона может называться не так, как устройство, и тогда оба признака ниже молчат:
      * fw4 пишет имя ЗОНЫ и в имя цепочки (`srcnat_vpn`), и в комментарий правила
      * ("Masquerade IPv4 vpn traffic"), а устройство называет ТОЛЬКО на переходе в эту
@@ -251,23 +330,27 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
     char want[80];
     const int want_n = snprintf(want, sizeof(want), "table inet %s", nft_table());
     const size_t dev_n = strlen(device);
-    while (pos && *pos) {
-        /* Строка без единого из признаков — ни заголовка таблицы, ни цепочки, ни устройства, ни
-         * подмены — пропускается без копии и без разбора: таких в наборе fw4 почти все (правила
-         * фильтра), а status спрашивает fw_check на каждый выход. Признаки ищутся memmem по
-         * границам строки; длинная строка режется кусками, как у dump_line. */
-        {
-            const char *nl = strchr(pos, '\n');
-            size_t len = nl ? (size_t)(nl - pos) + 1 : strlen(pos);
-            if (len > sizeof(line) - 1) len = sizeof(line) - 1;
-            if (strncmp(pos, "table ", 6) && !memmem(pos, len, "chain ", 6) &&
-                !memmem(pos, len, "masquerade", 10) && !memmem(pos, len, "snat", 4) &&
-                !(dev_n && memmem(pos, len, device, dev_n))) {
-                pos += len;
-                continue;
-            }
+    size_t ii = 0;
+    const char *dv = dev_n ? next_dev_chunk(dump, dump, device) : NULL;
+    int dev_more = dv != NULL;   /* искать ли устройство дальше: больше не нашлось — не искать */
+    for (;;) {
+        /* Следующая по порядку строка — из индекса или с устройством; одна и та же — один раз. */
+        const char *xi = ii < x->n ? dump + x->off[ii] : NULL;
+        if (!xi && !dv) break;
+        if (xi && (!dv || xi <= dv)) {
+            pos = xi;
+            ii++;
+            if (dv == xi) dv = NULL;
+        } else {
+            pos = dv;
+            dv = NULL;
         }
-        pos = dump_line(pos, line, sizeof(line));
+        if (!dv && dev_more) {
+            const char *after = pos + chunk_len(pos);
+            dv = *after ? next_dev_chunk(dump, after, device) : NULL;
+            dev_more = dv != NULL;
+        }
+        dump_line(pos, line, sizeof(line));
         /* Our own table mentions the device too; it proves nothing about NAT. */
         if (!strncmp(line, "table ", 6)) {
             in_steer = !strncmp(line, want, (size_t)want_n) &&
