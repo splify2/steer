@@ -1251,6 +1251,15 @@ static void mem_end(struct mem_run *m, struct cbuf *r, int code) {
 /* Отказ разбора спеки — тем же текстом, что err_die у подкоманды. */
 static int mem_no_spec(const struct steerd *d) {
     fprintf(stderr, "%s%s\n", "steer: ", d->err);
+    if (d->err_code[0]) {               /* слово и подстановки — строкой JSON, её вынет resp_ecode */
+        struct err e;
+        memset(&e, 0, sizeof(e));
+        snprintf(e.msg, sizeof(e.msg), "%s", d->err);
+        snprintf(e.code, sizeof(e.code), "%s", d->err_code);
+        snprintf(e.args, sizeof(e.args), "%s", d->err_args);
+        char b[4096];
+        if (err_json(&e, b, sizeof(b)) > 0) fprintf(stderr, "%s\n", b);
+    }
     return 2;
 }
 
@@ -1549,9 +1558,12 @@ static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled,
     } else {
         changed_json(&cj, d, NULL);
         fprintf(stderr, LOG_W "спека не прочитана (%s): %s\n", by, s->d.err);
-        char m[2304], f[2560];
+        char m[2304], f[3400];
         steerd_json_str(m, sizeof(m), s->d.err);
-        snprintf(f, sizeof(f), ",\"by\":\"%s\",\"message\":%s", by, m);
+        size_t fn = (size_t)snprintf(f, sizeof(f), ",\"by\":\"%s\",\"message\":%s", by, m);
+        if (s->d.err_code[0] && fn < sizeof(f))     /* слово и подстановки отказа (docs/errors.md) */
+            snprintf(f + fn, sizeof(f) - fn, ",\"code\":\"%s\",\"args\":%s", s->d.err_code,
+                     s->d.err_args[0] ? s->d.err_args : "{}");
         steerd_emit(&s->d, "spec-error", f);
     }
     if (changed && cj.p) cb_put(changed, cj.p, cj.n);
