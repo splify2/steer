@@ -26,6 +26,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 #include "pm.h"
 #include "httpc.h"
@@ -324,13 +327,61 @@ static void outs_free(struct outs *o) {
     memset(o, 0, sizeof(*o));
 }
 
+/* Будильники ожидания выходов: подписка на события демона (subscribe — helper-up, switched, revived,
+ * failed, applied) и группа RTMGRP_LINK netlink (operstate устройства — то, по чему status судит об up у
+ * выхода без помощника: интерфейс, awg, вид плагина с устройством). Любое событие — повод спросить status
+ * снова; его ответ — единственный судья.
+ *
+ * ЧТО БЫЛО. Опрос status с шагом 20 мс, удваивавшимся до 640: выход, вставший через 0,7 с, замечался
+ * через 1,3 с (замер на netns, вид плагина на dummy). Теперь — через время ответа status после события.
+ * Опрос остаётся страховкой раз в секунду: нет netlink (политика SELinux телефона) или подписки (демон
+ * старше subscribe) — ожидание всё равно кончается, только медленнее. */
+static int wake_sub(void) {
+    int s = ctlcall_open(0);
+    if (s < 0) return -1;
+    static const char req[] = "subscribe\n";
+    if (send(s, req, sizeof(req) - 1, MSG_NOSIGNAL) != (ssize_t)(sizeof(req) - 1)) { close(s); return -1; }
+    shutdown(s, SHUT_WR);
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);
+    return s;
+}
+
+static int wake_link(void) {
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
+    if (s < 0) return -1;
+    struct sockaddr_nl a;
+    memset(&a, 0, sizeof(a));
+    a.nl_family = AF_NETLINK;
+    a.nl_groups = RTMGRP_LINK;
+    if (bind(s, (struct sockaddr *)&a, sizeof(a)) != 0) { close(s); return -1; }
+    return s;
+}
+
+/* Вычерпать сокет. 0 — закрыт (демон ушёл или отключил подписчика): больше не ждать на нём. */
+static int wake_drain(int fd) {
+    char b[8192];
+    for (;;) {
+        ssize_t m = recv(fd, b, sizeof(b), 0);
+        if (m > 0) continue;
+        if (m < 0 && errno == EINTR) continue;
+        if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) return 1;
+        return 0;
+    }
+}
+
+static long long mono_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
 /* Ждать, пока выходы, бывшие up, снова up. 0 — дождались; -1 — причина в e. */
 static int wait_outs(struct pm_ctx *x, const struct outs *o, int timeout_s, struct pm_err *e) {
     if (!o->n || x->no_daemon) return 0;
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    long long until_ms = (long long)t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + (long long)timeout_s * 1000;
-    long step_ms = 20;   /* выход помощника встаёт за десятки мс: шаг растёт вдвое до 500 мс, а не секунда сразу */
+    long long until_ms = mono_ms() + (long long)timeout_s * 1000;
+    /* Будильники — до первого status: событие между ответом и подпиской не теряется. */
+    struct pollfd pf[2] = { { wake_sub(), POLLIN, 0 }, { wake_link(), POLLIN, 0 } };
+    int rc = -1;
     for (;;) {
         struct ydoc *d = daemon_status(x);
         const char *down = NULL;
@@ -338,23 +389,23 @@ static int wait_outs(struct pm_ctx *x, const struct outs *o, int timeout_s, stru
             const struct ynode *outs = ynode_get(ydoc_root(d), "outputs");
             for (size_t i = 0; i < o->n && !down; i++)
                 if (!yn_bool(ynode_get(outs, o->v[i]), "up", 0)) down = o->v[i];
-            if (!down) { ydoc_free(d); return 0; }
+            if (!down) { ydoc_free(d); rc = 0; break; }
         }
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long long now_ms = (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+        long long now_ms = mono_ms();
         if (now_ms >= until_ms) {
             pm_errc(e, "plugin.output_not_up", PMA("name", down ? down : "?", "seconds", pm_itoa(timeout_s)), "выход %s не поднялся за %d с", down ? down : "?", timeout_s);
             if (d) ydoc_free(d);
-            return -1;
+            break;
         }
         if (d) ydoc_free(d);
-        long left = (long)(until_ms - now_ms);
-        long nap = step_ms < left ? step_ms : left;
-        struct timespec ts = { nap / 1000, (nap % 1000) * 1000000L };
-        nanosleep(&ts, NULL);
-        if (step_ms < 500) step_ms *= 2;
+        long long left = until_ms - now_ms;
+        int nap = left < 1000 ? (int)left : 1000;
+        if (poll(pf, 2, nap) > 0)
+            for (int i = 0; i < 2; i++)
+                if (pf[i].revents && !wake_drain(pf[i].fd)) { close(pf[i].fd); pf[i].fd = -1; }
     }
+    for (int i = 0; i < 2; i++) if (pf[i].fd >= 0) close(pf[i].fd);
+    return rc;
 }
 
 /* ---- системные пакеты ---- */

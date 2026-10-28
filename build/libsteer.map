@@ -25,6 +25,7 @@ LIBSTEER_1 {
     ctlcall_parse;
     ctlcall_resp_free;
     ctlcall_roundtrip;
+    ctlcall_open;
     ctlcall_socket;
     die;
     dnsurl_parse;
@@ -185,10 +186,12 @@ LIBSTEER_1 {
     rtnl_default_devs;
     rtnl_main6_routes;
     rtnl_route6_backstop;
+    rtnl_route_default;
     rtnl_route_default_dev;
     rtnl_routes_dup;
     rtnl_rule_from;
     rtnl_rule_fwmark;
+    rtnl_rule_mark;
     rtnl_rules_dup;
     rtnl_table_flush;
     rtnl_table_has_default;

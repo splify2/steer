@@ -107,6 +107,9 @@ extern int (*g_ip6_show)(int table, char *out, size_t n);
 int routing6_live_ok(const struct route_facts *f, const char *dev, int dev_v6);
 extern int (*g_icmp_probe)(const char *dev);
 extern int (*g_cmd_hook)(const char *const argv[]);
+/* Шов стенда для маршрутов таблицы выхода (route_put в failover.c): задан — маршрут не ставится
+ * сообщением rtnetlink, а команда `ip route replace …` словами уходит сюда. */
+extern int (*g_route_hook)(const char *const argv[]);
 extern long (*g_revive_step)(void);
 
 #endif

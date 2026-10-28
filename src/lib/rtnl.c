@@ -381,7 +381,7 @@ int rtnl_rule_from(int add, struct in_addr src, int table, int prio) {
     return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
 }
 
-int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio) {
+int rtnl_rule_mark(int add, int fam, uint32_t mark, uint32_t mask, int table, int prio) {
     uint8_t buf[128];
     struct nlbuf b;
     struct fib_rule_hdr fr;
@@ -391,57 +391,55 @@ int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio)
     fr.table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
     /* NLM_F_EXCL — как у `ip rule add`: ядро тогда отвечает EEXIST на точную копию, и вторая
      * одинаковая не появляется. Без приоритета ядро выбирает его само — тем же правилом, что и
-     * для `ip rule add` без pref. */
-    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWRULE,
-                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+     * для `ip rule add` без pref; снятие без приоритета снимает первую подходящую копию (ENOENT —
+     * копий больше нет), как `ip rule del`. */
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), add ? RTM_NEWRULE : RTM_DELRULE,
+                                    NLM_F_REQUEST | NLM_F_ACK |
+                                        (add ? NLM_F_CREATE | NLM_F_EXCL : 0),
                                     &fr, sizeof(fr));
     nlbuf_put_u32(&b, FRA_FWMARK, mark);
     nlbuf_put_u32(&b, FRA_FWMASK, mask);
     nlbuf_put_u32(&b, FRA_TABLE, (uint32_t)table);
     if (prio > 0) nlbuf_put_u32(&b, FRA_PRIORITY, (uint32_t)prio);
     int rc = rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
-    return rc == EEXIST ? 0 : rc;
+    return add && rc == EEXIST ? 0 : rc;
+}
+
+int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio) {
+    return rtnl_rule_mark(1, fam, mark, mask, table, prio);
+}
+
+int rtnl_route_default(int fam, int table, int type, int ifindex, int metric) {
+    uint8_t buf[128];
+    struct nlbuf b;
+    struct rtmsg rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rtm_family = fam == 6 ? AF_INET6 : AF_INET;
+    rt.rtm_table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
+    rt.rtm_protocol = RTPROT_BOOT;
+    /* Как у iproute2: маршрут в устройство без шлюза — scope link, запрет — universe. */
+    rt.rtm_scope = type == RTN_UNICAST ? RT_SCOPE_LINK : RT_SCOPE_UNIVERSE;
+    rt.rtm_type = (unsigned char)type;
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWROUTE,
+                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+                                    &rt, sizeof(rt));
+    nlbuf_put_u32(&b, RTA_TABLE, (uint32_t)table);
+    if (type == RTN_UNICAST) nlbuf_put_u32(&b, RTA_OIF, (uint32_t)ifindex);
+    if (metric > 0) nlbuf_put_u32(&b, RTA_PRIORITY, (uint32_t)metric);
+    return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
 }
 
 int rtnl_route_default_dev(int table, int ifindex) {
-    uint8_t buf[128];
-    struct nlbuf b;
-    struct rtmsg rt;
-    memset(&rt, 0, sizeof(rt));
-    rt.rtm_family = AF_INET;
-    rt.rtm_table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
-    rt.rtm_protocol = RTPROT_BOOT;
-    rt.rtm_scope = RT_SCOPE_LINK;
-    rt.rtm_type = RTN_UNICAST;
-    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWROUTE,
-                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
-                                    &rt, sizeof(rt));
-    nlbuf_put_u32(&b, RTA_TABLE, (uint32_t)table);
-    nlbuf_put_u32(&b, RTA_OIF, (uint32_t)ifindex);
-    return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
+    return rtnl_route_default(4, table, RTN_UNICAST, ifindex, 0);
 }
 
+/* prohibit, а не blackhole: тот же вид, что кладёт table_bind6 (table_bh_type в failover.c —
+ * запрет IPv6 отвечает клиенту ICMPv6 сразу, шаг 8 выпуска 1.10). Замена, как у
+ * `ip -6 route replace` в backstop_set_fam: стоящий запрет той же метрики она не дублирует и
+ * blackhole прежней версии заменяет на месте. Устройства в сообщении нет — ядро само вешает
+ * запрет на lo. */
 int rtnl_route6_backstop(int table, int metric) {
-    uint8_t buf[128];
-    struct nlbuf b;
-    struct rtmsg rt;
-    memset(&rt, 0, sizeof(rt));
-    rt.rtm_family = AF_INET6;
-    rt.rtm_table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
-    rt.rtm_protocol = RTPROT_BOOT;
-    rt.rtm_scope = RT_SCOPE_UNIVERSE;
-    /* prohibit, а не blackhole: тот же вид, что кладёт table_bind6 (table_bh_type в failover.c —
-     * запрет IPv6 отвечает клиенту ICMPv6 сразу, шаг 8 выпуска 1.10). Замена, как у
-     * `ip -6 route replace` в backstop_set_fam: стоящий запрет той же метрики она не дублирует и
-     * blackhole прежней версии заменяет на месте. Устройства в сообщении нет — ядро само вешает
-     * запрет на lo. */
-    rt.rtm_type = RTN_PROHIBIT;
-    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWROUTE,
-                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
-                                    &rt, sizeof(rt));
-    nlbuf_put_u32(&b, RTA_TABLE, (uint32_t)table);
-    nlbuf_put_u32(&b, RTA_PRIORITY, (uint32_t)metric);
-    return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
+    return rtnl_route_default(6, table, RTN_PROHIBIT, 0, metric);
 }
 
 /* ---- вопросы diag ------------------------------------------------------------------------ */

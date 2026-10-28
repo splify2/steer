@@ -334,6 +334,8 @@ static int zapret_running(void) { return proc_cmdline_find("nfqws", 0); }
  * последнего слова (стенд failovermatch сверяет её строкой); fam 6 — `ip -6 rule` (маршрутизация
  * IPv6, docs/architecture.md, «4б»): та же метка, тот же номер таблицы — у IPv6 свой набор таблиц,
  * и номер не пересекается с таблицами IPv4 ничем, кроме числа. */
+int (*g_route_hook)(const char *const argv[]);
+
 static int rule_cmd(int fam, const char *verb, unsigned mark, const char *mask, int table,
                     const char *pref) {
     char m[40], t[16];
@@ -351,7 +353,10 @@ static int rule_cmd(int fam, const char *verb, unsigned mark, const char *mask, 
     argv[k++] = t;
     if (pref) { argv[k++] = "priority"; argv[k++] = pref; }
     argv[k] = NULL;
-    return run_quiet(argv);
+    /* Сообщением rtnetlink, а не процессом ip (route_put ниже); слова команды — шву стенда. */
+    if (g_route_hook) return g_route_hook(argv);
+    return rtnl_rule_mark(!strcmp(verb, "add"), fam, mark, (uint32_t)strtoul(mask, NULL, 0), table,
+                          pref ? atoi(pref) : 0);
 }
 
 static void rule_add_fam(int fam, unsigned mark, int table) {
@@ -425,13 +430,11 @@ void conntrack_evict(unsigned mark) {
 }
 
 void rule_drop(unsigned mark, int table) {
-    char m[32], t[16];
-    snprintf(m, sizeof(m), "0x%08x/0x%08x", mark, STEER_MARK_MASK);
-    snprintf(t, sizeof(t), "%d", table);
-    /* В цикле, потому что `ip rule add` дубликаты не проверяет и копий может быть
-     * несколько; до отказа — он и означает «больше таких нет». */
-    const char *del[] = { "ip", "rule", "del", "fwmark", m, "table", t, NULL };
-    while (run_quiet(del) == 0) ;
+    char mk[16];
+    snprintf(mk, sizeof(mk), "0x%08x", STEER_MARK_MASK);
+    /* В цикле, потому что копий может быть несколько (их ставил прежний `ip rule add` без
+     * проверки дубликатов); до отказа — он и означает «больше таких нет». */
+    while (rule_cmd(4, "del", mark, mk, table, NULL) == 0) ;
 }
 
 /* Правило IPv6 выхода — снять все копии. */
@@ -689,6 +692,18 @@ static void table_prune_fam(int fam, int table, const char *dev, int backstop) {
     free(routes);
 }
 
+/* Маршрут по умолчанию таблицы выхода — сообщением rtnetlink, а не процессом `ip`: привязка выхода
+ * (apply, сторож, помощник поднялся) запускала `ip` на каждый маршрут — до четырёх на выход с IPv6.
+ * argv — та же команда словами: её получает шов стенда g_route_hook (failovermatch сверяет команды
+ * строкой). Отказ — errno вместо кода `ip`; вызывающие смотрят только на «не 0». */
+static int route_put(const char *const argv[], int fam, int table, int type, const char *dev,
+                     int metric) {
+    if (g_route_hook) return g_route_hook(argv);
+    int ifindex = 0;
+    if (type == RTN_UNICAST && !(ifindex = (int)if_nametoindex(dev))) return ENODEV;
+    return rtnl_route_default(fam, table, type, ifindex, metric);
+}
+
 /* Поставить запасной запрет (см. STEER_BACKSTOP_METRIC в spec.h). Заменой: стоящий такой же
  * она не дублирует. */
 static void backstop_set_fam(int fam, int table) {
@@ -699,7 +714,8 @@ static void backstop_set_fam(int fam, int table) {
                          "table", t, NULL };
     const char *bs6[] = { "ip", "-6", "route", "replace", table_bh_type(6), "default", "metric",
                           m, "table", t, NULL };
-    run_quiet(fam == 6 ? bs6 : bs);
+    if (fam == 6) route_put(bs6, 6, table, RTN_PROHIBIT, NULL, STEER_BACKSTOP_METRIC);
+    else route_put(bs, 4, table, RTN_BLACKHOLE, NULL, STEER_BACKSTOP_METRIC);
 }
 
 static void backstop_set(int table) { backstop_set_fam(4, table); }
@@ -716,7 +732,8 @@ int table_bind(const struct output *o, const char *dev) {
     if (backstop) backstop_set(o->table);
     const char *to_dev[] = { "ip", "route", "replace", "default", "dev", dev, "table", t, NULL };
     const char *to_bh[] = { "ip", "route", "replace", "blackhole", "default", "table", t, NULL };
-    int rc = run_quiet(dev ? to_dev : to_bh);
+    int rc = dev ? route_put(to_dev, 4, o->table, RTN_UNICAST, dev, 0)
+                 : route_put(to_bh, 4, o->table, RTN_BLACKHOLE, NULL, 0);
     if (rc != 0) return rc;
     /* Без on_fail=drop запасной запрет снимается здесь же: режим мог смениться с drop, а
      * пустая таблица у direct/zapret — обещанное «напрямую», а не утечка. */
@@ -746,11 +763,12 @@ static int table_bind6(const struct output *o, const char *dev) {
                              NULL };
     const char *to_bh[] = { "ip", "-6", "route", "replace", table_bh_type(6), "default", "table",
                             t, NULL };
-    int rc = run_quiet(dev ? to_dev : to_bh);
+    int rc = dev ? route_put(to_dev, 6, o->table, RTN_UNICAST, dev, 0)
+                 : route_put(to_bh, 6, o->table, RTN_PROHIBIT, NULL, 0);
     if (rc != 0 && dev) {
         /* Устройство IPv6 не несёт (выключен на нём IPv6) или исчезло. Прежний маршрут в
          * другое устройство оставлять нельзя — IPv6 ушёл бы не туда; запрет на его место. */
-        if (run_quiet(to_bh) == 0) table_prune_fam(6, o->table, NULL, 1);
+        if (route_put(to_bh, 6, o->table, RTN_PROHIBIT, NULL, 0) == 0) table_prune_fam(6, o->table, NULL, 1);
         return rc;
     }
     if (rc != 0) return rc;
