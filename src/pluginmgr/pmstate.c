@@ -150,36 +150,67 @@ static void inst_free(struct pm_inst *x) {
 void pm_state_free(struct pm_state *s) {
     for (size_t i = 0; i < s->n; i++) inst_free(&s->v[i]);
     free(s->v);
+    free(s->hx);
     free_list(s->system_ours, s->nsys);
     free(s->auto_window); free(s->last_check); free(s->next_check);
     memset(s, 0, sizeof(*s));
 }
 
+static size_t id_hash(const char *s) {
+    size_t h = (size_t)1469598103934665603ULL;
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * (size_t)1099511628211ULL;
+    return h;
+}
+
+/* Ячейка хеша для id: занятая им или первая пустая. */
+static size_t *hx_slot(const struct pm_state *s, const char *id) {
+    for (size_t i = id_hash(id) & (s->hcap - 1);; i = (i + 1) & (s->hcap - 1))
+        if (!s->hx[i] || !strcmp(s->v[s->hx[i] - 1].id, id)) return &s->hx[i];
+}
+
+/* Перестроить хеш под n записей (после роста и удаления — индексы сдвигаются). */
+static void hx_rebuild(struct pm_state *s) {
+    size_t want = 16;
+    while (want < 2 * (s->n + 1)) want *= 2;
+    if (want != s->hcap) {
+        free(s->hx);
+        s->hx = pm_alloc(sizeof(*s->hx) * want);
+        s->hcap = want;
+    }
+    memset(s->hx, 0, sizeof(*s->hx) * s->hcap);
+    for (size_t i = 0; i < s->n; i++) *hx_slot(s, s->v[i].id) = i + 1;
+}
+
 struct pm_inst *pm_state_find(struct pm_state *s, const char *id) {
-    for (size_t i = 0; i < s->n; i++)
-        if (!strcmp(s->v[i].id, id)) return &s->v[i];
-    return NULL;
+    if (!s->n || !id) return NULL;
+    size_t k = *hx_slot(s, id);
+    return k ? &s->v[k - 1] : NULL;
 }
 
 struct pm_inst *pm_state_add(struct pm_state *s, const char *id) {
     struct pm_inst *x = pm_state_find(s, id);
     if (x) return x;
-    s->v = pm_realloc(s->v, sizeof(*s->v) * (s->n + 1));
+    if (s->n == s->cap) {
+        s->cap = s->cap ? 2 * s->cap : 8;
+        s->v = pm_realloc(s->v, sizeof(*s->v) * s->cap);
+    }
     x = &s->v[s->n++];
     memset(x, 0, sizeof(*x));
     x->id = pm_strdup(id);
     x->auto_update = 1;
+    if (2 * (s->n + 1) > s->hcap) hx_rebuild(s);
+    else *hx_slot(s, id) = s->n;
     return x;
 }
 
 void pm_state_del(struct pm_state *s, const char *id) {
-    for (size_t i = 0; i < s->n; i++) {
-        if (strcmp(s->v[i].id, id)) continue;
-        inst_free(&s->v[i]);
-        memmove(&s->v[i], &s->v[i + 1], sizeof(*s->v) * (s->n - i - 1));
-        s->n--;
-        return;
-    }
+    struct pm_inst *x = pm_state_find(s, id);
+    if (!x) return;
+    size_t i = (size_t)(x - s->v);
+    inst_free(x);
+    memmove(&s->v[i], &s->v[i + 1], sizeof(*s->v) * (s->n - i - 1));
+    s->n--;
+    hx_rebuild(s);
 }
 
 const char *pm_bad_why(const struct pm_inst *p, const char *ver) {
@@ -229,7 +260,7 @@ void pm_sys_ours_add(struct pm_state *s, const char *pkg) {
 /* ---- repos.d ---- */
 
 static void repo_free(struct pm_repo *r) {
-    free(r->name); free(r->url); free(r->file); free(r->last_generated); free(r->idx_err);
+    free(r->name); free(r->url); free(r->file); free(r->last_generated); free(r->idx_err); free(r->idx_miss);
     free_list(r->mirrors, r->nmirrors);
     free_list(r->keys, r->nkeys);
     if (r->idx) ydoc_free(r->idx);

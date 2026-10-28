@@ -183,7 +183,10 @@ int pm_write_atomic(const char *path, const void *d, size_t n, unsigned mode) {
         p += w;
         left -= (size_t)w;
     }
-    if (fsync(fd) != 0 || close(fd) != 0 || rename(tmp, path) != 0) {
+    /* close — всегда: при сбое fsync дескриптор иначе утекал бы. */
+    int bad = fsync(fd) != 0;
+    if (close(fd) != 0) bad = 1;
+    if (bad || rename(tmp, path) != 0) {
         unlink(tmp);
         free(tmp);
         return -1;
@@ -354,28 +357,39 @@ long yn_long(const struct ynode *map, const char *key, long dflt) {
     return n && ynode_long(n, &v) == 0 ? v : dflt;
 }
 
-int yn_equal(const struct ynode *a, const struct ynode *b) {
-    if (!a || !b) {
-        /* отсутствие поля равно null и пустому объекту */
-        const struct ynode *x = a ? a : b;
-        if (!x) return 1;
-        if (x->kind == YN_SCALAR) return x->style == YS_PLAIN && ynode_is_null(x);
-        return x->len == 0;
+/* Пустое по смыслу: нет поля, null, пустые объект и массив и объект из одних пустых значений. s2p index
+ * пустые поля не пишет ({"requires":{"plugins":{}}} в индексе — нет requires), так что для сверки индекса
+ * с архивом они равны отсутствию. */
+static int yn_blank(const struct ynode *x) {
+    if (!x) return 1;
+    if (x->kind == YN_SCALAR) return x->style == YS_PLAIN && ynode_is_null(x);
+    if (x->kind == YN_SEQ) return x->len == 0;
+    for (size_t i = 0; i < x->len; i++)
+        if (!yn_blank(x->items[2 * i + 1])) return 0;
+    return 1;
+}
+
+/* Все непустые значения отображения a есть в b и равны. */
+static int yn_map_sub(const struct ynode *a, const struct ynode *b) {
+    for (size_t i = 0; i < a->len; i++) {
+        const struct ynode *av = a->items[2 * i + 1];
+        if (yn_blank(av)) continue;
+        if (!yn_equal(av, ynode_get(b, a->items[2 * i]->str))) return 0;
     }
+    return 1;
+}
+
+int yn_equal(const struct ynode *a, const struct ynode *b) {
+    if (yn_blank(a) || yn_blank(b)) return yn_blank(a) && yn_blank(b);
     if (a->kind != b->kind) return 0;
     if (a->kind == YN_SCALAR) return a->len == b->len && !memcmp(a->str, b->str, a->len);
-    if (a->len != b->len) return 0;
     if (a->kind == YN_SEQ) {
+        if (a->len != b->len) return 0;
         for (size_t i = 0; i < a->len; i++)
             if (!yn_equal(a->items[i], b->items[i])) return 0;
         return 1;
     }
-    for (size_t i = 0; i < a->len; i++) {
-        const struct ynode *k = a->items[2 * i];
-        const struct ynode *bv = ynode_get(b, k->str);
-        if (!bv || !yn_equal(a->items[2 * i + 1], bv)) return 0;
-    }
-    return 1;
+    return yn_map_sub(a, b) && yn_map_sub(b, a);
 }
 
 /* ---- JSON: запись ---- */

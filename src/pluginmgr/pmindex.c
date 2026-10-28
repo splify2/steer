@@ -303,6 +303,9 @@ static int idx_from_seed(struct pm_repo *r, struct pm_err *e) {
 
 int pm_index_get(struct pm_repo *r, int refresh, struct pm_err *e) {
     if (r->iroot) return 0;
+    /* Кэш и семя без сети уже не дали индекса: перечитывать и проверять подпись заново на каждый
+     * плагин списка незачем — та же причина. Запрос с сетью пробует снова. */
+    if (!refresh && r->idx_miss) { *e = *r->idx_miss; return -1; }
     if (r->seed) return idx_from_seed(r, e);
     struct pm_err ce = {0};
     char *cd = cache_dir(r);
@@ -399,6 +402,10 @@ int pm_index_get(struct pm_repo *r, int refresh, struct pm_err *e) {
     if (r->idx_err) pm_errc(e, "plugin.index_failed", PMA("name", r->name, "why", r->idx_err), "%s", r->idx_err);
     else if (net_err) pm_errc(e, "plugin.index_download", PMA("name", r->name, "why", net_err), "индекс репозитория %s не скачался: %s", r->name, net_err);
     else pm_errc(e, "plugin.index_missing", PMA("name", r->name, "why", ce.msg[0] ? ce.msg : "кэш пуст"), "индекса репозитория %s нет: %s", r->name, ce.msg[0] ? ce.msg : "кэш пуст");
+    if (!refresh) {
+        if (!r->idx_miss) r->idx_miss = pm_alloc(sizeof(*r->idx_miss));
+        *r->idx_miss = *e;
+    }
     free(net_err); free(etag); free(etag_p); free(cd);
     return -1;
 done:
@@ -427,13 +434,14 @@ static const char *conflict_with(struct pm_ctx *x, const char *id, const struct 
     for (size_t i = 0; i < x->st.n; i++) {
         const char *other = x->st.v[i].id;
         if (!strcmp(other, id)) continue;
-        struct ydoc *m = pm_manifest(other);
+        struct ydoc *own;
+        const struct ynode *m = pm_manifest_ro(x, other, &own);
         if (!m) continue;
-        const struct ynode *oc = ynode_get(ydoc_root(m), "conflicts");
+        const struct ynode *oc = ynode_get(m, "conflicts");
         int hit = 0;
         for (size_t j = 0; j < ynode_len(oc); j++)
             if (yn_is_str(ynode_at(oc, j)) && !strcmp(ynode_at(oc, j)->str, id)) hit = 1;
-        ydoc_free(m);
+        if (own) ydoc_free(own);
         if (hit) return other;
     }
     return NULL;

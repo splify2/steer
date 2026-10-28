@@ -722,7 +722,7 @@ static void flow_release(struct hy2_flow *f, int reset) {
     pend_free(h, f);
     f->hbuf = NULL;
     f->up = NULL;
-    f->up_n = 0;
+    f->up_n = f->up_off = f->up_cap = 0;
     f->ux = NULL;
     f->q = NULL;
     f->state = 0;
@@ -781,21 +781,42 @@ static void flow_down(struct hy2_flow *f, const uint8_t *d, size_t n) {
     stack_sess_rx(f);
 }
 
-/* Дослать серверу остаток, который не принял буфер потока. */
+/* Дослать серверу остаток, который не принял буфер потока. Принятое снимается сдвигом начала, а не
+ * memmove хвоста: при остатке в окно (мегабайты) и подтверждениях по пакету сдвиг на каждую досылку
+ * переписывал весь остаток — квадрат по объёму. */
 static void flow_up_flush(struct hy2_flow *f) {
     struct hq *h = f->q;
     if (!f->up_n || f->gone || f->sclosed) return;
-    ssize_t k = qc_stream_send(h->qc, f->sid, f->up, f->up_n, 0);
+    ssize_t k = qc_stream_send(h->qc, f->sid, f->up + f->up_off, f->up_n, 0);
     if (k < 0) { flow_kill(f, 0); return; }
     h->tx_bytes += (uint64_t)k;
-    if ((size_t)k < f->up_n) {
-        memmove(f->up, f->up + k, f->up_n - (size_t)k);
-        f->up_n -= (size_t)k;
-        return;
+    f->up_off += (size_t)k;
+    f->up_n -= (size_t)k;
+    if (!f->up_n) f->up_off = 0;   /* буфер остаётся до конца потока: следующий остаток ляжет без malloc */
+}
+
+/* Положить в остаток n байт. Места не хватает: снятое начало не меньше остатка — сдвиг (переносится
+ * не больше уже отправленного); иначе новое место вдвое больше нужного. Каждый байт так переносится
+ * O(1) раз, память — не больше четырёх окон. 0 — легло; -1 — нет памяти. */
+static int up_append(struct hy2_flow *f, const uint8_t *d, size_t n) {
+    if (f->up_off + f->up_n + n > f->up_cap) {
+        if (f->up_off >= f->up_n && f->up_n + n <= f->up_cap) {
+            memmove(f->up, f->up + f->up_off, f->up_n);
+        } else {
+            size_t cap = f->up_cap ? f->up_cap : 4096;
+            while (cap < 2 * (f->up_n + n)) cap *= 2;
+            uint8_t *nb = malloc(cap);
+            if (!nb) return -1;
+            if (f->up_n) memcpy(nb, f->up + f->up_off, f->up_n);
+            free(f->up);
+            f->up = nb;
+            f->up_cap = cap;
+        }
+        f->up_off = 0;
     }
-    f->up_n = 0;
-    free(f->up);
-    f->up = NULL;
+    memcpy(f->up + f->up_off + f->up_n, d, n);
+    f->up_n += n;
+    return 0;
 }
 
 /* Сколько датаграмм не влезло и их пришлось потерять — слать: нечем. UDP клиента — датаграммами QUIC. */
@@ -832,11 +853,7 @@ int hy2c_send(struct hy2_flow *f, const unsigned char *d, size_t n) {
     if (!n) return SEND_OK;         /* запрос потока ушёл при открытии: серверу, говорящему первым, нечего добавить */
     if (f->up_n) {
         /* Остаток ещё ждёт места: порядок байт дороже скорости, новое — за ним. */
-        uint8_t *nb = realloc(f->up, f->up_n + n);
-        if (!nb) return SEND_FATAL;
-        memcpy(nb + f->up_n, d, n);
-        f->up = nb;
-        f->up_n += n;
+        if (up_append(f, d, n) != 0) return SEND_FATAL;
         act_add(h, f);
         return SEND_OK;
     }
@@ -844,10 +861,7 @@ int hy2c_send(struct hy2_flow *f, const unsigned char *d, size_t n) {
     if (k < 0) return SEND_FATAL;
     h->tx_bytes += (uint64_t)k;
     if ((size_t)k < n) {
-        f->up = malloc(n - (size_t)k);
-        if (!f->up) return SEND_FATAL;
-        memcpy(f->up, d + k, n - (size_t)k);
-        f->up_n = n - (size_t)k;
+        if (up_append(f, d + k, n - (size_t)k) != 0) return SEND_FATAL;
     }
     act_add(h, f);          /* пока узел не подтвердил, ждём ACK: он освободит место и вернёт клиенту окно */
     return SEND_OK;

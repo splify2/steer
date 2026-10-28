@@ -81,8 +81,10 @@ cp idx.pub keys/index/ && cp proto.pub keys/protocols/ && cp plg.pub keys/plugin
 mk() {
     d="src/$1-$2"
     rm -rf "$d"; mkdir -p "$d/bin"
-    printf '{"schema":1,"id":"%s","version":"%s","name":"%s","compat":{"steer-api":"^1.0"},"arch":"all"%s}\n' \
-        "$1" "$2" "$1" "$3" > "$d/plugin.json"
+    # steer.links исполняет только steer-api 1.3 и новее — s2p требует ^1.3 у таких манифестов.
+    api='^1.0'; case "$3" in *'"links"'*) api='^1.3' ;; esac
+    printf '{"schema":1,"id":"%s","version":"%s","name":"%s","compat":{"steer-api":"%s"},"arch":"all"%s}\n' \
+        "$1" "$2" "$1" "$api" "$3" > "$d/plugin.json"
     printf '#!/bin/sh\necho %s %s\n' "$1" "$2" > "$d/bin/$1"
     chmod 755 "$d/bin/$1"
     if [ -n "${4:-}" ]; then
@@ -108,7 +110,8 @@ mk foo 1.0.0 ',"requires":{"plugins":{"net1":"^1.2"}},"steer":{"commands":[{"nam
 mk neu 1.0.0 ''
 mk neu 2.0.0 ''
 sed -i 's/"steer-api":"\^1.0"/"steer-api":"^9.0"/' src/neu-2.0.0/plugin.json
-mk bar 1.0.0 ',"steer":{"commands":[{"name":"bar-x","prog":"bin/bar"}]}'
+# Пустые requires и conflicts: s2p index их не пишет — сверка индекса с архивом считает их отсутствием.
+mk bar 1.0.0 ',"requires":{"plugins":{},"system":[]},"conflicts":[],"steer":{"commands":[{"name":"bar-x","prog":"bin/bar"}]}'
 mk big 1.0.0 ''
 head -c 300000 /dev/urandom > src/big-1.0.0/bin/blob
 mk evil 1.0.0 ''
@@ -368,7 +371,9 @@ mk lnbad 1.0.0 ',"steer":{"links":[{"path":"/usr/bin/lnbad","target":"bin/lnbad"
 mk lnocc 1.0.0 ',"steer":{"links":[{"path":"/usr/bin/occ","target":"bin/lnocc"}]},"permissions":["fs:/usr/bin/occ"]'
 mk lndup 1.0.0 ',"steer":{"links":[{"path":"/usr/bin/lnprog","target":"bin/lndup"}]},"permissions":["fs:/usr/bin/lnprog"]'
 mk lnsys 1.0.0 ',"requires":{"system":["standin-pkg"]},"permissions":["system-packages"]'
-for p in lnbad lnocc lndup lnsys; do build "src/$p-1.0.0" plg.sec; done
+for p in lnocc lndup lnsys; do build "src/$p-1.0.0" plg.sec; done
+# Ссылку без права fs: s2p новых версий отвергает сам — тогда отказ менеджера проверить нечем.
+LNBAD=0; "$S2P" build src/lnbad-1.0.0 --key plg.sec -o dist >/dev/null 2>&1 && LNBAD=1
 index
 P search --json >/dev/null 2>&1
 o="$(P install ln --json 2>err.txt)"; rc=$?
@@ -392,9 +397,11 @@ o="$(P update ln --json 2>/dev/null)"; rc=$?
 check "links: обновление с упавшим postinst — откат" "1 ln 1.1.0" "$rc $(sys/usr/bin/lnprog)"
 has "  откат — по postinst, а не по проверке манифеста" "возвращена прежняя версия" "$o"
 check "  путь новой версии снят при откате" "no" "$([ -e sys/usr/bin/lnextra ] || [ -L sys/usr/bin/lnextra ] && echo yes || echo no)"
-o="$(P install lnbad --json 2>/dev/null)"; rc=$?
-check "links: путь без права fs: — отказ" "1" "$rc"
-has "  причина" "ссылка /usr/bin/lnbad без права fs:" "$o"
+if [ "$LNBAD" = 1 ]; then
+    o="$(P install lnbad --json 2>/dev/null)"; rc=$?
+    check "links: путь без права fs: — отказ" "1" "$rc"
+    has "  причина" "ссылка /usr/bin/lnbad без права fs:" "$o"
+else echo "pluginmgrmatch: s2p сам отвергает ссылку без права fs: — отказ менеджера не проверен"; fi
 o="$(P install lndup --json 2>/dev/null)"; rc=$?
 check "links: путь чужого плагина — отказ" "1" "$rc"
 has "  называет плагин" "путь /usr/bin/lnprog уже занят плагином ln" "$o"
@@ -447,6 +454,7 @@ kill $LP 2>/dev/null; wait $LP 2>/dev/null
 o="$(P install bar --job --json)"
 J="$(printf '%s\n' "$o" | jq_ 'd["job"]')"
 check "install --job: номер задания сразу" "yes" "$([ -n "$J" ] && echo yes)"
+check "  pid задания записан до ответа (job сразу видит его живым)" "yes" "$([ -s "run/jobs/$J/pid" ] && echo yes)"
 i=0; st=running
 while [ "$st" = running ] && [ $i -lt 100 ]; do
     st="$(P job "$J" --json | jq_ 'd["state"]')"; sleep 0.1; i=$((i + 1))

@@ -44,6 +44,55 @@ struct ydoc *pm_manifest(const char *id) {
     return d;
 }
 
+static size_t mhash(const char *s) {
+    size_t h = 1469598103934665603ULL & (size_t)-1;
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * (size_t)1099511628211ULL;
+    return h;
+}
+
+static struct pm_mslot *mslot(struct pm_ctx *x, const char *id) {
+    for (size_t i = mhash(id) & (x->mcap - 1);; i = (i + 1) & (x->mcap - 1))
+        if (!x->mc[i].id || !strcmp(x->mc[i].id, id)) return &x->mc[i];
+}
+
+void pm_mcache_on(struct pm_ctx *x) { x->mcache = 1; }
+
+void pm_mcache_free(struct pm_ctx *x) {
+    for (size_t i = 0; i < x->mcap; i++) {
+        free(x->mc[i].id);
+        if (x->mc[i].d) ydoc_free(x->mc[i].d);
+    }
+    free(x->mc);
+    x->mc = NULL;
+    x->mcap = x->mn = 0;
+    x->mcache = 0;
+}
+
+const struct ynode *pm_manifest_ro(struct pm_ctx *x, const char *id, struct ydoc **own) {
+    *own = NULL;
+    if (!x->mcache) {
+        *own = pm_manifest(id);
+        return *own ? ydoc_root(*own) : NULL;
+    }
+    if (2 * (x->mn + 1) > x->mcap) {
+        struct pm_mslot *old = x->mc;
+        size_t ocap = x->mcap;
+        x->mcap = ocap ? 2 * ocap : 16;
+        x->mc = pm_alloc(sizeof(*x->mc) * x->mcap);
+        memset(x->mc, 0, sizeof(*x->mc) * x->mcap);
+        for (size_t i = 0; i < ocap; i++)
+            if (old[i].id) *mslot(x, old[i].id) = old[i];
+        free(old);
+    }
+    struct pm_mslot *s = mslot(x, id);
+    if (!s->id) {
+        s->id = pm_strdup(id);
+        s->d = pm_manifest(id);   /* и отсутствие запоминается */
+        x->mn++;
+    }
+    return s->d ? ydoc_root(s->d) : NULL;
+}
+
 void pm_result_free(struct pm_result *r) {
     for (size_t i = 0; i < r->n; i++) { free(r->v[i].id); free(r->v[i].version); free(r->v[i].from); free(r->v[i].old); }
     free(r->v);
@@ -278,7 +327,10 @@ static void outs_free(struct outs *o) {
 /* Ждать, пока выходы, бывшие up, снова up. 0 — дождались; -1 — причина в e. */
 static int wait_outs(struct pm_ctx *x, const struct outs *o, int timeout_s, struct pm_err *e) {
     if (!o->n || x->no_daemon) return 0;
-    long until = (long)time(NULL) + timeout_s;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    long long until_ms = (long long)t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + (long long)timeout_s * 1000;
+    long step_ms = 20;   /* выход помощника встаёт за десятки мс: шаг растёт вдвое до 500 мс, а не секунда сразу */
     for (;;) {
         struct ydoc *d = daemon_status(x);
         const char *down = NULL;
@@ -288,13 +340,20 @@ static int wait_outs(struct pm_ctx *x, const struct outs *o, int timeout_s, stru
                 if (!yn_bool(ynode_get(outs, o->v[i]), "up", 0)) down = o->v[i];
             if (!down) { ydoc_free(d); return 0; }
         }
-        if ((long)time(NULL) >= until) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long long now_ms = (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+        if (now_ms >= until_ms) {
             pm_errc(e, "plugin.output_not_up", PMA("name", down ? down : "?", "seconds", pm_itoa(timeout_s)), "выход %s не поднялся за %d с", down ? down : "?", timeout_s);
             if (d) ydoc_free(d);
             return -1;
         }
         if (d) ydoc_free(d);
-        sleep(1);
+        long left = (long)(until_ms - now_ms);
+        long nap = step_ms < left ? step_ms : left;
+        struct timespec ts = { nap / 1000, (nap % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        if (step_ms < 500) step_ms *= 2;
     }
 }
 

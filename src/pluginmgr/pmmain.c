@@ -177,8 +177,8 @@ static void emit_names(struct jw *w, const struct ynode *list) {
 }
 
 static void emit_entry(struct pm_ctx *x, struct jw *w, const struct pm_inst *p, const char *id, int deep) {
-    struct ydoc *md = pm_manifest(id);
-    const struct ynode *m = md ? ydoc_root(md) : NULL;
+    struct ydoc *md;
+    const struct ynode *m = pm_manifest_ro(x, id, &md);
     char *dir = pm_path(pm_root(), id);
     jw_obj(w);
     jw_kstr(w, "id", id);
@@ -231,9 +231,10 @@ static void emit_entry(struct pm_ctx *x, struct jw *w, const struct pm_inst *p, 
     jw_arr(w);
     for (size_t i = 0; i < x->st.n; i++) {
         if (!strcmp(x->st.v[i].id, id)) continue;
-        struct ydoc *om = pm_manifest(x->st.v[i].id);
-        if (om && ynode_get(ynode_get(ynode_get(ydoc_root(om), "requires"), "plugins"), id)) jw_str(w, x->st.v[i].id);
-        if (om) ydoc_free(om);
+        struct ydoc *own;
+        const struct ynode *om = pm_manifest_ro(x, x->st.v[i].id, &own);
+        if (om && ynode_get(ynode_get(ynode_get(om, "requires"), "plugins"), id)) jw_str(w, x->st.v[i].id);
+        if (own) ydoc_free(own);
     }
     jw_aend(w);
     jw_key(w, "bad_versions");
@@ -308,6 +309,8 @@ static char **all_ids(struct pm_ctx *x, size_t *n) {
 }
 
 static int cmd_list(struct pm_ctx *x, const char *only, int deep) {
+    /* Без записи: манифесты разбираются по разу (used_by и отбор обновления смотрят манифесты всех). */
+    pm_mcache_on(x);
     size_t n = 0;
     char **ids = all_ids(x, &n);
     if (only && !pm_state_find(&x->st, only)) {
@@ -1161,25 +1164,29 @@ static int job_fork(struct pm_ctx *x, int *rc) {
     pid_t pid = fork();
     if (pid < 0) { free(dir); *rc = failc(x, "plugin.job_start_failed", NULL, "не завести задание"); return 0; }
     if (pid > 0) {
+        /* pid ребёнка — до ответа: «steer plugin job» сразу после него видит живое задание, а не
+         * «оборвано» (ребёнок мог ещё не дойти до своей записи). */
+        char pb[32];
+        int pn = snprintf(pb, sizeof(pb), "%d\n", (int)pid);
+        char *pidf = pm_path(dir, "pid");
+        pm_write_atomic(pidf, pb, (size_t)pn, 0644);
+        free(pidf);
         printf(x->json ? "{\"ok\":true,\"job\":\"%s\"}\n" : "задание %s\n", id);
         free(dir);
         *rc = 0;
         return 0;
     }
     setsid();
-    char *out = pm_path(dir, "out"), *log = pm_path(dir, "log"), *pidf = pm_path(dir, "pid");
+    char *out = pm_path(dir, "out"), *log = pm_path(dir, "log");
     int fo = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     int fl = open(log, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fo >= 0) { dup2(fo, 1); close(fo); }
     if (fl >= 0) { dup2(fl, 2); close(fl); }
     int nul = open("/dev/null", O_RDONLY);
     if (nul >= 0) { dup2(nul, 0); close(nul); }
-    char pb[32];
-    int n = snprintf(pb, sizeof(pb), "%d\n", (int)getpid());
-    pm_write_atomic(pidf, pb, (size_t)n, 0644);
     g_job_log = log;
     x->json = 1;
-    free(out); free(pidf);
+    free(out);
     setenv("STEER_PLUGIN_JOB_DIR", dir, 1);
     free(dir);
     return 1;
@@ -1357,6 +1364,7 @@ out_nojob:
     pm_unlock();
 out:
     fflush(stdout);
+    pm_mcache_free(&x);
     pm_state_free(&x.st);
     pm_repos_free(&x.repos);
     free(x.tg.core); free(x.tg.api); free(x.tg.abi); free(x.tg.host); free(x.tg.splify2); free(x.tg.arch);
