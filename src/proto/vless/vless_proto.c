@@ -222,3 +222,23 @@ int vless_parse_response(const unsigned char *buf, size_t n, size_t *skip) {
     *skip = 2 + extra;
     return 0;
 }
+
+int vless_response_feed(struct vless_response_stream *s,
+                        const unsigned char *buf, size_t n, size_t *skip) {
+    if (!s || !skip || (!buf && n)) return VLESS_EPROTO;
+    *skip = 0;
+    if (s->done) return 0;
+    while (s->have < 2 && *skip < n) {
+        s->head[s->have++] = buf[(*skip)++];
+        if (s->head[0] != 0) return VLESS_EPROTO;
+        if (s->have == 2) s->extra_left = s->head[1];
+    }
+    if (s->have < 2) return VLESS_EAGAIN;
+    size_t take = n - *skip;
+    if (take > s->extra_left) take = s->extra_left;
+    s->extra_left -= (unsigned)take;
+    *skip += take;
+    if (s->extra_left) return VLESS_EAGAIN;
+    s->done = 1;
+    return 0;
+}

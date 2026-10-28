@@ -40,4 +40,14 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
 
 int vless_parse_response(const unsigned char *buf, size_t n, size_t *skip);
 
+/* Transport reads may split the response header and its addon bytes. */
+struct vless_response_stream {
+    unsigned char head[2];
+    unsigned have;
+    unsigned extra_left;
+    int done;
+};
+int vless_response_feed(struct vless_response_stream *state,
+                        const unsigned char *buf, size_t n, size_t *skip);
+
 #endif

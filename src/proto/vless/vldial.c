@@ -91,6 +91,7 @@ static void vl_clear(void *sess) {
     struct vl_sess *s = sess;
     s->header_sent = 0;
     s->established = 0;
+    memset(&s->response, 0, sizeof(s->response));
     s->t.link.fd = -1;
     memset(&s->vis, 0, sizeof(s->vis));
     s->dg_want = s->dg_have = 0;
@@ -145,6 +146,7 @@ static int vl_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
     struct vl_sess *s = sess;
     s->header_sent = 0;
     s->established = 0;
+    memset(&s->response, 0, sizeof(s->response));
     if (vless_uuid_parse(node->uuid, s->uuid) != 0) {
         node_id_refused(node, udp ? "соединение UDP" : "соединение TCP");
         return -1;
@@ -580,7 +582,9 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
 
     if (!s->established) {
         size_t skip = 0;
-        if (vless_parse_response(cur, left, &skip) != 0) {
+        int header = vless_response_feed(&s->response, cur, left, &skip);
+        if (header == VLESS_EAGAIN) return 0;
+        if (header != 0) {
             TR("ответ VLESS не разобран (%zu байт)\n", left);
             return -1;
         }
