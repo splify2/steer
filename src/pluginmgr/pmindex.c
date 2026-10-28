@@ -303,6 +303,9 @@ static int idx_from_seed(struct pm_repo *r, struct pm_err *e) {
 
 int pm_index_get(struct pm_repo *r, int refresh, struct pm_err *e) {
     if (r->iroot) return 0;
+    /* Кэш и семя без сети уже не дали индекса: перечитывать и проверять подпись заново на каждый
+     * плагин списка незачем — та же причина. Запрос с сетью пробует снова. */
+    if (!refresh && r->idx_miss) { *e = *r->idx_miss; return -1; }
     if (r->seed) return idx_from_seed(r, e);
     struct pm_err ce = {0};
     char *cd = cache_dir(r);
@@ -399,6 +402,10 @@ int pm_index_get(struct pm_repo *r, int refresh, struct pm_err *e) {
     if (r->idx_err) pm_errc(e, "plugin.index_failed", PMA("name", r->name, "why", r->idx_err), "%s", r->idx_err);
     else if (net_err) pm_errc(e, "plugin.index_download", PMA("name", r->name, "why", net_err), "индекс репозитория %s не скачался: %s", r->name, net_err);
     else pm_errc(e, "plugin.index_missing", PMA("name", r->name, "why", ce.msg[0] ? ce.msg : "кэш пуст"), "индекса репозитория %s нет: %s", r->name, ce.msg[0] ? ce.msg : "кэш пуст");
+    if (!refresh) {
+        if (!r->idx_miss) r->idx_miss = pm_alloc(sizeof(*r->idx_miss));
+        *r->idx_miss = *e;
+    }
     free(net_err); free(etag); free(etag_p); free(cd);
     return -1;
 done:

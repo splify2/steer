@@ -139,6 +139,8 @@ struct pm_inst {
 };
 struct pm_state {
     struct pm_inst *v; size_t n;
+    size_t cap;                  /* место в v: растёт вдвое */
+    size_t *hx, hcap;            /* хеш id -> индекс+1 в v (0 — пусто), hcap — степень двойки */
     char **system_ours; size_t nsys;
     char *auto_window;           /* «03:00-05:00» */
     char *last_check, *next_check;
@@ -168,6 +170,7 @@ struct pm_repo {
     const struct ynode *iroot;
     char *idx_err;
     int idx_fresh;               /* загружен из сети в этом запуске */
+    struct pm_err *idx_miss;     /* без сети индекс уже не нашёлся в этом запуске — причина */
 };
 struct pm_repos { struct pm_repo *v; size_t n; };
 int pm_repos_load(struct pm_repos *r, struct pm_err *e);
