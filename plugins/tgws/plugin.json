@@ -8,7 +8,7 @@
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/splify2/splify2-extended-plugins",
   "compat": {
-    "steer-api": "^1.4",
+    "steer-api": "^1.5",
     "splify2-api": "^1.0"
   },
   "arch": [

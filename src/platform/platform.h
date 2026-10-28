@@ -119,6 +119,8 @@ const char *steer_rt_tables_dir(void);
 void steer_set_rt_tables_dir(const char *dir);    /* NULL — вернуть путь платформы */
 /* "<etc_dir>/<name>" в buf; возвращает buf. */
 const char *plat_etc_path(char *buf, size_t n, const char *name);
+/* Настройка платформы: переменная окружения, иначе platform.env менеджера плагинов (steer.platform). */
+const char *plat_setting(const char *name);
 /* КАТАЛОГ ВЫБОРА ЧЕЛОВЕКА — то, что обязано пережить перезагрузку (выбор `select` группы
  * pick: manual). Каталог состояния на роутере — tmpfs (/var/lib/steer живёт в /var → /tmp), и
  * запись там переживает перезапуск службы, но не перезагрузку. Постоянный носитель — каталог,

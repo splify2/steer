@@ -481,7 +481,7 @@ static struct plugin_kind *kind_load(const struct plugin *pl, const struct ynode
         kind_free(k);
         return NULL;
     }
-    /* paths (steer-api 1.4): помощник отставляет пути событием health — status выхода несёт paths_down
+    /* paths (steer-api 1.5): помощник отставляет пути событием health — status выхода несёт paths_down
      * всегда (пустой — отставленных нет), а не только после первого события. */
     int pb = 0;
     if (ynode_get(kn, "paths") && ynode_bool(ynode_get(kn, "paths"), &pb) == 0) k->paths = pb;
@@ -551,7 +551,7 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
             goto bad;
         }
     }
-    /* steer.settings (steer-api 1.4): "restart" — настройки плагина (conf/<id>/settings.json) входят в
+    /* steer.settings (steer-api 1.5): "restart" — настройки плагина (conf/<id>/settings.json) входят в
      * подпись перезапуска всех его помощников и служб; хост, записав их, зовёт reload. */
     {
         const char *sv = m_str(st, "settings");
@@ -1800,7 +1800,7 @@ char *plugin_conf_json(const struct spec *sp, const struct output *o, const stru
     return b.p;
 }
 
-/* Настройки плагина в подписи перезапуска (steer.settings: "restart", steer-api 1.4): содержимое
+/* Настройки плагина в подписи перезапуска (steer.settings: "restart", steer-api 1.5): содержимое
  * <etc>/conf/<id>/settings.json; файла нет — свой знак, чтобы появление и удаление файла тоже меняли
  * подпись. Хост пишет файл атомарно (переименованием) и зовёт reload — помощник поднимается сразу,
  * без паузы перезапуска и без слежки за файлом в самом плагине. */
@@ -2466,8 +2466,8 @@ static void pn_kernel_sets(struct pn_emit *pe, const char *text) {
             struct nft_set *s = ir_set_add(pe->t, "wan_dev", "ifname");
             if (s) {
                 ir_gap(s);
-                /* Устройства маршрутов по умолчанию main, как они лежат сейчас. Сменился WAN — событие сети будит демон
-                 * (hotplug 95-steer, сторож), reload печатает набор заново, и текст правил меняется. */
+                /* Устройства маршрутов по умолчанию main, как они лежат сейчас. Дальше набор ведёт демон: сменился
+                 * маршрут по умолчанию — он переписывает элементы по событию rtnetlink (src/daemon/wandev.c). */
                 struct wan_ctx wc = { .s = s };
                 rtnl_default_devs(wan_dev_add, &wc);
                 vec_free(wc.seen, wc.n);

@@ -75,12 +75,6 @@ LIBSTEER_1 {
     group_set_name_mixed;
     group_tolerance_ms;
     group_why_name;
-    h2_end_stream;
-    h2_next;
-    h2_read;
-    h2_start_ex;
-    h2_strerror;
-    h2_write;
     http_get;
     http_resp_free;
     iface_obfs;
@@ -152,6 +146,7 @@ LIBSTEER_1 {
     plat;
     plat_names;
     plat_select;
+    plat_setting;
     plat_spec_default;
     plat_spec_resolve;
     plugin_at;
@@ -187,6 +182,7 @@ LIBSTEER_1 {
     registry_assign;
     rtnl_addrs6;
     rtnl_default6;
+    rtnl_default_devs;
     rtnl_main6_routes;
     rtnl_route6_backstop;
     rtnl_route_default_dev;
@@ -202,7 +198,6 @@ LIBSTEER_1 {
     sc_hash_free;
     sc_hash_init;
     sc_hash_update;
-    sc_x25519_base;
     set_name_famtag;
     sigv_keynum_hex;
     sigv_parse_key;

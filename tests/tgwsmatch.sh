@@ -16,7 +16,7 @@
 #
 #   5. hello с API и id, хук check, разбор аргументов tgws-probe;
 #   6. мост по {conf}: слушает порт из output.ports, говорит up, читает настройки плагина (settings.json:
-#      пул, пути, адреса ДЦ, WARP) один раз; перезапуск по новым настройкам — подписью ядра (steer-api 1.4).
+#      пул, пути, адреса ДЦ, WARP) один раз; перезапуск по новым настройкам — подписью ядра (steer-api 1.5).
 #
 #   7. переход со stgws: scripts/postinst переносит пул, адреса ДЦ, WARP и домен по умолчанию микропакета в
 #      настройки плагина и выводит его службу из работы.
@@ -197,7 +197,7 @@ s=socket.socket()
 try: s.connect(('127.0.0.1',$mp)); print(1)
 except Exception: print(0)" 2>/dev/null)"
     # Настройки переписаны (так их пишет панель — plugin_settings_set): мост сам за файлом не следит и не
-    # выходит — перезапуск по подписи ведёт ядро (steer.settings: "restart", steer-api 1.4; pluginmodel).
+    # выходит — перезапуск по подписи ведёт ядро (steer.settings: "restart", steer-api 1.5; pluginmodel).
     printf '{"domains":["z.example"]}\n' > "$tmp/pconf/settings.json.new" && mv "$tmp/pconf/settings.json.new" "$tmp/pconf/settings.json"
     sleep 2.5
     check "настройки переписаны — мост не выходит сам (перезапуск — по подписи ядра)" "yes" "$(kill -0 "$bp" 2>/dev/null && echo yes || echo no)"

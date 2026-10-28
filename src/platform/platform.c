@@ -57,6 +57,42 @@ static const struct platform_ops *plat_choose(void) {
     return &plat_openwrt;
 }
 
+/* НАСТРОЙКИ ПЛАТФОРМЫ ОТ ПЛАГИНОВ (steer-api 1.4, `steer.platform` манифеста). Поле метки, приоритет
+ * правил, возврат решения и каналы на сам роутер нужны тому, кто знает соседей: box-connector (sing-box
+ * для podkop и forkop) работает внутри единственного steerd, а не своим экземпляром. Менеджер плагинов
+ * пишет то, что просят включённые плагины, в <каталог менеджера>/platform.env строками `ИМЯ=значение`;
+ * его читает каждый процесс ядра — steerd, apply, status, — поэтому все видят одно поле метки.
+ * Переменная окружения сильнее файла: стенды и ручной запуск задают своё. */
+const char *plat_setting(const char *name) {
+    const char *e = getenv(name);
+    if (e) return e;
+    static char *text;
+    static int loaded;
+    if (!loaded) {
+        loaded = 1;
+        const char *dir = getenv("STEER_PLUGIN_ETC");
+        char path[512];
+        snprintf(path, sizeof path, "%s/platform.env", dir && *dir ? dir : "/etc/steer/plugins");
+        FILE *f = fopen(path, "re");
+        if (f) {
+            size_t cap = 0;
+            ssize_t got = getdelim(&text, &cap, 0, f);
+            if (got <= 0) { free(text); text = NULL; }
+            fclose(f);
+        }
+    }
+    size_t nl = strlen(name);
+    for (char *l = text; l && *l;) {
+        char *end = strchr(l, '\n');
+        if (!strncmp(l, name, nl) && l[nl] == '=') {
+            if (end) *end = 0;              /* строка нужна только целиком; буфер свой */
+            return l + nl + 1;
+        }
+        l = end ? end + 1 : NULL;
+    }
+    return NULL;
+}
+
 /* ПОЛЕ МЕТКИ ИЗ ОКРУЖЕНИЯ: STEER_MARK_FIELD=<маска> (например 0x000000ff). Нужно экземпляру
  * движка, которого запускает steer-box-connector (sing-box для podkop и forkop): их правила nft
  * ставят метки в битах нашего поля по умолчанию — podkop 0x00100000 и 0x00200000, forkop
@@ -67,7 +103,7 @@ static const struct platform_ops *plat_choose(void) {
  * Маска — биты подряд, не больше шестнадцати; другое — предупреждение и поле платформы. Таблица
  * платформы — константа, поэтому поправка кладётся в копию, одну на процесс. */
 static int mark_field_env(uint32_t *base, unsigned *bits) {
-    const char *e = getenv("STEER_MARK_FIELD");
+    const char *e = plat_setting("STEER_MARK_FIELD");
     if (!e || !*e) return 0;
     char *end;
     unsigned long m = strtoul(e, &end, 0);
@@ -91,7 +127,7 @@ bad:
  * же экземпляру steer-box-connector нужен порядок наверняка: правила steer, за ними его правило
  * «метка tproxy podkop/forkop — в main», за ними их правило 105 в `local default dev lo`. */
 static int rule_pref_env(unsigned *pref) {
-    const char *e = getenv("STEER_RULE_PREF");
+    const char *e = plat_setting("STEER_RULE_PREF");
     if (!e || !*e) return 0;
     char *end;
     unsigned long v = strtoul(e, &end, 10);
@@ -114,7 +150,7 @@ static int rule_pref_env(unsigned *pref) {
  *   - свой DNS роутера в резолвер не заворачивается (local_dns = 0, см. platform.h).
  * У платформы телефона переменная ничего не меняет. */
 static int router_self_env(void) {
-    const char *e = getenv("STEER_ROUTER_SELF");
+    const char *e = plat_setting("STEER_ROUTER_SELF");
     return e && !strcmp(e, "1");
 }
 

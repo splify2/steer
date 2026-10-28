@@ -6,7 +6,7 @@
  *   - запись вида: имя, свойства caps, помощник из манифеста; kind_ops.helper плагина отдаёт
  *     программу плагина (полный путь), argv с раскрытыми {out} и {conf}, id плагина и путь {conf};
  *   - подпись помощника — от версии плагина и содержимого {conf}: те же ключи — та же подпись, другие
- *     ключи — другая; при steer.settings: "restart" — и от settings.json плагина (steer-api 1.4);
+ *     ключи — другая; при steer.settings: "restart" — и от settings.json плагина (steer-api 1.5);
  *   - {conf}: api, плагин, ключи по схеме, устройство, метка, таблица, подложка; пишется атомарно с
  *     правами 0600;
  *   - реестр видит свежий манифест после plugin_refresh (менеджер подменил каталог плагина).
@@ -79,23 +79,23 @@ int main(void) {
 
     /* ---- совместимость ---- */
     compat_plugin("c-caret", "^1.0");
-    compat_plugin("c-tilde", "~1.4");
+    compat_plugin("c-tilde", "~1.5");
     compat_plugin("c-ge", ">=1.0 <2");
     compat_plugin("c-or", "^2.0 || ^1.0");
-    compat_plugin("c-exact", "1.4");
-    compat_plugin("c-newer", "^1.5");
+    compat_plugin("c-exact", "1.5");
+    compat_plugin("c-newer", "^1.6");
     compat_plugin("c-major", "^2.0");
     compat_plugin("c-lt", "<1.0");
     compat_plugin("c-zero", "^0.9");
     compat_plugin("c-junk", "abc");
     plugin_reload(NULL);
-    check("^1.0 — совместим с steer-api 1.4", 1, plugin_find("c-caret")->enabled);
-    check("~1.1 — совместим", 1, plugin_find("c-tilde")->enabled);
+    check("^1.0 — совместим с steer-api 1.5", 1, plugin_find("c-caret")->enabled);
+    check("~1.5 — совместим", 1, plugin_find("c-tilde")->enabled);
     check(">=1.0 <2 — совместим", 1, plugin_find("c-ge")->enabled);
     check("^2.0 || ^1.0 — совместим", 1, plugin_find("c-or")->enabled);
-    check("1.4 — совместим", 1, plugin_find("c-exact")->enabled);
-    check("^1.5 — не совместим (ядро 1.4)", 0, plugin_find("c-newer")->enabled);
-    check_str("  причина называет числа", "c-newer 1.0.0 требует steer-api ^1.5, у ядра 1.4", why_of("c-newer"));
+    check("1.5 — совместим", 1, plugin_find("c-exact")->enabled);
+    check("^1.6 — не совместим (ядро 1.5)", 0, plugin_find("c-newer")->enabled);
+    check_str("  причина называет числа", "c-newer 1.0.0 требует steer-api ^1.6, у ядра 1.5", why_of("c-newer"));
     check("^2.0 — не совместим", 0, plugin_find("c-major")->enabled);
     check("<1.0 — не совместим", 0, plugin_find("c-lt")->enabled);
     check("^0.9 — не совместим", 0, plugin_find("c-zero")->enabled);
@@ -124,7 +124,7 @@ int main(void) {
 
     /* ---- вид с помощником ---- */
     put("hp/plugin.json",
-        "{\"schema\":1,\"id\":\"hp\",\"version\":\"3.1.4\",\"compat\":{\"steer-api\":\"^1.4\"},"
+        "{\"schema\":1,\"id\":\"hp\",\"version\":\"3.1.4\",\"compat\":{\"steer-api\":\"^1.5\"},"
         "\"steer\":{\"settings\":\"restart\",\"kinds\":[{\"name\":\"hpkind\",\"keys\":\"kinds/hp.schema.json\",\"paths\":true,"
         "\"caps\":[\"device\",\"mark\",\"ctmark\",\"over\"],"
         "\"helper\":{\"prog\":\"bin/h\",\"cmd\":\"hphelper\",\"argv\":[\"run\",\"{out}\",\"--conf\",\"{conf}\",\"--x\",\"{{lit}}\"],"

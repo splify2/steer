@@ -56,4 +56,9 @@ int nfv_ranges6_read(uint8_t family, const char *table, const char *set, struct 
 int nfv_ranges6_write(uint8_t family, const char *table, const char *set,
                       const struct nfv_range6 *want, size_t n);
 
+/* Набор имён устройств (type ifname, ключ — IFNAMSIZ байт с нулями) целиком становится names[0..n):
+ * сброс и новые элементы одной транзакцией, как у nfv_ranges6_write. Набора нет — -1 и ENOENT.
+ * 0 или -1 с errno. */
+int nfv_ifnames_write(uint8_t family, const char *table, const char *set, const char *const *names, size_t n);
+
 #endif

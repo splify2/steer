@@ -564,7 +564,7 @@ static const struct plugin_embed_file f_tgws[] = {
     "  \"license\": \"GPL-3.0-only\",\n"
     "  \"homepage\": \"https://github.com/splify2/splify2-extended-plugins\",\n"
     "  \"compat\": {\n"
-    "    \"steer-api\": \"^1.4\",\n"
+    "    \"steer-api\": \"^1.5\",\n"
     "    \"splify2-api\": \"^1.0\"\n"
     "  },\n"
     "  \"arch\": [\n"

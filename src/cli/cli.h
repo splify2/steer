@@ -109,7 +109,7 @@ void cli_usage_short(FILE *out);
 void cli_version(FILE *out);
 /* Версии осей совместимости плагинов, которые даёт это ядро (manifest.md, «compat»). steer-api — одно
  * число на всё ядро: реестр плагинов (STEER_API_VERSION, kinds/plugin.h), менеджер и version --json. */
-#define CLI_STEER_API "1.4"
+#define CLI_STEER_API "1.5"
 #define CLI_STEER_ABI "1.0"
 void cli_version_json(FILE *out);
 const char *cli_core_version(void);

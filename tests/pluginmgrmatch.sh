@@ -82,7 +82,7 @@ mk() {
     d="src/$1-$2"
     rm -rf "$d"; mkdir -p "$d/bin"
     # steer.links исполняет только steer-api 1.3 и новее — s2p требует ^1.3 у таких манифестов.
-    api='^1.0'; case "$3" in *'"links"'*) api='^1.3' ;; esac
+    api='^1.0'; case "$3" in *'"platform"'*) api='^1.4' ;; *'"links"'*) api='^1.3' ;; esac
     printf '{"schema":1,"id":"%s","version":"%s","name":"%s","compat":{"steer-api":"%s"},"arch":"all"%s}\n' \
         "$1" "$2" "$1" "$api" "$3" > "$d/plugin.json"
     printf '#!/bin/sh\necho %s %s\n' "$1" "$2" > "$d/bin/$1"
@@ -157,7 +157,7 @@ export STEER_PLUGIN_AUTO=0
 P() { "$BIN" plugin "$@"; }
 
 # ---- версия ядра для оси compat ----
-check "steer version --json: core, api, abi" "2.1.0 1.4 1.0" \
+check "steer version --json: core, api, abi" "2.1.0 1.5 1.0" \
     "$("$BIN" version --json | jq_ 'd["core"]+" "+d["api"]+" "+d["abi"]')"
 
 # ---- каталог ----
@@ -194,7 +194,7 @@ o="$(P install neu --json 2>/dev/null)"
 check "install neu: взята совместимая 1.0.0 (2.0.0 требует steer-api ^9)" "1.0.0" "$(printf '%s\n' "$o" | jq_ 'd["version"]')"
 o="$(P install neu 2.0.0 --json 2>/dev/null)"; rc=$?
 check "install neu 2.0.0: отказ" "1" "$rc"
-has "  причина с числами" "требует steer-api ^9.0, у ядра 1.4" "$o"
+has "  причина с числами" "требует steer-api ^9.0, у ядра 1.5" "$o"
 
 # ---- место ----
 o="$(STEER_PLUGIN_FREE=1000 P install big --json 2>/dev/null)"; rc=$?
@@ -436,6 +436,35 @@ o="$(STEER_PLUGIN_PKG="$T/pkgo.sh" P ensure lnsys --pkg standin-pkg --json 2>/de
 check "  --pkg standin-pkg: пакет этой транзакции считается стоящим" "0" "$rc"
 P remove lnsys --json >/dev/null 2>&1
 unset STEER_PLUGIN_SYSROOT
+
+# ---- steer.platform (steer-api 1.4): настройки платформы от включённых плагинов ----
+python3 - meta.json <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for i in ("pf", "pf2"): d["plugins"][i] = {"key_role": "plugins"}
+json.dump(d, open(sys.argv[1], "w"))
+PY
+mk pf 1.0.0 ',"steer":{"platform":{"mark_field":"0x000000ff","rule_pref":100,"mark_restore":true,"router_self":true}}'
+mk pf2 1.0.0 ',"steer":{"platform":{"mark_field":"0x0000ff00","router_self":false}}'
+for p in pf pf2; do build "src/$p-1.0.0" plg.sec; done
+index
+P search --json >/dev/null 2>&1
+printf '#!/bin/sh\necho "$1" >> "%s/initd.log"\n' "$T" > initd.sh; chmod 755 initd.sh
+export STEER_PLUGIN_INITD="$T/initd.sh"
+o="$(P install pf --json 2>/dev/null)"; rc=$?
+check "platform: install pf" "0" "$rc"
+check "  platform.env — что просит плагин" "STEER_MARK_FIELD=0x000000ff STEER_RULE_PREF=100 STEER_MARK_RESTORE=1 STEER_ROUTER_SELF=1" \
+    "$(tr '\n' ' ' < etc/platform.env | sed 's/ $//')"
+o="$(P install pf2 --json 2>&1)"; rc=$?
+check "platform: второй плагин с другим полем ставится" "0" "$rc"
+has "  предупреждение называет обоих" "steer.platform.mark_field: плагин pf2 просит 0x0000ff00, действует 0x000000ff от pf" "$o"
+check "  действует стоявший раньше" "STEER_MARK_FIELD=0x000000ff" "$(grep MARK_FIELD etc/platform.env)"
+P disable pf --json >/dev/null 2>&1
+check "platform: выключенный плагин не просит — действует второй" "STEER_MARK_FIELD=0x0000ff00" "$(cat etc/platform.env)"
+P remove pf2 --json >/dev/null 2>&1
+check "  ни один не просит — файла нет" "no" "$([ -e etc/platform.env ] && echo yes || echo no)"
+P remove pf --json >/dev/null 2>&1
+unset STEER_PLUGIN_INITD
 
 # ---- busy ----
 python3 - "$T/root/.lock" > lock.ready <<'PY' &

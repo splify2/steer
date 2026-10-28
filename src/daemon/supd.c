@@ -1616,7 +1616,7 @@ static void health_json(FILE *out, const struct helper_state *st, long now) {
 
 /* Объект выхода в status: пути, отставленные его помощником, чей срок не вышел (пустой массив —
  * отставленных нет). Только у выхода, чей помощник — ребёнок этого демона: всегда — у вида, который
- * объявил paths в манифесте (мост tgws, steer-api 1.4), у другого помощника — если он о путях сообщал. */
+ * объявил paths в манифесте (мост tgws, steer-api 1.5), у другого помощника — если он о путях сообщал. */
 static void status_fields(FILE *out, const char *name) {
     const struct supd *s = g_probe_sup;
     if (!s || !name) return;

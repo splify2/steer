@@ -7,7 +7,7 @@
  * доменов, пути ДЦ, адреса ДЦ, туннели WARP — лежат в своём каталоге настроек ({conf}: paths.conf,
  * у подкоманды — STEER_PLUGIN_CONF), файл settings.json по схеме plugins/tgws/settings.schema.json;
  * пишет его панель (splify2-api, plugin_settings_set). Мост читает его один раз при старте: файл входит в подпись
- * перезапуска помощника (манифест: steer.settings = "restart", steer-api 1.4), и хост, записав его, зовёт
+ * перезапуска помощника (манифест: steer.settings = "restart", steer-api 1.5), и хост, записав его, зовёт
  * reload — ядро поднимает мост заново сразу, без паузы перезапуска. */
 #define _GNU_SOURCE
 #include <errno.h>

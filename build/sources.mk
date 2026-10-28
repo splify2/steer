@@ -160,7 +160,7 @@ DAEMON_SRC := src/compile/groups.c src/compile/generate.c src/compile/balance.c 
               src/daemon/explain.c src/daemon/helpers.c src/daemon/supervise.c src/daemon/supd.c src/daemon/watch.c src/daemon/main.c \
               $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c \
               src/tools/srsread.c src/daemon/ctl.c \
-              src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c \
+              src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c src/daemon/wandev.c \
               src/daemon/foprobe.c src/daemon/gaiw.c src/daemon/urltest.c src/daemon/fogroup.c src/lib/nftvmap.c \
               src/daemon/folat.c src/daemon/plugso.c $(MODCMD_SRC)
 LIBSTEER_BASE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c $(MODEL_SRC) \
@@ -357,8 +357,8 @@ PROFILE_steerd     := $(STEERD_DYN_SRC)
 # Решения владельца (plugin-sdk/docs/steer-abi.md, «Сервисы протоколам»; open.md, О-1): протоколы —
 # плагины, обновляются отдельно от ядра; общий для них сетевой стек — один плагин-библиотека `net1`
 # с одной libs2p-net.so.1, а не копия в каждом. Ядро держит свою копию TLS/QUIC и wolfSSL: резолвер
-# (DoH, DoH3, DoQ), замер групп (urltls.c), менеджер плагинов (httpc.c, wbhttps.c, подпись, untar) и
-# коннектор (exports-ext.lst) работают и без единого плагина, а обновление net1 в фоне не должно
+# (DoH, DoH3, DoQ), замер групп (urltls.c) и менеджер плагинов (httpc.c, wbhttps.c, подпись, untar)
+# работают и без единого плагина, а обновление net1 в фоне не должно
 # ронять DNS роутера.
 #
 #   libsteer.so.<версия>  PROFILE_libsteer: модель, виды, разбор команд, линия событий, TLS 1.3,
@@ -426,8 +426,7 @@ PLUGINS_EXTENDED := tgws
 # `box-connector` (plugin-sdk/docs/migration-2.1.md, раздел 6): программа статическая, как tgws, со своей
 # копией TLS 1.3, REALITY, HTTP/2, корней, разбора .srs и wolfSSL, — плагину нельзя быть связанным с
 # libsteer.so.<версия>: тег «=версия ядра» снят (решение В10). EXT_TLS_SRC — то из дерева steer, что
-# вкомпилировано в такую программу (ext-build.sh --static); прежний экспорт для внешнего модуля на
-# libsteer — build/exports-ext.lst.
+# вкомпилировано в такую программу (ext-build.sh --static); отдельного экспорта libsteer для него нет.
 EXT_TLS_SRC := src/proto/tls/chello.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
                src/proto/tls/h2.c src/proto/tls/ech.c src/proto/tls/roots.c src/model/srs.c src/lib/gz.c src/lib/puff.c \
                $(CRYPTO_SRC) $(NET1_BASE_SRC)
