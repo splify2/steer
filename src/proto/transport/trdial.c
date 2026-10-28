@@ -106,6 +106,21 @@ static void sock_ready(int fd, int timeout_s) {
  * Своя копия того, что в obfs.c делает obfs_mark_sock, а не вызов: этот файл собирают стенды
  * без obfs.c (xhupmatch), а кода здесь три строки. required — задан via: тогда отказ SO_MARK —
  * отказ соединения, иначе оно молча ушло бы мимо выхода-цели напрямую. */
+static transport_socket_prepare_fn g_socket_prepare;
+static void *g_socket_prepare_ctx;
+
+void transport_set_socket_prepare(transport_socket_prepare_fn fn, void *ctx) {
+    g_socket_prepare = fn;
+    g_socket_prepare_ctx = ctx;
+}
+
+static int socket_prepare(int fd) {
+    if (!g_socket_prepare || g_socket_prepare(g_socket_prepare_ctx, fd) == 0) return 0;
+    close(fd);
+    errno = EACCES;
+    return -1;
+}
+
 static uint32_t g_sock_mark;
 static int g_sock_mark_req;
 
@@ -119,6 +134,7 @@ void transport_set_sock_mark(uint32_t mark, int required) {
 static int attempt_start(struct in_addr ip, uint16_t port, int *done) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
+    if (socket_prepare(fd) != 0) return -1;
     /* До connect(): маршрут, а с ним устройство и адрес источника, ядро выбирает там — по
      * метке, то есть по таблице выхода-цели. */
     if (steer_sock_mark(fd, g_sock_mark) != 0 && g_sock_mark_req) {
@@ -280,6 +296,7 @@ int tr_dial_udp(const char *host, uint16_t port) {
     freeaddrinfo(res);
     int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return TR_ESOCK;
+    if (socket_prepare(fd) != 0) return TR_ESOCK;
     if (steer_sock_mark(fd, g_sock_mark) != 0 && g_sock_mark_req) {
         close(fd);
         return TR_ESOCK;

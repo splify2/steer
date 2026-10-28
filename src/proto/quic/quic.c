@@ -39,6 +39,14 @@
 #include "qcssl.h"
 #include "sockmark.h"
 
+static qc_socket_prepare_fn g_socket_prepare;
+static void *g_socket_prepare_ctx;
+
+void qc_set_socket_prepare(qc_socket_prepare_fn prepare, void *ctx) {
+    g_socket_prepare = prepare;
+    g_socket_prepare_ctx = ctx;
+}
+
 #define QC_TXBUF        (64 * 1024)     /* пачка — до send_quantum, а он не больше 64 КиБ */
 /* Очередь исходящих датаграмм — 64: это защита от накопления, а не размер нагрузки. Датаграммы
  * ненадёжны по природе, и при полной очереди qc_datagram_send отвечает QC_EAGAIN (вызывающий
@@ -1039,6 +1047,7 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
     if (addr_parse(cfg->host, cfg->port, &q->remote, &q->remote_len) != 0) { rc = QC_EINVAL; goto fail; }
     q->fd = socket(q->remote.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (q->fd < 0) goto fail;
+    if (g_socket_prepare && g_socket_prepare(g_socket_prepare_ctx, q->fd) != 0) goto fail;
     sock_tune(q->fd);
     if (steer_sock_mark(q->fd, cfg->sock_mark) != 0 && cfg->mark_required) {
         rc = QC_ESOCK;

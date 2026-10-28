@@ -458,6 +458,12 @@ size_t tr_ws_frame(unsigned char *out, size_t cap, int opcode, int fin, const un
 int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
                 unsigned char *out, size_t cap, size_t *out_n);
 
+/* Optional host hook invoked before an outbound socket is connected. Install
+ * it before starting workers and keep the context alive until they stop.
+ * Returning nonzero rejects and closes the socket. */
+typedef int (*transport_socket_prepare_fn)(void *ctx, int fd);
+void transport_set_socket_prepare(transport_socket_prepare_fn fn, void *ctx);
+
 /* TCP до узла по всем адресам имени (trdial.c). Дескриптор либо отрицательный код TR_*. */
 int tr_dial(const char *host, uint16_t port, int timeout_s);
 /* Соединённый неблокирующий сокет UDP к узлу с той же меткой, что у TCP (trdial.c): датаграммы

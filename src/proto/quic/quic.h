@@ -36,6 +36,8 @@
  * GSO: на роутере узкое место — не вызовы, а шифр. */
 #ifndef STEER_QUIC_H
 #define STEER_QUIC_H
+typedef int (*qc_socket_prepare_fn)(void *ctx, int fd);
+void qc_set_socket_prepare(qc_socket_prepare_fn prepare, void *ctx);
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
