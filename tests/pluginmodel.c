@@ -89,13 +89,13 @@ int main(void) {
     compat_plugin("c-zero", "^0.9");
     compat_plugin("c-junk", "abc");
     plugin_reload(NULL);
-    check("^1.0 — совместим с steer-api 1.3", 1, plugin_find("c-caret")->enabled);
+    check("^1.0 — совместим с steer-api 1.4", 1, plugin_find("c-caret")->enabled);
     check("~1.1 — совместим", 1, plugin_find("c-tilde")->enabled);
     check(">=1.0 <2 — совместим", 1, plugin_find("c-ge")->enabled);
     check("^2.0 || ^1.0 — совместим", 1, plugin_find("c-or")->enabled);
     check("1.3 — совместим", 1, plugin_find("c-exact")->enabled);
-    check("^1.4 — не совместим (ядро 1.3)", 0, plugin_find("c-newer")->enabled);
-    check_str("  причина называет числа", "c-newer 1.0.0 требует steer-api ^1.4, у ядра 1.3", why_of("c-newer"));
+    check("^1.5 — не совместим (ядро 1.4)", 0, plugin_find("c-newer")->enabled);
+    check_str("  причина называет числа", "c-newer 1.0.0 требует steer-api ^1.5, у ядра 1.4", why_of("c-newer"));
     check("^2.0 — не совместим", 0, plugin_find("c-major")->enabled);
     check("<1.0 — не совместим", 0, plugin_find("c-lt")->enabled);
     check("^0.9 — не совместим", 0, plugin_find("c-zero")->enabled);

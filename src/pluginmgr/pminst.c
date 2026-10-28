@@ -984,6 +984,8 @@ static int system_deps(struct pm_ctx *x, const char *id, const struct ynode *man
 
 /* ---- keep.d ---- */
 
+static int platform_write(struct pm_ctx *x);
+
 int pm_keepd_write(struct pm_ctx *x) {
     char *buf = NULL;
     size_t n = 0;
@@ -1006,6 +1008,81 @@ int pm_keepd_write(struct pm_ctx *x) {
     }
     fclose(f);
     int r = pm_write_atomic(pm_keepd(), buf, n, 0644);
+    free(buf);
+    if (platform_write(x) != 0) r = -1;
+    return r;
+}
+
+/* ---- steer.platform (steer-api 1.4; manifest.md, «steer.platform») ----
+ *
+ * Настройки платформы, которые просит включённый плагин: поле метки, приоритет правил выходов, возврат
+ * решения после чужой перезаписи метки, каналы на сам роутер. Их ждёт box-connector — sing-box для podkop и
+ * forkop внутри единственного steerd: метки соседей лежат в битах поля steer по умолчанию. Файл
+ * <каталог менеджера>/platform.env читает каждый процесс ядра (plat_setting, platform.c); поле метки
+ * процесс берёт при старте, поэтому смена файла перезапускает службу ядра. Два плагина с разными
+ * значениями одной настройки — действует стоявший раньше, второму — предупреждение с обоими. */
+
+static const struct { const char *key, *env; int kind; } PLAT_KEYS[] = {
+    { "mark_field",   "STEER_MARK_FIELD",   0 },     /* строка — маска поля */
+    { "rule_pref",    "STEER_RULE_PREF",    1 },     /* число */
+    { "mark_restore", "STEER_MARK_RESTORE", 2 },     /* да/нет */
+    { "router_self",  "STEER_ROUTER_SELF",  2 },
+};
+#define PLAT_KEYS_N (sizeof PLAT_KEYS / sizeof PLAT_KEYS[0])
+
+static int platform_write(struct pm_ctx *x) {
+    char *val[PLAT_KEYS_N] = {0};
+    const char *who[PLAT_KEYS_N] = {0};
+    for (size_t i = 0; i < x->st.n; i++) {
+        if (!x->st.v[i].state || strcmp(x->st.v[i].state, "enabled")) continue;
+        struct ydoc *m = pm_manifest(x->st.v[i].id);
+        if (!m) continue;
+        const struct ynode *pl = ynode_get(ynode_get(ydoc_root(m), "steer"), "platform");
+        for (size_t k = 0; pl && k < PLAT_KEYS_N; k++) {
+            const struct ynode *n = ynode_get(pl, PLAT_KEYS[k].key);
+            if (!n || ynode_is_null(n)) continue;
+            char *v = NULL;
+            long l;
+            int b;
+            if (PLAT_KEYS[k].kind == 0 && yn_is_str(n)) v = pm_strdup(n->str);
+            else if (PLAT_KEYS[k].kind == 1 && ynode_long(n, &l) == 0) v = pm_fmt("%ld", l);
+            else if (PLAT_KEYS[k].kind == 2 && ynode_bool(n, &b) == 0) v = b ? pm_strdup("1") : NULL;
+            if (!v) continue;
+            if (!val[k]) { val[k] = v; who[k] = x->st.v[i].id; continue; }
+            if (strcmp(val[k], v))
+                pm_progress(x, "steer.platform.%s: плагин %s просит %s, действует %s от %s", PLAT_KEYS[k].key,
+                            x->st.v[i].id, v, val[k], who[k]);
+            free(v);
+        }
+        ydoc_free(m);
+    }
+    char *buf = NULL;
+    size_t n = 0;
+    FILE *f = open_memstream(&buf, &n);
+    if (!f) { for (size_t k = 0; k < PLAT_KEYS_N; k++) free(val[k]); return -1; }
+    for (size_t k = 0; k < PLAT_KEYS_N; k++)
+        if (val[k]) { fprintf(f, "%s=%s\n", PLAT_KEYS[k].env, val[k]); free(val[k]); }
+    fclose(f);
+    char *path = pm_fmt("%s/platform.env", pm_etc());
+    size_t on = 0;
+    char *old = pm_read(path, &on);
+    int same = old ? on == n && !memcmp(old, buf, n) : n == 0;
+    free(old);
+    int r = 0;
+    if (!same) {
+        r = n ? pm_write_atomic(path, buf, n, 0644) : (unlink(path) && errno != ENOENT ? -1 : 0);
+        /* Поле метки и приоритет процесс ядра берёт при старте: служба ядра поднимается заново. */
+        const char *initd = getenv("STEER_PLUGIN_INITD");
+        if (!initd) initd = "/etc/init.d/steer";
+        if (r == 0 && !x->no_daemon && *initd && access(initd, X_OK) == 0) {
+            char *argv[] = { (char *)initd, "restart", NULL };
+            char *out = NULL;
+            pm_progress(x, "настройки платформы от плагинов сменились — служба ядра поднимается заново");
+            if (run_prog(argv, NULL, NULL, &out, 120) != 0) pm_progress(x, "%s restart не удался", initd);
+            free(out);
+        }
+    }
+    free(path);
     free(buf);
     return r;
 }
@@ -1886,6 +1963,7 @@ int pm_set_enabled(struct pm_ctx *x, const char *id, int on, struct pm_err *e) {
     pm_inst_set(&inst->why, NULL);
     struct pm_err se = {0};
     if (pm_state_save(&x->st, &se) != 0) { *e = se; return -1; }
+    platform_write(x);
     struct pm_err re = {0};
     if (pm_daemon_reload(x, &re) != 0) {
         if (on && spec_ok) {

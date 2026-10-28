@@ -1172,7 +1172,7 @@ static void build_failopen(struct nft_table *t, const struct spec *sp) {
     ir_comment(r, "steer-failopen");
 }
 
-/* ВОЗВРАТ РЕШЕНИЯ ПОСЛЕ ЧУЖОЙ ПЕРЕЗАПИСИ (STEER_MARK_RESTORE=1 в окружении apply).
+/* ВОЗВРАТ РЕШЕНИЯ ПОСЛЕ ЧУЖОЙ ПЕРЕЗАПИСИ (STEER_MARK_RESTORE=1: окружение apply или steer.platform плагина).
  *
  * Нужен экземпляру steer-box-connector — sing-box для podkop и forkop. Их цепочки ставят метку
  * пакету ЦЕЛИКОМ (`meta mark set 0x04000000`) на тех же хуках и приоритетах, что наша разметка:
@@ -1187,7 +1187,7 @@ static void build_failopen(struct nft_table *t, const struct spec *sp) {
  * Пакет с непустым полем не трогается: у failopen бит zapret снят нарочно. Без переменной
  * цепочки нет, и набор правил прежний до байта. */
 static void build_mark_restore(struct nft_table *t) {
-    const char *e = getenv("STEER_MARK_RESTORE");
+    const char *e = plat_setting("STEER_MARK_RESTORE");
     if (!e || strcmp(e, "1")) return;
     struct nft_rule *r = ir_rule(ir_base_chain_add(t, "prerouting_restore", "filter",
                                                    "prerouting", "dstnat", 10));
