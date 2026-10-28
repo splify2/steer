@@ -166,6 +166,7 @@
 #include "ctl.h"
 #include "ynode.h"
 #include "plugso.h"
+#include "wandev.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
 
@@ -1950,6 +1951,8 @@ static void reload_done(struct conn *c) {
     /* Стартовое применение кончилось — удачно или нет: теперь первый проход сторожа (см.
      * «ПЕРВЫЙ ПРОХОД — ПОСЛЕ СТАРТОВОГО APPLY» в watchd.c). */
     if (c->boot) watchd_release(c->srv->watch);
+    /* @wan_dev напечатан заново; маршрут мог смениться, пока шло применение. */
+    wandev_sync(1);
     struct ctl_srv *s = c->srv;
     int resync = c->resync;
     conn_reply(c);
@@ -3606,6 +3609,8 @@ int ctl_serve_main(int argc, char **argv) {
     /* .so-плагины (steer-abi): после супервизора, чтобы host_v1 видел и спеку, и сторожа, и помощников. */
     plugso_boot(&S.d);
     plugauto_start(&S);
+    if (wandev_start(S.l) != 0)
+        fprintf(stderr, LOG_W "события маршрутов недоступны — @wan_dev обновляется только при apply\n");
     fprintf(stderr, LOG_I "слушаю %s%s%s\n", cf->sock, cf->watch ? ", сторожу выходы" : "",
             cf->supervise ? ", держу помощников" : "");
     if (cf->apply) {

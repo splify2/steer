@@ -160,7 +160,7 @@ DAEMON_SRC := src/compile/groups.c src/compile/generate.c src/compile/balance.c 
               src/daemon/explain.c src/daemon/helpers.c src/daemon/supervise.c src/daemon/supd.c src/daemon/watch.c src/daemon/main.c \
               $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c \
               src/tools/srsread.c src/daemon/ctl.c \
-              src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c \
+              src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c src/daemon/recon.c src/daemon/rulewd.c src/daemon/wandev.c \
               src/daemon/foprobe.c src/daemon/gaiw.c src/daemon/urltest.c src/daemon/fogroup.c src/lib/nftvmap.c \
               src/daemon/folat.c src/daemon/plugso.c $(MODCMD_SRC)
 LIBSTEER_BASE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c $(MODEL_SRC) \
