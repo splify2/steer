@@ -76,6 +76,14 @@ static int wr_full(int fd, const unsigned char *b, size_t n) {
 }
 
 /* Приветствие и, если нужно, авторизация имя/пароль по управляющему/потоковому fd. 0 — ок. */
+static int socks5_method_allowed(const unsigned char reply[2], int auth_required) {
+    return reply && reply[0] == 5 && reply[1] == (auth_required ? 2 : 0);
+}
+
+static int socks5_auth_ok(const unsigned char reply[2]) {
+    return reply && reply[0] == 1 && reply[1] == 0;
+}
+
 static int socks5_hello(int fd, const struct px_node *n) {
     unsigned char buf[2 + PX_USER_MAX + PX_PASS_MAX];
     int auth = n->user[0] != 0;
@@ -83,6 +91,7 @@ static int socks5_hello(int fd, const struct px_node *n) {
     else { unsigned char g[] = { 5, 1, 0 }; if (wr_full(fd, g, 3)) return TR_EIO; }
     if (rd_full(fd, buf, 2)) return TR_EIO;
     if (buf[0] != 5) return PX_EPROTO;
+    if (!socks5_method_allowed(buf, auth)) return PX_EAUTH;
     if (buf[1] == 2) {
         size_t ul = strlen(n->user), pl = strlen(n->pass), o = 0;
         buf[o++] = 1;
@@ -90,7 +99,7 @@ static int socks5_hello(int fd, const struct px_node *n) {
         buf[o++] = (unsigned char)pl; memcpy(buf + o, n->pass, pl); o += pl;
         if (wr_full(fd, buf, o)) return TR_EIO;
         if (rd_full(fd, buf, 2)) return TR_EIO;
-        if (buf[1] != 0) return PX_EAUTH;
+        if (!socks5_auth_ok(buf)) return PX_EAUTH;
     } else if (buf[1] != 0) {
         return PX_EAUTH;
     }
