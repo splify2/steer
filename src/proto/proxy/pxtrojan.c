@@ -76,12 +76,16 @@ static int tj_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
 /* Собрать заголовок запроса (hex пароля + CRLF + CMD + адрес + CRLF). */
 static size_t tj_header(struct trojan_sess *s, const struct flow_key *k, int udp,
                         unsigned char *out, size_t cap) {
-    if (cap < 56 + 2 + 1 + 7 + 2) return 0;
+    if (cap < 56u + 2u + 1u + (flow_is6(k) ? 19u : 7u) + 2u) return 0;
     size_t o = 0;
     memcpy(out, s->pwhex, 56); o += 56;
     out[o++] = '\r'; out[o++] = '\n';
     out[o++] = udp ? 3 : 1;
-    o += px_socks_addr(out + o, k->dst, k->dport);
+    size_t al = px_socks_addr_ip(out + o, cap - o,
+                                 flow_is6(k) ? k->dst6 : (const unsigned char *)&k->dst,
+                                 flow_is6(k) ? 6 : 4, k->dport);
+    if (!al) return 0;
+    o += al;
     out[o++] = '\r'; out[o++] = '\n';
     return o;
 }
@@ -114,9 +118,13 @@ static int tj_send(const void *ctx, void *sess, const struct flow_key *k, int ud
             size_t dl = ((size_t)p[0] << 8) | p[1];
             p += 2; left -= 2;
             if (dl > left) return SEND_FATAL;
-            size_t need = 7 + 2 + 2 + dl;       /* адрес + длина + CRLF + данные */
+            size_t need = (flow_is6(k) ? 19u : 7u) + 2 + 2 + dl;
             if (len + need > sizeof(out)) return SEND_FATAL;
-            len += px_socks_addr(out + len, k->dst, k->dport);
+            size_t al = px_socks_addr_ip(out + len, sizeof(out) - len,
+                                         flow_is6(k) ? k->dst6 : (const unsigned char *)&k->dst,
+                                         flow_is6(k) ? 6 : 4, k->dport);
+            if (!al) return SEND_FATAL;
+            len += al;
             out[len++] = (unsigned char)(dl >> 8);
             out[len++] = (unsigned char)dl;
             out[len++] = '\r'; out[len++] = '\n';

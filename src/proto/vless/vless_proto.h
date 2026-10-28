@@ -37,6 +37,10 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
                            const char *host, const unsigned char ip4[4],
                            uint16_t port, const char *flow,
                            unsigned char *out, size_t cap);
+size_t vless_build_request_ip(const unsigned char uuid[16], enum vless_cmd cmd,
+                              const char *host, const unsigned char *ip, int family,
+                              uint16_t port, const char *flow,
+                              unsigned char *out, size_t cap);
 
 int vless_parse_response(const unsigned char *buf, size_t n, size_t *skip);
 

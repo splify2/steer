@@ -14,6 +14,17 @@ size_t px_socks_addr(unsigned char *out, uint32_t dst_net, uint16_t dport_host) 
     return 7;
 }
 
+size_t px_socks_addr_ip(unsigned char *out, size_t cap, const unsigned char *ip,
+                        int family, uint16_t port) {
+    size_t bytes = family == 6 ? 16u : 4u;
+    if (!out || !ip || (family != 4 && family != 6) || cap < bytes + 3) return 0;
+    out[0] = family == 6 ? 4 : 1;
+    memcpy(out + 1, ip, bytes);
+    out[bytes + 1] = (unsigned char)(port >> 8);
+    out[bytes + 2] = (unsigned char)port;
+    return bytes + 3;
+}
+
 /* ---- shadowsocks ---------------------------------------------------------------------------- */
 
 void px_ss_evp_key(const char *pass, unsigned char *key, size_t key_n) {

@@ -160,8 +160,16 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
                            const char *host, const unsigned char ip4[4],
                            uint16_t port, const char *flow,
                            unsigned char *out, size_t cap) {
+    return vless_build_request_ip(uuid, cmd, host, ip4, 4, port, flow, out, cap);
+}
+
+size_t vless_build_request_ip(const unsigned char uuid[16], enum vless_cmd cmd,
+                              const char *host, const unsigned char *ip, int family,
+                              uint16_t port, const char *flow,
+                              unsigned char *out, size_t cap) {
     size_t i = 0;
-    if (cap < 24) return 0;
+    if (!uuid || !out || cap < 24 ||
+        (cmd != VLESS_CMD_TCP && cmd != VLESS_CMD_UDP && cmd != VLESS_CMD_MUX)) return 0;
     out[i++] = 0;                       /* версия протокола */
     memcpy(out + i, uuid, 16); i += 16;
 
@@ -201,9 +209,10 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
         out[i++] = (unsigned char)hl;
         memcpy(out + i, host, hl); i += hl;
     } else {
-        if (i + 5 > cap) return 0;
-        out[i++] = VLESS_ADDR_IPV4;
-        memcpy(out + i, ip4, 4); i += 4;
+        size_t bytes = family == 6 ? 16u : 4u;
+        if (!ip || (family != 4 && family != 6) || i + 1 + bytes > cap) return 0;
+        out[i++] = family == 6 ? VLESS_ADDR_IPV6 : VLESS_ADDR_IPV4;
+        memcpy(out + i, ip, bytes); i += bytes;
     }
     return i;
 }

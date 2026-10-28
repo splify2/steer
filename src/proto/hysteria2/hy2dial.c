@@ -26,6 +26,8 @@ struct hy2_sess {
     int fd;                     /* первым полем: clear трогает только начало */
     int udp;
     uint32_t dst;               /* IPv4 назначения, сетевой порядок */
+    unsigned char dst6[16];
+    int ipv6;
     uint16_t dport;
 };
 
@@ -49,6 +51,8 @@ static int h2_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
     struct hy2_sess *s = sess;
     s->udp = udp;
     s->dst = k->dst;
+    s->ipv6 = flow_is6(k);
+    memcpy(s->dst6, k->dst6, 16);
     s->dport = k->dport;
     return 0;
 }
@@ -56,9 +60,11 @@ static int h2_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
 static int h2_connect(const void *ctx, void *sess, int timeout_s) {
     (void)ctx;
     struct hy2_sess *s = sess;
-    char host[INET_ADDRSTRLEN];
+    char host[INET6_ADDRSTRLEN];
     struct in_addr a = { .s_addr = s->dst };
-    inet_ntop(AF_INET, &a, host, sizeof host);
+    if (!inet_ntop(s->ipv6 ? AF_INET6 : AF_INET,
+                   s->ipv6 ? (const void *)s->dst6 : (const void *)&a,
+                   host, sizeof(host))) return -1;
     int fd = hy2c_open(s->udp, host, s->dport, timeout_s);
     /* Исход слежке за узлом: «сервер отказал в этом адресе» узел не порочит — он ответил. */
     hy2_watch_seen(fd >= 0 || fd == HY2E_DENIED || fd == HY2E_NOUDP ? 0 : fd);

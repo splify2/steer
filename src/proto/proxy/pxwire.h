@@ -17,6 +17,8 @@
  * клиента уже разрешён (резолвер steer вернул fake-IP, DNAT подменит на настоящий). Пишет из
  * сетевого порядка dst и хостового dport (как во flow_key, tun.h). Возвращает длину (7). */
 size_t px_socks_addr(unsigned char *out, uint32_t dst_net, uint16_t dport_host);
+size_t px_socks_addr_ip(unsigned char *out, size_t cap, const unsigned char *ip,
+                        int family, uint16_t port);
 
 /* ---- shadowsocks: вывод ключей ------------------------------------------------------------- */
 

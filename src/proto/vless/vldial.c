@@ -196,12 +196,13 @@ static void xudp_key_init(void) {
 static void xudp_gid(const struct flow_key *k, unsigned char gid[8]) {
     pthread_once(&g_xudp_once, xudp_key_init);
     uint64_t h = 1469598103934665603ULL;               /* FNV-1a, 64 бита */
-    unsigned char in[16 + 6];
+    unsigned char in[16 + 16 + 2];
     memcpy(in, g_xudp_key, 16);
-    memcpy(in + 16, &k->src, 4);
-    in[20] = (unsigned char)(k->sport >> 8);
-    in[21] = (unsigned char)k->sport;
-    for (size_t i = 0; i < sizeof in; i++) { h ^= in[i]; h *= 1099511628211ULL; }
+    size_t ip_n = flow_is6(k) ? 16u : 4u;
+    memcpy(in + 16, flow_is6(k) ? k->src6 : (const unsigned char *)&k->src, ip_n);
+    in[16 + ip_n] = (unsigned char)(k->sport >> 8);
+    in[17 + ip_n] = (unsigned char)k->sport;
+    for (size_t i = 0; i < 18 + ip_n; i++) { h ^= in[i]; h *= 1099511628211ULL; }
     h ^= h >> 32;
     for (int i = 0; i < 8; i++) gid[i] = (unsigned char)(h >> (56 - 8 * i));
 }
@@ -226,9 +227,10 @@ static size_t xudp_frames(const struct flow_key *k, int first, const unsigned ch
             meta[m++] = 2;                             /* сеть: UDP */
             meta[m++] = (unsigned char)(k->dport >> 8);
             meta[m++] = (unsigned char)k->dport;       /* порт, затем тип адреса и адрес */
-            meta[m++] = VLESS_ADDR_IPV4;
-            memcpy(meta + m, &k->dst, 4);
-            m += 4;
+            size_t ip_n = flow_is6(k) ? 16u : 4u;
+            meta[m++] = flow_is6(k) ? VLESS_ADDR_IPV6 : VLESS_ADDR_IPV4;
+            memcpy(meta + m, flow_is6(k) ? k->dst6 : (const unsigned char *)&k->dst, ip_n);
+            m += ip_n;
             xudp_gid(k, meta + m);
             m += 8;
             first = 0;
@@ -394,8 +396,9 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
          * значило бы получить закрытый поток без внятной причины.
          *
          * dport уже в хостовом порядке — см. комментарий в tun.h. */
-        len = vless_build_request(s->uuid, udp ? VLESS_CMD_UDP : VLESS_CMD_TCP,
-                                  NULL, ip4, k->dport,
+        len = vless_build_request_ip(s->uuid, udp ? VLESS_CMD_UDP : VLESS_CMD_TCP,
+                                  NULL, flow_is6(k) ? k->dst6 : ip4,
+                                  flow_is6(k) ? 6 : 4, k->dport,
                                   udp ? NULL : node->flow, out, sizeof(out));
         if (!len) return SEND_FATAL;
     }

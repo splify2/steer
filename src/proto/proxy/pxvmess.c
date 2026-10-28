@@ -18,7 +18,7 @@
 #include "stack.h"
 #include "scrypto.h"
 
-#define VM_REQ_LEN (16 + 18 + 8 + 49 + 16)   /* заголовок запроса целиком (vm_build_request) */
+#define VM_REQ_LEN (16 + 18 + 8 + 61 + 16)   /* worst case: IPv6 request header */
 #define VM_CHUNK 0x3FEF                 /* нагрузки в куске: < 0x3FFF - 16 */
 enum { RH_LEN = 0, RH_HDR, RH_BODY };
 
@@ -31,6 +31,8 @@ struct vmess_sess {
     uint8_t has_benc, has_bdec, has_smask, has_rmask;
     uint16_t send_count, recv_count;
     uint32_t dst; uint16_t dport;
+    unsigned char dst6[16];
+    int ipv6;
     unsigned char biv[16], riv[16];
     struct sc_aead benc, bdec;
     struct sc_shake smask, rmask;
@@ -78,6 +80,8 @@ static int vm_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
     struct vmess_sess *s = sess;
     s->udp = (uint8_t)udp;
     s->dst = k->dst; s->dport = k->dport;
+    s->ipv6 = flow_is6(k);
+    memcpy(s->dst6, k->dst6, 16);
     s->sec = n->vmess_sec == VMESS_CHACHA20_POLY1305 ? 4 : 3;   /* auto и aes → 3 */
     return 0;
 }
@@ -120,7 +124,9 @@ static size_t vm_build_request(const struct px_node *n, struct vmess_sess *s,
     s->respv = rnd[12];
     px_vmess_cmdkey(n->vmess_id, cmdkey);
 
-    unsigned char H[49];
+    unsigned char H[61];
+    size_t address_n = s->ipv6 ? 16u : 4u;
+    size_t header_n = 45u + address_n;
     H[0] = 1;
     memcpy(H + 1, bodyiv, 16);
     memcpy(H + 17, bodykey, 16);
@@ -130,11 +136,12 @@ static size_t vm_build_request(const struct px_node *n, struct vmess_sess *s,
     H[36] = 0;
     H[37] = s->udp ? 2 : 1;
     H[38] = (unsigned char)(s->dport >> 8); H[39] = (unsigned char)s->dport;
-    H[40] = 1;                            /* ATYP IPv4 */
-    memcpy(H + 41, &s->dst, 4);
-    uint32_t f = px_fnv1a(H, 45);
-    H[45] = (unsigned char)(f >> 24); H[46] = (unsigned char)(f >> 16);
-    H[47] = (unsigned char)(f >> 8); H[48] = (unsigned char)f;
+    H[40] = s->ipv6 ? 3 : 1;              /* VMess: IPv4=1, IPv6=3 */
+    memcpy(H + 41, s->ipv6 ? s->dst6 : (const unsigned char *)&s->dst, address_n);
+    size_t check_at = 41 + address_n;
+    uint32_t f = px_fnv1a(H, check_at);
+    H[check_at] = (unsigned char)(f >> 24); H[check_at + 1] = (unsigned char)(f >> 16);
+    H[check_at + 2] = (unsigned char)(f >> 8); H[check_at + 3] = (unsigned char)f;
 
     unsigned char authid[16];
     px_vmess_authid(cmdkey, (uint64_t)time(NULL), rand4, authid);
@@ -150,14 +157,14 @@ static size_t vm_build_request(const struct px_node *n, struct vmess_sess *s,
     pl[0].p = (const unsigned char *)"VMess Header AEAD Nonce"; pl[0].n = 23;
     px_vmess_kdf(cmdkey, pl, 3, hdrnonce, 12);
 
-    if (cap < 16u + 18u + 8u + sizeof(H) + 16u) return 0;
+    if (cap < 16u + 18u + 8u + header_n + 16u) return 0;
     size_t o = 0;
     memcpy(out + o, authid, 16); o += 16;
     /* зашифрованная длина заголовка */
     /* Каждый отказ слоя (ключ не развернулся, SHAKE не завёлся) — отказ запроса (0 → SEND_FATAL):
      * дальше на провод ушли бы байты под неинициализированным ключом или маской длины. */
     struct sc_aead a;
-    unsigned char lenpt[2] = { (unsigned char)(sizeof(H) >> 8), (unsigned char)sizeof(H) };
+    unsigned char lenpt[2] = { (unsigned char)(header_n >> 8), (unsigned char)header_n };
     if (sc_aead_setkey(&a, SC_AES128_GCM, lenkey) != 0) return 0;
     int sr = sc_aead_seal(&a, lennonce, authid, 16, lenpt, 2, out + o + 2);
     sc_aead_free(&a);
@@ -166,11 +173,11 @@ static size_t vm_build_request(const struct px_node *n, struct vmess_sess *s,
     memcpy(out + o, connnonce, 8); o += 8;
     /* зашифрованный заголовок */
     if (sc_aead_setkey(&a, SC_AES128_GCM, hdrkey) != 0) return 0;
-    memcpy(out + o, H, sizeof H);
-    sr = sc_aead_seal(&a, hdrnonce, authid, 16, out + o, sizeof H, out + o + sizeof H);
+    memcpy(out + o, H, header_n);
+    sr = sc_aead_seal(&a, hdrnonce, authid, 16, out + o, header_n, out + o + header_n);
     sc_aead_free(&a);
     if (sr != 0) return 0;
-    o += sizeof(H) + 16;
+    o += header_n + 16;
 
     /* Ключи тела (send) и ответа (recv). */
     unsigned char bk[32]; size_t bkn;

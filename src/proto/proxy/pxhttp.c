@@ -19,6 +19,8 @@ struct http_sess {
     uint8_t established;
     uint16_t pend_off, pend_n;   /* байты цели, пришедшие вместе с ответом 200 (pend) */
     uint32_t dst; uint16_t dport;
+    unsigned char dst6[16];
+    int ipv6;
     struct transport t;
     unsigned char pend[HT_RESP_MAX];
 };
@@ -47,6 +49,8 @@ static int ht_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
         return -1;
     }
     s->dst = k->dst;
+    s->ipv6 = flow_is6(k);
+    memcpy(s->dst6, k->dst6, 16);
     s->dport = k->dport;
     return 0;
 }
@@ -69,14 +73,18 @@ static size_t b64enc(const unsigned char *in, size_t n, char *out) {
 
 /* Рукопожатие CONNECT: собрать запрос, прочитать ответ до конца заголовков, проверить «200». */
 static int http_connect(const struct px_node *n, struct http_sess *s, int timeout_s) {
-    char ip[INET_ADDRSTRLEN];
+    char ip[INET6_ADDRSTRLEN + 2];
     struct in_addr a = { .s_addr = s->dst };
-    inet_ntop(AF_INET, &a, ip, sizeof ip);
+    if (s->ipv6) {
+        char numeric[INET6_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET6, s->dst6, numeric, sizeof(numeric))) return PX_EPROTO;
+        snprintf(ip, sizeof(ip), "[%s]", numeric);
+    } else if (!inet_ntop(AF_INET, &a, ip, sizeof(ip))) return PX_EPROTO;
     /* Буфер — под самые длинные имя и пароль узла: строка CONNECT (до 70 знаков), Basic от
      * «имя:пароль» (до 4/3 от PX_USER_MAX + PX_PASS_MAX) и обрамление. Прежние 512 не вмещали
      * длинный Basic, а длина снова прибавлялась к rl — следующий snprintf писал за буфер. */
     char cred[PX_USER_MAX + PX_PASS_MAX + 2], b64[((PX_USER_MAX + PX_PASS_MAX + 2) * 4) / 3 + 8];
-    char req[128 + sizeof b64];
+    char req[256 + sizeof b64];
     b64[0] = '\0';
     if (n->user[0]) {
         int cl = snprintf(cred, sizeof cred, "%s:%s", n->user, n->pass);
