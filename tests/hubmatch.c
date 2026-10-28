@@ -29,6 +29,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <poll.h>
 
 /* Хабу run_quiet нужен для `ip link` (hub_retune_mtu, hub_dev_up, cmd_xsteer_hub); в
  * src/lib/run.c его настоящая реализация, а здесь — ЗАПИСЬ вместо запуска: подъём устройства
@@ -141,9 +142,19 @@ static int wire_open(void) {
     return fd;
 }
 
-/* Взять следующий ушедший сегмент. -1 — не ушло ничего. */
+/* Взять следующий ушедший сегмент. -1 — не ушло ничего.
+ *
+ * ДОСТАВКА ПО ПЕТЛЕ НЕ МГНОВЕННА. send() по UDP на петле кладёт датаграмму в очередь приёма
+ * через отложенную обработку сети, и на ядре WSL2 6.18 она к следующему recv(MSG_DONTWAIT)
+ * ещё не доходит: стенд видел «не ушло ничего» на месте оповещения, а само оповещение читал
+ * следующий случай как чужой ответ (12 провалов разом). Поэтому ждём до WIRE_WAIT_MS; там,
+ * где ушло, ожидание кончается на первой датаграмме, и цену платят только проверки «не ушло
+ * ничего». */
+#define WIRE_WAIT_MS 300
 static uint8_t wire_buf[2048];
-static int wire_take(uint8_t **pay, size_t *pn) {
+static int wire_take_wait(uint8_t **pay, size_t *pn, int wait_ms) {
+    struct pollfd pf = { .fd = obs_fd, .events = POLLIN };
+    if (poll(&pf, 1, wait_ms) <= 0) return -1;
     ssize_t n = recv(obs_fd, wire_buf, sizeof(wire_buf), MSG_DONTWAIT);
     if (n < 20) return -1;
     size_t hl = (size_t)(wire_buf[12] >> 4) * 4;
@@ -153,8 +164,22 @@ static int wire_take(uint8_t **pay, size_t *pn) {
     return wire_buf[13];
 }
 
+static int wire_take(uint8_t **pay, size_t *pn) {
+    return wire_take_wait(pay, pn, WIRE_WAIT_MS);
+}
+
+/* Слить всё, что ещё в пути: опоздавшая датаграмма прошлого случая иначе пришла бы
+ * ответом следующему. */
+/* Дождаться, пока на соединении к прикрытию будет что читать (данные или FIN). Цикл воркера
+ * зовёт decoy_event по готовности из poll; стенд обязан так же, иначе на той же отложенной
+ * доставке по петле событие застаёт пустой сокет. */
+static void up_wait(const struct sess *s) {
+    struct pollfd pf = { .fd = s->up_fd, .events = POLLIN };
+    poll(&pf, 1, 1000);
+}
+
 static void wire_drain(void) {
-    while (wire_take(NULL, NULL) >= 0) {}
+    while (wire_take_wait(NULL, NULL, 20) >= 0) {}
 }
 
 /* ---- минимальный SYN с опцией MSS -------------------------------------------
@@ -605,6 +630,7 @@ int main(void) {
             for (size_t i = 0; i < sizeof(big); i++) big[i] = (uint8_t)(i & 0xFF);
             check("  прикрытие ответило", (long)sizeof(big),
                   (long)send(up, big, sizeof(big), 0));
+            up_wait(s);
             decoy_event(&w, s, POLLIN, 1020);
             uint8_t *pay = NULL;
             size_t pn = 0, total = 0;
@@ -645,6 +671,7 @@ int main(void) {
          * ровно тот признак, ради устранения которого дорожка и заведена. */
         close(up);
         wire_drain();
+        up_wait(s);
         decoy_event(&w, s, POLLIN, 1040);
         {
             uint8_t *pay = NULL;
