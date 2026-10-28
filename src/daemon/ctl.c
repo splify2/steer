@@ -397,14 +397,19 @@ static const char *ctl_err_code(const char *err, const char *msg) {
 
 /* error — вид отказа (прежнее слово), message — фраза для журнала и командной строки, code — машинное слово
  * (docs/errors.md), args — подстановки (у отказов с числами в тексте — они же; у остальных пусто). */
-static void resp_error(struct cbuf *r, const char *err, const char *msg) {
+static void resp_errorc(struct cbuf *r, const char *err, const char *msg, const char *code, const char *args) {
     cb_str(r, ",\"error\":");
     cb_jstr(r, err);
     cb_str(r, ",\"message\":");
     cb_jstr(r, msg);
     cb_str(r, ",\"code\":");
-    cb_jstr(r, ctl_err_code(err, msg));
-    cb_str(r, ",\"args\":{}");
+    cb_jstr(r, code ? code : ctl_err_code(err, msg));
+    cb_str(r, ",\"args\":");
+    cb_str(r, args ? args : "{}");
+}
+
+static void resp_error(struct cbuf *r, const char *err, const char *msg) {
+    resp_errorc(r, err, msg, NULL, NULL);
 }
 
 /* Строка JSON отказа подкоманды (err_json, STEER_ERR_JSON) — последняя строка stderr: вынуть её из stderr и
@@ -1008,12 +1013,17 @@ static void conn_reply(struct conn *c) {
 }
 
 /* Отказ посреди запроса: всё, что успели дописать в ответ, выбрасывается. */
-static void conn_refuse(struct conn *c, const char *cmd, const char *err, const char *msg) {
+static void conn_refusec(struct conn *c, const char *cmd, const char *err, const char *msg, const char *code,
+                         const char *args) {
     c->resp.n = 0;
     c->resp.trunc = 0;
     resp_begin(&c->resp, cmd);
-    resp_error(&c->resp, err, msg);
+    resp_errorc(&c->resp, err, msg, code, args);
     conn_reply(c);
+}
+
+static void conn_refuse(struct conn *c, const char *cmd, const char *err, const char *msg) {
+    conn_refusec(c, cmd, err, msg, NULL, NULL);
 }
 
 /* ---- ребёнок ------------------------------------------------------------------------------ */
@@ -1211,6 +1221,13 @@ static FILE *mem_begin(struct mem_run *m) {
     return m->f;
 }
 
+/* Отказ команды в процессе: текст и строка JSON с кодом в stderr (resp_ecode вынет её в ecode/args). */
+static void mem_err_print(const struct err *e) {
+    fprintf(stderr, "steer: %s\n", e->msg);
+    char b[2048];
+    if (err_json(e, b, sizeof(b)) > 0) fprintf(stderr, "%s\n", b);
+}
+
 static void mem_end(struct mem_run *m, struct cbuf *r, int code) {
     struct cbuf out = { .max = CTL_OUT_MAX }, err = { .max = CTL_ERR_MAX };
     fflush(stderr);
@@ -1374,7 +1391,10 @@ static void mem_helper(struct conn *c, struct cbuf *r) {
     if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
     int code = 0;
     if (supd_helper_json(d->sup, c->q.argv[0], f) != 0) {
-        fprintf(stderr, "steer: helper: у выхода %s нет помощника под этим демоном\n", c->q.argv[0]);
+        struct err e;
+        memset(&e, 0, sizeof(e));
+        err_setf(&e, "ctl.helper_missing", "helper: у выхода %s нет помощника под этим демоном", c->q.argv[0]);
+        mem_err_print(&e);
         code = 1;
     }
     mem_end(&m, r, code);
@@ -1387,7 +1407,9 @@ static void mem_dns_log(struct conn *c, struct cbuf *r) {
     struct mem_run m;
     FILE *f = mem_begin(&m);
     if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
+    setenv("STEER_ERR_JSON", "1", 1);          /* отказ — ещё и строкой JSON с кодом, как у подкоманд */
     int code = dlog_print(f);
+    unsetenv("STEER_ERR_JSON");
     mem_end(&m, r, code);
 }
 
@@ -2126,10 +2148,11 @@ static void ctl_do_put_file(struct conn *c, struct cbuf *r) {
     long long bytes;
     ctl_lists_usage(dir, name, &files, &bytes);
     if (files >= CTL_FILES_MAX) {
-        char why[256];
+        char why[256], a[48];
         snprintf(why, sizeof(why), "в каталоге списков уже %d файлов — предел от бесконечной заливки; "
                  "уберите ненужные (rm-file)", CTL_FILES_MAX);
-        resp_error(r, "too-large", why);
+        snprintf(a, sizeof(a), "{\"1\":\"%d\"}", CTL_FILES_MAX);
+        resp_errorc(r, "too-large", why, "ctl.lists_files_max", a);
         return;
     }
     if (bytes + (long long)q->body_n > CTL_FILES_TOTAL) {
@@ -2656,8 +2679,10 @@ static int conn_parse(struct conn *c) {
         unsigned long long v = strtoull(w, NULL, 10);
         if (v > (unsigned long long)cmd->body) {
             char m[64];
+            char a[48];
             snprintf(m, sizeof(m), "тело больше %ld МиБ", cmd->body / (1024 * 1024));
-            conn_refuse(c, cmd->name, "too-large", m);
+            snprintf(a, sizeof(a), "{\"1\":\"%ld\"}", cmd->body / (1024 * 1024));
+            conn_refusec(c, cmd->name, "too-large", m, "ctl.body_too_large", a);
             return -1;
         }
         blen = (size_t)v;

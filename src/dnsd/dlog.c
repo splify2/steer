@@ -1,3 +1,4 @@
+#include "err.h"
 #include "dnsd_int.h"
 #include "sindex.h"
 #include "jsonw.h"
@@ -327,7 +328,10 @@ int dlog_print(FILE *out) {
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
     if ((size_t)snprintf(path, sizeof(path), "%s/dnsd.sock", steer_state_dir()) >= sizeof(a.sun_path)) {
-        fprintf(stderr, "steer[warn] dns-log: путь сокета журнала слишком длинный\n");
+        struct err e;
+        memset(&e, 0, sizeof(e));
+        err_setc(&e, "dnslog.path_long", "dns-log: путь сокета журнала слишком длинный", NULL);
+        err_print(&e);
         return 1;
     }
     memcpy(a.sun_path, path, strlen(path) + 1);                 /* длина сверена выше */
@@ -340,7 +344,10 @@ int dlog_print(FILE *out) {
             fprintf(out, "{\"schema\":1,\"running\":false,\"size\":%d,\"names\":[]}\n", DLOG_MIN);
             return 0;
         }
-        fprintf(stderr, "steer[warn] dns-log: %s: %s\n", path, strerror(e));
+        struct err er;
+        memset(&er, 0, sizeof(er));
+        err_setf(&er, "dnslog.socket", "dns-log: %s: %s", path, strerror(e));
+        err_print(&er);
         return 1;
     }
     struct timeval tv = { 3, 0 };
@@ -366,7 +373,10 @@ int dlog_print(FILE *out) {
     close(fd);
     if (!n || buf[n - 1] != '\n') {
         free(buf);
-        fprintf(stderr, "steer[warn] dns-log: резолвер не отдал журнал\n");
+        struct err er;
+        memset(&er, 0, sizeof(er));
+        err_setc(&er, "dnslog.no_reply", "dns-log: резолвер не отдал журнал", NULL);
+        err_print(&er);
         return 1;
     }
     fwrite(buf, 1, n, out);
