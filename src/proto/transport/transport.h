@@ -466,6 +466,9 @@ void transport_set_socket_prepare(transport_socket_prepare_fn fn, void *ctx);
 
 /* TCP до узла по всем адресам имени (trdial.c). Дескриптор либо отрицательный код TR_*. */
 int tr_dial(const char *host, uint16_t port, int timeout_s);
+/* Connect to an already-resolved numeric IPv6 destination without invoking a
+ * resolver. UDP returns a connected nonblocking datagram socket. */
+int tr_dial_ip6(const unsigned char ip[16], uint16_t port, int udp, int timeout_s);
 /* Соединённый неблокирующий сокет UDP к узлу с той же меткой, что у TCP (trdial.c): датаграммы
  * протоколов прокси (shadowsocks, SOCKS5). Дескриптор либо отрицательный код TR_*. */
 int tr_dial_udp(const char *host, uint16_t port);

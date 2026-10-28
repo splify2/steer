@@ -281,6 +281,43 @@ int tr_dial(const char *host, uint16_t port, int timeout_s) {
     return tcp_connect(host, port, timeout_s);
 }
 
+int tr_dial_ip6(const unsigned char ip[16], uint16_t port, int udp, int timeout_s) {
+    if (!ip || !port || timeout_s < 1 || timeout_s > 300) return TR_ECONNECT;
+    struct in6_addr numeric;
+    memcpy(&numeric, ip, sizeof(numeric));
+    if (IN6_IS_ADDR_V4MAPPED(&numeric)) return TR_ECONNECT;
+
+    int fd = socket(AF_INET6, (udp ? SOCK_DGRAM : SOCK_STREAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return TR_ESOCK;
+    if (socket_prepare(fd) != 0) { close(fd); return TR_ESOCK; }
+    if (steer_sock_mark(fd, g_sock_mark) != 0 && g_sock_mark_req) {
+        close(fd);
+        return TR_ESOCK;
+    }
+
+    struct sockaddr_in6 sa = { .sin6_family = AF_INET6, .sin6_port = htons(port) };
+    memcpy(&sa.sin6_addr, ip, 16);
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc != 0 && errno != EINPROGRESS) { close(fd); return TR_ECONNECT; }
+    if (rc != 0) {
+        int64_t deadline = now_ms() + (int64_t)timeout_s * 1000;
+        for (;;) {
+            int64_t remain = deadline - now_ms();
+            if (remain <= 0) { close(fd); return TR_ECONNECT; }
+            struct pollfd p = { .fd = fd, .events = POLLOUT };
+            rc = poll(&p, 1, (int)remain);
+            if (rc < 0 && errno == EINTR) continue;
+            int error = 0; socklen_t bytes = sizeof(error);
+            if (rc <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &bytes) || error) {
+                close(fd); return TR_ECONNECT;
+            }
+            break;
+        }
+    }
+    if (!udp) sock_ready(fd, timeout_s);
+    return fd;
+}
+
 /* Сокет UDP к узлу — для протоколов, у которых датаграммы идут датаграммами (shadowsocks, SOCKS5 UDP
  * ASSOCIATE; src/proto/proxy). Та же метка, что у TCP (`over`/`via`), и тем же правилом: метка
  * обязательна — без неё сокет не открывается. Первый адрес IPv4 имени: перебора, как у TCP, нет —
