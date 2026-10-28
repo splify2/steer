@@ -103,6 +103,7 @@ size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *
             k++;
             snprintf(h->name, sizeof(h->name), "%s", o->name);
             if (hp.plugin) snprintf(h->plugin, sizeof(h->plugin), "%s", hp.plugin);
+            h->paths = hp.paths;
             h->sig = helper_sig(sp, o, &hp);
             h->delay_ms = HELPERS_DELAY_MS;
             h->evfd = -1;

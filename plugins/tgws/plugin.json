@@ -8,7 +8,7 @@
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/splify2/splify2-extended-plugins",
   "compat": {
-    "steer-api": "^1.1",
+    "steer-api": "^1.4",
     "splify2-api": "^1.0"
   },
   "arch": [
@@ -53,6 +53,7 @@
           ]
         },
         "health": "events",
+        "paths": true,
         "nft": [
           "nft/tgws.nft"
         ],
@@ -72,7 +73,8 @@
         "help": "проверить путь до дата-центра Telegram и его ответ",
         "usage": "[media] [--node N] [--domain ДОМЕН] [--direct] [--timeout СЕК]"
       }
-    ]
+    ],
+    "settings": "restart"
   },
   "splify2": {
     "settings": {

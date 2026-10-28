@@ -16,7 +16,7 @@
 #
 #   5. hello с API и id, хук check, разбор аргументов tgws-probe;
 #   6. мост по {conf}: слушает порт из output.ports, говорит up, читает настройки плагина (settings.json:
-#      пул, пути, адреса ДЦ, WARP) и перезапускается сам, когда их переписали.
+#      пул, пути, адреса ДЦ, WARP) один раз; перезапуск по новым настройкам — подписью ядра (steer-api 1.4).
 #
 # Мост целиком (перехват в ядре Linux, веб-сокет, поток) — tests/run-tgws.sh (root, сетевые пространства).
 set -u
@@ -192,15 +192,11 @@ import socket,sys
 s=socket.socket()
 try: s.connect(('127.0.0.1',$mp)); print(1)
 except Exception: print(0)" 2>/dev/null)"
-    # Настройки переписаны (так их пишет панель — plugin_settings_set): мост выходит сам, супервизор ядра
-    # поднимает его заново уже с ними.
-    sleep 0.2
+    # Настройки переписаны (так их пишет панель — plugin_settings_set): мост сам за файлом не следит и не
+    # выходит — перезапуск по подписи ведёт ядро (steer.settings: "restart", steer-api 1.4; pluginmodel).
     printf '{"domains":["z.example"]}\n' > "$tmp/pconf/settings.json.new" && mv "$tmp/pconf/settings.json.new" "$tmp/pconf/settings.json"
-    n=0
-    while kill -0 "$bp" 2>/dev/null && [ "$n" -lt 60 ]; do sleep 0.1; n=$((n + 1)); done
-    check "настройки переписаны — мост вышел сам (перезапуск супервизором)" "no" "$(kill -0 "$bp" 2>/dev/null && echo yes || echo no)"
-    has "  и сказал down с причиной" "$(cat "$tmp/ev")" '{"ev":"down","why":"'
-    has "  в журнале — почему" "$(cat "$tmp/log")" "настройки изменились — перезапуск моста"
+    sleep 2.5
+    check "настройки переписаны — мост не выходит сам (перезапуск — по подписи ядра)" "yes" "$(kill -0 "$bp" 2>/dev/null && echo yes || echo no)"
     kill "$bp" 2>/dev/null
     wait "$bp" 2>/dev/null
     # Негодный файл настроек мост не роняет: Telegram без пула лучше, чем без моста.

@@ -99,6 +99,8 @@ struct helper {
     /* Помощник перебирает узлы (прислал node, nonode или excluded хоть раз): память демона отвечает
      * про его перебор (supd.c, probe_mem). Не сбрасывается с новым процессом. */
     int picks;
+    /* Вид помощника объявил paths (kind_helper.paths): paths_down в status — всегда, и пустым. */
+    int paths;
     /* Только у программы плагина (supd.c, ev_line): пришло ли hello и принято ли, не отвергнут ли
      * процесс (чужой API), версия из hello (для status) и записано ли в журнал, что программы нет. */
     int hello, rejected, nomod_logged;

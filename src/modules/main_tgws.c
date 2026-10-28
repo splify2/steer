@@ -6,21 +6,18 @@
  * перехвата ставит ядро по шаблону nft плагина (plugins/tgws/nft/tgws.nft). Настройки плагина — пул
  * доменов, пути ДЦ, адреса ДЦ, туннели WARP — лежат в своём каталоге настроек ({conf}: paths.conf,
  * у подкоманды — STEER_PLUGIN_CONF), файл settings.json по схеме plugins/tgws/settings.schema.json;
- * пишет его панель (splify2-api, plugin_settings_set). Переписан файл — мост перезапускается сам. */
+ * пишет его панель (splify2-api, plugin_settings_set). Мост читает его один раз при старте: файл входит в подпись
+ * перезапуска помощника (манифест: steer.settings = "restart", steer-api 1.4), и хост, записав его, зовёт
+ * reload — ядро поднимает мост заново сразу, без паузы перезапуска. */
 #define _GNU_SOURCE
-#include <errno.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
-#include "evline.h"
 #include "plugkit.h"
 #include "tghook.h"
 #include "tgws.h"
-#include "thrstack.h"
 
 /* Настройки плагина: документ живёт, пока жив процесс, списки — указатели на его строки. */
 struct tg_settings {
@@ -86,51 +83,6 @@ static void settings_opts(const struct tg_settings *s, struct tgws_opts *o) {
     o->verbose = s->verbose;
 }
 
-/* ---- перезапуск по настройкам -------------------------------------------------------------------
- *
- * Настройки плагина пишет панель, а не ядро, и в подпись перезапуска помощника ({conf}) они не входят.
- * Мост перечитать их на ходу не может: пул, карта и таблица ДЦ читаются потоками соединений без замка.
- * Поэтому мост сам смотрит на файл и, когда тот переписан, выходит — супервизор ядра поднимает его
- * заново (пауза перезапуска, helpers.h) уже с новыми настройками. Раз в две секунды — stat одного файла. */
-struct watch { char path[4200]; struct stat st; int have; };
-
-static int same(const struct watch *w, const struct stat *st, int have) {
-    if (have != w->have) return 0;
-    if (!have) return 1;
-    return st->st_ino == w->st.st_ino && st->st_size == w->st.st_size &&
-           st->st_mtim.tv_sec == w->st.st_mtim.tv_sec && st->st_mtim.tv_nsec == w->st.st_mtim.tv_nsec;
-}
-
-static void *watch_run(void *arg) {
-    struct watch *w = arg;
-    for (;;) {
-        sleep(2);
-        struct stat st;
-        int have = stat(w->path, &st) == 0;
-        if (same(w, &st, have)) continue;
-        fprintf(stderr, "steer[info] tgws: настройки изменились — перезапуск моста\n");
-        evline_emit("down", "why", EVLINE_STR, "настройки изменились", (const char *)NULL);
-        _exit(0);
-    }
-    return NULL;
-}
-
-static void watch_start(const char *path) {
-    static struct watch w;
-    if (!path || !*path) return;
-    snprintf(w.path, sizeof(w.path), "%s", path);
-    w.have = stat(w.path, &w.st) == 0;
-    pthread_t t;
-    pthread_attr_t at;
-    pthread_attr_init(&at);
-    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&at, thread_stack(64 * 1024));   /* + статическая TLS у glibc (thrstack.h) */
-    if (pthread_create(&t, &at, watch_run, &w) != 0)
-        fprintf(stderr, "steer[warn] tgws: слежка за настройками не завелась (%s) — новые настройки — после "
-                "перезапуска службы\n", strerror(errno));
-    pthread_attr_destroy(&at);
-}
-
 /* ---- подкоманды -------------------------------------------------------------------------------- */
 
 static int r_tgws(const struct pk_args *a) {
@@ -146,7 +98,6 @@ static int r_tgws(const struct pk_args *a) {
     char path[4200];
     settings_load(o->plugin_conf, &s, path, sizeof path);
     settings_opts(&s, &opt);
-    watch_start(path);
     return tgws_serve(&opt);
 }
 

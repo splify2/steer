@@ -1615,17 +1615,16 @@ static void health_json(FILE *out, const struct helper_state *st, long now) {
     fputs("]", out);
 }
 
-/* Объект выхода моста tgws в status: отставленные им пути, чей срок не вышел (пустой массив —
- * отставленных нет). Только у выхода, чей помощник — ребёнок этого демона: у моста всегда, у
- * другого помощника — если он о путях сообщал (health пишет только мост; так событие видно и
- * стенду, у которого моста в сборке нет). */
+/* Объект выхода в status: пути, отставленные его помощником, чей срок не вышел (пустой массив —
+ * отставленных нет). Только у выхода, чей помощник — ребёнок этого демона: всегда — у вида, который
+ * объявил paths в манифесте (мост tgws, steer-api 1.4), у другого помощника — если он о путях сообщал. */
 static void status_fields(FILE *out, const char *name) {
     const struct supd *s = g_probe_sup;
     if (!s || !name) return;
     for (size_t i = 0; i < s->set.n; i++) {
         const struct helper *h = &s->set.h[i];
         if (h->table || h->gone || strcmp(h->name, name)) continue;
-        if (strcmp(h->cmd, "tgws") && !h->st.health_n) continue;
+        if (!h->paths && !h->st.health_n) continue;
         fputs(",\"paths_down\":", out);
         health_json(out, &h->st, (long)time(NULL));
         return;
@@ -1665,7 +1664,7 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
                     st->total);
         /* Активные узлы пула (номера среди пригодных, как у vless-nodes) — когда клиент сказал. */
         if (st->active_known) fprintf(out, ",\"active\":[%s]", st->active);
-        if (!strcmp(h->cmd, "tgws") || st->health_n) {
+        if (h->paths || st->health_n) {
             fputs(",\"paths_down\":", out);
             health_json(out, st, now);
         }
