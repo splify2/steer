@@ -252,28 +252,67 @@ static int ip6tables_nat_ok(void) {
     return ok;
 }
 
+/* Снять все наши правила MASQUERADE (метка в поле ядра steer) из nat POSTROUTING.
+ *
+ * Без пределов: прежде читалось не больше 64 правил и 31 слова на правило, и сверх того правила
+ * оставались висеть молча. Снимаются одним процессом `<tool>-restore --noflush` (все -D одной
+ * транзакцией) вместо отдельного iptables на каждое правило; не вышло (нет -restore, отказ) — по
+ * правилу, как прежде. */
 static void masq_drop_all_tool(const char *tool) {
     char mask[24], cmd[96];
     snprintf(mask, sizeof(mask), "/0x%x ", STEER_MARK_MASK);
     snprintf(cmd, sizeof(cmd), "%s -w -t nat -S POSTROUTING 2>/dev/null", tool);
     FILE *p = popen(cmd, "r");
     if (!p) return;
-    char line[512], lines[64][512];
-    int n = 0;
-    while (n < 64 && fgets(line, sizeof(line), p)) {
+    char **lines = NULL, *line = NULL;
+    size_t n = 0, cap = 0, lcap = 0;
+    ssize_t got;
+    while ((got = getline(&line, &lcap, p)) > 0) {
         if (strncmp(line, "-A POSTROUTING ", 15) || !strstr(line, mask) ||
             !strstr(line, "-j MASQUERADE")) continue;
-        snprintf(lines[n++], sizeof(lines[0]), "%s", line + 15);
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            char **g = realloc(lines, nc * sizeof(*g));
+            if (!g) break;
+            lines = g;
+            cap = nc;
+        }
+        char *d = strdup(line + 15);
+        if (!d) break;
+        d[strcspn(d, "\n")] = '\0';
+        lines[n++] = d;
     }
+    free(line);
     pclose(p);
-    for (int i = 0; i < n; i++) {
-        const char *argv[32] = { tool, "-w", "-t", "nat", "-D", "POSTROUTING" };
-        int k = 6;
-        for (char *t = strtok(lines[i], " \n"); t && k < 31; t = strtok(NULL, " \n"))
-            argv[k++] = t;
-        argv[k] = NULL;
-        run(argv);
+    if (!n) { free(lines); return; }
+
+    int done = 0;
+    snprintf(cmd, sizeof(cmd), "%s-restore -w --noflush >/dev/null 2>&1", tool);
+    FILE *r = popen(cmd, "w");
+    if (r) {
+        fputs("*nat\n", r);
+        for (size_t i = 0; i < n; i++) fprintf(r, "-D POSTROUTING %s\n", lines[i]);
+        fputs("COMMIT\n", r);
+        done = pclose(r) == 0;
     }
+    for (size_t i = 0; i < n; i++) {
+        if (!done) {
+            size_t words = 1;
+            for (const char *q = lines[i]; *q; q++) words += *q == ' ';
+            const char **argv = malloc((words + 8) * sizeof(*argv));
+            if (argv) {
+                size_t k = 0;
+                argv[k++] = tool; argv[k++] = "-w"; argv[k++] = "-t"; argv[k++] = "nat";
+                argv[k++] = "-D"; argv[k++] = "POSTROUTING";
+                for (char *t = strtok(lines[i], " "); t; t = strtok(NULL, " ")) argv[k++] = t;
+                argv[k] = NULL;
+                run(argv);
+                free(argv);
+            }
+        }
+        free(lines[i]);
+    }
+    free(lines);
 }
 
 static void iptables_masq_drop_all(void) {
