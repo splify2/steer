@@ -283,7 +283,7 @@
 | `yaml.nul_byte` | — | в строке нулевой байт — такое значение обрезалось бы молча |
 | `yaml.reader` | `problem` | текст не читается как UTF-8/UTF-16: {problem} |
 | `yaml.second_document` | — | второй документ в потоке: ожидался один документ |
-| `yaml.syntax` | `problem` | ошибка YAML: {problem} |
+| `yaml.syntax` | `problem`, `context`, `context_line`, `problem_line` | ошибка YAML: {problem} (место отказа — начало конструкции, `problem_line` — где libyaml заметил) |
 | `yaml.tab` | `problem` | ошибка YAML: {problem}; табуляция: отступ в YAML — только пробелы |
 | `yaml.too_big` | `1` | документ больше {1} байт |
 | `yaml.too_deep` | `1` | вложенность глубже {1} уровней |

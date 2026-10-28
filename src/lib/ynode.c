@@ -180,10 +180,21 @@ static int ylib_fail(struct err *e, const char *name, const yaml_parser_t *p,
     default:
         line = (unsigned)p->problem_mark.line + 1;
         col = (unsigned)p->problem_mark.column + 1;
+        /* libyaml замечает ошибку там, где конструкция «не сошлась» («did not find expected key» —
+         * на следующей строке после блока), а ошибся человек в самой конструкции: место отказа —
+         * её начало (context_mark), а где заметили — в тексте и в problem_line. Табуляция — не
+         * этот случай: она сама и есть место. */
+        unsigned noticed = line;
+        int tabat = p->error == YAML_SCANNER_ERROR && p->problem_mark.index < len &&
+                    buf[p->problem_mark.index] == '\t';
+        if (p->context && !tabat) {
+            line = (unsigned)p->context_mark.line + 1;
+            col = (unsigned)p->context_mark.column + 1;
+        }
         if (p->context)
-            snprintf(msg, sizeof(msg), "ошибка YAML: %s (%s, начало в строке %u)",
+            snprintf(msg, sizeof(msg), "ошибка YAML: %s (%s, начало в строке %u; замечено в строке %u)",
                      p->problem ? p->problem : "?", p->context,
-                     (unsigned)p->context_mark.line + 1);
+                     (unsigned)p->context_mark.line + 1, noticed);
         else
             snprintf(msg, sizeof(msg), "ошибка YAML: %s", p->problem ? p->problem : "?");
         /* Самая частая ошибка руками — табуляция в отступе, и текст библиотеки («found character
@@ -201,6 +212,8 @@ static int ylib_fail(struct err *e, const char *name, const yaml_parser_t *p,
             err_args_add(e->args, sizeof(e->args), "context", p->context);
             snprintf(nb, sizeof(nb), "%u", (unsigned)p->context_mark.line + 1);
             err_args_add(e->args, sizeof(e->args), "context_line", nb);
+            snprintf(nb, sizeof(nb), "%u", noticed);
+            err_args_add(e->args, sizeof(e->args), "problem_line", nb);
         }
         return -1;
     }
