@@ -271,6 +271,42 @@ static void check(int ok, const char *what) {
 #define TEST_SLOTS 320                /* потолок слотов стенда: полная таблица достижима за мгновение */
 static int g_cfd[TEST_SLOTS];          /* клиентский конец сокета соединения по номеру слота; -1 — нет */
 
+/* Доставка по петле TCP не синхронна: сегмент (данные, FIN, RST), отправленный одним концом, ядро
+ * передаёт другому из softirq, и на ядрах, где он уходит в ksoftirqd (WSL2 6.18 — так), другой конец
+ * видит его только после того, как поток отдал процессор. Прежде стенд читал сразу и принимал
+ * «ещё не дошло» за «не послано»: 13 провалов RST/FIN и «данные не ушли» были не ошибкой стека, а
+ * гонкой стенда. Поэтому наблюдения через TCP ждут события (ppoll — не poll: poll стенд считает за
+ * стеком) до срока: NET_END_MS — исхода (FIN/RST), NET_LAG_MS — следующей порции данных. У AF_UNIX
+ * доставка синхронна, ожидание не нужно. */
+#define NET_END_MS 2000
+#define NET_LAG_MS 50
+
+static int sock_is_inet(int fd) {
+    int dom = 0;
+    socklen_t l = sizeof dom;
+    return getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &l) == 0 && (dom == AF_INET || dom == AF_INET6);
+}
+
+/* Дождаться события ev на fd не дольше ms. 1 — событие есть. */
+static int net_wait(int fd, short ev, int ms) {
+    struct pollfd p = { .fd = fd, .events = ev };
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    return ppoll(&p, 1, &ts, NULL) > 0;
+}
+
+/* Дождаться, пока в сокете fd (сторона стека) станет не меньше n непрочитанных байт, — записанное
+ * клиентом дошло. */
+static void net_wait_pending(int fd, size_t n) {
+    if (!sock_is_inet(fd)) return;
+    for (int i = 0; i < NET_END_MS; i++) {
+        int q = 0;
+        if (ioctl(fd, FIONREAD, &q) == 0 && (size_t)q >= n) return;
+        struct timespec ts = { 0, 1000000L };
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        ppoll(&p, 0, &ts, NULL);
+    }
+}
+
 static int cli_pair_unix(int sv[2]) {
     return socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv);
 }
@@ -331,16 +367,19 @@ static void cli_put(struct conn *c, const void *d, size_t n) {
         else break;
     }
     if (off != n) check(0, "стенд: клиент не смог записать в свой сокет");
+    net_wait_pending(conn_cfd(c), n);
     c->carmed |= CRD;
 }
 
 /* Всё, что дошло до клиента (до cap байт). */
 static size_t cli_get(int fd, unsigned char *buf, size_t cap) {
     size_t n = 0;
+    int inet = sock_is_inet(fd);
     while (n < cap) {
         ssize_t r = read(fd, buf + n, cap - n);
         if (r > 0) n += (size_t)r;
         else if (r < 0 && errno == EINTR) continue;
+        else if (r < 0 && errno == EAGAIN && inet && net_wait(fd, POLLIN, NET_LAG_MS)) continue;
         else break;
     }
     return n;
@@ -364,6 +403,7 @@ static int cli_end(int fd) {
         if (r > 0) continue;
         if (r == 0) return 1;
         if (errno == EINTR) continue;
+        if (errno == EAGAIN && net_wait(fd, POLLIN | POLLRDHUP, NET_END_MS)) continue;
         return errno == ECONNRESET ? 2 : 0;
     }
 }
