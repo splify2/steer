@@ -49,6 +49,12 @@ check "выход в локальное устройство: spec.device_is_lan
 printf 'version: 2\noutputs:\n  a: { kind: direct, bogus_key: 1 }\nrules: []\n' > "$T/s6.yaml"
 check "лишний ключ: spec.unknown_key" "spec.unknown_key bogus_key" "$(js "$T/s6.yaml" | pj 'd["code"]+" "+d["args"]["1"]')"
 
+# Спека v1 (JSON schema: 1): отказ без своего слова — spec.v1_error, текст в подстановке 1.
+printf '{"schema": 1, "outputs": {"a": {"kind": "bogus"}}}\n' > "$T/v1.json"
+o="$(js "$T/v1.json")"
+check "спека v1: spec.v1_error, текст отказа в подстановке 1" "spec.v1_error yes" \
+    "$(printf '%s' "$o" | pj 'd["code"]+" "+("yes" if d["args"]["1"] and d["args"]["1"] in d["error"] else "no")')"
+
 # Нет файла: у отказа слова нет — JSON без code, error есть.
 o="$(STEER_ERR_JSON=1 "$BIN" apply --dry-run --spec "$T/нет.yaml" 2>&1 >/dev/null | tail -n 1)"
 check "нет файла спеки: слова нет, JSON без code" "no-code" "$(printf '%s' "$o" | pj '"no-code" if "code" not in d and d["error"] else "has-code"' 2>/dev/null || echo not-json)"
