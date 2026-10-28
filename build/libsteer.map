@@ -188,6 +188,7 @@ LIBSTEER_1 {
     registry_assign;
     rtnl_addrs6;
     rtnl_default6;
+    rtnl_default_devs;
     rtnl_main6_routes;
     rtnl_route6_backstop;
     rtnl_route_default_dev;
