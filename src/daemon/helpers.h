@@ -200,6 +200,10 @@ void helper_putenv(const struct helper *h);
  * steerd; модули он не ищет). */
 const char *helper_argv0(const char *exe, char *buf, size_t n);
 
+/* Дескриптор процесса (pidfd_open, ядро ≥ 5.3): POLLIN — процесс вышел, и не только у своих детей.
+ * -1 — ядро не умеет или процесса уже нет. */
+int pidfd_of(pid_t pid);
+
 /* Погасить всех: ordered=0 — SIGTERM всем сразу (supervise); 1 — по одному в обратном порядке
  * подъёма, дожидаясь выхода каждого (демон). Кто не вышел за свой срок — SIGKILL. Ждёт сам
  * (waitpid), цикл событий к этому моменту уже не крутится. */

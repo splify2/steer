@@ -463,7 +463,7 @@ const char *helper_argv0(const char *exe, char *buf, size_t n) {
 
 /* Дескриптор процесса (pidfd, ядро ≥ 5.3): ждать выхода можно poll без опроса waitpid. -1 — ядро не умеет или
  * процесса уже нет. */
-static int pidfd_of(pid_t pid) {
+int pidfd_of(pid_t pid) {
 #ifdef SYS_pidfd_open
     return (int)syscall(SYS_pidfd_open, pid, 0);
 #else

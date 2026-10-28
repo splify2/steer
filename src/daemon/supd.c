@@ -804,6 +804,7 @@ static int orphans_stop(const char *who) {
     if (!d) return 0;
     pid_t *pid = NULL;
     unsigned long long *st = NULL;
+    int *pfd = NULL;
     size_t n = 0, cap = 0;
     pid_t me = getpid();
     struct dirent *e;
@@ -819,11 +820,19 @@ static int orphans_stop(const char *who) {
             size_t nc = cap ? cap * 2 : 16;
             pid_t *np = realloc(pid, nc * sizeof(*np));
             unsigned long long *ns = realloc(st, nc * sizeof(*ns));
+            int *nf = realloc(pfd, nc * sizeof(*nf));
             if (np) pid = np;
             if (ns) st = ns;
-            if (!np || !ns) break;
+            if (nf) pfd = nf;
+            if (!np || !ns || !nf) break;
             cap = nc;
         }
+        /* pidfd — до сигнала и со сверкой времени старта после него: дескриптор держит именно этот
+         * процесс, и его выход будит poll ниже в тот же миг (шаг опроса в 50 мс копился на каждом
+         * старте после падения демона). */
+        int fd = pidfd_of((pid_t)p);
+        if (fd >= 0 && proc_start((pid_t)p) != started) { close(fd); continue; }
+        pfd[n] = fd;
         st[n] = started;
         pid[n++] = (pid_t)p;
         kill((pid_t)p, SIGTERM);
@@ -840,6 +849,9 @@ static int orphans_stop(const char *who) {
             if (proc_start(pid[i]) != st[i]) pid[i] = 0;
             else left++;
         }
+        /* У всех оставшихся есть pidfd — ждать их выхода poll, иначе прежний шаг опроса. */
+        int all_fd = 1;
+        for (size_t i = 0; i < n && all_fd; i++) if (pid[i] && pfd[i] < 0) all_fd = 0;
         if (!left) break;
         if (helpers_now_ms() >= due) {
             if (hard) break;
@@ -852,11 +864,28 @@ static int orphans_stop(const char *who) {
             hard = 1;
             due = helpers_now_ms() + 1000;
         }
+        long ms = due - helpers_now_ms();
+        if (ms < 1) ms = 1;
+        if (all_fd) {
+            struct pollfd *pf = calloc(left, sizeof(*pf));
+            size_t k = 0;
+            for (size_t i = 0; pf && i < n; i++)
+                if (pid[i]) { pf[k].fd = pfd[i]; pf[k].events = POLLIN; k++; }
+            int r = pf ? poll(pf, (nfds_t)k, ms > 1000 ? 1000 : (int)ms) : -1;
+            /* Вышел — помечаем сразу: устройство и порт свободны с выходом, а зомби, которого ещё не
+             * пожал новый родитель, /proc показывает с тем же временем старта. */
+            for (size_t i = 0, j = 0; r > 0 && i < n; i++)
+                if (pid[i]) { if (pf[j].revents) pid[i] = 0; j++; }
+            free(pf);
+            if (r >= 0) continue;
+        }
         struct timespec ts = { 0, 50000000L };
         nanosleep(&ts, NULL);
     }
+    for (size_t i = 0; i < n; i++) if (pfd[i] >= 0) close(pfd[i]);
     free(pid);
     free(st);
+    free(pfd);
     return (int)n;
 }
 
