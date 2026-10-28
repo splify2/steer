@@ -29,6 +29,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <poll.h>
 
 /* Хабу run_quiet нужен для `ip link` (hub_retune_mtu, hub_dev_up, cmd_xsteer_hub); в
  * src/lib/run.c его настоящая реализация, а здесь — ЗАПИСЬ вместо запуска: подъём устройства
@@ -141,9 +142,19 @@ static int wire_open(void) {
     return fd;
 }
 
-/* Взять следующий ушедший сегмент. -1 — не ушло ничего. */
+/* Взять следующий ушедший сегмент. -1 — не ушло ничего.
+ *
+ * ДОСТАВКА ПО ПЕТЛЕ НЕ МГНОВЕННА. send() по UDP на петле кладёт датаграмму в очередь приёма
+ * через отложенную обработку сети, и на ядре WSL2 6.18 она к следующему recv(MSG_DONTWAIT)
+ * ещё не доходит: стенд видел «не ушло ничего» на месте оповещения, а само оповещение читал
+ * следующий случай как чужой ответ (12 провалов разом). Поэтому ждём до WIRE_WAIT_MS; там,
+ * где ушло, ожидание кончается на первой датаграмме, и цену платят только проверки «не ушло
+ * ничего». */
+#define WIRE_WAIT_MS 300
 static uint8_t wire_buf[2048];
-static int wire_take(uint8_t **pay, size_t *pn) {
+static int wire_take_wait(uint8_t **pay, size_t *pn, int wait_ms) {
+    struct pollfd pf = { .fd = obs_fd, .events = POLLIN };
+    if (poll(&pf, 1, wait_ms) <= 0) return -1;
     ssize_t n = recv(obs_fd, wire_buf, sizeof(wire_buf), MSG_DONTWAIT);
     if (n < 20) return -1;
     size_t hl = (size_t)(wire_buf[12] >> 4) * 4;
@@ -153,8 +164,22 @@ static int wire_take(uint8_t **pay, size_t *pn) {
     return wire_buf[13];
 }
 
+static int wire_take(uint8_t **pay, size_t *pn) {
+    return wire_take_wait(pay, pn, WIRE_WAIT_MS);
+}
+
+/* Слить всё, что ещё в пути: опоздавшая датаграмма прошлого случая иначе пришла бы
+ * ответом следующему. */
+/* Дождаться, пока на соединении к прикрытию будет что читать (данные или FIN). Цикл воркера
+ * зовёт decoy_event по готовности из poll; стенд обязан так же, иначе на той же отложенной
+ * доставке по петле событие застаёт пустой сокет. */
+static void up_wait(const struct sess *s) {
+    struct pollfd pf = { .fd = s->up_fd, .events = POLLIN };
+    poll(&pf, 1, 1000);
+}
+
 static void wire_drain(void) {
-    while (wire_take(NULL, NULL) >= 0) {}
+    while (wire_take_wait(NULL, NULL, 20) >= 0) {}
 }
 
 /* ---- минимальный SYN с опцией MSS -------------------------------------------
@@ -188,7 +213,22 @@ static int syn_mss(const uint8_t *ip) {
 }
 
 int main(void) {
-    printf("== хаб: арифметика записи ==\n");
+    /* Таблица сессий выделяется под конфигурацию (hub_sess_table), как в cmd_xsteer_hub:
+     * стенду хватает её отрезка для одного воркера. */
+    printf("== хаб: таблица сессий по конфигурации ==\n");
+    {
+        /* 32 пира по XS_CONNS_MAX соединений на четырёх воркерах: прежняя постоянная таблица
+         * (128 мест, по 32 на воркера) занималась ими ровно, и переподключению места не было. */
+        int per = hub_sess_table(4, 32);
+        check("на воркера хватает соединений всех пиров дважды", 1,
+              per >= 32 * XS_CONNS_MAX * 2 / 4);
+        check("таблица — ровно воркеры на отрезок", (long)per * 4, (long)g_sess_n);
+        check("свободные места названы пустыми", -1, (long)g_sess[g_sess_n - 1].conn.fd);
+        free(g_sess);
+        free(g_tx_lock);
+    }
+    if (hub_sess_table(1, 1) < 2) { printf("нет таблицы сессий\n"); return 1; }
+    printf("\n== хаб: арифметика записи ==\n");
 
     /* ПРАВИЛО НАБОРА, дословно как в worker_loop: перед чтением очередного кадра цикл требует
      * off + 2 + XS_MTU_DEF + XS_TAG <= XS_MAX_RECORD, а прочитанный кадр может быть полным.
@@ -605,6 +645,7 @@ int main(void) {
             for (size_t i = 0; i < sizeof(big); i++) big[i] = (uint8_t)(i & 0xFF);
             check("  прикрытие ответило", (long)sizeof(big),
                   (long)send(up, big, sizeof(big), 0));
+            up_wait(s);
             decoy_event(&w, s, POLLIN, 1020);
             uint8_t *pay = NULL;
             size_t pn = 0, total = 0;
@@ -645,6 +686,7 @@ int main(void) {
          * ровно тот признак, ради устранения которого дорожка и заведена. */
         close(up);
         wire_drain();
+        up_wait(s);
         decoy_event(&w, s, POLLIN, 1040);
         {
             uint8_t *pay = NULL;
