@@ -356,10 +356,62 @@ void l4_describe(const struct l4match *m, char *dst, size_t n) {
  * нет, свой счётчик теряет — это и правильно, его больше не существует.
  */
 /* Счётчики растут по числу каналов в ядре (раньше — массивы на 64: у 65-го канала счётчик при
- * каждом apply обнулялся МОЛЧА, и «объём канала» врал). */
-struct ctr { char name[32]; unsigned long pkts, bytes; };
-static struct ctr *g_ctr_up, *g_ctr_down;
-static size_t g_ctr_up_n, g_ctr_down_n, g_ctr_up_cap, g_ctr_down_cap;
+ * каждом apply обнулялся МОЛЧА, и «объём канала» врал).
+ *
+ * Поиск по имени — через хеш-таблицу (открытая адресация, индексы в массиве записей), а не
+ * перебором: правило читается на каждый status, и при тысячах каналов перебор давал квадрат —
+ * сложение двойников в ctr_take и counter_find на каждый канал ответа. Имя — копия целиком:
+ * прежнее поле на 32 знака обрезало длинное имя, и такой канал не находился никогда. */
+struct ctr { char *name; unsigned long pkts, bytes; };
+struct ctrtab {
+    struct ctr *v;
+    size_t n, cap;
+    uint32_t *slot;     /* индекс записи + 1; 0 — пусто */
+    size_t slots;       /* степень двойки, не меньше 2 * cap */
+};
+static struct ctrtab g_ctr[2];   /* [0] — отданное, [1] — скачанное */
+
+static uint32_t ctr_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *q = (const unsigned char *)s; *q; q++) h = (h ^ *q) * 16777619u;
+    return h;
+}
+
+static struct ctr *ctr_get(const struct ctrtab *t, const char *name, size_t *slot_out) {
+    if (!t->slots) { if (slot_out) *slot_out = (size_t)-1; return NULL; }
+    size_t m = t->slots - 1, i = ctr_hash(name) & m;
+    for (; t->slot[i]; i = (i + 1) & m)
+        if (!strcmp(t->v[t->slot[i] - 1].name, name)) return &t->v[t->slot[i] - 1];
+    if (slot_out) *slot_out = i;
+    return NULL;
+}
+
+static int ctr_grow(struct ctrtab *t) {
+    size_t nc = t->cap ? t->cap * 2 : 32;
+    struct ctr *nv = realloc(t->v, nc * sizeof(*nv));
+    if (!nv) return -1;
+    t->v = nv;
+    t->cap = nc;
+    size_t ns = 4;
+    while (ns < 2 * nc) ns *= 2;
+    uint32_t *sl = calloc(ns, sizeof(*sl));
+    if (!sl) return -1;
+    free(t->slot);
+    t->slot = sl;
+    t->slots = ns;
+    for (size_t k = 0; k < t->n; k++) {
+        size_t i = ctr_hash(t->v[k].name) & (ns - 1);
+        while (sl[i]) i = (i + 1) & (ns - 1);
+        sl[i] = (uint32_t)(k + 1);
+    }
+    return 0;
+}
+
+static void ctr_reset(struct ctrtab *t) {
+    for (size_t k = 0; k < t->n; k++) free(t->v[k].name);
+    t->n = 0;
+    if (t->slot) memset(t->slot, 0, t->slots * sizeof(*t->slot));
+}
 
 /* Чтение счётчиков — ОДНО на apply и status. Раздельные разошлись бы в понимании одного и того
  * же, а расхождение здесь означало бы, что перенесённое и показанное — разные числа.
@@ -379,36 +431,30 @@ static void ctr_take(void *arg, const char *comment, int has_counter,
     else return;
     unsigned long p = has_counter ? (unsigned long)packets : 0;
     unsigned long b = has_counter ? (unsigned long)bytes : 0;
-    struct ctr **arrp = down ? &g_ctr_down : &g_ctr_up;
-    struct ctr *arr = *arrp;
-    size_t *n = down ? &g_ctr_down_n : &g_ctr_up_n;
-    size_t *cap = down ? &g_ctr_down_cap : &g_ctr_up_cap;
+    struct ctrtab *t = &g_ctr[down];
     /* Одно имя — одно число. У правила группы бывает v6-двойник под тем же именем
      * (docs/architecture.md, «4б»): объём канала — их сумма. */
-    size_t k = 0;
-    while (k < *n && strcmp(arr[k].name, c) != 0) k++;
-    if (k < *n) {
-        arr[k].pkts += p;
-        arr[k].bytes += b;
+    size_t slot;
+    struct ctr *e = ctr_get(t, c, &slot);
+    if (e) {
+        e->pkts += p;
+        e->bytes += b;
         return;
     }
-    if (*n == *cap) {
-        size_t nc = *cap ? *cap * 2 : 32;
-        struct ctr *na = realloc(arr, nc * sizeof(*na));
-        if (!na) return;                /* нет памяти — счётчик этого канала не переносится */
-        *arrp = arr = na;
-        *cap = nc;
+    if (t->n == t->cap || slot == (size_t)-1) {
+        if (ctr_grow(t) != 0) return;   /* нет памяти — счётчик этого канала не переносится */
+        ctr_get(t, c, &slot);
     }
-    {
-        snprintf(arr[*n].name, sizeof(arr[*n].name), "%s", c);
-        arr[*n].pkts = p;
-        arr[*n].bytes = b;
-        (*n)++;
-    }
+    char *nm = strdup(c);
+    if (!nm) return;
+    t->v[t->n] = (struct ctr){ nm, p, b };
+    t->slot[slot] = (uint32_t)(t->n + 1);
+    t->n++;
 }
 
 void counters_load(void) {
-    g_ctr_up_n = g_ctr_down_n = 0;
+    ctr_reset(&g_ctr[0]);
+    ctr_reset(&g_ctr[1]);
     /* Все цепочки одним дампом: счётчики, снятые в разные моменты, дали бы «отдано больше,
      * чем скачано» на глазах у человека.
      *
@@ -434,11 +480,11 @@ void counters_load(void) {
 
 /* Найти прежнее значение. -1 — канала в ядре не было (первый apply или новый канал). */
 int counter_find(const char *name, int down, unsigned long *p, unsigned long *b) {
-    const struct ctr *arr = down ? g_ctr_down : g_ctr_up;
-    size_t n = down ? g_ctr_down_n : g_ctr_up_n;
-    for (size_t i = 0; i < n; i++)
-        if (!strcmp(arr[i].name, name)) { *p = arr[i].pkts; *b = arr[i].bytes; return 0; }
-    return -1;
+    const struct ctr *e = ctr_get(&g_ctr[down ? 1 : 0], name, NULL);
+    if (!e) return -1;
+    *p = e->pkts;
+    *b = e->bytes;
+    return 0;
 }
 
 /* `counter` с прежним значением, если оно есть (нули печатник пишет коротким `counter`). */

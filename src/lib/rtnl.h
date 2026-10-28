@@ -76,6 +76,8 @@ int rtnl_default6(void);
 /* Устройства маршрутов по умолчанию таблицы main, IPv4 и IPv6 (`ip route show default`, `ip -6 route
  * show default`): cb — на каждый такой маршрут с именем устройства (одно имя может прийти дважды).
  * Набор @wan_dev плагинов (steer-api 1.2, 5.3). 0 — спросили; -1 — спросить не вышло. */
+/* Есть ли в таблице маршрут по умолчанию IPv4 любого вида: 1 — есть, 0 — нет, -1 — netlink отказал. */
+int rtnl_table_has_default(int table);
 int rtnl_default_devs(void (*cb)(const char *dev, void *ctx), void *ctx);
 
 /* Через какое устройство ядро отправит пакет к dst — `ip route get dst`, поле dev (с учётом

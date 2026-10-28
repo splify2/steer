@@ -500,12 +500,29 @@ void status_answer(const struct spec *sp, const struct groups *gr, FILE *out) {
 
     char snap[256], tmp[288];
     status_snap_path(snap, sizeof snap);
-    snprintf(tmp, sizeof tmp, "%s.new", snap);
-    mkdir(steer_state_dir(), 0755);
-    FILE *f = fopen(tmp, "w");
-    if (f) {
-        int ok = fwrite(mem, 1, n, f) == n;
-        if (fclose(f) != 0 || !ok || rename(tmp, snap) != 0) unlink(tmp);
+    /* Снимок пишется, только когда ответ ИЗМЕНИЛСЯ. Демон отвечает на status каждые несколько
+     * секунд (панель опрашивает постоянно), и прежде каждый ответ был записью файла и rename — на
+     * пустом месте, если ничего не менялось (выходы те же, трафика нет). Сравнивается всё, кроме
+     * `at` (момент сборки — первое поле): изменилось что-то, кроме него, — пишем сразу, так что
+     * `status --fast` не теряет свежести данных. Файл исчез (почищен каталог состояния) — пишем. */
+    static uint64_t last_h;
+    static char last_snap[256];
+    const char *body = strstr(mem, ",\"features\"");
+    if (!body) body = mem;
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char *q = (const unsigned char *)body; q < (const unsigned char *)mem + n; q++)
+        h = (h ^ *q) * 1099511628211ull;
+    struct stat sst;
+    int same = h == last_h && !strcmp(last_snap, snap) && stat(snap, &sst) == 0;
+    if (!same) {
+        snprintf(tmp, sizeof tmp, "%s.new", snap);
+        mkdir(steer_state_dir(), 0755);
+        FILE *f = fopen(tmp, "w");
+        if (f) {
+            int ok = fwrite(mem, 1, n, f) == n;
+            if (fclose(f) != 0 || !ok || rename(tmp, snap) != 0) unlink(tmp);
+            else { last_h = h; snprintf(last_snap, sizeof last_snap, "%s", snap); }
+        }
     }
     fwrite(mem, 1, n, out);
     free(mem);

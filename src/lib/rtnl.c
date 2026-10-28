@@ -499,6 +499,35 @@ int rtnl_default_devs(void (*cb)(const char *dev, void *ctx), void *ctx) {
     return rtnl_talk(buf, msg_end(&b, nh), defdev_cb, &c) == 0 ? 0 : -1;
 }
 
+/* Есть ли в таблице маршрут по умолчанию IPv4 любого вида (устройство, blackhole, prohibit,
+ * unreachable) — то, что печатает `ip -4 route show table N` строкой с «default». */
+struct tdef_ctx { uint32_t table; int found; };
+
+static void tdef_cb(const struct nlmsghdr *h, void *ctx) {
+    struct tdef_ctx *c = ctx;
+    if (h->nlmsg_type != RTM_NEWROUTE || c->found) return;
+    const struct rtmsg *rt = NLMSG_DATA(h);
+    size_t hl = NLMSG_ALIGN(sizeof(*rt));
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl || rt->rtm_family != AF_INET) return;
+    if ((rt->rtm_flags & RTM_F_CLONED) || rt->rtm_dst_len != 0) return;
+    const struct rtattr *tb[RTA_MAX + 1];
+    attrs_parse((const uint8_t *)rt + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, RTA_MAX);
+    uint32_t table = tb[RTA_TABLE] ? rta_u32(tb[RTA_TABLE]) : rt->rtm_table;
+    if (table == c->table) c->found = 1;
+}
+
+int rtnl_table_has_default(int table) {
+    uint8_t buf[64];
+    struct nlbuf b;
+    struct rtmsg rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rtm_family = AF_INET;
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
+    struct tdef_ctx c = { (uint32_t)table, 0 };
+    if (rtnl_talk(buf, msg_end(&b, nh), tdef_cb, &c) != 0) return -1;
+    return c.found;
+}
+
 struct route_dev_ctx { char *dev; size_t n; };
 
 static void route_dev_cb(const struct nlmsghdr *h, void *ctx) {

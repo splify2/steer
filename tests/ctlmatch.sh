@@ -190,6 +190,15 @@ check "status: тот же JSON, что у подкоманды (без врем
     "$(printf '%s' "$r" | j stdout | sed 's/"at":[0-9]*,//')"
 r="$(ctl status fast)"
 check "status fast: запомненный ответ" "1" "$(printf '%s' "$r" | j stdout | grep -c '"cached":true')"
+# Снимок переписывается, только когда ответ изменился (кроме `at`): второй status с тем же
+# содержимым файл не трогает — тот же inode (запись идёт через rename, новый файл — новый inode);
+# исчезнувший снимок пишется заново.
+ctl status >/dev/null
+ino1="$(stat -c %i "$tmp/state/status.json" 2>/dev/null)"
+sleep 1; ctl status >/dev/null
+check "status: неизменный ответ не переписывает снимок" "$ino1" "$(stat -c %i "$tmp/state/status.json" 2>/dev/null)"
+rm -f "$tmp/state/status.json"; ctl status >/dev/null
+check "status: исчезнувший снимок пишется заново" "1" "$([ -s "$tmp/state/status.json" ] && echo 1)"
 
 "$BIN" diag --spec "$tmp/spec.json" --state-dir "$tmp/state" >/dev/null 2>&1; dcode=$?
 r="$(ctl diag)"
