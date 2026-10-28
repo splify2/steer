@@ -800,7 +800,7 @@ static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const st
     for (size_t i = 0; i < gr->n; i++) {
         const struct group *g = &gr->g[i];
         struct output *o = out_by_name(sp, g->out);
-        if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
+        if (!o) return err_setf(e, "compile.group_no_output", "channel group %s points at a missing output", g->name);
         /* Каналы на сам телефон — на хуке output, см. nft_emit_output_mark. */
         if (group_is_local(g)) continue;
         if (g->l4 && g->l4->quic_block && mh != MH_INGRESS) quic_reject(c, sp, g);
@@ -1097,7 +1097,7 @@ static int build_mark(struct nft_table *t, const struct spec *sp, const struct g
                       struct err *e) {
     /* Устройства ingress — не больше устройств спеки, массив по их числу (раньше 32 на стеке). */
     const char **devs = malloc((sp->lan_dev_n ? sp->lan_dev_n : 1) * sizeof(*devs));
-    if (!devs) return err_set(e, "%s", "недостаточно памяти для разметки ingress");
+    if (!devs) return err_setf(e, "compile.no_memory", "%s", "недостаточно памяти для разметки ingress");
     size_t nd = ingress_devs(sp, gr, devs);
     int rc = 0;
     if (nd) {
@@ -1920,7 +1920,7 @@ static int local_who(struct nft_rule *r, const struct group *g, struct err *e) {
     for (size_t i = 0; i < g->from_n; i++) {
         unsigned lo, hi;
         if (from_uid_range(g->from[i], &lo, &hi) != 0)
-            return err_set(e, "группа %s: негодный UID", g->name);   /* спека это уже отвергла */
+            return err_setf(e, "compile.group_bad_uid", "группа %s: негодный UID", g->name);   /* спека это уже отвергла */
         if (lo == hi) sb_add(&b, "%s%u", i ? ", " : "", lo);
         else sb_add(&b, "%s%u-%u", i ? ", " : "", lo, hi);
     }
@@ -1951,7 +1951,7 @@ static int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp,
         const struct group *g = &gr->g[i];
         if (!group_is_local(g)) continue;
         struct output *o = out_by_name(sp, g->out);
-        if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
+        if (!o) return err_setf(e, "compile.group_no_output", "channel group %s points at a missing output", g->name);
         if (g->all && out_needs_mark(o) && (!out_v6_ok(o) || (g->famreq && !(g->fam & 2)))) {
             /* С тем же сужением по протоколу и портам, что и канал: канал «UDP 50000-65535»
              * не вправе отнимать у приложения весь IPv6. Своя сеть (петля, link-local, ULA,
@@ -2271,7 +2271,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
      * адресов нет, и подмена молча не случилась бы. */
     for (size_t i = 0; i < gr->n; i++)
         if (gr->g[i].domains && gr->g[i].realip && gr->g[i].l4 && gr->g[i].l4->override_port)
-            return err_set(e, "группа %s: override_port у списка — только с dns.mode fakeip, а у "
+            return err_setf(e, "compile.override_port_realip", "группа %s: override_port у списка — только с dns.mode fakeip, а у "
                            "канала realip", gr->g[i].name);
     struct nft_table *t = ir_table_add(rs, NFT_FAM_INET, nft_table());
     build_group_sets(t, gr);
@@ -2279,7 +2279,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     if (build_mark(t, sp, gr, e) != 0) return -1;
     /* Группы balance: цепочки, карты и цепочки меток (compile/balance.c). Без таких групп — ничего,
      * и текст прежний до байта. */
-    if (nft_emit_balance(t, sp, gr) != 0) return err_set(e, "out of memory building the ruleset", NULL);
+    if (nft_emit_balance(t, sp, gr) != 0) return err_setf(e, "compile.no_memory", "out of memory building the ruleset");
     if (plat()->local_channels && has_local(gr) && nft_emit_output_mark(rs, sp, gr, e) != 0)
         return -1;
     build_failopen(t, sp);
@@ -2307,7 +2307,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
         if (plat()->local_channels && has_local_domains(gr)) nft_emit_output_dns(rs, sp, gr);
         if (sp->traceroute_hops) build_traceroute_raw(t);
     }
-    if (rs->oom) return err_set(e, "out of memory building the ruleset", NULL);
+    if (rs->oom) return err_setf(e, "compile.no_memory", "out of memory building the ruleset");
     return 0;
 }
 
@@ -2317,6 +2317,7 @@ int generate(const struct spec *sp, const struct groups *gr, FILE *f, struct err
     struct nft_rs rs;
     nft_rs_init(&rs);
     int rc = nft_build(&rs, sp, gr, e);
+    if (rc != 0) err_fallback(e, "compile.error");     /* отказ без своего слова — текст в подстановке 1 */
     if (rc == 0) nft_print(&rs, f);
     nft_rs_free(&rs);
     return rc;

@@ -267,17 +267,15 @@ static int hook_exec(const struct plugin *pl, const struct plugin_prog *p, const
     char why[256];
     size_t n = p->argc + 2;
     char **av = calloc(n, sizeof(*av));
-    if (!av) return err_set(e, "%s", "недостаточно памяти для запуска хука");
+    if (!av) return err_setc(e, "spec.no_memory", "%s", "недостаточно памяти для запуска хука");
     size_t k = 0;
     av[k++] = p->prog;
     for (size_t i = 0; i < p->argc; i++) {
         av[k] = plugin_subst(pl, out_name, p->argv[i], why, sizeof(why));
         if (!av[k]) {
-            char m[400];
-            snprintf(m, sizeof(m), "плагин %s: %s", pl->id, why);
             for (size_t j = 1; j < k; j++) free(av[j]);
             free(av);
-            return err_set(e, "%s", m);
+            return err_setf(e, "plugprep.hook_args", "плагин %s: %s", pl->id, why);
         }
         k++;
     }
@@ -286,13 +284,13 @@ static int hook_exec(const struct plugin *pl, const struct plugin_prog *p, const
     if (pipe(pin) != 0 || pipe(pout) != 0 || pipe(perr) != 0) {
         for (size_t j = 1; j < k; j++) free(av[j]);
         free(av);
-        return err_set(e, "%s", "не создать трубы для хука");
+        return err_setc(e, "plugprep.hook_pipe", "%s", "не создать трубы для хука");
     }
     pid_t pid = fork();
     if (pid < 0) {
         for (size_t j = 1; j < k; j++) free(av[j]);
         free(av);
-        return err_set(e, "%s", "не запустить хук: fork отказал");
+        return err_setc(e, "plugprep.hook_fork", "%s", "не запустить хук: fork отказал");
     }
     if (pid == 0) {
         dup2(pin[0], 0);
@@ -363,7 +361,7 @@ static int hook_exec(const struct plugin *pl, const struct plugin_prog *p, const
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
     r->code = WIFEXITED(st) ? WEXITSTATUS(st) : (WIFSIGNALED(st) ? -WTERMSIG(st) : -1);
-    if (r->out.oom || r->err.oom) return err_set(e, "%s", "недостаточно памяти для ответа хука");
+    if (r->out.oom || r->err.oom) return err_setc(e, "spec.no_memory", "%s", "недостаточно памяти для ответа хука");
     return 0;
 }
 
@@ -400,9 +398,9 @@ static int hook_run(const struct plugin *pl, const struct plugin_prog *p, const 
     if (hook_exec(pl, p, out_name, in, p->timeout_s ? p->timeout_s : dflt_timeout, &r, e) != 0) return -1;
     char m[600];
     if (r.timeout) {
-        snprintf(m, sizeof(m), "плагин %s: %s не уложился в %d с", pl->id, label, p->timeout_s ? p->timeout_s : dflt_timeout);
+        int tmo = p->timeout_s ? p->timeout_s : dflt_timeout;
         hrun_free(&r);
-        return err_set(e, "%s", m);
+        return err_setf(e, "plugprep.hook_timeout", "плагин %s: %s не уложился в %d с", pl->id, label, tmo);
     }
     if (r.code == 0) {
         *stdout_txt = r.out.p ? r.out.p : strdup("");
@@ -422,17 +420,20 @@ static int hook_run(const struct plugin *pl, const struct plugin_prog *p, const 
         hrun_free(&r);
         return 2;
     }
-    if (r.code == 3) {
-        snprintf(m, sizeof(m), "плагин %s: %s не готов (код 3) — повторите позже", pl->id, label);
-    } else if (r.code == 127) {
+    (void)m;
+    int rcode = r.code;
+    if (rcode == 3) {
+        hrun_free(&r);
+        return err_setf(e, "plugprep.hook_not_ready", "плагин %s: %s не готов (код 3) — повторите позже", pl->id, label);
+    } else if (rcode == 127) {
         char *l = last_line(r.err.p ? r.err.p : "");
-        snprintf(m, sizeof(m), "плагин %s: %s не запустился: %s", pl->id, label, l ? l : "");
+        hrun_free(&r);
+        err_setf(e, "plugprep.hook_not_started", "плагин %s: %s не запустился: %s", pl->id, label, l ? l : "");
         free(l);
-    } else {
-        snprintf(m, sizeof(m), "плагин %s: %s упал (код %d)", pl->id, label, r.code);
+        return -1;
     }
     hrun_free(&r);
-    return err_set(e, "%s", m);
+    return err_setf(e, "plugprep.hook_failed", "плагин %s: %s упал (код %d)", pl->id, label, rcode);
 }
 
 /* ---- подготовка ---------------------------------------------------------------------------- */
@@ -626,14 +627,14 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
     if (rec && rec->kind == YN_MAP && kind_name_of(rec, kname, sizeof(kname)) == 0) pk = plugin_kind_find(kname);
     struct err *e = p->e;
     if (!pk || (!pk->check.prog && !pk->expand.prog && !pk->res_ports && !pk->res_queues))
-        return member_put(p, name, rec, NULL, NULL) == 0 ? 0 : err_set(e, "%s", "недостаточно памяти");
+        return member_put(p, name, rec, NULL, NULL) == 0 ? 0 : err_setc(e, "spec.no_memory", "%s", "недостаточно памяти");
     const struct plugin *pl = pk->owner;
     /* Ключи вида — по схеме (как в разборе спеки). */
     size_t kc = 0;
     for (size_t i = 0; i < ynode_len(rec); i++) if (!is_common_key(ynode_key_at(rec, i)->str)) kc++;
     struct ynode km = { .kind = YN_MAP };
     km.items = calloc(2 * (kc ? kc : 1), sizeof(*km.items));
-    if (!km.items) return err_set(e, "%s", "недостаточно памяти");
+    if (!km.items) return err_setc(e, "spec.no_memory", "%s", "недостаточно памяти");
     for (size_t i = 0; i < ynode_len(rec); i++) {
         if (is_common_key(ynode_key_at(rec, i)->str)) continue;
         km.items[2 * km.len] = (struct ynode *)ynode_key_at(rec, i);
@@ -658,7 +659,7 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
     char *out_txt = NULL, *why = NULL;
     if (pk->check.prog) {
         char *in = hook_input(p, name, kname, kjson, rec);
-        if (!in) { free(kjson); return err_set(e, "%s", "недостаточно памяти"); }
+        if (!in) { free(kjson); return err_setc(e, "spec.no_memory", "%s", "недостаточно памяти"); }
         int hr = hook_run(pl, &pk->check, "check", name, 10, in, &out_txt, &why, e);
         free(in);
         if (hr == 2) {
@@ -681,30 +682,27 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
     }
     if (!pk->expand.prog) {
         free(kjson);
-        return member_put(p, name, rec, NULL, NULL) == 0 ? 0 : err_set(e, "%s", "недостаточно памяти");
+        return member_put(p, name, rec, NULL, NULL) == 0 ? 0 : err_setc(e, "spec.no_memory", "%s", "недостаточно памяти");
     }
     /* expand: self и новые выходы (steer-api.md, 3.3). */
     char *in = hook_input(p, name, kname, kjson, rec);
-    if (!in) { free(kjson); return err_set(e, "%s", "недостаточно памяти"); }
+    if (!in) { free(kjson); return err_setc(e, "spec.no_memory", "%s", "недостаточно памяти"); }
     int hr = hook_run(pl, &pk->expand, "expand", name, 10, in, &out_txt, &why, e);
     free(in);
     if (hr == 2) {
-        char m[900];
-        snprintf(m, sizeof(m), "плагин %s: разворот %s — %s", pl->id, name, why);
+        err_setf(e, "plugprep.expand_refused", "плагин %s: разворот %s — %s", pl->id, name, why);
         free(why);
         free(kjson);
-        return err_set(e, "%s", m);
+        return -1;
     }
     if (hr != 0) { free(kjson); return -1; }
     struct err pe;
     memset(&pe, 0, sizeof(pe));
     struct ydoc *fd = ydoc_parse_buf(out_txt, strlen(out_txt), "ответ expand", &pe);
     if (!fd) {
-        char m[900];
-        snprintf(m, sizeof(m), "плагин %s: разворот %s — ответ не разобран: %s", pl->id, name, pe.msg);
         free(out_txt);
         free(kjson);
-        return err_set(e, "%s", m);
+        return err_setf(e, "plugprep.expand_unreadable", "плагин %s: разворот %s — ответ не разобран: %s", pl->id, name, pe.msg);
     }
     free(out_txt);
     const struct ynode *fr = ydoc_root(fd);
@@ -712,20 +710,17 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
     const struct ynode *hn = ynode_get(fr, "helper");
     int helper = 0;
     if (hn) ynode_bool(hn, &helper);
-    char msg[900];
     if (!self || self->kind != YN_MAP) {
-        snprintf(msg, sizeof(msg), "плагин %s: разворот %s — в ответе нет self", pl->id, name);
         ydoc_free(fd); free(kjson);
-        return err_set(e, "%s", msg);
+        return err_setf(e, "plugprep.expand_no_self", "плагин %s: разворот %s — в ответе нет self", pl->id, name);
     }
     {
         char sk[96];
         if (kind_name_of(self, sk, sizeof(sk)) == 0 && plugin_kind_find(sk) &&
             plugin_kind_find(sk)->expand.prog) {
-            snprintf(msg, sizeof(msg), "плагин %s: разворот %s — self сам вида с разворотом (%s): разворот однократный",
-                     pl->id, name, sk);
             ydoc_free(fd); free(kjson);
-            return err_set(e, "%s", msg);
+            return err_setf(e, "plugprep.expand_self_again",
+                            "плагин %s: разворот %s — self сам вида с разворотом (%s): разворот однократный", pl->id, name, sk);
         }
     }
     /* Имена новых выходов: не заняты человеком и друг другом. */
@@ -733,21 +728,18 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
         const char *nn = ynode_key_at(outs, i)->str;
         char w2[300];
         if (!fragment_name_ok(nn, w2, sizeof(w2))) {
-            snprintf(msg, sizeof(msg), "плагин %s: разворот %s — outputs.%s: %s", pl->id, name, nn, w2);
             ydoc_free(fd); free(kjson);
-            return err_set(e, "%s", msg);
+            return err_setf(e, "plugprep.expand_bad_name", "плагин %s: разворот %s — outputs.%s: %s", pl->id, name, nn, w2);
         }
         for (size_t k = 0; k < p->names_n; k++)
             if (!strcmp(p->names[k], nn)) {
-                snprintf(msg, sizeof(msg), "плагин %s: разворот %s — outputs.%s: такой выход уже есть в спеке", pl->id, name, nn);
                 ydoc_free(fd); free(kjson);
-                return err_set(e, "%s", msg);
+                return err_setf(e, "plugprep.expand_name_taken", "плагин %s: разворот %s — outputs.%s: такой выход уже есть в спеке", pl->id, name, nn);
             }
         for (size_t k = 0; k < p->made_n; k++)
             if (!strcmp(p->made[k].name, nn)) {
-                snprintf(msg, sizeof(msg), "плагин %s: разворот %s — outputs.%s: уже заведён плагином %s", pl->id, name, nn, p->made[k].plugin);
                 ydoc_free(fd); free(kjson);
-                return err_set(e, "%s", msg);
+                return err_setf(e, "plugprep.expand_name_made", "плагин %s: разворот %s — outputs.%s: уже заведён плагином %s", pl->id, name, nn, p->made[k].plugin);
             }
     }
     /* self — выход под прежним именем; с помощником — помечен владельцем (помощник вида ведёт
@@ -755,7 +747,7 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
     /* Владелец self с помощником несёт и вид с ключами, как их получил разворот: {conf} помощника
      * развёрнутого выхода говорит ему вид плагина и его ключи (steer-api.md, 1.4), а не «group». */
     char *oj_self = helper ? owner_self_json(pl->id, name, pk->name, kjson) : NULL;
-    if (member_put(p, name, self, oj_self, NULL) != 0) { free(oj_self); ydoc_free(fd); free(kjson); return err_set(e, "%s", "недостаточно памяти"); }
+    if (member_put(p, name, self, oj_self, NULL) != 0) { free(oj_self); ydoc_free(fd); free(kjson); return err_setc(e, "spec.no_memory", "%s", "недостаточно памяти"); }
     free(oj_self);
     if (p->rep_expand.n) sb_str(&p->rep_expand, ",");
     sb_printf(&p->rep_expand, "{\"id\":");
@@ -769,7 +761,7 @@ static int prep_output(struct prep *p, const struct ynode *kn, const struct ynod
         if (!oj || member_put(p, nn, ynode_val_at(outs, i), oj, NULL) != 0 || prep_made(p, nn, pl->id, name) != 0) {
             free(oj);
             ydoc_free(fd); free(kjson);
-            return err_set(e, "%s", "недостаточно памяти");
+            return err_setc(e, "spec.no_memory", "%s", "недостаточно памяти");
         }
         free(oj);
         if (i) sb_str(&p->rep_expand, ",");
@@ -945,11 +937,10 @@ static int trial_error(struct prep *p, struct err *e, const char *msg) {
         const char *f = strstr(m, pat);
         if (f && (f[pl] == ':' || f[pl] == ' ' || f[pl] == '.' || !f[pl]) && pl > best) { best = pl; bi = i; }
     }
+    (void)out;
     if (bi < p->made_n)
-        snprintf(out, sizeof(out), "плагин %s: разворот %s — %s", p->made[bi].plugin, p->made[bi].from, m);
-    else
-        snprintf(out, sizeof(out), "подготовленная спека не разобрана: %s", m);
-    return err_set(e, "%s", out);
+        return err_setf(e, "plugprep.expand_invalid", "плагин %s: разворот %s — %s", p->made[bi].plugin, p->made[bi].from, m);
+    return err_setf(e, "plugprep.not_parsed", "подготовленная спека не разобрана: %s", m);
 }
 
 static void prune_old(const char *dir, const char *keep_key) {
@@ -967,7 +958,16 @@ static void prune_old(const char *dir, const char *keep_key) {
     closedir(d);
 }
 
+static int spec_prepare_inner(const char *path, struct err *e);
+
+/* Отказ без своего слова (из разбора, развёрнутого в подготовке, или редкий) — plugprep.error с текстом. */
 int spec_prepare(const char *path, struct err *e) {
+    int rc = spec_prepare_inner(path, e);
+    if (rc != 0) err_fallback(e, "plugprep.error");
+    return rc;
+}
+
+static int spec_prepare_inner(const char *path, struct err *e) {
     if (!needs_prepare()) return 0;
     char *human = NULL;
     size_t hn = 0;
@@ -981,7 +981,7 @@ int spec_prepare(const char *path, struct err *e) {
      * выхода) называются настоящими строкой и столбцом, а не «подготовленная спека не разобрана». */
     {
         struct spec *hs = calloc(1, sizeof(*hs));
-        if (!hs) { free(human); return err_set(e, "%s", "недостаточно памяти для подготовки"); }
+        if (!hs) { free(human); return err_setc(e, "spec.no_memory", "%s", "недостаточно памяти для подготовки"); }
         int hr = load_spec_mode(path, hs, e, LOAD_HUMAN);
         spec_release(hs);
         free(hs);
@@ -1005,7 +1005,7 @@ int spec_prepare(const char *path, struct err *e) {
     char *text = NULL;
     const struct ynode *outs = ynode_get(root, "outputs");
     p.names = calloc(outs ? ynode_len(outs) + 1 : 1, sizeof(*p.names));
-    if (!p.names) { err_set(e, "%s", "недостаточно памяти для подготовки"); goto done; }
+    if (!p.names) { err_setc(e, "spec.no_memory", "%s", "недостаточно памяти для подготовки"); goto done; }
     for (size_t i = 0; outs && outs->kind == YN_MAP && i < ynode_len(outs); i++)
         p.names[p.names_n++] = ynode_key_at(outs, i)->str;
     /* Владельца выхода, правила, списка и клиента пишет только плагин: в спеке человека `owner` — отказ,
@@ -1036,7 +1036,7 @@ int spec_prepare(const char *path, struct err *e) {
             }
         }
     }
-    if (pal_load(&p.al) != 0) { err_set(e, "%s", "недостаточно памяти для подготовки"); goto done; }
+    if (pal_load(&p.al) != 0) { err_setc(e, "spec.no_memory", "%s", "недостаточно памяти для подготовки"); goto done; }
     for (size_t i = 0; i < plugin_n(); i++) {
         const struct plugin *pl = plugin_at(i);
         if (pl->enabled && (pl->res_ports || pl->res_queues || pl->res_marks) &&
@@ -1061,24 +1061,22 @@ int spec_prepare(const char *path, struct err *e) {
         } else plugin_node_json(&full, ynode_val_at(root, i));
     }
     sb_str(&full, "\n}\n");
-    if (full.oom) { free(full.p); err_set(e, "%s", "недостаточно памяти для подготовки"); goto done; }
+    if (full.oom) { free(full.p); err_setc(e, "spec.no_memory", "%s", "недостаточно памяти для подготовки"); goto done; }
     text = full.p;
 
     /* pre_apply: каждый плагин видит результат предыдущего. */
     size_t np = plugin_n();
     const struct plugin **order = calloc(np ? np : 1, sizeof(*order));
-    if (!order) { err_set(e, "%s", "недостаточно памяти для подготовки"); goto done; }
+    if (!order) { err_setc(e, "spec.no_memory", "%s", "недостаточно памяти для подготовки"); goto done; }
     size_t on = pre_order(order, np);
     for (size_t i = 0; i < on; i++) {
         const struct plugin *pl = order[i];
         char *out_txt = NULL, *why = NULL;
         int hr = hook_run(pl, &pl->pre_apply, "pre_apply", NULL, 30, text, &out_txt, &why, e);
         if (hr == 2) {
-            char m[900];
-            snprintf(m, sizeof(m), "плагин %s: %s", pl->id, why);
+            err_setf(e, "plugprep.pre_apply_refused", "плагин %s: %s", pl->id, why);
             free(why);
             free(order);
-            err_set(e, "%s", m);
             goto done;
         }
         if (hr != 0) { free(order); goto done; }
@@ -1088,12 +1086,10 @@ int spec_prepare(const char *path, struct err *e) {
         struct ydoc *od = ydoc_parse_buf(text, strlen(text), "спека", &xe);
         const struct ynode *nr = nd ? ydoc_root(nd) : NULL;
         if (!nd || !od || !nr || nr->kind != YN_MAP) {
-            char m[900];
-            snprintf(m, sizeof(m), "плагин %s: pre_apply вернул спеку, которая не читается: %s", pl->id,
+            err_setf(e, "plugprep.pre_apply_unreadable", "плагин %s: pre_apply вернул спеку, которая не читается: %s", pl->id,
                      nd ? "не отображение" : xe.msg);
             ydoc_free(nd); ydoc_free(od);
             free(out_txt); free(order);
-            err_set(e, "%s", m);
             goto done;
         }
         struct sbuf added = { 0 }, changed = { 0 };
@@ -1101,7 +1097,7 @@ int spec_prepare(const char *path, struct err *e) {
         char *nt = spec_diff_mark(nr, ydoc_root(od), pl->id, &added, &na, &changed, &nc);
         ydoc_free(nd); ydoc_free(od);
         free(out_txt);
-        if (!nt) { free(added.p); free(changed.p); free(order); err_set(e, "%s", "недостаточно памяти для подготовки"); goto done; }
+        if (!nt) { free(added.p); free(changed.p); free(order); err_setc(e, "spec.no_memory", "%s", "недостаточно памяти для подготовки"); goto done; }
         free(text);
         text = nt;
         if (na || nc) {
@@ -1120,9 +1116,7 @@ int spec_prepare(const char *path, struct err *e) {
         cache_dir(cdir, sizeof(cdir));
         snprintf(pdir, sizeof(pdir), "%s/prepared", cdir);
         if (pu_mkdir_p(pdir) != 0 || pu_write_atomic(pp, text, strlen(text), 0644) != 0) {
-            char m[PATH_MAX + 120];
-            snprintf(m, sizeof(m), "не записать подготовленную спеку в %s: %s", pdir, strerror(errno));
-            err_set(e, "%s", m);
+            err_setf(e, "plugprep.write_failed", "не записать подготовленную спеку в %s: %s", pdir, strerror(errno));
             goto done;
         }
         /* Выдача ресурсов — на диск ДО пробной загрузки: подготовленную спеку читает разбор ядра, и порты и
@@ -1133,7 +1127,7 @@ int spec_prepare(const char *path, struct err *e) {
         struct spec *trial = calloc(1, sizeof(*trial));
         struct err te;
         memset(&te, 0, sizeof(te));
-        if (!trial) { unlink(pp); err_set(e, "%s", "недостаточно памяти для подготовки"); goto done; }
+        if (!trial) { unlink(pp); err_setc(e, "spec.no_memory", "%s", "недостаточно памяти для подготовки"); goto done; }
         int lr = load_spec_mode(path, trial, &te, LOAD_PREPARED);
         int was_prepared = trial->prepared;
         spec_release(trial);

@@ -193,14 +193,29 @@ static struct helper *by_fd(struct supd *s, int fd) {
     return NULL;
 }
 
+/* Причина демона со словом (supd.*): текст остаётся в st->why, слово и подстановки идут рядом. */
+static void why_set(struct helper_state *st, const char *code, const char *args, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static void why_set(struct helper_state *st, const char *code, const char *args, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(st->why, sizeof(st->why), fmt, ap);
+    va_end(ap);
+    snprintf(st->why_code, sizeof(st->why_code), "%s", code ? code : "");
+    snprintf(st->why_args, sizeof(st->why_args), "%s", args ? args : "");
+}
+
 static void emit_state(struct supd *s, const struct helper *h, const char *ev, const char *why) {
-    char out[80], w[512], f[700];
+    char out[80], w[512], f[900];
     steerd_json_str(out, sizeof(out), h->name);
     /* Служба плагина — не выход: подписчик, ждущий выход по "out", её за выход не примет. */
     const char *key = h->service ? "service" : "out";
     if (why) {
         steerd_json_str(w, sizeof(w), why);
-        snprintf(f, sizeof(f), ",\"%s\":%s,\"helper\":\"%s\",\"why\":%s", key, out, h->cmd, w);
+        size_t n = (size_t)snprintf(f, sizeof(f), ",\"%s\":%s,\"helper\":\"%s\",\"why\":%s", key, out, h->cmd, w);
+        if (h->st.why_code[0] && n < sizeof(f))
+            snprintf(f + n, sizeof(f) - n, ",\"code\":\"%s\",\"args\":%s", h->st.why_code,
+                     h->st.why_args[0] ? h->st.why_args : "{}");
     } else {
         snprintf(f, sizeof(f), ",\"%s\":%s,\"helper\":\"%s\"", key, out, h->cmd);
     }
@@ -302,7 +317,7 @@ static void ev_health(struct supd *s, struct helper *h, const struct evline *e) 
  * чём — ни в up, ни в устройство, к которому пришлось бы привязывать маршрут. Процесс гасится (SIGTERM),
  * причина остаётся в журнале и в status (last_down, поле rejected) до нового запуска: человек видит не
  * «помощник упал», а «обновите плагин». Перезапуск идёт по обычной паузе. */
-static void mod_reject(struct supd *s, struct helper *h, const char *why) {
+static void mod_reject(struct supd *s, struct helper *h, const char *why, const char *code, const char *args) {
     struct helper_state *st = &h->st;
     char reason[240];
     snprintf(reason, sizeof(reason), "плагин %s %s", h->plugin, why);
@@ -312,7 +327,10 @@ static void mod_reject(struct supd *s, struct helper *h, const char *why) {
     st->known = 1;
     st->said_down = 1;
     st->since = (long)time(NULL);
-    snprintf(st->why, sizeof(st->why), "%.199s", reason);
+    char aj[256];
+    snprintf(aj, sizeof(aj), "%s", args ? args : "");
+    err_args_add(aj, sizeof(aj), "plugin", h->plugin);       /* чья программа отвергнута — «плагин {plugin}» в тексте */
+    why_set(st, code, aj, "%.199s", reason);
     emit_state(s, h, "helper-down", st->why);
     wake_watch(s, h);
     if (h->pid > 0) kill(h->pid, SIGTERM);
@@ -326,18 +344,25 @@ static void plug_hello(struct supd *s, struct helper *h, const struct evline *e)
     if (ver) snprintf(h->mver, sizeof(h->mver), "%s", ver);
     char why[200];
     if (!api) {
-        mod_reject(s, h, "прислал hello без версии steer-api (api)");
+        mod_reject(s, h, "прислал hello без версии steer-api (api)", "supd.hello_no_api", NULL);
         return;
     }
     unsigned pa = 0, pi = 0, ka = 0, ki = 0;
     if (sscanf(api, "%u.%u", &pa, &pi) != 2 || sscanf(STEER_API_VERSION, "%u.%u", &ka, &ki) != 2 || pa != ka || pi > ki) {
+        char a[160], aj[96];
         snprintf(why, sizeof(why), "говорит steer-api %.16s, ядро — %s", api, STEER_API_VERSION);
-        mod_reject(s, h, why);
+        steerd_json_str(a, sizeof(a), api);
+        snprintf(aj, sizeof(aj), "{\"1\":%.40s,\"2\":\"%s\"}", a, STEER_API_VERSION);
+        mod_reject(s, h, why, "supd.hello_api_mismatch", aj);
         return;
     }
     if (mod && strcmp(mod, h->plugin) != 0) {
+        char a[160], b[160], aj[400];
         snprintf(why, sizeof(why), "представился плагином %.32s, а запущен как %.32s", mod, h->plugin);
-        mod_reject(s, h, why);
+        steerd_json_str(a, sizeof(a), mod);
+        steerd_json_str(b, sizeof(b), h->plugin);
+        snprintf(aj, sizeof(aj), "{\"1\":%.70s,\"2\":%.70s}", a, b);
+        mod_reject(s, h, why, "supd.hello_wrong_mod", aj);
         return;
     }
     h->hello = 1;
@@ -426,7 +451,7 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
         if (h->rejected) return;         /* процесс уже приговорён, его словам не верим */
         if (!h->hello) {
             if (!strcmp(e.ev, "hello")) plug_hello(s, h, &e);
-            else mod_reject(s, h, "не назвал версию (первое сообщение — не hello, steer-api.md 2.1)");
+            else mod_reject(s, h, "не назвал версию (первое сообщение — не hello, steer-api.md 2.1)", "supd.no_hello", NULL);
             return;
         }
         if (!strcmp(e.ev, "hello")) return;
@@ -442,6 +467,7 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
         st->watch = evline_int(&e, "watch", &v) && v == 1;
         st->since = (long)time(NULL);
         st->why[0] = '\0';
+        st->why_code[0] = st->why_args[0] = '\0';
         const char *dev = evline_str(&e, "dev");
         if (dev && !h->service) route_up(s, h, dev);
         emit_state(s, h, "helper-up", NULL);
@@ -452,7 +478,7 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
         st->known = 1;
         st->said_down = 1;
         st->since = (long)time(NULL);
-        snprintf(st->why, sizeof(st->why), "%s", why ? why : "");
+        why_set(st, NULL, NULL, "%s", why ? why : "");
         emit_state(s, h, "helper-down", st->why);
         wake_watch(s, h);
     } else if (!strcmp(e.ev, "node")) {
@@ -1261,7 +1287,10 @@ static int start_one(struct helper *h, void *arg) {
         /* Программы плагина нет (каталог плагина повреждён или снят вручную): так же — одна строка в
          * журнал, причина в status, повтор по паузе; переставят плагин — следующая попытка запустит. */
         if (h->plugin[0] && !s->seam && h->prog && *h->prog && access(h->prog, X_OK) != 0) {
-            snprintf(h->st.why, sizeof(h->st.why), "нет программы плагина %s — переставить плагин", h->plugin);
+            char pj[80], aj[100];
+            steerd_json_str(pj, sizeof(pj), h->plugin);
+            snprintf(aj, sizeof(aj), "{\"1\":%s}", pj);
+            why_set(&h->st, "supd.no_plugin_program", aj, "нет программы плагина %s — переставить плагин", h->plugin);
             h->st.known = 1;
             h->st.said_down = 1;
             if (!h->nomod_logged) {
@@ -1355,15 +1384,23 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         if (h->rejected) {
             /* причина уже записана приговором модулю (mod_reject), а не «убит SIGTERM» */
         } else if (h->gone)
-            snprintf(h->st.why, sizeof(h->st.why), "выход убран из спеки");
+            why_set(&h->st, "supd.out_removed", NULL, "выход убран из спеки");
         else if (h->restart && h->revive)
-            snprintf(h->st.why, sizeof(h->st.why), "перезапуск: выход не отвечает");
+            why_set(&h->st, "supd.restart_unresponsive", NULL, "перезапуск: выход не отвечает");
         else if (h->restart)
-            snprintf(h->st.why, sizeof(h->st.why), "перезапуск: параметры выхода изменились");
+            why_set(&h->st, "supd.restart_params", NULL, "перезапуск: параметры выхода изменились");
         else if (WIFEXITED(status))
-            snprintf(h->st.why, sizeof(h->st.why), "процесс вышел (код %d)", WEXITSTATUS(status));
+        {
+            char aj[40];
+            snprintf(aj, sizeof(aj), "{\"1\":\"%d\"}", WEXITSTATUS(status));
+            why_set(&h->st, "supd.exited", aj, "процесс вышел (код %d)", WEXITSTATUS(status));
+        }
         else
-            snprintf(h->st.why, sizeof(h->st.why), "процесс убит (сигнал %d)", WTERMSIG(status));
+        {
+            char aj[40];
+            snprintf(aj, sizeof(aj), "{\"1\":\"%d\"}", WTERMSIG(status));
+            why_set(&h->st, "supd.killed", aj, "процесс убит (сигнал %d)", WTERMSIG(status));
+        }
         if (was_up) {
             h->st.since = (long)time(NULL);
             emit_state(s, h, "helper-down", h->st.why);
@@ -1676,6 +1713,9 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
         if (st->why[0]) {
             steerd_json_str(wj, sizeof(wj), st->why);
             fprintf(out, ",\"last_down\":%s", wj);
+            if (st->why_code[0])
+                fprintf(out, ",\"last_down_code\":\"%s\",\"last_down_args\":%s", st->why_code,
+                        st->why_args[0] ? st->why_args : "{}");
         }
         /* Программа плагина: чья и какой версии (hello); отвергнутая — помечена, причина в last_down. */
         if (h->plugin[0]) {

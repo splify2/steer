@@ -35,12 +35,12 @@ static int group_add_file(struct group *g, const char *path, struct err *e) {
     if (g->files_n == g->files_cap) {
         size_t cap = g->files_cap ? g->files_cap * 2 : 8;
         const char **p = realloc(g->files, cap * sizeof(*p));
-        if (!p) return err_set(e, "out of memory building channel groups", NULL);
+        if (!p) return err_setf(e, "compile.no_memory", "out of memory building channel groups");
         g->files = p;
         /* Составной набор: сужение каждого файла — параллельно, той же ёмкости. */
         if (g->composite) {
             const struct l4match **q = realloc(g->files_l4, cap * sizeof(*q));
-            if (!q) return err_set(e, "out of memory building channel groups", NULL);
+            if (!q) return err_setf(e, "compile.no_memory", "out of memory building channel groups");
             g->files_l4 = q;
         }
         g->files_cap = cap;
@@ -53,7 +53,7 @@ static int group_add_srs(struct group *g, const struct srs_psel *ps, struct err 
     if (g->srs_n == g->srs_cap) {
         size_t cap = g->srs_cap ? g->srs_cap * 2 : 4;
         const struct srs_psel **p = realloc(g->srs, cap * sizeof(*p));
-        if (!p) return err_set(e, "out of memory building channel groups", NULL);
+        if (!p) return err_setf(e, "compile.no_memory", "out of memory building channel groups");
         g->srs = p;
         g->srs_cap = cap;
     }
@@ -89,7 +89,7 @@ static struct group *group_new(struct groups *gr, struct err *e) {
     if (gr->n == gr->cap) {
         size_t nc = gr->cap ? gr->cap * 2 : 16;
         struct group *p = realloc(gr->g, nc * sizeof(*p));
-        if (!p) { err_set(e, "out of memory building channel groups", NULL); return NULL; }
+        if (!p) { err_setf(e, "compile.no_memory", "out of memory building channel groups"); return NULL; }
         gr->g = p;
         gr->cap = nc;
     }
@@ -146,7 +146,7 @@ static int add_srs_channel(const struct spec *sp, struct groups *gr, const struc
     if (gr->plans_n == gr->plans_cap) {
         size_t nc = gr->plans_cap ? gr->plans_cap * 2 : 8;
         struct srs_plan *np = realloc(gr->plans, nc * sizeof(*np));
-        if (!np) return err_set(e, "out of memory building channel groups", NULL);
+        if (!np) return err_setf(e, "compile.no_memory", "out of memory building channel groups");
         gr->plans = np;
         gr->plans_cap = nc;
     }
@@ -355,7 +355,7 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
     for (size_t i = 0; i < gr->n; i++)
         for (size_t k = i + 1; k < gr->n; k++)
             if (!strcmp(gr->g[i].name, gr->g[k].name))
-                return err_set(e, "два разных набора каналов получили одно имя %s — "
+                return err_setf(e, "compile.group_name_twice", "два разных набора каналов получили одно имя %s — "
                     "укоротите или разведите имена выходов", gr->g[i].name);
     return 0;
 }
@@ -436,7 +436,7 @@ static int count_list(const char *path, size_t *total, size_t *bad, size_t *v6,
      * раньше (см. check_address_lists), и попасть сюда можно только если список исчез
      * между той проверкой и этим чтением. Редкость причины не повод оставить die() — правило
      * 5 касается любого пути, даже маловероятного. */
-    if (!in) return err_set(e, "%s: cannot read a channel's list", path);
+    if (!in) return err_setf(e, "compile.list_unreadable", "%s: cannot read a channel's list", path);
     char line[512];
     size_t lineno = 0;
     *total = *bad = *v6 = 0;

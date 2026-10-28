@@ -316,6 +316,20 @@ int main(int argc, char **argv) {
     /* Обрезанный вывод читающей команды — повторить движком целиком, а не отдать обрубок. */
     if (r.truncated && readonly) run_engine();
     if (r.err.n) fwrite(r.err.p, 1, r.err.n, stderr);
+    /* Слово отказа подкоманды: демон вынул строку JSON из stderr в ecode и args — при STEER_ERR_JSON=1 вернуть её, как
+     * печатает подкоманда в командной строке (docs/errors.md). error — первая строка stderr без «steer: ». */
+    if (r.ecode.p && r.args.p && getenv("STEER_ERR_JSON")) {
+        const char *t = r.err.p ? r.err.p : "";
+        if (!strncmp(t, "steer: ", 7)) t += 7;
+        fputs("{\"ok\":false,\"error\":\"", stderr);
+        for (; *t && *t != '\n'; t++) {
+            unsigned char ch = (unsigned char)*t;
+            if (ch == '"' || ch == '\\') fprintf(stderr, "\\%c", ch);
+            else if (ch < 0x20) fprintf(stderr, "\\u%04x", ch);
+            else fputc(ch, stderr);
+        }
+        fprintf(stderr, "\",\"code\":\"%s\",\"args\":%s}\n", r.ecode.p, r.args.p);
+    }
     if (r.out.n) fwrite(r.out.p, 1, r.out.n, stdout);
     if (r.error.p)
         fprintf(stderr, "steer: %s: %s\n", c.cmd, r.message.p ? r.message.p : r.error.p);

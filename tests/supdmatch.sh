@@ -241,7 +241,7 @@ check "  a и t не тронуты" "$pa $pt" "$(pid_of a) $(pid_of t)"
 check "  и о причине сказано" "1" "$(grep -c 'supervise: obfs b — параметры выхода изменились' "$tmp/d.err")"
 
 check "  подписчику — helper-down с нашей причиной" \
-    '{"v":1,"ev":"helper-down","out":"b","helper":"obfs","why":"перезапуск: параметры выхода изменились"}' \
+    '{"v":1,"ev":"helper-down","out":"b","helper":"obfs","why":"перезапуск: параметры выхода изменились","code":"supd.restart_params","args":{}}' \
     "$(grep '"ev":"helper-down"' "$tmp/sub.out")"
 
 # Смена спеки меняет поведение резолвера без перезапуска: канала больше нет.
@@ -274,7 +274,7 @@ check "  упал снова сразу — пауза растёт до 10 с" 
 kill -KILL "$(pid_of t)"
 wait_for 'grep -q "\"out\":\"t\",\"helper\":\"obfs\",\"why\"" "$tmp/sub.out"' 5
 check "помощник убит молча после up — helper-down с причиной" \
-    '{"v":1,"ev":"helper-down","out":"t","helper":"obfs","why":"процесс убит (сигнал 9)"}' \
+    '{"v":1,"ev":"helper-down","out":"t","helper":"obfs","why":"процесс убит (сигнал 9)","code":"supd.killed","args":{"1":"9"}}' \
     "$(grep '"out":"t","helper":"obfs","why"' "$tmp/sub.out")"
 wait_for '[ "$(runs t)" = 2 ] && [ "$(alive t)" = yes ]' 8
 wait_for '[ "$(runs b)" -ge 4 ] && [ "$(alive b)" = yes ]' 12

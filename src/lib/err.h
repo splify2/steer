@@ -25,6 +25,10 @@ struct err {
 /* То же, что err_set, но с кодом отказа; подстановка a (если не NULL) уходит в args как "1". */
 int err_setc(struct err *e, const char *code, const char *fmt, const char *a);
 
+/* Запасное слово: у отказа нет слова, но есть текст — слово code и текст как подстановка "1" (ключ «text»
+ * не нужен: общий вид «{1}»). Отказ с настоящим кодом не трогает. Возвращает -1. */
+int err_fallback(struct err *e, const char *code);
+
 /* Отказ с кодом и произвольным числом подстановок: формат как у printf (%s %d %u %ld %zu, %.Ns, %.*s) — все
  * подстановки уходят в args по порядку как "1", "2", … */
 int err_vsetc(struct err *e, const char *code, const char *fmt, va_list ap);

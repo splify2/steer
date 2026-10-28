@@ -140,3 +140,12 @@ void err_die(const struct err *e) {
     err_print(e);
     exit(2);
 }
+
+int err_fallback(struct err *e, const char *code) {
+    if (e->msg[0] && !e->code[0]) {
+        snprintf(e->code, sizeof(e->code), "%s", code);
+        e->args[0] = 0;
+        err_args_add(e->args, sizeof(e->args), "1", e->msg);
+    }
+    return -1;
+}

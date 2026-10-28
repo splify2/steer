@@ -25,6 +25,7 @@ struct ctlcall_str { char *p; size_t n; };
 struct ctlcall_resp {
     int has_code, code;
     struct ctlcall_str out, err, error, message, spec_path, state_dir;
+    struct ctlcall_str ecode, args;    /* слово отказа подкоманды (docs/errors.md) и объект подстановок как текст JSON */
     int truncated, enabled, applied;   /* -1 — поля нет (truncated — 0) */
 };
 

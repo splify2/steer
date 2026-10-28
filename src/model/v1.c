@@ -921,6 +921,7 @@ int spec_parse_v1(const char *text, struct spec *s, struct err *e) {
     int rc = v1_parse(text, s, e);
     ctx_free(&x);
     if (rc == 0) rc = check_mark_slots(s, e);
+    if (rc != 0) err_fallback(e, "spec.v1_error");      /* текст v1 — в подстановке 1 как есть */
     return rc;
 }
 
