@@ -456,6 +456,19 @@ for spec in $ISAS; do
     mkdir -p "$root/usr/share/steer"
     printf 'steer-abi %s\n' "$(sh build/abi.sh)" > "$root/usr/share/steer/steer-abi"
     chmod 0644 "$root/usr/share/steer/steer-abi"
+    # Открытые ключи официальных репозиториев (/usr/share/steer/keys/<роль>/<номер>.pub и revoked; роль — index,
+    # protocols, plugins; plugin-sdk/docs/s2p.md, «Ключи и ротация»). Два источника: дерево (files/usr/share/steer/keys —
+    # прежние ключи на время ротации и revoked) и конвейер выпуска ($STEER_KEYS_DIR — ключи, выведенные из секретов
+    # build/release-keys.sh). Без ключа роли index менеджер не примет индекс официального репозитория.
+    for _kd in files/usr/share/steer/keys "${STEER_KEYS_DIR:-}"; do
+        [ -n "$_kd" ] && [ -d "$_kd" ] || continue
+        mkdir -p "$root/usr/share/steer/keys"
+        cp -R "$_kd/." "$root/usr/share/steer/keys/"
+    done
+    if [ -d "$root/usr/share/steer/keys" ]; then
+        find "$root/usr/share/steer/keys" -type d -exec chmod 0755 {} +
+        find "$root/usr/share/steer/keys" -type f -exec chmod 0644 {} +
+    fi
     # Семя (раскладка 2.1, plugin-sdk/docs/migration-2.1.md, раздел 5): подписанные .s2p протоколов и net1
     # под эту архитектуру и index.json с подписью — переход и первая установка без сети. Архивы же
     # кладутся в $OUT рядом с пакетами (их публикует репозиторий плагинов).

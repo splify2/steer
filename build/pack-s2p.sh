@@ -28,6 +28,13 @@ fi
 . build/sources.sh
 KEY="${S2P_KEY:-}"
 TESTKEY=""
+# Выпуск (STEER_RELEASE=1, release.yml) тестовым ключом не подписывается: без ключей из секретов — отказ.
+if [ "${STEER_RELEASE:-0}" = 1 ]; then
+    [ -n "$KEY" ] && [ -n "${S2P_KEY_INDEX:-}" ] || {
+        echo "pack-s2p: выпуск без ключей подписи — нужны S2P_KEY (роль protocols) и S2P_KEY_INDEX (build/release-keys.sh)" >&2
+        exit 1; }
+    [ -f "${KEY%.sec}.pub" ] || { echo "pack-s2p: рядом с ключом $KEY нет ${KEY%.sec}.pub" >&2; exit 1; }
+fi
 if [ -z "$KEY" ]; then
     mkdir -p build/s2p-testkey
     [ -f build/s2p-testkey/test.sec ] || "$S2P_BIN" keygen -o build/s2p-testkey/test >/dev/null
@@ -67,19 +74,24 @@ sed -i "s/\"@VERSION@\"/\"$VERSION\"/" "$_d/plugin.json"
 # (S2P_SEED_EXPIRES): семя читают без сети спустя месяцы после выпуска, обычные 30 дней сделали бы его
 # негодным раньше, чем им воспользуются. default — протоколы (их ставит migrate при
 # первой установке), net1 тянется по requires.plugins.
-if [ -n "$SEED" ]; then
-    rm -rf "$SEED"
-    mkdir -p "$SEED"
-    _meta="$ST/meta.json"
-    {
-        printf '{'
+# Поля индекса вне манифестов — и для семени, и для индекса репозитория splify2/plugins (release.yml берёт
+# $DIST/s2p-meta.json: у всех архитектур он одинаковый).
+_meta="$DIST/s2p-meta.json"
+# Поля лежат под ключом plugins (plugin-sdk/docs/index.md, «Сборка индекса»): плоский объект s2p index молча
+# пропускает, и в индексе не оказывалось ни default, ни key_role — менеджер брал роль plugins, а архивы
+# протоколов подписаны ключом protocols.
+{
+        printf '{"plugins":{'
         printf '"net1":{"key_role":"protocols","tags":["library"]}'
         printf ',"awg":{"key_role":"protocols","tags":["library"]}'
         for _p in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC); do
             printf ',"%s":{"default":true,"key_role":"protocols","tags":["protocol"]}' "$_p"
         done
-        printf '}\n'
-    } > "$_meta"
+        printf '}}\n'
+} > "$_meta"
+if [ -n "$SEED" ]; then
+    rm -rf "$SEED"
+    mkdir -p "$SEED"
     _in="$ST/seed-in"
     mkdir -p "$_in"
     cp "$DIST/net1-$N1VER-$ARCH.s2p" "$DIST/awg-$VERSION-all.s2p" "$_in/"

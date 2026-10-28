@@ -337,11 +337,13 @@ arch_n=$(sed -n '/^ISAS="/,/^"$/p' build/arches.sh | grep -c '^[a-z0-9_.-]*:')
 check "архитектуры в build/arches.sh считаются" "1" "$([ "$arch_n" -ge 1 ] && echo 1 || echo 0)"
 check "барьер релиза считает архитектуры тем же образцом" "1" \
     "$(grep -c "sed -n '/\^ISAS=\"/,/\^\"\$/p' build/arches.sh | grep -c '\^\[a-z0-9_.-\]\*:'" "$wf")"
-# И число пакетов на архитектуру — из OURS в build.sh, а не константой: steer-warpbox добавил
-# девятый пакет, барьер ждал восемь, и выпуск 2.1.0 падал на собранном полном наборе.
-pkg_n=$(sed -n 's/^OURS="\(.*\)"$/\1/p' build.sh | wc -w)
-check "пакеты в OURS build.sh считаются" "1" "$([ "$pkg_n" -ge 1 ] && echo 1 || echo 0)"
-check "барьер релиза считает пакеты из OURS, а не числом" "1" "$(grep -c 'want=\$((arch_n \* pkg_n))' "$wf")"
+# С 2.1 пакет на архитектуру один — steer-core, а плагины протоколов считаются по build/sources.mk, а не константой:
+# steer-warpbox однажды добавил девятый пакет, барьер ждал восемь, и выпуск падал на собранном полном наборе.
+check "барьер релиза ждёт по steer-core на архитектуру" "1" "$(grep -c 'n=\$(ls out/steer-core\*\."\$ext"' "$wf")"
+check "барьер релиза считает .s2p по build/sources.mk" "1" \
+    "$(grep -c 'profile_var PLUGINS_NET1) \$(profile_var PLUGINS_STATIC)' "$wf")"
+check "барьер релиза проверяет подписи .s2p ключами выпуска" "1" "$(grep -c 'verify "\$f" --keys-dir' "$wf")"
+check "выпуск без ключей из секретов не начинается" "1" "$(grep -c 'sh build/release-keys.sh' "$wf")"
 
 # ---- два формата пакета и архив для VPS --------------------------------------
 # OpenWrt 24.10 перешёл на apk, но 23.05 и 22.03 живут на роутерах и будут жить: на 4/32
