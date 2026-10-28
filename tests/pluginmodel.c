@@ -79,21 +79,21 @@ int main(void) {
 
     /* ---- совместимость ---- */
     compat_plugin("c-caret", "^1.0");
-    compat_plugin("c-tilde", "~1.3");
+    compat_plugin("c-tilde", "~1.4");
     compat_plugin("c-ge", ">=1.0 <2");
     compat_plugin("c-or", "^2.0 || ^1.0");
-    compat_plugin("c-exact", "1.3");
-    compat_plugin("c-newer", "^1.4");
+    compat_plugin("c-exact", "1.4");
+    compat_plugin("c-newer", "^1.5");
     compat_plugin("c-major", "^2.0");
     compat_plugin("c-lt", "<1.0");
     compat_plugin("c-zero", "^0.9");
     compat_plugin("c-junk", "abc");
     plugin_reload(NULL);
     check("^1.0 — совместим с steer-api 1.4", 1, plugin_find("c-caret")->enabled);
-    check("~1.1 — совместим", 1, plugin_find("c-tilde")->enabled);
+    check("~1.4 — совместим", 1, plugin_find("c-tilde")->enabled);
     check(">=1.0 <2 — совместим", 1, plugin_find("c-ge")->enabled);
     check("^2.0 || ^1.0 — совместим", 1, plugin_find("c-or")->enabled);
-    check("1.3 — совместим", 1, plugin_find("c-exact")->enabled);
+    check("1.4 — совместим", 1, plugin_find("c-exact")->enabled);
     check("^1.5 — не совместим (ядро 1.4)", 0, plugin_find("c-newer")->enabled);
     check_str("  причина называет числа", "c-newer 1.0.0 требует steer-api ^1.5, у ядра 1.4", why_of("c-newer"));
     check("^2.0 — не совместим", 0, plugin_find("c-major")->enabled);
