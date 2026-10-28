@@ -254,7 +254,11 @@ ext-syntax:
 # из исходников той же версии и с теми же опциями, что у роутера (build/wolfssl), исходники —
 # STEER_WOLFSSL или скачивание со сверкой суммы; не нашлись — ГРОМКИЙ пропуск, а не падение.
 # Вся логика — в tests/ext-test.sh, как у прочих *.sh-стендов.
-ext-test:
+# Зависимости — не для сборки стендов самого ext-test (их он собирает сам), а для последнего шага,
+# libs-test: tgwsmatch берёт каталог плагинов у $(BUILD)/pkhooks, specschemamatch и nestlong —
+# $(BUILD)/steerd и $(BUILD)/steer. В чистом дереве (свежий worktree) без них ext-test падал
+# «не собран», хотя код был в порядке.
+ext-test: all $(BUILD)/pkhooks
 	@BUILD=$(BUILD) CC="$(CC)" sh tests/ext-test.sh
 
 # Разделяемая раскладка роутера (шаг 4 выпуска 1.10: libsteer.so, libsteer-wolfssl.so, steerd и
