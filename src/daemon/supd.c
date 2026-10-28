@@ -327,7 +327,10 @@ static void mod_reject(struct supd *s, struct helper *h, const char *why, const 
     st->known = 1;
     st->said_down = 1;
     st->since = (long)time(NULL);
-    why_set(st, code, args, "%.199s", reason);
+    char aj[256];
+    snprintf(aj, sizeof(aj), "%s", args ? args : "");
+    err_args_add(aj, sizeof(aj), "plugin", h->plugin);       /* чья программа отвергнута — «плагин {plugin}» в тексте */
+    why_set(st, code, aj, "%.199s", reason);
     emit_state(s, h, "helper-down", st->why);
     wake_watch(s, h);
     if (h->pid > 0) kill(h->pid, SIGTERM);
