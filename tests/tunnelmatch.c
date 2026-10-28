@@ -271,6 +271,42 @@ static void check(int ok, const char *what) {
 #define TEST_SLOTS 320                /* потолок слотов стенда: полная таблица достижима за мгновение */
 static int g_cfd[TEST_SLOTS];          /* клиентский конец сокета соединения по номеру слота; -1 — нет */
 
+/* Доставка по петле TCP не синхронна: сегмент (данные, FIN, RST), отправленный одним концом, ядро
+ * передаёт другому из softirq, и на ядрах, где он уходит в ksoftirqd (WSL2 6.18 — так), другой конец
+ * видит его только после того, как поток отдал процессор. Прежде стенд читал сразу и принимал
+ * «ещё не дошло» за «не послано»: 13 провалов RST/FIN и «данные не ушли» были не ошибкой стека, а
+ * гонкой стенда. Поэтому наблюдения через TCP ждут события (ppoll — не poll: poll стенд считает за
+ * стеком) до срока: NET_END_MS — исхода (FIN/RST), NET_LAG_MS — следующей порции данных. У AF_UNIX
+ * доставка синхронна, ожидание не нужно. */
+#define NET_END_MS 2000
+#define NET_LAG_MS 50
+
+static int sock_is_inet(int fd) {
+    int dom = 0;
+    socklen_t l = sizeof dom;
+    return getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &l) == 0 && (dom == AF_INET || dom == AF_INET6);
+}
+
+/* Дождаться события ev на fd не дольше ms. 1 — событие есть. */
+static int net_wait(int fd, short ev, int ms) {
+    struct pollfd p = { .fd = fd, .events = ev };
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    return ppoll(&p, 1, &ts, NULL) > 0;
+}
+
+/* Дождаться, пока в сокете fd (сторона стека) станет не меньше n непрочитанных байт, — записанное
+ * клиентом дошло. */
+static void net_wait_pending(int fd, size_t n) {
+    if (!sock_is_inet(fd)) return;
+    for (int i = 0; i < NET_END_MS; i++) {
+        int q = 0;
+        if (ioctl(fd, FIONREAD, &q) == 0 && (size_t)q >= n) return;
+        struct timespec ts = { 0, 1000000L };
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        ppoll(&p, 0, &ts, NULL);
+    }
+}
+
 static int cli_pair_unix(int sv[2]) {
     return socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv);
 }
@@ -331,16 +367,19 @@ static void cli_put(struct conn *c, const void *d, size_t n) {
         else break;
     }
     if (off != n) check(0, "стенд: клиент не смог записать в свой сокет");
+    net_wait_pending(conn_cfd(c), n);
     c->carmed |= CRD;
 }
 
 /* Всё, что дошло до клиента (до cap байт). */
 static size_t cli_get(int fd, unsigned char *buf, size_t cap) {
     size_t n = 0;
+    int inet = sock_is_inet(fd);
     while (n < cap) {
         ssize_t r = read(fd, buf + n, cap - n);
         if (r > 0) n += (size_t)r;
         else if (r < 0 && errno == EINTR) continue;
+        else if (r < 0 && errno == EAGAIN && inet && net_wait(fd, POLLIN, NET_LAG_MS)) continue;
         else break;
     }
     return n;
@@ -364,6 +403,7 @@ static int cli_end(int fd) {
         if (r > 0) continue;
         if (r == 0) return 1;
         if (errno == EINTR) continue;
+        if (errno == EAGAIN && net_wait(fd, POLLIN | POLLRDHUP, NET_END_MS)) continue;
         return errno == ECONNRESET ? 2 : 0;
     }
 }
@@ -1425,7 +1465,11 @@ static void t_empty_read(void) {
 static int dup_deliver(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
                        dialer_emit_fn emit, void *arg) {
     (void)ctx; (void)sess; (void)udp;
-    return emit(arg, d, n) != 0 || emit(arg, d, n) != 0 ? -1 : 0;
+    /* Сколько раз отдать прочитанное, чтобы проход вышел за запас кольца (CLIENT_ROOM_RESERVE) при чтении
+     * 18000 байт: запас считается от буфера чтения стека (DOWN_BUF), а не от записи. */
+    for (int k = 0; k < (int)(CLIENT_ROOM_RESERVE / 18000) + 1; k++)
+        if (emit(arg, d, n) != 0) return -1;
+    return 0;
 }
 
 /* Склейка записей клиенту (R-147): порция чтений у узла уходит в сокет клиента ОДНОЙ записью (writev по кольцу
@@ -1456,22 +1500,27 @@ static void t_tx_batch(void) {
     check(c->rtx.len == 0, "склейка: клиент принял всё — кольцо пусто");
     pos += got;
 
-    /* Вторая порция ложится через конец кольца. */
-    uint32_t head = c->rtx.head;
-    g_recv_rep = 10; g_recv_rep_n = 4000;
-    g_writev_calls = 0;
-    drain_conn(c, &g_tun);
-    got = cli_get(cli_fd(c), b, sizeof b);
-    check(got == 40000 && stream_bad(b, got, pos) == 0 && g_writev_calls == 1,
-          "склейка: порция через конец кольца уходит одной записью и без порчи");
-    check(head + 40000 > c->rtx.cap && c->rtx.head < head && c->rtx.cap == 64 * 1024,
+    /* Следующие порции — пока одна не ляжет через конец кольца (кольцо выросло до RTX_CAP). */
+    uint32_t head = 0;
+    int all_ok = 1, wrapped = 0;
+    for (int k = 0; k < 64 && !wrapped; k++) {
+        head = c->rtx.head;
+        wrapped = head + 40000 > c->rtx.cap;
+        g_recv_rep = 10; g_recv_rep_n = 4000;
+        g_writev_calls = 0;
+        drain_conn(c, &g_tun);
+        got = cli_get(cli_fd(c), b, sizeof b);
+        if (got != 40000 || stream_bad(b, got, pos) != 0 || g_writev_calls != 1) all_ok = 0;
+        pos += got;
+    }
+    check(all_ok, "склейка: порция через конец кольца уходит одной записью и без порчи");
+    check(wrapped && c->rtx.head < head && c->rtx.cap == RTX_CAP,
           "склейка: проверка идёт через край кольца");
-    pos += got;
 
     /* Договор дайлера: за проход не больше запаса кольца (CLIENT_ROOM_RESERVE). Верная раздача — тишина,
      * раздача вдвое больше прочитанного (накопитель, как был у ss и vmess) — строка в журнале и счёт. */
     check(g_overemit == 0, "договор дайлера: порция в рамках запаса — нарушений нет");
-    /* Нарушение договора: один проход отдаёт 2 x 18000 при запасе TUNNEL_BUF + 1024. */
+    /* Нарушение договора: один проход отдаёт прочитанные 18000 байт столько раз, что выходит за запас. */
     struct dialer_ops over = *g_dl->ops;
     over.deliver = dup_deliver;
     struct dialer over_dl = *g_dl;
@@ -1481,7 +1530,7 @@ static void t_tx_batch(void) {
     g_recv_rep = 1; g_recv_rep_n = 18000;
     drain_conn(c, &g_tun);
     g_dl = real_dl;
-    check(g_overemit == 1, "договор дайлера: проход отдал 36000 байт при запасе 19472 — нарушение сосчитано и названо");
+    check(g_overemit == 1, "договор дайлера: проход отдал больше запаса кольца — нарушение сосчитано и названо");
     (void)cli_get(cli_fd(c), b, sizeof b);                  /* поток испорчен намеренно — только вычерпать сокет */
     g_recv_rep = 0;
     conn_drop(c);

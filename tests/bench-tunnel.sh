@@ -23,10 +23,10 @@ cd "$(dirname "$0")/.."
 MB="${1:-32}"
 IDLE="${2:-0}"
 STREAMS="${3:-1}"
-BIN="${STEER:-./build/libs-host/steerd}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
-# steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
-LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
+# Туннель — программа плагина vless (протоколы — только плагины): выход ей даёт {conf}, как демон. net1 она
+# находит по RUNPATH раскладки.
+BIN="${STEER_VLESS:-./build/libs-host/plugins/vless/bin/vless}"
+[ -x "$BIN" ] || { echo "нет программы плагина: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
 
 NS=steer-bench
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
@@ -47,11 +47,15 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
-SPEC
+mkdir -p "$WORK/pst"
+# tcp_port 9480 — слушатель модуля, к нему ведёт перенаправление redir_dev ниже.
+cat > "$WORK/vl.json" <<CONF
+{"api":"1.1","plugin":{"id":"vless","version":"bench"},
+ "output":{"name":"vl","kind":"tunnel:vless","keys":{"subscription":"$WORK/sub.txt"},"device":"vl","mark":"0x00300000",
+           "mark_mask":"0x0ff00000","table":302,"ipv6":false,"on_fail":"drop","over":null,"sock_mark":"0x00000000",
+           "sock_mark_required":false,"tcp_port":9480,"ports":[],"queues":[]},
+ "paths":{"plugin_state":"$WORK/pst"},"platform":"openwrt"}
+CONF
 
 ip netns delete "$NS" 2>/dev/null || true
 ip netns add "$NS"
@@ -69,7 +73,7 @@ sleep 1
 # ОДНО ядро и ОДИН поток: на роутере их столько и есть, а на восьми ядрах разница между
 # «цикл дорогой» и «цикл дешёвый» размазывается по свободным ядрам и не видна.
 ip netns exec "$NS" taskset -c "${BENCH_CPUS:-0}" env STEER_TUN_THREADS="${BENCH_THREADS:-1}" "$BIN" vless vl \
-    --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
+    --conf "$WORK/vl.json" > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 
 for _ in $(seq 50); do
