@@ -2293,7 +2293,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
      * видов в тексте стоят раньше цепочки моста, в каком бы порядке выходы ни шли в спеке
      * (kind.c: kind_emit_all). */
     if (kind_emit_all(rs, sp, e) != 0) return -1;
-    if (!prof()->no_resolver) build_dns_redirect(t, sp);
+    build_dns_redirect(t, sp);
     build_tcp_redir(t, sp);
     /* Остальное по-прежнему по факту доменных каналов: карта fakeip и цепочка dstnat
      * стоят per-packet, и держать их пустыми на роутере без доменов незачем. Это гейт

@@ -3,6 +3,12 @@
   "title": "Telegram bridge",
   "type": "object",
   "properties": {
+    "pick": {
+      "type": "boolean",
+      "title": "Choose paths automatically",
+      "description": "On - paths of data centers are measured at start and every 6 hours. Paths set below take priority.",
+      "default": true
+    },
     "domains": {
       "type": "array",
       "title": "Spare domains",

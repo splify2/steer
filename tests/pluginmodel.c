@@ -6,7 +6,7 @@
  *   - запись вида: имя, свойства caps, помощник из манифеста; kind_ops.helper плагина отдаёт
  *     программу плагина (полный путь), argv с раскрытыми {out} и {conf}, id плагина и путь {conf};
  *   - подпись помощника — от версии плагина и содержимого {conf}: те же ключи — та же подпись, другие
- *     ключи — другая;
+ *     ключи — другая; при steer.settings: "restart" — и от settings.json плагина (steer-api 1.5);
  *   - {conf}: api, плагин, ключи по схеме, устройство, метка, таблица, подложка; пишется атомарно с
  *     правами 0600;
  *   - реестр видит свежий манифест после plugin_refresh (менеджер подменил каталог плагина).
@@ -79,23 +79,23 @@ int main(void) {
 
     /* ---- совместимость ---- */
     compat_plugin("c-caret", "^1.0");
-    compat_plugin("c-tilde", "~1.4");
+    compat_plugin("c-tilde", "~1.5");
     compat_plugin("c-ge", ">=1.0 <2");
     compat_plugin("c-or", "^2.0 || ^1.0");
-    compat_plugin("c-exact", "1.4");
-    compat_plugin("c-newer", "^1.5");
+    compat_plugin("c-exact", "1.5");
+    compat_plugin("c-newer", "^1.6");
     compat_plugin("c-major", "^2.0");
     compat_plugin("c-lt", "<1.0");
     compat_plugin("c-zero", "^0.9");
     compat_plugin("c-junk", "abc");
     plugin_reload(NULL);
-    check("^1.0 — совместим с steer-api 1.4", 1, plugin_find("c-caret")->enabled);
-    check("~1.4 — совместим", 1, plugin_find("c-tilde")->enabled);
+    check("^1.0 — совместим с steer-api 1.5", 1, plugin_find("c-caret")->enabled);
+    check("~1.5 — совместим", 1, plugin_find("c-tilde")->enabled);
     check(">=1.0 <2 — совместим", 1, plugin_find("c-ge")->enabled);
     check("^2.0 || ^1.0 — совместим", 1, plugin_find("c-or")->enabled);
-    check("1.4 — совместим", 1, plugin_find("c-exact")->enabled);
-    check("^1.5 — не совместим (ядро 1.4)", 0, plugin_find("c-newer")->enabled);
-    check_str("  причина называет числа", "c-newer 1.0.0 требует steer-api ^1.5, у ядра 1.4", why_of("c-newer"));
+    check("1.5 — совместим", 1, plugin_find("c-exact")->enabled);
+    check("^1.6 — не совместим (ядро 1.5)", 0, plugin_find("c-newer")->enabled);
+    check_str("  причина называет числа", "c-newer 1.0.0 требует steer-api ^1.6, у ядра 1.5", why_of("c-newer"));
     check("^2.0 — не совместим", 0, plugin_find("c-major")->enabled);
     check("<1.0 — не совместим", 0, plugin_find("c-lt")->enabled);
     check("^0.9 — не совместим", 0, plugin_find("c-zero")->enabled);
@@ -124,8 +124,8 @@ int main(void) {
 
     /* ---- вид с помощником ---- */
     put("hp/plugin.json",
-        "{\"schema\":1,\"id\":\"hp\",\"version\":\"3.1.4\",\"compat\":{\"steer-api\":\"^1.0\"},"
-        "\"steer\":{\"kinds\":[{\"name\":\"hpkind\",\"keys\":\"kinds/hp.schema.json\","
+        "{\"schema\":1,\"id\":\"hp\",\"version\":\"3.1.4\",\"compat\":{\"steer-api\":\"^1.5\"},"
+        "\"steer\":{\"settings\":\"restart\",\"kinds\":[{\"name\":\"hpkind\",\"keys\":\"kinds/hp.schema.json\",\"paths\":true,"
         "\"caps\":[\"device\",\"mark\",\"ctmark\",\"over\"],"
         "\"helper\":{\"prog\":\"bin/h\",\"cmd\":\"hphelper\",\"argv\":[\"run\",\"{out}\",\"--conf\",\"{conf}\",\"--x\",\"{{lit}}\"],"
         "\"env\":{\"HP_MODE\":\"fast\"}}}]}}");
@@ -170,7 +170,37 @@ int main(void) {
     h = (struct kind_helper){ .sig = KIND_SIG_INIT };
     kind_of(o)->helper(&sp, o, &h);
     check("подпись помощника: те же ключи — та же подпись", 1, h.sig == sig1);
+    check("  paths из манифеста — у помощника", 1, h.paths == 1);
     kind_helper_free(&h);
+    /* steer.settings: "restart" (steer-api 1.4) — settings.json плагина в подписи: появился, переписан,
+     * убран — подпись другая; тот же текст — та же. */
+    {
+        char sd[400], sf[500];
+        snprintf(sd, sizeof(sd), "%s/conf", g_etc);
+        mkdir(sd, 0755);
+        snprintf(sd, sizeof(sd), "%s/conf/hp", g_etc);
+        mkdir(sd, 0755);
+        snprintf(sf, sizeof(sf), "%s/settings.json", sd);
+        unsigned long long s[3];
+        const char *txt[2] = { "{\"a\":1}\n", "{\"a\":2}\n" };
+        for (int i = 0; i < 2; i++) {
+            FILE *f = fopen(sf, "w");
+            fputs(txt[i], f);
+            fclose(f);
+            h = (struct kind_helper){ .sig = KIND_SIG_INIT };
+            kind_of(o)->helper(&sp, o, &h);
+            s[i] = h.sig;
+            kind_helper_free(&h);
+        }
+        unlink(sf);
+        h = (struct kind_helper){ .sig = KIND_SIG_INIT };
+        kind_of(o)->helper(&sp, o, &h);
+        s[2] = h.sig;
+        kind_helper_free(&h);
+        check("настройки плагина появились — подпись другая", 1, s[0] != sig1);
+        check("  переписаны — другая", 1, s[1] != s[0]);
+        check("  убраны — снова прежняя", 1, s[2] == sig1);
+    }
 
     /* {conf} */
     char *cj = plugin_conf_json(&sp, o, pk);

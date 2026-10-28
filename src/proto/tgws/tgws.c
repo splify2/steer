@@ -58,6 +58,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <time.h>
 #include <netdb.h>
@@ -450,7 +451,15 @@ static void tgws_hosts(int dc, int media, char out[2][160]) {
 #define ROUTE_N 20              /* индекс dc*2+media, ДЦ 1..9 */
 enum { RT_AUTO = 0, RT_WS, RT_DIRECT };
 struct dc_route { char domain[128]; unsigned char how; };
-static struct dc_route g_route[ROUTE_N];
+/* Карта настроек (`routes`) и действующая карта. Действующую читают потоки соединений без замка, а
+ * подбор (tgws_route_pick) меняет её на ходу: он собирает НОВУЮ таблицу и подменяет указатель одним
+ * атомарным сохранением. Прежняя таблица не освобождается — поток соединения мог взять из неё строку
+ * домена и ещё дозванивается; подбор публикует таблицу только при изменившемся ответе, так что за
+ * сутки это единицы таблиц по 2,6 КБ. */
+static struct dc_route g_route_set[ROUTE_N];
+static time_t g_direct_bad[ROUTE_N];   /* отставка прямого пути (route_direct_failed, ниже) */
+static struct dc_route *_Atomic g_rt = g_route_set;
+#define g_route (atomic_load_explicit(&g_rt, memory_order_acquire))
 
 static int route_idx(int dc, int media) {
     /* ДЦ203 — в свободную ячейку 9: ему нужны своя строка в журнале переключений и своё
@@ -460,8 +469,9 @@ static int route_idx(int dc, int media) {
     return dc * 2 + (media ? 1 : 0);
 }
 
-static void route_init(const char *const *v, size_t cnt) {
-    memset(g_route, 0, sizeof(g_route));
+/* Строки карты v → таблица t. only_auto — заполнять только ячейки, о которых t молчит (подбор не
+ * перебивает пути, заданные человеком в настройках). Число принятых строк. */
+static size_t route_parse(struct dc_route *t, const char *const *v, size_t cnt, int only_auto) {
     size_t n = 0;
     for (size_t li = 0; li < cnt; li++) {
         char who[16], how[16], dom[ALT_NAME], tail[2];
@@ -478,12 +488,13 @@ static void route_init(const char *const *v, size_t cnt) {
         long dcn = k >= 1 ? strtol(who, &we, 10) : 0;
         int okdc = k >= 2 && we && !*we && we != who && ((dcn >= 1 && dcn <= 5) || dcn == 203);
         int i = okdc ? route_idx((int)dcn, media) : -1;
+        if (i >= 0 && only_auto && t[i].how != RT_AUTO) continue;
         if (i >= 0 && k == 2 && !strcmp(how, "direct")) {
-            g_route[i].how = RT_DIRECT;
-            g_route[i].domain[0] = '\0';
+            t[i].how = RT_DIRECT;
+            t[i].domain[0] = '\0';
         } else if (i >= 0 && k == 3 && !strcmp(how, "ws")) {
-            g_route[i].how = RT_WS;
-            snprintf(g_route[i].domain, sizeof(g_route[0].domain), "%s", dom);
+            t[i].how = RT_WS;
+            snprintf(t[i].domain, sizeof(t[0].domain), "%s", dom);
         } else {
             /* Негодная строка называется: молча пропущенная, она выглядела бы как «карта не действует». */
             fprintf(stderr, LOG_W "путь ДЦ «%s» не понят — нужно «НОМЕР[m] direct» или «НОМЕР[m] ws ДОМЕН»\n", line);
@@ -491,7 +502,30 @@ static void route_init(const char *const *v, size_t cnt) {
         }
         n++;
     }
+    return n;
+}
+
+static void route_init(const char *const *v, size_t cnt) {
+    memset(g_route_set, 0, sizeof(g_route_set));
+    size_t n = route_parse(g_route_set, v, cnt, 0);
+    atomic_store_explicit(&g_rt, g_route_set, memory_order_release);
     if (n) fprintf(stderr, LOG_I "путей ДЦ из настроек: %zu\n", n);
+}
+
+int tgws_route_pick(const char *const *v, size_t cnt) {
+    struct dc_route t[ROUTE_N];
+    memcpy(t, g_route_set, sizeof(t));
+    route_parse(t, v, cnt, 1);
+    const struct dc_route *cur = g_route;
+    if (!memcmp(t, cur, sizeof(t))) return 0;
+    struct dc_route *nt = malloc(sizeof(t));
+    if (!nt) return -1;
+    memcpy(nt, t, sizeof(t));
+    atomic_store_explicit(&g_rt, nt, memory_order_release);
+    /* Прямой путь, который подбор только что подтвердил, — не в отставке. */
+    for (int i = 0; i < ROUTE_N; i++)
+        if (nt[i].how == RT_DIRECT && cur[i].how != RT_DIRECT) g_direct_bad[i] = 0;
+    return 1;
 }
 
 /* Домен этого ДЦ по карте; NULL — карта про него молчит, значит общий порядок.
@@ -537,7 +571,6 @@ static const char *route_domain(int dc, int media) {
  * соединении (см. direct_prove), а неудача записывается сюда: следующие несколько минут этот
  * ДЦ идёт в мост без попытки, чтобы не платить ожиданием на каждом соединении. */
 #define DIRECT_BAD_S 300
-static time_t g_direct_bad[ROUTE_N];
 
 static int route_direct_now(int dc, int media, time_t now) {
     int i = route_idx(dc, media);

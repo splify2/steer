@@ -16,7 +16,10 @@
 #
 #   5. hello с API и id, хук check, разбор аргументов tgws-probe;
 #   6. мост по {conf}: слушает порт из output.ports, говорит up, читает настройки плагина (settings.json:
-#      пул, пути, адреса ДЦ, WARP) и перезапускается сам, когда их переписали.
+#      пул, пути, адреса ДЦ, WARP) один раз; перезапуск по новым настройкам — подписью ядра (steer-api 1.5).
+#
+#   7. переход со stgws: scripts/postinst переносит пул, адреса ДЦ, WARP и домен по умолчанию микропакета в
+#      настройки плагина и выводит его службу из работы.
 #
 # Мост целиком (перехват в ядре Linux, веб-сокет, поток) — tests/run-tgws.sh (root, сетевые пространства).
 set -u
@@ -187,20 +190,17 @@ EOF
     has "туннели WARP из настроек" "$log" "WARP: туннелей для моста 1"
     has "ДЦ2 своим доменом по пути из настроек" "$log" "ДЦ2: web.telegram.org, запасной c.example и пул"
     has "ДЦ4 напрямую по пути из настроек" "$log" "ДЦ4: напрямую, не перехватывая"
+    has "подбор путей — по умолчанию включён, домены: выхода и пул" "$log" "подбор путей включён: доменов 3"
     check "порт занят мостом" "1" "$(python3 -c "
 import socket,sys
 s=socket.socket()
 try: s.connect(('127.0.0.1',$mp)); print(1)
 except Exception: print(0)" 2>/dev/null)"
-    # Настройки переписаны (так их пишет панель — plugin_settings_set): мост выходит сам, супервизор ядра
-    # поднимает его заново уже с ними.
-    sleep 0.2
+    # Настройки переписаны (так их пишет панель — plugin_settings_set): мост сам за файлом не следит и не
+    # выходит — перезапуск по подписи ведёт ядро (steer.settings: "restart", steer-api 1.5; pluginmodel).
     printf '{"domains":["z.example"]}\n' > "$tmp/pconf/settings.json.new" && mv "$tmp/pconf/settings.json.new" "$tmp/pconf/settings.json"
-    n=0
-    while kill -0 "$bp" 2>/dev/null && [ "$n" -lt 60 ]; do sleep 0.1; n=$((n + 1)); done
-    check "настройки переписаны — мост вышел сам (перезапуск супервизором)" "no" "$(kill -0 "$bp" 2>/dev/null && echo yes || echo no)"
-    has "  и сказал down с причиной" "$(cat "$tmp/ev")" '{"ev":"down","why":"'
-    has "  в журнале — почему" "$(cat "$tmp/log")" "настройки изменились — перезапуск моста"
+    sleep 2.5
+    check "настройки переписаны — мост не выходит сам (перезапуск — по подписи ядра)" "yes" "$(kill -0 "$bp" 2>/dev/null && echo yes || echo no)"
     kill "$bp" 2>/dev/null
     wait "$bp" 2>/dev/null
     # Негодный файл настроек мост не роняет: Telegram без пула лучше, чем без моста.
@@ -214,6 +214,32 @@ except Exception: print(0)" 2>/dev/null)"
     kill "$bp" 2>/dev/null
     wait "$bp" 2>/dev/null
 fi
+
+# ---- 7. переход со stgws: scripts/postinst переносит настройки микропакета ---------------------------
+PI=plugins/tgws/scripts/postinst
+R="$tmp/mig"
+mkdir -p "$R/etc/stgws" "$R/etc/init.d" "$R/conf"
+printf 'a.example\n# комментарий\nbad_dom\nb.example хвост\n' > "$R/etc/stgws/tgws-domains.lst"
+printf 'z.example\n' > "$R/etc/stgws/domain"
+printf '149.154.167.220 2\n1.2.3.4 9\n149.154.164.250   4 media\n' > "$R/etc/stgws/tgws-dc.conf"
+printf 'zmwarp\n' > "$R/etc/stgws/warp.lst"
+printf '#!/bin/sh\n# служба stgws\necho "$1" >> "%s/svc.log"\n' "$R" > "$R/etc/init.d/tgws"
+chmod +x "$R/etc/init.d/tgws"
+TGWS_MIGRATE_ROOT="$R" STEER_PLUGIN_CONF="$R/conf" sh "$PI" --check >/dev/null 2>&1
+check "postinst --check ничего не пишет" "no" "$([ -e "$R/conf/settings.json" ] && echo yes || echo no)"
+o="$(TGWS_MIGRATE_ROOT="$R" STEER_PLUGIN_CONF="$R/conf" sh "$PI" "" 2>&1)"
+check "postinst первой установки — код 0" "0" "$?"
+check "настройки stgws перенесены (домен по умолчанию первым, негодное пропущено)" \
+    '{"pick":true,"domains":["z.example","a.example","b.example"],"dc_addresses":["149.154.167.220 2","149.154.164.250 4 media"],"warp":["zmwarp"]}' \
+    "$(cat "$R/conf/settings.json" 2>/dev/null)"
+has "  негодная строка названа" "$o" "«1.2.3.4 9» не подходит"
+check "служба stgws остановлена и снята с автозапуска" "stop disable" "$(tr '\n' ' ' < "$R/svc.log" | sed 's/ $//')"
+printf '{"domains":["mine.example"]}\n' > "$R/conf/settings.json"
+TGWS_MIGRATE_ROOT="$R" STEER_PLUGIN_CONF="$R/conf" sh "$PI" "" >/dev/null 2>&1
+check "настройки уже есть — не тронуты" '{"domains":["mine.example"]}' "$(cat "$R/conf/settings.json")"
+rm -f "$R/conf/settings.json"
+TGWS_MIGRATE_ROOT="$R" STEER_PLUGIN_CONF="$R/conf" sh "$PI" "2.1.0" >/dev/null 2>&1
+check "обновление плагина — перехода нет" "no" "$([ -e "$R/conf/settings.json" ] && echo yes || echo no)"
 
 echo "tgwsmatch: $pass ok, $fail fail"
 [ "$fail" -eq 0 ]

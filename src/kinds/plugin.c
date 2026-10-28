@@ -481,6 +481,10 @@ static struct plugin_kind *kind_load(const struct plugin *pl, const struct ynode
         kind_free(k);
         return NULL;
     }
+    /* paths (steer-api 1.5): помощник отставляет пути событием health — status выхода несёт paths_down
+     * всегда (пустой — отставленных нет), а не только после первого события. */
+    int pb = 0;
+    if (ynode_get(kn, "paths") && ynode_bool(ynode_get(kn, "paths"), &pb) == 0) k->paths = pb;
     const struct ynode *tx = ynode_get(kn, "texts");
     if (tx && tx->kind == YN_MAP) {
         k->lan_only = xdup(m_str(tx, "lan_only"));
@@ -543,6 +547,17 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
         if (r < 0) { snprintf(why, sizeof(why), "compat.steer-api: «%s» — диапазон не разобран", compat->str); ydoc_free(d); goto bad; }
         if (!r) {
             snprintf(why, sizeof(why), "%s %s требует steer-api %s, у ядра %s", id, ver, compat->str, STEER_API_VERSION);
+            ydoc_free(d);
+            goto bad;
+        }
+    }
+    /* steer.settings (steer-api 1.5): "restart" — настройки плагина (conf/<id>/settings.json) входят в
+     * подпись перезапуска всех его помощников и служб; хост, записав их, зовёт reload. */
+    {
+        const char *sv = m_str(st, "settings");
+        if (sv && !strcmp(sv, "restart")) p->settings_restart = 1;
+        else if (sv) {
+            snprintf(why, sizeof(why), "steer.settings — только «restart», а не «%s»", sv);
             ydoc_free(d);
             goto bad;
         }
@@ -1785,6 +1800,24 @@ char *plugin_conf_json(const struct spec *sp, const struct output *o, const stru
     return b.p;
 }
 
+/* Настройки плагина в подписи перезапуска (steer.settings: "restart", steer-api 1.5): содержимое
+ * <etc>/conf/<id>/settings.json; файла нет — свой знак, чтобы появление и удаление файла тоже меняли
+ * подпись. Хост пишет файл атомарно (переименованием) и зовёт reload — помощник поднимается сразу,
+ * без паузы перезапуска и без слежки за файлом в самом плагине. */
+static void settings_sig(const struct plugin *pl, unsigned long long *sig) {
+    if (!pl->settings_restart) return;
+    char etc[PATH_MAX], path[2 * PATH_MAX];
+    plugin_etc(etc, sizeof(etc));
+    snprintf(path, sizeof(path), "%s/conf/%s/settings.json", etc, pl->id);
+    FILE *f = fopen(path, "r");
+    if (!f) { kind_sig_mix(sig, "settings:-", 10); return; }
+    kind_sig_mix(sig, "settings:", 9);
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) kind_sig_mix(sig, buf, n);
+    fclose(f);
+}
+
 /* Помощник выхода: программа плагина с раскрытым argv. Подпись перезапуска — версия плагина и
  * ключи вида (а когда {conf} пишет демон — хеш его содержимого, steer-api.md, 1.4). */
 int plugin_kind_helper(const struct plugin_kind *pk, const struct spec *sp, const struct output *o,
@@ -1795,6 +1828,7 @@ int plugin_kind_helper(const struct plugin_kind *pk, const struct spec *sp, cons
     if (kind_helper_cmd(h, pk->helper_cmd ? pk->helper_cmd : pk->name) != 0) return -1;
     if (kind_helper_prog(h, pk->helper.prog) != 0) return -1;
     h->plugin = pl->id;
+    h->paths = pk->paths;
     /* {conf} несёт метки и таблицы — супервизор без демона назначает их до сбора (kind.h, marks). */
     h->marks = 1;
     char conf[PATH_MAX];
@@ -1828,6 +1862,7 @@ int plugin_kind_helper(const struct plugin_kind *pk, const struct spec *sp, cons
     if (!cj) return -1;
     kind_sig_mix(&h->sig, cj, strlen(cj));
     free(cj);
+    settings_sig(pl, &h->sig);
     const char *kj = out_plugin_keys(o);
     if (pk->watch_n && kj) {
         struct err e;
@@ -1869,6 +1904,7 @@ int plugin_svc_helper(const struct plugin_svc *sv, const struct spec *sp, struct
         mkdir(d, 0700);
     }
     kind_sig_mix(&h->sig, pl->version, strlen(pl->version));
+    settings_sig(pl, &h->sig);
     for (size_t i = 0; i < sv->run.argc; i++) {
         char *a = subst(pl, sp, NULL, NULL, sv->run.argv[i], why, sizeof(why));
         if (!a) {

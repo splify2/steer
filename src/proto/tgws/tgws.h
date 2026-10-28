@@ -23,6 +23,11 @@ struct tgws_opts {
     const char *const *warp;  size_t warp_n;
 };
 
+/* Пути, подобранные замером (настройка плагина `pick`): строки в формате `routes` («2 ws домен»,
+ * «4 direct»). Действуют только там, где настройки (`routes`) о ДЦ молчат; таблица подменяется на ходу,
+ * без перезапуска моста. 1 — карта изменилась, 0 — та же, -1 — нет памяти. */
+int tgws_route_pick(const char *const *v, size_t n);
+
 /* Поднять мост выхода. Не возвращается, пока жив. */
 int tgws_serve(const struct tgws_opts *o);
 

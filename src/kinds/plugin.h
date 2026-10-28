@@ -99,6 +99,8 @@ struct plugin_kind {
     char *lan_only, *novia, *selfnat_why;
     char *desc;                 /* kinds[].description, иначе description плагина; NULL — нет */
     int health_events;          /* health: events — здоровье и задержку судит помощник (up/down), а не проба */
+    int paths;                  /* paths: true — помощник отставляет пути (событие health): status выхода несёт
+                                 * paths_down всегда, пустым массивом — когда отставленных нет (steer-api 1.5) */
     char *helper_when;          /* helper.when — помощник только у выходов с этим ключом (вид ядра impl: core) */
     char **watch;  size_t watch_n;  /* ключи x-watch: содержимое их файлов — в подпись перезапуска */
     struct kind_ops ops;        /* запись вида: её и возвращает реестр видов (kind_by_name) */
@@ -127,6 +129,7 @@ struct plugin {
     struct plugin_svc *svc;  size_t svc_n;       /* steer.services[], в порядке манифеста */
     struct plugin_prog pre_apply;       /* prog NULL — хука нет */
     int has_hooks;              /* есть check, expand, pre_apply или ресурсы видов: от них зависит подготовка спеки */
+    int settings_restart;       /* steer.settings: "restart" — settings.json плагина в подписи его помощников и служб (1.5) */
     unsigned res_ports, res_queues, res_marks;   /* resources манифеста: сколько на весь плагин */
     char **kind_names;  size_t kind_names_n;    /* имена видов манифеста — и у выключенного плагина: для отказа «плагин X отключён» */
     char **requires;  size_t requires_n;    /* requires.plugins: id плагинов, раньше которых идут хуки */

@@ -62,7 +62,6 @@ struct cli_args {
      * обычном выводе: по строке на выход читает init-скрипт, и вторая колонка в ней сломала бы
      * его чтение молча. */
     int via;
-    const char *forward;
     const char *config;      /* конфигурация xsteer в стиле wg */
     /* Куда положить результат и где лежит его спутник. Понадобились подписке: движок теперь
      * сам её скачивает, а какой из подписок роутера она принадлежит — знает только
@@ -88,7 +87,7 @@ struct cli_args {
     int stream, stream_port;
     const char *pos[CLI_MAXPOS];
     int npos;
-    int dry_run, verbose, obfs, node, timeout, listen;
+    int dry_run, verbose, obfs;
     /* --fast: отдать запомненный ответ, ничего не пересчитывая. Пока это только `status`
      * (см. комментарий про снимок состояния в daemon/status.c), но флаг общий нарочно: «отдай, что
      * помнишь» — это свойство ответа, а не одной команды, и второе имя для того же смысла у
@@ -96,10 +95,8 @@ struct cli_args {
     int fast;
     /* --json: `spec convert` печатает спеку JSON-объектом (spec_print_v2_json, v2print.c). */
     int json;
-    /* --insecure у *-nodes и *-probe по ФАЙЛУ подписки: узлы с allowInsecure пригодны, как у выхода с
-     * `insecure: true`, и номера узлов совпадают с его номерами. С именем выхода — отказ (modcmd.c):
-     * там решает ключ insecure самого выхода. */
-    int insecure;
+    /* Флаги подкоманд протоколов и моста (--node, --timeout, --listen, --insecure, --forward) сняты: с 2.1
+     * эти подкоманды — программы плагинов, и флаги разбирает каждая сама (plugkit, pk_opt). */
 };
 
 const struct cli_cmd *cli_lookup(const char *name);
@@ -112,7 +109,7 @@ void cli_usage_short(FILE *out);
 void cli_version(FILE *out);
 /* Версии осей совместимости плагинов, которые даёт это ядро (manifest.md, «compat»). steer-api — одно
  * число на всё ядро: реестр плагинов (STEER_API_VERSION, kinds/plugin.h), менеджер и version --json. */
-#define CLI_STEER_API "1.4"
+#define CLI_STEER_API "1.5"
 #define CLI_STEER_ABI "1.0"
 void cli_version_json(FILE *out);
 const char *cli_core_version(void);

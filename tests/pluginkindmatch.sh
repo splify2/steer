@@ -230,7 +230,7 @@ while read -r n p; do
 done < "$tmp/real.txt"
 check "nft-map: приоритеты цепочек ядра совпадают с набором правил" "" "$miss"
 
-has "version --json: версия steer-api, по которой плагины сверяют compat" "$("$BIN" version --json 2>&1)" '"api":"1.4","abi":"1.0"'
+has "version --json: версия steer-api, по которой плагины сверяют compat" "$("$BIN" version --json 2>&1)" '"api":"1.5","abi":"1.0"'
 
 # ================= 5. подкоманда из манифеста ===========================================================
 check "подкоманда плагина исполняется" "hello from plugin: hello a b" "$("$BIN" fake-hello a b 2>&1)"
@@ -287,7 +287,7 @@ cat > "$ROOT/clash/plugin.json" <<'EOF'
   "steer": { "commands": [{ "name": "apply", "prog": "bin/x" }, { "name": "fake-hello", "prog": "bin/x" }] } }
 EOF
 st="$(stat ok)"
-has "несовместимый steer-api: плагин выключен с числами" "$st" 'oldapi 1.0.0 требует steer-api ^2.0, у ядра 1.4'
+has "несовместимый steer-api: плагин выключен с числами" "$st" 'oldapi 1.0.0 требует steer-api ^2.0, у ядра 1.5'
 has "имя команды ядра плагину не даётся" "$st" 'подкоманда apply — команда ядра'
 check "  команда ядра осталась ядру" "table" "$("$BIN" apply --dry-run --spec "$tmp/ok.yaml" 2>&1 | head -1 | cut -d' ' -f1)"
 rm -rf "$ROOT/oldapi" "$ROOT/clash"
@@ -370,9 +370,9 @@ EOF
 rm -rf "$ETC/cache" "$ETC/alloc.json"
 rs="$(dry ok)"
 al="$(grep 'plugin:svcplug' "$ETC/alloc.json" | sed 's/,$//')"
-check "ресурсы плагина: порт, две очереди, три бита метки вне поля steer и соседей" \
-    '"plugin:svcplug":{"ports":[10480],"queues":[4300,4301],"mark_bits":[31,15,14]}' "$al"
-has "{mark} — маска выданных битов" "$rs" "meta mark & 0x8000c000 == 0x8000c000 return"
+check "ресурсы плагина: порт, две очереди, три бита метки вне поля steer и соседей (бит 28 свободен с 2.1)" \
+    '"plugin:svcplug":{"ports":[10480],"queues":[4300,4301],"mark_bits":[31,28,15]}' "$al"
+has "{mark} — маска выданных битов" "$rs" "meta mark & 0x90008000 == 0x90008000 return"
 has "{queue0}" "$rs" "queue flags bypass to 4300"
 has "{port0} и {queue1}" "$rs" "udp dport 10480 counter queue to 4301"
 # соседний плагин не получает те же номера
