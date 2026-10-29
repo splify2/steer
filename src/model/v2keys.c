@@ -185,6 +185,8 @@ static const struct v2key T[] = {
       "\"global\"", "\"global\"", "device|global", .needs = "device:for" },
     { V2S_RULE, "quic", VT_STR, 0, "block — UDP/443 к назначениям правила отвергается; allow — не трогать.", "\"allow\"",
       "\"block\"", "block|allow" },
+    { V2S_RULE, "torrent", VT_STR, 0, "Торренты клиентов правила: block — не пропускать, direct — напрямую мимо выхода "
+      "правила; allow — как весь трафик правила.", "\"allow\"", "\"block\"", "block|direct|allow" },
     { V2S_RULE, "family", VT_STR, 0, "Семейство IP правила: 4, 6 или both.", "\"both\"", "\"both\"", "4|6|both" },
     { V2S_RULE, "on_family_unavailable", VT_STR, 0, "Что делать, когда выход не несёт IPv6: fallback — остаться по IPv4, "
       "block — отказать.", "\"fallback\"", "\"fallback\"", "fallback|block", .when = "family=6" },

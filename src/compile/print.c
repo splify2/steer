@@ -769,7 +769,8 @@ static void print_elements(FILE *f, const struct nft_set *s) {
     int composite = s->key && strstr(s->key, " . ") != NULL;
     const struct ir_seed *seed = NULL;
     size_t nseed = 0;
-    if (g_print_state_seed && g_print_seed && !s->data && (s->flags & NFT_SET_TIMEOUT))
+    if (g_print_state_seed && g_print_seed && !s->data && (s->flags & NFT_SET_TIMEOUT) &&
+        !(s->flags & NFT_SET_DYNAMIC))
         nseed = g_print_seed(s->o.name, fam, &seed);
     const struct ir_mixed *mix = NULL;
     int list = 0;
@@ -821,10 +822,13 @@ static void print_set(FILE *f, const struct nft_set *s) {
     if (s->flags) {
         fprintf(f, "        flags ");
         const char *sep = "";
+        if (s->flags & NFT_SET_DYNAMIC) { fprintf(f, "%sdynamic", sep); sep = ","; }
         if (s->flags & NFT_SET_INTERVAL) { fprintf(f, "%sinterval", sep); sep = ","; }
         if (s->flags & NFT_SET_TIMEOUT) fprintf(f, "%stimeout", sep);
         fprintf(f, "\n");
     }
+    if (s->size) fprintf(f, "        size %lu\n", s->size);
+    if (s->timeout) fprintf(f, "        timeout %s\n", s->timeout);
     if (s->auto_merge) fprintf(f, "        auto-merge\n");
     print_elements(f, s);
     fprintf(f, "    }\n");

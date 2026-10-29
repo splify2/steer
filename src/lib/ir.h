@@ -93,6 +93,9 @@ struct nft_obj {
 
 #define NFT_SET_INTERVAL 1u
 #define NFT_SET_TIMEOUT  2u
+/* Набор, который пополняет сам пакетный путь (`update @набор { … }`): флаг dynamic, а с ним — свой
+ * срок элементов (timeout) и потолок (size) набора; ядро без size ставит такому набору 65535. */
+#define NFT_SET_DYNAMIC  4u
 
 enum nft_elk {
     NFT_EL_VALUE,               /* s — один элемент как есть */
@@ -138,6 +141,8 @@ struct nft_set {
     const char *data;           /* не NULL — это карта (map), тип значения */
     unsigned flags;             /* NFT_SET_* */
     int auto_merge;
+    unsigned long size;         /* 0 — строки size нет */
+    const char *timeout;        /* срок элементов набора («10m»); NULL — строки timeout нет */
     struct nft_elsrc *els, **els_tail;
 };
 
