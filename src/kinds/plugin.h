@@ -137,6 +137,8 @@ struct plugin {
     struct pnft **nftp;
     char *manifest;             /* байты plugin.json — в ключ подготовки */
     size_t manifest_len;
+    unsigned long long build;   /* сборка: хеш plugin.json и MANIFEST (sha256 всех файлов) — у той же версии другой
+                                   сборки другое число (plugin_build_sig) */
 };
 
 /* ---- реестр ---- */
@@ -153,6 +155,10 @@ int plugin_reload(const char *root);
 size_t plugin_n(void);
 const struct plugin *plugin_at(size_t i);
 const struct plugin *plugin_find(const char *id);
+/* Сборка плагина и библиотек, которые он требует (requires.plugins), — в подпись sig: подпись перезапуска
+ * помощников и служб, ключи кэша подготовки спеки и хуков. Переставили net1 или сам плагин той же версии, но
+ * другой сборки — помощник перезапускается, а хуки исполняются заново, а не отвечают из кэша. */
+void plugin_build_sig(const struct plugin *pl, unsigned long long *sig);
 
 /* Вид плагина по имени манифеста («tunnel:vless»); NULL — нет такого у включённого плагина. */
 const struct plugin_kind *plugin_kind_find(const char *name);

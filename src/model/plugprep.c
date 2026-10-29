@@ -80,7 +80,8 @@ static int needs_prepare(void) {
 }
 
 /* Ключ подготовки: байты спеки человека, затем у каждого включённого плагина с хуками — id, версия,
- * plugin.json и MANIFEST (если есть). */
+ * plugin.json, MANIFEST (если есть) и сборки библиотек, которые он требует (plugin_build_sig): переставленная
+ * net1 той же версии — повод исполнить хуки заново. */
 static int prepare_key(const char *human, size_t hn, char key[65]) {
     struct sbuf b = { 0 };
     sb_put(&b, human, hn);
@@ -98,6 +99,9 @@ static int prepare_key(const char *human, size_t hn, char key[65]) {
         size_t mn;
         char *mt = slurp(mp, &mn);
         if (mt) { sb_put(&b, "\0", 1); sb_put(&b, mt, mn); free(mt); }
+        unsigned long long bs = 0;
+        plugin_build_sig(p, &bs);
+        sb_put(&b, (const char *)&bs, sizeof(bs));
     }
     int rc = b.oom || !b.p ? -1 : sha_hex(b.p, b.n, key);
     free(b.p);
@@ -374,11 +378,16 @@ static int hook_run(const struct plugin *pl, const struct plugin_prog *p, const 
                     struct err *e) {
     *stdout_txt = NULL;
     *why = NULL;
-    /* Ключ кэша: что запускали и что подали. */
+    /* Ключ кэша: что запускали (версия и сборка плагина и его библиотек, программа, argv) и что подали. */
     struct sbuf kb = { 0 };
     sb_str(&kb, label);
     sb_put(&kb, "\0", 1);
     sb_str(&kb, pl->version);
+    {
+        unsigned long long bs = 0;
+        plugin_build_sig(pl, &bs);
+        sb_put(&kb, (const char *)&bs, sizeof(bs));
+    }
     sb_put(&kb, "\0", 1);
     sb_str(&kb, p->prog);
     for (size_t i = 0; i < p->argc; i++) { sb_put(&kb, "\0", 1); sb_str(&kb, p->argv[i]); }
