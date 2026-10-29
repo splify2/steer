@@ -28,6 +28,11 @@
  *     идут с одного порта, и всё с него дальше — торрент;
  *   - torrent_peer[6] — пир (клиент . адрес . порт назначения) из рукопожатия TCP, SYN uTP и трекера:
  *     следующее соединение к тому же пиру — торрент, в том числе шифрованное (MSE) и по TCP после uTP.
+ *     Только пиры на портах от 1024: адрес и порт пира приходят от роя (трекер, DHT, PEX), и в нём
+ *     бывают чужие адреса — в том числе CDN на 80 и 443. Запомни роутер такой «пир» — обычный HTTPS
+ *     клиента к этому адресу отвергался бы весь срок памяти (снято на стенде QEMU: рукопожатие к
+ *     1.1.1.1:80 закрыло клиенту HTTP к 1.1.1.1). Торрент-клиенты слушают порты от 1024; соединение
+ *     с признаком к порту ниже отвергается само по себе, без памяти.
  * Потолок набора — TORRENT_SIZE: набор, который пополняют пакеты клиентов, ядро без потолка не
  * заводит (size 0 оно само делает 65535), а без предела любое устройство в сети наполняло бы память
  * роутера. Переполнение не отказ: новые записи не запоминаются (update — отдельным правилом, его неудача
@@ -153,11 +158,13 @@ static void torrent_policy(struct nft_table *t, int pol) {
     r = ir_rule(pc);
     ir_rule_fam(r, 4);
     ir_family(r, 4);
+    ir_x(r, "th dport >= 1024");
     ir_setref(r, "ip saddr . ip daddr . th dport", "torrent_peer");
     ir_x(r, "goto %s", peer);
     r = ir_rule(pc);
     ir_rule_fam(r, 6);
     ir_family(r, 6);
+    ir_x(r, "th dport >= 1024");
     ir_setref(r, "ip6 saddr . ip6 daddr . th dport", "torrent_peer6");
     ir_x(r, "goto %s", peer);
     torrent_sig(pc, peer, hit);
@@ -167,11 +174,11 @@ static void torrent_policy(struct nft_table *t, int pol) {
     r = ir_rule(cp);
     ir_rule_fam(r, 4);
     ir_family(r, 4);
-    ir_x(r, "update @torrent_peer { ip saddr . ip daddr . th dport }");
+    ir_x(r, "th dport >= 1024 update @torrent_peer { ip saddr . ip daddr . th dport }");
     r = ir_rule(cp);
     ir_rule_fam(r, 6);
     ir_family(r, 6);
-    ir_x(r, "update @torrent_peer6 { ip6 saddr . ip6 daddr . th dport }");
+    ir_x(r, "th dport >= 1024 update @torrent_peer6 { ip6 saddr . ip6 daddr . th dport }");
     ir_x(ir_rule(cp), "goto %s", hit);
 
     r = ir_rule(ch);

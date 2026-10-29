@@ -226,6 +226,12 @@ send tcp-tls-hello 42101; p3=$p
 check "память пира: TCP к пиру из uTP (как MSE) — отказ" "-" "$(where "$p3")"
 send tcp-tls-hello 42102; p4=$p
 check "  к другому порту — в туннель" "T" "$(where "$p4")"
+# Пир на порту ниже 1024 не запоминается: адрес из роя бывает чужим (CDN на 443), и память закрыла
+# бы клиенту обычный HTTPS к нему. Само соединение с признаком отвергается.
+send tcp-bt-handshake 443; p5=$p
+check "рукопожатие к порту 443 — отказ" "-" "$(where "$p5")"
+send tcp-http-get 443; p6=$p
+check "  а обычный TCP к тому же адресу и порту — в туннель (пир < 1024 не запомнен)" "T" "$(where "$p6")"
 check "status: поле torrent со счётчиком отказов" "1" \
     "$("$BIN" status --spec "$tmp/s.yaml" --state-dir "$tmp/st" 2>/dev/null | grep -c '"torrent":{"blocked":{"packets":[1-9]')"
 check "status: запомнены сокеты и пиры" "1" \
