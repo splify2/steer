@@ -130,6 +130,18 @@ static int flow_rejected(const struct flow_key *k, int udp) {
  * ответ на который ещё едет. */
 #define DNS_IDLE_S 10
 
+/* Поток UDP, на который узел не ответил ни одной датаграммой, после стольких секунд тишины клиента
+ * закрывается: столько держит неотвеченный поток UDP и conntrack ядра (nf_conntrack_udp_timeout).
+ *
+ * ЗАЧЕМ. Поток UDP — это связь с узлом и её дескриптор. DHT торрента и QUIC вкладок, которым никто не
+ * отвечает, шлют по датаграмме на новый адрес десятки раз в секунду, и каждый такой поток держался
+ * IDLE_EVICT_S (120 с): при 50 потоках в секунду это шесть тысяч связей, а у службы роутера дескрипторов
+ * 4096 (жёсткий предел procd) — выход упирался в EMFILE, и новые соединения через него переставали
+ * открываться, пока поток мёртвых датаграмм не стихнет (стенд tests/vless-soak.sh, UDP_SPRAY=50
+ * NOFILE=4096). Ответивший поток живёт прежние IDLE_EVICT_S: игре и звонку между пакетами нужна
+ * свобода, а неотвеченному — нет. */
+#define UDP_UNREPLIED_S 30
+
 /* ---- таблица соединений: горячее отдельно от толстого -----------------------
  *
  * Раньше это была одна структура, и в ней рядом лежали флаг `used` (1 байт, читается на
@@ -278,6 +290,9 @@ struct conn {
      * не упёрлась в EAGAIN). Подписка не перестраивается на каждом проходе: так у стороны узла было 36-41
      * вызова epoll_ctl на МБ (см. разбор событий в worker_loop). */
     uint8_t carmed;
+    /* Поток UDP: от узла пришла хоть одна датаграмма (emit_dgram). Поток без ответа держится не
+     * IDLE_EVICT_S, а UDP_UNREPLIED_S (conn_deadlines). */
+    uint8_t udp_replied;
 };
 
 /* Горячая запись обязана оставаться маленькой — в этом весь смысл разделения. Проверка
@@ -1834,6 +1849,7 @@ static int emit_dgram(void *arg, const unsigned char *p, size_t n) {
      * поток, по которому идёт только приём (а таких у UDP полно — те же обновления от
      * игрового сервера), иначе убрали бы по простою прямо во время работы. */
     c->last = g_now_s;
+    c->udp_replied = 1;
     return 0;
 }
 
@@ -2766,6 +2782,10 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
      * RST обязателен. Прежде здесь было молчаливое conn_drop, и клиент оставался с
      * соединением, которое считает открытым: следующий запрос по нему уходил в
      * пустоту и ждал таймаута — то есть наша уборка выглядела как зависший сайт. */
+    if (c->is_udp && !c->udp_replied && g_now_s - c->last > UDP_UNREPLIED_S) {
+        conn_reset(c, tun);                 /* у UDP это просто закрытие */
+        return 1;
+    }
     if (g_now_s - c->last > IDLE_EVICT_S) {
         /* Порог тот же, что у TCP, и это не экономия на константе. Простаивающий
          * поток UDP — это, как правило, QUIC между запросами: у него свой таймаут
@@ -3972,6 +3992,34 @@ static void stack_setup(const struct dialer *d) {
     for (int i = 0; i < SPARE_MAX; i++) g_spares[i].sess = m + (size_t)i * g_sess_stride;
 }
 
+/* Дескрипторы: соединению клиента нужно два-три (сокет клиента, связь с узлом, вторая связь), потоку UDP —
+ * связь с узлом. При мягком пределе 1024 таблица без предела упёрлась бы в него на пятой сотне соединений
+ * (I-529), и мягкий поднимался до жёсткого. Жёсткий у службы роутера — 4096 (procd), и это тоже чужое
+ * число, а не причина: дом, где через выход идёт всё (десятки устройств, торрент, QUIC), упирался в него,
+ * и выход «отваливался» — новые соединения получали EMFILE, пока старые не уйдут. Поэтому у кого есть
+ * право (CAP_SYS_RESOURCE: служба роутера — root) жёсткий предел поднимается до fs.nr_open ядра; без
+ * права — мягкий до жёсткого, как прежде. Возвращает итоговый мягкий предел. */
+static unsigned long stack_nofile_raise(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return 0;
+    rlim_t want = 0;
+    FILE *f = fopen("/proc/sys/fs/nr_open", "r");
+    if (f) {
+        unsigned long v;
+        if (fscanf(f, "%lu", &v) == 1) want = (rlim_t)v;
+        fclose(f);
+    }
+    if (want > rl.rlim_max) {
+        struct rlimit up = { want, want };
+        if (setrlimit(RLIMIT_NOFILE, &up) == 0) return (unsigned long)want;
+    }
+    if (rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) getrlimit(RLIMIT_NOFILE, &rl);
+    }
+    return (unsigned long)rl.rlim_cur;
+}
+
 /* host_fd < 0 — устройство заводит и поднимает сам стек (stack_run); иначе это готовый TUN хоста
  * (stack_run_fd), и ни очередей, ни адреса, ни программы раздачи стек не трогает. */
 static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack_ready_fn ready, void *arg,
@@ -3982,14 +4030,7 @@ static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack
     /* Порт слушателя TCP (R-152): соединения клиентов, перенаправленные правилом nft, принимаются здесь, а не
      * пакетами через TUN. Порт выводится из метки выхода (out_tcp_port) — так же его выводит демон, ставя
      * элемент карты перенаправления; STEER_TUN_TCPPORT — для стендов без демона. */
-    /* Дескрипторы: соединению клиента нужно два-три (сокет клиента, связь с узлом, вторая связь), и при
-     * мягком пределе 1024 таблица без предела упёрлась бы в него на пятой сотне соединений. Мягкий
-     * предел поднимается до жёсткого — права для этого не нужны (I-529). */
-    struct rlimit rl;
-    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
-        rl.rlim_cur = rl.rlim_max;
-        setrlimit(RLIMIT_NOFILE, &rl);
-    }
+    stack_nofile_raise();
     if (o->mark) g_kport = o->tcp_port;
     if (getenv("STEER_TUN_TCPPORT")) {
         int pt = atoi(getenv("STEER_TUN_TCPPORT"));
