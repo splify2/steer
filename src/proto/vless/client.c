@@ -213,24 +213,15 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
      * включать его в задержку значило бы мерить свою же работу. */
     if (ttfb_ms) *ttfb_ms = (int)(now_ms() - t_sent);
 
-    /* Ответ Vision тоже в кадрах, и первым в них идёт заголовок VLESS. Разворачиваем
-     * до разбора: иначе version-байт читался бы из поля команды кадра. */
-    const unsigned char *body = buf;
-    size_t body_n = got;
-    if (node->flow[0]) {
-        struct vision rv;
-        memset(&rv, 0, sizeof(rv));
-        size_t used = 0;
-        const unsigned char *pl = NULL;
-        size_t pl_n = 0;
-        if (vision_unwrap(&rv, buf, got, &used, &pl, &pl_n) == 0 && pl) {
-            body = pl;
-            body_n = pl_n;
-        }
-    }
-
+    /* Заголовок ответа VLESS идёт ДО кадров Vision и обёрткой не покрыт — разбирается из буфера как
+     * есть, тем же порядком, что у туннеля (vl_deliver: сначала заголовок, потом кадры). Прежде здесь
+     * сперва разворачивался кадр Vision — состоянием, объявленным внутри блока и обнулённым вместо UUID
+     * узла, — и разбор читал заголовок из rx_pre этого состояния уже после выхода из блока: чтение стека
+     * вне области видимости (ASan: stack-use-after-scope на первой же пробе узла с flow). Работало это
+     * случайно: нулевой «UUID» расходился с ответом сразу за «00 00», и в rx_pre лежали ровно байты
+     * заголовка. */
     size_t skip = 0;
-    int pr = vless_parse_response(body, body_n, &skip);
+    int pr = vless_parse_response(buf, got, &skip);
     transport_close(&c);
 
     if (pr == VLESS_EPROTO) {

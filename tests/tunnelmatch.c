@@ -1286,6 +1286,72 @@ static void t_dns_evict(void) {
     check(!full_table_gives_udp(53, 3), "I-055: поток DNS, молчащий 3 с, не вытесняется");
 }
 
+/* Поток UDP с заданным простоем и признаком ответа узла — через проход сроков. Возвращает, закрыл ли его
+ * проход (слот свободен). */
+static int udp_flow_closed(int idle_s, int replied, uint16_t sport) {
+    struct conn *c = conn_new(&g_tun);
+    if (!c) return -1;
+    memset(c, 0, sizeof(*c));
+    c->used = 1;
+    c->fd = -1;
+    c->is_udp = 1;
+    c->key = cli_key();
+    c->key.proto = 17;
+    c->key.sport = sport;
+    c->key.dport = 6881;
+    c->last = g_now_s - idle_s;
+    c->udp_replied = (uint8_t)replied;
+    __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
+    conn_link(c);
+    int closed = conn_deadlines(c, &g_tun, now_ns()) != 0 && !c->used;
+    if (c->used) conn_drop(c);
+    dev_drain(NULL);
+    return closed;
+}
+
+/* Неотвеченный поток UDP держится UDP_UNREPLIED_S, а не IDLE_EVICT_S. DHT торрента и QUIC без ответа
+ * открывали по потоку (и связи с узлом) на каждый новый адрес и держали их по 120 с: при 50 в секунду —
+ * шесть тысяч дескрипторов, а у службы роутера их 4096, и выход переставал открывать соединения
+ * (tests/vless-soak.sh, UDP_SPRAY=50 NOFILE=4096). */
+static void t_udp_unreplied(void) {
+    check(udp_flow_closed(UDP_UNREPLIED_S + 5, 0, 30001) == 1,
+          "UDP без ответа узла: тишина дольше 30 с — поток закрыт, связь отпущена");
+    check(udp_flow_closed(UDP_UNREPLIED_S - 10, 0, 30002) == 0,
+          "  тишина 20 с — поток без ответа ещё живёт (ответ мог задержаться)");
+    check(udp_flow_closed(UDP_UNREPLIED_S + 5, 1, 30003) == 0,
+          "  поток, которому узел отвечал, тишину в 35 с переживает (игра, звонок)");
+    check(udp_flow_closed(IDLE_EVICT_S + 5, 1, 30004) == 1,
+          "  и отвечавший закрывается по общему простою 120 с, как прежде");
+}
+
+/* Предел дескрипторов: мягкий не ниже жёсткого, а у кого есть право — жёсткий поднят до fs.nr_open ядра
+ * (служба роутера наследует от procd 4096, и выход упирался в EMFILE). */
+static void t_nofile_raise(void) {
+    struct rlimit was;
+    getrlimit(RLIMIT_NOFILE, &was);
+    struct rlimit low = { 256, was.rlim_max };
+    setrlimit(RLIMIT_NOFILE, &low);
+    unsigned long got = stack_nofile_raise();
+    struct rlimit now;
+    getrlimit(RLIMIT_NOFILE, &now);
+    check(got == (unsigned long)now.rlim_cur && now.rlim_cur >= was.rlim_max,
+          "NOFILE: мягкий предел поднят не ниже прежнего жёсткого");
+    unsigned long nr = 0;
+    FILE *f = fopen("/proc/sys/fs/nr_open", "r");
+    if (f) { if (fscanf(f, "%lu", &nr) != 1) nr = 0; fclose(f); }
+    if (geteuid() == 0 && nr) {
+        /* Под root: жёсткий предел ниже nr_open (как у procd) поднимается до nr_open. */
+        struct rlimit cap = { 4096, 4096 };
+        setrlimit(RLIMIT_NOFILE, &cap);
+        got = stack_nofile_raise();
+        getrlimit(RLIMIT_NOFILE, &now);
+        check(got == nr && now.rlim_cur == nr && now.rlim_max == nr,
+              "NOFILE: под root жёсткий 4096 (procd) поднят до fs.nr_open");
+    } else {
+        printf("  (NOFILE: не root — подъём жёсткого предела не проверяется)\n");
+    }
+}
+
 /* Пул запасных: готовая сессия отдаётся соединению, и слот после этого пуст. Жило в
  * tests/devupmatch.c вместе с проверкой самоуказателей; самоуказатели теперь чинит транспорт
  * (xhttp_moved) по вызову дайлера (vl_take), и их проверка осталась там, на настоящем
@@ -4043,6 +4109,8 @@ int main(void) {
     t_bad_uuid();
     t_send_refused();
     t_dns_evict();
+    t_udp_unreplied();
+    t_nofile_raise();
     t_spare_slot();
     t_spare_churn();
     t_born_turn();
