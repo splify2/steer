@@ -3721,6 +3721,141 @@ static void test_vless_big_up(void) {
     g_send_again_n = 0; g_send_pass = 0;
 }
 
+/* ---- кривые пакеты IPv6 (по PR #18 от vnenapravo7-source) --------------------------------------
+ * Разбор пакета клиента — первый код, который трогает недоверенные байты из устройства. Здесь: каждое
+ * укорочение верных пакетов, нарочно испорченные поля (длина, расширения, фрагментация, смещение данных
+ * TCP, опции SYN) и случайные порчи. Каждый пакет лежит в куче ровно своей длины, так что чтение за
+ * концом ловит сборка с -fsanitize=address; без неё — проверка, что разбор не обещает данных за концом. */
+static int v6_parse_heap(const unsigned char *src, size_t n, struct flow_key *k, size_t *off) {
+    unsigned char *h = malloc(n ? n : 1);
+    if (!h) return -2;
+    memcpy(h, src, n);
+    *off = 0;
+    int r = ip_parse(h, n, k, off);
+    (void)stack_owner(h, n, 8);
+    (void)tun_flow_owner(h, n, 8);
+    unsigned char un[128];
+    (void)icmp_unreach_build(un, sizeof un, h, n);
+    free(h);
+    return r;
+}
+
+static void t_v6_malformed(void) {
+    unsigned char good[4][256];
+    size_t gl[4];
+    struct flow_key k;
+    size_t off;
+    gl[0] = tcp_build6(good[0], sizeof good[0], V6_CLI, V6_SRV, 40000, 443, 1, 0, TCP_SYN, NULL, 0, 65535, 1460, 7);
+    gl[1] = pkt6(good[1], V6_CLI, V6_SRV, 17, 5353, 53, 30);
+    gl[2] = pkt6(good[2], V6_CLI, V6_SRV, 6, 40001, 443, 16);
+    /* Первый фрагмент UDP: заголовок фрагментации (следующий — UDP, смещение 0, M=1), за ним UDP. */
+    {
+        unsigned char *p = good[3];
+        size_t l = pkt6(p, V6_CLI, V6_SRV, 17, 7000, 53, 24);
+        memmove(p + 48, p + 40, l - 40);
+        p[40] = 17; p[41] = 0; p[42] = 0; p[43] = 1; p[44] = 0; p[45] = 0; p[46] = 0x12; p[47] = 0x34;
+        p[6] = 44;
+        size_t plen = l - 40 + 8;
+        p[4] = (unsigned char)(plen >> 8); p[5] = (unsigned char)plen;
+        gl[3] = l + 8;
+    }
+    int good_ok = 1, trunc_ok = 1;
+    for (int i = 0; i < 4; i++) {
+        if (v6_parse_heap(good[i], gl[i], &k, &off) != 0 || off > gl[i]) good_ok = 0;
+        /* Каждое укорочение: заявленная длина больше пришедшего — отказ на любой длине. */
+        for (size_t n = 0; n < gl[i]; n++)
+            if (v6_parse_heap(good[i], n, &k, &off) == 0) trunc_ok = 0;
+    }
+    check(good_ok && k.frag, "IPv6 кривые: четыре верных пакета (SYN с опциями, UDP, TCP с данными, первый фрагмент) разобраны");
+    check(trunc_ok, "IPv6 кривые: каждое укорочение верного пакета — отказ, без чтения за концом");
+
+    unsigned char p[256];
+    /* Расширения, которые разбор не берёт: hop-by-hop, маршрутизация, параметры получателя, «нет
+     * следующего», ESP, ICMPv6 — отказ: разбор принимает только TCP и UDP. */
+    static const unsigned char nh_bad[] = { 0, 43, 60, 59, 50, 51, 58, 135, 139, 140, 253, 254 };
+    int ext_ok = 1;
+    for (size_t i = 0; i < sizeof nh_bad; i++) {
+        memcpy(p, good[1], gl[1]);
+        p[6] = nh_bad[i];
+        if (v6_parse_heap(p, gl[1], &k, &off) == 0) ext_ok = 0;
+    }
+    check(ext_ok, "IPv6 кривые: hop-by-hop, маршрутизация, параметры, 59, ESP, AH, ICMPv6, mobility, HIP, shim6, опытные — отказ");
+
+    /* Фрагментация: не первый кусок, цепочка 44 → 44, заголовок фрагментации без следующего TCP/UDP, укороченный. */
+    memcpy(p, good[3], gl[3]);
+    p[42] = 0; p[43] = 0x08 | 1;                                       /* смещение 8 байт */
+    int fr_cont = v6_parse_heap(p, gl[3], &k, &off) != 0;
+    memcpy(p, good[3], gl[3]);
+    p[40] = 44;                                                        /* фрагмент во фрагменте */
+    int fr_chain = v6_parse_heap(p, gl[3], &k, &off) != 0;
+    memcpy(p, good[3], gl[3]);
+    p[40] = 0;                                                         /* за фрагментом hop-by-hop */
+    int fr_hbh = v6_parse_heap(p, gl[3], &k, &off) != 0;
+    memcpy(p, good[3], gl[3]);
+    p[4] = 0; p[5] = 4;                                                /* заявлено 4 байта, заголовок фрагментации — 8 */
+    int fr_short = v6_parse_heap(p, 44, &k, &off) != 0;
+    check(fr_cont && fr_chain && fr_hbh && fr_short,
+          "IPv6 кривые: продолжение фрагмента, 44 за 44, hop-by-hop за фрагментом, обрезанный заголовок фрагментации — отказ");
+
+    /* TCP: смещение данных меньше 20 и больше пакета — отказ; опции SYN с длиной 0, 1 и за концом
+     * заголовка — разбор не зацикливается и не выходит за опции, масштаб окна не выдумывается. */
+    memcpy(p, good[2], gl[2]);
+    p[52] = 0x40;                                                      /* doff = 16 */
+    int doff_small = v6_parse_heap(p, gl[2], &k, &off) != 0;
+    memcpy(p, good[2], gl[2]);
+    p[52] = 0xF0;                                                      /* doff = 60 при 36 байтах TCP */
+    int doff_big = v6_parse_heap(p, gl[2], &k, &off) != 0;
+    int opt_ok = 1;
+    static const unsigned char olen[] = { 0, 1, 9, 255 };
+    for (size_t i = 0; i < sizeof olen; i++) {
+        memcpy(p, good[0], gl[0]);
+        p[60] = 3; p[61] = olen[i];                                    /* первая опция — масштаб с кривой длиной */
+        p[64] = 3; p[65] = 3; p[66] = 9;                               /* настоящий масштаб дальше по списку */
+        memset(&k, 0, sizeof k);
+        if (v6_parse_heap(p, gl[0], &k, &off) != 0 || off != gl[0]) opt_ok = 0;
+        if (k.ws_seen && k.wscale > 14) opt_ok = 0;
+    }
+    check(doff_small && doff_big && opt_ok,
+          "IPv6 кривые: смещение данных TCP 16 и 60 — отказ; опции SYN с длиной 0, 1, 9, 255 — без выхода за заголовок");
+
+    /* UDP: восемь байт заголовка должны прийти целиком. */
+    memcpy(p, good[1], gl[1]);
+    p[4] = 0; p[5] = 4;
+    int udp_short = v6_parse_heap(p, 44, &k, &off) != 0;
+    check(udp_short, "IPv6 кривые: UDP с четырьмя байтами заголовка — отказ");
+
+    /* Случайная порча: байты заголовков, длина и обрезка. Разбор либо отказывает, либо отдаёт нагрузку
+     * в пределах пакета; сборка фрагментов принимает те же байты и не читает за концом. */
+    uint32_t seed = 0x9e3779b9u;
+    int fuzz_ok = 1;
+    for (int it = 0; it < 200000; it++) {
+        seed = seed * 1664525u + 1013904223u;
+        int g = (int)(seed >> 30);
+        memcpy(p, good[g], gl[g]);
+        int flips = 1 + (int)((seed >> 8) & 3);
+        for (int f = 0; f < flips; f++) {
+            seed = seed * 1664525u + 1013904223u;
+            size_t at = (seed >> 8) % gl[g];
+            if (at > 72 && (seed & 1)) at = (seed >> 3) % 72;          /* чаще — в заголовках */
+            p[at] = (unsigned char)(seed >> 24);
+        }
+        seed = seed * 1664525u + 1013904223u;
+        size_t n = (seed & 3) ? gl[g] : (seed >> 8) % (gl[g] + 1);
+        if (v6_parse_heap(p, n, &k, &off) == 0 && (off > n || (k.proto != 6 && k.proto != 17))) fuzz_ok = 0;
+        if (n >= 48 && (it & 15) == 0) {
+            unsigned char *h = malloc(n), out[512];
+            if (h) {
+                memcpy(h, p, n);
+                size_t an = udp_defrag(h, n, out, sizeof out);
+                if (an > sizeof out) fuzz_ok = 0;
+                free(h);
+            }
+        }
+    }
+    for (int i = 0; i < DEFRAG_SLOTS; i++) frag_free(i);
+    check(fuzz_ok, "IPv6 кривые: 200000 случайных порч — отказ или нагрузка в пределах пакета, только TCP и UDP");
+}
+
 /* ---- ответ VLESS по кускам (по PR #20 от vnenapravo7-source) -----------------------------------
  * Заголовок ответа [версия][длина доп][доп] может прийти не одним чтением: первый кусок транспорта
  * (запись TLS, кадр WebSocket, gRPC или xhttp) режет где угодно. Прежде неполный заголовок считался
@@ -3840,6 +3975,7 @@ int main(void) {
     t_owner();
     t_owner_mail();
     t_v6();
+    t_v6_malformed();
     t_vless_resp_split();
     t_udp_big();
     test_vless_big_up();
