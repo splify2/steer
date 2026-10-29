@@ -973,6 +973,34 @@ if command -v python3 >/dev/null 2>&1; then
     check "  libs: libs2p-net.so.$n1maj, abi $n1maj.$n1min, файл lib/" "libs2p-net.so.$n1maj $n1maj.$n1min lib/libs2p-net.so.$n1maj" \
         "$(jget plugins/net1/plugin.json '" ".join([d["libs"][0]["soname"], d["libs"][0]["abi"], d["libs"][0]["file"]])')"
     check "  SONAME в сборке тот же" "1" "$(grep -c "soname,libs2p-net.so.$n1maj" build/build-libs.sh)"
+    # Записанный ABI версии (build/net1/abi.lst): раскладка структур границы и экспорт — те, что записаны для
+    # S2P_NET_VERSION. Изменились, а версия та же — отказ: плагины прежней сборки с такой net1 не запускаются,
+    # а менеджеру по одинаковой версии не видно, что их надо обновить (так вышла net1 1.3.0 у 2.1.0-g3d6c8f1).
+    N1LST=build/net1/abi.lst
+    n1row="$(grep -v '^#' "$N1LST" | awk -v v="$n1ver" '$1 == v')"
+    check "abi.lst: строка версии net1 $n1ver есть, одна, abi $n1maj.$n1min" "1 $n1maj.$n1min" \
+        "$(printf '%s\n' "$n1row" | grep -c .) $(printf '%s' "$n1row" | awk '{print $2}')"
+    check "abi.lst: версии не повторяются и растут" "" \
+        "$(grep -v '^#' "$N1LST" | awk 'NF { print $1 }' | python3 -c '
+import sys
+v = [l.strip() for l in sys.stdin if l.strip()]
+k = [tuple(int(p) for p in x.split(".")) for x in v]
+print("" if len(set(v)) == len(v) and k == sorted(k) else " ".join(v))')"
+    n1exp="$(sed -n 's/^    \(s2p_[A-Za-z0-9_]*\);$/\1/p' "$N1MAP" | LC_ALL=C sort | sha256sum | cut -c1-16)"
+    check "abi.lst: экспорт карты = записанному для $n1ver (изменился — новая версия net1 и строка)" \
+        "$(printf '%s' "$n1row" | awk '{print $4}')" "$n1exp"
+    if [ "$(uname -m)" = x86_64 ] && command -v "${CC:-cc}" >/dev/null 2>&1; then
+        n1fp="$(mktemp -d)"
+        printf '%s\n' '#include <stdio.h>' '#include "s2pnet.h"' \
+            'int main(void) { printf("%016llx\n", (unsigned long long)s2p_net_fingerprint_calc()); return 0; }' > "$n1fp/fp.c"
+        # shellcheck disable=SC2046
+        "${CC:-cc}" -w $(for d in $(profile_var INC_DIRS); do printf -- '-I%s ' "$d"; done) -o "$n1fp/fp" "$n1fp/fp.c" 2>"$n1fp/log"
+        check "abi.lst: отпечаток раскладки net1 на x86_64 = записанному для $n1ver (изменился — новая версия net1 и строка)" \
+            "$(printf '%s' "$n1row" | awk '{print $3}')" "$("$n1fp/fp" 2>/dev/null || cat "$n1fp/log")"
+        rm -rf "$n1fp"
+    else
+        echo "buildmatch: не x86_64 или нет компилятора — отпечаток net1 не сверен (ПРОПУСК)"
+    fi
     # Манифест протокола: requires.plugins.net1 по ABI; подкоманды, помощник и хуки манифеста — ровно
     # команды программы плагина (таблица CMDS у PK_PROGRAM в src/modules/main_<id>.c), а не список ядра.
     for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC) $(profile_var PLUGINS_TLS); do

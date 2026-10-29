@@ -1378,6 +1378,255 @@ static void snap_free(struct snap *s) {
     free(s->from); free(s->installed_at);
 }
 
+/* ---- ABI библиотек ----
+ *
+ * Плагин-библиотека (type: library, libs — net1) и её зависимые связаны не только диапазоном версии: программа
+ * зависимого собрана с раскладкой структур и экспортом той сборки библиотеки, с которой её линковали, и с
+ * другой не запускается (net1 — src/net1/s2pcheck.c, код 2 со строкой «steer: библиотека …»; нет символа —
+ * отказ загрузчика). Диапазон этого не ловит: 2.1.0-g3d6c8f1 выпустила net1 1.3.0 с другой раскладкой под
+ * той же версией, установка такой net1 проходила, а каждый плагин на ней после этого откатывался — проверка
+ * здоровья падала на соседе прежней сборки.
+ *
+ * Поэтому менеджер ПРОБУЕТ: программа зависимого (исполняемый файл bin/, в котором есть SONAME библиотеки)
+ * запускается с LD_LIBRARY_PATH на каталог lib/ нужной копии библиотеки и STEER_LIB_PROBE=1 — сверка в
+ * конструкторе идёт до main, программа отвечает «подходит» и выходит (программы прежних сборок переменной
+ * не знают и уходят в main без подкоманды — их выдаёт только строка отказа). Пробы:
+ *   - ставится библиотека: стоящие зависимые против НОВОЙ копии (из .stage) — до подмены. Несовместимые
+ *     вне этой установки: из индекса или семени — берутся в ту же установку одной группой (тот же источник),
+ *     из файла — отказ plugin.lib_abi_breaks с их списком;
+ *   - ставится зависимый: его программы против СТОЯЩЕЙ библиотеки (если она не ставится в этой же группе) —
+ *     отказ plugin.lib_abi_mismatch до подмены;
+ *   - проверка здоровья: перечитывание упало на строке отказа ABI, а сам плагин (группа) совместим —
+ *     виноваты соседи прежней сборки (их список в выводе), а не он: установка не откатывается;
+ *   - migrate: несовместимые с ядром стоящие ставятся из семени заново и при той же версии. */
+static const char ABI_MARK[] = "steer: библиотека ";
+
+static int id_in(char *const *v, size_t n, const char *id) {
+    for (size_t i = 0; i < n; i++) if (!strcmp(v[i], id)) return 1;
+    return 0;
+}
+
+static void id_add(char ***v, size_t *n, const char *id) {
+    if (id_in(*v, *n, id)) return;
+    *v = pm_realloc(*v, sizeof(char *) * (*n + 1));
+    (*v)[(*n)++] = pm_strdup(id);
+}
+
+static void ids_free(char ***v, size_t *n) {
+    for (size_t i = 0; i < *n; i++) free((*v)[i]);
+    free(*v);
+    *v = NULL;
+    *n = 0;
+}
+
+static char *ids_join(char *const *v, size_t n) {
+    size_t len = 1;
+    for (size_t i = 0; i < n; i++) len += strlen(v[i]) + 2;
+    char *s = pm_alloc(len);
+    s[0] = '\0';
+    for (size_t i = 0; i < n; i++) { if (i) strcat(s, ", "); strcat(s, v[i]); }
+    return s;
+}
+
+static int is_library(const struct ynode *m) {
+    const char *t = yn_str(m, "type");
+    return t && !strcmp(t, "library") && ynode_len(ynode_get(m, "libs")) > 0;
+}
+
+/* Каталоги файлов libs[] манифеста под base (через «:») и их SONAME. 0 — у манифеста есть библиотеки. */
+struct libset { char *ldpath; char **soname; size_t nsoname; };
+
+static void libset_free(struct libset *l) {
+    free(l->ldpath);
+    ids_free(&l->soname, &l->nsoname);
+}
+
+static int libset_of(const struct ynode *m, const char *base, struct libset *l) {
+    memset(l, 0, sizeof(*l));
+    const struct ynode *libs = ynode_get(m, "libs");
+    for (size_t i = 0; i < ynode_len(libs); i++) {
+        const char *so = yn_str(ynode_at(libs, i), "soname"), *f = yn_str(ynode_at(libs, i), "file");
+        if (!so || !f) continue;
+        id_add(&l->soname, &l->nsoname, so);
+        const char *sl = strrchr(f, '/');
+        char *dir = sl ? pm_fmt("%s/%.*s", base, (int)(sl - f), f) : pm_strdup(base);
+        char *np = l->ldpath ? pm_fmt("%s:%s", l->ldpath, dir) : pm_strdup(dir);
+        free(l->ldpath);
+        free(dir);
+        l->ldpath = np;
+    }
+    if (!l->nsoname) { libset_free(l); return -1; }
+    return 0;
+}
+
+/* Строка отказа ABI из вывода пробы (куча) или NULL — программа подошла. */
+static char *probe_verdict(int rc, const char *out) {
+    static const char *const loader[] = { "Error relocating", "Error loading shared library", "error while loading shared libraries", NULL };
+    const char *hit = strstr(out, ABI_MARK);
+    for (size_t i = 0; !hit && rc == 127 && loader[i]; i++) hit = strstr(out, loader[i]);
+    if (!hit) return NULL;
+    const char *ls = hit;
+    while (ls > out && ls[-1] != '\n') ls--;
+    const char *le = strchr(hit, '\n');
+    return pm_fmt("%.*s", (int)(le ? le - ls : (long)strlen(ls)), ls);
+}
+
+/* Программы плагина из каталога pdir, связанные с библиотеками l, против копии l. 1 — несовместим (*why —
+ * строка отказа, куча); 0 — подходит или проверять нечего. */
+static int probe_plugin(const char *pdir, const struct libset *l, char **why) {
+    *why = NULL;
+    char *bdir = pm_path(pdir, "bin");
+    DIR *d = opendir(bdir);
+    int bad = 0;
+    struct dirent *de;
+    while (d && !bad && (de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        char *f = pm_path(bdir, de->d_name);
+        struct stat sb;
+        size_t n = 0;
+        char *body = stat(f, &sb) == 0 && S_ISREG(sb.st_mode) && (sb.st_mode & 0111) ? pm_read(f, &n) : NULL;
+        int linked = 0;
+        for (size_t i = 0; body && i < l->nsoname && !linked; i++)
+            linked = memmem(body, n, l->soname[i], strlen(l->soname[i])) != NULL;
+        free(body);
+        if (linked) {
+            char *ld = pm_fmt("LD_LIBRARY_PATH=%s", l->ldpath);
+            char *env[] = { ld, "STEER_LIB_PROBE=1", NULL };
+            char *argv[] = { f, NULL };
+            char *out = NULL;
+            int rc = run_prog(argv, NULL, env, &out, 20);
+            *why = probe_verdict(rc, out ? out : "");
+            bad = *why != NULL;
+            free(out);
+            free(ld);
+        }
+        free(f);
+    }
+    if (d) closedir(d);
+    free(bdir);
+    return bad;
+}
+
+/* Требует ли манифест m плагин id (requires.plugins). */
+static int requires_id(const struct ynode *m, const char *id) {
+    return ynode_get(ynode_get(ynode_get(m, "requires"), "plugins"), id) != NULL;
+}
+
+/* Стоящие плагины, которым нужна библиотека libid, несовместимые с её копией l (кроме skip). */
+static void dependents_broken(struct pm_ctx *x, const char *libid, const struct libset *l, char *const *skip,
+                              size_t nskip, char ***bad, size_t *nbad, char **first_why) {
+    for (size_t i = 0; i < x->st.n; i++) {
+        const char *did = x->st.v[i].id;
+        if (!strcmp(did, libid) || id_in(skip, nskip, did)) continue;
+        struct ydoc *dm = pm_manifest(did);
+        if (!dm) continue;
+        if (requires_id(ydoc_root(dm), libid)) {
+            char *dd = pm_path(pm_root(), did), *why = NULL;
+            if (probe_plugin(dd, l, &why)) {
+                id_add(bad, nbad, did);
+                if (first_why && !*first_why) *first_why = why; else free(why);
+            }
+            free(dd);
+        }
+        ydoc_free(dm);
+    }
+}
+
+/* Стоящие плагины, несовместимые со стоящими библиотеками (кроме skip); libs — эти библиотеки. */
+void pm_abi_broken(struct pm_ctx *x, char *const *skip, size_t nskip, char ***bad, size_t *nbad, char ***libs,
+                   size_t *nlibs, char **first_why) {
+    for (size_t i = 0; i < x->st.n; i++) {
+        const char *lid = x->st.v[i].id;
+        struct ydoc *lm = pm_manifest(lid);
+        if (!lm) continue;
+        struct libset l;
+        char *base = pm_path(pm_root(), lid);
+        if (is_library(ydoc_root(lm)) && libset_of(ydoc_root(lm), base, &l) == 0) {
+            size_t before = *nbad;
+            dependents_broken(x, lid, &l, skip, nskip, bad, nbad, first_why);
+            if (*nbad > before && libs) id_add(libs, nlibs, lid);
+            libset_free(&l);
+        }
+        free(base);
+        ydoc_free(lm);
+    }
+}
+
+/* Проверка ABI до подмены (см. выше). done — что уже встало в этой установке. 0 — можно ставить. */
+static int abi_check(struct pm_ctx *x, const char *id, const char *ver, const struct ynode *m, const char *stage,
+                     const struct pm_result *done, struct pm_err *e) {
+    /* Ставится зависимый: против стоящих библиотек, которые не ставятся вместе с ним. */
+    const struct ynode *deps = ynode_get(ynode_get(m, "requires"), "plugins");
+    for (size_t i = 0; i < ynode_len(deps); i++) {
+        const char *lid = ynode_key_at(deps, i)->str;
+        int lib_done = 0;
+        for (size_t k = 0; done && k < done->n; k++) if (!strcmp(done->v[k].id, lid)) lib_done = 1;
+        if (id_in(x->tx_ids, x->ntx, lid) && !lib_done) continue;
+        struct ydoc *lm = pm_manifest(lid);
+        if (!lm) continue;
+        struct libset l;
+        char *base = pm_path(pm_root(), lid);
+        int rc = 0;
+        if (is_library(ydoc_root(lm)) && libset_of(ydoc_root(lm), base, &l) == 0) {
+            char *why = NULL;
+            if (probe_plugin(stage, &l, &why)) {
+                const char *lv = yn_str(ydoc_root(lm), "version");
+                rc = pm_errc(e, "plugin.lib_abi_mismatch", PMA("id", id, "version", ver, "lib", lid, "lib_version", lv ? lv : "?", "why", why),
+                             "%s %s собран под другую сборку %s, чем стоящая %s %s (%s) — ставьте их вместе из одного источника или steer plugin migrate",
+                             id, ver, lid, lid, lv ? lv : "?", why);
+            }
+            free(why);
+            libset_free(&l);
+        }
+        free(base);
+        ydoc_free(lm);
+        if (rc) return -1;
+    }
+    if (!is_library(m)) return 0;
+    /* Ставится библиотека: стоящие зависимые против новой копии. Те, что ставятся вместе с ней, не в счёт. */
+    struct libset l;
+    if (libset_of(m, stage, &l) != 0) return 0;
+    char **bad = NULL, *why = NULL;
+    size_t nbad = 0;
+    dependents_broken(x, id, &l, x->tx_ids, x->ntx, &bad, &nbad, &why);
+    libset_free(&l);
+    if (!nbad) return 0;
+    char *list = ids_join(bad, nbad);
+    /* Индекс или семя: зависимые берутся в ту же установку (pm_install повторяет библиотеку группой с ними). */
+    if (x->abi_extend)
+        for (size_t i = 0; i < nbad; i++) id_add(&x->abi_more, &x->nabi_more, bad[i]);
+    pm_errc(e, "plugin.lib_abi_breaks", PMA("id", id, "version", ver, "deps", list, "why", why),
+            "%s %s несовместима со стоящими %s (%s) — их нужно обновить вместе с ней: одной командой "
+            "steer plugin install --file … --file … или steer plugin migrate", id, ver, list, why);
+    free(list);
+    free(why);
+    ids_free(&bad, &nbad);
+    return -1;
+}
+
+/* Перечитывание упало на строке отказа ABI, а сами ids с библиотеками совместимы: виноваты соседи прежней
+ * сборки. 1 — так (их список — в выводе); 0 — виноваты ids или причина другая. */
+static int abi_blame_others(struct pm_ctx *x, char *const *ids, size_t nids, const char *msg) {
+    if (!strstr(msg, ABI_MARK) && !strstr(msg, "Error relocating")) return 0;
+    char **bad = NULL;
+    size_t nbad = 0;
+    pm_abi_broken(x, NULL, 0, &bad, &nbad, NULL, NULL, NULL);
+    int others = 0, self = 0;
+    for (size_t i = 0; i < nbad; i++) {
+        if (id_in(ids, nids, bad[i])) self = 1;
+        else others = 1;
+    }
+    int r = others && !self;
+    if (r) {
+        char *list = ids_join(bad, nbad);
+        pm_progress(x, "ядро не перечитало плагины из-за стоящих %s прежней сборки (не подходят к стоящим библиотекам) — "
+                    "это не вина установки; обновите их: steer plugin migrate", list);
+        free(list);
+    }
+    ids_free(&bad, &nbad);
+    return r;
+}
+
 /* Группа (pm_opts.group): плагины встают подряд без проверки здоровья каждого, потом одна проверка на всю
  * группу; не здорова — откат всех, в обратном порядке. Запись держит то, что нужно для отката. */
 struct undo {
@@ -1438,9 +1687,13 @@ static int group_finish(struct pm_ctx *x, int before_bad, const char *before_msg
     if (active && !x->no_daemon) {
         pm_progress(x, "проверка здоровья группы (%zu)", n);
         if (pm_daemon_reload(x, &he) != 0) {
-            /* Ошибка, которая была и до группы, — не вина группы: не хуже, чем было. */
+            /* Ошибка, которая была и до группы, — не вина группы: не хуже, чем было. Как и отказ ABI соседей прежней
+             * сборки, когда сама группа с библиотеками совместима. */
+            char **gids = pm_alloc(sizeof(char *) * (n ? n : 1));
+            for (size_t i = 0; i < n; i++) gids[i] = u[i].id;
             if (before_bad && !strcmp(before_msg, he.msg)) pm_progress(x, "перечитывание плагинов не удавалось и до установки — %s", he.msg);
-            else healthy = 0;
+            else if (!abi_blame_others(x, gids, n, he.msg)) healthy = 0;
+            free(gids);
         }
         for (size_t i = 0; healthy && i < n; i++)
             if (!u[i].was_disabled && wait_outs(x, &u[i].before, u[i].timeout_s, &he) != 0) healthy = 0;
@@ -1582,6 +1835,7 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     if (links_validate(x, id, m, stage, e) != 0) goto out_stage;
     if (system_deps(x, id, m, &sys, &nsys, e) != 0) goto out_stage;
     if (run_script(id, stage, m, "postinst", "--check", e) != 0) goto out_stage;
+    if (abi_check(x, id, mver, m, stage, res, e) != 0) goto out_stage;
 
     /* Подмена. */
     struct pm_inst *inst = pm_state_find(&x->st, id);
@@ -1683,9 +1937,10 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     } else if (healthy && !was_disabled) {
         pm_progress(x, "проверка здоровья %s", id);
         if (pm_daemon_reload(x, &he) != 0) {
-            if (spec_ok && !(x->before_bad && !strcmp(x->before_err.msg, he.msg))) healthy = 0;
-            else if (spec_ok) pm_progress(x, "перечитывание плагинов не удавалось и до установки — %s", he.msg);
-            else pm_progress(x, "спека не читалась и до установки — %s", he.msg);
+            char *self[] = { (char *)id };
+            if (!spec_ok) pm_progress(x, "спека не читалась и до установки — %s", he.msg);
+            else if (x->before_bad && !strcmp(x->before_err.msg, he.msg)) pm_progress(x, "перечитывание плагинов не удавалось и до установки — %s", he.msg);
+            else if (!abi_blame_others(x, self, 1, he.msg)) healthy = 0;
         }
         if (healthy) {
             long t = yn_long(ynode_get(m, "health"), "timeout_s", 60);
@@ -1796,13 +2051,137 @@ static int plan_build(struct pm_ctx *x, struct plan *p, const struct pm_req *req
     return 0;
 }
 
+/* Конец группы (pm_opts.group, несколько файлов, библиотека с зависимыми): rc — итог установки по плану. Отказ —
+ * откат всех, что уже встали; иначе одна проверка здоровья на всю группу. */
+static int group_end(struct pm_ctx *x, int rc, struct pm_result *res, struct pm_err *e) {
+    x->defer = 0;
+    struct undo *u = x->undo;
+    if (rc != 0) {
+        /* Одна из группы не встала: откат всех, что уже стоят. */
+        struct pm_err se = {0};
+        for (size_t i = x->nundo; i-- > 0;) undo_apply(x, &u[i], e->msg);
+        if (x->nundo) { pm_state_save(&x->st, &se); pm_keepd_write(x); pm_daemon_reload(x, &se); }
+        pm_result_free(res);
+        memset(res, 0, sizeof(*res));
+    } else if (x->nundo) {
+        struct pm_err ge = {0};
+        if (group_finish(x, x->before_bad, x->before_err.msg, &ge) != 0) {
+            *e = ge;
+            pm_result_free(res);
+            memset(res, 0, sizeof(*res));
+            rc = -1;
+        } else {
+            for (size_t i = 0; i < x->nundo; i++)
+                pm_event(x, u[i].id, u[i].old_ver && strcmp(u[i].old_ver, u[i].mver) ? "updated" : (u[i].was_disabled ? "installed" : "enabled"),
+                         u[i].mver, u[i].old_ver, NULL);
+        }
+    }
+    undo_clear(x);
+    return rc;
+}
+
+static void group_begin(struct pm_ctx *x) {
+    if (x->defer) return;
+    x->defer = 1;
+    x->before_bad = !x->no_daemon && pm_daemon_reload(x, &x->before_err) != 0;
+}
+
+static int peek_cb(void *arg, const struct untar_entry *en) { (void)arg; (void)en; return 1; }
+
+/* plugin.json архива-файла без проверки — только чтобы знать id и порядок группы (проверяет install_one). */
+static struct ydoc *file_peek(const char *archive) {
+    char *sd = pm_path(pm_root(), ".stage");
+    pm_mkdirs(sd);
+    char *d = pm_fmt("%s/peek-%d", sd, (int)getpid());
+    pm_rmrf(d);
+    struct untar_opts uo = { peek_cb, NULL, 0, UNTAR_NO_LINKS };
+    char why[256];
+    untar_gz_file(archive, d, &uo, why, sizeof(why));
+    char *pj = pm_path(d, "plugin.json");
+    struct pm_err e = {0};
+    struct ydoc *doc = pm_json_load(pj, &e);
+    pm_rmrf(d);
+    free(pj); free(d); free(sd);
+    return doc;
+}
+
+/* Установка из файлов: один — как был; несколько — одной группой, библиотеки первыми (их зависимые из тех же
+ * файлов пробуются уже против новой копии). */
+static int install_files(struct pm_ctx *x, const char *const *files, size_t n, const struct pm_opts *o,
+                         struct pm_result *res, struct pm_err *e) {
+    const char **ord = pm_alloc(sizeof(char *) * (n ? n : 1));
+    int *lib = pm_alloc(sizeof(int) * (n ? n : 1));
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        struct ydoc *d = file_peek(files[i]);
+        lib[i] = d && is_library(ydoc_root(d));
+        if (d && yn_str(ydoc_root(d), "id")) id_add(&x->tx_ids, &x->ntx, yn_str(ydoc_root(d), "id"));
+        if (d) ydoc_free(d);
+    }
+    for (int pass = 0; pass < 2; pass++)
+        for (size_t i = 0; i < n; i++) if ((pass == 0) == !!lib[i]) ord[k++] = files[i];
+    if (n > 1) group_begin(x);
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        struct src s = { NULL, ord[i], o->unsigned_ok, NULL };
+        if (install_one(x, &s, NULL, res, e) != 0) rc = -1;
+    }
+    if (n > 1) rc = group_end(x, rc, res, e);
+    ids_free(&x->tx_ids, &x->ntx);
+    free(ord);
+    free(lib);
+    return rc;
+}
+
+/* Библиотека не встала из-за несовместимых стоящих зависимых (x->abi_more): они — в план после неё, заново и при
+ * той же версии, из того же источника (индекс своего репозитория или семя). 0 — план дополнен. */
+static int abi_extend_plan(struct pm_ctx *x, struct plan *p, size_t at, const char *variant, const struct pm_opts *o,
+                           struct pm_repos *seedrs, char ***force, size_t *nforce, struct pm_err *e) {
+    const struct pm_cand *lib = &p->v[at].c;
+    char *lid = pm_strdup(lib->id), *lver = pm_strdup(lib->version);
+    char *list = ids_join(x->abi_more, x->nabi_more);
+    int rc = 0;
+    for (size_t i = 0; i < x->nabi_more && rc == 0; i++) {
+        const char *did = x->abi_more[i];
+        struct item *have = plan_find(p, did);
+        if (have) {
+            /* Уже в плане, но стоял той же версией и пропущен: ещё раз, после библиотеки. */
+            struct pm_cand c = have->c;
+            p->v = pm_realloc(p->v, sizeof(*p->v) * (p->n + 1));
+            p->v[p->n++].c = c;
+        } else {
+            struct pm_err re = {0};
+            if (resolve(x, p, did, NULL, NULL, NULL, variant, NULL, 1, o, seedrs, &re) != 0) {
+                rc = pm_errc(e, "plugin.lib_abi_no_update", PMA("id", lid, "version", lver, "deps", list, "why", re.msg),
+                             "%s %s несовместима со стоящими %s, а обновить их вместе с ней не вышло: %s", lid, lver, list, re.msg);
+                break;
+            }
+        }
+        id_add(force, nforce, did);
+        id_add(&x->tx_ids, &x->ntx, did);
+    }
+    if (rc == 0) pm_progress(x, "%s %s несовместима со стоящими %s — они ставятся вместе с ней", lid, lver, list);
+    free(list); free(lid); free(lver);
+    ids_free(&x->abi_more, &x->nabi_more);
+    return rc ? -1 : 0;
+}
+
+/* Уже стоит ровно эта версия и вариант — нечего делать (кроме тех, что ставятся заново: несовместимы по ABI). */
+static int plan_skip(struct pm_ctx *x, const struct pm_cand *c, char *const *force, size_t nforce) {
+    struct pm_inst *inst = pm_state_find(&x->st, c->id);
+    char *cd = pm_path(pm_root(), c->id);
+    int here = pm_is_dir(cd);
+    free(cd);
+    return inst && inst->version && !strcmp(inst->version, c->version) && here &&
+           (!inst->variant || !strcmp(inst->variant, c->variant)) && (!inst->state || strcmp(inst->state, "failed")) &&
+           !id_in(force, nforce, c->id);
+}
+
 int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const struct pm_opts *o,
                struct pm_result *res, struct pm_err *e) {
     memset(res, 0, sizeof(*res));
-    if (o->file) {
-        struct src s = { NULL, o->file, o->unsigned_ok, NULL };
-        return install_one(x, &s, NULL, res, e);
-    }
+    if (o->nfiles) return install_files(x, o->files, o->nfiles, o, res, e);
+    if (o->file) { const char *one[] = { o->file }; return install_files(x, one, 1, o, res, e); }
     x->allow_bad = o->allow_bad;
     struct pm_repos seedrs = {0};
     struct pm_repo *sr = NULL;
@@ -1815,10 +2194,8 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
     struct plan p = {0};
     const char *reason = NULL;
     char *reason_buf = NULL;
-    if (o->group) {
-        x->defer = 1;
-        x->before_bad = !x->no_daemon && pm_daemon_reload(x, &x->before_err) != 0;
-    }
+    if (o->group) group_begin(x);
+    const char *variant = "full";
     int rc = plan_build(x, &p, req, nreq, "full", o, &seedrs, e);
     if (rc == 0 && space_check(x, &p, e) != 0) {
         /* На полный вариант нет места: облегчённый, если он есть и помещается (manifest.md). */
@@ -1828,6 +2205,7 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
         if (plan_build(x, &lp, req, nreq, "lite", o, &seedrs, &le) == 0 && space_check(x, &lp, &le) == 0) {
             free(p.v);
             p = lp;
+            variant = "lite";
             reason_buf = pm_fmt("облегчённый вариант: на полный %s", full_why);
             reason = reason_buf;
         } else {
@@ -1843,53 +2221,42 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
         if (sr) { free(sr->name); free(sr->url); if (sr->idx) ydoc_free(sr->idx); free(sr); }
         return -1;
     }
+    char **force = NULL;
+    size_t nforce = 0;
+    for (size_t i = 0; i < o->nreinstall; i++) id_add(&force, &nforce, o->reinstall[i]);
+    /* Что встанет в этой установке: стоящие копии этих плагинов библиотека не пробует. */
+    for (size_t i = 0; i < p.n; i++)
+        if (!plan_skip(x, &p.v[i].c, force, nforce)) id_add(&x->tx_ids, &x->ntx, p.v[i].c.id);
+    x->abi_extend = 1;
     for (size_t i = 0; i < p.n; i++) {
         const struct pm_cand *c = &p.v[i].c;
-        struct pm_inst *inst = pm_state_find(&x->st, c->id);
-        /* Уже стоит ровно эта версия и вариант — нечего делать. */
-        char *cd = pm_path(pm_root(), c->id);
-        int here = pm_is_dir(cd);
-        free(cd);
-        if (inst && inst->version && !strcmp(inst->version, c->version) && here &&
-            (!inst->variant || !strcmp(inst->variant, c->variant)) && (!inst->state || strcmp(inst->state, "failed")))
-            continue;
+        if (plan_skip(x, c, force, nforce)) continue;
         int lite = strcmp(c->variant, "full") != 0;
         struct src s = { c, NULL, 0, lite ? reason : NULL };
-        if (install_one(x, &s, c->id, res, e) != 0) {
-            res->failed = pm_realloc(res->failed, sizeof(char *) * (res->nfailed + 1));
-            res->failed[res->nfailed++] = pm_strdup(c->id);
-            rc = -1;
-            break;
+        if (install_one(x, &s, c->id, res, e) == 0) continue;
+        if (x->nabi_more) {
+            /* Библиотека несовместима со стоящими зависимыми: они — в ту же установку, всё — одной группой
+             * (одна проверка здоровья, откат вместе), библиотека — ещё раз. Второй раз так не расширяется. */
+            x->abi_extend = 0;
+            if (abi_extend_plan(x, &p, i, variant, o, &seedrs, &force, &nforce, e) == 0) {
+                group_begin(x);
+                i--;
+                continue;
+            }
         }
+        res->failed = pm_realloc(res->failed, sizeof(char *) * (res->nfailed + 1));
+        res->failed[res->nfailed++] = pm_strdup(c->id);
+        rc = -1;
+        break;
     }
+    x->abi_extend = 0;
+    ids_free(&x->abi_more, &x->nabi_more);
+    ids_free(&x->tx_ids, &x->ntx);
+    ids_free(&force, &nforce);
     free(p.v);
     free(reason_buf);
     if (sr) { free(sr->name); free(sr->url); if (sr->idx) ydoc_free(sr->idx); free(sr); }
-    if (o->group) {
-        x->defer = 0;
-        struct undo *u = x->undo;
-        if (rc != 0) {
-            /* Одна из группы не встала: откат всех, что уже стоят. */
-            struct pm_err se = {0};
-            for (size_t i = x->nundo; i-- > 0;) undo_apply(x, &u[i], e->msg);
-            if (x->nundo) { pm_state_save(&x->st, &se); pm_keepd_write(x); pm_daemon_reload(x, &se); }
-            pm_result_free(res);
-            memset(res, 0, sizeof(*res));
-        } else if (x->nundo) {
-            struct pm_err ge = {0};
-            if (group_finish(x, x->before_bad, x->before_err.msg, &ge) != 0) {
-                *e = ge;
-                pm_result_free(res);
-                memset(res, 0, sizeof(*res));
-                rc = -1;
-            } else {
-                for (size_t i = 0; i < x->nundo; i++)
-                    pm_event(x, u[i].id, u[i].old_ver && strcmp(u[i].old_ver, u[i].mver) ? "updated" : (u[i].was_disabled ? "installed" : "enabled"),
-                             u[i].mver, u[i].old_ver, NULL);
-            }
-        }
-        undo_clear(x);
-    }
+    if (x->defer) rc = group_end(x, rc, res, e);
     return rc;
 }
 

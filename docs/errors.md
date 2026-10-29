@@ -360,6 +360,9 @@
 | `plugin.key_revoked` | — | этот ключ отозван |
 | `plugin.key_unreadable` | — | ключ не распознан |
 | `plugin.key_write_failed` | — | не записать ключ |
+| `plugin.lib_abi_breaks` | `id`, `version`, `deps`, `why` | {id} {version} несовместима со стоящими {deps} ({why}) — их нужно обновить вместе с ней: одной командой steer plugin install --file … --file … или steer plugin migrate |
+| `plugin.lib_abi_mismatch` | `id`, `version`, `lib`, `lib_version`, `why` | {id} {version} собран под другую сборку {lib}, чем стоящая {lib} {lib_version} ({why}) — ставьте их вместе из одного источника или steer plugin migrate |
+| `plugin.lib_abi_no_update` | `id`, `version`, `deps`, `why` | {id} {version} несовместима со стоящими {deps}, а обновить их вместе с ней не вышло: {why} |
 | `plugin.link_busy` | `id`, `path` | {id} не встаёт: {path} уже есть, и поставил его не менеджер плагинов |
 | `plugin.link_core_path` | `id`, `path` | {id}: ссылка {path} — путь ядра steer, плагину его не дать |
 | `plugin.link_create` | `path`, `why` | не поставить ссылку {path}: {why} |

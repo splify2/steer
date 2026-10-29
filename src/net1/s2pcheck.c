@@ -5,9 +5,16 @@
  * экспорта — загрузчик сказал бы об этом сам, но словами компоновщика), и раскладка структур границы
  * та же. Не так — отказ строкой с обеими версиями до первого вызова стека: «перемешались плагин и
  * net1 разных сборок» должно читаться в журнале, а не порчей памяти. Код выхода 2 — отказ
- * (steer-api.md, 1.5). Конструктор, а не вызов из main: main у помощника общий (modcmd.c). */
+ * (steer-api.md, 1.5). Конструктор, а не вызов из main: main у помощника общий (modcmd.c).
+ *
+ * ПРОБА (STEER_LIB_PROBE=1). Менеджер плагинов, ставя библиотеку, запускает программы стоящих зависимых
+ * с LD_LIBRARY_PATH на её новую копию (src/pluginmgr/pminst.c, «ABI библиотек»): сверка прошла — строка
+ * «steer: net1 … подходит» и выход 0 здесь же, до main; не прошла — тот же отказ с кодом 2. Программы
+ * прежних сборок переменной не знают: у них сверка та же, а дальше main без подкоманды (код 2 без строки
+ * «steer: библиотека») — менеджер различает по строке. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "s2pnet.h"
 
@@ -24,5 +31,12 @@ __attribute__((constructor)) static void s2p_net_check(void) {
                 a->version, (unsigned long long)a->fingerprint,
                 (unsigned long long)s2p_net_fingerprint_calc());
         exit(2);
+    }
+    const char *probe = getenv("STEER_LIB_PROBE");
+    if (probe && *probe == '1') {
+        printf("steer: net1 %s (ABI %u.%u, отпечаток %016llx) подходит\n", a->version, a->major, a->minor,
+               (unsigned long long)a->fingerprint);
+        fflush(stdout);
+        _exit(0);
     }
 }

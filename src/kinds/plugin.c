@@ -511,6 +511,16 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
     p->manifest = txt;
     p->manifest_len = n;
     if (!p->id || !p->dir) return -1;
+    /* Сборка: plugin.json и MANIFEST (в нём sha256 каждого файла архива). */
+    p->build = 14695981039346656037ULL;
+    kind_sig_mix(&p->build, txt, n);
+    {
+        char mp[PATH_MAX + 16];
+        size_t mn = 0;
+        snprintf(mp, sizeof(mp), "%s/MANIFEST", dir);
+        char *mt = pl_read(mp, &mn);
+        if (mt) { kind_sig_mix(&p->build, mt, mn); free(mt); }
+    }
     char why[512] = "";
     struct err e;
     memset(&e, 0, sizeof(e));
@@ -1818,6 +1828,15 @@ static void settings_sig(const struct plugin *pl, unsigned long long *sig) {
     fclose(f);
 }
 
+void plugin_build_sig(const struct plugin *pl, unsigned long long *sig) {
+    kind_sig_mix(sig, &pl->build, sizeof(pl->build));
+    for (size_t i = 0; i < pl->requires_n; i++) {
+        const struct plugin *d = plugin_find(pl->requires[i]);
+        unsigned long long b = d ? d->build : 0;
+        kind_sig_mix(sig, &b, sizeof(b));
+    }
+}
+
 /* Помощник выхода: программа плагина с раскрытым argv. Подпись перезапуска — версия плагина и
  * ключи вида (а когда {conf} пишет демон — хеш его содержимого, steer-api.md, 1.4). */
 int plugin_kind_helper(const struct plugin_kind *pk, const struct spec *sp, const struct output *o,
@@ -1856,8 +1875,9 @@ int plugin_kind_helper(const struct plugin_kind *pk, const struct spec *sp, cons
         if (kind_helper_env(h, be) != 0) return -1;
     }
     kind_sig_mix(&h->sig, pl->version, strlen(pl->version));
-    /* Подпись перезапуска — версия плагина, всё содержимое {conf} (steer-api.md, 1.4) и содержимое
-     * файлов ключей x-watch. */
+    plugin_build_sig(pl, &h->sig);
+    /* Подпись перезапуска — версия и сборка плагина и его библиотек, всё содержимое {conf} (steer-api.md, 1.4)
+     * и содержимое файлов ключей x-watch. */
     char *cj = plugin_conf_json(sp, o, pk);
     if (!cj) return -1;
     kind_sig_mix(&h->sig, cj, strlen(cj));
@@ -1904,6 +1924,7 @@ int plugin_svc_helper(const struct plugin_svc *sv, const struct spec *sp, struct
         mkdir(d, 0700);
     }
     kind_sig_mix(&h->sig, pl->version, strlen(pl->version));
+    plugin_build_sig(pl, &h->sig);
     settings_sig(pl, &h->sig);
     for (size_t i = 0; i < sv->run.argc; i++) {
         char *a = subst(pl, sp, NULL, NULL, sv->run.argv[i], why, sizeof(why));

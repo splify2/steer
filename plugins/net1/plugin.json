@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "net1",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "type": "library",
   "name": "Сетевой стек туннелей",
   "description": "Общая библиотека протоколов: wolfSSL (внутри, скрыт), TLS 1.3 и REALITY, HTTP/2, QUIC, транспорты, стек TUN",
@@ -26,7 +26,7 @@
     {
       "soname": "libs2p-net.so.1",
       "file": "lib/libs2p-net.so.1",
-      "abi": "1.3"
+      "abi": "1.4"
     }
   ],
   "i18n": {

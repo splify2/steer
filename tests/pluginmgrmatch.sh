@@ -613,6 +613,89 @@ check "испорченное семя: отказ" "1" "$rc"
 has "  причина" "испорчен" "$o"
 printf '{"id":"splify2","url":"http://127.0.0.1:%s/","official":true,"priority":0,"keys":[]}\n' "$PORT" > etc/repos.d/splify2.json
 
+# ---- ABI библиотек (pminst.c, «ABI библиотек»): та же версия библиотеки, другая сборка ----
+# Плагин-библиотека abl1 (type: library, libs2p-abl.so.1) и зависимые abu, abv. «Сборка» — строка в файле
+# библиотеки; программа зависимого сверяет её со своей, как s2pcheck.c у net1: не та — строка «steer: библиотека …»
+# и код 2; STEER_LIB_PROBE=1 — «подходит» и код 0. Так 2.1.0-g3d6c8f1 выпустила net1 1.3.0 с другой раскладкой
+# под прежней версией: она вставала, а каждый плагин на ней потом откатывался.
+mkabl() {   # ВЕРСИЯ СБОРКА
+    d="src/abl1-$1-$2"; rm -rf "$d"; mkdir -p "$d/lib"
+    printf '{"schema":1,"id":"abl1","version":"%s","name":"abl1","type":"library","compat":{"steer-api":"^1.0"},"arch":"all","libs":[{"soname":"libs2p-abl.so.1","file":"lib/libs2p-abl.so.1","abi":"1.0"}]}\n' "$1" > "$d/plugin.json"
+    printf '%s\n' "$2" > "$d/lib/libs2p-abl.so.1"
+}
+mkabu() {   # ИМЯ ВЕРСИЯ СБОРКА
+    d="src/$1-$2-$3"; rm -rf "$d"; mkdir -p "$d/bin"
+    printf '{"schema":1,"id":"%s","version":"%s","name":"%s","compat":{"steer-api":"^1.0"},"arch":"all","requires":{"plugins":{"abl1":"^1.0"}},"steer":{"commands":[{"name":"%s-x","prog":"bin/%s"}]}}\n' \
+        "$1" "$2" "$1" "$1" "$1" > "$d/plugin.json"
+    cat > "$d/bin/$1" <<E
+#!/bin/sh
+# DT_NEEDED libs2p-abl.so.1
+L="\${LD_LIBRARY_PATH:-\$(dirname "\$0")/../../abl1/lib}"
+b="\$(cat "\${L%%:*}/libs2p-abl.so.1")"
+[ "\$b" = "$3" ] || { echo "steer: библиотека abl1 собрана с другой раскладкой структур, чем плагин (сборка \$b, у плагина $3)" >&2; exit 2; }
+[ "\${STEER_LIB_PROBE:-}" = 1 ] && { echo "steer: abl1 подходит"; exit 0; }
+echo "$1 $2 $3"
+E
+    chmod 755 "$d/bin/$1"
+}
+abuild() { "$S2P" build "$1" --key plg.sec -o "$2" >/dev/null 2>"$T/abuild.err" || { cat "$T/abuild.err"; echo "s2p build $1 не прошёл"; exit 1; }; }
+mkdir -p adA adB
+mkabl 1.0.0 A; mkabu abu 1.0.0 A; mkabu abv 1.0.0 A
+for p in abl1-1.0.0-A abu-1.0.0-A abv-1.0.0-A; do abuild "src/$p" adA; done
+mkabl 1.0.0 B; mkabu abu 1.0.0 B; mkabu abv 1.0.0 B
+for p in abl1-1.0.0-B abu-1.0.0-B abv-1.0.0-B; do abuild "src/$p" adB; done
+o="$(P install --file adA/abl1-1.0.0-all.s2p --file adA/abu-1.0.0-all.s2p --file adA/abv-1.0.0-all.s2p --json 2>err.txt)"; rc=$?
+check "abi: библиотека и зависимые сборки A из файлов одной командой" "0 abl1,abu,abv" \
+    "$rc $(printf '%s\n' "$o" | jq_ '",".join(x["id"] for x in d["installed"])')"
+check "  программа на месте и работает" "abu 1.0.0 A" "$(root/abu/bin/abu)"
+o="$(P install --file adB/abl1-1.0.0-all.s2p --json 2>err.txt)"; rc=$?
+check "abi: abl1 1.0.0 другой сборки одна — отказ до установки" "1 plugin.lib_abi_breaks" "$rc $(printf '%s\n' "$o" | jq_ 'd["code"]')"
+check "  подстановки: id, version, зависимые" "abl1 1.0.0 abu, abv" \
+    "$(printf '%s\n' "$o" | jq_ 'd["args"]["id"]+" "+d["args"]["version"]+" "+d["args"]["deps"]')"
+has "  why — строка отказа программы" "другой раскладкой структур" "$(printf '%s\n' "$o" | jq_ 'd["args"]["why"]')"
+check "  стоящая библиотека не тронута, зависимые работают" "A abu 1.0.0 A" "$(cat root/abl1/lib/libs2p-abl.so.1) $(root/abu/bin/abu)"
+o="$(P install --file adB/abu-1.0.0-all.s2p --json 2>err.txt)"; rc=$?
+check "abi: зависимый другой сборки один — отказ до установки" "1 plugin.lib_abi_mismatch abl1" \
+    "$rc $(printf '%s\n' "$o" | jq_ 'd["code"]+" "+d["args"]["lib"]')"
+check "  стоит прежний" "abu 1.0.0 A" "$(root/abu/bin/abu)"
+# Выход из тупика «по одному нельзя»: все вместе одной командой, библиотека — первой, в каком порядке ни назови.
+o="$(P install --file adB/abu-1.0.0-all.s2p --file adB/abv-1.0.0-all.s2p --file adB/abl1-1.0.0-all.s2p --json 2>err.txt)"; rc=$?
+check "abi: abl1, abu, abv сборки B одной командой — встали, библиотека первой" "0 abl1,abu,abv" \
+    "$rc $(printf '%s\n' "$o" | jq_ '",".join(x["id"] for x in d["installed"])')"
+check "  все — сборки B" "B abu 1.0.0 B abv 1.0.0 B" "$(cat root/abl1/lib/libs2p-abl.so.1) $(root/abu/bin/abu) $(root/abv/bin/abv)"
+# Сломанное состояние, как у 2.1.0-g3d6c8f1 (библиотека встала без зависимых): migrate ставит из семени заново
+# и библиотеку, и зависимых — при той же версии.
+for p in abl1 abu abv; do cp "adB/$p-1.0.0-all.s2p" dist/; done
+index
+cp repo/index.json repo/index.json.sig seed/
+cp adB/abl1-1.0.0-all.s2p adB/abu-1.0.0-all.s2p adB/abv-1.0.0-all.s2p seed/
+printf 'A\n' > root/abl1/lib/libs2p-abl.so.1
+o="$(root/abu/bin/abu 2>&1)"; rc=$?
+check "abi: сломанное состояние — зависимый не запускается" "2" "$rc"
+o="$(STEER_SPEC="$T/mspec0.yaml" P migrate --json 2>err.txt)"; rc=$?
+check "migrate: несовместимые по ABI ставятся из семени заново при той же версии" "0 abl1:seed,abu:seed,abv:seed" \
+    "$rc $(printf '%s\n' "$o" | jq_ '",".join(sorted(x["id"]+":"+x["from"] for x in d["installed"]))')"
+has "  и говорит, что несовместимо" "несовместимы со стоящими библиотеками: abu, abv" "$(cat err.txt)"
+check "  после migrate всё сборки B и работает" "B abu 1.0.0 B abv 1.0.0 B" "$(cat root/abl1/lib/libs2p-abl.so.1) $(root/abu/bin/abu) $(root/abv/bin/abv)"
+o="$(STEER_SPEC="$T/mspec0.yaml" P migrate --json 2>/dev/null)"
+check "  повторный migrate ничего не ставит" "[]" "$(printf '%s\n' "$o" | jq_ 'str(d["installed"])')"
+# Установка из файла поверх плагина из репозитория оставляет его репозиторий (pm_inst_set с тем же указателем читал
+# освобождённую память — repo становился пустым, и migrate потом не обновлял такой плагин из семени).
+P install --file adB/abu-1.0.0-all.s2p --json >/dev/null 2>&1
+check "  --file поверх плагина из репозитория: repo тот же" "splify2" "$(jq_ 'd["plugins"]["abu"]["repo"]' < etc/state.json)"
+# Обновление библиотеки из индекса: новая сборка не подходит к стоящим зависимым — они берутся в ту же установку
+# одной группой из своего репозитория.
+mkabl 1.1.0 C; mkabu abu 1.1.0 C; mkabu abv 1.1.0 C
+for p in abl1-1.1.0-C abu-1.1.0-C abv-1.1.0-C; do abuild "src/$p" dist; done
+index
+rm -rf run/splify2
+o="$(P update abl1 --json 2>err.txt)"; rc=$?
+check "update abl1: несовместимые зависимые обновлены вместе с ней" "0 abl1 1.1.0,abu 1.1.0,abv 1.1.0" \
+    "$rc $(printf '%s\n' "$o" | jq_ '",".join(sorted(x["id"]+" "+x["version"] for x in d["updated"]))')"
+has "  и говорит почему" "abl1 1.1.0 несовместима со стоящими abu, abv — они ставятся вместе с ней" "$(cat err.txt)"
+check "  всё сборки C" "C abu 1.1.0 C abv 1.1.0 C" "$(cat root/abl1/lib/libs2p-abl.so.1) $(root/abu/bin/abu) $(root/abv/bin/abv)"
+P remove abu --force --json >/dev/null 2>&1; P remove abv --force --json >/dev/null 2>&1; P remove abl1 --force --json >/dev/null 2>&1
+
 # ---- с демоном: plugin-* сокета, событие plugin, plugin-reload ----
 if [ "${PM_INNER:-}" = 1 ]; then
     mkdir -p st
@@ -739,6 +822,40 @@ PY
         "$rc $(jq_ 'd["plugins"]["net1"]["version"]+" "+d["plugins"]["foo"]["version"]' < etc/state.json)"
     check "  проверка здоровья одна на группу, не по плагину" "1 0" \
         "$(grep -c 'проверка здоровья группы' err.txt) $(grep -c 'проверка здоровья foo\|проверка здоровья net1' err.txt)"
+    # ABI: перечитывание падает на соседе прежней сборки (его хук не запускается с новой библиотекой) — не вина
+    # ставящегося плагина, если он сам с библиотекой совместим: установка не откатывается. Так на стенде после
+    # net1 1.3.0 другой раскладки каждый плагин по одному откатывался из-за соседа («по одному нельзя»).
+    P install --file adB/abl1-1.0.0-all.s2p --file adB/abu-1.0.0-all.s2p --json >/dev/null 2>&1
+    mk abx 1.0.0 ',"permissions":["spec.transform"],"requires":{"plugins":{"abl1":"^1.0"}},"steer":{"kinds":[{"name":"abx","caps":["mark"],"resources":{"ports":1},"expand":{"prog":"bin/expand","argv":["{out}"]}}]}'
+    cat > src/abx-1.0.0/bin/expand <<'E'
+#!/bin/sh
+# DT_NEEDED libs2p-abl.so.1
+L="${LD_LIBRARY_PATH:-$(dirname "$0")/../../abl1/lib}"
+b="$(cat "${L%%:*}/libs2p-abl.so.1")"
+[ "$b" = B ] || { echo "steer: библиотека abl1 собрана с другой раскладкой структур, чем плагин (сборка $b, у плагина B, процесс $$)" >&2; exit 2; }
+[ "${STEER_LIB_PROBE:-}" = 1 ] && { echo "steer: abl1 подходит"; exit 0; }
+cat >/dev/null
+printf '{"self":{"kind":"group","pick":"order","members":["%s.1"],"on_fail":"drop"},"outputs":{"%s.1":{"kind":"interface","device":"lo"}}}\n' "$1" "$1"
+E
+    chmod 755 src/abx-1.0.0/bin/expand
+    abuild src/abx-1.0.0 adB
+    o="$(P install --file adB/abx-1.0.0-all.s2p --json 2>err.txt)"; rc=$?
+    check "abi с демоном: abx (хук expand на abl1) встал" "0" "$rc"
+    printf 'version: 2\noutputs:\n  a1: { kind: abx }\n' > dspec.yaml
+    o="$("$BIN" ctl --socket "$T/s.sock" plugin-reload)"
+    check "  спека с выходом abx перечитана" "0" "$(printf '%s\n' "$o" | jq_ 'd["code"]')"
+    # Библиотека другой сборки встала без зависимых (как net1 у 2.1.0-g3d6c8f1): MANIFEST другой — другая сборка.
+    printf 'A\n' > root/abl1/lib/libs2p-abl.so.1
+    echo >> root/abl1/MANIFEST
+    o="$("$BIN" ctl --socket "$T/s.sock" plugin-reload 2>&1)"
+    has "  перечитывание теперь падает на хуке abx" "другой раскладкой структур" "$o"
+    o="$(P install --file adA/abu-1.0.0-all.s2p --json 2>err.txt)"; rc=$?
+    check "abi с демоном: abu, совместимый со стоящей abl1, ставится, хотя перечитывание падает на abx" "0 A" \
+        "$rc $(root/abu/bin/abu | cut -d' ' -f3)"
+    has "  вывод называет виноватого соседа" "из-за стоящих abx прежней сборки" "$(cat err.txt)"
+    printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > dspec.yaml
+    for p in abx abu abl1; do P remove $p --force --json >/dev/null 2>&1; done
+    "$BIN" ctl --socket "$T/s.sock" plugin-reload >/dev/null 2>&1
     kill $D 2>/dev/null; wait $D 2>/dev/null; D=""
 else
     echo "pluginmgrmatch: блок с демоном ПРОПУЩЕН — нужен root и unshare (сеть демона и reload)"

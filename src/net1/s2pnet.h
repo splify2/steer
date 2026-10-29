@@ -14,7 +14,11 @@
  * ломает. Типы на границе — структуры исходников (struct tun_out, pool_cfg, platform_ops, transport…):
  * плагин и net1 обязаны видеть их одинаково. Это ловит ОТПЕЧАТОК — размеры структур границы,
  * разрядность и порядок байт; помощник сверяет его при запуске (s2pcheck.c) и отказывает строкой,
- * а не портит память. Изменилась раскладка структуры границы — это major net1 (net2), а не minor. */
+ * а не портит память. Изменилась раскладка структуры границы или экспорт — новая версия net1 (не меньше
+ * minor) и строка в build/net1/abi.lst: tests/buildmatch.sh сверяет отпечаток и экспорт дерева с записанными
+ * для S2P_NET_VERSION, так что «та же версия, другая раскладка» не собирается. Плагины на net1 требуют
+ * ^<эту версию>; совместимость стоящих плагинов с новой net1 менеджер проверяет пробой до подмены
+ * (STEER_LIB_PROBE, s2pcheck.c; src/pluginmgr/pminst.c, «ABI библиотек»). */
 #ifndef STEER_S2PNET_H
 #define STEER_S2PNET_H
 
@@ -31,9 +35,9 @@
 #include "quic.h"
 
 #define S2P_NET_ABI_MAJOR 1
-#define S2P_NET_ABI_MINOR 3
+#define S2P_NET_ABI_MINOR 4
 /* Версия плагина net1 (plugins/net1/plugin.json, сверяет tests/buildmatch.sh): major = номер в id. */
-#define S2P_NET_VERSION "1.3.0"
+#define S2P_NET_VERSION "1.4.0"
 
 struct s2p_net_abi {
     uint32_t size;           /* sizeof(struct s2p_net_abi) — новые поля только в конец */

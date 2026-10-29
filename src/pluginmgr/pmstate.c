@@ -12,8 +12,11 @@
 /* ---- state.json ---- */
 
 void pm_inst_set(char **field, const char *v) {
+    /* v может быть самим *field (установка из файла берёт repo стоящей записи): сначала копия, потом free —
+     * иначе strdup читал освобождённую память, и repo становился "" (net1 и warpbox на стенде после --file). */
+    char *n = pm_strdup(v);
     free(*field);
-    *field = pm_strdup(v);
+    *field = n;
 }
 
 static char **str_list(const struct ynode *seq, size_t *n) {
