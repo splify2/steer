@@ -111,6 +111,7 @@ LIBS2P_NET_1 {
     s2p_tls13_aead_seal;
     s2p_tls13_keys_free;
     s2p_tls13_keys_setup;
+    s2p_tls_cert_roots;
     s2p_tr_dial;
     s2p_tr_dial_udp;
     s2p_transport_aux_drain;

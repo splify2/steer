@@ -73,6 +73,7 @@
 #include "dialer.h"
 #include "hy2conn.h"
 #include "quic.h"
+#include "roots.h"
 #include "tun.h"
 
 #define LOG_W2 "steer[warn]: "
@@ -357,6 +358,12 @@ static int make_cfg(const struct hy2_node *n, const char *ip, struct qc_cfg *c,
     c->sni = n->sni[0] ? n->sni : n->host[0] ? n->host : NULL;
     c->alpn = "h3";
     c->insecure = n->insecure;
+    /* Корни — те же, что у security=tls и DoH/DoT (tls_cert_roots, roots.c): на телефоне это
+     * склейка системного хранилища, на роутере NULL — файл ca-bundle. Прежде hysteria2 брал
+     * только умолчание qcssl (файл роутера), и на Android узел, который по vless+tls
+     * проверялся, по hysteria2 не поднимался: файла роутера там нет (по PR #16). Нужен и здесь, а не
+     * только в общем контексте рабочего: замер узла (hy2_probe) идёт со своим. */
+    c->ca_file = tls_cert_roots();
     if (n->has_pin) c->pin_sha256 = n->pin;
     else c->tls = tls;                  /* с отпечатком цепочка не проверяется — свой контекст без корней */
     /* Скорость: заданный up включает Brutal сразу, без него — BBR. Ответ сервера на авторизацию
@@ -1325,7 +1332,7 @@ void hy2c_loop_start(int worker, int nworkers) {
     h->want_up = 1;                     /* соединение — сразу: первый поток клиента не платит за рукопожатие */
     h->bg_try_ms = 0;
     if (!g_node->has_pin) {
-        h->tls = qc_tls_new(g_node->insecure, NULL, 0, NULL);
+        h->tls = qc_tls_new(g_node->insecure, NULL, 0, tls_cert_roots());   /* корни — как в make_cfg */
         if (!h->tls)
             fprintf(stderr, LOG_W2 "hysteria2: корни проверки сертификата не разобрались — каждый подъём разбирает их заново\n");
     }
