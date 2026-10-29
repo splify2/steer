@@ -70,6 +70,19 @@
 #define LOG_W  "steer[warn] tunnel: "
 #define LOG_I  "steer[info] tunnel: "
 
+/* Политика нового потока у хоста — см. stack.h. */
+static stack_flow_filter_fn g_flow_filter;
+static void *g_flow_filter_ctx;
+
+void stack_set_flow_filter(stack_flow_filter_fn filter, void *ctx) {
+    g_flow_filter = filter;
+    g_flow_filter_ctx = ctx;
+}
+
+static int flow_rejected(const struct flow_key *k, int udp) {
+    return g_flow_filter && g_flow_filter(g_flow_filter_ctx, k, udp) != 0;
+}
+
 /* Сколько соединений у потока цикла — предела нет, таблица растёт по нужде (I-529).
  *
  * Прежде здесь стояло 320 и при заполнении вытеснялись ЖИВЫЕ соединения (RST): число было взято под
@@ -2217,6 +2230,13 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
     }
 
     if (!c) {
+        if (flow_rejected(k, 1)) {
+            unsigned char un[128];
+            size_t ul = icmp_unreach_build(un, sizeof(un), pkt, n);
+            if (ul) tun_write_ctl(tun, un, ul);
+            TR("поток UDP отвергнут политикой хоста\n");
+            return;
+        }
         c = conn_new(tun);
         if (!c) return;                             /* все потоки свежие — клиент повторит */
         memset(c, 0, sizeof(*c));
@@ -3098,6 +3118,7 @@ static void kaccept_fd(int fd, const struct tun_dev *tun) {
  * там задаётся, а не спрашивается у ядра. NULL — соединения нет (сокет уже закрыт со сбросом). */
 static struct conn *conn_accept(int fd, const struct flow_key *k, const struct tun_dev *tun) {
     struct flow_key key = *k;
+    if (flow_rejected(&key, 0)) { sock_rst_close(fd); return NULL; }   /* политика хоста (stack.h) */
     struct conn *c = conn_new(tun);
     if (!c) { sock_rst_close(fd); return NULL; }
     memset(c, 0, sizeof(*c));
