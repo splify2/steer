@@ -1259,6 +1259,14 @@ static struct qc *qc_alloc(const struct qc_ops *ops, void *user) {
     return q;
 }
 
+static qc_socket_prepare_fn g_sock_prepare;
+static void *g_sock_prepare_ctx;
+
+void qc_set_socket_prepare(qc_socket_prepare_fn fn, void *ctx) {
+    g_sock_prepare = fn;
+    g_sock_prepare_ctx = ctx;
+}
+
 int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, struct qc **out) {
     if (!cfg || !ops || !out || !cfg->host || !cfg->port || !cfg->alpn) return QC_EINVAL;
     *out = NULL;
@@ -1281,6 +1289,7 @@ int qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, stru
     }
     q->fd = socket(q->remote.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (q->fd < 0) goto fail;
+    if (g_sock_prepare && g_sock_prepare(g_sock_prepare_ctx, q->fd) != 0) goto fail;   /* rc = QC_ESOCK */
     q->gro_on = sock_tune(q->fd);
     if (steer_sock_mark(q->fd, cfg->sock_mark) != 0 && cfg->mark_required) {
         rc = QC_ESOCK;

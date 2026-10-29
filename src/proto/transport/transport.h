@@ -435,6 +435,19 @@ const char *transport_strerror(int rc);
  * spec.h. 0 — не метить. required — метка обязательна: без неё соединение не открывается. */
 void transport_set_sock_mark(uint32_t mark, int required);
 
+/* Подготовка сокета к узлу хостом (по PR #12): fn зовётся на каждом сокете tr_dial и tr_dial_udp
+ * после socket() и до connect(). Зачем: приложение с VpnService обязано вывести собственные
+ * соединения из своего же туннеля (VpnService.protect(fd)), иначе они вернутся в TUN петлёй; там
+ * же хост может привязать сокет к сети (Network.bindSocket) или отказать. Не 0 — отказ: сокет
+ * закрывается здесь, один раз, а адрес считается недоступным (TCP пробует следующий, UDP отдаёт
+ * TR_ESOCK). Сам крючок дескриптор не закрывает ни при каком ответе — иначе закрытие вышло бы двойным.
+ * Ставится до запуска рабочих потоков, ctx живёт, пока они идут; NULL — без подготовки, как прежде.
+ * Сокеты QUIC (hysteria2, WARP MASQUE) — qc_set_socket_prepare в quic.h, отдельно: QUIC живёт и в
+ * ядре (DoH3, DoQ резолвера), без транспорта. Прочие сокеты (замер групп, менеджер плагинов,
+ * xsteer, tgws) крючка пока не зовут. */
+typedef int (*transport_socket_prepare_fn)(void *ctx, int fd);
+void transport_set_socket_prepare(transport_socket_prepare_fn fn, void *ctx);
+
 /* Сколько места обязан дать вызывающий transport_read: транспорты поверх HTTP/2 отдают за
  * один раз до целой записи TLS. */
 #define TRANSPORT_MIN_READ_CAP H2_MIN_READ_CAP

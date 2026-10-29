@@ -209,6 +209,12 @@ void qc_tls_early(struct qc_tls *t);
 /* Открыть соединение: сокет, TLS, первый пакет рукопожатия уходит сразу. 0 — успех, *out —
  * соединение; иначе QC_E*. ops копируется; user возвращается в колбэках. */
 int  qc_open(const struct qc_cfg *cfg, const struct qc_ops *ops, void *user, struct qc **out);
+/* Подготовка сокета хостом (по PR #12) — то же, что transport_set_socket_prepare (transport.h), для
+ * сокета qc_open: после socket(), до первого пакета. Не 0 — отказ, qc_open отдаёт QC_ESOCK и сокет
+ * закрывает сам (крючок его не закрывает). Сокет
+ * сервера (qc_listen) крючок не видит: он ничего не соединяет. */
+typedef int (*qc_socket_prepare_fn)(void *ctx, int fd);
+void qc_set_socket_prepare(qc_socket_prepare_fn fn, void *ctx);
 /* Закрыть: CONNECTION_CLOSE(app_err) серверу, затем on_closed(LOCAL). Память освобождает qc_free. */
 void qc_close(struct qc *q, uint64_t app_err);
 void qc_free(struct qc *q);

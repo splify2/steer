@@ -155,6 +155,14 @@ static int peer_family(int fd) {
     return ss.ss_family;
 }
 
+static int g_prep_n, g_prep_refuse, g_prep_unconn;
+static int prep_cb(void *ctx, int fd) {
+    (*(int *)ctx)++;
+    struct sockaddr_storage ss; socklen_t sl = sizeof ss;
+    g_prep_unconn = getpeername(fd, (struct sockaddr *)&ss, &sl) != 0;   /* ещё не соединён */
+    return g_prep_refuse ? -1 : 0;
+}
+
 static void conn_reset(void) { g_conn_n = 0; memset(g_conn, 0, sizeof g_conn); }
 
 int main(void) {
@@ -294,6 +302,24 @@ int main(void) {
         printf("via: SO_MARK недоступен (нет CAP_NET_ADMIN) — проверка IPv4 под меткой пропущена\n");
     }
     transport_set_sock_mark(0, 0);
+
+    /* ---- подготовка сокета хостом (по PR #12): до connect, отказ — закрыт и не соединён ---- */
+    g_prep_n = 0; g_prep_refuse = 0;
+    transport_set_socket_prepare(prep_cb, &g_prep_n);
+    fd = tr_dial("127.0.0.1", port, 3);
+    check("подготовка: TCP — крючок позван на сокете до connect", 1, fd >= 0 && g_prep_n == 1 && g_prep_unconn);
+    if (fd >= 0) close(fd);
+    g_prep_n = 0;
+    fd = tr_dial_udp("127.0.0.1", 9);
+    check("подготовка: UDP — крючок позван", 1, fd >= 0 && g_prep_n == 1 && g_prep_unconn);
+    if (fd >= 0) close(fd);
+    g_prep_refuse = 1;
+    fd = tr_dial("127.0.0.1", port, 3);
+    check("подготовка: хост отказал — TCP не соединяется", 1, fd < 0);
+    fd = tr_dial_udp("127.0.0.1", 9);
+    check("подготовка: хост отказал — UDP TR_ESOCK", TR_ESOCK, fd);
+    transport_set_socket_prepare(NULL, NULL);
+
     close(l4); close(l6);
     check("итог: дескрипторы не утекли", fds0 - 2, open_fds());
 
