@@ -2931,6 +2931,69 @@ static size_t own_pkt(unsigned char *p, uint32_t src, uint32_t dst, unsigned pro
     return hl + pay;
 }
 
+/* По PR #13: политика нового потока у хоста (stack_set_flow_filter). */
+static int g_ff_calls, g_ff_last_udp;
+static uint16_t g_ff_reject_port;
+static int ff_filter(void *ctx, const struct flow_key *k, int udp) {
+    (void)ctx;
+    g_ff_calls++;
+    g_ff_last_udp = udp;
+    return k->dport == g_ff_reject_port;
+}
+
+static void t_flow_filter(void) {
+    static unsigned char p[2048];
+    dev_drain(NULL);
+    stack_set_flow_filter(ff_filter, NULL);
+    g_ff_reject_port = 5300;
+    g_ff_calls = 0;
+    int lv = g_live_n;
+    size_t l = own_pkt(p, CLI_IP, SRV_IP, 17, 41000, 5300, 20, 0);
+    handle_packet(&g_tun, p, l);
+    unsigned char r[256];
+    ssize_t rn = recv(g_dev_peer, r, sizeof r, MSG_DONTWAIT);
+    check(g_ff_calls == 1 && g_ff_last_udp == 1 && g_live_n == lv,
+          "политика хоста: UDP отвергнут до сессии — поток не заведён");
+    check(rn >= 28 && r[9] == 1 && r[20] == 3 && r[21] == 3,
+          "  и клиенту ушёл ICMP «порт недостижим», а не тишина");
+    dev_drain(NULL);
+
+    /* Пропущенный поток заводится, и на следующих пакетах политику не спрашивают. */
+    g_ff_calls = 0;
+    l = own_pkt(p, CLI_IP, SRV_IP, 17, 41001, 5301, 20, 0);
+    handle_packet(&g_tun, p, l);
+    handle_packet(&g_tun, p, l);
+    struct flow_key uk;
+    memset(&uk, 0, sizeof uk);
+    uk.src = CLI_IP; uk.dst = SRV_IP; uk.sport = 41001; uk.dport = 5301; uk.proto = 17;
+    struct conn *uc = conn_find(&uk);
+    check(uc && g_ff_calls == 1, "политика хоста: пропущенный UDP заведён, спрошена один раз на поток");
+    if (uc) {
+        if (uc->pending) wait_ready(uc, 2000);
+        conn_drop(uc);
+    }
+
+    /* TCP: принятое соединение отвергнуто — сброс клиенту, слота нет. */
+    g_ff_reject_port = SRV_PORT;
+    g_ff_calls = 0;
+    lv = g_live_n;
+    int sv[2];
+    struct conn *tc = NULL;
+    if (cli_pair_unix(sv) == 0) {
+        struct flow_key k;
+        memset(&k, 0, sizeof k);
+        k.src = CLI_IP; k.dst = SRV_IP; k.sport = 41002; k.dport = SRV_PORT; k.proto = 6;
+        tc = conn_accept(sv[0], &k, &g_tun);
+        char b;
+        ssize_t got = read(sv[1], &b, 1);
+        check(!tc && g_ff_calls == 1 && g_ff_last_udp == 0 && g_live_n == lv && got <= 0,
+              "политика хоста: TCP отвергнут — сокет клиента закрыт, соединение не заведено");
+        close(sv[1]);
+    }
+    stack_set_flow_filter(NULL, NULL);
+    dev_drain(NULL);
+}
+
 /* По PR #11: устройство хоста (tun_adopt_fd) — копия с FD_CLOEXEC, без разгрузок; оригинал хоста не
  * закрывается. */
 static void t_tun_adopt(void) {
@@ -3961,6 +4024,7 @@ int main(void) {
     g_now_s = (time_t)(g_now_ns / 1000000000ull);
 
     t_no_connectors();
+    t_flow_filter();
     t_tun_adopt();
     t_connectors_burst();
     t_race();
