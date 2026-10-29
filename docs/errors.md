@@ -201,6 +201,10 @@
 | `spec.split_needs_tls` | `1` | {1}: делить ClientHello можно только у DoT (tls://) и DoH (https://); у этого сервера нет TLS поверх TCP |
 | `spec.too_long` | `1`, `2` | {1}: длиннее {2} байт |
 | `spec.too_long_79` | `1` | {1}: длиннее 79 байт |
+| `spec.torrent_bad` | `1`, `2` | {1}: «{2}» — нужен block (отвергать), direct (напрямую) или allow |
+| `spec.torrent_block_out` | `1` | правило {1}: torrent у выхода block — его трафик и так не проходит |
+| `spec.torrent_direct_out` | `1` | правило {1}: torrent: direct у выхода direct — его трафик и так идёт напрямую |
+| `spec.torrent_phone` | `1` | правило {1}: torrent действует на трафик клиентов раздачи, а не самого телефона (uid, self) |
 | `spec.tunnel_kind_v2` | `1`, `2` | {1}: в спеке v2 туннель пишется kind: tunnel, protocol: {2} |
 | `spec.tunnel_needs_protocol` | `1`, `2` | {1}: kind: tunnel нужен protocol (протоколы: {2}) |
 | `spec.uid_root` | `1` | {1}: uid 0 — это root, то есть само ядро steer и системные демоны; их трафик правилом не маршрутизируется |
@@ -214,6 +218,7 @@
 | `spec.unsup_mixed_clients` | `1` | ещё не поддерживается в этой версии ядра steer: правило {1}: клиенты разных видов (адреса, MAC, телефон) в одном for — разнесите их по правилам |
 | `spec.unsup_mixed_lists` | `1` | ещё не поддерживается в этой версии ядра steer: правило {1}: списки с разными proto/ports или с all в одном to — разнесите их по правилам |
 | `spec.unsup_quic_srs` | `1` | ещё не поддерживается в этой версии ядра steer: правило {1}: quic: block со списком srs — пока со списками prefixes_file и domains_file или с to: all |
+| `spec.unsup_torrent_srs` | `1` | ещё не поддерживается в этой версии ядра steer: правило {1}: torrent со списком srs — пока со списками prefixes_file и domains_file или с to: all |
 | `spec.upstream_group_nested` | `1`, `2` | {1}: «{2}» — группа; группа в группе не поддерживается — перечислите её серверы |
 | `spec.upstream_missing` | `1`, `2` | {1}: сервера «{2}» нет в dns.upstreams |
 | `spec.upstream_name_twice` | `1` | dns.upstreams: имя «{1}» повторяется |

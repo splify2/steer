@@ -22,6 +22,7 @@
 #include "nftdump.h"
 #include "nftcompat.h"
 #include "balance.h"
+#include "torrent.h"
 
 /* Строковый буфер для выражений-перечней («ip saddr { a, b }», «th dport { … }»). Растёт по
  * надобности: раньше это было 4 КБ «с запасом на 32 адреса», и клиент с сотней адресов терял хвост
@@ -795,6 +796,38 @@ static void quic_reject(struct nft_chain *c, const struct spec *sp, const struct
     }
 }
 
+/* ТОРРЕНТЫ у правила (`torrent: block | direct`, l4.torrent группы): пакет клиентов группы к её
+ * назначениям проходит распознавание (цепочка политики, compile/torrent.c) ДО правила разметки той же
+ * группы — как отказ QUIC выше: правило выше (иное назначение, иной выход) свои торренты не теряет.
+ * Цепочка распознавания решает сама (отказ или «напрямую» — accept без метки), а не узнанный пакет
+ * возвращается сюда и получает метку группы. «Весь трафик» — интернет, своя сеть не затрагивается. На
+ * ingress reject нет — ingress_devs при таком правиле разметку на ingress не ставит. */
+static void torrent_jump(struct nft_chain *c, const struct spec *sp, const struct group *g) {
+    static const char *const LOCAL4 = "ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, "
+        "172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }";
+    static const char *const LOCAL6 = "ip6 daddr != { ::1, fe80::/10, fc00::/7, ff00::/8 }";
+    const char *pc = g->l4->torrent == TORRENT_DIRECT ? TORRENT_CHAIN_DIRECT : TORRENT_CHAIN_BLOCK;
+    if (who4_ok(g)) {
+        struct nft_rule *r = ir_rule(c);
+        x_from(r, sp, g);
+        if (g->all) { ir_family(r, 4); ir_x(r, "%s", LOCAL4); }
+        x_dest(r, g, 0, group_has_set(g));
+        ir_x(r, "meta l4proto { tcp, udp }");
+        ir_x(r, "jump %s", pc);
+        ir_comment(r, "steer-torrent:%s", g->name);
+    }
+    if (g->all ? who6_ok(sp, g) : group_needs6(sp, g)) {
+        struct nft_rule *r = ir_rule(c);
+        ir_rule_fam(r, 6);
+        x_from6(r, sp, g, 0, !group_has_set6(g));
+        if (g->all) ir_x(r, "%s", LOCAL6);
+        x_dest6(r, g, 0);
+        ir_x(r, "meta l4proto { tcp, udp }");
+        ir_x(r, "jump %s", pc);
+        ir_comment(r, "steer-torrent:%s", g->name);
+    }
+}
+
 static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const struct groups *gr,
                             enum mark_hook mh, struct err *e) {
     for (size_t i = 0; i < gr->n; i++) {
@@ -803,6 +836,7 @@ static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const st
         if (!o) return err_setf(e, "compile.group_no_output", "channel group %s points at a missing output", g->name);
         /* Каналы на сам телефон — на хуке output, см. nft_emit_output_mark. */
         if (group_is_local(g)) continue;
+        if (g->l4 && g->l4->torrent && mh != MH_INGRESS) torrent_jump(c, sp, g);
         if (g->l4 && g->l4->quic_block && mh != MH_INGRESS) quic_reject(c, sp, g);
         /* ПРАВИЛО У ГРУППЫ ОДНО, и у него бывает v6-двойник ниже.
          * Клиент из одних адресов IPv6 правила IPv4 не даёт вовсе. */
@@ -1012,6 +1046,8 @@ static size_t ingress_devs(const struct spec *sp, const struct groups *gr, const
      * раньше отказа пакет уже получил бы метку выхода (разметка на ingress решает первой). */
     for (size_t i = 0; i < gr->n; i++)
         if (gr->g[i].l4 && gr->g[i].l4->quic_block) return 0;
+    /* То же у торрентов: их отказ и «напрямую» решаются в prerouting_mark. */
+    if (torrent_used(gr, 0)) return 0;
     /* То же у отказа IPv6 «весь трафик» по политике семейства (group_v6_guard). */
     for (size_t i = 0; i < gr->n; i++) {
         const struct output *go = out_by_name(sp, gr->g[i].out);
@@ -2276,6 +2312,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     struct nft_table *t = ir_table_add(rs, NFT_FAM_INET, nft_table());
     build_group_sets(t, gr);
     build_v6donor_set(t, sp);
+    torrent_emit(t, gr);
     if (build_mark(t, sp, gr, e) != 0) return -1;
     /* Группы balance: цепочки, карты и цепочки меток (compile/balance.c). Без таких групп — ничего,
      * и текст прежний до байта. */

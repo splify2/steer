@@ -155,7 +155,7 @@ KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/block.c src/kind
 # cli/modcmd.c — команды модулей (заглушки steerd и настоящие ветки модулей) и main модуля;
 # входит и в steerd, и в каждый бинарник модуля.
 MODCMD_SRC := src/cli/modcmd.c
-DAEMON_SRC := src/compile/groups.c src/compile/generate.c src/compile/balance.c src/compile/print.c src/daemon/fwcheck.c \
+DAEMON_SRC := src/compile/groups.c src/compile/generate.c src/compile/balance.c src/compile/torrent.c src/compile/print.c src/daemon/fwcheck.c \
               src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
               src/daemon/explain.c src/daemon/helpers.c src/daemon/supervise.c src/daemon/supd.c src/daemon/watch.c src/daemon/main.c \
               $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c \

@@ -464,14 +464,14 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
     for (size_t i = 0; i < s->client_n; i++)
         if (s->client[i].name[0]) { name_take(cn, s->client[i].name, "lan", cname[i]); cshow[i] = 1; }
     for (size_t i = 0; i < s->list_n; i++)
-        if (s->list[i].name[0] && !s->list[i].l4.quic_block) {
+        if (s->list[i].name[0] && !s->list[i].l4.quic_block && !s->list[i].l4.torrent) {
             name_take(ln, s->list[i].name, "all", lname[i]);
             lshow[i] = 1;
         }
-    /* Копия списка под `quic: block` носит имя оригинала (v2.c, quic_clone) и в спеке не
-     * печатается: правило ссылается на оригинал и пишет `quic: block` само. */
+    /* Копия списка под `quic: block` или `torrent` носит имя оригинала (v2.c, rule_list_clone) и в
+     * спеке не печатается: правило ссылается на оригинал и пишет ключ само. */
     for (size_t i = 0; i < s->list_n; i++) {
-        if (!s->list[i].name[0] || !s->list[i].l4.quic_block) continue;
+        if (!s->list[i].name[0] || !(s->list[i].l4.quic_block || s->list[i].l4.torrent)) continue;
         for (size_t k = 0; k < s->list_n; k++)
             if (lshow[k] && !strcmp(s->list[k].name, s->list[i].name)) {
                 memcpy(lname[i], lname[k], sizeof(lname[i]));
@@ -619,6 +619,7 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
                 }
             }
             if (ru->quic_block) fs(&w, "quic", "block");
+            if (ru->torrent) fs(&w, "torrent", ru->torrent == TORRENT_DIRECT ? "direct" : "block");
             if (ru->family) fs(&w, "family", ru->family == 4 ? "4" : "6");
             if (ru->fam_block) fs(&w, "on_family_unavailable", "block");
             if (ru->dev_scope) fs(&w, "scope", "device");

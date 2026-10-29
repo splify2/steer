@@ -1657,11 +1657,12 @@ static int merge_clients(struct v2 *x, struct spec_rule *r, const struct ynode *
     return 0;
 }
 
-/* `quic: block`: правило получает КОПИЮ своего списка с признаком выключенного QUIC (l4.quic_block).
- * Копия, а не признак на списке: список в lists общий, им могут пользоваться другие правила, и QUIC
- * у них остаётся. Массивы файлов копия делит с оригиналом (арена спеки живёт до конца процесса).
- * Правило «весь трафик» (lists_n == 0) получает безымянный список all, как у перевода v1. */
-static int quic_clone(struct v2 *x, struct spec_rule *r, const struct ynode *qn, const char *rn) {
+/* `quic: block` и `torrent`: правило получает КОПИЮ своего списка с признаками (l4.quic_block,
+ * l4.torrent). Копия, а не признак на списке: список в lists общий, им могут пользоваться другие
+ * правила, и у них QUIC и торренты остаются как были. Массивы файлов копия делит с оригиналом
+ * (арена спеки живёт до конца процесса). Правило «весь трафик» (lists_n == 0) получает безымянный
+ * список all, как у перевода v1. Копия одна на оба ключа. */
+static int rule_list_clone(struct v2 *x, struct spec_rule *r, const struct ynode *qn, const char *rn) {
     struct spec *s = x->s;
     if (spec_reserve_list(s, s->list_n + 1) != 0)
         return fail(x, qn, "spec.no_memory", "правило %s: недостаточно памяти для спеки (списков: %zu)", rn, s->list_n + 1);
@@ -1673,7 +1674,8 @@ static int quic_clone(struct v2 *x, struct spec_rule *r, const struct ynode *qn,
         m->all = 1;
         /* r->lists выделен под число пунктов to (не меньше одного) — место есть. */
     }
-    m->l4.quic_block = 1;
+    m->l4.quic_block = (uint8_t)r->quic_block;
+    m->l4.torrent = (uint8_t)r->torrent;
     r->lists[0] = (unsigned)s->list_n++;
     r->lists_n = 1;
     return 0;
@@ -1810,6 +1812,18 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
             return fail(x, qn, "spec.quic_bad", "%s: «%s» — нужен block (отвергать UDP/443) или allow", w, sv);
     }
 
+    /* Торренты (BitTorrent) клиентов правила: block — отказ, direct — напрямую мимо выхода правила;
+     * allow — записанное умолчание, как allow у quic. */
+    const struct ynode *trn = ynode_get(n, "torrent");
+    if (trn) {
+        snprintf(w, sizeof(w), "правило %s: torrent", rn);
+        if (str_of(x, trn, w, &sv)) return -1;
+        if (!strcmp(sv, "block")) r->torrent = TORRENT_BLOCK;
+        else if (!strcmp(sv, "direct")) r->torrent = TORRENT_DIRECT;
+        else if (strcmp(sv, "allow") != 0)
+            return fail(x, trn, "spec.torrent_bad", "%s: «%s» — нужен block (отвергать), direct (напрямую) или allow", w, sv);
+    }
+
     /* Политика семейства IP (R-154). both — записанное умолчание, как allow у quic. */
     const struct ynode *fyn = ynode_get(n, "family");
     if (fyn) {
@@ -1867,7 +1881,29 @@ static int p_rule(struct v2 *x, const struct ynode *n, size_t no) {
             if (x->cl[refs[i]].local)
                 return fail(x, qn, "spec.quic_phone", "правило %s: quic: block действует на трафик клиентов раздачи, а не "
                             "самого телефона (uid, self)", rn);
-        if (!(l && l->srs_n) && quic_clone(x, r, qn, rn)) return -1;
+    }
+    if (r->torrent) {
+        const struct spec_list *l = r->lists_n ? &s->list[r->lists[0]] : NULL;
+        const struct output *o = &s->out[r->out];
+        /* Как и у quic: проверки применимости — и у выключенного правила. */
+        if (out_is_block(o))
+            return fail(x, trn, "spec.torrent_block_out", "правило %s: torrent у выхода block — его трафик и так не проходит", rn);
+        /* Выход без метки (direct) и так оставляет пакету обычный путь: «напрямую» нечего менять. */
+        if (r->torrent == TORRENT_DIRECT && !out_needs_mark(o))
+            return fail(x, trn, "spec.torrent_direct_out", "правило %s: torrent: direct у выхода direct — его трафик и так идёт "
+                        "напрямую", rn);
+        if (l && l->srs_n)
+            unsup(x, trn, "spec.unsup_torrent_srs", "правило %s: torrent со списком srs — пока со списками prefixes_file и "
+                  "domains_file или с to: all", rn);
+        for (size_t i = 0; i < refs_n; i++)
+            if (x->cl[refs[i]].local)
+                return fail(x, trn, "spec.torrent_phone", "правило %s: torrent действует на трафик клиентов раздачи, а не "
+                            "самого телефона (uid, self)", rn);
+    }
+    {
+        const struct spec_list *l = r->lists_n ? &s->list[r->lists[0]] : NULL;
+        int srs = l && l->srs_n;
+        if (!srs && (r->quic_block || r->torrent) && rule_list_clone(x, r, r->quic_block ? qn : trn, rn)) return -1;
     }
 
     /* Выключенное правило не проверяем по смыслу (довод — в v1.c: иначе сломанное правило нельзя

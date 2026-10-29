@@ -89,6 +89,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@sh tests/v6ns.sh
 	@sh tests/v6host.sh
 	@sh tests/ingressns.sh
+	@sh tests/torrentmatch.sh
 	@sh tests/androidmatch.sh
 	@sh tests/platmatch.sh
 	@sh tests/supervisematch.sh
