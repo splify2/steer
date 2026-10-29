@@ -30,8 +30,7 @@
 # внеочередным проходом (период сторожа — 600 с), status показывает node_down с причиной, diag —
 # «узел перестал отвечать», а up возвращает пул; ход перебора узлов vless status берёт из памяти демона;
 # оживление обфускатора — перезапуск помощника демоном (helper-down с причиной, helper-up), ubus
-# не зовётся; смена содержимого файла стратегии zapret и reload перезапускают обработчик только
-# этого выхода.
+# не зовётся.
 #
 # Под root стенд уходит в своё сетевое пространство (unshare -n); без root — петля хоста и
 # высокие порты. Без python3 — пропуск (заглушка апстрима и запросы DNS).
@@ -46,6 +45,9 @@ fi
 [ "${SUPD_INNER:-}" = 1 ] && ip link set lo up 2>/dev/null
 
 tmp="$(mktemp -d)"
+# Помощника obfs выходу interface даёт плагин obfs (вид interface, helper.when obfs): каталог плагинов стенда.
+sh tests/plugroot.sh "$tmp/plugins" "$(dirname "$BIN")" || { echo "supdmatch: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 mkdir -p "$tmp/st"
 D="" SUB="" UP="" WD="" DN5="" Q5="" SL="" CAT="" DO6=""
 trap 'kill $D $SUB $UP $WD $DN5 $Q5 $SL $CAT $DO6 2>/dev/null; rm -rf "$tmp"' EXIT
@@ -63,6 +65,9 @@ check() {
 wait_for() {
     i=0
     while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    # Приговор по фактическому состоянию, а не по счётчику кругов: условие, ставшее истинным в последнюю
+    # десятую секунды, иначе объявлялось бы невыполненным.
+    eval "$1" && return 0
     return 1
 }
 
@@ -79,6 +84,11 @@ while :; do
         rm -f "$tmp/crash.\$2"
         printf '{"ev":"down","why":"стенд: отказ"}\n' >&9
         exit 3
+    fi
+    if [ -e "$tmp/active.\$2" ]; then
+        rm -f "$tmp/active.\$2"
+        # Тысяча узлов — событие в ~3,9 КиБ: прежний предел был 160 символов списка и 480 байт на запись.
+        printf '{"ev":"active","nodes":"%s"}\n' "\$(seq -s, 1 1000)" >&9
     fi
     if [ -e "$tmp/health.\$2" ]; then
         rm -f "$tmp/health.\$2"
@@ -202,6 +212,14 @@ check "  после клиента (STEER_DAEMON_ASKED) — считает са�
 check "  чужая спека — считает сам" "-" \
     "$(cp "$tmp/spec.json" "$tmp/other.json"; STEER_SOCKET="$tmp/s.sock" "$ENG" status --spec "$tmp/other.json" --state-dir "$tmp/st" | pdown)"
 
+# active со списком в тысячу узлов (больше прежних 160 символов): список доходит до status целиком.
+touch "$tmp/active.b"
+wait_for 'ctl helper b | grep -q "active"' 5
+check "  active на 1000 узлов — в ответе helper без обрезки (3892 знака списка)" "1000 3892" \
+    "$(ctl helper b | python3 -c 'import json,sys
+d = json.loads(json.load(sys.stdin)["stdout"])
+print(len(d["active"]), len(",".join(map(str, d["active"]))))')"
+
 # Резолвер на таблице: канал swap.test есть — AAAA погашен; чужое имя — ответ апстрима.
 wait_for '[ "$(python3 "$tmp/qaaaa.py" "$LPORT" other.test)" = 1 ]' 5
 check "резолвер: канал из таблицы демона забрал swap.test, чужое имя — наверх" "0 1" \
@@ -223,7 +241,7 @@ check "  a и t не тронуты" "$pa $pt" "$(pid_of a) $(pid_of t)"
 check "  и о причине сказано" "1" "$(grep -c 'supervise: obfs b — параметры выхода изменились' "$tmp/d.err")"
 
 check "  подписчику — helper-down с нашей причиной" \
-    '{"v":1,"ev":"helper-down","out":"b","helper":"obfs","why":"перезапуск: параметры выхода изменились"}' \
+    '{"v":1,"ev":"helper-down","out":"b","helper":"obfs","why":"перезапуск: параметры выхода изменились","code":"supd.restart_params","args":{}}' \
     "$(grep '"ev":"helper-down"' "$tmp/sub.out")"
 
 # Смена спеки меняет поведение резолвера без перезапуска: канала больше нет.
@@ -256,7 +274,7 @@ check "  упал снова сразу — пауза растёт до 10 с" 
 kill -KILL "$(pid_of t)"
 wait_for 'grep -q "\"out\":\"t\",\"helper\":\"obfs\",\"why\"" "$tmp/sub.out"' 5
 check "помощник убит молча после up — helper-down с причиной" \
-    '{"v":1,"ev":"helper-down","out":"t","helper":"obfs","why":"процесс убит (сигнал 9)"}' \
+    '{"v":1,"ev":"helper-down","out":"t","helper":"obfs","why":"процесс убит (сигнал 9)","code":"supd.killed","args":{"1":"9"}}' \
     "$(grep '"out":"t","helper":"obfs","why"' "$tmp/sub.out")"
 wait_for '[ "$(runs t)" = 2 ] && [ "$(alive t)" = yes ]' 8
 wait_for '[ "$(runs b)" -ge 4 ] && [ "$(alive b)" = yes ]' 12
@@ -642,7 +660,7 @@ fi
 # Выход-пул vpn из устройств xa и xb — устройств выходов kind=xsteer, чьи помощники (заглушки) пишут
 # up или down по файлу down.<выход>. Устройства — dummy: их наличие сторож видит в своём /sys, а
 # живость решает событие помощника. vl — выход vless, чей помощник застрял на переборе узлов (node
-# 2 из 5). zq и zr — выходы zapret со своими файлами стратегии. wo — interface с обфускатором;
+# 2 из 5). wo — interface с обфускатором;
 # у его устройства нет адреса, проба ICMP его не находит, и сторож его оживляет. ubus, ifdown и
 # ifup — заглушки в PATH демона: ubus записывает вызов, ifdown/ifup отказывают.
 XK="${STEER_XK:-$(dirname "$BIN")/steer-xk}"
@@ -665,7 +683,6 @@ echo "\$1 \$2 \$\$" >> "$W/log"
 trap 'echo "stop \$1 \$2 \$\$" >> "$W/log"; exit 0' TERM
 upline='{"ev":"up"}' downline='{"ev":"down","why":"стенд: отказ"}'
 case "\$1 \$2" in
-nfqws*) while :; do sleep 0.1; done ;;
 "vless vl") printf '{"ev":"node","n":2,"total":5}\n' >&9; while :; do sleep 0.1; done ;;
 "vless vx") printf '{"ev":"excluded","total":3}\n{"ev":"down","why":"все узлы-кандидаты исключены exclude"}\n' >&9; while :; do sleep 0.1; done ;;
 vless*) upline="{\"ev\":\"up\",\"watch\":1,\"dev\":\"\$2\"}" downline='{"ev":"down","why":"стенд: узел молчит"}' ;;
@@ -683,8 +700,6 @@ while :; do
 done
 H
     chmod +x "$W/helper"
-    printf 'strategy-1\n' > "$W/zq.opts"
-    printf 'strategy-r\n' > "$W/zr.opts"
     : > "$W/sub.txt"
     # wspec [wo] — с «wo» ещё и выход с обфускатором.
     wspec() {
@@ -695,8 +710,6 @@ H
  "xa":{"kind":"xsteer","conf":"/etc/xa.conf","on_fail":"direct"},
  "xb":{"kind":"xsteer","conf":"/etc/xb.conf","on_fail":"direct"},
  "vpn":{"kind":"interface","devices":["xa","xb"],"on_fail":"drop"},
- "zq":{"kind":"zapret","opts_file":"$W/zq.opts"},
- "zr":{"kind":"zapret","opts_file":"$W/zr.opts"},
  "vl":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
  "vx":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
  "va":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"},
@@ -854,19 +867,6 @@ for c in d["checks"]:
     check "  и helper-up после подъёма" "2" "$(grep -c '"ev":"helper-up","out":"wo"' "$W/sub.out")"
     check "  в журнале — почему" "1" "$(grep -c 'supervise: obfs wo — выход не отвечает, поднимаю заново' "$W/d.err")"
     check "  ubus не звался" "" "$(cat "$W/ubus.log" 2>/dev/null)"
-    check "  reload без смены стратегий обработчики zapret не тронул" "1 1" "$(wruns nfqws zq) $(wruns nfqws zr)"
-
-    # Стратегия zapret сменилась — reload перезапускает обработчик только этого выхода.
-    xa0="$(wruns xsteer xa)" vl0="$(wruns vless vl)" wo0="$(wruns obfs wo)"
-    printf 'strategy-2\n' > "$W/zq.opts"
-    wctl reload >/dev/null
-    wait_for '[ "$(wruns nfqws zq)" = 2 ]' 10
-    sleep 0.5
-    check "стратегия zq сменилась, reload — перезапущен обработчик zq" "2" "$(wruns nfqws zq)"
-    check "  zr и остальные помощники не тронуты" "1 $xa0 $vl0 $wo0" \
-        "$(wruns nfqws zr) $(wruns xsteer xa) $(wruns vless vl) $(wruns obfs wo)"
-    check "  новый обработчик — с тем же файлом" "1" \
-        "$(grep -c "supervise: nfqws zq — параметры выхода изменились" "$W/d.err")"
     check "  файлов probe-* и xsteer-*.json по-прежнему нет" "" "$(nofiles)"
     check "  журнал демона — с уровнем" "0" \
         "$(grep -v '^steer\[\(warn\|info\)\]' "$W/d.err" | grep -v '^steer dnsd: ' | grep -c .)"

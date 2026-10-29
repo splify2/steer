@@ -23,8 +23,8 @@
  * указателями в узел подписки. Поэтому следующий протокол поверх тех же транспортов (trojan,
  * shadowsocks через ws) — это новый дайлер, а не правка этого слоя.
  *
- * При выпуске 1.10 (шаг 4) весь этот каталог уходит в разделяемую libsteer вместе с TLS: модули
- * протоколов пользуются им, а не носят свою копию.
+ * Весь этот каталог живёт в разделяемой libsteer вместе с TLS: модули протоколов пользуются им,
+ * а не носят свою копию.
  */
 #ifndef STEER_TRANSPORT_H
 #define STEER_TRANSPORT_H
@@ -116,8 +116,21 @@ struct tr_link {
     /* 1 — в этом рукопожатии гибрид X25519MLKEM768 не предлагать (короткий ClientHello). Ставит
      * tr_link_open: после таймаута длинного Hello и на узле, для которого уже решено, что нужен короткий. */
     int nopq;
+    /* Живой режим записи (tr_link_live, I-534): связь отдана циклу стека, и запись не ждёт сокета —
+     * что он не принял сразу, лежит в oq (у голой связи) или в очереди tls (поверх TLS) и дослается по
+     * событию записи. До этого — при рукопожатии и в пробах — запись блокирующая, со сроком сокета. */
+    int live;
+    struct outq oq;
     struct tls13 tls;
 };
+
+/* Живая запись связи (см. tr_link.live): включить, сколько байт ждёт отправки, дослать без ожидания
+ * (0 — пусто, 1 — сокет занят, -1 — отказ). Верхний предел очереди не вводится: вызывающий (dialer_ops.room)
+ * перестаёт давать данные, когда ждущих набралось TR_OUT_HIWAT. */
+#define TR_OUT_HIWAT (256 * 1024)
+void tr_link_live(struct tr_link *l);
+size_t tr_link_pending(const struct tr_link *l);
+int tr_link_flush(struct tr_link *l);
 
 /* Разбор потока сообщений gRPC.
  *
@@ -185,6 +198,23 @@ struct xh_state {
     /* Отказ сервера на кусок выгрузки, прочитанный не записью, а слежкой за второй связью
      * (xhttp_aux_drain): отправка вернёт его первой, как вернула бы, прочитав сама. */
     int drain_err;
+    /* Прежняя связь выгрузки после переоткрытия (up_reopen), ещё не закрытая: цикл туннеля держит вторую
+     * связь в epoll по номеру дескриптора, и новая связь с номером только что закрытой выглядела бы той же —
+     * без записи в epoll (закрытие её снимает), то есть не слушаемой, а EPOLLOUT очереди ей не ставился бы.
+     * Пока прежняя открыта, у новой номер другой; закрывается на втором обходе цикла (xhttp_aux_fd) — первый
+     * успевает снять прежнюю из epoll, пока её номер ещё наш. 0 — нет. */
+    int zombie_fd;
+    uint8_t zombie_seen;
+    /* Копия узла для переоткрытия второй связи: сервер закрывает связь выгрузки после предела
+     * запросов на соединение (GOAWAY; nginx — keepalive_requests, ~1000), и packet-up, где каждый
+     * кусок — запрос, упирается в него на долгой выгрузке. Узел вызывающего (стек, подписка) к
+     * этому времени уже не жив, поэтому строки копируются в node_mem одним куском. NULL — копии
+     * нет (stream-one вторую связь не поднимает). Освобождает xhttp_close. */
+    struct tr_node node;
+    char *node_mem;
+    int open_timeout;
+    /* Живая запись включена (xhttp_live): вторая связь, поднятая позже (up_reopen), пишет так же. */
+    int live;
 };
 
 /* Разбор кадров WebSocket от сервера (RFC 6455, раздел 5) — потоком, по кускам любой длины.
@@ -253,7 +283,7 @@ struct transport;
 
 /* Транспорт — поле type= ссылки: как поток протокола уложен внутри защищённой связи.
  *
- * ws и httpupgrade (шаг 5 выпуска 1.10) — ещё две такие таблицы и два файла рядом с trgrpc.c:
+ * ws и httpupgrade — ещё две такие таблицы и два файла рядом с trgrpc.c:
  * запрос Upgrade по HTTP/1.1 в open (trupgrade.c), кадры WebSocket в write/read (trws.c; у
  * httpupgrade кадров нет — после ответа 101 поток идёт как есть), ALPN "http/1.1". Ни стек
  * туннеля, ни дайлер при этом не поменялись: они видят транспорт только через transport_write и
@@ -300,6 +330,13 @@ struct transport_ops {
      * NULL — второй связи у транспорта не бывает. */
     int  (*aux_fd)(const struct transport *t);
     int  (*aux_drain)(struct transport *t);
+    /* Сколько байт ждёт отправки в очереди второй связи (живая запись): пока они есть, цикл ждёт её записи
+     * (EPOLLOUT) и сливает через aux_drain. NULL — нет. */
+    size_t (*aux_pending)(const struct transport *t);
+    /* См. transport_big_write. NULL — нет. */
+    int  (*big_write)(const struct transport *t);
+    /* Основная связь отдана циклу (transport_live): включить живую запись у второй связи. NULL — нет. */
+    void (*live)(struct transport *t);
 };
 
 /* Безопасность — поле security= ссылки. Различаются только рукопожатием (см. шапку). */
@@ -345,6 +382,17 @@ int transport_write(struct transport *t, const unsigned char *d, size_t n);
  * по этому числу выбирает окно клиента: клиент шлёт то, что узел может принять, а не узнаёт
  * об этом по таймаутам повторной передачи (см. dialer_ops.room). */
 long transport_room(struct transport *t);
+/* Живая запись транспорта (I-534): дайлер включает её, когда связь отдана циклу стека; сколько байт связь
+ * ещё не отправила узлу; дослать без ожидания (0 — пусто, 1 — занят, -1 — отказ). Вторая связь xhttp под
+ * выгрузку остаётся блокирующей, как прежде. */
+void transport_live(struct transport *t);
+size_t transport_out_pending(const struct transport *t);
+int transport_out_flush(struct transport *t);
+/* Принимает ли запись ЛЮБОЙ длины одним вызовом, без своих ограничений на неё и без лишней копии
+ * на стороне вызывающего (packet-up: запись режется на POST сама). 1 — да; у stream-up и
+ * stream-one запись упирается в окно одного потока и кадры, у остальных — в запись TLS, и стек
+ * собирает для них не больше TUNNEL_BUF. Шифрование VLESS (enc) переупаковывает записи — для него 0. */
+int transport_big_write(const struct transport *t);
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got);
 
 /* Приём БЕЗ ЛИШНЕЙ КОПИИ там, где транспорт это позволяет (transport_ops.zc).
@@ -375,6 +423,7 @@ static inline int transport_fd(const struct transport *t) { return t->link.fd; }
  * (transport_ops.aux_drain). Подробности — в transport.c. */
 int transport_aux_fd(const struct transport *t);
 int transport_aux_drain(struct transport *t);
+size_t transport_aux_pending(const struct transport *t);
 
 /* Закрыть всё: дескрипторы обеих связей и контексты шифров в куче. Годится и для структуры,
  * которую transport_open не довёл до конца или не открывал вовсе (fd -1). */
@@ -385,6 +434,19 @@ const char *transport_strerror(int rc);
 /* Метка сокетов к узлу (SO_MARK до connect) — для `via`/`over`, см. «вложенные выходы» в
  * spec.h. 0 — не метить. required — метка обязательна: без неё соединение не открывается. */
 void transport_set_sock_mark(uint32_t mark, int required);
+
+/* Подготовка сокета к узлу хостом (по PR #12): fn зовётся на каждом сокете tr_dial и tr_dial_udp
+ * после socket() и до connect(). Зачем: приложение с VpnService обязано вывести собственные
+ * соединения из своего же туннеля (VpnService.protect(fd)), иначе они вернутся в TUN петлёй; там
+ * же хост может привязать сокет к сети (Network.bindSocket) или отказать. Не 0 — отказ: сокет
+ * закрывается здесь, один раз, а адрес считается недоступным (TCP пробует следующий, UDP отдаёт
+ * TR_ESOCK). Сам крючок дескриптор не закрывает ни при каком ответе — иначе закрытие вышло бы двойным.
+ * Ставится до запуска рабочих потоков, ctx живёт, пока они идут; NULL — без подготовки, как прежде.
+ * Сокеты QUIC (hysteria2, WARP MASQUE) — qc_set_socket_prepare в quic.h, отдельно: QUIC живёт и в
+ * ядре (DoH3, DoQ резолвера), без транспорта. Прочие сокеты (замер групп, менеджер плагинов,
+ * xsteer, tgws) крючка пока не зовут. */
+typedef int (*transport_socket_prepare_fn)(void *ctx, int fd);
+void transport_set_socket_prepare(transport_socket_prepare_fn fn, void *ctx);
 
 /* Сколько места обязан дать вызывающий transport_read: транспорты поверх HTTP/2 отдают за
  * один раз до целой записи TLS. */
@@ -474,6 +536,9 @@ int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, i
 /* Ввод-вывод основной связи в форме struct h2_io (ctx — struct tr_link). */
 int tr_link_write(void *ctx, const unsigned char *d, size_t n);
 int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got);
+
+/* Чтение голого сокета без ожидания: нет данных — *got = 0 и 0; конец — TR_ECLOSED; сбой — TR_EIO. */
+int tr_sock_read(int fd, unsigned char *d, size_t cap, size_t *got);
 
 /* Закрыть связь: сокет и, если это был TLS, ключи в куче. */
 void tr_link_close(struct tr_link *l);

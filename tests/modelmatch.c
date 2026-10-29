@@ -120,6 +120,14 @@ static void t_rules(void) {
     group_set_name(&g_spec, n1, sizeof(n1), "direct", "ip", tv->from, tv->from_n, 0, NULL);
     check_str("имя набора правила со своим клиентом", "direct_ip_c1", n1);
 
+    /* I-518: выходы с общим началом длиннее места в имени набора не сливаются, а короткие имена
+     * остаются прежними (от них зависит перенос счётчиков). */
+    char l0[64], l1[64];
+    group_set_name(&g_spec, l0, sizeof(l0), "provider-frankfurt-node-1", "ip", tv->from, tv->from_n, 0, NULL);
+    group_set_name(&g_spec, l1, sizeof(l1), "provider-frankfurt-node-2", "ip", tv->from, tv->from_n, 0, NULL);
+    check("длинные выходы с общим началом — разные наборы", 1, strcmp(l0, l1) != 0);
+    check("имя набора длинного выхода не длиннее 31", 1, strlen(l0) <= 31 && strlen(l1) <= 31);
+
     check("allow_all спеки v1 по-прежнему нужен", -1, load(
         "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
         "\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"

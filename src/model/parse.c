@@ -14,8 +14,8 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include "spec.h"
+#include "plugin.h"
 #include "srsplan.h"
-#include "obfs.h"
 #include "ynode.h"
 #include "v1.h"
 #include "v2.h"
@@ -128,7 +128,8 @@ static int from_disc(const struct spec *sp, const char (*from)[64], size_t from_
 int l4match_same(const struct l4match *a, const struct l4match *b) {
     int ae = l4match_empty(a), be = l4match_empty(b);
     if (ae || be) return ae && be;
-    if (a->proto != b->proto || a->ports_n != b->ports_n || a->override_port != b->override_port)
+    if (a->proto != b->proto || a->ports_n != b->ports_n || a->override_port != b->override_port ||
+        a->quic_block != b->quic_block)
         return 0;
     /* ПОРЯДОК ЗНАЧИМ, и это сознательно. Два канала с одними диапазонами, записанными в
      * разном порядке, дадут разные группы и разные наборы — то есть лишнее правило вместо
@@ -158,13 +159,20 @@ static const struct l4match *rule_l4(const struct spec *sp, size_t i) {
 }
 
 /* Различные сужения клауз наборов, которых нет среди сужений правил, — в порядке появления. */
-struct l4seen { const struct spec *sp; struct l4match *v; size_t n; };
+struct l4seen { const struct spec *sp; struct l4match *v; size_t n, cap; };
 static void l4seen_add(void *ctx, const struct l4match *m) {
     struct l4seen *c = ctx;
     for (size_t i = 0; i < c->sp->rule_n; i++)
         if (!l4match_empty(rule_l4(c->sp, i)) && l4match_same(rule_l4(c->sp, i), m)) return;
     for (size_t k = 0; k < c->n; k++) if (l4match_same(&c->v[k], m)) return;
-    if (c->n < 256) c->v[c->n++] = *m;
+    if (c->n == c->cap) {
+        size_t cap = c->cap ? c->cap * 2 : 64;
+        struct l4match *v = realloc(c->v, cap * sizeof(*v));
+        if (!v) return;             /* нет памяти: сужение не нумеруется, ниже вернётся «ничьё» число */
+        c->v = v;
+        c->cap = cap;
+    }
+    c->v[c->n++] = *m;
 }
 
 static int l4_disc(const struct spec *sp, const struct l4match *m) {
@@ -184,14 +192,14 @@ static int l4_disc(const struct spec *sp, const struct l4match *m) {
      * src/model/srsplan.c). Такие нумеруются ПОСЛЕ сужений каналов, в порядке каналов, файлов и
      * клауз: номера каналов тогда не сдвигаются от того, что в спеке появился набор, и имена
      * наборов у прежних каналов — а от них зависит перенос счётчиков — остаются прежними. */
-    static struct l4match seen[256];
-    struct l4seen c = { sp, seen, 0 };
+    struct l4seen c = { sp, NULL, 0, 0 };
     for (size_t i = 0; i < sp->rule_n; i++) {
         const struct spec_list *l = rule_list(sp, &sp->rule[i]);
         if (l->srs_n) srs_list_l4_each(l, l4seen_add, &c);
     }
     for (size_t k = 0; k < c.n; k++)
-        if (l4match_same(&seen[k], m)) return idx + 1 + (int)k;
+        if (l4match_same(&c.v[k], m)) { free(c.v); return idx + 1 + (int)k; }
+    free(c.v);
     /* Недостижимо: сужение приходит из спеки или её наборов. Возвращать здесь нуль значило бы
      * отдать имя без суффикса, то есть ровно то слияние наборов, от которого функция и
      * заведена, — поэтому число, которого ни у кого нет. */
@@ -226,6 +234,26 @@ static int twin_clash(const struct spec *sp, const char *out, int cd, int pd) {
     return 0;
 }
 
+void set_name_famtag(char *name, size_t n, char tag) {
+    size_t l = strlen(name);
+    if (tag && l + 1 < n) { name[l] = tag; name[l + 1] = '\0'; }
+}
+
+/* Часть имени выхода в составном имени (набор nftables, устройство): не длиннее width. Имя, которое
+ * влезает, идёт как есть — от имени набора зависит перенос счётчиков (counter_find), и короткие
+ * имена меняться не должны. Длинное — начало и шесть шестнадцатеричных знаков FNV-1a полного
+ * имени: голая обрезка сливала выходы с общим началом в один набор (I-518). */
+void name_part(char *dst, size_t n, const char *name, size_t width) {
+    size_t len = strlen(name);
+    if (len <= width || width < 8) {
+        snprintf(dst, n, "%.*s", (int)width, name);
+        return;
+    }
+    uint32_t h = 2166136261u;
+    for (const unsigned char *q = (const unsigned char *)name; *q; q++) h = (h ^ *q) * 16777619u;
+    snprintf(dst, n, "%.*s%06x", (int)(width - 6), name, (unsigned)(h & 0xffffff));
+}
+
 void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out, const char *kind,
                     const char (*from)[64], size_t from_n, int realip,
                     const struct l4match *l4) {
@@ -238,19 +266,25 @@ void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out,
      * роутере — при обновлении движка, которое для человека выглядит как «ничего не менял». */
     if (!pd) {
         if (!rip && from_same(from, from_n, sp->lan.from, sp->lan.from_n)) {
-            snprintf(dst, n, "%.24s_%s", out, kind);
+            char o[32];
+            name_part(o, sizeof o, out, 24);
+            snprintf(dst, n, "%s_%s", o, kind);
             return;
         }
         /* Выход обрезается сильнее, чтобы имя с суффиксом осталось коротким: у наборов
          * nftables на старых ядрах предел длины 32 символа. */
         int cd = from_disc(sp, from, from_n);
-        snprintf(dst, n, "%.18s_%s_c%d%s%s", out, kind, cd, rip ? "r" : "",
+        char o[32];
+        name_part(o, sizeof o, out, 18);
+        snprintf(dst, n, "%s_%s_c%d%s%s", o, kind, cd, rip ? "r" : "",
                  !rip && twin_clash(sp, out, cd, 0) ? "x" : "");
         return;
     }
     /* Выход обрезается ещё сильнее: суффиксов теперь два, а предел в 32 символа тот же. */
     int cd = from_disc(sp, from, from_n);
-    snprintf(dst, n, "%.14s_%s_c%d%s_p%d%s", out, kind, cd, rip ? "r" : "", pd,
+    char o[32];
+    name_part(o, sizeof o, out, 14);
+    snprintf(dst, n, "%s_%s_c%d%s_p%d%s", o, kind, cd, rip ? "r" : "", pd,
              twin_clash(sp, out, cd, pd) ? "x" : "");
 }
 
@@ -261,7 +295,9 @@ void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out,
 void group_set_name_mixed(const struct spec *sp, char *dst, size_t n, const char *out,
                           const char *kind, const char (*from)[64], size_t from_n, int realip) {
     int rip = realip && !strcmp(kind, "dom");
-    snprintf(dst, n, "%.16s_%s_c%d%s_m", out, kind, from_disc(sp, from, from_n), rip ? "r" : "");
+    char o[32];
+    name_part(o, sizeof o, out, 16);
+    snprintf(dst, n, "%s_%s_c%d%s_m", o, kind, from_disc(sp, from, from_n), rip ? "r" : "");
 }
 
 /* Имя доп. группы канала — клауз набора с условиями, которых у канала нет (клиент, приложение,
@@ -271,7 +307,9 @@ void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char
                           const char *kind, const char (*from)[64], size_t from_n, int realip,
                           unsigned id) {
     int rip = realip && !strcmp(kind, "dom");
-    snprintf(dst, n, "%.12s_%s_c%d%s_e%u", out, kind, from_disc(sp, from, from_n),
+    char o[32];
+    name_part(o, sizeof o, out, 12);
+    snprintf(dst, n, "%s_%s_c%d%s_e%u", o, kind, from_disc(sp, from, from_n),
              rip ? "r" : "", id);
 }
 
@@ -279,10 +317,8 @@ void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char
  * которым компилятор даёт группе v6-двойника (generate.c: out_v6_ok, who6_ok): выход несёт IPv6
  * или метки не ставит вовсе (direct), а «кто» выражается для IPv6 — устройством, MAC, адресом
  * IPv6, клиентами по умолчанию или владельцем сокета на телефоне («uid:N» — тоже с двоеточием,
- * как адрес IPv6, и у generate.c считается так же). Режим fake-IP ещё требует nat в семействе
- * IPv6: на старом ядре без NFTC_IP6NAT карты fakeip6 и её dnat поставить негде. */
-int dom6_ok(const struct spec *sp, const struct output *o, const char (*from)[64], size_t from_n,
-            int realip, int nftc) {
+ * как адрес IPv6, и у generate.c считается так же). */
+int dom6_ok(const struct spec *sp, const struct output *o, const char (*from)[64], size_t from_n) {
     if (out_needs_mark(o) && !out_has_cap(o, KC_IPV6)) return 0;
     /* IPv6 выхода снят (spec_v6_resolve): `ipv6: off` или выход рядом с донором. Отдельной
      * строкой ради direct — у него метки нет, и строка выше его не касается, а рядом с донором
@@ -291,7 +327,6 @@ int dom6_ok(const struct spec *sp, const struct output *o, const char (*from)[64
     int who = !from_n || spec_is_mac(from[0]) || from_same(from, from_n, sp->lan.from, sp->lan.from_n);
     for (size_t i = 0; i < from_n && !who; i++) who = strchr(from[i], ':') != NULL;
     if (!who) return 0;
-    if (!realip && (nftc & NFTC_LEGACY) && !(nftc & NFTC_IP6NAT)) return 0;
     return 1;
 }
 
@@ -381,7 +416,7 @@ uint32_t fakeip6_to4(const uint8_t a[16]) {
     static const uint8_t pfx[12] = { FAKEIP6_PREFIX_BYTES };
     if (memcmp(a, pfx, 12) != 0) return 0;
     uint32_t v = ((uint32_t)a[12] << 24) | ((uint32_t)a[13] << 16) | ((uint32_t)a[14] << 8) | a[15];
-    return (v & 0xfffe0000u) == 0xc6120000u ? v : 0;
+    return (v & FAKEIP_POOL_MASK) == FAKEIP_POOL_BASE ? v : 0;
 }
 
 /* «адрес:порт» → адрес и порт. Живёт здесь, а не в obfs.c, потому что нужен обоим:
@@ -441,11 +476,19 @@ static int load_v2(const char *buf, size_t n, const char *name, struct spec *s, 
     const struct ynode *root = ydoc_root(d);
     int rc;
     if (root && root->kind == YN_MAP && !ynode_get(root, "version") && ynode_get(root, "schema"))
-        rc = ynode_err(e, d, ynode_get(root, "schema"), "%s", "спека v1 пишется JSON-объектом "
-                       "({\"schema\": 1, …}); спека YAML — это v2, и начинается она с version: 2");
+        {
+            struct err t;
+            err_setc(&t, "spec.v1_in_yaml", "%s", "спека v1 пишется JSON-объектом "
+                     "({\"schema\": 1, …}); спека YAML — это v2, и начинается она с version: 2");
+            rc = ynode_errc(e, d, ynode_get(root, "schema"), &t);
+        }
     else if (root && root->kind == YN_MAP && !ynode_get(root, "version"))
-        rc = ynode_err(e, d, root, "%s", "нет version: 2 — спека YAML — это спека v2 "
-                       "(docs/spec-v2.md); спека v1 — JSON-объект со schema");
+        {
+            struct err t;
+            err_setc(&t, "spec.no_version_yaml", "%s", "нет version: 2 — спека YAML — это спека v2 "
+                     "(docs/spec-v2.md); спека v1 — JSON-объект со schema");
+            rc = ynode_errc(e, d, root, &t);
+        }
     else
         rc = spec_parse_v2(d, s, e);
     ydoc_free(d);
@@ -475,38 +518,86 @@ static int spec_pick_default(const char **path, struct err *e) {
 static int load_text(char *buf, size_t n, const char *path, struct spec *s, struct err *e);
 
 int load_spec(const char *path, struct spec *s, struct err *e) {
+    return load_spec_mode(path, s, e, LOAD_PREPARED);
+}
+
+/* Текст спеки по пути (с выбором между spec.json и spec.yaml, spec_pick_default) в кучу; "-" — stdin.
+ * 0 — прочитан, *buf с нулём в конце, *n — длина; -1 — отказ в e. Тем же читают load_spec_mode и
+ * шаг подготовки (plugprep.c): байты, по которым считается ключ, — ровно те, что разбирает ядро. */
+int spec_read_text(const char *path, char **buf, size_t *n, struct err *e) {
+    if (spec_pick_default(&path, e) != 0) return -1;
+    FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
+    if (!f) return err_set(e, "%s: cannot open", path);
+    /* Текст читается в кучу по мере надобности. Потолок — 16 МиБ: столько же,
+     * сколько принимает ctl (CTL_FILE_MAX), — защита от файла-невпопад (лог вместо спеки), а не
+     * размер спеки: спека на тысячи правил — сотни килобайт. */
+    size_t cap = 16384, len = 0;
+    char *b = malloc(cap);
+    if (!b) { if (f != stdin) fclose(f); return err_set(e, "%s", "недостаточно памяти для спеки"); }
+    for (;;) {
+        if (len + 1 >= cap) {
+            if (cap >= SPEC_TEXT_MAX) {
+                free(b);
+                if (f != stdin) fclose(f);
+                return err_set(e, "%s", "spec too large (max 16 MiB)");
+            }
+            char *nb = realloc(b, cap * 2);
+            if (!nb) { free(b); if (f != stdin) fclose(f); return err_set(e, "%s", "недостаточно памяти для спеки"); }
+            b = nb;
+            cap *= 2;
+        }
+        size_t got = fread(b + len, 1, cap - 1 - len, f);
+        if (!got) break;
+        len += got;
+    }
+    b[len] = '\0';
+    if (f != stdin) fclose(f);
+    *buf = b;
+    *n = len;
+    return 0;
+}
+
+int load_spec_mode(const char *path, struct spec *s, struct err *e, int flags) {
     /* Спека — значение (правило 6): экземпляр обнуляется здесь, а не оставляется на
      * совести вызывающего, и получает те же умолчания, что раньше стояли инициализаторами
      * глобалов — один br-lan клиентским устройством, всё остальное пусто/нуль. */
     if (spec_defaults(s) != 0) return err_set(e, "%s", "недостаточно памяти для спеки");
+    s->load_flags = flags;
+    char *buf = NULL;
+    size_t n = 0;
     if (spec_pick_default(&path, e) != 0) return -1;
-    FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
-    if (!f) return err_set(e, "%s: cannot open", path);
-    /* Текст читается в кучу по мере надобности (раньше — статический буфер в 256 КиБ, то есть
-     * 256 КиБ bss ради спеки, которая занимает полкилобайта). Потолок — 16 МиБ: столько же,
-     * сколько принимает ctl (CTL_FILE_MAX), — защита от файла-невпопад (лог вместо спеки), а не
-     * размер спеки: спека на тысячи правил — сотни килобайт. */
-    size_t cap = 16384, n = 0;
-    char *buf = malloc(cap);
-    if (!buf) { if (f != stdin) fclose(f); return err_set(e, "%s", "недостаточно памяти для спеки"); }
-    for (;;) {
-        if (n + 1 >= cap) {
-            if (cap >= SPEC_TEXT_MAX) {
-                free(buf);
-                if (f != stdin) fclose(f);
-                return err_set(e, "%s", "spec too large (max 16 MiB)");
-            }
-            char *nb = realloc(buf, cap * 2);
-            if (!nb) { free(buf); if (f != stdin) fclose(f); return err_set(e, "%s", "недостаточно памяти для спеки"); }
-            buf = nb;
-            cap *= 2;
+    if (spec_read_text(path, &buf, &n, e) != 0) return -1;
+    /* ПОДГОТОВЛЕННАЯ СПЕКА (kinds/plugprep.c, steer-api.md 3.1): если хуки плагинов исполнены над
+     * этой спекой и ключ совпал (байты спеки, версии и манифесты плагинов), читается она: выходы
+     * видов с разворотом заведены, номера ресурсов выданы. Хуков load_spec не исполняет. Имя и
+     * каталог для путей остаются спеки человека. */
+    if (!(flags & LOAD_HUMAN)) {
+        char *pt = NULL, key[65];
+        size_t pn = 0;
+        int pr = spec_prepared_text(path, buf, n, &pt, &pn, key);
+        if (pr < 0) {
+            free(buf);
+            return err_set(e, "%s", "недостаточно памяти для спеки");
         }
-        size_t got = fread(buf + n, 1, cap - 1 - n, f);
-        if (!got) break;
-        n += got;
+        if (pr > 0) {
+            /* Отказ по подготовленной спеке называл бы место в ней, а не в спеке человека (её ключ —
+             * байты спеки, а не платформа: подготовленная телефоном спека с uid на роутере не
+             * годится). Поэтому при отказе отвечает разбор спеки человека, если отказывает и он. */
+            s->prepared = 1;
+            memcpy(s->prepared_key, key, sizeof(key));
+            int rc = load_text(pt, pn, path, s, e);
+            free(pt);
+            if (rc == 0) { free(buf); return 0; }
+            struct err he;
+            memset(&he, 0, sizeof(he));
+            if (spec_defaults(s) != 0) { free(buf); return err_set(e, "%s", "недостаточно памяти для спеки"); }
+            s->load_flags = flags;
+            int hr = load_text(buf, n, path, s, &he);
+            free(buf);
+            if (hr != 0) *e = he;
+            return -1;
+        }
     }
-    buf[n] = '\0';
-    if (f != stdin) fclose(f);
     int rc = load_text(buf, n, path, s, e);
     free(buf);
     return rc;
@@ -529,12 +620,18 @@ static int load_text(char *buf, size_t n, const char *path, struct spec *s, stru
     if (*p == '{' || !*p) {
         int ver = json_top_key(p, "version"), sch = json_top_key(p, "schema");
         if (ver && sch)
-            return err_set(e, "в спеке и version, и schema — это два формата (version: 2 — спека v2, "
+            return err_setc(e, "spec.both_formats", "в спеке и version, и schema — это два формата (version: 2 — спека v2, "
                            "schema — v1); оставьте одно", NULL);
         if (!ver) {
             int rc = spec_parse_v1(buf, s, e);
             if (rc == 0 || sch || !strstr(buf, "version")) return rc;
+            int lf = s->load_flags, pr = s->prepared;
+            char pk[65];
+            memcpy(pk, s->prepared_key, sizeof(pk));
             if (spec_defaults(s) != 0) return err_set(e, "%s", "недостаточно памяти для спеки");
+            s->load_flags = lf;
+            s->prepared = pr;
+            memcpy(s->prepared_key, pk, sizeof(pk));
             e->msg[0] = '\0';
         }
     }
@@ -718,7 +815,7 @@ int spec_dns_up_used(const struct spec *sp, size_t u) {
 /* ---- адрес апстрима DNS (dns.upstreams, docs/spec-v2.md) ---------------------------------------
  *
  * Схема выбирает транспорт, и только она: `https://` — DoH (RFC 8484), `tls://` — DoT (RFC 7858),
- * `udp://` и `tcp://` — обычный DNS, `quic://` — DoQ (RFC 9250, порт 853 по UDP, ALPN `doq`). Так же
+ * `udp://` и `tcp://` — обычный DNS, `quic://` — DoQ (RFC 9250, порт 853 по UDP, ALPN `doq`), `h3://` — DoH по HTTP/3 (RFC 9114, порт 443 по UDP, ALPN `h3`). Так же
  * пишут DoQ AdGuard (dnsproxy, AdGuard Home) и sing-box (`quic://dns.adguard-dns.com`); Xray для
  * него пишет `quic+local://`, а `doq://` — не схема ни у одного из этих клиентов, поэтому её нет и
  * здесь. Имя в quic:// и tls:// — одного рода: SNI и проверка сертификата идут по нему, а адрес
@@ -727,20 +824,21 @@ int spec_dns_up_used(const struct spec *sp, size_t u) {
  * Имя или адрес сервера — до первого `:` или `/`; адрес IPv6 пишется в скобках, как в любом URL.
  * Для udp:// и tcp:// нужен адрес, а не имя: обычный DNS на имя потребовал бы разрешить его тем же
  * обычным DNS, то есть тем самым системным резолвером, от которого bootstrap и отвязывает
- * апстрим. Путь есть только у DoH (умолчание /dns-query, как у dns.google и cloudflare-dns.com).
+ * апстрим. Путь есть только у DoH и DoH3 (умолчание /dns-query, как у dns.google и cloudflare-dns.com).
  * Порт по умолчанию — у протокола: 53, 853, 443. Разбор один и тот же у спеки (demon) и у
  * резолвера: последнему демон передаёт адрес строкой, и разойтись им нечем. */
 int dnsurl_parse(const char *url, struct spec_dns_up *u, char *why, size_t why_n) {
     static const struct { const char *scheme; int proto; unsigned short port; } S[] = {
         { "udp://", DNSP_UDP, 53 }, { "tcp://", DNSP_TCP, 53 }, { "tls://", DNSP_DOT, 853 },
         { "https://", DNSP_DOH, 443 }, { "quic://", DNSP_QUIC, 853 },
+        { "h3://", DNSP_DOH3, 443 },
     };
     u->proto = DNSP_NONE;
     size_t k = 0;
     for (; k < sizeof(S) / sizeof(S[0]); k++)
         if (!strncmp(url, S[k].scheme, strlen(S[k].scheme))) break;
     if (k == sizeof(S) / sizeof(S[0])) {
-        snprintf(why, why_n, "нужен адрес вида https://… (DoH), tls://… (DoT), quic://… (DoQ), udp://… или tcp://…");
+        snprintf(why, why_n, "нужен адрес вида https://… (DoH), tls://… (DoT), quic://… (DoQ), h3://… (DoH по HTTP/3), udp://… или tcp://…");
         return -1;
     }
     const char *p = url + strlen(S[k].scheme);
@@ -777,8 +875,8 @@ int dnsurl_parse(const char *url, struct spec_dns_up *u, char *why, size_t why_n
     }
     const char *path = "/dns-query";
     if (*p == '/') {
-        if (S[k].proto != DNSP_DOH) {
-            snprintf(why, why_n, "путь есть только у https://");
+        if (S[k].proto != DNSP_DOH && S[k].proto != DNSP_DOH3) {
+            snprintf(why, why_n, "путь есть только у https:// и h3://");
             return -1;
         }
         path = p;
@@ -805,6 +903,6 @@ int dnsurl_parse(const char *url, struct spec_dns_up *u, char *why, size_t why_n
     u->proto = (unsigned char)S[k].proto;
     u->port = (unsigned short)port;
     snprintf(u->host, sizeof(u->host), "%s", host);
-    snprintf(u->path, sizeof(u->path), "%s", S[k].proto == DNSP_DOH ? path : "");
+    snprintf(u->path, sizeof(u->path), "%s", S[k].proto == DNSP_DOH || S[k].proto == DNSP_DOH3 ? path : "");
     return 0;
 }

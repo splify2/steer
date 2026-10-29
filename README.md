@@ -24,8 +24,8 @@ podkop и forkop — [steer-box-connector](https://github.com/splify2/steer-box-
 
 - **Правила сверху вниз**: какой трафик каких клиентов в какой выход; побеждает первое совпадение
 - **Домены через fake-IP**: резолвер отвечает служебным адресом, ядро Linux возвращает настоящий через DNAT
-- **DNS под правило**: DoT, DoH, DoQ, UDP/TCP — напрямую или через выход, с кэшем; группы серверов (все сразу или по очереди) и свой сервер для остальных сайтов
-- **Выходы и группы**: интерфейс, туннель по подписке, zapret; группы `order`, `latency`, `manual`, `balance`; `on_fail` при отказе всех
+- **DNS под правило**: DoT, DoH (HTTP/1.1, HTTP/2, HTTP/3), DoQ, UDP/TCP — напрямую или через выход, с кэшем; группы серверов (все сразу или по очереди) и свой сервер для остальных сайтов
+- **Выходы и группы**: интерфейс, туннель по подписке; группы `order`, `latency`, `manual`, `balance`; `on_fail` при отказе всех
 - **Свои клиенты протоколов** модулями: VLESS/Reality (Vision, tcp/grpc/xhttp/ws/httpupgrade), hysteria2, trojan, shadowsocks, socks, http, vmess, xsteer
 - **WireGuard поверх поддельного TCP** там, где режут UDP
 - **`steer fit`** ужимает блок-лист в сотни тысяч префиксов до размера, который влезает в роутер
@@ -51,7 +51,8 @@ opkg install ./steer-core-<версия>-1_<арх>.ipk ./steer-vless-<верс�
 | `steer-proxy` | клиенты trojan, shadowsocks, socks, http, vmess |
 | `steer-xsteer` | клиент звезды xsteer |
 | `steer-obfs` | WireGuard поверх поддельного TCP |
-| `steer-tgws` | мост Telegram |
+| `steer-warpbox` | Cloudflare WARP выходом `kind: warp` (регистрация, подбор точек, замена). Нужен `kmod-amneziawg` или `kmod-wireguard` |
+| `steer-extended` | устаревший мета-пакет: `steer-core` и первые четыре модуля (без `steer-hysteria2`, `steer-proxy`, `steer-warpbox`) |
 
 ## Быстрый старт
 

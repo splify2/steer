@@ -1,7 +1,6 @@
 #!/bin/sh
 # Разделяемая раскладка роутера под ОДНУ архитектуру (шаг 4 выпуска 1.10, docs/architecture.md,
-# «Сборки»): libsteer-wolfssl.so, libsteer.so, steerd, модули steer-vless, steer-xsteer, steer-obfs,
-# steer-tgws.
+# «Сборки»): libsteer-wolfssl.so, libsteer.so, steerd, плагин-библиотека net1 и программы плагинов.
 #
 #     sh build/build-libs.sh ВЫХОДНОЙ_КАТАЛОГ ВЕРСИЯ [РЕВИЗИЯ]
 #
@@ -12,7 +11,8 @@
 # /opt/wolfssl), JOBS (параллельность). Зовут этот скрипт build.sh (внутри образа сборщика, по разу
 # на архитектуру) и tests/libs-test.sh (на хосте, gcc).
 #
-# ЧТО В КАКОМ ФАЙЛЕ — build/sources.mk (PROFILE_libsteer, PROFILE_steerd, PROFILE_mod_*); здесь
+# ЧТО В КАКОМ ФАЙЛЕ — build/sources.mk (PROFILE_libsteer, PROFILE_steerd, PROFILE_net1, PROFILE_plug_*);
+# здесь
 # только рецепт. Файлы на выходе называются по SONAME, а не по «libсteer.so»: у libsteer версия
 # движка (ABI между версиями не обещается, и бинарник, слинкованный с чужой версией, должен не
 # запуститься с понятной ошибкой загрузчика, а не молча взять несовместимую), у libsteer-wolfssl —
@@ -25,6 +25,20 @@
 # архитектуру по имени загрузчика musl (ld-musl-mipsel-sf.so.1 для mipsel soft-float,
 # ld-musl-armhf.so.1 для hard-float ARM, и т. д.). RPATH не нужен: библиотеки лежат в /usr/lib,
 # где musl ищет по умолчанию.
+#
+# РАСКЛАДКА 2.1 (единственная; build/sources.mk, «РАСКЛАДКА 2.1»): libsteer без стека протоколов,
+# steerd, плагин-библиотека net1 и программы плагинов (модулей ядра больше нет):
+#
+#     ВЫХОД/libsteer.so.<версия> libsteer-wolfssl.so.<версия> steerd
+#     ВЫХОД/plugins/net1/lib/libs2p-net.so.1
+#     ВЫХОД/plugins/<id>/bin/<id>          vless hysteria2 proxy xsteer warpbox obfs tgws
+#
+# tgws — плагин репозитория splify2-extended-plugins (PLUGINS_EXTENDED): программу собирает это дерево,
+# архив .s2p — тот репозиторий.
+#
+# Плагины ищут net1 по RUNPATH $ORIGIN/../../net1/lib — раскладка каталога плагинов на роутере
+# (/usr/lib/steer/plugins/<id>/bin) та же, что здесь. Прежней раскладки 2.0 (модули steer-<m> на
+# libsteer со стеком) больше нет: виды и подкоманды протоколов ядро берёт только у плагинов.
 set -eu
 
 OUT="${1:?нужен выходной каталог}"
@@ -120,8 +134,13 @@ compile() {
 CRYPTO="$(profile_var CRYPTO_SRC)"
 QUIC_ALL="$(profile_var QUIC_SRC)"
 QUIC_SSL="$(profile_var QUIC_SSL_SRC)"
+LAYOUT="${STEER_LAYOUT:-2.1}"
+case "$LAYOUT" in
+    2.1) LIB_PROFILE=PROFILE_libsteer; LIB_MAP=build/libsteer.map ;;
+    *) echo "build-libs: STEER_LAYOUT — только 2.1 (раскладка 2.0 с модулями протоколов снята), а не «$LAYOUT»" >&2; exit 2 ;;
+esac
 LIB_SRC=""
-for f in $(profile_var PROFILE_libsteer); do
+for f in $(profile_var "$LIB_PROFILE"); do
     case " $CRYPTO $QUIC_ALL " in *" $f "*) ;; *) LIB_SRC="$LIB_SRC $f" ;; esac
 done
 # shellcheck disable=SC2086
@@ -165,12 +184,12 @@ $CC -shared -o "$WSO" "$OBJ/abi.o" -Wl,--whole-archive "$WLIB" -Wl,--no-whole-ar
 SO="$OUT/libsteer.so.$VERSION"
 # shellcheck disable=SC2086
 $CC -shared -o "$SO" "$OBJ"/lib/*.o "$NGLIB" "$WSO" \
-    -Wl,-soname,"libsteer.so.$VERSION" -Wl,--version-script=build/libsteer.map \
+    -Wl,-soname,"libsteer.so.$VERSION" -Wl,--version-script="$LIB_MAP" \
     -Wl,-Bsymbolic -Wl,--gc-sections $ZDEFS -Wl,-z,relro -s $LIBS
 
 # ---- steerd и модули ------------------------------------------------------------------------------
-# steerd: -Os, как базовый движок всегда (пакет ядра весит меньше, а горячих циклов в нём нет).
-# Модули: -O2 — в xsteer через xsclient.c идёт поток пакетов звезды.
+# steerd и модули: -O2 (I-540) — размер пакета больше не главная цель, а в steerd работают разбор
+# спеки, сторож и резолвер; в xsteer через xsclient.c идёт поток пакетов звезды.
 link_app() {  # ИМЯ КЛАСС-ФЛАГИ СПИСОК-ПРОФИЛЯ
     _n="$1"; _f="$2"; _p="$3"
     _od="$OBJ/$_n"
@@ -192,35 +211,133 @@ link_app() {  # ИМЯ КЛАСС-ФЛАГИ СПИСОК-ПРОФИЛЯ
 
 # shellcheck disable=SC2086
 MODCMD="$(profile_var MODCMD_SRC)"
-$CC -Os $APPF -c "$MODCMD" -o "$OBJ/modcmd.o"
+$CC -O2 $APPF -c "$MODCMD" -o "$OBJ/modcmd.o"
 # STEER_EXT_ONLY=1 (build/ext-build.sh) — только библиотеки и внешние модули: steerd и модули steer
 # внешнему модулю не нужны, их пакеты собирает build.sh steer.
 if [ -z "${STEER_EXT_ONLY:-}" ]; then
-link_app steerd "-Os $APPF" PROFILE_steerd
-link_app steer-vless "-O2 $APPF" PROFILE_mod_vless
-link_app steer-xsteer "-O2 $APPF" PROFILE_mod_xsteer
-link_app steer-obfs "-O2 $APPF" PROFILE_mod_obfs
-link_app steer-tgws "-O2 $APPF" PROFILE_mod_tgws
-link_app steer-hysteria2 "-O2 $APPF" PROFILE_mod_hysteria2
-link_app steer-proxy "-O2 $APPF" PROFILE_mod_proxy
+link_app steerd "-O2 $APPF" PROFILE_steerd
 fi
 
-# Внешние модули (STEER_EXT_APPS="имя:каталог …"): бинарники из исходников ВНЕ этого дерева —
-# steer-box-connector (sing-box). Собираются теми же флагами и с той же libsteer, что модули
-# steer, а нужные им символы библиотека экспортирует по build/exports-ext.lst. Зовёт их сборка
-# build/ext-build.sh.
+# ---- net1 и плагины протоколов (раскладка 2.1) ----------------------------------------------------
+if [ -z "${STEER_EXT_ONLY:-}" ]; then
+    N1MAP=build/net1/libs2p-net.map
+    # Заголовок переименования: по строке `#define имя s2p_имя` на каждое имя карты, кроме родных
+    # s2p_net_* (src/net1/s2pnet.h). Подключается ключом -include и к net1, и к плагинам на ней: те и
+    # другие видят одни и те же имена, а исходники не меняются.
+    N1H="$OBJ/s2p-names.h"
+    {
+        echo "/* Порождён build/build-libs.sh из $N1MAP — не править. */"
+        sed -n 's/^ *s2p_\([A-Za-z0-9_]*\);$/\1/p' "$N1MAP" | grep -v '^net_' |
+            awk '{print "#define " $1 " s2p_" $1}'
+    } > "$N1H"
+    N1DIR="$OUT/plugins/net1/lib"
+    mkdir -p "$N1DIR" "$OBJ/net1"
+    # Флаги — как у libsteer (тот же стек, тот же горячий путь), без STEER_LIBSTEER: реестра видов в
+    # net1 нет. Видимость задаёт карта (local: *), поэтому и wolfSSL, и ngtcp2 из архивов остаются
+    # внутри библиотеки.
+    # -Wno-address: src/lib/sockmark.h спрашивает слабую `plat` (стенды без платформы), а под
+    # переименованием это уже сильная s2p_plat — проверка верна, но gcc предупреждает о ней.
+    # TLS — модель по умолчанию (global-dynamic), а НЕ initial-exec, как у libsteer: net1 грузят не
+    # только программы протоколов при запуске (DT_NEEDED), но и steerd dlopen'ом — вместе с .so-плагином
+    # ядра, которому net1 нужен (steer-abi). У библиотеки, загруженной dlopen, места в статическом блоке
+    # TLS процесса нет (__thread net1 — десятки КиБ: буферы рукопожатия TLS), и initial-exec там — отказ
+    # загрузчика «cannot allocate memory in static TLS block» (glibc) или порча (musl). Цена невелика:
+    # __thread в net1 — static, и для них компилятор берёт local-dynamic (одна база модуля на функцию,
+    # дальше смещения), а таблицы потока стека и без того — указатели в куче (src/tunnel/stack.c).
+    # Проверка — tests/libs-test.sh, «net1 в процессе steerd».
+    N1F="-Wno-address -O2 -fPIC -fno-semantic-interposition -ffunction-sections -fdata-sections \
+         -Wall -Wextra -include $OBJ/steer_version.h -include $N1H $STEER_INC $THIRD_DEFS"
+    N1_PLAIN=""
+    for f in $(profile_var PROFILE_net1); do
+        case " $CRYPTO $QUIC_ALL " in *" $f "*) ;; *) N1_PLAIN="$N1_PLAIN $f" ;; esac
+    done
+    # shellcheck disable=SC2086
+    compile "$N1F" "$OBJ/net1" $N1_PLAIN
+    # shellcheck disable=SC2086
+    $CC $N1F $WCFLAGS -c "$CRYPTO" -o "$OBJ/net1/$(echo "$CRYPTO" | tr / _).o"
+    for f in $(profile_var NET1_QUIC_SRC); do
+        case " $QUIC_SSL " in *" $f "*) _wc="$WCFLAGS" ;; *) _wc="" ;; esac
+        # shellcheck disable=SC2086
+        $CC $N1F $NGCFLAGS $_wc -c "$f" -o "$OBJ/net1/$(echo "$f" | tr / _).o"
+    done
+    N1SO="$N1DIR/libs2p-net.so.1"
+    # wolfSSL — архивом целиком (--whole-archive не нужен: тянется только то, что зовут scrypto.c,
+    # qcssl.c и ngtcp2), ngtcp2 — тоже архивом. -z defs: у net1 нет ни одной ссылки наружу, кроме libc.
+    # shellcheck disable=SC2086
+    $CC -shared -o "$N1SO" "$OBJ"/net1/*.o "$NGLIB" "$WLIB" \
+        -Wl,-soname,libs2p-net.so.1 -Wl,--version-script="$N1MAP" \
+        -Wl,-Bsymbolic -Wl,--gc-sections $ZDEFS -Wl,-z,relro -s $LIBS
+
+    # plug ИМЯ — плагин протокола: код протокола и разбор спеки статически, стек — из net1.
+    # RUNPATH ставит компоновщик ($ORIGIN/../../net1/lib, plugin-sdk/docs/manifest.md, «libs»).
+    _ldi=""
+    [ -z "$INTERP" ] || _ldi="-Wl,--dynamic-linker=$INTERP"
+    # Вид: 1 — на net1; 0 — статически без TLS; tls — статически со своим TLS и wolfSSL (архив с -fPIC тот
+    # же, что у библиотек: лишнего в программу не попадает, --gc-sections).
+    plug() {
+        _n="$1"; _net="$2"
+        _od="$OBJ/plug-$_n"; _pd="$OUT/plugins/$_n/bin"
+        mkdir -p "$_od" "$_pd"
+        if [ "$_net" = 1 ]; then _pf="-O2 $APPF -Wno-address -include $N1H"; else _pf="-O2 $APPF"; fi
+        _ps=""
+        for f in $(profile_var "PROFILE_plug_$_n"); do
+            [ "$_net" = tls ] && [ "$f" = "$CRYPTO" ] && continue
+            _ps="$_ps $f"
+        done
+        # shellcheck disable=SC2086
+        compile "$_pf" "$_od" $_ps
+        if [ "$_net" = tls ]; then
+            # shellcheck disable=SC2086
+            $CC $_pf $WCFLAGS -c "$CRYPTO" -o "$_od/$(echo "$CRYPTO" | tr / _).o"
+            # shellcheck disable=SC2086
+            $CC -o "$_pd/$_n" "$_od"/*.o "$WLIB" $_ldi -Wl,--gc-sections -s $LIBS
+        elif [ "$_net" = 1 ]; then
+            # shellcheck disable=SC2086
+            $CC -o "$_pd/$_n" "$_od"/*.o "$N1SO" '-Wl,-rpath,$ORIGIN/../../net1/lib' $_ldi \
+                -Wl,--gc-sections -Wl,--as-needed -s $LIBS
+        else
+            # shellcheck disable=SC2086
+            $CC -o "$_pd/$_n" "$_od"/*.o $_ldi -Wl,--gc-sections -s $LIBS
+        fi
+    }
+    for _p in $(profile_var PLUGINS_NET1); do plug "$_p" 1; done
+    for _p in $(profile_var PLUGINS_STATIC); do plug "$_p" 0; done
+    for _p in $(profile_var PLUGINS_TLS); do plug "$_p" tls; done
+fi
+
+# Внешние модули (STEER_EXT_APPS="имя:каталог …"): бинарники из исходников ВНЕ этого дерева.
+# Собираются теми же флагами и с той же libsteer, что модули steer, и берут у неё только то, что
+# она экспортирует модулям дерева. Зовёт их сборка build/ext-build.sh.
 _eldi=""
 [ -z "$INTERP" ] || _eldi="-Wl,--dynamic-linker=$INTERP"
+# STEER_EXT_STATIC=1 (ext-build.sh --static) — программа плагина без libsteer: свои исходники, EXT_TLS_SRC
+# дерева steer и wolfSSL статически (как tgws, PLUGINS_TLS), от системы — только libc. Так собирается плагин
+# box-connector: связь с libsteer.so.<версия> привязала бы его к одной версии ядра.
+if [ -n "${STEER_EXT_STATIC:-}" ] && [ -n "${STEER_EXT_APPS:-}" ]; then
+    _xod="$OBJ/ext-tls"
+    mkdir -p "$_xod"
+    _xs=""
+    for f in $(profile_var EXT_TLS_SRC); do [ "$f" = "$CRYPTO" ] || _xs="$_xs $f"; done
+    # shellcheck disable=SC2086
+    compile "-O2 $APPF" "$_xod" $_xs
+    # shellcheck disable=SC2086
+    $CC -O2 $APPF $WCFLAGS -c "$CRYPTO" -o "$_xod/$(echo "$CRYPTO" | tr / _).o"
+fi
 for _ea in ${STEER_EXT_APPS:-}; do
     _en="${_ea%%:*}"; _ed="${_ea#*:}"
     _eod="$OBJ/ext-$_en"
     mkdir -p "$_eod"
     # shellcheck disable=SC2046,SC2086
     compile "-O2 $APPF -I$_ed" "$_eod" $(ls "$_ed"/*.c)
+    if [ -n "${STEER_EXT_STATIC:-}" ]; then
+        # shellcheck disable=SC2086
+        $CC -o "$OUT/$_en" "$_eod"/*.o "$_xod"/*.o "$WLIB" $_eldi -Wl,--gc-sections -s $LIBS
+        continue
+    fi
     # shellcheck disable=SC2086
     $CC -o "$OUT/$_en" "$_eod"/*.o "$OBJ/modcmd.o" "$SO" $_eldi $RPL \
         -Wl,--gc-sections -Wl,--as-needed -s $LIBS
 done
 
-# Клиент сокета `steer` — по-прежнему статический, один на все раскладки (build.sh собирает его сам).
-echo "libs: готово в $OUT (libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"
+# Клиент сокета `steer` — по-прежнему статический (build.sh собирает его сам).
+echo "libs: готово в $OUT (раскладка 2.1: libsteer.so.$VERSION, libsteer-wolfssl.so.$WVER, steerd, net1, плагины $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC) $(profile_var PLUGINS_TLS)${STEER_EXT_APPS:+, внешние: $STEER_EXT_APPS})"

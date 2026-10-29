@@ -18,6 +18,10 @@
 #   tests/hubmatch.c   — арифметика записи в хабе: правило набора кадров в пачку против
 #                        объявленной строки воркера (I-070).
 #   tests/devupmatch.c — подъём устройства туннеля: каждый отказ `ip` обязан быть назван (I-114).
+#   tests/sigmatch.c   — подпись Ed25519 в формате usign (векторы tests/sigvec, выпущены usign);
+#   tests/tarmatch.c   — распаковка ustar+gzip с настоящим SHA-256 слоя (в make test — со своим);
+#   tests/pluginmgrmatch.sh — менеджер плагинов: установка, подпись, место, откат, семя (архивы из s2p);
+#   tests/httpsmatch.sh — HTTPS клиента libsteer: настоящий TLS 1.3 против python-сервера со своим корнем.
 #   tests/probe.sh     — активное зондирование хаба настоящим openssl s_client (нужен root).
 #
 # В обычный `make test` они НЕ входят: там библиотеки нет по построению (R-014, см. ext-syntax в
@@ -95,6 +99,25 @@ CERTGEN="$BUILD/wolfssl-host/certgen-$CCTAG.o"
 echo "ext-test: собираю и прогоняю scryptomatch..."
 $CC -O2 -g -w $STEER_INC -Itests -o "$BUILD/scryptomatch" tests/scryptomatch.c $CRYPTO -lpthread
 "$BUILD/scryptomatch"
+
+# Ed25519 (подпись пакетов плагинов, формат usign), распаковка ustar+gzip с настоящим SHA-256 слоя и
+# HTTPS клиента libsteer с настоящим TLS против python-сервера со своим корнем.
+echo "ext-test: собираю и прогоняю sigmatch..."
+$CC -O2 -g -w $STEER_INC -Itests -o "$BUILD/sigmatch" tests/sigmatch.c src/lib/sigverify.c $CRYPTO -lpthread
+"$BUILD/sigmatch" | tail -1
+echo "ext-test: собираю и прогоняю tarmatch (SHA-256 слоя scrypto)..."
+$CC -O2 -g -w $STEER_INC -Itests -o "$BUILD/tarmatch-real" tests/tarmatch.c src/lib/untar.c src/lib/gz.c src/lib/puff.c \
+	src/tools/hwid.c src/lib/jsonw.c $(profile_var PLATFORM_SRC) $CRYPTO -lpthread
+"$BUILD/tarmatch-real" | tail -1
+# Менеджер плагинов (src/pluginmgr) на архивах, индексах и ключах из s2p (plugin-sdk), настоящей подписи и
+# сети на localhost: стенд собирает steerd с менеджером сам из того же wolfSSL; нет s2p — громкий пропуск внутри.
+echo "ext-test: прогоняю pluginmgrmatch..."
+BUILD="$BUILD" CC="$CC" sh tests/pluginmgrmatch.sh
+echo "ext-test: собираю и прогоняю httpsmatch..."
+$CC -O2 -g -w $STEER_INC -o "$BUILD/httpsget" tests/httpsget.c src/proto/tls/httpc.c src/proto/tls/reality.c \
+	src/proto/tls/chello.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/proto/tls/roots.c \
+	$(profile_var PLATFORM_SRC) src/lib/err.c $CRYPTO -lpthread
+sh tests/httpsmatch.sh "$BUILD/httpsget"
 
 # cpmatch — ветка ChaCha20-Poly1305 для 32-битного MIPS (scrypto.c, SC_CP_OWN; poly1305_32.h) на хосте,
 # с переносимой арифметикой вместо multu/maddu, против wolfSSL; сама scryptomatch на этой же ветке — по векторам RFC 8439.
@@ -174,13 +197,14 @@ echo "ext-test: собираю и прогоняю spokematch (ASan: ${ASAN:-н�
 # то есть весь ext-test не доходит даже до первой проверки — а именно в нём и живёт ASan.
 # ctlcall.c — по той же причине: `steer xsteer-peers` под демоном отдаёт запрос в сокет
 # (cmd_xsteer_peers → ctlcall_forward), и с тех пор, как xsclient.c зовёт его, стенд без этого
-# файла не компоновался — ext-test падал здесь, не дойдя ни до одной проверки.
+# файла не компоновался — ext-test падал здесь, не дойдя ни до одной проверки. plugkit.c и pkjson.c —
+# {conf} выхода и отказ программы плагина (xsclient.c — программа плагина xsteer, src/plugkit).
 $CC -O1 -g -w $STEER_INC $ASAN -o "$BUILD/spokematch" \
 	tests/spokematch.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
-	src/lib/jsonw.c src/lib/evline.c src/lib/ctlcall.c \
+	src/lib/jsonw.c src/lib/evline.c src/lib/ctlcall.c src/plugkit/plugkit.c src/plugkit/pkjson.c \
 	$MODEL_SRC $KINDS_SRC $CRYPTO -lpthread
 "$BUILD/spokematch"
 
@@ -273,7 +297,8 @@ $CC -O2 -w $STEER_INC -o "$BUILD/hubmatch" tests/hubmatch.c \
 echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/tun.c \
-	src/proto/vless/vldial.c src/tunnel/pool.c src/proto/vless/client.c \
+	src/proto/vless/vldial.c src/tunnel/pool.c src/tunnel/geo.c src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/tls/httpc.c \
+	src/proto/vless/client.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/vless/sub.c src/proto/vless/sublink.c \
 	src/proto/transport/transport.c src/proto/transport/trdial.c src/proto/transport/trsec.c src/proto/tls/ech.c \
 	src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/roots.c \
@@ -374,6 +399,13 @@ if [ -n "$NSRC" ]; then
 	# shellcheck disable=SC2086
 	$CC $QCF -o "$BUILD/qcloop" tests/qcloop.c $QCSRC "$NGLIB" "$WLIB" -lpthread -lm
 	"$BUILD/qcloop"
+
+	# qcbatch — чистые части пакетного ввода-вывода UDP (какие датаграммы идут одним вызовом GSO,
+	# какие ошибки его отключают, нарезка склеенного приёма GRO).
+	echo "ext-test: собираю и прогоняю qcbatch..."
+	# shellcheck disable=SC2086
+	$CC $QCF -o "$BUILD/qcbatch" tests/qcbatch.c $QCSRC "$NGLIB" "$WLIB" -lpthread -lm
+	"$BUILD/qcbatch"
 
 	# qcserver и qcbench — пара замера; сам замер (сетевые пространства имён и netem, нужен root) —
 	# tests/qcbench.sh, здесь его короткая проверка «Brutal держит заданное, CUBIC проседает».

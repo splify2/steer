@@ -21,7 +21,6 @@
 #include "spec.h"
 #include "awg.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "ctl.h"
@@ -76,9 +75,12 @@ static int fake_domain(uint32_t fake4, char *dst, size_t n) {
         return -1;
     FILE *f = fopen(path, "r");
     if (!f) return -1;
-    char line[1024];
+    /* Строка любой длины (getline): fgets на 1024 байта разрезал бы длинную строку надвое, и вторая
+     * половина разбиралась бы как отдельная запись. */
+    char *line = NULL;
+    size_t cap = 0;
     int found = -1;
-    while (found && fgets(line, sizeof(line), f)) {
+    while (found && getline(&line, &cap, f) >= 0) {
         char *t1 = strchr(line, '\t');
         if (!t1) continue;
         *t1 = '\0';
@@ -92,6 +94,7 @@ static int fake_domain(uint32_t fake4, char *dst, size_t n) {
         dst[l] = '\0';
         found = 0;
     }
+    free(line);
     fclose(f);
     return found;
 }
@@ -116,6 +119,8 @@ const char *explain_set_phrase(const char *addr, int has_files, int has_domains)
  * ровно один сервер, а тянуть resolver-библиотеку в статический бинарь для роутера — это
  * килобайты за то, что укладывается в один буфер.
  */
+static int dns_answer_a(const unsigned char *r, ssize_t rn, char *out, size_t out_n);
+
 static int dns_ask(const char *name, char *out, size_t out_n) {
     unsigned char q[512];
     size_t n = 0;
@@ -156,9 +161,19 @@ static int dns_ask(const char *name, char *out, size_t out_n) {
         return -1;
     }
 
-    unsigned char r[1024];
-    ssize_t rn = recv(fd, r, sizeof r, 0);
+    /* Буфер на самую длинную датаграмму UDP: ответ длиннее прежних 1024 байт приходил усечённым, и
+     * адрес из хвоста списка ответов оставался за краем («ответа нет», хотя он есть). */
+    unsigned char *r = malloc(65535);
+    if (!r) { close(fd); return -1; }
+    ssize_t rn = recv(fd, r, 65535, 0);
     close(fd);
+    int rc = dns_answer_a(r, rn, out, out_n);
+    free(r);
+    return rc;
+}
+
+/* Первый адрес типа A из ответа r (rn байт). 0 — есть; -2 — ответ есть, адреса нет; -1 — не ответ. */
+static int dns_answer_a(const unsigned char *r, ssize_t rn, char *out, size_t out_n) {
     if (rn < 12) return -1;
     unsigned ancount = ((unsigned)r[6] << 8) | r[7];
     if (!ancount) return -2;                       /* ответ есть, адреса нет — NODATA */
@@ -202,15 +217,6 @@ int looks_like_name(const char *s) {
 
 
 
-/* Лежит ли адрес (или весь префикс) в наборе — по его дампу, без `nft get element`.
- *
- * Нужна ядру 4.9: NFT_MSG_GETSETELEM там отвечает только на дамп, а на запрос одного элемента
- * — -EOPNOTSUPP (одиночный get появился в 4.15). Без этой ветки explain на телефоне отвечал бы
- * «ни один канал не забирает» про каждый адрес, в том числе про те, что прямо в списке.
- *
- * Разбирается не формат nft целиком, а слова из цифр, точек, дробей и дефисов после
- * «elements = {»: адрес, префикс, диапазон. Прочее (timeout 1h, expires 59m) адресом не
- * читается и пропускается само. */
 /* Покрывает ли элемент набора tok (адрес, префикс или диапазон) весь спрошенный адрес addr —
  * у обоих семейств (1.9: адрес IPv6 ищется в парном наборе «<группа>6»). Семейство — по addr:
  * элемент другого семейства просто не разбирается. */
@@ -222,49 +228,6 @@ static int span_covers(const char *tok, const char *addr) {
     }
     uint32_t qlo, qhi, lo, hi;
     return ipv4_span(addr, &qlo, &qhi) && ipv4_span(tok, &lo, &hi) && lo <= qlo && qhi <= hi;
-}
-
-/* Знак слова элемента в дампе: у IPv6 — ещё шестнадцатеричные буквы и двоеточие. */
-static int elem_char(int c, int v6) {
-    if ((c >= '0' && c <= '9') || c == '.' || c == '/' || c == '-') return 1;
-    return v6 && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == ':');
-}
-
-static int set_scan(const char *set, const char *addr) {
-    for (const char *q = set; *q; q++)
-        if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
-              (*q >= '0' && *q <= '9') || *q == '_' || *q == '-'))
-            return 0;
-    int v6 = strchr(addr, ':') != NULL;
-    if (!span_covers(addr, addr)) return 0;
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "nft list set inet %s %.64s 2>/dev/null", nft_table(), set);
-    FILE *p = popen(cmd, "r");
-    if (!p) return 0;
-    int in = 0, hit = 0, c;
-    char tok[96];
-    size_t tn = 0;
-    const char *key = "elements = {";
-    size_t kpos = 0;
-    while (!hit && (c = fgetc(p)) != EOF) {
-        if (!in) {
-            kpos = (c == key[kpos]) ? kpos + 1 : (c == key[0] ? 1 : 0);
-            if (!key[kpos]) in = 1;
-            continue;
-        }
-        if (elem_char(c, v6)) {
-            if (tn + 1 < sizeof(tok)) tok[tn++] = (char)c;
-            continue;
-        }
-        if (tn) {
-            tok[tn] = '\0';
-            tn = 0;
-            if (span_covers(tok, addr)) hit = 1;
-        }
-        if (c == '}') in = 0;
-    }
-    pclose(p);
-    return hit;
 }
 
 /* Составной набор (адрес . протокол . порты, канал со смешанным сужением): запрос одного
@@ -318,12 +281,10 @@ static int set_scan_mixed(const char *set, const char *addr, char *desc, size_t 
     return hit;
 }
 
-/* Есть ли адрес в наборе: одиночным `nft get element`, а на старом ядре, где его нет, —
- * разбором дампа (set_scan). На современном ядре путь прежний, один запуск nft. */
-static int set_lookup(const char *set, const char *elem, const char *addr) {
+/* Есть ли адрес в наборе: одиночным `nft get element`. */
+static int set_lookup(const char *set, const char *elem) {
     const char *q[] = { "nft", "get", "element", "inet", nft_table(), set, elem, NULL };
-    if (run(q) == 0) return 1;
-    return NFT_LEGACY && set_scan(set, addr);
+    return run(q) == 0;
 }
 
 /* КАКИМ СЕРВЕРОМ DNS ОТВЕТИЛ РЕЗОЛВЕР НА ИМЯ — поле `dns` его записи в журнале имён (dns-log, dlog.c):
@@ -404,7 +365,6 @@ int cmd_explain(const char *spec, const char *what) {
 /* Сам ответ — в поток out, по спеке и группам вызывающего: подкоманда читает спеку сама,
  * демон отдаёт свою из памяти. Код — тот, с которым кончается подкоманда. */
 int explain_emit(const struct spec *cfg, const struct groups *gr, const char *what, FILE *out) {
-    g_nftc = nft_compat_seen();
 
     /* Имя сначала превращаем в адрес — и печатаем, во что именно. Без этой строки человек
      * видел бы вердикт по адресу, которого не спрашивал, и не мог бы понять, тот ли это
@@ -463,20 +423,13 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
             if (gr->g[i].composite)
                 hit = set_scan_mixed(setname, addr, mdesc, sizeof(mdesc), &mnarrow);
             else
-                hit = set_lookup(setname, elem, addr);
+                hit = set_lookup(setname, elem);
             /* Исключения-подсети доп. группы (набор «x.com, но не эти адреса»): адрес в них —
              * значит этот канал его не берёт, смотрим следующий. Они только IPv4. */
             if (hit && gr->g[i].xcidr && !v6) {
                 char xn[80];
                 snprintf(xn, sizeof(xn), "%.63s_x", gr->g[i].name);
-                if (set_lookup(xn, elem, addr)) hit = 0;
-            }
-            /* Старая раскладка: у доменной группы вторая половина набора, с префиксами. */
-            if (!hit && legacy_may_have_static(&gr->g[i])) {
-                char base[72];
-                snprintf(base, sizeof(base), "%s", setname);
-                nft_static_set_name(setname, sizeof(setname), base);
-                hit = set_lookup(setname, elem, addr);
+                if (set_lookup(xn, elem)) hit = 0;
             }
         }
         if (!hit) continue;
@@ -484,7 +437,7 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
         /* Не бывает: build_groups сверил каждый канал с выходами. Но исполняет это и демон, и
          * die() здесь завершил бы его целиком — поэтому отказ возвращается. */
         if (!o) {
-            fprintf(stderr, "steer: group %s points at a missing output\n", gr->g[i].name);
+            fprintf(stderr, "steer: группа %s ведёт в несуществующий выход\n", gr->g[i].name);
             return 2;
         }
         fprintf(out, "%s -> %s \"%s\" -> output \"%s\"", addr,
@@ -516,7 +469,7 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
         if (gr->g[i].xsrc_n)
             fprintf(out, "      правило набора ограничено клиентами (source_ip_cidr): "
                    "подсетей %zu — остальные клиенты идут мимо\n", gr->g[i].xsrc_n);
-        if (!l4match_empty(gr->g[i].l4)) {
+        if (!l4match_plain(gr->g[i].l4)) {
             /* С запасом на предел L4_PORTS_MAX:шестнадцать диапазонов вида «50000-65535» с
              * разделителями — это 217 байт, и обрезанное пояснение было бы хуже полного. */
             char d[256];

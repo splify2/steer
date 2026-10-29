@@ -39,6 +39,7 @@
 #include "nftvmap.h"
 #include "nftdump.h"
 #include "failover_int.h"
+#include "plugin.h"
 
 #define LOG_W "steer[warn] failover: "
 
@@ -233,6 +234,45 @@ int fog_pick_known(const struct spec *sp, struct fo_store *st, const struct outp
     return first;
 }
 
+/* ---- страна члена (only и exclude группы) ------------------------------------------------------- */
+
+/* Значение строкового поля "key":"XX" файла состояния туннеля — две заглавные латинские буквы. */
+static int state_cc(const char *st, const char *key, char cc[3]) {
+    char pat[32];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(st, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    if (p[0] < 'A' || p[0] > 'Z' || p[1] < 'A' || p[1] > 'Z' || p[2] != '"') return 0;
+    cc[0] = p[0];
+    cc[1] = p[1];
+    cc[2] = '\0';
+    return 1;
+}
+
+int fog_member_cc(const struct output *m, char cc[3]) {
+    /* Файл состояния выхода плагина (steer-api.md, 2.2: поля geo_cc и node_cc). Фактическая страна
+     * (geo_cc, проверка выхода) — важнее заявленной именем узла. */
+    char *st = plugin_out_state(m);
+    if (!st) return 0;
+    int ok = state_cc(st, "geo_cc", cc) || state_cc(st, "node_cc", cc);
+    free(st);
+    return ok;
+}
+
+int fog_cc_allowed(const struct output *go, const struct output *m) {
+    const struct group_cfg *g = out_group(go);
+    if (!g || (!g->ccsel.only_n && !g->ccsel.cc_n)) return 1;
+    char cc[3];
+    if (!fog_member_cc(m, cc)) return !g->ccsel.only_n;     /* страны нет: only не берёт, exclude — берёт */
+    for (size_t i = 0; i < g->ccsel.cc_n; i++)
+        if (!strcmp(g->ccsel.cc[i], cc)) return 0;
+    if (!g->ccsel.only_n) return 1;
+    for (size_t i = 0; i < g->ccsel.only_n; i++)
+        if (!strcmp(g->ccsel.only[i], cc)) return 1;
+    return 0;
+}
+
 /* ---- состояние «замера нет» (журнал) -------------------------------------------------------- */
 
 struct lat_note {
@@ -334,10 +374,10 @@ int fog_idle_now(const char *group) {
 
 /* ---- balance: карта в ядре --------------------------------------------------------------- */
 
-int fog_balance_sync(const struct spec *sp, const struct output *go, const unsigned char *alive) {
+int fog_balance_sync(const struct spec *sp, const struct output *go, const unsigned char *alive, int cur) {
     static int told;
     const struct group_cfg *g = out_group(go);
-    if (!g || g->pick != PICK_BALANCE) return 0;
+    if (!g || !group_carded(go)) return 0;
     char map[32];
     group_bal_map(go, map, sizeof(map));
     static char have[GROUP_BAL_SLOTS][NFV_CHAIN_MAX], want[GROUP_BAL_SLOTS][NFV_CHAIN_MAX];
@@ -355,7 +395,12 @@ int fog_balance_sync(const struct spec *sp, const struct output *go, const unsig
         return -1;
     }
     unsigned char owner[GROUP_BAL_SLOTS];
-    group_balance_slots(g, alive, owner);
+    if (g->pick == PICK_BALANCE) group_balance_slots(g, alive, owner);
+    else {
+        /* Закрепляющая order/latency: один слот (compile/balance.c) — текущий член. */
+        memset(owner, 0xff, sizeof(owner));
+        if (cur >= 0 && (size_t)cur < g->members_n) owner[0] = (unsigned char)cur;
+    }
     for (unsigned s = 0; s < GROUP_BAL_SLOTS; s++)
         if (owner[s] != 0xff) group_bal_target(spec_out(sp, g->members[owner[s]]), want[s], NFV_CHAIN_MAX);
     if (!memcmp(have, want, sizeof(have))) return 0;
@@ -377,8 +422,8 @@ int fog_balance_sync(const struct spec *sp, const struct output *go, const unsig
 void fog_balance_adopt(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct group_cfg *g = out_group(&sp->out[i]);
-        if (g && g->pick == PICK_BALANCE && group_named(g))
-            fog_balance_sync(sp, &sp->out[i], g->alive);
+        if (g && group_carded(&sp->out[i]) && group_named(g))
+            fog_balance_sync(sp, &sp->out[i], g->alive, g->cur);
     }
 }
 
@@ -649,13 +694,20 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
     }
     /* Запись groups — выбранный член сразу, чтобы status не ждал прохода. */
     char *text = rec_read(st, "groups");
-    char val[700], cur[64] = "-", al[640] = "-";
-    if (text && rec_get(text, go->name, val, sizeof(val))) sscanf(val, "%63s %639s", cur, al);
+    /* Живые члены — в куче по длине записи: у группы balance на сотню членов строка длиннее
+     * любого буфера, а обрезка по слову теряла бы хвост живых молча. */
+    char *val = rec_dup(text, go->name);
     free(text);
-    snprintf(gline, sizeof(gline), "%s %s ", go->name, alive ? mname : "-");
-    char full[800];
-    snprintf(full, sizeof(full), "%s%s", gline, al);
-    rec_set(st, "groups", go->name, full);
+    char *cur = NULL, *al = NULL;
+    if (!val || !groups_split(val, &cur, &al)) al = "-";
+    size_t fl = strlen(go->name) + strlen(alive ? mname : "-") + strlen(al) + 3;
+    char *full = malloc(fl);
+    if (full) {
+        snprintf(full, fl, "%s %s %s", go->name, alive ? mname : "-", al);
+        rec_set(st, "groups", go->name, full);
+        free(full);
+    }
+    free(val);
     return 0;
 }
 
@@ -664,5 +716,6 @@ int cmd_select(const char *spec, const char *group, const char *member) {
     struct err e = {0};
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    tcp_redir_learn(&cfg);
     return fog_select(&cfg, &fo_store_files, group, member, 1, NULL, NULL, stdout);
 }

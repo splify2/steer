@@ -230,7 +230,7 @@ static void chain_rules_cb(const struct nlmsghdr *h, void *arg) {
     if (!msg_is(h, NFT_MSG_NEWRULE)) return;
     const struct nlattr *tb[NFTA_RULE_MAX + 1];
     msg_attrs(h, tb, NFTA_RULE_MAX);
-    char t[64], ch[64];
+    char t[NFD_NAME], ch[NFD_NAME];
     if (strcmp(nla_cstr(tb[NFTA_RULE_TABLE], t, sizeof(t)), c->table) != 0) return;
     nla_cstr(tb[NFTA_RULE_CHAIN], ch, sizeof(ch));
     size_t k = 0;
@@ -355,22 +355,19 @@ int nfd_chain_exists(uint8_t family, const char *table, const char *chain) {
  * прямо по байтам ответа, без разбора выражений по видам. Правила и цепочки — в порядке дампа (он
  * порядок таблицы).
  *
- * ВСЕ СЕМЕЙСТВА — ЧЕТЫРЬМЯ ОБМЕНАМИ. С 2026-09-28 отпечаток снимается не только на apply, но и на
+ * ЧЕТЫРЬМЯ ОБМЕНАМИ. С 2026-09-28 отпечаток снимается не только на apply, но и на
  * каждом проходе сторожа демона (recon.c, «СВЕРКА НА ПРОХОДЕ СТОРОЖА»), и число обменов с ядром
- * стало ценой прохода. Прежде каждое из трёх семейств (inet, ip, ip6 — у раскладки старого
- * ядра) стоило своего запроса таблицы и трёх дампов, а номер таблицы — ещё одного запроса: до
- * тринадцати обменов. Теперь дамп на вид объекта один на все семейства (nfgen_family =
- * NFPROTO_UNSPEC), а раскладка по семействам — по семейству ответа:
- *   таблицы  — дамп всех таблиц (их на машине единицы): есть ли наши в каждом семействе и номер
- *              таблицы inet;
+ * стало ценой прохода. Дамп на вид объекта один (nfgen_family = NFPROTO_UNSPEC), в отпечаток
+ * идут только объекты таблицы inet (по семейству ответа):
+ *   таблицы  — дамп всех таблиц (их на машине единицы): есть ли наша inet и её номер;
  *   цепочки  — дамп всех цепочек: фильтра по таблице у дампа цепочек в ядре нет, отбор по имени
  *              таблицы — здесь (у fw4 роутера цепочек десятки — это заголовки, килобайты);
  *   наборы   — дамп всех наборов без атрибута таблицы: с NFPROTO_UNSPEC ядро ищет таблицу по
  *              имени И семейству (nft_ctx_init_from_setattr) и отвечает ENOENT, поэтому фильтр
  *              — здесь; ответ — только заголовки;
- *   правила  — дамп с атрибутом таблицы: этот фильтр новое ядро понимает и при NFPROTO_UNSPEC
- *              (на 4.9 его нет вовсе, и отбор всё равно повторяется здесь).
- * Нет наших таблиц ни в одном семействе — остальные три дампа не нужны. Цепочки берутся любые:
+ *   правила  — дамп с атрибутом таблицы (ядро понимает этот фильтр и при NFPROTO_UNSPEC); отбор
+ *              по имени таблицы и семейству всё равно здесь — фильтр не смотрит на семейство.
+ * Нет нашей таблицы — остальные три дампа не нужны. Цепочки берутся любые:
  * имена и хуки не разбираются, так что цепочка на любом хуке (в том числе inet ingress, со своим
  * списком устройств) входит в отпечаток так же, как prerouting_mark. */
 
@@ -421,35 +418,24 @@ static void fp_exprs(uint64_t *h, const struct nlattr *list) {
     }
 }
 
-/* Семейства таблиц движка: номер в отпечатке и бит в nfd_tfp.fams. -1 — не наше семейство. */
-static const uint8_t g_tfp_fams[3] = { NFD_INET, NFD_IP, NFD_IP6 };
-
-static int tfp_fam(uint8_t f) {
-    for (int i = 0; i < 3; i++)
-        if (g_tfp_fams[i] == f) return i;
-    return -1;
-}
-
 struct tfp_ctx {
     const char *table;
     uint16_t msg;                   /* NFT_MSG_NEW* объектов этого дампа */
     uint32_t skip;                  /* маска номеров атрибутов, которые не входят */
-    uint64_t h[3];                  /* по семейству (g_tfp_fams) */
-    unsigned n[3];
+    uint64_t h;
+    unsigned n;
 };
 
 static void tfp_cb(const struct nlmsghdr *m, void *arg) {
     struct tfp_ctx *c = arg;
-    if (!msg_is(m, c->msg)) return;
-    int fi = tfp_fam(msg_family(m));
-    if (fi < 0) return;
+    if (!msg_is(m, c->msg) || msg_family(m) != NFD_INET) return;
     size_t hl = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct nfgenmsg));
     if (m->nlmsg_len < hl) return;
-    /* Таблица — первый атрибут у всех трёх видов (NFTA_*_TABLE == 1): фильтр дампа по таблице
-     * старое ядро не понимает, поэтому отбор здесь. */
+    /* Таблица — первый атрибут у всех трёх видов (NFTA_*_TABLE == 1): у дампа цепочек и наборов
+     * фильтра по таблице нет, поэтому отбор здесь. */
     const struct nlattr *tb[2];
     nfd_parse((const uint8_t *)m + hl, m->nlmsg_len - hl, tb, 1);
-    char t[64];
+    char t[NFD_NAME];
     if (!tb[1] || strcmp(nla_cstr(tb[1], t, sizeof(t)), c->table) != 0) return;
     uint64_t h = NFD_FNV_INIT;
     const uint8_t *q = (const uint8_t *)m + hl;
@@ -467,13 +453,14 @@ static void tfp_cb(const struct nlmsghdr *m, void *arg) {
         q += al;
         len -= al;
     }
-    fp_mix(&c->h[fi], &h, sizeof(h));
-    c->n[fi]++;
+    fp_mix(&c->h, &h, sizeof(h));
+    c->n++;
 }
 
 static void tfp_reset(void *arg) {
     struct tfp_ctx *c = arg;
-    for (int i = 0; i < 3; i++) { c->h[i] = NFD_FNV_INIT; c->n[i] = 0; }
+    c->h = NFD_FNV_INIT;
+    c->n = 0;
 }
 
 /* Дамп отпечатка — с повтором прерванного, но без «годится любой снимок», как у nfd_dump:
@@ -501,15 +488,13 @@ struct ttab_ctx {
 
 static void ttab_cb(const struct nlmsghdr *m, void *arg) {
     struct ttab_ctx *c = arg;
-    if (!msg_is(m, NFT_MSG_NEWTABLE)) return;
-    int fi = tfp_fam(msg_family(m));
-    if (fi < 0) return;
+    if (!msg_is(m, NFT_MSG_NEWTABLE) || msg_family(m) != NFD_INET) return;
     const struct nlattr *tb[NFD_TABLE_HANDLE + 1];
     msg_attrs(m, tb, NFD_TABLE_HANDLE);
-    char t[64];
+    char t[NFD_NAME];
     if (strcmp(nla_cstr(tb[NFTA_TABLE_NAME], t, sizeof(t)), c->table) != 0) return;
-    c->fams |= 1u << fi;
-    if (fi == 0) c->handle = nla_be64(tb[NFD_TABLE_HANDLE]);
+    c->fams = 1;
+    c->handle = nla_be64(tb[NFD_TABLE_HANDLE]);
 }
 
 static void ttab_reset(void *arg) {
@@ -557,15 +542,11 @@ int nfd_table_fp(const char *table, struct nfd_tfp *out) {
         if (rc != 0 && rc != ENOENT) { close(fd); return -1; }
     }
     close(fd);
-    /* По семейству: есть ли таблица, затем три вида объектов — число и свёртка. */
-    for (int f = 0; f < 3; f++) {
-        if (!(tt.fams & (1u << f))) continue;
-        fp_mix(&h, &g_tfp_fams[f], 1);
-        for (int k = 0; k < 3; k++) {
-            fp_mix(&h, &k, sizeof(k));
-            fp_mix(&h, &c[k].n[f], sizeof(c[k].n[f]));
-            fp_mix(&h, &c[k].h[f], sizeof(c[k].h[f]));
-        }
+    /* Три вида объектов — число и свёртка. */
+    for (int k = 0; k < 3; k++) {
+        fp_mix(&h, &k, sizeof(k));
+        fp_mix(&h, &c[k].n, sizeof(c[k].n));
+        fp_mix(&h, &c[k].h, sizeof(c[k].h));
     }
     out->fp = h;
     out->handle = tt.handle;
@@ -590,7 +571,7 @@ static void sets_list_cb(const struct nlmsghdr *m, void *arg) {
     if (!msg_is(m, NFT_MSG_NEWSET)) return;
     const struct nlattr *tb[NFTA_SET_MAX + 1];
     msg_attrs(m, tb, NFTA_SET_MAX);
-    char t[64];
+    char t[NFD_NAME];
     if (strcmp(nla_cstr(tb[NFTA_SET_TABLE], t, sizeof(t)), c->table) != 0) return;
     struct nfd_set s;
     memset(&s, 0, sizeof(s));
@@ -624,9 +605,8 @@ struct elems_ctx {
 static void elems_list_cb(const struct nlmsghdr *m, void *arg) {
     struct elems_ctx *c = arg;
     if (!msg_is(m, NFT_MSG_NEWSETELEM)) return;
-    /* Номер поколения набора правил (nfgenmsg.res_id: младшие 16 бит base_seq — так отвечает и
-     * 4.9, проверено на tools/vm49): растёт с каждой транзакцией, в том числе с элементом
-     * резолвера. Разный у ответов одного дампа — посреди дампа кто-то писал. */
+    /* Номер поколения набора правил (nfgenmsg.res_id: младшие 16 бит base_seq): растёт с каждой
+     * транзакцией, в том числе с элементом резолвера. Разный у ответов одного дампа — посреди дампа кто-то писал. */
     uint16_t g = ((const struct nfgenmsg *)NLMSG_DATA(m))->res_id;
     if (!c->msgs++) c->gen = g;
     else if (g != c->gen) c->gen_moved = 1;
@@ -683,69 +663,11 @@ int nfd_set_elems(uint8_t family, const char *table, const char *set, nfd_elem_f
     return rc;
 }
 
-/* ---- redirect на порт ---------------------------------------------------------------------- */
-
 /* Регистр выражения — в номер 32-битной ячейки (NFT_REG_1..4 — по четыре ячейки). -1 — не данные. */
 static int reg_slot(uint32_t r) {
     if (r >= NFT_REG_1 && r <= NFT_REG_4) return (int)(r - NFT_REG_1) * 4;
     if (r >= NFD_REG32_00 && r < NFD_REG32_00 + 16) return (int)(r - NFD_REG32_00);
     return -1;
-}
-
-struct redir_ctx {
-    const char *table;
-    uint16_t port_be;
-    int found;
-};
-
-static void redir_cb(const struct nlmsghdr *h, void *arg) {
-    struct redir_ctx *c = arg;
-    if (c->found || !msg_is(h, NFT_MSG_NEWRULE)) return;
-    const struct nlattr *tb[NFTA_RULE_MAX + 1];
-    msg_attrs(h, tb, NFTA_RULE_MAX);
-    char t[64];
-    if (strcmp(nla_cstr(tb[NFTA_RULE_TABLE], t, sizeof(t)), c->table) != 0 ||
-        !tb[NFTA_RULE_EXPRESSIONS])
-        return;
-    /* Порт — в регистре, куда его положило immediate перед redir. */
-    int have[16] = {0};
-    uint16_t val[16] = {0};
-    const struct nlattr *e;
-    NLA_FOR_EACH(e, tb[NFTA_RULE_EXPRESSIONS]) {
-        const struct nlattr *et[NFTA_EXPR_MAX + 1];
-        nfd_nested(e, et, NFTA_EXPR_MAX);
-        char name[32];
-        nla_cstr(et[NFTA_EXPR_NAME], name, sizeof(name));
-        if (!et[NFTA_EXPR_DATA]) continue;
-        if (!strcmp(name, "immediate")) {
-            const struct nlattr *it[NFTA_IMMEDIATE_MAX + 1];
-            nfd_nested(et[NFTA_EXPR_DATA], it, NFTA_IMMEDIATE_MAX);
-            int s = reg_slot(nla_be32(it[NFTA_IMMEDIATE_DREG]));
-            if (s < 0 || !it[NFTA_IMMEDIATE_DATA]) continue;
-            const struct nlattr *dt[NFTA_DATA_MAX + 1];
-            nfd_nested(it[NFTA_IMMEDIATE_DATA], dt, NFTA_DATA_MAX);
-            if (!dt[NFTA_DATA_VALUE] || nla_size(dt[NFTA_DATA_VALUE]) < 2) continue;
-            memcpy(&val[s], nla_ptr(dt[NFTA_DATA_VALUE]), 2);
-            have[s] = 1;
-        } else if (!strcmp(name, "redir")) {
-            const struct nlattr *rt[NFTA_REDIR_MAX + 1];
-            nfd_nested(et[NFTA_EXPR_DATA], rt, NFTA_REDIR_MAX);
-            if (!rt[NFTA_REDIR_REG_PROTO_MIN]) continue;
-            int s = reg_slot(nla_be32(rt[NFTA_REDIR_REG_PROTO_MIN]));
-            if (s >= 0 && have[s] && val[s] == c->port_be) c->found = 1;
-        }
-    }
-}
-
-int nfd_has_redirect(uint8_t family, const char *table, uint16_t port) {
-    int fd = nfd_open();
-    if (fd < 0) return 0;
-    struct redir_ctx c = { table, htons(port), 0 };
-    int rc = nfd_talk(fd, NFT_MSG_GETRULE, 1, family, NFTA_RULE_TABLE, table, 0, NULL,
-                      redir_cb, &c);
-    close(fd);
-    (void)rc;
-    return c.found;
 }
 
 /* ---- набор правил текстом ------------------------------------------------------------------ *
@@ -789,16 +711,16 @@ static void sb_printf(struct sbuf *s, const char *fmt, ...) {
 }
 
 struct rs_elem {
-    uint8_t key[16];
+    uint8_t key[NFD_DATA_MAX];
     uint8_t klen;
     int verdict;          /* у карты вердиктов: 1 — есть */
     int32_t vcode;
-    char vchain[64];
+    char vchain[NFD_NAME];
 };
 
 struct rs_set {
     uint8_t fam;
-    char table[64], name[64], comment[128];
+    char table[NFD_NAME], name[NFD_NAME], comment[128];
     uint32_t flags;
     struct rs_elem *el;
     size_t el_n, el_cap;
@@ -806,13 +728,13 @@ struct rs_set {
 
 struct rs_obj {           /* таблица, цепочка или flowtable */
     uint8_t fam;
-    char table[64], name[64];
+    char table[NFD_NAME], name[NFD_NAME];
     char *head;           /* строки заголовка (тип, хук, устройства, комментарий), malloc */
 };
 
 struct rs_rule {
     uint8_t fam;
-    char table[64], chain[64];
+    char table[NFD_NAME], chain[NFD_NAME];
     char *text;
 };
 
@@ -1190,7 +1112,7 @@ static void expr_cmp(struct rctx *c, const struct nlattr *data) {
 static void expr_lookup(struct rctx *c, const struct nlattr *data) {
     const struct nlattr *t[NFTA_LOOKUP_MAX + 1];
     nfd_nested(data, t, NFTA_LOOKUP_MAX);
-    char name[64];
+    char name[NFD_NAME];
     nla_cstr(t[NFTA_LOOKUP_SET], name, sizeof(name));
     int sl = reg_slot(nla_be32(t[NFTA_LOOKUP_SREG]));
     enum rk k = sl >= 0 ? c->kind[sl] : RK_NONE;
@@ -1241,7 +1163,7 @@ static void expr_immediate(struct rctx *c, const struct nlattr *data) {
     if (!dt[NFTA_DATA_VERDICT]) return;
     const struct nlattr *vt[NFTA_VERDICT_MAX + 1];
     nfd_nested(dt[NFTA_DATA_VERDICT], vt, NFTA_VERDICT_MAX);
-    char chain[64];
+    char chain[NFD_NAME];
     put_verdict(c->s, (int32_t)nla_be32(vt[NFTA_VERDICT_CODE]),
                 nla_cstr(vt[NFTA_VERDICT_CHAIN], chain, sizeof(chain)));
 }

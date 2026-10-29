@@ -1,0 +1,107 @@
+{
+  "type": "object",
+  "properties": {
+    "subscription": {
+      "type": "string",
+      "minLength": 1,
+      "x-path": "etc",
+      "x-watch": true
+    },
+    "nodes": {
+      "type": [
+        "integer",
+        "array"
+      ],
+      "minimum": 0,
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "minItems": 1,
+      "uniqueItems": true,
+      "x-one-or-list": true
+    },
+    "insecure": {
+      "type": "boolean"
+    },
+    "exclude": {
+      "type": [
+        "string",
+        "array"
+      ],
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z]{2}$"
+      },
+      "minItems": 1,
+      "uniqueItems": true,
+      "pattern": "^[A-Z]{2}$",
+      "x-one-or-list": true
+    },
+    "exclude_name": {
+      "type": [
+        "string",
+        "array"
+      ],
+      "minLength": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1,
+      "uniqueItems": true,
+      "x-one-or-list": true
+    },
+    "only": {
+      "type": [
+        "string",
+        "array"
+      ],
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z]{2}$"
+      },
+      "minItems": 1,
+      "uniqueItems": true,
+      "pattern": "^[A-Z]{2}$",
+      "x-one-or-list": true
+    },
+    "active": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65536
+    },
+    "by": {
+      "enum": [
+        "connection",
+        "site",
+        "site_client"
+      ]
+    },
+    "interval": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 86400
+    },
+    "silence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 32767
+    },
+    "pick": {
+      "enum": [
+        "order",
+        "latency"
+      ]
+    },
+    "tolerance": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 60000
+    }
+  },
+  "required": [
+    "subscription"
+  ],
+  "additionalProperties": false
+}

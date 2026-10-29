@@ -63,13 +63,16 @@ static void test_vmess(void) {
 }
 
 static void test_wire(void) {
-    unsigned char a[8];
-    uint32_t ip; /* 1.2.3.4 в сетевом порядке */
-    unsigned char ipb[4] = { 1, 2, 3, 4 };
-    memcpy(&ip, ipb, 4);
-    size_t n = px_socks_addr(a, ip, 443);
+    unsigned char a[PX_ADDR_MAX];
+    unsigned char ipb[4] = { 1, 2, 3, 4 };     /* 1.2.3.4 в сетевом порядке */
+    size_t n = px_socks_addr(a, 0, ipb, 443);
     check("socks addr длина", 7, (long)n);
     hx("socks addr 1.2.3.4:443", "010102030401bb", a, 7);
+    /* IPv6: ATYP 4, шестнадцать байт, порт (RFC 1928) */
+    unsigned char ip6[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    n = px_socks_addr(a, 1, ip6, 443);
+    check("socks addr IPv6 длина", 19, (long)n);
+    hx("socks addr [2001:db8::1]:443", "0420010db800000000000000000000000101bb", a, 19);
     check("CRC32(00..0b)", (long)0x9270c965u, (long)px_crc32((const unsigned char[]){0,1,2,3,4,5,6,7,8,9,10,11}, 12));
     unsigned char ten[10]; for (int i = 0; i < 10; i++) ten[i] = (unsigned char)i;
     check("FNV1a(00..09)", (long)0x2f854072u, (long)px_fnv1a(ten, 10));

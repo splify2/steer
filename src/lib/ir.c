@@ -1,4 +1,4 @@
-/* Промежуточное дерево набора правил: арена, построение, поиск, переделка. Устройство и
+/* Промежуточное дерево набора правил: арена, построение, поиск. Устройство и
  * уровень детализации — в шапке ir.h. */
 #include <stdarg.h>
 #include <stdint.h>
@@ -100,33 +100,11 @@ struct nft_table *ir_table_add(struct nft_rs *rs, enum nft_family fam, const cha
     return t;
 }
 
-void ir_obj_append(struct nft_table *t, struct nft_obj *o) {
-    if (!t || !o) return;
+static void ir_obj_append(struct nft_table *t, struct nft_obj *o) {
     o->table = t;
     o->next = NULL;
     *t->objs_tail = o;
     t->objs_tail = &o->next;
-}
-
-void ir_obj_unlink(struct nft_obj *o) {
-    if (!o || !o->table) return;
-    struct nft_table *t = o->table;
-    struct nft_obj **pp = &t->objs;
-    while (*pp && *pp != o) pp = &(*pp)->next;
-    if (!*pp) return;
-    *pp = o->next;
-    if (t->objs_tail == &o->next) t->objs_tail = pp;
-    o->next = NULL;
-    o->table = NULL;
-}
-
-void ir_obj_insert_after(struct nft_obj *after, struct nft_obj *o) {
-    if (!after || !o || !after->table) return;
-    struct nft_table *t = after->table;
-    o->table = t;
-    o->next = after->next;
-    after->next = o;
-    if (t->objs_tail == &after->next) t->objs_tail = &o->next;
 }
 
 struct nft_set *ir_set_add(struct nft_table *t, const char *name, const char *key) {
@@ -223,25 +201,17 @@ struct nft_rule *ir_rule(struct nft_chain *c) {
     return r;
 }
 
-struct nft_expr *ir_expr_insert(struct nft_rule *r, struct nft_expr *before, enum nft_xk k,
-                                const char *text, const char *arg) {
-    if (!r) return NULL;
+/* Новое выражение в конец правила. */
+static struct nft_expr *ir_push(struct nft_rule *r, enum nft_xk k, const char *text,
+                                const char *arg) {
     struct nft_expr *x = ir_alloc(rule_rs(r), sizeof(*x));
     if (!x) return NULL;
     x->k = k;
     x->text = text;
     x->arg = arg;
-    struct nft_expr **pp = &r->x;
-    while (*pp && *pp != before) pp = &(*pp)->next;
-    x->next = *pp;
-    *pp = x;
-    if (!x->next) r->x_tail = &x->next;
+    *r->x_tail = x;
+    r->x_tail = &x->next;
     return x;
-}
-
-static struct nft_expr *ir_push(struct nft_rule *r, enum nft_xk k, const char *text,
-                                const char *arg) {
-    return ir_expr_insert(r, NULL, k, text, arg);
 }
 
 void ir_x(struct nft_rule *r, const char *fmt, ...) {
@@ -286,17 +256,8 @@ void ir_dnat(struct nft_rule *r, const char *key, const char *map) {
     ir_push(r, NFT_X_DNAT, ir_strdup(rule_rs(r), key), ir_strdup(rule_rs(r), map));
 }
 
-void ir_jump(struct nft_rule *r, const char *chain) {
-    if (!r) return;
-    ir_push(r, NFT_X_JUMP, NULL, ir_strdup(rule_rs(r), chain));
-}
-
 void ir_notrack(struct nft_rule *r) {
     if (r) ir_push(r, NFT_X_NOTRACK, "notrack", NULL);
-}
-
-void ir_frag6(struct nft_rule *r, const char *text) {
-    if (r) ir_push(r, NFT_X_FRAG6, ir_strdup(rule_rs(r), text), NULL);
 }
 
 void ir_comment(struct nft_rule *r, const char *fmt, ...) {
@@ -311,38 +272,6 @@ void ir_rule_fam(struct nft_rule *r, int fam) {
     if (r) r->fam = fam;
 }
 
-struct nft_rule *ir_rule_clone(struct nft_chain *dst, const struct nft_rule *r) {
-    if (!r || !r->chain) return NULL;
-    struct nft_rs *rs = rule_rs(r);
-    struct nft_rule *n = ir_alloc(rs, sizeof(*n));
-    if (!n) return NULL;
-    n->x_tail = &n->x;
-    n->fam = r->fam;
-    n->pkts = r->pkts;
-    n->bytes = r->bytes;
-    n->comment = r->comment;
-    for (const struct nft_expr *x = r->x; x; x = x->next) {
-        struct nft_expr *c = ir_alloc(rs, sizeof(*c));
-        if (!c) return NULL;
-        *c = *x;
-        c->next = NULL;
-        *n->x_tail = c;
-        n->x_tail = &c->next;
-    }
-    if (dst) {
-        n->chain = dst;
-        *dst->rules_tail = n;
-        dst->rules_tail = &n->next;
-    } else {
-        struct nft_chain *c = r->chain;
-        n->chain = c;
-        n->next = r->next;
-        ((struct nft_rule *)r)->next = n;
-        if (c->rules_tail == &((struct nft_rule *)r)->next) c->rules_tail = &n->next;
-    }
-    return n;
-}
-
 /* ---- поиск --------------------------------------------------------------------------- */
 
 struct nft_table *ir_table_find(const struct nft_rs *rs, enum nft_family fam, const char *name) {
@@ -351,45 +280,10 @@ struct nft_table *ir_table_find(const struct nft_rs *rs, enum nft_family fam, co
     return NULL;
 }
 
-static struct nft_obj *obj_find(const struct nft_table *t, enum nft_objk k, const char *name) {
+struct nft_chain *ir_chain_find(const struct nft_table *t, const char *name) {
     if (!t) return NULL;
     for (struct nft_obj *o = t->objs; o; o = o->next)
-        if (o->k == k && o->name && !strcmp(o->name, name)) return o;
-    return NULL;
-}
-
-struct nft_set *ir_set_find(const struct nft_table *t, const char *name) {
-    return ir_obj_set(obj_find(t, NFT_OBJ_SET, name));
-}
-
-struct nft_chain *ir_chain_find(const struct nft_table *t, const char *name) {
-    return ir_obj_chain(obj_find(t, NFT_OBJ_CHAIN, name));
-}
-
-static int comment_is(const struct nft_rule *r, const char *comment) {
-    if (!comment) return 1;
-    return r->comment && !strcmp(r->comment, comment);
-}
-
-struct nft_rule *ir_rule_find(const struct nft_chain *c, const char *comment) {
-    if (!c) return NULL;
-    for (struct nft_rule *r = c->rules; r; r = r->next)
-        if (comment_is(r, comment)) return r;
-    return NULL;
-}
-
-size_t ir_rule_count(const struct nft_chain *c, const char *comment) {
-    size_t n = 0;
-    if (!c) return 0;
-    for (struct nft_rule *r = c->rules; r; r = r->next)
-        if (comment_is(r, comment)) n++;
-    return n;
-}
-
-struct nft_expr *ir_expr_find(const struct nft_rule *r, enum nft_xk k) {
-    if (!r) return NULL;
-    for (struct nft_expr *x = r->x; x; x = x->next)
-        if (x->k == k) return x;
+        if (o->k == NFT_OBJ_CHAIN && o->name && !strcmp(o->name, name)) return ir_obj_chain(o);
     return NULL;
 }
 
@@ -399,20 +293,6 @@ int ir_rule_has(const struct nft_rule *r, const char *needle) {
         if ((x->text && strstr(x->text, needle)) || (x->arg && strstr(x->arg, needle)))
             return 1;
     return 0;
-}
-
-/* Именованные приоритеты nft (таблица из nftables: doc/nft.txt, «PRIORITY»). */
-static const struct { const char *name; int v; } prio_names[] = {
-    { "raw", -300 }, { "mangle", -150 }, { "dstnat", -100 }, { "filter", 0 },
-    { "security", 50 }, { "srcnat", 100 },
-};
-
-int ir_prio_value(const struct nft_chain *c) {
-    int base = 0;
-    if (c->prio_name)
-        for (size_t i = 0; i < sizeof(prio_names) / sizeof(prio_names[0]); i++)
-            if (!strcmp(prio_names[i].name, c->prio_name)) base = prio_names[i].v;
-    return base + c->prio_off;
 }
 
 void ir_prio_str(const struct nft_chain *c, char *dst, size_t n) {

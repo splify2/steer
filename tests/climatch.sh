@@ -34,6 +34,13 @@ code() {
     check "$name" "$want" "$?"
 }
 
+# Каталог плагинов стенда (tests/plugroot.sh): манифесты официальных плагинов дерева и программа хуков
+# build/pkhooks под именем bin/<id>. Подкоманды протоколов ядро берёт только из манифестов: с ним они
+# есть и доходят до программы плагина, без него — их нет вовсе.
+PR="$tmp/plugins"
+sh tests/plugroot.sh "$PR" "$(dirname "$BIN")" || { echo "climatch: каталог плагинов не собран"; exit 2; }
+WITHP="env STEER_PLUGINS_ROOT=$PR STEER_PLUGINS_ETC=$tmp/plugetc"
+
 # ---- справка отвечает нулём и печатает в stdout -----------------------------
 # Код 2 и вывод в stderr — это поведение ОШИБКИ. Справка, запрошенная явно, ошибкой
 # не является: `steer --help | less` на прежнем движке показывал пустую страницу,
@@ -52,12 +59,10 @@ check "help КОМАНДА и КОМАНДА --help совпадают" "$a" "$b
 # Разделы справки идут подряд: «Диагностика:» печатается один раз, а не трижды (три команды
 # лежали среди VLESS и Telegram). И у --kind перечислены ВСЕ виды выходов, которые знает спека.
 check "help: раздел «Диагностика» один" "1" "$("$BIN" help 2>/dev/null | grep -c '^Диагностика:')"
-for k in direct interface vless xsteer zapret tgws awg; do
+for k in direct interface tgws awg плагина; do
     check "help outputs: --kind знает вид $k" "1" \
         "$("$BIN" help outputs 2>/dev/null | grep -c "только выходы этого вида:.*\b$k\b")"
 done
-check "help tgws-probe: срок по умолчанию назван верно" "1" \
-    "$("$BIN" help tgws-probe 2>/dev/null | grep -c 'по умолчанию 5 секунд')"
 check "КОМАНДА -h — то же самое" "$a" "$c"
 check "справка по команде показывает синопсис" "1" \
     "$(printf '%s' "$a" | grep -c 'steer explain <адрес|имя>')"
@@ -101,8 +106,6 @@ code "чужой флаг команде — отказ" 2 -- "$BIN" status --dr
 code "флаг без значения — отказ" 2 -- "$BIN" apply --spec
 code "значение, съеденное флагом, — отказ" 2 -- "$BIN" apply --spec --dry-run
 code "лишний позиционный — отказ" 2 -- "$BIN" apply лишнее
-code "не-число там, где ждали число" 2 -- "$BIN" vless-probe out --node abc
-code "порт за пределами диапазона" 2 -- "$BIN" obfs-server --listen 99999 --forward 127.0.0.1:51820
 code "флаг вместо команды — отказ" 2 -- "$BIN" --spec /etc/steer/spec.json apply
 code "обязательный аргумент пропущен" 2 -- "$BIN" explain
 
@@ -173,57 +176,43 @@ accepted() { # ИМЯ -- команда...
     check "$name" "принят" "$([ "$rc" = 2 ] && echo "ОТВЕРГНУТ разбором" || echo "принят")"
 }
 accepted "splify2: apply --dry-run --spec" -- "$BIN" apply --dry-run --spec "$tmp/spec.json"
-accepted "splify2: outputs --kind vless --spec" -- "$BIN" outputs --kind vless --spec "$tmp/spec.json"
+accepted "splify2: outputs --kind vless --spec (вид плагина)" -- $WITHP "$BIN" outputs --kind vless --spec "$tmp/spec.json"
+code "outputs --kind vless без плагина — нет такого вида" 2 -- "$BIN" outputs --kind vless --spec "$tmp/spec.json"
 accepted "splify2: outputs --obfs --spec" -- "$BIN" outputs --obfs --spec "$tmp/spec.json"
 accepted "splify2: status --spec" -- "$BIN" status --spec "$tmp/spec.json"
 accepted "splify2: diag --spec" -- "$BIN" diag --spec "$tmp/spec.json"
 accepted "splify2: explain АДРЕС --spec" -- "$BIN" explain 1.2.3.4 --spec "$tmp/spec.json"
-# Команды VLESS в базовой сборке отвечают кодом 2 — «в этой сборке их нет», — и по коду
-# это не отличить от отказа разбора. Поэтому здесь проверяется маркер: базовая сборка
-# обязана дойти до отказа САМОЙ КОМАНДЫ и назвать нужный пакет. Заодно это единственное
-# место, где закреплена строка «steer-extended».
-#
-# Строка — контракт, а не текст. splify2 (rpcd/splify2) отличает базовую сборку от
-# расширенной так:  out="$(steer vless '' 2>&1)"; case "$out" in *steer-extended*) …
-# и по этому решает, показывать ли вкладку VLESS целиком. Переформулируйте отказ в
-# src/daemon/main.c без оглядки сюда — и интерфейс объявит расширенную сборку базовой.
-ext_marker() { # ИМЯ -- команда...
-    name="$1"; shift 2
+# ПОДКОМАНДЫ ПРОТОКОЛОВ — ИЗ МАНИФЕСТОВ ПЛАГИНОВ (steer-api.md, 4.3). Ядро их имён не знает: без плагинов
+# `steer vless-nodes` — неизвестная команда, с плагином — программа плагина bin/<id> с теми же словами.
+# Здесь программа — build/pkhooks (tests/plugroot.sh): она называет себя и первое слово, и по этой строке
+# видно, что вызов дошёл до программы плагина. Свой разбор флагов (--insecure только с файлом, --node
+# числом, противоречия --stream) — у самой программы плагина: tests/libs-test.sh гоняет настоящие.
+reach() { # ИМЯ ПЛАГИН КОМАНДА -- команда...
+    name="$1"; pl="$2"; cmdw="$3"; shift 4
     out="$("$@" 2>&1 >/dev/null)"
-    check "$name" "1" "$(printf '%s' "$out" | grep -c 'steer-extended')"
+    check "$name" "1" "$(printf '%s' "$out" | grep -c "pkhooks ($pl): «$cmdw»")"
 }
-ext_marker "splify2: vless-nodes доходит до команды" -- \
-    "$BIN" vless-nodes v --spec "$tmp/spec.json"
-ext_marker "splify2: vless-probe --node -1 --timeout 6 доходит до команды" -- \
-    "$BIN" vless-probe v --node -1 --timeout 6 --spec "$tmp/spec.json"
-ext_marker "splify2: vless-probe --node 0 доходит до команды" -- \
-    "$BIN" vless-probe v --node 0 --timeout 6 --spec "$tmp/spec.json"
-# --insecure у перечня и проверки узлов ПО ФАЙЛУ подписки: узлы с allowInsecure входят в перечень с
-# той же нумерацией, что у выхода с insecure: true. Разбор флаг пропускает до команды (в базовой
-# сборке — до отказа «нужен пакет»); с именем выхода флаг — отказ разбора кодом 2 и словами: у выхода
-# решает его собственный ключ insecure, и молча взять флаг значило бы показать не те номера.
+code "vless-nodes без плагина — неизвестная команда" 2 -- "$BIN" vless-nodes /tmp/x
+check "  и словами «нет такой команды», а не «нужен пакет»" "1 0" \
+    "$("$BIN" vless-nodes /tmp/x 2>&1 | grep -c 'нет такой команды') $("$BIN" vless-nodes /tmp/x 2>&1 | grep -c 'нужен пакет')"
 printf 'vless://x@h.example:443#n\n' > "$tmp/sub.txt"
 for c in vless-nodes vless-probe hysteria2-nodes hysteria2-probe proxy-nodes proxy-probe; do
-    out="$("$BIN" $c "$tmp/sub.txt" --insecure 2>&1 >/dev/null)"
-    check "$c /файл --insecure доходит до команды" "1" "$(printf '%s' "$out" | grep -c 'нужен пакет')"
-    out="$("$BIN" $c v --insecure --spec "$tmp/spec.json" 2>&1 >/dev/null)"; rc=$?
-    check "$c выход --insecure: отказ кодом 2" "2" "$rc"
-    check "  и словами «только с файлом подписки», а не «нужен пакет»" "1 0" \
-        "$(printf '%s' "$out" | grep -c 'только с файлом подписки') $(printf '%s' "$out" | grep -c 'нужен пакет')"
+    pl="${c%%-*}"
+    reach "$c /файл --insecure доходит до программы плагина" "$pl" "$c" -- $WITHP "$BIN" $c "$tmp/sub.txt" --insecure
+    # Слово — имя выхода (conf: true в манифесте): ядро ищет выход в спеке, чтобы дать программе его {conf}.
+    out="$($WITHP "$BIN" $c v --spec "$tmp/spec.json" 2>&1 >/dev/null)"; rc=$?
+    check "$c выход: ядро ищет выход для {conf} — нет его, отказ кодом 2" "2 1" \
+        "$rc $(printf '%s' "$out" | grep -c 'выхода v нет в спеке')"
 done
-out="$("$BIN" vless-probe "$tmp/sub.txt" --node 0 --timeout 6 --insecure 2>&1 >/dev/null)"
-check "vless-probe /файл --node --timeout --insecure доходит до команды" "1" \
-    "$(printf '%s' "$out" | grep -c 'нужен пакет')"
-code "--insecure у команды без узлов — отказ разбора" 2 -- "$BIN" status --insecure
-# Подписка: те же вызовы, какими её зовёт splify2. Проверяется, что разбор аргументов их
-# ПРОПУСКАЕТ и отказ приходит от самой команды: --out и --info — новые флаги, и опечатка в
-# их имени выглядела бы как «подписка не скачалась», причём молча.
-ext_marker "splify2: sub-fetch <ссылка> --out --info доходит до команды" -- \
-    "$BIN" sub-fetch https://p.example/s --out "$tmp/sub.txt" --info "$tmp/sub.userinfo"
-ext_marker "splify2: sub-fetch без --info доходит до команды" -- \
-    "$BIN" sub-fetch https://p.example/s --out "$tmp/sub.txt"
-ext_marker "splify2: sub-quota <ссылка> --info доходит до команды" -- \
-    "$BIN" sub-quota https://p.example/s --info "$tmp/sub.userinfo"
+reach "splify2: sub-fetch <ссылка> --out --info доходит до программы плагина" vless sub-fetch -- \
+    $WITHP "$BIN" sub-fetch https://p.example/s --out "$tmp/sub.txt" --info "$tmp/sub.userinfo"
+reach "splify2: sub-quota <ссылка> --info доходит до программы плагина" vless sub-quota -- \
+    $WITHP "$BIN" sub-quota https://p.example/s --info "$tmp/sub.userinfo"
+reach "xsteer-link доходит до программы плагина" xsteer xsteer-link -- $WITHP "$BIN" xsteer-link -
+reach "warp-reg доходит до программы плагина" warpbox warp-reg -- $WITHP "$BIN" warp-reg "$tmp/w.reg"
+check "help vless-nodes с плагином — справка из манифеста" "1" \
+    "$($WITHP "$BIN" help vless-nodes 2>/dev/null | grep -c 'Команда плагина vless')"
+code "--insecure у команды ядра — отказ разбора" 2 -- "$BIN" status --insecure
 # sub-hwid И dev-id ОТВЕЧАЮТ В БАЗОВОЙ СБОРКЕ, а не отказывают «нужен steer-extended», — и
 # это ровно то свойство, ради которого идентификатор переехал в src/tools/hwid.c. Прежде здесь
 # стояла проверка на отказ, и она была верна, пока читатель был один: панель подписки.
@@ -237,47 +226,19 @@ check "dev-id отвечает и в базовой сборке" "1" \
     "$(STEER_DEVID_ITERS=1000 "$BIN" dev-id 2>/dev/null | grep -c '"tid":')"
 check "и это ДРУГОЙ идентификатор, а не тот же" "0" \
     "$(STEER_DEVID_ITERS=1000 "$BIN" dev-id 2>/dev/null | grep -c 'splify2-')"
-# Флаги подписки чужим командам не даются: список флагов команды — это данные, по которым
-# растут и справка, и разбор, и разойтись им негде.
-code "sub-fetch не принимает --spec" 2 -- "$BIN" sub-fetch https://p.example/s --spec /dev/null
+# Флаги чужим командам не даются: список флагов команды — это данные, по которым растут и справка,
+# и разбор, и разойтись им негде.
 code "status не принимает --out" 2 -- "$BIN" status --out /dev/null
-code "sub-fetch без ссылки — отказ разбора" 2 -- "$BIN" sub-fetch --out "$tmp/sub.txt"
-
-# Пустое имя выхода: rpcd зовёт именно `steer vless ''`. Пустая строка обязана считаться
-# позиционным аргументом, а не пропущенным, — иначе разбор отвергнет вызов раньше, чем
-# движок успеет назвать пакет, и определение сборки сломается.
-ext_marker "splify2: vless '' называет пакет (по этому splify2 узнаёт сборку)" -- \
-    "$BIN" vless ''
 accepted "splify2: fit --budget --report ФАЙЛ" -- \
     "$BIN" fit --budget 100 --report "$tmp/rep.json" /dev/null
 
-# tgws-probe понимает одно слово — media. Любое другое молча проверяло ОБЫЧНУЮ точку, и
-# «steer tgws-probe medai» отвечал «ок» про другую (I-316). Опечатка — отказ разбора с
-# названием того, что есть, раньше, чем команда куда-либо пойдёт.
-ext_marker "tgws-probe media доходит до команды" -- "$BIN" tgws-probe media
-code "tgws-probe medai: отказ" 2 -- "$BIN" tgws-probe medai
-check "tgws-probe medai: отказ разбора, а не команды" "0" \
-    "$("$BIN" tgws-probe medai 2>&1 >/dev/null | grep -c 'steer-extended')"
-check "tgws-probe medai: названо, что есть" "1" \
-    "$("$BIN" tgws-probe medai 2>&1 >/dev/null | grep -c '«media»')"
-
-# Режим потока xsteer: --no-stream вместе с --stream или --stream-port — противоречие.
-# Прежде побеждал порядок: «--stream-port 5 --no-stream» молча выключал поток и бросал порт,
-# «--no-stream --stream» включал (I-316). Теперь отказ разбора при любом порядке, а каждый
-# флаг поодиночке по-прежнему доходит до команды.
-for args in "--stream-port 5 --no-stream" "--no-stream --stream-port 5" \
-            "--stream --no-stream" "--no-stream --stream"; do
-    # shellcheck disable=SC2086
-    check "xsteer $args: отказ разбора" "0" \
-        "$("$BIN" xsteer x $args 2>&1 >/dev/null | grep -c 'steer-extended')"
-    # shellcheck disable=SC2086
-    check "xsteer $args: названо противоречие" "1" \
-        "$("$BIN" xsteer x $args 2>&1 >/dev/null | grep -c -- '--no-stream')"
-done
-for args in "--stream-port 5" "--stream" "--no-stream" "--stream --stream-port 5"; do
-    # shellcheck disable=SC2086
-    ext_marker "xsteer $args доходит до команды" -- "$BIN" xsteer x $args
-done
+# Мост Telegram — плагин tgws (plugins/tgws): у ядра своей команды tgws-probe нет. Без плагина — неизвестная
+# команда; с плагином она в справке под его именем и доходит до его программы (разбор её слов и отказы —
+# tests/tgwsmatch.sh, программа плагина).
+code "без плагина tgws команды tgws-probe нет" 2 -- "$BIN" tgws-probe media
+check "  и ядро не называет пакет модуля" "0" "$("$BIN" tgws-probe media 2>&1 | grep -c 'steer-tgws\|steer-extended')"
+check "с плагином tgws-probe — команда плагина в справке" "1" \
+    "$($WITHP "$BIN" help 2>/dev/null | grep -c '^  tgws-probe .*\[tgws\]$')"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

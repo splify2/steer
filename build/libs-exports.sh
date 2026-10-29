@@ -2,7 +2,8 @@
 # Списки экспорта разделяемых библиотек (шаг 4 выпуска 1.10): что libsteer.so отдаёт steerd и
 # модулям, а libsteer-wolfssl.so — libsteer.
 #
-#     sh build/libs-exports.sh gen     переписать build/libsteer.map и build/wolfssl/libsteer-wolfssl.map
+#     sh build/libs-exports.sh gen     переписать build/libsteer.map, build/wolfssl/libsteer-wolfssl.map
+#                                      и build/net1/libs2p-net.map (экспорт плагина net1)
 #     sh build/libs-exports.sh check   сверить файлы с кодом (выход 1 — расходятся)
 #
 # ЗАЧЕМ СПИСКИ, А НЕ «ВСЁ ВИДИМОЕ». Без version-script библиотека отдаёт наружу каждый глобальный
@@ -66,7 +67,9 @@ for f in $QUIC_STAND; do
     $CC $F $NGCFLAGS -Itests -c "$f" -o "$W/app/$(echo "$f" | tr / _).o"
 done
 {
-    for p in PROFILE_steerd PROFILE_mod_vless PROFILE_mod_xsteer PROFILE_mod_obfs PROFILE_mod_tgws PROFILE_mod_hysteria2 PROFILE_mod_proxy; do
+    # Раскладка 2.1: из libsteer берёт только steerd; протоколы и мост Telegram — плагины (на net1 или
+    # статические) и с libsteer не связаны (нужды плагинов на net1 — карта net1 ниже).
+    for p in PROFILE_steerd; do
         profile_var "$p"
     done
 } | tr ' ' '\n' | sort -u | grep -v '^$' > "$W/app.lst"
@@ -78,15 +81,6 @@ nm -g --defined-only "$W"/lib/*.o | awk 'NF==3 {print $3}' | sort -u > "$W/defs"
 # пропадает без единого сообщения. Именно так DoQ мог бы «работать» в стенде и отказывать на роутере.
 nm -u "$W"/app/*.o | awk '$1=="U" || $1=="w" {print $2}' | sort -u > "$W/undef"
 comm -12 "$W/defs" "$W/undef" > "$W/need"
-# Нужды модулей вне дерева (build/exports-ext.lst): их исходников здесь нет. Каждый обязан быть
-# определён в libsteer — иначе это опечатка или символ, который библиотека потеряла.
-EXT=build/exports-ext.lst
-if [ -f "$EXT" ]; then
-    grep -v '^#' "$EXT" | grep -v '^$' | sort -u > "$W/ext"
-    _missing="$(comm -23 "$W/ext" "$W/defs")"
-    [ -z "$_missing" ] || { echo "libs-exports: в $EXT символы, которых нет в libsteer: $_missing" >&2; exit 1; }
-    sort -u "$W/need" "$W/ext" -o "$W/need"
-fi
 # Все, что определено в libsteer, а снаружи не зовётся, остаётся скрытым.
 # wolfSSL, нужная libsteer: слой примитивов, обёртка QUIC (qcssl.c) и криптобэкенд ngtcp2. Из
 # архива берутся все члены, а не достижимые: сборщик выбросит лишнее, а список экспорта от этого
@@ -101,9 +95,43 @@ $CC $F -DSTEER_CP_OWN -c $CRYPTO -o "$W/scrypto-own.o"
     nm -u "$W/libngtcp2.a"
 } | awk '$1=="U" && ($2 ~ /^(wc_|wolf)/) {print $2}' | sort -u > "$W/wneed"
 
+# ---- net1: libs2p-net.so.1 -------------------------------------------------------------------
+# Экспорт net1 — то, что плагины протоколов на ней (PLUGINS_NET1) берут из её исходников; имена — с
+# приставкой s2p_ (build/build-libs.sh переименовывает их заголовком из этой же карты). Плюс родная
+# s2p_net_abi. Объекты — без переименования: считаются исходные имена, приставка ставится здесь.
+mkdir -p "$W/net1" "$W/plug"
+N1_SRC=""
+for f in $(profile_var PROFILE_net1); do
+    case " $QUIC_ALL " in *" $f "*) ;; *) N1_SRC="$N1_SRC $f" ;; esac
+done
+comp "$W/net1" $N1_SRC
+for f in $(profile_var NET1_QUIC_SRC); do
+    # shellcheck disable=SC2086
+    $CC $F $NGCFLAGS -c "$f" -o "$W/net1/$(echo "$f" | tr / _).o"
+done
+for _pl in $(profile_var PLUGINS_NET1); do profile_var "PROFILE_plug_$_pl"; done | tr ' ' '\n' | sort -u | grep -v '^$' > "$W/plug.lst"
+comp "$W/plug" $(cat "$W/plug.lst")
+nm -g --defined-only "$W"/net1/*.o | awk 'NF==3 {print $3}' | sort -u > "$W/n1defs"
+nm -u "$W"/plug/*.o | awk '$1=="U" || $1=="w" {print $2}' | sort -u > "$W/n1undef"
+comm -12 "$W/n1defs" "$W/n1undef" | grep -v '^s2p_' > "$W/n1need" || true
+
+emit_net1() {
+    echo "/* Экспорт libs2p-net.so.1 (плагин net1) — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками"
+    echo " * не правится. Имена исходников стека, которые берут плагины протоколов ($(profile_var PLUGINS_NET1 | sed 's/ /, /g')),"
+    echo " * с приставкой s2p_; из той же карты сборка порождает заголовок переименования (src/net1/s2pnet.h)."
+    echo " * Остальное, вместе с wolfSSL и ngtcp2, скрыто. Удалить или изменить имя — major net1. */"
+    echo "LIBS2P_NET_1 {"
+    echo "  global:"
+    echo "    s2p_net_abi;"
+    sed 's/^/    s2p_/; s/$/;/' "$W/n1need"
+    echo "  local:"
+    echo "    *;"
+    echo "};"
+}
+
 emit_libsteer() {
     echo "/* Экспорт libsteer.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится."
-    echo " * Символы, которые steerd и модули (steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy) берут"
+    echo " * Символы, которые steerd берёт"
     echo " * из библиотеки, и программный интерфейс QUIC (qc_*), который берёт стенд QUIC_STAND_SRC, пока"
     echo " * настоящих потребителей нет; остальное скрыто (local: *). Проверка: check. */"
     echo "LIBSTEER_1 {"
@@ -128,16 +156,19 @@ emit_wolfssl() {
 }
 emit_libsteer > "$W/libsteer.map"
 emit_wolfssl > "$W/libsteer-wolfssl.map"
+emit_net1 > "$W/libs2p-net.map"
 
 case "$MODE" in
 gen)
     cp "$W/libsteer.map" build/libsteer.map
     cp "$W/libsteer-wolfssl.map" build/wolfssl/libsteer-wolfssl.map
-    echo "libs-exports: libsteer.map — $(wc -l < "$W/need") символов, libsteer-wolfssl.map — $(wc -l < "$W/wneed")"
+    mkdir -p build/net1
+    cp "$W/libs2p-net.map" build/net1/libs2p-net.map
+    echo "libs-exports: libsteer.map — $(wc -l < "$W/need") символов, libsteer-wolfssl.map — $(wc -l < "$W/wneed"), libs2p-net.map — $(($(wc -l < "$W/n1need") + 1))"
     ;;
 check)
     bad=0
-    for pair in libsteer.map:build/libsteer.map libsteer-wolfssl.map:build/wolfssl/libsteer-wolfssl.map; do
+    for pair in libsteer.map:build/libsteer.map libsteer-wolfssl.map:build/wolfssl/libsteer-wolfssl.map libs2p-net.map:build/net1/libs2p-net.map; do
         gen="$W/${pair%%:*}"; have="${pair#*:}"
         if ! diff -u "$have" "$gen" > "$W/diff" 2>&1; then
             echo "libs-exports: $have разошёлся с кодом (sh build/libs-exports.sh gen):"

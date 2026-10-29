@@ -31,6 +31,8 @@ skip() { echo "urlhttps: $1 — пропуск"; exit 0; }
 [ -x "$LIBS/steerd" ] || skip "нет раскладки libs ($LIBS, tests/libs-test.sh)"
 BIN="$LIBS/steerd"
 LD_LIBRARY_PATH="$LIBS"; export LD_LIBRARY_PATH
+# Протоколы — плагины раскладки (программы build-libs.sh, манифесты кладёт tests/libs-test.sh).
+STEER_PLUGINS_ROOT="$LIBS/plugins"; export STEER_PLUGINS_ROOT
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else
@@ -40,6 +42,9 @@ check() {
 wait_for() {
     i=0
     while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    # Приговор по фактическому состоянию, а не по счётчику кругов: условие, ставшее истинным в последнюю
+    # десятую секунды, иначе объявлялось бы невыполненным.
+    eval "$1" && return 0
     return 1
 }
 for t in nft ip tc python3 nsenter unshare openssl awk; do command -v $t >/dev/null 2>&1 || skip "$t нет"; done

@@ -1,8 +1,7 @@
 /* Транспорт xhttp: поток протокола в теле запросов HTTP/2 — одним запросом или двумя связями.
  *
- * Верхний ярус транспорта (transport.h). Переехал из клиента VLESS (client.c) без изменений в
- * поведении; вторая связь под выгрузку поднимается теперь тем же tr_link_open, что и основная,
- * — прежде рукопожатие было скопировано в неё отдельной функцией.
+ * Верхний ярус транспорта (transport.h). Вторая связь под выгрузку поднимается тем же
+ * tr_link_open, что и основная.
  *
  * xhttp в режиме stream-one не оборачивает ничего: тело запроса — это поток наверх, тело
  * ответа — поток вниз. Зато он требует набивки: сервер проверяет длину x_padding в
@@ -15,6 +14,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
+#include <stdlib.h>
 #include <sys/random.h>
 
 #include "transport.h"
@@ -112,22 +112,9 @@ static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
      *
      * ЖДАТЬ ЗДЕСЬ НЕЛЬЗЯ. Слив ответов делается попутно с отправкой, и блокирующее чтение
      * остановило бы выгрузку до прихода ответа — то есть превратило бы поток в череду
-     * «отправил и жду». Поверх TLS ожидания и нет: tls13_read опрашивает сокет с нулевым
-     * сроком и отдаёт ноль байт, когда записи ещё нет. На голом сокете (security=none)
-     * такого поведения нет, и опрос приходится ставить самим — поэтому чтение этой связи
-     * своё, а не tr_link_read основной. */
-    if (u->link.plain) {
-        struct pollfd p = { .fd = u->link.fd, .events = POLLIN };
-        if (poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN)) { *got = 0; return 0; }
-        ssize_t r = read(u->link.fd, d, cap);
-        if (r == 0) return TR_ECLOSED;
-        if (r < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { *got = 0; return 0; }
-            return TR_EIO;
-        }
-        *got = (size_t)r;
-        return 0;
-    }
+     * «отправил и жду». Ожидания нет ни поверх TLS, ни на голом сокете (security=none): оба
+     * чтения не ждут (recv с MSG_DONTWAIT) и отдают ноль байт, когда записи ещё нет. */
+    if (u->link.plain) return tr_sock_read(u->link.fd, d, cap, got);
     return tls13_read(&u->link.tls, d, cap, got);
 }
 
@@ -148,6 +135,11 @@ static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
  * а обрыв связи назовёт следующая запись. */
 static int up_drain(struct xh_up *u) {
     if (!u->started) return 0;
+    /* Живая запись (I-534): то, что сокет не принял сразу, лежит в очереди связи и уходит здесь — слив
+     * зовётся перед каждой отправкой, при каждом ответе сервера и при низком месте. Сам сокет выгрузки
+     * цикл на запись не ждёт: пока очередь не пуста, сервер не дочитал, и его ответ или WINDOW_UPDATE
+     * придёт по этой же связи и разбудит слив. */
+    if (u->link.live && tr_link_pending(&u->link) && tr_link_flush(&u->link) < 0) return H2_EIO;
     static __thread unsigned char sink[H2_MIN_READ_CAP];
     /* Пока связь не опустеет, но с пределом, чтобы один вызов не крутился вечно. НЕ пока чтение не
      * вернёт данных: на этой связи оно не вернёт их никогда (ответы — пустые 200), и остановка
@@ -174,6 +166,37 @@ static int up_drain(struct xh_up *u) {
     return 0;
 }
 
+/* Копия строк узла в одном выделении: нужна, чтобы позже переоткрыть вторую связь (up_reopen).
+ * 0 — готово, иначе -1 (нет памяти). */
+static int node_keep(struct xh_state *x, const struct tr_node *n) {
+    const char *const *src[] = { &n->host, &n->type, &n->security, &n->sni, &n->fp, &n->pbk,
+                                 &n->sid, &n->path, &n->http_host, &n->headers, &n->service,
+                                 &n->mode, &n->pqv, &n->pcs, &n->pks, &n->vcn, &n->ech,
+                                 &n->encryption };
+    size_t cnt = sizeof(src) / sizeof(src[0]), total = 0;
+    for (size_t i = 0; i < cnt; i++) if (*src[i]) total += strlen(*src[i]) + 1;
+    char *mem = malloc(total ? total : 1), *w = mem;
+    if (!mem) return -1;
+    x->node = *n;
+    /* Те же поля, в том же порядке, но уже в копии: сдвиг указателя в x->node равен сдвигу
+     * соответствующего поля в n. */
+    const char **dst[] = { &x->node.host, &x->node.type, &x->node.security, &x->node.sni,
+                           &x->node.fp, &x->node.pbk, &x->node.sid, &x->node.path,
+                           &x->node.http_host, &x->node.headers, &x->node.service, &x->node.mode,
+                           &x->node.pqv, &x->node.pcs, &x->node.pks, &x->node.vcn, &x->node.ech,
+                           &x->node.encryption };
+    for (size_t i = 0; i < cnt; i++) {
+        if (!*src[i]) { *dst[i] = NULL; continue; }
+        size_t k = strlen(*src[i]) + 1;
+        memcpy(w, *src[i], k);
+        *dst[i] = w;
+        w += k;
+    }
+    free(x->node_mem);
+    x->node_mem = mem;
+    return 0;
+}
+
 /* Поднять вторую связь. Тот же путь установления, что и у основной: TCP, и дальше либо
  * ничего (security=none), либо Reality, либо обычный TLS с проверкой. ALPN — всегда h2. */
 static int up_connect(struct transport *t, const struct tr_node *n, int timeout_s) {
@@ -185,6 +208,8 @@ static int up_connect(struct transport *t, const struct tr_node *n, int timeout_
         tls13_free(&u->link.tls); close(u->link.fd); u->link.fd = -1;
         return TR_ENOH2;
     }
+    /* Основная связь уже отдана циклу (xhttp_live) — вторая пишет так же, без ожидания сокета. */
+    if (t->xh.live) tr_link_live(&u->link);
     return 0;
 }
 
@@ -237,6 +262,9 @@ static int up_open(struct transport *t, const struct tr_node *n, int timeout_s) 
 
 /* ---- транспорт ------------------------------------------------------------------------ */
 
+/* scMaxEachPostBytes, когда узел его не объявил: умолчание Xray и клиента, и сервера. */
+#define XH_POST_DEFAULT 1000000u
+
 static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     struct xh_state *x = &t->xh;
     struct h2_io io = { .ctx = &t->link, .write = tr_link_write, .read = tr_link_read };
@@ -245,6 +273,11 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
      * :authority и на любое другое имя отвечает 404 (hub.go). */
     const char *authority = n->http_host && n->http_host[0] ? n->http_host
                           : n->sni[0] ? n->sni : n->host;
+    char abuf[136];
+    if (authority == n->host && strchr(authority, ':')) {   /* адрес IPv6 в :authority — в скобках */
+        snprintf(abuf, sizeof(abuf), "[%s]", authority);
+        authority = abuf;
+    }
     char path[320];
 
     /* Режим определяется ЗДЕСЬ, один раз: дальше он читается и при открытии потоков, и при
@@ -255,10 +288,13 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
     x->pad_from = n->pad_from;
     x->pad_to = n->pad_to;
     x->pad_set = n->pad_set;
-    /* Предел тела POST: диапазон scMaxEachPostBytes узла; размер каждого POST выбирается при его
-     * отправке (post_pick). Не объявлен — предела нет. */
-    x->post_min = n->post_to ? n->post_from : 0;
-    x->post_max = n->post_to ? n->post_to : 0;
+    /* Предел тела POST: диапазон scMaxEachPostBytes узла; не объявлен — умолчание Xray, 1000000
+     * (сервер на тело больше своего предела отвечает 413). Размер каждого POST выбирается при его
+     * отправке (post_pick). */
+    x->post_min = n->post_to ? n->post_from : XH_POST_DEFAULT;
+    x->post_max = n->post_to ? n->post_to : XH_POST_DEFAULT;
+    x->node_mem = NULL;
+    x->open_timeout = timeout_s;
     if (getrandom(&x->post_rng, sizeof x->post_rng, 0) != (ssize_t)sizeof x->post_rng)
         x->post_rng = (uint64_t)(uintptr_t)t ^ 0x9E3779B97F4A7C15ull;
 
@@ -275,6 +311,8 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
         return h2_start_ex(&t->h2, &io, authority, path, "application/grpc", ref,
                            H2_POST, 0, 1);
     }
+
+    if (node_keep(x, n)) return TR_ESOCK;
 
     /* Два оставшихся режима начинаются одинаково: сессия получает имя, и по этому имени
      * сервер потом свяжет с ней запросы выгрузки. Имя дописывается к пути — так у Xray
@@ -295,19 +333,26 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
     return up_open(t, n, timeout_s);
 }
 
-/* packet-up: нижняя граница размера POST — post_min (не больше post_max). 0 — предела нет. */
+/* packet-up: нижняя граница размера POST — меньшее из post_min и окна потока (окно каждого нового
+ * потока — peer_init_win, и POST больше него не уйдёт), см. post_pick. До первого запроса окно —
+ * умолчательные 65535. 0 — предела нет. */
 static size_t post_floor(const struct xh_state *x) {
     if (!x->post_max) return 0;
-    return x->post_min && x->post_min < x->post_max ? x->post_min : x->post_max;
+    size_t lo = x->post_min && x->post_min < x->post_max ? x->post_min : x->post_max;
+    long win = x->up.started ? x->up.h2.peer_init_win : 65535;
+    if (win > 0 && (size_t)win < lo) lo = (size_t)win;
+    return lo;
 }
 
 /* packet-up: размер очередного POST — равномерно в [post_min, post_max], как делает клиент Xray
- * (RandomRange на каждый запрос). xorshift64*: на каждый POST системный вызов getrandom не нужен,
- * а случайность здесь — не секрет, а форма трафика. 0 — предела нет. */
+ * (RandomRange на каждый запрос), но не больше окна потока. xorshift64*: на каждый POST системный
+ * вызов getrandom не нужен, а случайность здесь — не секрет, а форма трафика. 0 — предела нет. */
 static size_t post_pick(struct xh_state *x) {
     if (!x->post_max) return 0;
     size_t lo = post_floor(x);
     size_t hi = x->post_max;
+    long win = x->up.started ? x->up.h2.peer_init_win : 65535;
+    if (win > 0 && (size_t)win < hi) hi = (size_t)win;
     if (hi <= lo) return lo;
     uint64_t r = x->post_rng ? x->post_rng : 0x9E3779B97F4A7C15ull;
     r ^= r >> 12; r ^= r << 25; r ^= r >> 27;
@@ -331,12 +376,23 @@ static long packet_conn_room(const struct xh_up *u) {
  * дальше PACKET_INFLIGHT от самого старого неотвеченного. Восемь — с большим запасом до умолчания
  * сервера и ниже даже сниженного. */
 #define PACKET_INFLIGHT 16
-#define PACKET_SLOT 8192
+
+/* Закрыл ли сервер связь выгрузки (FIN, обрыв): читать на ней уже нечего, и ответы, которых
+ * нет, не придут. */
+static int up_hung(const struct xh_up *u) {
+    if (!u->link.plain && tls13_has_record(&u->link.tls)) return 0;   /* ещё есть что слить */
+    struct pollfd p = { .fd = u->link.fd, .events = POLLIN | POLLRDHUP };
+    return poll(&p, 1, 0) > 0 && (p.revents & (POLLRDHUP | POLLHUP | POLLERR));
+}
 
 /* Сколько кусков ещё можно послать, пока окно по seq не заполнено (см. PACKET_INFLIGHT). Номера
  * потоков растут на два за кусок. */
 static long packet_slots(const struct xh_up *u) {
     if (!u->started) return PACKET_INFLIGHT;
+    /* После GOAWAY новых запросов на этой связи не будет: пока на неё ещё идут ответы, мест нет
+     * (их доберёт слив), а когда ответы кончились — связь переоткроется (up_reopen) и места новые. */
+    if (u->h2.goaway)
+        return h2_open_streams(&u->h2) > 0 && !up_hung(u) ? 0 : PACKET_INFLIGHT;
     uint32_t oldest = h2_oldest_open(&u->h2);
     if (!oldest) return PACKET_INFLIGHT;
     long ahead = (long)(u->h2.sid - oldest) / 2 + 1;   /* кусков от самого старого до последнего */
@@ -351,6 +407,26 @@ static long packet_room(const struct xh_up *u) {
     const struct h2 *h = &u->h2;
     int32_t r = h->send_win_conn < h->peer_init_win ? h->send_win_conn : h->peer_init_win;
     return r > 0 ? r : 0;
+}
+
+/* Переоткрыть вторую связь после GOAWAY: новых запросов сервер на ней не примет, а поток
+ * (сессия) у него живёт отдельно от связи — по идентификатору в пути, — поэтому куски идут дальше
+ * с тем же seq. Зовётся, когда неотвеченных кусков на старой связи нет: закрытие её раньше
+ * выбросило бы ответы, которые сервер ещё доотдаёт, и кусок, который он собирался принять. */
+static int up_reopen(struct transport *t) {
+    struct xh_state *x = &t->xh;
+    if (!x->node_mem) return H2_ERESET;             /* узла нет — переоткрывать нечем */
+    struct xh_up *u = &x->up;
+    /* Прежний дескриптор остаётся открытым, пока не поднята новая связь, и закрывается позже (zombie_fd). */
+    if (x->zombie_fd > 0) close(x->zombie_fd);
+    x->zombie_fd = u->link.fd > 0 ? u->link.fd : 0;
+    x->zombie_seen = 0;
+    u->link.fd = -1;
+    outq_free(&u->link.oq);
+    if (!u->link.plain) tls13_free(&u->link.tls);
+    u->link.tls.ready = 0;
+    u->started = 0;
+    return up_connect(t, &x->node, x->open_timeout);
 }
 
 static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
@@ -388,6 +464,26 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
              * для суммы, окно каждого нового потока — для одного куска. Число кусков заранее
              * неизвестно (размеры случайны), поэтому места считаются по худшему: все куски
              * наименьшего размера. */
+            /* Связь выгрузки закрыта сервером (GOAWAY): ждём ответов на то, что уже ушло, потом
+             * поднимаем новую. Пока ответы идут — «нет места», как и при полном окне: клиент
+             * повторит запись, а слежка за связью (aux_drain) разбудит цикл. */
+            /* Слив до проверки: GOAWAY, лежащий в сокете непрочитанным, иначе не виден, и кусок
+             * ушёл бы на поток сверх last_stream_id — сервер его молча отбросит. Запрос на кусок
+             * дороже одного poll, так что цена здесь пренебрежима. */
+            if (x->up.started) {
+                int pre = up_drain(&x->up);
+                if (pre) return pre;        /* отказ на прошлый кусок (I-219): поток уже не цел */
+            }
+            if (x->up.started && x->up.h2.goaway) {
+                if (h2_open_streams(&x->up.h2) > 0) {
+                    if (!up_hung(&x->up)) return H2_EWINDOW;
+                    /* Связь закрыта, а на часть кусков ответа нет: сервер мог их не принять, и
+                     * переоткрытие выдало бы дыру в потоке за целый. Честный отказ. */
+                    return H2_ERESET;
+                }
+                int rr = up_reopen(t);
+                if (rr) return rr;
+            }
             size_t floor_sz = post_floor(x);
             size_t piece = floor_sz && floor_sz < n ? floor_sz : n;
             /* Куски этой записи обязаны уместиться среди неотвеченных; запись, которой одной нужно
@@ -407,6 +503,11 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
                 if (!rc) rc = h2_write(&x->up.h2, d + off, m);
                 if (!rc) rc = h2_end_stream(&x->up.h2);
                 if (!rc) x->seq++;
+                /* «Всё или ничего»: окна проверены до первого куска, но если запись всё же
+                 * отказала «окно закрыто» ПОСЛЕ того, как часть кусков ушла, повторять её целиком
+                 * нельзя — первые куски дошли бы дважды, и поток сервера разошёлся бы с клиентским.
+                 * Это уже не «повторите», а обрыв (I-543). */
+                if (rc == H2_EWINDOW && off) rc = H2_EIO;
                 off += m;
             }
             int dr = up_drain(&x->up);
@@ -433,11 +534,16 @@ static void xhttp_moved(struct transport *t) {
  * нулю после memset, поэтому проверка на «больше нуля», а не «не -1». */
 static void xhttp_close(struct transport *t) {
     struct xh_up *u = &t->xh.up;
+    if (t->xh.zombie_fd > 0) close(t->xh.zombie_fd);
+    t->xh.zombie_fd = 0;
     if (u->link.fd > 0) close(u->link.fd);
     u->link.fd = -1;
+    outq_free(&u->link.oq);
     if (!u->link.plain) tls13_free(&u->link.tls);
     u->link.tls.ready = 0;
     u->started = 0;
+    free(t->xh.node_mem);
+    t->xh.node_mem = NULL;
 }
 
 /* Конец ответа уже известен, а сказать о нём можно только следующим чтением (причина — у grpc_pending в
@@ -453,7 +559,19 @@ static int xhttp_pending(const struct transport *t) { return t->h2.done || t->h2
  * записей», то есть «нет чтений», и место оставалось закрытым: выгрузка stream-up падала с 3 ГБ до
  * 14 МБ за 20 с. Поэтому низкое место сначала сливает связь выгрузки, а потом сообщается. */
 #define UP_ROOM_LOW 65536
+static long xhttp_room_win(struct transport *t);
 static long xhttp_room(struct transport *t) {
+    long r = xhttp_room_win(t);
+    /* Обратное давление второй связи (живая запись): очередь выгрузки не растёт выше TR_OUT_HIWAT. */
+    size_t p = t->xh.up.started ? tr_link_pending(&t->xh.up.link) : 0;
+    if (p) {
+        long cap = p >= TR_OUT_HIWAT ? 0 : (long)(TR_OUT_HIWAT - p);
+        if (cap < r) r = cap;
+    }
+    return r;
+}
+
+static long xhttp_room_win(struct transport *t) {
     struct xh_state *x = &t->xh;
     switch (x->mode) {
         case XH_STREAM_ONE: return h2_room(&t->h2);
@@ -464,15 +582,15 @@ static long xhttp_room(struct transport *t) {
             /* В БАЙТАХ, которые несут свободные места под куски, а не окно HTTP/2: окно бывает в
              * мегабайты, а неотвеченных кусков может быть лишь PACKET_INFLIGHT. Получив окно, клиент
              * слал куда больше, чем брали места, и каждый отказанный сегмент ждал таймаута повторной
-             * передачи (11 МБ выгружено за 20 с). Место считается по PACKET_SLOT байт, меньше того, что
-             * стек собирает в одну отправку (до 16 КБ), так что выданное окно заполняет куски целиком;
-             * наименьший кусок диапазона узла (post_floor) — когда он меньше. */
+             * передачи (11 МБ выгружено за 20 с). Место считается по наименьшему куску диапазона
+             * (post_floor): запись не больше места занимает не больше свободных мест, как бы ни
+             * выпали случайные размеры; без предела у узла — по 64 КБ, окну по умолчанию. */
             if (packet_room(&x->up) < UP_ROOM_LOW || packet_slots(&x->up) <= PACKET_INFLIGHT / 2)
                 up_drain(&x->up);
             long r = packet_room(&x->up);
             long slots = packet_slots(&x->up);
             size_t fl = post_floor(x);
-            long per = fl && fl < PACKET_SLOT ? (long)fl : PACKET_SLOT;
+            long per = fl ? (long)fl : 65536;
             if (slots < 0) slots = 0;
             if (r > slots * per) r = slots * per;
             if (r > packet_conn_room(&x->up)) r = packet_conn_room(&x->up);
@@ -490,7 +608,11 @@ static long xhttp_room(struct transport *t) {
  * своего таймера: выгрузка packet-up шла кусками «окно, пауза» (8-10 Мбит/с при 150 у stream-up).
  * Теперь ответ будит цикл сам: он сливает связь и, если место выросло, шлёт клиенту окно. */
 static int xhttp_aux_fd(const struct transport *t) {
-    const struct xh_state *x = &t->xh;
+    struct xh_state *x = &((struct transport *)t)->xh;
+    if (x->zombie_fd > 0) {
+        if (x->zombie_seen) { close(x->zombie_fd); x->zombie_fd = 0; }
+        else x->zombie_seen = 1;
+    }
     if (x->mode == XH_STREAM_ONE || !x->up.started || x->up.link.fd <= 0) return -1;
     return x->up.link.fd;
 }
@@ -503,15 +625,48 @@ static int xhttp_aux_drain(struct transport *t) {
     if (rc && !x->drain_err) x->drain_err = rc;
     if (rc) return rc;
     /* Закрытая сервером связь читается всегда (конец потока): будить цикл ею бесконечно нельзя. */
-    struct pollfd p = { .fd = x->up.link.fd, .events = POLLIN | POLLRDHUP };
-    if (poll(&p, 1, 0) > 0 && (p.revents & (POLLRDHUP | POLLHUP | POLLERR))) return -1;
+    if (up_hung(&x->up)) {
+        /* Предел запросов на соединение (GOAWAY) при отвеченных кусках — не конец: поднимаем
+         * связь заново, и цикл подхватит новый дескриптор (aux_fd). Иначе слежка за выгрузкой
+         * снялась бы навсегда, и ответы снова читались бы только попутно с отправкой. */
+        if (x->mode == XH_PACKET_UP && x->up.h2.goaway && h2_open_streams(&x->up.h2) == 0 &&
+            up_reopen(t) == 0)
+            return 0;
+        if (x->mode == XH_PACKET_UP && h2_open_streams(&x->up.h2) > 0 && !x->drain_err)
+            x->drain_err = H2_ERESET;
+        return -1;
+    }
     return 0;
 }
+
+/* Что связь выгрузки не успела отдать сокету (живая запись): цикл ставит на неё EPOLLOUT, иначе остаток ждал бы
+ * ответа сервера, а сервер ждёт этот остаток. */
+static size_t xhttp_aux_pending(const struct transport *t) {
+    const struct xh_state *x = &t->xh;
+    if (x->mode == XH_STREAM_ONE || !x->up.started || x->up.link.fd <= 0) return 0;
+    return tr_link_pending(&x->up.link);
+}
+
+/* Одним вызовом принимает любую запись только packet-up: режет её на POST сам. У stream-up и
+ * stream-one запись — это DATA в одном потоке с окном, и стек собирает для них не больше записи TLS.
+ * Vision (flow) сюда не доходит: узел xhttp с flow отсеивается при разборе ссылки, а у дайлера
+ * VLESS узел с flow большой записи не получает в любом случае (vl_up_max). */
+/* Основная связь отдана циклу (transport_live): вторая — тоже, и поднятая позже — тоже. */
+static void xhttp_live(struct transport *t) {
+    t->xh.live = 1;
+    /* По открытой связи, а не по started: packet-up открывает связь заранее, а первый запрос — с первым куском,
+     * и связь без запроса оставалась бы с блокирующей записью. */
+    if (t->xh.mode != XH_STREAM_ONE && t->xh.up.link.fd > 0)
+        tr_link_live(&t->xh.up.link);
+}
+
+static int xhttp_big_write(const struct transport *t) { return t->xh.mode == XH_PACKET_UP; }
 
 const struct transport_ops tr_xhttp = {
     .name = "xhttp", .alpn = "h2", .zc = 0,
     .open = xhttp_open, .write = xhttp_write, .read = xhttp_read,
     .moved = xhttp_moved, .close = xhttp_close, .pending = xhttp_pending,
     .room = xhttp_room,
-    .aux_fd = xhttp_aux_fd, .aux_drain = xhttp_aux_drain,
+    .aux_fd = xhttp_aux_fd, .aux_drain = xhttp_aux_drain, .aux_pending = xhttp_aux_pending,
+    .big_write = xhttp_big_write, .live = xhttp_live,
 };

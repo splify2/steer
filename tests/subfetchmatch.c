@@ -21,38 +21,18 @@
  *     исправную подписку пустой.
  *
  * КАК ЭТО ПРОВЕРЯЕТСЯ БЕЗ СЕТИ И БЕЗ КРИПТОБИБЛИОТЕКИ. Файл включает исходник (тот же приём,
- * что в submatch.c и dnsmatch.c), подставляет свой `run_quiet`, а вместо curl в PATH кладёт
- * скрипт-заглушку, который пишет заранее заданные заголовки и тело. SHA-256 у идентификатора
- * свой (src/tools/hwid.c), библиотеки он не требует. Поддельный mbedtls_sha256, который стоял
- * здесь, пока идентификатор считался библиотекой, снят: после переезда в hwid.c его не звал
- * никто.
+ * что в submatch.c и dnsmatch.c) и подставляет свой http_get: клиент libsteer (httpc.c) здесь не
+ * линкуется, а его заглушка отдаёт заранее заданные статус, заголовки и тело из файлов песочницы и
+ * записывает, что у неё попросили (метод, заголовки запроса). Сам клиент — со всеми переадресациями,
+ * cookie, сроками и chunked — проверяет tests/httpmatch.c на настоящем сокете. SHA-256 у
+ * идентификатора свой (src/tools/hwid.c), библиотеки он не требует.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <fcntl.h>
-
-/* ---- заглушки, без которых стенд не собрать ---------------------------------------- */
-
-/* Тот же запуск, что в src/lib/run.c: заглушка curl обязана запускаться по-настоящему, иначе
- * ветка скачивания осталась бы непроверенной вовсе. */
-int run_quiet(const char *const argv[]);
-int run_quiet(const char *const argv[]) {
-    pid_t p = fork();
-    if (p < 0) return -1;
-    if (p == 0) {
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
-        execvp(argv[0], (char *const *)argv);
-        _exit(127);
-    }
-    int st = 0;
-    waitpid(p, &st, 0);
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-}
 
 /* Идентификатор и описание устройства переехали в src/tools/hwid.c (он входит и в базовую
  * сборку). Стенд подключает его напрямую — так же, как подключает subfetch.c: проверять
@@ -319,55 +299,63 @@ static void t_quota(void) {
     unlink(info);
 }
 
-/* ---- проверки: скачивание целиком, через поддельный curl ---------------------------- */
+/* ---- проверки: скачивание целиком, через заглушку клиента ---------------------------- */
 
-/* Поддельный curl. Ведёт себя как настоящий в том, что нам важно: понимает -D и -o, а тело
- * и заголовки берёт из файлов песочницы по имени запрошенного адреса. Так проверяется вся
- * дорожка команды, включая повтор за другим форматом. */
-static void make_fake_curl(void) {
+/* Заглушка http_get (libsteer: httpc.h). Статус, заголовки и тело берёт из файлов песочницы по ключу
+ * адреса (…/json — «json», остальное — «main»): rc.<ключ> — отказ клиента (сеть, срок), status.<ключ> —
+ * статус вместо 200, hdr.<ключ>, body.<ключ>. Записывает в песочницу, чем и как спросили: метод
+ * (seen.method), заголовки запроса (seen.headers) и число обращений (seen.count). Файл rej.hdr — панель
+ * отвечает 403 на запрос с заголовками устройства (проверка повтора без них). */
+int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn) {
+    memset(r, 0, sizeof *r);
+    if (why && wn) why[0] = 0;
     char p[512];
-    snprintf(p, sizeof p, "%s/bin", T);
-    mkdir(p, 0755);
-    snprintf(p, sizeof p, "%s/bin/curl", T);
-    wr(p,
-       "#!/bin/sh\n"
-       "# Заглушка curl для стенда: тело и заголовки берутся из файлов песочницы.\n"
-       "hdr=''; out=''; url=''; head=0; ua=''; cookies=no\n"
-       "while [ $# -gt 0 ]; do\n"
-       "    case \"$1\" in\n"
-       "        -D) hdr=\"$2\"; shift 2 ;;\n"
-       "        -o) out=\"$2\"; shift 2 ;;\n"
-       "        -H) shift 2 ;;\n"
-       "        -A) ua=\"$2\"; shift 2 ;;\n"
-       "        -b) cookies=yes; shift 2 ;;\n"
-       "        --max-redirs) shift 2 ;;\n"
-       "        --max-time) shift 2 ;;\n"
-       "        -fsSI) head=1; shift ;;\n"
-       "        -fsSL) shift ;;\n"
-       "        *) url=\"$1\"; shift ;;\n"
-       "    esac\n"
-       "done\n"
-       "# Чем движок представился и включал ли cookie-движок — в песочницу: панель за\n"
-       "# DDoS-Guard отвечает пустотой клиенту по имени curl, а панель за cookie-проверкой\n"
-       "# без cookie водит по кругу редиректов.\n"
-       "printf '%s' \"$ua\" > \"$SANDBOX/seen.ua\"\n"
-       "printf '%s' \"$cookies\" > \"$SANDBOX/seen.cookies\"\n"
-       "case \"$url\" in\n"
-       "    */json) key=json ;;\n"
-       "    *) key=main ;;\n"
-       "esac\n"
-       "[ -f \"$SANDBOX/rc.$key\" ] && exit \"$(cat \"$SANDBOX/rc.$key\")\"\n"
-       "[ -n \"$hdr\" ] && [ -f \"$SANDBOX/hdr.$key\" ] && cp \"$SANDBOX/hdr.$key\" \"$hdr\"\n"
-       "if [ \"$head\" = 0 ] && [ -n \"$out\" ]; then\n"
-       "    [ -f \"$SANDBOX/body.$key\" ] || exit 1\n"
-       "    cp \"$SANDBOX/body.$key\" \"$out\"\n"
-       "fi\n"
-       "exit 0\n");
-    chmod(p, 0755);
-    char path[1024];
-    snprintf(path, sizeof path, "%s/bin:%s", T, getenv("PATH") ? getenv("PATH") : "/bin");
-    setenv("PATH", path, 1);
-    setenv("SANDBOX", T, 1);
+    const char *key = strlen(q->url) >= 5 && !strcmp(q->url + strlen(q->url) - 5, "/json") ? "json" : "main";
+    snprintf(p, sizeof p, "%s/seen.method", T);
+    wr(p, q->method ? q->method : "GET");
+    snprintf(p, sizeof p, "%s/seen.headers", T);
+    wr(p, q->headers ? q->headers : "");
+    snprintf(p, sizeof p, "%s/seen.count", T);
+    int cnt = atoi(rd(p)) + 1;
+    char cs[16];
+    snprintf(cs, sizeof cs, "%d", cnt);
+    wr(p, cs);
+
+    snprintf(p, sizeof p, "%s/rc.%s", T, key);
+    if (access(p, F_OK) == 0) { if (why) snprintf(why, wn, "заглушка: отказ"); return HTTPC_ECONNECT; }
+    int status = 200;
+    snprintf(p, sizeof p, "%s/status.%s", T, key);
+    if (access(p, F_OK) == 0) status = atoi(rd(p));
+    snprintf(p, sizeof p, "%s/rej.hdr", T);
+    if (q->headers && strstr(q->headers, "x-hwid") && access(p, F_OK) == 0) status = 403;
+    r->status = status;
+    snprintf(p, sizeof p, "%s/hdr.%s", T, key);
+    if (access(p, F_OK) == 0) {
+        char *h = strdup(rd(p));
+        size_t o = 0;
+        for (size_t i = 0; h[i]; i++) if (h[i] != '\r') h[o++] = h[i];
+        h[o] = 0;
+        r->headers = h;
+        r->headers_n = o;
+    }
+    int head = q->method && !strcmp(q->method, "HEAD");
+    if (!head && q->dest_path && status / 100 == 2) {
+        snprintf(p, sizeof p, "%s/body.%s", T, key);
+        if (access(p, F_OK) != 0) { http_resp_free(r); return HTTPC_ECONNECT; }
+        FILE *in = fopen(p, "rb"), *out = fopen(q->dest_path, "wb");
+        char buf[4096];
+        size_t n;
+        while (in && out && (n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, out);
+        if (in) fclose(in);
+        if (out) fclose(out);
+    }
+    return 0;
+}
+void http_resp_free(struct http_resp *r) {
+    free(r->headers);
+    free(r->url);
+    free(r->etag);
+    memset(r, 0, sizeof *r);
 }
 
 static void fixture(const char *key, const char *what, const char *text) {
@@ -383,7 +371,6 @@ static int call_fetch(void) { return g_rc = cmd_sub_fetch(g_url, g_out, g_info);
 static int call_quota(void) { return g_rc = cmd_sub_quota(g_url, g_info); }
 
 static void t_fetch(void) {
-    make_fake_curl();
     mkiface("eth0", "c4:41:1e:dd:ee:01", 1);
     snprintf(g_out, sizeof g_out, "%s/sub.txt", T);
     snprintf(g_info, sizeof g_info, "%s/sub.userinfo", T);
@@ -413,17 +400,21 @@ static void t_fetch(void) {
     ck_true("файл узлов на месте", strstr(rd(g_out), "vless://") != NULL);
     ck_true("остаток записан рядом", strstr(rd(g_info), "total=1000") != NULL);
 
-    /* КАК МЫ ПРЕДСТАВЛЯЕМСЯ ПАНЕЛИ. Обе проверки — про живые отказы, а не про оформление
-     * запроса. Панель за DDoS-Guard отвечает клиенту по имени `curl` кодом 200 с пустым
-     * телом (отказ, который не выглядит отказом), а панель за cookie-проверкой отвечает 302
-     * на тот же адрес и без cookie водит по кругу до предела редиректов. */
-    char up[640], seen[256];
-    snprintf(up, sizeof up, "%s/seen.ua", T);
+    /* КАК МЫ ПРЕДСТАВЛЯЕМСЯ ПАНЕЛИ. Имя в User-Agent и cookie-движок — дело клиента libsteer
+     * (httpc.c: по умолчанию «steer/<версия>», cookie на время вызова; их проверяет httpmatch.c на
+     * сокете), а здесь — что подписка ИХ НЕ ПЕРЕБИВАЕТ: чужое имя в заголовках запроса (v2rayNG,
+     * Mozilla, curl) значило бы врать панели, которая считает устройства, и получать JSON вместо
+     * списка ссылок. И что заголовки устройства ушли целиком. */
+    char up[640], seen[1024];
+    snprintf(up, sizeof up, "%s/seen.headers", T);
     snprintf(seen, sizeof seen, "%s", rd(up));
-    ck_true("движок называет себя своим именем", strncmp(seen, "steer/", 6) == 0);
-    ck_true("и не выдаёт себя за чужой клиент", !has(seen, "v2ray") && !has(seen, "Mozilla"));
-    snprintf(up, sizeof up, "%s/seen.cookies", T);
-    ck_true("cookie-движок включён", strcmp(rd(up), "yes") == 0);
+    ck_true("User-Agent подписка не ставит: имя — у клиента", !has(seen, "User-Agent") && !has(seen, "user-agent"));
+    ck_true("идентификатор устройства уходит заголовком x-hwid", has(seen, "x-hwid: splify2-"));
+    ck_true("и описание системы с моделью", has(seen, "x-device-os: OpenWrt 25.12.5") && has(seen, "x-ver-os: OpenWrt 25.12.5") &&
+                                           has(seen, "x-device-model: Xiaomi AX3000T"));
+    ck_true("заголовки разделены CRLF", has(seen, "\r\nx-device-os:"));
+    snprintf(up, sizeof up, "%s/seen.method", T);
+    ck("подписка — обычный GET", "GET", rd(up));
 
     /* Временные файлы убраны. Оставленный `.hdr` — это заголовки панели, лежащие в /etc
      * навсегда; оставленный `.tmp` — половина подписки, которую следующий запуск примет за
@@ -494,6 +485,89 @@ static void t_fetch(void) {
     ck("остаток лежит рядом с подпиской", "/etc/steer/sub.userinfo", derived);
     info_for("/etc/steer/subs/second", derived, sizeof derived);
     ck("а без «.txt» — просто рядом", "/etc/steer/subs/second.userinfo", derived);
+}
+
+/* ОТКАЗ ПАНЕЛИ НА ЗАГОЛОВКИ УСТРОЙСТВА. Защита перед панелью бывает недовольна лишним заголовком и
+ * отвечает отказом именно на них; подписка без HWID лучше никакой, но человеку об этом говорится
+ * (hwid_sent=false, а панель при заглушке — device_warn). Статус >= 400 — отказ, как у `curl -f`. */
+static void t_reject(void) {
+    snprintf(g_url, sizeof g_url, "https://panel.example/sub");
+    char p[640];
+    snprintf(p, sizeof p, "%s/seen.count", T);
+    unlink(p);
+    fixture("main", "rc", NULL);
+    fixture("main", "body", "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?"
+            "type=tcp&security=reality&sni=a.example&pbk=Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyMDA&sid=ab12#x\n");
+    fixture("main", "hdr", "HTTP/1.1 200 OK\r\n");
+    snprintf(p, sizeof p, "%s/rej.hdr", T);
+    wr(p, "");
+    char *out = cap(call_fetch);
+    ck_true("панель отвергла заголовки устройства — подписка всё же скачана", has(out, "\"ok\":true"));
+    ck_true("и сказано, что идентификатор не ушёл", has(out, "\"hwid_sent\":false"));
+    snprintf(p, sizeof p, "%s/seen.count", T);
+    ck("и было ровно два захода (с заголовками, без)", "2", rd(p));
+    snprintf(p, sizeof p, "%s/seen.headers", T);
+    ck("второй заход — без заголовков устройства", "", rd(p));
+    snprintf(p, sizeof p, "%s/rej.hdr", T);
+    unlink(p);
+
+    /* 404 и прочее >= 400 — отказ, прежний файл не тронут, временный убран. */
+    wr(g_out, "vless://прежнее\n");
+    fixture("main", "status", "404");
+    fixture("json", "status", "404");
+    out = cap(call_fetch);
+    ck_true("статус 404 — отказ", has(out, "\"ok\":false"));
+    ck_true("прежняя подписка не тронута", strstr(rd(g_out), "прежнее") != NULL);
+    snprintf(p, sizeof p, "%s.tmp", g_out);
+    ck_true("временный файл убран", access(p, F_OK) != 0);
+    fixture("main", "status", NULL);
+    fixture("json", "status", NULL);
+}
+
+/* GZIP, О КОТОРОМ НЕ ПРОСИЛИ. Панель за nginx отдаёт тело сжатым при любом запросе, и curl без
+ * --compressed кладёт в файл байты gzip: снято на живой подписке. Сжатие — настоящим gzip, а не
+ * заготовкой: и с именем файла в заголовке (FNAME), и без него, как пишет поток. */
+static void t_gzip(void) {
+    snprintf(g_url, sizeof g_url, "https://panel.example/sub");
+    const char *LINKS =
+        "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?"
+        "type=xhttp&security=reality&sni=a.example&pbk=Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyMDA&"
+        "sid=ab12&mode=stream-one&path=/xhttp#gz\n";
+    char src[512], cmd[2600];
+    snprintf(src, sizeof src, "%s/plain.txt", T);
+    wr(src, LINKS);
+    fixture("main", "hdr", "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n");
+    fixture("main", "rc", NULL);
+
+    snprintf(cmd, sizeof cmd, "gzip -c '%s' > '%s/body.main'", src, T);
+    if (system(cmd) != 0) { printf("  ПРОПУСК gzip: нет gzip на машине стенда\n"); return; }
+    char *out = cap(call_fetch);
+    ck_true("сжатое тело распаковано", has(out, "\"ok\":true") && has(out, "\"usable\":1"));
+    ck("в файле узлов — ссылки, а не gzip", LINKS, rd(g_out));
+
+    snprintf(cmd, sizeof cmd, "gzip -c < '%s' > '%s/body.main'", src, T);
+    if (system(cmd) == 0) {
+        out = cap(call_fetch);
+        ck_true("gzip без имени файла — тоже", has(out, "\"usable\":1"));
+    }
+
+    /* Обрезанный gzip — отказ, и прежняя подписка цела: половина тела — половина узлов. */
+    snprintf(cmd, sizeof cmd, "gzip -c '%s' | head -c 30 > '%s/body.main'", src, T);
+    if (system(cmd) == 0) {
+        wr(g_out, "vless://прежнее\n");
+        out = cap(call_fetch);
+        ck_true("обрезанный gzip — отказ", has(out, "\"ok\":false"));
+        ck_true("прежняя подписка не тронута", strstr(rd(g_out), "прежнее") != NULL);
+    }
+    /* Испорченная сумма в хвосте — тоже отказ. */
+    snprintf(cmd, sizeof cmd,
+             "gzip -c '%s' > '%s/z' && n=$(wc -c < '%s/z') && head -c $((n-8)) '%s/z' > '%s/body.main' && "
+             "printf '\\001\\002\\003\\004' >> '%s/body.main' && tail -c 4 '%s/z' >> '%s/body.main'",
+             src, T, T, T, T, T, T, T);
+    if (system(cmd) == 0) {
+        out = cap(call_fetch);
+        ck_true("неверный CRC-32 — отказ", has(out, "\"ok\":false"));
+    }
 }
 
 static void t_quota_cmd(void) {
@@ -664,6 +738,8 @@ int main(void) {
     t_warn();
     t_quota();
     t_fetch();
+    t_reject();
+    t_gzip();
     t_quota_cmd();
     t_device_hdrs();
     t_multi();

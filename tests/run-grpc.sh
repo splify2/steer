@@ -221,6 +221,8 @@ SPEC
         echo "run-grpc: ПРОВАЛ — туннель vl не поднялся:"; tail -8 "$W/steer-$MODE.log"; FAIL=1
         kill "$SPID" "$XPID" 2>/dev/null || true; continue; }
     ip netns exec "$NSC" ip route replace "$TARGET/32" dev vl
+    . tests/lib-redir.sh
+    redir_dev "$NSC" vl   # TCP — к слушателю модуля (R-152), как на роутере
     echo "run-grpc: туннель поднят, нагрузка $DUR с (два потока вниз, два вверх, страницы по 10/с)"
 
     rc=0

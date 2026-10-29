@@ -40,6 +40,9 @@ cleanup() {
     [ -n "$tmp" ] && rm -rf "$tmp"
 }
 trap cleanup EXIT
+# Выход без IPv6 в фикстурах — мост Telegram (kind: tgws), вид плагина tgws: каталог плагинов дерева.
+sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" >/dev/null || { echo "v6ns: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else
@@ -50,6 +53,9 @@ check() {
 wait_for() {
     i=0
     while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    # Приговор по фактическому состоянию, а не по счётчику кругов: условие, ставшее истинным в последнюю
+    # десятую секунды, иначе объявлялось бы невыполненным.
+    eval "$1" && return 0
     return 1
 }
 # Пространства-соседи: pid процесса-якоря у каждого (не через $(…): фоновый якорь держал бы
@@ -217,9 +223,8 @@ wait "$D" 2>/dev/null
 #            v6-двойник пометило поддельный адрес (набор «<канал>6»), а dnat по карте fakeip6
 #            перевёл его в настоящий, и маршрут метки увёл пакет в туннель;
 #   real-ip: получает настоящий адрес, он лежит в наборе «<канал>6» со сроком, пинг — в туннель.
-# Спека здесь v2: поддельный и настоящий IPv6 на AAAA — только у неё. Та же спека записью v1
-# (dspec.json) даёт тот же набор правил, но резолвер по ней на AAAA отвечает пустым ответом, как
-# до 1.9 (sp->dns.names_v4, spec.h) — это проверяется вторым резолвером в конце раздела.
+# Та же спека записью v1 (dspec.json) даёт тот же набор правил и те же ответы на AAAA — это
+# проверяется вторым резолвером в конце раздела.
 if command -v python3 >/dev/null 2>&1; then
     $IT ip addr add 2001:db8:7::1/128 dev t1 nodad
     $IT ip addr add 2001:db8:8::1/128 dev t1 nodad
@@ -335,7 +340,7 @@ PY
     check "explain IPv6 правила в выход без IPv6 — отбрасывается" "1" \
         "$("$BIN" explain 2001:db8:5::1 $DS 2>/dev/null | grep -c 'выход без IPv6')"
     # Спека v1 с теми же каналами: набор правил тот же до байта (с «<канал>6» и v6-двойниками),
-    # а таблица резолвера — «4» у обоих каналов, и на AAAA обоих имён ответ пустой, как до 1.9.
+    # и таблица резолвера с теми же семействами («46» у обоих каналов), и на AAAA — те же ответы.
     # Свой резолвер на своём порту и со своим каталогом состояния, рядом с первым. Сверка наборов
     # правил — в третьем, чистом каталоге: в $tmp/st уже лежит файл fake-IP, а apply засевает из
     # него карты, и разница была бы в состоянии, а не в спеке.
@@ -345,15 +350,15 @@ PY
            "$BIN" apply --dry-run --spec "$tmp/dspec.json" --state-dir "$tmp/stc" 2>/dev/null > "$tmp/r1.nft"
            cmp -s "$tmp/r1.nft" "$tmp/r2.nft" && grep -q "set ${set_f}6 {" "$tmp/r1.nft" &&
            echo same || echo differ)"
-    check "спека v1: в таблице резолвера оба канала — только IPv4" "4 4" \
+    check "спека v1: в таблице резолвера оба канала — IPv4 и IPv6" "46 46" \
         "$("$BIN" dnsd-table $D1 2>/dev/null | awk -F'|' 'NF > 4 { printf "%s%s", s, $4; s = " " }')"
     mkdir -p "$tmp/st1"
     "$BIN" dnsd $D1 --listen-port 15391 --upstream-port 15393 >"$tmp/dnsd1.out" 2>&1 & DN1=$!
     pids="$pids $DN1"
     sleep 1
-    check "спека v1: AAAA имени fake-IP — пустой ответ" "empty" \
-        "$($IC python3 "$tmp/q6.py" fd00:1::1 15391 fake.test)"
-    check "спека v1: AAAA имени real-ip — пустой ответ" "empty" \
+    check "спека v1: AAAA имени fake-IP — поддельный IPv6 из пула" "fdfe:dcba:9876::c612" \
+        "$($IC python3 "$tmp/q6.py" fd00:1::1 15391 fake.test | sed 's/:[0-9a-f]*$//')"
+    check "спека v1: AAAA имени real-ip — настоящий адрес" "2001:db8:8::1" \
         "$($IC python3 "$tmp/q6.py" fd00:1::1 15391 real.test)"
     kill "$DN" "$DN1" "$UP" 2>/dev/null
     wait "$DN" 2>/dev/null

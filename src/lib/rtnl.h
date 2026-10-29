@@ -19,7 +19,7 @@
  * Разница с `ip`, о которой надо знать: таблицы печатаются номерами, кроме local, main и
  * default (iproute2 заменил бы номер именем из rt_tables, если кто-то его завёл, — разбор к
  * этому готов в обе стороны), а маршруты таблицы отбираются здесь, а не ядром: фильтр дампа по
- * таблице (NETLINK_GET_STRICT_CHK) есть только с 4.20, а телефон бывает на 4.9 и 4.19.
+ * таблице ядро применяет только к сокету с NETLINK_GET_STRICT_CHK, а этот сокет его не ставит.
  *
  * Синхронно: ядро отвечает на запрос rtnetlink внутри того же системного вызова, ждать тут
  * нечего. Буферы статические — зовёт это только основной поток. */
@@ -29,26 +29,20 @@
 #include <stddef.h>
 #include <netinet/in.h>
 
-/* Правила IPv4 строками `ip -4 rule show`. 0 — прочитано (на живой коробке строк всегда хотя
- * бы три: правила ядра); -1 — спросить не вышло, out пуст — ровно тот признак «состояние не
- * прочитать», на который рассчитан route_facts_of. Не влезшее в n обрезается по строке. */
-int rtnl_rules_text(char *out, size_t n);
-
-/* Дамп правил IPv4 (v6 == 0) или IPv6 текстом в куче, любой длины: буфер растёт, пока дамп не
- * влезет целиком (по правилу на выход и семейство, а выходов не 16: обрезанный на 16 КиБ дамп
- * выдавал бы правила поздних выходов за снятые, и сверка перепривязывала бы их без конца).
- * NULL — спросить не вышло; иначе free() вызывающему. */
+/* Дамп правил IPv4 (v6 == 0) или IPv6 строками `ip -4 rule show`, текстом в куче, любой длины:
+ * буфер растёт, пока дамп не влезет целиком (по правилу на выход и семейство, а выходов не 16:
+ * обрезанный дамп выдавал бы правила поздних выходов за снятые, и сверка перепривязывала бы их
+ * без конца). Пустая строка — ядро не прислало ни одного правила (ядро без IPv6); NULL — спросить
+ * не вышло (ошибка или нехватка памяти), «состояние не прочитать», на что рассчитан
+ * route_facts_of. Иначе free() вызывающему. */
 char *rtnl_rules_dup(int v6);
 
-/* Маршруты IPv4 таблицы table строками `ip -4 route show table N`. 0 — прочитано (в том числе
- * пустая таблица), -1 — нет. */
-int rtnl_routes_text(int table, char *out, size_t n);
-
-/* То же для IPv6 — `ip -6 rule show` и `ip -6 route show table N` (маршрутизация IPv6 выходов,
- * docs/architecture.md, «4б»). Запрет (blackhole, unreachable, prohibit) печатается без `dev lo`,
- * который ядро приписывает ему в IPv6. Ядро без IPv6 — -1, «состояние не прочитать». */
-int rtnl_rules_text6(char *out, size_t n);
-int rtnl_routes_text6(int table, char *out, size_t n);
+/* Маршруты таблицы table строками `ip -4 route show table N` (v6 — `ip -6 route show table N`:
+ * маршрутизация IPv6 выходов, docs/architecture.md, «4б»), текстом в куче любой длины, как у
+ * rtnl_rules_dup. Пустая строка — пустая таблица; NULL — не прочитать (ядро без IPv6 тоже).
+ * Запрет (blackhole, unreachable, prohibit) в IPv6 печатается без `dev lo`, который ядро
+ * приписывает ему там. */
+char *rtnl_routes_dup(int table, int v6);
 
 /* Правило `from SRC lookup TABLE priority PRIO`: add — поставить, иначе снять. 0 или errno. */
 int rtnl_rule_from(int add, struct in_addr src, int table, int prio);
@@ -58,6 +52,16 @@ int rtnl_rule_from(int add, struct in_addr src, int table, int prio);
  * 0 или errno. Этим страж правил демона возвращает снятое снаружи правило выхода сразу, без
  * запуска ip (src/daemon/rulewd.c). */
 int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio);
+
+/* То же с выбором: add — поставить (как rtnl_rule_fwmark), иначе снять одну копию (`ip [-6] rule del
+ * fwmark MARK/MASK table TABLE [priority PRIO]`; prio 0 — первую подходящую). 0 или errno: ENOENT при
+ * снятии — копий больше нет. */
+int rtnl_rule_mark(int add, int fam, uint32_t mark, uint32_t mask, int table, int prio);
+
+/* `ip [-6] route replace [TYPE] default [dev <ifindex>] [metric METRIC] table TABLE`: fam 4 или 6,
+ * type — RTN_UNICAST (в устройство ifindex, scope link, как у iproute2 без шлюза), RTN_BLACKHOLE
+ * или RTN_PROHIBIT (устройства нет); metric 0 — не передавать (умолчание ядра). 0 или errno. */
+int rtnl_route_default(int fam, int table, int type, int ifindex, int metric);
 
 /* `ip -4 route replace default dev <ifindex> table TABLE` (scope link, как у iproute2 без
  * шлюза). 0 или errno. */
@@ -79,6 +83,13 @@ int rtnl_table_flush(int table);
  * 1 — есть, 0 — нет, -1 — спросить не вышло. */
 int rtnl_default6(void);
 
+/* Устройства маршрутов по умолчанию таблицы main, IPv4 и IPv6 (`ip route show default`, `ip -6 route
+ * show default`): cb — на каждый такой маршрут с именем устройства (одно имя может прийти дважды).
+ * Набор @wan_dev плагинов (steer-api 1.2, 5.3). 0 — спросили; -1 — спросить не вышло. */
+/* Есть ли в таблице маршрут по умолчанию IPv4 любого вида: 1 — есть, 0 — нет, -1 — netlink отказал. */
+int rtnl_table_has_default(int table);
+int rtnl_default_devs(void (*cb)(const char *dev, void *ctx), void *ctx);
+
 /* Через какое устройство ядро отправит пакет к dst — `ip route get dst`, поле dev (с учётом
  * правил, как и у iproute2). 0 — имя в dev; иначе errno, dev пуст. */
 int rtnl_route_dev(struct in_addr dst, char *dev, size_t n);
@@ -87,26 +98,27 @@ int rtnl_route_dev(struct in_addr dst, char *dev, size_t n);
  * v6donor_derive в failover.c): нуль-маршруты `unreachable P` (dst_len > 0) — их ставит netifd на
  * каждый делегированный префикс, чтобы не было петли, — и маршруты по умолчанию с источником
  * `default from P …` (src_len > 0) — их ставит netifd на префикс провайдера (sourcefilter). Адреса
- * — 16 байт в порядке сети, oif — номер устройства (0 — нет). Сколько записано (<= max) или -1. */
+ * — 16 байт в порядке сети, oif — номер устройства (0 — нет). Массив — в куче (free вызывающему;
+ * при нуле записей может быть NULL), число записей — результат, -1 — прочитать не вышло. */
 struct rtnl_route6 {
     uint8_t dst[16], src[16];
     uint8_t dst_len, src_len;
     unsigned type;
     int oif;
 };
-int rtnl_main6_routes(struct rtnl_route6 *v, size_t max);
+int rtnl_main6_routes(struct rtnl_route6 **out);
 
 /* Адреса IPv6 всех устройств — `ip -6 addr show` с признаками, которых getifaddrs не отдаёт:
  * flags — IFA_F_* (IFA_F_DEPRECATED ставится и по сроку предпочтения 0: адрес «устарел» — netifd
  * снял префикс, из которого его выдал, и новых соединений с него ядро не заводит). ifindex —
- * номер устройства. Сколько записано (<= max) или -1. Нужны diag (IPv6 от хоста): устаревший
- * адрес LAN из снятого префикса — не «адрес из префикса хоста». */
+ * номер устройства. Массив в куче и число записей — как у rtnl_main6_routes. Нужны diag (IPv6 от
+ * хоста): устаревший адрес LAN из снятого префикса — не «адрес из префикса хоста». */
 struct rtnl_addr6 {
     uint8_t a[16];
     uint8_t plen;
     int ifindex;
     uint32_t flags;
 };
-int rtnl_addrs6(struct rtnl_addr6 *v, size_t max);
+int rtnl_addrs6(struct rtnl_addr6 **out);
 
 #endif

@@ -22,10 +22,8 @@
  * Почему своя реализация, а не криптобиблиотека, которой линкуется вся расширенная сборка. Две
  * причины:
  *
- *   1. Когда это писалось, SHA-1 в mbedtls этого проекта НЕ СОБИРАЛСЯ (урезанная конфигурация
- *      без MBEDTLS_SHA1_C). У wolfSSL, которая mbedtls сменила (выпуск 1.10), SHA-1 есть — он
- *      нужен разбору сертификатов, — но за слоем src/lib/scrypto.h его нет нарочно: протоколам
- *      он не нужен ни для чего, кроме этого вывода, и вторая причина остаётся в силе.
+ *   1. SHA-1 у wolfSSL есть — он нужен разбору сертификатов, — но за слоем src/lib/scrypto.h
+ *      его нет нарочно: протоколам он не нужен ни для чего, кроме этого вывода.
  *   2. vless_proto.c — арифметика формата, без библиотек, и именно поэтому его вместе с
  *      sub.c проверяет стенд из обычного `make test`, где криптобиблиотеки нет по построению
  *      (R-014). Утащив сюда криптобиблиотеку, мы вынесли бы проверку вывода
@@ -156,10 +154,10 @@ int vless_uuid_parse(const char *s, unsigned char out[16]) {
 /* Заголовок запроса. Адрес передаётся ИМЕНЕМ, когда оно известно: так разрешение имени
  * делает сервер, и запрос не утекает наружу через локальный DNS. Для трафика из TUN имени
  * нет — там уже адрес, и передаётся он как адрес. */
-size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
-                           const char *host, const unsigned char ip4[4],
-                           uint16_t port, const char *flow,
-                           unsigned char *out, size_t cap) {
+size_t vless_build_request_a(const unsigned char uuid[16], enum vless_cmd cmd,
+                             const char *host, const unsigned char *ip, size_t ip_n,
+                             uint16_t port, const char *flow,
+                             unsigned char *out, size_t cap) {
     size_t i = 0;
     if (cap < 24) return 0;
     out[i++] = 0;                       /* версия протокола */
@@ -201,11 +199,19 @@ size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
         out[i++] = (unsigned char)hl;
         memcpy(out + i, host, hl); i += hl;
     } else {
-        if (i + 5 > cap) return 0;
-        out[i++] = VLESS_ADDR_IPV4;
-        memcpy(out + i, ip4, 4); i += 4;
+        if (ip_n != 4 && ip_n != 16) return 0;
+        if (i + 1 + ip_n > cap) return 0;
+        out[i++] = ip_n == 4 ? VLESS_ADDR_IPV4 : VLESS_ADDR_IPV6;
+        memcpy(out + i, ip, ip_n); i += ip_n;
     }
     return i;
+}
+
+size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
+                           const char *host, const unsigned char ip4[4],
+                           uint16_t port, const char *flow,
+                           unsigned char *out, size_t cap) {
+    return vless_build_request_a(uuid, cmd, host, ip4, 4, port, flow, out, cap);
 }
 
 /* Ответ: версия + длина доп. Возвращает число байт, которые надо отбросить перед
@@ -220,5 +226,25 @@ int vless_parse_response(const unsigned char *buf, size_t n, size_t *skip) {
     size_t extra = buf[1];
     if (n < 2 + extra) return VLESS_EAGAIN;
     *skip = 2 + extra;
+    return 0;
+}
+
+int vless_response_feed(struct vless_response_stream *s,
+                        const unsigned char *buf, size_t n, size_t *skip) {
+    if (!s || !skip || (!buf && n)) return VLESS_EPROTO;
+    *skip = 0;
+    if (s->done) return 0;
+    while (s->have < 2 && *skip < n) {
+        s->head[s->have++] = buf[(*skip)++];
+        if (s->head[0] != 0) return VLESS_EPROTO;
+        if (s->have == 2) s->extra_left = s->head[1];
+    }
+    if (s->have < 2) return VLESS_EAGAIN;
+    size_t take = n - *skip;
+    if (take > s->extra_left) take = s->extra_left;
+    s->extra_left -= (unsigned)take;
+    *skip += take;
+    if (s->extra_left) return VLESS_EAGAIN;
+    s->done = 1;
     return 0;
 }

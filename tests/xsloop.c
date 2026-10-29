@@ -145,6 +145,15 @@ int main(void) {
     check("MTU: хаб узнал MTU пира", 1439, p.ss.peer.mtu);
     check("MTU: пир узнала MTU хаба", 1400, p.cs.peer.mtu);
     check("версия: хаб прочитал версию пира", XS_PROTO_VER, p.ss.peer.ver);
+    /* Бит FLAG_SPLIT (I-556) едет в обе стороны, номер соединения от него не страдает. */
+    check("FLAG_SPLIT: хаб видит бит у пира", 1, xs_peer_splits(&p.ss.peer));
+    check("FLAG_SPLIT: пир видит бит у хаба", 1, xs_peer_splits(&p.cs.peer));
+    check("FLAG_SPLIT: номер соединения прежний", 0, p.ss.peer.flags & 0x07);
+    {
+        struct xs_payload old_peer = { XS_PROTO_VER, 3, 1400, 1 };
+        check("FLAG_SPLIT: прежний пир (flags без бита) — не объявил", 0, xs_peer_splits(&old_peer));
+        check("  и номер его соединения читается как раньше", 3, old_peer.flags & 0x07);
+    }
 
     /* ---- поток данных ------------------------------------------------------- */
     {

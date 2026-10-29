@@ -34,10 +34,12 @@
 set -u
 LIBS="$(cd "${LIBS:-build/libs-host}" 2>/dev/null && pwd)"
 skip() { echo "sigpipe: $1 — пропуск"; exit 0; }
-[ -x "$LIBS/steerd" ] && [ -x "$LIBS/steer-vless" ] || skip "нет раскладки libs ($LIBS, tests/libs-test.sh)"
+[ -x "$LIBS/steerd" ] && [ -x "$LIBS/plugins/vless/bin/vless" ] || skip "нет раскладки libs ($LIBS, tests/libs-test.sh)"
 BIN="$LIBS/steerd"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LD_LIBRARY_PATH="$LIBS"; export LD_LIBRARY_PATH
+# Протоколы — плагины раскладки (программы build-libs.sh, манифесты кладёт tests/libs-test.sh).
+STEER_PLUGINS_ROOT="$LIBS/plugins"; export STEER_PLUGINS_ROOT
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else
@@ -47,6 +49,9 @@ check() {
 wait_for() {
     i=0
     while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    # Приговор по фактическому состоянию, а не по счётчику кругов: условие, ставшее истинным в последнюю
+    # десятую секунды, иначе объявлялось бы невыполненным.
+    eval "$1" && return 0
     return 1
 }
 for t in nft ip python3 nsenter unshare openssl pgrep awk ss; do command -v $t >/dev/null 2>&1 || skip "$t нет"; done
@@ -141,7 +146,8 @@ ping_tunnel $TLS; check "туннель TLS отвечает до нагрузк
 ping_tunnel $NONE; check "туннель без шифрования отвечает до нагрузки" "0" "$?"
 
 # Модули — дети демона по имени бинарника; резолвер — тоже ребёнок, `steerd dnsd`.
-kids() { pgrep -P "$D" -x "$1" | sort -n | tr '\n' ' ' | sed 's/ $//'; }
+# Модуль раскладки 2.0 зовётся steer-vless, помощник плагина 2.1 по манифесту — своим именем (vless).
+kids() { { pgrep -P "$D" -x "$1"; pgrep -P "$D" -x "${1#steer-}"; } | sort -n | tr '\n' ' ' | sed 's/ $//'; }
 mods="$(kids steer-vless)"
 check "демон поднял два модуля vless" "2" "$(printf '%s\n' $mods | wc -l)"
 set -- $mods; M1="$1"; M2="${2:-0}"

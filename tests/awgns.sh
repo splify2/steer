@@ -6,8 +6,8 @@
 # Ядро здесь — ядро машины разработки, а модуль — ОБЫЧНЫЙ WireGuard: AmneziaWG на ней нет, и
 # это не недостаток стенда, а второе, что он проверяет: файл без обфускации поднимается
 # запасным модулем wireguard, а файл с обфускацией получает внятный отказ («в ядре нет модуля
-# AmneziaWG»), и устройство не создаётся. Модуль AmneziaWG и ядро телефона — tests/awg49e.sh на
-# стенде tools/vm49.
+# AmneziaWG»), и устройство не создаётся. Модуль AmneziaWG — только на ядре телефона (стенд
+# tools/vm49 хаба).
 #
 # Пир настраивается инструментом `wg`, то есть независимой реализацией протокола настройки:
 # стенд, где обе стороны настроил бы наш же код, проверял бы сам себя.
@@ -121,7 +121,10 @@ check "модуль — запасной wireguard (AmneziaWG на машине 
 check "приватный ключ на устройстве — из файла" "$(cat "$tmp/our.key")" "$(wg show nl private-key 2>/dev/null)"
 check "пир и эндпоинт" "192.0.2.2:51820" "$(wg show nl endpoints 2>/dev/null | cut -f2)"
 check "keepalive выключен (батарея)" "off" "$(wg show nl persistent-keepalive 2>/dev/null | cut -f2)"
-check "метка сокета туннеля без via" "${AWG_FWMARK:-off}" "$(wg show nl fwmark 2>/dev/null)"
+# На роутере (zapret есть) у внешних пакетов туннеля всегда бит «не твой» общему обходу, 0x40000000
+# (src/lib/sockmark.h); у сборки телефона его нет.
+zbit=0; [ "${AWG_FWMARK:-off}" = off ] && zbit=$((0x40000000))
+check "метка сокета туннеля без via" "${AWG_FWMARK:-0x40000000}" "$(wg show nl fwmark 2>/dev/null)"
 check "адрес из Address" "1" "$(ip -4 addr show dev nl | grep -c '10.77.0.2/24')"
 check "MTU по умолчанию 1420" "1" "$(ip link show nl | grep -c 'mtu 1420')"
 check "предупреждение про DNS из файла" "1" "$(printf '%s\n' "$err" | grep -c 'DNS из файла не применяется')"
@@ -246,7 +249,7 @@ uxmark="$(omark ux)"; nlmark="$(omark nl)"
 # У Android-сборки к метке цели добавлен бит «собственный трафик туннеля» (STEER_TUNNEL_BIT,
 # 0x10000000): по нему заворот DNS приложений пропускает туннель через via.
 tunbit=0; [ "${AWG_FWMARK:-off}" != off ] && tunbit=$((0x10000000))
-check "via: метка сокета туннеля — метка выхода ux" "$(printf '0x%x' "$((uxmark | tunbit))")" \
+check "via: метка сокета туннеля — метка выхода ux" "$(printf '0x%x' "$((uxmark | tunbit | zbit))")" \
       "$(wg show nl fwmark 2>/dev/null)"
 check "via: status называет цель" "1" "$(st | grep -o '"nl":{[^}]*' | grep -c '"via":"ux"')"
 ping -q -c 3 -W 2 -m "$((nlmark))" -I 10.77.0.2 198.51.100.1 >"$tmp/ping.out" 2>&1
@@ -289,11 +292,11 @@ sed -i 's/^ux .*/ux 500000 304/' "$tmp/state/registry"
 [ "${AWG_FWMARK:-off}" != off ] && sed -i 's/^ux .*/ux 1000000 304/' "$tmp/state/registry"
 "$BIN" apply $S >/dev/null 2>&1
 check "via: новая метка цели — на устройстве тем же apply" \
-      "$(printf '0x%x' "$(($(omark ux) | tunbit))")" "$(wg show nl fwmark 2>/dev/null)"
+      "$(printf '0x%x' "$(($(omark ux) | tunbit | zbit))")" "$(wg show nl fwmark 2>/dev/null)"
 check "  и она не прежняя" "1" "$([ "$(omark ux)" != "$uxmark" ] && echo 1 || echo 0)"
 
 # ---- 6b. сторож по кругу: замеры в памяти, во флеш — только перемены ---------------------
-# На телефоне сторож — `failover --loop`, каталог состояния — /data (флеш), проход — раз в минуту
+# На телефоне сторож — демон с --watch, каталог состояния — /data (флеш), проход — раз в минуту
 # и по событиям сети. Замер счётчиков туннеля (для приговора «молчит») раньше писался в
 # <state>/awg-<dev>.hs каждый проход, выбор устройств (active) — тоже каждый проход, подпись awg —
 # при каждой починке. Теперь замеры живут в памяти процесса круга (проход — автомат на его цикле
@@ -315,7 +318,7 @@ check "круг: apply двух туннелей" "0" "$?"
 rm -f "$tmp/state"/awg-*.hs
 ddmark="$(omark dd)"; ddtable="$(st | grep -o '"dd":{[^}]*' | grep -o '"table":[0-9]*' | cut -d: -f2)"
 sig0="$(stat -c %y "$tmp/state/awg-dd.sig" 2>/dev/null)"
-"$BIN" failover $S --loop 3 >"$tmp/loop.out" 2>&1 &
+"$BIN" daemon --watch --watch-period 3 --socket "$tmp/steer.sock" $S >"$tmp/loop.out" 2>&1 &
 loop=$!
 # Трафик в dd всё время круга: попытки рукопожатия растят tx, а ответа нет — rx стоит.
 ping -q -i 0.5 -c 50 -W 1 -m "$((ddmark))" -I 10.77.9.2 198.51.100.1 >/dev/null 2>&1 &

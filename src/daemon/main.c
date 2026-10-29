@@ -34,8 +34,8 @@
 
 #include "spec.h"
 #include "awg.h"
+#include "plugin.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "srsread.h"
@@ -70,17 +70,12 @@ static int ask_daemon(const char *line, const char *spec, const char *state_dir)
     return ctlcall_forward(line, spec, state_dir, 10);
 }
 
-/* Уровень в журнале — см. одноимённые макросы в failover.c и obfs.c. Метка подсистемы
- * здесь «apply»: все строки ниже пишутся при компиляции и применении спеки. Отказы
- * вызывающему (die и разбор аргументов) уровня НЕ несут и несут «steer: » — это ответ
- * тому, кто позвал, а не запись в журнал; так и записано в контракте. */
 int dnsd_main(int argc, char **argv);
-
-/* Имя таблицы правил (nft_table) — в spec.h: его спрашивает и сторож, см. failopen_mark в
- * failover.c. */
+/* steer dns-probe — проверка DNS-серверов слоем апстримов резолвера (src/dnsd/dprobe.c). */
+int dns_probe_main(int argc, char **argv);
+void dns_probe_usage_flags(FILE *f);
 
 int cmd_failover(const char *spec, int verbose);
-void probe_rule_cleanup(void);   /* failover.c */
 /* Свои флаги эти двое печатают сами — см. комментарии у объявлений. Справка по ним
  * склеивается из таблицы (что команда делает) и этих строк (чем ей управляют). */
 void dnsd_usage_flags(FILE *out);
@@ -91,13 +86,11 @@ int dnsd_sig_print(const char *spec, FILE *out);
 /* Та же таблица, которую демон шлёт резолверу трубой --table-fd (docs/architecture.md, раздел
  * 4а) — текстом в stdout, для стендов и ручной отладки. src/dnsd/tabfmt.c. */
 void tabfmt_build(const struct spec *sp, FILE *out);
-/* КОМАНДЫ МОДУЛЕЙ, КОТОРЫХ В СБОРКЕ МОЖЕТ НЕ БЫТЬ (docs/architecture.md, раздел 2, правило 3).
+/* КОМАНДЫ, КОТОРЫХ В СБОРКЕ МОЖЕТ НЕ БЫТЬ (docs/architecture.md, раздел 2, правило 3).
  *
- * Клиенты VLESS и xsteer, подписка, обфускатор, мост Telegram и служебные команды xsteer — команды
- * модулей; что с ними делает steerd (исполняет на месте в статической сборке, запускает
- * бинарник модуля или называет пакет), решает src/cli/modcmd.c, там же слабые ссылки на них и
- * контрактные тексты отказов. Здесь остался один хаб: он не модуль роутера, а отдельный архив
- * для VPS (профиль server).
+ * Модулей ядра больше нет: подкоманды протоколов и моста Telegram — плагинов (манифесты,
+ * plugin_cmd_find). Здесь остался один хаб: он не модуль роутера, а отдельный архив для VPS
+ * (профиль server).
  *
  * ЕДИНСТВЕННАЯ ПОДКОМАНДА «VLESS», КОТОРАЯ ОТВЕЧАЕТ БЕЗ МОДУЛЯ. Идентификатор роутера считает
  * src/tools/hwid.c, входящий в каждую сборку: читателей у него стало двое, и второй (телеметрия
@@ -116,15 +109,31 @@ static int no_hub(void) {
 
 int aggregate_main(int argc, char **argv);
 
+/* Менеджер плагинов (src/pluginmgr) — в steerd пакета steer-core, где есть HTTPS и проверка подписи.
+ * Статическим сборкам без криптобиблиотеки (базовая, мини-сборка tgws, хаб, телефон) его не дают:
+ * там команда отвечает отказом. */
+int pm_main(int argc, char **argv) __attribute__((weak));
+
+static int no_plugin_mgr(void) {
+    fprintf(stderr, "steer: менеджера плагинов в этой сборке нет — он в пакете steer-core\n");
+    return 2;
+}
+
 /* Роль steer-tools (docs/architecture.md, раздел 2, «Процессы»): ссылка на steerd, и под этим
  * именем движок отвечает только на инструменты — то, что не трогает ни правил, ни демона и
  * нужно человеку и управляющему слою отдельно от движка. Отличается argv[0], а не сборкой: файл
  * один, и расходиться инструментам с движком негде. */
 static const char *const TOOLS[] = {
-    "fit", "srs-read", "obfs-server", "sub-fetch", "sub-quota", "sub-hwid", "dev-id",
-    "tls-probe", "tgws-probe", "vless-nodes", "proxy-nodes", "xsteer-key", "xsteer-link", "xsteer-check",
-    "xsteer-hub", "dnsd-table", NULL,
+    "fit", "srs-read", "sub-hwid", "dev-id", "xsteer-hub", "dnsd-table", NULL,
 };
+
+/* Программы плагинов, вкомпилированные в статический бинарник (телефон; src/plugkit, PK_PROGRAM): ядро
+ * запускает их этим же бинарником с STEER_PK_BUILTIN=<id> (вкомпилированный плагин, kinds/plugin.h), а
+ * под именем <id> (ссылка bin/<id> на бинарник) он — та же программа. В раскладке пакета их нет вовсе
+ * (ссылки слабые). Имён протоколов ядро не знает: только раздел. */
+struct pk_prog;
+const struct pk_prog *pk_prog_find(const char *id) __attribute__((weak));
+int pk_prog_run(const struct pk_prog *p, int argc, char **argv) __attribute__((weak));
 
 static int tools_role(const char *argv0) {
     const char *b = strrchr(argv0, '/');
@@ -138,8 +147,18 @@ static int is_tool(const char *cmd) {
 }
 
 int main(int argc, char **argv) {
-    /* Платформа (src/platform/platform.h) — до всего остального (modcmd_platform_args, общая с
-     * модулями): от неё зависят пути по умолчанию, справка и раскладка меток. */
+    if (pk_prog_find && pk_prog_run && argv[0]) {
+        const char *bi = getenv("STEER_PK_BUILTIN");
+        const struct pk_prog *p = bi && *bi ? pk_prog_find(bi) : NULL;
+        /* Детям программы (ctl, steer) имя не передаётся: они — не она. */
+        unsetenv("STEER_PK_BUILTIN");
+        if (!p) {
+            const char *b = strrchr(argv[0], '/');
+            p = pk_prog_find(b ? b + 1 : argv[0]);
+        }
+        if (p) return pk_prog_run(p, argc, argv);
+    }
+    /* Платформа (src/platform/platform.h) — до всего остального (modcmd_platform_args): от неё зависят пути по умолчанию, справка и раскладка меток. */
     if (modcmd_platform_args(&argc, argv) != 0) return 2;
     plat();
     if (argc < 2) {
@@ -147,7 +166,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *cmd = argv[1];
-    if (tools_role(argv[0]) && !is_tool(cmd) && strcmp(cmd, "help") && strcmp(cmd, "--help") &&
+    /* Подкоманды плагинов — свои программы, правил и демона не трогают: steer-tools их отдаёт тоже. */
+    if (tools_role(argv[0]) && !is_tool(cmd) && !plugin_cmd_find(cmd) && strcmp(cmd, "help") && strcmp(cmd, "--help") &&
         strcmp(cmd, "-h") && strcmp(cmd, "version") && strcmp(cmd, "--version") &&
         strcmp(cmd, "-V")) {
         fprintf(stderr, "steer-tools: %s — не инструмент, а команда ядра: steer %s\n"
@@ -162,6 +182,13 @@ int main(int argc, char **argv) {
      * раньше получал «unknown command: --help» с кодом 2. */
     if (!strcmp(cmd, "help") || !strcmp(cmd, "--help") || !strcmp(cmd, "-h")) {
         if (argc > 2) {
+            const struct plugin_cmd *pc = plugin_cmd_find(argv[2]);
+            if (pc) {
+                printf("steer %s — %s\n", pc->name, pc->help ? pc->help : "команда плагина");
+                if (pc->usage) printf("\nИспользование:\n  steer %s %s\n", pc->name, pc->usage);
+                printf("\nКоманда плагина %s.\n", pc->owner->id);
+                return 0;
+            }
             const struct cli_cmd *c = cli_lookup(argv[2]);
             if (!c) cli_unknown(argv[2]);
             cli_help(stdout, c);
@@ -171,7 +198,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(cmd, "version") || !strcmp(cmd, "--version") || !strcmp(cmd, "-V")) {
-        cli_version(stdout);
+        if (argc > 2 && !strcmp(argv[2], "--json")) cli_version_json(stdout);
+        else cli_version(stdout);
         return 0;
     }
     /* Флаг вместо команды. Отдельная строка, потому что «нет такой команды: --spec»
@@ -188,6 +216,13 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "apply-plan")) return cmd_apply_plan(argc - 2, argv + 2);
     if (!strcmp(cmd, "apply-commit")) return cmd_apply_commit(argc - 2, argv + 2);
 
+    /* Подкоманда плагина (манифест, steer.commands): исполняется вместо этого процесса. Раньше
+     * команд ядра — имя команды ядра плагин взять не может (plugin.c, resolve_conflicts). */
+    {
+        const struct plugin_cmd *pc = plugin_cmd_find(cmd);
+        if (pc) return plugin_cmd_exec(pc, argc - 2, argv + 2);
+    }
+
     const struct cli_cmd *c = cli_lookup(cmd);
     if (!c) cli_unknown(cmd);
     /* Просьба о справке перехватывается ДО разбора, одинаково для всех команд —
@@ -196,11 +231,12 @@ int main(int argc, char **argv) {
         cli_help(stdout, c);
         /* У команд со своим разбором список флагов знает только их парсер, поэтому
          * справка склеивается из двух половин. */
-        if (c->passthru) {
+        if (c->passthru && strcmp(cmd, "plugin") != 0) {
             fputs("\nФлаги:\n", stdout);
             if (!strcmp(cmd, "fit")) aggregate_usage_flags(stdout);
             else if (!strcmp(cmd, "daemon") || !strcmp(cmd, "ctl-serve") || !strcmp(cmd, "ctl"))
                 ctl_usage_flags(stdout);
+            else if (!strcmp(cmd, "dns-probe")) dns_probe_usage_flags(stdout);
             else dnsd_usage_flags(stdout);
         }
         return 0;
@@ -210,11 +246,12 @@ int main(int argc, char **argv) {
      * Такие команды помечены в таблице как passthru и получают argv как есть. */
     if (c->passthru) {
         if (!strcmp(cmd, "fit")) return aggregate_main(argc - 1, argv + 1);
-        /* ctl-serve — прежнее имя демона: под ним его запускает сервис телефона
-         * (vendor/der, init/steerd.rc), и оно остаётся синонимом. */
+        /* ctl-serve — прежнее имя демона, синоним daemon (таблица команд, src/cli/cli.c). */
         if (!strcmp(cmd, "daemon") || !strcmp(cmd, "ctl-serve"))
             return ctl_serve_main(argc - 2, argv + 2);
         if (!strcmp(cmd, "ctl")) return ctl_client_main(argc - 2, argv + 2);
+        if (!strcmp(cmd, "dns-probe")) return dns_probe_main(argc - 2, argv + 2);
+        if (!strcmp(cmd, "plugin")) return pm_main ? pm_main(argc - 2, argv + 2) : no_plugin_mgr();
         return dnsd_main(argc - 2, argv + 2);
     }
 
@@ -234,6 +271,16 @@ int main(int argc, char **argv) {
     const char *spec = a.spec, *arg = a.npos ? a.pos[0] : NULL;
 
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, a.dry_run);
+    /* Карта nft для плагинов: таблица, базовые цепочки с приоритетами числом, слоты (steer-api.md, 5.1). */
+    /* Схема спеки v2 (docs/spec-schema.md): таблицы ключей разбора, реестры видов и плагинов. */
+    if (!strcmp(cmd, "spec-schema")) {
+        if (v2_schema_print(stdout, a.json, &e) < 0) err_die(&e);
+        return fflush(stdout) == 0 ? 0 : 1;
+    }
+    if (!strcmp(cmd, "nft-map")) {
+        plugin_nft_map(stdout, a.json);
+        return fflush(stdout) == 0 ? 0 : 1;
+    }
     /* Эти две исполняет демон, а посылает клиент steer (src/client/main.c). Сюда они доходят,
      * только если движок позвали напрямую или клиент не нашёл демона своей спеки. */
     if (!strcmp(cmd, "reload") || !strcmp(cmd, "subscribe")) {
@@ -246,7 +293,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "spec")) {
         if (strcmp(arg, "convert") != 0)
             die("steer spec понимает только convert, а не «%s»", arg);
-        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        /* Спека человека, не подготовленная: выходы, заведённые хуками плагинов, в ней не печатаются. */
+        if (load_spec_mode(spec, &cfg, &e, LOAD_HUMAN) < 0) err_die(&e);
         if ((a.json ? spec_print_v2_json(stdout, &cfg, &e) : spec_print_v2(stdout, &cfg, &e)) < 0)
             err_die(&e);
         return fflush(stdout) == 0 ? 0 : 1;
@@ -265,7 +313,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "down")) return cmd_down();
     if (!strcmp(cmd, "supervise")) return cmd_supervise(spec);
     if (!strcmp(cmd, "failover"))
-        return a.loop ? failover_loop(spec, a.verbose, a.loop) : cmd_failover(spec, a.verbose);
+        return cmd_failover(spec, a.verbose);
     /* Без демона (клиент его не нашёл или движок позван напрямую): то же, что делает демон, но с
      * памятью сторожа в файлах каталога состояния (src/daemon/fogroup.c). */
     if (!strcmp(cmd, "select")) return cmd_select(spec, a.pos[0], a.pos[1]);
@@ -284,8 +332,15 @@ int main(int argc, char **argv) {
          * давал пустой вывод и код 0, а по этому выводу init-скрипт решает, каким выходам
          * поднимать процессы. Тишина вместо отказа означала бы не поднятый туннель без
          * единой строки о причине. */
-        if (a.kind && !kind_by_name(a.kind))
-            die("--kind: нужен interface, vless, xsteer, zapret или direct, а не %s", a.kind);
+        /* plugin-device — член выхода плагина (kind: warp): в реестре видов его нет (руками в спеке
+         * не пишется), но управляющему слою устройства таких членов нужны так же, как awg, — для
+         * зоны фаервола. Виды плагинов — по имени записи реестра (vless для tunnel:vless). */
+        int kind_ok = !a.kind || kind_by_name_v2(a.kind) || !strcmp(a.kind, kind_plugin_device.name) ||
+                      !strcmp(a.kind, kind_unavail.name);
+        for (size_t pi = 0; !kind_ok && pi < plugin_kinds_n(); pi++)
+            kind_ok = !strcmp(plugin_kind_ops_at(pi)->name, a.kind);
+        if (!kind_ok)
+            die("--kind: нужен вид выхода (direct, block, interface, awg, group или вид плагина), а не %s", a.kind);
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         for (size_t i = 0; i < cfg.out_n; i++) {
             const char *k = out_kind_name(&cfg.out[i]);
@@ -313,21 +368,13 @@ int main(int argc, char **argv) {
      * находиться — резолвер не поднимался, а apply при этом ставил перенаправление
      * DNS, и каждый запрос из LAN уходил в закрытый порт. Что будет сгенерировано,
      * знает только движок, поэтому отвечает он. */
-    /* Что поднимать init-скрипту для выходов kind=zapret и kind=tgws: по строке на выход, код 0,
-     * если поднимать есть что. Что печатается и почему, — у самих видов (kinds/zapret.c,
-     * kinds/tgws.c). */
-    if (!strcmp(cmd, "zapret-instances") || !strcmp(cmd, "tgws-instances")) {
-        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
-        if (registry_assign(&cfg, &e) < 0) err_die(&e);
-        return !strcmp(cmd, "zapret-instances") ? zapret_instances(&cfg) : tgws_instances(&cfg);
-    }
     /* ХВАТИТ ЛИ РЕЗОЛВЕРУ SIGHUP. Печатает подпись таблицы каналов по текущей спеке; сам
      * резолвер положил такую же в каталог состояния при запуске. Совпали — init-скрипт
      * посылает HUP, и локальная сеть не теряет разрешение имён ни на секунду; разошлись —
      * нужен перезапуск, потому что состав каналов HUP не пересобирает.
      *
      * Отдельной командой, а не полем status: её читает оболочка построчно и сравнивает
-     * целиком, а не разбирает. Тот же довод, что у zapret-instances и needs-dnsd. */
+     * целиком, а не разбирает. Тот же довод, что у needs-dnsd. */
     if (!strcmp(cmd, "dnsd-sig")) return dnsd_sig_print(spec, stdout);
     /* Та же таблица, которую резолвер получил бы трубой --table-fd — текстом в stdout, для
      * стендов (труба вместо файла спеки) и ручной отладки. Формат — src/dnsd/tabfmt.h. */
@@ -365,13 +412,6 @@ int main(int argc, char **argv) {
     /* Хаб живёт на VPS: спека ему не нужна и не читается — там ни выходов, ни каналов, а
      * есть конфигурация звезды и порт. Прецедент тот же, что у obfs-server. */
     if (!strcmp(cmd, "xsteer-hub")) return cmd_xsteer_hub ? cmd_xsteer_hub(a.config) : no_hub();
-    /* Команды модулей (VLESS и подписка, xsteer, обфускатор, мост Telegram): на месте, если
-     * модуль слинкован в этот бинарник, иначе — запуском steer-<модуль> или отказом «нужен
-     * пакет» (src/cli/modcmd.c). */
-    {
-        int mrc = modcmd_run(cmd, argc, argv, &a, spec, arg, &cfg);
-        if (mrc != MODCMD_NONE) return mrc;
-    }
     /* Сюда попасть нельзя: имя нашлось в таблице, значит ветка для него есть. Если
      * всё-таки попали — в таблицу добавили команду и забыли про диспетчер. */
     die("команда %s объявлена, но не подключена — это ошибка в ядре steer", cmd);

@@ -588,6 +588,8 @@ int hy2_gecko_tx(void *user, const uint8_t *src, size_t n,
     return 0;
 }
 
+/* dst вмещает собранный пакет — до 8 кусков по GK_CHUNK (QUIC даёт фильтру свой буфер
+ * QC_FILTER_RX_MAX, а не слот приёма: сборка на месте писала за его границу, I-517). */
 size_t hy2_gecko_rx(void *user, uint8_t *dst, const uint8_t *src, size_t n) {
     struct hy2_gecko *g = user;
     uint8_t buf[2200];
@@ -631,4 +633,92 @@ size_t hy2_gecko_rx(void *user, uint8_t *dst, const uint8_t *src, size_t n) {
     }
     s->used = 0;
     return tot;
+}
+
+uint64_t hy2_brutal_share(uint64_t cap, unsigned n) {
+    if (!cap) return 0;
+    uint64_t s = cap / (n ? n : 1);
+    return s ? s : 1;
+}
+
+/* a * b целиком, 128 бит парой слов: на 32-битных целях __int128 нет */
+static void mul64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo) {
+    uint64_t a0 = (uint32_t)a, a1 = a >> 32;
+    uint64_t b0 = (uint32_t)b, b1 = b >> 32;
+    uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+    uint64_t mid = (p00 >> 32) + (uint32_t)p01 + (uint32_t)p10;
+    *lo = (mid << 32) | (uint32_t)p00;
+    *hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+}
+
+int hy2_worker_busy(uint64_t bytes, uint64_t ms, uint64_t share_bps) {
+    if (!bytes) return 0;
+    if (!ms) return 1;
+    /* bytes * 8000 / ms >= share_bps / 8, без деления */
+    uint64_t lh, ll, rh, rl;
+    mul64(bytes, 64000u, &lh, &ll);
+    mul64(share_bps, ms, &rh, &rl);
+    return lh > rh || (lh == rh && ll >= rl);
+}
+
+/* ---- сборка фрагментов ---- */
+
+struct hy2_rasm {
+    struct hy2_rasm *next;
+    uint64_t t;                 /* когда пришёл первый фрагмент */
+    uint32_t total;             /* сумма длин пришедших */
+    uint16_t pkt;
+    uint8_t n, got;
+    struct { uint8_t *p; uint16_t len; } fr[];
+};
+
+static void rasm_free_one(struct hy2_rasm *r) {
+    for (unsigned i = 0; i < r->n; i++) free(r->fr[i].p);
+    free(r);
+}
+
+void hy2_rasm_free(struct hy2_rasm **head) {
+    while (*head) {
+        struct hy2_rasm *r = *head;
+        *head = r->next;
+        rasm_free_one(r);
+    }
+}
+
+uint8_t *hy2_rasm_feed(struct hy2_rasm **head, const struct hy2_udp_msg *m, uint64_t now_ms, size_t pre,
+                       size_t *total) {
+    if (!m->nfrag || m->frag >= m->nfrag) return NULL;
+    struct hy2_rasm *r = NULL, **pp = head;
+    while (*pp) {
+        struct hy2_rasm *c = *pp;
+        if (c->pkt == m->pkt && c->n == m->nfrag) { r = c; pp = &c->next; continue; }
+        if (now_ms - c->t > HY2_RASM_TTL_MS) { *pp = c->next; rasm_free_one(c); continue; }
+        pp = &c->next;
+    }
+    if (!r) {
+        r = calloc(1, sizeof *r + (size_t)m->nfrag * sizeof r->fr[0]);
+        if (!r) return NULL;
+        r->t = now_ms;
+        r->pkt = m->pkt;
+        r->n = m->nfrag;
+        r->next = *head;
+        *head = r;
+    }
+    if (r->fr[m->frag].p) return NULL;                  /* повтор фрагмента */
+    r->fr[m->frag].p = malloc(m->n ? m->n : 1);
+    if (!r->fr[m->frag].p) return NULL;
+    memcpy(r->fr[m->frag].p, m->data, m->n);
+    r->fr[m->frag].len = (uint16_t)m->n;
+    r->total += (uint32_t)m->n;
+    if (++r->got < r->n) return NULL;
+    for (pp = head; *pp != r; pp = &(*pp)->next) {}
+    *pp = r->next;
+    uint8_t *blk = r->total <= 65507 ? malloc(pre + r->total) : NULL;   /* больше датаграммы UDP по IPv4 не бывает */
+    if (blk) {
+        size_t t = pre;
+        for (unsigned i = 0; i < r->n; i++) { memcpy(blk + t, r->fr[i].p, r->fr[i].len); t += r->fr[i].len; }
+        *total = r->total;
+    }
+    rasm_free_one(r);
+    return blk;
 }

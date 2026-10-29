@@ -207,6 +207,12 @@ def big(n, kind):
         # /32 через одну: соседние не сливаются в диапазон, и префиксов выходит ровно n.
         base = int(ipaddress.ip_address("10.0.0.0"))
         rules.append({"ip_cidr": [str(ipaddress.ip_address(base + 2 * i)) + "/32" for i in range(n)]})
+    if kind == "wide":
+        # Ширина вдоль пути: на каждом из 20 уровней по 35 братьев, путь по самому большому (последнему) ребёнку, обход кладёт на стек всех
+        # детей узла сразу, и к двадцатому уровню в стеке за 700 записей (I-519). Метка — один
+        # байт, так что у одного узла детей не больше 256; n здесь не используется.
+        letters = "abcdefghijklmnopqrstuvwxy0123456789"
+        rules.append({"domain": [("z" * lvl + c)[::-1] for lvl in range(20) for c in letters]})
     return rules
 
 

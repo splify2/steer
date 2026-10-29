@@ -16,6 +16,7 @@
 const struct kind_ops kind_direct;
 struct output *out_by_name(const struct spec *sp, const char *n) { (void)sp; (void)n; return NULL; }
 const struct group_cfg *out_group(const struct output *o) { (void)o; return NULL; }
+int group_carded(const struct output *o) { (void)o; return 0; }
 void conntrack_evict(unsigned mark) { (void)mark; }
 
 static int fails;

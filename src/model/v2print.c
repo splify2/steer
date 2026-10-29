@@ -23,6 +23,9 @@
 #include <unistd.h>
 
 #include "spec.h"
+#include "awg.h"
+#include "plugin.h"
+#include "ynode.h"
 #include "v2.h"
 
 /* ---- скаляры ------------------------------------------------------------------------------- */
@@ -78,7 +81,7 @@ static void fseq(struct flow *w, const char *key, const char *const *v, size_t n
 }
 
 /* Перечень из массива строк одинаковой ширины (`char (*)[stride]` спеки): без промежуточного
- * массива указателей — раньше он лежал на стеке под предельное число записей. */
+ * массива указателей. */
 static void fseq_s(struct flow *w, const char *key, const char *base, size_t stride, size_t n) {
     fk(w, key);
     fputc('[', w->f);
@@ -117,6 +120,7 @@ static void dns_up_flow(FILE *f, const struct spec *s, const struct spec_dns_up 
     if (u->out >= 0) fs(&w, "out", oname_of(oname, (size_t)u->out));
     if (u->ips_n) fseq_s(&w, "ips", u->ips[0], sizeof(u->ips[0]), u->ips_n);
     if (u->boot_n) fseq_s(&w, "bootstrap", u->boot[0], sizeof(u->boot[0]), u->boot_n);
+    if (u->frag) { fk(&w, "fragment"); fputs("true", f); }
     fputs(" }", f);
 }
 
@@ -134,8 +138,16 @@ static void name_take(struct names *ns, const char *base, const char *reserved, 
     char b[32];
     snprintf(b, sizeof(b), "%.24s", base);
     snprintf(dst, 32, "%s", b);
-    for (int k = 2; name_used(ns, dst) || (reserved && !strcmp(dst, reserved)); k++)
-        snprintf(dst, 32, "%.24s-%d", b, k % 1000);
+    /* Суффикс — полным числом, а не k % 1000: на тысяче занятых имён с общим началом остаток
+     * возвращался к уже занятым, и цикл не кончался (I-543). Основа ужимается ровно настолько,
+     * чтобы с суффиксом в 32 байта (с нулём) помещались все его цифры. */
+    for (int k = 2; name_used(ns, dst) || (reserved && !strcmp(dst, reserved)); k++) {
+        int digits = 1;
+        for (int t = k; t >= 10; t /= 10) digits++;
+        int keep = 30 - digits;                 /* 32 - ноль - дефис - цифры */
+        if (keep > 24) keep = 24;
+        snprintf(dst, 32, "%.*s-%d", keep, b, k);
+    }
     if (ns->n == ns->cap) {
         size_t nc = ns->cap ? ns->cap * 2 : 32;
         char (*nv)[32] = realloc(ns->v, nc * sizeof(*nv));
@@ -249,10 +261,67 @@ static const char *on_fail_name(enum on_fail f) {
     return f == FAIL_DIRECT ? "direct" : f == FAIL_ZAPRET ? "zapret" : "drop";
 }
 
-static void output_flow(FILE *f, const struct output *o, const struct onames *oname) {
+static void json_qstr(FILE *f, const char *s);
+
+/* Узел JSON ключей вида плагина — потоковым YAML: простой скаляр как есть, остальные строки в
+ * кавычках (строка «5» не должна стать числом). */
+static void flow_node(FILE *f, const struct ynode *n) {
+    if (n->kind == YN_SCALAR) {
+        /* Простой скаляр — как есть; строка в кавычках — без них, если читается обратно строкой
+         * (не числом и не словом YAML): «abc», «sub/x» — так, «5» и «true» — в кавычках. */
+        int plain_str = n->style != YS_PLAIN && plain_ok(n->str) &&
+                        !((n->str[0] >= '0' && n->str[0] <= '9') || n->str[0] == '+');
+        if (n->style == YS_PLAIN || plain_str) fputs(n->str, f);
+        else json_qstr(f, n->str);
+    } else if (n->kind == YN_SEQ) {
+        fputc('[', f);
+        for (size_t i = 0; i < n->len; i++) {
+            if (i) fputs(", ", f);
+            flow_node(f, ynode_at(n, i));
+        }
+        fputc(']', f);
+    } else {
+        fputs("{ ", f);
+        for (size_t i = 0; i < ynode_len(n); i++) {
+            if (i) fputs(", ", f);
+            json_qstr(f, ynode_key_at(n, i)->str);
+            fputs(": ", f);
+            flow_node(f, ynode_val_at(n, i));
+        }
+        fputs(" }", f);
+    }
+}
+
+/* Выход вида плагина (и недоступного вида — его ключи записаны как есть): вид и ключи из keys_json.
+ * Имя вида — как в манифесте: «tunnel:vless» пишется kind: tunnel, protocol: vless. */
+static void plugin_flow(struct flow *w, const struct output *o) {
+    const struct kind_ops *k = kind_of(o);
+    const char *name = k == &kind_unavail ? (o->plg.shown ? o->plg.shown : "unavail")
+                                          : k->plugin->name;
+    if (!strncmp(name, "tunnel:", 7)) {
+        fs(w, "kind", "tunnel");
+        fs(w, "protocol", name + 7);
+    } else fs(w, "kind", name);
+    char dflt[32];
+    awg_default_ifname(o->name, dflt, sizeof(dflt));
+    if (out_has_device(o) && o->device[0] && strcmp(o->device, dflt) != 0) fs(w, "device", o->device);
+    if (!o->plg.keys_json) return;
+    struct err pe = {0};
+    struct ydoc *d = ydoc_parse_buf(o->plg.keys_json, strlen(o->plg.keys_json), "keys", &pe);
+    if (!d) return;
+    const struct ynode *r = ydoc_root(d);
+    for (size_t i = 0; i < ynode_len(r); i++) {
+        fk(w, ynode_key_at(r, i)->str);
+        flow_node(w->f, ynode_val_at(r, i));
+    }
+    ydoc_free(d);
+}
+
+static void output_flow(FILE *f, const struct spec *s, const struct output *o, const struct onames *oname) {
     const struct kind_ops *k = kind_of(o);
     const struct group_cfg *g = out_group(o);
     struct flow w = { f, 0 };
+    (void)s;
     fputs("{ ", f);
     if (g) {
         static const char *const PICK[] = { "order", "latency", "manual", "balance" };
@@ -280,6 +349,8 @@ static void output_flow(FILE *f, const struct output *o, const struct onames *on
             fk(&w, "idle_timeout");
             fprintf(f, "%d", g->idle_timeout_s);
         }
+        if (g->ccsel.only_n) fseq_s(&w, "only", g->ccsel.only[0], 3, g->ccsel.only_n);
+        if (g->ccsel.cc_n) fseq_s(&w, "exclude", g->ccsel.cc[0], 3, g->ccsel.cc_n);
         int weighted = 0;
         for (size_t i = 0; i < g->members_n; i++)
             if (g->weight[i] > 1) weighted = 1;
@@ -291,48 +362,17 @@ static void output_flow(FILE *f, const struct output *o, const struct onames *on
             fputc(']', f);
         }
         if (g->pick == PICK_BALANCE && g->by != BY_CONNECTION) fs(&w, "by", group_by_name(g->by));
+    } else if (k->plugin || k == &kind_unavail) {
+        plugin_flow(&w, o);
     } else {
         struct out_keys kk;
         memset(&kk, 0, sizeof(kk));
         kk.v2 = 1;
         if (k->keys_of) k->keys_of(o, &kk);
-        if (v2_tunnel_proto(k->name)) {
-            fs(&w, "kind", "tunnel");
-            fs(&w, "protocol", k->name);
-        } else fs(&w, "kind", k->name);
+        fs(&w, "kind", k->name);
         if (out_has_device(o) && o->device[0] && !kk.device_derived) fs(&w, "device", o->device);
-        if (kk.sub_file[0]) fpath(&w, "subscription", kk.sub_file);
-        if (kk.nodes_n) {
-            fk(&w, "nodes");
-            fputc('[', f);
-            for (size_t i = 0; i < kk.nodes_n; i++) fprintf(f, "%s%d", i ? ", " : "", kk.nodes[i]);
-            fputc(']', f);
-        }
-        if (kk.transports) {
-            /* Одно имя — строкой, как в примере раздела 3 (`transport: ws`), несколько — списком
-             * в порядке имён (tcp, grpc, xhttp, ws, httpupgrade), не в порядке записи: это
-             * множество, и печать обязана быть неподвижной точкой convert. */
-            unsigned c = 0;
-            for (unsigned i = 0; i < TT_COUNT; i++) c += (kk.transports >> i) & 1u;
-            fk(&w, "transport");
-            if (c > 1) fputc('[', f);
-            for (unsigned i = 0, m = 0; i < TT_COUNT; i++)
-                if (kk.transports & (1u << i)) fprintf(f, "%s%s", m++ ? ", " : "", tunnel_transport_name(i));
-            if (c > 1) fputc(']', f);
-        }
-        if (kk.insecure) { fk(&w, "insecure"); fputs("true", f); }
-        if (kk.excl.cc_n) fseq_s(&w, "exclude", kk.excl.cc[0], 3, kk.excl.cc_n);
-        if (kk.excl.names_n) fseq(&w, "exclude_name", kk.excl.names, kk.excl.names_n);
-        /* Пул узлов туннеля — только отличное от умолчания (struct tun_pool). */
-        if (kk.pool.active > 1) { fk(&w, "active"); fprintf(f, "%d", kk.pool.active); }
-        if (kk.pool.by != BY_CONNECTION) fs(&w, "by", group_by_name(kk.pool.by));
-        if (kk.pool.interval_s) { fk(&w, "interval"); fprintf(f, "%d", kk.pool.interval_s); }
-        if (kk.pool.silence_s) { fk(&w, "silence"); fprintf(f, "%d", kk.pool.silence_s < 0 ? 0 : kk.pool.silence_s); }
         if (kk.conf[0]) fpath(&w, "conf", kk.conf);
-        if (kk.stream) { fk(&w, "stream"); fputs("true", f); }
-        if (kk.stream_port) { fk(&w, "stream_port"); fprintf(f, "%d", kk.stream_port); }
         if (kk.opts_file[0]) fpath(&w, "strategy", kk.opts_file);
-        if (kk.domain[0]) fs(&w, "domain", kk.domain);
         if (kk.obfs.on) {
             char sv[96], lv[96];
             snprintf(sv, sizeof(sv), "%s:%d", kk.obfs.server, kk.obfs.server_port);
@@ -363,8 +403,7 @@ static void output_flow(FILE *f, const struct output *o, const struct onames *on
 }
 
 /* Рабочие таблицы печати: имена всех сущностей модели — выходы (именованные и безымянные члены),
- * клиенты, списки. По числу сущностей спеки, а не на предельное число (раньше — статические
- * массивы под 16 + 64 + 64 + 64 имён). */
+ * клиенты, списки. По числу сущностей спеки, а не на предельное число. */
 struct pv2 {
     char (*oname)[32], (*cname)[32], (*lname)[32];
     unsigned char *cshow, *lshow;
@@ -425,7 +464,20 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
     for (size_t i = 0; i < s->client_n; i++)
         if (s->client[i].name[0]) { name_take(cn, s->client[i].name, "lan", cname[i]); cshow[i] = 1; }
     for (size_t i = 0; i < s->list_n; i++)
-        if (s->list[i].name[0]) { name_take(ln, s->list[i].name, "all", lname[i]); lshow[i] = 1; }
+        if (s->list[i].name[0] && !s->list[i].l4.quic_block) {
+            name_take(ln, s->list[i].name, "all", lname[i]);
+            lshow[i] = 1;
+        }
+    /* Копия списка под `quic: block` носит имя оригинала (v2.c, quic_clone) и в спеке не
+     * печатается: правило ссылается на оригинал и пишет `quic: block` само. */
+    for (size_t i = 0; i < s->list_n; i++) {
+        if (!s->list[i].name[0] || !s->list[i].l4.quic_block) continue;
+        for (size_t k = 0; k < s->list_n; k++)
+            if (lshow[k] && !strcmp(s->list[k].name, s->list[i].name)) {
+                memcpy(lname[i], lname[k], sizeof(lname[i]));
+                break;
+            }
+    }
     for (size_t r = 0; r < s->rule_n; r++) {
         const struct spec_rule *ru = &s->rule[r];
         char base[32];
@@ -439,9 +491,9 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
         for (size_t k = 0; k < ru->lists_n; k++) {
             size_t l = ru->lists[k];
             const struct spec_list *li = &s->list[l];
-            if (lshow[l]) continue;
+            if (lshow[l] || lname[l][0]) continue;
             /* «Весь трафик» без сужения — это `to: all`, списка для него не нужно. */
-            if (li->all && l4match_empty(&li->l4) && !li->srs_n && !li->prefixes_n && !li->domains_n)
+            if (li->all && l4match_plain(&li->l4) && !li->srs_n && !li->prefixes_n && !li->domains_n)
                 continue;
             name_take(ln, base, "all", lname[l]);
             lshow[l] = 1;
@@ -488,22 +540,24 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
             if (yq_len(oname[anon_order[i]]) > ow) ow = yq_len(oname[anon_order[i]]);
         fputs("\noutputs:\n", f);
         for (size_t i = 0; i < s->out_n; i++) {
+            if (out_owned_by(&s->out[i], NULL, NULL)) continue;     /* выход плагина (разворот его хука expand) — часть записи владельца */
             key_pad(f, oname[i], ow);
-            output_flow(f, &s->out[i], &onm);
+            output_flow(f, s, &s->out[i], &onm);
             fputc('\n', f);
         }
         for (size_t i = 0; i < anon_n; i++) {
             const struct output *m = spec_out(s, SPEC_ANON_BASE + (anon_order[i] - s->out_n));
             key_pad(f, oname[anon_order[i]], ow);
-            output_flow(f, m, &onm);
+            output_flow(f, s, m, &onm);
             fputc('\n', f);
         }
     }
 
     size_t named_up = 0;
     for (size_t i = 0; i < s->dns.up_n; i++) named_up += !s->dns.up[i].inl;
-    if (s->traceroute_hops || s->dns.cache || named_up || s->dns.boot_n) {
+    if (s->traceroute_hops || s->dns.mesh_clients || s->dns.cache || named_up || s->dns.boot_n) {
         fputs("\ndns:\n", f);
+        if (s->dns.mesh_clients) fputs("  mesh_clients: true\n", f);
         if (s->traceroute_hops) fputs("  traceroute_hops: true\n", f);
         if (s->dns.cache) {
             fprintf(f, "  cache: %ld\n", s->dns.cache);
@@ -549,7 +603,7 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
             if (rn) fseq(&w, "for", refs, rn);
             rn = 0;
             for (size_t k = 0; k < ru->lists_n; k++)
-                if (lshow[ru->lists[k]]) refs[rn++] = lname[ru->lists[k]];
+                if (lshow[ru->lists[k]] || lname[ru->lists[k]][0]) refs[rn++] = lname[ru->lists[k]];
             if (rn) fseq(&w, "to", refs, rn);
             else fs(&w, "to", "all");
             free(refs);
@@ -564,6 +618,9 @@ static int spec_print_v2_body(FILE *f, const struct spec *s, struct err *e, stru
                     fs(&w, "dns", du->name);
                 }
             }
+            if (ru->quic_block) fs(&w, "quic", "block");
+            if (ru->family) fs(&w, "family", ru->family == 4 ? "4" : "6");
+            if (ru->fam_block) fs(&w, "on_family_unavailable", "block");
             if (ru->dev_scope) fs(&w, "scope", "device");
             if (ru->disabled) { fk(&w, "enabled"); fputs("false", f); }
             fputs(" }\n", f);
@@ -657,7 +714,7 @@ int spec_print_v2_json(FILE *f, const struct spec *s, struct err *e) {
     int rc = spec_print_v2(m, s, e);
     if (fclose(m) != 0 && rc == 0) rc = e ? err_set(e, "недостаточно памяти для печати спеки", NULL) : -1;
     if (rc != 0) { free(buf); return rc; }
-    struct err pe = { { 0 } };
+    struct err pe = {0};
     struct ydoc *d = ydoc_parse_buf(buf, len, "spec", &pe);
     free(buf);
     if (!d) return e ? err_set(e, "печать спеки не разобралась: %s", pe.msg) : -1;

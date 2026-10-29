@@ -28,7 +28,7 @@
  * трогаем, — поэтому остаток потока остаётся верным и расшифруется у дата-центра.
  *
  * ОТКУДА НОМЕР ДЦ. Из адреса назначения (SO_ORIGINAL_DST), потому что в рукопожатии его нет.
- * Таблица ниже, её можно дополнить файлом. НЕИЗВЕСТНЫЙ АДРЕС НЕ ПЕРЕХВАТЫВАЕТСЯ: соединение
+ * Таблица ниже, её можно дополнить в настройках. НЕИЗВЕСТНЫЙ АДРЕС НЕ ПЕРЕХВАТЫВАЕТСЯ: соединение
  * просто переливается на исходный адрес как было. Увести соединение не в тот дата-центр —
  * значит сломать то, что работало, а промолчать об этом нечем: клиент получил бы ответы
  * чужого ДЦ и решил бы, что его выкинули.
@@ -58,6 +58,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <time.h>
 #include <netdb.h>
@@ -73,12 +74,16 @@
 #include "tgws.h"
 #include "tls13.h"
 #include "reality.h"
-#include "spec.h"
+#include "wipe.h"
 #include "evline.h"
 #include "thrstack.h"
 
 #define LOG_I "steer[info] tgws: "
 #define LOG_W "steer[warn] tgws: "
+
+/* Метка, по которой системный zapret пропускает пакет (DESYNC_MARK): так соединения моста наверх идут
+ * мимо обхода роутера (sock_path). Число — договор с zapret, а не поле меток ядра steer. */
+#define TG_ZAPRET_SKIP 0x40000000u
 
 /* ЖУРНАЛ — СОСТОЯНИЕ, А НЕ ПОТОК. Строка на каждое соединение (куда пошло, сколько
  * передано, «не MTProto») на живом роутере давала десятки строк в минуту: клиент Telegram
@@ -127,7 +132,7 @@ static int tg_verbose(void) {
 #define IDLE_TIMEOUT_S 300
 
 /* Домен точек веб-сокета — тот, что назван выходу в спеке (`domain`); это умолчание
- * действует, только когда его не назвали ни спека, ни STEER_TGWS_DOMAIN.
+ * действует, только когда его не назвали ни спека, ни флаг --domain пробы.
  *
  * САМ web.telegram.org МОСТ ПРОБУЕТ ВСЕГДА, но только для ДЦ2 и ДЦ4 — см. «прямо к
  * Telegram» ниже. Точки kwsN.web.telegram.org отвечают только TLS 1.2 (сертификат GoDaddy,
@@ -143,7 +148,7 @@ static int tg_verbose(void) {
  * домен самого владельца роутера, либо тот, который кто-то держит для сообщества, и
  * зашивать его в движок значило бы решать за человека, чьим каналом он пользуется.
  *
- * Умолчанием пользуется проба (tgws-probe без STEER_TGWS_DOMAIN): она говорит только
+ * Умолчанием пользуется проба (tgws-probe без --domain): она говорит только
  * TLS 1.3 и ходит по имени, так что против самого web.telegram.org она упрётся в отказ TLS —
  * проверять ею надо домен за Cloudflare. */
 #define TGWS_DOMAIN_DEFAULT "web.telegram.org"
@@ -153,18 +158,17 @@ static int tg_verbose(void) {
  * Адреса встроены в клиенты Telegram и меняются редко. Медийные ДЦ обслуживают загрузку
  * файлов и объявляются отрицательным номером — у них своя точка `kwsN-1`.
  *
- * Таблицу можно дополнить файлом (STEER_TGWS_DCMAP, по умолчанию /etc/steer/tgws-dc.conf):
- * строки вида `149.154.167.220 2` или `149.154.164.250 4 media`. Файл, а не только сборка,
- * потому что список чужой: Telegram может добавить адрес, и чинить это перевыпуском пакета
- * — заведомо медленнее, чем строкой в конфигурации. */
+ * Таблицу можно дополнить настройкой плагина dc_addresses: строки вида `149.154.167.220 2` или
+ * `149.154.164.250 4 media`. Настройка, а не только сборка, потому что список чужой: Telegram может
+ * добавить адрес, и чинить это перевыпуском плагина — заведомо медленнее, чем строкой в настройках. */
 /* Запись таблицы — АДРЕС ИЛИ ПОДСЕТЬ. Только поимённых адресов не хватило: Telegram держит
  * за одним дата-центром весь /24 и раздаёт клиентам разные адреса из него, поэтому мост,
  * знающий девять адресов, видел живого клиента и говорил «не наш дата-центр». Совпадение
  * ищется по самой длинной маске: подсеть задаёт общее правило, отдельный адрес — исключение
  * из него (в 149.154.167.0/24 живёт второй ДЦ, но .91 и .92 — четвёртый). */
 struct dc_ent { uint32_t ip; uint32_t mask; short dc; short media; };
-static struct dc_ent g_dc[128];
-static size_t g_dc_n;
+static struct dc_ent *g_dc;
+static size_t g_dc_n, g_dc_cap;
 
 /* Подсети — из объявлений Telegram, отдельные адреса — исключения внутри них. Медийные ДЦ
  * (флаг media) обслуживают загрузку файлов и имеют свою точку kwsN-1. */
@@ -210,7 +214,6 @@ static void dc_add(const char *ip, short dc, short media) {
     unsigned bits = 32;
     const char *slash = strchr(ip, '/');
 
-    if (g_dc_n >= sizeof(g_dc) / sizeof(g_dc[0])) return;
     if (slash) {
         size_t n = (size_t)(slash - ip);
         if (n >= sizeof(buf)) return;
@@ -228,6 +231,13 @@ static void dc_add(const char *ip, short dc, short media) {
         if (g_dc[i].ip == net && g_dc[i].mask == mask) {
             g_dc[i].dc = dc; g_dc[i].media = media; return;
         }
+    if (g_dc_n == g_dc_cap) {
+        size_t nc = g_dc_cap ? 2 * g_dc_cap : 64;
+        struct dc_ent *nd = realloc(g_dc, nc * sizeof(*nd));
+        if (!nd) { fprintf(stderr, LOG_W "нет памяти под таблицу ДЦ — %s пропущен\n", ip); return; }
+        g_dc = nd;
+        g_dc_cap = nc;
+    }
     g_dc[g_dc_n].ip = net;
     g_dc[g_dc_n].mask = mask;
     g_dc[g_dc_n].dc = dc;
@@ -235,30 +245,29 @@ static void dc_add(const char *ip, short dc, short media) {
     g_dc_n++;
 }
 
-static void dc_table_init(void) {
+/* Встроенная таблица и дополнение из настроек плагина (`dc_addresses`): строки вида
+ * `149.154.167.220 2` или `149.154.164.250 4 media`. Негодная строка НАЗЫВАЕТСЯ в журнале и
+ * пропускается: молча выброшенный адрес выглядел бы как «не наш дата-центр». */
+static void dc_table_init(const char *const *extra, size_t n) {
     g_dc_n = 0;
     for (size_t i = 0; i < sizeof(DC_BUILTIN) / sizeof(DC_BUILTIN[0]); i++)
         dc_add(DC_BUILTIN[i].ip, DC_BUILTIN[i].dc, DC_BUILTIN[i].media);
-
-    char dflt[512];
-    const char *path = getenv("STEER_TGWS_DCMAP");
-    if (!path) path = plat_etc_path(dflt, sizeof dflt, "tgws-dc.conf");
-    FILE *f = fopen(path, "r");
-    if (!f) return;
-    char line[128];
     size_t added = 0;
-    while (fgets(line, sizeof(line), f)) {
-        char ip[64], flag[16];
+    for (size_t i = 0; i < n; i++) {
+        char ip[64], flag[16], tail[2];
         int dc;
         flag[0] = '\0';
-        if (line[0] == '#') continue;
-        int n = sscanf(line, "%63s %d %15s", ip, &dc, flag);
-        if (n < 2 || dc < 1 || dc > 9) continue;
-        dc_add(ip, (short)dc, (short)(!strcmp(flag, "media")));
+        if (!extra[i] || extra[i][0] == '#') continue;
+        int k = sscanf(extra[i], "%63s %d %15s %1s", ip, &dc, flag, tail);
+        if (k < 2 || k > 3 || dc < 1 || (dc > 5 && dc != 203) || (k == 3 && strcmp(flag, "media"))) {
+            fprintf(stderr, LOG_W "адрес ДЦ «%s» не понят — нужно «АДРЕС[/МАСКА] НОМЕР [media]», "
+                    "номер 1..5 или 203\n", extra[i]);
+            continue;
+        }
+        dc_add(ip, (short)dc, (short)(k == 3));
         added++;
     }
-    fclose(f);
-    if (added) fprintf(stderr, LOG_I "адресов ДЦ из %s: %zu\n", path, added);
+    if (added) fprintf(stderr, LOG_I "адресов ДЦ из настроек: %zu\n", added);
 }
 
 /* Запасные домены. Точки общественные и чужие: 503 от Cloudflare приходит и на исправном
@@ -267,14 +276,12 @@ static void dc_table_init(void) {
  * переподключится через секунду, и так по кругу; снаружи это видно как
  * «подключается-отключается раз в 2-3 секунды».
  *
- * Список — файлом, а не в спеке: домены живут и умирают чаще, чем настройка роутера, и
- * обновляет его тот же набор данных, что и списки (у brb это data/tgws-domains.lst). */
-/* Потолок ВЫШЕ размера пула, а не вровень с ним. Стояло 16 при 21 домене в
- * data/tgws-domains.lst — чтение в alt_init обрывается по этому числу, и последние пять
- * строк файла мост не видел никогда. Снаружи это неотличимо от «домены кончились»:
- * пул исчерпан, а пять живых точек лежат в файле непрочитанными. */
-#define MAX_ALT 24
-static char g_alt[MAX_ALT][128];
+ * Список — в настройках плагина (`domains`), а не в спеке: домены живут и умирают чаще, чем
+ * настройка маршрутизации, и общий на все выходы моста. */
+/* Пул — сколько доменов назвал человек, без потолка: прежний потолок (16, затем 24) обрывал чтение,
+ * и последние строки списка мост не видел никогда — снаружи это неотличимо от «домены кончились». */
+#define ALT_NAME 128
+static char (*g_alt)[ALT_NAME];
 static size_t g_alt_n;
 
 /* Домен, только что ответивший 503, на минуту уходит в конец очереди.
@@ -292,10 +299,11 @@ static size_t g_alt_n;
  * может вовсе не лежать в пуле, и номер перестал что-либо значить — два разных домена
  * делили бы одну отставку, а это ровно та ошибка, которую невозможно увидеть в журнале. */
 #define ALT_COOLDOWN_S 60
-/* Вдвое: у ДЦ203 отставки свои (см. cool_key). */
-#define COOL_N (2 * (2 + MAX_ALT + 12))
-static struct { char d[128]; time_t until; } g_cool[COOL_N];
-static size_t g_cool_n;
+/* Мест — сколько доменов отставлялось (пул, домен выхода, web.telegram.org, домены карты; у ДЦ203 свои,
+ * см. cool_key): массив растёт по мере надобности, потолка нет. */
+struct cool { char d[ALT_NAME]; time_t until; };
+static struct cool *g_cool;
+static size_t g_cool_n, g_cool_cap;
 
 /* Отставки читают и пишут потоки serve, наполнитель запаса и health_report разом: без замка
  * имя и срок могли разъехаться по разным слотам. Замок берут только dom_ok_now и dom_cool. */
@@ -304,7 +312,14 @@ static pthread_mutex_t g_cool_mx = PTHREAD_MUTEX_INITIALIZER;
 static time_t *cool_slot(const char *d, int make) {
     for (size_t i = 0; i < g_cool_n; i++)
         if (!strcmp(g_cool[i].d, d)) return &g_cool[i].until;
-    if (!make || g_cool_n >= COOL_N) return NULL;
+    if (!make) return NULL;
+    if (g_cool_n == g_cool_cap) {
+        size_t nc = g_cool_cap ? 2 * g_cool_cap : 32;
+        struct cool *ng = realloc(g_cool, nc * sizeof(*ng));
+        if (!ng) return NULL;
+        g_cool = ng;
+        g_cool_cap = nc;
+    }
     snprintf(g_cool[g_cool_n].d, sizeof(g_cool[0].d), "%s", d);
     g_cool[g_cool_n].until = 0;
     return &g_cool[g_cool_n++].until;
@@ -330,9 +345,7 @@ static const char *cool_key(char *buf, size_t cap, int dc, const char *d) {
     return buf;
 }
 
-/* Мест под отставки может не хватить (доменов в карте и пуле вместе больше, чем слотов) —
- * тогда домен просто не отставляется. Это хуже, чем отставить, но лучше, чем отставить
- * ЧУЖОЙ: очередь останется честной, а лишнее рукопожатие стоит полсекунды. */
+/* Нет памяти под отставку — домен просто не отставляется: лишнее рукопожатие стоит полсекунды. */
 static void dom_cool(const char *d, time_t until) {
     pthread_mutex_lock(&g_cool_mx);
     time_t *t = cool_slot(d, 1);
@@ -340,50 +353,37 @@ static void dom_cool(const char *d, time_t until) {
     pthread_mutex_unlock(&g_cool_mx);
 }
 
-static void alt_init(void) {
-    char dflt[512];
-    const char *path = getenv("STEER_TGWS_DOMAINS");
-    if (!path) path = plat_etc_path(dflt, sizeof dflt, "tgws-domains.lst");
-    FILE *f = fopen(path, "r");
-    if (!f) return;
-    /* Слишком длинное имя НАЗЫВАЕТСЯ и пропускается, а не урезается (I-155). Урезанное имя —
-     * это домен, которого человек не писал, а в журнале дозвон в него выглядит как «точка
-     * недоступна», то есть неотличимо от честно молчащего домена. Строка длиннее буфера
-     * чтения дочитывается до конца: иначе её хвост fgets отдал бы следующей «строкой», и из
-     * одной записи получилось бы два чужих имени. */
-    char line[160];
-    unsigned lineno = 0;
-    while (g_alt_n < MAX_ALT && fgets(line, sizeof(line), f)) {
-        lineno++;
-        int overlong = 0;
-        if (!strchr(line, '\n') && !feof(f)) {
-            int c;
-            while ((c = fgetc(f)) != EOF && c != '\n') { }
-            overlong = 1;
-        }
-        char *p = line;
+/* Пул из настроек плагина (`domains`): имена по порядку предпочтения. Слишком длинное имя НАЗЫВАЕТСЯ и
+ * пропускается, а не урезается (I-155): урезанное имя — домен, которого человек не писал, а в журнале
+ * дозвон в него выглядит как «точка недоступна», то есть неотличимо от честно молчащего домена. */
+static void alt_init(const char *const *v, size_t n) {
+    free(g_alt);
+    g_alt = NULL;
+    g_alt_n = 0;
+    if (!n) return;
+    g_alt = calloc(n, sizeof(*g_alt));
+    if (!g_alt) { fprintf(stderr, LOG_W "нет памяти под запасные домены — пул пуст\n"); return; }
+    for (size_t i = 0; i < n; i++) {
+        const char *p = v[i] ? v[i] : "";
         while (*p == ' ' || *p == '\t') p++;
-        p[strcspn(p, " \t\r\n")] = '\0';
-        if (!*p || *p == '#') continue;
-        if (overlong || strlen(p) >= sizeof(g_alt[0])) {
-            fprintf(stderr, LOG_W "%s, строка %u: имя длиннее %zu байт — строка пропущена, "
-                    "исправьте её\n", path, lineno, sizeof(g_alt[0]) - 1);
+        size_t l = strcspn(p, " \t\r\n");
+        if (!l || *p == '#') continue;
+        if (l >= ALT_NAME) {
+            fprintf(stderr, LOG_W "запасной домен %zu: имя длиннее %d байт — пропущен, исправьте его\n",
+                    i + 1, ALT_NAME - 1);
             continue;
         }
-        memcpy(g_alt[g_alt_n], p, strlen(p) + 1);
+        memcpy(g_alt[g_alt_n], p, l);
+        g_alt[g_alt_n][l] = '\0';
         g_alt_n++;
     }
-    fclose(f);
     if (g_alt_n) fprintf(stderr, LOG_I "запасных доменов: %zu\n", g_alt_n);
 }
 
-/* Домен точек. Из спеки, а её может не быть (проба спеку не читает) — тогда из окружения,
- * иначе прямой. */
-static char g_domain[128];
-static void domain_init(const char *from_spec) {
-    const char *env = getenv("STEER_TGWS_DOMAIN");
-    const char *d = (from_spec && *from_spec) ? from_spec : (env && *env ? env : TGWS_DOMAIN_DEFAULT);
-    snprintf(g_domain, sizeof(g_domain), "%s", d);
+/* Домен точек: у моста — ключ domain выхода, у пробы — флаг --domain; не назван — прямой. */
+static char g_domain[ALT_NAME];
+static void domain_init(const char *d) {
+    snprintf(g_domain, sizeof(g_domain), "%s", d && *d ? d : TGWS_DOMAIN_DEFAULT);
 }
 
 /* Имена точек ДЦ в порядке предпочтения: у медийного впереди `kwsN-1`, у обычного `kwsN`.
@@ -438,9 +438,8 @@ static void tgws_hosts(int dc, int media, char out[2][160]) {
  * что и так работало, — а у медийных ДЦ это ещё и самый объёмный трафик. Способ `direct`
  * говорит мосту не перехватывать такой ДЦ.
  *
- * ФАЙЛОМ, А НЕ В СПЕКЕ, по той же причине, что и пул запасных: карта — это РЕЗУЛЬТАТ ЗАМЕРА,
- * он живёт минутами и переписывается подбором, а спека — настройка человека. Смешать их
- * значило бы переписывать настройку замером.
+ * В НАСТРОЙКАХ ПЛАГИНА (`routes`), А НЕ В СПЕКЕ, по той же причине, что и пул запасных: карта —
+ * свойство провайдера и доменов, а не маршрутизации, и общая на все выходы моста.
  *
  * Формат — строка на дата-центр:
  *
@@ -452,7 +451,15 @@ static void tgws_hosts(int dc, int media, char out[2][160]) {
 #define ROUTE_N 20              /* индекс dc*2+media, ДЦ 1..9 */
 enum { RT_AUTO = 0, RT_WS, RT_DIRECT };
 struct dc_route { char domain[128]; unsigned char how; };
-static struct dc_route g_route[ROUTE_N];
+/* Карта настроек (`routes`) и действующая карта. Действующую читают потоки соединений без замка, а
+ * подбор (tgws_route_pick) меняет её на ходу: он собирает НОВУЮ таблицу и подменяет указатель одним
+ * атомарным сохранением. Прежняя таблица не освобождается — поток соединения мог взять из неё строку
+ * домена и ещё дозванивается; подбор публикует таблицу только при изменившемся ответе, так что за
+ * сутки это единицы таблиц по 2,6 КБ. */
+static struct dc_route g_route_set[ROUTE_N];
+static time_t g_direct_bad[ROUTE_N];   /* отставка прямого пути (route_direct_failed, ниже) */
+static struct dc_route *_Atomic g_rt = g_route_set;
+#define g_route (atomic_load_explicit(&g_rt, memory_order_acquire))
 
 static int route_idx(int dc, int media) {
     /* ДЦ203 — в свободную ячейку 9: ему нужны своя строка в журнале переключений и своё
@@ -462,39 +469,63 @@ static int route_idx(int dc, int media) {
     return dc * 2 + (media ? 1 : 0);
 }
 
-static void route_init(void) {
-    memset(g_route, 0, sizeof(g_route));
-    char dflt[512];
-    const char *path = getenv("STEER_TGWS_ROUTE");
-    if (!path) path = plat_etc_path(dflt, sizeof dflt, "tgws-route.conf");
-    FILE *f = fopen(path, "r");
-    if (!f) return;
-    char line[224];
+/* Строки карты v → таблица t. only_auto — заполнять только ячейки, о которых t молчит (подбор не
+ * перебивает пути, заданные человеком в настройках). Число принятых строк. */
+static size_t route_parse(struct dc_route *t, const char *const *v, size_t cnt, int only_auto) {
     size_t n = 0;
-    while (fgets(line, sizeof(line), f)) {
-        char who[16], how[16], dom[128];
+    for (size_t li = 0; li < cnt; li++) {
+        char who[16], how[16], dom[ALT_NAME], tail[2];
+        const char *line = v[li] ? v[li] : "";
         if (line[0] == '#') continue;
         dom[0] = '\0';
-        int k = sscanf(line, "%15s %15s %127s", who, how, dom);
-        if (k < 2) continue;
+        int k = sscanf(line, "%15s %15s %127s %1s", who, how, dom, tail);
         /* Медийный ДЦ пишется буквой m у номера — «2m». Отдельным столбцом это было бы
          * поле, которое почти всегда пусто, а у медийного ДЦ и путь, и домен свои. */
-        size_t wl = strlen(who);
+        size_t wl = k >= 1 ? strlen(who) : 0;
         int media = 0;
         if (wl && (who[wl - 1] == 'm' || who[wl - 1] == 'M')) { media = 1; who[wl - 1] = '\0'; }
-        int i = route_idx(atoi(who), media);
-        if (i < 0) continue;
-        if (!strcmp(how, "direct")) {
-            g_route[i].how = RT_DIRECT;
-            g_route[i].domain[0] = '\0';
-        } else if (!strcmp(how, "ws") && dom[0]) {
-            g_route[i].how = RT_WS;
-            snprintf(g_route[i].domain, sizeof(g_route[0].domain), "%s", dom);
-        } else continue;
+        char *we = NULL;
+        long dcn = k >= 1 ? strtol(who, &we, 10) : 0;
+        int okdc = k >= 2 && we && !*we && we != who && ((dcn >= 1 && dcn <= 5) || dcn == 203);
+        int i = okdc ? route_idx((int)dcn, media) : -1;
+        if (i >= 0 && only_auto && t[i].how != RT_AUTO) continue;
+        if (i >= 0 && k == 2 && !strcmp(how, "direct")) {
+            t[i].how = RT_DIRECT;
+            t[i].domain[0] = '\0';
+        } else if (i >= 0 && k == 3 && !strcmp(how, "ws")) {
+            t[i].how = RT_WS;
+            snprintf(t[i].domain, sizeof(t[0].domain), "%s", dom);
+        } else {
+            /* Негодная строка называется: молча пропущенная, она выглядела бы как «карта не действует». */
+            fprintf(stderr, LOG_W "путь ДЦ «%s» не понят — нужно «НОМЕР[m] direct» или «НОМЕР[m] ws ДОМЕН»\n", line);
+            continue;
+        }
         n++;
     }
-    fclose(f);
-    if (n) fprintf(stderr, LOG_I "карта дата-центров из %s: %zu строк\n", path, n);
+    return n;
+}
+
+static void route_init(const char *const *v, size_t cnt) {
+    memset(g_route_set, 0, sizeof(g_route_set));
+    size_t n = route_parse(g_route_set, v, cnt, 0);
+    atomic_store_explicit(&g_rt, g_route_set, memory_order_release);
+    if (n) fprintf(stderr, LOG_I "путей ДЦ из настроек: %zu\n", n);
+}
+
+int tgws_route_pick(const char *const *v, size_t cnt) {
+    struct dc_route t[ROUTE_N];
+    memcpy(t, g_route_set, sizeof(t));
+    route_parse(t, v, cnt, 1);
+    const struct dc_route *cur = g_route;
+    if (!memcmp(t, cur, sizeof(t))) return 0;
+    struct dc_route *nt = malloc(sizeof(t));
+    if (!nt) return -1;
+    memcpy(nt, t, sizeof(t));
+    atomic_store_explicit(&g_rt, nt, memory_order_release);
+    /* Прямой путь, который подбор только что подтвердил, — не в отставке. */
+    for (int i = 0; i < ROUTE_N; i++)
+        if (nt[i].how == RT_DIRECT && cur[i].how != RT_DIRECT) g_direct_bad[i] = 0;
+    return 1;
 }
 
 /* Домен этого ДЦ по карте; NULL — карта про него молчит, значит общий порядок.
@@ -503,7 +534,7 @@ static void route_init(void) {
  * самой массовой жалобы выборки — «картинки и файлы в Telegram не грузятся».
  *
  * Подбор обещает каждому дата-центру свой домен, но медийную точку он меряет только у ДЦ2
- * (см. brb/tgws, шаг подбора): у медийных ДЦ 1, 3, 4, 5 строки в карте не появляется вовсе.
+ * (прежний подбор stgws): у медийных ДЦ 1, 3, 4, 5 строки в карте не появляется вовсе.
  * Запасного хода здесь не было, route_domain возвращал NULL, и мост откатывался к общему
  * домену — то есть ровно к поведению ДО починки, только теперь на самом объёмном трафике.
  * Это же объясняет асимметрию «на ПК стабильно, на телефоне ни в какую»: телефон чаще ходит
@@ -540,7 +571,6 @@ static const char *route_domain(int dc, int media) {
  * соединении (см. direct_prove), а неудача записывается сюда: следующие несколько минут этот
  * ДЦ идёт в мост без попытки, чтобы не платить ожиданием на каждом соединении. */
 #define DIRECT_BAD_S 300
-static time_t g_direct_bad[ROUTE_N];
 
 static int route_direct_now(int dc, int media, time_t now) {
     int i = route_idx(dc, media);
@@ -1019,55 +1049,44 @@ static void ws_consume(struct ws_rx *rx, size_t used) {
  * Туннель, к которому не вышло даже TCP, отставляется на WARP_BAD_S: он лёг, и платить
  * тайм-аутом за каждое соединение незачем.
  *
- * СПИСОК ТУННЕЛЕЙ — ФАЙЛОМ (STEER_TGWS_WARP, по умолчанию /etc/stgws/warp.lst): имена
- * интерфейсов по строке. Пишет его тот, кто туннели поднимает (Zapret Manager), и туннели в
- * российских колониях туда не кладёт: выход у них внутри страны. Файл перечитывается, когда
- * меняется, — перезапускать мост ради новой точки входа не нужно. Нет файла — нет WARP. */
-#define WARP_MAX   4
+ * СПИСОК ТУННЕЛЕЙ — В НАСТРОЙКАХ ПЛАГИНА (`warp`): имена интерфейсов по порядку предпочтения; туннели
+ * в российских колониях туда не кладут — выход у них внутри страны. Поднят ли туннель, мост смотрит
+ * на каждом соединении (/sys/class/net), так что лёгший и вернувшийся туннель перезапуска не требует.
+ * Пусто — нет WARP. */
 #define WARP_BAD_S 30
-static char g_warp[WARP_MAX][IFNAMSIZ];
+static char (*g_warp)[IFNAMSIZ];
 static size_t g_warp_n;
-static time_t g_warp_bad[WARP_MAX];
-static time_t g_warp_mtime;
-static time_t g_warp_checked;
+static time_t *g_warp_bad;
 static pthread_mutex_t g_warp_mx = PTHREAD_MUTEX_INITIALIZER;
 
-static void warp_reload_locked(time_t now) {
-    if (now == g_warp_checked) return;
-    g_warp_checked = now;
-    const char *path = getenv("STEER_TGWS_WARP");
-    if (!path) path = "/etc/stgws/warp.lst";
-    struct stat sb;
-    if (stat(path, &sb) != 0) { g_warp_n = 0; g_warp_mtime = 0; return; }
-    if (sb.st_mtime == g_warp_mtime && g_warp_n) return;
-    FILE *f = fopen(path, "r");
-    if (!f) { g_warp_n = 0; return; }
-    char line[64];
-    size_t n = 0;
-    while (n < WARP_MAX && fgets(line, sizeof(line), f)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        p[strcspn(p, " \t\r\n")] = '\0';
-        if (!*p || *p == '#' || strlen(p) >= IFNAMSIZ) continue;
-        memcpy(g_warp[n], p, strlen(p) + 1);
-        g_warp_bad[n] = 0;
-        n++;
+static void warp_init(const char *const *v, size_t n) {
+    free(g_warp);
+    free(g_warp_bad);
+    g_warp = NULL;
+    g_warp_bad = NULL;
+    g_warp_n = 0;
+    if (!n) return;
+    g_warp = calloc(n, sizeof(*g_warp));
+    g_warp_bad = calloc(n, sizeof(*g_warp_bad));
+    if (!g_warp || !g_warp_bad) { fprintf(stderr, LOG_W "нет памяти под туннели WARP — без WARP\n"); return; }
+    for (size_t i = 0; i < n; i++) {
+        const char *p = v[i] ? v[i] : "";
+        if (!*p || *p == '#') continue;
+        if (strlen(p) >= IFNAMSIZ || strpbrk(p, " \t/")) {
+            fprintf(stderr, LOG_W "туннель WARP «%s»: такого имени интерфейса не бывает — пропущен\n", p);
+            continue;
+        }
+        memcpy(g_warp[g_warp_n++], p, strlen(p) + 1);
     }
-    fclose(f);
-    if (n != g_warp_n || sb.st_mtime != g_warp_mtime)
-        fprintf(stderr, LOG_I "WARP: туннелей для моста %zu\n", n);
-    g_warp_n = n;
-    g_warp_mtime = sb.st_mtime;
+    fprintf(stderr, LOG_I "WARP: туннелей для моста %zu\n", g_warp_n);
 }
 
 /* Туннель для очередного соединения: первый поднятый и не отставленный. NULL — идём без WARP.
- * Возвращает указатель в g_warp: имена меняются только при перечитывании файла, а оно
- * случается не чаще раза в секунду — за это время соединение имя уже прочитало. */
+ * Возвращает указатель в g_warp: список задаётся при запуске и дальше не меняется. */
 static const char *warp_dev_now(void) {
     time_t now = time(NULL);
     const char *dev = NULL;
     pthread_mutex_lock(&g_warp_mx);
-    warp_reload_locked(now);
     for (size_t i = 0; i < g_warp_n && !dev; i++) {
         if (g_warp_bad[i] > now) continue;
         char sys[64];
@@ -1113,7 +1132,7 @@ static void sock_path(int fd, const char *via) {
      * ответа на TLS ко всем доменам пула, и не грузилось всё, что лежит в ДЦ1, 3, 5 и 203.
      * Домены пула для того и подобраны, чтобы открываться без ухищрений; tg-ws-proxy ходит
      * к ним тоже без обхода. Метка — та, по которой zapret пропускает пакет (DESYNC_MARK). */
-    unsigned mk = ZAPRET_SKIP_MARK;
+    unsigned mk = TG_ZAPRET_SKIP;           /* и на телефоне: мост там тоже бывает рядом с обходом */
     setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
 }
 
@@ -1188,6 +1207,8 @@ static int tls_start(struct upstream *u, const char *sni) {
     if (up_write(u, hello, hello_n) < 0) { g_tls_rc = -102; return -1; }
     memset(&u->tls, 0, sizeof(u->tls));
     g_tls_rc = tls13_handshake(&u->tls, u->fd, hello, hello_n, priv);
+    steer_wipe(priv, sizeof(priv));         /* эфемерный ключ нужен только до конца рукопожатия */
+    steer_wipe(&st, sizeof(st));
     /* На отказе освобождаем здесь, а не у вызывающих: tls_on ещё ноль, и их ветки отказа
      * ключей не трогают. Отказ рукопожатия бывает и после разворота ключа записи (tls13.c:
      * ключ чтения не развернулся), и тогда контекст AEAD оставался бы выделенным (I-197).
@@ -1462,13 +1483,9 @@ struct pump_stat {
 static void keepalive_on(int fd) {
     int one = 1, idle = 240, intvl = 30, cnt = 4;
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-#ifdef TCP_KEEPIDLE
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
-#else
-    (void)idle; (void)intvl; (void)cnt;
-#endif
 }
 
 /* Монотонные миллисекунды: срок затишья не должен сдвигаться от перевода часов роутера —
@@ -1843,14 +1860,14 @@ static int dial_core(short dc, short media, struct upstream *u_out,
     char epbuf[160];
     /* Домены по порядку: свой, потом запасные. Больше трёх не пробуем — человек ждёт
      * соединения, а не полного обхода списка. */
-    const char *doms[2 + MAX_ALT];
+    const char *doms[3];
     size_t dom_n = 0;
     time_t now = time(NULL);
 
     /* ПОРЯДОК: САМЫЙ БЫСТРЫЙ ИЗ ТЕХ, КТО НЕ В ОТКАЗЕ.
      *
      * Список приходит упорядоченным — сначала домены, у которых отвечает больше точек и
-     * меньше круг (см. `tgws pick`). Отсюда правило: берём первый не отставленный, а домен,
+     * меньше круг). Отсюда правило: берём первый не отставленный, а домен,
      * ответивший 503, отходит в сторону на минуту, и нагрузка сама перетекает к следующему.
      *
      * Круговая раздача, которая была здесь до этого, оказалась хуже с обеих сторон: по кругу
@@ -1864,7 +1881,7 @@ static int dial_core(short dc, short media, struct upstream *u_out,
     /* ПЕРВЫМ ИДЁТ ДОМЕН ЭТОГО ДАТА-ЦЕНТРА, а не общий. Карта — результат замера именно по
      * этому ДЦ (см. route_init), и общий домен, выбранный как лучший в среднем, у него может
      * не отвечать вовсе. Общий остаётся вторым: он проверен хотя бы где-то. */
-    const char *all[3 + MAX_ALT];
+    const char *all[3 + g_alt_n];
     size_t all_n = 0;
     /* ДЦ203 своих точек apiws не имеет и ходит точками ДЦ2 — но ТОЛЬКО через чужие домены.
      * Точка веб-клиента Telegram (149.154.167.220) его не обслуживает: клиент получал там
@@ -1875,7 +1892,7 @@ static int dial_core(short dc, short media, struct upstream *u_out,
     const char *pref = route_domain(wdc, media);
     if (pref) all[all_n++] = pref;
     if (!pref || strcmp(pref, g_domain)) all[all_n++] = g_domain;
-    for (size_t i = 0; i < g_alt_n && all_n < 3 + MAX_ALT; i++) {
+    for (size_t i = 0; i < g_alt_n; i++) {
         int dup = 0;
         for (size_t k = 0; k < all_n; k++) if (!strcmp(all[k], g_alt[i])) dup = 1;
         if (!dup) all[all_n++] = g_alt[i];
@@ -2077,6 +2094,20 @@ static int warm_take(short dc, short media, struct upstream *u_out, char *sni, s
     }
     pthread_mutex_unlock(&g_warm_mx);
     return got;
+}
+
+/* Не закрыл ли пир соединение, пока оно лежало в запасе. Запись в сокет, чей пир прислал FIN,
+ * УДАЁТСЯ — ошибка придёт только на следующей, — поэтому одной проверки `ws_send() < 0` мало:
+ * аккуратно закрытое точкой (край Cloudflare закрывает веб-сокеты сам при переработке)
+ * уезжало клиенту как живое и давало молчание мессенджера (I-195). Спрашиваем сокет: на
+ * покое, пока мы ничего не слали, читать там нечего — любой ввод (close-кадр, alert TLS, EOF)
+ * или RDHUP значит, что соединение отдавать нельзя. Лишний ping от точки даст ложное «мертво»
+ * и один повторный дозвон — дешевле, чем отдать мёртвое. */
+static int up_peer_gone(const struct upstream *u) {
+    struct pollfd p = { .fd = u->fd, .events = POLLIN | POLLRDHUP, .revents = 0 };
+    if (u->tls_on && tls13_has_record(&u->tls)) return 1;       /* уже прочитанное в буфере */
+    if (poll(&p, 1, 0) < 0) return 0;                           /* не знаем — решит ws_send */
+    return (p.revents & (POLLIN | POLLRDHUP | POLLHUP | POLLERR)) != 0;
 }
 
 /* ОДИН ПРОХОД наполнителя: убрать тухлые слоты, добрать недостающее. Возвращает число
@@ -2461,7 +2492,7 @@ static void *serve(void *arg) {
     u.fd = -1;
     if (warm_take(dc, media, &u, sni_buf, sizeof(sni_buf))) {
         from_warm = 1;
-        if (ws_send(&u, hs, HS_LEN) < 0) {
+        if (up_peer_gone(&u) || ws_send(&u, hs, HS_LEN) < 0) {
             up_drop(&u);
             from_warm = 0;
         }
@@ -2594,7 +2625,7 @@ static int probe_send(struct upstream *u, struct obf *o,
  *
  * Берутся только точные записи таблицы (маска /32): подсеть адресом не является, и стучаться
  * в её нулевой адрес значило бы проверять не то. Точная запись есть у каждого ДЦ, а
- * дополнить их можно тем же файлом, что и остальную таблицу (STEER_TGWS_DCMAP) — списка,
+ * дополнить их можно тем же, что и остальную таблицу (настройка dc_addresses) — списка,
  * который нельзя поправить на месте, здесь нет. */
 static uint32_t dc_repr(int dc) {
     for (size_t i = 0; i < g_dc_n; i++)
@@ -2612,7 +2643,6 @@ static uint32_t dc_repr(int dc) {
  *
  * 0 — дата-центр отвечает напрямую (значит его можно не перехватывать вовсе). */
 static int probe_direct(int dc, int media, int timeout_s) {
-    dc_table_init();
     uint32_t ip = dc_repr(dc);
     if (!ip) { printf("итог:       точного адреса ДЦ%d в таблице нет\n", dc); return 2; }
 
@@ -2701,7 +2731,7 @@ out:
     return rc;
 }
 
-int cmd_tgws_probe(int dc, int media, int direct, int timeout_s) {
+int tgws_probe(const struct tgws_opts *opt, int dc, int media, int direct, int timeout_s) {
     /* Номера — те, что бывают у Telegram: 1..5 и 203 (его точка у доменов пула — kws203).
      * Прежде принимались 1..9 при подсказке «1..5»: проба в ДЦ6..9 стучалась в несуществующее
      * kwsN, а 203, который мост обслуживает, проверить было нельзя вовсе. */
@@ -2710,10 +2740,11 @@ int cmd_tgws_probe(int dc, int media, int direct, int timeout_s) {
         return 2;
     }
     if (timeout_s <= 0) timeout_s = UP_TIMEOUT_S;
+    dc_table_init(opt->dc, opt->dc_n);
     if (direct) return probe_direct(dc, media, timeout_s);
-    domain_init(NULL);
+    domain_init(opt->domain);
 
-    char cand[2][160], host[160];
+    char cand[2][160], host[sizeof(cand)];
     const char *port = "443";
     const char *ep = getenv("STEER_TGWS_ENDPOINT");
     tgws_hosts(dc, media, cand);
@@ -2856,35 +2887,18 @@ bad:
 
 /* ---- служба ------------------------------------------------------------------------- */
 
-int cmd_tgws(const char *spec, const char *name) {
-    evline_open();
+int tgws_serve(const struct tgws_opts *opt) {
+    const char *name = opt->name;
     if (!name || !*name) { fprintf(stderr, LOG_W "нужно имя выхода\n"); return 2; }
-    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec/registry_assign.
-     *
-     * Спека — значение (правило 6, раздел 2): свой экземпляр у этой точки входа. */
-    static struct spec cfg;
-    struct err e = {0};
-    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
-    if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    if (opt->port <= 0 || opt->port > 65535) { fprintf(stderr, LOG_W "%s: ядро не выдало порт моста\n", name); return 2; }
+    if (opt->verbose) g_verbose = 1;
 
-    const struct output *o = NULL;
-    for (size_t i = 0; i < cfg.out_n; i++)
-        if (!strcmp(cfg.out[i].name, name)) { o = &cfg.out[i]; break; }
-    if (!o) { fprintf(stderr, LOG_W "нет выхода %s\n", name); return 2; }
-    /* Настройку своего выхода спрашиваем у вида: не tgws — не наш. */
-    const struct tgws_cfg *tc = out_tgws(o);
-    if (!tc) {
-        fprintf(stderr, LOG_W "выход %s не kind=tgws\n", name);
-        return 2;
-    }
-
-    dc_table_init();
-    domain_init(tc->domain);
-    alt_init();
-    route_init();
-    (void)warp_dev_now();   /* строка «WARP: туннелей для моста N» при запуске */
-    int port = out_tgws_port(o);
+    dc_table_init(opt->dc, opt->dc_n);
+    domain_init(opt->domain);
+    alt_init(opt->alt, opt->alt_n);
+    route_init(opt->route, opt->route_n);
+    warp_init(opt->warp, opt->warp_n);
+    int port = opt->port;
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {

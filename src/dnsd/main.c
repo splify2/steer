@@ -58,7 +58,7 @@
 static int cmd_match(const char *path, const char *host) {
     struct ruleset rs = {0};
     if (load_rules(path, &rs) != 0) {
-        fprintf(stderr, "cannot read rules file: %s\n", path);
+        fprintf(stderr, "не прочитать файл правил: %s\n", path);
         return 2;
     }
     int m = ruleset_match(&rs, host);
@@ -187,6 +187,8 @@ void dnsd_usage_flags(FILE *out) {
           "                           заменяет текущую без перезапуска\n"
           "  --ca-file ФАЙЛ           корни для проверки сертификата апстримов DoT и DoH вместо\n"
           "                           системных (для стендов)\n"
+          "  --fakeip-idle СЕК        имя без вопросов дольше СЕК и без живых соединений\n"
+          "                           возвращает адрес пула fake-IP (по умолчанию 1800)\n"
           "  --orphan-timeout СЕК     труба таблицы закрылась (демона нет) — отвечать по\n"
           "                           последней таблице и ждать нового демона СЕК секунд\n"
           "                           (по умолчанию 60; 0 — выйти сразу)\n"
@@ -232,6 +234,8 @@ int dnsd_main(int argc, char **argv) {
             g_table_fd = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--orphan-timeout") == 0 && i + 1 < argc) {
             g_orphan_sec = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--fakeip-idle") == 0 && i + 1 < argc) {
+            g_fakeip_idle = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ca-file") == 0 && i + 1 < argc) {
             g_dup_ca_file = argv[++i];
         } else if (strcmp(argv[i], "--fakeip-state") == 0 && i + 1 < argc) {
@@ -248,22 +252,12 @@ int dnsd_main(int argc, char **argv) {
         }
     }
 
-    /* Раскладка — та же проба, что у apply, и тем же ответом: наборы и карту резолвер находит
-     * по именам, и искать их не в той таблице значило бы наполнять пустоту. Спрашивается у
-     * ядра, а не у файла, который оставил apply: резолвер поднимается и раньше первого apply
-     * (загрузка), и ответ ядра от порядка запуска не зависит. Имя таблицы — своё у сборки
-     * (nft_table), как у всего остального движка. Спеки эта проба не касается вовсе — делается
-     * до ветки ниже и одинаково для обоих источников таблицы каналов. */
+    /* Наборы и карты fake-IP — в таблице inet движка. Имя таблицы — своё у сборки (nft_table), как
+     * у всего остального движка. */
     {
-        static char sets_tbl[64], map_tbl[64], map6_tbl[64];
-        int legacy = nft_compat() & NFTC_LEGACY;
+        static char sets_tbl[64];
         snprintf(sets_tbl, sizeof(sets_tbl), "inet %s", nft_table());
-        snprintf(map_tbl, sizeof(map_tbl), "%s %s", legacy ? "ip" : "inet", nft_table());
-        snprintf(map6_tbl, sizeof(map6_tbl), "%s %s", legacy ? "ip6" : "inet", nft_table());
         g_nft_table = sets_tbl;
-        g_nft_map_table = map_tbl;
-        g_nft_map6_table = map6_tbl;
-        g_nft_sets_interval = !legacy;
     }
 
     /* --table-fd: демон уже прочитал спеку и построил таблицу каналов сам (docs/architecture.md,
@@ -321,16 +315,16 @@ int dnsd_main(int argc, char **argv) {
     if (!g_dch_n) {
         if (g_table_fd >= 0)
             fprintf(stderr, "steer dnsd: таблица от демона без доменных каналов — "
-                            "forwarding only, no domain routing\n");
+                            "только пересылка, домены по правилам не разбираются\n");
         else
-            fprintf(stderr, "steer dnsd: no channel in %s matches domains — "
-                            "forwarding only, no domain routing\n", spec);
+            fprintf(stderr, "steer dnsd: в %s нет доменных каналов — "
+                            "только пересылка, домены по правилам не разбираются\n", spec);
     }
     if (!g_fakeip_state_path) {
         static char st[PATH_MAX];
         int need = snprintf(st, sizeof(st), "%s/fakeip.state", steer_state_dir());
         if (need < 0 || (size_t)need >= sizeof(st)) {
-            fprintf(stderr, "steer dnsd: --state-dir too long, no room for fakeip.state\n");
+            fprintf(stderr, "steer dnsd: путь --state-dir слишком длинный, fakeip.state не поместится\n");
             return 1;
         }
         g_fakeip_state_path = st;

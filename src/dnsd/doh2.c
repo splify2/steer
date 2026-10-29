@@ -144,7 +144,7 @@ static int status_huff(const uint8_t *p, size_t n) {
     return digits == 3 ? v : -1;
 }
 
-static int status_of_value(const uint8_t *p, size_t n, int huff) {
+int h2d_status_value(const uint8_t *p, size_t n, int huff) {
     if (!huff) {
         if (n != 3 || p[0] < '0' || p[0] > '9' || p[1] < '0' || p[1] > '9' || p[2] < '0' || p[2] > '9') return -1;
         return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
@@ -186,7 +186,7 @@ int h2d_status(const uint8_t *blk, size_t n) {
         int64_t vl = hp_dint(blk, n, &i, 7);
         if (vl < 0 || (size_t)vl > n - i) return -1;
         if (is_status && !status) {
-            int v = status_of_value(blk + i, (size_t)vl, vh);
+            int v = h2d_status_value(blk + i, (size_t)vl, vh);
             if (v < 100 || v > 599) return -1;
             status = v;
         }

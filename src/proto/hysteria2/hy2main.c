@@ -26,11 +26,12 @@
 #include "hy2.h"
 #include "hy2conn.h"
 #include "hy2dial.h"
-#include "spec.h"
 #include "evline.h"
 #include "jsonw.h"
-#include "probe.h"
+#include "pool.h"
 #include "thrstack.h"
+#include "pktun.h"
+#include "hy2cmd.h"
 
 #define LOG_W2 "steer[warn]: "
 #define LOG_I2 "steer[info]: "
@@ -39,20 +40,15 @@
 static struct hy2_node *g_nodes;
 
 /* Номера узлов для перебора: не больше, чем пригодных узлов и записей выбора nodes. */
-static int *sel_alloc(const struct output *o, size_t cnt, size_t *cap) {
+static int *sel_alloc(const struct pk_tun *o, size_t cnt, size_t *cap) {
     size_t c = cnt;
-    if (o && o->hy2.nodes_n > c) c = o->hy2.nodes_n;
+    if (o && o->nodes_n > c) c = o->nodes_n;
     *cap = c;
     int *s = calloc(c + 1, sizeof(*s));
-    if (!s) die("нет памяти под список узлов", NULL);
+    if (!s) pk_fail("нет памяти под список узлов");
     return s;
 }
 
-static struct spec *spec_new(void) {
-    struct spec *sp = calloc(1, sizeof(*sp));
-    if (!sp) die("нет памяти под спеку", NULL);
-    return sp;
-}
 
 /* ---- подписка --------------------------------------------------------------------------------- */
 
@@ -62,31 +58,27 @@ static int load_nodes_file(const char *path, size_t *cnt, struct hy2_sub_stats *
     return 0;
 }
 
-static int load_nodes(struct spec *sp, const char *spec_path, const char *out_name,
-                      struct output **out, size_t *cnt, struct hy2_sub_stats *st) {
-    struct err e = {0};
-    if (load_spec(spec_path, sp, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(sp, out_name);
-    if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
-    const struct hy2_cfg *hc = out_hysteria2(o);
-    if (!hc) {
-        fprintf(stderr, LOG_W2 "выход %s не hysteria2 (kind другой)\n", out_name);
+/* Выход — из {conf}: ключи вида проверены схемой манифеста, сочетания — pk_tun_check. */
+static struct pk_tun g_t;
+
+static int load_nodes(const struct pk_out *o, size_t *cnt, struct hy2_sub_stats *st) {
+    char err[400];
+    if (strcmp(o->kind, "tunnel:hysteria2") != 0) {
+        fprintf(stderr, LOG_W2 "выход %s не hysteria2 (kind %s)\n", o->tun.name, o->kind);
         return 2;
     }
-    *out = o;
-    return load_nodes_file(hc->sub_file, cnt, st);
+    if (pk_tun_load(o, &g_t, err, sizeof err) != 0 || pk_tun_check(&g_t, err, sizeof err) != 0) {
+        fprintf(stderr, LOG_W2 "outputs.%s: %s\n", o->tun.name, err);
+        return 2;
+    }
+    return load_nodes_file(g_t.sub_file, cnt, st);
 }
 
 /* Метка сокета к узлу — до первого соединения: проба при подъёме и `hysteria2-probe` идут тем же
  * путём, что и сам туннель (иначе при `via` проба стучалась бы напрямую). Смысл метки — «вложенные
  * выходы» в spec.h; сокет QUIC метит обёртка (qc_cfg.sock_mark). */
-static void underlay_setup(struct spec *sp, const struct output *o) {
-    static const struct output none;
-    if (o && o->over[0]) {
-        struct err e = {0};
-        if (registry_assign(sp, &e) < 0) err_die(&e);
-    }
-    hy2c_set_mark(out_underlay_mark(sp, o ? o : &none), o && o->over[0]);
+static void underlay_setup(const struct pk_out *o) {
+    hy2c_set_mark(pk_sock_mark(o), o && o->sock_mark_required);
 }
 
 /* x — исключение выхода; NULL — перечень по файлу. cc и excluded — как у vless (vlmain.c). */
@@ -108,11 +100,11 @@ static void node_json(const struct hy2_node *n, int index, const struct node_exc
 
 /* exclude, exclude_name (hy2_cfg.excl): исключённые уходят из кандидатов, номера не сдвигаются. Одна
  * функция на подъём и на `hysteria2-probe`. */
-static size_t exclude_filter(const struct output *o, const struct hy2_node *nodes, int *sel, size_t n) {
+static size_t exclude_filter(const struct pk_tun *o, const struct hy2_node *nodes, int *sel, size_t n) {
     if (!o) return n;
     size_t k = 0;
     for (size_t i = 0; i < n; i++)
-        if (!node_excluded(&o->hy2.excl, nodes[sel[i]].name)) sel[k++] = sel[i];
+        if (!node_excluded(&o->excl, nodes[sel[i]].name)) sel[k++] = sel[i];
     return k;
 }
 
@@ -133,26 +125,27 @@ static void skipped_json(const struct hy2_sub_stats *st) {
 /* insecure — `--insecure` по файлу. У hysteria2 он ничего не меняет и принимается ради единого вызова
  * у всех протоколов: `insecure=1` здесь параметр ссылки узла, а не ключ выхода (kinds/hysteria2.c),
  * поэтому такие узлы пригодны всегда и номера по файлу с флагом и без него те же, что у выхода. */
-int cmd_hysteria2_nodes(const char *spec_path, const char *out_name, int insecure) {
+int cmd_hysteria2_nodes(const struct pk_out *po, const char *out_name, int insecure) {
     (void)insecure;
-    struct output *o = NULL;
+    const struct pk_tun *o = NULL;
     size_t cnt = 0;
     struct hy2_sub_stats st;
     int by_file = out_name && out_name[0] == '/';
-    int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
-                     : load_nodes(spec_new(), spec_path, out_name, &o, &cnt, &st);
+    if (!by_file && !po) { fprintf(stderr, LOG_W2 "выход %s: нужен --conf (steer hysteria2-nodes зовёт ядро)\n", out_name); return 2; }
+    int rc = by_file ? load_nodes_file(out_name, &cnt, &st) : load_nodes(po, &cnt, &st);
     if (rc) return rc;
+    if (!by_file) o = &g_t;
     printf("{\"output\":");
     jsonw_str(stdout, by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    jsonw_str(stdout, by_file ? out_name : o->hy2.sub_file);
-    size_t chosen_n = o ? o->hy2.nodes_n : 0;
-    printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->hy2.nodes[0] : -1);
-    for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->hy2.nodes[i]);
+    jsonw_str(stdout, by_file ? out_name : o->sub_file);
+    size_t chosen_n = o ? o->nodes_n : 0;
+    printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->nodes[0] : -1);
+    for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->nodes[i]);
     printf("],\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[", cnt, st.skipped, st.foreign);
     for (size_t i = 0; i < cnt; i++) {
         if (i) putchar(',');
-        node_json(&g_nodes[i], (int)i, o ? &o->hy2.excl : NULL);
+        node_json(&g_nodes[i], (int)i, o ? &o->excl : NULL);
     }
     printf("]");
     skipped_json(&st);
@@ -160,18 +153,18 @@ int cmd_hysteria2_nodes(const char *spec_path, const char *out_name, int insecur
     return 0;
 }
 
-int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node, int timeout_s,
+int cmd_hysteria2_probe(const struct pk_out *po, const char *out_name, int node, int timeout_s,
                         int insecure) {
     (void)insecure;                                    /* см. cmd_hysteria2_nodes */
-    struct output *o = NULL;
+    const struct pk_tun *o = NULL;
     size_t cnt = 0;
     struct hy2_sub_stats st;
     int by_file = out_name && out_name[0] == '/';
-    struct spec *sp = spec_new();
-    int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
-                     : load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
+    if (!by_file && !po) { fprintf(stderr, LOG_W2 "выход %s: нужен --conf (steer hysteria2-probe зовёт ядро)\n", out_name); return 2; }
+    int rc = by_file ? load_nodes_file(out_name, &cnt, &st) : load_nodes(po, &cnt, &st);
     if (rc) return rc;
-    underlay_setup(sp, o);
+    if (!by_file) o = &g_t;
+    underlay_setup(by_file ? NULL : po);
     if (!cnt) {
         printf("{\"ok\":false,\"error\":\"в подписке нет пригодных узлов hysteria2\",\"skipped\":%zu,"
                "\"foreign\":%zu", st.skipped, st.foreign);
@@ -190,14 +183,14 @@ int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node, i
     else if (by_file) {
         for (size_t i = 0; i < cnt; i++) sel[sel_n++] = (int)i;
     } else {
-        sel_n = out_hy2_node_list(o, cnt, sel, sel_cap);
+        sel_n = pk_node_list(o, cnt, sel, sel_cap);
         if (!sel_n) {
             printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, пригодных всего %zu\"}\n", cnt);
             return 1;
         }
         sel_n = exclude_filter(o, g_nodes, sel, sel_n);
         if (!sel_n) {
-            printf("{\"ok\":false,\"error\":\"все выбранные узлы исключены exclude или exclude_name\"}\n");
+            printf("{\"ok\":false,\"error\":\"все выбранные узлы исключены exclude, exclude_name или only\"}\n");
             return 1;
         }
     }
@@ -205,7 +198,7 @@ int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node, i
     printf("{\"output\":");
     jsonw_str(stdout, by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    jsonw_str(stdout, by_file ? out_name : o->hy2.sub_file);
+    jsonw_str(stdout, by_file ? out_name : o->sub_file);
     printf(",\"results\":[");
     for (size_t k = 0; k < sel_n; k++) {
         size_t i = (size_t)sel[k];
@@ -227,19 +220,57 @@ int cmd_hysteria2_probe(const char *spec_path, const char *out_name, int node, i
 
 /* ---- файл состояния для status и diag --------------------------------------------------------- */
 
-static char g_state_out[64];
 static const struct hy2_node *g_cur;
 
+/* СТРАНА ВЫХОДА. node_cc — по флагу в имени узла, geo_cc — какую видят сайты через выход (одна проверка
+ * geo.c после подъёма: узел у hysteria2 на ходу не меняется — клиент перезапускается). Поля состояния
+ * читает сторож групп (only и exclude группы, daemon/fogroup.c) и status. geo.c — только в libsteer
+ * (слабая ссылка): без него проверки нет. */
+int geo_trace(const char *dev, char cc[3], char *why, size_t wn) __attribute__((weak));
+static int g_geo_state;             /* 0 — нет, 1 — страна получена, 2 — не вышло (атомарно) */
+static char g_geo_cc[3];
+
+static void *geo_thread(void *arg) {
+    char dev[16], why[200];
+    snprintf(dev, sizeof(dev), "%s", (const char *)arg);
+    for (int tries = 0; tries < 2; tries++) {
+        char cc[3];
+        if (geo_trace(dev, cc, why, sizeof(why)) == 0) {
+            memcpy(g_geo_cc, cc, 3);
+            __atomic_store_n(&g_geo_state, 1, __ATOMIC_RELEASE);
+            if (node_cc(g_cur->name, cc) && strcmp(cc, g_geo_cc) != 0)
+                fprintf(stderr, LOG_W2 "узел %s назван страной %s, а выход виден из %s\n", g_cur->name, cc,
+                        g_geo_cc);
+            return NULL;
+        }
+        if (tries == 0) sleep(20);
+    }
+    fprintf(stderr, LOG_I2 "страна выхода не определилась: %s\n", why);
+    __atomic_store_n(&g_geo_state, 2, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* Файл состояния выхода (steer-api.md, 2.2): переписывается, только когда изменился, — каждое
+ * изменение будит ядро событием state, а поля меняются реже, чем идёт опрос (раз в 3 с). */
+static char *g_state_last;
+
 static void state_write(void) {
-    char path[300], tmp[320];
-    snprintf(path, sizeof(path), "%s/hy2-%.32s", steer_state_dir(), g_state_out);
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     struct hy2c_status s;
     hy2c_status(&s);
-    FILE *f = fopen(tmp, "w");
+    char *buf = NULL;
+    size_t bn = 0;
+    FILE *f = open_memstream(&buf, &bn);
     if (!f) return;
     fprintf(f, "{\"pid\":%ld,\"node\":", (long)getpid());
     jsonw_str(f, g_cur->name);
+    char ncc[3];
+    int has = node_cc(g_cur->name, ncc);
+    if (has) fprintf(f, ",\"node_cc\":\"%s\"", ncc);
+    int gs = __atomic_load_n(&g_geo_state, __ATOMIC_ACQUIRE);
+    if (gs == 1) {
+        fprintf(f, ",\"geo_cc\":\"%s\"", g_geo_cc);
+        if (has && strcmp(ncc, g_geo_cc) != 0) fputs(",\"geo_mismatch\":true", f);
+    } else if (gs == 2) fputs(",\"geo_failed\":true", f);
     fprintf(f, ",\"up\":%s,\"hs_ms\":%u,\"cc\":\"%s\",\"brutal_bps\":%llu,\"udp\":%s,\"obfs\":\"%s\","
                "\"hop\":%s,\"rtt_ms\":%llu,\"flows\":%u,\"error\":",
             s.up ? "true" : "false", s.hs_ms, s.brutal ? "brutal" : "bbr",
@@ -247,14 +278,20 @@ static void state_write(void) {
             g_cur->obfs == 2 ? "gecko" : g_cur->obfs ? "salamander" : "", g_cur->hop_n ? "true" : "false",
             (unsigned long long)(s.rtt_us / 1000), s.flows);
     jsonw_str(f, s.up ? "" : s.err);
-    fprintf(f, "}\n");
+    fputc('}', f);
     fclose(f);
-    if (rename(tmp, path) != 0) unlink(tmp);
+    if (!g_state_last || strcmp(g_state_last, buf) != 0) {
+        pk_status_write(pk_out(), buf);
+        free(g_state_last);
+        g_state_last = buf;
+    } else free(buf);
 }
 
 static void *state_thread(void *arg) {
     (void)arg;
     for (;;) {
+        /* Имя узла разрешается тут, а не в цикле рабочего: getaddrinfo блокирует (hy2conn.c). */
+        hy2c_refresh_addr();
         state_write();
         struct timespec ts = { 3, 0 };
         nanosleep(&ts, NULL);
@@ -341,6 +378,13 @@ static void nw_down(const char *why) {
     evline_emit("down", "why", EVLINE_STR, w[0] ? w : "узел не отвечает", (const char *)NULL);
 }
 
+/* Проверка узла наперегонки (pool_race_first, I-535). Рукопожатие и авторизацию в мс несёт строка why. */
+static int hy_race_probe(void *arg, int id, char *why, size_t n) {
+    int hs = 0;
+    int rc = hy2_probe(&((const struct hy2_node *)arg)[id], 8, why, n, &hs);
+    if (rc == 0) snprintf(why, n, "рукопожатие и авторизация %d мс", hs);
+    return rc;
+}
 static void *nw_thread(void *arg) {
     (void)arg;
     const struct hy2_node *cur = &g_nw.nodes[g_nw.cur];
@@ -386,13 +430,20 @@ static void *nw_thread(void *arg) {
             due = nw_now_ms() + (uint64_t)g_nw_period_s * 1000ull;
             continue;
         }
-        for (size_t k = 0; k < g_nw.sel_n; k++) {
-            const struct hy2_node *n = &g_nw.nodes[g_nw.sel[k]];
-            if (g_nw.sel[k] == g_nw.cur || hy2_probe(n, NW_TIMEOUT_S, why, sizeof(why), &hs) != 0)
-                continue;
-            fprintf(stderr, LOG_W2 "узел %s не отвечает, а %s отвечает — выхожу, чтобы выбрать "
-                            "узел заново\n", cur->name, n->name);
-            exit(0);
+        {
+            /* Остальные кандидаты — наперегонки: ответил хоть один — выходим, чтобы выбрать узел заново. */
+            int *others = malloc((g_nw.sel_n ? g_nw.sel_n : 1) * sizeof(*others));
+            size_t on = 0;
+            for (size_t k = 0; others && k < g_nw.sel_n; k++)
+                if (g_nw.sel[k] != g_nw.cur) others[on++] = g_nw.sel[k];
+            struct pool_race pr = { .n = on, .ids = others, .probe = hy_race_probe, .arg = (void *)g_nw.nodes };
+            int w = on ? pool_race_first(&pr, why, sizeof(why)) : -1;
+            free(others);
+            if (w >= 0) {
+                fprintf(stderr, LOG_W2 "узел %s не отвечает, а %s отвечает — выхожу, чтобы выбрать "
+                                "узел заново\n", cur->name, g_nw.nodes[w].name);
+                exit(0);
+            }
         }
         retry = retry * 2 > NW_RETRY_MAX_S ? NW_RETRY_MAX_S : retry * 2;
         due = nw_now_ms() + retry * 1000ull;
@@ -436,8 +487,12 @@ static void watch_start(const struct hy2_node *nodes, const int *sel, size_t sel
 
 /* ---- подъём выхода ---------------------------------------------------------------------------- */
 
-static void h2_probe_report(const char *out_name, enum probe_state st, int node, int total) {
-    if (!evline_enabled()) probe_report(out_name, st, node, total);
+/* Ход перебора — в файл состояния выхода, пока его не переписало состояние туннеля (как у vless). */
+static void h2_probe_report(const char *state, int node, int total) {
+    char j[160];
+    snprintf(j, sizeof j, "{\"pid\":%ld,\"up\":false,\"probe\":{\"state\":\"%s\",\"node\":%d,\"total\":%d}}",
+             (long)getpid(), state, node, total);
+    pk_status_write(pk_out(), j);
 }
 
 struct ready_arg {
@@ -455,23 +510,39 @@ static void h2_ready(void *arg, const char *dev) {
     pthread_create(&st, NULL, state_thread, NULL);
     pthread_detach(st);
     watch_start(ra->nodes, ra->sel, ra->sel_n, ra->cur, ra->checked, dev);
+    if (geo_trace && dev && dev[0]) {
+        static char gdev[16];
+        static pthread_t gt;
+        snprintf(gdev, sizeof(gdev), "%s", dev);
+        if (pthread_create(&gt, NULL, geo_thread, gdev) == 0) pthread_detach(gt);
+    }
     if (!evline_enabled())
         fprintf(stderr, LOG_I2 "%s поднят; маршрут выхода к нему ставит демон — без демона "
                         "таблица выхода не тронута\n", dev);
 }
 
-int cmd_hysteria2(const char *spec_path, const char *out_name) {
+static const char *g_race_out;
+static void hy_race_start(void *arg, int id, size_t k, size_t n) {
+    (void)arg; (void)id;
+    h2_probe_report("running", (int)k, (int)n);
+    evline_emit("node", "n", EVLINE_INT, (long)k, "total", EVLINE_INT, (long)n, (const char *)NULL);
+}
+static void hy_race_fail(void *arg, int id, const char *why) {
+    fprintf(stderr, LOG_I2 "%s — %s\n", ((const struct hy2_node *)arg)[id].name, why);
+}
+
+int cmd_hysteria2(const struct pk_out *po) {
     evline_open();
-    struct output *o = NULL;
+    const char *out_name = po->tun.name;
     size_t cnt = 0;
     struct hy2_sub_stats st;
-    struct spec *sp = spec_new();
-    int rc = load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
+    int rc = load_nodes(po, &cnt, &st);
     if (rc) return rc;
-    underlay_setup(sp, o);
+    const struct pk_tun *o = &g_t;
+    underlay_setup(po);
     struct hy2_node *nodes = g_nodes;
     if (!cnt) {
-        h2_probe_report(out_name, PROBE_FAILED, 0, 0);
+        h2_probe_report("failed", 0, 0);
         evline_emit("down", "why", EVLINE_STR, "в подписке нет пригодных узлов hysteria2",
                     (const char *)NULL);
         fprintf(stderr, LOG_W2 "в подписке нет пригодных узлов hysteria2 (пропущено %zu, чужих %zu)\n",
@@ -485,10 +556,10 @@ int cmd_hysteria2(const char *spec_path, const char *out_name) {
 
     size_t sel_cap;
     int *sel = sel_alloc(o, cnt, &sel_cap);          /* живёт до конца процесса: его читает сторож */
-    size_t sel_n = out_hy2_node_list(o, cnt, sel, sel_cap);
+    size_t sel_n = pk_node_list(o, cnt, sel, sel_cap);
     if (!sel_n) {
-        h2_probe_report(out_name, PROBE_NO_SUCH_NODE, o->hy2.nodes_n ? o->hy2.nodes[0] : -1, (int)cnt);
-        evline_emit("nonode", "node", EVLINE_INT, (long)(o->hy2.nodes_n ? o->hy2.nodes[0] : -1),
+        h2_probe_report("no_such_node", o->nodes_n ? o->nodes[0] : -1, (int)cnt);
+        evline_emit("nonode", "node", EVLINE_INT, (long)(o->nodes_n ? o->nodes[0] : -1),
                     "total", EVLINE_INT, (long)cnt, (const char *)NULL);
         fprintf(stderr, LOG_W2 "выбранных узлов нет в подписке (пригодных всего %zu) — проверьте nodes\n", cnt);
         return 1;
@@ -496,53 +567,42 @@ int cmd_hysteria2(const char *spec_path, const char *out_name) {
     size_t before = sel_n;
     sel_n = exclude_filter(o, g_nodes, sel, sel_n);
     if (!sel_n) {
-        h2_probe_report(out_name, PROBE_ALL_EXCLUDED, 0, (int)before);
+        h2_probe_report("all_excluded", 0, (int)before);
         evline_emit("excluded", "total", EVLINE_INT, (long)before, (const char *)NULL);
         evline_emit("down", "why", EVLINE_STR, "все узлы-кандидаты исключены exclude", (const char *)NULL);
-        fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude или exclude_name — проверьте "
+        fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude, exclude_name или only — проверьте "
                         "исключение и подписку\n", before);
         return 1;
     }
     int chosen = -1;
-    if (out_hy2_node_named(o)) {
+    if (pk_node_named(o)) {
         chosen = sel[0];
-        probe_clear(out_name);
     } else {
-        for (size_t i = 0; i < sel_n; i++) {
-            char why[256];
-            int hs = 0;
-            h2_probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)sel_n);
-            evline_emit("node", "n", EVLINE_INT, (long)(i + 1), "total", EVLINE_INT, (long)sel_n,
-                        (const char *)NULL);
-            if (hy2_probe(&nodes[sel[i]], 8, why, sizeof(why), &hs) == 0) {
-                fprintf(stderr, LOG_I2 "выбран %s (рукопожатие и авторизация %d мс)\n",
-                        nodes[sel[i]].name, hs);
-                chosen = sel[i];
-                break;
-            }
-            fprintf(stderr, LOG_I2 "%s — %s\n", nodes[sel[i]].name, why);
-        }
+        /* Кандидаты — наперегонки (pool_race_first, I-535), как у VLESS. */
+        char why[256];
+        g_race_out = out_name;
+        struct pool_race pr = { .n = sel_n, .ids = sel, .probe = hy_race_probe, .arg = nodes,
+                                .on_start = hy_race_start, .on_fail = hy_race_fail };
+        chosen = pool_race_first(&pr, why, sizeof why);
+        if (chosen >= 0) fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[chosen].name, why);
     }
     if (chosen < 0) {
-        h2_probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);
+        h2_probe_report("failed", 0, (int)sel_n);
         evline_emit("down", "why", EVLINE_STR, "ни один узел подписки не отвечает", (const char *)NULL);
         fprintf(stderr, LOG_W2 "ни один узел подписки не отвечает\n");
         return 1;
     }
-    probe_clear(out_name);
     static struct ready_arg ra;
     ra.nodes = nodes;
     ra.sel = sel;
     ra.sel_n = sel_n;
     ra.cur = chosen;
-    ra.checked = !out_hy2_node_named(o);
+    ra.checked = !pk_node_named(o);
     g_cur = &nodes[chosen];
-    snprintf(g_state_out, sizeof(g_state_out), "%s", out_name);
 
-    struct err e = {0};
-    if (registry_assign(sp, &e) < 0) err_die(&e);
-    /* Ключи пула, которые у hysteria2 есть: период проверки узла и срок простоя QUIC. */
-    if (o->hy2.pool.interval_s) g_nw_period_s = o->hy2.pool.interval_s;
-    hy2c_set_idle(o->hy2.pool.silence_s);
-    return hy2_tunnel_run(o, &nodes[chosen], h2_ready, &ra);
+    /* Ключи пула, которые у hysteria2 есть: период проверки узла и срок простоя QUIC. Метка, таблица и
+     * порт слушателя — из {conf}. */
+    if (o->pool.interval_s) g_nw_period_s = o->pool.interval_s;
+    hy2c_set_idle(o->pool.silence_s);
+    return hy2_tunnel_run(&po->tun, &nodes[chosen], h2_ready, &ra);
 }

@@ -1,8 +1,10 @@
 /* СПЕКА v1 → МОДЕЛЬ v2 (docs/architecture.md, «3. Спека v2» и «4в»).
  *
- * Спека v1 — JSON со `schema: 1` или `schema: 2` — читается до 2.0.0, и читается ЭТИМ файлом:
- * разбор, все прежние проверки (с прежними текстами отказов — их сверяют стенды и снимок) и
- * перевод в модель v2, в которой работает весь остальной движок. В 2.0.0 файл удаляется целиком.
+ * Спека v1 — JSON со `schema: 1` или `schema: 2` — читается ТОЛЬКО как вход перевода (решение
+ * владельца, I-541): при загрузке она разбирается этим файлом и переводится в модель v2 в памяти
+ * (`steer spec convert` печатает результат спекой v2), и дальше весь движок работает с моделью
+ * v2, о формате v1 не зная ничего. Старая спека на диске загружается как прежде, переписывать её
+ * не нужно.
  *
  * ПЕРЕВОД:
  *   - канал → правило (struct spec_rule) с безымянными клиентом и списком. Клиент — только если
@@ -25,9 +27,11 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include "spec.h"
-#include "obfs.h"
 #include "check.h"
 #include "v1.h"
+#include "plugin.h"
+#include "plugutil.h"
+#include "ynode.h"
 
 /* Канал спеки v1 — ровно то, что в нём написано, до перевода в правило. Живёт только на время
  * разбора одного канала (на стеке): модель хранит правило, список и клиента. */
@@ -259,6 +263,100 @@ static int parse_obfs(struct js *j, const char *name, struct out_obfs *ob, struc
     return obfs_set(name, mode, server, listen, ob, e);
 }
 
+/* ВИДЫ ПЛАГИНОВ В СПЕКЕ v1. Формат v1 заморожен (kind.h), и в нём три вида, которые теперь дают плагины:
+ * `vless` (ключи sub_file, node, nodes), `xsteer` (conf, stream, stream_port) и мост Telegram `tgws`
+ * (domain). Таких видов в ядре нет — только в манифестах плагинов, поэтому v1 переводит такой выход в вид
+ * плагина спеки v2 — tunnel:vless, xsteer или tgws — с ключами, переименованными по таблице ниже, и дальше выход живёт как любой выход вида
+ * плагина: схема ключей манифеста, его помощник, {conf}. Таблица — знание о ФОРМАТЕ v1 (какие имена
+ * он писал), а не о плагинах: вид берётся у того плагина, который его объявил. Плагина нет — тот же
+ * путь, что у v2 (steer-api.md, 3.5): при старте выход недоступен, при apply и check — отказ. */
+static const struct { const char *v1, *v2; } V1_PLUGIN_KIND[] = {
+    { "vless", "tunnel:vless" },
+    { "xsteer", "xsteer" },
+    { "tgws", "tgws" },
+};
+
+static int v1_plugin_kind(struct spec *s, struct output *o, const char *kind, const struct out_keys *k,
+                          struct err *e) {
+    const char *v2 = NULL;
+    for (size_t i = 0; i < sizeof(V1_PLUGIN_KIND) / sizeof(V1_PLUGIN_KIND[0]); i++)
+        if (!strcmp(V1_PLUGIN_KIND[i].v1, kind)) v2 = V1_PLUGIN_KIND[i].v2;
+    if (!v2) return 1;
+    struct sbuf b = { 0 };
+    sb_str(&b, "{");
+    int n = 0;
+    if (k->sub_file[0]) { sb_str(&b, "\"subscription\":"); sb_json(&b, k->sub_file); n++; }
+    if (k->nodes_n) {
+        sb_str(&b, n++ ? ",\"nodes\":[" : "\"nodes\":[");
+        for (size_t i = 0; i < k->nodes_n; i++) sb_printf(&b, "%s%d", i ? "," : "", k->nodes[i]);
+        sb_str(&b, "]");
+    }
+    if (k->conf[0]) { sb_str(&b, n++ ? ",\"conf\":" : "\"conf\":"); sb_json(&b, k->conf); }
+    if (k->stream) { sb_str(&b, n++ ? ",\"stream\":true" : "\"stream\":true"); }
+    if (k->stream_port) { sb_printf(&b, "%s\"stream_port\":%d", n++ ? "," : "", k->stream_port); }
+    if (k->domain[0]) { sb_str(&b, n++ ? ",\"domain\":" : "\"domain\":"); sb_json(&b, k->domain); }
+    sb_str(&b, "}");
+    if (b.oom) { free(b.p); return v1_nomem(e); }
+    const struct plugin_kind *pk = plugin_kind_find(v2);
+    if (!pk) {
+        char why[400];
+        const char *id = NULL;
+        int known = plugin_kind_why(v2, why, sizeof why, &id) != NULL;
+        if (!known || (s->load_flags & LOAD_STRICT)) {
+            free(b.p);
+            if (!known) snprintf(why, sizeof why, "вид %s даёт плагин, а такого плагина ядро не знает", v2);
+            char m[sizeof(why) + 64];
+            snprintf(m, sizeof m, "outputs.%s: %s", o->name, why);
+            return err_set(e, "%s", m);
+        }
+        int rc = out_make_unavail(s, o, why, id, v2);
+        if (rc == 0) {
+            o->plg.keys_json = spec_strdup(s, b.p);
+            if (!o->plg.keys_json) rc = -1;
+        }
+        free(b.p);
+        if (rc) return v1_nomem(e);
+        o->kind = &kind_unavail;
+        return 0;
+    }
+    struct err pe;
+    memset(&pe, 0, sizeof(pe));
+    struct ydoc *d = ydoc_parse_buf(b.p, b.n, "spec v1", &pe);
+    free(b.p);
+    if (!d) {
+        char m[sizeof(pe.msg) + 64];
+        snprintf(m, sizeof m, "outputs.%s: %s", o->name, pe.msg);
+        return err_set(e, "%s", m);
+    }
+    char conf[2 * PATH_MAX], etc[PATH_MAX], *json = NULL;
+    const struct ynode *at = NULL;
+    plugin_etc(etc, sizeof(etc));
+    snprintf(conf, sizeof(conf), "%s/conf/%s", etc, pk->owner->id);
+    struct err ke;
+    memset(&ke, 0, sizeof(ke));
+    int rc = plugin_keys_check(pk, ydoc_root(d), plat()->etc_dir, conf, &json, &at, &ke);
+    ydoc_free(d);
+    if (rc != 0) {
+        char m[sizeof(ke.msg) + 64];
+        snprintf(m, sizeof m, "outputs.%s: %s", o->name, ke.msg);
+        return err_set(e, "%s", m);
+    }
+    o->kind = &pk->ops;
+    o->plg.pk = pk;
+    o->plg.keys_json = spec_strdup(s, json);
+    free(json);
+    if (!o->plg.keys_json) return v1_nomem(e);
+    /* Ресурсы выхода (порт моста tgws): подготовки у спеки v1 нет, поэтому номера выдаются здесь — те же
+     * постоянные номера alloc.json, что выдала бы подготовка v2. */
+    if ((pk->res_ports || pk->res_queues) &&
+        plugin_alloc_out(s, pk, o->name, &o->plg.ports, &o->plg.ports_n, &o->plg.queues, &o->plg.queues_n, e) != 0) {
+        char m[sizeof(e->msg) + 64];
+        snprintf(m, sizeof m, "outputs.%s: %s", o->name, e->msg);
+        return err_set(e, "%s", m);
+    }
+    return 0;
+}
+
 static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
     if (js_lit(j, '{') != 0) return err_set(e, "outputs: expected an object", NULL);
     js_ws(j);
@@ -327,10 +425,9 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             else if (!strcmp(key, "obfs")) { if (parse_obfs(j, o.name, &k.obfs, e) != 0) return -1; }
             else if (!strcmp(key, "sub_file")) { if (js_str(j, k.sub_file, sizeof(k.sub_file), e) != 0 && e->msg[0]) return -1; }
             else if (!strcmp(key, "conf")) { if (js_str(j, k.conf, sizeof(k.conf), e) != 0 && e->msg[0]) return -1; }
-            /* Файл ключей nfqws у kind=zapret. Отдельным ключом, а не переиспользованным
-             * `conf`: у xsteer там конфигурация в стиле wg с приватным ключом, здесь —
-             * список ключей командной строки, и одно имя для двух разных вещей однажды
-             * привело бы к попытке поднять туннель по стратегии обхода. */
+            /* Файл настройки внешнего модуля DPI (recheck). Отдельным ключом, а не переиспользованным
+             * `conf`: у xsteer там конфигурация в стиле wg с приватным ключом, и одно имя для
+             * двух разных вещей однажды привело бы к попытке поднять туннель по настройке обхода. */
             else if (!strcmp(key, "opts_file")) { if (js_str(j, k.opts_file, sizeof(k.opts_file), e) != 0 && e->msg[0]) return -1; }
             else if (!strcmp(key, "domain")) { if (js_str(j, k.domain, sizeof(k.domain), e) != 0 && e->msg[0]) return -1; }
             /* Через какой выход идёт трафик самого туннеля (подложка `over` модели — см. блок
@@ -355,6 +452,10 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             else if (!strcmp(key, "stream_port")) {
                 long v = 0;
                 if (js_num(j, &v, e) != 0) return -1;
+                /* Диапазон — на long, ДО приведения к int: (int)4294967739 даёт 443 и проходил проверку
+                 * вида как законный порт. 0 — «порт хаба как в Endpoint», остальное — 1..65535. */
+                if (v < 0 || v > 65535)
+                    return err_set(e, "outputs.%s: stream_port вне 1..65535", o.name);
                 k.stream_port = (int)v;
             }
             /* `node` — сокращение для списка из одного узла, `nodes` — сам список. Дальше по
@@ -365,6 +466,11 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
                 long v = 0;
                 if (js_num(j, &v, e) != 0) return -1;
                 k.node_one = 1;
+                /* Потолок тот же, что у элементов `nodes` (num_array), и тоже на long до приведения:
+                 * (int)4294967297 давал номер 1. */
+                if (v > 100000)
+                    return err_set(e, "outputs.%s: node — номер узла подписки не больше 100000",
+                        o.name);
                 if (v >= 0) {
                     k.nodes = (int *)spec_alloc(s, sizeof(int));
                     if (!k.nodes) return v1_nomem(e);
@@ -443,15 +549,32 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
          * молча никуда не ведёт. */
         /* Группы (kind: group) в реестре нет — спека v1 её не знает, и `"kind": "group"` здесь
          * остаётся неизвестным видом, как было (см. kind.h). */
+        if (!strcmp(kind, "zapret"))
+            return err_set(e, "outputs.%s: kind zapret убран из ядра steer: обход DPI — отдельный модуль "
+                       "recheck, без обхода выход заменяет kind: direct", o.name);
         const struct kind_ops *kd = kind_by_name(kind);
-        if (!kd) return err_set(e, "outputs.%s: неизвестный kind "
-                   "(нужен direct, interface, vless, xsteer, zapret, tgws или awg)", o.name);
+        int legacy = 0;
+        if (!kd) {
+            int lr = v1_plugin_kind(s, &o, kind, &k, e);
+            if (lr < 0) return -1;
+            if (lr) return err_set(e, "outputs.%s: неизвестный kind "
+                       "(нужен direct, interface, vless, xsteer, tgws или awg)", o.name);
+            kd = o.kind;
+            legacy = 1;
+        }
         if (kd->absent) {
             static char msg[256];
             snprintf(msg, sizeof(msg), "outputs.%s: %s", o.name, kd->absent);
             return err_set(e, "%s", msg);
         }
         o.kind = kd;
+        /* Ключи протокола уже ушли в ключи вида плагина (v1_plugin_kind): вид их не видит. */
+        if (legacy) {
+            k.sub_file[0] = k.conf[0] = '\0';
+            k.stream = k.stream_port = 0;
+            k.nodes_n = 0;
+            k.domain[0] = '\0';
+        }
         if (kd->parse && kd->parse(&o, &k, e) != 0) return -1;
         /* КЛЮЧ ЧУЖОГО ВИДА — отказ. Поле, принятое молча у чужого вида выхода, — это
          * «настроено», сказанное о том, что не настроено. Проверки стоят ПОСЛЕ разбора вида,
@@ -463,14 +586,13 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
          * него, у direct транспорта нет вовсе. Режим потока — свойство транспорта xsteer. */
         if (k.obfs.on && !(kd->keys & KK_OBFS))
             return err_set(e, "outputs.%s: obfs есть только у kind=interface", o.name);
-        if ((k.stream || k.stream_port) && !(kd->keys & KK_STREAM))
+        if (!legacy && (k.stream || k.stream_port) && !(kd->keys & KK_STREAM))
             return err_set(e, "outputs.%s: stream есть только у kind=xsteer", o.name);
         if (k.opts_file[0] && !(kd->keys & KK_OPTS))
-            return err_set(e, "outputs.%s: opts_file есть только у kind=zapret", o.name);
-        if (k.domain[0] && !(kd->keys & KK_DOMAIN))
+            return err_set(e, "outputs.%s: opts_file есть только у kind=recheck", o.name);
+        if (k.domain[0])
             return err_set(e, "outputs.%s: domain есть только у kind=tgws", o.name);
-        /* Своя проверка вида после общих — то, что зависит от общих полей (on_fail у zapret и
-         * tgws). */
+        /* Своя проверка вида после общих — то, что зависит от общих полей (on_fail у tgws). */
         if (kd->check && kd->check(s, &o, e) != 0) return -1;
         /* Какой из двух форм записан выбор узлов. Нужно, чтобы отличить «поля нет» от «поле
          * задано» и поймать выход, где заданы обе: молча взять одну значило бы, что половина
@@ -482,7 +604,7 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
          * может стоять в спеке, написанной до этой версии, а `node` там стоять мог — и у
          * чужого вида выхода он и раньше ничего не делал. Отказать на нём сейчас значило бы
          * сломать применение спеки, которая работала, ради поля, которое ничего не меняет. */
-        if (k.node_many && !(kd->keys & KK_NODES))
+        if (k.node_many && !legacy && !(kd->keys & KK_NODES))
             return err_set(e, "outputs.%s: nodes есть только у kind=vless — это номера узлов подписки",
                 o.name);
         /* Дубликат номера делает перебор бессмысленным ровно так же, как дубликат устройства
@@ -707,24 +829,6 @@ static int parse_channels(struct js *j, struct spec *s, struct v1_ctx *x, struct
                         if (js_str(j, m, sizeof(m), e) != 0 && e->msg[0]) return -1;
                         if (!strcmp(m, "realip")) {
                             c.realip = 1;
-                            /* РЕЖИМ УХОДИТ (решение владельца, запуск 65), но принимается
-                             * по-прежнему: спеки с ним уже лежат на роутерах, и отказ
-                             * означал бы, что обновление движка снимает маршрутизацию.
-                             * Поэтому предупреждение, а не die, — и с уровнем, потому что
-                             * спека разобрана и работа продолжается.
-                             *
-                             * Что теряется при переходе на fakeip: читаемость traceroute.
-                             * В real-IP ответ идёт клиенту нетронутым, DNAT нет, ICMP не
-                             * переписывается и трассировка показывает настоящие узлы (см.
-                             * ветку real-IP в upstream_answer, src/dnsd/proxy.c). Взамен
-                             * fakeip даёт точность на домен: в real-IP два домена за
-                             * одним адресом склеиваются, и если они в разных
-                             * каналах, первый разрешённый решает за оба. Пул поддельных
-                             * адресов исчерпать нечем — 198.18.0.0/15 это 131072 адреса
-                             * против полутора тысяч имён в самом большом списке. */
-                            fprintf(stderr, "steer[warn] channel %s: mode=realip уходит из "
-                                    "ядра — переведите канал на fakeip; сейчас режим ещё "
-                                    "работает\n", c.name);
                         }
                         else if (strcmp(m, "fakeip") != 0) return err_set(e, "channels: unknown mode %s (want fakeip or realip)", m);
                     }
@@ -817,15 +921,11 @@ int spec_parse_v1(const char *text, struct spec *s, struct err *e) {
     int rc = v1_parse(text, s, e);
     ctx_free(&x);
     if (rc == 0) rc = check_mark_slots(s, e);
+    if (rc != 0) err_fallback(e, "spec.v1_error");      /* текст v1 — в подстановке 1 как есть */
     return rc;
 }
 
 static int v1_parse(const char *text, struct spec *s, struct err *e) {
-    /* Имена правил v1 — только IPv4: на AAAA имени под доменным каналом резолвер отвечает пустым
-     * ответом, как до 1.9, и в выход с IPv6 тоже (доводы — у поля, spec.h). Ставится до разбора,
-     * а не после: у функции десятки выходов с отказом, а отказ v1 и так обнуляет спеку
-     * (load_spec зовёт spec_defaults, прежде чем пробовать v2). */
-    s->dns.names_v4 = 1;
     struct js j = { text };
     long schema = -1;
     /* Какой из двух форм записано локальное устройство. Нужно, чтобы отличить «поля нет» от
@@ -1128,14 +1228,9 @@ static int v1_parse(const char *text, struct spec *s, struct err *e) {
          * ДО всего, что касается выхода.
          *
          * Проверка стояла ниже, за `continue` по «у выхода нет устройства», и из-за этого не
-         * срабатывала там, где последствие самое тяжёлое. У выхода kind=zapret устройства нет
-         * по определению (движок его прямо запрещает), значит канал `any` на обход DPI
-         * проезжал молча — и весь трафик локальной сети уходил в nfqws, а при on_fail=drop
-         * умирал целиком. То же с kind=tgws и kind=direct.
-         *
-         * Воспроизведено на стенде в QEMU: спека с `{"any": true}` и выходом kind=zapret
-         * принимается, правило выходит без `ip daddr @набор`, и счётчик растёт на ЛЮБОМ
-         * трафике клиента (59 -> 97 пакетов, пока клиент ходил на два несвязанных сайта).
+         * срабатывала там, где последствие самое тяжёлое. У выхода без устройства (tgws, direct, модуль DPI)
+         * канал `any` проезжал молча — и весь трафик локальной сети уходил в этот выход, а при
+         * on_fail=drop умирал целиком.
          *
          * Условие от выхода не зависит вовсе: «весь трафик вместо списка» — это свойство
          * КАНАЛА, и место ему здесь, до поиска выхода. У правила на устройство согласия

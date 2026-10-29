@@ -58,6 +58,13 @@ static const char XRAY_LIST[] =
 static const char CF_LIST[] =
     "AEX+DQBBNwAgACANG785NbYxf2vAoHiUugO7PDLchnWNz2f+95epg2DJewAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=";
 
+static int fill_sid_zero(void *ctx, unsigned char sid[32], const unsigned char *hs, size_t hs_n,
+                         const unsigned char shared[32]) {
+    (void)ctx; (void)hs; (void)hs_n; (void)shared;
+    memset(sid, 0x5A, 32);
+    return 0;
+}
+
 int main(void) {
     uint8_t list[1100];
     struct ech_cfg c;
@@ -155,6 +162,22 @@ int main(void) {
     check("  во внутреннем ech_is_inner (тип 1), во внешнем — outer (тип 0) единственный",
           find_ext(es.inner + 4, es.inner_n - 4, 0xfe0d, &ei, &ein) && ein == 1 && ei[0] == 1 &&
           find_ext(outer + 9, on - 9, 0xfe0d, &ei, &ein) && ein > 100 && ei[0] == 0);
+
+    /* I-216: на пути носителя (fill_sid) authkey не выводится — но и мусором со стека он не остаётся. */
+    {
+        struct reality_cfg pc = { .sni = "secret.example", .plain = 1, .fp = "chrome" };
+        struct reality_state ps;
+        struct reality_carrier car;
+        memset(&car, 0, sizeof car);
+        car.fill_sid = fill_sid_zero;
+        memset(&ps, 0xAA, sizeof ps);
+        size_t pn = 0;
+        int prc = reality_build_hello_carry(&pc, &ps, &car, hello, sizeof hello, &pn);
+        static const uint8_t zero[32];
+        check("I-216: носитель — Hello собран", prc == 0 && pn > 0);
+        check("I-216: носитель — authkey и shared обнулены, а не мусор со стека",
+              !memcmp(ps.authkey, zero, 32) && !memcmp(ps.shared, zero, 32));
+    }
 
     printf(g_fail ? "echmatch: ПРОВАЛОВ %d\n" : "echmatch: все проверки прошли\n", g_fail);
     return g_fail ? 1 : 0;

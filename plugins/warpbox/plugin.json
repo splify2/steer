@@ -1,0 +1,94 @@
+{
+  "schema": 1,
+  "id": "warpbox",
+  "version": "@VERSION@",
+  "type": "plugin",
+  "name": "WARP",
+  "description": "Cloudflare WARP: регистрация, подбор точек входа, замена",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/splify2/steer",
+  "compat": {
+    "steer-api": "^1.1"
+  },
+  "arch": [
+    "aarch64_cortex-a53",
+    "aarch64_cortex-a72",
+    "aarch64_generic",
+    "arm_cortex-a7_neon-vfpv4",
+    "arm_cortex-a9",
+    "arm_cortex-a9_neon",
+    "arm_cortex-a9_vfpv3-d16",
+    "mipsel_24kc",
+    "mips_24kc",
+    "x86_64"
+  ],
+  "requires": {
+    "plugins": {
+      "net1": "^1.3",
+      "awg": "^2.1"
+    },
+    "system": [
+      "kmod-tun"
+    ]
+  },
+  "permissions": [
+    "ctl",
+    "http",
+    "net.admin",
+    "spec.transform",
+    "system-packages"
+  ],
+  "steer": {
+    "kinds": [
+      {
+        "name": "warp",
+        "description": "Cloudflare WARP одной строкой: группа из count туннелей.",
+        "keys": "kinds/warp.schema.json",
+        "caps": [
+          "device",
+          "mark",
+          "ctmark",
+          "over",
+          "ipv6"
+        ],
+        "expand": {
+          "prog": "bin/warpbox",
+          "argv": [
+            "warp-expand"
+          ]
+        },
+        "helper": {
+          "prog": "bin/warpbox",
+          "cmd": "warp",
+          "argv": [
+            "warp",
+            "{out}",
+            "--conf",
+            "{conf}"
+          ]
+        }
+      }
+    ],
+    "commands": [
+      {
+        "name": "warp-reg",
+        "prog": "bin/warpbox",
+        "help": "зарегистрировать устройство WARP",
+        "usage": "<файл>"
+      },
+      {
+        "name": "warp-scan",
+        "prog": "bin/warpbox",
+        "help": "подобрать точки входа WARP для выхода",
+        "usage": "<выход>",
+        "conf": true
+      }
+    ]
+  },
+  "i18n": {
+    "languages": [
+      "ru",
+      "en"
+    ]
+  }
+}

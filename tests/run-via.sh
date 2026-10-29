@@ -19,8 +19,7 @@
 #
 # В режиме android то же самое делает приложение самого телефона: wget под UID 10050, канал
 # `from: uid:10050` на хуке output, Android-сборка движка (поле метки 22-27, ip rule 9000,
-# masquerade у выхода-интерфейса правилом iptables). Раскладка правил — STEER_NFT_COMPAT
-# (modern или legacy-min: та, что на ядре 4.9 телефона, с битом перемаршрутизации).
+# masquerade у выхода-интерфейса правилом iptables).
 #
 # Затем — отказ цели (vx0 лёг — сторож объявляет нерабочим и vl, ожил — возвращает тем же
 # проходом) и контроль, без которого первая часть ничего не доказывает: тот же выход без via
@@ -37,15 +36,17 @@
 #
 # Использование:
 #   STEER=<расширенный движок> sh tests/run-via.sh router
-#   STEER=<расширенный движок, собранный с -DSTEER_DEFAULT_PLATFORM=android> STEER_NFT_COMPAT=legacy-min \
+#   STEER=<расширенный движок, собранный с -DSTEER_DEFAULT_PLATFORM=android>
 #       sh tests/run-via.sh android
 # Нужны root, ip netns, nft, python3, wget; в режиме android — iptables и setpriv.
 set -eu
 cd "$(dirname "$0")/.."
 
 MODE="${1:-router}"
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${STEER:-./build/libs-host/steerd}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
+# steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
+LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 MB=4
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
@@ -156,6 +157,8 @@ start_vless() {
         inA ip route show table all | grep -q '^default dev vl ' && return 0
         sleep 0.2
     done
+    # Приговор по состоянию, а не по счётчику кругов.
+    inA ip route show table all | grep -q '^default dev vl ' && return 0
     return 1
 }
 stop_vless() {
@@ -182,7 +185,7 @@ fetch() {
     [ "$got" = $((MB * 1024 * 1024)) ]
 }
 
-echo "run-via: режим $MODE, раскладка ${STEER_NFT_COMPAT:-по пробе}"
+echo "run-via: режим $MODE"
 
 # ---- 1. vl через vx -----------------------------------------------------------------
 spec ',"via":"vx"'

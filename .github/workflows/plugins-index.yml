@@ -1,0 +1,47 @@
+name: Индекс плагинов
+
+# Переподпись индекса официального репозитория splify2 (splify2/plugins, gh-pages). Индекс живёт 30 дней
+# (expires, защита от подсовывания старого индекса), и роутер просроченный не принимает: без выпусков ядра
+# индекс устарел бы через месяц. Раз в неделю он подписывается заново с новыми generated и expires;
+# содержимое не меняется. Нужны секреты S2P_KEY_INDEX, S2P_KEY_PROTOCOLS и PLUGINS_TOKEN.
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugins-index
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: splify2/plugin-sdk
+          ref: ${{ vars.PLUGIN_SDK_REF || 'main' }}
+          path: .plugin-sdk
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+      - name: Переподписать индекс
+        env:
+          S2P_KEY_INDEX: ${{ secrets.S2P_KEY_INDEX }}
+          S2P_KEY_PROTOCOLS: ${{ secrets.S2P_KEY_PROTOCOLS }}
+          S2P_KEY_PLUGINS: ${{ secrets.S2P_KEY_PLUGINS }}
+          PUBLISH_TOKEN: ${{ secrets.PLUGINS_TOKEN }}
+        run: |
+          set -eu
+          [ -n "$PUBLISH_TOKEN" ] || { echo "::error::нет секрета PLUGINS_TOKEN (запись в splify2/plugins)"; exit 1; }
+          K="$RUNNER_TEMP/s2p-keys"
+          sh build/release-keys.sh "$K"
+          S2P_OUT="$RUNNER_TEMP/s2p-bin" sh .plugin-sdk/build.sh
+          S2P="$RUNNER_TEMP/s2p-bin/s2p" INDEX_SLUG=splify2/plugins INDEX_ID=splify2 INDEX_NAME=splify2 \
+            INDEX_KEY="$K/sec/index.sec" PUBS="$K/sec/protocols.pub" sh .plugin-sdk/tools/publish-index.sh

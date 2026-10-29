@@ -1,0 +1,45 @@
+# args: apply --dry-run --spec TMP/two.yaml --state-dir TMP/st
+# exit: 0
+# env: STEER_NFT_INGRESS=0
+# env: STEER_PLUGINS_ETC=TMP/plugetc
+# env: STEER_PLUGINS_ROOT=TMP/plugins
+table inet steer {
+    set tg_ip {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 149.154.160.0/20, 91.108.4.0/22 }
+    }
+    set tg2_ip_c1 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 149.154.160.0/20, 91.108.4.0/22 }
+    }
+    chain prerouting_mark {
+        type filter hook prerouting priority mangle + 1; policy accept;
+        iifname "br-lan" ip daddr @tg_ip meta mark set mark and 0xf00fffff or 0x40100000 counter return comment "steer:tg_ip"
+        ip saddr { 192.168.1.50 } ip daddr @tg2_ip_c1 meta mark set mark and 0xf00fffff or 0x40200000 counter return comment "steer:tg2_ip_c1"
+    }
+
+    chain postrouting_down {
+        type filter hook postrouting priority srcnat + 10; policy accept;
+        oifname "br-lan" ip saddr @tg_ip counter comment "steer-down:tg_ip"
+        ip daddr { 192.168.1.50 } ip saddr @tg2_ip_c1 counter comment "steer-down:tg2_ip_c1"
+    }
+
+    chain plugin_prerouting-dnat {
+        type nat hook prerouting priority dstnat + 1; policy accept;
+        jump plugin_tgws_prerouting-dnat
+    }
+
+    chain plugin_tgws_prerouting-dnat {
+        meta mark and 0x0ff00000 == 0x00100000 tcp dport { 443, 80, 5222 } counter redirect to :10480 comment "steer:plugin:tgws:tg"
+        meta mark and 0x0ff00000 == 0x00200000 tcp dport { 443, 80, 5222 } counter redirect to :10481 comment "steer:plugin:tgws:tg2"
+    }
+    chain prerouting_dns {
+        type nat hook prerouting priority dstnat - 2; policy accept;
+        iifname "br-lan" udp dport 53 counter redirect to :5300
+        iifname "br-lan" tcp dport 53 counter redirect to :5300
+    }
+}

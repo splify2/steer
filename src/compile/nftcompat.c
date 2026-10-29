@@ -38,137 +38,24 @@ static int nft_check_text(const char *text) {
     return WEXITSTATUS(st) == 0;
 }
 
-/* Пробная таблица с одной цепочкой nat в семействе fam. Своё имя (<таблица>_nprobe): `nft -c`
- * ничего не создаёт, но с чужой живой таблицей того же имени проверялось бы её содержимое.
- * Приоритет числом, а не словом dstnat: символьные имена приоритетов знает nft с 0.9.1, и на
- * совсем старой сборке проба отказала бы разбором, а не ядром, — ответ был бы про nft, а не
- * про то, что спрашивается. */
-static int nft_nat_probe(const char *fam) {
-    char text[256];
-    snprintf(text, sizeof(text),
-             "table %s %s_nprobe {\n"
-             "    chain c {\n"
-             "        type nat hook prerouting priority -100; policy accept;\n"
-             "    }\n"
-             "}\n", fam, nft_table());
-    return nft_check_text(text);
-}
-
-/* Что из необязательного старое ядро всё-таки умеет. Спрашивается только в старой раскладке:
- * у современного ядра есть всё.
- *
- * notrack — ОТДЕЛЬНОЙ пробой, а не выводом из версии. В upstream выражение появилось в 4.10, и
- * в ядре телефона (LineageOS lineage-22.2, net/netfilter/nft_ct.c) его нет — файл совпадает с
- * v4.9 с точностью до стабильных исправлений. А Debian в своё 4.9 его перенёс: на стенде
- * tools/vm49 (4.9.320 из stretch) nft_ct.ko несёт alias nft-expr-notrack, и `notrack` грузится.
- * Номер версии здесь не ответ — ответ даёт только ядро. */
-static int nft_legacy_extras(void) {
-    int r = 0;
-    /* STEER_NFT_IP6NAT (0 или 1) переопределяет пробу для стендов, как STEER_NFT_CONCAT ниже:
-     * `nft -c` без root (сборка в GitHub Actions) отвечает «не умеет», и раскладка для старого
-     * ядра на стенде теряла таблицу ip6 — на роутере проба идёт от root и отвечает верно. */
-    const char *o6 = getenv("STEER_NFT_IP6NAT");
-    if (o6 && (!strcmp(o6, "0") || !strcmp(o6, "1"))) {
-        if (*o6 == '1') r |= NFTC_IP6NAT;
-    } else if (nft_nat_probe("ip6") == 1) r |= NFTC_IP6NAT;
-    char text[256];
-    snprintf(text, sizeof(text),
-             "table inet %s_nprobe {\n"
-             "    chain c {\n"
-             "        type filter hook output priority -300; policy accept;\n"
-             "        meta mark 0x00000001 notrack\n"
-             "    }\n"
-             "}\n", nft_table());
-    /* STEER_NFT_NOTRACK (0 или 1) — то же переопределение для стендов, что STEER_NFT_IP6NAT выше. */
-    const char *on = getenv("STEER_NFT_NOTRACK");
-    if (on && (!strcmp(on, "0") || !strcmp(on, "1"))) {
-        if (*on == '1') r |= NFTC_NOTRACK;
-    } else if (nft_check_text(text) == 1) r |= NFTC_NOTRACK;
-    return r;
-}
-
-/* Раскладка набора правил — объяснение у объявления в spec.h. Здесь только порядок решения.
- *
- * СНАЧАЛА inet. Принял — ядро современное, и дальше спрашивать нечего: всё, чего нет в 4.9,
- * появилось раньше nat в inet (5.2). Не смогли спросить (нет nft — ответ -1; нет прав, как у
- * стенда под обычным пользователем, — отказ и на inet, и на ip) — тоже современная раскладка:
- * так движок работал всегда, и если ядро её не примет, отказ apply назовёт это сам, а не
- * гадание.
- *
- * Отверг — спрашиваем ip. Принял ip при отказе inet — это и есть старое ядро: nat есть, но не
- * в inet. Отверг и ip — у ядра нет nat вовсе (не собран, не загружен), и раскладка его не
- * вернёт: остаёмся на современной, чтобы отказ был тем же, что и до этой проверки.
- *
- * ip6 спрашивается ОТДЕЛЬНО и только в старой раскладке. На телефоне nat для IPv6
- * (NF_NAT_IPV6) в конфиге ядра LineageOS (mi845_defconfig) не включён, и таблица ip6 с цепочкой nat в том же
- * файле отвергла бы всю транзакцию — то есть вместе с заворотом DNS по IPv6 пропало бы всё. */
-int nft_compat(void) {
-    static int cached = -1;
-    if (cached >= 0) return cached;
-    const char *e = getenv("STEER_NFT_COMPAT");
-    int r = 0;
-    if (e && !strcmp(e, "modern")) {
-        r = 0;
-    } else if (e && !strcmp(e, "legacy-min")) {
-        r = NFTC_LEGACY;
-    } else if (e && !strcmp(e, "legacy")) {
-        r = NFTC_LEGACY | nft_legacy_extras();
-    } else {
-        if (e && *e)
-            fprintf(stderr, "steer[warn] STEER_NFT_COMPAT=%.32s не понят (modern, legacy, "
-                            "legacy-min) — раскладка правил выбирается пробой ядра\n", e);
-        if (nft_nat_probe("inet") == 0 && nft_nat_probe("ip") == 1)
-            r = NFTC_LEGACY | nft_legacy_extras();
-    }
-    cached = r;
-    return r;
-}
-
-/* Раскладка, которую поставил apply, — по ядру (объяснение у объявления). Таблица ip движка есть
- * только в старой раскладке: современная держит всё в inet. Она же и единственное, что читателю
- * от раскладки нужно, — где искать nat и вторую половину доменного набора. Одиночный запрос
- * таблицы по netlink вместо двух `nft -c`: diag и explain демон собирает в своём процессе, и
- * процессов у них быть не должно (docs/architecture.md, «4а», «Сокет и протокол»). */
-int nft_compat_seen(void) {
-    const char *e = getenv("STEER_NFT_COMPAT");
-    if (e && *e) return nft_compat();
-    return nfd_table_exists(NFD_IP, nft_table()) ? NFTC_LEGACY : 0;
-}
-
-/* То же, что nft_compat_seen, и ещё NFTC_IP6NAT: цепочка nat в таблице ip6 движка стоит только
- * при нём (legacy.c, build_family). Спрашивает таблица каналов резолвера (dch_build) — от этого
- * бита зависит fake-IP v6, а собирает её и демон в своём процессе, где проба `nft -c` была бы
- * процессом. До первого apply ответ — «современная раскладка»; расхождение безопасно: резолвер
- * тогда выдаёт поддельный IPv6, карты fakeip6 в ядре нет, и ответ на AAAA пустой (proxy.c), а
- * после apply таблица собирается заново уже по стоящей раскладке. */
-int nft_compat_seen6(void) {
-    const char *e = getenv("STEER_NFT_COMPAT");
-    if (e && *e) return nft_compat();
-    if (!nfd_table_exists(NFD_IP, nft_table())) return 0;
-    return NFTC_LEGACY |
-           (nfd_chain_exists(NFD_IP6, nft_table(), "prerouting_nat") ? NFTC_IP6NAT : 0);
-}
+/* Раскладка набора правил этого запуска (nftcompat.h). */
+int g_nftc;
 
 /* Составной интервальный набор (ipv4_addr . inet_proto . inet_service, flags interval,timeout):
  * примет ли его ядро. Нужен только каналам, у списка которых сужение СМЕШАННОЕ (набор .srs, где
  * часть подсетей — «udp 50000-65535», часть — без сужения, см. src/model/srsplan.c): такой
  * список ложится в ядро одним набором и одним правилом. Интервалы в составном ключе (pipapo)
- * есть с Linux 5.6; на старой раскладке (4.9) их нет заведомо, а на 5.2-5.5 раскладка
- * современная, но набор не примется — поэтому для современной спрашивается ядро, пробной
- * таблицей через `nft -c`. Нет — канал делится на группы по сужению, как раньше делились
+ * есть с Linux 5.6; на 5.2-5.5 раскладка современная, но набор не примется — поэтому
+ * спрашивается ядро, пробной таблицей через `nft -c`. Нет — канал делится на группы по сужению, как раньше делились
  * каналы с разными портами.
  *
  * Спрашивается лениво — только когда такой канал есть, — и один раз на процесс. STEER_NFT_CONCAT
- * (0 или 1) переопределяет ответ для стендов; STEER_NFT_COMPAT=modern без него значит «да»
- * (стенды генератора ядра не спрашивают вовсе), legacy и legacy-min — «нет». */
+ * (0 или 1) переопределяет ответ для стендов. */
 int nft_concat_ok(void) {
     static int cached = -1;
     if (cached >= 0) return cached;
     const char *o = getenv("STEER_NFT_CONCAT");
     if (o && (!strcmp(o, "0") || !strcmp(o, "1"))) return cached = o[0] == '1';
-    if (nft_compat() & NFTC_LEGACY) return cached = 0;
-    const char *e = getenv("STEER_NFT_COMPAT");
-    if (e && !strcmp(e, "modern")) return cached = 1;
     char text[512];
     snprintf(text, sizeof(text),
              "table inet %s_nprobe {\n"
@@ -183,13 +70,13 @@ int nft_concat_ok(void) {
 
 /* Цепочка inet ingress (разметка каналов, compile/generate.c, «разметка на ingress»): примет ли
  * её ядро. Хук ingress в семействе inet — Linux 5.10 (и nftables 0.9.7, иначе отказ разбора), и
- * нужен ещё CONFIG_NETFILTER_INGRESS; номер версии здесь, как и у notrack, не ответ — ответ даёт
+ * нужен ещё CONFIG_NETFILTER_INGRESS; номер версии здесь не ответ — ответ даёт
  * ядро. Проба — на lo: цепочка ingress ставится только на существующее устройство (иначе ядро
  * отвергает всю транзакцию, «No such file or directory»), а lo есть в любом сетевом
  * пространстве. Не смогли спросить (нет nft, нет прав) — «нет»: без ingress движок работает так,
  * как работал до него, и это безопасный ответ на незнание.
  *
- * Старая раскладка — «нет» без пробы: 4.9 хука ingress в inet не знает. */
+ */
 static int ingress_env(void) {
     const char *o = getenv("STEER_NFT_INGRESS");
     if (!o) return -1;
@@ -208,9 +95,6 @@ int nft_ingress_ok(void) {
     if (cached >= 0) return cached;
     int o = ingress_env();
     if (o >= 0) return cached = o != 0;
-    if (nft_compat() & NFTC_LEGACY) return cached = 0;
-    const char *e = getenv("STEER_NFT_COMPAT");
-    if (e && !strcmp(e, "modern")) return cached = 1;
     char text[512];
     snprintf(text, sizeof(text),
              "table inet %s_nprobe {\n"

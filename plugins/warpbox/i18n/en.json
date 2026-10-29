@@ -1,0 +1,4 @@
+{
+  "plugin.name": "WARP",
+  "plugin.description": "Cloudflare WARP: device registration, endpoint selection and replacement"
+}

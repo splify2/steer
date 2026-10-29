@@ -22,6 +22,36 @@
 #include "unit.h"
 #include "ynode.h"
 
+/* Значение скаляра, иначе NULL. */
+static const char *ynode_str(const struct ynode *n) {
+    return n && n->kind == YN_SCALAR ? n->str : NULL;
+}
+
+/* Файл для --dump: целиком в память и ydoc_parse_buf. */
+static struct ydoc *parse_file(const char *path, struct err *e) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(e->msg, sizeof(e->msg), "%s: не открывается", path);
+        return NULL;
+    }
+    size_t len = 0, cap = 0;
+    char *buf = NULL;
+    for (;;) {
+        if (len == cap) {
+            char *nb = realloc(buf, cap = cap ? cap * 2 : 16384);
+            if (!nb) { free(buf); fclose(f); snprintf(e->msg, sizeof(e->msg), "нет памяти"); return NULL; }
+            buf = nb;
+        }
+        size_t got = fread(buf + len, 1, cap - len, f);
+        if (!got) break;
+        len += got;
+    }
+    fclose(f);
+    struct ydoc *d = ydoc_parse_buf(buf, len, path, e);
+    free(buf);
+    return d;
+}
+
 /* ---- печать дерева (--dump и сообщения стенда) ------------------------------------------ */
 static void dump_str(FILE *f, const char *s) {
     fputc('"', f);
@@ -146,7 +176,7 @@ static const char spec_v2[] =
 "  wg1:  { kind: interface, device: wg1 }\n"
 "  nl:   { kind: tunnel, protocol: vless, subscription: sub/nl, nodes: [3, 5],\n"
 "          transport: ws, over: wg0 }\n"
-"  dpi:  { kind: zapret, strategy: zapret/yt.opts }\n"
+"  dpi:  { kind: block }\n"
 "  res:  { kind: group, pick: order,   members: [wg0, wg1], on_fail: drop }\n"
 "  eu:   { kind: group, pick: manual,  members: [nl, res], default: nl }\n"
 "  bal:  { kind: group, pick: balance, members: [nl, wg1] }\n"
@@ -376,6 +406,8 @@ static void test_errors(void) {
                "t.yaml:3:", "ошибка YAML: mapping values are not allowed");
     refuse_has("синтаксис: незакрытый список — место и контекст", "a: [1, 2\nb: 3\n",
                "t.yaml:", "начало в строке 1");
+    refuse_has("синтаксис: место — начало конструкции, а не где заметили", "x: 1\na:\n  b: 1\n c: 2\n",
+               "t.yaml:1:1:", "замечено в строке 4");
     refuse_has("табуляция в отступе названа", "a:\n\tb: 1\n", "t.yaml:2:", "табуляция");
     refuse_eq("повторный ключ: второе вхождение, строка первого",
               "a: 1\nb: 2\na: 3\n", "t.yaml:3:1: ключ \"a\" повторяется (первый раз — строка 1)");
@@ -453,32 +485,11 @@ static void test_errors(void) {
     free(huge);
 }
 
-/* ---- файл ------------------------------------------------------------------------------ */
-static void test_file(void) {
-    char path[] = "/tmp/yamlmatch.XXXXXX";
-    int fd = mkstemp(path);
-    check("файл: временный создан", 1, fd >= 0);
-    if (fd < 0) return;
-    static const char body[] = "ok: 1\nbad: [1,\n";
-    check("файл: записан", (long)sizeof(body) - 1, (long)write(fd, body, sizeof(body) - 1));
-    close(fd);
-    struct err e;
-    memset(&e, 0, sizeof(e));
-    struct ydoc *d = ydoc_parse_file(path, &e);
-    check("файл: ошибка разбора", 1, d == NULL);
-    check("файл: сообщение начинается с пути", 0, strncmp(e.msg, path, strlen(path)));
-    unlink(path);
-    memset(&e, 0, sizeof(e));
-    d = ydoc_parse_file("/nonexistent/spec.yaml", &e);
-    check("файл: нет файла — отказ", 1, d == NULL);
-    check_str("файл: нет файла — текст", "/nonexistent/spec.yaml: не открывается: No such file or directory", e.msg);
-}
-
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--dump") == 0) {
         struct err e;
         memset(&e, 0, sizeof(e));
-        struct ydoc *d = ydoc_parse_file(argv[2], &e);
+        struct ydoc *d = parse_file(argv[2], &e);
         if (!d) { fprintf(stderr, "%s\n", e.msg); return 2; }
         dump(stdout, ydoc_root(d));
         fputc('\n', stdout);
@@ -490,6 +501,5 @@ int main(int argc, char **argv) {
     test_json();
     test_scalars();
     test_errors();
-    test_file();
     return unit_done("yamlmatch");
 }

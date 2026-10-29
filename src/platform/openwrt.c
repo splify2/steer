@@ -66,13 +66,7 @@ const struct platform_ops plat_openwrt = {
     .ca_dirs = NULL,
 
     /* Поле метки — восемь бит с двадцатого (контракт, docs/contract-v1.md); почему именно
-     * они и с кем поле соседствует — marks.h.
-     *
-     * Мини-сборка микропакета tgws живёт в своём бите 28, а не в диапазоне полного движка: оба
-     * ставятся рядом и метят пакеты на одном приоритете, и при общей маске тот, чья цепочка
-     * идёт второй, стирал бы метку первого (подробно — marks.h). Это свойство профиля, а не
-     * платформы: поле задаёт файл профиля src/profile/tgws.c, и plat() (platform.c) подменяет
-     * им эти три числа. */
+     * они и с кем поле соседствует — marks.h. */
     .mark_base = 0x00100000u,
     .mark_bits = 8,
     .mark_mask = PLAT_MARK_MASK(0x00100000u, 8),
@@ -81,9 +75,8 @@ const struct platform_ops plat_openwrt = {
      * с первого выпуска. */
     .rule_pref = 0,
     .probe_pref = 29999,
-    /* Цепочек route на output (каналов на сам роутер) нет, собственный трафик движка не
-     * метится: каналы роутера — на prerouting, трафик самого роутера они не трогают. */
-    .reroute_bit = 0,
+    /* Собственный трафик движка не метится: каналы роутера — на prerouting, трафик самого
+     * роутера они не трогают. */
     .self_mark = 0,
     .tunnel_bit = 0,
     .app_uid_min = 0,
@@ -100,7 +93,6 @@ const struct platform_ops plat_openwrt = {
     .lan_devs_persist = 1,
     /* IPv6 в LAN раздают netifd (ip6prefix, ip6assign) и odhcpd — ipv6: routed и nat действуют. */
     .lan_ipv6_host = 1,
-    .warn_iptables_nat = 1,
     .dnsd_origdst = 0,                /* наверх — dnsmasq роутера на петле */
     .ctl_allow_domain = NULL,
 

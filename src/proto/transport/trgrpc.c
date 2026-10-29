@@ -1,6 +1,6 @@
 /* Транспорт grpc: поток протокола в сообщениях gRPC внутри одного потока HTTP/2.
  *
- * Верхний ярус транспорта (transport.h). Переехал из клиента VLESS (client.c) без изменений.
+ * Верхний ярус транспорта (transport.h).
  *
  * grpc и xhttp — это HTTP/2, а не «другой формат кадров». Разница между ними меньше, чем
  * кажется: оба открывают один поток запросом POST и гоняют байты в его теле. Отличаются
@@ -92,8 +92,13 @@ static int grpc_unwrap(struct grpc_de *de, const unsigned char *in, size_t n,
             while (i < n && de->msg_left > 0) {
                 unsigned char b = in[i++];
                 de->msg_left--;
-                if (de->pb_n >= sizeof(de->pb)) return TR_EGRPC;  /* varint длиннее пяти байт не бывает */
+                /* Длина поля — uint32: varint не длиннее 5 байт (тег + 5 = 6 в pb). Буфер pb больше (8), и
+                 * прежняя проверка по его размеру пропускала 7 байт — сдвиг на 35 и 42 бита в uint32_t
+                 * (UB), а значение молча терялось. */
+                if (de->pb_n >= 6) return TR_EGRPC;
                 if (de->pb_n == 0 && b != 0x0A) return TR_EGRPC;  /* ждём только поле 1 */
+                /* Пятый байт varint несёт лишь биты 28..31: старше — число не влезает в uint32. */
+                if (de->pb_n == 5 && (b & 0x7F) > 0x0F) return TR_EGRPC;
                 de->pb[de->pb_n++] = b;
                 if (de->pb_n > 1 && !(b & 0x80)) { complete = 1; break; }
             }
@@ -128,6 +133,11 @@ static int grpc_open(struct transport *t, const struct tr_node *n, int timeout_s
     /* Имя хоста в :authority — маскировочный домен, как и в SNI: сервер прикрывается им,
      * и запрос к другому имени выдал бы нас сразу. */
     const char *authority = n->sni[0] ? n->sni : n->host;
+    char abuf[136];
+    if (authority == n->host && strchr(authority, ':')) {   /* адрес IPv6 в :authority — в скобках */
+        snprintf(abuf, sizeof(abuf), "[%s]", authority);
+        authority = abuf;
+    }
     char path[320];
     grpc_path(n, path, sizeof(path));
     memset(&t->de, 0, sizeof(t->de));

@@ -3,15 +3,13 @@
 
 /* ---- промежуточное дерево набора правил nftables -------------------------------------
  *
- * ЗАЧЕМ. До 1.7 генератор печатал текст nftables прямо в FILE*, и всё, что хотело знать о
- * наборе правил что-то кроме текста, — старая раскладка ядра 4.9, стенды, будущие модули
- * видов и платформ — должно было либо вклиниваться в fprintf ветками, либо разбирать текст
- * обратно. Дерево разводит эти две заботы: генератор (generate.c) и модули видов строят
- * ЧТО стоит в ядре, раскладка старого ядра (legacy.c) переделывает дерево, а печатник
- * (print.c) один на всех и знает только синтаксис nft.
+ * ЗАЧЕМ. Всё, что хочет знать о наборе правил что-то кроме текста, — стенды, модули видов и
+ * платформ — иначе должно было бы либо вклиниваться в печать ветками, либо разбирать текст
+ * обратно. Дерево разводит эти две заботы: генератор (generate.c) и модули видов строят ЧТО
+ * стоит в ядре, а печатник (print.c) один на всех и знает только синтаксис nft.
  *
- * СТРУКТУРА. Набор правил (struct nft_rs) — список таблиц в порядке печати; таблица
- * (семейство, имя) — упорядоченный список объектов: наборов/карт (struct nft_set) и цепочек
+ * СТРУКТУРА. Набор правил (struct nft_rs) — список таблиц в порядке печати (у движка одна —
+ * inet); таблица (семейство, имя) — упорядоченный список объектов: наборов/карт (struct nft_set) и цепочек
  * (struct nft_chain) вперемешку, потому что в тексте они и идут вперемешку (набор failopen
  * стоит между цепочками, карта fakeip — рядом со своей цепочкой dnat), а снимок генератора
  * обязан совпадать до байта. Цепочка — базовая (type/hook/priority/policy) или обычная
@@ -23,22 +21,18 @@
  * сравнения ничего бы сейчас не дала, а стоила бы второго словаря nft внутри движка. Свой
  * вид получают только те выражения, которые кто-то ищет или переделывает, не разбирая текст:
  *
- *   NFT_X_SETREF   поиск в наборе — старая раскладка переименовывает набор и удваивает
- *                  правило на каждую его половину, стенды спрашивают «правило смотрит в @X»;
+ *   NFT_X_SETREF   поиск в наборе — стенды спрашивают «правило смотрит в @X»;
  *   NFT_X_COUNTER  место счётчика в правиле (оно не всегда в конце: «counter redirect…»),
  *                  сами значения — в полях pkts/bytes правила: перенос счётчиков через apply
- *                  кладёт их туда, клон правила обнуляет;
- *   NFT_X_MARKSET  запись метки пакета — после неё старая раскладка дописывает бит
- *                  перемаршрутизации (STEER_REROUTE_BIT) в цепочках type route;
- *   NFT_X_FAMILY   «meta nfproto ipvN» — в таблице одного семейства лишнее и не печатается;
- *   NFT_X_DNAT     dnat по карте — в inet пишется «dnat ip to», в ip/ip6 «dnat to»;
- *   NFT_X_JUMP, NFT_X_NOTRACK, NFT_X_FRAG6 — чтобы старая раскладка могла снять цепочки с
- *                  notrack (и прыгающие в них) и заменить «exthdr frag exists».
+ *                  кладёт их туда;
+ *   NFT_X_MARKSET  запись метки пакета — стенды спрашивают «правило ставит метку»;
+ *   NFT_X_FAMILY   «meta nfproto ipvN»;
+ *   NFT_X_DNAT     dnat по карте — «dnat ip to» или «dnat ip6 to» по семейству правила;
+ *   NFT_X_NOTRACK  «notrack».
  *
  * comment — отдельным полем: по нему стенды и перенос счётчиков находят правило
  * («steer:<группа>», «steer-down:<группа>»), и печатается он всегда последним. fam — для
- * какого семейства правило (0 — для обоих, 4, 6): в inet это только пометка, а когда
- * старая раскладка разносит nat по таблицам ip и ip6, она решает, куда правило идёт.
+ * какого семейства правило (0 — для обоих, 4, 6): по нему dnat выбирает «ip» или «ip6».
  *
  * ПАМЯТЬ. Всё дерево — в арене (цепочка кусков), освобождение одно: nft_rs_free. Элементы
  * наборов в дерево НЕ загружаются: списки бывают на сотни тысяч префиксов, а роутер — на
@@ -53,18 +47,16 @@
 #include <stddef.h>
 #include <stdio.h>
 
-enum nft_family { NFT_FAM_INET, NFT_FAM_IP, NFT_FAM_IP6 };
+enum nft_family { NFT_FAM_INET };
 
 enum nft_xk {
     NFT_X_RAW,       /* text — готовый текст nft */
-    NFT_X_FAMILY,    /* «meta nfproto ipv<fam>»; печатается только в inet */
+    NFT_X_FAMILY,    /* «meta nfproto ipv<fam>» */
     NFT_X_SETREF,    /* «<text> @<arg>» — поиск в наборе arg */
     NFT_X_MARKSET,   /* text — запись метки пакета («meta mark set …») */
     NFT_X_COUNTER,   /* «counter» или «counter packets N bytes M» (значения — в правиле) */
-    NFT_X_DNAT,      /* «dnat [ip ]to <text> map @<arg>» */
-    NFT_X_JUMP,      /* «jump <arg>» */
+    NFT_X_DNAT,      /* «dnat ip[6] to <text> map @<arg>» */
     NFT_X_NOTRACK,   /* «notrack» */
-    NFT_X_FRAG6,     /* text — «есть заголовок фрагмента IPv6», запись зависит от ядра */
 };
 
 struct nft_expr {
@@ -212,26 +204,17 @@ void ir_setref(struct nft_rule *r, const char *match, const char *set);
 void ir_markset(struct nft_rule *r, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void ir_counter(struct nft_rule *r, unsigned long pkts, unsigned long bytes);
 void ir_dnat(struct nft_rule *r, const char *key, const char *map);
-void ir_jump(struct nft_rule *r, const char *chain);
 void ir_notrack(struct nft_rule *r);
-void ir_frag6(struct nft_rule *r, const char *text);
 void ir_comment(struct nft_rule *r, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void ir_rule_fam(struct nft_rule *r, int fam);
 
 /* ---- поиск ---- */
 /* name == NULL — первая таблица этого семейства. */
 struct nft_table *ir_table_find(const struct nft_rs *rs, enum nft_family fam, const char *name);
-struct nft_set *ir_set_find(const struct nft_table *t, const char *name);
 struct nft_chain *ir_chain_find(const struct nft_table *t, const char *name);
-/* Первое правило с таким комментарием и сколько их (comment == NULL — все правила). */
-struct nft_rule *ir_rule_find(const struct nft_chain *c, const char *comment);
-size_t ir_rule_count(const struct nft_chain *c, const char *comment);
-/* Первое выражение этого вида в правиле или NULL. */
-struct nft_expr *ir_expr_find(const struct nft_rule *r, enum nft_xk k);
-/* Есть ли в правиле выражение, чей текст содержит needle (для стендов). */
+/* Есть ли в правиле выражение, чей текст содержит needle. */
 int ir_rule_has(const struct nft_rule *r, const char *needle);
-/* Приоритет числом (mangle + 1 = -149) и словами, как пишет nft. */
-int ir_prio_value(const struct nft_chain *c);
+/* Приоритет словами, как пишет nft («mangle + 1»). */
 void ir_prio_str(const struct nft_chain *c, char *dst, size_t n);
 
 static inline struct nft_set *ir_obj_set(struct nft_obj *o) {
@@ -240,16 +223,6 @@ static inline struct nft_set *ir_obj_set(struct nft_obj *o) {
 static inline struct nft_chain *ir_obj_chain(struct nft_obj *o) {
     return o && o->k == NFT_OBJ_CHAIN ? (struct nft_chain *)o : NULL;
 }
-
-/* ---- переделка (раскладки) ---- */
-void ir_obj_unlink(struct nft_obj *o);
-void ir_obj_append(struct nft_table *t, struct nft_obj *o);
-void ir_obj_insert_after(struct nft_obj *after, struct nft_obj *o);
-/* Копия правила со своими выражениями (строки общие): в конец dst или сразу за r (dst NULL). */
-struct nft_rule *ir_rule_clone(struct nft_chain *dst, const struct nft_rule *r);
-/* Новое выражение перед before (before == NULL — в конец). */
-struct nft_expr *ir_expr_insert(struct nft_rule *r, struct nft_expr *before, enum nft_xk k,
-                                const char *text, const char *arg);
 
 /* ---- печать (print.c) ---- */
 /* Текст nft всего дерева в f. Элементы наборов читаются из файлов потоком. */

@@ -51,7 +51,6 @@ struct platform_ops {
     uint32_t mark_mask;               /* маска поля — PLAT_MARK_MASK(база, ширина) */
     unsigned rule_pref;               /* приоритет ip rule выходов; 0 — не передавать pref */
     unsigned probe_pref;              /* приоритет правила пробы сторожа */
-    uint32_t reroute_bit;             /* бит перемаршрутизации в старой раскладке; 0 — нет */
     uint32_t self_mark;               /* метка собственного трафика движка; 0 — не метится */
     uint32_t tunnel_bit;              /* бит собственного трафика туннеля через via; 0 — нет */
     unsigned app_uid_min;             /* первый UID приложений (канал «self») */
@@ -64,7 +63,7 @@ struct platform_ops {
      * podkop и forkop спрашивает 127.0.0.42, то есть коннектор, который сам спрашивает dnsd; заворот
      * отправил бы вопрос dnsmasq в dnsd, а имя вне правил — обратно в dnsmasq, по кругу. */
     unsigned local_dns : 1;
-    unsigned zapret : 1;              /* kind zapret и on_fail zapret */
+    unsigned zapret : 1;              /* системный zapret: бит пропуска и on_fail zapret */
     unsigned fw4 : 1;                 /* firewall4: проверки зоны и masquerade после apply */
     unsigned netifd : 1;              /* сторож оживляет интерфейс ifdown/ifup и procd */
     unsigned iptables_masq : 1;       /* masquerade выходов — правилом nat iptables движка */
@@ -81,7 +80,6 @@ struct platform_ops {
      * nat` у выхода (шаг 8 выпуска 1.10, spec.h: out_ipv6_mode). На телефоне раздачей IPv6
      * владеет Tethering Android, и эти режимы там — отсутствие ключа с предупреждением. */
     unsigned lan_ipv6_host : 1;
-    unsigned warn_iptables_nat : 1;   /* старое ядро: предупреждать о живом nat iptables */
     unsigned dnsd_origdst : 1;        /* резолвер переспрашивает того, к кому шёл запрос (умолчание) */
     const char *ctl_allow_domain;     /* SELinux-домен клиента сокета; NULL — проверки нет */
     /* Таблица «пакет → UID» (package_name из наборов sing-box, src/model/srsplan.c); NULL —
@@ -121,6 +119,8 @@ const char *steer_rt_tables_dir(void);
 void steer_set_rt_tables_dir(const char *dir);    /* NULL — вернуть путь платформы */
 /* "<etc_dir>/<name>" в buf; возвращает buf. */
 const char *plat_etc_path(char *buf, size_t n, const char *name);
+/* Настройка платформы: переменная окружения, иначе platform.env менеджера плагинов (steer.platform). */
+const char *plat_setting(const char *name);
 /* КАТАЛОГ ВЫБОРА ЧЕЛОВЕКА — то, что обязано пережить перезагрузку (выбор `select` группы
  * pick: manual). Каталог состояния на роутере — tmpfs (/var/lib/steer живёт в /var → /tmp), и
  * запись там переживает перезапуск службы, но не перезагрузку. Постоянный носитель — каталог,

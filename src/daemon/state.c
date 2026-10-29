@@ -10,6 +10,7 @@
 #include "state.h"
 #include "err.h"
 #include "registry.h"
+#include "plugin.h"
 
 int steerd_init(struct steerd *d, struct loop *l, const char *spec_path, const char *state_dir) {
     memset(d, 0, sizeof(*d));
@@ -46,12 +47,25 @@ int steerd_load(struct steerd *d) {
         free(ns);
         free(ng);
         snprintf(d->err, sizeof(d->err), "нет памяти под спеку");
+        snprintf(d->err_code, sizeof(d->err_code), "spec.no_memory");
+        d->err_args[0] = '\0';
         return -1;
+    }
+    /* Плагины могли смениться (менеджер, ручная раскладка): реестр перечитывается, если каталог
+     * плагинов или state.json изменились. */
+    plugin_refresh();
+    /* Подготовка спеки (хуки плагинов, kinds/plugprep.c) — при старте и reload; сбой не роняет
+     * остальное: выходы, которым подготовка нужна, остаются недоступными и живут по on_fail. */
+    if (spec_prepare(d->spec_path, &e) < 0) {
+        fprintf(stderr, "steer[warn] подготовка спеки: %s\n", e.msg);
+        e.msg[0] = e.code[0] = e.args[0] = '\0';
     }
     /* Тот же порядок, что у cmd_status: разбор, метки из реестра, группы. */
     if (load_spec(d->spec_path, ns, &e) < 0 || registry_assign(ns, &e) < 0 ||
         build_groups(ns, ng, &e) < 0) {
         snprintf(d->err, sizeof(d->err), "%s", e.msg);
+        snprintf(d->err_code, sizeof(d->err_code), "%s", e.code);
+        snprintf(d->err_args, sizeof(d->err_args), "%s", e.args);
         groups_release(ng);
         free(ng);
         spec_release(ns);
@@ -64,8 +78,9 @@ int steerd_load(struct steerd *d) {
     free(d->sp);
     d->sp = ns;
     d->gr = ng;
+    tcp_redir_learn(ns);
     d->have = 1;
-    d->err[0] = '\0';
+    d->err[0] = d->err_code[0] = d->err_args[0] = '\0';
     spec_fp(d->spec_path, d->fp);
     return 0;
 }

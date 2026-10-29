@@ -10,6 +10,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 
+#include "err.h"
 #include "xsconf.h"
 #include "xslink.h"
 #include "xswire.h"
@@ -112,8 +113,10 @@ int cmd_xsteer_link(const char *what, const char *name) {
     struct xs_secrets sec;
     char err[384], from_link[XS_LINK_NAME_MAX] = "";
     if (!what) {
-        fprintf(stderr, "steer: нужен файл, ссылка xs:// или «-» (позиционным аргументом "
-                        "или --config)\n");
+        struct err t;
+        err_setc(&t, "xslink.need_arg", "%s", "нужен файл, ссылка xs:// или «-» (позиционным аргументом "
+                 "или --config)");
+        err_print(&t);
         return 2;
     }
     int was_link = 0;
@@ -121,11 +124,15 @@ int cmd_xsteer_link(const char *what, const char *name) {
                          &was_link, err, sizeof(err)) != 0) {
         /* Хабовую конфигурацию узнаём по её же отказу: ListenPort в файле есть, а пиром он не
          * бывает. Сказать «это хаб» полезнее, чем перечислить, чем файл не годится для пира. */
+        struct err t;
         if (strstr(err, "ListenPort"))
-            fprintf(stderr, "steer: это конфигурация хаба — ссылка описывает доступ ОДНОГО пира, "
-                            "а у хаба список пиров. Ссылку выдают из конфигурации пира.\n");
-        else
-            fprintf(stderr, "steer: %s\n", err);
+            err_setc(&t, "xslink.hub_config", "%s", "это конфигурация хаба — ссылка описывает доступ ОДНОГО пира, "
+                     "а у хаба список пиров. Ссылку выдают из конфигурации пира.");
+        else {
+            err_setc(&t, "xslink.rejected", "%s", err);
+            err_args_add(t.args, sizeof(t.args), "why", err);
+        }
+        err_print(&t);
         return 2;
     }
     char out[XS_URI_MAX];
@@ -144,7 +151,10 @@ int cmd_xsteer_link(const char *what, const char *name) {
      * печати: приватный ключ и есть то, что печатается. Отсюда порядок: напечатали, затёрли. */
     if (rc != 0) {
         xs_conf_wipe(&sec);
-        fprintf(stderr, "steer: %s\n", err);
+        struct err t;
+        err_setc(&t, "xslink.render_failed", "%s", err);
+        err_args_add(t.args, sizeof(t.args), "why", err);
+        err_print(&t);
         return 2;
     }
     printf("%s\n", out);

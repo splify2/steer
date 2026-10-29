@@ -1,4 +1,4 @@
-/* Исключение узлов подписки у выхода kind: tunnel — ключи `exclude` и `exclude_name` спеки v2
+/* Исключение узлов подписки у выхода kind: tunnel — ключи `exclude`, `exclude_name` и `only` спеки v2
  * (docs/spec-v2.md). Общее для всех протоколов туннеля: разбор спеки (model/v2.c), печать
  * (model/v2print.c), виды (kinds/vless.c, hysteria2.c, proxy.c) и модули, которые отбирают
  * кандидатов (vlmain.c, hy2main.c, pxmain.c) и печатают узлы (`*-nodes`).
@@ -26,6 +26,8 @@
 struct node_exclude {
     char (*cc)[3];              /* коды стран, две заглавные латинские буквы; арена спеки */
     size_t cc_n;
+    char (*only)[3];            /* `only`: брать ТОЛЬКО узлы этих стран; арена спеки */
+    size_t only_n;
     const char **names;         /* подстроки имени узла как записаны в спеке; арена спеки */
     size_t names_n;
 };
@@ -87,9 +89,18 @@ static inline int node_name_has(const char *hay, const char *needle) {
     return 0;
 }
 
-/* Исключён ли узел с этим именем. x == NULL или пустое исключение — нет. */
+/* Исключён ли узел с этим именем. x == NULL или пустое исключение — нет. С `only` исключён и узел
+ * без флага: страну ему назвать нечем, а человек просил узлы КОНКРЕТНЫХ стран — угадывать не за что. */
 static inline int node_excluded(const struct node_exclude *x, const char *name) {
     if (!x || !name) return 0;
+    if (x->only_n) {
+        char cc[3];
+        int in = 0;
+        if (node_cc(name, cc))
+            for (size_t i = 0; i < x->only_n && !in; i++)
+                in = x->only[i][0] == cc[0] && x->only[i][1] == cc[1];
+        if (!in) return 1;
+    }
     if (x->cc_n) {
         char cc[3];
         if (node_cc(name, cc))

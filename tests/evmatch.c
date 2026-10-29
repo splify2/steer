@@ -107,6 +107,16 @@ static void child_roundtrip(int wfd) {
                  "n", EVLINE_INT, 3L, (const char *)NULL);
 }
 
+/* ---- сценарий 5: длинное событие (список узлов пула) — выше прежних 480 байт, до PIPE_BUF */
+
+static char g_nodes[8192];
+static void child_long(int wfd) {
+    char envbuf[16];
+    snprintf(envbuf, sizeof envbuf, "%d", wfd);
+    setenv("STEER_EVENT_FD", envbuf, 1);
+    evline_emit("active", "nodes", EVLINE_STR, g_nodes, (const char *)NULL);
+}
+
 /* ---- сценарий 4: труба полна — запись теряется, потомок не виснет */
 
 static void child_full_pipe(int wfd) {
@@ -187,6 +197,7 @@ int main(void) {
         int has_n = evline_int(&e, "n", &nval);
         check("поле n нашлось", 1, has_n);
         check("поле n — число 3", 3, nval);
+        evline_free(&e);
         close(p[0]); close(p[1]);
     }
 
@@ -230,6 +241,49 @@ int main(void) {
               (long)prefilled, (long)got);
         free(all);
         close(p[0]); close(p[1]);
+    }
+
+    /* Сценарий 5: 1000 узлов в списке (~3,5 КиБ) — раньше событие терялось (480 байт), а разбор
+     * резал значение на 200 байтах; теперь доходит целиком. Сверх PIPE_BUF — потеря целиком. */
+    {
+        int p[2];
+        if (pipe(p) != 0) { perror("pipe"); return 1; }
+        size_t o = 0;
+        for (int i = 1; i <= 1000 && o < 3500; i++) o += (size_t)snprintf(g_nodes + o, sizeof g_nodes - o, "%s%d", i > 1 ? "," : "", i);
+        run_child(child_long, p[1]);
+        static char buf[8192];
+        size_t n = drain(p[0], buf, sizeof buf);
+        check("событие в 3 КиБ ушло целиком (прежний предел 480)", 1, n > 3000 ? 1 : 0);
+        if (n) buf[n - 1] = 0;
+        static struct evline e;
+        check("длинное событие разобрано", 0, evline_parse(buf, &e));
+        const char *nodes = evline_str(&e, "nodes");
+        check_str("список узлов дошёл без обрезки", g_nodes, nodes ? nodes : "(нет)");
+        evline_free(&e);
+        /* больше PIPE_BUF — теряется целиком, обрубка в трубе нет */
+        memset(g_nodes, '7', 4500); g_nodes[4500] = 0;
+        run_child(child_long, p[1]);
+        n = drain(p[0], buf, sizeof buf);
+        check("событие длиннее PIPE_BUF в трубу не попало", 0, (long)n);
+        close(p[0]); close(p[1]);
+    }
+
+    /* Поля разбора без предела: двадцать полей и ключ длиннее шестнадцати знаков (прежде — шесть
+     * полей, остальные молча отбрасывались, и ключ в 15 знаков). */
+    {
+        char line[1024];
+        size_t o = (size_t)snprintf(line, sizeof line, "{\"ev\":\"plugin-long-event-name\"");
+        for (int i = 0; i < 20; i++)
+            o += (size_t)snprintf(line + o, sizeof line - o, ",\"field_with_long_key_%d\":%s", i,
+                                  i % 2 ? "\"s\"" : "7");
+        snprintf(line + o, sizeof line - o, "}");
+        struct evline e;
+        check("двадцать полей: событие разобрано", 0, evline_parse(line, &e));
+        check_str("  длинное имя события цело", "plugin-long-event-name", e.ev);
+        long v = 0;
+        check("  двадцатое поле (строка) доступно", 1, evline_str(&e, "field_with_long_key_19") != NULL);
+        check("  девятнадцатое (число) доступно", 1, evline_int(&e, "field_with_long_key_18", &v) && v == 7);
+        evline_free(&e);
     }
 
     return unit_done("evmatch");

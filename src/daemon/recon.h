@@ -52,7 +52,7 @@ struct recon_state {
      * элементы до следующего nft -f не сверяются. */
     int kel_ok;
     uint64_t kel, kel_n;
-    struct recon_out *out;          /* куча, recon_applied растит; отдаёт recon_state_free */
+    struct recon_out *out;          /* куча, recon_applied растит; живёт с демоном */
     size_t n, cap;
     /* Подписи сторожа — отдельно от применённого: их сверка нужна и тогда, когда в ядро ничего
      * не шло. */
@@ -97,7 +97,6 @@ void recon_init(struct recon_state *st);
  * утечка. recon_plan_parse и recon_decide начинают с нулевой структуры (свежее соединение). */
 void recon_plan_free(struct recon_plan *p);
 void recon_diff_free(struct recon_diff *d);
-void recon_state_free(struct recon_state *st);
 /* Разобрать вывод плана. 0 — годный. */
 int recon_plan_parse(const char *text, size_t n, struct recon_plan *p);
 /* Решить по плану и применённому — и по ядру: таблица на месте и та же ли (номер), не изменены ли

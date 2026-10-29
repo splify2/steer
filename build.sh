@@ -46,12 +46,36 @@ REV="$(git describe --tags --exact-match 2>/dev/null ||
 OUT=out
 # Сколько частей сборки не собралось (FAILED в выводе) — код возврата в конце.
 fails=0
+# Предупреждения компилятора (-Wall -Wextra) удачных сборок — для итоговой строки.
+warns=0
 # Свой образ, а не образ сборщика splify: в том нет исходников криптобиблиотеки, и расширенная
 # сборка в нём падает на ненайденном заголовке, тогда как базовая проходит. Незаметная поломка:
 # `./build.sh` печатает архитектуры, пакеты появляются, и только extended молча отсутствует.
 # Тег — по библиотеке: steer-builder:wolfssl (build/Dockerfile); прежний steer-builder:mbedtls
 # с mbedtls 3.6.2 этой сборке не годится — в нём нет исходников wolfSSL.
 IMAGE="${STEER_BUILDER_IMAGE:-steer-builder:wolfssl}"
+
+# Снять каталог выхода libs. Его создаёт docker (от root), и на машине без root (GitHub Actions)
+# `rm -rf` снаружи падал «Permission denied» — а при set -e это роняло всю сборку. Снимаем внутри
+# контейнера; обычный rm — для каталога, который и так наш. Не вышло — возврат 1, решает вызывающий.
+rm_libs() {
+    rm -rf "$1" 2>/dev/null || true
+    [ -e "$1" ] || return 0
+    docker run --rm -v "$PWD:/src" --entrypoint rm "$IMAGE" -rf "/src/$1" >/dev/null 2>&1 || true
+    [ ! -e "$1" ]
+}
+
+# Предупреждения удачной сборки. Файл stderr компилятора раньше читали только при провале
+# (grep error), и на успехе -Wall -Wextra не видел никто: предупреждение жило, пока его не
+# превращали в ошибку. Здесь — число и первые три строки, остальное лежит в самом файле; ничего
+# не печатается, если предупреждений нет, чтобы тихий вывод по строке на архитектуру остался тихим.
+warn_report() {  # ФАЙЛ_STDERR
+    _wn="$(grep -c 'warning:' "$1" 2>/dev/null || true)"
+    [ "${_wn:-0}" -gt 0 ] || return 0
+    warns=$((warns + _wn))
+    printf '    предупреждений: %s (подробно — %s)\n' "$_wn" "$1"
+    grep -m3 'warning:' "$1" | sed 's/^/      /'
+}
 
 # Собрать образ, если его нет. Иначе первая же сборка на чужой машине упирается в
 # «Unable to find image», и человек ищет, откуда его взять, — а он описан прямо здесь,
@@ -127,7 +151,7 @@ mkdir -p "$OUT" build/pkg
 # заметить это можно было бы только на роутере. Отличаются они только метаданными.
 #
 # ipkg-build — родной скрипт OpenWrt, тот же, что собирает пакеты в их SDK. Берётся из
-# сети один раз и кладётся в build/ (см. .gitignore): переписывать его своими руками
+# сети один раз, закреплённой версией (коммит и sha256 ниже), и кладётся в build/ (см. .gitignore): переписывать его своими руками
 # значило бы получить .ipk, который opkg принимает не везде, — ровно та ошибка, на
 # которой в splify обжигались с po2lmo.
 IPKG=build/ipkg-build
@@ -139,22 +163,34 @@ if [ ! -x "$IPKG" ]; then
     # заголовком `Accept: application/vnd.github.raw` отдаёт тот же файл байтами, никуда не
     # перенаправляя. Это машина сборщика, а не роутер, но человек с закрытым доменом не мог
     # собрать пакеты вовсе, и сообщение об этом ничем не отличалось от «сеть отвалилась».
-    RAW=https://raw.githubusercontent.com/openwrt/openwrt/master/scripts/ipkg-build
-    API='https://api.github.com/repos/openwrt/openwrt/contents/scripts/ipkg-build?ref=master'
+    # ВЕРСИЯ ЗАКРЕПЛЕНА (I-540): коммит openwrt/openwrt и сумма файла. Скрипт из ветки master
+    # менялся бы под сборкой без нашего ведома, а чужой код в цепочке выпуска без суммы — дыра:
+    # сумма проверяется ПОСЛЕ скачивания, и несошедшийся файл не кладётся в build/.
+    IPKG_COMMIT=e36c2946b7b574504335ff517b19b7c1eedf1bd8
+    IPKG_SHA256=5a85d59b6656074015bc20add788993143f7b51f371f977b5286af9ed5f22f5b
+    RAW=https://raw.githubusercontent.com/openwrt/openwrt/$IPKG_COMMIT/scripts/ipkg-build
+    API="https://api.github.com/repos/openwrt/openwrt/contents/scripts/ipkg-build?ref=$IPKG_COMMIT"
     ACCEPT='Accept: application/vnd.github.raw'
+    IPKG_TMP="$IPKG.part"
     # curl или wget: на машине сборщика бывает любой из двух, а требовать конкретный
     # значит уронить сборку там, где всё для неё есть.
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$RAW" -o "$IPKG" ||
-        curl -fsSL -H "$ACCEPT" "$API" -o "$IPKG" ||
+        curl -fsSL "$RAW" -o "$IPKG_TMP" ||
+        curl -fsSL -H "$ACCEPT" "$API" -o "$IPKG_TMP" ||
             { echo "не удалось скачать ipkg-build ни из $RAW, ни из $API"; exit 1; }
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$IPKG" "$RAW" ||
-        wget -qO "$IPKG" --header="$ACCEPT" "$API" ||
+        wget -qO "$IPKG_TMP" "$RAW" ||
+        wget -qO "$IPKG_TMP" --header="$ACCEPT" "$API" ||
             { echo "не удалось скачать ipkg-build ни из $RAW, ни из $API"; exit 1; }
     else
         echo "нужен curl или wget, чтобы взять ipkg-build"; exit 1
     fi
+    got="$(sha256sum "$IPKG_TMP" | cut -d' ' -f1)"
+    if [ "$got" != "$IPKG_SHA256" ]; then
+        rm -f "$IPKG_TMP"
+        echo "ipkg-build: сумма $got, ожидалась $IPKG_SHA256 (коммит $IPKG_COMMIT)"; exit 1
+    fi
+    mv "$IPKG_TMP" "$IPKG"
     chmod +x "$IPKG"
 fi
 
@@ -165,15 +201,13 @@ fi
 # неработающей половине.
 #
 #   nftables, ip-full  — правила и `ip rule`; объявлены с самого начала.
-#   kmod-nft-queue     — выражение `queue` в наборе правил: им выход kind=zapret отдаёт
-#                        помеченный трафик своему обработчику nfqws. Без модуля ядро
+#   kmod-nft-queue     — выражение `queue` в наборе правил: им модуль DPI (recheck)
+#                        отдаёт помеченный трафик своему обработчику. Без модуля ядро
 #                        отвергает правило, а `nft -f` атомарен — то есть один такой выход
 #                        снимает маршрутизацию ЦЕЛИКОМ, сообщением «No such file or
 #                        directory» с указателем на слово queue (проверено на роутере,
 #                        OpenWrt 25.12 / nftables 1.1.6). Модуль весит единицы килобайт;
 #                        цена объявить его всем несравнимо меньше цены такого отказа.
-#                        Движок при этом ещё и проверяет ядро сам (nfqueue_supported в
-#                        src/daemon/apply.c) — установке файлом из релиза зависимости не помогают.
 #   conntrack          — снятие установленных соединений выхода при смене маршрута
 #                        (src/daemon/failover.c, conntrack_evict). Снимает их сам движок, через
 #                        ctnetlink, а инструмент — запасной путь на случай, когда ядро по
@@ -206,7 +240,7 @@ pkg_deps() {  # ФАЙЛ_БИНАРНИКА ВИД (core|mod|tun) -> "nftables i
 # обновить один, оставив другой (apk — `имя=версия`, opkg — `имя (= версия)`). Чужие пакеты
 # (nftables, kmod-…) остаются без версии. Демон дополнительно проверяет версию при запуске модуля
 # (hello, docs/ctl.md) — на случай установки файлами мимо менеджера.
-OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-tgws steer-hysteria2 steer-proxy steer-extended "
+OURS=" steer-core steer-vless steer-xsteer steer-obfs steer-hysteria2 steer-proxy steer-warpbox steer-extended "
 dep_apk() {  # ИМЕНА через пробел -> "имя=версия ..." для наших
     for _d in $1; do
         case "$OURS" in *" $_d "*) printf '%s=%s-r1 ' "$_d" "$VERSION" ;; *) printf '%s ' "$_d" ;; esac
@@ -243,6 +277,11 @@ mk_ipk() {
         echo "Description: $ipk_desc"
     } > "$ipk_root/CONTROL/control"
     cp "build/scripts/$ipk_scr.postinst" "$ipk_root/CONTROL/postinst"
+    # preinst — только у ядра: запомнить пакеты модулей до того, как менеджер их снимет.
+    if [ -f "build/scripts/$ipk_scr.preinst" ]; then
+        cp "build/scripts/$ipk_scr.preinst" "$ipk_root/CONTROL/preinst"
+        chmod 0755 "$ipk_root/CONTROL/preinst"
+    fi
     cp "build/scripts/$ipk_scr.prerm" "$ipk_root/CONTROL/prerm"
     cp "build/scripts/$ipk_scr.postrm" "$ipk_root/CONTROL/postrm"
     chmod 0755 "$ipk_root/CONTROL/postinst" "$ipk_root/CONTROL/prerm" "$ipk_root/CONTROL/postrm"
@@ -259,7 +298,11 @@ mk_ipk() {
     rm -rf "$ipk_root/CONTROL"
 }
 
-echo "steer $VERSION"
+# Раскладка роутера: 2.1 (умолчание) — ядро без стека протоколов, net1 и протоколы плагинами (.s2p и семя
+# в steer-core, build/pack-s2p.sh); 2.0 — прежние пакеты steer-<m> на libsteer (STEER_LAYOUT=2.0).
+LAYOUT="${STEER_LAYOUT:-2.1}"
+PLUGS="$(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC) $(profile_var PLUGINS_TLS)"
+echo "steer $VERSION (раскладка $LAYOUT)"
 for spec in $ISAS; do
     arch=${spec%%:*}; rest=${spec#*:}
     target=${rest%%:*}; mcpu=${rest#*:}
@@ -270,6 +313,7 @@ for spec in $ISAS; do
                -o "build/steerd-$arch" $BASE_INC $THIRD_DEFS $BASE_SRC \
                2>"build/$arch.err"; then
         echo "$(stat -c %s "build/steerd-$arch") bytes"
+        warn_report "build/$arch.err"
     else
         # Старый бинарник обязан исчезнуть: иначе упаковка молча положит в пакет
         # сборку от прошлого раза, и ошибка компиляции превратится в «версия
@@ -288,6 +332,7 @@ for spec in $ISAS; do
                -o "build/steer-client-$arch" $BASE_INC $CLIENT_SRC \
                2>"build/$arch-client.err"; then
         echo "$(stat -c %s "build/steer-client-$arch") bytes"
+        warn_report "build/$arch-client.err"
     else
         rm -f "build/steer-client-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch-client.err" || head -1 "build/$arch-client.err")"
@@ -295,42 +340,8 @@ for spec in $ISAS; do
         continue
     fi
 
-    # Мини-вариант для микропакета tgws: только перехват Telegram и то, на чём он стоит.
-    # Нужен потому, что тот пакет носит бинарник внутри себя, и три четверти мегабайта там
-    # заметны: на 4/32 разница между «ставится» и «места нет».
-    printf '  %-26s ' "$arch (tgws)"
-    if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
-            /src/build/build-ext.sh "$target" "$mcpu" "/src/build/steer-tgws-$arch" \
-            "$VERSION" tgws "$REV" \
-            2>"build/$arch-tgws.err"; then
-        echo "$(stat -c %s "build/steer-tgws-$arch") bytes"
-    else
-        rm -f "build/steer-tgws-$arch"
-        echo "FAILED — $(grep -m1 error "build/$arch-tgws.err" || head -1 "build/$arch-tgws.err")"
-        fails=$((fails + 1))
-    fi
-
-    # Мини-вариант для микропакета tgws: только перехват Telegram и то, на чём он стоит.
-    # Нужен потому, что тот пакет носит бинарник внутри себя, и три четверти мегабайта там
-    # заметны: на 4/32 разница между «ставится» и «места нет».
-    #
-    # ИМЯ ДРУГОЕ — stgws, а не steer. Микропакет ставится и туда, где полный движок уже стоит
-    # (его ставит splify2 или сам brb), и один путь на два разных бинарника означал бы, что
-    # установка микропакета молча подменяет полный движок урезанным.
-    printf '  %-26s ' "$arch (stgws)"
-    if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
-            /src/build/build-ext.sh "$target" "$mcpu" "/src/build/stgws-$arch" \
-            "$VERSION" tgws "$REV" \
-            2>"build/$arch-tgws.err"; then
-        echo "$(stat -c %s "build/stgws-$arch") bytes"
-    else
-        rm -f "build/stgws-$arch"
-        echo "FAILED — $(grep -m1 error "build/$arch-tgws.err" || head -1 "build/$arch-tgws.err")"
-        fails=$((fails + 1))
-    fi
-
-    # Разделяемая раскладка роутера (шаг 4 выпуска 1.10): libsteer-wolfssl.so, libsteer.so, steerd и
-    # модули steer-vless, steer-xsteer, steer-obfs, steer-tgws. Логика — build/build-libs.sh (одна
+    # Разделяемая раскладка роутера (шаг 4 выпуска 1.10): libsteer-wolfssl.so, libsteer.so, steerd, net1 и
+    # программы плагинов (с 2.1 — и мост tgws, плагин репозитория splify2-extended-plugins). Логика — build/build-libs.sh (одна
     # для этого цикла и для tests/libs-test.sh), списки файлов — build/sources.mk. Статического
     # расширенного бинарника роутера больше нет: его место — steerd + модули на общих библиотеках
     # (статическая сборка расширенной части остаётся у телефона, шаг 6, и у стендов).
@@ -339,19 +350,30 @@ for spec in $ISAS; do
     # абсолютному пути и обязан совпасть с файлом musl на роутере.
     printf '  %-26s ' "$arch (libs)"
     libs="build/libs/$arch"
-    rm -rf "$libs"
+    if ! rm_libs "$libs"; then
+        echo "FAILED — не удалось снять $libs (владелец root?)"
+        fails=$((fails + 1))
+        rm -f "$OUT"/steer-*_"$arch".apk "$OUT"/steer-*_"$arch".ipk
+        continue
+    fi
     # Объектные файлы снимаются и владелец выхода возвращается ВНУТРИ контейнера: docker пишет от
     # root, и на машине без root (GitHub Actions) `rm -rf obj` снаружи падал «Permission denied».
     if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh \
             -e CC="zig cc -target $target -mcpu=$mcpu" -e AR="zig ar" -e ZIG=1 \
-            -e INTERP="$(interp_of "$target" "$mcpu")" "$IMAGE" -c \
+            -e INTERP="$(interp_of "$target" "$mcpu")" -e STEER_LAYOUT="$LAYOUT" "$IMAGE" -c \
             'sh /src/build/build-libs.sh "$1" "$2" "$3"; rc=$?; rm -rf "$1/obj"; chown -R "$4" "$1"; exit $rc' _ \
             "/src/$libs" "$VERSION" "$REV" "$(id -u):$(id -g)" \
             >"build/$arch-libs.log" 2>"build/$arch-libs.err"; then
         echo "libsteer $(stat -c %s "$libs"/libsteer.so.*) + wolfssl $(stat -c %s "$libs"/libsteer-wolfssl.so.*)" \
              "+ steerd $(stat -c %s "$libs/steerd") bytes"
+        if [ "$LAYOUT" = 2.1 ]; then
+            printf '  %-26s net1 %s' "" "$(stat -c %s "$libs/plugins/net1/lib/libs2p-net.so.1")"
+            for _p in $PLUGS; do printf ' + %s %s' "$_p" "$(stat -L -c %s "$libs/plugins/$_p/bin/$_p")"; done
+            echo " bytes"
+        fi
+        warn_report "build/$arch-libs.err"
     else
-        rm -rf "$libs"
+        rm_libs "$libs" || echo "    (не удалось снять $libs)"
         echo "FAILED — $(grep -m1 error "build/$arch-libs.err" || head -1 "build/$arch-libs.err")"
         fails=$((fails + 1))
         # Пакеты этой архитектуры от прошлой сборки — не этой: оставь их в $OUT, и список «packages»
@@ -363,19 +385,17 @@ for spec in $ISAS; do
 
     # ---- пакеты ---------------------------------------------------------------------------
     #
-    # Пять пакетов модулей, ядро и один мета-пакет на архитектуру (docs/architecture.md, «Сборки»):
+    # Раскладка 2.1 — один пакет на архитектуру (docs/architecture.md, «Сборки»):
     #
     #   steer-core         ядро и общая крипта: steerd на общих библиотеках, клиент steer,
-    #                      libsteer.so.<версия> (модель, виды, TLS, транспорты, стек, слой
-    #                      криптографии), libsteer-wolfssl.so.<версия wolfSSL> (наша wolfSSL,
-    #                      QUIC включён заранее, см. build/wolfssl), init-скрипт, обработчик обхода,
-    #                      hotplug, keep.d. dnsd — подкоманда steerd, своего файла у него нет;
-    #   steer-vless, steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2
-    #                      по одному бинарнику модуля; зависят от steer-core ТОЧНОЙ версии и ничего
-    #                      из файлов ядра не повторяют;
-    #   steer-extended     мета-пакет на переход: ядро и модули vless, xsteer, obfs, tgws (без
-    #                      hysteria2). Его по имени ставит splify2 (`steer_install`); уйдёт,
-    #                      когда splify2 начнёт ставить steer-core и модули сам.
+    #                      libsteer.so.<версия> (модель, виды, TLS, слой криптографии),
+    #                      libsteer-wolfssl.so.<версия wolfSSL> (наша wolfSSL, QUIC включён заранее,
+    #                      см. build/wolfssl), init-скрипт, обработчик обхода, hotplug, keep.d, семя
+    #                      плагинов протоколов. dnsd — подкоманда steerd, своего файла у него нет.
+    #
+    # Протоколы и мост Telegram — плагины (.s2p), пакетов steer-<модуль> больше нет: steer-core 2.1
+    # заменяет их все (steer-tgws в том числе). Прежняя раскладка 2.0 (пакеты модулей и мета-пакет
+    # steer-extended) ниже осталась под LAYOUT=2.0, но build/build-libs.sh её уже не собирает.
     #
     # Библиотеки лежат в steer-core, отдельных пакетов libsteer и libsteer-wolfssl нет. Довод:
     # ядру крипта нужна и без модулей — steerd сам ходит по HTTPS (замер групп, urltls) и
@@ -403,10 +423,6 @@ for spec in $ISAS; do
     cp "$libs/steerd" "$root/usr/sbin/steerd"
     cp "build/steer-client-$arch" "$root/usr/sbin/steer"
     ln -sf steerd "$root/usr/sbin/steer-tools"
-    # Обработчик обхода DPI: его запускает procd для каждого выхода kind=zapret, и читает он
-    # файл стратегии при КАЖДОМ запуске (см. его шапку). Обработчик — часть ядра, а не модуль:
-    # правила очереди пишет ядро, а kind=zapret входит в каждый профиль.
-    cp files/usr/sbin/steer-nfqws "$root/usr/sbin/steer-nfqws"
     cp files/etc/init.d/steer "$root/etc/init.d/steer"
     # Реакция на события сети: подъём и падение интерфейса доходят до сторожа сразу, а не
     # через минуту опроса. Файл невелик, но без него правка I-137 существует только в дереве.
@@ -419,7 +435,57 @@ for spec in $ISAS; do
     # Файл кладётся В ПОЛЕЗНУЮ НАГРУЗКУ, а не в скрипт установки: он обязан исчезнуть вместе
     # с пакетом и принадлежать ему, как init-скрипт.
     cp files/lib/upgrade/keep.d/steer "$root/lib/upgrade/keep.d/steer"
-    chmod 0755 "$root/usr/sbin/steerd" "$root/usr/sbin/steer" "$root/usr/sbin/steer-nfqws" \
+    # Плагины (src/pluginmgr): каталог, официальный репозиторий и что из них переживает sysupgrade.
+    # keep.d/steer-plugins менеджер переписывает при каждой установке и снятии (дописывает keep
+    # плагинов); в пакете — основа: оба каталога целиком (plugin-sdk, s2p.md, «sysupgrade»).
+    # Ключи официального репозитория (/usr/share/steer/keys/<роль>/) и семя (/usr/share/steer/seed)
+    # кладёт конвейер выпуска, когда они есть; без ключа индекс официального репозитория не принимается.
+    mkdir -p "$root/usr/lib/steer/plugins" "$root/etc/steer/plugins/repos.d"
+    cp files/lib/upgrade/keep.d/steer-plugins "$root/lib/upgrade/keep.d/steer-plugins"
+    cp files/etc/steer/plugins/repos.d/splify2.json "$root/etc/steer/plugins/repos.d/splify2.json"
+    chmod 0644 "$root/lib/upgrade/keep.d/steer-plugins" "$root/etc/steer/plugins/repos.d/splify2.json"
+    # Вход fw4 для перенаправленных к службам steer соединений (гостевые зоны с input REJECT) —
+    # почему, в самом файле. fw4 подхватывает его при перечитывании; postinst перечитывает.
+    mkdir -p "$root/usr/share/nftables.d/chain-pre/input"
+    cp files/usr/share/nftables.d/chain-pre/input/30-steer.nft \
+       "$root/usr/share/nftables.d/chain-pre/input/30-steer.nft"
+    chmod 0644 "$root/usr/share/nftables.d/chain-pre/input/30-steer.nft"
+    # Версия steer-abi ядра — для .so-плагинов (steerd динамический и грузит их сам: src/daemon/plugso.c). Загрузчик внутри
+    # steerd, отдельной libsteer-plugin.so в пакете нет; файл — то, что читает менеджер плагинов
+    # (compat.steer-abi), не запуская steerd.
+    mkdir -p "$root/usr/share/steer"
+    printf 'steer-abi %s\n' "$(sh build/abi.sh)" > "$root/usr/share/steer/steer-abi"
+    chmod 0644 "$root/usr/share/steer/steer-abi"
+    # Открытые ключи официальных репозиториев (/usr/share/steer/keys/<роль>/<номер>.pub и revoked; роль — index,
+    # protocols, plugins; plugin-sdk/docs/s2p.md, «Ключи и ротация»). Два источника: дерево (files/usr/share/steer/keys —
+    # прежние ключи на время ротации и revoked) и конвейер выпуска ($STEER_KEYS_DIR — ключи, выведенные из секретов
+    # build/release-keys.sh). Без ключа роли index менеджер не примет индекс официального репозитория.
+    for _kd in files/usr/share/steer/keys "${STEER_KEYS_DIR:-}"; do
+        [ -n "$_kd" ] && [ -d "$_kd" ] || continue
+        mkdir -p "$root/usr/share/steer/keys"
+        cp -R "$_kd/." "$root/usr/share/steer/keys/"
+    done
+    if [ -d "$root/usr/share/steer/keys" ]; then
+        find "$root/usr/share/steer/keys" -type d -exec chmod 0755 {} +
+        find "$root/usr/share/steer/keys" -type f -exec chmod 0644 {} +
+    fi
+    # Семя (раскладка 2.1, plugin-sdk/docs/migration-2.1.md, раздел 5): подписанные .s2p протоколов и net1
+    # под эту архитектуру и index.json с подписью — переход и первая установка без сети. Архивы же
+    # кладутся в $OUT рядом с пакетами (их публикует репозиторий плагинов).
+    if [ "$LAYOUT" = 2.1 ]; then
+        _seedrc=0
+        sh build/pack-s2p.sh "$libs" "$arch" "$VERSION" "$OUT" "$root/usr/share/steer/seed" \
+            > "build/$arch-s2p.log" 2>&1 || _seedrc=$?
+        case "$_seedrc" in
+            0) printf '  %-26s семя %s байт (%s архивов)\n' "" "$(du -sb "$root/usr/share/steer/seed" | cut -f1)" \
+                   "$(find "$root/usr/share/steer/seed" -name '*.s2p' | wc -l)"
+               grep -h 'ТЕСТОВЫМ' "build/$arch-s2p.log" | sed 's/^/    /' || true ;;
+            3) echo "    семя пропущено: $(tail -1 "build/$arch-s2p.log")" ;;
+            *) echo "    FAILED — .s2p: $(grep -m1 -i 'error\|ошиб\|отказ' "build/$arch-s2p.log" || tail -1 "build/$arch-s2p.log")"
+               fails=$((fails + 1)) ;;
+        esac
+    fi
+    chmod 0755 "$root/usr/sbin/steerd" "$root/usr/sbin/steer" \
                "$root/etc/init.d/steer" "$root/etc/hotplug.d/iface/95-steer"
     chmod 0644 "$root/lib/upgrade/keep.d/steer"
 
@@ -447,9 +513,36 @@ for spec in $ISAS; do
     # установки: в одной транзакции ядро встаёт раньше коннектора, и /etc/init.d/sing-box ещё
     # чужой; метку ставит install.sh тестового набора на время установки.
     mkdir -p build/scripts
+    # preinst/pre-upgrade ядра: какие модули стояли пакетами (steer-vless…, раскладка 2.0). Решатель
+    # apk снимает их РАНЬШЕ, чем зовёт pre-upgrade нового ядра (проверено на 3.0.5: «Purging steer-vless»
+    # идёт первым), так что бинарников уже нет — остаётся /etc/apk/world: имена пакетов в нём стоят,
+    # их закрывает provides ядра. У opkg preinst идёт до снятия, там виден и бинарник. Список отдаёт
+    # `steer plugin migrate` в postinst (migration-2.1.md, 3.1), и тот ставит плагины из семени. tgws в
+    # список не входит: плагин моста — из репозитория splify2-extended-plugins, в семени его нет. После первого перехода (есть migrate.done.json) имена в
+    # world остаются навсегда и решать ими уже нельзя: человек мог снять плагин. Пишется в
+    # /etc/steer/plugins: keep.d переносит его через sysupgrade.
+    cat > build/scripts/steer.preinst <<'EOF'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+[ -e /etc/steer/plugins/migrate.done.json ] && exit 0
+_pk=""
+for _m in vless hysteria2 proxy xsteer obfs warpbox; do
+	if [ -e "/usr/sbin/steer-$_m" ] || grep -Eq "^steer-$_m(><.*)?\$" /etc/apk/world 2>/dev/null; then
+		_pk="$_pk${_pk:+,}\"steer-$_m\""
+	fi
+done
+[ -n "$_pk" ] || exit 0
+mkdir -p /etc/steer/plugins
+printf '{"packages":[%s]}\n' "$_pk" > /etc/steer/plugins/migrate.json
+exit 0
+EOF
     cat > build/scripts/steer.postinst <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
+[ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null
+# Плагины протоколов — по спеке и по прежним пакетам модулей, из семени без сети (раскладка 2.1);
+# в прежней раскладке команды нет — отказ молчит. До перезапуска службы: демон встаёт с плагинами.
+/usr/sbin/steer plugin migrate 2>&1 | sed 's/^/steer: /'
 if grep -q steer-box-connector /etc/init.d/sing-box 2>/dev/null || [ -e /var/run/steer-box-installing ]; then
 	/etc/init.d/steer stop 2>/dev/null
 	/etc/init.d/steer disable 2>/dev/null
@@ -481,7 +574,8 @@ EOF
     printf '#!/bin/sh\nexit 0\n' > build/scripts/noop.postinst
     cp build/scripts/noop.postinst build/scripts/noop.prerm
     cp build/scripts/noop.postinst build/scripts/noop.postrm
-    printf '#!/bin/sh\nexit 0\n' > build/scripts/steer.postrm
+    # Включение входа fw4 (usr/share/nftables.d) уходит с пакетом — fw4 перечитывает набор без него.
+    printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n[ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null\nexit 0\n' > build/scripts/steer.postrm
     chmod +x build/scripts/*
 
     # pack ИМЯ КОРЕНЬ ЗАВИСИМОСТИ ОПИСАНИЕ ВИД-СКРИПТОВ [КОНФЛИКТЫ] [ЗАМЕНЯЕТ] — оба формата из одного
@@ -490,17 +584,22 @@ EOF
     # в depends; opkg: Conflicts). ЗАМЕНЯЕТ — пакеты, чьи файлы этот вправе занять и чьё имя он
     # берёт на себя (apk: replaces + provides имя=версия; opkg: Replaces + Provides).
     pack() {
-        _n="$1"; _r="$2"; _dp="$3"; _ds="$4"; _sk="$5"; _cf="${6:-}"; _rp="${7:-}"
+        _n="$1"; _r="$2"; _dp="$3"; _ds="$4"; _sk="$5"; _cf="${6:-}"; _rp="${7:-}"; _cfi="${8:-}"
         _dinfo=""
         _dall="$(dep_apk "$_dp")"
         for _c in $_cf; do _dall="$_dall !$_c"; done
         [ -n "$_dall" ] && _dinfo="--info depends:'$_dall'"
         _ipkx=""
-        [ -n "$_cf" ] && _ipkx="$(printf 'Conflicts: %s' "$(echo $_cf | sed 's/ /, /g')")"
+        # opkg снимает установленный пакет только при Conflicts вместе с Replaces (проверено на opkg 24.10:
+        # одних Provides/Replaces мало — модули 2.0.5 остаются стоять); для apk то же делает provides.
+        [ -n "$_cf$_cfi" ] && _ipkx="$(printf 'Conflicts: %s' "$(echo $_cf $_cfi | sed 's/ /, /g')")"
         if [ -n "$_rp" ]; then
-            _pv="${_rp%% *}"
-            _dinfo="$_dinfo --info replaces:'$_rp' --info provides:'$_pv=$VERSION-r1'"
-            _ipkx="$(printf '%s\nReplaces: %s\nProvides: %s' "$_ipkx" "$(echo $_rp | sed 's/ /, /g')" "$_pv")"
+            # provides — на КАЖДОЕ имя «заменяет», а не на первое (plugin-sdk/docs/open.md, О-23):
+            # steer-core 2.1 закрывает собой все прежние пакеты модулей (migration-2.1.md, раздел 2).
+            _pv=""
+            for _n1 in $_rp; do _pv="$_pv${_pv:+ }$_n1=$VERSION-r1"; done
+            _dinfo="$_dinfo --info replaces:'$_rp' --info provides:'$_pv'"
+            _ipkx="$(printf '%s\nReplaces: %s\nProvides: %s' "$_ipkx" "$(echo $_rp | sed 's/ /, /g')" "$(echo $_rp | sed 's/ /, /g')")"
             _ipkx="$(printf '%s' "$_ipkx" | sed '/^$/d')"
         fi
         # apk: скрипты — четыре хука. post-deinstall нужен модулям (перезапуск после удаления).
@@ -520,6 +619,7 @@ EOF
                --info name:$_n --info version:$VERSION-r1 \
                --info description:'$_ds' \
                --info arch:$arch $_dinfo \
+               $( [ -f build/scripts/$_sk.preinst ] && echo "--script pre-install:build/scripts/$_sk.preinst --script pre-upgrade:build/scripts/$_sk.preinst") \
                --script post-install:build/scripts/$_sk.postinst \
                --script post-upgrade:build/scripts/$_sk.postinst \
                --script pre-deinstall:build/scripts/$_sk.prerm \
@@ -533,15 +633,30 @@ EOF
     # steer, libsteer и libsteer-wolfssl — конфликтуют и заменяются (миграция, см. выше). Имя
     # `steer` идёт первым в ЗАМЕНЯЕТ: pack берёт первое как provides.
     deps="$(pkg_deps "$root/usr/sbin/steerd" core)"
+    # kmod-tun держит само ядро: протоколы-плагины (vless, hysteria2, xsteer) создают TUN, а прежние пакеты
+    # модулей тянули kmod-tun и при переходе снимаются в той же транзакции — apk тут же удаляет и
+    # осиротевший kmod-tun (проверено на apk 3.0.5), а менеджер плагинов из postinst пакет поставить не
+    # может: база заперта. Без этой зависимости плагины встали бы без TUN (migration-2.1.md, раздел 4).
+    [ "$LAYOUT" = 2.0 ] || deps="$deps $(pkg_deps "" tun)"
+    # Раскладка 2.1: протоколы и мост Telegram — плагины, steer-core берёт на себя имена всех прежних пакетов
+    # модулей (с steer-tgws: мост — плагин tgws) и мета-пакета (migration-2.1.md, раздел 2) — конфликтует с
+    # ними и заменяет, так что установка ядра 2.1 снимает их в той же транзакции.
+    _old="steer libsteer libsteer-wolfssl"
+    _mods=""
+    [ "$LAYOUT" = 2.0 ] || _mods="steer-vless steer-hysteria2 steer-proxy steer-xsteer steer-obfs steer-warpbox steer-tgws steer-extended"
     pack steer-core "$root" "$deps" "steer-core: ядро маршрутизации по политике (каналы на входе, nftables на выходе) и общая крипта" \
-        steer "steer libsteer libsteer-wolfssl" "steer libsteer libsteer-wolfssl"
+        steer "$_old" "$_old $_mods" "$_mods"
 
     # Модули: по одному бинарнику в usr/sbin рядом со steerd, где их находит движок (src/lib/
     # module.c). Зависимость от steer-core — точной версии: ядро и модуль общаются линией событий,
     # формат которой между выпусками не обещан (hello в docs/ctl.md).
-    # steer-hysteria2 и steer-proxy — тоже модули, но в steer-extended они НЕ входят: отдельные
-    # пакеты, которые ставят сознательно (см. мета-пакет ниже).
-    for m in vless xsteer obfs tgws hysteria2 proxy; do
+    # steer-hysteria2, steer-proxy и steer-warpbox — тоже модули, но в steer-extended они НЕ входят:
+    # отдельные пакеты, которые ставят сознательно (см. мета-пакет ниже). У steer-warpbox нет
+    # зависимости от модуля ядра: туннели WARP — выходы awg ядра steer, а им годится и kmod-amneziawg
+    # (сторонний, с обфускацией), и kmod-wireguard из фидов OpenWrt — выбор за человеком.
+    _modlist=""
+    [ "$LAYOUT" = 2.0 ] && _modlist="vless xsteer obfs hysteria2 proxy warpbox"
+    for m in $_modlist; do
         mroot="build/pkg/$arch-$m"
         rm -rf "$mroot"
         mkdir -p "$mroot/usr/sbin"
@@ -551,9 +666,9 @@ EOF
             vless)  md="steer-vless: клиент VLESS/Reality для steer (модуль)"; mk=tun ;;
             xsteer) md="steer-xsteer: клиент звезды xsteer для steer (модуль)"; mk=tun ;;
             obfs)   md="steer-obfs: обфускатор WireGuard для steer (модуль)"; mk=mod ;;
-            tgws)   md="steer-tgws: мост Telegram для steer (модуль)"; mk=mod ;;
             hysteria2) md="steer-hysteria2: клиент hysteria2 (QUIC, Brutal) для steer (модуль)"; mk=tun ;;
             proxy)  md="steer-proxy: клиенты trojan, shadowsocks, socks, http, vmess для steer (модуль)"; mk=tun ;;
+            warpbox) md="steer-warpbox: Cloudflare WARP для steer — регистрация, подбор точек, замена (модуль)"; mk=mod ;;
         esac
         mdeps="steer-core $(pkg_deps "$mroot/usr/sbin/steer-$m" "$mk")"
         pack "steer-$m" "$mroot" "$mdeps" "$md" mod
@@ -561,13 +676,14 @@ EOF
 
     # steer-box-connector — свой репозиторий (github.com/splify2/steer-box-connector).
 
-    # Мета-пакет steer-extended (устарел, оставлен на переход): ядро и модули vless, xsteer, obfs,
-    # tgws; hysteria2 не входит. Пустой пакет менеджеры не любят, поэтому в нём один маленький
+    # Мета-пакет steer-extended (устарел, оставлен на переход): ядро и модули vless, xsteer, obfs;
+    # hysteria2 не входит. Пустой пакет менеджеры не любят, поэтому в нём один маленький
     # файл-метка. Имя сохранено ради splify2, который ставит его по имени.
+    [ "$LAYOUT" = 2.0 ] || continue
     xroot="build/pkg/$arch-extended"
     rm -rf "$xroot"
     mkdir -p "$xroot/usr/lib/steer"
-    printf 'steer-extended %s: мета-пакет — steer-core, steer-vless, steer-xsteer, steer-obfs, steer-tgws\n' \
+    printf 'steer-extended %s: мета-пакет — steer-core, steer-vless, steer-xsteer, steer-obfs\n' \
         "$VERSION" > "$xroot/usr/lib/steer/extended"
     # Системные зависимости 1.5.x (nftables ip-full conntrack kmod-nft-queue kmod-tun) мета-пакет
     # повторяет нарочно. opkg (OpenWrt 24.10 и старше) при обновлении steer-extended 1.5.x до этого
@@ -575,8 +691,8 @@ EOF
     # и снимает: после `opkg install ./*-2.0.0-1_<арх>.ipk` на роутере не оставалось ip-full,
     # conntrack, kmod-nft-queue и (без hysteria2) kmod-tun. apk решает транзакцию целиком и этого
     # не делает, но зависимости общие для обоих форматов.
-    pack steer-extended "$xroot" "steer-core steer-vless steer-xsteer steer-obfs steer-tgws $(pkg_deps "" core) $(pkg_deps "" tun)" \
-        "steer-extended (устарел, взамен — steer-core и нужные модули): ядро, VLESS/Reality, xsteer, обфускатор, мост Telegram" noop
+    pack steer-extended "$xroot" "steer-core steer-vless steer-xsteer steer-obfs $(pkg_deps "" core) $(pkg_deps "" tun)" \
+        "steer-extended (устарел, взамен — steer-core и нужные модули): ядро, VLESS/Reality, xsteer, обфускатор" noop
 done
 
 # ---- серверная половина обфускации: архив для VPS -----------------------------
@@ -675,6 +791,7 @@ for arch in x86_64 aarch64_generic; do
     chmod 0755 "$stage/steer-hub" "$stage/xs_install.sh"
     tar -C "$stage" -czf "$OUT/steer-hub-$uarch.tar.gz" .
     printf '%s bytes\n' "$(stat -c %s "$OUT/steer-hub-$uarch.tar.gz")"
+    warn_report "build/$arch-hub.err"
 done
 
 # Владелец всего, что писал docker (от root): бинарники и архивы wolfSSL в build/, пакеты apk в
@@ -689,6 +806,7 @@ fi
 
 echo "packages:"
 ls -1 "$OUT" 2>/dev/null | sed 's/^/  /'
+[ "$warns" = 0 ] || echo "build.sh: предупреждений компилятора за сборку — $warns (строки выше, полный текст — build/*.err)"
 # Что-то не собралось — код отказа: прежде сборка с FAILED в выводе отвечала 0, и вызывающий (руками,
 # release.yml) узнавал об этом, только читая вывод.
 if [ "$fails" != 0 ]; then

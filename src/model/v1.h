@@ -1,4 +1,4 @@
-/* Спека v1 (JSON со `schema: 1` или `2`) → модель v2 — src/model/v1.c. До 2.0.0. */
+/* Спека v1 (JSON со `schema: 1` или `2`) → модель v2 — src/model/v1.c. Только перевод при загрузке. */
 #ifndef STEER_V1_H
 #define STEER_V1_H
 

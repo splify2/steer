@@ -65,10 +65,18 @@
 #define LOG_I "steer[info] hub: "
 
 #define XSH_BATCH 16
-/* Сессий вчетверо больше, чем пиров: запас на переподключение пира без разрыва И на
- * неравномерность раскладки по воркерам (порты хэшируются, и одному воркеру может достаться
- * вдвое больше пиров, чем в среднем). */
-#define XSH_MAX_SESS (XS_PEERS_MAX * 4)
+/* ТАБЛИЦА СЕССИЙ — ПО КОНФИГУРАЦИИ, а не по пределу пиров при сборке (hub_sess_table).
+ *
+ * Прежде она была постоянной: XS_PEERS_MAX * 4 = 128 мест, поровну на воркеров. Число «4»
+ * писалось как запас вчетверо на переподключение и неравномерность — но с тех пор каждый пир
+ * открывает до XS_CONNS_MAX (4) соединений, и запас съелся целиком: 32 пира по 4 соединения
+ * занимали таблицу ровно, и переподключение пира, пока его прежняя сессия ещё не молчит минуту,
+ * получало отказ «таблица полна работающими туннелями». Теперь на каждого описанного пира —
+ * его соединения дважды (старая и новая сессия при переподключении), плюс место под
+ * одновременные рукопожатия и дорожку прикрытия. Единственный настоящий потолок — индекс
+ * сессий воркера (XS_SIDX_SLOTS слотов открытой адресации, держим заполнение не выше
+ * половины), и упор в него назван в журнале числом. */
+#define XSH_SESS_HS_SLACK 16
 /* Предел числа воркеров — ЧЕТЫРЕ, и это не «на всякий случай», а результат замера.
  *
  * Цена воркера лежит в ядре: приём идёт сырым сокетом, и ядро на каждый локально доставляемый
@@ -251,6 +259,7 @@ struct sess {
      * применился к половине пакетов пачки» здесь возможно. Порт правки из реализации на Go
      * (I-093), где то же место помечал детектор гонок. */
     int      batch_max;
+    int      peer_split;           /* пир объявил сборку разрезанных записей (XS_FLAG_SPLIT) */
     xsh_ms   cool_until;
     long long last_report, last_grow, keep_next;
     int16_t  peer;                 /* индекс пира или -1, пока не опознан */
@@ -308,7 +317,8 @@ struct sess {
 #define XSH_LOAD(p)     __atomic_load_n(&(p), __ATOMIC_RELAXED)
 #define XSH_STORE(p, v) __atomic_store_n(&(p), (v), __ATOMIC_RELAXED)
 
-static struct sess g_sess[XSH_MAX_SESS];
+static struct sess *g_sess;
+static int g_sess_n;
 static struct xs_router g_router;
 static struct xs_conf g_conf;
 static struct xs_secrets g_sec;
@@ -346,7 +356,7 @@ static int g_decoy_map_n;
  * вкус: sess_free обнуляет структуру целиком (memset), а обнулить мьютекс, который в этот миг
  * кто-то держит, — это порча замка, то есть зависание или порча памяти под нагрузкой, ловимая
  * только в бою. Отдельный массив живёт всё время работы процесса и не обнуляется никогда. */
-static pthread_mutex_t g_tx_lock[XSH_MAX_SESS];
+static pthread_mutex_t *g_tx_lock;
 /* Один замок на всё, что делается РАЗ НА РУКОПОЖАТИЕ: таблица пиров, метки времени, привязка
  * пир→сессия, пересчёт MTU устройства. Частота этих действий — доли раза в секунду на всю
  * звезду, поэтому дробить их на отдельные замки значило бы усложнять без выигрыша. На горячем
@@ -549,6 +559,34 @@ static struct sess *sess_evict_pick(struct worker *w, struct sess *oldest_raw,
     return NULL;
 }
 
+/* Выделить таблицу сессий под конфигурацию: см. шапку у XSH_SESS_HS_SLACK. Возвращает число
+ * мест на воркера (у каждого свой отрезок g_sess) или -1, если не хватило памяти. */
+static int hub_sess_table(int workers, size_t peer_n) {
+    if (workers < 1) workers = 1;
+    size_t need = peer_n * XS_CONNS_MAX * 2;
+    size_t per = (need + (size_t)workers - 1) / (size_t)workers + XSH_DECOY_MAX + XSH_SESS_HS_SLACK;
+    if (per > XS_SIDX_SLOTS / 2) {
+        fprintf(stderr, LOG_W "сессий на воркера нужно %zu, индекс держит %d — беру %d\n",
+                per, XS_SIDX_SLOTS / 2, XS_SIDX_SLOTS / 2);
+        per = XS_SIDX_SLOTS / 2;
+    }
+    size_t total = per * (size_t)workers;
+    struct sess *ns = calloc(total, sizeof(*ns));
+    pthread_mutex_t *nl = calloc(total, sizeof(*nl));
+    if (!ns || !nl) { free(ns); free(nl); return -1; }
+    for (size_t i = 0; i < total; i++) {
+        ns[i].conn.fd = -1;
+        ns[i].peer = -1;
+        ns[i].conn_id = -1;
+        ns[i].up_fd = -1;
+        pthread_mutex_init(&nl[i], NULL);
+    }
+    g_sess = ns;
+    g_tx_lock = nl;
+    g_sess_n = (int)total;
+    return (int)per;
+}
+
 static struct sess *sess_alloc(struct worker *w, const struct obfs_seg *seg, int listen_port,
                                long long now) {
     struct sess *free_slot = NULL, *oldest = NULL, *oldest_raw = NULL;
@@ -606,7 +644,7 @@ static struct sess *sess_alloc(struct worker *w, const struct obfs_seg *seg, int
 static void hub_retune_mtu(void) {
     pthread_mutex_lock(&g_ctl);
     int best = 0;
-    for (int i = 0; i < XSH_MAX_SESS; i++)
+    for (int i = 0; i < g_sess_n; i++)
         if (g_sess[i].phase == PH_EST) {
             int m = XSH_LOAD(g_sess[i].mtu);
             if (m > 0 && (!best || m < best)) best = m;
@@ -1187,6 +1225,8 @@ static void hs_confirm(struct worker *w, struct sess *s, const struct obfs_seg *
     int conn_id = s->hs.peer.flags & 0x07;
     if (conn_id >= XS_CONNS_MAX) conn_id = 0;
     s->conn_id = (int8_t)conn_id;
+    /* Бит FLAG_SPLIT — тоже из подписанной части, и тоже до xs_hs_wipe. */
+    s->peer_split = xs_peer_splits(&s->hs.peer);
     xs_hs_wipe(&s->hs);
     xs_win_reset(&s->win);
     xs_reasm_reset(&s->reasm);
@@ -1195,8 +1235,11 @@ static void hs_confirm(struct worker *w, struct sess *s, const struct obfs_seg *
      *
      * STEER_XS_COMPAT=1 оставляет один кадр навсегда: это аварийный выключатель нового формата на
      * время обновления, когда к хабу ещё приходят пиры предыдущей версии. Сборку Hello из
-     * сегментов выключать не нужно — короткий Hello старого пира она разбирает сразу. */
-    XSH_STORE(s->batch_max, g_compat ? 1 : 2);
+     * сегментов выключать не нужно — короткий Hello старого пира она разбирает сразу.
+     *
+     * Пир, не объявивший бит XS_FLAG_SPLIT (прежняя версия, I-556), получает по одному кадру в
+     * записи и без роста — то же, что STEER_XS_COMPAT, только само и для него одного. */
+    XSH_STORE(s->batch_max, (g_compat || !s->peer_split) ? 1 : 2);
     XSH_STORE(s->cool_until, 0);
     s->last_drops = s->reasm.dropped;
     s->phase = PH_EST;
@@ -1525,8 +1568,8 @@ static void *worker_loop(void *arg) {
     struct worker *w = arg;
     long long d_last = xs_now_ms();
     for (;;) {
-        struct pollfd fds[2 + XSH_MAX_SESS];
-        int pmap[XSH_MAX_SESS];
+        struct pollfd fds[2 + w->cap];
+        int pmap[w->cap];
         int nf = 0, np = 0;
         fds[nf].fd = w->rx; fds[nf].events = POLLIN; fds[nf].revents = 0; nf++;
         fds[nf].fd = w->tun.fd; fds[nf].events = POLLIN; fds[nf].revents = 0; nf++;
@@ -1689,9 +1732,13 @@ static void *worker_loop(void *arg) {
                 if (dst && d != dst) {
                     /* Пакет другому пиру закрывает набор. Его самого переносим в начало и делаем
                      * первым кадром следующей записи: откладывать его до следующего круга значило
-                     * бы менять порядок пакетов в потоке. */
+                     * бы менять порядок пакетов в потоке. Убираем его в сторону ДО отправки:
+                     * send_to запечатывает запись на месте и пишет тег сразу за ней — ровно на
+                     * длину и начало этого пакета (I-516). */
+                    uint8_t hold[XS_MTU_DEF];
+                    memcpy(hold, pay + off + 2, (size_t)r);
                     hub_send_frames(w, dst, pay, off, frames);
-                    memmove(pay + XS_BATCH_HDR + 2, pay + off + 2, (size_t)r);
+                    memcpy(pay + XS_BATCH_HDR + 2, hold, (size_t)r);
                     off = XS_BATCH_HDR;
                     frames = 0;
                 }
@@ -1805,7 +1852,7 @@ static void *worker_loop(void *arg) {
             }
             /* Рост пачки на чистом пути: медленно вверх, мгновенно вниз (см. hub_frame). */
             int bm = XSH_LOAD(s->batch_max);
-            if (!g_compat && s->phase == PH_EST && now >= XSH_LOAD(s->cool_until) &&
+            if (!g_compat && s->peer_split && s->phase == PH_EST && now >= XSH_LOAD(s->cool_until) &&
                 now - s->last_grow >= XSH_REASM_GROW_MS && bm < XS_BATCH_FRAMES_MAX) {
                 bm *= 2;
                 if (bm > XS_BATCH_FRAMES_MAX) bm = XS_BATCH_FRAMES_MAX;
@@ -1852,12 +1899,6 @@ int cmd_xsteer_hub(const char *conf_path) {
         snprintf(g_dev, sizeof(g_dev), "%s", g_conf.device);
     for (int i = 0; i < XS_PEERS_MAX; i++)
         for (int c = 0; c < XS_CONNS_MAX; c++) g_peer_sess[i][c] = -1;
-    for (int i = 0; i < XSH_MAX_SESS; i++) {
-        g_sess[i].conn.fd = -1;
-        g_sess[i].peer = -1;
-        g_sess[i].conn_id = -1;
-        g_sess[i].up_fd = -1;
-    }
     xs_router_build(&g_router, g_conf.peer, g_conf.peer_n);
 
     int debug = getenv("STEER_XS_DEBUG") != NULL;
@@ -1929,9 +1970,12 @@ int cmd_xsteer_hub(const char *conf_path) {
     }
 
 
-    for (int i = 0; i < XSH_MAX_SESS; i++) pthread_mutex_init(&g_tx_lock[i], NULL);
-
-    int per = XSH_MAX_SESS / n;
+    int per = hub_sess_table(n, g_conf.peer_n);
+    if (per < 0) {
+        fprintf(stderr, LOG_W "нет памяти под таблицу сессий (%zu пиров, %d воркеров)\n",
+                g_conf.peer_n, n);
+        return 1;
+    }
     for (int i = 0; i < n; i++) {
         struct worker *w = &g_w[i];
         w->id = i;

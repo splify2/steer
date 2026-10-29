@@ -35,7 +35,6 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-#include "spec.h"
 #include "xsconn.h"
 #include "xsconf.h"
 #include "xslink.h"
@@ -48,6 +47,11 @@
 #include "run.h"
 #include "evline.h"
 #include "ctlcall.h"
+
+#include "plugkit.h"
+#include "xscmd.h"
+#include "platform.h"
+#include "err.h"
 
 #define LOG_W "steer[warn] xsteer: "
 #define LOG_I "steer[info] xsteer: "
@@ -169,6 +173,7 @@ struct spoke {
      * запись гибнет целиком при потере любого сегмента, поэтому на рваном пути пачка обязана
      * схлопываться до одного кадра. Растёт по чистой обратной связи, падает мгновенно. */
     int batch_max;
+    int peer_split;               /* хаб объявил сборку разрезанных записей (XS_FLAG_SPLIT, I-556) */
     long long cool_until, last_report, last_grow, keep_next;
 
     /* Приём и отправка: свои у каждого воркера (см. выше). */
@@ -216,16 +221,20 @@ static struct xs_secrets g_sc;
 /* Состояние на диск: его читают сторож (жив ли туннель) и status. Отдельным файлом, а не
  * через опрос процесса, потому что проверка процесса — это запуск процесса, а status
  * опрашивают раз в пять секунд. */
+/* Помощник выхода (есть {conf}) пишет файл состояния выхода (steer-api.md, 2.2): status ядра
+ * вкладывает его в outputs.<имя>.plugin.state, `steer xsteer-peers` печатает. Событием state ядро
+ * будится только на смене заметного — связь, MTU, соединения, хаб, разгрузка, обрывы, — а не на
+ * счётчиках, которые меняются каждые две секунды: их status читает из файла сам, когда спросят. */
+static char *g_state_key;
+
 static void state_write(struct spoke *s) {
-    /* Ребёнок демона с --supervise (труба событий есть): здоровье демон знает из up/down, и файл
-     * для сторожа не пишется — раз в две секунды на флеш телефона (evline.h). `steer
-     * xsteer-peers` у такого выхода берёт живое состояние у демона (команда сокета helper) —
-     * без счётчиков и рукопожатия: их знает только этот процесс. Клиент, поднятый netifd или
-     * руками, трубы не имеет и пишет файл, как раньше. */
-    if (evline_enabled()) return;
-    char tmp[336];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", s->state_path);
-    FILE *f = fopen(tmp, "w");
+    const struct pk_out *po = pk_out();
+    /* Без {conf}: ребёнок демона с трубой событий файла не пишет (демон знает здоровье из up/down);
+     * клиент, поднятый netifd или руками, пишет xsteer-<устройство>.json, как раньше. */
+    if (!po && evline_enabled()) return;
+    char *buf = NULL;
+    size_t bn = 0;
+    FILE *f = open_memstream(&buf, &bn);
     if (!f) return;
     char fp[12];
     xs_key_fp(s->hub_pub, fp);
@@ -288,12 +297,43 @@ static void state_write(struct spoke *s) {
     /* Причина последнего обрыва — только если он был. Пустая строка вместо отсутствия поля
      * читалась бы как «обрыв был, причина неизвестна», а это другое утверждение. */
     if (last_down) fprintf(f, ",\"last_down\":\"%s\"", last_down);
-    fprintf(f, "}\n");
+    fprintf(f, "}");
     fclose(f);
-    /* Переименование, а не запись на месте: читатель не должен увидеть половину файла.
-     * Секретов в файле нет — печатает его тот же код, что xs_conf_json, и приватного ключа
-     * он не видит по построению. */
-    rename(tmp, s->state_path);
+    if (!buf) return;
+    /* Секретов в файле нет — печатает его тот же код, что xs_conf_json, и приватного ключа он не
+     * видит по построению. */
+    if (po) {
+        char key[400];
+        snprintf(key, sizeof key, "%d|%d|%d|%s|%d|%d%d%d|%d|%llu|%s", any_up, s->mtu, g_conns,
+                 s->conf->peer[0].endpoint, s->stream, t0->gso, t0->gro, t0->rx_gso, s->mtu_confirmed, resets,
+                 last_down ? last_down : "");
+        int changed = !g_state_key || strcmp(g_state_key, key) != 0;
+        if (changed) { free(g_state_key); g_state_key = strdup(key); }
+        /* Файл — всегда (счётчики свежие), событие — только на смене заметного. */
+        char tmp[4200];
+        snprintf(tmp, sizeof tmp, "%s.tmp", po->status_path);
+        FILE *w = fopen(tmp, "w");
+        if (w) {
+            fputs(buf, w);
+            fputc('\n', w);
+            if (fclose(w) == 0 && rename(tmp, po->status_path) == 0) {
+                if (changed) evline_emit("state", (const char *)NULL);
+            } else unlink(tmp);
+        }
+        free(buf);
+        return;
+    }
+    char tmp[336];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", s->state_path);
+    FILE *w = fopen(tmp, "w");
+    if (w) {
+        fputs(buf, w);
+        fputc('\n', w);
+        fclose(w);
+        /* Переименование, а не запись на месте: читатель не должен увидеть половину файла. */
+        rename(tmp, s->state_path);
+    }
+    free(buf);
 }
 
 /* Поднять TUN. Два режима, и разница между ними — В ТОМ, КТО ВЛАДЕЕТ УСТРОЙСТВОМ.
@@ -365,8 +405,8 @@ static int tun_up_queues(struct spoke *s, struct tun_dev *q, int want, const cha
 /* Рукопожатие прошло — up демону, с именем устройства (поле dev, evline.h).
  *
  * По первому такому up за жизнь процесса демон привязывает к устройству маршрут выхода
- * (daemon/supd.c, route_up) — с 1.10 (шаг 3) это не работа клиента: bind_device — код демона, и
- * в бинарник модуля на libsteer (шаг 4) он не едет. Следующие up (второе соединение, новое
+ * (daemon/supd.c, route_up) — это не работа клиента: bind_device — код демона, и в бинарник
+ * модуля на libsteer он не едет. Следующие up (второе соединение, новое
  * рукопожатие после обрыва) несут то же dev, и демон их за привязку не считает: маршрут после
  * отказа возвращает сторож, как и раньше.
  *
@@ -467,6 +507,7 @@ static int do_handshake(struct spoke *s) {
     rc = xs_hs_client_confirm(&hs, &s->tx, s->txb, sizeof(s->txb), &fn);
     if (rc == 0) rc = xs_conn_send(&s->conn, 0x18, s->txb, fn, 0);
     int peer_mtu = hs.peer.mtu;
+    s->peer_split = xs_peer_splits(&hs.peer);   /* до xs_hs_wipe: он затирает рукопожатие целиком */
     xs_hs_wipe(&hs);
     if (rc != 0) return rc;
 
@@ -490,7 +531,7 @@ static int do_handshake(struct spoke *s) {
      * ни разбирать контейнер пачки, и пока он где-то работает, туннель к нему поднимается только
      * так. Переменной, а не настройкой в конфигурации: это временная мера на один рабочий день, а
      * не свойство выхода, и в spec.json ей места нет. */
-    s->batch_max = getenv("STEER_XS_COMPAT") ? 1 : 2;
+    s->batch_max = (getenv("STEER_XS_COMPAT") || !s->peer_split) ? 1 : 2;
     s->cool_until = 0;
     s->last_drops = s->reasm.dropped;
     s->up = 1;
@@ -666,16 +707,15 @@ static void session_down_why(struct spoke *s, const char *why) {
 static void session_down(struct spoke *s) { session_down_why(s, NULL); }
 
 /* Общий цикл обеих ролей вынесен, чтобы «поднять для выхода спеки» и «поднять на готовом
- * устройстве» отличались ровно тем, чем отличаются: владением устройством. Маршрутизацией с 1.10
- * (шаг 3) не владеет ни та, ни другая: у выхода спеки маршрут ставит демон по up (xs_emit_up), в
+ * устройстве» отличались ровно тем, чем отличаются: владением устройством. Маршрутизацией не владеет
+ * ни та, ни другая: у выхода спеки маршрут ставит демон по up (xs_emit_up), в
  * режиме netifd — netifd. Скопировать цикл во второй раз значило бы два места для одной ошибки в
  * пути данных. */
 static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, int managed);
-static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const char *conf_path,
-                           int stream, int stream_port);
+static int cmd_xsteer_out(const struct pk_out *po, const char *conf_path, int stream, int stream_port);
 
-int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_path,
-               const char *device, int stream, int stream_port) {
+int cmd_xsteer(const struct pk_out *po, const char *conf_path, const char *device, int stream,
+               int stream_port) {
     evline_open();
     static struct spoke sd;
     /* Режим транспорта задаётся ключом и только здесь: дальше он едет полем spoke, потому что
@@ -689,7 +729,7 @@ int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_pat
     /* Без имени выхода спека не читается ВОВСЕ: на маршрутизаторе, где туннелем владеет
      * netifd, выходов и каналов может не быть, а требовать спеку ради того, чтобы её не
      * использовать, значило бы требовать настройку, которая ни на что не влияет. */
-    if (!out_name || !out_name[0]) {
+    if (!po) {
         if (!conf_path || !device) {
             fprintf(stderr, "steer: без имени выхода нужны --config и --device "
                             "(подсказка: steer xsteer --help)\n");
@@ -711,44 +751,41 @@ int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_pat
                  steer_state_dir(), device);
         return spoke_run(&sd, device, device, 1);
     }
-    return cmd_xsteer_spec(spec_path, out_name, conf_path, stream, stream_port);
+    return cmd_xsteer_out(po, conf_path, stream, stream_port);
 }
 
-static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const char *conf_path,
-                           int stream, int stream_port) {
-    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec/registry_assign.
-     *
-     * Спека — значение (правило 6, раздел 2): свой экземпляр у этой точки входа. */
-    static struct spec cfg;
-    struct err e = {0};
-    if (load_spec(spec_path, &cfg, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(&cfg, out_name);
-    if (!o) die("нет такого выхода: %s", out_name);
-    const struct xsteer_cfg *xc = out_xsteer(o);
-    if (!xc) die("выход %s не kind=xsteer", out_name);
-    /* Реестр нужен ДО подъёма: из него берётся метка выхода-цели при `via` (ниже; адрес
-     * устройства — из конфигурации xsteer, не из таблицы). Вызов идемпотентен и с apply не
-     * спорит: тот же файл, те же номера. До 1.10 отсюда же брались метка и таблица для привязки
-     * устройства этим процессом (без реестра метка была бы нулевой, и `ip rule fwmark 0x0`
-     * поймало бы весь трафик роутера); привязку теперь делает демон по своей спеке, где реестр
-     * назначен при загрузке (daemon/state.c). */
-    if (registry_assign(&cfg, &e) < 0) err_die(&e);
-    /* Метка соединения с хабом — out_underlay_mark: метка выхода-цели при `via`, иначе обычное
-     * «мимо каналов» (см. «вложенные выходы» в spec.h). После registry_assign — у цели метка
-     * появляется там. Ставят её obfs_raw_open (поддельный TCP) и stream_dial (поток). */
-    obfs_set_sock_mark(out_underlay_mark(&cfg, o), o->over[0] != 0);
+/* Путь конфигурации выхода: ключ conf или {etc}/xsteer/<выход>.conf (умолчание вида). В куче. */
+static char *xs_conf_of(const struct pk_out *po) {
+    const char *c = pk_key_str(po, "conf");
+    char *p = NULL;
+    if (c) p = strdup(c);
+    else if (asprintf(&p, "%s/xsteer/%s.conf", po->etc ? po->etc : "/etc/steer", po->tun.name) < 0) p = NULL;
+    if (!p) pk_fail("нет памяти");
+    return p;
+}
+
+static int cmd_xsteer_out(const struct pk_out *po, const char *conf_path, int stream, int stream_port) {
+    if (strcmp(po->kind, "xsteer") != 0) pk_fail("выход %s не kind=xsteer (kind %s)", po->tun.name, po->kind);
+    int xs_stream = pk_key_bool(po, "stream", 0);
+    int xs_stream_port = (int)pk_key_long(po, "stream_port", 0);
+    /* Порт без режима — настройка, которая ничего не делает: сказать «настроено», не настроив, хуже,
+     * чем отказать (тот же довод, что у хука check вида). */
+    if (xs_stream_port && !xs_stream)
+        pk_fail("outputs.%s: stream_port без stream: транспорт остался бы поддельным TCP", po->tun.name);
+    /* Метка соединения с хабом — метка своих сокетов из {conf}: метка выхода-подложки при over,
+     * иначе «мимо каналов». Ставят её obfs_raw_open (поддельный TCP) и stream_dial (поток). */
+    obfs_set_sock_mark(pk_sock_mark(po), po->sock_mark_required);
 
     static struct spoke s;
-    s.out_name = o->name;
+    s.out_name = po->tun.name;
     /* Ключ командной строки СИЛЬНЕЕ спеки, а не наоборот: спека описывает постоянную
      * настройку выхода, а ключом человек проверяет руками — и «проверил ключом, а работало по
      * спеке» это потерянный час. Отсутствие ключа (0) при заданном в спеке потоке оставляет
      * поток: выключить его руками можно --no-stream, который приезжает сюда как -1. */
-    s.stream = stream ? stream > 0 : xc->stream;
-    s.stream_port = stream_port ? stream_port : xc->stream_port;
+    s.stream = stream ? stream > 0 : xs_stream;
+    s.stream_port = stream_port ? stream_port : xs_stream_port;
     char err[256];
-    const char *path = conf_path ? conf_path : xc->conf;
+    const char *path = conf_path ? conf_path : xs_conf_of(po);
     if (xs_conf_load_any(path, XS_ROLE_SPOKE, &g_cf, &g_sc, NULL, 0, NULL,
                          err, sizeof(err)) != 0) {
         fprintf(stderr, LOG_W "%s\n", err);
@@ -774,16 +811,12 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
      * остальные входы MTU через эту функцию уже идут (строки с dev_mtu, mtu_apply и вторым
      * подъёмом), а этот — главный путь `steer xsteer <выход>` — остался. */
     s.mtu = xs_mtu_clamp(g_cf.mtu);
-    snprintf(s.state_path, sizeof(s.state_path), "%s/xsteer-%.40s.json",
-             steer_state_dir(), o->name);
 
-    /* Таблицу к устройству привязывал до 1.10 САМ процесс: apply прошёл раньше, дождаться
-     * устройства снаружи нельзя, и момент готовности знает только тот, кто его создал. Момент
-     * по-прежнему знаем мы, но говорим о нём демону — up с именем устройства после рукопожатия
-     * (xs_emit_up), — а привязывает он, тем же bind_device в своём процессе (шаг 3, тот же довод,
-     * что у клиента VLESS в vlmain.c, vl_ready). В режиме netifd маршрутизацией владеет он, а
-     * выход описывается в спеке как обычный interface. */
-    return spoke_run(&s, o->device, o->name, 0);
+    /* Момент готовности устройства знает только тот, кто его создал, — мы. Говорим о нём демону
+     * — up с именем устройства после рукопожатия (xs_emit_up), — а привязывает таблицу он, тем же
+     * bind_device в своём процессе (тот же довод, что у клиента VLESS в vlmain.c, vl_ready). В
+     * режиме netifd маршрутизацией владеет он, а выход описывается в спеке как обычный interface. */
+    return spoke_run(&s, po->tun.device, po->tun.name, 0);
 }
 
 /* Сколько соединений открывать. По одному на ядро, но не больше XS_CONNS_MAX.
@@ -1834,7 +1867,7 @@ static void *worker_main(void *arg) {
             }
         }
         /* Рост пачки на чистом пути: медленно вверх, мгновенно вниз (см. spoke_frame). */
-        if (!getenv("STEER_XS_COMPAT") && now >= s->cool_until &&
+        if (!getenv("STEER_XS_COMPAT") && s->peer_split && now >= s->cool_until &&
             now - s->last_grow >= XSC_REASM_GROW_MS && s->batch_max < XS_BATCH_FRAMES_MAX) {
             s->batch_max *= 2;
             if (s->batch_max > XS_BATCH_FRAMES_MAX) s->batch_max = XS_BATCH_FRAMES_MAX;
@@ -1871,22 +1904,12 @@ static void *worker_main(void *arg) {
 
 /* ---- пиры и ключи ----------------------------------------------------------- */
 
-int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *conf_path) {
-    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec.
-     *
-     * Спека — значение (правило 6, раздел 2): свой экземпляр у этой точки входа. */
-    static struct spec cfg;
-    struct err e = {0};
-    if (load_spec(spec_path, &cfg, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(&cfg, out_name);
-    if (!o) die("нет такого выхода: %s", out_name);
-    const struct xsteer_cfg *xc = out_xsteer(o);
-    if (!xc) die("выход %s не kind=xsteer", out_name);
+int cmd_xsteer_peers(const struct pk_out *po, const char *conf_path) {
+    if (strcmp(po->kind, "xsteer") != 0) pk_fail("выход %s не kind=xsteer (kind %s)", po->tun.name, po->kind);
     struct xs_conf c;
     struct xs_secrets sec;
     char err[256];
-    const char *path = conf_path ? conf_path : xc->conf;
+    const char *path = conf_path ? conf_path : xs_conf_of(po);
     if (xs_conf_load_any(path, XS_ROLE_SPOKE, &c, &sec, NULL, 0, NULL, err, sizeof(err)) != 0) {
         fprintf(stderr, LOG_W "%s\n", err);
         return 2;
@@ -1899,20 +1922,31 @@ int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *co
     /* Живое состояние лежит рядом, в файле, который пишет сам процесс. Печатаем его как есть
      * — разбирать нечего, а склеивать два JSON в один значило бы завести формат, который
      * придётся согласовывать с интерфейсом отдельно. */
-    char sp[320];
-    snprintf(sp, sizeof(sp), "%s/xsteer-%.40s.json", steer_state_dir(), o->name);
-    FILE *f = fopen(sp, "r");
+    /* Файл состояния выхода — в своём каталоге плагина (steer-api.md, 2.2). */
+    FILE *f = fopen(po->status_path, "r");
     if (!f) {
         /* Клиент — ребёнок демона с трубой событий: файла он не пишет, и живое состояние — у
          * демона в памяти (команда сокета helper: процесс, up, причина отказа, перезапуски).
          * Счётчиков и рукопожатия там нет — клиент сообщает только смену состояния. Демона нет
          * или помощник не его — состояния нет: рукопожатий не было. */
         char line[64];
-        snprintf(line, sizeof(line), "helper %.31s\n", o->name);
-        ctlcall_socket(NULL);
-        return ctlcall_forward(line, spec_path, steer_state_dir(), 10) == 0 ? 0 : 1;
+        snprintf(line, sizeof(line), "helper %.31s\n", po->tun.name);
+        /* Сокет демона — из окружения программы плагина (STEER_CTL_SOCK, steer-api.md, 1.2). */
+        ctlcall_socket(getenv("STEER_CTL_SOCK"));
+        char *r = ctlcall_roundtrip(line, NULL, 0, 10);
+        struct ctlcall_resp cr;
+        memset(&cr, 0, sizeof cr);
+        int rc = 1;
+        if (r && ctlcall_parse(r, &cr) == 0 && cr.has_code) {
+            if (cr.out.p) fputs(cr.out.p, stdout);
+            if (cr.err.p) fputs(cr.err.p, stderr);
+            rc = cr.code;
+        }
+        ctlcall_resp_free(&cr);
+        free(r);
+        return rc;
     }
-    char line[1024];
+    char line[4096];
     if (fgets(line, sizeof(line), f)) fputs(line, stdout);
     fclose(f);
     return 0;

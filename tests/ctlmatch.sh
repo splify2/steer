@@ -4,8 +4,8 @@
 #
 # Что проверяется.
 #  1. Каждая команда таблицы отвечает тем же, что одноимённая подкоманда, набранная руками:
-#     status (без поля времени), status fast, diag (код), explain, version; vless-nodes в
-#     базовой сборке — честный отказ подкоманды, а не сервера.
+#     status (без поля времени), status fast, diag (код), explain, version; команды плагинов
+#     (vless-nodes, sub-check) доходят до программы плагина, отказ — её, а не сервера.
 #  2. Слова запроса проверяются до запуска: флаг вместо адреса, чужой знак, число вне
 #     пределов, неизвестная команда, лишнее слово — отказ bad-request/unknown-command.
 #  3. Пределы: строка длиннее 512 байт и тело больше 1 МиБ — too-large, причём тело не
@@ -62,6 +62,10 @@ tmp="$(mktemp -d)"
 # Обходить каталог сокета должен и чужой uid из пункта 4 — как /data/misc/steer (0711).
 chmod 0711 "$tmp"
 mkdir -p "$tmp/state" "$tmp/bin"
+# Команды протоколов (vless-nodes, sub-check, vless-probe) — из манифестов плагинов (steer-api.md, 4.3):
+# каталог плагинов стенда — tests/plugroot.sh, программа плагина — build/pkhooks (называет себя и слово).
+sh tests/plugroot.sh "$tmp/plugins" "$(dirname "$BIN")" || { echo "ctlmatch: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 SRV="" SUP="" DNSD="" SUB1=""
 trap 'kill $SRV $SUP $DNSD $SUB1 ${WD:-} ${WSUB:-} ${RPID:-} 2>/dev/null; rm -rf "$tmp"' EXIT
 pass=0 fail=0
@@ -73,6 +77,9 @@ check() {
 wait_for() {
     i=0
     while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    # Приговор по фактическому состоянию, а не по счётчику кругов: условие, ставшее истинным в последнюю
+    # десятую секунды, иначе объявлялось бы невыполненным.
+    eval "$1" && return 0
     return 1
 }
 
@@ -183,6 +190,15 @@ check "status: тот же JSON, что у подкоманды (без врем
     "$(printf '%s' "$r" | j stdout | sed 's/"at":[0-9]*,//')"
 r="$(ctl status fast)"
 check "status fast: запомненный ответ" "1" "$(printf '%s' "$r" | j stdout | grep -c '"cached":true')"
+# Снимок переписывается, только когда ответ изменился (кроме `at`): второй status с тем же
+# содержимым файл не трогает — тот же inode (запись идёт через rename, новый файл — новый inode);
+# исчезнувший снимок пишется заново.
+ctl status >/dev/null
+ino1="$(stat -c %i "$tmp/state/status.json" 2>/dev/null)"
+sleep 1; ctl status >/dev/null
+check "status: неизменный ответ не переписывает снимок" "$ino1" "$(stat -c %i "$tmp/state/status.json" 2>/dev/null)"
+rm -f "$tmp/state/status.json"; ctl status >/dev/null
+check "status: исчезнувший снимок пишется заново" "1" "$([ -s "$tmp/state/status.json" ] && echo 1)"
 
 "$BIN" diag --spec "$tmp/spec.json" --state-dir "$tmp/state" >/dev/null 2>&1; dcode=$?
 r="$(ctl diag)"
@@ -195,19 +211,15 @@ check "explain: тот же ответ, что у подкоманды" \
     "$(printf '%s' "$r" | j stdout)"
 
 r="$(ctl vless-nodes vpn)"
-check "vless-nodes в базовой сборке: отказ подкоманды (код 2), не сервера" "2 -" \
+check "vless-nodes (команда плагина vless): выход vpn не вида vless — отказ подкоманды (код 2), не сервера" "2 -" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j error)"
-# sub-check: разбор подписки подкомандой vless-nodes по временному файлу. В базовой сборке
-# VLESS нет — честный отказ подкоманды (код 2), не сервера; временный файл убран в любом случае.
+# sub-check: разбор подписки подкомандой плагина vless-nodes по временному файлу (тело — файлом,
+# manifest.md commands[].ctl.body). Программа стенда отвечает кодом 2 и называет слово — видно, что
+# запрос дошёл до программы плагина; временный файл убран в любом случае.
 printf 'vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?security=none#n\n' > "$tmp/sub.txt"
 r="$(ctl sub-check < "$tmp/sub.txt")"
-if "$BIN" version | grep -q 'расширенная'; then
-    check "sub-check: код 0, пригодных узлов 1" "0 1" \
-        "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j stdout | j usable)"
-else
-    check "sub-check в базовой сборке: отказ подкоманды (код 2), не сервера" "2 -" \
-        "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j error)"
-fi
+check "sub-check: программа плагина vless-nodes по файлу (код 2 стенда), не отказ сервера" "2 - 1" \
+    "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j error) $(printf '%s' "$r" | j stderr | grep -c 'pkhooks (vless): «vless-nodes»')"
 check "  временный файл подписки убран" "0" "$(ls /tmp | grep -c "^sub-check\.ctl-")"
 check "sub-check без длины тела — bad-request" "bad-request" "$(printf 'sub-check\n' | raw | j error)"
 r="$(ctl dns-log)"
@@ -217,7 +229,7 @@ check "dns-log без резолвера: код 0, running=false, имён не
 # ---- 2. слова запроса -------------------------------------------------------------------
 check "explain с флагом вместо адреса — bad-request" "bad-request" "$(ctl explain --spec | j error)"
 check "explain с чужим знаком — bad-request" "bad-request" "$(ctl 'explain' 'a;b' | j error)"
-check "vless-probe: срок вне 1..30 — bad-request" "bad-request" "$(ctl vless-probe vpn 0 99 | j error)"
+check "vless-probe: срок вне 1..30 (ctl.args манифеста) — bad-request" "bad-request" "$(ctl vless-probe vpn 0 99 | j error)"
 check "vless-probe: номер не число — bad-request" "bad-request" "$(ctl vless-probe vpn abc | j error)"
 check "status с лишним словом — bad-request" "bad-request" "$(ctl status slow | j error)"
 check "неизвестная команда — unknown-command" "unknown-command" "$(ctl conns-all | j error)"
@@ -264,6 +276,12 @@ before="$(sum)"
 r="$(ctl check < "$tmp/bad.json")"
 check "check негодной спеки: код 2 и причина" "2 1" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j stderr | grep -c 'kind')"
+printf '{"version":2,"outputs":{"a":{"kind":"bogus"}},"rules":[]}\n' > "$tmp/bad2.json"
+r="$(ctl check < "$tmp/bad2.json")"
+check "check негодной спеки v2: ecode и args ядра (docs/errors.md), code остаётся кодом возврата" "2 spec.unknown_kind outputs.a" \
+    "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j ecode) $(printf '%s' "$r" | j args.1)"
+check "  строка JSON отказа убрана из stderr" "0" "$(printf '%s' "$r" | j stderr | grep -c '^{')"
+check "отказ сервера несёт code и args: unknown-command" "unknown-command ctl.unknown_command" "$(ctl conns-all | j error) $(ctl conns-all | j code)"
 check "check годной спеки: код 0" "0" "$(ctl check < "$tmp/B.json" | j code)"
 check "check ничего не сохраняет" "$before" "$(sum)"
 r="$(ctl apply < "$tmp/bad.json")"
@@ -298,7 +316,7 @@ r="$(ctl reload)"
 check "reload без резолвера и супервизора: трогать некого" "0 none none" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j reload.dnsd) $(printf '%s' "$r" | j reload.outputs)"
 obfs_spec a
-STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/sup.json" 2>"$tmp/sup.err" &
+STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/sup.json" --state-dir "$tmp/state" 2>"$tmp/sup.err" &
 SUP=$!
 wait_for 'grep -q "^obfs a " "$tmp/helper.log" 2>/dev/null' 5
 obfs_spec a bb
@@ -442,7 +460,9 @@ printf '{"schema":1,' > "$tmp/spec.json"
 r="$(ctl reload)"
 wait_for 'grep -q "spec-error" "$tmp/sub1.out"' 5
 check "reload негодной спеки: spec-error с причиной" "1" \
-    "$(grep -c '^{"v":1,"ev":"spec-error","by":"reload","message":".\+"}$' "$tmp/sub1.out")"
+    "$(grep -c '^{"v":1,"ev":"spec-error","by":"reload","message":".\+"' "$tmp/sub1.out")"
+check "  и со словом отказа: code spec.v1_error и args" "1" \
+    "$(grep -c '^{"v":1,"ev":"spec-error","by":"reload","message":".\+","code":"spec.v1_error","args":{"1":".\+"}}$' "$tmp/sub1.out")"
 check "  а status отвечает по последней годной" "0 1" \
     "$(ctl status | j code) $(ctl status | j stdout | grep -c '"lists":1')"
 cp "$tmp/spec.good" "$tmp/spec.json"

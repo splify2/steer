@@ -25,13 +25,10 @@ struct spec;
 struct err;
 struct out_keys;
 struct out_obfs;
-struct vless_cfg;
-struct hy2_cfg;
-struct xsteer_cfg;
-struct tgws_cfg;
 struct group_cfg;
+struct plugin_kind;
 /* Дерево ruleset (src/lib/ir.h). Объявлено ради поля emit ниже: заголовок дерева подключают
- * сами виды, которые его строят (zapret.c, tgws.c). */
+ * сами виды, которые его строят (tgws.c). */
 struct nft_rs;
 
 /* Свойства вида — то, о чём спрашивает общий код. Были предикатами со списком видов внутри
@@ -54,11 +51,16 @@ enum kind_cap {
     /* Выход несёт IPv6: трафик v6 можно отдавать в него так же, как v4 (docs/architecture.md,
      * «4б»). У вида с устройством это правило `ip -6 rule` и таблица IPv6 (out_route6 в spec.h),
      * у zapret — та же очередь nfqws. Поставлен тем видам, у которых v6 есть по устройству
-     * выхода: интерфейс и awg — устройства ядра с обоими семействами, zapret трафик никуда не
-     * уводит, а только разбирает. VLESS — после проверки v6 в стеке src/tunnel, xsteer и tgws —
-     * по их протоколам; direct маршрута не меняет вовсе. IPv6 правил, ведущих в выход без бита,
+     * выхода: интерфейс и awg — устройства ядра с обоими семействами, zapret трафик никуда не уводит, а только
+     * разбирает, туннели с протоколом (vless, hysteria2, прокси) — стек src/tunnel несёт IPv6 и по TCP
+     * (перенаправление к слушателю двойного стека), и по UDP (TUN); xsteer и tgws — по их протоколам v6 нет;
+     * direct маршрута не меняет вовсе. Ключ `ipv6: off` снимает бит у выхода (out_caps). IPv6 правил, ведущих в выход без бита,
      * отвергается (цепочка forward_v6, generate.c), а не уходит напрямую. */
     KC_IPV6         = 1 << 9,
+    /* TCP клиентов завершает ядро Linux: правило nat перенаправляет соединение по метке выхода к
+     * слушателю модуля (порт — out_tcp_port, marks.h), и модуль гонит поток узлу, не разбирая
+     * пакетов TCP сам (R-152, generate.c: build_tcp_redir). Через TUN такого выхода идёт UDP. */
+    KC_TCP_REDIR    = 1 << 10,
 };
 
 /* Ключи спеки, которые принадлежат виду. Разбирает их parse.c — для всех видов, в том числе не
@@ -71,7 +73,6 @@ enum kind_key {
     KK_OBFS   = 1 << 0,
     KK_STREAM = 1 << 1,
     KK_OPTS   = 1 << 2,
-    KK_DOMAIN = 1 << 3,
     KK_NODES  = 1 << 4,
     /* `devices` спеки v1 — пул кандидатов. Принимает его только interface: пул устройств — это
      * группа (kind: group), и собирает её перевод v1 (model/v1.c) из безымянных интерфейсов. */
@@ -85,24 +86,44 @@ enum kind_key {
 
 /* Помощник выхода — процесс, который поднимает супервизор (daemon/helpers.c: `steer supervise` и
  * демон с --supervise). cmd — подкоманда движка («vless», «xsteer», «obfs», «tgws») или имя
- * помощника-программы («nfqws»), sig — подпись того, что помощник читает из спеки при
+ * помощника-программы, sig — подпись того, что помощник читает из спеки при
  * старте: супервизор кладёт в неё начальное значение FNV, вид подмешивает свои поля
  * (kind_sig_mix), общий код — цель `via`. */
 struct kind_helper {
-    char cmd[16];               /* «hysteria2» — девять знаков */
+    char *cmd;                  /* куча; пишет kind_helper_cmd */
     unsigned long long sig;
-    /* Помощник — не подкоманда движка, а своя программа рядом с ним (zapret: обработчик
-     * steer-nfqws, init.d/steer). prog — имя файла в каталоге движка, arg — её аргументы
-     * (пустой — конец). prog пуст — `<движок> <cmd> <выход> --spec …`, как у остальных. */
-    char prog[16];
-    char arg[2][256];
-    /* Переменная окружения помощнику («ИМЯ=значение»; пусто — нет) — то, что init.d ставит
-     * procd_set_param env (STEER_TUN_STATS у vless). В подпись не входит: это отладка. */
-    char env[32];
-    /* Помощнику нужны метки реестра (номер очереди zapret выводится из метки): супервизор,
+    /* Помощник — не подкоманда движка, а своя программа рядом с ним (внешний модуль вроде
+     * recheck). prog — имя файла в каталоге движка, arg — её аргументы (arg_n штук). prog
+     * пуст (NULL) — `<движок> <cmd> <выход> --spec …`, как у остальных. */
+    char *prog;
+    char **arg;
+    size_t arg_n;
+    /* Переменные окружения помощнику («ИМЯ=значение») — то, что init.d ставит
+     * procd_set_param env (STEER_TUN_STATS у vless). В подпись не входят: это отладка. */
+    char **env;
+    size_t env_n;
+    /* Помощник — программа плагина (kinds/plugin.c): plugin — id плагина (строка реестра, не
+     * освобождается), prog — ПОЛНЫЙ путь, arg — весь argv после него с уже раскрытыми подстановками
+     * ({out}, {conf}…), conf_path — путь файла настройки выхода {conf} (куча), который ядро кладёт до
+     * запуска. У помощника ядра plugin NULL и всё остальное как выше. */
+    const char *plugin;
+    char *conf_path;
+    /* Помощнику нужны метки реестра (номер очереди выводится из метки): супервизор,
      * который иначе реестр не трогает (supervise.c), назначает их перед подсчётом состава. */
     int marks;
+    /* Помощник отставляет пути (paths у вида плагина, steer-api 1.5): status выхода — с paths_down. */
+    int paths;
 };
+
+/* Поля помощника живут в куче и без пределов по длине и числу: вид задаёт их этими вызовами,
+ * а тот, кто получил kind_helper от kind_ops.helper, освобождает его kind_helper_free. Все
+ * четыре — 0 или -1 (нет памяти); строки копируются. */
+int kind_helper_cmd(struct kind_helper *h, const char *cmd);
+int kind_helper_prog(struct kind_helper *h, const char *prog);
+int kind_helper_arg(struct kind_helper *h, const char *arg);
+int kind_helper_env(struct kind_helper *h, const char *var);
+int kind_helper_conf(struct kind_helper *h, const char *path);
+void kind_helper_free(struct kind_helper *h);
 
 /* Имя, которое починка вида разрешила бы getaddrinfo (Endpoint у awg). Разрешение имени
  * блокирует — DNS может отвечать секунды или не отвечать вовсе, — а сторож в демоне работает на
@@ -125,6 +146,9 @@ typedef void kind_diag_fn(const char *id, const char *verdict, const char *what,
 
 struct kind_ops {
     const char *name;           /* как пишется в спеке */
+    /* Не NULL — вид плагина: запись создана реестром из манифеста (kinds/plugin.c), живёт в куче
+     * до plugin-reload; настройка выхода — struct plugin_out в output. NULL — вид ядра. */
+    const struct plugin_kind *plugin;
     unsigned caps;              /* enum kind_cap */
     unsigned keys;              /* enum kind_key */
     /* Не NULL — вида в этой сборке нет, и разбор отвечает ровно этой строкой (после
@@ -165,15 +189,14 @@ struct kind_ops {
 
     /* ---- правила ---- */
     /* Свои правила nft: дописывает в дерево (lib/ir.h) то, что нужно ОДНОМУ выходу этого
-     * вида. Цепочки, общие для всех выходов вида (например, zapret_queue — своя очередь на
-     * каждый выход, но цепочка одна), заводит первый вызов на пустом дереве — тот же приём,
+     * вида. Цепочки, общие для всех выходов вида (своя очередь на каждый выход, но цепочка одна), заводит первый вызов на пустом дереве — тот же приём,
      * что у build_group_sets и соседей. NULL — виду в дереве сказать нечего (direct, group и
      * виды с устройством: их правила пишет общий код по caps, а не per-kind emit).
      *
      * Порядок вызовов — kind_emit_all (kind.c): по ВИДАМ, в порядке реестра (kind_at), а
      * внутри вида — по выходам в порядке спеки. Так текст ruleset не зависит от того, в каком
      * порядке человек перечислил выходы разных видов: все правила одного вида ложатся в дерево
-     * подряд, одним блоком, как было при отдельных построителях nft_emit_zapret/nft_emit_tgws
+     * подряд, одним блоком, как было при отдельных построителях nft_emit_tgws
      * (docs/architecture.md, «Вид выхода»). Тот же приём и с тем же доводом уже применяется в
      * kind_ops.diag (daemon/diag.c). */
     void (*emit)(struct nft_rs *rs, const struct spec *sp, const struct output *o);
@@ -203,6 +226,9 @@ struct kind_ops {
     /* ---- помощник ---- */
     /* 0 — выходу нужен помощник, h заполнен; -1 — не нужен. */
     int (*helper)(const struct spec *sp, const struct output *o, struct kind_helper *h);
+    /* Ключи вида объектом JSON — для {conf} помощника, которого виду ядра даёт плагин (impl: core,
+     * steer-api.md, 1.4: output.keys). NULL — ключей в {conf} нет. */
+    void (*conf_keys)(FILE *f, const struct output *o);
 };
 
 /* ---- реестр (kind.c) ---- */
@@ -211,7 +237,7 @@ struct kind_ops {
 const struct kind_ops *kind_by_name(const char *name);
 /* То же для спеки v2: реестр и группа (kind: group — её в реестре нет, см. ниже). */
 const struct kind_ops *kind_by_name_v2(const char *name);
-/* Все виды по порядку реестра: direct, interface, vless, xsteer, zapret, tgws, awg. */
+/* Все виды по порядку реестра: direct, interface, vless, xsteer, tgws, awg. */
 size_t kind_count(void);
 const struct kind_ops *kind_at(size_t i);
 /* Шаг FNV-1a подписи помощника (с границей поля: «ab»+«c» не равно «a»+«bc»). */
@@ -220,8 +246,10 @@ void kind_sig_mix(unsigned long long *h, const void *p, size_t n);
 
 /* Дописать в дерево rs правила всех видов, у которых есть emit: по видам в порядке реестра,
  * внутри вида — по выходам в порядке спеки (см. kind_ops.emit выше). Одна точка входа вместо
- * ручного прохода по видам в generate.c — новый вид с emit не требует правки компилятора. */
-void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
+ * ручного прохода по видам в generate.c — новый вид с emit не требует правки компилятора. После
+ * видов ядра — наборы, слоты и шаблоны плагинов (plugin_emit_all): 0 — готово, -1 — отказ с
+ * причиной в e (имя плагина и строка файла nft). */
+int kind_emit_all(struct nft_rs *rs, const struct spec *sp, struct err *e);
 
 /* Записи видов. Определены в src/kinds/<вид>.c; реестр ссылается на них слабо (kind.c), поэтому
  * вид, файла которого нет в сборке, у реестра есть — записью отказа.
@@ -231,32 +259,29 @@ void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
  * спека v1 её не знает (`"kind": "group"` в v1 обязан остаться неизвестным видом, иначе спека,
  * принятая с ним, значила бы то, чего v1 не обещал), своих правил и проверок у неё нет, а
  * собирает её перевод v1 (model/v1.c) напрямую. Разбор v2 находит её через kind_by_name_v2. */
-extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer, kind_zapret,
-                             kind_tgws, kind_awg, kind_group, kind_hysteria2,
-                             kind_trojan, kind_shadowsocks, kind_socks, kind_http, kind_vmess;
+extern const struct kind_ops kind_direct, kind_interface, kind_awg, kind_group,
+                             kind_plugin_device, kind_unavail, kind_block;
+/* Выход «Блок» (kinds/block.c): резолвер отвечает на имена его правил пустым адресом. */
+int out_is_block(const struct output *o);
 
 /* Вид обнулённого выхода (kind == NULL; так их собирают стенды) — direct, как у нулевого
  * значения прежнего перечня видов. Читает его kind_of в spec.h. */
 #define KIND_ZERO (&kind_direct)
 
-/* ПРЕЖНИЕ ИМЕНА ВИДОВ — только для стендов (tests/specmatch.c, tests/failovermatch.c), которым
- * нужно собрать выход конкретного вида, не читая спеку: `g_spec.out[0].kind = OUT_XSTEER`.
+/* ИМЕНА ВИДОВ ДЛЯ СТЕНДОВ — только для стендов (tests/specmatch.c, tests/failovermatch.c), которым
+ * нужно собрать выход конкретного вида, не читая спеку: `g_spec.out[0].kind = OUT_INTERFACE`.
  * Общий код вида не сравнивает — он спрашивает kind_of(o)->caps или конкретную функцию вида
- * (zapret_present, out_tgws и соседи ниже). Вне src/kinds и стендов эти имена ловит
+ * (iface_obfs и соседи ниже). Вне src/kinds и стендов эти имена ловит
  * tests/buildmatch.sh. */
 #define OUT_DIRECT    (&kind_direct)
 #define OUT_INTERFACE (&kind_interface)
-#define OUT_VLESS     (&kind_vless)
-#define OUT_XSTEER    (&kind_xsteer)
-#define OUT_ZAPRET    (&kind_zapret)
-#define OUT_TGWS      (&kind_tgws)
-#define OUT_AWG       (&kind_awg)
 #define OUT_GROUP     (&kind_group)
 
 /* ---- вопросы к отдельным видам ------------------------------------------------------------
  *
- * Помощнику вида (клиенту vless, xsteer, мосту tgws) нужна настройка своего выхода, и спросить
- * её он должен у вида: «это мой выход?» — NULL, если выход другого вида. */
+ * Коду ядра нужна настройка выхода своего вида, и спросить её он должен у вида: «это мой выход?» — NULL,
+ * если выход другого вида. Помощники видов плагинов спрашивают не вид, а свой файл настройки выхода
+ * {conf} (steer-api.md, 1.4). */
 
 /* Вид, которым выход виден снаружи: в status, в `steer outputs --kind`, в подписях сверки и в
  * отказах разбора. У группы из перевода v1 — вид прежнего выхода (interface), см.
@@ -317,9 +342,16 @@ void group_balance_slots(const struct group_cfg *g, const unsigned char *alive,
 void group_bal_chain(const struct output *o, char *dst, size_t n);
 void group_bal_map(const struct output *o, char *dst, size_t n);
 void group_mark_chain(const struct output *o, char *dst, size_t n);
-/* Куда ведёт слот карты, отданный члену m: вложенная balance — в её цепочку (её доля делится
- * дальше по её весам), остальные — в цепочку метки члена. */
+/* Куда ведёт слот карты, отданный члену m: вложенная группа с картой (group_carded) — в её цепочку
+ * (balance делит долю дальше по весам, order/latency — на свой текущий член), остальные — в цепочку
+ * метки члена. */
 void group_bal_target(const struct output *m, char *dst, size_t n);
+/* Группа с картой соединений в ядре (compile/balance.c): balance — новые соединения по живым членам;
+ * order и latency с именованными членами — ЗАКРЕПЛЕНИЕ: новое соединение — на текущий член, а
+ * установленное остаётся на том, где началось, пока тот жив (смена члена по задержке или возврат на
+ * предпочтительный не рвут соединений). manual — нет: человек, выбравший член, ждёт, что туда уйдёт
+ * всё. Пул v1 (безымянные члены без своих меток) — нет: закреплять не за что. */
+int group_carded(const struct output *o);
 /* Вес члена balance — 1..GROUP_WEIGHT_MAX (`weights` спеки v2). */
 #define GROUP_WEIGHT_MAX 100
 /* Сколько секунд без трафика через группу urltest не делается — предел `idle_timeout`. */
@@ -391,69 +423,5 @@ const char *group_why_name(int why);
 
 /* interface: обфускация транспорта или NULL, если её нет (или выход не interface). */
 const struct out_obfs *iface_obfs(const struct output *o);
-
-/* vless */
-const struct vless_cfg *out_vless(const struct output *o);
-/* Развернуть выбор узлов выхода в порядок перебора при подписке из `usable` пригодных узлов.
- * Пишет в dst номера кандидатов по предпочтению и возвращает, сколько написал.
- *
- * Живёт рядом с разбором выхода, а не в клиенте vless: это ЗНАЧЕНИЕ поля `nodes`, а не деталь
- * подъёма туннеля, и проверить его стендом надо там, где стенд не требует ни криптобиблиотеки, ни
- * сети. Клиент и `vless-probe` зовут одну и ту же функцию — иначе диагностика показывала бы
- * перебор, отличный от настоящего.
- *
- * Номер вне подписки ПРОПУСКАЕТСЯ, а не роняет выход: подписка обновляется, узлов в ней
- * становится меньше, и устаревший номер не повод выключить локации, которые на месте.
- * Возврат 0 при непустом `nodes` означает, что не осталось ни одного, — вот это уже отказ,
- * потому что перебирать вместо выбранного что попало значит увести трафик в локацию,
- * которую человек не выбирал. */
-size_t out_node_list(const struct output *o, size_t usable, int *dst, size_t max);
-/* hysteria2: настройка выхода, порядок перебора узлов и «назван ли узел» — те же вопросы, что у
- * vless выше, с тем же смыслом (kinds/hysteria2.c). */
-const struct hy2_cfg *out_hysteria2(const struct output *o);
-size_t out_hy2_node_list(const struct output *o, size_t usable, int *dst, size_t max);
-int out_hy2_node_named(const struct output *o);
-/* Протоколы прокси (trojan, shadowsocks, socks, http, vmess): те же вопросы, с тем же смыслом
- * (kinds/proxy.c). out_proxy — настройка любого из пяти видов, иначе NULL. */
-const struct proxy_cfg *out_proxy(const struct output *o);
-size_t out_proxy_node_list(const struct output *o, size_t usable, int *dst, size_t max);
-int out_proxy_node_named(const struct output *o);
-/* Назван ли узел ЧЕЛОВЕКОМ — то есть выбирать не из чего и перебор не нужен.
- *
- * Отдельным вопросом, а не длиной списка кандидатов, потому что это разные вещи. Кандидат
- * остаётся один и тогда, когда его никто не называл: в подписке единственный узел, или из
- * трёх выбранных в ней уцелел один. Клиент решал по длине — и на подписке из одного узла
- * переставал его проверять вовсе: туннель поднимался на молчащем узле, а вместо «ни один
- * узел подписки не отвечает» человек снова видел «устройства нет» (I-100, ради снятия
- * которого перебор и стал виден).
- *
- * Пропускать проверку можно ровно в одном случае — номер написан в спеке: там человек уже
- * решил, и сообщать ему «выбран единственный выбранный» нечего. */
-int out_node_named(const struct output *o);
-
-/* xsteer */
-const struct xsteer_cfg *out_xsteer(const struct output *o);
-
-/* zapret */
-/* Жив ли обработчик очереди nfqueue с этим номером — то есть работает ли выход kind=zapret. */
-int nfqws_on_queue(int queue);
-/* Работает ли системный обход (любой nfqws) — нужен on_fail=zapret у выходов с устройством. */
-int zapret_running(void);
-/* `steer zapret-instances`: что поднимать init-скрипту. Код — как у команды. */
-int zapret_instances(const struct spec *sp);
-/* Есть ли в спеке хоть один выход kind=zapret — общему коду (apply.c) это нужно знать про
- * ядро: без notrack порождённые обработчиком пакеты остаются на учёте conntrack, а без
- * kmod-nft-queue правило очереди не встанет вовсе. Раньше жила в compile/groups.c как
- * has_zapret и сравнивала kind напрямую; здесь то же самое — вопрос вида, а не общего кода. */
-int zapret_present(const struct spec *sp);
-
-/* tgws */
-const struct tgws_cfg *out_tgws(const struct output *o);
-/* `steer tgws-instances`: что поднимать init-скрипту. Код — как у команды. */
-int tgws_instances(const struct spec *sp);
-/* Есть ли в спеке хоть один выход kind=tgws — нужно раскладке старого ядра (legacy.c): в ней
- * заводится своя таблица `ip`, только когда моста есть куда перехватывать. Тот же довод и та
- * же замена, что у zapret_present. */
-int tgws_present(const struct spec *sp);
 
 #endif

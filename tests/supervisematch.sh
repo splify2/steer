@@ -3,7 +3,8 @@
 #
 # Помощники здесь не настоящие: шов STEER_SUPERVISE_EXE подставляет скрипт, который
 # записывает «команда выход pid» и спит. Так видно ровно то, что делает супервизор, без сети,
-# туннелей и root. Выходы — с obfs: их помощник есть и в базовой сборке.
+# туннелей и root. Выходы — с obfs: их помощника заводит плагин obfs (вид interface, помощник при obfs;
+# каталог плагинов стенда — tests/plugroot.sh).
 #
 # Что проверяется: по помощнику на выход с процессом; убитый помощник перезапускается; SIGHUP
 # после удаления выхода из спеки гасит его помощника и не трогает остальных; SIGHUP с
@@ -17,6 +18,8 @@ BIN="${STEER:-./build/steer}"
 [ -x "$BIN" ] || { echo "not built: $BIN (make test)"; exit 2; }
 pass=0 fail=0
 tmp="$(mktemp -d)"
+sh tests/plugroot.sh "$tmp/plugins" "$(dirname "$BIN")" || { echo "supervisematch: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
         fail=$((fail + 1)); printf 'FAIL %s\n  expected: %s\n  actual:   %s\n' "$1" "$2" "$3"
@@ -49,6 +52,9 @@ running() { grep -c "^obfs $1 " "$tmp/log" 2>/dev/null; }
 wait_for() {
     i=0
     while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    # Приговор по фактическому состоянию, а не по счётчику кругов: условие, ставшее истинным в последнюю
+    # десятую секунды, иначе объявлялось бы невыполненным.
+    eval "$1" && return 0
     return 1
 }
 alive() {  # alive ВЫХОД — жив ли его последний помощник
@@ -57,7 +63,7 @@ alive() {  # alive ВЫХОД — жив ли его последний помо
 }
 
 spec a bb
-STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/spec.json" 2>"$tmp/sup.err" &
+STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/spec.json" --state-dir "$tmp/st0" 2>"$tmp/sup.err" &
 SUP=$!
 sleep 1
 check "поднят помощник выхода a" "1" "$(running a)"
@@ -124,7 +130,7 @@ exit 1
 H
 chmod +x "$tmp/crash"
 spec d
-STEER_SUPERVISE_EXE="$tmp/crash" "$BIN" supervise --spec "$tmp/spec.json" 2>"$tmp/crash.err" &
+STEER_SUPERVISE_EXE="$tmp/crash" "$BIN" supervise --spec "$tmp/spec.json" --state-dir "$tmp/st0" 2>"$tmp/crash.err" &
 SUP=$!
 sleep 12
 check "падающий сразу: к 12-й секунде два запуска (0 и 5 с)" "2" "$(grep -c '^obfs d ' "$tmp/crash.log")"
@@ -155,8 +161,10 @@ wait_for '[ "$(running a)" = 1 ]' 5
 check "via: помощник выхода a поднят" "1" "$(running a)"
 check "via: метки — из реестра каталога состояния супервизора" "1" "$(grep -c '^t ' "$st/registry" 2>/dev/null)"
 p="$(grep '^obfs a ' "$tmp/log" | tail -1 | cut -d' ' -f3)"
-check "via: помощник получил тот же каталог состояния" "1" \
-    "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -c -- "--state-dir $st")"
+# Помощник плагина узнаёт каталоги из {conf} (steer-api.md, 1.4): файл лежит в каталоге состояния
+# супервизора.
+check "via: помощник получил {conf} в каталоге состояния супервизора" "1" \
+    "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -c -- "--conf $st/plugin/obfs/a.json")"
 kill -HUP $SUP
 sleep 2
 check "via: SIGHUP без изменений — помощник не перезапущен" "1 yes" "$(running a) $(alive a)"

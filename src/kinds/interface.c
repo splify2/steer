@@ -16,6 +16,7 @@
 #include "nftdump.h"
 #include "procscan.h"
 #include "rtnl.h"
+#include "plugin.h"
 
 const struct out_obfs *iface_obfs(const struct output *o) {
     return kind_of(o) == &kind_interface && o->iface.obfs.on ? &o->iface.obfs : NULL;
@@ -26,7 +27,7 @@ static int iface_parse(struct output *o, const struct out_keys *k, struct err *e
      * работает сейчас, devices — из чего выбирать. Задан только список — устройство выводится
      * из первого; сам список (если в нём есть из чего выбирать) станет группой у перевода v1. */
     if (!o->device[0] && k->devices_n) snprintf(o->device, sizeof(o->device), "%s", k->devices[0]);
-    if (!o->device[0]) return err_set(e, "outputs.%s: kind interface needs a device", o->name);
+    if (!o->device[0]) return err_setc(e, "spec.interface_needs_device", "outputs.%s: kind interface needs a device", o->name);
     o->iface.obfs = k->obfs;
     return 0;
 }
@@ -98,10 +99,18 @@ static void iface_diag(kind_diag_fn *diag, const struct spec *sp, const struct o
     if (!ob->on) return;
     char what[200], why[400];
 
-    /* Обходом /proc (src/lib/procscan.c): у демона обфускатор — его ребёнок с argv[0] «…/steer»,
-     * без демона — экземпляр procd с той же строкой. */
-    char needle[64];
-    snprintf(needle, sizeof(needle), "steer obfs %.32s", o->name);
+    /* Обфускатор — помощник плагина (iface_helper). Нет плагина — так и сказать: перезапуск ядра его
+     * не поставит. Есть — обходом /proc (src/lib/procscan.c): у демона помощник — его ребёнок с
+     * командной строкой «<программа> <cmd> <выход> --conf …». */
+    const struct plugin_kind *pk = plugin_core_ext("interface", "obfs");
+    if (!pk) {
+        snprintf(what, sizeof(what), "выход %.40s: обфускатора нет", o->name);
+        diag("obfs", "fail", what, "у выхода есть obfs, а плагина, который ведёт обфускатор (ключ obfs вида "
+             "interface), нет — найдите и поставьте его: steer plugin search obfs");
+        return;
+    }
+    char needle[96];
+    snprintf(needle, sizeof(needle), "%.32s %.32s --conf", pk->helper_cmd ? pk->helper_cmd : pk->name, o->name);
     int alive = proc_cmdline_find(needle, 0);
     snprintf(what, sizeof(what), "выход %.40s: обфускатор %s", o->name, alive ? "работает" : "не запущен");
     diag("obfs", alive ? "ok" : "fail", what,
@@ -145,18 +154,23 @@ static void iface_diag(kind_diag_fn *diag, const struct spec *sp, const struct o
     }
 }
 
-/* Помощник — обфускатор (`steer obfs <выход>`). В подпись — сервер и локальный адрес: ровно то,
- * что он читает при старте (см. helper_sig в daemon/helpers.c). */
+/* Помощник — обфускатор. Его даёт плагин (manifest.md: вид interface с impl: core и helper.when:
+ * obfs, plugin_core_ext), а ядро не знает ни имени программы, ни её команд: выходу с obfs — помощник
+ * того плагина, что взялся за ключ obfs вида interface. Его {conf} несёт ключ obfs (iface_conf_keys),
+ * подпись перезапуска — всё содержимое {conf} (plugin.c). Плагина нет — помощника нет, а diag говорит,
+ * какой плагин поставить. */
 static int iface_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
-    (void)sp;
+    if (!o->iface.obfs.on) return -1;
+    const struct plugin_kind *pk = plugin_core_ext("interface", "obfs");
+    return pk ? plugin_kind_helper(pk, sp, o, h) : -1;
+}
+
+/* Ключ obfs в {conf}: так, как он пишется в спеке v2 (docs/spec-v2.md). */
+static void iface_conf_keys(FILE *f, const struct output *o) {
     const struct out_obfs *ob = &o->iface.obfs;
-    if (!ob->on) return -1;
-    snprintf(h->cmd, sizeof(h->cmd), "obfs");
-    kind_sig_mix(&h->sig, ob->server, strlen(ob->server));
-    kind_sig_mix(&h->sig, &ob->server_port, sizeof(ob->server_port));
-    kind_sig_mix(&h->sig, ob->listen, strlen(ob->listen));
-    kind_sig_mix(&h->sig, &ob->listen_port, sizeof(ob->listen_port));
-    return 0;
+    if (!ob->on) { fputs("{}", f); return; }
+    fprintf(f, "{\"obfs\":{\"server\":\"%s:%d\",\"listen\":\"%s:%d\"}}", ob->server, ob->server_port,
+            ob->listen, ob->listen_port);
 }
 
 const struct kind_ops kind_interface = {
@@ -170,4 +184,5 @@ const struct kind_ops kind_interface = {
     .status = iface_status,
     .diag = iface_diag,
     .helper = iface_helper,
+    .conf_keys = iface_conf_keys,
 };

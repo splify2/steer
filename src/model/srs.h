@@ -58,8 +58,6 @@ struct srs_elem {
 #define SRS_F_XDOM   0x04u      /* есть исключения-имена */
 #define SRS_F_XCIDR  0x08u      /* есть исключения-подсети */
 
-#define SRS_MAX_SRC  64         /* подсетей source_ip_cidr в клаузе */
-#define SRS_MAX_PKG  16         /* пакетов package_name в клаузе */
 
 struct srs_pfx4 { uint32_t net; int plen; };      /* host order */
 
@@ -102,12 +100,10 @@ void srs_cache_drop(void);
 
 size_t srs_clause_n(const struct srs_set *s);
 const struct srs_clause *srs_clause(const struct srs_set *s, size_t i);
-const char *srs_path(const struct srs_set *s);
 /* Что снято при чтении (невыразимое или неприменимое на этой платформе), одной фразой для
  * строки steer[warn]; NULL — ничего. */
 const char *srs_skipped(const struct srs_set *s);
-/* Есть ли хоть одна клауза вида kind / с флагом flag. */
-int srs_any_kind(const struct srs_set *s, unsigned kind);
+/* Есть ли хоть одна клауза с флагом flag. */
 int srs_any_flag(const struct srs_set *s, unsigned flag);
 
 /* Второй проход: элементы по порядку файла. want — SRS_EL_DOMAIN|SRS_EL_CIDR: чего не просили,
@@ -135,11 +131,12 @@ int l4_same_set(const struct l4match *a, const struct l4match *b);
 /* Разложение сужения на ящики «протокол × порты» для составного набора nftables
  * (ipv4_addr . inet_proto . inet_service): без сужения — один ящик 0-255 × 0-65535. */
 struct l4box { unsigned char plo, phi; unsigned short lo, hi; };
-#define L4BOX_MAX (2 * L4_PORTS_MAX + 1)
+/* out — места на 2 * ports_n ящиков (не меньше одного). */
 size_t l4_boxes(const struct l4match *m, struct l4box *out);
 /* Объединение нескольких сужений в НЕПЕРЕСЕКАЮЩИЕСЯ ящики: ядро не принимает в составной
  * набор пересекающиеся элементы (EEXIST), а одному адресу бывают нужны два сужения сразу. */
-size_t l4_union_boxes(const struct l4match *const *ms, size_t n, struct l4box *out);
+struct l4box *l4_union_alloc(const struct l4match *const *ms, size_t n, size_t *nb);
+/* Массив ящиков по размеру входа, освобождает вызывающий; NULL с *nb = 0 — нет памяти. */
 /* Текст ящика для nft: «17 . 50000-65535». */
 void l4_box_text(const struct l4box *b, char *dst, size_t n);
 /* Сужение текстом для таблицы резолвера: «-» (нет), «udp/50000-65535+19000-20000». */

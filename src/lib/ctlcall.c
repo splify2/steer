@@ -211,9 +211,18 @@ int ctlcall_parse(const char *s, struct ctlcall_resp *r) {
         else if (!strcmp(key.p, "message")) dst = &r->message;
         else if (!strcmp(key.p, "spec_path")) dst = &r->spec_path;
         else if (!strcmp(key.p, "state_dir")) dst = &r->state_dir;
+        else if (!strcmp(key.p, "ecode")) dst = &r->ecode;
         if (dst && *s == '"') {
             free(dst->p);
             s = json_str(s, dst);
+        } else if (!strcmp(key.p, "args") && *s == '{') {
+            const char *end = json_skip(s);
+            if (end) {
+                free(r->args.p);
+                r->args.p = strndup(s, (size_t)(end - s));
+                r->args.n = (size_t)(end - s);
+            }
+            s = end;
         } else if (!strcmp(key.p, "code")) {
             char *e = NULL;
             long v = strtol(s, &e, 10);
@@ -240,7 +249,7 @@ int ctlcall_parse(const char *s, struct ctlcall_resp *r) {
 
 void ctlcall_resp_free(struct ctlcall_resp *r) {
     free(r->out.p); free(r->err.p); free(r->error.p); free(r->message.p);
-    free(r->spec_path.p); free(r->state_dir.p);
+    free(r->spec_path.p); free(r->state_dir.p); free(r->ecode.p); free(r->args.p);
     memset(r, 0, sizeof(*r));
 }
 

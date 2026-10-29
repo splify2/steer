@@ -49,15 +49,9 @@ int dbg(void) {
  * the routing set (best-effort policy mark) we fire-and-forget after the
  * reply, since the default policy covers a missing entry anyway.
  */
-const char *g_nft_table = "inet steer"; /* "<family> <table>" */
-/* Где лежит карта fakeip. В современной раскладке — там же, где наборы каналов; в старой
- * (ядро 4.9, см. nft_compat в spec.h) — в таблице ip, рядом с единственной цепочкой nat,
- * потому что наборы между таблицами не видны, а nat в inet на таком ядре нет вовсе. */
-const char *g_nft_map_table = "inet steer";
-/* Интервальные ли наборы каналов. В старой раскладке доменный набор — hash со сроками
- * (интервальный набор со сроками ядро 4.9 не умеет), и элемент туда идёт ОДИН, без пары
- * «начало + конец диапазона»: конец с флагом INTERVAL_END hash-набор отверг бы. */
-int g_nft_sets_interval = 1;
+/* "<family> <table>": наборы каналов и карты fakeip/fakeip6 — все в одной таблице. Наборы
+ * каналов интервальные (элемент — пара «начало + конец диапазона», см. nftlk_elem_build). */
+const char *g_nft_table = "inet steer";
 
 /* nfgenmsg::nfgen_family takes a NFPROTO_* constant (NOT AF_* despite the
  * kernel header's misleading "AF_xxx" comment — nf_tables predates that
@@ -67,7 +61,6 @@ int g_nft_sets_interval = 1;
  * build can resolve to 0 (verified: glibc-cross 13 gives NFPROTO_INET==0),
  * whereas the kernel's canonical values are fixed ABI numbers. Hard-code the
  * stable uapi values instead — they never change. */
-#define SPL_NFPROTO_UNSPEC  0
 #define SPL_NFPROTO_INET    1   /* nft's "inet" family — the only one we use */
 #define SPL_NFPROTO_IPV4    2
 #define SPL_NFPROTO_ARP     3
@@ -78,9 +71,7 @@ int g_nft_sets_interval = 1;
 /* Map the textual table family (first token of "--table", e.g. "inet") to its
  * NFPROTO number. Defaults to INET — this daemon only ever targets "inet fw4". */
 /* Сравнивается ПЕРВОЕ СЛОВО, а не строка целиком: nftlk_split_table отдаёт семейство
- * указателем на начало «ip steer», без обрезки, и strcmp с "ip" там не совпадал никогда —
- * любое семейство молча становилось inet. Пока все наши объекты жили в inet, этого не было
- * видно; карта fakeip в таблице ip (старая раскладка, см. nft_compat) получала ENOENT. */
+ * указателем на начало «inet steer», без обрезки. */
 static uint8_t nftlk_family(const char *fam) {
     if (!fam) return SPL_NFPROTO_INET;
     size_t n = strcspn(fam, " ");
@@ -438,23 +429,17 @@ uint32_t set_ttl_clamp(uint32_t ttl) {
 int nft_last_add_rc;
 
 static int add_element(const char *set_name, const void *key_net, size_t alen, uint32_t ttl) {
-    uint64_t timeout_ms;
-    if (ttl == 0) {
-        timeout_ms = 0;                          /* permanent: no NFTA_SET_ELEM_TIMEOUT */
-    } else {
-        if (ttl < 1) ttl = 1;
-        if (ttl > 86400) ttl = 86400;
-        timeout_ms = (uint64_t)ttl * 1000;
-    }
+    /* 0 — постоянный элемент: без NFTA_SET_ELEM_TIMEOUT. */
+    uint64_t timeout_ms = ttl ? (uint64_t)set_ttl_clamp(ttl) * 1000 : 0;
     int rc = elem_msg(NFT_MSG_NEWSETELEM, g_nft_table, set_name,
-                      key_net, alen, g_nft_sets_interval, NULL, timeout_ms);
-    if (rc == -EINVAL && g_nft_sets_interval)
+                      key_net, alen, 1, NULL, timeout_ms);
+    if (rc == -EINVAL)
         /* Имя splify-dnsd осталось от предыдущего проекта, и строка из-за него не
          * доезжала до интерфейса вовсе: журнал там собирается как `logread | grep steer`,
          * а подстроки steer в ней не было. При этом сообщение важное — доменная
          * маршрутизация не наполняется. */
-        fprintf(stderr, "steer[warn] dnsd: %s rejected an interval element (-EINVAL) — "
-                        "is it declared without `flags interval`?\n", set_name);
+        fprintf(stderr, "steer[warn] dnsd: %s не принял элемент-интервал (-EINVAL) — "
+                        "набор объявлен без `flags interval`?\n", set_name);
     nft_last_add_rc = rc;
     /* Already there = already in the desired state. (A refreshed timeout would be
      * nicer, but the element only has to outlive the client's cached answer, and
@@ -469,7 +454,7 @@ int nft_add_element(const char *set_name, uint32_t key_host, uint32_t ttl) {
 
 /* Элемент IPv6 — в парный набор «<группа>6» (fake-IP v6 и real-ip v6, docs/architecture.md,
  * «4б»). Тот же набор флагов и те же правила, что у IPv4: интервальный набор получает пару
- * «начало + маркер конца», hash со сроками старой раскладки — один элемент. */
+ * «начало + маркер конца». */
 int nft_add_element6(const char *set_name, const uint8_t key[16], uint32_t ttl) {
     return add_element(set_name, key, 16, ttl);
 }
@@ -485,7 +470,7 @@ int nft_add_element6(const char *set_name, const uint8_t key[16], uint32_t ttl) 
  * ядре 6.8: «076433c6 00000011 000050c3 - 076433c6 00000011 0000ffff».
  *
  * Срок — на самом элементе, как у обычного. Пересекающийся элемент ядро отвергает (EEXIST),
- * поэтому вызывающий кладёт ящики, уже разложенные без пересечений (l4_union_boxes). */
+ * поэтому вызывающий кладёт ящики, уже разложенные без пересечений (l4_union_alloc). */
 static size_t nftlk_concat_build(uint8_t *buf, size_t cap, uint32_t seq, uint16_t nft_msg_type,
                                  const char *table, const char *obj_name,
                                  const uint8_t *key, const uint8_t *key_end, size_t klen,
@@ -649,18 +634,13 @@ static int map_set(const char *table, const char *map_name, const void *k, const
 int nft_map_set_element(const char *map_name, uint32_t fake_host,
                          uint32_t real_host, uint32_t known_real) {
     uint32_t k = htonl(fake_host), d = htonl(real_host);
-    return map_set(g_nft_map_table, map_name, &k, &d, 4,
+    return map_set(g_nft_table, map_name, &k, &d, 4,
                    known_real != 0 && known_real != real_host);
 }
 
-/* Карта fakeip6 — где лежит: в современной раскладке там же, где fakeip, в старой — в таблице
- * ip6 (legacy.c переносит карту к правилу dnat её семейства; без nat в ip6 карты нет вовсе, и
- * резолвер поддельных IPv6 не выдаёт — таблица каналов тогда не несёт семейства 6). */
-const char *g_nft_map6_table = "inet steer";
-
 int nft_map_set_element6(const char *map_name, const uint8_t fake[16], const uint8_t real[16],
                          const uint8_t *known_real) {
-    return map_set(g_nft_map6_table, map_name, fake, real, 16,
+    return map_set(g_nft_table, map_name, fake, real, 16,
                    known_real && memcmp(known_real, real, 16) != 0);
 }
 
@@ -685,8 +665,7 @@ int nft_map_set_element6(const char *map_name, const uint8_t fake[16], const uin
  * срока. Слитый засев — ровно такой: постоянные элементы внутри пула. Отрезок шире пула — это
  * префикс адресного списка (список «bogon» с 198.18.0.0/15 законно покрывает весь пул), и
  * вырезать из него адрес значило бы молча поменять список человека; со сроком — не наш засев.
- * Тогда — ENOENT, как прежде. Старая раскладка (hash, g_nft_sets_interval = 0) не сливает ничего,
- * и туда эта функция не нужна. */
+ * Тогда — ENOENT. */
 
 /* Найти атрибут type в потоке атрибутов [p, p+len). */
 static const struct nlattr *nla_find(const uint8_t *p, size_t len, uint16_t type) {
@@ -707,8 +686,7 @@ static const struct nlattr *nla_find(const uint8_t *p, size_t len, uint16_t type
 /* Элемент по ключу: у интервального набора — граница отрезка, в котором лежит key (end = 0 — его
  * начало, 1 — его маркер конца, исключающий), у карты без интервалов — сам элемент. 0 — найдено,
  * ключ в out, *timed — у элемента есть срок, и если data не NULL — значение элемента карты в data
- * (alen байт), *has_data — оно было в ответе; -ENOENT — такого ключа нет; иное — отказ ядра (старое
- * ядро отдаёт элементы только дампом и на одиночный GET отвечает -EOPNOTSUPP) или ответа нет
+ * (alen байт), *has_data — оно было в ответе; -ENOENT — такого ключа нет; иное — отказ ядра или ответа нет
  * (-ETIMEDOUT). Обычный запрос, не транзакция: GET в пакет не входит. */
 static int nftlk_get_elem(const char *table, const char *set, const uint8_t *key, size_t alen,
                           int end, uint8_t *out, int *timed, uint8_t *data, int *has_data) {
@@ -816,8 +794,7 @@ static int nftlk_get_bound(const char *table, const char *set, const uint8_t *ke
  * другое — снять и положить одной транзакцией (map_set с changed); ключа нет — простой add. Цена
  * та же, что у прежнего add: один обмен netlink на имя в обычном случае (засев совпал), два — когда
  * ключа нет (после перезапуска резолвера карта пуста) и транзакция — когда значение разошлось.
- * Ядро без одиночного GET (старое: только дамп) или иной отказ ответа — прежний простой add: хуже,
- * чем было, не становится. Горячий
+ * Отказ ответа на GET — простой add. Горячий
  * путь ответа DNS это не зовёт: там «установленное» знает память (known_real), и засевом она не
  * расходится — расхождение возникает только на замене набора, после которой и зовут этот проход.
  *
@@ -849,12 +826,12 @@ int nft_set_has(const char *set_name, const void *key_net, size_t alen) {
 
 int nft_map_ensure_element(const char *map_name, uint32_t fake_host, uint32_t real_host) {
     uint32_t k = htonl(fake_host), d = htonl(real_host);
-    return map_ensure(g_nft_map_table, map_name, &k, &d, 4);
+    return map_ensure(g_nft_table, map_name, &k, &d, 4);
 }
 
 int nft_map_ensure_element6(const char *map_name, const uint8_t fake[16],
                             const uint8_t real[16]) {
-    return map_ensure(g_nft_map6_table, map_name, fake, real, 16);
+    return map_ensure(g_nft_table, map_name, fake, real, 16);
 }
 
 /* Отрезок [lo, hi) интервального набора одним сообщением: начало и маркер конца (как у
@@ -906,7 +883,7 @@ static void key_step(uint8_t *k, size_t alen, int up) {
 
 int nft_elem_carve(const char *set, const uint8_t *key, size_t alen, const uint8_t *lo,
                    const uint8_t *hi) {
-    if (!g_nft_sets_interval || (alen != 4 && alen != 16)) return -ENOENT;
+    if (alen != 4 && alen != 16) return -ENOENT;
     uint8_t s[16], e[16];
     int ts = 0, te = 0;
     int rc = nftlk_get_bound(g_nft_table, set, key, alen, 0, s, &ts);

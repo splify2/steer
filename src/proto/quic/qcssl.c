@@ -154,6 +154,24 @@ int qcssl_peer_sha256(void *ssl, uint8_t out[32]) {
     return rc;
 }
 
+int qcssl_peer_der(void *ssl, uint8_t *out, size_t cap) {
+    WOLFSSL_X509 *x = wolfSSL_get_peer_certificate(ssl);
+    if (!x) return -1;
+    int len = 0;
+    const unsigned char *der = wolfSSL_X509_get_der(x, &len);
+    int rc = -1;
+    if (der && len > 0 && (size_t)len <= cap) { memcpy(out, der, (size_t)len); rc = len; }
+    wolfSSL_X509_free(x);
+    return rc;
+}
+
+int qcssl_ctx_client_cert(void *ctx, const uint8_t *cert, size_t cert_n, const uint8_t *key, size_t key_n) {
+    if (wolfSSL_CTX_use_certificate_buffer(ctx, cert, (long)cert_n, WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS ||
+        wolfSSL_CTX_use_PrivateKey_buffer(ctx, key, (long)key_n, WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS)
+        return -1;
+    return 0;
+}
+
 void qcssl_free(void *ssl) {
     if (ssl) wolfSSL_free(ssl);
 }

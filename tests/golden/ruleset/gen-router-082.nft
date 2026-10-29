@@ -1,4 +1,6 @@
 # args: apply --dry-run --spec TMP/pp.json --state-dir TMP/st-pp
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: channels.p: ports: негодная запись «» — нужно «443» или «50000-65535», числа от 1 до 65535, начало не больше конца
+# env: STEER_PLUGINS_ETC=TMP/plugetc
+# env: STEER_PLUGINS_ROOT=TMP/plugins
+# stderr: steer: channels.p: ports: диапазоны 1-100 и 50-60 пересекаются — сложите их в один

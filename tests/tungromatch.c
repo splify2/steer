@@ -22,6 +22,7 @@
  * исходник напрямую и входит в обычный make test — как xswirematch и xsstreammatch.
  */
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -181,12 +182,19 @@ static void superframe_case(int hint_full_first) {
     memcpy(frame, &vh, sizeof(vh));
     if (send(g_pair[1], frame, VNET_HDR_LEN + tot, 0) < 0) { perror("send"); exit(2); }
 
-    int same = 1, count = 0;
+    int same = 1, count = 0, buf_mid = -1, sock_mid = -1;
     for (int i = 0; i < 5; i++) {
         unsigned char got[2048];
         ssize_t r = tun_read_packet(&g_dev, got, sizeof(got));
         if (r <= 0) break;
         count++;
+        if (i == 1) {
+            /* Порция оборвалась после второго сегмента: сокет уже пуст (кадр прочитан целиком), а три
+             * сегмента ждут в буфере — цикл узнаёт о них только у tun_buffered, не у epoll. */
+            struct pollfd pf = { .fd = g_dev.fd, .events = POLLIN };
+            sock_mid = poll(&pf, 1, 0);
+            buf_mid = tun_buffered(&g_dev);
+        }
         if ((size_t)r != want_n[i] || memcmp(got, want[i], (size_t)r) != 0) {
             same = 0;
             printf("     сегмент %d разошёлся: %zd байт против %zu\n", i, r, want_n[i]);
@@ -195,6 +203,9 @@ static void superframe_case(int hint_full_first) {
         }
     }
     check("разбор склеенного: отдано пакетов", 5, count);
+    check("посреди кадра: устройство уже пусто для poll", 0, sock_mid);
+    check("посреди кадра: tun_buffered видит остаток", 1, buf_mid);
+    check("после кадра: tun_buffered пуст", 0, tun_buffered(&g_dev));
     check("разбор склеенного: пакеты те же, что без склейки", 1, same);
     check("разбор склеенного: ничего не отброшено", 0, (long)g_dev.rx_dropped);
 }

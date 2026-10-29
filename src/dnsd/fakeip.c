@@ -1,6 +1,11 @@
 #include "dnsd_int.h"
 #include "nftnl.h"
 #include "srs.h"
+#include "ctnl.h"
+#include <linux/netlink.h>
+#include <linux/netfilter/nfnetlink.h>
+#include <linux/netfilter/nfnetlink_conntrack.h>
+#include <pthread.h>
 
 /* ---------------------------------------------------------------------- */
 /* fake-IP pool: one stable, exclusive synthetic IPv4 per matched domain    */
@@ -88,6 +93,7 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
     t->entries[t->n].domain = strdup(domain);
     if (!t->entries[t->n].domain) return -1;
     t->entries[t->n].addr = addr;
+    t->entries[t->n].last_used = time(NULL);
     t->entries[t->n].real_host = 0;
     t->entries[t->n].real_saved = 0;
     t->entries[t->n].has_real6_saved = 0;
@@ -124,7 +130,7 @@ static int fakeip_table_has(const struct fakeip_table *t, const char *domain) {
 }
 
 /* State file format: one entry per line.
- *   domain\tfake_ip            (legacy / --fakeip CLI output)
+ *   domain\tfake_ip            (real backend unknown; also what --fakeip writes)
  *   domain\tfake_ip\treal_ip   (extended: real backend, for post-restart rehydrate)
  *   domain\tfake_ip\treal_ip\treal_ip6
  *   domain\tfake_ip\t-\treal_ip6
@@ -133,8 +139,7 @@ static int fakeip_table_has(const struct fakeip_table *t, const char *domain) {
  *                               он выводится из fake_ip, см. шапку файла)
  * Missing file -> empty table, not an error (first run). A malformed line is
  * skipped, not fatal — the domain simply gets re-allocated (a fresh index) on
- * the next match. The legacy 2-field form is parsed identically to before, so
- * an existing state file upgrades transparently. Испорченное четвёртое поле строку не
+ * the next match. Испорченное четвёртое поле строку не
  * отвергает: пропадает только настоящий IPv6, и первый AAAA спросит его заново. */
 void fakeip_state_load(const char *path) {
     FILE *f = fopen(path, "r");
@@ -194,7 +199,13 @@ void fakeip_state_load(const char *path) {
     fclose(f);
 }
 
+static int fakeip_writer_active(void);
+
 static void fakeip_state_append(const char *path, const char *domain, uint32_t addr) {
+    /* Поток записи (ниже) держит снимок, снятый ДО этого имени, и его rename затёр бы дописанную строку:
+     * имя пропало бы из файла, а флаг «грязно» уже снят. Строка не дописывается — таблица грязная, и ближайшая
+     * перезапись (по сроку, по просьбе загрузчика, при выходе) унесёт имя в файл вместе со всеми. */
+    if (fakeip_writer_active()) { g_fakeip_dirty = 1; return; }
     FILE *f = fopen(path, "a");
     if (!f) return;
     struct in_addr a; a.s_addr = htonl(addr);
@@ -208,17 +219,12 @@ static void fakeip_state_append(const char *path, const char *domain, uint32_t a
  * Called after we learn a fresh real_ip for an already-allocated domain, so
  * the next restart can rehydrate the DNAT map without re-resolving. Best-effort
  * (atomic via rename); a failure just means a later restart re-resolves. */
-void fakeip_state_rewrite(void) {
-    if (!g_fakeip_state_path) return;
-    /* Буфер — по длине ПУТИ, а не имени хоста: путь состояния задаёт снаружи
-     * (--state-file/--state-dir), и обрезка «%s.tmp» на произвольном месте давала
-     * чужое имя — от несуществующего до самого файла состояния или существующего
-     * каталога. Обрезка проверяется явно: писать некуда лучше, чем писать не туда. */
-    char tmp[PATH_MAX];
-    int need = snprintf(tmp, sizeof(tmp), "%s.tmp", g_fakeip_state_path);
-    if (need < 0 || (size_t)need >= sizeof(tmp)) return;
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
+/* Содержимое файла состояния из g_fakeip — в памяти, без ввода-вывода (строки — формат выше). NULL — нет
+ * памяти. Вызывающий освобождает. */
+static char *fakeip_state_serialize(size_t *len) {
+    char *buf = NULL;
+    FILE *f = open_memstream(&buf, len);
+    if (!f) return NULL;
     for (size_t i = 0; i < g_fakeip.n; i++) {
         const struct fakeip_entry *en = &g_fakeip.entries[i];
         struct in_addr fa; fa.s_addr = htonl(en->addr);
@@ -246,6 +252,24 @@ void fakeip_state_rewrite(void) {
         else
             fprintf(f, "%s\t%s\n", en->domain, fstr);
     }
+    if (fclose(f) != 0) { free(buf); return NULL; }
+    return buf;
+}
+
+/* Записать содержимое в файл состояния атомарно: временный файл, fsync, rename. Может стоять на носителе
+ * сотни миллисекунд (флеш), поэтому из цикла резолвера её не зовут — только синхронные места (fakeip_state_flush)
+ * и поток записи (ниже). */
+static void fakeip_state_store(const char *path, const char *buf, size_t len) {
+    /* Буфер — по длине ПУТИ, а не имени хоста: путь состояния задаёт снаружи
+     * (--state-file/--state-dir), и обрезка «%s.tmp» на произвольном месте давала
+     * чужое имя — от несуществующего до самого файла состояния или существующего
+     * каталога. Обрезка проверяется явно: писать некуда лучше, чем писать не туда. */
+    char tmp[PATH_MAX];
+    int need = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (need < 0 || (size_t)need >= sizeof(tmp)) return;
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    if (len && fwrite(buf, 1, len, f) != len) { fclose(f); unlink(tmp); return; }
     /* Данные должны лечь на носитель ДО rename: иначе отключение питания между
      * rename и фактической записью оставляет пустой state-файл — ровно ту
      * потерю всей таблицы, от которой защищается разбор в fakeip_state_load. */
@@ -255,24 +279,131 @@ void fakeip_state_rewrite(void) {
         return;
     }
     fclose(f);
-    if (rename(tmp, g_fakeip_state_path) != 0)
+    if (rename(tmp, path) != 0)
         unlink(tmp);
 }
 
+/* ПОТОК ЗАПИСИ (I-534). Перезапись с fsync в цикле резолвера останавливала все вопросы клиентов на время записи
+ * на носитель — на флеше это десятки и сотни миллисекунд раз в FAKEIP_ANSWER_TTL. Теперь цикл только
+ * сериализует таблицу в память (процессор, без ввода-вывода) и передаёт буфер потоку, который пишет, делает fsync и
+ * rename. Передаётся последний снимок: пока поток занят, следующий просто заменяет ожидающий. Места, где файл
+ * должен лежать на носителе СЕЙЧАС (засев по просьбе загрузчика, выход резолвера), ждут поток
+ * (fakeip_state_wait) и пишут сами. */
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    char *buf;                  /* ожидающий снимок */
+    size_t len;
+    char *path;                 /* копия пути: g_fakeip_state_path меняется только при старте, но поток живёт дольше */
+    int busy;                   /* поток пишет сейчас */
+    int started;
+} g_fw = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+static void *fakeip_writer(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_fw.mu);
+    for (;;) {
+        while (!g_fw.buf) pthread_cond_wait(&g_fw.cv, &g_fw.mu);
+        char *buf = g_fw.buf;
+        size_t len = g_fw.len;
+        char *path = g_fw.path;
+        g_fw.buf = NULL;
+        g_fw.path = NULL;
+        g_fw.busy = 1;
+        pthread_mutex_unlock(&g_fw.mu);
+        fakeip_state_store(path, buf, len);
+        free(buf);
+        free(path);
+        pthread_mutex_lock(&g_fw.mu);
+        g_fw.busy = 0;
+        pthread_cond_broadcast(&g_fw.cv);
+    }
+    return NULL;
+}
+
+/* Занят ли поток записи или ждёт ли его снимок. */
+static int fakeip_writer_active(void) {
+    pthread_mutex_lock(&g_fw.mu);
+    int a = g_fw.buf != NULL || g_fw.busy;
+    pthread_mutex_unlock(&g_fw.mu);
+    return a;
+}
+
+/* Дождаться, пока поток записи отдаст то, что принял и что ждёт. */
+void fakeip_state_wait(void) {
+    pthread_mutex_lock(&g_fw.mu);
+    while (g_fw.buf || g_fw.busy) pthread_cond_wait(&g_fw.cv, &g_fw.mu);
+    pthread_mutex_unlock(&g_fw.mu);
+}
+
+/* Перезапись файла в фоне: цикл не ждёт носителя. 0 — снимок передан, -1 — не вышло (нет памяти или потока:
+ * вызывающий оставит таблицу грязной и повторит). */
+int fakeip_state_rewrite_async(void) {
+    if (!g_fakeip_state_path) return 0;
+    size_t len;
+    char *buf = fakeip_state_serialize(&len);
+    if (!buf) return -1;
+    char *path = strdup(g_fakeip_state_path);
+    if (!path) { free(buf); return -1; }
+    pthread_mutex_lock(&g_fw.mu);
+    if (!g_fw.started) {
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        pthread_t t;
+        int er = pthread_create(&t, &a, fakeip_writer, NULL);
+        pthread_attr_destroy(&a);
+        if (er != 0) { pthread_mutex_unlock(&g_fw.mu); free(buf); free(path); return -1; }
+        g_fw.started = 1;
+    }
+    free(g_fw.buf);
+    free(g_fw.path);
+    g_fw.buf = buf;
+    g_fw.len = len;
+    g_fw.path = path;
+    pthread_cond_broadcast(&g_fw.cv);
+    pthread_mutex_unlock(&g_fw.mu);
+    return 0;
+}
+
+void fakeip_state_rewrite(void) {
+    if (!g_fakeip_state_path) return;
+    fakeip_state_wait();                      /* не наперегонки с потоком записи: тот же временный файл */
+    size_t len;
+    char *buf = fakeip_state_serialize(&len);
+    if (!buf) return;
+    fakeip_state_store(g_fakeip_state_path, buf, len);
+    free(buf);
+}
+
 /* ФАЙЛ НЕ ОТСТАЁТ ОТ ПАМЯТИ ТАМ, ГДЕ ИЗ НЕГО ЧИТАЮТ (проверка на QEMU 98b7964, 2026-09-28).
- * Перезапись по сроку — не чаще раза в FAKEIP_ANSWER_TTL (цикл в
- * proxy.c: носитель телефона — флеш, и молотить его на каждый переезд адреса незачем). Но из файла
- * читают двое, и обоим минутное отставание стоило связи: засев карты и наборов при замене набора
+ * Перезапись по сроку — не чаще раза в FAKEIP_STATE_DEBOUNCE_S (цикл в proxy.c; была минута
+ * «ради флеша» — отставание файла стоило связи, I-541). Но из файла читают двое, и обоим отставание
+ * стоило связи: засев карты и наборов при замене набора
  * правил (fpseed.c) — новое имя без подмены, старый адрес вместо нового; и новый резолвер после
  * `steer restart` — SIGTERM прежнего выход из цикла ничего не дописывал, и имена последних секунд
  * терялись вовсе, пока их не спросят заново. Поэтому файл пишется ещё в два мига, и оба — редкие
  * события, а не трафик: по просьбе загрузчика прямо перед засевом («flush», adopt.c) и при выходе
- * резолвера (proxy.c, после цикла). Писать при каждой новой паре было бы проще, но на телефоне
- * файл лежит на флеше, а новых имён в сети — сотни в час; здесь же запись одна на apply. Ничего
- * не менялось — ничего и не пишется. */
+ * резолвера (proxy.c, после цикла). Ничего не менялось — ничего и не пишется. */
 void fakeip_state_flush(void) {
+    /* Флаг чист, но снимок может быть ещё у потока записи (fakeip_state_flush_async снял его при передаче):
+     * файл нужен на носителе к возврату — загрузчик прочтёт его сразу, а резолвер сейчас выйдет. */
+    fakeip_state_wait();
     if (!g_fakeip_dirty) return;
     fakeip_state_rewrite();
+    g_fakeip_dirty = 0;
+    g_fakeip_last_rewrite = time(NULL);
+}
+
+/* Возврат адресов — ниже, после работы с наборами каналов (ей нужны dch_del и карта). */
+static uint32_t *g_free;                 /* свободные адреса пула в порядке выдачи */
+static size_t g_free_n, g_free_i;
+static void fakeip_reclaim_try(time_t now);
+/* То же по сроку в цикле (proxy.c): запись идёт в фоне, цикл не ждёт носителя (I-534). Не вышло передать —
+ * таблица остаётся грязной, и срок придёт снова. */
+void fakeip_state_flush_async(void) {
+    if (!g_fakeip_dirty) return;
+    if (fakeip_state_rewrite_async() != 0) return;
     g_fakeip_dirty = 0;
     g_fakeip_last_rewrite = time(NULL);
 }
@@ -288,24 +419,38 @@ int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr) {
     snprintf(domain, sizeof(domain), "%s", domain_in);
     str_lower(domain);
     long at = fakeip_find(domain);
+    time_t now = time(NULL);
     if (at >= 0) {
+        g_fakeip.entries[at].last_used = now;
         *out_addr = g_fakeip.entries[at].addr;
         return 0;
     }
-    if (g_fakeip_next >= FAKEIP_POOL_SIZE - 1) {   /* последний — широковещательный пула */
-        /* Пул кончился: домен уйдёт клиенту реальным адресом, то есть МИМО канала, в
-         * который его положил человек. Молчать об этом нельзя — снаружи это «правило
-         * перестало работать», и связать это с пулом нечем. */
-        static time_t said_pool;
-        time_t now = time(NULL);
-        if (warn_due(&said_pool, now))
-            fprintf(stderr, "steer dnsd: пул fake-IP исчерпан (%u адресов, занято %zu): "
-                            "новые домены идут мимо каналов\n",
-                    (unsigned)FAKEIP_POOL_SIZE, g_fakeip.n);
-        return -1;
+    uint32_t addr;
+    int from_free = 0;
+    if (g_fakeip_next < FAKEIP_POOL_SIZE - 1) {    /* последний — широковещательный пула */
+        addr = fakeip_index_to_addr(g_fakeip_next);
+    } else {
+        /* Выдача дошла до края пула: возвращаем адреса простоявших имён. Свободные берутся по
+         * кругу от места последней выдачи, а не сразу заново: клиент с кэшем DNS успевает
+         * отпустить прежний адрес. */
+        if (g_free_i >= g_free_n) fakeip_reclaim_try(now);
+        if (g_free_i >= g_free_n) {
+            /* Пул кончился по-настоящему: домен уйдёт клиенту реальным адресом, то есть МИМО
+             * канала, в который его положил человек. Молчать об этом нельзя — снаружи это
+             * «правило перестало работать», и связать это с пулом нечем. */
+            static time_t said_pool;
+            if (warn_due(&said_pool, now))
+                fprintf(stderr, "steer dnsd: пул fake-IP исчерпан (%u адресов, занято %zu: все "
+                                "спрошены в последние %d с или держат соединения): новые "
+                                "домены идут мимо каналов\n",
+                        (unsigned)FAKEIP_POOL_SIZE, g_fakeip.n, g_fakeip_idle);
+            return -1;
+        }
+        addr = g_free[g_free_i];
+        from_free = 1;
     }
-    uint32_t addr = fakeip_index_to_addr(g_fakeip_next);
     if (fakeip_table_add(&g_fakeip, domain, addr) != 0) return -1;
+    if (from_free) g_free_i++;
     if (g_fakeip_state_path) fakeip_state_append(g_fakeip_state_path, domain, addr);
     *out_addr = addr;
     return 0;
@@ -395,37 +540,48 @@ const char *g_fakeip_map = "fakeip";
  * . протокол . порты: имя попадает туда с сужением тех правил канала, с которыми совпало, а
  * если совпало с несколькими — их объединением, разложенным на непересекающиеся ящики (ядро не
  * принимает в составной набор пересекающиеся элементы). */
-static size_t dch_boxes(size_t i, const char *domain, struct nftlk_box *out) {
+static struct nftlk_box *dch_boxes(size_t i, const char *domain, size_t *n) {
     static const struct l4match none;
     const struct dchan *d = &g_dch[i];
-    const struct l4match *ms[64];
+    /* Частей у канала сколько есть — совпавших не больше, чем частей, плюс «без сужения». */
+    const struct l4match **ms = malloc((d->parts_n + 1) * sizeof(*ms));
+    *n = 0;
+    if (!ms) return NULL;
     size_t k = 0;
     if (ruleset_match(&d->rules, domain)) ms[k++] = &none;
-    for (size_t p = 0; p < d->parts_n && k < 64; p++)
+    for (size_t p = 0; p < d->parts_n; p++)
         if (ruleset_match(&d->parts[p].rules, domain) &&
             !(d->parts[p].has_excl && ruleset_match(&d->parts[p].excl, domain)))
             ms[k++] = &d->parts[p].l4;
     /* Правила сменились с тех пор, как адрес туда лёг (удаление после перечитывания): прежнего
      * сужения уже не узнать — берётся полный ящик, лучшее, что можно сделать. */
     if (!k) ms[k++] = &none;
-    struct l4box b[L4BOX_MAX];
-    size_t n = l4_union_boxes(ms, k, b);
-    for (size_t j = 0; j < n; j++) {
+    size_t nb;
+    struct l4box *b = l4_union_alloc(ms, k, &nb);
+    free(ms);
+    if (!b) return NULL;
+    struct nftlk_box *out = malloc((nb ? nb : 1) * sizeof(*out));
+    if (!out) { free(b); return NULL; }
+    for (size_t j = 0; j < nb; j++) {
         out[j].plo = b[j].plo;
         out[j].phi = b[j].phi;
         out[j].lo = b[j].lo;
         out[j].hi = b[j].hi;
     }
-    return n;
+    free(b);
+    *n = nb;
+    return out;
 }
 
 int dch_add(size_t i, const char *domain, uint32_t addr_host, uint32_t ttl) {
     if (!g_dch[i].composite) return nft_add_element(g_dch[i].set, addr_host, ttl);
-    struct nftlk_box b[L4BOX_MAX];
-    size_t n = dch_boxes(i, domain, b);
+    size_t n;
+    struct nftlk_box *b = dch_boxes(i, domain, &n);
+    if (!b) return -1;
     int rc = 0;
     for (size_t j = 0; j < n; j++)
         if (nft_concat_element(1, g_dch[i].set, addr_host, &b[j], ttl) != 0) rc = -1;
+    free(b);
     return rc;
 }
 
@@ -454,8 +610,8 @@ void dch_del(size_t i, const char *domain, uint32_t addr_host) {
     if (!g_dch[i].composite) {
         uint32_t k_net = htonl(addr_host);
         int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_dch[i].set,
-                                 &k_net, g_nft_sets_interval, NULL, 0);
-        if (drc == -ENOENT && g_nft_sets_interval) {
+                                 &k_net, 1, NULL, 0);
+        if (drc == -ENOENT) {
             uint8_t lo[4], hi[4];
             pool_bounds4(lo, hi);
             drc = nft_elem_carve(g_dch[i].set, (const uint8_t *)&k_net, 4, lo, hi);
@@ -464,9 +620,10 @@ void dch_del(size_t i, const char *domain, uint32_t addr_host) {
             fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n", g_dch[i].set, drc);
         return;
     }
-    struct nftlk_box b[L4BOX_MAX];
-    size_t n = dch_boxes(i, domain, b);
+    size_t n;
+    struct nftlk_box *b = dch_boxes(i, domain, &n);
     for (size_t j = 0; j < n; j++) nft_concat_element(0, g_dch[i].set, addr_host, &b[j], 0);
+    free(b);
 }
 
 /* Адрес IPv6 — в парный набор «<set>6» (компилятор заводит его доменной группе с dom6, тем же
@@ -479,11 +636,13 @@ int dch_add6(size_t i, const char *domain, const uint8_t addr[16], uint32_t ttl)
     char s6[80];
     dch_set6_name(i, s6, sizeof(s6));
     if (!g_dch[i].composite) return nft_add_element6(s6, addr, ttl);
-    struct nftlk_box b[L4BOX_MAX];
-    size_t n = dch_boxes(i, domain, b);
+    size_t n;
+    struct nftlk_box *b = dch_boxes(i, domain, &n);
+    if (!b) return -1;
     int rc = 0;
     for (size_t j = 0; j < n; j++)
         if (nft_concat_element6(1, s6, addr, &b[j], ttl) != 0) rc = -1;
+    free(b);
     return rc;
 }
 
@@ -491,9 +650,8 @@ void dch_del6(size_t i, const char *domain, const uint8_t addr[16]) {
     char s6[80];
     dch_set6_name(i, s6, sizeof(s6));
     if (!g_dch[i].composite) {
-        int drc = nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_table, s6, addr,
-                                  g_nft_sets_interval, NULL, 0);
-        if (drc == -ENOENT && g_nft_sets_interval) {
+        int drc = nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_table, s6, addr, 1, NULL, 0);
+        if (drc == -ENOENT) {
             uint8_t lo[16], hi[16];
             pool_bounds6(lo, hi);
             drc = nft_elem_carve(s6, addr, 16, lo, hi);
@@ -502,9 +660,177 @@ void dch_del6(size_t i, const char *domain, const uint8_t addr[16]) {
             fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n", s6, drc);
         return;
     }
-    struct nftlk_box b[L4BOX_MAX];
-    size_t n = dch_boxes(i, domain, b);
+    size_t n;
+    struct nftlk_box *b = dch_boxes(i, domain, &n);
     for (size_t j = 0; j < n; j++) nft_concat_element6(0, s6, addr, &b[j], 0);
+    free(b);
+}
+
+/* ---- возврат адресов пула ----------------------------------------------------------------------
+ *
+ * ЗАЧЕМ. Пул — 131070 адресов, и раньше они только выдавались: имя получало адрес навсегда, и на
+ * устройстве, которое живёт месяцами и ходит на десятки тысяч разных имён (сервер, компьютер),
+ * пул кончался, а новые имена шли мимо каналов до перезапуска. Теперь у записи есть время
+ * последнего вопроса (last_used), и когда выдача доходит до края пула, имена, которых не
+ * спрашивали дольше g_fakeip_idle секунд, отдают адрес.
+ *
+ * КОГДА ЗАПИСЬ ВОЗВРАЩАЕТ АДРЕС. Только если её не спрашивали g_fakeip_idle секунд (клиент с
+ * кэшем DNS приходит за адресом заново раньше: поддельный ответ живёт FAKEIP_ANSWER_TTL) И к
+ * адресу нет живых соединений в conntrack: сеанс, открытый часы назад, держит адрес, пока идёт
+ * (пересдать его другому имени значило бы увести сеанс на чужой сайт). Не удалось спросить
+ * conntrack — решает один срок простоя, а не «никогда»: иначе пул без conntrack кончался бы
+ * по-прежнему.
+ *
+ * ЧТО СНИМАЕТСЯ. Адрес — из наборов каналов (v4 и v6), элементы карт fakeip и fakeip6, запись —
+ * из таблицы, индекса и файла состояния (перезаписывается сразу: иначе в файле у одного адреса
+ * два имени до следующей перезаписи). Размер пула не из спеки: диапазон 198.18.0.0/15 зашит в
+ * правила (метка, nat), в разбор спеки и в пару fdfe:dcba:9876::/96, и менять его значит менять
+ * все три места; число адресов называет сообщение об исчерпании. */
+int g_fakeip_idle = FAKEIP_IDLE_DEFAULT;
+
+/* Живые адреса по conntrack: записи с исходным назначением в пуле (подмена переписывает только
+ * кортеж ответа, так что поддельный адрес стоит в исходном кортеже — как у ct_origdst и
+ * ctnl_evict_mark_keep). */
+static int fakeip_live_rec(const uint8_t *a, const uint8_t *end, uint8_t family, void *ctx) {
+    uint8_t *bits = ctx;
+    const struct nlattr *orig = ct_attr(a, end, CTA_TUPLE_ORIG);
+    const struct nlattr *tip = ct_attr_in(orig, CTA_TUPLE_IP);
+    int v6 = family == AF_INET6;
+    const struct nlattr *da = ct_attr_in(tip, v6 ? CTA_IP_V6_DST : CTA_IP_V4_DST);
+    size_t alen = v6 ? 16 : 4;
+    if (!da || da->nla_len < NLA_HDRLEN + alen) return 0;
+    uint32_t h;
+    if (v6) {
+        h = fakeip6_to4((const uint8_t *)da + NLA_HDRLEN);
+        if (!h) return 0;
+    } else {
+        uint32_t n;
+        memcpy(&n, (const uint8_t *)da + NLA_HDRLEN, 4);
+        h = ntohl(n);
+    }
+    if (h < FAKEIP_POOL_BASE || h >= FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE) return 0;
+    uint32_t i = h - FAKEIP_POOL_BASE;
+    bits[i >> 3] |= (uint8_t)(1u << (i & 7));
+    return 0;
+}
+
+static int fakeip_live_ct(uint8_t *bits) {
+    int dfd = ctnl_socket();
+    uint8_t *buf = malloc(CTNL_RCVBUF);
+    if (dfd < 0 || !buf) {
+        if (dfd >= 0) close(dfd);
+        free(buf);
+        return -1;
+    }
+    uint32_t seq = (uint32_t)time(NULL);
+    int rc = 0;
+    static const uint8_t fam[] = { AF_INET, AF_INET6 };
+    for (size_t i = 0; i < sizeof(fam) && rc == 0; i++)
+        rc = ctnl_dump(dfd, fam[i], 0, 0, 0, &seq, buf, fakeip_live_rec, bits);
+    close(dfd);
+    free(buf);
+    return rc == 0 ? 0 : -1;
+}
+
+int (*g_fakeip_live)(uint8_t *bits) = fakeip_live_ct;
+
+/* Снять всё, что ядро держит под записью: адрес в наборах каналов и подмену в картах. ENOENT —
+ * желаемое состояние. */
+static void fakeip_entry_unroute(const struct fakeip_entry *e) {
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(e->sets, i)) dch_del(i, e->domain, e->addr);
+    uint8_t f6[16];
+    fakeip6_of(e->addr, f6);
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(e->sets6, i)) dch_del6(i, e->domain, f6);
+    if (e->real_host || e->real_saved) {
+        uint32_t k = htonl(e->addr);
+        nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_fakeip_map, &k, 0, NULL, 0);
+    }
+    if (e->has_real6 || e->has_real6_saved)
+        nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_table, g_fakeip6_map, f6, 0, NULL, 0);
+}
+
+void fakeip_pool_reset(void) {
+    free(g_free);
+    g_free = NULL;
+    g_free_n = g_free_i = 0;
+}
+
+size_t fakeip_reclaim(time_t now) {
+    size_t bytes = FAKEIP_POOL_SIZE / 8;
+    uint8_t *live = calloc(1, bytes), *used = calloc(1, bytes);
+    if (!live || !used) {
+        free(live);
+        free(used);
+        return 0;
+    }
+    int known = g_fakeip_live && g_fakeip_live(live) == 0;
+    static time_t said_ct;
+    if (!known && warn_due(&said_ct, now))
+        fprintf(stderr, "steer dnsd: conntrack недоступен — адреса пула fake-IP возвращаются "
+                        "только по сроку простоя (%d с)\n", g_fakeip_idle);
+    size_t w = 0;
+    for (size_t r = 0; r < g_fakeip.n; r++) {
+        struct fakeip_entry *e = &g_fakeip.entries[r];
+        uint32_t i = e->addr - FAKEIP_POOL_BASE;
+        int in_pool = e->addr >= FAKEIP_POOL_BASE && e->addr < FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE;
+        if (in_pool && now - e->last_used >= g_fakeip_idle &&
+            !(known && (live[i >> 3] & (1u << (i & 7))))) {
+            fakeip_entry_unroute(e);
+            free(e->domain);
+            continue;
+        }
+        if (in_pool) used[i >> 3] |= (uint8_t)(1u << (i & 7));
+        if (w != r) g_fakeip.entries[w] = *e;
+        w++;
+    }
+    size_t freed = g_fakeip.n - w;
+    if (freed) {
+        g_fakeip.n = w;
+        /* Номера записей сдвинулись — индекс строится заново (один проход; случай редкий: пул
+         * кончается раз в много часов). */
+        sindex_free(&g_fakeip_idx);
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        for (size_t k = 0; k < g_fakeip.n; k++)
+            if (sindex_put(&g_fakeip_idx, &g_fakeip, fakeip_key, g_fakeip.entries[k].domain,
+                           (uint32_t)k, 0) != 0)
+                fprintf(stderr, "steer dnsd: индекс fake-IP не пересобран (нет памяти)\n");
+        fakeip_state_rewrite();
+        g_fakeip_dirty = 0;
+        g_fakeip_last_rewrite = now;
+    }
+    /* Свободные адреса — все, что не заняты (и дыры от прежних запусков: файл состояния уплотнял
+     * пул не сам), по кругу от последней выдачи. Первый и последний адрес пула не выдаются. */
+    uint32_t start = g_free_i ? g_free[g_free_i - 1] - FAKEIP_POOL_BASE + 1 : 1;
+    if (start >= FAKEIP_POOL_SIZE - 1) start = 1;
+    size_t cnt = 0;
+    for (uint32_t i = 1; i < FAKEIP_POOL_SIZE - 1; i++)
+        if (!(used[i >> 3] & (1u << (i & 7)))) cnt++;
+    uint32_t *nf = cnt ? malloc(cnt * sizeof(*nf)) : NULL;
+    fakeip_pool_reset();
+    if (nf) {
+        size_t k = 0;
+        for (uint32_t j = 0; j < FAKEIP_POOL_SIZE - 2; j++) {
+            uint32_t i = 1 + (start - 1 + j) % (FAKEIP_POOL_SIZE - 2);
+            if (!(used[i >> 3] & (1u << (i & 7)))) nf[k++] = FAKEIP_POOL_BASE + i;
+        }
+        g_free = nf;
+        g_free_n = k;
+    }
+    free(live);
+    free(used);
+    return freed;
+}
+
+/* С дросселем: пул полон занятыми — каждое новое имя заново обходило бы таблицу и дампило бы
+ * conntrack; раз в 10 с достаточно (срок простоя — минуты). */
+static void fakeip_reclaim_try(time_t now) {
+    static time_t last;
+    if (last && now - last < WARN_EVERY_SEC) return;
+    last = now;
+    fakeip_reclaim(now);
+    if (g_free_i < g_free_n) last = 0;      /* вернулось — следующий край пула без ожидания */
 }
 
 void fakeip_route_set(const char *domain, chm_t want) {

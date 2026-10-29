@@ -1,0 +1,4 @@
+{
+  "plugin.name": "WARP",
+  "plugin.description": "Cloudflare WARP: регистрация, подбор точек входа, замена"
+}

@@ -1,0 +1,81 @@
+#!/bin/sh
+# scripts.postinst плагина tgws (manifest.md, «scripts»): переход с микропакета stgws (brb, пакет tgws).
+#
+#   postinst --check        проверка: ничего не меняет, код 0
+#   postinst <старая|"">    после распаковки; переход — только при первой установке (старая версия пуста)
+#
+# Что переносится из /etc/stgws в настройки плагина ($STEER_PLUGIN_CONF/settings.json, схема settings.schema.json):
+#   tgws-domains.lst  пул доменов             → domains (первое слово строки, «#» — комментарий)
+#   domain            домен по умолчанию       → первым в domains, если его там нет
+#   tgws-dc.conf      дополнение таблицы ДЦ    → dc_addresses («адрес[/маска] номер [media]»)
+#   warp.lst          туннели WARP             → warp (первое слово строки)
+# route.conf не переносится: это замер прежнего подбора, а не настройка человека, — его заменяет настройка
+# pick (мост мерит пути сам). Строка, не подходящая под схему, пропускается и называется в выводе.
+#
+# Настройки уже есть (человек или прежняя установка их написал) — не трогаются. Служба прежнего моста
+# (/etc/init.d/tgws микропакета: два моста перехватывали бы одни и те же соединения, а бит метки 28 ядро
+# больше не бережёт) останавливается и снимается с автозапуска; сам пакет остаётся — снимает его человек
+# (`apk del tgws` или `opkg remove tgws`), как и любой пакет, который он ставил сам.
+#
+# TGWS_MIGRATE_ROOT — корень для стенда (tests/tgwsmatch.sh); на роутере пуст.
+set -u
+R="${TGWS_MIGRATE_ROOT:-}"
+OLD="$R/etc/stgws"
+CONF="${STEER_PLUGIN_CONF:-}"
+
+[ "${1:-}" = "--check" ] && exit 0
+[ -n "${1:-}" ] && exit 0                       # обновление плагина — переход уже был
+[ -d "$OLD" ] || exit 0                         # микропакета не было
+[ -n "$CONF" ] || { echo "tgws: нет STEER_PLUGIN_CONF — настройки stgws не перенесены" >&2; exit 0; }
+
+DOM_RE='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+DC_RE='^[0-9]{1,3}([.][0-9]{1,3}){3}(/[0-9]{1,2})? +(1|2|3|4|5|203)( +media)?$'
+IF_RE='^[A-Za-z0-9_.-]{1,15}$'
+
+# Список строк JSON из первого слова строк файла (или из строк целиком при whole=1), с проверкой.
+# list ФАЙЛ РЕГВЫР ЦЕЛИКОМ ИМЯ [ПЕРВЫМ]
+list() {
+    _f="$1" _re="$2" _whole="$3" _name="$4" _first="${5:-}" _out="" _seen=" "
+    add() {
+        case "$_seen" in *" $1 "*) return ;; esac
+        if printf '%s\n' "$1" | grep -Eq "$_re"; then
+            _seen="$_seen$1 "
+            _out="$_out${_out:+,}\"$1\""
+        else
+            echo "tgws: $_name: «$1» не подходит — пропущено" >&2
+        fi
+    }
+    [ -n "$_first" ] && add "$_first"
+    if [ -f "$_f" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="$(printf '%s' "$line" | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//')"
+            case "$line" in ''|'#'*) continue ;; esac
+            if [ "$_whole" = 1 ]; then add "$line"; else add "${line%% *}"; fi
+        done < "$_f"
+    fi
+    printf '[%s]' "$_out"
+}
+
+if [ -e "$CONF/settings.json" ]; then
+    echo "tgws: настройки плагина уже есть — из stgws ничего не переносится"
+else
+    first=""
+    [ -f "$OLD/domain" ] && first="$(sed -n 's/^[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$OLD/domain" | head -1)"
+    domains="$(list "$OLD/tgws-domains.lst" "$DOM_RE" 0 domains "$first")"
+    dcs="$(list "$OLD/tgws-dc.conf" "$DC_RE" 1 dc_addresses)"
+    warp="$(list "$OLD/warp.lst" "$IF_RE" 0 warp)"
+    mkdir -p "$CONF"
+    tmp="$CONF/.settings.json.$$"
+    printf '{"pick":true,"domains":%s,"dc_addresses":%s,"warp":%s}\n' "$domains" "$dcs" "$warp" > "$tmp" &&
+        mv "$tmp" "$CONF/settings.json" || { rm -f "$tmp"; echo "tgws: настройки не записаны" >&2; exit 1; }
+    echo "tgws: настройки stgws перенесены: домены $domains, адреса ДЦ $dcs, WARP $warp"
+fi
+
+# Служба микропакета: остановить и снять с автозапуска (пакет — человека).
+svc="$R/etc/init.d/tgws"
+if [ -x "$svc" ] && grep -q stgws "$svc" 2>/dev/null; then
+    "$svc" stop >/dev/null 2>&1
+    "$svc" disable >/dev/null 2>&1
+    echo "tgws: прежний мост stgws остановлен и снят с автозапуска; пакет tgws можно снять: apk del tgws (opkg remove tgws)"
+fi
+exit 0

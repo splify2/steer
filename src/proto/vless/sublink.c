@@ -134,13 +134,6 @@ void sl_set_field(char *dst, size_t n, const char *src, size_t len) {
  * path) путь в 60 знаков, записанный процентами целиком (`%2Fstatic%2Fv1…` — так его кодируют
  * многие панели), обрезался до раскодирования на трети и уезжал на сервер чужим путём: у xhttp и
  * ws это 404 при исправном узле. */
-void sl_set_pct(char *dst, size_t n, const char *src, size_t len) {
-    char tmp[512];
-    sl_set_field(tmp, sizeof(tmp), src, len);
-    sl_pct_decode(tmp);
-    sl_set_field(dst, n, tmp, strlen(tmp));
-}
-
 /* Снять с конца строки неполную последовательность UTF-8. Нужно там, где строку обрезал
  * буфер: обрезка идёт по байту, а буква вне ASCII занимает от двух байт, и граница
  * приходится на её середину. Одинокий ведущий байт — не «испорченная буква», а байт,
@@ -367,27 +360,59 @@ void sl_parse_extra(struct vless_node *n, const char *extra) {
  * что бывает у единиц. Поэтому узел держит УКАЗАТЕЛЬ на строку из общей таблицы, где одинаковые
  * значения хранятся один раз. Строки не освобождаются: указатель обязан пережить и узел, и его копии
  * (узлы копируются по значению между массивами разбора и стеком туннеля), а повторные разборы той же
- * подписки находят уже занесённое и памяти не прибавляют. Таблица ограничена — переполнение узла не
- * теряет, а объявляет непригодным с названной причиной (без неё хостильная подписка со случайными
- * ключами росла бы в памяти роутера на каждом обновлении). */
-#define SUB_INTERN_MAX 256
-static const char *g_intern[SUB_INTERN_MAX];
+ * подписки находят уже занесённое и памяти не прибавляют.
+ *
+ * ПРЕДЕЛА ЧИСЛА ЗНАЧЕНИЙ НЕТ. Было 256 различных значений на процесс, и сверх них узлы объявлялись
+ * непригодными («таблица полна»): подписка на 300 узлов с разными ключами теряла последние, и каждое
+ * обновление с новыми ключами постепенно выбирало таблицу насовсем (I-526). Теперь таблица — открытая
+ * хеш-таблица, растёт по надобности; рост ограничен памятью, а не константой. */
+static struct { const char **t; size_t cap, n; } g_intern;
 static volatile int g_intern_lock;
-/* Метки непригодных значений: разбор не удался, причина уже названа в node_usable. */
+/* Метки непригодных значений: разбор не удался, причина уже названа в node_usable. SL_FULL остаётся
+ * ответом при нехватке памяти (таблицы больше нет). */
 const char SL_BAD_PQV[] = "!pqv";
 const char SL_FULL[] = "!full";
+
+static size_t intern_hash(const char *v, size_t n) {
+    size_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= (unsigned char)v[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+/* Таблица удваивается, пока занято больше половины; строки переезжают указателями, не копиями. */
+static int intern_grow(void) {
+    size_t nc = g_intern.cap ? g_intern.cap * 2 : 256;
+    const char **nt = calloc(nc, sizeof *nt);
+    if (!nt) return -1;
+    for (size_t i = 0; i < g_intern.cap; i++) {
+        const char *s = g_intern.t[i];
+        if (!s) continue;
+        size_t k = intern_hash(s, strlen(s)) & (nc - 1);
+        while (nt[k]) k = (k + 1) & (nc - 1);
+        nt[k] = s;
+    }
+    free(g_intern.t);
+    g_intern.t = nt;
+    g_intern.cap = nc;
+    return 0;
+}
 
 const char *sl_intern(const char *v, size_t n) {
     while (__atomic_test_and_set(&g_intern_lock, __ATOMIC_ACQUIRE)) { }
     const char *r = SL_FULL;
-    for (int i = 0; i < SUB_INTERN_MAX; i++) {
-        if (!g_intern[i]) {
-            char *c = malloc(n + 1);
-            if (c) { memcpy(c, v, n); c[n] = '\0'; g_intern[i] = c; r = c; }
+    if ((g_intern.n + 1) * 2 > g_intern.cap && intern_grow() != 0 && !g_intern.cap) goto out;
+    size_t k = intern_hash(v, n) & (g_intern.cap - 1);
+    for (;;) {
+        const char *s = g_intern.t[k];
+        if (!s) {
+            char *c = (g_intern.n + 1) * 2 <= g_intern.cap + g_intern.cap / 2 ? malloc(n + 1) : NULL;
+            if (c) { memcpy(c, v, n); c[n] = '\0'; g_intern.t[k] = c; g_intern.n++; r = c; }
             break;
         }
-        if (strlen(g_intern[i]) == n && !memcmp(g_intern[i], v, n)) { r = g_intern[i]; break; }
+        if (strlen(s) == n && !memcmp(s, v, n)) { r = s; break; }
+        k = (k + 1) & (g_intern.cap - 1);
     }
+out:
     __atomic_clear(&g_intern_lock, __ATOMIC_RELEASE);
     return r;
 }
@@ -420,9 +445,13 @@ static const char *pin_slot(const struct vless_node *n, int spki) { return spki 
 void sl_add_pins(struct vless_node *n, const char *v, int spki) {
     const char *cur = pin_slot(n, spki);
     if (cur == SL_BAD_PIN || cur == SL_FULL) return;
-    char buf[1100];
+    /* По длине входа: запись в 43..64 знака даёт 64 знака hex и запятую, то есть не больше двух длин
+     * входа плюс уже набранное. Прежние 1100 байт отвергали узел с шестнадцатью отпечатками. */
+    size_t curl = cur ? strlen(cur) : 0, bcap = curl + 2 * strlen(v) + 4;
+    char *buf = malloc(bcap);
     size_t bl = 0;
-    if (cur) bl = (size_t)snprintf(buf, sizeof buf, "%s", cur);
+    if (!buf) { if (spki) n->pks = SL_FULL; else n->pcs = SL_FULL; return; }
+    if (cur) { memcpy(buf, cur, curl); bl = curl; }
     const char *p = v;
     int bad = 0;
     while (*p && !bad) {
@@ -452,7 +481,7 @@ void sl_add_pins(struct vless_node *n, const char *v, int spki) {
                 if (!bad && k != 64) bad = 1;
             }
             if (!bad) {
-                if (bl + 66 >= sizeof buf) bad = 1;
+                if (bl + 66 >= bcap) bad = 1;
                 else {
                     if (bl) buf[bl++] = ',';
                     for (int i = 0; i < 32; i++) bl += (size_t)snprintf(buf + bl, 3, "%02x", raw[i]);
@@ -463,15 +492,19 @@ void sl_add_pins(struct vless_node *n, const char *v, int spki) {
         p = e + 1;
     }
     const char *r = bad ? SL_BAD_PIN : bl ? sl_intern(buf, bl) : NULL;
+    free(buf);
     if (spki) n->pks = r; else n->pcs = r;
 }
 
 /* verifyPeerCertByName: имена через запятую, пробелы вокруг отбрасываются, пустые пропускаются
  * (так читает и Xray). */
 void sl_set_vcn(struct vless_node *n, const char *v) {
-    char buf[300];
+    /* Буфер по длине значения (результат не длиннее входа): прежние 300 байт отвергали узел со списком имён
+     * подлиннее («таблица полна» для vcn в 299 знаков, I-526). */
+    char *buf = malloc(strlen(v) + 1);
     size_t bl = 0;
     n->vcn = NULL;
+    if (!buf) { n->vcn = SL_FULL; return; }
     const char *p = v;
     while (*p) {
         const char *e = strchr(p, ',');
@@ -479,7 +512,6 @@ void sl_set_vcn(struct vless_node *n, const char *v) {
         while (tn && (*p == ' ' || *p == '\t')) { p++; tn--; }
         while (tn && (p[tn - 1] == ' ' || p[tn - 1] == '\t')) tn--;
         if (tn) {
-            if (bl + tn + 2 >= sizeof buf) { n->vcn = SL_BAD_PIN; return; }
             if (bl) buf[bl++] = ',';
             memcpy(buf + bl, p, tn);
             bl += tn;
@@ -488,6 +520,7 @@ void sl_set_vcn(struct vless_node *n, const char *v) {
         p = e + 1;
     }
     if (bl) n->vcn = sl_intern(buf, bl);
+    free(buf);
 }
 
 /* ECH: ECHConfigList узла (Xray echConfigList, `ech=` ссылки, ech-opts.config Clash, ech.config sing-box) в
@@ -499,12 +532,16 @@ void sl_set_vcn(struct vless_node *n, const char *v) {
 const char SL_BAD_ECH[] = "!ech";
 const char SL_ECH_DNS[] = "!ech-dns";
 void sl_set_ech(struct vless_node *n, const char *v) {
-    char raw[1100];
     n->ech = NULL;
     if (!v[0]) return;
     if (strstr(v, "://")) { n->ech = SL_ECH_DNS; return; }
-    size_t bl = b64_decode(v, strlen(v), raw, sizeof raw);
-    int ok = bl >= 8 && bl < sizeof raw && (size_t)(((unsigned char)raw[0] << 8) | (unsigned char)raw[1]) + 2 == bl;
+    /* Декодированное не длиннее входа: буфер по длине, а не 1100 байт (длинный список отвергался как
+     * «не ECH»). */
+    size_t rawcap = strlen(v) + 1;
+    char *raw = malloc(rawcap);
+    if (!raw) { n->ech = SL_BAD_ECH; return; }
+    size_t bl = b64_decode(v, strlen(v), raw, rawcap);
+    int ok = bl >= 8 && bl < rawcap && (size_t)(((unsigned char)raw[0] << 8) | (unsigned char)raw[1]) + 2 == bl;
     if (ok) {
         ok = 0;
         for (size_t p = 2; p + 4 <= bl;) {
@@ -514,6 +551,7 @@ void sl_set_ech(struct vless_node *n, const char *v) {
             p += 4 + l;
         }
     }
+    free(raw);
     n->ech = ok ? sl_intern(v, strlen(v)) : SL_BAD_ECH;
 }
 
@@ -603,17 +641,17 @@ static int upg_node_bad(struct vless_node *n, int ws) {
  * параметров vless:// в sub.c; VLESS-своё (flow, encryption) разбирает own вызывающего. */
 int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen) {
     if (klen == 4 && !strncmp(k, "type", 4)) {
-        sl_set_field(n->type, sizeof(n->type), v, vlen);
+        SL_SET(n, type, v, vlen);
         /* Те же вторые имена, что у конфига Xray (sub.c): raw — каноническое имя tcp с Xray 24.9.30,
          * websocket — ws. Без этого ссылка с type=raw отсеивалась «транспорт raw не поддержан». */
         if (!strcmp(n->type, "raw")) snprintf(n->type, sizeof(n->type), "tcp");
         else if (!strcmp(n->type, "websocket")) snprintf(n->type, sizeof(n->type), "ws");
     }
-    else if (klen == 8 && !strncmp(k, "security", 8)) sl_set_field(n->security, sizeof(n->security), v, vlen);
-    else if (klen == 3 && !strncmp(k, "sni", 3)) sl_set_field(n->sni, sizeof(n->sni), v, vlen);
-    else if (klen == 2 && !strncmp(k, "fp", 2)) sl_set_field(n->fp, sizeof(n->fp), v, vlen);
-    else if (klen == 3 && !strncmp(k, "pbk", 3)) sl_set_field(n->pbk, sizeof(n->pbk), v, vlen);
-    else if (klen == 3 && !strncmp(k, "sid", 3)) sl_set_field(n->sid, sizeof(n->sid), v, vlen);
+    else if (klen == 8 && !strncmp(k, "security", 8)) SL_SET(n, security, v, vlen);
+    else if (klen == 3 && !strncmp(k, "sni", 3)) SL_SET(n, sni, v, vlen);
+    else if (klen == 2 && !strncmp(k, "fp", 2)) sl_set_field(n->fp, sizeof(n->fp), v, vlen);   /* имя отпечатка: длинное незнакомое — умолчание, не отказ */
+    else if (klen == 3 && !strncmp(k, "pbk", 3)) SL_SET(n, pbk, v, vlen);
+    else if (klen == 3 && !strncmp(k, "sid", 3)) SL_SET(n, sid, v, vlen);
     else if (klen == 10 && !strncmp(k, "headerType", 10)) { if (vlen == 4 && !strncmp(v, "http", 4)) n->tcp_http = 1; }
     /* pqv — постквантовая часть Xray-core (паритет 26.9): проверка подписи ML-DSA-65 сертификата
      * Reality. Значение длинное — см. sl_intern. */
@@ -639,20 +677,19 @@ int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *
         char *d = sl_param_dup(v, vlen);
         if (d) { if (sl_truthy(d)) n->allow_insecure = 1; free(d); }
     }
-    else if (klen == 4 && !strncmp(k, "path", 4)) sl_set_pct(n->path, sizeof(n->path), v, vlen);
-    else if (klen == 11 && !strncmp(k, "serviceName", 11)) { sl_set_field(n->service, sizeof(n->service), v, vlen); sl_pct_decode(n->service); }
-    else if (klen == 4 && !strncmp(k, "mode", 4)) sl_set_field(n->mode, sizeof(n->mode), v, vlen);
+    else if (klen == 4 && !strncmp(k, "path", 4)) SL_SET_PCT(n, path, v, vlen);
+    else if (klen == 11 && !strncmp(k, "serviceName", 11)) SL_SET_PCT(n, service, v, vlen);
+    else if (klen == 4 && !strncmp(k, "mode", 4)) SL_SET(n, mode, v, vlen);
     /* host — заголовок Host у ws и httpupgrade. У xhttp в ссылке он тоже бывает, но xhttp его не
      * читает: :authority там — sni, как было. */
-    else if (klen == 4 && !strncmp(k, "host", 4)) sl_set_pct(n->http_host, sizeof(n->http_host), v, vlen);
+    else if (klen == 4 && !strncmp(k, "host", 4)) SL_SET_PCT(n, http_host, v, vlen);
     /* extra — настройки транспорта в JSON. Читается ради длины набивки: сервер её ПРОВЕРЯЕТ и на
      * чужую отвечает 400 (см. sl_pad_range). Буфер под ПРОЦЕНТНУЮ форму: она втрое длиннее текста,
      * и 256 байт обрезали JSON до раскодирования — xPaddingBytes дальше ~85 знаков пропадал молча. */
     else if (klen == 5 && !strncmp(k, "extra", 5)) {
-        char ex[2048];
-        sl_set_field(ex, sizeof(ex), v, vlen);
-        sl_pct_decode(ex);
-        sl_parse_extra(n, ex);
+        char *ex = sl_param_dup(v, vlen);      /* по длине значения, а не 2048 байт с обрезкой */
+        if (ex) { sl_parse_extra(n, ex); free(ex); }
+        else sl_mark_cut(n, "extra", 1);
     }
     else return 0;
     return 1;
@@ -669,7 +706,10 @@ int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_
 
     const char *at = strchr(p, '@');
     if (!at) return -1;
-    sl_set_field(n->uuid, sizeof(n->uuid), p, (size_t)(at - p));
+    /* Протокол с собственной копией секрета (trojan: pass, длиннее uuid[64]) просит указатель — для него
+     * эта копия справочная, и её обрезка узел не портит. Без указателя (vless) uuid и есть данные. */
+    if (secret) sl_set_field(n->uuid, sizeof(n->uuid), p, (size_t)(at - p));
+    else SL_SET(n, uuid, p, (size_t)(at - p));
     if (secret) *secret = p;
     if (secret_n) *secret_n = (size_t)(at - p);
 
@@ -679,19 +719,33 @@ int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_
     const char *hash = strchr(p, '#');
     const char *hp_end = hash ? hash : p + strlen(p);
     const char *qmark = memchr(p, '?', (size_t)(hp_end - p));
-    const char *colon = memchr(p, ':', (size_t)((qmark ? qmark : hp_end) - p));
-    if (!colon) return -1;
-    sl_set_field(n->host, sizeof(n->host), p, (size_t)(colon - p));
+    const char *hp_stop = qmark ? qmark : hp_end;
+    /* Хост: имя, IPv4 или IPv6 в квадратных скобках (RFC 3986: `[2001:db8::1]:443`). Без скобок
+     * адрес IPv6 от порта не отличить — такая ссылка не разбирается, как и у Xray. Скобки в
+     * поле хоста не попадают: дальше хост идёт в getaddrinfo, а он скобок не знает. */
+    const char *colon, *hs;
+    size_t hl;
+    if (*p == '[') {
+        const char *rb = memchr(p, ']', (size_t)(hp_stop - p));
+        if (!rb || rb + 1 >= hp_stop || rb[1] != ':' || rb == p + 1) return -1;
+        hs = p + 1; hl = (size_t)(rb - hs); colon = rb + 1;
+    } else {
+        colon = memchr(p, ':', (size_t)(hp_stop - p));
+        if (!colon) return -1;
+        hs = p; hl = (size_t)(colon - p);
+    }
+    SL_SET(n, host, hs, hl);
+    sl_host_zone_decode(n->host);
     {
         /* Порт — только цифры до конца хоста и в диапазоне 1..65535: atoi давал 4464 на
          * «:70000», 65535 на «:-1» и 443 на «:443abc», и узел шёл не туда. */
         char pnum[8];
         const char *pe = colon + 1;
         size_t pl = 0;
-        while (pe < (qmark ? qmark : hp_end) && *pe >= '0' && *pe <= '9' && pl + 1 < sizeof(pnum))
+        while (pe < hp_stop && *pe >= '0' && *pe <= '9' && pl + 1 < sizeof(pnum))
             pnum[pl++] = *pe++;
         pnum[pl] = '\0';
-        if (!pl || pe != (qmark ? qmark : hp_end)) return -1;
+        if (!pl || pe != hp_stop) return -1;
         n->port = sl_port_of(pnum);
     }
     if (!n->port) return -1;
@@ -732,6 +786,17 @@ int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_
  * заполнены умолчаниями: делает это первая строка. */
 int sl_link_usable_pre(struct vless_node *n) {
     if (!n->security[0]) snprintf(n->security, sizeof(n->security), "none");
+
+    /* Значение не влезло в поле узла: обрезанное — уже другое (ключ, путь, имя сервера), и узел с ним
+     * молча не работал бы (I-526). Причина называет поле и ширину. */
+    if (n->trunc_what) {
+        if (n->trunc_cap)
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "%s длиннее %u байт", n->trunc_what,
+                     (unsigned)n->trunc_cap);
+        else                         /* ширины нет: значение не уместилось от нехватки памяти */
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "%s", n->trunc_what);
+        return 1;
+    }
 
     /* Постквантовые поля. Метки ставит разбор (set_encryption в sub.c, sl_set_pqv): значение не по правилу Xray или
      * таблица длинных значений полна. Причины короткие — skip_reason всего 64 байта. */
@@ -903,6 +968,7 @@ int sl_link_usable_post(struct vless_node *n) {
 void sl_skip_note(struct vless_sub_stats *st, const struct vless_node *n, const char *reason) {
     if (!st) return;
     st->skipped++;
+    if (!strcmp(reason, VLESS_SKIP_OVERFLOW)) st->overflow++;
     for (size_t i = 0; i < st->reasons_n; i++) {
         if (!strcmp(st->reasons[i].reason, reason)) { st->reasons[i].count++; return; }
     }
@@ -914,7 +980,7 @@ void sl_skip_note(struct vless_sub_stats *st, const struct vless_node *n, const 
      * и host — тогда пример остаётся пустым, и это честнее выдуманного «узел 3». */
     if (n && n->name[0]) snprintf(s->example, sizeof(s->example), "%s", n->name);
     else if (n && n->host[0]) snprintf(s->example, sizeof(s->example), "%s:%u",
-                                      n->host, n->port);
+                                      vless_host_fmt(n->host).s, n->port);
     s->count = 1;
 }
 

@@ -9,19 +9,22 @@
 #define STEER_PXWIRE_H
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "proxy.h"
 
 /* ---- адрес SOCKS5 (ATYP+ADDR+PORT) --------------------------------------------------------- */
 
-/* Адрес назначения в форме SOCKS5: 0x01 + IPv4(4) + порт(2 BE). Имён клиент не передаёт — адрес
- * клиента уже разрешён (резолвер steer вернул fake-IP, DNAT подменит на настоящий). Пишет из
- * сетевого порядка dst и хостового dport (как во flow_key, tun.h). Возвращает длину (7). */
-size_t px_socks_addr(unsigned char *out, uint32_t dst_net, uint16_t dport_host);
+/* Адрес назначения в форме SOCKS5: 0x01 + IPv4(4) или 0x04 + IPv6(16), затем порт(2 BE). Имён клиент не
+ * передаёт — адрес клиента уже разрешён (резолвер steer вернул fake-IP, DNAT подменит на настоящий).
+ * Пишет из сетевого порядка dst (v6 — 16 байт, иначе 4) и хостового dport (как во flow_key, tun.h).
+ * Возвращает длину: 7 или 19 (PX_ADDR_MAX). */
+#define PX_ADDR_MAX 19
+size_t px_socks_addr(unsigned char *out, int v6, const unsigned char *dst_net, uint16_t dport_host);
 
 /* ---- shadowsocks: вывод ключей ------------------------------------------------------------- */
 
-/* Ключ из пароля (AEAD не-2022): EVP_BytesToKey на MD5, как в shadowsocks-libev. key_n — 16 или 32. */
-void px_ss_evp_key(const char *pass, unsigned char *key, size_t key_n);
+/* Ключ из пароля (AEAD не-2022): EVP_BytesToKey на MD5, как в shadowsocks-libev. key_n — 16 или 32. 0 — готово, -1 — отказ слоя хеширования. */
+int  px_ss_evp_key(const char *pass, unsigned char *key, size_t key_n);
 /* Подключ сессии (AEAD не-2022): HKDF-SHA1(key, salt, "ss-subkey"), длина — key_n. */
 int  px_ss_subkey(const unsigned char *key, size_t key_n, const unsigned char *salt,
                   unsigned char *subkey);
@@ -52,5 +55,22 @@ void px_vmess_authid(const unsigned char cmdkey[16], uint64_t ts, const unsigned
  * ради совместимости структуры; AEAD-заголовок её не проверяет, но v2ray кладёт). */
 uint32_t px_fnv1a(const unsigned char *p, size_t n);
 uint32_t px_crc32(const unsigned char *p, size_t n);
+
+/* Буфер потока цикла под крупную датаграмму UDP (до UDP_DGRAM_ABS): на стеке 64 КБ не держат, а malloc
+ * на каждую датаграмму в цикле лишний. Растёт по требованию и живёт, пока жив поток. Слотов два: 0 — приём,
+ * 1 — сборка или разбор, чтобы одно не затирало другое. Буферы свои у каждого файла протокола (static
+ * inline): общему файлу они не нужны, а стенды дайлеров линкуются без pxwire.c. NULL — памяти нет. */
+static inline unsigned char *px_scratch(int slot, size_t n) {
+    static __thread struct { unsigned char *p; size_t cap; } sc[2];
+    if (slot < 0 || slot > 1) return NULL;
+    if (sc[slot].cap < n) {
+        size_t nc = n < 2048 ? 2048 : n;
+        unsigned char *np = realloc(sc[slot].p, nc);
+        if (!np) return NULL;
+        sc[slot].p = np;
+        sc[slot].cap = nc;
+    }
+    return sc[slot].p;
+}
 
 #endif

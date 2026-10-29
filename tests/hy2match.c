@@ -309,6 +309,9 @@ static void test_urls(void) {
           !strcmp(n.obfs_pass, "abcd") && !n.gecko_min);
     CHECK(hy2_parse_bandwidth("100") == 12500000 && hy2_parse_bandwidth("1 gbps") == 125000000);
     CHECK(hy2_parse_bandwidth("8mbps") == 1000000 && hy2_parse_bandwidth("abc") == 0);
+    /* I-543: «nan» и «inf» разбираются strtod; NaN не меньше нуля, и приведение его к целому не определено. */
+    CHECK(hy2_parse_bandwidth("nan") == 0 && hy2_parse_bandwidth("-nan mbps") == 0);
+    CHECK(hy2_parse_bandwidth("inf") == 0 && hy2_parse_bandwidth("infinity gbps") == 0);
 }
 
 static void test_sub(void) {
@@ -367,6 +370,55 @@ static void test_sub(void) {
     n = hy2_parse_sub(t, nodes, 8, &st);
     CHECK(n == 1 && !strcmp(nodes[0].name, "name"));
     CHECK(hy2_sub_text(txt, strlen(txt), dec, sizeof dec) == txt);
+
+    /* I-526: поле, не влезшее в узел, — отказ с названием и шириной, а не обрезанное значение. hy2wire.h
+     * обещает это для obfs-password; Auth (191) и SNI раньше резались молча. */
+    {
+        static char url[2048];
+        char lg[400];
+        memset(lg, 'q', sizeof lg - 1);
+        lg[sizeof lg - 1] = '\0';
+        snprintf(url, sizeof url, "hysteria2://%s@h.example:443/?sni=h.example", lg);
+        n = hy2_parse_sub(url, nodes, 8, &st);
+        CHECK(n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "auth длиннее 191 байт"));
+        snprintf(url, sizeof url, "hysteria2://pw@h.example:443/?obfs=salamander&obfs-password=%s", lg);
+        n = hy2_parse_sub(url, nodes, 8, &st);
+        CHECK(n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "obfs-password длиннее 128 байт"));
+        snprintf(url, sizeof url, "hysteria2://pw@h.example:443/?sni=%s", lg);
+        n = hy2_parse_sub(url, nodes, 8, &st);
+        CHECK(n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "sni длиннее 127 байт"));
+        /* Пароль obfs в 300 знаков: прежняя копия значения в 512 байт его всё же вмещала, но поле — 128. */
+        snprintf(url, sizeof url, "hysteria2://pw@h.example:443/?obfs=salamander&obfs-password=okpass1");
+        n = hy2_parse_sub(url, nodes, 8, &st);
+        CHECK(n == 1 && !strcmp(nodes[0].obfs_pass, "okpass1"));
+        /* Конфиг Xray: то же самое. */
+        static char js[2048];
+        snprintf(js, sizeof js,
+                 "{\"outbounds\":[{\"protocol\":\"hysteria\",\"tag\":\"x\",\"settings\":{\"version\":2,\"address\":\"h.example\",\"port\":443},"
+                 "\"streamSettings\":{\"hysteriaSettings\":{\"version\":2,\"auth\":\"%s\"}}}]}", lg);
+        n = hy2_parse_sub(js, nodes, 8, &st);
+        CHECK(n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "auth длиннее 191 байт"));
+        /* Параметр без «=» (obfs) не роняет разбор: значение — пустая строка, писать в неё нельзя. */
+        n = hy2_parse_sub("hysteria2://pw@h.example:443/?insecure&obfs", nodes, 8, &st);
+        CHECK(n == 1);
+    }
+
+    /* Конфиг Xray крупнее 131072 токенов: узел после большого массива находится (прежде — ноль узлов и тишина). */
+    {
+        size_t cap = 8 * 1024 * 1024;
+        char *big = malloc(cap);
+        size_t o = (size_t)snprintf(big, cap, "{\"junk\":[");
+        for (int i = 0; i < 150000; i++) o += (size_t)snprintf(big + o, cap - o, "%s1", i ? "," : "");
+        o += (size_t)snprintf(big + o, cap - o,
+             "],\"outbounds\":[{\"protocol\":\"hysteria\",\"tag\":\"late\",\"settings\":{\"version\":2,\"address\":\"h.example\",\"port\":443},"
+             "\"streamSettings\":{\"hysteriaSettings\":{\"version\":2,\"auth\":\"a\"}}}]}");
+        n = hy2_parse_sub(big, nodes, 8, &st);
+        CHECK(n == 1 && !strcmp(nodes[0].name, "late"));
+        free(big);
+        /* Оборванный конфиг — не тишина, а запись о пропуске. */
+        n = hy2_parse_sub("{\"outbounds\":[{\"protocol\":\"hyst", nodes, 8, &st);
+        CHECK(n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "конфиг подписки не разобран"));
+    }
 }
 
 /* Пределы: подписка на 500 узлов из файла, ссылка длиннее стекового буфера, диапазонов портов
@@ -399,11 +451,147 @@ static void test_limits(void) {
     CHECK(strstr(nd.skip_reason, "диапазонов больше 8") != NULL);
 }
 
+/* Brutal при нескольких рабочих: сумма долей не больше заданной скорости. */
+static void test_brutal_share(void) {
+    CHECK(hy2_brutal_share(100000000, 1) == 100000000);
+    CHECK(hy2_brutal_share(100000000, 0) == 100000000);
+    CHECK(hy2_brutal_share(100000000, 4) == 25000000);
+    CHECK(hy2_brutal_share(0, 4) == 0);                 /* BBR остаётся BBR */
+    CHECK(hy2_brutal_share(3, 8) == 1);                 /* ноль был бы BBR */
+    for (unsigned n = 1; n <= 64; n++)
+        CHECK(hy2_brutal_share(123456789, n) * n <= 123456789);
+    /* занятость: доля 8 Мбит/с = 1 МБ/с, порог — восьмая часть = 125000 Б за секунду */
+    CHECK(!hy2_worker_busy(0, 1000, 8000000));
+    CHECK(!hy2_worker_busy(2000, 1000, 8000000));       /* запросы и подтверждения */
+    CHECK(hy2_worker_busy(125000, 1000, 8000000));
+    CHECK(hy2_worker_busy(500000, 1000, 8000000));
+    CHECK(!hy2_worker_busy(124999, 1000, 8000000));
+    /* границы 64 бит */
+    const uint64_t M = UINT64_MAX;
+    CHECK(!hy2_worker_busy(0, 0, 0));
+    CHECK(!hy2_worker_busy(0, M, M));
+    CHECK(hy2_worker_busy(1, 0, M));
+    CHECK(hy2_worker_busy(M, 0, 0));
+    CHECK(hy2_worker_busy(1, 1, 0));
+    CHECK(hy2_worker_busy(1, 1, 64000));                /* равенство */
+    CHECK(!hy2_worker_busy(1, 1, 64001));
+    CHECK(hy2_worker_busy(M, 1, M));
+    CHECK(hy2_worker_busy(M, M, 64000));                /* M*64000 >= 64000*M */
+    CHECK(!hy2_worker_busy(M, M, M));
+    CHECK(!hy2_worker_busy(1, M, 1));
+    CHECK(hy2_worker_busy(1, 1, M) == 0);
+    CHECK(hy2_worker_busy(M, 1000, M));
+    CHECK(!hy2_worker_busy(1, M, M));
+    CHECK(hy2_worker_busy(125000, 1, 8000000));
+    CHECK(hy2_worker_busy(125, 1, 8000));
+#ifdef __SIZEOF_INT128__
+    {
+        uint64_t x = 0x9e3779b97f4a7c15ull;
+        static const uint64_t edge[] = { 0, 1, 2, 63999, 64000, 64001, 0xffffffffull,
+                                         0x100000000ull, M - 1, M };
+        for (unsigned i = 0; i < 200000; i++) {
+            uint64_t v[3];
+            for (int k = 0; k < 3; k++) {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                unsigned sh = (unsigned)(x >> 58);          /* разный порядок величин */
+                v[k] = (i % 5 == 0) ? edge[(x >> 20) % 10] : (x >> sh);
+            }
+            int want = v[0] ? (!v[1] ? 1 :
+                       ((unsigned __int128)v[0] * 64000u >= (unsigned __int128)v[2] * v[1])) : 0;
+            CHECK(hy2_worker_busy(v[0], v[1], v[2]) == want);
+        }
+        /* равенство и соседи вокруг него в широком диапазоне */
+        for (unsigned i = 0; i < 20000; i++) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            uint64_t ms = (x >> 40) + 1, sh = (x >> 8) & 0xffffffffffull;
+            unsigned __int128 need = (unsigned __int128)sh * ms;
+            if (need % 64000u) continue;
+            unsigned __int128 b = need / 64000u;
+            if (b >> 64) continue;
+            CHECK(hy2_worker_busy((uint64_t)b, ms, sh));
+            if (b > 1) CHECK(!hy2_worker_busy((uint64_t)b - 1, ms, sh));
+        }
+    }
+#endif
+}
+
+/* Сборка фрагментов: несколько датаграмм одного потока вперемешку, крупнейшая датаграмма, разные
+ * размеры кусков, повтор фрагмента, срок недособранной (I-528). */
+static void rasm_msg(struct hy2_udp_msg *m, uint16_t pkt, unsigned fi, unsigned nf, const uint8_t *d, size_t n) {
+    memset(m, 0, sizeof *m);
+    m->sid = 1; m->pkt = pkt; m->frag = (uint8_t)fi; m->nfrag = (uint8_t)nf; m->data = d; m->n = n;
+}
+
+static void test_rasm(void) {
+    static uint8_t A[65507], B[40000];
+    for (size_t i = 0; i < sizeof A; i++) A[i] = (uint8_t)(i * 31 + 7);
+    for (size_t i = 0; i < sizeof B; i++) B[i] = (uint8_t)(i * 17 + 3);
+    struct hy2_rasm *ras = NULL;
+    struct hy2_udp_msg m;
+    size_t tot = 0, pre = 16;
+    uint8_t *got;
+    /* А — 65507 байт кусками по 1200 (55 штук), Б — 40000 кусками по 1100; куски идут вперемешку,
+     * Б — в обратном порядке. */
+    unsigned na = (sizeof A + 1199) / 1200, nb = (sizeof B + 1099) / 1100;
+    unsigned ia = 0, ib = nb;
+    int done_a = 0, done_b = 0, bad = 0;
+    while (ia < na || ib > 0) {
+        if (ia < na) {
+            size_t off = (size_t)ia * 1200, n = sizeof A - off < 1200 ? sizeof A - off : 1200;
+            rasm_msg(&m, 100, ia, na, A + off, n);
+            got = hy2_rasm_feed(&ras, &m, 1000, pre, &tot);
+            ia++;
+            if (got) { done_a = tot == sizeof A && !memcmp(got + pre, A, tot); free(got); }
+        }
+        if (ib > 0) {
+            ib--;
+            size_t off = (size_t)ib * 1100, n = sizeof B - off < 1100 ? sizeof B - off : 1100;
+            rasm_msg(&m, 200, ib, nb, B + off, n);
+            got = hy2_rasm_feed(&ras, &m, 1000, pre, &tot);
+            if (got) { done_b = tot == sizeof B && !memcmp(got + pre, B, tot); free(got); }
+        }
+    }
+    (void)bad;
+    CHECK(done_a);                                                    /* 65507 байт собраны */
+    CHECK(done_b);                                                    /* вторая сборка параллельно, куски наоборот */
+    CHECK(ras == NULL);                                               /* обе сняты по готовности */
+    /* Повтор фрагмента не портит сборку и не завершает её раньше срока. */
+    static const uint8_t p1[] = "aaaa", p2[] = "bbbbbb", p3[] = "cc";
+    rasm_msg(&m, 7, 0, 3, p1, 4); CHECK(!hy2_rasm_feed(&ras, &m, 1000, 0, &tot));
+    CHECK(!hy2_rasm_feed(&ras, &m, 1000, 0, &tot));                   /* тот же фрагмент ещё раз */
+    rasm_msg(&m, 7, 2, 3, p3, 2); CHECK(!hy2_rasm_feed(&ras, &m, 1000, 0, &tot));
+    rasm_msg(&m, 7, 1, 3, p2, 6);
+    got = hy2_rasm_feed(&ras, &m, 1000, 0, &tot);
+    CHECK(got && tot == 12 && !memcmp(got, "aaaabbbbbbcc", 12));
+    free(got);
+    /* Недособранная живёт срок: к следующему фрагменту после него — снята, и новая с тем же id начинается заново. */
+    rasm_msg(&m, 9, 0, 2, p1, 4); CHECK(!hy2_rasm_feed(&ras, &m, 1000, 0, &tot));
+    rasm_msg(&m, 10, 0, 2, p1, 4); CHECK(!hy2_rasm_feed(&ras, &m, 1000 + HY2_RASM_TTL_MS + 1, 0, &tot));
+    rasm_msg(&m, 9, 1, 2, p3, 2);
+    CHECK(!hy2_rasm_feed(&ras, &m, 1000 + HY2_RASM_TTL_MS + 2, 0, &tot));   /* первой половины уже нет */
+    /* Больше 65507 байт — брак, молча. */
+    static uint8_t big[1500];
+    rasm_msg(&m, 11, 0, 2, big, sizeof big); CHECK(!hy2_rasm_feed(&ras, &m, 2000000, 0, &tot));
+    hy2_rasm_free(&ras);
+    CHECK(ras == NULL);
+    struct hy2_rasm *r2 = NULL;
+    static uint8_t huge[1400];
+    int toobig = 0;
+    for (unsigned i = 0; i < 48; i++) {
+        rasm_msg(&m, 12, i, 48, huge, sizeof huge);
+        if (hy2_rasm_feed(&r2, &m, 5, 0, &tot)) toobig = 1;
+    }
+    CHECK(!toobig);                                                   /* 48 × 1400 = 67200 > 65507 */
+    hy2_rasm_free(&r2);
+}
+
 int main(void) {
+    test_brutal_share();
     test_limits();
     test_varint();
     test_blake2b();
     test_udp();
+    test_rasm();
     test_salamander();
     test_gecko();
     test_auth_response();

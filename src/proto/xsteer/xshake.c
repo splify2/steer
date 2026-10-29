@@ -357,7 +357,7 @@ static int xs_hs_client_hello_impl(struct xs_hs *hs, const struct xs_secrets *se
     cc.our_static = our_pub;
     cc.our_priv = sec->priv;
     cc.pay.ver = XS_PROTO_VER;
-    cc.pay.flags = (uint8_t)(conn_id & 0x07);
+    cc.pay.flags = (uint8_t)((conn_id & 0x07) | XS_FLAG_SPLIT);
     cc.pay.mtu = (uint16_t)mtu;
     cc.pay.stamp = (uint64_t)time(NULL);
 
@@ -545,7 +545,7 @@ static int xs_hs_server_write_impl(struct xs_hs *hs, int mtu, uint8_t *out, size
     if (o + XS_REC_HDR + body + XS_FIN_REC > cap) return XS_ESMALL;
     out[o++] = 0x17; out[o++] = 0x03; out[o++] = 0x03;
     out[o++] = (uint8_t)(body >> 8); out[o++] = (uint8_t)(body & 0xFF);
-    struct xs_payload mine = { XS_PROTO_VER, 0, (uint16_t)mtu, (uint64_t)time(NULL) };
+    struct xs_payload mine = { XS_PROTO_VER, XS_FLAG_SPLIT, (uint16_t)mtu, (uint64_t)time(NULL) };
     uint8_t plain[XS_SID_PLAIN];
     payload_pack(&mine, plain);
     if ((rc = encrypt_and_hash(hs, plain, XS_SID_PLAIN, out + o)) != 0) return rc;

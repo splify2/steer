@@ -126,6 +126,32 @@ static long fake_step(void) { g_slept++; return 0; }
 #include "../src/model/spec.h"
 #include "daemon.h"
 #include "failover_int.h"
+#include "fogroup.h"
+
+/* Виды туннелей стенда. В ядре видов протоколов нет — они приходят из манифестов плагинов (kinds/plugin.c);
+ * сторожу важны только их свойства, и стенд держит записи с теми же свойствами, что у манифестов
+ * xsteer (health: events — здоровье и задержку судит помощник) и tunnel:vless. */
+static int owned_health(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp; (void)o; (void)dev;
+    return 1;
+}
+static int owned_latency(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp; (void)o; (void)dev;
+    return -1;
+}
+static const struct kind_ops kind_t_xsteer = {
+    .name = "xsteer",
+    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER | KC_SKIP_ZAPRET,
+    .health = owned_health,
+    .latency = owned_latency,
+};
+static const struct kind_ops kind_t_vless = {
+    .name = "vless",
+    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_SELF_NAT | KC_OVER | KC_SKIP_ZAPRET |
+            KC_TCP_PROBE | KC_FLOW_UDP | KC_TCP_REDIR | KC_IPV6,
+};
+#define OUT_XSTEER (&kind_t_xsteer)
+#define OUT_VLESS (&kind_t_vless)
 
 /* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): один экземпляр
  * на весь стенд, ровно как в других стендах модели. load_spec/registry_assign здесь мокнуты —
@@ -464,6 +490,9 @@ static void tick(const char *rules, const char *routes) {
 }
 
 int main(void) {
+    /* Маршруты таблиц выходов демон ставит сообщением rtnetlink (route_put): стенду — командой
+     * словами в тот же журнал run_quiet, что и прежде. */
+    g_route_hook = run_quiet;
     /* Своя папка состояния, и ДО первого прохода: проход пишет active и метки
      * перезапусков, а делать это в общем /tmp значило бы и зависеть от того, что там
      * оставил кто-то другой, и оставлять следы самому. */
@@ -544,12 +573,10 @@ int main(void) {
     tick(RULES_LEGACY, "default dev lo scope link\n");
     check("снятое правило fwmark — возвращено",
           cmd_seen("ip rule add fwmark 0x00100000/0x0ff00000 table 300"), 1);
-    /* И снимается прежняя форма тоже: иначе после обновления в ядре лежали бы два правила
-     * на одну метку, и порядок между ними определялся бы приоритетом, а не замыслом. Снимается
-     * она с ЯВНОЙ маской 0xffffffff и приоритетом: `ip rule del fwmark X` без маски на ядре 4.9
-     * снимает любое правило с меткой X, в том числе только что поставленное с маской. */
-    check("прежняя форма без маски снимается — с явной маской",
-          cmd_seen("ip rule del fwmark 0x00100000/0xffffffff table 300 priority 32764"), 1);
+    /* Прежняя форма без маски (до R-094) больше не снимается (I-541): её не ставит ни одна
+     * версия давно, а вслепую снимать правило по метке без маски нельзя. */
+    check("прежняя форма без маски не трогается",
+          cmd_seen("ip rule del fwmark 0x00100000/0xffffffff"), 0);
     check("  и никогда без маски", cmd_seen("ip rule del fwmark 0x00100000 table"), 0);
 
     /* 3. Таблица пуста: ядро вычистило маршрут вместе с TUN умершего процесса. */
@@ -703,8 +730,7 @@ int main(void) {
     check("перепривязка: стоящее правило не снимается",
           cmd_seen("ip rule del fwmark 0x00100000/0x0ff00000"), 0);
     check("перепривязка: стоящее правило не дублируется", rule_added, 0);
-    /* Правила нет (прежний отказ в режиме direct) — добавляется, и снимается только прежняя
-     * форма без маски, и только после. */
+    /* Правила нет (прежний отказ в режиме direct) — добавляется. */
     out_set("lo", FAIL_DROP);
     state_write("active", "vl old0\n");
     tick(RULES_LEGACY, "default dev old0 scope link \n");
@@ -715,9 +741,8 @@ int main(void) {
     check("правила нет — маршрут раньше правила",
           cmd_at("ip route replace default dev lo table 300") <
           cmd_at("ip rule add fwmark 0x00100000/0x0ff00000 table 300"), 1);
-    check("прежняя форма без маски снимается после добавления",
-          cmd_at("ip rule add fwmark 0x00100000/0x0ff00000 table 300") <
-          cmd_at("ip rule del fwmark 0x00100000/0xffffffff table 300"), 1);
+    check("прежняя форма без маски не снимается",
+          cmd_seen("ip rule del fwmark 0x00100000/0xffffffff"), 0);
     /* Прежней формы в дампе нет — снимать нечего, и вслепую ничего не снимается. */
     out_set("lo", FAIL_DROP);
     state_write("active", "vl old0\n");
@@ -743,6 +768,27 @@ int main(void) {
             "32765:\tfrom all fwmark 0x100000/0xff00000 lookup 305\n"
             "32766:\tfrom all fwmark 0x100000 lookup 300\n", 0x100000, 300);
         check("копии: имя таблицы — наше, чужой номер и форма без маски — нет", c.n, 1);
+        rule_copies_free(&c);
+    }
+    /* Копий больше прежнего предела (8) и правило длиннее прежних 512 байт: считаются все. */
+    {
+        char many[4096] = "";
+        size_t o = 0;
+        for (int i = 0; i < 20; i++)
+            o += (size_t)snprintf(many + o, sizeof(many) - o,
+                "%d:\tfrom all fwmark 0x100000/0xff00000 lookup 300\n", 32000 + i);
+        struct rule_copies c = rule_copies_of(many, 0x100000, 300);
+        check("копии: 20 верных копий — все посчитаны (раньше не больше 8)", c.n, 20);
+        check("копии: приоритет последней копии записан", c.n == 20 ? (int)c.pref[19] : -1, 32019);
+        rule_copies_free(&c);
+        char longl[2048];
+        o = (size_t)snprintf(longl, sizeof(longl), "32764:\tfrom 10.0.0.0/8 ");
+        for (int i = 0; i < 40; i++)
+            o += (size_t)snprintf(longl + o, sizeof(longl) - o, "iif eth%d ", i);
+        snprintf(longl + o, sizeof(longl) - o, "fwmark 0x100000/0xff00000 lookup 300\n");
+        c = rule_copies_of(longl, 0x100000, 300);
+        check("копии: правило длиннее 512 байт — копия найдена", c.n, 1);
+        rule_copies_free(&c);
     }
     /* Отказ при on_fail=drop: запрет — заменой, а не сбросом и добавлением (между ними
      * таблица пуста и помеченное уходит напрямую). */
@@ -1378,6 +1424,70 @@ int main(void) {
 
         g_latency_probe = NULL;
         g_health_probe = NULL;
+    }
+
+    /* ---- only и exclude группы: страна ЖИВОГО узла члена из файла состояния его туннеля ----
+     * Файл — состояния выхода плагина (steer-api.md, 2.2): <state>/plugin/<id>/<выход>.status.json.
+     * Члены здесь — выходы, которые ведёт помощник плагина (owner — они сами, plugin_out_state). */
+    {
+        char d[] = "/tmp/failovermatch-cc-XXXXXX";
+        if (!mkdtemp(d)) { perror("mkdtemp"); return 1; }
+        steer_set_state_dir(d);
+        struct { const char *tag, *out, *body; } F[] = {
+            { "vless", "nl", "\"node_cc\":\"NL\"" },                        /* только заявленная */
+            { "vless", "ru", "\"node_cc\":\"NL\",\"geo_cc\":\"RU\"" },      /* выход виден из другой страны */
+            { "hysteria2", "de", "\"node_cc\":\"DE\"" },
+            { "proxy", "nf", "\"up\":true" },                               /* страны у узла нет */
+        };
+        for (size_t i = 0; i < sizeof(F) / sizeof(F[0]); i++) {
+            char path[300];
+            snprintf(path, sizeof(path), "%s/plugin", d);
+            mkdir(path, 0755);
+            snprintf(path, sizeof(path), "%s/plugin/%s", d, F[i].tag);
+            mkdir(path, 0755);
+            snprintf(path, sizeof(path), "%s/plugin/%s/%s.status.json", d, F[i].tag, F[i].out);
+            FILE *f = fopen(path, "w");
+            fprintf(f, "{\"pid\":%ld,%s}\n", (long)getpid(), F[i].body);
+            fclose(f);
+        }
+        struct output m[5], go;
+        memset(m, 0, sizeof(m));
+        const char *mn[5] = { "nl", "ru", "de", "nf", "gone" };
+        const char *mp[5] = { "vless", "vless", "hysteria2", "proxy", "vless" };
+        for (int i = 0; i < 5; i++) {
+            snprintf(m[i].name, sizeof(m[i].name), "%s", mn[i]);
+            m[i].owner_plugin = mp[i];
+            m[i].owner_out = mn[i];
+        }
+        memset(&go, 0, sizeof(go));
+        go.kind = OUT_GROUP;
+        group_cfg_init(&go.grp);
+        char cc[3];
+        check("страна члена: заявленная по имени узла", fog_member_cc(&m[0], cc) && !strcmp(cc, "NL"), 1);
+        check("страна члена: фактическая важнее заявленной", fog_member_cc(&m[1], cc) && !strcmp(cc, "RU"), 1);
+        check("страна члена: у hysteria2 тот же ключ", fog_member_cc(&m[2], cc) && !strcmp(cc, "DE"), 1);
+        check("страна члена: у узла страны нет — нет", fog_member_cc(&m[3], cc), 0);
+        check("страна члена: файла нет — нет", fog_member_cc(&m[4], cc), 0);
+        int all = 1;
+        for (int i = 0; i < 5; i++) all &= fog_cc_allowed(&go, &m[i]);
+        check("без only и exclude группа берёт всех", all, 1);
+        char only[2][3] = { "NL", "DE" }, ex[1][3] = { "RU" };
+        go.grp.ccsel.only = only;
+        go.grp.ccsel.only_n = 2;
+        check("only [NL, DE]: берутся nl, de; ru (фактически RU), без страны и без файла — нет",
+              fog_cc_allowed(&go, &m[0]) && !fog_cc_allowed(&go, &m[1]) && fog_cc_allowed(&go, &m[2]) &&
+              !fog_cc_allowed(&go, &m[3]) && !fog_cc_allowed(&go, &m[4]), 1);
+        go.grp.ccsel.only_n = 0;
+        go.grp.ccsel.cc = ex;
+        go.grp.ccsel.cc_n = 1;
+        check("exclude [RU]: нет только ru; без страны и без файла — берутся",
+              fog_cc_allowed(&go, &m[0]) && !fog_cc_allowed(&go, &m[1]) && fog_cc_allowed(&go, &m[2]) &&
+              fog_cc_allowed(&go, &m[3]) && fog_cc_allowed(&go, &m[4]), 1);
+        char pth[200];
+        const char *rm[] = { "vless-nl", "vless-ru", "hy2-de", "proxy-nf", NULL };
+        for (int i = 0; rm[i]; i++) { snprintf(pth, sizeof(pth), "%s/%s", d, rm[i]); unlink(pth); }
+        rmdir(d);
+        steer_set_state_dir(g_dir);
     }
 
     /* ---- via: отказ цели делает нерабочим и зависящий выход ------------------------------ */

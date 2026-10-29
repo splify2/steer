@@ -25,6 +25,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -124,6 +125,18 @@ static int queue_open(const char *name, short flags) {
 static int queue_rx_gso(int fd) {
     unsigned feat = TUN_F_CSUM | TUN_F_TSO4;
     return ioctl(fd, TUNSETOFFLOAD, feat) == 0 ? 0 : -1;
+}
+
+int tun_adopt_fd(struct tun_dev *d, int fd) {
+    int copy = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0) {
+        fprintf(stderr, "steer[warn] tunnel: устройство хоста (дескриптор %d) не взялось: %s\n", fd,
+                strerror(errno));
+        return TUN_ESETUP;
+    }
+    memset(d, 0, sizeof(*d));
+    d->fd = copy;
+    return 1;
 }
 
 int tun_open(struct tun_dev *d, int max_queues, const char *name) {
@@ -392,10 +405,37 @@ ssize_t tun_read_packet(struct tun_dev *d, unsigned char *buf, size_t cap) {
  * места для ошибки в нём. */
 int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *payload_off) {
     if (n < 20) return -1;
-    if ((p[0] >> 4) != 4) return -1;                 /* IPv6 не поддержан */
-    size_t ihl = (size_t)(p[0] & 0x0F) * 4;
+    size_t ihl;
+    if ((p[0] >> 4) == 6) {
+        /* IPv6: фиксированный заголовок 40 байт. За ним — TCP, UDP или заголовок фрагментации (RFC 8200:
+         * смещение в 8-байтовых блоках — старшие 13 бит, M — младший). Другие расширения разбирать
+         * нечем (hop-by-hop, маршрутизация и параметры получателя пользовательский UDP и TCP не несут), и
+         * такой пакет отвергается: допустить их значило бы дать двум пакетам одного потока разные хэши
+         * раздачи по рабочим (tun_flow_owner смотрит только на следующий заголовок). */
+        if (n < 40) return -1;
+        size_t plen = ((size_t)p[4] << 8) | p[5];
+        if (plen + 40 > n) return -1;
+        k->v6 = 1;
+        memcpy(k->src6, p + 8, 16);
+        memcpy(k->dst6, p + 24, 16);
+        k->proto = p[6];
+        k->frag = 0;
+        ihl = 40;
+        if (p[6] == 44) {
+            if (n < 48) return -1;
+            unsigned fo = (unsigned)((p[42] << 8) | p[43]);
+            if (fo & 0xFFF8) return -1;              /* не первый фрагмент — заголовка нет */
+            k->frag = (fo & 1) ? 1 : 0;
+            k->proto = p[40];
+            ihl = 48;
+        }
+        goto l4;
+    }
+    if ((p[0] >> 4) != 4) return -1;
+    ihl = (size_t)(p[0] & 0x0F) * 4;
     if (ihl < 20 || n < ihl) return -1;
 
+    k->v6 = 0;
     k->proto = p[9];
     memcpy(&k->src, p + 12, 4);
     memcpy(&k->dst, p + 16, 4);
@@ -415,6 +455,7 @@ int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *paylo
     if (frag & 0x1FFF) return -1;                    /* не первый фрагмент — заголовка нет */
     k->frag = (frag & 0x2000) ? 1 : 0;               /* MF: продолжение будет */
 
+l4:
     if (k->proto == 6) {                             /* TCP */
         if (n < ihl + 20) return -1;
         const unsigned char *t = p + ihl;
@@ -504,41 +545,6 @@ static uint16_t csum_fin(uint32_t acc) {
 
 /* Собрать TCP-пакет для отправки клиенту. Адреса и порты меняются местами: мы отвечаем
  * от имени того, к кому клиент обращался. */
-/* Заголовок IP и TCP без опций, поля сумм оставлены нулями.
- *
- * Отдельно от tcp_build потому, что для потока данных сумму TCP считать может НЕ НАДО:
- * при разгрузке её досчитывает ядро, и это ровно та экономия, ради которой разгрузка и
- * включается. Смешивать «собрать заголовок» и «посчитать сумму по всем данным» в одной
- * функции значило бы платить за вторую там, где она не нужна. */
-void tcp_hdr_build(unsigned char out[TUN_HDR_LEN],
-                   uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
-                   uint32_t seq, uint32_t ack, unsigned char flags,
-                   size_t data_n, uint16_t window) {
-    size_t total = TUN_HDR_LEN + data_n;
-    memset(out, 0, TUN_HDR_LEN);
-    out[0] = 0x45;
-    out[2] = (unsigned char)(total >> 8);
-    out[3] = (unsigned char)total;
-    out[8] = 64;
-    out[9] = 6;
-    memcpy(out + 12, &src, 4);
-    memcpy(out + 16, &dst, 4);
-    uint16_t ipsum = csum_fin(csum_add(out, 20, 0));
-    out[10] = (unsigned char)(ipsum >> 8);
-    out[11] = (unsigned char)ipsum;
-
-    unsigned char *t = out + 20;
-    t[0] = (unsigned char)(sport >> 8); t[1] = (unsigned char)sport;
-    t[2] = (unsigned char)(dport >> 8); t[3] = (unsigned char)dport;
-    t[4] = (unsigned char)(seq >> 24); t[5] = (unsigned char)(seq >> 16);
-    t[6] = (unsigned char)(seq >> 8);  t[7] = (unsigned char)seq;
-    t[8] = (unsigned char)(ack >> 24); t[9] = (unsigned char)(ack >> 16);
-    t[10] = (unsigned char)(ack >> 8); t[11] = (unsigned char)ack;
-    t[12] = 0x50;                                    /* data offset 5 слов, опций нет */
-    t[13] = flags;
-    t[14] = (unsigned char)(window >> 8); t[15] = (unsigned char)window;
-}
-
 /* Сумма псевдозаголовка TCP: адреса, протокол, длина. */
 static uint32_t tcp_pseudo_sum(uint32_t src, uint32_t dst, size_t tcp_len) {
     unsigned char pseudo[12];
@@ -549,86 +555,112 @@ static uint32_t tcp_pseudo_sum(uint32_t src, uint32_t dst, size_t tcp_len) {
     return csum_add(pseudo, 12, 0);
 }
 
-/* Дождаться, пока в очереди устройства освободится место, и повторить запись.
- *
- * Очередь заполняется на любом пике скорости, и write отвечает EAGAIN — устройство у нас
- * неблокирующее (иначе последнее чтение в цикле засыпало бы). Считать это отказом
- * соединения нельзя: очередь разгружается за микросекунды, а первая версия так и делала —
- * скачивание пропадало совсем.
- *
- * Ожидание миллисекунда, а не десять: замерено, что десять превращались в потолок скорости
- * (110 проходов цикла в секунду при простое poll в 0%). */
-static int tun_writev(const struct tun_dev *d, struct iovec *iov, int n) {
-    for (int attempts = 0;;) {
-        if (writev(d->fd, iov, n) >= 0) return 0;
-        if (errno == EINTR) continue;
-        if ((errno != EAGAIN && errno != EWOULDBLOCK) || ++attempts > 200) return -1;
-        struct pollfd wp = { .fd = d->fd, .events = POLLOUT };
-        poll(&wp, 1, 1);
-    }
+/* Сумма псевдозаголовка IPv6 (RFC 8200, 8.1): адреса, длина верхнего уровня (32 бита), следующий заголовок. */
+static uint32_t pseudo6_sum(const unsigned char *src, const unsigned char *dst, size_t len, unsigned char nh) {
+    unsigned char ph[40];
+    memcpy(ph, src, 16);
+    memcpy(ph + 16, dst, 16);
+    ph[32] = (unsigned char)(len >> 24); ph[33] = (unsigned char)(len >> 16);
+    ph[34] = (unsigned char)(len >> 8);  ph[35] = (unsigned char)len;
+    ph[36] = ph[37] = ph[38] = 0;
+    ph[39] = nh;
+    return csum_add(ph, sizeof(ph), 0);
 }
 
-int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
-                   const unsigned char *data, size_t data_n) {
-    struct iovec iov[3];
-    int n = 0;
-    struct vnet_hdr vh;
-    size_t tcp_len = 20 + data_n;
-    /* Адреса берём из уже собранного заголовка через memcpy, а не сдвигами: в flow_key они
-     * лежат в СЕТЕВОМ порядке внутри uint32_t, и сборка сдвигами дала бы верный результат
-     * только на little-endian — то есть mips_24kc считал бы сумму от перевёрнутых адресов. */
-    uint32_t src, dst;
-    memcpy(&src, hdr + 12, 4);
-    memcpy(&dst, hdr + 16, 4);
+/* Очередь записи в устройство (I-534). Раньше при EAGAIN поток цикла стоял в poll по миллисекунде, до 200
+ * раз: заполненная очередь устройства останавливала ВСЕ соединения потока на срок до 200 мс, хотя клиенту
+ * нужна была одна датаграмма. Теперь не доставшаяся датаграмма уходит в очередь потока, а цикл идёт дальше:
+ * когда устройство снова принимает (EPOLLOUT, stack.c), очередь сливается по порядку — порядок пакетов
+ * сохраняется, запись в обход очереди его бы переставила.
+ *
+ * Предел очереди — TUN_WQ_MAX байт на поток: это та же очередь, что ядро держит у устройства
+ * (txqueuelen 500 пакетов — три четверти мегабайта), только пережидающая пики, и память у неё не должна
+ * расти без счёта. Дальше датаграмма отбрасывается и считается — как у любого UDP при перегрузке; у
+ * соединения конца это не вызывает. Отбрасывание обратным давлением не лечится: UDP клиента отправителя
+ * не слышит. */
+#define TUN_WQ_MAX (4u << 20)
 
-    if (d->gso) {
-        /* Сумму ставим НЕДОСЧИТАННОЙ: только псевдозаголовок, без прохода по данным.
-         * Досчитает ядро — так же, как для любого сокета с CHECKSUM_PARTIAL.
-         *
-         * В поле check кладётся свёрнутая, но НЕ инвертированная сумма псевдозаголовка с
-         * НАСТОЯЩЕЙ длиной всего сегмента. Это тот же вид, который ядро само себе готовит
-         * в __tcp_v4_send_check: `th->check = ~tcp_v4_check(skb->len, saddr, daddr, 0)`.
-         * Поправку на длину каждого куска при нарезке вносит tcp_gso_segment. Инвертировать
-         * здесь ещё раз означало бы отдать сумму, которая не сойдётся ни у одного куска, —
-         * а выглядело бы это как «пакеты уходят, клиент их не видит». */
-        uint16_t partial = (uint16_t)~csum_fin(tcp_pseudo_sum(
-                src, dst, tcp_len));
-        hdr[20 + 16] = (unsigned char)(partial >> 8);
-        hdr[20 + 17] = (unsigned char)partial;
+struct tun_wq_pkt {
+    struct tun_wq_pkt *next;
+    int fd;
+    size_t n;
+    unsigned char d[];
+};
+static __thread struct {
+    struct tun_wq_pkt *head, *tail;
+    size_t bytes;
+    unsigned long long dropped;
+} g_wq;
 
-        memset(&vh, 0, sizeof(vh));
-        vh.flags = VNET_F_NEEDS_CSUM;
-        vh.csum_start = 20;                          /* начало заголовка TCP */
-        vh.csum_offset = 16;                         /* поле check внутри него */
-        vh.hdr_len = TUN_HDR_LEN;
-        /* Нарезку просим только когда резать есть что: пометка GSO на сегменте в один MSS
-         * лишней работы ядру не добавляет, но и смысла не несёт. */
-        if (data_n > TUN_MSS) {
-            vh.gso_type = VNET_GSO_TCPV4;
-            vh.gso_size = TUN_MSS;
+int tun_wq_pending(void) { return g_wq.head != NULL; }
+unsigned long long tun_wq_dropped(void) { return g_wq.dropped; }
+
+/* Слить очередь, пока устройство принимает. 0 — пусто, 1 — устройство снова занято (ждать EPOLLOUT),
+ * -1 — устройство сломано (очередь брошена). */
+int tun_wq_flush(void) {
+    while (g_wq.head) {
+        struct tun_wq_pkt *p = g_wq.head;
+        ssize_t w = write(p->fd, p->d, p->n);
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 1;
+        /* Записано или отказано насовсем (устройство закрыто, пакет не принят ядром): пакет уходит из
+         * очереди — повтор того, что ядро отвергло, не имеет смысла, а хвост ждать не должен. */
+        g_wq.head = p->next;
+        if (!g_wq.head) g_wq.tail = NULL;
+        g_wq.bytes -= p->n;
+        free(p);
+    }
+    return 0;
+}
+
+void tun_wq_free(void) {
+    while (g_wq.head) {
+        struct tun_wq_pkt *p = g_wq.head;
+        g_wq.head = p->next;
+        free(p);
+    }
+    g_wq.tail = NULL;
+    g_wq.bytes = 0;
+}
+
+/* Записать пакет (iov — заголовок vnet и сам пакет). 0 — записан или в очереди (и отброшенный по
+ * пределу очереди — тоже 0: потеря UDP не рвёт соединение), -1 — устройство отказало насовсем. */
+static int tun_writev(const struct tun_dev *d, struct iovec *iov, int n) {
+    if (g_wq.head && tun_wq_flush() < 0) return -1;
+    if (!g_wq.head) {
+        for (;;) {
+            if (writev(d->fd, iov, n) >= 0) return 0;
+            if (errno == EINTR) continue;
+            break;
         }
-        iov[n].iov_base = &vh;
-        iov[n].iov_len = sizeof(vh);
-        n++;
-    } else {
-        /* Без разгрузки сумму приходится считать самим, и это проход по ВСЕМ данным. */
-        uint32_t acc = tcp_pseudo_sum(src, dst, tcp_len);
-        acc = csum_add(hdr + 20, 20, acc);
-        acc = csum_add(data, data_n, acc);
-        uint16_t tsum = csum_fin(acc);
-        hdr[20 + 16] = (unsigned char)(tsum >> 8);
-        hdr[20 + 17] = (unsigned char)tsum;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
     }
-
-    iov[n].iov_base = hdr;
-    iov[n].iov_len = TUN_HDR_LEN;
-    n++;
-    if (data_n) {
-        iov[n].iov_base = (void *)(uintptr_t)data;
-        iov[n].iov_len = data_n;
-        n++;
+    size_t len = 0;
+    for (int i = 0; i < n; i++) len += iov[i].iov_len;
+    if (g_wq.bytes + len > TUN_WQ_MAX) {
+        static __thread time_t said;
+        time_t now = time(NULL);
+        if (!g_wq.dropped++ || now - said >= 10) {
+            said = now;
+            fprintf(stderr, "steer[warn] tunnel: очередь записи в устройство полна (%u КиБ) — датаграммы "
+                            "клиенту отбрасываются; всего отброшено %llu\n", TUN_WQ_MAX >> 10, g_wq.dropped);
+        }
+        return 0;
     }
-    return tun_writev(d, iov, n);
+    struct tun_wq_pkt *p = malloc(sizeof(*p) + len);
+    if (!p) { g_wq.dropped++; return 0; }
+    p->next = NULL;
+    p->fd = d->fd;
+    p->n = len;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        memcpy(p->d + off, iov[i].iov_base, iov[i].iov_len);
+        off += iov[i].iov_len;
+    }
+    if (g_wq.tail) g_wq.tail->next = p; else g_wq.head = p;
+    g_wq.tail = p;
+    g_wq.bytes += len;
+    return 0;
 }
 
 void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n) {
@@ -844,6 +876,28 @@ void tun_gro_push(const struct tun_dev *d, struct tun_gro *g, unsigned char *pkt
  * 8 байт его данных — по ним клиент и опознаёт, какое своё соединение отвергли. */
 size_t icmp_unreach_build(unsigned char *out, size_t cap,
                           const unsigned char *orig, size_t orig_n) {
+    if (orig_n >= 40 && (orig[0] >> 4) == 6) {
+        /* ICMPv6 «адресат недостижим, порт недостижим» (RFC 4443, 3.1: тип 1, код 4). Цитата — сколько
+         * влезет в минимальный MTU IPv6 (1280), сумма — с псевдозаголовком, в отличие от ICMPv4. */
+        size_t quote = orig_n > 1280 - 48 ? 1280 - 48 : orig_n;
+        size_t total6 = 40 + 8 + quote;
+        if (cap < total6) return 0;
+        memset(out, 0, 48);
+        out[0] = 0x60;
+        out[4] = (unsigned char)((8 + quote) >> 8);
+        out[5] = (unsigned char)(8 + quote);
+        out[6] = 58;                                /* ICMPv6 */
+        out[7] = 64;
+        memcpy(out + 8, orig + 24, 16);             /* от имени назначения */
+        memcpy(out + 24, orig + 8, 16);             /* клиенту */
+        out[40] = 1;                                /* destination unreachable */
+        out[41] = 4;                                /* port unreachable */
+        memcpy(out + 48, orig, quote);
+        uint16_t ic6 = csum_fin(csum_add(out + 40, 8 + quote, pseudo6_sum(out + 8, out + 24, 8 + quote, 58)));
+        out[42] = (unsigned char)(ic6 >> 8);
+        out[43] = (unsigned char)ic6;
+        return total6;
+    }
     if (orig_n < 20) return 0;
     size_t ihl = (size_t)(orig[0] & 0x0F) * 4;
     if (ihl < 20 || ihl > orig_n) return 0;
@@ -874,33 +928,47 @@ size_t icmp_unreach_build(unsigned char *out, size_t cap,
     return total;
 }
 
-size_t tcp_build(unsigned char *out, size_t cap,
-                 uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
-                 uint32_t seq, uint32_t ack, unsigned char flags,
-                 const unsigned char *data, size_t data_n, uint16_t window,
-                 unsigned mss, int wscale) {
+/* Тело tcp_build и tcp_build6: v6 — семейство, src и dst — байты адресов в сетевом порядке (4 или 16). */
+static size_t tcp_build_af(unsigned char *out, size_t cap, int v6,
+                           const unsigned char *src, const unsigned char *dst,
+                           uint16_t sport, uint16_t dport,
+                           uint32_t seq, uint32_t ack, unsigned char flags,
+                           const unsigned char *data, size_t data_n, uint16_t window,
+                           unsigned mss, int wscale) {
     /* Опции: MSS занимает 4 байта, масштаб окна 3, и вместе они дают 7 — а длина
      * заголовка TCP измеряется в 32-битных словах. Дополняем NOP до восьми. */
     size_t opt_n = 0;
     if (mss) opt_n += 4;
     if (wscale >= 0) opt_n += 4;                     /* NOP + kind + len + shift */
-    size_t total = 20 + 20 + opt_n + data_n;
+    size_t iph = v6 ? 40 : 20;
+    size_t total = iph + 20 + opt_n + data_n;
     if (total > cap) return 0;
-    memset(out, 0, 40 + opt_n);
+    memset(out, 0, iph + 20 + opt_n);
 
-    out[0] = 0x45;                                   /* IPv4, ihl=5 */
-    out[2] = (unsigned char)(total >> 8);
-    out[3] = (unsigned char)total;
-    out[8] = 64;                                     /* TTL */
-    out[9] = 6;                                      /* TCP */
-    memcpy(out + 12, &src, 4);
-    memcpy(out + 16, &dst, 4);
-    out[10] = 0; out[11] = 0;
-    uint16_t ipsum = csum_fin(csum_add(out, 20, 0));
-    out[10] = (unsigned char)(ipsum >> 8);
-    out[11] = (unsigned char)ipsum;
+    if (v6) {
+        size_t pl = 20 + opt_n + data_n;
+        out[0] = 0x60;                               /* IPv6 */
+        out[4] = (unsigned char)(pl >> 8);
+        out[5] = (unsigned char)pl;
+        out[6] = 6;                                  /* TCP */
+        out[7] = 64;                                 /* предел переходов */
+        memcpy(out + 8, src, 16);
+        memcpy(out + 24, dst, 16);
+    } else {
+        out[0] = 0x45;                               /* IPv4, ihl=5 */
+        out[2] = (unsigned char)(total >> 8);
+        out[3] = (unsigned char)total;
+        out[8] = 64;                                 /* TTL */
+        out[9] = 6;                                  /* TCP */
+        memcpy(out + 12, src, 4);
+        memcpy(out + 16, dst, 4);
+        out[10] = 0; out[11] = 0;
+        uint16_t ipsum = csum_fin(csum_add(out, 20, 0));
+        out[10] = (unsigned char)(ipsum >> 8);
+        out[11] = (unsigned char)ipsum;
+    }
 
-    unsigned char *t = out + 20;
+    unsigned char *t = out + iph;
     t[0] = (unsigned char)(sport >> 8); t[1] = (unsigned char)sport;
     t[2] = (unsigned char)(dport >> 8); t[3] = (unsigned char)dport;
     t[4] = (unsigned char)(seq >> 24); t[5] = (unsigned char)(seq >> 16);
@@ -925,12 +993,37 @@ size_t tcp_build(unsigned char *out, size_t cap,
     }
     if (data_n) memcpy(t + 20 + opt_n, data, data_n);
 
-    uint32_t acc = tcp_pseudo_sum(src, dst, 20 + opt_n + data_n);
+    uint32_t acc;
+    if (v6) {
+        acc = pseudo6_sum(src, dst, 20 + opt_n + data_n, 6);
+    } else {
+        uint32_t s4, d4;
+        memcpy(&s4, src, 4);
+        memcpy(&d4, dst, 4);
+        acc = tcp_pseudo_sum(s4, d4, 20 + opt_n + data_n);
+    }
     acc = csum_add(t, 20 + opt_n + data_n, acc);
     uint16_t tsum = csum_fin(acc);
     t[16] = (unsigned char)(tsum >> 8);
     t[17] = (unsigned char)tsum;
     return total;
+}
+
+size_t tcp_build(unsigned char *out, size_t cap,
+                 uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
+                 uint32_t seq, uint32_t ack, unsigned char flags,
+                 const unsigned char *data, size_t data_n, uint16_t window,
+                 unsigned mss, int wscale) {
+    return tcp_build_af(out, cap, 0, (const unsigned char *)&src, (const unsigned char *)&dst, sport, dport,
+                        seq, ack, flags, data, data_n, window, mss, wscale);
+}
+
+size_t tcp_build6(unsigned char *out, size_t cap,
+                  const uint8_t src[16], const uint8_t dst[16], uint16_t sport, uint16_t dport,
+                  uint32_t seq, uint32_t ack, unsigned char flags,
+                  const unsigned char *data, size_t data_n, uint16_t window,
+                  unsigned mss, int wscale) {
+    return tcp_build_af(out, cap, 1, src, dst, sport, dport, seq, ack, flags, data, data_n, window, mss, wscale);
 }
 
 /* ---- UDP клиенту ----------------------------------------------------------- */
@@ -1046,6 +1139,272 @@ int udp_write_to_client(const struct tun_dev *d, uint32_t src, uint32_t dst,
         nio++;
         if (tun_writev(d, iov, nio) != 0) return -1;
         off += chunk;
+    }
+    return 0;
+}
+
+/* Один пакет клиенту: с заголовком vnet при включённой разгрузке (обязателен всегда, см. udp_write_to_client). */
+static int tun_write_pkt(const struct tun_dev *d, const unsigned char *pkt, size_t n) {
+    struct iovec iov[2];
+    int nio = 0;
+    struct vnet_hdr vh;
+    if (d->gso) {
+        memset(&vh, 0, sizeof(vh));
+        vh.gso_type = VNET_GSO_NONE;
+        iov[nio].iov_base = &vh;
+        iov[nio].iov_len = sizeof(vh);
+        nio++;
+    }
+    iov[nio].iov_base = (void *)(uintptr_t)pkt;
+    iov[nio].iov_len = n;
+    nio++;
+    return tun_writev(d, iov, nio);
+}
+
+/* IPv6: то же, что udp_write_to_client. Сумма UDP у IPv6 обязательна (RFC 8200, 8.1) и считается по
+ * псевдозаголовку из 16-байтовых адресов; ноль в поле суммы здесь запрещён, поэтому тоже 0xFFFF. Датаграмма,
+ * не влезающая в MTU, режется заголовком фрагментации: в каждом куске фиксированный заголовок (следующий
+ * заголовок 44), восемь байт фрагментации (смещение в блоках по 8 байт, M, 32-битный номер) и кусок,
+ * кратный восьми, кроме последнего. Выше MTU фрагменты ждёт собрать стек клиента. */
+int udp_write_to_client6(const struct tun_dev *d, const uint8_t src[16], const uint8_t dst[16],
+                         uint16_t sport, uint16_t dport,
+                         const unsigned char *data, size_t n, uint32_t frag_id) {
+    static __thread unsigned char l4[8 + UDP_DGRAM_ABS];
+    if (n > UDP_DGRAM_ABS) return -1;
+    size_t udp_len = 8 + n;
+    l4[0] = (unsigned char)(sport >> 8); l4[1] = (unsigned char)sport;
+    l4[2] = (unsigned char)(dport >> 8); l4[3] = (unsigned char)dport;
+    l4[4] = (unsigned char)(udp_len >> 8); l4[5] = (unsigned char)udp_len;
+    l4[6] = 0; l4[7] = 0;
+    memcpy(l4 + 8, data, n);
+    uint16_t usum = csum_fin(csum_add(l4, udp_len, pseudo6_sum(src, dst, udp_len, 17)));
+    if (!usum) usum = 0xFFFF;
+    l4[6] = (unsigned char)(usum >> 8);
+    l4[7] = (unsigned char)usum;
+
+    unsigned char pkt[40 + 8 + UDP6_MTU_PAYLOAD];
+    if (40 + udp_len <= TUN_MTU) {
+        memset(pkt, 0, 40);
+        pkt[0] = 0x60;
+        pkt[4] = (unsigned char)(udp_len >> 8);
+        pkt[5] = (unsigned char)udp_len;
+        pkt[6] = 17;
+        pkt[7] = 64;
+        memcpy(pkt + 8, src, 16);
+        memcpy(pkt + 24, dst, 16);
+        memcpy(pkt + 40, l4, udp_len);
+        return tun_write_pkt(d, pkt, 40 + udp_len);
+    }
+    size_t per = (UDP6_MTU_PAYLOAD - 8) & ~(size_t)7;   /* нагрузка куска: 1448 */
+    size_t off = 0;
+    while (off < udp_len) {
+        size_t chunk = udp_len - off;
+        if (chunk > per) chunk = per;
+        int more = off + chunk < udp_len;
+        memset(pkt, 0, 48);
+        pkt[0] = 0x60;
+        pkt[4] = (unsigned char)((8 + chunk) >> 8);
+        pkt[5] = (unsigned char)(8 + chunk);
+        pkt[6] = 44;                                /* заголовок фрагментации */
+        pkt[7] = 64;
+        memcpy(pkt + 8, src, 16);
+        memcpy(pkt + 24, dst, 16);
+        pkt[40] = 17;                               /* за ним — UDP */
+        unsigned fo = (unsigned)off | (more ? 1u : 0u);   /* off кратно 8: младшие три бита свободны */
+        pkt[42] = (unsigned char)(fo >> 8);
+        pkt[43] = (unsigned char)fo;
+        pkt[44] = (unsigned char)(frag_id >> 24); pkt[45] = (unsigned char)(frag_id >> 16);
+        pkt[46] = (unsigned char)(frag_id >> 8);  pkt[47] = (unsigned char)frag_id;
+        memcpy(pkt + 48, l4 + off, chunk);
+        if (tun_write_pkt(d, pkt, 48 + chunk) != 0) return -1;
+        off += chunk;
+    }
+    return 0;
+}
+
+/* ---- программа раздачи в ядре (R-146) ------------------------------------------------------------
+ *
+ * ЗАЧЕМ. Несколько рабочих потоков держат каждое соединение целиком, и пакеты клиента обязаны приходить
+ * владельцу. Раздавал их поток-читатель: читал единственную очередь и копировал пакет в кольцо рабочего.
+ * Это работает, но стоит — на скачивании одним потоком ACK клиента шёл через читателя и будил рабочего
+ * через eventfd: минус 12–25 % скорости и плюс 20–45 % процессора на ГиБ (стенд perf-tb, 2 ядра).
+ * Ядро умеет раздавать само: у устройства с IFF_MULTI_QUEUE очередь для пакета выбирает программа eBPF
+ * (TUNSETSTEERINGEBPF, ядро ≥ 4.16), если она стоит. Тогда каждый рабочий читает СВОЮ очередь, как
+ * единственный поток прежде, — ни читателя, ни копии, ни побудок.
+ *
+ * ПОЧЕМУ НЕ РАЗДАЧА ЯДРА ПО УМОЛЧАНИЮ. Без программы ядро выбирает очередь по своему хэшу и таблице
+ * потоков, и обе половины соединения к одной очереди не привязывает — на роутере это было 12 против
+ * 292 Мбит/с (stack.c, у g_conns). Программа считает tun_flow_owner — тот же хэш, которым рабочий
+ * проверяет, что пакет его (handle_packet), так что расхождение видно счётчиком «не у владельца».
+ *
+ * КАК. Программа — 60 с небольшим инструкций, собранных здесь же (библиотека bpf не нужна): загрузки
+ * LD_ABS/LD_IND по смещениям от сетевого заголовка (SKF_NET_OFF), арифметика 32-битная, как в
+ * tun_mix32, сжатие в номер — 64-битным умножением, как в tun_flow_owner. Ядро берёт результат по
+ * модулю числа очередей, а он и так меньше. Загрузка, выходящая за пакет (усечённый заголовок),
+ * завершает программу с нулём — такой пакет всё равно не разберётся.
+ *
+ * Не встала (ядро без bpf, без JIT — работает интерпретатор, без TUNSETSTEERINGEBPF, отказ проверяющего)
+ * — причина в why, и раздаёт читатель (stack.c). */
+#include <sys/syscall.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
+
+struct bpf_prog_buf {
+    struct bpf_insn in[192];
+    int n;
+};
+
+static void bi(struct bpf_prog_buf *b, uint8_t code, uint8_t dst, uint8_t src, int16_t off, int32_t imm) {
+    struct bpf_insn *x = &b->in[b->n++];
+    memset(x, 0, sizeof(*x));
+    x->code = code;
+    x->dst_reg = dst;
+    x->src_reg = src;
+    x->off = off;
+    x->imm = imm;
+}
+
+/* x = tun_mix32(x), t — временный регистр. Всё 32-битное (BPF_ALU): старшие биты обнуляются, как у uint32_t. */
+static void bi_mix32(struct bpf_prog_buf *b, uint8_t x, uint8_t t) {
+    static const struct { int sh; uint32_t mul; } st[3] = { { 16, 0x85EBCA6Bu }, { 13, 0xC2B2AE35u }, { 16, 0 } };
+    for (int i = 0; i < 3; i++) {
+        bi(b, BPF_ALU | BPF_MOV | BPF_X, t, x, 0, 0);
+        bi(b, BPF_ALU | BPF_RSH | BPF_K, t, 0, 0, st[i].sh);
+        bi(b, BPF_ALU | BPF_XOR | BPF_X, x, t, 0, 0);
+        if (st[i].mul) bi(b, BPF_ALU | BPF_MUL | BPF_K, x, 0, 0, (int32_t)st[i].mul);
+    }
+}
+
+/* Переход вперёд на метку, которой ещё нет: запомнить место, смещение вписать потом (bi_land). */
+static int bi_jmp(struct bpf_prog_buf *b, uint8_t op, uint8_t dst, int32_t imm) {
+    bi(b, BPF_JMP | op | BPF_K, dst, 0, 0, imm);
+    return b->n - 1;
+}
+static void bi_land(struct bpf_prog_buf *b, int at) { b->in[at].off = (int16_t)(b->n - at - 1); }
+
+static void steer_prog_build(struct bpf_prog_buf *b, unsigned nq) {
+    enum { R0 = 0, R1, R2, R6 = 6, R7, R8, R9, R10 };
+    b->n = 0;
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R6, R1, 0, 0);              /* LD_ABS берёт пакет из r6 */
+    bi(b, BPF_LD | BPF_B | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 0);     /* версия и длина заголовка */
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R7, R0, 0, 0);
+    bi(b, BPF_ALU | BPF_RSH | BPF_K, R0, 0, 0, 4);
+    int is4 = bi_jmp(b, BPF_JEQ, R0, 4);
+    /* IPv6: адреса сворачиваются исключением по четырём словам, дальше та же формула (tun_flow_owner в
+     * tun.h); следующий заголовок — вместо протокола, порты — только если он TCP или UDP (у фрагмента 44 —
+     * их нет, и все куски датаграммы дают один хэш). */
+    int not6 = bi_jmp(b, BPF_JNE, R0, 6);                          /* ни IPv4, ни IPv6 — очередь 0 */
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_K, R7, 0, 0, 40);              /* r7 = длина заголовка */
+    bi(b, BPF_LD | BPF_B | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 6);     /* следующий заголовок */
+    bi(b, BPF_STX | BPF_W | BPF_MEM, R10, R0, -4, 0);
+    bi(b, BPF_LD | BPF_W | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 24);    /* назначение, четыре слова */
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R9, R0, 0, 0);
+    for (int w = 28; w <= 36; w += 4) {
+        bi(b, BPF_LD | BPF_W | BPF_ABS, 0, 0, 0, SKF_NET_OFF + w);
+        bi(b, BPF_ALU | BPF_XOR | BPF_X, R9, R0, 0, 0);
+    }
+    bi(b, BPF_LDX | BPF_W | BPF_MEM, R0, R10, -4, 0);
+    bi(b, BPF_ALU | BPF_ADD | BPF_X, R9, R0, 0, 0);                /* свёртка назначения + протокол */
+    bi_mix32(b, R9, R2);
+    bi(b, BPF_LD | BPF_W | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 8);     /* источник, четыре слова */
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R8, R0, 0, 0);
+    for (int w = 12; w <= 20; w += 4) {
+        bi(b, BPF_LD | BPF_W | BPF_ABS, 0, 0, 0, SKF_NET_OFF + w);
+        bi(b, BPF_ALU | BPF_XOR | BPF_X, R8, R0, 0, 0);
+    }
+    bi(b, BPF_ALU | BPF_XOR | BPF_X, R8, R9, 0, 0);
+    bi_mix32(b, R8, R2);
+    bi(b, BPF_LDX | BPF_W | BPF_MEM, R0, R10, -4, 0);
+    int p6tcp = bi_jmp(b, BPF_JEQ, R0, 6);
+    int p6none = bi_jmp(b, BPF_JNE, R0, 17);
+    bi_land(b, p6tcp);
+    bi(b, BPF_LD | BPF_W | BPF_IND, 0, R7, 0, SKF_NET_OFF);        /* порты */
+    bi(b, BPF_ALU | BPF_XOR | BPF_X, R8, R0, 0, 0);
+    bi_mix32(b, R8, R2);
+    bi_land(b, p6none);
+    int fin6 = bi_jmp(b, BPF_JA, 0, 0);                            /* к общему концу, мимо блока IPv4 */
+    bi_land(b, is4);
+    bi(b, BPF_ALU | BPF_AND | BPF_K, R7, 0, 0, 0x0F);
+    bi(b, BPF_ALU | BPF_LSH | BPF_K, R7, 0, 0, 2);                 /* r7 = ihl в байтах */
+    bi(b, BPF_LD | BPF_B | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 9);     /* протокол */
+    bi(b, BPF_STX | BPF_W | BPF_MEM, R10, R0, -4, 0);              /* LD_ABS портит r1-r5: протокол — на стек */
+    bi(b, BPF_LD | BPF_W | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 16);    /* назначение */
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R9, R0, 0, 0);
+    bi(b, BPF_LDX | BPF_W | BPF_MEM, R0, R10, -4, 0);
+    bi(b, BPF_ALU | BPF_ADD | BPF_X, R9, R0, 0, 0);                /* назначение + протокол */
+    bi_mix32(b, R9, R2);
+    bi(b, BPF_LD | BPF_W | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 12);    /* источник */
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R8, R0, 0, 0);
+    bi(b, BPF_ALU | BPF_XOR | BPF_X, R8, R9, 0, 0);
+    bi_mix32(b, R8, R2);                                           /* r8 = хэш адресов и протокола */
+    bi(b, BPF_LD | BPF_H | BPF_ABS, 0, 0, 0, SKF_NET_OFF + 6);     /* флаги и смещение фрагмента */
+    bi(b, BPF_ALU | BPF_AND | BPF_K, R0, 0, 0, 0x3FFF);
+    int frag = bi_jmp(b, BPF_JNE, R0, 0);                          /* фрагмент — без портов */
+    bi(b, BPF_LDX | BPF_W | BPF_MEM, R0, R10, -4, 0);
+    int tcp = bi_jmp(b, BPF_JEQ, R0, 6);
+    int notudp = bi_jmp(b, BPF_JNE, R0, 17);
+    bi_land(b, tcp);
+    int shortihl = bi_jmp(b, BPF_JLT, R7, 20);
+    bi(b, BPF_LD | BPF_W | BPF_IND, 0, R7, 0, SKF_NET_OFF);        /* порты: источник << 16 | назначение */
+    bi(b, BPF_ALU | BPF_XOR | BPF_X, R8, R0, 0, 0);
+    bi_mix32(b, R8, R2);
+    bi_land(b, frag);
+    bi_land(b, notudp);
+    bi_land(b, shortihl);
+    bi_land(b, fin6);
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_X, R0, R8, 0, 0);              /* (uint64_t)h * nq >> 32 */
+    bi(b, BPF_ALU64 | BPF_MUL | BPF_K, R0, 0, 0, (int32_t)nq);
+    bi(b, BPF_ALU64 | BPF_RSH | BPF_K, R0, 0, 0, 32);
+    bi(b, BPF_JMP | BPF_EXIT, 0, 0, 0, 0);
+    bi_land(b, not6);
+    bi(b, BPF_ALU64 | BPF_MOV | BPF_K, R0, 0, 0, 0);
+    bi(b, BPF_JMP | BPF_EXIT, 0, 0, 0, 0);
+}
+
+int tun_steer_attach(int fd, unsigned nq, char *why, size_t why_n) {
+    if (why_n) why[0] = 0;
+    if (getenv("STEER_TUN_NOSTEER")) {
+        snprintf(why, why_n, "выключена (STEER_TUN_NOSTEER)");
+        return -1;
+    }
+    static struct bpf_prog_buf b;
+    steer_prog_build(&b, nq);
+    union bpf_attr a;
+    memset(&a, 0, sizeof(a));
+    a.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+    a.insns = (uint64_t)(uintptr_t)b.in;
+    a.insn_cnt = (uint32_t)b.n;
+    a.license = (uint64_t)(uintptr_t)"GPL";
+    int pfd = (int)syscall(__NR_bpf, BPF_PROG_LOAD, &a, sizeof(a));
+    if (pfd < 0) {
+        int e = errno;
+        /* Без журнала проверяющего — первая попытка: журнал, не влезший в буфер, сам по себе отказ
+         * (ENOSPC). Отказали — повтор с журналом, только чтобы назвать причину. */
+        static char log[16384];
+        log[0] = 0;
+        a.log_buf = (uint64_t)(uintptr_t)log;
+        a.log_size = sizeof(log);
+        a.log_level = 1;
+        int again = (int)syscall(__NR_bpf, BPF_PROG_LOAD, &a, sizeof(a));
+        if (again >= 0) close(again);
+        /* Последняя непустая строка журнала проверяющего — сама причина отказа. */
+        const char *last = "";
+        for (char *s = log; *s; ) {
+            char *nl = strchr(s, '\n');
+            if (nl) *nl = 0;
+            if (*s) last = s;
+            if (!nl) break;
+            s = nl + 1;
+        }
+        snprintf(why, why_n, "программа не загрузилась: %s%s%s", strerror(e), *last ? " — " : "", last);
+        return -1;
+    }
+    int rc = ioctl(fd, TUNSETSTEERINGEBPF, &pfd);
+    int e = errno;
+    close(pfd);    /* устройство держит свою ссылку на программу */
+    if (rc != 0) {
+        snprintf(why, why_n, "устройство её не приняло (TUNSETSTEERINGEBPF): %s", strerror(e));
+        return -1;
     }
     return 0;
 }

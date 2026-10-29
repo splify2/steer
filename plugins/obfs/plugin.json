@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "id": "obfs",
+  "version": "@VERSION@",
+  "type": "plugin",
+  "name": "Обфускатор WireGuard",
+  "description": "WireGuard поверх поддельного TCP для выходов interface",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/splify2/steer",
+  "compat": {
+    "steer-api": "^1.1"
+  },
+  "arch": [
+    "aarch64_cortex-a53",
+    "aarch64_cortex-a72",
+    "aarch64_generic",
+    "arm_cortex-a7_neon-vfpv4",
+    "arm_cortex-a9",
+    "arm_cortex-a9_neon",
+    "arm_cortex-a9_vfpv3-d16",
+    "mipsel_24kc",
+    "mips_24kc",
+    "x86_64"
+  ],
+  "permissions": [
+    "net.admin"
+  ],
+  "steer": {
+    "commands": [
+      {
+        "name": "obfs-server",
+        "prog": "bin/obfs",
+        "help": "сервер обфускации (VPS)",
+        "usage": "--listen ПОРТ --forward АДРЕС:ПОРТ"
+      }
+    ],
+    "kinds": [
+      {
+        "name": "interface",
+        "impl": "core",
+        "helper": {
+          "prog": "bin/obfs",
+          "cmd": "obfs",
+          "when": "obfs",
+          "argv": [
+            "obfs",
+            "{out}",
+            "--conf",
+            "{conf}"
+          ]
+        }
+      }
+    ]
+  },
+  "i18n": {
+    "languages": [
+      "ru",
+      "en"
+    ]
+  }
+}

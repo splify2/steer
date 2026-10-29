@@ -21,6 +21,9 @@ command -v python3 >/dev/null 2>&1 || { echo "dnsproxy: python3 нет — пр�
 
 tmp="$(mktemp -d)"
 trap 'kill ${DPID:-0} ${UPID:-0} ${DPID2:-0} ${DPID3:-0} ${UPID3:-0} 2>/dev/null; exec 3>&- 2>/dev/null; rm -rf "$tmp"' EXIT
+# Выход без IPv6 в фикстурах — мост Telegram (kind: tgws), вид плагина tgws: каталог плагинов дерева.
+sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" >/dev/null || { echo "dnsproxy: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 
 LPORT=15300
 UPORT=15353
@@ -165,6 +168,18 @@ if what == 'pipeline':
         if r and struct.unpack('>H', r[:2])[0] == 0x3000 + i and r[-4:] == bytes([93, 184, 216, 35]):
             seq += 1
     print(ok, seq)
+elif what == 'many':
+    # Сто соединений одновременно — больше прежних 32 (TCP_MAX_CONN): все открыты до первого
+    # вопроса, значит, места нет ни у кого лишнего, и каждое обязано получить свой ответ.
+    n = 100
+    cs = [conn() for _ in range(n)]
+    for i, c in enumerate(cs): c.sendall(framed(q(0x6000 + i, 'many%d.test' % i)))
+    ok = 0
+    for i, c in enumerate(cs):
+        r = reply(c)
+        if r and struct.unpack('>H', r[:2])[0] == 0x6000 + i and r[-4:] == bytes([93, 184, 216, 35]):
+            ok += 1
+    print(ok)
 elif what == 'big':
     c = conn()
     c.sendall(framed(q(0x4242, 'big.test')))
@@ -220,6 +235,7 @@ ok=$1 bad_id=$2 lost=$3 bad_addr=$4
 tcp_pipe="$(python3 "$tmp/tcpclient.py" "$LPORT" pipeline 2>&1)"
 tcp_big="$(python3 "$tmp/tcpclient.py" "$LPORT" big 2>&1)"
 tcp_slow="$(python3 "$tmp/tcpclient.py" "$LPORT" slow 2>&1)"
+tcp_many="$(python3 "$tmp/tcpclient.py" "$LPORT" many 2>&1)"
 wait "$IDLE"
 tcp_idle="$(cat "$tmp/idle.txt")"
 # Тишина: ожиданий в пути нет, соединения TCP закрыты по простою — резолверу не на что
@@ -262,10 +278,11 @@ check "TCP: конвейер из трёх запросов одной запи�
     "3 5" "$tcp_pipe"
 check "TCP: ответ больше 4 КБ (300 записей) пришёл целиком" "4826 300" "$tcp_big"
 check "TCP: медленный клиент не держит цикл — UDP и другое соединение отвечают" "1 1" "$tcp_slow"
+check "TCP: сто соединений одновременно (прежний предел 32) — все ответы пришли" "100" "$tcp_many"
 check "TCP: соединение без запросов закрыто по простою" "closed" "$tcp_idle"
 check "в тишине резолвер не просыпается (добровольных переключений за 3 с не больше одного)" \
     "ok" "$quiet"
-check "TCP: наверх по TCP ушли ровно вопросы клиентов TCP" "10" \
+check "TCP: наверх по TCP ушли ровно вопросы клиентов TCP" "110" \
     "$(cat "$tmp/up.txt.tcp" 2>/dev/null | wc -l | tr -d ' ')"
 
 # ---- --table-fd: таблица каналов из трубы демона, а не из спеки самим резолвером -----------
@@ -414,7 +431,7 @@ check "table-fd: нового демона нет за срок — резолв
 #        а её здесь нет — ответ пустой, а не настоящий AAAA мимо выхода (сам fake6 — dnsnft.sh);
 #   t4 — выход без IPv6 (tgws): пустой ответ сразу, клиент идёт по IPv4;
 # имя вне правил — настоящий AAAA как есть. Всё это — спека v2; та же спека записью v1 отвечает на
-# AAAA всех трёх пустым ответом, как до 1.9 (sp->dns.names_v4, spec.h), — проверка в конце.
+# AAAA тем же, что у v2 (перевод v1 → v2 IPv6 не отнимает) — проверка в конце.
 LPORT3=15302
 UPORT3=15365
 for n in r6 f6 t4; do printf '%s.test\n' "$n" > "$tmp/$n.lst"; done
@@ -432,10 +449,10 @@ printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
 '{"name":"f6","match":{"domains_files":["%s/f6.lst"]},"out":"vpn"},'\
 '{"name":"t4","match":{"domains_files":["%s/t4.lst"]},"out":"tg"}]}' \
     "$tmp" "$tmp" "$tmp" > "$tmp/spec6v1.json"
-tab6="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/spec6.json" 2>/dev/null)"
+tab6="$(STEER_NFT_INGRESS=1 "$BIN" dnsd-table --spec "$tmp/spec6.json" 2>/dev/null)"
 python3 "$tmp/upstream-aaaa.py" "$UPORT3" & UPID3=$!
 sleep 1
-STEER_NFT_COMPAT=modern "$BIN" dnsd --spec "$tmp/spec6.json" --state-dir "$tmp/state3" \
+STEER_NFT_INGRESS=1 "$BIN" dnsd --spec "$tmp/spec6.json" --state-dir "$tmp/state3" \
     --listen-port "$LPORT3" --upstream-port "$UPORT3" > "$tmp/log3" 2>&1 & DPID3=$!
 sleep 1
 if ! kill -0 "$DPID3" 2>/dev/null; then
@@ -446,11 +463,10 @@ a_f6="$(python3 "$tmp/qaaaa.py" "$LPORT3" f6.test)"
 a_t4="$(python3 "$tmp/qaaaa.py" "$LPORT3" t4.test)"
 a_out="$(python3 "$tmp/qaaaa.py" "$LPORT3" out.test)"
 kill "$DPID3" 2>/dev/null; wait "$DPID3" 2>/dev/null
-# Спека v1 с теми же каналами — тот же апстрим, свой резолвер. real-ip — главный случай: у спеки v2
-# он отдаёт настоящий AAAA и без ядра, у v1 ответ пустой.
+# Спека v1 с теми же каналами — тот же апстрим, свой резолвер: ответы те же, что у спеки v2.
 LPORT4=15303
-tab6v1="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/spec6v1.json" 2>/dev/null)"
-STEER_NFT_COMPAT=modern "$BIN" dnsd --spec "$tmp/spec6v1.json" --state-dir "$tmp/state4" \
+tab6v1="$(STEER_NFT_INGRESS=1 "$BIN" dnsd-table --spec "$tmp/spec6v1.json" 2>/dev/null)"
+STEER_NFT_INGRESS=1 "$BIN" dnsd --spec "$tmp/spec6v1.json" --state-dir "$tmp/state4" \
     --listen-port "$LPORT4" --upstream-port "$UPORT3" > "$tmp/log4" 2>&1 & DPID4=$!
 sleep 1
 v1_r6="$(python3 "$tmp/qaaaa.py" "$LPORT4" r6.test)"
@@ -467,11 +483,76 @@ check "AAAA: real-ip в выход с IPv6 — настоящий адрес (AN
 check "AAAA: fake-IP без карты fakeip6 в ядре — пустой ответ, не настоящий AAAA" "0" "$a_f6"
 check "AAAA: правило в выход без IPv6 — пустой ответ" "0" "$a_t4"
 check "AAAA: имя вне правил — настоящий адрес" "1" "$a_out"
-check "спека v1: в таблице все три — только 4" "4 4 4" \
+check "спека v1: семейства в таблице те же, что у v2" \
+    "$(printf '%s\n' "$tab6" | awk -F'|' 'NF > 4 { printf "%s%s", s, $4; s = " " }')" \
     "$(printf '%s\n' "$tab6v1" | awk -F'|' 'NF > 4 { printf "%s%s", s, $4; s = " " }')"
-check "спека v1: AAAA real-ip в выход с IPv6 — пустой ответ, как до 1.9" "0" "$v1_r6"
-check "спека v1: AAAA fake-IP в выход с IPv6 — пустой ответ" "0" "$v1_f6"
+check "спека v1: AAAA real-ip в выход с IPv6 — как у v2 (настоящий адрес)" "$a_r6" "$v1_r6"
+check "спека v1: AAAA fake-IP без карты fakeip6 — как у v2 (пустой ответ)" "$a_f6" "$v1_f6"
 check "спека v1: имя вне правил — настоящий адрес" "1" "$v1_out"
+
+# ---- политика семейства правила (R-154, docs/spec-v2.md: family, on_family_unavailable) -------
+# Тот же апстрим (на всё — настоящая запись), четыре правила real-ip (ядро резолверу не нужно):
+#   p4 — family: 4, выход с IPv6:       AAAA пуст, A — настоящий (ANCOUNT 1);
+#   p6 — family: 6, выход с IPv6:       AAAA настоящий, A пуст — не настоящий адрес мимо правила;
+#   pf — family: 6, выход без IPv6, запас (fallback): работает по IPv4 — AAAA пуст, A настоящий;
+#   pk — family: 6, выход без IPv6, block: имя не открывается — A и AAAA нулевые адреса.
+cat > "$tmp/qrr.py" <<'PY'
+import socket, struct, sys
+port, name, qtype = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+q = struct.pack('>HHHHHH', 0x7b7b, 0x0100, 1, 0, 0, 0)
+for l in name.split('.'): q += bytes([len(l)]) + l.encode()
+q += b'\x00' + struct.pack('>HH', qtype, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(q, ('127.0.0.1', port))
+try:
+    d, _ = s.recvfrom(2048)
+    n = struct.unpack('>H', d[6:8])[0]
+    qe = 12
+    while d[qe]: qe += 1 + d[qe]
+    qe += 5                                     # конец вопроса; дальше первая запись ответа
+    rd = b''
+    if n:
+        rl = struct.unpack('>H', d[qe + 10:qe + 12])[0]
+        rd = d[qe + 12:qe + 12 + rl]
+    print(n, 'zero' if n and not any(rd) else 'real' if n else '-')
+except socket.timeout:
+    print('timeout')
+PY
+for n in p4 p6 pf pk; do printf '%s.test\n' "$n" > "$tmp/$n.lst"; done
+printf '{"version":2,"lan":{"addr":["127.0.0.0/8"]},'\
+'"lists":{"p4":{"domains_file":"%s/p4.lst"},"p6":{"domains_file":"%s/p6.lst"},'\
+'"pf":{"domains_file":"%s/pf.lst"},"pk":{"domains_file":"%s/pk.lst"}},'\
+'"outputs":{"vpn":{"kind":"interface","device":"lo"},"tg":{"kind":"tgws","domain":"example.com"}},'\
+'"rules":[{"name":"p4","to":"p4","out":"vpn","resolve":"realip","family":"4"},'\
+'{"name":"p6","to":"p6","out":"vpn","resolve":"realip","family":"6"},'\
+'{"name":"pf","to":"pf","out":"tg","resolve":"realip","family":"6"},'\
+'{"name":"pk","to":"pk","out":"tg","resolve":"realip","family":"6","on_family_unavailable":"block"}]}' \
+    "$tmp" "$tmp" "$tmp" "$tmp" > "$tmp/specfam.json"
+tabfam="$(STEER_NFT_INGRESS=1 "$BIN" dnsd-table --spec "$tmp/specfam.json" 2>/dev/null)"
+LPORT5=15304
+python3 "$tmp/upstream-aaaa.py" "$UPORT3" & UPID5=$!
+sleep 1
+STEER_NFT_INGRESS=1 "$BIN" dnsd --spec "$tmp/specfam.json" --state-dir "$tmp/state5" \
+    --listen-port "$LPORT5" --upstream-port "$UPORT3" > "$tmp/log5" 2>&1 & DPID5=$!
+sleep 1
+if ! kill -0 "$DPID5" 2>/dev/null; then
+    echo "FAIL резолвер (семейство) не поднялся:"; cat "$tmp/log5"; exit 1
+fi
+fq() { python3 "$tmp/qrr.py" "$LPORT5" "$1" "$2"; }
+fam_p4="$(fq p4.test 1) / $(fq p4.test 28)"
+fam_p6="$(fq p6.test 1) / $(fq p6.test 28)"
+fam_pf="$(fq pf.test 1) / $(fq pf.test 28)"
+fam_pk="$(fq pk.test 1) / $(fq pk.test 28)"
+kill "$DPID5" 2>/dev/null; wait "$DPID5" 2>/dev/null
+kill "$UPID5" 2>/dev/null; wait "$UPID5" 2>/dev/null
+
+check "таблица: семейства правил с политикой — 4, 6, 4 (запас), 6 с блоком (режим 2); режим real-ip — 1" \
+    "p4:4:1 p6:6:1 pf:4:1 pk:6:2" \
+    "$(printf '%s\n' "$tabfam" | awk -F'|' 'NF > 4 { printf "%s%s:%s:%s", s, $5, $4, $3; s = " " }')"
+check "family: 4 — A настоящий, AAAA пуст" "1 real / 0 -" "$fam_p4"
+check "family: 6 — A пуст (не настоящий адрес мимо правила), AAAA настоящий" "0 - / 1 real" "$fam_p6"
+check "family: 6, выход без IPv6, fallback — по IPv4: A настоящий, AAAA пуст" "1 real / 0 -" "$fam_pf"
+check "family: 6, выход без IPv6, block — A и AAAA нулевые" "1 zero / 1 zero" "$fam_pk"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

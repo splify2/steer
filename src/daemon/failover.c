@@ -2,8 +2,7 @@
  *
  * Один проход по вызову (failover_pass), состояние — в маршрутных таблицах ядра, в
  * реестре и в памяти сторожа между проходами (active, latency, restart-*). «Раз в минуту» —
- * дело того, кто проход зовёт: init-скрипт кругом `steer failover`, `failover --loop`
- * (watch.c) или демон с --watch (watchd.c). Где лежит память между проходами — файлы или
+ * дело того, кто проход зовёт: демон с --watch (watchd.c) или одиночный `steer failover`. Где лежит память между проходами — файлы или
  * память демона, — решает тот же вызывающий, см. fostate.h.
  *
  * Кандидаты выхода — у группы (kind: group, src/kinds/group.c) её члены по порядку, у выхода с
@@ -45,6 +44,7 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include "spec.h"
+#include "procscan.h"
 #include "awg.h"
 #include "run.h"
 #include "rtnl.h"
@@ -82,6 +82,7 @@ static void routes_show(int table, char *out, size_t n);
 static void rules6_show(char *out, size_t n);
 static void routes6_show(int table, char *out, size_t n);
 static char *rules_dump(int fam);
+static char *routes_dump(int fam, int table);
 
 /* Адрес источника устройства: без него правило пробы не к чему привязать, а само
  * отсутствие адреса уже означает, что устройство не готово нести трафик. */
@@ -256,7 +257,7 @@ struct fo_hsrc fo_hsrc_files = { &files_hops };
 #define TCP_PROBE_TIMEOUT 4
 
 /* Шов замера — симметрично шву здоровья и по той же причине: стенду нужно задавать
- * задержки кандидатов, не поднимая сокетов. В бою указатель NULL и меряет device_latency.
+ * задержки кандидатов, не поднимая сокетов. В бою указатель NULL и меряет folat_member (folat.c).
  * Объявление (extern) — в failover_int.h: его присваивает tests/failovermatch.c. */
 int (*g_latency_probe)(const struct spec *, const struct output *, const char *);
 
@@ -313,8 +314,8 @@ const struct output *out_for_device(const struct spec *sp, const struct output *
  * остальное — пробой ICMP. */
 int (*g_health_probe)(const struct spec *, const struct output *, const char *);
 
-/* Работает ли обход (zapret_running) и жив ли обработчик очереди (nfqws_on_queue) — вопросы к
- * процессам nfqws, они в kinds/zapret.c. */
+/* Работает ли системный обход (любой nfqws) — нужен on_fail=zapret у выходов с устройством. */
+static int zapret_running(void) { return proc_cmdline_find("nfqws", 0); }
 
 /* Куда направить таблицу выхода, когда живых устройств нет.
  *
@@ -333,6 +334,8 @@ int (*g_health_probe)(const struct spec *, const struct output *, const char *);
  * последнего слова (стенд failovermatch сверяет её строкой); fam 6 — `ip -6 rule` (маршрутизация
  * IPv6, docs/architecture.md, «4б»): та же метка, тот же номер таблицы — у IPv6 свой набор таблиц,
  * и номер не пересекается с таблицами IPv4 ничем, кроме числа. */
+int (*g_route_hook)(const char *const argv[]);
+
 static int rule_cmd(int fam, const char *verb, unsigned mark, const char *mask, int table,
                     const char *pref) {
     char m[40], t[16];
@@ -350,7 +353,10 @@ static int rule_cmd(int fam, const char *verb, unsigned mark, const char *mask, 
     argv[k++] = t;
     if (pref) { argv[k++] = "priority"; argv[k++] = pref; }
     argv[k] = NULL;
-    return run_quiet(argv);
+    /* Сообщением rtnetlink, а не процессом ip (route_put ниже); слова команды — шву стенда. */
+    if (g_route_hook) return g_route_hook(argv);
+    return rtnl_rule_mark(!strcmp(verb, "add"), fam, mark, (uint32_t)strtoul(mask, NULL, 0), table,
+                          pref ? atoi(pref) : 0);
 }
 
 static void rule_add_fam(int fam, unsigned mark, int table) {
@@ -424,24 +430,14 @@ void conntrack_evict(unsigned mark) {
 }
 
 void rule_drop(unsigned mark, int table) {
-    char m[32], legacy[24], t[16];
-    snprintf(m, sizeof(m), "0x%08x/0x%08x", mark, STEER_MARK_MASK);
-    snprintf(legacy, sizeof(legacy), "0x%08x", mark);
-    snprintf(t, sizeof(t), "%d", table);
-    /* В цикле, потому что `ip rule add` дубликаты не проверяет и копий может быть
-     * несколько; до отказа — он и означает «больше таких нет». */
-    const char *del[] = { "ip", "rule", "del", "fwmark", m, "table", t, NULL };
-    while (run_quiet(del) == 0) ;
-    /* Прежняя форма БЕЗ маски: она осталась в ядре от версии до R-094. Снять её обязан
-     * тот же вызов — иначе на одну метку легли бы два правила, и какое из них поймает
-     * пакет, решал бы приоритет, а не замысел. Через несколько версий строку можно
-     * убрать; пока роутеры обновляются, она и есть весь механизм перехода. */
-    const char *dell[] = { "ip", "rule", "del", "fwmark", legacy, "table", t, NULL };
-    while (run_quiet(dell) == 0) ;
+    char mk[16];
+    snprintf(mk, sizeof(mk), "0x%08x", STEER_MARK_MASK);
+    /* В цикле, потому что копий может быть несколько (их ставил прежний `ip rule add` без
+     * проверки дубликатов); до отказа — он и означает «больше таких нет». */
+    while (rule_cmd(4, "del", mark, mk, table, NULL) == 0) ;
 }
 
-/* Правило IPv6 выхода — снять все копии. Прежней формы без маски у IPv6 не бывало: правила IPv6
- * движок ставит только с 1.9, сразу с маской. */
+/* Правило IPv6 выхода — снять все копии. */
 void rule_drop6(unsigned mark, int table) {
     char mk[16];
     snprintf(mk, sizeof(mk), "0x%08x", STEER_MARK_MASK);
@@ -473,7 +469,7 @@ void route6_flush(int table) {
  * месте (и тип тоже: blackhole на устройство и обратно, проверено на 6.8 и 4.9), поэтому
  * таблица не бывает пустой ни на миг; всё лишнее, что в ней было, снимается ПОСЛЕ. Правило не
  * снимается вовсе, если оно уже стоит: недостающее добавляется, а лишние копии и прежние формы
- * (без маски, не на своём приоритете) снимаются после того, как верная копия есть. Одинаковые
+ * (не на своём приоритете) снимаются после того, как верная копия есть. Одинаковые
  * правила в ядре ничего не решают друг за друга, так что «сначала добавить, потом снять» —
  * это и есть «ровно одна копия без мгновения, когда нет ни одной».
  *
@@ -486,7 +482,20 @@ void route6_flush(int table) {
  * снимались точно, по приоритету, а не «первая попавшаяся». wrong[] — наше правило на чужом
  * приоритете: осталось от сборки, где приоритет выбирало ядро. Чистая функция — стенд
  * failovermatch. */
-/* struct rule_copies и RULE_COPIES_MAX — в failover_int.h: их читает и стенд failovermatch. */
+/* struct rule_copies — в failover_int.h: их читает и стенд failovermatch. */
+static void copies_add(unsigned long **v, int *n, unsigned long pref, int *oom) {
+    unsigned long *g = realloc(*v, ((size_t)*n + 1) * sizeof(**v));
+    if (!g) { *oom = 1; return; }
+    *v = g;
+    g[(*n)++] = pref;
+}
+
+void rule_copies_free(struct rule_copies *c) {
+    free(c->pref);
+    free(c->wrong);
+    memset(c, 0, sizeof(*c));
+}
+
 struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
     struct rule_copies c;
     memset(&c, 0, sizeof c);
@@ -494,13 +503,21 @@ struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
     if (!c.known) return c;
     char want_tbl[16];
     snprintf(want_tbl, sizeof(want_tbl), "%d", table);
+    /* Строка правила копируется целиком в буфер, растущий по самой длинной: правило со многими
+     * условиями не теряет хвост с «lookup» (раньше — 512 байт) и не перестаёт быть копией. */
+    char *line = NULL;
+    size_t lcap = 0;
     for (const char *ln = rules; ln && *ln; ) {
         const char *end = strchr(ln, '\n');
         size_t len = end ? (size_t)(end - ln) : strlen(ln);
-        char line[512];
-        size_t n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
-        memcpy(line, ln, n);
-        line[n] = '\0';
+        if (len + 1 > lcap) {
+            char *g = realloc(line, len + 1);
+            if (!g) { c.oom = 1; break; }
+            line = g;
+            lcap = len + 1;
+        }
+        memcpy(line, ln, len);
+        line[len] = '\0';
         ln = end ? end + 1 : NULL;
 
         char *stop = NULL;
@@ -510,10 +527,8 @@ struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
         if (!fm) continue;
         unsigned long got = strtoul(fm + 7, &stop, 16);
         if (!stop || (uint32_t)got != mark) continue;
-        /* Без маски — прежняя форма (ядро печатает маску 0xffffffff никак). Её снимают, но не
-         * считают верной копией — см. rule_ensure. */
-        int legacy = *stop != '/';
-        if (!legacy && (uint32_t)strtoul(stop + 1, NULL, 16) != STEER_MARK_MASK) continue;
+        /* Без маски — не наше правило (прежнюю форму без маски движок не ставит с R-094). */
+        if (*stop != '/' || (uint32_t)strtoul(stop + 1, NULL, 16) != STEER_MARK_MASK) continue;
         const char *lk = strstr(line, "lookup ");
         if (!lk) continue;
         const char *t = lk + 7;
@@ -522,17 +537,13 @@ struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
         for (size_t i = 0; i < tl; i++)
             if (!isdigit((unsigned char)t[i])) numeric = 0;
         if (numeric && (tl != strlen(want_tbl) || strncmp(t, want_tbl, tl) != 0)) continue;
-        if (legacy) {
-            if (c.legacy_n < RULE_COPIES_MAX) c.legacy[c.legacy_n++] = pref;
-            continue;
-        }
         if (STEER_RULE_PREF && pref != (unsigned long)STEER_RULE_PREF) {
-            if (c.wrong_n < RULE_COPIES_MAX) c.wrong[c.wrong_n++] = pref;
+            copies_add(&c.wrong, &c.wrong_n, pref, &c.oom);
             continue;
         }
-        if (c.n < RULE_COPIES_MAX) c.pref[c.n] = pref;
-        c.n++;
+        copies_add(&c.pref, &c.n, pref, &c.oom);
     }
+    free(line);
     return c;
 }
 
@@ -547,36 +558,22 @@ static void rule_del_at(int fam, unsigned mark, int table, unsigned long pref) {
 
 /* Правило одного семейства — ровно одной копией (см. rule_ensure ниже). */
 static void rule_ensure_fam(int fam, unsigned mark, int table) {
-    /* Статический и с запасом — по той же причине, что в route_facts_read: это ВСЕ правила
+    /* Дамп в куче любой длины — по той же причине, что в route_facts_read: это ВСЕ правила
      * коробки, и обрезанный дамп значил бы «нашего нет» и лишнюю копию. */
     char *rules = rules_dump(fam);
     if (!rules) return;
     struct rule_copies c = rule_copies_of(rules, mark, table);
     free(rules);
+    /* Нет памяти под список — копии неполны: добавляем, если верной нет, но ничего не снимаем. */
+    if (c.oom) c.n = c.wrong_n = 0;
     /* Прочитать не вышло (нет ip, отказал popen) — добавляем, ничего не снимая: лишняя копия
      * того же правила ничего не меняет в маршрутизации, а снятие вслепую могло бы оставить
      * метку без правила — то есть ту самую утечку, ради которой всё это. */
     if (!c.known || c.n == 0) rule_add_fam(fam, mark, table);
     /* Верная копия есть (или только что добавлена) — теперь можно убирать лишнее. */
-    for (int k = 1; k < c.n && k < RULE_COPIES_MAX; k++) rule_del_at(fam, mark, table, c.pref[k]);
+    for (int k = 1; k < c.n; k++) rule_del_at(fam, mark, table, c.pref[k]);
     for (int k = 0; k < c.wrong_n; k++) rule_del_at(fam, mark, table, c.wrong[k]);
-    if (fam == 6) return;           /* прежней формы без маски у IPv6 не бывало */
-    /* Прежняя форма без маски — см. rule_drop. Снимается после того, как форма с маской есть, и
-     * ТОЛЬКО с явной маской 0xffffffff (так её хранит ядро) и приоритетом. `ip rule del fwmark X
-     * table T` без маски на ядре 4.9 (телефон) снимает ЛЮБОЕ правило с меткой X — и с нашей
-     * маской тоже: маска там сравнивается, только если её назвали. rule_drop это не задевало
-     * (он снимает обе формы по замыслу), а здесь сняло бы только что поставленное верное правило
-     * — то есть метка осталась бы без правила, а трафик ушёл бы напрямую; поймал стенд legacy49
-     * на ядре 4.9. Не прочитав дамп, прежнюю форму не трогаем вовсе. */
-    char legacy[40], t[16], p[24];
-    snprintf(legacy, sizeof(legacy), "0x%08x/0xffffffff", mark);
-    snprintf(t, sizeof(t), "%d", table);
-    for (int k = 0; k < c.legacy_n; k++) {
-        snprintf(p, sizeof(p), "%lu", c.legacy[k]);
-        const char *dell[] = { "ip", "rule", "del", "fwmark", legacy, "table", t,
-                               "priority", p, NULL };
-        run_quiet(dell);
-    }
+    rule_copies_free(&c);
 }
 
 void rule_ensure(unsigned mark, int table) {
@@ -647,18 +644,16 @@ static int rt_line_parse(const char *line, struct rt_line *r) {
  * Только у IPv6. У IPv4 запрет остаётся blackhole: переходить клиенту с IPv4 некуда, и «сразу или
  * по таймауту» там ничего не меняет, а смена задела бы запрет каждого выхода на каждом роутере.
  * Сверка сторожа запрет любого вида читает одинаково (route_facts_of: blackhole, unreachable и
- * prohibit — «запрет»), а запасной запрет прежней версии (blackhole с той же метрикой) снимает
- * table_prune_fam ниже: для IPv6 он больше не «свой» запасной, а лишняя запись таблицы. */
+ * prohibit — «запрет»). */
 static const char *table_bh_type(int fam) {
     return fam == 6 ? "prohibit" : "blackhole";
 }
 
 static void table_prune_fam(int fam, int table, const char *dev, int backstop) {
-    static char routes[8192];
     char t[16];
     snprintf(t, sizeof(t), "%d", table);
-    if (fam == 6) routes6_show(table, routes, sizeof(routes));
-    else routes_show(table, routes, sizeof(routes));
+    char *routes = routes_dump(fam, table);
+    if (!routes) return;                /* не прочитать — не убираем вслепую */
     unsigned long main_metric = fam == 6 ? RT6_METRIC_DEFAULT : 0;
     int kept = 0;
     for (const char *ln = routes; ln && *ln; ) {
@@ -694,6 +689,19 @@ static void table_prune_fam(int fam, int table, const char *dev, int backstop) {
         argv[k] = NULL;
         run_quiet(argv);
     }
+    free(routes);
+}
+
+/* Маршрут по умолчанию таблицы выхода — сообщением rtnetlink, а не процессом `ip`: привязка выхода
+ * (apply, сторож, помощник поднялся) запускала `ip` на каждый маршрут — до четырёх на выход с IPv6.
+ * argv — та же команда словами: её получает шов стенда g_route_hook (failovermatch сверяет команды
+ * строкой). Отказ — errno вместо кода `ip`; вызывающие смотрят только на «не 0». */
+static int route_put(const char *const argv[], int fam, int table, int type, const char *dev,
+                     int metric) {
+    if (g_route_hook) return g_route_hook(argv);
+    int ifindex = 0;
+    if (type == RTN_UNICAST && !(ifindex = (int)if_nametoindex(dev))) return ENODEV;
+    return rtnl_route_default(fam, table, type, ifindex, metric);
 }
 
 /* Поставить запасной запрет (см. STEER_BACKSTOP_METRIC в spec.h). Заменой: стоящий такой же
@@ -706,7 +714,8 @@ static void backstop_set_fam(int fam, int table) {
                          "table", t, NULL };
     const char *bs6[] = { "ip", "-6", "route", "replace", table_bh_type(6), "default", "metric",
                           m, "table", t, NULL };
-    run_quiet(fam == 6 ? bs6 : bs);
+    if (fam == 6) route_put(bs6, 6, table, RTN_PROHIBIT, NULL, STEER_BACKSTOP_METRIC);
+    else route_put(bs, 4, table, RTN_BLACKHOLE, NULL, STEER_BACKSTOP_METRIC);
 }
 
 static void backstop_set(int table) { backstop_set_fam(4, table); }
@@ -723,11 +732,14 @@ int table_bind(const struct output *o, const char *dev) {
     if (backstop) backstop_set(o->table);
     const char *to_dev[] = { "ip", "route", "replace", "default", "dev", dev, "table", t, NULL };
     const char *to_bh[] = { "ip", "route", "replace", "blackhole", "default", "table", t, NULL };
-    int rc = run_quiet(dev ? to_dev : to_bh);
+    int rc = dev ? route_put(to_dev, 4, o->table, RTN_UNICAST, dev, 0)
+                 : route_put(to_bh, 4, o->table, RTN_BLACKHOLE, NULL, 0);
     if (rc != 0) return rc;
     /* Без on_fail=drop запасной запрет снимается здесь же: режим мог смениться с drop, а
      * пустая таблица у direct/zapret — обещанное «напрямую», а не утечка. */
     table_prune(o->table, dev, backstop);
+    /* TCP выхода — за маршрутом: к слушателю модуля этого устройства или никуда из карты. */
+    tcp_redir_sync(o, dev);
     return 0;
 }
 
@@ -751,11 +763,12 @@ static int table_bind6(const struct output *o, const char *dev) {
                              NULL };
     const char *to_bh[] = { "ip", "-6", "route", "replace", table_bh_type(6), "default", "table",
                             t, NULL };
-    int rc = run_quiet(dev ? to_dev : to_bh);
+    int rc = dev ? route_put(to_dev, 6, o->table, RTN_UNICAST, dev, 0)
+                 : route_put(to_bh, 6, o->table, RTN_PROHIBIT, NULL, 0);
     if (rc != 0 && dev) {
         /* Устройство IPv6 не несёт (выключен на нём IPv6) или исчезло. Прежний маршрут в
          * другое устройство оставлять нельзя — IPv6 ушёл бы не туда; запрет на его место. */
-        if (run_quiet(to_bh) == 0) table_prune_fam(6, o->table, NULL, 1);
+        if (route_put(to_bh, 6, o->table, RTN_PROHIBIT, NULL, 0) == 0) table_prune_fam(6, o->table, NULL, 1);
         return rc;
     }
     if (rc != 0) return rc;
@@ -795,6 +808,130 @@ void failopen_mark(const struct output *o, int on) {
     run_quiet(cmd);
 }
 
+/* ---- TCP клиентов — к слушателю модуля (R-152; правила — build_tcp_redir в generate.c) -------
+ *
+ * Карта TCP_REDIR_MAP: метка выхода → порт слушателя модуля, в чьё устройство таблица выхода
+ * сейчас привязана. Элемент ведётся вместе с маршрутом: таблица выхода в устройство модуля с
+ * KC_TCP_REDIR — элемент с его портом, в другое устройство, в запрет или пуста — элемента нет, и
+ * TCP выхода идёт по маршруту (on_fail решает так же, как прежде). У группы метка своя, а порт —
+ * члена, на котором она стоит, поэтому порт ищется по устройству, а не по выходу.
+ *
+ * Устройство → порт: из спеки этого процесса (tcp_redir_learn зовут там же, где спеку получают
+ * метки реестра: демон, apply, команды сторожа). Копией, а не указателем: спеку демон меняет
+ * целиком (steerd_load), и указатель пережил бы её. */
+struct redir_dev {
+    char dev[sizeof(((struct output *)0)->device)];
+    int port;
+};
+static struct redir_dev *g_redir;
+static size_t g_redir_n;
+/* Что этот процесс поставил в карту: метка → порт. Нужно tcp_redir_dev_gone — снять элементы,
+ * ведущие к слушателю умершего модуля, не перебирая выходы и маршруты. */
+struct redir_el {
+    unsigned mark;
+    int port;
+};
+static struct redir_el *g_rel;
+static size_t g_rel_n, g_rel_cap;
+
+static void rel_note(unsigned mark, int port) {
+    for (size_t i = 0; i < g_rel_n; i++)
+        if (g_rel[i].mark == mark) {
+            if (port) g_rel[i].port = port;
+            else g_rel[i] = g_rel[--g_rel_n];
+            return;
+        }
+    if (!port) return;
+    if (g_rel_n == g_rel_cap) {
+        size_t nc = g_rel_cap ? g_rel_cap * 2 : 8;
+        struct redir_el *v = realloc(g_rel, nc * sizeof(*v));
+        if (!v) return;
+        g_rel = v;
+        g_rel_cap = nc;
+    }
+    g_rel[g_rel_n++] = (struct redir_el){ mark, port };
+}
+
+void tcp_redir_learn(const struct spec *sp) {
+    size_t n = 0;
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (sp->out[i].mark && sp->out[i].device[0] && out_has_cap(&sp->out[i], KC_TCP_REDIR)) n++;
+    struct redir_dev *v = n ? calloc(n, sizeof(*v)) : NULL;
+    if (n && !v) return;                /* прежняя таблица остаётся: лучше старое, чем ничего */
+    size_t k = 0;
+    for (size_t i = 0; i < sp->out_n && k < n; i++) {
+        const struct output *o = &sp->out[i];
+        if (!o->mark || !o->device[0] || !out_has_cap(o, KC_TCP_REDIR)) continue;
+        snprintf(v[k].dev, sizeof(v[k].dev), "%s", o->device);
+        v[k].port = out_tcp_port(o);
+        k++;
+    }
+    free(g_redir);
+    g_redir = v;
+    g_redir_n = k;
+}
+
+static int redir_port(const char *dev) {
+    for (size_t i = 0; dev && i < g_redir_n; i++)
+        if (!strcmp(g_redir[i].dev, dev)) return g_redir[i].port;
+    return 0;
+}
+
+/* Элемент выхода o — под таблицу, привязанную к dev (NULL — к запрету или пустая). Без выходов с
+ * KC_TCP_REDIR в спеке карты нет, и nft не зовётся вовсе. Замена — одной транзакцией (delete и
+ * add в одной команде nft): элемент с другим портом `add` не перепишет, а снятие отдельной
+ * командой оставило бы миг, когда TCP выхода идёт мимо слушателя. Нет элемента — эта транзакция
+ * отказывает целиком, и тогда простой add. */
+static void redir_set(unsigned mark, int port) {
+    char tbl[64], cmd[256];
+    snprintf(tbl, sizeof(tbl), "inet %s " TCP_REDIR_MAP, nft_table());
+    rel_note(mark, port);
+    if (!port) {
+        snprintf(cmd, sizeof(cmd), "delete element %s { 0x%08x }", tbl, mark);
+        const char *del[] = { "nft", cmd, NULL };
+        run_quiet(del);
+        return;
+    }
+    snprintf(cmd, sizeof(cmd), "delete element %s { 0x%08x }; add element %s { 0x%08x : %d }", tbl,
+             mark, tbl, mark, port);
+    const char *swap[] = { "nft", cmd, NULL };
+    if (run_quiet(swap) == 0) return;
+    snprintf(cmd, sizeof(cmd), "add element %s { 0x%08x : %d }", tbl, mark, port);
+    const char *add[] = { "nft", cmd, NULL };
+    run_quiet(add);
+}
+
+void tcp_redir_sync(const struct output *o, const char *dev) {
+    if (!g_redir_n || !o->mark || !out_has_device(o)) return;
+    redir_set(o->mark, redir_port(dev));
+}
+
+/* Модуль устройства dev вышел: его слушателя больше нет. Ядро в тот же миг вычищает маршруты в
+ * исчезнувшее устройство, и таблица выхода пустеет (или держит запасной запрет) до решения
+ * сторожа; элементы карты, ведущие к этому порту, снимаются так же сразу — иначе до прохода
+ * сторожа TCP выхода получал бы сброс от закрытого порта, а не то, что решает on_fail. */
+void tcp_redir_dev_gone(const char *dev) {
+    int port = redir_port(dev);
+    if (!port) return;
+    for (size_t i = g_rel_n; i-- > 0;)
+        if (g_rel[i].port == port) redir_set(g_rel[i].mark, 0);
+}
+
+/* Новый набор правил приходит с пустой картой, а привязка apply идёт до его загрузки: элементы
+ * возвращаются по таблицам выходов, как они стоят в ядре (тот же приём, что failopen_after_load
+ * в apply.c). */
+static struct route_facts route_facts_read(const struct output *o);
+
+void tcp_redir_after_load(const struct spec *sp) {
+    if (!g_redir_n) return;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if (!o->mark || !out_has_device(o)) continue;
+        struct route_facts f = route_facts_read(o);
+        if (f.known && f.table == TBL_DEV) tcp_redir_sync(o, f.dev);
+    }
+}
+
 /* ---- IPv6 от хоста: префикс донора (шаг 8 выпуска 1.10; устройство — spec.h, enum out_ipv6) ---
  *
  * ОТКУДА ПРЕФИКС, КОГДА `prefix:` НЕ ЗАПИСАН. Раздачу IPv6 ведёт netifd по настройке человека:
@@ -821,25 +958,30 @@ void failopen_mark(const struct output *o, int on) {
  * интерфейс туннеля, — часто позже, чем встал движок, — а человек может сменить ip6prefix, не
  * трогая спеку. Проход идёт и по событию адреса IPv6 (watchd слушает RTMGRP_IPV6_IFADDR), так что
  * набор догоняет netifd за секунды. */
-#define V6_LAN_ADDRS 32
-
 int v6donor_derive(const struct spec *sp, const struct output *d, struct v6pfx *p) {
     memset(p, 0, sizeof(*p));
-    static struct rtnl_route6 rt[256];
-    int n = rtnl_main6_routes(rt, sizeof(rt) / sizeof(rt[0]));
-    if (n <= 0) return 0;
-    uint8_t lan[V6_LAN_ADDRS][16];
-    size_t ln = 0;
+    struct rtnl_route6 *rt = NULL;
+    int n = rtnl_main6_routes(&rt);
+    if (n <= 0) { free(rt); return 0; }
+    uint8_t (*lan)[16] = NULL;
+    size_t ln = 0, lcap = 0;
     struct ifaddrs *ifa = NULL;
-    if (getifaddrs(&ifa) != 0) return 0;
-    for (struct ifaddrs *a = ifa; a && ln < V6_LAN_ADDRS; a = a->ifa_next) {
+    if (getifaddrs(&ifa) != 0) { free(rt); return 0; }
+    for (struct ifaddrs *a = ifa; a; a = a->ifa_next) {
         if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET6 || !a->ifa_name) continue;
         const uint8_t *x = ((const struct sockaddr_in6 *)a->ifa_addr)->sin6_addr.s6_addr;
         if ((x[0] & 0xfe) == 0xfc || (x[0] == 0xfe && (x[1] & 0xc0) == 0x80) || x[0] == 0xff)
             continue;                        /* ULA, link-local, multicast */
         int ours = 0;
         for (size_t i = 0; i < sp->lan_dev_n && !ours; i++) ours = !strcmp(a->ifa_name, sp->lan_dev[i]);
-        if (ours) memcpy(lan[ln++], x, 16);
+        if (!ours) continue;
+        if (ln == lcap) {
+            uint8_t (*g)[16] = realloc(lan, (lcap ? lcap * 2 : 16) * sizeof(*lan));
+            if (!g) { free(lan); free(rt); freeifaddrs(ifa); return 0; }
+            lan = g;
+            lcap = lcap ? lcap * 2 : 16;
+        }
+        memcpy(lan[ln++], x, 16);
     }
     freeifaddrs(ifa);
     int donor_if = d->device[0] ? (int)if_nametoindex(d->device) : 0;
@@ -871,6 +1013,8 @@ int v6donor_derive(const struct spec *sp, const struct output *d, struct v6pfx *
         if (fn < 4) found[fn] = c;
         fn++;
     }
+    free(lan);
+    free(rt);
     if (fn == 1) { *p = found[0]; return 1; }
     return fn ? -1 : 0;
 }
@@ -953,6 +1097,7 @@ static void apply_failed(const struct output *o, int announce) {
     rule_drop(o->mark, o->table);
     const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
     run_quiet(flush);
+    tcp_redir_sync(o, NULL);
     /* IPv6 — так же: правило снято, таблица пуста, IPv6 выхода идёт напрямую, как и IPv4. */
     if (out_route6(o)) {
         rule_drop6(o->mark, o->table);
@@ -1062,6 +1207,7 @@ void bind_device(struct output *o, const char *dev) {
             const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
             run_quiet(flush);
             if (out_route6(o)) route6_flush(o->table);
+            tcp_redir_sync(o, NULL);
             failopen_mark(o, 1);
         }
     }
@@ -1157,12 +1303,8 @@ struct route_facts route_facts_of(const char *rules, const char *routes,
         /* Маска обязана быть НАШЕЙ, и это проверка в обе стороны.
          *
          * Чужая маска (`fwmark 0x100000/0xff`) поймает не тот трафик: согласиться с таким
-         * правилом значило бы не поставить своё. Отсутствие маски — тоже не наше, хотя
-         * раньше было единственной нашей формой: правило без маски осталось в ядре от
-         * версии до R-094, и если считать его верным, сторож не тронет его никогда, то
-         * есть обновление не доедет. Считая его чужим, сторож пересоздаёт привязку, а
-         * rule_drop снимает обе формы — и через минуту после обновления в ядре остаётся
-         * только правило с маской.
+         * правилом значило бы не поставить своё. Отсутствие маски — тоже не наше: движок
+         * ставит правило только с маской.
          *
          * Ядро печатает маску без ведущих нулей (`0x100000/0xff00000`) — форма проверена
          * на живом роутере, см. RULES_WITH в tests/failovermatch.c. */
@@ -1302,20 +1444,31 @@ int (*g_ip_show)(int table, char *out, size_t n);
 
 static void rules_show(char *out, size_t n) {
     out[0] = '\0';
-    if (g_ip_show) { g_ip_show(-1, out, n); return; }
-    rtnl_rules_text(out, n);
+    if (g_ip_show) g_ip_show(-1, out, n);
 }
 
 static void routes_show(int table, char *out, size_t n) {
     out[0] = '\0';
-    if (g_ip_show) { g_ip_show(table, out, n); return; }
-    rtnl_routes_text(table, out, n);
+    if (g_ip_show) g_ip_show(table, out, n);
+}
+
+/* IPv6 — тем же приёмом. Стенд с g_ip_show без g_ip6_show получает пустой текст («не прочитать»). */
+int (*g_ip6_show)(int table, char *out, size_t n);
+
+static void rules6_show(char *out, size_t n) {
+    out[0] = '\0';
+    if (g_ip6_show) g_ip6_show(-1, out, n);
+}
+
+static void routes6_show(int table, char *out, size_t n) {
+    out[0] = '\0';
+    if (g_ip6_show) g_ip6_show(table, out, n);
 }
 
 /* Дамп правил семейства fam (4 или 6) — строка в куче любой длины, free вызывающему (пустая
  * строка — «не прочитать»). Правил на коробке по одному-два на выход и десятки чужих (mwan3, fw4,
- * чужие туннели); буфер в 16 КиБ обрезал бы дамп на сотне выходов, и «нашего правила нет» вело бы
- * к лишней копии каждый проход. Швы стенда (g_ip_show) отвечают в буфер, для них — мегабайт. */
+ * чужие туннели); обрезанный дамп значил бы «нашего правила нет» и лишнюю копию каждый проход.
+ * Швы стенда (g_ip_show) отвечают в буфер, для них — мегабайт. */
 static char *rules_dump(int fam) {
     if (g_ip_show || g_ip6_show) {
         size_t n = 1u << 20;
@@ -1329,21 +1482,19 @@ static char *rules_dump(int fam) {
     return b ? b : strdup("");
 }
 
-/* IPv6 — тем же приёмом. Стенд с g_ip_show без g_ip6_show получает пустой текст («не прочитать»). */
-int (*g_ip6_show)(int table, char *out, size_t n);
-
-static void rules6_show(char *out, size_t n) {
-    out[0] = '\0';
-    if (g_ip6_show) { g_ip6_show(-1, out, n); return; }
-    if (g_ip_show) return;
-    rtnl_rules_text6(out, n);
-}
-
-static void routes6_show(int table, char *out, size_t n) {
-    out[0] = '\0';
-    if (g_ip6_show) { g_ip6_show(table, out, n); return; }
-    if (g_ip_show) return;
-    rtnl_routes_text6(table, out, n);
+/* Маршруты таблицы выхода — так же: строка в куче любой длины, free вызывающему; пустая — таблица
+ * пуста, NULL — «не прочитать» (ошибка ядра, нехватка памяти): пустой дамп вместо этого сторож
+ * читал бы как опустевшую таблицу и перепривязывал выход. Обрезанный дамп был бы тем же. */
+static char *routes_dump(int fam, int table) {
+    if (g_ip_show || g_ip6_show) {
+        size_t n = 1u << 20;
+        char *b = malloc(n);
+        if (!b) return NULL;
+        if (fam == 6) routes6_show(table, b, n);
+        else routes_show(table, b, n);
+        return b;
+    }
+    return rtnl_routes_dup(table, fam == 6);
 }
 
 /* Включён ли IPv6 на устройстве: /proc/sys/net/ipv6/conf/<dev>/disable_ipv6. Файла нет — IPv6 в
@@ -1367,28 +1518,28 @@ int routing6_live_ok(const struct route_facts *f, const char *dev, int dev_v6) {
 }
 
 static struct route_facts route6_facts_read(const struct output *o) {
-    static char routes[8192];
     char *rules = rules_dump(6);
-    if (!rules) { struct route_facts none; memset(&none, 0, sizeof(none)); return none; }
-    routes6_show(o->table, routes, sizeof(routes));
-    struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+    char *routes = rules ? routes_dump(6, o->table) : NULL;
+    struct route_facts f;
+    if (rules && routes) f = route_facts_of(rules, routes, o->mark, o->table);
+    else memset(&f, 0, sizeof(f));
     free(rules);
+    free(routes);
     return f;
 }
 
 static struct route_facts route_facts_read(const struct output *o) {
-    /* Статические, и с запасом. Вывод `ip rule show` — это ВСЕ правила коробки, а не
-     * только наши: рядом живут mwan3, fw4 и чужие туннели, у которых правил бывают
-     * десятки. Обрезанный дамп означал бы «нашего правила нет» и пересоздание живой
-     * привязки каждую минуту — то есть короткий провал помеченного трафика на ровном
-     * месте. Статические: буферы большие, а проход однопоточный (в демоне — на цикле событий,
-     * по одному шагу за раз), и делить с ними стек незачем. */
-    static char routes[8192];
+    /* Вывод `ip rule show` — это ВСЕ правила коробки, а не только наши: рядом живут mwan3, fw4 и
+     * чужие туннели, у которых правил бывают десятки. Обрезанный дамп означал бы «нашего правила
+     * нет» и пересоздание живой привязки каждую минуту — то есть короткий провал помеченного
+     * трафика на ровном месте. Поэтому дампы в куче и любой длины. */
     char *rules = rules_dump(4);
-    if (!rules) { struct route_facts none; memset(&none, 0, sizeof(none)); return none; }
-    routes_show(o->table, routes, sizeof(routes));
-    struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+    char *routes = rules ? routes_dump(4, o->table) : NULL;
+    struct route_facts f;
+    if (rules && routes) f = route_facts_of(rules, routes, o->mark, o->table);
+    else memset(&f, 0, sizeof(f));
     free(rules);
+    free(routes);
     return f;
 }
 
@@ -1611,6 +1762,8 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
     for (size_t oi = 0; oi < on; oi++) {
         struct output *o = &sp->out[ord[oi]];
         if (!out_has_device(o)) continue;
+        /* Вид недоступен (нет плагина): устройства нет и не будет, выход живёт по on_fail. */
+        if (o->unavail) { o->failed = 1; continue; }
         char rec[32];
         active_get_st(st, o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
         /* «-» — сторож признал выход неработающим и поставил on_fail (out_finish): и у группы, и
@@ -1632,7 +1785,7 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
              * тридцатью двумя членами. */
             unsigned char *alive = g->alive;
             for (size_t k = 0; k < mn; k++)
-                alive[k] = !M(k)->failed && device_present(M(k)->device);
+                alive[k] = !M(k)->failed && device_present(M(k)->device) && fog_cc_allowed(o, M(k));
             /* Несущий член — как у прохода: по записи groups, пока группа не в отказе; записи
              * groups нет — по устройству из active. */
             int cur = -1;
@@ -1770,8 +1923,6 @@ static void fo_emit(fo_event_fn ev, void *arg, enum fo_ev_kind kind, const struc
  * короткого замыкания условия, не делается и здесь). Состояния ниже названы по местам прежнего
  * кода, где он ждал. Им же пользуются все, кто проход зовёт:
  *   - демон с --watch (watchd.c) — на своём цикле, fo_pass_start;
- *   - `steer failover --loop` (watch.c) — на своём цикле, тоже fo_pass_start: fork на проход
- *     ушёл и оттуда;
  *   - `steer failover` — failover_pass: заводит цикл, крутит его до конца прохода и выходит.
  *
  * Что по-прежнему синхронно: действия над ядром в конце шага выхода — привязка таблицы
@@ -1887,6 +2038,7 @@ struct fo_run {
         int ti, best, rule;
         char src[64];
         struct foprobe *p;
+        unsigned mark;                /* проба TCP: метка выхода с KC_TCP_REDIR (0 — через устройство) */
         const struct output *m;       /* замер: член группы (метка — у именованного) */
         struct folat_m *fm;           /* замер: идущий urltest члена (IPv4 и, если надо, IPv6) */
         int ms6;                      /* замер: итог по IPv6 (-2 — не мерили) */
@@ -1949,7 +2101,7 @@ static void hp_tcp_cb(void *arg, int ok, int ms);
 static int hp_tcp_next(struct fo_run *r) {
     for (; PROBE_TARGETS[r->hp.ti]; r->hp.ti++) {
         int ok = 0, ms = -1;
-        r->hp.p = foprobe_tcp(r->l, r->hp.dev, PROBE_TARGETS[r->hp.ti], TCP_PROBE_PORT,
+        r->hp.p = foprobe_tcp(r->l, r->hp.dev, r->hp.mark, PROBE_TARGETS[r->hp.ti], TCP_PROBE_PORT,
                               TCP_PROBE_TIMEOUT_MS, hp_tcp_cb, r, &ok, &ms);
         if (r->hp.p) return 1;
         if (hp_tcp_take(r, ok, ms)) return 0;
@@ -2037,6 +2189,9 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
     r->res = 0;
     if (!device_present(dev)) return 0;
     o = out_for_device(sp, o, dev);
+    /* TCP выхода с KC_TCP_REDIR завершает ядро и отдаёт слушателю модуля по метке (R-152) — проба идёт тем
+     * же путём, с меткой выхода устройства, а не через TUN. */
+    r->hp.mark = out_has_cap(o, KC_TCP_REDIR) ? o->mark : 0;
     /* Устройство создаёт наш процесс — сначала спросить о нём источник здоровья (fostate.h):
      * «не поднят» — приговор без пробы, «поднят» — дальше прежняя мера устройства, а у
      * помощника, который сам следит за узлом (watch), «поднят» — уже приговор: устройство на
@@ -2471,10 +2626,21 @@ static void out_finish(struct fo_run *r) {
             }
         }
     }
+    /* Закрепляющая order/latency: новые соединения — на выбранный член этого прохода (карта, fogroup.c);
+     * установленные остаются на своих членах. Карта переписана — строка в журнал; событие смены члена
+     * уже ушло выше (FO_EV_SWITCHED). */
+    if (r->named && gcf && gcf->pick != PICK_BALANCE && group_carded(o) &&
+        fog_balance_sync(r->sp, o, r->galive, chosen ? r->pk : -1) == 1) {
+        r->changed = 1;
+        if (r->verbose || (chosen && r->pk >= 0))
+            fprintf(stderr, LOG_I "выход %s: новые соединения — на %s, установленные остаются на своих "
+                            "членах\n", o->name,
+                    chosen && r->pk >= 0 && (size_t)r->pk < r->cand_n ? r->cand[r->pk]->name : "запасной путь группы");
+    }
     /* balance: карта раздачи в ядре — по живым членам этого прохода (fogroup.c: по факту в ядре,
      * запись — только при расхождении). Переписана — событие balance с составом. */
     if (r->named && gcf && gcf->pick == PICK_BALANCE &&
-        fog_balance_sync(r->sp, o, r->galive) == 1) {
+        fog_balance_sync(r->sp, o, r->galive, -1) == 1) {
         /* Список имён — в куче по числу членов (имя ≤ 31 байт и запятая): раньше буфер был на 16. */
         size_t alc = r->cand_n * 33 + 1, l = 0;
         char *al = malloc(alc);
@@ -2620,7 +2786,8 @@ static void fo_step(struct fo_run *r) {
             /* Группа v2: живые члены — все сразу, без проб (приговоры их проходов уже есть). */
             for (size_t k = 0; r->named && k < r->cand_n; k++) {
                 size_t m = spec_out_idx(sp, r->cand[k]);
-                if (m != (size_t)-1 && r->alive[m]) r->galive[k] = 1;
+                if (m != (size_t)-1 && r->alive[m] && fog_cc_allowed(o, r->cand[k]))
+                    r->galive[k] = 1;
             }
             /* manual — член, выбранный человеком (select), или default. Не отвечает — отказ группы
              * с её on_fail: переключиться на другого значило бы решить за человека.
@@ -3230,5 +3397,6 @@ int cmd_failover(const char *spec, int verbose) {
     struct err e = {0};
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    tcp_redir_learn(&cfg);
     return failover_pass(&cfg, &fo_store_files, verbose, NULL, NULL);
 }

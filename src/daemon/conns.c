@@ -40,19 +40,18 @@
  * живут в сокете, а не в записи соединения), и угадывать его по порту значило бы показывать
  * человеку неправду.
  *
- * СЧЁТЧИКИ (packets/bytes, reply_packets/reply_bytes) — только если ядро их ведёт: у 4.9 и у
- * свежих ядер это sysctl net.netfilter.nf_conntrack_acct, по умолчанию выключенный, и запись,
- * заведённая без него, счётчиков не получает и потом. Нет атрибута — нет поля: ноль означал бы
+ * СЧЁТЧИКИ (packets/bytes, reply_packets/reply_bytes) — только если ядро их ведёт: это sysctl
+ * net.netfilter.nf_conntrack_acct, по умолчанию выключенный, и запись, заведённая без него,
+ * счётчиков не получает и потом. Нет атрибута — нет поля: ноль означал бы
  * «ничего не передано», а это неправда.
  *
- * ПРЕДЕЛ — CONNS_MAX записей в ответе; остальные считаются (total), но не печатаются, и ответ
- * несёт "truncated":true. Запись — до ~350 байт JSON (два адреса IPv6), 2000 записей — ~700 КиБ,
- * с запасом внутри предела вывода управляющего сокета (1 МиБ, CTL_OUT_MAX в ctl.c): ответ
- * через сокет обрезаться посреди JSON не должен никогда. На телефоне живых соединений сотни.
+ * ПРЕДЕЛА ЧИСЛА ЗАПИСЕЙ НЕТ: в ответе все подошедшие соединения (раньше — первые 2000, остальные
+ * только считались, и на сервере с десятками тысяч соединений список был неполным). Запись — до
+ * ~350 байт JSON, сто тысяч соединений — ~35 МиБ; предел ответа — предел вывода управляющего
+ * сокета (CTL_OUT_MAX в ctl.c), и поле "truncated" остаётся в ответе (всегда false, пока
+ * записи не режутся) ради прежних разборщиков.
  *
  * БАТАРЕЯ. Одна команда — два дампа (IPv4 и IPv6) по запросу экрана; ничего не остаётся жить. */
-#define CONNS_MAX 2000
-
 struct conns_reg { char name[32]; uint32_t mark; };
 
 struct ctnl_conns_ctx {
@@ -84,10 +83,9 @@ static const char *ct_tcp_state(uint8_t st) {
     return st < sizeof(N) / sizeof(N[0]) ? N[st] : NULL;
 }
 
-/* Число из атрибута счётчика: be64 у свежих ядер и у 4.9, be32 у очень старых (CTA_COUNTERS32_*).
- * Атрибут be64 в сообщении выровнен только на 4 байта — поэтому чтение по байтам, а не
- * разыменование. */
-static int ct_counter(const struct nlattr *nest, int t64, int t32, unsigned long long *v) {
+/* Число из атрибута счётчика (be64). Атрибут в сообщении выровнен только на 4 байта — поэтому
+ * чтение по байтам, а не разыменование. */
+static int ct_counter(const struct nlattr *nest, int t64, unsigned long long *v) {
     const struct nlattr *x = ct_attr_in(nest, t64);
     if (x && x->nla_len >= NLA_HDRLEN + 8) {
         /* По байтам, старший первым: так одинаково верно и на little-endian телефоне, и на
@@ -98,22 +96,15 @@ static int ct_counter(const struct nlattr *nest, int t64, int t32, unsigned long
         *v = r;
         return 1;
     }
-    x = ct_attr_in(nest, t32);
-    if (x && x->nla_len >= NLA_HDRLEN + 4) {
-        uint32_t b;
-        memcpy(&b, (const uint8_t *)x + NLA_HDRLEN, 4);
-        *v = ntohl(b);
-        return 1;
-    }
     return 0;
 }
 
 static void ct_print_counters(FILE *out, const struct nlattr *nest, const char *pfx) {
     unsigned long long v;
     if (!nest) return;
-    if (ct_counter(nest, CTA_COUNTERS_PACKETS, CTA_COUNTERS32_PACKETS, &v))
+    if (ct_counter(nest, CTA_COUNTERS_PACKETS, &v))
         fprintf(out, ",\"%spackets\":%llu", pfx, v);
-    if (ct_counter(nest, CTA_COUNTERS_BYTES, CTA_COUNTERS32_BYTES, &v))
+    if (ct_counter(nest, CTA_COUNTERS_BYTES, &v))
         fprintf(out, ",\"%sbytes\":%llu", pfx, v);
 }
 
@@ -135,7 +126,6 @@ static int ctnl_conns_rec(const uint8_t *a, const uint8_t *end, uint8_t family, 
         pn->nla_len < NLA_HDRLEN + 1)
         return 0;                              /* запись без кортежа — показывать нечего */
     x->total++;
-    if (x->shown >= CONNS_MAX) return 0;
     char s[INET6_ADDRSTRLEN], d[INET6_ADDRSTRLEN];
     inet_ntop(family, (const uint8_t *)sa + NLA_HDRLEN, s, sizeof(s));
     inet_ntop(family, (const uint8_t *)da + NLA_HDRLEN, d, sizeof(d));
@@ -299,12 +289,13 @@ static int rr_mark_add(unsigned **v, size_t *n, unsigned m) {
     return 0;
 }
 
-/* Метки, которые соединение через выход o может нести: свою и, у balance, — членов (вглубь). */
+/* Метки, которые соединение через выход o может нести: свою и, у группы с картой (balance,
+ * закрепляющие order/latency), — членов (вглубь). */
 static int rr_marks_of(const struct spec *sp, const struct output *o, unsigned **v, size_t *n,
                        int depth) {
     if (!o || depth > 16) return 0;
     if (out_needs_mark(o) && rr_mark_add(v, n, o->mark & STEER_MARK_MASK) < 0) return -1;
-    if (out_group(o) && o->grp.pick == PICK_BALANCE)
+    if (group_carded(o))
         for (size_t i = 0; i < o->grp.members_n; i++)
             if (rr_marks_of(sp, spec_out(sp, o->grp.members[i]), v, n, depth + 1) < 0) return -1;
     return 0;

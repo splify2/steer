@@ -21,13 +21,11 @@
 #include "spec.h"
 #include "awg.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "ctl.h"
 #include "nftquery.h"
 #include "generate.h"
-#include "legacy.h"
 #include "nftdump.h"
 
 /* Сколько элементов в наборе по мнению ядра. -1 — набора нет.
@@ -39,18 +37,9 @@ long set_count(const char *name) {
     return nfd_set_count(NFD_INET, nft_table(), name);
 }
 
-/* Есть ли цепочка движка в ядре. В старой раскладке nat живёт в таблице ip (legacy.c, шаг 4), и
- * искать только в inet значило бы объявить пропавшим то, что стоит на исправном телефоне. */
+/* Есть ли цепочка движка в ядре. */
 int nft_chain_here(const char *chain) {
-    if (nfd_chain_exists(NFD_INET, nft_table(), chain)) return 1;
-    return NFT_LEGACY && nfd_chain_exists(NFD_IP, nft_table(), chain);
-}
-
-/* Есть ли правило `redirect to :PORT` — заворот DNS старой раскладки: там у него нет своей
- * цепочки, он правило общей цепочки nat, и узнаётся по самому правилу. */
-int nft_redirect_here(uint16_t port) {
-    return nfd_has_redirect(NFD_INET, nft_table(), port) ||
-           nfd_has_redirect(NFD_IP, nft_table(), port);
+    return nfd_chain_exists(NFD_INET, nft_table(), chain);
 }
 
 /* "A.B.C.D[/N]" → сеть и маска. 0, если строка не префикс.
@@ -104,8 +93,7 @@ int ipv4_span(const char *t, uint32_t *lo, uint32_t *hi) {
 }
 
 /* То же для IPv6 (адрес, префикс, диапазон): границы — 16 байт в порядке сети, сравниваются
- * memcmp. Нужна explain: адрес IPv6 ищется в парных наборах «<группа>6» дампом там, где
- * одиночного запроса элемента нет (старое ядро, составной набор). */
+ * memcmp. Нужна explain: в составном наборе адрес ищется дампом (set_scan_mixed). */
 int ipv6_span(const char *t, uint8_t lo[16], uint8_t hi[16]) {
     char buf[96];
     size_t n = strlen(t);

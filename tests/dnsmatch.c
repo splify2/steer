@@ -73,6 +73,18 @@ static void build(struct ruleset *rs, const char *const *lines) {
     }
 }
 
+/* Живые соединения для стенда пула fake-IP: адреса из списка (n < 0 — «узнать нельзя»). */
+static uint32_t *g_pool_live_addr;
+static int g_pool_live_n;
+static int pool_live_stub(uint8_t *bits) {
+    if (g_pool_live_n < 0) return -1;
+    for (int i = 0; i < g_pool_live_n; i++) {
+        uint32_t ix = g_pool_live_addr[i] - FAKEIP_POOL_BASE;
+        bits[ix >> 3] |= (uint8_t)(1u << (ix & 7));
+    }
+    return 0;
+}
+
 int main(void) {
     {
         struct ruleset rs;
@@ -85,9 +97,9 @@ int main(void) {
         check("ruleset_add при отказе strdup: набор пуст", 0, (int)rs.n);
         ruleset_free(&rs);
     }
-    /* Раскладка ядра — современная, без пробы nft: от неё зависит половина IPv6 каналов
-     * fake-IP (dom6_ok), и стенд не должен зависеть от машины. */
-    setenv("STEER_NFT_COMPAT", "modern", 1);
+    /* Ответы проб ядра заданы явно, без `nft -c`: стенд не должен зависеть от машины. */
+    setenv("STEER_NFT_INGRESS", "1", 1);
+    setenv("STEER_NFT_CONCAT", "1", 1);
     {
         static const char *const lines[] = { "youtube.com", "=exact.example", NULL };
         struct ruleset rs;
@@ -327,6 +339,168 @@ int main(void) {
         g_fakeip_next = 0;
     }
 
+    /* ---- ПУЛ fake-IP: адреса возвращаются (I-521) ------------------------------------------------
+     *
+     * Раньше 131070 адресов только выдавались: на 131071-м новом имени — «пул исчерпан» навсегда.
+     * Теперь простоявшее имя без живых соединений отдаёт адрес, а имя с соединением, и имя, которое
+     * только что спрашивали, — нет. Живые соединения здесь подставляет стенд (g_fakeip_live; в
+     * работе это conntrack). */
+    {
+        size_t cap = FAKEIP_POOL_SIZE - 2;      /* без адреса сети и последнего */
+        fakeip_pool_reset();
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 1;
+        g_fakeip_state_path = NULL;
+        char nm[64];
+        uint32_t addr = 0;
+        int all_ok = 1;
+        for (size_t i = 0; i < cap; i++) {
+            snprintf(nm, sizeof(nm), "h%zu.pool.test", i);
+            if (fakeip_lookup_or_alloc(nm, &addr) != 0) all_ok = 0;
+        }
+        check("пул: выдан весь пул до последнего адреса", 1, all_ok);
+        check("пул: все записи в таблице", (int)cap, (int)g_fakeip.n);
+        check("пул: все заняты свежими вопросами — следующее имя отказ", -1,
+              fakeip_lookup_or_alloc("over.pool.test", &addr));
+
+        /* Первые 100 имён простояли дольше срока; у первых десяти — живое соединение. */
+        time_t now = time(NULL);
+        uint32_t live_addr[10];
+        for (size_t i = 0; i < 100; i++) g_fakeip.entries[i].last_used = now - 2 * g_fakeip_idle;
+        for (size_t i = 0; i < 10; i++) live_addr[i] = g_fakeip.entries[i].addr;
+        g_fakeip_live = pool_live_stub;
+        g_pool_live_addr = live_addr;
+        g_pool_live_n = 10;
+        /* Выдача, как прежде, сначала отказывает (дроссель сверки — раз в 10 с) — стенд зовёт сверку
+         * сам, а затем идёт обычным путём выдачи. */
+        check("пул: вернулось 90 адресов (10 держат соединения)", 90, (int)fakeip_reclaim(now));
+        check("пул: ушедшее имя не находится", 1, fakeip_find("h50.pool.test") < 0);
+        check("пул: имя с соединением осталось", 1, fakeip_find("h5.pool.test") >= 0);
+        check("пул: индекс цел после уплотнения", 1, fakeip_find("h100.pool.test") >= 0 &&
+              g_fakeip.entries[fakeip_find("h100.pool.test")].addr ==
+              FAKEIP_POOL_BASE + 101);
+        int got_ok = 1, dist = 1, no_live = 1;
+        static uint8_t seen_a[FAKEIP_POOL_SIZE / 8];
+        memset(seen_a, 0, sizeof(seen_a));
+        for (int i = 0; i < 90; i++) {
+            snprintf(nm, sizeof(nm), "again%d.pool.test", i);
+            if (fakeip_lookup_or_alloc(nm, &addr) != 0) { got_ok = 0; continue; }
+            uint32_t ix = addr - FAKEIP_POOL_BASE;
+            if (seen_a[ix >> 3] & (1u << (ix & 7))) dist = 0;
+            seen_a[ix >> 3] |= (uint8_t)(1u << (ix & 7));
+            for (int k = 0; k < 10; k++) if (addr == live_addr[k]) no_live = 0;
+        }
+        check("пул: 90 новых имён получили возвращённые адреса", 1, got_ok);
+        check("пул: адреса возвращённые разные", 1, dist);
+        check("пул: адрес с живым соединением не выдан заново", 1, no_live);
+        check("пул: 91-е имя — снова отказ (занято всё)", -1,
+              fakeip_lookup_or_alloc("over2.pool.test", &addr));
+
+        /* conntrack недоступен (-1): решает один срок простоя, а не «никогда». */
+        g_pool_live_n = -1;
+        for (size_t i = 0; i < g_fakeip.n; i++) g_fakeip.entries[i].last_used = now;
+        for (size_t i = 0; i < 7; i++) g_fakeip.entries[i].last_used = now - 2 * g_fakeip_idle;
+        check("пул: без conntrack возвращается по сроку простоя", 7, (int)fakeip_reclaim(now));
+        check("пул: и выдаётся из возвращённых", 0, fakeip_lookup_or_alloc("nolive.pool.test", &addr));
+        fakeip_pool_reset();
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 1;
+        g_fakeip_live = NULL;
+    }
+    /* ---- ФОНОВАЯ ПЕРЕЗАПИСЬ ФАЙЛА СОСТОЯНИЯ (I-534): цикл не ждёт fsync ---------------------------------
+     * fakeip_state_flush_async сериализует таблицу и отдаёт потоку; файл на месте после fakeip_state_wait, а
+     * флаг «грязно» снят сразу. Последний снимок побеждает: два подряд — в файле второй. */
+    {
+        char dirt[] = "/tmp/dnsmatch-fakeip-XXXXXX";
+        char path[128];
+        if (!mkdtemp(dirt)) { perror("mkdtemp"); return 1; }
+        snprintf(path, sizeof(path), "%s/fakeip.state", dirt);
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        g_fakeip_next = 0;
+        g_fakeip_state_path = NULL;
+        uint32_t aa = 0;
+        fakeip_lookup_or_alloc("bg-one.test", &aa);
+        fakeip_lookup_or_alloc("bg-two.test", &aa);
+        g_fakeip_state_path = path;
+        g_fakeip_dirty = 1;
+        fakeip_state_flush_async();
+        check("фон: флаг «грязно» снят сразу после передачи потоку", 0, g_fakeip_dirty);
+        fakeip_lookup_or_alloc("bg-three.test", &aa);
+        g_fakeip_dirty = 1;
+        fakeip_state_flush_async();
+        fakeip_state_wait();
+        char all[2048] = {0};
+        FILE *rf = fopen(path, "r");
+        size_t got = rf ? fread(all, 1, sizeof(all) - 1, rf) : 0;
+        if (rf) fclose(rf);
+        check("фон: файл записан потоком, в нём все три домена (последний снимок)", 1,
+              got > 0 && strstr(all, "bg-one.test") && strstr(all, "bg-two.test") && strstr(all, "bg-three.test"));
+        char tmp[160];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        check("фон: временного файла не осталось", 1, access(tmp, F_OK) != 0);
+        unlink(path);
+        rmdir(dirt);
+        g_fakeip_state_path = NULL;
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        g_fakeip_next = 0;
+    }
+
+    /* ---- ФОН И СИНХРОННЫЕ МЕСТА ЧТЕНИЯ ФАЙЛА (I-534): flush ждёт поток, append не теряется ------------------
+     * Снимок уже у потока, флаг «грязно» снят. Просьба загрузчика («flush») и выход резолвера зовут
+     * fakeip_state_flush: файл обязан лежать на носителе к её возврату, хотя флаг чист. И имя, выданное, пока
+     * поток пишет, не пропадает из файла: дописанная строка не должна затираться более старым снимком. */
+    {
+        char dirt[] = "/tmp/dnsmatch-fakeip-XXXXXX";
+        char path[128];
+        if (!mkdtemp(dirt)) { perror("mkdtemp"); return 1; }
+        snprintf(path, sizeof(path), "%s/fakeip.state", dirt);
+        int lost_flush = 0, lost_append = 0;
+        for (int round = 0; round < 40; round++) {
+            fakeip_pool_reset();
+            memset(&g_fakeip, 0, sizeof(g_fakeip));
+            memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+            g_fakeip_next = 1;
+            g_fakeip_state_path = NULL;
+            uint32_t aa = 0;
+            char nm[64];
+            for (int i = 0; i < 3000; i++) {
+                snprintf(nm, sizeof(nm), "r%d-%d.flushwait.test", round, i);
+                fakeip_lookup_or_alloc(nm, &aa);
+            }
+            unlink(path);
+            g_fakeip_state_path = path;
+            g_fakeip_dirty = 1;
+            fakeip_state_flush_async();
+            fakeip_state_flush();               /* чисто: но поток ещё пишет, и файл нужен сейчас */
+            if (access(path, F_OK) != 0) lost_flush++;
+            fakeip_state_wait();
+            /* Имя, выданное во время записи снимка, в котором его нет. */
+            g_fakeip_dirty = 1;
+            fakeip_state_flush_async();
+            fakeip_lookup_or_alloc("during-write.flushwait.test", &aa);
+            fakeip_state_flush();
+            fakeip_state_wait();
+            char *all = calloc(1, 1 << 20);
+            FILE *rf = fopen(path, "r");
+            size_t got = rf && all ? fread(all, 1, (1 << 20) - 1, rf) : 0;
+            if (rf) fclose(rf);
+            if (!got || !strstr(all, "during-write.flushwait.test")) lost_append++;
+            free(all);
+        }
+        check("фон: flush при чистом флаге дожидается потока (файл на месте)", 0, lost_flush);
+        check("фон: имя, выданное во время записи снимка, остаётся в файле", 0, lost_append);
+        unlink(path);
+        char tmp[160];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        unlink(tmp);
+        rmdir(dirt);
+        g_fakeip_state_path = NULL;
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        g_fakeip_next = 0;
+    }
+
     /* ---- ГИБРИДНЫЙ СПИСОК: адреса и имена в одном файле -------------------------
      *
      * Проверяется не ruleset_add, а load_rules_into — то есть путь ЧТЕНИЯ ФАЙЛА, потому
@@ -491,8 +665,8 @@ int main(void) {
             fputs("web.example\n", w1); fclose(w1);
             fputs("srv.example\nother.example\n", w2); fclose(w2);
 
-            /* Спека v2 (JSON с `version`): поле семейства «46» бывает только у неё — у спеки v1
-             * имена правил только IPv4 (sp->dns.names_v4, проверка ниже). */
+            /* Спека v2 (JSON с `version`): поле семейства «46» — у выхода с IPv6; те же каналы
+             * спекой v1 (ниже) дают то же семейство. */
             char sp[] = "/tmp/dnsmatch-tab-spec.XXXXXX";
             int sf = mkstemp(sp);
             if (sf >= 0) {
@@ -563,6 +737,22 @@ int main(void) {
 
                 check("формат таблицы: разбор принял текст", 0,
                       tabfmt_parse(text, textlen));
+                /* Приёмник из трубы: та же таблица кусками по 7 байт — собирается ровно на последнем,
+                 * а досмотр строк идёт с места остановки (tabfmt_feed), а не с начала. */
+                {
+                    struct tabfmt_feed fd = {0};
+                    int done = -1, early = 0;
+                    for (size_t o = 0; o < textlen; o += 7) {
+                        size_t cn = textlen - o < 7 ? textlen - o : 7;
+                        int fr = tabfmt_feed(&fd, text + o, cn);
+                        if (fr == 1 && o + cn < textlen) early = 1;
+                        if (fr == 1) done = 1;
+                        if (fr < 0) done = -2;
+                    }
+                    check("приёмник таблицы: кусками по 7 байт собралась целиком, не раньше конца", 1,
+                          done == 1 && !early && fd.len == 0);
+                    free(fd.buf);
+                }
                 check("формат таблицы: то же число каналов после разбора",
                       (int)snap_n, (int)g_dch_n);
                 for (size_t i = 0; i < snap_n && i < g_dch_n; i++) {
@@ -643,10 +833,8 @@ int main(void) {
                 unlink(sp);
             }
 
-            /* Те же два канала спекой v1: выход тот же, клиенты те же, — а семейство только
-             * IPv4 у обоих, и в строке таблицы «4». До 1.9 резолвер на AAAA имён под правилом
-             * отвечал пустым ответом, и спека v1 это поведение сохраняет (sp->dns.names_v4,
-             * spec.h); поддельный и настоящий IPv6 на AAAA — только у спеки v2. */
+            /* Те же два канала спекой v1: выход тот же, клиенты те же — и семейство то же, что у
+             * v2, «46» у обоих (перевод v1 → v2 IPv6 не отнимает). */
             char sp1[] = "/tmp/dnsmatch-tab-v1.XXXXXX";
             int sf1 = mkstemp(sp1);
             if (sf1 >= 0) {
@@ -663,7 +851,6 @@ int main(void) {
                 static struct spec cfg1;
                 struct err e = {0};
                 if (load_spec(sp1, &cfg1, &e) < 0) err_die(&e);
-                check("спека v1: имена правил только IPv4", 1, cfg1.dns.names_v4);
                 char *text = NULL;
                 size_t textlen = 0;
                 FILE *mem = open_memstream(&text, &textlen);
@@ -671,9 +858,9 @@ int main(void) {
                 fclose(mem);
                 check("спека v1: два канала", 2, (int)g_dch_n);
                 for (size_t i = 0; i < g_dch_n; i++)
-                    check("спека v1: канал выхода с IPv6 — только IPv4", DCH_V4, g_dch[i].fam);
-                check("спека v1: строки каналов несут «|4|» (fake-IP и real-ip)", 1,
-                      text && strstr(text, "|0|4|web") != NULL && strstr(text, "|1|4|srv") != NULL);
+                    check("спека v1: канал выхода с IPv6 — IPv4 и IPv6", DCH_V4 | DCH_V6, g_dch[i].fam);
+                check("спека v1: строки каналов несут «|46|» (fake-IP и real-ip)", 1,
+                      text && strstr(text, "|0|46|web") != NULL && strstr(text, "|1|46|srv") != NULL);
                 free(text);
                 /* g_dch держит указатели внутрь cfg1 — обнулить руками, как перед разбором
                  * выше, чтобы следующий tabfmt_parse не освобождал чужие строки. */
@@ -1089,6 +1276,157 @@ int main(void) {
             g_dch_n = 0;
             unlink(sp);
         }
+    }
+
+    /* ---- пределы без причины (I-523): больше прежнего предела работает ---- */
+    {
+        /* Журнал имён: 3000 свежих имён — больше прежних 256 — остаются все. */
+        for (int i = 0; i < 3000; i++) {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "Name%d.Example.com", i);
+            dlog_note(nm, -1);
+        }
+        check("журнал имён: 3000 свежих имён хранятся все (прежний предел 256)", 3000, (int)dlog_count());
+        dlog_note("name5.example.com", -1);
+        check("журнал имён: повторный вопрос не плодит запись", 3000, (int)dlog_count());
+
+        /* real-ip: 5000 разных элементов (прежний предел 2048) и повтор без роста. */
+        for (int i = 0; i < 5000; i++) {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "ri%d.example.com", i);
+            realip_note(nm, 0x0a000000u + (uint32_t)i, 300);
+        }
+        realip_note("ri7.example.com", 0x0a000000u + 7u, 600);
+        check("real-ip: 5000 элементов помнятся все (прежний предел 2048)", 5000, (int)realip_count());
+        uint8_t a6[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+        realip_note6("ri7.example.com", a6, 300);
+        check("real-ip: адрес другого семейства — своя запись", 5001, (int)realip_count());
+
+        /* Разбор ответа: 100 записей A и 100 AAAA — прежде собирались 32 и 16. */
+        static uint8_t big[8192];
+        memset(big, 0, sizeof(big));
+        big[0] = 0x12; big[1] = 0x34; big[2] = 0x81; big[3] = 0x80; big[5] = 1;
+        big[7] = 100;
+        memcpy(big + 12, "\3big\4test\0\0\1\0\1", 14);
+        size_t bp = 12 + 14;
+        for (int i = 0; i < 100; i++) {
+            static const uint8_t h[] = { 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4 };
+            memcpy(big + bp, h, sizeof(h)); bp += sizeof(h);
+            big[bp++] = 10; big[bp++] = 0; big[bp++] = 0; big[bp++] = (uint8_t)i;
+        }
+        char bq[MAX_HOSTNAME];
+        uint16_t bt = 0;
+        size_t be = 0;
+        struct answer_ip bips[128];
+        struct answer_ip6 bips6[8];
+        int bn6 = 0;
+        int bn4 = parse_response(big, bp, bq, sizeof(bq), &bt, &be, bips, 128, bips6, 8, &bn6);
+        check("разбор ответа: 100 записей A собраны все (прежний предел 32)", 100, bn4);
+        check("разбор ответа: последняя запись цела", 1, bn4 == 100 && ((bips[99].addr >> 24) & 0xff) == 99);
+
+        /* Кэш ответов: ответ на 3 КБ (больше 1232) кладётся и достаётся. */
+        struct dcache_cfg dc = { 64, 1, 3600, 60 };
+        dcache_config(&dc);
+        int an = 190;
+        static uint8_t cb[8192];
+        memset(cb, 0, sizeof(cb));
+        cb[0] = 0x22; cb[1] = 0x33; cb[2] = 0x81; cb[3] = 0x80; cb[5] = 1; cb[7] = (uint8_t)an;
+        memcpy(cb + 12, "\3big\4test\0\0\1\0\1", 14);
+        size_t cp = 26;
+        for (int i = 0; i < an; i++) {
+            static const uint8_t h[] = { 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 1, 0, 0, 4 };
+            memcpy(cb + cp, h, sizeof(h)); cp += sizeof(h);
+            cb[cp++] = 10; cb[cp++] = 1; cb[cp++] = 0; cb[cp++] = (uint8_t)i;
+        }
+        check("кэш: ответ больше 1232 байт кладётся", 1, cp > 1232 && dcache_put(1, cb, cp, 1000));
+        uint8_t qq[64] = { 0x44, 0x55, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+        memcpy(qq + 12, "\3big\4test\0\0\1\0\1", 14);
+        static uint8_t gb[8192];
+        size_t gn = dcache_get(1, qq, 26, gb, sizeof(gb), 1010);
+        check("кэш: большой ответ выдан целиком, с номером спрашивающего", 1,
+              gn == cp && gb[0] == 0x44 && gb[1] == 0x55);
+        dcache_flush();
+    }
+
+    /* ---- ОБЩИЙ ИНДЕКС КАНАЛОВ (I-536) ---------------------------------------------
+     *
+     * dch_match_mask ищет имя по одной таблице суффиксов всех каналов, а не проходом по каналам.
+     * Сверка с прежним проходом (dch_matches по каждому каналу) на каналах всех видов правил:
+     * доменные, точные, шаблоны, регулярные выражения, части с исключениями и без; на именах
+     * из совпадающих, чужих и граничных (подстрока без точки, регистр, глубокие поддомены). */
+    {
+        static const char *const c0[] = { "youtube.com", "=exact.example.org", "Deep.Sub.Example.NET", NULL };
+        static const char *const c1[] = { "youtube.com", "example.net", "=only.here.io", NULL };
+        static const char *const c2[] = { "*.wild.example.com", "re:^r[0-9]+\\.regex\\.io$", "plain.org", NULL };
+        static const char *const c3[] = { "partA.com", "shared.test", NULL };
+        static const char *const c3x[] = { "bad.partA.com", NULL };
+        static const char *const c4[] = { "shared.test", "last.example", NULL };
+        dch_zero(5);
+        g_dch_n = 5;
+        for (size_t i = 0; i < 5; i++) snprintf(g_dch[i].set, sizeof(g_dch[i].set), "ch%zu", i);
+        build(&g_dch[0].rules, c0);
+        build(&g_dch[1].rules, c1);
+        build(&g_dch[2].rules, c2);
+        g_dch[3].parts = calloc(1, sizeof(struct dpart));
+        g_dch[3].parts_n = 1;
+        build(&g_dch[3].parts[0].rules, c3);
+        build(&g_dch[3].parts[0].excl, c3x);
+        g_dch[3].parts[0].has_excl = 1;
+        build(&g_dch[4].rules, c4);
+        static const char *const names[] = {
+            "youtube.com", "www.youtube.com", "notyoutube.com", "ube.com", "YOUTUBE.COM", "a.b.c.youtube.com",
+            "exact.example.org", "x.exact.example.org", "only.here.io", "a.only.here.io", "example.net",
+            "deep.sub.example.net", "x.deep.sub.example.net", "sub.example.net", "q.wild.example.com",
+            "wild.example.com", "r12.regex.io", "xr12.regex.io", "plain.org", "a.plain.org", "partA.com",
+            "x.partA.com", "bad.partA.com", "y.bad.partA.com", "shared.test", "a.shared.test", "last.example",
+            "unknown.invalid", "com", "", "a", NULL };
+        int same = 1, any = 0;
+        for (size_t i = 0; names[i]; i++) {
+            chm_t want = 0;
+            for (size_t c = 0; c < g_dch_n; c++)
+                if (dch_matches(&g_dch[c], names[i])) want = chm_or(want, chm_one(c));
+            chm_t got = dch_match_mask(names[i]);
+            if (got != want) { same = 0; printf("  расхождение на «%s»: %u против %u\n", names[i], got, want); }
+            if (want) any++;
+        }
+        check("общий индекс: набор каналов тот же, что у прохода по каждому", 1, same);
+        check("общий индекс: сверка не пустая (совпавших имён > 10)", 1, any > 10);
+        check("общий индекс: shared.test — оба канала (часть и обычный)", 1,
+              dch_match_mask("a.shared.test") == chm2(3, 4));
+        check("общий индекс: исключение части работает (bad.partA.com — мимо)", 0,
+              (int)dch_match_mask("bad.partA.com"));
+        check("общий индекс: точное — только само имя", 1,
+              dch_match_mask("exact.example.org") != 0 && dch_match_mask("x.exact.example.org") == 0);
+
+        /* Смена правил сбрасывает индекс: имя, добавленное после первого подбора, находится. */
+        check("общий индекс: имени ещё нет", 0, (int)dch_match_mask("late.added.test"));
+        ruleset_add(&g_dch[1].rules, (char[]){ "added.test" });
+        check("общий индекс: правило добавлено — имя находится", 1,
+              dch_match_mask("late.added.test") == chm_one(1));
+        ruleset_free(&g_dch[1].rules);
+        check("общий индекс: набор освобождён — имя не находится", 0, (int)dch_match_mask("late.added.test"));
+
+        /* Много каналов и много правил: счёт тот же, что у прохода (число каналов не ограничено). */
+        dch_zero(300);
+        g_dch_n = 300;
+        int ok300 = 1;
+        for (size_t i = 0; i < 300; i++) {
+            char nm[64];
+            snprintf(g_dch[i].set, sizeof(g_dch[i].set), "c%zu", i);
+            memset(&g_dch[i].rules, 0, sizeof(g_dch[i].rules));
+            snprintf(nm, sizeof nm, "d%zu.big.test", i);
+            ruleset_add(&g_dch[i].rules, nm);
+            snprintf(nm, sizeof nm, "common.big.test");
+            ruleset_add(&g_dch[i].rules, nm);
+        }
+        for (size_t i = 0; i < 300; i += 37) {
+            char nm[64];
+            snprintf(nm, sizeof nm, "www.d%zu.big.test", i);
+            if (dch_match_mask(nm) != chm_one(i)) ok300 = 0;
+        }
+        chm_t allm = dch_match_mask("x.common.big.test");
+        for (size_t i = 0; i < 300; i++) if (!chm_has(allm, i)) ok300 = 0;
+        check("общий индекс: 300 каналов, имя в каждом — набор из 300", 1, ok300);
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");

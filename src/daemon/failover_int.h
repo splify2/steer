@@ -49,18 +49,19 @@ int routing_live_ok(const struct route_facts *f, const char *dev);
 int routing_failed_ok(const struct route_facts *f, enum on_fail of);
 
 /* ---- лишние копии правила пробы/выхода (rule_copies_of) ---------------------------- */
-#define RULE_COPIES_MAX 8
+/* Приоритеты копий — в куче, сколько нашлось (раньше — не больше восьми каждого вида, и лишние
+ * копии сверх них не снимались никогда). Освобождает rule_copies_free. */
 struct rule_copies {
     int known;                      /* дамп прочитан (пустым он на живой коробке не бывает) */
     int n;                          /* верных копий */
-    unsigned long pref[RULE_COPIES_MAX];
+    unsigned long *pref;            /* их приоритеты, n штук */
     int wrong_n;                    /* копий на чужом приоритете */
-    unsigned long wrong[RULE_COPIES_MAX];
-    int legacy_n;                   /* прежняя форма без маски (см. rule_drop) */
-    unsigned long legacy[RULE_COPIES_MAX];
+    unsigned long *wrong;
+    int oom;                        /* не хватило памяти под список: снимать вслепую нельзя */
 };
 
 struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table);
+void rule_copies_free(struct rule_copies *c);
 
 /* on_fail выхода o — то, что проход делает при отказе (apply_failed с объявлением в журнале).
  * Наружу — ради команды select (fogroup.c): выбранный человеком член не работает, — и ради apply
@@ -79,8 +80,8 @@ void active_get_st(struct fo_store *st, const char *out, char *dev, size_t n);
 int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose);
 void cleanup_probe_rule(void);
 int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev);
-/* Швы здоровья/задержки: NULL в бою, стенд подставляет свою пробу — см. health_of в
- * failover.c. */
+/* Швы здоровья/задержки: NULL в бою, стенд подставляет свою пробу — см. hp_start в
+ * failover.c и folat_member в folat.c. */
 extern int (*g_health_probe)(const struct spec *, const struct output *, const char *);
 extern int (*g_latency_probe)(const struct spec *, const struct output *, const char *);
 /* Порог гистерезиса читает переменную окружения один раз и кэширует ответ — стенду нужно
@@ -106,6 +107,9 @@ extern int (*g_ip6_show)(int table, char *out, size_t n);
 int routing6_live_ok(const struct route_facts *f, const char *dev, int dev_v6);
 extern int (*g_icmp_probe)(const char *dev);
 extern int (*g_cmd_hook)(const char *const argv[]);
+/* Шов стенда для маршрутов таблицы выхода (route_put в failover.c): задан — маршрут не ставится
+ * сообщением rtnetlink, а команда `ip route replace …` словами уходит сюда. */
+extern int (*g_route_hook)(const char *const argv[]);
 extern long (*g_revive_step)(void);
 
 #endif

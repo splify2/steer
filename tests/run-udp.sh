@@ -23,8 +23,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${STEER:-./build/libs-host/steerd}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
+# steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
+LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 
 NS=steer-udp
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
@@ -40,7 +42,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf '%s\n' "vless://$UUID@127.0.0.1:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
+# Узел — на dummy внутри пространства, а не на петле: узел в 127.0.0.0/8 движок отвергает как «отвечать
+# некому» (sub.c), и на петле стенд не поднимался вовсе.
+NODE=10.66.3.1
+printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
 cat > "$WORK/spec.json" <<SPEC
 {"schema":1,
  "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
@@ -50,8 +55,11 @@ SPEC
 ip netns delete "$NS" 2>/dev/null || true
 ip netns add "$NS"
 ip netns exec "$NS" ip link set lo up
+ip netns exec "$NS" ip link add stand type dummy
+ip netns exec "$NS" ip addr add "$NODE/32" dev stand
+ip netns exec "$NS" ip link set stand up
 
-ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb 1 \
+ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --mb 1 --bind "$NODE" \
     > "$WORK/srv.log" 2>&1 &
 SRV_PID=$!
 sleep 1
@@ -70,6 +78,8 @@ fi
 
 # Куда угодно, кроме localhost: поддельному серверу адрес безразличен, важно попасть в туннель.
 ip netns exec "$NS" ip route replace 203.0.113.0/24 dev vl
+. tests/lib-redir.sh
+redir_dev "$NS" vl   # TCP — к слушателю модуля (R-152), как на роутере
 
 # Клиент внутри пространства: своим сокетом UDP, потому что ни один готовый инструмент не
 # умеет сказать «пришла ли ответная датаграмма ЦЕЛОЙ и той же». ICMP слушаем сырым сокетом —
@@ -134,7 +144,9 @@ check("датаграмма 217 байт вернулась той же", r == p
 #    больше MTU В ОБЕ СТОРОНЫ: наверх датаграмма приходит от клиента уже фрагментами и
 #    собирается туннелем, обратно она же уходит фрагментами и собирается стеком клиента.
 #    Одна проверка закрывает и сборку, и нарезку — эхо не сойдётся, если сломано любое.
-for n in (1, 1472, 3000):
+#    4097, 20000, 65000 и 65507 — датаграммы крупнее прежних пределов (4096 в стеке, ~14,8 КБ у
+#    VLESS вверх, I-528): формат несёт длину двумя байтами, и ограничивать здесь нечем.
+for n in (1, 1472, 3000, 4097, 20000, 65000, 65507):
     p = bytes((i * 37 + n) % 251 for i in range(n))
     r = echo(s, TARGET_A, 443, p)
     check("датаграмма %d байт вернулась той же" % n, r == p,

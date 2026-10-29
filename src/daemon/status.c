@@ -19,9 +19,10 @@
 #include <time.h>
 
 #include "spec.h"
+#include "platform.h"
 #include "awg.h"
+#include "plugin.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "ctl.h"
@@ -31,6 +32,7 @@
 #include "generate.h"
 #include "grpurl.h"
 #include "jsonw.h"
+#include "plugso.h"
 
 
 /* ---- status --------------------------------------------------------------- */
@@ -139,6 +141,27 @@ static void group_emit(FILE *out, const struct spec *sp, const struct output *o)
     for (size_t k = 0; k < g->members_n; k++)
         if (g->alive[k]) fprintf(out, "%s\"%s\"", n++ ? "," : "", spec_out(sp, g->members[k])->name);
     fprintf(out, "]");
+    if (g->ccsel.only_n || g->ccsel.cc_n) {
+        /* Выбор по стране (only, exclude): заданные списки, страна каждого члена с известной страной
+         * (фактическая, иначе по имени узла) и члены, которых выбор не берёт. */
+        fprintf(out, ",\"countries\":{\"only\":[");
+        for (size_t i = 0; i < g->ccsel.only_n; i++) fprintf(out, "%s\"%s\"", i ? "," : "", g->ccsel.only[i]);
+        fprintf(out, "],\"exclude\":[");
+        for (size_t i = 0; i < g->ccsel.cc_n; i++) fprintf(out, "%s\"%s\"", i ? "," : "", g->ccsel.cc[i]);
+        fprintf(out, "],\"members\":{");
+        n = 0;
+        for (size_t k = 0; k < g->members_n; k++) {
+            char cc[3];
+            if (fog_member_cc(spec_out(sp, g->members[k]), cc))
+                fprintf(out, "%s\"%s\":\"%s\"", n++ ? "," : "", spec_out(sp, g->members[k])->name, cc);
+        }
+        fprintf(out, "},\"skipped\":[");
+        n = 0;
+        for (size_t k = 0; k < g->members_n; k++)
+            if (!fog_cc_allowed(o, spec_out(sp, g->members[k])))
+                fprintf(out, "%s\"%s\"", n++ ? "," : "", spec_out(sp, g->members[k])->name);
+        fprintf(out, "]}");
+    }
     if (g->pick == PICK_MANUAL && g->sel >= 0 && (size_t)g->sel < g->members_n)
         fprintf(out, ",\"select\":\"%s\"", spec_out(sp, g->members[g->sel])->name);
     if (g->pick == PICK_LATENCY) {
@@ -236,8 +259,8 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
     fprintf(out, "{\"schema\":1,\"at\":%ld,"
                  "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
                  "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\",\"awg\","
-                 "\"via\",\"failed\",\"groups\",\"balance_by\",\"exclude\",\"active_nodes\",\"spec_json\","
-                 "\"dns_groups\",\"dns_other\"]",
+                 "\"via\",\"failed\",\"groups\",\"balance_by\",\"exclude\",\"node_only\",\"group_only\",\"node_geo\",\"lat_score\",\"active_nodes\",\"block\",\"spec_json\",\"pool_latency\","
+                 "\"dns_groups\",\"dns_other\",\"dns_fragment\",\"dns_h3\"]",
             (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
@@ -274,13 +297,37 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
          * повторяется: она видна у самой цели в этом же ответе, а второй источник того же
          * ответа однажды разошёлся бы с первым. */
         if (sp->out[i].over[0]) fprintf(out, ",\"via\":\"%s\"", sp->out[i].over);
+        /* Кто завёл выход (хук плагина) и недоступен ли его вид (spec-fields.md, раздел 8). Полей нет у
+         * выхода человека с доступным видом — status прежний до байта. */
+        if (out_owner_plugin(&sp->out[i])) {
+            fputs(",\"owner\":{\"plugin\":", out);
+            jsonw_str(out, sp->out[i].owner_plugin);
+            if (sp->out[i].owner_out) {
+                fputs(",\"out\":", out);
+                jsonw_str(out, sp->out[i].owner_out);
+            }
+            fputc('}', out);
+        }
+        if (out_unavail(&sp->out[i])) {
+            fputs(",\"unavail\":{\"why\":", out);
+            jsonw_str(out, sp->out[i].unavail);
+            if (sp->out[i].unavail_plugin) {
+                fputs(",\"plugin\":", out);
+                jsonw_str(out, sp->out[i].unavail_plugin);
+            }
+            fputc('}', out);
+        }
         if (out_has_device(&sp->out[i])) {
             struct fwcheck c = fw_check(sp->out[i].device);
+            /* `nat` — подмена IPv4 есть, кем бы ни была: masq зоны fw4 или своя postrouting_nat4
+             * (out_nat4_by_steer); кем — `nat_by`, как `nat6_by` у IPv6. */
+            int nat4_ours = out_nat4_by_steer(out_for_device(sp, &sp->out[i], sp->out[i].device));
             fprintf(out, ",\"device\":\"%s\",\"up\":%s%s,\"mark\":\"0x%08x\",\"table\":%d"
                    ",\"in_firewall\":%s,\"nat\":%s",
                    sp->out[i].device, up ? "true" : "false", failed ? ",\"failed\":true" : "",
                    sp->out[i].mark, sp->out[i].table,
-                   c.in_firewall ? "true" : "false", c.masqueraded ? "true" : "false");
+                   c.in_firewall ? "true" : "false", c.masqueraded || nat4_ours ? "true" : "false");
+            if (nat4_ours || c.masqueraded) fprintf(out, ",\"nat_by\":\"%s\"", nat4_ours ? "steer" : "fw4");
             /* С 1.10 `nat` — подмена IPv4 (masq зоны), а `nat6` — IPv6 (masq6), отдельно
              * (fw_check по семействам, fwcheck.c): прежде одно поле засчитывало любое правило
              * masquerade за оба. `nat6` — только у выхода, который несёт IPv6 (out_route6): у
@@ -293,7 +340,10 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
              * интерфейсу это читалось как поломка. Кем — отдельным полем `nat6_by` («steer» —
              * своя цепочка, она ставится всегда, когда ключ есть; иначе «fw4»), только при
              * `nat6: true`. */
-            if (out_route6(&sp->out[i])) {
+            /* У выхода, что завершает соединения сам (vless, hysteria2, прокси: KC_SELF_NAT), подмены нет ни по
+             * IPv4, ни по IPv6 — адреса клиентов наружу не уходят, и вопрос не стоит. */
+            if (out_route6(&sp->out[i]) &&
+                !out_self_natting(out_for_device(sp, &sp->out[i], sp->out[i].device))) {
                 int ours = out_ipv6_mode_dev(sp, &sp->out[i], sp->out[i].device) == OUT_V6_NAT;
                 fprintf(out, ",\"nat6\":%s", ours || c.masq6 ? "true" : "false");
                 if (ours || c.masq6) fprintf(out, ",\"nat6_by\":\"%s\"", ours ? "steer" : "fw4");
@@ -368,19 +418,41 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
                    sp->out[i].on_fail == FAIL_ZAPRET ? "zapret" : "direct");
             group_emit(out, sp, &sp->out[i]);
         }
-        /* Свои поля вида (kind_ops.status): у vless — выбранные узлы подписки, у interface —
+        /* Свои поля вида (kind_ops.status): у вида плагина — plugin с файлом состояния, у interface —
          * обфускация, у awg — рукопожатие и счётчики из ядра (все три — после on_fail, в объекте
-         * выхода с устройством), у zapret — очередь, файл стратегии и живость обработчика. */
+         * выхода с устройством), у модуля DPI — очередь, файл настройки и живость обработчика. */
         {
             const struct kind_ops *k = kind_of(&sp->out[i]);
             if (k->status) k->status(out, sp, &sp->out[i]);
+            /* Выход, развёрнутый плагином с помощником (группа kind: warp и подобные): состояние
+             * его помощника — тем же полем plugin, что у вида плагина (spec-fields.md, раздел 8). */
+            else plugin_owner_status(out, &sp->out[i]);
         }
         /* То, что о помощнике выхода знает демон по его событиям (у моста tgws — отставленные
          * пути, paths_down): только в ответе демона-супервизора, подкоманда о них не знает. */
         if (g_status_extra) g_status_extra(out, sp->out[i].name);
+        plugso_status_out(out, sp->out[i].name);
         fprintf(out, "}");
     }
-    fprintf(out, "},\"channels\":[");
+    fprintf(out, "}");
+    /* Плагины ядра: id, версия, состояние и причина (spec-fields.md, раздел 8). Поля нет, пока ни
+     * одного плагина на машине нет — status прежний до байта. */
+    if (plugin_n()) {
+        fputs(",\"plugins\":[", out);
+        for (size_t pi = 0; pi < plugin_n(); pi++) {
+            const struct plugin *pl = plugin_at(pi);
+            fprintf(out, "%s{\"id\":", pi ? "," : "");
+            jsonw_str(out, pl->id);
+            fputs(",\"version\":", out);
+            jsonw_str(out, pl->version ? pl->version : "");
+            fprintf(out, ",\"state\":\"%s\",\"why\":", pl->enabled ? "enabled" : "failed");
+            if (pl->why) jsonw_str(out, pl->why);
+            else fputs("null", out);
+            fputc('}', out);
+        }
+        fputc(']', out);
+    }
+    fprintf(out, ",\"channels\":[");
 
     counters_load();
     for (size_t i = 0; i < gr->n; i++) {
@@ -402,7 +474,9 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
             fprintf(out, "%s\"%s\"", m ? "," : "", gr->g[i].members[m]);
         fprintf(out, "]}");
     }
-    fprintf(out, "]}\n");
+    fprintf(out, "]");
+    plugso_status_print(out);
+    fprintf(out, "}\n");
 }
 
 /* Полный ответ: посчитать, запомнить и напечатать в out.
@@ -426,12 +500,29 @@ void status_answer(const struct spec *sp, const struct groups *gr, FILE *out) {
 
     char snap[256], tmp[288];
     status_snap_path(snap, sizeof snap);
-    snprintf(tmp, sizeof tmp, "%s.new", snap);
-    mkdir(steer_state_dir(), 0755);
-    FILE *f = fopen(tmp, "w");
-    if (f) {
-        int ok = fwrite(mem, 1, n, f) == n;
-        if (fclose(f) != 0 || !ok || rename(tmp, snap) != 0) unlink(tmp);
+    /* Снимок пишется, только когда ответ ИЗМЕНИЛСЯ. Демон отвечает на status каждые несколько
+     * секунд (панель опрашивает постоянно), и прежде каждый ответ был записью файла и rename — на
+     * пустом месте, если ничего не менялось (выходы те же, трафика нет). Сравнивается всё, кроме
+     * `at` (момент сборки — первое поле): изменилось что-то, кроме него, — пишем сразу, так что
+     * `status --fast` не теряет свежести данных. Файл исчез (почищен каталог состояния) — пишем. */
+    static uint64_t last_h;
+    static char last_snap[256];
+    const char *body = strstr(mem, ",\"features\"");
+    if (!body) body = mem;
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char *q = (const unsigned char *)body; q < (const unsigned char *)mem + n; q++)
+        h = (h ^ *q) * 1099511628211ull;
+    struct stat sst;
+    int same = h == last_h && !strcmp(last_snap, snap) && stat(snap, &sst) == 0;
+    if (!same) {
+        snprintf(tmp, sizeof tmp, "%s.new", snap);
+        mkdir(steer_state_dir(), 0755);
+        FILE *f = fopen(tmp, "w");
+        if (f) {
+            int ok = fwrite(mem, 1, n, f) == n;
+            if (fclose(f) != 0 || !ok || rename(tmp, snap) != 0) unlink(tmp);
+            else { last_h = h; snprintf(last_snap, sizeof last_snap, "%s", snap); }
+        }
     }
     fwrite(mem, 1, n, out);
     free(mem);

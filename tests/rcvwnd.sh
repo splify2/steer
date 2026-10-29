@@ -1,24 +1,20 @@
 #!/bin/sh
-# Окно приёма стека TUN с настоящим клиентом ядра Linux: масштаб окна (RFC 7323) обязан быть согласован,
-# а выгрузка через туннель при задержке в LAN — не упираться в 64 КБ на круг.
+# Линия клиента с задержкой и потерями: выгрузка через туннель не упирается в «окно на круг» (R-152).
 #
-# ЧТО НАШЛИ. Стек туннеля объявлял клиенту окно 65535 без масштаба (OUR_WSCALE 0 в stack.c): клиент не
-# вправе иметь в пути больше 64 КБ на соединение, а скорость соединения — это окно, делённое на круг.
-# Замер (узел — Xray, клиент — ядро Linux, netem по 3 мс в каждую сторону): выгрузка одним потоком 83 Мбит/с
-# при потолке 65535 байт / 6,1 мс = 86, с масштабом — около 1,4 Гбит/с; в настоящей сети с Wi-Fi (круг 2-5 мс)
-# прежний потолок — 100-250 Мбит/с на соединение, сколько бы ни давали узел и процессор. Без задержки (veth,
-# круг в доли миллисекунды) окно скорость выгрузки не ограничивало: её держит узел.
+# ЧТО БЫЛО. Свой TCP-стек туннеля держал у клиента не больше 64 КБ в пути (сначала окно 65535 без масштаба,
+# потом кольцо повтора RTX_CAP), а скорость соединения — это окно, делённое на круг: при круге 6 мс выгрузка
+# одним потоком шла 83 Мбит/с, в настоящей сети с Wi-Fi (круг 2-5 мс) — 100-250 Мбит/с, сколько бы ни давали
+# узел и процессор; с потерей 0,5 % — десятки Мбит/с (SACK не было, повтор по таймеру). Замер в хабе
+# (STEER_REBUILD.md, «Ход R-152»): на линии «2 мс + 0,5 %» скачивание через TUN — 49 Мбит/с, через слушатель — 5092.
 #
-# ЧТО ПРОВЕРЯЕТ СТЕНД. Модуль steer-vless (прямой запуск, без демона: маршрут на цель — в TUN, как у
-# tests/run-tunnel.sh) принимает выгрузку настоящего клиента ядра, между клиентом и роутером — netem в
-# обе стороны (круг 6 мс), узел — приёмник без шифрования (tests/sigpipe-node.py, порт 82). Дважды:
-#   * по умолчанию — клиент видит в `ss -ti` масштаб окна роутера (wscale:<наш>,<его>), объявленное окно
-#     (snd_wnd) выше 64 КБ, и выгрузка быстрее потолка «64 КБ на круг» больше чем втрое;
-#   * с STEER_TUN_RCVWND=0 (прежнее поведение одной переменной) — масштаба нет (wscale:0), окно не выше
-#     65535, скорость не выше потолка «64 КБ на круг» с запасом на разброс замера.
-# Клиент без опции масштаба в SYN (net.ipv4.tcp_window_scaling=0 в его пространстве) — третий прогон: масштаба
-# нет, окно 65535, выгрузка идёт и не рвётся. Что опции в SYN-ACK на такой SYN нет, проверяет tunnelmatch
-# (клиент её всё равно проигнорировал бы, и в ss этого не видно).
+# ЧТО ПРОВЕРЯЕТ СТЕНД. TCP клиента завершает ядро: правило nat перенаправляет его к слушателю модуля (здесь
+# правило ставит стенд по адресу цели, на роутере — демон по метке выхода). Модуль steer-vless (прямой запуск,
+# без демона) принимает выгрузку настоящего клиента ядра; между клиентом и роутером — netem в обе стороны
+# (круг 6 мс), узел — приёмник без шифрования (tests/sigpipe-node.py, порт 82). Прогоны:
+#   * линия с задержкой — клиент видит у роутера масштаб окна (wscale:<наш>,<его>) и окно выше 64 КБ, и
+#     выгрузка быстрее потолка «64 КБ на круг» больше чем втрое;
+#   * задержка и потеря 0,5 % — выгрузка всё равно быстрее этого потолка больше чем втрое;
+#   * клиент без опции масштаба (net.ipv4.tcp_window_scaling=0) — выгрузка идёт и не рвётся.
 #
 # Нужны root, unshare -nm, ip, tc (netem), ss, nsenter и python3 — иначе пропуск, а не падение.
 # LIBS — раскладка libs (tests/libs-test.sh, build/libs-host).
@@ -37,6 +33,9 @@ check() {
 wait_for() {
     i=0
     while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    # Приговор по фактическому состоянию, а не по счётчику кругов: условие, ставшее истинным в последнюю
+    # десятую секунды, иначе объявлялось бы невыполненным.
+    eval "$1" && return 0
     return 1
 }
 for t in ip tc ss python3 nsenter unshare awk; do command -v $t >/dev/null 2>&1 || skip "$t нет"; done
@@ -126,6 +125,13 @@ run() {
     wait_for 'ip link show vl >/dev/null 2>&1' 20
     wait_for 'grep -q "запасных сессий" "$tmp/mod.log"' 20
     ip route replace "$TARGET/32" dev vl
+    # TCP клиента — к слушателю модуля (порт 9480: единственный выход стенда, место 0).
+    nft list table inet rcvwnd_redir >/dev/null 2>&1 || nft -f - <<NFT
+table inet rcvwnd_redir {
+    chain pre { type nat hook prerouting priority -101; policy accept;
+        ip daddr $TARGET ip protocol tcp counter redirect to :9480; }
+}
+NFT
     # nsenter напрямую, а не функцией C: у функции $! — подоболочка, и kill её не убил бы сам python.
     nsenter -t "$CPID" -n python3 "$tmp/up.py" "$TARGET" "$SECS" >"$tmp/cl.$name" 2>&1 & CL=$!
     sleep "$(awk -v s="$SECS" 'BEGIN { print s / 2 }')"
@@ -145,30 +151,31 @@ mbit() { awk -v b="$(field "$1" bytes_acked)" -v s="$SECS" 'BEGIN { printf "%d",
 CEIL="$(awk -v d="$DELAY" 'BEGIN { printf "%d", 65535 * 8 / (2 * d / 1000) / 1e6 }')"
 
 run scaled STEER_X=1
-run legacy STEER_TUN_RCVWND=0
+C tc qdisc change dev c0 root netem delay "${DELAY}ms" loss 0.5% limit 100000
+tc qdisc change dev p0 root netem delay "${DELAY}ms" loss 0.5% limit 100000
+run lossy STEER_X=1
+C tc qdisc change dev c0 root netem delay "${DELAY}ms" limit 100000
+tc qdisc change dev p0 root netem delay "${DELAY}ms" limit 100000
 C sysctl -qw net.ipv4.tcp_window_scaling=0
 run nows STEER_X=1
 C sysctl -qw net.ipv4.tcp_window_scaling=1
 
 echo "  круг ${DELAY}x2 мс; потолок «64 КБ на круг» — $CEIL Мбит/с"
-for v in scaled legacy nows; do
+for v in scaled lossy nows; do
     echo "  $v: $(mbit "$tmp/ss.end.$v") Мбит/с, snd_wnd $(field "$tmp/ss.mid.$v" snd_wnd), wscale $(field "$tmp/ss.mid.$v" wscale), rtt $(field "$tmp/ss.mid.$v" rtt)"
 done
 
-check "в журнале модуля — окно приёма и множитель, не нулевой" "1" \
-    "$(sed -n 's/.*окно приёма клиентов: до [0-9]* КБ, масштаб \([0-9]*\).*/\1/p' "$tmp/mod.log" | head -n 1 | grep -c '^[1-9]')"
+check "через слушатель: перенаправление сработало (счётчик правила)" "1" \
+    "$([ "$(nft list table inet rcvwnd_redir | grep -o 'packets [0-9]*' | grep -o '[0-9]*')" -ge 3 ] 2>/dev/null && echo 1 || echo 0)"
 # Масштаб — по ss клиента: wscale:<масштаб роутера>,<его собственный>.
-check "по умолчанию клиент видит масштаб окна роутера (wscale:N,... с N > 0)" "1" \
+check "клиент видит масштаб окна роутера (wscale:N,... с N > 0)" "1" \
     "$([ "$(field "$tmp/ss.mid.scaled" wscale | cut -d, -f1)" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
 check "  и окно выше 64 КБ (snd_wnd)" "1" "$([ "$(field "$tmp/ss.mid.scaled" snd_wnd)" -gt 65535 ] 2>/dev/null && echo 1 || echo 0)"
 check "  и выгрузка быстрее потолка «64 КБ на круг» больше чем втрое" "1" \
     "$([ "$(mbit "$tmp/ss.end.scaled")" -gt $((CEIL * 3)) ] && echo 1 || echo 0)"
-check "STEER_TUN_RCVWND=0: масштаба нет (wscale:0,...)" "0" "$(field "$tmp/ss.mid.legacy" wscale | cut -d, -f1)"
-check "  окно не выше 65535" "1" "$([ "$(field "$tmp/ss.mid.legacy" snd_wnd)" -le 65535 ] 2>/dev/null && echo 1 || echo 0)"
-check "  скорость не выше потолка с запасом на разброс (в полтора раза)" "1" \
-    "$([ "$(mbit "$tmp/ss.end.legacy")" -le $((CEIL * 3 / 2)) ] && echo 1 || echo 0)"
-check "клиент без масштаба окна: выгрузка идёт, окно 65535, масштаба нет" "1" \
-    "$([ "$(mbit "$tmp/ss.end.nows")" -gt 10 ] && [ "$(field "$tmp/ss.mid.nows" snd_wnd)" -le 65535 ] && [ -z "$(field "$tmp/ss.mid.nows" wscale)" ] && echo 1 || echo 0)"
+check "потеря 0,5 %: выгрузка быстрее того же потолка больше чем втрое" "1" \
+    "$([ "$(mbit "$tmp/ss.end.lossy")" -gt $((CEIL * 3)) ] && echo 1 || echo 0)"
+check "клиент без масштаба окна: выгрузка идёт, масштаба нет" "1" \
+    "$([ "$(mbit "$tmp/ss.end.nows")" -gt 10 ] && [ -z "$(field "$tmp/ss.mid.nows" wscale)" ] && echo 1 || echo 0)"
 
 echo "rcvwnd: $pass ok, $fail fail"
-[ "$fail" = 0 ]

@@ -1,5 +1,5 @@
-/* Управляющий сокет движка: демон `steer daemon` (он же `steer ctl-serve` — прежнее имя, под
- * которым его запускает сервис телефона) и `steer ctl` (клиент для отладки).
+/* Управляющий сокет движка: демон `steer daemon` (он же `steer ctl-serve` — прежнее имя) и
+ * `steer ctl` (клиент для отладки).
  *
  * ЗАЧЕМ. На роутере управляющий слой splify2 зовёт движок как программу: rpcd исполняет
  * `steer status`, кладёт спеку в /etc/steer и зовёт `steer apply`. На телефоне так нельзя.
@@ -98,8 +98,8 @@
  * не даёт вторичным пользователям настройки сети устройства.
  *
  * ПРЕДЕЛЫ. Не больше четырёх запросов одновременно (пятому — busy сразу, не очередь: очередь
- * держала бы соединения открытыми на неопределённое время); подписчиков — не больше восьми, и
- * они в четыре запроса не входят. Строка 512 байт, тело 1 МиБ (файл списка — 16 МиБ); пять
+ * держала бы соединения открытыми на неопределённое время); подписчиков — сколько позволит RLIMIT_NOFILE
+ * процесса, и они в четыре запроса не входят. Строка 512 байт, тело 1 МиБ (файл списка — 16 МиБ); пять
  * секунд на запрос; у каждой команды через ребёнка свой срок, по истечении — SIGKILL всей
  * группе процессов команды (nft и ip, которых она запустила, тоже). Медленный или молчащий
  * клиент демон не держит: чтение и запись неблокирующие, со сроками, а очередь событий
@@ -142,6 +142,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #ifdef __BIONIC__
 #include <sys/system_properties.h>
@@ -150,6 +151,7 @@
 #include "platform.h"
 #include "spec.h"
 #include "groups.h"
+#include "plugin.h"
 #include "cli.h"
 #include "daemon.h"
 #include "loop.h"
@@ -163,10 +165,10 @@
 #include "nftcompat.h"
 #include "ctl.h"
 #include "ynode.h"
+#include "plugso.h"
+#include "wandev.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
-/* Выключатель движка — то же свойство, за которым следит init (vendor/der/init/steerd.rc). */
-#define STEER_CTL_PROP "persist.der.steer.enabled"
 
 #define CTL_LINE_MAX    512
 /* ТЕЛО СПЕКИ (check, apply) — защита демона от запроса, который просит памяти без меры (тело
@@ -195,7 +197,10 @@
 #define CTL_FILES_MAX   4096
 #define CTL_FILES_TOTAL (128LL * 1024 * 1024)
 #define CTL_FNAME_MAX   64
-#define CTL_OUT_MAX     (1024 * 1024)
+/* Вывод ребёнка и ответ из памяти — до 256 МиБ: это защита от ребёнка, который пишет без
+ * конца, а не рамка для честного ответа. Прежний мегабайт обрезал список соединений и status
+ * большой спеки посреди JSON; ответ сверх предела по-прежнему помечается "truncated". */
+#define CTL_OUT_MAX     (256LL * 1024 * 1024)
 #define CTL_ERR_MAX     (64 * 1024)
 #define CTL_CLIENTS_MAX 4
 #define CTL_REQ_MS      5000
@@ -203,8 +208,10 @@
  * дочитывать непрочитанный остаток запроса после ответа (см. conn_drain). */
 #define CTL_SEND_MS     5000
 #define CTL_DRAIN_MS    1000
-/* ПОДПИСЧИКИ. Восемь — с запасом на приложение (экран и фоновая служба) и отладку из adb;
- * больше незачем, а каждый — открытый дескриптор и очередь в памяти демона.
+/* ПОДПИСЧИКИ. Число не ограничено: подписчики — приложение, отладка из adb и плагины (у
+ * каждого свой), а каждый — открытый дескриптор и очередь в памяти демона. Предел у числа один —
+ * RLIMIT_NOFILE процесса: мягкий предел при старте поднимается до жёсткого (ctl_serve_main), а
+ * упёршись, accept ждёт освободившегося дескриптора (accept_tm).
  *
  * Очередь событий подписчика — 32 КиБ поверх буфера сокета (его демон уменьшает до 16 КиБ,
  * чтобы очередь, которую он видит, и была той, что ограничена). Событие — сотня байт, и
@@ -212,10 +219,8 @@
  * держать для него память дальше значило бы дать одному зависшему клиенту расти в демоне без
  * предела. Переполнение — отключить: подписчик переподключится и спросит status заново, это
  * честнее, чем тихо выбрасывать события из середины потока. */
-#define CTL_SUBS_MAX    8
 #define CTL_SUBQ_MAX    (32 * 1024)
 #define CTL_SUB_SNDBUF  (16 * 1024)
-#define CTL_ALLOW_UIDS  8
 #define CTL_AID_SYSTEM  1000
 #define CTL_USER_RANGE  100000   /* AID_USER_OFFSET: uid = пользователь * 100000 + приложение */
 
@@ -230,13 +235,13 @@ struct ctl_conf {
     const char *state_dir;       /* NULL — умолчание движка, флаг подкомандам не передаётся */
     const char *lists_dir;       /* куда put-file кладёт файлы (lists_dir платформы, --lists-dir) */
     const char *allow_domain;    /* NULL или "" — по домену не пускать */
-    uid_t allow_uid[CTL_ALLOW_UIDS];
+    uid_t *allow_uid;            /* куча: --allow-uid столько раз, сколько дано */
     int allow_uid_n;
     int watch;                   /* --watch: демон — сторож выходов (watchd.c) */
     int watch_period;            /* --watch-period, секунд */
     int supervise;               /* --supervise: помощники и резолвер — дети демона (supd.c) */
     int apply;                   /* --apply: применить спеку при старте (как reload) */
-    const char *dnsd_flags[9];   /* --dnsd-flag: лишние флаги резолверу-ребёнку, NULL в конце */
+    const char **dnsd_flags;     /* --dnsd-flag: лишние флаги резолверу-ребёнку, NULL в конце (куча) */
     int dnsd_flag_n;
     char exe[PATH_MAX];
 };
@@ -337,14 +342,105 @@ static void resp_begin(struct cbuf *r, const char *cmd) {
     if (cmd) { cb_str(r, ",\"cmd\":"); cb_jstr(r, cmd); }
 }
 
-static void resp_error(struct cbuf *r, const char *err, const char *msg) {
+/* Код отказа сервера (docs/errors.md): по тексту — для отказов с постоянной фразой, иначе по виду. */
+static const char *ctl_err_code(const char *err, const char *msg) {
+    static const struct { const char *msg, *code; } T[] = {
+        { "слишком много слов в запросе", "ctl.too_many_words" },
+        { "пустое слово: слова разделяются одним пробелом", "ctl.empty_word" },
+        { "такой команды нет", "ctl.unknown_command" },
+        { "сервер занят другими запросами — повторите позже", "ctl.busy" },
+        { "нужна длина тела последним словом", "ctl.need_body_length" },
+        { "длина тела — десятичное число байт", "ctl.bad_body_length" },
+        { "не то число слов у команды", "ctl.wrong_word_count" },
+        { "нет памяти под тело", "ctl.no_memory" },
+        { "нет памяти под ответ", "ctl.no_memory" },
+        { "нет памяти", "ctl.no_memory" },
+        { "тело не пришло целиком за 5 секунд", "ctl.body_timeout" },
+        { "запрос не пришёл целиком за 5 секунд", "ctl.request_timeout" },
+        { "строка запроса длиннее 512 байт", "ctl.line_too_long" },
+        { "этому процессу управлять ядром steer нельзя", "ctl.denied" },
+        { "не удалось начать обработку запроса", "ctl.cannot_start" },
+        { "не удалось дождаться ядра", "ctl.wait_failed" },
+        { "не удалось запустить ядро", "ctl.spawn_failed" },
+        { "команда не уложилась в свой срок и остановлена", "ctl.timeout" },
+        { "проверка не уложилась в свой срок и остановлена", "ctl.timeout" },
+        { "применение не уложилось в свой срок и остановлено", "ctl.timeout" },
+        { "не удалось записать временный файл спеки", "ctl.spec_tmp_failed" },
+        { "не удалось записать временный файл тела", "ctl.body_tmp_failed" },
+        { "не записать тело во временный файл", "ctl.body_tmp_failed" },
+        { "план применения не разобран", "ctl.plan_unreadable" },
+        { "не удалось заменить спеку", "ctl.spec_replace_failed" },
+        { "не удалось создать каталог списков", "ctl.lists_dir_failed" },
+        { "каталог списков — не каталог", "ctl.lists_dir_not_dir" },
+        { "слишком длинный путь каталога списков", "ctl.lists_path_long" },
+        { "не удалось создать временный файл в каталоге списков", "ctl.lists_tmp_failed" },
+        { "не удалось записать файл (нет места?)", "ctl.file_write_failed" },
+        { "файлы списков заняли бы больше 128 МиБ — уберите ненужные (rm-file)", "ctl.lists_total_big" },
+        { "не удалось прочитать сохранённую спеку", "ctl.saved_spec_unreadable" },
+        { "файл упомянут в сохранённой спеке — сначала примените спеку без него", "ctl.file_in_use" },
+        { "не удалось удалить файл", "ctl.file_remove_failed" },
+        { "недопустимое имя плагина в теле", "ctl.bad_plugin_name" },
+        { "тело — id плагинов через пробел", "ctl.body_plugin_ids" },
+        { "тело — объект JSON с id и state", "ctl.body_plugin_event" },
+        { "не удалось прочитать спеку", "ctl.spec_unreadable" },
+    };
+    for (size_t i = 0; i < sizeof(T) / sizeof(*T); i++)
+        if (!strcmp(T[i].msg, msg)) return T[i].code;
+    if (!strcmp(err, "bad-request")) return "ctl.bad_request";
+    if (!strcmp(err, "too-large")) return "ctl.too_large";
+    if (!strcmp(err, "unknown-command")) return "ctl.unknown_command";
+    if (!strcmp(err, "denied")) return "ctl.denied";
+    if (!strcmp(err, "busy")) return "ctl.busy";
+    if (!strcmp(err, "timeout")) return "ctl.timeout";
+    if (!strcmp(err, "in-use")) return "ctl.in_use";
+    return "ctl.internal";
+}
+
+/* error — вид отказа (прежнее слово), message — фраза для журнала и командной строки, code — машинное слово
+ * (docs/errors.md), args — подстановки (у отказов с числами в тексте — они же; у остальных пусто). */
+static void resp_errorc(struct cbuf *r, const char *err, const char *msg, const char *code, const char *args) {
     cb_str(r, ",\"error\":");
     cb_jstr(r, err);
     cb_str(r, ",\"message\":");
     cb_jstr(r, msg);
+    cb_str(r, ",\"code\":");
+    cb_jstr(r, code ? code : ctl_err_code(err, msg));
+    cb_str(r, ",\"args\":");
+    cb_str(r, args ? args : "{}");
+}
+
+static void resp_error(struct cbuf *r, const char *err, const char *msg) {
+    resp_errorc(r, err, msg, NULL, NULL);
+}
+
+/* Строка JSON отказа подкоманды (err_json, STEER_ERR_JSON) — последняя строка stderr: вынуть её из stderr и
+ * положить в ответ как ecode и args. Поле code здесь занято кодом возврата подкоманды, поэтому слово — ecode. */
+static void resp_ecode(struct cbuf *r, struct cbuf *err) {
+    if (!err->p || err->n < 16) return;
+    char *end = err->p + err->n;
+    while (end > err->p && (end[-1] == '\n' || end[-1] == ' ')) end--;
+    char *ls = end;
+    while (ls > err->p && ls[-1] != '\n') ls--;
+    if (strncmp(ls, "{\"ok\":false,\"error\":\"", 21) != 0) return;
+    *end = 0;
+    char *c = strstr(ls, ",\"code\":\"");
+    if (c) {
+        c += 9;
+        char *q = strchr(c, '"');
+        char *a = q ? strstr(q, "\"args\":") : NULL;
+        if (q && a && end[-1] == '}') {
+            cb_str(r, ",\"ecode\":\"");
+            cb_put(r, c, (size_t)(q - c));
+            cb_str(r, "\",\"args\":");
+            cb_put(r, a + 7, (size_t)(end - 1 - (a + 7)));
+        }
+    }
+    err->n = (size_t)(ls - err->p);
+    err->p[err->n] = 0;
 }
 
 static void resp_run(struct cbuf *r, int code, struct cbuf *out, struct cbuf *err) {
+    resp_ecode(r, err);
     cb_utf8_trim(out);
     cb_utf8_trim(err);
     cb_fmt(r, ",\"code\":%d,\"stdout\":", code);
@@ -404,6 +500,9 @@ static void ctl_refuse_now(int c, const char *err, const char *msg) {
 /* ---- выключатель движка ---------------------------------------------------------------- */
 
 #ifdef __BIONIC__
+/* Выключатель движка — то же свойство, за которым следит init (vendor/der/init/steerd.rc). */
+#define STEER_CTL_PROP "persist.der.steer.enabled"
+
 static void ctl_prop_cb(void *cookie, const char *name, const char *value, uint32_t serial) {
     (void)name; (void)serial;
     snprintf((char *)cookie, PROP_VALUE_MAX, "%s", value);
@@ -451,6 +550,15 @@ enum ctl_argkind {
     CA_INT,       /* целое в [lo, hi] */
     CA_LIT,       /* ровно слово lit; уходит в argv одним флагом без значения */
     CA_FILE,      /* имя файла списка: [A-Za-z0-9_.-], до 64 знаков, не с «-»/«.», без «..» */
+    /* Слова команд плагинов (plugin-*, src/pluginmgr): */
+    CA_PLUGIN,    /* id плагина: [a-z0-9][a-z0-9-]*, до 64 знаков (manifest.md) */
+    CA_VER,       /* версия: semver, [0-9A-Za-z.+~-], начинается с цифры, до 64 знаков */
+    CA_WORD,      /* слово поиска: печатное без пробелов, не с «-», до 64 знаков */
+    CA_URL,       /* адрес репозитория: http(s)://, печатное без пробелов, до 400 знаков */
+    CA_KEYID,     /* номер ключа usign: ровно 16 знаков hex */
+    CA_REPO,      /* имя репозитория: [A-Za-z0-9_.-], не с «-»/«.», до 64 знаков */
+    CA_ONOFF,     /* on или off */
+    CA_JOBID,     /* номер задания менеджера: [0-9-], до 32 знаков */
 };
 
 struct ctl_arg {
@@ -523,7 +631,7 @@ struct conn {
     struct ctl_srv *srv;
     int fd;
     enum conn_state st;
-    int counted;              /* входит в четыре одновременных запроса */
+    int counted;              /* занимает одно из четырёх мест (CTL_CLIENTS_MAX) */
     int hup;                  /* собеседник ушёл, пока команда шла: ответ отдавать некому */
     int eof;                  /* подписчик закрыл свою половину — читать больше нечего */
     struct loop_timer *tm;    /* срок запроса, отдачи или дочитывания */
@@ -561,6 +669,7 @@ struct conn {
      * (srv_lan). */
     int resync;
     struct recon_kernel kern; /* ядро после nft -f apply-commit (строка recon-kernel) */
+    struct ctl_cmd pcmd;      /* строка команды плагина (plugin_ctl_cmd): её адрес — в q.cmd */
 };
 
 struct ctl_srv {
@@ -612,9 +721,13 @@ static void mem_helper(struct conn *c, struct cbuf *r);
 static void st_apply(struct conn *c);
 static void st_check(struct conn *c);
 static void st_reload(struct conn *c);
-static void st_sub_check(struct conn *c);
+static void st_plugcmd_body(struct conn *c);
+static int plugin_ctl_cmd(const char *name, struct ctl_cmd *k);
 static void st_subscribe(struct conn *c);
 static void st_repair(struct conn *c);
+static void st_plugin(struct conn *c);
+static void st_plugin_reload(struct conn *c);
+static void mem_plugin_event(struct conn *c, struct cbuf *r);
 
 /* ТАБЛИЦА — единственное, что сервер умеет. Команда, которой здесь нет, не исполняется ни в
  * каком виде: слова запроса никогда не становятся именем подкоманды, в argv идут только
@@ -629,18 +742,18 @@ static void st_repair(struct conn *c);
  * с каталогом, которую делает сам демон, и подкоманда ради неё была бы вторым путём записи в
  * каталог, которым никто, кроме сервера, не пользуется.
  *
- * Сроки детей: vless-probe без номера узла перебирает узлы подписки по очереди, каждый со своим --timeout;
- * check и apply — свои (см. st_check, st_apply). */
+ * Сроки детей — у строк; check и apply — свои (см. st_check, st_apply).
+ *
+ * КОМАНДЫ ПЛАГИНОВ (steer-api.md, 4.3). Подкоманда из манифеста с `ctl` получает строку здесь же,
+ * собранную из манифеста (plugin_ctl_cmd): слова — по видам ctl.args, срок — ctl.timeout_s, тело —
+ * файлом (ctl.body: file). Исполняет её ребёнок `steerd <команда> <слова…>` — тот же путь, что у
+ * человека в shell (plugin_cmd_exec), с --spec и --state-dir демона: у команды с conf по ним ядро
+ * кладёт {conf} выхода. Имён команд плагинов ядро не знает; команда ядра с тем же именем — первая. */
 static const struct ctl_cmd CTL_CMDS[] = {
     {"version",     NULL, mem_version, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
     {"status",      NULL, mem_status, NULL, 0, 0, 1, {{CA_LIT, "--fast", "fast", 0, 0}}, 0, 0, 0},
     {"diag",        NULL, mem_diag, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
     {"explain",     NULL, mem_explain, NULL, 0, 1, 1, {{CA_TARGET, NULL, NULL, 0, 0}}, 0, 0, 0},
-    {"vless-nodes", "vless-nodes", NULL, NULL, 0, 1, 1, {{CA_NAME, NULL, NULL, 0, 0}}, 15, 1, 0},
-    {"vless-probe", "vless-probe", NULL, NULL, 0, 1, 3,
-        {{CA_NAME, NULL, NULL, 0, 0},
-         {CA_INT, "--node", NULL, -1, 9999},
-         {CA_INT, "--timeout", NULL, 1, 30}}, 180, 1, 0},
     {"check",       NULL, NULL, st_check,  CTL_BODY_MAX, 0, 0, {{0}}, 0, 1, 1},
     {"apply",       NULL, NULL, st_apply,  CTL_BODY_MAX, 0, 0, {{0}}, 0, 1, 1},
     {"reload",      NULL, NULL, st_reload, 0, 0, 0, {{0}}, 0, 1, 1},
@@ -650,12 +763,43 @@ static const struct ctl_cmd CTL_CMDS[] = {
     {"put-file",    NULL, ctl_do_put_file, NULL, CTL_FILE_MAX, 1, 1, {{CA_FILE, NULL, NULL, 0, 0}}, 0, 0, 0},
     {"list-files",  NULL, ctl_do_list_files, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
     {"rm-file",     NULL, ctl_do_rm_file, NULL, 0, 1, 1, {{CA_FILE, NULL, NULL, 0, 0}}, 0, 0, 1},
-    {"sub-check",   NULL, NULL, st_sub_check, CTL_FILE_MAX, 0, 0, {{0}}, 0, 0, 0},
     {"subscribe",   NULL, NULL, st_subscribe, 0, 0, 0, {{0}}, 0, 0, 0},
     /* Выбор члена группы pick: manual (docs/ctl.md): в процессе, без apply — изменяющая, идёт по
      * одной с apply и reload (они пишут те же таблицы). */
     {"select",      NULL, mem_select, NULL, 0, 2, 2,
         {{CA_NAME, NULL, NULL, 0, 0}, {CA_NAME, NULL, NULL, 0, 0}}, 0, 0, 1},
+    /* МЕНЕДЖЕР ПЛАГИНОВ (steer-api.md, 4.2; src/pluginmgr): ребёнок `steerd plugin <действие> … --json`,
+     * тот же, что у человека в shell. Изменяющие идут под СВОЕЙ блокировкой менеджера (flock), а не в
+     * очереди apply: установка ждёт сеть и проверку здоровья до десяти минут, а проверке здоровья
+     * нужен plugin-reload — изменяющая команда демона; в общей очереди они ждали бы друг друга.
+     * Занятый менеджер отвечает «busy: …» кодом 1. Сам plugin-reload — в очереди apply.
+     * Тело plugin-repo-add — открытый ключ, plugin-install-file — архив .s2p, plugin-ensure — id
+     * плагинов через пробел (их может быть сколько угодно, а слов в строке запроса — пять). */
+    {"plugin-list",         "list", NULL, st_plugin, 0, 0, 0, {{0}}, 60, 0, 0},
+    {"plugin-search",       "search", NULL, st_plugin, 0, 0, 1, {{CA_WORD, NULL, NULL, 0, 0}}, 180, 0, 0},
+    {"plugin-status",       "status", NULL, st_plugin, 0, 0, 1, {{CA_PLUGIN, NULL, NULL, 0, 0}}, 60, 0, 0},
+    {"plugin-install",      "install", NULL, st_plugin, 0, 1, 2,
+        {{CA_PLUGIN, NULL, NULL, 0, 0}, {CA_VER, NULL, NULL, 0, 0}}, 600, 0, 0},
+    {"plugin-install-file", "install", NULL, st_plugin, 64L * 1024 * 1024, 0, 1,
+        {{CA_LIT, "--unsigned", "unsigned", 0, 0}}, 600, 0, 0},
+    {"plugin-update",       "update", NULL, st_plugin, 0, 0, 1, {{CA_PLUGIN, NULL, NULL, 0, 0}}, 3600, 0, 0},
+    {"plugin-remove",       "remove", NULL, st_plugin, 0, 1, 3,
+        {{CA_PLUGIN, NULL, NULL, 0, 0}, {CA_LIT, "--force", "force", 0, 0}, {CA_LIT, "--purge", "purge", 0, 0}}, 300, 0, 0},
+    {"plugin-enable",       "enable", NULL, st_plugin, 0, 1, 1, {{CA_PLUGIN, NULL, NULL, 0, 0}}, 300, 0, 0},
+    {"plugin-disable",      "disable", NULL, st_plugin, 0, 1, 1, {{CA_PLUGIN, NULL, NULL, 0, 0}}, 300, 0, 0},
+    {"plugin-autoupdate",   "autoupdate", NULL, st_plugin, 0, 2, 2,
+        {{CA_PLUGIN, NULL, NULL, 0, 0}, {CA_ONOFF, NULL, NULL, 0, 0}}, 30, 0, 0},
+    {"plugin-ensure",       "ensure", NULL, st_plugin, 64 * 1024, 0, 0, {{0}}, 3600, 0, 0},
+    {"plugin-job",          "job", NULL, st_plugin, 0, 1, 1, {{CA_JOBID, NULL, NULL, 0, 0}}, 10, 0, 0},
+    {"plugin-repo-list",    "repo list", NULL, st_plugin, 0, 0, 0, {{0}}, 30, 0, 0},
+    {"plugin-repo-add",     "repo add", NULL, st_plugin, 64 * 1024, 2, 2,
+        {{CA_URL, NULL, NULL, 0, 0}, {CA_KEYID, NULL, NULL, 0, 0}}, 120, 0, 0},
+    {"plugin-repo-del",     "repo del", NULL, st_plugin, 0, 1, 1, {{CA_REPO, NULL, NULL, 0, 0}}, 30, 0, 0},
+    /* Перечитать плагины (реестр ядра, kinds/plugin.c) и спеку — как reload; зовёт менеджер после
+     * каждого изменения. Изменяющая: в очереди с apply. */
+    {"plugin-reload",       NULL, NULL, st_plugin_reload, 0, 0, 0, {{0}}, 0, 1, 1},
+    /* Событие `plugin` подписчикам: менеджер сообщает, что сделал (тело — объект JSON). */
+    {"plugin-event",        NULL, mem_plugin_event, NULL, 64 * 1024, 0, 0, {{0}}, 0, 0, 0},
 };
 
 static const struct ctl_cmd *ctl_lookup(const char *name) {
@@ -711,6 +855,48 @@ static const char *ctl_arg_bad(const struct ctl_arg *a, const char *w) {
         }
         return NULL;
     }
+    case CA_PLUGIN:
+        if (!n || n > 64) return "недопустимое имя плагина";
+        if (!((w[0] >= 'a' && w[0] <= 'z') || (w[0] >= '0' && w[0] <= '9'))) return "недопустимое имя плагина";
+        for (size_t i = 0; i < n; i++)
+            if (!((w[i] >= 'a' && w[i] <= 'z') || (w[i] >= '0' && w[i] <= '9') || w[i] == '-'))
+                return "недопустимое имя плагина";
+        return NULL;
+    case CA_VER:
+        if (!n || n > 64 || !(w[0] >= '0' && w[0] <= '9')) return "недопустимая версия";
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)w[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '.' || c == '+' || c == '~' || c == '-'))
+                return "недопустимая версия";
+        }
+        return NULL;
+    case CA_WORD:
+    case CA_URL:
+        if (!n || n > (a->kind == CA_URL ? 400u : 64u)) return "слишком длинное или пустое слово";
+        if (w[0] == '-') return "слово не может начинаться с «-»";
+        for (size_t i = 0; i < n; i++)
+            if ((unsigned char)w[i] <= ' ' || w[i] == 0x7f) return "недопустимый знак";
+        if (a->kind == CA_URL && strncmp(w, "https://", 8) && strncmp(w, "http://", 7))
+            return "адрес репозитория — https://…";
+        return NULL;
+    case CA_KEYID:
+        if (n != 16 || strspn(w, "0123456789abcdefABCDEF") != 16) return "номер ключа — 16 знаков hex";
+        return NULL;
+    case CA_REPO:
+        if (!n || n > 64 || w[0] == '-' || w[0] == '.') return "недопустимое имя репозитория";
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)w[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '.' || c == '-'))
+                return "недопустимое имя репозитория";
+        }
+        return NULL;
+    case CA_ONOFF:
+        return strcmp(w, "on") && strcmp(w, "off") ? "нужно on или off" : NULL;
+    case CA_JOBID:
+        if (!n || n > 32 || strspn(w, "0123456789-") != n || w[0] == '-') return "недопустимый номер задания";
+        return NULL;
     default:
         return "лишнее слово";
     }
@@ -828,12 +1014,17 @@ static void conn_reply(struct conn *c) {
 }
 
 /* Отказ посреди запроса: всё, что успели дописать в ответ, выбрасывается. */
-static void conn_refuse(struct conn *c, const char *cmd, const char *err, const char *msg) {
+static void conn_refusec(struct conn *c, const char *cmd, const char *err, const char *msg, const char *code,
+                         const char *args) {
     c->resp.n = 0;
     c->resp.trunc = 0;
     resp_begin(&c->resp, cmd);
-    resp_error(&c->resp, err, msg);
+    resp_errorc(&c->resp, err, msg, code, args);
     conn_reply(c);
+}
+
+static void conn_refuse(struct conn *c, const char *cmd, const char *err, const char *msg) {
+    conn_refusec(c, cmd, err, msg, NULL, NULL);
 }
 
 /* ---- ребёнок ------------------------------------------------------------------------------ */
@@ -923,13 +1114,13 @@ static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t o
     /* Ход перебора узлов vless из памяти супервизора (--supervise) — ребёнку в окружение: клиенты
      * с трубой событий файлов probe-* не пишут, а подкоманды спрашивают probe_read. Запись
      * потерянного узла несёт причину (закодированной — до пятисот байт на выход), отсюда запас. */
-    char pmem[4096];
-    supd_probe_env(s->d.sup, pmem, sizeof(pmem));
-    if (pipe2(po, O_CLOEXEC) != 0) return -1;
-    if (pipe2(pe, O_CLOEXEC) != 0) { close(po[0]); close(po[1]); return -1; }
+    char *pmem = supd_probe_env(s->d.sup);      /* без предела: строка в куче по числу выходов */
+    if (pipe2(po, O_CLOEXEC) != 0) { free(pmem); return -1; }
+    if (pipe2(pe, O_CLOEXEC) != 0) { close(po[0]); close(po[1]); free(pmem); return -1; }
     pid_t pid = fork();
     if (pid < 0) {
         close(po[0]); close(po[1]); close(pe[0]); close(pe[1]);
+        free(pmem);
         return -1;
     }
     if (pid == 0) {
@@ -943,11 +1134,13 @@ static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t o
         /* Сигналы цикла заблокированы, SIGPIPE игнорируется — и то и другое наследуется
          * через exec, а подкоманды рассчитывают на обычное поведение. */
         loop_child_reset();
-        if (pmem[0]) putenv(pmem);
+        if (pmem) putenv(pmem);
+        setenv("STEER_ERR_JSON", "1", 1);   /* отказ подкоманды — ещё и строкой JSON с кодом (docs/errors.md) */
         execv(s->cf.exe, argv);
         dprintf(2, LOG_W "не запустить %s: %s\n", s->cf.exe, strerror(errno));
         _exit(127);
     }
+    free(pmem);
     close(po[1]);
     close(pe[1]);
     /* Неблокирующим — только наш конец: у ребёнка stdout обычный. */
@@ -1029,6 +1222,13 @@ static FILE *mem_begin(struct mem_run *m) {
     return m->f;
 }
 
+/* Отказ команды в процессе: текст и строка JSON с кодом в stderr (resp_ecode вынет её в ecode/args). */
+static void mem_err_print(const struct err *e) {
+    fprintf(stderr, "steer: %s\n", e->msg);
+    char b[2048];
+    if (err_json(e, b, sizeof(b)) > 0) fprintf(stderr, "%s\n", b);
+}
+
 static void mem_end(struct mem_run *m, struct cbuf *r, int code) {
     struct cbuf out = { .max = CTL_OUT_MAX }, err = { .max = CTL_ERR_MAX };
     fflush(stderr);
@@ -1052,6 +1252,15 @@ static void mem_end(struct mem_run *m, struct cbuf *r, int code) {
 /* Отказ разбора спеки — тем же текстом, что err_die у подкоманды. */
 static int mem_no_spec(const struct steerd *d) {
     fprintf(stderr, "%s%s\n", "steer: ", d->err);
+    if (d->err_code[0]) {               /* слово и подстановки — строкой JSON, её вынет resp_ecode */
+        struct err e;
+        memset(&e, 0, sizeof(e));
+        snprintf(e.msg, sizeof(e.msg), "%s", d->err);
+        snprintf(e.code, sizeof(e.code), "%s", d->err_code);
+        snprintf(e.args, sizeof(e.args), "%s", d->err_args);
+        char b[4096];
+        if (err_json(&e, b, sizeof(b)) > 0) fprintf(stderr, "%s\n", b);
+    }
     return 2;
 }
 
@@ -1092,7 +1301,7 @@ static void mem_status(struct conn *c, struct cbuf *r) {
     } else {
         memcpy(d->view, d->sp, sizeof(*d->view));
         /* Выбор устройств — из памяти сторожа, если сторож — сам демон (--watch); иначе из
-         * файла, который пишет `failover --loop`. */
+         * файла, который пишет `steer failover`. */
         outputs_adopt_active_st(d->view, d->outs ? d->outs : &fo_store_files);
         /* Дамп ruleset для fw_check — один на процесс подкоманды; у демона процесс один на
          * всё время, и дамп берётся заново на каждый ответ. */
@@ -1192,7 +1401,10 @@ static void mem_helper(struct conn *c, struct cbuf *r) {
     if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
     int code = 0;
     if (supd_helper_json(d->sup, c->q.argv[0], f) != 0) {
-        fprintf(stderr, "steer: helper: у выхода %s нет помощника под этим демоном\n", c->q.argv[0]);
+        struct err e;
+        memset(&e, 0, sizeof(e));
+        err_setf(&e, "ctl.helper_missing", "helper: у выхода %s нет помощника под этим демоном", c->q.argv[0]);
+        mem_err_print(&e);
         code = 1;
     }
     mem_end(&m, r, code);
@@ -1205,7 +1417,9 @@ static void mem_dns_log(struct conn *c, struct cbuf *r) {
     struct mem_run m;
     FILE *f = mem_begin(&m);
     if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
+    setenv("STEER_ERR_JSON", "1", 1);          /* отказ — ещё и строкой JSON с кодом, как у подкоманд */
     int code = dlog_print(f);
+    unsetenv("STEER_ERR_JSON");
     mem_end(&m, r, code);
 }
 
@@ -1345,9 +1559,12 @@ static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled,
     } else {
         changed_json(&cj, d, NULL);
         fprintf(stderr, LOG_W "спека не прочитана (%s): %s\n", by, s->d.err);
-        char m[2304], f[2560];
+        char m[2304], f[3400];
         steerd_json_str(m, sizeof(m), s->d.err);
-        snprintf(f, sizeof(f), ",\"by\":\"%s\",\"message\":%s", by, m);
+        size_t fn = (size_t)snprintf(f, sizeof(f), ",\"by\":\"%s\",\"message\":%s", by, m);
+        if (s->d.err_code[0] && fn < sizeof(f))     /* слово и подстановки отказа (docs/errors.md) */
+            snprintf(f + fn, sizeof(f) - fn, ",\"code\":\"%s\",\"args\":%s", s->d.err_code,
+                     s->d.err_args[0] ? s->d.err_args : "{}");
         steerd_emit(&s->d, "spec-error", f);
     }
     if (changed && cj.p) cb_put(changed, cj.p, cj.n);
@@ -1600,6 +1817,18 @@ static void apply_committed(struct conn *c, int code) {
     resp_bool(&c->resp, "saved", 1);
     resp_bool(&c->resp, "applied", 1);
     resp_bool(&c->resp, "enabled", 1);
+    /* Что изменили хуки плагинов при подготовке спеки (pre_apply, expand): отчёт шага
+     * подготовки (model/plugprep.c) — поле plugins. Нет хуков, нет и поля. */
+    {
+        char *rep = NULL;
+        if (spec_prepare_report(spec, &rep) == 0) {
+            size_t rl = strlen(rep);
+            while (rl && (rep[rl - 1] == '\n' || rep[rl - 1] == ' ')) rep[--rl] = '\0';
+            cb_str(&c->resp, ",\"plugins\":");      /* отчёт любой длины: cb_fmt режет на 1 КиБ */
+            cb_str(&c->resp, rep);
+            free(rep);
+        }
+    }
     c->after_reload = apply_finish;
     reload_begin(c);
 }
@@ -1756,6 +1985,8 @@ static void reload_done(struct conn *c) {
     /* Стартовое применение кончилось — удачно или нет: теперь первый проход сторожа (см.
      * «ПЕРВЫЙ ПРОХОД — ПОСЛЕ СТАРТОВОГО APPLY» в watchd.c). */
     if (c->boot) watchd_release(c->srv->watch);
+    /* @wan_dev напечатан заново; маршрут мог смениться, пока шло применение. */
+    wandev_sync(1);
     struct ctl_srv *s = c->srv;
     int resync = c->resync;
     conn_reply(c);
@@ -1932,10 +2163,11 @@ static void ctl_do_put_file(struct conn *c, struct cbuf *r) {
     long long bytes;
     ctl_lists_usage(dir, name, &files, &bytes);
     if (files >= CTL_FILES_MAX) {
-        char why[256];
+        char why[256], a[48];
         snprintf(why, sizeof(why), "в каталоге списков уже %d файлов — предел от бесконечной заливки; "
                  "уберите ненужные (rm-file)", CTL_FILES_MAX);
-        resp_error(r, "too-large", why);
+        snprintf(a, sizeof(a), "{\"1\":\"%d\"}", CTL_FILES_MAX);
+        resp_errorc(r, "too-large", why, "ctl.lists_files_max", a);
         return;
     }
     if (bytes + (long long)q->body_n > CTL_FILES_TOTAL) {
@@ -2017,6 +2249,8 @@ static void ctl_do_list_files(struct conn *c, struct cbuf *r) {
     cb_str(r, "]");
 }
 
+/* Упомянут ли путь в тексте спеки — строкой JSON, как его пишет приложение ("…/lists/имя"),
+ * или с экранированными косыми ("…\/lists\/имя": так пишут некоторые сериализаторы JSON). */
 /* Упоминает ли спека файл path. Спека разбирается тем же ynode, что читает её ядро (YAML и JSON), и
  * путь сверяется с КАЖДЫМ скаляром: прежде путь искался текстом только в двойных кавычках, а в YAML
  * путь пишется без них — и rm-file удалял файл, на который спека ссылается. Относительный путь спеки
@@ -2045,7 +2279,7 @@ static int ctl_spec_mentions(const struct cbuf *spec, const char *path, const ch
     char dir[PATH_MAX] = "";
     const char *sl = spec_path ? strrchr(spec_path, '/') : NULL;
     if (sl && (size_t)(sl - spec_path) < sizeof(dir)) snprintf(dir, sizeof(dir), "%.*s", (int)(sl - spec_path), spec_path);
-    struct err e = { { 0 } };
+    struct err e = {0};
     struct ydoc *d = ydoc_parse_buf(spec->p, strlen(spec->p), "spec", &e);
     if (d) {
         int m = ynode_mentions(ydoc_root(d), path, dir);
@@ -2098,36 +2332,62 @@ static void ctl_do_rm_file(struct conn *c, struct cbuf *r) {
     free(spec.p);
 }
 
-static void sub_check_done(struct conn *c, int code) {
+/* ---- команды плагинов (steer-api.md, 4.3) --------------------------------------------------------- */
+
+/* Строка таблицы для подкоманды плагина name из манифеста. 0 — есть; -1 — такой подкоманды с ctl нет
+ * или слов у неё больше, чем держит строка таблицы (args). */
+static int plugin_ctl_cmd(const char *name, struct ctl_cmd *k) {
+    const struct plugin_cmd *pc = plugin_cmd_find(name);
+    if (!pc || !pc->ctl || pc->ctl_args_n > sizeof(k->args) / sizeof(k->args[0])) return -1;
+    memset(k, 0, sizeof(*k));
+    k->name = pc->name;
+    k->sub = pc->name;
+    k->start = pc->ctl_body_max ? st_plugcmd_body : NULL;
+    k->body = pc->ctl_body_max;
+    k->argmax = (int)pc->ctl_args_n;
+    k->argmin = k->argmax - pc->ctl_optional < 0 ? 0 : k->argmax - pc->ctl_optional;
+    for (size_t i = 0; i < pc->ctl_args_n; i++) {
+        const struct plugin_ctl_arg *a = &pc->ctl_args[i];
+        struct ctl_arg *t = &k->args[i];
+        t->kind = !strcmp(a->kind, "name") ? CA_NAME : !strcmp(a->kind, "int") ? CA_INT :
+                  !strcmp(a->kind, "target") ? CA_TARGET : !strcmp(a->kind, "file") ? CA_FILE : CA_WORD;
+        t->flag = a->flag;
+        t->lo = a->lo;
+        t->hi = a->hi;
+    }
+    k->timeout_s = pc->ctl_timeout_s > 0 ? pc->ctl_timeout_s : 60;
+    k->spec = pc->conf;
+    k->lock = pc->ctl_lock;
+    return 0;
+}
+
+static void plugcmd_body_done(struct conn *c, int code) {
     unlink(c->tmp);
     if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться ядра"); conn_reply(c); return; }
     resp_run(&c->resp, code, &c->job.out, &c->job.err);
-    if (c->job.timed_out) resp_error(&c->resp, "timeout", "разбор подписки не уложился в свой срок и остановлен");
+    if (c->job.timed_out) resp_error(&c->resp, "timeout", "команда не уложилась в свой срок и остановлена");
     conn_reply(c);
 }
 
-/* sub-check <длина> + тело — разобрать присланный файл подписки, ничего не сохраняя: сколько
- * узлов пригодно, сколько пропущено и почему. Нужно приложению ДО того, как подписка станет
- * файлом выхода: скачав её, логика показывает человеку «пригодно 12, пропущено 3 — ws не
- * поддерживается» и решает, заливать ли (put-file).
- *
- * Разбирает не демон, а `steer vless-nodes <файл>` ребёнком — та же подкоманда, тем же
- * разбором (vless_parse_sub), что и подъём выхода: второй разбор «для проверки» разошёлся бы с
- * тем, которым узлы потом поднимаются. Тело кладётся во временный файл каталога времянок
- * движка (путь абсолютный — по нему vless-nodes отличает файл от имени выхода) и удаляется
- * сразу после разбора. В ответе — код и вывод подкоманды как есть; поле sub_file в её JSON —
- * имя этого временного файла, для приложения оно ничего не значит. В базовой сборке (без
- * VLESS) подкоманда честно отказывает кодом 2, как vless-nodes. */
-static void st_sub_check(struct conn *c) {
+/* Команда плагина с телом (ctl.body: file): тело — во временный файл каталога времянок движка, его путь
+ * (абсолютный) — последним словом подкоманды; файл удаляется, когда она кончится. Так `sub-check`
+ * плагина vless разбирает присланную подписку, ничего не сохраняя. */
+static void st_plugcmd_body(struct conn *c) {
     char stem[PATH_MAX];
-    snprintf(stem, sizeof stem, "%s/sub-check", plat()->tmp_dir);
+    snprintf(stem, sizeof stem, "%s/%s", plat()->tmp_dir, c->q.cmd->name);
     if (ctl_write_tmp(stem, c->q.body, c->q.body_n, c->tmp, sizeof(c->tmp)) != 0) {
-        resp_error(&c->resp, "internal", "не удалось записать временный файл подписки");
+        resp_error(&c->resp, "internal", "не удалось записать временный файл тела");
         conn_reply(c);
         return;
     }
-    char *av[4] = { c->srv->cf.exe, "vless-nodes", c->tmp, NULL };
-    if (job_start(c, av, 15, CTL_OUT_MAX, CTL_ERR_MAX, sub_check_done) != 0) {
+    char *av[20];
+    size_t n = ctl_argv(&c->q, c->q.cmd->sub, av, sizeof(av) / sizeof(av[0]) - 1);
+    /* Путь тела — после слов, до --spec (ctl_argv кладёт его последним). */
+    size_t at = n;
+    for (size_t i = 2; i < n; i++) if (!strcmp(av[i], "--spec")) { at = i; break; }
+    memmove(&av[at + 1], &av[at], (n - at + 1) * sizeof(*av));
+    av[at] = c->tmp;
+    if (job_start(c, av, c->q.cmd->timeout_s, CTL_OUT_MAX, CTL_ERR_MAX, plugcmd_body_done) != 0) {
         unlink(c->tmp);
         resp_error(&c->resp, "internal", "не удалось запустить ядро");
         conn_reply(c);
@@ -2165,11 +2425,6 @@ static void sub_push(struct steerd_sub *sb, const char *line, size_t n) {
 
 static void st_subscribe(struct conn *c) {
     struct ctl_srv *s = c->srv;
-    if (s->subs >= CTL_SUBS_MAX) {
-        resp_error(&c->resp, "busy", "подписчиков уже восемь — повторите позже");
-        conn_reply(c);
-        return;
-    }
     if (c->counted) { c->counted = 0; s->active--; }
     s->subs++;
     c->st = C_SUB;
@@ -2184,6 +2439,215 @@ static void st_subscribe(struct conn *c) {
     c->sub.arg = c;
     steerd_sub_add(&s->d, &c->sub);
     conn_flush(c);
+}
+
+/* ---- менеджер плагинов ---------------------------------------------------------------------------
+ *
+ * Команды plugin-* — дети `steerd plugin <действие> … --json` (src/pluginmgr/pmmain.c): ответ — их код,
+ * stdout (объект JSON) и stderr (ход). Тело, если есть, — во временный файл каталога состояния, путь —
+ * флагом (--file, --key-file); у plugin-ensure тело — id плагинов, они идут словами. */
+
+/* Реестр плагинов ядра (src/kinds/plugin.c): слабо — в сборке без него plugin-reload просто
+ * перечитывает спеку. */
+int plugin_reload(const char *root) __attribute__((weak));
+
+static void plugin_done(struct conn *c, int code) {
+    if (c->tmp[0]) { unlink(c->tmp); c->tmp[0] = '\0'; }
+    sub_done(c, code);
+}
+
+static int plugin_id_ok(const char *w, size_t n) {
+    if (!n || n > 64 || !((w[0] >= 'a' && w[0] <= 'z') || (w[0] >= '0' && w[0] <= '9'))) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!((w[i] >= 'a' && w[i] <= 'z') || (w[i] >= '0' && w[i] <= '9') || w[i] == '-')) return 0;
+    return 1;
+}
+
+static void st_plugin(struct conn *c) {
+    const struct ctl_req *q = &c->q;
+    const char *name = q->cmd->name;
+    c->tmp[0] = '\0';
+    /* Слова тела plugin-ensure — сколько угодно; argv — в куче по их числу. */
+    size_t nwords = 0;
+    if (!strcmp(name, "plugin-ensure")) {
+        for (size_t i = 0; i < q->body_n; ) {
+            while (i < q->body_n && (q->body[i] == ' ' || q->body[i] == '\n' || q->body[i] == '\t' || q->body[i] == '\r')) i++;
+            size_t st = i;
+            while (i < q->body_n && !(q->body[i] == ' ' || q->body[i] == '\n' || q->body[i] == '\t' || q->body[i] == '\r')) i++;
+            if (i == st) continue;
+            if (!plugin_id_ok(q->body + st, i - st)) {
+                resp_error(&c->resp, "bad-request", "недопустимое имя плагина в теле");
+                conn_reply(c);
+                return;
+            }
+            nwords++;
+        }
+        if (!nwords) { resp_error(&c->resp, "bad-request", "тело — id плагинов через пробел"); conn_reply(c); return; }
+    }
+    size_t cap = nwords + 16;
+    char **av = calloc(cap, sizeof(char *));
+    char *words = NULL;
+    if (!av) { resp_error(&c->resp, "internal", "нет памяти"); conn_reply(c); return; }
+    size_t n = 0;
+    av[n++] = (char *)q->cf->exe;
+    av[n++] = "plugin";
+    char sub[32];
+    snprintf(sub, sizeof(sub), "%s", q->cmd->sub);
+    char *sp = strchr(sub, ' ');
+    if (sp) { *sp = '\0'; av[n++] = sub; av[n++] = sp + 1; }
+    else av[n++] = sub;
+    for (int i = 0; i < q->argc; i++) {
+        const struct ctl_arg *a = &q->cmd->args[i];
+        if (a->flag) av[n++] = (char *)a->flag;
+        if (a->kind != CA_LIT || !a->flag) av[n++] = (char *)q->argv[i];
+    }
+    if (nwords) {
+        words = malloc(q->body_n + 1);
+        if (!words) { free(av); resp_error(&c->resp, "internal", "нет памяти"); conn_reply(c); return; }
+        memcpy(words, q->body, q->body_n);
+        words[q->body_n] = '\0';
+        for (char *t = strtok(words, " \t\r\n"); t; t = strtok(NULL, " \t\r\n")) av[n++] = t;
+    } else if (q->cmd->body) {
+        const char *flag = !strcmp(name, "plugin-repo-add") ? "--key-file" : "--file";
+        char final[PATH_MAX];
+        snprintf(final, sizeof(final), "%s/plugin-%s", ctl_state_dir(q->cf),
+                 !strcmp(name, "plugin-repo-add") ? "key.pub" : "upload.s2p");
+        if (ctl_write_tmp(final, q->body ? q->body : "", q->body_n, c->tmp, sizeof(c->tmp)) != 0) {
+            free(av);
+            c->tmp[0] = '\0';
+            resp_error(&c->resp, "internal", "не записать тело во временный файл");
+            conn_reply(c);
+            return;
+        }
+        av[n++] = (char *)flag;
+        av[n++] = c->tmp;
+    }
+    av[n++] = "--json";
+    av[n] = NULL;
+    int rc = job_start(c, av, q->cmd->timeout_s, CTL_OUT_MAX, CTL_ERR_MAX, plugin_done);
+    free(av);
+    free(words);
+    if (rc != 0) {
+        if (c->tmp[0]) { unlink(c->tmp); c->tmp[0] = '\0'; }
+        resp_error(&c->resp, "internal", "не удалось запустить ядро");
+        conn_reply(c);
+    }
+}
+
+/* plugin-reload: реестр плагинов ядра заново, затем то же, что reload (спека, помощники, правила). */
+static void st_plugin_reload(struct conn *c) {
+    if (plugin_reload) plugin_reload(NULL);
+    st_reload(c);
+}
+
+/* plugin-event: тело — объект JSON от менеджера; подписчикам уходит событие `plugin` с полями id,
+ * state, version, from, why, by (steer-api.md, 4.1). Прочие поля тела не пересылаются. */
+static void mem_plugin_event(struct conn *c, struct cbuf *r) {
+    struct err e = {0};
+    struct ydoc *d = c->q.body_n ? ydoc_parse_buf(c->q.body, c->q.body_n, "plugin-event", &e) : NULL;
+    const struct ynode *root = d ? ydoc_root(d) : NULL;
+    const struct ynode *id = ynode_get(root, "id"), *st = ynode_get(root, "state");
+    if (!root || root->kind != YN_MAP || !id || id->kind != YN_SCALAR || !st || st->kind != YN_SCALAR) {
+        if (d) ydoc_free(d);
+        resp_error(r, "bad-request", "тело — объект JSON с id и state");
+        return;
+    }
+    struct cbuf f = {0};
+    static const char *const keys[] = {"id", "state", "version", "from", "why", "by", NULL};
+    for (int i = 0; keys[i]; i++) {
+        const struct ynode *v = ynode_get(root, keys[i]);
+        cb_fmt(&f, ",\"%s\":", keys[i]);
+        if (v && v->kind == YN_SCALAR && !(v->style == YS_PLAIN && ynode_is_null(v))) cb_jstr(&f, v->str);
+        else cb_str(&f, "null");
+    }
+    cb_put(&f, "", 0);
+    fprintf(stderr, LOG_I "плагин %s: %s\n", id->str, st->str);
+    steerd_emit(&c->srv->d, "plugin", f.p);
+    free(f.p);
+    ydoc_free(d);
+    cb_str(r, ",\"code\":0,\"stdout\":\"\",\"stderr\":\"\"");
+}
+
+/* ---- автообновление плагинов (s2p.md, «Фоновое автообновление») ----------------------------------
+ *
+ * Таймер в цикле демона, без cron и отдельного сторожа: по сроку — ребёнок `steerd plugin update
+ * --auto`, демон его не ждёт (только подбирает по выходу). Когда звать в следующий раз, решает сам
+ * менеджер: он пишет срок в state.json (auto.next — раз в сутки со сдвигом до часа, раньше — к
+ * началу ночного окна, если есть обновления, и повтор плагинов pending). Демон этот срок читает
+ * после каждого прохода. Нет каталога плагинов — таймера нет (стенды, телефон). */
+#define PLUGAUTO_FIRST_MS (5L * 60 * 1000)
+
+static const char *plugauto_root(void) {
+    const char *v = getenv("STEER_PLUGIN_DIR");
+    return v && *v ? v : "/usr/lib/steer/plugins";
+}
+
+static long plugauto_delay_ms(void) {
+    const char *etc = getenv("STEER_PLUGIN_ETC");
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/state.json", etc && *etc ? etc : "/etc/steer/plugins");
+    struct cbuf b = {0};
+    long ms = 24L * 3600 * 1000;
+    if (ctl_read_file(p, &b, 64L * 1024 * 1024) == 1) {
+        struct err e = {0};
+        struct ydoc *d = ydoc_parse_buf(b.p, b.n, "state.json", &e);
+        const struct ynode *nx = d ? ynode_get(ynode_get(ydoc_root(d), "auto"), "next") : NULL;
+        if (nx && nx->kind == YN_SCALAR) {
+            struct tm tm = {0};
+            if (strptime(nx->str, "%Y-%m-%dT%H:%M:%SZ", &tm)) {
+                time_t t = timegm(&tm), now = time(NULL);
+                ms = t > now ? (long)(t - now) * 1000L : 1000L;
+            }
+        } else {
+            ms = PLUGAUTO_FIRST_MS;
+        }
+        if (d) ydoc_free(d);
+    } else {
+        ms = PLUGAUTO_FIRST_MS;
+    }
+    free(b.p);
+    if (ms < 1000) ms = 1000;
+    return ms;
+}
+
+static struct loop_timer *g_plugauto_tm;
+static pid_t g_plugauto_pid;
+
+static void plugauto_exit(struct loop *l, pid_t pid, int status, void *arg) {
+    (void)l; (void)pid; (void)arg;
+    g_plugauto_pid = 0;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        fprintf(stderr, LOG_W "фоновое обновление плагинов не прошло (код %d) — подробности в steer plugin status\n",
+                WIFEXITED(status) ? WEXITSTATUS(status) : 128);
+    if (g_plugauto_tm) loop_timer_set(g_plugauto_tm, plugauto_delay_ms());
+}
+
+static void plugauto_fire(struct loop *l, struct loop_timer *t, void *arg) {
+    struct ctl_srv *s = arg;
+    (void)t;
+    if (g_plugauto_pid) return;
+    pid_t pid = fork();
+    if (pid < 0) { loop_timer_set(g_plugauto_tm, 600000L); return; }
+    if (pid == 0) {
+        setpgid(0, 0);
+        int nul = open("/dev/null", O_RDWR);
+        if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); }
+        loop_child_reset();
+        char *av[] = { s->cf.exe, "plugin", "update", "--auto", NULL };
+        execv(s->cf.exe, av);
+        _exit(127);
+    }
+    g_plugauto_pid = pid;
+    loop_child(l, pid, plugauto_exit, s);
+}
+
+static void plugauto_start(struct ctl_srv *s) {
+    const char *off = getenv("STEER_PLUGIN_AUTO");
+    if (off && !strcmp(off, "0")) return;
+    struct stat st;
+    if (stat(plugauto_root(), &st) != 0 || !S_ISDIR(st.st_mode)) return;
+    g_plugauto_tm = loop_timer_new(s->l, plugauto_fire, s);
+    if (g_plugauto_tm) loop_timer_set(g_plugauto_tm, plugauto_delay_ms());
 }
 
 /* ---- запрос ------------------------------------------------------------------------------------ */
@@ -2204,8 +2668,16 @@ static int conn_parse(struct conn *c) {
     for (int i = 0; i < nt; i++)
         if (!tok[i][0]) { conn_refuse(c, NULL, "bad-request", "пустое слово: слова разделяются одним пробелом"); return -1; }
     const struct ctl_cmd *cmd = ctl_lookup(tok[0]);
+    if (!cmd && plugin_ctl_cmd(tok[0], &c->pcmd) == 0) cmd = &c->pcmd;
     if (!cmd) { conn_refuse(c, NULL, "unknown-command", "такой команды нет"); return -1; }
 
+    if (!c->counted) {
+        if (!strcmp(cmd->name, "subscribe")) { /* не занимает место */ }
+        else if (c->srv->active >= CTL_CLIENTS_MAX) {
+            conn_refuse(c, cmd->name, "busy", "сервер занят другими запросами — повторите позже");
+            return -1;
+        } else { c->counted = 1; c->srv->active++; }
+    }
     memset(&c->q, 0, sizeof(c->q));
     c->q.cmd = cmd;
     c->q.cf = &c->srv->cf;
@@ -2222,8 +2694,10 @@ static int conn_parse(struct conn *c) {
         unsigned long long v = strtoull(w, NULL, 10);
         if (v > (unsigned long long)cmd->body) {
             char m[64];
+            char a[48];
             snprintf(m, sizeof(m), "тело больше %ld МиБ", cmd->body / (1024 * 1024));
-            conn_refuse(c, cmd->name, "too-large", m);
+            snprintf(a, sizeof(a), "{\"1\":\"%ld\"}", cmd->body / (1024 * 1024));
+            conn_refusec(c, cmd->name, "too-large", m, "ctl.body_too_large", a);
             return -1;
         }
         blen = (size_t)v;
@@ -2482,10 +2956,6 @@ static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
             ctl_refuse_now(c, "denied", "этому процессу управлять ядром steer нельзя");
             continue;
         }
-        if (s->active >= CTL_CLIENTS_MAX) {
-            ctl_refuse_now(c, "busy", "сервер занят другими запросами — повторите позже");
-            continue;
-        }
         struct conn *n = calloc(1, sizeof(*n));
         if (n) {
             n->srv = s;
@@ -2500,8 +2970,11 @@ static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
             continue;
         }
         n->st = C_REQ;
-        n->counted = 1;
-        s->active++;
+        /* Четыре запроса — это ИДУЩИЕ команды. Соединение, которое ещё не прислало строку,
+         * место занимает, пока оно есть; сверх четырёх оно принимается без места и получает его
+         * по строке (conn_parse) — или busy, если это не subscribe: подписчики, которых плагины
+         * поднимают разом, в четыре запроса не входят и не упираются в них. */
+        if (s->active < CTL_CLIENTS_MAX) { n->counted = 1; s->active++; }
         n->next = s->conns;
         s->conns = n;
         loop_timer_set(n->tm, CTL_REQ_MS);
@@ -2725,10 +3198,14 @@ static void srv_restored(void *arg, const char *all, const char *rules, const ch
 
 static void st_repair(struct conn *c) {
     struct ctl_srv *s = c->srv;
-    if (!s->on || !s->d.have || rulewd_missing(s->d.sp, c->tmp, sizeof(c->tmp)) <= 0) {
+    char *miss = NULL;
+    if (!s->on || !s->d.have || rulewd_missing(s->d.sp, &miss) <= 0) {
+        free(miss);
         conn_reply(c);
         return;
     }
+    /* Список выходов — своя строка в куче, а не c->tmp на PATH_MAX: на сотнях выходов он
+     * длиннее пути. av[] её только называет, и job_start копирует аргументы до возврата. */
     char *av[12];
     size_t n = 0;
     av[n++] = s->cf.exe;
@@ -2737,13 +3214,14 @@ static void st_repair(struct conn *c) {
     av[n++] = (char *)s->cf.spec;
     if (s->cf.state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)s->cf.state_dir; }
     av[n++] = "--rule";
-    av[n++] = c->tmp;
+    av[n++] = miss;
     av[n++] = "--masq-ensure";
     av[n] = NULL;
     if (job_start(c, av, 60, CTL_ERR_MAX, CTL_ERR_MAX, repair_done) != 0) {
-        fprintf(stderr, LOG_W "правила выходов (%s): не удалось запустить ядро\n", c->tmp);
+        fprintf(stderr, LOG_W "правила выходов (%s): не удалось запустить ядро\n", miss);
         conn_reply(c);
     }
+    free(miss);
 }
 
 /* Обратный вызов стража: поставить починку в очередь изменяющих команд. Уже ждёт или идёт —
@@ -2860,15 +3338,10 @@ static int srv_lan_budget(struct ctl_srv *s);
  * его не делает. */
 static int srv_table_flushed(struct ctl_srv *s) {
     if (!s->d.have || !ctl_enabled()) return 0;
-    size_t routed = 0;
-    for (size_t i = 0; i < s->d.sp->out_n; i++) {
-        const struct output *o = &s->d.sp->out[i];
-        if (out_has_device(o) && o->mark && o->table) routed++;
-    }
-    if (!routed) return 0;
-    char list[512];
-    int miss = rulewd_missing(s->d.sp, list, sizeof(list));
-    return miss >= 0 && (size_t)miss < routed;
+    /* Прямо: стоит ли правило хоть у одного выхода. Прежде — «не у всех выходов не хватает правила»,
+     * а нехватку у выхода с ПУСТОЙ таблицей rulewd нарочно не считает: после штатного `steer down`
+     * (таблицы опустошены, правила сняты) выходило «правила стоят», и сторож возвращал снятое. */
+    return rulewd_present(s->d.sp) > 0;
 }
 
 static void srv_kcheck(void *arg) {
@@ -2923,8 +3396,7 @@ static void srv_kcheck(void *arg) {
  * гостевой), и на пачку хватает одной сверки. Сверка уже идёт — ещё одна после неё (lan_again):
  * её план мог собраться до нового устройства.
  *
- * Только если раскладка вообще ставит ingress (NFTC_INGRESS без NFTC_LEGACY; раскладка ещё не
- * известна — сверяем): иначе цепочки нет и возвращать нечего. Пропавшее устройство (up = 0) сверки
+ * Только если раскладка вообще ставит ingress (NFTC_INGRESS; раскладка ещё не известна — сверяем): иначе цепочки нет и возвращать нечего. Пропавшее устройство (up = 0) сверки
  * не зовёт: вешать цепочку не на что, а пересчитать набор без него успеет сверка по появлению — или
  * проход, если устройство ушло насовсем.
  *
@@ -2975,7 +3447,7 @@ static void srv_lan(void *arg, const char *dev, int up) {
     (void)dev;
     if (!s->on || !s->d.have || !s->lan_tm) return;
     int nftc = s->rec.nftc;
-    if (nftc >= 0 && (!(nftc & NFTC_INGRESS) || (nftc & NFTC_LEGACY))) return;
+    if (nftc >= 0 && !(nftc & NFTC_INGRESS)) return;
     /* И пропажа, и появление объясняют расхождение, которое найдёт проход (srv_kcheck). */
     s->lan_at = loop_now_ms();
     if (!up) return;
@@ -2994,19 +3466,18 @@ void ctl_usage_flags(FILE *out) {
           "  --spec ФАЙЛ         daemon: спека, которую читают и заменяют команды\n"
           "                      (по умолчанию %s)\n"
           "  --state-dir КАТАЛОГ daemon: каталог состояния (по умолчанию %s)\n"
-          "  --allow-uid N       daemon: пускать и этот uid (до восьми раз); root и system\n"
+          "  --allow-uid N       daemon: пускать и этот uid (сколько угодно раз); root и system\n"
           "                      пускаются всегда\n"
           "  --allow-domain ИМЯ  daemon: пускать процессы этого домена SELinux у владельца\n"
           "                      устройства (по умолчанию splify2_app на платформе Android;\n"
           "                      пустое значение — не пускать по домену)\n"
           "  --lists-dir КАТАЛОГ daemon: куда put-file кладёт файлы списков\n"
           "                      (по умолчанию %s)\n"
-          "  --watch             daemon: сторожить выходы самому (вместо failover --loop;\n"
-          "                      оба сразу не запускать)\n"
+          "  --watch             daemon: сторожить выходы самому\n"
           "  --watch-period СЕК  daemon: период прохода сторожа в тишине (по умолчанию 60)\n"
           "  --supervise         daemon: держать помощников выходов и резолвер самому (вместо\n"
           "                      procd или steer supervise; оба сразу не запускать)\n"
-          "  --dnsd-flag ФЛАГ    daemon: передать резолверу ещё и этот флаг (до восьми раз)\n"
+          "  --dnsd-flag ФЛАГ    daemon: передать резолверу ещё и этот флаг (сколько угодно раз)\n"
           "  --apply             daemon: применить спеку при старте (сверкой, как reload)\n",
           p->ctl_sock, p->spec_path, p->state_dir, p->lists_dir);
 }
@@ -3062,6 +3533,13 @@ int ctl_serve_main(int argc, char **argv) {
     cf->spec = plat_spec_default();
     cf->lists_dir = plat()->lists_dir;
     cf->allow_domain = plat()->ctl_allow_domain;
+    /* Дескрипторы: каждый подписчик и каждый запрос — по одному, а плагинов и подписчиков
+     * не ограничено. Мягкий предел поднимается до жёсткого — права для этого не нужны. */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
     for (int i = 0; i < argc; i++) {
         const char *f = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -3079,7 +3557,9 @@ int ctl_serve_main(int argc, char **argv) {
                 char *e = NULL;
                 unsigned long u = strtoul(v, &e, 10);
                 if (!*v || *e || u > 0xfffffffful) ctl_bad_flag("daemon", "--allow-uid: нужно число", v);
-                if (cf->allow_uid_n >= CTL_ALLOW_UIDS) ctl_bad_flag("daemon", "--allow-uid больше восьми раз", NULL);
+                uid_t *nu = realloc(cf->allow_uid, ((size_t)cf->allow_uid_n + 1) * sizeof(*nu));
+                if (!nu) ctl_bad_flag("daemon", "нет памяти", NULL);
+                cf->allow_uid = nu;
                 cf->allow_uid[cf->allow_uid_n++] = (uid_t)u;
             }
             continue;
@@ -3090,8 +3570,12 @@ int ctl_serve_main(int argc, char **argv) {
         if (!strcmp(f, "--dnsd-flag")) {
             if (!v) ctl_bad_flag("daemon", "у флага нет значения", f);
             i++;
-            if (cf->dnsd_flag_n >= 8) ctl_bad_flag("daemon", "--dnsd-flag больше восьми раз", NULL);
+            /* Место и под закрывающий NULL. */
+            const char **nf = realloc(cf->dnsd_flags, ((size_t)cf->dnsd_flag_n + 2) * sizeof(*nf));
+            if (!nf) ctl_bad_flag("daemon", "нет памяти", NULL);
+            cf->dnsd_flags = nf;
             cf->dnsd_flags[cf->dnsd_flag_n++] = v;
+            cf->dnsd_flags[cf->dnsd_flag_n] = NULL;
             continue;
         }
         if (!strcmp(f, "--watch-period")) {
@@ -3159,13 +3643,20 @@ int ctl_serve_main(int argc, char **argv) {
         struct supd_conf sc = { ctl_enabled, cf->dnsd_flags };
         if (!supd_start(&S.d, &sc)) { fprintf(stderr, LOG_W "супервизор: нет памяти\n"); return 1; }
     }
+    /* .so-плагины (steer-abi): после супервизора, чтобы host_v1 видел и спеку, и сторожа, и помощников. */
+    plugso_boot(&S.d);
+    plugauto_start(&S);
+    if (wandev_start(S.l) != 0)
+        fprintf(stderr, LOG_W "события маршрутов недоступны — @wan_dev обновляется только при apply\n");
     fprintf(stderr, LOG_I "слушаю %s%s%s\n", cf->sock, cf->watch ? ", сторожу выходы" : "",
             cf->supervise ? ", держу помощников" : "");
     if (cf->apply) {
         if (!S.d.have) fprintf(stderr, LOG_W "спеки нет — применять при старте нечего\n");
         else if (boot_apply(&S) != 0) watchd_release(S.watch);
     }
-    return loop_run(S.l);
+    int rc = loop_run(S.l);
+    plugso_fini_all();
+    return rc;
 }
 
 /* ---- клиент ------------------------------------------------------------------------------------ */
@@ -3190,6 +3681,8 @@ int ctl_client_main(int argc, char **argv) {
     if (i >= argc) ctl_bad_flag("ctl", "нужна команда", NULL);
     struct cbuf req = {0}, body = {0};
     const struct ctl_cmd *cmd = ctl_lookup(argv[i]);
+    static struct ctl_cmd pk;
+    if (!cmd && plugin_ctl_cmd(argv[i], &pk) == 0) cmd = &pk;      /* команда плагина: тело — по её манифесту */
     int words = argc, from_fd = 0;
     if (cmd && cmd->body && !strcmp(cmd->name, "put-file")) {
         if (argc - i != 3) ctl_bad_flag("ctl", "put-file: нужны имя и файл (или «-»)", NULL);

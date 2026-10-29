@@ -1,15 +1,17 @@
 #!/bin/sh
 # Прогон ЦЕЛОГО туннеля на локальном стенде: без узла подписки и без интернета.
 #
-# Что здесь проверяется и почему только так. Синтез TCP, повторная передача и раскладка
-# соединений по потокам живут только на настоящем трафике — модульным тестом их не достать.
+# Что здесь проверяется и почему только так. TCP клиента через слушатель модуля (R-152: перенаправление
+# nat; здесь его ставит стенд, tests/lib-redir.sh) и раскладка соединений по потокам живут только на
+# настоящем трафике — модульным тестом их не достать.
 # Пока трафик брался у узла подписки, каждая проверка зависела от чужого сервера: «не
 # восстановилось после потерь» было не отличить от «узел лёг», и дважды именно на этом всё и
 # остановилось.
 #
 # Стенд: своё сетевое пространство, в нём поддельный сервер VLESS на 127.0.0.1 (tests/
-# fake-vless.py), поднятый steer туннель и wget как клиент. Потери вносятся правилом nft на
-# ВХОДЕ с устройства туннеля — то есть теряются ровно те пакеты, которые синтезировали мы.
+# fake-vless.py), поднятый steer туннель и wget как клиент. Потери вносятся правилом nft на входе
+# слушателя модуля (петля, порт 9480): TCP клиента теперь ведёт ядро, и проверяется, что путь сокета
+# переживает его повторы.
 #
 # Использование: tests/run-tunnel.sh [потери_в_процентах] [потоков]
 set -eu
@@ -23,15 +25,19 @@ STREAMS="${2:-1}"
 # его ядро придерживает подтверждение отложенным таймером. На настоящей сети сегмент
 # нарезается, подтверждения идут густо, и этого замедления нет.
 MB=8
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${STEER:-./build/libs-host/steerd}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
+# steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
+LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 
 NS=steer-tunnel
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
 PORT=10800
 # Узел стенда — на обычном адресе, а не на петле: движок отвергает узел в 127.0.0.0/8
 # как «отвечать некому» (sub.c), и стенд от этого не поднимался вовсе.
-NODE=10.66.0.1
+# NODE=2001:db8:66::1 — тот же прогон с узлом по адресу IPv6 (issue #7); в ссылке адрес — в скобках.
+NODE="${NODE:-10.66.0.1}"
+case "$NODE" in *:*) NODE_URL="[$NODE]"; NODE_PFX=128 ;; *) NODE_URL="$NODE"; NODE_PFX=32 ;; esac
 WORK="$(mktemp -d)"
 
 cleanup() {
@@ -43,7 +49,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf '%s\n' "vless://$UUID@$NODE:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
+printf '%s\n' "vless://$UUID@$NODE_URL:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
 cat > "$WORK/spec.json" <<SPEC
 {"schema":1,
  "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
@@ -55,7 +61,7 @@ ip netns add "$NS"
 ip netns exec "$NS" ip link set lo up
 # Адрес узла живёт на dummy внутри пространства: снаружи он не виден, а петлёй не является.
 ip netns exec "$NS" ip link add stand type dummy
-ip netns exec "$NS" ip addr add "$NODE/32" dev stand
+ip netns exec "$NS" ip addr add "$NODE/$NODE_PFX" dev stand
 ip netns exec "$NS" ip link set stand up
 
 # Сервер и туннель — внутри пространства: сервер слушает на 127.0.0.1, туннель туда и ходит.
@@ -64,7 +70,15 @@ ip netns exec "$NS" python3 tests/fake-vless.py --port "$PORT" --uuid "$UUID" --
 SRV_PID=$!
 sleep 1
 
-ip netns exec "$NS" env STEER_TUN_STATS=1 "$BIN" vless vl \
+# Один поток без потерь (проход, где счёт вызовов не искажает повторы): туннель под strace, считаем
+# epoll_ctl. Читающий дескриптор соединения стоит в epoll по фронту и не снимается на каждое закрытие окна
+# клиента, поэтому за 8 МБ вызовов единицы; прежде была пара DEL/ADD на каждое закрытие окна (323 на этот же
+# прогон). Без strace проверка пропускается.
+TRACE=""
+if [ "$LOSS" = 0 ] && [ "$STREAMS" = 1 ] && command -v strace >/dev/null 2>&1; then
+    TRACE="strace -f -qq -e trace=epoll_ctl -o $WORK/ctl.txt"
+fi
+ip netns exec "$NS" env STEER_TUN_STATS=1 $TRACE "$BIN" vless vl \
     --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 
@@ -81,12 +95,14 @@ sed -n 's/^/  /p' "$WORK/tun.log" | grep -iE "разгрузк|потоков" |
 # Куда угодно, кроме localhost: адрес поддельному серверу не важен, важно попасть в туннель.
 TARGET=203.0.113.7
 ip netns exec "$NS" ip route replace "$TARGET/32" dev vl
+. tests/lib-redir.sh
+redir_dev "$NS" vl
 
 if [ "$LOSS" != 0 ]; then
     ip netns exec "$NS" nft add table inet loss
     ip netns exec "$NS" nft add chain inet loss input \
         '{ type filter hook input priority -300; policy accept; }'
-    ip netns exec "$NS" nft add rule inet loss input iifname vl \
+    ip netns exec "$NS" nft add rule inet loss input iifname lo tcp dport 9480 \
         numgen random mod 100 lt "$LOSS" counter drop
 fi
 
@@ -116,9 +132,14 @@ dropped=0
 [ "$LOSS" != 0 ] && dropped=$(ip netns exec "$NS" nft list table inet loss 2>/dev/null |
     sed -n 's/.*packets \([0-9]*\).*/\1/p' | head -1)
 
-echo "  повторов у туннеля:"
-grep -o 'повторов [0-9]*/с ([0-9.]* КБ/с)' "$WORK/tun.log" 2>/dev/null |
-    grep -v 'повторов 0/с' | sort -u | tail -2 | sed 's/^/    /' || true
+if [ -n "$TRACE" ]; then
+    ctl=$(wc -l < "$WORK/ctl.txt")
+    echo "  epoll_ctl за прогон: $ctl"
+    if [ "$ctl" -gt 32 ]; then
+        echo "  ОШИБКА: epoll_ctl $ctl раз за $MB МБ (ждали не больше 32): подписка дескрипторов снова перестраивается на каждом проходе"
+        exit 1
+    fi
+fi
 # Какие потоки реально работали: «стало быстрее» и «всё село в одну очередь» в остальных
 # числах выглядят одинаково.
 busy=$(grep -o '^tun-stats\[[0-9]\]' "$WORK/tun.log" 2>/dev/null | sort -u | tr -d 'tun-satsm[]' | tr '\n' ' ')

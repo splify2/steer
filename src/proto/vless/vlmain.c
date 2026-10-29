@@ -1,12 +1,10 @@
 /* Модуль VLESS: подкоманды `steer vless`, `vless-nodes` и `vless-probe`.
  *
- * Точка входа протокола. Жила в конце цикла туннеля (tunnel.c), пока цикл был сварен с VLESS;
- * при выделении стека (шаг 2 выпуска 1.10) переехала сюда без изменений в выводе и кодах
- * выхода. Отсюда модуль читает спеку и подписку, выбирает первый узел и отдаёт устройство стеку с
+ * Точка входа протокола. Отсюда модуль читает спеку и подписку, выбирает первый узел и отдаёт устройство стеку с
  * дайлером под пулом узлов (vless_tunnel_run в vldial.c, src/tunnel/pool.c): пул держит `active`
  * узлов сразу, следит за каждым и заменяет умерший без перезапуска процесса.
  *
- * В пакете роутера (1.10, шаг 4) эти команды — команды бинарника модуля steer-vless: демон
+ * В пакете роутера эти команды — команды бинарника модуля steer-vless: демон
  * запускает его ребёнком (механизм prog, daemon/helpers.c), а в steerd от них остаётся заглушка
  * (cli/modcmd.c): запустить модуль, если он установлен, иначе отказ «нужен пакет steer-vless».
  * Точка входа модуля — src/modules/main_vless.c. В статических сборках (телефон, стенды) файл
@@ -16,14 +14,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "vless.h"
 #include "client.h"
 #include "vldial.h"
+#include "vlcmd.h"
 #include "pool.h"
-#include "spec.h"
 #include "evline.h"
 #include "jsonw.h"
+#include "pktun.h"
 
 /* Без слова tunnel: подъём выхода и разбор подписки — это ещё не туннель. */
 #define LOG_W2 "steer[warn]: "
@@ -38,17 +38,6 @@
 /* Узлы подписки — массив в куче по числу узлов в файле (vless_load_sub): раньше их было «не больше
  * 128», статикой на 157 КБ, а хвост подписки терялся. */
 static struct vless_node *g_nodes;
-/* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): экземпляр
- * заводит каждая точка входа (cmd_vless, cmd_vless_nodes, cmd_vless_probe) и передаёт его
- * параметром в load_nodes и underlay_setup. Выделяется по требованию, а не static в каждой из
- * трёх: struct spec — под 300 КБ, и три статических экземпляра заняли бы в bss втрое больше
- * того одного, что был общим на файл, хотя на процесс команда всегда одна. Не освобождается:
- * живёт до конца процесса, как и прежний static. */
-static struct spec *spec_new(void) {
-    struct spec *sp = calloc(1, sizeof(*sp));
-    if (!sp) die("нет памяти под спеку", NULL);
-    return sp;
-}
 
 /* Найти выход и разобрать его подписку. Одно место на все три команды: иначе «как
  * читается подписка» разошлось бы между подъёмом, списком и проверкой — а расхождение
@@ -65,27 +54,26 @@ static int load_nodes_file(const char *path, size_t *cnt, struct vless_sub_stats
     return 0;
 }
 
-static int load_nodes(struct spec *sp, const char *spec_path, const char *out_name,
-                      struct output **out, size_t *cnt, struct vless_sub_stats *st) {
-    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec. */
-    struct err e = {0};
-    if (load_spec(spec_path, sp, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(sp, out_name);
-    if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
-    /* Настройку своего выхода спрашиваем у вида: не vless — не наш. */
-    const struct vless_cfg *vc = out_vless(o);
-    if (!vc) {
-        fprintf(stderr, LOG_W2 "выход %s не vless (kind другой)\n", out_name);
+/* Выход — из {conf} (src/plugkit): ключи вида уже проверены схемой манифеста, сочетания — здесь же
+ * (pk_tun_check), как у хука check. */
+static struct pk_tun g_t;
+
+static int load_nodes(const struct pk_out *o, size_t *cnt, struct vless_sub_stats *st) {
+    char err[400];
+    if (strcmp(o->kind, "tunnel:vless") != 0) {
+        fprintf(stderr, LOG_W2 "выход %s не vless (kind %s)\n", o->tun.name, o->kind);
         return 2;
     }
-    *out = o;
+    if (pk_tun_load(o, &g_t, err, sizeof err) != 0 || pk_tun_check(&g_t, err, sizeof err) != 0) {
+        fprintf(stderr, LOG_W2 "outputs.%s: %s\n", o->tun.name, err);
+        return 2;
+    }
     /* insecure выхода — ДО разбора подписки: от него зависит, пригодны ли узлы с allowInsecure. */
-    vless_set_insecure(vc->insecure);
-    if (vc->insecure)
+    vless_set_insecure(g_t.insecure);
+    if (g_t.insecure)
         fprintf(stderr, LOG_W2 "выход %s: insecure — сертификат узлов security=tls НЕ проверяется\n",
-                out_name);
-    return load_nodes_file(vc->sub_file, cnt, st);
+                o->tun.name);
+    return load_nodes_file(g_t.sub_file, cnt, st);
 }
 
 /* Метка сокетов к узлам — до первого соединения, то есть и до перебора узлов: проверка узла
@@ -97,13 +85,8 @@ static int load_nodes(struct spec *sp, const char *spec_path, const char *out_na
  * Реестр — только при via: у цели метка появляется там, а без via этот процесс реестра до
  * подъёма не трогал, и трогать его ради метки «мимо каналов» незачем. Без выхода (проба
  * файла подписки) метка — обычная «мимо каналов»: её отдаёт та же функция для выхода без via. */
-static void underlay_setup(struct spec *sp, const struct output *o) {
-    static const struct output none;
-    if (o && o->over[0]) {
-        struct err e = {0};
-        if (registry_assign(sp, &e) < 0) err_die(&e);
-    }
-    transport_set_sock_mark(out_underlay_mark(sp, o ? o : &none), o && o->over[0]);
+static void underlay_setup(const struct pk_out *o) {
+    transport_set_sock_mark(pk_sock_mark(o), o && o->sock_mark_required);
 }
 
 /* x — исключение выхода (exclude, exclude_name); NULL — перечень по файлу, без выхода. */
@@ -148,25 +131,25 @@ static void node_json(const struct vless_node *n, int index, const struct node_e
 /* Ключи `exclude:` и `exclude_name:` (vless_cfg.excl): из кандидатов уходят исключённые узлы, порядок
  * остальных прежний. Только отбор — номера не сдвигаются (src/model/nodesel.h). Одна функция на
  * подъём и на `vless-probe`, как transport_filter. Возвращает, сколько осталось. */
-static size_t exclude_filter(const struct output *o, const struct vless_node *nodes, int *sel,
+static size_t exclude_filter(const struct pk_tun *t, const struct vless_node *nodes, int *sel,
                              size_t sel_n) {
-    if (!o) return sel_n;
+    if (!t) return sel_n;
     size_t k = 0;
     for (size_t i = 0; i < sel_n; i++)
-        if (!node_excluded(&o->vless.excl, nodes[sel[i]].name)) sel[k++] = sel[i];
+        if (!node_excluded(&t->excl, nodes[sel[i]].name)) sel[k++] = sel[i];
     return k;
 }
 
 /* Ключ `transport:` спеки v2 (vless_cfg.transports в spec.h): из кандидатов остаются узлы с
  * этими транспортами, порядок предпочтения прежний. Одна функция на подъём и на `vless-probe` —
  * по той же причине, что out_node_list. Возвращает, сколько осталось. */
-static size_t transport_filter(const struct output *o, const struct vless_node *nodes, int *sel,
+static size_t transport_filter(const struct pk_tun *t, const struct vless_node *nodes, int *sel,
                                size_t sel_n) {
-    unsigned want = o ? o->vless.transports : 0;
+    unsigned want = t ? t->transports : 0;
     if (!want) return sel_n;
     size_t k = 0;
     for (size_t i = 0; i < sel_n; i++)
-        if (tunnel_transport_bit(nodes[sel[i]].type) & want) sel[k++] = sel[i];
+        if (pk_transport_bit(nodes[sel[i]].type) & want) sel[k++] = sel[i];
     return k;
 }
 
@@ -199,8 +182,8 @@ static void skipped_json(const struct vless_sub_stats *st) {
  * непригодные, человек выбрал бы номер 5, а поднялся бы другой узел — и понять это было
  * бы невозможно, потому что оба списка выглядят правдоподобно. Непригодные считаются
  * отдельно и объясняются причиной, но номеров не занимают. */
-int cmd_vless_nodes(const char *spec_path, const char *out_name, int insecure) {
-    struct output *o = NULL;
+int cmd_vless_nodes(const struct pk_out *po, const char *out_name, int insecure) {
+    const struct pk_tun *o = NULL;
     size_t cnt = 0;
     struct vless_sub_stats st;
     /* Аргумент с косой чертой — путь к файлу подписки, а не имя выхода: имена выходов
@@ -212,25 +195,26 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name, int insecure) {
      * разбора, что в load_nodes, — поэтому перечень по файлу с флагом нумерует узлы ровно как выход
      * с `insecure: true`, а без флага — как выход без него. */
     if (by_file) vless_set_insecure(insecure);
-    int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
-                     : load_nodes(spec_new(), spec_path, out_name, &o, &cnt, &st);
+    if (!by_file && !po) { fprintf(stderr, LOG_W2 "выход %s: нужен --conf (steer vless-nodes зовёт ядро)\n", out_name); return 2; }
+    int rc = by_file ? load_nodes_file(out_name, &cnt, &st) : load_nodes(po, &cnt, &st);
     if (rc) return rc;
+    if (!by_file) o = &g_t;
 
     printf("{\"output\":");
     jsonw_str(stdout, by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    jsonw_str(stdout, by_file ? out_name : o->vless.sub_file);
+    jsonw_str(stdout, by_file ? out_name : o->sub_file);
     /* `node` — прежнее поле: один выбранный номер либо -1. Выбор из нескольких узлов оно
      * выразить не может, поэтому при нём печатается -1, а сам выбор лежит в `chosen`. Старый
      * потребитель этого поля читает то же, что читал: «узел не назначен, ищем рабочий». */
-    size_t chosen_n = o ? o->vless.nodes_n : 0;
-    printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->vless.nodes[0] : -1);
-    for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->vless.nodes[i]);
+    size_t chosen_n = o ? o->nodes_n : 0;
+    printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->nodes[0] : -1);
+    for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->nodes[i]);
     printf("],\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[",
            cnt, st.skipped, st.foreign);
     for (size_t i = 0; i < cnt; i++) {
         if (i) putchar(',');
-        node_json(&g_nodes[i], (int)i, o ? &o->vless.excl : NULL);
+        node_json(&g_nodes[i], (int)i, o ? &o->excl : NULL);
     }
     printf("]");
     skipped_json(&st);
@@ -246,9 +230,9 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name, int insecure) {
  * По одному узлу за вызов не случайно: проверка узла упирается в таймаут, и «проверить
  * все» на подписке из двадцати шести узлов заняло бы минуты — дольше, чем живёт вызов
  * ubus. Интерфейс спрашивает по одному и заполняет таблицу постепенно. */
-int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s,
+int cmd_vless_probe(const struct pk_out *po, const char *out_name, int node, int timeout_s,
                     int insecure) {
-    struct output *o = NULL;
+    const struct pk_tun *o = NULL;
     size_t cnt = 0;
     struct vless_sub_stats st;
     /* Вместо имени выхода — путь к файлу подписки, как у vless-nodes и по той же причине:
@@ -257,13 +241,13 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
      * порядка предпочтения, поэтому `--node -1` здесь значит «все по порядку подписки», а
      * не «как поднимется выход». */
     int by_file = out_name && out_name[0] == '/';
-    /* Спека нужна и пробе файла: метку «мимо каналов» underlay_setup спрашивает у неё же. */
-    struct spec *sp = spec_new();
     if (by_file) vless_set_insecure(insecure);       /* как у vless-nodes: номера те же */
-    int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
-                     : load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
+    if (!by_file && !po) { fprintf(stderr, LOG_W2 "выход %s: нужен --conf (steer vless-probe зовёт ядро)\n", out_name); return 2; }
+    int rc = by_file ? load_nodes_file(out_name, &cnt, &st) : load_nodes(po, &cnt, &st);
     if (rc) return rc;
-    underlay_setup(sp, o);
+    if (!by_file) o = &g_t;
+    /* Проба файла — «мимо каналов» (метка платформы); выхода — его метка сокетов из {conf}. */
+    underlay_setup(by_file ? NULL : po);
     if (!cnt) {
         printf("{\"ok\":false,\"error\":\"в подписке нет пригодных узлов\","
                "\"skipped\":%zu,\"foreign\":%zu", st.skipped, st.foreign);
@@ -286,7 +270,7 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     else if (by_file) {
         for (size_t i = 0; i < cnt; i++) sel[sel_n++] = (int)i;
     } else {
-        sel_n = out_node_list(o, cnt, sel, cnt + 1);
+        sel_n = pk_node_list(o, cnt, sel, cnt + 1);
         if (!sel_n) {
             printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, "
                    "пригодных всего %zu\"}\n", cnt);
@@ -300,8 +284,8 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
         }
         sel_n = exclude_filter(o, g_nodes, sel, sel_n);
         if (!sel_n) {
-            printf("{\"ok\":false,\"error\":\"все выбранные узлы исключены exclude или "
-                   "exclude_name\"}\n");
+            printf("{\"ok\":false,\"error\":\"все выбранные узлы исключены exclude, exclude_name или "
+                   "only\"}\n");
             return 1;
         }
     }
@@ -309,7 +293,7 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     printf("{\"output\":");
     jsonw_str(stdout, by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    jsonw_str(stdout, by_file ? out_name : o->vless.sub_file);
+    jsonw_str(stdout, by_file ? out_name : o->sub_file);
     printf(",\"results\":[");
     for (size_t k = 0; k < sel_n; k++) {
         size_t i = (size_t)sel[k];
@@ -331,22 +315,22 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     return found >= 0 ? 0 : 1;
 }
 
-/* Ход перебора — в файл probe-<выход> (probe_report), только если о нём некому сказать иначе:
- * у ребёнка демона с --supervise есть труба событий (evline_enabled), и демон знает то же из
- * node/nonode/down — файл там не нужен никому, а флеш телефона изнашивает (probe.h). Снимается
- * запись (probe_clear) в любом режиме: удалить отсутствующий файл ничего не пишет, а оставшийся
- * от прежнего запуска под procd рассказывал бы про перебор, которого больше нет. */
-static void vl_probe_report(const char *out_name, enum probe_state st, int node, int total) {
-    if (!evline_enabled()) probe_report(out_name, st, node, total);
+/* Ход перебора — в файл состояния выхода (steer-api.md, 2.2: <выход>.status.json и событие state):
+ * status и diag ядра показывают «проверяется узел k из n» и приговор перебора, пока пул узлов не
+ * переписал файл своим состоянием. Демон знает то же из событий node, nonode, excluded, down. */
+static void vl_probe_report(const char *state, int node, int total) {
+    char j[160];
+    snprintf(j, sizeof j, "{\"pid\":%ld,\"up\":false,\"probe\":{\"state\":\"%s\",\"node\":%d,\"total\":%d}}",
+             (long)getpid(), state, node, total);
+    pk_status_write(pk_out(), j);
 }
 
 /* Устройство поднято (ready у stack_run, stack.h). up демону и слежку за узлами завёл пул узлов
  * (src/tunnel/pool.c) перед этим вызовом; здесь — только строка о маршруте без демона.
  *
- * МАРШРУТ ВЫХОДА ЗДЕСЬ НЕ СТАВИТСЯ (1.10, шаг 3). До того клиент сам звал bind_device — код
- * демона в процессе помощника: таблица, ip rule, conntrack, набор failopen. С шага 4 модуль —
- * свой бинарник на libsteer, и маршрутизации с её моделью в нём быть не должно, а под демоном она
- * и не нужна: демон привязывает маршрут по этому же up (поле dev, evline.h) в своём процессе,
+ * МАРШРУТ ВЫХОДА ЗДЕСЬ НЕ СТАВИТСЯ. bind_device — код демона (таблица, ip rule, conntrack,
+ * набор failopen), модуль — свой бинарник на libsteer, и маршрутизации с её моделью в нём быть не
+ * должно, а под демоном она и не нужна: демон привязывает маршрут по этому же up (поле dev, evline.h) в своём процессе,
  * рядом со стражем правил и сторожем.
  *
  * БЕЗ ДЕМОНА (трубы событий нет: ручной запуск, стенды вроде tests/run-tunnel.sh, прежний `steer
@@ -373,21 +357,48 @@ static const char *vl_pool_name(const void *node) {
     return ((const struct vless_node *)node)->name;
 }
 
-int cmd_vless(const char *spec_path, const char *out_name) {
+/* Проверка узла наперегонки (pool_race_first): имя выхода — для строки состояния, номер проверки — «k из n». */
+static const char *out_name_race;
+static int vl_race_probe(void *arg, int id, char *why, size_t n) {
+    return vless_probe(&((const struct vless_node *)arg)[id], 8, why, n);
+}
+static void vl_race_start(void *arg, int id, size_t k, size_t n) {
+    (void)arg; (void)id;
+    vl_probe_report("running", (int)k, (int)n);
+    evline_emit("node", "n", EVLINE_INT, (long)k, "total", EVLINE_INT, (long)n, (const char *)NULL);
+}
+static void vl_race_fail(void *arg, int id, const char *why) {
+    fprintf(stderr, LOG_I2 "%s — %s\n", ((const struct vless_node *)arg)[id].name, why);
+}
+
+/* insecure — в diag ядра (steer-api.md, 2.3): warn, пока ключ включён. Строка едет полем diag файла
+ * состояния; пул вписывает её в каждую свою запись (pool_cfg.diag). */
+static char *g_diag;
+static void vl_diag_insecure(const struct pk_out *po) {
+    if (!g_t.insecure) return;
+    char what[160];
+    snprintf(what, sizeof(what), "выход %.40s: сертификат узла не проверяется", po->tun.name);
+    pk_diag_json(&g_diag, "insecure", "warn", what,
+                 "у выхода стоит insecure: цепочку, имя и срок сертификата узла (security=tls) никто не "
+                 "сверяет — уберите ключ или закрепите сертификат (pcs в ссылке узла)");
+}
+
+int cmd_vless(const struct pk_out *po) {
     evline_open();
-    struct output *o = NULL;
+    const char *out_name = po->tun.name;
     size_t cnt = 0;
     struct vless_sub_stats st;
-    struct spec *sp = spec_new();
-    int rc = load_nodes(sp, spec_path, out_name, &o, &cnt, &st);
+    int rc = load_nodes(po, &cnt, &st);
     if (rc) return rc;
-    underlay_setup(sp, o);
+    const struct pk_tun *o = &g_t;
+    underlay_setup(po);
+    vl_diag_insecure(po);
     struct vless_node *nodes = g_nodes;
     if (!cnt) {
         /* Приговор — не только в журнал. Диагностика без него говорила «устройства нет,
          * смотрите журнал движка», то есть отправляла человека искать то, что уже известно
          * здесь (I-100). total=0 отличает «узлов в подписке нет» от «ни один не ответил». */
-        vl_probe_report(out_name, PROBE_FAILED, 0, 0);
+        vl_probe_report("failed", 0, 0);
         evline_emit("down", "why", EVLINE_STR, "в подписке нет пригодных узлов",
                      (const char *)NULL);
         fprintf(stderr, LOG_W2 "в подписке нет пригодных узлов "
@@ -406,10 +417,10 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     /* Кандидаты в порядке предпочтения. Пустой `nodes` (и прежнее `node: -1`) означает «вся
      * подписка», выбранное подмножество — только его узлы и только в написанном порядке. Одна
      * функция на подъём и на `vless-probe`: покажи диагностика другой порядок, она объясняла
-     * бы не тот перебор, который случится (см. out_node_list в kinds/vless.c). */
+     * бы не тот перебор, который случится (pk_node_list, src/plugkit/pktun.c). */
     int *sel = calloc(cnt + 1, sizeof(int));           /* кандидатов не больше узлов подписки */
     if (!sel) { fprintf(stderr, LOG_W2 "нет памяти под список кандидатов\n"); return 1; }
-    size_t sel_n = out_node_list(o, cnt, sel, cnt + 1);
+    size_t sel_n = pk_node_list(o, cnt, sel, cnt + 1);
     if (!sel_n) {
         /* Сюда попадают только выборы, целиком уехавшие за пределы подписки: она обновилась,
          * узлов стало меньше. Перебирать вместо выбранного что попало нельзя — это увело бы
@@ -420,24 +431,24 @@ int cmd_vless(const char *spec_path, const char *out_name) {
          * на подписке из двадцати девяти живых узлов, где человек написал `node: 31`. Снято
          * с роутера; в запись теперь едет и номер, который он написал, и настоящее число
          * пригодных — по ним приговор читается без journal. */
-        vl_probe_report(out_name, PROBE_NO_SUCH_NODE, o->vless.nodes_n ? o->vless.nodes[0] : -1, (int)cnt);
+        vl_probe_report("no_such_node", o->nodes_n ? o->nodes[0] : -1, (int)cnt);
         evline_emit("nonode",
-                     "node", EVLINE_INT, (long)(o->vless.nodes_n ? o->vless.nodes[0] : -1),
+                     "node", EVLINE_INT, (long)(o->nodes_n ? o->nodes[0] : -1),
                      "total", EVLINE_INT, (long)cnt, (const char *)NULL);
         fprintf(stderr, LOG_W2 "выбранных узлов нет в подписке (пригодных всего %zu) — "
                         "проверьте nodes\n", cnt);
         return 1;
     }
-    if (sel_n < o->vless.nodes_n)
+    if (sel_n < o->nodes_n)
         fprintf(stderr, LOG_W2 "узлов выбрано %zu, в подписке есть %zu — остальные номера "
-                        "вне подписки\n", o->vless.nodes_n, sel_n);
+                        "вне подписки\n", o->nodes_n, sel_n);
     /* transport: — фильтр по транспорту узла. Не осталось никого — отказ со своей причиной, а
      * не перебор чего попало: человек написал `transport: ws`, и увести туннель на tcp-узел
      * значило бы молча сменить путь трафика (например, мимо CDN). */
     size_t before = sel_n;
     sel_n = transport_filter(o, nodes, sel, sel_n);
     if (!sel_n) {
-        vl_probe_report(out_name, PROBE_FAILED, 0, 0);
+        vl_probe_report("failed", 0, 0);
         evline_emit("down", "why", EVLINE_STR, "в подписке нет узлов с транспортом из transport",
                     (const char *)NULL);
         fprintf(stderr, LOG_W2 "среди %zu выбранных узлов нет ни одного с транспортом из "
@@ -449,17 +460,17 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     before = sel_n;
     sel_n = exclude_filter(o, nodes, sel, sel_n);
     if (!sel_n) {
-        vl_probe_report(out_name, PROBE_ALL_EXCLUDED, 0, (int)before);
+        vl_probe_report("all_excluded", 0, (int)before);
         evline_emit("excluded", "total", EVLINE_INT, (long)before, (const char *)NULL);
         evline_emit("down", "why", EVLINE_STR, "все узлы-кандидаты исключены exclude",
                     (const char *)NULL);
-        fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude или exclude_name — "
+        fprintf(stderr, LOG_W2 "все %zu узлов-кандидатов исключены exclude, exclude_name или only — "
                         "проверьте исключение и подписку\n", before);
         return 1;
     }
 
     int chosen = -1;
-    if (out_node_named(o)) {
+    if (pk_node_named(o)) {
         chosen = sel[0];
         /* Узел назван номером — перебора нет, и объяснять нечего. Прежняя запись снимается:
          * она осталась бы от предыдущей настройки и рассказывала бы про перебор, которого
@@ -469,7 +480,6 @@ int cmd_vless(const char *spec_path, const char *out_name) {
          * остаётся один и в подписке из единственного узла, и когда из трёх выбранных
          * уцелел один. По длине списка проверка там пропускалась вовсе — туннель поднимался
          * на молчащем узле, и вместо приговора возвращалось «устройства нет» (I-100). */
-        probe_clear(out_name);
     } else {
         /* Перебор — то самое состояние, у которого не было имени. Устройство появится только
          * после выбора, а до тех пор его нет, и раньше это выглядело как отказ: одинаково с
@@ -480,21 +490,17 @@ int cmd_vless(const char *spec_path, const char *out_name) {
          * Счёт идёт по КАНДИДАТАМ, а не по подписке: при `nodes: [6,7,12]` человек ждёт «2 из
          * 3», а не «2 из 26» — перебираться будут три, и обещать двадцать шесть значило бы
          * назвать чужое ожидание. */
-        for (size_t i = 0; i < sel_n; i++) {
-            char why[256];
-            vl_probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)sel_n);
-            evline_emit("node", "n", EVLINE_INT, (long)(i + 1), "total", EVLINE_INT, (long)sel_n,
-                        (const char *)NULL);
-            if (vless_probe(&nodes[sel[i]], 8, why, sizeof(why)) == 0) {
-                fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[sel[i]].name, why);
-                chosen = sel[i];
-                break;
-            }
-            fprintf(stderr, LOG_I2 "%s — %s\n", nodes[sel[i]].name, why);
-        }
+        /* Кандидаты — наперегонки (pool_race_first, I-535): первый ответивший побеждает, а мёртвые первые
+         * узлы не держат подъём по 8 с на каждый. Порядок предпочтения — порядок запуска. */
+        char why[256];
+        out_name_race = out_name;
+        struct pool_race pr = { .n = sel_n, .ids = sel, .probe = vl_race_probe, .arg = g_nodes,
+                                .on_start = vl_race_start, .on_fail = vl_race_fail };
+        chosen = pool_race_first(&pr, why, sizeof why);
+        if (chosen >= 0) fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[chosen].name, why);
     }
     if (chosen < 0) {
-        vl_probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);
+        vl_probe_report("failed", 0, (int)sel_n);
         evline_emit("down", "why", EVLINE_STR, "ни один узел подписки не отвечает",
                      (const char *)NULL);
         fprintf(stderr, LOG_W2 "ни один узел подписки не отвечает\n");
@@ -508,32 +514,29 @@ int cmd_vless(const char *spec_path, const char *out_name) {
      * когда живых узлов не осталось, и снова up. Заводится она не здесь, а когда стек поднял
      * устройство: up несёт имя устройства, и по нему демон привязывает маршрут выхода. Без демона
      * событий никто не читает, а слежка всё равно идёт — замена узла и сброс соединений нужны и там. */
-    probe_clear(out_name);
     /* Пул узлов (src/tunnel/pool.c): первый активный — выбранный здесь, остальные `active - 1`
      * пул найдёт среди кандидатов сам, уже с поднятым устройством, — подъём не ждёт их проверок. */
     static const struct pool_proto proto = {
         .ops = &vless_dialer, .probe = vl_pool_probe, .name = vl_pool_name, .tag = "vless",
     };
     static struct pool_cfg pc;
-    const struct tun_pool *tp = &o->vless.pool;
+    const struct pk_pool *tp = &o->pool;
     pc.proto = &proto;
     pc.nodes = nodes;
     pc.stride = sizeof(*nodes);
     pc.sel = sel;
     pc.sel_n = sel_n;
     pc.first = chosen;
-    pc.checked = !out_node_named(o);
+    pc.checked = !pk_node_named(o);
     pc.active = tp->active ? tp->active : 1;
     pc.by = tp->by;
-    pc.interval_s = tp->interval_s ? tp->interval_s : POOL_INTERVAL_S;
+    pc.pick = tp->pick;
+    pc.tolerance_ms = tp->tol_set ? tp->tolerance_ms : -1;
+    pc.interval_s = tp->interval_s;         /* 0 — умолчание пула: у pick: latency своё */
     pc.silence_s = tp->silence_s < 0 ? 0 : tp->silence_s ? tp->silence_s : POOL_SILENCE_S;
     pc.out = out_name;
 
-    /* Реестр — чтобы узнать таблицу выхода: из неё берётся адрес устройства. Вызов
-     * идемпотентен и с apply не спорит: тот же файл, те же номера. Правило 5,
-     * docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал die()
-     * изнутри registry_assign. */
-    struct err e = {0};
-    if (registry_assign(sp, &e) < 0) err_die(&e);
-    return vless_tunnel_run(o, &pc, vl_ready, NULL);
+    /* Метка, таблица и порт слушателя — из {conf}: их назначило ядро по всей спеке. */
+    pc.diag = g_diag;
+    return vless_tunnel_run(&po->tun, &pc, vl_ready, NULL);
 }

@@ -6,6 +6,7 @@
 #include "dialer.h"
 #include "transport.h"
 #include "vision.h"
+#include "vless_proto.h"
 
 /* Сессия VLESS на одно соединение клиента: состояние потока и связь с узлом.
  *
@@ -18,6 +19,7 @@ struct vl_sess {
     /* ---- поток: VLESS и Vision ---- */
     uint8_t header_sent;       /* заголовок запроса VLESS уже ушёл узлу */
     uint8_t established;       /* заголовок ответа VLESS снят */
+    struct vless_response_stream response;   /* заголовок ответа, пока не снят целиком (vless_response_feed) */
     /* ---- сборка датаграммы UDP (только у потоков UDP) ----
      *
      * VLESS несёт датаграммы потоком: [длина(2)][данные] и снова. Записи TLS про эти
@@ -37,6 +39,9 @@ struct vl_sess {
      * при закрытии сессии. Датаграммы до 4 КБ (почти все) собираются в dg и кучи не трогают,
      * поэтому на 320 потоков память растёт только у тех, по кому реально идёт крупное. */
     unsigned char *dgbig;
+    /* Остаток крупной датаграммы, не вошедший в окно h2 (vl_write): уйдёт перед следующей записью. */
+    unsigned char *utail;
+    size_t utail_n, utail_off;
     /* Разобранный UUID узла: нужен один раз на соединение — в заголовке запроса VLESS и
      * при заводе Vision. */
     unsigned char uuid[16];
@@ -53,17 +58,14 @@ struct vl_sess {
 
 extern const struct dialer_ops vless_dialer;
 
-/* Трассировка разбора (STEER_TUN_TRACE) — та же, что у стека, и в тот же поток журнала. */
-void vl_set_trace(int on);
-
 /* Поднять туннель выхода на пуле узлов pc (src/tunnel/pool.h; узлы — struct vless_node, первый
  * активный — pc->first): проверка узла, которую нельзя отложить до первого соединения, и стек с
  * дайлером VLESS под пулом (pool_run). ready — как у stack_run (stack.h, stack_ready_fn): устройство
  * поднято; up демону говорит пул, модуль — только своё; NULL — ничего. Возвращает код выхода
  * процесса, всегда ненулевой — успешного выхода у цикла нет. */
-struct output;
+struct tun_out;
 struct pool_cfg;
-int vless_tunnel_run(struct output *o, const struct pool_cfg *pc,
+int vless_tunnel_run(const struct tun_out *o, const struct pool_cfg *pc,
                      void (*ready)(void *arg, const char *dev), void *arg);
 
 #endif

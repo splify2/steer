@@ -25,11 +25,11 @@
 #include "pool.h"
 
 time_t stack_now_s(void) { return time(NULL); }
-int stack_run(struct output *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
+int stack_run(const struct tun_out *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
     (void)o; (void)d; (void)ready; (void)arg;
     return 1;
 }
-int pool_run(struct output *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg) {
+int pool_run(const struct tun_out *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg) {
     (void)o; (void)pc; (void)ready; (void)arg;
     return 1;
 }

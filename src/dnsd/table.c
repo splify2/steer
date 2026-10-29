@@ -156,10 +156,129 @@ chm_t chm_upto(chm_t m, size_t n) {
  * второго остаются с поддельным адресом, которого нет ни в одном правиле. Кто из
  * правил заберёт пакет, решает порядок цепочки — тот же порядок, в котором правила
  * стоят у человека на экране. */
+/* ПОДБОР КАНАЛОВ ПО ИМЕНИ — один индекс на все каналы, а не проход по каналам.
+ *
+ * Прежде имя проверялось против каждого канала по очереди (dch_matches): у каждого свой индекс по
+ * суффиксам, и запрос стоил «число каналов × число меток». Каналов у человека с десятком
+ * правил бывает десятки, и это на каждый вопрос клиента и на каждую запись fake-IP при засеве.
+ * Теперь суффиксы всех каналов лежат в ОДНОЙ таблице: запись — шаблон и два набора каналов (у кого
+ * он доменный, у кого точный). Имя «a.b.c» спрашивает таблицу про «a.b.c», «b.c» и «c» — столько
+ * поисков, сколько меток, — и получает набор каналов сразу, независимо от их числа.
+ *
+ * Не в индекс идут каналы, правила которых по суффиксу не найти: шаблоны и регулярные выражения
+ * (fancy) и части с исключениями. Их единицы; они проверяются прежним dch_matches. Результат
+ * тот же, что у прохода по всем каналам: набор всех, кому имя принадлежит.
+ *
+ * Индекс строится лениво, при первом подборе после любой смены правил: ruleset_add и ruleset_free
+ * ставят g_dch_stale (rules.c), число каналов сверяется само. Ключи — указатели на шаблоны в
+ * правилах каналов, не копии: правила живут до следующей смены, которая и сбросит индекс. */
+struct dix_ent { const char *pat; chm_t ns, ex; };
+static struct {
+    struct sindex ix;
+    struct dix_ent *e;
+    size_t n, cap;
+    size_t *slow, slow_n;       /* каналы без индекса: подбор прежним dch_matches */
+    size_t built;               /* g_dch_n при сборке */
+    int ok;
+} g_dix;
+
+static const char *dix_key(const void *owner, uint32_t idx) {
+    return ((const struct dix_ent *)owner)[idx].pat;
+}
+
+static void dix_reset(void) {
+    sindex_free(&g_dix.ix);
+    free(g_dix.e);
+    free(g_dix.slow);
+    memset(&g_dix, 0, sizeof(g_dix));
+}
+
+static int dix_add(const struct ruleset *rs, size_t ch, chm_t one) {
+    for (size_t k = 0; k < rs->n; k++) {
+        const struct rule *r = &rs->rules[k];
+        if (r->type != RULE_EXACT && r->type != RULE_NAMESPACE) continue;
+        uint32_t hit = sindex_get(&g_dix.ix, g_dix.e, dix_key, r->pattern);
+        struct dix_ent *en;
+        if (hit) {
+            en = &g_dix.e[(hit & SIDX_IDX_MASK) - 1];
+        } else {
+            if (g_dix.n == g_dix.cap) {
+                size_t nc = g_dix.cap ? g_dix.cap * 2 : 1024;
+                struct dix_ent *ne = realloc(g_dix.e, nc * sizeof(*ne));
+                if (!ne) return -1;
+                g_dix.e = ne;
+                g_dix.cap = nc;
+            }
+            en = &g_dix.e[g_dix.n];
+            en->pat = r->pattern;
+            en->ns = en->ex = 0;
+            if (sindex_put(&g_dix.ix, g_dix.e, dix_key, r->pattern, (uint32_t)g_dix.n, 1) != 0) return -1;
+            g_dix.n++;
+        }
+        chm_t *m = r->type == RULE_EXACT ? &en->ex : &en->ns;
+        if (!chm_has(*m, ch)) *m = chm_or(*m, one);
+    }
+    return 0;
+}
+
+static int dix_build(void) {
+    dix_reset();
+    for (size_t i = 0; i < g_dch_n; i++) {
+        const struct dchan *d = &g_dch[i];
+        int slow = d->rules.fancy_n > 0;
+        for (size_t p = 0; p < d->parts_n && !slow; p++)
+            slow = d->parts[p].has_excl || d->parts[p].rules.fancy_n > 0;
+        if (slow) {
+            size_t *ns = realloc(g_dix.slow, (g_dix.slow_n + 1) * sizeof(*ns));
+            if (!ns) goto fail;
+            g_dix.slow = ns;
+            g_dix.slow[g_dix.slow_n++] = i;
+            continue;
+        }
+        chm_t one = chm_one(i);
+        if (dix_add(&d->rules, i, one) != 0) goto fail;
+        for (size_t p = 0; p < d->parts_n; p++)
+            if (dix_add(&d->parts[p].rules, i, one) != 0) goto fail;
+    }
+    g_dix.built = g_dch_n;
+    g_dix.ok = 1;
+    g_dch_stale = 0;
+    return 0;
+fail:
+    dix_reset();
+    return -1;
+}
+
 chm_t dch_match_mask(const char *host) {
     chm_t m = 0;
-    for (size_t i = 0; i < g_dch_n; i++)
+    if (g_dch_stale || !g_dix.ok || g_dix.built != g_dch_n) {
+        if (dix_build() != 0) {                 /* нет памяти: прежний проход по каналам */
+            for (size_t i = 0; i < g_dch_n; i++)
+                if (dch_matches(&g_dch[i], host)) m = chm_or(m, chm_one(i));
+            return m;
+        }
+    }
+    char lower[MAX_HOSTNAME];
+    size_t n = strlen(host);
+    if (n >= sizeof(lower)) n = sizeof(lower) - 1;
+    memcpy(lower, host, n);
+    lower[n] = '\0';
+    str_lower(lower);
+    for (const char *suf = lower;;) {
+        uint32_t hit = sindex_get(&g_dix.ix, g_dix.e, dix_key, suf);
+        if (hit) {
+            const struct dix_ent *en = &g_dix.e[(hit & SIDX_IDX_MASK) - 1];
+            m = chm_or(m, en->ns);
+            if (suf == lower) m = chm_or(m, en->ex);
+        }
+        const char *dot = strchr(suf, '.');
+        if (!dot) break;
+        suf = dot + 1;
+    }
+    for (size_t k = 0; k < g_dix.slow_n; k++) {
+        size_t i = g_dix.slow[k];
         if (dch_matches(&g_dch[i], host)) m = chm_or(m, chm_one(i));
+    }
     return m;
 }
 
@@ -180,6 +299,14 @@ chm_t dch_fakeip_only(chm_t mask) {
     for (size_t i = 0; i < g_dch_n; i++)
         if (g_dch[i].realip && chm_has(mask, i)) mask = chm_andn(mask, chm_one(i));
     return mask;
+}
+
+/* У всех ли каналов маски нет половины IPv4 (правила family: 6): тогда A имени — пустой ответ. */
+int dch_none_v4(chm_t mask) {
+    if (!mask) return 0;
+    for (size_t i = 0; i < g_dch_n; i++)
+        if (chm_has(mask, i) && (g_dch[i].fam & DCH_V4)) return 0;
+    return 1;
 }
 
 int dch_all_v6(chm_t mask) {
@@ -218,7 +345,7 @@ int dch_all_v6(chm_t mask) {
  * половина IPv6 (выход сменили на несущий IPv6), требует перезапуска. */
 static void dch_signature(FILE *out) {
     for (size_t i = 0; i < g_dch_n; i++) {
-        fprintf(out, "%s|%d|%s", g_dch[i].set, g_dch[i].realip ? 1 : 0,
+        fprintf(out, "%s|%d|%s", g_dch[i].set, g_dch[i].block ? 2 : g_dch[i].realip ? 1 : 0,
                 (g_dch[i].fam & DCH_V6) ? "46" : "4");
         for (size_t k = 0; k < g_dch[i].rules_n; k++)
             fprintf(out, "|%s", g_dch[i].rules_path[k]);
@@ -273,6 +400,7 @@ static void dch_name(const struct spec *sp, char *dst, size_t n, const struct sp
     const struct spec_client *w = rule_who(sp, c);
     group_set_name(sp, dst, n, rule_out(sp, c)->name, "dom", w->from, w->from_n, realip,
                    &rule_list(sp, c)->l4);
+    set_name_famtag(dst, n, rule_famtag(c));       /* политика семейства (R-154) — как у компилятора */
 }
 
 /* ---- каналы с наборами sing-box -----------------------------------------------------------
@@ -287,7 +415,7 @@ static size_t g_plan_cap;
 
 static void unit_name(const struct spec *sp, const struct spec_rule *c, const struct srs_part *p,
                       int realip, char *dst, size_t n) {
-    if (!p) { dch_name(sp, dst, n, c, realip); return; }
+    if (!p) { dch_name(sp, dst, n, c, realip); return; }   /* хвост политики — внутри */
     const struct spec_client *w = rule_who(sp, c);
     const struct spec_list *l = rule_list(sp, c);
     const char *out = rule_out(sp, c)->name;
@@ -298,6 +426,7 @@ static void unit_name(const struct spec *sp, const struct spec_rule *c, const st
     else
         group_set_name(sp, dst, n, out, "dom", w->from, w->from_n, realip,
                        l4match_same(&p->l4, &l->l4) ? &l->l4 : &p->l4);
+    set_name_famtag(dst, n, rule_famtag(c));
 }
 
 /* Строки источников, собранные здесь (выбор клауз), живут до следующей сборки таблицы. */
@@ -429,20 +558,20 @@ static int dch_join_domain_group(const struct spec *sp, const struct spec_rule *
 
 /* Семейства набора канала: IPv4 всегда, IPv6 — если компилятор даёт этой доменной группе парный
  * набор и v6-двойника (dom6_ok — одно решение на обоих; доп. группа набора .srs половины IPv6 не
- * имеет, как и у компилятора, group_has_set6). Раскладка ядра — та, что стоит (nft_compat_seen6:
- * по netlink, без пробы `nft -c` — таблицу собирает и демон в своём процессе), и спрашивается
- * только когда от неё что-то зависит: fake-IP с выходом и клиентами, которые IPv6 допускают.
- *
- * Спека v1 (sp->dns.names_v4 — ставит перевод v1) — всегда только IPv4: на AAAA её имён пустой
- * ответ, как до 1.9, хотя компилятор набор «<имя>6» и двойника заводит. Доводы — у поля в
- * spec.h. Таблица демону несёт это полем семейства «4», и резолверу номер формата спеки знать не
- * нужно. */
-static int dch_fam(const struct spec *sp, const struct spec_rule *r, int realip, int extra) {
-    if (extra || sp->dns.names_v4) return DCH_V4;
+ * имеет, как и у компилятора, group_has_set6). */
+static int dch_fam(const struct spec *sp, const struct spec_rule *r, int extra, int *blocked) {
+    *blocked = 0;
+    if (extra) return DCH_V4;
     const struct spec_client *w = rule_who(sp, r);
     const struct output *o = rule_out(sp, r);
-    if (!dom6_ok(sp, o, w->from, w->from_n, realip, 0)) return DCH_V4;
-    if (!realip && !dom6_ok(sp, o, w->from, w->from_n, realip, nft_compat_seen6())) return DCH_V4;
+    /* Политика семейства правила (R-154): половины и «блок» считает та же rule_fam_eff, что у
+     * компилятора (groups.c), по тому же ответу dom6_ok. Блок — канал отвечает пустым адресом
+     * (kinds/block.c) на A и AAAA: имя правила не открывается, а не уходит напрямую. */
+    if (r->family) {
+        int e = rule_fam_eff(r, dom6_ok(sp, o, w->from, w->from_n), blocked);
+        return (e & 1 ? DCH_V4 : 0) | (e & 2 ? DCH_V6 : 0);
+    }
+    if (!dom6_ok(sp, o, w->from, w->from_n)) return DCH_V4;
     return DCH_V4 | DCH_V6;
 }
 
@@ -502,9 +631,11 @@ static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
         else if (!(p->own && l->prefixes_n && p->kind != SP_EXTRA) ||
                  !dch_join_domain_group(sp, c, p, set, sizeof(set), &realip, &up))
             continue;
-        struct dchan *d = dch_slot(set, realip, up, rule_out(sp, c)->name,
-                                   dch_fam(sp, c, realip, p->kind == SP_EXTRA));
+        int blk;
+        int fam = dch_fam(sp, c, p->kind == SP_EXTRA, &blk);
+        struct dchan *d = dch_slot(set, realip, up, rule_out(sp, c)->name, fam);
         if (!d) return;
+        if (out_is_block(rule_out(sp, c)) || blk) d->block = 1;
         dch_name_rule(d, c, p->has_dom);
         int composite = p->kind == SP_COMPOSITE;
         if (p->own) {
@@ -707,8 +838,10 @@ void dch_build(const struct spec *sp) {
             snprintf(nd->set, sizeof(nd->set), "%s", set);
             snprintf(nd->out, sizeof(nd->out), "%.31s", rule_out(sp, r)->name);
             nd->realip = realip;
+            int blk;
+            nd->fam = dch_fam(sp, r, 0, &blk);
+            nd->block = out_is_block(rule_out(sp, r)) || blk;
             nd->up = up;
-            nd->fam = dch_fam(sp, r, realip, 0);
             k = g_dch_n++;
         }
         if (!g_dch[k].chan[0] || (!g_dch[k].chan_dom && l->domains_n)) {

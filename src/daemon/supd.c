@@ -50,7 +50,7 @@
  * DNS), у помощника — нет, зато он держит то, что нужно новому экземпляру: устройство TUN
  * клиента vless или xsteer (новый падает «устройство vr не создалось: Resource busy, отказал
  * TUNSETIFF» с паузой 5→10→…→80 с, и выход лежит, пока сироту не убьют руками — проверка на
- * QEMU 4192267), порт listen обфускатора, очередь NFQUEUE обработчика zapret. Прежде после
+ * QEMU 4192267), порт listen обфускатора, очередь NFQUEUE обработчика модуля DPI. Прежде после
  * kill -9 демона такого сироту не гасил никто: новый демон подхватывал только резолвер
  * (adopt_dnsd), а сам помощник смерти родителя не замечал — события он пишет лишь при смене
  * состояния, и закрытая труба в тишине ничем себя не выдаёт. Теперь признаков три, и каждый
@@ -76,10 +76,8 @@
  *      каталога состояния, чьего демона с тем pid и тем временем старта больше нет. Нужно это
  *      не на случай, что PDEATHSIG не сработал, а потому что SIGTERM помощник исполняет не
  *      мгновенно: клиент vless закрывает соединения, обфускатор — сокеты, и новый демон,
- *      поднятый procd через секунду, иначе ещё мог бы застать устройство занятым. Сирот
- *      прежней версии (без STEER_SUPD) узнаём по STEER_EVENT_FD, родителю init и --state-dir в
- *      командной строке — их после обновления поверх упавшего демона тоже некому гасить.
- *      Чужих не трогает: без STEER_EVENT_FD (помощники под procd, `steer supervise`) процесс не
+ *      поднятый procd через секунду, иначе ещё мог бы застать устройство занятым.
+ *      Чужих не трогает: без STEER_EVENT_FD или без STEER_SUPD (помощники под procd, `steer supervise`) процесс не
  *      наш, с меткой другого каталога состояния — чужой демон, с меткой живого демона —
  *      помощник живого демона (второй демон на том же каталоге — не наш случай, и гасить у
  *      него помощников этот демон не берётся).
@@ -117,28 +115,33 @@
 #include "platform.h"
 #include "spec.h"
 #include "evline.h"
+#include "plugin.h"
 #include "tabfmt.h"
 #include "daemon.h"
 #include "loop.h"
 #include "state.h"
 #include "watchd.h"
 #include "helpers.h"
-#include "module.h"
+#include "awg.h"
 
 #define LOG_SW "steer[warn] supervise: "
-/* Таблицы, не забранные резолвером: одна — десятки килобайт; больше мегабайта в очереди —
- * резолвер не читает трубу вовсе, и труба закрывается (он выйдет и поднимется заново). */
-#define SUPD_TABQ_MAX (1024 * 1024)
-#define SUPD_DNSD_FLAGS 8
+/* Таблицы, не забранные резолвером: резолвер, у которого в очереди лежит больше восьми таблиц
+ * сразу (и не меньше мегабайта), трубу не читает вовсе, и она закрывается (он выйдет и
+ * поднимется заново). Предел считается в таблицах, а не в байтах: таблица спеки с большими
+ * списками бывает и в десятки мегабайт, и жёсткий мегабайт закрывал бы трубу на первой же
+ * отдаче. Одна таблица в пустую очередь принимается любой длины. */
+#define SUPD_TABQ_MIN (1024 * 1024)
+#define SUPD_TABQ_TABS 8
 
 struct supd {
     struct steerd *d;
     struct loop *l;
     int (*enabled)(void);
-    const char *dnsd_flags[SUPD_DNSD_FLAGS + 1];
+    const char **dnsd_flags;        /* куча, NULL в конце; число флагов не ограничено */
+    size_t dnsd_flag_n;
     struct helper_set set;
     struct helper *fresh;          /* план сверки: по выходу спеки + резолвер (supd_plan) */
-    size_t fresh_cap;
+    size_t fresh_cap, fresh_n;
     struct loop_timer *tm;
     char exe[PATH_MAX];       /* движок или шов STEER_SUPERVISE_EXE */
     char self[PATH_MAX];      /* настоящий файл движка: резолвер и помощники-программы */
@@ -156,10 +159,25 @@ struct supd {
     /* Резолвер забран у прежнего демона (adopt_dnsd): соединение с его управляющим сокетом —
      * его закрытие и есть выход резолвера; -1 — резолвер свой ребёнок (или его нет). */
     int dn_conn;
+    /* Забор резолвера (adopt_dnsd) идёт без ожидания в цикле демона: ad_ph — что ждём (0 — ничего;
+     * 1 — ответ «ok» на «adopt»; 2 — выхода резолвера после SIGTERM; 3 — после SIGKILL), ad_ans/ad_an —
+     * принятая часть ответа, ad_pid — резолвер, ad_p1 — конец записи новой трубы таблицы (до «ok» — не
+     * s->dn_fd), ad_tm — срок ожидания. */
+    int ad_ph, ad_p1;
+    char ad_ans[16];
+    size_t ad_an;
+    pid_t ad_pid;
+    struct loop_timer *ad_tm;
     /* Метка помощников «чей я» (шапка, «Помощники демона не переживают»): «STEER_SUPD=…» для
      * putenv в ребёнке, и pid демона — для проверки getppid() там же. */
     char tag[PATH_MAX + 64];
     pid_t me;
+    /* Приговоры членам групп от их помощника (событие member, модуль steer-warpbox): член мёртв
+     * по проверке модуля раньше, чем это увидит сторож по рукопожатию. Держится, пока жив процесс
+     * помощника: вышел он — его приговоры снимаются (child_cb), иначе член остался бы «мёртвым»
+     * навсегда. */
+    struct mverdict { char out[32], grp[32]; signed char v; } *mv;
+    size_t mv_n, mv_cap;
 };
 
 static void supd_kick(struct supd *s);
@@ -175,14 +193,31 @@ static struct helper *by_fd(struct supd *s, int fd) {
     return NULL;
 }
 
+/* Причина демона со словом (supd.*): текст остаётся в st->why, слово и подстановки идут рядом. */
+static void why_set(struct helper_state *st, const char *code, const char *args, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static void why_set(struct helper_state *st, const char *code, const char *args, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(st->why, sizeof(st->why), fmt, ap);
+    va_end(ap);
+    snprintf(st->why_code, sizeof(st->why_code), "%s", code ? code : "");
+    snprintf(st->why_args, sizeof(st->why_args), "%s", args ? args : "");
+}
+
 static void emit_state(struct supd *s, const struct helper *h, const char *ev, const char *why) {
-    char out[80], w[512], f[700];
+    char out[80], w[512], f[900];
     steerd_json_str(out, sizeof(out), h->name);
+    /* Служба плагина — не выход: подписчик, ждущий выход по "out", её за выход не примет. */
+    const char *key = h->service ? "service" : "out";
     if (why) {
         steerd_json_str(w, sizeof(w), why);
-        snprintf(f, sizeof(f), ",\"out\":%s,\"helper\":\"%s\",\"why\":%s", out, h->cmd, w);
+        size_t n = (size_t)snprintf(f, sizeof(f), ",\"%s\":%s,\"helper\":\"%s\",\"why\":%s", key, out, h->cmd, w);
+        if (h->st.why_code[0] && n < sizeof(f))
+            snprintf(f + n, sizeof(f) - n, ",\"code\":\"%s\",\"args\":%s", h->st.why_code,
+                     h->st.why_args[0] ? h->st.why_args : "{}");
     } else {
-        snprintf(f, sizeof(f), ",\"out\":%s,\"helper\":\"%s\"", out, h->cmd);
+        snprintf(f, sizeof(f), ",\"%s\":%s,\"helper\":\"%s\"", key, out, h->cmd);
     }
     steerd_emit(s->d, ev, f);
 }
@@ -191,7 +226,7 @@ static void emit_state(struct supd *s, const struct helper *h, const char *ev, c
  * устройство выхода создаёт наш процесс (vless, xsteer). Обфускатор и мост сторож о здоровье не
  * спрашивает — будить его их событиями незачем. */
 static void wake_watch(struct supd *s, const struct helper *h) {
-    if (!s->d->watch || !s->d->have) return;
+    if (!s->d->watch || !s->d->have || h->service) return;
     const struct output *o = out_by_name(s->d->sp, h->name);
     if (o && out_engine_managed(o)) watchd_helper_changed(s->d->watch);
 }
@@ -242,7 +277,7 @@ static void route_up(struct supd *s, struct helper *h, const char *dev) {
 /* health (мост tgws): путь до ДЦ отставлен — оценка пути, а не помощника целиком, поэтому
  * здоровья выхода она не меняет и сторожа не будит (выход моста сторож не выбирает: устройства у
  * него нет). Демон её помнит — status выхода показывает отставленные пути, пока их срок не
- * вышел (paths_down, supd_status_fields), — и шлёт подписчикам событием health. Тот же путь
+ * вышел (paths_down, status_fields), — и шлёт подписчикам событием health. Тот же путь
  * повторно — запись обновляется на месте; мест нет — вытесняется самая старая. */
 static void ev_health(struct supd *s, struct helper *h, const struct evline *e) {
     long dc, media = 0, cool = 0;
@@ -278,74 +313,163 @@ static void ev_health(struct supd *s, struct helper *h, const struct evline *e) 
     steerd_emit(s->d, "health", f);
 }
 
-/* ОТВЕРГНУТЬ МОДУЛЬ (шаг 4 выпуска 1.10, evline.h: hello). Модуль — отдельный бинарник со своим
- * пакетом, и на роутере он легко оказывается другой версии, чем движок: пакеты обновили не
- * все. Формат событий между выпусками не обещан, поэтому чужой версии демон не верит ни в чём —
- * ни в up, ни в устройство, к которому пришлось бы привязывать маршрут. Процесс гасится
- * (SIGTERM), причина остаётся в журнале и в status (last_down, поле rejected) до нового запуска:
- * человек видит не «помощник упал», а «поставьте модуль той же версии». Перезапуск идёт по
- * обычной паузе — обновили пакет, и следующий запуск пройдёт. */
-static void mod_reject(struct supd *s, struct helper *h, const char *why) {
+/* ОТВЕРГНУТЬ ПРОГРАММУ ПЛАГИНА (steer-api.md, 2.1: hello). Программе с чужим API демон не верит ни в
+ * чём — ни в up, ни в устройство, к которому пришлось бы привязывать маршрут. Процесс гасится (SIGTERM),
+ * причина остаётся в журнале и в status (last_down, поле rejected) до нового запуска: человек видит не
+ * «помощник упал», а «обновите плагин». Перезапуск идёт по обычной паузе. */
+static void mod_reject(struct supd *s, struct helper *h, const char *why, const char *code, const char *args) {
     struct helper_state *st = &h->st;
-    char reason[200];
-    snprintf(reason, sizeof(reason), "модуль %s %s", h->prog, why);
+    char reason[240];
+    snprintf(reason, sizeof(reason), "плагин %s %s", h->plugin, why);
     fprintf(stderr, LOG_SW "%s %s — %s: отвергнут\n", h->cmd, h->name, reason);
     h->rejected = 1;
     st->up = 0;
     st->known = 1;
     st->said_down = 1;
     st->since = (long)time(NULL);
-    snprintf(st->why, sizeof(st->why), "%s", reason);
+    char aj[256];
+    snprintf(aj, sizeof(aj), "%s", args ? args : "");
+    err_args_add(aj, sizeof(aj), "plugin", h->plugin);       /* чья программа отвергнута — «плагин {plugin}» в тексте */
+    why_set(st, code, aj, "%.199s", reason);
     emit_state(s, h, "helper-down", st->why);
     wake_watch(s, h);
     if (h->pid > 0) kill(h->pid, SIGTERM);
 }
 
-/* Первое сообщение модуля обязано быть hello с версией движка. */
-static void mod_hello(struct supd *s, struct helper *h, const struct evline *e) {
-    const char *ver = evline_str(e, "ver");
-    if (!ver) {
-        mod_reject(s, h, "прислал hello без версии");
+/* hello программы плагина (steer-api.md, 2.1): api — версия steer-api, которой она говорит: major — как
+ * у ядра, minor — не больше; mod — id плагина, чья это программа. Версию плагина (ver) с версией ядра
+ * не сверяем: плагины обновляются отдельно. Не так — процесс гасится, причина — в status и журнал. */
+static void plug_hello(struct supd *s, struct helper *h, const struct evline *e) {
+    const char *api = evline_str(e, "api"), *ver = evline_str(e, "ver"), *mod = evline_str(e, "mod");
+    if (ver) snprintf(h->mver, sizeof(h->mver), "%s", ver);
+    char why[200];
+    if (!api) {
+        mod_reject(s, h, "прислал hello без версии steer-api (api)", "supd.hello_no_api", NULL);
         return;
     }
-    /* Версия, которой модуль представился, запоминается и у отвергнутого: по ней человек видит в
-     * helper, какой модуль стоит, а не только «отвергнут» (docs/ctl.md, module_ver). */
-    snprintf(h->mver, sizeof(h->mver), "%s", ver);
-    if (strcmp(ver, steer_engine_version()) != 0) {
-        char why[160];
-        snprintf(why, sizeof(why), "версии %.16s, а ядро %.16s — обновите пакеты steer вместе",
-                 ver, steer_engine_version());
-        mod_reject(s, h, why);
+    unsigned pa = 0, pi = 0, ka = 0, ki = 0;
+    if (sscanf(api, "%u.%u", &pa, &pi) != 2 || sscanf(STEER_API_VERSION, "%u.%u", &ka, &ki) != 2 || pa != ka || pi > ki) {
+        char a[160], aj[96];
+        snprintf(why, sizeof(why), "говорит steer-api %.16s, ядро — %s", api, STEER_API_VERSION);
+        steerd_json_str(a, sizeof(a), api);
+        snprintf(aj, sizeof(aj), "{\"1\":%.40s,\"2\":\"%s\"}", a, STEER_API_VERSION);
+        mod_reject(s, h, why, "supd.hello_api_mismatch", aj);
+        return;
+    }
+    if (mod && strcmp(mod, h->plugin) != 0) {
+        char a[160], b[160], aj[400];
+        snprintf(why, sizeof(why), "представился плагином %.32s, а запущен как %.32s", mod, h->plugin);
+        steerd_json_str(a, sizeof(a), mod);
+        steerd_json_str(b, sizeof(b), h->plugin);
+        snprintf(aj, sizeof(aj), "{\"1\":%.70s,\"2\":%.70s}", a, b);
+        mod_reject(s, h, why, "supd.hello_wrong_mod", aj);
         return;
     }
     h->hello = 1;
 }
 
-static void ev_line(struct supd *s, struct helper *h, const char *line) {
-    struct evline e;
-    if (evline_parse(line, &e) != 0) return;
+/* revive (прежнее имя — awg; плагин warpbox, evline.h): файл члена развёрнутой группы переписан — перенастроить его
+ * устройство сейчас, тем же awg_revive, что зовёт сторож, а не ждать прохода; fresh 1 — живой туннель
+ * пересел на более быструю точку, и сессия нужна новая (awg_refresh). Только член группы этого
+ * помощника (out_owned_by): чужим выходом помощник распоряжаться не вправе. */
+static void ev_awg(struct supd *s, struct helper *h, const struct evline *e) {
+    const char *name = evline_str(e, "out");
+    if (!name || !s->d->have) return;
+    const struct output *o = out_by_name(s->d->sp, name);
+    if (!o || !out_owned_by(o, NULL, h->name)) {
+        fprintf(stderr, LOG_SW "%s %s просит перенастроить %s — это не член его группы\n", h->cmd, h->name, name);
+        return;
+    }
+    long fresh = 0;
+    if (evline_int(e, "fresh", &fresh) && fresh == 1) awg_refresh(s->d->sp, o);
+    else awg_revive(s->d->sp, o, o->device, NULL, 0);
+    if (s->d->watch) watchd_helper_changed(s->d->watch);
+}
+
+/* Записать приговор v члену name группы grp; who — кто его вынес (для журнала). Общее у события member
+ * помощника и у .so-плагина (host->member_verdict, plugso.c). */
+static void mverdict_set(struct supd *s, const char *grp, const char *who, const char *name, int v) {
+    struct mverdict *m = NULL;
+    for (size_t i = 0; i < s->mv_n; i++)
+        if (!strcmp(s->mv[i].out, name)) m = &s->mv[i];
+    if (!m) {
+        if (v == -1) return;
+        if (s->mv_n == s->mv_cap) {
+            size_t nc = s->mv_cap ? s->mv_cap * 2 : 8;
+            struct mverdict *n = realloc(s->mv, nc * sizeof(*n));
+            if (!n) return;
+            s->mv = n;
+            s->mv_cap = nc;
+        }
+        m = &s->mv[s->mv_n++];
+        snprintf(m->out, sizeof(m->out), "%s", name);
+        snprintf(m->grp, sizeof(m->grp), "%s", grp);
+        m->v = -1;
+    }
+    if (m->v == (signed char)v) return;
+    m->v = (signed char)v;
+    if (v == 0) fprintf(stderr, "steer[info] supervise: %s: член %s не отвечает — увожу группу с него\n",
+                        who, name);
+    if (s->d->watch) watchd_helper_changed(s->d->watch);
+}
+
+/* member (модуль steer-warpbox, evline.h): приговор члену его группы — ok 0 (мёртв: трафик группы
+ * уходит с него сразу), 1 (жив) или -1 (не знаю: решает сторож по своим признакам). Только член
+ * группы этого помощника. Смена приговора будит сторожа: проход уводит группу с мёртвого члена, не
+ * дожидаясь, пока рукопожатие устареет (у awg это до трёх минут). */
+static void ev_member(struct supd *s, struct helper *h, const struct evline *e) {
+    const char *name = evline_str(e, "out");
+    long v;
+    if (!name || !evline_int(e, "ok", &v) || v < -1 || v > 1 || !s->d->have) return;
+    const struct output *o = out_by_name(s->d->sp, name);
+    if (!o || !out_owned_by(o, NULL, h->name)) return;
+    char who[96];
+    snprintf(who, sizeof who, "%s %s", h->cmd, h->name);
+    mverdict_set(s, h->name, who, name, (int)v);
+}
+
+static void mv_drop_group(struct supd *s, const char *grp) {
+    size_t w = 0;
+    for (size_t i = 0; i < s->mv_n; i++)
+        if (strcmp(s->mv[i].grp, grp) != 0) s->mv[w++] = s->mv[i];
+    s->mv_n = w;
+}
+
+int supd_member_verdict(const struct steerd *d, const char *out) {
+    const struct supd *s = d ? d->sup : NULL;
+    for (size_t i = 0; s && out && i < s->mv_n; i++)
+        if (!strcmp(s->mv[i].out, out)) return s->mv[i].v;
+    return -1;
+}
+
+static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *ep) {
+    const struct evline e = *ep;
     struct helper_state *st = &h->st;
     long v, t;
-    /* Шов стенда (STEER_SUPERVISE_EXE) подменяет модуль заглушкой движка: она про hello не знает. */
-    if (h->module && !s->seam) {
+    /* Шов стенда (STEER_SUPERVISE_EXE) подменяет программу заглушкой движка: она про hello не знает. */
+    if (h->plugin[0] && !s->seam) {
         if (h->rejected) return;         /* процесс уже приговорён, его словам не верим */
         if (!h->hello) {
-            if (!strcmp(e.ev, "hello")) mod_hello(s, h, &e);
-            else mod_reject(s, h, "не назвал версию (первое сообщение — не hello): "
-                                  "нужен модуль того же выпуска, что ядро");
+            if (!strcmp(e.ev, "hello")) plug_hello(s, h, &e);
+            else mod_reject(s, h, "не назвал версию (первое сообщение — не hello, steer-api.md 2.1)", "supd.no_hello", NULL);
             return;
         }
         if (!strcmp(e.ev, "hello")) return;
     }
-    if (!strcmp(e.ev, "up")) {
+    /* Служба говорит о себе: up/down — готова ли, state — переписан её файл состояния, ready — поднялась.
+     * Узлы, устройства, приговоры выходам и health у неё не бывают: чужое по смыслу пропускается. */
+    if (h->service && strcmp(e.ev, "up") && strcmp(e.ev, "down") && strcmp(e.ev, "state") && strcmp(e.ev, "ready"))
+        return;
+    if (!strcmp(e.ev, "up") || (h->service && !strcmp(e.ev, "ready"))) {
         st->up = 1;
         st->known = 1;
         st->said_down = 0;
         st->watch = evline_int(&e, "watch", &v) && v == 1;
         st->since = (long)time(NULL);
         st->why[0] = '\0';
+        st->why_code[0] = st->why_args[0] = '\0';
         const char *dev = evline_str(&e, "dev");
-        if (dev) route_up(s, h, dev);
+        if (dev && !h->service) route_up(s, h, dev);
         emit_state(s, h, "helper-up", NULL);
         wake_watch(s, h);
     } else if (!strcmp(e.ev, "down")) {
@@ -354,11 +478,12 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
         st->known = 1;
         st->said_down = 1;
         st->since = (long)time(NULL);
-        snprintf(st->why, sizeof(st->why), "%s", why ? why : "");
+        why_set(st, NULL, NULL, "%s", why ? why : "");
         emit_state(s, h, "helper-down", st->why);
         wake_watch(s, h);
     } else if (!strcmp(e.ev, "node")) {
         if (!evline_int(&e, "n", &v) || !evline_int(&e, "total", &t)) return;
+        h->picks = 1;
         st->node = v;
         st->total = t;
         char out[80], f[160];
@@ -366,13 +491,27 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
         snprintf(f, sizeof(f), ",\"out\":%s,\"n\":%ld,\"total\":%ld", out, v, t);
         steerd_emit(s->d, "node", f);
     } else if (!strcmp(e.ev, "nonode")) {
+        h->picks = 1;
         if (evline_int(&e, "node", &v)) st->nonode = v;
         if (evline_int(&e, "total", &t)) st->total = t;
     } else if (!strcmp(e.ev, "excluded")) {
+        h->picks = 1;
         st->excluded = 1;
         if (evline_int(&e, "total", &t)) st->total = t;
     } else if (!strcmp(e.ev, "health")) {
         ev_health(s, h, &e);
+    } else if (!strcmp(e.ev, "revive") || !strcmp(e.ev, "awg")) {
+        /* revive — имя API 1.x; awg — прежнее, принимается до API 2.0 (steer-api.md, 2.2). */
+        ev_awg(s, h, &e);
+    } else if (!strcmp(e.ev, "state")) {
+        /* Помощник переписал свой файл состояния (steer-api.md, 2.2): интерфейс перечитает status выхода. */
+        char out[80], id[96], f[200];
+        steerd_json_str(out, sizeof(out), h->name);
+        steerd_json_str(id, sizeof(id), h->plugin[0] ? h->plugin : "");
+        snprintf(f, sizeof(f), ",\"id\":%s,\"%s\":%s", id, h->service ? "service" : "out", out);
+        steerd_emit(s->d, "plugin-state", f);
+    } else if (!strcmp(e.ev, "member")) {
+        ev_member(s, h, &e);
     } else if (!strcmp(e.ev, "active")) {
         /* Активные узлы пула: только цифры и запятые — строка ложится в JSON массивом как есть
          * (helper ниже), поэтому чужое в ней отвергается целиком. */
@@ -382,6 +521,13 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
         snprintf(st->active, sizeof(st->active), "%s", nodes);
         st->active_known = 1;
     }
+}
+
+static void ev_line(struct supd *s, struct helper *h, const char *line) {
+    struct evline e;
+    if (evline_parse(line, &e) != 0) return;
+    ev_dispatch(s, h, &e);
+    evline_free(&e);
 }
 
 /* Дочитать трубу помощника. 1 — открыта, 0 — конец (закрыта здесь же). */
@@ -517,8 +663,10 @@ static int tab_send(struct supd *s, int force) {
         s->qn -= s->qoff;
         s->qoff = 0;
     }
-    if (s->qn + n > SUPD_TABQ_MAX) {
-        fprintf(stderr, LOG_SW "резолвер не забирает таблицу — закрываю трубу\n");
+    size_t qmax = n > SUPD_TABQ_MIN / SUPD_TABQ_TABS ? n * SUPD_TABQ_TABS : SUPD_TABQ_MIN;
+    if (s->qn > 0 && s->qn + n > qmax) {
+        fprintf(stderr, LOG_SW "резолвер не забирает таблицу: в очереди %zu байт, ещё %zu, предел %zu — "
+                "закрываю трубу\n", s->qn, n, qmax);
         free(p);
         tab_close(s);
         return 0;
@@ -563,10 +711,10 @@ static void child_arm(struct supd *s) {
 
 /* ---- помощники, пережившие прежний демон --------------------------------------------------- */
 
-/* Время старта процесса (поле 22 /proc/<pid>/stat, тики от загрузки) и его родитель. 0 — процесса
+/* Время старта процесса (поле 22 /proc/<pid>/stat, тики от загрузки). 0 — процесса
  * нет или он зомби: вышел и ждёт только, пока его приберут, — для нас это «вышел». Пара «pid и
  * время старта» и есть имя процесса: pid, занятый заново, даст другое время. */
-static unsigned long long proc_start(pid_t pid, pid_t *ppid) {
+static unsigned long long proc_start(pid_t pid) {
     char path[64], b[1024];
     snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -580,33 +728,42 @@ static unsigned long long proc_start(pid_t pid, pid_t *ppid) {
     if (!p || p[1] != ' ') return 0;
     p += 2;
     char st = 0;
-    int pp = 0;
-    if (sscanf(p, "%c %d", &st, &pp) != 2 || st == 'Z' || st == 'X') return 0;
+    if (sscanf(p, "%c", &st) != 1 || st == 'Z' || st == 'X') return 0;
     for (int f = 3; f < 22; f++) {
         p = strchr(p, ' ');
         if (!p) return 0;
         p++;
     }
     unsigned long long t = strtoull(p, NULL, 10);
-    if (ppid) *ppid = (pid_t)pp;
     return t ? t : 1;
 }
 
 /* Файл /proc/<pid>/<what> целиком (environ, cmdline — строки через NUL) до n-1 байт; длина. */
-static size_t proc_read(pid_t pid, const char *what, char *b, size_t n) {
+static size_t proc_read(pid_t pid, const char *what, char **out) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/%s", (int)pid, what);
+    *out = NULL;
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;
-    size_t got = 0;
-    while (got < n - 1) {
-        ssize_t m = read(fd, b + got, n - 1 - got);
+    /* Окружение с плагинами бывает любым по размеру: читаем, пока не кончится. */
+    char *b = NULL;
+    size_t got = 0, cap = 0;
+    for (;;) {
+        if (got + 4097 > cap) {
+            size_t nc = cap ? cap * 2 : 8192;
+            char *nb = realloc(b, nc);
+            if (!nb) { free(b); close(fd); return 0; }
+            b = nb;
+            cap = nc;
+        }
+        ssize_t m = read(fd, b + got, cap - 1 - got);
         if (m < 0 && errno == EINTR) continue;
         if (m <= 0) break;
         got += (size_t)m;
     }
     close(fd);
     b[got] = '\0';
+    *out = b;
     return got;
 }
 
@@ -624,37 +781,32 @@ static const char *nul_env(const char *b, size_t n, const char *key) {
 
 /* Помощник ли pid демона этого каталога состояния, оставшийся без демона (шапка, признак 3). В
  * what — «команда выход» из командной строки, для журнала. */
+static int orphan_check(pid_t pid, char *what, size_t wn, char **envp, char **clp);
 static int orphan_of(pid_t pid, char *what, size_t wn) {
-    static char env[32768];
-    char cl[PATH_MAX + 256];
-    pid_t ppid = 0;
-    if (!proc_start(pid, &ppid)) return 0;
-    size_t n = proc_read(pid, "environ", env, sizeof(env));
+    char *env = NULL, *cl = NULL;
+    int rc = orphan_check(pid, what, wn, &env, &cl);
+    free(env);
+    free(cl);
+    return rc;
+}
+
+static int orphan_check(pid_t pid, char *what, size_t wn, char **envp, char **clp) {
+    if (!proc_start(pid)) return 0;
+    size_t n = proc_read(pid, "environ", envp);
+    char *env = *envp;
     if (!n || !nul_env(env, n, "STEER_EVENT_FD")) return 0;
-    size_t cn = proc_read(pid, "cmdline", cl, sizeof(cl));
-    const char *dir = plat()->state_dir;
+    size_t cn = proc_read(pid, "cmdline", clp);
+    char *cl = *clp ? *clp : (char *)"";
     const char *tag = nul_env(env, n, "STEER_SUPD");
-    if (tag) {
-        char *end = NULL;
-        long dp = strtol(tag, &end, 10);
-        if (end == tag || *end != ':' || dp <= 0) return 0;
-        const char *t = end + 1;
-        unsigned long long st = strtoull(t, &end, 10);
-        if (end == t || *end != ':') return 0;
-        dir = end + 1;
-        if (strcmp(dir, steer_state_dir()) != 0) return 0;
-        if (proc_start((pid_t)dp, NULL) == st) return 0;         /* его демон жив */
-    } else {
-        /* Сирота версии без метки: демон мёртв — значит, родитель уже init; каталог состояния —
-         * из --state-dir командной строки (helper_argv), без него — каталог платформы. */
-        if (ppid != 1) return 0;
-        for (size_t i = 0; i < cn;) {
-            size_t l = strnlen(cl + i, cn - i);
-            if (!strcmp(cl + i, "--state-dir") && i + l + 1 < cn) { dir = cl + i + l + 1; break; }
-            i += l + 1;
-        }
-        if (strcmp(dir, steer_state_dir()) != 0) return 0;
-    }
+    if (!tag) return 0;
+    char *end = NULL;
+    long dp = strtol(tag, &end, 10);
+    if (end == tag || *end != ':' || dp <= 0) return 0;
+    const char *t = end + 1;
+    unsigned long long st = strtoull(t, &end, 10);
+    if (end == t || *end != ':') return 0;
+    if (strcmp(end + 1, steer_state_dir()) != 0) return 0;
+    if (proc_start((pid_t)dp) == st) return 0;                   /* его демон жив */
     /* argv[1] и argv[2] — «vless vr», «obfs a»; у помощника-программы — её имя и первый флаг. */
     const char *a1 = cn ? cl + strnlen(cl, cn) + 1 : cl;
     const char *a2 = a1 < cl + cn ? a1 + strlen(a1) + 1 : a1;
@@ -678,6 +830,7 @@ static int orphans_stop(const char *who) {
     if (!d) return 0;
     pid_t *pid = NULL;
     unsigned long long *st = NULL;
+    int *pfd = NULL;
     size_t n = 0, cap = 0;
     pid_t me = getpid();
     struct dirent *e;
@@ -687,17 +840,25 @@ static int orphans_stop(const char *who) {
         if (!end || *end || p <= 1 || p == me) continue;
         char what[128];
         if (!orphan_of((pid_t)p, what, sizeof(what))) continue;
-        unsigned long long started = proc_start((pid_t)p, NULL);
+        unsigned long long started = proc_start((pid_t)p);
         if (!started) continue;
         if (n == cap) {
             size_t nc = cap ? cap * 2 : 16;
             pid_t *np = realloc(pid, nc * sizeof(*np));
             unsigned long long *ns = realloc(st, nc * sizeof(*ns));
+            int *nf = realloc(pfd, nc * sizeof(*nf));
             if (np) pid = np;
             if (ns) st = ns;
-            if (!np || !ns) break;
+            if (nf) pfd = nf;
+            if (!np || !ns || !nf) break;
             cap = nc;
         }
+        /* pidfd — до сигнала и со сверкой времени старта после него: дескриптор держит именно этот
+         * процесс, и его выход будит poll ниже в тот же миг (шаг опроса в 50 мс копился на каждом
+         * старте после падения демона). */
+        int fd = pidfd_of((pid_t)p);
+        if (fd >= 0 && proc_start((pid_t)p) != started) { close(fd); continue; }
+        pfd[n] = fd;
         st[n] = started;
         pid[n++] = (pid_t)p;
         kill((pid_t)p, SIGTERM);
@@ -711,9 +872,12 @@ static int orphans_stop(const char *who) {
         size_t left = 0;
         for (size_t i = 0; i < n; i++) {
             if (!pid[i]) continue;
-            if (proc_start(pid[i], NULL) != st[i]) pid[i] = 0;
+            if (proc_start(pid[i]) != st[i]) pid[i] = 0;
             else left++;
         }
+        /* У всех оставшихся есть pidfd — ждать их выхода poll, иначе прежний шаг опроса. */
+        int all_fd = 1;
+        for (size_t i = 0; i < n && all_fd; i++) if (pid[i] && pfd[i] < 0) all_fd = 0;
         if (!left) break;
         if (helpers_now_ms() >= due) {
             if (hard) break;
@@ -726,11 +890,28 @@ static int orphans_stop(const char *who) {
             hard = 1;
             due = helpers_now_ms() + 1000;
         }
+        long ms = due - helpers_now_ms();
+        if (ms < 1) ms = 1;
+        if (all_fd) {
+            struct pollfd *pf = calloc(left, sizeof(*pf));
+            size_t k = 0;
+            for (size_t i = 0; pf && i < n; i++)
+                if (pid[i]) { pf[k].fd = pfd[i]; pf[k].events = POLLIN; k++; }
+            int r = pf ? poll(pf, (nfds_t)k, ms > 1000 ? 1000 : (int)ms) : -1;
+            /* Вышел — помечаем сразу: устройство и порт свободны с выходом, а зомби, которого ещё не
+             * пожал новый родитель, /proc показывает с тем же временем старта. */
+            for (size_t i = 0, j = 0; r > 0 && i < n; i++)
+                if (pid[i]) { if (pf[j].revents) pid[i] = 0; j++; }
+            free(pf);
+            if (r >= 0) continue;
+        }
         struct timespec ts = { 0, 50000000L };
         nanosleep(&ts, NULL);
     }
+    for (size_t i = 0; i < n; i++) if (pfd[i] >= 0) close(pfd[i]);
     free(pid);
     free(st);
+    free(pfd);
     return (int)n;
 }
 
@@ -790,8 +971,7 @@ static void dnsd_kill(int fd, pid_t pid) {
 /* Попросить резолвер этого каталога состояния выйти, если хозяина у него нет (просьба «down»,
  * src/dnsd/adopt.c): решает сам резолвер, потому что только он знает, открыта ли его труба
  * таблицы. «ok» — ждать его выхода (закрытие соединения), по сроку SIGKILL; «busy» — хозяин жив,
- * не трогать. Ответа нет вовсе — резолвер прежней версии (просьбы не знает и закрывает
- * соединение) или не отвечает: гасить сигналом, как прежде. 1 — погашен, pid в *pid; 0 —
+ * не трогать. Ответа нет — резолвер не отвечает: гасить сигналом. 1 — погашен, pid в *pid; 0 —
  * резолвера нет или у него живой хозяин. */
 static int dnsd_down(pid_t *pid) {
     int fd = dnsd_connect(pid);
@@ -852,8 +1032,7 @@ int supd_orphan_down(void) {
  * Ответ ждётся недолго (500 мс): резолвер отвечает из своего цикла, и если он в этот миг
  * перечитывает списки, просьба дождётся очереди и без нас — загрузчику незачем стоять. 1 —
  * резолвер ответил; 0 — резолвера нет (сокета нет: без демона и без пережившего его резолвера)
- * или ответ не пришёл вовремя; -1 — резолвер прежней версии, просьбы не знает (закрыл
- * соединение молча): тогда элементы вернёт таблица от демона, как прежде. */
+ * или ответ не пришёл вовремя: тогда элементы вернёт таблица от демона. */
 static int dnsd_ask(const char *req, int ms) {
     pid_t pid;
     int fd = dnsd_connect(&pid);
@@ -870,8 +1049,7 @@ static int dnsd_ask(const char *req, int ms) {
     while ((r = poll(&p, 1, ms)) < 0 && errno == EINTR) {}
     if (r > 0) m = recv(fd, b, sizeof(b), MSG_DONTWAIT);
     close(fd);
-    if (m >= 3 && !memcmp(b, "ok\n", 3)) return 1;
-    return m == 0 ? -1 : 0;
+    return m >= 3 && !memcmp(b, "ok\n", 3);
 }
 
 int supd_dnsd_reassert(void) {
@@ -897,11 +1075,93 @@ static void dn_conn_close(struct supd *s) {
     s->dn_conn = -1;
 }
 
-/* Соединение с забранным резолвером стало читаемым: он ничего не пишет после «ok», так что это
+static int dnsd_spawn(struct supd *s, struct helper *h);
+
+/* Забор не удался или резолвер погашен: поднять свой ребёнок вместо него. Зовётся из событий цикла,
+ * поэтому за start_one докладывает сам — loop_child и повторный подъём по паузе. */
+static void ad_spawn_own(struct supd *s) {
+    pid_t old = s->ad_pid;
+    s->ad_ph = 0;
+    loop_timer_stop(s->ad_tm);
+    dn_conn_close(s);
+    if (s->ad_p1 >= 0) { close(s->ad_p1); s->ad_p1 = -1; }
+    if (s->stopping) return;
+    for (size_t i = 0; i < s->set.n; i++) {
+        struct helper *h = &s->set.h[i];
+        if (!h->table || h->pid != old) continue;
+        h->pid = 0;
+        if (dnsd_spawn(s, h) == 0) loop_child(s->l, h->pid, child_cb, s);
+        break;
+    }
+    supd_kick(s);
+}
+
+/* Погасить резолвер, не ответивший на «adopt»: SIGTERM, три секунды на выход, дальше SIGKILL и ещё
+ * секунда. Выход — закрытие соединения (ad_conn_cb) или срок (ad_timer). */
+static void ad_kill_begin(struct supd *s) {
+    fprintf(stderr, LOG_SW "резолвер прежнего демона (pid %d) не отдался — гашу\n", (int)s->ad_pid);
+    kill(s->ad_pid, SIGTERM);
+    s->ad_ph = 2;
+    loop_timer_set(s->ad_tm, 3000);
+}
+
+static void ad_timer(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l; (void)t;
+    struct supd *s = arg;
+    if (s->ad_ph == 1) { ad_kill_begin(s); return; }
+    if (s->ad_ph == 2) {
+        kill(s->ad_pid, SIGKILL);
+        s->ad_ph = 3;
+        loop_timer_set(s->ad_tm, 1000);
+        return;
+    }
+    if (s->ad_ph == 3) ad_spawn_own(s);
+}
+
+/* Соединение с резолвером читаемо в ходе забора: ответ на «adopt» или его закрытие. */
+static void ad_conn_cb(struct supd *s) {
+    char b[64];
+    ssize_t m = recv(s->dn_conn, b, sizeof(b), MSG_DONTWAIT);
+    if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
+    if (m <= 0) {                         /* закрыл: ответа не будет (прежняя версия) или он вышел */
+        if (s->ad_ph == 1) kill(s->ad_pid, SIGTERM);
+        ad_spawn_own(s);
+        return;
+    }
+    if (s->ad_ph != 1) return;            /* гасим: ждём закрытия, лишнее не нужно */
+    size_t take = (size_t)m < sizeof(s->ad_ans) - 1 - s->ad_an ? (size_t)m : sizeof(s->ad_ans) - 1 - s->ad_an;
+    memcpy(s->ad_ans + s->ad_an, b, take);
+    s->ad_an += take;
+    s->ad_ans[s->ad_an] = '\0';
+    if (!memchr(s->ad_ans, '\n', s->ad_an) && s->ad_an < sizeof(s->ad_ans) - 1) return;
+    if (!strcmp(s->ad_ans, "ok\n")) {
+        fcntl(s->ad_p1, F_SETFL, fcntl(s->ad_p1, F_GETFL) | O_NONBLOCK);
+        tab_close(s);
+        s->dn_fd = s->ad_p1;
+        s->ad_p1 = -1;
+        s->ad_ph = 0;
+        loop_timer_stop(s->ad_tm);
+        fprintf(stderr, "steer[info] supervise: dnsd подхвачен (pid %d) — резолвер пережил прежний "
+                        "демон\n", (int)s->ad_pid);
+        tab_send(s, 1);
+        return;
+    }
+    if (!strcmp(s->ad_ans, "busy\n")) {
+        /* Труба у резолвера открыта — у него живой хозяин, второй демон на том же каталоге
+         * состояния. Не наш случай, и гасить чужой резолвер этот демон не берётся. */
+        fprintf(stderr, LOG_SW "у резолвера (pid %d) живой демон — поднимаю свой\n", (int)s->ad_pid);
+        ad_spawn_own(s);
+        return;
+    }
+    ad_kill_begin(s);
+}
+
+/* Соединение с резолвером стало читаемым. После забора он ничего не пишет после «ok», так что это
  * его выход — то же, что loop_child у своего ребёнка (код выхода неизвестен: не наш ребёнок). */
 static void dn_conn_cb(struct loop *l, int fd, uint32_t events, void *arg) {
     (void)l; (void)events;
     struct supd *s = arg;
+    if (s->ad_ph) { ad_conn_cb(s); return; }
     char b[64];
     ssize_t m = recv(fd, b, sizeof(b), MSG_DONTWAIT);
     if (m > 0 || (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))) return;
@@ -914,10 +1174,13 @@ static void dn_conn_cb(struct loop *l, int fd, uint32_t events, void *arg) {
 }
 
 /* Забрать резолвер, переживший прежний демон: отдать ему новую трубу таблицы (конец чтения) и
- * свой stderr через SCM_RIGHTS, дождаться «ok». 1 — забран; 0 — живого нет (или не отдался), и
- * запускать надо свой. Живой, но не ответивший, гасится: свой резолвер на его порту не встал бы. */
+ * свой stderr через SCM_RIGHTS. Ответ «ok» ждёт цикл (ad_conn_cb, срок — ad_timer), а не эта
+ * функция: резолвер, занятый перечитыванием списков, отвечает не сразу, и демон на это время не
+ * замирал бы. 1 — забор начат, резолвер считается принадлежащим помощнику (h->pid), и если не
+ * отдастся — цикл сам поднимет свой (ad_spawn_own); 0 — живого нет, запускать надо свой. */
 static int adopt_dnsd(struct supd *s, struct helper *h) {
     pid_t pid;
+    if (s->ad_ph) return 1;               /* забор уже идёт */
     int c = dnsd_connect(&pid);
     if (c < 0) return 0;
     int p[2];
@@ -941,59 +1204,40 @@ static int adopt_dnsd(struct supd *s, struct helper *h) {
     memcpy(CMSG_DATA(ch), fds, nfd * sizeof(int));
     ssize_t w = sendmsg(c, &mh, MSG_NOSIGNAL);
     close(p[0]);
-    char ans[16] = "";
-    size_t an = 0;
-    if (w == 6) {
-        struct timeval tv = { 2, 0 };
-        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        while (an < sizeof(ans) - 1 && !memchr(ans, '\n', an)) {
-            ssize_t m = recv(c, ans + an, sizeof(ans) - 1 - an, 0);
-            if (m < 0 && errno == EINTR) continue;
-            if (m <= 0) break;
-            an += (size_t)m;
-        }
-        ans[an] = '\0';
-    }
-    if (strcmp(ans, "ok\n") != 0) {
+    if (w != 6 || !s->ad_tm) {
+        fprintf(stderr, LOG_SW "резолвер прежнего демона (pid %d) не отдался — гашу\n", (int)pid);
         close(p[1]);
-        if (!strcmp(ans, "busy\n")) {
-            /* Труба у резолвера открыта — у него живой хозяин, второй демон на том же каталоге
-             * состояния. Не наш случай, и гасить чужой резолвер этот демон не берётся. */
-            fprintf(stderr, LOG_SW "у резолвера (pid %d) живой демон — поднимаю свой\n", (int)pid);
-            close(c);
-        } else {
-            fprintf(stderr, LOG_SW "резолвер прежнего демона (pid %d) не отдался — гашу\n", (int)pid);
-            dnsd_kill(c, pid);
-        }
-        return 0;
-    }
-    fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL) | O_NONBLOCK);
-    fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK);
-    tab_close(s);
-    dn_conn_close(s);
-    s->dn_fd = p[1];
-    s->dn_conn = c;
-    if (loop_fd_add(s->l, c, EPOLLIN, dn_conn_cb, s) != 0) {
-        /* Без соединения в цикле выхода резолвера не узнать: погасить и поднять свой. */
-        s->dn_conn = -1;
-        tab_close(s);
         dnsd_kill(c, pid);
         return 0;
     }
+    fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK);
+    tab_close(s);
+    dn_conn_close(s);
+    s->dn_conn = c;
+    if (loop_fd_add(s->l, c, EPOLLIN, dn_conn_cb, s) != 0) {
+        /* Без соединения в цикле ответа не узнать: погасить и поднять свой. */
+        s->dn_conn = -1;
+        close(p[1]);
+        dnsd_kill(c, pid);
+        return 0;
+    }
+    s->ad_ph = 1;
+    s->ad_p1 = p[1];
+    s->ad_an = 0;
+    s->ad_ans[0] = '\0';
+    s->ad_pid = pid;
+    loop_timer_set(s->ad_tm, 2000);
     h->pid = pid;
     h->started_ms = helpers_now_ms();
-    fprintf(stderr, "steer[info] supervise: dnsd подхвачен (pid %d) — резолвер пережил прежний "
-                    "демон\n", (int)pid);
-    tab_send(s, 1);
     return 1;
 }
 
 /* 0 — запущен свой ребёнок, 1 — забран живой (loop_child ему не нужен), -1 — не вышло. */
-static int start_dnsd(struct supd *s, struct helper *h) {
-    if (adopt_dnsd(s, h)) return 1;
+static int dnsd_spawn(struct supd *s, struct helper *h) {
     int p[2];
     if (pipe2(p, O_CLOEXEC) != 0) return -1;
-    const char *av[8 + SUPD_DNSD_FLAGS];
+    const char **av = malloc((8 + s->dnsd_flag_n) * sizeof(*av));
+    if (!av) { close(p[0]); close(p[1]); return -1; }
     size_t n = 0;
     av[n++] = s->self;
     av[n++] = "dnsd";
@@ -1008,13 +1252,14 @@ static int start_dnsd(struct supd *s, struct helper *h) {
     char a0[PATH_MAX + 8];
     av[0] = helper_argv0(s->self, a0, sizeof(a0));
     pid_t pid = fork();
-    if (pid < 0) { close(p[0]); close(p[1]); return -1; }
+    if (pid < 0) { free(av); close(p[0]); close(p[1]); return -1; }
     if (pid == 0) {
         loop_child_reset();
         child_fd3(p[0]);
         execv(s->self, (char *const *)av);
         _exit(127);
     }
+    free(av);
     close(p[0]);
     fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL) | O_NONBLOCK);
     tab_close(s);
@@ -1022,6 +1267,11 @@ static int start_dnsd(struct supd *s, struct helper *h) {
     helper_started(h, pid);
     tab_send(s, 1);
     return 0;
+}
+
+static int start_dnsd(struct supd *s, struct helper *h) {
+    if (adopt_dnsd(s, h)) return 1;
+    return dnsd_spawn(s, h);
 }
 
 static void child_cb(struct loop *l, pid_t pid, int status, void *arg);
@@ -1034,47 +1284,47 @@ static int start_one(struct helper *h, void *arg) {
         if (rc < 0) return -1;
         if (rc == 1) return 0;          /* забран живой: о его выходе скажет dn_conn */
     } else {
-        /* Бинарника модуля нет (пакет не поставлен или удалён): не запускать вслепую, а сказать
-         * прямо — один раз в журнал, дальше в status (last_down), — и повторять по обычной паузе:
-         * поставят пакет, следующая попытка запустит. */
-        if (h->module && !s->seam) {
-            char mp[PATH_MAX + 64];
-            if (steer_module_path(h->prog, mp, sizeof(mp)) != 0) {
-                snprintf(h->st.why, sizeof(h->st.why), "нужен пакет %s", h->prog);
-                h->st.known = 1;
-                h->st.said_down = 1;
-                if (!h->nomod_logged) {
-                    /* steer-extended ставит остальные модули, но не hysteria2 и не proxy: у них свои пакеты. */
-                    int in_ext = strcmp(h->prog, "steer-hysteria2") != 0 && strcmp(h->prog, "steer-proxy") != 0;
-                    fprintf(stderr, LOG_SW "%s %s — модуля нет: нужен пакет %s%s\n", h->cmd, h->name,
-                            h->prog, in_ext ? " (входит в steer-extended)" : "");
-                    h->nomod_logged = 1;
-                }
-                return -1;
+        /* Программы плагина нет (каталог плагина повреждён или снят вручную): так же — одна строка в
+         * журнал, причина в status, повтор по паузе; переставят плагин — следующая попытка запустит. */
+        if (h->plugin[0] && !s->seam && h->prog && *h->prog && access(h->prog, X_OK) != 0) {
+            char pj[80], aj[100];
+            steerd_json_str(pj, sizeof(pj), h->plugin);
+            snprintf(aj, sizeof(aj), "{\"1\":%s}", pj);
+            why_set(&h->st, "supd.no_plugin_program", aj, "нет программы плагина %s — переставить плагин", h->plugin);
+            h->st.known = 1;
+            h->st.said_down = 1;
+            if (!h->nomod_logged) {
+                fprintf(stderr, LOG_SW "%s %s — нет программы плагина %s (%s): переставить плагин\n", h->cmd,
+                        h->name, h->plugin, h->prog);
+                h->nomod_logged = 1;
             }
-            h->nomod_logged = 0;
+            return -1;
         }
+        if (h->plugin[0]) h->nomod_logged = 0;
         h->hello = h->rejected = 0;
         h->mver[0] = '\0';
         int p[2];
         if (pipe2(p, O_CLOEXEC) != 0) return -1;
-        const char *av[12];
         char prog[PATH_MAX + 32];
-        helper_argv(h, s->exe, s->self, s->seam, s->d->spec_path, prog, sizeof(prog), av);
+        const char **av = helper_argv(h, s->exe, s->self, s->seam, s->d->spec_path, prog, sizeof(prog));
+        if (!av) { close(p[0]); close(p[1]); return -1; }
         const char *path = av[0];
         char a0[PATH_MAX + 8];
         av[0] = helper_argv0(path, a0, sizeof(a0));
         pid_t pid = fork();
-        if (pid < 0) { close(p[0]); close(p[1]); return -1; }
+        if (pid < 0) { free(av); close(p[0]); close(p[1]); return -1; }
         if (pid == 0) {
             loop_child_reset();
             child_arm(s);
             child_fd3(p[1]);
             putenv("STEER_EVENT_FD=3");
-            if (h->env[0]) putenv(h->env);
+            /* Программа плагина — своё окружение (steer-api.md, 1.2): версии, id, каталоги; env манифеста после. */
+            if (h->plugin[0] && plugin_find(h->plugin)) plugin_env_set(plugin_find(h->plugin), NULL);
+            helper_putenv(h);
             execv(path, (char *const *)av);
             _exit(127);
         }
+        free(av);
         close(p[1]);
         fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
         h->evfd = p[0];
@@ -1119,6 +1369,10 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         if (h->evfd >= 0) ev_drain(s, h);
         if (h->evfd >= 0) { loop_fd_del(s->l, h->evfd); close(h->evfd); h->evfd = -1; }
         int was_up = h->st.up;
+        /* Приговоры членам от этого процесса больше не правда (ev_member). */
+        if (h->name[0] && !h->service) mv_drop_group(s, h->name);
+        /* Слушатель TCP модуля ушёл вместе с процессом (R-152): перенаправление к нему — снять. */
+        if (h->st.bound[0]) tcp_redir_dev_gone(h->st.bound);
         h->st.running = 0;
         h->st.up = 0;
         /* down клиента, следившего за узлом, говорил об узлах этого процесса (пул узлов,
@@ -1130,15 +1384,23 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         if (h->rejected) {
             /* причина уже записана приговором модулю (mod_reject), а не «убит SIGTERM» */
         } else if (h->gone)
-            snprintf(h->st.why, sizeof(h->st.why), "выход убран из спеки");
+            why_set(&h->st, "supd.out_removed", NULL, "выход убран из спеки");
         else if (h->restart && h->revive)
-            snprintf(h->st.why, sizeof(h->st.why), "перезапуск: выход не отвечает");
+            why_set(&h->st, "supd.restart_unresponsive", NULL, "перезапуск: выход не отвечает");
         else if (h->restart)
-            snprintf(h->st.why, sizeof(h->st.why), "перезапуск: параметры выхода изменились");
+            why_set(&h->st, "supd.restart_params", NULL, "перезапуск: параметры выхода изменились");
         else if (WIFEXITED(status))
-            snprintf(h->st.why, sizeof(h->st.why), "процесс вышел (код %d)", WEXITSTATUS(status));
+        {
+            char aj[40];
+            snprintf(aj, sizeof(aj), "{\"1\":\"%d\"}", WEXITSTATUS(status));
+            why_set(&h->st, "supd.exited", aj, "процесс вышел (код %d)", WEXITSTATUS(status));
+        }
         else
-            snprintf(h->st.why, sizeof(h->st.why), "процесс убит (сигнал %d)", WTERMSIG(status));
+        {
+            char aj[40];
+            snprintf(aj, sizeof(aj), "{\"1\":\"%d\"}", WTERMSIG(status));
+            why_set(&h->st, "supd.killed", aj, "процесс убит (сигнал %d)", WTERMSIG(status));
+        }
         if (was_up) {
             h->st.since = (long)time(NULL);
             emit_state(s, h, "helper-down", h->st.why);
@@ -1152,21 +1414,23 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
 }
 
 /* Поднимать ли резолвер — ответ needs-dnsd (там же доводы, почему «всегда»); по нему же решает
- * супервизор демона. Здесь, а не в main.c: стенды компонуют модули демона без main.c. В
- * мини-сборке — «поднимать нечего», и это тот же ответ, что даёт генератор правил: он там
- * перенаправления DNS не ставит. Два ответа обязаны совпадать, иначе init-скрипт однажды поднимет
- * резолвер без правила или, хуже, правило останется без резолвера. */
+ * супервизор демона. Здесь, а не в main.c: стенды компонуют модули демона без main.c. Сборки без
+ * резолвера (мини-сборка моста tgws) больше нет — поднимать всегда, как генератор всегда ставит
+ * перенаправление DNS. */
 int dnsd_wanted(void) {
-    return !prof()->no_resolver;
+    return 1;
 }
 
 /* ---- состав -------------------------------------------------------------------------------- */
 
 static size_t supd_plan(struct supd *s) {
     size_t n = 0;
+    /* Прежний план отдан сверке и больше не нужен: его строки — свои у каждой записи. */
+    helpers_launch_free(s->fresh, s->fresh_n);
+    s->fresh_n = 0;
     if (!s->d->have || (s->enabled && !s->enabled())) return 0;
-    /* Помощников не больше выходов спеки + резолвер. */
-    size_t need = s->d->sp->out_n + 1;
+    /* Помощников не больше выходов спеки, служб плагинов и резолвера. */
+    size_t need = helpers_max(s->d->sp);
     if (need > s->fresh_cap) {
         struct helper *nf = realloc(s->fresh, need * sizeof(*nf));
         if (!nf) return 0;
@@ -1177,13 +1441,13 @@ static size_t supd_plan(struct supd *s) {
     if (dnsd_wanted()) {
         struct helper *h = &s->fresh[n++];
         memset(h, 0, sizeof(*h));
-        snprintf(h->cmd, sizeof(h->cmd), "dnsd");
+        if (helper_set_cmd(h, "dnsd") != 0) { n--; return s->fresh_n = n; }
         h->table = 1;
         h->sig = KIND_SIG_INIT;
         h->delay_ms = HELPERS_DELAY_MS;
         h->evfd = -1;
     }
-    return n;
+    return s->fresh_n = n;
 }
 
 struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
@@ -1194,8 +1458,13 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     s->enabled = c->enabled;
     s->dn_fd = -1;
     s->dn_conn = -1;
-    for (size_t i = 0; c->dnsd_flags && c->dnsd_flags[i] && i < SUPD_DNSD_FLAGS; i++)
-        s->dnsd_flags[i] = c->dnsd_flags[i];
+    s->ad_p1 = -1;
+    size_t nfl = 0;
+    while (c->dnsd_flags && c->dnsd_flags[nfl]) nfl++;
+    s->dnsd_flags = calloc(nfl + 1, sizeof(*s->dnsd_flags));
+    if (!s->dnsd_flags) { free(s); return NULL; }
+    for (size_t i = 0; i < nfl; i++) s->dnsd_flags[i] = c->dnsd_flags[i];
+    s->dnsd_flag_n = nfl;
     ssize_t el = readlink("/proc/self/exe", s->self, sizeof(s->self) - 1);
     if (el <= 0) { free(s); return NULL; }
     s->self[el] = '\0';
@@ -1204,10 +1473,11 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     s->seam = seam && *seam;
     snprintf(s->exe, sizeof(s->exe), "%s", s->seam ? seam : s->self);
     s->tm = loop_timer_new(s->l, supd_timer, s);
-    if (!s->tm) { free(s); return NULL; }
+    s->ad_tm = loop_timer_new(s->l, ad_timer, s);
+    if (!s->tm || !s->ad_tm) { free(s); return NULL; }
     s->me = getpid();
     snprintf(s->tag, sizeof(s->tag), "STEER_SUPD=%d:%llu:%s", (int)s->me,
-             proc_start(s->me, NULL), steer_state_dir());
+             proc_start(s->me), steer_state_dir());
     /* Раньше первого запуска своих: сирота прежнего демона держит устройство или порт, и свой
      * помощник на них не встал бы (шапка, «Помощники демона не переживают»). */
     orphans_stop("supervise");
@@ -1218,8 +1488,9 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     status_extra_source(status_fields);
     size_t fn = supd_plan(s);
     if (fn && helpers_reserve(&s->set, fn) != 0) { free(s->fresh); free(s); return NULL; }
-    if (fn) memcpy(s->set.h, s->fresh, fn * sizeof(s->fresh[0]));
-    s->set.n = fn;
+    for (size_t i = 0; i < fn; i++)
+        if (helper_clone(&s->set.h[s->set.n], &s->fresh[i]) == 0) s->set.n++;
+    fn = s->set.n;
     if (d->have && fn == (size_t)(dnsd_wanted() && (!s->enabled || s->enabled())))
         fprintf(stderr, "steer[info] supervise: выходов со своим процессом в спеке нет\n");
     int dn = 0;
@@ -1288,6 +1559,9 @@ void supd_stop(struct supd *s) {
     if (!s || s->stopping) return;
     s->stopping = 1;
     loop_timer_stop(s->tm);
+    loop_timer_stop(s->ad_tm);
+    s->ad_ph = 0;
+    if (s->ad_p1 >= 0) { close(s->ad_p1); s->ad_p1 = -1; }
     /* Резолвер гасится явно: закрытую трубу он пережил бы — для него это «демон пропал» (adopt.c).
      * Сигнал — раньше, чем конец трубы: тогда EOF он и не примет за пропажу. Свой ребёнок
      * дожидается ниже, в helpers_stop, вместе с помощниками; забранный — здесь, по закрытию его
@@ -1321,7 +1595,7 @@ const struct helper_state *helper_state_of(const struct steerd *d, const char *o
     if (!s || !out) return NULL;
     for (size_t i = 0; i < s->set.n; i++) {
         const struct helper *h = &s->set.h[i];
-        if (!h->table && !h->gone && !strcmp(h->name, out)) return &h->st;
+        if (!h->table && !h->service && !h->gone && !strcmp(h->name, out)) return &h->st;
     }
     return NULL;
 }
@@ -1330,7 +1604,7 @@ int supd_restart(struct supd *s, const char *out, const char *cmd) {
     if (!s || s->stopping || !out || !cmd) return -1;
     for (size_t i = 0; i < s->set.n; i++) {
         struct helper *h = &s->set.h[i];
-        if (h->table || h->gone || strcmp(h->name, out) || strcmp(h->cmd, cmd)) continue;
+        if (h->table || h->service || h->gone || strcmp(h->name, out) || strcmp(h->cmd, cmd)) continue;
         if (h->pid) {
             /* Уже гасится (новые параметры или прошлая просьба) — поднимется сразу и так. */
             if (!h->restart) {
@@ -1349,13 +1623,7 @@ int supd_restart(struct supd *s, const char *out, const char *cmd) {
     return -1;
 }
 
-/* ---- ход перебора узлов vless из памяти (probe.h) ---------------------------------------- */
-
-/* Помощник перебирает узлы подписки и рассказывает о переборе событиями node/nonode/down: vless и
- * hysteria2 говорят одним языком, и память демона отвечает про обоих одинаково. */
-static int cmd_picks_nodes(const char *cmd) {
-    return !strcmp(cmd, "vless") || !strcmp(cmd, "hysteria2") || !strcmp(cmd, "proxy");
-}
+/* ---- ход перебора узлов из памяти (probe.h) --------------------------------------------- */
 
 /* То же, что записал бы клиент (probe_report в src/proto/vless/vlmain.c), — по его событиям:
  * nonode — номер вне подписки (живёт до следующего запуска, как запись — пока свежа); node без
@@ -1381,7 +1649,9 @@ static int probe_mem(const char *out, struct probe_status *ps) {
     if (!s || !out) return -1;
     for (size_t i = 0; i < s->set.n; i++) {
         const struct helper *h = &s->set.h[i];
-        if (h->table || h->gone || strcmp(h->name, out) || !cmd_picks_nodes(h->cmd)) continue;
+        /* Помощник, который перебирает узлы, говорит о переборе событиями node/nonode/excluded/down
+         * (evline.h) — по ним он и узнаётся, а не по имени команды. */
+        if (h->table || h->service || h->gone || strcmp(h->name, out) || !h->picks) continue;
         ps->state = probe_of(h, &ps->node, &ps->total);
         ps->since = 0;
         ps->why[0] = '\0';
@@ -1410,17 +1680,16 @@ static void health_json(FILE *out, const struct helper_state *st, long now) {
     fputs("]", out);
 }
 
-/* Объект выхода моста tgws в status: отставленные им пути, чей срок не вышел (пустой массив —
- * отставленных нет). Только у выхода, чей помощник — ребёнок этого демона: у моста всегда, у
- * другого помощника — если он о путях сообщал (health пишет только мост; так событие видно и
- * стенду, у которого моста в сборке нет). */
+/* Объект выхода в status: пути, отставленные его помощником, чей срок не вышел (пустой массив —
+ * отставленных нет). Только у выхода, чей помощник — ребёнок этого демона: всегда — у вида, который
+ * объявил paths в манифесте (мост tgws, steer-api 1.5), у другого помощника — если он о путях сообщал. */
 static void status_fields(FILE *out, const char *name) {
     const struct supd *s = g_probe_sup;
     if (!s || !name) return;
     for (size_t i = 0; i < s->set.n; i++) {
         const struct helper *h = &s->set.h[i];
         if (h->table || h->gone || strcmp(h->name, name)) continue;
-        if (strcmp(h->cmd, "tgws") && !h->st.health_n) continue;
+        if (!h->paths && !h->st.health_n) continue;
         fputs(",\"paths_down\":", out);
         health_json(out, &h->st, (long)time(NULL));
         return;
@@ -1437,30 +1706,33 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
         const struct helper_state *st = &h->st;
         char nj[80], wj[512];
         steerd_json_str(nj, sizeof(nj), h->name);
-        fprintf(out, "{\"schema\":1,\"out\":%s,\"helper\":\"%s\",\"running\":%s,\"up\":%s",
-                nj, h->cmd, st->running ? "true" : "false", st->up ? "true" : "false");
+        fprintf(out, "{\"schema\":1,\"%s\":%s,\"helper\":\"%s\",\"running\":%s,\"up\":%s",
+                h->service ? "service" : "out", nj, h->cmd, st->running ? "true" : "false", st->up ? "true" : "false");
         fprintf(out, ",\"since\":%ld,\"started\":%ld,\"restarts\":%u", st->since, st->started,
                 st->restarts);
         if (st->why[0]) {
             steerd_json_str(wj, sizeof(wj), st->why);
             fprintf(out, ",\"last_down\":%s", wj);
+            if (st->why_code[0])
+                fprintf(out, ",\"last_down_code\":\"%s\",\"last_down_args\":%s", st->why_code,
+                        st->why_args[0] ? st->why_args : "{}");
         }
-        /* Модуль (отдельный бинарник): чей и какой версии, если он представился; отвергнутый за
-         * чужую версию помечен — причина в last_down. */
-        if (h->module) {
-            fprintf(out, ",\"module\":\"%s\"", h->prog);
+        /* Программа плагина: чья и какой версии (hello); отвергнутая — помечена, причина в last_down. */
+        if (h->plugin[0]) {
+            steerd_json_str(wj, sizeof(wj), h->plugin);
+            fprintf(out, ",\"plugin\":%s", wj);
             if (h->mver[0]) {
                 steerd_json_str(wj, sizeof(wj), h->mver);
-                fprintf(out, ",\"module_ver\":%s", wj);
+                fprintf(out, ",\"plugin_ver\":%s", wj);
             }
             if (h->rejected) fputs(",\"rejected\":true", out);
         }
-        if (cmd_picks_nodes(h->cmd) && (st->node || st->nonode))
+        if (h->picks && (st->node || st->nonode))
             fprintf(out, ",\"node\":%ld,\"total\":%ld", st->nonode ? st->nonode : st->node,
                     st->total);
         /* Активные узлы пула (номера среди пригодных, как у vless-nodes) — когда клиент сказал. */
         if (st->active_known) fprintf(out, ",\"active\":[%s]", st->active);
-        if (!strcmp(h->cmd, "tgws") || st->health_n) {
+        if (h->paths || st->health_n) {
             fputs(",\"paths_down\":", out);
             health_json(out, st, now);
         }
@@ -1470,30 +1742,40 @@ int supd_helper_json(const struct supd *s, const char *name, FILE *out) {
     return found ? 0 : -1;
 }
 
-void supd_probe_env(const struct supd *s, char *buf, size_t n) {
-    if (!n) return;
-    buf[0] = '\0';
-    if (!s) return;
-    size_t w = (size_t)snprintf(buf, n, "STEER_PROBE_MEM=");
-    for (size_t i = 0; i < s->set.n && w < n; i++) {
+char *supd_probe_env(const struct supd *s) {
+    if (!s) return NULL;
+    char *buf = NULL;
+    size_t bn = 0;
+    FILE *f = open_memstream(&buf, &bn);
+    if (!f) return NULL;
+    fputs("STEER_PROBE_MEM=", f);
+    long w0 = ftell(f);
+    for (size_t i = 0; i < s->set.n; i++) {
         const struct helper *h = &s->set.h[i];
-        if (h->table || h->gone || !cmd_picks_nodes(h->cmd)) continue;
+        if (h->table || h->gone || !h->picks) continue;
         int node, total;
         enum probe_state ps = probe_of(h, &node, &total);
         const char *word = ps == PROBE_RUNNING ? "probing" : ps == PROBE_FAILED ? "failed"
                          : ps == PROBE_NO_SUCH_NODE ? "nonode" : ps == PROBE_ALL_EXCLUDED ? "excluded"
                          : ps == PROBE_LOST ? "lost"
                          : "none";
+        if (ftell(f) > w0) fputc(' ', f);
+        fprintf(f, "%s:%s:%d:%d", h->name, word, node, total);
         /* У lost ещё время и причина — diag ребёнком называет её так же, как status демона. */
-        char tail[600] = "";
         if (ps == PROBE_LOST) {
             char ew[520];
             probe_mem_escape(h->st.why, ew, sizeof(ew));
-            snprintf(tail, sizeof(tail), ":%ld:%s", h->st.since, ew);
+            fprintf(f, ":%ld:%s", h->st.since, ew);
         }
-        int m = snprintf(buf + w, n - w, "%s%s:%s:%d:%d%s", w > 16 ? " " : "", h->name, word,
-                         node, total, tail);
-        if (m < 0 || (size_t)m >= n - w) { buf[w] = '\0'; break; }
-        w += (size_t)m;
     }
+    if (fclose(f) != 0) { free(buf); return NULL; }
+    return buf;
+}
+
+/* Приговор члену группы от .so-плагина (host->member_verdict): grp — id плагина. */
+void supd_member_set(struct supd *s, const char *grp, const char *out, int v) {
+    if (!s || !s->d->have || !out_by_name(s->d->sp, out)) return;
+    char who[96];
+    snprintf(who, sizeof who, "plugin %s", grp);
+    mverdict_set(s, grp, who, out, v);
 }

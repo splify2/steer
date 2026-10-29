@@ -24,8 +24,10 @@
  * web.telegram.org свой, в tls13.c), ни сервера TLS (QUIC у нас только клиент), ни DH, DSA,
  * DES, RC4, MD4, PSK, PBKDF; ни файловой системы (корни читает certverify.c сам, буфером) и
  * ни сокетного ввода-вывода (WOLFSSL_USER_IO: QUIC отдаёт байты через ngtcp2, а не сокет).
- * Ed25519 не нужен: сертификат REALITY разбирается своим кодом и сверяется HMAC-SHA512
- * (certverify.c), а не подписью.
+ * Ed25519 — ТОЛЬКО ПРОВЕРКА подписи пакетов плагинов (формат usign/signify, src/lib/sigverify.c):
+ * сертификат REALITY им не подписан, он сверяется HMAC-SHA512 (certverify.c). Подписывать
+ * ядру нечем и незачем, поэтому NO_ED25519_SIGN; ключи и подписи (в том числе в сертификатах)
+ * wolfSSL здесь не разбирает — вход сырой, 32 и 64 байта.
  *
  * РАЗМЕР. В статическом бинарнике то, что не вызывается, выбрасывает компоновщик (-ffunction-
  * sections и --gc-sections в build.sh, LTO у zig), поэтому QUIC, EVP и TLS-стек wolfSSL места в
@@ -132,6 +134,9 @@
 #define HAVE_ONE_TIME_AUTH
 
 #define HAVE_CURVE25519
+#define HAVE_ED25519
+#define NO_ED25519_SIGN
+#define NO_ED25519_CLIENT_AUTH
 
 #define HAVE_ECC
 #define ECC_USER_CURVES

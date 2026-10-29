@@ -202,6 +202,17 @@ int sc_x25519(unsigned char out[32], const unsigned char scalar[32], const unsig
 /* Публичная половина: X25519(scalar, 9). */
 int sc_x25519_base(unsigned char pub[32], const unsigned char scalar[32]);
 
+/* ---- Ed25519: только проверка подписи (RFC 8032) ------------------------------------------------ */
+
+/* Подпись пакетов плагинов (src/lib/sigverify.c, формат usign/signify): ключ и подпись — сырые 32 и 64
+ * байта, сообщение — целиком в памяти (Ed25519 хеширует его дважды, потоком не проверить). Подписывать
+ * ядру нечем и незачем. 0 — подпись верна; SC_ESIG — не сошлась (в том числе S >= L и точка не на кривой);
+ * SC_EPARSE — открытый ключ не разобрался; SC_EINVAL — сообщение длиннее 4 ГиБ (длина у wolfSSL 32-битная). */
+#define SC_ED25519_PK  32
+#define SC_ED25519_SIG 64
+int sc_ed25519_verify(const unsigned char pk[SC_ED25519_PK], const unsigned char *msg, size_t msg_n,
+                      const unsigned char sig[SC_ED25519_SIG]);
+
 /* ---- ML-KEM-768 и ML-DSA-65 (FIPS 203 и 204) ---------------------------------------------- */
 
 /* Постквантовая часть паритета с Xray-core: половина гибрида X25519MLKEM768 в TLS 1.3 (ClientHello
@@ -256,6 +267,16 @@ void sc_blake3_hash(unsigned char out[32], const void *in, size_t n);
  * произвольные байты. out_n — до 64. */
 void sc_blake3_derive_key(unsigned char *out, size_t out_n, const void *ctx, size_t ctx_n,
                           const void *material, size_t material_n);
+
+/* ---- ECDSA P-256: ключ клиента MASQUE (модуль steer-warpbox) ---------------------------------
+ *
+ * Закрытый ключ — 32 байта скаляра, открытый — 65 байт несжатой точки 04||X||Y. Подпись — над
+ * готовым хешем SHA-256, в DER (SEQUENCE r, s), до SC_P256_SIG_MAX байт. 0 — готово. */
+#define SC_P256_SIG_MAX 72
+int sc_p256_keygen(unsigned char priv[32], unsigned char pub[65]);
+int sc_p256_public(const unsigned char priv[32], unsigned char pub[65]);
+int sc_p256_sign(const unsigned char priv[32], const unsigned char digest[32],
+                 unsigned char *sig, size_t *sig_n);
 
 /* ---- подписи и сертификаты ---------------------------------------------------------------- */
 

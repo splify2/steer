@@ -1,0 +1,161 @@
+{
+  "schema": 1,
+  "id": "vless",
+  "version": "@VERSION@",
+  "type": "plugin",
+  "name": "VLESS",
+  "description": "Туннели VLESS и Reality",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/splify2/steer",
+  "compat": {
+    "steer-api": "^1.1"
+  },
+  "arch": [
+    "aarch64_cortex-a53",
+    "aarch64_cortex-a72",
+    "aarch64_generic",
+    "arm_cortex-a7_neon-vfpv4",
+    "arm_cortex-a9",
+    "arm_cortex-a9_neon",
+    "arm_cortex-a9_vfpv3-d16",
+    "mipsel_24kc",
+    "mips_24kc",
+    "x86_64"
+  ],
+  "requires": {
+    "system": [
+      "kmod-tun"
+    ],
+    "kernel": [
+      "/dev/net/tun"
+    ],
+    "plugins": {
+      "net1": "^1.3"
+    }
+  },
+  "permissions": [
+    "net.admin",
+    "http",
+    "ctl",
+    "system-packages"
+  ],
+  "steer": {
+    "kinds": [
+      {
+        "name": "tunnel:vless",
+        "keys": "kinds/vless.schema.json",
+        "caps": [
+          "device",
+          "mark",
+          "ctmark",
+          "engine-owned",
+          "self-nat",
+          "over",
+          "tcp-probe",
+          "flow-udp",
+          "tcp-redir",
+          "ipv6"
+        ],
+        "helper": {
+          "prog": "bin/vless",
+          "cmd": "vless",
+          "argv": [
+            "vless",
+            "{out}",
+            "--conf",
+            "{conf}"
+          ]
+        },
+        "health": "tcp",
+        "texts": {
+          "selfnat_why": "masquerade не нужен: туннель завершает TCP сам, адреса клиентов наружу не уходят"
+        },
+        "description": "Туннель VLESS по подписке.",
+        "check": {
+          "prog": "bin/vless",
+          "argv": [
+            "check"
+          ]
+        }
+      }
+    ],
+    "commands": [
+      {
+        "name": "vless-nodes",
+        "prog": "bin/vless",
+        "help": "узлы подписки выхода или файла подписки (путь с «/»)",
+        "usage": "<выход|/файл> [--insecure]",
+        "conf": true,
+        "ctl": {
+          "timeout_s": 15,
+          "args": [
+            "name"
+          ]
+        }
+      },
+      {
+        "name": "vless-probe",
+        "prog": "bin/vless",
+        "help": "проверить узел выхода и измерить задержку",
+        "usage": "<выход|/файл> [--node N] [--timeout СЕК] [--insecure]",
+        "conf": true,
+        "ctl": {
+          "timeout_s": 180,
+          "args": [
+            "name",
+            {
+              "kind": "int",
+              "flag": "--node",
+              "min": -1,
+              "max": 9999
+            },
+            {
+              "kind": "int",
+              "flag": "--timeout",
+              "min": 1,
+              "max": 30
+            }
+          ],
+          "optional": 2
+        }
+      },
+      {
+        "name": "sub-check",
+        "prog": "bin/vless",
+        "argv": [
+          "vless-nodes"
+        ],
+        "help": "разобрать присланную подписку, ничего не сохраняя",
+        "ctl": {
+          "timeout_s": 15,
+          "body": "file",
+          "body_max": 16777216
+        }
+      },
+      {
+        "name": "sub-fetch",
+        "prog": "bin/vless",
+        "help": "скачать подписку",
+        "usage": "<ссылка> --out ФАЙЛ [--info ФАЙЛ]"
+      },
+      {
+        "name": "sub-quota",
+        "prog": "bin/vless",
+        "help": "остаток трафика подписки",
+        "usage": "<ссылка> [--info ФАЙЛ]"
+      },
+      {
+        "name": "tls-probe",
+        "prog": "bin/vless",
+        "help": "проверить TLS узла",
+        "usage": "ХОСТ[:ПОРТ] [--out АДРЕС] [--node ПОРТ]"
+      }
+    ]
+  },
+  "i18n": {
+    "languages": [
+      "ru",
+      "en"
+    ]
+  }
+}

@@ -10,15 +10,16 @@
  *   - имя устройства, выданное не по правилу, — это «wg0» в списке интерфейсов телефона, то
  *     есть ровно тот след, которого владелец просил не оставлять.
  * Всё это проверяется в памяти, без CAP_NET_ADMIN: ядро здесь не нужно. Поведение с ядром —
- * tests/awgns.sh (свежее ядро, модуль wireguard, без AmneziaWG — там же отказ без модуля) и
- * tests/awg49e.sh (ядро 4.9 с модулем AmneziaWG).
+ * tests/awgns.sh (свежее ядро, модуль wireguard, без AmneziaWG — там же отказ без модуля).
  *
  * Парсер спеки (MODEL_SRC) линкуется отдельным объектом (Makefile): load_spec() возвращает
  * отказ, а не зовёт exit() сама (правило 5, docs/architecture.md, раздел 2), и spec_str ниже
- * читает код возврата напрямую — перехватывать больше нечего. src/kinds/awg.c — вне пяти
- * каталогов правила юнит-стендов (раздел 4), поэтому остаётся #include: awg_conf_free и другие его
- * статические помощники стенду нужны как есть. run_quiet — заглушка: до команд ip стенд не
+ * читает код возврата напрямую — перехватывать больше нечего. src/kinds/awg.c и слой устройства под
+ * ним src/kinds/awgdev.c — #include: их статические помощники (разбор ключа, сборка сообщений, подпись
+ * параметров) стенду нужны как есть. run_quiet — заглушка: до команд ip стенд не
  * доходит. */
+/* awg.c ниже — #include, а ему нужен _GNU_SOURCE (setns, устройства подбора) до первого заголовка. */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -28,6 +29,7 @@
 
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 
+#include "../src/kinds/awgdev.c"
 #include "../src/kinds/awg.c"
 
 static int fails, passes;
@@ -288,7 +290,9 @@ int main(void) {
         check(t, 1, a && NLA_PLEN(a) == 32 && !memcmp(NLA_DATA(a), want, 32));
         a = find(top, tl, AD_FWMARK);
         snprintf(t, sizeof t, "SET v%d: FWMARK u32", ver);
-        check(t, 0x00c00000, a && NLA_PLEN(a) == 4 ? (long)u32of(a) : -1);
+        /* Метка via и — на платформе с zapret — бит «не твой» общему обходу (sockmark.h): внешние
+         * пакеты туннеля мимо zapret роутера; на телефоне бита нет. */
+        check(t, plat()->zapret ? 0x40c00000L : 0x00c00000L, a && NLA_PLEN(a) == 4 ? (long)u32of(a) : -1);
         a = find(top, tl, AD_JC);
         snprintf(t, sizeof t, "SET v%d: JC — u16", ver);
         check(t, 4, a && NLA_PLEN(a) == 2 ? u16of(a) : -1);

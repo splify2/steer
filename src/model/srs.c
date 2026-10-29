@@ -150,7 +150,6 @@ enum {
 #define LBL_ADG_OPEN 0x08  /* '\b' — adguard_domain без «^»: дальше целые метки     */
 
 #define MAX_KEY     512    /* ключ дерева: домен плюс метка; с запасом на UTF-8 */
-#define MAX_DEPTH   512    /* глубина обхода не больше длины ключа              */
 #define MAX_STR     4096   /* строка элемента (keyword, regex, пакет): длиннее — не наш файл */
 
 /* ---- причины снять правило ------------------------------------------------------------ */
@@ -172,8 +171,6 @@ static const struct { unsigned bit; const char *what; } DR_TEXT[] = {
     { DR_NET,     "транспорт не tcp и не udp" },
     { DR_PKGRE,   "шаблоны пакетов" },
     { DR_PORTS,   "портов больше, чем выражается" },
-    { DR_SRCOVER, "источников больше, чем выражается" },
-    { DR_PKGOVER, "приложений больше, чем выражается" },
     { DR_TOPINV,  "«всё, кроме …»" },
     { DR_LOGINV,  "логическое правило с invert" },
     { DR_ANDOR,   "«или» внутри «и»" },
@@ -468,10 +465,10 @@ struct drule {
     unsigned drop;              /* DR_*: из-за чего правило не выражается */
     unsigned skip;              /* DR_*: что снято без снятия правила (adguard_domain) */
     struct srs_pfx4 *src;
-    size_t src_n;
+    size_t src_n, src_cap;
     int src_seen;               /* был ли source_ip_cidr вообще (v6-только — тоже был) */
     char **pkg;
-    size_t pkg_n;
+    size_t pkg_n, pkg_cap;
 };
 #define G_NET   1u
 #define G_PORT  2u
@@ -501,10 +498,12 @@ static void lnode_free(struct lnode *n) {
 struct src_ctx { struct drule *d; };
 static int src_add(void *ctx, struct u128 net, int plen) {
     struct drule *d = ((struct src_ctx *)ctx)->d;
-    if (d->src_n >= SRS_MAX_SRC) { d->drop |= DR_SRCOVER; return 0; }
-    if (!d->src) {
-        d->src = calloc(SRS_MAX_SRC, sizeof(*d->src));
-        if (!d->src) return 1;
+    if (d->src_n == d->src_cap) {
+        size_t cap = d->src_cap ? d->src_cap * 2 : 64;
+        struct srs_pfx4 *v = realloc(d->src, cap * sizeof(*v));
+        if (!v) return 1;
+        d->src = v;
+        d->src_cap = cap;
     }
     d->src[d->src_n].net = (uint32_t)net.lo;
     d->src[d->src_n].plen = plen;
@@ -766,8 +765,13 @@ static int scan_default(struct rd *r, struct drule *d) {
                 if (r->err || l > MAX_STR) { r->err = 1; return -1; }
                 const unsigned char *q = rd_take(r, (size_t)l);
                 if (!q) return -1;
-                if (d->pkg_n >= SRS_MAX_PKG || l >= 128) { d->drop |= DR_PKGOVER; continue; }
-                if (!d->pkg && !(d->pkg = calloc(SRS_MAX_PKG, sizeof(char *)))) { r->err = 1; return -1; }
+                if (d->pkg_n == d->pkg_cap) {
+                    size_t cap = d->pkg_cap ? d->pkg_cap * 2 : 16;
+                    char **v = realloc(d->pkg, cap * sizeof(*v));
+                    if (!v) { r->err = 1; return -1; }
+                    d->pkg = v;
+                    d->pkg_cap = cap;
+                }
                 char *s = malloc((size_t)l + 1);
                 if (!s) { r->err = 1; return -1; }
                 memcpy(s, q, (size_t)l);
@@ -1029,7 +1033,6 @@ static unsigned pm_of(const struct drule *d) {
 
 /* ---- нормальная форма ---------------------------------------------------------------- */
 
-#define MAX_XOCC 64
 struct conj {
     unsigned pm;
     struct pset ps;
@@ -1038,8 +1041,8 @@ struct conj {
     const struct drule *pkg;
     const struct drule *first;      /* первое положительное правило */
     size_t npos, nneg;
-    const struct drule *x[MAX_XOCC];
-    size_t xn;
+    const struct drule **x;         /* исключения: растёт по числу «и не…» */
+    size_t xn, xcap;
     unsigned why;                   /* причина, если не выражается */
     int empty;                      /* выражается, но пусто — снимается молча */
 };
@@ -1083,7 +1086,13 @@ static int conj_neg(struct conj *c, const struct drule *d) {
     if (dims == 0) { c->empty = 1; return 0; }          /* «и не (всё)» — не совпадает ничто */
     if (dims > 1 || (d->items & (G_SRC | G_PKG))) { c->why |= DR_EXCL; return -1; }
     if (d->has) {
-        if (c->xn >= MAX_XOCC) { c->why |= DR_EXCL; return -1; }
+        if (c->xn == c->xcap) {
+            size_t cap = c->xcap ? c->xcap * 2 : 8;
+            const struct drule **v = realloc(c->x, cap * sizeof(*v));
+            if (!v) { c->why |= DR_EXCL; return -1; }
+            c->x = v;
+            c->xcap = cap;
+        }
         c->x[c->xn++] = d;
         return 0;
     }
@@ -1310,19 +1319,26 @@ static int conj_emit(struct srs_set *s, struct conj *c, uint32_t rule) {
 static int norm_top(struct srs_set *s, const struct lnode *n, uint32_t rule) {
     struct conj c;
     conj_init(&c);
+    int rc;
     if (!n->logical) {
         if (n->invert) { drop_rule(s, DR_TOPINV); return 0; }
-        if (conj_pos(&c, &n->d) != 0) { drop_rule(s, c.why); return 0; }
-        return conj_emit(s, &c, rule);
-    }
-    if (n->invert) { drop_rule(s, DR_LOGINV); return 0; }
-    if (n->mode == 1) {
+        if (conj_pos(&c, &n->d) != 0) { drop_rule(s, c.why); rc = 0; }
+        else rc = conj_emit(s, &c, rule);
+    } else if (n->invert) {
+        drop_rule(s, DR_LOGINV);
+        return 0;
+    } else if (n->mode == 1) {
         for (size_t i = 0; i < n->nkids; i++)
             if (norm_top(s, n->kids[i], rule) != 0) return -1;
         return 0;
+    } else if (conj_and(&c, n) != 0) {
+        drop_rule(s, c.why);
+        rc = 0;
+    } else {
+        rc = conj_emit(s, &c, rule);
     }
-    if (conj_and(&c, n) != 0) { drop_rule(s, c.why); return 0; }
-    return conj_emit(s, &c, rule);
+    free(c.x);
+    return rc;
 }
 
 static int occ_reserve(struct srs_set *s, size_t need) {
@@ -1464,12 +1480,7 @@ size_t srs_clause_n(const struct srs_set *s) { return s->cl_n; }
 const struct srs_clause *srs_clause(const struct srs_set *s, size_t i) {
     return i < s->cl_n ? &s->cl[i] : NULL;
 }
-const char *srs_path(const struct srs_set *s) { return s->path; }
 const char *srs_skipped(const struct srs_set *s) { return s->skipped[0] ? s->skipped : NULL; }
-int srs_any_kind(const struct srs_set *s, unsigned kind) {
-    for (size_t i = 0; i < s->cl_n; i++) if (s->cl[i].kind == kind) return 1;
-    return 0;
-}
 int srs_any_flag(const struct srs_set *s, unsigned flag) {
     for (size_t i = 0; i < s->cl_n; i++) if (s->cl[i].flags & flag) return 1;
     return 0;
@@ -1664,10 +1675,14 @@ typedef int (*key_emit)(struct walk *w, uint32_t target, const unsigned char *ke
 
 static int succinct_walk(struct walk *w, uint32_t target, const struct succinct *s, key_emit emit) {
     size_t nbits = s->nbitmap * 64;
-    struct swalk *stack = malloc(MAX_DEPTH * sizeof(*stack));
+    /* Стек растёт по потребности: в него ложатся ВСЕ дети узла, и у корня большого набора их
+     * тысячи (метки первого уровня, TLD) — это ширина, а не глубина, и фиксированным числом её не
+     * ограничить. Глубину держит проверка e.plen >= MAX_KEY ниже. */
+    size_t cap = 1024;
+    struct swalk *stack = malloc(cap * sizeof(*stack));
     unsigned char key[MAX_KEY];
     if (!stack) return -1;
-    int sp = 0;
+    size_t sp = 0;
     stack[sp].node = 0; stack[sp].bm = 0; stack[sp].plen = 0; stack[sp].label = 0;
     sp++;
     int rc = 0;
@@ -1680,7 +1695,13 @@ static int succinct_walk(struct walk *w, uint32_t target, const struct succinct 
             if (zeros >= s->nlabels) { rc = -1; break; }        /* карта врёт про метки */
             uint32_t child = (uint32_t)zeros + 1;
             if ((size_t)child > s->nones) { rc = -1; break; }   /* нет позиции для узла */
-            if (sp >= MAX_DEPTH || e.plen >= MAX_KEY) { rc = -1; break; }
+            if (e.plen >= MAX_KEY) { rc = -1; break; }
+            if (sp >= cap) {
+                struct swalk *g = cap > SIZE_MAX / 2 / sizeof(*stack) ? NULL : realloc(stack, cap * 2 * sizeof(*stack));
+                if (!g) { rc = -1; break; }
+                stack = g;
+                cap *= 2;
+            }
             size_t pos = select1(s, child - 1);
             if (pos == (size_t)-1) { rc = -1; break; }
             stack[sp].node  = child;
@@ -1961,33 +1982,63 @@ size_t l4_boxes(const struct l4match *m, struct l4box *out) {
     return n;
 }
 
-size_t l4_union_boxes(const struct l4match *const *ms, size_t n, struct l4box *out) {
+/* Слить диапазоны портов на месте: сортировка и объединение смежных. */
+static size_t pr_merge(struct port_range *r, size_t n) {
+    if (n < 2) return n;
+    qsort(r, n, sizeof(r[0]), pr_cmp);
+    size_t w = 0;
+    for (size_t i = 1; i < n; i++) {
+        if ((unsigned)r[i].lo <= (unsigned)r[w].hi + 1u) {
+            if (r[i].hi > r[w].hi) r[w].hi = r[i].hi;
+        } else {
+            r[++w] = r[i];
+        }
+    }
+    return w + 1;
+}
+
+struct l4box *l4_union_alloc(const struct l4match *const *ms, size_t n, size_t *nb) {
     /* «Без сужения» накрывает всё — один ящик. Иначе у каждого из двух протоколов свои порты,
-     * слитые в непересекающиеся диапазоны: ящики tcp и udp не пересекаются по протоколу. */
-    struct pset t = { .all = 0, .n = 0 }, u = { .all = 0, .n = 0 };
+     * слитые в непересекающиеся диапазоны: ящики tcp и udp не пересекаются по протоколу. Число
+     * ящиков растёт с числом сужений (по 16 диапазонов у каждого) — массивы по размеру входа. */
+    *nb = 0;
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++) total += ms[i]->ports_n ? ms[i]->ports_n : 1;
+    struct port_range *t = malloc((total ? total : 1) * 2 * sizeof(*t));
+    if (!t) return NULL;
+    struct port_range *u = t + total;
+    size_t tn = 0, un = 0;
     for (size_t i = 0; i < n; i++) {
         const struct l4match *m = ms[i];
-        if (l4match_empty(m)) return l4_boxes(m, out);
-        struct pset p;
-        pset_from(&p, m->ports, m->ports_n);
-        if (p.all) { p.all = 0; p.r[0].lo = 0; p.r[0].hi = 65535; p.n = 1; }
+        if (l4match_empty(m)) {
+            free(t);
+            struct l4box *o = malloc(sizeof(*o));
+            if (o) *nb = l4_boxes(m, o);
+            return o;
+        }
         for (int k = 0; k < 2; k++) {
             if (k == 0 && m->proto == CH_PROTO_UDP) continue;
             if (k == 1 && m->proto == CH_PROTO_TCP) continue;
-            struct pset *d = k == 0 ? &t : &u;
-            for (size_t j = 0; j < p.n && d->n < sizeof(d->r) / sizeof(d->r[0]); j++)
-                d->r[d->n++] = p.r[j];
-            pset_norm(d);
+            struct port_range *d = k == 0 ? t : u;
+            size_t *dn = k == 0 ? &tn : &un;
+            if (!m->ports_n) { d[*dn].lo = 0; d[*dn].hi = 65535; (*dn)++; continue; }
+            for (size_t j = 0; j < m->ports_n; j++) d[(*dn)++] = m->ports[j];
         }
     }
+    tn = pr_merge(t, tn);
+    un = pr_merge(u, un);
+    struct l4box *out = malloc((tn + un ? tn + un : 1) * sizeof(*out));
+    if (!out) { free(t); return NULL; }
     size_t o = 0;
-    for (size_t j = 0; j < t.n && o < L4BOX_MAX; j++) {
-        out[o].plo = out[o].phi = 6; out[o].lo = t.r[j].lo; out[o].hi = t.r[j].hi; o++;
+    for (size_t j = 0; j < tn; j++) {
+        out[o].plo = out[o].phi = 6; out[o].lo = t[j].lo; out[o].hi = t[j].hi; o++;
     }
-    for (size_t j = 0; j < u.n && o < L4BOX_MAX; j++) {
-        out[o].plo = out[o].phi = 17; out[o].lo = u.r[j].lo; out[o].hi = u.r[j].hi; o++;
+    for (size_t j = 0; j < un; j++) {
+        out[o].plo = out[o].phi = 17; out[o].lo = u[j].lo; out[o].hi = u[j].hi; o++;
     }
-    return o;
+    free(t);
+    *nb = o;
+    return out;
 }
 
 void l4_box_text(const struct l4box *b, char *dst, size_t n) {

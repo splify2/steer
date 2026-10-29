@@ -157,6 +157,30 @@ static void t_end_in_one_record(int with_rst, int with_end_stream, const char *w
     transport_close(&c);
 }
 
+/* Длина поля protobuf varint-ом ненормальной длины. Поле — uint32, varint не длиннее 5 байт: прежний
+ * разбор брал до 7 и сдвигал uint32_t на 35 и 42 бита (UB), теряя значение молча. */
+static void t_varint(const unsigned char *vi, size_t vn, const char *data, int want_ok, const char *what) {
+    struct transport c;
+    check(open_stream(&c) == 0, "поток открыт");
+    unsigned char w[512], m[64];
+    size_t n = 0, dn = strlen(data);
+    static const unsigned char ok[1] = { 0x88 };
+    n += frame(w + n, FRH, FEND_HEADERS, 1, ok, 1);
+    s_put32(m + 1, (uint32_t)(1 + vn + dn));
+    m[0] = 0;
+    m[5] = 0x0A;
+    memcpy(m + 6, vi, vn);
+    memcpy(m + 6 + vn, data, dn);
+    n += frame(w + n, FRD, 0, 1, m, 6 + vn + dn);
+    if (write(g_srv, w, n) != (ssize_t)n) { perror("write"); exit(2); }
+    unsigned char buf[TRANSPORT_MIN_READ_CAP];
+    size_t got = 0;
+    int rc = transport_read(&c, buf, sizeof(buf), &got);
+    if (want_ok) check(rc == 0 && got == dn && !memcmp(buf, data, dn), what);
+    else check(rc != 0, what);
+    transport_close(&c);
+}
+
 static void t_trailers_only(const char *what) {
     /* Ответ из одних концевых HEADERS: сервер отказал в методе. Данных нет вовсе, поток закончен. */
     struct transport c;
@@ -186,6 +210,14 @@ int main(void) {
     t_end_in_one_record(1, 0, "данные + RST_STREAM без END_STREAM");
     t_end_in_one_record(0, 0, "только данные");
     t_trailers_only("ответ из одних концевых HEADERS");
+    {
+        static const unsigned char v5[] = { 0x84, 0x80, 0x80, 0x80, 0x00 };   /* 4, пять байт — законно */
+        static const unsigned char v5big[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0x7F };  /* больше 2^32 */
+        static const unsigned char v7[] = { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 };
+        t_varint(v5, sizeof(v5), "abcd", 1, "varint длины из 5 байт: данные отданы");
+        t_varint(v5big, sizeof(v5big), "abcd", 0, "varint из 5 байт сверх uint32: отказ");
+        t_varint(v7, sizeof(v7), "abcd", 0, "varint из 7 байт: отказ");
+    }
     printf(g_fail ? "\ngrpcmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;
 }

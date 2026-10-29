@@ -3,15 +3,12 @@
 # поле метки, пути по умолчанию и раскладка правил.
 #
 # Проверяется то, что сборка меняет, и ничего сверх: остальное у неё общее с роутерной и
-# проверено её стендами. Раскладка nft к сборке не привязана (её выбирает проба ядра, см.
-# nft_compat в src/model/spec.h), поэтому здесь она задаётся явно — и современная, и старая: обе
-# обязаны собираться с полем метки телефона.
+# проверено её стендами. Раскладка правил одна (раскладку для Linux 4.9 убрали, I-541).
 #
 # Что проверяется.
 #  1. Поле метки — биты 22-27: маска 0x0fc00000, запись `mark and 0xf03fffff`, и ни одного
 #     следа роутерного поля 0x0ff00000 — в бит 20 и 21 пишет netd.
 #  2. Пути по умолчанию — /data/misc/steer: /etc и /var на телефоне только для чтения.
-#  3. Старая раскладка (legacy-min — ровно ядро телефона) собирается и с этим полем.
 #  5. Каналы на сам телефон (from: self / uid:N): правило на output, отказы разбора.
 #  4. zapret на телефоне нет: бит пропуска zapret (0x40000000, в битах vendor netd) не ставится,
 #     цепочки failopen, которая существует ради него, нет, а kind/on_fail zapret — отказ спеки.
@@ -42,7 +39,7 @@ cat > "$tmp/spec.json" <<EOF2
 EOF2
 S="--spec $tmp/spec.json --state-dir $tmp/state"
 
-out="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run $S 2>/dev/null)"
+out="$("$BIN" apply --dry-run $S 2>/dev/null)"
 check "современная раскладка собирается" "0" "$?"
 # Правило IPv4 одно; второе — его v6-двойник (доменная группа выхода с IPv6 получает пару IPv6,
 # fake-IP v6), с той же меткой.
@@ -65,18 +62,10 @@ check "состояние по умолчанию — /data/misc/steer/state" "1
     "$(printf '%s\n' "$help" | grep -c '/data/misc/steer/state')"
 check "и ни слова про /etc/steer" "0" "$(printf '%s\n' "$help" | grep -c '/etc/steer')"
 
-lout="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run $S 2>/dev/null)"
-check "старая раскладка собирается" "0" "$?"
-check "старая раскладка: nat в таблице ip" "1" "$(printf '%s\n' "$lout" | grep -c '^table ip steer {')"
-# Правил два: адресный и доменный каналы слились в одну группу, и в старой раскладке у неё
-# по правилу на каждую половину набора.
-check "старая раскладка: метка та же" "2" \
-    "$(printf '%s\n' "$lout" | grep -c 'meta mark set mark and 0xf03fffff or 0x00400000')"
-
 sed 's/"kind": "direct" }/"kind": "zapret" }/' "$tmp/spec.json" > "$tmp/z.json"
 "$BIN" apply --dry-run --spec "$tmp/z.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/z.err"
 check "kind zapret — отказ спеки" "2" "$?"
-check "  и причина названа" "1" "$(grep -c 'на телефоне zapret нет' "$tmp/z.err")"
+check "  и причина названа" "1" "$(grep -c 'recheck' "$tmp/z.err")"
 sed 's/"on_fail": "direct"/"on_fail": "zapret"/' "$tmp/spec.json" > "$tmp/zf.json"
 "$BIN" apply --dry-run --spec "$tmp/zf.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/zf.err"
 check "on_fail zapret — отказ спеки" "2" "$?"
@@ -89,13 +78,11 @@ cat > "$tmp/local.json" <<EOF2
   "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
   "channels": [ { "name": "a", "from": ["uid:10123"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
 EOF2
-lo="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/local.json" --state-dir "$tmp/state" 2>/dev/null)"
+lo="$("$BIN" apply --dry-run --spec "$tmp/local.json" --state-dir "$tmp/state" 2>/dev/null)"
 check "канал по UID: правило на output со skuid" "1" \
     "$(printf '%s\n' "$lo" | grep -c 'meta skuid 10123 ct direction original ip daddr @vpn_ip_c0 meta mark set')"
 check "канал по UID: на prerouting его нет" "0" \
     "$(printf '%s\n' "$lo" | sed -n '/chain prerouting_mark/,/}/p' | grep -c skuid)"
-check "старая раскладка: бит перемаршрутизации снимает цепочка route в ip" "1" \
-    "$(printf '%s\n' "$lo" | grep -c 'type route hook output priority mangle + 2')"
 bad() {   # bad ИМЯ FROM ТЕКСТ — спека с таким «кому» отвергается кодом 2 и называет причину
     sed "s|\"from\": \[\"uid:10123\"\]|\"from\": $2|" "$tmp/local.json" > "$tmp/bad.json"
     "$BIN" apply --dry-run --spec "$tmp/bad.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/bad.err"
@@ -118,8 +105,7 @@ cat > "$tmp/loc2.json" <<EOF2
     { "name": "u", "from": ["uid:10123", "uid:1010200-1010300"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" },
     { "name": "d", "from": ["uid:10124"], "match": { "domains_files": ["$tmp/d.lst"] }, "out": "vpn" } ] }
 EOF2
-m2="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)"
-l2="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)"
+m2="$("$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)"
 c() { printf '%s\n' "$1" | grep -c -- "$2"; }
 check "self — приложения (UID от 10000), только исходящие соединения" "2" \
     "$(c "$m2" 'meta skuid >= 10000 ct direction original')"
@@ -127,8 +113,6 @@ check "приложения списком и диапазоном — в фиг
     "$(c "$m2" 'meta skuid { 10123, 1010200-1010300 } ct direction original')"
 check "современная раскладка: output_mark — цепочка route прямо в inet" "1" \
     "$(c "$m2" 'type route hook output priority mangle + 1')"
-check "старая раскладка: бит 21 ставится после метки соединения — у трёх групп и двойника IPv6" "4" \
-    "$(c "$l2" 'ct mark set mark meta mark set mark or 0x00200000')"
 # Выход interface несёт IPv6 (1.9): IPv6 «весь трафик» не отвергается, а уводится двойником — с
 # тем же сужением и мимо своей сети.
 check "IPv6 «весь трафик» — двойник в выход с IPv6, с тем же сужением, мимо своей сети" "1" \
@@ -137,46 +121,25 @@ check "  отказа IPv6 у выхода с IPv6 нет" "0" "$(c "$m2" 'count
 check "«весь трафик» — не в свою сеть (RFC 1918, link-local, мультикаст)" "1" \
     "$(c "$m2" 'meta nfproto ipv4 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }')"
 # Метка пакета — в метку соединения (ct mark set mark): по ней резолвер переспрашивает с меткой
-# сети исходного запроса. Оба семейства: в современной раскладке одно правило в inet без
-# nfproto, в старой — по цепочке nat output в ip и ip6.
+# сети исходного запроса. Оба семейства: одно правило в inet без nfproto.
 dnsrule='meta mark and 0x0fc00000 != 0x0fc00000 udp dport 53 ct mark set mark counter redirect to :5300'
 check "DNS телефона — все, кроме запроса самого резолвера (метка движка), оба семейства" "1" \
     "$(c "$m2" "$dnsrule")"
 check "  без ограничения семейством" "0" "$(c "$m2" "nfproto ipv4 $dnsrule")"
-# Половину в ip6 (она есть, только если ядро приняло nat в ip6 — это решает проба, а не
-# переменная) проверяет tests/local49.sh на ядре 4.9.
-check "  на старой раскладке — в таблице ip" "1" \
-    "$(printf '%s\n' "$l2" | sed -n '/^table ip steer/,/^}/p' | grep -c -- "$dnsrule")"
-# Таблица ip6 без nat в ip6 теперь есть — в ней одна цепочка перемаршрутизации IPv6 приложений
-# (двойник «весь трафик» метит IPv6), а nat в ней нет.
-ip6t="$(printf '%s\n' "$l2" | sed -n '/^table ip6 steer/,/^}/p')"
-check "  без nat в ip6 в таблице ip6 — только перемаршрутизация" "1 1 0" \
-    "$(c "$ip6t" 'chain ') $(c "$ip6t" 'chain output_reroute') $(c "$ip6t" 'type nat')"
 # TCP/53 — рядом с UDP/53, тем же правилом (метка движка, ct mark set mark, оба семейства).
 tcprule='meta mark and 0x0fc00000 != 0x0fc00000 tcp dport 53 ct mark set mark counter redirect to :5300'
 check "DNS телефона по TCP/53 — рядом с UDP, с тем же исключением метки движка" "1" \
     "$(c "$m2" "$tcprule")"
-check "  на старой раскладке — в таблице ip" "1" \
-    "$(printf '%s\n' "$l2" | sed -n '/^table ip steer/,/^}/p' | grep -c -- "$tcprule")"
-# Раздача: TCP/53 заворачивается рядом с UDP/53 в обеих раскладках (на старой — и в ip6).
-check "раздача: TCP/53 к резолверу, современная раскладка" "1" \
+# Раздача: TCP/53 заворачивается рядом с UDP/53.
+check "раздача: TCP/53 к резолверу" "1" \
     "$(c "$m2" 'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
-check "раздача: TCP/53 к резолверу, старая раскладка без nat в ip6 (только ip)" "1" \
-    "$(c "$l2" 'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
-# Режим legacy спрашивает nat в ip6 у ядра пробой `nft -c`: под root с nft он есть, и правил два
-# (ip и ip6), а на машине без них (runner GitHub) проба отвечает «нет», и правило одно — только в
-# ip. Поэтому ожидание берётся у UDP/53 той же раскладки: TCP обязан стоять везде, где стоит UDP.
-lg="$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)"
-check "раздача: TCP/53 к резолверу, старая раскладка с nat в ip6 — там же, где UDP/53" \
-    "$(c "$lg" 'iifname "rndis0" udp dport 53 counter redirect to :5300')" \
-    "$(c "$lg" 'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
 check "раздача: TCP/53 стоит сразу за UDP/53" "1" \
     "$(printf '%s\n' "$m2" | grep -A1 'iifname "rndis0" udp dport 53' | grep -c 'tcp dport 53')"
 check "поддельные адреса для соединений телефона переводятся на output" "1" \
     "$(c "$m2" 'ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip comment "steer-fakeip-local"')"
 check "  и поддельные IPv6 — картой fakeip6" "1" \
     "$(c "$m2" 'ip6 daddr fdfe:dcba:9876::/96 counter dnat ip6 to ip6 daddr map @fakeip6 comment "steer-fakeip-local"')"
-check "masquerade — не в nft (его ставит iptables при apply)" "0" "$(c "$m2$l2" 'masquerade')"
+check "masquerade — не в nft (его ставит iptables при apply)" "0" "$(c "$m2" 'masquerade')"
 
 spec_bad() {   # spec_bad ИМЯ ТЕКСТ — спека из stdin отвергается и называет причину
     cat > "$tmp/sb.json"
@@ -184,6 +147,9 @@ spec_bad() {   # spec_bad ИМЯ ТЕКСТ — спека из stdin отвер
     check "$1" "2" "$?"
     check "  причина: $2" "1" "$(grep -c "$2" "$tmp/sb.err")"
 }
+# Мост Telegram — вид плагина tgws: стенду — каталог плагинов дерева (tests/plugroot.sh).
+sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" || { echo "androidmatch: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins" STEER_PLUGINS_ETC="$tmp/plugetc" \
 spec_bad "канал телефона с выходом tgws — отказ" 'только для клиентов раздачи' <<EOF2
 { "schema": 2, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
   "channels": [ { "name": "t", "from": ["uid:10123"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "tg" } ] }
@@ -202,16 +168,13 @@ EOF2
 # пишется только в спеке с via: без via текст правил прежний побайтно (проверки выше).
 sed 's|"outputs": { "vpn": { "kind": "interface", "device": "wg0" } }|"outputs": { "vpn": { "kind": "interface", "device": "wg0" }, "nl": { "kind": "awg", "conf": "/nonexistent/nl.conf", "via": "vpn" } }|' \
     "$tmp/loc2.json" > "$tmp/via.json"
-mv3="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/via.json" --state-dir "$tmp/state" 2>/dev/null)"
-lv3="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/via.json" --state-dir "$tmp/state" 2>/dev/null)"
+mv3="$("$BIN" apply --dry-run --spec "$tmp/via.json" --state-dir "$tmp/state" 2>/dev/null)"
 vdns='meta mark and 0x0fc00000 != 0x0fc00000 meta mark and 0x10000000 == 0x00000000 udp dport 53 ct mark set mark counter redirect to :5300'
 vtcp='meta mark and 0x0fc00000 != 0x0fc00000 meta mark and 0x10000000 == 0x00000000 tcp dport 53 ct mark set mark counter redirect to :5300'
 check "via: заворот UDP/53 пропускает туннель (бит 0x10000000)" "1" "$(c "$mv3" "$vdns")"
 check "via: заворот TCP/53 пропускает туннель" "1" "$(c "$mv3" "$vtcp")"
-check "via: и на старой раскладке, в таблице ip" "2" \
-    "$(printf '%s\n' "$lv3" | sed -n '/^table ip steer/,/^}/p' | grep -c -- 'meta mark and 0x10000000 == 0x00000000 [ut][dc]p dport 53')"
-check "без via бита туннеля в правилах нет" "0" "$(c "$m2$l2" '0x10000000')"
-# Ядро машины разработки принимает такое правило (ядро 4.9 — стенд local49 на vm49).
+check "без via бита туннеля в правилах нет" "0" "$(c "$m2" '0x10000000')"
+# Ядро машины разработки принимает такое правило.
 if [ "$(id -u)" = 0 ] && command -v nft >/dev/null 2>&1 && unshare -n true 2>/dev/null; then
     printf '%s\n' "$mv3" > "$tmp/via.nft"
     unshare -n nft -c -f "$tmp/via.nft" >/dev/null 2>"$tmp/via.err"
@@ -227,7 +190,7 @@ fi
 # Разметка раздачи на ingress (compile/generate.c, «разметка на ingress») на телефоне не ставится:
 # устройства раздачи появляются с включением раздачи (lan_devs_persist = 0). Даже когда ядро
 # «принимает» inet ingress и устройство «есть» (STEER_NFT_INGRESS=all), текст — прежний.
-ing="$(STEER_NFT_INGRESS=all STEER_NFT_COMPAT=modern "$BIN" apply --dry-run $S 2>/dev/null)"
+ing="$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run $S 2>/dev/null)"
 check "раздача на телефоне — без ingress" "0" "$(printf '%s\n' "$ing" | grep -c 'hook ingress')"
 check "  и текст тот же, что без него" "$out" "$ing"
 
@@ -245,7 +208,7 @@ outputs:
 rules:
   - { to: a, out: wg }
 EOF
-    STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/h6.yaml" --state-dir "$tmp/state" 2>"$tmp/h6.err"
+    "$BIN" apply --dry-run --spec "$tmp/h6.yaml" --state-dir "$tmp/state" 2>"$tmp/h6.err"
 }
 h6_none="$(h6 '')"
 h6_r="$(h6 ', ipv6: routed, prefix: "2001:db8:1::/56"')"

@@ -27,11 +27,11 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <poll.h>
 
 #include "scrypto.h"
 #include "certverify.h"
 #include "tls13.h"
+#include "wipe.h"
 
 /* Из reality.c: тот же X25519, но со вторым множителем из ServerHello. Общая функция, а
  * не копия, потому что копия крипто-кода — это два места, где может разойтись прижатие
@@ -146,12 +146,13 @@ static int rbuf_fill(struct tls13 *t, int may_wait) {
     }
     if (t->rbuf_n >= sizeof(t->rbuf)) return TLS13_ETOOBIG;
 
-    if (!may_wait) {
-        struct pollfd p = { .fd = t->fd, .events = POLLIN };
-        int pr = poll(&p, 1, 0);
-        if (pr <= 0 || !(p.revents & POLLIN)) return TLS13_EAGAIN;
-    }
-    ssize_t r = read(t->fd, t->rbuf + t->rbuf_n, sizeof(t->rbuf) - t->rbuf_n);
+    /* Поток данных не ждёт — и спрашивает не poll перед чтением, а само чтение: recv с MSG_DONTWAIT
+     * на пустом сокете сразу даёт EAGAIN. Прежде здесь стоял poll(…, 0) перед каждым read — второй
+     * системный вызов на каждое чтение: 66–115 вызовов poll на МБ у gRPC и Vision (замер R-148),
+     * а сокет узла блокирующий и со сроком, так что read без проверки ждал бы до его конца. Рукопожатие
+     * (may_wait) читает как раньше — ждёт. */
+    ssize_t r = may_wait ? read(t->fd, t->rbuf + t->rbuf_n, sizeof(t->rbuf) - t->rbuf_n)
+                         : recv(t->fd, t->rbuf + t->rbuf_n, sizeof(t->rbuf) - t->rbuf_n, MSG_DONTWAIT);
     if (r == 0) return TLS13_ECLOSED;
     if (r < 0) {
         if (errno == EINTR) return 0;
@@ -234,14 +235,22 @@ void tls13_keys_free(struct tls13_keys *k) {
     k->ctx_ready = 0;
 }
 
-/* Безопасна на ОБНУЛЁННОЙ структуре и при повторном вызове — это контракт, а не удобство: с шага 2
- * выпуска 1.10 её зовёт transport_close на любой связи, в том числе при security=none, где
+/* Безопасна на ОБНУЛЁННОЙ структуре и при повторном вызове — это контракт, а не удобство:
+ * её зовёт transport_close на любой связи, в том числе при security=none, где
  * tls13_init не звали вовсе. Держится на том, что у каждого контекста слоя нулевой «алгоритм» или
  * флаг готовности значит «пусто» (sc_hash_free, sc_aead_free ничего не делают), а освобождение
  * этот признак снова обнуляет. */
 void tls13_free(struct tls13 *t) {
+    outq_free(&t->oq);
+    t->live = 0;
     tls13_keys_free(&t->rd);
     tls13_keys_free(&t->wr);
+    /* Ключ и iv трафика — секреты на всё время соединения; освободить контекст шифра мало: массивы
+     * остаются в структуре, которую вызывающий часто отдаёт в free/кучу без обнуления. */
+    steer_wipe(t->rd.key, sizeof(t->rd.key));
+    steer_wipe(t->wr.key, sizeof(t->wr.key));
+    steer_wipe(t->rd.iv, sizeof(t->rd.iv));
+    steer_wipe(t->wr.iv, sizeof(t->wr.iv));
     sc_hash_free(&t->tr);
     sc_hash_free(&t->tr384);
     t->ready = 0;
@@ -289,6 +298,7 @@ static int aead_open_once(const struct tls13_keys *src, uint64_t seq,
     int rc = tls13_keys_setup(&k);
     if (rc == 0) rc = tls13_aead_open(&k, seq, aad, aad_n, buf, n);
     tls13_keys_free(&k);
+    steer_wipe(&k, sizeof(k));              /* копия ключа рукопожатия на стеке */
     return rc;
 }
 
@@ -300,6 +310,7 @@ static int aead_seal_once(const struct tls13_keys *src, uint64_t seq,
     int rc = tls13_keys_setup(&k);
     if (rc == 0) rc = tls13_aead_seal(&k, seq, aad, aad_n, buf, n, tag);
     tls13_keys_free(&k);
+    steer_wipe(&k, sizeof(k));
     return rc;
 }
 
@@ -313,6 +324,22 @@ static __thread char g_verify_reason[96];
 
 const char *tls13_verify_reason(void) { return g_verify_reason; }
 
+/* Секреты расписания ключей одним куском. Раньше лежали отдельными массивами на стеке handshake(), и
+ * ни один из многочисленных выходов (return на каждой ошибке разбора) их не стирал: после рукопожатия
+ * в стеке оставались handshake-секреты, мастер-секрет, секреты трафика и общий секрет ECDHE (в т.ч.
+ * ML-KEM) — читаются из дампа памяти или чужого вызова, севшего на тот же стек. Собраны в структуру,
+ * чтобы обёртка handshake() стёрла их ОДИН раз на любом выходе, а не по return в полусотне мест. */
+struct hs_secrets {
+    unsigned char early[48], derived[48], hs_secret[48];
+    unsigned char ecdhe[SC_MLKEM768_SS + 32];
+    unsigned char c_hs[48], s_hs[48];
+    unsigned char master[48], c_ap[48], s_ap[48];
+    unsigned char fkey[48], cfkey[48];
+    struct tls13_keys c_hk, s_hk;           /* ключи рукопожатия — копии с ключом и iv */
+};
+
+static int write_all_fd(int fd, const unsigned char *p, size_t n);
+
 /* Принимает уже отправленный ClientHello (для транскрипта) и общий секрет.
  *
  * host != NULL включает проверку подлинности сервера по сертификату (security=tls). При
@@ -321,7 +348,7 @@ const char *tls13_verify_reason(void) { return g_verify_reason; }
  * заголовке reality.c.
  *
  * Возвращается с готовыми ключами трафика. */
-static int handshake(struct tls13 *t, int fd,
+static int handshake_run(struct hs_secrets *sec, struct tls13 *t, int fd,
                      const unsigned char *client_hello, size_t hello_n,
                      const unsigned char *our_priv,
                      const struct tls13_auth *auth) {
@@ -463,11 +490,11 @@ static int handshake(struct tls13 *t, int fd,
     /* Расписание ключей RFC 8446 §7.1. Каждый шаг обязателен и порядок его строг:
      * early -> handshake -> master, с derive-secret между ними. */
     unsigned char zeros[48] = {0};
-    unsigned char early[48], derived[48], hs_secret[48], empty_hash[48];
+    unsigned char empty_hash[48];
     if (sc_hash(md, zeros, 0, empty_hash) != 0) return TLS13_ECRYPTO;
 
-    if (sc_hkdf_extract(md, NULL, 0, zeros, H, early) != 0) return TLS13_ECRYPTO;
-    if (expand_label(md, early, H, "derived", empty_hash, H, derived, H) != 0) return TLS13_ECRYPTO;
+    if (sc_hkdf_extract(md, NULL, 0, zeros, H, sec->early) != 0) return TLS13_ECRYPTO;
+    if (expand_label(md, sec->early, H, "derived", empty_hash, H, sec->derived, H) != 0) return TLS13_ECRYPTO;
 
     /* ECDHE-вход расписания — секрет с ЭФЕМЕРНЫМ ключом сервера из ServerHello, а не
      * тот, что посчитан в reality.c.
@@ -484,28 +511,27 @@ static int handshake(struct tls13 *t, int fd,
      * эфемерным ключом — иначе поток не был бы неотличим от настоящего HTTPS. */
     /* Секрет гибрида — mlkem_ss ‖ x25519_ss (draft-ietf-tls-ecdhe-mlkem: у X25519MLKEM768 ML-KEM
      * первый; тот же порядок у Go и BoringSSL). Обычный X25519 — просто 32 байта. */
-    unsigned char ecdhe[SC_MLKEM768_SS + 32];
     size_t ecdhe_n = 32;
     if (have_kem) {
         if (getenv("STEER_PQ_TRACE")) fprintf(stderr, "steer[pq]: сервер выбрал X25519MLKEM768\n");
-        if (sc_mlkem768_decaps(ecdhe, auth->mlkem_dk, kem_ct) != 0) return TLS13_ECRYPTO;
-        if (x25519_shared_ext(our_priv, server_pub, ecdhe + SC_MLKEM768_SS) != 0) return TLS13_ECRYPTO;
-        ecdhe_n = sizeof(ecdhe);
-    } else if (x25519_shared_ext(our_priv, server_pub, ecdhe) != 0) return TLS13_ECRYPTO;
-    if (sc_hkdf_extract(md, derived, H, ecdhe, ecdhe_n, hs_secret) != 0)
+        if (sc_mlkem768_decaps(sec->ecdhe, auth->mlkem_dk, kem_ct) != 0) return TLS13_ECRYPTO;
+        if (x25519_shared_ext(our_priv, server_pub, sec->ecdhe + SC_MLKEM768_SS) != 0) return TLS13_ECRYPTO;
+        ecdhe_n = sizeof(sec->ecdhe);
+    } else if (x25519_shared_ext(our_priv, server_pub, sec->ecdhe) != 0) return TLS13_ECRYPTO;
+    if (sc_hkdf_extract(md, sec->derived, H, sec->ecdhe, ecdhe_n, sec->hs_secret) != 0)
         return TLS13_ECRYPTO;
 
     unsigned char th[48];
     tr_hash(t, th);
-    unsigned char c_hs[48], s_hs[48];
-    if (derive_secret(md, hs_secret, "c hs traffic", th, H, c_hs) != 0) return TLS13_ECRYPTO;
-    if (derive_secret(md, hs_secret, "s hs traffic", th, H, s_hs) != 0) return TLS13_ECRYPTO;
+    if (derive_secret(md, sec->hs_secret, "c hs traffic", th, H, sec->c_hs) != 0) return TLS13_ECRYPTO;
+    if (derive_secret(md, sec->hs_secret, "s hs traffic", th, H, sec->s_hs) != 0) return TLS13_ECRYPTO;
 
-    struct tls13_keys c_hk = t->wr, s_hk = t->rd;
-    if (expand_label(md, c_hs, H, "key", NULL, 0, c_hk.key, c_hk.key_n) != 0) return TLS13_ECRYPTO;
-    if (expand_label(md, c_hs, H, "iv", NULL, 0, c_hk.iv, 12) != 0) return TLS13_ECRYPTO;
-    if (expand_label(md, s_hs, H, "key", NULL, 0, s_hk.key, s_hk.key_n) != 0) return TLS13_ECRYPTO;
-    if (expand_label(md, s_hs, H, "iv", NULL, 0, s_hk.iv, 12) != 0) return TLS13_ECRYPTO;
+    sec->c_hk = t->wr;
+    sec->s_hk = t->rd;
+    if (expand_label(md, sec->c_hs, H, "key", NULL, 0, sec->c_hk.key, sec->c_hk.key_n) != 0) return TLS13_ECRYPTO;
+    if (expand_label(md, sec->c_hs, H, "iv", NULL, 0, sec->c_hk.iv, 12) != 0) return TLS13_ECRYPTO;
+    if (expand_label(md, sec->s_hs, H, "key", NULL, 0, sec->s_hk.key, sec->s_hk.key_n) != 0) return TLS13_ECRYPTO;
+    if (expand_label(md, sec->s_hs, H, "iv", NULL, 0, sec->s_hk.iv, 12) != 0) return TLS13_ECRYPTO;
 
     /* Дальше сервер шлёт зашифрованные сообщения. Читаем до Finished, попутно добавляя
      * их в транскрипт: Certificate и CertificateVerify нам не нужны по содержанию, но
@@ -556,7 +582,7 @@ static int handshake(struct tls13 *t, int fd,
 
         unsigned char aad[5] = { 0x17, 0x03, 0x03,
                                  (unsigned char)(n >> 8), (unsigned char)n };
-        rc = aead_open_once(&s_hk, s_seq++, aad, 5, rec, n);
+        rc = aead_open_once(&sec->s_hk, s_seq++, aad, 5, rec, n);
         if (rc) return rc;
         size_t pt = n - 16;
         /* Последний непустой байт — настоящий тип записи (RFC 8446 §5.4). */
@@ -637,11 +663,11 @@ static int handshake(struct tls13 *t, int fd,
             if (msg == 0x14) {                  /* Finished */
                 /* Проверяем ДО добавления в транскрипт: сервер считал его от хеша
                  * предыдущих сообщений. */
-                unsigned char fkey[48], hash[48], want[48];
+                unsigned char hash[48], want[48];
                 tr_hash(t, hash);
-                if (expand_label(md, s_hs, H, "finished", NULL, 0, fkey, H) != 0)
+                if (expand_label(md, sec->s_hs, H, "finished", NULL, 0, sec->fkey, H) != 0)
                     return TLS13_ECRYPTO;
-                if (sc_hmac(md, fkey, H, hash, H, want) != 0) return TLS13_ECRYPTO;
+                if (sc_hmac(md, sec->fkey, H, hash, H, want) != 0) return TLS13_ECRYPTO;
                 if (mlen != H || memcmp(hsbuf + p + 4, want, H) != 0) return TLS13_EFINISHED;
                 memcpy(server_finished, want, H);
                 got_finished = 1;
@@ -703,17 +729,22 @@ static int handshake(struct tls13 *t, int fd,
     }
 
     /* Свой Finished — от транскрипта, включающего серверный. */
-    unsigned char th2[48], cfkey[48], chash[48], cfin[48];
+    unsigned char th2[48], chash[48], cfin[48];
     tr_hash(t, th2);
-    if (expand_label(md, c_hs, H, "finished", NULL, 0, cfkey, H) != 0) return TLS13_ECRYPTO;
+    if (expand_label(md, sec->c_hs, H, "finished", NULL, 0, sec->cfkey, H) != 0) return TLS13_ECRYPTO;
     memcpy(chash, th2, H);
-    if (sc_hmac(md, cfkey, H, chash, H, cfin) != 0) return TLS13_ECRYPTO;
+    if (sc_hmac(md, sec->cfkey, H, chash, H, cfin) != 0) return TLS13_ECRYPTO;
 
     /* Отправляем: ChangeCipherSpec (совместимость с middlebox, как браузер) и
-     * зашифрованный Finished. */
+     * зашифрованный Finished — ОДНИМ write: браузер шлёт их одним полётом, а два отдельных
+     * write давали два сегмента с мелким первым (6 байт), по которым наш клиент отличался от
+     * него, и короткую запись между ними никто не обрабатывал (I-543). write_all_fd дописывает
+     * то, что ядро приняло не целиком. */
     {
-        unsigned char ccs[6] = { 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
-        if (write(fd, ccs, 6) != 6) return TLS13_EIO;
+        unsigned char out[6 + 160];
+        static const unsigned char ccs[6] = { 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
+        memcpy(out, ccs, 6);
+        unsigned char *rec = out + 6;
 
         unsigned char pt[96];
         size_t pl = 0;
@@ -722,34 +753,54 @@ static int handshake(struct tls13 *t, int fd,
         memcpy(pt + pl, cfin, H); pl += H;
         pt[pl++] = 0x16;                        /* inner type */
 
-        unsigned char out[160];
         size_t total = pl + 16;
-        out[0] = 0x17; out[1] = 0x03; out[2] = 0x03;
-        out[3] = (unsigned char)(total >> 8); out[4] = (unsigned char)total;
-        memcpy(out + 5, pt, pl);
-        if (aead_seal_once(&c_hk, 0, out, 5, out + 5, pl, out + 5 + pl) != 0) return TLS13_ECRYPTO;
-        if (write(fd, out, 5 + total) != (ssize_t)(5 + total)) return TLS13_EIO;
+        rec[0] = 0x17; rec[1] = 0x03; rec[2] = 0x03;
+        rec[3] = (unsigned char)(total >> 8); rec[4] = (unsigned char)total;
+        memcpy(rec + 5, pt, pl);
+        if (aead_seal_once(&sec->c_hk, 0, rec, 5, rec + 5, pl, rec + 5 + pl) != 0) return TLS13_ECRYPTO;
+        int wrc = write_all_fd(fd, out, 6 + 5 + total);
+        if (wrc != 0) return wrc;
     }
 
     /* Ключи трафика приложения — от master secret и полного транскрипта. */
-    unsigned char master[48], c_ap[48], s_ap[48];
-    if (expand_label(md, hs_secret, H, "derived", empty_hash, H, derived, H) != 0)
+    if (expand_label(md, sec->hs_secret, H, "derived", empty_hash, H, sec->derived, H) != 0)
         return TLS13_ECRYPTO;
-    if (sc_hkdf_extract(md, derived, H, zeros, H, master) != 0) return TLS13_ECRYPTO;
+    if (sc_hkdf_extract(md, sec->derived, H, zeros, H, sec->master) != 0) return TLS13_ECRYPTO;
     tr_hash(t, th2);
-    if (derive_secret(md, master, "c ap traffic", th2, H, c_ap) != 0) return TLS13_ECRYPTO;
-    if (derive_secret(md, master, "s ap traffic", th2, H, s_ap) != 0) return TLS13_ECRYPTO;
+    if (derive_secret(md, sec->master, "c ap traffic", th2, H, sec->c_ap) != 0) return TLS13_ECRYPTO;
+    if (derive_secret(md, sec->master, "s ap traffic", th2, H, sec->s_ap) != 0) return TLS13_ECRYPTO;
 
-    if (expand_label(md, c_ap, H, "key", NULL, 0, t->wr.key, t->wr.key_n) != 0) return TLS13_ECRYPTO;
-    if (expand_label(md, c_ap, H, "iv", NULL, 0, t->wr.iv, 12) != 0) return TLS13_ECRYPTO;
-    if (expand_label(md, s_ap, H, "key", NULL, 0, t->rd.key, t->rd.key_n) != 0) return TLS13_ECRYPTO;
-    if (expand_label(md, s_ap, H, "iv", NULL, 0, t->rd.iv, 12) != 0) return TLS13_ECRYPTO;
+    if (expand_label(md, sec->c_ap, H, "key", NULL, 0, t->wr.key, t->wr.key_n) != 0) return TLS13_ECRYPTO;
+    if (expand_label(md, sec->c_ap, H, "iv", NULL, 0, t->wr.iv, 12) != 0) return TLS13_ECRYPTO;
+    if (expand_label(md, sec->s_ap, H, "key", NULL, 0, t->rd.key, t->rd.key_n) != 0) return TLS13_ECRYPTO;
+    if (expand_label(md, sec->s_ap, H, "iv", NULL, 0, t->rd.iv, 12) != 0) return TLS13_ECRYPTO;
     /* Ключи трафика больше не меняются — разворачиваем их в контексты шифров здесь, и
      * дальше поток идёт без единого setkey. */
     if (tls13_keys_setup(&t->wr) != 0 || tls13_keys_setup(&t->rd) != 0) return TLS13_ECRYPTO;
     t->wr_seq = t->rd_seq = 0;
     t->ready = 1;
     return 0;
+}
+
+
+/* Обёртка: все выходы handshake_run проходят здесь, поэтому стирание одно. На ошибке стираются и ключи
+ * трафика в t (могли быть выведены до отказа): вызывающий вызовет tls13_free, но ключи в массивах он
+ * не обнуляет за рамками нашей зачистки, а рукопожатие, не доведённое до ready, их не использует. */
+static int handshake(struct tls13 *t, int fd,
+                     const unsigned char *client_hello, size_t hello_n,
+                     const unsigned char *our_priv,
+                     const struct tls13_auth *auth) {
+    struct hs_secrets sec;
+    memset(&sec, 0, sizeof(sec));
+    int rc = handshake_run(&sec, t, fd, client_hello, hello_n, our_priv, auth);
+    steer_wipe(&sec, sizeof(sec));
+    if (rc != 0) {
+        steer_wipe(t->rd.key, sizeof(t->rd.key));
+        steer_wipe(t->wr.key, sizeof(t->wr.key));
+        steer_wipe(t->rd.iv, sizeof(t->rd.iv));
+        steer_wipe(t->wr.iv, sizeof(t->wr.iv));
+    }
+    return rc;
 }
 
 int tls13_handshake(struct tls13 *t, int fd,
@@ -808,6 +859,13 @@ int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) {
                       out + 5 + chunk + 1) != 0)
             return TLS13_ECRYPTO;
         size_t want = 5 + total, sent = 0;
+        if (t->live) {
+            /* Живая связь: сокет не ждём (outq_send), непринятое — в очередь (I-534). */
+            if (outq_send(t->fd, &t->oq, out, want) != 0) return TLS13_EIO;
+            data += chunk;
+            n -= chunk;
+            continue;
+        }
         while (sent < want) {
             ssize_t w = write(t->fd, out + sent, want - sent);
             if (w <= 0) {

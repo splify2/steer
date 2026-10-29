@@ -1,0 +1,4 @@
+{
+  "plugin.name": "Прокси",
+  "plugin.description": "Туннели trojan, shadowsocks, socks, http и vmess"
+}

@@ -28,6 +28,13 @@ struct pool_proto {
 /* Умолчания ключей выхода (docs/spec-v2.md): период проверки узла и порог молчания, секунды. */
 #define POOL_INTERVAL_S 60
 #define POOL_SILENCE_S  20
+/* pick: latency — период замера всех кандидатов (умолчание `interval` при этом выборе), как у url-test
+ * sing-box, и допуск по умолчанию, мс — как у группы latency. */
+#define POOL_LAT_INTERVAL_S 180
+#define POOL_LAT_TOLERANCE_MS 50
+enum pool_pick { POOL_PICK_ORDER = 0, POOL_PICK_LATENCY = 1 };
+/* Раздача новых соединений между активными узлами (ключ `by`): те же значения, что у by группы. */
+enum pool_by { POOL_BY_CONNECTION = 0, POOL_BY_SITE = 1, POOL_BY_SITE_CLIENT = 2 };
 
 struct pool_cfg {
     const struct pool_proto *proto;
@@ -44,12 +51,55 @@ struct pool_cfg {
     int by;             /* enum group_by */
     int interval_s;     /* период проверки каждого узла */
     int silence_s;      /* порог молчания узла на живом соединении (struct dialer), 0 — нет */
+    int pick;           /* enum pool_pick: по порядку предпочтения или самые быстрые */
+    int tolerance_ms;   /* pick: latency — допуск смены узла, мс; < 0 — умолчание */
     const char *out;    /* имя выхода: файл состояния */
+    /* Строки diag протокола для файла состояния (steer-api.md, 2.3): объекты {"id","verdict","what",
+     * "why"} через запятую, без скобок; NULL — своих нет. К ним пул добавляет свою — «активных узлов
+     * k из n», когда узлов держать нужно больше одного. */
+    const char *diag;
 };
 
 /* Поднять туннель выхода o на пуле узлов: стек с дайлером пула (stack_run), слежка за узлами, когда
  * устройство поднято, и ready модуля после неё (может быть NULL). Код выхода процесса — как у
  * stack_run. */
-int pool_run(struct output *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg);
+int pool_run(const struct tun_out *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg);
+/* Файл состояния пула для status. Помощник плагина пишет <state>/plugin/<id>/<выход>.status.json и
+ * говорит ядру событием state (steer-api.md, 2.2); не задан — <каталог состояния>/<tag>-<выход>, как в 2.0. */
+void pool_set_status_path(const char *path);
+
+/* ---- проба кандидатов наперегонки (I-535) ----------------------------------------------------------
+ *
+ * Подъём и замена узла перебирали кандидатов по одному со сроком проверки 8 с: при мёртвых первых узлах
+ * выход поднимался минутами. Теперь проверки идут параллельно, как happy eyeballs (RFC 8305): первый
+ * кандидат стартует сразу, каждый следующий — через stagger_ms, если никто ещё не ответил, и сразу, если
+ * все прежние уже отказали. Первый ответивший побеждает; остальные доходят до своего срока в фоне и
+ * на результат не влияют. Порядок предпочтения сохраняется как порядок запуска: живой первый узел
+ * ответит раньше, чем стартует третий.
+ *
+ * Параллельных проверок не больше POOL_RACE_PAR: у каждой поток, сокеты и рукопожатие, а сервер с
+ * ограничением соединений с адреса принимает десяток параллельных клиентов, и сотня разом выглядела бы
+ * как перебор. */
+#define POOL_RACE_STAGGER_MS 250
+#define POOL_RACE_PAR 8
+
+struct pool_race {
+    size_t n;
+    const int *ids;             /* кандидаты в порядке предпочтения; гонка копирует их себе */
+    /* Проверка кандидата id в потоке гонки: 0 — жив, иначе why — причина. arg и всё, на что он указывает,
+     * живут до конца процесса: проигравшие проверки заканчиваются после возврата pool_race_first. */
+    int (*probe)(void *arg, int id, char *why, size_t why_n);
+    void *arg;
+    int stagger_ms;             /* 0 — POOL_RACE_STAGGER_MS */
+    int max_par;                /* 0 — POOL_RACE_PAR */
+    /* Необязательно. Стартовала проба k-я из n (по счёту запуска): подъём пишет «проверяется узел k из n». */
+    void (*on_start)(void *arg, int id, size_t k, size_t n);
+    /* Необязательно: кандидат отказал (зовётся в потоке гонки, строка — его). */
+    void (*on_fail)(void *arg, int id, const char *why);
+};
+
+/* Номер первого ответившего кандидата (значение из ids) и его why; -1 — не ответил ни один (why — причина
+ * последнего отказа). */
+int pool_race_first(const struct pool_race *r, char *why, size_t why_n);
 
 #endif

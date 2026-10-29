@@ -65,10 +65,11 @@ int evline_enabled(void) {
     return g_fd >= 0;
 }
 
-/* С запасом ниже PIPE_BUF (POSIX гарантирует его минимум 512, на Linux 4096): событие с
- * контрактными двумя-тремя полями сюда влезает многократно, а если когда-нибудь не влезло —
- * лучше потерять его целиком, чем отправить обрезанный и невалидный JSON в трубу. */
-#define EVLINE_WRITE_MAX 480
+/* Предел — PIPE_BUF (evline.h, EVLINE_LINE_MAX): до него write в трубу атомарен, а событие
+ * длиннее может пройти частью и оставить в трубе обрубок невалидного JSON. Прежние 480 байт
+ * резали список активных узлов пула уже на сотне узлов — теперь событие, не влезшее и в
+ * четыре килобайта, теряется целиком, но с длиной в журнале (stderr помощника). */
+#define EVLINE_WRITE_MAX EVLINE_LINE_MAX
 
 void evline_emit(const char *ev, ...) {
     evline_ensure_open();
@@ -114,6 +115,9 @@ void evline_emit(const char *ev, ...) {
      * модуль), как у моста tgws и резолвера, и запись возвращает EPIPE. Помощник без демона не
      * нужен (src/daemon/supd.c, «Помощники демона не переживают») — выход тем же SIGTERM, что по
      * PDEATHSIG. Только с меткой демона: у ручного запуска с чужой трубой свои правила. */
+    if (mem && n > EVLINE_WRITE_MAX)
+        fprintf(stderr, "steer[warn] событие %s не влезло в трубу: %zu байт при пределе %d — потеряно\n",
+                ev, n, EVLINE_WRITE_MAX);
     if (mem && n > 0 && n <= EVLINE_WRITE_MAX) {
         ssize_t w = write(g_fd, mem, n);
         if (w < 0 && errno == EPIPE && getenv("STEER_SUPD")) raise(SIGTERM);
@@ -185,57 +189,88 @@ static const char *skip_ws(const char *p) {
     return p;
 }
 
+void evline_free(struct evline *e) {
+    for (int i = 0; i < e->n; i++) {
+        free(e->f[i].key);
+        if (e->f[i].type == EVLINE_STR) free(e->f[i].v.s);
+    }
+    free(e->f);
+    free(e->ev);
+    memset(e, 0, sizeof(*e));
+}
+
+/* Поле в конец разбора: key и s уходят в разбор (при отказе освобождаются здесь). */
+static int add_field(struct evline *out, char *key, enum evline_type type, char *s, long i) {
+    if (out->n == out->cap) {
+        int nc = out->cap ? out->cap * 2 : 8;
+        struct evline_field *nf = realloc(out->f, (size_t)nc * sizeof(*nf));
+        if (!nf) { free(key); free(s); return -1; }
+        out->f = nf;
+        out->cap = nc;
+    }
+    struct evline_field *fl = &out->f[out->n++];
+    fl->key = key;
+    fl->type = type;
+    if (type == EVLINE_STR) fl->v.s = s; else fl->v.i = i;
+    return 0;
+}
+
 int evline_parse(const char *line, struct evline *out) {
     memset(out, 0, sizeof(*out));
     const char *p = skip_ws(line);
     if (*p != '{') return -1;
     p++;
+    /* Строка, ключ и значение после разбора экранирования не длиннее самой строки. */
+    size_t cap = strlen(p) + 1;
+    char *tmp = malloc(cap);
+    if (!tmp) return -1;
     int have_ev = 0;
     for (;;) {
         p = skip_ws(p);
         if (*p == '}') { p++; break; }
-        char key[EVLINE_KEYLEN];
-        const char *q = parse_jstr(p, key, sizeof(key));
-        if (!q) return -1;
+        const char *q = parse_jstr(p, tmp, cap);
+        if (!q) goto bad;
+        char *key = strdup(tmp);
+        if (!key) goto bad;
         p = skip_ws(q);
-        if (*p != ':') return -1;
+        if (*p != ':') { free(key); goto bad; }
         p = skip_ws(p + 1);
 
         if (!strcmp(key, "ev")) {
-            const char *r = parse_jstr(p, out->ev, sizeof(out->ev));
-            if (!r) return -1;
+            free(key);
+            const char *r = parse_jstr(p, tmp, cap);
+            if (!r) goto bad;
+            free(out->ev);
+            if (!(out->ev = strdup(tmp))) goto bad;
             have_ev = 1;
             p = r;
         } else if (*p == '"') {
-            char val[EVLINE_VALLEN];
-            const char *r = parse_jstr(p, val, sizeof(val));
-            if (!r) return -1;
+            const char *r = parse_jstr(p, tmp, cap);
+            char *val = r ? strdup(tmp) : NULL;
+            if (!val) { free(key); goto bad; }
             p = r;
-            if (out->n < EVLINE_MAXFIELDS) {
-                struct evline_field *fl = &out->f[out->n++];
-                snprintf(fl->key, sizeof(fl->key), "%s", key);
-                fl->type = EVLINE_STR;
-                snprintf(fl->v.s, sizeof(fl->v.s), "%s", val);
-            }
+            if (add_field(out, key, EVLINE_STR, val, 0) != 0) goto bad;
         } else {
             char *end = NULL;
             errno = 0;
             long iv = strtol(p, &end, 10);
-            if (end == p) return -1;
-            if (out->n < EVLINE_MAXFIELDS) {
-                struct evline_field *fl = &out->f[out->n++];
-                snprintf(fl->key, sizeof(fl->key), "%s", key);
-                fl->type = EVLINE_INT;
-                fl->v.i = iv;
-            }
+            if (end == p) { free(key); goto bad; }
+            if (add_field(out, key, EVLINE_INT, NULL, iv) != 0) goto bad;
             p = end;
         }
         p = skip_ws(p);
         if (*p == ',') { p++; continue; }
         if (*p == '}') { p++; break; }
-        return -1;
+        goto bad;
     }
-    return have_ev ? 0 : -1;
+    free(tmp);
+    if (have_ev) return 0;
+    evline_free(out);
+    return -1;
+bad:
+    free(tmp);
+    evline_free(out);
+    return -1;
 }
 
 const char *evline_str(const struct evline *e, const char *key) {

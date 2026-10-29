@@ -22,6 +22,12 @@ check() {
     fi
 }
 
+# Мост Telegram (kind: tgws) — вид плагина tgws (plugins/tgws): стенд идёт с каталогом плагинов дерева
+# (tests/plugroot.sh — манифесты и программа хуков build/pkhooks). Сам вид проверяет tests/tgwsmatch.sh;
+# здесь tgws — просто выход без устройства.
+sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" || { echo "gen: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
+
 printf '203.0.113.0/24\n198.51.100.5\n' > "$tmp/a.lst"
 
 printf '198.51.100.5\n' > "$tmp/b.lst"
@@ -98,8 +104,12 @@ table inet steer {
         meta mark and 0x0ff00000 == 0x00000000 return
         meta mark and 0x0ff00000 == 0x00100000 oifname != "wg0" counter drop comment "steer-guard:vpn"
     }
+    chain postrouting_nat4 {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "wg0" meta nfproto ipv4 counter masquerade comment "steer-nat4:vpn"
+    }
     chain prerouting_dns {
-        type nat hook prerouting priority dstnat; policy accept;
+        type nat hook prerouting priority dstnat - 2; policy accept;
         ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300
         meta nfproto ipv6 iifname "br-lan" udp dport 53 counter redirect to :5300
         ip saddr 192.168.1.0/24 tcp dport 53 counter redirect to :5300
@@ -327,6 +337,13 @@ check "у разворота fake-IP есть счётчик" "1" \
     "$(printf '%s\n' "$dout" | grep -c 'counter dnat ip to ip daddr map @fakeip')"
 check "DNS redirect covers IPv6 too" "1" \
     "$(printf '%s\n' "$dout" | grep -c 'nfproto ipv6 iifname "br-lan" udp dport 53')"
+# Пакет к пулу fake-IP не выходит в mesh-VPN и в устройства клиентов: Tailscale уводил такой пакет в
+# tailscale0, пир возвращал его, и очередь установщиков стека туннеля забивалась кругом (I-558).
+check "пул fake-IP не уходит в tailscale и в устройство клиентов" "1" \
+    "$(printf '%s\n' "$dout" | grep -c 'ip daddr 198.18.0.0/15 oifname { "tailscale\*", "zt\*", "br-lan" } counter drop')"
+check "… у охранной цепочки хук postrouting" "1" \
+    "$(printf '%s\n' "$dout" | grep -A1 'chain postrouting_fakeguard' | grep -c 'hook postrouting')"
+check "без доменных каналов охраны пула нет" "0" "$(printf '%s\n' "$out" | grep -c 'fakeguard')"
 # No domain channel means none of that plumbing should exist at all.
 check "no fake-IP plumbing without domain channels" "0" \
     "$(printf '%s\n' "$out" | grep -c 'fakeip')"
@@ -629,8 +646,7 @@ tdout="$("$BIN" apply --dry-run --spec "$tmp/threedom.json" --state-dir "$tmp/st
 check "fakeip, realip и свои клиенты — три разных набора" "3" \
     "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*\) .*/\1/p' | grep -v '6$' | sort -u | wc -l)"
 # Половина IPv6 в наборе правил — у fakeip и realip клиентов по умолчанию, но не у клиента из
-# одного адреса IPv4: его IPv6 правилом не узнать. (Спека здесь v1, и на AAAA резолвер отвечает
-# пустым ответом у всех трёх — sp->dns.names_v4; набор правил от этого не меняется.)
+# одного адреса IPv4: его IPv6 правилом не узнать.
 check "  пары IPv6 — у fakeip и realip, у клиента из адреса IPv4 — нет" "vpn_dom6 vpn_dom_c0r6" \
     "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*6\) .*/\1/p' | sort | paste -sd' ')"
 
@@ -659,7 +675,7 @@ check "и это правило безусловное — набор оно н�
 #
 # Бит ZAPRET_SKIP_MARK (0x40000000) — чужой: это тот бит, по которому цепочка системного
 # zapret говорит «этот пакет не мой» (её условие входа — `meta mark & 0x40000000 == 0`).
-# До запуска 65 мы ставили его ТОЛЬКО выходу kind=zapret, и трафик, уходящий в туннель,
+# Когда-то мы ставили его только своему обработчику обхода, и трафик, уходящий в туннель,
 # по-прежнему проходил через общий обход.
 #
 # Почему это вредно, а не просто бесполезно: пакет, уходящий в туннель, DPI видит снаружи
@@ -669,9 +685,8 @@ check "и это правило безусловное — набор оно н�
 # kind=direct — единственное исключение, и оно же смысл прямого канала: там общий обход
 # обязан работать.
 #
-# Выходов в фикстуре ТРИ, и мост Telegram здесь не для полноты: у него причина та же, что у
-# kind=zapret (его трафик разбирает наш собственный обработчик, и второй разбиратель поверх —
-# это два обхода на один пакет), но вид выхода другой, и забытым `case` он оказался бы первым.
+# Выходов в фикстуре ТРИ, и мост Telegram здесь не для полноты: у него вид выхода без
+# устройства (вид плагина tgws), и забытым `case` он оказался бы первым.
 # kind=vless и kind=xsteer базовая сборка не принимает вовсе, поэтому их доля правила
 # проверяется по самой функции — см. out_skips_zapret в tests/specmatch.c.
 printf '203.0.113.0/24\n' > "$tmp/p.lst"
@@ -758,164 +773,40 @@ if [ -f "$init" ]; then
         "$(grep -cE '^[^#]*(steer failover|steer dnsd|procd_open_instance (failover|dnsd))' "$init")"
 fi
 
-# ---- kind=zapret: очередь вместо маршрута ------------------------------------
-#
-# У этого вида выхода нет ни устройства, ни таблицы: пакет уходит обычным маршрутом, а
-# выход меняет только то, что с ним по дороге сделает nfqws. Поэтому и проверяется здесь
-# не маршрутизация, а ровно три вещи, каждая из которых уже была сломана в разработке:
-# метка (без неё правило канала встаёт, а в очередь не попадает ни один пакет), приоритет
-# цепочки (mangle идёт ДО трансляции адресов, а обходу нужен пакет в том виде, в каком он
-# уйдёт с роутера) и `bypass` как выражение on_fail.
+# ---- kind=zapret убран из ядра: отказ с названием замены ------------------------------------
+# Обход DPI теперь даёт модуль recheck; в спеке v1 и v2 старый вид отвергается ясным сообщением,
+# а не «неизвестным kind».
 cat > "$tmp/zap.json" <<EOF
 { "schema": 1, "lan_devices": ["br-lan"],
-  "outputs": { "direct": { "kind": "direct" },
-               "yt":  { "kind": "zapret" },
-               "dis": { "kind": "zapret", "on_fail": "direct" } },
-  "channels": [ { "name": "ю", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "yt" },
-                { "name": "д", "match": { "prefixes_file": "$tmp/b.lst" }, "out": "dis" } ] }
+  "outputs": { "direct": { "kind": "direct" }, "yt": { "kind": "zapret" } },
+  "channels": [ { "name": "ю", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "yt" } ] }
 EOF
 zout="$("$BIN" apply --dry-run --spec "$tmp/zap.json" --state-dir "$tmp/state-z" 2>&1)"
-check "zapret: спека компилируется" "0" "$?"
-check "цепочка очередей появилась" "1" "$(printf '%s\n' "$zout" | grep -c 'chain zapret_queue {')"
-# Приоритет — post-NAT. Сначала здесь стояло `mangle + 10`, то есть ДО трансляции адресов:
-# nfqws правил бы ClientHello с адресом источника из локальной сети, а в сеть уходил бы
-# другой пакет. У самого zapret цепочка стоит на srcnat + 1 ровно поэтому.
-check "очередь висит после трансляции адресов" "1" \
-    "$(printf '%s\n' "$zout" | grep -c 'hook postrouting priority srcnat + 2')"
-# Свои пакеты обработчика в очередь не возвращаются: у них поднят 0x20000000. Без этого
-# правила первое же соединение даёт круг «свой пакет снова в свою очередь».
-check "первым правилом выход по своей метке" "1" \
-    "$(printf '%s\n' "$zout" | grep -c 'meta mark and 0x20000000 == 0x20000000 counter return')"
-# on_fail=drop (умолчание) — очередь БЕЗ bypass: нет процесса, нет трафика. on_fail=direct —
-# с bypass: нет процесса, трафик идёт как обычный. Выражает это само ядро, без сторожа.
-check "on_fail=drop даёт очередь без bypass" "1" \
-    "$(printf '%s\n' "$zout" | grep -c 'queue num 8300 comment "steer:zapret:yt"')"
-check "on_fail=direct даёт bypass" "1" \
-    "$(printf '%s\n' "$zout" | grep -c 'queue num 8301 bypass comment "steer:zapret:dis"')"
-# Предел пакетов: без него в userspace уезжает весь поток, а не первые пакеты соединения.
-check "в очередь идут только первые пакеты" "2" \
-    "$(printf '%s\n' "$zout" | grep -c 'ct original packets 1-9')"
-# Выход узнаётся по метке СОЕДИНЕНИЯ: метку пакета между маршрутизацией и postrouting
-# переписывает Tailscale (`mark and 0xff00ffff xor 0x40000` на всём, что пришло с tailscale0),
-# и по ней первые четыре выхода до очереди не доезжали — с телефона через Tailscale обход не
-# работал, из LAN работал. ct mark стоит с prerouting и чужими не трогается.
-check "выход узнаётся по ct mark, а не по метке пакета" "2" \
-    "$(printf '%s\n' "$zout" | grep -c 'ct mark and 0x0ff00000 == 0x00[12]00000 ct original packets 1-9 meta mark set')"
-check "по метке пакета очередь больше не ищется" "0" \
-    "$(printf '%s\n' "$zout" | grep -c 'meta mark and 0x0ff00000 == 0x00[12]00000 ct original')"
-# Метка канала несёт ЧУЖОЙ бит 0x40000000 — им системный обход узнаёт «этот трафик не мой».
-check "трафик выхода помечен как чужой для общего обхода" "1" \
-    "$(printf '%s\n' "$zout" | grep -c 'or 0x40100000')"
-# …но перед НАШЕЙ очередью этот бит снимается: nfqws считает своим порождённым любой пакет с
-# общим битом со своим fwmark (0x60000000) и не обрабатывает его. Пока бит доезжал до очереди,
-# выход не трогал ни одного пакета (снято с роутера владельца: YouTube 3 из 37 → 33 из 37).
-check "перед очередью чужой бит снимается" "2" \
-    "$(printf '%s\n' "$zout" | grep -c 'meta mark set mark and 0xbfffffff counter queue num')"
-# Ответные пакеты тоже в очередь, как у zapret: по ним nfqws узнаёт TTL для autottl.
-check "ответные пакеты соединения идут в очередь по ct mark" "2" \
-    "$(printf '%s\n' "$zout" | grep -c 'ct reply packets 1-3 counter queue num 830[01] bypass comment "steer:zapret-reply:')"
-check "цепочка ответов висит на prerouting" "1" \
-    "$(printf '%s\n' "$zout" | grep -A1 'chain zapret_queue_in' | grep -c 'hook prerouting priority mangle;')"
-# Порождённые обработчиком пакеты снимаются с учёта conntrack НАШЕЙ цепочкой, а не цепочкой
-# службы zapret: та исчезает вместе со службой, а выключить общий обход и оставить его одному
-# выходу — ровно то, ради чего выход и заводят. Снято с роутера владельца: общий обход
-# выключен, обработчик жив, очередь считает — YouTube не открывается (INVALID у fw4).
-check "своя predefrag до conntrack" "1" \
-    "$(printf '%s\n' "$zout" | grep -c 'chain zapret_predefrag {')"
-check "висит на output до conntrack" "1" \
-    "$(printf '%s\n' "$zout" | grep -c 'hook output priority -401')"
-check "вход по чужому биту порождённых пакетов" "1" \
-    "$(printf '%s\n' "$zout" | grep -c 'meta mark and 0x40000000 != 0x00000000 jump zapret_predefrag_nfqws')"
-# ТРИ правила, а не четыре: правила zapret про «postnat traffic» здесь быть не должно.
-#
-# У zapret бит 0x20000000 значит «пакет взят из цепочки ПОСЛЕ трансляции адресов»; у нас тот же
-# бит значит «пакет нашего обработчика». Правило мы взяли вместе с чужим смыслом бита — и стали
-# снимать с учёта ВСЕ пакеты нашего nfqws. Снятый учёт означает, что к ним не применяется
-# трансляция адресов, а копии nfqws строит из исходного кортежа соединения: они уходят в
-# интернет с частным адресом клиента, сервер их не узнаёт, канал виснет до таймаута.
-#
-# Проверено на стенде в QEMU с клиентом за LAN: с этим правилом — таймаут 5 проб из 5, без него
-# — HTTP 200 за 19-40 мс, 4 из 4. Тот же nfqws и та же стратегия на весь роутер службой zapret
-# работают в обоих случаях, то есть дело именно в правиле.
-check "три правила notrack: фрагменты и данные без ACK, но не «postnat»" "3" \
-    "$(printf '%s\n' "$zout" | grep -c ' notrack comment')"
-# Таблицы маршрутизации у такого выхода нет: маршрут не меняется вовсе.
-check "маршрутной таблицы у выхода zapret нет" "0" \
-    "$(printf '%s\n' "$zout" | grep -c 'ip route')"
-# Пока в спеке нет ни одного такого выхода, цепочки быть не должно: пустая базовая цепочка
-# в postrouting — это лишний проход по правилам на КАЖДОМ пакете роутера.
-check "без выходов zapret цепочки нет" "0" "$(printf '%s\n' "$out" | grep -c 'zapret_queue')"
-check "и predefrag без них тоже нет" "0" "$(printf '%s\n' "$out" | grep -c 'zapret_predefrag')"
+check "kind zapret в v1 отвергается" "2" "$?"
+check "и названа замена" "1" "$(printf '%s\n' "$zout" | grep -c 'recheck.*kind: direct')"
+cat > "$tmp/zap2.yaml" <<EOF
+version: 2
+outputs:
+  yt: { kind: zapret }
+EOF
+zout="$("$BIN" apply --dry-run --spec "$tmp/zap2.yaml" --state-dir "$tmp/state-z" 2>&1)"
+check "kind zapret в v2 отвергается" "2" "$?"
+check "с номером строки и колонки и заменой" "1" "$(printf '%s\n' "$zout" | grep -c '3:.*recheck.*kind: direct')"
 
-# ---- перехват Telegram (kind=tgws) --------------------------------------------------------
-# Правило стоит в nat prerouting, то есть ловит трафик КЛИЕНТОВ. Приоритет и хук проверяются
-# здесь, а работу целиком — tests/run-tgws.sh на двух сетевых пространствах: на одном
-# пространстве соединение идёт через output и правило не срабатывает вовсе.
-cat > "$tmp/tgws.json" <<EOF
-{ "schema": 1, "lan_devices": ["br-lan"],
-  "outputs": { "direct": { "kind": "direct" }, "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
-  "channels": [ { "name": "тг", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "tg" } ] }
-EOF
-tout="$("$BIN" apply --dry-run --spec "$tmp/tgws.json" --state-dir "$tmp/state-t" 2>&1)"
-check "tgws: спека компилируется" "0" "$?"
-check "цепочка перехвата появилась" "1" \
-    "$(printf '%s\n' "$tout" | grep -c 'chain tgws_redirect')"
-# dstnat + 1, а не dstnat: сначала наша же цепочка fakeip обязана вернуть настоящий адрес,
-# и только потом решается, наш ли он. И не mangle: метку канала ставят раньше, на mangle + 1.
-check "перехват идёт после трансляции адресов" "1" \
-    "$(printf '%s\n' "$tout" | grep -c 'hook prerouting priority dstnat + 1')"
-check "заворачивает по метке выхода на его порт" "1" \
-    "$(printf '%s\n' "$tout" | grep -c 'meta mark and 0x0ff00000 == 0x00100000 tcp dport { 443, 80, 5222 } counter redirect to :8480')"
-# Таблицы маршрутизации у такого выхода нет — маршрут не меняется, меняется адресат.
-check "маршрутной таблицы у выхода tgws нет" "0" \
-    "$(printf '%s\n' "$tout" | grep -c 'ip route')"
-check "без выходов tgws цепочки нет" "0" "$(printf '%s\n' "$out" | grep -c 'tgws_redirect')"
-# Порт печатает движок: второй расчёт того же в init-скрипте разошёлся бы молча.
-ti="$("$BIN" tgws-instances --spec "$tmp/tgws.json" --state-dir "$tmp/state-t" 2>&1)"
-check "tgws-instances: код 0, когда поднимать есть что" "0" "$?"
-check "имя и порт по строке на выход" "tg	8480" "$ti"
-"$BIN" tgws-instances --spec "$tmp/zap.json" --state-dir "$tmp/state-z" >/dev/null 2>&1
-check "без таких выходов код 1" "1" "$?"
-# Устройство у такого выхода — почти наверняка описка, и молча принять её значит обещать
-# маршрутизацию, которой не будет.
-cat > "$tmp/tgws-bad.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk", "device": "eth0" } }, "channels": [] }
-EOF
-"$BIN" apply --dry-run --spec "$tmp/tgws-bad.json" --state-dir "$tmp/state-tb" >/dev/null 2>&1
-check "устройство у tgws отвергается" "2" "$?"
-# on_fail у него не выражается ничем: правило перехвата стоит в ядре всегда.
-cat > "$tmp/tgws-of.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk", "on_fail": "direct" } }, "channels": [] }
-EOF
-"$BIN" apply --dry-run --spec "$tmp/tgws-of.json" --state-dir "$tmp/state-to" >/dev/null 2>&1
-check "on_fail=direct у tgws отвергается" "2" "$?"
-# Домена нет — выход отвергается: прямые точки Telegram отвечают только TLS 1.2 и стоят на
-# телеграмовских адресах, то есть на тех самых, которые режут. Подставить их молча значило бы
-# завести выход, который выглядит настроенным и не работает никогда.
-cat > "$tmp/tgws-nd.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws" } }, "channels": [] }
-EOF
-"$BIN" apply --dry-run --spec "$tmp/tgws-nd.json" --state-dir "$tmp/state-tn" >/dev/null 2>&1
-check "tgws без domain отвергается" "2" "$?"
-# И наоборот: domain у чужого вида выхода — поле, принятое молча там, где оно ничего не значит.
-cat > "$tmp/tgws-alien.json" <<EOF
-{ "schema": 1, "outputs": { "d": { "kind": "direct", "domain": "ex.co.uk" } }, "channels": [] }
-EOF
-"$BIN" apply --dry-run --spec "$tmp/tgws-alien.json" --state-dir "$tmp/state-ta" >/dev/null 2>&1
-check "domain у чужого вида выхода отвергается" "2" "$?"
+# ---- перехват Telegram (kind: tgws) — tests/tgwsmatch.sh ---------------------------------------
 
 # ---- `any` без списков: согласие требуется независимо от вида выхода -----------------------
 #
 # Канал `any` без списков уводит В ВЫХОД ВЕСЬ трафик клиентов, и движок этого не разрешает без
 # явного `allow_all`. Но проверка стояла ЗА `continue` по «у выхода нет устройства» — и потому
-# не срабатывала там, где последствие самое тяжёлое: у kind=zapret устройства нет по
-# определению, значит весь трафик локальной сети уходил в nfqws, а при on_fail=drop умирал
+# не срабатывала там, где последствие самое тяжёлое: у kind=tgws устройства нет по
+# определению, значит весь трафик локальной сети уходил в мост, а при on_fail=drop умирал
 # целиком. Воспроизведено на стенде в QEMU: спека принималась, правило выходило без
 # `ip daddr @набор`, счётчик рос на любом трафике клиента.
 #
 # Проверяются все три случая: запрет там, где его не было, и оба законных обхода запрета.
 cat > "$tmp/any-zap.json" <<EOF
-{ "schema": 1, "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"zapret"} },
+{ "schema": 1, "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"tgws","domain":"ex.co.uk"} },
   "channels": [ { "name": "c", "out": "zt", "match": { "any": true } } ] }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/any-zap.json" --state-dir "$tmp/state-any" >/dev/null 2>&1
@@ -925,7 +816,7 @@ check "и сказано, что делать" "1" \
        grep -c 'allow_all')"
 # Осознанное «весь трафик» — законно и проходит.
 cat > "$tmp/any-ok.json" <<EOF
-{ "schema": 1, "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"zapret"} },
+{ "schema": 1, "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"tgws","domain":"ex.co.uk"} },
   "channels": [ { "name": "c", "out": "zt", "match": { "any": true, "allow_all": true } } ] }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/any-ok.json" --state-dir "$tmp/state-any" >/dev/null 2>&1
@@ -934,7 +825,7 @@ check "any с allow_all проходит" "0" "$?"
 # Это и есть «весь трафик телефона в туннель» и «этот ноутбук не маршрутизируем».
 cat > "$tmp/any-dev.json" <<EOF
 { "schema": 2, "lan_devices": ["br-lan"],
-  "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"zapret"} },
+  "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"tgws","domain":"ex.co.uk"} },
   "channels": [ { "name": "d", "out": "zt", "scope": "device", "from": ["192.168.1.50"],
                   "match": { "any": true } } ] }
 EOF
@@ -978,126 +869,15 @@ check "смена файла списка меняет подпись" "no" \
 check "команда объявлена с --state-dir" "2" \
     "$("$BIN" help dnsd-sig 2>&1 | grep -c 'state-dir')"
 
-# Что поднимать — спрашивают у движка, вместе с номером очереди и файлом ключей.
-#
-# ВЫХОД БЕЗ ФАЙЛА СТРАТЕГИИ НЕ НАЗЫВАЕТСЯ ВОВСЕ. Так выглядит только что заведённый выход:
-# интерфейс создаёт его пустым, стратегию выбирают следующим действием. Пока движок называл
-# и такой выход, обёртка steer-nfqws выходила с кодом 2 сразу, а procd поднимал её снова
-# через свои пять секунд — бесконечно. Замерено на живом роутере: три записи в daemon.err за
-# пятнадцать секунд, то есть около семнадцати тысяч строк в сутки на недокрученный выход.
-#
-# Спека здесь своя, с `opts_file` В ПЕСОЧНИЦЕ: у zap.json путь выводится из имени и указывает
-# в /etc/steer/zapret, а стенд не вправе ни читать, ни создавать файлы настоящей системы.
-cat > "$tmp/zap-opts.json" <<EOF
-{ "schema": 1, "lan_devices": ["br-lan"],
-  "outputs": { "direct": { "kind": "direct" },
-               "yt":  { "kind": "zapret", "opts_file": "$tmp/yt.opts" },
-               "dis": { "kind": "zapret", "opts_file": "$tmp/dis.opts", "on_fail": "direct" } },
-  "channels": [ { "name": "ю", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "yt" },
-                { "name": "д", "match": { "prefixes_file": "$tmp/b.lst" }, "out": "dis" } ] }
-EOF
-rm -f "$tmp/yt.opts" "$tmp/dis.opts"
-zi="$("$BIN" zapret-instances --spec "$tmp/zap-opts.json" --state-dir "$tmp/state-z" 2>/dev/null)"
-check "без файла стратегии поднимать нечего — код 1" "1" "$?"
-check "и ни одной строки" "0" "$(printf '%s' "$zi" | grep -c .)"
-# ПРИЧИНА ГОВОРИТСЯ, но в stderr: init-скрипт читает stdout, значит строка попадёт в журнал
-# один раз за запуск, а не раз в пять секунд, как это делал перезапуск обёртки.
-check "причина названа в stderr, а не в stdout" "2" \
-    "$("$BIN" zapret-instances --spec "$tmp/zap-opts.json" --state-dir "$tmp/state-z" 2>&1 >/dev/null |
-       grep -c 'файла стратегии')"
-# Файл появился у одного из двух — называется ровно он. Это и есть состояние «стратегию
-# выбрали одному выходу, второй ещё пустой».
-printf -- '--dpi-desync=fake\n' > "$tmp/yt.opts"
-zi="$("$BIN" zapret-instances --spec "$tmp/zap-opts.json" --state-dir "$tmp/state-z" 2>/dev/null)"
-check "со стратегией у одного — код 0" "0" "$?"
-check "и ровно одна строка" "1" "$(printf '%s\n' "$zi" | grep -c .)"
-check "номер очереди печатает движок" "1" \
-    "$(printf '%s\n' "$zi" | grep -c "^yt	8300	$tmp/yt.opts$")"
-# Оба с файлами — обе строки.
-printf -- '--dpi-desync=fake\n' > "$tmp/dis.opts"
-zi="$("$BIN" zapret-instances --spec "$tmp/zap-opts.json" --state-dir "$tmp/state-z" 2>/dev/null)"
-check "zapret-instances: код 0, когда поднимать есть что" "0" "$?"
-check "по строке на выход" "2" "$(printf '%s\n' "$zi" | grep -c .)"
-"$BIN" zapret-instances --spec "$tmp/spec.json" --state-dir "$tmp/state-z" >/dev/null 2>&1
-check "zapret-instances: код 1, когда таких выходов нет" "1" "$?"
-
 if [ -f "$init" ]; then
-    # Номер очереди init-скрипт БЕРЁТ У ДВИЖКА, а не считает сам: второй источник правды о
-    # том, какой процесс какой трафик разбирает, разошёлся бы молча — процесс встал бы на
-    # очередь, в которую ядро ничего не отдаёт.
-    #
-    # С шага 6 обработчики поднимает демон (src/kinds/zapret.c, zapret_helper): номер очереди он
-    # берёт тем же out_zapret_queue, что и zapret-instances, а init-скрипт их не поднимает вовсе.
-    check "обработчики zapret поднимает демон, а не init-скрипт" "0 1" \
-        "$(grep -c '^[^#]*zapret-instances\|^[^#]*procd_open_instance "zapret_' "$init") $(grep -c '^static int zapret_helper' src/kinds/zapret.c)"
-    check "init-скрипт не считает номер очереди сам" "0" \
-        "$(grep -c '^[^#]*8300' "$init")"
-    # Описание экземпляра НЕЛЬЗЯ собирать в подоболочке: procd_open_instance накапливает его
-    # в переменных оболочки, и из подоболочки оно не возвращается никуда — ни одного
-    # поднятого обработчика при полностью исправном на вид скрипте.
-    check "экземпляры не открываются в конвейере" "0" \
-        "$(grep -c '|[[:space:]]*while.*read.*zname' "$init")"
-    # Ключи стратегии читает ОБЁРТКА, а не init-скрипт: описание экземпляра procd
-    # фиксируется в момент start_service, поэтому собранная в скрипте командная строка
-    # означала бы, что смена стратегии требует перезапуска всего движка вместе с туннелями.
-    check "обработчик поднимается обёрткой" "1" \
-        "$(grep -c '"steer-nfqws"' src/kinds/zapret.c)"
-    check "init-скрипт не собирает ключи сам" "0" \
-        "$(grep -c 'dpi-desync-fwmark' "$init")"
-    # И обратная сторона того же: должна быть команда, которая перечитывает стратегии, НЕ
-    # трогая туннели. Без неё единственным способом применить другую стратегию остаётся
-    # restart, а он роняет клиенты vless — то есть каждая проба стоит секунд без интернета.
+    # reload_zapret остался для splify2, который его зовёт: теперь это «демон, перечитай спеку».
     check "есть reload_zapret" "1" "$(grep -c '^reload_zapret()' "$init")"
     check "reload_zapret объявлен в EXTRA_COMMANDS" "1" \
         "$(grep -c '^EXTRA_COMMANDS=.*reload_zapret' "$init")"
-    # Сигнал уходит ИМЕНОВАННЫМ экземплярам обхода, а не '*': звёздочка уже однажды убивала
+    # Сигнал уходит ИМЕНОВАННЫМ экземплярам, а не '*': звёздочка уже однажды убивала
     # туннели на каждое «Сохранить и применить» (см. reload_dnsd там же).
     check "reload_zapret не сигналит всем подряд" "0" \
         "$(sed -n '/^reload_zapret()/,/^}/p' "$init" | grep -c "procd_send_signal steer '\*'")"
-fi
-
-# Обёртка обработчика: она и есть то место, где файл стратегии превращается в аргументы.
-wrap=files/usr/sbin/steer-nfqws
-check "обёртка обработчика найдена" "1" "$([ -f "$wrap" ] && echo 1 || echo 0)"
-if [ -f "$wrap" ]; then
-    check "обёртка ставит метку своих пакетов" "1" \
-        "$(grep -c 'dpi-desync-fwmark=0x60000000' "$wrap")"
-    # Комментарии в файл ключей не едут: первая строка там — имя стратегии (так её отмечает
-    # и Zapret Manager), и уехав в командную строку, она стала бы неизвестным ключом, на
-    # котором nfqws отказывает целиком.
-    check "обёртка пропускает строки-комментарии" "1" \
-        "$(grep -cF 'case "$line" in' "$wrap")"
-    check "обёртка отказывает без файла ключей" "1" \
-        "$(grep -c 'файла стратегии' "$wrap")"
-    # Обработчики — ДО apply: при on_fail=drop правило очереди стоит без bypass, то есть
-    # пока процесса нет, помеченный трафик отбрасывается ядром. С шага 6 порядок держит демон:
-    # супервизор заводится раньше применения при старте (--apply).
-    check "обработчики поднимаются раньше apply при старте" "1" \
-        "$([ "$(grep -n 'if (!supd_start(&S.d' src/daemon/ctl.c | cut -d: -f1)" \
-             -lt "$(grep -n 'boot_apply(&S)' src/daemon/ctl.c | cut -d: -f1)" ] \
-           && echo 1 || echo 0)"
-
-    # А теперь ПОВЕДЕНИЕ, а не наличие строк: обёртка запускается с подставным nfqws (шов
-    # NFQWS у неё для этого и есть) и предъявляет то, что дошло до командной строки.
-    #
-    # Файл без завершающего перевода строки — не выдумка стенда, а обычный след правки
-    # руками: файл ключей объявлен «просто файлом», и его правят по ssh (splify2#17 — то же
-    # про свои списки). `read` на последней строке без перевода возвращает ненулевой код,
-    # УЖЕ ЗАПОЛНИВ переменную, поэтому цикл `while read` теряет её молча — и стратегия
-    # работает без последнего ключа, а именно в нём обычно и стоит способ обхода. Этот
-    # капкан в проекте уже срабатывал дважды на чтении запроса ubus (см. sub_info и
-    # sub_quota в объекте rpcd splify2), поэтому проверяется, а не подразумевается.
-    mkdir -p "$tmp/nfq"
-    printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$OUT"\n' > "$tmp/nfq/nfqws"
-    chmod +x "$tmp/nfq/nfqws"
-    printf '#Стратегия\n--dpi-desync=fake\n--dpi-desync-ttl=6' > "$tmp/z.opts"
-    OUT="$tmp/zargs" NFQWS="$tmp/nfq/nfqws" sh "$wrap" 8300 "$tmp/z.opts" 2>/dev/null
-    check "обёртка не теряет последний ключ без перевода строки" "1" \
-        "$(grep -cx -- '--dpi-desync-ttl=6' "$tmp/zargs" 2>/dev/null)"
-    check "и имя стратегии в ключи не уезжает" "0" \
-        "$(grep -c '^#' "$tmp/zargs" 2>/dev/null)"
-    check "и номер очереди тот, что дали" "1" \
-        "$(grep -cx -- '--qnum=8300' "$tmp/zargs" 2>/dev/null)"
 fi
 
 # ---- пустая спека законна ----------------------------------------------------
@@ -1426,10 +1206,9 @@ spec <<'EOF'
       "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
   ] }
 EOF
-# Семейство в подписи — «4»: спека v1, и на AAAA её имён резолвер отвечает пустым ответом, как до
-# 1.9 (sp->dns.names_v4, spec.h), хотя набор vpn_dom6 компилятор заводит (проверка ниже).
+# Семейство в подписи — «46»: у выхода-интерфейса есть IPv6, и набор vpn_dom6 компилятор заводит.
 hsig="$("$BIN" dnsd-sig --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
-check "гибридный канал в доменной группе соседа" "vpn_dom|0|4|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
+check "гибридный канал в доменной группе соседа" "vpn_dom|0|46|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
 hout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
 check "и компилятор завёл ровно эти наборы" "set vpn_dom {|set vpn_dom6 {|set vpn_ip_c0_p1 {" \
     "$(printf '%s\n' "$hout" | grep -o 'set [a-z0-9_]* {' | paste -sd'|')"
@@ -1670,51 +1449,22 @@ check "dry-run без строк замены таблицы" "0" \
     "$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-fo-drop" 2>/dev/null |
        grep -c '^delete table')"
 
-# ---- раскладка для старого ядра (Linux 4.9) -------------------------------------------------
-# Текстом, без ядра: legacy-min не спрашивает ядро ни о чём, поэтому вывод один и тот же на
-# любой машине и под любым пользователем. Загрузку в ядро проверяет applynft-legacy.sh, а
-# настоящее 4.9 — стенд tools/vm49 в хабе. Здесь — то, без чего 4.9 отвергнет весь файл.
+# ---- раскладка одна: nat в inet (раскладку для Linux 4.9 убрали, I-541) ---------------------
 printf '198.51.100.0/24\n' > "$tmp/lp.lst"
 cat > "$tmp/legacy.json" <<EOF
 { "schema": 2, "traceroute_hops": true, "from_default": ["192.168.1.0/24"],
   "outputs": { "vpn": { "kind": "interface", "device": "wg0" },
-               "yt":  { "kind": "zapret" },
                "tg":  { "kind": "tgws", "domain": "ex.co.uk" } },
   "channels": [ { "name": "d", "match": { "domains_file": "$tmp/d.lst",
                                           "prefixes_files": ["$tmp/lp.lst"] }, "out": "vpn" },
-                { "name": "z", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "yt" },
                 { "name": "t", "match": { "prefixes_file": "$tmp/b.lst" }, "out": "tg" } ] }
 EOF
-lout="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/legacy.json" \
-        --state-dir "$tmp/st-legacy" 2>"$tmp/legacy.err")"
-check "legacy: спека компилируется" "0" "$?"
-# Всё, что до таблицы ip, — это таблица inet: nat там 4.9 не принимает вовсе.
-check "legacy: в inet нет ни одной цепочки nat" "0" \
-    "$(printf '%s\n' "$lout" | sed '/^table ip /,$d' | grep -c 'type nat')"
-check "legacy: nat — одна цепочка на prerouting в ip" "1" \
-    "$(printf '%s\n' "$lout" | grep -c 'type nat hook prerouting priority dstnat - 1')"
-check "legacy: и пустая на postrouting — для обратной трансляции ответов" "1" \
-    "$(printf '%s\n' "$lout" | grep -c 'type nat hook postrouting priority srcnat + 1')"
-check "legacy: интервального набора со сроками нет" "0" \
-    "$(printf '%s\n' "$lout" | grep -c 'interval,timeout')"
-check "legacy: доменный набор — hash со сроками, префиксы — в _n" "2" \
-    "$(printf '%s\n' "$lout" | grep -c 'set vpn_dom {\|set vpn_dom_n {')"
-check "legacy: notrack без пробы ядра не ставится" "0" "$(printf '%s\n' "$lout" | grep -c notrack)"
-check "legacy: exthdr exists не ставится (4.9 грузит вместо него другое правило)" "0" \
-    "$(printf '%s\n' "$lout" | grep -c 'exthdr')"
-check "legacy: dnat по карте без слова ip" "1" \
-    "$(printf '%s\n' "$lout" | grep -c 'dnat to ip daddr map @fakeip')"
-check "legacy: ip6 без пробы не собирается" "0" "$(printf '%s\n' "$lout" | grep -c '^table ip6 ')"
-# Четвёртая строка (1.9) — у доменных правил fake-IP без nat в ip6 нет IPv6: AAAA гасится.
-check "legacy: сказано, чего не будет (notrack дважды, IPv6 и fake-IP v6)" "4" \
-    "$(grep -c 'не знает notrack\|nat для IPv6' "$tmp/legacy.err")"
-check "legacy: про fake-IP v6 — отдельной строкой" "1" \
-    "$(grep -c 'у доменных правил fake-IP нет IPv6' "$tmp/legacy.err")"
-# Современная раскладка той же спеки — прежний текст: ни одной строки старой раскладки.
-mout="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/legacy.json" \
-        --state-dir "$tmp/st-legacy" 2>/dev/null)"
-check "modern: одна таблица inet" "1" "$(printf '%s\n' "$mout" | grep -c '^table ')"
-check "modern: exthdr frag exists на месте" "1" "$(printf '%s\n' "$mout" | grep -c 'exthdr frag exists')"
+mout="$("$BIN" apply --dry-run --spec "$tmp/legacy.json" --state-dir "$tmp/st-legacy" 2>"$tmp/legacy.err")"
+check "спека компилируется" "0" "$?"
+check "одна таблица inet" "1" "$(printf '%s\n' "$mout" | grep -c '^table ')"
+check "интервальный набор со сроками — один доменный набор" "1" \
+    "$(printf '%s\n' "$mout" | grep -c 'set vpn_dom {')"
+check "про старое ядро ни слова" "0" "$(grep -c 'старого ядра\|не знает notrack' "$tmp/legacy.err")"
 
 # ---- разметка на ingress (compile/generate.c, «разметка на ingress») -----------------------
 # STEER_NFT_INGRESS=all — ядро «принимает» inet ingress, и устройства раздачи «есть»: текст не
@@ -1761,7 +1511,7 @@ check "ingress: на ingress нет ни одного выражения ct" "0"
     "$(chain_of "$iout" ingress_mark | grep -c ' ct ')"
 
 # Сложная спека: MAC и адреса обоих семейств в «кому», несколько устройств раздачи, сужение по
-# портам, доменный канал, «весь трафик», группы order/latency/balance, zapret, мост Telegram.
+# портам, доменный канал, «весь трафик», группы order/latency/balance, блок, мост Telegram.
 printf '10.20.0.0/16\n2001:db8:20::/48\n' > "$tmp/ing-w.lst"
 printf 'work.example\n' > "$tmp/ing-w.dom"
 printf '149.154.160.0/20\n' > "$tmp/ing-t.lst"
@@ -1782,7 +1532,7 @@ outputs:
   res:  { kind: group, pick: order, members: [wg0, wg1], on_fail: drop }
   fast: { kind: group, pick: latency, members: [wg0, wg1], tolerance: 50 }
   bal:  { kind: group, pick: balance, members: [wg0, wg1] }
-  dpi:  { kind: zapret }
+  dpi:  { kind: block }
   tg:   { kind: tgws, domain: ex.co.uk }
   dir:  { kind: direct }
 rules:
@@ -1805,14 +1555,19 @@ check "ingress: цепочка на всех устройствах раздач
 check "ingress: запасные правила prerouting — прежние до байта" \
     "$(chain_of "$pout" prerouting_mark)" \
     "$(chain_of "$iout" prerouting_mark | grep -v 'comment "steer-ingress"$')"
-# Правила ingress — те же правила каналов в том же порядке, без метки соединения; у balance —
-# метка группы вместо перехода в её цепочку (ниже отдельно).
+# Правила ingress — те же правила каналов в том же порядке, без метки соединения; у групп с картой
+# (balance и закрепляющие order/latency, compile/balance.c) — метка группы вместо перехода в её
+# цепочку (ниже отдельно): их правила сравниваются по именам каналов, а не текстом.
+carded="$(chain_of "$pout" prerouting_mark | sed -n 's/.*goto bal_[0-9]* comment "\(steer:[^"]*\)".*/\1"/p')"
 check "ingress: правила каналов — те же, в том же порядке, без ct mark" \
     "$(chain_of "$pout" prerouting_mark | sed '1,2d;$d' | grep -v 'goto bal_' | sed 's/ ct mark set mark//')" \
-    "$(chain_of "$iout" ingress_mark | sed '1,3d;$d' | grep -v 'comment "steer:bal_all')"
+    "$(chain_of "$iout" ingress_mark | sed '1,3d;$d' | grep -vF "$carded")"
+check "ingress: каналы групп с картой (balance, order, latency) — те же и на ingress" \
+    "$(printf '%s\n' "$carded" | sort)" \
+    "$(chain_of "$iout" ingress_mark | grep -oF "$carded" | sort)"
 regmark() { printf '0x%08x' "0x$(awk -v o="$1" '$1 == o { print $2 }' "$tmp/st-ing/registry")"; }
 bmark="$(regmark bal)"
-bchain="$(chain_of "$pout" prerouting_mark | sed -n 's/.*counter goto \(bal_[0-9]*\).*/\1/p' | head -n 1)"
+bchain="$(chain_of "$pout" prerouting_mark | sed -n 's/.*counter goto \(bal_[0-9]*\) comment "steer:bal_all.*/\1/p' | head -n 1)"
 check "ingress: balance — метка группы на ingress (IPv4 и IPv6)" "2" \
     "$(chain_of "$iout" ingress_mark | grep -c "meta mark set mark and 0xf00fffff or $bmark counter return comment \"steer:bal_all")"
 check "ingress: balance — prerouting по метке группы идёт в её цепочку" "1" \
@@ -1824,7 +1579,7 @@ keys_map="$(chain_of "$iout" prerouting_mark | sed -n 's/.*vmap { \(.*\) }.*/\1/
 check "ingress: ключи карты — метки ingress и «разобран»" "$keys_set" "$keys_map"
 check "ingress: мост Telegram (без метки соединения) — просто выход" "1" \
     "$(chain_of "$iout" prerouting_mark | grep -c "$(regmark tg) : return")"
-check "ingress: zapret — с меткой соединения (очередь узнаёт соединение по ней)" "1" \
+check "ingress: блок — с меткой соединения" "1" \
     "$(chain_of "$iout" prerouting_mark | grep -c "$(regmark dpi) : goto ingress_ct")"
 
 # Откаты: там, где ingress не ставится, текст — прежний, до байта.
@@ -1832,8 +1587,6 @@ sed 's/devices: \[br-lan, tailscale0\]/devices: [nosuch-steer0]/' "$tmp/ing.yaml
 check "ingress: устройства раздачи нет — ingress не ставится, текст прежний" \
     "$(STEER_NFT_INGRESS=0 "$BIN" apply --dry-run --spec "$tmp/ing-nodev.yaml" --state-dir "$tmp/st-ing" 2>/dev/null)" \
     "$(STEER_NFT_INGRESS=1 "$BIN" apply --dry-run --spec "$tmp/ing-nodev.yaml" --state-dir "$tmp/st-ing" 2>/dev/null)"
-check "ingress: старое ядро (legacy-min) — ingress нет" "0" \
-    "$(STEER_NFT_INGRESS=all STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run $IS 2>/dev/null | grep -c 'hook ingress')"
 sed 's/tolerance: 50 }/tolerance: 50, idle_timeout: 600 }/' "$tmp/ing.yaml" > "$tmp/ing-idle.yaml"
 check "ingress: группа latency с idle_timeout — тоже на ingress (сторож считает трафик и в ingress_mark)" "1" \
     "$(STEER_NFT_INGRESS=all "$BIN" apply --dry-run --spec "$tmp/ing-idle.yaml" --state-dir "$tmp/st-ing" 2>/dev/null |
@@ -1922,9 +1675,6 @@ check "ipv6 nat: masquerade IPv6 своей цепочкой — на оба в�
 check "ipv6 nat: цепочка — nat на srcnat" "1" \
     "$(chain_of "$h6n" postrouting_nat6 | grep -c 'type nat hook postrouting priority srcnat; policy accept;')"
 check "ipv6 nat: набора v6donor и отказов по источнику нет" "0" "$(printf '%s\n' "$h6n" | grep -c 'v6donor')"
-h6nl="$(STEER_NFT_COMPAT=legacy STEER_NFT_IP6NAT=1 "$BIN" apply --dry-run --spec "$tmp/h6n.yaml" $H6 2>/dev/null)"
-check "ipv6 nat, старое ядро: masquerade — в ip6 postrouting_nat" "2" \
-    "$(printf '%s\n' "$h6nl" | sed -n '/^table ip6 /,/^}/p' | grep -c 'oifname "wg[12]" counter masquerade comment "steer-nat6:')"
 h6spec "$tmp/h6o.yaml" ', ipv6: off' ''
 h6o="$("$BIN" apply --dry-run --spec "$tmp/h6o.yaml" $H6 2>/dev/null)"
 check "ipv6 off: IPv6 правил выхода — отказ по метке" "1" \

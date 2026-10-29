@@ -57,7 +57,7 @@ static void list_push(struct list *l, uint32_t lo, uint32_t hi) {
     if (l->n == l->cap) {
         size_t nc = l->cap ? l->cap * 2 : 1024;
         struct range *nv = realloc(l->v, nc * sizeof(*nv));
-        if (!nv) die("out of memory");
+        if (!nv) die("не хватает памяти");
         l->v = nv;
         l->cap = nc;
     }
@@ -463,7 +463,7 @@ static void v6_push(struct v6list *l, const char *line, const struct v6r *r) {
         size_t nc = l->cap ? l->cap * 2 : 16;
         char **ns = realloc(l->s, nc * sizeof(*ns));
         struct v6r *nr = realloc(l->r, nc * sizeof(*nr));
-        if (!ns || !nr) die("out of memory");
+        if (!ns || !nr) die("не хватает памяти");
         l->s = ns;
         l->r = nr;
         l->cap = nc;
@@ -472,7 +472,7 @@ static void v6_push(struct v6list *l, const char *line, const struct v6r *r) {
     while (*p == ' ' || *p == '\t') p++;
     size_t n = strcspn(p, " \t\r\n");
     char *c = malloc(n + 1);
-    if (!c) die("out of memory");
+    if (!c) die("не хватает памяти");
     memcpy(c, p, n);
     c[n] = '\0';
     l->s[l->n] = c;

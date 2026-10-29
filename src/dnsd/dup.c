@@ -33,6 +33,12 @@
  *     до конца рукопожатия (0-RTT, dupq_early_ready в pick_conn); сервер, отвергший 0-RTT, получает
  *     их заново на том же соединении (on_early_rejected, quic_after). Без билета — полное
  *     рукопожатие, и платить его приходится раз на простой в DUP_IDLE_MS.
+ *   - DoH3 (RFC 8484 по HTTP/3, RFC 9114) — то же соединение QUIC, ALPN `h3`, и тот же порядок:
+ *     одно соединение, вопрос — свой двунаправленный поток. По нему идёт запрос HTTP/3 (HEADERS: POST,
+ *     :authority, :path, content-type, accept; DATA с вопросом) и приходит ответ (HEADERS с :status,
+ *     DATA) до FIN; кадры и QPACK — doh3.c. QPACK — только статическая таблица (своя динамическая
+ *     равна нулю), потоки кодировщика и декодировщика не открываются. С рукопожатием уходит поток
+ *     управления с SETTINGS. 0-RTT не берётся. Ответ с кодом не 200 — отказ вопроса, соединение живёт.
  * Соединение TLS создаётся потоком (dial), сокет тогда переходит циклу. Пока соединения нет,
  * вопросы ждут в той же таблице (ci < 0); не установилось — все ожидающие получают отказ сразу,
  * а следующая попытка — через растущую паузу (1, 2, 4 ... 30 с). Обрыв соединения под вопросом —
@@ -58,6 +64,7 @@
 #include "tls13.h"
 #include "doq.h"
 #include "doh2.h"
+#include "doh3.h"
 #include "dupq.h"
 #include "sockmark.h"
 
@@ -75,13 +82,14 @@ extern int dupq_timeout_ms(struct dupq *q) __attribute__((weak));
 extern int dupq_on_readable(struct dupq *q) __attribute__((weak));
 extern int dupq_on_timer(struct dupq *q) __attribute__((weak));
 extern int dupq_stream_open(struct dupq *q, int64_t *sid) __attribute__((weak));
+extern int dupq_stream_open_uni(struct dupq *q, int64_t *sid) __attribute__((weak));
 extern int dupq_early_ready(const struct dupq *q) __attribute__((weak));
 extern ssize_t dupq_stream_send(struct dupq *q, int64_t sid, const uint8_t *d, size_t n, int fin) __attribute__((weak));
 extern int dupq_stream_reset(struct dupq *q, int64_t sid, uint64_t app_err) __attribute__((weak));
 
 int dup_have_quic(void) {
     return dupq_prepare && dupq_ready && dupq_open && dupq_close && dupq_free && dupq_fd && dupq_timeout_ms &&
-           dupq_on_readable && dupq_on_timer && dupq_stream_open && dupq_stream_send && dupq_stream_reset;
+           dupq_on_readable && dupq_on_timer && dupq_stream_open && dupq_stream_open_uni && dupq_stream_send && dupq_stream_reset;
 }
 
 extern int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got) __attribute__((weak));
@@ -102,7 +110,7 @@ static int dup_conn_limit(void) {
     if (lim) return lim;
     struct rlimit rl;
     long v = 1024;
-    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) v = (long)rl.rlim_cur;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) v = rl.rlim_cur == RLIM_INFINITY ? 262144 : (long)rl.rlim_cur;
     v /= 4;
     lim = v < 3 ? 3 : v > 65536 ? 65536 : (int)v;
     return lim;
@@ -155,10 +163,20 @@ static size_t g_dups_cap;
 /* Вопросы в полёте — блоками по DUP_REQ_BLOCK: адрес вопроса стабилен (его держат вызовы
  * обратной связи), рост — новый блок. */
 static struct dreq **g_reqb;
-int g_req_cap;                      /* dupint.h */
-               /* всего мест: кратно DUP_REQ_BLOCK */
+int g_req_cap;                      /* dupint.h: всего мест, кратно DUP_REQ_BLOCK */
+/* Верхняя граница занятых мест: все занятые — ниже g_req_hi (проходы по вопросам идут до неё, а
+ * не до пика за всё время работы), а новый вопрос берёт самое нижнее свободное (g_req_free — с
+ * него и ищем), поэтому граница держится у числа вопросов в полёте. */
+static int g_req_hi, g_req_free;
 struct dreq *req_ref(int k) { return &g_reqb[k / DUP_REQ_BLOCK][k % DUP_REQ_BLOCK]; }
 #define RQ(k) (*req_ref(k))
+/* Занятое место освободить: номер в апстриме снова свободен, границы подтянуть. */
+static void req_release(struct dreq *r) {
+    if (r->up && r->up->wid_used) r->up->wid_used[r->wid >> 3] &= (uint8_t)~(1u << (r->wid & 7));
+    r->used = 0;
+    if (r->slot < g_req_free) g_req_free = r->slot;
+    while (g_req_hi > 0 && !RQ(g_req_hi - 1).used) g_req_hi--;
+}
 static int req_grow(void) {
     struct dreq **nb = realloc(g_reqb, (size_t)(g_req_cap / DUP_REQ_BLOCK + 1) * sizeof(*nb));
     if (!nb) return -1;
@@ -186,9 +204,19 @@ static int sa_len(const struct sockaddr_storage *a) {
  * ответам). */
 static int stream_proto(const struct dup *up) {
     return up->cfg.u.proto == DNSP_TCP || up->cfg.u.proto == DNSP_DOT || up->cfg.u.proto == DNSP_DOH ||
-           up->cfg.u.proto == DNSP_QUIC;
+           up->cfg.u.proto == DNSP_QUIC || up->cfg.u.proto == DNSP_DOH3;
 }
-static int quic_proto(const struct dup *up) { return up->cfg.u.proto == DNSP_QUIC; }
+/* Транспорты поверх QUIC: DoQ и DoH по HTTP/3 — соединение, потоки вопросов и обратные вызовы общие,
+ * различается то, что идёт по потоку (кадр DoQ или запрос HTTP/3), и коды закрытия. */
+static int quic_proto(const struct dup *up) { return up->cfg.u.proto == DNSP_QUIC || up->cfg.u.proto == DNSP_DOH3; }
+static int h3_proto(const struct dup *up) { return up->cfg.u.proto == DNSP_DOH3; }
+static const char *qname(const struct dup *up) { return h3_proto(up) ? "DoH3" : "DoQ"; }
+/* Коды приложения при закрытии соединения и сброса потока: у DoQ свои (RFC 9250, 4.3), у HTTP/3 свои
+ * (RFC 9114, 8.1). «Нет ошибки» в dconn.qerr — 0 у обоих; при закрытии он становится кодом протокола. */
+static uint64_t q_code_ok(const struct dup *up) { return h3_proto(up) ? H3D_E_NO_ERROR : DOQ_NO_ERROR; }
+static uint64_t q_code_cancel(const struct dup *up) { return h3_proto(up) ? H3D_E_REQUEST_CANCELLED : DOQ_REQUEST_CANCELLED; }
+static uint64_t q_code_proto(const struct dup *up) { return h3_proto(up) ? H3D_E_GENERAL_PROTOCOL : DOQ_PROTOCOL_ERROR; }
+static uint64_t q_code_internal(const struct dup *up) { return h3_proto(up) ? H3D_E_INTERNAL : DOQ_INTERNAL_ERROR; }
 static int tls_proto(const struct dup *up) {
     return up->cfg.u.proto == DNSP_DOT || up->cfg.u.proto == DNSP_DOH;
 }
@@ -246,7 +274,7 @@ static void req_finish(struct dreq *r, uint8_t *ans, size_t n) {
          * 4.3): сервер перестаёт работать над ответом, а поток освобождается под следующий вопрос.
          * Поток, дочитанный до конца или уже закрытый, не трогаем. */
         if (!ans && r->sid >= 0 && c->qc && !c->qclosed && !r->rxfin && dupq_stream_reset)
-            dupq_stream_reset(c->qc, r->sid, DOQ_REQUEST_CANCELLED);
+            dupq_stream_reset(c->qc, r->sid, q_code_cancel(up));
         if (r->sid >= 0 && c->busy > 0) c->busy--;
     }
     if (up->cfg.u.proto == DNSP_DOH && r->sid >= 0 && r->ci >= 0 && r->ci < up->c_n) {
@@ -262,7 +290,7 @@ static void req_finish(struct dreq *r, uint8_t *ans, size_t n) {
     }
     uint8_t *rx = r->rx;            /* ans при DoQ и DoH/h2 лежит внутри него: освободить после обратного вызова */
     r->rx = NULL;
-    r->used = 0;
+    req_release(r);
     if (ans) {
         ans[0] = (uint8_t)(r->oid >> 8);
         ans[1] = (uint8_t)r->oid;
@@ -282,12 +310,75 @@ static struct dreq *req_at(int i) { return (i >= 0 && i < g_req_cap && RQ(i).use
 static void conn_free_bufs(struct dconn *c) {
     free(c->rb); free(c->wb);
     c->rb = c->wb = NULL;
-    c->rn = c->rcap = c->wn = c->woff = 0;
+    c->rn = c->rcap = c->wn = c->woff = c->wcap = 0;
 }
 
 static int cidx(const struct dconn *c) { return c->idx; }
 
 static void up_kick(struct dup *up);
+
+/* ---- сроки вопросов: куча, а не проход по всем -------------------------------------------------
+ *
+ * Прежде dup_tick и dup_wait_ms на каждом витке цикла обходили ВСЕ вопросы в полёте: при каскаде
+ * таймаутов (апстрим лёг, вопросов тысячи) каждый виток стоил O(R), и весь каскад — O(R²). Теперь
+ * у каждого вопроса одна живая запись в куче по ближайшему из его сроков (req_due): общий срок
+ * ответа, повтор по UDP, подозрение на мёртвое соединение QUIC. Тик берёт из кучи только те, чей
+ * срок пришёл, и каждому делает то же, что прежний проход (tick_req); ближайший срок для сна цикла —
+ * корень кучи. Запись может быть РАНЬШЕ нужного (состояние вопроса изменилось, срок отодвинулся) —
+ * тогда при срабатывании срок пересчитывается и вопрос ложится в кучу заново; позже нужного она быть
+ * не должна, поэтому req_rekey зовётся там, где срок приближается: при постановке вопроса, при
+ * открытии потока QUIC (срок «сервер молчит») и после каждого срабатывания. */
+struct hent { long due; int slot; uint32_t seq; };
+static struct hent *g_heap;
+static size_t g_heap_n, g_heap_cap;
+static uint32_t g_req_seq;
+
+static int heap_push(long due, int slot, uint32_t seq) {
+    if (g_heap_n == g_heap_cap) {
+        size_t nc = g_heap_cap ? g_heap_cap * 2 : 256;
+        struct hent *nh = realloc(g_heap, nc * sizeof(*nh));
+        if (!nh) return -1;
+        g_heap = nh;
+        g_heap_cap = nc;
+    }
+    size_t i = g_heap_n++;
+    while (i) {
+        size_t p = (i - 1) / 2;
+        if (g_heap[p].due <= due) break;
+        g_heap[i] = g_heap[p];
+        i = p;
+    }
+    g_heap[i] = (struct hent){ due, slot, seq };
+    return 0;
+}
+
+static void heap_pop(void) {
+    struct hent last = g_heap[--g_heap_n];
+    size_t i = 0;
+    while (g_heap_n) {
+        size_t c = 2 * i + 1;
+        if (c >= g_heap_n) break;
+        if (c + 1 < g_heap_n && g_heap[c + 1].due < g_heap[c].due) c++;
+        if (g_heap[c].due >= last.due) break;
+        g_heap[i] = g_heap[c];
+        i = c;
+    }
+    if (g_heap_n) g_heap[i] = last;
+}
+
+static long req_due(const struct dreq *r);
+
+/* Запись в кучу не удалась (нет памяти): вопросы без записи подбирает следующий тик проходом по
+ * таблице (dup_tick), пока память не появится, а цикл просыпается раз в 100 мс (dup_wait_ms). */
+static int g_heap_lost;
+
+void req_rekey(struct dreq *r) {
+    if (!r->used) return;
+    long due = req_due(r);
+    if (r->hkey && r->hkey <= due) return;             /* уже стоит раньше или тогда же */
+    if (heap_push(due, r->slot, r->hseq) == 0) r->hkey = due;
+    else g_heap_lost = 1;
+}
 
 /* Закрыть соединение: вопросы на нём переставляются в ожидание (один раз) или получают отказ. */
 static void conn_close(struct dconn *c, const char *why) {
@@ -307,13 +398,13 @@ static void conn_close(struct dconn *c, const char *why) {
          * закрывает dupq_free, из epoll он уходит до него. */
         struct dupq *q = c->qc;
         c->qc = NULL;
-        if (!c->qclosed && dupq_close) dupq_close(q, c->qerr);
+        if (!c->qclosed && dupq_close) dupq_close(q, c->qerr ? c->qerr : q_code_ok(up));
         if (c->qfd >= 0) epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->qfd, NULL);
         if (dupq_free) dupq_free(q);
     }
     c->qfd = -1;
     c->qhs = c->qclosed = 0;
-    c->qerr = DOQ_NO_ERROR;
+    c->qerr = 0;
     c->fd = -1;
     c->tls = NULL;
     int was_ready = c->st == CS_READY;
@@ -327,7 +418,7 @@ static void conn_close(struct dconn *c, const char *why) {
     c->hbn = 0;
     conn_free_bufs(c);
     int had = 0;
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used || r->up != up || r->ci != i) continue;
         had = 1;
@@ -394,9 +485,22 @@ static int conn_write(struct dconn *c, const uint8_t *b, size_t n) {
     }
     if (c->wn - c->woff + (n - done) > 256 * 1024) return -1;
     if (c->woff == c->wn) c->wn = c->woff = 0;
-    uint8_t *nb = realloc(c->wb, c->wn + (n - done));
-    if (!nb) return -1;
-    c->wb = nb;
+    /* Ёмкость растёт вдвое, а не ровно на добавку: очередь, к которой дописывают по кусочку (медленный
+     * сервер), иначе перевыделялась бы на каждую запись — квадрат от числа записей. Ушедшее с головы
+     * (woff) вытесняется сдвигом, а не ростом. */
+    if (c->woff && c->wn + (n - done) > c->wcap) {
+        memmove(c->wb, c->wb + c->woff, c->wn - c->woff);
+        c->wn -= c->woff;
+        c->woff = 0;
+    }
+    if (c->wn + (n - done) > c->wcap) {
+        size_t nc = c->wcap ? c->wcap : 4096;
+        while (nc < c->wn + (n - done)) nc *= 2;
+        uint8_t *nb = realloc(c->wb, nc);
+        if (!nb) return -1;
+        c->wb = nb;
+        c->wcap = nc;
+    }
     memcpy(c->wb + c->wn, b + done, n - done);
     c->wn += n - done;
     conn_ev(c, EPOLLIN | EPOLLOUT);
@@ -406,11 +510,23 @@ static int conn_write(struct dconn *c, const uint8_t *b, size_t n) {
 /* Поставить вопрос r на готовое соединение c. */
 static int conn_send(struct dup *up, struct dconn *c, struct dreq *r) {
     if (quic_proto(up)) {
-        /* DoQ: новый двунаправленный поток, в нём один запрос и FIN (RFC 9250, 4.2). Потоков
-         * больше нет (сервер разрешил столько-то одновременных) — QC_EAGAIN, вопрос остаётся в
-         * очереди и уйдёт, когда закроется чей-то поток (quic_after зовёт up_kick). */
-        uint8_t buf[2 + DUP_QMAX];
-        size_t fn = doq_frame_query(buf, sizeof(buf), r->q, r->qn);
+        /* DoQ: новый двунаправленный поток, в нём один запрос и FIN (RFC 9250, 4.2); DoH3 — то же с
+         * запросом HTTP/3 (HEADERS и DATA, RFC 9114, 4.1). Потоков больше нет (сервер разрешил столько-то
+         * одновременных) — QC_EAGAIN, вопрос остаётся в очереди и уйдёт, когда закроется чей-то поток
+         * (quic_after зовёт up_kick). */
+        uint8_t buf[1200 + DUP_QMAX];
+        size_t fn;
+        if (h3_proto(up)) {
+            if (c->st != CS_READY) return 1;           /* поток управления уходит с рукопожатием (quic_after) */
+            char auth[160];
+            if (strchr(up->cfg.u.host, ':')) snprintf(auth, sizeof(auth), "[%s]", up->cfg.u.host);  /* IPv6 — в скобках */
+            else snprintf(auth, sizeof(auth), "%s", up->cfg.u.host);
+            size_t al = strlen(auth);
+            if (up->cfg.u.port != 443) snprintf(auth + al, sizeof(auth) - al, ":%u", up->cfg.u.port);
+            fn = h3d_request(buf, sizeof(buf), auth, up->cfg.u.path, r->q, r->qn);
+        } else {
+            fn = doq_frame_query(buf, sizeof(buf), r->q, r->qn);
+        }
         int64_t sid = -1;
         if (!fn) return -1;
         int rc = dupq_stream_open(c->qc, &sid);
@@ -420,11 +536,12 @@ static int conn_send(struct dup *up, struct dconn *c, struct dreq *r) {
         if (w != (ssize_t)fn) {
             /* Кадр в несколько сотен байт буфер отправки (1 МиБ) принимает целиком; иначе
              * соединение неисправно. Поток, открытый впустую, сбрасывается. */
-            dupq_stream_reset(c->qc, sid, DOQ_INTERNAL_ERROR);
+            dupq_stream_reset(c->qc, sid, q_code_internal(up));
             return -1;
         }
         r->ci = cidx(c);
         r->sid = sid;
+        req_rekey(r);                           /* появился срок «сервер молчит» (DUP_QUIC_DEAD_MS) */
         c->busy++;
         c->last_ms = now_ms();
         up->q_sent++;
@@ -512,13 +629,13 @@ static int up_want_conns(const struct dup *up) {
     /* DoH по http/1.1: по соединению на ожидающий вопрос, но не больше предела дескрипторов (dup_conn_limit),
      * и уже идущие не считаются. */
     int waiting = 0, lim = dup_conn_limit();
-    for (int k = 0; k < g_req_cap; k++)
+    for (int k = 0; k < g_req_hi; k++)
         if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) waiting++;
     return waiting > lim ? lim : (waiting ? waiting : 1);
 }
 
 static void fail_waiting(struct dup *up) {
-    for (int k = 0; k < g_req_cap; k++)
+    for (int k = 0; k < g_req_hi; k++)
         if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) req_finish(&RQ(k), NULL, 0);
 }
 
@@ -729,15 +846,15 @@ static void q_on_early_rej(void *u) { ((struct dconn *)u)->qerej = 1; }
 static void q_on_data(void *u, int64_t sid, const uint8_t *d, size_t n, int fin) {
     struct dconn *c = u;
     struct dup *up = c->up;
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used || r->up != up || r->ci != cidx(c) || r->sid != sid) continue;
         /* Потолок буфера ответа — формат: длина сообщения 16 бит, значит кадр не больше 2 + 65535
-         * (doq.h). Больше — сервер нарушил формат, и это видно уже здесь, до накопления гигабайтов. */
-        if (r->rxn + n > 2u + DOQ_MSG_MAX) {
+         * (doq.h; у HTTP/3 — H3D_RX_MAX). Больше — сервер нарушил формат, и это видно уже здесь, до накопления гигабайтов. */
+        if (r->rxn + n > (h3_proto(up) ? H3D_RX_MAX : 2u + DOQ_MSG_MAX)) {
             r->rxbad = 1;
             r->rxfin = 1;
-            c->qerr = DOQ_PROTOCOL_ERROR;
+            c->qerr = h3_proto(up) ? H3D_E_MESSAGE_ERROR : DOQ_PROTOCOL_ERROR;
             return;
         }
         if (r->rxn + n > r->rxcap) {
@@ -757,7 +874,7 @@ static void q_on_data(void *u, int64_t sid, const uint8_t *d, size_t n, int fin)
 
 static void q_on_sclose(void *u, int64_t sid, uint64_t app_err) {
     struct dconn *c = u;
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used || r->up != c->up || r->ci != cidx(c) || r->sid != sid) continue;
         r->rxfin = 1;
@@ -768,8 +885,8 @@ static void q_on_sclose(void *u, int64_t sid, uint64_t app_err) {
 
 static void q_on_closed(void *u, int reason, const char *why) {
     struct dconn *c = u;
+    (void)reason;
     c->qclosed = 1;
-    c->qreason = reason;
     snprintf(c->qwhy, sizeof(c->qwhy), "%s", why ? why : "");
 }
 
@@ -777,12 +894,46 @@ static void q_on_closed(void *u, int reason, const char *why) {
  * обратных вызовов (см. struct dconn). */
 static void quic_reap(struct dconn *c) {
     struct dup *up = c->up;
-    for (int k = 0; k < g_req_cap && c->qc; k++) {
+    for (int k = 0; k < g_req_hi && c->qc; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used || r->up != up || r->ci != cidx(c) || r->sid < 0) continue;
         const uint8_t *m = NULL;
         size_t ml = 0;
-        int rc = doq_take_answer(r->rx, r->rxn, &m, &ml);
+        int rc;
+        if (h3_proto(up)) {
+            /* DoH3: ответ целый, когда сервер закончил поток (FIN или закрытие); разбор — doh3.c. Код,
+             * не равный 200, — отказ сервера с причиной в журнале, соединение остаётся (как у DoH/h2). */
+            if (!r->rxfin) continue;
+            if (r->rxbad || !r->rxn) {
+                up_err(up, r->rxbad ? "DoH3: сервер сбросил поток вопроса" : "DoH3: поток закрыт без ответа");
+                req_finish(r, NULL, 0);
+                continue;
+            }
+            int hs = 0;
+            size_t bl = 0;
+            const char *why = "";
+            uint64_t he = 0;
+            rc = h3d_response(r->rx, r->rxn, 1, &hs, &bl, &why, &he);
+            if (rc == 1 && hs != 200) {
+                up_err(up, "DoH3: сервер ответил HTTP %d", hs);
+                req_finish(r, NULL, 0);
+                continue;
+            }
+            if (rc == 1 && bl < 12) { rc = -1; why = "тело ответа короче заголовка DNS"; he = H3D_E_MESSAGE_ERROR; }
+            if (rc < 0) {
+                char nb[24];
+                up_err(up, "DoH3: %s (%s)", why, h3d_errname(he, nb, sizeof(nb)));
+                /* Ошибка сообщения — беда одного вопроса; ошибки кадров и сжатия — всего соединения
+                 * (RFC 9114, 8.1; RFC 9204, 6): его и закрываем. */
+                if (he != H3D_E_MESSAGE_ERROR) c->qerr = he;
+                req_finish(r, NULL, 0);
+                continue;
+            }
+            m = r->rx;
+            ml = bl;
+        } else {
+            rc = doq_take_answer(r->rx, r->rxn, &m, &ml);
+        }
         if (rc == 1) {
             if (same_question(r, m, ml)) {
                 c->last_ms = now_ms();
@@ -793,7 +944,7 @@ static void quic_reap(struct dconn *c) {
             }
         } else if (rc < 0) {
             up_err(up, "DoQ: ответ нарушает формат RFC 9250 (%zu байт на потоке)", r->rxn);
-            c->qerr = DOQ_PROTOCOL_ERROR;
+            c->qerr = q_code_proto(up);
             r->rxfin = 1;                               /* поток не сбрасывать: сервер и так наказан */
             req_finish(r, NULL, 0);
         } else if (r->rxfin) {
@@ -815,7 +966,7 @@ static void quic_after(struct dconn *c) {
              * уходят заново на этом же соединении, ставшем готовым; попытка не тратится, это не сбой
              * вопроса. Ответа на них не будет, поэтому ждать его нельзя. */
             int i = cidx(c);
-            for (int k = 0; k < g_req_cap; k++) {
+            for (int k = 0; k < g_req_hi; k++) {
                 struct dreq *r = &RQ(k);
                 if (!r->used || r->up != up || r->ci != i) continue;
                 r->ci = -1;
@@ -828,6 +979,22 @@ static void quic_after(struct dconn *c) {
             c->busy = 0;
             c->qerej = 0;
             up->q_early_rej++;
+        }
+        if (h3_proto(up)) {
+            /* HTTP/3: первым делом поток управления с SETTINGS (RFC 9114, 6.2.1; он живёт, пока живо
+             * соединение). Потоки кодировщика и декодировщика QPACK не открываются: таблицы нет. */
+            uint8_t cb[32];
+            size_t cn = h3d_control_open(cb, sizeof(cb));
+            int64_t csid = -1;
+            if (!cn || dupq_stream_open_uni(c->qc, &csid) != 0 ||
+                dupq_stream_send(c->qc, csid, cb, cn, 0) != (ssize_t)cn) {
+                up_err(up, "DoH3: поток управления не открылся");
+                up->qpos++;
+                conn_close(c, NULL);
+                up_backoff(up);
+                fail_waiting(up);
+                return;
+            }
         }
         c->st = CS_READY;
         c->last_ms = now_ms();
@@ -842,7 +1009,7 @@ static void quic_after(struct dconn *c) {
             /* Не дошли до конца рукопожатия: отказ TLS (имя в сертификате, корни, ALPN), порт
              * закрыт, сервер молчит. Следующая попытка — с другого адреса из выдачи и не раньше
              * паузы, вопросы, что ждали, получают SERVFAIL сейчас. */
-            up_err(up, "DoQ: рукопожатие с %.60s не удалось (%s)", up->cfg.u.host,
+            up_err(up, "%s: рукопожатие с %.60s не удалось (%s)", qname(up), up->cfg.u.host,
                    c->qwhy[0] ? c->qwhy : "нет ответа");
             up->qpos++;
             conn_close(c, NULL);
@@ -852,12 +1019,13 @@ static void quic_after(struct dconn *c) {
             /* Простаивающее соединение закрывается сервером или по молчанию (QC_CLOSE_IDLE) — не
              * сбой; сбой — закрытие под вопросами, о нём conn_close напишет в error. */
             char why[128];
-            snprintf(why, sizeof(why), "DoQ: соединение закрыто (%s)", c->qwhy);
+            snprintf(why, sizeof(why), "%s: соединение закрыто (%s)", qname(up), c->qwhy);
             conn_close(c, why);
         }
         return;
     }
-    if (c->qerr != DOQ_NO_ERROR) conn_close(c, "DoQ: сервер нарушил протокол — соединение закрыто");
+    if (c->qerr != 0) conn_close(c, h3_proto(up) ? "DoH3: сервер нарушил протокол — соединение закрыто"
+                                                  : "DoQ: сервер нарушил протокол — соединение закрыто");
 }
 
 /* Событие сокета QUIC или таймера. */
@@ -878,9 +1046,9 @@ static void quic_start(struct dup *up, struct dconn *c, const struct sockaddr_st
     const char *err = NULL;
     char ip[64] = "";
     unsigned port = up->cfg.u.port;
-    if (!dup_have_quic()) err = "в этой сборке нет QUIC: DoQ недоступен";
+    if (!dup_have_quic()) err = h3_proto(up) ? "в этой сборке нет QUIC: DoH3 недоступен" : "в этой сборке нет QUIC: DoQ недоступен";
     else if (an <= 0) err = "нет адреса сервера";
-    else if (!dupq_ready()) err = "нет корней для проверки сертификата DoQ";
+    else if (!dupq_ready()) err = "нет корней для проверки сертификата";
     if (!err) {
         const struct sockaddr_storage *a = &ad[up->qpos % (unsigned)an];
         if (a->ss_family == AF_INET6) inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)a)->sin6_addr, ip, sizeof(ip));
@@ -897,12 +1065,15 @@ static void quic_start(struct dup *up, struct dconn *c, const struct sockaddr_st
          * DOQ_NO_ERROR; срок QUIC чуть длиннее, чтобы он не сработал первым молча. Сервер вправе
          * договориться о меньшем: тогда соединение уйдёт раньше и пересоздастся вопросом. */
         cfg.idle_ms = (unsigned)DUP_IDLE_MS + 30000u;
-        cfg.early_data = 1;                    /* 0-RTT по билету, если он есть (dupq_early_ready) */
+        /* 0-RTT по билету, если он есть (dupq_early_ready). У DoH3 не берём: запрос HTTP/3 идёт после
+         * потока управления, а он открывается по завершении рукопожатия (quic_after). */
+        cfg.early_data = !h3_proto(up);
+        cfg.alpn = h3_proto(up) ? H3D_ALPN : DOQ_ALPN;
         struct dupq_ops ops = { .on_handshake = q_on_hs, .on_stream_data = q_on_data,
                                 .on_stream_close = q_on_sclose, .on_closed = q_on_closed,
                                 .on_early_rejected = q_on_early_rej };
         c->qhs = c->qclosed = c->qerej = 0;
-        c->qerr = DOQ_NO_ERROR;
+        c->qerr = 0;
         c->qwhy[0] = '\0';
         int rc = dupq_open(&cfg, &ops, c, &c->qc);
         if (rc != 0) {
@@ -921,7 +1092,7 @@ static void quic_start(struct dup *up, struct dconn *c, const struct sockaddr_st
     }
     if (err) {
         c->st = CS_FREE;
-        up_err(up, "DoQ: %s", err);
+        up_err(up, "%s: %s", qname(up), err);
         up->qpos++;
         up_backoff(up);
         fail_waiting(up);
@@ -939,7 +1110,7 @@ static void quic_start(struct dup *up, struct dconn *c, const struct sockaddr_st
     if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, c->qfd, &e) != 0) {
         c->qfd = -1;
         conn_close(c, NULL);
-        up_err(up, "DoQ: сокет не встал в epoll");
+        up_err(up, "%s: сокет не встал в epoll", qname(up));
         up_backoff(up);
         fail_waiting(up);
         return;
@@ -967,7 +1138,7 @@ static struct dconn *pick_conn(struct dup *up) {
 }
 
 static void up_kick(struct dup *up) {
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (!r->used || r->up != up || r->ci != -1) continue;
         struct dconn *c = pick_conn(up);
@@ -985,7 +1156,7 @@ static void up_kick(struct dup *up) {
         else if (c->qc && c->qclosed) { quic_after(c); k = -1; }  /* соединение умерло при отправке */
     }
     int waiting = 0;
-    for (int k = 0; k < g_req_cap; k++) if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) waiting++;
+    for (int k = 0; k < g_req_hi; k++) if (RQ(k).used && RQ(k).up == up && RQ(k).ci == -1) waiting++;
     if (!waiting) return;
     /* Соединение есть, вопросы ждут потоков, а не второго соединения (DoQ; DoH по h2). */
     if ((quic_proto(up) || (up->cfg.u.proto == DNSP_DOH && up->hproto == 2)) && pick_conn(up)) return;
@@ -1003,7 +1174,7 @@ static void up_kick(struct dup *up) {
 /* ---- чтение ---------------------------------------------------------------------------------- */
 
 static struct dreq *find_by_wid(struct dup *up, int ci, uint16_t wid) {
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (r->used && r->up == up && r->ci == ci && r->wid == wid) return r;
     }
@@ -1138,7 +1309,7 @@ static void h2_rst(struct dconn *c, uint32_t sid, uint32_t code) {
 }
 
 static struct dreq *find_by_sid(struct dup *up, int ci, uint32_t sid) {
-    for (int k = 0; k < g_req_cap; k++) {
+    for (int k = 0; k < g_req_hi; k++) {
         struct dreq *r = &RQ(k);
         if (r->used && r->up == up && r->ci == ci && r->sid == (int64_t)sid) return r;
     }
@@ -1262,7 +1433,7 @@ static int h2_frames(struct dconn *c) {
             c->h2_go = 1;
             /* Потоки за last_stream_id сервер не обрабатывал: их вопросы уходят на новое соединение,
              * попытка не считается. Остальные дорабатывают на этом. */
-            for (int k = 0; k < g_req_cap; k++) {
+            for (int k = 0; k < g_req_hi; k++) {
                 struct dreq *r = &RQ(k);
                 if (r->used && r->up == up && r->ci == cidx(c) && r->sid > (int64_t)last) h2_requeue(c, r);
             }
@@ -1538,13 +1709,13 @@ static void up_retire(struct dup *up) {
         if (c->dial) { c->dial->cancel = 1; c->dial = NULL; }
         if (c->st != CS_FREE && c->st != CS_DIAL) {
             /* Вопросы без повтора: апстрима больше нет. */
-            for (int k = 0; k < g_req_cap; k++)
+            for (int k = 0; k < g_req_hi; k++)
                 if (RQ(k).used && RQ(k).up == up && RQ(k).ci == i) RQ(k).tries = 2;
             conn_close(c, NULL);
         }
         c->st = CS_FREE;
     }
-    for (int k = 0; k < g_req_cap; k++)
+    for (int k = 0; k < g_req_hi; k++)
         if (RQ(k).used && RQ(k).up == up) req_finish(&RQ(k), NULL, 0);
     if (up->ufd >= 0) {
         epoll_ctl(g_epfd, EPOLL_CTL_DEL, up->ufd, NULL);
@@ -1558,7 +1729,7 @@ static void up_retire(struct dup *up) {
 static int cfg_same(const struct dup_cfg *a, const struct dup_cfg *b) {
     if (strcmp(a->u.name, b->u.name) || strcmp(a->u.url, b->u.url) || strcmp(a->via, b->via) ||
         a->mark != b->mark || a->need_mark != b->need_mark || a->u.ips_n != b->u.ips_n ||
-        a->u.boot_n != b->u.boot_n || a->grp != b->grp || a->gm_n != b->gm_n)
+        a->u.boot_n != b->u.boot_n || a->grp != b->grp || a->gm_n != b->gm_n || a->u.frag != b->u.frag)
         return 0;
     /* Группа — те же члены на тех же местах настройки: паузы членов переживают перенастройку. */
     for (size_t i = 0; i < a->gm_n; i++) if (a->gm[i] != b->gm[i]) return 0;
@@ -1598,6 +1769,8 @@ void dup_apply(const struct dup_cfg *c, size_t n) {
             g_store[g_store_n++] = up;
         }
         unsigned gen = up->gen;
+        uint8_t *keepw = up->wid_used;          /* карта номеров вопросов — тоже; без вопросов она пуста */
+        if (keepw) memset(keepw, 0, 8192);
         struct dconn **keepc = up->c;           /* соединения (их блоки) переживают переназначение */
         int keep_n = up->c_n, keep_cap = up->c_cap;
         free(up->ips_own);                      /* личные копии адресов прежней настройки */
@@ -1605,6 +1778,7 @@ void dup_apply(const struct dup_cfg *c, size_t n) {
         free(up->gm_own);                       /* и номеров членов группы, их паузы */
         free(up->gp);
         memset(up, 0, sizeof(*up));
+        up->wid_used = keepw;
         up->c = keepc;
         up->c_n = keep_n;
         up->c_cap = keep_cap;
@@ -1689,11 +1863,11 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
         return -1;
     }
     if (quic_proto(up) && !dup_have_quic()) {
-        up_err(up, "в этой сборке нет QUIC: DoQ недоступен");
+        up_err(up, "в этой сборке нет QUIC: %s недоступен", qname(up));
         return -1;
     }
     struct dreq *r = NULL;
-    for (int k = 0; k < g_req_cap; k++) if (!RQ(k).used) { r = &RQ(k); break; }
+    for (int k = g_req_free; k < g_req_cap; k++) if (!RQ(k).used) { r = &RQ(k); break; }
     if (!r) {
         /* Мест нет — новый блок; растёт до нехватки памяти, а число вопросов в полёте держит
          * очередь ожидающих резолвера (MAX_PENDING). */
@@ -1704,6 +1878,8 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
     int slot = r->slot;
     memset(r, 0, offsetof(struct dreq, q));
     r->slot = slot;
+    g_req_free = slot + 1;
+    if (slot >= g_req_hi) g_req_hi = slot + 1;
     r->sid = -1;                                        /* DoQ: поток ещё не открыт */
     memcpy(r->q, q, n);
     r->qn = (uint16_t)n;
@@ -1711,13 +1887,15 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
     r->up = up;
     r->up_gen = up->gen;
     r->oid = (uint16_t)((q[0] << 8) | q[1]);
-    for (;;) {                                          /* номер, не занятый другим вопросом апстрима */
+    /* Номер, не занятый другим вопросом апстрима: занятые помнит битовая карта на 65536 номеров —
+     * 8 КиБ на апстрим вместо прохода по всем вопросам на каждый новый. */
+    if (!up->wid_used) up->wid_used = calloc(8192, 1);
+    for (int tries = 0;; tries++) {
         r->wid = up->next_id++;
-        int taken = 0;
-        for (int k = 0; k < g_req_cap; k++)
-            if (&RQ(k) != r && RQ(k).used && RQ(k).up == up && RQ(k).wid == r->wid) taken = 1;
-        if (!taken) break;
+        if (!up->wid_used || !(up->wid_used[r->wid >> 3] & (1u << (r->wid & 7)))) break;
+        if (tries >= 65536) break;                      /* заняты все 65536 — невозможно: вопросов меньше */
     }
+    if (up->wid_used) up->wid_used[r->wid >> 3] |= (uint8_t)(1u << (r->wid & 7));
     r->q[0] = (uint8_t)(r->wid >> 8);
     r->q[1] = (uint8_t)r->wid;
     r->cb = cb;
@@ -1725,19 +1903,22 @@ int dup_ask(size_t idx, const uint8_t *q, size_t n, dup_done_fn cb, void *ctx) {
     r->t0 = now_ms();
     r->deadline = r->t0 + DUP_REQ_MS;
     r->ci = -1;
+    r->hseq = ++g_req_seq;
     if (up->cfg.u.proto == DNSP_UDP) {
         r->ci = -2;
+        req_rekey(r);
         if (udp_send(up, r) != 0) {
             up_err(up, "UDP: %s", strerror(errno));
-            r->used = 0;
+            req_release(r);
             return -1;
         }
         return 0;
     }
     if (now_ms() < up->retry_at_ms && !pick_conn(up)) {
-        r->used = 0;
+        req_release(r);
         return -1;                                     /* пауза после неудачи: отказ сразу */
     }
+    req_rekey(r);
     up_kick(up);
     if (!r->used) return 0;                             /* отказ уже отдан обратным вызовом */
     return 0;
@@ -1771,51 +1952,97 @@ int dup_event(void *ptr, uint32_t evs) {
     return 1;
 }
 
+/* Ближайший срок вопроса: общий срок ответа, а раньше него — повтор по UDP или проверка мёртвого
+ * соединения QUIC, пока они ещё возможны (условия те же, что в tick_req). */
+static long req_due(const struct dreq *r) {
+    const struct dup *up = r->up;
+    long t = r->deadline;
+    if (up->cfg.u.proto == DNSP_UDP && r->ci == -2 && r->tries == 0 && r->t0 + DUP_UDP_RETRY_MS < t)
+        t = r->t0 + DUP_UDP_RETRY_MS;
+    if (quic_proto(up) && r->sid >= 0 && r->tries == 0 && r->ci >= 0 && r->t0 + DUP_QUIC_DEAD_MS < t &&
+        CN(up, r->ci)->st == CS_READY && CN(up, r->ci)->qrx_ms <= r->t0)
+        t = r->t0 + DUP_QUIC_DEAD_MS;
+    return t;
+}
+
+/* Что делает срок с вопросом r в момент now: повтор по UDP, закрытие мёртвого соединения QUIC или
+ * отказ по сроку ответа. Тело прежнего прохода dup_tick. */
+static void tick_req(struct dreq *r, long now) {
+    struct dup *up = r->up;
+    if (up->cfg.u.proto == DNSP_UDP && r->ci == -2 && r->tries == 0 && now - r->t0 >= DUP_UDP_RETRY_MS &&
+        now < r->deadline) {
+        r->tries = 1;
+        udp_send(up, r);
+        return;
+    }
+    if (quic_proto(up) && r->sid >= 0 && r->tries == 0 && r->ci >= 0 && now - r->t0 >= DUP_QUIC_DEAD_MS &&
+        now < r->deadline && CN(up, r->ci)->st == CS_READY && CN(up, r->ci)->qrx_ms <= r->t0) {
+        /* Ни пакета от сервера с тех пор, как ушёл вопрос: соединение мертво (DUP_QUIC_DEAD_MS).
+         * conn_close переставит этот вопрос и остальные в ожидание, up_kick заведёт соединение. */
+        struct dconn *dc = CN(up, r->ci);
+        up_err(up, "%s: сервер молчит %d мс — соединение пересоздаётся", qname(up), DUP_QUIC_DEAD_MS);
+        conn_close(dc, NULL);
+        up_kick(up);
+        return;
+    }
+    if (now < r->deadline) return;
+    int ci = r->ci;
+    /* Причина, названная сервером или соединением после ухода вопроса (HTTP 505, сброс потока,
+     * отказ TLS), полезнее общего «нет ответа»: её и оставляем в last_error. */
+    if (!(up->err[0] && up->err_ms >= r->t0)) up_err(up, "нет ответа за %d мс", DUP_REQ_MS);
+    int silent = ci >= 0 && ci < up->c_n && CN(up, ci)->qrx_ms <= r->t0;
+    req_finish(r, NULL, 0);
+    if (ci >= 0 && CN(up, ci)->st == CS_READY) {
+        /* HTTP/2, DoT и TCP: остальные вопросы соединения живы (поток брошенного вопроса h2
+         * req_finish сбросил); соединение рвём, только если с ухода вопроса от сервера не пришло
+         * ни байта (мёртвый путь). Иначе мёртвое DoT-соединение принимало бы все вопросы апстрима,
+         * пока ядро не бросит повторы TCP (tcp_retries2 — десятки минут). */
+        int closed = 1;
+        if (up->cfg.u.proto == DNSP_DOH && CN(up, ci)->h2) { if (silent) conn_close(CN(up, ci), NULL); else closed = 0; }
+        else if (up->cfg.u.proto == DNSP_DOH) conn_close(CN(up, ci), NULL);
+        else if (!quic_proto(up)) {                                            /* у DoQ — req_finish */
+            if (CN(up, ci)->busy > 0) CN(up, ci)->busy--;
+            if (silent) conn_close(CN(up, ci), NULL); else closed = 0;
+        } else closed = 0;
+        /* Вопросы закрытого соединения conn_close переставил в ожидание — отправить их сейчас (по
+         * другому соединению или новому), а не в следующий раз, когда кто-нибудь спросит апстрим. */
+        if (closed) up_kick(up);
+    }
+}
+
+/* Убрать с вершины кучи записи, которых уже нет в живых: вопрос закончен, место занято другим
+ * вопросом, срок отодвинут новой записью. */
+static void heap_clean(void) {
+    while (g_heap_n) {
+        const struct hent *e = &g_heap[0];
+        const struct dreq *r = e->slot < g_req_cap ? &RQ(e->slot) : NULL;
+        if (r && r->used && r->hseq == e->seq && r->hkey == e->due) return;
+        heap_pop();
+    }
+}
+
 void dup_tick(void) {
     long now = now_ms();
-    for (int k = 0; k < g_req_cap; k++) {
-        struct dreq *r = &RQ(k);
-        if (!r->used) continue;
-        struct dup *up = r->up;
-        if (up->cfg.u.proto == DNSP_UDP && r->ci == -2 && r->tries == 0 && now - r->t0 >= DUP_UDP_RETRY_MS &&
-            now < r->deadline) {
-            r->tries = 1;
-            udp_send(up, r);
-            continue;
-        }
-        if (quic_proto(up) && r->sid >= 0 && r->tries == 0 && r->ci >= 0 && now - r->t0 >= DUP_QUIC_DEAD_MS &&
-            now < r->deadline && CN(up, r->ci)->st == CS_READY && CN(up, r->ci)->qrx_ms <= r->t0) {
-            /* Ни пакета от сервера с тех пор, как ушёл вопрос: соединение мертво (DUP_QUIC_DEAD_MS).
-             * conn_close переставит этот вопрос и остальные в ожидание, up_kick заведёт соединение. */
-            struct dconn *dc = CN(up, r->ci);
-            up_err(up, "DoQ: сервер молчит %d мс — соединение пересоздаётся", DUP_QUIC_DEAD_MS);
-            conn_close(dc, NULL);
-            up_kick(up);
-            k = -1;                                     /* таблицу вопросов сдвинули: с начала */
-            continue;
-        }
-        if (now < r->deadline) continue;
-        int ci = r->ci;
-        /* Причина, названная сервером или соединением после ухода вопроса (HTTP 505, сброс потока,
-         * отказ TLS), полезнее общего «нет ответа»: её и оставляем в last_error. */
-        if (!(up->err[0] && up->err_ms >= r->t0)) up_err(up, "нет ответа за %d мс", DUP_REQ_MS);
-        int silent = ci >= 0 && ci < up->c_n && CN(up, ci)->qrx_ms <= r->t0;
-        req_finish(r, NULL, 0);
-        if (ci >= 0 && CN(up, ci)->st == CS_READY) {
-            /* HTTP/2, DoT и TCP: остальные вопросы соединения живы (поток брошенного вопроса h2
-             * req_finish сбросил); соединение рвём, только если с ухода вопроса от сервера не пришло
-             * ни байта (мёртвый путь). Иначе мёртвое DoT-соединение принимало бы все вопросы апстрима,
-             * пока ядро не бросит повторы TCP (tcp_retries2 — десятки минут). */
-            int closed = 1;
-            if (up->cfg.u.proto == DNSP_DOH && CN(up, ci)->h2) { if (silent) conn_close(CN(up, ci), NULL); else closed = 0; }
-            else if (up->cfg.u.proto == DNSP_DOH) conn_close(CN(up, ci), NULL);
-            else if (!quic_proto(up)) {                                            /* у DoQ — req_finish */
-                if (CN(up, ci)->busy > 0) CN(up, ci)->busy--;
-                if (silent) conn_close(CN(up, ci), NULL); else closed = 0;
-            } else closed = 0;
-            /* Вопросы закрытого соединения conn_close переставил в ожидание — отправить их сейчас (по
-             * другому соединению или новому), а не в следующий раз, когда кто-нибудь спросит апстрим. */
-            if (closed) { up_kick(up); k = -1; }
+    if (g_heap_lost) {
+        g_heap_lost = 0;
+        for (int k = 0; k < g_req_hi; k++)
+            if (RQ(k).used && !RQ(k).hkey) req_rekey(&RQ(k));
+    }
+    for (;;) {
+        heap_clean();
+        if (!g_heap_n || g_heap[0].due > now) break;
+        struct hent e = g_heap[0];
+        heap_pop();
+        struct dreq *r = &RQ(e.slot);
+        r->hkey = 0;
+        tick_req(r, now);
+        if (r->used && r->hseq == e.seq) {
+            /* Срок не наступил или действие его не сняло — не раньше следующей миллисекунды: иначе
+             * вопрос, чей срок «уже» и который ничего не сдвинул, крутил бы этот цикл вечно. */
+            long due = req_due(r);
+            if (due <= now) due = now + 1;
+            if (heap_push(due, r->slot, r->hseq) == 0) r->hkey = due;
+            else g_heap_lost = 1;
         }
     }
     for (size_t i = 0; i < g_dups_n; i++) {
@@ -1846,16 +2073,9 @@ void dup_tick(void) {
 
 int dup_wait_ms(void) {
     long now = now_ms(), best = grp_deadline();
-    for (int k = 0; k < g_req_cap; k++) {
-        if (!RQ(k).used) continue;
-        long t = RQ(k).deadline;
-        if (RQ(k).ci == -2 && RQ(k).tries == 0 && RQ(k).t0 + DUP_UDP_RETRY_MS < t)
-            t = RQ(k).t0 + DUP_UDP_RETRY_MS;
-        if (RQ(k).sid >= 0 && RQ(k).tries == 0 && RQ(k).ci >= 0 && quic_proto(RQ(k).up) &&
-            CN(RQ(k).up, RQ(k).ci)->qrx_ms <= RQ(k).t0 && RQ(k).t0 + DUP_QUIC_DEAD_MS < t)
-            t = RQ(k).t0 + DUP_QUIC_DEAD_MS;
-        if (best < 0 || t < best) best = t;
-    }
+    heap_clean();
+    if (g_heap_n && (best < 0 || g_heap[0].due < best)) best = g_heap[0].due;
+    if (g_heap_lost && (best < 0 || now + 100 < best)) best = now + 100;
     /* Соединения DoQ живут и без вопросов: проснуться к таймеру QUIC (потерянный пакет, конец
      * рукопожатия, простой) и к сроку нашего закрытия простаивающего соединения. */
     for (size_t i = 0; i < g_dups_n; i++) {
@@ -1881,7 +2101,7 @@ int dup_wait_ms(void) {
 }
 
 int dup_busy(void) {
-    for (int k = 0; k < g_req_cap; k++) if (RQ(k).used) return 1;
+    for (int k = 0; k < g_req_hi; k++) if (RQ(k).used) return 1;
     return grp_busy();
 }
 
@@ -1911,8 +2131,14 @@ static const char *proto_name(int p) {
     case DNSP_DOT: return "dot";
     case DNSP_DOH: return "doh";
     case DNSP_QUIC: return "doq";
+    case DNSP_DOH3: return "doh3";
     default: return "?";
     }
+}
+
+const char *dup_error(size_t idx) {
+    if (idx >= g_dups_n || !g_dups[idx] || !g_dups[idx]->err[0]) return NULL;
+    return g_dups[idx]->err;
 }
 
 void dup_render(FILE *f) {
@@ -1921,7 +2147,7 @@ void dup_render(FILE *f) {
         const struct dup *up = g_dups[i];
         int conns = 0, queued = 0;
         for (int k = 0; k < up->c_n; k++) conns += CN(up, k)->st == CS_READY;
-        for (int k = 0; k < g_req_cap; k++) queued += RQ(k).used && RQ(k).up == up;
+        for (int k = 0; k < g_req_hi; k++) queued += RQ(k).used && RQ(k).up == up;
         if (up->cfg.grp) {
             /* Группа серверов: свои поля (dupgrp.c), имя и пустой url — как у сервера. */
             fprintf(f, "%s{\"name\":\"%s\",\"url\":\"\",", i ? "," : "", up->cfg.u.name);
@@ -1949,6 +2175,7 @@ void dup_render(FILE *f) {
         } else {
             fputs("null,\"error_ago\":null", f);
         }
+        if (up->cfg.u.proto == DNSP_DOH3) fputs(",\"http\":\"h3\"", f);
         /* DoH: по какому HTTP говорит сервер (выбор ALPN при последнем соединении). */
         if (up->cfg.u.proto == DNSP_DOH && up->hproto)
             fprintf(f, ",\"http\":\"%s\"", up->hproto == 2 ? "h2" : "http/1.1");

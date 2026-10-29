@@ -1,6 +1,6 @@
 /* Транспорт ws: поток протокола в кадрах WebSocket (RFC 6455) после запроса Upgrade.
  *
- * Верхний ярус транспорта (transport.h), шаг 5 выпуска 1.10. Запрос Upgrade и ответ 101 — общие с
+ * Верхний ярус транспорта (transport.h). Запрос Upgrade и ответ 101 — общие с
  * httpupgrade (trupgrade.c); здесь — только кадры.
  *
  * ОТПРАВКА — КАК У XRAY. Клиент Xray пишет в gorilla/websocket одним WriteMessage(BinaryMessage)
@@ -308,9 +308,8 @@ static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
         const unsigned char *in = d;
         size_t n = 0;
         if (t->link.plain) {
-            ssize_t k = read(t->link.fd, d, cap);
-            if (k <= 0) return k == 0 ? TR_ECLOSED : TR_EIO;
-            n = (size_t)k;
+            rc = tr_sock_read(t->link.fd, d, cap, &n);
+            if (rc) return rc;
         } else {
             rc = tls13_read_ref(&t->link.tls, &in, &n);
             if (rc) return rc;
@@ -339,9 +338,11 @@ static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
         rc = tr_ws_parse(r, in, n, d, cap, &on);
     } else {
         /* Голый сокет: читаем прямо в d и разбираем на месте. */
-        ssize_t k = read(t->link.fd, d, cap);
-        if (k <= 0) return k == 0 ? TR_ECLOSED : TR_EIO;
-        rc = tr_ws_parse(r, d, (size_t)k, d, cap, &on);
+        size_t k = 0;
+        rc = tr_sock_read(t->link.fd, d, cap, &k);
+        if (rc) return rc;
+        if (!k) return 0;
+        rc = tr_ws_parse(r, d, k, d, cap, &on);
     }
     if (rc) return rc;
     rc = ws_answer(t);

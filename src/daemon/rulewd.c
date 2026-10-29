@@ -102,7 +102,7 @@
  * Отказ сторожа (apply_failed: снять правило, сбросить таблицу) идёт в цикле демона одним
  * синхронным куском — событие своего снятия страж читает уже после сброса таблицы. `steer down`
  * снимает таблицы nftables раньше правил — проверка видит «таблицы движка нет» и молчит.
- * Сверка — два дампа rtnetlink в процессе (rtnl_rules_text, rtnl_routes_text) и разбор тем же
+ * Сверка — два дампа rtnetlink в процессе (rtnl_rules_dup, rtnl_routes_dup) и разбор тем же
  * route_facts_of, которым сверяет маршрутизацию сторож, — без единого процесса. Пока идёт своя
  * команда, которая сама снимает правила (посреди apply-commit с --drop или --route правило бывает
  * уже снято, а таблица ещё не сброшена), проверка не трогает только выходы, которых команда держит
@@ -190,9 +190,10 @@ enum { MISS_R4 = 1, MISS_R6 = 2, MISS_BS6 = 4 };
  * «ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo»). rules и rules6 — дампы правил, уже прочитанные (rules6 пуст —
  * ядро без IPv6, и половина IPv6 не сверяется). -1 — ядро не спросить. */
 static int out_missing(const char *rules, const char *rules6, const struct output *o) {
-    static char routes[8192], routes6[8192];
-    if (rtnl_routes_text(o->table, routes, sizeof(routes)) != 0) return -1;
+    char *routes = rtnl_routes_dup(o->table, 0);
+    if (!routes) return -1;
     struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+    free(routes);
     if (!f.known) return -1;
     /* Таблица IPv4 занята — маршрут на устройство, запрет или запасной запрет. Пуста — правило
      * снято вместе с ней, и это наше решение (см. шапку). */
@@ -200,8 +201,10 @@ static int out_missing(const char *rules, const char *rules6, const struct outpu
     int miss = !f.rule && busy4 ? MISS_R4 : 0;
     /* С 1.9 у выхода с маршрутом IPv6 так же сверяется и его половина IPv6. */
     if (!out_route6(o) || !rules6[0]) return miss;
-    if (rtnl_routes_text6(o->table, routes6, sizeof(routes6)) != 0) return miss;
+    char *routes6 = rtnl_routes_dup(o->table, 1);
+    if (!routes6) return miss;
     struct route_facts f6 = route_facts_of(rules6, routes6, o->mark, o->table);
+    free(routes6);
     if (!f6.known) return miss;
     int busy6 = !(f6.table == TBL_EMPTY && !f6.backstop);
     /* Правило IPv6 обязано стоять, если выход ведёт трафик по IPv4 (правило IPv4 стоит или его
@@ -264,8 +267,39 @@ static int missing_x(const struct rulewd *r, const struct spec *sp, char *list, 
     return cnt;
 }
 
-int rulewd_missing(const struct spec *sp, char *list, size_t n) {
-    return missing_x(NULL, sp, list, n, NULL);
+/* Место под имена всех выходов спеки через запятую: список не обрезается, сколько бы их ни было
+ * (раньше — 512 байт, и имена сверх них молча выпадали из возврата правил и из журнала). */
+static size_t names_cap(const struct spec *sp) {
+    size_t n = 1;
+    for (size_t i = 0; sp && i < sp->out_n; i++) n += strlen(sp->out[i].name) + 1;
+    return n;
+}
+
+int rulewd_missing(const struct spec *sp, char **list) {
+    size_t n = names_cap(sp);
+    *list = malloc(n);
+    if (!*list) return -1;
+    int cnt = missing_x(NULL, sp, *list, n, NULL);
+    if (cnt < 0) { free(*list); *list = NULL; }
+    return cnt;
+}
+
+int rulewd_present(const struct spec *sp) {
+    char *rules, *rules6;
+    if (!sp || rules_read(&rules, &rules6) != 0) return -1;
+    int cnt = 0;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if (!out_has_device(o) || !o->mark || !o->table) continue;
+        char *routes = rtnl_routes_dup(o->table, 0);
+        if (!routes) continue;
+        struct route_facts f = route_facts_of(rules, routes, o->mark, o->table);
+        free(routes);
+        if (f.known && f.rule) cnt++;
+    }
+    free(rules);
+    free(rules6);
+    return cnt;
 }
 
 /* Приоритет, с которым вернуть правило семейства fam с меткой mark: свой у платформы, иначе тот,
@@ -346,6 +380,9 @@ static void rulewd_defer(struct rulewd *r) {
     loop_timer_set(r->tm, RULEWD_BUSY_MS);
 }
 
+static void rulewd_check_in(struct rulewd *r, char *list, char *rl, char *bs, char *left,
+                            size_t nc);
+
 static void rulewd_check(struct rulewd *r) {
     struct steerd *d = r->d;
     r->pending = 0;
@@ -354,16 +391,25 @@ static void rulewd_check(struct rulewd *r) {
      * вышло (-1) — проверяем как обычно. */
     uint64_t h;
     if (recon_table_handle(nft_table(), &h) == 1) return;
-    char list[512];
+    size_t nc = names_cap(d->sp);
+    char *buf = malloc(nc * 4);
+    if (!buf) return;
+    char *list = buf, *rl = buf + nc, *bs = buf + 2 * nc, *left = buf + 3 * nc;
+    rulewd_check_in(r, list, rl, bs, left, nc);
+    free(buf);
+}
+
+static void rulewd_check_in(struct rulewd *r, char *list, char *rl, char *bs, char *left,
+                            size_t nc) {
+    struct steerd *d = r->d;
     int hm = 0;
-    int cnt = missing_x(r, d->sp, list, sizeof(list), &hm);
+    int cnt = missing_x(r, d->sp, list, nc, &hm);
     /* Чего-то не хватает у выхода, которого держит идущая команда, — вернуться к нему, когда она
      * кончится (rulewd_defer): событие снятия не повторится. */
     if (hm) rulewd_defer(r);
     if (cnt <= 0) return;
     if (!r->cf.restored) { r->cf.repair(r->cf.arg); return; }
-    char rl[512], bs[512];
-    int rc = rulewd_restore(r, d->sp, list, rl, bs, sizeof(list));
+    int rc = rulewd_restore(r, d->sp, list, rl, bs, nc);
     /* В счёт шторма — возвраты правил (и неудачные попытки), но не одного запрета IPv6: его
      * снимает ядро вместе с lo, а не тот, кто дерётся за `ip rule`, и на `network restart` он
      * приходит вторым возвратом рядом с правилами — два перезапуска сети за минуту иначе уже
@@ -372,8 +418,7 @@ static void rulewd_check(struct rulewd *r) {
         r->back_at[r->back_i] = loop_now_ms();
         r->back_i = (r->back_i + 1) % (RULEWD_STORM_N + 1);
     }
-    char left[512];
-    if (rc > 0 && missing_x(r, d->sp, left, sizeof(left), NULL) == 0) {
+    if (rc > 0 && missing_x(r, d->sp, left, nc, NULL) == 0) {
         r->cf.restored(r->cf.arg, list, rl, bs);
         return;
     }
@@ -423,15 +468,14 @@ static int rule_is_ours(const struct nlmsghdr *h, int *fam, uint32_t *markp, uin
 }
 
 /* Снят ли запасной запрет IPv6 (см. шапку, «ЗАПРЕТ IPv6 УХОДИТ ВМЕСТЕ С lo»): маршрут IPv6
- * `prohibit default` (или `blackhole default` прежней версии — его заменяет первая же привязка) с
- * метрикой STEER_BACKSTOP_METRIC. Чья это таблица, событие не решает — это
+ * `prohibit default` с метрикой STEER_BACKSTOP_METRIC. Чья это таблица, событие не решает — это
  * сверка по спеке (out_missing): так чужой запрет с той же метрикой стоит лишь одной проверки. */
 static int route_is_backstop6(const struct nlmsghdr *h) {
     const struct rtmsg *rt = NLMSG_DATA(h);
     size_t hl = NLMSG_ALIGN(sizeof(*rt));
     if (h->nlmsg_len < NLMSG_HDRLEN + hl) return 0;
     if (rt->rtm_family != AF_INET6 || rt->rtm_dst_len ||
-        (rt->rtm_type != RTN_PROHIBIT && rt->rtm_type != RTN_BLACKHOLE))
+        rt->rtm_type != RTN_PROHIBIT)
         return 0;
     const char *p = (const char *)rt + hl, *e = (const char *)h + h->nlmsg_len;
     while (p + sizeof(struct rtattr) <= e) {

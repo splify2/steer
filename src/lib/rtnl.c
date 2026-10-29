@@ -19,8 +19,7 @@
 #include "rtnl.h"
 
 static uint32_t g_rtnl_seq;
-/* Семейство дампа правил и маршрутов: AF_INET (прежние rtnl_*_text) или AF_INET6 (…_text6,
- * маршрутизация IPv6 выходов с 1.9). Переменной, а не параметром колбэков: вызов синхронный и
+/* Семейство дампа правил и маршрутов: AF_INET или AF_INET6 (маршрутизация IPv6 выходов). Переменной, а не параметром колбэков: вызов синхронный и
  * однопоточный (см. rtnl.h), и так печатник у обоих семейств один. */
 static int g_fam = AF_INET;
 
@@ -119,16 +118,37 @@ static uint32_t rta_u32(const struct rtattr *a) {
 struct textbuf {
     char *p;
     size_t n, len;
-    int full;
+    int full;               /* не хватило памяти: текст неполон, и отдавать его нельзя */
 };
 
-/* Одна строка целиком или никак: обрезанная строка разобралась бы как другая. */
+/* Одна строка целиком или никак: обрезанная строка разобралась бы как другая. Буфер растёт, пока
+ * дамп не влезет: размер таблицы правил и маршрутов задаёт коробка (по правилу на выход и
+ * семейство, чужие туннели, mwan3), а не мы, и обрезка по числу молча давала бы сверке неполное
+ * состояние. */
 static void tb_line(struct textbuf *t, const char *line) {
     size_t l = strlen(line);
-    if (t->full || t->len + l + 1 > t->n) { t->full = 1; return; }
+    if (t->full) return;
+    if (t->len + l + 1 > t->n) {
+        size_t n = t->n ? t->n : 4096;
+        while (t->len + l + 1 > n) {
+            if (n > SIZE_MAX / 2) { t->full = 1; return; }
+            n *= 2;
+        }
+        char *g = realloc(t->p, n);
+        if (!g) { t->full = 1; return; }
+        t->p = g;
+        t->n = n;
+    }
     memcpy(t->p + t->len, line, l);
     t->len += l;
     t->p[t->len] = '\0';
+}
+
+/* Итог печати в куче: пустая строка, если ядро ничего не прислало, NULL — не вышло. */
+static char *tb_result(struct textbuf *t) {
+    if (t->full) { free(t->p); return NULL; }
+    if (!t->p) return strdup("");
+    return t->p;
 }
 
 static const char *table_name(uint32_t t, char *buf, size_t n) {
@@ -185,53 +205,23 @@ static void rule_cb(const struct nlmsghdr *h, void *ctx) {
     tb_line(t, line);
 }
 
-/* Дамп правил в out (n байт); *full — не всё влезло. */
-static int rules_text_full(char *out, size_t n, int *full) {
-    if (!n) return -1;
-    out[0] = '\0';
+char *rtnl_rules_dup(int v6) {
     uint8_t buf[64];
     struct nlbuf b;
     struct fib_rule_hdr fr;
+    int saved = g_fam;
+    g_fam = v6 ? AF_INET6 : AF_INET;
     memset(&fr, 0, sizeof(fr));
     fr.family = (uint8_t)g_fam;
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETRULE,
                                     NLM_F_REQUEST | NLM_F_DUMP, &fr, sizeof(fr));
-    struct textbuf t = { out, n, 0, 0 };
-    if (rtnl_talk(buf, msg_end(&b, nh), rule_cb, &t) != 0) { out[0] = '\0'; return -1; }
-    if (full) *full = t.full;
-    return 0;
-}
-
-int rtnl_rules_text(char *out, size_t n) {
-    return rules_text_full(out, n, NULL);
-}
-
-char *rtnl_rules_dup(int v6) {
-    size_t n = 16384;
-    int saved = g_fam;
-    g_fam = v6 ? AF_INET6 : AF_INET;
+    struct textbuf t;
+    memset(&t, 0, sizeof(t));
     char *res = NULL;
-    for (;;) {
-        char *p = malloc(n);
-        if (!p) break;
-        int full = 0;
-        if (rules_text_full(p, n, &full) != 0) { free(p); break; }
-        if (!full) { res = p; break; }
-        free(p);
-        /* Потолок 64 МиБ — не размер таблицы правил, а защита от дампа, который не кончается:
-         * правил столько не бывает (одно на выход и на семейство плюс десяток ядерных). */
-        if (n >= ((size_t)64 << 20)) break;
-        n *= 2;
-    }
+    if (rtnl_talk(buf, msg_end(&b, nh), rule_cb, &t) != 0) free(t.p);
+    else res = tb_result(&t);
     g_fam = saved;
     return res;
-}
-
-int rtnl_rules_text6(char *out, size_t n) {
-    g_fam = AF_INET6;
-    int rc = rtnl_rules_text(out, n);
-    g_fam = AF_INET;
-    return rc;
 }
 
 struct route_ctx {
@@ -241,6 +231,7 @@ struct route_ctx {
      * как делает `ip route flush`. */
     uint8_t *raw;
     size_t raw_n, raw_cap;
+    int raw_on, raw_full;
 };
 
 static const char *rt_type_name(unsigned t) {
@@ -269,11 +260,19 @@ static void route_cb(const struct nlmsghdr *h, void *ctx) {
     attrs_parse((const uint8_t *)rt + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, RTA_MAX);
     uint32_t table = tb[RTA_TABLE] ? rta_u32(tb[RTA_TABLE]) : rt->rtm_table;
     if (table != c->table) return;
-    if (c->raw) {
-        if (c->raw_n + h->nlmsg_len <= c->raw_cap) {
-            memcpy(c->raw + c->raw_n, h, h->nlmsg_len);
-            c->raw_n += NLMSG_ALIGN(h->nlmsg_len);
+    if (c->raw_on) {
+        size_t need = c->raw_n + NLMSG_ALIGN(h->nlmsg_len);
+        if (c->raw_full) return;
+        if (need > c->raw_cap) {
+            size_t cap = c->raw_cap ? c->raw_cap : 16384;
+            while (need > cap) cap *= 2;
+            uint8_t *g = realloc(c->raw, cap);
+            if (!g) { c->raw_full = 1; return; }
+            c->raw = g;
+            c->raw_cap = cap;
         }
+        memcpy(c->raw + c->raw_n, h, h->nlmsg_len);
+        c->raw_n = need;
         return;
     }
     char line[512], a[INET6_ADDRSTRLEN], dev[IF_NAMESIZE];
@@ -327,36 +326,30 @@ static int routes_dump(struct route_ctx *c) {
     return rtnl_talk(buf, msg_end(&b, nh), route_cb, c);
 }
 
-int rtnl_routes_text(int table, char *out, size_t n) {
-    if (!n) return -1;
-    out[0] = '\0';
+char *rtnl_routes_dup(int table, int v6) {
     struct route_ctx c;
     memset(&c, 0, sizeof(c));
     c.table = (uint32_t)table;
-    c.t.p = out;
-    c.t.n = n;
-    if (routes_dump(&c) != 0) { out[0] = '\0'; return -1; }
-    return 0;
-}
-
-int rtnl_routes_text6(int table, char *out, size_t n) {
-    g_fam = AF_INET6;
-    int rc = rtnl_routes_text(table, out, n);
-    g_fam = AF_INET;
-    return rc;
+    int saved = g_fam;
+    g_fam = v6 ? AF_INET6 : AF_INET;
+    char *res = NULL;
+    if (routes_dump(&c) != 0) free(c.t.p);
+    else res = tb_result(&c.t);
+    g_fam = saved;
+    return res;
 }
 
 int rtnl_table_flush(int table) {
-    static _Alignas(8) uint8_t raw[16384];
     struct route_ctx c;
     memset(&c, 0, sizeof(c));
     c.table = (uint32_t)table;
-    c.raw = raw;
-    c.raw_cap = sizeof(raw);
+    c.raw_on = 1;
     int rc = routes_dump(&c);
-    if (rc) return rc;
+    /* Недочитанный дамп — не «таблица снята»: уборка по неполным данным оставила бы маршруты. */
+    if (!rc && c.raw_full) rc = ENOMEM;
+    if (rc) { free(c.raw); return rc; }
     for (size_t off = 0; off + NLMSG_HDRLEN <= c.raw_n; ) {
-        struct nlmsghdr *h = (struct nlmsghdr *)(raw + off);
+        struct nlmsghdr *h = (struct nlmsghdr *)(c.raw + off);
         size_t len = h->nlmsg_len;
         if (len < NLMSG_HDRLEN || off + len > c.raw_n) break;
         h->nlmsg_type = RTM_DELROUTE;
@@ -366,6 +359,7 @@ int rtnl_table_flush(int table) {
         rtnl_talk(h, len, NULL, NULL);
         off += NLMSG_ALIGN(len);
     }
+    free(c.raw);
     return 0;
 }
 
@@ -387,7 +381,7 @@ int rtnl_rule_from(int add, struct in_addr src, int table, int prio) {
     return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
 }
 
-int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio) {
+int rtnl_rule_mark(int add, int fam, uint32_t mark, uint32_t mask, int table, int prio) {
     uint8_t buf[128];
     struct nlbuf b;
     struct fib_rule_hdr fr;
@@ -397,57 +391,55 @@ int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio)
     fr.table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
     /* NLM_F_EXCL — как у `ip rule add`: ядро тогда отвечает EEXIST на точную копию, и вторая
      * одинаковая не появляется. Без приоритета ядро выбирает его само — тем же правилом, что и
-     * для `ip rule add` без pref. */
-    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWRULE,
-                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+     * для `ip rule add` без pref; снятие без приоритета снимает первую подходящую копию (ENOENT —
+     * копий больше нет), как `ip rule del`. */
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), add ? RTM_NEWRULE : RTM_DELRULE,
+                                    NLM_F_REQUEST | NLM_F_ACK |
+                                        (add ? NLM_F_CREATE | NLM_F_EXCL : 0),
                                     &fr, sizeof(fr));
     nlbuf_put_u32(&b, FRA_FWMARK, mark);
     nlbuf_put_u32(&b, FRA_FWMASK, mask);
     nlbuf_put_u32(&b, FRA_TABLE, (uint32_t)table);
     if (prio > 0) nlbuf_put_u32(&b, FRA_PRIORITY, (uint32_t)prio);
     int rc = rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
-    return rc == EEXIST ? 0 : rc;
+    return add && rc == EEXIST ? 0 : rc;
+}
+
+int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio) {
+    return rtnl_rule_mark(1, fam, mark, mask, table, prio);
+}
+
+int rtnl_route_default(int fam, int table, int type, int ifindex, int metric) {
+    uint8_t buf[128];
+    struct nlbuf b;
+    struct rtmsg rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rtm_family = fam == 6 ? AF_INET6 : AF_INET;
+    rt.rtm_table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
+    rt.rtm_protocol = RTPROT_BOOT;
+    /* Как у iproute2: маршрут в устройство без шлюза — scope link, запрет — universe. */
+    rt.rtm_scope = type == RTN_UNICAST ? RT_SCOPE_LINK : RT_SCOPE_UNIVERSE;
+    rt.rtm_type = (unsigned char)type;
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWROUTE,
+                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+                                    &rt, sizeof(rt));
+    nlbuf_put_u32(&b, RTA_TABLE, (uint32_t)table);
+    if (type == RTN_UNICAST) nlbuf_put_u32(&b, RTA_OIF, (uint32_t)ifindex);
+    if (metric > 0) nlbuf_put_u32(&b, RTA_PRIORITY, (uint32_t)metric);
+    return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
 }
 
 int rtnl_route_default_dev(int table, int ifindex) {
-    uint8_t buf[128];
-    struct nlbuf b;
-    struct rtmsg rt;
-    memset(&rt, 0, sizeof(rt));
-    rt.rtm_family = AF_INET;
-    rt.rtm_table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
-    rt.rtm_protocol = RTPROT_BOOT;
-    rt.rtm_scope = RT_SCOPE_LINK;
-    rt.rtm_type = RTN_UNICAST;
-    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWROUTE,
-                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
-                                    &rt, sizeof(rt));
-    nlbuf_put_u32(&b, RTA_TABLE, (uint32_t)table);
-    nlbuf_put_u32(&b, RTA_OIF, (uint32_t)ifindex);
-    return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
+    return rtnl_route_default(4, table, RTN_UNICAST, ifindex, 0);
 }
 
+/* prohibit, а не blackhole: тот же вид, что кладёт table_bind6 (table_bh_type в failover.c —
+ * запрет IPv6 отвечает клиенту ICMPv6 сразу, шаг 8 выпуска 1.10). Замена, как у
+ * `ip -6 route replace` в backstop_set_fam: стоящий запрет той же метрики она не дублирует и
+ * blackhole прежней версии заменяет на месте. Устройства в сообщении нет — ядро само вешает
+ * запрет на lo. */
 int rtnl_route6_backstop(int table, int metric) {
-    uint8_t buf[128];
-    struct nlbuf b;
-    struct rtmsg rt;
-    memset(&rt, 0, sizeof(rt));
-    rt.rtm_family = AF_INET6;
-    rt.rtm_table = table < 256 ? (uint8_t)table : RT_TABLE_UNSPEC;
-    rt.rtm_protocol = RTPROT_BOOT;
-    rt.rtm_scope = RT_SCOPE_UNIVERSE;
-    /* prohibit, а не blackhole: тот же вид, что кладёт table_bind6 (table_bh_type в failover.c —
-     * запрет IPv6 отвечает клиенту ICMPv6 сразу, шаг 8 выпуска 1.10). Замена, как у
-     * `ip -6 route replace` в backstop_set_fam: стоящий запрет той же метрики она не дублирует и
-     * blackhole прежней версии заменяет на месте. Устройства в сообщении нет — ядро само вешает
-     * запрет на lo. */
-    rt.rtm_type = RTN_PROHIBIT;
-    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_NEWROUTE,
-                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
-                                    &rt, sizeof(rt));
-    nlbuf_put_u32(&b, RTA_TABLE, (uint32_t)table);
-    nlbuf_put_u32(&b, RTA_PRIORITY, (uint32_t)metric);
-    return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
+    return rtnl_route_default(6, table, RTN_PROHIBIT, 0, metric);
 }
 
 /* ---- вопросы diag ------------------------------------------------------------------------ */
@@ -476,6 +468,62 @@ int rtnl_default6(void) {
     int found = 0;
     if (rtnl_talk(buf, msg_end(&b, nh), default6_cb, &found) != 0) return -1;
     return found;
+}
+
+struct defdev_ctx { void (*cb)(const char *dev, void *ctx); void *ctx; };
+
+static void defdev_cb(const struct nlmsghdr *h, void *ctx) {
+    struct defdev_ctx *c = ctx;
+    if (h->nlmsg_type != RTM_NEWROUTE) return;
+    const struct rtmsg *rt = NLMSG_DATA(h);
+    size_t hl = NLMSG_ALIGN(sizeof(*rt));
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl || (rt->rtm_family != AF_INET && rt->rtm_family != AF_INET6)) return;
+    if ((rt->rtm_flags & RTM_F_CLONED) || rt->rtm_dst_len != 0 || rt->rtm_type != RTN_UNICAST) return;
+    const struct rtattr *tb[RTA_MAX + 1];
+    attrs_parse((const uint8_t *)rt + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, RTA_MAX);
+    uint32_t table = tb[RTA_TABLE] ? rta_u32(tb[RTA_TABLE]) : rt->rtm_table;
+    char name[IF_NAMESIZE];
+    if (table == RT_TABLE_MAIN && tb[RTA_OIF] && if_indextoname(rta_u32(tb[RTA_OIF]), name)) c->cb(name, c->ctx);
+}
+
+int rtnl_default_devs(void (*cb)(const char *dev, void *ctx), void *ctx) {
+    uint8_t buf[64];
+    struct nlbuf b;
+    struct rtmsg rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rtm_family = AF_UNSPEC;
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
+    struct defdev_ctx c = { cb, ctx };
+    return rtnl_talk(buf, msg_end(&b, nh), defdev_cb, &c) == 0 ? 0 : -1;
+}
+
+/* Есть ли в таблице маршрут по умолчанию IPv4 любого вида (устройство, blackhole, prohibit,
+ * unreachable) — то, что печатает `ip -4 route show table N` строкой с «default». */
+struct tdef_ctx { uint32_t table; int found; };
+
+static void tdef_cb(const struct nlmsghdr *h, void *ctx) {
+    struct tdef_ctx *c = ctx;
+    if (h->nlmsg_type != RTM_NEWROUTE || c->found) return;
+    const struct rtmsg *rt = NLMSG_DATA(h);
+    size_t hl = NLMSG_ALIGN(sizeof(*rt));
+    if (h->nlmsg_len < NLMSG_HDRLEN + hl || rt->rtm_family != AF_INET) return;
+    if ((rt->rtm_flags & RTM_F_CLONED) || rt->rtm_dst_len != 0) return;
+    const struct rtattr *tb[RTA_MAX + 1];
+    attrs_parse((const uint8_t *)rt + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, RTA_MAX);
+    uint32_t table = tb[RTA_TABLE] ? rta_u32(tb[RTA_TABLE]) : rt->rtm_table;
+    if (table == c->table) c->found = 1;
+}
+
+int rtnl_table_has_default(int table) {
+    uint8_t buf[64];
+    struct nlbuf b;
+    struct rtmsg rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rtm_family = AF_INET;
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
+    struct tdef_ctx c = { (uint32_t)table, 0 };
+    if (rtnl_talk(buf, msg_end(&b, nh), tdef_cb, &c) != 0) return -1;
+    return c.found;
 }
 
 struct route_dev_ctx { char *dev; size_t n; };
@@ -513,7 +561,7 @@ int rtnl_route_dev(struct in_addr dst, char *dev, size_t n) {
 
 /* ---- маршруты main IPv6 для префикса донора (rtnl.h) ---------------------------------------- */
 
-struct main6_ctx { struct rtnl_route6 *v; size_t n, max; };
+struct main6_ctx { struct rtnl_route6 *v; size_t n, cap; int oom; };
 
 static void main6_cb(const struct nlmsghdr *h, void *ctx) {
     struct main6_ctx *c = ctx;
@@ -528,7 +576,14 @@ static void main6_cb(const struct nlmsghdr *h, void *ctx) {
     if (table != RT_TABLE_MAIN) return;
     int nullroute = rt->rtm_type == RTN_UNREACHABLE && rt->rtm_dst_len > 0;
     int srcdef = rt->rtm_dst_len == 0 && rt->rtm_src_len > 0;
-    if ((!nullroute && !srcdef) || c->n >= c->max) return;
+    if ((!nullroute && !srcdef) || c->oom) return;
+    if (c->n >= c->cap) {
+        size_t cap = c->cap ? c->cap * 2 : 64;
+        struct rtnl_route6 *g = realloc(c->v, cap * sizeof(*g));
+        if (!g) { c->oom = 1; return; }
+        c->v = g;
+        c->cap = cap;
+    }
     struct rtnl_route6 *r = &c->v[c->n];
     memset(r, 0, sizeof(*r));
     r->type = rt->rtm_type;
@@ -540,7 +595,8 @@ static void main6_cb(const struct nlmsghdr *h, void *ctx) {
     c->n++;
 }
 
-int rtnl_main6_routes(struct rtnl_route6 *v, size_t max) {
+int rtnl_main6_routes(struct rtnl_route6 **out) {
+    *out = NULL;
     uint8_t buf[64];
     struct nlbuf b;
     struct rtmsg rt;
@@ -548,18 +604,19 @@ int rtnl_main6_routes(struct rtnl_route6 *v, size_t max) {
     rt.rtm_family = AF_INET6;
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE,
                                     NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
-    struct main6_ctx c = { v, 0, max };
-    if (rtnl_talk(buf, msg_end(&b, nh), main6_cb, &c) != 0) return -1;
+    struct main6_ctx c = { NULL, 0, 0, 0 };
+    if (rtnl_talk(buf, msg_end(&b, nh), main6_cb, &c) != 0 || c.oom) { free(c.v); return -1; }
+    *out = c.v;
     return (int)c.n;
 }
 
 /* ---- адреса IPv6 с признаками (rtnl.h) ------------------------------------------------------ */
 
-struct addr6_ctx { struct rtnl_addr6 *v; size_t n, max; };
+struct addr6_ctx { struct rtnl_addr6 *v; size_t n, cap; int oom; };
 
 static void addr6_cb(const struct nlmsghdr *h, void *ctx) {
     struct addr6_ctx *c = ctx;
-    if (h->nlmsg_type != RTM_NEWADDR || c->n >= c->max) return;
+    if (h->nlmsg_type != RTM_NEWADDR || c->oom) return;
     const struct ifaddrmsg *ia = NLMSG_DATA(h);
     size_t hl = NLMSG_ALIGN(sizeof(*ia));
     if (h->nlmsg_len < NLMSG_HDRLEN + hl || ia->ifa_family != AF_INET6) return;
@@ -568,6 +625,13 @@ static void addr6_cb(const struct nlmsghdr *h, void *ctx) {
     /* У IPv6 IFA_ADDRESS — сам адрес (IFA_LOCAL у него бывает только у точка-точка). */
     const struct rtattr *a = tb[IFA_LOCAL] ? tb[IFA_LOCAL] : tb[IFA_ADDRESS];
     if (!a || RTA_PAYLOAD(a) < 16) return;
+    if (c->n >= c->cap) {
+        size_t cap = c->cap ? c->cap * 2 : 64;
+        struct rtnl_addr6 *g = realloc(c->v, cap * sizeof(*g));
+        if (!g) { c->oom = 1; return; }
+        c->v = g;
+        c->cap = cap;
+    }
     struct rtnl_addr6 *r = &c->v[c->n];
     memset(r, 0, sizeof(*r));
     memcpy(r->a, RTA_DATA(a), 16);
@@ -586,7 +650,8 @@ static void addr6_cb(const struct nlmsghdr *h, void *ctx) {
     c->n++;
 }
 
-int rtnl_addrs6(struct rtnl_addr6 *v, size_t max) {
+int rtnl_addrs6(struct rtnl_addr6 **out) {
+    *out = NULL;
     uint8_t buf[64];
     struct nlbuf b;
     struct ifaddrmsg ia;
@@ -594,7 +659,8 @@ int rtnl_addrs6(struct rtnl_addr6 *v, size_t max) {
     ia.ifa_family = AF_INET6;
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETADDR,
                                     NLM_F_REQUEST | NLM_F_DUMP, &ia, sizeof(ia));
-    struct addr6_ctx c = { v, 0, max };
-    if (rtnl_talk(buf, msg_end(&b, nh), addr6_cb, &c) != 0) return -1;
+    struct addr6_ctx c = { NULL, 0, 0, 0 };
+    if (rtnl_talk(buf, msg_end(&b, nh), addr6_cb, &c) != 0 || c.oom) { free(c.v); return -1; }
+    *out = c.v;
     return (int)c.n;
 }

@@ -78,7 +78,7 @@ struct px_node {
 struct px_skip { char reason[96]; char example[144]; size_t count; };
 struct px_sub_stats {
     size_t skipped;                      /* узлов наших протоколов, непригодных к работе */
-    size_t foreign;                      /* ссылок и outbound'ов других протоколов */
+    size_t foreign;                      /* ссылок других протоколов */
     struct px_skip reasons[PX_SKIP_REASONS];
     size_t reasons_n, reasons_dropped;
 };
@@ -87,8 +87,9 @@ struct px_sub_stats {
  * ссылка наших протоколов. want — только этот протокол (0 — любой из пяти). */
 int px_parse_url(const char *url, struct px_node *n, enum px_proto want);
 
-/* Подписка целиком: список ссылок по строкам, тот же список в base64, либо конфиг sing-box (объект
- * outbounds). Берутся узлы протокола want (0 — все пять); чужое — в foreign. Число пригодных. */
+/* Подписка целиком: список ссылок по строкам или тот же список в base64. Конфиг sing-box (объект
+ * outbounds) здесь не разбирается — его переводит в ссылки коннектор (steer-box-connector). Берутся
+ * узлы протокола want (0 — все пять); чужое — в foreign. Число пригодных. */
 size_t px_parse_sub(const char *text, struct px_node *out, size_t max, enum px_proto want,
                     struct px_sub_stats *st);
 const char *px_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_n);
@@ -99,7 +100,6 @@ struct px_node *px_load_sub(const char *path, enum px_proto want, size_t *cnt,
 
 /* Имя протокола для спеки и ссылки, и обратно. */
 const char *px_proto_name(enum px_proto p);
-enum px_proto px_proto_by_name(const char *s);
 
 /* Имена шифров для вывода узла (proxy-nodes): метод shadowsocks и шифр тела vmess. */
 const char *px_ss_method_name(enum ss_method m);

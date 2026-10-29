@@ -20,8 +20,8 @@
 
 #include "spec.h"
 #include "awg.h"
+#include "plugin.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "ctl.h"
@@ -34,6 +34,8 @@
 #include "fogroup.h"
 #include "fpseed.h"
 #include "recon.h"
+#include "nftdump.h"
+#include "rtnl.h"
 
 static void iptables_masq_drop_all(void);   /* ниже, у apply_routing */
 static int table_has_default(int table);    /* ниже, у apply-commit */
@@ -108,28 +110,31 @@ static void registry_snapshot(void) {
 static void cleanup_stale_routing(const struct spec *sp) {
     for (size_t i = 0; i < g_oldreg_n; i++) {
         int live = 0;
-        /* Выход с устройством живой только с той же ПАРОЙ «метка, таблица»: освободившуюся метку
-         * реестр отдаёт другому выходу, и правило прежнего владельца (`fwmark M lookup <его
-         * таблица>`) пережило бы его, уводя трафик нового в мёртвую таблицу. Выход без устройства
-         * (таблицы у него нет) — по метке, как прежде. */
+        /* Живое — та же ПАРА «метка, таблица» у выхода с устройством. Одной метки мало: освободившуюся
+         * метку реестр отдаёт другому выходу, и правило прежнего владельца (`fwmark M lookup
+         * <его таблица>`) пережило бы его, уводя трафик нового в мёртвую таблицу. Так было на
+         * стенде QEMU 2026-10-13: WARP с двух туннелей сократили до одного, метку cf.2 получил
+         * kind: block, и его трафик пропадал в таблице steer_cf.2, не доходя до отказа. rule_drop
+         * снимает именно эту пару — правило нового владельца с другой таблицей не задевается. */
         for (size_t k = 0; k < sp->out_n; k++)
             if (out_needs_mark(&sp->out[k]) && sp->out[k].mark == g_oldreg[i].mark &&
-                (!out_has_device(&sp->out[k]) || sp->out[k].table == g_oldreg[i].table)) {
+                (!out_has_device(&sp->out[k]) ? 0 : sp->out[k].table == g_oldreg[i].table)) {
                 live = 1;
                 break;
             }
         if (live) continue;
-        /* Таблицу — только ничью: её номер реестр тоже мог отдать другому выходу. Правила снимаются
-         * в любом случае, и IPv4, и IPv6 именно этой пары. */
+        char table[16];
+        snprintf(table, sizeof(table), "%d", g_oldreg[i].table);
+        rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
+        rule_drop6(g_oldreg[i].mark, g_oldreg[i].table);
+        /* Таблицу — только ничью: её номер реестр тоже мог отдать другому выходу. */
         int tlive = 0;
         for (size_t k = 0; k < sp->out_n && !tlive; k++)
             tlive = out_has_device(&sp->out[k]) && sp->out[k].table == g_oldreg[i].table;
-        if (tlive) {
-            rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
-            rule_drop6(g_oldreg[i].mark, g_oldreg[i].table);
-            continue;
-        }
-        routing_drop(g_oldreg[i].mark, g_oldreg[i].table);
+        if (tlive) continue;
+        const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
+        run(flush);
+        route6_flush(g_oldreg[i].table);
     }
 }
 
@@ -148,8 +153,8 @@ static void cleanup_stale_routing(const struct spec *sp) {
  * разрешаться вовсе. То же с on_fail=drop: blackhole в таблице выхода пережил бы выключение
  * и держал трафик закрытым без всякой видимой причины.
  *
- * Все таблицы — в каждой раскладке: inet (обычное ядро), ip/ip6 (nat старого ядра, см.
- * nft_compat) и steer_obfs (правила обфускаторов). Какой таблицы нет — отказ nft молча
+ * Все таблицы: inet, ip и ip6 (остатки прежней раскладки для ядра 4.9) и steer_obfs (правила
+ * обфускаторов). Какой таблицы нет — отказ nft молча
  * значит «нечего снимать». Спека не читается: снимать надо и то, что поставила прежняя
  * спека, а реестр в состоянии — это и есть список того, что стоит в ядре. */
 int cmd_down(void) {
@@ -247,28 +252,67 @@ static int ip6tables_nat_ok(void) {
     return ok;
 }
 
+/* Снять все наши правила MASQUERADE (метка в поле ядра steer) из nat POSTROUTING.
+ *
+ * Без пределов: прежде читалось не больше 64 правил и 31 слова на правило, и сверх того правила
+ * оставались висеть молча. Снимаются одним процессом `<tool>-restore --noflush` (все -D одной
+ * транзакцией) вместо отдельного iptables на каждое правило; не вышло (нет -restore, отказ) — по
+ * правилу, как прежде. */
 static void masq_drop_all_tool(const char *tool) {
     char mask[24], cmd[96];
     snprintf(mask, sizeof(mask), "/0x%x ", STEER_MARK_MASK);
     snprintf(cmd, sizeof(cmd), "%s -w -t nat -S POSTROUTING 2>/dev/null", tool);
     FILE *p = popen(cmd, "r");
     if (!p) return;
-    char line[512], lines[64][512];
-    int n = 0;
-    while (n < 64 && fgets(line, sizeof(line), p)) {
+    char **lines = NULL, *line = NULL;
+    size_t n = 0, cap = 0, lcap = 0;
+    ssize_t got;
+    while ((got = getline(&line, &lcap, p)) > 0) {
         if (strncmp(line, "-A POSTROUTING ", 15) || !strstr(line, mask) ||
             !strstr(line, "-j MASQUERADE")) continue;
-        snprintf(lines[n++], sizeof(lines[0]), "%s", line + 15);
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            char **g = realloc(lines, nc * sizeof(*g));
+            if (!g) break;
+            lines = g;
+            cap = nc;
+        }
+        char *d = strdup(line + 15);
+        if (!d) break;
+        d[strcspn(d, "\n")] = '\0';
+        lines[n++] = d;
     }
+    free(line);
     pclose(p);
-    for (int i = 0; i < n; i++) {
-        const char *argv[32] = { tool, "-w", "-t", "nat", "-D", "POSTROUTING" };
-        int k = 6;
-        for (char *t = strtok(lines[i], " \n"); t && k < 31; t = strtok(NULL, " \n"))
-            argv[k++] = t;
-        argv[k] = NULL;
-        run(argv);
+    if (!n) { free(lines); return; }
+
+    int done = 0;
+    snprintf(cmd, sizeof(cmd), "%s-restore -w --noflush >/dev/null 2>&1", tool);
+    FILE *r = popen(cmd, "w");
+    if (r) {
+        fputs("*nat\n", r);
+        for (size_t i = 0; i < n; i++) fprintf(r, "-D POSTROUTING %s\n", lines[i]);
+        fputs("COMMIT\n", r);
+        done = pclose(r) == 0;
     }
+    for (size_t i = 0; i < n; i++) {
+        if (!done) {
+            size_t words = 1;
+            for (const char *q = lines[i]; *q; q++) words += *q == ' ';
+            const char **argv = malloc((words + 8) * sizeof(*argv));
+            if (argv) {
+                size_t k = 0;
+                argv[k++] = tool; argv[k++] = "-w"; argv[k++] = "-t"; argv[k++] = "nat";
+                argv[k++] = "-D"; argv[k++] = "POSTROUTING";
+                for (char *t = strtok(lines[i], " "); t; t = strtok(NULL, " ")) argv[k++] = t;
+                argv[k] = NULL;
+                run(argv);
+                free(argv);
+            }
+        }
+        free(lines[i]);
+    }
+    free(lines);
 }
 
 static void iptables_masq_drop_all(void) {
@@ -381,7 +425,7 @@ static void apply_routing_one(const struct output *o) {
         fprintf(stderr, LOG_W "output %s: маршрут IPv6 в %s не встал (IPv6 на устройстве "
                         "выключен?) — IPv6 правил выхода остановлен\n", o->name, o->device);
     if (rc != 0) {
-        fprintf(stderr, LOG_W "output %s: cannot route via %s — is the device up?\n",
+        fprintf(stderr, LOG_W "выход %s: не проложить маршрут через %s — устройство поднято?\n",
                 o->name, o->device);
         /* Пустая таблица — это не «нет маршрута», а «ищи дальше»: помеченный
          * пакет провалится в следующую таблицу и уйдёт напрямую, то есть ровно
@@ -402,6 +446,7 @@ static void apply_routing_one(const struct output *o) {
              * прежнее устройство. */
             const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
             run(flush);
+            tcp_redir_sync(o, NULL);
             if (out_route6(o)) {
                 /* IPv6 — тем же путём напрямую: правило на месте, таблица пуста. */
                 rule_ensure6(o->mark, o->table);
@@ -416,120 +461,14 @@ static void apply_routing(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) apply_routing_one(&sp->out[i]);
 }
 
-/* Стоит ли в ядре таблица «<семейство> <наша таблица>». Один `nft list tables` на процесс:
- * спрашивают о двух семействах подряд, а перечень таблиц за это время не меняется. Не смогли
- * спросить — «нет»: лишний `delete` отверг бы весь набор правил, а пропущенный оставляет
- * только чужую теперь таблицу, о которой скажет diag. */
+/* Стоит ли в ядре таблица «<семейство> <наша таблица>» — вопрос ядру по netlink (nfd_table_exists),
+ * а не разбор текста `nft list tables` в буфере: перечень таблиц на коробке с чужими firewall
+ * длиннее любого буфера, и обрезанный перечень выдавал бы стоящую таблицу за отсутствующую.
+ * Не смогли спросить — «нет»: лишний `delete` отверг бы весь набор правил, а пропущенный
+ * оставляет только чужую теперь таблицу, о которой скажет diag. */
 static int nft_table_exists(const char *fam) {
-    static char list[4096];
-    static int loaded;
-    if (!loaded) {
-        loaded = 1;
-        FILE *p = popen("nft list tables 2>/dev/null", "r");
-        if (p) {
-            size_t n = fread(list, 1, sizeof(list) - 1, p);
-            list[n] = '\0';
-            pclose(p);
-        }
-    }
-    char want[96];
-    snprintf(want, sizeof(want), "table %s %s", fam, nft_table());
-    size_t wn = strlen(want);
-    for (const char *q = list; (q = strstr(q, want)) != NULL; q += wn)
-        if ((q == list || q[-1] == '\n') && (q[wn] == '\n' || q[wn] == '\0')) return 1;
-    return 0;
+    return nfd_table_exists(!strcmp(fam, "ip6") ? NFD_IP6 : NFD_IP, nft_table());
 }
-
-/* ЧЕГО НЕ БУДЕТ НА СТАРОМ ЯДРЕ — вслух, при каждом apply в старой раскладке.
- *
- * Раскладка для 4.9 собирает всё, что ядро умеет, а без чего-то приходится обходиться. Молча
- * выбросить правило значило бы, что человек узнает о нём по симптому, — поэтому каждое
- * выброшенное называется здесь вместе с последствием. Строки идут в stderr и в журнал, как
- * остальные предупреждения apply. */
-static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
-    if (!NFT_LEGACY) return;
-    fprintf(stderr, "steer[info] apply: ядро без nat в семействе inet — правила собраны для "
-                    "nftables старого ядра: таблицы inet и ip%s\n",
-            legacy_has_ip6(sp) ? " и ip6" : "");
-    if (zapret_present(sp) && !(g_nftc & NFTC_NOTRACK))
-        fprintf(stderr, LOG_W "ядро не знает notrack: порождённые обработчиком zapret пакеты "
-                        "(подделки, куски разрезанного) остаются на учёте conntrack. Где "
-                        "firewall отбрасывает ct state invalid, обход выходов kind=zapret "
-                        "может не срабатывать\n");
-    if (sp->traceroute_hops && has_domains(gr) && !(g_nftc & NFTC_NOTRACK))
-        fprintf(stderr, LOG_W "ядро не знает notrack: traceroute_hops на нём не действует, "
-                        "промежуточные узлы будут видны как прежде\n");
-    if (!prof()->no_resolver && !(g_nftc & NFTC_IP6NAT))
-        fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут "
-                        "мимо резолвера ядра steer, и доменные каналы видят только тех, кто "
-                        "спрашивает по IPv4\n");
-    /* fake-IP v6 держится на dnat в ip6 (карта fakeip6): без него у доменных правил fake-IP
-     * половины IPv6 нет (dom6_ok), и AAAA их имён резолвер гасит. */
-    if (!(g_nftc & NFTC_IP6NAT) && has_fakeip(gr))
-        fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: у доменных правил fake-IP нет IPv6 — "
-                        "на запросы AAAA их имён ответ пустой, и клиенты ходят к этим сайтам по "
-                        "IPv4\n");
-    if (plat()->local_channels && !(g_nftc & NFTC_IP6NAT) && has_local_domains(gr))
-        fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS приложений телефона по "
-                        "IPv6 идут мимо резолвера ядра steer, и доменные каналы телефона их не "
-                        "видят\n");
-    /* На Android таблица nat iptables есть всегда, но PREROUTING в ней у netd — пустая
-     * oem_nat_pre, и предупреждать там не о чем (plat()->warn_iptables_nat). Почему это вообще
-     * важно — у legacy.c (шаг 4, «почему dstnat - 1»). */
-    FILE *t = plat()->warn_iptables_nat ? fopen("/proc/net/ip_tables_names", "r") : NULL;
-    if (t) {
-        char line[64];
-        int nat = 0;
-        while (fgets(line, sizeof(line), t)) if (!strncmp(line, "nat", 3)) nat = 1;
-        fclose(t);
-        if (nat)
-            fprintf(stderr, LOG_W "на этом ядре работает и nat iptables: для соединений, "
-                            "которые не забрало ядро steer, его правила PREROUTING (пробросы "
-                            "портов) не сработают — старое ядро не даёт двум таблицам nat "
-                            "поделить один хук\n");
-    }
-}
-
-/* Умеет ли ЯДРО отдавать пакеты в очередь nfqueue.
- *
- * ЗАЧЕМ ОТДЕЛЬНАЯ ПРОВЕРКА. Без модуля nft_queue правило `queue num N` не отвергается
- * разбором — оно отвергается ядром, и nft говорит об этом так: «Could not process rule: No
- * such file or directory» с указателем на слово queue. Дословно проверено на роутере
- * (OpenWrt 25.12, nftables 1.1.6, kmod-nft-queue не установлен). Прочитать в этом «нет
- * пакета kmod-nft-queue» невозможно, а последствие — отказ ВСЕЙ транзакции: `nft -f`
- * атомарен, поэтому вместе с очередью не встают ни наборы, ни метки, ни перенаправление
- * DNS. То есть один незнакомый роутеру вид выхода снимает маршрутизацию целиком.
- *
- * Зависимость пакета этого не закрывает, и это главный довод. Движок ставят файлом из
- * GitHub Releases (install.sh), а файл зависимостей не разрешает — их проверяет только
- * менеджер пакетов. Объявить kmod-nft-queue в .apk нужно (и объявлено), но полагаться на
- * это как на единственную защиту значит защитить не тот путь установки.
- *
- * ПРОБА, А НЕ ПОИСК МОДУЛЯ. Спросить у ядра «есть ли nft_queue» нечем: /proc/modules врёт о
- * встроенном в ядро (=y вместо =m), а перечня поддерживаемых выражений nftables не отдаёт.
- * Поэтому спрашивается ровно то, что нам нужно: примет ли ядро правило с queue. Стоит это
- * одного запуска nft и только когда в спеке есть выход kind=zapret. */
-static int nfqueue_supported(void) {
-    char tmp[256];
-    steer_tmp_template(tmp, sizeof(tmp), "steer-qprobe");
-    int fd = mkstemp(tmp);
-    if (fd < 0) return 1;   /* не смогли проверить — не мешаем: решать будет сам nft */
-    FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); unlink(tmp); return 1; }
-    /* Своё имя таблицы: `nft -c` ничего не создаёт, но столкнуться именем с чужой живой
-     * таблицей всё равно нельзя — проверка тогда проверяла бы её содержимое. */
-    fprintf(f, "table inet %s_qprobe {\n"
-               "    chain c {\n"
-               "        type filter hook output priority mangle + 10; policy accept;\n"
-               "        meta mark and 0x%08x == 0x%08x queue num %d bypass\n"
-               "    }\n}\n", nft_table(), STEER_MARK_MASK, STEER_MARK_BASE, ZAPRET_QUEUE_BASE);
-    fclose(f);
-    const char *check[] = { "nft", "-c", "-f", tmp, NULL };
-    int rc = run_quiet(check);
-    unlink(tmp);
-    return rc == 0;
-}
-
 
 /* IPv6 ОТ ХОСТА — что не так, вслух при apply (подробно и с приговором — diag, `ipv6_host`).
  * Ключ routed/nat там, где он не действует (телефон), и донор, префикс которого не узнать: без
@@ -566,49 +505,46 @@ static void report_v6_host(const struct spec *sp) {
 
 /* Общее начало: разбор, реестр, группы, проверки, раскладка. full=0 — только разбор, реестр и
  * выбор устройств (apply-commit без новых правил: ему нужны метки и таблицы выходов, а групп и
- * списков он не касается). nftc < 0 — раскладку спросить у ядра (nft_compat); иначе взять
- * готовую — её демон запомнил с первого плана и пробы ядра не повторяет. report — сказать о
- * том, чего не будет на старом ядре. */
+ * списков он не касается). nftc < 0 — раскладку (хук ingress) спросить у ядра; иначе взять
+ * готовую — её демон запомнил с первого плана и пробы ядра не повторяет. report — сказать вслух о
+ * том, что спека просит сверх возможного. */
 static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr, int full,
-                          int nftc, int report) {
+                          int nftc, int report, int strict) {
     /* Разбор спеки и компиляция возвращают отказ, а не завершают процесс сами (правило 5,
      * docs/architecture.md, раздел 2) — err_die здесь, в точке входа, довершает то же самое:
      * код 2, тот же текст, что раньше печатал die() изнутри load_spec/build_groups/generate. */
     struct err e = {0};
-    if (load_spec(spec, cfg, &e) < 0) err_die(&e);
+    /* ШАГ ПОДГОТОВКИ (kinds/plugprep.c): хуки плагинов check, expand, pre_apply — над спекой человека,
+     * до разбора. strict — apply и check из интерфейса: отказ хука — отказ всей спеки, и выход вида
+     * без плагина тоже отказ (LOAD_STRICT). Без strict — запуск и перезагрузка: сбой подготовки не
+     * роняет остальное, выходы, которые не подготовлены, уходят в on_fail как недоступные. Подготовка
+     * нужна и разбору без хуков — ничего не делает, пока хуков нет ни у одного плагина. */
+    if (full && spec_prepare(spec, &e) < 0) {
+        if (strict) err_die(&e);
+        fprintf(stderr, "steer[warn] подготовка спеки: %s\n", e.msg);
+        e.msg[0] = '\0';
+    }
+    if (load_spec_mode(spec, cfg, &e, strict ? LOAD_STRICT : LOAD_PREPARED) < 0) err_die(&e);
     /* Снимок реестра — строго до registry_assign: тот перезапишет файл текущими
      * выходами, и метки удалённых/переименованных будут потеряны вместе с
      * единственным способом снять их правила из ядра. */
     registry_snapshot();
     if (registry_assign(cfg, &e) < 0) err_die(&e);
+    tcp_redir_learn(cfg);
     if (!full) {
         outputs_adopt_active(cfg);
         return;
     }
     /* Раскладка набора правил — до генерации и до dry-run: интерфейс проверяет спеку именно
-     * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. И до build_groups:
-     * от неё зависит половина IPv6 доменных групп (fake-IP v6 — только где есть nat в ip6). */
-    g_nftc = nftc >= 0 ? nftc : nft_compat();
+     * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. */
+    g_nftc = nftc >= 0 ? nftc : 0;
     /* Хук ingress (NFTC_INGRESS) — тем же разом, что раскладка, и ходит вместе с ней (--nftc):
      * проба `nft -c` на каждый apply была бы процессом на каждое сохранение настройки. Где
-     * ingress не будет всё равно — телефон с устройствами раздачи по требованию, поле метки без
-     * места под «разобран на ingress» (мини-сборка tgws), — ядро не спрашивается вовсе. */
-    if (nftc < 0 && !(g_nftc & NFTC_LEGACY) && plat()->lan_devs_persist &&
+     * ingress не будет всё равно — телефон с устройствами раздачи по требованию, — ядро не спрашивается вовсе. */
+    if (nftc < 0 && plat()->lan_devs_persist &&
         steer_ingress_seen_ok() && nft_ingress_ok())
         g_nftc |= NFTC_INGRESS;
     if (build_groups(cfg, gr, &e) < 0) err_die(&e);
-    /* ДОМЕННЫЙ КАНАЛ В МИНИ-СБОРКЕ — ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ.
-     *
-     * Домены маршрутизируются через резолвер движка, а мини-сборка его не поднимает и
-     * перенаправления DNS не ставит (см. генератор правил). Такая спека применилась бы и
-     * не работала: имена не разрешаются нами, fake-адрес не появляется, канал стоит
-     * пустым. Молчаливое применение здесь хуже отказа — искать причину пришлось бы на
-     * роутере. */
-    for (size_t i = 0; prof()->no_resolver && i < gr->n; i++)
-        if (gr->g[i].domains)
-            die("канал «%s» доменный, а эта сборка резолвера не поднимает: разрешать имена "
-                "ей нечем. Переведите канал на адресный список или поставьте полное ядро steer",
-                gr->g[i].name);
     /* Устройство выхода — то, что несёт трафик сейчас, а не первое в списке кандидатов.
      * Иначе применение настройки уводило бы таблицу с работающего запасного устройства на
      * неработающее основное, а при on_fail=drop ещё и ставило запрет — то есть каждое
@@ -624,7 +560,6 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
      * Значит человек узнает про не тот список сразу при сохранении, а не потом, когда
      * apply молча не подействует. */
     if (check_address_lists(gr, &e) < 0) err_die(&e);
-    if (report) report_legacy_gaps(cfg, gr);
 }
 
 /* ЗАСЕВ НАБОРОВ КАНАЛОВ fake-IP — вокруг печати текста для ядра (доводы — в шапке
@@ -697,23 +632,14 @@ static void failopen_seed_end(void) {
     failopen_seed_buf = NULL;
 }
 
-/* Одна транзакция: проверка очереди zapret, файл «добавить — удалить — новая таблица», nft -f.
+/* Одна транзакция: файл «добавить — удалить — новая таблица», nft -f.
  * 0 — ядро приняло; 1 — отвергло (прежняя таблица стоит, причина в журнале). */
 static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
     struct err e = {0};
-    /* Отказываем ДО транзакции и НАЗЫВАЕМ причину: иначе человек получит отказ всей
-     * маршрутизации с сообщением про несуществующий файл. Пакет назван прямо — его же
-     * тянет за собой zapret, поэтому у тех, кто обходом уже пользуется, он стоит. */
-    if (zapret_present(cfg) && !nfqueue_supported())
-        die("в спеке есть выход kind=zapret, а ядро не принимает правило queue — "
-            "нужен пакет kmod-nft-queue (его ставит и сам zapret). Правила НЕ применены: "
-            "nft грузит набор целиком, и отказ на очереди снял бы заодно наборы, метки и "
-            "перенаправление DNS", NULL);
-
     char tmp[256];
     steer_tmp_template(tmp, sizeof(tmp), "steer-ruleset");
     int fd = mkstemp(tmp);
-    if (fd < 0) die("cannot create a temporary ruleset", NULL);
+    if (fd < 0) die("не создать временный файл набора правил", NULL);
     FILE *f = fdopen(fd, "w");
     /* Крупный буфер на чисто дозаписывающий поток: musl по умолчанию даёт
      * BUFSIZ в 1 КБ, и набор на сотни тысяч элементов дробился на тысячи
@@ -750,25 +676,16 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
      * В --dry-run эти две строки не печатаются: там выводится сам набор правил (его сверяют
      * стенды и интерфейс), а замена — дело применения. */
     fprintf(f, "table inet %s\ndelete table inet %s\n", nft_table(), nft_table());
-    /* Таблицы ip и ip6 — тем же приёмом и в той же транзакции. Их создаёт только старая
-     * раскладка (legacy.c), но УДАЛЯТЬ их обязана любая: ядро телефона обновится
-     * до нового (Android 17 — ядра новее 5.2), apply выберет современную раскладку, и
-     * оставшаяся от старой цепочка nat заворачивала бы DNS второй раз, а карта fakeip в ней
-     * отставала бы от резолвера. И наоборот, выход раскладки из ip6 (ядро перестало
-     * принимать nat в ip6) не должен оставлять прежнюю таблицу. Отсутствующую таблицу
-     * удалять нельзя — `delete` отверг бы весь файл, — поэтому для таблицы вне раскладки
-     * спрашиваем ядро, есть ли она (один `nft list tables` на apply). На роутере, где старой
-     * раскладки не было никогда, файл остаётся прежним, байт в байт. */
+    /* Таблицы ip и ip6 движка — остатки раскладки для Linux 4.9 (убрана, I-541): прежний apply
+     * мог поставить их на телефоне, и оставшаяся там цепочка nat заворачивала бы DNS второй раз, а
+     * карта fakeip в ней отставала бы от резолвера. Отсутствующую таблицу удалять нельзя —
+     * `delete` отверг бы весь файл, — поэтому спрашиваем ядро, есть ли она. Где остатков нет
+     * (роутер), файл остаётся прежним, байт в байт. */
     {
         static const char *const fams[2] = { "ip", "ip6" };
-        int want[2] = { legacy_has_ip(cfg), legacy_has_ip6(cfg) };
-        for (int k = 0; k < 2; k++) {
-            if (want[k])
-                fprintf(f, "table %s %s\ndelete table %s %s\n",
-                        fams[k], nft_table(), fams[k], nft_table());
-            else if (nft_table_exists(fams[k]))
+        for (int k = 0; k < 2; k++)
+            if (nft_table_exists(fams[k]))
                 fprintf(f, "delete table %s %s\n", fams[k], nft_table());
-        }
     }
     seed_begin(cfg, gr, 1);
     failopen_seed_begin(cfg);
@@ -781,7 +698,7 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
     const char *load[] = { "nft", "-f", tmp, NULL };
     int rc = run(load);
     if (rc != 0) {
-        fprintf(stderr, LOG_W "nft refused the ruleset, the previous one stays (kept: %s)\n",
+        fprintf(stderr, LOG_W "nft отверг набор правил, прежний остаётся (файл набора: %s)\n",
                 tmp);
         const char *check[] = { "nft", "-c", "-f", tmp, NULL };
         run(check);
@@ -859,7 +776,8 @@ int cmd_apply(const char *spec, int dry) {
     static struct spec cfg;
     static struct groups gr;
     struct err e = {0};
-    apply_prepare(spec, &cfg, &gr, 1, -1, 1);
+    /* `apply --dry-run` — та же проверка, что check интерфейса: строгая. Просто `apply` — запуск. */
+    apply_prepare(spec, &cfg, &gr, 1, -1, 1, dry);
     /* Снять накопленное ДО генерации: она вписывает эти значения в новые правила, иначе
      * каждый apply обнулял бы объёмы. Читаем и при --dry-run — так печатаемый текст остаётся
      * тем, что реально применится, а на машине без таблицы вывод не меняется вовсе. */
@@ -909,6 +827,7 @@ int cmd_apply(const char *spec, int dry) {
     apply_routing(&cfg);
     if (ruleset_load(&cfg, &gr) != 0) return 1;
     failopen_after_load(&cfg);
+    tcp_redir_after_load(&cfg);
     /* Карта balance из набора правил — «все члены живы»; сразу к живым по подхвату, как её
      * поставил бы проход (fog_balance_adopt в fogroup.c). */
     fog_balance_adopt(&cfg);
@@ -1060,7 +979,7 @@ int cmd_apply_plan(int argc, char **argv) {
     static struct spec cfg;
     static struct groups gr;
     struct err e = {0};
-    apply_prepare(a.spec, &cfg, &gr, 1, a.nftc, 1);
+    apply_prepare(a.spec, &cfg, &gr, 1, a.nftc, 1, 1);
     awg_check_all(&cfg);
     unsigned long long h = 14695981039346656037ULL;
     /* Поток-отпечаток: fopencookie есть в glibc и musl, но в bionic его нет вовсе (даже с
@@ -1072,7 +991,7 @@ int cmd_apply_plan(int argc, char **argv) {
     cookie_io_functions_t io = { .write = fnv_write };
     FILE *f = fopencookie(&h, "w", io);
 #endif
-    if (!f) die("cannot open a stream for the ruleset fingerprint", NULL);
+    if (!f) die("не открыть поток для отпечатка набора правил", NULL);
     static char buf[65536];
     setvbuf(f, buf, _IOFBF, sizeof(buf));
     /* Отпечаток — без засева карты fake-IP из файла состояния резолвера: файл растёт с каждым
@@ -1110,16 +1029,11 @@ int cmd_apply_plan(int argc, char **argv) {
 /* Есть ли в таблице выхода маршрут по умолчанию (устройство или запрет). Нет — выход пущен
  * напрямую (apply_failed в режиме direct/zapret или неудачная привязка выше). */
 static int table_has_default(int table) {
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "ip -4 route show table %d 2>/dev/null", table);
-    FILE *p = popen(cmd, "r");
-    if (!p) return 1;
-    char line[512];
-    int yes = 0;
-    while (fgets(line, sizeof(line), p))
-        if (!strncmp(line, "default", 7) || strstr(line, " default ")) yes = 1;
-    pclose(p);
-    return yes;
+    /* Вопрос ядру по netlink, а не `ip -4 route show table N` через popen: apply спрашивает это
+     * про каждый выход дважды, и с десятками выходов это были сотни процессов sh и ip на apply.
+     * netlink отказал — как прежде при отказе popen: считаем, что маршрут есть. */
+    int r = rtnl_table_has_default(table);
+    return r < 0 ? 1 : r;
 }
 
 static int name_in_list(const char *list, const char *name) {
@@ -1162,7 +1076,7 @@ int cmd_apply_commit(int argc, char **argv) {
     recon_args_parse(argc, argv, &a, "apply-commit");
     static struct spec cfg;
     static struct groups gr;
-    apply_prepare(a.spec, &cfg, &gr, a.ruleset, a.nftc, a.ruleset);
+    apply_prepare(a.spec, &cfg, &gr, a.ruleset, a.nftc, a.ruleset, 0);
     /* Порядок — как у подкоманды (cmd_apply, «ПОРЯДОК»): устройства kind=awg, привязка выходов,
      * и только потом набор правил — чтобы новая метка не существовала без своего правила. Этим
      * путём идёт и старт демона (--apply: первый apply применяет всё). */
@@ -1186,6 +1100,7 @@ int cmd_apply_commit(int argc, char **argv) {
          * членами: отметки — по таблицам выходов (и тех, что привязаны выше: их отметку приняла
          * прежняя таблица), карты — к живым, как у подкоманды. */
         failopen_after_load(&cfg);
+        tcp_redir_after_load(&cfg);
         fog_balance_adopt(&cfg);
     }
     for (const char *p = a.drop; p && *p; ) {

@@ -43,9 +43,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # Сам список — функцией, чтобы его же печатал вызов `build.sh list` для сверки с Android.bp.
 wolfssl_c_files() {
     for f in internal keys ssl tls tls13 quic wolfio; do echo "src/$f.c"; done
-    # ge_operations.c — групповая математика Ed25519: X25519 берёт её для открытого ключа там, где
-    # у кривой свой ассемблер (aarch64, CURVED25519_ASM_64BIT); на остальных целях файл пуст.
-    for f in aes asn chacha chacha20_poly1305 coding cpuid curve25519 ecc error fe_operations \
+    # ge_operations.c — групповая математика Ed25519: проверка подписи плагинов (ed25519.c) стоит на
+    # ней, а X25519 берёт её для открытого ключа там, где у кривой свой ассемблер (aarch64).
+    for f in aes asn chacha chacha20_poly1305 coding cpuid curve25519 ecc ed25519 error fe_operations \
              ge_operations hash hmac kdf logging md5 memory poly1305 random rsa sha sha256 sha3 sha512 \
              sp_int wc_encrypt wc_mldsa wc_mlkem wc_mlkem_poly wc_port wolfmath; do
         echo "wolfcrypt/src/$f.c"

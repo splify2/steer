@@ -49,11 +49,22 @@ struct dial {
     struct sockaddr_storage res[DIAL_MAXADDR];  /* заново найденные адреса (bootstrap) */
     int res_n;
     long res_ttl;                       /* секунд */
-    int peer_i;                         /* к какому адресу подключились: индекс в res/cached */
-    int peer_from_res;
     struct sockaddr_storage addr[DIAL_MAXADDR];  /* DoQ: все адреса сервера по порядку выдачи */
     int addr_n;
 };
+
+/* ClientHello в две записи TLS (`fragment: true`, DoT и DoH). Hello — уже готовая запись (5 байт
+ * заголовка и сообщение рукопожатия, как её строит reality_build_hello_carry); хеш рукопожатия
+ * считается по сообщению, а не по записям, поэтому разрез сервер не замечает (RFC 8446, 5.1: сообщение
+ * рукопожатия вправе занимать несколько записей).
+ *
+ * dup_hello_split — смещение разреза в байтах записи (с заголовком): случайная точка внутри имени SNI
+ * (rnd выбирает её), а у Hello без SNI — на 30-80 байтах сообщения; 0 — разрезать нечем (запись
+ * короткая или не Hello). dup_hello_send — запись одной отправкой, при frag — двумя с паузой около
+ * 2 мс между ними (сокет с TCP_NODELAY): DPI, ищущий SNI в одной записи или одном сегменте, его не
+ * находит. Только первая запись соединения; дальше сокетом владеет рукопожатие. 0 — ушло. */
+size_t dup_hello_split(const unsigned char *h, size_t n, unsigned rnd);
+int dup_hello_send(int fd, const unsigned char *h, size_t n, int frag);
 
 /* Запустить поток. 0 — запущен и вернёт байт в wfd; -1 — не удалось (rc и err заполнены). */
 int dial_launch(struct dial *d);
@@ -87,7 +98,6 @@ struct dconn {
     int qhs;                    /* on_handshake сработал */
     int qerej;                  /* on_early_rejected сработал: вопросы, ушедшие до рукопожатия, потеряны */
     int qclosed;                /* on_closed сработал: qc больше не пригоден, только qc_free */
-    int qreason;                /* QC_CLOSE_* */
     char qwhy[64];
     uint64_t qerr;              /* код приложения при нашем закрытии (DOQ_*) */
     int fd, st;
@@ -96,7 +106,7 @@ struct dconn {
     uint8_t *rb;
     size_t rn, rcap;
     uint8_t *wb;
-    size_t wn, woff;
+    size_t wn, woff, wcap;      /* очередь записи: занято [woff, wn), выделено wcap */
     /* DoH по HTTP/2 (h2 — сервер выбрал h2 в ALPN). Вопрос — поток, номер потока в dreq.sid, число
      * открытых потоков — busy. Окна отправки ведутся только по данным: заголовки в окно не входят
      * (RFC 9113, 6.9), а тело вопроса — до килобайта. */
@@ -147,6 +157,7 @@ struct dup {
     unsigned long q_sent, q_ok, q_fail;
     unsigned long q_early, q_early_rej;   /* DoQ: вопросов ушло в 0-RTT; соединений, где сервер его отверг */
     uint16_t next_id;
+    uint8_t *wid_used;          /* битовая карта номеров вопросов в полёте (65536 бит), кучей */
     int hproto;                 /* DoH: что выбрал сервер при последнем соединении — 0 не знаем, 1
                                  * http/1.1, 2 h2 (от этого зависит, сколько соединений заводить) */
     /* Группа серверов (cfg.grp): личная копия номеров членов (cfg.gm указывает сюда) и пауза
@@ -165,6 +176,8 @@ struct dreq {
     uint8_t tries;
     uint16_t wid, oid;
     long t0, deadline;
+    uint32_t hseq;              /* номер вопроса за всё время: записи кучи сроков чужого вопроса на этом месте не годятся */
+    long hkey;                  /* срок его действующей записи в куче сроков; 0 — записи нет */
     dup_done_fn cb;
     void *ctx;
     /* DoQ: поток вопроса (-1 — ещё не открыт) и накопленный ответ (rxn байт из rxcap, куча). rxfin —
@@ -191,5 +204,8 @@ extern struct dup **g_dups;             /* текущие апстримы, по
 extern size_t g_dups_n;
 extern int g_req_cap;                   /* мест в таблице вопросов */
 struct dreq *req_ref(int k);            /* место k, 0 <= k < g_req_cap */
+/* Пересчитать срок вопроса в куче: после того, как у него поменялось то, от чего срок зависит (стенд,
+ * правящий deadline руками, зовёт это сам). */
+void req_rekey(struct dreq *r);
 
 #endif

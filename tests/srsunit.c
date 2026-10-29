@@ -218,6 +218,19 @@ static void t_idn(void) {
     coll_free(&c);
 }
 
+/* Обход кладёт на стек всех детей узла сразу: на глубине 20 при 35 братьях на уровне это 700
+ * записей, а стек был на 512 — ширина вдоль пути объявлялась «не разобран» (I-519). Набор собран
+ * mksrs.py --big 1 --kind wide. */
+static void t_wide(void) {
+    struct coll c;
+    check("35 братьев на 20 уровнях: обход цел", 0, walk(FIX "wide.srs", SRS_EL_DOMAIN, NULL, &c));
+    size_t lines = 0;
+    for (const char *q = S(&c.dom); *q; q++) lines += *q == '\n';
+    check("… все ключи отданы", 700, (long)lines);
+    check("… глубокий ключ на месте", 1, strstr(S(&c.dom), "=azzzzzzzzzzzzzzzzzzz\n") != NULL);
+    coll_free(&c);
+}
+
 static void t_v1(void) {
     struct coll c, o;
     check("версия 1: разобран", 0, walk(FIX "telegram-v1.srs", SRS_EL_DOMAIN | SRS_EL_CIDR, NULL, &c));
@@ -411,6 +424,88 @@ static void t_broken(void) {
     if (system(cmd) != 0) printf("  (не убран %s)\n", dir);
 }
 
+/* Больше прежних пределов: ящиков сверх 33, сужений сверх 64 в одном объединении. */
+static void t_union_many(void) {
+    enum { N = 200 };
+    struct l4match *v = calloc(N, sizeof(*v));
+    const struct l4match **ms = calloc(N, sizeof(*ms));
+    for (int i = 0; i < N; i++) {
+        char t[32];
+        /* Непересекающиеся и несмежные: порт 1000 + 10*i. */
+        int n = snprintf(t, sizeof(t), "udp/%d", 1000 + 10 * i);
+        l4_from_text(t, (size_t)n, &v[i]);
+        ms[i] = &v[i];
+    }
+    size_t nb = 0;
+    struct l4box *bx = l4_union_alloc(ms, N, &nb);
+    check("объединение 200 сужений: 200 ящиков, ни один не обрезан", N, (long)nb);
+    check("… последний порт на месте", 1, nb == N && bx[N - 1].lo == 1000 + 10 * (N - 1) &&
+          bx[N - 1].plo == 17);
+    free(bx);
+    /* Каждое по 16 диапазонов: 5 сужений — 80 ящиков (раньше предел 33). */
+    char t[512];
+    struct l4match w[5];
+    for (int i = 0; i < 5; i++) {
+        int n = snprintf(t, sizeof(t), "tcp/");
+        for (int k = 0; k < 16; k++)
+            n += snprintf(t + n, sizeof(t) - (size_t)n, "%s%d-%d", k ? "+" : "",
+                          10000 * (i + 1) + 100 * k, 10000 * (i + 1) + 100 * k + 10);
+        l4_from_text(t, (size_t)n, &w[i]);
+        ms[i] = &w[i];
+    }
+    bx = l4_union_alloc(ms, 5, &nb);
+    check("5 сужений по 16 диапазонов: 80 ящиков", 80, (long)nb);
+    free(bx);
+    free(v);
+    free(ms);
+}
+
+/* Клауза набора с источниками, пакетами и исключениями сверх прежних 64/16/64: правило не
+ * снимается, всё доезжает до клаузы. Набор собирает mksrs.py (python3 есть у всех стендов). */
+static void t_limits(void) {
+    char dir[] = "/tmp/srsunit.XXXXXX";
+    if (!mkdtemp(dir)) return;
+    char js[300], sp[300], cmd[700];
+    snprintf(js, sizeof(js), "%s/lim.json", dir);
+    snprintf(sp, sizeof(sp), "%s/lim.srs", dir);
+    FILE *f = fopen(js, "w");
+    fputs("{\"rules\":[{\"ip_cidr\":[\"192.0.2.0/24\"],\"source_ip_cidr\":[", f);
+    for (int i = 0; i < 100; i++) fprintf(f, "%s\"10.%d.1.0/24\"", i ? "," : "", i);
+    fputs("]},{\"ip_cidr\":[\"198.51.100.0/24\"],\"package_name\":[", f);
+    for (int i = 0; i < 30; i++) fprintf(f, "%s\"com.example.app%d\"", i ? "," : "", i);
+    fputs("]},{\"type\":\"logical\",\"mode\":\"and\",\"rules\":[{\"ip_cidr\":[\"10.0.0.0/8\"]}", f);
+    for (int i = 0; i < 70; i++)
+        fprintf(f, ",{\"ip_cidr\":[\"10.0.%d.0/24\"],\"invert\":true}", i);
+    fputs("]},{\"package_name\":[\"", f);
+    for (int i = 0; i < 200; i++) fputc('a', f);
+    fputs("\"]}]}", f);
+    fclose(f);
+    snprintf(cmd, sizeof(cmd), "python3 " FIX "mksrs.py %s %s", js, sp);
+    check("mksrs собрал набор", 0, system(cmd));
+    const struct srs_set *s;
+    struct err e = {0};
+    check("набор сверх прежних пределов открылся", 0, srs_open(sp, &s, &e));
+    const struct srs_clause *src = NULL, *pk = NULL, *ex = NULL, *lp = NULL;
+    for (size_t i = 0; i < srs_clause_n(s); i++) {
+        const struct srs_clause *c = srs_clause(s, i);
+        if (c->src_n == 100) src = c;
+        if (c->pkg_n == 30) pk = c;
+        if (c->n_xv4 == 70 && (c->flags & SRS_F_XCIDR)) ex = c;
+        if (c->kind == SRS_C_ALL && c->pkg_n == 1) lp = c;
+    }
+    check("100 источников в одной клаузе (было 64)", 1, src != NULL);
+    check("… последний на месте", 1, src && src->src[99].net == 0x0A630100u);
+    check("30 пакетов в одной клаузе (было 16)", 1, pk != NULL);
+    check_str("… последний на месте", "com.example.app29", pk ? pk->pkg[29] : "");
+    check("70 исключений-подсетей (было 64)", 1, ex != NULL);
+    check("имя пакета в 200 знаков (было до 127)", 1, lp != NULL);
+    check("ничего не снято", 1, srs_skipped(s) == NULL || !srs_skipped(s)[0]);
+    srs_release(s);
+    char rm[400];
+    snprintf(rm, sizeof(rm), "rm -rf %s", dir);
+    if (system(rm)) { }
+}
+
 static void t_l4(void) {
     struct l4match a, b, o;
     char t[128];
@@ -435,8 +530,8 @@ static void t_l4(void) {
     l4_from_text("udp/19000-20000+60000-65535", 27, &u2);
     l4_from_text("tcp", 3, &u3);
     const struct l4match *ms[3] = { &u1, &u2, &u3 };
-    struct l4box bx[L4BOX_MAX];
-    size_t nb = l4_union_boxes(ms, 3, bx);
+    size_t nb;
+    struct l4box *bx = l4_union_alloc(ms, 3, &nb);
     struct buf out = { 0 };
     for (size_t i = 0; i < nb; i++) {
         l4_box_text(&bx[i], t, sizeof(t));
@@ -446,11 +541,13 @@ static void t_l4(void) {
     check_str("объединение — непересекающиеся ящики, udp слиты",
               "6 . 0-65535;17 . 19000-20000;17 . 50000-65535;", S(&out));
     free(out.p);
+    free(bx);
     struct l4match none;
     memset(&none, 0, sizeof(none));
     const struct l4match *ms2[2] = { &u1, &none };
-    nb = l4_union_boxes(ms2, 2, bx);
+    bx = l4_union_alloc(ms2, 2, &nb);
     l4_box_text(&bx[0], t, sizeof(t));
+    free(bx);
     check("с «без сужения» — один ящик", 1, (long)nb);
     check_str("… 0-255 × 0-65535", "0-255 . 0-65535", t);
     l4_to_text(&u2, t, sizeof(t));
@@ -542,12 +639,15 @@ int main(void) {
     t_discord_clauses();
     t_want();
     t_idn();
+    t_wide();
     t_v1();
     t_logic();
     t_v6();
     t_adguard();
     t_broken();
     t_l4();
+    t_union_many();
+    t_limits();
     t_plan();
     return unit_done("srsunit");
 }

@@ -93,6 +93,9 @@ check() {
 wait_for() {
     i=0
     while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    # Приговор по фактическому состоянию, а не по счётчику кругов: условие, ставшее истинным в последнюю
+    # десятую секунды, иначе объявлялось бы невыполненным.
+    eval "$1" && return 0
     return 1
 }
 has() { printf '%s\n' "$1" | grep -qF -- "$2" && echo yes || echo no; }
@@ -116,9 +119,9 @@ EOF
 mkdir -p "$tmp/t1/st"
 printf 'seed.test\t198.18.0.1\t203.0.113.10\nx.seed.test\t198.18.0.2\nboth.test\t198.18.0.5\t203.0.113.11\nrip.test\t198.18.0.6\t203.0.113.12\nnone.example\t198.18.0.7\t203.0.113.13\n' \
     > "$tmp/t1/st/fakeip.state"
-DRY="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/t1/spec.json" \
+DRY="$(STEER_NFT_INGRESS=1 "$BIN" apply --dry-run --spec "$tmp/t1/spec.json" \
        --state-dir "$tmp/t1/st" 2>/dev/null)"
-tab="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/t1/spec.json" --state-dir "$tmp/t1/st" 2>/dev/null)"
+tab="$(STEER_NFT_INGRESS=1 "$BIN" dnsd-table --spec "$tmp/t1/spec.json" --state-dir "$tmp/t1/st" 2>/dev/null)"
 SA="$(printf '%s\n' "$tab" | awk -F'|' '$5 == "a" { print $1 }')"
 SB="$(printf '%s\n' "$tab" | awk -F'|' '$5 == "b" { print $1 }')"
 SR="$(printf '%s\n' "$tab" | awk -F'|' '$5 == "r" { print $1 }')"
@@ -136,22 +139,13 @@ check "  правило «без подмены — drop» стоит за dnat"
     "$(printf '%s\n' "$DRY" | awk '/chain prerouting_dnat/ { f = 1; next } f && /^    }/ { exit } f && /198\.18/' |
        sed 's/^ *//' | paste -sd'|')"
 # Отпечаток плана от файла состояния не зависит (засев в него не входит, print.c).
-plan_fp() { STEER_NFT_COMPAT=modern "$BIN" apply-plan --spec "$tmp/t1/spec.json" --state-dir "$1" \
+plan_fp() { STEER_NFT_INGRESS=1 "$BIN" apply-plan --spec "$tmp/t1/spec.json" --state-dir "$1" \
                 2>/dev/null | awk '$1 == "ruleset" { print $2 }'; }
 mkdir -p "$tmp/t1/st0"
 FP1="$(plan_fp "$tmp/t1/st")"
 FP0="$(plan_fp "$tmp/t1/st0")"
 check "  отпечаток плана — тот же, что без файла состояния" "yes" \
     "$([ -n "$FP1" ] && [ "$FP1" = "$FP0" ] && echo yes || echo "no:$FP1/$FP0")"
-# Старая раскладка: засев — в динамическую половину (hash, имя группы), не в «_n».
-DRYL="$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/t1/spec.json" \
-        --state-dir "$tmp/t1/st" 2>/dev/null)"
-set_elsl() { printf '%s\n' "$DRYL" | awk -v s="$1" '$1 == "set" && $2 == s { f = 1 } f && /elements/ { print; exit } f && /^    }/ { exit }'; }
-check "  старая раскладка: засев — в динамическую половину" \
-    "        elements = { 198.18.0.1, 198.18.0.2, 198.18.0.5 }" "$(set_elsl "$SA")"
-check "  старая раскладка: «_n» — только список" "        elements = { 203.0.113.0/24 }" \
-    "$(set_elsl "${SA}_n")"
-
 # Составной набор (tests/srs/dnsmixed.srs): имя с сужением — с ним, соседние адреса не слиты,
 # исключённое имя не засеяно. Ядро такой набор принимает (nft -f ниже, часть 2 — своя таблица).
 cat > "$tmp/t1/cspec.json" <<EOF
@@ -162,7 +156,7 @@ EOF
 mkdir -p "$tmp/t1/cst"
 printf 'a.voice.example\t198.18.0.1\t203.0.113.20\nb.voice.example\t198.18.0.2\t203.0.113.21\nwww.plain.example\t198.18.0.5\t203.0.113.22\nno.excl.example\t198.18.0.7\t203.0.113.23\nwww.excl.example\t198.18.0.8\t203.0.113.24\n' \
     > "$tmp/t1/cst/fakeip.state"
-CDRY="$(STEER_NFT_COMPAT=modern STEER_NFT_CONCAT=1 "$BIN" apply --dry-run \
+CDRY="$(STEER_NFT_INGRESS=1 STEER_NFT_CONCAT=1 "$BIN" apply --dry-run \
         --spec "$tmp/t1/cspec.json" --state-dir "$tmp/t1/cst" 2>/dev/null)"
 cels="$(printf '%s\n' "$CDRY" | awk '$1 == "set" && $2 == "vpn_dom_c0_m" { f = 1 } f && /elements/ { print; exit }')"
 # Протокол в тексте генератора — номером (17), как у подсетей набора.
@@ -194,9 +188,9 @@ EOF
 mkdir -p "$tmp/t1/st6"
 printf 'seed.test\t198.18.0.1\t203.0.113.10\t2001:db8:7::1\nx.seed.test\t198.18.0.2\t203.0.113.11\n' \
     > "$tmp/t1/st6/fakeip.state"
-DRY6="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/t1/v6.yaml" \
+DRY6="$(STEER_NFT_INGRESS=1 "$BIN" apply --dry-run --spec "$tmp/t1/v6.yaml" \
         --state-dir "$tmp/t1/st6" 2>/dev/null)"
-tab6="$(STEER_NFT_COMPAT=modern "$BIN" dnsd-table --spec "$tmp/t1/v6.yaml" --state-dir "$tmp/t1/st6" 2>/dev/null)"
+tab6="$(STEER_NFT_INGRESS=1 "$BIN" dnsd-table --spec "$tmp/t1/v6.yaml" --state-dir "$tmp/t1/st6" 2>/dev/null)"
 S6="$(printf '%s\n' "$tab6" | awk -F'|' '$5 == "f" { print $1 }')"
 set_els6() { printf '%s\n' "$DRY6" | awk -v s="$1" '$1 == "set" && $2 == s { f = 1 } f && /elements/ { print; exit } f && /^    }/ { exit }'; }
 check "IPv6: набор IPv4 — оба имени" "        elements = { 198.18.0.1, 198.18.0.2 }" "$(set_els6 "$S6")"

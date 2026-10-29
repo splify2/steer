@@ -65,6 +65,57 @@ jobs:
           echo "$V" > VERSION
           echo "VERSION=$V" >> "$GITHUB_ENV"
 
+      # Выпуск 2.1 подписывает плагины протоколов, семя steer-core и индекс официального репозитория splify2
+      # (splify2/plugins). Ключи — секреты Actions (решение владельца В8; plugin-sdk/docs/s2p.md, «Ключи и ротация»):
+      # S2P_KEY_INDEX — индекс, S2P_KEY_PROTOCOLS — архивы протоколов, S2P_KEY_PLUGINS — открытый ключ для архивов
+      # splify2-core-plugins и splify2-extended-plugins. Значение — файл .sec от `s2p keygen -o имя`. Шаг стоит до
+      # сборки: без ключей выпуск не начинается (тестового ключа в выпуске нет — роутер не принял бы ни одного архива).
+      - name: Ключи подписи
+        env:
+          S2P_KEY_INDEX: ${{ secrets.S2P_KEY_INDEX }}
+          S2P_KEY_PROTOCOLS: ${{ secrets.S2P_KEY_PROTOCOLS }}
+          S2P_KEY_PLUGINS: ${{ secrets.S2P_KEY_PLUGINS }}
+          PLUGINS_TOKEN: ${{ secrets.PLUGINS_TOKEN }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -eu
+          if [ -z "$S2P_KEY_PLUGINS" ]; then
+            echo "::error::нет секрета S2P_KEY_PLUGINS — без его открытого ключа в steer-core роутер не примет плагины splify2-core-plugins и splify2-extended-plugins"
+            exit 1
+          fi
+          # Публикация индекса splify2/plugins — только у стабильного выпуска: предварительный не должен
+          # доставаться роутерам автообновлением.
+          if [ "$INPUT_PRERELEASE" != true ] && [ -z "$PLUGINS_TOKEN" ]; then
+            echo "::error::нет секрета PLUGINS_TOKEN (токен с правом записи в splify2/plugins) — плагины протоколов не попали бы в индекс"
+            exit 1
+          fi
+          K="$RUNNER_TEMP/s2p-keys"
+          sh build/release-keys.sh "$K" || { echo "::error::ключи подписи из секретов не прочитаны (лог шага)"; exit 1; }
+          {
+            echo "S2P_KEY=$K/sec/protocols.sec"
+            echo "S2P_KEY_INDEX=$K/sec/index.sec"
+            echo "STEER_KEYS_DIR=$K/pub"
+            echo "STEER_RELEASE=1"
+            echo "S2P_KEYS=$K"
+          } >> "$GITHUB_ENV"
+
+      # Инструмент s2p (сборка .s2p, подпись, индекс) — из plugin-sdk той же организации; ветка или тег —
+      # переменная PLUGIN_SDK_REF (по умолчанию main).
+      - uses: actions/checkout@v4
+        with:
+          repository: splify2/plugin-sdk
+          ref: ${{ vars.PLUGIN_SDK_REF || 'main' }}
+          path: .plugin-sdk
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+      - name: Собрать s2p
+        run: |
+          set -eu
+          S2P_OUT="$RUNNER_TEMP/s2p-bin" sh .plugin-sdk/build.sh
+          echo "S2P=$RUNNER_TEMP/s2p-bin/s2p" >> "$GITHUB_ENV"
+
       - name: Стенды
         run: |
           set -eu
@@ -110,21 +161,32 @@ jobs:
             grep -E 'FAILED|не удалась|packaging failed' /tmp/build.log
             exit 1
           fi
-          # Ожидаемое число считается из самого build.sh, а не вписано сюда числом:
-          # список архитектур меняется, и константа разошлась бы с ним молча. На каждую
-          # архитектуру восемь пакетов: steer-core (ядро с общими библиотеками), модули steer-vless,
-          # steer-xsteer, steer-obfs, steer-tgws, steer-hysteria2, steer-proxy и мета-пакет
-          # steer-extended — и это в КАЖДОМ из двух форматов. Список архитектур — build/arches.sh.
+          # С 2.1 пакет у ядра один — steer-core (протоколы стали плагинами .s2p, мета-пакета нет): по .apk и .ipk на
+          # архитектуру. Список архитектур — build/arches.sh, а не число здесь: иначе разошлись бы молча.
           arch_n=$(sed -n '/^ISAS="/,/^"$/p' build/arches.sh | grep -c '^[a-z0-9_.-]*:')
-          want=$((arch_n * 8))
           for ext in apk ipk; do
-            n=$(ls out/*."$ext" 2>/dev/null | wc -l)
-            [ "$n" -eq "$want" ] || {
-              echo "::error::пакетов .$ext — $n, а ожидалось $want (архитектур $arch_n × 8)"
+            n=$(ls out/steer-core*."$ext" 2>/dev/null | wc -l)
+            all=$(ls out/*."$ext" 2>/dev/null | wc -l)
+            [ "$n" -eq "$arch_n" ] && [ "$all" -eq "$arch_n" ] || {
+              echo "::error::пакетов .$ext: steer-core $n, всего $all, а ожидалось $arch_n (по одному steer-core на архитектуру)"
               ls -la out/ 2>/dev/null
               exit 1; }
-            echo "собрано .$ext: $n из $want ожидаемых"
+            echo "собрано .$ext: $n из $arch_n"
           done
+          # Плагины протоколов: на архитектуру — net1 и каждый из PLUGINS_NET1 и PLUGINS_STATIC (build/sources.mk),
+          # плюс один awg на все. Семя должно быть в каждом пакете, подписанное ключом выпуска, а не тестовым.
+          per=$(sh -c '. build/sources.sh; echo net1 $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC)' | wc -w)
+          s=$(ls out/*.s2p 2>/dev/null | grep -vc -- '-all\.s2p$' || true)
+          [ "$s" -eq $((arch_n * per)) ] && ls out/awg-*-all.s2p >/dev/null 2>&1 || {
+            echo "::error::архивов .s2p $s (ждали $((arch_n * per)): $arch_n архитектур × $per) или нет awg-*-all.s2p"
+            ls -la out/*.s2p 2>/dev/null
+            exit 1; }
+          if grep -qE 'ТЕСТОВЫМ|семя пропущено' /tmp/build.log; then
+            echo "::error::семя пропущено или подписано тестовым ключом:"; grep -E 'ТЕСТОВЫМ|семя пропущено' /tmp/build.log; exit 1
+          fi
+          for f in out/*.s2p; do "$S2P" verify "$f" --keys-dir "$S2P_KEYS/pub" --role protocols >/dev/null || {
+            echo "::error::$f не проходит проверку подписи ключами выпуска"; exit 1; }; done
+          echo "архивов .s2p: $s + awg, подписи сходятся с ключами выпуска"
           # Серверная половина: по архиву на каждую VPS-архитектуру из build.sh. Список
           # берётся оттуда же по той же причине — чтобы не разойтись молча.
           vps_n=$(sed -n '/^for arch in .* do$/{/aarch64_generic/p}' build.sh | head -1 |
@@ -266,35 +328,27 @@ jobs:
           NOTES: |
             Ядро маршрутизации по политикам для OpenWrt.
 
-            **Какой пакет брать.** Имя файла содержит архитектуру — ту же, что показывает
-            `apk --print-arch` на роутере.
+            **Какой пакет брать.** Пакет один — `steer-core-*` с архитектурой в имени (та же, что показывает
+            `apk --print-arch` на роутере): ядро, библиотеки, менеджер плагинов, ключи официального
+            репозитория и семя — подписанные плагины протоколов под эту архитектуру. Протоколы (vless,
+            hysteria2, trojan/shadowsocks/socks/http/vmess, xsteer, obfs, WARP) — плагины `.s2p` официального
+            репозитория splify2: при установке ядро ставит их само из сети, а без сети — из семени. Прежние
+            пакеты `steer-vless`, `steer-hysteria2`, `steer-proxy`, `steer-xsteer`, `steer-obfs`,
+            `steer-tgws`, `steer-warpbox` и `steer-extended` пакет ядра заменяет и снимает в той же
+            транзакции, а выходы, которые на них стояли, получают плагины.
 
-            * `steer-core-*` — ядро: каналы, наборы адресов, доменные списки с fake-IP, failover
-              между устройствами, общая криптография (библиотеки `libsteer` и `libsteer-wolfssl`
-              лежат внутри пакета). Заменяет прежние пакеты `steer`, `libsteer` и `libsteer-wolfssl`.
-            * `steer-vless-*`, `steer-xsteer-*` — клиенты туннелей (VLESS/Reality с Vision,
-              транспортами tcp/grpc/xhttp/ws/httpupgrade; звезда xsteer) — отдельные модули.
-              Нужны, только если туннель поднимает само ядро; для готового wireguard или
-              amneziawg достаточно ядра.
-            * `steer-obfs-*` (обфускатор WireGuard), `steer-tgws-*` (мост Telegram) и
-              `steer-hysteria2-*` (клиент hysteria2) — модули.
-            * `steer-extended-*` — мета-пакет для перехода с 1.x: ядро и модули vless, xsteer, obfs,
-              tgws (без hysteria2 и proxy). Новой установке не нужен; при обновлении роутера с 1.x
-              ставьте его вместе с ядром и модулями (команда ниже берёт все пакеты разом) — тогда
-              apk не упрётся в конфликт с прежним steer-extended, а opkg не оставит его запись.
-              После перехода его можно снять: ядро и модули останутся.
-
-            Модуль должен быть той же версии, что ядро (менеджер пакетов следит сам).
+            sing-box для podkop и forkop — плагин `box-connector` и пакет-заглушка `steer-box-connector`
+            из выпусков [steer-box-connector](https://github.com/splify2/steer-box-connector/releases).
 
             **Два формата.** `.apk` — для OpenWrt 25.12 и новее, `.ipk` — для 24.10, 23.05
             и всего, что осталось на opkg. Содержимое одинаковое, отличаются только
             метаданные пакета.
 
             ```sh
-            # OpenWrt 25.12+ (все пакеты нужной архитектуры разом)
-            apk add --allow-untrusted ./*-${{ env.VERSION }}-1_<arch>.apk
+            # OpenWrt 25.12+
+            apk add --allow-untrusted ./steer-core-${{ env.VERSION }}-1_<arch>.apk
             # OpenWrt 24.10 и старше
-            opkg install ./*-${{ env.VERSION }}-1_<arch>.ipk
+            opkg install ./steer-core_${{ env.VERSION }}-1_<arch>.ipk
             ```
 
             **`steer-obfs-*.tar.gz` — серверная половина обфускации, для VPS.** Нужна
@@ -348,6 +402,19 @@ jobs:
             out/*.ipk
             out/*.tar.gz
           body_path: ${{ runner.temp }}/release-notes.md
+
+      # Индекс официального репозитория splify2 (splify2/plugins, ветка gh-pages — туда смотрит
+      # files/etc/steer/plugins/repos.d/splify2.json): архивы протоколов этого выпуска добавляются, прежние версии
+      # остаются. Индекс подписан ключом роли index и живёт 30 дней — переподпись по расписанию в plugins-index.yml.
+      - name: Опубликовать плагины протоколов в splify2/plugins
+        if: ${{ !inputs.prerelease }}
+        env:
+          PUBLISH_TOKEN: ${{ secrets.PLUGINS_TOKEN }}
+        run: |
+          set -eu
+          INDEX_SLUG=splify2/plugins INDEX_ID=splify2 INDEX_NAME=splify2 \
+            INDEX_KEY="$S2P_KEY_INDEX" PUBS="$S2P_KEYS/sec/protocols.pub" \
+            ARCHIVES=out META=out/s2p-meta.json sh .plugin-sdk/tools/publish-index.sh
 
       # splify2/releases — version.json, списки изменений и копии пакетов всех проектов: по нему
       # установщик, роутер и сайт узнают о выпуске. Шаги последние: выпуск здесь к этому времени

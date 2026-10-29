@@ -17,6 +17,7 @@
 #define STEER_SUBLINK_H
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "vless.h"
 #include "transport.h"
@@ -29,8 +30,34 @@ int sl_host_leads_nowhere(const char *h);
 int sl_host_is_name(const char *h);
 void sl_pct_decode(char *s);
 void sl_set_field(char *dst, size_t n, const char *src, size_t len);
-/* Поле в процентной форме: раскодировать, потом обрезать по полю. */
-void sl_set_pct(char *dst, size_t n, const char *src, size_t len);
+
+/* Поле узла, которое не обрезается молча: не влезло — узел помечается (vless_node.trunc_what), и
+ * sl_link_usable_pre отвергает его с названием поля и шириной. Обрезанный пароль, путь или SNI —
+ * не «длинное имя», а другой ключ: узел шёл на сервер и не работал без слова причины (I-526).
+ * Встроенные, а не экспортные: поверх sl_set_field и sl_pct_decode, лишних символов libsteer нет. */
+static inline void sl_mark_cut(struct vless_node *n, const char *what, size_t cap) {
+    if (!n->trunc_what) { n->trunc_what = what; n->trunc_cap = (uint16_t)(cap - 1); }   /* cap 1 — «без ширины» */
+}
+static inline void sl_set_nf(struct vless_node *n, const char *what, char *dst, size_t cap,
+                             const char *src, size_t len) {
+    if (len >= cap) sl_mark_cut(n, what, cap);
+    sl_set_field(dst, cap, src, len);
+}
+#define SL_SET(n, f, v, l) sl_set_nf((n), #f, (n)->f, sizeof((n)->f), (v), (l))
+/* Процентная форма: раскодируется ВЕСЬ текст (промежуточный буфер — по длине, а не 512 байт), и уже
+ * результат сверяется с полем. */
+static inline void sl_set_pct_nf(struct vless_node *n, const char *what, char *dst, size_t cap,
+                                 const char *src, size_t len) {
+    char sb[512];
+    char *t = len < sizeof sb ? sb : (char *)malloc(len + 1);
+    if (!t) { sl_mark_cut(n, what, cap); dst[0] = '\0'; return; }
+    memcpy(t, src, len);
+    t[len] = '\0';
+    sl_pct_decode(t);
+    sl_set_nf(n, what, dst, cap, t, strlen(t));
+    if (t != sb) free(t);
+}
+#define SL_SET_PCT(n, f, v, l) sl_set_pct_nf((n), #f, (n)->f, sizeof((n)->f), (v), (l))
 /* Снять с конца строки неполную последовательность UTF-8. */
 void sl_utf8_trim_tail(char *s);
 /* Имя узла: процентная форма, обрезка по буферу без оборванных знаков. */
@@ -74,7 +101,18 @@ void sl_parse_extra(struct vless_node *n, const char *extra);
 /* Свой параметр протокола: 1 — разобран (дальше не смотреть), 0 — не его. */
 typedef int (*sl_own_fn)(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen);
 
-/* схема://секрет@хост:порт?параметры#имя. Узел обнуляется; секрет (до '@', как есть) ложится в
+/* Зона link-local в адресе из ссылки: в URL знак «%» пишется «%25» (RFC 6874), `[fe80::1%25br-lan]`.
+ * getaddrinfo ждёт «fe80::1%br-lan», поэтому «%25» перед зоной сворачивается в «%», на месте. Только у
+ * адреса с двоеточием: в имени «%25» — процентное кодирование, им занимается sl_pct_decode. Встроенная,
+ * а не экспортная функция libsteer: её зовут и ядро, и модуль steer-proxy (pxsub.c), и лишний символ
+ * в списке экспорта (build/libsteer.map) ради четырёх строк не нужен. */
+static inline void sl_host_zone_decode(char *h) {
+    if (!strchr(h, ':')) return;
+    char *z = strstr(h, "%25");
+    if (z) memmove(z + 1, z + 3, strlen(z + 3) + 1);
+}
+
+/* схема://секрет@хост:порт?параметры#имя. Хост — имя, IPv4 или `[IPv6]` (скобки в поле не попадают). Узел обнуляется; секрет (до '@', как есть) ложится в
  * n->uuid, а его начало и длина в ссылке — в *secret и *secret_n (для протокола, которому нужен
  * длиннее поля или раскодированным). Параметры: сначала own (может быть NULL), затем поля
  * транспорта и безопасности (sl_link_param). type по умолчанию — tcp. 0 — разобрана (годность ещё

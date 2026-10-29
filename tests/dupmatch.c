@@ -5,6 +5,7 @@
 #include "dnsd_int.h"
 #include "doq.h"
 #include "doh2.h"
+#include "doh3.h"
 #include "tabfmt.h"
 #include <sys/stat.h>
 
@@ -85,6 +86,18 @@ int main(void) {
     check("  порт", 8853, u.port);
     check_str("  адрес", "2001:db8::1", u.host);
     check("путь у quic:// — отказ", -1, parse("quic://dns.test/x", &u));
+    check("h3://dns.test — DoH3 443, путь по умолчанию", 0, parse("h3://dns.test", &u));
+    check("  протокол", DNSP_DOH3, u.proto);
+    check("  порт 443", 443, u.port);
+    check_str("  имя", "dns.test", u.host);
+    check_str("  путь", "/dns-query", u.path);
+    check("h3://dns.test:8443/q — порт и путь", 0, parse("h3://dns.test:8443/q", &u));
+    check("  порт", 8443, u.port);
+    check_str("  путь", "/q", u.path);
+    check("h3://[2001:db8::1] — IPv6", 0, parse("h3://[2001:db8::1]", &u));
+    check_str("  адрес", "2001:db8::1", u.host);
+    check("h3:// без имени — отказ", -1, parse("h3://", &u));
+    check("http3:// — не схема", -1, parse("http3://dns.test", &u));
     check("doq:// — не схема (ни AdGuard, ни sing-box, ни Xray её не пишут)", -1, parse("doq://dns.test", &u));
     check("http:// — отказ", -1, parse("http://dns.test", &u));
     check("путь у tls:// — отказ", -1, parse("tls://dns.test/x", &u));
@@ -262,6 +275,7 @@ int main(void) {
     const char *bad[] = {
         "dns: { upstreams: { a: { url: 'tls://dns.test' } } }",                    /* нечем разрешить имя */
         "dns: { upstreams: { a: { url: 'quic://dns.test' } } }",                    /* DoQ: нечем разрешить имя */
+        "dns: { upstreams: { a: { url: 'h3://dns.test' } } }",                      /* DoH3: нечем разрешить имя */
         "dns: { upstream: nope }",                                                  /* нет такого */
         "dns: { upstreams: { a: { url: 'tls://1.1.1.1', out: nope } } }",          /* нет выхода */
         "dns: { cache_ttl: { min: 100, max: 10 } }",                                /* min > max */
@@ -442,6 +456,149 @@ int main(void) {
         char nb[24];
         check_str("h2: имя кода 7", "REFUSED_STREAM", h2d_errname(H2D_E_REFUSED_STREAM, nb, sizeof(nb)));
         check_str("  неизвестный код", "код 99", h2d_errname(99, nb, sizeof(nb)));
+    }
+
+    /* DoH по HTTP/3 (RFC 9114) и QPACK (RFC 9204): кадры по байтам. Образцы блоков заголовков — выход
+     * независимого кодировщика (pylsqpack, ls-qpack), а не наш: «0000d9» — :status 200 по статической
+     * таблице, «0000ff08» — 500, «00005f09821003» — 201 литералом с кодом Хаффмана. */
+    {
+        uint8_t b[16];
+        uint64_t v = 0;
+        static const uint8_t v8[] = { 0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c };
+        static const uint8_t v4[] = { 0x9d, 0x7f, 0x3e, 0x7d }, v2[] = { 0x7b, 0xbd }, v1[] = { 0x25 };
+        check("h3: varint 8 байт (RFC 9000, A.1)", 8, (int)h3d_varint_get(v8, sizeof(v8), &v));
+        check("  значение", 1, v == 151288809941952652ull);
+        check("  4 байта", 4, (int)h3d_varint_get(v4, sizeof(v4), &v));
+        check("  значение", 1, v == 494878333ull);
+        check("  2 байта", 2, (int)h3d_varint_get(v2, sizeof(v2), &v));
+        check("  значение", 1, v == 15293);
+        check("  1 байт", 1, (int)h3d_varint_get(v1, sizeof(v1), &v));
+        check("  значение", 1, v == 37);
+        check("  оборван — 0", 0, (int)h3d_varint_get(v4, 3, &v));
+        check("  запись 15293 — те же два байта", 2, (int)h3d_varint_put(b, sizeof(b), 15293));
+        check("  байты", 1, !memcmp(b, v2, 2));
+        check("  запись 494878333 — четыре", 4, (int)h3d_varint_put(b, sizeof(b), 494878333ull));
+        check("  запись 63 — один, 64 — два", 3, (int)(h3d_varint_put(b, sizeof(b), 63) + h3d_varint_put(b, sizeof(b), 64)));
+        check("  не поместилось — 0", 0, (int)h3d_varint_put(b, 1, 64));
+        check("  больше 2^62-1 — 0", 0, (int)h3d_varint_put(b, sizeof(b), 1ull << 62));
+
+        static const uint8_t ctl[] = { 0x00, 0x04, 0x04, 0x01, 0x00, 0x07, 0x00 };
+        size_t cl = h3d_control_open(b, sizeof(b));
+        check("h3: поток управления — тип 0, SETTINGS (таблица 0, блокированных 0)", 1, cl == sizeof(ctl) && !memcmp(b, ctl, cl));
+        check("  мало места — 0", 0, (int)h3d_control_open(b, 6));
+
+        uint8_t qq[64], rq[512];
+        size_t qlen3 = mk_query(qq, "x.test");
+        qq[0] = 0xab; qq[1] = 0xcd;
+        size_t rl = h3d_request(rq, sizeof(rq), "dns.test:8443", "/dns-query", qq, qlen3);
+        /* HEADERS: префикс 0000, POST d4, https d7, :authority (50, длина, строка), :path (51, длина,
+         * строка), content-type ec, accept de. */
+        static const uint8_t hd1[] = { 0x00, 0x00, 0xd4, 0xd7, 0x50, 13 };
+        check("h3: запрос — HEADERS, префикс 0000, POST, https, :authority", 1, rl > 40 && rq[0] == 0x01 && !memcmp(rq + 2, hd1, 6) &&
+              !memcmp(rq + 8, "dns.test:8443", 13));
+        check("  :path — имя по номеру 1 (0x51), значение без Хаффмана", 1, rq[21] == 0x51 && rq[22] == 10 && !memcmp(rq + 23, "/dns-query", 10));
+        check("  content-type (0xec) и accept (0xde) — по статической таблице", 1, rq[33] == 0xec && rq[34] == 0xde);
+        size_t hl = rq[1];
+        check("  длина блока заголовков — до DATA", 1, rq[2 + hl] == 0x00 && rq[3 + hl] == (uint8_t)qlen3);
+        check("  длина всего запроса", (int)(2 + hl + 2 + qlen3), (int)rl);
+        check("  номер сообщения в теле — 0", 1, rq[rl - qlen3] == 0 && rq[rl - qlen3 + 1] == 0);
+        check("  остальное тело — вопрос", 1, !memcmp(rq + rl - qlen3 + 2, qq + 2, qlen3 - 2));
+        check("  короче заголовка DNS — 0", 0, (int)h3d_request(rq, sizeof(rq), "a", "/", qq, 11));
+        check("  мало места — 0", 0, (int)h3d_request(rq, 30, "a", "/", qq, qlen3));
+
+        /* :status из блока. */
+        static const uint8_t t200[] = { 0, 0, 0xd9 }, t500[] = { 0, 0, 0xff, 0x08 }, t201h[] = { 0, 0, 0x5f, 0x09, 0x82, 0x10, 0x03 };
+        static const uint8_t t404[] = { 0, 0, 0xdb }, t103[] = { 0, 0, 0xd8 };
+        static const uint8_t t418[] = { 0, 0, 0x5f, 0x09, 0x03, '4', '1', '8' };
+        static const uint8_t tnm[] = { 0, 0, 0x27, 0x00, ':', 's', 't', 'a', 't', 'u', 's', 3, '4', '0', '4' };  /* имя строкой: 001 N H длина(3) = 7 и продолжение 0 */
+        static const uint8_t tnone[] = { 0, 0, 0xec };
+        static const uint8_t tdyn[] = { 0, 0, 0x80 }, tpb[] = { 0, 0, 0x10 }, tric[] = { 1, 0, 0xd9 }, tcut[] = { 0, 0, 0x5f, 0x09, 3, '4' };
+        static const uint8_t tjunk[] = { 0, 0, 0x5f, 0x09, 0x03, 'x', '0', '5' };
+        check("h3: :status 200 по статической таблице (24..28)", 200, h3d_status(t200, sizeof(t200)));
+        check("  404", 404, h3d_status(t404, sizeof(t404)));
+        check("  103", 103, h3d_status(t103, sizeof(t103)));
+        check("  500 по статической таблице (63..71)", 500, h3d_status(t500, sizeof(t500)));
+        check("  201 литералом с именем по номеру и кодом Хаффмана", 201, h3d_status(t201h, sizeof(t201h)));
+        check("  418 литералом, цифры", 418, h3d_status(t418, sizeof(t418)));
+        check("  :status с именем строкой", 404, h3d_status(tnm, sizeof(tnm)));
+        check("  без :status — 0", 0, h3d_status(tnone, sizeof(tnone)));
+        check("  ссылка на динамическую таблицу — ошибка сжатия", -1, h3d_status(tdyn, sizeof(tdyn)));
+        check("  после-базовая ссылка — ошибка", -1, h3d_status(tpb, sizeof(tpb)));
+        check("  обязательный счёт вставок не 0 — ошибка", -1, h3d_status(tric, sizeof(tric)));
+        check("  оборванная строка — ошибка", -1, h3d_status(tcut, sizeof(tcut)));
+        check("  нецифровое значение — ошибка", -1, h3d_status(tjunk, sizeof(tjunk)));
+
+        /* Ответ целиком. */
+        uint8_t ans[128];
+        size_t anl = mk_answer(ans, "x.test", 60, 0, 1);
+        uint8_t rs[400];
+        int st = 0;
+        size_t bl = 0;
+        const char *why = "";
+        uint64_t he = 0;
+        size_t o = 0;
+        static const uint8_t hdr200[] = { 0x01, 0x03, 0x00, 0x00, 0xd9 };
+        memcpy(rs, hdr200, sizeof(hdr200)); o = sizeof(hdr200);
+        rs[o++] = 0x00; rs[o++] = (uint8_t)anl; memcpy(rs + o, ans, anl); o += anl;
+        size_t full = o;
+        uint8_t w[400];
+        memcpy(w, rs, full);
+        check("h3: ответ целый (HEADERS 200, DATA, FIN)", 1, h3d_response(w, full, 1, &st, &bl, &why, &he));
+        check("  код", 200, st);
+        check("  тело — сообщение DNS, сдвинуто в начало", 1, bl == anl && !memcmp(w, ans, anl));
+        memcpy(w, rs, full);
+        check("  без FIN ждём", 0, h3d_response(w, full, 0, &st, &bl, &why, &he));
+        check("  половина DATA, FIN — оборвано посреди кадра", -1, h3d_response(w, full - 5, 1, &st, &bl, &why, &he));
+        check("  половина DATA без FIN — ждём", 0, h3d_response(w, full - 5, 0, &st, &bl, &why, &he));
+        check("  код ошибки — кадр", 0x106, (int)(h3d_response(w, full - 5, 1, &st, &bl, &why, &he), he));
+        check("  половина заголовка кадра — ждём", 0, h3d_response(w, 1, 0, &st, &bl, &why, &he));
+
+        /* DATA кусками, неизвестный кадр (GREASE 0x21), промежуточный 103 и трейлеры. */
+        o = 0;
+        static const uint8_t hdr103[] = { 0x01, 0x03, 0x00, 0x00, 0xd8 };
+        memcpy(rs + o, hdr103, 5); o += 5;
+        rs[o++] = 0x21; rs[o++] = 2; rs[o++] = 0xee; rs[o++] = 0xee;
+        memcpy(rs + o, hdr200, 5); o += 5;
+        size_t half = anl / 2;
+        rs[o++] = 0x00; rs[o++] = (uint8_t)half; memcpy(rs + o, ans, half); o += half;
+        rs[o++] = 0x21; rs[o++] = 0;
+        rs[o++] = 0x00; rs[o++] = (uint8_t)(anl - half); memcpy(rs + o, ans + half, anl - half); o += anl - half;
+        rs[o++] = 0x01; rs[o++] = 0x03; rs[o++] = 0; rs[o++] = 0; rs[o++] = 0xec;
+        memcpy(w, rs, o);
+        check("h3: 103, GREASE, DATA двумя кусками, трейлеры — склеен", 1, h3d_response(w, o, 1, &st, &bl, &why, &he));
+        check("  код 200", 200, st);
+        check("  тело целое", 1, bl == anl && !memcmp(w, ans, anl));
+
+        static const uint8_t r404[] = { 0x01, 0x03, 0x00, 0x00, 0xdb, 0x00, 0x03, 'n', 'o', 'p' };
+        memcpy(w, r404, sizeof(r404));
+        check("h3: HTTP 404 — это ответ (1), решает вызывающий", 1, h3d_response(w, sizeof(r404), 1, &st, &bl, &why, &he));
+        check("  код 404", 404, st);
+        static const uint8_t rdata[] = { 0x00, 0x01, 'x', 0x01, 0x03, 0x00, 0x00, 0xd9 };
+        memcpy(w, rdata, sizeof(rdata));
+        check("h3: DATA раньше HEADERS — нарушение", -1, h3d_response(w, sizeof(rdata), 1, &st, &bl, &why, &he));
+        check("  код H3_FRAME_UNEXPECTED", H3D_E_FRAME_UNEXPECTED, (int)he);
+        static const uint8_t rset[] = { 0x01, 0x03, 0x00, 0x00, 0xd9, 0x04, 0x00 };
+        memcpy(w, rset, sizeof(rset));
+        check("h3: SETTINGS на потоке запроса — нарушение", -1, h3d_response(w, sizeof(rset), 1, &st, &bl, &why, &he));
+        static const uint8_t rdyn[] = { 0x01, 0x03, 0x00, 0x00, 0x80 };
+        memcpy(w, rdyn, sizeof(rdyn));
+        check("h3: ссылка на динамическую таблицу — ошибка сжатия", -1, h3d_response(w, sizeof(rdyn), 1, &st, &bl, &why, &he));
+        check("  код QPACK_DECOMPRESSION_FAILED", H3D_E_QPACK_DECOMPRESSION, (int)he);
+        static const uint8_t rnoh[] = { 0x01, 0x03, 0x00, 0x00, 0xd8 };
+        memcpy(w, rnoh, sizeof(rnoh));
+        check("h3: только 103, окончательного ответа нет — ошибка", -1, h3d_response(w, sizeof(rnoh), 1, &st, &bl, &why, &he));
+        check("h3: пусто и FIN — окончательного ответа нет", -1, h3d_response(w, 0, 1, &st, &bl, &why, &he));
+        /* Тело больше сообщения DNS: кадр DATA на 65536 байт. */
+        static uint8_t big[16 + 65536 + 8];
+        size_t bo = 0;
+        memcpy(big, hdr200, 5); bo = 5;
+        big[bo++] = 0x00; bo += h3d_varint_put(big + bo, 8, 65536);
+        memset(big + bo, 0, 65536); bo += 65536;
+        check("h3: тело 65536 — длиннее сообщения DNS", -1, h3d_response(big, bo, 1, &st, &bl, &why, &he));
+        check("  ошибка сообщения, а не соединения", H3D_E_MESSAGE_ERROR, (int)he);
+        char nb3[24];
+        check_str("h3: имя кода", "H3_REQUEST_CANCELLED", h3d_errname(H3D_E_REQUEST_CANCELLED, nb3, sizeof(nb3)));
+        check_str("  неизвестный код", "код 0x99", h3d_errname(0x99, nb3, sizeof(nb3)));
     }
 
     unlink(lst); unlink(lst2); unlink(sp); rmdir(dir);

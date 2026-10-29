@@ -88,6 +88,42 @@ static void on_alarm(int sig) {
 }
 
 int main(void) {
+    /* ---- таблица длинных значений без предела (I-526) ------------------------------------------ */
+    {
+        enum { N = 1500 };
+        static const char *ptr[N];
+        char v[32];
+        int full = 0, dup = 0;
+        for (int i = 0; i < N; i++) {
+            snprintf(v, sizeof v, "value-%05d", i);
+            ptr[i] = sl_intern(v, strlen(v));
+            if (ptr[i] == SL_FULL) full++;
+        }
+        for (int i = 0; i < N; i += 7) {
+            snprintf(v, sizeof v, "value-%05d", i);
+            if (sl_intern(v, strlen(v)) != ptr[i]) dup++;
+        }
+        check_n("intern: полторы тысячи различных значений — ни одно не «таблица полна»", 0, full);
+        check_n("intern: то же значение — тот же экземпляр", 0, dup);
+        check("intern: значение сохранено как есть", "value-00777", ptr[777]);
+    }
+
+    /* ---- числа JSON без переполнения (I-543) ---------------------------------------------- */
+    {
+        struct sj j = { .p = "443," };
+        check_n("sj_num: обычное число", 443, sj_num(&j));
+        struct sj q = { .p = "\"8080\"," };
+        check_n("sj_num: число в кавычках", 8080, sj_num(&q));
+        struct sj big = { .p = "123456789012345678901234567890,\"x\":1" };
+        check_n("sj_num: 30 цифр — переполнение, а не ложное число", -1, sj_num(&big));
+        /* Прежде разбор вставал на 23-й цифре, и остаток цифр ломал следующее поле объекта. */
+        check("sj_num: после длинного числа поток стоит на запятой", ",\"x\":1", big.p);
+        struct sj bq = { .p = "\"1234567890123456789012345\"," };
+        check_n("sj_num: 25 цифр в кавычках — переполнение, не первые 23", -1, sj_num(&bq));
+        check_n("str_num: 23 цифры — переполнение", -1, str_num("99999999999999999999999"));
+        check_n("str_num: обычное", 2048, str_num("2048"));
+    }
+
     /* ---- исключение узлов (src/model/nodesel.h): страна по флагу, кусок имени ------------- */
     {
         char cc[3] = "";
@@ -107,12 +143,20 @@ int main(void) {
         check_n("кусок, которого нет", 0, node_name_has("Мобильный #6", "лте"));
         char ru[2][3] = { "RU", "US" };
         const char *names[1] = { "мобил" };
-        struct node_exclude x = { ru, 2, names, 1 };
+        struct node_exclude x = { .cc = ru, .cc_n = 2, .names = names, .names_n = 1 };
         check_n("исключён по стране", 1, node_excluded(&x, "\xF0\x9F\x87\xB7\xF0\x9F\x87\xBA Москва"));
         check_n("исключён по куску имени", 1, node_excluded(&x, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Мобильный"));
         check_n("не исключён", 0, node_excluded(&x, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам"));
         check_n("узел без флага по стране не исключается", 0, node_excluded(&x, "RU Moscow"));
         check_n("пустое исключение — ничего", 0, node_excluded(NULL, "x"));
+        /* only: берутся узлы только этих стран, узел без флага не берётся */
+        char nlde[2][3] = { "NL", "DE" };
+        struct node_exclude o = { .only = nlde, .only_n = 2 };
+        check_n("only: узел страны из списка берётся", 0, node_excluded(&o, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам"));
+        check_n("only: узел другой страны исключён", 1, node_excluded(&o, "\xF0\x9F\x87\xB7\xF0\x9F\x87\xBA Москва"));
+        check_n("only: узел без флага исключён", 1, node_excluded(&o, "NL Amsterdam"));
+        o.names = names; o.names_n = 1;
+        check_n("only вместе с exclude_name — пересечение", 1, node_excluded(&o, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Мобильный"));
     }
 
     /* ---- base64: то, чем подписки реально приходят ------------------------- */
@@ -174,6 +218,42 @@ int main(void) {
          * показывает %D0%A3... вместо имени. */
         check("имя раскодировано из процентной формы", "Узел", n.name);
     }
+
+    /* ---- узел по адресу IPv6 (issue splify2/steer#7) ---------------------------------- */
+    {
+        struct vless_node n;
+        check_n("vless://…@[2001:db8::1]:443 разбирается",
+                0, vless_parse_url("vless://u@[2001:db8::1]:443?security=none&type=tcp#v6", &n));
+        check("IPv6: хост без скобок", "2001:db8::1", n.host);
+        check_n("IPv6: порт", 443, n.port);
+        check("IPv6: имя узла", "v6", n.name);
+        check_n("vless IPv6 без параметров, порт 8443",
+                0, vless_parse_url("vless://u@[2001:db8:0:1::7]:8443#x", &n));
+        check("IPv6: сжатая запись", "2001:db8:0:1::7", n.host);
+        check_n("IPv6: порт 8443", 8443, n.port);
+        check_n("link-local с зоной: fe80::1%25eth0",
+                0, vless_parse_url("vless://u@[fe80::1%25eth0]:443#ll", &n));
+        check("зона: «%25» свёрнут в «%»", "fe80::1%eth0", n.host);
+        check_n("скобка не закрыта — отказ", -1, vless_parse_url("vless://u@[2001:db8::1:443#x", &n));
+        check_n("после скобки нет порта — отказ", -1, vless_parse_url("vless://u@[2001:db8::1]#x", &n));
+        check_n("пустые скобки — отказ", -1, vless_parse_url("vless://u@[]:443#x", &n));
+        check_n("IPv6 без скобок с портом — отказ (адрес от порта не отличить)", -1,
+                vless_parse_url("vless://u@2001:db8::1:443#x", &n));
+        check_n("IPv6 + tls без sni — по-прежнему непригоден (проверять сертификат не против чего)",
+                1, vless_parse_url("vless://u@[2001:db8::1]:443?security=tls#x", &n));
+        check_n("IPv6 + tls + sni — пригоден",
+                0, vless_parse_url("vless://u@[2001:db8::1]:443?security=tls&sni=node.example.org#x", &n));
+        check_n("узел «::1» — отвечать некому",
+                1, vless_parse_url("vless://u@[::1]:443#x", &n));
+    }
+
+    /* ---- пустой хост ------------------------------------------------------------------- */
+    {
+        struct vless_node n;
+        /* Пустой хост — узел непригоден с причиной (пропущен, а не выброшен молча). */
+        check_n("vless://u@:443 — хоста нет, узел непригоден", 1, vless_parse_url("vless://u@:443#x", &n));
+    }
+
 
     /* ---- непригодные узлы: пропущены с причиной, а не выброшены ------------ */
     {
@@ -370,14 +450,15 @@ int main(void) {
      * Заголовок sub.c обещает: «в ней 26 узлов, а steer видит 17» должно объясняться
      * цифрой. Значит ни одна ссылка не имеет права исчезнуть, не попав ни в один
      * счётчик. До правки исчезали две: IPv6-литерал в host (первое двоеточие
-     * оказывается внутри скобок, порт читается как 0) и ссылка с портом 0. Обе
+     * оказывается внутри скобок, порт читается как 0; сегодня скобочная форма разбирается
+     * — issue #7, — и здесь остаётся IPv6 без скобок, который по-прежнему не разбирается) и ссылка с портом 0. Обе
      * возвращают -1, а -1 не считался нигде — узел пропадал из подписки бесследно. */
     {
         struct vless_node nodes[16];
         struct vless_sub_stats st;
         const char *sub =
             "vless://a@1.2.3.4:443?security=reality&pbk=K&sni=x.com#ok\n"
-            "vless://b@[2001:db8::1]:443?security=reality&pbk=K&sni=x.com#ipv6\n"
+            "vless://b@2001:db8::1:443?security=reality&pbk=K&sni=x.com#ipv6\n"
             "vless://c@5.6.7.8:0?security=reality&pbk=K&sni=x.com#zero-port\n"
             "vless://d@9.9.9.9:443?security=tls#tls\n"
             "hy2://e@10.0.0.1:443#foreign\n";
@@ -390,26 +471,118 @@ int main(void) {
                 5, (long)(n + st.skipped + st.foreign));
     }
 
-    /* Ссылка длиннее буфера строки тоже исчезала бесследно: ветка длины отбрасывала
-     * её раньше разбора. Считается как непригодная — она и есть непригодная. */
+    /* Ссылка длиннее прежнего буфера строки (8192) разбирается как любая: предела длины ссылки нет. Узел с
+     * длинным НЕИЗВЕСТНЫМ параметром пригоден; узел, у которого длинное значение — поле, не влезающее в
+     * узел (здесь SNI), — непригоден с названной шириной поля, а не с «ссылка длиннее» и не с молча
+     * обрезанным SNI (I-526). */
     {
         struct vless_node nodes[4];
         struct vless_sub_stats st;
-        char big[16384];
-        int k = snprintf(big, sizeof(big), "vless://u@h:443?sni=");
+        static char big[16384];
+        int k = snprintf(big, sizeof(big), "vless://11111111-2222-3333-4444-555555555555@h.example:443?sni=h.example&zzz=");
         memset(big + k, 'x', 9000);
         big[k + 9000] = '\0';
         size_t n = vless_parse_sub(big, nodes, 4, &st);
-        check_n("слишком длинная ссылка: не взята", 0, (long)n);
-        check_n("слишком длинная ссылка: учтена как непригодная", 1, (long)st.skipped);
-        check("слишком длинная ссылка: причина названа", "ссылка длиннее 8191 байт",
+        check_n("ссылка 9000+ байт с длинным неизвестным параметром: взята", 1, (long)n);
+
+        k = snprintf(big, sizeof(big), "vless://11111111-2222-3333-4444-555555555555@h.example:443?sni=");
+        memset(big + k, 'x', 9000);
+        big[k + 9000] = '\0';
+        n = vless_parse_sub(big, nodes, 4, &st);
+        check_n("SNI в 9000 знаков: не взят", 0, (long)n);
+        check_n("SNI в 9000 знаков: учтён как непригодный", 1, (long)st.skipped);
+        check("SNI в 9000 знаков: причина называет поле и ширину", "sni длиннее 127 байт",
               st.reasons[0].reason);
-        /* Пример у этой причины — длина и начало адреса узла (I-209): по одной причине
-         * нельзя отличить ссылку чуть длиннее предела от блоба на десятки килобайт, а
-         * починки у них разные. Начало берётся после '@': до него идентификатор, которому
-         * в журнале, пересылаемом в трекер, не место. */
-        check("слишком длинная ссылка: пример — длина и начало адреса",
-              "9020 байт: …@h:443?sni=xxxxxxxxxxxxxxxxxxxxxx", st.reasons[0].example);
+    }
+
+    /* I-526: у каждого поля узла, которое раньше обрезалось молча, — отказ с названием и шириной. */
+    {
+        struct vless_node nd;
+        static char url[2048];
+        char fld[400];
+        memset(fld, 'p', sizeof fld - 1);
+        fld[sizeof fld - 1] = '\0';
+        static const struct { const char *param; const char *reason; } cases[] = {
+            { "path", "path длиннее 127 байт" },
+            { "host", "http_host длиннее 127 байт" },
+            { "pbk",  "pbk длиннее 63 байт" },
+            { "sid",  "sid длиннее 31 байт" },
+            { "serviceName", "service длиннее 63 байт" },
+            { "mode", "mode длиннее 15 байт" },
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+            snprintf(url, sizeof url, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&type=ws&sni=h.example&%s=%s",
+                     cases[i].param, fld);
+            int rc = vless_parse_url(url, &nd);
+            char what[96];
+            snprintf(what, sizeof what, "%s в 399 знаков: узел не взят", cases[i].param);
+            check_n(what, 1, rc);
+            snprintf(what, sizeof what, "%s в 399 знаков: причина", cases[i].param);
+            check(what, cases[i].reason, nd.skip_reason);
+        }
+        /* fp — имя отпечатка: длинное незнакомое не отказ (хелло берёт умолчание), как и прежде. */
+        snprintf(url, sizeof url, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&type=ws&sni=h.example&fp=%s", fld);
+        check_n("fp в 399 знаков: узел взят, отпечаток — умолчание", 0, vless_parse_url(url, &nd));
+        /* Хост и uuid. */
+        snprintf(url, sizeof url, "vless://11111111-2222-3333-4444-555555555555@%s:443", fld);
+        int rc = vless_parse_url(url, &nd);
+        check_n("host в 399 знаков: узел не взят", 1, rc);
+        check("host в 399 знаков: причина", "host длиннее 127 байт", nd.skip_reason);
+        /* Влезающее значение — как прежде. */
+        snprintf(url, sizeof url, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&type=ws&sni=h.example&path=%%2Fa%%2Fb");
+        check_n("path в процентной форме, влезает: узел взят", 0, vless_parse_url(url, &nd));
+        /* Процентная форма РАСКОДИРУЕТСЯ до проверки ширины: 160 знаков — это 120 байт пути, он влезает в 127. */
+        char enc[300] = "";
+        for (int i = 0; i < 40; i++) strcat(enc, "%2Fab");
+        snprintf(url, sizeof url, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&type=ws&sni=h.example&path=%s", enc);
+        check_n("path: 160 знаков в процентной форме = 120 байт, узел взят", 0, vless_parse_url(url, &nd));
+    }
+
+    /* Строка JSON, не влезшая в поле узла, — отказ узла, а не обрезанное значение (sing-box). */
+    {
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+        static char js[4096];
+        char longpbk[200];
+        memset(longpbk, 'k', sizeof longpbk - 1);
+        longpbk[sizeof longpbk - 1] = '\0';
+        snprintf(js, sizeof js,
+                 "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"sb\",\"server\":\"h.example\",\"server_port\":443,"
+                 "\"uuid\":\"11111111-2222-3333-4444-555555555555\",\"tls\":{\"enabled\":true,\"server_name\":\"h.example\","
+                 "\"reality\":{\"enabled\":true,\"public_key\":\"%s\",\"short_id\":\"ab\"}}}]}", longpbk);
+        size_t n = vless_parse_sub(js, nodes, 4, &st);
+        check_n("sing-box: public_key в 199 знаков — узел не взят", 0, (long)n);
+        check_n("sing-box: учтён как непригодный", 1, (long)st.skipped);
+        check("sing-box: причина называет ширину", "значение длиннее 63 байт", st.reasons[0].reason);
+    }
+
+    /* Clash: больше 96 пар и 12 КБ в одном узле не теряют поля после лимита. */
+    {
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+        static char y[40000];
+        int k = snprintf(y, sizeof y,
+                         "proxies:\n  - name: big\n    type: vless\n    server: h.example\n    port: 443\n"
+                         "    uuid: 11111111-2222-3333-4444-555555555555\n    network: ws\n    tls: true\n    servername: h.example\n"
+                         "    ws-opts:\n      headers:\n");
+        for (int i = 0; i < 200; i++)
+            k += snprintf(y + k, sizeof y - (size_t)k, "        X-H%03d: value-%03d-%0100d\n", i, i, 7);
+        k += snprintf(y + k, sizeof y - (size_t)k, "      path: /tail-path\n");
+        size_t n = vless_parse_sub(y, nodes, 4, &st);
+        /* Заголовков больше, чем влезает в headers узла, — узел непригоден, а не «берёт что успел». Главное
+         * здесь — path, лежащий ПОСЛЕ двухсот пар: прежде он пропадал молча, и узел шёл с путём «». */
+        check_n("clash: 200 заголовков — узел не взят (headers не влезли)", 0, (long)n);
+        check("clash: причина — негодные headers", "негодные headers у ws", st.reasons[0].reason);
+        k = snprintf(y, sizeof y,
+                     "proxies:\n  - name: big\n    type: vless\n    server: h.example\n    port: 443\n"
+                     "    uuid: 11111111-2222-3333-4444-555555555555\n    network: ws\n    tls: true\n    servername: h.example\n"
+                     "    ws-opts:\n");
+        for (int i = 0; i < 150; i++)
+            k += snprintf(y + k, sizeof y - (size_t)k, "      x-unused-%03d: v\n", i);
+        k += snprintf(y + k, sizeof y - (size_t)k, "      path: /tail-path\n");
+        n = vless_parse_sub(y, nodes, 4, &st);
+        check_n("clash: 150 лишних ключей перед path — узел взят", 1, (long)n);
+        check("clash: path после лимита пар не потерян", "/tail-path", n ? nodes[0].path : "");
     }
 
     /* Ссылка постквантового Reality. Длина взята с живой подписки: Xray-core 25.9+ кладёт
@@ -483,7 +656,7 @@ int main(void) {
             "vless://b@2.2.2.2:443?security=tls#Второй\n"
             "vless://c@3.3.3.3:443?security=tls#Третий\n"
             "vless://d@4.4.4.4:443?type=kcp&security=none#Вебсокет\n"
-            "vless://e@[2001:db8::1]:443?security=none#IPv6\n"
+            "vless://e@2001:db8::1:443?security=none#IPv6\n"
             "vless://f@6.6.6.6:443?security=reality&pbk=K&sni=x.com#Годный\n";
         size_t n = vless_parse_sub(sub, nodes, 16, &st);
         check_n("причины: пригоден один узел", 1, (long)n);
@@ -505,9 +678,10 @@ int main(void) {
         check("вторая причина: транспорт kcp", "транспорт kcp не поддержан",
               st.reasons[1].reason);
         check("kcp: пример — имя своего узла", "Вебсокет", st.reasons[1].example);
-        /* IPv6-литерал разбор не осиливает и до проверки пригодности не доходит —
-         * причину называет уже сам обход подписки, иначе ссылка снова стала бы
-         * «пропущено на единицу больше» без объяснения. */
+        /* IPv6-литерал БЕЗ скобок разбор не осиливает (адрес от порта не отличить; со скобками
+         * узел разбирается — выше) и до проверки пригодности не доходит — причину называет уже
+         * сам обход подписки, иначе ссылка снова стала бы «пропущено на единицу больше» без
+         * объяснения. */
         check("третья причина: ссылка не разобрана", "ссылка не разобрана",
               st.reasons[2].reason);
     }
@@ -1266,6 +1440,35 @@ int main(void) {
         check_n("500 узлов из файла: взяты все", 500, (long)n);
         check_n("  пропущенных нет", 0, (long)st.skipped);
         if (nodes && n == 500) check("  последний — со своим именем", "node499", nodes[499].name);
+        free(nodes);
+    }
+
+    /* ---- Clash YAML и sing-box JSON из файла: узлы описаны ключом `type`, а не «://» и "protocol" ---
+     * Места под узлы сначала считались по подстрокам, и подписка из пяти узлов давала «пригодно 1,
+     * пропущено 4: узлов больше, чем помещается». Теперь массив растёт по счёту самого разбора. */
+    for (int fmt = 0; fmt < 2; fmt++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/submatch-multi%d.%d", fmt, (int)getpid());
+        FILE *f = fopen(path, "w");
+        if (f && fmt == 0) fputs("proxies:\n", f);
+        if (f && fmt == 1) fputs("{\"outbounds\":[", f);
+        for (int i = 0; f && i < 5; i++) {
+            if (fmt == 0)
+                fprintf(f, "  - name: c%d\n    type: vless\n    server: x%d.example\n    port: 443\n"
+                           "    uuid: 11111111-2222-3333-4444-555555555555\n    tls: true\n    servername: s\n", i, i);
+            else
+                fprintf(f, "%s{\"type\":\"vless\",\"tag\":\"n%d\",\"server\":\"x%d.example\",\"server_port\":443,"
+                           "\"uuid\":\"11111111-2222-3333-4444-555555555555\",\"tls\":{\"enabled\":true,\"server_name\":\"s\"}}",
+                        i ? "," : "", i, i);
+        }
+        if (f && fmt == 1) fputs("]}", f);
+        if (f) fclose(f);
+        struct vless_sub_stats st;
+        size_t n = 0;
+        struct vless_node *nodes = vless_load_sub(path, &n, &st);
+        unlink(path);
+        check_n(fmt ? "sing-box JSON, 5 узлов: взяты все" : "Clash YAML, 5 узлов: взяты все", 5, (long)n);
+        check_n("  пропущенных нет", 0, (long)st.skipped);
         free(nodes);
     }
 

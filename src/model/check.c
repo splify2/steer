@@ -11,7 +11,6 @@
 #include <arpa/inet.h>
 
 #include "spec.h"
-#include "obfs.h"
 #include "check.h"
 
 /* ---- порты ---------------------------------------------------------------------------------
@@ -67,24 +66,24 @@ int obfs_set(const char *name, const char *mode, const char *server, const char 
      * «наверное, тот самый»: обфускация, которой нет, выглядит как рабочий выход, из которого
      * не выходит ни один пакет. */
     if (mode[0] && strcmp(mode, "wg-over-tcp") != 0)
-        return err_set(e, "outputs.%s: неизвестный obfs.mode (сейчас есть только wg-over-tcp)", name);
-    if (!server[0]) return err_set(e, "outputs.%s: obfs нужен server вида адрес:порт", name);
+        return err_setc(e, "spec.obfs_mode", "outputs.%s: неизвестный obfs.mode (сейчас есть только wg-over-tcp)", name);
+    if (!server[0]) return err_setc(e, "spec.obfs_no_server", "outputs.%s: obfs нужен server вида адрес:порт", name);
     if (obfs_split_hostport(server, ob->server, sizeof(ob->server), &ob->server_port) != 0)
-        return err_set(e, "outputs.%s: obfs.server должен быть вида адрес:порт", name);
+        return err_setc(e, "spec.obfs_server_form", "outputs.%s: obfs.server должен быть вида адрес:порт", name);
     /* Имя, а не адрес — отказ. Имя пришлось бы разрешать, и разрешать его через тот самый DNS,
      * который может идти в туннель, который поднимается через этот самый сервер. Управляющий
      * слой резолвит один раз и кладёт сюда адрес — то же правило, что со списками: движок
      * читает то, что ему положили. */
     struct in_addr tmp;
     if (inet_pton(AF_INET, ob->server, &tmp) != 1)
-        return err_set(e, "outputs.%s: obfs.server должен быть адресом, а не именем", name);
+        return err_setc(e, "spec.obfs_server_name", "outputs.%s: obfs.server должен быть адресом, а не именем", name);
 
-    if (!listen[0]) return err_set(e, "outputs.%s: obfs нужен listen — тот же адрес и порт, что в "
+    if (!listen[0]) return err_setc(e, "spec.obfs_no_listen", "outputs.%s: obfs нужен listen — тот же адрес и порт, что в "
                         "Endpoint пира WireGuard", name);
     if (obfs_split_hostport(listen, ob->listen, sizeof(ob->listen), &ob->listen_port) != 0)
-        return err_set(e, "outputs.%s: obfs.listen должен быть вида адрес:порт", name);
+        return err_setc(e, "spec.obfs_listen_form", "outputs.%s: obfs.listen должен быть вида адрес:порт", name);
     if (inet_pton(AF_INET, ob->listen, &tmp) != 1)
-        return err_set(e, "outputs.%s: obfs.listen должен быть адресом, а не именем", name);
+        return err_setc(e, "spec.obfs_listen_name", "outputs.%s: obfs.listen должен быть адресом, а не именем", name);
     ob->on = 1;
     return 0;
 }
@@ -114,8 +113,8 @@ static int via_idx(const struct spec *sp, const struct output *o) { return (int)
 /* Устройства, в которые может уйти трафик выхода: у группы — устройства её членов, у выхода с
  * устройством — его собственное (out_members). */
 /* Устройства выхода: у группы — листья всех членов, вниз по вложенным группам (любое из них может
- * оказаться выбранным); список растёт по числу устройств (раньше — 64 записи, а сверх них листья
- * просто не проверялись, то есть проверка молча слепла на большом пуле). Вложенность ограничена
+ * оказаться выбранным); список растёт по числу устройств, и большой пул проверяется
+ * целиком. Вложенность ограничена
  * числом выходов: группы без кругов вкладываются не глубже, чем их всего. leaves = 0 — только
  * члены без групп: так смотрит проверка дубликатов, где вложенная группа с общими листьями
  * законна (bal из res и wg1, а рядом запасной wg0). */
@@ -162,7 +161,6 @@ struct over_ws { int *on_path, *seen, *stack; struct devlist td, od; };
 
 static int over_check_run(const struct spec *sp, const char *w, int *bad, struct err *e,
                           struct over_ws *ws) {
-    static char msg[512];
     int *on_path = ws->on_path, *seen = ws->seen, *stack = ws->stack;
 #define td (ws->td)                 /* списки устройств живут в ws: realloc виден обёртке */
 #define od (ws->od)
@@ -172,30 +170,26 @@ static int over_check_run(const struct spec *sp, const char *w, int *bad, struct
         if (!o->over[0]) continue;
         if (bad) *bad = (int)i;
         if (!out_over_capable(o)) {
-            snprintf(msg, sizeof(msg),
+            return err_setf(e, "spec.over_incapable",
                      "выход %.31s: %s есть только у выходов со своим соединением с сервером — "
-                     "vless, xsteer, awg и interface с obfs; у kind=%s соединение открывает не ядро steer, "
+                     "туннели со своим сокетом, awg и interface с obfs; у kind=%s соединение открывает не ядро steer, "
                      "и пустить его через другой выход нечем", o->name, w,
                      out_kind_shown(o)->novia ? out_kind_shown(o)->novia : out_kind_name(o));
-            return err_set(e, "%s", msg);
         }
         if (!strcmp(o->over, o->name)) {
-            snprintf(msg, sizeof(msg), "выход %s: %s указывает на него самого — туннель не может "
+            return err_setf(e, "spec.over_self", "выход %s: %s указывает на него самого — туннель не может "
                      "идти внутри себя", o->name, w);
-            return err_set(e, "%s", msg);
         }
         const struct output *v = out_over(sp, o);
         if (!v) {
-            snprintf(msg, sizeof(msg), "выход %.31s: %s «%.31s» — такого выхода в спеке нет",
+            return err_setf(e, "spec.over_target_missing", "выход %.31s: %s «%.31s» — такого выхода в спеке нет",
                      o->name, w, o->over);
-            return err_set(e, "%s", msg);
         }
         if (!out_over_target_ok(v)) {
-            snprintf(msg, sizeof(msg),
+            return err_setf(e, "spec.over_target_no_device",
                      "выход %.31s: %s «%.31s» — это kind=%s, у него нет устройства, в которое "
-                     "можно пустить туннель (нужен выход с устройством: interface, vless, xsteer, awg)",
+                     "можно пустить туннель (нужен выход с устройством: interface, awg или туннель)",
                      o->name, w, v->name, out_kind_name(v));
-            return err_set(e, "%s", msg);
         }
 
         /* Цепочка по одним подложкам: круг и глубина. Путь печатается целиком — по одному имени
@@ -210,15 +204,13 @@ static int over_check_run(const struct spec *sp, const char *w, int *bad, struct
             if (pl < sizeof(path))
                 pl += (size_t)snprintf(path + pl, sizeof(path) - pl, " → %s", n->name);
             if (on_path[via_idx(sp, n)]) {
-                snprintf(msg, sizeof(msg), "выход %.31s: %s замыкается в круг (%s) — туннели "
+                return err_setf(e, "spec.over_cycle", "выход %.31s: %s замыкается в круг (%s) — туннели "
                          "заворачивались бы друг в друга, и не встал бы ни один", o->name, w, path);
-                return err_set(e, "%s", msg);
             }
             on_path[via_idx(sp, n)] = 1;
             if (hops > MAX_OVER_DEPTH) {
-                snprintf(msg, sizeof(msg), "выход %.31s: цепочка %s длиннее %d переходов (%s)",
+                return err_setf(e, "spec.over_depth", "выход %.31s: цепочка %s длиннее %d переходов (%s)",
                          o->name, w, MAX_OVER_DEPTH, path);
-                return err_set(e, "%s", msg);
             }
         }
 
@@ -233,9 +225,8 @@ static int over_check_run(const struct spec *sp, const char *w, int *bad, struct
         while (top) {
             const struct output *t = &sp->out[stack[--top]];
             if (t == o) {
-                snprintf(msg, sizeof(msg), "выход %.31s: %s замыкается в круг через устройства "
+                rc = err_setf(e, "spec.over_pool_cycle", "выход %.31s: %s замыкается в круг через устройства "
                          "пула — туннель однажды пошёл бы внутрь себя", o->name, w);
-                rc = err_set(e, "%s", msg);
                 goto out;
             }
             if (via_devs(sp, t, &td) != 0 || via_devs(sp, o, &od) != 0) {
@@ -245,10 +236,9 @@ static int over_check_run(const struct spec *sp, const char *w, int *bad, struct
             for (size_t d = 0; d < td.n; d++) {
                 for (size_t k = 0; k < od.n; k++)
                     if (!strcmp(td.v[d], od.v[k])) {
-                        snprintf(msg, sizeof(msg), "выход %.31s: %s ведёт в %.31s, а среди его "
+                        rc = err_setf(e, "spec.over_pool_device", "выход %.31s: %s ведёт в %.31s, а среди его "
                                  "устройств %.31s — устройство самого выхода, туннель пошёл бы "
                                  "внутрь себя", o->name, w, t->name, td.v[d]);
-                        rc = err_set(e, "%s", msg);
                         goto out;
                     }
                 const struct output *wo = via_dev_owner(sp, td.v[d], t);
@@ -303,12 +293,10 @@ int spec_check_outputs(const struct spec *sp, const char *over_word, int *bad, s
             if (!strcmp(o->device, sp->lan_dev[d])) {
                 /* 256, не 160: через указатель на struct spec gcc считает границы имени и
                  * устройства не так точно, и -Wformat-truncation видит в этом риск. */
-                char msg[256];
-                snprintf(msg, sizeof(msg),
+                free(dv.v);
+                return err_setf(e, "spec.device_is_lan",
                          "выход %s ведёт в %s — это локальная сеть, трафик закольцуется",
                          o->name, sp->lan_dev[d]);
-                free(dv.v);
-                return err_set(e, "%s", msg);
             }
 
         /* Дубликат устройства внутри одного пула делает failover бессмысленным: второй
@@ -321,11 +309,10 @@ int spec_check_outputs(const struct spec *sp, const char *over_word, int *bad, s
         for (size_t a = 0; a < dv.n; a++)
             for (size_t b = a + 1; b < dv.n; b++)
                 if (!strcmp(dv.v[a], dv.v[b])) {
-                    char msg[160];
-                    snprintf(msg, sizeof(msg), "выход %s: устройство %s указано дважды",
+                    err_setf(e, "spec.device_twice", "выход %s: устройство %s указано дважды",
                              o->name, dv.v[a]);
                     free(dv.v);
-                    return err_set(e, "%s", msg);
+                    return -1;
                 }
     }
     free(dv.v);
@@ -340,11 +327,9 @@ int check_mark_slots(const struct spec *sp, struct err *e) {
     if (n <= slots) return 0;
     /* Цифры раскладки, а не имя константы: столько мест даёт поле метки, вот какие это биты, и
      * вот почему больше нельзя (marks.h, «СКОЛЬКО ВЫХОДОВ ВЛЕЗАЕТ В ПОЛЕ МЕТКИ»). */
-    char msg[600];
-    snprintf(msg, sizeof(msg), "выходов с меткой %zu, а поле метки даёт мест не больше %u: у метки "
+    return err_setf(e, "spec.mark_slots", "выходов с меткой %zu, а поле метки даёт мест не больше %u: у метки "
              "%d бит (биты %d-%d), значения, которые чужая перезапись соседних битов 16-23 могла бы "
              "превратить в метку другого выхода, не раздаются. Выходы без метки (direct) в счёт не "
              "идут", n, slots, (int)STEER_MARK_BITS,
              STEER_MARK_LOBIT, STEER_MARK_HIBIT);
-    return err_set(e, "%s", msg);
 }

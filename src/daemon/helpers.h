@@ -21,6 +21,7 @@
 #include <sys/types.h>
 
 #include "spec.h"
+#include "evline.h"
 
 /* Помощников не «не больше 32»: по одному на выход с собственным процессом плюс резолвер, то есть
  * не больше выходов спеки + 1. Наборы (helper_set, планы) растут по этому числу. */
@@ -53,6 +54,8 @@ struct helper_state {
     int up;               /* последнее событие — up (и процесс с тех пор не выходил) */
     int known;            /* с запуска процесса было хоть одно up или down */
     char why[200];        /* причина последнего down (или выхода процесса); пусто — не было */
+    char why_code[40];    /* слово причины, если она демона (docs/errors.md, supd.*); пусто — слов помощника, кода нет */
+    char why_args[256];    /* подстановки причины — объект JSON ({"1":"…"}); пусто — их нет */
     long node, total;     /* последнее node: проверяется узел node из total; 0 — не было */
     long nonode;          /* последнее nonode: выбранного узла нет в подписке; 0 — не было */
     int excluded;         /* последнее excluded: все кандидаты исключены exclude; 0 — не было */
@@ -75,31 +78,43 @@ struct helper_state {
     /* Клиент туннеля по подписке: номера активных живых узлов пула через запятую (событие active,
      * evline.h; src/tunnel/pool.c), «» — живых нет; active_known — событие было. Сбрасывается с
      * новым процессом. */
-    char active[160];
+    char active[EVLINE_LINE_MAX]; /* событие не длиннее трубы, строка узлов — тем более */
     int active_known;
 };
 
 struct helper {
     /* Состав — из вида выхода (kind_ops.helper). */
-    char cmd[16];               /* «hysteria2» — девять знаков: восьми уже не хватало */
-    char name[32];
-    char prog[16];
-    char arg[2][256];
-    char env[32];
-    /* prog — бинарник модуля (steer-vless и остальные, src/lib/module.h), а не своя программа
-     * вроде steer-nfqws: ему передаются те же слова, что подкоманде (`<cmd> <выход> --spec …`),
-     * он присылает hello с версией (evline.h), и демон сверяет её со своей. Ставится
-     * helpers_plan, когда команда помощника — команда модуля, а в самом steerd её нет
-     * (статические сборки несут модули в себе, и там помощник — по-прежнему подкоманда). */
-    int module;
-    /* Только у модуля (supd.c, ev_line): пришло ли hello и принято ли, не отвергнут ли процесс за
-     * чужую версию, версия из hello (для status) и записано ли в журнал, что бинарника нет. */
+    /* Как запустить — строки в куче, без пределов по длине и числу (плагины ставят свои
+     * программы, аргументы и переменные): helper_launch_set, helper_clone, helper_launch_free.
+     * prog — NULL или пусто, если помощник — подкоманда движка; arg — аргументы программы;
+     * env — «ИМЯ=значение», по одной на переменную. */
+    char *cmd;
+    char name[32];               /* имя выхода: спека v2 держит его в 32 байтах */
+    char *prog;
+    char **arg;
+    size_t arg_n;
+    char **env;
+    size_t env_n;
+    /* id плагина, чья это программа (kind_helper.plugin); пусто — помощник ядра. У программы плагина
+     * первое событие — hello с версией steer-api (steer-api.md, 2.1): supd.c, plug_hello. */
+    char plugin[64];
+    /* Помощник перебирает узлы (прислал node, nonode или excluded хоть раз): память демона отвечает
+     * про его перебор (supd.c, probe_mem). Не сбрасывается с новым процессом. */
+    int picks;
+    /* Вид помощника объявил paths (kind_helper.paths): paths_down в status — всегда, и пустым. */
+    int paths;
+    /* Только у программы плагина (supd.c, ev_line): пришло ли hello и принято ли, не отвергнут ли
+     * процесс (чужой API), версия из hello (для status) и записано ли в журнал, что программы нет. */
     int hello, rejected, nomod_logged;
     char mver[32];
     unsigned long long sig;   /* подпись параметров, которые помощник читает при старте */
     /* Не помощник выхода, а резолвер на таблице (демон; name пуст): его запуск и труба — свои
      * (supd.c), а пауза, сверка и остановка — общие. */
     int table;
+    /* Служба плагина (steer.services[]): одна на роутер, а не на выход. name — её имя; у службы нет
+     * маршрута, устройства и приговоров выходам — супервизор принимает от неё hello, up/down, ready и
+     * state, остальное пропускает. */
+    int service;
 
     /* Перезапуск. */
     pid_t pid;
@@ -113,7 +128,7 @@ struct helper {
     /* Демон: труба событий (конец чтения; -1 — нет) и недочитанная строка. */
     int evfd;
     size_t evlen;
-    char evbuf[512];
+    char evbuf[EVLINE_LINE_MAX + 2];   /* строка события и \n: длиннее трубы не бывает */
     struct helper_state st;
 };
 
@@ -125,8 +140,28 @@ struct helper_set {
 /* Место в наборе на n помощников. 0 — есть; -1 — нет памяти. */
 int helpers_reserve(struct helper_set *s, size_t n);
 
+/* Поля запуска (cmd, prog, arg, env) — из описания вида; прежние освобождаются. 0 или -1 (нет
+ * памяти: поля остаются пустыми). */
+struct kind_helper;
+int helper_launch_set(struct helper *h, const struct kind_helper *hp);
+/* cmd — одной строкой (резолвер dnsd: описания вида у него нет). */
+int helper_set_cmd(struct helper *h, const char *cmd);
+/* Копия помощника целиком: dst получает свои строки. 0 или -1 (dst обнулён). */
+int helper_clone(struct helper *dst, const struct helper *src);
+/* Освободить поля запуска помощника (сам он остаётся: набор владеет массивом). */
+void helper_launch_free(struct helper *h);
+/* ...у n помощников подряд. */
+void helpers_launch_free(struct helper *v, size_t n);
+/* Запись и чтение помощника по трубе (supervise.c: состав считает дочерний процесс). Чтение
+ * ждёт записи того же процесса: раскладка структуры одна, а строки идут следом с длинами. */
+int helper_write(FILE *w, const struct helper *h);
+int helper_read(FILE *r, struct helper *h);
+
+/* Сколько помощников нужно самое большее по спеке: выходы, службы плагинов и резолвер. */
+size_t helpers_max(const struct spec *sp);
+
 /* Состав помощников по разобранной спеке — в порядке зависимостей via: цель раньше того, чей
- * туннель через неё идёт. Метки выходов с via (и zapret) уже должны быть назначены реестром;
+ * туннель через неё идёт. Метки выходов с via (и модуль DPI) уже должны быть назначены реестром;
  * *need_marks (может быть NULL) — 1, если кому-то из помощников нужны метки. */
 size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *need_marks);
 
@@ -151,10 +186,14 @@ long helpers_due(struct helper_set *s, helper_start_fn start, void *arg);
 void helper_started(struct helper *h, pid_t pid);
 
 /* argv помощника: exe — движок (или шов STEER_SUPERVISE_EXE), self — настоящий файл движка (у
- * помощника-программы она лежит рядом с ним), seam — exe подменён швом. av — не меньше 10
- * мест. Помощник-подкоманда получает --state-dir, если каталог состояния не путь платформы. */
-void helper_argv(const struct helper *h, const char *exe, const char *self, int seam,
-                 const char *spec, char *progbuf, size_t pbn, const char **av);
+ * помощника-программы она лежит рядом с ним), seam — exe подменён швом. Возвращает массив из
+ * кучи, закрытый NULL (число слов не ограничено; освобождает free вызвавший), NULL — нет
+ * памяти. Строки массива — в h, в spec и в progbuf: пока массив нужен, они должны жить.
+ * Помощник-подкоманда получает --state-dir, если каталог состояния не путь платформы. */
+const char **helper_argv(const struct helper *h, const char *exe, const char *self, int seam,
+                         const char *spec, char *progbuf, size_t pbn);
+/* Поставить переменные окружения помощника (в дочернем процессе перед exec). */
+void helper_putenv(const struct helper *h);
 
 /* argv[0] ребёнка, которого запускают файлом exe: «<каталог>/steer», если exe — steerd или
  * бинарник модуля (steer-vless и остальные), иначе сам exe. Процесс помощника в списке процессов
@@ -164,6 +203,10 @@ void helper_argv(const struct helper *h, const char *exe, const char *self, int 
  * исполняется, и ctl_find демона сверяет именно exe (ищет только dnsd и supervise, то есть
  * steerd; модули он не ищет). */
 const char *helper_argv0(const char *exe, char *buf, size_t n);
+
+/* Дескриптор процесса (pidfd_open, ядро ≥ 5.3): POLLIN — процесс вышел, и не только у своих детей.
+ * -1 — ядро не умеет или процесса уже нет. */
+int pidfd_of(pid_t pid);
 
 /* Погасить всех: ordered=0 — SIGTERM всем сразу (supervise); 1 — по одному в обратном порядке
  * подъёма, дожидаясь выхода каждого (демон). Кто не вышел за свой срок — SIGKILL. Ждёт сам
@@ -187,6 +230,8 @@ struct supd_conf {
 
 /* Поднять детей по спеке в памяти демона: помощников и резолвер на таблице. NULL — нет памяти. */
 struct supd *supd_start(struct steerd *d, const struct supd_conf *c);
+/* Приговор члену группы от .so-плагина (host->member_verdict): ok -1, 0, 1; grp — id плагина. */
+void supd_member_set(struct supd *s, const char *grp, const char *out, int ok);
 /* Что тронула сверка (apply-сверка, docs/ctl.md, поле changed): выходы, чей помощник поднят,
  * перезапущен ради новых параметров или погашен; написана ли резолверу новая таблица. */
 struct supd_changes {
@@ -212,8 +257,7 @@ void supd_stop(struct supd *s);
 int supd_orphan_down(void);
 /* Загрузчик набора правил (apply.c, ruleset_load): резолверу этого каталога состояния — вернуть
  * элементы real-ip сразу после nft -f, не дожидаясь таблицы от демона (просьба «reassert»,
- * src/dnsd/adopt.c). 1 — резолвер ответил; 0 — резолвера нет или ответ не пришёл за 500 мс;
- * -1 — резолвер просьбы не знает. */
+ * src/dnsd/adopt.c). 1 — резолвер ответил; 0 — резолвера нет или ответ не пришёл за 500 мс. */
 int supd_dnsd_reassert(void);
 /* Он же, прямо перед засевом fake-IP из файла состояния: резолверу — записать файл сейчас (просьба
  * «flush»). Возврат — как у supd_dnsd_reassert, срок ответа — 1 с. */
@@ -222,6 +266,9 @@ int supd_dnsd_flush(void);
 /* Состояние помощника выхода out из памяти демона. NULL — демон не супервизор (--supervise нет)
  * или у выхода нет помощника. */
 const struct helper_state *helper_state_of(const struct steerd *d, const char *out);
+/* Приговор члену группы от помощника группы (событие member, supd.c): 0 — мёртв, 1 — жив, -1 — не
+ * сказано (или помощник с тех пор вышел). */
+int supd_member_verdict(const struct steerd *d, const char *out);
 
 /* Сторож оживляет выход: перезапустить помощника cmd выхода out сразу, без паузы (живого — SIGTERM
  * и подъём, как выйдет; ждущего паузы — подъём сейчас). 0 — заказано; -1 — такого помощника у
@@ -234,8 +281,8 @@ int supd_restart(struct supd *s, const char *out, const char *cmd);
 int supd_helper_json(const struct supd *s, const char *name, FILE *out);
 
 /* Ход перебора узлов клиентов vless из памяти демона — в запись окружения для детей демона
- * (`STEER_PROBE_MEM=…`, её читает probe_read вместо файлов probe-*; см. src/model/probe.h). Пусто
- * (buf[0] = 0) — демон не супервизор. */
-void supd_probe_env(const struct supd *s, char *buf, size_t n);
+ * (`STEER_PROBE_MEM=…`, её читает probe_read вместо файлов probe-*; см. src/model/probe.h). Строка
+ * в куче, без предела по числу выходов; освобождает вызывающий. NULL — демон не супервизор. */
+char *supd_probe_env(const struct supd *s);
 
 #endif

@@ -1,0 +1,4 @@
+{
+  "plugin.name": "Proxy",
+  "plugin.description": "Trojan, Shadowsocks, SOCKS, HTTP and VMess tunnels"
+}

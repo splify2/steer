@@ -24,12 +24,12 @@ include build/sources.mk
 CORE_HDR := $(wildcard $(addsuffix /*.h,$(CORE_DIRS) $(PROFILE_DIRS) $(THIRD_DIRS)))
 # Точки входа модулей (src/modules, шаг 4 выпуска 1.10) — тоже расширенная часть: их main живёт
 # только в разделяемой раскладке, и ни один статический профиль их не компилирует.
-EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC) $(HY2_MOD_SRC) $(KINDS_HY2_SRC) $(PROXY_MOD_SRC) $(KINDS_PROXY_SRC) $(wildcard src/modules/*.c))
+EXT_ALL_SRC := $(sort $(PLUGMGR_SRC) $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(TGWS_MODULE_SRC) $(HY2_MOD_SRC) $(PROXY_MOD_SRC) $(WARP_MOD_SRC) $(OBFS_MOD_SRC) src/proto/obfs/obfs.c $(wildcard src/modules/*.c) $(wildcard src/net1/*.c) $(wildcard src/plugkit/*.c))
 # Модель для стендов, которые компонуют её отдельным списком: разбор спрашивает вид у реестра, поэтому
 # вместе с моделью идут виды (src/kinds). Без awg.c: он тянет run_quiet из lib/run.c, а стенды
 # подменяют run_quiet своим — awg.c берут только те, кому нужен сам вид awg (specmatch, awgmatch).
 # Вид, которого в списке нет, у реестра остаётся записью отказа (см. src/kinds/kind.c).
-# Дерево ruleset (src/lib/ir.c), которое kind_ops.emit видов zapret и tgws строит напрямую, уже
+# Дерево ruleset (src/lib/ir.c), которое kind_ops.emit вида block строит напрямую, уже
 # в MODEL_SRC (build/sources.mk): без него компоновка падала бы на ir_rule/ir_x и соседях, даже
 # если стенд emit не зовёт вовсе, — символ нужен компоновщику.
 MODEL_KINDS := $(MODEL_SRC) $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC))
@@ -60,16 +60,6 @@ $(BUILD)/steer: $(CLIENT_SRC) src/platform/platform.h | $(BUILD)/steerd
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(CLIENT_SRC)
 
-# Демон базовой сборки с видами vless и xsteer — только для стенда tests/supdmatch.sh: сторож демона
-# берёт здоровье выходов, чьё устройство создаёт наш процесс, у супервизора (--watch вместе с
-# --supervise), а такие виды есть только в расширенной сборке, которая собирается docker'ом с
-# wolfSSL. Помощников стенд подменяет швом STEER_SUPERVISE_EXE, поэтому клиенты туннелей (и
-# криптобиблиотека) демону не нужны: хватает файлов видов — реестр видов (kind.c) ссылается на них слабо.
-# Не пакет и не профиль: в build/sources.mk его нет нарочно.
-$(BUILD)/steer-xk: $(CORE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC) $(CORE_HDR) VERSION
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) $(KINDS_EXT_SRC) $(KINDS_HY2_SRC) $(KINDS_PROXY_SRC)
-
 # Сборка под Android — тот же движок и те же исходники, у которого только умолчание выбора
 # платформы при запуске — телефон (-DSTEER_DEFAULT_PLATFORM=android, src/platform/platform.c):
 # своё поле метки (биты 22-27, в 0-21 пишет netd), свои каталоги (/data/misc/steer) и
@@ -81,20 +71,21 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/modelmatch $(BUILD)/steer-xk $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/b3match $(BUILD)/subpq
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/b3match $(BUILD)/subpq $(BUILD)/abihost $(BUILD)/abihost-static $(BUILD)/steerd-static $(BUILD)/pluginmodel $(BUILD)/pkhooks $(BUILD)/pkmatch
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
 	@sh tests/v2match.sh
-	@sh tests/tgwsmark.sh
+	@sh tests/specschemamatch.sh
+	@sh tests/tgwsmatch.sh
 	@BUILD=$(BUILD) sh tests/noforward.sh
 	@BUILD=$(BUILD) sh tests/boxenv.sh
 	@sh tests/climatch.sh
+	@sh tests/errcodematch.sh
 	@sh tests/dnsproxy.sh
 	@sh tests/dnsgroups.sh
 	@sh tests/dnsnft.sh
 	@sh tests/applynft.sh
-	@sh tests/applynft-legacy.sh
 	@sh tests/v6ns.sh
 	@sh tests/v6host.sh
 	@sh tests/ingressns.sh
@@ -102,9 +93,12 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/platmatch.sh
 	@sh tests/supervisematch.sh
 	@sh tests/ctlmatch.sh
+	@sh tests/pluginlimits.sh
+	@sh tests/pluginkindmatch.sh
 	@sh tests/reroutematch.sh
 	@sh tests/supdmatch.sh
 	@sh tests/modhello.sh
+	@sh tests/plugsvc.sh
 	@sh tests/reconmatch.sh
 	@sh tests/swapmatch.sh
 	@sh tests/netrestart.sh
@@ -112,15 +106,20 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/diagmatch.sh
 	@sh tests/statusmatch.sh
 	@sh tests/buildmatch.sh
+	@sh tests/abimatch.sh
 	@sh tests/srsmatch.sh
 	@$(BUILD)/srsunit
+	@$(BUILD)/procscanmatch
 	@$(BUILD)/modelmatch
+	@$(BUILD)/pluginmodel
+	@$(BUILD)/pkmatch
 	@sh tests/srsgen.sh
 	@sh tests/srsnft.sh
 	@sh tests/vpsfetch.sh
 	@$(BUILD)/dnsmatch
 	@$(BUILD)/dupmatch
 	@$(BUILD)/dupconnmatch
+	@$(BUILD)/dupfragmatch
 	@$(BUILD)/specmatch
 	@$(BUILD)/specmatch-ext
 	@$(BUILD)/failovermatch
@@ -136,14 +135,20 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/grpcmatch
 	@$(BUILD)/xhupmatch
 	@$(BUILD)/wsmatch
+	@$(BUILD)/tls13readmatch
+	@$(BUILD)/outqmatch
+	@$(BUILD)/certrootsmatch
 	@$(BUILD)/pqfallbackmatch
 	@$(BUILD)/b3match
 	@$(BUILD)/subpq
 	@$(BUILD)/submatch
 	@$(BUILD)/subfetchmatch
+	@$(BUILD)/httpmatch
+	@$(BUILD)/tarmatch
 	@$(BUILD)/hy2match
 	@$(BUILD)/pxsubmatch
 	@$(BUILD)/pxdialmatch
+	@$(BUILD)/trdialmatch
 	@$(BUILD)/fwmatch
 	@$(BUILD)/obfsmatch
 	@$(BUILD)/visionmatch
@@ -152,6 +157,12 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/xsconnmatch
 	@$(BUILD)/xsstreammatch
 	@$(BUILD)/tungromatch
+	@$(BUILD)/tunsteermatch
+	@$(BUILD)/spscmatch
+	@R=""; setarch $$(uname -m) -R true 2>/dev/null && R="setarch $$(uname -m) -R"; \
+	if echo 'int main(void){return 0;}' | $(CC) -fsanitize=thread -x c - -o $(BUILD)/.tsanprobe 2>/dev/null && $$R $(BUILD)/.tsanprobe 2>/dev/null; then \
+		$(MAKE) -s $(BUILD)/spscmatch-tsan && $$R $(BUILD)/spscmatch-tsan; \
+	else echo "spscmatch-tsan: ПРОПУСК — компилятор или система не умеет -fsanitize=thread (это не падение)"; fi
 	@$(BUILD)/tunnelmatch
 	@$(BUILD)/tunnamematch
 	@$(BUILD)/xsconfmatch
@@ -161,6 +172,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/hwidmatch.sh
 	@$(BUILD)/awgmatch
 	@$(BUILD)/awgmatch-android
+	@$(BUILD)/warpmatch
 	@sh tests/awgns.sh
 	@$(BUILD)/irmatch
 	@$(BUILD)/irmatch-android
@@ -169,6 +181,9 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/urltestmatch
 	@$(BUILD)/urltlsmatch
 	@sh tests/nftvmapmatch.sh
+	@STEER=$(BUILD)/steer sh tests/wandevmatch.sh
+	@BUILD=$(BUILD) sh tests/rtnlmatch.sh
+	@BUILD=$(BUILD) sh tests/nftdumpmatch.sh
 	@sh tests/groupsmatch.sh
 
 # Перезапись снимка генератора (tests/snapshot.sh). Только когда ruleset меняется
@@ -177,7 +192,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 print-inc:
 	@echo $(addprefix -I,$(INC_DIRS))
 
-snapshot-record: all $(BUILD)/steer-android $(BUILD)/tgwssim
+snapshot-record: all $(BUILD)/steer-android $(BUILD)/pkhooks
 	@sh tests/snapshot.sh record
 
 # Сборка под Android тем же NDK, что прошивка (Android.bp, bionic): ни стенды на хосте, ни
@@ -204,21 +219,11 @@ ndk-check:
 		echo "ndk-check: $$a — steerd и steer собираются"; \
 	done
 
-# Мини-сборка микропакета tgws на хосте — для стенда tgwsmark: ядро движка с файлом профиля
-# tgws (src/profile/tgws.c), мост заменён заглушкой (tests/tgws-stub.c), потому что настоящий
-# тянет TLS и docker. Проверяется не мост, а ruleset рядом с полным движком: свой бит метки,
-# свой порт, свой ряд таблиц, чужой реестр.
-$(BUILD)/tgwssim: $(CORE_SRC) $(CORE_HDR) src/profile/tgws.c tests/tgws-stub.c VERSION
+# Движок с файлом профиля extended: нужен стенду diagmatch. Вид туннеля tunnel:vless приходит из
+# манифеста плагина (стенд называет ядру каталог plugins/ дерева), подкоманды плагина не нужны.
+$(BUILD)/diagsim: $(CORE_SRC) $(CORE_HDR) src/profile/extended.c VERSION
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) src/profile/tgws.c tests/tgws-stub.c
-
-# Движок, собранный как расширенный (виды и файл профиля extended), но без самой расширенной
-# части: нужен стенду diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает
-# реестром видов, а проверять диагностику интереснее всего именно на VLESS-выходе. Подкоманды
-# расширенной сборки заменены заглушками — см. tests/vless-stub.c.
-$(BUILD)/diagsim: $(CORE_SRC) $(KINDS_EXT_SRC) $(CORE_HDR) src/profile/extended.c tests/vless-stub.c
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) $(KINDS_EXT_SRC) src/profile/extended.c tests/vless-stub.c
+	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) src/profile/extended.c
 
 # SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
 # хеш: в самом идентификаторе он обрезан до двадцати знаков, и расхождение в старших байтах
@@ -250,14 +255,18 @@ ext-syntax:
 # из исходников той же версии и с теми же опциями, что у роутера (build/wolfssl), исходники —
 # STEER_WOLFSSL или скачивание со сверкой суммы; не нашлись — ГРОМКИЙ пропуск, а не падение.
 # Вся логика — в tests/ext-test.sh, как у прочих *.sh-стендов.
-ext-test:
+# Зависимости — не для сборки стендов самого ext-test (их он собирает сам), а для последнего шага,
+# libs-test: tgwsmatch берёт каталог плагинов у $(BUILD)/pkhooks, specschemamatch и nestlong —
+# $(BUILD)/steerd и $(BUILD)/steer. В чистом дереве (свежий worktree) без них ext-test падал
+# «не собран», хотя код был в порядке.
+ext-test: all $(BUILD)/pkhooks
 	@BUILD=$(BUILD) CC="$(CC)" sh tests/ext-test.sh
 
 # Разделяемая раскладка роутера (шаг 4 выпуска 1.10: libsteer.so, libsteer-wolfssl.so, steerd и
 # модули) на хосте — тем же build/build-libs.sh, что кладёт файлы в пакеты, и с теми же исходниками
 # wolfSSL, что ext-test. В `make test` не входит по той же причине, что ext-test (нужна
 # библиотека); ext-test зовёт этот стенд последним шагом. Вся логика — в tests/libs-test.sh.
-libs-test: all $(BUILD)/steer-android $(BUILD)/tgwssim
+libs-test: all $(BUILD)/steer-android $(BUILD)/abihost
 	@BUILD=$(BUILD) CC="$(CC)" sh tests/libs-test.sh
 
 # Переписать списки экспорта libsteer.so и libsteer-wolfssl.so по коду (build/libs-exports.sh).
@@ -287,6 +296,13 @@ $(BUILD)/dupconnmatch: tests/dupconnmatch.c tests/unit.h $(DNSD_SRC) src/dnsd/du
                        src/dnsd/doh2.h src/lib/jsonw.c $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/dupconnmatch.c $(DNSD_SRC) src/lib/jsonw.c $(MODEL_KINDS) -lpthread
+
+# ClientHello DoT/DoH двумя записями TLS (`fragment: true`): разрез, заголовки, пауза, ключ спеки и
+# седьмое поле таблицы без сети — tests/dupfragmatch.c.
+$(BUILD)/dupfragmatch: tests/dupfragmatch.c tests/unit.h $(DNSD_SRC) src/dnsd/dup.h src/dnsd/dupint.h src/dnsd/tabfmt.h \
+                       src/lib/jsonw.c $(MODEL_KINDS) src/model/spec.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/dupfragmatch.c $(DNSD_SRC) src/lib/jsonw.c $(MODEL_KINDS) -lpthread
 
 # Парсер конфигурации проверяется отдельной программой по той же причине: load_spec
 # читает файл и зовёт die()/exit(2) на неверной спеке — перехватить это через подкоманду
@@ -342,9 +358,9 @@ $(BUILD)/specmatch: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c src/model/s
 # «базовая отказывает» и «расширенная разбирает» проверяются одним файлом. Отказ базовой сборки
 # даёт реестр видов, а не #ifdef в разборе: здесь виды расширенной части (KINDS_EXT_SRC)
 # скомпонованы, в build/specmatch — нет.
-$(BUILD)/specmatch-ext: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c $(KINDS_EXT_SRC) src/model/spec.h
+$(BUILD)/specmatch-ext: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSPECMATCH_EXT -o $@ tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c $(KINDS_EXT_SRC)
+	$(CC) $(CFLAGS) -DSPECMATCH_EXT -o $@ tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c
 
 # Поддельный TCP проверяется в памяти: сборка и разбор сегмента, контрольные суммы и
 # арифметика номеров — чистые функции без сокетов, поэтому стенд не требует ни сети, ни
@@ -359,19 +375,29 @@ $(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.
 # tests/awgmatch.c.
 # Дважды — роутерная и Android-сборка: у них разная метка сокета туннеля без via (0 против
 # STEER_SELF_MARK). С ядром — tests/awgns.sh.
-$(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
+$(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awgdev.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/awgmatch.c $(MODEL_KINDS)
+	$(CC) $(CFLAGS) -o $@ tests/awgmatch.c $(filter-out src/kinds/awgdev.c,$(MODEL_KINDS))
 
-$(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
+# Модуль steer-warpbox без сети: группа kind: warp в спеке, JSON по пути, файл туннеля и маски I1
+# через разбор awg ядра (tests/warpmatch.c).
+$(BUILD)/warpmatch: tests/warpmatch.c src/kinds/awg.c src/kinds/awg.h src/proto/warp/wbconf.c src/proto/warp/wbconf.h \
+                    src/proto/warp/wbjson.c src/proto/warp/wbmask.h src/proto/warp/wbexpand.c src/plugkit/pkjson.c \
+                    $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSTEER_DEFAULT_PLATFORM=android -o $@ tests/awgmatch.c $(MODEL_KINDS)
+	$(CC) $(CFLAGS) -o $@ tests/warpmatch.c src/kinds/awg.c src/proto/warp/wbconf.c src/proto/warp/wbjson.c \
+		src/proto/warp/wbexpand.c src/plugkit/pkjson.c src/lib/jsonw.c $(MODEL_KINDS)
+
+$(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awgdev.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -DSTEER_DEFAULT_PLATFORM=android -o $@ tests/awgmatch.c $(filter-out src/kinds/awgdev.c,$(MODEL_KINDS))
 
 # Виды — объектами (без awg.c и без парсера: стенд подменяет load_spec своей спекой). С
-# src/lib/ir.c — тем же доводом, что у MODEL_KINDS: zapret_emit/tgws_emit зовут ir_* на
+# src/lib/ir.c — тем же доводом, что у MODEL_KINDS: emit видов зовёт ir_* на
 # компоновке, даже когда стенд их не вызывает (модели стенд не компонует, поэтому отдельно). И с
-# src/lib/module.c: kinds/tgws.c спрашивает, установлен ли модуль моста (шаг 4 выпуска 1.10).
-FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC) src/lib/ir.c src/lib/module.c
+# src/lib/module.c: реестр плагинов (kinds/plugin.c) спрашивает версию ядра. И с
+# YAML_SRC: реестр плагинов (kinds/plugin.c) читает манифесты и схемы тем же разбором, что спеку.
+FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c src/kinds/awgdev.c,$(KINDS_BASE_SRC)) src/lib/ir.c src/lib/module.c $(YAML_SRC)
 
 # Модель v2 и перевод спеки v1 (src/model/v1.c, src/kinds/group.c): каналы → правила, списки,
 # клиенты; пул devices → группа — модулями модели, без движка: см. шапку tests/modelmatch.c. С
@@ -380,16 +406,55 @@ $(BUILD)/modelmatch: tests/modelmatch.c tests/unit.h $(MODEL_KINDS) src/kinds/aw
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/modelmatch.c $(MODEL_KINDS) src/kinds/awg.c
 
+# Хуки официальных плагинов без сети (tests/pkhooks.c): программа bin/<id> каталога плагинов стендов ядра
+# (tests/plugroot.sh) — check и expand те же, что у настоящих программ протоколов.
+PKHOOKS_SRC := src/plugkit/plugkit.c src/plugkit/pkjson.c src/plugkit/pktun.c src/proto/xsteer/xshook.c \
+               src/proto/tgws/tghook.c src/proto/warp/wbexpand.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC) src/lib/err.c
+$(BUILD)/pkhooks: tests/pkhooks.c $(PKHOOKS_SRC) $(wildcard src/plugkit/*.h)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/pkhooks.c $(PKHOOKS_SRC)
+
+# Сторона плагина в API ядра (src/plugkit): JSON, {conf}, ключи туннеля, точка входа (tests/pkmatch.c).
+$(BUILD)/pkmatch: tests/pkmatch.c $(PKHOOKS_SRC) $(wildcard src/plugkit/*.h)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/pkmatch.c $(PKHOOKS_SRC)
+
+# Хост стенда tests/abimatch.sh: настоящий загрузчик .so-плагинов (src/daemon/plugso.c) с циклом, подписчиками
+# и моделью спеки, без демона (шапка tests/abihost.c). Плагины стенда собирает сам стенд из tests/abi/plugin.c.
+# Те же исходники статически (-static): статическая сборка обязана честно отказывать (abimatch.sh, п. 9);
+# steerd-static — весь движок статически, как телефон и мини-сборки.
+$(BUILD)/abihost-static: tests/abihost.c src/daemon/plugso.c src/daemon/loop.c src/daemon/gaiw.c src/daemon/state.c $(MODEL_KINDS) src/kinds/awg.c $(CORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -static -o $@ tests/abihost.c src/daemon/plugso.c src/daemon/loop.c src/daemon/gaiw.c src/daemon/state.c $(MODEL_KINDS) src/kinds/awg.c 2>/dev/null
+
+$(BUILD)/steerd-static: $(CORE_SRC) $(CORE_HDR) VERSION
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(DEFS) -static -o $@ $(CORE_SRC) 2>/dev/null
+
+$(BUILD)/abihost: tests/abihost.c src/daemon/plugso.c src/daemon/loop.c src/daemon/gaiw.c src/daemon/state.c $(MODEL_KINDS) src/kinds/awg.c $(CORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/abihost.c src/daemon/plugso.c src/daemon/loop.c src/daemon/gaiw.c src/daemon/state.c $(MODEL_KINDS) src/kinds/awg.c -rdynamic
+
+# Плагинная модель ядра (реестр манифестов, совместимость, помощник вида, {conf}) — тем же набором
+# объектов, что у modelmatch; манифесты фальшивых плагинов стенд пишет сам во временный каталог.
+$(BUILD)/pluginmodel: tests/pluginmodel.c tests/unit.h $(MODEL_KINDS) src/kinds/awg.c $(CORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/pluginmodel.c $(MODEL_KINDS) src/kinds/awg.c
+
+# Обход /proc (src/lib/procscan.c): хвост длинной командной строки.
+$(BUILD)/procscanmatch: tests/procscanmatch.c tests/unit.h src/lib/procscan.c src/lib/procscan.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/procscanmatch.c src/lib/procscan.c
+
 # Читатель наборов sing-box (src/model/srs.c) и раскладка канала с ними (srsplan.c) — модулями
 # модели, без движка: см. шапку tests/srsunit.c.
 $(BUILD)/srsunit: tests/srsunit.c tests/unit.h $(MODEL_KINDS) $(CORE_HDR)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/srsunit.c $(MODEL_KINDS)
 
-# Дерево набора правил (src/lib/ir.h): генератор и раскладка старого ядра проверяются
-# запросами к дереву, а не текстом — см. шапку tests/irmatch.c. Модули компилятора линкуются
-# с моделью отдельными объектами (само дерево приходит с моделью, MODEL_SRC). Дважды — роутер
-# и телефон (цепочки на output).
+# Дерево набора правил (src/lib/ir.h): генератор проверяется запросами к дереву, а не текстом —
+# см. шапку tests/irmatch.c. Модули компилятора линкуются с моделью отдельными объектами (само
+# дерево приходит с моделью, MODEL_SRC). Дважды — роутер и телефон (цепочки на output).
 COMPILE_SRC := $(filter-out $(MODEL_SRC),$(filter src/compile/%,$(CORE_SRC)))
 $(BUILD)/irmatch: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KINDS) $(CORE_HDR)
 	@mkdir -p $(BUILD)
@@ -443,6 +508,16 @@ $(BUILD)/urltlsmatch: tests/urltlsmatch.c src/proto/tls/urltls.c src/proto/tls/u
 $(BUILD)/nftvmap-tool: tests/nftvmap-tool.c src/lib/nftvmap.c src/lib/nftvmap.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/nftvmap-tool.c src/lib/nftvmap.c
+
+# Дампы ядра по netlink (src/lib/rtnl.c) — инструмент стенда tests/rtnlmatch.sh.
+$(BUILD)/rtnl-tool: tests/rtnl-tool.c src/lib/rtnl.c src/lib/rtnl.h src/lib/nlbuf.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/rtnl-tool.c src/lib/rtnl.c
+
+# Дампы nftables по netlink (src/lib/nftdump.c) — инструмент стенда tests/nftdumpmatch.sh.
+$(BUILD)/nftdump-tool: tests/nftdump-tool.c src/lib/nftdump.c src/lib/nftdump.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/nftdump-tool.c src/lib/nftdump.c
 
 # Зависимость выхода от чужого firewall: fw_check судит о конфигурации по тексту дампа
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
@@ -502,6 +577,23 @@ $(BUILD)/wsmatch: tests/wsmatch.c tests/trvenc-stub.c src/proto/transport/transp
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/wsmatch.c tests/trvenc-stub.c $(WSMATCH_SRC) $(PLATFORM_SRC) -lpthread
 
+# Чтение потока TLS не ждёт и не спрашивает poll (tls13.c, rbuf_fill). Стенд линкует настоящий tls13.c,
+# а не заглушку, как прочие транспортные стенды; криптографию он не зовёт — служебные записи пропускаются без
+# расшифровки, — и её ссылки оставлены неразрешёнными, чтобы не тянуть шифры ради стенда чтения.
+# Хранилище корней по пути (I-217): библиотека корней подменена самим стендом, certverify.c — отдельным объектом.
+$(BUILD)/certrootsmatch: tests/certrootsmatch.c tests/unit.h src/proto/tls/certverify.c src/proto/tls/certverify.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc/lib -Isrc/proto/tls -o $@ tests/certrootsmatch.c src/proto/tls/certverify.c -Wl,--unresolved-symbols=ignore-all -lpthread
+
+$(BUILD)/outqmatch: tests/outqmatch.c tests/unit.h src/lib/outq.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc/lib -o $@ tests/outqmatch.c
+
+$(BUILD)/tls13readmatch: tests/tls13readmatch.c tests/unit.h src/proto/tls/tls13.c src/proto/tls/tls13.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc/lib -Isrc/proto/tls -o $@ tests/tls13readmatch.c src/proto/tls/tls13.c \
+	      -Wl,--unresolved-symbols=ignore-all -ldl
+
 # Запасной путь при потере длинного ClientHello (tr_link_open): TLS и Reality — заглушки стенда, трогается
 # только выбор Hello; tr_dial подменён самим стендом.
 $(BUILD)/pqfallbackmatch: tests/pqfallbackmatch.c src/proto/transport/trsec.c src/proto/transport/transport.h
@@ -547,12 +639,30 @@ $(BUILD)/subpq: tests/subpq.c tests/sub-pq-samples.h src/proto/vless/sub.c src/p
 # run_quiet и поддельный curl в PATH (SHA-256 идентификатора устройства — свой, в hwid.c).
 # Поэтому ни сети, ни криптобиблиотеки, ни docker он не требует и входит в обычный make test —
 # при том что до переноса вся эта работа жила в оболочке объекта rpcd и не проверялась ничем.
-$(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/proto/vless/subfetch.h \
+$(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/proto/vless/subfetch.h src/lib/puff.c src/lib/puff.h \
+                  src/lib/gz.c src/lib/gz.h src/proto/tls/httpc.h \
                   src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h \
                   src/proto/vless/sub.c src/proto/vless/sublink.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
                   src/proto/transport/trpath.c src/proto/transport/trpath.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c src/proto/vless/sublink.c src/proto/transport/trpath.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/subfetchmatch.c src/lib/jsonw.c src/lib/puff.c src/lib/gz.c src/proto/vless/sublink.c src/proto/transport/trpath.c $(PLATFORM_SRC)
+
+# HTTP/1.1-клиент libsteer (src/proto/tls/httpc.c) против настоящего сервера на сокете в самом стенде:
+# Content-Length, chunked, переадресации, cookie, ETag, сроки, обрывы, тела в десятки мегабайт потоком.
+# TLS подменён заглушками (криптобиблиотеки в make test нет); настоящий HTTPS — tests/httpsmatch.sh в
+# make ext-test. Потоки сервера — -lpthread.
+$(BUILD)/httpmatch: tests/httpmatch.c tests/unit.h src/proto/tls/httpc.c src/proto/tls/httpc.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests -o $@ tests/httpmatch.c src/proto/tls/httpc.c -lpthread
+
+# Распаковка ustar+gzip (src/lib/untar.c, gz.c) на настоящих архивах tests/tarvec. SHA-256 файлов в
+# распаковщике — sc_hash_* слоя scrypto; здесь (без криптобиблиотеки) стенд подставляет свои
+# (TAR_STUB_HASH, считают независимым steer_sha256), в make ext-test он собирается с настоящим слоем.
+$(BUILD)/tarmatch: tests/tarmatch.c tests/unit.h src/lib/untar.c src/lib/untar.h src/lib/gz.c src/lib/gz.h \
+                   src/lib/puff.c src/tools/hwid.c src/tools/hwid.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests -DTAR_STUB_HASH -o $@ tests/tarmatch.c src/lib/untar.c src/lib/gz.c src/lib/puff.c \
+		src/tools/hwid.c src/lib/jsonw.c $(PLATFORM_SRC)
 
 # Провод hysteria2 и узлы (src/proto/hysteria2/hy2wire.c, hy2sub.c): целые QUIC, запрос
 # авторизации QPACK и разбор ответа, TCPRequest/Response, UDPMessage, Salamander и BLAKE2b на
@@ -572,10 +682,17 @@ $(BUILD)/pxsubmatch: tests/pxsubmatch.c src/proto/proxy/pxsub.c src/proto/proxy/
 
 # Дайлеры прокси (src/proto/proxy: trojan, http) через таблицы dialer_ops — транспорт и хеш подменены
 # заглушками в стенде, поэтому без сети и криптобиблиотеки.
-$(BUILD)/pxdialmatch: tests/pxdialmatch.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxhttp.c src/proto/proxy/pxvmess.c src/proto/proxy/pxss.c \
-                    src/proto/proxy/proxy.h src/proto/proxy/pxdial.h src/proto/proxy/pxwire.h
+$(BUILD)/pxdialmatch: tests/pxdialmatch.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxhttp.c src/proto/proxy/pxvmess.c src/proto/proxy/pxss.c src/proto/proxy/pxsocks.c \
+                    src/proto/proxy/proxy.h src/proto/proxy/pxdial.h src/proto/proxy/pxwire.h src/lib/outq.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests -o $@ tests/pxdialmatch.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxhttp.c src/proto/proxy/pxvmess.c src/proto/proxy/pxss.c
+	$(CC) $(CFLAGS) -Itests -o $@ tests/pxdialmatch.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxhttp.c src/proto/proxy/pxvmess.c src/proto/proxy/pxss.c src/proto/proxy/pxsocks.c
+
+# Установление сокета до узла (trdial.c) по IPv4 и IPv6: литералы, имя только с AAAA, смешанный набор,
+# кэш победителя с семейством, scope id, UDP (issue #7). Резолвер и connect подменены в самом стенде,
+# сети наружу нет; без IPv6 на петле стенд пропускается вслух.
+$(BUILD)/trdialmatch: tests/trdialmatch.c src/proto/transport/trdial.c src/proto/transport/transport.h tests/unit.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc/proto/transport -Itests -o $@ tests/trdialmatch.c src/proto/transport/trdial.c -ldl
 
 # Арифметика провода xsteer: заголовок записи, вывод nonce, окно приёма, пределы
 # соединения. Всё, что она считает, ломается МОЛЧА — пакет отбрасывается стеком той
@@ -610,6 +727,21 @@ $(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/tungromatch.c $(PLATFORM_SRC)
 
+# Программа раздачи в ядре (tun_steer_attach, R-146): настоящее устройство с несколькими очередями в своём
+# сетевом пространстве, каждый пакет — в очереди того рабочего, которого назовёт tun_flow_owner. Без root — пропуск.
+$(BUILD)/tunsteermatch: tests/tunsteermatch.c src/tunnel/tun.c src/tunnel/tun.h tests/unit.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/tunsteermatch.c src/tunnel/tun.c $(PLATFORM_SRC)
+
+# Кольцо между читателем TUN и рабочими потоками стека (R-146): порядок, потеря при переполнении,
+# побудка спящего. Второй раз то же под -fsanitize=thread: проверяются правила памяти, а не итог.
+$(BUILD)/spscmatch: tests/spscmatch.c src/tunnel/spsc.h tests/unit.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/spscmatch.c -lpthread
+$(BUILD)/spscmatch-tsan: tests/spscmatch.c src/tunnel/spsc.h tests/unit.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -fsanitize=thread -g -o $@ tests/spscmatch.c -lpthread
+
 # Разбор пакетов туннеля VLESS на подменённом транспорте (I-320, I-321, I-322): стек
 # (stack.c) включается целиком, дайлер VLESS (vldial.c) настоящий и компонуется отдельно, а
 # соединение с узлом (vless_connect и transport_*) подменено, поэтому криптобиблиотека не нужна —
@@ -619,7 +751,7 @@ $(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 # перезапуска, раздача by. Молчание узла в сети — tests/run-silence.sh (root).
 TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
                   src/proto/vless/vldial.c \
-                  src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS) $(KINDS_EXT_SRC)
+                  src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS)
 $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/stack.c src/tunnel/pool.c src/tunnel/pool.h src/tunnel/dialer.h $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/tunnelmatch.c \
@@ -691,11 +823,11 @@ $(BUILD)/yamlmatch: tests/yamlmatch.c tests/unit.h $(YAML_SRC) src/lib/ynode.h s
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steerd $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
-	       $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/b3match $(BUILD)/subpq \
+	       $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/b3match $(BUILD)/subpq \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
-	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/yamlmatch $(BUILD)/wolfssl-host \
-	       $(BUILD)/scryptomatch $(BUILD)/vlessmatch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
+	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/yamlmatch $(BUILD)/wolfssl-host \
+	       $(BUILD)/scryptomatch $(BUILD)/sigmatch $(BUILD)/vlessmatch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
 	       $(BUILD)/devupmatch $(BUILD)/ndk \
-	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool \
+	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

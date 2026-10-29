@@ -32,12 +32,35 @@ int vless_uuid_form(const char *s);
 /* 16 байт идентификатора из текстовой формы. 0 — вышло, -1 — форма непригодна. */
 int vless_uuid_parse(const char *s, unsigned char out[16]);
 
-/* flow — имя потока (xtls-rprx-vision) или NULL/"" для обычного VLESS. */
+/* flow — имя потока (xtls-rprx-vision) или NULL/"" для обычного VLESS. ip — адрес байтами: четыре (IPv4) или
+ * шестнадцать (IPv6), ip_n — сколько; без имени (host) он и едет в заголовке. */
+size_t vless_build_request_a(const unsigned char uuid[16], enum vless_cmd cmd,
+                             const char *host, const unsigned char *ip, size_t ip_n,
+                             uint16_t port, const char *flow,
+                             unsigned char *out, size_t cap);
+/* То же с адресом IPv4 (ip4 — четыре байта). */
 size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
                            const char *host, const unsigned char ip4[4],
                            uint16_t port, const char *flow,
                            unsigned char *out, size_t cap);
 
 int vless_parse_response(const unsigned char *buf, size_t n, size_t *skip);
+
+/* Заголовок ответа по кускам: [версия 0][длина доп][доп]. Первый кусок от транспорта режет где угодно —
+ * запись TLS, кадр WebSocket, gRPC или xhttp, — и вся тройка не обязана прийти одним чтением. Прежде
+ * vl_deliver разбирал её только целиком (vless_parse_response), неполная считалась чужим ответом, и
+ * соединение рвалось. Состояние живёт в сессии и обнуляется на открытии потока; дополнение не хранится,
+ * только счётчик оставшихся байт — длина его до 255, держать нечего.
+ *
+ * vless_response_feed: 0 — заголовок снят (*skip — сколько байт этого куска ушло на него, дальше
+ * данные), VLESS_EAGAIN — весь кусок ушёл в заголовок, ждём следующий, VLESS_EPROTO — версия не 0. */
+struct vless_response_stream {
+    unsigned char head[2];     /* версия и длина дополнения */
+    unsigned have;             /* сколько из head уже пришло */
+    unsigned extra_left;       /* байт дополнения ещё впереди */
+    int done;                  /* заголовок снят */
+};
+int vless_response_feed(struct vless_response_stream *state,
+                        const unsigned char *buf, size_t n, size_t *skip);
 
 #endif

@@ -43,6 +43,9 @@ nft add map inet steer fakeip '{ type ipv4_addr : ipv4_addr; }'
 
 tmp="$(mktemp -d)"
 trap 'kill ${DPID:-0} ${UPID:-0} ${MPID:-0} ${DPID6:-0} ${UPID6:-0} 2>/dev/null; rm -rf "$tmp"' EXIT
+# Выход без IPv6 в фикстурах — мост Telegram (kind: tgws), вид плагина tgws: каталог плагинов дерева.
+sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" >/dev/null || { echo "dnsnft: каталог плагинов не собран"; exit 2; }
+STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 
 LPORT=15310
 UPORT=15363
@@ -252,8 +255,7 @@ PY
 printf 'v6.io\nv6b.io\n' > "$tmp/d6.lst"
 printf 'r6.io\n' > "$tmp/r6.lst"
 printf 't4.io\n' > "$tmp/t4.lst"
-# Спека v2: поддельный и настоящий IPv6 на AAAA — только у неё. Та же спека записью v1 — ниже,
-# в «h»: там на AAAA пустой ответ, как до 1.9.
+# Та же спека записью v1 — ниже, в «h»: ответы те же (перевод v1 → v2 IPv6 не отнимает).
 printf '{"version":2,"lan":{"addr":["127.0.0.0/8"]},'\
 '"lists":{"c6":{"domains_file":"%s/d6.lst"},"r6":{"domains_file":"%s/r6.lst"},'\
 '"t4":{"domains_file":"%s/t4.lst"}},'\
@@ -356,19 +358,19 @@ check "g. после HUP адрес IPv4 снова в наборе, срок о
 check "g. и адрес IPv6 — в наборе «<канал>6», срок оставшийся" "yes" \
     "$(left_of "${set_r6}6" 2001:db8:77::7 | grep -qx '[1-5]\{0,1\}[0-9]s' && echo yes || echo "no:$(left_of "${set_r6}6" 2001:db8:77::7)")"
 
-# h. Та же спека записью v1: имена правил только IPv4 (sp->dns.names_v4, spec.h) — в таблице «4» у
-#    всех трёх, и на AAAA и fake-IP-, и real-ip-правила в выход с IPv6 ответ пустой, как до 1.9,
-#    хотя карта fakeip6 и наборы «<канал>6» в ядре стоят. Свой резолвер на своём порту и со своим
-#    каталогом состояния, рядом с первым.
-check "h. спека v1: в таблице — только IPv4 у всех каналов" "4 4 4" \
+# h. Та же спека записью v1: перевод в модель IPv6 не отнимает — в таблице те же семейства, и на AAAA
+#    fake-IP- и real-ip-правила в выход с IPv6 отвечают, как у v2. Свой резолвер на своём порту и
+#    со своим каталогом состояния, рядом с первым.
+check "h. спека v1: в таблице те же семейства, что у v2" "46 46 4" \
     "$("$BIN" dnsd-table --spec "$tmp/spec6v1.json" 2>/dev/null | awk -F'|' 'NF > 4 { printf "%s%s", s, $4; s = " " }')"
 LPORT7=15321
 mkdir -p "$tmp/state7"
 "$BIN" dnsd --spec "$tmp/spec6v1.json" --state-dir "$tmp/state7" \
     --listen-port "$LPORT7" --upstream-port "$UPORT6" >> "$tmp/log7" 2>&1 & DPID7=$!
 sleep 1
-check "h. спека v1: AAAA fake-IP-правила — пустой" "empty" "$(python3 "$tmp/client6.py" "$LPORT7" v6.io)"
-check "h. спека v1: AAAA real-ip-правила — пустой" "empty" "$(python3 "$tmp/client6.py" "$LPORT7" r6.io)"
+check "h. спека v1: AAAA fake-IP-правила — поддельный IPv6 из пула" "fdfe:dcba:9876::c612" \
+    "$(python3 "$tmp/client6.py" "$LPORT7" v6.io | sed 's/:[0-9a-f]*$//')"
+check "h. спека v1: AAAA real-ip-правила — настоящий адрес" "2001:db8:77::7" "$(python3 "$tmp/client6.py" "$LPORT7" r6.io)"
 check "h. спека v1: имя вне правил — настоящий AAAA" "2001:db8:77::7" \
     "$(python3 "$tmp/client6.py" "$LPORT7" out.io)"
 kill "$DPID7" 2>/dev/null; wait "$DPID7" 2>/dev/null

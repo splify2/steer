@@ -32,8 +32,7 @@
  * забывается, когда движок выключен (правила снимает init, включённый движок их ставит init же) и
  * когда применение не прошло целиком. Чужое вмешательство в ядро — `steer down`, `steer apply` из
  * init — меняет номер таблицы или убирает её, и сверка видит это по netlink: тогда тоже всё
- * заново. На ядре до 4.16 номера таблиц нет, и там видно только «таблица есть или нет»; init
- * телефона ставит ту же сохранённую спеку, что держит демон, так что разойтись им не на чем.
+ * заново.
  *
  * СВЕРКА С ЯДРОМ, А НЕ ТОЛЬКО С ПАМЯТЬЮ. Прежде неизменная спека значила «в ядро не идём», если
  * таблица та же (номер). Проверка на QEMU-роутере (2026-09-27)
@@ -123,10 +122,8 @@
  *     журнал, одна на окно; расхождение, объяснимое пропажей или появлением устройства раздачи
  *     (цепочку ingress ядро снимает вместе с ним), — вне этого счёта, в своём пределе (доводы —
  *     у srv_kcheck в ctl.c, «ЛИМИТ МОЛЧАЛ»);
- *   - без демона (`steer failover --loop`, прямой вызов) сверки на проходе нет: помнить
- *     применённое там некому;
- *   - на телефоне — то же самое: раскладка старого ядра (таблицы ip и ip6 рядом с inet)
- *     входит в тот же отпечаток теми же четырьмя дампами.
+ *   - без демона (одиночный `steer failover`) сверки на проходе нет: помнить применённое там
+ *     некому.
  * Прочитать ядро не вышло — проход ничего не решает (решит следующий): незнание здесь не повод
  * компилировать и ставить набор заново, как на явном apply.
  *
@@ -155,7 +152,7 @@
  *     отданное по счёту: вставка перед курсором сдвигает его, и склеенный дамп дал бы ложное
  *     расхождение — замену набора правил на пустом месте. Поэтому у доменного набора смотрится
  *     номер поколения в ответах дампа (nfd_set_elems, *stable: он растёт с каждой транзакцией, и
- *     так отвечает и 4.9): у всех ответов один — снимок цельный; разный — дамп заново, три таких
+ *     так отвечают все ядра): у всех ответов один — снимок цельный; разный — дамп заново, три таких
  *     подряд — «не прочитать», и элементы в этот раз не сверяются. Сначала было «два дампа до
  *     совпадения», но дамп набора в 200 тысяч подсетей стоит секунды (замер ниже), и второй
  *     удваивал цену ровно в обычном случае. Статический набор, кроме нас, не пишет никто — там
@@ -186,8 +183,7 @@
  *     status демона читает те же счётчики в процессе — поток-рабочий делил бы их без замков;
  *   - сбой компилятора (die на битом списке, зависание nft) задевает только ребёнка, как и
  *     прежде, а срок команды убивает его группу целиком.
- * Прежний путь делал то же двумя детьми — dry-run и apply, то есть компилировал дважды на каждый
- * apply; сейчас на неизменной спеке компиляция одна (план), а nft и ip не запускаются вовсе. План
+ * На неизменной спеке компиляция одна (план), а nft и ip не запускаются вовсе. План
  * внешних процессов не зовёт: раскладку набора правил (проба ядра через nft) демон узнаёт у
  * первого плана и дальше передаёт готовой. nft -f и ip — в apply-commit, ребёнке демона, чей
  * выход приходит через loop_child.
@@ -219,9 +215,8 @@
 
 #define LOG_W "steer[warn] ctl: "
 
-/* Наши таблицы в ядре (nfd_table_fp): inet — всегда, ip и ip6 — те, что ставит раскладка старого
- * ядра (legacy.c); появившаяся или пропавшая таблица раскладки — тоже другой отпечаток. 0 —
- * снято; -1 — ядро не ответило. */
+/* Наши таблицы в ядре (nfd_table_fp): таблица движка во всех семействах; появившаяся или
+ * пропавшая таблица — тоже другой отпечаток. 0 — снято; -1 — ядро не ответило. */
 static int kernel_fp(struct nfd_tfp *t) {
     return nfd_table_fp(nft_table(), t) == 0 ? 0 : -1;
 }
@@ -231,9 +226,11 @@ enum { KR_OK, KR_REBIND, KR_WATCH };
 
 static int kernel_route(const struct spec *sp, const struct output *so, struct fo_store *outs,
                         const char *rules, const char *rules6, const char **why) {
-    static char routes[8192];
-    if (rtnl_routes_text(so->table, routes, sizeof(routes)) != 0) return KR_OK;
+    /* Дамп в куче любой длины: обрезанный читался бы как другая таблица выхода. */
+    char *routes = rtnl_routes_dup(so->table, 0);
+    if (!routes) return KR_OK;
     struct route_facts f = route_facts_of(rules, routes, so->mark, so->table);
+    free(routes);
     if (!f.known) return KR_OK;
     char rec[32];
     active_get_st(outs, so->name, rec, sizeof(rec));
@@ -266,9 +263,10 @@ static int kernel_route(const struct spec *sp, const struct output *so, struct f
         return KR_REBIND;
     }
     if (out_route6(so) && rules6[0]) {
-        static char routes6[8192];
-        if (rtnl_routes_text6(so->table, routes6, sizeof(routes6)) != 0) return KR_OK;
+        char *routes6 = rtnl_routes_dup(so->table, 1);
+        if (!routes6) return KR_OK;
         struct route_facts f6 = route_facts_of(rules6, routes6, so->mark, so->table);
+        free(routes6);
         if (!f6.known) return KR_OK;
         if (!f6.rule) { *why = "правила fwmark IPv6 нет"; return KR_REBIND; }
         /* При живом IPv4 половина IPv6 — маршрут в устройство или запрет (IPv6 на устройстве
@@ -308,13 +306,6 @@ void recon_diff_free(struct recon_diff *d) {
     free(d->route_kern);
     free(d->drop);
     memset(d, 0, sizeof(*d));
-}
-
-void recon_state_free(struct recon_state *st) {
-    free(st->out);
-    free(st->w);
-    memset(st, 0, sizeof(*st));
-    st->nftc = -1;
 }
 
 /* Место в растущем массиве под ещё одну запись: 0 — есть, -1 — нет памяти. */
@@ -473,9 +464,14 @@ void recon_decide(const struct recon_state *st, const struct recon_plan *p, cons
         for (size_t i = 0; i < st->n; i++) {
             const struct recon_out *was = &st->out[i];
             const struct recon_out *now = out_find(p->out, p->n, was->name);
+            /* Был awg — больше не awg: устройство снимает проход awg (awg_apply_all), и спрашивать это
+             * надо ДО сверки метки и таблицы. Член kind: warp при смене transport с awg на masque
+             * сохраняет имя, метку и таблицу, и раньше проход awg для него не звался: устройство
+             * AmneziaWG оставалось, а TUN с тем же именем модуль создать не мог («Invalid argument»,
+             * стенд QEMU 2026-10-12). */
+            if (was->awg && (!now || !now->awg)) d->awg = 1;
             if (now && now->mark == was->mark && now->table == was->table) continue;
             drop_add(d, p, was->mark, was->table);
-            if (was->awg && (!now || !now->awg)) d->awg = 1;
         }
     free(rules);
     free(rules6);
@@ -652,9 +648,9 @@ static void kel_reset(void *arg) {
 }
 
 struct kel_sets {
-    struct nfd_set v[256];
-    size_t n;
-    int over;
+    struct nfd_set *v;
+    size_t n, cap;
+    int over;                       /* нет памяти под список наборов */
 };
 
 static void kel_set(void *arg, const struct nfd_set *s) {
@@ -664,18 +660,21 @@ static void kel_set(void *arg, const struct nfd_set *s) {
     /* Префикс хоста у донора IPv6: элементы ведёт сторож (v6donor_sync, failover.c) — выведенный
      * префикс меняется без смены спеки, и сверка считала бы каждое такое изменение чужой правкой. */
     if (!strcmp(s->name, V6DONOR_SET)) return;
-    if (c->n == sizeof(c->v) / sizeof(c->v[0])) { c->over = 1; return; }
+    if (c->over) return;
+    if (c->n == c->cap) {
+        size_t cap = c->cap ? c->cap * 2 : 64;
+        struct nfd_set *g = realloc(c->v, cap * sizeof(*g));
+        if (!g) { c->over = 1; return; }
+        c->v = g;
+        c->cap = cap;
+    }
     c->v[c->n++] = *s;
 }
 
-int recon_kernel_elems(uint64_t *sum, uint64_t *n) {
-    *sum = *n = 0;
-    static struct kel_sets sets;
-    memset(&sets, 0, sizeof(sets));
-    if (nfd_sets(nft_table(), kel_set, &sets) != 0 || sets.over) return -1;
+static int kernel_elems_of(const struct kel_sets *sets, uint64_t *sum, uint64_t *n) {
     uint64_t total = 0, total_n = 0;
-    for (size_t i = 0; i < sets.n; i++) {
-        const struct nfd_set *st = &sets.v[i];
+    for (size_t i = 0; i < sets->n; i++) {
+        const struct nfd_set *st = &sets->v[i];
         struct kel_sum s = { (st->flags & KEL_TIMEOUT) != 0, 0, 0 };
         /* Доменный набор пишет и резолвер — дамп, посреди которого прошла транзакция, заново
          * (шапка); три таких подряд — «не прочитать». */
@@ -699,6 +698,17 @@ int recon_kernel_elems(uint64_t *sum, uint64_t *n) {
     *sum = total;
     *n = total_n;
     return 0;
+}
+
+int recon_kernel_elems(uint64_t *sum, uint64_t *n) {
+    *sum = *n = 0;
+    struct kel_sets sets;
+    memset(&sets, 0, sizeof(sets));
+    int rc = nfd_sets(nft_table(), kel_set, &sets) != 0 || sets.over
+                 ? -1 : kernel_elems_of(&sets, sum, n);
+    free(sets.v);
+    if (rc) *sum = *n = 0;
+    return rc;
 }
 
 /* Строка ребёнка apply-commit: `recon-kernel НОМЕР ОТПЕЧАТОК СВОДКА ЧИСЛО` (шестнадцатеричные,

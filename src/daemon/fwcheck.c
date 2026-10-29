@@ -22,7 +22,6 @@
 #include "spec.h"
 #include "awg.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "ctl.h"
@@ -84,12 +83,28 @@ static void zone_of_chain(const char *tok, char *out, size_t n) {
     if (!strncmp(tok, "srcnat_", 7) && tok[7]) snprintf(out, n, "%s", tok + 7);
 }
 
-#define FWC_CHAINS 16
-static void remember_chain(char tab[FWC_CHAINS][64], size_t *n, const char *name) {
-    if (!*name || *n >= FWC_CHAINS) return;
-    for (size_t i = 0; i < *n; i++)
-        if (!strcmp(tab[i], name)) return;
-    snprintf(tab[(*n)++], 64, "%s", name);
+/* Имена цепочек, растущий список без повторов: у fw4 на роутере с десятками зон их больше
+ * шестнадцати (раньше — таблица на 16, и цепочка сверх неё теряла masquerade выхода). */
+struct fwc_chains { char **v; size_t n, cap; };
+
+static void remember_chain(struct fwc_chains *t, const char *name) {
+    if (!*name) return;
+    for (size_t i = 0; i < t->n; i++)
+        if (!strcmp(t->v[i], name)) return;
+    if (t->n == t->cap) {
+        size_t cap = t->cap ? t->cap * 2 : 16;
+        char **g = realloc(t->v, cap * sizeof(*g));
+        if (!g) return;
+        t->v = g;
+        t->cap = cap;
+    }
+    char *d = strdup(name);
+    if (d) t->v[t->n++] = d;
+}
+
+static void chains_free(struct fwc_chains *t) {
+    for (size_t i = 0; i < t->n; i++) free(t->v[i]);
+    free(t->v);
 }
 
 /* Два дампа набора правил, у каждого свой кэш на процесс.
@@ -112,6 +127,45 @@ static void remember_chain(char tab[FWC_CHAINS][64], size_t *n, const char *name
  *
  * Кэш всегда либо NULL, либо получен malloc'ом: tests/fwmatch.c сбрасывает его между
  * пробами через fwcheck_reset_cache(), изображая свежий процесс на каждую пробу. */
+#define FW_LINE_CAP 2048
+struct fwidx { const char *dump; size_t *off; size_t n; };
+
+/* Длина куска строки с позиции p — как у dump_line с буфером FW_LINE_CAP. */
+static size_t chunk_len(const char *p) {
+    const char *nl = strchr(p, '\n');
+    size_t len = nl ? (size_t)(nl - p) + 1 : strlen(p);
+    return len > FW_LINE_CAP - 1 ? FW_LINE_CAP - 1 : len;
+}
+
+static void fwidx_build(struct fwidx *x, const char *dump) {
+    x->dump = dump;
+    x->off = NULL;
+    x->n = 0;
+    size_t cap = 0;
+    for (const char *p = dump; p && *p; ) {
+        size_t len = chunk_len(p);
+        if (!strncmp(p, "table ", 6) || memmem(p, len, "chain ", 6) ||
+            memmem(p, len, "masquerade", 10) || memmem(p, len, "snat", 4)) {
+            if (x->n == cap) {
+                size_t nc = cap ? cap * 2 : 256;
+                size_t *g = realloc(x->off, nc * sizeof(*g));
+                if (!g) { free(x->off); x->off = NULL; x->n = 0; x->dump = NULL; return; }
+                x->off = g;
+                cap = nc;
+            }
+            x->off[x->n++] = (size_t)(p - dump);
+        }
+        p += len;
+    }
+}
+
+static void fwidx_free(struct fwidx *x) {
+    free(x->off);
+    memset(x, 0, sizeof(*x));
+}
+
+static struct fwidx g_nl_idx;
+
 static char *g_nft_dump, *g_nl_dump;
 
 /* Сброс кэша дампа — единственное, что стенду нужно от него самого, а не через fw_check().
@@ -122,6 +176,7 @@ void fwcheck_reset_cache(void) {
     g_nft_dump = NULL;
     free(g_nl_dump);
     g_nl_dump = NULL;
+    fwidx_free(&g_nl_idx);
 }
 
 static const char *nl_dump(void) {
@@ -169,8 +224,24 @@ static const char *dump_line(const char *p, char *line, size_t cap) {
     return p + len;
 }
 
+/* ИНДЕКС ДАМПА — один на дамп, а не проход по всему дампу на каждый выход. status зовёт fw_check
+ * на каждый выход с устройством, и прежде каждый вызов перебирал все строки набора правил: при
+ * десятках выходов и тысячах правил fw4 это было главной ценой ответа. Строки, которые
+ * fw_check_dump читает независимо от устройства, — заголовки таблиц, цепочки, подмена
+ * (masquerade/snat) — собираются один раз (их смещения, по кускам dump_line); строки с самим
+ * устройством находятся поиском имени по всему дампу (strstr), и разбираются только оба множества
+ * по порядку. Ответ тот же, что у полного прохода: состояние разбора (таблица, цепочка) меняют
+ * только строки индекса. */
+static struct fwcheck fw_check_idx(const struct fwidx *x, const char *device);
+
 struct fwcheck fw_check(const char *device) {
-    return fw_check_dump(nl_dump(), device);
+    const char *d = nl_dump();
+    if (g_nl_idx.dump != d) {
+        fwidx_free(&g_nl_idx);
+        fwidx_build(&g_nl_idx, d);
+    }
+    if (g_nl_idx.dump == d) return fw_check_idx(&g_nl_idx, device);
+    return fw_check_dump(d, device);    /* нет памяти под индекс — полным проходом */
 }
 
 /* Семейства правила подмены — битами: 1 — IPv4, 2 — IPv6.
@@ -205,8 +276,31 @@ static unsigned table_fams_of(const char *line) {
 }
 
 struct fwcheck fw_check_dump(const char *dump, const char *device) {
+    struct fwidx x;
+    fwidx_build(&x, dump);
+    struct fwcheck r = fw_check_idx(&x, device);
+    fwidx_free(&x);
+    return r;
+}
+
+/* Следующая строка с устройством от позиции from: начало её куска (как у dump_line) или NULL. */
+static const char *next_dev_chunk(const char *dump, const char *from, const char *device) {
+    const char *q = strstr(from, device);
+    if (!q) return NULL;
+    const char *ls = q;
+    while (ls > dump && ls[-1] != '\n') ls--;
+    for (;;) {
+        size_t len = chunk_len(ls);
+        if (q < ls + len) return ls < from ? from : ls;
+        ls += len;
+    }
+}
+
+static struct fwcheck fw_check_idx(const struct fwidx *x, const char *device) {
+    const char *dump = x->dump;
     struct fwcheck r;
     memset(&r, 0, sizeof(r));
+    if (!dump) return r;   /* дампа нет или нет памяти под индекс — «не видно», как у пустого */
     /* Зона может называться не так, как устройство, и тогда оба признака ниже молчат:
      * fw4 пишет имя ЗОНЫ и в имя цепочки (`srcnat_vpn`), и в комментарий правила
      * ("Masquerade IPv4 vpn traffic"), а устройство называет ТОЛЬКО на переходе в эту
@@ -219,8 +313,7 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
      * один проход и пересекаются в конце. */
     /* Цепочки с подменой — по семейству отдельно (masq_chain[0] — IPv4, [1] — IPv6): у зоны fw4 в
      * одной цепочке srcnat_<зона> бывает одно правило, другое или оба. */
-    char dev_chain[FWC_CHAINS][64], masq_chain[2][FWC_CHAINS][64];
-    size_t dev_chain_n = 0, masq_chain_n[2] = { 0, 0 };
+    struct fwc_chains dev_chain = {0}, masq_chain[2] = {{0}, {0}};
     unsigned tfams = 3;
     /* Без содержимого именованных наборов (как у `nft -t`): проверка смотрит на имена
      * устройств в правилах и цепочках, а элементы наборов ей не нужны — при этом их бывают
@@ -229,21 +322,51 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
     char line[2048];
     char chain[128] = "";
     int in_steer = 0;
-    while ((pos = dump_line(pos, line, sizeof(line))) != NULL) {
-        /* Our own table mentions the device too; it proves nothing about NAT. */
-        {
-            char want[80];
-            snprintf(want, sizeof(want), "table inet %s", nft_table());
-            if (strstr(line, want)) in_steer = 1;
-            else if (!strncmp(line, "table ", 6)) in_steer = 0;
+    /* Своя таблица — заголовок `table inet <имя> {` с именем ЦЕЛИКОМ. Раньше это был поиск
+     * подстроки «table inet steer» в каждой строке: чужая таблица `inet steerbox` (или любая, чьё
+     * имя начинается с нашего) считалась своей и пропускалась, и выход с masquerade в ней получал
+     * «нет NAT». Строка-образец собиралась snprintf на КАЖДУЮ строку дампа — половина времени
+     * fw_check на большом наборе правил fw4. */
+    char want[80];
+    const int want_n = snprintf(want, sizeof(want), "table inet %s", nft_table());
+    const size_t dev_n = strlen(device);
+    size_t ii = 0;
+    const char *dv = dev_n ? next_dev_chunk(dump, dump, device) : NULL;
+    int dev_more = dv != NULL;   /* искать ли устройство дальше: больше не нашлось — не искать */
+    for (;;) {
+        /* Следующая по порядку строка — из индекса или с устройством; одна и та же — один раз. */
+        const char *xi = ii < x->n ? dump + x->off[ii] : NULL;
+        if (!xi && !dv) break;
+        if (xi && (!dv || xi <= dv)) {
+            pos = xi;
+            ii++;
+            if (dv == xi) dv = NULL;
+        } else {
+            pos = dv;
+            dv = NULL;
         }
-        if (!strncmp(line, "table ", 6)) tfams = table_fams_of(line);
+        if (!dv && dev_more) {
+            const char *after = pos + chunk_len(pos);
+            dv = *after ? next_dev_chunk(dump, after, device) : NULL;
+            dev_more = dv != NULL;
+        }
+        dump_line(pos, line, sizeof(line));
+        /* Our own table mentions the device too; it proves nothing about NAT. */
+        if (!strncmp(line, "table ", 6)) {
+            in_steer = !strncmp(line, want, (size_t)want_n) &&
+                       (line[want_n] == ' ' || line[want_n] == '{' || line[want_n] == '\n' ||
+                        line[want_n] == '\0');
+            tfams = table_fams_of(line);
+        }
         if (in_steer) continue;
 
         const char *c = strstr(line, "chain ");
         if (c) snprintf(chain, sizeof(chain), "%s", c + 6);
 
-        if (names_device(line, device)) r.in_firewall = 1;
+        /* Устройство в строке — один поиск на строку: у большинства строк fw4 его нет, и
+         * дальше им проверять нечего, кроме подмены в цепочке, названной устройством. */
+        const int dev_here = dev_n && strstr(line, device) && names_device(line, device);
+        if (dev_here) r.in_firewall = 1;
         /* fw4 does NOT name the device on the masquerade rule: it emits
          * `chain srcnat_warp0 { meta nfproto ipv4 masquerade comment "...warp0..." }`
          * and matches the device on the jump into that chain. Checking only the rule
@@ -254,20 +377,20 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
          * Требование oif намеренное — masquerade живёт на выходе, и переход по входящему
          * устройству (dstnat) про NAT наружу не говорит ничего. */
         const char *j = strstr(line, "jump ");
-        if (j && strstr(line, "oif") && names_device(line, device)) {
+        if (j && dev_here && strstr(line, "oif")) {
             char t[64];
             chain_token(j + 5, t, sizeof t);
-            remember_chain(dev_chain, &dev_chain_n, t);
+            remember_chain(&dev_chain, t);
         }
         if (strstr(line, "masquerade") || strstr(line, "snat")) {
             unsigned f = rule_fams(line, tfams);
-            if (names_device(line, device) || names_device(chain, device)) {
+            if (dev_here || names_device(chain, device)) {
                 if (f & 1) r.masqueraded = 1;
                 if (f & 2) {
                     r.masq6 = 1;
                     /* Устройство названо именем цепочки (зона зовётся как устройство:
                      * srcnat_wg0) — это и есть зона; названо в самом правиле — зоны нет. */
-                    if (!r.zone6[0] && !names_device(line, device)) {
+                    if (!r.zone6[0] && !dev_here) {
                         char t[64];
                         chain_token(chain, t, sizeof t);
                         zone_of_chain(t, r.zone6, sizeof(r.zone6));
@@ -277,20 +400,23 @@ struct fwcheck fw_check_dump(const char *dump, const char *device) {
                 char t[64];
                 chain_token(chain, t, sizeof t);
                 for (int k = 0; k < 2; k++)
-                    if (f & (1u << k)) remember_chain(masq_chain[k], &masq_chain_n[k], t);
+                    if (f & (1u << k)) remember_chain(&masq_chain[k], t);
             }
         }
     }
     for (int fam = 0; fam < 2; fam++) {
         int *got = fam ? &r.masq6 : &r.masqueraded;
-        for (size_t i = 0; i < dev_chain_n && !*got; i++)
-            for (size_t k = 0; k < masq_chain_n[fam]; k++)
-                if (!strcmp(dev_chain[i], masq_chain[fam][k])) {
+        for (size_t i = 0; i < dev_chain.n && !*got; i++)
+            for (size_t k = 0; k < masq_chain[fam].n; k++)
+                if (!strcmp(dev_chain.v[i], masq_chain[fam].v[k])) {
                     *got = 1;
-                    if (fam) zone_of_chain(dev_chain[i], r.zone6, sizeof(r.zone6));
+                    if (fam) zone_of_chain(dev_chain.v[i], r.zone6, sizeof(r.zone6));
                     break;
                 }
     }
+    chains_free(&dev_chain);
+    chains_free(&masq_chain[0]);
+    chains_free(&masq_chain[1]);
     return r;
 }
 
@@ -302,10 +428,10 @@ void report_traceroute_dep(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
         if (!out_has_device(&sp->out[i])) continue;
         if (fw_check(sp->out[i].device).masqueraded) {
-            fprintf(stderr, LOG_W "traceroute_hops cannot work for output %s: %s "
-                            "masquerades, so ICMP errors come addressed to the router "
-                            "and only conntrack can route them to the client — "
-                            "untracking them drops the hops entirely\n",
+            fprintf(stderr, LOG_W "traceroute_hops не сработает для выхода %s: %s "
+                            "подменяет адрес, поэтому ошибки ICMP приходят на адрес роутера "
+                            "и вернуть их клиенту может только conntrack — "
+                            "если их не отслеживать, узлы пропадут совсем\n",
                     sp->out[i].name, sp->out[i].device);
             return;
         }
@@ -317,11 +443,10 @@ void report_traceroute_dep(const struct spec *sp) {
     while ((pos = dump_line(pos, line, sizeof(line))) != NULL)
         if (strstr(line, "untracked") && strstr(line, "accept")) ok = 1;
     if (!ok)
-        fprintf(stderr, LOG_W "traceroute_hops is on but no rule accepting untracked "
-                        "packets was found — ICMP time-exceeded will be dropped by the "
-                        "firewall and hops will show as asterisks. Needed once, in the "
-                        "firewall (not here): accept ct state untracked icmp type "
-                        "time-exceeded towards %s\n", sp->lan_dev[0]);
+        fprintf(stderr, LOG_W "traceroute_hops включён, но правила, принимающего неотслеживаемые "
+                        "пакеты, нет — фаервол отбросит ICMP time-exceeded, и узлы в traceroute "
+                        "будут звёздочками. Нужно один раз, в фаерволе (не здесь): "
+                        "accept ct state untracked icmp type time-exceeded в сторону %s\n", sp->lan_dev[0]);
 }
 
 /* ЧУЖИЕ ПРАВИЛА НА БИТАХ 16-23 — предупреждение, а не отказ.
@@ -341,7 +466,7 @@ void report_traceroute_dep(const struct spec *sp) {
  *
  * Не отказ, потому что соседство законно и чаще всего безвредно: Tailscale переписывает
  * метку в хуке forward, то есть ПОСЛЕ решения о маршруте, и ip rule выхода его не замечает;
- * единственный наш читатель метки после forward — очередь kind=zapret — узнаёт выход по
+ * единственный наш читатель метки после forward — очередь модуля DPI — узнаёт выход по
  * метке соединения. Отказ применить спеку на роутере с Tailscale снял бы маршрутизацию у
  * людей, у которых всё работает. Вредные случаи — чужое правило, которое метит ТОТ ЖЕ пакет
  * в prerouting после нас (стирает наши биты — пакет уходит по main, мимо выхода и мимо
@@ -354,7 +479,8 @@ int report_mark_overlap(void) {
      * пересекается, и говорить не о чем. */
     if (STEER_MARK_LOBIT > 23) return 0;
     const char *pos = nft_dump();
-    char line[2048], table[96] = "", said[8][96];
+    char line[2048], table[96] = "";
+    struct fwc_chains said = {0};   /* названные таблицы — без предела (прежде — не больше 8) */
     int n_said = 0;
     while ((pos = dump_line(pos, line, sizeof(line))) != NULL) {
         const char *p = line;
@@ -376,10 +502,10 @@ int report_mark_overlap(void) {
             if (v == 0x00ff0000ul || v == 0xff00fffful) { hit = 1; break; }
         }
         if (!hit) continue;
-        int dup = 0;
-        for (int k = 0; k < n_said; k++) if (!strcmp(said[k], table)) dup = 1;
-        if (dup || n_said >= 8) continue;
-        snprintf(said[n_said++], sizeof(said[0]), "%s", table);
+        size_t before = said.n;
+        remember_chain(&said, table);
+        if (said.n == before) continue;   /* уже названа (или нет памяти) */
+        n_said++;
         /* Биты — из базы и ширины поля (STEER_MARK_LOBIT/HIBIT), а не строкой: у сборки под
          * Android поле 22-27, и пересекается оно с 16-23 на двух битах, а не на четырёх. */
         fprintf(stderr, LOG_W "таблица %s метит пакеты маской 0x00ff0000 (биты 16-23, так "
@@ -389,6 +515,7 @@ int report_mark_overlap(void) {
                         "перестанет действовать её политика на этом пакете\n", table,
                 STEER_MARK_LOBIT, STEER_MARK_HIBIT, STEER_MARK_LOBIT);
     }
+    chains_free(&said);
     return n_said;
 }
 
@@ -449,8 +576,8 @@ void report_output_deps(const struct spec *sp) {
         if (!out_has_device(&sp->out[i])) continue;
         struct fwcheck c = fw_check(sp->out[i].device);
         if (!c.in_firewall)
-            fprintf(stderr, LOG_W "output %s: %s is not mentioned by the firewall at all — "
-                            "traffic steered there will not come back until it is in a zone\n",
+            fprintf(stderr, LOG_W "выход %s: фаервол не знает устройства %s — "
+                            "трафик, ушедший туда, не вернётся, пока оно не окажется в зоне\n",
                     sp->out[i].name, sp->out[i].device);
         /* Выходу vless NAT не нужен, и предупреждать о нём — значит посылать человека
          * настраивать то, чему нечего транслировать: клиент завершает TCP у себя и
@@ -473,11 +600,20 @@ void report_output_deps(const struct spec *sp) {
         else if (out_self_natting(out_for_device(sp, &sp->out[i], sp->out[i].device))) {
             /* нечего проверять */
         }
+        else if (out_nat4_by_steer(out_for_device(sp, &sp->out[i], sp->out[i].device))) {
+            /* подмену IPv4 ставит само ядро (generate.c, build_nat4); IPv6 — ниже, своим вопросом */
+            if (!c.masq6 && out_route6(&sp->out[i]) &&
+                out_ipv6_mode_dev(sp, &sp->out[i], sp->out[i].device) == OUT_V6_KIND &&
+                lan_has_global_v6(sp))
+                fprintf(stderr, LOG_W "output %s: у %s нет masquerade IPv6 — IPv6 клиентов уйдёт "
+                                "в туннель с их адресами, и ответ не вернётся; поставьте выходу "
+                                "ipv6: nat\n", sp->out[i].name, sp->out[i].device);
+        }
         else {
             if (!c.masqueraded)
-                fprintf(stderr, LOG_W "output %s: no masquerade/snat rule found for %s — "
-                                "if that path needs NAT, packets leave with LAN addresses and "
-                                "the channel goes quiet while its counter still rises\n",
+                fprintf(stderr, LOG_W "выход %s: для %s нет правила masquerade/snat — "
+                                "если этому пути нужна подмена адреса, пакеты уйдут с адресами LAN, "
+                                "и канал замолчит, хотя его счётчик растёт\n",
                         sp->out[i].name, sp->out[i].device);
             /* IPv6 — своим вопросом (fw_check по семействам, шаг 8 выпуска 1.10): masq6 зоны. */
             /* У `ipv6: nat` подмену ставит сам движок, у `ipv6: routed` её не нужно вовсе. */

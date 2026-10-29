@@ -67,13 +67,6 @@ int sc_aesctr_init(struct sc_aesctr *c, const unsigned char key[32], const unsig
 int sc_aesctr_xor(struct sc_aesctr *c, const unsigned char *in, unsigned char *out, size_t n)
                                         { (void)c; memmove(out, in, n); return 0; }
 void sc_aesctr_free(struct sc_aesctr *c) { c->ready = 0; }
-/* Мосту (cmd_tgws) эти две функции нужны на этапе разбора спеки — этот стенд его не зовёт, но
- * символы обязаны разрешиться на линковке: спека — значение, а не глобалы (правило 6,
- * docs/architecture.md, раздел 2), поэтому здесь больше нет и мока g_out/g_out_n — cmd_tgws с
- * этого шага держит свой static struct spec сам. */
-int load_spec(const char *path, struct spec *s, struct err *e) { (void)path; (void)s; (void)e; return 0; }
-int registry_assign(struct spec *s, struct err *e) { (void)s; (void)e; return 0; }
-const struct tgws_cfg *out_tgws(const struct output *o) { (void)o; return NULL; }
 
 static int fails;
 
@@ -116,24 +109,16 @@ static long run_pump(int cfd, int ufd, struct pump_stat *st) {
 int main(void) {
     /* ---- 1. alt_init: длинная строка ------------------------------------------------
      *
-     * Две длины, потому что до правки они ломались по-разному: 140 байт влезали в буфер
-     * чтения и урезались до 127 — мост звонил в имя, которого человек не писал; 300 байт
-     * не влезали и в буфер чтения, и хвост строки читался следующей «строкой» — то есть из
-     * одной строки получалось два чужих имени. Правильный исход у обеих один: строки нет,
-     * соседи на месте. */
+     * Две длины, потому что прежде (список был файлом) они ломались по-разному: 140 байт влезали в
+     * буфер чтения и урезались до 127 — мост звонил в имя, которого человек не писал; 300 байт не
+     * влезали и в буфер чтения, и хвост строки читался следующей «строкой». Теперь список — строки
+     * настроек плагина, а правильный исход у обеих тот же: имени нет, соседи на месте. */
     {
-        char path[] = "/tmp/tgwsfailmatch-XXXXXX";
-        int fd = mkstemp(path);
-        FILE *f = fdopen(fd, "w");
         char l140[141], l300[301];
         memset(l140, 'a', 136); memcpy(l140 + 136, ".com", 5);
         memset(l300, 'b', 296); memcpy(l300 + 296, ".com", 5);
-        fprintf(f, "first.example\n%s\n%s\nlast.example\n", l140, l300);
-        fclose(f);
-        setenv("STEER_TGWS_DOMAINS", path, 1);
-        g_alt_n = 0;
-        alt_init();
-        unlink(path);
+        const char *const doms[] = { "first.example", l140, l300, "last.example" };
+        alt_init(doms, 4);
         eq("список с двумя слишком длинными: принято только два", (long)g_alt_n, 2);
         eqs("первый домен на месте", g_alt_n > 0 ? g_alt[0] : "", "first.example");
         eqs("домен после длинных строк на месте", g_alt_n > 1 ? g_alt[1] : "", "last.example");

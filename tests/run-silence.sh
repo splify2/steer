@@ -22,12 +22,14 @@
 # Красный до правки (ядро без порога молчания и без пула узлов): закачка висит до --max-time, тихое
 # соединение — до конца стенда, а клиент, найдя живой B, выходит, и туннеля больше нет.
 #
-# Использование: tests/run-silence.sh   (STEER=<бинарник>, по умолчанию ./build/steer-ext-check)
+# Использование: tests/run-silence.sh   (STEER=<бинарник>, по умолчанию ./build/libs-host/steerd)
 set -eu
 cd "$(dirname "$0")/.."
 
-BIN="${STEER:-./build/steer-ext-check}"
-[ -x "$BIN" ] || { echo "нет бинарника: $BIN (собери extended)"; exit 2; }
+BIN="${STEER:-./build/libs-host/steerd}"
+[ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
+# steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
+LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 [ "$(id -u)" = 0 ] || { echo "run-silence: нужен root (сетевое пространство) — ПРОПУСК"; exit 0; }
 
 NS=steer-silence
@@ -83,6 +85,8 @@ if ! ip netns exec "$NS" ip link show vl >/dev/null 2>&1; then
     echo "устройство vl не поднялось:"; sed 's/^/  /' "$WORK/tun.log"; exit 1
 fi
 ip netns exec "$NS" ip route replace 203.0.113.0/24 dev vl
+. tests/lib-redir.sh
+redir_dev "$NS" vl   # TCP — к слушателю модуля (R-152), как на роутере
 grep -q "vl -> nodeA" "$WORK/tun.log" || { echo "стенд: туннель не на узле A"; sed 's/^/  /' "$WORK/tun.log"; exit 1; }
 TPID=$(ip netns pids "$NS" | while read -r p; do
     tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q " vless vl " && echo "$p"; done | head -1)

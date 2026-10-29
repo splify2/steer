@@ -1,4 +1,6 @@
-# args: apply --dry-run --spec TMP/tgws-of.json --state-dir TMP/state-to
+# args: apply --dry-run --spec TMP/any-zap.json --state-dir TMP/state-any
 # exit: 2
 # env: STEER_NFT_INGRESS=0
-# stderr: steer: outputs.tg: у kind tgws on_fail только drop: перехват стоит в ядре, и без моста соединение отвергается — обойти это правилом нечем
+# env: STEER_PLUGINS_ETC=TMP/plugetc
+# env: STEER_PLUGINS_ROOT=TMP/plugins
+# stderr: steer: канал c забирает ВЕСЬ трафик в туннель. Если это правда нужно, добавьте "allow_all": true — иначе выберите список

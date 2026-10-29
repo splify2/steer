@@ -1,11 +1,9 @@
 /* ---- генератор: спека и группы каналов → дерево набора правил -----------------------------
  *
- * С 1.7 генератор строит дерево (ir.h), а не печатает текст: печатает print.c, раскладку
- * старого ядра делает legacy.c преобразованием этого же дерева, и здесь про неё не знают
- * ничего — всё, что ниже, это набор правил современного ядра.
+ * Генератор строит дерево (ir.h), а не печатает текст: печатает print.c.
  *
- * Части, которые зависят от вида выхода, — kind_ops.emit модулей видов (zapret_emit в
- * kinds/zapret.c, tgws_emit в kinds/tgws.c, docs/architecture.md, «Вид выхода»): их зовёт
+ * Части, которые зависят от вида выхода, — kind_ops.emit модулей видов (tgws_emit в
+ * kinds/tgws.c, docs/architecture.md, «Вид выхода»): их зовёт
  * kind_emit_all (kind.c) двумя проходами по видам в порядке реестра, поэтому здесь про них не
  * знают ничего, кроме самого вызова в nft_build. Части, которые есть только на телефоне
  * (разметка на выходе, счёт скачанного на входе, заворот DNS приложений, «кто» по владельцу
@@ -29,7 +27,7 @@
  * надобности: раньше это было 4 КБ «с запасом на 32 адреса», и клиент с сотней адресов терял хвост
  * перечня МОЛЧА — правило применялось, а часть устройств оно не касалось. Освобождается
  * sb_emit (вместе с выдачей выражения в правило) или sb_free. */
-struct sbuf { char *s; size_t n, cap; };
+struct sbuf { char *s; size_t n, cap; int oom; };
 
 static void sb_add(struct sbuf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void sb_add(struct sbuf *b, const char *fmt, ...) {
@@ -45,7 +43,7 @@ static void sb_add(struct sbuf *b, const char *fmt, ...) {
         size_t nc = b->cap ? b->cap : 256;
         while (nc < b->n + (size_t)k + 1) nc *= 2;
         char *p = realloc(b->s, nc);
-        if (!p) { va_end(ap); return; }
+        if (!p) { b->oom = 1; va_end(ap); return; }   /* sb_emit скажет об этом правилам: rs->oom */
         b->s = p;
         b->cap = nc;
     }
@@ -54,15 +52,20 @@ static void sb_add(struct sbuf *b, const char *fmt, ...) {
     b->n += (size_t)k;
 }
 static const char *sb_str(const struct sbuf *b) { return b->s ? b->s : ""; }
-static void sb_free(struct sbuf *b) { free(b->s); b->s = NULL; b->n = b->cap = 0; }
-/* Выражение — в правило, буфер — обратно. */
+static void sb_free(struct sbuf *b) { free(b->s); b->s = NULL; b->n = b->cap = 0; b->oom = 0; }
+/* Выражение — в правило, буфер — обратно. Без памяти на выражение оно НЕ уходит в правило урезанным:
+ * правило без условия сработало бы на весь трафик вместо перечня. Вместо этого rs->oom — общий отказ
+ * сборки (ir.h, «отказ памяти»), и применение спеки не состоится (I-543). */
 static void sb_emit(struct nft_rule *r, struct sbuf *b) {
-    ir_x(r, "%s", sb_str(b));
+    if (b->oom) {
+        if (r && r->chain && r->chain->o.table && r->chain->o.table->rs) r->chain->o.table->rs->oom = 1;
+    } else
+        ir_x(r, "%s", sb_str(b));
     sb_free(b);
 }
 
 /* Единственные оставшиеся в этом файле пользователи — построители цепочек output для каналов
- * на само устройство ниже (plat()->local_channels): kind_ops.emit видов zapret/tgws берёт
+ * на само устройство ниже (plat()->local_channels): kind_ops.emit вида tgws берёт
  * таблицу так же, но своим вызовом ir_table_find в src/kinds. */
 static struct nft_table *inet_table(struct nft_rs *rs) {
     return ir_table_find(rs, NFT_FAM_INET, NULL);
@@ -167,7 +170,7 @@ static void x_to(struct nft_rule *r, const struct spec *sp, const struct group *
  * Правило группы в таблице inet смотрит в набор ipv4_addr, и пакет IPv6 его не касается. С 1.9
  * у группы есть v6-двойник: то же «кто», то же сужение, поиск в парном наборе «<имя>6» (или
  * «весь трафик»), та же метка — и тот же комментарий, поэтому счётчик канала остаётся одним
- * числом (counters_load складывает правила с одним именем, как у половин набора старого ядра).
+ * числом (counters_load складывает правила с одним именем).
  *
  * «Кто» у двойника:
  *   устройства (iifname) и MAC (ether saddr) — одно выражение на оба семейства. У группы «весь
@@ -192,17 +195,30 @@ static int who6_ok(const struct spec *sp, const struct group *g) {
 
 /* Есть ли у группы правило IPv4: «кто» из одних адресов IPv6 его не даёт. */
 static int who4_ok(const struct group *g) {
+    if (!(g->fam & 1)) return 0;               /* family: 6 — IPv4 не наше дело (R-154) */
     return who_any_family(g) || who_count(g, 4);
 }
 
 /* Правило IPv4 группы ловит и IPv6: «кто» без адресов и назначение без набора («весь трафик»). */
 static int group_v4_agn(const struct group *g) {
-    return who_any_family(g) && !group_has_set(g) && !g->xsrc_n;
+    /* С политикой семейства правило IPv4 семейство называет само (ir_family в build_mark_rule4), и
+     * двойник у группы свой — «оба семейства одним правилом» остаётся только у группы без неё. */
+    return !g->famreq && who_any_family(g) && !group_has_set(g) && !g->xsrc_n;
+}
+
+/* IPv6 клиентов группы «весь трафик» с политикой семейства, оставившей её без половины IPv6, —
+ * отвергается правилом в prerouting_mark: иначе при family: 4 (или запасном IPv4) он шёл бы
+ * напрямую мимо выхода, а правило «весь трафик» именно это и обещает не делать. Выходу без метки
+ * (direct) нечего охранять — его трафик и так идёт обычным путём. */
+static int group_v6_guard(const struct spec *sp, const struct group *g, const struct output *o) {
+    return g->famreq && g->all && !g->xsrc_n && !(g->fam & 2) && out_needs_mark(o) &&
+           who6_ok(sp, g);
 }
 
 /* Нужен ли группе v6-двойник: есть набор IPv6 или это «весь трафик» (не доп. группа с «ip saddr»
  * из набора — ограничение по клиенту у неё только IPv4), и правило IPv4 IPv6 не ловит. */
 static int group_needs6(const struct spec *sp, const struct group *g) {
+    if (!(g->fam & 2)) return 0;               /* family: 4 или IPv6 недоступен с запасом (R-154) */
     if (group_v4_agn(g)) return 0;
     if (!group_has_set6(g) && !(g->all && !g->xsrc_n)) return 0;
     return who6_ok(sp, g);
@@ -268,7 +284,7 @@ static int out_v6_ok(const struct output *o) {
  *
  * reverse — встречный путь: там наш клиент получатель, а порт сервера ИСХОДЯЩИЙ. */
 static void x_l4(struct nft_rule *r, const struct l4match *m, int reverse) {
-    if (l4match_empty(m)) return;
+    if (l4match_plain(m)) return;       /* признак quic трафик не сужает */
     if (m->proto == CH_PROTO_TCP)      ir_x(r, "meta l4proto tcp");
     else if (m->proto == CH_PROTO_UDP) ir_x(r, "meta l4proto udp");
     else                               ir_x(r, "meta l4proto { tcp, udp }");
@@ -340,10 +356,62 @@ void l4_describe(const struct l4match *m, char *dst, size_t n) {
  * нет, свой счётчик теряет — это и правильно, его больше не существует.
  */
 /* Счётчики растут по числу каналов в ядре (раньше — массивы на 64: у 65-го канала счётчик при
- * каждом apply обнулялся МОЛЧА, и «объём канала» врал). */
-struct ctr { char name[32]; unsigned long pkts, bytes; };
-static struct ctr *g_ctr_up, *g_ctr_down;
-static size_t g_ctr_up_n, g_ctr_down_n, g_ctr_up_cap, g_ctr_down_cap;
+ * каждом apply обнулялся МОЛЧА, и «объём канала» врал).
+ *
+ * Поиск по имени — через хеш-таблицу (открытая адресация, индексы в массиве записей), а не
+ * перебором: правило читается на каждый status, и при тысячах каналов перебор давал квадрат —
+ * сложение двойников в ctr_take и counter_find на каждый канал ответа. Имя — копия целиком:
+ * прежнее поле на 32 знака обрезало длинное имя, и такой канал не находился никогда. */
+struct ctr { char *name; unsigned long pkts, bytes; };
+struct ctrtab {
+    struct ctr *v;
+    size_t n, cap;
+    uint32_t *slot;     /* индекс записи + 1; 0 — пусто */
+    size_t slots;       /* степень двойки, не меньше 2 * cap */
+};
+static struct ctrtab g_ctr[2];   /* [0] — отданное, [1] — скачанное */
+
+static uint32_t ctr_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *q = (const unsigned char *)s; *q; q++) h = (h ^ *q) * 16777619u;
+    return h;
+}
+
+static struct ctr *ctr_get(const struct ctrtab *t, const char *name, size_t *slot_out) {
+    if (!t->slots) { if (slot_out) *slot_out = (size_t)-1; return NULL; }
+    size_t m = t->slots - 1, i = ctr_hash(name) & m;
+    for (; t->slot[i]; i = (i + 1) & m)
+        if (!strcmp(t->v[t->slot[i] - 1].name, name)) return &t->v[t->slot[i] - 1];
+    if (slot_out) *slot_out = i;
+    return NULL;
+}
+
+static int ctr_grow(struct ctrtab *t) {
+    size_t nc = t->cap ? t->cap * 2 : 32;
+    struct ctr *nv = realloc(t->v, nc * sizeof(*nv));
+    if (!nv) return -1;
+    t->v = nv;
+    t->cap = nc;
+    size_t ns = 4;
+    while (ns < 2 * nc) ns *= 2;
+    uint32_t *sl = calloc(ns, sizeof(*sl));
+    if (!sl) return -1;
+    free(t->slot);
+    t->slot = sl;
+    t->slots = ns;
+    for (size_t k = 0; k < t->n; k++) {
+        size_t i = ctr_hash(t->v[k].name) & (ns - 1);
+        while (sl[i]) i = (i + 1) & (ns - 1);
+        sl[i] = (uint32_t)(k + 1);
+    }
+    return 0;
+}
+
+static void ctr_reset(struct ctrtab *t) {
+    for (size_t k = 0; k < t->n; k++) free(t->v[k].name);
+    t->n = 0;
+    if (t->slot) memset(t->slot, 0, t->slots * sizeof(*t->slot));
+}
 
 /* Чтение счётчиков — ОДНО на apply и status. Раздельные разошлись бы в понимании одного и того
  * же, а расхождение здесь означало бы, что перенесённое и показанное — разные числа.
@@ -363,37 +431,30 @@ static void ctr_take(void *arg, const char *comment, int has_counter,
     else return;
     unsigned long p = has_counter ? (unsigned long)packets : 0;
     unsigned long b = has_counter ? (unsigned long)bytes : 0;
-    struct ctr **arrp = down ? &g_ctr_down : &g_ctr_up;
-    struct ctr *arr = *arrp;
-    size_t *n = down ? &g_ctr_down_n : &g_ctr_up_n;
-    size_t *cap = down ? &g_ctr_down_cap : &g_ctr_up_cap;
-    /* Одно имя — одно число. С 1.9 у правила группы бывает v6-двойник под тем же именем
-     * (docs/architecture.md, «4б»), а в старой раскладке у доменной группы с префиксами правил
-     * два (по одному на половину набора, см. legacy.c): объём канала — их сумма. */
-    size_t k = 0;
-    while (k < *n && strcmp(arr[k].name, c) != 0) k++;
-    if (k < *n) {
-        arr[k].pkts += p;
-        arr[k].bytes += b;
+    struct ctrtab *t = &g_ctr[down];
+    /* Одно имя — одно число. У правила группы бывает v6-двойник под тем же именем
+     * (docs/architecture.md, «4б»): объём канала — их сумма. */
+    size_t slot;
+    struct ctr *e = ctr_get(t, c, &slot);
+    if (e) {
+        e->pkts += p;
+        e->bytes += b;
         return;
     }
-    if (*n == *cap) {
-        size_t nc = *cap ? *cap * 2 : 32;
-        struct ctr *na = realloc(arr, nc * sizeof(*na));
-        if (!na) return;                /* нет памяти — счётчик этого канала не переносится */
-        *arrp = arr = na;
-        *cap = nc;
+    if (t->n == t->cap || slot == (size_t)-1) {
+        if (ctr_grow(t) != 0) return;   /* нет памяти — счётчик этого канала не переносится */
+        ctr_get(t, c, &slot);
     }
-    {
-        snprintf(arr[*n].name, sizeof(arr[*n].name), "%s", c);
-        arr[*n].pkts = p;
-        arr[*n].bytes = b;
-        (*n)++;
-    }
+    char *nm = strdup(c);
+    if (!nm) return;
+    t->v[t->n] = (struct ctr){ nm, p, b };
+    t->slot[slot] = (uint32_t)(t->n + 1);
+    t->n++;
 }
 
 void counters_load(void) {
-    g_ctr_up_n = g_ctr_down_n = 0;
+    ctr_reset(&g_ctr[0]);
+    ctr_reset(&g_ctr[1]);
     /* Все цепочки одним дампом: счётчики, снятые в разные моменты, дали бы «отдано больше,
      * чем скачано» на глазах у человека.
      *
@@ -419,11 +480,11 @@ void counters_load(void) {
 
 /* Найти прежнее значение. -1 — канала в ядре не было (первый apply или новый канал). */
 int counter_find(const char *name, int down, unsigned long *p, unsigned long *b) {
-    const struct ctr *arr = down ? g_ctr_down : g_ctr_up;
-    size_t n = down ? g_ctr_down_n : g_ctr_up_n;
-    for (size_t i = 0; i < n; i++)
-        if (!strcmp(arr[i].name, name)) { *p = arr[i].pkts; *b = arr[i].bytes; return 0; }
-    return -1;
+    const struct ctr *e = ctr_get(&g_ctr[down ? 1 : 0], name, NULL);
+    if (!e) return -1;
+    *p = e->pkts;
+    *b = e->bytes;
+    return 0;
 }
 
 /* `counter` с прежним значением, если оно есть (нули печатник пишет коротким `counter`). */
@@ -565,8 +626,7 @@ static void build_group_sets(struct nft_table *t, const struct groups *gr) {
         /* Парный набор IPv6 (docs/architecture.md, «4б»): строки IPv6 тех же файлов и подсети
          * IPv6 тех же наборов .srs. У доменной группы с половиной IPv6 (dom6) его наполняет и
          * резолвер — поддельными адресами IPv6 (навсегда) и настоящими из ответов AAAA (со
-         * сроком ответа), поэтому флаг timeout, как у набора IPv4 доменной группы. На старом
-         * ядре такой набор делится надвое тем же шагом, что набор IPv4 (legacy.c). Без dom6
+         * сроком ответа), поэтому флаг timeout, как у набора IPv4 доменной группы. Без dom6
          * элементы в нём только постоянные, и флага нет. */
         if (group_has_set6(g)) {
             struct nft_set *s6 = ir_set_add(t, n6, "ipv6_addr");
@@ -697,21 +757,70 @@ static void v6donor_catchall(struct nft_chain *c, const struct spec *sp, enum ma
     ir_comment(r, "steer-v6donor:%s", d->name);
 }
 
+/* QUIC ВЫКЛЮЧЕН у правила (`quic: block`, l4.quic_block группы): UDP/443 к назначениям группы
+ * отвергается ДО правила разметки той же группы — первое совпавшее решает, и правило выше (иное
+ * назначение, иной выход) QUIC своих адресов не теряет. Отказ — тот же ICMP «запрещено», что у
+ * kind=block: браузер узнаёт о нём сразу и уходит на TCP, а не ждёт срока.
+ *
+ * Отвергает цепочка prerouting_mark: на ingress (netdev) reject недоступен, поэтому ingress_devs
+ * при таком правиле разметку на ingress не ставит. «Весь трафик» — это интернет, как у
+ * output_mark: своя сеть (принтер, NAS с HTTP/3) не затрагивается. Адреса домена здесь уже
+ * поддельные (fake-IP): dnat к настоящему стоит позже разметки, и набор группы их и содержит. */
+static void quic_reject(struct nft_chain *c, const struct spec *sp, const struct group *g) {
+    static const char *const LOCAL4 = "ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, "
+        "172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }";
+    static const char *const LOCAL6 = "ip6 daddr != { ::1, fe80::/10, fc00::/7, ff00::/8 }";
+    if (who4_ok(g)) {
+        struct nft_rule *r = ir_rule(c);
+        x_from(r, sp, g);
+        if (g->all) { ir_family(r, 4); ir_x(r, "%s", LOCAL4); }
+        x_dest(r, g, 0, group_has_set(g));
+        ir_x(r, "meta l4proto udp");
+        ir_x(r, "th dport 443");
+        ir_counter(r, 0, 0);
+        ir_x(r, "reject with icmpx admin-prohibited");
+        ir_comment(r, "steer-quic:%s", g->name);
+    }
+    if (g->all ? who6_ok(sp, g) : group_needs6(sp, g)) {
+        struct nft_rule *r = ir_rule(c);
+        ir_rule_fam(r, 6);
+        x_from6(r, sp, g, 0, !group_has_set6(g));
+        if (g->all) ir_x(r, "%s", LOCAL6);
+        x_dest6(r, g, 0);
+        ir_x(r, "meta l4proto udp");
+        ir_x(r, "th dport 443");
+        ir_counter(r, 0, 0);
+        ir_x(r, "reject with icmpx admin-prohibited");
+        ir_comment(r, "steer-quic:%s", g->name);
+    }
+}
+
 static int build_mark_rules(struct nft_chain *c, const struct spec *sp, const struct groups *gr,
                             enum mark_hook mh, struct err *e) {
     for (size_t i = 0; i < gr->n; i++) {
         const struct group *g = &gr->g[i];
         struct output *o = out_by_name(sp, g->out);
-        if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
+        if (!o) return err_setf(e, "compile.group_no_output", "channel group %s points at a missing output", g->name);
         /* Каналы на сам телефон — на хуке output, см. nft_emit_output_mark. */
         if (group_is_local(g)) continue;
-        /* ПРАВИЛО У ГРУППЫ ОДНО (в старой раскладке у доменной группы с префиксами их
-         * становится два — см. legacy.c, шаг 1), и с 1.9 у него бывает v6-двойник ниже.
+        if (g->l4 && g->l4->quic_block && mh != MH_INGRESS) quic_reject(c, sp, g);
+        /* ПРАВИЛО У ГРУППЫ ОДНО, и у него бывает v6-двойник ниже.
          * Клиент из одних адресов IPv6 правила IPv4 не даёт вовсе. */
         int carried = 0;
         if (who4_ok(g)) {
             carried = 1;
             build_mark_rule4(c, sp, g, o, mh);
+        }
+        /* Политика семейства: IPv6 «весь трафик» без половины IPv6 — отказ, не утечка. */
+        if (mh != MH_INGRESS && group_v6_guard(sp, g, o)) {
+            struct nft_rule *rg = ir_rule(c);
+            ir_rule_fam(rg, 6);
+            x_from6(rg, sp, g, 0, 1);
+            x_l4(rg, g->l4, 0);
+            ir_x(rg, "ip6 daddr != { ::1, fe80::/10, fc00::/7, ff00::/8 }");
+            ir_counter(rg, 0, 0);
+            ir_x(rg, "reject with icmpx type admin-prohibited");
+            ir_comment(rg, "steer-v6fam:%s", g->name);
         }
         if (group_needs6(sp, g)) {
             struct nft_rule *r6 = ir_rule(c);
@@ -747,6 +856,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
     {
         struct nft_rule *r = ir_rule(c);
         x_from(r, sp, g);
+        if (g->famreq && !group_has_set(g) && who_any_family(g)) ir_family(r, 4);
         x_dest(r, g, 0, group_has_set(g));
         /* НАШИ биты, а не всё слово: `mark and ~маска or метка`. Перезапись стирала метку
          * mwan3/pbr/sqm молча, а их перезапись — нашу, и тогда помеченный пакет уходил по
@@ -768,10 +878,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
          * тот, которым системный zapret узнаёт «этот пакет не мой» (ZAPRET_SKIP_MARK,
          * см. spec.h; кому именно и почему — out_skips_zapret там же).
          *
-         * У kind=zapret без него трафик разбирали бы двое: сначала общий обход своей
-         * стратегией, потом наш экземпляр своей, — и вышло бы не то, что выбрал
-         * человек, ни в одном из двух смыслов. У туннельных выходов причина другая и
-         * не менее веская: обход стал бы рассинхронизировать ВНЕШНИЕ пакеты туннеля,
+         * У туннельных выходов обход стал бы рассинхронизировать ВНЕШНИЕ пакеты туннеля,
          * до полезной нагрузки не добираясь вовсе.
          *
          * Ставится ЗДЕСЬ, в prerouting, потому что цепочки zapret висят на
@@ -822,7 +929,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
  *
  * ЧТО НЕ ПЕРЕЕЗЖАЕТ И ПОЧЕМУ. На ingress нет записи conntrack — её заводит conntrack на
  * prerouting (-200). Значит там нельзя ни поставить метку соединения (`ct mark set mark`: на неё
- * опираются снятие соединений выхода сторожем, очередь kind=zapret и счёт телефона), ни
+ * опираются снятие соединений выхода сторожем, очередь модуля DPI и счёт телефона), ни
  * прочитать её (память выбора группы balance, balance.c). Эти две вещи остаются в
  * prerouting_mark, и делает их там правило ingress_trust ниже по готовой метке пакета. Заворот
  * DNS, dnat fake-IP и перехват моста — цепочки nat, на ingress их нет вовсе; они на месте.
@@ -882,7 +989,7 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
  *   (conntrack выключен) фрагменты шли по отдельности и без ingress — prerouting тоже видел их
  *   без портов.
  *
- * ГДЕ INGRESS НЕ СТАВИТСЯ (ingress_devs): старое ядро и ядро без inet ingress (NFTC_INGRESS,
+ * ГДЕ INGRESS НЕ СТАВИТСЯ (ingress_devs): ядро без inet ingress (NFTC_INGRESS,
  *   проба nft_ingress_ok), платформа, где устройства раздачи появляются по требованию
  *   (lan_devs_persist — телефон), поле метки без места под «разобран» (мини-сборка tgws), спека
  *   без правил для раздачи, и ни одного существующего устройства раздачи. Каналы на сам телефон (from self, uid) —
@@ -896,11 +1003,20 @@ static void build_mark_rule4(struct nft_chain *c, const struct spec *sp, const s
  *   перекрываются; TCP на veth с GRO — в пределах разброса.
  *   Устройство — docs/architecture.md, раздел 2, «Набор правил», «Разметка на ingress». */
 static size_t ingress_devs(const struct spec *sp, const struct groups *gr, const char **devs) {
-    if (!(g_nftc & NFTC_INGRESS) || (g_nftc & NFTC_LEGACY)) return 0;
+    if (!(g_nftc & NFTC_INGRESS)) return 0;
     if (!plat()->lan_devs_persist || !steer_ingress_seen_ok()) return 0;
     int any = 0;
     for (size_t i = 0; i < gr->n && !any; i++) any = !group_is_local(&gr->g[i]);
     if (!any) return 0;
+    /* Правило с выключенным QUIC отвергает пакет в prerouting_mark, а на ingress reject нет, и
+     * раньше отказа пакет уже получил бы метку выхода (разметка на ingress решает первой). */
+    for (size_t i = 0; i < gr->n; i++)
+        if (gr->g[i].l4 && gr->g[i].l4->quic_block) return 0;
+    /* То же у отказа IPv6 «весь трафик» по политике семейства (group_v6_guard). */
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct output *go = out_by_name(sp, gr->g[i].out);
+        if (go && !group_is_local(&gr->g[i]) && group_v6_guard(sp, &gr->g[i], go)) return 0;
+    }
     size_t n = 0;
     for (size_t i = 0; i < sp->lan_dev_n; i++)
         if (nft_ingress_all_devs() || if_nametoindex(sp->lan_dev[i]))
@@ -970,7 +1086,7 @@ static void ingress_trust(struct nft_table *t, struct nft_chain *pm, const struc
     sb_emit(r, &b);
     ir_comment(r, "steer-ingress");
     /* «Разобран, выхода нет» — снять значение: дальше пакет идёт с тем же пустым полем, что без
-     * ingress (его видят чужие правила postrouting, сторож, очередь zapret). */
+     * ingress (его видят чужие правила postrouting, сторож, очередь модуля DPI). */
     ir_markset(ir_rule(ir_chain_add(t, "ingress_seen")), "meta mark set mark and 0x%08x",
                ~STEER_MARK_MASK);
     if (ct) ir_x(ir_rule(ir_chain_add(t, "ingress_ct")), "ct mark set mark");
@@ -981,7 +1097,7 @@ static int build_mark(struct nft_table *t, const struct spec *sp, const struct g
                       struct err *e) {
     /* Устройства ingress — не больше устройств спеки, массив по их числу (раньше 32 на стеке). */
     const char **devs = malloc((sp->lan_dev_n ? sp->lan_dev_n : 1) * sizeof(*devs));
-    if (!devs) return err_set(e, "%s", "недостаточно памяти для разметки ingress");
+    if (!devs) return err_setf(e, "compile.no_memory", "%s", "недостаточно памяти для разметки ingress");
     size_t nd = ingress_devs(sp, gr, devs);
     int rc = 0;
     if (nd) {
@@ -1056,7 +1172,7 @@ static void build_failopen(struct nft_table *t, const struct spec *sp) {
     ir_comment(r, "steer-failopen");
 }
 
-/* ВОЗВРАТ РЕШЕНИЯ ПОСЛЕ ЧУЖОЙ ПЕРЕЗАПИСИ (STEER_MARK_RESTORE=1 в окружении apply).
+/* ВОЗВРАТ РЕШЕНИЯ ПОСЛЕ ЧУЖОЙ ПЕРЕЗАПИСИ (STEER_MARK_RESTORE=1: окружение apply или steer.platform плагина).
  *
  * Нужен экземпляру steer-box-connector — sing-box для podkop и forkop. Их цепочки ставят метку
  * пакету ЦЕЛИКОМ (`meta mark set 0x04000000`) на тех же хуках и приоритетах, что наша разметка:
@@ -1071,7 +1187,7 @@ static void build_failopen(struct nft_table *t, const struct spec *sp) {
  * Пакет с непустым полем не трогается: у failopen бит zapret снят нарочно. Без переменной
  * цепочки нет, и набор правил прежний до байта. */
 static void build_mark_restore(struct nft_table *t) {
-    const char *e = getenv("STEER_MARK_RESTORE");
+    const char *e = plat_setting("STEER_MARK_RESTORE");
     if (!e || strcmp(e, "1")) return;
     struct nft_rule *r = ir_rule(ir_base_chain_add(t, "prerouting_restore", "filter",
                                                    "prerouting", "dstnat", 10));
@@ -1246,8 +1362,8 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
  * вернули — никуда». TCP клиента повторит SYN через секунду и найдёт правило на месте.
  *
  * КАКИЕ МЕТКИ. Только выходов с устройством и своей таблицей (out_has_device, метка и таблица):
- *   - direct метки нет вовсе; kind=zapret и tgws метку имеют, но таблицы у них нет, и их трафик
- *     законно идёт обычным маршрутом (zapret — в очередь на postrouting, tgws — в мост на самом
+ *   - direct метки нет вовсе; tgws и модуль DPI метку имеют, но таблицы у них нет, и их трафик
+ *     законно идёт обычным маршрутом (модуль DPI — в очередь на postrouting, tgws — в мост на самом
  *     роутере, через input, сюда не доходит);
  *   - «пущен напрямую» (набор FAILOPEN_SET: сторож при on_fail=direct/zapret снял правило нарочно)
  *     — законно идёт по main: первым проверяется набор (out_releasable в spec.h — почему набор
@@ -1284,9 +1400,7 @@ static void build_forward_v6(struct nft_table *t, const struct spec *sp, const s
  * «лучше не работает заметно, чем работает не туда». Пересылаемый IPv6 такого выхода отвергает ещё
  * forward_v6 выше, раньше и с ответом клиенту.
  *
- * Старая раскладка (legacy.c) цепочку не трогает: filter на postrouting в inet есть и на 4.9, и в
- * ней нет ни nat, ни notrack. Счётчик на правиле — чтобы diag и человек видели, что пакеты
- * отбрасывались. */
+ * Счётчик на правиле — чтобы diag и человек видели, что пакеты отбрасывались. */
 struct guard_list { const char **v; size_t n, cap; int oom; };
 
 static void guard_devs(const struct spec *sp, const struct output *o, struct guard_list *d,
@@ -1326,6 +1440,8 @@ static void guard_use(const struct spec *sp, const struct output *o, unsigned ch
     for (size_t k = 0; k < mn; k++) guard_use(sp, out_member(sp, o, k), used, depth + 1);
 }
 
+static int has_tcp_redir(const struct spec *sp);
+
 static void build_guard(struct nft_table *t, const struct spec *sp, const struct groups *gr) {
     unsigned char *used = calloc(sp->out_n ? sp->out_n : 1, 1);
     if (!used) return;
@@ -1358,6 +1474,16 @@ static void build_guard(struct nft_table *t, const struct spec *sp, const struct
             struct nft_rule *r = ir_rule(c);
             ir_x(r, "meta mark and 0x%08x == 0x00000000", STEER_MARK_MASK);
             ir_x(r, "return");
+            /* Петля — не утечка. Собственный сокет роутера с меткой туннельного выхода (замер члена
+             * группы — urltest, туннель поверх туннеля — over) перенаправляется к слушателю модуля
+             * (R-152, build_tcp_redir) и уходит в lo; страж отбрасывал его как «не в устройство
+             * выхода», и замер членов-туннелей не проходил никогда («срок вышел: соединение не
+             * установилось», стенд QEMU 2026-10-13). */
+            if (has_tcp_redir(sp)) {
+                r = ir_rule(c);
+                ir_x(r, "oifname \"lo\"");
+                ir_x(r, "return");
+            }
             if (has_releasable(sp)) {
                 char m[40];
                 snprintf(m, sizeof(m), "meta mark and 0x%08x", STEER_MARK_MASK);
@@ -1444,8 +1570,10 @@ static void build_guard(struct nft_table *t, const struct spec *sp, const struct
  * выбор делать нельзя — разошедшиеся правило и процесс это ровно тот отказ, который
  * здесь и починен. */
 static void build_dns_redirect(struct nft_table *t, const struct spec *sp) {
+    /* dstnat - 2: раньше перенаправления TCP в модули (build_tcp_redir) — запрос к 53-му порту
+     * забирает резолвер, даже если метка клиента ведёт в выход. */
     struct nft_chain *c = ir_base_chain_add(t, "prerouting_dns", "nat", "prerouting",
-                                            "dstnat", 0);
+                                            "dstnat", -2);
     static const char *const protos[2] = { "udp", "tcp" };
     /* Подсети IPv6 в from_default (с 1.9 это законно): тогда и IPv6 забирается по адресу, а не по
      * устройству — ровно как IPv4. Без них — прежние две формы, до байта. */
@@ -1468,6 +1596,21 @@ static void build_dns_redirect(struct nft_table *t, const struct spec *sp) {
         ir_x(r, "%s dport 53", protos[k]);
         ir_counter(r, 0, 0);
         ir_x(r, "redirect to :%d", DNS_PORT);
+    }
+    /* `dns.mesh_clients: true` (I-273): клиенты mesh-VPN. У клиента Tailscale резолвер — свой
+     * (MagicDNS, 100.100.100.100), и до нашего он доходит, только если сеть Tailscale отдаёт
+     * клиентам адрес роутера как сервер имён; тогда запрос приходит на tailscale0 или zt*, и без
+     * этого правила его обслуживает dnsmasq — настоящим адресом, мимо fake-IP. Имя устройства —
+     * шаблоном по тем же причинам, что у x_ifs (демон создаёт устройство позже сети). Только по
+     * явной просьбе: чужой сети без просьбы не касаемся. */
+    if (sp->dns.mesh_clients) {
+        for (int k = 0; k < 2; k++) {
+            struct nft_rule *r = ir_rule(c);
+            ir_x(r, "iifname { \"tailscale*\", \"zt*\" }");
+            ir_x(r, "%s dport 53", protos[k]);
+            ir_counter(r, 0, 0);
+            ir_x(r, "redirect to :%d", DNS_PORT);
+        }
     }
 }
 
@@ -1516,6 +1659,39 @@ static void port_override_rules(struct nft_chain *c, const struct groups *gr, co
             ir_x(r, "dnat ip6 to ip6 daddr map @fakeip6 : %u", g->l4->override_port);
             ir_comment(r, "%s:%s", comment, g->name);
         }
+    }
+}
+
+/* ПОДДЕЛЬНЫЙ АДРЕС НЕ ВЫХОДИТ В УСТРОЙСТВА КЛИЕНТОВ И В MESH-VPN (I-558).
+ *
+ * Пул fake-IP — адреса, которых настоящими не бывает, и дороги из него наружу нет нигде, кроме
+ * подмены в ядре steer (fakeip_nomap_drop держит первый пакет, но не остальные и не свой трафик
+ * роутера). Tailscale же ставит свои маршруты в таблицу 52 по правилу 5270 и при узле выхода или
+ * объявленной кем-то подсети 198.18.0.0/15 уводит пакет к пулу в tailscale0; пир возвращает его
+ * роутеру, и пакет идёт по кругу. Снято у пользователя: очередь установщиков стека туннеля
+ * (CONNQ) забита соединениями к поддельным адресам, лишние SYN получают RST, сайты не открываются.
+ *
+ * Поэтому пакет к пулу, которому остаётся выйти в устройство клиентов спеки или в сеть mesh-VPN
+ * (имена tailscale*, zt* — их демоны создают устройство позже сети, поэтому по имени, как iifname
+ * у x_ifs), отбрасывается. Клиентов Tailscale это не задевает: их пакеты ПРИХОДЯТ с tailscale0, а
+ * ответ роутера идёт на адрес клиента, не на пул. Подмена fake→real делается в prerouting, до
+ * postrouting, поэтому законный пакет несёт здесь уже настоящий адрес. Счётчик — чтобы петлю было
+ * видно (diag и человек). */
+static void build_fakeip_guard(struct nft_table *t, const struct spec *sp, int v6) {
+    struct nft_chain *c = ir_base_chain_add(t, "postrouting_fakeguard", "filter", "postrouting",
+                                            "filter", 0);
+    for (int fam = 4; fam <= (v6 ? 6 : 4); fam += 2) {
+        struct nft_rule *r = ir_rule(c);
+        ir_rule_fam(r, fam);
+        ir_x(r, "%s", fam == 4 ? "ip daddr 198.18.0.0/15" : "ip6 daddr " FAKEIP6_NET);
+        struct sbuf b = { .n = 0 };
+        sb_add(&b, "oifname { \"tailscale*\", \"zt*\"");
+        for (size_t i = 0; i < sp->lan_dev_n; i++) sb_add(&b, ", \"%s\"", sp->lan_dev[i]);
+        sb_add(&b, " }");
+        sb_emit(r, &b);
+        ir_counter(r, 0, 0);
+        ir_x(r, "drop");
+        ir_comment(r, "steer-fakeip-guard");
     }
 }
 
@@ -1577,9 +1753,8 @@ static void build_fakeip(struct nft_table *t, const struct groups *gr, int v6) {
  *
  * ПОЧЕМУ ЗДЕСЬ. Цепочка nat видит только первый пакет соединения — правило ничего не стоит
  * остальному трафику, — и стоит там же, где решается подмена, поэтому не зависит от того, где и
- * когда ставится метка (цепочка разметки, хук ingress): метку оно не читает вовсе. В старой
- * раскладке оно уезжает вместе с dnat в таблицы ip и ip6 (legacy.c, шаг 4) — ссылок на наборы
- * inet у него нет. Счётчик — чтобы diag и человек видели, что такие пакеты были. */
+ * когда ставится метка (цепочка разметки, хук ingress): метку оно не читает вовсе. Счётчик —
+ * чтобы diag и человек видели, что такие пакеты были. */
 static void fakeip_nomap_drop(struct nft_chain *c, int v6, const char *comment) {
     struct nft_rule *r = ir_rule(c);
     ir_rule_fam(r, 4);
@@ -1641,9 +1816,7 @@ static void build_traceroute_raw(struct nft_table *t) {
  *
  * ОБА СЕМЕЙСТВА. Запрос по IPv6 (сервер сети из RDNSS, в том числе link-local) заворачивается
  * так же: резолвер ищет исходное назначение и в AF_INET6 и переспрашивает тот же IPv6-сервер
- * (см. g_origdst в dnsd/proxy.c). В современной раскладке это одно правило в inet, в старой — по
- * цепочке nat output в ip и ip6 (legacy.c разносит его по семействам); на старом ядре без nat в
- * ip6 (NFTC_IP6NAT) IPv6-половины нет — там такого правила не поставить, и apply об этом говорит. */
+ * (см. g_origdst в dnsd/proxy.c). Это одно правило в inet. */
 
 /* Само правило заворота — одно на всех раскладках и семействах (по правилу на протокол).
  *
@@ -1688,7 +1861,8 @@ static void local_dns_redirect(struct nft_chain *c, const struct spec *sp) {
 
 /* Заворот DNS приложений и перевод поддельных адресов для соединений самого телефона —
  * цепочка nat на хуке output. */
-void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct groups *gr) {
+static void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp,
+                                const struct groups *gr) {
     struct nft_chain *c = ir_base_chain_add(inet_table(rs), "output_dns", "nat", "output",
                                             "dstnat", 0);
     if (plat()->local_dns) local_dns_redirect(c, sp);
@@ -1700,8 +1874,7 @@ void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct 
     ir_counter(r, 0, 0);
     ir_dnat(r, "ip daddr", "fakeip");
     ir_comment(r, "steer-fakeip-local");
-    /* Поддельные IPv6 — тем же правилом по карте fakeip6 (только когда она есть; на старом ядре
-     * без nat в ip6 её нет — dom6_ok). */
+    /* Поддельные IPv6 — тем же правилом по карте fakeip6 (только когда она есть — dom6_ok). */
     int v6 = has_fakeip6(gr);
     if (v6) {
         r = ir_rule(c);
@@ -1747,7 +1920,7 @@ static int local_who(struct nft_rule *r, const struct group *g, struct err *e) {
     for (size_t i = 0; i < g->from_n; i++) {
         unsigned lo, hi;
         if (from_uid_range(g->from[i], &lo, &hi) != 0)
-            return err_set(e, "группа %s: негодный UID", g->name);   /* спека это уже отвергла */
+            return err_setf(e, "compile.group_bad_uid", "группа %s: негодный UID", g->name);   /* спека это уже отвергла */
         if (lo == hi) sb_add(&b, "%s%u", i ? ", " : "", lo);
         else sb_add(&b, "%s%u-%u", i ? ", " : "", lo, hi);
     }
@@ -1763,15 +1936,14 @@ static int local_who(struct nft_rule *r, const struct group *g, struct err *e) {
  * решает», одно правило на группу, метка — наши биты с маской, метка соединения — как там.
  *
  * Тип цепочки — route, прямо в inet, где и наборы: смена метки в ней сама заставляет ядро
- * искать маршрут заново. В старой раскладке route в inet нет — там её переделывает legacy.c
- * (шаг 2: filter и бит перемаршрутизации).
+ * искать маршрут заново.
  *
  * IPv6 (docs/architecture.md, «4б»). У группы — v6-двойник: с набором IPv6 «<имя>6» или, у «весь
  * трафик», интернет IPv6 мимо своей сети. Выход с IPv6 ведёт его своей таблицей IPv6. Выходу без
  * IPv6 двойник отвечает отказом — приложения переходят на IPv4 (так устроен выбор адреса у
  * любого клиента с двумя стеками), и ничего не утекает напрямую. */
-int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
-                         struct err *e) {
+static int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp,
+                                const struct groups *gr, struct err *e) {
     struct nft_table *t = inet_table(rs);
     struct nft_chain *c = ir_base_chain_add(t, "output_mark", "route", "output", "mangle", 1);
     ir_gap(c);
@@ -1779,8 +1951,8 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
         const struct group *g = &gr->g[i];
         if (!group_is_local(g)) continue;
         struct output *o = out_by_name(sp, g->out);
-        if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
-        if (g->all && out_needs_mark(o) && !out_v6_ok(o)) {
+        if (!o) return err_setf(e, "compile.group_no_output", "channel group %s points at a missing output", g->name);
+        if (g->all && out_needs_mark(o) && (!out_v6_ok(o) || (g->famreq && !(g->fam & 2)))) {
             /* С тем же сужением по протоколу и портам, что и канал: канал «UDP 50000-65535»
              * не вправе отнимать у приложения весь IPv6. Своя сеть (петля, link-local, ULA,
              * мультикаст) — не наружу и не мимо туннеля, её не трогаем. */
@@ -1794,27 +1966,30 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
             ir_x(r, "reject");
             ir_comment(r, "steer-v6:%s", g->name);
         }
-        struct nft_rule *r = ir_rule(c);
-        if (local_who(r, g, e) != 0) return -1;
-        /* «Весь трафик» — это интернет, а не своя сеть: принтер, NAS и Chromecast в Wi-Fi
-         * через туннель не видны. Только IPv4 — IPv6 такой группы отвергнут правилом выше
-         * (выход без IPv6) или уведён двойником ниже. */
-        if (g->all) {
-            ir_family(r, 4);
-            ir_x(r, "ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, "
-                    "192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }");
-        } else {
-            ir_rule_fam(r, 4);          /* поиск в наборе IPv4 — только IPv4 */
+        struct nft_rule *r;
+        if (g->fam & 1) {
+            r = ir_rule(c);
+            if (local_who(r, g, e) != 0) return -1;
+            /* «Весь трафик» — это интернет, а не своя сеть: принтер, NAS и Chromecast в Wi-Fi
+             * через туннель не видны. Только IPv4 — IPv6 такой группы отвергнут правилом выше
+             * (выход без IPv6) или уведён двойником ниже. */
+            if (g->all) {
+                ir_family(r, 4);
+                ir_x(r, "ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, "
+                        "192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }");
+            } else {
+                ir_rule_fam(r, 4);          /* поиск в наборе IPv4 — только IPv4 */
+            }
+            x_dest(r, g, 0, group_has_set(g));
+            x_mark(r, o, o->mark);
+            x_counter_carried(r, g->name, 0);
+            ir_x(r, "return");
+            ir_comment(r, "steer:%s", g->name);
         }
-        x_dest(r, g, 0, group_has_set(g));
-        x_mark(r, o, o->mark);
-        x_counter_carried(r, g->name, 0);
-        ir_x(r, "return");
-        ir_comment(r, "steer:%s", g->name);
         /* v6-двойник (docs/architecture.md, «4б»). «Весь трафик» в выход с IPv6 (или direct) —
          * интернет IPv6 мимо своей сети, как у IPv4 выше; с набором IPv6 — поиск в нём. Выход без
          * IPv6: у «весь трафик» отказ стоит выше, у набора — отказ здесь же, тем же текстом. */
-        int all6 = g->all && out_v6_ok(o);
+        int all6 = g->all && out_v6_ok(o) && (g->fam & 2);
         if (!all6 && !group_has_set6(g)) continue;
         r = ir_rule(c);
         if (local_who(r, g, e) != 0) return -1;
@@ -1947,7 +2122,7 @@ static void build_v6donor_set(struct nft_table *t, const struct spec *sp) {
  *
  * По устройству, а не по метке: в устройство выхода IPv6 клиентов уводит только наша метка, а
  * свой трафик роутер шлёт с адреса этого же устройства — masquerade ему ничего не меняет. Цепочка
- * nat в inet; старая раскладка (legacy.c) переносит правило в ip6 по его семейству. */
+ * nat в inet. */
 static void build_nat6(struct nft_table *t, const struct spec *sp) {
     struct nft_chain *c = NULL;
     for (size_t i = 0; i < sp->out_n; i++) {
@@ -1964,6 +2139,130 @@ static void build_nat6(struct nft_table *t, const struct spec *sp) {
     }
 }
 
+/* Подмена IPv4 на устройствах выходов — в СВОЕЙ таблице, как IPv6 у `ipv6: nat` (build_nat6).
+ *
+ * РЕШЕНИЕ ВЛАДЕЛЬЦА (2026-10-12): все устройства выходов steer лежат в одной зоне fw4 `steer_zone`
+ * БЕЗ masq (её ведёт splify2), а подмену адреса ставит ядро — тем видам, которым она нужна: туннель
+ * с устройством, который адреса клиентов не завершает сам (interface, awg, члены kind: warp — у WARP
+ * туннель принимает пакеты только с адреса регистрации). Сами себе подмена — vless, hysteria2, прокси
+ * (завершают соединения у себя) и xsteer (подмена ему вредна: хаб узнаёт пира по адресу) —
+ * KC_SELF_NAT, им правила нет. Прежде masquerade ставила зона steer_iface, и смысл был тот же; две зоны
+ * splify2 (с подменой и без) сведены в одну.
+ *
+ * Зоны fw4 ядро по-прежнему не трогает, и ЗОНА устройству нужна: политика forward зоны в fw4
+ * действует только внутри зоны, а транзит в устройство вне всех зон уходит в handle_reject (стенд
+ * QEMU 2026-10-12). Подмена дважды (своя зона человека с masq и это правило) не страшна: адрес
+ * соединению назначает первая сработавшая цепочка nat.
+ *
+ * Устройства — выходов спеки и безымянных членов пула v1 (`devices`), каждое один раз. */
+static void nat4_dev(struct nft_table *t, struct nft_chain **c, const struct output *o,
+                     const char **seen, size_t *seen_n) {
+    if (!out_nat4_by_steer(o)) return;
+    for (size_t k = 0; k < *seen_n; k++)
+        if (!strcmp(seen[k], o->device)) return;
+    seen[(*seen_n)++] = o->device;
+    if (!*c) *c = ir_base_chain_add(t, "postrouting_nat4", "nat", "postrouting", "srcnat", 0);
+    struct nft_rule *r = ir_rule(*c);
+    ir_rule_fam(r, 4);
+    ir_x(r, "oifname \"%s\"", o->device);
+    ir_family(r, 4);
+    ir_counter(r, 0, 0);
+    ir_x(r, "masquerade");
+    ir_comment(r, "steer-nat4:%s", o->name[0] ? o->name : o->device);
+}
+
+static void build_nat4(struct nft_table *t, const struct spec *sp) {
+    struct nft_chain *c = NULL;
+    size_t cap = sp->out_n + sp->anon_n + 1, seen_n = 0;
+    const char **seen = calloc(cap, sizeof(*seen));
+    if (!seen) { t->rs->oom = 1; return; }
+    for (size_t i = 0; i < sp->out_n; i++) nat4_dev(t, &c, &sp->out[i], seen, &seen_n);
+    for (size_t i = 0; i < sp->anon_n; i++) nat4_dev(t, &c, &sp->anon[i], seen, &seen_n);
+    free(seen);
+}
+
+/* ---- TCP клиентов — к слушателю модуля (R-152) ----------------------------------------------
+ *
+ * У выхода с KC_TCP_REDIR (vless, hysteria2, прокси) TCP клиентов завершает ядро Linux: первый
+ * пакет соединения перенаправляется по метке выхода на порт слушателя модуля (out_tcp_port), а
+ * модуль гонит поток узлу. Прежде такой TCP шёл пакетами в TUN, и модуль разбирал его своим
+ * стеком: два прохода пакета через границу ядра и свой TCP поверх. Замер на одном стенде —
+ * перенаправление 21-27 Гбит/с при 0,22-0,27 с CPU на ГиБ против 10-12 Гбит/с и 0,59-0,85 у
+ * обхода через TUN (решение владельца 2026-10-11, R-152 в хабе). UDP по-прежнему идёт в TUN.
+ *
+ * КАРТА, А НЕ ПРАВИЛО НА ВЫХОД. Куда вести метку, решает не спека, а сторож: метка группы ведёт
+ * в порт того члена, на котором группа сейчас (таблица выхода привязана к его устройству), а у
+ * выхода без живого модуля элемента нет вовсе — тогда правило не совпадает, и соединение идёт
+ * по маршруту выхода, то есть туда, куда решает on_fail (запрет, напрямую). Элементы ведёт демон
+ * вместе с привязкой таблицы (tcp_redir_sync в failover.c); набор правил приходит с пустой картой
+ * и заполняется после загрузки.
+ *
+ * ПРИОРИТЕТ dstnat - 1 — РАНЬШЕ подмены fake-IP. Трансляция назначения у соединения одна: первая
+ * цепочка nat, назначившая её, решает за остальные (nf_nat_inet_fn), поэтому перенаправление
+ * после dnat по карте fakeip не сработало бы никогда. Поддельный адрес модуль разворачивает сам —
+ * по тому же файлу состояния резолвера, что засевает карту (fakeip.state), — и подделку без
+ * подмены сбрасывает, как сбросило бы правило steer-fakeip-nomap. Заворот DNS стоит ещё раньше,
+ * на dstnat - 2 (build_dns_redirect): запрос к 53-му порту забирает резолвер, а не выход.
+ *
+ * Хук output — для соединений самого роутера с меткой выхода: сокет туннеля поверх другого
+ * выхода (over) несёт метку цели и попадает к её слушателю так же, как трафик клиента. На
+ * платформе с заворотом DNS приложений (output_dns на dstnat) запрос к 53-му порту в выход не
+ * уводится — его забирает тот заворот, как и прежде.
+ */
+static int has_tcp_redir(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (sp->out[i].mark && out_has_cap(&sp->out[i], KC_TCP_REDIR)) return 1;
+    return 0;
+}
+
+/* Несёт ли хоть один выход с перенаправлением TCP IPv6 (KC_IPV6 стоит у видов, а `ipv6: off` его снимает):
+ * только тогда метка в карте может прийти от пакета IPv6, и правилу для IPv6 есть что ловить. */
+static int has_tcp_redir6(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (sp->out[i].mark && out_has_cap(&sp->out[i], KC_TCP_REDIR) &&
+            out_has_cap(&sp->out[i], KC_IPV6)) return 1;
+    return 0;
+}
+
+static void build_tcp_redir(struct nft_table *t, const struct spec *sp) {
+    if (!has_tcp_redir(sp)) return;
+    ir_gap(ir_map_add(t, TCP_REDIR_MAP, "mark", "inet_service"));
+    static const char *const hooks[2] = { "prerouting", "output" };
+    static const char *const names[2] = { "prerouting_tcp_redir", "output_tcp_redir" };
+    char m[40];
+    snprintf(m, sizeof(m), "meta mark and 0x%08x", STEER_MARK_MASK);
+    for (int k = 0; k < 2; k++) {
+        struct nft_chain *c = ir_base_chain_add(t, names[k], "nat", hooks[k], "dstnat", -1);
+        if (!k) ir_gap(c);
+        struct nft_rule *r = ir_rule(c);
+        ir_x(r, "ip protocol tcp");
+        /* Метка — в карте: счётчик правила считает перенаправленные соединения, а не весь TCP. */
+        ir_setref(r, m, TCP_REDIR_MAP);
+        /* Адрес самого роутера (его WAN, адрес в другой своей сети) остаётся ему: в маршруте
+         * выхода такой пакет и прежде доставлялся локально — таблица local стоит раньше правил
+         * меток. */
+        ir_x(r, "fib daddr type != local");
+        if (k == 1 && plat()->local_dns) ir_x(r, "tcp dport != 53");
+        ir_counter(r, 0, 0);
+        ir_x(r, "redirect to :meta mark and 0x%08x map @%s", STEER_MARK_MASK, TCP_REDIR_MAP);
+        ir_comment(r, "steer-tcp-redir");
+        /* IPv6: то же правилом своего семейства (в таблице inet `ip protocol` смотрит только IPv4), тот же порт
+         * и та же карта — слушатель модуля двойного стека (stack.c, klisten_open), исходное назначение у него
+         * IP6T_SO_ORIGINAL_DST. Комментарий тот же: считает перенаправленное, а не семейство. */
+        if (has_tcp_redir6(sp)) {
+            r = ir_rule(c);
+            ir_family(r, 6);
+            ir_x(r, "meta l4proto tcp");
+            ir_setref(r, m, TCP_REDIR_MAP);
+            ir_x(r, "fib daddr type != local");
+            if (k == 1 && plat()->local_dns) ir_x(r, "tcp dport != 53");
+            ir_counter(r, 0, 0);
+            ir_x(r, "redirect to :meta mark and 0x%08x map @%s", STEER_MARK_MASK, TCP_REDIR_MAP);
+            ir_comment(r, "steer-tcp-redir");
+        }
+    }
+}
+
 /* Дерево набора правил современной раскладки. Порядок объектов — порядок печати, и он
  * прежний до байта (снимок tests/golden/ruleset). */
 int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
@@ -1972,7 +2271,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
      * адресов нет, и подмена молча не случилась бы. */
     for (size_t i = 0; i < gr->n; i++)
         if (gr->g[i].domains && gr->g[i].realip && gr->g[i].l4 && gr->g[i].l4->override_port)
-            return err_set(e, "группа %s: override_port у списка — только с dns.mode fakeip, а у "
+            return err_setf(e, "compile.override_port_realip", "группа %s: override_port у списка — только с dns.mode fakeip, а у "
                            "канала realip", gr->g[i].name);
     struct nft_table *t = ir_table_add(rs, NFT_FAM_INET, nft_table());
     build_group_sets(t, gr);
@@ -1980,7 +2279,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     if (build_mark(t, sp, gr, e) != 0) return -1;
     /* Группы balance: цепочки, карты и цепочки меток (compile/balance.c). Без таких групп — ничего,
      * и текст прежний до байта. */
-    if (nft_emit_balance(t, sp, gr) != 0) return err_set(e, "out of memory building the ruleset", NULL);
+    if (nft_emit_balance(t, sp, gr) != 0) return err_setf(e, "compile.no_memory", "out of memory building the ruleset");
     if (plat()->local_channels && has_local(gr) && nft_emit_output_mark(rs, sp, gr, e) != 0)
         return -1;
     build_failopen(t, sp);
@@ -1989,31 +2288,36 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     build_forward_v6(t, sp, gr);
     build_guard(t, sp, gr);
     build_nat6(t, sp);
+    build_nat4(t, sp);
     /* Построители видов (kind_ops.emit): по видам, в порядке реестра, поэтому все цепочки
-     * zapret в тексте стоят раньше цепочки моста, в каком бы порядке выходы ни шли в спеке
+     * видов в тексте стоят раньше цепочки моста, в каком бы порядке выходы ни шли в спеке
      * (kind.c: kind_emit_all). */
-    kind_emit_all(rs, sp);
-    if (!prof()->no_resolver) build_dns_redirect(t, sp);
+    if (kind_emit_all(rs, sp, e) != 0) return -1;
+    build_dns_redirect(t, sp);
+    build_tcp_redir(t, sp);
     /* Остальное по-прежнему по факту доменных каналов: карта fakeip и цепочка dstnat
      * стоят per-packet, и держать их пустыми на роутере без доменов незачем. Это гейт
      * по СТОИМОСТИ, а не по смыслу, и переворачиваться он может свободно — ни один
      * чужой ключ от него не зависит. */
     if (has_domains(gr)) {
-        if (has_fakeip(gr)) build_fakeip(t, gr, has_fakeip6(gr));
+        if (has_fakeip(gr)) {
+            build_fakeip(t, gr, has_fakeip6(gr));
+            build_fakeip_guard(t, sp, has_fakeip6(gr));
+        }
         if (plat()->local_channels && has_local_domains(gr)) nft_emit_output_dns(rs, sp, gr);
         if (sp->traceroute_hops) build_traceroute_raw(t);
     }
-    if (rs->oom) return err_set(e, "out of memory building the ruleset", NULL);
+    if (rs->oom) return err_setf(e, "compile.no_memory", "out of memory building the ruleset");
     return 0;
 }
 
-/* Текст набора правил этого запуска: дерево, раскладка ядра (g_nftc) и печать. На отказе в f
+/* Текст набора правил этого запуска: дерево и печать. На отказе в f
  * не пишется ничего — дерево строится целиком до печати. */
 int generate(const struct spec *sp, const struct groups *gr, FILE *f, struct err *e) {
     struct nft_rs rs;
     nft_rs_init(&rs);
     int rc = nft_build(&rs, sp, gr, e);
-    if (rc == 0) rc = legacy_rewrite(&rs, sp, g_nftc, e);
+    if (rc != 0) err_fallback(e, "compile.error");     /* отказ без своего слова — текст в подстановке 1 */
     if (rc == 0) nft_print(&rs, f);
     nft_rs_free(&rs);
     return rc;

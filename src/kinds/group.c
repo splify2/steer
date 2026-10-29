@@ -42,6 +42,8 @@
 #include <string.h>
 
 #include "spec.h"
+#include "awg.h"
+#include "plugin.h"
 
 /* Спека v2 знает группу по имени; спека v1 — нет (kind_by_name её не находит, см. kind.h). */
 const struct kind_ops *kind_by_name_v2(const char *name) {
@@ -59,6 +61,9 @@ const struct kind_ops *out_kind_shown(const struct output *o) {
 }
 
 const char *out_kind_name(const struct output *o) {
+    /* Недоступный выход называется прежним видом (vless у туннеля, у которого нет плагина). */
+    if (kind_of(o) == &kind_unavail && o->plg.shown)
+        return !strncmp(o->plg.shown, "tunnel:", 7) ? o->plg.shown + 7 : o->plg.shown;
     return out_kind_shown(o)->name;
 }
 
@@ -109,15 +114,13 @@ int group_named(const struct group_cfg *g) {
 
 int group_seal(struct spec *sp, struct output *go, struct err *e) {
     struct group_cfg *g = &go->grp;
-    if (!g->members_n) return err_set(e, "outputs.%s: у группы нет членов", go->name);
+    if (!g->members_n) return err_setc(e, "spec.group_no_members_name", "outputs.%s: у группы нет членов", go->name);
     /* Единственный предел числа членов, и он — свойство карты balance (kind.h, GROUP_BAL_SLOTS):
      * у члена без слота доли нет. Остальные pick пределов по числу членов не имеют. */
     if (g->pick == PICK_BALANCE && g->members_n > GROUP_BAL_SLOTS) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "outputs.%.31s: у группы pick: balance членов не больше %d "
+        return err_setf(e, "spec.balance_members", "outputs.%.31s: у группы pick: balance членов не больше %d "
                  "(в карте ядра %d слотов, у каждого члена нужен хотя бы один), а их %zu",
                  go->name, GROUP_BAL_SLOTS, GROUP_BAL_SLOTS, g->members_n);
-        return err_set(e, "%s", msg);
     }
     unsigned caps = ~0u;
     for (size_t i = 0; i < g->members_n; i++) {
@@ -127,15 +130,13 @@ int group_seal(struct spec *sp, struct output *go, struct err *e) {
          * одно устройство нечем (см. шапку, «ВЛОЖЕННОСТЬ»). */
         const struct group_cfg *mg = out_group(m);
         if (mg && mg->pick == PICK_BALANCE && g->pick != PICK_BALANCE) {
-            char msg[400];
-            snprintf(msg, sizeof(msg), "outputs.%s: %s — группа pick: balance, а членом группы pick: %s "
+            return err_setf(e, "spec.balance_nested", "outputs.%s: %s — группа pick: balance, а членом группы pick: %s "
                      "она быть не может: у такой группы трафик идёт в одно устройство, а у balance "
                      "устройство на каждое соединение своё", go->name, m->name,
                      group_pick_name(g->pick));
-            return err_set(e, "%s", msg);
         }
         if (!out_has_device(m))
-            return err_set(e, "outputs.%s: член группы без устройства", go->name);
+            return err_setc(e, "spec.member_no_device_name", "outputs.%s: член группы без устройства", go->name);
         caps &= out_caps(m);
     }
     /* Своего сокета наверх и своего процесса у группы нет: KC_OVER и KC_ENGINE_OWNED — свойства
@@ -329,8 +330,7 @@ void group_balance_slots(const struct group_cfg *g, const unsigned char *alive,
 }
 
 /* Имена объектов balance в таблице движка — по номеру таблицы выхода из реестра, а не по имени:
- * имя выхода бывает до 31 байта, и с приставкой оно не влезло бы в предел имени цепочки старых
- * ядер (32 с нулём, ядро 4.9 телефона). Номер таблицы у выхода свой и живёт в реестре. */
+ * имя короткое при любом имени выхода, а номер таблицы у выхода свой и живёт в реестре. */
 void group_bal_chain(const struct output *o, char *dst, size_t n) {
     snprintf(dst, n, "bal_%d", o->table);
 }
@@ -341,17 +341,59 @@ void group_mark_chain(const struct output *o, char *dst, size_t n) {
     snprintf(dst, n, "mark_%d", o->table);
 }
 void group_bal_target(const struct output *m, char *dst, size_t n) {
-    const struct group_cfg *g = out_group(m);
-    if (g && g->pick == PICK_BALANCE) group_bal_chain(m, dst, n);
+    if (group_carded(m)) group_bal_chain(m, dst, n);
     else group_mark_chain(m, dst, n);
+}
+
+int group_carded(const struct output *o) {
+    const struct group_cfg *g = out_group(o);
+    if (!g) return 0;
+    if (g->pick == PICK_BALANCE) return 1;
+    return (g->pick == PICK_ORDER || g->pick == PICK_LATENCY) && group_named(g);
 }
 
 static unsigned group_caps_of(const struct output *o) {
     return o->grp.caps;
 }
 
+/* Помощник группы — только у группы, которую развернул плагин (его хук expand вернул helper: true,
+ * steer-api.md, 3.3): помощник вида плагина ведёт её членов (member, revive). У обычной группы
+ * помощника нет. */
+static int group_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
+    return plugin_owner_helper(sp, o, h);
+}
+
+/* ---- plugin-device: общий вид «устройство держит процесс владельца» ---------------------------
+ *
+ * Прежнее имя — warp-masque: член WARP с TUN плагина warpbox (поток туннеля MASQUE). Вид общий
+ * (spec-fields.md, раздел 3): устройство создаёт и держит процесс плагина,
+ * который завёл выход (owner), как у xsteer; маршрут, метку, таблицу и подмену адресов ведёт ядро,
+ * как у любого выхода с устройством. Своих ключей у вида нет, руками в спеке он не пишется:
+ * принимается только в подготовленной спеке и только с `owner` (разворот хука expand, model/v2.c) —
+ * поэтому в реестре видов (kind.c) его нет: разбор находит его сам. Имя устройства — ключ `device`
+ * или выведенное по правилу awg (awg_default_ifname): имя не должно выдавать туннель. */
+static int pdev_parse(struct output *o, const struct out_keys *k, struct err *e) {
+    if (k->devices_n)
+        return err_set(e, "outputs.%s: устройство выхода плагина выбирает ядро steer", o->name);
+    if (!o->device[0]) awg_default_ifname(o->name, o->device, sizeof(o->device));
+    return 0;
+}
+
+static void pdev_keys_of(const struct output *o, struct out_keys *k) {
+    (void)o;
+    (void)k;
+}
+
+const struct kind_ops kind_plugin_device = {
+    .name = "plugin-device",
+    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_OVER | KC_SKIP_ZAPRET | KC_IPV6,
+    .parse = pdev_parse,
+    .keys_of = pdev_keys_of,
+};
+
 const struct kind_ops kind_group = {
     .name = "group",
     .caps_of = group_caps_of,
     .novia = "группа",
+    .helper = group_helper,
 };

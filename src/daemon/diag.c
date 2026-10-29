@@ -23,7 +23,6 @@
 #include "spec.h"
 #include "awg.h"
 #include "hwid.h"
-#include "obfs.h"
 #include "cli.h"
 #include "srs.h"
 #include "ctl.h"
@@ -31,7 +30,6 @@
 #include "groups.h"
 #include "generate.h"
 #include "nftquery.h"
-#include "nftcompat.h"
 #include "procscan.h"
 #include "rtnl.h"
 
@@ -345,20 +343,24 @@ static void lan6_note(struct lan6 *r, const struct v6pfx *p, const uint8_t *x) {
 static struct lan6 lan6_scan(const struct spec *sp, const struct v6pfx *p) {
     struct lan6 r;
     memset(&r, 0, sizeof(r));
-    static struct rtnl_addr6 av[256];
-    int an = rtnl_addrs6(av, sizeof(av) / sizeof(av[0]));
-    if (an >= 0) {
-        int idx[8];
+    struct rtnl_addr6 *av = NULL;
+    int an = rtnl_addrs6(&av);
+    int *idx = an >= 0 ? calloc(sp->lan_dev_n ? sp->lan_dev_n : 1, sizeof(*idx)) : NULL;
+    if (an >= 0 && idx) {
         size_t ni = 0;
-        for (size_t i = 0; i < sp->lan_dev_n && ni < 8; i++)
+        for (size_t i = 0; i < sp->lan_dev_n; i++)
             if ((idx[ni] = (int)if_nametoindex(sp->lan_dev[i])) > 0) ni++;
         for (int k = 0; k < an; k++) {
             int ours = 0;
             for (size_t i = 0; i < ni && !ours; i++) ours = av[k].ifindex == idx[i];
             if (ours && !(av[k].flags & IFA_F_DEPRECATED)) lan6_note(&r, p, av[k].a);
         }
+        free(idx);
+        free(av);
         return r;
     }
+    free(idx);
+    free(av);
     struct ifaddrs *ifa = NULL;
     if (getifaddrs(&ifa) != 0) return r;
     for (struct ifaddrs *a = ifa; a; a = a->ifa_next) {
@@ -469,9 +471,10 @@ static int lan_ifname(const struct spec *sp, char *name, size_t n, char *assign,
  * накрывающий его или лежащий в нём. В отличие от v6donor_derive адрес LAN из префикса здесь не
  * нужен: вопрос как раз о том, почему его нет. 1 — есть, 0 — нет, -1 — маршруты не прочитать. */
 static int v6_announced(const struct output *o, const struct v6pfx *p) {
-    static struct rtnl_route6 rt[256];
-    int n = rtnl_main6_routes(rt, sizeof(rt) / sizeof(rt[0]));
+    struct rtnl_route6 *rt = NULL;
+    int n = rtnl_main6_routes(&rt);
     if (n < 0) return -1;
+    int res = 0;
     int donor_if = o->device[0] ? (int)if_nametoindex(o->device) : 0;
     for (int i = 0; i < n; i++) {
         if (rt[i].type != RTN_UNREACHABLE || !rt[i].dst_len || rt[i].dst_len > 64) continue;
@@ -489,12 +492,15 @@ static int v6_announced(const struct output *o, const struct v6pfx *p) {
             if ((v6pfx_has(&s, c.a) || v6pfx_has(&c, s.a)) && rt[j].oif && rt[j].oif != donor_if)
                 isp = 1;
         }
-        if (!isp) return 1;
+        if (!isp) { res = 1; break; }
     }
-    return 0;
+    free(rt);
+    return res;
 }
 
 static void diag_v6_host(const struct spec *sp, const struct groups *gr) {
+    int want6 = 0;
+    for (size_t i = 0; i < sp->rule_n && !want6; i++) want6 = sp->rule[i].family == 6;
     char what[200], why[400];
     int ra_said = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
@@ -603,8 +609,10 @@ static void diag_v6_host(const struct spec *sp, const struct groups *gr) {
                 continue;
             }
             /* У LAN только ULA: маршрут по умолчанию в RA odhcpd объявляет без глобального префикса,
-             * только если ra_default у секции dhcp этой сети не 0. */
-            if (l.ula && !l.gua && have_uci && lname[0] && !ra_said) {
+             * только если ra_default у секции dhcp этой сети не 0. Говорится лишь при правиле
+             * «только IPv6»: без него IPv6 клиентам не нужен, и у кого IPv6 в интернет не работает,
+             * предупреждение висело бы всегда. */
+            if (l.ula && !l.gua && have_uci && lname[0] && !ra_said && want6) {
                 ra_said = 1;            /* это про LAN, а не про выход: один раз на отчёт */
                 char rd[16] = "", sec[64] = "";
                 int r = uci_find("dhcp", "dhcp", "interface", lname, "ra_default", rd, sizeof(rd),
@@ -717,10 +725,6 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
     g_diag_out = out;
     g_diag_first = 1;
     g_diag_warn = g_diag_fail = 0;
-    /* Раскладка — та, что стоит в ядре: искать правила там, где их поставил apply (цепочки и
-     * наборы ниже). Проба `nft -c`, которой её узнаёт компилятор, здесь не нужна: отчёт читает
-     * применённое, а не решает, что применять. */
-    g_nftc = nft_compat_seen();
     fprintf(out, "{\"schema\":1,\"checks\":[");
 
     /* 1. Таблица. Без неё всё остальное бессмысленно: apply не применялся или его снесли. */
@@ -744,14 +748,6 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
         const struct group *g = &gr->g[i];
         if (!g->files_n && !g->srs_n && !g->domains) continue;
         long n = set_count(g->name);
-        /* Старая раскладка: префиксы доменной группы лежат во второй половине набора (<имя>_n,
-         * см. generate). Адресов у канала — сумма обеих. */
-        if (n >= 0 && legacy_may_have_static(g)) {
-            char sn[80];
-            nft_static_set_name(sn, sizeof(sn), g->name);
-            long m = set_count(sn);
-            if (m > 0) n += m;
-        }
         char what[160], why[240];
         if (n < 0) {
             snprintf(what, sizeof(what), "канал %.48s: набора в ядре нет", g->name);
@@ -850,9 +846,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
     /* 4. Резолвер и редирект. Доменные каналы держатся на обоих: без редиректа клиент
      *    спрашивает не нас, без процесса спрашивать некого. */
     if (has_domains(gr)) {
-        /* В старой раскладке у заворота нет своей цепочки — он правило общей цепочки nat
-         * (legacy.c, шаг 4), и узнаётся по самому правилу. */
-        int redir = NFT_LEGACY ? nft_redirect_here(DNS_PORT) : nft_chain_here("prerouting_dns");
+        int redir = nft_chain_here("prerouting_dns");
         diag("dns_redirect", redir ? "ok" : "fail",
              redir ? "запросы DNS заворачиваются на ядро steer"
                    : "запросы DNS на ядро steer не заворачиваются",
@@ -999,7 +993,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
                 snprintf(what, sizeof(what),
                          "выход %.40s: все узлы-кандидаты (%d) исключены", sp->out[i].name, pr.total);
                 snprintf(why, sizeof(why),
-                         "exclude и exclude_name не оставили ни одного узла — уберите часть "
+                         "exclude, exclude_name и only не оставили ни одного узла — уберите часть "
                          "исключений или возьмите другой узел");
                 diag("output", "fail", what, why);
                 continue;
@@ -1021,7 +1015,7 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
                 else
                     snprintf(why, sizeof(why),
                              "подписка скачана, но узлов нужного вида в ней нет; проверьте "
-                             "ссылку и поддержку vless/reality у поставщика");
+                             "ссылку и протокол узлов у поставщика");
                 diag("output", "fail", what, why);
                 continue;
             }
@@ -1102,6 +1096,8 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
             }
         }
         struct fwcheck c = fw_check(sp->out[i].device);
+        /* Подмену IPv4 ставит само ядро (out_nat4_by_steer) — fw_check свою таблицу не читает. */
+        if (out_nat4_by_steer(out_for_device(sp, &sp->out[i], sp->out[i].device))) c.masqueraded = 1;
         /* Нужен ли masquerade — свойство УСТРОЙСТВА, а не выхода, который его назвал: в пуле
          * kind=interface активным бывает устройство VLESS-туннеля или хаба xsteer, и вопрос
          * решает его владелец. Без этого исправно собранный пул получал бы вечное «нет
@@ -1197,12 +1193,12 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
      *     дописать. */
     diag_v6_host(sp, gr);
 
-    /* 8. Свои проверки видов (kind_ops.diag): обфускация транспорта у interface, обработчик
-     *    очереди и файл стратегии у zapret.
+    /* 8. Свои проверки видов (kind_ops.diag): обфускация транспорта у interface, проверки
+     *    внешних модулей.
      *
      *    Обход — по видам в порядке реестра, а внутри вида — по выходам в порядке спеки. Так
      *    проверки одного вида идут подряд, одним блоком, как шли, пока были секциями этой
-     *    функции (сначала все obfs, потом все zapret), и ответ не зависит от того, в каком
+     *    функции (сначала все obfs, потом все остальные), и ответ не зависит от того, в каком
      *    порядке человек записал выходы разных видов. */
     for (size_t ki = 0; ki < kind_count(); ki++) {
         const struct kind_ops *k = kind_at(ki);

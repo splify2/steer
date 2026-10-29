@@ -1,13 +1,8 @@
 /* Транспорт до узла: сборка ярусов, ввод-вывод связи и транспорт tcp. Ярусы — в transport.h.
  *
- * Переехало из клиента VLESS (client.c) при выделении стека туннеля из протокола (шаг 2
- * выпуска 1.10): прежде соединение с узлом было `struct vless_conn`, и транспорт в нём решался
- * перечислением `enum vless_transport { VT_RAW, VT_GRPC, VT_XHTTP }` с разбором по switch в
- * каждой функции обмена. Теперь транспорт — таблица (struct transport_ops), и новый (ws,
- * httpupgrade) — это новая таблица, а не ещё одна ветка в каждом switch.
- *
- * Поведение не менялось ни в чём: порядок шагов установления, кто и чем закрывается на каждом
- * отказе, ALPN, нулевая копия на tcp — те же. Держат это стенды vlessmatch (ветви отказа под
+ * Транспорт — таблица (struct transport_ops): новый (ws, httpupgrade) — это новая таблица, а не
+ * ещё одна ветка в каждой функции обмена. Порядок шагов установления, кто и чем закрывается на
+ * каждом отказе, ALPN, нулевую копию на tcp держат стенды vlessmatch (ветви отказа под
  * AddressSanitizer), xhupmatch (ответы на выгрузку xhttp) и ext-test на настоящей библиотеке.
  */
 #define _GNU_SOURCE
@@ -26,6 +21,7 @@
 int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
     struct tr_link *l = ctx;
     if (l->plain) {
+        if (l->live) return outq_send(l->fd, &l->oq, d, n) == 0 ? 0 : TR_EIO;
         size_t sent = 0;
         while (sent < n) {
             /* send с MSG_NOSIGNAL, а не write: закрытый узлом сокет — отказ записи (EPIPE), а не
@@ -44,6 +40,19 @@ int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
     return tls13_write(&l->tls, d, n);
 }
 
+/* Прочитать у голого сокета, НЕ ЖДА: данных нет — 0 байт и код 0, как «пока нечего» у tls13_read. Сокет
+ * узла блокирующий и со сроком (trdial.c), и обычный read на пустом ждал бы до его конца — восьми секунд
+ * на весь цикл туннеля. Поэтому цикл (stack.c, drain_conn_reads) прежде каждого чтения спрашивал poll;
+ * теперь чтение само не ждёт, и спрашивать незачем: один вызов вместо двух на каждое чтение у узла. */
+int tr_sock_read(int fd, unsigned char *d, size_t cap, size_t *got) {
+    *got = 0;
+    ssize_t r = recv(fd, d, cap, MSG_DONTWAIT);
+    if (r > 0) { *got = (size_t)r; return 0; }
+    if (r == 0) return TR_ECLOSED;
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
+    return TR_EIO;
+}
+
 int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
     struct tr_link *l = ctx;
     /* Прямое копирование: сервер перестал шифровать в нашу сторону, и расшифровывать
@@ -57,16 +66,30 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
         size_t pending = tls13_take_pending(&l->tls, d, cap);
         if (pending) { *got = pending; return 0; }
     }
-    if (l->plain || l->rx_direct) {
-        ssize_t r = read(l->fd, d, cap);
-        if (r <= 0) return r == 0 ? TR_ECLOSED : TR_EIO;
-        *got = (size_t)r;
-        return 0;
-    }
+    if (l->plain || l->rx_direct) return tr_sock_read(l->fd, d, cap, got);
     return tls13_read(&l->tls, d, cap, got);
 }
 
+void tr_link_live(struct tr_link *l) {
+    l->live = 1;
+    l->tls.live = 1;
+}
+
+size_t tr_link_pending(const struct tr_link *l) {
+    return outq_pending(l->plain ? &l->oq : &l->tls.oq);
+}
+
+int tr_link_flush(struct tr_link *l) {
+    if (l->fd < 0) return -1;
+    return l->plain ? outq_flush(l->fd, &l->oq) : outq_flush(l->tls.fd, &l->tls.oq);
+}
+
 void tr_link_close(struct tr_link *l) {
+    /* Последнее слово, без ожидания: ws шлёт при закрытии кадр close, и в живом режиме он мог остаться в
+     * очереди. Не ушёл — не страшно, закрытие сокета скажет то же. */
+    if (l->fd >= 0 && l->live && tr_link_pending(l)) (void)tr_link_flush(l);
+    outq_free(&l->oq);
+    l->live = 0;
     if (l->fd >= 0) close(l->fd);
     l->fd = -1;
     /* Контексты шифров живут в куче: без освобождения туннель за час работы утекает на
@@ -176,14 +199,36 @@ int transport_write(struct transport *t, const unsigned char *d, size_t n) {
     return t->fr->write(t, d, n);
 }
 
-long transport_room(struct transport *t) {
-    if (!t->fr || !t->fr->room) return -1;
-    long r = t->fr->room(t);
-    /* Шифрование VLESS оборачивает каждую запись в запись AEAD: длина и метка. Берём запас, а не
-     * точную надбавку: она зависит от того, как данные разбиты на записи. */
-    if (t->enc) r -= r / 32 + 64;
-    return r > 0 ? r : 0;
+int transport_big_write(const struct transport *t) {
+    return !t->enc && t->fr && t->fr->big_write && t->fr->big_write(t);
 }
+
+long transport_room(struct transport *t) {
+    long r = -1;
+    if (t->fr && t->fr->room) {
+        r = t->fr->room(t);
+        /* Шифрование VLESS оборачивает каждую запись в запись AEAD: длина и метка. Берём запас, а не
+         * точную надбавку: она зависит от того, как данные разбиты на записи. */
+        if (t->enc) r -= r / 32 + 64;
+        if (r < 0) r = 0;
+    }
+    /* Обратное давление живой записи (I-534): узел не успевает принимать — очередь связи растёт, и пока
+     * в ней TR_OUT_HIWAT байт и больше, новых данных клиента не берём. Окно клиента от этого сужается само
+     * (conn_room), а чтение его сокета ждёт события записи узла. */
+    size_t p = tr_link_pending(&t->link);
+    if (p) {
+        long cap = p >= TR_OUT_HIWAT ? 0 : (long)(TR_OUT_HIWAT - p);
+        if (r < 0 || cap < r) r = cap;
+    }
+    return r;
+}
+
+void transport_live(struct transport *t) {
+    tr_link_live(&t->link);
+    if (t->fr && t->fr->live) t->fr->live(t);
+}
+size_t transport_out_pending(const struct transport *t) { return tr_link_pending(&t->link); }
+int transport_out_flush(struct transport *t) { return tr_link_flush(&t->link); }
 
 int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     *got = 0;
@@ -235,6 +280,11 @@ int transport_aux_fd(const struct transport *t) {
 int transport_aux_drain(struct transport *t) {
     if (!t->fr || !t->fr->aux_drain) return -1;
     return t->fr->aux_drain(t);
+}
+
+size_t transport_aux_pending(const struct transport *t) {
+    if (!t->fr || !t->fr->aux_pending) return 0;
+    return t->fr->aux_pending(t);
 }
 
 void transport_moved(struct transport *t) {

@@ -33,6 +33,15 @@ int fog_manual_pick(const struct spec *sp, struct fo_store *st, const struct out
 int fog_pick_known(const struct spec *sp, struct fo_store *st, const struct output *g,
                    const unsigned char *alive, int cur);
 
+/* СТРАНА ЧЛЕНА ГРУППЫ: фактическая (geo_cc) или, пока проверки выхода не было, заявленная именем узла
+ * (node_cc) из файла состояния туннеля-члена, то есть страна ЖИВОГО узла — она меняется вместе с
+ * узлом. 1 — известна, cc — две буквы; 0 — члена нет среди туннелей, его процесс не жив или у узла
+ * страны нет. */
+int fog_member_cc(const struct output *m, char cc[3]);
+/* Берёт ли страна члена `only` и `exclude` группы go: без этих ключей — всегда; член без известной
+ * страны не берётся при `only` и берётся при одном `exclude`. */
+int fog_cc_allowed(const struct output *go, const struct output *m);
+
 /* balance: привести карты всех групп pick: balance в ядре к живым членам по состоянию подхвата
  * (group_cfg.alive, outputs_adopt_active_st). Зовёт apply после загрузки набора правил: тот
  * ставит карту «все члены живы». */
@@ -50,10 +59,12 @@ int fog_idle(const struct spec *sp, const struct output *g, int limit, fo_traffi
  * сторож ещё не встречал. */
 int fog_idle_now(const char *group);
 
-/* balance: привести карту группы в ядре к живым членам alive (байт на члена: 1 — жив). По факту в ядре, а
- * не по памяти: apply ставит карту со всеми членами, и сверка обязана это заметить. 1 — карта
- * переписана; 0 — уже такая; -1 — карты нет или ядро отказало (сказано в журнале один раз). */
-int fog_balance_sync(const struct spec *sp, const struct output *g, const unsigned char *alive);
+/* Группа с картой (group_carded): привести карту в ядре к живым членам alive (balance; байт на члена:
+ * 1 — жив) или к текущему члену cur (закрепляющие order/latency; -1 — никого, карта пуста). По факту в
+ * ядре, а не по памяти: apply ставит карту со всеми членами (у order/latency — на первого), и сверка
+ * обязана это заметить. 1 — карта переписана; 0 — уже такая; -1 — карты нет или ядро отказало
+ * (сказано в журнале один раз). */
+int fog_balance_sync(const struct spec *sp, const struct output *g, const unsigned char *alive, int cur);
 
 /* Запись `groups` прохода: по группе — выбранный член (или «-») и живые члены. Пишется только
  * при изменении текста (тот же довод про флеш, что у active_save). cur[i] — номер члена группы

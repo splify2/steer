@@ -1,6 +1,6 @@
 /* Запрос Upgrade по HTTP/1.1 — общий у ws и httpupgrade — и транспорт httpupgrade.
  *
- * Верхний ярус транспорта (transport.h), шаг 5 выпуска 1.10. Оба транспорта начинаются одним и тем
+ * Верхний ярус транспорта (transport.h). Оба транспорта начинаются одним и тем
  * же: GET с `Connection: Upgrade` и `Upgrade: websocket`, ответ 101 — и расходятся после него. У
  * ws дальше кадры (trws.c), у httpupgrade — поток как есть: это «апгрейд без WebSocket», который
  * Xray и sing-box завели ради посредников (CDN), пропускающих только запросы, похожие на
@@ -737,9 +737,8 @@ static int hu_read_wait(struct transport *t, unsigned char *d, size_t cap, size_
     const unsigned char *in = d;
     size_t n = 0;
     if (t->link.plain) {
-        ssize_t k = read(t->link.fd, d, cap);
-        if (k <= 0) return k == 0 ? TR_ECLOSED : TR_EIO;
-        n = (size_t)k;
+        int rc = tr_sock_read(t->link.fd, d, cap, &n);
+        if (rc) return rc;
     } else {
         int rc = tls13_read_ref(&t->link.tls, &in, &n);
         if (rc) return rc;

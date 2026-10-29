@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "domain": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 127,
+      "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$",
+      "x-example": "tg.example"
+    }
+  },
+  "required": [
+    "domain"
+  ],
+  "additionalProperties": false
+}

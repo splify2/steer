@@ -12,7 +12,6 @@
 #include "sublink.h"
 #include "stack.h"
 #include "pool.h"
-#include "spec.h"
 
 const struct dialer_ops *px_dialer_for(enum px_proto p) {
     switch (p) {
@@ -114,7 +113,7 @@ out:
 
 /* ---- подъём -------------------------------------------------------------------------------- */
 
-int px_tunnel_run(struct output *o, const struct pool_cfg *pc,
+int px_tunnel_run(const struct tun_out *o, const struct pool_cfg *pc,
                   void (*ready)(void *arg, const char *dev), void *arg) {
     const struct px_node *node = (const struct px_node *)pc->nodes + pc->first;
     if (!pc->proto->ops) {

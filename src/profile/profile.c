@@ -15,10 +15,6 @@ const struct profile *prof(void) {
     if (!g_prof_ready) {
         if (&steer_profile) g_prof = steer_profile;
         if (!g_prof.build) g_prof.build = "базовая сборка";
-        /* Полный движок берёт таблицы с 300 (300 плюс место в реестре, model/registry.c), мост — порты от 8480. */
-        if (!g_prof.table_base) g_prof.table_base = 300;
-        if (!g_prof.rt_tables_file) g_prof.rt_tables_file = "steer.conf";
-        if (!g_prof.tgws_port_base) g_prof.tgws_port_base = 8480;
         g_prof_ready = 1;
     }
     return &g_prof;

@@ -18,7 +18,7 @@
 struct http_sess {
     uint8_t established;
     uint16_t pend_off, pend_n;   /* байты цели, пришедшие вместе с ответом 200 (pend) */
-    uint32_t dst; uint16_t dport;
+    uint8_t dst[16]; uint8_t v6; uint16_t dport;
     struct transport t;
     unsigned char pend[HT_RESP_MAX];
 };
@@ -26,7 +26,7 @@ struct http_sess {
 static const char *ht_peer(const void *ctx) { return ((const struct px_node *)ctx)->vn.host; }
 static void ht_describe(const void *ctx, char *out, size_t n) {
     const struct px_node *nd = ctx;
-    snprintf(out, n, "%s (%s:%u http/%s)", nd->name, nd->vn.host, nd->vn.port, nd->vn.security);
+    snprintf(out, n, "%s (%s:%u http/%s)", nd->name, vless_host_fmt(nd->vn.host).s, nd->vn.port, nd->vn.security);
 }
 
 static void ht_clear(void *sess) {
@@ -46,7 +46,8 @@ static int ht_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
                     ((const struct px_node *)ctx)->name); }
         return -1;
     }
-    s->dst = k->dst;
+    s->v6 = k->v6;
+    memcpy(s->dst, flow_dst_bytes(k), flow_alen(k));
     s->dport = k->dport;
     return 0;
 }
@@ -69,14 +70,19 @@ static size_t b64enc(const unsigned char *in, size_t n, char *out) {
 
 /* Рукопожатие CONNECT: собрать запрос, прочитать ответ до конца заголовков, проверить «200». */
 static int http_connect(const struct px_node *n, struct http_sess *s, int timeout_s) {
-    char ip[INET_ADDRSTRLEN];
-    struct in_addr a = { .s_addr = s->dst };
-    inet_ntop(AF_INET, &a, ip, sizeof ip);
+    char ip[INET6_ADDRSTRLEN + 2];
+    if (s->v6) {                         /* у IPv6 в CONNECT и Host адрес — в скобках (RFC 9110, 7.2) */
+        ip[0] = '[';
+        inet_ntop(AF_INET6, s->dst, ip + 1, sizeof ip - 2);
+        strcat(ip, "]");
+    } else {
+        inet_ntop(AF_INET, s->dst, ip, sizeof ip);
+    }
     /* Буфер — под самые длинные имя и пароль узла: строка CONNECT (до 70 знаков), Basic от
      * «имя:пароль» (до 4/3 от PX_USER_MAX + PX_PASS_MAX) и обрамление. Прежние 512 не вмещали
      * длинный Basic, а длина снова прибавлялась к rl — следующий snprintf писал за буфер. */
     char cred[PX_USER_MAX + PX_PASS_MAX + 2], b64[((PX_USER_MAX + PX_PASS_MAX + 2) * 4) / 3 + 8];
-    char req[128 + sizeof b64];
+    char req[192 + sizeof b64];
     b64[0] = '\0';
     if (n->user[0]) {
         int cl = snprintf(cred, sizeof cred, "%s:%s", n->user, n->pass);
@@ -173,6 +179,22 @@ static int ht_deliver(const void *ctx, void *sess, int udp, const unsigned char 
     return got ? emit(arg, rx, got) : 0;
 }
 
+/* Место у узла: у голого транспорта предела нет, пока очередь живой записи не набралась (обратное давление, I-534). */
+static long ht_room(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_room(&((struct http_sess *)sess)->t);
+}
+/* Живая запись (dialer_ops.live, out_pending, out_flush; I-534). */
+static void ht_live(void *sess) { transport_live(&((struct http_sess *)sess)->t); }
+static size_t ht_out_pending(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_out_pending(&((struct http_sess *)sess)->t);
+}
+static int ht_out_flush(const void *ctx, void *sess) {
+    (void)ctx;
+    return transport_out_flush(&((struct http_sess *)sess)->t);
+}
+
 const struct dialer_ops proxy_http_dialer = {
     .name = "http",
     .caps = 0,
@@ -182,4 +204,5 @@ const struct dialer_ops proxy_http_dialer = {
     .fd = ht_fd, .has_data = ht_has_data,
     .flow_open = ht_flow_open, .send = ht_send, .dgram_frame = ht_dgram_frame,
     .read = ht_read, .deliver = ht_deliver,
+    .room = ht_room, .live = ht_live, .out_pending = ht_out_pending, .out_flush = ht_out_flush,
 };

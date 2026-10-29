@@ -86,6 +86,21 @@ PSK32=$(head -c32 /dev/urandom | base64)
 IPSK=$(head -c16 /dev/urandom | base64)
 UPSK=$(head -c16 /dev/urandom | base64)
 
+# Шифр «none» у сервера ss: живёт не во всякой сборке Xray (в 26.9.9 и 26.10.21 его нет — конфиг не
+# грузится целиком: «unknown cipher method: none», и тогда падает ВЕСЬ стенд, а не один случай).
+# Спрашиваем у самого сервера минимальным конфигом `run -test`: принял — вход ставим, нет — вход
+# выпускаем из конфига, а случай пропускаем громко (ниже). Клиент не трогаем: провал других
+# протоколов от этого не глушится.
+SSN_IN=""; SSN_OK=0
+cat > "$W/n.json" <<EOF
+{"inbounds":[{"listen":"127.0.0.1","port":$SSN,"protocol":"shadowsocks","settings":{"method":"none","password":"x","network":"tcp,udp"}}],
+ "outbounds":[{"protocol":"freedom"}]}
+EOF
+if "$XRAY" run -test -c "$W/n.json" >"$W/n.log" 2>&1; then
+	SSN_OK=1
+	SSN_IN=' {"listen":"127.0.0.1","port":'$SSN',"protocol":"shadowsocks","settings":{"method":"none","password":"x","network":"tcp,udp"}},'
+fi
+
 cat > "$W/x.json" <<EOF
 {"log":{"loglevel":"warning"},"inbounds":[
  {"listen":"127.0.0.1","port":$TR,"protocol":"trojan","settings":{"clients":[{"password":"tp"}]},
@@ -94,7 +109,7 @@ cat > "$W/x.json" <<EOF
  {"listen":"127.0.0.1","port":$SS22,"protocol":"shadowsocks","settings":{"method":"2022-blake3-aes-128-gcm","password":"$PSK16","network":"tcp,udp"}},
  {"listen":"127.0.0.1","port":$SS22C,"protocol":"shadowsocks","settings":{"method":"2022-blake3-chacha20-poly1305","password":"$PSK32","network":"tcp,udp"}},
  {"listen":"127.0.0.1","port":$SSMU,"protocol":"shadowsocks","settings":{"method":"2022-blake3-aes-128-gcm","password":"$IPSK","clients":[{"password":"$UPSK","email":"u@x"}],"network":"tcp,udp"}},
- {"listen":"127.0.0.1","port":$SSN,"protocol":"shadowsocks","settings":{"method":"none","password":"x","network":"tcp,udp"}},
+$SSN_IN
  {"listen":"127.0.0.1","port":$SK,"protocol":"socks","settings":{"auth":"password","accounts":[{"user":"su","pass":"sp"}],"udp":true,"ip":"127.0.0.1"}},
  {"listen":"127.0.0.1","port":$SK4,"protocol":"socks","settings":{"auth":"noauth","udp":false}},
  {"listen":"127.0.0.1","port":$HT,"protocol":"http","settings":{"accounts":[{"user":"hu","pass":"hp"}]}},
@@ -106,6 +121,7 @@ EOF
 "$XRAY" run -c "$W/x.json" >"$W/x.log" 2>&1 &
 PIDS="$PIDS $!"
 sleep 2
+XVER=$("$XRAY" version 2>/dev/null | awk 'NR==1{print $2}')
 echo "proxy: сервер — $("$XRAY" version 2>/dev/null | head -1)"
 
 vmess_url() { # порт net path scy
@@ -114,7 +130,7 @@ vmess_url() { # порт net path scy
 	printf 'vmess://%s' "$(printf '%s' "$json" | base64 | tr -d '\n')"
 }
 
-FAILS=0
+FAILS=0; SKIPS=0
 run() { # название ссылка tcp|udp порт
 	if out=$(timeout 30 "$PROBE" "$2" "$3" 127.0.0.1 "$4" 3 2>&1); then
 		echo "  ok   $1"
@@ -136,8 +152,13 @@ else
 fi
 run "ss 2022-chacha tcp"    "ss://2022-blake3-chacha20-poly1305:$PSK32@localhost:$SS22C" tcp $HP
 run "ss 2022 multiuser tcp" "ss://2022-blake3-aes-128-gcm:$IPSK:$UPSK@localhost:$SSMU" tcp $HP
-run "ss none tcp"           "ss://none:x@localhost:$SSN" tcp $HP
-run "ss none udp"           "ss://none:x@localhost:$SSN" udp $UP
+if [ $SSN_OK = 1 ]; then
+	run "ss none tcp"           "ss://none:x@localhost:$SSN" tcp $HP
+	run "ss none udp"           "ss://none:x@localhost:$SSN" udp $UP
+else
+	echo "  пропуск: Xray $XVER не умеет ss none (сервер не принимает шифр; остальные случаи идут)"
+	SKIPS=$((SKIPS + 1))
+fi
 run "socks5 tcp"            "socks5://su:sp@localhost:$SK" tcp $HP
 run "socks5 udp"            "socks5://su:sp@localhost:$SK" udp $UP
 run "socks4 tcp"            "socks4://localhost:$SK4" tcp $HP
@@ -160,4 +181,5 @@ run_up "socks5 tcp: 4 МБ под давлением" "socks5://localhost:$SINK"
 run_up "ss aes-256-gcm tcp: 4 МБ под давлением" "ss://aes-256-gcm:sspass@localhost:$SS"
 run_up "http tcp: 4 МБ под давлением" "http://hu:hp@localhost:$HT"
 
+[ "$SKIPS" = 0 ] || echo "proxy: пропущено случаев: $SKIPS (см. «пропуск» выше — это не падение, но и не зелёное)"
 [ $FAILS = 0 ] && echo "proxy: все проверки прошли" || { echo "proxy: провалов: $FAILS"; sed -n '1,30p' "$W/x.log"; exit 1; }

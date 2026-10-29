@@ -6,7 +6,6 @@ build/steer
 build/steer-*
 build/steerd
 build/steerd-*
-build/libmbed-*.a
 # Разделяемая раскладка (шаг 4 выпуска 1.10): выход build/build-libs.sh по архитектурам, временные
 # объекты списков экспорта и хостовая сборка стенда tests/libs-test.sh.
 build/libs/
@@ -20,16 +19,17 @@ build/scripts/
 out/
 build/sing-box
 build/bench-*
-build/cstorm-*
-build/hget-*
-build/res-*
-build/tmo-*
 build/tun-gso-*
 build/gcm-size
 # Собранные стенды `make test`, которым Makefile велит лежать в build/. Один из них
 # (build/dcmatch) однажды уехал в репозиторий вместе с правкой моста и с тех пор
 # менялся в каждом коммите, который трогал tgws.c: собранный файл в истории — это
 # бинарный дифф на ровном месте и лишний повод для конфликта (I-237).
+build/httpmatch
+build/httpsget
+build/sigmatch
+build/tarmatch
+build/tarmatch-real
 build/dcmatch
 build/msgsplitmatch
 build/warmmatch
@@ -58,16 +58,23 @@ build/awgmatch-android
 build/irmatch
 build/srsunit
 build/modelmatch
+build/pluginmodel
 build/irmatch-android
 build/xswirematch
 build/xsstreammatch
 build/xsepochmatch
 build/tungromatch
+build/spscmatch
+build/spscmatch-tsan
+build/tunsteermatch
+build/.tsanprobe
 build/tunnelmatch
 build/xhupmatch
 build/grpcmatch
 build/wsmatch
 build/tls13readmatch
+build/outqmatch
+build/certrootsmatch
 build/tunnamematch
 build/xsconfmatch
 build/xsroutematch
@@ -95,6 +102,7 @@ build/ngtcp2-host/
 build/qcbench
 build/qcbrutal
 build/qcloop
+build/qcbatch
 build/qcserver
 # Архивы wolfSSL под цели сборки (build/build-ext.sh, build/bench.sh, рецепт SDK)
 build/wolfssl-obj/
@@ -121,6 +129,9 @@ build/platmatch
 build/ndk/
 build/ndk-*.log
 build/nftvmap-tool
+build/nftdump-tool
+build/rtnl-tool
+build/procscanmatch
 build/urltestmatch
 build/nftvmapmatch
 build/groupsmatch
@@ -129,7 +140,6 @@ build/groupsmatch
 # с d278b90).
 build/hub-*/
 build/obfs-*/
-build/uprobe-*
 build/xsconnmatch
 build/xslinkmatch
 # Стенды make test и ext-test, которых в списке не было (дерево после прогона оставалось грязным).
@@ -145,4 +155,20 @@ build/subpq
 build/vencprobe
 build/xudpprobe
 build/trdialmatch
+build/warpmatch
 build/urltlsmatch
+build/abihost
+build/abihost-static
+# Раскладка 2.1: стадии архивов .s2p, тестовый ключ подписи (build/pack-s2p.sh) и журналы.
+build/s2p-stage/
+build/s2p-testkey/
+build/*-s2p.log
+build/libs-host20/
+build/libs-host20.log
+build/libs-test-*.log
+build/libs-plug/
+build/libs20-*/
+build/libs20-*.log
+build/build-*.log
+build/pkhooks
+build/pkmatch
