@@ -535,6 +535,16 @@ def window_rate(t_from):
     return (sum(w), len(w))
 
 
+def window_errors(t_from):
+    """Отказы проб окна: {ошибка: [секунды стенда]} — чтобы провал ровного участка было с чем разбирать."""
+    errs = {}
+    with lock:
+        for (t, ok, e) in probes:
+            if t >= t_from and not ok:
+                errs.setdefault(e, []).append(round(t))
+    return errs
+
+
 def main():
     set_hosts(A.ip_a)
     xray_start()
@@ -588,6 +598,7 @@ def main():
         log("ровный участок: проб %d/%d, счётчики %s, процесс %s" % (ok, n, json.dumps(stats), mon[-1] if mon else "-"))
         if n and ok < n * 0.95:
             verdict.append("%s: ровный участок после — проб %d/%d" % (name, ok, n))
+            log("отказы проб ровного участка:", window_errors(t1))
 
     # Конец: нагрузку остановить, клиентские соединения закрыть, дать туннелю убрать за собой.
     stop.set()
