@@ -218,6 +218,22 @@ void transport_set_sock_mark(uint32_t mark, int required) {
     g_sock_mark_req = mark && required;
 }
 
+/* Подготовка сокета хостом — см. transport.h. */
+static transport_socket_prepare_fn g_sock_prepare;
+static void *g_sock_prepare_ctx;
+
+void transport_set_socket_prepare(transport_socket_prepare_fn fn, void *ctx) {
+    g_sock_prepare = fn;
+    g_sock_prepare_ctx = ctx;
+}
+
+/* 0 — сокет годен; -1 — хост отказал, и сокет уже закрыт. */
+static int sock_prepare(int fd) {
+    if (!g_sock_prepare || g_sock_prepare(g_sock_prepare_ctx, fd) == 0) return 0;
+    close(fd);
+    return -1;
+}
+
 /* ВЫХОД-ЦЕЛЬ (`via`) — ТОЛЬКО IPv4. Метка сокета ведёт пакет в таблицу цели правилом `ip rule fwmark`,
  * а у движка это правило (и маршрут по умолчанию в таблице выхода) для IPv6 у целей без IPv6 (vless,
  * xsteer, прокси) нет: сокет IPv6 с той же меткой ушёл бы по обычным правилам, то есть НАПРЯМУЮ, мимо
@@ -242,6 +258,7 @@ static int attempt_start(const struct tr_addr *ip, int *done) {
     if (via_forbids(ip)) return -1;
     int fd = socket(ip->ss.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
+    if (sock_prepare(fd) != 0) return -1;
     /* До connect(): маршрут, а с ним устройство и адрес источника, ядро выбирает там — по
      * метке, то есть по таблице выхода-цели. */
     if (steer_sock_mark(fd, g_sock_mark) != 0 && g_sock_mark_req) {
@@ -401,6 +418,7 @@ int tr_dial_udp(const char *host, uint16_t port) {
         if (via_forbids(&addr[i])) continue;
         int fd = socket(addr[i].ss.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) { err = TR_ESOCK; continue; }
+        if (sock_prepare(fd) != 0) return TR_ESOCK;
         if (steer_sock_mark(fd, g_sock_mark) != 0 && g_sock_mark_req) {
             close(fd);
             return TR_ESOCK;
