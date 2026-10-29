@@ -127,6 +127,18 @@ static int queue_rx_gso(int fd) {
     return ioctl(fd, TUNSETOFFLOAD, feat) == 0 ? 0 : -1;
 }
 
+int tun_adopt_fd(struct tun_dev *d, int fd) {
+    int copy = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0) {
+        fprintf(stderr, "steer[warn] tunnel: устройство хоста (дескриптор %d) не взялось: %s\n", fd,
+                strerror(errno));
+        return TUN_ESETUP;
+    }
+    memset(d, 0, sizeof(*d));
+    d->fd = copy;
+    return 1;
+}
+
 int tun_open(struct tun_dev *d, int max_queues, const char *name) {
     /* IFF_NO_PI: без 4-байтного префикса протокола. Он нужен только тому, кто хочет
      * различать семейства на одном устройстве, а у нас IPv4 и разбор всё равно по

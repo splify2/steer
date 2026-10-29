@@ -3951,7 +3951,10 @@ static void stack_setup(const struct dialer *d) {
     for (int i = 0; i < SPARE_MAX; i++) g_spares[i].sess = m + (size_t)i * g_sess_stride;
 }
 
-int stack_run(const struct tun_out *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
+/* host_fd < 0 — устройство заводит и поднимает сам стек (stack_run); иначе это готовый TUN хоста
+ * (stack_run_fd), и ни очередей, ни адреса, ни программы раздачи стек не трогает. */
+static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack_ready_fn ready, void *arg,
+                          int host_fd) {
     const char *dev = o->device;
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     g_stats = getenv("STEER_TUN_STATS") != NULL;
@@ -3992,14 +3995,16 @@ int stack_run(const struct tun_out *o, const struct dialer *d, stack_ready_fn re
     g_workers_plan = want;
     struct tun_dev *qs = calloc((size_t)want, sizeof(*qs));
     if (!qs) { fprintf(stderr, LOG_W "нет памяти под очереди устройства\n"); return 1; }
-    int nq = tun_open(qs, want, dev);
+    int nq = host_fd >= 0 ? tun_adopt_fd(qs, host_fd) : tun_open(qs, want, dev);
     /* Код выхода — ОДИН, и он положительный. Возвращая сюда -40 или -41, движок отдавал
      * их main, а тот отдавал ядру: отрицательное обрезается до байта, и procd получал 216
      * или 215. Число, которое ничего не значит ни для человека, ни для splify2. Причину
      * называет tun_open своим сообщением, здесь остаётся признак отказа. */
     if (nq < 0) return 1;
     char steer_why[256] = "";
-    if (want > 1 && nq < 2)
+    if (want > 1 && host_fd >= 0)
+        snprintf(steer_why, sizeof(steer_why), "устройство дал хост, очередь у него одна");
+    else if (want > 1 && nq < 2)
         snprintf(steer_why, sizeof(steer_why), "ядро не дало нескольких очередей (IFF_MULTI_QUEUE)");
     else if (want > 1 && tun_steer_attach(qs[0].fd, (unsigned)nq, steer_why, sizeof(steer_why)) == 0)
         g_steered = 1;
@@ -4017,7 +4022,7 @@ int stack_run(const struct tun_out *o, const struct dialer *d, stack_ready_fn re
         int fl = fcntl(qs[i].fd, F_GETFL, 0);
         if (fl >= 0) fcntl(qs[i].fd, F_SETFL, fl | O_NONBLOCK);
     }
-    tun_bring_up(dev, o->table);
+    if (host_fd < 0) tun_bring_up(dev, o->table);   /* устройство хоста: адрес и маршруты — его */
     /* Слушатель TCP — до up: с up демон начнёт перенаправлять сюда TCP выхода. Порт занят (чужая служба,
      * второй экземпляр с другой спекой) — выхода без слушателя не бывает: перенаправление отдало бы
      * соединения тому, кто на порту, или сбросу. Модуль выходит, супервизор повторит по паузе. */
@@ -4193,4 +4198,16 @@ int stack_run(const struct tun_out *o, const struct dialer *d, stack_ready_fn re
         fprintf(stderr, LOG_W "%s больше не несёт трафик — все потоки (%d) "
                         "завершились\n", dev, n);
     return 1;
+}
+
+int stack_run(const struct tun_out *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
+    return stack_run_impl(o, d, ready, arg, -1);
+}
+
+int stack_run_fd(const struct tun_out *o, const struct dialer *d, int fd, stack_ready_fn ready, void *arg) {
+    if (fd < 0) {
+        fprintf(stderr, LOG_W "%s: дескриптор устройства от хоста не задан (%d)\n", o->device, fd);
+        return 1;
+    }
+    return stack_run_impl(o, d, ready, arg, fd);
 }

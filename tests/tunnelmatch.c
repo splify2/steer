@@ -2931,6 +2931,24 @@ static size_t own_pkt(unsigned char *p, uint32_t src, uint32_t dst, unsigned pro
     return hl + pay;
 }
 
+/* По PR #11: устройство хоста (tun_adopt_fd) — копия с FD_CLOEXEC, без разгрузок; оригинал хоста не
+ * закрывается. */
+static void t_tun_adopt(void) {
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0) { check(0, "устройство хоста: пара сокетов"); return; }
+    struct tun_dev d;
+    memset(&d, 0x5a, sizeof d);
+    int n = tun_adopt_fd(&d, sp[0]);
+    int fl = n == 1 ? fcntl(d.fd, F_GETFD) : -1;
+    check(n == 1 && d.fd != sp[0] && fl >= 0 && (fl & FD_CLOEXEC) && !d.gso && !d.gro && !d.rx_gso && !d.rx,
+          "устройство хоста: копия дескриптора с FD_CLOEXEC, разгрузки выключены");
+    if (n == 1) close(d.fd);
+    check(fcntl(sp[0], F_GETFD) >= 0 && write(sp[1], "x", 1) == 1 && recv(sp[0], &fl, sizeof fl, MSG_DONTWAIT) == 1,
+          "  дескриптор хоста после закрытия копии жив");
+    close(sp[0]); close(sp[1]);
+    check(tun_adopt_fd(&d, -1) == TUN_ESETUP, "устройство хоста: негодный дескриптор — TUN_ESETUP");
+}
+
 static void t_owner(void) {
     static unsigned char p[2048];
     int ok = 1;
@@ -3943,6 +3961,7 @@ int main(void) {
     g_now_s = (time_t)(g_now_ns / 1000000000ull);
 
     t_no_connectors();
+    t_tun_adopt();
     t_connectors_burst();
     t_race();
     t_tun_wq();
