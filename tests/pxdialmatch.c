@@ -658,31 +658,54 @@ static void test_udp_partial(const char *who, const struct dialer_ops *ops, stru
 }
 
 /* socks5: ответ авторизации — версия 1 (RFC 1929), а не 5; пароль принят только при 01 00. */
-static int socks_auth_try(unsigned char ver, unsigned char status) {
+static int g_sock_wrote;
+static int socks_try_rep(const unsigned char *rep, size_t rep_n, int with_user) {
     const struct dialer_ops *ops = &proxy_socks_dialer;
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return -999;
-    unsigned char rep[] = { 5, 2, ver, status, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };   /* выбор метода, авторизация, ответ CONNECT */
-    if (write(sp[1], rep, sizeof rep) != (ssize_t)sizeof rep) return -999;
+    if (write(sp[1], rep, rep_n) != (ssize_t)rep_n) return -999;
     g_tcp_fd = sp[0];
     struct px_node n; memset(&n, 0, sizeof n);
     n.proto = PX_SOCKS; n.socks_ver = 5;
-    snprintf(n.user, sizeof n.user, "u"); snprintf(n.pass, sizeof n.pass, "p");
+    if (with_user) { snprintf(n.user, sizeof n.user, "u"); snprintf(n.pass, sizeof n.pass, "p"); }
     void *sess = calloc(1, ops->sess_size);
     ops->clear(sess);
     struct flow_key k; memset(&k, 0, sizeof k);
     ops->flow_open(&n, sess, &k, 0);
     int rc = ops->connect(&n, sess, 2);
     ops->close(sess); free(sess);
+    /* Что клиент успел написать серверу сверх приветствия: у узла без имени — ни байта авторизации. */
+    unsigned char got[64];
+    ssize_t gn = read(sp[1], got, sizeof got);
+    g_sock_wrote = gn > 0 ? (int)gn : 0;
     close(sp[1]);
     g_tcp_fd = -1;
     return rc;
+}
+
+/* Выбор метода, авторизация, ответ CONNECT. */
+static int socks_auth_try_n(unsigned char method, unsigned char ver, unsigned char status, int with_user) {
+    unsigned char rep[] = { 5, method, ver, status, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+    return socks_try_rep(rep, sizeof rep, with_user);
+}
+
+static int socks_auth_try(unsigned char ver, unsigned char status) {
+    return socks_auth_try_n(2, ver, status, 1);
 }
 
 static void test_socks(void) {
     check("socks5: авторизация 01 00 принята", 0, socks_auth_try(1, 0));
     check("socks5: ответ авторизации с чужой версией (00 00) — PX_EPROTO", PX_EPROTO, socks_auth_try(0, 0));
     check("socks5: ответ 01 01 — отказ пароля", PX_EAUTH, socks_auth_try(1, 1));
+    /* Узел без имени предложил только 00, сервер выбрал 02 — отказ, пустые имя и пароль не уходят
+     * (по PR #21). Ответ 00 на узле с именем — по-прежнему допустим. */
+    check("socks5: без имени, сервер выбрал 02 — PX_EAUTH", PX_EAUTH, socks_auth_try_n(2, 1, 0, 0));
+    check("  на провод ушло только приветствие 05 01 00", 3, g_sock_wrote);
+    check("socks5: ответ FF (ничего не подошло) — PX_EAUTH", PX_EAUTH, socks_auth_try_n(0xFF, 1, 0, 1));
+    {
+        unsigned char rep[] = { 5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };    /* метод 00 и сразу ответ CONNECT */
+        check("socks5: имя задано, сервер выбрал 00 — принято", 0, socks_try_rep(rep, sizeof rep, 1));
+    }
     struct px_node n; memset(&n, 0, sizeof n);
     n.proto = PX_SOCKS; n.socks_ver = 5;
     test_udp_partial("socks", &proxy_socks_dialer, &n);
