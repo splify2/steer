@@ -679,6 +679,10 @@ has "  и говорит, что несовместимо" "несовмести
 check "  после migrate всё сборки B и работает" "B abu 1.0.0 B abv 1.0.0 B" "$(cat root/abl1/lib/libs2p-abl.so.1) $(root/abu/bin/abu) $(root/abv/bin/abv)"
 o="$(STEER_SPEC="$T/mspec0.yaml" P migrate --json 2>/dev/null)"
 check "  повторный migrate ничего не ставит" "[]" "$(printf '%s\n' "$o" | jq_ 'str(d["installed"])')"
+# Установка из файла поверх плагина из репозитория оставляет его репозиторий (pm_inst_set с тем же указателем читал
+# освобождённую память — repo становился пустым, и migrate потом не обновлял такой плагин из семени).
+P install --file adB/abu-1.0.0-all.s2p --json >/dev/null 2>&1
+check "  --file поверх плагина из репозитория: repo тот же" "splify2" "$(jq_ 'd["plugins"]["abu"]["repo"]' < etc/state.json)"
 # Обновление библиотеки из индекса: новая сборка не подходит к стоящим зависимым — они берутся в ту же установку
 # одной группой из своего репозитория.
 mkabl 1.1.0 C; mkabu abu 1.1.0 C; mkabu abv 1.1.0 C
