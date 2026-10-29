@@ -3721,6 +3721,73 @@ static void test_vless_big_up(void) {
     g_send_again_n = 0; g_send_pass = 0;
 }
 
+/* ---- ответ VLESS по кускам (по PR #20 от vnenapravo7-source) -----------------------------------
+ * Заголовок ответа [версия][длина доп][доп] может прийти не одним чтением: первый кусок транспорта
+ * (запись TLS, кадр WebSocket, gRPC или xhttp) режет где угодно. Прежде неполный заголовок считался
+ * чужим ответом, и соединение рвалось. */
+static struct { unsigned char buf[256]; size_t n; int cnt; } g_vr;
+static int vr_emit(void *arg, const unsigned char *d, size_t n) {
+    (void)arg;
+    if (g_vr.n + n <= sizeof g_vr.buf) { memcpy(g_vr.buf + g_vr.n, d, n); g_vr.n += n; }
+    g_vr.cnt++;
+    return 0;
+}
+
+static void t_vless_resp_split(void) {
+    struct vless_response_stream st;
+    size_t skip;
+    /* Сам разбор: по байту, с дополнением из трёх байт; сразу всё; чужая версия на первом байте. */
+    const unsigned char hdr[] = { 0, 3, 0xaa, 0xbb, 0xcc, 'x', 'y' };
+    memset(&st, 0, sizeof st);
+    int bytewise = 1;
+    for (size_t i = 0; i < 4; i++)
+        if (vless_response_feed(&st, hdr + i, 1, &skip) != VLESS_EAGAIN || skip != 1) bytewise = 0;
+    int last = vless_response_feed(&st, hdr + 4, 3, &skip);
+    check(bytewise && last == 0 && skip == 1 && st.done,
+          "VLESS ответ: заголовок с тремя байтами дополнения по байту — ждём, на последнем снят, данные целы");
+    check(vless_response_feed(&st, hdr + 5, 2, &skip) == 0 && skip == 0,
+          "VLESS ответ: после снятого заголовка разбор ничего не съедает");
+    memset(&st, 0, sizeof st);
+    check(vless_response_feed(&st, hdr, sizeof hdr, &skip) == 0 && skip == 5, "VLESS ответ: целиком — 5 байт заголовка");
+    memset(&st, 0, sizeof st);
+    const unsigned char bad[] = { 1, 0 };
+    check(vless_response_feed(&st, bad, 1, &skip) == VLESS_EPROTO, "VLESS ответ: версия не 0 — отказ на первом байте");
+    memset(&st, 0, sizeof st);
+    check(vless_response_feed(&st, hdr, 0, &skip) == VLESS_EAGAIN && skip == 0, "VLESS ответ: пустое чтение — ждём");
+    memset(&st, 0, sizeof st);
+    const unsigned char maxadd[2] = { 0, 255 };
+    unsigned char zeros[255] = { 0 };
+    int r1 = vless_response_feed(&st, maxadd, 2, &skip);
+    int r2 = vless_response_feed(&st, zeros, 254, &skip);
+    int r3 = vless_response_feed(&st, zeros, 255, &skip);
+    check(r1 == VLESS_EAGAIN && r2 == VLESS_EAGAIN && r3 == 0 && skip == 1,
+          "VLESS ответ: дополнение 255 байт двумя кусками — снято ровно, лишнее осталось данными");
+
+    /* Через дайлер: UDP без flow, ответ и две датаграммы [длина(2)][данные], поданные по одному байту. */
+    struct vl_sess *vs = calloc(1, vless_dialer.sess_size);
+    vless_dialer.clear(vs);
+    struct flow_key key;
+    memset(&key, 0, sizeof key);
+    key.proto = 17;
+    g_node.flow[0] = 0;
+    vless_dialer.flow_open(&g_node, vs, &key, 1);
+    const unsigned char wire[] = { 0, 2, 0x11, 0x22, 0, 3, 'a', 'b', 'c', 0, 2, 'd', 'e' };
+    memset(&g_vr, 0, sizeof g_vr);
+    int rc = 0;
+    for (size_t i = 0; i < sizeof wire && !rc; i++)
+        rc = vless_dialer.deliver(&g_node, vs, 1, wire + i, 1, vr_emit, NULL);
+    check(!rc && g_vr.cnt == 2 && g_vr.n == 5 && !memcmp(g_vr.buf, "abcde", 5),
+          "VLESS дайлер: ответ и датаграммы по одному байту — обе датаграммы клиенту, соединение живо");
+    /* Закрытие и новый поток в той же сессии: состояние разбора сброшено, чужая версия — отказ. */
+    vless_dialer.clear(vs);
+    vless_dialer.flow_open(&g_node, vs, &key, 1);
+    const unsigned char badv[] = { 7 };
+    check(vless_dialer.deliver(&g_node, vs, 1, badv, 1, vr_emit, NULL) < 0,
+          "VLESS дайлер: после повторного открытия разбор с нуля, версия 7 — отказ");
+    vless_dialer.clear(vs);
+    free(vs);
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -3773,6 +3840,7 @@ int main(void) {
     t_owner();
     t_owner_mail();
     t_v6();
+    t_vless_resp_split();
     t_udp_big();
     test_vless_big_up();
     if (pool_part() != 0) check(0, "стенд пула: слушатель на петле не завёлся");

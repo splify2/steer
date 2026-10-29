@@ -19,7 +19,7 @@ struct vl_sess {
     /* ---- поток: VLESS и Vision ---- */
     uint8_t header_sent;       /* заголовок запроса VLESS уже ушёл узлу */
     uint8_t established;       /* заголовок ответа VLESS снят */
-    struct vless_response_stream response;
+    struct vless_response_stream response;   /* заголовок ответа, пока не снят целиком (vless_response_feed) */
     /* ---- сборка датаграммы UDP (только у потоков UDP) ----
      *
      * VLESS несёт датаграммы потоком: [длина(2)][данные] и снова. Записи TLS про эти
