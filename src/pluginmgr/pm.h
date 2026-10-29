@@ -242,6 +242,12 @@ struct pm_ctx {
     struct pm_mslot *mc;         /* кэш манифестов команд только чтения (pm_mcache_on): хеш по id */
     size_t mcap, mn;
     int mcache;
+    /* ABI библиотек (pminst.c): ids этой установки (их стоящие копии не пробуются — они и так заменяются);
+     * abi_extend — несовместимых зависимых библиотеки можно взять в ту же установку (индекс, семя), они
+     * копятся в abi_more. */
+    char **tx_ids; size_t ntx;
+    int abi_extend;
+    char **abi_more; size_t nabi_more;
 };
 void pm_progress(struct pm_ctx *x, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
@@ -256,12 +262,20 @@ struct pm_opts {
     int update;                  /* обновление: только из своего репозитория */
     int auto_;                   /* фоновое */
     int group;                   /* весь план одной группой: одна проверка здоровья, откат всей группы */
+    const char *const *files;    /* несколько файлов (--file …): одной группой, библиотеки первыми */
+    size_t nfiles;
+    char *const *reinstall;      /* ставить заново и при той же версии (несовместимы по ABI с библиотекой) */
+    size_t nreinstall;
 };
 struct pm_done { char *id, *version, *from, *old; int updated; };
 struct pm_result { struct pm_done *v; size_t n; char **failed; size_t nfailed; };
 int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const struct pm_opts *o,
                struct pm_result *res, struct pm_err *e);
 int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_err *e);
+/* Стоящие плагины, несовместимые по ABI со стоящими библиотеками (проба программ, pminst.c), кроме skip: их ids
+ * в *bad, библиотеки — в *libs (NULL — не нужны), строка первого отказа — в *first_why (NULL — не нужна; куча). */
+void pm_abi_broken(struct pm_ctx *x, char *const *skip, size_t nskip, char ***bad, size_t *nbad, char ***libs,
+                   size_t *nlibs, char **first_why);
 int pm_set_enabled(struct pm_ctx *x, const char *id, int on, struct pm_err *e);
 void pm_result_free(struct pm_result *r);
 int pm_keepd_write(struct pm_ctx *x);

@@ -81,7 +81,7 @@ static int failc(struct pm_ctx *x, const char *code, const char *const *kv, cons
 }
 
 static int usage(void) {
-    fputs("steer plugin list | search [слово] | status [id] | install <id> [версия] | install --file F [--unsigned]\n"
+    fputs("steer plugin list | search [слово] | status [id] | install <id> [версия] | install --file F [--file F2…] [--unsigned]\n"
           "             | update [id] [--auto] | remove <id> [--force] [--purge] | enable <id> | disable <id>\n"
           "             | autoupdate <id> on|off | repo list | repo add <url> <номер ключа> | repo del <имя>\n"
           "             | ensure <id>... [--pkg ИМЯ] | migrate | job <номер>      (--json — ответ JSON; --job — install/update заданием)\n"
@@ -681,16 +681,19 @@ static void emit_result(struct pm_ctx *x, const struct pm_result *res, const cha
     fputc('\n', stdout);
 }
 
-static int cmd_install(struct pm_ctx *x, const char *id, const char *ver, const char *file, int unsigned_ok) {
+/* files — архивы --file (несколько — одной группой: библиотека и её зависимые встают вместе). */
+static int cmd_install(struct pm_ctx *x, const char *id, const char *ver, const char *const *files, size_t nfiles,
+                       int unsigned_ok) {
     struct pm_opts o = {0};
     struct pm_req rq = { id, ver };
-    o.file = file;
+    o.files = files;
+    o.nfiles = nfiles;
     o.unsigned_ok = unsigned_ok;
     o.allow_bad = ver != NULL;
     o.allow_seed = 1;
     struct pm_result res;
     struct pm_err e = {0};
-    int rc = pm_install(x, &rq, file ? 0 : 1, &o, &res, &e);
+    int rc = pm_install(x, &rq, nfiles ? 0 : 1, &o, &res, &e);
     if (rc != 0) { pm_result_free(&res); return fail_e(x, &e); }
     emit_result(x, &res, NULL, NULL, 0);
     pm_result_free(&res);
@@ -993,18 +996,25 @@ static const char *seed_plugin_for(const struct ynode *plugins, const char *kind
 /* Обновление стоящих плагинов из семени (переход на новое ядро): плагин, поставленный из официального
  * репозитория семени, получает версию семени, если она выше стоящей и подходит этому ядру (compat). Так
  * библиотека net1 1.2.0 доходит до 1.3.0, а плагин, чей steer-api новое ядро не принимает, — до версии,
- * которая принимает. Плагины из файла, из чужих репозиториев и более новые, чем в семени, не трогаются. */
+ * которая принимает. Плагины из файла, из чужих репозиториев и более новые, чем в семени, не трогаются.
+ *
+ * Кроме того — несовместимые по ABI (pm_abi_broken: программа плагина не запускается со стоящей библиотекой,
+ * pminst.c, «ABI библиотек»): они и библиотеки, к которым они не подходят, ставятся из семени заново ОТКУДА БЫ
+ * ни стояли и при той же версии (лишь бы в семени не ниже стоящей): та же версия — не та же сборка, а
+ * сломанный помощник хуже чужого происхождения. */
 static void migrate_refresh(struct pm_ctx *x, struct pm_result *all, struct idset *bad, size_t *nfail) {
     struct pm_repo *sr = pm_seed_repo();
     if (!sr) return;
     struct pm_err e = {0};
+    struct idset ids = {0}, force = {0};
+    char **broken = NULL, **libs = NULL, *why = NULL;
+    size_t nbroken = 0, nlibs = 0;
     if (pm_index_get(sr, 0, &e) != 0) goto out;
     const char *rid = yn_str(ynode_get(sr->iroot, "repo"), "id");
     if (!rid) goto out;
     /* Набор для обновления: все, у кого в семени версия выше. Ставятся ОДНОЙ группой (зависимости и
      * зависимые вместе — новый warpbox без нового net1 не встаёт, и наоборот): одна проверка здоровья
      * на группу, не прошла — откат всей группы. */
-    struct idset ids = {0};
     for (size_t i = 0; i < x->st.n; i++) {
         struct pm_inst *p = &x->st.v[i];
         if (!p->version || !p->repo || p->unsigned_ || strcmp(p->repo, rid)) continue;
@@ -1015,12 +1025,43 @@ static void migrate_refresh(struct pm_ctx *x, struct pm_result *all, struct idse
         if (pm_ver_cmp(c.version, p->version) <= 0) continue;
         idset_add(&ids, p->id);
     }
+    pm_abi_broken(x, NULL, 0, &broken, &nbroken, &libs, &nlibs, &why);
+    if (nbroken) {
+        /* Отбор и среди bad_versions: откат прежней попытки мог пометить версию семени, хотя виновата была
+         * несовместимость соседа. */
+        x->allow_bad = 1;
+        for (size_t pass = 0; pass < 2; pass++) {
+            char **v = pass ? broken : libs;
+            size_t n = pass ? nbroken : nlibs;
+            for (size_t i = 0; i < n; i++) {
+                struct pm_inst *p = pm_state_find(&x->st, v[i]);
+                if (!p || !p->version || !pm_index_plugin(sr, v[i])) continue;
+                struct pm_cand c;
+                struct pm_err se = {0};
+                if (pm_select(x, sr, v[i], NULL, NULL, p->variant ? p->variant : "full", NULL, &c, &se) != 0) continue;
+                if (pm_ver_cmp(c.version, p->version) < 0) continue;
+                idset_add(&ids, v[i]);
+                idset_add(&force, v[i]);
+            }
+        }
+        char *m = NULL;
+        for (size_t i = 0; i < nbroken; i++) {
+            char *n2 = m ? pm_fmt("%s, %s", m, broken[i]) : pm_strdup(broken[i]);
+            free(m);
+            m = n2;
+        }
+        pm_progress(x, "несовместимы со стоящими библиотеками: %s (%s) — ставятся из семени", m, why ? why : "");
+        free(m);
+    }
     if (ids.n) {
         struct pm_req *rq = pm_alloc(sizeof(*rq) * ids.n);
         for (size_t i = 0; i < ids.n; i++) { rq[i].id = ids.v[i]; rq[i].version = NULL; }
         struct pm_opts o = {0};
         o.seed_only = 1;
         o.group = 1;
+        o.allow_bad = nbroken > 0;
+        o.reinstall = force.v;
+        o.nreinstall = force.n;
         struct pm_result res;
         struct pm_err ie = {0};
         if (pm_install(x, rq, ids.n, &o, &res, &ie) != 0) {
@@ -1039,6 +1080,15 @@ static void migrate_refresh(struct pm_ctx *x, struct pm_result *all, struct idse
         free(rq);
     }
 out:
+    for (size_t i = 0; i < ids.n; i++) free(ids.v[i]);
+    free(ids.v);
+    for (size_t i = 0; i < force.n; i++) free(force.v[i]);
+    free(force.v);
+    for (size_t i = 0; i < nbroken; i++) free(broken[i]);
+    free(broken);
+    for (size_t i = 0; i < nlibs; i++) free(libs[i]);
+    free(libs);
+    free(why);
     free(sr->name); free(sr->url);
     if (sr->idx) ydoc_free(sr->idx);
     free(sr);
@@ -1263,7 +1313,9 @@ int pm_main(int argc, char **argv) {
     size_t npos = 0;
     char **ens = NULL;
     size_t nens = 0;
-    const char *file = NULL, *keyfile = NULL;
+    const char *keyfile = NULL;
+    const char **files = NULL;
+    size_t nfiles = 0;
     int force = 0, purge = 0, unsigned_ok = 0, auto_ = 0, if_stale = 0, job = 0;
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i];
@@ -1274,7 +1326,10 @@ int pm_main(int argc, char **argv) {
         else if (!strcmp(a, "--auto")) auto_ = 1;
         else if (!strcmp(a, "--if-stale")) if_stale = 1;
         else if (!strcmp(a, "--job")) job = 1;
-        else if (!strcmp(a, "--file") && i + 1 < argc) file = argv[++i];
+        else if (!strcmp(a, "--file") && i + 1 < argc) {
+            files = pm_realloc(files, sizeof(char *) * (nfiles + 1));
+            files[nfiles++] = argv[++i];
+        }
         else if (!strcmp(a, "--key-file") && i + 1 < argc) keyfile = argv[++i];
         else if (!strcmp(a, "--by") && i + 1 < argc) x.by = argv[++i];
         else if (!strcmp(a, "--pkg") && i + 1 < argc) x.pkg_tx = argv[++i];
@@ -1306,7 +1361,7 @@ int pm_main(int argc, char **argv) {
     if (!strcmp(act, "job") && npos == 2) { rc = cmd_job(&x, pos[1]); goto out; }
 
     /* Изменяющие — под блокировкой. */
-    int known = (!strcmp(act, "install") && (file ? npos == 1 : (npos == 2 || npos == 3))) ||
+    int known = (!strcmp(act, "install") && (nfiles ? npos == 1 : (npos == 2 || npos == 3))) ||
                 (!strcmp(act, "update") && npos <= 2) ||
                 (!strcmp(act, "remove") && npos == 2) ||
                 ((!strcmp(act, "enable") || !strcmp(act, "disable")) && npos == 2) ||
@@ -1329,7 +1384,7 @@ int pm_main(int argc, char **argv) {
         int prc = 0;
         if (!job_fork(&x, &prc)) { rc = prc; goto out_nojob; }
     }
-    if (!strcmp(act, "install")) rc = cmd_install(&x, file ? NULL : pos[1], npos == 3 ? pos[2] : NULL, file, unsigned_ok);
+    if (!strcmp(act, "install")) rc = cmd_install(&x, nfiles ? NULL : pos[1], npos == 3 ? pos[2] : NULL, files, nfiles, unsigned_ok);
     else if (!strcmp(act, "update")) rc = cmd_update(&x, npos == 2 ? pos[1] : NULL, auto_, if_stale);
     else if (!strcmp(act, "ensure")) rc = cmd_ensure(&x, ens + 1, nens - 1);
     else if (!strcmp(act, "migrate")) rc = cmd_migrate(&x);
@@ -1369,6 +1424,7 @@ out:
     pm_repos_free(&x.repos);
     free(x.tg.core); free(x.tg.api); free(x.tg.abi); free(x.tg.host); free(x.tg.splify2); free(x.tg.arch);
     free(ens);
+    free(files);
     (void)g_job_log;
     return rc;
 }

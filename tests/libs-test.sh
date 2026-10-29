@@ -77,8 +77,10 @@ if command -v nm >/dev/null 2>&1; then
     # Раскладка 2.1: стек протоколов ушёл из ядра в net1 (build/sources.mk, «РАСКЛАДКА 2.1»).
     check "в libsteer нет стека TUN, транспортов и разбора ссылок узлов" "0" \
         "$(printf '%s\n' "$have" | grep -c '^pool_run$\|^stack_run$\|^transport_open$\|^tun_open$\|^sl_link_parse$')"
-    check "  а TLS, QUIC и HTTP/2 для себя ядро держит" "4" \
-        "$(printf '%s\n' "$have" | grep -c '^tls13_read$\|^qc_open$\|^h2_read$\|^tls_cert_roots$')"
+    # h2_read снаружи libsteer больше не зовут (коннектор — статическая программа плагина, de3593c): в карте его нет,
+    # HTTP/2 ядро держит внутри для DoH2 — снаружи от него виден клиент HTTP (http_get).
+    check "  а TLS, QUIC и HTTP для себя ядро держит" "4" \
+        "$(printf '%s\n' "$have" | grep -c '^tls13_read$\|^qc_open$\|^http_get$\|^tls_cert_roots$')"
     n1want="$(sed -n 's/^ *\([A-Za-z_0-9]*\);$/\1/p' build/net1/libs2p-net.map | sort)"
     n1have="$(nm -D --defined-only "$N1SO" | awk '$2 ~ /^[TDBRVW]$/ {sub(/@.*/, "", $3); print $3}' | sort)"
     check "в .dynsym net1 — ровно карта build/net1/libs2p-net.map" "$n1want" "$n1have"
@@ -427,6 +429,13 @@ check "net1 с другой раскладкой структур: код 2 и �
     "$r $(printf '%s' "$o" | grep -c 'другой раскладкой структур')"
 o="$("$L/plugins/vless/bin/vless" vless-nodes /nonexistent 2>&1)"
 check "настоящая net1: сверка молчит" "0" "$(printf '%s' "$o" | grep -c 'net1')"
+# Проба менеджера плагинов (STEER_LIB_PROBE=1, src/pluginmgr/pminst.c, «ABI библиотек»): ответ до main, без подкоманды.
+o="$(STEER_LIB_PROBE=1 "$L/plugins/vless/bin/vless" 2>&1)"; r=$?
+check "проба: настоящая net1 — код 0 и «подходит», до main" "0 1 0" \
+    "$r $(printf '%s' "$o" | grep -c "^steer: net1 .* подходит$") $(printf '%s' "$o" | grep -c 'подкоманд')"
+o="$(STEER_LIB_PROBE=1 LD_PRELOAD="$L/n1abi/fp.so" "$L/plugins/warpbox/bin/warpbox" 2>&1)"; r=$?
+check "проба: net1 другой раскладки — код 2 и строка «steer: библиотека»" "2 1" \
+    "$r $(printf '%s' "$o" | grep -c '^steer: библиотека net1 .*другой раскладкой структур')"
 
 # ---- net1 в процессе steerd: .so-плагин ядра, которому нужен net1 ------------------------------------
 # net1 грузится и dlopen'ом (вслед за .so-плагином steer-abi), поэтому её TLS — модель global-dynamic: со
