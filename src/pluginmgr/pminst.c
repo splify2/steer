@@ -31,6 +31,7 @@
 #include <linux/rtnetlink.h>
 
 #include "pm.h"
+#include "pmkind.h"
 #include "httpc.h"
 #include "untar.h"
 #include "scrypto.h"
@@ -936,8 +937,9 @@ static int manifest_checks(struct pm_ctx *x, const char *id, const struct ynode 
         const char *impl = yn_str(k, "impl");
         if (impl && !strcmp(impl, "core")) {
             const char *kn = yn_str(k, "name");
+            /* Вид ядра из перечня pmkind.c (awg; interface — помощник obfs по ключу), а не любой. */
             if (!official) return pm_errc(e, "plugin.core_impl_official", PMA("id", id), "%s: impl: core принимается только из официального репозитория", id);
-            if (!kn || strcmp(kn, "awg")) return pm_errc(e, "plugin.core_impl_kind", PMA("id", id, "kind", kn ? kn : "?"), "%s: вида %s ядро не знает — impl: core для него нельзя", id, kn ? kn : "?");
+            if (!pm_core_ext_kind(kn)) return pm_errc(e, "plugin.core_impl_kind", PMA("id", id, "kind", kn ? kn : "?"), "%s: вида %s ядро не знает — impl: core для него нельзя", id, kn ? kn : "?");
         }
     }
     if (nft && !has_perm(man, "nft")) return pm_errc(e, "plugin.perm_nft", PMA("id", id), "%s: файлы nft без права nft", id);

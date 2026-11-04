@@ -332,7 +332,7 @@ WARP_MOD_SRC := src/proto/warp/wbreg.c src/proto/warp/wbconf.c \
 # Менеджер плагинов: команда `steer plugin …` в steerd (src/pluginmgr/pm.h). Стоит на libsteer: HTTP-клиент
 # (httpc.c), подпись (sigverify.c), распаковка (untar.c), хеши (scrypto.c), разбор JSON (ynode.c).
 PLUGMGR_SRC := src/pluginmgr/pmutil.c src/pluginmgr/pmver.c src/pluginmgr/pmstate.c src/pluginmgr/pmindex.c \
-               src/pluginmgr/pminst.c src/pluginmgr/pmmain.c
+               src/pluginmgr/pminst.c src/pluginmgr/pmkind.c src/pluginmgr/pmmain.c
 STEERD_DYN_SRC := $(DAEMON_SRC) src/proto/tls/urltls.c $(PLUGMGR_SRC)
 VLESS_MODULE_SRC := $(VLESS_MOD_SRC) src/proto/vless/sub.c src/proto/vless/subfetch.c \
                     src/proto/tls/tlsprobe.c src/modules/main_vless.c

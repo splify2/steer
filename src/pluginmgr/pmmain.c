@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 
 #include "pm.h"
+#include "pmkind.h"
 #include "err.h"
 #include "sigverify.h"
 
@@ -949,48 +950,16 @@ static void idset_add(struct idset *s, const char *id) {
     s->v[s->n++] = pm_strdup(id);
 }
 
-/* Виды из выходов спеки: `tunnel` — по протоколу (`tunnel:vless`), остальные — по имени вида. */
-static void spec_kinds(const char *path, struct idset *kinds, int *have) {
+static void idset_add_cb(void *s, const char *id) { idset_add(s, id); }
+
+/* Плагины, которых требуют выходы спеки (pmkind.c): have — файл спеки есть (разобрался он или нет). */
+static void spec_plugins(const char *path, const struct ynode *plugins, struct idset *want, int *have) {
     size_t n = 0;
     char *buf = pm_read(path, &n);
     if (!buf) return;
     *have = 1;
-    struct err ye = {0};
-    struct ydoc *d = ydoc_parse_buf(buf, n, path, &ye);
-    if (d) {
-        const struct ynode *outs = ynode_get(ydoc_root(d), "outputs");
-        for (size_t i = 0; i < ynode_len(outs); i++) {
-            const struct ynode *o = ynode_val_at(outs, i);
-            const char *k = yn_str(o, "kind");
-            if (!k) continue;
-            if (!strcmp(k, "tunnel")) {
-                const char *pr = yn_str(o, "protocol");
-                char *kn = pm_fmt("tunnel:%s", pr ? pr : "vless");
-                idset_add(kinds, kn);
-                free(kn);
-            } else {
-                idset_add(kinds, k);
-                if (ynode_get(o, "obfs")) idset_add(kinds, "obfs-key");
-            }
-        }
-        ydoc_free(d);
-    }
+    pm_spec_plugins(buf, n, path, plugins, idset_add_cb, want);
     free(buf);
-}
-
-/* Какой плагин даёт вид по индексу семени (provides.kinds). */
-static const char *seed_plugin_for(const struct ynode *plugins, const char *kind) {
-    for (size_t i = 0; i < ynode_len(plugins); i++) {
-        const struct ynode *vs = ynode_get(ynode_val_at(plugins, i), "versions");
-        for (size_t j = 0; j < ynode_len(vs); j++) {
-            const struct ynode *ks = ynode_get(ynode_get(ynode_at(vs, j), "provides"), "kinds");
-            for (size_t k = 0; k < ynode_len(ks); k++) {
-                const struct ynode *c = ynode_at(ks, k);
-                if (yn_is_str(c) && !strcmp(c->str, kind)) return ynode_key_at(plugins, i)->str;
-            }
-        }
-    }
-    return NULL;
 }
 
 /* Обновление стоящих плагинов из семени (переход на новое ядро): плагин, поставленный из официального
@@ -1101,14 +1070,8 @@ static int cmd_migrate(struct pm_ctx *x) {
     struct pm_err e = {0};
     /* Новое ядро — новая проверка: пометки «ядро не перечитало плагины» прежних версий снимаются. */
     if (pm_bad_clear_reload(&x->st)) pm_state_save(&x->st, &e);
-    struct idset kinds = {0}, want = {0};
+    struct idset want = {0};
     int have_spec = 0;
-    const char *sp = getenv("STEER_SPEC");
-    if (sp) spec_kinds(sp, &kinds, &have_spec);
-    else {
-        spec_kinds("/etc/steer/spec.yaml", &kinds, &have_spec);
-        spec_kinds("/etc/steer/spec.json", &kinds, &have_spec);
-    }
     char *mj = pm_path(pm_etc(), "migrate.json");
     int have_mj = 0;
     struct ydoc *md = pm_json_load(mj, &e);
@@ -1132,13 +1095,13 @@ static int cmd_migrate(struct pm_ctx *x) {
         free(mj);
         return failc(x, "plugin.seed_no_index", NULL, "в семени нет индекса: нечего ставить");
     }
-    for (size_t i = 0; i < kinds.n; i++) {
-        const char *id = seed_plugin_for(plugins, kinds.v[i]);
-        /* Виды без записи в provides.kinds: warp ведёт warpbox (он тянет awg), obfs у interface — ключ. */
-        if (!id && !strcmp(kinds.v[i], "warp")) id = "warpbox";
-        if (!id && !strcmp(kinds.v[i], "awg")) id = "awg";
-        if (!id && !strcmp(kinds.v[i], "obfs-key")) id = "obfs";
-        if (id) idset_add(&want, id);
+    /* Плагины по выходам спеки: протоколы — по provides.kinds семени, виды ядра — по правилу pmkind.c
+     * (obfs — только выходу interface с ключом obfs, а не всякому interface). */
+    const char *sp = getenv("STEER_SPEC");
+    if (sp) spec_plugins(sp, plugins, &want, &have_spec);
+    else {
+        spec_plugins("/etc/steer/spec.yaml", plugins, &want, &have_spec);
+        spec_plugins("/etc/steer/spec.json", plugins, &want, &have_spec);
     }
     if (!have_spec && !have_mj)
         for (size_t i = 0; i < ynode_len(plugins); i++)

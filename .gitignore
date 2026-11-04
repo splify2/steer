@@ -172,3 +172,4 @@ build/libs20-*.log
 build/build-*.log
 build/pkhooks
 build/pkmatch
+build/pmkindmatch
