@@ -9,6 +9,7 @@ mipsel_24kc:mipsel-linux-musl:mips32r2+soft_float
 mips_24kc:mips-linux-musl:mips32r2+soft_float
 aarch64_cortex-a53:aarch64-linux-musl:cortex_a53
 aarch64_cortex-a72:aarch64-linux-musl:cortex_a72
+aarch64_cortex-a73:aarch64-linux-musl:cortex_a73
 aarch64_generic:aarch64-linux-musl:baseline
 arm_cortex-a7_neon-vfpv4:arm-linux-musleabihf:cortex_a7
 arm_cortex-a9:arm-linux-musleabi:cortex_a9
