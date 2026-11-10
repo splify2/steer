@@ -131,6 +131,10 @@ void dpause_ok(struct dpause *p);
  * отказал, вернулся бы первым из-за запоздавшего ответа на старый вопрос и дёргался туда-сюда). */
 void dpause_ok_at(struct dpause *p, long sent_ms);
 void dpause_fail(struct dpause *p, long now);
+/* Отказ на вопрос, отправленный в sent_ms: паузу удлиняет, только если вопрос ушёл ПОСЛЕ последнего
+ * отказа. Пачка вопросов, бывших в пути, когда сервер отказал (страница — это двадцать вопросов
+ * разом), — один сбой, а не двадцать: иначе пауза за один миг удваивалась до предела в 300 с. */
+void dpause_fail_at(struct dpause *p, long sent_ms, long now);
 int dpause_on(const struct dpause *p, long now);
 
 /* Есть ли в сборке TLS (DoT/DoH пригодны). */
