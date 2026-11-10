@@ -70,6 +70,7 @@ build/tunsteermatch
 build/.tsanprobe
 build/tunnelmatch
 build/tunfloodmatch
+build/hsdlmatch
 build/xhupmatch
 build/grpcmatch
 build/wsmatch

@@ -514,6 +514,37 @@ static void t_no_connectors(void) {
     if (c) conn_drop(c);
 }
 
+/* F1 (аудит 2.1.0): установщик ведёт connect дайлера под общим сроком установления (tr_watch_begin, слой
+ * сокетов trdial.c — здесь подменён). Срок вышел — соединение сбрасывается, что бы ни ответил дайлер: сокеты
+ * связи уже закрыты на чтение и запись. Сам срок у сокета проверяет tests/hsdlmatch.c. */
+static int g_watch_begun, g_watch_ms, g_watch_fire;
+void tr_watch_begin(int total_ms) {
+    __atomic_add_fetch(&g_watch_begun, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_watch_ms, total_ms, __ATOMIC_RELAXED);
+}
+int tr_watch_end(void) { return __atomic_load_n(&g_watch_fire, __ATOMIC_RELAXED); }
+
+static void t_hs_deadline(void) {
+    int b0 = __atomic_load_n(&g_watch_begun, __ATOMIC_RELAXED);
+    unsigned long long d0 = g_hs_deadline;
+    __atomic_store_n(&g_watch_fire, 1, __ATOMIC_RELAXED);
+    struct conn *c = sock_conn(CLI_PORT + 77, SRV_IP);
+    int got = 0;
+    for (int i = 0; c && i < 2000 && !got; i++) {
+        got = __atomic_load_n(&c->done, __ATOMIC_ACQUIRE);
+        if (!got) usleep(1000);
+    }
+    int rc = c ? c->rc : 0;
+    int closed = got ? conn_ready(c, &g_tun) : 0;
+    __atomic_store_n(&g_watch_fire, 0, __ATOMIC_RELAXED);
+    check(__atomic_load_n(&g_watch_begun, __ATOMIC_RELAXED) > b0 &&
+          __atomic_load_n(&g_watch_ms, __ATOMIC_RELAXED) == CONNECT_TOTAL_MS,
+          "F1: установщик ведёт connect под общим сроком установления (16 с)");
+    check(rc == STACK_RC_HSDEADLINE && closed == 1 && g_hs_deadline == d0 + 1,
+          "F1: срок вышел — соединение сброшено, исход сосчитан (g_hs_deadline)");
+    if (c && !closed && c->used) conn_drop(c);
+}
+
 /* R-152: TCP в устройство не несётся — его завершает ядро на слушателе модуля. Попавший в TUN пакет TCP
  * (перенаправления ещё нет или раскладка старого ядра) получает сброс, а не тишину; соединения в таблице
  * не заводится и установщик не просится. RST клиента отвечать не надо. */
@@ -4090,6 +4121,7 @@ int main(void) {
     g_now_s = (time_t)(g_now_ns / 1000000000ull);
 
     t_no_connectors();
+    t_hs_deadline();
     t_flow_filter();
     t_tun_adopt();
     t_connectors_burst();
