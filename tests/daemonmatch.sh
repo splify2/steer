@@ -77,7 +77,14 @@ start() { echo "start" >> "$it/calls"; }
 [ -n "\${REFUSED:-}" ] && STEER="$it/steer1"
 [ -n "\${AUTOSTART_OFF:-}" ] && steer_autostart_off() { return 0; }
 [ -n "\${AUTOSTART_ON:-}" ] && steer_autostart_off() { return 1; }
+# rc.common с USE_PROCD: stop — это stop_service, procd_kill и service_stopped; ждать нечего (pid пуст).
+ubus() { :; }
+jsonfilter() { :; }
+RESTART_MARK="$it/st/restart"
+stop() { stop_service; echo "procd_kill \$([ -e "$it/st/restart" ] && echo mark || echo nomark)" >> "$it/calls"; service_stopped; }
 case "\$1" in
+  restart) restart ;;
+  stop) stop ;;
   start) start_service ;;
   triggers) service_triggers ;;
   reload) reload_service ;;
@@ -98,6 +105,17 @@ EOF
     check "  без спеки тоже поднимается (apply через сокет её и заведёт)" "no 1" \
         "$([ -f "$it/spec.json" ] && echo yes || echo no) $(printf '%s\n' "$out" | grep -c '^instance steerd$')"
     check "  start ничего не применяет сам" "" "$(cat "$it/calls" 2>/dev/null)"
+    # restart не снимает правил: между остановкой и стартом демона `steerd down` не зовётся (иначе на
+    # время перезапуска трафик on_fail: drop шёл бы напрямую, а DNS — к dnsmasq); демону оставлена
+    # просьба не гасить резолвер. stop — снимает, и просьбы после него нет.
+    : > "$it/calls"
+    sh "$it/run.sh" restart >/dev/null 2>&1
+    check "init.d: restart — демон сменяется, steerd down не зовётся" "procd_kill mark|start" \
+        "$(tr '\n' '|' < "$it/calls" | sed 's/|$//')"
+    : > "$it/calls"
+    sh "$it/run.sh" stop >/dev/null 2>&1
+    check "init.d: stop — правила снимает steerd down, просьбы о перезапуске нет" "procd_kill nomark|steerd down" \
+        "$(tr '\n' '|' < "$it/calls" | sed 's/|$//')"
     check "init.d: триггер сети — reapply" "trigger config.change network /etc/init.d/steer reapply" \
         "$(sh "$it/run.sh" triggers)"
     : > "$it/spec.json"
@@ -432,7 +450,33 @@ wait_for 'grep -q "watch: первый проход" "$tmp/d2.err"' 10
 sleep 1
 check "перезапуск: первый проход — после стартового apply" "ok" "$(order_ok "$tmp/d2.err")"
 check "  строк «разъехалась» нет" "0" "$(grep -c 'разъехал' "$tmp/d2.err")"
+# Перезапуск службы (restart в init.d): файл-просьба и SIGTERM — без `steer down`. Набор правил и
+# правила выходов всё время в ядре, резолвер не гаснет и достаётся новому демону; помощник гаснет.
+DN2="$(grep -o 'supervise: dnsd запущен (pid [0-9]*' "$tmp/d2.err" | grep -o '[0-9]*$')"
+po2="$(pid_of o)"
+h0="$("$real_nft" list table inet steer 2>/dev/null | grep -c .)"
+r0="$(ours)"
+: > "$tmp/st/restart"
 kill "$D"; wait $D 2>/dev/null; D=""
+check "restart: набор правил остался в ядре" "yes" "$([ "$h0" -gt 0 ] && [ "$("$real_nft" list table inet steer 2>/dev/null | grep -c .)" -gt 0 ] && echo yes || echo no)"
+check "  правила выходов остались" "$r0" "$(ours)"
+check "  резолвер жив" "yes" "$([ -n "$DN2" ] && kill -0 "$DN2" 2>/dev/null && echo yes || echo no)"
+check "  помощник погашен" "no" "$(kill -0 "$po2" 2>/dev/null && echo yes || echo no)"
+check "  просьба снята демоном" "no" "$([ -e "$tmp/st/restart" ] && echo yes || echo no)"
+STEER_SUPERVISE_EXE="$tmp/helper" unshare -m sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" \
+    daemon --watch --supervise --apply --socket \"$tmp/steer.sock\" $S \
+    --dnsd-flag --listen-port --dnsd-flag $LPORT --dnsd-flag --upstream-port --dnsd-flag $UPORT" \
+    >"$tmp/d3.out" 2>"$tmp/d3.err" &
+D=$!
+wait_for 'grep -q "dnsd подхвачен (pid $DN2)" "$tmp/d3.err" && grep -q "спека применена при старте" "$tmp/d3.err"' 10
+check "  новый демон забрал тот же резолвер" "1" "$(grep -c "dnsd подхвачен (pid $DN2)" "$tmp/d3.err")"
+check "  и применил спеку" "1" "$(grep -c 'спека применена при старте' "$tmp/d3.err")"
+check "  правила выходов на месте" "$r0" "$(ours)"
+# Без просьбы SIGTERM — остановка: резолвер гаснет, как прежде (забранный — не ребёнок демона, и
+# его выход демон ждёт по закрытию соединения; процесс исчезает из /proc чуть позже).
+kill "$D"; wait $D 2>/dev/null; D=""
+wait_for '! kill -0 "$DN2" 2>/dev/null' 3
+check "stop после restart: резолвера нет" "no" "$(kill -0 "$DN2" 2>/dev/null && echo yes || echo no)"
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
 
 # steer-tools: ссылка на steerd, роль по argv[0].

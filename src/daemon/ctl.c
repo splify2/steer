@@ -3087,6 +3087,18 @@ static void srv_jobs_stop(struct ctl_srv *s) {
         if (c->job.running) kill(-c->job.pid, SIGKILL);
 }
 
+/* Файл-просьба «выходишь ради перезапуска» (restart в files/etc/init.d/steer): <каталог
+ * состояния>/restart. Файл, а не сигнал: демон прежнего выпуска, которого перезапускает скрипт
+ * нового пакета, незнакомый сигнал убил бы без уборки, а файл он просто не читает. Просьба
+ * разовая — снимается прочитавшим её и каждым стартом демона. */
+static int srv_restart_mark(int consume) {
+    char p[PATH_MAX];
+    if ((size_t)snprintf(p, sizeof(p), "%s/restart", steer_state_dir()) >= sizeof(p)) return 0;
+    int have = access(p, F_OK) == 0;
+    if (consume) unlink(p);
+    return have;
+}
+
 static void srv_term(struct loop *l, int signo, void *arg) {
     (void)signo;
     struct ctl_srv *s = arg;
@@ -3096,7 +3108,15 @@ static void srv_term(struct loop *l, int signo, void *arg) {
     /* Детям команд — SIGTERM сразу: гаснут, пока демон по одному гасит помощников. */
     for (struct conn *c = s->conns; c; c = c->next)
         if (c->job.running) kill(-c->job.pid, SIGTERM);
-    supd_stop(s->d.sup);
+    /* Перезапуск службы: набор правил остаётся в ядре, и заворот DNS по-прежнему ведёт к резолверу
+     * — погасить его значило бы оставить клиентов без DNS до нового демона. Остановка (файла
+     * просьбы нет) гасит и его: правила следом снимает `steerd down`. */
+    if (srv_restart_mark(1)) {
+        fprintf(stderr, "steer[info] daemon: перезапуск службы — резолвер оставлен новому демону\n");
+        supd_stop_keep_dnsd(s->d.sup);
+    } else {
+        supd_stop(s->d.sup);
+    }
     srv_jobs_stop(s);
     loop_stop(l, 0);
 }
@@ -3602,6 +3622,7 @@ int ctl_serve_main(int argc, char **argv) {
      * игнорируется ещё и ради записи, которую делает код в процессе. Детям он возвращается
      * (loop_child_reset). */
     signal(SIGPIPE, SIG_IGN);
+    srv_restart_mark(1);         /* просьба адресована прежнему демону; этому её пришлют заново */
     S.l = loop_new();
     if (!S.l) { fprintf(stderr, LOG_W "цикл событий: %s\n", strerror(errno)); return 1; }
     S.lfd = ctl_listen(cf, &S.ino);
