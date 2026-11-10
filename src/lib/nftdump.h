@@ -69,6 +69,10 @@ struct nfd_tfp {
     unsigned fams;              /* 1 — таблица inet есть, 0 — нет */
 };
 int nfd_table_fp(const char *table, struct nfd_tfp *out);
+/* Свёртка одного сообщения дампа (NEWCHAIN, NEWSET, NEWRULE таблицы table семейства inet) — та,
+ * что идёт в отпечаток: только по разрешённым атрибутам вида. 1 — посчитана. Для стенда
+ * (tests/nftdump-tool.c): отпечаток не должен зависеть от атрибутов, которых ядро steer не задаёт. */
+int nfd_fp_msg(const void *nlmsg, size_t len, const char *table, uint64_t *out);
 
 /* Именованные наборы и карты таблиц ИМЯ во всех семействах — заголовком: семейство, имя, флаги
  * (NFT_SET_*), длина ключа. Безымянные (флаг NFT_SET_ANONYMOUS) тоже приходят: отбирает
