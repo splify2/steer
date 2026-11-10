@@ -99,7 +99,7 @@ else: print(".".join(str(b) for b in d[-4:]))
 PY
 
 printf 'example.com\nmoved.net\nfail.io\nstay.org\nperm.io\nwin.io\nwin2.io\n' > "$tmp/d.lst"
-printf 'bind.io\nidle.io\nzero.io\nheal.io\nvictim.io\npa.io\npb.io\npc.io\npc2.io\n' >> "$tmp/d.lst"
+printf 'bind.io\nidle.io\nzero.io\nheal.io\nvictim.io\npre.io\npa.io\npb.io\npc.io\npc2.io\n' >> "$tmp/d.lst"
 printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
 '"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
 '"channels":[{"name":"c","match":{"domains_files":["%s/d.lst"],"mode":"fakeip"},"out":"vpn"}]}' \
@@ -455,6 +455,17 @@ settle
 check "10. карта поддельного адреса victim.io не тронута" "203.0.113.101" "$(mapval "$vfake")"
 check "10. и подмены на адрес нападающего в карте нет" "0" \
     "$(nft list map inet steer fakeip | grep -c ': 6\.6\.6\.6')"
+# То же до первого вопроса жертвы: прежде запись pre.io заводилась с адресом нападающего, и
+# первый же честный вопрос получал поддельный адрес, ведущий к нему.
+echo 6.6.6.6 > "$tmp/ip"
+check "10. вопрос с байтом 0 до записи имени — ответ апстрима как есть" "6.6.6.6" \
+    "$(ask8 hex:0370726503696f000861747461636b6572076578616d706c6500)"
+settle
+echo 203.0.113.102 > "$tmp/ip"
+pfake="$(ask8 pre.io)"
+settle
+check "10. затем честный вопрос pre.io — в карте настоящий адрес, не нападающего" "203.0.113.102" \
+    "$(mapval "$pfake")"
 kill "$DPID8" 2>/dev/null; wait "$DPID8" 2>/dev/null
 check "10. в файле состояния имени нападающего нет, victim.io — одна строка" "0 1" \
     "$(grep -c 'attacker' "$tmp/state8/fakeip.state") $(grep -c '^victim\.io' "$tmp/state8/fakeip.state")"
