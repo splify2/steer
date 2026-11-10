@@ -125,9 +125,10 @@ struct tr_link {
 };
 
 /* Живая запись связи (см. tr_link.live): включить, сколько байт ждёт отправки, дослать без ожидания
- * (0 — пусто, 1 — сокет занят, -1 — отказ). Верхний предел очереди не вводится: вызывающий (dialer_ops.room)
- * перестаёт давать данные, когда ждущих набралось TR_OUT_HIWAT. */
-#define TR_OUT_HIWAT (256 * 1024)
+ * (0 — пусто, 1 — сокет занят, -1 — отказ). Данные клиента вызывающий (dialer_ops.room) перестаёт давать,
+ * когда ждущих набралось TR_OUT_HIWAT; сверх этого очередь растёт только ответами, которые заказал узел, и
+ * у неё свой потолок (OUTQ_MAX, outq.h). */
+#define TR_OUT_HIWAT OUTQ_HIWAT
 void tr_link_live(struct tr_link *l);
 size_t tr_link_pending(const struct tr_link *l);
 int tr_link_flush(struct tr_link *l);

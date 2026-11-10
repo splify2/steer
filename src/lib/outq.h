@@ -11,10 +11,32 @@
 #define STEER_OUTQ_H
 #include <errno.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+
+/* Пороги очереди (аудит 2.1.0, F9).
+ *
+ * OUTQ_HIWAT — сколько данных КЛИЕНТА связь берёт в очередь: дальше место у узла нулевое (transport_room,
+ * room дайлеров прокси), и новые данные клиента не читаются, пока очередь не сойдёт. Поэтому законно в
+ * очереди бывает не больше OUTQ_HIWAT и одной порции сверху.
+ *
+ * Всё, что сверх, — ответы, которые узел вынуждает нас слать: ACK на PING и SETTINGS у HTTP/2, pong на ping
+ * у ws. Их узел может заказывать без конца, не читая ответов, и очередь росла без предела (PoC: 16 МБ PING —
+ * 16 МБ в очереди). Против этого два рубежа:
+ *   OUTQ_RX_STOP — стек перестаёт читать у узла, пока очередь выше (stack.c, conn_node_backlog): нечитаемый
+ *                  узел больше ничего не закажет. Вдвое выше OUTQ_HIWAT — чтобы обычная выгрузка его не
+ *                  касалась никогда;
+ *   OUTQ_MAX     — сверх этого очередь не принимает (outq_add отвечает -1, связь закрывается): это значит,
+ *                  что за одно чтение узел заказал больше OUTQ_MAX − OUTQ_RX_STOP ответов, — нарушение
+ *                  протокола, а не медленная сеть. Вчетверо выше OUTQ_HIWAT: запас, который законный узел
+ *                  не выбирает ни при каком размере записи. */
+#define OUTQ_HIWAT   (256 * 1024)
+#define OUTQ_RX_STOP (2 * OUTQ_HIWAT)
+#define OUTQ_MAX     (4 * OUTQ_HIWAT)
 
 /* p — буфер из кучи, [off, n) — ещё не отправленное, cap — его размер. Нулевая структура — пустая очередь. */
 struct outq {
@@ -31,6 +53,19 @@ static inline void outq_free(struct outq *q) {
 
 static inline int outq_add(struct outq *q, const unsigned char *d, size_t n) {
     if (!n) return 0;
+    if (outq_pending(q) + n > OUTQ_MAX) {
+        /* Строка — не чаще раза в десять секунд (на единицу трансляции: функция в заголовке). */
+        static time_t said;
+        time_t now = time(NULL);
+        if (now - said >= 10) {
+            said = now;
+            fprintf(stderr, "steer[warn] связь с узлом: в очереди отправки было бы %zu байт при пределе %d — узел "
+                            "заказывает ответы (PING, SETTINGS, ping), не читая их; связь закрыта\n",
+                    outq_pending(q) + n, (int)OUTQ_MAX);
+        }
+        errno = ENOBUFS;
+        return -1;
+    }
     if (q->off == q->n) q->off = q->n = 0;                  /* пусто — писать с начала */
     if (q->n + n > q->cap) {
         if (q->off) {                                       /* сперва уплотнить: отправленное не держим */

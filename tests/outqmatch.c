@@ -37,14 +37,15 @@ int main(void) {
     unsigned char got[16];
     check("outq: байты дошли", 16, read(sv[1], got, sizeof got));
 
-    /* Мегабайт при буфере в 4 КБ: вызов не ждёт, остаток в очереди. */
-    enum { BIG = 1 << 20 };
+    /* Крупная запись (три OUTQ_HIWAT — столько законная очередь не набирает, но и до потолка OUTQ_MAX далеко) при
+     * буфере в 4 КБ: вызов не ждёт, остаток в очереди. */
+    enum { BIG = 3 * OUTQ_HIWAT };
     unsigned char *big = malloc(BIG);
     for (size_t i = 0; i < BIG; i++) big[i] = (unsigned char)(i * 31 + (i >> 8));
     long t0 = ms_now();
     int rc = outq_send(sv[0], &q, big, BIG);
     long dt = ms_now() - t0;
-    check("outq: мегабайт принят без ожидания (< 100 мс)", 1, rc == 0 && dt < 100);
+    check("outq: крупная запись принята без ожидания (< 100 мс)", 1, rc == 0 && dt < 100);
     check("outq: почти всё в очереди", 1, outq_pending(&q) > BIG - 200000);
 
     /* Пока очередь не пуста, новая запись идёт в хвост. */
@@ -66,8 +67,8 @@ int main(void) {
     check("outq: слив — дошло всё записанное", 1, off == want);
     check("outq: сокет по ходу был занят (flush вернул 1), очередь опустела (0)", 1, busy_seen && flush_rc == 0);
     check("outq: после слива буфер возвращён", 1, q.p == NULL && outq_pending(&q) == 0);
-    check("outq: байты мегабайта в том же порядке", 1, off == want && !memcmp(rx, big, BIG));
-    check("outq: хвост — после мегабайта", 1, off == want && !memcmp(rx + BIG, tail, sizeof tail));
+    check("outq: байты крупной записи в том же порядке", 1, off == want && !memcmp(rx, big, BIG));
+    check("outq: хвост — после крупной записи", 1, off == want && !memcmp(rx + BIG, tail, sizeof tail));
 
     /* Собеседник ушёл: запись — отказ, а не сигнал и не ожидание. */
     close(sv[1]);
@@ -76,6 +77,17 @@ int main(void) {
     check("outq: закрытый собеседник — отказ записи", -1, er);
     outq_free(&q);
     close(sv[0]);
+
+    /* Потолок (аудит 2.1.0, F9): узел, заказывающий ответы и не читающий их, раздувал очередь без предела
+     * (16 МБ PING — 16 МБ в очереди). До OUTQ_MAX очередь принимает, сверх — отказ, и очередь не тронута. */
+    struct outq cq;
+    memset(&cq, 0, sizeof cq);
+    unsigned char *blk = calloc(1, OUTQ_MAX);
+    check("outq: до потолка OUTQ_MAX очередь принимает", 0, outq_add(&cq, blk, OUTQ_MAX));
+    check("outq: байт сверх потолка — отказ", -1, outq_add(&cq, blk, 1));
+    check("outq: отказ очередь не тронул", 1, outq_pending(&cq) == OUTQ_MAX);
+    outq_free(&cq);
+    free(blk);
     free(big);
     free(rx);
     return unit_done("outqmatch");

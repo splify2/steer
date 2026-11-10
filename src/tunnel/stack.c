@@ -51,6 +51,7 @@
 #include "thrstack.h"
 #include "platform.h"
 #include "marks.h"
+#include "outq.h"
 
 /* ---- журнал с уровнем --------------------------------------------------------
  *
@@ -2155,6 +2156,15 @@ static size_t conn_out_pending(const struct conn *c) {
     return g_dl->ops->out_pending(g_dl->ctx, SESS(c));
 }
 
+/* Узел не забирает то, что мы ему должны: в очереди связи больше OUTQ_RX_STOP (outq.h). Данные клиента
+ * останавливаются раньше (OUTQ_HIWAT, место дайлера), так что сверх — только ответы на служебное, которое узел
+ * заказывает (PING и SETTINGS у HTTP/2, ping у ws). Пока так, у узла не читаем: не прочитанный, он не закажет
+ * больше, а очередь сходит, как только он начнёт читать (аудит 2.1.0, F9). Прежде чтение шло всегда, и узел,
+ * шлющий PING и не читающий ответы, раздувал очередь без предела. */
+static int conn_node_backlog(const struct conn *c) {
+    return conn_out_pending(c) >= OUTQ_RX_STOP;
+}
+
 /* Сколько байт клиента соединения c собирается в одну отправку (см. dialer_ops.up_max). Пока
  * соединение не готово или дайлер не называет большего — UP_MAX: место дайлера под заголовок и
  * кадр Vision. */
@@ -3122,6 +3132,11 @@ static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
                (long)(c - g_conns), c->rtx.len);
             return;
         }
+        /* Ответы на служебное узла копятся быстрее, чем он их забирает: дальше не читаем (conn_node_backlog). */
+        if (conn_node_backlog(c)) {
+            c->rx_ready = 1;
+            return;
+        }
         if (++reads >= DRAIN_MAX_READS || g_rx_total - drained_from >= DRAIN_MAX_BYTES) {
             if (g_stats) g_st.drain_full++;
             /* Прервались на своём пределе, а данные, может быть, ещё в буфере: отметим, что
@@ -3992,7 +4007,8 @@ static void *worker_loop(void *arg) {
             /* У потока UDP окна нет, а значит нет и повода не читать: датаграмма уходит
              * клиенту сразу и целиком, копить её негде и не нужно. Придерживать чтение
              * было бы не управлением потоком, а задержкой на пустом месте. */
-            int want = !c->srv_closed && (c->is_udp || client_can_take_record(c));
+            size_t outp = conn_out_pending(c);
+            int want = !c->srv_closed && (c->is_udp || client_can_take_record(c)) && outp < OUTQ_RX_STOP;
             if (!want && !c->srv_closed && g_stats) g_st.win_skips++;
             /* Чтение стоит в наборе всегда (по фронту, EPOLLET), а не только пока клиент готов принять: прежде
              * закрытое окно снимало дескриптор с epoll (DEL), открытое — ставило (ADD), и это 36-41 вызова
@@ -4005,7 +4021,7 @@ static void *worker_loop(void *arg) {
              * нечего ставить: события потока приходят из loop_poll (stack_sess_rx). EPOLLOUT (по уровню) — только
              * пока узел не принял данные клиента сокета: SEND_AGAIN у дайлера без своего окна (room -1, сокет
              * узла полон) ждёт записи узла событием, а не опросом (R-152). */
-            unsigned arm = ARM_IN | (((c->cfd1 && c->early && conn_room(c) < 0) || conn_out_pending(c)) ? ARM_OUT : 0u);
+            unsigned arm = ARM_IN | (((c->cfd1 && c->early && conn_room(c) < 0) || outp) ? ARM_OUT : 0u);
             if (!g_inloop && arm != c->armed) {
                 struct epoll_event e = { .events = EPOLLIN | EPOLLET | (arm & ARM_OUT ? EPOLLOUT : 0u),
                                          .data = { .u32 = (uint32_t)(c - g_conns) } };
@@ -4281,11 +4297,14 @@ static void *worker_loop(void *arg) {
             if (!c->used || c->pending || c->born_turn == g_turn) continue;
             /* Узел снова принимает запись: дослать то, что связь держит в очереди (живая запись, I-534). Отказ —
              * связь сломана, как при отказе send. */
-            if ((evs[i].events & EPOLLOUT) && g_dl->ops->out_flush && c->fd >= 0 &&
-                g_dl->ops->out_flush(g_dl->ctx, SESS(c)) < 0) {
-                conn_node_lost(c);
-                conn_reset(c, &tun);
-                continue;
+            if ((evs[i].events & EPOLLOUT) && g_dl->ops->out_flush && c->fd >= 0) {
+                if (g_dl->ops->out_flush(g_dl->ctx, SESS(c)) < 0) {
+                    conn_node_lost(c);
+                    conn_reset(c, &tun);
+                    continue;
+                }
+                /* Очередь сошла ниже порога — недочитанное у узла читает проход ниже, в этом же витке. */
+                if (c->rx_ready && !conn_node_backlog(c)) rx_dirty = 1;
             }
             /* Только запись: узел снова принимает — ранние данные досылает проход сроков (conn_deadlines). */
             if (!(evs[i].events & ~(uint32_t)EPOLLOUT)) continue;
@@ -4305,6 +4324,8 @@ static void *worker_loop(void *arg) {
             /* Окно закрыто — фронт уже потрачен, а сокет, возможно, полон: запоминаем, что читать надо, и
              * читаем, когда окно откроется (проход ниже, в этом же витке, если подтверждение уже разобрано). */
             if (!c->is_udp && !client_can_take_record(c)) { c->rx_ready = 1; rx_dirty = 1; continue; }
+            /* Узел не забирает ответы — отложить до EPOLLOUT (conn_node_backlog). */
+            if (conn_node_backlog(c)) { c->rx_ready = 1; continue; }
             drain_conn(c, &tun);
         }
 
@@ -4318,7 +4339,7 @@ static void *worker_loop(void *arg) {
             if (!c->rx_ready || c->pending) continue;
             /* Тот же отказ, что у разбора событий: читать у узла, когда кольцу клиента некуда принять запись,
              * нельзя. Флаг при этом остаётся (ждёт места в кольце клиента). */
-            if (c->srv_closed || (!c->is_udp && !client_can_take_record(c))) continue;
+            if (c->srv_closed || (!c->is_udp && !client_can_take_record(c)) || conn_node_backlog(c)) continue;
             drain_conn(c, &tun);
         }
 

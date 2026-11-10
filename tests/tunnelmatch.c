@@ -223,7 +223,9 @@ size_t transport_aux_pending(const struct transport *c) { (void)c; return g_aux_
 long transport_room(struct transport *c) { (void)c; return g_room; }
 /* Живая запись (I-534): у подмены сокета нет — держать нечего. */
 void transport_live(struct transport *c) { (void)c; }
-size_t transport_out_pending(const struct transport *c) { (void)c; return 0; }
+/* Очередь связи (живая запись): сколько стенд велит считать неотправленным узлу (F9, t_node_backlog). */
+static size_t g_out_pending;
+size_t transport_out_pending(const struct transport *c) { (void)c; return g_out_pending; }
 int transport_out_flush(struct transport *c) { (void)c; return 0; }
 /* Принимает ли транспорт запись любой длины (xhttp packet-up). */
 static int g_big_write;
@@ -543,6 +545,32 @@ static void t_hs_deadline(void) {
     check(rc == STACK_RC_HSDEADLINE && closed == 1 && g_hs_deadline == d0 + 1,
           "F1: срок вышел — соединение сброшено, исход сосчитан (g_hs_deadline)");
     if (c && !closed && c->used) conn_drop(c);
+}
+
+/* F9 (аудит 2.1.0): узел, который заказывает ответы (PING, SETTINGS, ping) и не читает их, раздувал очередь
+ * отправки без предела, а стек читал у него всегда. Теперь, пока в очереди связи OUTQ_RX_STOP и больше, у узла
+ * не читают: проход чтения останавливается после первого же чтения и помнит, что недочитал (rx_ready), а
+ * когда очередь сойдёт — читает дальше. */
+static void t_node_backlog(void) {
+    struct conn *c = open_conn();
+    if (!c) { check(0, "F9: стенд — соединение"); return; }
+    g_out_pending = OUTQ_RX_STOP;
+    g_recv_rc = 0;
+    g_recv_rep = 50;
+    g_recv_rep_n = 1000;
+    int r0 = g_recv_calls;
+    drain_conn(c, &g_tun);
+    int reads = g_recv_calls - r0;
+    check(reads == 1 && c->rx_ready,
+          "F9: узел не забирает ответы (очередь ≥ 512 КиБ) — у него больше не читают, недочитанное помнится");
+    g_out_pending = 0;
+    r0 = g_recv_calls;
+    drain_conn(c, &g_tun);
+    check(g_recv_calls - r0 > 1, "F9: очередь сошла — чтение у узла продолжается");
+    g_recv_rep = 0;
+    unsigned char b[65536];
+    while (cli_get(cli_fd(c), b, sizeof b) > 0) {}
+    conn_drop(c);
 }
 
 /* R-152: TCP в устройство не несётся — его завершает ядро на слушателе модуля. Попавший в TUN пакет TCP
@@ -4122,6 +4150,7 @@ int main(void) {
 
     t_no_connectors();
     t_hs_deadline();
+    t_node_backlog();
     t_flow_filter();
     t_tun_adopt();
     t_connectors_burst();
