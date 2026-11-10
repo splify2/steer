@@ -111,5 +111,10 @@ extern int (*g_cmd_hook)(const char *const argv[]);
  * сообщением rtnetlink, а команда `ip route replace …` словами уходит сюда. */
 extern int (*g_route_hook)(const char *const argv[]);
 extern long (*g_revive_step)(void);
+/* Сомнение прохода (failover.c, «СОМНЕНИЕ») — стенду: есть ли у роутера путь наружу (вместо
+ * вопроса о маршруте ядру машины, на которой идёт стенд) и сколько байт приняло устройство (вместо
+ * /sys; -1 — свидетельства нет). */
+extern int (*g_upstream_probe)(void);
+extern long long (*g_dev_rx)(const char *dev);
 
 #endif

@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 int rule_added = 0;
 int rule_deleted = 0;
@@ -107,15 +108,27 @@ static int fake_ip_show(int table, char *out, size_t n) {
 }
 
 /* Проба ICMP целиком — то, что сделала бы настоящая: правило пробы (таблица 299) и эхо через
- * устройство. Ответ всегда «дошло» — мёртвым устройство делает его отсутствие (lo есть всегда,
- * nodev — нет), а не проба. */
+ * устройство. Ответ по умолчанию «дошло» — мёртвым устройство делает его отсутствие (lo есть
+ * всегда, nodev — нет), а не проба. Стенд сомнения (ниже) задаёт ответ сам: g_icmp_ok — молчит
+ * ли существующее устройство, g_icmp_after_ifup — отвечает ли оно после перезапуска. */
+static int cmd_seen(const char *needle);
+static int g_icmp_ok = 1, g_icmp_after_ifup;
 static int fake_icmp_probe(const char *dev) {
     if (g_cmd_n + 2 <= (int)(sizeof(g_cmd) / sizeof(*g_cmd))) {
         snprintf(g_cmd[g_cmd_n++], sizeof(g_cmd[0]), "probe-rule from %s table 299", dev);
         snprintf(g_cmd[g_cmd_n++], sizeof(g_cmd[0]), "icmp-probe -I %s 1.1.1.1", dev);
     }
-    return 1;
+    if (g_icmp_after_ifup && cmd_seen("ifup")) return 1;
+    return g_icmp_ok;
 }
+
+/* Путь наружу у самого роутера и счётчик принятого устройством — швы сомнения (failover_int.h):
+ * без них проход читал бы таблицу main и /sys машины, на которой идёт стенд. -1 у счётчика —
+ * «свидетельства нет». */
+static int g_up = 1;
+static int fake_upstream(void) { return g_up; }
+static long long g_rx = -1;
+static long long fake_rx(const char *dev) { (void)dev; return g_rx; }
 
 /* Ожидание подъёма: revive ждёт десятью шагами по секунде, и настоящий шаг стоил бы десять
  * секунд на каждую проверку этой ветки, не добавляя к ней ничего: устройства в стенде по ходу
@@ -383,6 +396,74 @@ static void out_set(const char *dev, enum on_fail of) {
     g_spec.out[0].table = 300;
 }
 
+static void state_rm(const char *name) {
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s", g_dir, name);
+    unlink(path);
+}
+
+/* Первое слово-другое записи name (пусто — записи нет или она пуста). */
+static void state_read(const char *name, char *buf, size_t n) {
+    char path[128];
+    buf[0] = '\0';
+    snprintf(path, sizeof(path), "%s/%s", g_dir, name);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    if (!fgets(buf, (int)n, f)) buf[0] = '\0';
+    fclose(f);
+    buf[strcspn(buf, "\n")] = '\0';
+}
+
+/* Выход kind=interface с одним устройством — туннель netifd (WireGuard, AmneziaWG): проба —
+ * ICMP (шов g_icmp_probe), оживление — ifdown/ifup (шов g_cmd_hook). Устройство — lo: оно есть
+ * на любой машине, а команды стенд только записывает. */
+static void out_set_wg(const char *dev) {
+    outs_reset();
+    g_spec.out_n = 1;
+    snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "wg");
+    g_spec.out[0].kind = OUT_INTERFACE;
+    g_spec.out[0].on_fail = FAIL_DROP;
+    snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", dev);
+    g_spec.out[0].mark = 0x100000;
+    g_spec.out[0].table = 300;
+}
+
+/* Тот же выход членом группы v2 `all` (именованные члены): группа судит по приговору члена и
+ * идёт в проходе после него. pick: manual — не из-за выбора человека (член один), а потому что
+ * у order и latency группа v2 ведёт карту новых соединений в ядре (group_carded), и проход
+ * полез бы в nftables машины, на которой идёт стенд. */
+static void out_set_wg_group(void) {
+    out_set_wg("lo");
+    g_spec.out_n = 2;
+    struct output *g = &g_spec.out[1];
+    snprintf(g->name, sizeof(g->name), "%s", "all");
+    g->kind = OUT_GROUP;
+    g->on_fail = FAIL_DROP;
+    snprintf(g->device, sizeof(g->device), "%s", "lo");
+    g->mark = 0x200000;
+    g->table = 301;
+    group_cfg_init(&g->grp);
+    g->grp.pick = PICK_MANUAL;
+    struct err e = {0};
+    if (group_members_alloc(&g_spec, &g->grp, 1) != 0) { perror("out_set_wg_group"); exit(1); }
+    g->grp.members[g->grp.members_n++] = 0;
+    if (group_seal(&g_spec, g, &e) != 0) { fprintf(stderr, "out_set_wg_group: %s\n", e.msg); exit(1); }
+}
+
+/* Тронул ли проход трафик выхода: перезапуск интерфейса, снятие соединений, перезапись
+ * маршрута в таблице. */
+static int touched(void) {
+    return cmd_seen("ifdown") + cmd_seen("ifup") + cmd_seen("ctnl evict") +
+           cmd_seen("conntrack -D") + cmd_seen("ip route replace");
+}
+
+/* Здоровье пула «lo + ещё одно существующее устройство»: lo молчит, второе отвечает. */
+static char g_spare_dev[32];
+static int spare_health(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp; (void)o;
+    return !strcmp(dev, g_spare_dev);
+}
+
 /* Пул разнородных выходов: устройство создаёт и обслуживает выход-владелец (здесь
  * kind=xsteer — его проба не требует ни сети, ни root), а НАЗЫВАЕТ его в своём `devices`
  * другой выход, kind=interface, собирающий локацию подписки, wireguard и хаб в один список
@@ -503,6 +584,8 @@ int main(void) {
     g_icmp_probe = fake_icmp_probe;
     g_cmd_hook = run_quiet;
     g_revive_step = fake_step;
+    g_upstream_probe = fake_upstream;
+    g_dev_rx = fake_rx;
 
     /* Test sig_cleanup/cleanup_probe_rule indirectly by checking rule_deleted */
     cleanup_probe_rule();
@@ -1488,6 +1571,261 @@ int main(void) {
         for (int i = 0; rm[i]; i++) { snprintf(pth, sizeof(pth), "%s/%s", d, rm[i]); unlink(pth); }
         rmdir(d);
         steer_set_state_dir(g_dir);
+    }
+
+    /* ---- сомнение: молчание устройства, которое несёт трафик ---------------------------------
+     *
+     * Снято с живого роутера: выход `wg0` (kind: interface, единственное устройство — туннель
+     * AmneziaWG, on_fail: drop), через него идёт долгий поток UDP (голос). Поток «сам» рвался и
+     * возвращался. Сторож перезапускал туннель по ОДНОМУ проходу без ответа: один эхо-запрос на
+     * адрес, два потерянных пакета — и ifdown/ifup устройства, на которое ведёт таблица выхода;
+     * вернувшийся маршрут (или вставший запрет) снимал ещё и записи conntrack. Так же кончался
+     * короткий провал канала провайдера: проход через 5 с после события сети застаёт WAN ещё
+     * лежащим, туннель молчит — и перезапускается исправный туннель.
+     *
+     * Устройство стенда — lo (есть и «поднято»), проба ICMP — шов с ответом стенда, счётчик
+     * принятого и путь наружу — швы, ifdown/ifup и маршруты — журнал команд. */
+    {
+        char dev[32], rec[64];
+        snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-doubt-XXXXXX");
+        if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
+        steer_set_state_dir(g_dir);
+        g_health_probe = NULL;
+#define WG_ROUTES "default dev lo scope link \nblackhole default metric 65535 \n"
+#define WG_RESET(active) do { \
+            state_rm("doubt-wg"); state_rm("restart-lo"); state_rm("groups"); \
+            state_write("active", active); \
+            g_icmp_ok = 0; g_icmp_after_ifup = 0; g_up = 1; g_rx = -1; g_slept = 0; \
+        } while (0)
+
+        /* (а) Один проход без ответа: ни перезапуска, ни снятия соединений, ни запрета — выход
+         *     остаётся на устройстве, серия записана. */
+        out_set_wg("lo");
+        WG_RESET("wg lo 0\n");
+        tick(RULES_WITH, WG_ROUTES);
+        check("сомнение: один проход без ответа — интерфейс не перезапускается",
+              cmd_seen("ifdown") + cmd_seen("ifup"), 0);
+        check("сомнение: один проход без ответа — соединения не снимаются",
+              cmd_seen("ctnl evict") + cmd_seen("conntrack -D"), 0);
+        check("сомнение: один проход без ответа — таблица не переписывается",
+              cmd_seen("ip route replace"), 0);
+        active_get("wg", dev, sizeof(dev));
+        check("сомнение: один проход без ответа — выход остаётся на устройстве", !strcmp(dev, "lo"), 1);
+        state_read("doubt-wg", rec, sizeof(rec));
+        check("сомнение: серия записана (первый проход из трёх)", !strncmp(rec, "lo 1 ", 5), 1);
+        /* Ответ пришёл — сомнения нет, запись стёрта, и снова ничего не тронуто. */
+        g_icmp_ok = 1;
+        tick(RULES_WITH, WG_ROUTES);
+        state_read("doubt-wg", rec, sizeof(rec));
+        check("сомнение: ответившая проба стирает серию", rec[0] == '\0', 1);
+        check("сомнение: ответившая проба — ничего не тронуто", touched(), 0);
+        /* Серия — ПОДРЯД: два провала, ответ, два провала — приговора нет. */
+        {
+            int t = 0;
+            const int ok[] = { 0, 0, 1, 0, 0 };
+            for (size_t i = 0; i < sizeof(ok) / sizeof(*ok); i++) {
+                g_icmp_ok = ok[i];
+                tick(RULES_WITH, WG_ROUTES);
+                t += touched();
+            }
+            check("сомнение: прерванная серия не копится — выход не тронут", t, 0);
+        }
+
+        /* (б) Три прохода подряд без ответа, счётчик принятого стоит: на третьем — оживление
+         *     (ifdown, потом ifup, десять шагов ожидания), не ожило — on_fail и снятие
+         *     соединений, как и раньше. */
+        out_set_wg("lo");
+        WG_RESET("wg lo 0\n");
+        g_rx = 5000;
+        tick(RULES_WITH, WG_ROUTES);
+        check("серия: первый проход — выход не тронут", touched(), 0);
+        tick(RULES_WITH, WG_ROUTES);
+        check("серия: второй проход — выход не тронут", touched(), 0);
+        check("серия: до приговора шагов ожидания нет", g_slept, 0);
+        tick(RULES_WITH, WG_ROUTES);
+        check("серия: третий проход — интерфейс перезапущен",
+              cmd_seen("ifdown lo") && cmd_seen("ifup lo"), 1);
+        check("серия: ifdown раньше ifup", cmd_at("ifdown lo") < cmd_at("ifup lo"), 1);
+        check("серия: после перезапуска — десять шагов ожидания", g_slept, 10);
+        check("серия: не ожил — запрет on_fail=drop",
+              cmd_seen("ip route replace blackhole default table 300"), 1);
+        check("серия: не ожил — соединения выхода сняты", cmd_seen("ctnl evict 1048576/267386880"), 1);
+        active_get("wg", dev, sizeof(dev));
+        check("серия: не ожил — выход записан в отказе", !strcmp(dev, "-"), 1);
+        state_read("doubt-wg", rec, sizeof(rec));
+        check("серия: приговор стирает запись сомнения", rec[0] == '\0', 1);
+        /* То же, но после перезапуска туннель отвечает: выход остаётся на устройстве, запрета
+         * нет, а маршрут в таблице цел — соединения не снимаются. */
+        out_set_wg("lo");
+        WG_RESET("wg lo 0\n");
+        g_rx = 5000;
+        g_icmp_after_ifup = 1;
+        tick(RULES_WITH, WG_ROUTES);
+        tick(RULES_WITH, WG_ROUTES);
+        check("серия с оживлением: до третьего прохода выход не тронут", touched(), 0);
+        tick(RULES_WITH, WG_ROUTES);
+        check("серия с оживлением: третий проход — интерфейс перезапущен", cmd_seen("ifdown lo"), 1);
+        check("серия с оживлением: запрета нет",
+              cmd_seen("ip route replace blackhole default table 300"), 0);
+        active_get("wg", dev, sizeof(dev));
+        check("серия с оживлением: выход на устройстве", !strcmp(dev, "lo"), 1);
+
+        /* (в) Проба молчит, а устройство ПРИНИМАЕТ: счётчик растёт от прохода к проходу —
+         *     туннель жив, перезапуска нет, сколько бы проходов ни молчал ICMP. Первый проход
+         *     сравнивать не с чем — он первый в серии; дальше рост серию сбрасывает. */
+        out_set_wg("lo");
+        WG_RESET("wg lo 0\n");
+        g_rx = 1000;
+        {
+            int t = 0;
+            for (int i = 0; i < 8; i++) {
+                tick(RULES_WITH, WG_ROUTES);
+                t += touched();
+                g_rx += 4000;
+            }
+            check("принимает трафик: восемь проходов без ответа ICMP — выход не тронут", t, 0);
+        }
+        active_get("wg", dev, sizeof(dev));
+        check("принимает трафик: выход остаётся на устройстве", !strcmp(dev, "lo"), 1);
+        state_read("doubt-wg", rec, sizeof(rec));
+        check("принимает трафик: серия сброшена", !strncmp(rec, "lo 0 ", 5), 1);
+        /* Счётчик встал — серия идёт с начала: два прохода ещё без приговора, третий — оживление. */
+        g_rx -= 4000;
+        tick(RULES_WITH, WG_ROUTES);
+        check("трафик встал: первый проход серии — выход не тронут", touched(), 0);
+        tick(RULES_WITH, WG_ROUTES);
+        check("трафик встал: второй проход серии — выход не тронут", touched(), 0);
+        tick(RULES_WITH, WG_ROUTES);
+        check("трафик встал: третий проход серии — интерфейс перезапущен", cmd_seen("ifdown lo"), 1);
+
+        /* (г) У самого роутера нет маршрута по умолчанию: туннель молчит, потому что молчит
+         *     провайдер. Ни перезапуска, ни отказа, серия не считается — сколько бы это ни
+         *     длилось; путь вернулся — серия идёт с начала. */
+        out_set_wg("lo");
+        WG_RESET("wg lo 0\n");
+        g_up = 0;
+        g_rx = 5000;
+        {
+            int t = 0;
+            for (int i = 0; i < 5; i++) {
+                tick(RULES_WITH, WG_ROUTES);
+                t += touched();
+            }
+            check("нет пути наружу: пять проходов без ответа — выход не тронут", t, 0);
+        }
+        active_get("wg", dev, sizeof(dev));
+        check("нет пути наружу: выход остаётся на устройстве", !strcmp(dev, "lo"), 1);
+        g_up = 1;
+        tick(RULES_WITH, WG_ROUTES);
+        tick(RULES_WITH, WG_ROUTES);
+        check("путь наружу вернулся: два прохода — ещё без приговора", touched(), 0);
+        tick(RULES_WITH, WG_ROUTES);
+        check("путь наружу вернулся: третий проход без ответа — оживление", cmd_seen("ifdown lo"), 1);
+        /* Выход уже в отказе, пути наружу нет: оживление не делается и отметка перезапуска не
+         * тратится — иначе вернувшийся провайдер застал бы оживление запрещённым на 300 с. */
+        out_set_wg("lo");
+        WG_RESET("wg -\n");
+        g_up = 0;
+        tick(RULES_WITH, "blackhole default \n");
+        check("в отказе без пути наружу: интерфейс не перезапускается",
+              cmd_seen("ifdown") + cmd_seen("ifup"), 0);
+        state_read("restart-lo", rec, sizeof(rec));
+        check("в отказе без пути наружу: отметка перезапуска не потрачена", rec[0] == '\0', 1);
+        /* Путь есть — выход в отказе оживляется сразу, как и раньше: трафика через него нет. */
+        g_up = 1;
+        tick(RULES_WITH, "blackhole default \n");
+        check("в отказе с путём наружу: оживление сразу, без серии", cmd_seen("ifdown lo"), 1);
+
+        /* (д) Чего сомнение не меняет. Устройства нет вовсе — сомневаться не в чем: отказ и
+         *     попытка оживления в том же проходе. */
+        out_set_wg("nodev0");
+        WG_RESET("wg nodev0 0\n");
+        state_rm("restart-nodev0");
+        tick(RULES_WITH, "default dev nodev0 scope link \n");
+        check("устройства нет: оживление в том же проходе", cmd_seen("ifdown nodev0"), 1);
+        check("устройства нет: on_fail в том же проходе",
+              cmd_seen("ip route replace blackhole default table 300"), 1);
+        state_rm("restart-nodev0");
+        /* Пул: текущее устройство существует и молчит, запасное отвечает — уход на запасное в
+         * том же проходе, без серии и без перезапуска. Запасным служит любое второе поднятое
+         * устройство машины (команды только записываются); нет такого — проверка пропускается. */
+        g_spare_dev[0] = '\0';
+        {
+            DIR *d = opendir("/sys/class/net");
+            struct dirent *de;
+            while (d && (de = readdir(d)) != NULL)
+                if (de->d_name[0] != '.' && strcmp(de->d_name, "lo") != 0 &&
+                    strlen(de->d_name) < sizeof(g_spare_dev) && device_present(de->d_name)) {
+                    snprintf(g_spare_dev, sizeof(g_spare_dev), "%s", de->d_name);
+                    break;
+                }
+            if (d) closedir(d);
+        }
+        if (g_spare_dev[0]) {
+            outs_reset();
+            g_spec.out_n = 1;
+            snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "wg");
+            g_spec.out[0].kind = OUT_INTERFACE;
+            g_spec.out[0].on_fail = FAIL_DROP;
+            g_spec.out[0].mark = 0x100000;
+            g_spec.out[0].table = 300;
+            out_pool(&g_spec.out[0], "lo", g_spare_dev);
+            WG_RESET("wg lo 0\n");
+            g_health_probe = spare_health;
+            tick(RULES_WITH, WG_ROUTES);
+            g_health_probe = NULL;
+            active_get("wg", dev, sizeof(dev));
+            check("пул: молчащее текущее, живое запасное — уход сразу", !strcmp(dev, g_spare_dev), 1);
+            check("пул: уход на запасное — без перезапуска интерфейса",
+                  cmd_seen("ifdown") + cmd_seen("ifup"), 0);
+            state_read("doubt-wg", rec, sizeof(rec));
+            check("пул: уход на запасное — серии нет", rec[0] == '\0', 1);
+        } else {
+            fprintf(stderr, "failovermatch: второго поднятого устройства нет — проверка ухода пула "
+                            "на запасное при сомнении пропущена\n");
+        }
+
+        /* (е) Группа v2 из одного члена: член в сомнении — группа держится за него (уйти не на
+         *     кого), её таблица не получает запрет, соединения группы не снимаются. Приговор
+         *     члену на третьем проходе — отказ и члена, и группы. */
+#define RULES_BOTH \
+    "0:\tfrom all lookup local\n" \
+    "32763:\tfrom all fwmark 0x200000/0xff00000 lookup 301\n" \
+    "32764:\tfrom all fwmark 0x100000/0xff00000 lookup 300\n" \
+    "32766:\tfrom all lookup main\n" \
+    "32767:\tfrom all lookup default\n"
+        out_set_wg_group();
+        WG_RESET("");
+        g_icmp_ok = 1;
+        tick(RULES_BOTH, WG_ROUTES);                 /* оба привязаны, записи сторожа есть */
+        active_get("all", dev, sizeof(dev));
+        check("группа v2: подготовка — группа на устройстве члена", !strcmp(dev, "lo"), 1);
+        g_icmp_ok = 0;
+        g_rx = 5000;
+        tick(RULES_BOTH, WG_ROUTES);
+        check("группа v2: член в сомнении — никто не тронут", touched(), 0);
+        active_get("all", dev, sizeof(dev));
+        check("группа v2: член в сомнении — группа остаётся на нём", !strcmp(dev, "lo"), 1);
+        tick(RULES_BOTH, WG_ROUTES);
+        check("группа v2: второй проход серии — никто не тронут", touched(), 0);
+        tick(RULES_BOTH, WG_ROUTES);
+        check("группа v2: приговор члену — его интерфейс перезапущен", cmd_seen("ifdown lo"), 1);
+        check("группа v2: приговор члену — запрет в таблице группы",
+              cmd_seen("ip route replace blackhole default table 301"), 1);
+        active_get("all", dev, sizeof(dev));
+        check("группа v2: приговор члену — группа в отказе", !strcmp(dev, "-"), 1);
+
+        g_icmp_ok = 1; g_icmp_after_ifup = 0; g_up = 1; g_rx = -1;
+        {
+            char path[160];
+            const char *names[] = { "active", "groups", "doubt-wg", "doubt-all", "restart-lo",
+                                    "restart-nodev0", "latency", NULL };
+            for (int i = 0; names[i]; i++) {
+                snprintf(path, sizeof(path), "%s/%s", g_dir, names[i]);
+                unlink(path);
+            }
+            rmdir(g_dir);
+        }
     }
 
     /* ---- via: отказ цели делает нерабочим и зависящий выход ------------------------------ */

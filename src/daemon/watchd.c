@@ -29,11 +29,22 @@
  *
  * РАСПИСАНИЕ: первый проход при старте, следующий — через
  * период после конца предыдущего; событие сети (RTMGRP_LINK, адреса IPv4/IPv6) — внеочередной
- * проход через WATCH_SETTLE_S секунд после первого события пачки. На роутере (plat()->netifd)
- * события, пришедшие за время прохода, — следы его же ifdown/ifup, и они выбрасываются; на
- * телефоне сторож интерфейсы не трогает, и событие за время прохода настоящее — после прохода
- * ещё один через WATCH_SETTLE_S. Смена спеки в памяти демона (apply, reload, SIGHUP) — тоже
- * внеочередной проход.
+ * проход через WATCH_SETTLE_S секунд после первого события пачки. Смена спеки в памяти демона
+ * (apply, reload, SIGHUP) — тоже внеочередной проход. Проход, в котором у выхода началась серия
+ * молчания устройства, несущего его трафик (итог FO_PASS_RETRY; failover.c, «СОМНЕНИЕ»), зовёт
+ * следующий через WATCH_RETRY_S, а не через период: приговор выносится по серии проходов, и
+ * ждать её по минуте на шаг значило бы держать мёртвый туннель лишние минуты.
+ *
+ * СОБЫТИЯ ВО ВРЕМЯ ПРОХОДА. Проход на роутере сам шумит событиями сети: оживляя устройство, он
+ * делает ifdown/ifup (или перезапускает помощника, или перенастраивает awg), и события об ЭТОМ
+ * устройстве — следы его же работы: проход их видит сам (ждёт подъёма) и нового прохода они не
+ * стоят. Какие устройства проход оживляет, он говорит сам (fo_pass_on_revive), и выбрасываются
+ * события только о них — по имени и по номеру устройства. Раньше выбрасывалось ВСЁ, что пришло
+ * за проход, а проход с оживлением идёт до ≈70 с: вернувшийся за это время WAN (PPPoE
+ * переподключился) оставался незамеченным, и выход, которому проход только что поставил
+ * on_fail, лежал до следующего периода. Теперь чужое событие за время прохода — ещё один проход
+ * через WATCH_SETTLE_S после него; потерянные события (ENOBUFS) считаются чужими. На телефоне
+ * сторож интерфейсы не трогает, и там чужим было и остаётся любое событие.
  * В тишине демон просыпается только таймером периода (timerfd на CLOCK_MONOTONIC: во сне
  * устройства он стоит и не будит его).
  *
@@ -116,9 +127,9 @@
  * событие: RTM_NEWLINK приходит и на каждую смену состояния (порт моста, carrier, up), и сверка
  * на каждое такое была бы компиляцией на пустом месте; новый номер бывает только у нового
  * устройства. Только там, где устройства раздачи постоянны (plat()->lan_devs_persist — роутер):
- * на телефоне ingress не ставится вовсе. События за время прохода и перед ним по-прежнему
- * выбрасываются для прохода (следы его же ifdown/ifup), но устройства раздачи из них разбираются
- * всегда — выброшенное пересоздание моста оставило бы цепочку снятой до следующего прохода. */
+ * на телефоне ingress не ставится вовсе. Устройства раздачи разбираются из каждого события, и из
+ * того, что для прохода выброшено (следы его же оживления): выброшенное пересоздание моста
+ * оставило бы цепочку снятой до следующего прохода. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -326,6 +337,13 @@ struct watchd {
      * 0 — устройства нет. */
     struct { char name[IFNAMSIZ]; int idx; } *lan;   /* растёт по числу устройств спеки */
     size_t lan_n, lan_cap;
+    /* Устройства, которые идущий проход взялся оживлять (шапка, «СОБЫТИЯ ВО ВРЕМЯ ПРОХОДА»): имя
+     * и номер на момент оживления — пересозданное устройство приходит с новым номером, а
+     * событие об адресе исчезнувшего несёт только старый. */
+    struct { char name[IFNAMSIZ]; int idx; } *rev;
+    size_t rev_n, rev_cap;
+    int foreign;                  /* дочитанное содержало событие не об оживляемом устройстве */
+    int retry;                    /* проход просил следующий раньше периода (FO_PASS_RETRY) */
 };
 
 /* Сбросить очередь событий: alive у каждого — своя строка в куче. */
@@ -409,9 +427,64 @@ static void watchd_lan_msg(struct watchd *w, const struct nlmsghdr *h) {
     watchd_lan_set(w, name, h->nlmsg_type == RTM_NEWLINK ? ifi->ifi_index : 0);
 }
 
-/* Дочитать сокет событий сети: 1 — было хоть одно событие (как watch_nl_drain). Устройства
- * раздачи разбираются всегда, даже когда событие для прохода выбрасывается. Переполнение
- * (ENOBUFS: события потеряны) — номера устройств раздачи сверяются с ядром заново. */
+/* Проход взялся оживлять устройство dev (fo_pass_on_revive) — события о нём до конца прохода
+ * его собственные. */
+static void watchd_reviving(void *arg, const char *dev) {
+    struct watchd *w = arg;
+    if (strlen(dev) >= IFNAMSIZ) return;
+    for (size_t i = 0; i < w->rev_n; i++)
+        if (!strcmp(w->rev[i].name, dev)) return;
+    if (w->rev_n == w->rev_cap) {
+        size_t nc = w->rev_cap ? w->rev_cap * 2 : 4;
+        void *nr = realloc(w->rev, nc * sizeof(*w->rev));
+        if (!nr) return;              /* без памяти события устройства сочтутся чужими: лишний проход */
+        w->rev = nr;
+        w->rev_cap = nc;
+    }
+    snprintf(w->rev[w->rev_n].name, IFNAMSIZ, "%s", dev);
+    w->rev[w->rev_n].idx = (int)if_nametoindex(dev);
+    w->rev_n++;
+}
+
+/* Событие сети h — об устройстве, которое идущий проход оживляет? Ссылка узнаётся по имени и
+ * номеру, адрес — по номеру: прежнему (устройство уже снято, имени у номера нет) или нынешнему
+ * (устройство пересоздано под тем же именем). Не событие ссылки или адреса — тоже «да»: это
+ * служебные сообщения netlink, а не перемена в сети. */
+static int watchd_msg_own(const struct watchd *w, const struct nlmsghdr *h) {
+    int idx = 0;
+    char name[IFNAMSIZ] = "";
+    if (h->nlmsg_type == RTM_NEWLINK || h->nlmsg_type == RTM_DELLINK) {
+        const struct ifinfomsg *ifi = NLMSG_DATA(h);
+        size_t hl = NLMSG_ALIGN(sizeof(*ifi));
+        if (h->nlmsg_len < NLMSG_HDRLEN + hl) return 1;
+        idx = ifi->ifi_index;
+        const struct rtattr *a = (const struct rtattr *)((const char *)ifi + hl);
+        int left = (int)(h->nlmsg_len - NLMSG_HDRLEN - hl);
+        for (; RTA_OK(a, left); a = RTA_NEXT(a, left))
+            if (a->rta_type == IFLA_IFNAME) {
+                size_t n = RTA_PAYLOAD(a);
+                if (n >= sizeof(name)) n = sizeof(name) - 1;
+                memcpy(name, RTA_DATA(a), n);
+                name[n] = '\0';
+            }
+    } else if (h->nlmsg_type == RTM_NEWADDR || h->nlmsg_type == RTM_DELADDR) {
+        if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifaddrmsg))) return 1;
+        idx = (int)((const struct ifaddrmsg *)NLMSG_DATA(h))->ifa_index;
+    } else {
+        return 1;
+    }
+    for (size_t i = 0; i < w->rev_n; i++) {
+        if (name[0] && !strcmp(name, w->rev[i].name)) return 1;
+        if (idx && (idx == w->rev[i].idx || idx == (int)if_nametoindex(w->rev[i].name))) return 1;
+    }
+    return 0;
+}
+
+/* Дочитать сокет событий сети: 1 — было хоть одно событие (как watch_nl_drain). Было ли среди
+ * них чужое — не об устройстве, которое идущий проход оживляет, — ложится в w->foreign (вне
+ * прохода таких устройств нет, и чужое — всякое). Устройства раздачи разбираются всегда, даже
+ * когда событие для прохода выбрасывается. Переполнение (ENOBUFS: события потеряны) — номера
+ * устройств раздачи сверяются с ядром заново, а потерянное считается чужим. */
 static int watchd_drain(struct watchd *w) {
     if (w->nl < 0) return 0;
     _Alignas(struct nlmsghdr) char buf[8192];
@@ -419,11 +492,12 @@ static int watchd_drain(struct watchd *w) {
     ssize_t r;
     while ((r = recv(w->nl, buf, sizeof(buf), 0)) > 0 || (r < 0 && errno == ENOBUFS)) {
         any = 1;
-        if (r < 0) { lost = 1; continue; }
-        if (!watchd_lan_on(w)) continue;
+        if (r < 0) { lost = 1; w->foreign = 1; continue; }
         size_t m = (size_t)r;
-        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, m); h = NLMSG_NEXT(h, m))
-            watchd_lan_msg(w, h);
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, m); h = NLMSG_NEXT(h, m)) {
+            if (!watchd_msg_own(w, h)) w->foreign = 1;
+            if (watchd_lan_on(w)) watchd_lan_msg(w, h);
+        }
     }
     if (lost && watchd_lan_on(w) && w->d->have)
         for (size_t i = 0; i < w->d->sp->lan_dev_n; i++)
@@ -448,7 +522,12 @@ static void watchd_settle(struct watchd *w) {
 static void watchd_period(struct watchd *w) {
     w->settling = 0;
     if (watchd_dormant(w)) { loop_timer_stop(w->tm); return; }
-    loop_timer_set(w->tm, w->cf.period_s * 1000L);
+    /* Серия молчания у выхода (FO_PASS_RETRY) — следующий проход раньше; период короче
+     * WATCH_RETRY_S (стенды) остаётся периодом. */
+    long s = w->cf.period_s;
+    if (w->retry && s > WATCH_RETRY_S) s = WATCH_RETRY_S;
+    w->retry = 0;
+    loop_timer_set(w->tm, s * 1000L);
 }
 
 static void watchd_timer(struct loop *l, struct loop_timer *t, void *arg) {
@@ -480,12 +559,15 @@ static void watchd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
     (void)fd;
     if (!watchd_drain(w)) return;
     if (watchd_dormant(w)) return;
-    /* Во время прохода: на роутере — следы его же ifdown/ifup (выбрасываются после прохода),
-     * на телефоне — настоящее событие, и после прохода нужен ещё один. */
+    /* Во время прохода: событие об устройстве, которое проход сам оживляет, — след его работы и
+     * выбрасывается; чужое — настоящее, и после прохода нужен ещё один (шапка, «СОБЫТИЯ ВО
+     * ВРЕМЯ ПРОХОДА»). На телефоне сторож интерфейсы не трогает — там настоящее любое. */
     if (w->run) {
-        if (!plat()->netifd) w->pending = 1;
+        if (!plat()->netifd || w->foreign) w->pending = 1;
+        w->foreign = 0;
         return;
     }
+    w->foreign = 0;
     watchd_settle(w);
 }
 
@@ -608,8 +690,16 @@ static void watchd_after(struct watchd *w) {
     /* Таймеры замеров групп latency — по спеке, которую проход только что прошёл (новая группа
      * получает свой, ушедшая теряет). */
     if (!watchd_dormant(w)) folat_sync(w->lat);
-    /* На роутере события за время прохода — следы его же ifdown/ifup (см. шапку). */
-    if (plat()->netifd) watchd_drain(w);
+    /* На роутере недочитанное за время прохода — следы его же оживления, кроме событий о чужих
+     * устройствах: те зовут ещё один проход (шапка, «СОБЫТИЯ ВО ВРЕМЯ ПРОХОДА»). Со следующего
+     * события оживляемых устройств нет: то, что придёт о них ПОСЛЕ прохода (netifd поднимает
+     * интерфейс не мгновенно), — повод пройти ещё раз и вернуть выход. */
+    if (plat()->netifd) {
+        watchd_drain(w);
+        if (w->foreign) w->pending = 1;
+    }
+    w->foreign = 0;
+    w->rev_n = 0;
     if (w->pending) {
         w->pending = 0;
         watchd_settle(w);
@@ -626,6 +716,7 @@ static void watchd_pass_done(void *arg, int res) {
         w->revive_next = 1;
         w->pending = 1;
     }
+    if (res & FO_PASS_RETRY) w->retry = 1;
     watchd_after(w);
 }
 
@@ -758,6 +849,11 @@ static void watchd_pass_start(struct watchd *w) {
     if (w->lat) fo_pass_lat_extern(w->run);
     if (!w->revive_next) fo_pass_defer_revive(w->run);
     w->revive_next = 0;
+    /* Что успело прийти до прохода — уже в нём; оживляемые устройства — с чистого листа. */
+    w->rev_n = 0;
+    w->foreign = 0;
+    w->retry = 0;
+    fo_pass_on_revive(w->run, watchd_reviving, w);
     loop_timer_set(w->kill_tm, watchd_pass_max_s(w->sp) * 1000L);
 }
 

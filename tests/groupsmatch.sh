@@ -10,6 +10,11 @@
 # стороне ответчика.
 #
 # Что проверяется.
+#  5. Закрепление order и latency и молчание члена: предпочтительный член вернулся или другой стал
+#     быстрее — установленное соединение доживает на прежнем члене, новое идёт на выбранный, и так
+#     несколько кругов колебаний задержки; проба члена молчит, а устройство на месте — группа уходит
+#     на живого в том же проходе, член не получает ни отказа, ни оживления, соединение через него
+#     живёт; три прохода молчания подряд — отказ члена.
 #  1. manual: `steer select man b` переключает таблицу группы на устройство b без apply (набор
 #     правил в ядре не пересоздаётся), подписчику — switched с by: select и member; status — select
 #     и selected; выбор переживает перезапуск демона и «перезагрузку» (чистый каталог состояния,
@@ -106,6 +111,8 @@ R() { nsenter -t "$RPID" -n "$@"; }
 C() { nsenter -t "$CPID" -n "$@"; }
 R ip link set lo up
 R ip addr add 1.1.1.1/32 dev lo; R ip addr add 8.8.8.8/32 dev lo; R ip addr add 10.2.0.1/32 dev lo
+# Адреса правил закрепляющих групп (5): 10.6.0.1 — order, 10.7.0.1 — latency.
+R ip addr add 10.6.0.1/32 dev lo; R ip addr add 10.7.0.1/32 dev lo
 # «Сайты» групп by (3а): 10.4.0.1-24 — by: site, 10.5.0.1-24 — by: site_client.
 for i in $(seq 1 24); do R ip addr add 10.4.0.$i/32 dev lo; R ip addr add 10.5.0.$i/32 dev lo; done
 for k in 1 2 3; do
@@ -199,7 +206,7 @@ PY
 cat > "$tmp/echo.py" <<'PY'
 import socket, threading
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('10.2.0.1', 9000)); s.listen(16)
+s.bind(('0.0.0.0', 9000)); s.listen(16)
 def serve(c, a):
     f = c.makefile('rwb', buffering=0)
     for line in f:
@@ -225,7 +232,7 @@ PY
 # Долгое соединение клиента: пишет строку по сигналу (файл-триггер), ответ — в журнал.
 cat > "$tmp/long.py" <<'PY'
 import socket, sys, time, os
-s = socket.create_connection(('10.2.0.1', 9000), timeout=5)
+s = socket.create_connection((sys.argv[3] if len(sys.argv) > 3 else '10.2.0.1', 9000), timeout=5)
 f = s.makefile('rwb', buffering=0)
 out = open(sys.argv[1], 'a', buffering=1)
 n = 0
@@ -260,6 +267,8 @@ printf '10.2.0.0/24\n' > "$tmp/bal.lst"
 printf '10.3.0.0/24\n' > "$tmp/idl.lst"
 printf '10.4.0.0/24\n' > "$tmp/sit.lst"
 printf '10.5.0.0/24\n' > "$tmp/sic.lst"
+printf '10.6.0.0/24\n' > "$tmp/po.lst"
+printf '10.7.0.0/24\n' > "$tmp/pl.lst"
 V6G=""
 [ "$V6" = 1 ] && V6G='  v6g: { kind: group, pick: latency, members: [b, a], url: "http://probe.test:8080/v6_204", tolerance: 60, idle_timeout: 0 }'
 cat > "$tmp/spec.yaml" <<EOF
@@ -270,6 +279,8 @@ lists:
   li: { prefixes_file: $tmp/idl.lst }
   ls: { prefixes_file: $tmp/sit.lst }
   lc: { prefixes_file: $tmp/sic.lst }
+  lpo: { prefixes_file: $tmp/po.lst }
+  lpl: { prefixes_file: $tmp/pl.lst }
 outputs:
   a:   { kind: interface, device: sw1 }
   b:   { kind: interface, device: sw2 }
@@ -288,7 +299,11 @@ $V6G
   bal: { kind: group, pick: balance, members: [a, b] }
   sit: { kind: group, pick: balance, by: site, members: [a, b, c] }
   sic: { kind: group, pick: balance, by: site_client, members: [a, b, c] }
+  po:  { kind: group, pick: order, members: [a, b] }
+  pl:  { kind: group, pick: latency, members: [b, a], url: "http://10.2.0.1:8080/pl_204", tolerance: 30, interval: 5, idle_timeout: 0 }
 rules:
+  - { name: po, to: [lpo], out: po }
+  - { name: pl, to: [lpl], out: pl }
   - { name: bal, to: [lb], out: bal }
   - { name: idl, to: [li], out: idl }
   - { name: sit, to: [ls], out: sit }
@@ -575,7 +590,10 @@ sw_why() {   # ВЫХОД УСТРОЙСТВО — «причина член» �
 }
 check "  подписчику — switched на c с причиной down (не latency)" "down c" "$(sw_why dead3 sw3)"
 ip link set sw1 up
-wait_for '[ "$(tdev dead3)" = sw1 ]' 40
+# Ждать и таблицу, и status: таблицу группы проход переписывает посреди обхода, а память, по которой
+# отвечает status (active, groups), кладёт в конце прохода — между ними до секунды status ещё
+# называет прежний член (сторож на этой спеке проходит дольше: группы po и pl части 5).
+wait_for '[ "$(tdev dead3) $(st outputs.dead3.group.selected)" = "sw1 a" ]' 40
 check "a вернулся: группа снова на самом быстром" "sw1 a" "$(tdev dead3) $(st outputs.dead3.group.selected)"
 wait_for '[ "$(sw_why dead3 sw1)" = "latency a" ]' 10
 check "  возврат на a — switched с причиной latency" "latency a" "$(sw_why dead3 sw1)"
@@ -725,6 +743,106 @@ check "  у клиента .3 — тоже" "" "$(echo "$c3" | tr ' ' '\n' | gre
 check "  у разных клиентов один сайт бывает на разных членах" "yes" "$([ "$c2" != "$c3" ] && echo yes || echo no)"
 check "  в цепочке группы — jhash пары адресов" "1" \
     "$(nft list chain inet steer "bal_$(reg sic 3)" | grep -c 'jhash ip saddr . ip daddr mod 120 seed')"
+
+# ---- 5. закрепление order и latency; молчание члена ----
+# Жалоба с живых роутеров: долгое соединение (голос) рвётся и возвращается само, чаще — когда выходов
+# несколько. Смена члена «нашёлся лучший» (предпочтительный вернулся, другой стал быстрее) рвать
+# установленное не должна: оно доживает на прежнем члене, новые идут на выбранный. И член, чья проба
+# молчит, а устройство на месте, не получает ни отказа, ни оживления по одному проходу: группа уходит
+# с него сразу, а его соединения живут, пока молчание не подтверждено (failover.c, «СОМНЕНИЕ»).
+long_open() {
+    rm -f "$tmp/$1.log" "$tmp/$1.go".*
+    nsenter -t "$CPID" -n python3 "$tmp/long.py" "$tmp/$1.log" "$tmp/$1.go" "$2" >"$tmp/$1.err" 2>&1 &
+    LPS="$LPS $!"
+    sleep 0.5
+}
+# long_say ИМЯ N — N-я строка по долгому соединению; ответ — адрес члена, которым оно идёт (пусто —
+# соединение умерло).
+long_say() {
+    touch "$tmp/$1.go.$2"
+    ls_i=0
+    while [ $ls_i -lt 60 ]; do
+        ls_r="$(awk -v n="$2" '$1 == n { print $2 }' "$tmp/$1.log" 2>/dev/null)"
+        [ -n "$ls_r" ] && break
+        sleep 0.1; ls_i=$((ls_i + 1))
+    done
+    echo "$ls_r"
+}
+# via АДРЕС — каким членом идёт новое соединение.
+via() { C python3 -c 'import socket, sys
+s = socket.create_connection((sys.argv[1], 9000), timeout=3)
+s.sendall(b"x\n")
+print(s.makefile().readline().strip())' "$1" 2>/dev/null; }
+sel() { st "outputs.$1.group.selected"; }
+# on ГРУППА ЧЛЕН — карта новых соединений группы в ядре ведёт на члена. Ждать надо её, а не status:
+# тот считает выбор и по наличию устройства, то есть меняется раньше прохода, который переписывает карту.
+on() { [ "$(nft list map inet steer "balmap_$(reg "$1" 3)" 2>/dev/null | grep -o 'goto mark_[0-9]*' | sort -u | tr '\n' ' ')" = "goto mark_$(reg "$2" 3) " ]; }
+LPS=""
+R tc qdisc del dev sw1p root 2>/dev/null; R tc qdisc del dev sw2p root 2>/dev/null
+ip link set sw1 up; ip link set sw2 up; ip link set sw3 up
+stop_daemon
+start_daemon
+wait_for 'on po a' 40
+check "order: оба члена живы — группа на первом" "a" "$(sel po)"
+ip link set sw1 down
+wait_for 'on po b' 20
+long_open o1 10.6.0.1
+check "order: a лёг — соединение идёт через b" "10.9.2.1" "$(long_say o1 0)"
+ip link set sw1 up
+wait_for 'on po a' 60
+check "order: предпочтительный вернулся — группа снова на нём" "a" "$(sel po)"
+check "  установленное соединение дожило на прежнем члене" "10.9.2.1" "$(long_say o1 1)"
+check "  новое соединение — через предпочтительный" "10.9.1.1" "$(via 10.6.0.1)"
+
+# latency: задержки колеблются — группа ходит между членами, долгое соединение остаётся на своём.
+R tc qdisc add dev sw1p root netem delay 100ms
+wait_for 'on pl b' 40
+long_open l1 10.7.0.1
+check "latency: быстрый — b, соединение через него" "b 10.9.2.1" "$(sel pl) $(long_say l1 0)"
+for round in 1 2; do
+    R tc qdisc del dev sw1p root; R tc qdisc add dev sw2p root netem delay 100ms
+    wait_for 'on pl a' 40
+    check "latency, круг $round: быстрее стал a — группа на нём" "a" "$(sel pl)"
+    check "  установленное соединение дожило на b" "10.9.2.1" "$(long_say l1 $((round * 2 - 1)))"
+    check "  новое соединение — через a" "10.9.1.1" "$(via 10.7.0.1)"
+    R tc qdisc del dev sw2p root; R tc qdisc add dev sw1p root netem delay 100ms
+    wait_for 'on pl b' 40
+    check "latency, круг $round: быстрее снова b — группа на нём" "b" "$(sel pl)"
+    check "  установленное соединение по-прежнему живо" "10.9.2.1" "$(long_say l1 $((round * 2)))"
+done
+R tc qdisc del dev sw1p root 2>/dev/null
+
+# Молчание члена: эхо-запросы через sw1 у ответчика пропадают, остальной трафик идёт.
+silence() {
+    R nft add table ip gm_silence
+    R nft add chain ip gm_silence in '{ type filter hook input priority 0; policy accept; }'
+    R nft add rule ip gm_silence in iifname sw1p icmp type echo-request drop
+}
+wait_for 'on po a' 60
+long_open d1 10.6.0.1
+check "молчание члена: до него соединение идёт через a" "a 10.9.1.1" "$(sel po) $(long_say d1 0)"
+emark=$(wc -l < "$tmp/d.err"); smark=$(wc -l < "$tmp/sub.out")
+silence
+wait_for 'tail -n +$((emark + 1)) "$tmp/d.err" | grep -q "выход a: sw1 не отвечает (1 из 3 подряд)"' 30
+wait_for 'on po b' 10
+check "молчание члена: группа ушла на живого, не дожидаясь приговора" "b" "$(sel po)"
+check "  таблица члена — на его устройстве, члену отказ не записан" "sw1 ok" \
+    "$(tdev a) $([ "$(st outputs.a.failed)" = True ] && echo failed || echo ok)"
+check "  соединение через молчащий член живо" "10.9.1.1" "$(long_say d1 1)"
+check "  новое соединение — через b" "10.9.2.1" "$(via 10.6.0.1)"
+R nft delete table ip gm_silence
+wait_for 'on po a' 60
+check "проба члена снова отвечает — группа вернулась на него" "a" "$(sel po)"
+check "  соединение дожило" "10.9.1.1" "$(long_say d1 2)"
+check "  члена не оживляли и в отказ не ставили" "0 0" \
+    "$(tail -n +$((emark + 1)) "$tmp/d.err" | grep -c 'sw1: не отвечает — ') $(tail -n +$((smark + 1)) "$tmp/sub.out" | grep -c '"ev":"failed","out":"a"')"
+# Молчание подтверждено тремя проходами подряд — отказ члена, как и раньше.
+silence
+wait_for 'tail -n +$((smark + 1)) "$tmp/sub.out" | grep -q "\"ev\":\"failed\",\"out\":\"a\""' 90
+check "молчание три прохода подряд — отказ члена" "1" \
+    "$(tail -n +$((smark + 1)) "$tmp/sub.out" | grep -c '"ev":"failed","out":"a"')"
+R nft delete table ip gm_silence
+for p in $LPS; do kill "$p" 2>/dev/null; done
 
 stop_daemon
 echo "groupsmatch: $pass passed, $fail failed"

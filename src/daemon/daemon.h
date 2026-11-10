@@ -107,6 +107,10 @@ int cmd_explain(const char *spec, const char *what);
 int watch_nl_open(void);
 int watch_nl_drain(int fd);
 #define WATCH_SETTLE_S 5
+/* Через сколько сторож демона проходит снова, когда проход оставил выход в сомнении с начатой
+ * серией молчания (FO_PASS_RETRY; failover.c, «СОМНЕНИЕ» — там же, почему 15: три прохода серии
+ * укладываются в ≈45 с). */
+#define WATCH_RETRY_S 15
 /* masquerade на телефоне сторож возвращает не на каждом проходе (watch.c, watch_masq_due). */
 #define WATCH_MASQ_S 600
 int watch_masq_due(long *last, int force);
