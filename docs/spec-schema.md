@@ -67,7 +67,8 @@
 
 **Записи «имя → запись»** (`clients`, `lists`, `outputs`, `dns.upstreams`): `type: object`,
 `additionalProperties` — схема записи, `x-name` — `{"pattern", "maxLength", "reserved"}` для имени
-(`reserved` — занятые слова: клиент `lan`, список `all`). **Список записей** (`rules`) — `type: array`
+(`reserved` — занятые слова: клиент `lan`, список `all`). `pattern` у `x-name` шире разбора: имя,
+начинающееся с `-`, и имена `.` и `..` он пропускает, а разбор отвергает. **Список записей** (`rules`) — `type: array`
 и `items`.
 
 **Записи с вариантами.** Выход устроен по виду, а ключи вида разные, поэтому у записи `outputs.<имя>`
@@ -80,9 +81,11 @@
   `x-spec` (`{"kind": "tunnel", "protocol": "vless"}`) и `x-example` (годная запись: обязательные
   ключи с примерами). В `properties` варианта стоят **все** ключи этого вида — общие и свои, и
   только они; ключа, которого вида не знает, в варианте нет;
-- вариант вида, которого нет в сборке, — `x-absent` с причиной («kind vless требует пакет
-  steer-vless») и без ключей: форму для него нельзя нарисовать, а разбор такую спеку отвергает;
-- `x-protocols` у записи — перечень протоколов `tunnel` (встроенных и плагинных).
+- вариант вида ядра, которого нет в сборке, — `x-absent` с причиной («kind awg в этой сборке нет»)
+  и без ключей: форму для него нельзя нарисовать, а разбор такую спеку отвергает. Виды протоколов
+  (`tunnel:<протокол>`, `xsteer`, `warp`, `tgws`) приходят только из установленных плагинов: пока
+  плагина нет, варианта его вида в схеме нет вовсе (раздел «Виды плагинов»);
+- `x-protocols` у записи — перечень протоколов `tunnel` установленных плагинов (без них — пустой).
 
 `dns.upstreams.<имя>` и `dns` правила (`rules[].dns`: имя или запись) — тоже с вариантами:
 `x-discriminator`: `{"has": "servers", "yes": "group", "no": "server"}` — есть ключ `servers`, и это
@@ -97,10 +100,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "x-schema-version": 1,
-  "x-steer-version": "2.0.5",
+  "x-steer-version": "2.1.0",
   "x-platform": "router",
   "x-plugins": [
-    { "id": "warpbox", "version": "1.0.0", "enabled": true, "kinds": ["warp"] }
+    { "id": "warpbox", "version": "2.1.0", "enabled": true, "kinds": ["warp"] }
   ],
   "type": "object",
   "properties": {
@@ -135,7 +138,7 @@
       "additionalProperties": {
         "type": "object",
         "required": ["kind"],
-        "properties": { "kind": { "type": "string", "enum": ["direct", "interface", "tunnel", "group", "warp"] } },
+        "properties": { "kind": { "type": "string", "enum": ["direct", "interface", "awg", "block", "group", "warp"] } },
         "x-discriminator": { "key": "kind", "then": { "tunnel": "protocol" } },
         "x-variants": {
           "group": {
@@ -202,9 +205,9 @@
 - у ключа плагина без `x-example` пример берётся из `default`, первого значения `enum` или по типу
   и границам — чтобы `x-example` варианта был годной записью;
 - у варианта `x-plugin: {"id", "version"}`;
-- вид плагина, чьё имя совпало с видом ядра (`impl: core`: плагин даёт допуск, а код остаётся в ядре),
-  замещает его вариант на его месте. Пока плагина `warp` нет, `kind: warp` разворачивает само ядро, и
-  вариант `warp` строится из таблицы ключей (`V2S_WARP`);
+- вид плагина, чьё имя совпало с видом ядра (`impl: core`: код вида остаётся в ядре, а плагин
+  добавляет зависимости и помощника — `awg` у плагина `awg`, `interface` у плагина `obfs`), замещает
+  его вариант на его месте;
 - выключенный плагин и его виды в `x-variants` не попадают; он назван в `x-plugins` с `enabled: false`
   и причиной в `why`.
 
@@ -234,7 +237,7 @@
   «только на телефоне»);
 - плагины: виды и ключи плагинов вливаются с `x-plugin`, их ключи принимает разбор, выключенный плагин
   назван в `x-plugins`;
-- виды расширенной части (`vless`, `hysteria2`, `trojan`, `shadowsocks`, `socks`, `http`, `vmess`,
-  `xsteer`) — в сборке с модулями: `tests/libs-test.sh` (`make libs-test`, входит в `tests/ext-test.sh`)
-  зовёт тот же стенд на раскладке с модулями; в `make test` таких видов нет, и схема называет их
-  недоступными.
+- виды плагинов протоколов (`vless`, `hysteria2`, `trojan`, `shadowsocks`, `socks`, `http`, `vmess`,
+  `xsteer`) — на раскладке с библиотеками и плагинами: `tests/libs-test.sh` (`make libs-test`, входит в
+  `tests/ext-test.sh`) зовёт тот же стенд там; в `make test` плагинов протоколов нет, и этих видов в
+  схеме нет.
