@@ -142,16 +142,45 @@ static int fakeip_table_has(const struct fakeip_table *t, const char *domain) {
  * Missing file -> empty table, not an error (first run). A malformed line is
  * skipped, not fatal — the domain simply gets re-allocated (a fresh index) on
  * the next match. Испорченное четвёртое поле строку не
- * отвергает: пропадает только настоящий IPv6, и первый AAAA спросит его заново. */
+ * отвергает: пропадает только настоящий IPv6, и первый AAAA спросит его заново.
+ *
+ * СТРОГОСТЬ К ЧУЖИМ СТРОКАМ. Файл писали и версии, копировавшие имя из провода как есть: имя с
+ * табуляцией и переводом строки («x\t198.18.A.B\t6.6.6.6\n.youtube.com») дописывало в файл чужую
+ * строку, и после перезапуска запись «x» получала поддельный адрес youtube.com с настоящим
+ * адресом нападающего, а rehydrate ставил его в карту поверх элемента жертвы. Поэтому строка
+ * отвергается, если: имя не из тех, что даёт разбор вопроса (dns_name_ok); поддельный адрес уже
+ * выдан другому имени этого файла (первая раздача побеждает — так же решают засев карты в
+ * наборе правил, print.c, и наборов, fpseed.c); строка длиннее буфера (хвост строки иначе
+ * читался бы следующей строкой). Настоящий адрес внутри пула (подмена на поддельный же адрес) —
+ * не адрес: запись остаётся без него. Отвергнутое помечает таблицу грязной: ближайшая
+ * перезапись снимает такие строки и для остальных читателей файла (засев карты, туннель). */
 void fakeip_state_load(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return;
+    /* Поддельные адреса, уже занятые (в таблице до загрузки и строками выше): бит на адрес пула. */
+    uint8_t *taken = calloc(1, FAKEIP_POOL_SIZE / 8);
+    if (!taken) { fclose(f); return; }
+    for (size_t i = 0; i < g_fakeip.n; i++) {
+        uint32_t a = g_fakeip.entries[i].addr;
+        if (a >= FAKEIP_POOL_BASE && a < FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE)
+            taken[(a - FAKEIP_POOL_BASE) >> 3] |= (uint8_t)(1u << ((a - FAKEIP_POOL_BASE) & 7));
+    }
+    size_t bad = 0;
     char line[MAX_HOSTNAME + 128];          /* имя, два адреса IPv4, IPv6 и табуляции */
     while (fgets(line, sizeof(line), f)) {
-        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        else if (!feof(f)) {
+            /* Длиннее любой строки, которую пишет резолвер: брак целиком, вместе с хвостом. */
+            int c;
+            while ((c = fgetc(f)) != EOF && c != '\n') {}
+            bad++;
+            continue;
+        }
         char *tab1 = strchr(line, '\t');
         if (!tab1) continue;
         *tab1 = '\0';
+        if (!dns_name_ok(line)) { bad++; continue; }
         /* Terminate the fake-IP field BEFORE parsing it. inet_aton() rejects a
          * string with anything after the address, so reading the 3-field form
          * without cutting at the second tab fed it "198.18.0.0\t104.20.39.144"
@@ -177,7 +206,10 @@ void fakeip_state_load(const char *path) {
          * both bloat the table and, before the high-water mark above, corrupt the
          * next index. */
         if (fakeip_table_has(&g_fakeip, line) == 0) continue;
+        uint32_t fi = ntohl(a.s_addr) - FAKEIP_POOL_BASE;
+        if (taken[fi >> 3] & (1u << (fi & 7))) { bad++; continue; }
         if (fakeip_table_add(&g_fakeip, line, ntohl(a.s_addr)) != 0) continue;
+        taken[fi >> 3] |= (uint8_t)(1u << (fi & 7));
 
         if (tab2) { /* optional third field: last-seen real backend */
             char *real_s = tab2 + 1;
@@ -187,9 +219,11 @@ void fakeip_state_load(const char *path) {
             /* И «в ядре» (real_host — до rehydrate, который подтвердит его или обнулит), и «знаем»
              * (real_saved — до следующего ответа; неудачная запись в ядро его не трогает, см.
              * struct fakeip_entry). */
-            if (inet_aton(real_s, &r) != 0)
+            uint32_t rh = inet_aton(real_s, &r) != 0 ? ntohl(r.s_addr) : 0;
+            if (rh >= FAKEIP_POOL_BASE && rh < FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE) { rh = 0; bad++; }
+            if (rh)
                 g_fakeip.entries[g_fakeip.n - 1].real_host =
-                    g_fakeip.entries[g_fakeip.n - 1].real_saved = ntohl(r.s_addr);
+                    g_fakeip.entries[g_fakeip.n - 1].real_saved = rh;
             uint8_t r6[16];
             if (tab3 && inet_pton(AF_INET6, tab3 + 1, r6) == 1) {
                 memcpy(g_fakeip.entries[g_fakeip.n - 1].real6, r6, 16);
@@ -199,6 +233,13 @@ void fakeip_state_load(const char *path) {
         }
     }
     fclose(f);
+    free(taken);
+    if (bad) {
+        g_fakeip_dirty = 1;
+        fprintf(stderr, "steer dnsd: файл состояния fake-IP %s: отвергнуто строк — %zu (имя не "
+                        "имя DNS, поддельный адрес уже выдан другому имени или настоящий адрес из "
+                        "пула); файл будет перезаписан без них\n", path, bad);
+    }
 }
 
 static int fakeip_writer_active(void);

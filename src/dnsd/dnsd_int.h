@@ -371,6 +371,10 @@ void dch_del6(size_t i, const char *domain, const uint8_t addr[16]);
 #define DNSD_OPT_NOFORWARD 65001
 
 /* wire.c */
+/* Имя-строка из тех, что может дать разбор вопроса (метки без байтов 0x00-0x20, '.' и 0x7F, без
+ * пустых меток, не длиннее MAX_HOSTNAME - 1): 1 — да. Им проверяются имена, пришедшие не из провода
+ * (файл состояния fake-IP, команда --fakeip). Корень (пустое имя) — нет: fake-IP его не получает. */
+int dns_name_ok(const char *s);
 int query_noforward(const uint8_t *pkt, size_t len, size_t qend);
 int parse_query(const uint8_t *pkt, size_t len, char *out_qname,
                  size_t qname_len, uint16_t *out_qtype, size_t *out_qend);

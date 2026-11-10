@@ -409,6 +409,146 @@ int main(void) {
     }
 
     {
+        /* ИМЕНА С ЧУЖИМИ БАЙТАМИ В МЕТКЕ (аудит 2.1.0, D1–D3; стенд аудита audit/dnsname.c).
+         * Метка из провода становилась строкой как есть: байт 0 обрывал имя (вопрос в зону
+         * нападающего читался как youtube.com, и адрес из его ответа вставал в карту fake-IP),
+         * точка внутри метки давала то же имя, что две метки (отравление кэша), табуляция и
+         * перевод строки дописывали строки в файл состояния. */
+        uint8_t q[600];
+        char name[MAX_HOSTNAME];
+        uint16_t qtype = 0;
+        size_t qend = 0;
+        #define MKQ(wire, wl) do {                                                   \
+            memset(q, 0, 12); q[0] = 0x11; q[1] = 0x22; q[2] = 0x01; q[5] = 1;       \
+            memcpy(q + 12, (wire), (wl)); qn = 12 + (wl);                            \
+            q[qn++] = 0; q[qn++] = 1; q[qn++] = 0; q[qn++] = 1; } while (0)
+        size_t qn;
+        static const uint8_t nul[] = "\x07youtube\x04" "com\x00" "\x08" "attacker\x07" "example";
+        MKQ(nul, sizeof(nul));
+        check("D1: вопрос с байтом 0 в метке не разобран", -1,
+              parse_query(q, qn, name, sizeof(name), &qtype, &qend));
+        /* Ответ апстрима на тот же вопрос с A 6.6.6.6 — тоже не разобран: ни правил, ни карты. */
+        static const uint8_t a6666[] = { 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0x0e, 0x10, 0, 4, 6, 6, 6, 6 };
+        uint8_t r[700];
+        memcpy(r, q, qn); r[2] = 0x81; r[3] = 0x80; r[7] = 1;
+        memcpy(r + qn, a6666, sizeof(a6666));
+        struct answer_ip ips[4];
+        int n6 = 0;
+        check("D1: ответ на такой вопрос не разобран (адрес в карту не идёт)", -1,
+              parse_response(r, qn + sizeof(a6666), name, sizeof(name), &qtype, &qend, ips, 4, NULL, 0, &n6));
+        static const uint8_t dot[] = "\x0byoutube.com";
+        MKQ(dot, sizeof(dot));
+        check("D2: точка внутри метки — не разобран", -1,
+              parse_query(q, qn, name, sizeof(name), &qtype, &qend));
+        static const char *const badl[] = { "x\t198", "x\n198", "a b", "x\x7f", "x\x01", NULL };
+        for (int i = 0; badl[i]; i++) {
+            uint8_t w[80];
+            size_t l = strlen(badl[i]);
+            w[0] = (uint8_t)l; memcpy(w + 1, badl[i], l);
+            memcpy(w + 1 + l, "\x07youtube\x03" "com", 13);     /* с корнем: 12 байт меток и 0 */
+            MKQ(w, 1 + l + 13);
+            char what[96];
+            snprintf(what, sizeof(what), "D3: метка с байтом 0x%02x не разобрана",
+                     (unsigned)(uint8_t)badl[i][1]);
+            check(what, -1, parse_query(q, qn, name, sizeof(name), &qtype, &qend));
+        }
+        /* Законные имена проходят: подчёркивание, дефис, цифры, punycode, регистр, байты UTF-8. */
+        static const struct { const char *wire; size_t wl; const char *str; } good[] = {
+            /* Длина — с корнем: завершающий байт 0 литерала. */
+            { "\x06_dmarc\x07" "Example\x03" "COM", 20, "_dmarc.Example.COM" },
+            { "\x0exn--80ak6aa92e\x03" "com", 20, "xn--80ak6aa92e.com" },
+            { "\x05" "a-b_c\x02" "1x\x01*", 12, "a-b_c.1x.*" },
+            { "\x02\xc3\xa9\x04test", 9, "\xc3\xa9.test" },
+        };
+        for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+            MKQ(good[i].wire, good[i].wl);
+            char what[96];
+            snprintf(what, sizeof(what), "законное имя %zu разобрано как есть", i);
+            int rc = parse_query(q, qn, name, sizeof(name), &qtype, &qend);
+            check(what, 1, rc == 0 && !strcmp(name, good[i].str));
+        }
+        /* Имя ЗАПИСИ ответа с байтом 0 не отменяет адресов: строкой его никто не читает. */
+        static const uint8_t www[] = "\x03www\x04test";
+        MKQ(www, sizeof(www));
+        memcpy(r, q, qn); r[2] = 0x81; r[3] = 0x80; r[7] = 1;
+        static const uint8_t rr[] = { 3, 'x', 0, 'y', 0, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4 };
+        memcpy(r + qn, rr, sizeof(rr));
+        int na = parse_response(r, qn + sizeof(rr), name, sizeof(name), &qtype, &qend, ips, 4, NULL, 0, &n6);
+        check("имя записи ответа с байтом 0: адрес собран", 1,
+              na == 1 && ips[0].addr == htonl(0x01020304u) && !strcmp(name, "www.test"));
+        #undef MKQ
+
+        /* Кэш: ключ — метки с длинами. NXDOMAIN на однометочное «youtube.com» не отдаётся тому,
+         * кто спрашивает настоящий youtube.com (прежде — 29 байт с RCODE 3). */
+        struct dcache_cfg dc = { 64, 0, 3600, 300 };
+        dcache_config(&dc);
+        uint8_t nx[64] = { 0x00, 0x02, 0x81, 0x83, 0, 1, 0, 0, 0, 0, 0, 0 };
+        memcpy(nx + 12, "\x0byoutube.com\0\0\1\0\1", 17);
+        check("D2: NXDOMAIN на однометочное имя кладётся в кэш", 1, dcache_put(1, nx, 29, 1000));
+        uint8_t yq[64] = { 0x77, 0x77, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+        memcpy(yq + 12, "\x07youtube\x03" "com\0\0\1\0\1", 17);
+        uint8_t gb[512];
+        check("D2: ...и не отдаётся на вопрос о настоящем youtube.com", 0,
+              (int)dcache_get(1, yq, 29, gb, sizeof(gb), 1001));
+        memcpy(yq + 12, "\x0bYouTube.com\0\0\1\0\1", 17);
+        check("D2: на то же однометочное имя (другой регистр) — отдаётся", 29,
+              (int)dcache_get(1, yq, 29, gb, sizeof(gb), 1001));
+        dcache_flush();
+
+        /* Имя-строка (файл состояния, --fakeip). */
+        check("dns_name_ok: обычное", 1, dns_name_ok("www.example.com"));
+        check("dns_name_ok: подчёркивание и punycode", 1, dns_name_ok("_sip._tcp.xn--p1ai"));
+        check("dns_name_ok: табуляция", 0, dns_name_ok("x\t198.18.0.5"));
+        check("dns_name_ok: пробел", 0, dns_name_ok("a b.test"));
+        check("dns_name_ok: пустая метка", 0, dns_name_ok("a..test"));
+        check("dns_name_ok: точка в конце", 0, dns_name_ok("a.test."));
+        check("dns_name_ok: пустое", 0, dns_name_ok(""));
+        check("dns_name_ok: метка 64 байта", 0,
+              dns_name_ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test"));
+    }
+
+    {
+        /* D3: ФАЙЛ СОСТОЯНИЯ, УЖЕ ОТРАВЛЕННЫЙ ПРЕЖНЕЙ ВЕРСИЕЙ, лечится при загрузке. Строка «x» с
+         * поддельным адресом youtube.com и настоящим нападающего, имя с пробелом, подмена на адрес
+         * пула и строка длиннее буфера (её хвост читался бы отдельной строкой). */
+        char dir[] = "/tmp/dnsmatch-poison.XXXXXX";
+        if (!mkdtemp(dir)) { perror("mkdtemp"); return 2; }
+        char path[768];
+        snprintf(path, sizeof(path), "%s/state", dir);
+        FILE *f = fopen(path, "w");
+        fputs("youtube.com\t198.18.0.5\t142.250.1.1\n", f);
+        fputs("x\t198.18.0.5\t6.6.6.6\n", f);
+        fputs("bad name.test\t198.18.0.6\t6.6.6.6\n", f);
+        fputs("loop.test\t198.18.0.7\t198.18.0.9\n", f);
+        /* Ровно буфер чтения загрузчика (MAX_HOSTNAME + 128 - 1 байт): хвост — «z.test…». */
+        for (int i = 0; i < MAX_HOSTNAME + 128 - 1; i++) fputc('a', f);
+        fputs("z.test\t198.18.0.8\t6.6.6.6\n", f);
+        fputs("ok.test\t198.18.0.10\t93.184.216.34\n", f);
+        fclose(f);
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 0;
+        g_fakeip_state_path = NULL;
+        g_fakeip_dirty = 0;
+        fakeip_state_load(path);
+        check("D3: загружены youtube.com, loop.test, ok.test", 3, (int)g_fakeip.n);
+        check("D3: youtube.com — свой настоящий адрес", 1,
+              fakeip_entry_known_real("youtube.com") == 0x8EFA0101u);
+        check("D3: «x» на чужом поддельном адресе отвергнута", -1, (int)fakeip_find("x"));
+        check("D3: имя с пробелом отвергнуто", -1, (int)fakeip_find("bad name.test"));
+        check("D3: хвост длинной строки не стал строкой", -1, (int)fakeip_find("z.test"));
+        check("D3: подмена на адрес пула не принята", 0, (int)fakeip_entry_known_real("loop.test"));
+        check("D3: строка после длинной цела", 1, fakeip_entry_known_real("ok.test") == 0x5DB8D822u);
+        check("D3: отвергнутое помечает файл к перезаписи", 1, g_fakeip_dirty);
+        g_fakeip_dirty = 0;
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 0;
+        unlink(path);
+        rmdir(dir);
+    }
+
+    {
         /* Долгий путь к файлу состояния fake-IP. Путь задаётся снаружи (--state-file,
          * --state-dir), то есть его длину выбирает не движок, а буфер под имя временного
          * файла был размером в имя ХОСТА (MAX_HOSTNAME, 256). «%s.tmp» в него молча не

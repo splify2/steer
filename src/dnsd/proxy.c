@@ -709,7 +709,12 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
     uint16_t qtype = 0;
     size_t qend = 0;
     int quiet = 0;
-    int hit = -2; /* -2 = вопрос не разобрался; см. struct pending */
+    /* -2 = вопрос не разобрался; см. struct pending. Сюда же — имя с байтом, которому в строке не
+     * место (0, '.', управляющие внутри метки — wire.c, label_byte_ok): такой вопрос уходит наверх
+     * как есть, но без правил, кэша и fake-IP, и ответ на него ничему не учит. Не FORMERR: имена
+     * экземпляров DNS-SD с пробелом законны и продолжают разрешаться, только мимо правил — как
+     * любое имя вне их. */
+    int hit = -2;
     chm_t sets = 0;
     if (parse_query(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend) == 0) {
         /* Совпавшие каналы — ВСЕ, а решает ответ первый из них: он старший по

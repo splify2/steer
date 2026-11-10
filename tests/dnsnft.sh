@@ -26,6 +26,8 @@
 #     элемент карты не меняется; имя, которое спросили после долгого простоя, — меняется.
 #  9. Апстрим отвечает 0.0.0.0 (блокирует имя): клиенту — 0.0.0.0, поддельный адрес не выдаётся,
 #     в карте и файле состояния имени нет; подмена, уже стоявшая под именем, снимается.
+# 10. Вопрос с байтом 0 внутри метки (имя для строки — «victim.io», для апстрима — имя в зоне
+#     нападающего): ответ уходит клиенту как есть, но карта и файл состояния victim.io не тронуты.
 #
 # Нужны root (сетевое пространство и nf_tables), nft и python3. Без них стенд пропускается,
 # а не проваливается: остальной набор обязан проходить на голой машине.
@@ -75,8 +77,12 @@ cat > "$tmp/client.py" <<'PY'
 import socket, struct, sys
 port, name = int(sys.argv[1]), sys.argv[2]
 q = struct.pack('>HHHHHH', 0x4242, 0x0100, 1, 0, 0, 0)
-for l in name.split('.'): q += bytes([len(l)]) + l.encode()
-q += b'\x00' + struct.pack('>HH', 1, 1)
+if name.startswith('hex:'):                 # имя в проводе как есть, с корнем (метки с чужими байтами)
+    q += bytes.fromhex(name[4:])
+else:
+    for l in name.split('.'): q += bytes([len(l)]) + l.encode()
+    q += b'\x00'
+q += struct.pack('>HH', 1, 1)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
 s.sendto(q, ('127.0.0.1', port))
 try:
@@ -90,7 +96,7 @@ else: print(".".join(str(b) for b in d[-4:]))
 PY
 
 printf 'example.com\nmoved.net\nfail.io\nstay.org\nperm.io\nwin.io\nwin2.io\n' > "$tmp/d.lst"
-printf 'bind.io\nidle.io\nzero.io\nheal.io\n' >> "$tmp/d.lst"
+printf 'bind.io\nidle.io\nzero.io\nheal.io\nvictim.io\n' >> "$tmp/d.lst"
 printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
 '"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
 '"channels":[{"name":"c","match":{"domains_files":["%s/d.lst"],"mode":"fakeip"},"out":"vpn"}]}' \
@@ -431,7 +437,24 @@ ask8 heal.io > /dev/null
 settle
 check "9. апстрим стал отвечать 0.0.0.0 — подмена снята из карты" "" "$(mapval "$fake")"
 check "9. и следующий ответ клиенту — 0.0.0.0" "0.0.0.0" "$(ask8 heal.io)"
+# --- 10. Байт 0 внутри метки (аудит 2.1.0, D1) -------------------------------------------------
+# Вопрос «\x06victim\x03io\x00\x08attacker\x07example»: метка «io\0» прежде обрывала строку, и имя
+# читалось как victim.io — под правилом, — а адрес из ответа на имя в зоне нападающего вставал в
+# карту поддельного адреса victim.io для всех клиентов и в файл состояния.
+echo 203.0.113.101 > "$tmp/ip"
+vfake="$(ask8 victim.io)"
+settle
+check "10. victim.io: в карте настоящий адрес" "203.0.113.101" "$(mapval "$vfake")"
+echo 6.6.6.6 > "$tmp/ip"
+check "10. вопрос с байтом 0 в метке — ответ апстрима как есть, без поддельного адреса" "6.6.6.6" \
+    "$(ask8 hex:0676696374696d03696f000861747461636b6572076578616d706c6500)"
+settle
+check "10. карта поддельного адреса victim.io не тронута" "203.0.113.101" "$(mapval "$vfake")"
+check "10. и подмены на адрес нападающего в карте нет" "0" \
+    "$(nft list map inet steer fakeip | grep -c ': 6\.6\.6\.6')"
 kill "$DPID8" 2>/dev/null; wait "$DPID8" 2>/dev/null
+check "10. в файле состояния имени нападающего нет, victim.io — одна строка" "0 1" \
+    "$(grep -c 'attacker' "$tmp/state8/fakeip.state") $(grep -c '^victim\.io' "$tmp/state8/fakeip.state")"
 check "9. в файле состояния заблокированных имён нет" "0" \
     "$(grep -c '^zero\.io\|^heal\.io' "$tmp/state8/fakeip.state")"
 check "9. а имена с подменой — на месте" "2" "$(grep -c '^bind\.io\|^idle\.io' "$tmp/state8/fakeip.state")"

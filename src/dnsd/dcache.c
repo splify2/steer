@@ -77,8 +77,14 @@ void dcache_config(const struct dcache_cfg *c) {
     if (!g_tab) g_nb = 0;
 }
 
-/* Имя в проводе (без сжатия, как в секции вопроса) -> строка строчными буквами через точки;
- * возвращает смещение за именем или -1. */
+/* Имя в проводе (без сжатия, как в секции вопроса) -> ключ кэша: те же метки с байтами длины,
+ * буквы строчными, без завершающего корня; возвращает смещение за именем или -1.
+ *
+ * Ключ — метки с длинами, а не строка через точки: строка неоднозначна. Одна метка
+ * «youtube.com» (\x0byoutube.com) и две (\x07youtube\x03com) давали одну строку и один провод
+ * той же длины, и NXDOMAIN на первое имя кэш отдавал всем, кто спрашивал второе. Резолвер такие
+ * вопросы до кэша и не пускает (wire.c, label_byte_ok), но ключ, который нельзя спутать,
+ * не зависит от того, кто и как его зовёт. */
 static long qname_lower(const uint8_t *p, size_t n, size_t off, char *out, size_t cap, size_t *len) {
     size_t o = 0;
     for (;;) {
@@ -86,8 +92,8 @@ static long qname_lower(const uint8_t *p, size_t n, size_t off, char *out, size_
         uint8_t l = p[off++];
         if (!l) break;
         if (l & 0xC0) return -1;
-        if (off + l > n || o + l + 2 > cap) return -1;
-        if (o) out[o++] = '.';
+        if (off + l > n || o + 1 + l + 1 > cap) return -1;
+        out[o++] = (char)l;
         for (uint8_t i = 0; i < l; i++) out[o++] = (char)tolower(p[off + i]);
         off += l;
     }
