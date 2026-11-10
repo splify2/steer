@@ -255,6 +255,55 @@ int main(void) {
         check("привязка v6: после долгого простоя — адрес из ответа", 0, memcmp(got, b6[0].addr, 16));
     }
     {
+        /* Пустой адрес в ответе апстрима (0.0.0.0, :: — так блокирует имя фильтрующий сервер) — не
+         * адрес для подмены. Прежде имени выдавался поддельный адрес с подменой на 0.0.0.0, и клиент
+         * висел на соединении «в никуда» вместо отказа сразу. */
+        struct answer_ip z4[3] = { { 0, 60 }, { htonl(0x01020304u), 60 }, { 0, 60 } };
+        check("пустой адрес: из ответа A убраны 0.0.0.0, настоящий остался", 1,
+              answer_drop_empty4(z4, 3) == 1 && z4[0].addr == htonl(0x01020304u));
+        struct answer_ip z0[2] = { { 0, 60 }, { 0, 10 } };
+        check("пустой адрес: ответ из одних 0.0.0.0 — подменять нечего", 0, answer_drop_empty4(z0, 2));
+        struct answer_ip6 z6[2];
+        memset(z6, 0, sizeof(z6));
+        z6[1].addr[15] = 1;
+        check("пустой адрес: из ответа AAAA убран ::", 1, answer_drop_empty6(z6, 2) == 1 && z6[0].addr[15] == 1);
+        memset(z6, 0, sizeof(z6));
+        check("пустой адрес: ответ из одного :: — подменять нечего", 0, answer_drop_empty6(z6, 1));
+
+        /* Запись прежней версии: поддельный адрес выдан, настоящего нет (0.0.0.0 в памяти — «не
+         * знаем»). Первый же пустой ответ снимает её; соседние записи находятся по-прежнему. */
+        uint32_t fa = 0, fb = 0, fc = 0, again = 0;
+        fakeip_lookup_or_alloc("old-blocked.test", &fa);
+        fakeip_lookup_or_alloc("neighbour.test", &fb);
+        fakeip_entry_set_real("neighbour.test", 0x05060708u);
+        size_t before = g_fakeip.n;
+        fakeip_entry_blocked("old-blocked.test", 0);
+        check("блок апстрима: запись без настоящего адреса снята", 1, fakeip_find("old-blocked.test") < 0);
+        check("  в таблице на одну запись меньше", (long)before - 1, (long)g_fakeip.n);
+        check("  сосед находится, адрес и подмена прежние", 1,
+              fakeip_lookup_or_alloc("neighbour.test", &again) == 0 && again == fb &&
+              fakeip_entry_get_real("neighbour.test") == 0x05060708u);
+        check("  ранее выданные имена находятся", 1, fakeip_find("one.test") >= 0 && fakeip_find("bind.test") >= 0);
+        fakeip_entry_blocked("never-seen.test", 0);
+        check("блок апстрима: имя без записи — ничего не меняется", (long)before - 1, (long)g_fakeip.n);
+
+        /* Имя с обеими половинами: пустой A снимает только половину IPv4 (на AAAA имя по-прежнему
+         * отвечает подменой), пустой AAAA следом — запись целиком. */
+        uint8_t r6[16] = { 0x2a, 0 };
+        r6[15] = 9;
+        fakeip_lookup_or_alloc("half.test", &fc);
+        fakeip_entry_set_real("half.test", 0x0a0b0c0du);
+        fakeip_entry_set_real6("half.test", r6);
+        g_fakeip_dirty = 0;
+        fakeip_entry_blocked("half.test", 0);
+        check("блок апстрима: пустой A — настоящий IPv4 забыт", 0, (long)fakeip_entry_known_real("half.test"));
+        check("  запись осталась: половина IPv6 жива", 1,
+              fakeip_find("half.test") >= 0 && fakeip_entry_known_real6("half.test") != NULL);
+        check("  файл состояния будет переписан", 1, g_fakeip_dirty);
+        fakeip_entry_blocked("half.test", 1);
+        check("блок апстрима: пустой AAAA следом — запись снята целиком", 1, fakeip_find("half.test") < 0);
+    }
+    {
         /* Подавление HTTPS (65) и SVCB (64) на совпавшем домене. Проверяется не
          * константа, а форма ответа: клиент должен получить NODATA — тот же вопрос,
          * ноль записей — и ни одной подсказки ipv4hint из настоящего ответа. Иначе

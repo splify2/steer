@@ -1217,6 +1217,19 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
                 reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
             return 1;
         }
+        /* Пустой адрес (::) вместо настоящего — имя заблокировано апстримом; см. то же у A ниже. */
+        n6 = answer_drop_empty6(ips6, n6);
+        if (n6 == 0) {
+            static const uint8_t zero6[16];
+            fakeip_entry_blocked(qname, 1);
+            if (!quiet) {
+                uint8_t out[512];
+                size_t len = build_rewritten_response6(buf, qend, out, sizeof(out), zero6);
+                reply_client(len ? out : buf, len ? len : (size_t)n, &p->client, p->client_len,
+                             &p->local, p->have_local);
+            }
+            return 1;
+        }
         if (fakeip_lookup_or_alloc(qname, &fake_addr) == 0) {
             /* «Установленное» — то, что знаем, а не только то, что подтвердило ядро: после
              * резолвера, поднятого до набора правил, в карте лежит засев из файла (real_saved,
@@ -1256,6 +1269,25 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
                          &p->local, p->have_local);
         }
         return 1;
+    }
+
+    /* ПУСТОЙ АДРЕС ВМЕСТО НАСТОЯЩЕГО: апстрим, который блокирует имя (AdGuard DNS), отвечает на него
+     * 0.0.0.0. Это не адрес для подмены: клиент с поддельным адресом соединялся бы «в никуда» и
+     * ждал своего срока, а 0.0.0.0 отказывает ему сразу. Клиенту уходит то же, что у выхода «Блок»
+     * (dns_query), поддельный адрес не выдаётся, а уже стоящее под именем снимается
+     * (fakeip_entry_blocked). Пустые адреса вперемешку с настоящими просто отбрасываются. */
+    if (qtype == DNS_TYPE_A && nips > 0) {
+        nips = answer_drop_empty4(ips, nips);
+        if (nips == 0) {
+            fakeip_entry_blocked(qname, 0);
+            if (!quiet) {
+                uint8_t out[512];
+                size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 1, 0);
+                reply_client(len ? out : buf, len ? len : (size_t)n, &p->client, p->client_len,
+                             &p->local, p->have_local);
+            }
+            return 1;
+        }
     }
 
     if (qtype == DNS_TYPE_A && nips > 0) {

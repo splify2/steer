@@ -852,6 +852,69 @@ void fakeip_pool_reset(void) {
     g_free_n = g_free_i = 0;
 }
 
+/* Номера записей сдвинулись — индекс строится заново (один проход по таблице). */
+static void fakeip_reindex(void) {
+    sindex_free(&g_fakeip_idx);
+    memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+    for (size_t k = 0; k < g_fakeip.n; k++)
+        if (sindex_put(&g_fakeip_idx, &g_fakeip, fakeip_key, g_fakeip.entries[k].domain,
+                       (uint32_t)k, 0) != 0)
+            fprintf(stderr, "steer dnsd: индекс fake-IP не пересобран (нет памяти)\n");
+}
+
+/* ИМЯ, НА КОТОРОЕ АПСТРИМ ОТВЕЧАЕТ ПУСТЫМ АДРЕСОМ (0.0.0.0, ::) — так блокируют фильтрующие серверы
+ * (AdGuard DNS). Прежде такой ответ шёл как настоящий адрес: имени выдавался поддельный, в карту
+ * ложилось «поддельный : 0.0.0.0», клиент соединялся с поддельным адресом и висел до своего срока
+ * соединения — вместо отказа сразу, какой даёт 0.0.0.0. Теперь клиенту уходит пустой адрес (как у
+ * выхода «Блок», proxy.c), поддельный не выдаётся, а что уже стоит под именем — снимается здесь:
+ * элемент карты, адрес в наборах каналов, настоящий адрес записи. Запись, у которой не осталось ни
+ * одной половины, уходит из таблицы и файла состояния. Так лечатся и записи прежних версий: они
+ * приходят из файла без настоящего адреса (0.0.0.0 — это «не знаем»), и первый же вопрос имени их
+ * снимает. Элемент карты снимается и тогда, когда запись о нём не знает: «поддельный : 0.0.0.0»
+ * прежней версии в памяти выглядит как «подмены нет». ENOENT — желаемое состояние.
+ *
+ * Запись с живой половиной другого семейства остаётся, и повторный пустой ответ в ядро уже не
+ * ходит: снимать под ней нечего (ни наборов, ни настоящего адреса этого семейства). */
+void fakeip_entry_blocked(const char *domain, int v6) {
+    long at = fakeip_find(domain);
+    if (at < 0) return;
+    struct fakeip_entry *e = &g_fakeip.entries[at];
+    uint8_t f6[16];
+    fakeip6_of(e->addr, f6);
+    int other = v6 ? (e->real_host || e->real_saved) : (e->has_real6 || e->has_real6_saved);
+    if (v6) {
+        if (!other || e->sets6 || e->has_real6 || e->has_real6_saved) {
+            for (size_t i = 0; i < g_dch_n; i++)
+                if (chm_has(e->sets6, i)) dch_del6(i, e->domain, f6);
+            nftlk_elem_msg6(NFT_MSG_DELSETELEM, g_nft_table, g_fakeip6_map, f6, 0, NULL, 0);
+            if (e->has_real6 || e->has_real6_saved) g_fakeip_dirty = 1;
+        }
+        e->sets6 = 0;
+        e->has_real6 = e->has_real6_saved = 0;
+        e->route6_asserted = e->refreshed6 = 0;
+    } else {
+        if (!other || e->sets || e->real_host || e->real_saved) {
+            for (size_t i = 0; i < g_dch_n; i++)
+                if (chm_has(e->sets, i)) dch_del(i, e->domain, e->addr);
+            uint32_t k = htonl(e->addr);
+            nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_fakeip_map, &k, 0, NULL, 0);
+            if (e->real_host || e->real_saved) g_fakeip_dirty = 1;
+        }
+        e->sets = 0;
+        e->real_host = e->real_saved = 0;
+        e->route_asserted = e->refreshed = 0;
+    }
+    if (other) return;
+    /* Обе половины пусты. Половина другого семейства подмены не имела, но её набор мог нести адрес
+     * (переутверждение маршрута) — снять и его, прежде чем запись уйдёт. */
+    fakeip_entry_unroute(e);
+    free(e->domain);
+    g_fakeip.n--;
+    if ((size_t)at != g_fakeip.n) g_fakeip.entries[at] = g_fakeip.entries[g_fakeip.n];
+    fakeip_reindex();
+    g_fakeip_dirty = 1;
+}
+
 size_t fakeip_reclaim(time_t now) {
     size_t bytes = FAKEIP_POOL_SIZE / 8;
     uint8_t *live = calloc(1, bytes), *used = calloc(1, bytes);
@@ -883,14 +946,8 @@ size_t fakeip_reclaim(time_t now) {
     size_t freed = g_fakeip.n - w;
     if (freed) {
         g_fakeip.n = w;
-        /* Номера записей сдвинулись — индекс строится заново (один проход; случай редкий: пул
-         * кончается раз в много часов). */
-        sindex_free(&g_fakeip_idx);
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
-        for (size_t k = 0; k < g_fakeip.n; k++)
-            if (sindex_put(&g_fakeip_idx, &g_fakeip, fakeip_key, g_fakeip.entries[k].domain,
-                           (uint32_t)k, 0) != 0)
-                fprintf(stderr, "steer dnsd: индекс fake-IP не пересобран (нет памяти)\n");
+        /* Случай редкий: пул кончается раз в много часов. */
+        fakeip_reindex();
         fakeip_state_rewrite();
         g_fakeip_dirty = 0;
         g_fakeip_last_rewrite = now;
