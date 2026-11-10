@@ -558,6 +558,53 @@ o="$(P install --file edist/bar-1.0.0-all.s2p --json 2>/dev/null)"; rc=$?
 check "файл чужим ключом: отказ" "1" "$rc"
 has "  причина" "такого ключа у ядра нет" "$o"
 
+# ---- id и version из plugin.json архива — в путь только по правилам имени и версии ----
+# Архив без подписи, в нём plugin.json с id, уводящим за каталог плагинов (MANIFEST переписан под
+# новый plugin.json, заголовок прежний — «bar 1.0.0»): прежде pm_rmrf и rename шли по
+# <root>/.stage/<id>-<версия> ДО сверки с заголовком, и мишень снаружи стиралась и подменялась.
+# Мишень — $T/evil-1.0.0 и $T/victim с файлом-свидетелем.
+craft() {  # ВХОД ВЫХОД ID ВЕРСИЯ
+    python3 - "$@" <<'PY'
+import hashlib, io, sys, tarfile
+src, dst, nid, nver = sys.argv[1:5]
+tin = tarfile.open(src, "r:gz")
+mem = [(m, tin.extractfile(m).read() if m.isfile() else None) for m in tin.getmembers()]
+import json
+for i, (m, b) in enumerate(mem):
+    if m.name == "plugin.json":
+        j = json.loads(b); j["id"] = nid; j["version"] = nver
+        pj = json.dumps(j).encode(); mem[i] = (m, pj)
+for i, (m, b) in enumerate(mem):
+    if m.name == "MANIFEST":
+        out = []
+        for ln in b.decode().split("\n"):
+            f = ln.split(" ", 3)
+            if len(f) == 4 and f[3] == "plugin.json":
+                ln = "%s %d %s plugin.json" % (hashlib.sha256(pj).hexdigest(), len(pj), f[2])
+            out.append(ln)
+        mem[i] = (m, "\n".join(out).encode())
+tout = tarfile.open(dst, "w:gz", format=tarfile.USTAR_FORMAT)
+for m, b in mem:
+    if b is not None: m.size = len(b); tout.addfile(m, io.BytesIO(b))
+    else: tout.addfile(m)
+tout.close()
+PY
+}
+P remove bar --json >/dev/null 2>&1
+mkdir -p evil-1.0.0 victim && echo keep > evil-1.0.0/witness && echo keep > victim/witness
+craft udist/bar-1.0.0-all.s2p evil-id.s2p ../../evil 1.0.0
+o="$(P install --file evil-id.s2p --unsigned --json 2>/dev/null)"; rc=$?
+check "plugin.json с id «../../evil»: отказ" "1" "$rc"
+has "  код отказа" "plugin.bad_id_version" "$o"
+check "  мишень снаружи цела" "keep" "$(cat evil-1.0.0/witness 2>/dev/null)"
+craft udist/bar-1.0.0-all.s2p evil-ver.s2p bar "1.0.0+/../../../victim"
+o="$(P install --file evil-ver.s2p --unsigned --json 2>/dev/null)"; rc=$?
+check "plugin.json с версией «1.0.0+/../../../victim»: отказ" "1" "$rc"
+has "  код отказа" "plugin.bad_id_version" "$o"
+check "  мишень снаружи цела" "keep" "$(cat victim/witness 2>/dev/null)"
+check "  в .stage ничего не осталось" "" "$(ls root/.stage 2>/dev/null)"
+check "  bar не поставлен" "no" "$([ -d root/bar ] && echo yes || echo no)"
+
 # ---- сторонний репозиторий ----
 mkdir -p repo3 dist3
 mk qux 1.0.0 ''

@@ -88,9 +88,29 @@ static int sv_cmp(const struct sv *a, const struct sv *b) {
     return pre_cmp(a, b);
 }
 
+/* Версия идёт в пути (.stage/<id>-<версия>, архив во временном каталоге), поэтому годится только
+ * алфавит semver — цифры, латиница, «.», «-», «+». Разбор sv_parse берёт после «-» и «+» что угодно
+ * до конца строки, и «1.0.0+/../../x» прежде проходил: версия из plugin.json архива уводила
+ * pm_rmrf и rename за пределы каталога плагинов. Длина — та же, что у id (64): у настоящих версий
+ * она — десяток знаков. */
 int pm_ver_ok(const char *v) {
     struct sv s;
-    return v && *v && sv_parse(v, strlen(v), &s) == 0 && s.parts >= 1;
+    if (!v || !*v || strlen(v) > 64) return 0;
+    for (const char *p = v; *p; p++)
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              *p == '.' || *p == '-' || *p == '+'))
+            return 0;
+    return sv_parse(v, strlen(v), &s) == 0 && s.parts >= 1;
+}
+
+/* Имя плагина (index.md, `$defs.id`: ^[a-z0-9][a-z0-9-]*$, до 64 знаков). Одно правило для имён из
+ * командной строки, индекса и plugin.json архива: имя становится каталогом <root>/<id>. */
+int pm_id_ok(const char *s) {
+    if (!s || !*s || strlen(s) > 64) return 0;
+    if (!((*s >= 'a' && *s <= 'z') || (*s >= '0' && *s <= '9'))) return 0;
+    for (const char *p = s; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '-')) return 0;
+    return 1;
 }
 
 int pm_ver_cmp(const char *a, const char *b) {

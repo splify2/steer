@@ -91,14 +91,6 @@ static int usage(void) {
     return 2;
 }
 
-static int id_ok(const char *s) {
-    if (!s || !*s || strlen(s) > 64) return 0;
-    if (!((*s >= 'a' && *s <= 'z') || (*s >= '0' && *s <= '9'))) return 0;
-    for (const char *p = s; *p; p++)
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '-')) return 0;
-    return 1;
-}
-
 /* ---- записи списка ---- */
 
 static const struct pm_repo *repo_of(struct pm_ctx *x, const char *name) {
@@ -296,7 +288,7 @@ static char **all_ids(struct pm_ctx *x, size_t *n) {
     if (d) {
         struct dirent *de;
         while ((de = readdir(d))) {
-            if (de->d_name[0] == '.' || !id_ok(de->d_name) || pm_state_find(&x->st, de->d_name)) continue;
+            if (de->d_name[0] == '.' || !pm_id_ok(de->d_name) || pm_state_find(&x->st, de->d_name)) continue;
             char *pj = pm_fmt("%s/%s/plugin.json", pm_root(), de->d_name);
             int ok = pm_exists(pj);
             free(pj);
@@ -1315,7 +1307,7 @@ int pm_main(int argc, char **argv) {
     /* Только чтение — без блокировки. */
     if (!strcmp(act, "list") && npos == 1) { rc = cmd_list(&x, NULL, 0); goto out; }
     if (!strcmp(act, "status") && npos <= 2) {
-        if (npos == 2 && !id_ok(pos[1])) { rc = failc(&x, "plugin.bad_name", NULL, "недопустимое имя плагина"); goto out; }
+        if (npos == 2 && !pm_id_ok(pos[1])) { rc = failc(&x, "plugin.bad_name", NULL, "недопустимое имя плагина"); goto out; }
         rc = cmd_list(&x, npos == 2 ? pos[1] : NULL, 1);
         goto out;
     }
@@ -1336,7 +1328,7 @@ int pm_main(int argc, char **argv) {
         for (size_t i = 1; i < npos; i++) {
             if (!strcmp(act, "install") && i == 2) { if (!pm_ver_ok(pos[i])) { rc = failc(&x, "plugin.bad_version", NULL, "недопустимая версия"); goto out; } continue; }
             if (!strcmp(act, "autoupdate") && i == 2) continue;
-            if (!id_ok(pos[i])) { rc = failc(&x, "plugin.bad_name", NULL, "недопустимое имя плагина"); goto out; }
+            if (!pm_id_ok(pos[i])) { rc = failc(&x, "plugin.bad_name", NULL, "недопустимое имя плагина"); goto out; }
         }
     }
     if (pm_lock() != 0) { rc = failc(&x, "plugin.busy", NULL, "busy: менеджер плагинов занят другим запросом — повторите позже"); goto out; }

@@ -1862,6 +1862,13 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     mid = yn_str(m, "id");
     const char *mver = yn_str(m, "version");
     if (!mid || !mver) { pm_errc(e, "plugin.no_id_version", NULL, "в plugin.json нет id или version"); goto out_stage; }
+    /* id и версия идут в пути (.stage/<id>-<версия>, <root>/<id>) ДО сверки с заголовком MANIFEST:
+     * plugin.json архива-файла с id «../../../etc/uci» уводил pm_rmrf и rename за пределы каталога
+     * плагинов. Те же правила, что у имени и версии из командной строки и индекса. */
+    if (!pm_id_ok(mid) || !pm_ver_ok(mver) || !pm_id_ok(hid) || !pm_ver_ok(hver)) {
+        pm_errc(e, "plugin.bad_id_version", NULL, "недопустимые id или version в архиве");
+        goto out_stage;
+    }
     if (!s->c) {
         /* Файл: заголовок MANIFEST и id из plugin.json должны совпасть (проверка в unpack шла с пустым id). */
         char *real = pm_fmt("%s/.stage/%s-%s", pm_root(), mid, mver);

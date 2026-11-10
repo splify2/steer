@@ -117,7 +117,8 @@ void jw_knode(struct jw *w, const char *k, const struct ynode *n);
 
 /* ---- semver (pmver.c) ---- */
 int pm_ver_cmp(const char *a, const char *b);               /* как strcmp; неразбираемое — меньше */
-int pm_ver_ok(const char *v);                               /* похоже на semver */
+int pm_ver_ok(const char *v);                               /* semver и только его алфавит: годится в путь */
+int pm_id_ok(const char *s);                                /* имя плагина: [a-z0-9][a-z0-9-]*, до 64 */
 /* Версия v в диапазоне r (npm: = ^ ~ >= > <= < пробел «и», || «или», * x). -1 — диапазон не
  * разобрался. */
 int pm_range_match(const char *r, const char *v);

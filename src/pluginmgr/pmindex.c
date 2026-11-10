@@ -470,6 +470,9 @@ static const char *key_of(const struct ynode *map, const char *id) {
 
 int pm_select(struct pm_ctx *x, struct pm_repo *r, const char *id, const char *range, const char *exact,
               const char *variant, const char *below, struct pm_cand *c, struct pm_err *e) {
+    /* Имя идёт в пути (архив во временном каталоге, .stage, <root>/<id>); зависимость из чужого
+     * манифеста приходит сюда без проверки командной строки. */
+    if (!pm_id_ok(id)) return pm_errc(e, "plugin.bad_name", NULL, "недопустимое имя плагина");
     const struct ynode *pl = pm_index_plugin(r, id);
     if (!pl) return pm_errc(e, "plugin.not_in_repo", PMA("id", id, "name", r->name), "плагина %s нет в репозитории %s", id, r->name);
     const struct ynode *vs = ynode_get(pl, "versions");
