@@ -236,6 +236,11 @@ struct conn {
      * идут потоком и следующее чтение всё разгребало, а вот ХВОСТ ответа мог простоять до
      * таймаута повтора у клиента. */
     uint8_t rx_ready;
+    /* Сколько памяти соединения учтено в общем бюджете туннеля, КиБ (conn_charge, «бюджет памяти» ниже):
+     * сессия, кольцо недописанного, ранние данные. Хранится учтённое, а не пересчитывается при
+     * закрытии: так снятие всегда равно взятому, и счёт процесса не уплывает. Стоит в промежутке
+     * выравнивания перед livepos и горячую запись не удлиняет. */
+    uint16_t mem_kib;
     /* Место в g_live и следующий в цепочке хэша. Индексы, а не указатели: четыре байта против
      * восьми, и вся горячая запись обязана влезть в две строки кэша. */
     int32_t livepos;
@@ -293,6 +298,9 @@ struct conn {
     /* Поток UDP: от узла пришла хоть одна датаграмма (emit_dgram). Поток без ответа держится не
      * IDLE_EVICT_S, а UDP_UNREPLIED_S (conn_deadlines). */
     uint8_t udp_replied;
+    /* Заявка этого соединения учтена в доле источника (src_pend_take): снять её надо ровно один раз —
+     * при разборе готовности, при снятии заявок на выходе или при закрытии (pend_release). */
+    uint8_t pend_acct;
 };
 
 /* Горячая запись обязана оставаться маленькой — в этом весь смысл разделения. Проверка
@@ -412,10 +420,18 @@ _Static_assert(DOWN_BUF >= TUNNEL_BUF, "буфер чтения у узла ме
 /* Запас места в кольце недописанного под один проход дайлера: весь буфер чтения плюс запас. */
 #define CLIENT_ROOM_RESERVE (DOWN_BUF + 1024)
 
+static int mem_room(const struct flow_key *k, size_t add_bytes);
+
 /* Готов ли клиент принять ещё одну запись целиком: в кольце недописанного есть место под проход
- * дайлера. Окно клиента держит ядро — по нему сокет и принимает (sock_flush). */
+ * дайлера. Окно клиента держит ядро — по нему сокет и принимает (sock_flush).
+ *
+ * Место — то, что уже взято, или то, что бюджет памяти даст взять (mem_room, «бюджет памяти» ниже): кольцо
+ * растёт сразу до RTX_CAP (emit_to_client), и если бюджет роста не даёт, соединение у узла не читает, пока
+ * его клиент не разгребёт кольцо. Так на пределе встают медленные читатели, а не все. */
 static int client_can_take_record(const struct conn *c) {
-    return RTX_CAP - c->rtx.len >= CLIENT_ROOM_RESERVE;
+    if (RTX_CAP - c->rtx.len < CLIENT_ROOM_RESERVE) return 0;
+    if (c->rtx.cap - c->rtx.len >= CLIENT_ROOM_RESERVE) return 1;
+    return mem_room(&c->key, RTX_CAP - c->rtx.cap);
 }
 
 /* Сколько берём у одного соединения за проход цикла — в БАЙТАХ, а не в чтениях.
@@ -980,16 +996,407 @@ static uint64_t g_spare_clock_ns;
  * потока-заказчика: по готовности установщик будит его цикл, чтобы SYN-ACK... уже не
  * SYN-ACK (он ушёл сразу), а ранние данные не ждали до 20 мс опроса. Узла в заявке нет: он
  * один на процесс и лежит в дайлере (g_dl). */
-struct connjob { struct conn *c; void *sess; struct spare *sp; int efd; };
-/* Очередь заявок — кольцо, растущее вдвое: q[head .. head+n) по модулю cap. */
+/* udp, enq_ns и cfd — ради разбора заявки установщиком (connector): какой очереди она, сколько ждёт и жив
+ * ли ещё клиент TCP (cfd — его сокет, -1 у потока UDP и у пополнения пула). */
+struct connjob { struct conn *c; void *sess; struct spare *sp; int efd; int cfd; uint8_t udp; uint64_t enq_ns; };
+/* Очередь заявок — ДВЕ, и каждая — кольцо, растущее вдвое: q[head .. head+n) по модулю cap.
+ *
+ * ЗАЧЕМ ДВЕ (аудит 2.1.0, T1). Очередь была одна и по порядку прихода, и заявки TCP всех клиентов вставали
+ * за спреем датаграмм одного: клиент LAN, пославший по датаграмме на 20 000 разных адресов (DHT торрента,
+ * скан портов, вредонос), ставил 20 000 заявок, установщиков не больше 64, рукопожатие 300 мс — и ~94 с
+ * (при мёртвом узле ~40 минут) не открывалось ни одно новое соединение, TCP тоже (замер audit/udpflood.c).
+ * Теперь TCP и пополнение пула — в очереди 0, UDP — в очереди 1; установщик берёт из очереди 0 до трёх
+ * заявок подряд на одну из очереди 1 (CQ_HI_RUN), если обе не пусты: поток UDP не задерживает TCP больше,
+ * чем на одно рукопожатие из четырёх, а лавина TCP не морит UDP совсем. Длину обеих держит доля
+ * источника (src_pend_take), срок ожидания — разбор установщиком (CQ_WAIT_*). */
+#define CQ_HI_RUN 3
+struct cq_ring { struct connjob *q; unsigned cap, head, n; };
 static struct {
-    struct connjob *q;
-    unsigned cap, head, n;
+    struct cq_ring r[2];            /* 0 — TCP и пополнение пула, 1 — UDP */
+    unsigned n;                     /* заявок в обеих */
+    unsigned hi_run;                /* сколько подряд взято из очереди 0 при непустой очереди 1 */
     unsigned nthreads, idle, max;   /* потоков всего, ждущих заявку, потолок */
     pthread_mutex_t mu;
     pthread_cond_t cv;
     int started;
 } g_cq = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+/* Сколько заявка может ждать установщика, прежде чем он её пропустит, не начиная рукопожатия.
+ *
+ * TCP — CONNECT_TIMEOUT_S: столько же ждёт и само рукопожатие. Заявка, простоявшая больше, означает, что
+ * установщики не успевают за потоком соединений (мёртвый узел или лавина), и рукопожатие ей уже ничего не
+ * даст, кроме места в очереди за счёт следующих: клиент получает RST и повторяет, а очередь не копит
+ * мёртвое.
+ * UDP — 5 с: срок ожидания одной попытки у резолвера (glibc — 5 с), а QUIC за это время уже повторил
+ * Initial и сам перешёл на TCP. Первая датаграмма потока лежит в ранних данных и уехала бы узлу через
+ * 5 с после того, как клиент перестал её ждать. */
+#define CQ_WAIT_TCP_MS (CONNECT_TIMEOUT_S * 1000)
+#define CQ_WAIT_UDP_MS 5000
+
+/* Исходы заявки, которые называет сам стек, а не дайлер (c->rc): разбирает их conn_ready раньше
+ * dialer_ops.strerror. Числа — вне кодов дайлеров (те отрицательные и малые). */
+#define STACK_RC_QEXPIRED   0x7ff00001   /* заявка простояла в очереди дольше CQ_WAIT_* */
+#define STACK_RC_QGONE      0x7ff00002   /* клиент закрыл соединение, пока заявка ждала */
+#define STACK_RC_HSDEADLINE 0x7ff00003   /* рукопожатие с узлом не уложилось в CONNECT_TOTAL_MS */
+
+/* Общий срок рукопожатия с узлом — от начала connect до готовой связи (аудит 2.1.0, F1).
+ *
+ * Срок сокета (SO_RCVTIMEO, trdial.c) действует на КАЖДОЕ чтение: сервер или посредник, отдающий по байту
+ * чаще, чем раз в восемь секунд, держал рукопожатие часами (64 записи по 16 КБ), а с ним — установщика.
+ * Шестьдесят четыре таких — и новые соединения туннеля не открывались вовсе. Срок ставит установщик, то есть
+ * то место, через которое проходит открытие связи у ЛЮБОГО протокола и транспорта: TCP, TLS и Reality,
+ * Vision, ws/h2/grpc/xhttp, переговоры SOCKS и HTTP CONNECT — всё это внутри одного connect дайлера. Сам срок
+ * держит слой сокетов (tr_watch_begin в trdial.c): по его истечении сокеты связи закрываются на чтение и
+ * запись (shutdown), и любое блокирующее чтение или запись внутри протокола тут же кончается.
+ *
+ * Шестнадцать секунд — два срока сокета: самый долгий законный путь — потерянный длинный ClientHello
+ * (ждём ответа CONNECT_TIMEOUT_S, trsec.c) и повтор коротким, который на живом узле занимает доли секунды
+ * и укладывается во второй срок с запасом даже на спутниковом канале (круг 600 мс × 4 круга). */
+#define CONNECT_TOTAL_MS (2 * CONNECT_TIMEOUT_S * 1000)
+
+/* Слой сокетов до узла (src/proto/transport/trdial.c): общий срок установления. Слабые ссылки — стек
+ * собирается и без транспорта (дайлеры QUIC и стенды без trdial.c), и тогда срок держит сам дайлер. */
+extern void tr_watch_begin(int total_ms) __attribute__((weak));
+extern int tr_watch_end(void) __attribute__((weak));
+
+/* Сколько заявок одного рода держит процесс и сколько из них — один источник (аудит 2.1.0, T1).
+ *
+ * ЧТО ОГРАНИЧЕНО И ПОЧЕМУ. Заявка — это соединение в ожидании установщика: слот, сессия (~45 КиБ у VLESS, из
+ * них тронутые страницы — около 10 КиБ до рукопожатия) и рукопожатие к узлу впереди. 20 000 заявок от одного
+ * клиента — это 206 МБ (замер audit/udpflood.c) и 20 000 рукопожатий к узлу, после которых сервер с
+ * ограничением соединений с адреса банит роутер.
+ *
+ * СКОЛЬКО. Очередь разбирается со скоростью «установщики / рукопожатие»: 64 / 0,3 с ≈ 210 заявок в секунду.
+ * CQ_PER_CONNECTOR = 16 заявок на установщика — это ~5 с ожидания в хвосте при рукопожатии 300 мс, то есть
+ * как раз до срока CQ_WAIT_*: заявки глубже всё равно истекли бы, не дождавшись. Предел растёт с числом
+ * установщиков (STEER_TUN_CONNECTORS), а не с памятью: узкое место здесь — рукопожатия, а не байты.
+ * Отдельно для TCP и UDP: лавина одного рода не съедает места другого.
+ *
+ * ИСТОЧНИК — адрес клиента (у IPv6 — его /64: адресов временных у одного устройства много). Источнику —
+ * четверть предела рода: один клиент не занимает всё, и даже четыре «тяжёлых» оставляют место прочим.
+ * 256 заявок TCP одного клиента — это вся пачка восстановления сессии браузера с десятками вкладок, причём
+ * запасные сессии (g_spares) заявок не ставят вовсе.
+ *
+ * НА ПРЕДЕЛЕ — отказ сразу и вслух: TCP — RST (клиент повторит), UDP — ICMP «порт недоступен» (QUIC
+ * переходит на TCP мгновенно, а не по своему сроку), в журнале — источник и оба числа, счётчик отказов
+ * (g_refused_pend). Предел считается по заявкам, принятым в работу (от conn_submit до разбора готовности),
+ * а не только лежащим в очереди: те, что у установщика, тоже держат слот и память. */
+#define CQ_PER_CONNECTOR 16
+
+/* Бюджет памяти туннеля (аудит 2.1.0, T2).
+ *
+ * ЧТО СЧИТАЕТСЯ. Память, которую соединение держит в куче модуля сверх буферов ядра: сессия дайлера (шаг
+ * g_sess_stride — у VLESS ~45 КиБ), кольцо недописанного клиенту (до RTX_CAP = 256 КиБ) и ранние данные (до
+ * 64 КиБ). Без общего счёта предела не было вовсе: дескрипторов процессу дано до fs.nr_open
+ * (stack_nofile_raise), и тысяча медленных читателей одного клиента — это ~357 МБ, OOM роутера на 256–512 МБ.
+ *
+ * СКОЛЬКО. Половина памяти, доступной системе при запуске (MemAvailable), но не меньше MEM_BUDGET_MIN_MB:
+ * вторая половина остаётся резолверу, dnsmasq и всем прочим, а на сервере с десятками гигабайт предел так
+ * далёк, что его не видно. STEER_TUN_MEM_MB задаёт бюджет руками.
+ *
+ * ДВА ПОРОГА. Новое соединение принимается, пока занято не больше трёх четвертей бюджета, а кольцо растёт
+ * до всего бюджета: последняя четверть — запас уже открытым соединениям, иначе сессии новых съели бы
+ * память, без которой старые не могут читать, и встало бы всё.
+ *
+ * ДОЛЯ ИСТОЧНИКА — половина бюджета (MEM_SRC_DIV): один клиент (дом с одним компьютером, торрент) берёт
+ * много, но не всё, и остальным остаётся половина. Порог приёма у доли тот же — три четверти от неё.
+ *
+ * НА ПРЕДЕЛЕ. Новое соединение не открывается (TCP — RST, UDP — ICMP «порт недоступен»; журнал называет
+ * занятое, бюджет и долю источника). Кольцо, которому для следующего чтения у узла нужно расти, не растёт:
+ * такое соединение не читает у узла, пока его клиент не разгребёт своё (client_can_take_record) — то есть
+ * встают ровно медленные читатели, а тот, чей клиент забирает данные сразу, качает как прежде. Пустые кольца
+ * при занятом больше чем наполовину бюджете отдаются системе сразу, а не через пять секунд простоя. До OOM
+ * дело не доходит: память берётся только после проверки, и сверх бюджета может оказаться не больше, чем по
+ * кольцу на рабочего (проверка и рост — в одном витке, но рабочих несколько). */
+#define MEM_BUDGET_MIN_MB 16
+#define MEM_SRC_DIV 2
+
+/* Источник — ключ доли: адрес клиента IPv4 или /64 адреса IPv6. */
+struct src_key { uint8_t v6; uint8_t a[8]; };
+struct src_ent {
+    struct src_key k;
+    uint8_t used;
+    unsigned pend[2];               /* заявок TCP и UDP */
+    size_t mem_kib;                 /* учтённой памяти соединений этого источника */
+};
+/* Таблица источников — одна на процесс под своим замком: соединения одного клиента раскиданы по рабочим
+ * хэшем пятёрки (и раздачей по кругу у TCP), так что доля на рабочего не ограничила бы источник вовсе.
+ * Замок берётся на открытие соединения, на рост и отдачу кольца и на закрытие — не на пакет и не на байт.
+ * Открытая адресация с линейным пробированием, удаление со сдвигом назад (без «надгробий»); растёт вдвое,
+ * когда занято больше половины. */
+static struct {
+    struct src_ent *t;
+    size_t cap, n;
+    unsigned pend_n[2];             /* заявок рода на процесс */
+    pthread_mutex_t mu;
+} g_src = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static struct {
+    pthread_once_t once;
+    unsigned pend_max, pend_src_max;
+    size_t mem_budget_kib, mem_src_kib;
+} g_lim = { .once = PTHREAD_ONCE_INIT };
+static size_t g_mem_kib;                    /* учтено всего, КиБ; атомарно */
+/* Отказы — счётчики процесса: строки журнала идут не чаще раза в несколько секунд, а число — полное. */
+static unsigned long long g_refused_pend, g_refused_mem, g_q_expired, g_q_gone, g_mem_throttled, g_hs_deadline;
+
+/* Потолок установщиков: STEER_TUN_CONNECTORS или CONNECTORS_MAX. Читается один раз. */
+static unsigned cq_max(void) {
+    static unsigned v;
+    unsigned m = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (m) return m;
+    const char *e = getenv("STEER_TUN_CONNECTORS");
+    int x = e ? atoi(e) : 0;
+    m = x >= 1 ? (unsigned)x : CONNECTORS_MAX;
+    __atomic_store_n(&v, m, __ATOMIC_RELAXED);
+    return m;
+}
+
+/* Доступная системе память, КиБ (MemAvailable; у ядра без него — MemFree + Cached); 0 — не узнать. */
+static size_t mem_avail_kib(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char l[128];
+    unsigned long avail = 0, freek = 0, cached = 0, v;
+    while (fgets(l, sizeof(l), f)) {
+        if (sscanf(l, "MemAvailable: %lu", &v) == 1) avail = v;
+        else if (sscanf(l, "MemFree: %lu", &v) == 1) freek = v;
+        else if (sscanf(l, "Cached: %lu", &v) == 1) cached = v;
+    }
+    fclose(f);
+    return avail ? (size_t)avail : (size_t)(freek + cached);
+}
+
+static void lim_init(void) {
+    g_lim.pend_max = cq_max() * CQ_PER_CONNECTOR;
+    g_lim.pend_src_max = g_lim.pend_max / 4 ? g_lim.pend_max / 4 : 1;
+    const char *e = getenv("STEER_TUN_MEM_MB");
+    long mb = e ? atol(e) : 0;
+    size_t kib = mb > 0 ? (size_t)mb * 1024 : mem_avail_kib() / 2;
+    if (mb <= 0 && kib < (size_t)MEM_BUDGET_MIN_MB * 1024) kib = (size_t)MEM_BUDGET_MIN_MB * 1024;
+    g_lim.mem_budget_kib = kib;
+    g_lim.mem_src_kib = kib / MEM_SRC_DIV;
+}
+
+static void lim_ready(void) { pthread_once(&g_lim.once, lim_init); }
+
+static void src_key_of(const struct flow_key *k, struct src_key *o) {
+    memset(o, 0, sizeof(*o));
+    o->v6 = k->v6;
+    memcpy(o->a, flow_src_bytes(k), k->v6 ? 8 : 4);
+}
+
+static size_t src_home(const struct src_key *s, size_t mask) {
+    uint64_t x;
+    memcpy(&x, s->a, 8);
+    x ^= (uint64_t)s->v6 << 63;
+    x *= 0x9E3779B97F4A7C15ull;
+    return (size_t)(x >> 32) & mask;
+}
+
+/* Запись источника под g_src.mu; create — завести, если нет. NULL — нет и не заведена (нет памяти). */
+static struct src_ent *src_get(const struct src_key *s, int create) {
+    if (g_src.cap) {
+        size_t mask = g_src.cap - 1;
+        for (size_t i = src_home(s, mask);; i = (i + 1) & mask) {
+            struct src_ent *e = &g_src.t[i];
+            if (!e->used) break;
+            if (!memcmp(&e->k, s, sizeof(*s))) return e;
+        }
+    }
+    if (!create) return NULL;
+    if ((g_src.n + 1) * 2 > g_src.cap) {
+        size_t nc = g_src.cap ? g_src.cap * 2 : 64;
+        struct src_ent *nt = calloc(nc, sizeof(*nt));
+        if (!nt) return NULL;
+        for (size_t j = 0; j < g_src.cap; j++) {
+            if (!g_src.t[j].used) continue;
+            size_t i = src_home(&g_src.t[j].k, nc - 1);
+            while (nt[i].used) i = (i + 1) & (nc - 1);
+            nt[i] = g_src.t[j];
+        }
+        free(g_src.t);
+        g_src.t = nt;
+        g_src.cap = nc;
+    }
+    size_t mask = g_src.cap - 1, i = src_home(s, mask);
+    while (g_src.t[i].used) i = (i + 1) & mask;
+    struct src_ent *e = &g_src.t[i];
+    memset(e, 0, sizeof(*e));
+    e->k = *s;
+    e->used = 1;
+    g_src.n++;
+    return e;
+}
+
+/* Убрать запись, если она больше ничего не держит. Сдвиг назад: цепочки проб остаются целыми. */
+static void src_tidy(struct src_ent *e) {
+    if (e->pend[0] || e->pend[1] || e->mem_kib) return;
+    size_t mask = g_src.cap - 1, i = (size_t)(e - g_src.t), j = i;
+    g_src.t[i].used = 0;
+    g_src.n--;
+    for (;;) {
+        j = (j + 1) & mask;
+        if (!g_src.t[j].used) break;
+        size_t h = src_home(&g_src.t[j].k, mask);
+        /* Запись j может встать на место i, если её дом не лежит в (i, j] по кругу. */
+        if (i <= j ? (h <= i || h > j) : (h <= i && h > j)) {
+            g_src.t[i] = g_src.t[j];
+            g_src.t[j].used = 0;
+            i = j;
+        }
+    }
+}
+
+static const char *src_str(const struct flow_key *k, char *b, size_t n) {
+    inet_ntop(k->v6 ? AF_INET6 : AF_INET, flow_src_bytes(k), b, (socklen_t)n);
+    return b;
+}
+
+/* Взять место под заявку рода udp для источника k. 0 — взято; 1 — у источника предел; 2 — у процесса;
+ * -1 — нет памяти под учёт. have — сколько у источника уже было. */
+static int src_pend_take(const struct flow_key *k, int udp, unsigned *have) {
+    lim_ready();
+    struct src_key s;
+    src_key_of(k, &s);
+    pthread_mutex_lock(&g_src.mu);
+    int rc = 0;
+    struct src_ent *e = src_get(&s, 1);
+    *have = e ? e->pend[udp] : 0;
+    if (!e) rc = -1;
+    else if (e->pend[udp] >= g_lim.pend_src_max) rc = 1;
+    else if (g_src.pend_n[udp] >= g_lim.pend_max) rc = 2;
+    else { e->pend[udp]++; g_src.pend_n[udp]++; }
+    if (e && rc) src_tidy(e);
+    pthread_mutex_unlock(&g_src.mu);
+    return rc;
+}
+
+static void src_pend_give(const struct flow_key *k, int udp) {
+    struct src_key s;
+    src_key_of(k, &s);
+    pthread_mutex_lock(&g_src.mu);
+    struct src_ent *e = src_get(&s, 0);
+    if (e && e->pend[udp]) { e->pend[udp]--; g_src.pend_n[udp]--; src_tidy(e); }
+    pthread_mutex_unlock(&g_src.mu);
+}
+
+/* Снять учтённую заявку соединения (если она учтена). */
+static void pend_release(struct conn *c) {
+    if (!c->pend_acct) return;
+    c->pend_acct = 0;
+    src_pend_give(&c->key, c->is_udp);
+}
+
+/* Можно ли источнику e взять ещё add КиБ при занятых used: бюджет процесса и доля источника, для нового
+ * соединения (open) — по три четверти от каждого (см. «два порога» у бюджета памяти). Под g_src.mu. */
+static int mem_allow_locked(const struct src_ent *e, size_t used, size_t add, int open) {
+    size_t lim = open ? g_lim.mem_budget_kib / 4 * 3 : g_lim.mem_budget_kib;
+    size_t share = open ? g_lim.mem_src_kib / 4 * 3 : g_lim.mem_src_kib;
+    return used + add <= lim && (e ? e->mem_kib : 0) + add <= share;
+}
+
+/* Даст ли бюджет кольцу соединения с ключом k вырасти на add_bytes. Без замка там, где ответ ясен по счёту
+ * процесса: у источника не больше, чем у всех, так что пока всё занятое с прибавкой влезает в долю, доля
+ * соблюдена сама. Это горячий путь (client_can_take_record), и замок здесь — только под давлением. */
+static int mem_room(const struct flow_key *k, size_t add_bytes) {
+    lim_ready();
+    size_t add = (add_bytes + 1023) / 1024;
+    size_t used = __atomic_load_n(&g_mem_kib, __ATOMIC_RELAXED);
+    if (used + add <= g_lim.mem_src_kib) return 1;
+    int ok = 0;
+    if (used + add <= g_lim.mem_budget_kib) {
+        struct src_key s;
+        src_key_of(k, &s);
+        pthread_mutex_lock(&g_src.mu);
+        ok = mem_allow_locked(src_get(&s, 0), __atomic_load_n(&g_mem_kib, __ATOMIC_RELAXED), add, 0);
+        pthread_mutex_unlock(&g_src.mu);
+    }
+    if (!ok) {
+        /* Отказ здесь — пауза чтения у узла, а не потеря: спрашивают снова на каждом витке. Поэтому счётчик —
+         * «сколько раз отказано», а журнал — раз в десять секунд на процесс. */
+        unsigned long long tot = __atomic_add_fetch(&g_mem_throttled, 1, __ATOMIC_RELAXED);
+        static time_t said;
+        time_t now = g_now_s;
+        if (now - __atomic_load_n(&said, __ATOMIC_RELAXED) >= 10) {
+            __atomic_store_n(&said, now, __ATOMIC_RELAXED);
+            char a[INET6_ADDRSTRLEN];
+            fprintf(stderr, LOG_W "память туннеля на пределе: занято %zu КиБ из %zu — соединения, чей клиент "
+                            "не забирает данные (например, у %s), не читают у узла, пока клиент не разгребёт своё; "
+                            "отказов в росте кольца всего %llu\n",
+                    used, g_lim.mem_budget_kib, src_str(k, a, sizeof(a)), tot);
+        }
+    }
+    return ok;
+}
+
+/* Сколько памяти держит соединение сейчас, КиБ (с округлением вверх). */
+static size_t conn_mem_now(const struct conn *c) {
+    size_t b = c->used ? g_sess_stride + sizeof(struct conn) : 0;
+    b += c->rtx.cap;
+    if (c->early) b += c->early_cap ? c->early_cap : EARLY_CAP;
+    size_t kib = (b + 1023) / 1024;
+    return kib > 0xFFFF ? 0xFFFF : kib;
+}
+
+/* Учесть память соединения: kib — сколько оно держит теперь. force — учесть и сверх бюджета (память уже
+ * взята или без неё соединение сломается: ранние данные, кольцо после проверки client_can_take_record);
+ * иначе это открытие соединения: 0 — учтено, -1 — порог приёма бюджета или доли не даёт (ничего не учтено). */
+static int conn_charge(struct conn *c, size_t kib, int force) {
+    lim_ready();
+    if (kib == c->mem_kib) return 0;
+    struct src_key s;
+    src_key_of(&c->key, &s);
+    pthread_mutex_lock(&g_src.mu);
+    struct src_ent *e = src_get(&s, 1);
+    if (kib > c->mem_kib) {
+        size_t add = kib - c->mem_kib;
+        if (!force && (!e || !mem_allow_locked(e, __atomic_load_n(&g_mem_kib, __ATOMIC_RELAXED), add, 1))) {
+            if (e) src_tidy(e);
+            pthread_mutex_unlock(&g_src.mu);
+            return -1;
+        }
+        __atomic_add_fetch(&g_mem_kib, add, __ATOMIC_RELAXED);
+        if (e) e->mem_kib += add;
+    } else {
+        size_t sub = c->mem_kib - kib;
+        __atomic_sub_fetch(&g_mem_kib, sub, __ATOMIC_RELAXED);
+        if (e) { e->mem_kib = e->mem_kib > sub ? e->mem_kib - sub : 0; src_tidy(e); }
+    }
+    c->mem_kib = (uint16_t)kib;
+    pthread_mutex_unlock(&g_src.mu);
+    return 0;
+}
+
+/* Память соединения изменилась (кольцо, ранние данные): учесть, не спрашивая бюджета. */
+static void conn_mem_sync(struct conn *c) {
+    size_t kib = conn_mem_now(c);
+    if (kib != c->mem_kib) conn_charge(c, kib, 1);
+}
+
+/* Взять память под новое соединение (сессия и запись). 0 — взята; -1 — бюджет или доля не дают, в журнал —
+ * числа (не чаще раза в пять секунд на рабочего), в счётчик — отказ. */
+static int conn_mem_open(struct conn *c, int udp) {
+    if (conn_charge(c, conn_mem_now(c), 0) == 0) return 0;
+    unsigned long long tot = __atomic_add_fetch(&g_refused_mem, 1, __ATOMIC_RELAXED);
+    static __thread time_t said;
+    if (g_now_s - said >= 5) {
+        said = g_now_s;
+        char a[INET6_ADDRSTRLEN];
+        struct src_key s;
+        src_key_of(&c->key, &s);
+        pthread_mutex_lock(&g_src.mu);
+        struct src_ent *e = src_get(&s, 0);
+        size_t mine = e ? e->mem_kib : 0;
+        pthread_mutex_unlock(&g_src.mu);
+        fprintf(stderr, LOG_W "память туннеля на пределе: занято %zu КиБ из %zu (новые — до %zu), у %s — %zu КиБ "
+                        "из доли %zu (новые — до %zu) — %s отклонено (%s); всего отклонено %llu\n",
+                __atomic_load_n(&g_mem_kib, __ATOMIC_RELAXED), g_lim.mem_budget_kib, g_lim.mem_budget_kib / 4 * 3,
+                src_str(&c->key, a, sizeof(a)), mine, g_lim.mem_src_kib, g_lim.mem_src_kib / 4 * 3,
+                udp ? "новый поток UDP" : "новое соединение", udp ? "ICMP" : "RST", tot);
+    }
+    return -1;
+}
 
 static uint64_t spare_now(void) { return g_spare_clock_ns ? g_spare_clock_ns : now_ns(); }
 
@@ -1004,6 +1411,53 @@ static void spare_note(int ok) {
         g_spare_fail_ns = spare_now();
     }
     pthread_mutex_unlock(&g_spare_mu);
+}
+
+/* Взять заявку из очередей (под g_cq.mu, очереди не пусты): из очереди 0, но не больше CQ_HI_RUN подряд,
+ * пока ждёт очередь 1 (см. «две очереди» у g_cq). */
+static struct connjob cq_pop(void) {
+    int lo = g_cq.r[1].n && (!g_cq.r[0].n || g_cq.hi_run >= CQ_HI_RUN);
+    struct cq_ring *r = &g_cq.r[lo];
+    g_cq.hi_run = lo || !g_cq.r[1].n ? 0 : g_cq.hi_run + 1;
+    struct connjob j = r->q[r->head];
+    r->head = (r->head + 1) % r->cap;
+    r->n--;
+    g_cq.n--;
+    return j;
+}
+
+/* Заявку брать не стоит: простояла дольше срока или клиент TCP уже ушёл. 0 — брать; иначе код исхода. */
+static int connjob_stale(const struct connjob *j) {
+    uint64_t waited_ms = (now_ns() - j->enq_ns) / 1000000ull;
+    if (waited_ms > (uint64_t)(j->udp ? CQ_WAIT_UDP_MS : CQ_WAIT_TCP_MS)) return STACK_RC_QEXPIRED;
+    if (j->cfd >= 0) {
+        /* Сокет клиента не закрывается, пока заявка в работе (pending): спрашивать его отсюда можно. Ушёл —
+         * это RST или закрытие целиком (HUP, ERR); полузакрытие (RDHUP) — законный «запрос и FIN», ответ ждут. */
+        struct pollfd p = { .fd = j->cfd, .events = POLLIN | POLLRDHUP };
+        if (poll(&p, 1, 0) > 0 && (p.revents & (POLLHUP | POLLERR))) return STACK_RC_QGONE;
+    }
+    return 0;
+}
+
+/* Соединение к узлу со сроком на всё установление (CONNECT_TOTAL_MS): срок держит слой сокетов, если он
+ * собран (tr_watch_begin); вышел — исход STACK_RC_HSDEADLINE, что бы ни ответил дайлер (сокеты связи уже
+ * закрыты на чтение и запись). */
+static int connect_timed(void *sess) {
+    if (tr_watch_begin) tr_watch_begin(CONNECT_TOTAL_MS);
+    int rc = g_dl->ops->connect(g_dl->ctx, sess, CONNECT_TIMEOUT_S);
+    if (tr_watch_end && tr_watch_end()) {
+        unsigned long long tot = __atomic_add_fetch(&g_hs_deadline, 1, __ATOMIC_RELAXED);
+        static time_t said;
+        time_t now = time(NULL);
+        if (now - __atomic_load_n(&said, __ATOMIC_RELAXED) >= 10) {
+            __atomic_store_n(&said, now, __ATOMIC_RELAXED);
+            fprintf(stderr, LOG_W "рукопожатие с узлом %s не уложилось в %d мс — связь закрыта (узел или посредник "
+                            "отдаёт ответ по капле); всего %llu\n",
+                    g_dl->ops->peer(g_dl->ctx), CONNECT_TOTAL_MS, tot);
+        }
+        rc = STACK_RC_HSDEADLINE;
+    }
+    return rc;
 }
 
 static void *connector(void *arg) {
@@ -1028,9 +1482,7 @@ static void *connector(void *arg) {
                 g_cq.idle--;
             }
         }
-        struct connjob j = g_cq.q[g_cq.head];
-        g_cq.head = (g_cq.head + 1) % g_cq.cap;
-        g_cq.n--;
+        struct connjob j = cq_pop();
         pthread_mutex_unlock(&g_cq.mu);
 
         if (!j.c) {
@@ -1038,7 +1490,9 @@ static void *connector(void *arg) {
              * её заберёт следующий SYN. Слот наш (FILLING), пока не отдадим. Исход слежке
              * за узлом докладывает сам дайлер — внутри connect. */
             struct spare *sp = j.sp;
-            int rc = g_dl->ops->connect(g_dl->ctx, j.sess, CONNECT_TIMEOUT_S);
+            int rc = connect_timed(j.sess);
+            /* Связь, открытая к сроку, но закрытая им (shutdown), годной запасной не будет. */
+            if (rc == STACK_RC_HSDEADLINE) g_dl->ops->close(j.sess);
             pthread_mutex_lock(&g_spare_mu);
             if (rc == 0) {
                 sp->born_ns = spare_now();
@@ -1051,10 +1505,16 @@ static void *connector(void *arg) {
             continue;
         }
 
-        /* Исход — и слежке за узлом (под демоном): серия отказов зовёт её проверку раньше
-         * срока. Докладывает дайлер, потому что мера «жив ли узел» — его. */
-        int rc = g_dl->ops->connect(g_dl->ctx, j.sess, CONNECT_TIMEOUT_S);
-        spare_note(rc == 0);
+        /* Просроченную заявку и заявку ушедшего клиента не исполняем: рукопожатие к узлу стоило бы
+         * установщика и соединения у узла ради ответа, которого никто не ждёт. Узлу это не отказ —
+         * spare_note не зовётся. */
+        int rc = connjob_stale(&j);
+        if (!rc) {
+            /* Исход — и слежке за узлом (под демоном): серия отказов зовёт её проверку раньше
+             * срока. Докладывает дайлер, потому что мера «жив ли узел» — его. */
+            rc = connect_timed(j.sess);
+            spare_note(rc == 0);
+        }
         j.c->rc = rc;
         /* RELEASE: цикл читает done с ACQUIRE, и всё, что записано в сессию выше, обязано
          * быть видно ему к этому моменту. Без барьера это ровно та ошибка, которая
@@ -1101,11 +1561,7 @@ static int connector_spawn(int extra) {
 static int connq_push(const struct connjob *j) {
     pthread_mutex_lock(&g_cq.mu);
     if (!g_cq.started) {
-        if (!g_cq.max) {
-            const char *e = getenv("STEER_TUN_CONNECTORS");
-            int v = e ? atoi(e) : 0;
-            g_cq.max = v >= 1 ? (unsigned)v : CONNECTORS_MAX;
-        }
+        if (!g_cq.max) g_cq.max = cq_max();
         int err = 0;
         for (unsigned i = 0; i < CONNECTORS && i < g_cq.max; i++) {
             err = connector_spawn(0);
@@ -1123,17 +1579,19 @@ static int connq_push(const struct connjob *j) {
         }
         g_cq.started = 1;
     }
-    if (g_cq.n == g_cq.cap) {
-        unsigned nc = g_cq.cap ? g_cq.cap * 2 : 64;
+    struct cq_ring *r = &g_cq.r[j->c && j->udp ? 1 : 0];
+    if (r->n == r->cap) {
+        unsigned nc = r->cap ? r->cap * 2 : 64;
         struct connjob *nq = malloc((size_t)nc * sizeof(*nq));
         if (!nq) { pthread_mutex_unlock(&g_cq.mu); return -1; }
-        for (unsigned i = 0; i < g_cq.n; i++) nq[i] = g_cq.q[(g_cq.head + i) % g_cq.cap];
-        free(g_cq.q);
-        g_cq.q = nq;
-        g_cq.cap = nc;
-        g_cq.head = 0;
+        for (unsigned i = 0; i < r->n; i++) nq[i] = r->q[(r->head + i) % r->cap];
+        free(r->q);
+        r->q = nq;
+        r->cap = nc;
+        r->head = 0;
     }
-    g_cq.q[(g_cq.head + g_cq.n) % g_cq.cap] = *j;
+    r->q[(r->head + r->n) % r->cap] = *j;
+    r->n++;
     g_cq.n++;
     /* Ждущих меньше, чем заявок, — нужен ещё один установщик (отказ создания не страшен: прежние
      * разберут очередь, только дольше). */
@@ -1253,7 +1711,7 @@ static void spare_refill(void) {
 
     for (int k = 0; k < nfill; k++) {
         struct connjob j = { .c = NULL, .sess = g_spares[fill[k]].sess, .sp = &g_spares[fill[k]],
-                             .efd = -1 };
+                             .efd = -1, .cfd = -1, .enq_ns = now_ns() };
         if (connq_push(&j) != 0) {
             /* Очередь полна — живые заявки важнее. Вернуть ВСЕ оставшиеся резервы:
              * слот в состоянии FILLING без заявки не заполнит никто и никогда. */
@@ -1287,16 +1745,20 @@ static void spare_refill(void) {
 static int connq_release(struct conn *base) {
     if (g_inloop) return 0;     /* установщиков нет: заявок в очереди и в работе не бывает */
     pthread_mutex_lock(&g_cq.mu);
-    unsigned kept = 0;
-    for (unsigned i = 0; i < g_cq.n; i++) {
-        struct connjob j = g_cq.q[(g_cq.head + i) % g_cq.cap];
-        if (j.c >= base && j.c < base + g_nslots) {
-            j.c->pending = 0;            /* нашу запись больше никто не тронет */
-            continue;
+    for (int q = 0; q < 2; q++) {
+        struct cq_ring *r = &g_cq.r[q];
+        unsigned kept = 0;
+        for (unsigned i = 0; i < r->n; i++) {
+            struct connjob j = r->q[(r->head + i) % r->cap];
+            if (j.c >= base && j.c < base + g_nslots) {
+                j.c->pending = 0;            /* нашу запись больше никто не тронет */
+                continue;
+            }
+            r->q[(r->head + kept++) % r->cap] = j;
         }
-        g_cq.q[(g_cq.head + kept++) % g_cq.cap] = j;
+        g_cq.n -= r->n - kept;
+        r->n = kept;
     }
-    g_cq.n = kept;
     pthread_mutex_unlock(&g_cq.mu);
 
     /* Взятые в работу: ждём доклада. Предел щедрый — таймаут установления восемь секунд, и
@@ -1324,8 +1786,35 @@ static int connq_release(struct conn *base) {
  * прежний опрос раз в 20 мс. */
 static __thread int g_conn_efd = -1;
 
-/* Поставить заявку. 0 — принята, иначе отказ connq_push (нет памяти или установщиков). */
+static int conn_submit_job(struct conn *c);
+
+/* Поставить заявку. 0 — принята; -1 и -2 — отказ connq_push (нет памяти или установщиков); -3 — доля
+ * источника или процесса (src_pend_take) исчерпана: отказ назван в журнале и сосчитан здесь же. */
 static int conn_submit(struct conn *c) {
+    unsigned have = 0;
+    int pr = src_pend_take(&c->key, c->is_udp, &have);
+    if (pr) {
+        if (pr < 0) return -1;
+        unsigned long long tot = __atomic_add_fetch(&g_refused_pend, 1, __ATOMIC_RELAXED);
+        static __thread time_t said;
+        if (g_now_s - said >= 5) {
+            said = g_now_s;
+            char a[INET6_ADDRSTRLEN];
+            fprintf(stderr, LOG_W "%s от %s: заявок на установку %s у источника %u (предел %u на источник, %u на "
+                            "процесс) — %s; всего отклонено %llu\n",
+                    c->is_udp ? "новый поток UDP отклонён" : "новое соединение отклонено",
+                    src_str(&c->key, a, sizeof(a)), c->is_udp ? "UDP" : "TCP", have, g_lim.pend_src_max,
+                    g_lim.pend_max, c->is_udp ? "клиенту ICMP «порт недоступен»" : "клиенту RST", tot);
+        }
+        return -3;
+    }
+    c->pend_acct = 1;
+    int rc = conn_submit_job(c);
+    if (rc) pend_release(c);
+    return rc;
+}
+
+static int conn_submit_job(struct conn *c) {
     if (g_inloop) {
         /* Без установщика: открытие начинает сам дайлер, здесь же, и не ждёт ответа узла. Исход — через
          * stack_sess_ready (когда придёт, не раньше), а отказ на месте — кодом. Заявка при этом такая же:
@@ -1338,7 +1827,8 @@ static int conn_submit(struct conn *c) {
         }
         return 0;
     }
-    struct connjob j = { .c = c, .sess = SESS(c), .sp = NULL, .efd = g_conn_efd };
+    struct connjob j = { .c = c, .sess = SESS(c), .sp = NULL, .efd = g_conn_efd,
+                         .cfd = c->cfd1 ? conn_cfd(c) : -1, .udp = c->is_udp, .enq_ns = now_ns() };
     return connq_push(&j);
 }
 
@@ -1351,6 +1841,7 @@ static int conn_submit(struct conn *c) {
  * таблица, список живых, свободные и — после них — сессии дайлера шагом g_sess_stride. Резерв не
  * получился — берём вдвое меньше, пока не получится (потолок объяснён у CONN_CHUNK). */
 static int conn_table_init(void) {
+    lim_ready();
     if (!g_conns) {
         size_t pg = (size_t)sysconf(_SC_PAGESIZE);
         size_t cap = g_slots_want;
@@ -1613,6 +2104,9 @@ static struct conn *conn_new(const struct tun_dev *tun) {
  * нужно, и делать его после close значило бы ходить в ядро с закрытым номером. */
 static void conn_drop(struct conn *c) {
     TR("закрываю conn#%ld fd=%d\n", (long)(c - g_conns), c->fd);
+    /* Доля источника и бюджет — до затирания записи: ключ источника нужен обоим. */
+    pend_release(c);
+    if (c->mem_kib) conn_charge(c, 0, 1);
     if (c->used) {
         g_dl->ops->close(SESS(c));
         conn_unlink(c);
@@ -1733,6 +2227,7 @@ static int early_flush(struct conn *c) {
     free(c->early);
     c->early = NULL;
     c->early_n = c->early_off = c->early_cap = 0;
+    conn_mem_sync(c);
     return 0;
 }
 
@@ -1748,6 +2243,7 @@ static int early_hold(struct conn *c, const unsigned char *d, size_t n) {
     if (!c->early) {
         c->early = malloc(cap);
         if (!c->early) return -1;
+        conn_mem_sync(c);
     }
     memcpy(c->early + c->early_n, d, n);
     c->early_n += (uint32_t)n;
@@ -1770,8 +2266,9 @@ static int early_reserve(struct conn *c, size_t need) {
     if (c->early_n || need > UDP_DGRAM_ABS + 66) return -1;
     free(c->early);
     c->early = malloc(need);
-    if (!c->early) { c->early_cap = 0; return -1; }
+    if (!c->early) { c->early_cap = 0; conn_mem_sync(c); return -1; }
     c->early_cap = (uint32_t)need;
+    conn_mem_sync(c);
     return 0;
 }
 
@@ -1879,8 +2376,12 @@ static int sock_flush(struct conn *c) {
  * и отправка TCP на каждые 16 КБ дороже копии в кольцо. Место проверено заранее (client_can_take_record);
  * кольцо заводится при первых данных и растёт по надобности. */
 static int emit_to_client(struct conn *c, const unsigned char *p, size_t n) {
+    /* Бюджет памяти уже спрошен перед чтением (client_can_take_record), поэтому учёт здесь без отказа:
+     * отказ посреди прохода оборвал бы поток, уже прочитанный у узла. */
+    uint32_t was = c->rtx.cap;
     if (!c->rtx.cap && rtx_init(&c->rtx, RTX_START) != 0) return -1;
     if (rtx_room(&c->rtx) < n && c->rtx.cap < RTX_CAP) rtx_grow(&c->rtx, RTX_CAP);
+    if (c->rtx.cap != was) conn_mem_sync(c);
     if (rtx_room(&c->rtx) < n) return -1;
     rtx_push(&c->rtx, p, (uint32_t)n);
     return 0;
@@ -2225,6 +2726,26 @@ overlap:
  * Правило «сессия на поток» — стека, а не только VLESS: дайлер получает поток целиком и один,
  * поэтому протокол с мультиплексированием понадобился бы стеку как другая модель, а не как
  * ещё одна таблица (см. «чего здесь нет» в dialer.h). */
+/* Отказ потоку UDP — клиенту ICMP «порт недоступен»: QUIC переходит на TCP сразу, резолвер спрашивает
+ * другой сервер, а не ждут своего срока.
+ *
+ * Не чаще ICMP_REFUSE_PER_S в секунду на рабочего — столько же, сколько отвечает само ядро Linux
+ * (net.ipv4.icmp_msgs_per_sec = 1000): отказы бывают залпом (спрей датаграмм, T1), и ответ на каждую
+ * был бы встречным залпом в того же клиента. Сверх — молча, но отказ уже сосчитан и назван тем, кто
+ * отказал. Буфер — под цитату IPv6 целиком (icmp_unreach_build: 40 + 8 + до 1232): в 128 байт ответ на
+ * пакет IPv6 длиннее 80 байт не собирался вовсе. */
+#define ICMP_REFUSE_PER_S 1000
+static void udp_refuse(const struct tun_dev *tun, const unsigned char *pkt, size_t n) {
+    static __thread time_t sec;
+    static __thread unsigned sent;
+    if (sec != g_now_s) { sec = g_now_s; sent = 0; }
+    if (sent >= ICMP_REFUSE_PER_S) return;
+    sent++;
+    unsigned char un[1280];
+    size_t ul = icmp_unreach_build(un, sizeof(un), pkt, n);
+    if (ul) tun_write_ctl(tun, un, ul);
+}
+
 static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct flow_key *k,
                        const unsigned char *pkt, size_t n, size_t off) {
     size_t dn = n - off;
@@ -2247,9 +2768,7 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
 
     if (!c) {
         if (flow_rejected(k, 1)) {
-            unsigned char un[128];
-            size_t ul = icmp_unreach_build(un, sizeof(un), pkt, n);
-            if (ul) tun_write_ctl(tun, un, ul);
+            udp_refuse(tun, pkt, n);
             TR("поток UDP отвергнут политикой хоста\n");
             return;
         }
@@ -2264,6 +2783,12 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
         c->aux = -1;
         conn_link(c);                               /* после ключа: хэш считается по нему */
         c->last = g_now_s;
+        /* Бюджет памяти туннеля: сессия потока берётся только если он даёт (conn_mem_open назвал отказ). */
+        if (conn_mem_open(c, 1) != 0) {
+            conn_drop(c);
+            udp_refuse(tun, pkt, n);
+            return;
+        }
         /* Отказ дайлер называет сам (у VLESS — негодный UUID узла, I-097). */
         if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), k, 1) != 0) {
             conn_drop(c);
@@ -2283,7 +2808,8 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
             TR("UDP: заявка установщику\n");
         } else {
             /* Заявка не встала в очередь (нет памяти). Сказать об этом надо: снаружи это выглядит как
-             * «QUIC не работает через туннель». Отказ -2 (нет установщиков) connq_push назвал сам. */
+             * «QUIC не работает через туннель». Отказ -2 (нет установщиков) connq_push назвал сам, -3 (доля
+             * источника) — conn_submit; клиенту на него ICMP, чтобы QUIC не ждал своего срока. */
             static __thread time_t said_q;
             if (qr == -1 && g_now_s - said_q >= 5) {
                 said_q = g_now_s;
@@ -2291,6 +2817,7 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
                                 "датаграмма отброшена\n");
             }
             conn_drop(c);
+            if (qr == -3) udp_refuse(tun, pkt, n);
             return;
         }
         spare_refill();
@@ -2630,12 +3157,34 @@ static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
 static int conn_ready(struct conn *c, const struct tun_dev *tun) {
     const struct dialer_ops *d = g_dl->ops;
     c->pending = 0;
+    pend_release(c);
     c->fd = d->fd(SESS(c));
     if (c->rc == 0) node_sock_silence(c->fd);
-    if (c->client_gone) {
-        /* Клиент передумал, пока шло рукопожатие. Отвечать некому — просто
+    if (c->client_gone || c->rc == STACK_RC_QGONE) {
+        /* Клиент передумал, пока шло рукопожатие (или пока заявка ждала). Отвечать некому — просто
          * закрываем и поток к узлу, и запись. */
+        if (c->rc == STACK_RC_QGONE) __atomic_add_fetch(&g_q_gone, 1, __ATOMIC_RELAXED);
         conn_drop(c);
+        return 1;
+    }
+    if (c->rc == STACK_RC_QEXPIRED) {
+        /* Установщики не успели за потоком заявок. Сброс, а не ожидание: клиент повторит, а очередь не копит
+         * то, чего уже никто не ждёт. Журнал — числа, не чаще раза в пять секунд. */
+        unsigned long long tot = __atomic_add_fetch(&g_q_expired, 1, __ATOMIC_RELAXED);
+        static __thread time_t said;
+        if (g_now_s - said >= 5) {
+            said = g_now_s;
+            fprintf(stderr, LOG_W "%s дольше %d мс (установщиков до %u, узел не успевает) — %s; всего %llu\n",
+                    c->is_udp ? "поток UDP ждал установщика" : "соединение ждало установщика",
+                    c->is_udp ? CQ_WAIT_UDP_MS : CQ_WAIT_TCP_MS, cq_max(),
+                    c->is_udp ? "закрыт" : "клиенту RST", tot);
+        }
+        conn_reset(c, tun);
+        return 1;
+    }
+    if (c->rc == STACK_RC_HSDEADLINE) {
+        /* Назван установщиком (connect_timed) — здесь только сброс. */
+        conn_reset(c, tun);
         return 1;
     }
     if (c->rc != 0) {
@@ -2769,7 +3318,13 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
     /* Пустое кольцо отдаём обратно системе. Соединение при этом полностью рабочее:
      * при следующих данных кольцо появится снова. Именно после простоя, а не сразу по
      * опустошении, — иначе на каждом залпе подтверждений шли бы malloc и free. */
-    if (c->rtx.cap && !c->rtx.len && g_now_s - c->last > 5) rtx_done(&c->rtx);
+    /* Под давлением на бюджет памяти (занято больше половины) — сразу: пустое кольцо нужнее тем, кто
+     * ждёт места, а malloc на следующем залпе дешевле отказа новому соединению. */
+    if (c->rtx.cap && !c->rtx.len &&
+        (g_now_s - c->last > 5 || __atomic_load_n(&g_mem_kib, __ATOMIC_RELAXED) > g_lim.mem_budget_kib / 2)) {
+        rtx_done(&c->rtx);
+        conn_mem_sync(c);
+    }
 
     /* Уборка задержавшихся: без неё таблица заполняется соединениями, которые клиент
      * бросил без FIN, и новые перестают открываться.
@@ -3151,6 +3706,8 @@ static struct conn *conn_accept(int fd, const struct flow_key *k, const struct t
     c->last = g_now_s;
     c->estab_ns = g_now_ns ? g_now_ns : 1;
     conn_link(c);
+    /* Бюджет памяти туннеля: не даёт — RST (conn_mem_open назвал отказ). */
+    if (conn_mem_open(c, 0) != 0) { conn_reset(c, tun); return NULL; }
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     if (g_dl->ops->flow_open(g_dl->ctx, SESS(c), &key, 0) != 0) { conn_reset(c, tun); return NULL; }
@@ -3161,9 +3718,11 @@ static struct conn *conn_accept(int fd, const struct flow_key *k, const struct t
         spare_refill();
         return c;
     }
-    if (conn_submit(c) != 0) {
+    int qr = conn_submit(c);
+    if (qr != 0) {
+        /* -3 (доля источника) назвал conn_submit; остальное — нехватка памяти или установщиков. */
         static __thread time_t said_q;
-        if (g_now_s - said_q >= 5) {
+        if (qr != -3 && g_now_s - said_q >= 5) {
             said_q = g_now_s;
             fprintf(stderr, LOG_W "нет памяти под очередь установки соединений, соединение сброшено\n");
         }
@@ -3237,6 +3796,7 @@ static void sock_read(struct conn *c, const struct tun_dev *tun) {
                 memcpy(c->early, buf + off, rest);
                 c->early_n = c->early_cap = (uint32_t)rest;
                 c->early_off = 0;
+                conn_mem_sync(c);
                 return;
             }
             conn_node_lost(c);

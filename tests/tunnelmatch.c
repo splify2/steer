@@ -522,7 +522,7 @@ static void t_tcp_tun_rst(void) {
     unsigned char p[128];
     dev_drain(NULL);
     int live0 = g_live_n;
-    unsigned head0 = g_cq.head;
+    unsigned head0 = g_cq.r[0].head + g_cq.r[1].head;
     unsigned long long rst0 = g_tcp_tun_rst;
 
     size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, 1000, 0, TCP_SYN, NULL, 0,
@@ -535,7 +535,7 @@ static void t_tcp_tun_rst(void) {
           last.dport == CLI_PORT,
           "TCP в устройстве: SYN получает RST+ACK с номером подтверждения ISN + 1 от имени сервера");
     check(g_tcp_tun_rst == rst0 + 1, "TCP в устройстве: счётчик g_tcp_tun_rst вырос");
-    check(!conn_find(&k) && g_live_n == live0 && g_cq.head == head0,
+    check(!conn_find(&k) && g_live_n == live0 && g_cq.r[0].head + g_cq.r[1].head == head0,
           "TCP в устройстве: соединение в таблицу не заводится, установщик не просится");
 
     /* Данные и подтверждение: RST с номером из подтверждения (RFC 793, 3.4). */
@@ -2745,11 +2745,11 @@ static void t_inloop(void) {
 
     /* Исход сразу, из самого connect: ни установщика, ни потока. Установщики от прежних проверок могут уже
      * стоять (g_cq.started), поэтому смотрим на очередь: заявка в неё не ложится. */
-    unsigned head0 = g_cq.head;
+    unsigned head0 = g_cq.r[0].head + g_cq.r[1].head;
     struct conn *c = pm_open(41000, SRV_IP);
     check(c != NULL && g_in_connects == 1 && g_in_same_thread,
           "в цикле: connect зовёт сам стек, в своём потоке");
-    check(g_cq.head == head0 && g_cq.n == 0, "  заявка установщику не ставилась (очередь не двигалась)");
+    check(g_cq.r[0].head + g_cq.r[1].head == head0 && g_cq.n == 0, "  заявка установщику не ставилась (очередь не двигалась)");
     if (!c) return;
     check(c->fd == 77 && !c->armed, "  связь есть, а в epoll соединению ставить нечего (дескриптора нет)");
 
@@ -3610,7 +3610,7 @@ static void t_connectors_burst(void) {
     uint64_t t0 = now_ns();
     int refused = 0;
     for (int i = 0; i < N; i++) {
-        struct connjob j = { .c = &jobs[i], .sess = &jobs[i], .sp = NULL, .efd = -1 };
+        struct connjob j = { .c = &jobs[i], .sess = &jobs[i], .sp = NULL, .efd = -1, .cfd = -1, .enq_ns = now_ns() };
         if (connq_push(&j) != 0) refused++;
     }
     for (int w = 0; w < 600 && __atomic_load_n(&g_slow_done, __ATOMIC_RELAXED) < N; w++) usleep(10000);
