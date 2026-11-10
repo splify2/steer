@@ -671,9 +671,9 @@ $(BUILD)/tarmatch: tests/tarmatch.c tests/unit.h src/lib/untar.c src/lib/untar.h
 # авторизации QPACK и разбор ответа, TCPRequest/Response, UDPMessage, Salamander и BLAKE2b на
 # векторах — ни сети, ни QUIC, ни криптобиблиотеки, поэтому входит в обычный make test.
 $(BUILD)/hy2match: tests/hy2match.c src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2wire.h \
-                   src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2.h
+                   src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2.h tests/memcap.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/hy2match.c src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2sub.c
+	$(CC) $(CFLAGS) -Itests -o $@ tests/hy2match.c src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2sub.c
 
 # Разбор ссылок и подписки прокси (src/proto/proxy/pxsub.c) — без сети и криптографии, как submatch.
 # sublink.c, sub.c, vless_proto.c и trpath.c — те же общие части, что у разбора vless.

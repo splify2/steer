@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "hy2.h"
+#include "memcap.h"
 
 static int g_fail;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "hy2match: %s:%d: не выполнено: %s\n", __FILE__, __LINE__, #c); g_fail++; } } while (0)
@@ -585,7 +586,29 @@ static void test_rasm(void) {
     hy2_rasm_free(&r2);
 }
 
+/* Чужая скобка или запятая на месте значения в конфиге Xray: отказ «не разобран» сразу и без
+ * раздувания. Прежде «[}» (два байта) наращивал массив токенов до 4 ГБ — примитив нулевой длины
+ * не сдвигал разбор. Потолок ребёнку — 512 МиБ, допуск по пику RSS — 16 МиБ. */
+static int broken_one(void *arg) {
+    struct hy2_node nodes[2];
+    struct hy2_sub_stats st;
+    size_t n = hy2_parse_sub((const char *)arg, nodes, 2, &st);
+    return n == 0 && st.skipped == 1 && !strcmp(st.reasons[0].reason, "конфиг подписки не разобран") ? 0 : 1;
+}
+
+static void test_broken_json(void) {
+    static const char *const bad[] = { "[}", "{]", "[,}", "[1}", "{\"a\":}", "[[[[}", "{\"outbounds\":[}" };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        long kb = memcap_run(broken_one, (void *)bad[i], 512, 10);
+        if (kb < 0 || kb > 16 * 1024) {
+            fprintf(stderr, "hy2match: «%s»: пик +%ld КиБ (−1 — не отказ или упал)\n", bad[i], kb);
+            g_fail++;
+        }
+    }
+}
+
 int main(void) {
+    test_broken_json();
     test_brutal_share();
     test_limits();
     test_varint();
