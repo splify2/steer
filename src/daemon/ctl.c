@@ -167,6 +167,7 @@
 #include "ynode.h"
 #include "plugso.h"
 #include "wandev.h"
+#include "nftdump.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
 
@@ -705,7 +706,13 @@ struct ctl_srv {
      * после смены устройства раздачи, которую ещё не видел ни один план, — объяснимое и не в счёт
      * RESYNC_BURST. resync_said — окно (самая старая починка в нём), о котором отказ уже сказан. */
     long lan_at, plan_at, resync_said;
+    /* Повтор стартового применения (boot_retry): таймер, номер следующей попытки и пауза перед ней. */
+    struct loop_timer *boot_tm;
+    int boot_try;
+    long boot_pause_ms;
 };
+
+static void boot_retry_arm(struct ctl_srv *s);
 
 static void mem_version(struct conn *c, struct cbuf *r);
 static void mem_status(struct conn *c, struct cbuf *r);
@@ -1985,6 +1992,12 @@ static void reload_done(struct conn *c) {
     /* Стартовое применение кончилось — удачно или нет: теперь первый проход сторожа (см.
      * «ПЕРВЫЙ ПРОХОД — ПОСЛЕ СТАРТОВОГО APPLY» в watchd.c). */
     if (c->boot) watchd_release(c->srv->watch);
+    /* Стартовое применение не прошло — повторить (boot_retry_arm): прежнего набора правил после
+     * перезагрузки нет, и ждать ручного reload значило бы стоять без маршрутизации. */
+    if (c->boot) {
+        if (c->rcode != 0) boot_retry_arm(c->srv);
+        else c->srv->boot_try = 0;
+    }
     /* @wan_dev напечатан заново; маршрут мог смениться, пока шло применение. */
     wandev_sync(1);
     struct ctl_srv *s = c->srv;
@@ -2003,9 +2016,11 @@ static void reload_done(struct conn *c) {
 static void reload_head(struct conn *c, int enabled, struct cbuf *err) {
     if (c->boot) {
         if (c->rcode != 0)
-            fprintf(stderr, LOG_W "применение при старте не прошло (код %d)%s%.*s", c->rcode,
+            fprintf(stderr, LOG_W "применение при старте не прошло (код %d) — повторю%s%.*s", c->rcode,
                     err && err->n ? ":\n" : "\n", err ? (int)err->n : 0,
                     err && err->p ? err->p : "");
+        else if (enabled && c->srv->boot_try)
+            fprintf(stderr, LOG_I "спека применена при старте — с попытки %d\n", c->srv->boot_try + 1);
         else if (enabled)
             fprintf(stderr, LOG_I "спека применена при старте\n");
     }
@@ -3145,13 +3160,57 @@ static int boot_apply(struct ctl_srv *s) {
     c->hup = 1;          /* ответ отдавать некому: conn_reply освобождает соединение */
     c->boot = 1;
     c->st = C_RUN;
+    c->job.po = c->job.pe = -1;
     c->q.cmd = ctl_lookup("reload");
     c->q.cf = &s->cf;
     c->next = s->conns;
     s->conns = c;
     resp_begin(&c->resp, "reload");
+    /* Повтор приходит по таймеру и может застать чужую изменяющую команду — тогда в её очередь. */
+    if (s->lock_owner) {
+        c->st = C_WAIT;
+        struct conn **pp = &s->lockq;
+        while (*pp) pp = &(*pp)->qnext;
+        *pp = c;
+        return 0;
+    }
     conn_exec(c);
     return 0;
+}
+
+/* ---- повтор стартового применения ---------------------------------------------------------------
+ *
+ * Стартовое применение могло не пройти не по вине спеки: nft ещё нечем принять набор (fw4 на
+ * холодной загрузке не поднялся), список докачивается, ядро не дало памяти. Прежде об отказе была
+ * одна строка в журнале, и всё: демон не выходит, respawn procd его не повторяет, а сверка на
+ * проходе сторожа без запомненного применения не работает. После перезагрузки прежнего набора
+ * правил в ядре нет — правила fwmark стоят, а меток, заворота DNS и запрета никто не ставит, и
+ * трафик шёл напрямую до ручного reload.
+ *
+ * Повтор — тем же стартовым применением, с растущей паузой (5 с, вдвое, до 5 минут): пока не
+ * пройдёт, пока движок включён и спека есть. Кто-то применил раньше (apply или reload по сокету
+ * прошли — у демона есть запомненное применение) — повторять нечего. Пауза не сбрасывается от
+ * чужих неудач: спека, которую не принимает ядро, не должна превращаться в компиляцию по кругу. */
+#define BOOT_RETRY_MIN_MS 5000L
+#define BOOT_RETRY_MAX_MS (5 * 60 * 1000L)
+
+static void boot_retry_arm(struct ctl_srv *s) {
+    if (!s->boot_tm) return;
+    s->boot_pause_ms = !s->boot_pause_ms ? BOOT_RETRY_MIN_MS :
+                       s->boot_pause_ms * 2 > BOOT_RETRY_MAX_MS ? BOOT_RETRY_MAX_MS : s->boot_pause_ms * 2;
+    const char *e = getenv("STEER_BOOT_RETRY_MS");          /* шов стенда: пауза первой попытки */
+    if (e && *e && s->boot_try == 0) s->boot_pause_ms = atol(e) > 0 ? atol(e) : s->boot_pause_ms;
+    s->boot_try++;
+    fprintf(stderr, LOG_I "стартовое применение: попытка %d через %ld с\n", s->boot_try + 1,
+            (s->boot_pause_ms + 999) / 1000);
+    loop_timer_set(s->boot_tm, s->boot_pause_ms);
+}
+
+static void boot_retry(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l; (void)t;
+    struct ctl_srv *s = arg;
+    if (!s->on || !s->d.have || s->rec.valid) { s->boot_try = 0; s->boot_pause_ms = 0; return; }
+    if (boot_apply(s) != 0) boot_retry_arm(s);
 }
 
 /* ---- починка правил выходов (страж правил, rulewd.c) --------------------------------------------
@@ -3369,11 +3428,23 @@ static void srv_kcheck(void *arg) {
     /* Своя изменяющая команда идёт или ждёт очереди — её замена набора правил ещё не запомнена
      * (или уже в полёте), и расхождение с ней не расхождение. Проход при этом и не начинается
      * (srv_busy), но починка, поставленная прошлым проходом, может ждать в очереди. */
-    if (!s->on || !s->rec.valid || s->lock_owner || s->lockq) return;
+    if (!s->on || s->lock_owner || s->lockq) return;
     for (struct conn *c = s->conns; c; c = c->next)
-        if (c->resync) return;
+        if (c->resync || c->boot) return;
     const char *why = "";
-    int drift = recon_kernel_drift(&s->rec, &why);
+    int drift;
+    if (!s->rec.valid) {
+        /* Запомненного применения нет: стартовое не прошло (или последнее отвергнуто). Раньше
+         * проход на этом молчал. Таблицы в ядре нет, а движок включён, спека есть и правила
+         * выходов стоят — это то же «не то, что должно стоять», что снятая мимо нас таблица ниже:
+         * чинить, в общем счёте починок. Таблица есть (отвергнут новый набор, стоит прежний) —
+         * трогать нечего. */
+        if (!s->d.have || nfd_table_exists(NFD_INET, nft_table()) || !srv_table_flushed(s)) return;
+        why = "движок включён и спека есть, а набора правил в ядре Linux нет";
+        drift = 1;
+    } else {
+        drift = recon_kernel_drift(&s->rec, &why);
+    }
     if (drift == 2 && srv_table_flushed(s)) {
         why = "таблицы ядра steer нет в ядре Linux, а правила выходов стоят — её снял кто-то другой";
         drift = 1;
@@ -3638,6 +3709,7 @@ int ctl_serve_main(int argc, char **argv) {
      * status до тех пор отвечает тем же отказом, что подкоманда. */
     if (steerd_load(&S.d) != 0) fprintf(stderr, LOG_W "спека не прочитана: %s\n", S.d.err);
     S.accept_tm = loop_timer_new(S.l, srv_accept_resume, &S);
+    S.boot_tm = loop_timer_new(S.l, boot_retry, &S);
     if (!S.accept_tm || loop_fd_add(S.l, S.lfd, EPOLLIN, srv_accept, &S) != 0) {
         fprintf(stderr, LOG_W "цикл событий: %s\n", strerror(errno));
         return 1;
