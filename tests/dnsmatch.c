@@ -628,6 +628,56 @@ int main(void) {
     }
 
     {
+        /* D6: ДОЛЯ ТАБЛИЦЫ ОЖИДАНИЙ НА КЛИЕНТА. Прежде ~205 вопросов в секунду без ответа от одного
+         * клиента занимали все 1024 места, и вопросы остальных отбрасывались молча. Теперь у клиента
+         * не больше восьмой части мест, и его новый вопрос вытесняет его же самый давний. */
+        struct sockaddr_storage cl[9];
+        memset(cl, 0, sizeof(cl));
+        for (int i = 0; i < 9; i++) {
+            ((struct sockaddr_in *)&cl[i])->sin_family = AF_INET;
+            ((struct sockaddr_in *)&cl[i])->sin_addr.s_addr = htonl(0x0A000001u + (uint32_t)i);
+        }
+        time_t base = time(NULL) + 100;
+        int ok = 1;
+        struct pending *last = NULL;
+        for (int i = 0; i < 2000; i++) {
+            struct pending *p = pending_alloc(&cl[0]);
+            if (!p) { ok = 0; break; }
+            p->expire = base + i;
+            pending_take(p);
+            last = p;
+        }
+        uint64_t k0 = fakeip_client_key(&cl[0]);
+        check("D6: 2000 вопросов одного клиента без ответа — все приняты (вытеснением)", 1, ok);
+        check("D6: и клиент держит ровно свою долю", MAX_PENDING / 8, (int)pending_client_count(k0));
+        int newest = 1;
+        long min_exp = -1;
+        for (int i = 0; i < MAX_PENDING; i++)
+            if (g_pending[i].in_use && g_pending[i].ckey == k0 &&
+                (min_exp < 0 || g_pending[i].expire < min_exp)) min_exp = (long)g_pending[i].expire;
+        if (min_exp != (long)(base + 2000 - MAX_PENDING / 8)) newest = 0;
+        check("D6: вытеснялись его же самые давние", 1, newest && last && last->expire == base + 1999);
+        struct pending *pb = pending_alloc(&cl[1]);
+        check("D6: вопрос другого клиента получает место", 1, pb != NULL && !pb->in_use);
+        /* Восемь клиентов у своих долей занимают таблицу целиком: девятому места нет — как прежде при
+         * полной таблице, — но вопрос каждого из восьми по-прежнему принимается (своё давнее). */
+        for (int c = 1; c < 8; c++)
+            for (int i = 0; i < MAX_PENDING / 8; i++) {
+                struct pending *p = pending_alloc(&cl[c]);
+                if (!p) { ok = 0; break; }
+                p->expire = base + i;
+                pending_take(p);
+            }
+        check("D6: восемь долей заняли таблицу", 1, ok);
+        check("D6: девятому клиенту в полной таблице места нет", 1, pending_alloc(&cl[8]) == NULL);
+        struct pending *p3 = pending_alloc(&cl[3]);
+        check("D6: клиент у своей доли в полной таблице вытесняет своё", 1,
+              p3 != NULL && p3->ckey == fakeip_client_key(&cl[3]));
+        for (int i = 0; i < MAX_PENDING; i++) pending_drop(&g_pending[i]);
+        check("D6: после снятия счёт клиента — ноль", 0, (int)pending_client_count(k0));
+    }
+
+    {
         /* Долгий путь к файлу состояния fake-IP. Путь задаётся снаружи (--state-file,
          * --state-dir), то есть его длину выбирает не движок, а буфер под имя временного
          * файла был размером в имя ХОСТА (MAX_HOSTNAME, 256). «%s.tmp» в него молча не

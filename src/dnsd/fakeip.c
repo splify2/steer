@@ -483,81 +483,13 @@ unsigned fakeip_per_client(void) {
     return v;
 }
 
-/* Счёт записей по клиентам: открытая адресация по ключу (0 — пусто), удаление сдвигом назад
- * (без надгробий). Клиентов — сколько адресов спрашивало имена под правилами; запись счёта
- * уходит, как только у клиента не осталось адресов. */
-struct fowner { uint64_t key; uint32_t n; };
-static struct fowner *g_own;
-static size_t g_own_cap, g_own_n;            /* cap — степень двойки */
+/* Счёт записей по клиентам (struct kcount, dnsd_int.h). */
+static struct kcount g_own;
 
-static size_t own_slot(uint64_t key) {
-    uint64_t h = key * 0x9E3779B97F4A7C15ull;
-    return (size_t)(h >> 32) & (g_own_cap - 1);
-}
-
-static struct fowner *own_find(uint64_t key) {
-    if (!g_own_cap) return NULL;
-    for (size_t i = own_slot(key);; i = (i + 1) & (g_own_cap - 1)) {
-        if (!g_own[i].key) return NULL;
-        if (g_own[i].key == key) return &g_own[i];
-    }
-}
-
-static int own_grow(void) {
-    size_t nc = g_own_cap ? g_own_cap * 2 : 64;
-    struct fowner *nt = calloc(nc, sizeof(*nt));
-    if (!nt) return -1;
-    struct fowner *old = g_own;
-    size_t oc = g_own_cap;
-    g_own = nt;
-    g_own_cap = nc;
-    for (size_t i = 0; i < oc; i++) {
-        if (!old[i].key) continue;
-        size_t j = own_slot(old[i].key);
-        while (g_own[j].key) j = (j + 1) & (g_own_cap - 1);
-        g_own[j] = old[i];
-    }
-    free(old);
-    return 0;
-}
-
-unsigned fakeip_owner_count(uint64_t owner) {
-    const struct fowner *o = owner ? own_find(owner) : NULL;
-    return o ? o->n : 0;
-}
-
-static int own_add(uint64_t key) {
-    struct fowner *o = own_find(key);
-    if (o) { o->n++; return 0; }
-    if ((g_own_n + 1) * 2 > g_own_cap && own_grow() != 0) return -1;
-    size_t i = own_slot(key);
-    while (g_own[i].key) i = (i + 1) & (g_own_cap - 1);
-    g_own[i].key = key;
-    g_own[i].n = 1;
-    g_own_n++;
-    return 0;
-}
+unsigned fakeip_owner_count(uint64_t owner) { return kc_get(&g_own, owner); }
 
 /* Запись ушла из таблицы — счёт её клиента уменьшается. */
-static void own_release(const struct fakeip_entry *e) {
-    struct fowner *o = e->owner ? own_find(e->owner) : NULL;
-    if (!o) return;
-    if (--o->n) return;
-    /* Последняя запись клиента: место счёта освобождается сдвигом назад — следующие за ним в
-     * той же цепочке встают ближе к своему месту, и поиск не обрывается на дыре. */
-    size_t i = (size_t)(o - g_own);
-    g_own[i].key = 0;
-    g_own_n--;
-    for (size_t j = (i + 1) & (g_own_cap - 1); g_own[j].key; j = (j + 1) & (g_own_cap - 1)) {
-        size_t h = own_slot(g_own[j].key);
-        /* Запись j может встать в дыру i, если её место h не лежит в (i, j] по кругу. */
-        if ((j > i && (h <= i || h > j)) || (j < i && h <= i && h > j)) {
-            g_own[i] = g_own[j];
-            g_own[j].key = 0;
-            i = j;
-        }
-    }
-}
+static void own_release(const struct fakeip_entry *e) { kc_sub(&g_own, e->owner); }
 
 /* Looks up domain's existing fake IP, or allocates the next free one and
  * persists it. Returns 0 and fills *out_addr (host order) on success; -1 if
@@ -619,7 +551,7 @@ int fakeip_lookup_or_alloc_for(const char *domain_in, uint64_t owner, uint32_t *
         from_free = 1;
     }
     if (fakeip_table_add(&g_fakeip, domain, addr) != 0) return -1;
-    if (owner && own_add(owner) == 0) g_fakeip.entries[g_fakeip.n - 1].owner = owner;
+    if (owner && kc_add(&g_own, owner) == 0) g_fakeip.entries[g_fakeip.n - 1].owner = owner;
     if (from_free) g_free_i++;
     if (g_fakeip_state_path) fakeip_state_append(g_fakeip_state_path, domain, addr);
     *out_addr = addr;

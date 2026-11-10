@@ -532,20 +532,83 @@ static int pending_reap(time_t now) {
     int live = 0;
     for (int i = 0; i < MAX_PENDING; i++) {
         if (g_pending[i].in_use && g_pending[i].expire < now)
-            g_pending[i].in_use = 0;      /* сокета за слотом больше нет — закрывать нечего */
+            pending_drop(&g_pending[i]);  /* сокета за слотом больше нет — закрывать нечего */
         live |= g_pending[i].in_use;
     }
     return live;
 }
 
-static struct pending *pending_alloc(void) {
-    for (int i = 0; i < MAX_PENDING; i++)
-        if (!g_pending[i].in_use) return &g_pending[i];
-    /* Всё занято — прежде чем ронять запрос, попробовать вернуть протухшее:
-     * редкий путь, но именно он сохраняет прежнюю ёмкость под всплеском. */
-    pending_reap(time(NULL));
-    for (int i = 0; i < MAX_PENDING; i++)
-        if (!g_pending[i].in_use) return &g_pending[i];
+/* ДОЛЯ ТАБЛИЦЫ НА КЛИЕНТА (аудит 2.1.0, D6). Таблица одна на всех: 1024 места по 5 с — 204 вопроса
+ * в секунду без ответа. Один клиент, засыпающий резолвер вопросами к молчащей зоне (или в упор в
+ * dns-forward-max dnsmasq), прежде занимал все места, и вопросы остальных отбрасывались молча. Теперь
+ * у клиента (fakeip_client_key: адрес IPv4 или /64 IPv6) не больше PENDING_PER_CLIENT мест; новый
+ * вопрос сверх них вытесняет его же самый давний — не дождавшийся ответа дольше всех, — а места
+ * остальных не трогает. Восьмая часть (128): это 25 вопросов в секунду без ответа от одного
+ * устройства, а живой клиент за раз держит десятки (страница — 20-40 имён) и отпускает их за
+ * миллисекунды ответа. Петля доли не имеет: за ней пересыльщики всей сети (коннектор, AdGuard Home).
+ * Вытесненный вопрос — то же, что протухший (pending_reap): его ответ, если придёт, уже не
+ * совпадёт ни поколением, ни отпечатком, ни номером вопроса своего транспорта.
+ *
+ * Счёт мест клиента — в g_pend_kc, и меняется он только парой pending_take/pending_drop: всякое
+ * «занято/свободно» слота идёт через них. Проход по таблице ради подсчёта на каждый вопрос стоил бы
+ * 200 КБ памяти на пакет (см. pending_reap); по таблице ходит только вытеснение, то есть клиент
+ * уже у своей доли. */
+#define PENDING_PER_CLIENT (MAX_PENDING / 8)
+static struct kcount g_pend_kc;
+
+void pending_take(struct pending *p) {
+    if (p->in_use) return;
+    p->in_use = 1;
+    /* Нет памяти на счёт — место без счёта (ckey 0): доля не действует, но и не врёт. */
+    if (p->ckey && kc_add(&g_pend_kc, p->ckey) != 0) p->ckey = 0;
+}
+
+void pending_drop(struct pending *p) {
+    if (!p->in_use) return;
+    p->in_use = 0;
+    kc_sub(&g_pend_kc, p->ckey);
+}
+
+/* Мест у клиента сейчас (стенды). */
+unsigned pending_client_count(uint64_t key) { return kc_get(&g_pend_kc, key); }
+
+/* Не static ради tests/dnsmatch.c (см. struct pending в dnsd_int.h): доля проверяется там. Место
+ * выдаётся свободным (in_use == 0) с ключом клиента; занятым его делает pending_take. */
+struct pending *pending_alloc(const struct sockaddr_storage *from) {
+    uint64_t key = from ? fakeip_client_key(from) : 0;
+    if (key && kc_get(&g_pend_kc, key) >= PENDING_PER_CLIENT) {
+        struct pending *own_old = NULL;
+        for (int i = 0; i < MAX_PENDING; i++) {
+            struct pending *q = &g_pending[i];
+            if (q->in_use && q->ckey == key && (!own_old || q->expire < own_old->expire)) own_old = q;
+        }
+        if (own_old) {
+            static time_t said;
+            if (warn_due(&said, time(NULL))) {
+                char who[INET6_ADDRSTRLEN] = "?";
+                if (from->ss_family == AF_INET6)
+                    inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)from)->sin6_addr, who, sizeof(who));
+                else if (from->ss_family == AF_INET)
+                    inet_ntop(AF_INET, &((const struct sockaddr_in *)from)->sin_addr, who, sizeof(who));
+                fprintf(stderr, "steer dnsd: клиент %s держит %d вопросов без ответа (его доля "
+                                "таблицы ожиданий из %d): новый вытесняет его же самый давний\n",
+                        who, PENDING_PER_CLIENT, MAX_PENDING);
+            }
+            pending_drop(own_old);
+            own_old->ckey = key;
+            return own_old;
+        }
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < MAX_PENDING; i++)
+            if (!g_pending[i].in_use) {
+                g_pending[i].ckey = key;
+                return &g_pending[i];
+            }
+        /* Всё занято — прежде чем ронять запрос, попробовать вернуть протухшее:
+         * редкий путь, но именно он сохраняет прежнюю ёмкость под всплеском. */
+        if (pass == 0) pending_reap(time(NULL));
+    }
     return NULL;
 }
 
@@ -559,7 +622,7 @@ static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, 
 static void pending_arm(struct pending *p, const struct sockaddr_storage *from, socklen_t fromlen,
                         const struct dnsd_local *local, int have_local, int hit, chm_t sets,
                         int quiet) {
-    p->in_use = 1;
+    pending_take(p);
     g_live = 1;
     p->tcp_up = -1;
     p->sec = 0;
@@ -865,7 +928,7 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
         }
     }
 
-    struct pending *p = pending_alloc();
+    struct pending *p = pending_alloc(&from);
     if (!p) {
         /* Мест нет: запрос отбрасывается, клиент переспросит сам. Но сказать об этом
          * надо — это и есть «DNS тормозит», увиденное изнутри, и без строки в журнале
@@ -1009,7 +1072,7 @@ static void forward_old(struct pending *p, uint8_t *buf, size_t n, size_t qend,
     p->qfp = (qend > 12 && qend <= (size_t)n) ? question_fp(buf, qend) : 0;
     p->qsec_end = (uint16_t)((p->qfp) ? qend : 0);
 
-    p->in_use = 1;
+    pending_take(p);
     g_live = 1;
     p->tcp_up = tcpu;
     p->sec = 0;
@@ -1129,7 +1192,7 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
     buf[0] = (uint8_t)(p->cli_id >> 8);
     buf[1] = (uint8_t)(p->cli_id & 0xFF);
 
-    p->in_use = 0;
+    pending_drop(p);
     int quiet = p->quiet;
 
     /* Несовпавший домен (подавляющее большинство трафика): решение уже принято
@@ -1792,7 +1855,7 @@ static struct pending *tcpu_pending(const struct tcpu *u) {
 /* Наверх не вышло (не соединился, оборвал, ответил не то) — SERVFAIL клиенту и конец. */
 static void tcpu_fail(struct tcpu *u) {
     struct pending *p = tcpu_pending(u);
-    if (p) p->in_use = 0;
+    if (p) pending_drop(p);
     tcp_servfail(tcpu_conn(u), u->q + 2, u->qend, u->cli_id);
     tcpu_close(u);
 }
@@ -1997,7 +2060,7 @@ static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, 
             else g_other_pause.fail++;
             g_other_fallback++;
             uint8_t qb[MAX_PKT];
-            p->in_use = 0;
+            pending_drop(p);
             p->sec = 0;
             p->oth = 0;
             if (tc != &g_tcp_dead && qn >= 12 && qn <= sizeof(qb)) {
@@ -2012,7 +2075,7 @@ static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, 
         p->sec = 0;
         upstream_answer(p, (uint8_t *)(uintptr_t)ans, (ssize_t)n);
     } else if (!ok) {
-        p->in_use = 0;
+        pending_drop(p);
         p->sec = 0;
         static time_t said;
         if (warn_due(&said, time(NULL)))
