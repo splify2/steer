@@ -114,6 +114,7 @@ restart() {
     _steer_restart=1
     mkdir -p "${RESTART_MARK%/*}" 2>/dev/null && : > "$RESTART_MARK"
     stop "$@"
+    trap - TERM
     _steer_restart=
     start "$@"
 }

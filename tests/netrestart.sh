@@ -53,6 +53,9 @@
 # объяснимо и чинится мимо исчерпанного лимита; пять пересозданий моста подряд — цепочка ingress
 # каждый раз назад.
 #
+# R — перезапуск службы (restart init.d: файл-просьба и новый демон) под трафиком — у провайдера ни
+# одного пакета; прежний stop со `steer down` и start — окно есть (сторожевой опыт).
+#
 # Нужны root, unshare -nm, nsenter, ip, nft и python3. Чего-то нет — стенд пропускается вслух.
 set -u
 BIN="${STEER:-./build/steer}"
@@ -738,6 +741,53 @@ check "C3: пять пересозданий моста подряд при ис
 check "  сверок по новому устройству раздачи — пять" "5" \
     "$(($(grep -c 'устройство раздачи появилось заново' "$tmp/c.err") - n0))"
 [ -n "${NETRESTART_KEEP:-}" ] && cp "$tmp/c.err" "$NETRESTART_KEEP.c"
+kill "$D" 2>/dev/null
+wait "$D" 2>/dev/null
+"$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
+
+# ---- R. перезапуск службы под трафиком (restart в files/etc/init.d/steer) -----------------------
+# Прежде restart был stop и start rc.common: между ними `steerd down` снимал набор правил, правила
+# fwmark и таблицы выходов, и трафик канала на время перезапуска шёл к провайдеру (на QEMU 5
+# пакетов потока 20 в секунду). Теперь restart оставляет демону файл-просьбу, гасит его, и новый
+# применяет спеку сверкой поверх стоящего. R1 — так; R2 — прежний путь (сторожевой опыт: окно
+# действительно есть, и R1 проверяет не пустоту).
+"$BIN" daemon --watch --watch-period 3 --apply --socket "$tmp/s.sock" $S >"$tmp/r1.out" 2>"$tmp/r1.err" &
+D=$!
+pids="$pids $D"
+wait_for 'grep -q "спека применена при старте" "$tmp/r1.err"' 15
+sleep 2
+W0="$(cnt "$IW" real)" WP0="$(cnt "$IW" pool)" T0="$(cnt "$IT" real1)"
+send_start 198.18.0.1
+sleep 0.3
+: > "$tmp/st/restart"
+kill "$D" 2>/dev/null
+wait "$D" 2>/dev/null
+"$BIN" daemon --watch --watch-period 3 --apply --socket "$tmp/s.sock" $S >"$tmp/r2.out" 2>"$tmp/r2.err" &
+D=$!
+pids="$pids $D"
+wait_for 'grep -q "спека применена при старте" "$tmp/r2.err"' 15
+sleep 0.5
+sent="$(send_stop)"
+check "R1: перезапуск службы под трафиком — у провайдера ни одного пакета (отправлено $sent)" "0 0" \
+    "$(($(cnt "$IW" real) - W0)) $(($(cnt "$IW" pool) - WP0))"
+check "  туннель получал и после перезапуска" "yes" \
+    "$([ $(($(cnt "$IT" real1) - T0)) -gt 50 ] && echo yes || echo "no:$(($(cnt "$IT" real1) - T0))")"
+check "  просьба снята" "no" "$([ -e "$tmp/st/restart" ] && echo yes || echo no)"
+W0="$(cnt "$IW" real)" WP0="$(cnt "$IW" pool)"
+send_start 198.18.0.1
+sleep 0.3
+kill "$D" 2>/dev/null
+wait "$D" 2>/dev/null
+"$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
+"$BIN" daemon --watch --watch-period 3 --apply --socket "$tmp/s.sock" $S >"$tmp/r3.out" 2>"$tmp/r3.err" &
+D=$!
+pids="$pids $D"
+wait_for 'grep -q "спека применена при старте" "$tmp/r3.err"' 15
+sleep 0.5
+sent="$(send_stop)"
+leak=$(( $(cnt "$IW" real) - W0 + $(cnt "$IW" pool) - WP0 ))
+check "R2: прежний путь (stop со steer down, затем start) — окно было: у провайдера $leak из $sent" "yes" \
+    "$([ "$leak" -gt 0 ] && echo yes || echo no)"
 kill "$D" 2>/dev/null
 wait "$D" 2>/dev/null
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
