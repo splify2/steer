@@ -598,6 +598,31 @@ static void hostile_fixtures(void) {
     fixture("json", "hdr", "HTTP/1.1 200 OK\r\n");
 }
 
+/* ОТВЕТ БЕЗ УЗЛОВ. Ответ 200 без единого узла (страница HTML, пустой JSON) и после повтора за /json —
+ * отказ с причиной, прежняя подписка цела (прежде он ложился поверх рабочего файла, ok:true). Только
+ * непригодные узлы VLESS — тоже отказ, и число их названо. */
+static void t_empty(void) {
+    hostile_fixtures();
+    char p[640];
+    wr(g_out, "vless://прежнее\n");
+    fixture("main", "body", "<html><body>Технические работы</body></html>\n");
+    fixture("json", "body", "{}");
+    char *out = cap(call_fetch);
+    ck_true("ответ без узлов — отказ", has(out, "\"ok\":false"));
+    ck_true("  причина названа", has(out, "нет ни одного узла") && has(out, "прежняя подписка оставлена"));
+    ck_true("  прежняя подписка не тронута", strstr(rd(g_out), "прежнее") != NULL);
+    snprintf(p, sizeof p, "%s.tmp", g_out);
+    ck_true("  временный файл убран", access(p, F_OK) != 0);
+    ck_num("  код возврата — отказ", 1, g_rc);
+
+    fixture("main", "body", "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?type=kcp#bad\n");
+    out = cap(call_fetch);
+    ck_true("только непригодные узлы — отказ с их числом", has(out, "\"ok\":false") && has(out, "непригодных: 1"));
+    ck_true("  прежняя подписка не тронута", strstr(rd(g_out), "прежнее") != NULL);
+    fixture("main", "body", NULL);
+    fixture("json", "body", NULL);
+}
+
 /* ТЕЛО СВЕРХ ПОТОЛКА РАЗБОРА (64 МиБ — больше не прочтёт ни один разбор подписки): отказ клиента по
  * пределу (max_body), без повтора без заголовков; gzip-бомба — 65 МиБ нулей в ~65 КБ — распаковка
  * останавливается на 64 МиБ, ничего не остаётся. */
@@ -808,6 +833,7 @@ int main(void) {
     t_fetch();
     t_reject();
     t_gzip();
+    t_empty();
     t_oversize();
     t_quota_cmd();
     t_device_hdrs();
