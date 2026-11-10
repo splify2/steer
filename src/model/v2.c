@@ -282,6 +282,9 @@ static int name_of(struct v2 *x, const struct ynode *key, const char *section, c
  * временном файле рядом со спекой, так что каталог тот же. */
 static int path_of(struct v2 *x, const struct ynode *n, const char *where, const char *v, char *dst,
                    size_t cap) {
+    if (!spec_path_ok(v))
+        return fail(x, n, "spec.bad_path", "%s: путь «%s» — в нём «|», управляющий символ или начало «dns:»; "
+                    "переименуйте файл", where, v);
     if (v[0] == '/') return copy_to(x, n, where, v, dst, cap);
     /* Каталог не определился (слишком длинный путь, нет рабочего каталога): оставить путь
      * относительным значило бы тихо сменить смысл — от каталога процесса, а не спеки. */

@@ -661,6 +661,61 @@ static void t_line_class(void) {
     }
 }
 
+/* Имена и пути из спеки не становятся текстом набора правил, ключом командной строки и лишним
+ * полем таблицы резолвера. */
+static void t_names(void) {
+    check("имя: обычное", 1, name_ok("vpn-1.nl_a"));
+    check("имя: с дефиса — нет (ключ командной строки программы плагина)", 0, name_ok("-rf"));
+    check("имя: «.» — нет", 0, name_ok("."));
+    check("имя: «..» — нет", 0, name_ok(".."));
+    check("имя: с точки, но не каталог — да", 1, name_ok(".a"));
+    check("имя: дефис в середине — да", 1, name_ok("a-b"));
+    check("подпись: «|» разрешён (имя правила — текст человека)", 1, label_ok("YouTube | Видео"));
+    check("путь: обычный", 1, spec_path_ok("/etc/steer/lists/a.lst"));
+    check("путь: с «|» — нет", 0, spec_path_ok("/tmp/a.lst|/etc/shadow|dns:9"));
+    check("путь: с переводом строки — нет", 0, spec_path_ok("/tmp/a.lst\n1|x"));
+    check("путь: относительный с «dns:» — нет", 0, spec_path_ok("dns:9"));
+
+    /* Спека v1: from и from_default уходят в текст набора как есть — проверяются, как у v2. */
+    #define V1(body) "{\"schema\":2," body ",\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}}," \
+                     "\"channels\":[{\"name\":\"a\",%s\"match\":{\"prefixes_files\":[\"%s\"]},\"out\":\"vpn\"}]}"
+    char spec[2048];
+    snprintf(spec, sizeof(spec), V1("\"from_default\":[\"192.168.1.0/24\"]"), "", "TMP/a.lst");
+    check("v1: обычная спека читается", 0, load(spec));
+    snprintf(spec, sizeof(spec), V1("\"from_default\":[\"192.168.1.0/24 } accept; ip saddr { 1.1.1.1\"]"), "", "TMP/a.lst");
+    check("v1: from_default с текстом nft — отказ", -1, load(spec));
+    check("  назван", 1, has("from_default") && has("не адрес"));
+    snprintf(spec, sizeof(spec), V1("\"from_default\":[\"192.168.1.0/33\"]"), "", "TMP/a.lst");
+    check("v1: from_default с длиной префикса 33 — отказ", -1, load(spec));
+    snprintf(spec, sizeof(spec), V1("\"from_default\":[\"192.168.1.0/24\",\"fd00::/8\"]"),
+             "\"from\":[\"192.168.1.5\",\"192.168.1.9-192.168.1.20\",\"fd00::5\"],", "TMP/a.lst");
+    check("v1: адрес, диапазон и IPv6 в from — читается", 0, load(spec));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    snprintf(spec, sizeof(spec), V1("\"from_default\":[\"192.168.1.0/24\"]"),
+             "\"from\":[\"aa:bb:cc:dd:ee:ff\"],", "TMP/a.lst");
+    check("v1: MAC в from — читается", 0, load(spec));
+    snprintf(spec, sizeof(spec), V1("\"from_default\":[\"192.168.1.0/24\"]"),
+             "\"from\":[\"10.0.0.1, 10.0.0.2 } drop comment x {\"],", "TMP/a.lst");
+    check("v1: from с текстом nft — отказ", -1, load(spec));
+    check("  назван", 1, has("from:") && has("не адрес"));
+    snprintf(spec, sizeof(spec), V1("\"from_default\":[\"192.168.1.0/24\"]"), "", "TMP/a.lst|/etc/hostname|dns:9");
+    check("v1: путь списка с «|» — отказ", -1, load(spec));
+    check("  назван", 1, has("путь списка"));
+    #undef V1
+    check("v2: путь списка с «|» — отказ", -1,
+          load("version: 2\nlan: { devices: [br-lan] }\noutputs:\n  vpn: { kind: interface, device: wg0 }\n"
+               "lists:\n  d: { domains_file: 'TMP/a.lst|/etc/hostname|dns:9' }\n"
+               "rules:\n  - { name: d, to: d, out: vpn }\n"));
+    check("  назван", 1, has("путь"));
+    check("v2: имя правила с «|» — читается", 0,
+          load("version: 2\nlan: { devices: [br-lan] }\noutputs:\n  vpn: { kind: interface, device: wg0 }\n"
+               "lists:\n  d: { prefixes_file: 'TMP/a.lst' }\n"
+               "rules:\n  - { name: 'YouTube | Видео', to: d, out: vpn }\n"));
+    if (g_msg[0]) printf("     %s\n", g_msg);
+    check("v2: выход с именем с дефиса — отказ", -1,
+          load("version: 2\nlan: { devices: [br-lan] }\noutputs:\n  -vpn: { kind: interface, device: wg0 }\n"));
+}
+
 int main(void) {
     snprintf(g_tmp, sizeof(g_tmp), "/tmp/modelmatch-XXXXXX");
     if (!mkdtemp(g_tmp)) { perror("mkdtemp"); return 2; }
@@ -672,6 +727,7 @@ int main(void) {
     t_groups_v2();
     t_pick();
     t_line_class();
+    t_names();
     char cmd[320];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmp);
     if (system(cmd) != 0) fprintf(stderr, "modelmatch: не убран %s\n", g_tmp);

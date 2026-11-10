@@ -178,6 +178,47 @@ int main(void) {
     check("  и у первого (d)", 1, fr[0]);
     free(txt);
 
+    /* ---- таблица: имя правила с «|» не делит строку на лишние поля ----
+     * Имя правила — подпись человека, и «|» в ней законен. Сырым оно становилось лишним путём
+     * списка и чужим апстримом канала («x|/etc/hostname|dns:9»). В таблице имя кодируется, резолвер
+     * получает его как было. */
+    {
+        char dl[240];
+        snprintf(dl, sizeof(dl), "%s/d.lst", dir);
+        f = fopen(dl, "w");
+        fputs("example.org\n", f);
+        fclose(f);
+        f = fopen(sp, "w");
+        fprintf(f, "version: 2\nlan: { devices: [br-lan] }\noutputs:\n  vpn: { kind: interface, device: wg0 }\n"
+                   "lists:\n  d: { domains_file: %s }\n"
+                   "rules:\n  - { name: 'x|/etc/hostname|dns:9 100%%', to: d, out: vpn }\n", dl);
+        fclose(f);
+        static struct spec c4;
+        struct err e4 = {0};
+        check("спека с «|» в имени правила читается (существующие спеки не ломаются)", 0, load_spec(sp, &c4, &e4) < 0);
+        struct err e5 = {0};
+        check("  метки розданы", 0, registry_assign(&c4, &e5) < 0);
+        txt = NULL;
+        tn = 0;
+        m = open_memstream(&txt, &tn);
+        tabfmt_build(&c4, m);
+        fclose(m);
+        int bars = 0;
+        const char *l2 = strchr(txt, '\n');
+        for (const char *q = l2 ? l2 + 1 : txt; *q && *q != '\n'; q++) bars += *q == '|';
+        check("  в строке канала ровно пять разделителей (имя закодировано)", 5, bars);
+        for (size_t i = 0; i < g_dch_n; i++) free(g_dch[i].rules_path);
+        memset(g_dch, 0, g_dch_cap * sizeof(*g_dch));
+        g_dch_n = 0;
+        check("  таблица разбирается", 0, tabfmt_parse(txt, tn));
+        check("  канал один", 1, (int)g_dch_n);
+        check("  список у канала один — свой", 1, g_dch_n ? (int)g_dch[0].rules_n : -1);
+        check("  путь списка — его файл", 1, g_dch_n && g_dch[0].rules_n && !strcmp(g_dch[0].rules_path[0], dl));
+        check("  апстрим каналу не подменён", 0, g_dch_n ? g_dch[0].up : -1);
+        check("  имя дошло до резолвера как было", 1, g_dch_n && !strcmp(g_dch[0].chan, "x|/etc/hostname|dns:9 100%"));
+        free(txt);
+    }
+
     /* ---- отказы ---- */
     static const char *const bad[] = {
         "dns: { upstreams: { a: { url: 'udp://1.1.1.1', fragment: true } } }",                /* нет TLS */

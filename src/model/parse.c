@@ -48,6 +48,9 @@ const struct spec_list spec_list_all = { .all = 1 };
  * ему хватает. Пустое имя отвергается тоже: оно ломает и набор, и pgrep. */
 int name_ok(const char *s) {
     if (!s || !*s) return 0;
+    /* Имя уходит ещё и аргументом программам плагинов и в имена файлов состояния: с дефиса оно
+     * читалось бы ключом командной строки, а «.» и «..» — каталогом, а не файлом. */
+    if (*s == '-' || !strcmp(s, ".") || !strcmp(s, "..")) return 0;
     for (const unsigned char *q = (const unsigned char *)s; *q; q++)
         if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
               (*q >= '0' && *q <= '9') || *q == '_' || *q == '-' || *q == '.'))
@@ -66,6 +69,19 @@ int label_ok(const char *s) {
     if (!s || !*s) return 0;
     for (const unsigned char *q = (const unsigned char *)s; *q; q++)
         if (*q == '"' || *q == '\\' || *q < 0x20 || *q == 0x7F) return 0;
+    return 1;
+}
+
+/* Путь из спеки (список, набор .srs, файл настроек): без «|», без управляющих символов и, если он
+ * относительный, не с «dns:» в начале. Путь списка уходит резолверу полем строки таблицы доменных
+ * каналов (src/dnsd/tabfmt.c), где поля разделяет «|», строки — перевод строки, а поле «dns:N» —
+ * номер апстрима канала: путь «a.lst|/etc/shadow|dns:9» стал бы там ещё одним списком и чужим
+ * апстримом. У файла такого имени на роутере нет причины быть — отказ, а не кодирование. */
+int spec_path_ok(const char *s) {
+    if (!s) return 0;
+    if (!strncmp(s, "dns:", 4)) return 0;
+    for (const unsigned char *q = (const unsigned char *)s; *q; q++)
+        if (*q == '|' || *q < 0x20 || *q == 0x7F) return 0;
     return 1;
 }
 

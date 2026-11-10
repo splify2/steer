@@ -15,6 +15,38 @@ static void join_list(FILE *out, const char (*v)[46], size_t n) {
     for (size_t i = 0; i < n; i++) fprintf(out, "%s%s", i ? "," : "", v[i]);
 }
 
+/* Имя канала в строке таблицы. Это подпись человека (label_ok: любой UTF-8 без кавычки и
+ * управляющих), и «|» в ней законен: правило «YouTube | Видео». Сырым оно делило строку на лишние
+ * поля — хвост имени читался путём списка, а «x|/etc/hostname|dns:9» давало каналу чужой файл и
+ * чужой апстрим. Запретить «|» в именах значило бы после обновления не загрузить спеку, которая
+ * вчера работала, поэтому имя кодируется: «|», «%» и управляющие байты — как %XX; разбор ниже
+ * (chan_decode) возвращает имя как было, и журнал имён называет правило по-прежнему. */
+static void chan_encode(FILE *out, const char *s) {
+    for (const unsigned char *q = (const unsigned char *)s; *q; q++) {
+        if (*q == '|' || *q == '%' || *q < 0x20) fprintf(out, "%%%02X", *q);
+        else fputc(*q, out);
+    }
+}
+
+static int hexv(char c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 :
+           c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+}
+
+/* Обратное chan_encode, с усечением до dcap: «%» без двух шестнадцатеричных цифр остаётся как есть. */
+static void chan_decode(char *dst, size_t dcap, const char *src, size_t flen) {
+    size_t o = 0;
+    for (size_t i = 0; i < flen && o + 1 < dcap; i++) {
+        if (src[i] == '%' && i + 2 < flen && hexv(src[i + 1]) >= 0 && hexv(src[i + 2]) >= 0) {
+            dst[o++] = (char)(hexv(src[i + 1]) * 16 + hexv(src[i + 2]));
+            i += 2;
+        } else {
+            dst[o++] = src[i];
+        }
+    }
+    dst[o] = '\0';
+}
+
 void tabfmt_build(const struct spec *sp, FILE *out) {
     dch_build(sp);
     /* Без апстримов и кэша таблица остаётся такой, какой была до 1.11, — байт в байт: заголовок
@@ -35,8 +67,9 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
          * (dom6_ok — парный набор «<set>6» и v6-двойник у компилятора) и спека не v1, иначе
          * «4» (решает dch_fam, table.c). */
         /* Режим: 0 — fake-IP, 1 — real-ip, 2 — блок (пустой адрес в ответ, kinds/block.c). */
-        fprintf(out, "%s|%s|%d|%s|%s", c->set, c->out, c->block ? 2 : c->realip ? 1 : 0,
-                (c->fam & DCH_V6) ? ((c->fam & DCH_V4) ? "46" : "6") : "4", c->chan);
+        fprintf(out, "%s|%s|%d|%s|", c->set, c->out, c->block ? 2 : c->realip ? 1 : 0,
+                (c->fam & DCH_V6) ? ((c->fam & DCH_V4) ? "46" : "6") : "4");
+        chan_encode(out, c->chan);
         for (size_t k = 0; k < c->rules_n; k++)
             fprintf(out, "|%s", c->rules_path[k]);
         if (c->up) fprintf(out, "|dns:%d", c->up);
@@ -122,7 +155,7 @@ static int parse_chan_line(const char *buf, size_t from, size_t line_end, struct
                 break;
             }
             case 3: field_copy(family, family_cap, buf + pos, flen); break;
-            case 4: field_copy(c->chan, sizeof(c->chan), buf + pos, flen); break;
+            case 4: chan_decode(c->chan, sizeof(c->chan), buf + pos, flen); break;
             default:
                 /* Поле «dns:N» — апстрим канала (1.11); остальное — пути списков. */
                 if (flen > 4 && !memcmp(buf + pos, "dns:", 4)) {
