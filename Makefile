@@ -85,6 +85,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@sh tests/dnsproxy.sh
 	@sh tests/dnsgroups.sh
 	@sh tests/dnsnft.sh
+	@sh tests/dnsdead.sh
 	@sh tests/applynft.sh
 	@sh tests/v6ns.sh
 	@sh tests/v6host.sh

@@ -19,6 +19,7 @@
 #include "dupq.h"
 #include "tls13.h"
 #include <sys/eventfd.h>
+#include <netinet/tcp.h>
 #include "reality.h"
 #include "unit.h"
 
@@ -48,9 +49,12 @@ static void rec_clear(void) {
     g_rh = g_rt = 0;
 }
 
+static int g_rerr;                                /* следующее чтение — «сервер закрыл соединение» */
+
 int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got) {
     (void)t;
     *got = 0;
+    if (g_rerr) { g_rerr = 0; return TLS13_ECLOSED; }
     if (g_rh == g_rt) return 0;                   /* записи нет — «пока нечего», как у настоящего */
     struct frec *r = &g_rq[g_rh++];
     if (r->n > cap) return TLS13_ETOOBIG;
@@ -605,6 +609,69 @@ int main(void) {
         dup_tick();
         check("  вопрос группы закончен отказом", 1, g_fail);
         check("  у групп работы не осталось", 0, grp_busy());
+    }
+
+    /* 15. DoT: соединение оборвалось под вопросом (сервер закрыл простаивавшее как раз тогда, когда
+     *     в него ушёл вопрос; ядро сняло мёртвое по TCP_USER_TIMEOUT). Вопрос переставляется в
+     *     ожидание — и обязан сразу уйти по другому соединению или завести новое. Прежде диспетчер
+     *     после обрыва не звался: вопрос ждал своего срока и получал отказ без повтора. */
+    {
+        struct dup *up = mk_up("tls://127.0.0.1");
+        struct dconn *c0 = add_conn(up, CS_READY, 0);
+        dup_ask(0, g_qbuf, qn, on_done, NULL);
+        struct dreq *r = nth_req(up, 0);
+        check("DoT: вопрос ушёл по первому соединению", 0, r ? r->ci : -9);
+        struct dconn *c1 = add_conn(up, CS_READY, 0);
+        g_rerr = 1;
+        dup_event(&c0->tag, EPOLLIN | EPOLLERR);
+        check("  соединение оборвалось под вопросом — закрыто", CS_FREE, c0->st);
+        check("  вопрос не отказан", 0, g_fail);
+        check("  и сразу ушёл по другому соединению (повтор — один)", 1,
+              r->used && r->ci == c1->idx && r->tries == 1);
+
+        up = mk_up("tls://127.0.0.1");
+        c0 = add_conn(up, CS_READY, 0);
+        dup_ask(0, g_qbuf, qn, on_done, NULL);
+        g_rerr = 1;
+        dup_event(&c0->tag, EPOLLIN | EPOLLERR);
+        check("DoT: обрыв под вопросом, другого соединения нет — заводится новое", 1, up->dialing);
+        check("  вопрос ждёт его, а не отказан", 1, g_fail == 0 && nth_req(up, 0) && nth_req(up, 0)->ci == -1);
+    }
+
+    /* 16. Соединение TCP, за которым следит ядро: на готовом соединении стоят TCP_USER_TIMEOUT
+     *     (отправленное и не подтверждённое полторы секунды — обрыв, событие сокета) и проба
+     *     простаивающего соединения через 15 с. Настоящий сокет TCP на петле: у пары AF_UNIX этих
+     *     настроек нет. Как ядро по ним рвёт соединение — tests/dnsdead.sh. */
+    {
+        struct dup *up = mk_up("tcp://127.0.0.1");
+        int ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_in sa = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+        socklen_t sl = sizeof(sa);
+        bind(ls, (struct sockaddr *)&sa, sizeof(sa));
+        listen(ls, 1);
+        getsockname(ls, (struct sockaddr *)&sa, &sl);
+        struct dconn *c = add_conn(up, CS_TCPCONN, 0);
+        epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+        close(c->fd);
+        c->fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        connect(c->fd, (struct sockaddr *)&sa, sizeof(sa));
+        struct epoll_event e = { .events = EPOLLOUT, .data.ptr = &c->tag };
+        epoll_ctl(g_epfd, EPOLL_CTL_ADD, c->fd, &e);
+        int as = accept(ls, NULL, NULL);
+        dup_event(&c->tag, EPOLLOUT);
+        check("tcp: соединение установлено", CS_READY, c->st);
+        unsigned ut = 0;
+        int ka = 0, idle = 0, intvl = 0;
+        socklen_t ol = sizeof(ut);
+        getsockopt(c->fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ut, &ol);
+        ol = sizeof(ka); getsockopt(c->fd, SOL_SOCKET, SO_KEEPALIVE, &ka, &ol);
+        ol = sizeof(idle); getsockopt(c->fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, &ol);
+        ol = sizeof(intvl); getsockopt(c->fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, &ol);
+        check("  неподтверждённое 1,5 с — обрыв (TCP_USER_TIMEOUT)", 1500, (long)ut);
+        check("  проба простаивающего соединения включена", 1, ka != 0);
+        check("  через 15 с тишины, ответа ждёт 5 с", 1, idle == 15 && intvl == 5);
+        close(as);
+        close(ls);
     }
 
     dup_apply(NULL, 0);

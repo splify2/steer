@@ -147,6 +147,12 @@ static int dup_conn_limit(void) {
  *     сразу заведёт новое (с билетом — в 0-RTT), а группа failover видит, что готового соединения
  *     у сервера нет (dup_warm). */
 #define DUP_QUIC_KEEPALIVE_MS 15000
+/* То же для соединений TCP (tcp://, DoT, DoH), только следит ядро (conn_tcp_watch): отправленное и
+ * не подтверждённое за DUP_TCP_DEAD_MS — соединение мертво (TCP_USER_TIMEOUT), а простаивающее
+ * проверяется пробой раз в DUP_TCP_KEEPIDLE_S секунд. Сроки — те же, что у QUIC, по тем же причинам. */
+#define DUP_TCP_DEAD_MS DUP_QUIC_DEAD_MS
+#define DUP_TCP_KEEPIDLE_S (DUP_QUIC_KEEPALIVE_MS / 1000)
+#define DUP_TCP_KEEPINTVL_S 5
 #define DUP_QUIC_QUIET_MS (DUP_QUIC_KEEPALIVE_MS + 2000)
 #define DUP_QUIC_DEAD_QUIET_MS 400
 #define DUP_QUIC_LOST_MS (DUP_QUIC_KEEPALIVE_MS + 5000)
@@ -667,6 +673,29 @@ static void up_backoff(struct dup *up) {
     up->retry_at_ms = now_ms() + up->backoff_ms;
 }
 
+/* СОЕДИНЕНИЕ TCP, ЗА КОТОРЫМ СЛЕДИТ ЯДРО. Путь к серверу пропадает молча (запись NAT истекла, адрес
+ * сменился): вопрос, ушедший в такое соединение, ждал весь свой срок (DUP_REQ_MS, четыре секунды)
+ * и получал отказ — повторить его к тому времени было уже некому, клиент ждёт пять секунд. Теперь:
+ *   - TCP_USER_TIMEOUT: данные, не подтверждённые сервером DUP_TCP_DEAD_MS, — ядро рвёт соединение
+ *     и будит цикл ошибкой сокета. conn_close переставляет вопрос в ожидание (один раз), и он
+ *     уходит на новом соединении — через полторы секунды, а не отказом через четыре. Живой сервер,
+ *     который долго думает над ответом, под это не попадает: сам вопрос он подтверждает сразу;
+ *   - SO_KEEPALIVE: простаивающее соединение ядро проверяет пробой через DUP_TCP_KEEPIDLE_S секунд
+ *     тишины и, не получив подтверждения за DUP_TCP_KEEPINTVL_S, рвёт его (с TCP_USER_TIMEOUT
+ *     хватает одной пробы без ответа) — мёртвое соединение закрыто до вопроса клиента, как у QUIC.
+ * Опроса нет: всё это таймеры ядра и событие сокета. Ставится на готовое соединение, а не до
+ * connect: срок установки — свой (DUP_DIAL_MS). Отказ setsockopt (сокет не TCP — у стенда) не беда:
+ * остаётся прежний срок вопроса. */
+static void conn_tcp_watch(int fd) {
+    int on = 1, idle = DUP_TCP_KEEPIDLE_S, intvl = DUP_TCP_KEEPINTVL_S, cnt = 1;
+    unsigned dead = DUP_TCP_DEAD_MS;
+    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &dead, sizeof(dead));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+}
+
 /* Начать соединение по TCP без TLS (tcp://): неблокирующий connect в цикле. */
 static int tcp_dial(struct dup *up, struct dconn *c) {
     int fd = socket(up->srv.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -845,6 +874,7 @@ static void dial_event_cb(struct dial *d) {
     up->retry_at_ms = 0;
     up->err[0] = '\0';
     dial_free(d);
+    conn_tcp_watch(c->fd);
     conn_register(c, EPOLLIN);
     if (c->h2) {
         uint8_t hello[64];
@@ -1578,7 +1608,7 @@ static int h2_frames(struct dconn *c) {
     return 0;
 }
 
-static void conn_readable(struct dconn *c) {
+static void conn_read(struct dconn *c) {
     struct dup *up = c->up;
     if (c->st == CS_TCPCONN) {
         int err = 0;
@@ -1595,8 +1625,8 @@ static void conn_readable(struct dconn *c) {
         up->backoff_ms = 0;
         up->retry_at_ms = 0;
         up->err[0] = '\0';
+        conn_tcp_watch(c->fd);
         conn_ev(c, EPOLLIN);
-        up_kick(up);
         return;
     }
     /* Предел в 64 витка — против того, чтобы один сокет держал цикл, пока сервер шлёт без остановки;
@@ -1618,12 +1648,12 @@ static void conn_readable(struct dconn *c) {
             }
             if (got) c->qrx_ms = now_ms();
             if (c->h2) {
-                if (c->rn && h2_frames(c) != 0) { up_kick(up); return; }
+                if (c->rn && h2_frames(c) != 0) return;
             } else if (up->cfg.u.proto == DNSP_DOH) {
                 if (c->rn) {
                     int pr = doh_parse(c);
                     if (pr < 0) { conn_close(c, NULL); return; }
-                    if (pr == 1 && c->close_after) { conn_close(c, NULL); up_kick(up); return; }
+                    if (pr == 1 && c->close_after) { conn_close(c, NULL); return; }
                 }
             } else if (got) {
                 stream_frames(c);
@@ -1639,6 +1669,16 @@ static void conn_readable(struct dconn *c) {
             stream_frames(c);
         }
     }
+}
+
+/* Событие чтения соединения. Диспетчер ожидающих зовётся после ЛЮБОГО исхода: пришли ответы —
+ * освободились места под вопросы; соединение оборвалось (сервер закрыл простаивавшее как раз под
+ * вопросом, ядро сняло мёртвое по TCP_USER_TIMEOUT) — conn_close переставил его вопросы в ожидание,
+ * и им нужно новое соединение сейчас. Прежде после обрыва диспетчер не звался, и переставленный
+ * вопрос ждал, пока апстрим не спросит кто-нибудь ещё, — обычно до своего срока и отказа. */
+static void conn_readable(struct dconn *c) {
+    struct dup *up = c->up;
+    conn_read(c);
     up_kick(up);
 }
 
@@ -1648,7 +1688,9 @@ static void conn_writable(struct dconn *c) {
         ssize_t w = send(c->fd, c->wb + c->woff, c->wn - c->woff, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (w < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+            struct dup *up = c->up;
             conn_close(c, "запись в соединение не удалась");
+            up_kick(up);                        /* вопросы закрытого соединения — на новое */
             return;
         }
         c->woff += (size_t)w;
