@@ -125,9 +125,10 @@ struct tr_link {
 };
 
 /* Живая запись связи (см. tr_link.live): включить, сколько байт ждёт отправки, дослать без ожидания
- * (0 — пусто, 1 — сокет занят, -1 — отказ). Верхний предел очереди не вводится: вызывающий (dialer_ops.room)
- * перестаёт давать данные, когда ждущих набралось TR_OUT_HIWAT. */
-#define TR_OUT_HIWAT (256 * 1024)
+ * (0 — пусто, 1 — сокет занят, -1 — отказ). Данные клиента вызывающий (dialer_ops.room) перестаёт давать,
+ * когда ждущих набралось TR_OUT_HIWAT; сверх этого очередь растёт только ответами, которые заказал узел, и
+ * у неё свой потолок (OUTQ_MAX, outq.h). */
+#define TR_OUT_HIWAT OUTQ_HIWAT
 void tr_link_live(struct tr_link *l);
 size_t tr_link_pending(const struct tr_link *l);
 int tr_link_flush(struct tr_link *l);
@@ -522,6 +523,14 @@ int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
 
 /* TCP до узла по всем адресам имени (trdial.c). Дескриптор либо отрицательный код TR_*. */
 int tr_dial(const char *host, uint16_t port, int timeout_s);
+
+/* Общий срок установления связи в этом потоке (trdial.c, аудит 2.1.0, F1): между begin и end каждый сокет,
+ * открытый tr_dial, по истечении total_ms закрывается на чтение и запись (shutdown) — и любое блокирующее
+ * чтение или запись протокола на нём тут же кончается, сколько бы байт ни капало. end снимает срок и
+ * отвечает 1, если он истёк (сокеты закрыты, связь негодна). Открывает срок тот, кто владеет потоком
+ * установления, — установщик стека (stack.c, connect_timed); вне срока поведение прежнее. */
+void tr_watch_begin(int total_ms);
+int tr_watch_end(void);
 /* Соединённый неблокирующий сокет UDP к узлу с той же меткой, что у TCP (trdial.c): датаграммы
  * протоколов прокси (shadowsocks, SOCKS5). Дескриптор либо отрицательный код TR_*. */
 int tr_dial_udp(const char *host, uint16_t port);

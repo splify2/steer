@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "../src/proto/tls/h2.c"
+#include "outq.h"
 
 static int fails;
 
@@ -108,6 +109,23 @@ static size_t settings_frame(unsigned char *out, uint16_t id, uint32_t v) {
     out[9] = (unsigned char)(id >> 8); out[10] = (unsigned char)id;
     put32(out + 11, v);
     return 15;
+}
+
+
+/* PING-лавина (аудит 2.1.0, F9): узел шлёт PING и SETTINGS, не читая наших ACK. Запись — в очередь живой
+ * связи, как у tr_link_write поверх занятого сокета (outq_add: сокет «не принимает» вовсе), чтение — кадры
+ * PING без конца, порциями по записи TLS. */
+static struct outq g_pq;
+static unsigned long g_pin;
+static int pq_write(void *c, const unsigned char *d, size_t n) { (void)c; return outq_add(&g_pq, d, n) ? H2_EIO : 0; }
+static int pq_read(void *c, unsigned char *d, size_t cap, size_t *got) {
+    (void)c;
+    static const unsigned char p[17] = { 0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+    size_t k = 0;
+    while (k + 17 <= cap && k + 17 <= 16384) { memcpy(d + k, p, 17); k += 17; }
+    *got = k;
+    g_pin += k;
+    return 0;
 }
 
 int main(void) {
@@ -726,6 +744,26 @@ int main(void) {
         io.feed_n = put_frame(feed, FR_WINDOW_UPDATE, 0, h.sid, inc, 4);
         h2_read(&h, out, sizeof(out), &got);
         check("WINDOW_UPDATE на текущий поток: окно потока +1000", str0 + 1000, h.send_win);
+    }
+
+    {
+        /* Прежде: 16 МБ PING — 16 МБ в очереди. Теперь очередь упирается в OUTQ_MAX, ответ не встаёт в неё, и
+         * h2_read отвечает ошибкой — связь закрывается (а стек ещё раньше перестаёт читать у такого узла,
+         * conn_node_backlog). */
+        static struct h2 ph;
+        static unsigned char pout[H2_MIN_READ_CAP];
+        struct h2_io pio = { NULL, pq_write, pq_read };
+        h2_start_ex(&ph, &pio, "x", "/", NULL, NULL, H2_POST, 0, 0);
+        int prc = 0;
+        while (g_pin < (16u << 20)) {
+            size_t pg;
+            prc = h2_read(&ph, pout, sizeof pout, &pg);
+            if (prc) break;
+        }
+        printf("  PING-лавина: принято %lu байт PING, в очереди %zu байт, h2_read %d\n", g_pin, outq_pending(&g_pq), prc);
+        check("PING-лавина: очередь ответов не выходит за OUTQ_MAX", 1, outq_pending(&g_pq) <= OUTQ_MAX);
+        check("PING-лавина: связь закрывается ошибкой, не дожидаясь 16 МБ", 1, prc != 0 && g_pin < (16u << 20));
+        outq_free(&g_pq);
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");

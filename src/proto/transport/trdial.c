@@ -18,9 +18,11 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <pthread.h>
 
 #include "transport.h"
 #include "sockmark.h"
+#include "thrstack.h"
 
 /* ---- установление TCP: ВСЕ адреса узла, а не первый ---------------------------
  *
@@ -392,9 +394,141 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
  * Возвращает то же, что tcp_connect: дескриптор либо отрицательный код TR_*. */
 static int (*g_tcp_dial)(const char *host, uint16_t port, int timeout_s);
 
+/* ---- общий срок установления (transport.h, tr_watch_begin) -----------------------------------------
+ *
+ * ЗАЧЕМ. Срок сокета (SO_RCVTIMEO в sock_ready) — на КАЖДОЕ чтение: узел или посредник, отдающий ответ по
+ * байту раз в несколько секунд, держал рукопожатие TLS часами, а с ним — поток установщика; 64 таких — и
+ * туннель не открывал новых соединений вовсе (аудит 2.1.0, F1; PoC: капля раз в 700 мс при сроке сокета 1 с
+ * — через 12 с рукопожатие всё ещё ждёт). Проверять время в каждом цикле чтения каждого протокола (TLS,
+ * Reality, ws, h2, grpc, xhttp, SOCKS, HTTP CONNECT) — значит однажды забыть одно из них. Поэтому срок
+ * держится здесь, у сокета: всё установление любого протокола идёт по сокету, который открыл tr_dial.
+ *
+ * КАК. Сокет, открытый внутри срока, ставится на учёт копией дескриптора (dup): по истечении срока поток
+ * присмотра делает shutdown(копия, SHUT_RDWR), и это закрывает сам сокет — блокирующее чтение возвращает 0,
+ * запись — EPIPE, протокол выходит со своей ошибкой. Копия, а не номер владельца: владелец вправе закрыть
+ * свой номер в любой момент (отказ рукопожатия), и ядро отдаст номер другому сокету — shutdown по чужому
+ * номеру оборвал бы чужое соединение. Копия держит номер за нами, пока tr_watch_end её не закроет; закрытие
+ * копии самого сокета не трогает.
+ *
+ * Поток присмотра один на процесс, заводится по первому сроку и спит до ближайшего срока. Не завёлся (нет
+ * памяти под поток) — срок не держится, как прежде, и это сказано в журнале один раз. */
+struct watch_ent {
+    int64_t deadline_ms;
+    int fd;                 /* копия дескриптора */
+    unsigned long scope;
+    int fired;
+};
+static pthread_mutex_t g_watch_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_watch_cv;
+static pthread_once_t g_watch_once = PTHREAD_ONCE_INIT;
+static int g_watch_ok;              /* поток присмотра стоит */
+static struct watch_ent *g_watch;
+static size_t g_watch_n, g_watch_cap;
+static unsigned long g_watch_seq;
+static __thread unsigned long g_scope;          /* 0 — срока нет */
+static __thread int64_t g_scope_deadline;
+
+static void *watch_loop(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_watch_mu);
+    for (;;) {
+        int64_t now = now_ms(), next = 0;
+        for (size_t i = 0; i < g_watch_n; i++) {
+            struct watch_ent *e = &g_watch[i];
+            if (e->fired) continue;
+            if (e->deadline_ms <= now) {
+                shutdown(e->fd, SHUT_RDWR);
+                e->fired = 1;
+            } else if (!next || e->deadline_ms < next) {
+                next = e->deadline_ms;
+            }
+        }
+        if (!next) {
+            pthread_cond_wait(&g_watch_cv, &g_watch_mu);
+            continue;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t wait = next - now;
+        ts.tv_sec += (time_t)(wait / 1000);
+        ts.tv_nsec += (long)(wait % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_watch_cv, &g_watch_mu, &ts);
+    }
+    return NULL;
+}
+
+static void watch_start(void) {
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&g_watch_cv, &ca);
+    pthread_condattr_destroy(&ca);
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    /* Стек скромный, но с запасом под статический TLS (thread_stack: у glibc он берётся из стека). */
+    pthread_attr_setstacksize(&a, thread_stack(64 * 1024));
+    pthread_t t;
+    int err = pthread_create(&t, &a, watch_loop, NULL);
+    pthread_attr_destroy(&a);
+    g_watch_ok = err == 0;
+    if (err)
+        fprintf(stderr, "steer[warn] транспорт: поток присмотра за сроком установления не создался (%s) — "
+                        "рукопожатие с узлом ограничено только сроком каждого чтения\n", strerror(err));
+}
+
+void tr_watch_begin(int total_ms) {
+    pthread_once(&g_watch_once, watch_start);
+    pthread_mutex_lock(&g_watch_mu);
+    g_scope = ++g_watch_seq;
+    pthread_mutex_unlock(&g_watch_mu);
+    g_scope_deadline = now_ms() + total_ms;
+}
+
+/* Поставить сокет fd на учёт текущего срока (если срок открыт). */
+static void watch_add(int fd) {
+    if (!g_scope || !g_watch_ok) return;
+    int d = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (d < 0) return;
+    pthread_mutex_lock(&g_watch_mu);
+    if (g_watch_n == g_watch_cap) {
+        size_t nc = g_watch_cap ? g_watch_cap * 2 : 16;
+        struct watch_ent *nw = realloc(g_watch, nc * sizeof(*nw));
+        if (!nw) { pthread_mutex_unlock(&g_watch_mu); close(d); return; }
+        g_watch = nw;
+        g_watch_cap = nc;
+    }
+    g_watch[g_watch_n++] = (struct watch_ent){ g_scope_deadline, d, g_scope, 0 };
+    pthread_cond_signal(&g_watch_cv);
+    pthread_mutex_unlock(&g_watch_mu);
+}
+
+int tr_watch_end(void) {
+    if (!g_scope) return 0;
+    int fired = 0;
+    pthread_mutex_lock(&g_watch_mu);
+    for (size_t i = 0; i < g_watch_n; ) {
+        if (g_watch[i].scope != g_scope) { i++; continue; }
+        fired |= g_watch[i].fired;
+        close(g_watch[i].fd);
+        g_watch[i] = g_watch[--g_watch_n];
+    }
+    pthread_mutex_unlock(&g_watch_mu);
+    g_scope = 0;
+    return fired;
+}
+
 int tr_dial(const char *host, uint16_t port, int timeout_s) {
-    if (g_tcp_dial) return g_tcp_dial(host, port, timeout_s);
-    return tcp_connect(host, port, timeout_s);
+    /* Внутри общего срока перебор адресов не ждёт дольше его остатка. */
+    if (g_scope) {
+        int64_t left = g_scope_deadline - now_ms();
+        if (left <= 0) return TR_ECONNECT;
+        if (left < (int64_t)timeout_s * 1000) timeout_s = (int)((left + 999) / 1000);
+    }
+    int fd = g_tcp_dial ? g_tcp_dial(host, port, timeout_s) : tcp_connect(host, port, timeout_s);
+    if (fd >= 0) watch_add(fd);
+    return fd;
 }
 
 /* Сокет UDP к узлу — для протоколов, у которых датаграммы идут датаграммами (shadowsocks, SOCKS5 UDP

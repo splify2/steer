@@ -1650,11 +1650,20 @@ static void *worker_loop(void *arg) {
                 if (what < 0) { sess_free(w, s); continue; }
                 if (what != 1) continue;
 
+                /* Номер подтверждения двигается только принятым по-настоящему (xs_conn_rx_ok): RST
+                 * принимается ровно на него. В рукопожатии и у чужого (приманка) тега на сегменте нет — сразу;
+                 * у данных — после сошедшегося тега записи, ниже. */
+                if (s->phase != PH_EST) {
+                    pthread_mutex_lock(&g_tx_lock[s - g_sess]);
+                    xs_conn_rx_ok(&s->conn, seg.seq, seg.plen);
+                    pthread_mutex_unlock(&g_tx_lock[s - g_sess]);
+                }
                 if (s->phase == PH_SYN) { w->d_hs++; hs_step(w, s, &seg, g_conf.listen_port, now); continue; }
                 if (s->phase == PH_HS) { w->d_hs++; hs_confirm(w, s, &seg, now); continue; }
                 /* Не наш вовсе: байты идут настоящему серверу как есть. */
                 if (s->phase == PH_PROXY) { decoy_up(w, s, &seg, now); continue; }
                 w->d_data++;
+                int authed = 0;
 
                 /* Сборка записи, которая могла быть разрезана между сегментами. Она же
                  * предфильтр: сегмент, не начинающийся с заголовка записи и не продолжающий
@@ -1680,6 +1689,7 @@ static void *worker_loop(void *arg) {
                 if (tls13_aead_open(&s->rx, rel, hdr, XS_REC_HDR, ct, body_n) != 0)
                     continue;
                 xs_win_commit(&s->win, rel);
+                authed = 1;
                 /* Живость сессии отмечается ЗДЕСЬ, а не на приёме сегмента: доказательством служит
                  * сошедшийся тег, а не сам факт, что в четвёрку кто-то написал. См. last_auth. */
                 XSH_STORE(s->last_auth, xsh_ms_of(now));
@@ -1690,6 +1700,11 @@ static void *worker_loop(void *arg) {
                 } else {
                     hub_frame(w, s, ct, pn, now);
                 }
+                }
+                if (authed && s->phase == PH_EST) {
+                    pthread_mutex_lock(&g_tx_lock[s - g_sess]);
+                    xs_conn_rx_ok(&s->conn, seg.seq, seg.plen);
+                    pthread_mutex_unlock(&g_tx_lock[s - g_sess]);
                 }
             }
             if (got < XSH_BATCH) break;

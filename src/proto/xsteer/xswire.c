@@ -44,11 +44,11 @@ int xs_win_check(const struct xs_win *w, uint32_t rel) {
      * закрывает подавляющую часть пакетов: они идут по порядку. */
     if ((int32_t)(rel - w->max) > 0) return 0;
     unsigned have = w->n;
-    if (have == XS_WIN_RING) {
-        /* Кольцо обернулось: старейшее помнимое лежит там, куда сейчас писать. Всё, что
-         * старше него, отвергаем — не потому, что это точно повтор, а потому, что
-         * проверить нечем, а пропустить непроверенное здесь нельзя. */
-        if ((int32_t)(rel - w->ring[w->head]) < 0) return -1;
+    if (have == XS_WIN_RING && w->floor) {
+        /* Кольцо обернулось: всё, что не дальше самого дальнего вытесненного (floor), отвергаем — не
+         * потому, что это точно повтор, а потому, что проверить нечем, а пропустить непроверенное здесь
+         * нельзя. Порог — именно дальнейшее из вытесненных, а не старейшее по приёму (см. xs_win.floor). */
+        if ((int32_t)(rel - w->floor) <= 0) return -1;
     }
     for (unsigned i = 0; i < have; i++)
         if (w->ring[i] == rel) return -1;
@@ -56,6 +56,11 @@ int xs_win_check(const struct xs_win *w, uint32_t rel) {
 }
 
 void xs_win_commit(struct xs_win *w, uint32_t rel) {
+    /* Вытесняемое кольцом — в порог: дальше оно уже не помнится. */
+    if (w->n == XS_WIN_RING) {
+        uint32_t ev = w->ring[w->head];
+        if (!w->floor || (int32_t)(ev - w->floor) > 0) w->floor = ev;
+    }
     w->ring[w->head] = rel;
     w->head = (uint16_t)((w->head + 1) % XS_WIN_RING);
     if (w->n < XS_WIN_RING) w->n++;

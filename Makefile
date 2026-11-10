@@ -71,7 +71,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/nldonematch $(BUILD)/b3match $(BUILD)/subpq $(BUILD)/abihost $(BUILD)/abihost-static $(BUILD)/steerd-static $(BUILD)/pluginmodel $(BUILD)/pkhooks $(BUILD)/pkmatch $(BUILD)/pmkindmatch $(BUILD)/foprobematch
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/nldonematch $(BUILD)/b3match $(BUILD)/subpq $(BUILD)/abihost $(BUILD)/abihost-static $(BUILD)/steerd-static $(BUILD)/pluginmodel $(BUILD)/pkhooks $(BUILD)/pkmatch $(BUILD)/pmkindmatch $(BUILD)/foprobematch $(BUILD)/tunfloodmatch $(BUILD)/hsdlmatch $(BUILD)/httpcspinmatch
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -141,6 +141,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@$(BUILD)/xhupmatch
 	@$(BUILD)/wsmatch
 	@$(BUILD)/tls13readmatch
+	@$(BUILD)/hsdlmatch
 	@$(BUILD)/outqmatch
 	@$(BUILD)/certrootsmatch
 	@$(BUILD)/pqfallbackmatch
@@ -149,6 +150,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@$(BUILD)/submatch
 	@$(BUILD)/subfetchmatch
 	@$(BUILD)/httpmatch
+	@$(BUILD)/httpcspinmatch
 	@$(BUILD)/tarmatch
 	@$(BUILD)/hy2match
 	@$(BUILD)/pxsubmatch
@@ -169,6 +171,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 		$(MAKE) -s $(BUILD)/spscmatch-tsan && $$R $(BUILD)/spscmatch-tsan; \
 	else echo "spscmatch-tsan: ПРОПУСК — компилятор или система не умеет -fsanitize=thread (это не падение)"; fi
 	@$(BUILD)/tunnelmatch
+	@$(BUILD)/tunfloodmatch
 	@$(BUILD)/tunnamematch
 	@$(BUILD)/xsconfmatch
 	@$(BUILD)/xslinkmatch
@@ -613,6 +616,14 @@ $(BUILD)/tls13readmatch: tests/tls13readmatch.c tests/unit.h src/proto/tls/tls13
 	$(CC) $(CFLAGS) -Isrc/lib -Isrc/proto/tls -o $@ tests/tls13readmatch.c src/proto/tls/tls13.c \
 	      -Wl,--unresolved-symbols=ignore-all -ldl
 
+# Общий срок установления связи с узлом (аудит 2.1.0, F1): сервер, капающий ответ по байту, не держит
+# рукопожатие бесконечно — tr_watch_begin в trdial.c закрывает сокет по сроку. Настоящие tr_dial и tls13.c,
+# криптография не нужна (до неё не доходит; хеш транскрипта заглушен в стенде), сеть — петля.
+$(BUILD)/hsdlmatch: tests/hsdlmatch.c tests/unit.h src/proto/transport/trdial.c src/proto/transport/transport.h src/proto/tls/tls13.c src/proto/tls/tls13.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc/lib -Isrc/proto/tls -Isrc/proto/transport -Itests -o $@ tests/hsdlmatch.c \
+	      src/proto/transport/trdial.c src/proto/tls/tls13.c -Wl,--unresolved-symbols=ignore-all -lpthread -ldl
+
 # Запасной путь при потере длинного ClientHello (tr_link_open): TLS и Reality — заглушки стенда, трогается
 # только выбор Hello; tr_dial подменён самим стендом.
 $(BUILD)/pqfallbackmatch: tests/pqfallbackmatch.c src/proto/transport/trsec.c src/proto/transport/transport.h
@@ -670,6 +681,15 @@ $(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/pro
 # Content-Length, chunked, переадресации, cookie, ETag, сроки, обрывы, тела в десятки мегабайт потоком.
 # TLS подменён заглушками (криптобиблиотеки в make test нет); настоящий HTTPS — tests/httpsmatch.sh в
 # make ext-test. Потоки сервера — -lpthread.
+# Ожидание данных HTTPS в httpc.c — poll до срока, а не холостая петля (аудит 2.1.0, F2): настоящий http_get
+# по https:// к серверу на петле, чтение TLS — настоящий tls13.c (записи ChangeCipherSpec — без криптографии);
+# рукопожатие, запись и освобождение TLS подменены обёрткой компоновщика, вызовы чтения считаются.
+$(BUILD)/httpcspinmatch: tests/httpcspinmatch.c tests/unit.h src/proto/tls/httpc.c src/proto/tls/httpc.h src/proto/tls/tls13.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests -o $@ tests/httpcspinmatch.c src/proto/tls/httpc.c src/proto/tls/tls13.c \
+	      -Wl,--wrap=tls13_read_ref -Wl,--wrap=tls13_handshake_auth -Wl,--wrap=tls13_write -Wl,--wrap=tls13_free \
+	      -Wl,--unresolved-symbols=ignore-all -lpthread -ldl
+
 $(BUILD)/httpmatch: tests/httpmatch.c tests/unit.h src/proto/tls/httpc.c src/proto/tls/httpc.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests -o $@ tests/httpmatch.c src/proto/tls/httpc.c -lpthread
@@ -774,6 +794,14 @@ TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.
 $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/stack.c src/tunnel/pool.c src/tunnel/pool.h src/tunnel/dialer.h $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/tunnelmatch.c \
+		$(TUNNELMATCH_SRC) -lpthread -ldl
+
+# Один клиент LAN не кладёт туннель всем (аудит 2.1.0, T1 и T2): спрей датаграмм на 20 000 адресов, очередь
+# установщиков, срок заявки, бюджет памяти при сотнях медленных читателей. Стенд — tunnelmatch.c с его
+# подменами (включается целиком), рукопожатие подменено сном; сети и прав не нужно.
+$(BUILD)/tunfloodmatch: tests/tunfloodmatch.c tests/tunnelmatch.c src/tunnel/stack.c src/tunnel/pool.c src/tunnel/pool.h src/tunnel/dialer.h $(TUNNELMATCH_SRC)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests -o $@ tests/tunfloodmatch.c \
 		$(TUNNELMATCH_SRC) -lpthread -ldl
 
 # Имя устройства: движок работает ровно с тем именем, о котором просил, — иначе отказ. Ядро

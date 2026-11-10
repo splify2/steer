@@ -467,6 +467,8 @@ static int do_handshake(struct spoke *s) {
         if (obfs_parse(pkt, (size_t)r, &seg) != 0) continue;
         if (seg.sport != s->conn.dport || seg.dport != s->conn.sport) continue;
         if (xs_conn_on_seg(&s->conn, &seg, xs_now_ms()) != 1) continue;
+        /* Рукопожатие: тега у сегмента нет, ответ проверяет Noise целиком — номер подтверждения двигаем сразу. */
+        xs_conn_rx_ok(&s->conn, seg.seq, seg.plen);
         /* Ответ хаба приходит одним сегментом: он собран так, чтобы влезть (см. xshake.c).
          * Но склеить два сегмента мы всё равно умеем — дешевле, чем однажды не понять почему
          * рукопожатие не проходит на канале с меньшим MSS. */
@@ -1736,6 +1738,7 @@ static void *worker_main(void *arg) {
                     int what = xs_conn_on_seg(&s->conn, &seg, now);
                     if (what < 0) { session_down(s); break; }
                     if (what != 1) continue;
+                    int authed = 0;            /* в сегменте сошёлся тег хотя бы одной записи */
                     /* Сборка записи, которая могла быть разрезана между сегментами. Она же
                      * предфильтр: сегмент, не начинающийся с заголовка записи и не продолжающий
                      * начатую, отбрасывается до всякой криптографии.
@@ -1762,6 +1765,7 @@ static void *worker_main(void *arg) {
                     /* Коммит окна ТОЛЬКО после сошедшегося тега: иначе подделанный пакет с
                      * далёким смещением выбил бы из окна весь честный поток. */
                     xs_win_commit(&s->win, rel);
+                    authed = 1;
                     size_t pn = body_n - XS_TAG;
                     struct spoke_fctx fc = { s, dev, now };
                     if (pn && ct[0] == XS_CTL_BATCH) {
@@ -1772,6 +1776,10 @@ static void *worker_main(void *arg) {
                     tun_gro_flush(&s->tun, &s->gro);   /* см. пояснение выше */
                     /* keepalive молча учтён: он уже обновил last_rx. */
                     }
+                    /* Подтверждаем только проверенное: номер подтверждения — то, на что принимается RST
+                     * (xs_conn_rx_ok). Кусок записи без сошедшегося тега ждёт продолжения — его покроет
+                     * подтверждение сегмента, который запись допишет. */
+                    if (authed) xs_conn_rx_ok(&s->conn, seg.seq, seg.plen);
                 }
                 if (got < XSC_BATCH) break;
             }

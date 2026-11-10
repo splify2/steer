@@ -223,7 +223,9 @@ size_t transport_aux_pending(const struct transport *c) { (void)c; return g_aux_
 long transport_room(struct transport *c) { (void)c; return g_room; }
 /* Живая запись (I-534): у подмены сокета нет — держать нечего. */
 void transport_live(struct transport *c) { (void)c; }
-size_t transport_out_pending(const struct transport *c) { (void)c; return 0; }
+/* Очередь связи (живая запись): сколько стенд велит считать неотправленным узлу (F9, t_node_backlog). */
+static size_t g_out_pending;
+size_t transport_out_pending(const struct transport *c) { (void)c; return g_out_pending; }
 int transport_out_flush(struct transport *c) { (void)c; return 0; }
 /* Принимает ли транспорт запись любой длины (xhttp packet-up). */
 static int g_big_write;
@@ -514,6 +516,63 @@ static void t_no_connectors(void) {
     if (c) conn_drop(c);
 }
 
+/* F1 (аудит 2.1.0): установщик ведёт connect дайлера под общим сроком установления (tr_watch_begin, слой
+ * сокетов trdial.c — здесь подменён). Срок вышел — соединение сбрасывается, что бы ни ответил дайлер: сокеты
+ * связи уже закрыты на чтение и запись. Сам срок у сокета проверяет tests/hsdlmatch.c. */
+static int g_watch_begun, g_watch_ms, g_watch_fire;
+void tr_watch_begin(int total_ms) {
+    __atomic_add_fetch(&g_watch_begun, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_watch_ms, total_ms, __ATOMIC_RELAXED);
+}
+int tr_watch_end(void) { return __atomic_load_n(&g_watch_fire, __ATOMIC_RELAXED); }
+
+static void t_hs_deadline(void) {
+    int b0 = __atomic_load_n(&g_watch_begun, __ATOMIC_RELAXED);
+    unsigned long long d0 = g_hs_deadline;
+    __atomic_store_n(&g_watch_fire, 1, __ATOMIC_RELAXED);
+    struct conn *c = sock_conn(CLI_PORT + 77, SRV_IP);
+    int got = 0;
+    for (int i = 0; c && i < 2000 && !got; i++) {
+        got = __atomic_load_n(&c->done, __ATOMIC_ACQUIRE);
+        if (!got) usleep(1000);
+    }
+    int rc = c ? c->rc : 0;
+    int closed = got ? conn_ready(c, &g_tun) : 0;
+    __atomic_store_n(&g_watch_fire, 0, __ATOMIC_RELAXED);
+    check(__atomic_load_n(&g_watch_begun, __ATOMIC_RELAXED) > b0 &&
+          __atomic_load_n(&g_watch_ms, __ATOMIC_RELAXED) == CONNECT_TOTAL_MS,
+          "F1: установщик ведёт connect под общим сроком установления (16 с)");
+    check(rc == STACK_RC_HSDEADLINE && closed == 1 && g_hs_deadline == d0 + 1,
+          "F1: срок вышел — соединение сброшено, исход сосчитан (g_hs_deadline)");
+    if (c && !closed && c->used) conn_drop(c);
+}
+
+/* F9 (аудит 2.1.0): узел, который заказывает ответы (PING, SETTINGS, ping) и не читает их, раздувал очередь
+ * отправки без предела, а стек читал у него всегда. Теперь, пока в очереди связи OUTQ_RX_STOP и больше, у узла
+ * не читают: проход чтения останавливается после первого же чтения и помнит, что недочитал (rx_ready), а
+ * когда очередь сойдёт — читает дальше. */
+static void t_node_backlog(void) {
+    struct conn *c = open_conn();
+    if (!c) { check(0, "F9: стенд — соединение"); return; }
+    g_out_pending = OUTQ_RX_STOP;
+    g_recv_rc = 0;
+    g_recv_rep = 50;
+    g_recv_rep_n = 1000;
+    int r0 = g_recv_calls;
+    drain_conn(c, &g_tun);
+    int reads = g_recv_calls - r0;
+    check(reads == 1 && c->rx_ready,
+          "F9: узел не забирает ответы (очередь ≥ 512 КиБ) — у него больше не читают, недочитанное помнится");
+    g_out_pending = 0;
+    r0 = g_recv_calls;
+    drain_conn(c, &g_tun);
+    check(g_recv_calls - r0 > 1, "F9: очередь сошла — чтение у узла продолжается");
+    g_recv_rep = 0;
+    unsigned char b[65536];
+    while (cli_get(cli_fd(c), b, sizeof b) > 0) {}
+    conn_drop(c);
+}
+
 /* R-152: TCP в устройство не несётся — его завершает ядро на слушателе модуля. Попавший в TUN пакет TCP
  * (перенаправления ещё нет или раскладка старого ядра) получает сброс, а не тишину; соединения в таблице
  * не заводится и установщик не просится. RST клиента отвечать не надо. */
@@ -522,7 +581,7 @@ static void t_tcp_tun_rst(void) {
     unsigned char p[128];
     dev_drain(NULL);
     int live0 = g_live_n;
-    unsigned head0 = g_cq.head;
+    unsigned head0 = g_cq.r[0].head + g_cq.r[1].head;
     unsigned long long rst0 = g_tcp_tun_rst;
 
     size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, 1000, 0, TCP_SYN, NULL, 0,
@@ -535,7 +594,7 @@ static void t_tcp_tun_rst(void) {
           last.dport == CLI_PORT,
           "TCP в устройстве: SYN получает RST+ACK с номером подтверждения ISN + 1 от имени сервера");
     check(g_tcp_tun_rst == rst0 + 1, "TCP в устройстве: счётчик g_tcp_tun_rst вырос");
-    check(!conn_find(&k) && g_live_n == live0 && g_cq.head == head0,
+    check(!conn_find(&k) && g_live_n == live0 && g_cq.r[0].head + g_cq.r[1].head == head0,
           "TCP в устройстве: соединение в таблицу не заводится, установщик не просится");
 
     /* Данные и подтверждение: RST с номером из подтверждения (RFC 793, 3.4). */
@@ -2745,11 +2804,11 @@ static void t_inloop(void) {
 
     /* Исход сразу, из самого connect: ни установщика, ни потока. Установщики от прежних проверок могут уже
      * стоять (g_cq.started), поэтому смотрим на очередь: заявка в неё не ложится. */
-    unsigned head0 = g_cq.head;
+    unsigned head0 = g_cq.r[0].head + g_cq.r[1].head;
     struct conn *c = pm_open(41000, SRV_IP);
     check(c != NULL && g_in_connects == 1 && g_in_same_thread,
           "в цикле: connect зовёт сам стек, в своём потоке");
-    check(g_cq.head == head0 && g_cq.n == 0, "  заявка установщику не ставилась (очередь не двигалась)");
+    check(g_cq.r[0].head + g_cq.r[1].head == head0 && g_cq.n == 0, "  заявка установщику не ставилась (очередь не двигалась)");
     if (!c) return;
     check(c->fd == 77 && !c->armed, "  связь есть, а в epoll соединению ставить нечего (дескриптора нет)");
 
@@ -3610,7 +3669,7 @@ static void t_connectors_burst(void) {
     uint64_t t0 = now_ns();
     int refused = 0;
     for (int i = 0; i < N; i++) {
-        struct connjob j = { .c = &jobs[i], .sess = &jobs[i], .sp = NULL, .efd = -1 };
+        struct connjob j = { .c = &jobs[i], .sess = &jobs[i], .sp = NULL, .efd = -1, .cfd = -1, .enq_ns = now_ns() };
         if (connq_push(&j) != 0) refused++;
     }
     for (int w = 0; w < 600 && __atomic_load_n(&g_slow_done, __ATOMIC_RELAXED) < N; w++) usleep(10000);
@@ -4090,6 +4149,8 @@ int main(void) {
     g_now_s = (time_t)(g_now_ns / 1000000000ull);
 
     t_no_connectors();
+    t_hs_deadline();
+    t_node_backlog();
     t_flow_filter();
     t_tun_adopt();
     t_connectors_burst();
