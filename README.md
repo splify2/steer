@@ -15,8 +15,8 @@
 </div>
 
 Правила описываются одной спекой (YAML или JSON), ядро steer превращает её в правила `nftables`,
-таблицы маршрутизации и наборы адресов одной атомарной транзакцией. Написано на C под слабые
-роутеры: одно процессорное ядро, десятки мегабайт памяти, 6–7 МБ на разделе overlay. Панель с
+таблицы маршрутизации и наборы адресов одной атомарной транзакцией. Написано на C; протоколы —
+плагины, которые приходят в самом пакете ядра и ставятся без сети. Панель с
 каталогом сервисов поверх ядра — [splify2](https://github.com/splify2/splify2), замена sing-box для
 podkop и forkop — [steer-box-connector](https://github.com/splify2/steer-box-connector).
 
@@ -25,34 +25,31 @@ podkop и forkop — [steer-box-connector](https://github.com/splify2/steer-box-
 - **Правила сверху вниз**: какой трафик каких клиентов в какой выход; побеждает первое совпадение
 - **Домены через fake-IP**: резолвер отвечает служебным адресом, ядро Linux возвращает настоящий через DNAT
 - **DNS под правило**: DoT, DoH (HTTP/1.1, HTTP/2, HTTP/3), DoQ, UDP/TCP — напрямую или через выход, с кэшем; группы серверов (все сразу или по очереди) и свой сервер для остальных сайтов
-- **Выходы и группы**: интерфейс, туннель по подписке; группы `order`, `latency`, `manual`, `balance`; `on_fail` при отказе всех
-- **Свои клиенты протоколов** модулями: VLESS/Reality (Vision, tcp/grpc/xhttp/ws/httpupgrade), hysteria2, trojan, shadowsocks, socks, http, vmess, xsteer
+- **Выходы и группы**: интерфейс, AmneziaWG, туннель по подписке, блок; группы `order`, `latency`, `manual`, `balance`; `on_fail` при отказе всех
+- **Свои клиенты протоколов** плагинами: VLESS/Reality (Vision, tcp/grpc/xhttp/ws/httpupgrade), hysteria2, trojan, shadowsocks, socks, http, vmess, xsteer, Cloudflare WARP — TCP и UDP, IPv4 и IPv6
+- **IPv6 по правилам**: `family: 4 | 6 | both` у правила, без утечек мимо выхода
 - **WireGuard поверх поддельного TCP** там, где режут UDP
 - **`steer fit`** ужимает блок-лист в сотни тысяч префиксов до размера, который влезает в роутер
-- **CLI и управляющий сокет**: `apply`, `status`, `diag`, `explain`, события для панелей
+- **CLI и управляющий сокет**: `apply`, `status`, `diag`, `explain`, `plugin`, события для панелей
 
 ## Установка
 
-Пакеты своей архитектуры (`DISTRIB_ARCH` в `/etc/openwrt_release`) — со страницы
+Пакет своей архитектуры (`DISTRIB_ARCH` в `/etc/openwrt_release`) — со страницы
 [выпусков](https://github.com/splify2/steer/releases) или из ветки
-[dist](https://gitlab.com/xyzmean/steer/-/tree/dist) зеркала. Ядро `steer-core` нужно всегда, модули —
-по нужде, всё одной командой:
+[dist](https://gitlab.com/xyzmean/steer/-/tree/dist) зеркала. Пакет на архитектуру один — `steer-core`;
+плагины протоколов (`vless`, `hysteria2`, `proxy`, `xsteer`, `obfs`, `warpbox`, `awg`) лежат в нём же и
+ставятся без сети:
 
 ```sh
-apk add --allow-untrusted ./steer-core-<версия>-1_<арх>.apk ./steer-vless-<версия>-1_<арх>.apk   # OpenWrt на apk
-opkg install ./steer-core-<версия>-1_<арх>.ipk ./steer-vless-<версия>-1_<арх>.ipk               # OpenWrt на opkg
+apk add --allow-untrusted ./steer-core-<версия>-1_<арх>.apk   # OpenWrt на apk
+opkg install ./steer-core-<версия>-1_<арх>.ipk               # OpenWrt на opkg
+steer plugin list                                            # что поставлено
+steer plugin install vless                                   # недостающий протокол
 ```
 
-| Пакет | Что это |
-|---|---|
-| `steer-core` | ядро: маршрутизация, сторож, резолвер, `steerd`, `steer`, библиотеки `libsteer` |
-| `steer-vless` | клиент VLESS/Reality |
-| `steer-hysteria2` | клиент hysteria2 (QUIC, Brutal, Salamander) |
-| `steer-proxy` | клиенты trojan, shadowsocks, socks, http, vmess |
-| `steer-xsteer` | клиент звезды xsteer |
-| `steer-obfs` | WireGuard поверх поддельного TCP |
-| `steer-warpbox` | Cloudflare WARP выходом `kind: warp` (регистрация, подбор точек, замена). Нужен `kmod-amneziawg` или `kmod-wireguard` |
-| `steer-extended` | устаревший мета-пакет: `steer-core` и первые четыре модуля (без `steer-hysteria2`, `steer-proxy`, `steer-warpbox`) |
+Обновление с 2.0.x снимает прежние пакеты модулей (`steer-vless` и другие, `steer-extended`) и ставит
+нужные плагины по выходам спеки. Мост Telegram — плагин `tgws` из репозитория
+`splify2-extended-plugins`. Подробно — [docs/guide.md](docs/guide.md#установка).
 
 ## Быстрый старт
 
@@ -80,12 +77,12 @@ steer explain example.org
 [splify2.github.io/docs/steer](https://splify2.github.io/docs/steer/): [подробное описание](docs/guide.md),
 [спека v2](docs/spec-v2.md), [управление и события](docs/ctl.md), [устройство ядра](docs/architecture.md),
 протоколы [VLESS](docs/vless.md), [hysteria2](docs/hysteria2.md), [trojan и другие](docs/proxy.md),
-[xsteer](docs/xsteer.md), [сервер и хаб](server/README.md).
+[xsteer](docs/xsteer.md), [WARP](docs/warp.md), [сервер и хаб](server/README.md).
 
 ## Сборка
 
 ```sh
-./build.sh                          # пакеты под все архитектуры (STEER_ARCH=<арх> — одну), нужен docker
+./build.sh                          # пакеты под все 11 архитектур (STEER_ARCH=<арх> — одну), нужен docker
 make && make test                   # сборка и стенды на машине разработки
 ```
 
