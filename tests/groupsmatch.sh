@@ -590,7 +590,10 @@ sw_why() {   # ВЫХОД УСТРОЙСТВО — «причина член» �
 }
 check "  подписчику — switched на c с причиной down (не latency)" "down c" "$(sw_why dead3 sw3)"
 ip link set sw1 up
-wait_for '[ "$(tdev dead3)" = sw1 ]' 40
+# Ждать и таблицу, и status: таблицу группы проход переписывает посреди обхода, а память, по которой
+# отвечает status (active, groups), кладёт в конце прохода — между ними до секунды status ещё
+# называет прежний член (сторож на этой спеке проходит дольше: группы po и pl части 5).
+wait_for '[ "$(tdev dead3) $(st outputs.dead3.group.selected)" = "sw1 a" ]' 40
 check "a вернулся: группа снова на самом быстром" "sw1 a" "$(tdev dead3) $(st outputs.dead3.group.selected)"
 wait_for '[ "$(sw_why dead3 sw1)" = "latency a" ]' 10
 check "  возврат на a — switched с причиной latency" "latency a" "$(sw_why dead3 sw1)"
