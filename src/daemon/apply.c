@@ -698,9 +698,21 @@ static int ruleset_load(const struct spec *cfg, const struct groups *gr) {
     const char *load[] = { "nft", "-f", tmp, NULL };
     int rc = run(load);
     if (rc != 0) {
+        /* Отвергнутый набор остаётся для разбора — ОДНИМ файлом с постоянным именем, который
+         * следующий отказ перезаписывает. Раньше оставался файл mkstemp на каждый отказ: повтор
+         * применения (сверка сторожа, повтор при старте) складывал их в /tmp — в память роутера —
+         * по набору на попытку. Не переименовался — остаётся временный, как прежде. */
+        char kept[256];
+        steer_tmp_template(kept, sizeof(kept), "steer-ruleset");
+        char *x = strrchr(kept, '.');
+        const char *name = tmp;
+        if (x && (size_t)(x - kept) + sizeof(".rejected") <= sizeof(kept)) {
+            strcpy(x, ".rejected");
+            if (rename(tmp, kept) == 0) name = kept;
+        }
         fprintf(stderr, LOG_W "nft отверг набор правил, прежний остаётся (файл набора: %s)\n",
-                tmp);
-        const char *check[] = { "nft", "-c", "-f", tmp, NULL };
+                name);
+        const char *check[] = { "nft", "-c", "-f", name, NULL };
         run(check);
         return 1;
     }

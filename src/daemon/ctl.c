@@ -167,6 +167,7 @@
 #include "ynode.h"
 #include "plugso.h"
 #include "wandev.h"
+#include "nftdump.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
 
@@ -469,12 +470,13 @@ static void resp_bool(struct cbuf *r, const char *k, int v) {
  * шлёт целиком, прежде чем читать ответ, и сброс на середине его записи он увидел бы ошибкой
  * записи, а не нашим too-large. По локальному сокету это десятки миллисекунд; дальше —
  * секунда срока, и хватит. */
-static void ctl_close_now(int c) {
+static void ctl_close_cap(int c, size_t cap) {
     shutdown(c, SHUT_WR);
     size_t total = 0;
     char buf[16384];
-    while (total < 2 * (size_t)CTL_FILE_MAX) {
-        ssize_t m = recv(c, buf, sizeof(buf), MSG_DONTWAIT);
+    while (total < cap) {
+        size_t want = cap - total < sizeof(buf) ? cap - total : sizeof(buf);
+        ssize_t m = recv(c, buf, want, MSG_DONTWAIT);
         if (m < 0 && errno == EINTR) continue;
         if (m <= 0) break;
         total += (size_t)m;
@@ -482,9 +484,18 @@ static void ctl_close_now(int c) {
     close(c);
 }
 
+/* Дочитывание у того, кого не пустили (denied): одно чтение, не больше CTL_DENIED_DRAIN. Предел
+ * в два тела файла — ради своих, чей слишком большой put-file надо принять и отвергнуть словом;
+ * чужому процессу он давал рычаг: каждое его соединение стоило демону чтения десятков мегабайт
+ * прямо в приёме, в единственном потоке цикла. Строка запроса честного клиента (до 512 байт)
+ * уходит из очереди, и он видит конец ответа, а не сброс; всё сверх остаётся непрочитанным, и
+ * приславший это получает сброс — ему и положено. */
+#define CTL_DENIED_DRAIN 4096
+
 /* Отказ одной строкой — для тех, кого не пустили или кому некогда: соединения у них нет,
- * отвечает сам приём. Ответ короче буфера сокета, запись не блокирует. */
-static void ctl_refuse_now(int c, const char *err, const char *msg) {
+ * отвечает сам приём. Ответ короче буфера сокета, запись не блокирует. drain — сколько
+ * дочитать перед закрытием (ctl_close_cap). */
+static void ctl_refuse_cap(int c, const char *err, const char *msg, size_t drain) {
     struct cbuf r = {0};
     resp_begin(&r, NULL);
     resp_error(&r, err, msg);
@@ -494,7 +505,11 @@ static void ctl_refuse_now(int c, const char *err, const char *msg) {
         do w = send(c, r.p, r.n, MSG_NOSIGNAL | MSG_DONTWAIT); while (w < 0 && errno == EINTR);
     }
     free(r.p);
-    ctl_close_now(c);
+    ctl_close_cap(c, drain);
+}
+
+static void ctl_refuse_now(int c, const char *err, const char *msg) {
+    ctl_refuse_cap(c, err, msg, 2 * (size_t)CTL_FILE_MAX);
 }
 
 /* ---- выключатель движка ---------------------------------------------------------------- */
@@ -705,7 +720,17 @@ struct ctl_srv {
      * после смены устройства раздачи, которую ещё не видел ни один план, — объяснимое и не в счёт
      * RESYNC_BURST. resync_said — окно (самая старая починка в нём), о котором отказ уже сказан. */
     long lan_at, plan_at, resync_said;
+    /* Повтор стартового применения (boot_retry): таймер, номер следующей попытки и пауза перед ней. */
+    struct loop_timer *boot_tm;
+    int boot_try;
+    long boot_pause_ms;
+    /* Журнал отказов приёма (srv_deny_log): начало окна, строк в нём и сколько опущено. */
+    long deny_win;
+    int deny_n;
+    unsigned long deny_more;
 };
+
+static void boot_retry_arm(struct ctl_srv *s);
 
 static void mem_version(struct conn *c, struct cbuf *r);
 static void mem_status(struct conn *c, struct cbuf *r);
@@ -1985,6 +2010,12 @@ static void reload_done(struct conn *c) {
     /* Стартовое применение кончилось — удачно или нет: теперь первый проход сторожа (см.
      * «ПЕРВЫЙ ПРОХОД — ПОСЛЕ СТАРТОВОГО APPLY» в watchd.c). */
     if (c->boot) watchd_release(c->srv->watch);
+    /* Стартовое применение не прошло — повторить (boot_retry_arm): прежнего набора правил после
+     * перезагрузки нет, и ждать ручного reload значило бы стоять без маршрутизации. */
+    if (c->boot) {
+        if (c->rcode != 0) boot_retry_arm(c->srv);
+        else c->srv->boot_try = 0;
+    }
     /* @wan_dev напечатан заново; маршрут мог смениться, пока шло применение. */
     wandev_sync(1);
     struct ctl_srv *s = c->srv;
@@ -2003,9 +2034,11 @@ static void reload_done(struct conn *c) {
 static void reload_head(struct conn *c, int enabled, struct cbuf *err) {
     if (c->boot) {
         if (c->rcode != 0)
-            fprintf(stderr, LOG_W "применение при старте не прошло (код %d)%s%.*s", c->rcode,
+            fprintf(stderr, LOG_W "применение при старте не прошло (код %d) — повторю%s%.*s", c->rcode,
                     err && err->n ? ":\n" : "\n", err ? (int)err->n : 0,
                     err && err->p ? err->p : "");
+        else if (enabled && c->srv->boot_try)
+            fprintf(stderr, LOG_I "спека применена при старте — с попытки %d\n", c->srv->boot_try + 1);
         else if (enabled)
             fprintf(stderr, LOG_I "спека применена при старте\n");
     }
@@ -2934,13 +2967,46 @@ static void srv_accept_resume(struct loop *l, struct loop_timer *t, void *arg) {
     loop_fd_mod(l, s->lfd, EPOLLIN);
 }
 
+/* Строка журнала об отказе — не на каждого: CTL_DENY_LOG строк за CTL_DENY_WIN_MS, остальные
+ * считаются и называются одной строкой в начале следующего окна. Журнал роутера — кольцо в памяти:
+ * процесс, который стучится в сокет в цикле, вытеснял бы из него всё остальное. */
+#define CTL_DENY_LOG 5
+#define CTL_DENY_WIN_MS 60000L
+
+static void srv_deny_log(struct ctl_srv *s, const char *who) {
+    long now = loop_now_ms();
+    if (!s->deny_win || now - s->deny_win >= CTL_DENY_WIN_MS) {
+        if (s->deny_more > 1)
+            fprintf(stderr, LOG_W "отказ: и ещё %lu таких за %ld с — строки о них опущены\n",
+                    s->deny_more - 1, CTL_DENY_WIN_MS / 1000);
+        s->deny_win = now ? now : 1;
+        s->deny_n = 0;
+        s->deny_more = 0;
+    }
+    if (s->deny_n < CTL_DENY_LOG) {
+        s->deny_n++;
+        fprintf(stderr, LOG_W "отказ: %s\n", who);
+        return;
+    }
+    /* Первый сверх предела называется (кто стучится — видно по нему), остальные только считаются. */
+    if (!s->deny_more++)
+        fprintf(stderr, LOG_W "отказ: %s — отказов больше %d за минуту, дальше считаю молча\n", who,
+                CTL_DENY_LOG);
+}
+
+/* За одно пробуждение принимается не больше CTL_ACCEPT_BURST соединений: приём без предела держал
+ * цикл в этой функции, пока очередь сокета не опустеет, — тот, кто открывает соединения быстрее,
+ * чем они закрываются, останавливал сторожа, таймеры и события помощников. Оставшиеся в очереди
+ * epoll (по уровню) отдаст следующим оборотом, после остальных событий. */
+#define CTL_ACCEPT_BURST 16
+
 static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
     (void)ev;
     struct ctl_srv *s = arg;
-    for (;;) {
+    for (int burst = 0; burst < CTL_ACCEPT_BURST; burst++) {
         int c = accept4(fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (c < 0) {
-            if (errno == EINTR || errno == ECONNABORTED) continue;
+            if (errno == EINTR || errno == ECONNABORTED) continue;       /* в счёт пачки: цикл конечен */
             /* Нехватка дескрипторов или памяти не проходит сама за микросекунду, а соединение
              * так и ждёт в очереди — epoll будил бы демон сразу же, и он крутился бы вхолостую.
              * Приём снимается на 200 мс; в обычной работе сюда не попасть. */
@@ -2952,8 +3018,8 @@ static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
         }
         char who[320];
         if (!ctl_peer_ok(c, &s->cf, who, sizeof(who))) {
-            fprintf(stderr, LOG_W "отказ: %s\n", who);
-            ctl_refuse_now(c, "denied", "этому процессу управлять ядром steer нельзя");
+            srv_deny_log(s, who);
+            ctl_refuse_cap(c, "denied", "этому процессу управлять ядром steer нельзя", CTL_DENIED_DRAIN);
             continue;
         }
         struct conn *n = calloc(1, sizeof(*n));
@@ -3087,6 +3153,18 @@ static void srv_jobs_stop(struct ctl_srv *s) {
         if (c->job.running) kill(-c->job.pid, SIGKILL);
 }
 
+/* Файл-просьба «выходишь ради перезапуска» (restart в files/etc/init.d/steer): <каталог
+ * состояния>/restart. Файл, а не сигнал: демон прежнего выпуска, которого перезапускает скрипт
+ * нового пакета, незнакомый сигнал убил бы без уборки, а файл он просто не читает. Просьба
+ * разовая — снимается прочитавшим её и каждым стартом демона. */
+static int srv_restart_mark(int consume) {
+    char p[PATH_MAX];
+    if ((size_t)snprintf(p, sizeof(p), "%s/restart", steer_state_dir()) >= sizeof(p)) return 0;
+    int have = access(p, F_OK) == 0;
+    if (consume) unlink(p);
+    return have;
+}
+
 static void srv_term(struct loop *l, int signo, void *arg) {
     (void)signo;
     struct ctl_srv *s = arg;
@@ -3096,7 +3174,15 @@ static void srv_term(struct loop *l, int signo, void *arg) {
     /* Детям команд — SIGTERM сразу: гаснут, пока демон по одному гасит помощников. */
     for (struct conn *c = s->conns; c; c = c->next)
         if (c->job.running) kill(-c->job.pid, SIGTERM);
-    supd_stop(s->d.sup);
+    /* Перезапуск службы: набор правил остаётся в ядре, и заворот DNS по-прежнему ведёт к резолверу
+     * — погасить его значило бы оставить клиентов без DNS до нового демона. Остановка (файла
+     * просьбы нет) гасит и его: правила следом снимает `steerd down`. */
+    if (srv_restart_mark(1)) {
+        fprintf(stderr, "steer[info] daemon: перезапуск службы — резолвер оставлен новому демону\n");
+        supd_stop_keep_dnsd(s->d.sup);
+    } else {
+        supd_stop(s->d.sup);
+    }
     srv_jobs_stop(s);
     loop_stop(l, 0);
 }
@@ -3125,13 +3211,57 @@ static int boot_apply(struct ctl_srv *s) {
     c->hup = 1;          /* ответ отдавать некому: conn_reply освобождает соединение */
     c->boot = 1;
     c->st = C_RUN;
+    c->job.po = c->job.pe = -1;
     c->q.cmd = ctl_lookup("reload");
     c->q.cf = &s->cf;
     c->next = s->conns;
     s->conns = c;
     resp_begin(&c->resp, "reload");
+    /* Повтор приходит по таймеру и может застать чужую изменяющую команду — тогда в её очередь. */
+    if (s->lock_owner) {
+        c->st = C_WAIT;
+        struct conn **pp = &s->lockq;
+        while (*pp) pp = &(*pp)->qnext;
+        *pp = c;
+        return 0;
+    }
     conn_exec(c);
     return 0;
+}
+
+/* ---- повтор стартового применения ---------------------------------------------------------------
+ *
+ * Стартовое применение могло не пройти не по вине спеки: nft ещё нечем принять набор (fw4 на
+ * холодной загрузке не поднялся), список докачивается, ядро не дало памяти. Прежде об отказе была
+ * одна строка в журнале, и всё: демон не выходит, respawn procd его не повторяет, а сверка на
+ * проходе сторожа без запомненного применения не работает. После перезагрузки прежнего набора
+ * правил в ядре нет — правила fwmark стоят, а меток, заворота DNS и запрета никто не ставит, и
+ * трафик шёл напрямую до ручного reload.
+ *
+ * Повтор — тем же стартовым применением, с растущей паузой (5 с, вдвое, до 5 минут): пока не
+ * пройдёт, пока движок включён и спека есть. Кто-то применил раньше (apply или reload по сокету
+ * прошли — у демона есть запомненное применение) — повторять нечего. Пауза не сбрасывается от
+ * чужих неудач: спека, которую не принимает ядро, не должна превращаться в компиляцию по кругу. */
+#define BOOT_RETRY_MIN_MS 5000L
+#define BOOT_RETRY_MAX_MS (5 * 60 * 1000L)
+
+static void boot_retry_arm(struct ctl_srv *s) {
+    if (!s->boot_tm) return;
+    s->boot_pause_ms = !s->boot_pause_ms ? BOOT_RETRY_MIN_MS :
+                       s->boot_pause_ms * 2 > BOOT_RETRY_MAX_MS ? BOOT_RETRY_MAX_MS : s->boot_pause_ms * 2;
+    const char *e = getenv("STEER_BOOT_RETRY_MS");          /* шов стенда: пауза первой попытки */
+    if (e && *e && s->boot_try == 0) s->boot_pause_ms = atol(e) > 0 ? atol(e) : s->boot_pause_ms;
+    s->boot_try++;
+    fprintf(stderr, LOG_I "стартовое применение: попытка %d через %ld с\n", s->boot_try + 1,
+            (s->boot_pause_ms + 999) / 1000);
+    loop_timer_set(s->boot_tm, s->boot_pause_ms);
+}
+
+static void boot_retry(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l; (void)t;
+    struct ctl_srv *s = arg;
+    if (!s->on || !s->d.have || s->rec.valid) { s->boot_try = 0; s->boot_pause_ms = 0; return; }
+    if (boot_apply(s) != 0) boot_retry_arm(s);
 }
 
 /* ---- починка правил выходов (страж правил, rulewd.c) --------------------------------------------
@@ -3349,11 +3479,23 @@ static void srv_kcheck(void *arg) {
     /* Своя изменяющая команда идёт или ждёт очереди — её замена набора правил ещё не запомнена
      * (или уже в полёте), и расхождение с ней не расхождение. Проход при этом и не начинается
      * (srv_busy), но починка, поставленная прошлым проходом, может ждать в очереди. */
-    if (!s->on || !s->rec.valid || s->lock_owner || s->lockq) return;
+    if (!s->on || s->lock_owner || s->lockq) return;
     for (struct conn *c = s->conns; c; c = c->next)
-        if (c->resync) return;
+        if (c->resync || c->boot) return;
     const char *why = "";
-    int drift = recon_kernel_drift(&s->rec, &why);
+    int drift;
+    if (!s->rec.valid) {
+        /* Запомненного применения нет: стартовое не прошло (или последнее отвергнуто). Раньше
+         * проход на этом молчал. Таблицы в ядре нет, а движок включён, спека есть и правила
+         * выходов стоят — это то же «не то, что должно стоять», что снятая мимо нас таблица ниже:
+         * чинить, в общем счёте починок. Таблица есть (отвергнут новый набор, стоит прежний) —
+         * трогать нечего. */
+        if (!s->d.have || nfd_table_exists(NFD_INET, nft_table()) || !srv_table_flushed(s)) return;
+        why = "движок включён и спека есть, а набора правил в ядре Linux нет";
+        drift = 1;
+    } else {
+        drift = recon_kernel_drift(&s->rec, &why);
+    }
     if (drift == 2 && srv_table_flushed(s)) {
         why = "таблицы ядра steer нет в ядре Linux, а правила выходов стоят — её снял кто-то другой";
         drift = 1;
@@ -3602,6 +3744,7 @@ int ctl_serve_main(int argc, char **argv) {
      * игнорируется ещё и ради записи, которую делает код в процессе. Детям он возвращается
      * (loop_child_reset). */
     signal(SIGPIPE, SIG_IGN);
+    srv_restart_mark(1);         /* просьба адресована прежнему демону; этому её пришлют заново */
     S.l = loop_new();
     if (!S.l) { fprintf(stderr, LOG_W "цикл событий: %s\n", strerror(errno)); return 1; }
     S.lfd = ctl_listen(cf, &S.ino);
@@ -3617,6 +3760,7 @@ int ctl_serve_main(int argc, char **argv) {
      * status до тех пор отвечает тем же отказом, что подкоманда. */
     if (steerd_load(&S.d) != 0) fprintf(stderr, LOG_W "спека не прочитана: %s\n", S.d.err);
     S.accept_tm = loop_timer_new(S.l, srv_accept_resume, &S);
+    S.boot_tm = loop_timer_new(S.l, boot_retry, &S);
     if (!S.accept_tm || loop_fd_add(S.l, S.lfd, EPOLLIN, srv_accept, &S) != 0) {
         fprintf(stderr, LOG_W "цикл событий: %s\n", strerror(errno));
         return 1;

@@ -1183,6 +1183,24 @@ static int adopt_dnsd(struct supd *s, struct helper *h) {
     if (s->ad_ph) return 1;               /* забор уже идёт */
     int c = dnsd_connect(&pid);
     if (c < 0) return 0;
+    /* Резолвер другой сборки не забирается. После обновления пакета перезапуск службы оставляет
+     * резолвер прежнего демона жить (supd_stop_keep_dnsd) — но это процесс прежнего бинарника: формат
+     * таблицы и просьб у него свой, и новый код резолвера без этого не заработал бы до следующей
+     * остановки. Такой гасится, и сразу поднимается свой: перерыв DNS — запуск резолвера, а не весь
+     * перезапуск демона. Сверка — файл программы (устройство и inode): заменённый пакетом файл у
+     * живого процесса остаётся прежним inode. Не узнать (нет /proc) — забирать, как раньше. */
+    {
+        char pe[64];
+        struct stat me, it;
+        snprintf(pe, sizeof(pe), "/proc/%d/exe", (int)pid);
+        if (stat("/proc/self/exe", &me) == 0 &&
+            (stat(pe, &it) != 0 || it.st_dev != me.st_dev || it.st_ino != me.st_ino)) {
+            fprintf(stderr, LOG_SW "резолвер прежнего демона (pid %d) — другой сборки: гашу и поднимаю свой\n",
+                    (int)pid);
+            dnsd_kill(c, pid);
+            return 0;
+        }
+    }
     int p[2];
     if (pipe2(p, O_CLOEXEC) != 0) { dnsd_kill(c, pid); return 0; }
     int fds[2] = { p[0], 2 };
@@ -1555,13 +1573,26 @@ void supd_spec_changed(struct supd *s, struct supd_changes *ch, int replaced) {
     supd_kick(s);
 }
 
-void supd_stop(struct supd *s) {
+/* keep_dnsd — демон уходит ради перезапуска службы (supd_stop_keep_dnsd): резолверу сигнала нет,
+ * труба закрывается — для него это «демон пропал», и он отвечает по последней таблице, пока его не
+ * заберёт новый демон (шапка, «Резолвер переживает демона»). Помощники гаснут как всегда. */
+static void supd_stop_impl(struct supd *s, int keep_dnsd) {
     if (!s || s->stopping) return;
     s->stopping = 1;
     loop_timer_stop(s->tm);
     loop_timer_stop(s->ad_tm);
     s->ad_ph = 0;
     if (s->ad_p1 >= 0) { close(s->ad_p1); s->ad_p1 = -1; }
+    if (keep_dnsd) {
+        for (size_t i = 0; i < s->set.n; i++)
+            if (s->set.h[i].table) s->set.h[i].pid = 0;      /* helpers_stop его не тронет и не ждёт */
+        tab_close(s);
+        if (s->dn_conn >= 0) {
+            loop_fd_del(s->l, s->dn_conn);
+            close(s->dn_conn);
+            s->dn_conn = -1;
+        }
+    }
     /* Резолвер гасится явно: закрытую трубу он пережил бы — для него это «демон пропал» (adopt.c).
      * Сигнал — раньше, чем конец трубы: тогда EOF он и не примет за пропажу. Свой ребёнок
      * дожидается ниже, в helpers_stop, вместе с помощниками; забранный — здесь, по закрытию его
@@ -1589,6 +1620,9 @@ void supd_stop(struct supd *s) {
         }
     helpers_stop(&s->set, 1);
 }
+
+void supd_stop(struct supd *s) { supd_stop_impl(s, 0); }
+void supd_stop_keep_dnsd(struct supd *s) { supd_stop_impl(s, 1); }
 
 const struct helper_state *helper_state_of(const struct steerd *d, const char *out) {
     const struct supd *s = d ? d->sup : NULL;

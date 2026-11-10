@@ -29,6 +29,9 @@ SPEC_YAML=/etc/steer/spec.yaml
 # Абсолютные пути: команду экземпляра запускает procd, а не эта оболочка, и его PATH — не наш.
 STEERD=/usr/sbin/steerd
 STEER=/usr/sbin/steer
+# Файл-просьба демону на время restart: «выходишь ради перезапуска — резолвер оставь» (читает
+# srv_term в src/daemon/ctl.c). Каталог состояния роутера — тот же, что у реестра ниже.
+RESTART_MARK=/var/lib/steer/restart
 
 boot() {
     # `nft -f` нужны собственные таблицы fw4; на холодной загрузке он может ещё подниматься.
@@ -61,6 +64,9 @@ start_service() {
 stop_service() {
     _steerd_pid="$(ubus call service list '{"name":"steer"}' 2>/dev/null |
                    jsonfilter -e '@.steer.instances.steerd.pid' 2>/dev/null)"
+    # Просьба «оставь резолвер» — только от restart ниже; у остановки её быть не должно, даже если
+    # прежний restart оборвали на полпути.
+    [ -n "${_steer_restart:-}" ] || rm -f "$RESTART_MARK"
 }
 
 service_stopped() {
@@ -69,6 +75,8 @@ service_stopped() {
         sleep 1
         _i=$((_i + 1))
     done
+    # Перезапуск правил не снимает (restart ниже): дальше — только остановка.
+    [ -n "${_steer_restart:-}" ] && return 0
     if [ -x "$STEERD" ]; then
         "$STEERD" down
         return 0
@@ -86,6 +94,29 @@ service_stopped() {
     for m in $(awk '{print $2}' /var/lib/steer/registry 2>/dev/null); do
         while ip rule del fwmark "0x$m/0x0ff00000" 2>/dev/null; do :; done
     done
+}
+
+# Перезапуск — свой, а не stop и start из rc.common: тот между ними звал бы `steerd down`, и на
+# всё время перезапуска (демон гасит помощников до 10 с, потом новый компилирует спеку) в ядре не
+# было бы ни набора правил, ни правил fwmark, ни таблиц выходов с их blackhole. Трафик выходов с
+# on_fail: drop шёл бы напрямую, а DNS — к dnsmasq: клиенты запоминали настоящие адреса на срок
+# жизни записи, и доменные правила с fake-IP не видели их и после возврата правил. Так было при
+# каждом обновлении пакета (его postinst зовёт restart).
+#
+# Здесь демон только сменяется: набор правил, правила и таблицы остаются в ядре — туннели на время
+# смены лежат, и трафик их выходов ведёт себя как при отказе выхода (on_fail). Новый демон
+# применяет спеку сверкой: таблица заменяется одной транзакцией, маршруты — `route replace`,
+# лишнее от прежней спеки снимается по реестру. Резолвер прежний демон по файлу-просьбе не гасит,
+# а оставляет новому (src/daemon/supd.c, «Резолвер переживает демона»): DNS клиентов не пропадает.
+# Остановка (stop) правила по-прежнему снимает: кто остановил службу, хочет её выключить.
+restart() {
+    trap '' TERM
+    _steer_restart=1
+    mkdir -p "${RESTART_MARK%/*}" 2>/dev/null && : > "$RESTART_MARK"
+    stop "$@"
+    trap - TERM
+    _steer_restart=
+    start "$@"
 }
 
 # Снят ли автозапуск: ссылка в /etc/rc.d — это и есть запись человеческого решения «не

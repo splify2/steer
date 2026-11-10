@@ -3,12 +3,20 @@
  *   routes 4|6 TABLE   — строк в дампе таблицы (-1 — не прочитано);
  *   main6              — сколько маршрутов IPv6 main отдал rtnl_main6_routes;
  *   addrs6             — сколько адресов IPv6 отдал rtnl_addrs6;
- *   flush TABLE        — код rtnl_table_flush. */
+ *   flush TABLE        — код rtnl_table_flush;
+ *   defdevs            — устройства маршрутов по умолчанию main (rtnl_default_devs), через пробел
+ *                        по порядку дампа; «-» — дамп не прочитан. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "rtnl.h"
+
+static void dev_add(const char *dev, void *ctx) {
+    char *line = ctx;
+    size_t n = strlen(line);
+    snprintf(line + n, 512 - n, "%s%s", n ? " " : "", dev);
+}
 
 static long lines(const char *s) {
     long n = 0;
@@ -35,8 +43,12 @@ int main(int argc, char **argv) {
         free(v);
     } else if (argc >= 3 && !strcmp(argv[1], "flush")) {
         printf("%d\n", rtnl_table_flush(atoi(argv[2])));
+    } else if (argc >= 2 && !strcmp(argv[1], "defdevs")) {
+        char line[512] = "";
+        if (rtnl_default_devs(dev_add, line) != 0) printf("-\n");
+        else printf("%s\n", line);
     } else {
-        fprintf(stderr, "rtnl-tool: rules|routes|main6|addrs6|flush\n");
+        fprintf(stderr, "rtnl-tool: rules|routes|main6|addrs6|flush|defdevs\n");
         return 2;
     }
     return 0;

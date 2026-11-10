@@ -555,6 +555,10 @@ exit 0
 EOF
     {
         printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n'
+        # Обновление — не удаление: менеджер пакетов, который зовёт prerm и при обновлении (dpkg-образный
+        # «prerm upgrade»), не должен снимать правила — службу перезапустит postinst нового пакета, без
+        # окна с трафиком мимо правил (свой restart init-скрипта службы).
+        printf '[ "${1:-}" = upgrade ] && exit 0\n'
         printf '/etc/init.d/steer stop 2>/dev/null\n/etc/init.d/steer disable 2>/dev/null\nexit 0\n'
     } > build/scripts/steer.prerm
     # Модуль: при коннекторе — перезапуск запущенного sing-box; иначе — службы steer, только если

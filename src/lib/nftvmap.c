@@ -186,7 +186,7 @@ int nfv_map_read(uint8_t family, const char *table, const char *map, char (*chai
                 done = 1;
                 break;
             }
-            if (h->nlmsg_type == NLMSG_DONE) { rc = 0; done = 1; break; }
+            if (h->nlmsg_type == NLMSG_DONE) { rc = nl_done_errno(h); done = 1; break; }
             nfv_rd_msg(h, &rd);
         }
     }
@@ -369,7 +369,7 @@ int nfv_ranges6_read(uint8_t family, const char *table, const char *set, struct 
                 done = 1;
                 break;
             }
-            if (h->nlmsg_type == NLMSG_DONE) { rc = 0; done = 1; break; }
+            if (h->nlmsg_type == NLMSG_DONE) { rc = nl_done_errno(h); done = 1; break; }
             size_t off = NLMSG_ALIGN(sizeof(struct nfgenmsg));
             if (h->nlmsg_len < NLMSG_HDRLEN + off) continue;
             const struct nlattr *tb[NFTA_SET_ELEM_LIST_MAX + 1];

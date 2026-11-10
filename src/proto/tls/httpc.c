@@ -35,6 +35,7 @@
 #include <time.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 
@@ -840,8 +841,12 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
         if (b.mode == B_CHUNKED) b.ck = CK_SIZE;
 
         if (q->dest_path) {
-            c.sink_fd = open(q->dest_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            /* 0600, и существующему файлу тоже: сюда пишется тело подписки — ссылки узлов с UUID и
+             * паролями. Прежние 0644 отдавали их любому пользователю машины; O_TRUNC прав старого
+             * файла не меняет, поэтому fchmod. */
+            c.sink_fd = open(q->dest_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
             if (c.sink_fd < 0) { WHY("файл %s: %s", q->dest_path, strerror(errno)); rc = HTTPC_ESINK; conn_close(&k); reply_free(&y); goto out; }
+            (void)fchmod(c.sink_fd, 0600);
         }
         /* Байты тела, что пришли вместе с заголовками. */
         rc = body_push(&c, &b, (const unsigned char *)y.raw + y.hdr_len, y.raw_n - y.hdr_len);

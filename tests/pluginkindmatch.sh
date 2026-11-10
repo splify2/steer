@@ -309,6 +309,18 @@ for f in "$ETC/cache/prepared/"*.json; do
 done
 [ -f "$key" ] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "FAIL подготовленная спека не записана"; }
 prep="$(cat "$key" 2>/dev/null)"
+# В подготовленной спеке и ответах хуков — ключи и пароли узлов: файлы 0600, каталоги кэша 0700.
+perm() { ls -ld "$1" 2>/dev/null | cut -c1-10; }
+check "подготовленная спека — только владельцу (0600)" "-rw-------" "$(perm "$key")"
+check "  отчёт подготовки — тоже" "-rw-------" "$(perm "${key%.json}.report.json")"
+check "  каталог prepared — 0700" "drwx------" "$(perm "$ETC/cache/prepared")"
+check "  ответы хуков в кэше — 0600, каталог плагина — 0700" "drwx------ 0" \
+    "$(perm "$ETC/cache/xpplug") $(find "$ETC/cache/xpplug" -type f -perm /077 | grep -c .)"
+# Оставшееся от прежних выпусков (0644 и 0755) чинится при первом же обращении к подготовке.
+chmod 0755 "$ETC/cache/prepared" "$ETC/cache/xpplug"; chmod 0644 "$key" "$ETC/cache/xpplug"/*
+outs xp >/dev/null 2>&1
+check "права прежних файлов кэша исправлены при запуске" "drwx------ -rw------- 0" \
+    "$(perm "$ETC/cache/prepared") $(perm "$key") $(find "$ETC/cache" -mindepth 2 -type f -perm /077 | grep -c .)"
 has "подготовленная спека: self под прежним именем" "$prep" '"x1":{"kind":"group"'
 has "  члены с owner = {плагин, выход}" "$prep" '"x1.1":{"owner":{"plugin":"xpplug","out":"x1"}'
 has "  правило хука с owner = {плагин}" "$prep" '{"owner":{"plugin":"xpplug"},"name":"added-by-hook"'

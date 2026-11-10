@@ -678,6 +678,20 @@ static int chan_store(struct spec *s, struct v1_ctx *x, const struct v1_chan *c,
     l->domains_n = c->domains_n;
     l->srs_files = c->srs_files;
     l->srs_n = c->srs_n;
+    /* Пути списков — той же проверкой, что у спеки v2 (spec_path_ok): они идут резолверу полями
+     * таблицы каналов. */
+    {
+        const char **const fs[3] = { l->prefixes_files, l->domains_files, l->srs_files };
+        const size_t fn[3] = { l->prefixes_n, l->domains_n, l->srs_n };
+        for (int k = 0; k < 3; k++)
+            for (size_t f = 0; f < fn[k]; f++)
+                if (!spec_path_ok(fs[k][f])) {
+                    static char msg[400];
+                    snprintf(msg, sizeof(msg), "channels.%.40s: путь списка «%.200s» — в нём «|», управляющий "
+                             "символ или начало «dns:»; переименуйте файл", c->name, fs[k][f]);
+                    return err_set(e, "%s", msg);
+                }
+    }
     l->l4 = c->l4;
     /* `any` рядом со списками ничего не значит (так было всегда: группа «весь трафик» — только
      * у канала без списков), поэтому в модель он приходит признаком списка, а не канала. */
@@ -1107,6 +1121,28 @@ static int v1_parse(const char *text, struct spec *s, struct err *e) {
         if (from_is_local(s->lan.from[k]))
             return err_set(e, "from_default: «%s» — сам телефон, а не клиенты; укажите его в from канала",
                 s->lan.from[k]);
+    /* Записи «кому» уходят в текст набора правил как есть (`ip saddr { … }`, заворот DNS), и у
+     * спеки v1 их никто не проверял: строка «1.1.1.1 } accept; …» дописывала в набор свои правила,
+     * а опечатка отвергала его целиком. Та же проверка, что у спеки v2 (addr_check, mac_ok):
+     * адрес, подсеть или диапазон IPv4 и IPv6, у канала ещё MAC. Пустая строка — прежнее
+     * «записи нет» (выбрасывается ниже). */
+    for (size_t k = 0; k < s->lan.from_n; k++)
+        if (s->lan.from[k][0] && !spec_line_family(s->lan.from[k])) {
+            static char msg[300];
+            snprintf(msg, sizeof(msg), "from_default: «%.60s» — не адрес IPv4 или IPv6, не подсеть и не диапазон",
+                     s->lan.from[k]);
+            return err_set(e, "%s", msg);
+        }
+    for (size_t i = 0; i < s->client_n; i++) {
+        const struct spec_client *cl = &s->client[i];
+        for (size_t k = 0; k < cl->from_n; k++) {
+            const char *v = cl->from[k];
+            if (!v[0] || from_is_local(v) || spec_is_mac(v) || spec_line_family(v)) continue;
+            static char msg[300];
+            snprintf(msg, sizeof(msg), "from: «%.60s» — не адрес IPv4 или IPv6, не подсеть, не диапазон и не MAC", v);
+            return err_set(e, "%s", msg);
+        }
+    }
     for (size_t i = 0; i < s->rule_n; i++) {
         struct spec_rule *c = &s->rule[i];
         /* Свой клиент правила (его `from` у канала v1) — изменяемый: пустые строки из него

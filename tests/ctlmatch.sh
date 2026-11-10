@@ -266,6 +266,43 @@ if [ $ROOT = 1 ] && command -v setpriv >/dev/null 2>&1; then
     check "  и отказ записан в журнал сервера" "1" "$(grep -c 'steer\[warn\] ctl: отказ: uid 65534' "$tmp/serve.err")"
     r="$(setpriv --reuid 65533 --regid 65533 --clear-groups "$ENGINE" ctl --socket "$tmp/s.sock" version)"
     check "uid из --allow-uid — пускается" "0" "$(printf '%s' "$r" | j code)"
+    # Чужой процесс стучится в цикле, и каждое соединение несёт мегабайт: демон не читает его тело
+    # (раньше дочитывал до 32 МиБ на отказ), журнал получает несколько строк и счёт, а не строку на
+    # каждого, и свой запрос посреди этого отвечается.
+    cat > "$tmp/flood.py" <<'PY'
+import socket, sys
+blob = b'x' * (1 << 20)
+got = 0
+for i in range(400):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(sys.argv[1])
+        s.settimeout(2)
+        try: s.sendall(blob)
+        except OSError: pass
+        try:
+            if b'denied' in s.recv(4096): got += 1
+        except OSError: pass
+    except OSError: pass
+    s.close()
+print(got)
+PY
+    chmod 644 "$tmp/flood.py"
+    d0="$(grep -c 'ctl: отказ: uid 65534' "$tmp/serve.err")"
+    t0="$(date +%s)"
+    setpriv --reuid 65534 --regid 65534 --clear-groups python3 "$tmp/flood.py" "$tmp/s.sock" > "$tmp/flood.out" 2>/dev/null &
+    FL=$!
+    sleep 0.3
+    check "поток отказов: свой запрос посреди него отвечается" "0" "$(ctl version | j code)"
+    wait $FL
+    t1="$(date +%s)"
+    check "  400 чужих соединений по мегабайту разобраны быстро (≤ 10 с)" "yes" "$([ $((t1 - t0)) -le 10 ] && echo yes || echo "no: $((t1 - t0)) с")"
+    check "  в журнале не строка на каждого (5 за минуту и одна о пределе)" "yes" \
+        "$([ $(($(grep -c 'ctl: отказ: uid 65534' "$tmp/serve.err") - d0)) -le 6 ] && echo yes || echo no)"
+    check "  и сказано, что дальше счёт молча" "1" "$(grep -c 'отказов больше 5 за минуту, дальше считаю молча' "$tmp/serve.err")"
+    check "  чужой процесс ответ получал (denied, а не сброс)" "yes" \
+        "$([ "$(cat "$tmp/flood.out" 2>/dev/null || echo 0)" -gt 0 ] && echo yes || echo no)"
+    check "  после потока сервер отвечает" "0" "$(ctl version | j code)"
 else
     echo "ctlmatch: не root или нет setpriv — проверки uid пропущены"
 fi

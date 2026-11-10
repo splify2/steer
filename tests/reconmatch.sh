@@ -83,8 +83,10 @@ wait_for() {
 
 for t in nft ip; do
     real="$(command -v $t)"
-    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/%s.log"\nexec "%s" "$@"\n' "$tmp" "$t" "$real" \
-        > "$tmp/bin/$t"
+    # Файл reject.<инструмент> — отказ `-f` по заказу стенда (отказ ядра, раздел 7): адресную строку,
+    # которую nft отверг бы, разбор списков теперь пропускает сам.
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/%s.log"\n[ "$1" = -f ] && [ -e "%s/reject.%s" ] && { echo "Error: стенд: отвергнуто" >&2; exit 1; }\nexec "%s" "$@"\n' \
+        "$tmp" "$t" "$tmp" "$t" "$real" > "$tmp/bin/$t"
     chmod +x "$tmp/bin/$t"
 done
 PATH="$tmp/bin:$PATH"
@@ -450,16 +452,18 @@ check "  резолвер — тот же процесс, таблицу пол�
 
 # ---- 7. отказ ядра -------------------------------------------------------------------------------
 H5="$(handle)"
-printf '999.1.1.1\n' > "$tmp/p3.lst"
+printf '10.3.0.0/16\n' > "$tmp/p3.lst"
 before="$(cksum < "$tmp/spec.json")"
 fresh
+: > "$tmp/reject.nft"
 r="$(ctl apply < "$tmp/S6.json")"
+rm -f "$tmp/reject.nft"
 check "отказ ядра: не применено, прежняя спека возвращена" "false false true" \
     "$(printf '%s' "$r" | j saved | tr -d '\n') $(printf '%s' "$r" | j applied | tr -d '\n') $(printf '%s' "$r" | j rolled_back)"
 check "  spec.json — прежний" "$before" "$(cksum < "$tmp/spec.json")"
 check "  прежняя таблица в ядре на месте" "$H5 1" \
     "$(handle) $("$real_nft" list table inet steer | grep -c '10\.2\.0\.0/16')"
-kept="$(printf '%s' "$r" | j stderr | sed -n 's/.*(kept: \(.*\))$/\1/p')"
+kept="$(printf '%s' "$r" | j stderr | sed -n 's/.*(файл набора: \(.*\))$/\1/p')"
 [ -n "$kept" ] && rm -f "$kept"
 fresh
 r="$(ctl apply < "$tmp/S5.json")"
