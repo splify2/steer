@@ -225,6 +225,10 @@ struct fakeip_entry {
     chm_t sets6;
     time_t route6_asserted;
     time_t refreshed6;
+    /* Клиент, по вопросу которого адрес выдан (fakeip_client_key, proxy.c), — для предела выдачи
+     * на клиента (FAKEIP_PER_CLIENT, fakeip.c); 0 — не знаем (запись из файла, команда --fakeip).
+     * На диск не пишется: после перезапуска счёт начинается заново. */
+    uint64_t owner;
 };
 
 struct fakeip_table {
@@ -396,6 +400,15 @@ size_t build_rewritten_response6(const uint8_t *orig, size_t qend,
 /* fakeip.c */
 long fakeip_find(const char *domain);
 int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr);
+/* То же с клиентом, по вопросу которого выдаётся адрес (owner, 0 — не считать). -1 — пул
+ * исчерпан, -2 — клиент исчерпал свой предел (fakeip_per_client): вызывающий обязан отказать
+ * (SERVFAIL), а не отдать настоящий адрес имени под правилом. */
+int fakeip_lookup_or_alloc_for(const char *domain_in, uint64_t owner, uint32_t *out_addr);
+unsigned fakeip_per_client(void);
+/* proxy.c: ключ клиента для пределов — адрес IPv4 или префикс /64 IPv6; 0 — петля, не считать. */
+uint64_t fakeip_client_key(const struct sockaddr_storage *a);
+/* Сколько записей сейчас числится за клиентом (стенды и explain). */
+unsigned fakeip_owner_count(uint64_t owner);
 void fakeip_state_load(const char *path);
 void fakeip_state_rewrite(void);
 /* Файл состояния — сейчас, если в памяти есть незаписанное (g_fakeip_dirty): просьба «flush»

@@ -549,6 +549,85 @@ int main(void) {
     }
 
     {
+        /* D5: ПРЕДЕЛ ВЫДАЧИ FAKE-IP НА КЛИЕНТА. Один клиент, спрашивающий случайные имена под
+         * правилом, прежде занимал весь пул, и новые имена ВСЕХ клиентов получали настоящий адрес.
+         * Теперь за клиентом не больше fakeip_per_client() адресов; сверх — -2 (резолвер отвечает
+         * SERVFAIL ему одному), а другой клиент получает адрес как обычно. */
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 1;
+        g_fakeip_state_path = NULL;
+        struct sockaddr_storage ca, cb, c6a, c6b;
+        memset(&ca, 0, sizeof(ca)); memset(&cb, 0, sizeof(cb));
+        memset(&c6a, 0, sizeof(c6a)); memset(&c6b, 0, sizeof(c6b));
+        ((struct sockaddr_in *)&ca)->sin_family = AF_INET;
+        ((struct sockaddr_in *)&ca)->sin_addr.s_addr = htonl(0xC0A80166u);   /* 192.168.1.102 */
+        ((struct sockaddr_in *)&cb)->sin_family = AF_INET;
+        ((struct sockaddr_in *)&cb)->sin_addr.s_addr = htonl(0xC0A80167u);
+        ((struct sockaddr_in6 *)&c6a)->sin6_family = AF_INET6;
+        inet_pton(AF_INET6, "2001:db8:1:2::aaaa", &((struct sockaddr_in6 *)&c6a)->sin6_addr);
+        ((struct sockaddr_in6 *)&c6b)->sin6_family = AF_INET6;
+        inet_pton(AF_INET6, "2001:db8:1:2:1234:5678:9abc:def0", &((struct sockaddr_in6 *)&c6b)->sin6_addr);
+        uint64_t ka = fakeip_client_key(&ca), kb = fakeip_client_key(&cb);
+        check("ключ клиента: разные адреса IPv4 — разные клиенты", 1, ka && kb && ka != kb);
+        check("ключ клиента: адреса одной /64 — один клиент", 1,
+              fakeip_client_key(&c6a) == fakeip_client_key(&c6b));
+        struct sockaddr_storage lo4, lo6;
+        memset(&lo4, 0, sizeof(lo4)); memset(&lo6, 0, sizeof(lo6));
+        ((struct sockaddr_in *)&lo4)->sin_family = AF_INET;
+        ((struct sockaddr_in *)&lo4)->sin_addr.s_addr = htonl(0x7F000001u);
+        ((struct sockaddr_in6 *)&lo6)->sin6_family = AF_INET6;
+        ((struct sockaddr_in6 *)&lo6)->sin6_addr = in6addr_loopback;
+        check("ключ клиента: петля не считается (пересыльщики всей сети)", 1,
+              fakeip_client_key(&lo4) == 0 && fakeip_client_key(&lo6) == 0);
+        unsigned lim = fakeip_per_client();
+        check("предел на клиента — восьмая часть пула", (int)(FAKEIP_POOL_SIZE / 8), (int)lim);
+        int okall = 1;
+        uint32_t addr = 0;
+        char nm[64];
+        for (unsigned i = 0; i < lim; i++) {
+            snprintf(nm, sizeof(nm), "r%u.flood.test", i);
+            if (fakeip_lookup_or_alloc_for(nm, ka, &addr) != 0) { okall = 0; break; }
+        }
+        check("D5: клиент получает свои адреса до предела", 1, okall);
+        check("D5: счёт клиента — ровно предел", (int)lim, (int)fakeip_owner_count(ka));
+        check("D5: другой клиент получает адрес", 0,
+              fakeip_lookup_or_alloc_for("victim.flood.test", kb, &addr));
+        check("D5: и адрес — из пула", 1, addr >= FAKEIP_POOL_BASE && addr < FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE);
+        /* У предела клиент сначала возвращает свои простоявшие имена (живых соединений нет —
+         * заглушка conntrack с пустым ответом) и снова получает адрес. */
+        int (*live_was)(uint8_t *) = g_fakeip_live;
+        g_fakeip_live = pool_live_stub;
+        g_pool_live_n = 0;
+        for (size_t i = 0; i < g_fakeip.n; i++)
+            if (g_fakeip.entries[i].owner == ka) g_fakeip.entries[i].last_used -= g_fakeip_idle + 1;
+        check("D5: у предела простоявшие имена клиента возвращаются, адрес выдан", 0,
+              fakeip_lookup_or_alloc_for("again.flood.test", ka, &addr));
+        check("D5: и счёт клиента — одна запись", 1, (int)fakeip_owner_count(ka));
+        check("D5: чужое имя возврат не тронул", 1, fakeip_find("victim.flood.test") >= 0);
+        okall = 1;
+        for (unsigned i = 1; i < lim; i++) {
+            snprintf(nm, sizeof(nm), "s%u.flood.test", i);
+            if (fakeip_lookup_or_alloc_for(nm, ka, &addr) != 0) { okall = 0; break; }
+        }
+        check("D5: снова до предела", 1, okall && fakeip_owner_count(ka) == lim);
+        check("D5: сверх предела (имена свежие) — отказ (-2), а не адрес", -2,
+              fakeip_lookup_or_alloc_for("over.flood.test", ka, &addr));
+        check("D5: уже выданное имя клиенту по-прежнему отвечает", 0,
+              fakeip_lookup_or_alloc_for("s7.flood.test", ka, &addr));
+        check("D5: другой клиент и тогда получает адрес", 0,
+              fakeip_lookup_or_alloc_for("victim2.flood.test", kb, &addr));
+        g_fakeip_live = live_was;
+        for (size_t i = 0; i < g_fakeip.n; i++) free(g_fakeip.entries[i].domain);
+        free(g_fakeip.entries);
+        sindex_free(&g_fakeip_idx);
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_pool_reset();
+        g_fakeip_next = 1;
+    }
+
+    {
         /* Долгий путь к файлу состояния fake-IP. Путь задаётся снаружи (--state-file,
          * --state-dir), то есть его длину выбирает не движок, а буфер под имя временного
          * файла был размером в имя ХОСТА (MAX_HOSTNAME, 256). «%s.tmp» в него молча не

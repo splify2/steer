@@ -107,6 +107,7 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
     t->entries[t->n].sets6 = 0;
     t->entries[t->n].route6_asserted = 0;
     t->entries[t->n].refreshed6 = 0;
+    t->entries[t->n].owner = 0;
     t->n++;
     if (t == &g_fakeip &&
         sindex_put(&g_fakeip_idx, t, fakeip_key, t->entries[t->n - 1].domain,
@@ -451,11 +452,123 @@ void fakeip_state_flush_async(void) {
     g_fakeip_last_rewrite = time(NULL);
 }
 
+/* ПРЕДЕЛ ВЫДАЧИ НА КЛИЕНТА (аудит 2.1.0, D5).
+ *
+ * Пул один на всех (131070 адресов), а адрес возвращается только имени, которое молчит дольше
+ * g_fakeip_idle (30 мин). Один клиент сети, спрашивающий случайные имена под правилом с
+ * подстановочной зоной (<случайное>.blogspot.com, CDN), за минуты занимал весь пул — и прежде
+ * каждое новое имя под правилом у ВСЕХ клиентов получало настоящий адрес, то есть шло мимо
+ * выхода. Теперь за клиентом числятся адреса, выданные по его вопросам, и их не больше
+ * FAKEIP_PER_CLIENT. Восьмая часть пула (16384): чтобы занять пул целиком, нужно восемь
+ * клиентов, а одно устройство столько разных имён под правилами за полчаса не спрашивает —
+ * браузер с десятками вкладок даёт сотни, в худшем случае тысячи. Дойдя до предела, клиент
+ * сначала возвращает адреса своих же простоявших имён (fakeip_reclaim — тот же возврат, что у
+ * края пула, с тем же дросселем), и только если вернуть нечего, новое имя ему не выдаётся:
+ * SERVFAIL этому клиенту (proxy.c), остальным — как прежде. Имя, выданное по вопросу клиента,
+ * числится за ним, пока не вернётся в пул, даже если его спрашивают и другие: иначе второй
+ * адрес того же нападающего «разделял» бы его имена и снимал с него счёт без конца.
+ *
+ * Клиент — адрес IPv4 или префикс /64 адреса IPv6 (fakeip_client_key, proxy.c): устройство
+ * со SLAAC владеет всей /64 и меняет адреса в ней сколько угодно. Петля предела не имеет: за
+ * пересыльщиком на самом роутере (коннектор, AdGuard Home) — вся сеть. STEER_DNSD_FAKEIP_PER_CLIENT
+ * — то же число для стендов. */
+#define FAKEIP_PER_CLIENT (FAKEIP_POOL_SIZE / 8)
+
+unsigned fakeip_per_client(void) {
+    static unsigned v;
+    if (!v) {
+        const char *e = getenv("STEER_DNSD_FAKEIP_PER_CLIENT");
+        v = e && atoi(e) > 0 ? (unsigned)atoi(e) : FAKEIP_PER_CLIENT;
+    }
+    return v;
+}
+
+/* Счёт записей по клиентам: открытая адресация по ключу (0 — пусто), удаление сдвигом назад
+ * (без надгробий). Клиентов — сколько адресов спрашивало имена под правилами; запись счёта
+ * уходит, как только у клиента не осталось адресов. */
+struct fowner { uint64_t key; uint32_t n; };
+static struct fowner *g_own;
+static size_t g_own_cap, g_own_n;            /* cap — степень двойки */
+
+static size_t own_slot(uint64_t key) {
+    uint64_t h = key * 0x9E3779B97F4A7C15ull;
+    return (size_t)(h >> 32) & (g_own_cap - 1);
+}
+
+static struct fowner *own_find(uint64_t key) {
+    if (!g_own_cap) return NULL;
+    for (size_t i = own_slot(key);; i = (i + 1) & (g_own_cap - 1)) {
+        if (!g_own[i].key) return NULL;
+        if (g_own[i].key == key) return &g_own[i];
+    }
+}
+
+static int own_grow(void) {
+    size_t nc = g_own_cap ? g_own_cap * 2 : 64;
+    struct fowner *nt = calloc(nc, sizeof(*nt));
+    if (!nt) return -1;
+    struct fowner *old = g_own;
+    size_t oc = g_own_cap;
+    g_own = nt;
+    g_own_cap = nc;
+    for (size_t i = 0; i < oc; i++) {
+        if (!old[i].key) continue;
+        size_t j = own_slot(old[i].key);
+        while (g_own[j].key) j = (j + 1) & (g_own_cap - 1);
+        g_own[j] = old[i];
+    }
+    free(old);
+    return 0;
+}
+
+unsigned fakeip_owner_count(uint64_t owner) {
+    const struct fowner *o = owner ? own_find(owner) : NULL;
+    return o ? o->n : 0;
+}
+
+static int own_add(uint64_t key) {
+    struct fowner *o = own_find(key);
+    if (o) { o->n++; return 0; }
+    if ((g_own_n + 1) * 2 > g_own_cap && own_grow() != 0) return -1;
+    size_t i = own_slot(key);
+    while (g_own[i].key) i = (i + 1) & (g_own_cap - 1);
+    g_own[i].key = key;
+    g_own[i].n = 1;
+    g_own_n++;
+    return 0;
+}
+
+/* Запись ушла из таблицы — счёт её клиента уменьшается. */
+static void own_release(const struct fakeip_entry *e) {
+    struct fowner *o = e->owner ? own_find(e->owner) : NULL;
+    if (!o) return;
+    if (--o->n) return;
+    /* Последняя запись клиента: место счёта освобождается сдвигом назад — следующие за ним в
+     * той же цепочке встают ближе к своему месту, и поиск не обрывается на дыре. */
+    size_t i = (size_t)(o - g_own);
+    g_own[i].key = 0;
+    g_own_n--;
+    for (size_t j = (i + 1) & (g_own_cap - 1); g_own[j].key; j = (j + 1) & (g_own_cap - 1)) {
+        size_t h = own_slot(g_own[j].key);
+        /* Запись j может встать в дыру i, если её место h не лежит в (i, j] по кругу. */
+        if ((j > i && (h <= i || h > j)) || (j < i && h <= i && h > j)) {
+            g_own[i] = g_own[j];
+            g_own[j].key = 0;
+            i = j;
+        }
+    }
+}
+
 /* Looks up domain's existing fake IP, or allocates the next free one and
  * persists it. Returns 0 and fills *out_addr (host order) on success; -1 if
- * the pool is exhausted (caller falls back to relaying the real answer
- * unchanged — fail open, never block DNS over an exhausted pool). */
+ * the pool is exhausted. Прежде исчерпание означало настоящий адрес клиенту — мимо выхода;
+ * теперь вызывающий резолвер отказывает (SERVFAIL, proxy.c): имя под правилом не уходит мимо
+ * канала ни при каком исходе выдачи. */
 int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr) {
+    return fakeip_lookup_or_alloc_for(domain_in, 0, out_addr);
+}
+
+int fakeip_lookup_or_alloc_for(const char *domain_in, uint64_t owner, uint32_t *out_addr) {
     /* Ключ таблицы — строчные буквы, и приводит к ним сама таблица, а не каждый вызывающий:
      * демон приводил, команда `--fakeip` нет, и X.TEST получала второй адрес рядом с x.test. */
     char domain[MAX_HOSTNAME];
@@ -468,6 +581,18 @@ int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr) {
         *out_addr = g_fakeip.entries[at].addr;
         return 0;
     }
+    if (owner && fakeip_owner_count(owner) >= fakeip_per_client()) {
+        /* Свой предел: сначала вернуть простоявшее (возврат общий — адреса молчащих имён всех
+         * клиентов, — но он и так случился бы у края пула), и только потом отказ. Дроссель свой,
+         * а не fakeip_reclaim_try: тот снимает его, когда свободные адреса есть, а до края пула
+         * они есть всегда — и каждый вопрос клиента у предела обходил бы таблицу и conntrack. */
+        static time_t own_reclaim_at;
+        if (!own_reclaim_at || now - own_reclaim_at >= WARN_EVERY_SEC) {
+            own_reclaim_at = now;
+            fakeip_reclaim(now);
+        }
+        if (fakeip_owner_count(owner) >= fakeip_per_client()) return -2;
+    }
     uint32_t addr;
     int from_free = 0;
     if (g_fakeip_next < FAKEIP_POOL_SIZE - 1) {    /* последний — широковещательный пула */
@@ -478,21 +603,23 @@ int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr) {
          * отпустить прежний адрес. */
         if (g_free_i >= g_free_n) fakeip_reclaim_try(now);
         if (g_free_i >= g_free_n) {
-            /* Пул кончился по-настоящему: домен уйдёт клиенту реальным адресом, то есть МИМО
-             * канала, в который его положил человек. Молчать об этом нельзя — снаружи это
-             * «правило перестало работать», и связать это с пулом нечем. */
+            /* Пул кончился по-настоящему: новое имя под правилом не получает ни поддельного
+             * адреса, ни настоящего (резолвер отвечает SERVFAIL). Молчать об этом нельзя —
+             * снаружи это «правило перестало открывать новые имена», и связать это с пулом
+             * нечем. */
             static time_t said_pool;
             if (warn_due(&said_pool, now))
                 fprintf(stderr, "steer dnsd: пул fake-IP исчерпан (%u адресов, занято %zu: все "
                                 "спрошены в последние %d с или держат соединения): новые "
-                                "домены идут мимо каналов\n",
-                        (unsigned)FAKEIP_POOL_SIZE, g_fakeip.n, g_fakeip_idle);
+                                "имена под правилами получают SERVFAIL\n",
+                        (unsigned)FAKEIP_POOL_SIZE - 2, g_fakeip.n, g_fakeip_idle);
             return -1;
         }
         addr = g_free[g_free_i];
         from_free = 1;
     }
     if (fakeip_table_add(&g_fakeip, domain, addr) != 0) return -1;
+    if (owner && own_add(owner) == 0) g_fakeip.entries[g_fakeip.n - 1].owner = owner;
     if (from_free) g_free_i++;
     if (g_fakeip_state_path) fakeip_state_append(g_fakeip_state_path, domain, addr);
     *out_addr = addr;
@@ -949,6 +1076,7 @@ void fakeip_entry_blocked(const char *domain, int v6) {
     /* Обе половины пусты. Половина другого семейства подмены не имела, но её набор мог нести адрес
      * (переутверждение маршрута) — снять и его, прежде чем запись уйдёт. */
     fakeip_entry_unroute(e);
+    own_release(e);
     free(e->domain);
     g_fakeip.n--;
     if ((size_t)at != g_fakeip.n) g_fakeip.entries[at] = g_fakeip.entries[g_fakeip.n];
@@ -977,6 +1105,7 @@ size_t fakeip_reclaim(time_t now) {
         if (in_pool && now - e->last_used >= g_fakeip_idle &&
             !(known && (live[i >> 3] & (1u << (i & 7))))) {
             fakeip_entry_unroute(e);
+            own_release(e);
             free(e->domain);
             continue;
         }

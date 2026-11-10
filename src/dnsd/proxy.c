@@ -592,6 +592,39 @@ static int from_loopback(const struct sockaddr_storage *a) {
     return 0;
 }
 
+/* КЛИЕНТ ДЛЯ ПРЕДЕЛОВ (выдача fake-IP — fakeip.c, FAKEIP_PER_CLIENT; места таблицы ожиданий —
+ * pending_alloc): адрес IPv4 (и v4-mapped), у IPv6 — префикс /64. Устройство со SLAAC владеет всей
+ * своей /64 и меняет адреса временных расширений (RFC 8981) сколько угодно: ключ по полному адресу
+ * IPv6 предела бы не давал. Ключ IPv4 — 0xFFFF:адрес в верхних битах (префикса /64 «0:0:ffff:…» у
+ * настоящего клиента IPv6 не бывает).
+ *
+ * Петля (127.0.0.0/8, ::1) — 0, «не считать»: с петли спрашивают пересыльщики самого устройства,
+ * за каждым из которых — вся сеть (коннектор sing-box для podkop и forkop, AdGuard Home или
+ * dnsmasq перед резолвером), и предел одного клиента стал бы пределом всей сети. Процессы
+ * роутера — не чужие. */
+uint64_t fakeip_client_key(const struct sockaddr_storage *a) {
+    uint32_t v4;
+    if (a->ss_family == AF_INET) {
+        v4 = ntohl(((const struct sockaddr_in *)a)->sin_addr.s_addr);
+    } else if (a->ss_family == AF_INET6) {
+        const struct in6_addr *v6 = &((const struct sockaddr_in6 *)a)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(v6)) {
+            memcpy(&v4, &v6->s6_addr[12], 4);
+            v4 = ntohl(v4);
+        } else if (IN6_IS_ADDR_LOOPBACK(v6)) {
+            return 0;
+        } else {
+            uint64_t k = 0;
+            for (int i = 0; i < 8; i++) k = (k << 8) | v6->s6_addr[i];
+            return k ? k : 1;
+        }
+    } else {
+        return 1;
+    }
+    if ((v4 >> 24) == 127) return 0;
+    return (0xFFFFull << 32) | v4;
+}
+
 static chm_t match_for(const char *qname, uint16_t qtype) {
     chm_t m = dch_match_mask(qname);
     if (qtype == DNS_TYPE_A && m) {
@@ -1056,6 +1089,34 @@ static int handle_upstream_response(int ufd) {
     return upstream_answer(p, buf, n);
 }
 
+/* Поддельный адрес имени под правилом не выдан (пул исчерпан или клиент дошёл до своего предела,
+ * fakeip_lookup_or_alloc_for): клиенту SERVFAIL, а не настоящий адрес — настоящий увёл бы имя мимо
+ * выхода, который выбрал человек (аудит 2.1.0, D5: прежде так и было). SERVFAIL резолверы клиентов
+ * держат секунды, и имя спросят снова, когда адрес найдётся. rc -2 — предел клиента: строка журнала
+ * называет его адрес и число, не чаще раза в WARN_EVERY_SEC. */
+static void fakeip_refuse(struct pending *p, const uint8_t *buf, size_t qend, int rc) {
+    if (rc == -2) {
+        static time_t said;
+        if (warn_due(&said, time(NULL))) {
+            char who[INET6_ADDRSTRLEN] = "?";
+            if (p->client.ss_family == AF_INET6)
+                inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)&p->client)->sin6_addr, who, sizeof(who));
+            else if (p->client.ss_family == AF_INET)
+                inet_ntop(AF_INET, &((const struct sockaddr_in *)&p->client)->sin_addr, who, sizeof(who));
+            fprintf(stderr, "steer dnsd: клиент %s занял свой предел fake-IP (%u адресов, все "
+                            "спрошены в последние %d с или держат соединения): его новые имена "
+                            "под правилами получают SERVFAIL\n", who, fakeip_per_client(),
+                    g_fakeip_idle);
+        }
+    }
+    if (p->quiet) return;
+    uint8_t out[512];
+    size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
+    if (!len) return;
+    out[3] = (uint8_t)((out[3] & 0xf0) | 0x02);              /* RCODE 2 — SERVFAIL */
+    reply_client(out, len, &p->client, p->client_len, &p->local, p->have_local);
+}
+
 /* Ответ сверху, уже сверенный со своим ожиданием, — один путь для UDP и TCP: доменные каналы,
  * fakeip, наборы, ответ клиенту. Кому отвечать, решает g_tcp_cur (см. reply_client). */
 static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
@@ -1235,7 +1296,14 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
             }
             return 1;
         }
-        if (fakeip_lookup_or_alloc(qname, &fake_addr) == 0) {
+        int arc = fakeip_lookup_or_alloc_for(qname, fakeip_client_key(&p->client), &fake_addr);
+        if (arc == -2) {
+            /* Предел клиента: SERVFAIL, как у A, — пустой AAAA увёл бы его на A, которое
+             * откажут тем же. Исчерпанный пул (-1) — пустой ответ ниже, как прежде. */
+            fakeip_refuse(p, buf, qend, arc);
+            return 1;
+        }
+        if (arc == 0) {
             /* «Установленное» — то, что знаем, а не только то, что подтвердило ядро: после
              * резолвера, поднятого до набора правил, в карте лежит засев из файла (real_saved,
              * struct fakeip_entry), и смена адреса обязана идти одной транзакцией «снять —
@@ -1297,7 +1365,12 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
 
     if (qtype == DNS_TYPE_A && nips > 0) {
         uint32_t fake_addr;
-        if (fakeip_lookup_or_alloc(qname, &fake_addr) == 0) {
+        int arc = fakeip_lookup_or_alloc_for(qname, fakeip_client_key(&p->client), &fake_addr);
+        if (arc != 0) {
+            fakeip_refuse(p, buf, qend, arc);
+            return 1;
+        }
+        {
             /* Какой адрес класть в DNAT. Порядок RR в ответе — не сигнал: CDN
              * тасуют записи в каждом ответе, и «первый A сменился» означало
              * delete+add транзакцию в ядре и перезапись state-файла на каждый
@@ -1398,9 +1471,9 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
     }
 
     /* Fallback: matched but nothing to substitute (qtype outside A/AAAA/HTTPS/SVCB
-     * — MX, TXT, PTR and the like — zero real A answers yet, or the fake-IP pool
-     * is exhausted). Relay the real answer unchanged — fail open, never block the
-     * DNS transaction. */
+     * — MX, TXT, PTR and the like — zero real A answers yet, or a persistent kernel
+     * refusal of the map). Relay the real answer unchanged — fail open, never block the
+     * DNS transaction. Исчерпанный пул сюда больше не приходит: это SERVFAIL (fakeip_refuse). */
     if (!quiet)
         reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
     return 1;

@@ -28,6 +28,7 @@
 #     в карте и файле состояния имени нет; подмена, уже стоявшая под именем, снимается.
 # 10. Вопрос с байтом 0 внутри метки (имя для строки — «victim.io», для апстрима — имя в зоне
 #     нападающего): ответ уходит клиенту как есть, но карта и файл состояния victim.io не тронуты.
+# 11. Предел выдачи fake-IP на клиента: сверх него — SERVFAIL этому клиенту, другому — адрес.
 #
 # Нужны root (сетевое пространство и nf_tables), nft и python3. Без них стенд пропускается,
 # а не проваливается: остальной набор обязан проходить на голой машине.
@@ -48,7 +49,7 @@ nft add table inet steer 2>/dev/null || { echo "dnsnft: nf_tables недосту
 nft add map inet steer fakeip '{ type ipv4_addr : ipv4_addr; }'
 
 tmp="$(mktemp -d)"
-trap 'kill ${DPID:-0} ${UPID:-0} ${MPID:-0} ${DPID6:-0} ${UPID6:-0} ${DPID8:-0} 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'kill ${DPID:-0} ${UPID:-0} ${MPID:-0} ${DPID6:-0} ${UPID6:-0} ${DPID8:-0} ${DPID11:-0} 2>/dev/null; rm -rf "$tmp"' EXIT
 # Выход без IPv6 в фикстурах — мост Telegram (kind: tgws), вид плагина tgws: каталог плагинов дерева.
 sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" >/dev/null || { echo "dnsnft: каталог плагинов не собран"; exit 2; }
 STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
@@ -84,6 +85,8 @@ else:
     q += b'\x00'
 q += struct.pack('>HH', 1, 1)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+import os
+if os.environ.get('DNSNFT_SRC'): s.bind((os.environ['DNSNFT_SRC'], 0))   # другой клиент
 s.sendto(q, ('127.0.0.1', port))
 try:
     d, _ = s.recvfrom(2048)
@@ -96,7 +99,7 @@ else: print(".".join(str(b) for b in d[-4:]))
 PY
 
 printf 'example.com\nmoved.net\nfail.io\nstay.org\nperm.io\nwin.io\nwin2.io\n' > "$tmp/d.lst"
-printf 'bind.io\nidle.io\nzero.io\nheal.io\nvictim.io\n' >> "$tmp/d.lst"
+printf 'bind.io\nidle.io\nzero.io\nheal.io\nvictim.io\npa.io\npb.io\npc.io\npc2.io\n' >> "$tmp/d.lst"
 printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
 '"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
 '"channels":[{"name":"c","match":{"domains_files":["%s/d.lst"],"mode":"fakeip"},"out":"vpn"}]}' \
@@ -458,6 +461,31 @@ check "10. в файле состояния имени нападающего н
 check "9. в файле состояния заблокированных имён нет" "0" \
     "$(grep -c '^zero\.io\|^heal\.io' "$tmp/state8/fakeip.state")"
 check "9. а имена с подменой — на месте" "2" "$(grep -c '^bind\.io\|^idle\.io' "$tmp/state8/fakeip.state")"
+
+# --- 11. Предел выдачи fake-IP на клиента (аудит 2.1.0, D5) ------------------------------------
+# Предел на стенде — 2 (STEER_DNSD_FAKEIP_PER_CLIENT; по умолчанию восьмая часть пула). Третье
+# новое имя под правилом того же клиента — SERVFAIL, а не настоящий адрес мимо выхода; другой
+# клиент то же имя получает поддельным адресом. Клиенты — адреса 10.99.0.1 и .2 на lo: петля
+# предела не имеет (за ней пересыльщики всей сети, fakeip_client_key).
+ip addr add 10.99.0.1/32 dev lo
+ip addr add 10.99.0.2/32 dev lo
+LPORT11=15324
+mkdir -p "$tmp/state11"
+STEER_DNSD_FAKEIP_PER_CLIENT=2 "$BIN" dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state11" \
+    --listen-port "$LPORT11" --upstream-port "$UPORT" > "$tmp/log11" 2>&1 & DPID11=$!
+sleep 1
+ask11() { DNSNFT_SRC="${SRC11:-10.99.0.1}" python3 "$tmp/client.py" "$LPORT11" "$1"; }
+echo 203.0.113.111 > "$tmp/ip"
+check "11. первое и второе имя клиента — поддельные адреса" "198.18 198.18" \
+    "$(ask11 pa.io | cut -d. -f1-2) $(ask11 pb.io | cut -d. -f1-2)"
+check "11. третье — SERVFAIL, не настоящий адрес" "rcode2" "$(ask11 pc.io)"
+check "11. уже выданное имя — по-прежнему поддельный адрес" "198.18" "$(ask11 pa.io | cut -d. -f1-2)"
+check "11. другой клиент получает поддельный адрес того же имени" "198.18" \
+    "$(SRC11=10.99.0.2 ask11 pc.io | cut -d. -f1-2)"
+check "11. строка журнала называет предел" "1" "$(grep -c 'предел fake-IP (2 адресов' "$tmp/log11")"
+check "11. с петли предела нет — третье имя получает поддельный адрес" "198.18" \
+    "$(SRC11=127.0.0.1 ask11 pc2.io | cut -d. -f1-2)"
+kill "$DPID11" 2>/dev/null; wait "$DPID11" 2>/dev/null
 
 nft delete map inet steer fakeip6
 nft add map inet steer fakeip6 '{ type ipv6_addr : ipv4_addr; }'
