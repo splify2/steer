@@ -494,6 +494,13 @@ static int pin_raw(const char *p, size_t tn, int spki, unsigned char raw[32]) {
 void sl_add_pins(struct vless_node *n, const char *v, int spki) {
     const char *cur = pin_slot(n, spki);
     if (cur == SL_BAD_PIN || cur == SL_FULL) return;
+    /* Значения нет — вызывающему не хватило памяти его собрать (массив пинов в sub.c). Метку ставит
+     * эта функция, а не он: SL_FULL — имя этой библиотеки, и в раскладке libs разбор подписки живёт в
+     * другой; ссылка на метку оттуда — новый символ ABI ради одной строки. */
+    if (!v) {
+        if (spki) n->pks = SL_FULL; else n->pcs = SL_FULL;
+        return;
+    }
     /* Записей не больше, чем запятых плюс одна. */
     size_t cap = 1;
     for (const char *q = v; *q; q++) cap += *q == ',';

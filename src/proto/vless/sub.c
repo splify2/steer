@@ -701,7 +701,7 @@ static void sb_tls(struct sj *j, struct vless_node *n, int *enabled, int *realit
                     memcpy(all + al, pv, pl + 1);
                     al += pl;
                 } while (sj_arr_next(j, &fa) == 0);
-                if (oom) n->pks = SL_FULL;
+                if (oom) sl_add_pins(n, NULL, 1);
                 else if (all) sl_add_pins(n, all, 1);
                 free(all);
             } else if (r < 0) { pv[0] = '\0'; sj_str(j, pv, sizeof pv); sl_add_pins(n, pv, 1); }
