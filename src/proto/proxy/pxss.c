@@ -493,8 +493,9 @@ static int ss_tcp_down(const struct px_node *n, struct ss_sess *s, const unsigne
              * читалась вовсе (I-416). */
             uint64_t ts = 0;
             for (int i = 0; i < 8; i++) ts = (ts << 8) | s->acc[1 + i];
-            int64_t skew = (int64_t)ts - (int64_t)time(NULL);
-            if (skew > 30 || skew < -30) return -1;
+            /* Беззнаково: прежнее «(int64_t)ts - now» на метке за 2^63 давало знаковое переполнение (UB). */
+            uint64_t now = (uint64_t)time(NULL);
+            if ((ts > now ? ts - now : now - ts) > 30) return -1;
             size_t varlen = ((size_t)s->acc[9 + s->keylen] << 8) | s->acc[10 + s->keylen];
             s->rx = RS_PAY;
             s->want = varlen + 16;

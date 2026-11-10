@@ -9,7 +9,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "proxy.h"
@@ -693,7 +695,39 @@ static int socks_auth_try(unsigned char ver, unsigned char status) {
     return socks_auth_try_n(2, ver, status, 1);
 }
 
+/* SOCKS5 UDP: ответ из трёх байт (RSV RSV FRAG без типа адреса) — не датаграмма, и тип адреса за ним
+ * не читается. Прежде проверка «got < 3» пропускала got == 3, и читался rx[3] — байт за концом. Три байта
+ * кладутся в конец страницы, за ней — страница без доступа: чтение за конец роняет ребёнка. */
+static void test_socks_udp_short(void) {
+    long pg = sysconf(_SC_PAGESIZE);
+    unsigned char *m = mmap(NULL, (size_t)pg * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) { check("socks5 udp: mmap", 0, -1); return; }
+    mprotect(m + pg, (size_t)pg, PROT_NONE);
+    static const unsigned char cases[][4] = { { 0, 0, 0 }, { 0, 0, 0, 1 } };
+    static const size_t lens[] = { 3, 4 };
+    for (size_t c = 0; c < 2; c++) {
+        unsigned char *rx = m + pg - lens[c];
+        memcpy(rx, cases[c], lens[c]);
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) {
+            struct px_node n; memset(&n, 0, sizeof n);
+            n.proto = PX_SOCKS; n.socks_ver = 5;
+            g_em_calls = 0;
+            int r = proxy_socks_dialer.deliver(&n, NULL, 1, rx, lens[c], emit, NULL);
+            _exit(r == 0 && g_em_calls == 0 ? 0 : 3);
+        }
+        int st = 0;
+        waitpid(pid, &st, 0);
+        char t[100];
+        snprintf(t, sizeof t, "socks5 udp: ответ из %zu байт — отброшен, за конец не читается", lens[c]);
+        check(t, 1, WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+    munmap(m, (size_t)pg * 2);
+}
+
 static void test_socks(void) {
+    test_socks_udp_short();
     check("socks5: авторизация 01 00 принята", 0, socks_auth_try(1, 0));
     check("socks5: ответ авторизации с чужой версией (00 00) — PX_EPROTO", PX_EPROTO, socks_auth_try(0, 0));
     check("socks5: ответ 01 01 — отказ пароля", PX_EAUTH, socks_auth_try(1, 1));
@@ -714,11 +748,14 @@ static void test_socks(void) {
     test_udp_partial("ss", &proxy_ss_dialer, &n);
 }
 
-/* SIP022: метка времени ответа сервера — в пределах 30 с от нашей. */
+/* SIP022: метка времени ответа сервера — в пределах 30 с от нашей. Метки за 2^63 (знаковое переполнение
+ * в прежнем «(int64_t)ts - now»: под UBSan — падение), ноль и максимум — отказ, без UB. */
 static void test_ss2022_ts(void) {
     const struct dialer_ops *ops = &proxy_ss_dialer;
-    long skews[] = { 0, 25, -25, 40, -40 };
-    int want[] = { 0, 0, 0, -1, -1 };
+    enum { NREL = 5 };
+    long skews[] = { 0, 25, -25, 40, -40, 0, 0, 0, 0 };
+    uint64_t absts[] = { 0, 0, 0, 0, 0, 0x8000000000000000ull, 0x8000000000000001ull, UINT64_MAX, 1 };
+    int want[] = { 0, 0, 0, -1, -1, -1, -1, -1, -1 };
     for (size_t i = 0; i < sizeof skews / sizeof *skews; i++) {
         struct px_node n; struct flow_key k;
         void *sess = ss_tcp_open(&n, SS_2022_AES128, 16, &k);
@@ -727,7 +764,7 @@ static void test_ss2022_ts(void) {
         unsigned char rx[16 + 27 + 16 + 100 + 16];
         size_t o = 0;
         memset(rx + o, 7, 16); o += 16;
-        uint64_t ts = (uint64_t)((long)time(NULL) + skews[i]);
+        uint64_t ts = i < NREL ? (uint64_t)((long)time(NULL) + skews[i]) : absts[i];
         rx[o++] = 1;
         for (int b = 0; b < 8; b++) rx[o++] = (unsigned char)(ts >> (56 - 8 * b));
         memcpy(rx + o, reqsalt, 16); o += 16;
@@ -736,7 +773,10 @@ static void test_ss2022_ts(void) {
         g_em_n = 0; g_em_calls = 0;
         int dr = ops->deliver(&n, sess, 0, rx, o, emit, NULL);
         char t[120];
-        snprintf(t, sizeof t, "ss 2022: метка времени ответа %+lds от нашей — %s", skews[i], want[i] ? "отказ" : "принята");
+        if (i < NREL)
+            snprintf(t, sizeof t, "ss 2022: метка времени ответа %+lds от нашей — %s", skews[i], want[i] ? "отказ" : "принята");
+        else
+            snprintf(t, sizeof t, "ss 2022: метка времени ответа %#llx — отказ", (unsigned long long)ts);
         check(t, want[i], dr);
         ops->close(sess); free(sess);
     }
