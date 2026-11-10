@@ -167,7 +167,10 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                        struct vless_sub_stats *st);
 
 /* Файл подписки → массив узлов в куче (free вызывающему), *cnt — сколько пригодных. NULL — файл
- * не открылся или больше 64 МиБ. Ни число узлов, ни размер подписки константой не ограничены. */
+ * не открылся или больше VLESS_SUB_FILE_MAX. Число узлов константой не ограничено. Тот же потолок
+ * (64 МиБ) у разборов hysteria2 и прокси, и его же держит скачивание (subfetch.c): файл крупнее
+ * не прочтёт ни один разбор, а качать и распаковывать его на флеш незачем. */
+#define VLESS_SUB_FILE_MAX ((size_t)64 << 20)
 struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_sub_stats *st);
 
 #endif

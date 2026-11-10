@@ -304,8 +304,10 @@ static void t_quota(void) {
 /* Заглушка http_get (libsteer: httpc.h). Статус, заголовки и тело берёт из файлов песочницы по ключу
  * адреса (…/json — «json», остальное — «main»): rc.<ключ> — отказ клиента (сеть, срок), status.<ключ> —
  * статус вместо 200, hdr.<ключ>, body.<ключ>. Записывает в песочницу, чем и как спросили: метод
- * (seen.method), заголовки запроса (seen.headers) и число обращений (seen.count). Файл rej.hdr — панель
- * отвечает 403 на запрос с заголовками устройства (проверка повтора без них). */
+ * (seen.method), заголовки запроса (seen.headers: заголовки источника и общие — заглушка и есть
+ * источник, переадресаций у неё нет; их разводит httpc.c, проверка — httpmatch.c), предел тела
+ * (seen.maxbody) и число обращений (seen.count). Файл rej.hdr — панель отвечает 403 на запрос с
+ * заголовками устройства (проверка повтора без них). Тело длиннее max_body — HTTPC_EBIG, как у клиента. */
 int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn) {
     memset(r, 0, sizeof *r);
     if (why && wn) why[0] = 0;
@@ -314,7 +316,17 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
     snprintf(p, sizeof p, "%s/seen.method", T);
     wr(p, q->method ? q->method : "GET");
     snprintf(p, sizeof p, "%s/seen.headers", T);
-    wr(p, q->headers ? q->headers : "");
+    {
+        char hb[2048];
+        snprintf(hb, sizeof hb, "%s%s", q->origin_headers ? q->origin_headers : "", q->headers ? q->headers : "");
+        wr(p, hb);
+    }
+    snprintf(p, sizeof p, "%s/seen.maxbody", T);
+    {
+        char mb[32];
+        snprintf(mb, sizeof mb, "%llu", q->max_body);
+        wr(p, mb);
+    }
     snprintf(p, sizeof p, "%s/seen.count", T);
     int cnt = atoi(rd(p)) + 1;
     char cs[16];
@@ -327,7 +339,7 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
     snprintf(p, sizeof p, "%s/status.%s", T, key);
     if (access(p, F_OK) == 0) status = atoi(rd(p));
     snprintf(p, sizeof p, "%s/rej.hdr", T);
-    if (q->headers && strstr(q->headers, "x-hwid") && access(p, F_OK) == 0) status = 403;
+    if (q->origin_headers && strstr(q->origin_headers, "x-hwid") && access(p, F_OK) == 0) status = 403;
     r->status = status;
     snprintf(p, sizeof p, "%s/hdr.%s", T, key);
     if (access(p, F_OK) == 0) {
@@ -342,6 +354,11 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
     if (!head && q->dest_path && status / 100 == 2) {
         snprintf(p, sizeof p, "%s/body.%s", T, key);
         if (access(p, F_OK) != 0) { http_resp_free(r); return HTTPC_ECONNECT; }
+        struct stat bs;
+        if (q->max_body && stat(p, &bs) == 0 && (unsigned long long)bs.st_size > q->max_body) {
+            if (why) snprintf(why, wn, "тело ответа больше %llu байт", q->max_body);
+            return HTTPC_EBIG;
+        }
         FILE *in = fopen(p, "rb"), *out = fopen(q->dest_path, "wb");
         char buf[4096];
         size_t n;
@@ -570,6 +587,57 @@ static void t_gzip(void) {
     }
 }
 
+/* Подготовка песочницы к проверкам враждебных ответов: прежние отказы и статусы сняты. */
+static void hostile_fixtures(void) {
+    snprintf(g_url, sizeof g_url, "https://panel.example/sub");
+    fixture("main", "rc", NULL);
+    fixture("json", "rc", NULL);
+    fixture("main", "status", NULL);
+    fixture("json", "status", NULL);
+    fixture("main", "hdr", "HTTP/1.1 200 OK\r\n");
+    fixture("json", "hdr", "HTTP/1.1 200 OK\r\n");
+}
+
+/* ТЕЛО СВЕРХ ПОТОЛКА РАЗБОРА (64 МиБ — больше не прочтёт ни один разбор подписки): отказ клиента по
+ * пределу (max_body), без повтора без заголовков; gzip-бомба — 65 МиБ нулей в ~65 КБ — распаковка
+ * останавливается на 64 МиБ, ничего не остаётся. */
+static void t_oversize(void) {
+    hostile_fixtures();
+    char p[640];
+    wr(g_out, "vless://прежнее\n");
+    /* Тело сверх потолка разбора: файл-заглушка разреженный (65 МиБ без записи на диск). */
+    snprintf(p, sizeof p, "%s/body.main", T);
+    {
+        int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { if (ftruncate(fd, (off_t)65 << 20) != 0) { } close(fd); }
+    }
+    snprintf(p, sizeof p, "%s/seen.count", T);
+    unlink(p);
+    char *out = cap(call_fetch);
+    ck_true("тело больше 64 МиБ — отказ с числом", has(out, "\"ok\":false") && has(out, "подписка больше 64 МиБ"));
+    snprintf(p, sizeof p, "%s/seen.maxbody", T);
+    ck("  клиенту назван предел 64 МиБ", "67108864", rd(p));
+    snprintf(p, sizeof p, "%s/seen.count", T);
+    ck("  повтора без заголовков нет", "1", rd(p));
+    ck_true("  прежняя подписка не тронута", strstr(rd(g_out), "прежнее") != NULL);
+
+    char cmd[1200];
+    snprintf(cmd, sizeof cmd, "head -c %d /dev/zero | gzip -1 > '%s/body.main'", 65 << 20, T);
+    if (system(cmd) != 0) { printf("  ПРОПУСК gzip-бомбы: нет gzip на машине стенда\n"); return; }
+    struct stat zs;
+    snprintf(p, sizeof p, "%s/body.main", T);
+    ck_true("бомба: сжатое меньше мегабайта", stat(p, &zs) == 0 && zs.st_size < (1 << 20));
+    out = cap(call_fetch);
+    ck_true("gzip-бомба — отказ с числом", has(out, "\"ok\":false") && has(out, "после распаковки больше 64 МиБ"));
+    ck_true("  прежняя подписка не тронута", strstr(rd(g_out), "прежнее") != NULL);
+    snprintf(p, sizeof p, "%s.tmp", g_out);
+    ck_true("  временный файл убран", access(p, F_OK) != 0);
+    snprintf(p, sizeof p, "%s.tmp.gz", g_out);
+    ck_true("  распакованный хвост убран", access(p, F_OK) != 0);
+    fixture("main", "body", NULL);
+    fixture("json", "body", NULL);
+}
+
 static void t_quota_cmd(void) {
     snprintf(g_url, sizeof g_url, "https://panel.example/sub");
     snprintf(g_info, sizeof g_info, "%s/sub.userinfo", T);
@@ -740,6 +808,7 @@ int main(void) {
     t_fetch();
     t_reject();
     t_gzip();
+    t_oversize();
     t_quota_cmd();
     t_device_hdrs();
     t_multi();

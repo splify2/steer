@@ -1575,8 +1575,8 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
  * дополнительных мест (разбор чистый, повтор даёт тот же результат). Остаток арифметики
  * (usable + skipped + foreign) сходится, как и прежде. Потолок файла — 64 МиБ: защита от файла-
  * не-подписки под этим именем, а не размер подписки (тысяча узлов — сотни килобайт).
- * NULL — файл не открылся, слишком велик или нет памяти; иначе массив (free), *cnt — узлов. */
-#define VLESS_SUB_FILE_MAX ((size_t)64 << 20)
+ * NULL — файл не открылся, слишком велик (VLESS_SUB_FILE_MAX, vless.h) или нет памяти; иначе
+ * массив (free), *cnt — узлов. */
 struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_sub_stats *st) {
     *cnt = 0;
     if (st) memset(st, 0, sizeof(*st));
