@@ -470,12 +470,13 @@ static void resp_bool(struct cbuf *r, const char *k, int v) {
  * шлёт целиком, прежде чем читать ответ, и сброс на середине его записи он увидел бы ошибкой
  * записи, а не нашим too-large. По локальному сокету это десятки миллисекунд; дальше —
  * секунда срока, и хватит. */
-static void ctl_close_now(int c) {
+static void ctl_close_cap(int c, size_t cap) {
     shutdown(c, SHUT_WR);
     size_t total = 0;
     char buf[16384];
-    while (total < 2 * (size_t)CTL_FILE_MAX) {
-        ssize_t m = recv(c, buf, sizeof(buf), MSG_DONTWAIT);
+    while (total < cap) {
+        size_t want = cap - total < sizeof(buf) ? cap - total : sizeof(buf);
+        ssize_t m = recv(c, buf, want, MSG_DONTWAIT);
         if (m < 0 && errno == EINTR) continue;
         if (m <= 0) break;
         total += (size_t)m;
@@ -483,9 +484,18 @@ static void ctl_close_now(int c) {
     close(c);
 }
 
+/* Дочитывание у того, кого не пустили (denied): одно чтение, не больше CTL_DENIED_DRAIN. Предел
+ * в два тела файла — ради своих, чей слишком большой put-file надо принять и отвергнуть словом;
+ * чужому процессу он давал рычаг: каждое его соединение стоило демону чтения десятков мегабайт
+ * прямо в приёме, в единственном потоке цикла. Строка запроса честного клиента (до 512 байт)
+ * уходит из очереди, и он видит конец ответа, а не сброс; всё сверх остаётся непрочитанным, и
+ * приславший это получает сброс — ему и положено. */
+#define CTL_DENIED_DRAIN 4096
+
 /* Отказ одной строкой — для тех, кого не пустили или кому некогда: соединения у них нет,
- * отвечает сам приём. Ответ короче буфера сокета, запись не блокирует. */
-static void ctl_refuse_now(int c, const char *err, const char *msg) {
+ * отвечает сам приём. Ответ короче буфера сокета, запись не блокирует. drain — сколько
+ * дочитать перед закрытием (ctl_close_cap). */
+static void ctl_refuse_cap(int c, const char *err, const char *msg, size_t drain) {
     struct cbuf r = {0};
     resp_begin(&r, NULL);
     resp_error(&r, err, msg);
@@ -495,7 +505,11 @@ static void ctl_refuse_now(int c, const char *err, const char *msg) {
         do w = send(c, r.p, r.n, MSG_NOSIGNAL | MSG_DONTWAIT); while (w < 0 && errno == EINTR);
     }
     free(r.p);
-    ctl_close_now(c);
+    ctl_close_cap(c, drain);
+}
+
+static void ctl_refuse_now(int c, const char *err, const char *msg) {
+    ctl_refuse_cap(c, err, msg, 2 * (size_t)CTL_FILE_MAX);
 }
 
 /* ---- выключатель движка ---------------------------------------------------------------- */
@@ -710,6 +724,10 @@ struct ctl_srv {
     struct loop_timer *boot_tm;
     int boot_try;
     long boot_pause_ms;
+    /* Журнал отказов приёма (srv_deny_log): начало окна, строк в нём и сколько опущено. */
+    long deny_win;
+    int deny_n;
+    unsigned long deny_more;
 };
 
 static void boot_retry_arm(struct ctl_srv *s);
@@ -2949,13 +2967,46 @@ static void srv_accept_resume(struct loop *l, struct loop_timer *t, void *arg) {
     loop_fd_mod(l, s->lfd, EPOLLIN);
 }
 
+/* Строка журнала об отказе — не на каждого: CTL_DENY_LOG строк за CTL_DENY_WIN_MS, остальные
+ * считаются и называются одной строкой в начале следующего окна. Журнал роутера — кольцо в памяти:
+ * процесс, который стучится в сокет в цикле, вытеснял бы из него всё остальное. */
+#define CTL_DENY_LOG 5
+#define CTL_DENY_WIN_MS 60000L
+
+static void srv_deny_log(struct ctl_srv *s, const char *who) {
+    long now = loop_now_ms();
+    if (!s->deny_win || now - s->deny_win >= CTL_DENY_WIN_MS) {
+        if (s->deny_more > 1)
+            fprintf(stderr, LOG_W "отказ: и ещё %lu таких за %ld с — строки о них опущены\n",
+                    s->deny_more - 1, CTL_DENY_WIN_MS / 1000);
+        s->deny_win = now ? now : 1;
+        s->deny_n = 0;
+        s->deny_more = 0;
+    }
+    if (s->deny_n < CTL_DENY_LOG) {
+        s->deny_n++;
+        fprintf(stderr, LOG_W "отказ: %s\n", who);
+        return;
+    }
+    /* Первый сверх предела называется (кто стучится — видно по нему), остальные только считаются. */
+    if (!s->deny_more++)
+        fprintf(stderr, LOG_W "отказ: %s — отказов больше %d за минуту, дальше считаю молча\n", who,
+                CTL_DENY_LOG);
+}
+
+/* За одно пробуждение принимается не больше CTL_ACCEPT_BURST соединений: приём без предела держал
+ * цикл в этой функции, пока очередь сокета не опустеет, — тот, кто открывает соединения быстрее,
+ * чем они закрываются, останавливал сторожа, таймеры и события помощников. Оставшиеся в очереди
+ * epoll (по уровню) отдаст следующим оборотом, после остальных событий. */
+#define CTL_ACCEPT_BURST 16
+
 static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
     (void)ev;
     struct ctl_srv *s = arg;
-    for (;;) {
+    for (int burst = 0; burst < CTL_ACCEPT_BURST; burst++) {
         int c = accept4(fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (c < 0) {
-            if (errno == EINTR || errno == ECONNABORTED) continue;
+            if (errno == EINTR || errno == ECONNABORTED) continue;       /* в счёт пачки: цикл конечен */
             /* Нехватка дескрипторов или памяти не проходит сама за микросекунду, а соединение
              * так и ждёт в очереди — epoll будил бы демон сразу же, и он крутился бы вхолостую.
              * Приём снимается на 200 мс; в обычной работе сюда не попасть. */
@@ -2967,8 +3018,8 @@ static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
         }
         char who[320];
         if (!ctl_peer_ok(c, &s->cf, who, sizeof(who))) {
-            fprintf(stderr, LOG_W "отказ: %s\n", who);
-            ctl_refuse_now(c, "denied", "этому процессу управлять ядром steer нельзя");
+            srv_deny_log(s, who);
+            ctl_refuse_cap(c, "denied", "этому процессу управлять ядром steer нельзя", CTL_DENIED_DRAIN);
             continue;
         }
         struct conn *n = calloc(1, sizeof(*n));
