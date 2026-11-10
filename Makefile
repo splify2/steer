@@ -451,7 +451,7 @@ $(BUILD)/procscanmatch: tests/procscanmatch.c tests/unit.h src/lib/procscan.c sr
 
 # Читатель наборов sing-box (src/model/srs.c) и раскладка канала с ними (srsplan.c) — модулями
 # модели, без движка: см. шапку tests/srsunit.c.
-$(BUILD)/srsunit: tests/srsunit.c tests/unit.h $(MODEL_KINDS) $(CORE_HDR)
+$(BUILD)/srsunit: tests/srsunit.c tests/unit.h tests/memcap.h $(MODEL_KINDS) $(CORE_HDR)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/srsunit.c $(MODEL_KINDS)
 
