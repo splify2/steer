@@ -328,6 +328,34 @@ for i in $(seq 1 100); do ( fake "$(ask "p$i.doq.svc.test")" >> "$tmp/par.res" )
 n=0; while [ "$(wc -l < "$tmp/par.res")" -lt 100 ] && [ $n -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
 check "сто одновременных вопросов: все с ответом" "100" "$(grep -c '^fake$' "$tmp/par.res")"
 check "  соединение по-прежнему одно" "1" "$(dnslog doq conns)"
+
+# ---- 2а. простой: PING держит соединение, мёртвый путь узнаётся до вопроса -----------------------------
+# Пока соединение держится без вопросов, резолвер шлёт PING (раз в 15 с молчания, а при коротком
+# сроке простоя сервера — чаще: у dnsproxy он 30 с, PING идёт раз в 10 с): пакеты QUIC на сервер
+# идут и без вопросов, соединение остаётся тем же, и следующий вопрос уходит по нему сразу. Простой
+# здесь — 25 с, не дольше: соединение без вопросов dnsproxy через 30 с закрывает сам, с PING или
+# без (кодом DOQ_NO_ERROR; резолвер узнаёт об этом сразу и следующий вопрос ведёт на новом). Потом
+# путь обрывается молча (сервер перестаёт видеть пакеты соединения, ответа нет): через 20 с тишины
+# резолвер закрывает соединение сам, и вопрос после этого идёт на новом — без ожидания на мёртвом.
+p0=$(qpk tun)
+sleep 25
+p1=$(qpk tun)
+check "простой 25 с: PING шёл (пакеты QUIC на сервер без единого вопроса)" "1" \
+    "$([ $((p1 - p0)) -ge 2 ] && echo 1 || echo "0 (пакетов: $((p1 - p0)))")"
+check "  соединение то же, готово" "ready 1" "$(dnslog doq state) $(dnslog doq conns)"
+ms="$(ask k1.doq.svc.test 1 ms)"
+check "  вопрос после простоя — сразу, по готовому соединению" "1" \
+    "$(python3 -c 'import sys; print(1 if float(sys.argv[1]) < 300 else "0 (%s мс)" % sys.argv[1])' "$ms" 2>&1)"
+inS nft add rule inet doqcnt in udp dport 853 ip saddr 10.0.2.1 drop
+sleep 23
+check "путь пропал молча: через 20 с тишины соединение закрыто без вопроса клиента" "0" "$(dnslog doq conns)"
+inS nft flush chain inet doqcnt in
+inS nft add rule inet doqcnt in udp dport 853 ip saddr 10.0.2.1 counter comment '"tun"'
+inS nft add rule inet doqcnt in udp dport 853 ip saddr 10.0.1.1 counter comment '"wan"'
+ms="$(ask k2.doq.svc.test 1 ms)"
+check "  путь вернулся: вопрос идёт на новом соединении без ожидания на мёртвом" "1" \
+    "$(python3 -c 'import sys; print(1 if float(sys.argv[1]) < 600 else "0 (%s мс)" % sys.argv[1])' "$ms" 2>&1)"
+check "  соединение одно" "1" "$(dnslog doq conns)"
 check "  ни одного отказа" "0" "$(dnslog doq failed)"
 
 # ---- 3. без выхода, кэш -------------------------------------------------------------------------------
