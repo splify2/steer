@@ -217,6 +217,23 @@ o="$(P install bar --json 2>/dev/null)"; rc=$?
 check "подменённый архив: отказ" "1" "$rc"
 has "  по сумме из подписанного индекса" "не совпал с подписанным индексом" "$o"
 cp bar.orig repo/bar/1.0.0/bar-1.0.0-all.s2p
+# Архив длиннее размера из подписанного индекса: отказ на байте сверх него, а не после скачивания
+# мегабайта на флеш; во временном каталоге ничего не остаётся.
+BARSZ=$(wc -c < bar.orig | tr -d ' ')
+head -c 1048576 /dev/zero >> repo/bar/1.0.0/bar-1.0.0-all.s2p
+o="$(P install bar --json 2>/dev/null)"; rc=$?
+check "архив длиннее размера из индекса: отказ" "1" "$rc"
+has "  подмена, с размером из индекса" "байт — больше $BARSZ) — подмена" "$o"
+check "  во временном каталоге пусто" "" "$(ls tmp 2>/dev/null | grep '\.s2p$')"
+cp bar.orig repo/bar/1.0.0/bar-1.0.0-all.s2p
+# Индекс зеркала больше 16 МиБ — отказ с числом до чтения в память.
+cp repo/index.json index.orig
+python3 -c 'import sys; open(sys.argv[1], "w").write("{" + " " * (17 << 20) + "}")' repo/index.json
+rm -rf run/splify2
+o="$(P search --json 2>/dev/null)"
+has "индекс больше 16 МиБ: отказ с числом" "байт — больше 16777216" "$o"
+cp index.orig repo/index.json
+rm -rf run/splify2
 
 # ---- чужой ключ ----
 o="$(P install evil --json 2>/dev/null)"; rc=$?

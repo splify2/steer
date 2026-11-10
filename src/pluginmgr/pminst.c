@@ -695,11 +695,33 @@ static char *fetch_asset(struct pm_ctx *x, const struct pm_cand *c, int *tmp, st
         q.dest_path = dest;
         q.connect_ms = 10000;
         q.idle_ms = 30000;
+        /* Размер архива известен из подписанного индекса (index.md: size обязателен, от 1): больше —
+         * уже подмена, и качать её до конца на флеш незачем — отказ на байте сверх него. Общий срок —
+         * из того же размера: минута плюс время на 32 КБ/с. Сервер, который отдаёт по байту раз в
+         * 29 с, иначе держал бы установку вечно (idle_ms такого не видит), а законный архив в сотни
+         * мегабайт на медленном канале укладывается. Без размера (индекс вне схемы) — без предела
+         * тела и полчаса на всё. */
+        long want = yn_long(c->asset, "size", -1);
+        if (want > 0) {
+            q.max_body = (unsigned long long)want;
+            q.total_ms = (int)(60000 + (want / 32 > 0x7fffffffL - 60000 ? 0x7fffffffL - 60000 : want / 32));
+        } else {
+            q.total_ms = 30 * 60 * 1000;
+        }
         struct http_resp rp = {0};
         char hw[256] = "";
         int rc = http_get(&q, &rp, hw, sizeof(hw));
         if (rc == 0 && (rp.status < 200 || rp.status > 299)) { snprintf(hw, sizeof(hw), "ответ %d", rp.status); rc = -1; }
         http_resp_free(&rp);
+        if (rc == HTTPC_EBIG) {
+            /* Длиннее размера из подписанного индекса — это уже не сбой сети, а подмена, и причина
+             * важнее отказа следующего зеркала (как у несовпавшей суммы ниже). */
+            free(last);
+            last_tamper = 1;
+            last = pm_fmt("архив %s %s с %s длиннее размера из подписанного индекса (%s) — подмена", c->id, c->version, urls[i], hw);
+            unlink(dest);
+            continue;
+        }
         if (rc != 0) {
             if (!last_tamper) {
                 free(last);

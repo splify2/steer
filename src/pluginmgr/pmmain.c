@@ -538,13 +538,13 @@ static int cmd_repo_add(struct pm_ctx *x, const char *url, const char *keyid, co
     char *body = NULL, *sig = NULL;
     size_t bn = 0, sn = 0;
     char why[256] = "";
-    if (pm_http_mem(iu, &body, &bn, why, sizeof(why)) != 0) {
+    if (pm_http_mem(iu, 0, &body, &bn, why, sizeof(why)) != 0) {
         char *m = pm_fmt("индекс %s не скачался: %s", iu, why);
         int r = failc(x, "plugin.index_url_download", PMA("url", iu, "why", why), m);
         free(m); free(iu); free(su); free(kt);
         return r;
     }
-    if (pm_http_mem(su, &sig, &sn, why, sizeof(why)) != 0) {
+    if (pm_http_mem(su, 1, &sig, &sn, why, sizeof(why)) != 0) {
         char *m = pm_fmt("подпись индекса %s не скачалась: %s", su, why);
         int r = failc(x, "plugin.index_sig_download", PMA("url", su, "why", why), m);
         free(m); free(iu); free(su); free(kt); free(body);

@@ -285,7 +285,8 @@ int pm_keepd_write(struct pm_ctx *x);
 int pm_links_repair(struct pm_ctx *x, const char *id, struct pm_err *e);
 int pm_file_sha256(const char *path, unsigned char out[32], unsigned long long *size);
 /* Скачать url в память (pmindex.c). 0 — ответ 2xx; why — причина отказа. */
-int pm_http_mem(const char *url, char **body, size_t *n, char *why, size_t wn);
+/* sig — подпись (потолок 1 МиБ), иначе индекс (16 МиБ): см. pmindex.c. */
+int pm_http_mem(const char *url, int sig, char **body, size_t *n, char *why, size_t wn);
 /* Манифест стоящего плагина (NULL — не читается). */
 struct ydoc *pm_manifest(const char *id);
 /* Манифест для чтения: при включённом кэше (команды без записи — list, status) каждый plugin.json
