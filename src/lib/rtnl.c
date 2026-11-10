@@ -44,7 +44,9 @@ static int rtnl_open(void) {
 typedef void (*rtnl_cb)(const struct nlmsghdr *h, void *ctx);
 
 /* Отправить одно сообщение и дочитать ответ: до подтверждения, до NLMSG_DONE у дампа. Каждое
- * сообщение ответа, кроме служебных, — в cb. 0 или errno. */
+ * сообщение ответа, кроме служебных, — в cb. 0 или errno; у дампа ещё код из NLMSG_DONE (дамп
+ * оборван, nl_done_errno) и EINTR — таблица менялась посреди дампа (NLM_F_DUMP_INTR): ответ не из
+ * одного мгновения, повторяет rtnl_dump. */
 static int rtnl_talk(void *msg, size_t len, rtnl_cb cb, void *ctx) {
     int fd = rtnl_open();
     if (fd < 0) return errno ? errno : EIO;
@@ -52,7 +54,7 @@ static int rtnl_talk(void *msg, size_t len, rtnl_cb cb, void *ctx) {
     struct sockaddr_nl to;
     memset(&to, 0, sizeof(to));
     to.nl_family = AF_NETLINK;
-    int rc = EIO;
+    int rc = EIO, intr = 0;
     if (sendto(fd, msg, len, 0, (struct sockaddr *)&to, sizeof(to)) < 0) {
         rc = errno;
         close(fd);
@@ -66,17 +68,36 @@ static int rtnl_talk(void *msg, size_t len, rtnl_cb cb, void *ctx) {
         for (struct nlmsghdr *h = (struct nlmsghdr *)rbuf; NLMSG_OK(h, (size_t)n);
              h = NLMSG_NEXT(h, n)) {
             if (h->nlmsg_seq != req->nlmsg_seq) continue;
+            if (h->nlmsg_flags & NLM_F_DUMP_INTR) intr = 1;
             if (h->nlmsg_type == NLMSG_ERROR) {
                 const struct nlmsgerr *e = NLMSG_DATA(h);
                 rc = e->error ? -e->error : 0;
                 done = 1;
                 break;
             }
-            if (h->nlmsg_type == NLMSG_DONE) { rc = 0; done = 1; break; }
+            if (h->nlmsg_type == NLMSG_DONE) { rc = nl_done_errno(h); done = 1; break; }
             if (cb) cb(h, ctx);
         }
     }
     close(fd);
+    return rc == 0 && intr ? EINTR : rc;
+}
+
+/* Дамп с повтором. Ядро помечает часть дампа NLM_F_DUMP_INTR, когда таблица (правила, маршруты,
+ * адреса) поменялась, пока её отдавали: в ответе может не быть записи, которая стоит, или быть
+ * снятая. Раньше такой ответ принимался как есть — сверка видела «нет маршрута по умолчанию» на
+ * мгновение смены и чинила то, что стоит, а сброс таблицы по неполному дампу оставлял маршруты.
+ * Повтор — с чистого листа (reset обнуляет собранное колбэком), до RTNL_DUMP_TRIES раз; таблица,
+ * которая меняется без передышки и после этого, — отказ EINTR: решать по смеси двух мгновений
+ * хуже, чем не решать (вызывающий повторит своим следующим проходом). */
+#define RTNL_DUMP_TRIES 5
+
+static int rtnl_dump(void *msg, size_t len, rtnl_cb cb, void *ctx, void (*reset)(void *ctx)) {
+    int rc = EINTR;
+    for (int i = 0; i < RTNL_DUMP_TRIES && rc == EINTR; i++) {
+        if (i && reset) reset(ctx);
+        rc = rtnl_talk(msg, len, cb, ctx);
+    }
     return rc;
 }
 
@@ -145,6 +166,14 @@ static void tb_line(struct textbuf *t, const char *line) {
 }
 
 /* Итог печати в куче: пустая строка, если ядро ничего не прислало, NULL — не вышло. */
+/* Повтор дампа (rtnl_dump): собранное прерванным проходом — выбросить, буфер оставить. */
+static void tb_reset(void *ctx) {
+    struct textbuf *t = ctx;
+    t->len = 0;
+    t->full = 0;
+    if (t->p) t->p[0] = '\0';
+}
+
 static char *tb_result(struct textbuf *t) {
     if (t->full) { free(t->p); return NULL; }
     if (!t->p) return strdup("");
@@ -218,7 +247,7 @@ char *rtnl_rules_dup(int v6) {
     struct textbuf t;
     memset(&t, 0, sizeof(t));
     char *res = NULL;
-    if (rtnl_talk(buf, msg_end(&b, nh), rule_cb, &t) != 0) free(t.p);
+    if (rtnl_dump(buf, msg_end(&b, nh), rule_cb, &t, tb_reset) != 0) free(t.p);
     else res = tb_result(&t);
     g_fam = saved;
     return res;
@@ -315,6 +344,13 @@ static void route_cb(const struct nlmsghdr *h, void *ctx) {
     tb_line(&c->t, line);
 }
 
+static void route_reset(void *ctx) {
+    struct route_ctx *c = ctx;
+    tb_reset(&c->t);
+    c->raw_n = 0;
+    c->raw_full = 0;
+}
+
 static int routes_dump(struct route_ctx *c) {
     uint8_t buf[64];
     struct nlbuf b;
@@ -323,7 +359,7 @@ static int routes_dump(struct route_ctx *c) {
     rt.rtm_family = (uint8_t)g_fam;
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE,
                                     NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
-    return rtnl_talk(buf, msg_end(&b, nh), route_cb, c);
+    return rtnl_dump(buf, msg_end(&b, nh), route_cb, c, route_reset);
 }
 
 char *rtnl_routes_dup(int table, int v6) {
@@ -457,6 +493,8 @@ static void default6_cb(const struct nlmsghdr *h, void *ctx) {
     if (table == RT_TABLE_MAIN) *found = 1;
 }
 
+static void int_reset(void *ctx) { *(int *)ctx = 0; }
+
 int rtnl_default6(void) {
     uint8_t buf[64];
     struct nlbuf b;
@@ -466,11 +504,30 @@ int rtnl_default6(void) {
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE,
                                     NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
     int found = 0;
-    if (rtnl_talk(buf, msg_end(&b, nh), default6_cb, &found) != 0) return -1;
+    if (rtnl_dump(buf, msg_end(&b, nh), default6_cb, &found, int_reset) != 0) return -1;
     return found;
 }
 
-struct defdev_ctx { void (*cb)(const char *dev, void *ctx); void *ctx; };
+/* Устройства маршрутов по умолчанию main — собираются целиком и отдаются вызывающему только после
+ * полного дампа: при повторе (rtnl_dump) устройство из прерванного прохода, которого в новом нет,
+ * не должно остаться в наборе @wan_dev. Повторы имён снимаются здесь же (v4 и v6 через одно
+ * устройство, несколько маршрутов). */
+struct defdev_ctx { char (*v)[IF_NAMESIZE]; size_t n, cap; int oom; };
+
+static void defdev_put(struct defdev_ctx *c, unsigned ifindex) {
+    char name[IF_NAMESIZE];
+    if (!ifindex || !if_indextoname(ifindex, name)) return;
+    for (size_t i = 0; i < c->n; i++)
+        if (!strcmp(c->v[i], name)) return;
+    if (c->n == c->cap) {
+        size_t cap = c->cap ? c->cap * 2 : 8;
+        char (*g)[IF_NAMESIZE] = realloc(c->v, cap * sizeof(*g));
+        if (!g) { c->oom = 1; return; }
+        c->v = g;
+        c->cap = cap;
+    }
+    memcpy(c->v[c->n++], name, IF_NAMESIZE);
+}
 
 static void defdev_cb(const struct nlmsghdr *h, void *ctx) {
     struct defdev_ctx *c = ctx;
@@ -482,8 +539,14 @@ static void defdev_cb(const struct nlmsghdr *h, void *ctx) {
     const struct rtattr *tb[RTA_MAX + 1];
     attrs_parse((const uint8_t *)rt + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, RTA_MAX);
     uint32_t table = tb[RTA_TABLE] ? rta_u32(tb[RTA_TABLE]) : rt->rtm_table;
-    char name[IF_NAMESIZE];
-    if (table == RT_TABLE_MAIN && tb[RTA_OIF] && if_indextoname(rta_u32(tb[RTA_OIF]), name)) c->cb(name, c->ctx);
+    if (table != RT_TABLE_MAIN) return;
+    if (tb[RTA_OIF]) defdev_put(c, rta_u32(tb[RTA_OIF]));
+}
+
+static void defdev_reset(void *ctx) {
+    struct defdev_ctx *c = ctx;
+    c->n = 0;
+    c->oom = 0;
 }
 
 int rtnl_default_devs(void (*cb)(const char *dev, void *ctx), void *ctx) {
@@ -493,8 +556,13 @@ int rtnl_default_devs(void (*cb)(const char *dev, void *ctx), void *ctx) {
     memset(&rt, 0, sizeof(rt));
     rt.rtm_family = AF_UNSPEC;
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
-    struct defdev_ctx c = { cb, ctx };
-    return rtnl_talk(buf, msg_end(&b, nh), defdev_cb, &c) == 0 ? 0 : -1;
+    struct defdev_ctx c = { NULL, 0, 0, 0 };
+    int rc = rtnl_dump(buf, msg_end(&b, nh), defdev_cb, &c, defdev_reset);
+    /* Не хватило памяти — список неполон: отдать его значило бы снять из @wan_dev настоящий WAN. */
+    if (rc == 0 && !c.oom)
+        for (size_t i = 0; i < c.n; i++) cb(c.v[i], ctx);
+    free(c.v);
+    return rc == 0 && !c.oom ? 0 : -1;
 }
 
 /* Есть ли в таблице маршрут по умолчанию IPv4 любого вида (устройство, blackhole, prohibit,
@@ -514,6 +582,8 @@ static void tdef_cb(const struct nlmsghdr *h, void *ctx) {
     if (table == c->table) c->found = 1;
 }
 
+static void tdef_reset(void *ctx) { ((struct tdef_ctx *)ctx)->found = 0; }
+
 int rtnl_table_has_default(int table) {
     uint8_t buf[64];
     struct nlbuf b;
@@ -522,7 +592,7 @@ int rtnl_table_has_default(int table) {
     rt.rtm_family = AF_INET;
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
     struct tdef_ctx c = { (uint32_t)table, 0 };
-    if (rtnl_talk(buf, msg_end(&b, nh), tdef_cb, &c) != 0) return -1;
+    if (rtnl_dump(buf, msg_end(&b, nh), tdef_cb, &c, tdef_reset) != 0) return -1;
     return c.found;
 }
 
@@ -595,6 +665,12 @@ static void main6_cb(const struct nlmsghdr *h, void *ctx) {
     c->n++;
 }
 
+static void main6_reset(void *ctx) {
+    struct main6_ctx *c = ctx;
+    c->n = 0;
+    c->oom = 0;
+}
+
 int rtnl_main6_routes(struct rtnl_route6 **out) {
     *out = NULL;
     uint8_t buf[64];
@@ -605,7 +681,7 @@ int rtnl_main6_routes(struct rtnl_route6 **out) {
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETROUTE,
                                     NLM_F_REQUEST | NLM_F_DUMP, &rt, sizeof(rt));
     struct main6_ctx c = { NULL, 0, 0, 0 };
-    if (rtnl_talk(buf, msg_end(&b, nh), main6_cb, &c) != 0 || c.oom) { free(c.v); return -1; }
+    if (rtnl_dump(buf, msg_end(&b, nh), main6_cb, &c, main6_reset) != 0 || c.oom) { free(c.v); return -1; }
     *out = c.v;
     return (int)c.n;
 }
@@ -650,6 +726,12 @@ static void addr6_cb(const struct nlmsghdr *h, void *ctx) {
     c->n++;
 }
 
+static void addr6_reset(void *ctx) {
+    struct addr6_ctx *c = ctx;
+    c->n = 0;
+    c->oom = 0;
+}
+
 int rtnl_addrs6(struct rtnl_addr6 **out) {
     *out = NULL;
     uint8_t buf[64];
@@ -660,7 +742,7 @@ int rtnl_addrs6(struct rtnl_addr6 **out) {
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof(buf), RTM_GETADDR,
                                     NLM_F_REQUEST | NLM_F_DUMP, &ia, sizeof(ia));
     struct addr6_ctx c = { NULL, 0, 0, 0 };
-    if (rtnl_talk(buf, msg_end(&b, nh), addr6_cb, &c) != 0 || c.oom) { free(c.v); return -1; }
+    if (rtnl_dump(buf, msg_end(&b, nh), addr6_cb, &c, addr6_reset) != 0 || c.oom) { free(c.v); return -1; }
     *out = c.v;
     return (int)c.n;
 }

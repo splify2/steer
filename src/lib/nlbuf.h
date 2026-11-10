@@ -121,4 +121,15 @@ static inline void nlbuf_end_nested(struct nlbuf *b, struct nlattr *outer) {
     outer->nla_len = (uint16_t)len;
 }
 
+/* Код конца дампа. NLMSG_DONE несёт int: 0 — дамп пройден, -errno — оборван (ядро не смогло
+ * отдать очередную часть: нехватка памяти, ENOBUFS, отказ обработчика дампа). Читать DONE как
+ * «успех» значило бы принять обрезанный дамп за полный: сверка решила бы, что правила или
+ * маршрута нет, и полезла бы «чинить» то, что стоит. Короткий DONE (без кода) — успех. */
+static inline int nl_done_errno(const struct nlmsghdr *h) {
+    if (h->nlmsg_len < NLMSG_LENGTH(sizeof(int))) return 0;
+    int e;
+    memcpy(&e, NLMSG_DATA(h), sizeof(e));
+    return e < 0 ? -e : 0;
+}
+
 #endif

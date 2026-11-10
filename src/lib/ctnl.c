@@ -180,7 +180,9 @@ int ctnl_dump(int dfd, uint8_t family, int filter, uint32_t val, uint32_t mask,
         for (struct nlmsghdr *h = (struct nlmsghdr *)buf; len > 0 && NLMSG_OK(h, (unsigned)len);
              h = NLMSG_NEXT(h, len)) {
             if (h->nlmsg_seq != dseq) continue;
-            if (h->nlmsg_type == NLMSG_DONE) return 0;
+            /* Оборванный дамп (DONE с кодом) — не «записей больше нет»: снятие записей выхода
+             * сочло бы недочитанные снятыми. */
+            if (h->nlmsg_type == NLMSG_DONE) return nl_done_errno(h) ? -1 : 0;
             if (h->nlmsg_type == NLMSG_ERROR) {
                 if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) return -1;
                 int err = ((struct nlmsgerr *)NLMSG_DATA(h))->error;

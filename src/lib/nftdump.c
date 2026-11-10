@@ -102,7 +102,7 @@ static int nfd_talk(int fd, uint16_t msg, int dump, uint8_t family,
                 done = 1;
                 break;
             }
-            if (h->nlmsg_type == NLMSG_DONE) { rc = 0; done = 1; break; }
+            if (h->nlmsg_type == NLMSG_DONE) { rc = nl_done_errno(h); done = 1; break; }
             if (cb) cb(h, arg);
         }
     }
