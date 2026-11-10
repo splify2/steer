@@ -10,8 +10,8 @@
 # ключ (индекс, архив, сторонний репозиторий); несовместимая версия и выбор совместимой; обновление и
 # откат по scripts/postinst (bad_versions); удаление (зависимые, выходы спеки, --force, --purge); ensure
 # из семени без сети; задания; busy; установка из файла (--unsigned); репозитории (add/list/del);
-# системные пакеты и пути ядра; keep.d; с демоном (root и unshare) — команды plugin-* сокета, событие
-# plugin подписчику и plugin-reload.
+# системные пакеты (и альтернативы «a|b») и пути ядра; keep.d; с демоном (root и unshare) — команды
+# plugin-* сокета, событие plugin подписчику и plugin-reload.
 #
 #   sh tests/pluginmgrmatch.sh [steerd с менеджером]
 # Без аргумента — собирает его сам (профиль extended + PLUGMGR_SRC + wolfSSL из $BUILD/wolfssl-host, как
@@ -345,6 +345,41 @@ o="$(STEER_PLUGIN_PKG="$T/pkg.sh" P install pk --json 2>/dev/null)"; rc=$?
 check "requires.system: пакет поставлен менеджером" "0 add kmod-test" "$rc $(cat pkg.log 2>/dev/null)"
 check "  записан в system_ours и system плагина" "kmod-test kmod-test" \
     "$(jq_ '" ".join(d["system_ours"])+" "+" ".join(d["plugins"]["pk"]["system"])' < etc/state.json)"
+# Альтернативы «a|b»: пробуются по порядку, пока одна не встанет. Заглушка pkga.sh ставит только имена из
+# переменной PKG_OK и пишет каждую попытку в pkg.log; отказ печатает, как apk, последней строкой.
+cat > pkga.sh <<E
+#!/bin/sh
+case "\$1" in
+installed) grep -qx "\$2" "$T/pkgs" 2>/dev/null ;;
+add) echo "try \$2" >> "$T/pkg.log"
+    case " \$PKG_OK " in *" \$2 "*) echo "\$2" >> "$T/pkgs" ;; *) echo "fetch"; echo "ERROR: \$2 (no such package)" >&2; exit 1 ;; esac ;;
+esac
+E
+chmod 755 pkga.sh
+P remove pk --json >/dev/null 2>&1
+: > pkgs; : > pkg.log
+o="$(STEER_PLUGIN_PKG="$T/pkga.sh" PKG_OK="" P install pk --json 2>/dev/null)"; rc=$?
+check "requires.system a|b: не встала ни одна — отказ, пробовались обе по порядку" "1 try kmod-test try kmod-alt" "$rc $(tr '\n' ' ' < pkg.log | sed 's/ $//')"
+check "  code и список всех альтернатив в args" "plugin.packages_failed pk kmod-test, kmod-alt" \
+    "$(printf '%s' "$o" | jq_ 'd["code"]+" "+d["args"]["id"]+" "+d["args"]["pkgs"]')"
+has "  текст называет обе" "не поставился ни один из пакетов kmod-test, kmod-alt" "$o"
+has "  и причину утилиты по каждой" "kmod-test: ERROR: kmod-test (no such package); kmod-alt: ERROR: kmod-alt (no such package)" "$o"
+check "  плагин не встал" "no" "$(jq_ '"yes" if "pk" in d["plugins"] else "no"' < etc/state.json)"
+: > pkg.log
+o="$(STEER_PLUGIN_PKG="$T/pkga.sh" P ensure pk --pkg standin-pkg --json 2>/dev/null)"; rc=$?
+check "  изнутри транзакции пакета: отказ без вызова утилиты" "1 " "$rc $(cat pkg.log)"
+has "    называет все альтернативы и пакет транзакции" "нужен один из пакетов kmod-test, kmod-alt — поставьте его после установки standin-pkg" "$o"
+has "    code" '"plugin.needs_package_any_after"' "$o"
+o="$(STEER_PLUGIN_PKG="$T/pkga.sh" PKG_OK="kmod-alt" P install pk --json 2>err.txt)"; rc=$?
+check "requires.system a|b: первой в фидах нет — встала вторая" "0 try kmod-test try kmod-alt" "$rc $(tr '\n' ' ' < pkg.log | sed 's/ $//')"
+check "  в system плагина и в system_ours — та, что поставлена" "kmod-alt True False" \
+    "$(jq_ '" ".join(d["plugins"]["pk"]["system"])+" "+str("kmod-alt" in d["system_ours"])+" "+str("kmod-test" in d["plugins"]["pk"]["system"])' < etc/state.json)"
+has "  ход работ называет пробуемый пакет" "пакет kmod-alt для pk (вариант 2 из 2)" "$(cat err.txt)"
+P remove pk --json >/dev/null 2>&1
+echo kmod-alt > pkgs; : > pkg.log
+o="$(STEER_PLUGIN_PKG="$T/pkga.sh" PKG_OK="kmod-test kmod-alt" P install pk --json 2>/dev/null)"; rc=$?
+check "requires.system a|b: вторая уже стоит — ничего не ставится" "0 " "$rc $(cat pkg.log)"
+check "  и в system плагина ничего не записано" "" "$(jq_ '" ".join(d["plugins"]["pk"].get("system", []))' < etc/state.json)"
 o="$(P install kern --json 2>/dev/null)"; rc=$?
 check "requires.kernel: пути нет — отказ" "1" "$rc"
 has "  называет путь" "нет /nonexistent/steer-test-path" "$o"
