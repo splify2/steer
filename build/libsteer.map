@@ -191,6 +191,7 @@ LIBSTEER_1 {
     rtnl_route6_backstop;
     rtnl_route_default;
     rtnl_route_default_dev;
+    rtnl_route_dev;
     rtnl_routes_dup;
     rtnl_rule_from;
     rtnl_rule_fwmark;
