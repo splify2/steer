@@ -380,6 +380,19 @@ echo kmod-alt > pkgs; : > pkg.log
 o="$(STEER_PLUGIN_PKG="$T/pkga.sh" PKG_OK="kmod-test kmod-alt" P install pk --json 2>/dev/null)"; rc=$?
 check "requires.system a|b: вторая уже стоит — ничего не ставится" "0 " "$rc $(cat pkg.log)"
 check "  и в system плагина ничего не записано" "" "$(jq_ '" ".join(d["plugins"]["pk"].get("system", []))' < etc/state.json)"
+# Первая уже стоит: ничего не ставится, и плагину пакет не записывается — снятие плагина его не снимет.
+P remove pk --json >/dev/null 2>&1
+echo kmod-test > pkgs; : > pkg.log
+o="$(STEER_PLUGIN_PKG="$T/pkga.sh" PKG_OK="kmod-test kmod-alt" P install pk --json 2>/dev/null)"; rc=$?
+check "requires.system a|b: первая уже стоит — ничего не ставится" "0 " "$rc $(cat pkg.log)"
+check "  и в system плагина ничего не записано" "" "$(jq_ '" ".join(d["plugins"]["pk"].get("system", []))' < etc/state.json)"
+# Обе в фидах: ставится первая, вторая не пробуется.
+P remove pk --json >/dev/null 2>&1
+: > pkgs; : > pkg.log
+o="$(STEER_PLUGIN_PKG="$T/pkga.sh" PKG_OK="kmod-test kmod-alt" P install pk --json 2>/dev/null)"; rc=$?
+check "requires.system a|b: обе в фидах — встала первая, вторая не пробовалась" "0 try kmod-test" "$rc $(tr '\n' ' ' < pkg.log | sed 's/ $//')"
+check "  в system плагина — первая" "kmod-test" "$(jq_ '" ".join(d["plugins"]["pk"].get("system", []))' < etc/state.json)"
+P remove pk --json >/dev/null 2>&1
 o="$(P install kern --json 2>/dev/null)"; rc=$?
 check "requires.kernel: пути нет — отказ" "1" "$rc"
 has "  называет путь" "нет /nonexistent/steer-test-path" "$o"
