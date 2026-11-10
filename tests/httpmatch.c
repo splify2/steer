@@ -36,6 +36,7 @@ const char *tls13_verify_reason(void) { return ""; }
 void tls13_free(struct tls13 *t) { (void)t; }
 int tls13_write(struct tls13 *t, const unsigned char *d, size_t n) { (void)t; (void)d; (void)n; return -1; }
 int tls13_read_ref(struct tls13 *t, const unsigned char **b, size_t *n) { (void)t; (void)b; (void)n; return -1; }
+int tls13_has_record(const struct tls13 *t) { (void)t; return 0; }
 int tls13_handshake_auth(struct tls13 *t, int fd, const unsigned char *h, size_t hn, const unsigned char *s,
                          const struct tls13_auth *a) { (void)t; (void)fd; (void)h; (void)hn; (void)s; (void)a; return -1; }
 int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_state *st, const struct reality_carrier *car,

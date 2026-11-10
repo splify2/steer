@@ -443,10 +443,26 @@ static int conn_open(struct ctx *c, const struct url *u, struct conn *k) {
 static int conn_recv(struct conn *k, long wait, const unsigned char **p, size_t *n) {
     set_timeo(k->fd, wait);
     if (k->t) {
-        int rc = tls13_read_ref(k->t, p, n);
-        if (rc == 0) return 0;
-        if (rc == TLS13_ECLOSED) return 1;
-        return rc == TLS13_ETIMEOUT ? HTTPC_ETIMEOUT : HTTPC_EIO;
+        /* Чтение TLS не ждёт (tls13_read_ref берёт сокет с MSG_DONTWAIT — так нужно циклу туннеля): на пустом
+         * сокете оно сразу отвечает «0 байт», и SO_RCVTIMEO здесь не значит ничего. Прежде read_head и цикл
+         * тела принимали это за порцию и звали снова — холостая петля на 100 % ядра (PoC аудита 2.1.0, F2:
+         * 1,4 млн вызовов за 3 с), а срок молчания idle_ms не наступал никогда. Теперь ждём сами: poll до
+         * конца срока, и «0 байт» после служебной записи (билет сессии) — повод читать дальше, а не порция.
+         * Срок общий на вызов: сервер, капающий служебными записями или кусками записи, его не продлевает. */
+        long end = mono_ms() + wait;
+        for (;;) {
+            int rc = tls13_read_ref(k->t, p, n);
+            if (rc == TLS13_ECLOSED) return 1;
+            if (rc) return rc == TLS13_ETIMEOUT ? HTTPC_ETIMEOUT : HTTPC_EIO;
+            if (*n) return 0;
+            if (tls13_has_record(k->t)) continue;          /* целая запись уже у нас — сокет не спрашиваем */
+            long left = end - mono_ms();
+            if (left <= 0) return HTTPC_ETIMEOUT;
+            struct pollfd pf = { k->fd, POLLIN, 0 };
+            int pr = poll(&pf, 1, (int)left);
+            if (pr < 0 && errno != EINTR) return HTTPC_EIO;
+            if (pr == 0) return HTTPC_ETIMEOUT;
+        }
     }
     ssize_t r = recv(k->fd, k->buf, sizeof k->buf, 0);
     if (r == 0) return 1;
@@ -732,7 +748,10 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
     const void *body = q->body;
     size_t body_n = q->body ? q->body_n : 0;
     struct ctx c = { .q = q, .r = r, .why = why, .wn = wn, .sink_fd = -1 };
-    if (q->total_ms > 0) c.end_ms = mono_ms() + q->total_ms;
+    /* Общий срок есть всегда, если его не сняли явно (total_ms < 0): без него сервер, отдающий тело по байту
+     * чаще idle_ms, держал вызов бесконечно (аудит 2.1.0, F2). См. HTTPC_TOTAL_DEFAULT_MS. */
+    long total = q->total_ms > 0 ? q->total_ms : q->total_ms < 0 ? 0 : HTTPC_TOTAL_DEFAULT_MS;
+    if (total) c.end_ms = mono_ms() + total;
     int max_redir = q->max_redirects == 0 ? 10 : q->max_redirects;
     struct url u;
     int rc = url_parse(q->url ? q->url : "", &u);

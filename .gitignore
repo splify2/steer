@@ -71,6 +71,7 @@ build/.tsanprobe
 build/tunnelmatch
 build/tunfloodmatch
 build/hsdlmatch
+build/httpcspinmatch
 build/xhupmatch
 build/grpcmatch
 build/wsmatch
