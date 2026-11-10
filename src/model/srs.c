@@ -841,10 +841,25 @@ static int scan_default(struct rd *r, struct drule *d) {
     }
 }
 
-static struct lnode *scan_rule(struct rd *r, int depth, uint32_t *occ) {
+/* Бюджет узлов дерева одного правила верхнего уровня. Дерево правила строится в памяти целиком
+ * (norm_top нужна вся логика сразу), узел — около 250 байт, а пустое обычное правило в файле —
+ * три байта, которые zlib сжимает почти в ничто: набор 17 КБ из одного «или» на 4000 «или» по
+ * 1000 пустых правил требовал 1 ГБ. 131072 узла — около 34 МБ на пике, и это больше прежнего
+ * предела детей у одного логического правила (100000), так что всякое правило, которое читалось
+ * прежде без вложенности, читается и теперь. Настоящие наборы далеко от этого: geosite/geoip
+ * издателей — по одному обычному правилу на файл без логики (tests/srs: discord, telegram,
+ * youtube), логика в рукописных наборах — единицы детей. Узлы разных правил верхнего уровня
+ * не складываются: дерево освобождается до следующего. */
+#define SRS_TREE_NODES 131072
+#define SRS_STR_(x) #x
+#define SRS_STR(x) SRS_STR_(x)
+
+static struct lnode *scan_rule(struct rd *r, int depth, uint32_t *occ, size_t *left) {
     if (depth > 100) { r->err = 1; return NULL; }   /* тот же предел, что у sing-box */
     unsigned kind = rd_u8(r);
     if (r->err) return NULL;
+    if (!*left) { r->err = 4; return NULL; }
+    (*left)--;
     struct lnode *n = calloc(1, sizeof(*n));
     if (!n) { r->err = 1; return NULL; }
     if (kind == 0) {
@@ -858,10 +873,13 @@ static struct lnode *scan_rule(struct rd *r, int depth, uint32_t *occ) {
         n->mode = rd_u8(r) ? 1 : 0;
         uint64_t cnt = rd_uvarint(r);
         if (r->err || cnt > 100000u) { r->err = 1; lnode_free(n); return NULL; }
+        /* Каждый ребёнок — узел бюджета: объявленное число сверх остатка отвергается до calloc,
+         * иначе массивы указателей на детей, которых в файле нет, росли бы по 800 КБ на узел. */
+        if (cnt > *left) { r->err = 4; lnode_free(n); return NULL; }
         n->kids = calloc(cnt ? (size_t)cnt : 1, sizeof(*n->kids));
         if (!n->kids) { r->err = 1; lnode_free(n); return NULL; }
         for (uint64_t i = 0; i < cnt; i++) {
-            struct lnode *k = scan_rule(r, depth + 1, occ);
+            struct lnode *k = scan_rule(r, depth + 1, occ, left);
             if (!k) { lnode_free(n); return NULL; }
             n->kids[n->nkids++] = k;
         }
@@ -1376,6 +1394,7 @@ static const char *rd_errtext(int code) {
     switch (code) {
     case 2: return "неизвестный тип элемента";
     case 3: return "неизвестный вид правила";
+    case 4: return "в правиле больше " SRS_STR(SRS_TREE_NODES) " вложенных правил";
     default: return "набор не разобран";
     }
 }
@@ -1401,7 +1420,8 @@ static struct srs_set *prescan(const char *path, struct err *e) {
     int bad = r->err || nrules > 100000u;
     uint32_t occ = 0;
     for (uint64_t i = 0; !bad && i < nrules; i++) {
-        struct lnode *n = scan_rule(r, 0, &occ);
+        size_t left = SRS_TREE_NODES;
+        struct lnode *n = scan_rule(r, 0, &occ, &left);
         if (!n) { bad = 1; break; }
         if (occ_reserve(s, occ) != 0 || norm_top(s, n, (uint32_t)i) != 0) {
             lnode_free(n);

@@ -26,6 +26,7 @@
 #include "srs.h"
 #include "srsplan.h"
 #include "unit.h"
+#include "memcap.h"
 
 #define FIX "tests/srs/"
 
@@ -506,6 +507,59 @@ static void t_limits(void) {
     if (system(rm)) { }
 }
 
+/* Дерево логического правила с бюджетом узлов (F7 аудита): набор 17 КБ — одно «или» из 4000 «или»
+ * по 1000 пустых правил, 4 млн узлов — прежде занимал 1 ГБ памяти. Теперь — отказ с числом,
+ * и пик памяти в пределах бюджета (около 34 МБ). Одно «или» на 100000 детей — прежний предел
+ * детей — по-прежнему читается. Наборы собирает python3 (zlib), как mksrs.py в t_limits. */
+static const char *g_bomb;
+static int open_bomb(void *arg) {
+    (void)arg;
+    const struct srs_set *s;
+    struct err e = {0};
+    int rc = srs_open(g_bomb, &s, &e);
+    return rc == -1 && strstr(e.msg, "131072") ? 0 : 1;
+}
+
+static void t_tree_budget(void) {
+    char dir[] = "/tmp/srsunit.XXXXXX";
+    if (!mkdtemp(dir)) return;
+    char bomb[300], wide[300], cmd[1400];
+    snprintf(bomb, sizeof bomb, "%s/bomb.srs", dir);
+    snprintf(wide, sizeof wide, "%s/wide.srs", dir);
+    static const char GEN[] =
+        "import sys, zlib\n"
+        "def uv(n):\n"
+        "    o = bytearray()\n"
+        "    while True:\n"
+        "        b = n & 0x7f; n >>= 7\n"
+        "        if n: o.append(b | 0x80)\n"
+        "        else: o.append(b); return bytes(o)\n"
+        "out, K, M = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])\n"
+        "leaf = b'\\x00\\xff\\x00'\n"
+        "inner = (b'\\x01\\x01' + uv(M) + leaf * M + b'\\x00') if M else leaf\n"
+        "body = uv(1) + b'\\x01\\x01' + uv(K) + inner * K + b'\\x00'\n"
+        "open(out, 'wb').write(b'SRS\\x01' + zlib.compress(body, 9))\n";
+    char gen[300];
+    snprintf(gen, sizeof gen, "%s/gen.py", dir);
+    FILE *f = fopen(gen, "w");
+    if (f) { fputs(GEN, f); fclose(f); }
+    snprintf(cmd, sizeof cmd, "python3 %s %s 4000 1000 && python3 %s %s 100000 0", gen, bomb, gen, wide);
+    check("наборы-бомбы собраны", 0, system(cmd));
+    g_bomb = bomb;
+    long kb = memcap_run(open_bomb, NULL, 512, 30);
+    check("4 млн узлов в одном правиле: отказ с числом 131072", 1, kb >= 0);
+    check("… пик памяти не больше 64 МиБ", 1, kb >= 0 && kb <= 64 * 1024);
+    if (kb > 64 * 1024) printf("     пик +%ld КиБ\n", kb);
+    const struct srs_set *s;
+    struct err e = {0};
+    check("«или» на 100000 детей — разобран", 0, srs_open(wide, &s, &e));
+    if (e.msg[0]) printf("     (%s)\n", e.msg);
+    if (!e.msg[0]) srs_release(s);
+    srs_cache_drop();
+    snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
+    if (system(cmd)) { }
+}
+
 static void t_l4(void) {
     struct l4match a, b, o;
     char t[128];
@@ -648,6 +702,7 @@ int main(void) {
     t_l4();
     t_union_many();
     t_limits();
+    t_tree_budget();
     t_plan();
     return unit_done("srsunit");
 }

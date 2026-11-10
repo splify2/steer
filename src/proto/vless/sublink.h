@@ -86,6 +86,8 @@ extern const char SL_BAD_PQV[], SL_FULL[], SL_BAD_PIN[], SL_BAD_ECH[], SL_ECH_DN
 /* Общая таблица длинных строк (pqv, encryption, отпечатки): одинаковые значения — один экземпляр. */
 const char *sl_intern(const char *v, size_t n);
 void sl_set_pqv(struct vless_node *n, const char *v);
+/* Отпечатки поля через запятую → n->pcs (spki 0) или n->pks (spki 1), повторы отсеяны; поле, заданное
+ * снова, заменяет прежний список. Массив склеивает вызывающий: один вызов на поле (см. sublink.c). */
 void sl_add_pins(struct vless_node *n, const char *v, int spki);
 void sl_set_vcn(struct vless_node *n, const char *v);
 void sl_set_ech(struct vless_node *n, const char *v);

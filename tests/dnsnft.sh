@@ -26,6 +26,9 @@
 #     элемент карты не меняется; имя, которое спросили после долгого простоя, — меняется.
 #  9. Апстрим отвечает 0.0.0.0 (блокирует имя): клиенту — 0.0.0.0, поддельный адрес не выдаётся,
 #     в карте и файле состояния имени нет; подмена, уже стоявшая под именем, снимается.
+# 10. Вопрос с байтом 0 внутри метки (имя для строки — «victim.io», для апстрима — имя в зоне
+#     нападающего): ответ уходит клиенту как есть, но карта и файл состояния victim.io не тронуты.
+# 11. Предел выдачи fake-IP на клиента: сверх него — SERVFAIL этому клиенту, другому — адрес.
 #
 # Нужны root (сетевое пространство и nf_tables), nft и python3. Без них стенд пропускается,
 # а не проваливается: остальной набор обязан проходить на голой машине.
@@ -46,7 +49,7 @@ nft add table inet steer 2>/dev/null || { echo "dnsnft: nf_tables недосту
 nft add map inet steer fakeip '{ type ipv4_addr : ipv4_addr; }'
 
 tmp="$(mktemp -d)"
-trap 'kill ${DPID:-0} ${UPID:-0} ${MPID:-0} ${DPID6:-0} ${UPID6:-0} ${DPID8:-0} 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'kill ${DPID:-0} ${UPID:-0} ${MPID:-0} ${DPID6:-0} ${UPID6:-0} ${DPID8:-0} ${DPID11:-0} 2>/dev/null; rm -rf "$tmp"' EXIT
 # Выход без IPv6 в фикстурах — мост Telegram (kind: tgws), вид плагина tgws: каталог плагинов дерева.
 sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" >/dev/null || { echo "dnsnft: каталог плагинов не собран"; exit 2; }
 STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
@@ -75,9 +78,15 @@ cat > "$tmp/client.py" <<'PY'
 import socket, struct, sys
 port, name = int(sys.argv[1]), sys.argv[2]
 q = struct.pack('>HHHHHH', 0x4242, 0x0100, 1, 0, 0, 0)
-for l in name.split('.'): q += bytes([len(l)]) + l.encode()
-q += b'\x00' + struct.pack('>HH', 1, 1)
+if name.startswith('hex:'):                 # имя в проводе как есть, с корнем (метки с чужими байтами)
+    q += bytes.fromhex(name[4:])
+else:
+    for l in name.split('.'): q += bytes([len(l)]) + l.encode()
+    q += b'\x00'
+q += struct.pack('>HH', 1, 1)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+import os
+if os.environ.get('DNSNFT_SRC'): s.bind((os.environ['DNSNFT_SRC'], 0))   # другой клиент
 s.sendto(q, ('127.0.0.1', port))
 try:
     d, _ = s.recvfrom(2048)
@@ -90,7 +99,7 @@ else: print(".".join(str(b) for b in d[-4:]))
 PY
 
 printf 'example.com\nmoved.net\nfail.io\nstay.org\nperm.io\nwin.io\nwin2.io\n' > "$tmp/d.lst"
-printf 'bind.io\nidle.io\nzero.io\nheal.io\n' >> "$tmp/d.lst"
+printf 'bind.io\nidle.io\nzero.io\nheal.io\nvictim.io\npre.io\npa.io\npb.io\npc.io\npc2.io\n' >> "$tmp/d.lst"
 printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
 '"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
 '"channels":[{"name":"c","match":{"domains_files":["%s/d.lst"],"mode":"fakeip"},"out":"vpn"}]}' \
@@ -431,10 +440,63 @@ ask8 heal.io > /dev/null
 settle
 check "9. апстрим стал отвечать 0.0.0.0 — подмена снята из карты" "" "$(mapval "$fake")"
 check "9. и следующий ответ клиенту — 0.0.0.0" "0.0.0.0" "$(ask8 heal.io)"
+# --- 10. Байт 0 внутри метки (аудит 2.1.0, D1) -------------------------------------------------
+# Вопрос «\x06victim\x03io\x00\x08attacker\x07example»: метка «io\0» прежде обрывала строку, и имя
+# читалось как victim.io — под правилом, — а адрес из ответа на имя в зоне нападающего вставал в
+# карту поддельного адреса victim.io для всех клиентов и в файл состояния.
+echo 203.0.113.101 > "$tmp/ip"
+vfake="$(ask8 victim.io)"
+settle
+check "10. victim.io: в карте настоящий адрес" "203.0.113.101" "$(mapval "$vfake")"
+echo 6.6.6.6 > "$tmp/ip"
+check "10. вопрос с байтом 0 в метке — ответ апстрима как есть, без поддельного адреса" "6.6.6.6" \
+    "$(ask8 hex:0676696374696d03696f000861747461636b6572076578616d706c6500)"
+settle
+check "10. карта поддельного адреса victim.io не тронута" "203.0.113.101" "$(mapval "$vfake")"
+check "10. и подмены на адрес нападающего в карте нет" "0" \
+    "$(nft list map inet steer fakeip | grep -c ': 6\.6\.6\.6')"
+# То же до первого вопроса жертвы: прежде запись pre.io заводилась с адресом нападающего, и
+# первый же честный вопрос получал поддельный адрес, ведущий к нему.
+echo 6.6.6.6 > "$tmp/ip"
+check "10. вопрос с байтом 0 до записи имени — ответ апстрима как есть" "6.6.6.6" \
+    "$(ask8 hex:0370726503696f000861747461636b6572076578616d706c6500)"
+settle
+echo 203.0.113.102 > "$tmp/ip"
+pfake="$(ask8 pre.io)"
+settle
+check "10. затем честный вопрос pre.io — в карте настоящий адрес, не нападающего" "203.0.113.102" \
+    "$(mapval "$pfake")"
 kill "$DPID8" 2>/dev/null; wait "$DPID8" 2>/dev/null
+check "10. в файле состояния имени нападающего нет, victim.io — одна строка" "0 1" \
+    "$(grep -c 'attacker' "$tmp/state8/fakeip.state") $(grep -c '^victim\.io' "$tmp/state8/fakeip.state")"
 check "9. в файле состояния заблокированных имён нет" "0" \
     "$(grep -c '^zero\.io\|^heal\.io' "$tmp/state8/fakeip.state")"
 check "9. а имена с подменой — на месте" "2" "$(grep -c '^bind\.io\|^idle\.io' "$tmp/state8/fakeip.state")"
+
+# --- 11. Предел выдачи fake-IP на клиента (аудит 2.1.0, D5) ------------------------------------
+# Предел на стенде — 2 (STEER_DNSD_FAKEIP_PER_CLIENT; по умолчанию восьмая часть пула). Третье
+# новое имя под правилом того же клиента — SERVFAIL, а не настоящий адрес мимо выхода; другой
+# клиент то же имя получает поддельным адресом. Клиенты — адреса 10.99.0.1 и .2 на lo: петля
+# предела не имеет (за ней пересыльщики всей сети, fakeip_client_key).
+ip addr add 10.99.0.1/32 dev lo
+ip addr add 10.99.0.2/32 dev lo
+LPORT11=15324
+mkdir -p "$tmp/state11"
+STEER_DNSD_FAKEIP_PER_CLIENT=2 "$BIN" dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state11" \
+    --listen-port "$LPORT11" --upstream-port "$UPORT" > "$tmp/log11" 2>&1 & DPID11=$!
+sleep 1
+ask11() { DNSNFT_SRC="${SRC11:-10.99.0.1}" python3 "$tmp/client.py" "$LPORT11" "$1"; }
+echo 203.0.113.111 > "$tmp/ip"
+check "11. первое и второе имя клиента — поддельные адреса" "198.18 198.18" \
+    "$(ask11 pa.io | cut -d. -f1-2) $(ask11 pb.io | cut -d. -f1-2)"
+check "11. третье — SERVFAIL, не настоящий адрес" "rcode2" "$(ask11 pc.io)"
+check "11. уже выданное имя — по-прежнему поддельный адрес" "198.18" "$(ask11 pa.io | cut -d. -f1-2)"
+check "11. другой клиент получает поддельный адрес того же имени" "198.18" \
+    "$(SRC11=10.99.0.2 ask11 pc.io | cut -d. -f1-2)"
+check "11. строка журнала называет предел" "1" "$(grep -c 'предел fake-IP (2 адресов' "$tmp/log11")"
+check "11. с петли предела нет — третье имя получает поддельный адрес" "198.18" \
+    "$(SRC11=127.0.0.1 ask11 pc2.io | cut -d. -f1-2)"
+kill "$DPID11" 2>/dev/null; wait "$DPID11" 2>/dev/null
 
 nft delete map inet steer fakeip6
 nft add map inet steer fakeip6 '{ type ipv6_addr : ipv4_addr; }'

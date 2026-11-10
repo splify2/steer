@@ -22,6 +22,7 @@
 
 #include "../src/proto/vless/sub.c"
 #include "nodesel.h"
+#include "memcap.h"
 /* Вывод UUID живёт в vless_proto.c, а проверка пригодности — в sub.c, и стенду нужны
  * оба: ссылка из панели обязана и пройти проверку пригодности, и дать те самые 16 байт,
  * которые уедут в заголовок запроса. Исходник включается тем же приёмом, что и sub.c —
@@ -85,6 +86,63 @@ static void on_alarm(int sig) {
     (void)sig;
     printf("ЗАВИС: разбор не вернулся за 2 с\n");
     _exit(1);
+}
+
+/* Подписка sing-box с одним узлом и 4000 пинами certificate_public_key_sha256 (как gen_pins.py
+ * аудита): arg 0 — один и тот же пин, 1 — все разные. 0 — узел взят и пины у него верные. */
+static void b64_32(const unsigned char raw[32], char out[45]) {
+    static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0;
+    for (int i = 0; i < 33; i += 3) {
+        unsigned v = (unsigned)raw[i] << 16 | (i + 1 < 32 ? (unsigned)raw[i + 1] << 8 : 0) | (i + 2 < 32 ? raw[i + 2] : 0);
+        out[o++] = A[v >> 18 & 63]; out[o++] = A[v >> 12 & 63];
+        out[o++] = i + 1 < 32 ? A[v >> 6 & 63] : '=';
+        out[o++] = i + 2 < 32 ? A[v & 63] : '=';
+    }
+    out[o] = '\0';
+}
+
+static int pins_sb(void *arg) {
+    enum { K = 4000 };
+    int distinct = arg != NULL;
+    size_t cap = (size_t)K * 50 + 1024, o = 0;
+    char *js = malloc(cap);
+    if (!js) return 1;
+    o += (size_t)snprintf(js + o, cap - o, "{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"x\",\"server\":\"h.example\","
+                          "\"server_port\":443,\"uuid\":\"11111111-1111-1111-1111-111111111111\",\"tls\":{\"enabled\":true,"
+                          "\"server_name\":\"h.example\",\"certificate_public_key_sha256\":[");
+    for (int i = 0; i < K; i++) {
+        unsigned char raw[32] = { 0 };
+        char b[45];
+        if (distinct) { raw[0] = (unsigned char)(i >> 8); raw[1] = (unsigned char)i; }
+        b64_32(raw, b);
+        o += (size_t)snprintf(js + o, cap - o, "%s\"%s\"", i ? "," : "", b);
+    }
+    snprintf(js + o, cap - o, "]}}]}");
+    struct vless_node nodes[2];
+    struct vless_sub_stats st;
+    size_t n = vless_parse_sub(js, nodes, 2, &st);
+    free(js);
+    if (n != 1 || !nodes[0].pks) return 1;
+    size_t want = distinct ? (size_t)K * 65 - 1 : 64;
+    return strlen(nodes[0].pks) == want ? 0 : 1;
+}
+
+/* Ссылка с 3000 повторами pcs=<разные 64 hex> (poc/pcs3000.txt аудита). Действует последнее. */
+static int pins_link(void *arg) {
+    (void)arg;
+    enum { K = 3000 };
+    size_t cap = (size_t)K * 72 + 256, o = 0;
+    char *u = malloc(cap);
+    if (!u) return 1;
+    o += (size_t)snprintf(u + o, cap - o, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&sni=h.example");
+    for (int i = 0; i < K; i++) o += (size_t)snprintf(u + o, cap - o, "&pcs=%056x%08x", 0u, (unsigned)i);
+    struct vless_node n;
+    int rc = vless_parse_url(u, &n);
+    free(u);
+    char last[65];
+    snprintf(last, sizeof last, "%056x%08x", 0u, (unsigned)(K - 1));
+    return rc == 0 && n.pcs && !strcmp(n.pcs, last) ? 0 : 1;
 }
 
 int main(void) {
@@ -1268,6 +1326,44 @@ int main(void) {
                  "?security=reality&sni=a.example&pbk=k&fp=chrome#%%D0%%A3%%D0%%B7%%D0%%B5%%D0%%BB");
         check_n("короткое имя: узел разобран", 0, vless_parse_url(url, &n));
         check("короткое имя не тронуто обрезкой", "Узел", n.name);
+    }
+
+    /* ---- пины сертификата: память линейна по их числу (F3) --------------------------------------
+     * Прежде каждый пин массива sing-box и каждый повтор pcs= копировал весь накопленный список в
+     * общую таблицу строк, которая ничего не освобождает: 4000 пинов (188 КБ подписки) — 1 ГБ.
+     * Разбор идёт в дочернем процессе с потолком 512 МиБ; допуск по пику RSS — 32 МиБ. */
+    {
+        long kb;
+        kb = memcap_run(pins_sb, (void *)0, 512, 20);
+        check_n("пины: 4000 одинаковых в массиве sing-box — пик RSS ≤ 32 МиБ", 1, kb >= 0 && kb <= 32 * 1024);
+        if (kb < 0 || kb > 32 * 1024) printf("     пик +%ld КиБ\n", kb);
+        kb = memcap_run(pins_sb, (void *)1, 512, 20);
+        check_n("пины: 4000 разных в массиве sing-box — пик RSS ≤ 32 МиБ", 1, kb >= 0 && kb <= 32 * 1024);
+        if (kb < 0 || kb > 32 * 1024) printf("     пик +%ld КиБ\n", kb);
+        kb = memcap_run(pins_link, NULL, 512, 20);
+        check_n("пины: 3000 повторов pcs= в ссылке — пик RSS ≤ 32 МиБ", 1, kb >= 0 && kb <= 32 * 1024);
+        if (kb < 0 || kb > 32 * 1024) printf("     пик +%ld КиБ\n", kb);
+
+        /* Повторы отпечатка отсеиваются, порядок первых вхождений сохраняется; поле, заданное снова,
+         * заменяет прежний список; испорченный отпечаток не снимается следующим значением. */
+        struct vless_node n;
+        char u[600];
+        char h1[65], h2[65];
+        memset(h1, 'a', 64); h1[64] = '\0';
+        memset(h2, 'b', 64); h2[64] = '\0';
+        snprintf(u, sizeof u, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&sni=h.example"
+                 "&pcs=%s,%s,%s", h1, h2, h1);
+        check_n("pcs с повтором: узел разобран", 0, vless_parse_url(u, &n));
+        char want[200];
+        snprintf(want, sizeof want, "%s,%s", h1, h2);
+        check("pcs с повтором: повтор отсеян, порядок цел", want, n.pcs ? n.pcs : "(нет)");
+        snprintf(u, sizeof u, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&sni=h.example"
+                 "&pcs=%s&pcs=%s", h1, h2);
+        check_n("pcs дважды: узел разобран", 0, vless_parse_url(u, &n));
+        check("pcs дважды: действует последнее", h2, n.pcs ? n.pcs : "(нет)");
+        snprintf(u, sizeof u, "vless://11111111-2222-3333-4444-555555555555@h.example:443?security=tls&sni=h.example"
+                 "&pcs=abcd&pcs=%s", h2);
+        check_n("pcs испорчен, затем годен: узел непригоден", 1, vless_parse_url(u, &n));
     }
 
     printf("\n%d проверок пройдено", g_pass);

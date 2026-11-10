@@ -154,6 +154,11 @@ static int cmd_selftest(void) {
  * the SAME address (persistence); a different domain must print a different
  * one (collision-freedom) — that's what the bats coverage exercises. */
 static int cmd_fakeip(const char *state_path, const char *domain) {
+    /* Имя ложится строкой в файл состояния — то же правило, что у имени из провода (wire.c). */
+    if (!dns_name_ok(domain)) {
+        fprintf(stderr, "не имя DNS: %s\n", domain);
+        return 1;
+    }
     g_fakeip_state_path = state_path;
     fakeip_state_load(state_path);
     uint32_t addr;

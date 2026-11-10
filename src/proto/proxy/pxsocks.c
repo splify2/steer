@@ -307,7 +307,9 @@ static int sk_deliver(const void *ctx, void *sess, int udp, const unsigned char 
                       dialer_emit_fn emit, void *arg) {
     (void)ctx; (void)sess;
     if (!udp) return got ? emit(arg, rx, got) : 0;
-    if (got < 3) return 0;
+    /* RSV(2) FRAG(1) и тип адреса (1): короче — не датаграмма. «got < 3» пропускал got == 3 и читал
+     * rx[3] за концом принятого. */
+    if (got < 4) return 0;
     /* [RSV(2) FRAG(1) адрес SOCKS5 данные]; фрагментированные (FRAG != 0) не поддерживаем. */
     if (rx[2] != 0) return 0;
     size_t o = 3, al;

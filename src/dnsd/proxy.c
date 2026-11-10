@@ -532,20 +532,83 @@ static int pending_reap(time_t now) {
     int live = 0;
     for (int i = 0; i < MAX_PENDING; i++) {
         if (g_pending[i].in_use && g_pending[i].expire < now)
-            g_pending[i].in_use = 0;      /* сокета за слотом больше нет — закрывать нечего */
+            pending_drop(&g_pending[i]);  /* сокета за слотом больше нет — закрывать нечего */
         live |= g_pending[i].in_use;
     }
     return live;
 }
 
-static struct pending *pending_alloc(void) {
-    for (int i = 0; i < MAX_PENDING; i++)
-        if (!g_pending[i].in_use) return &g_pending[i];
-    /* Всё занято — прежде чем ронять запрос, попробовать вернуть протухшее:
-     * редкий путь, но именно он сохраняет прежнюю ёмкость под всплеском. */
-    pending_reap(time(NULL));
-    for (int i = 0; i < MAX_PENDING; i++)
-        if (!g_pending[i].in_use) return &g_pending[i];
+/* ДОЛЯ ТАБЛИЦЫ НА КЛИЕНТА (аудит 2.1.0, D6). Таблица одна на всех: 1024 места по 5 с — 204 вопроса
+ * в секунду без ответа. Один клиент, засыпающий резолвер вопросами к молчащей зоне (или в упор в
+ * dns-forward-max dnsmasq), прежде занимал все места, и вопросы остальных отбрасывались молча. Теперь
+ * у клиента (fakeip_client_key: адрес IPv4 или /64 IPv6) не больше PENDING_PER_CLIENT мест; новый
+ * вопрос сверх них вытесняет его же самый давний — не дождавшийся ответа дольше всех, — а места
+ * остальных не трогает. Восьмая часть (128): это 25 вопросов в секунду без ответа от одного
+ * устройства, а живой клиент за раз держит десятки (страница — 20-40 имён) и отпускает их за
+ * миллисекунды ответа. Петля доли не имеет: за ней пересыльщики всей сети (коннектор, AdGuard Home).
+ * Вытесненный вопрос — то же, что протухший (pending_reap): его ответ, если придёт, уже не
+ * совпадёт ни поколением, ни отпечатком, ни номером вопроса своего транспорта.
+ *
+ * Счёт мест клиента — в g_pend_kc, и меняется он только парой pending_take/pending_drop: всякое
+ * «занято/свободно» слота идёт через них. Проход по таблице ради подсчёта на каждый вопрос стоил бы
+ * 200 КБ памяти на пакет (см. pending_reap); по таблице ходит только вытеснение, то есть клиент
+ * уже у своей доли. */
+#define PENDING_PER_CLIENT (MAX_PENDING / 8)
+static struct kcount g_pend_kc;
+
+void pending_take(struct pending *p) {
+    if (p->in_use) return;
+    p->in_use = 1;
+    /* Нет памяти на счёт — место без счёта (ckey 0): доля не действует, но и не врёт. */
+    if (p->ckey && kc_add(&g_pend_kc, p->ckey) != 0) p->ckey = 0;
+}
+
+void pending_drop(struct pending *p) {
+    if (!p->in_use) return;
+    p->in_use = 0;
+    kc_sub(&g_pend_kc, p->ckey);
+}
+
+/* Мест у клиента сейчас (стенды). */
+unsigned pending_client_count(uint64_t key) { return kc_get(&g_pend_kc, key); }
+
+/* Не static ради tests/dnsmatch.c (см. struct pending в dnsd_int.h): доля проверяется там. Место
+ * выдаётся свободным (in_use == 0) с ключом клиента; занятым его делает pending_take. */
+struct pending *pending_alloc(const struct sockaddr_storage *from) {
+    uint64_t key = from ? fakeip_client_key(from) : 0;
+    if (key && kc_get(&g_pend_kc, key) >= PENDING_PER_CLIENT) {
+        struct pending *own_old = NULL;
+        for (int i = 0; i < MAX_PENDING; i++) {
+            struct pending *q = &g_pending[i];
+            if (q->in_use && q->ckey == key && (!own_old || q->expire < own_old->expire)) own_old = q;
+        }
+        if (own_old) {
+            static time_t said;
+            if (warn_due(&said, time(NULL))) {
+                char who[INET6_ADDRSTRLEN] = "?";
+                if (from->ss_family == AF_INET6)
+                    inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)from)->sin6_addr, who, sizeof(who));
+                else if (from->ss_family == AF_INET)
+                    inet_ntop(AF_INET, &((const struct sockaddr_in *)from)->sin_addr, who, sizeof(who));
+                fprintf(stderr, "steer dnsd: клиент %s держит %d вопросов без ответа (его доля "
+                                "таблицы ожиданий из %d): новый вытесняет его же самый давний\n",
+                        who, PENDING_PER_CLIENT, MAX_PENDING);
+            }
+            pending_drop(own_old);
+            own_old->ckey = key;
+            return own_old;
+        }
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < MAX_PENDING; i++)
+            if (!g_pending[i].in_use) {
+                g_pending[i].ckey = key;
+                return &g_pending[i];
+            }
+        /* Всё занято — прежде чем ронять запрос, попробовать вернуть протухшее:
+         * редкий путь, но именно он сохраняет прежнюю ёмкость под всплеском. */
+        if (pass == 0) pending_reap(time(NULL));
+    }
     return NULL;
 }
 
@@ -559,7 +622,7 @@ static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, 
 static void pending_arm(struct pending *p, const struct sockaddr_storage *from, socklen_t fromlen,
                         const struct dnsd_local *local, int have_local, int hit, chm_t sets,
                         int quiet) {
-    p->in_use = 1;
+    pending_take(p);
     g_live = 1;
     p->tcp_up = -1;
     p->sec = 0;
@@ -590,6 +653,39 @@ static int from_loopback(const struct sockaddr_storage *a) {
         return IN6_IS_ADDR_V4MAPPED(v6) && v6->s6_addr[12] == 127;
     }
     return 0;
+}
+
+/* КЛИЕНТ ДЛЯ ПРЕДЕЛОВ (выдача fake-IP — fakeip.c, FAKEIP_PER_CLIENT; места таблицы ожиданий —
+ * pending_alloc): адрес IPv4 (и v4-mapped), у IPv6 — префикс /64. Устройство со SLAAC владеет всей
+ * своей /64 и меняет адреса временных расширений (RFC 8981) сколько угодно: ключ по полному адресу
+ * IPv6 предела бы не давал. Ключ IPv4 — 0xFFFF:адрес в верхних битах (префикса /64 «0:0:ffff:…» у
+ * настоящего клиента IPv6 не бывает).
+ *
+ * Петля (127.0.0.0/8, ::1) — 0, «не считать»: с петли спрашивают пересыльщики самого устройства,
+ * за каждым из которых — вся сеть (коннектор sing-box для podkop и forkop, AdGuard Home или
+ * dnsmasq перед резолвером), и предел одного клиента стал бы пределом всей сети. Процессы
+ * роутера — не чужие. */
+uint64_t fakeip_client_key(const struct sockaddr_storage *a) {
+    uint32_t v4;
+    if (a->ss_family == AF_INET) {
+        v4 = ntohl(((const struct sockaddr_in *)a)->sin_addr.s_addr);
+    } else if (a->ss_family == AF_INET6) {
+        const struct in6_addr *v6 = &((const struct sockaddr_in6 *)a)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(v6)) {
+            memcpy(&v4, &v6->s6_addr[12], 4);
+            v4 = ntohl(v4);
+        } else if (IN6_IS_ADDR_LOOPBACK(v6)) {
+            return 0;
+        } else {
+            uint64_t k = 0;
+            for (int i = 0; i < 8; i++) k = (k << 8) | v6->s6_addr[i];
+            return k ? k : 1;
+        }
+    } else {
+        return 1;
+    }
+    if ((v4 >> 24) == 127) return 0;
+    return (0xFFFFull << 32) | v4;
 }
 
 static chm_t match_for(const char *qname, uint16_t qtype) {
@@ -709,7 +805,12 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
     uint16_t qtype = 0;
     size_t qend = 0;
     int quiet = 0;
-    int hit = -2; /* -2 = вопрос не разобрался; см. struct pending */
+    /* -2 = вопрос не разобрался; см. struct pending. Сюда же — имя с байтом, которому в строке не
+     * место (0, '.', управляющие внутри метки — wire.c, label_byte_ok): такой вопрос уходит наверх
+     * как есть, но без правил, кэша и fake-IP, и ответ на него ничему не учит. Не FORMERR: имена
+     * экземпляров DNS-SD с пробелом законны и продолжают разрешаться, только мимо правил — как
+     * любое имя вне их. */
+    int hit = -2;
     chm_t sets = 0;
     if (parse_query(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend) == 0) {
         /* Совпавшие каналы — ВСЕ, а решает ответ первый из них: он старший по
@@ -827,7 +928,7 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
         }
     }
 
-    struct pending *p = pending_alloc();
+    struct pending *p = pending_alloc(&from);
     if (!p) {
         /* Мест нет: запрос отбрасывается, клиент переспросит сам. Но сказать об этом
          * надо — это и есть «DNS тормозит», увиденное изнутри, и без строки в журнале
@@ -971,7 +1072,7 @@ static void forward_old(struct pending *p, uint8_t *buf, size_t n, size_t qend,
     p->qfp = (qend > 12 && qend <= (size_t)n) ? question_fp(buf, qend) : 0;
     p->qsec_end = (uint16_t)((p->qfp) ? qend : 0);
 
-    p->in_use = 1;
+    pending_take(p);
     g_live = 1;
     p->tcp_up = tcpu;
     p->sec = 0;
@@ -1051,6 +1152,34 @@ static int handle_upstream_response(int ufd) {
     return upstream_answer(p, buf, n);
 }
 
+/* Поддельный адрес имени под правилом не выдан (пул исчерпан или клиент дошёл до своего предела,
+ * fakeip_lookup_or_alloc_for): клиенту SERVFAIL, а не настоящий адрес — настоящий увёл бы имя мимо
+ * выхода, который выбрал человек (аудит 2.1.0, D5: прежде так и было). SERVFAIL резолверы клиентов
+ * держат секунды, и имя спросят снова, когда адрес найдётся. rc -2 — предел клиента: строка журнала
+ * называет его адрес и число, не чаще раза в WARN_EVERY_SEC. */
+static void fakeip_refuse(struct pending *p, const uint8_t *buf, size_t qend, int rc) {
+    if (rc == -2) {
+        static time_t said;
+        if (warn_due(&said, time(NULL))) {
+            char who[INET6_ADDRSTRLEN] = "?";
+            if (p->client.ss_family == AF_INET6)
+                inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)&p->client)->sin6_addr, who, sizeof(who));
+            else if (p->client.ss_family == AF_INET)
+                inet_ntop(AF_INET, &((const struct sockaddr_in *)&p->client)->sin_addr, who, sizeof(who));
+            fprintf(stderr, "steer dnsd: клиент %s занял свой предел fake-IP (%u адресов, все "
+                            "спрошены в последние %d с или держат соединения): его новые имена "
+                            "под правилами получают SERVFAIL\n", who, fakeip_per_client(),
+                    g_fakeip_idle);
+        }
+    }
+    if (p->quiet) return;
+    uint8_t out[512];
+    size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
+    if (!len) return;
+    out[3] = (uint8_t)((out[3] & 0xf0) | 0x02);              /* RCODE 2 — SERVFAIL */
+    reply_client(out, len, &p->client, p->client_len, &p->local, p->have_local);
+}
+
 /* Ответ сверху, уже сверенный со своим ожиданием, — один путь для UDP и TCP: доменные каналы,
  * fakeip, наборы, ответ клиенту. Кому отвечать, решает g_tcp_cur (см. reply_client). */
 static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
@@ -1063,7 +1192,7 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
     buf[0] = (uint8_t)(p->cli_id >> 8);
     buf[1] = (uint8_t)(p->cli_id & 0xFF);
 
-    p->in_use = 0;
+    pending_drop(p);
     int quiet = p->quiet;
 
     /* Несовпавший домен (подавляющее большинство трафика): решение уже принято
@@ -1230,7 +1359,14 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
             }
             return 1;
         }
-        if (fakeip_lookup_or_alloc(qname, &fake_addr) == 0) {
+        int arc = fakeip_lookup_or_alloc_for(qname, fakeip_client_key(&p->client), &fake_addr);
+        if (arc == -2) {
+            /* Предел клиента: SERVFAIL, как у A, — пустой AAAA увёл бы его на A, которое
+             * откажут тем же. Исчерпанный пул (-1) — пустой ответ ниже, как прежде. */
+            fakeip_refuse(p, buf, qend, arc);
+            return 1;
+        }
+        if (arc == 0) {
             /* «Установленное» — то, что знаем, а не только то, что подтвердило ядро: после
              * резолвера, поднятого до набора правил, в карте лежит засев из файла (real_saved,
              * struct fakeip_entry), и смена адреса обязана идти одной транзакцией «снять —
@@ -1292,7 +1428,12 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
 
     if (qtype == DNS_TYPE_A && nips > 0) {
         uint32_t fake_addr;
-        if (fakeip_lookup_or_alloc(qname, &fake_addr) == 0) {
+        int arc = fakeip_lookup_or_alloc_for(qname, fakeip_client_key(&p->client), &fake_addr);
+        if (arc != 0) {
+            fakeip_refuse(p, buf, qend, arc);
+            return 1;
+        }
+        {
             /* Какой адрес класть в DNAT. Порядок RR в ответе — не сигнал: CDN
              * тасуют записи в каждом ответе, и «первый A сменился» означало
              * delete+add транзакцию в ядре и перезапись state-файла на каждый
@@ -1393,9 +1534,9 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
     }
 
     /* Fallback: matched but nothing to substitute (qtype outside A/AAAA/HTTPS/SVCB
-     * — MX, TXT, PTR and the like — zero real A answers yet, or the fake-IP pool
-     * is exhausted). Relay the real answer unchanged — fail open, never block the
-     * DNS transaction. */
+     * — MX, TXT, PTR and the like — zero real A answers yet, or a persistent kernel
+     * refusal of the map). Relay the real answer unchanged — fail open, never block the
+     * DNS transaction. Исчерпанный пул сюда больше не приходит: это SERVFAIL (fakeip_refuse). */
     if (!quiet)
         reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
     return 1;
@@ -1714,7 +1855,7 @@ static struct pending *tcpu_pending(const struct tcpu *u) {
 /* Наверх не вышло (не соединился, оборвал, ответил не то) — SERVFAIL клиенту и конец. */
 static void tcpu_fail(struct tcpu *u) {
     struct pending *p = tcpu_pending(u);
-    if (p) p->in_use = 0;
+    if (p) pending_drop(p);
     tcp_servfail(tcpu_conn(u), u->q + 2, u->qend, u->cli_id);
     tcpu_close(u);
 }
@@ -1919,7 +2060,7 @@ static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, 
             else g_other_pause.fail++;
             g_other_fallback++;
             uint8_t qb[MAX_PKT];
-            p->in_use = 0;
+            pending_drop(p);
             p->sec = 0;
             p->oth = 0;
             if (tc != &g_tcp_dead && qn >= 12 && qn <= sizeof(qb)) {
@@ -1934,7 +2075,7 @@ static void sec_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, 
         p->sec = 0;
         upstream_answer(p, (uint8_t *)(uintptr_t)ans, (ssize_t)n);
     } else if (!ok) {
-        p->in_use = 0;
+        pending_drop(p);
         p->sec = 0;
         static time_t said;
         if (warn_due(&said, time(NULL)))

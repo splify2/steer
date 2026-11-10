@@ -225,8 +225,15 @@ static struct ydoc *idx_verify(struct pm_repo *r, const char *body, size_t bn, c
     return d;
 }
 
-static int http_to_mem(const char *url, const char *etag, char **body, size_t *bn, char **etag_out,
-                       int *not_modified, char *why, size_t wn) {
+/* Потолки ответа зеркала: зеркала по замыслу недоверенные — подпись защищает содержимое, но не
+ * размер, а индекс и подпись читаются в память целиком до проверки. Индекс — 16 МиБ: сейчас это
+ * около 1,2 КБ на плагин (семя на 8 плагинов — 9,5 КБ), потолок оставляет место на десятки тысяч
+ * плагинов. Подпись — 1 МиБ: блок usign — 156 байт, а блоков столько, сколько ключей в ротации. */
+#define PM_INDEX_MAX ((unsigned long long)16 << 20)
+#define PM_SIG_MAX   ((unsigned long long)1 << 20)
+
+static int http_to_mem(const char *url, const char *etag, unsigned long long max, char **body, size_t *bn,
+                       char **etag_out, int *not_modified, char *why, size_t wn) {
     char *tmpd = pm_strdup(pm_tmp());
     pm_mkdirs(tmpd);
     char *dest = pm_fmt("%s/.idx.%d", tmpd, (int)getpid());
@@ -238,6 +245,7 @@ static int http_to_mem(const char *url, const char *etag, char **body, size_t *b
     q.connect_ms = 10000;
     q.idle_ms = 30000;
     q.total_ms = 120000;
+    q.max_body = max;
     struct http_resp rp = {0};
     int rc = http_get(&q, &rp, why, wn);
     *not_modified = 0;
@@ -263,10 +271,10 @@ static int http_to_mem(const char *url, const char *etag, char **body, size_t *b
     return rc;
 }
 
-int pm_http_mem(const char *url, char **body, size_t *n, char *why, size_t wn) {
+int pm_http_mem(const char *url, int sig, char **body, size_t *n, char *why, size_t wn) {
     int nm = 0;
     *body = NULL;
-    return http_to_mem(url, NULL, body, n, NULL, &nm, why, wn);
+    return http_to_mem(url, NULL, sig ? PM_SIG_MAX : PM_INDEX_MAX, body, n, NULL, &nm, why, wn);
 }
 
 static int idx_from_cache(struct pm_repo *r, struct pm_err *e) {
@@ -328,7 +336,7 @@ int pm_index_get(struct pm_repo *r, int refresh, struct pm_err *e) {
             char *body = NULL, *netag = NULL;
             size_t bn = 0;
             int nm = 0;
-            int rc = http_to_mem(u, etag && *etag ? etag : NULL, &body, &bn, &netag, &nm, why, sizeof(why));
+            int rc = http_to_mem(u, etag && *etag ? etag : NULL, PM_INDEX_MAX, &body, &bn, &netag, &nm, why, sizeof(why));
             if (rc != 0) {
                 free(net_err);
                 net_err = pm_fmt("%s: %s", u, why);
@@ -352,7 +360,7 @@ int pm_index_get(struct pm_repo *r, int refresh, struct pm_err *e) {
             size_t sn = 0;
             int snm = 0;
             char why2[256] = "";
-            rc = http_to_mem(su, NULL, &sig, &sn, NULL, &snm, why2, sizeof(why2));
+            rc = http_to_mem(su, NULL, PM_SIG_MAX, &sig, &sn, NULL, &snm, why2, sizeof(why2));
             free(su);
             if (rc != 0) {
                 free(net_err);
@@ -470,6 +478,9 @@ static const char *key_of(const struct ynode *map, const char *id) {
 
 int pm_select(struct pm_ctx *x, struct pm_repo *r, const char *id, const char *range, const char *exact,
               const char *variant, const char *below, struct pm_cand *c, struct pm_err *e) {
+    /* Имя идёт в пути (архив во временном каталоге, .stage, <root>/<id>); зависимость из чужого
+     * манифеста приходит сюда без проверки командной строки. */
+    if (!pm_id_ok(id)) return pm_errc(e, "plugin.bad_name", NULL, "недопустимое имя плагина");
     const struct ynode *pl = pm_index_plugin(r, id);
     if (!pl) return pm_errc(e, "plugin.not_in_repo", PMA("id", id, "name", r->name), "плагина %s нет в репозитории %s", id, r->name);
     const struct ynode *vs = ynode_get(pl, "versions");

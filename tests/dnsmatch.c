@@ -409,6 +409,275 @@ int main(void) {
     }
 
     {
+        /* ИМЕНА С ЧУЖИМИ БАЙТАМИ В МЕТКЕ (аудит 2.1.0, D1–D3; стенд аудита audit/dnsname.c).
+         * Метка из провода становилась строкой как есть: байт 0 обрывал имя (вопрос в зону
+         * нападающего читался как youtube.com, и адрес из его ответа вставал в карту fake-IP),
+         * точка внутри метки давала то же имя, что две метки (отравление кэша), табуляция и
+         * перевод строки дописывали строки в файл состояния. */
+        uint8_t q[600];
+        char name[MAX_HOSTNAME];
+        uint16_t qtype = 0;
+        size_t qend = 0;
+        #define MKQ(wire, wl) do {                                                   \
+            memset(q, 0, 12); q[0] = 0x11; q[1] = 0x22; q[2] = 0x01; q[5] = 1;       \
+            memcpy(q + 12, (wire), (wl)); qn = 12 + (wl);                            \
+            q[qn++] = 0; q[qn++] = 1; q[qn++] = 0; q[qn++] = 1; } while (0)
+        size_t qn;
+        static const uint8_t nul[] = "\x07youtube\x04" "com\x00" "\x08" "attacker\x07" "example";
+        MKQ(nul, sizeof(nul));
+        check("D1: вопрос с байтом 0 в метке не разобран", -1,
+              parse_query(q, qn, name, sizeof(name), &qtype, &qend));
+        /* Ответ апстрима на тот же вопрос с A 6.6.6.6 — тоже не разобран: ни правил, ни карты. */
+        static const uint8_t a6666[] = { 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0x0e, 0x10, 0, 4, 6, 6, 6, 6 };
+        uint8_t r[700];
+        memcpy(r, q, qn); r[2] = 0x81; r[3] = 0x80; r[7] = 1;
+        memcpy(r + qn, a6666, sizeof(a6666));
+        struct answer_ip ips[4];
+        int n6 = 0;
+        check("D1: ответ на такой вопрос не разобран (адрес в карту не идёт)", -1,
+              parse_response(r, qn + sizeof(a6666), name, sizeof(name), &qtype, &qend, ips, 4, NULL, 0, &n6));
+        static const uint8_t dot[] = "\x0byoutube.com";
+        MKQ(dot, sizeof(dot));
+        check("D2: точка внутри метки — не разобран", -1,
+              parse_query(q, qn, name, sizeof(name), &qtype, &qend));
+        static const char *const badl[] = { "x\t198", "x\n198", "a b", "x\x7f", "x\x01", NULL };
+        for (int i = 0; badl[i]; i++) {
+            uint8_t w[80];
+            size_t l = strlen(badl[i]);
+            w[0] = (uint8_t)l; memcpy(w + 1, badl[i], l);
+            memcpy(w + 1 + l, "\x07youtube\x03" "com", 13);     /* с корнем: 12 байт меток и 0 */
+            MKQ(w, 1 + l + 13);
+            char what[96];
+            snprintf(what, sizeof(what), "D3: метка с байтом 0x%02x не разобрана",
+                     (unsigned)(uint8_t)badl[i][1]);
+            check(what, -1, parse_query(q, qn, name, sizeof(name), &qtype, &qend));
+        }
+        /* Законные имена проходят: подчёркивание, дефис, цифры, punycode, регистр, байты UTF-8. */
+        static const struct { const char *wire; size_t wl; const char *str; } good[] = {
+            /* Длина — с корнем: завершающий байт 0 литерала. */
+            { "\x06_dmarc\x07" "Example\x03" "COM", 20, "_dmarc.Example.COM" },
+            { "\x0exn--80ak6aa92e\x03" "com", 20, "xn--80ak6aa92e.com" },
+            { "\x05" "a-b_c\x02" "1x\x01*", 12, "a-b_c.1x.*" },
+            { "\x02\xc3\xa9\x04test", 9, "\xc3\xa9.test" },
+        };
+        for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+            MKQ(good[i].wire, good[i].wl);
+            char what[96];
+            snprintf(what, sizeof(what), "законное имя %zu разобрано как есть", i);
+            int rc = parse_query(q, qn, name, sizeof(name), &qtype, &qend);
+            check(what, 1, rc == 0 && !strcmp(name, good[i].str));
+        }
+        /* Имя ЗАПИСИ ответа с байтом 0 не отменяет адресов: строкой его никто не читает. */
+        static const uint8_t www[] = "\x03www\x04test";
+        MKQ(www, sizeof(www));
+        memcpy(r, q, qn); r[2] = 0x81; r[3] = 0x80; r[7] = 1;
+        static const uint8_t rr[] = { 3, 'x', 0, 'y', 0, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4 };
+        memcpy(r + qn, rr, sizeof(rr));
+        int na = parse_response(r, qn + sizeof(rr), name, sizeof(name), &qtype, &qend, ips, 4, NULL, 0, &n6);
+        check("имя записи ответа с байтом 0: адрес собран", 1,
+              na == 1 && ips[0].addr == htonl(0x01020304u) && !strcmp(name, "www.test"));
+        #undef MKQ
+
+        /* Кэш: ключ — метки с длинами. NXDOMAIN на однометочное «youtube.com» не отдаётся тому,
+         * кто спрашивает настоящий youtube.com (прежде — 29 байт с RCODE 3). */
+        struct dcache_cfg dc = { 64, 0, 3600, 300 };
+        dcache_config(&dc);
+        uint8_t nx[64] = { 0x00, 0x02, 0x81, 0x83, 0, 1, 0, 0, 0, 0, 0, 0 };
+        memcpy(nx + 12, "\x0byoutube.com\0\0\1\0\1", 17);
+        check("D2: NXDOMAIN на однометочное имя кладётся в кэш", 1, dcache_put(1, nx, 29, 1000));
+        uint8_t yq[64] = { 0x77, 0x77, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+        memcpy(yq + 12, "\x07youtube\x03" "com\0\0\1\0\1", 17);
+        uint8_t gb[512];
+        check("D2: ...и не отдаётся на вопрос о настоящем youtube.com", 0,
+              (int)dcache_get(1, yq, 29, gb, sizeof(gb), 1001));
+        memcpy(yq + 12, "\x0bYouTube.com\0\0\1\0\1", 17);
+        check("D2: на то же однометочное имя (другой регистр) — отдаётся", 29,
+              (int)dcache_get(1, yq, 29, gb, sizeof(gb), 1001));
+        dcache_flush();
+
+        /* Имя-строка (файл состояния, --fakeip). */
+        check("dns_name_ok: обычное", 1, dns_name_ok("www.example.com"));
+        check("dns_name_ok: подчёркивание и punycode", 1, dns_name_ok("_sip._tcp.xn--p1ai"));
+        check("dns_name_ok: табуляция", 0, dns_name_ok("x\t198.18.0.5"));
+        check("dns_name_ok: пробел", 0, dns_name_ok("a b.test"));
+        check("dns_name_ok: пустая метка", 0, dns_name_ok("a..test"));
+        check("dns_name_ok: точка в конце", 0, dns_name_ok("a.test."));
+        check("dns_name_ok: пустое", 0, dns_name_ok(""));
+        check("dns_name_ok: метка 64 байта", 0,
+              dns_name_ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test"));
+    }
+
+    {
+        /* D3: ФАЙЛ СОСТОЯНИЯ, УЖЕ ОТРАВЛЕННЫЙ ПРЕЖНЕЙ ВЕРСИЕЙ, лечится при загрузке. Строка «x» с
+         * поддельным адресом youtube.com и настоящим нападающего, имя с пробелом, подмена на адрес
+         * пула и строка длиннее буфера (её хвост читался бы отдельной строкой). */
+        char dir[] = "/tmp/dnsmatch-poison.XXXXXX";
+        if (!mkdtemp(dir)) { perror("mkdtemp"); return 2; }
+        char path[768];
+        snprintf(path, sizeof(path), "%s/state", dir);
+        FILE *f = fopen(path, "w");
+        fputs("youtube.com\t198.18.0.5\t142.250.1.1\n", f);
+        fputs("x\t198.18.0.5\t6.6.6.6\n", f);
+        fputs("bad name.test\t198.18.0.6\t6.6.6.6\n", f);
+        fputs("loop.test\t198.18.0.7\t198.18.0.9\n", f);
+        /* Ровно буфер чтения загрузчика (MAX_HOSTNAME + 128 - 1 байт): хвост — «z.test…». */
+        for (int i = 0; i < MAX_HOSTNAME + 128 - 1; i++) fputc('a', f);
+        fputs("z.test\t198.18.0.8\t6.6.6.6\n", f);
+        fputs("ok.test\t198.18.0.10\t93.184.216.34\n", f);
+        fclose(f);
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 0;
+        g_fakeip_state_path = NULL;
+        g_fakeip_dirty = 0;
+        fakeip_state_load(path);
+        check("D3: загружены youtube.com, loop.test, ok.test", 3, (int)g_fakeip.n);
+        check("D3: youtube.com — свой настоящий адрес", 1,
+              fakeip_entry_known_real("youtube.com") == 0x8EFA0101u);
+        check("D3: «x» на чужом поддельном адресе отвергнута", -1, (int)fakeip_find("x"));
+        check("D3: имя с пробелом отвергнуто", -1, (int)fakeip_find("bad name.test"));
+        check("D3: хвост длинной строки не стал строкой", -1, (int)fakeip_find("z.test"));
+        check("D3: подмена на адрес пула не принята", 0, (int)fakeip_entry_known_real("loop.test"));
+        check("D3: строка после длинной цела", 1, fakeip_entry_known_real("ok.test") == 0x5DB8D822u);
+        check("D3: отвергнутое помечает файл к перезаписи", 1, g_fakeip_dirty);
+        g_fakeip_dirty = 0;
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 0;
+        unlink(path);
+        rmdir(dir);
+    }
+
+    {
+        /* D5: ПРЕДЕЛ ВЫДАЧИ FAKE-IP НА КЛИЕНТА. Один клиент, спрашивающий случайные имена под
+         * правилом, прежде занимал весь пул, и новые имена ВСЕХ клиентов получали настоящий адрес.
+         * Теперь за клиентом не больше fakeip_per_client() адресов; сверх — -2 (резолвер отвечает
+         * SERVFAIL ему одному), а другой клиент получает адрес как обычно. */
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 1;
+        g_fakeip_state_path = NULL;
+        struct sockaddr_storage ca, cb, c6a, c6b;
+        memset(&ca, 0, sizeof(ca)); memset(&cb, 0, sizeof(cb));
+        memset(&c6a, 0, sizeof(c6a)); memset(&c6b, 0, sizeof(c6b));
+        ((struct sockaddr_in *)&ca)->sin_family = AF_INET;
+        ((struct sockaddr_in *)&ca)->sin_addr.s_addr = htonl(0xC0A80166u);   /* 192.168.1.102 */
+        ((struct sockaddr_in *)&cb)->sin_family = AF_INET;
+        ((struct sockaddr_in *)&cb)->sin_addr.s_addr = htonl(0xC0A80167u);
+        ((struct sockaddr_in6 *)&c6a)->sin6_family = AF_INET6;
+        inet_pton(AF_INET6, "2001:db8:1:2::aaaa", &((struct sockaddr_in6 *)&c6a)->sin6_addr);
+        ((struct sockaddr_in6 *)&c6b)->sin6_family = AF_INET6;
+        inet_pton(AF_INET6, "2001:db8:1:2:1234:5678:9abc:def0", &((struct sockaddr_in6 *)&c6b)->sin6_addr);
+        uint64_t ka = fakeip_client_key(&ca), kb = fakeip_client_key(&cb);
+        check("ключ клиента: разные адреса IPv4 — разные клиенты", 1, ka && kb && ka != kb);
+        check("ключ клиента: адреса одной /64 — один клиент", 1,
+              fakeip_client_key(&c6a) == fakeip_client_key(&c6b));
+        struct sockaddr_storage lo4, lo6;
+        memset(&lo4, 0, sizeof(lo4)); memset(&lo6, 0, sizeof(lo6));
+        ((struct sockaddr_in *)&lo4)->sin_family = AF_INET;
+        ((struct sockaddr_in *)&lo4)->sin_addr.s_addr = htonl(0x7F000001u);
+        ((struct sockaddr_in6 *)&lo6)->sin6_family = AF_INET6;
+        ((struct sockaddr_in6 *)&lo6)->sin6_addr = in6addr_loopback;
+        check("ключ клиента: петля не считается (пересыльщики всей сети)", 1,
+              fakeip_client_key(&lo4) == 0 && fakeip_client_key(&lo6) == 0);
+        unsigned lim = fakeip_per_client();
+        check("предел на клиента — восьмая часть пула", (int)(FAKEIP_POOL_SIZE / 8), (int)lim);
+        int okall = 1;
+        uint32_t addr = 0;
+        char nm[64];
+        for (unsigned i = 0; i < lim; i++) {
+            snprintf(nm, sizeof(nm), "r%u.flood.test", i);
+            if (fakeip_lookup_or_alloc_for(nm, ka, &addr) != 0) { okall = 0; break; }
+        }
+        check("D5: клиент получает свои адреса до предела", 1, okall);
+        check("D5: счёт клиента — ровно предел", (int)lim, (int)fakeip_owner_count(ka));
+        check("D5: другой клиент получает адрес", 0,
+              fakeip_lookup_or_alloc_for("victim.flood.test", kb, &addr));
+        check("D5: и адрес — из пула", 1, addr >= FAKEIP_POOL_BASE && addr < FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE);
+        /* У предела клиент сначала возвращает свои простоявшие имена (живых соединений нет —
+         * заглушка conntrack с пустым ответом) и снова получает адрес. */
+        int (*live_was)(uint8_t *) = g_fakeip_live;
+        g_fakeip_live = pool_live_stub;
+        g_pool_live_n = 0;
+        for (size_t i = 0; i < g_fakeip.n; i++)
+            if (g_fakeip.entries[i].owner == ka) g_fakeip.entries[i].last_used -= g_fakeip_idle + 1;
+        check("D5: у предела простоявшие имена клиента возвращаются, адрес выдан", 0,
+              fakeip_lookup_or_alloc_for("again.flood.test", ka, &addr));
+        check("D5: и счёт клиента — одна запись", 1, (int)fakeip_owner_count(ka));
+        check("D5: чужое имя возврат не тронул", 1, fakeip_find("victim.flood.test") >= 0);
+        okall = 1;
+        for (unsigned i = 1; i < lim; i++) {
+            snprintf(nm, sizeof(nm), "s%u.flood.test", i);
+            if (fakeip_lookup_or_alloc_for(nm, ka, &addr) != 0) { okall = 0; break; }
+        }
+        check("D5: снова до предела", 1, okall && fakeip_owner_count(ka) == lim);
+        check("D5: сверх предела (имена свежие) — отказ (-2), а не адрес", -2,
+              fakeip_lookup_or_alloc_for("over.flood.test", ka, &addr));
+        check("D5: уже выданное имя клиенту по-прежнему отвечает", 0,
+              fakeip_lookup_or_alloc_for("s7.flood.test", ka, &addr));
+        check("D5: другой клиент и тогда получает адрес", 0,
+              fakeip_lookup_or_alloc_for("victim2.flood.test", kb, &addr));
+        g_fakeip_live = live_was;
+        for (size_t i = 0; i < g_fakeip.n; i++) free(g_fakeip.entries[i].domain);
+        free(g_fakeip.entries);
+        sindex_free(&g_fakeip_idx);
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_pool_reset();
+        g_fakeip_next = 1;
+    }
+
+    {
+        /* D6: ДОЛЯ ТАБЛИЦЫ ОЖИДАНИЙ НА КЛИЕНТА. Прежде ~205 вопросов в секунду без ответа от одного
+         * клиента занимали все 1024 места, и вопросы остальных отбрасывались молча. Теперь у клиента
+         * не больше восьмой части мест, и его новый вопрос вытесняет его же самый давний. */
+        struct sockaddr_storage cl[9];
+        memset(cl, 0, sizeof(cl));
+        for (int i = 0; i < 9; i++) {
+            ((struct sockaddr_in *)&cl[i])->sin_family = AF_INET;
+            ((struct sockaddr_in *)&cl[i])->sin_addr.s_addr = htonl(0x0A000001u + (uint32_t)i);
+        }
+        time_t base = time(NULL) + 100;
+        int ok = 1;
+        struct pending *last = NULL;
+        for (int i = 0; i < 2000; i++) {
+            struct pending *p = pending_alloc(&cl[0]);
+            if (!p) { ok = 0; break; }
+            p->expire = base + i;
+            pending_take(p);
+            last = p;
+        }
+        uint64_t k0 = fakeip_client_key(&cl[0]);
+        check("D6: 2000 вопросов одного клиента без ответа — все приняты (вытеснением)", 1, ok);
+        check("D6: и клиент держит ровно свою долю", MAX_PENDING / 8, (int)pending_client_count(k0));
+        int newest = 1;
+        long min_exp = -1;
+        for (int i = 0; i < MAX_PENDING; i++)
+            if (g_pending[i].in_use && g_pending[i].ckey == k0 &&
+                (min_exp < 0 || g_pending[i].expire < min_exp)) min_exp = (long)g_pending[i].expire;
+        if (min_exp != (long)(base + 2000 - MAX_PENDING / 8)) newest = 0;
+        check("D6: вытеснялись его же самые давние", 1, newest && last && last->expire == base + 1999);
+        struct pending *pb = pending_alloc(&cl[1]);
+        check("D6: вопрос другого клиента получает место", 1, pb != NULL && !pb->in_use);
+        /* Восемь клиентов у своих долей занимают таблицу целиком: девятому места нет — как прежде при
+         * полной таблице, — но вопрос каждого из восьми по-прежнему принимается (своё давнее). */
+        for (int c = 1; c < 8; c++)
+            for (int i = 0; i < MAX_PENDING / 8; i++) {
+                struct pending *p = pending_alloc(&cl[c]);
+                if (!p) { ok = 0; break; }
+                p->expire = base + i;
+                pending_take(p);
+            }
+        check("D6: восемь долей заняли таблицу", 1, ok);
+        check("D6: девятому клиенту в полной таблице места нет", 1, pending_alloc(&cl[8]) == NULL);
+        struct pending *p3 = pending_alloc(&cl[3]);
+        check("D6: клиент у своей доли в полной таблице вытесняет своё", 1,
+              p3 != NULL && p3->ckey == fakeip_client_key(&cl[3]));
+        for (int i = 0; i < MAX_PENDING; i++) pending_drop(&g_pending[i]);
+        check("D6: после снятия счёт клиента — ноль", 0, (int)pending_client_count(k0));
+    }
+
+    {
         /* Долгий путь к файлу состояния fake-IP. Путь задаётся снаружи (--state-file,
          * --state-dir), то есть его длину выбирает не движок, а буфер под имя временного
          * файла был размером в имя ХОСТА (MAX_HOSTNAME, 256). «%s.tmp» в него молча не

@@ -4,6 +4,7 @@
  * Код перенесён из sub.c без изменений в поведении: те же правила, те же тексты причин, тот же
  * порядок проверок (node_usable в sub.c зовёт обе половины годности в прежнем порядке). */
 #define _GNU_SOURCE
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -442,56 +443,102 @@ const char SL_BAD_PIN[] = "!pin";
 
 static const char *pin_slot(const struct vless_node *n, int spki) { return spki ? n->pks : n->pcs; }
 
+/* Отпечаток в сыром виде и его место в записи — для отсева повторов сортировкой. */
+struct pin_ent { unsigned char raw[32]; size_t ord; };
+
+static int pin_ent_cmp(const void *a, const void *b) {
+    const struct pin_ent *x = a, *y = b;
+    int c = memcmp(x->raw, y->raw, 32);
+    return c ? c : (x->ord > y->ord) - (x->ord < y->ord);
+}
+
+/* Одна запись отпечатка (без пробелов по краям) → 32 байта. 0 — разобралась. */
+static int pin_raw(const char *p, size_t tn, int spki, unsigned char raw[32]) {
+    if (spki) {
+        char d[48];
+        if (tn < 43 || tn > 44 || b64_decode(p, tn, d, sizeof d) != 32) return -1;
+        memcpy(raw, d, 32);
+        return 0;
+    }
+    /* Двоеточия — привычная запись OpenSSL (`AB:CD:…`), Xray их отбрасывает. */
+    size_t k = 0;
+    memset(raw, 0, 32);
+    for (size_t i = 0; i < tn; i++) {
+        int c = (unsigned char)p[i], h;
+        if (c == ':') continue;
+        h = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+            : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (h < 0 || k >= 64) return -1;
+        if (k & 1) raw[k / 2] = (unsigned char)(raw[k / 2] << 4 | h);
+        else raw[k / 2] = (unsigned char)h;
+        k++;
+    }
+    return k == 64 ? 0 : -1;
+}
+
+/* Список отпечатков поля (через запятую) → слот узла: 64 знака hex строчными через запятую, в
+ * общей таблице. Поле, заданное снова, ЗАМЕНЯЕТ прежний список (последнее значение — как у разбора
+ * JSON в Go); массив sing-box вызывающий склеивает в одну строку и отдаёт одним вызовом.
+ *
+ * Прежде каждый вызов дописывал к накопленному: копировал весь прежний список и клал в таблицу
+ * новую строку, а прежние строки таблица не освобождает. Массив из K пинов давал K строк длиной
+ * до 65·K — 188 КБ подписки съедали 1 ГБ. Теперь вызов стоит O(длины значения), строка в таблицу
+ * кладётся одна.
+ *
+ * Повторы отпечатка отсеиваются (порядок первых вхождений сохраняется): сверка у соединения идёт
+ * по списку целиком, и K одинаковых пинов были бы K сравнений на каждом рукопожатии. Отсев —
+ * сортировкой, а не хешем: подобрать отпечатки под коллизии сортировки нельзя.
+ *
+ * Испорченный отпечаток — непригодный узел (SL_BAD_PIN), и следующее значение поля это не снимает:
+ * причина отказа не должна зависеть от порядка ключей. */
 void sl_add_pins(struct vless_node *n, const char *v, int spki) {
     const char *cur = pin_slot(n, spki);
     if (cur == SL_BAD_PIN || cur == SL_FULL) return;
-    /* По длине входа: запись в 43..64 знака даёт 64 знака hex и запятую, то есть не больше двух длин
-     * входа плюс уже набранное. Прежние 1100 байт отвергали узел с шестнадцатью отпечатками. */
-    size_t curl = cur ? strlen(cur) : 0, bcap = curl + 2 * strlen(v) + 4;
-    char *buf = malloc(bcap);
-    size_t bl = 0;
-    if (!buf) { if (spki) n->pks = SL_FULL; else n->pcs = SL_FULL; return; }
-    if (cur) { memcpy(buf, cur, curl); bl = curl; }
-    const char *p = v;
+    /* Записей не больше, чем запятых плюс одна. */
+    size_t cap = 1;
+    for (const char *q = v; *q; q++) cap += *q == ',';
+    struct pin_ent *e = malloc(cap * sizeof *e), *srt = NULL;
+    char *buf = NULL;
+    const char *r = NULL;
+    size_t cnt = 0;
     int bad = 0;
-    while (*p && !bad) {
-        const char *e = strchr(p, ',');
-        size_t tn = e ? (size_t)(e - p) : strlen(p);
+    if (!e) { r = SL_FULL; goto out; }
+    for (const char *p = v; *p && !bad;) {
+        const char *c = strchr(p, ',');
+        size_t tn = c ? (size_t)(c - p) : strlen(p);
         while (tn && (*p == ' ' || *p == '\t')) { p++; tn--; }
         while (tn && (p[tn - 1] == ' ' || p[tn - 1] == '\t')) tn--;
-        unsigned char raw[32] = { 0 };
         if (tn) {
-            if (spki) {
-                char d[48];
-                bad = tn < 43 || tn > 44 || b64_decode(p, tn, d, sizeof d) != 32;
-                if (!bad) memcpy(raw, d, 32);
-            } else {
-                /* Двоеточия — привычная запись OpenSSL (`AB:CD:…`), Xray их отбрасывает. */
-                size_t k = 0;
-                for (size_t i = 0; i < tn && !bad; i++) {
-                    int c = (unsigned char)p[i], h;
-                    if (c == ':') continue;
-                    h = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
-                        : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
-                    if (h < 0 || k >= 64) { bad = 1; break; }
-                    if (k & 1) raw[k / 2] = (unsigned char)(raw[k / 2] << 4 | h);
-                    else raw[k / 2] = (unsigned char)h;
-                    k++;
-                }
-                if (!bad && k != 64) bad = 1;
-            }
-            if (!bad) {
-                if (bl + 66 >= bcap) bad = 1;
-                else {
-                    if (bl) buf[bl++] = ',';
-                    for (int i = 0; i < 32; i++) bl += (size_t)snprintf(buf + bl, 3, "%02x", raw[i]);
-                }
-            }
+            if (pin_raw(p, tn, spki, e[cnt].raw) != 0) bad = 1;
+            else { e[cnt].ord = cnt; cnt++; }
         }
-        if (!e) break;
-        p = e + 1;
+        if (!c) break;
+        p = c + 1;
     }
-    const char *r = bad ? SL_BAD_PIN : bl ? sl_intern(buf, bl) : NULL;
+    if (bad) { r = SL_BAD_PIN; goto out; }
+    if (!cnt) goto out;
+    srt = malloc(cnt * sizeof *srt);
+    buf = malloc(cnt * 65);
+    if (!srt || !buf) { r = SL_FULL; goto out; }
+    memcpy(srt, e, cnt * sizeof *srt);
+    qsort(srt, cnt, sizeof *srt, pin_ent_cmp);
+    /* Повтор — не первое вхождение в группе равных: помечается порядком SIZE_MAX в исходном. */
+    for (size_t i = 1; i < cnt; i++)
+        if (!memcmp(srt[i].raw, srt[i - 1].raw, 32)) e[srt[i].ord].ord = SIZE_MAX;
+    size_t bl = 0;
+    for (size_t i = 0; i < cnt; i++) {
+        if (e[i].ord == SIZE_MAX) continue;
+        if (bl) buf[bl++] = ',';
+        for (int b = 0; b < 32; b++) {
+            static const char HEX[] = "0123456789abcdef";
+            buf[bl++] = HEX[e[i].raw[b] >> 4];
+            buf[bl++] = HEX[e[i].raw[b] & 15];
+        }
+    }
+    r = sl_intern(buf, bl);
+out:
+    free(e);
+    free(srt);
     free(buf);
     if (spki) n->pks = r; else n->pcs = r;
 }

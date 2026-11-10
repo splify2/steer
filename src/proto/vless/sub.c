@@ -674,12 +674,36 @@ static void sb_tls(struct sj *j, struct vless_node *n, int *enabled, int *realit
             else if (on) n->ech = SL_ECH_DNS;
         }
         else if (!strcmp(k, "certificate_public_key_sha256")) {
-            /* Массив строк base64: SHA-256 от SubjectPublicKeyInfo. Строка вместо массива — тоже. */
+            /* Массив строк base64: SHA-256 от SubjectPublicKeyInfo. Строка вместо массива — тоже.
+             * Элементы склеиваются через запятую и уходят в sl_add_pins одним вызовом: вызов на
+             * элемент копировал весь накопленный список, и память росла квадратом числа пинов
+             * (188 КБ подписки — 1 ГБ). Буфер растёт удвоением — линейно. */
             char pv[80];
             int fa = 1;
             int r = sj_arr_next(j, &fa);
             if (r == 0) {
-                do { pv[0] = '\0'; sj_str(j, pv, sizeof pv); sl_add_pins(n, pv, 1); } while (sj_arr_next(j, &fa) == 0);
+                char *all = NULL;
+                size_t al = 0, ac = 0;
+                int oom = 0;
+                do {
+                    pv[0] = '\0';
+                    sj_str(j, pv, sizeof pv);
+                    size_t pl = strlen(pv);
+                    if (oom) continue;
+                    if (al + pl + 2 > ac) {
+                        size_t nc = ac ? ac * 2 : 256;
+                        while (nc < al + pl + 2) nc *= 2;
+                        char *na = realloc(all, nc);
+                        if (!na) { oom = 1; continue; }
+                        all = na; ac = nc;
+                    }
+                    if (al) all[al++] = ',';
+                    memcpy(all + al, pv, pl + 1);
+                    al += pl;
+                } while (sj_arr_next(j, &fa) == 0);
+                if (oom) n->pks = SL_FULL;
+                else if (all) sl_add_pins(n, all, 1);
+                free(all);
             } else if (r < 0) { pv[0] = '\0'; sj_str(j, pv, sizeof pv); sl_add_pins(n, pv, 1); }
         }
         else if (!strcmp(k, "utls")) {
@@ -1551,8 +1575,8 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
  * дополнительных мест (разбор чистый, повтор даёт тот же результат). Остаток арифметики
  * (usable + skipped + foreign) сходится, как и прежде. Потолок файла — 64 МиБ: защита от файла-
  * не-подписки под этим именем, а не размер подписки (тысяча узлов — сотни килобайт).
- * NULL — файл не открылся, слишком велик или нет памяти; иначе массив (free), *cnt — узлов. */
-#define VLESS_SUB_FILE_MAX ((size_t)64 << 20)
+ * NULL — файл не открылся, слишком велик (VLESS_SUB_FILE_MAX, vless.h) или нет памяти; иначе
+ * массив (free), *cnt — узлов. */
 struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_sub_stats *st) {
     *cnt = 0;
     if (st) memset(st, 0, sizeof(*st));

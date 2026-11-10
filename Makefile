@@ -454,7 +454,7 @@ $(BUILD)/procscanmatch: tests/procscanmatch.c tests/unit.h src/lib/procscan.c sr
 
 # Читатель наборов sing-box (src/model/srs.c) и раскладка канала с ними (srsplan.c) — модулями
 # модели, без движка: см. шапку tests/srsunit.c.
-$(BUILD)/srsunit: tests/srsunit.c tests/unit.h $(MODEL_KINDS) $(CORE_HDR)
+$(BUILD)/srsunit: tests/srsunit.c tests/unit.h tests/memcap.h $(MODEL_KINDS) $(CORE_HDR)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/srsunit.c $(MODEL_KINDS)
 
@@ -641,9 +641,9 @@ $(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/sublin
                   src/model/nodesel.h \
                   src/proto/vless/vless.h src/proto/transport/vencp.h \
                   src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
-                  src/proto/transport/trpath.c src/proto/transport/trpath.h
+                  src/proto/transport/trpath.c src/proto/transport/trpath.h tests/memcap.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/submatch.c src/proto/vless/sublink.c src/proto/transport/trpath.c
+	$(CC) $(CFLAGS) -Itests -o $@ tests/submatch.c src/proto/vless/sublink.c src/proto/transport/trpath.c
 
 # Постквантовые поля подписки (encryption, pqv / mldsa65Verify): tests/subpq.c, образцы значений Xray-core
 # 26.9.9 — tests/sub-pq-samples.h. Библиотеки нет; sub.c линкуется объектом, а не включается (предел на
@@ -687,9 +687,9 @@ $(BUILD)/tarmatch: tests/tarmatch.c tests/unit.h src/lib/untar.c src/lib/untar.h
 # авторизации QPACK и разбор ответа, TCPRequest/Response, UDPMessage, Salamander и BLAKE2b на
 # векторах — ни сети, ни QUIC, ни криптобиблиотеки, поэтому входит в обычный make test.
 $(BUILD)/hy2match: tests/hy2match.c src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2wire.h \
-                   src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2.h
+                   src/proto/hysteria2/hy2sub.c src/proto/hysteria2/hy2.h tests/memcap.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/hy2match.c src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2sub.c
+	$(CC) $(CFLAGS) -Itests -o $@ tests/hy2match.c src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2sub.c
 
 # Разбор ссылок и подписки прокси (src/proto/proxy/pxsub.c) — без сети и криптографии, как submatch.
 # sublink.c, sub.c, vless_proto.c и trpath.c — те же общие части, что у разбора vless.

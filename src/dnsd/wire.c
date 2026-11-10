@@ -4,13 +4,52 @@
 /* DNS wire-format parsing (read-only; never mutates the packet)          */
 /* ---------------------------------------------------------------------- */
 
+/* БАЙТ, КОТОРОМУ НЕ МЕСТО В МЕТКЕ ИМЕНИ, СТАНОВЯЩЕГОСЯ СТРОКОЙ.
+ *
+ * Провод DNS разрешает в метке любые байты (RFC 2181 §11), а дальше резолвера имя живёт строкой:
+ * ключ правил, таблицы fake-IP, кэша и строка файла состояния «домен\tподдельный\tнастоящий».
+ * Метка, скопированная как есть, ломала все четыре:
+ * - байт 0 обрывал строку: вопрос \x07youtube\x04com\x00\x08attacker\x07example — «youtube.com»
+ *   для правил и карты fake-IP, а для апстрима — имя в зоне нападающего, и адрес из ЕГО ответа
+ *   вставал в карту поддельного адреса youtube.com для всех клиентов;
+ * - точка внутри метки (\x0byoutube.com — одна метка) склеивалась в ту же строку, что две метки, и
+ *   NXDOMAIN на такое имя кэш отдавал всем, кто спрашивал настоящий youtube.com;
+ * - табуляция и перевод строки дописывали в файл состояния чужие строки, которые после перезапуска
+ *   резолвера переписывали элемент карты другого имени.
+ * Поэтому отвергается: 0x00-0x20 (управляющие, пробел — разделители строк и полей), '.' и 0x7F.
+ * Остальное проходит: буквы обоих регистров (регистр приводится позже, DNS-0x20 работает), цифры,
+ * '-', '_' (_dmarc, _sip._tcp), punycode IDN (xn--…), '*' и байты от 0x80 (сырые UTF-8 у
+ * локальных имён). Законные имена, которые теряют правила, — только с пробелом в метке
+ * (экземпляры DNS-SD: «My Printer._ipp._tcp…»): их вопрос не отвергается, а уходит наверх как
+ * есть, только без правил, кэша и fake-IP (proxy.c, dns_query: hit = -2). */
+static int label_byte_ok(uint8_t c) {
+    return c > 0x20 && c != '.' && c != 0x7F;
+}
+
+int dns_name_ok(const char *s) {
+    size_t n = strlen(s), lab = 0;
+    if (!n || n >= MAX_HOSTNAME) return 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = (uint8_t)s[i];
+        if (c == '.') {
+            if (!lab) return 0;                 /* пустая метка: «..», точка в начале или конце */
+            lab = 0;
+            continue;
+        }
+        if (!label_byte_ok(c) || ++lab > 63) return 0;
+    }
+    return lab != 0;
+}
+
 /* Decodes a (possibly compressed) name starting at pos into out (dot-joined,
  * NUL terminated), and returns via *next the stream position right after the
  * name (following RFC1035 compression-pointer semantics: only the FIRST
  * pointer counts toward the caller's next-field offset). */
+/* strict — имя станет строкой (вопрос): метка с байтом, которому в строке не место
+ * (label_byte_ok), — -1, как испорченное имя. Без strict имя только проходится (имена записей
+ * ответа: строкой их никто не читает, и отказ из-за них потерял бы адреса ответа за ними). */
 static int parse_name_adv(const uint8_t *pkt, size_t len, size_t pos, char *out,
-                           size_t outlen, size_t *next) {
-    size_t start = pos;
+                           size_t outlen, size_t *next, int strict) {
     size_t opos = 0;
     int jumps = 0;
     size_t cursor = pos;
@@ -40,13 +79,15 @@ static int parse_name_adv(const uint8_t *pkt, size_t len, size_t pos, char *out,
         cursor++;
         if (cursor + label_len > len) return -1;
         if (opos + label_len + 1 >= outlen) return -1;
+        if (strict)
+            for (size_t i = 0; i < label_len; i++)
+                if (!label_byte_ok(pkt[cursor + i])) return -1;
         if (opos > 0) out[opos++] = '.';
         memcpy(out + opos, pkt + cursor, label_len);
         opos += label_len;
         cursor += label_len;
     }
     out[opos] = '\0';
-    (void)start;
     *next = advance_to;
     return 0;
 }
@@ -77,7 +118,7 @@ int parse_response(const uint8_t *pkt, size_t len, char *out_qname,
     if (qdcount != 1) return -1;
 
     size_t next = 0;
-    if (parse_name_adv(pkt, len, pos, out_qname, qname_len, &next) != 0)
+    if (parse_name_adv(pkt, len, pos, out_qname, qname_len, &next, 1) != 0)
         return -1;
     pos = next;
     if (pos + 4 > len) return -1;
@@ -88,7 +129,7 @@ int parse_response(const uint8_t *pkt, size_t len, char *out_qname,
     int found = 0;
     for (uint16_t a = 0; a < ancount && pos < len; a++) {
         char rrname[MAX_HOSTNAME];
-        if (parse_name_adv(pkt, len, pos, rrname, sizeof(rrname), &next) != 0)
+        if (parse_name_adv(pkt, len, pos, rrname, sizeof(rrname), &next, 0) != 0)
             break;
         pos = next;
         if (pos + 10 > len) break;
@@ -129,7 +170,7 @@ int parse_query(const uint8_t *pkt, size_t len, char *out_qname,
     uint16_t qdcount = (pkt[4] << 8) | pkt[5];
     if (qdcount != 1) return -1;
     size_t next = 0;
-    if (parse_name_adv(pkt, len, 12, out_qname, qname_len, &next) != 0) return -1;
+    if (parse_name_adv(pkt, len, 12, out_qname, qname_len, &next, 1) != 0) return -1;
     if (next + 4 > len) return -1;
     *out_qtype = (uint16_t)((pkt[next] << 8) | pkt[next + 1]);
     *out_qend = next + 4;

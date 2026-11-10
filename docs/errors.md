@@ -306,6 +306,7 @@
 | `plugin.archive_incomplete` | `id` | архив {id}: нет plugin.json, MANIFEST и MANIFEST.sig |
 | `plugin.archive_name` | `got`, `want` | архив назван {got}, а ждали {want} — подмена |
 | `plugin.archive_unsigned` | `id` | архив {id} не подписан |
+| `plugin.bad_id_version` | — | недопустимые id или version в архиве |
 | `plugin.bad_name` | — | недопустимое имя плагина |
 | `plugin.bad_version` | — | недопустимая версия |
 | `plugin.busy` | — | busy: менеджер плагинов занят другим запросом — повторите позже |

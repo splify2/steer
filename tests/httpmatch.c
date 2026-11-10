@@ -47,6 +47,8 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
 /* ---- сервер ------------------------------------------------------------------------------------ */
 
 static int g_lfd, g_port;
+/* Второй слушатель на другом порту — «чужой» источник для переадресации (тот же serve). */
+static int g_lfd2, g_port2;
 
 static void sendall(int fd, const void *p, size_t n) {
     const char *c = p;
@@ -152,6 +154,8 @@ static void *serve(void *arg) {
         R("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:%d/ok\r\nContent-Length: 0\r\n\r\n", g_port);
     } else if (!strcmp(path, "/rscheme")) {
         R("HTTP/1.1 302 Found\r\nLocation: //127.0.0.1:%d/ok\r\nContent-Length: 0\r\n\r\n", g_port);
+    } else if (!strcmp(path, "/rport")) {         /* на другой порт — другой источник */
+        R("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:%d/echo\r\nContent-Length: 0\r\n\r\n", g_port2);
     } else if (!strcmp(path, "/r307")) {
         sends(fd, "HTTP/1.1 307 Temporary\r\nLocation: /echo\r\nContent-Length: 0\r\n\r\n");
     } else if (!strcmp(path, "/rloop")) {
@@ -213,9 +217,9 @@ static void *serve(void *arg) {
 }
 
 static void *acceptor(void *arg) {
-    (void)arg;
+    int lfd = arg ? (int)(long)arg : g_lfd;
     for (;;) {
-        int fd = accept(g_lfd, NULL, NULL);
+        int fd = accept(lfd, NULL, NULL);
         if (fd < 0) continue;
         pthread_t th;
         pthread_attr_t at;
@@ -279,6 +283,15 @@ int main(void) {
     g_port = ntohs(sa.sin_port);
     pthread_t th;
     pthread_create(&th, NULL, acceptor, NULL);
+    g_lfd2 = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(g_lfd2, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sa.sin_port = 0;
+    sl = sizeof sa;
+    if (bind(g_lfd2, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(g_lfd2, 64) != 0) { perror("listen"); return 2; }
+    getsockname(g_lfd2, (struct sockaddr *)&sa, &sl);
+    g_port2 = ntohs(sa.sin_port);
+    pthread_t th2;
+    pthread_create(&th2, NULL, acceptor, (void *)(long)g_lfd2);
 
     char why[300];
     struct http_resp r;
@@ -322,6 +335,57 @@ int main(void) {
         check("  свой Accept вместо нашего", 1, strstr((char *)a.b, "Accept: text/x\r\n") && !strstr((char *)a.b, "Accept: */*"));
         check("  If-None-Match", 1, strstr((char *)a.b, "If-None-Match: \"v9\"\r\n") != NULL);
         DONE();
+    }
+
+    /* ---- заголовки источника: только первой ссылке, не хосту переадресации ---------------------------- */
+    {
+        NEW();
+        struct http_req q = { .url = url("/r303"), .body_cb = collect, .cb_arg = &a, .idle_ms = 2000,
+                              .headers = "X-Common: 1\r\n", .origin_headers = "x-hwid: dev1\r\nx-device-model: M\r\n" };
+        check("переадресация в том же источнике", 0, http_get(&q, &r, why, sizeof why));
+        a.b[a.n] = 0;
+        check("  заголовки источника дошли", 1, strstr((char *)a.b, "x-hwid: dev1\r\nx-device-model: M\r\n") != NULL);
+        check("  и общие", 1, strstr((char *)a.b, "X-Common: 1\r\n") != NULL);
+        DONE();
+        NEW();
+        q.url = url("/rport");
+        q.cb_arg = &a;
+        check("переадресация на другой порт", 0, http_get(&q, &r, why, sizeof why));
+        a.b[a.n] = 0;
+        check("  туда пришёл именно запрос (GET /echo)", 1, !strncmp((char *)a.b, "GET /echo HTTP/1.1\r\n", 20));
+        check("  заголовков источника там нет", 0, strstr((char *)a.b, "x-hwid") != NULL || strstr((char *)a.b, "x-device-model") != NULL);
+        check("  общие — есть", 1, strstr((char *)a.b, "X-Common: 1\r\n") != NULL);
+        DONE();
+    }
+
+    /* ---- предел тела (max_body): Content-Length, до закрытия, chunked; файл не остаётся ---------------- */
+    {
+        NEW();
+        struct http_req q = { .url = url("/ok"), .body_cb = collect, .cb_arg = &a, .idle_ms = 2000, .max_body = 11 };
+        check("тело ровно в предел — принято", 0, http_get(&q, &r, why, sizeof why));
+        DONE();
+        NEW();
+        q.max_body = 10;
+        q.cb_arg = &a;
+        check("Content-Length больше предела — HTTPC_EBIG", HTTPC_EBIG, http_get(&q, &r, why, sizeof why));
+        check("  ни байта тела приёмнику", 0, (long)a.cnt);
+        check("  причина называет предел", 1, strstr(why, "10") != NULL);
+        DONE();
+        char tmpl[] = "/tmp/httpmatch.XXXXXX";
+        char *dir = mkdtemp(tmpl);
+        char fp[300];
+        snprintf(fp, sizeof fp, "%s/body", dir);
+        static const char *const paths[] = { "/bigcl", "/big", "/bigchunk" };
+        for (int i = 0; i < 3; i++) {
+            struct http_req qf = { .url = url(paths[i]), .dest_path = fp, .idle_ms = 5000, .max_body = 1u << 20 };
+            char lbl[80];
+            snprintf(lbl, sizeof lbl, "%s в файл с пределом 1 МиБ — HTTPC_EBIG", paths[i]);
+            check(lbl, HTTPC_EBIG, http_get(&qf, &r, why, sizeof why));
+            check("  отдано не больше предела", 1, r.body_n <= (1u << 20));
+            check("  файла нет", 1, access(fp, F_OK) != 0);
+            http_resp_free(&r);
+        }
+        rmdir(dir);
     }
 
     /* ---- запросы с телом, any_status, addr -------------------------------------------------------------- */

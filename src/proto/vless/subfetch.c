@@ -407,7 +407,12 @@ static void quota_json(const struct quota *q) {
  *
  * Сверяется всё, что даёт обёртка (RFC 1952): метод, длина и CRC-32 распакованного. Битый
  * gzip — отказ, а не «что распаковалось»: половина подписки означала бы половину узлов. */
-/* 0 — файл не gzip или распакован на месте; -1 — gzip испорчен или не записался. */
+/* Потолок распакованного — тот же VLESS_SUB_FILE_MAX: больше не прочтёт ни один разбор, а gzip-бомба
+ * в мегабайт прежде разворачивалась в гигабайт на флеше роутера, пока не кончится место. Распакованное
+ * сверх потолка — отказ, временный файл удаляется.
+ *
+ * 0 — файл не gzip или распакован на месте; -1 — gzip испорчен или не записался; -2 — распакованное
+ * больше потолка. */
 static int gunzip_inplace(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
@@ -426,13 +431,17 @@ static int gunzip_inplace(const char *path) {
     char out[520];
     snprintf(out, sizeof out, "%s.gz", path);
     FILE *o = buf ? fopen(out, "wb") : NULL;
-    int ok = 0;
+    int ok = 0, big = 0;
     if (o) {
         long k;
+        size_t total = 0;
         ok = 1;
         /* gz_read сверяет метод, длину и CRC-32 и на конце отвечает 0, а на любом изъяне — -1. */
-        while ((k = gz_read(g, buf, 16384)) > 0)
+        while ((k = gz_read(g, buf, 16384)) > 0) {
+            total += (size_t)k;
+            if (total > VLESS_SUB_FILE_MAX) { ok = 0; big = 1; break; }
             if (fwrite(buf, 1, (size_t)k, o) != (size_t)k) { ok = 0; break; }
+        }
         if (k < 0) ok = 0;
         if (fclose(o) != 0) ok = 0;
         if (ok && rename(out, path) != 0) ok = 0;
@@ -441,6 +450,10 @@ static int gunzip_inplace(const char *path) {
     free(buf);
     if (g) gz_close(g);
     free(z);
+    if (big) {
+        fprintf(stderr, LOG_W "подписка после распаковки больше %zu МиБ: %s\n", VLESS_SUB_FILE_MAX >> 20, path);
+        return -2;
+    }
     if (!ok) {
         fprintf(stderr, LOG_W "панель прислала испорченный gzip: %s\n", path);
         return -1;
@@ -458,9 +471,16 @@ static int gunzip_inplace(const char *path) {
  * Повтор без заголовков остался от времён, когда их умели не все качальщики, но и теперь он нужен: панель
  * может ответить отказом именно на них (лишний заголовок режет защита), а подписка без них лучше никакой.
  *
- * Заголовки ответа пишутся в hdr_path как есть: статусная строка и поля, по строке на поле. */
+ * Заголовки ответа пишутся в hdr_path как есть: статусная строка и поля, по строке на поле.
+ *
+ * Заголовки устройства уходят только самой панели (origin_headers): переадресация на другой хост
+ * (CDN, чужой сервер по Location) идентификатор устройства и модель не получает.
+ *
+ * Тело — не больше VLESS_SUB_FILE_MAX и до, и после распаковки (см. gunzip_inplace): больше не
+ * прочтёт ни один разбор подписки. Такой отказ повтором без заголовков не лечится — сразу -2, а в
+ * big (если не NULL) — причина для ответа. 1 — скачано, 0 — нет. */
 static int sub_get(const char *url, const char *body, const char *hdr_path,
-                   const char *id, int head, int *hwid_sent) {
+                   const char *id, int head, int *hwid_sent, char *big, size_t big_n) {
     char os[80], model[80];
     steer_dev_os(os, sizeof os);
     steer_dev_model(model, sizeof model);
@@ -475,9 +495,10 @@ static int sub_get(const char *url, const char *body, const char *hdr_path,
         struct http_req q = {
             .url = url,
             .method = head ? "HEAD" : "GET",
-            .headers = with_id ? hdrs : NULL,
+            .origin_headers = with_id ? hdrs : NULL,
             .dest_path = head ? NULL : body,
             .total_ms = head ? HEAD_TIMEOUT_MS : FETCH_TIMEOUT_MS,
+            .max_body = VLESS_SUB_FILE_MAX,
         };
         struct http_resp r;
         char why[200];
@@ -489,12 +510,22 @@ static int sub_get(const char *url, const char *body, const char *hdr_path,
                 if (f) { fwrite(r.headers, 1, r.headers_n, f); fclose(f); }
             }
             http_resp_free(&r);
-            if (body && gunzip_inplace(body) != 0) return 0;
+            int gz = body ? gunzip_inplace(body) : 0;
+            if (gz == -2) {
+                if (big && big_n) snprintf(big, big_n, "подписка после распаковки больше %zu МиБ", VLESS_SUB_FILE_MAX >> 20);
+                unlink(body);
+                return -2;
+            }
+            if (gz != 0) return 0;
             *hwid_sent = with_id;
             return 1;
         }
         if (body) unlink(body);
         http_resp_free(&r);
+        if (rc == HTTPC_EBIG) {
+            if (big && big_n) snprintf(big, big_n, "подписка больше %zu МиБ", VLESS_SUB_FILE_MAX >> 20);
+            return -2;
+        }
         if (!with_id) return 0;
     }
 }
@@ -579,9 +610,12 @@ int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) 
     unlink(tmp); unlink(hdrp);
 
     int sent = 0;
-    if (!sub_get(url, tmp, hdrp, have_id ? id : NULL, 0, &sent)) {
+    char big[120] = "";
+    if (sub_get(url, tmp, hdrp, have_id ? id : NULL, 0, &sent, big, sizeof big) != 1) {
         unlink(tmp); unlink(hdrp);
-        printf("{\"ok\":false,\"error\":\"подписка не скачалась\",\"url\":");
+        printf("{\"ok\":false,\"error\":");
+        jsonw_str(stdout, big[0] ? big : "подписка не скачалась");
+        printf(",\"url\":");
         jsonw_str(stdout, url);
         printf(",\"hwid\":");
         jsonw_str(stdout, have_id ? id : "");
@@ -633,7 +667,7 @@ int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) 
             snprintf(tmp2, sizeof tmp2, "%s.json.tmp", out_path);
             snprintf(hdr2, sizeof hdr2, "%s.json.hdr", out_path);
             int sent2 = 0;
-            if (sub_get(jurl, tmp2, hdr2, have_id ? id : NULL, 0, &sent2)) {
+            if (sub_get(jurl, tmp2, hdr2, have_id ? id : NULL, 0, &sent2, NULL, 0) == 1) {
                 struct vless_sub_stats st2;
                 size_t u2 = usable_nodes(tmp2, &st2);
                 if (u2 > 0) {
@@ -650,6 +684,28 @@ int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) 
             }
             unlink(tmp2); unlink(hdr2);
         }
+    }
+
+    /* ОТВЕТ БЕЗ УЗЛОВ НЕ ЗАМЕНЯЕТ ПОДПИСКУ. Ответ 200 с заглушкой, страницей HTML, обрезанным телом
+     * или пустым JSON — и после повтора за /json ни одного пригодного узла VLESS и ни одной ссылки
+     * других протоколов (их считает foreign: hysteria2, trojan, ss… читают свои модули, и годность
+     * их здесь не решается). Прежде такой ответ ложился поверх рабочего файла, и туннель при
+     * следующем подъёме оставался без узлов. Теперь прежний файл не трогается, ответ — отказ с
+     * причиной. */
+    if (!usable && !st.foreign) {
+        unlink(tmp); unlink(hdrp);
+        char why[160];
+        if (st.skipped)
+            snprintf(why, sizeof why, "в ответе панели нет пригодных узлов (непригодных: %zu) — прежняя подписка оставлена",
+                     st.skipped);
+        else
+            snprintf(why, sizeof why, "в ответе панели нет ни одного узла — прежняя подписка оставлена");
+        printf("{\"ok\":false,\"error\":");
+        jsonw_str(stdout, why);
+        printf(",\"url\":");
+        jsonw_str(stdout, url);
+        printf(",\"skipped\":%zu}\n", st.skipped);
+        return 1;
     }
 
     /* Перенос через rename, а не запись поверх: оборванная запись поверх рабочей подписки
@@ -718,7 +774,7 @@ int cmd_sub_quota(const char *url, const char *info_path) {
         snprintf(hdrp, sizeof hdrp, "%s.head", info_path);
         unlink(hdrp);
         int sent = 0;
-        if (sub_get(url, NULL, hdrp, have_id ? id : NULL, 1, &sent)) {
+        if (sub_get(url, NULL, hdrp, have_id ? id : NULL, 1, &sent, NULL, 0) == 1) {
             hdrs_load(hdrp, hdrs, sizeof hdrs);
             unlink(hdrp);
             asked = 1;
@@ -740,7 +796,7 @@ int cmd_sub_quota(const char *url, const char *info_path) {
     snprintf(hdrp, sizeof hdrp, "%s.probe.hdr", info_path);
     unlink(probe); unlink(hdrp);
     int sent = 0;
-    if (sub_get(url, probe, hdrp, have_id ? id : NULL, 0, &sent)) {
+    if (sub_get(url, probe, hdrp, have_id ? id : NULL, 0, &sent, NULL, 0) == 1) {
         asked = 1;
         hdrs_load(hdrp, hdrs, sizeof hdrs);
         quota_save(info_path, hdrs, 0, &q);

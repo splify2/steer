@@ -305,6 +305,8 @@ struct ctx {
     int sink_fd;
     struct jar jar;
     const char *addr_host;          /* (копия) хост первой ссылки — только для него действует q->addr */
+    int orig_tls;                   /* схема и порт первой ссылки: вместе с addr_host — источник, */
+    unsigned orig_port;             /* которому одному уходят q->origin_headers */
 };
 
 /* Сколько ждать: want мс, но не дольше общего срока. 0 — срок вышел. */
@@ -476,6 +478,11 @@ struct body {
 };
 
 static int sink_write(struct ctx *c, const unsigned char *d, size_t n) {
+    /* Предел тела — до записи: байт сверх него не должен попасть ни в файл, ни приёмнику. */
+    if (c->q->max_body && c->r->body_n + n > c->q->max_body) {
+        if (c->why && c->wn) snprintf(c->why, c->wn, "тело ответа больше %llu байт", c->q->max_body);
+        return HTTPC_EBIG;
+    }
     if (c->sink_fd >= 0)
         for (size_t o = 0; o < n;) {
             ssize_t w = write(c->sink_fd, d + o, n - o);
@@ -701,6 +708,17 @@ static int send_request(struct ctx *c, struct conn *k, const struct url *u, cons
     if (!first) sb_str(&b, "\r\n");
     if (extra) sb_str(&b, extra);
     if (extra && *extra && (b.n < 2 || b.p[b.n - 1] != '\n')) sb_str(&b, "\r\n");
+    /* Заголовки источника — только ему: переадресация на другой хост, порт или схему (CDN, чужой
+     * сервер по Location от панели) не получает идентификаторы устройства. Одно исключение — тот же
+     * хост с http:80 на https:443: обычное «перейдите на https» самой панели, и заголовки, уже
+     * ушедшие открытым текстом, по TLS тому же хосту хуже не станут. */
+    const char *own = c->q->origin_headers;
+    int same = u->tls == c->orig_tls && u->port == c->orig_port;
+    int upgrade = !c->orig_tls && c->orig_port == 80 && u->tls && u->port == 443;
+    if (own && *own && c->addr_host && (same || upgrade) && !strcasecmp(u->host, c->addr_host)) {
+        sb_str(&b, own);
+        if (b.n < 2 || b.p[b.n - 1] != '\n') sb_str(&b, "\r\n");
+    }
     if (body || !strcasecmp(method, "POST") || !strcasecmp(method, "PUT") || !strcasecmp(method, "PATCH")) {
         char cl[48];
         snprintf(cl, sizeof cl, "Content-Length: %zu\r\n", body ? body_n : 0);
@@ -740,6 +758,8 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
     if (rc) { WHY(rc == HTTPC_ENOMEM ? "нет памяти" : "ссылка не http:// и не https:// или разобрана не до конца: %.200s", q->url ? q->url : ""); return rc; }
     int ims = q->idle_ms > 0 ? q->idle_ms : 30000;
     c.addr_host = strdup(u.host);                     /* u.host меняется на переадресациях */
+    c.orig_tls = u.tls;
+    c.orig_port = u.port;
 
     for (;;) {
         struct conn k;
@@ -833,6 +853,11 @@ int http_get(const struct http_req *q, struct http_resp *r, char *why, size_t wn
             for (size_t i = 0; i < cln; i++) {
                 if (cl[i] < '0' || cl[i] > '9' || (len >> 60)) { WHY("Content-Length не число"); rc = HTTPC_EPROTO; conn_close(&k); reply_free(&y); goto out; }
                 len = len * 10 + (unsigned)(cl[i] - '0');
+            }
+            /* Объявленная длина сверх предела — отказ до первого байта тела и до файла. */
+            if (q->max_body && len > q->max_body) {
+                WHY("тело ответа %llu байт — больше %llu", len, q->max_body);
+                rc = HTTPC_EBIG; conn_close(&k); reply_free(&y); goto out;
             }
             b.mode = B_LEN;
             b.left = len;

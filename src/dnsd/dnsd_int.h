@@ -37,6 +37,78 @@
 
 #define MAX_HOSTNAME 256
 
+/* СЧЁТ ПО КЛИЕНТАМ — для пределов резолвера на клиента (выдача fake-IP, fakeip.c; места таблицы
+ * ожиданий, proxy.c). Ключ — fakeip_client_key (никогда не 0: 0 — «не считать»). Открытая
+ * адресация, размер — степень двойки, заполнение не больше половины; удаление сдвигом назад, без
+ * надгробий: счёт клиента, дошедший до нуля, уходит сразу, и таблица держит только тех, у кого
+ * что-то есть сейчас. Нет памяти на рост — kc_add отвечает -1, и вызывающий решает, считать ли
+ * это отказом. */
+struct kcount_e { uint64_t key; uint32_t n; };
+struct kcount { struct kcount_e *t; size_t cap, n; };
+
+static inline size_t kc_slot(const struct kcount *m, uint64_t key) {
+    return (size_t)((key * 0x9E3779B97F4A7C15ull) >> 32) & (m->cap - 1);
+}
+
+static inline struct kcount_e *kc_find(const struct kcount *m, uint64_t key) {
+    if (!m->cap || !key) return NULL;
+    for (size_t i = kc_slot(m, key);; i = (i + 1) & (m->cap - 1)) {
+        if (!m->t[i].key) return NULL;
+        if (m->t[i].key == key) return &m->t[i];
+    }
+}
+
+static inline uint32_t kc_get(const struct kcount *m, uint64_t key) {
+    const struct kcount_e *e = kc_find(m, key);
+    return e ? e->n : 0;
+}
+
+static inline int kc_add(struct kcount *m, uint64_t key) {
+    if (!key) return 0;
+    struct kcount_e *e = kc_find(m, key);
+    if (e) { e->n++; return 0; }
+    if ((m->n + 1) * 2 > m->cap) {
+        size_t nc = m->cap ? m->cap * 2 : 64;
+        struct kcount_e *nt = calloc(nc, sizeof(*nt));
+        if (!nt) return -1;
+        struct kcount old = *m;
+        m->t = nt;
+        m->cap = nc;
+        for (size_t i = 0; i < old.cap; i++) {
+            if (!old.t[i].key) continue;
+            size_t j = kc_slot(m, old.t[i].key);
+            while (m->t[j].key) j = (j + 1) & (m->cap - 1);
+            m->t[j] = old.t[i];
+        }
+        free(old.t);
+    }
+    size_t i = kc_slot(m, key);
+    while (m->t[i].key) i = (i + 1) & (m->cap - 1);
+    m->t[i].key = key;
+    m->t[i].n = 1;
+    m->n++;
+    return 0;
+}
+
+static inline void kc_sub(struct kcount *m, uint64_t key) {
+    struct kcount_e *e = kc_find(m, key);
+    if (!e || --e->n) return;
+    /* Последнее у клиента: место уходит, и записи той же цепочки за ним сдвигаются назад —
+     * поиск не обрывается на дыре. Запись j встаёт в дыру i, если её место h не лежит в (i, j]
+     * по кругу. */
+    size_t i = (size_t)(e - m->t);
+    m->t[i].key = 0;
+    m->n--;
+    for (size_t j = (i + 1) & (m->cap - 1); m->t[j].key; j = (j + 1) & (m->cap - 1)) {
+        size_t h = kc_slot(m, m->t[j].key);
+        if ((j > i && (h <= i || h > j)) || (j < i && h <= i && h > j)) {
+            m->t[i] = m->t[j];
+            m->t[j].key = 0;
+            i = j;
+        }
+    }
+}
+
 /* FAKEIP_ANSWER_TTL is independent of the real record's TTL — the fake IP
  * itself never needs to expire from the client's cache the way a real
  * record does (it's a stable, persistent allocation); this just needs to be
@@ -225,6 +297,10 @@ struct fakeip_entry {
     chm_t sets6;
     time_t route6_asserted;
     time_t refreshed6;
+    /* Клиент, по вопросу которого адрес выдан (fakeip_client_key, proxy.c), — для предела выдачи
+     * на клиента (FAKEIP_PER_CLIENT, fakeip.c); 0 — не знаем (запись из файла, команда --fakeip).
+     * На диск не пишется: после перезапуска счёт начинается заново. */
+    uint64_t owner;
 };
 
 struct fakeip_table {
@@ -371,6 +447,10 @@ void dch_del6(size_t i, const char *domain, const uint8_t addr[16]);
 #define DNSD_OPT_NOFORWARD 65001
 
 /* wire.c */
+/* Имя-строка из тех, что может дать разбор вопроса (метки без байтов 0x00-0x20, '.' и 0x7F, без
+ * пустых меток, не длиннее MAX_HOSTNAME - 1): 1 — да. Им проверяются имена, пришедшие не из провода
+ * (файл состояния fake-IP, команда --fakeip). Корень (пустое имя) — нет: fake-IP его не получает. */
+int dns_name_ok(const char *s);
 int query_noforward(const uint8_t *pkt, size_t len, size_t qend);
 int parse_query(const uint8_t *pkt, size_t len, char *out_qname,
                  size_t qname_len, uint16_t *out_qtype, size_t *out_qend);
@@ -392,6 +472,15 @@ size_t build_rewritten_response6(const uint8_t *orig, size_t qend,
 /* fakeip.c */
 long fakeip_find(const char *domain);
 int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr);
+/* То же с клиентом, по вопросу которого выдаётся адрес (owner, 0 — не считать). -1 — пул
+ * исчерпан, -2 — клиент исчерпал свой предел (fakeip_per_client): вызывающий обязан отказать
+ * (SERVFAIL), а не отдать настоящий адрес имени под правилом. */
+int fakeip_lookup_or_alloc_for(const char *domain_in, uint64_t owner, uint32_t *out_addr);
+unsigned fakeip_per_client(void);
+/* proxy.c: ключ клиента для пределов — адрес IPv4 или префикс /64 IPv6; 0 — петля, не считать. */
+uint64_t fakeip_client_key(const struct sockaddr_storage *a);
+/* Сколько записей сейчас числится за клиентом (стенды и explain). */
+unsigned fakeip_owner_count(uint64_t owner);
 void fakeip_state_load(const char *path);
 void fakeip_state_rewrite(void);
 /* Файл состояния — сейчас, если в памяти есть незаписанное (g_fakeip_dirty): просьба «flush»
@@ -581,6 +670,9 @@ struct pending {
     uint16_t txid;
     struct dnsd_local local;
     int have_local;
+    /* Клиент для доли таблицы (pending_alloc, fakeip_client_key; 0 — петля, доли нет). Ставит
+     * pending_alloc при выдаче места: вопрос этого места — его. */
+    uint64_t ckey;
     time_t expire;
     /* Запрос ушёл на апстрим со своим транспортом (dup.h): его порядковый номер (0 — нет), чтобы
      * запоздалый ответ на прежнее содержимое слота не принять за ответ на нынешнее; соединение
@@ -606,6 +698,13 @@ int name_local(const char *q);
 extern struct pending g_pending[MAX_PENDING];
 extern uint8_t g_gen_next;
 uint8_t pending_next_gen(void);
+/* Место таблицы для вопроса клиента from (доля на клиента — proxy.c, PENDING_PER_CLIENT); NULL —
+ * мест нет. pending_client_count — сколько мест клиента занято. */
+struct pending *pending_alloc(const struct sockaddr_storage *from);
+unsigned pending_client_count(uint64_t key);
+/* Место занято / свободно — только через них: они ведут счёт мест клиента. */
+void pending_take(struct pending *p);
+void pending_drop(struct pending *p);
 uint16_t pending_tag(const struct pending *p);
 uint16_t question_fp(const uint8_t *pkt, size_t qend);
 
