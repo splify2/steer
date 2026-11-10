@@ -440,8 +440,10 @@ static int pkg_installed(const struct pm_ctx *x, const char *name) {
     return hit;
 }
 
-/* Поставить пакет. Единственный вызов чужой утилиты менеджера (manifest.md, requires.system). */
-static int pkg_add(const char *name, struct pm_err *e) {
+/* Поставить пакет. Единственный вызов чужой утилиты менеджера (manifest.md, requires.system).
+ * why (если не NULL) — при отказе последняя строка вывода утилиты в куче (может быть пустой): из неё
+ * system_deps складывает общий отказ по альтернативам «a|b». */
+static int pkg_add(const char *name, char **why, struct pm_err *e) {
     const char *pk = getenv("STEER_PLUGIN_PKG");
     char *out = NULL;
     int rc;
@@ -465,7 +467,8 @@ static int pkg_add(const char *name, struct pm_err *e) {
     if (rc != 0) {
         char *last = trim_out(out);
         pm_errc(e, "plugin.package_failed", PMA("name", name, "sep", *last ? ": " : "", "last", last), "пакет %s не поставился%s%s", name, *last ? ": " : "", last);
-        free(last);
+        if (why) *why = last;
+        else free(last);
         return -1;
     }
     free(out);
@@ -988,6 +991,40 @@ static int manifest_checks(struct pm_ctx *x, const char *id, const struct ynode 
     return 0;
 }
 
+/* Альтернативы одного требования «a|b» (manifest.md): имена без пробелов по краям, пустые пропущены.
+ * Возвращает число имён; *v и каждое имя — в куче (alts_free). */
+static size_t alts_split(const char *alt, char ***v) {
+    char *copy = pm_strdup(alt), *save = NULL;
+    size_t n = 0;
+    *v = NULL;
+    for (char *p = strtok_r(copy, "|", &save); p; p = strtok_r(NULL, "|", &save)) {
+        while (*p == ' ') p++;
+        size_t l = strlen(p);
+        while (l && p[l - 1] == ' ') p[--l] = '\0';
+        if (!l) continue;
+        *v = pm_realloc(*v, sizeof(char *) * (n + 1));
+        (*v)[n++] = pm_strdup(p);
+    }
+    free(copy);
+    return n;
+}
+
+static void alts_free(char **v, size_t n) {
+    for (size_t i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
+
+/* «a, b» — список альтернатив для текста отказа: черта «|» из манифеста человеку ничего не говорит. */
+static char *alts_join(char **v, size_t n) {
+    char *r = pm_strdup("");
+    for (size_t i = 0; i < n; i++) {
+        char *t = pm_fmt("%s%s%s", r, i ? ", " : "", v[i]);
+        free(r);
+        r = t;
+    }
+    return r;
+}
+
 /* Системные пакеты и пути ядра. sys_out — что поставлено менеджером. */
 static int system_deps(struct pm_ctx *x, const char *id, const struct ynode *man, char ***sys_out, size_t *nsys,
                        struct pm_err *e) {
@@ -996,25 +1033,58 @@ static int system_deps(struct pm_ctx *x, const char *id, const struct ynode *man
     for (size_t i = 0; i < ynode_len(sys); i++) {
         const char *alt = yn_is_str(ynode_at(sys, i)) ? ynode_at(sys, i)->str : NULL;
         if (!alt) continue;
-        char *copy = pm_strdup(alt), *save = NULL, *firstp = NULL;
+        char **names = NULL;
+        size_t nn = alts_split(alt, &names);
         int have = 0;
-        for (char *p = strtok_r(copy, "|", &save); p && !have; p = strtok_r(NULL, "|", &save)) {
-            while (*p == ' ') p++;
-            if (!firstp) firstp = p;
-            if (pkg_installed(x, p)) have = 1;
+        for (size_t k = 0; k < nn && !have; k++)
+            if (pkg_installed(x, names[k])) have = 1;
+        if (have || !nn) { alts_free(names, nn); continue; }
+        char *list = alts_join(names, nn);
+        if (x->pkg_tx) {
+            /* Изнутри транзакции apk/opkg база заперта: поставить пакет нельзя. Человеку называются все
+             * альтернативы: первая может не лежать в фидах вовсе (kmod-amneziawg), а годится любая. */
+            if (nn == 1)
+                pm_errc(e, "plugin.needs_package_after", PMA("id", id, "pkg", names[0], "tx", x->pkg_tx), "%s не встаёт: нужен пакет %s — поставьте его после установки %s", id, names[0], x->pkg_tx);
+            else
+                pm_errc(e, "plugin.needs_package_any_after", PMA("id", id, "pkgs", list, "tx", x->pkg_tx), "%s не встаёт: нужен один из пакетов %s — поставьте его после установки %s", id, list, x->pkg_tx);
+            free(list);
+            alts_free(names, nn);
+            return -1;
         }
-        if (!have && firstp && x->pkg_tx) {
-            /* Изнутри транзакции apk/opkg база заперта: поставить пакет нельзя. */
-            free(copy);
-            return pm_errc(e, "plugin.needs_package_after", PMA("id", id, "pkg", firstp, "tx", x->pkg_tx), "%s не встаёт: нужен пакет %s — поставьте его после установки %s", id, firstp, x->pkg_tx);
+        /* Альтернативы пробуются по порядку манифеста, пока одна не встанет: первой автор ставит лучшую,
+         * но её может не быть в фидах этой сборки (kmod-amneziawg — сторонний пакет), и отказ на ней
+         * оставлял человека ставить пакет руками, хотя вторая лежит в фидах. */
+        const char *got = NULL;
+        char *whys = NULL;      /* «пакет: причина; пакет: причина» — что ответила утилита на каждую */
+        struct pm_err pe;
+        memset(&pe, 0, sizeof(pe));
+        for (size_t k = 0; k < nn && !got; k++) {
+            if (nn == 1) pm_progress(x, "пакет %s для %s", names[k], id);
+            else pm_progress(x, "пакет %s для %s (вариант %zu из %zu)", names[k], id, k + 1, nn);
+            char *why = NULL;
+            if (pkg_add(names[k], &why, &pe) == 0) { got = names[k]; break; }
+            if (k + 1 < nn) pm_progress(x, "%s — пробую %s", pe.msg, names[k + 1]);
+            if (why && *why) {
+                char *t = pm_fmt("%s%s%s: %s", whys ? whys : "", whys ? "; " : "", names[k], why);
+                free(whys);
+                whys = t;
+            }
+            free(why);
         }
-        if (!have && firstp) {
-            pm_progress(x, "пакет %s для %s", firstp, id);
-            if (pkg_add(firstp, e) != 0) { free(copy); return -1; }
-            *sys_out = pm_realloc(*sys_out, sizeof(char *) * (*nsys + 1));
-            (*sys_out)[(*nsys)++] = pm_strdup(firstp);
+        if (!got) {
+            /* Одно имя — прежний отказ утилиты как есть; несколько — отказ называет все, что пробовали. */
+            if (nn == 1) pm_errcopy(e, &pe);
+            else pm_errc(e, "plugin.packages_failed", PMA("id", id, "pkgs", list, "sep", whys ? ": " : "", "why", whys ? whys : ""), "%s не встаёт: не поставился ни один из пакетов %s%s%s", id, list, whys ? ": " : "", whys ? whys : "");
+            free(whys);
+            free(list);
+            alts_free(names, nn);
+            return -1;
         }
-        free(copy);
+        *sys_out = pm_realloc(*sys_out, sizeof(char *) * (*nsys + 1));
+        (*sys_out)[(*nsys)++] = pm_strdup(got);
+        free(whys);
+        free(list);
+        alts_free(names, nn);
     }
     const struct ynode *kern = ynode_get(req, "kernel");
     for (size_t i = 0; i < ynode_len(kern); i++) {
@@ -1028,8 +1098,22 @@ static int system_deps(struct pm_ctx *x, const char *id, const struct ynode *man
         }
         free(copy);
         if (!have) {
+            /* Подсказка — первое требование requires.system; у него могут быть альтернативы «a|b», и тогда
+             * называются все списком, а не сырой строкой манифеста с чертой. */
             const char *pk = ynode_len(sys) ? (yn_is_str(ynode_at(sys, 0)) ? ynode_at(sys, 0)->str : NULL) : NULL;
-            return pm_errc(e, pk ? "plugin.system_missing_pkg" : "plugin.system_missing", PMA("id", id, "alt", alt, "package", pk ? pk : ""), "%s не встаёт: нет %s%s%s", id, alt, pk ? " (нужен пакет " : "", pk ? pk : "");
+            char **names = NULL;
+            size_t nn = pk ? alts_split(pk, &names) : 0;
+            if (nn > 1) {
+                char *list = alts_join(names, nn);
+                pm_errc(e, "plugin.system_missing_pkgs", PMA("id", id, "alt", alt, "packages", list), "%s не встаёт: нет %s (нужен один из пакетов %s)", id, alt, list);
+                free(list);
+            } else if (nn == 1) {
+                pm_errc(e, "plugin.system_missing_pkg", PMA("id", id, "alt", alt, "package", names[0]), "%s не встаёт: нет %s (нужен пакет %s)", id, alt, names[0]);
+            } else {
+                pm_errc(e, "plugin.system_missing", PMA("id", id, "alt", alt), "%s не встаёт: нет %s", id, alt);
+            }
+            alts_free(names, nn);
+            return -1;
         }
     }
     return 0;

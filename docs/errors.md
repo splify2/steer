@@ -394,6 +394,7 @@
 | `plugin.needed_by_outputs` | `id`, `outputs` | плагин {id} нужен выходам: {outputs}; снять всё равно — с --force |
 | `plugin.needed_by_plugins` | `id`, `users` | плагин {id} нужен плагинам {users}; снять всё равно — с --force |
 | `plugin.needs_package_after` | `id`, `pkg`, `tx` | {id} не встаёт: нужен пакет {pkg} — поставьте его после установки {tx} |
+| `plugin.needs_package_any_after` | `id`, `pkgs`, `tx` | {id} не встаёт: нужен один из пакетов {pkgs} — поставьте его после установки {tx} |
 | `plugin.needs_plugin` | `id`, `dep`, `range` | {id} требует плагин {dep} {range} — поставьте его |
 | `plugin.net_and_seed` | `net`, `seed` | {net}; из семени: {seed} |
 | `plugin.no_archive_url` | `id`, `version` | у архива {id} {version} в индексе нет адреса |
@@ -414,6 +415,7 @@
 | `plugin.on_off` | — | нужно on или off |
 | `plugin.output_not_up` | `name`, `seconds` | выход {name} не поднялся за {seconds} с |
 | `plugin.package_failed` | `name`, `sep`, `last` | пакет {name} не поставился{sep}{last} |
+| `plugin.packages_failed` | `id`, `pkgs`, `sep`, `why` | {id} не встаёт: не поставился ни один из пакетов {pkgs}{sep}{why} |
 | `plugin.perm_nft` | `id` | {id}: файлы nft без права nft |
 | `plugin.perm_so` | `id` | {id}: steer.so без права so |
 | `plugin.perm_system` | `id` | {id}: requires.system без права system-packages |
@@ -448,6 +450,7 @@
 | `plugin.subcommand_core` | `name` | подкоманда {name} — команда ядра, плагину её не дать |
 | `plugin.system_missing` | `id`, `alt` | {id} не встаёт: нет {alt} |
 | `plugin.system_missing_pkg` | `id`, `alt`, `package` | {id} не встаёт: нет {alt} (нужен пакет {package}) |
+| `plugin.system_missing_pkgs` | `id`, `alt`, `packages` | {id} не встаёт: нет {alt} (нужен один из пакетов {packages}) |
 | `plugin.unpack_failed` | `id`, `why` | архив {id} не распаковался: {why} |
 | `plugin.unsigned` | `what` | {what} не подписан |
 | `plugin.version_conflict` | `id`, `range`, `have` | нужен {id} {range}, а план уже берёт {have} |
