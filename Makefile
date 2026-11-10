@@ -665,13 +665,14 @@ $(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/pro
 # Content-Length, chunked, переадресации, cookie, ETag, сроки, обрывы, тела в десятки мегабайт потоком.
 # TLS подменён заглушками (криптобиблиотеки в make test нет); настоящий HTTPS — tests/httpsmatch.sh в
 # make ext-test. Потоки сервера — -lpthread.
-# Ожидание данных HTTPS в httpc.c — poll до срока, а не холостая петля (аудит 2.1.0, F2): настоящий tls13.c
-# (записи ChangeCipherSpec — без криптографии), httpc.c включён ради static read_head, вызовы чтения TLS
-# считаются обёрткой компоновщика.
+# Ожидание данных HTTPS в httpc.c — poll до срока, а не холостая петля (аудит 2.1.0, F2): настоящий http_get
+# по https:// к серверу на петле, чтение TLS — настоящий tls13.c (записи ChangeCipherSpec — без криптографии);
+# рукопожатие, запись и освобождение TLS подменены обёрткой компоновщика, вызовы чтения считаются.
 $(BUILD)/httpcspinmatch: tests/httpcspinmatch.c tests/unit.h src/proto/tls/httpc.c src/proto/tls/httpc.h src/proto/tls/tls13.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests -o $@ tests/httpcspinmatch.c src/proto/tls/tls13.c \
-	      -Wl,--wrap=tls13_read_ref -Wl,--unresolved-symbols=ignore-all -lpthread -ldl
+	$(CC) $(CFLAGS) -Itests -o $@ tests/httpcspinmatch.c src/proto/tls/httpc.c src/proto/tls/tls13.c \
+	      -Wl,--wrap=tls13_read_ref -Wl,--wrap=tls13_handshake_auth -Wl,--wrap=tls13_write -Wl,--wrap=tls13_free \
+	      -Wl,--unresolved-symbols=ignore-all -lpthread -ldl
 
 $(BUILD)/httpmatch: tests/httpmatch.c tests/unit.h src/proto/tls/httpc.c src/proto/tls/httpc.h
 	@mkdir -p $(BUILD)
