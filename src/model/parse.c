@@ -659,11 +659,19 @@ struct output *out_by_name(const struct spec *sp, const char *n) {
  * заметно снаружи: набор соберётся, резолвер запустится, а часть списка просто не будет
  * действовать.
  *
- * Проверяется ФОРМА, а не значения октетов: `1.1.1.1` и `8.8.8.0/24` адреса, `youtube.com`
- * нет. Строка вроде `123.456.789.0` формой проходит, а адресом не является — её отвергнет
- * nft, и это правильное место для такого отказа: там она названа по имени, а угадывать
- * здесь значило бы завести второй разборщик адресов рядом с ядерным. */
-static int addr_half_ok(const char *s, const char *end) {
+ * ТРИ ИСХОДА, а не два: адрес (семейство 4 или 6), имя и ИСПОРЧЕННЫЙ АДРЕС — строка, по форме
+ * адресная, но адресом не являющаяся: `300.1.1.1`, `10.0.0.0/33`, `1.2.3.4/`, `1...2`, обрыв
+ * загрузки `104.16.0.`, диапазон задом наперёд. Раньше здесь проверялась только форма, а значения
+ * оставлялись nft — «там строка названа по имени». Но nft на одной такой строке отвергает НАБОР
+ * ЦЕЛИКОМ: на работающем роутере оставался прежний набор, а после перезагрузки прежнего нет, и
+ * маршрутизации не было вовсе, пока человек не чинил чужой список руками. Список — чужие данные;
+ * одна строка в нём не должна решать судьбу набора. Поэтому значения разбираются здесь, строго:
+ * компилятор испорченную строку пропускает и говорит о ней одной строкой на список
+ * (check_address_lists), а резолвер не берёт её доменным правилом (spec_line_is_addr — «строка
+ * адресная по форме», а не «годный адрес»): оба читателя по-прежнему согласны, чья строка. */
+
+/* Форма половины IPv4: цифры, три точки, не больше одной косой черты. */
+static int addr_half_shape(const char *s, const char *end) {
     int digits = 0, dots = 0, slash = 0;
     for (const char *p = s; p < end; p++) {
         if (*p >= '0' && *p <= '9') { digits++; continue; }
@@ -674,13 +682,44 @@ static int addr_half_ok(const char *s, const char *end) {
     return digits > 0 && dots == 3 && slash <= 1;
 }
 
+/* Половина IPv4 строго: четыре октета 0–255 и, если with_len, необязательная длина «/0–32»
+ * (у половин диапазона длины нет). Октет — одна-три цифры без ведущего нуля: `010.1.1.1` разные
+ * разборщики читают по-разному (восьмеричное у inet_aton, отказ у inet_pton), и какой из них стоит
+ * за nft на этом роутере, отсюда не узнать — такая строка считается испорченной. *val — адрес. */
+static int addr_half_ok(const char *s, const char *end, int with_len, uint32_t *val) {
+    uint32_t a = 0;
+    const char *p = s;
+    for (int o = 0; o < 4; o++) {
+        unsigned v = 0;
+        int nd = 0;
+        while (p < end && *p >= '0' && *p <= '9' && nd < 4) { v = v * 10 + (unsigned)(*p - '0'); p++; nd++; }
+        if (nd < 1 || nd > 3 || v > 255 || (nd > 1 && p[-nd] == '0')) return 0;
+        a = (a << 8) | v;
+        if (o < 3) {
+            if (p >= end || *p != '.') return 0;
+            p++;
+        }
+    }
+    if (p < end) {
+        if (!with_len || *p != '/') return 0;
+        p++;
+        unsigned len = 0;
+        int nd = 0;
+        while (p < end && *p >= '0' && *p <= '9' && nd < 3) { len = len * 10 + (unsigned)(*p - '0'); p++; nd++; }
+        if (nd < 1 || nd > 2 || len > 32 || p != end) return 0;
+    }
+    if (val) *val = a;
+    return 1;
+}
+
 /* Половина IPv6: адрес с необязательной длиной префикса «/0-128» (with_len), без длины — у
  * половин диапазона «a-b». Здесь, в отличие от IPv4, проверка НЕ по форме, а разбором
  * (inet_pton): запись IPv6 со сжатием «::» и хвостом в точечной записи форме «цифры и
  * двоеточия» не опишешь без второго разборщика, а строк IPv6 в списках на порядки меньше, чем
  * IPv4, — цена разбора не заметна. Двоеточие обязательно: MAC («aa:bb:cc:dd:ee:ff») адресом
- * IPv6 не разбирается (шесть групп без «::»), и спутать их нельзя. */
-static int addr6_half_ok(const char *s, const char *end, int with_len) {
+ * IPv6 не разбирается (шесть групп без «::»), и спутать их нельзя. *val (может быть NULL) —
+ * адрес: по нему сверяется порядок концов диапазона. */
+static int addr6_half_ok(const char *s, const char *end, int with_len, struct in6_addr *val) {
     char buf[64];
     size_t n = (size_t)(end - s);
     if (n == 0 || n >= sizeof(buf)) return 0;
@@ -696,7 +735,9 @@ static int addr6_half_ok(const char *s, const char *end, int with_len) {
         if (e == sl + 1 || *e || len < 0 || len > 128) return 0;
     }
     struct in6_addr a;
-    return inet_pton(AF_INET6, buf, &a) == 1;
+    if (inet_pton(AF_INET6, buf, &a) != 1) return 0;
+    if (val) *val = a;
+    return 1;
 }
 
 /* Диапазон здесь обязателен, и это не расширение ради полноты: `steer fit` сам ВЫДАЁТ
@@ -727,7 +768,7 @@ int spec_one_host(const char *s) {
     if (n >= sizeof(buf)) return 0;
     memcpy(buf, s, n);
     buf[n] = '\0';
-    return spec_line_is_addr(buf) && !strchr(buf, '-');
+    return spec_line_family(buf) == 4 && !strchr(buf, '-');
 }
 
 int from_is_local(const char *s) {
@@ -762,16 +803,38 @@ int from_uid_range(const char *s, unsigned *lo, unsigned *hi) {
 int spec_line_family(const char *s) {
     const char *dash = strchr(s, '-');
     const char *end = s + strlen(s);
-    if (!dash) return addr_half_ok(s, end) ? 4 : addr6_half_ok(s, end, 1) ? 6 : 0;
-    /* Ровно один дефис, и обе половины — адреса одного семейства. */
+    if (!dash) return addr_half_ok(s, end, 1, NULL) ? 4 : addr6_half_ok(s, end, 1, NULL) ? 6 : 0;
+    /* Ровно один дефис, обе половины — адреса одного семейства без длины, и начало не больше
+     * конца: диапазон задом наперёд nft отвергает вместе со всем набором. */
     if (strchr(dash + 1, '-')) return 0;
-    if (addr_half_ok(s, dash) && addr_half_ok(dash + 1, end)) return 4;
-    if (addr6_half_ok(s, dash, 0) && addr6_half_ok(dash + 1, end, 0)) return 6;
+    uint32_t lo, hi;
+    if (addr_half_ok(s, dash, 0, &lo) && addr_half_ok(dash + 1, end, 0, &hi)) return lo <= hi ? 4 : 0;
+    struct in6_addr lo6, hi6;
+    if (addr6_half_ok(s, dash, 0, &lo6) && addr6_half_ok(dash + 1, end, 0, &hi6))
+        return memcmp(&lo6, &hi6, sizeof(lo6)) <= 0 ? 6 : 0;
     return 0;
 }
 
+/* Адресная ли строка ПО ФОРМЕ — то есть не имя. Шире, чем «годный адрес»: сюда входят и
+ * испорченные адреса (шапка раздела). IPv4 — прежняя форма (цифры и три точки в каждой половине);
+ * IPv6 — двоеточие и ничего, кроме шестнадцатеричных цифр, двоеточий, точек, косой черты и дефиса
+ * (в имени двоеточия не бывает). Резолвер по ней решает, что строка не его; компилятор берёт из
+ * таких только годные (spec_line_family). */
 int spec_line_is_addr(const char *s) {
-    return spec_line_family(s) != 0;
+    if (spec_line_family(s) != 0) return 1;
+    const char *end = s + strlen(s);
+    const char *dash = strchr(s, '-');
+    if (!dash) {
+        if (addr_half_shape(s, end)) return 1;
+    } else if (!strchr(dash + 1, '-') && addr_half_shape(s, dash) && addr_half_shape(dash + 1, end)) {
+        return 1;
+    }
+    if (!strchr(s, ':')) return 0;
+    for (const char *p = s; *p; p++) {
+        int hex = (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F');
+        if (!hex && *p != ':' && *p != '.' && *p != '/' && *p != '-') return 0;
+    }
+    return 1;
 }
 
 /* MAC-адрес: шесть групп по одной-две шестнадцатеричные цифры через двоеточие. Группы

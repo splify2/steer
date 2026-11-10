@@ -428,9 +428,13 @@ int has_via(const struct spec *sp) {
  *
  * Отдельным проходом, до генерации: сообщение об ошибке должно появиться раньше, чем
  * мы начнём собирать набор, и раньше, чем что-либо будет применено. */
+/* Испорченные адреса (по форме адрес, но негодный — parse.c, «что такое строка списка») входят в
+ * bad и считаются ещё и отдельно, со своей первой строкой: о них говорится иначе, чем об именах. */
+struct list_broken { size_t n, line; char sample[104]; };
+
 static int count_list(const char *path, size_t *total, size_t *bad, size_t *v6,
                       char *first_bad, size_t first_bad_n, size_t *first_bad_line,
-                      struct err *e) {
+                      struct list_broken *br, struct err *e) {
     FILE *in = fopen(path, "r");
     /* Отказ здесь — почти всегда гонка: readability уже проверена вызывающим мгновением
      * раньше (см. check_address_lists), и попасть сюда можно только если список исчез
@@ -440,6 +444,7 @@ static int count_list(const char *path, size_t *total, size_t *bad, size_t *v6,
     char line[512];
     size_t lineno = 0;
     *total = *bad = *v6 = 0;
+    memset(br, 0, sizeof(*br));
     if (first_bad_n) first_bad[0] = '\0';
     while (fgets(line, sizeof(line), in)) {
         lineno++;
@@ -453,6 +458,14 @@ static int count_list(const char *path, size_t *total, size_t *bad, size_t *v6,
         int fam = spec_line_family(p);
         if (fam == 6) (*v6)++;
         if (fam) continue;
+        if (spec_line_is_addr(p)) {
+            if (!br->n++) {
+                snprintf(br->sample, sizeof(br->sample), "%.100s", p);
+                br->line = lineno;
+            }
+            (*bad)++;
+            continue;
+        }
         if (!(*bad)++ && first_bad_n) {
             /* Точность в формате, а не только размер буфера: строка из файла бывает
              * длиннее образца, и обрезать её надо явно, а не «как получится». */
@@ -532,11 +545,23 @@ int check_address_lists(struct groups *gr, struct err *e) {
         for (size_t k = 0; k < g->files_n; k++) {
             size_t total = 0, bad = 0, v6 = 0, bad_line = 0;
             char sample[128];
+            struct list_broken br;
             if (count_list(g->files[k], &total, &bad, &v6, sample, sizeof(sample), &bad_line,
-                           e) != 0)
+                           &br, e) != 0)
                 return -1;
             g->addrs += total - bad - v6;
             g->addrs6 += v6;
+            /* Испорченные адреса — одной строкой на список, и набор собирается без них: раньше
+             * такая строка уходила в текст набора, и nft отвергал его целиком. Дальше список
+             * судится по остальным строкам. */
+            if (br.n) {
+                fprintf(stderr, LOG_W "%s: испорченных адресных строк %zu из %zu, пропускаю их "
+                                "(первая — %zu: «%s»)\n",
+                        g->files[k], br.n, total, br.line, br.sample);
+                total -= br.n;
+                bad -= br.n;
+                if (!total) continue;
+            }
             if (!total) {
                 fprintf(stderr, LOG_W "%s: список пуст — канал «%s» ничего не поймает\n",
                         g->files[k], g->members_n ? g->members[0] : g->name);

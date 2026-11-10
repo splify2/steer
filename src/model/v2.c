@@ -347,7 +347,7 @@ static int mac_ok(const char *s) {
  * (docs/architecture.md, «4б»): правило IPv4 берёт записи IPv4, его v6-двойник — записи IPv6, и
  * смесь семейств в одном клиенте допустима. */
 static int addr_check(struct v2 *x, const struct ynode *n, const char *where, const char *v) {
-    if (!spec_line_is_addr(v))
+    if (!spec_line_family(v))
         return fail(x, n, "spec.bad_address", "%s: «%s» — не адрес IPv4 или IPv6, не подсеть и не диапазон", where, v);
     return 0;
 }
@@ -596,7 +596,7 @@ static int p_list(struct v2 *x, const struct ynode *key, const struct ynode *val
         if (items_ok(x, n, w)) return -1;
         for (size_t i = 0; i < n_items(n); i++) {
             const struct ynode *it = item(n, i);
-            if (a == 1 && !spec_line_is_addr(it->str))
+            if (a == 1 && !spec_line_family(it->str))
                 return fail(x, it, "spec.list_bad_prefix", "%s: «%s» — не адрес, не подсеть и не диапазон", w, it->str);
             if (a == 0 && spec_line_is_addr(it->str))
                 return fail(x, it, "spec.list_address_in_domains", "%s: «%s» — адрес, а не домен; ему место в prefixes", w, it->str);
