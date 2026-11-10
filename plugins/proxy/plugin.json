@@ -13,6 +13,7 @@
   "arch": [
     "aarch64_cortex-a53",
     "aarch64_cortex-a72",
+    "aarch64_cortex-a73",
     "aarch64_generic",
     "arm_cortex-a7_neon-vfpv4",
     "arm_cortex-a9",
