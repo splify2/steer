@@ -71,5 +71,18 @@ check "сброс таблицы: код 0" "0" "$(T flush 200)"
 check "… в таблице IPv4 пусто" "0" "$(T routes 4 200)"
 check "… в таблице IPv6 700 маршрутов остались (сброс — семейства IPv4)" "700" "$(T routes 6 200)"
 
+# Устройства маршрутов по умолчанию main (набор @wan_dev, src/daemon/wandev.c). Маршрут через два
+# шлюза приходит без RTA_OIF — устройства в RTA_MULTIPATH; прежде такой WAN не видел никто.
+ip link add w1 type dummy && ip link set w1 up && ip addr add 192.0.2.1/24 dev w1
+ip link add w2 type dummy && ip link set w2 up && ip addr add 198.51.100.1/24 dev w2
+check "WAN: маршрута по умолчанию нет — пусто" "" "$(T defdevs)"
+ip route add default via 192.0.2.254 dev w1
+check "WAN: маршрут по умолчанию через один шлюз — его устройство" "w1" "$(T defdevs)"
+ip route replace default nexthop via 192.0.2.254 dev w1 nexthop via 198.51.100.254 dev w2
+check "WAN: маршрут через два шлюза (RTA_MULTIPATH) — оба устройства" "w1 w2" "$(T defdevs)"
+ip -6 addr add 2001:db8:77::1/64 dev w2 nodad
+ip -6 route add default via 2001:db8:77::fe dev w2
+check "  и IPv6 через то же устройство — без повтора имени" "w1 w2" "$(T defdevs)"
+
 echo "rtnlmatch: $pass passed, $fail failed"
 [ "$fail" = 0 ]

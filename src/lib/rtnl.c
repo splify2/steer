@@ -541,6 +541,21 @@ static void defdev_cb(const struct nlmsghdr *h, void *ctx) {
     uint32_t table = tb[RTA_TABLE] ? rta_u32(tb[RTA_TABLE]) : rt->rtm_table;
     if (table != RT_TABLE_MAIN) return;
     if (tb[RTA_OIF]) defdev_put(c, rta_u32(tb[RTA_OIF]));
+    /* Маршрут по умолчанию через несколько шлюзов (`ip route add default nexthop via … dev wan
+     * nexthop via … dev wwan`, mwan3, два провайдера) приходит без RTA_OIF: устройства лежат в
+     * RTA_MULTIPATH, по одному rtnexthop на шлюз. Без их разбора @wan_dev оставался пустым, и всё,
+     * что по нему отличает WAN (плагины, steer-api 1.2), WAN не видело вовсе. */
+    if (tb[RTA_MULTIPATH]) {
+        const struct rtnexthop *nh = RTA_DATA(tb[RTA_MULTIPATH]);
+        size_t left = RTA_PAYLOAD(tb[RTA_MULTIPATH]);
+        while (left >= sizeof(*nh) && nh->rtnh_len >= sizeof(*nh) && nh->rtnh_len <= left) {
+            defdev_put(c, (unsigned)nh->rtnh_ifindex);
+            size_t step = RTNH_ALIGN(nh->rtnh_len);
+            if (step >= left) break;
+            left -= step;
+            nh = (const struct rtnexthop *)((const uint8_t *)nh + step);
+        }
+    }
 }
 
 static void defdev_reset(void *ctx) {
