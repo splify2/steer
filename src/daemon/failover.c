@@ -1941,6 +1941,11 @@ static void fo_emit(fo_event_fn ev, void *arg, enum fo_ev_kind kind, const struc
  * превращается в пачку проб. */
 
 #define ICMP_PROBE_TIMEOUT_MS 3000                     /* как у прежнего `ping -W 3` */
+/* Эхо-запросов на цель за её срок: сразу, через секунду и через две. Одна датаграмма теряется и
+ * на исправном туннеле (очередь под нагрузкой, смена ключей, предел ICMP у адресата), а цель,
+ * записанная мёртвой по одной потере, — половина пути к перезапуску туннеля. Три потери подряд
+ * у одной цели и три у другой — это уже не случайность. Срок цели и прохода не вырос. */
+#define ICMP_PROBE_TRIES 3
 #define TCP_PROBE_TIMEOUT_MS  (TCP_PROBE_TIMEOUT * 1000)
 #define REVIVE_WAIT_STEPS 10
 #define REVIVE_STEP_MS 1000
@@ -2126,7 +2131,7 @@ static int hp_icmp_next(struct fo_run *r) {
     for (; PROBE_TARGETS[r->hp.ti]; r->hp.ti++) {
         int ok = 0;
         r->hp.p = foprobe_icmp(r->l, r->hp.dev, r->hp.src, PROBE_TARGETS[r->hp.ti],
-                               ICMP_PROBE_TIMEOUT_MS, hp_icmp_cb, r, &ok);
+                               ICMP_PROBE_TIMEOUT_MS, ICMP_PROBE_TRIES, hp_icmp_cb, r, &ok);
         if (r->hp.p) return 1;
         if (ok) break;
     }

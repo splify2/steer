@@ -43,7 +43,12 @@ struct foprobe {
     void *arg;
     long t0;
     struct in_addr dst;
-    uint16_t id, seq;
+    /* ICMP: свои запросы — номера с seq0 по seq; rtm — таймер повтора, left — сколько запросов
+     * ещё послать, gap — через сколько миллисекунд следующий. */
+    uint16_t id, seq0, seq;
+    struct loop_timer *rtm;
+    int left;
+    long gap;
 };
 
 static void probe_free(struct foprobe *p) {
@@ -52,6 +57,7 @@ static void probe_free(struct foprobe *p) {
         close(p->fd);
     }
     loop_timer_free(p->tm);
+    loop_timer_free(p->rtm);
     if (p->sp) fospawn_cancel(p->sp);
     free(p);
 }
@@ -195,8 +201,13 @@ static void icmp_ready(struct loop *l, int fd, uint32_t ev, void *arg) {
         if (fl >= sizeof(from) && from.sin_addr.s_addr != p->dst.s_addr) continue;
         uint16_t id = (uint16_t)(ic[4] << 8 | ic[5]), seq = (uint16_t)(ic[6] << 8 | ic[7]);
         /* Ping-сокету номер выдаёт ядро и ответы разбирает само; сырой видит все ответы на
-         * устройстве — свой узнаётся по номеру. */
-        if (seq != p->seq || (p->kind == PK_RAW && id != p->id)) continue;
+         * устройстве — свой узнаётся по номеру. Годится ответ на ЛЮБОЙ из своих запросов
+         * (seq0..seq), а не только на последний: ответ на первый, пришедший после повтора, —
+         * тот же живой путь. Сравнение — в арифметике uint16: счётчик номеров общий на процесс
+         * и переходит через ноль. */
+        if ((uint16_t)(seq - p->seq0) > (uint16_t)(p->seq - p->seq0) ||
+            (p->kind == PK_RAW && id != p->id))
+            continue;
         probe_finish(p, 1, elapsed_ms(p->t0));
         return;
     }
@@ -236,6 +247,39 @@ static int icmp_open(int kind, const char *dev, struct in_addr src, int *fd, cha
     return 0;
 }
 
+/* Послать очередной эхо-запрос пробы — со следующим номером. 0 — ушёл. */
+static int icmp_send(struct foprobe *p) {
+    uint8_t pkt[64];
+    memset(pkt, 0, sizeof(pkt));
+    uint16_t seq = ++g_icmp_seq;
+    pkt[0] = ICMP_ECHO;
+    pkt[4] = (uint8_t)(p->id >> 8);
+    pkt[5] = (uint8_t)p->id;
+    pkt[6] = (uint8_t)(seq >> 8);
+    pkt[7] = (uint8_t)seq;
+    for (size_t i = 8; i < sizeof(pkt); i++) pkt[i] = (uint8_t)i;
+    uint16_t c = csum(pkt, sizeof(pkt));
+    pkt[2] = (uint8_t)(c >> 8);
+    pkt[3] = (uint8_t)c;
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_addr = p->dst;
+    if (sendto(p->fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&to, sizeof(to)) < 0) return -1;
+    p->seq = seq;
+    return 0;
+}
+
+/* Повтор запроса цели, которая ещё не ответила. Отказ отправки здесь пробу не кончает (у
+ * первого запроса — кончает): устройство могло моргнуть между запросами, а приговор всё равно
+ * выносит срок пробы. */
+static void icmp_resend(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l;
+    struct foprobe *p = arg;
+    icmp_send(p);
+    if (--p->left > 0) loop_timer_set(t, p->gap);
+}
+
 static void ping_done(void *arg, int rc) {
     struct foprobe *p = arg;
     p->sp = NULL;
@@ -243,8 +287,10 @@ static void ping_done(void *arg, int rc) {
 }
 
 struct foprobe *foprobe_icmp(struct loop *l, const char *dev, const char *src, const char *host,
-                             int timeout_ms, foprobe_cb cb, void *arg, int *ok) {
+                             int timeout_ms, int tries, foprobe_cb cb, void *arg, int *ok) {
     *ok = 0;
+    if (tries < 1) tries = 1;
+    long gap = timeout_ms / tries;
     struct in_addr s4, d4;
     if (inet_aton(src, &s4) == 0 || inet_aton(host, &d4) == 0) return NULL;
     int fd = -1, kind = g_icmp_from;
@@ -263,9 +309,12 @@ struct foprobe *foprobe_icmp(struct loop *l, const char *dev, const char *src, c
                             "%s) — проверяю внешним ping, процесс на каждую пробу\n",
                     g_why_raw[0] ? g_why_raw : "-", g_why_dgram[0] ? g_why_dgram : "-");
         }
-        char w[16];
-        snprintf(w, sizeof(w), "%d", timeout_ms > 999 ? timeout_ms / 1000 : 1);
-        const char *argv[] = { "ping", "-c", "1", "-W", w, "-I", dev, "-q", host, NULL };
+        /* Те же запросы и тот же срок: ping шлёт их раз в секунду и ждёт ответа на последний
+         * -W секунд; код 0 — пришёл хотя бы один ответ (и у busybox, и у iputils). */
+        char w[16], c[16];
+        snprintf(w, sizeof(w), "%ld", gap > 999 ? gap / 1000 : 1L);
+        snprintf(c, sizeof(c), "%d", tries);
+        const char *argv[] = { "ping", "-c", c, "-W", w, "-I", dev, "-q", host, NULL };
         /* Сам ping ждёт свой срок; предел ребёнку — с запасом, от зависшего ping. */
         struct foprobe *p = probe_new(l, PK_PING, cb, arg, timeout_ms + 5000);
         if (!p) return NULL;
@@ -278,34 +327,21 @@ struct foprobe *foprobe_icmp(struct loop *l, const char *dev, const char *src, c
         }
         return p;
     }
-    uint8_t pkt[64];
-    memset(pkt, 0, sizeof(pkt));
-    uint16_t seq = ++g_icmp_seq;
-    uint16_t id = (uint16_t)(getpid() ^ 0x5354);
-    pkt[0] = ICMP_ECHO;
-    pkt[4] = (uint8_t)(id >> 8);
-    pkt[5] = (uint8_t)id;
-    pkt[6] = (uint8_t)(seq >> 8);
-    pkt[7] = (uint8_t)seq;
-    for (size_t i = 8; i < sizeof(pkt); i++) pkt[i] = (uint8_t)i;
-    uint16_t c = csum(pkt, sizeof(pkt));
-    pkt[2] = (uint8_t)(c >> 8);
-    pkt[3] = (uint8_t)c;
-    struct sockaddr_in to;
-    memset(&to, 0, sizeof(to));
-    to.sin_family = AF_INET;
-    to.sin_addr = d4;
     struct foprobe *p = probe_new(l, kind, cb, arg, timeout_ms);
     if (!p) { close(fd); return NULL; }
     p->fd = fd;
     p->dst = d4;
-    p->id = id;
-    p->seq = seq;
-    if (loop_fd_add(l, fd, EPOLLIN, icmp_ready, p) != 0 ||
-        sendto(fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&to, sizeof(to)) < 0) {
+    p->id = (uint16_t)(getpid() ^ 0x5354);
+    p->seq0 = (uint16_t)(g_icmp_seq + 1);
+    p->left = tries - 1;
+    p->gap = gap;
+    if (p->left > 0) p->rtm = loop_timer_new(l, icmp_resend, p);
+    if ((p->left > 0 && !p->rtm) || loop_fd_add(l, fd, EPOLLIN, icmp_ready, p) != 0 ||
+        icmp_send(p) != 0) {
         probe_free(p);
         return NULL;
     }
+    if (p->left > 0) loop_timer_set(p->rtm, gap);
     return p;
 }
 

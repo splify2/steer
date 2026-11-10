@@ -14,7 +14,7 @@
  *   1) сырой сокет SOCK_RAW/IPPROTO_ICMP — демон и сторож работают под root (CAP_NET_RAW);
  *   2) если его не дают (EPERM/EACCES: на телефоне сырой сокет может запретить SELinux), —
  *      ping-сокет SOCK_DGRAM/IPPROTO_ICMP (net.ipv4.ping_group_range);
- *   3) если нет и его — внешний `ping -c 1 -W <срок> -I <устройство>` ребёнком. Это процесс на
+ *   3) если нет и его — внешний `ping -c <запросов> -W <с> -I <устройство>` ребёнком. Это процесс на
  *      ПРОБУ, а не на проход, и последний откат: о нём пишется в журнал один раз за процесс,
  *      а неудавшиеся способы больше не пробуются, чтобы не платить за отказ на каждой пробе.
  * Сокет в обоих первых случаях привязан к устройству (SO_BINDTODEVICE) и к адресу источника
@@ -22,6 +22,10 @@
  * источника нужен правилу пробы (`from <адрес> lookup 299`, его ставит failover.c), которое
  * ведёт пробу и ответ на неё через проверяемое устройство. Почему правило остаётся и при
  * SO_BINDTODEVICE — в шапке device_healthy (failover.c).
+ * Запросов к цели несколько (tries), через равные доли срока, пока цель молчит; ответ на любой
+ * из них — «жива». Одна датаграмма теряется и на исправном пути (очередь туннеля под нагрузкой,
+ * смена ключей WireGuard, предел ICMP у адресата), и приговор по одной стоил перезапуска
+ * туннеля, который несёт трафик. Срок пробы от числа запросов не растёт.
  *
  * КОМАНДА — fork+exec с выброшенным выводом (как run_quiet), в своей группе процессов, выход —
  * через loop_child, срок — таймером: по сроку группа получает SIGKILL.
@@ -46,9 +50,10 @@ typedef void (*foprobe_cb)(void *arg, int ok, int ms);
 struct foprobe *foprobe_tcp(struct loop *l, const char *dev, unsigned mark, const char *host, int port,
                             int timeout_ms, foprobe_cb cb, void *arg, int *ok, int *ms);
 
-/* Эхо ICMP к host через устройство dev с адреса src. Договор — как у foprobe_tcp. */
+/* Эхо ICMP к host через устройство dev с адреса src: tries запросов за срок timeout_ms (первый
+ * сразу, следующие через timeout_ms / tries, пока нет ответа). Договор — как у foprobe_tcp. */
 struct foprobe *foprobe_icmp(struct loop *l, const char *dev, const char *src, const char *host,
-                             int timeout_ms, foprobe_cb cb, void *arg, int *ok);
+                             int timeout_ms, int tries, foprobe_cb cb, void *arg, int *ok);
 
 void foprobe_cancel(struct foprobe *p);
 
