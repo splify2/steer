@@ -187,6 +187,74 @@ int main(void) {
         check("fake-IP: у другого домена своего нет", 1, fakeip_entry_get_real("two.test") == 0);
     }
     {
+        /* Привязка поддельного адреса к настоящему (fakeip_real_pick). Сети доставки ротируют
+         * ответы: два ответа подряд с непересекающимися адресами — обычное дело, и прежний адрес при
+         * этом рабочий. Замена под именем, которым пользуются, уводила живые сеансы QUIC на другой
+         * сервер. Пока имя спрашивают, привязка стоит; меняется она после долгого простоя имени
+         * или когда прежний адрес давно не встречался в ответах. */
+        uint32_t fa = 0;
+        const uint32_t A = 0x9df000aeu, B = 0x3990f422u, C = 0x3990f423u;   /* 157.240.0.174, 57.144.244.34/35 */
+        struct answer_ip ab[2] = { { htonl(B), 60 }, { htonl(A), 60 } };
+        struct answer_ip ob[1] = { { htonl(B), 60 } }, oc[1] = { { htonl(C), 60 } };
+        fakeip_lookup_or_alloc("bind.test", &fa);
+        time_t t0 = time(NULL);
+        check("привязка: первый ответ — первый адрес ответа", 1,
+              fakeip_real_pick("bind.test", ob, 1, t0) == B);
+        fakeip_entry_set_real("bind.test", A);
+        struct fakeip_entry *e = &g_fakeip.entries[fakeip_find("bind.test")];
+        check("привязка: прежний адрес среди ответов (не первым) — остаётся", 1,
+              fakeip_real_pick("bind.test", ab, 2, t0 + 10) == A);
+        fakeip_touch(e, t0 + 70);
+        check("привязка: имя спрашивают, в ответе только другие адреса — остаётся прежний", 1,
+              fakeip_real_pick("bind.test", ob, 1, t0 + 70) == A);
+        fakeip_touch(e, t0 + 130);
+        check("  и на следующий ответ с третьим адресом — тоже", 1,
+              fakeip_real_pick("bind.test", oc, 1, t0 + 130) == A);
+        int held = 1;
+        for (time_t t = t0 + 190; t < t0 + 10 + FAKEIP_REAL_ABSENT_DEFAULT; t += 60) {
+            fakeip_touch(e, t);
+            if (fakeip_real_pick("bind.test", ob, 1, t) != A) held = 0;
+        }
+        check("  полчаса непрерывных вопросов без прежнего адреса в ответах — привязка стоит", 1, held);
+        fakeip_touch(e, t0 + 10 + FAKEIP_REAL_ABSENT_DEFAULT);
+        check("привязка: прежнего адреса нет в ответах полчаса — заменяется", 1,
+              fakeip_real_pick("bind.test", ob, 1, t0 + 10 + FAKEIP_REAL_ABSENT_DEFAULT) == B);
+        /* Замена состоялась (ядро приняло): отсчёт начинается заново с новым адресом. */
+        fakeip_entry_set_real("bind.test", B);
+        e->real_seen = t0 + 2000;
+        fakeip_touch(e, t0 + 2000);
+        fakeip_touch(e, t0 + 2000 + FAKEIP_REAL_IDLE_DEFAULT);       /* ровно срок — ещё не простой */
+        check("привязка: вопрос через десять минут ровно — именем ещё пользуются", 1,
+              fakeip_real_pick("bind.test", oc, 1, t0 + 2000 + FAKEIP_REAL_IDLE_DEFAULT) == B);
+        time_t t1 = t0 + 2000 + 2 * FAKEIP_REAL_IDLE_DEFAULT + 1;    /* простой дольше срока */
+        fakeip_touch(e, t1);
+        check("привязка: имя спросили после долгого простоя — адрес берётся из ответа", 1,
+              fakeip_real_pick("bind.test", oc, 1, t1) == C);
+        fakeip_entry_set_real("bind.test", C);
+        e->real_seen = t1;
+        fakeip_touch(e, t1 + 5);
+        check("  а следующий ответ с другим адресом привязку уже не трогает", 1,
+              fakeip_real_pick("bind.test", ob, 1, t1 + 5) == C);
+        check("привязка: время последнего вопроса отмечено", 1, e->last_used == t1 + 5);
+
+        /* Половина IPv6 — то же правило, свои сроки и своя отметка «после простоя». */
+        struct answer_ip6 a6[1], b6[1];
+        memset(a6, 0, sizeof(a6)); memset(b6, 0, sizeof(b6));
+        a6[0].addr[0] = 0x2a; a6[0].addr[15] = 1;
+        b6[0].addr[0] = 0x2a; b6[0].addr[15] = 2;
+        uint8_t got[16];
+        fakeip_entry_set_real6("bind.test", a6[0].addr);
+        e->real6_seen = t1;
+        e->idle6 = 0;
+        fakeip_touch(e, t1 + 10);
+        fakeip_real_pick6("bind.test", b6, 1, t1 + 10, got);
+        check("привязка v6: имя спрашивают — прежний адрес остаётся", 0, memcmp(got, a6[0].addr, 16));
+        fakeip_touch(e, t1 + 10 + FAKEIP_REAL_IDLE_DEFAULT + 1);
+        fakeip_real_pick("bind.test", ob, 1, t1 + 10 + FAKEIP_REAL_IDLE_DEFAULT + 1);   /* ответ A отметку v6 не снимает */
+        fakeip_real_pick6("bind.test", b6, 1, t1 + 10 + FAKEIP_REAL_IDLE_DEFAULT + 1, got);
+        check("привязка v6: после долгого простоя — адрес из ответа", 0, memcmp(got, b6[0].addr, 16));
+    }
+    {
         /* Подавление HTTPS (65) и SVCB (64) на совпавшем домене. Проверяется не
          * константа, а форма ответа: клиент должен получить NODATA — тот же вопрос,
          * ноль записей — и ни одной подсказки ipv4hint из настоящего ответа. Иначе

@@ -164,6 +164,13 @@ struct fakeip_entry {
      * (map_set: смена адреса одной транзакцией). has_real6_saved — то же для real6. */
     uint32_t real_saved;
     int has_real6_saved;
+    /* ПРИВЯЗКА ПОДДЕЛЬНОГО АДРЕСА К НАСТОЯЩЕМУ (fakeip_real_pick, fakeip.c). real_seen и
+     * real6_seen — когда настоящий адрес записи в последний раз был среди адресов ответа (или
+     * поставлен). idle4 и idle6 — имя спросили после простоя дольше g_fakeip_real_idle, и ответа
+     * на этот вопрос ещё не было: ставит fakeip_touch, снимает первый разобранный ответ своего
+     * семейства. В файл не пишутся: после перезапуска сроки начинаются заново. */
+    time_t real_seen, real6_seen;
+    uint8_t idle4, idle6;
     /* В КАКИХ наборах доменных каналов сейчас лежит этот поддельный адрес — по биту
      * на канал (0 = ни в одном). Набор битов, а не один номер, и это разница по
      * существу: имя, названное в ДВУХ правилах сразу, обязано попасть в оба набора.
@@ -394,6 +401,18 @@ void fakeip_state_flush_async(void);
 void fakeip_state_wait(void);
 /* Сколько подмен последний fakeip_rehydrate нашёл в ядре с другим значением и заменил. */
 extern size_t g_fakeip_fixed;
+/* Имя спросили (и быстрый путь, и долгий): время последнего вопроса и отметка «после простоя». */
+void fakeip_touch(struct fakeip_entry *e, time_t now);
+/* КАКОЙ НАСТОЯЩИЙ АДРЕС СТОИТ ПОД ПОДДЕЛЬНЫМ после ответа с адресами ips[0..nips): прежний, пока
+ * именем пользуются, даже если его нет в ответе; первый из ответа — когда прежнего нет, именем
+ * давно не пользовались или прежний давно не встречался в ответах (правило и сроки — fakeip.c).
+ * Адрес — в порядке хоста; nips > 0. Вариант 6 пишет выбранный адрес в out. */
+#define FAKEIP_REAL_IDLE_DEFAULT 600
+#define FAKEIP_REAL_ABSENT_DEFAULT 1800
+extern int g_fakeip_real_idle, g_fakeip_real_absent;
+uint32_t fakeip_real_pick(const char *domain, const struct answer_ip *ips, int nips, time_t now);
+void fakeip_real_pick6(const char *domain, const struct answer_ip6 *ips, int nips, time_t now,
+                       uint8_t out[16]);
 uint32_t fakeip_entry_get_real(const char *domain);
 /* Настоящий адрес, который знаем: стоящий в ядре, а если не стоит — из файла или прошлого ответа
  * (real_saved). 0 — не знаем. Им сверяется новый ответ и смена значения в карте. */
