@@ -769,6 +769,7 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
                 str_lower(lname);
                 long at = fakeip_find(lname);
                 if (at >= 0 && g_fakeip.entries[at].has_real6) {
+                    fakeip_touch(&g_fakeip.entries[at], time(NULL));
                     uint8_t f6[16], out[512];
                     fakeip6_of(g_fakeip.entries[at].addr, f6);
                     size_t len = build_rewritten_response6(buf, qend, out, sizeof(out), f6);
@@ -793,6 +794,9 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
                 str_lower(lname);
                 long at = fakeip_find(lname);
                 if (at >= 0 && g_fakeip.entries[at].real_host) {
+                    /* Имя спросили: по времени вопроса живёт привязка к настоящему адресу
+                     * (fakeip_real_pick) и возвращаются адреса пула. */
+                    fakeip_touch(&g_fakeip.entries[at], time(NULL));
                     /* DNAT для этого fake-IP уже стоит (real_host запоминается
                      * только после успешного ack от ядра либо восстановлен
                      * rehydrate-проходом) — значит, ответ клиенту безопасен до
@@ -1213,18 +1217,28 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
                 reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
             return 1;
         }
+        /* Пустой адрес (::) вместо настоящего — имя заблокировано апстримом; см. то же у A ниже. */
+        n6 = answer_drop_empty6(ips6, n6);
+        if (n6 == 0) {
+            static const uint8_t zero6[16];
+            fakeip_entry_blocked(qname, 1);
+            if (!quiet) {
+                uint8_t out[512];
+                size_t len = build_rewritten_response6(buf, qend, out, sizeof(out), zero6);
+                reply_client(len ? out : buf, len ? len : (size_t)n, &p->client, p->client_len,
+                             &p->local, p->have_local);
+            }
+            return 1;
+        }
         if (fakeip_lookup_or_alloc(qname, &fake_addr) == 0) {
             /* «Установленное» — то, что знаем, а не только то, что подтвердило ядро: после
              * резолвера, поднятого до набора правил, в карте лежит засев из файла (real_saved,
              * struct fakeip_entry), и смена адреса обязана идти одной транзакцией «снять —
              * положить», а не простым add, на который ядро ответит EEXIST и оставит прежний. */
             const uint8_t *known = fakeip_entry_known_real6(qname);
-            const uint8_t *real6 = ips6[0].addr;
-            if (known)
-                for (int k = 0; k < n6; k++)
-                    if (!memcmp(ips6[k].addr, known, 16)) { real6 = known; break; }
+            /* Какой адрес класть в подмену — см. то же у A ниже (fakeip_real_pick). */
             uint8_t f6[16], r6[16];
-            memcpy(r6, real6, 16);          /* known указывает в запись — она может переехать */
+            fakeip_real_pick6(qname, ips6, n6, time(NULL), r6);
             fakeip6_of(fake_addr, f6);
             int maprc = nft_map_set_element6(g_fakeip6_map, f6, r6, known);
             if (maprc == 0) {
@@ -1257,6 +1271,25 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
         return 1;
     }
 
+    /* ПУСТОЙ АДРЕС ВМЕСТО НАСТОЯЩЕГО: апстрим, который блокирует имя (AdGuard DNS), отвечает на него
+     * 0.0.0.0. Это не адрес для подмены: клиент с поддельным адресом соединялся бы «в никуда» и
+     * ждал своего срока, а 0.0.0.0 отказывает ему сразу. Клиенту уходит то же, что у выхода «Блок»
+     * (dns_query), поддельный адрес не выдаётся, а уже стоящее под именем снимается
+     * (fakeip_entry_blocked). Пустые адреса вперемешку с настоящими просто отбрасываются. */
+    if (qtype == DNS_TYPE_A && nips > 0) {
+        nips = answer_drop_empty4(ips, nips);
+        if (nips == 0) {
+            fakeip_entry_blocked(qname, 0);
+            if (!quiet) {
+                uint8_t out[512];
+                size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 1, 0);
+                reply_client(len ? out : buf, len ? len : (size_t)n, &p->client, p->client_len,
+                             &p->local, p->have_local);
+            }
+            return 1;
+        }
+    }
+
     if (qtype == DNS_TYPE_A && nips > 0) {
         uint32_t fake_addr;
         if (fakeip_lookup_or_alloc(qname, &fake_addr) == 0) {
@@ -1265,14 +1298,12 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
              * delete+add транзакцию в ядре и перезапись state-файла на каждый
              * ре-резолв — вечно, пока домен спрашивают. Если установленный
              * backend всё ещё среди ответов, он всё ещё обслуживает домен —
-             * оставляем его; настоящий переезд (адреса нет в ответе) по-прежнему
-             * ведёт к замене. */
+             * оставляем его. Нет его в ответе — тоже оставляем, пока именем
+             * пользуются: замена увела бы живые сеансы QUIC на другой сервер
+             * (правило и сроки — fakeip_real_pick, fakeip.c). */
             /* Знаем, а не только стоит в ядре — см. то же у AAAA выше. */
             uint32_t known = fakeip_entry_known_real(qname);
-            uint32_t real_host = ntohl(ips[0].addr);
-            if (known)
-                for (int k = 0; k < nips; k++)
-                    if (ntohl(ips[k].addr) == known) { real_host = known; break; }
+            uint32_t real_host = fakeip_real_pick(qname, ips, nips, time(NULL));
             if (dbg())
                 fprintf(stderr, "nftlk-debug: matched qname=%s qtype=%u nips=%d fake=0x%08x real=0x%08x nlk_fd=%d\n",
                         qname, qtype, nips, fake_addr, real_host, g_nlk_fd);

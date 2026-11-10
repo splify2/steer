@@ -54,6 +54,7 @@ int dupq_open(const struct dupq_cfg *c, const struct dupq_ops *o, void *user, st
     cfg.mark_required = c->sock_mark != 0;  /* без метки уйти мимо выхода нельзя */
     cfg.handshake_ms = c->handshake_ms;
     cfg.idle_ms = c->idle_ms;
+    cfg.keepalive_ms = c->keepalive_ms;
     cfg.early_data = c->early_data;
     struct qc_ops ops;
     memset(&ops, 0, sizeof(ops));

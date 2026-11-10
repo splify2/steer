@@ -209,6 +209,23 @@ size_t build_rewritten_response(const uint8_t *orig, size_t qend,
     return pos;
 }
 
+/* Убрать из адресов ответа пустые (0.0.0.0, ::): так отвечает апстрим, блокирующий имя. Возврат —
+ * сколько адресов осталось; 0 — ответ состоял из одних пустых. */
+int answer_drop_empty4(struct answer_ip *ips, int n) {
+    int w = 0;
+    for (int k = 0; k < n; k++)
+        if (ips[k].addr) ips[w++] = ips[k];
+    return w;
+}
+
+int answer_drop_empty6(struct answer_ip6 *ips, int n) {
+    static const uint8_t zero6[16];
+    int w = 0;
+    for (int k = 0; k < n; k++)
+        if (memcmp(ips[k].addr, zero6, 16)) ips[w++] = ips[k];
+    return w;
+}
+
 /* То же с одной записью AAAA — поддельным адресом IPv6 (fake-IP v6). Голова и вопрос — как у
  * build_rewritten_response, запись — 28 байт. */
 size_t build_rewritten_response6(const uint8_t *orig, size_t qend,

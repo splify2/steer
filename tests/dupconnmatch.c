@@ -6,13 +6,20 @@
  * установки (dial_event_cb), — рукопожатия и сети нет. Проверяется то, что происходит в цикле
  * событий: разбор пришедшего, сроки, перестановка вопросов между соединениями.
  *
+ * Обёртка QUIC подменена так же (шов dupq.h): соединение «открывается» сразу, потоки выдаются по
+ * номеру, в сеть ничего не уходит. Этого хватает для того, что dup.c решает сам: PING в настройке
+ * соединения, сроки молчащего соединения DoQ, срок простоя. Сам PING на проводе — tests/doqup.sh.
+ *
  * Кадры и HPACK без соединения — tests/dupmatch.c; настоящие серверы — tests/dnsup.sh,
  * tests/doh2up.sh. */
 #define _GNU_SOURCE
 #include "dnsd_int.h"
 #include "dupint.h"
 #include "doh2.h"
+#include "dupq.h"
 #include "tls13.h"
+#include <sys/eventfd.h>
+#include <netinet/tcp.h>
 #include "reality.h"
 #include "unit.h"
 
@@ -42,9 +49,12 @@ static void rec_clear(void) {
     g_rh = g_rt = 0;
 }
 
+static int g_rerr;                                /* следующее чтение — «сервер закрыл соединение» */
+
 int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got) {
     (void)t;
     *got = 0;
+    if (g_rerr) { g_rerr = 0; return TLS13_ECLOSED; }
     if (g_rh == g_rt) return 0;                   /* записи нет — «пока нечего», как у настоящего */
     struct frec *r = &g_rq[g_rh++];
     if (r->n > cap) return TLS13_ETOOBIG;
@@ -69,6 +79,38 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     return -1;
 }
 
+/* ---- подмена QUIC -------------------------------------------------------------------------- */
+
+struct dupq { int fd; };
+static struct dupq_cfg g_qcfg;                    /* настройка последнего dupq_open */
+static int g_qopen, g_qclose, g_qstreams;
+
+int dupq_prepare(const char *roots) { (void)roots; return 1; }
+int dupq_ready(void) { return 1; }
+int dupq_open(const struct dupq_cfg *cfg, const struct dupq_ops *ops, void *user, struct dupq **out) {
+    (void)ops; (void)user;
+    g_qcfg = *cfg;
+    g_qopen++;
+    struct dupq *q = calloc(1, sizeof(*q));
+    q->fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    *out = q;
+    return 0;
+}
+void dupq_close(struct dupq *q, uint64_t app_err) { (void)q; (void)app_err; g_qclose++; }
+void dupq_free(struct dupq *q) { close(q->fd); free(q); }
+int dupq_fd(const struct dupq *q) { return q->fd; }
+int dupq_timeout_ms(struct dupq *q) { (void)q; return -1; }
+int dupq_on_readable(struct dupq *q) { (void)q; return 0; }
+int dupq_on_timer(struct dupq *q) { (void)q; return 0; }
+int dupq_early_ready(const struct dupq *q) { (void)q; return 0; }
+int dupq_stream_open(struct dupq *q, int64_t *sid) { (void)q; *sid = 4 * g_qstreams++; return 0; }
+int dupq_stream_open_uni(struct dupq *q, int64_t *sid) { (void)q; *sid = 2; return 0; }
+ssize_t dupq_stream_send(struct dupq *q, int64_t sid, const uint8_t *d, size_t n, int fin) {
+    (void)q; (void)sid; (void)d; (void)fin;
+    return (ssize_t)n;
+}
+int dupq_stream_reset(struct dupq *q, int64_t sid, uint64_t app_err) { (void)q; (void)sid; (void)app_err; return 0; }
+
 /* ---- проверки ----------------------------------------------------------------------------- */
 
 
@@ -79,7 +121,7 @@ static void on_done(void *ctx, const uint8_t *ans, size_t n, const uint8_t *q, s
     if (ans) { g_ans++; g_last_n = n; } else g_fail++;
 }
 
-static int g_peer[64], g_peer_n;
+static int g_peer[256], g_peer_n;
 
 /* Апстрим по адресу url — единственный в настройке. */
 static struct dup *mk_up(const char *url) {
@@ -133,6 +175,70 @@ static struct dconn *add_conn(struct dup *up, int st, int h2) {
     struct epoll_event e = { .events = st == CS_TCPCONN ? EPOLLOUT : EPOLLIN, .data.ptr = &c->tag };
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, c->fd, &e);
     return c;
+}
+
+/* Готовое соединение QUIC — каким его оставляет quic_after по завершении рукопожатия. */
+static struct dconn *add_quic(struct dup *up) {
+    if (up->c_n == up->c_cap) {
+        int nc = up->c_cap ? up->c_cap * 2 : 4;
+        up->c = realloc(up->c, (size_t)nc * sizeof(*up->c));
+        up->c_cap = nc;
+    }
+    struct dconn *c = NULL;
+    for (int i = 0; i < up->c_n; i++) if (CN(up, i)->st == CS_FREE) { c = CN(up, i); break; }
+    if (!c) {
+        c = calloc(1, sizeof(*c));
+        c->idx = up->c_n;
+        up->c[up->c_n++] = c;
+    }
+    c->up = up;
+    c->tag.magic = DTAG_MAGIC; c->tag.kind = DT_CONN; c->tag.obj = c;
+    c->fd = -1;
+    struct dupq_cfg qc = {0};
+    struct dupq_ops ops = {0};
+    dupq_open(&qc, &ops, c, &c->qc);
+    c->qfd = dupq_fd(c->qc);
+    c->qhs = 1;
+    c->qclosed = c->qerej = 0;
+    c->st = CS_READY;
+    c->busy = 0;
+    c->last_ms = c->qrx_ms = now_ms();
+    struct epoll_event e = { .events = EPOLLIN, .data.ptr = &c->tag };
+    epoll_ctl(g_epfd, EPOLL_CTL_ADD, c->qfd, &e);
+    return c;
+}
+
+/* Группа failover из двух серверов DoT: настройка — серверы a и b, за ними группа g (номер 2). */
+static void mk_group(void) {
+    dup_apply(NULL, 0);
+    struct dup_cfg cfg[3];
+    char why[128];
+    static unsigned gm[2] = { 0, 1 };
+    memset(cfg, 0, sizeof(cfg));
+    static const char *const url[2] = { "tls://127.0.0.1", "tls://127.0.0.2" };
+    for (int i = 0; i < 2; i++) {
+        if (dnsurl_parse(url[i], &cfg[i].u, why, sizeof(why)) != 0) { printf("url %s: %s\n", url[i], why); exit(2); }
+        snprintf(cfg[i].u.name, sizeof(cfg[i].u.name), "%c", 'a' + i);
+        snprintf(cfg[i].u.url, sizeof(cfg[i].u.url), "%s", url[i]);
+    }
+    snprintf(cfg[2].u.name, sizeof(cfg[2].u.name), "g");
+    cfg[2].grp = DNSG_FAILOVER;
+    cfg[2].gm = gm;
+    cfg[2].gm_n = 2;
+    dup_apply(cfg, 3);
+    g_ans = g_fail = 0;
+    g_wrote = 0;
+    rec_clear();
+}
+
+/* Ответ DoT на вопрос r — записью TLS в очередь подмены. */
+static void push_dot_answer(const struct dreq *r) {
+    uint8_t rec[2 + 64];
+    if (!r) return;                               /* вопроса нет — проверка рядом это и покажет */
+    rec[0] = 0; rec[1] = (uint8_t)r->qn;
+    memcpy(rec + 2, r->q, r->qn);
+    rec[4] |= 0x80;
+    rec_push(rec, 2u + r->qn);
 }
 
 static uint8_t g_qbuf[64];
@@ -335,6 +441,237 @@ int main(void) {
         dup_tick();
         check("  соединение, не установившееся за срок, закрыто", CS_FREE, c->st);
         check("  ждавший вопрос получил отказ сразу", 1, g_fail);
+    }
+
+    /* 8. DoQ: соединение держится с PING. Настройка доходит до обёртки через настоящий путь —
+     *    вопрос, поток поиска адреса (адрес записан в url, искать нечего), quic_start. Без PING о
+     *    мёртвом пути узнавал первый вопрос после паузы: полторы секунды тишины и рукопожатие. */
+    {
+        struct dup *up = mk_up("quic://127.0.0.1");
+        int was = g_qopen;
+        dup_ask(0, g_qbuf, qn, on_done, NULL);
+        for (int i = 0; i < 50 && g_qopen == was; i++) {
+            struct epoll_event ev;
+            if (epoll_wait(g_epfd, &ev, 1, 100) == 1) dup_event(ev.data.ptr, ev.events);
+        }
+        check("DoQ: соединение открыто через обёртку", was + 1, g_qopen);
+        check("  PING при молчании — раз в 15 с", 15000, (long)g_qcfg.keepalive_ms);
+        check("  срок простоя QUIC длиннее срока PING", 1, g_qcfg.idle_ms > g_qcfg.keepalive_ms);
+        (void)up;
+    }
+
+    /* 9. DoQ: срок «сервер молчит». На соединении, где пакеты идут (PING подтверждается), он
+     *    прежний — полторы секунды. На соединении, молчавшем дольше PING ещё до вопроса, — 400 мс:
+     *    путь, скорее всего, мёртв, и клиенту незачем ждать полторы секунды, чтобы в этом убедиться. */
+    {
+        struct dup *up = mk_up("quic://127.0.0.1");
+        struct dconn *c = add_quic(up);
+        dup_ask(0, g_qbuf, qn, on_done, NULL);
+        struct dreq *r = nth_req(up, 0);
+        check("DoQ: вопрос ушёл потоком готового соединения", 0, r ? r->ci : -9);
+        int w = dup_wait_ms();
+        check("  соединение не молчало: срок «сервер молчит» — 1,5 с", 1, w > 1300 && w <= 1500);
+        dup_tick();
+        check("  и до срока соединение живо", CS_READY, c->st);
+
+        up = mk_up("quic://127.0.0.1");
+        c = add_quic(up);
+        c->qrx_ms = now_ms() - 18000;             /* PING ушёл три секунды назад, ответа нет */
+        dup_ask(0, g_qbuf, qn, on_done, NULL);
+        r = nth_req(up, 0);
+        check("DoQ: вопрос ушёл на молчавшее соединение", 0, r ? r->ci : -9);
+        w = dup_wait_ms();
+        check("  срок «сервер молчит» — 400 мс", 1, w > 200 && w <= 400);
+        r->t0 -= 450;                             /* 450 мс спустя: от сервера по-прежнему ни пакета */
+        c->qrx_ms -= 450;
+        req_rekey(r);
+        dup_tick();
+        check("  срок вышел: молчавшее соединение закрыто", 1, c->qc == NULL);
+        check("  вопрос не отказан, а ждёт нового соединения (одна попытка)", 1,
+              g_fail == 0 && r->used && r->tries == 1);
+    }
+
+    /* 10. DoQ без вопросов: PING и его повторы остались без ответа — соединение закрывается сразу, не
+     *     дожидаясь вопроса клиента, и цикл просыпается к этому сроку сам. Соединение, по которому
+     *     пакеты идут, держится — но не дольше срока простоя: тот считается от последнего вопроса,
+     *     и подтверждения PING его не продлевают. */
+    {
+        struct dup *up = mk_up("quic://127.0.0.1");
+        struct dconn *c = add_quic(up);
+        c->qrx_ms = now_ms() - 10000;
+        int w = dup_wait_ms();
+        check("DoQ: цикл проснётся к сроку «PING без ответа» (20 с молчания)", 1, w > 9000 && w <= 10001);
+        dup_tick();
+        check("  десять секунд тишины — соединение живо", CS_READY, c->st);
+        c->qrx_ms = now_ms() - 21000;
+        dup_tick();
+        check("  PING без ответа: соединение закрыто без вопроса клиента", CS_FREE, c->st);
+        check("  готового соединения у сервера нет (группа шагнёт раньше)", 0, dup_warm(up));
+
+        up = mk_up("quic://127.0.0.1");
+        c = add_quic(up);
+        check("DoQ: готовое соединение, пакеты идут — вопрос уйдёт сразу", 1, dup_warm(up));
+        c->last_ms = now_ms() - 300001;           /* последний вопрос — больше пяти минут назад */
+        dup_event(&c->tag, EPOLLIN);              /* а пакет от сервера (подтверждение PING) — только что */
+        check("  пакет от сервера учтён", 1, now_ms() - c->qrx_ms < 1000);
+        dup_tick();
+        check("  PING срок простоя не продлевает: соединение закрыто", CS_FREE, c->st);
+    }
+
+    /* 11. Группа failover: шаг к следующему серверу. У первого готовое соединение — следующего
+     *     спрашивают через полторы секунды молчания; готового нет (идёт рукопожатие) — через 350 мс:
+     *     после простоя первая пачка вопросов ждала рукопожатия первого сервера полторы секунды. */
+    {
+        mk_group();
+        struct dconn *a = add_conn(g_dups[0], CS_READY, 0);
+        struct dconn *b = add_conn(g_dups[1], CS_READY, 0);
+        dup_ask(2, g_qbuf, qn, on_done, NULL);
+        check("группа: вопрос ушёл первому серверу", 1, a->busy);
+        check("  второму — нет", 0, b->busy);
+        long left = grp_deadline() - now_ms();
+        check("  шаг к следующему — через 1,5 с", 1, left > 1300 && left <= 1500);
+
+        mk_group();
+        a = add_conn(g_dups[0], CS_DIAL, 0);      /* первый сервер ещё соединяется */
+        a->tls = NULL;
+        b = add_conn(g_dups[1], CS_READY, 0);
+        dup_ask(2, g_qbuf, qn, on_done, NULL);
+        check("группа: первый сервер без готового соединения — вопрос ждёт его", 0, b->busy);
+        left = grp_deadline() - now_ms();
+        check("  шаг к следующему — через 350 мс", 1, left > 200 && left <= 350);
+        a->st = CS_FREE;                          /* стенд собрал его руками: потока установки нет */
+    }
+
+    /* 12. Группа failover: сервер после паузы. Он снова первый и проверяется настоящим вопросом, но
+     *     клиент проверку не ждёт: вместе с ним сразу спрошен следующий, и ответ — первого, кто
+     *     ответил годно. Годный ответ вернувшегося снимает испытание. */
+    {
+        mk_group();
+        struct dup *g = g_dups[2];
+        struct dconn *a = add_conn(g_dups[0], CS_READY, 0);
+        struct dconn *b = add_conn(g_dups[1], CS_READY, 0);
+        g->gp[0].step_ms = 5000;                  /* отказывал; пауза кончилась секунду назад */
+        g->gp[0].fail_ms = now_ms() - 6000;
+        g->gp[0].until_ms = now_ms() - 1000;
+        dup_ask(2, g_qbuf, qn, on_done, NULL);
+        check("группа: сервер после паузы спрошен первым", 1, a->busy);
+        check("  и сразу же — следующий", 1, b->busy);
+        push_dot_answer(nth_req(g_dups[1], 0));
+        dup_event(&b->tag, EPOLLIN);
+        check("  клиенту ушёл ответ следующего, не дожидаясь вернувшегося", 1, g_ans);
+        check("  вернувшийся ещё на испытании", 5000, g->gp[0].step_ms);
+        push_dot_answer(nth_req(g_dups[0], 0));
+        dup_event(&a->tag, EPOLLIN);
+        check("  ответил годно — испытание снято", 0, g->gp[0].step_ms);
+        check("  второго ответа клиент не получил", 1, g_ans);
+        dup_ask(2, g_qbuf, qn, on_done, NULL);
+        check("  дальше — как обычно: вопрос только первому", 1, a->busy == 1 && b->busy == 0);
+    }
+
+    /* 13. Пауза члена группы: пачка вопросов, бывших в пути, когда сервер отказал, — один сбой.
+     *     Каждый отказ пачки удваивал паузу, и страница в двадцать вопросов за один миг доводила её
+     *     до предела в пять минут. */
+    {
+        mk_group();
+        struct dup *g = g_dups[2];
+        struct dconn *a = add_conn(g_dups[0], CS_READY, 0);
+        add_conn(g_dups[1], CS_READY, 0);
+        for (int i = 0; i < 20; i++) dup_ask(2, g_qbuf, qn, on_done, NULL);
+        check("пауза: двадцать вопросов у первого сервера", 20, a->busy);
+        a->qrx_ms = now_ms() + 1;                 /* сервер шлёт что-то, но не ответы: соединение живо */
+        usleep(2000);                             /* отказ — позже отправки */
+        for (int i = 0; i < 20; i++) {
+            struct dreq *r = nth_req(g_dups[0], i);
+            r->deadline = now_ms() - 1;
+            req_rekey(r);
+        }
+        dup_tick();
+        check("  все двадцать отказаны по сроку", 20, (long)g->gp[0].fail);
+        check("  пауза — первая (5 с), а не удвоенная двадцать раз", 5000, g->gp[0].step_ms);
+    }
+
+    /* 14. Группу убрали (перенастройка), когда её вопрос ждал шага к следующему серверу: первый уже
+     *     отказал, следующего спросит ближайший виток. Спрашивать больше некого — вопрос обязан
+     *     закончиться отказом на этом витке, а не висеть вечно: вызывающий не получал ответа вовсе, а
+     *     цикл считал, что у группы есть работа, и не засыпал. */
+    {
+        mk_group();
+        add_conn(g_dups[0], CS_READY, 0);
+        add_conn(g_dups[1], CS_READY, 0);
+        dup_ask(2, g_qbuf, qn, on_done, NULL);
+        /* Новая настройка без этих серверов и группы: первый сервер уходит раньше группы и отдаёт
+         * её вопросу отказ, пока группа ещё жива. */
+        struct dup_cfg none;
+        memset(&none, 0, sizeof(none));
+        snprintf(none.u.name, sizeof(none.u.name), "other");
+        dup_apply(&none, 1);
+        check("группа убрана посреди обхода: ответа клиент не получил", 0, g_ans);
+        dup_tick();
+        check("  вопрос группы закончен отказом", 1, g_fail);
+        check("  у групп работы не осталось", 0, grp_busy());
+    }
+
+    /* 15. DoT: соединение оборвалось под вопросом (сервер закрыл простаивавшее как раз тогда, когда
+     *     в него ушёл вопрос; ядро сняло мёртвое по TCP_USER_TIMEOUT). Вопрос переставляется в
+     *     ожидание — и обязан сразу уйти по другому соединению или завести новое. Прежде диспетчер
+     *     после обрыва не звался: вопрос ждал своего срока и получал отказ без повтора. */
+    {
+        struct dup *up = mk_up("tls://127.0.0.1");
+        struct dconn *c0 = add_conn(up, CS_READY, 0);
+        dup_ask(0, g_qbuf, qn, on_done, NULL);
+        struct dreq *r = nth_req(up, 0);
+        check("DoT: вопрос ушёл по первому соединению", 0, r ? r->ci : -9);
+        struct dconn *c1 = add_conn(up, CS_READY, 0);
+        g_rerr = 1;
+        dup_event(&c0->tag, EPOLLIN | EPOLLERR);
+        check("  соединение оборвалось под вопросом — закрыто", CS_FREE, c0->st);
+        check("  вопрос не отказан", 0, g_fail);
+        check("  и сразу ушёл по другому соединению (повтор — один)", 1,
+              r->used && r->ci == c1->idx && r->tries == 1);
+
+        up = mk_up("tls://127.0.0.1");
+        c0 = add_conn(up, CS_READY, 0);
+        dup_ask(0, g_qbuf, qn, on_done, NULL);
+        g_rerr = 1;
+        dup_event(&c0->tag, EPOLLIN | EPOLLERR);
+        check("DoT: обрыв под вопросом, другого соединения нет — заводится новое", 1, up->dialing);
+        check("  вопрос ждёт его, а не отказан", 1, g_fail == 0 && nth_req(up, 0) && nth_req(up, 0)->ci == -1);
+    }
+
+    /* 16. Соединение TCP, за которым следит ядро: на готовом соединении стоят TCP_USER_TIMEOUT
+     *     (отправленное и не подтверждённое полторы секунды — обрыв, событие сокета) и проба
+     *     простаивающего соединения через 15 с. Настоящий сокет TCP на петле: у пары AF_UNIX этих
+     *     настроек нет. Как ядро по ним рвёт соединение — tests/dnsdead.sh. */
+    {
+        struct dup *up = mk_up("tcp://127.0.0.1");
+        int ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_in sa = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+        socklen_t sl = sizeof(sa);
+        bind(ls, (struct sockaddr *)&sa, sizeof(sa));
+        listen(ls, 1);
+        getsockname(ls, (struct sockaddr *)&sa, &sl);
+        struct dconn *c = add_conn(up, CS_TCPCONN, 0);
+        epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+        close(c->fd);
+        c->fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        connect(c->fd, (struct sockaddr *)&sa, sizeof(sa));
+        struct epoll_event e = { .events = EPOLLOUT, .data.ptr = &c->tag };
+        epoll_ctl(g_epfd, EPOLL_CTL_ADD, c->fd, &e);
+        int as = accept(ls, NULL, NULL);
+        dup_event(&c->tag, EPOLLOUT);
+        check("tcp: соединение установлено", CS_READY, c->st);
+        unsigned ut = 0;
+        int ka = 0, idle = 0, intvl = 0;
+        socklen_t ol = sizeof(ut);
+        getsockopt(c->fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ut, &ol);
+        ol = sizeof(ka); getsockopt(c->fd, SOL_SOCKET, SO_KEEPALIVE, &ka, &ol);
+        ol = sizeof(idle); getsockopt(c->fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, &ol);
+        ol = sizeof(intvl); getsockopt(c->fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, &ol);
+        check("  неподтверждённое 1,5 с — обрыв (TCP_USER_TIMEOUT)", 1500, (long)ut);
+        check("  проба простаивающего соединения включена", 1, ka != 0);
+        check("  через 15 с тишины, ответа ждёт 5 с", 1, idle == 15 && intvl == 5);
+        close(as);
+        close(ls);
     }
 
     dup_apply(NULL, 0);

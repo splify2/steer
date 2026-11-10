@@ -128,6 +128,34 @@ static int dup_conn_limit(void) {
  * подтвердить пакет хотя бы на канале в сотни миллисекунд. Соединение пересоздаётся, вопрос
  * уходит на новом (один раз, как при любом обрыве). */
 #define DUP_QUIC_DEAD_MS 1500
+/* DoQ и DoH3: PING при молчании, пока соединение держится (DUP_IDLE_MS после последнего вопроса).
+ * Без него о смерти пути (запись NAT о потоке UDP истекла у провайдера, адрес PPPoE сменился) узнавал
+ * первый же вопрос клиента после паузы: DUP_QUIC_DEAD_MS тишины и новое рукопожатие — «сайты
+ * открываются с задержкой после простоя». Пятнадцать секунд — вдвое чаще, чем истекает самая
+ * короткая запись о потоке UDP (30 с — столько conntrack Linux держит поток без ответа): запись не
+ * истекает, и потеря одного PING ничего не меняет. На срок простоя соединения PING не влияет: тот считается от последнего вопроса (last_ms),
+ * а не от последнего пакета (qrx_ms).
+ *
+ * С PING молчание сервера стало знанием, а не догадкой: живой путь даёт пакет не реже чем раз в
+ * DUP_QUIC_KEEPALIVE_MS плюс круг до сервера.
+ *   - DUP_QUIC_QUIET_MS: дольше не было ни пакета — PING остался без подтверждения (две секунды сверх
+ *     срока — на круг и один повтор потерянного). Вопрос на такое соединение ждёт ответа не
+ *     DUP_QUIC_DEAD_MS, а DUP_QUIC_DEAD_QUIET_MS: живой сервер за это время подтверждает пакет и
+ *     на канале в сотни миллисекунд, а мёртвый путь стоит клиенту 400 мс, не полторы секунды.
+ *   - DUP_QUIC_LOST_MS: без вопросов и без пакета столько — без ответа остались PING и его повторы
+ *     за пять секунд. Соединение закрывается сейчас, не дожидаясь вопроса: следующий
+ *     сразу заведёт новое (с билетом — в 0-RTT), а группа failover видит, что готового соединения
+ *     у сервера нет (dup_warm). */
+#define DUP_QUIC_KEEPALIVE_MS 15000
+/* То же для соединений TCP (tcp://, DoT, DoH), только следит ядро (conn_tcp_watch): отправленное и
+ * не подтверждённое за DUP_TCP_DEAD_MS — соединение мертво (TCP_USER_TIMEOUT), а простаивающее
+ * проверяется пробой раз в DUP_TCP_KEEPIDLE_S секунд. Сроки — те же, что у QUIC, по тем же причинам. */
+#define DUP_TCP_DEAD_MS DUP_QUIC_DEAD_MS
+#define DUP_TCP_KEEPIDLE_S (DUP_QUIC_KEEPALIVE_MS / 1000)
+#define DUP_TCP_KEEPINTVL_S 5
+#define DUP_QUIC_QUIET_MS (DUP_QUIC_KEEPALIVE_MS + 2000)
+#define DUP_QUIC_DEAD_QUIET_MS 400
+#define DUP_QUIC_LOST_MS (DUP_QUIC_KEEPALIVE_MS + 5000)
 /* Срок простоя первого соединения. Пять минут; STEER_DNSD_IDLE_MS (не меньше 200) — только для стендов:
  * 0-RTT виден лишь на соединении, которое закрылось само, и ждать ради этого пять минут в тесте незачем
  * (tests/doqup.sh). */
@@ -645,6 +673,29 @@ static void up_backoff(struct dup *up) {
     up->retry_at_ms = now_ms() + up->backoff_ms;
 }
 
+/* СОЕДИНЕНИЕ TCP, ЗА КОТОРЫМ СЛЕДИТ ЯДРО. Путь к серверу пропадает молча (запись NAT истекла, адрес
+ * сменился): вопрос, ушедший в такое соединение, ждал весь свой срок (DUP_REQ_MS, четыре секунды)
+ * и получал отказ — повторить его к тому времени было уже некому, клиент ждёт пять секунд. Теперь:
+ *   - TCP_USER_TIMEOUT: данные, не подтверждённые сервером DUP_TCP_DEAD_MS, — ядро рвёт соединение
+ *     и будит цикл ошибкой сокета. conn_close переставляет вопрос в ожидание (один раз), и он
+ *     уходит на новом соединении — через полторы секунды, а не отказом через четыре. Живой сервер,
+ *     который долго думает над ответом, под это не попадает: сам вопрос он подтверждает сразу;
+ *   - SO_KEEPALIVE: простаивающее соединение ядро проверяет пробой через DUP_TCP_KEEPIDLE_S секунд
+ *     тишины и, не получив подтверждения за DUP_TCP_KEEPINTVL_S, рвёт его (с TCP_USER_TIMEOUT
+ *     хватает одной пробы без ответа) — мёртвое соединение закрыто до вопроса клиента, как у QUIC.
+ * Опроса нет: всё это таймеры ядра и событие сокета. Ставится на готовое соединение, а не до
+ * connect: срок установки — свой (DUP_DIAL_MS). Отказ setsockopt (сокет не TCP — у стенда) не беда:
+ * остаётся прежний срок вопроса. */
+static void conn_tcp_watch(int fd) {
+    int on = 1, idle = DUP_TCP_KEEPIDLE_S, intvl = DUP_TCP_KEEPINTVL_S, cnt = 1;
+    unsigned dead = DUP_TCP_DEAD_MS;
+    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &dead, sizeof(dead));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+}
+
 /* Начать соединение по TCP без TLS (tcp://): неблокирующий connect в цикле. */
 static int tcp_dial(struct dup *up, struct dconn *c) {
     int fd = socket(up->srv.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -823,6 +874,7 @@ static void dial_event_cb(struct dial *d) {
     up->retry_at_ms = 0;
     up->err[0] = '\0';
     dial_free(d);
+    conn_tcp_watch(c->fd);
     conn_register(c, EPOLLIN);
     if (c->h2) {
         uint8_t hello[64];
@@ -1065,6 +1117,7 @@ static void quic_start(struct dup *up, struct dconn *c, const struct sockaddr_st
          * DOQ_NO_ERROR; срок QUIC чуть длиннее, чтобы он не сработал первым молча. Сервер вправе
          * договориться о меньшем: тогда соединение уйдёт раньше и пересоздастся вопросом. */
         cfg.idle_ms = (unsigned)DUP_IDLE_MS + 30000u;
+        cfg.keepalive_ms = DUP_QUIC_KEEPALIVE_MS;
         /* 0-RTT по билету, если он есть (dupq_early_ready). У DoH3 не берём: запрос HTTP/3 идёт после
          * потока управления, а он открывается по завершении рукопожатия (quic_after). */
         cfg.early_data = !h3_proto(up);
@@ -1555,7 +1608,7 @@ static int h2_frames(struct dconn *c) {
     return 0;
 }
 
-static void conn_readable(struct dconn *c) {
+static void conn_read(struct dconn *c) {
     struct dup *up = c->up;
     if (c->st == CS_TCPCONN) {
         int err = 0;
@@ -1572,8 +1625,8 @@ static void conn_readable(struct dconn *c) {
         up->backoff_ms = 0;
         up->retry_at_ms = 0;
         up->err[0] = '\0';
+        conn_tcp_watch(c->fd);
         conn_ev(c, EPOLLIN);
-        up_kick(up);
         return;
     }
     /* Предел в 64 витка — против того, чтобы один сокет держал цикл, пока сервер шлёт без остановки;
@@ -1595,12 +1648,12 @@ static void conn_readable(struct dconn *c) {
             }
             if (got) c->qrx_ms = now_ms();
             if (c->h2) {
-                if (c->rn && h2_frames(c) != 0) { up_kick(up); return; }
+                if (c->rn && h2_frames(c) != 0) return;
             } else if (up->cfg.u.proto == DNSP_DOH) {
                 if (c->rn) {
                     int pr = doh_parse(c);
                     if (pr < 0) { conn_close(c, NULL); return; }
-                    if (pr == 1 && c->close_after) { conn_close(c, NULL); up_kick(up); return; }
+                    if (pr == 1 && c->close_after) { conn_close(c, NULL); return; }
                 }
             } else if (got) {
                 stream_frames(c);
@@ -1616,6 +1669,16 @@ static void conn_readable(struct dconn *c) {
             stream_frames(c);
         }
     }
+}
+
+/* Событие чтения соединения. Диспетчер ожидающих зовётся после ЛЮБОГО исхода: пришли ответы —
+ * освободились места под вопросы; соединение оборвалось (сервер закрыл простаивавшее как раз под
+ * вопросом, ядро сняло мёртвое по TCP_USER_TIMEOUT) — conn_close переставил его вопросы в ожидание,
+ * и им нужно новое соединение сейчас. Прежде после обрыва диспетчер не звался, и переставленный
+ * вопрос ждал, пока апстрим не спросит кто-нибудь ещё, — обычно до своего срока и отказа. */
+static void conn_readable(struct dconn *c) {
+    struct dup *up = c->up;
+    conn_read(c);
     up_kick(up);
 }
 
@@ -1625,7 +1688,9 @@ static void conn_writable(struct dconn *c) {
         ssize_t w = send(c->fd, c->wb + c->woff, c->wn - c->woff, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (w < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+            struct dup *up = c->up;
             conn_close(c, "запись в соединение не удалась");
+            up_kick(up);                        /* вопросы закрытого соединения — на новое */
             return;
         }
         c->woff += (size_t)w;
@@ -1952,6 +2017,16 @@ int dup_event(void *ptr, uint32_t evs) {
     return 1;
 }
 
+/* Соединение QUIC к моменту at молчит дольше, чем молчит живой путь с PING (DUP_QUIC_QUIET_MS). */
+static int quic_quiet(const struct dconn *c, long at) { return at - c->qrx_ms > DUP_QUIC_QUIET_MS; }
+
+/* Сколько вопрос r ждёт первого пакета от сервера, прежде чем соединение c считается мёртвым.
+ * Зовётся, пока после вопроса пакетов не было (qrx_ms <= t0), поэтому qrx_ms здесь — последний
+ * пакет ДО вопроса: по нему и видно, ушёл ли вопрос в соединение, которое уже молчало. */
+static long quic_dead_ms(const struct dreq *r, const struct dconn *c) {
+    return quic_quiet(c, r->t0) ? DUP_QUIC_DEAD_QUIET_MS : DUP_QUIC_DEAD_MS;
+}
+
 /* Ближайший срок вопроса: общий срок ответа, а раньше него — повтор по UDP или проверка мёртвого
  * соединения QUIC, пока они ещё возможны (условия те же, что в tick_req). */
 static long req_due(const struct dreq *r) {
@@ -1959,9 +2034,10 @@ static long req_due(const struct dreq *r) {
     long t = r->deadline;
     if (up->cfg.u.proto == DNSP_UDP && r->ci == -2 && r->tries == 0 && r->t0 + DUP_UDP_RETRY_MS < t)
         t = r->t0 + DUP_UDP_RETRY_MS;
-    if (quic_proto(up) && r->sid >= 0 && r->tries == 0 && r->ci >= 0 && r->t0 + DUP_QUIC_DEAD_MS < t &&
-        CN(up, r->ci)->st == CS_READY && CN(up, r->ci)->qrx_ms <= r->t0)
-        t = r->t0 + DUP_QUIC_DEAD_MS;
+    if (quic_proto(up) && r->sid >= 0 && r->tries == 0 && r->ci >= 0 &&
+        CN(up, r->ci)->st == CS_READY && CN(up, r->ci)->qrx_ms <= r->t0 &&
+        r->t0 + quic_dead_ms(r, CN(up, r->ci)) < t)
+        t = r->t0 + quic_dead_ms(r, CN(up, r->ci));
     return t;
 }
 
@@ -1975,12 +2051,14 @@ static void tick_req(struct dreq *r, long now) {
         udp_send(up, r);
         return;
     }
-    if (quic_proto(up) && r->sid >= 0 && r->tries == 0 && r->ci >= 0 && now - r->t0 >= DUP_QUIC_DEAD_MS &&
-        now < r->deadline && CN(up, r->ci)->st == CS_READY && CN(up, r->ci)->qrx_ms <= r->t0) {
-        /* Ни пакета от сервера с тех пор, как ушёл вопрос: соединение мертво (DUP_QUIC_DEAD_MS).
-         * conn_close переставит этот вопрос и остальные в ожидание, up_kick заведёт соединение. */
+    if (quic_proto(up) && r->sid >= 0 && r->tries == 0 && r->ci >= 0 && now < r->deadline &&
+        CN(up, r->ci)->st == CS_READY && CN(up, r->ci)->qrx_ms <= r->t0 &&
+        now - r->t0 >= quic_dead_ms(r, CN(up, r->ci))) {
+        /* Ни пакета от сервера с тех пор, как ушёл вопрос: соединение мертво (DUP_QUIC_DEAD_MS, а
+         * молчавшее и до вопроса — DUP_QUIC_DEAD_QUIET_MS). conn_close переставит этот вопрос и
+         * остальные в ожидание, up_kick заведёт соединение. */
         struct dconn *dc = CN(up, r->ci);
-        up_err(up, "%s: сервер молчит %d мс — соединение пересоздаётся", qname(up), DUP_QUIC_DEAD_MS);
+        up_err(up, "%s: сервер молчит %ld мс — соединение пересоздаётся", qname(up), now - dc->qrx_ms);
         conn_close(dc, NULL);
         up_kick(up);
         return;
@@ -2057,6 +2135,11 @@ void dup_tick(void) {
              * дескрипторы впрок. */
             long idle = k == 0 ? DUP_IDLE_MS : 30000L;
             if (c->st == CS_READY && !c->busy && now - c->last_ms > idle) conn_close(c, NULL);
+            /* QUIC без вопросов: PING и его повторы остались без ответа — путь мёртв, и узнаём мы это
+             * сейчас, а не с первым вопросом клиента (DUP_QUIC_LOST_MS). Под вопросами то же решает
+             * срок вопроса (tick_req). */
+            if (c->qc && c->st == CS_READY && !c->busy && now - c->qrx_ms > DUP_QUIC_LOST_MS)
+                conn_close(c, NULL);
             /* tcp:// (и TCP после усечённого UDP): connect идёт в цикле, и без своего срока SYN в никуда
              * держал бы место «соединяемся» столько, сколько ядро его повторяет (около двух минут), —
              * новое соединение всё это время не заводится. Срок — как у установки TLS в потоке. */
@@ -2093,6 +2176,8 @@ int dup_wait_ms(void) {
             if (c->st == CS_READY && !c->busy) {
                 long t = c->last_ms + (k == 0 ? DUP_IDLE_MS : 30000L);
                 if (best < 0 || t < best) best = t;
+                t = c->qrx_ms + DUP_QUIC_LOST_MS + 1;       /* PING без ответа: закрыть (dup_tick) */
+                if (t < best) best = t;
             }
         }
     }
@@ -2107,6 +2192,21 @@ int dup_busy(void) {
 
 void dup_close_all(void) {
     dup_apply(NULL, 0);
+}
+
+/* Уйдёт ли вопрос к апстриму сразу: по UDP — всегда, по соединению — когда готовое есть (у QUIC —
+ * ещё и не молчащее дольше PING). Нет — вопросу сперва ждать рукопожатия: группа failover тогда
+ * страхуется следующим сервером раньше (dupgrp.c, GRP_STEP_COLD_MS). */
+int dup_warm(const struct dup *up) {
+    if (!stream_proto(up)) return 1;
+    long now = now_ms();
+    for (int i = 0; i < up->c_n; i++) {
+        const struct dconn *c = CN(up, i);
+        if (c->st != CS_READY || (c->h2 && c->h2_go)) continue;
+        if (c->qc && quic_quiet(c, now)) continue;
+        return 1;
+    }
+    return 0;
 }
 
 const char *dup_state(const struct dup *up) {

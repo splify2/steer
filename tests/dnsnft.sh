@@ -22,6 +22,10 @@
 #  6. Стойкий отказ ядра (карта не того типа) — настоящий адрес, а не SERVFAIL; окно
 #     пересборки (таблицы нет) — SERVFAIL, но не дольше MAP_WINDOW_SEC (15 с) подряд, после —
 #     тоже настоящий адрес; первое принятое отображение окно обнуляет.
+#  8. Привязка: два ответа апстрима подряд с разными адресами под именем, которым пользуются, —
+#     элемент карты не меняется; имя, которое спросили после долгого простоя, — меняется.
+#  9. Апстрим отвечает 0.0.0.0 (блокирует имя): клиенту — 0.0.0.0, поддельный адрес не выдаётся,
+#     в карте и файле состояния имени нет; подмена, уже стоявшая под именем, снимается.
 #
 # Нужны root (сетевое пространство и nf_tables), nft и python3. Без них стенд пропускается,
 # а не проваливается: остальной набор обязан проходить на голой машине.
@@ -42,7 +46,7 @@ nft add table inet steer 2>/dev/null || { echo "dnsnft: nf_tables недосту
 nft add map inet steer fakeip '{ type ipv4_addr : ipv4_addr; }'
 
 tmp="$(mktemp -d)"
-trap 'kill ${DPID:-0} ${UPID:-0} ${MPID:-0} ${DPID6:-0} ${UPID6:-0} 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'kill ${DPID:-0} ${UPID:-0} ${MPID:-0} ${DPID6:-0} ${UPID6:-0} ${DPID8:-0} 2>/dev/null; rm -rf "$tmp"' EXIT
 # Выход без IPv6 в фикстурах — мост Telegram (kind: tgws), вид плагина tgws: каталог плагинов дерева.
 sh tests/plugroot.sh "$tmp/plugins" "${BUILD:-build}" >/dev/null || { echo "dnsnft: каталог плагинов не собран"; exit 2; }
 STEER_PLUGINS_ROOT="$tmp/plugins"; STEER_PLUGINS_ETC="$tmp/plugetc"; export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
@@ -86,6 +90,7 @@ else: print(".".join(str(b) for b in d[-4:]))
 PY
 
 printf 'example.com\nmoved.net\nfail.io\nstay.org\nperm.io\nwin.io\nwin2.io\n' > "$tmp/d.lst"
+printf 'bind.io\nidle.io\nzero.io\nheal.io\n' >> "$tmp/d.lst"
 printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
 '"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
 '"channels":[{"name":"c","match":{"domains_files":["%s/d.lst"],"mode":"fakeip"},"out":"vpn"}]}' \
@@ -95,7 +100,11 @@ echo 203.0.113.1 > "$tmp/ip"
 python3 "$tmp/upstream.py" "$UPORT" "$tmp/ip" & UPID=$!
 nft monitor > "$tmp/mon" 2>&1 & MPID=$!
 sleep 1
-"$BIN" dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state" \
+# Случаи 1-6 проверяют, КАК ядро принимает переезд (одной транзакцией, с откатом), а не когда
+# резолвер на него решается: привязка к прежнему адресу здесь выключена (срок «адреса нет в
+# ответах» — ноль), иначе второй ответ под только что спрошенным именем ничего бы не менял.
+# Сама привязка — случай 8, со сроками по умолчанию.
+STEER_DNSD_REAL_ABSENT_S=0 "$BIN" dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state" \
     --listen-port "$LPORT" --upstream-port "$UPORT" > "$tmp/log" 2>&1 & DPID=$!
 sleep 1
 kill -0 "$DPID" 2>/dev/null || { echo "FAIL резолвер не поднялся:"; cat "$tmp/log"; exit 1; }
@@ -375,6 +384,58 @@ check "h. спека v1: имя вне правил — настоящий AAAA"
     "$(python3 "$tmp/client6.py" "$LPORT7" out.io)"
 kill "$DPID7" 2>/dev/null; wait "$DPID7" 2>/dev/null
 
+# --- 8. Привязка поддельного адреса к настоящему ---------------------------------------------
+# Свой резолвер: срок «адреса нет в ответах» — по умолчанию (полчаса), срок простоя имени — 2 с
+# вместо десяти минут, чтобы стенд не ждал. Апстрим — первый (адрес из файла ip).
+# Карта общая у всех резолверов стенда, а пул у каждого свой и начинается с того же адреса:
+# элементы прежних случаев убираются, иначе первый адрес этого резолвера уже занят чужой подменой.
+LPORT8=15322
+mkdir -p "$tmp/state8"
+nft flush map inet steer fakeip
+STEER_DNSD_REAL_IDLE_S=2 "$BIN" dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state8" \
+    --listen-port "$LPORT8" --upstream-port "$UPORT" > "$tmp/log8" 2>&1 & DPID8=$!
+sleep 1
+ask8() { python3 "$tmp/client.py" "$LPORT8" "$1"; }
+echo 203.0.113.81 > "$tmp/ip"
+fake="$(ask8 bind.io)"
+settle
+check "8. привязка: первый ответ — в карте его адрес" "203.0.113.81" "$(mapval "$fake")"
+g0="$(gens)"
+echo 203.0.113.82 > "$tmp/ip"
+check "8. имя спрашивают, апстрим ответил другим адресом — клиенту тот же поддельный" "$fake" "$(ask8 bind.io)"
+settle
+check "8. элемент карты не изменился" "203.0.113.81" "$(mapval "$fake")"
+check "8. и ядро не тронуто ни одной транзакцией" "0" "$(( $(gens) - g0 ))"
+echo 203.0.113.91 > "$tmp/ip"
+fake="$(ask8 idle.io)"
+settle
+check "8. второе имя: в карте первый адрес" "203.0.113.91" "$(mapval "$fake")"
+sleep 3.2                     # имя не спрашивали дольше срока простоя
+echo 203.0.113.92 > "$tmp/ip"
+ask8 idle.io > /dev/null
+settle
+check "8. имя спросили после долгого простоя — в карте новый адрес" "203.0.113.92" "$(mapval "$fake")"
+
+# --- 9. Апстрим блокирует имя: ответ 0.0.0.0 -------------------------------------------------
+echo 0.0.0.0 > "$tmp/ip"
+check "9. ответ апстрима 0.0.0.0 — клиенту 0.0.0.0, а не поддельный адрес" "0.0.0.0" "$(ask8 zero.io)"
+check "9. в карте нет подмены на 0.0.0.0" "0" "$(nft list map inet steer fakeip | grep -c ': 0\.0\.0\.0')"
+# Подмена уже стояла (имя заблокировали позже или запись осталась от прежней версии): первый
+# вопрос ещё отвечает из быстрого пути поддельным адресом, фоновый ответ апстрима снимает запись.
+echo 203.0.113.95 > "$tmp/ip"
+fake="$(ask8 heal.io)"
+settle
+check "9. имя с подменой: в карте настоящий адрес" "203.0.113.95" "$(mapval "$fake")"
+echo 0.0.0.0 > "$tmp/ip"
+ask8 heal.io > /dev/null
+settle
+check "9. апстрим стал отвечать 0.0.0.0 — подмена снята из карты" "" "$(mapval "$fake")"
+check "9. и следующий ответ клиенту — 0.0.0.0" "0.0.0.0" "$(ask8 heal.io)"
+kill "$DPID8" 2>/dev/null; wait "$DPID8" 2>/dev/null
+check "9. в файле состояния заблокированных имён нет" "0" \
+    "$(grep -c '^zero\.io\|^heal\.io' "$tmp/state8/fakeip.state")"
+check "9. а имена с подменой — на месте" "2" "$(grep -c '^bind\.io\|^idle\.io' "$tmp/state8/fakeip.state")"
+
 nft delete map inet steer fakeip6
 nft add map inet steer fakeip6 '{ type ipv6_addr : ipv4_addr; }'
 check "e. карта fakeip6 не того типа — пустой AAAA, не настоящий" "empty" "$(ask6 v6b.io)"
@@ -384,6 +445,7 @@ nft delete table inet steer
 if [ "$fail" -gt 0 ]; then
     echo "--- nft monitor"; cat "$tmp/mon"; echo "--- dnsd"; tail -n 20 "$tmp/log"
     echo "--- dnsd (IPv6)"; tail -n 20 "$tmp/log6"
+    echo "--- dnsd (привязка)"; tail -n 20 "$tmp/log8"
 fi
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

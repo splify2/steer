@@ -199,6 +199,7 @@ long grp_deadline(void);                /* ближайший срок груп�
 int grp_busy(void);
 void grp_render(FILE *f, const struct dup *g);
 const char *dup_state(const struct dup *up);     /* состояние апстрима для dns-log (dup.c) */
+int dup_warm(const struct dup *up);              /* вопрос уйдёт сразу, без рукопожатия (dup.c) */
 
 extern struct dup **g_dups;             /* текущие апстримы, по номеру настройки */
 extern size_t g_dups_n;
