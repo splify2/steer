@@ -176,3 +176,5 @@ build/build-*.log
 build/pkhooks
 build/pkmatch
 build/pmkindmatch
+build/foprobematch
+build/nldonematch
