@@ -625,9 +625,9 @@ $(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/sublin
                   src/model/nodesel.h \
                   src/proto/vless/vless.h src/proto/transport/vencp.h \
                   src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h \
-                  src/proto/transport/trpath.c src/proto/transport/trpath.h
+                  src/proto/transport/trpath.c src/proto/transport/trpath.h tests/memcap.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/submatch.c src/proto/vless/sublink.c src/proto/transport/trpath.c
+	$(CC) $(CFLAGS) -Itests -o $@ tests/submatch.c src/proto/vless/sublink.c src/proto/transport/trpath.c
 
 # Постквантовые поля подписки (encryption, pqv / mldsa65Verify): tests/subpq.c, образцы значений Xray-core
 # 26.9.9 — tests/sub-pq-samples.h. Библиотеки нет; sub.c линкуется объектом, а не включается (предел на
