@@ -1827,8 +1827,15 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
  * DDNS не подхватывается), сокет остаётся привязан к отмершему пути UDP/CGNAT, а
  * состояние proto-error само не снимается.
  *
- * Безопасно, потому что делается только с устройством, которое НЕ несёт трафик:
- * либо оно и так не отвечает, либо маршруты указывают на другое.
+ * БЕЗОПАСНЫМ ЭТО НЕ ЯВЛЯЕТСЯ. Оживляется устройство, на которое всё ещё указывает таблица
+ * выхода: у выхода с одним устройством другого нет, а у пула до оживления доходит только когда
+ * молчат все. Пока молчание не подтверждено, через это устройство могут идти соединения людей,
+ * и ifdown рвёт их все: туннель лежит от нескольких секунд до ≈70 с (ifup, рукопожатие, шаги
+ * ожидания), а вернувшийся маршрут или вставший on_fail ещё и снимает записи conntrack выхода.
+ * Раньше сюда приводил ОДИН проход без ответа — один потерянный эхо-запрос на цель или
+ * короткий провал канала провайдера, — и долгий поток UDP (голос) через исправный туннель
+ * рвался «сам по себе». Поэтому оживление — только после подтверждённого молчания: см. «СОМНЕНИЕ»
+ * ниже (серия проходов, счётчик принятого устройством, путь наружу у самого роутера).
  *
  * Отдельная защита от циклов: перезапуск не чаще раза в NN секунд на устройство.
  * Мёртвый пир иначе получал бы ifdown/ifup каждую минуту, и туннель никогда не
@@ -1958,6 +1965,121 @@ static void fo_emit(fo_event_fn ev, void *arg, enum fo_ev_kind kind, const struc
 int (*g_icmp_probe)(const char *dev);
 int (*g_cmd_hook)(const char *const argv[]);
 long (*g_revive_step)(void);
+int (*g_upstream_probe)(void);
+long long (*g_dev_rx)(const char *dev);
+
+/* ==== СОМНЕНИЕ: МОЛЧАНИЕ УСТРОЙСТВА, КОТОРОЕ НЕСЁТ ТРАФИК ===================================
+ *
+ * Ни одно устройство выхода не ответило на пробу. Раньше это сразу значило «мёртв»: оживление
+ * (ifdown/ifup) и, если не ожило, on_fail со снятием соединений. Но проба — два адреса в
+ * интернете, спрошенные раз в минуту, и молчит она не только у мёртвого туннеля: потерялись
+ * эхо-запросы, моргнул канал провайдера (PPPoE переподключился — событие сети зовёт проход
+ * через 5 с, когда WAN ещё не вернулся), адресаты режут ICMP. Цена ложного приговора — обрыв
+ * каждого соединения выхода на время от нескольких секунд до ≈70 с; цена позднего — столько же
+ * лишнего простоя у туннеля, который и так лежит. Поэтому приговор устройству, НА КОТОРОЕ
+ * СЕЙЧАС ВЕДЁТ ТАБЛИЦА ВЫХОДА, выносится не по одному проходу. Пока он не вынесен, выход
+ * остаётся как есть: маршрут в устройстве, соединения не тронуты, запись `active` прежняя
+ * (трафик при этом никуда не утекает: у мёртвого туннеля он пропадает в туннеле, как пропал бы
+ * в запрете).
+ *
+ * Три причины не верить молчанию, по порядку:
+ *
+ *  1. У САМОГО РОУТЕРА НЕТ ПУТИ НАРУЖУ (upstream_up): ядро не находит маршрута к адресу пробы
+ *     мимо устройств выходов, хотя раньше он был, — WAN лежит. Туннелю тогда отвечать не через
+ *     что, и его молчание говорит о провайдере, а не о туннеле. Оживлять нечего и вредно: ifup
+ *     без WAN не поднимет ничего, а отметка «перезапускали» отложила бы настоящее оживление на
+ *     RESTART_COOLDOWN. Серия не считается. Так для любого выхода — и для того, что уже в
+ *     отказе.
+ *
+ *  2. УСТРОЙСТВО ПРИНИМАЕТ (dev_rx_bytes): счётчик принятых байт вырос с прошлого прохода.
+ *     Принятое туннелем — то, что прислал и расшифровал его пир: туннель жив, что бы ни говорил
+ *     ICMP, и перезапуск оборвал бы ровно тот трафик, который счётчик и показал. Серия
+ *     сбрасывается. Свидетельством счётчик служит только у устройств без ARP (WireGuard, TUN,
+ *     PPP): у Ethernet он растёт и от широковещательного шума сегмента, в котором интернета нет.
+ *     Счётчик читается из /sys, как и наличие устройства, — без процессов; в rtnl.c чтения
+ *     счётчиков нет, и заводить ради одного числа разбор IFLA_STATS64 незачем.
+ *
+ *  3. МОЛЧАНИЕ НЕ ПОДТВЕРЖДЕНО: проходов без ответа подряд меньше FAIL_PASSES.
+ *
+ * FAIL_PASSES = 3 — то же число, что у гистерезиса возврата (STEER_FAILOVER_HYST), и по той же
+ * причине: один и два провала подряд на живом канале случаются, три проверки, разнесённые во
+ * времени, — уже состояние, а не помеха. Чтобы подтверждение не стоило трёх минут, проход с
+ * начатой серией просит следующий раньше периода (итог FO_PASS_RETRY, у демона — через
+ * WATCH_RETRY_S = 15 с): серия из трёх проходов по ≈6 с пробы с двумя паузами по 15 с — около
+ * 45 с от первого молчания до оживления вместо мгновенного. Провал короче этого туннель
+ * переживает без нашего участия (WireGuard повторяет рукопожатие сам каждые 5 с), а дольше
+ * 45 с молчит обычно то, что действительно надо перезапускать. У `steer failover` проход один
+ * на запуск, и серию там растягивает тот, кто его зовёт.
+ *
+ * ЧЕГО СОМНЕНИЕ НЕ МЕНЯЕТ. Уход с молчащего устройства на ЖИВОЕ запасное — по-прежнему сразу, в
+ * том же проходе: и у пула, и у группы v2 (её член в сомнении для группы «не отвечает», и
+ * группа уходит на живого; держится за него она, только когда живых нет вовсе). Устройство,
+ * которого нет (operstate down, имя исчезло) или у которого нет адреса IPv4, — отказ сразу:
+ * сомневаться не в чем. Так же — когда «не работает» сказала не проба в сеть (ICMP, TCP), а
+ * помощник туннеля или мера вида: они знают туннель изнутри. Выход, уже стоящий в отказе, оживляется как раньше — трафика через
+ * него нет.
+ *
+ * ПАМЯТЬ — запись `doubt-<выход>` (fostate.h): `устройство серия принято причина`. Есть только
+ * пока выход в сомнении; ответившая проба или вынесенный приговор её стирают, так что на
+ * здоровом выходе проход не пишет ничего. */
+#define FAIL_PASSES 3
+
+enum { DOUBT_NONE, DOUBT_STREAK, DOUBT_RX, DOUBT_UPSTREAM };
+
+struct doubt_rec {
+    char dev[32];
+    int fails;                 /* проходов подряд без ответа и без свидетельств жизни */
+    long long rx;              /* принято устройством на прошлом проходе; -1 — не знаем */
+    int why;                   /* чем кончился прошлый проход (DOUBT_*) — строка журнала на перемене */
+};
+
+static int doubt_get(struct fo_store *st, const char *out, struct doubt_rec *d) {
+    char name[48];
+    snprintf(name, sizeof(name), "doubt-%.31s", out);
+    FILE *f = st->ops->open_r(st, name);
+    if (!f) return 0;
+    int n = fscanf(f, "%31s %d %lld %d", d->dev, &d->fails, &d->rx, &d->why);
+    fclose(f);
+    return n == 4;
+}
+
+static void doubt_put(struct fo_store *st, const char *out, const struct doubt_rec *d) {
+    char name[48], txt[96];
+    snprintf(name, sizeof(name), "doubt-%.31s", out);
+    int n = snprintf(txt, sizeof(txt), "%s %d %lld %d\n", d->dev, d->fails, d->rx, d->why);
+    if (n > 0) st->ops->put(st, name, txt, (size_t)n);
+}
+
+/* Стереть — только если есть что: здоровый выход не должен писать в хранилище на каждом
+ * проходе (у `steer failover` это файл). */
+static void doubt_clear(struct fo_store *st, const char *out) {
+    struct doubt_rec d;
+    if (!doubt_get(st, out, &d)) return;
+    char name[48];
+    snprintf(name, sizeof(name), "doubt-%.31s", out);
+    st->ops->put(st, name, "", 0);
+}
+
+/* Сколько байт приняло устройство; -1 — свидетельством жизни счётчик не служит (устройство с
+ * ARP — см. «СОМНЕНИЕ», причина 2) или не читается. */
+static long long dev_rx_bytes(const char *dev) {
+    if (g_dev_rx) return g_dev_rx(dev);
+    char path[128];
+    unsigned fl = 0;
+    snprintf(path, sizeof(path), "/sys/class/net/%s/flags", dev);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int ok = fscanf(f, "%x", &fl) == 1;
+    fclose(f);
+    if (!ok || !(fl & (IFF_POINTOPOINT | IFF_NOARP))) return -1;
+    snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/rx_bytes", dev);
+    f = fopen(path, "r");
+    if (!f) return -1;
+    long long rx = -1;
+    if (fscanf(f, "%lld", &rx) != 1) rx = -1;
+    fclose(f);
+    return rx;
+}
 
 enum fo_state {
     S_START, S_OUT, S_SCAN, S_SCAN_R, S_LAT, S_LAT_M, S_LAT_M_R, S_LAT_C, S_LAT_CUR_R,
@@ -1970,6 +2092,8 @@ enum fo_state {
 /* Вид пробы: здоровье через шов стенда (в проходе), здоровье устройства без шва (ожидание
  * подъёма при оживлении — так было и раньше: там спрашивалось само устройство), замер. */
 enum { HP_HEALTH, HP_HEALTH_REAL, HP_LATENCY };
+
+enum { ALIVE_NO, ALIVE_YES, ALIVE_HELD };
 
 struct fo_run {
     struct loop *l;
@@ -1992,7 +2116,10 @@ struct fo_run {
      * выходов и 16 членов. */
     size_t n_out, maxm;
     int *streak_new;
-    int *alive;                       /* кто в ЭТОМ проходе нашёл живое устройство */
+    /* Кто в ЭТОМ проходе нашёл живое устройство (ALIVE_YES) или удержан в сомнении
+     * (ALIVE_HELD): трафик через удержанного идёт, как шёл, — выход поверх него (via) остаётся,
+     * а группа v2 считает такого члена не отвечающим и держится за него, только если живых нет. */
+    int *alive;
     /* Кто в этом проходе остался без живого устройства — в файл active он ложится «-». Отдельно
      * от device: устройство выхода проход не стирает (см. out_finish), иначе выход, чьё
      * устройство названо членом группы ниже по спеке, перестал бы быть его владельцем. */
@@ -2035,12 +2162,22 @@ struct fo_run {
     void *traffic_arg;
     int defer_rev;                    /* fo_pass_defer_revive: членов групп v2 не оживлять здесь */
     int rev_wanted;                   /* ...и такое оживление отложено — итог FO_PASS_REVIVE */
+    /* Сомнение (см. «СОМНЕНИЕ» выше): held — текущий выход удержан на молчащем устройстве без
+     * приговора (DOUBT_*), retry — у кого-то в проходе идёт серия, итог FO_PASS_RETRY. */
+    int held;
+    int retry;
+    int cur_net;                      /* молчание текущего устройства — ответ пробы в сеть (hp.net) */
+    int up_now;                       /* путь наружу у роутера в этом проходе: -2 — не спрошен */
+    int probe_ok;                     /* проба ICMP или TCP какого-то выхода дошла до интернета */
+    fo_revive_fn on_revive;           /* кому сказать, какое устройство проход взялся оживлять */
+    void *on_revive_arg;
 
     /* ---- идущая проба ---- */
     struct {
         int kind;
         char dev[32];
         int ti, best, rule;
+        int net;                      /* приговор здоровья — от пробы в сеть (ICMP, TCP), а не от помощника или вида */
         char src[64];
         struct foprobe *p;
         unsigned mark;                /* проба TCP: метка выхода с KC_TCP_REDIR (0 — через устройство) */
@@ -2096,7 +2233,7 @@ static int hp_tcp_take(struct fo_run *r, int ok, int ms) {
         if (ok && ms >= 0 && (r->hp.best < 0 || ms < r->hp.best)) r->hp.best = ms;
         return 0;
     }
-    if (ok) { r->res = 1; return 1; }
+    if (ok) { r->res = 1; r->probe_ok = 1; return 1; }
     return 0;
 }
 
@@ -2146,6 +2283,7 @@ static void hp_icmp_cb(void *arg, int ok, int ms) {
     r->hp.p = NULL;
     if (ok) {
         r->res = 1;
+        r->probe_ok = 1;
         probe_rule_clear(r);
     } else {
         r->hp.ti++;
@@ -2182,6 +2320,7 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
     snprintf(r->hp.dev, sizeof(r->hp.dev), "%s", dev);
     r->hp.ti = 0;
     r->hp.best = -1;
+    r->hp.net = 0;
     if (kind == HP_HEALTH && g_health_probe) { r->res = g_health_probe(sp, o, dev); return 0; }
     if (kind == HP_LATENCY) {
         int ms4 = -1, ms6 = -2;
@@ -2215,6 +2354,7 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
         int up = 0, fresh = 0;
         if (r->hs->ops->xsdev(r->hs, dev, &up, &fresh)) { r->res = fresh ? up : 1; return 0; }
     }
+    r->hp.net = 1;
     if (out_has_cap(o, KC_TCP_PROBE)) return hp_tcp_next(r);
     if (g_icmp_probe) { r->res = g_icmp_probe(dev); return 0; }
     if (!device_src(dev, r->hp.src, sizeof(r->hp.src))) return 0;
@@ -2228,7 +2368,7 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
 static int cand_health(struct fo_run *r, size_t k) {
     if (r->named) {
         size_t m = spec_out_idx(r->sp, r->cand[k]);
-        r->res = m != (size_t)-1 && r->alive[m];
+        r->res = m != (size_t)-1 && r->alive[m] == ALIVE_YES;
         return 0;
     }
     return hp_start(r, HP_HEALTH, r->o, r->cand[k]->device);
@@ -2426,6 +2566,7 @@ static struct fo_run *run_new(struct loop *l, struct spec *sp, struct fo_store *
     r->done = done;
     r->done_arg = done_arg;
     r->rv.nl = -1;
+    r->up_now = -2;
     r->kick = loop_timer_new(l, run_kick, r);
     r->rv.tm = loop_timer_new(l, rv_timer, r);
     if (!r->kick || !r->rv.tm) {
@@ -2489,6 +2630,118 @@ void fo_pass_lat_extern(struct fo_run *r) {
     if (r) r->lat_extern = 1;
 }
 
+void fo_pass_on_revive(struct fo_run *r, fo_revive_fn fn, void *arg) {
+    if (!r) return;
+    r->on_revive = fn;
+    r->on_revive_arg = arg;
+}
+
+/* ---- путь наружу у самого роутера («СОМНЕНИЕ», причина 1) --------------------------------
+ *
+ * Вопрос ядру — один поиск маршрута к первому адресу пробы без метки (`ip route get 1.1.1.1`):
+ * так ушёл бы пакет самого роутера. 1 — путь есть: маршрут ведёт в поднятое устройство; 0 —
+ * пути нет: ядро отвечает «сеть недостижима» или устройство маршрута лежит; -1 — судить нечем:
+ * netlink отказал, маршрут ведёт в устройство одного из выходов (туннель, в который завёрнут
+ * трафик самого роутера, себе путём наружу не служит, а маршрут к его серверу отсюда не
+ * узнать) или платформа держит маршруты сетей не в main (телефон: netd).
+ *
+ * «Пути нет» значит «молчит провайдер» только там, где путь БЫЛ: у роутера без маршрута по
+ * умолчанию в main (выход наружу только отдельным маршрутом к серверу туннеля; стенд в
+ * пространстве имён без WAN) его нет никогда, и туннели при этом работают. Поэтому проход
+ * помнит, что видел путь (запись `upstream`, fostate.h), и верит его отсутствию только после
+ * этого. И забывает, когда видит обратное: проба выхода дошла до интернета, а пути по-прежнему
+ * «нет» — значит по этому маршруту здесь судить нельзя (upstream_learn в конце прохода). */
+static int upstream_now(const struct spec *sp) {
+    if (!plat()->netifd) return -1;
+    struct in_addr a;
+    if (inet_aton(PROBE_TARGETS[0], &a) == 0) return -1;
+    char dev[IF_NAMESIZE];
+    int rc = rtnl_route_dev(a, dev, sizeof(dev));
+    if (rc == ENETUNREACH || rc == EHOSTUNREACH) return 0;
+    if (rc != 0) return -1;
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (out_has_device(&sp->out[i]) && !strcmp(sp->out[i].device, dev)) return -1;
+    for (size_t i = 0; i < sp->anon_n; i++)
+        if (!strcmp(sp->anon[i].device, dev)) return -1;
+    return device_present(dev) ? 1 : 0;
+}
+
+static int upstream_seen(struct fo_store *st) {
+    FILE *f = st->ops->open_r(st, "upstream");
+    if (!f) return 0;
+    int v = 0;
+    if (fscanf(f, "%d", &v) != 1) v = 0;
+    fclose(f);
+    return v == 1;
+}
+
+/* Есть ли у роутера путь наружу; не узнать — «есть»: по незнанию оживление не запрещаем. */
+static int upstream_up(struct fo_run *r) {
+    if (g_upstream_probe) return g_upstream_probe();
+    if (r->up_now == -2) r->up_now = upstream_now(r->sp);
+    return !(r->up_now == 0 && upstream_seen(r->st));
+}
+
+/* Конец прохода: запомнить, что путь наружу есть, или забыть, если проба выхода дошла до
+ * интернета без него. Запись меняется только на перемене — здоровый проход ничего не пишет. */
+static void upstream_learn(struct fo_run *r) {
+    if (g_upstream_probe) return;
+    if (r->up_now == -2) r->up_now = upstream_now(r->sp);
+    int seen = upstream_seen(r->st);
+    if (r->up_now == 1 && !seen) r->st->ops->put(r->st, "upstream", "1\n", 2);
+    else if (r->up_now == 0 && seen && r->probe_ok) r->st->ops->put(r->st, "upstream", "", 0);
+}
+
+/* Ни одно устройство выхода не ответило: вынести ли приговор или удержать выход на устройстве,
+ * которое несёт его трафик (см. «СОМНЕНИЕ»). DOUBT_NONE — приговор (оживление и on_fail);
+ * иначе — причина удержания, и запись сомнения обновлена. up — есть ли путь наружу. */
+static int doubt_judge(struct fo_run *r, const struct output *o, int up) {
+    if (r->cur < 0 || (size_t)r->cur >= r->cand_n) return DOUBT_NONE;
+    /* Сомневаться можно в пробе, ушедшей в сеть. «Не работает» от помощника, который сам следит
+     * за узлом, от вида (awg: рукопожатие устарело) или от файла состояния туннеля — приговор
+     * того, кто знает туннель изнутри и свои повторы уже сделал. */
+    if (!r->cur_net) return DOUBT_NONE;
+    const char *dev = r->cand[r->cur]->device;
+    /* Устройства нет или у него нет адреса IPv4 — оно трафик не несёт (см. device_src), и
+     * сомневаться не в чем. */
+    char src[64];
+    if (!device_present(dev) || !device_src(dev, src, sizeof(src))) return DOUBT_NONE;
+    struct doubt_rec d;
+    int have = doubt_get(r->st, o->name, &d) && !strcmp(d.dev, dev);
+    if (!have) {
+        memset(&d, 0, sizeof(d));
+        snprintf(d.dev, sizeof(d.dev), "%s", dev);
+        d.rx = -1;
+    }
+    long long rx = dev_rx_bytes(dev);
+    int was = d.why, why;
+    if (!up) {
+        why = DOUBT_UPSTREAM;
+        d.fails = 0;
+    } else if (have && d.rx >= 0 && rx > d.rx) {
+        why = DOUBT_RX;
+        d.fails = 0;
+    } else if (++d.fails < FAIL_PASSES) {
+        why = DOUBT_STREAK;
+    } else {
+        return DOUBT_NONE;                  /* запись сотрёт S_FIN: приговор вынесен */
+    }
+    d.rx = rx;
+    d.why = why;
+    doubt_put(r->st, o->name, &d);
+    /* Строка — на перемене причины и на каждом шаге серии (их не больше FAIL_PASSES - 1): выход,
+     * чьи адресаты пробы режут ICMP, иначе писал бы одно и то же каждый проход. */
+    if (why == DOUBT_STREAK)
+        fprintf(stderr, LOG_W "выход %s: %s не отвечает (%d из %d подряд) — трафик пока не трогаю, "
+                        "проверю ещё раз\n", o->name, dev, d.fails, FAIL_PASSES);
+    else if (why != was || r->verbose)
+        fprintf(stderr, LOG_W "выход %s: %s не отвечает на пробу, но %s — туннель не трогаю\n",
+                o->name, dev,
+                why == DOUBT_RX ? "принимает трафик"
+                                : "у роутера нет пути наружу: молчит провайдер");
+    return why;
+}
+
 /* Выход o — член группы спеки v2 (именованные члены)? */
 static int named_member(const struct spec *sp, const struct output *o) {
     size_t idx = spec_out_idx(sp, o);
@@ -2509,7 +2762,7 @@ static void out_finish(struct fo_run *r) {
     const char *chosen = r->chosen;
     const char *was = r->was;
     r->streak_new[r->i] = r->new_streak;
-    r->alive[r->i] = chosen != NULL;
+    r->alive[r->i] = !chosen ? ALIVE_NO : r->held ? ALIVE_HELD : ALIVE_YES;
     /* Группа v2: выбранный член — в событие и в запись groups. */
     const char *member = NULL;
     const struct group_cfg *gcf = out_group(o);
@@ -2560,9 +2813,10 @@ static void out_finish(struct fo_run *r) {
                     fprintf(stderr, LOG_W "%s: состояние маршрутизации не прочитать "
                                     "— ничего не меняю\n", o->name);
             } else if (!routing_live_ok(&f, chosen)) {
-                fprintf(stderr, LOG_W "выход %s: %s отвечает, но маршрутизация "
+                fprintf(stderr, LOG_W "выход %s: %s %s, но маршрутизация "
                                 "разъехалась (%s) — возвращаю маршрут\n",
-                        o->name, chosen, facts_why(&f, chosen));
+                        o->name, chosen, r->held ? "на месте" : "отвечает",
+                        facts_why(&f, chosen));
                 bind_device(o, chosen);
                 r->changed = 1;
             } else {
@@ -2585,7 +2839,8 @@ static void out_finish(struct fo_run *r) {
                         backstop_set_fam(6, o->table);
                     }
                 }
-                if (r->verbose) fprintf(stderr, LOG_I "%s: %s работает\n", o->name, chosen);
+                if (r->verbose && !r->held)
+                    fprintf(stderr, LOG_I "%s: %s работает\n", o->name, chosen);
             }
         }
     } else {
@@ -2737,6 +2992,8 @@ static void fo_step(struct fo_run *r) {
                 if (gc >= 0 && strcmp(r->was, "-") != 0) r->cur = gc;
             }
             r->first_h = -1;
+            r->cur_net = 0;
+            r->held = DOUBT_NONE;
             r->k = 0;
             r->s = S_SCAN;
             continue;
@@ -2752,6 +3009,7 @@ static void fo_step(struct fo_run *r) {
 
         case S_SCAN_R:
             if (r->res) { r->first_h = (int)r->k; r->s = S_LAT; continue; }
+            if ((int)r->k == r->cur) r->cur_net = r->hp.net;
             if (r->verbose)
                 fprintf(stderr, LOG_W "%s: %s не отвечает\n", o->name, r->cand[r->k]->device);
             r->k++;
@@ -2791,7 +3049,7 @@ static void fo_step(struct fo_run *r) {
             /* Группа v2: живые члены — все сразу, без проб (приговоры их проходов уже есть). */
             for (size_t k = 0; r->named && k < r->cand_n; k++) {
                 size_t m = spec_out_idx(sp, r->cand[k]);
-                if (m != (size_t)-1 && r->alive[m] && fog_cc_allowed(o, r->cand[k]))
+                if (m != (size_t)-1 && r->alive[m] == ALIVE_YES && fog_cc_allowed(o, r->cand[k]))
                     r->galive[k] = 1;
             }
             /* manual — член, выбранный человеком (select), или default. Не отвечает — отказ группы
@@ -3007,7 +3265,28 @@ static void fo_step(struct fo_run *r) {
              * тот же, поэтому основной туннель получает попытку первым. Группа v2 своих членов
              * не оживляет: каждый член — выход со своим проходом, и оживление — в нём. */
             if (!r->chosen && !r->via_down && !r->named) {
+                /* Приговор или сомнение (см. «СОМНЕНИЕ»): устройство, которое несёт трафик
+                 * выхода, по одному проходу без ответа не оживляется и в отказ не уходит. */
+                int up = upstream_up(r);
+                r->held = doubt_judge(r, o, up);
+                if (r->held != DOUBT_NONE) {
+                    r->chosen = r->cand[r->cur]->device;
+                    r->pk = r->cur;
+                    if (r->held == DOUBT_STREAK) r->retry = 1;
+                    r->s = S_FIN;
+                    continue;
+                }
                 if (r->cur >= 0) r->cur_dead = 1;   /* ни одно не ответило — и текущее тоже */
+                /* Пути наружу нет у самого роутера — оживлять нечем и незачем: выход уходит в
+                 * отказ (или остаётся в нём), а отметка перезапуска не тратится — она нужна
+                 * тому проходу, который застанет провайдера вернувшимся. */
+                if (!up) {
+                    if (r->verbose)
+                        fprintf(stderr, LOG_I "%s: у роутера нет пути наружу — оживление "
+                                        "отложено\n", o->name);
+                    r->s = S_FIN;
+                    continue;
+                }
                 /* Член группы v2 под сторожем демона — оживление следующим проходом
                  * (fo_pass_defer_revive): группа, которая идёт после него, не должна ждать
                  * его ifdown/ifup и шагов ожидания, чтобы уйти на живого члена. */
@@ -3046,6 +3325,22 @@ static void fo_step(struct fo_run *r) {
             continue;
 
         case S_FIN:
+            /* Группа v2 без живых членов, а её нынешний член удержан в сомнении: группа держится
+             * за него — уйти не на кого, а отказ группы оборвал бы те же соединения, которые
+             * сомнение члена бережёт. У manual — только если это и есть выбор человека. */
+            if (r->named && !r->chosen && r->cur >= 0 && (size_t)r->cur < r->cand_n) {
+                size_t m = spec_out_idx(sp, r->cand[r->cur]);
+                const struct group_cfg *g = out_group(o);
+                if (m != (size_t)-1 && r->alive[m] == ALIVE_HELD && fog_cc_allowed(o, r->cand[r->cur]) &&
+                    (!g || g->pick != PICK_MANUAL || fog_manual_pick(sp, r->st, o) == r->cur)) {
+                    r->chosen = r->cand[r->cur]->device;
+                    r->pk = r->cur;
+                    r->galive[r->cur] = 1;
+                    r->held = DOUBT_STREAK;
+                }
+            }
+            /* Выход ответил или получил приговор — сомнения больше нет. */
+            if (r->held == DOUBT_NONE) doubt_clear(r->st, o->name);
             out_finish(r);
             r->oi++;
             r->s = S_OUT;
@@ -3057,11 +3352,12 @@ static void fo_step(struct fo_run *r) {
             /* Префикс хоста у донора IPv6 — по ядру этого прохода (v6donor_sync: без спеки с
              * донором — ничего, два чтения netlink и getifaddrs — иначе). */
             v6donor_sync(sp);
+            upstream_learn(r);
             if (!r->changed && r->verbose) fprintf(stderr, LOG_I "изменений нет\n");
             /* Строки о переключении — в stdout: у долгоживущего процесса он буферизован, а
              * читают его журнал сервиса и стенды — сразу после прохода. */
             fflush(stdout);
-            run_end(r, r->rev_wanted ? FO_PASS_REVIVE : 0);
+            run_end(r, (r->rev_wanted ? FO_PASS_REVIVE : 0) | (r->retry ? FO_PASS_RETRY : 0));
             return;
 
         /* ---- одна проба или одно оживление (синхронные обёртки для стенда) ---- */
@@ -3099,6 +3395,9 @@ static void fo_step(struct fo_run *r) {
                 rv_done(r, 0);
                 continue;
             }
+            /* Дальше устройство перезапускается или ждётся — события сети о нём до конца
+             * прохода будут следами этого оживления (watchd.c, «СОБЫТИЯ ВО ВРЕМЯ ПРОХОДА»). */
+            if (r->on_revive) r->on_revive(r->on_revive_arg, dev);
             /* Устройство xsteer, поднятое netifd: клиент наш, а интерфейс — его, и зовётся
              * интерфейс НЕ так, как устройство (xs0 против xs-xs0). `ifdown xs-xs0` netifd
              * отвечает «Interface not found», то есть сторож писал бы в журнал отказ вместо
