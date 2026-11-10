@@ -325,7 +325,20 @@ int xs_conn_on_seg(struct xs_conn *c, const struct obfs_seg *s, long long now) {
     }
     if (c->state == XSC_SYN_RCVD && (s->flags & TH_ACK)) c->state = XSC_EST;
     if (!s->plen || c->state != XSC_EST) return 0;
-    c->ack = obfs_next_ack(c->ack, s->seq, s->plen);
+    /* Номер подтверждения здесь НЕ двигается: сегмент ещё не проверен. Двигает его xs_conn_rx_ok — после
+     * сошедшегося тега записи (или в фазах рукопожатия, где тега у сегмента нет вовсе).
+     *
+     * Прежде ack двигал любой сегмент с данными и верной четвёркой, а RST принимается ровно на ack (выше).
+     * Слепому этого хватало: четыре сегмента с номерами X, X+2^30, X+2^31, X+3·2^30 сводят ack к
+     * X+3·2^30+1 при ЛЮБОМ прежнем, и RST с этим номером снимал сессию — ~140 тысяч пакетов вне пути на
+     * перебор порта пира (аудит 2.1.0, PoC poc_xsrst; тестом — xsconnmatch). Теперь ack знает только тот,
+     * кто видит наш трафик или держит ключ. */
+    return 1;
+}
+
+void xs_conn_rx_ok(struct xs_conn *c, uint32_t seq, size_t plen) {
+    if (!plen || c->state != XSC_EST) return;
+    c->ack = obfs_next_ack(c->ack, seq, plen);
     c->unacked++;
     c->rx_since_ack++;
     /* Окно шевелим раз в восемь принятых сегментов: настоящий приёмник меняет его, когда
@@ -345,7 +358,6 @@ int xs_conn_on_seg(struct xs_conn *c, const struct obfs_seg *s, long long now) {
             c->last_bare_ns = ns;
         }
     }
-    return 1;
 }
 
 int xs_conn_tick(struct xs_conn *c, long long now, int sending) {

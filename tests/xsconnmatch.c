@@ -329,5 +329,50 @@ int main(void) {
               xs_conn_need_keepalive(&c, 0, t0 + 1000000));
     }
 
+    /* 12. СЛЕПОЙ ОБРЫВ (аудит 2.1.0, PoC poc_xsrst). Прежде номер подтверждения двигал ЛЮБОЙ сегмент с данными
+     * и верной четвёркой — до проверки тега записи. Четыре сегмента с номерами X, X+2^30, X+2^31, X+3·2^30
+     * сводили ack к X+3·2^30+1 при любом прежнем, и RST с этим номером снимал сессию: слепому вне пути
+     * хватало ~140 тысяч пакетов на перебор порта пира. Теперь ack двигает только xs_conn_rx_ok — после
+     * сошедшегося тега, — и та же серия сессию не снимает ни при одном исходном ack. */
+    {
+        unsigned killed = 0, moved = 0, tries = 0;
+        for (uint64_t A = 0; A < (1ull << 32); A += 0x10001357ull) {
+            struct xs_conn c;
+            conn_ready(&c, t0);
+            c.isn_rx = 4000;
+            c.ack = (uint32_t)A;
+            static const uint8_t junk[1] = { 0 };
+            struct obfs_seg s;
+            memset(&s, 0, sizeof s);
+            s.flags = TH_ACK;
+            s.payload = junk;
+            s.plen = 1;
+            uint32_t X = 0x11111111u;
+            for (int i = 0; i < 4; i++) { s.seq = X + (uint32_t)i * 0x40000000u; xs_conn_on_seg(&c, &s, t0); }
+            if (c.ack != (uint32_t)A) moved++;
+            struct obfs_seg r;
+            memset(&r, 0, sizeof r);
+            r.flags = TH_RST;
+            r.seq = X + 3u * 0x40000000u + 1;
+            if (xs_conn_on_seg(&c, &r, t0 + 1) == -1) killed++;
+            tries++;
+        }
+        printf("  слепой обрыв: исходных ack %u, номер сдвинут %u раз, сессия снята %u раз\n", tries, moved, killed);
+        check("слепой обрыв: непроверенные сегменты номер подтверждения не двигают", 0, (long)moved);
+        check("слепой обрыв: RST по сведённому номеру сессию не снимает", 0, (long)killed);
+
+        /* Проверенные данные двигают номер, как прежде: законный RST ядра той стороны (номер = наш ack) годен. */
+        struct xs_conn c;
+        conn_ready(&c, t0);
+        c.ack = 5000;
+        xs_conn_rx_ok(&c, 5000, 1200);
+        check("проверенные данные: номер подтверждения сдвинут на конец сегмента", 6200, (long)c.ack);
+        struct obfs_seg r;
+        memset(&r, 0, sizeof r);
+        r.flags = TH_RST;
+        r.seq = 6200;
+        check("законный RST на сдвинутом номере сессию снимает", -1, xs_conn_on_seg(&c, &r, t0));
+    }
+
     return unit_done("xsconnmatch");
 }
