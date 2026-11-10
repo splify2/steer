@@ -383,6 +383,58 @@ int main(void) {
         check("не установлено — не судим", 0, conn_dead(&c, t));
     }
 
+    /* Номер подтверждения без подписи — только в объявленном окне (аудит 2.1.0): серия из четырёх сегментов с
+     * шагом 2^30 сводила ack к известному числу при любом прежнем, и RST по нему снимал сессию. */
+    {
+        uint32_t win = (uint32_t)OBFS_WIN << OBFS_WSCALE;
+        uint32_t a = 1000;
+        check("ack в окне: сегмент впереди двигает", 1, obfs_ack_take(&a, 1000, 100));
+        check("  на конец сегмента", 1100, (long)a);
+        check("ack в окне: повтор не двигает", 0, obfs_ack_take(&a, 1000, 100));
+        check("ack в окне: конец на краю окна двигает", 1, obfs_ack_take(&a, 1100 + win - 10, 10));
+        a = 5000;
+        check("ack в окне: за окном не двигает", 0, obfs_ack_take(&a, 5000 + win, 10));
+        check("ack в окне: перескок через ноль в окне двигает", 1,
+              ({ uint32_t z = 0xFFFFFFF0u; int r = obfs_ack_take(&z, 0xFFFFFFF8u, 32); r && z == 0x18u; }));
+        unsigned moved = 0;
+        for (uint64_t A = 0; A < (1ull << 32); A += 0x10001357ull) {
+            uint32_t ack = (uint32_t)A, X = 0x11111111u;
+            for (int i = 0; i < 4; i++) obfs_ack_take(&ack, X + (uint32_t)i * 0x40000000u, 1);
+            if (ack == X + 3u * 0x40000000u + 1) moved++;
+        }
+        check("слепая серия из четырёх сегментов не сводит ack к своему числу (16 исходных)", 0, (long)moved);
+    }
+
+    /* Сервер: SYN не вытесняет установленные сессии, полуоткрытых — не больше HALF_MAX, таблица растёт сверх
+     * прежних 64 (аудит 2.1.0, F5). Нужны сырые сокеты — под root; иначе громкий пропуск. */
+    if (geteuid() == 0) {
+        uint32_t lo = htonl(INADDR_LOOPBACK), fwd = htonl(INADDR_LOOPBACK);
+        enum { EST = 100, FLOOD = HALF_MAX + 50 };
+        int made = 0;
+        for (int i = 0; i < EST; i++) {
+            struct sess *x = sess_alloc(lo, (uint16_t)(20000 + i), lo, 4443, fwd, 51820);
+            if (x) { sess_est(x); made++; }
+        }
+        for (int i = 0; i < FLOOD; i++) sess_alloc(lo, (uint16_t)(30000 + i), lo, 4443, fwd, 51820);
+        int est_alive = 0;
+        for (int i = 0; i < EST; i++) {
+            struct sess *x = sess_find(lo, (uint16_t)(20000 + i));
+            if (x && x->c.state == ST_EST) est_alive++;
+        }
+        printf("  сессий %d (установленных %d из %d), полуоткрытых %d, уступило %llu\n", g_sess_n, est_alive, made,
+               g_half_n, g_half_evicted);
+        check("сервер: таблица больше прежних 64 — все 100 установленных заведены", EST, made);
+        check("сервер: лавина SYN ни одной установленной не вытеснила", EST, est_alive);
+        check("сервер: полуоткрытых не больше HALF_MAX", HALF_MAX, g_half_n);
+        check("сервер: уступили давние полуоткрытые, вытеснение сосчитано", 50, (long)g_half_evicted);
+        check("сервер: давняя полуоткрытая ушла, свежая на месте", 1,
+              !sess_find(lo, 30000) && sess_find(lo, (uint16_t)(30000 + FLOOD - 1)) != NULL);
+        for (int i = 0; i < g_sess_cap; i++) if (g_sess[i].used) sess_free(&g_sess[i]);
+        check("сервер: после освобождения сессий ноль", 0, g_sess_n + g_half_n);
+    } else {
+        printf("  (сервер: не root — сырых сокетов нет, таблица сессий не проверяется)\n");
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

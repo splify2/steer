@@ -368,6 +368,32 @@ uint32_t obfs_next_ack(uint32_t have, uint32_t seq, size_t plen) {
     return ((int32_t)(want - have) > 0) ? want : have;
 }
 
+int obfs_ack_take(uint32_t *ack, uint32_t seq, size_t plen) {
+    /* Конец сегмента должен быть впереди и не дальше окна, которое мы объявляем (OBFS_WIN << OBFS_WSCALE =
+     * 8 МиБ, масштаб — в SYN): проверка приемлемости настоящего приёмника TCP (RFC 793, 3.3). У obfs нет
+     * подписи на сегменте, и без неё номер подтверждения двигал любой сегмент с верной четвёркой — четыре
+     * сегмента с шагом 2^30 сводили его к известному числу, и RST по нему снимал сессию (аудит 2.1.0, тот
+     * же приём, что у xsteer). В окне слепому нужно угадать его положение: 2^32 / 8 МиБ = 512 попыток на
+     * порт клиента, а не четыре. Сегмент вне окна до WireGuard всё равно доходит — подлинность там. */
+    uint32_t ahead = seq + (uint32_t)plen - *ack;
+    if (!plen || (int32_t)ahead <= 0 || ahead > (uint32_t)OBFS_WIN << OBFS_WSCALE) return 0;
+    *ack = seq + (uint32_t)plen;
+    return 1;
+}
+
+/* RST с чужим номером отвергнут (RFC 5961 §3): сосчитать и сказать не чаще раза в десять секунд. */
+static unsigned long long g_rst_bad;
+static void rst_rejected(const char *who) {
+    static long long said;
+    g_rst_bad++;
+    long long t = now_ms();
+    if (t - said >= 10000) {
+        said = t;
+        fprintf(stderr, "steer[info] obfs: %s: RST с чужим номером отвергнут (всего %llu) — сессию снимает "
+                        "только RST с ожидаемым номером\n", who, g_rst_bad);
+    }
+}
+
 /* ---- отбор пакетов в ядре --------------------------------------------------
  *
  * Сырой сокет получает КОПИЮ каждого TCP-пакета, доставляемого локально, — и это не
@@ -994,6 +1020,12 @@ int obfs_client(const char *out_name, const char *server, int server_port,
                     c.last_rx = now_ms();
 
                     if (s.flags & TH_RST) {
+                        /* Только с номером, которого ждём (RFC 5961 §3): в рукопожатии — подтверждение нашего
+                         * ISN + 1 (c.seq после SYN), дальше — ровно c.ack. Свой «сессии нет» сервер шлёт именно
+                         * так (номер — поле подтверждения нашего сегмента). Прежде любой RST с четвёркой
+                         * обрывал сессию: слепому хватало перебора порта клиента. */
+                        int ok = c.state == ST_SYN_SENT ? (s.flags & TH_ACK) && s.ack == c.seq : s.seq == c.ack;
+                        if (!ok) { rst_rejected(out_name); continue; }
                         fprintf(stderr, LOG_W "%s: сервер оборвал сессию (RST)\n", out_name);
                         evline_emit("down", "why", EVLINE_STR, "сервер оборвал сессию (RST)",
                                      (const char *)NULL);
@@ -1010,8 +1042,7 @@ int obfs_client(const char *out_name, const char *server, int server_port,
                         continue;
                     }
                     if (s.plen && c.state == ST_EST) {
-                        c.ack = obfs_next_ack(c.ack, s.seq, s.plen);
-                        c.unacked++;
+                        if (obfs_ack_take(&c.ack, s.seq, s.plen)) c.unacked++;
                         /* Датаграмма отдаётся наверх в любом случае, даже вне порядка:
                          * за порядок и подлинность отвечает WireGuard, а не мы. */
                         g_iov[k].iov_base = (void *)(uintptr_t)s.payload;
@@ -1094,30 +1125,101 @@ int obfs_client(const char *out_name, const char *server, int server_port,
  * четвёрка, как в апстриме. Своего сокета UDP на сессию достаточно, чтобы ответы от
  * WireGuard возвращались тому, чьи они: connect() к цели фиксирует получателя, а ядро
  * само разводит ответы по сокетам. */
-#define MAX_SESS 64
+/* Сессий не «до 64», а сколько клиентов (аудит 2.1.0): таблица растёт вдвое по нужде, поиск — по хэшу
+ * четвёрки, а не перебором. Настоящий потолок — дескрипторы: у сессии их два (сырой сокет ответа и UDP к
+ * WireGuard), и отказ socket() называется в журнале числом сессий.
+ *
+ * ПОЛУОТКРЫТЫЕ — ОТДЕЛЬНО. Прежде любой SYN заводил сессию, а полная таблица вытесняла самую давнюю по
+ * приёму, то есть ЖИВУЮ: посторонний с 64 разными портами (подделывать адрес не нужно) выбивал всех клиентов
+ * по кругу (аудит, F5). Теперь SYN никогда не вытесняет установленную сессию. Полуоткрытых (SYN_RCVD) не
+ * больше HALF_MAX: законный клиент полуоткрыт один круг до сервера, а лавине SYN достаётся только этот пул —
+ * на пределе вытесняется самая давняя ПОЛУОТКРЫТАЯ. 256 — с запасом на одновременный переподъём всех
+ * клиентов большого сервера после его перезапуска; полуоткрытая без ACK живёт HALF_IDLE_MS (клиент за это
+ * время повторит SYN не раз). Вытеснение считается и называется в журнале. Ни одна полуоткрытая не держит
+ * установленные: те живут до SESS_IDLE_MS тишины. Полная защита от подделки (SYN-cookie) — не здесь: у obfs
+ * нет секрета, на котором её строить без изменения проводного формата. */
 #define SESS_IDLE_MS 180000
+#define HALF_MAX 256
+#define HALF_IDLE_MS 10000
 
 struct sess {
     struct fconn c;
     int udp;                    /* к локальному WireGuard */
     int tx;                     /* сырой сокет к этому клиенту */
     int used;
+    int hnext;                  /* следующая в цепочке хэша, -1 — нет */
+    long long born;             /* когда пришёл SYN (для полуоткрытых) */
 };
 
-static struct sess g_sess[MAX_SESS];
+static struct sess *g_sess;
+static int g_sess_cap, g_sess_n, g_half_n;
+static int *g_sbucket;          /* голова цепочки по хэшу четвёрки; размер — g_sess_cap * 2 */
+static unsigned long long g_half_evicted;
+
+static unsigned sess_hash(uint32_t caddr, uint16_t cport) {
+    uint32_t h = caddr ^ ((uint32_t)cport * 0x9E3779B1u);
+    h ^= h >> 15;
+    h *= 0x2545F491u;
+    h ^= h >> 13;
+    return h & (unsigned)(g_sess_cap * 2 - 1);
+}
 
 static struct sess *sess_find(uint32_t caddr, uint16_t cport) {
-    for (int i = 0; i < MAX_SESS; i++)
-        if (g_sess[i].used && g_sess[i].c.daddr == caddr && g_sess[i].c.dport == cport)
-            return &g_sess[i];
+    if (!g_sess_cap) return NULL;
+    for (int i = g_sbucket[sess_hash(caddr, cport)]; i >= 0; i = g_sess[i].hnext)
+        if (g_sess[i].c.daddr == caddr && g_sess[i].c.dport == cport) return &g_sess[i];
     return NULL;
 }
 
+static void sess_unlink(struct sess *s) {
+    int *p = &g_sbucket[sess_hash(s->c.daddr, s->c.dport)];
+    int me = (int)(s - g_sess);
+    while (*p >= 0 && *p != me) p = &g_sess[*p].hnext;
+    if (*p == me) *p = s->hnext;
+    s->hnext = -1;
+}
+
 static void sess_free(struct sess *s) {
+    if (s->used) {
+        sess_unlink(s);
+        g_sess_n--;
+        if (s->c.state == ST_SYN_RCVD) g_half_n--;
+    }
     if (s->udp >= 0) close(s->udp);
     if (s->tx >= 0) close(s->tx);
     s->udp = s->tx = -1;
     s->used = 0;
+}
+
+/* Сессия перешла из полуоткрытых в установленные. */
+static void sess_est(struct sess *s) {
+    if (s->c.state == ST_SYN_RCVD) g_half_n--;
+    s->c.state = ST_EST;
+}
+
+/* Свободный слот; таблица полна — вдвое больше (хэш строится заново). NULL — нет памяти. Указатели на
+ * сессии после роста недействительны: держат их только в пределах одного пакета. */
+static struct sess *sess_slot(void) {
+    for (int i = 0; i < g_sess_cap; i++) if (!g_sess[i].used) return &g_sess[i];
+    int nc = g_sess_cap ? g_sess_cap * 2 : 64;
+    struct sess *ns = realloc(g_sess, (size_t)nc * sizeof(*ns));
+    if (!ns) return NULL;
+    int *nb = malloc((size_t)nc * 2 * sizeof(*nb));
+    if (!nb) { g_sess = ns; return NULL; }
+    for (int i = g_sess_cap; i < nc; i++) { memset(&ns[i], 0, sizeof(ns[i])); ns[i].udp = ns[i].tx = -1; ns[i].hnext = -1; }
+    g_sess = ns;
+    free(g_sbucket);
+    g_sbucket = nb;
+    int old = g_sess_cap;
+    g_sess_cap = nc;
+    for (int i = 0; i < nc * 2; i++) g_sbucket[i] = -1;
+    for (int i = 0; i < old; i++) {
+        if (!g_sess[i].used) continue;
+        unsigned h = sess_hash(g_sess[i].c.daddr, g_sess[i].c.dport);
+        g_sess[i].hnext = g_sbucket[h];
+        g_sbucket[h] = i;
+    }
+    return &g_sess[old];
 }
 
 /* our_addr — адрес, НА КОТОРЫЙ клиент прислал SYN: с него и отвечаем (см. obfs_raw_open_from).
@@ -1127,24 +1229,37 @@ static void sess_free(struct sess *s) {
  * строки в журнале. Та же беда, что у хаба xsteer, и то же лекарство. */
 static struct sess *sess_alloc(uint32_t caddr, uint16_t cport, uint32_t our_addr,
                                uint16_t our_port, uint32_t fwd_addr, int fwd_port) {
-    struct sess *slot = NULL, *oldest = NULL;
-    for (int i = 0; i < MAX_SESS; i++) {
-        if (!g_sess[i].used) { slot = &g_sess[i]; break; }
-        if (!oldest || g_sess[i].c.last_rx < oldest->c.last_rx) oldest = &g_sess[i];
+    /* Полуоткрытых на пределе — уступает самая давняя ПОЛУОТКРЫТАЯ; установленные не трогаются. */
+    if (g_half_n >= HALF_MAX) {
+        struct sess *old = NULL;
+        for (int i = 0; i < g_sess_cap; i++)
+            if (g_sess[i].used && g_sess[i].c.state == ST_SYN_RCVD && (!old || g_sess[i].born < old->born))
+                old = &g_sess[i];
+        if (old) {
+            sess_free(old);
+            g_half_evicted++;
+            static long long said;
+            long long t = now_ms();
+            if (t - said >= 10000) {
+                said = t;
+                fprintf(stderr, LOG_W "сервер: полуоткрытых сессий %d (предел %d) — давняя без ACK уступила "
+                                      "новому SYN; всего уступило %llu (лавина SYN?)\n",
+                        HALF_MAX, HALF_MAX, g_half_evicted);
+            }
+        }
     }
-    /* Таблица полна — вытесняем самую старую. Отказать новому клиенту ради записи,
-     * которая молчит дольше всех, хуже: та либо жива и придёт снова, либо мертва. */
-    if (!slot) { sess_free(oldest); slot = oldest; }
-
+    struct sess *slot = sess_slot();
+    if (!slot) return NULL;
     memset(slot, 0, sizeof(*slot));
     slot->udp = slot->tx = -1;
+    slot->hnext = -1;
 
     slot->tx = obfs_raw_open_from(caddr, our_addr, &slot->c.saddr);
-    if (slot->tx < 0) return NULL;
+    if (slot->tx < 0) goto nofd;
     obfs_filter_none(slot->tx);
 
     slot->udp = socket(AF_INET, SOCK_DGRAM, 0);
-    if (slot->udp < 0) { sess_free(slot); return NULL; }
+    if (slot->udp < 0) goto nofd;
     struct sockaddr_in to;
     memset(&to, 0, sizeof(to));
     to.sin_family = AF_INET;
@@ -1163,7 +1278,26 @@ static struct sess *sess_alloc(uint32_t caddr, uint16_t cport, uint32_t our_addr
     slot->c.sport = our_port;
     slot->c.seq = rnd32();
     slot->c.last_rx = now_ms();
+    slot->c.state = ST_SYN_RCVD;
+    slot->born = slot->c.last_rx;
+    unsigned h = sess_hash(caddr, cport);
+    slot->hnext = g_sbucket[h];
+    g_sbucket[h] = (int)(slot - g_sess);
+    g_sess_n++;
+    g_half_n++;
     return slot;
+
+nofd:;
+    int er = errno;
+    sess_free(slot);
+    static long long said;
+    long long t = now_ms();
+    if (t - said >= 10000) {
+        said = t;
+        fprintf(stderr, LOG_W "сервер: сокет новой сессии не открылся (%s) при %d сессиях — SYN без ответа; "
+                              "поднимите предел открытых файлов (ulimit -n)\n", strerror(er), g_sess_n);
+    }
+    return NULL;
 }
 
 int obfs_server(int listen_port, const char *forward, int forward_port) {
@@ -1173,7 +1307,6 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
         fprintf(stderr, LOG_W "адрес назначения задаётся адресом: %s\n", forward);
         return 2;
     }
-    for (int i = 0; i < MAX_SESS; i++) { g_sess[i].udp = -1; g_sess[i].tx = -1; }
 
     /* Приём — один сырой сокет без connect: клиентов много и заранее они неизвестны.
      * Отвечает каждому свой сокет сессии, привязанный к её адресу. */
@@ -1207,15 +1340,25 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
             listen_port, forward, forward_port);
     evline_emit("up", (const char *)NULL);
 
+    /* Набор poll — по числу сессий, растёт вместе с таблицей. map — номер сессии, а не указатель: приём ниже
+     * может завести сессию, и таблица переедет (sess_slot). */
+    struct pollfd *fds = NULL;
+    int *map = NULL, fds_cap = 0;
     for (;;) {
-        struct pollfd fds[1 + MAX_SESS];
-        struct sess *map[1 + MAX_SESS];
+        if (fds_cap < 1 + g_sess_cap) {
+            int nc = 1 + g_sess_cap;
+            struct pollfd *nf2 = realloc(fds, (size_t)nc * sizeof(*fds));
+            int *nm = nf2 ? realloc(map, (size_t)nc * sizeof(*map)) : NULL;
+            if (nf2) fds = nf2;
+            if (nm) { map = nm; fds_cap = nc; }
+            if (!nf2 || !nm) { fprintf(stderr, LOG_W "сервер: нет памяти под набор poll\n"); break; }
+        }
         int nf = 0;
-        fds[nf].fd = rx; fds[nf].events = POLLIN; fds[nf].revents = 0; map[nf] = NULL; nf++;
-        for (int i = 0; i < MAX_SESS; i++)
+        fds[nf].fd = rx; fds[nf].events = POLLIN; fds[nf].revents = 0; map[nf] = -1; nf++;
+        for (int i = 0; i < g_sess_cap; i++)
             if (g_sess[i].used && g_sess[i].udp >= 0) {
                 fds[nf].fd = g_sess[i].udp; fds[nf].events = POLLIN; fds[nf].revents = 0;
-                map[nf] = &g_sess[i];
+                map[nf] = i;
                 nf++;
             }
 
@@ -1249,6 +1392,7 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                         if (!ss) continue;
                     } else {
                         ss->c.seq -= 1;         /* повтор того же SYN-ACK */
+                        if (ss->c.state == ST_EST) { g_half_n++; ss->born = now_ms(); }
                     }
                     ss->c.ack = s.seq + 1;
                     ss->c.state = ST_SYN_RCVD;
@@ -1307,11 +1451,16 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                     continue;
                 }
                 ss->c.last_rx = now_ms();
-                if (s.flags & TH_RST) { sess_free(ss); continue; }
-                if (ss->c.state == ST_SYN_RCVD && (s.flags & TH_ACK)) ss->c.state = ST_EST;
+                if (s.flags & TH_RST) {
+                    /* Только с номером, которого ждём (RFC 5961 §3), — как у xsteer. Прежде любой RST с
+                     * четвёркой клиента снимал сессию: слепому хватало перебора порта клиента. */
+                    if (s.seq == ss->c.ack) sess_free(ss);
+                    else rst_rejected("сервер");
+                    continue;
+                }
+                if (ss->c.state == ST_SYN_RCVD && (s.flags & TH_ACK)) sess_est(ss);
                 if (s.plen && ss->c.state == ST_EST) {
-                    ss->c.ack = obfs_next_ack(ss->c.ack, s.seq, s.plen);
-                    ss->c.unacked++;
+                    if (obfs_ack_take(&ss->c.ack, s.seq, s.plen)) ss->c.unacked++;
                     send(ss->udp, s.payload, s.plen, MSG_NOSIGNAL);
                 }
             }
@@ -1321,7 +1470,8 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
 
         for (int i = 1; i < nf; i++) {
             if (!(fds[i].revents & POLLIN)) continue;
-            struct sess *ss = map[i];
+            struct sess *ss = &g_sess[map[i]];
+            if (!ss->used || ss->udp != fds[i].fd) continue;      /* закрыта или заменена приёмом выше */
             for (;;) {
                 /* Место под заголовок резервируется при чтении, поэтому датаграмма
                  * уходит клиенту с того места, куда её положило ядро, — без копии. */
@@ -1353,9 +1503,11 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
         }
 
         long long t = now_ms();
-        for (int i = 0; i < MAX_SESS; i++) {
+        for (int i = 0; i < g_sess_cap; i++) {
             if (!g_sess[i].used) continue;
             if (t - g_sess[i].c.last_rx > SESS_IDLE_MS) { sess_free(&g_sess[i]); continue; }
+            /* Полуоткрытая без ACK дольше HALF_IDLE_MS: клиент за это время повторил бы SYN. */
+            if (g_sess[i].c.state == ST_SYN_RCVD && t - g_sess[i].born > HALF_IDLE_MS) { sess_free(&g_sess[i]); continue; }
             if (g_sess[i].c.state == ST_EST && g_sess[i].c.unacked &&
                 (g_sess[i].c.unacked >= ACK_SEGS || t - g_sess[i].c.last_ack >= ACK_MS))
                 conn_send(g_sess[i].tx, &g_sess[i].c, TH_ACK, NULL, 0, 0);

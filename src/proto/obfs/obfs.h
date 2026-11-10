@@ -72,6 +72,11 @@ uint16_t obfs_tcp_csum(uint32_t saddr, uint32_t daddr, const void *seg, size_t l
 /* Куда сдвинуть ack, приняв сегмент. Только вперёд, с учётом переполнения uint32. */
 uint32_t obfs_next_ack(uint32_t have, uint32_t seq, size_t plen);
 
+/* То же для сегмента без подписи (obfs): номер двигается, только если конец сегмента впереди и не дальше
+ * объявленного окна (OBFS_WIN << OBFS_WSCALE). 1 — сдвинут. У xsteer сегмент проверен тегом записи, и ему
+ * хватает obfs_next_ack (xs_conn_rx_ok). */
+int obfs_ack_take(uint32_t *ack, uint32_t seq, size_t plen);
+
 /* «адрес:порт» → адрес и порт. 0 — разобрано. */
 int obfs_split_hostport(const char *s, char *host, size_t hn, int *port);
 
