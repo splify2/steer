@@ -72,6 +72,50 @@ static void cache_dir(char *buf, size_t n) {
     snprintf(buf, n, "%s/cache", etc);
 }
 
+/* ПРАВА КЭША ПОДГОТОВКИ. В подготовленной спеке и в ответах хуков лежит то же, что в спеке
+ * человека и сверх того: ключи туннелей, UUID и пароли узлов, развёрнутые хуком expand. Писались
+ * они 0644 в каталоги 0755 под {etc} — на постоянную память, любому пользователю машины. Теперь
+ * файлы — 0600, каталоги кэша (prepared и по одному на плагин) — 0700.
+ *
+ * Уже лежащее чинится здесь же, при первом обращении процесса к подготовке (это и старт демона —
+ * его стартовое применение, и любой apply): обновление пакета прав старых файлов само не меняет. */
+static void cache_perms_fix(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    char cdir[PATH_MAX];
+    cache_dir(cdir, sizeof(cdir));
+    DIR *d = opendir(cdir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char sub[PATH_MAX + 300];
+        snprintf(sub, sizeof(sub), "%s/%s", cdir, de->d_name);
+        struct stat sb;
+        if (lstat(sub, &sb) != 0 || !S_ISDIR(sb.st_mode)) continue;
+        if (sb.st_mode & 077) chmod(sub, 0700);
+        DIR *d2 = opendir(sub);
+        if (!d2) continue;
+        struct dirent *fe;
+        while ((fe = readdir(d2))) {
+            char fp[PATH_MAX + 600];
+            snprintf(fp, sizeof(fp), "%s/%s", sub, fe->d_name);
+            if (lstat(fp, &sb) == 0 && S_ISREG(sb.st_mode) && (sb.st_mode & 077)) chmod(fp, 0600);
+        }
+        closedir(d2);
+    }
+    closedir(d);
+}
+
+/* Каталог кэша со всеми родителями; сам он — 0700 (родители — как у pu_mkdir_p). */
+static int cache_mkdir(const char *dir) {
+    if (pu_mkdir_p(dir) != 0) return -1;
+    struct stat sb;
+    if (stat(dir, &sb) == 0 && (sb.st_mode & 077)) chmod(dir, 0700);
+    return 0;
+}
+
 /* Нужна ли подготовка: у какого-то включённого плагина есть хук или ресурсы видов. */
 static int needs_prepare(void) {
     for (size_t i = 0; i < plugin_n(); i++)
@@ -117,6 +161,7 @@ static void prepared_path(char *buf, size_t n, const char *key, const char *ext)
 int spec_prepared_text(const char *path, const char *human, size_t human_n, char **text, size_t *n,
                        char key[65]) {
     (void)path;
+    cache_perms_fix();
     if (!needs_prepare()) return 0;
     if (prepare_key(human, human_n, key) != 0) return 0;
     char pp[PATH_MAX + 80];
@@ -417,7 +462,7 @@ static int hook_run(const struct plugin *pl, const struct plugin_prog *p, const 
         if (have_key) {
             char sub[PATH_MAX + 16];
             snprintf(sub, sizeof(sub), "%s/%s", cdir, pl->id);
-            if (pu_mkdir_p(sub) == 0) pu_write_atomic(cfile, *stdout_txt, strlen(*stdout_txt), 0644);
+            if (cache_mkdir(sub) == 0) pu_write_atomic(cfile, *stdout_txt, strlen(*stdout_txt), 0600);
         }
         hrun_free(&r);
         return 0;
@@ -977,6 +1022,7 @@ int spec_prepare(const char *path, struct err *e) {
 }
 
 static int spec_prepare_inner(const char *path, struct err *e) {
+    cache_perms_fix();
     if (!needs_prepare()) return 0;
     char *human = NULL;
     size_t hn = 0;
@@ -1124,7 +1170,7 @@ static int spec_prepare_inner(const char *path, struct err *e) {
         char cdir[PATH_MAX], pdir[PATH_MAX + 16];
         cache_dir(cdir, sizeof(cdir));
         snprintf(pdir, sizeof(pdir), "%s/prepared", cdir);
-        if (pu_mkdir_p(pdir) != 0 || pu_write_atomic(pp, text, strlen(text), 0644) != 0) {
+        if (cache_mkdir(pdir) != 0 || pu_write_atomic(pp, text, strlen(text), 0600) != 0) {
             err_setf(e, "plugprep.write_failed", "не записать подготовленную спеку в %s: %s", pdir, strerror(errno));
             goto done;
         }
@@ -1152,7 +1198,7 @@ static int spec_prepare_inner(const char *path, struct err *e) {
                   p.rep_expand.p ? p.rep_expand.p : "", p.rep_warn.p ? p.rep_warn.p : "");
         char rp[PATH_MAX + 100];
         prepared_path(rp, sizeof(rp), key, ".report.json");
-        if (!rep.oom && rep.p) pu_write_atomic(rp, rep.p, rep.n, 0644);
+        if (!rep.oom && rep.p) pu_write_atomic(rp, rep.p, rep.n, 0600);
         free(rep.p);
         prune_old(pdir, key);
         if (p.al_changed) pal_save(&p.al);

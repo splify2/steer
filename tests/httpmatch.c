@@ -444,6 +444,9 @@ int main(void) {
         check("тело в файл (40 МиБ)", 0, http_get(&q, &r, why, sizeof why));
         struct stat st;
         check("  размер файла", 40 << 20, stat(fp, &st) == 0 ? (long)st.st_size : -1);
+        /* Тело подписки — ссылки узлов с UUID и паролями: файл только владельцу, и прежний 0644 — тоже. */
+        check("  файл тела создан 0600", 0600, (long)(st.st_mode & 0777));
+        chmod(fp, 0644);
         http_resp_free(&r);
         /* Файл и колбэк разом. */
         struct acc cnt = {0};
@@ -452,6 +455,7 @@ int main(void) {
         q.cb_arg = &cnt;
         check("файл и колбэк одновременно", 0, http_get(&q, &r, why, sizeof why));
         check("  файл усечён и перезаписан (11 байт)", 11, stat(fp, &st) == 0 ? (long)st.st_size : -1);
+        check("  существовавшему 0644 права исправлены на 0600", 0600, (long)(st.st_mode & 0777));
         check("  колбэк видел те же 11", 11, (long)cnt.cnt);
         http_resp_free(&r);
         /* Обрыв — файл не остаётся. */
