@@ -138,7 +138,8 @@ static void sockets_used(unsigned char *used /* 65536 */) {
     }
 }
 
-#define PORT_FIRST  10480
+/* Порты — от PLUGIN_PORT_FIRST (marks.h: там же объяснено, почему fw4 принимает перенаправленное к ним). */
+#define PORT_FIRST  PLUGIN_PORT_FIRST
 #define QUEUE_FIRST 4300
 
 /* Выдать выходу owner n портов и m очередей (сколько уже есть — остаётся). 0 — готово; -1 — отказ,

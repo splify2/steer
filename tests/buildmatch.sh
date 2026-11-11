@@ -604,6 +604,18 @@ check "в keep.d только абсолютные пути" "0" "$(grep -cv '^/
 #
 # `find` в sysupgrade рекурсивен по каталогу из keep.d, поэтому одна строка `.../lists/custom`
 # берёт свои списки и НЕ берёт лежащие рядом файлы издателя — исключений выражать не нужно.
+# Включение fw4: ряд перенаправленных портов покрывает и слушатели туннелей (TCP_PORT_BASE), и всё, что
+# распорядитель выдаёт плагинам (PLUGIN_PORT_FIRST и выше, до 65535), — src/model/marks.h. Перечень
+# 9480-9734 отставал от распорядителя (порты плагинов от 10480). Поведение — tests/fwinclude.sh (docker).
+FWINC=files/usr/share/nftables.d/chain-pre/input/30-steer.nft
+fw_lo="$(sed -n 's/^#define STEER_REDIR_PORT_FIRST \([A-Z_0-9]*\)$/\1/p' src/model/marks.h)"
+fw_tcp="$(sed -n 's/^#define TCP_PORT_BASE \([0-9]*\)$/\1/p' src/model/marks.h)"
+fw_plug="$(sed -n 's/^#define PLUGIN_PORT_FIRST \([0-9]*\)$/\1/p' src/model/marks.h)"
+check "marks.h: нижняя граница ряда fw4 — TCP_PORT_BASE ($fw_tcp), порты плагинов от $fw_plug выше неё" "TCP_PORT_BASE 1" \
+    "$fw_lo $([ "${fw_plug:-0}" -ge "${fw_tcp:-99999}" ] && echo 1 || echo 0)"
+check "plugalloc.c берёт PORT_FIRST из PLUGIN_PORT_FIRST" "1" "$(grep -c '^#define PORT_FIRST  PLUGIN_PORT_FIRST$' src/kinds/plugalloc.c)"
+check "включение fw4 принимает перенаправленное к $fw_tcp-65535 (TCP и UDP)" "1" \
+    "$(grep -c "^ct status dnat meta l4proto { tcp, udp } th dport $fw_tcp-65535 accept" "$FWINC")"
 check "keep.d не тащит каталог списков издателя" "0" \
     "$(grep -cx '/etc/steer/lists' "$KEEP")"
 check "и не тащит его файлы поимённо" "0" \
