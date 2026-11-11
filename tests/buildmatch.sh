@@ -619,6 +619,13 @@ check "install.sh берёт готовый бинарник, если он ря
     "$(grep -c 'if \[ -x "\$here/steer" \]' server/install.sh)"
 check "build.sh кладёт архив steer-obfs в out" "1" \
     "$(grep -c 'tar -C build -czf "\$OUT/steer-obfs' build.sh)"
+# С 2.1 obfs-server — команда программы плагина obfs, а не ядра: архив из steerd-<арх> и установка из
+# исходников через `make all` (build/steer — клиент сокета) отвечали «нет такой команды». Поведение
+# проверяет tests/obfsserver.sh, здесь — что источник не откатился к ядру.
+check "архив steer-obfs — из программы плагина obfs (PROFILE_plug_obfs), а не из steerd" "1 0" \
+    "$(grep -c 'OBFS_SRV_SRC="\$(profile_var PROFILE_plug_obfs)"' build.sh) $(grep -c 'bin="build/steerd-\$arch"' build.sh)"
+check "install.sh из исходников собирает make obfs-server" "1 0" \
+    "$(grep -c 'make -C "\$root" -s obfs-server' server/install.sh) $(grep -c 'make -C "\$root" -s all' server/install.sh)"
 
 # Каждое слово в профилях обязано быть существующим файлом .c.
 #

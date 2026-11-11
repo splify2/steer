@@ -1,15 +1,18 @@
 #!/bin/sh
 # Серверная половина «WireGuard поверх TCP»: сборка, юнит, запуск.
 #
-# Ставится на VPS рядом с WireGuard. Собирается системным cc из тех же исходников, что и
-# движок на роутере: внешних зависимостей у базовой сборки нет вовсе, поэтому скачивать
-# готовый бинарник (и гадать про libc целевой системы) незачем.
+# Ставится на VPS рядом с WireGuard. Бинарник — программа плагина obfs (её команда obfs-server), та же,
+# что у плагина на роутере; из исходников собирается системным cc (`make obfs-server`): внешних
+# зависимостей у неё нет вовсе, поэтому скачивать готовый бинарник (и гадать про libc) незачем.
 #
 # Идемпотентен: повторный запуск обновляет бинарник и настройки на месте.
 set -e
 
 PORT=4567
 FORWARD=127.0.0.1:51820
+# DESTDIR — корень для файлов вместо / (стенд tests/obfsserver.sh): с ним установщик не требует root и
+# не трогает systemd, а пишет бинарник, настройки и юнит под DESTDIR.
+DESTDIR="${DESTDIR:-}"
 PREFIX=/usr/local/sbin
 ENVFILE=/etc/default/steer-obfs
 UNIT=/etc/systemd/system/steer-obfs.service
@@ -33,7 +36,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ "$(id -u)" = 0 ] || { echo "нужны права root"; exit 1; }
+[ -n "$DESTDIR" ] || [ "$(id -u)" = 0 ] || { echo "нужны права root"; exit 1; }
 
 # Запускается из корня репозитория или из server/ — определяемся по своему пути, а не по
 # текущему каталогу: «сработало у меня» из-за cd — не то свойство, которое нужно установщику.
@@ -59,7 +62,9 @@ else
         exit 1
     }
     command -v cc >/dev/null 2>&1 || { echo "нужен компилятор: apt install build-essential"; exit 1; }
-    BIN="$root/build/steer"
+    # Не `make all`: build/steer — клиент сокета ядра, а ядро steerd с 2.1 команды obfs-server не несёт —
+    # она у программы плагина obfs (Makefile, цель obfs-server).
+    BIN="$root/build/obfs-server"
 fi
 
 command -v nft >/dev/null 2>&1 || cat <<'EOF'
@@ -68,22 +73,28 @@ command -v nft >/dev/null 2>&1 || cat <<'EOF'
   iptables -I OUTPUT -p tcp --sport ПОРТ --tcp-flags RST RST -j DROP
 EOF
 
-if [ "$BIN" = "$root/build/steer" ]; then
-    echo "собираю ядро…"
-    make -C "$root" -s all
+if [ "$BIN" = "$root/build/obfs-server" ]; then
+    echo "собираю obfs-server…"
+    make -C "$root" -s obfs-server
 fi
+# Команду спрашиваем до установки: бинарник без obfs-server (так было с архивом из ядра) иначе встал бы
+# юнитом, который падает раз в три секунды с «нет такой команды».
+"$BIN" obfs-server --help >/dev/null 2>&1 || {
+    echo "$BIN не отвечает на obfs-server --help — это не сервер обфускации, ставить нечего"
+    exit 1
+}
 
-install -d "$PREFIX"
-install -m 0755 "$BIN" "$PREFIX/steer"
+install -d "$DESTDIR$PREFIX" "$DESTDIR$(dirname "$ENVFILE")" "$DESTDIR$(dirname "$UNIT")"
+install -m 0755 "$BIN" "$DESTDIR$PREFIX/steer"
 
-cat > "$ENVFILE" <<EOF
+cat > "$DESTDIR$ENVFILE" <<EOF
 # Настройки серверной половины обфускации. Меняются здесь, а не в юните:
 # systemctl edit не понадобится, а обновление установщиком юнит перезапишет.
 OBFS_PORT=$PORT
 OBFS_FORWARD=$FORWARD
 EOF
 
-cat > "$UNIT" <<EOF
+cat > "$DESTDIR$UNIT" <<EOF
 [Unit]
 Description=steer obfs — WireGuard поверх поддельного TCP (серверная половина)
 # После сети: сырой сокет выбирает маршрут при первом же ответе клиенту.
@@ -110,6 +121,10 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+if [ -n "$DESTDIR" ]; then
+    echo "DESTDIR=$DESTDIR: файлы разложены, systemd не тронут"
+    exit 0
+fi
 systemctl daemon-reload
 systemctl enable --now steer-obfs
 systemctl restart steer-obfs
