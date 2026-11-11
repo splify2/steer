@@ -31,6 +31,9 @@
 #include <sys/socket.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/pkt_sched.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
@@ -127,6 +130,59 @@ static int queue_rx_gso(int fd) {
     return ioctl(fd, TUNSETOFFLOAD, feat) == 0 ? 0 : -1;
 }
 
+/* Корневая дисциплина очереди устройства — noqueue.
+ *
+ * ЗАЧЕМ. Устройству с IFF_MULTI_QUEUE ядро заводит 256 очередей передачи (MAX_TAP_QUEUES) — столько, сколько
+ * устройство может иметь, а не сколько мы открыли, — и корнем ставит mq: по своей дисциплине на КАЖДУЮ из 256.
+ * Дисциплина по умолчанию (fq_codel на OpenWrt, pfifo_fast на прочих) держит память, размер которой задаёт
+ * txqueuelen, а его стек поднимает до 4096 (tun_bring_up): выходит около 100 КиБ на очередь, 25 МиБ невозвратной
+ * памяти ядра на одно устройство туннеля. Замер на стенде (OpenWrt 25.12, ядро 6.12): SUnreclaim 19,9 МиБ без
+ * туннеля, 44,6 с одним; с noqueue — 19,9. На роутере с 256 МиБ три туннеля забирали треть памяти.
+ *
+ * ЧТО ТЕРЯЕТСЯ: ничего. Дисциплина копит пакеты, только когда устройство останавливает очередь, а TUN её не
+ * останавливает никогда: tun_net_xmit кладёт пакет в кольцо очереди (его размер — тот же txqueuelen, оно и даёт
+ * запас на пики) и при полном кольце отбрасывает сам. Дисциплина перед ним — пустой проход.
+ *
+ * Ставится ДО подъёма устройства: дисциплины по умолчанию ядро заводит при подъёме, и с уже назначенным корнем
+ * не заводит вовсе. Отказ — не отказ туннеля: остаётся дисциплина ядра и её память. */
+static void queue_noqueue(const char *name) {
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (s < 0) return;
+    int err = errno = 0;
+    if (ioctl(s, SIOCGIFINDEX, &ifr) != 0) { err = errno; goto out; }
+    struct {
+        struct nlmsghdr h;
+        struct tcmsg t;
+        char attr[RTA_SPACE(8)];
+    } m;
+    memset(&m, 0, sizeof(m));
+    m.h.nlmsg_type = RTM_NEWQDISC;
+    m.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
+    m.h.nlmsg_len = NLMSG_LENGTH(sizeof(m.t));
+    m.t.tcm_family = AF_UNSPEC;
+    m.t.tcm_ifindex = ifr.ifr_ifindex;
+    m.t.tcm_parent = TC_H_ROOT;
+    struct rtattr *a = (struct rtattr *)((char *)&m + NLMSG_ALIGN(m.h.nlmsg_len));
+    a->rta_type = TCA_KIND;
+    a->rta_len = RTA_LENGTH(8);
+    memcpy(RTA_DATA(a), "noqueue", 8);
+    m.h.nlmsg_len = NLMSG_ALIGN(m.h.nlmsg_len) + RTA_ALIGN(a->rta_len);
+    struct sockaddr_nl k = { .nl_family = AF_NETLINK };
+    if (sendto(s, &m, m.h.nlmsg_len, 0, (struct sockaddr *)&k, sizeof(k)) < 0) { err = errno; goto out; }
+    struct { struct nlmsghdr h; struct nlmsgerr e; char pad[256]; } r;
+    ssize_t n = recv(s, &r, sizeof(r), 0);
+    if (n < (ssize_t)NLMSG_LENGTH(sizeof(struct nlmsgerr)) || r.h.nlmsg_type != NLMSG_ERROR) err = EIO;
+    else err = -r.e.error;
+out:
+    close(s);
+    if (err)
+        fprintf(stderr, "steer[info] tunnel: %s: дисциплина очереди осталась ядерной (%s) — на каждую из очередей "
+                        "устройства ядро держит свою память\n", name, strerror(err));
+}
+
 int tun_adopt_fd(struct tun_dev *d, int fd) {
     int copy = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (copy < 0) {
@@ -216,6 +272,7 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
                 n++;
             }
         }
+        queue_noqueue(name);
         return n;
     }
     /* Ни один набор флагов не подошёл. Молча вернуть код нельзя: он доходил до человека
