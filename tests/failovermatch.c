@@ -1870,6 +1870,46 @@ int main(void) {
             snprintf(path, sizeof(path), "%s/%s", g_dir, names[i]);
             unlink(path);
         }
+        /* Группа из туннелей, записанная в спеке РАНЬШЕ членов: устройство она наследует от первого члена, а порт
+         * слушателя — только у члена. Карта перенаправления TCP обязана вести и метку группы, и метку члена в порт
+         * ЧЛЕНА; пока группа попадала в таблицу «устройство → порт», побеждала она, и TCP шёл в порт без слушателя. */
+        {
+            outs_reset();
+            g_spec.out_n = 3;
+            struct output *g = &g_spec.out[0], *m1 = &g_spec.out[1], *m2 = &g_spec.out[2];
+            snprintf(g->name, sizeof(g->name), "%s", "zm_vpn");
+            g->kind = OUT_GROUP;
+            g->mark = 0x100000;
+            g->on_fail = FAIL_DROP;
+            group_cfg_init(&g->grp);
+            g->grp.pick = PICK_MANUAL;
+            snprintf(m1->name, sizeof(m1->name), "%s", "zmv_vless");
+            m1->kind = OUT_VLESS;
+            m1->mark = 0x200000;
+            snprintf(m1->device, sizeof(m1->device), "%s", "zmv_vless");
+            snprintf(m2->name, sizeof(m2->name), "%s", "zmv_hy2");
+            m2->kind = OUT_VLESS;
+            m2->mark = 0x300000;
+            snprintf(m2->device, sizeof(m2->device), "%s", "zmv_hy2");
+            struct err ge = {0};
+            if (group_members_alloc(&g_spec, &g->grp, 2) != 0) { perror("group_members_alloc"); exit(1); }
+            g->grp.members[g->grp.members_n++] = 1;
+            g->grp.members[g->grp.members_n++] = 2;
+            if (group_seal(&g_spec, g, &ge) != 0) { fprintf(stderr, "группа раньше членов: %s\n", ge.msg); exit(1); }
+            /* Что у группы в живой спеке: устройство несущего члена и способности членов (так её видит демон). */
+            snprintf(g->device, sizeof(g->device), "%s", "zmv_vless");
+            g->grp.caps = kind_t_vless.caps;
+            check("  у группы устройство члена и способность перенаправления (условие дефекта)",
+                  !strcmp(g->device, "zmv_vless") && out_has_cap(g, KC_TCP_REDIR) && group_named(&g->grp), 1);
+            tcp_redir_learn(&g_spec);
+            check("группа раньше членов: порт устройства первого члена — порт члена, а не группы",
+                  tcp_redir_port_of("zmv_vless"), out_tcp_port(m1));
+            check("  порт члена и порт группы различны (иначе проверка ничего не ловит)",
+                  out_tcp_port(m1) != out_tcp_port(g), 1);
+            check("  второй член — свой порт", tcp_redir_port_of("zmv_hy2"), out_tcp_port(m2));
+            outs_reset();
+            tcp_redir_learn(&g_spec);
+        }
         rmdir(g_dir);
         steer_set_state_dir("/tmp");
         if (g_fail) {

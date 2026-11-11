@@ -852,16 +852,27 @@ static void rel_note(unsigned mark, int port) {
     g_rel[g_rel_n++] = (struct redir_el){ mark, port };
 }
 
+/* Выход, чей модуль слушает порт: у него своё устройство и свой слушатель. ГРУППА сюда не входит: способность
+ * KC_TCP_REDIR и имя устройства она наследует от членов (устройство — первого члена, group.c), а порт из её
+ * собственной метки не слушает никто. Пока группа попадала в таблицу, записанная в спеке раньше членов она
+ * отвечала на поиск по устройству первой — и метки группы и её члена вели на её порт: TCP клиентов получал
+ * отказ, а reload и restart ничего не меняли (спека из подписки с vless и hysteria2, группа первой). */
+static int redir_owner(const struct output *o) {
+    const struct group_cfg *g = out_group(o);
+    if (g && group_named(g)) return 0;
+    return o->mark && o->device[0] && out_has_cap(o, KC_TCP_REDIR);
+}
+
 void tcp_redir_learn(const struct spec *sp) {
     size_t n = 0;
     for (size_t i = 0; i < sp->out_n; i++)
-        if (sp->out[i].mark && sp->out[i].device[0] && out_has_cap(&sp->out[i], KC_TCP_REDIR)) n++;
+        if (redir_owner(&sp->out[i])) n++;
     struct redir_dev *v = n ? calloc(n, sizeof(*v)) : NULL;
     if (n && !v) return;                /* прежняя таблица остаётся: лучше старое, чем ничего */
     size_t k = 0;
     for (size_t i = 0; i < sp->out_n && k < n; i++) {
         const struct output *o = &sp->out[i];
-        if (!o->mark || !o->device[0] || !out_has_cap(o, KC_TCP_REDIR)) continue;
+        if (!redir_owner(o)) continue;
         snprintf(v[k].dev, sizeof(v[k].dev), "%s", o->device);
         v[k].port = out_tcp_port(o);
         k++;
@@ -876,6 +887,8 @@ static int redir_port(const char *dev) {
         if (!strcmp(g_redir[i].dev, dev)) return g_redir[i].port;
     return 0;
 }
+
+int tcp_redir_port_of(const char *dev) { return redir_port(dev); }
 
 /* Элемент выхода o — под таблицу, привязанную к dev (NULL — к запрету или пустая). Без выходов с
  * KC_TCP_REDIR в спеке карты нет, и nft не зовётся вовсе. Замена — одной транзакцией (delete и

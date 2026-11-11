@@ -331,6 +331,10 @@ static inline int conn_cfd(const struct conn *c) { return c->cfd1 - 1; }
 /* Порт слушателя TCP модуля (R-152); 0 — слушателя нет, TCP приходит пакетами через TUN. Задаётся до
  * запуска рабочих (out_tcp_port выхода, стенды — STEER_TUN_TCPPORT), дальше только читается. */
 static int g_kport;
+/* Метка выхода с перенаправлением TCP (0 — выход без него): по ней, а не через устройство, ходят соединения
+ * самого процесса, которым нужен путь трафика выхода (проверка страны, geo.c). Ставится там же, где g_kport. */
+static uint32_t g_kmark;
+uint32_t stack_redir_mark(void) { return g_kmark; }
 /* Слушатель рабочего 0 — открыт в stack_run ДО сообщения up: демон по up ставит перенаправление, и
  * соединение, пришедшее раньше рабочих, ждёт в очереди этого слушателя, а не получает сброс. */
 static int g_lfd0 = -1;
@@ -4614,6 +4618,7 @@ static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack
      * элемент карты перенаправления; STEER_TUN_TCPPORT — для стендов без демона. */
     stack_nofile_raise();
     if (o->mark) g_kport = o->tcp_port;
+    if (o->mark && o->tcp_port) g_kmark = o->mark;
     if (getenv("STEER_TUN_TCPPORT")) {
         int pt = atoi(getenv("STEER_TUN_TCPPORT"));
         if (pt > 0 && pt < 65536) g_kport = pt;

@@ -1479,6 +1479,8 @@ void bind_device(struct output *o, const char *dev);
  * вернуть элементы в карту только что загруженного набора правил. Всё — в failover.c. */
 void tcp_redir_learn(const struct spec *sp);
 void tcp_redir_sync(const struct output *o, const char *dev);
+/* Порт слушателя модуля, чьё устройство — dev (0 — такого нет): то, чем tcp_redir_sync заполняет карту. Для стенда. */
+int tcp_redir_port_of(const char *dev);
 void tcp_redir_after_load(const struct spec *sp);
 /* Модуль устройства dev вышел — снять элементы, ведущие к его слушателю (supd.c, child_cb). */
 void tcp_redir_dev_gone(const char *dev);
