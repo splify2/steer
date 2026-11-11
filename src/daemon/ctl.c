@@ -3494,7 +3494,7 @@ static void srv_kcheck(void *arg) {
          * чинить, в общем счёте починок. Таблица есть (отвергнут новый набор, стоит прежний) —
          * трогать нечего. */
         if (!s->d.have || nfd_table_exists(NFD_INET, nft_table()) || !srv_table_flushed(s)) return;
-        why = "движок включён и спека есть, а набора правил в ядре Linux нет";
+        why = "ядро steer включено и спека есть, а набора правил в ядре Linux нет";
         drift = 1;
     } else {
         drift = recon_kernel_drift(&s->rec, &why);

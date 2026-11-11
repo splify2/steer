@@ -64,8 +64,9 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
     for (size_t i = 0; i < g_dch_n; i++) {
         const struct dchan *c = &g_dch[i];
         /* family — по факту (1.9, IPv6): «46», когда у доменной группы есть половина IPv6
-         * (dom6_ok — парный набор «<set>6» и v6-двойник у компилятора) и спека не v1, иначе
-         * «4» (решает dch_fam, table.c). */
+         * (dom6_ok — парный набор «<set>6» и v6-двойник у компилятора), «6» или «4» по политике
+         * семейства правила (family); спека v1 с 2.1 решается так же, как v2 с теми же каналами
+         * (решает dch_fam, table.c; docs/contract-v1.md, «ответ на AAAA»). */
         /* Режим: 0 — fake-IP, 1 — real-ip, 2 — блок (пустой адрес в ответ, kinds/block.c). */
         fprintf(out, "%s|%s|%d|%s|", c->set, c->out, c->block ? 2 : c->realip ? 1 : 0,
                 (c->fam & DCH_V6) ? ((c->fam & DCH_V4) ? "46" : "6") : "4");

@@ -558,7 +558,7 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             int lr = v1_plugin_kind(s, &o, kind, &k, e);
             if (lr < 0) return -1;
             if (lr) return err_set(e, "outputs.%s: неизвестный kind "
-                       "(нужен direct, interface, vless, xsteer, tgws или awg)", o.name);
+                       "(нужен direct, interface, awg, block, vless, xsteer или tgws)", o.name);
             kd = o.kind;
             legacy = 1;
         }
