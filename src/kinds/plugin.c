@@ -9,7 +9,8 @@
  *
  * НИЧЕГО ЗАШИТОГО. Перечня видов плагинов в ядре нет: вид приходит из манифеста вместе со схемой,
  * свойствами, помощником и шаблонами. Какой плагин даёт вид, которого нет, ядро узнаёт из индекса семени
- * (provides.kinds, seed_kind_plugin), а не из своего списка.
+ * (provides.kinds, seed_kind_plugin), а для официальных плагинов вне семени (tgws) — из таблицы
+ * offkinds.h, порождённой из манифестов дерева при сборке: это только имя плагина для отказа, а не вид.
  *
  * ОТКАЗЫ НЕ ВАЛЯТ РЕЕСТР. Манифест, который не читается, несовместим по steer-api, конфликтует по
  * имени или назван в state.json отключённым, превращает свой плагин в выключенный с причиной
@@ -38,6 +39,7 @@
 #include "plugutil.h"
 #include "module.h"
 #include "ynode.h"
+#include "offkinds.h"
 #include "ir.h"
 #include "marks.h"
 #include "jsonw.h"
@@ -987,9 +989,9 @@ const struct plugin_cmd *plugin_cmd_find(const char *name) {
 }
 
 /* Какой плагин даёт вид, которого нет: индекс семени (steer-core кладёт его в /usr/share/steer/seed,
- * STEER_PLUGIN_SEED — стендам), поле provides.kinds версий (plugin-sdk/docs/index.md). Своего перечня
- * «вид → плагин» у ядра нет: имя плагина приходит из индекса, как и сам плагин. id — в куче (free);
- * NULL — индекса нет или вид в нём не назван. */
+ * STEER_PLUGIN_SEED — стендам), поле provides.kinds версий (plugin-sdk/docs/index.md). Свой перечень
+ * «вид → плагин» у ядра — только порождённый из манифестов дерева (offkinds.h) и только для официальных
+ * плагинов, которых в семени нет. id — в куче (free); NULL — индекса нет или вид в нём не назван. */
 static char *seed_kind_plugin(const char *kind) {
     const char *dir = getenv("STEER_PLUGIN_SEED");
     char path[PATH_MAX];
@@ -1028,6 +1030,10 @@ const char *plugin_kind_why(const char *name, char *buf, size_t n, const char **
                 return buf;
             }
     char *sid = seed_kind_plugin(name);
+    /* Официальный плагин вне семени (tgws — из репозитория splify2-extended-plugins): вид всё равно
+     * чей-то, а не описка. Без этого выход моста без плагина рушил спеку целиком — при старте демона
+     * тоже, и после перехода с 2.0.x (стоял пакет steer-tgws) роутер оставался вовсе без правил. */
+    if (!sid && official_kind_plugin(name)) sid = strdup(official_kind_plugin(name));
     if (!sid) return NULL;
     /* id — строка реестра, если плагин стоит; иначе — своя копия на время процесса (её отдают вызывающим). */
     const struct plugin *p = plugin_find(sid);

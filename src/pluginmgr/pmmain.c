@@ -1098,13 +1098,24 @@ static int cmd_migrate(struct pm_ctx *x) {
     if (!have_spec && !have_mj)
         for (size_t i = 0; i < ynode_len(plugins); i++)
             if (yn_bool(ynode_val_at(plugins, i), "default", 0)) idset_add(&want, ynode_key_at(plugins, i)->str);
-    /* Только то, что есть в индексе семени (tgws и прочие пакеты — не наши). */
+    /* Только то, что есть в индексе семени. Плагин, которого выходам спеки не хватает, а в семени нет
+     * (tgws — из репозитория splify2-extended-plugins), migrate не ставит и неудачей не считает: переход
+     * идёт из postinst, без сети, и не должен от неё зависеть. Выход такого вида при старте демона
+     * недоступен и живёт по on_fail, остальная спека применяется; человеку — что сделать. */
     struct pm_result all = {0};
     char **present = NULL;
     size_t np = 0, nfail = 0;
-    struct idset bad = {0};
+    struct idset bad = {0}, absent = {0};
     for (size_t i = 0; i < want.n; i++) {
-        if (!ynode_get(plugins, want.v[i])) continue;
+        if (!ynode_get(plugins, want.v[i])) {
+            const struct pm_inst *pi = pm_state_find(&x->st, want.v[i]);
+            if (!pi || !pi->version) {
+                idset_add(&absent, want.v[i]);
+                fprintf(stderr, "плагина %s в семени нет: выход с его видом недоступен, пока плагин не поставлен — "
+                        "поставьте плагин %s (steer plugin install %s, нужна сеть)\n", want.v[i], want.v[i], want.v[i]);
+            }
+            continue;
+        }
         struct pm_err ee = {0};
         if (ensure_one(x, want.v[i], &all, &present, &np, &ee) != 0) {
             char *m = pm_fmt("%s: %s", want.v[i], ee.msg);
@@ -1120,6 +1131,8 @@ static int cmd_migrate(struct pm_ctx *x) {
     } else {
         emit_result(x, &all, "present", present, np);
     }
+    for (size_t i = 0; i < absent.n; i++) free(absent.v[i]);
+    free(absent.v);
     if (have_mj && !nfail) {
         char *dn = pm_path(pm_etc(), "migrate.done.json");
         rename(mj, dn);

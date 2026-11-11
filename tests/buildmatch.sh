@@ -132,6 +132,14 @@ check "sources.mk: манифесты вкомпилированных плаг�
     "$(for p in base extended server android; do missing_in "$p" "$(profile_var PKEMBED_SRC)" | grep -q . || printf '%s' "$p"; done)"
 check "src/plugkit/pkembed.c — плод build/pkembed.sh из plugins/ (не устарел)" "" \
     "$(sh build/pkembed.sh | cmp -s - src/plugkit/pkembed.c || echo 'устарел: sh build/pkembed.sh > src/plugkit/pkembed.c')"
+# Таблица видов официальных плагинов (вид без плагина — «нужен плагин <id>», а не «неизвестный kind», и для
+# плагинов вне семени, как tgws) — из тех же манифестов; без python3 генератор не запускается.
+if command -v python3 >/dev/null 2>&1; then
+    check "src/kinds/offkinds.h — плод build/offkinds.sh из plugins/ (не устарел)" "" \
+        "$(sh build/offkinds.sh | cmp -s - src/kinds/offkinds.h || echo 'устарел: sh build/offkinds.sh > src/kinds/offkinds.h')"
+else
+    echo "buildmatch: нет python3 — src/kinds/offkinds.h не сверен (ПРОПУСК)"
+fi
 check "вкомпилированы манифесты ровно тех плагинов, чьи программы вкомпилированы" "$(profile_var PLUGINS_EMBED)" \
     "$(for f in $(profile_var PK_STATIC_SRC); do sed -n 's/^PK_PROGRAM("\([a-z0-9]*\)".*/\1/p' "$f"; done | tr '\n' ' ' | sed 's/ $//')"
 

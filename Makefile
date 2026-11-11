@@ -858,7 +858,7 @@ $(BUILD)/evmatch: tests/evmatch.c src/lib/evline.c src/lib/evline.h src/lib/json
 
 # Виды ядра под impl: core и плагины выходов спеки для `steer plugin migrate` (src/pluginmgr/pmkind.c):
 # модуль менеджера без менеджера вокруг — только ynode; стенд читает манифесты plugins/<id>/plugin.json.
-$(BUILD)/pmkindmatch: tests/pmkindmatch.c tests/unit.h src/pluginmgr/pmkind.c src/pluginmgr/pmkind.h $(YAML_SRC) \
+$(BUILD)/pmkindmatch: tests/pmkindmatch.c tests/unit.h src/pluginmgr/pmkind.c src/pluginmgr/pmkind.h src/kinds/offkinds.h $(YAML_SRC) \
                       src/lib/ynode.h src/lib/err.c src/lib/err.h $(wildcard plugins/*/plugin.json)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/pmkindmatch.c src/pluginmgr/pmkind.c $(YAML_SRC) src/lib/err.c

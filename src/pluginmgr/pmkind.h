@@ -18,7 +18,8 @@ int pm_core_ext_kind(const char *name);
 
 /* Плагины, которых требуют выходы спеки (текст YAML или JSON, buf длиной n; name — для сообщений):
  * add(arg, id) на каждый, повторы возможны. plugins — раздел plugins индекса семени (provides.kinds);
- * NULL — только правила перечня. Возврат: 0; -1 — спека не разобралась (ничего не добавлено). */
+ * NULL — только правила перечня и таблица видов официальных плагинов (offkinds.h). Плагин вида, которого
+ * в семени нет (tgws), тоже добавляется: решать, откуда его ставить, — вызывающему. Возврат: 0; -1 — спека не разобралась (ничего не добавлено). */
 int pm_spec_plugins(const char *buf, size_t n, const char *name, const struct ynode *plugins,
                     void (*add)(void *arg, const char *id), void *arg);
 

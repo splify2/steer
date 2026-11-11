@@ -682,6 +682,16 @@ check "  готовый переход: migrate.done.json есть, migrate.json
     "$([ -f etc/migrate.done.json ] && echo yes || echo no) $([ -f etc/migrate.json ] && echo yes || echo no)"
 o="$(STEER_SPEC="$T/mspec.yaml" P migrate --json 2>/dev/null)"
 check "повторный migrate ничего не ставит" "[] ['foo', 'net1']" "$(printf '%s\n' "$o" | jq_ 'str(d["installed"])+" "+str(d["present"])')"
+# Выход вида официального плагина, которого в семени нет (tgws — из репозитория splify2-extended-plugins): migrate
+# его не ставит (переход идёт без сети), неудачей не считает и говорит, что сделать; переход завершается.
+printf 'version: 2\noutputs:\n  d: { kind: direct }\n  tg: { kind: tgws, domain: ex.co.uk, on_fail: drop }\n' > mspec_tg.yaml
+printf '{"packages":["steer-tgws"]}\n' > etc/migrate.json
+o="$(STEER_SPEC="$T/mspec_tg.yaml" P migrate --json 2>err.txt)"; rc=$?
+check "migrate: выход tgws без плагина в семени — не неудача, ставить нечего" "0 []" \
+    "$rc $(printf '%s\n' "$o" | jq_ 'str(d["installed"])')"
+check "  и говорит, что сделать" "1" "$(grep -c 'поставьте плагин tgws (steer plugin install tgws, нужна сеть)' err.txt)"
+check "  переход завершён" "yes no" \
+    "$([ -f etc/migrate.done.json ] && echo yes || echo no) $([ -f etc/migrate.json ] && echo yes || echo no)"
 # migrate обновляет стоящие плагины из семени: версия семени выше стоящей — ставится (net1 1.2.0 → 1.3.0), та же —
 # нет; плагин из чужого репозитория не трогается.
 mk net1 1.3.0 ''
