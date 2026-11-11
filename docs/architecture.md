@@ -32,7 +32,8 @@ xsteer — [docs/xsteer.md](xsteer.md).
 `/usr/share/steer/seed`; своего списка «вид → плагин» у ядра нет), а при `apply` — отказ с той же причиной;
 команды протоколов без плагина — «нет такой команды». Модулей ядра нет: мост Telegram — тоже плагин
 (`tgws`, вид `tgws`, исходник — `plugins/tgws`, `src/modules/main_tgws.c`, `src/proto/tgws`; выпускает его
-репозиторий `splify2-extended-plugins`).
+репозиторий `splify2-extended-plugins`). В индексе семени его нет, поэтому без плагина вид `tgws` ядру
+неизвестен: спека с ним не загружается («неизвестный kind»), а не даёт выход `unavail`.
 
 Экспорт `libsteer.so` — version-script `build/libsteer.map` (только то, что берёт `steerd`;
 порождён из кода `build/libs-exports.sh`, проверка — `make libs-test`), SONAME
