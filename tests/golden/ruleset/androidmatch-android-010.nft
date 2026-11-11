@@ -71,7 +71,7 @@ table inet steer {
         ip6 daddr fdfe:dcba:9876::/96 oifname { "tailscale*", "zt*", "rndis0" } counter drop comment "steer-fakeip-guard"
     }
     chain output_dns {
-        type nat hook output priority dstnat; policy accept;
+        type nat hook output priority -100; policy accept;
         meta mark and 0x0fc00000 != 0x0fc00000 udp dport 53 ct mark set mark counter redirect to :5300 comment "steer-dns-local"
         meta mark and 0x0fc00000 != 0x0fc00000 tcp dport 53 ct mark set mark counter redirect to :5300 comment "steer-dns-local-tcp"
         ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip comment "steer-fakeip-local"

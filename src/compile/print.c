@@ -817,7 +817,9 @@ static void print_elements(FILE *f, const struct nft_set *s) {
 
 static void print_set(FILE *f, const struct nft_set *s) {
     fprintf(f, "%s    %s %s {\n", s->o.gap ? "\n" : "", s->data ? "map" : "set", s->o.name);
-    if (s->data) fprintf(f, "        type %s : %s;\n", s->key, s->data);
+    /* Ключ «typeof …» печатается как есть: тип ключа карты задан выражением, а не именем типа (balance.c). */
+    if (s->data && !strncmp(s->key, "typeof ", 7)) fprintf(f, "        %s : %s;\n", s->key, s->data);
+    else if (s->data) fprintf(f, "        type %s : %s;\n", s->key, s->data);
     else fprintf(f, "        type %s\n", s->key);
     if (s->flags) {
         fprintf(f, "        flags ");

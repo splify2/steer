@@ -611,7 +611,7 @@ if echo "$out" | grep -q 'meta nfproto ipv4 jhash ip daddr mod 120 seed 0x[0-9a-
    echo "$out" | grep -q 'meta nfproto ipv6 jhash ip6 daddr mod 120 seed 0x[0-9a-f]* vmap @balmap_[0-9]* comment "steer-balance:st"' &&
    echo "$out" | grep -q 'meta nfproto ipv4 jhash ip saddr . ip daddr mod 120 seed 0x[0-9a-f]* vmap @balmap_[0-9]* comment "steer-balance:sc"' &&
    echo "$out" | grep -q 'meta nfproto ipv6 jhash ip6 saddr . ip6 daddr mod 120 seed 0x[0-9a-f]* vmap @balmap_[0-9]* comment "steer-balance:sc"' &&
-   ! echo "$out" | grep -q 'numgen'; then ok; else
+   ! echo "$out" | grep -v 'typeof numgen' | grep -q 'numgen'; then ok; else
     bad "by: site/site_client — jhash по обоим семействам, без numgen" "$(echo "$out" | grep -E 'jhash|numgen' | head -n 8)"; fi
 "$BIN" spec convert --spec "$tmp/s.yaml" > "$tmp/by1.yaml" 2>&1
 "$BIN" spec convert --spec "$tmp/by1.yaml" > "$tmp/by2.yaml" 2>&1

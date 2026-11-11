@@ -296,6 +296,14 @@ int ir_rule_has(const struct nft_rule *r, const char *needle) {
 }
 
 void ir_prio_str(const struct nft_chain *c, char *dst, size_t n) {
+    /* `dstnat` на хуке output — ЧИСЛОМ. Имя приоритета nft привязывает к хуку, и nftables 1.0.8 (OpenWrt 23.05)
+     * знает dstnat только на prerouting: «type nat hook output priority dstnat - 1» он отвергал («invalid priority
+     * expression value in this context»), а с ним — весь набор правил, и apply оставлял прежний. Новые nft имя
+     * на output принимают и печатают то же число (-100), так что запись числом верна для всех. */
+    if (c->prio_name && c->hook && !strcmp(c->hook, "output") && !strcmp(c->prio_name, "dstnat")) {
+        snprintf(dst, n, "%d", -100 + c->prio_off);
+        return;
+    }
     if (!c->prio_name) snprintf(dst, n, "%d", c->prio_off);
     else if (c->prio_off > 0) snprintf(dst, n, "%s + %d", c->prio_name, c->prio_off);
     else if (c->prio_off < 0) snprintf(dst, n, "%s - %d", c->prio_name, -c->prio_off);

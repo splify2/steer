@@ -82,7 +82,7 @@ table inet steer {
     }
 
     map balmap_302 {
-        type mark : verdict;
+        typeof numgen inc mod 2 : verdict;
         elements = { 0 : goto mark_300 }
     }
     chain bal_302 {
@@ -102,7 +102,7 @@ table inet steer {
     }
 
     map balmap_303 {
-        type mark : verdict;
+        typeof numgen inc mod 2 : verdict;
         elements = { 0 : goto mark_300 }
     }
     chain bal_303 {
@@ -116,7 +116,7 @@ table inet steer {
     }
 
     map balmap_304 {
-        type mark : verdict;
+        typeof numgen inc mod 2 : verdict;
         elements = { 0 : goto mark_300, 1 : goto mark_300, 2 : goto mark_300, 3 : goto mark_300, 4 : goto mark_300, 5 : goto mark_300, 6 : goto mark_300, 7 : goto mark_300, 8 : goto mark_300, 9 : goto mark_300, 10 : goto mark_300, 11 : goto mark_300, 12 : goto mark_300, 13 : goto mark_300, 14 : goto mark_300, 15 : goto mark_300, 16 : goto mark_300, 17 : goto mark_300, 18 : goto mark_300, 19 : goto mark_300, 20 : goto mark_300, 21 : goto mark_300, 22 : goto mark_300, 23 : goto mark_300, 24 : goto mark_300, 25 : goto mark_300, 26 : goto mark_300, 27 : goto mark_300, 28 : goto mark_300, 29 : goto mark_300, 30 : goto mark_300, 31 : goto mark_300, 32 : goto mark_300, 33 : goto mark_300, 34 : goto mark_300, 35 : goto mark_300, 36 : goto mark_300, 37 : goto mark_300, 38 : goto mark_300, 39 : goto mark_300, 40 : goto mark_300, 41 : goto mark_300, 42 : goto mark_300, 43 : goto mark_300, 44 : goto mark_300, 45 : goto mark_300, 46 : goto mark_300, 47 : goto mark_300, 48 : goto mark_300, 49 : goto mark_300, 50 : goto mark_300, 51 : goto mark_300, 52 : goto mark_300, 53 : goto mark_300, 54 : goto mark_300, 55 : goto mark_300, 56 : goto mark_300, 57 : goto mark_300, 58 : goto mark_300, 59 : goto mark_300, 60 : goto mark_301, 61 : goto mark_301, 62 : goto mark_301, 63 : goto mark_301, 64 : goto mark_301, 65 : goto mark_301, 66 : goto mark_301, 67 : goto mark_301, 68 : goto mark_301, 69 : goto mark_301, 70 : goto mark_301, 71 : goto mark_301, 72 : goto mark_301, 73 : goto mark_301, 74 : goto mark_301, 75 : goto mark_301, 76 : goto mark_301, 77 : goto mark_301, 78 : goto mark_301, 79 : goto mark_301, 80 : goto mark_301, 81 : goto mark_301, 82 : goto mark_301, 83 : goto mark_301, 84 : goto mark_301, 85 : goto mark_301, 86 : goto mark_301, 87 : goto mark_301, 88 : goto mark_301, 89 : goto mark_301, 90 : goto mark_301, 91 : goto mark_301, 92 : goto mark_301, 93 : goto mark_301, 94 : goto mark_301, 95 : goto mark_301, 96 : goto mark_301, 97 : goto mark_301, 98 : goto mark_301, 99 : goto mark_301, 100 : goto mark_301, 101 : goto mark_301, 102 : goto mark_301, 103 : goto mark_301, 104 : goto mark_301, 105 : goto mark_301, 106 : goto mark_301, 107 : goto mark_301, 108 : goto mark_301, 109 : goto mark_301, 110 : goto mark_301, 111 : goto mark_301, 112 : goto mark_301, 113 : goto mark_301, 114 : goto mark_301, 115 : goto mark_301, 116 : goto mark_301, 117 : goto mark_301, 118 : goto mark_301, 119 : goto mark_301 }
     }
     chain bal_304 {

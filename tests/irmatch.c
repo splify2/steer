@@ -521,7 +521,7 @@ static void t_balance(void) {
           r && ir_rule_has(r, cm("goto ", bc)) && !ir_expr_find(r, NFT_X_MARKSET) &&
           ir_expr_find(r, NFT_X_COUNTER) != NULL);
     const struct nft_set *m = ir_set_find(t, bm);
-    check_str("карта: type mark : verdict", "mark verdict",
+    check_str("карта: ключ — тип выражения поиска (numgen, jhash), значение — verdict", "typeof numgen inc mod 2 verdict",
               m ? ir_printf(&rs, "%s %s", m->key, m->data ? m->data : "-") : "-");
     check("  слотов 120 — все члены живы", GROUP_BAL_SLOTS, (long)nels(m));
     /* res — order с именованными членами, то есть закрепляющая (group_carded): её слоты ведут в её

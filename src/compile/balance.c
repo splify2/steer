@@ -122,7 +122,12 @@ static void build_one(struct nft_table *t, const struct spec *sp, const struct o
 
     /* Карта: все члены живы. У закрепляющей order/latency — все слоты первому члену (его выбрал бы
      * проход, когда живы все); текущий по факту ставит сверка после загрузки (fog_balance_adopt). */
-    struct nft_set *m = ir_map_add(t, ir_strdup(t->rs, map), "mark", "verdict");
+    /* Ключ карты — ТИП ВЫРАЖЕНИЯ, которое по ней ищет (numgen и jhash дают целое), а не `mark`: nftables 1.0.8
+     * (OpenWrt 23.05) сверяет типы строго и отвергал `numgen … vmap @карта` с ключом mark («datatype mismatch,
+     * map expects packet mark, mapping expression has type integer») — у каждой группы order и latency, то есть
+     * набор правил со спекой с группой на 23.05 не вставал вовсе. Размер ключа прежний (32 бита): элементы карты
+     * демон переписывает по netlink теми же сообщениями (lib/nftvmap.c). */
+    struct nft_set *m = ir_map_add(t, ir_strdup(t->rs, map), "typeof numgen inc mod 2", "verdict");
     ir_gap(m);
     unsigned char owner[GROUP_BAL_SLOTS];
     unsigned slots = gc->pick == PICK_BALANCE ? GROUP_BAL_SLOTS : 1;
