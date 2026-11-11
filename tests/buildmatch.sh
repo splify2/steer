@@ -747,13 +747,27 @@ for d in README.md docs/guide.md docs/contract-v1.md docs/vless.md docs/proxy.md
 done
 check "в документации нет зашитых номеров версии" "" "$stale"
 
-# Таблица пакетов docs/guide.md — по составу build.sh (OURS): пакет, которого в таблице нет,
-# человек не найдёт вовсе (так из неё однажды выпал steer-proxy).
+# Таблица плагинов docs/guide.md — по составу plugins/ дерева: плагин, которого в таблице нет, человек не
+# найдёт вовсе (так из прежней таблицы пакетов однажды выпал steer-proxy). С 2.1 пакет ядра один
+# (steer-core), протоколы — плагины, и таблица пакетов модулей в guide заменена таблицей плагинов;
+# OURS в build.sh остался ради раскладки 2.0 (STEER_LAYOUT=2.0) и с guide больше не сверяется.
 no_pkg=""
-for p in $(sed -n 's/^OURS="\(.*\)"$/\1/p' build.sh); do
+for p in $(cd plugins && ls); do
+    [ -f "plugins/$p/plugin.json" ] || continue
     grep -q "^| \`$p\` |" docs/guide.md || no_pkg="$no_pkg$p "
 done
-check "все пакеты build.sh есть в таблице docs/guide.md" "" "$no_pkg"
+check "все плагины plugins/ есть в таблице docs/guide.md" "" "$no_pkg"
+# Архитектуры манифестов плагинов — ровно build/arches.sh: архив .s2p собирается под каждую архитектуру
+# сборки, и s2p отказывает архитектуре, которой нет в манифесте (так aarch64_cortex-a73 появилась в
+# arches.sh, а архивы под неё не собирались, пока её не дописали в манифесты).
+arch_want="$(sed -n '/^ISAS="/,/^"$/p' build/arches.sh | grep '^[a-z0-9_.-]*:' | cut -d: -f1 | LC_ALL=C sort | tr '\n' ' ')"
+if command -v python3 >/dev/null 2>&1; then
+    for mf in plugins/*/plugin.json; do
+        a="$(python3 -c 'import json,sys; a=json.load(open(sys.argv[1])).get("arch"); print("all" if a == "all" else " ".join(sorted(a)) + " ")' "$mf")"
+        [ "$a" = all ] && continue
+        check "$mf: arch — ровно архитектуры build/arches.sh" "$arch_want" "$a"
+    done
+fi
 
 # Команды, обещанные в README и docs/guide.md (таблица команд живёт там), обязаны существовать в
 # ядре или в официальном плагине: их читают раньше, чем `steer help`, и несуществующая команда там —
