@@ -109,9 +109,12 @@ int main(void) {
           plugin_kind_why("k-c-newer", buf, sizeof(buf), &id) != NULL && id && !strcmp(id, "c-newer"));
     check("вид, которого нет ни у кого, — без причины (неизвестный kind)", 1,
           plugin_kind_why("nosuchkind", buf, sizeof(buf), &id) == NULL);
-    /* Своего списка «вид → плагин» у ядра нет: имя плагина — из индекса семени (provides.kinds). Семени
-     * нет — причины нет (неизвестный протокол). */
-    check("нет семени — причины нет", 1, plugin_kind_why("tunnel:vless", buf, sizeof(buf), &id) == NULL);
+    /* Имя плагина для вида — из индекса семени (provides.kinds), а без семени — из таблицы видов официальных
+     * плагинов, собранной вместе с ядром (src/kinds/offkinds.h): на роутере без семени или с плагином из другого
+     * репозитория (tgws) отказ всё равно называет, что поставить, а не «неизвестный kind». */
+    id = NULL;
+    check("нет семени — плагин назван по таблице официальных видов", 1,
+          plugin_kind_why("tunnel:vless", buf, sizeof(buf), &id) != NULL && id && !strcmp(id, "vless"));
     put("../seed/index.json", "{\"plugins\":{\"vless\":{\"versions\":[{\"version\":\"2.1.0\","
         "\"provides\":{\"kinds\":[\"tunnel:vless\"]}}]}}}");
     char seed[300];

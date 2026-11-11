@@ -758,7 +758,11 @@ int main(void) {
         /* Умолчание conf ({etc}/xsteer/<выход>.conf) — у программы плагина, а не в ключах. */
         check_str("xsteer: ключи вида пусты", "{}", out_plugin_keys(&g_spec.out[0]));
 #else
-        check("xsteer: без плагинов — отказ парсером", 2, load_from_str(s));
+        /* Вид официального плагина без самого плагина — недоступный выход, а не отказ всей спеки: остальные
+         * выходы работают, а этот живёт по своему on_fail и называет плагин, который нужно поставить. */
+        check("xsteer: без плагина спека читается", 0, load_from_str(s));
+        check("xsteer: без плагина выход недоступен и называет плагин xsteer", 1, out_unavail(&g_spec.out[0]) != NULL &&
+              g_spec.out[0].unavail_plugin && !strcmp(g_spec.out[0].unavail_plugin, "xsteer"));
 #endif
     }
 #ifdef SPECMATCH_EXT
@@ -793,7 +797,11 @@ int main(void) {
         check_str("vless: sub_file — ключ subscription", "{\"subscription\":\"/tmp/sub.txt\"}",
                   out_plugin_keys(&g_spec.out[0]));
 #else
-        check("vless: без плагинов — отказ парсером", 2, load_from_str(s));
+        /* Вид официального плагина без самого плагина — недоступный выход, а не отказ всей спеки: остальные
+         * выходы работают, а этот живёт по своему on_fail и называет плагин, который нужно поставить. */
+        check("vless: без плагина спека читается", 0, load_from_str(s));
+        check("vless: без плагина выход недоступен и называет плагин vless", 1, out_unavail(&g_spec.out[0]) != NULL &&
+              g_spec.out[0].unavail_plugin && !strcmp(g_spec.out[0].unavail_plugin, "vless"));
 #endif
     }
     {

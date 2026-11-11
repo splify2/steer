@@ -56,7 +56,9 @@ rc=\$?
 {
     printf '# args: %s\n' "\$*"
     printf '# exit: %s\n' "\$rc"
-    env | grep '^STEER_' | LC_ALL=C sort | sed 's/^/# env: /'
+    # Переменные СБОРКИ в снимок не идут: STEER_KEYS_DIR и STEER_RELEASE выставляет конвейер выпуска (ключи подписи), на
+    # разбор спеки и набор правил они не влияют, а снимок с ними расходился с эталоном — выпуск 2.1.0 упал на этом шаге.
+    env | grep '^STEER_' | grep -v -E '^STEER_(KEYS_DIR|RELEASE|ARCH|BUILDER_IMAGE|WOLFSSL|NGTCP2)=' | LC_ALL=C sort | sed 's/^/# env: /'
     sed 's/^/# stderr: /' "\$buf.err"
     cat "\$buf"
 } | sed -E 's#/[A-Za-z0-9_./-]*/tmp\.[A-Za-z0-9]+#TMP#g' > "$out/\$(printf '%s-%03d.nft' "\$tag" "\$n")"
