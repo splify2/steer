@@ -60,6 +60,17 @@ $(BUILD)/steer: $(CLIENT_SRC) src/platform/platform.h | $(BUILD)/steerd
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(CLIENT_SRC)
 
+# Серверная половина обфускации (VPS, server/install.sh и архив steer-obfs-<версия>-<арх>.tar.gz в build.sh):
+# программа плагина obfs из тех же исходников (PROFILE_plug_obfs) — её команда obfs-server. Ядро (steerd)
+# этой команды с 2.1 не несёт, клиент сокета build/steer — тем более; без своей цели установка из исходников
+# клала на VPS бинарник, который отвечал «нет такой команды: obfs-server». Ни библиотек steer, ни wolfSSL
+# программе не нужно: собирается системным cc без зависимостей.
+.PHONY: obfs-server
+obfs-server: $(BUILD)/obfs-server
+$(BUILD)/obfs-server: $(PROFILE_plug_obfs) $(CORE_HDR) VERSION
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(DEFS) -o $@ $(PROFILE_plug_obfs)
+
 # Сборка под Android — тот же движок и те же исходники, у которого только умолчание выбора
 # платформы при запуске — телефон (-DSTEER_DEFAULT_PLATFORM=android, src/platform/platform.c):
 # своё поле метки (биты 22-27, в 0-21 пишет netd), свои каталоги (/data/misc/steer) и
@@ -78,6 +89,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@sh tests/v2match.sh
 	@sh tests/specschemamatch.sh
 	@sh tests/tgwsmatch.sh
+	@BUILD=$(BUILD) sh tests/obfsserver.sh
 	@BUILD=$(BUILD) sh tests/noforward.sh
 	@BUILD=$(BUILD) sh tests/boxenv.sh
 	@sh tests/climatch.sh
@@ -858,7 +870,7 @@ $(BUILD)/evmatch: tests/evmatch.c src/lib/evline.c src/lib/evline.h src/lib/json
 
 # Виды ядра под impl: core и плагины выходов спеки для `steer plugin migrate` (src/pluginmgr/pmkind.c):
 # модуль менеджера без менеджера вокруг — только ynode; стенд читает манифесты plugins/<id>/plugin.json.
-$(BUILD)/pmkindmatch: tests/pmkindmatch.c tests/unit.h src/pluginmgr/pmkind.c src/pluginmgr/pmkind.h $(YAML_SRC) \
+$(BUILD)/pmkindmatch: tests/pmkindmatch.c tests/unit.h src/pluginmgr/pmkind.c src/pluginmgr/pmkind.h src/kinds/offkinds.h $(YAML_SRC) \
                       src/lib/ynode.h src/lib/err.c src/lib/err.h $(wildcard plugins/*/plugin.json)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/pmkindmatch.c src/pluginmgr/pmkind.c $(YAML_SRC) src/lib/err.c
@@ -879,7 +891,7 @@ clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steerd $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
 	       $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/b3match $(BUILD)/subpq \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
-	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
+	       $(BUILD)/steer-hub $(BUILD)/steer-ext $(BUILD)/obfs-server \
 	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/yamlmatch $(BUILD)/pmkindmatch $(BUILD)/wolfssl-host \
 	       $(BUILD)/scryptomatch $(BUILD)/sigmatch $(BUILD)/vlessmatch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
 	       $(BUILD)/devupmatch $(BUILD)/ndk \

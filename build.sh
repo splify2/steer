@@ -708,22 +708,24 @@ done
 # компилятора нет и ставить его нельзя.
 #
 # Архив содержит ровно то, что нужно на той стороне: статический бинарник, установщик и
-# краткую справку. Код тот же, что у модуля steer-obfs в пакете для роутера (obfs.c и obfsmain.c
-# входят в статическую базовую сборку, а в пакете — в libsteer и модуль), — отдельной обфускации
+# краткую справку. Бинарник — программа плагина obfs (PROFILE_plug_obfs, src/modules/main_obfs.c), с 2.1
+# только она несёт команду obfs-server: ядро steerd её больше не знает, и архив из steerd-<арх> отвечал
+# «нет такой команды: obfs-server». Код тот же, что у плагина obfs на роутере, — отдельной обфускации
 # для сервера нет и быть не должно: две реализации означали бы две обфускации, расходящиеся в
-# мелочах на проводе. Сборка здесь статическая, без библиотек: на VPS нет пакетов OpenWrt.
+# мелочах на проводе. Сборка здесь статическая (на VPS нет ни musl OpenWrt, ни net1): у программы
+# плагина на роутере загрузчик musl вшит по пути роутера, на glibc-VPS она не запустилась бы. Подкоманду
+# программа берёт из argv[1], а не из имени файла, поэтому в архиве она по-прежнему зовётся steer —
+# так её зовут server/install.sh, юнит steer-obfs и уже стоящие установки.
 #
 # Архитектуры только те, на которых VPS реально бывают. Собирать архив под mips значило
 # бы предлагать людям то, чего не существует.
 echo "серверная половина:"
+OBFS_SRV_SRC="$(profile_var PROFILE_plug_obfs)" || exit 2
 for arch in x86_64 aarch64_generic; do
-    # Движок, а не клиент: на VPS нет ни демона, ни сокета — obfs-server подкомандой самого
-    # движка. Имя внутри архива прежнее (steer): его зовут server/install.sh и человек.
-    bin="build/steerd-$arch"
-    if [ ! -f "$bin" ]; then
-        printf '  %-26s пропуск (ядро не собралось)\n' "$arch"
-        continue
-    fi
+    spec=""
+    for s in $ISAS; do [ "${s%%:*}" = "$arch" ] && spec="$s" && break; done
+    [ -n "$spec" ] || continue
+    rest=${spec#*:}; target=${rest%%:*}; mcpu=${rest#*:}
     # Имя внутри архива — привычное человеку, а не имя цели OpenWrt: на VPS про
     # aarch64_generic никто не знает, там знают uname -m.
     case "$arch" in
@@ -731,6 +733,27 @@ for arch in x86_64 aarch64_generic; do
         aarch64_generic)  uarch=aarch64 ;;
         *)                uarch=$arch ;;
     esac
+    bin="build/obfs-server-$arch"
+    # shellcheck disable=SC2086
+    if ! docker run --rm -v "$PWD:/src" -w /src "$IMAGE" \
+            cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra \
+               -DSTEER_VERSION="\"$VERSION\"" \
+               -o "$bin" $BASE_INC $THIRD_DEFS $OBFS_SRV_SRC \
+               2>"build/$arch-obfs-server.err"; then
+        rm -f "$bin" "$OUT/steer-obfs-$VERSION-$uarch.tar.gz"
+        printf '  %-26s FAILED — %s\n' "$uarch" "$(grep -m1 error "build/$arch-obfs-server.err" || head -1 "build/$arch-obfs-server.err")"
+        fails=$((fails + 1))
+        continue
+    fi
+    warn_report "build/$arch-obfs-server.err"
+    # Своя архитектура — спросить у бинарника команду, ради которой архив и собран: архив без неё уже
+    # уходил в выпуск (из steerd, после переноса obfs-server в плагин), и заметил это только человек на VPS.
+    if [ "$(uname -m)" = "$uarch" ] && ! "$bin" obfs-server --help >/dev/null 2>&1; then
+        rm -f "$OUT/steer-obfs-$VERSION-$uarch.tar.gz"
+        printf '  %-26s FAILED — %s не отвечает на obfs-server --help\n' "$uarch" "$bin"
+        fails=$((fails + 1))
+        continue
+    fi
     stage="build/obfs-$uarch"
     rm -rf "$stage"
     mkdir -p "$stage"

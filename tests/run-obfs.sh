@@ -26,6 +26,8 @@ set -u
 cd "$(dirname "$0")/.."
 
 BIN="${STEER:-build/steer}"
+# Серверная половина — программа плагина obfs (`make obfs-server`): ядро с 2.1 команды obfs-server не несёт.
+SRV="${OBFS_SERVER:-build/obfs-server}"
 PRE="${STEER_PRELOAD:-}"
 
 skip() { echo "пропущено: $1"; exit 0; }
@@ -33,6 +35,7 @@ skip() { echo "пропущено: $1"; exit 0; }
 command -v ip >/dev/null 2>&1 || skip "нет ip"
 command -v python3 >/dev/null 2>&1 || skip "нет python3"
 [ -x "$BIN" ] || { echo "нет бинарника: $BIN (make)"; exit 2; }
+[ -x "$SRV" ] || { echo "нет бинарника: $SRV (make obfs-server)"; exit 2; }
 
 S=obfs-s$$
 C=obfs-c$$
@@ -117,7 +120,9 @@ for k in ('synack', 'rst'):
     print(k, got.get(k, 'нет'))
 PY
 
+BIN0="$BIN"; BIN="$SRV"
 run_steer "$S" "$WORK/srv.log" obfs-server --listen 4443 --forward 127.0.0.1:51821
+BIN="$BIN0"
 sleep 0.5
 for dst in 10.99.0.3 10.99.0.1; do
     ip netns exec "$C" python3 "$WORK/probe.py" 10.99.0.2 "$dst" >"$WORK/probe.out"

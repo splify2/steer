@@ -1652,10 +1652,12 @@ static void reload_begin(struct conn *c);
  * (проверки dry-run и отпечатки частей), решение recon_decide, ребёнок `apply-commit` только с
  * изменившимися частями — или никакого, если меняться нечему. */
 
-/* Ребёнок-план по спеке path; раскладку набора правил, узнанную у прежнего плана, — готовой. */
-static int plan_start(struct conn *c, const char *path, job_done_fn done) {
+/* Ребёнок-план по спеке path; раскладку набора правил, узнанную у прежнего плана, — готовой. start —
+ * план стартового применения и reload (apply-plan --start): выход вида без плагина недоступен, а не
+ * отказ всей спеки; apply из интерфейса проверяется строго. */
+static int plan_start(struct conn *c, const char *path, int start, job_done_fn done) {
     struct ctl_srv *s = c->srv;
-    char *av[12], nb[16];
+    char *av[13], nb[16];
     size_t n = 0;
     s->plan_at = loop_now_ms();     /* после него устройства раздачи план уже видел (srv_kcheck) */
     av[n++] = s->cf.exe;
@@ -1671,6 +1673,7 @@ static int plan_start(struct conn *c, const char *path, job_done_fn done) {
     /* Сводка элементов статических наборов ядра — только когда есть с чем её сравнить
      * (recon.c, «СВЕРКА ЭЛЕМЕНТОВ»): дамп больших списков стоит своих миллисекунд. */
     if (s->rec.valid && s->rec.kel_ok) av[n++] = "--kernel-elems";
+    if (start) av[n++] = "--start";
     av[n] = NULL;
     return job_start(c, av, 120, CTL_OUT_MAX, CTL_ERR_MAX, done);
 }
@@ -1886,7 +1889,7 @@ static void st_apply(struct conn *c) {
         conn_reply(c);
         return;
     }
-    if (plan_start(c, c->tmp, apply_planned) != 0) {
+    if (plan_start(c, c->tmp, 0, apply_planned) != 0) {
         unlink(c->tmp);
         resp_error(&c->resp, "internal", "не удалось запустить ядро");
         conn_reply(c);
@@ -2107,7 +2110,7 @@ static void st_reload(struct conn *c) {
         reload_head(c, 0, NULL);
         return;
     }
-    if (plan_start(c, c->srv->cf.spec, reload_planned) != 0) {
+    if (plan_start(c, c->srv->cf.spec, 1, reload_planned) != 0) {
         struct cbuf e = {0};
         cb_str(&e, LOG_W "не удалось запустить ядро\n");
         c->rcode = 127;
@@ -3491,7 +3494,7 @@ static void srv_kcheck(void *arg) {
          * чинить, в общем счёте починок. Таблица есть (отвергнут новый набор, стоит прежний) —
          * трогать нечего. */
         if (!s->d.have || nfd_table_exists(NFD_INET, nft_table()) || !srv_table_flushed(s)) return;
-        why = "движок включён и спека есть, а набора правил в ядре Linux нет";
+        why = "ядро steer включено и спека есть, а набора правил в ядре Linux нет";
         drift = 1;
     } else {
         drift = recon_kernel_drift(&s->rec, &why);

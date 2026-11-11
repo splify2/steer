@@ -4,6 +4,7 @@
 
 #include "pmkind.h"
 #include "err.h"
+#include "offkinds.h"
 
 /* Виды ядра, которые плагин официального репозитория дополняет (impl: core). key — ключ выхода, при
  * котором плагин нужен (helper.when его манифеста); NULL — нужен всякому выходу вида. */
@@ -65,8 +66,17 @@ int pm_spec_plugins(const char *buf, size_t n, const char *name, const struct yn
             snprintf(kn, sizeof(kn), "tunnel:%s", pr ? pr : "vless");
         } else snprintf(kn, sizeof(kn), "%s", k);
         const char *id = seed_plugin_for(plugins, kn);
-        /* warp в provides.kinds не записан: группу warp ведёт warpbox (он тянет awg). */
-        if (!id && !strcmp(kn, "warp")) id = "warpbox";
+        /* Вида нет в семени — таблица официальных плагинов (offkinds.h, из манифестов дерева): tgws
+         * выпускает репозиторий splify2-extended-plugins, в семени его нет, но выходу он всё равно нужен —
+         * migrate скажет, что его ставить из сети. Там же warp (warpbox) на случай семени без индекса. */
+        if (!id) id = official_kind_plugin(kn);
+        /* Спека v1 пишет протокол видом (kind: vless): вид v2 для него — tunnel:<протокол>. */
+        if (!id && strncmp(kn, "tunnel:", 7)) {
+            char tk[170];
+            snprintf(tk, sizeof(tk), "tunnel:%s", kn);
+            id = seed_plugin_for(plugins, tk);
+            if (!id) id = official_kind_plugin(tk);
+        }
         if (id) add(arg, id);
     }
     ydoc_free(d);

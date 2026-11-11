@@ -866,6 +866,7 @@ struct recon_args {
     int nftc;                  /* -1 — спросить ядро */
     int ruleset, awg, masq, masq_ensure;
     int kelems;                /* apply-plan: сводка элементов статических наборов ядра */
+    int start;                 /* apply-plan: запуск и reload — недоступный вид не отказ (LOAD_STRICT) */
     const char *route, *drop;  /* через запятую; NULL — нет */
     const char *rule;          /* только правило выхода, таблицу не трогать (починка демона) */
 };
@@ -890,6 +891,7 @@ static void recon_args_parse(int argc, char **argv, struct recon_args *a, const 
             else if (!strcmp(k, "--masq")) a->masq = 1;
             else if (!strcmp(k, "--masq-ensure")) a->masq_ensure = 1;
             else if (!strcmp(k, "--kernel-elems")) a->kelems = 1;
+            else if (!strcmp(k, "--start")) a->start = 1;
             else {
                 fprintf(stderr, "steer %s: непонятное слово %s\n", who, k);
                 exit(2);
@@ -970,9 +972,13 @@ static unsigned long long out_watch_sig(const struct output *o, unsigned long lo
     return h;
 }
 
-/* apply-plan --spec ПУТЬ [--state-dir …] [--nftc N] [--kernel-elems]: всё, что делает `apply --dry-run` (те же
+/* apply-plan --spec ПУТЬ [--state-dir …] [--nftc N] [--kernel-elems] [--start]: всё, что делает `apply --dry-run` (те же
  * проверки, те же предупреждения в stderr, тот же код отказа), только набор правил не печатается,
- * а сворачивается в отпечаток. Счётчики из ядра не читаются нарочно: план не зовёт ни одного
+ * а сворачивается в отпечаток. --start — план стартового применения и reload демона: проверка не
+ * строгая (apply_prepare, strict), выход вида без плагина — недоступный (unavail) и живёт по on_fail,
+ * остальная спека применяется. Без него стартовое применение — тоже сверка через этот план — отвергало
+ * спеку целиком, и роутер после перехода с 2.0.x без плагина tgws (или vless) оставался вовсе без
+ * правил; строгость нужна только apply из интерфейса — там человек тут же видит отказ и причину. Счётчики из ядра не читаются нарочно: план не зовёт ни одного
  * процесса (раскладку демон передаёт готовой), а перенос счётчиков — дело apply-commit, который
  * пересобирает текст уже с ними. В stdout — план строками:
  *   nftc N                      раскладка набора правил (NFTC_*)
@@ -991,7 +997,7 @@ int cmd_apply_plan(int argc, char **argv) {
     static struct spec cfg;
     static struct groups gr;
     struct err e = {0};
-    apply_prepare(a.spec, &cfg, &gr, 1, a.nftc, 1, 1);
+    apply_prepare(a.spec, &cfg, &gr, 1, a.nftc, 1, !a.start);
     awg_check_all(&cfg);
     unsigned long long h = 14695981039346656037ULL;
     /* Поток-отпечаток: fopencookie есть в glibc и musl, но в bionic его нет вовсе (даже с

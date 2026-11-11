@@ -268,11 +268,47 @@ has "  плагин в сводке с причиной" "$st" '{"id":"fakeplug"
 has "  apply — отказ с причиной" "$(dry ok)" "плагин fakeplug отключён: отключён человеком"
 check "  подкоманда отключённого плагина не регистрируется" "1" "$("$BIN" fake-hello >/dev/null 2>&1; echo $(( $? > 0 )))"
 rm -f "$ETC/state.json"
-# без каталога плагинов протокол из семени — тот же отказ «нужен плагин», без семени — «не знаю»
+# без каталога плагинов протокол из семени — тот же отказ «нужен плагин»; без семени — тоже: протокол официального
+# плагина ядро знает и по таблице видов, порождённой из манифестов дерева (src/kinds/offkinds.h)
 out="$(STEER_PLUGINS_ROOT="$tmp/none" "$BIN" apply --dry-run --spec "$tmp/novonly.yaml" 2>&1)"
 has "без каталога плагинов: протокол по семени — «нужен плагин»" "$out" "outputs.v: нужен плагин vless — поставить"
 out="$(STEER_PLUGIN_SEED="$tmp/none" STEER_PLUGINS_ROOT="$tmp/none" "$BIN" apply --dry-run --spec "$tmp/novonly.yaml" 2>&1)"
-has "без каталога и семени: протокол неизвестен" "$out" "протокол «vless» не знаю"
+has "без каталога и семени: протокол официального плагина — «нужен плагин»" "$out" "outputs.v: нужен плагин vless — поставить"
+spec nov4 '  v:  { kind: tunnel, protocol: nosuch, subscription: sub/x }'
+out="$(STEER_PLUGIN_SEED="$tmp/none" STEER_PLUGINS_ROOT="$tmp/none" "$BIN" apply --dry-run --spec "$tmp/nov4.yaml" 2>&1)"
+has "без каталога и семени: чужой протокол неизвестен" "$out" "протокол «nosuch» не знаю"
+
+# Вид официального плагина вне семени — tgws (выпускает репозиторий splify2-extended-plugins). До 2.1.0 такой
+# выход был «неизвестным kind» и рушил спеку целиком, при старте демона тоже: после перехода с 2.0.x (стоял
+# steer-tgws) роутер оставался без правил. Теперь — как vless без плагина: при старте и reload выход
+# недоступен и живёт по on_fail, остальное применяется; apply из интерфейса — отказ с той же причиной.
+spec tgu '  tg: { kind: tgws, domain: ex.co.uk, on_fail: drop }
+  d:  { kind: direct }'
+tgenv() { STEER_PLUGIN_SEED="$tmp/none" STEER_PLUGINS_ROOT="$tmp/none" "$@"; }
+check "tgws без плагина: оба выхода разобраны" "tg d" "$(tgenv "$BIN" outputs --spec "$tmp/tgu.yaml" 2>&1 | tr '\n' ' ' | sed 's/ $//')"
+st="$(tgenv "$BIN" status --spec "$tmp/tgu.yaml" --state-dir "$ST" 2>&1)"
+has "  status: unavail, плагин назван" "$st" '"tg":{"kind":"tgws","unavail":{"why":"нужен плагин tgws — поставить","plugin":"tgws"}'
+has "  status: выход failed, on_fail drop" "$st" '"failed":true,"mark"'
+has "  status: direct рядом работает" "$st" '"d":{"kind":"direct"}'
+out="$(tgenv "$BIN" apply --dry-run --spec "$tmp/tgu.yaml" 2>&1)"
+has "  apply --dry-run (как apply из интерфейса): отказ называет плагин" "$out" "outputs.tg: нужен плагин tgws — поставить"
+hasnt "  а не «неизвестный kind»" "$out" "неизвестный kind"
+# План стартового применения и reload демона (ctl.c, plan_start: apply-plan --start) — не строгий: спека
+# применяется, выход tg в плане есть (метка и таблица — для правил on_fail). Без --start — прежний строгий отказ.
+out="$(tgenv "$BIN" apply-plan --start --spec "$tmp/tgu.yaml" --state-dir "$ST" --nftc 0 2>&1)"; rc=$?
+check "  apply-plan --start (запуск, reload): спека проходит" "0" "$rc"
+has "  в плане и недоступный выход" "$out" "out tg "
+has "  и direct" "$out" "out d "
+tgenv "$BIN" apply-plan --spec "$tmp/tgu.yaml" --state-dir "$ST" --nftc 0 >/dev/null 2>&1
+check "  apply-plan без --start (apply из интерфейса): строгий отказ" "2" "$?"
+dg="$(tgenv "$BIN" diag --spec "$tmp/tgu.yaml" --state-dir "$ST" 2>&1)"
+has "  diag: выход недоступен с причиной" "$dg" '"what":"выход tg недоступен: нужен плагин tgws — поставить"'
+has "  diag: действие — поставить плагин" "$dg" "поставьте плагин tgws (steer plugin install tgws); до тех пор трафик канала остановлен"
+printf '{"schema":1,"outputs":{"tg":{"kind":"tgws","domain":"ex.co.uk","on_fail":"drop"},"d":{"kind":"direct"}},"channels":[]}\n' > "$tmp/tgu1.json"
+st="$(tgenv "$BIN" status --spec "$tmp/tgu1.json" --state-dir "$ST" 2>&1)"
+has "спека v1, kind: tgws без плагина — unavail, а не отказ всей спеки" "$st" '"unavail":{"why":"нужен плагин tgws — поставить","plugin":"tgws"}'
+spec tgtypo '  tg: { kind: tgwss, domain: ex.co.uk }'
+has "описка в виде — по-прежнему «неизвестный kind»" "$(tgenv "$BIN" apply --dry-run --spec "$tmp/tgtypo.yaml" 2>&1)" "неизвестный kind «tgwss»"
 out="$(STEER_PLUGINS_ROOT="$tmp/none" "$BIN" apply --dry-run --spec "$tmp/ok.yaml" 2>&1)"
 has "без раскладки плагинов: вид плагина неизвестен" "$out" "неизвестный kind «fakekind»"
 

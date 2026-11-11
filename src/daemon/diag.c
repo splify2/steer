@@ -934,6 +934,30 @@ int diag_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
     /* 7. Выходы: устройство, зона фаервола, NAT. То же, что в status, но с приговором —
      *    в status это поля, и какие из них важны, человек угадывал сам. */
     for (size_t i = 0; i < sp->out_n; i++) {
+        /* Вид выхода недоступен (плагин не стоит или отключён, спека не подготовлена): устройство
+         * у такого выхода — лишь имя для правил on_fail, и ветки ниже сказали бы «устройства нет,
+         * туннель не поднят» — чинить туннель незачем, нужен плагин. Приговор — причина ядра и
+         * действие; «поставьте» — только тому, чей плагин не стоит (у отключённого — «включите»). */
+        const char *uw = out_unavail(&sp->out[i]);
+        if (uw) {
+            const struct output *o = &sp->out[i];
+            const char *pid = o->unavail_plugin;
+            const char *traffic = o->on_fail == FAIL_DROP ? "остановлен" :
+                                  o->on_fail == FAIL_ZAPRET ? "идёт через обход" : "идёт напрямую";
+            char uwhat[400], uwhy[400], act[200] = "";
+            snprintf(uwhat, sizeof(uwhat), "выход %.40s недоступен: %.300s", o->name, uw);
+            /* Причина — чужая строка (причина отключения из state.json): кавычку, обратную косую
+             * и управляющие байты — пробелом, как у причины клиента выше, иначе JSON разломится. */
+            for (char *c = uwhat; *c; c++)
+                if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) *c = ' ';
+            if (pid && !strncmp(uw, "нужен плагин", strlen("нужен плагин")))
+                snprintf(act, sizeof(act), "поставьте плагин %.40s (steer plugin install %.40s); ", pid, pid);
+            else if (pid && strstr(uw, "отключён"))
+                snprintf(act, sizeof(act), "включите плагин %.40s (steer plugin enable %.40s); ", pid, pid);
+            snprintf(uwhy, sizeof(uwhy), "%sдо тех пор трафик канала %s, остальные выходы работают", act, traffic);
+            diag("output", "fail", uwhat, uwhy);
+            continue;
+        }
         if (!out_has_device(&sp->out[i])) continue;
         if (diag_dup_device(sp, i)) continue;
         char path[128];

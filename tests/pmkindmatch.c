@@ -127,6 +127,12 @@ int main(void) {
     check_str("tunnel без protocol — vless", "vless", want_for(plugins, "version: 2\noutputs:\n  v: { kind: tunnel }\n"));
     check_str("warp — warpbox", "warpbox", want_for(plugins, "version: 2\noutputs:\n  w: { kind: warp }\n"));
     check_str("warp без семени — всё равно warpbox", "warpbox", want_for(NULL, "version: 2\noutputs:\n  w: { kind: warp }\n"));
+    /* tgws в семени нет (его выпускает splify2-extended-plugins), но выходу он нужен: migrate назовёт его
+     * и не будет ставить из семени (offkinds.h, cmd_migrate). */
+    check_str("tgws не в семени — всё равно tgws", "tgws",
+              want_for(plugins, "version: 2\noutputs:\n  t: { kind: tgws, domain: ex.co.uk }\n"));
+    check_str("спека v1: kind vless — плагин vless", "vless",
+              want_for(plugins, "{\"schema\":1,\"outputs\":{\"v\":{\"kind\":\"vless\",\"sub_file\":\"/x\"}}}"));
     check_str("direct и block — ничего", "",
               want_for(plugins, "version: 2\noutputs:\n  d: { kind: direct }\n  b: { kind: block }\n"));
     check_str("спека JSON: interface без obfs и с obfs", "obfs",

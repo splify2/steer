@@ -132,6 +132,14 @@ check "sources.mk: манифесты вкомпилированных плаг�
     "$(for p in base extended server android; do missing_in "$p" "$(profile_var PKEMBED_SRC)" | grep -q . || printf '%s' "$p"; done)"
 check "src/plugkit/pkembed.c — плод build/pkembed.sh из plugins/ (не устарел)" "" \
     "$(sh build/pkembed.sh | cmp -s - src/plugkit/pkembed.c || echo 'устарел: sh build/pkembed.sh > src/plugkit/pkembed.c')"
+# Таблица видов официальных плагинов (вид без плагина — «нужен плагин <id>», а не «неизвестный kind», и для
+# плагинов вне семени, как tgws) — из тех же манифестов; без python3 генератор не запускается.
+if command -v python3 >/dev/null 2>&1; then
+    check "src/kinds/offkinds.h — плод build/offkinds.sh из plugins/ (не устарел)" "" \
+        "$(sh build/offkinds.sh | cmp -s - src/kinds/offkinds.h || echo 'устарел: sh build/offkinds.sh > src/kinds/offkinds.h')"
+else
+    echo "buildmatch: нет python3 — src/kinds/offkinds.h не сверен (ПРОПУСК)"
+fi
 check "вкомпилированы манифесты ровно тех плагинов, чьи программы вкомпилированы" "$(profile_var PLUGINS_EMBED)" \
     "$(for f in $(profile_var PK_STATIC_SRC); do sed -n 's/^PK_PROGRAM("\([a-z0-9]*\)".*/\1/p' "$f"; done | tr '\n' ' ' | sed 's/ $//')"
 
@@ -570,8 +578,12 @@ check "файл keep.d есть в репозитории" "yes" "$([ -f "$KEEP"
 # awg — файлы выходов kind: awg по умолчанию (<etc>/awg/<выход>.conf, src/kinds/awg.c): ключи
 # туннеля, которые человек положил сам; без каталога в списке обновление прошивки оставляло выход
 # без конфига.
+#
+# warp — регистрации WARP и файлы туннелей группы warp (<etc>/warp/<группа>-<n>.reg и .conf, плагин warpbox,
+# src/proto/warp/wbmain.c): без каталога в списке обновление прошивки теряло регистрации, и плагин
+# заводил новые, хотя docs/warp.md обещает новую регистрацию только по необходимости.
 for f in /etc/steer/spec.json /etc/steer/spec.yaml /etc/steer/select /etc/steer/sub.txt /etc/steer/sub.userinfo \
-         /etc/steer/subs /etc/steer/lists/custom /etc/steer/awg /etc/steer/xsteer; do
+         /etc/steer/subs /etc/steer/lists/custom /etc/steer/awg /etc/steer/xsteer /etc/steer/warp; do
     check "keep.d объявляет $f" "1" "$(grep -cx "$f" "$KEEP")"
 done
 # Ни комментариев, ни пустых строк, ни относительных путей: файл читает не человек, а
@@ -596,6 +608,18 @@ check "в keep.d только абсолютные пути" "0" "$(grep -cv '^/
 #
 # `find` в sysupgrade рекурсивен по каталогу из keep.d, поэтому одна строка `.../lists/custom`
 # берёт свои списки и НЕ берёт лежащие рядом файлы издателя — исключений выражать не нужно.
+# Включение fw4: ряд перенаправленных портов покрывает и слушатели туннелей (TCP_PORT_BASE), и всё, что
+# распорядитель выдаёт плагинам (PLUGIN_PORT_FIRST и выше, до 65535), — src/model/marks.h. Перечень
+# 9480-9734 отставал от распорядителя (порты плагинов от 10480). Поведение — tests/fwinclude.sh (docker).
+FWINC=files/usr/share/nftables.d/chain-pre/input/30-steer.nft
+fw_lo="$(sed -n 's/^#define STEER_REDIR_PORT_FIRST \([A-Z_0-9]*\)$/\1/p' src/model/marks.h)"
+fw_tcp="$(sed -n 's/^#define TCP_PORT_BASE \([0-9]*\)$/\1/p' src/model/marks.h)"
+fw_plug="$(sed -n 's/^#define PLUGIN_PORT_FIRST \([0-9]*\)$/\1/p' src/model/marks.h)"
+check "marks.h: нижняя граница ряда fw4 — TCP_PORT_BASE ($fw_tcp), порты плагинов от $fw_plug выше неё" "TCP_PORT_BASE 1" \
+    "$fw_lo $([ "${fw_plug:-0}" -ge "${fw_tcp:-99999}" ] && echo 1 || echo 0)"
+check "plugalloc.c берёт PORT_FIRST из PLUGIN_PORT_FIRST" "1" "$(grep -c '^#define PORT_FIRST  PLUGIN_PORT_FIRST$' src/kinds/plugalloc.c)"
+check "включение fw4 принимает перенаправленное к $fw_tcp-65535 (TCP и UDP)" "1" \
+    "$(grep -c "^ct status dnat meta l4proto { tcp, udp } th dport $fw_tcp-65535 accept" "$FWINC")"
 check "keep.d не тащит каталог списков издателя" "0" \
     "$(grep -cx '/etc/steer/lists' "$KEEP")"
 check "и не тащит его файлы поимённо" "0" \
@@ -611,6 +635,13 @@ check "install.sh берёт готовый бинарник, если он ря
     "$(grep -c 'if \[ -x "\$here/steer" \]' server/install.sh)"
 check "build.sh кладёт архив steer-obfs в out" "1" \
     "$(grep -c 'tar -C build -czf "\$OUT/steer-obfs' build.sh)"
+# С 2.1 obfs-server — команда программы плагина obfs, а не ядра: архив из steerd-<арх> и установка из
+# исходников через `make all` (build/steer — клиент сокета) отвечали «нет такой команды». Поведение
+# проверяет tests/obfsserver.sh, здесь — что источник не откатился к ядру.
+check "архив steer-obfs — из программы плагина obfs (PROFILE_plug_obfs), а не из steerd" "1 0" \
+    "$(grep -c 'OBFS_SRV_SRC="\$(profile_var PROFILE_plug_obfs)"' build.sh) $(grep -c 'bin="build/steerd-\$arch"' build.sh)"
+check "install.sh из исходников собирает make obfs-server" "1 0" \
+    "$(grep -c 'make -C "\$root" -s obfs-server' server/install.sh) $(grep -c 'make -C "\$root" -s all' server/install.sh)"
 
 # Каждое слово в профилях обязано быть существующим файлом .c.
 #
@@ -716,13 +747,27 @@ for d in README.md docs/guide.md docs/contract-v1.md docs/vless.md docs/proxy.md
 done
 check "в документации нет зашитых номеров версии" "" "$stale"
 
-# Таблица пакетов docs/guide.md — по составу build.sh (OURS): пакет, которого в таблице нет,
-# человек не найдёт вовсе (так из неё однажды выпал steer-proxy).
+# Таблица плагинов docs/guide.md — по составу plugins/ дерева: плагин, которого в таблице нет, человек не
+# найдёт вовсе (так из прежней таблицы пакетов однажды выпал steer-proxy). С 2.1 пакет ядра один
+# (steer-core), протоколы — плагины, и таблица пакетов модулей в guide заменена таблицей плагинов;
+# OURS в build.sh остался ради раскладки 2.0 (STEER_LAYOUT=2.0) и с guide больше не сверяется.
 no_pkg=""
-for p in $(sed -n 's/^OURS="\(.*\)"$/\1/p' build.sh); do
+for p in $(cd plugins && ls); do
+    [ -f "plugins/$p/plugin.json" ] || continue
     grep -q "^| \`$p\` |" docs/guide.md || no_pkg="$no_pkg$p "
 done
-check "все пакеты build.sh есть в таблице docs/guide.md" "" "$no_pkg"
+check "все плагины plugins/ есть в таблице docs/guide.md" "" "$no_pkg"
+# Архитектуры манифестов плагинов — ровно build/arches.sh: архив .s2p собирается под каждую архитектуру
+# сборки, и s2p отказывает архитектуре, которой нет в манифесте (так aarch64_cortex-a73 появилась в
+# arches.sh, а архивы под неё не собирались, пока её не дописали в манифесты).
+arch_want="$(sed -n '/^ISAS="/,/^"$/p' build/arches.sh | grep '^[a-z0-9_.-]*:' | cut -d: -f1 | LC_ALL=C sort | tr '\n' ' ')"
+if command -v python3 >/dev/null 2>&1; then
+    for mf in plugins/*/plugin.json; do
+        a="$(python3 -c 'import json,sys; a=json.load(open(sys.argv[1])).get("arch"); print("all" if a == "all" else " ".join(sorted(a)) + " ")' "$mf")"
+        [ "$a" = all ] && continue
+        check "$mf: arch — ровно архитектуры build/arches.sh" "$arch_want" "$a"
+    done
+fi
 
 # Команды, обещанные в README и docs/guide.md (таблица команд живёт там), обязаны существовать в
 # ядре или в официальном плагине: их читают раньше, чем `steer help`, и несуществующая команда там —
