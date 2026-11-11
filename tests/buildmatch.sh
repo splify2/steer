@@ -578,8 +578,12 @@ check "файл keep.d есть в репозитории" "yes" "$([ -f "$KEEP"
 # awg — файлы выходов kind: awg по умолчанию (<etc>/awg/<выход>.conf, src/kinds/awg.c): ключи
 # туннеля, которые человек положил сам; без каталога в списке обновление прошивки оставляло выход
 # без конфига.
+#
+# warp — регистрации WARP и файлы туннелей группы warp (<etc>/warp/<группа>-<n>.reg и .conf, плагин warpbox,
+# src/proto/warp/wbmain.c): без каталога в списке обновление прошивки теряло регистрации, и плагин
+# заводил новые, хотя docs/warp.md обещает новую регистрацию только по необходимости.
 for f in /etc/steer/spec.json /etc/steer/spec.yaml /etc/steer/select /etc/steer/sub.txt /etc/steer/sub.userinfo \
-         /etc/steer/subs /etc/steer/lists/custom /etc/steer/awg /etc/steer/xsteer; do
+         /etc/steer/subs /etc/steer/lists/custom /etc/steer/awg /etc/steer/xsteer /etc/steer/warp; do
     check "keep.d объявляет $f" "1" "$(grep -cx "$f" "$KEEP")"
 done
 # Ни комментариев, ни пустых строк, ни относительных путей: файл читает не человек, а
