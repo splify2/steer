@@ -63,6 +63,40 @@ static char *opkg_arch(void) {
     return best;
 }
 
+/* Архитектура из /etc/openwrt_release: строка DISTRIB_ARCH='<имя>'.
+ *
+ * ЗАЧЕМ. У opkg архитектура зашита в сам менеджер, и строк «arch …» в /etc/opkg.conf штатной системы НЕТ
+ * (проверено на OpenWrt 23.05.5 и по жалобе с 24.10.5: `opkg print-architecture` её печатает, файлы — нет).
+ * opkg_arch возвращала пусто, цель оставалась без архитектуры, и ни один плагин со сборкой под архитектуру не
+ * ставился: «у net1 1.4.2 нет сборки под » — на всех роутерах с opkg протоколы 2.1 не вставали ни из сети, ни
+ * из семени пакета. Файл выпуска есть на любой OpenWrt, и имя в нём то же, что у пакетов. Стенды подменяют путь
+ * переменной STEER_OPENWRT_RELEASE. */
+static char *release_arch(void) {
+    const char *path = getenv("STEER_OPENWRT_RELEASE");
+    char *b = pm_read(path && *path ? path : "/etc/openwrt_release", NULL);
+    if (!b) return NULL;
+    char *r = NULL;
+    for (char *l = strtok(b, "\n"); l && !r; l = strtok(NULL, "\n")) {
+        while (*l == ' ' || *l == '\t') l++;
+        if (strncmp(l, "DISTRIB_ARCH=", 13)) continue;
+        char *v = l + 13;
+        if (*v == '\'' || *v == '"') v++;
+        size_t n = strcspn(v, "'\"\r\n \t");
+        if (!n || n > 96) continue;
+        int ok = 1;
+        for (size_t i = 0; i < n && ok; i++) {
+            char c = v[i];
+            ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+                 c == '.' || c == '+';
+        }
+        if (!ok) continue;
+        v[n] = '\0';
+        r = pm_strdup(v);
+    }
+    free(b);
+    return r;
+}
+
 void pm_target_load(struct pm_target *t) {
     memset(t, 0, sizeof(*t));
     const char *c = getenv("STEER_PLUGIN_CORE");
@@ -87,7 +121,7 @@ void pm_target_load(struct pm_target *t) {
     else t->splify2 = first_line("/usr/share/splify2/version");
     const char *a = getenv("STEER_PLUGIN_ARCH");
     if (a && *a) t->arch = pm_strdup(a);
-    else if (!(t->arch = first_line("/etc/apk/arch"))) t->arch = opkg_arch();
+    else if (!(t->arch = first_line("/etc/apk/arch")) && !(t->arch = opkg_arch())) t->arch = release_arch();
 }
 
 /* Версия последней прочитанной оси панели: держится до следующего вызова pm_compat_why, как buf. */

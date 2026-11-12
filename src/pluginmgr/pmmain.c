@@ -97,10 +97,43 @@ static const struct pm_repo *repo_of(struct pm_ctx *x, const char *name) {
     return name ? pm_repo_find(&x->repos, name) : NULL;
 }
 
+/* Манифест стоящего плагина подписан ключом выпуска (роли plugins или protocols)?
+ *
+ * ЗАЧЕМ. Плагин, поставленный ФАЙЛОМ, репозитория в состоянии не имеет (репозиторий пишется взятому из индекса), и
+ * список называл его «unsigned» — хотя подпись была и проверена при установке. Так выглядели все плагины, которые
+ * ставит из своего семени пакет панели: на карточке «поставлен из файла без подписи, splify2 за него не отвечает» у
+ * её собственных языков, подписок и каталога списков. MANIFEST и MANIFEST.sig остаются в каталоге плагина, и вопрос
+ * «чей он» решается по ним же: подпись ключом выпуска над манифестом с этим id — плагин официальный. Проверяется
+ * при каждом выводе списка: записи о доверии, которую можно было бы подделать или не обновить, нет. */
+static int signed_official(const struct pm_inst *p) {
+    if (!p || !p->id) return 0;
+    char *dir = pm_path(pm_root(), p->id);
+    char *mp = pm_path(dir, "MANIFEST"), *sp = pm_path(dir, "MANIFEST.sig");
+    size_t mn = 0, sn = 0;
+    char *m = pm_read(mp, &mn), *sg = pm_read(sp, &sn);
+    int ok = 0;
+    /* Заголовок манифеста несёт id: подпись чужого официального плагина к этому каталогу не подходит. */
+    if (m && sg && mn > 6 && !strncmp(m, "s2p 1 ", 6)) {
+        size_t il = strlen(p->id);
+        if (!strncmp(m + 6, p->id, il) && m[6 + il] == ' ') {
+            static const char *const roles[] = { "plugins", "protocols" };
+            for (size_t i = 0; i < sizeof(roles) / sizeof(roles[0]) && !ok; i++) {
+                struct pm_keyset ks;
+                struct pm_err e = {0};
+                pm_keys_role(&ks, roles[i]);
+                ok = pm_sig_check(&ks, sg, sn, m, mn, "MANIFEST", &e) == 0;
+                pm_keys_free(&ks);
+            }
+        }
+    }
+    free(m); free(sg); free(mp); free(sp); free(dir);
+    return ok;
+}
+
 static const char *trust_of(struct pm_ctx *x, const struct pm_inst *p) {
     if (p && p->unsigned_) return "unsigned";
     const struct pm_repo *r = repo_of(x, p ? p->repo : NULL);
-    if (!p || !p->repo) return "unsigned";
+    if (!p || !p->repo) return signed_official(p) ? "official" : "unsigned";
     return r && r->official ? "official" : "third-party";
 }
 

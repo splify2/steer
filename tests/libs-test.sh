@@ -169,10 +169,10 @@ SPEC
 out="$(P apply --dry-run --spec "$L/redirspec/spec.yaml" --state-dir "$L/redirspec/st" 2>&1)"
 check "выход vless: карта tcp_redir «метка → порт»" "1" \
     "$(printf '%s\n' "$out" | grep -c 'type mark : inet_service')"
-check "  перенаправление на prerouting и output, dstnat - 1, IPv4 и не адрес роутера" "2 2" \
-    "$(printf '%s\n' "$out" | grep -c 'nat hook \(prerouting\|output\) priority dstnat - 1') $(printf '%s\n' "$out" | grep 'steer-tcp-redir' | grep -c 'ip protocol tcp meta mark and 0x0ff00000 @tcp_redir fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
+check "  перенаправление на prerouting (dstnat - 1) и output (то же числом, -101), IPv4 и не адрес роутера" "2 2" \
+    "$(printf '%s\n' "$out" | grep -c 'nat hook prerouting priority dstnat - 1\|nat hook output priority -101') $(printf '%s\n' "$out" | grep 'steer-tcp-redir' | grep -c 'ip protocol tcp meta mark and 0x0ff00000 != 0x00000000 fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
 check "  и то же для IPv6 — своим правилом семейства на prerouting и output" "2" \
-    "$(printf '%s\n' "$out" | grep 'steer-tcp-redir' | grep -c 'meta nfproto ipv6 meta l4proto tcp meta mark and 0x0ff00000 @tcp_redir fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
+    "$(printf '%s\n' "$out" | grep 'steer-tcp-redir' | grep -c 'meta nfproto ipv6 meta l4proto tcp meta mark and 0x0ff00000 != 0x00000000 fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
 check "  заворот DNS раньше (dstnat - 2)" "1" \
     "$(printf '%s\n' "$out" | grep -A1 'chain prerouting_dns' | grep -c 'priority dstnat - 2')"
 cat > "$L/redirspec/spec2.yaml" <<SPEC

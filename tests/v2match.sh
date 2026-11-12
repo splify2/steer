@@ -203,8 +203,8 @@ if [ -x "$XK" ]; then
         bad "balance из интерфейса и VLESS (оба несут IPv6): IPv6 раздаётся картой, отказа нет" "$(echo "$out" | grep -E 'bal_|jhash|v6' | head -n 8)"; fi
     printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl }\nlists:\n  p: { prefixes_file: [lists/dc.lst] }\nrules:\n  - { to: [p], out: nl }\n' > "$tmp/redir6.yaml"
     out="$(cd "$tmp" && "$XKA" apply --dry-run --spec redir6.yaml --state-dir "$tmp/state" 2>&1)"
-    n4="$(echo "$out" | grep 'steer-tcp-redir' | grep -c 'ip protocol tcp meta mark and 0x0ff00000 @tcp_redir fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
-    n6="$(echo "$out" | grep 'steer-tcp-redir' | grep -c 'meta nfproto ipv6 meta l4proto tcp meta mark and 0x0ff00000 @tcp_redir fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
+    n4="$(echo "$out" | grep 'steer-tcp-redir' | grep -c 'ip protocol tcp meta mark and 0x0ff00000 != 0x00000000 fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
+    n6="$(echo "$out" | grep 'steer-tcp-redir' | grep -c 'meta nfproto ipv6 meta l4proto tcp meta mark and 0x0ff00000 != 0x00000000 fib daddr type != local counter redirect to :meta mark and 0x0ff00000 map @tcp_redir')"
     if [ "$n4 $n6" = "2 2" ]; then ok; else
         bad "VLESS: перенаправление TCP — правило IPv4 и правило IPv6 на prerouting и output" "$n4 $n6"; fi
     printf 'version: 2\noutputs:\n  nl: { kind: tunnel, protocol: vless, subscription: sub/nl, ipv6: off }\nlists:\n  p: { prefixes_file: [lists/dc.lst] }\nrules:\n  - { to: [p], out: nl }\n' > "$tmp/redir6off.yaml"

@@ -2991,8 +2991,16 @@ static void handle_packet_one(const struct tun_dev *tun, const unsigned char *pk
         static __thread time_t said;
         if (g_now_s - said >= 10) {
             said = g_now_s;
-            fprintf(stderr, LOG_W "TCP пришёл в устройство (перенаправления к слушателю нет) — сброс "
-                            "(всего %llu)\n", g_tcp_tun_rst);
+            /* Кто и куда: без этого по строке не отличить соединение самого роутера (программа, привязавшая сокет
+             * к устройству туннеля, — так ходили замеры панели и чужие сторожа) от клиента LAN, чьё соединение
+             * началось до привязки выхода, — и каждую такую жалобу приходилось разбирать вслепую. SYN — новое
+             * соединение мимо перенаправления, без SYN — середина соединения, начатого до него. */
+            char sa[INET6_ADDRSTRLEN] = "?", da[INET6_ADDRSTRLEN] = "?";
+            inet_ntop(k.v6 ? AF_INET6 : AF_INET, flow_src_bytes(&k), sa, sizeof(sa));
+            inet_ntop(k.v6 ? AF_INET6 : AF_INET, flow_dst_bytes(&k), da, sizeof(da));
+            fprintf(stderr, LOG_W "TCP пришёл в устройство (перенаправления к слушателю нет) — сброс: %s:%u → %s:%u, "
+                            "%s (всего %llu)\n", sa, k.sport, da, k.dport,
+                    (k.tcp_flags & TCP_SYN) ? "новое соединение" : "середина соединения", g_tcp_tun_rst);
         }
     }
 }

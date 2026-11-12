@@ -2272,8 +2272,13 @@ static void build_tcp_redir(struct nft_table *t, const struct spec *sp) {
         if (!k) ir_gap(c);
         struct nft_rule *r = ir_rule(c);
         ir_x(r, "ip protocol tcp");
-        /* Метка — в карте: счётчик правила считает перенаправленные соединения, а не весь TCP. */
-        ir_setref(r, m, TCP_REDIR_MAP);
+        /* Метка steer у соединения есть — иначе искать нечего. Проверки «метка есть в карте» здесь НЕТ, и это не
+         * упущение: искать ключ в КАРТЕ как в наборе (`meta mark and … @tcp_redir`) ядро Linux 5.15 (OpenWrt 23.05)
+         * запрещает — «Could not process rule: Invalid argument», и набор правил с туннелем на 23.05 не вставал
+         * вовсе; новые ядра это разрешают, поэтому на 24.10 и 25.12 было не видно. Решает сама карта в `redirect`:
+         * метки в ней нет — поиск не находит, правило не срабатывает, соединение идёт по маршруту выхода. Счётчик
+         * поэтому считает соединения с меткой steer, дошедшие до правила, а не только перенаправленные. */
+        ir_x(r, "%s != 0x00000000", m);
         /* Адрес самого роутера (его WAN, адрес в другой своей сети) остаётся ему: в маршруте
          * выхода такой пакет и прежде доставлялся локально — таблица local стоит раньше правил
          * меток. */
@@ -2289,7 +2294,7 @@ static void build_tcp_redir(struct nft_table *t, const struct spec *sp) {
             r = ir_rule(c);
             ir_family(r, 6);
             ir_x(r, "meta l4proto tcp");
-            ir_setref(r, m, TCP_REDIR_MAP);
+            ir_x(r, "%s != 0x00000000", m);
             ir_x(r, "fib daddr type != local");
             if (k == 1 && plat()->local_dns) ir_x(r, "tcp dport != 53");
             ir_counter(r, 0, 0);
