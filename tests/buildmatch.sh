@@ -369,8 +369,8 @@ done
 # (иначе у ядра и у библиотек снова было бы по имени, которое надо держать в одной версии).
 check "отдельных пакетов библиотек нет" "0" \
     "$(grep -c '^ *pack libsteer' build.sh)"
-check "обе библиотеки кладутся в корень steer-core" "1" \
-    "$(grep -c 'cp "\$libs"/libsteer.so.\* "\$libs"/libsteer-wolfssl.so.\* "\$root/usr/lib/"' build.sh)"
+check "библиотеки ядра (libsteer, wolfSSL, ngtcp2) кладутся в корень steer-core" "1" \
+    "$(grep -c 'cp "\$libs"/libsteer.so.\* "\$libs"/libsteer-wolfssl.so.\* "\$libs"/libsteer-ngtcp2.so.\* "\$root/usr/lib/"' build.sh)"
 check "модуль не несёт библиотек ядра" "0" \
     "$(sed -n '/^    for m in \$_modlist/,/^    done/p' build.sh | grep -c 'libsteer')"
 # Миграция со старых пакетов: provides и replaces имени steer, конфликт с steer, libsteer и
@@ -393,7 +393,7 @@ check "steer-core 2.1 держит kmod-tun (иначе apk снимает ег�
 check "steer.preinst читает /etc/apk/world и пропускает уже сделанный переход" "1 1" \
     "$(grep -c 'grep -Eq "^steer-\$_m(><.\*)?\\\$" /etc/apk/world' build.sh) $(grep -c 'migrate.done.json \] && exit 0' build.sh)"
 check "steer.postinst зовёт steer plugin migrate до перезапуска службы" "yes" \
-    "$(awk '/plugin migrate/ { m = NR } /init.d\/steer enable/ { if (!r) r = NR } END { print (m && r && m < r) ? "yes" : "no" }' build.sh)"
+    "$(awk '/plugin migrate/ { if (!m) m = NR } /init.d\/steer enable/ { if (!r) r = NR } END { print (m && r && m < r) ? "yes" : "no" }' build.sh)"
 check "pack передаёт pre-install и pre-upgrade, если есть preinst" "1" \
     "$(sed -n '/^    pack() {/,/^    }/p' build.sh | grep -c -- '--script pre-install:build/scripts/\$_sk.preinst --script pre-upgrade:')"
 check "pack-s2p кладёт в семя awg (плагин без файлов, нужен warpbox)" "1 1" \
@@ -979,8 +979,8 @@ done
 # он не входит (pack-s2p.sh берёт только PLUGINS_NET1 и PLUGINS_STATIC).
 check "мост tgws — плагин extended: PLUGINS_TLS и PLUGINS_EXTENDED, не в семени" "tgws tgws 0" \
     "$(profile_var PLUGINS_TLS) $(profile_var PLUGINS_EXTENDED) $(grep -c 'PLUGINS_TLS\|PLUGINS_EXTENDED' build/pack-s2p.sh)"
-check "build-libs.sh: tgws — статически со своим TLS и wolfSSL (архив с -fPIC), без net1 и libsteer" "1 1" \
-    "$(grep -c 'for _p in \$(profile_var PLUGINS_TLS); do plug "\$_p" tls; done' build/build-libs.sh) $(grep -c '\$CC -o "\$_pd/\$_n" "\$_od"/\*.o "\$WLIB" \$_ldi' build/build-libs.sh)"
+check "build-libs.sh: tgws — свой TLS статически, wolfSSL — общая библиотека ядра (ось steer-crypto), без net1 и libsteer" "1 1 0" \
+    "$(grep -c 'for _p in \$(profile_var PLUGINS_TLS); do plug "\$_p" tls; done' build/build-libs.sh) $(grep -c 'link_exe "\$_pd/\$_n" "\$_od"/\*.o \$MEMOPS "\$WSO" \$_ldi' build/build-libs.sh) $(grep -v '^[[:space:]]*#' build/build-libs.sh | sed -n '/^    plug() {/,/^    }/p' | grep -c 'WLIB')"
 cat "$sd/libsteer" "$sd/net1" "$sd/steerd" "$sd"/plug_* | sort -u > "$sd/all21"
 check "раскладка 2.1 покрывает расширенный профиль (кроме файла профиля)" "src/profile/extended.c " \
     "$(comm -23 "$sd/extended" "$sd/all21" | tr '\n' ' ')"
@@ -1046,6 +1046,31 @@ print("" if len(set(v)) == len(v) and k == sorted(k) else " ".join(v))')"
     else
         echo "buildmatch: не x86_64 или нет компилятора — отпечаток net1 не сверен (ПРОПУСК)"
     fi
+    # Ось steer-crypto (build/wolfssl/crypto.lst): общие библиотеки криптографии и QUIC ядра, с которыми связаны net1
+    # и tgws. Сменилась их сборка (версия, серия патчей, экспорт, раскладка), а ось та же — отказ: плагин прежней
+    # сборки поставился бы на ядро, с библиотеками которого не загрузится.
+    CRLST=build/wolfssl/crypto.lst
+    crrow="$(grep -v '^#' "$CRLST" | awk 'NF' | tail -1)"
+    crax="$(printf '%s' "$crrow" | awk '{print $1}')"
+    crnow="$crax $(sh build/wolfssl/fetch.sh version) $(sh build/ngtcp2/fetch.sh soname) \
+$(sed -n 's/^    \([A-Za-z0-9_]*\);$/\1/p' build/wolfssl/libsteer-wolfssl.map | LC_ALL=C sort | sha256sum | cut -c1-16) \
+$(sed -n 's/^    \([A-Za-z0-9_]*\);$/\1/p' build/ngtcp2/libsteer-ngtcp2.map | LC_ALL=C sort | sha256sum | cut -c1-16) \
+$(cat build/ngtcp2/patches/*.patch | sha256sum | cut -c1-16) $(cat build/wolfssl/abi.c build/wolfssl/user_settings.h | sha256sum | cut -c1-16)"
+    check "crypto.lst: библиотеки ядра = записанным для steer-crypto $crax (изменились — новая ось, строка, версия net1)" \
+        "$crrow" "$crnow"
+    check "crypto.lst: оси не повторяются и растут" "" \
+        "$(grep -v '^#' "$CRLST" | awk 'NF { print $1 }' | python3 -c '
+import sys
+v = [l.strip() for l in sys.stdin if l.strip()]
+k = [tuple(int(p) for p in x.split(".")) for x in v]
+print("" if len(set(v)) == len(v) and k == sorted(k) else " ".join(v))')"
+    check "  CLI_STEER_CRYPTO (src/cli/cli.h) = последней оси" "$crax" \
+        "$(sed -n 's/^#define CLI_STEER_CRYPTO "\(.*\)"$/\1/p' src/cli/cli.h)"
+    for q in net1 tgws; do
+        check "  plugins/$q: compat.steer-crypto = ^$crax" "^$crax" "$(jget "plugins/$q/plugin.json" 'd["compat"].get("steer-crypto")')"
+    done
+    check "  build-libs.sh: SONAME библиотек ядра — по версии wolfSSL и серии ngtcp2" "1 1" \
+        "$(grep -c 'soname,"libsteer-wolfssl.so.$WVER"' build/build-libs.sh) $(grep -c 'soname,"libsteer-ngtcp2.so.$NGTAG"' build/build-libs.sh)"
     # Манифест протокола: requires.plugins.net1 по ABI; подкоманды, помощник и хуки манифеста — ровно
     # команды программы плагина (таблица CMDS у PK_PROGRAM в src/modules/main_<id>.c), а не список ядра.
     for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC) $(profile_var PLUGINS_TLS); do

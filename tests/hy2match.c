@@ -341,11 +341,33 @@ static void test_sub(void) {
         "{\"protocol\":\"hysteria\",\"settings\":{\"version\":1,\"address\":\"old\",\"port\":1}}]}";
     n = hy2_parse_sub(js, nodes, 8, &st);
     CHECK(n == 1 && st.skipped == 1);
-    CHECK(!strcmp(nodes[0].name, "hy") && !strcmp(nodes[0].host, "h.example") && nodes[0].port == 443);
+    /* Имя — remarks конфига («x»), а не tag исходящего (у панелей это «proxy» у всех узлов). */
+    CHECK(!strcmp(nodes[0].name, "x") && !strcmp(nodes[0].host, "h.example") && nodes[0].port == 443);
     CHECK(!strcmp(nodes[0].auth, "pa\"ss") && !strcmp(nodes[0].sni, "front.example") && nodes[0].has_pin);
     CHECK(nodes[0].obfs && !strcmp(nodes[0].obfs_pass, "obfspass"));
     CHECK(nodes[0].hop_n == 1 && nodes[0].hop[0] == 20000 && nodes[0].hop[1] == 20100 && nodes[0].hop_s == 10);
     CHECK(nodes[0].up_bps == 6250000 && nodes[0].down_bps == 12500000);
+
+    /* Ответ панели клиенту Happ: массив конфигов, tag у всех исходящих — «proxy», различает их только
+     * remarks. Узел называется по remarks, второй hysteria того же конфига — с номером; конфиг без
+     * remarks — по tag, как прежде. Пропущенный узел называется в причине тем же именем. */
+    const char *happ =
+        "[{\"remarks\":\"\\ud83c\\uddf3\\ud83c\\uddf1 Амстердам 3\",\"outbounds\":["
+        "{\"tag\":\"proxy\",\"protocol\":\"hysteria\",\"settings\":{\"version\":2,\"address\":\"a.example\",\"port\":443},"
+        "\"streamSettings\":{\"hysteriaSettings\":{\"version\":2,\"auth\":\"a\"}}},"
+        "{\"tag\":\"proxy-2\",\"protocol\":\"hysteria\",\"settings\":{\"version\":2,\"address\":\"b.example\",\"port\":443},"
+        "\"streamSettings\":{\"hysteriaSettings\":{\"version\":2,\"auth\":\"a\"}}},"
+        "{\"tag\":\"direct\",\"protocol\":\"freedom\"}]},"
+        "{\"outbounds\":[{\"tag\":\"bare\",\"protocol\":\"hysteria\",\"settings\":{\"version\":2,\"address\":\"c.example\",\"port\":443},"
+        "\"streamSettings\":{\"hysteriaSettings\":{\"version\":2,\"auth\":\"a\"}}}]},"
+        "{\"remarks\":\"Стокгольм 1\",\"outbounds\":[{\"tag\":\"proxy\",\"protocol\":\"hysteria\","
+        "\"settings\":{\"version\":1,\"address\":\"d.example\",\"port\":443}}]}]";
+    n = hy2_parse_sub(happ, nodes, 8, &st);
+    CHECK(n == 3 && st.skipped == 1);
+    CHECK(!strcmp(nodes[0].name, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам 3") && !strcmp(nodes[0].host, "a.example"));
+    CHECK(!strcmp(nodes[1].name, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам 3 (2)") && !strcmp(nodes[1].host, "b.example"));
+    CHECK(!strcmp(nodes[2].name, "bare"));
+    CHECK(st.reasons_n == 1 && !strcmp(st.reasons[0].example, "Стокгольм 1"));
 
     /* Имя в записи \u с суррогатной парой (панели на Python/PHP): ⚡ 📱 Германия — один знак вне BMP, не два CESU. */
     const char *jsn =

@@ -1088,6 +1088,86 @@ out:
     free(sr);
 }
 
+/* ---- семя после установки (2.1.4) ----
+ *
+ * Архивы семени (/usr/share/steer/seed/<id>/<версия>/…s2p) нужны, пока плагина нет: первая установка и переход без
+ * сети. Плагин, который уже стоит версией не ниже семени, из них никогда не ставится (обновление из семени — только
+ * на более новую, migrate_refresh), а архив лежал на флеше рядом с распакованным плагином: net1 — дважды, 0,7 МБ на
+ * mipsel в 2.1.3. Поэтому после каждой установки, обновления, ensure и migrate архивы таких плагинов снимаются, а
+ * index.json и index.json.sig остаются: по provides.kinds семени ядро узнаёт, кто даёт вид (pmkind.c).
+ *
+ * Не трогается: архив плагина, которого нет, который не встал (failed) или стоит версией ниже семени — ему семя
+ * ещё нужно (откат при неудачной проверке здоровья оставляет прежнюю версию, и семя для повтора на месте). Файлы
+ * принадлежат пакету steer-core: apk и opkg при обновлении и снятии пакета отсутствующий файл пропускают, а новый
+ * пакет кладёт новое семя — его migrate в postinst ставит и снова чистит. Без сети снятый и потом снова нужный
+ * плагин уже не встанет из семени — только из сети (отказ «архива в семени нет» говорит об этом). */
+static void rmdir_up(const char *dir, const char *stop) {
+    char *d = pm_strdup(dir);
+    size_t sl = strlen(stop);
+    while (strlen(d) > sl && !strncmp(d, stop, sl) && rmdir(d) == 0) {
+        char *sl2 = strrchr(d, '/');
+        if (!sl2) break;
+        *sl2 = '\0';
+    }
+    free(d);
+}
+
+static void seed_prune(struct pm_ctx *x) {
+    char *ip = pm_path(pm_seed(), "index.json");
+    struct pm_err e = {0};
+    struct ydoc *d = pm_exists(ip) ? pm_json_load(ip, &e) : NULL;
+    free(ip);
+    if (!d) return;
+    struct pm_state st = {0};
+    if (pm_state_load(&st, &e) != 0) { ydoc_free(d); return; }
+    const struct ynode *plugins = ynode_get(ydoc_root(d), "plugins");
+    char *done = NULL;
+    unsigned long long freed = 0;
+    for (size_t i = 0; i < ynode_len(plugins); i++) {
+        const char *id = ynode_key_at(plugins, i)->str;
+        struct pm_inst *p = pm_state_find(&st, id);
+        if (!p || !p->version || (p->state && !strcmp(p->state, "failed"))) continue;
+        char *pd = pm_path(pm_root(), id);
+        int here = pm_is_dir(pd);
+        free(pd);
+        if (!here) continue;
+        const struct ynode *vers = ynode_get(ynode_val_at(plugins, i), "versions");
+        for (size_t k = 0; k < ynode_len(vers); k++) {
+            const struct ynode *v = ynode_at(vers, k);
+            const char *vv = yn_str(v, "version");
+            if (!vv || pm_ver_cmp(vv, p->version) > 0) continue;
+            const struct ynode *assets = ynode_get(v, "assets");
+            for (size_t a = 0; a < ynode_len(assets); a++) {
+                const char *path = yn_str(ynode_val_at(assets, a), "path");
+                if (!path || strstr(path, "..")) continue;
+                /* Те же два места, где архив ищет установка (fetch_asset): путь индекса и имя файла в корне семени. */
+                const char *base = strrchr(path, '/');
+                char *cands[2] = { pm_path(pm_seed(), path), pm_path(pm_seed(), base ? base + 1 : path) };
+                for (int c = 0; c < 2; c++) {
+                    struct stat sb;
+                    if (lstat(cands[c], &sb) != 0 || !S_ISREG(sb.st_mode) || unlink(cands[c]) != 0) continue;
+                    freed += (unsigned long long)sb.st_size;
+                    char *sl = strrchr(cands[c], '/');
+                    if (sl) { *sl = '\0'; rmdir_up(cands[c], pm_seed()); }
+                    char *n2 = done ? pm_fmt("%s, %s %s", done, id, vv) : pm_fmt("%s %s", id, vv);
+                    free(done);
+                    done = n2;
+                }
+                free(cands[0]);
+                free(cands[1]);
+            }
+        }
+    }
+    if (done) {
+        char h[32];
+        pm_human(freed, h, sizeof(h));
+        pm_progress(x, "семя: убраны архивы стоящих плагинов (%s) — освобождено %s", done, h);
+    }
+    free(done);
+    pm_state_free(&st);
+    ydoc_free(d);
+}
+
 /* `steer plugin migrate`: плагины, которых требует спека человека, и те, что стояли пакетами
  * (migrate.json, его пишет pre-upgrade/preinst steer-core 2.1); при первой установке — все `default: true`
  * индекса семени. Работает без демона; неудача одного плагина остальные не останавливает. */
@@ -1415,6 +1495,10 @@ int pm_main(int argc, char **argv) {
             else rc = cmd_repo_del(&x, pos[2]);
         }
     }
+    /* Семя после установки (seed_prune выше): после всякой команды, которая могла поставить плагин, — и после
+     * неудачной: частично вставшие плагины тоже стоят. */
+    if (!strcmp(act, "install") || !strcmp(act, "update") || !strcmp(act, "ensure") || !strcmp(act, "migrate"))
+        seed_prune(&x);
     job_finish(rc);
 out_nojob:
     pm_unlock();
@@ -1423,7 +1507,7 @@ out:
     pm_mcache_free(&x);
     pm_state_free(&x.st);
     pm_repos_free(&x.repos);
-    free(x.tg.core); free(x.tg.api); free(x.tg.abi); free(x.tg.host); free(x.tg.splify2); free(x.tg.arch);
+    free(x.tg.core); free(x.tg.api); free(x.tg.abi); free(x.tg.crypto); free(x.tg.host); free(x.tg.splify2); free(x.tg.arch);
     free(ens);
     free(files);
     (void)g_job_log;

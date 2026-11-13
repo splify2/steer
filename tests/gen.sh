@@ -1646,10 +1646,11 @@ check "ipv6 routed: IPv6 правил во второй выход — отка�
     "$(chain_of "$h6r" forward_v6 | grep -c 'comment "steer-v6drop:other"')"
 # Парный набор у группы второго выхода есть — ради строк IPv6 адресного списка, — но без срока:
 # резолвер в него адресов не кладёт (dom6_ok — нет), и AAAA её имён пуст.
-check "ipv6 routed: доменная группа второго выхода — без половины IPv6 резолвера (AAAA пуст)" "0" \
-    "$(printf '%s\n' "$h6r" | sed -n '/set other_dom6 {/,/}/p' | grep -c timeout)"
+# Доменные правила da и db стоят ниже правила c (dir) — у них своя часть группы (_s2, порядок правил).
+check "ipv6 routed: доменная группа второго выхода — набор IPv4 есть, двойника IPv6 нет" "1 0" \
+    "$(printf '%s\n' "$h6r" | grep -c 'set other_dom_s2 {') $(printf '%s\n' "$h6r" | grep -c 'set other_dom_s26 {')"
 check "ipv6 routed: доменная группа донора — с половиной IPv6" "1" \
-    "$(printf '%s\n' "$h6r" | sed -n '/set host_dom6 {/,/}/p' | grep -c 'flags interval,timeout')"
+    "$(printf '%s\n' "$h6r" | sed -n '/set host_dom_s26 {/,/}/p' | grep -c 'flags interval,timeout')"
 check "ipv6 routed: у донора своя метка и в postrouting_guard" "1" \
     "$(chain_of "$h6r" postrouting_guard | grep -c 'comment "steer-guard:host"')"
 check "ipv6 routed: резолвер — у имён второго выхода только IPv4" "46 4" \
@@ -1681,6 +1682,100 @@ check "ipv6 off: IPv6 правил выхода — отказ по метке" 
     "$(chain_of "$h6o" forward_v6 | grep -c 'comment "steer-v6drop:host"')"
 check "ipv6 off: у второго выхода без ключа IPv6 прежний (не отвергается)" "0" \
     "$(chain_of "$h6o" forward_v6 | grep -c 'steer-v6drop:other')"
+
+# ---- ПОРЯДОК ПРАВИЛ ПРИ ПЕРЕСЕЧЕНИИ СПИСКОВ (rule_segs, model/parse.c) ---------------------------
+# Правила одного выхода с одними клиентами сливаются в один набор, и место набора — у первого из
+# них. Если между ними стоит правило другого выхода, позднее правило поднималось бы выше него:
+# [insta→A, youtube→B, google→A], youtube.com есть и у google — и уходил в A. Теперь google — своя
+# часть (A_dom_s2) ПОСЛЕ правила youtube, и в цепочке, и в таблице резолвера (первый канал имени —
+# первое правило). Без барьера между правилами одного выхода — слияние как раньше, наборов не больше.
+printf 'instagram.com\n' > "$tmp/ord-insta.dom"
+printf 'youtube.com\n' > "$tmp/ord-yt.dom"
+printf 'google.com\nyoutube.com\n' > "$tmp/ord-g.dom"
+printf '10.1.0.0/16\n' > "$tmp/ord-a.lst"
+printf '10.1.2.0/24\n' > "$tmp/ord-b.lst"
+printf '10.1.2.0/24\n10.3.0.0/16\n' > "$tmp/ord-c.lst"
+ordspec() {   # ordspec ФАЙЛ ПРАВИЛА...
+    f="$1"; shift
+    {
+        cat <<EOF
+version: 2
+lan: { devices: [steer-nolan0] }
+clients:
+  p1: { mac: [aa:bb:cc:dd:ee:01] }
+  p2: { mac: [aa:bb:cc:dd:ee:02] }
+  pn: { addr: [192.168.1.0/24] }
+lists:
+  insta: { domains_file: $tmp/ord-insta.dom }
+  yt:    { domains_file: $tmp/ord-yt.dom }
+  g:     { domains_file: $tmp/ord-g.dom }
+  ia:    { prefixes_file: $tmp/ord-a.lst }
+  ib:    { prefixes_file: $tmp/ord-b.lst }
+  ic:    { prefixes_file: $tmp/ord-c.lst }
+outputs:
+  A: { kind: interface, device: wg1 }
+  B: { kind: interface, device: wg2 }
+rules:
+EOF
+        for r in "$@"; do printf '  - %s\n' "$r"; done
+    } > "$f"
+}
+ORD="--state-dir $tmp/st-ord"
+ord_marks() { chain_of "$1" prerouting_mark | grep ' ip daddr ' | sed -n 's/.*comment "steer:\([^"]*\)".*/\1/p' | tr '\n' ' ' | sed 's/ $//'; }
+ord_table() { "$BIN" dnsd-table --spec "$1" $ORD 2>/dev/null | awk -F'|' 'NR > 1 { printf "%s%s:%s", n++ ? " " : "", $1, $5 }'; }
+
+ordspec "$tmp/ord1.yaml" '{ name: insta, to: insta, out: A }' '{ name: youtube, to: yt, out: B }' \
+    '{ name: google, to: g, out: A }'
+ord1="$("$BIN" apply --dry-run --spec "$tmp/ord1.yaml" $ORD 2>/dev/null)"
+check "порядок: [insta→A, youtube→B, google→A] — google своей частью после youtube" \
+    "A_dom B_dom A_dom_s2" "$(ord_marks "$ord1")"
+check "порядок: резолвер — каналы в том же порядке (первый канал youtube.com — youtube→B)" \
+    "A_dom:insta B_dom:youtube A_dom_s2:google" "$(ord_table "$tmp/ord1.yaml")"
+check "порядок: у части свой двойник IPv6 и своя строка снятия метки" "1 1" \
+    "$(printf '%s\n' "$ord1" | grep -c 'set A_dom_s26 {') $(chain_of "$ord1" postrouting_down | grep -c 'ip saddr @A_dom_s2 ')"
+ordspec "$tmp/ord2.yaml" '{ name: insta, to: insta, out: A }' '{ name: google, to: g, out: A }' \
+    '{ name: youtube, to: yt, out: B }'
+check "порядок: правила одного выхода подряд — один набор, как раньше" \
+    "A_dom B_dom" "$(ord_marks "$("$BIN" apply --dry-run --spec "$tmp/ord2.yaml" $ORD 2>/dev/null)")"
+check "порядок: правила одного выхода подряд — резолвер сливает их в один канал" \
+    "A_dom:insta B_dom:youtube" "$(ord_table "$tmp/ord2.yaml")"
+# Адресные списки: 10.1.2.0/24 у ib (B) и у ic (A) — решает ib, он выше.
+ordspec "$tmp/ord3.yaml" '{ name: a, to: ia, out: A }' '{ name: b, to: ib, out: B }' '{ name: c, to: ic, out: A }'
+ord3="$("$BIN" apply --dry-run --spec "$tmp/ord3.yaml" $ORD 2>/dev/null)"
+check "порядок: адресные списки — A, B, затем вторая часть A" "A_ip B_ip A_ip_s2" "$(ord_marks "$ord3")"
+check "порядок: адрес из обоих списков — в наборе B и во второй части A, не в первой" "0 1 1" \
+    "$(printf '%s\n' "$ord3" | sed -n '/set A_ip {/,/}/p' | grep -c '10.1.2.0/24') $(printf '%s\n' "$ord3" | sed -n '/set B_ip {/,/}/p' | grep -c '10.1.2.0/24') $(printf '%s\n' "$ord3" | sed -n '/set A_ip_s2 {/,/}/p' | grep -c '10.1.2.0/24')"
+# Общий домен раньше конкретного: решает порядок правил, а не длина суффикса.
+ordspec "$tmp/ord4.yaml" '{ name: g, to: g, out: A }' '{ name: yt, to: yt, out: B }'
+check "порядок: имя в двух правилах — первый канал у верхнего правила, не у более точного" \
+    "A_dom:g B_dom:yt" "$(ord_table "$tmp/ord4.yaml")"
+# Правило того же выхода, но другого действия (quic: block) — тоже барьер.
+ordspec "$tmp/ord5.yaml" '{ name: insta, to: insta, out: A }' '{ name: q, to: yt, out: A, quic: block }' \
+    '{ name: google, to: g, out: A }'
+check "порядок: правило того же выхода с quic: block между — барьер" \
+    "A_dom A_dom_c0_p1 A_dom_s2" \
+    "$(ord_marks "$("$BIN" apply --dry-run --spec "$tmp/ord5.yaml" $ORD 2>/dev/null)")"
+# Тот же выход с другими портами — не барьер: пакет, совпавший с обоими, уходит туда же.
+ordspec "$tmp/ord9.yaml" '{ name: insta, to: insta, out: A }' '{ name: p, to: ib, out: A }' \
+    '{ name: google, to: g, out: A }'
+sed -i 's|^  ib: .*|  ib:    { prefixes_file: '"$tmp"'/ord-b.lst, proto: udp, ports: ["50000-65535"] }|' "$tmp/ord9.yaml"
+check "порядок: правило того же выхода с другими портами между — не барьер" \
+    "A_dom A_ip_c0_p1" "$(ord_marks "$("$BIN" apply --dry-run --spec "$tmp/ord9.yaml" $ORD 2>/dev/null)")"
+# Правило другого выхода на ДРУГОЕ устройство (MAC без общих) — не барьер: пакеты не пересекаются.
+ordspec "$tmp/ord6.yaml" '{ name: i1, for: p1, to: insta, out: A }' '{ name: y2, for: p2, to: yt, out: B }' \
+    '{ name: g1, for: p1, to: g, out: A }'
+check "порядок: между правилами устройства p1 — правило устройства p2 — сливаются" \
+    "A_dom_c0 B_dom_c1" "$(ord_marks "$("$BIN" apply --dry-run --spec "$tmp/ord6.yaml" $ORD 2>/dev/null)")"
+# А правило на подсеть, в которую входит устройство, — барьер.
+ordspec "$tmp/ord7.yaml" '{ name: i1, for: p1, to: insta, out: A }' '{ name: yn, for: pn, to: yt, out: B }' \
+    '{ name: g1, for: p1, to: g, out: A }'
+check "порядок: правило на подсеть между правилами устройства — барьер" \
+    "A_dom_c0 B_dom_c1 A_dom_c0_s2" "$(ord_marks "$("$BIN" apply --dry-run --spec "$tmp/ord7.yaml" $ORD 2>/dev/null)")"
+# Выключенное правило барьером не служит.
+ordspec "$tmp/ord8.yaml" '{ name: insta, to: insta, out: A }' '{ name: youtube, to: yt, out: B, enabled: false }' \
+    '{ name: google, to: g, out: A }'
+check "порядок: выключенное правило между — не барьер" \
+    "A_dom" "$(ord_marks "$("$BIN" apply --dry-run --spec "$tmp/ord8.yaml" $ORD 2>/dev/null)")"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -199,6 +199,7 @@ LIBSTEER_1 {
     rtnl_rules_dup;
     rtnl_table_flush;
     rtnl_table_has_default;
+    rule_segs;
     run;
     run_quiet;
     sc_hash_final;

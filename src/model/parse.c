@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include "spec.h"
@@ -270,9 +271,28 @@ void name_part(char *dst, size_t n, const char *name, size_t width) {
     snprintf(dst, n, "%.*s%06x", (int)(width - 6), name, (unsigned)(h & 0xffffff));
 }
 
+/* Хвост имени набора по части группы (rule_segs): у части 0 его нет — имя прежнее до байта; у
+ * следующих — «_s<номер>», номер с двух. Номер вида 16, 26, ... получает ещё «x»: иначе имя части
+ * «_s1» плюс «6» двойника IPv6 совпало бы с именем части «_s16» (та же беда, что у twin_clash). */
+static size_t seg_suffix(char *dst, size_t n, int seg) {
+    dst[0] = '\0';
+    if (seg <= 0) return 0;
+    int num = seg + 1;
+    snprintf(dst, n, "_s%d%s", num, num >= 16 && num % 10 == 6 ? "x" : "");
+    return strlen(dst);
+}
+
+/* Ширина части имени выхода с хвостом части: имя обязано остаться в прежней длине (31 знак на
+ * старых ядрах вместе с «6» двойника и буквой семейства), поэтому хвост отнимается у выхода. */
+static size_t seg_width(size_t width, size_t sl) {
+    return sl + 4 < width ? width - sl : 4;
+}
+
 void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out, const char *kind,
                     const char (*from)[64], size_t from_n, int realip,
-                    const struct l4match *l4) {
+                    const struct l4match *l4, int seg) {
+    char ss[16];
+    size_t sl = seg_suffix(ss, sizeof ss, seg);
     /* realip различает только доменные группы: у адресных резолвер не участвует. */
     int rip = realip && !strcmp(kind, "dom");
     int pd = l4_disc(sp, l4);
@@ -283,25 +303,25 @@ void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out,
     if (!pd) {
         if (!rip && from_same(from, from_n, sp->lan.from, sp->lan.from_n)) {
             char o[32];
-            name_part(o, sizeof o, out, 24);
-            snprintf(dst, n, "%s_%s", o, kind);
+            name_part(o, sizeof o, out, seg_width(24, sl));
+            snprintf(dst, n, "%s_%s%s", o, kind, ss);
             return;
         }
         /* Выход обрезается сильнее, чтобы имя с суффиксом осталось коротким: у наборов
          * nftables на старых ядрах предел длины 32 символа. */
         int cd = from_disc(sp, from, from_n);
         char o[32];
-        name_part(o, sizeof o, out, 18);
-        snprintf(dst, n, "%s_%s_c%d%s%s", o, kind, cd, rip ? "r" : "",
-                 !rip && twin_clash(sp, out, cd, 0) ? "x" : "");
+        name_part(o, sizeof o, out, seg_width(18, sl));
+        snprintf(dst, n, "%s_%s_c%d%s%s%s", o, kind, cd, rip ? "r" : "",
+                 !rip && twin_clash(sp, out, cd, 0) ? "x" : "", ss);
         return;
     }
     /* Выход обрезается ещё сильнее: суффиксов теперь два, а предел в 32 символа тот же. */
     int cd = from_disc(sp, from, from_n);
     char o[32];
-    name_part(o, sizeof o, out, 14);
-    snprintf(dst, n, "%s_%s_c%d%s_p%d%s", o, kind, cd, rip ? "r" : "", pd,
-             twin_clash(sp, out, cd, pd) ? "x" : "");
+    name_part(o, sizeof o, out, seg_width(14, sl));
+    snprintf(dst, n, "%s_%s_c%d%s_p%d%s%s", o, kind, cd, rip ? "r" : "", pd,
+             twin_clash(sp, out, cd, pd) ? "x" : "", ss);
 }
 
 /* Имя СОСТАВНОГО набора канала со смешанным сужением (src/model/srsplan.c): у элементов свои
@@ -309,11 +329,13 @@ void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out,
  * группы без сужения, и свой хвост «_m», чтобы с ней не совпасть. Выход обрезается до 16:
  * имя обязано уложиться в 31 символ (старые ядра). */
 void group_set_name_mixed(const struct spec *sp, char *dst, size_t n, const char *out,
-                          const char *kind, const char (*from)[64], size_t from_n, int realip) {
+                          const char *kind, const char (*from)[64], size_t from_n, int realip,
+                          int seg) {
     int rip = realip && !strcmp(kind, "dom");
-    char o[32];
-    name_part(o, sizeof o, out, 16);
-    snprintf(dst, n, "%s_%s_c%d%s_m", o, kind, from_disc(sp, from, from_n), rip ? "r" : "");
+    char o[32], ss[16];
+    size_t sl = seg_suffix(ss, sizeof ss, seg);
+    name_part(o, sizeof o, out, seg_width(16, sl));
+    snprintf(dst, n, "%s_%s_c%d%s_m%s", o, kind, from_disc(sp, from, from_n), rip ? "r" : "", ss);
 }
 
 /* Имя доп. группы канала — клауз набора с условиями, которых у канала нет (клиент, приложение,
@@ -321,12 +343,127 @@ void group_set_name_mixed(const struct spec *sp, char *dst, size_t n, const char
  * ним остаётся место на «_x» набора исключений. */
 void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char *out,
                           const char *kind, const char (*from)[64], size_t from_n, int realip,
-                          unsigned id) {
+                          unsigned id, int seg) {
     int rip = realip && !strcmp(kind, "dom");
-    char o[32];
-    name_part(o, sizeof o, out, 12);
-    snprintf(dst, n, "%s_%s_c%d%s_e%u", o, kind, from_disc(sp, from, from_n),
-             rip ? "r" : "", id);
+    char o[32], ss[16];
+    size_t sl = seg_suffix(ss, sizeof ss, seg);
+    name_part(o, sizeof o, out, seg_width(12, sl));
+    snprintf(dst, n, "%s_%s_c%d%s_e%u%s", o, kind, from_disc(sp, from, from_n),
+             rip ? "r" : "", id, ss);
+}
+
+/* ---- ПОРЯДОК ПРАВИЛ ПРИ СЛИЯНИИ НАБОРОВ (rule_segs, объявление в spec.h) ------------------------
+ *
+ * Компилятор сливает правила одного выхода с одними клиентами (и тем же сужением, политикой
+ * семейства) в одну группу — один набор и одно правило nft, — и место группы в цепочке у её ПЕРВОГО
+ * правила. Пока между сливаемыми правилами нет правила с другим действием, это ничего не меняет. А
+ * если есть — позднее правило молча поднималось выше него: [Insta→A, YouTube→B, Google→A], и
+ * youtube.com из списка Google уходил в A, хотя YouTube→B стоит раньше (Zapret Manager ставит
+ * «свой список» секции первым, и списки секций пересекаются). Первое совпавшее правило спеки
+ * обязано решать и тут.
+ *
+ * Поэтому у каждого правила — номер ЧАСТИ его группы. Часть сменяется, когда между правилом и
+ * предыдущим правилом той же группы стоит правило, которое может забрать те же пакеты (клиенты
+ * могут пересечься) с другим действием: другой выход, quic, torrent, подмена порта, политика
+ * семейства, режим резолвера или сервер DNS (протокол и порты сужения действия не меняют). Назначения такого правила считаются пересекающимися
+ * всегда: списки меняются без пересборки, и доказать их непересечение здесь нечем. Правило того же
+ * действия барьером не служит — перестановка двух правил в один выход трафика не меняет, и такие
+ * правила сливаются, как раньше.
+ *
+ * Номер входит в имя набора (хвост «_s<номер>» у частей после первой), и группа сливает только
+ * правила одной части. Считают его одной функцией и компилятор (build_groups), и резолвер
+ * (dch_build): имена наборов у них совпадают без сговора, а первый канал резолвера для имени —
+ * первое правило спеки. Порядок — тот же, что у компилятора: сначала правила на устройство, потом
+ * остальные; выключенные правила не участвуют. */
+static int rule_dns_eff(const struct spec *sp, const struct spec_rule *r) {
+    return r->dns ? (int)r->dns : (int)sp->dns.general;
+}
+
+/* Одно ли действие у правил: что сделается с пакетом, совпавшим с обоими. Протокол и порты сужения
+ * действия не меняют (пакет, совпавший с обоими правилами, уйдёт в тот же выход) — меняют отказ QUIC,
+ * торренты и подмена порта. */
+static int rule_same_action(const struct spec *sp, const struct spec_rule *a, const struct spec_rule *b) {
+    if (strcmp(rule_out(sp, a)->name, rule_out(sp, b)->name) != 0) return 0;
+    const struct l4match *la = &rule_list(sp, a)->l4, *lb = &rule_list(sp, b)->l4;
+    if (la->quic_block != lb->quic_block || la->torrent != lb->torrent ||
+        la->override_port != lb->override_port) return 0;
+    if (a->family != b->family || a->fam_block != b->fam_block) return 0;
+    if (a->realip != b->realip) return 0;
+    return rule_dns_eff(sp, a) == rule_dns_eff(sp, b);
+}
+
+/* Вид записи клиента для проверки пересечения: 1 — MAC, 2 — один адрес IPv4, 3 — владелец сокета
+ * (uid:N), 0 — прочее (подсеть, IPv6, устройство): про такое пересечение не решаем. */
+static int who_kind(const char *s) {
+    if (spec_is_mac(s)) return 1;
+    if (!strncmp(s, "uid:", 4)) return 3;
+    if (strchr(s, '/') || strchr(s, ':')) return 0;
+    struct in_addr a;
+    return inet_pton(AF_INET, s, &a) == 1 ? 2 : 0;
+}
+
+/* Могут ли клиенты двух правил пересечься. Нет — только когда оба списка из записей одного
+ * точного вида (MAC, одиночный IPv4, uid) и общих записей нет: MAC и адрес одного устройства, как и
+ * подсеть с адресом, пересекаются. */
+static int rule_who_overlap(const struct spec *sp, const struct spec_rule *a, const struct spec_rule *b) {
+    const struct spec_client *wa = rule_who(sp, a), *wb = rule_who(sp, b);
+    if (!wa->from_n || !wb->from_n) return 1;
+    int k = who_kind(wa->from[0]);
+    if (!k) return 1;
+    for (size_t i = 0; i < wa->from_n; i++) if (who_kind(wa->from[i]) != k) return 1;
+    for (size_t i = 0; i < wb->from_n; i++) if (who_kind(wb->from[i]) != k) return 1;
+    for (size_t i = 0; i < wa->from_n; i++)
+        for (size_t j = 0; j < wb->from_n; j++)
+            if (!strcasecmp(wa->from[i], wb->from[j])) return 1;
+    return 0;
+}
+
+/* Могут ли правила попасть в одну группу компилятора: выход, клиенты, политика семейства, «весь
+ * трафик» и сужение — ключ build_groups. Режим резолвера сюда не входит: адресное правило компилятор
+ * сливает и с доменным другого режима, и номер части у таких правил обязан быть общим. */
+static int rule_same_key(const struct spec *sp, const struct spec_rule *a, const struct spec_rule *b) {
+    if (strcmp(rule_out(sp, a)->name, rule_out(sp, b)->name) != 0) return 0;
+    if (!l4match_same(&rule_list(sp, a)->l4, &rule_list(sp, b)->l4)) return 0;
+    if (a->family != b->family || a->fam_block != b->fam_block) return 0;
+    if (rule_list(sp, a)->all != rule_list(sp, b)->all) return 0;
+    const struct spec_client *wa = rule_who(sp, a), *wb = rule_who(sp, b);
+    return from_same(wa->from, wa->from_n, wb->from, wb->from_n);
+}
+
+int *rule_segs(const struct spec *sp) {
+    size_t n = sp->rule_n;
+    int *seg = calloc(n ? n : 1, sizeof(*seg));
+    size_t *ord = malloc((n ? n : 1) * sizeof(*ord));
+    if (!seg || !ord) { free(seg); free(ord); return NULL; }
+    size_t m = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (size_t i = 0; i < n; i++) {
+            const struct spec_rule *r = &sp->rule[i];
+            if ((pass == 0) != (r->dev_scope != 0) || r->disabled) continue;
+            ord[m++] = i;
+        }
+    for (size_t p = 0; p < m; p++) {
+        const struct spec_rule *c = &sp->rule[ord[p]];
+        int barrier = 0, s = 0;
+        for (size_t q = p; q-- > 0;) {
+            const struct spec_rule *d = &sp->rule[ord[q]];
+            int same = rule_same_action(sp, d, c);
+            if (rule_same_key(sp, d, c)) {
+                /* Часть не меньше, чем у любого прежнего правила того же ключа, и больше — если
+                 * между ними барьер: компилятор сливает по ключу и правила разного режима (у
+                 * адресного режима нет), и через барьер им сливаться нельзя. */
+                int want = seg[ord[q]] + barrier;
+                if (want > s) s = want;
+                if (same) break;            /* часть этого правила уже учла всех прежних */
+                /* Тот же ключ, другой режим резолвера или сервер DNS: у резолвера это другой канал,
+                 * и для правил за ним он — барьер (первым для общих имён должен остаться он). */
+            }
+            if (!same && rule_who_overlap(sp, d, c)) barrier = 1;
+        }
+        seg[ord[p]] = s;
+    }
+    free(ord);
+    return seg;
 }
 
 /* Доменный набор с половиной IPv6 — объяснение у объявления в spec.h. Условия — те же, по

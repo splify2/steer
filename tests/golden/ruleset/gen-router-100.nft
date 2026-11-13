@@ -4,25 +4,25 @@
 # env: STEER_PLUGINS_ETC=TMP/plugetc
 # env: STEER_PLUGINS_ROOT=TMP/plugins
 table inet steer {
-    set host_dom {
+    set host_ip {
         type ipv4_addr
-        flags interval,timeout
+        flags interval
         auto-merge
         elements = { 203.0.113.0/24 }
     }
-    set host_dom6 {
+    set host_ip6 {
         type ipv6_addr
-        flags interval,timeout
+        flags interval
         auto-merge
         elements = { 2001:db8:a::/48 }
     }
-    set other_dom {
+    set other_ip {
         type ipv4_addr
-        flags interval,timeout
+        flags interval
         auto-merge
         elements = { 198.51.100.0/24 }
     }
-    set other_dom6 {
+    set other_ip6 {
         type ipv6_addr
         flags interval
         auto-merge
@@ -39,6 +39,21 @@ table inet steer {
         auto-merge
         elements = { 2001:db8:c::/48 }
     }
+    set host_dom_s2 {
+        type ipv4_addr
+        flags interval,timeout
+        auto-merge
+    }
+    set host_dom_s26 {
+        type ipv6_addr
+        flags interval,timeout
+        auto-merge
+    }
+    set other_dom_s2 {
+        type ipv4_addr
+        flags interval,timeout
+        auto-merge
+    }
     set v6donor {
         type ipv6_addr
         flags interval
@@ -47,23 +62,29 @@ table inet steer {
     chain ingress_mark {
         type filter hook ingress device "steer-nolan0" priority filter + 10; policy accept;
         meta mark and 0x0ff00000 == 0x00000000 meta mark set mark and 0xf00fffff or 0x0f000000 comment "steer-ingress"
-        iifname "steer-nolan0" ip daddr @host_dom meta mark set mark and 0xf00fffff or 0x40100000 counter return comment "steer:host_dom"
-        iifname "steer-nolan0" ip6 daddr @host_dom6 meta mark set mark and 0xf00fffff or 0x40100000 counter return comment "steer:host_dom"
-        iifname "steer-nolan0" ip daddr @other_dom meta mark set mark and 0xf00fffff or 0x40200000 counter return comment "steer:other_dom"
-        iifname "steer-nolan0" ip6 daddr @other_dom6 meta mark set mark and 0xf00fffff or 0x40200000 counter return comment "steer:other_dom"
+        iifname "steer-nolan0" ip daddr @host_ip meta mark set mark and 0xf00fffff or 0x40100000 counter return comment "steer:host_ip"
+        iifname "steer-nolan0" ip6 daddr @host_ip6 meta mark set mark and 0xf00fffff or 0x40100000 counter return comment "steer:host_ip"
+        iifname "steer-nolan0" ip daddr @other_ip meta mark set mark and 0xf00fffff or 0x40200000 counter return comment "steer:other_ip"
+        iifname "steer-nolan0" ip6 daddr @other_ip6 meta mark set mark and 0xf00fffff or 0x40200000 counter return comment "steer:other_ip"
         iifname "steer-nolan0" ip daddr @dir_ip counter return comment "steer:dir_ip"
         iifname "steer-nolan0" ip6 daddr @dir_ip6 counter return comment "steer:dir_ip"
+        iifname "steer-nolan0" ip daddr @host_dom_s2 meta mark set mark and 0xf00fffff or 0x40100000 counter return comment "steer:host_dom_s2"
+        iifname "steer-nolan0" ip6 daddr @host_dom_s26 meta mark set mark and 0xf00fffff or 0x40100000 counter return comment "steer:host_dom_s2"
+        iifname "steer-nolan0" ip daddr @other_dom_s2 meta mark set mark and 0xf00fffff or 0x40200000 counter return comment "steer:other_dom_s2"
         ip6 saddr @v6donor ip6 daddr != @v6donor ip6 daddr != { fc00::/7, fe80::/10, ff00::/8 } meta mark set mark and 0xf00fffff or 0x40100000 counter return comment "steer-v6donor:host"
     }
     chain prerouting_mark {
         type filter hook prerouting priority mangle + 1; policy accept;
         iifname "steer-nolan0" meta mark and 0x0ff00000 vmap { 0x0f000000 : goto ingress_seen, 0x00100000 : goto ingress_ct, 0x00200000 : goto ingress_ct } comment "steer-ingress"
-        iifname "steer-nolan0" ip daddr @host_dom meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:host_dom"
-        iifname "steer-nolan0" ip6 daddr @host_dom6 meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:host_dom"
-        iifname "steer-nolan0" ip daddr @other_dom meta mark set mark and 0xf00fffff or 0x40200000 ct mark set mark counter return comment "steer:other_dom"
-        iifname "steer-nolan0" ip6 daddr @other_dom6 meta mark set mark and 0xf00fffff or 0x40200000 ct mark set mark counter return comment "steer:other_dom"
+        iifname "steer-nolan0" ip daddr @host_ip meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:host_ip"
+        iifname "steer-nolan0" ip6 daddr @host_ip6 meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:host_ip"
+        iifname "steer-nolan0" ip daddr @other_ip meta mark set mark and 0xf00fffff or 0x40200000 ct mark set mark counter return comment "steer:other_ip"
+        iifname "steer-nolan0" ip6 daddr @other_ip6 meta mark set mark and 0xf00fffff or 0x40200000 ct mark set mark counter return comment "steer:other_ip"
         iifname "steer-nolan0" ip daddr @dir_ip counter return comment "steer:dir_ip"
         iifname "steer-nolan0" ip6 daddr @dir_ip6 counter return comment "steer:dir_ip"
+        iifname "steer-nolan0" ip daddr @host_dom_s2 meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:host_dom_s2"
+        iifname "steer-nolan0" ip6 daddr @host_dom_s26 meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:host_dom_s2"
+        iifname "steer-nolan0" ip daddr @other_dom_s2 meta mark set mark and 0xf00fffff or 0x40200000 ct mark set mark counter return comment "steer:other_dom_s2"
         ip6 saddr @v6donor ip6 daddr != @v6donor ip6 daddr != { fc00::/7, fe80::/10, ff00::/8 } meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer-v6donor:host"
     }
     chain ingress_seen {
@@ -75,12 +96,15 @@ table inet steer {
 
     chain postrouting_down {
         type filter hook postrouting priority srcnat + 10; policy accept;
-        oifname "steer-nolan0" ip saddr @host_dom counter comment "steer-down:host_dom"
-        oifname "steer-nolan0" ip6 saddr @host_dom6 counter comment "steer-down:host_dom"
-        oifname "steer-nolan0" ip saddr @other_dom counter comment "steer-down:other_dom"
-        oifname "steer-nolan0" ip6 saddr @other_dom6 counter comment "steer-down:other_dom"
+        oifname "steer-nolan0" ip saddr @host_ip counter comment "steer-down:host_ip"
+        oifname "steer-nolan0" ip6 saddr @host_ip6 counter comment "steer-down:host_ip"
+        oifname "steer-nolan0" ip saddr @other_ip counter comment "steer-down:other_ip"
+        oifname "steer-nolan0" ip6 saddr @other_ip6 counter comment "steer-down:other_ip"
         oifname "steer-nolan0" ip saddr @dir_ip counter comment "steer-down:dir_ip"
         oifname "steer-nolan0" ip6 saddr @dir_ip6 counter comment "steer-down:dir_ip"
+        oifname "steer-nolan0" ip saddr @host_dom_s2 counter comment "steer-down:host_dom_s2"
+        oifname "steer-nolan0" ip6 saddr @host_dom_s26 counter comment "steer-down:host_dom_s2"
+        oifname "steer-nolan0" ip saddr @other_dom_s2 counter comment "steer-down:other_dom_s2"
     }
     chain forward_v6 {
         type filter hook forward priority mangle; policy accept;

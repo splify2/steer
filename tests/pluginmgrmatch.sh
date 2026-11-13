@@ -102,7 +102,7 @@ index() {   # индекс репозитория splify2 из dist, подпи�
 }
 cat > meta.json <<'E'
 {"plugins":{"net1":{"key_role":"protocols","default":true},"foo":{"key_role":"protocols","default":true},
-"bar":{"key_role":"plugins"},"big":{"key_role":"protocols"},"neu":{"key_role":"protocols"},"evil":{"key_role":"protocols"},
+"bar":{"key_role":"plugins"},"big":{"key_role":"protocols"},"neu":{"key_role":"protocols"},"cry":{"key_role":"protocols"},"evil":{"key_role":"protocols"},
 "pk":{"key_role":"plugins"},"kern":{"key_role":"plugins"},"tg":{"key_role":"protocols"}}}
 E
 mk net1 1.2.0 ''
@@ -110,6 +110,10 @@ mk foo 1.0.0 ',"requires":{"plugins":{"net1":"^1.2"}},"steer":{"commands":[{"nam
 mk neu 1.0.0 ''
 mk neu 2.0.0 ''
 sed -i 's/"steer-api":"\^1.0"/"steer-api":"^9.0"/' src/neu-2.0.0/plugin.json
+# cry 2.0.0 связан с библиотеками криптографии ядра другой сборки (ось steer-crypto, 2.1.4).
+mk cry 1.0.0 ''
+mk cry 2.0.0 ''
+sed -i 's/"steer-api":"\^1.0"/"steer-api":"^1.0","steer-crypto":"^9.0"/' src/cry-2.0.0/plugin.json
 # Пустые requires и conflicts: s2p index их не пишет — сверка индекса с архивом считает их отсутствием.
 mk bar 1.0.0 ',"requires":{"plugins":{},"system":[]},"conflicts":[],"steer":{"commands":[{"name":"bar-x","prog":"bin/bar"}]}'
 mk big 1.0.0 ''
@@ -123,7 +127,7 @@ head -c 400000 /dev/urandom > src/tg-1.0.0/bin/blob
 mk tglite 1.0.0 ',"variant":"lite"'
 sed -i 's/"id":"tglite"/"id":"tg"/; s/"name":"tglite"/"name":"tg"/' src/tglite-1.0.0/plugin.json
 mv src/tglite-1.0.0/bin/tglite src/tglite-1.0.0/bin/tg
-for p in net1-1.2.0 foo-1.0.0 neu-1.0.0 neu-2.0.0 big-1.0.0 tg-1.0.0 tglite-1.0.0; do build "src/$p" proto.sec; done
+for p in net1-1.2.0 foo-1.0.0 neu-1.0.0 neu-2.0.0 cry-1.0.0 cry-2.0.0 big-1.0.0 tg-1.0.0 tglite-1.0.0; do build "src/$p" proto.sec; done
 build src/bar-1.0.0 plg.sec
 build src/pk-1.0.0 plg.sec
 build src/kern-1.0.0 plg.sec
@@ -157,12 +161,12 @@ export STEER_PLUGIN_AUTO=0
 P() { "$BIN" plugin "$@"; }
 
 # ---- версия ядра для оси compat ----
-check "steer version --json: core, api, abi" "2.1.0 1.5 1.0" \
-    "$("$BIN" version --json | jq_ 'd["core"]+" "+d["api"]+" "+d["abi"]')"
+check "steer version --json: core, api, abi, crypto" "2.1.0 1.5 1.0 1.0" \
+    "$("$BIN" version --json | jq_ 'd["core"]+" "+d["api"]+" "+d["abi"]+" "+d["crypto"]')"
 
 # ---- каталог ----
 o="$(P search --json)"
-check "search: каталог из индекса" "bar big evil foo kern net1 neu pk tg" "$(printf '%s\n' "$o" | jq_ '" ".join(sorted(p["id"] for p in d["plugins"]))')"
+check "search: каталог из индекса" "bar big cry evil foo kern net1 neu pk tg" "$(printf '%s\n' "$o" | jq_ '" ".join(sorted(p["id"] for p in d["plugins"]))')"
 check "  neu: показана совместимая 1.0.0, самая новая 2.0.0" "1.0.0 2.0.0" \
     "$(printf '%s\n' "$o" | jq_ '[p["version"]+" "+p["latest"] for p in d["plugins"] if p["id"]=="neu"][0]')"
 check "  repo list: официальный" "splify2 True" "$(P repo list --json | jq_ 'd["repos"][0]["name"]+" "+str(d["repos"][0]["official"])')"
@@ -195,6 +199,13 @@ check "install neu: взята совместимая 1.0.0 (2.0.0 требуе�
 o="$(P install neu 2.0.0 --json 2>/dev/null)"; rc=$?
 check "install neu 2.0.0: отказ" "1" "$rc"
 has "  причина с числами" "требует steer-api ^9.0, у ядра 1.5" "$o"
+o="$(P install cry --json 2>/dev/null)"
+check "install cry: взята 1.0.0 (2.0.0 требует библиотеки ядра steer-crypto ^9)" "1.0.0" "$(printf '%s\n' "$o" | jq_ 'd["version"]')"
+o="$(P install cry 2.0.0 --json 2>/dev/null)"; rc=$?
+check "install cry 2.0.0: отказ" "1" "$rc"
+has "  причина: ось и обе версии" "требует steer-crypto ^9.0, у ядра 1.0" "$o"
+o="$(STEER_PLUGIN_CRYPTO= P install cry 2.0.0 --json 2>/dev/null)"
+has "  ядро без библиотек (статическая сборка): «нет»" "требует steer-crypto ^9.0, у ядра нет" "$o"
 
 # ---- место ----
 o="$(STEER_PLUGIN_FREE=1000 P install big --json 2>/dev/null)"; rc=$?
@@ -649,7 +660,7 @@ check "repo del: файл и ключи убраны" "no no" \
     "$([ -f etc/repos.d/third.json ] && echo yes || echo no) $([ -d etc/keys/third ] && echo yes || echo no)"
 
 # ---- ensure из семени без сети ----
-P remove qux --json >/dev/null 2>&1; P remove pk --json >/dev/null 2>&1; P remove neu --json >/dev/null 2>&1
+P remove qux --json >/dev/null 2>&1; P remove pk --json >/dev/null 2>&1; P remove neu --json >/dev/null 2>&1; P remove cry --json >/dev/null 2>&1
 rm -rf root/foo root/net1
 python3 - etc/state.json <<'PY'
 import json, sys
@@ -662,17 +673,28 @@ printf '{"id":"splify2","url":"http://127.0.0.1:1/","official":true,"priority":0
 o="$(P ensure foo --json 2>err.txt)"; rc=$?
 check "ensure без сети: из семени" "0 net1:seed,foo:seed" "$rc $(printf '%s\n' "$o" | jq_ '",".join(x["id"]+":"+x["from"] for x in d["installed"])')"
 check "  стоит версия семени" "foo 1.3.0" "$(root/foo/bin/foo)"
+check "семя после установки: архивы вставших плагинов сняты, индекс остался (2.1.4)" "no no yes yes" \
+    "$([ -e seed/net1-1.2.0-all.s2p ] && echo yes || echo no) $([ -e seed/foo-1.3.0-all.s2p ] && echo yes || echo no) $([ -f seed/index.json ] && echo yes || echo no) $([ -f seed/index.json.sig ] && echo yes || echo no)"
+has "  и говорит, сколько освободил" "семя: убраны архивы стоящих плагинов (foo 1.3.0, net1 1.2.0)" "$(cat err.txt)"
 o="$(P ensure foo net1 --json 2>/dev/null)"
 check "ensure уже стоящих — ничего не ставит" "[] ['foo', 'net1']" "$(printf '%s\n' "$o" | jq_ 'str(d["installed"])+" "+str(d["present"])')"
+P remove foo --force --json >/dev/null 2>&1
+o="$(P ensure foo --json 2>/dev/null)"; rc=$?
+check "снятый плагин без сети: архива в семени уже нет — отказ" "1" "$rc"
+has "  причина: нужна сеть" "нужна сеть" "$o"
+# Новый пакет ядра кладёт семя заново (seed_put): переход ниже идёт по нему.
+seed_put() { cp repo/index.json repo/index.json.sig seed/; cp repo/net1/1.2.0/net1-1.2.0-all.s2p repo/foo/1.3.0/foo-1.3.0-all.s2p seed/; }
 # migrate (переход 2.0.x → 2.1, migration-2.1.md, 3.3): плагины — по видам выходов спеки и по прежним пакетам модулей
 # (migrate.json), из семени без сети; `steer-tgws` пакетом остаётся и плагином не ставится; готовый переход
 # получает имя migrate.done.json.
 P remove foo --force --json >/dev/null 2>&1; P remove net1 --force --json >/dev/null 2>&1
+seed_put
 printf 'version: 2\noutputs:\n  d: { kind: direct }\n  f: { kind: tunnel, protocol: foo, subscription: /x }\n' > mspec.yaml
 o="$(STEER_SPEC="$T/mspec.yaml" P migrate --json 2>err.txt)"; rc=$?
 check "migrate по спеке: плагин вида tunnel:foo и его net1 — из семени" "0 net1:seed,foo:seed" \
     "$rc $(printf '%s\n' "$o" | jq_ '",".join(x["id"]+":"+x["from"] for x in d["installed"])')"
 P remove foo --force --json >/dev/null 2>&1; P remove net1 --force --json >/dev/null 2>&1
+seed_put
 printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > mspec0.yaml
 printf '{"packages":["steer-foo","steer-tgws"]}\n' > etc/migrate.json
 o="$(STEER_SPEC="$T/mspec0.yaml" P migrate --json 2>err.txt)"; rc=$?
@@ -728,6 +750,8 @@ STEER_SPEC="$T/mspec.yaml" P migrate --json >/dev/null 2>&1
 check "migrate: пометка с ошибкой перечитывания снята, чужая осталась" "['9.9.8']" \
     "$(jq_ 'str(sorted(d["plugins"]["foo"].get("bad_versions", {})))' < etc/state.json)"
 rm -f etc/migrate.done.json
+check "migrate: семя обновлённой net1 снято после установки" "no" "$([ -e seed/net1-1.3.0-all.s2p ] && echo yes || echo no)"
+cp repo/foo/1.3.0/foo-1.3.0-all.s2p seed/
 printf 'X' | dd of=seed/foo-1.3.0-all.s2p bs=1 seek=200 conv=notrunc 2>/dev/null
 P remove foo --force --json >/dev/null 2>&1
 o="$(P ensure foo --json 2>/dev/null)"; rc=$?

@@ -1,14 +1,15 @@
 {
   "schema": 1,
   "id": "net1",
-  "version": "1.4.3",
+  "version": "1.5.0",
   "type": "library",
   "name": "Сетевой стек туннелей",
-  "description": "Общая библиотека протоколов: wolfSSL (внутри, скрыт), TLS 1.3 и REALITY, HTTP/2, QUIC, транспорты, стек TUN",
+  "description": "Общая библиотека протоколов: TLS 1.3 и REALITY, HTTP/2, QUIC, транспорты, стек TUN",
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/splify2/steer",
   "compat": {
-    "steer-api": "^1.1"
+    "steer-api": "^1.1",
+    "steer-crypto": "^1.0"
   },
   "arch": [
     "aarch64_cortex-a53",

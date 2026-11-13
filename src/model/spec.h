@@ -1233,19 +1233,26 @@ int spec_path_ok(const char *s);
  * «сужения нет», и тогда имя получается прежним, байт в байт. */
 /* Часть имени выхода не длиннее width для составных имён; длинное — с хэшем (parse.c). */
 void name_part(char *dst, size_t n, const char *name, size_t width);
+/* seg — номер части группы (rule_segs): 0 — имя прежнее, иначе хвост «_s<seg+1>». */
 void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out, const char *kind,
                     const char (*from)[64], size_t from_n, int realip,
-                    const struct l4match *l4);
+                    const struct l4match *l4, int seg);
+/* Номер части группы у каждого правила спеки (по индексу правила; у выключенных — 0): правила одной
+ * группы с правилом другого действия между ними — разные части, разные наборы и своё место в
+ * цепочке, чтобы первое совпавшее правило спеки решало и при пересечении списков (parse.c). Массив
+ * из rule_n чисел, отдаётся free; NULL — нехватка памяти. Одна функция на компилятор и резолвер. */
+int *rule_segs(const struct spec *sp);
 /* Одно ли сужение у двух каналов. Нужна компилятору: протокол и порты входят в ключ
  * слияния групп наравне с выходом и списком клиентов — см. build_groups в compile/groups.c. */
 int l4match_same(const struct l4match *a, const struct l4match *b);
 /* Имена наборов канала с наборами .srs: составного (смешанное сужение) и доп. группы (клаузы с
  * условиями, которых у канала нет) — см. parse.c и src/model/srsplan.c. */
 void group_set_name_mixed(const struct spec *sp, char *dst, size_t n, const char *out,
-                          const char *kind, const char (*from)[64], size_t from_n, int realip);
+                          const char *kind, const char (*from)[64], size_t from_n, int realip,
+                          int seg);
 void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char *out,
                           const char *kind, const char (*from)[64], size_t from_n, int realip,
-                          unsigned id);
+                          unsigned id, int seg);
 
 /* ДОМЕННЫЙ НАБОР С ПОЛОВИНОЙ IPv6 (docs/architecture.md, «4б»): получает ли доменная группа выхода
  * o с клиентами from парный набор «<имя>6», v6-двойника правила и ответы AAAA от

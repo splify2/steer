@@ -321,9 +321,34 @@ static int pl_node_cc(int node, char cc[3]) {
     return node_cc(g_pl.cf.proto->name(pl_node(node)), cc);
 }
 
-/* Состав и здоровье выхода — демону и в файл состояния, только на перемене. Не под замком: читает
- * слоты под ним сам. */
+/* Состав и здоровье выхода — демону и в файл состояния, только на перемене. Не под замком слотов:
+ * читает слоты под ним сам.
+ *
+ * Зовут её несколько потоков (слежка, проверка страны, замер, подъём), и целиком она идёт под своим
+ * замком g_pub_mu: снимок слотов, решение «сказать up или down» по said_up и само событие — одно
+ * целое. Без него поток со снимком «живых нет», взятым ДО того, как другой поток вернул узел и сказал
+ * up, говорил down поверх — и демон держал выход в отказе при живом узле: удачная проверка живого
+ * узла публикации не зовёт, и поправить это было некому до следующей перемены (снаружи это видно как
+ * «туннель отвечает, а выход выключен», панель перезапускала службу). */
+static pthread_mutex_t g_pub_mu = PTHREAD_MUTEX_INITIALIZER;
+static void pl_publish_locked(void);
 static void pl_publish(void) {
+    pthread_mutex_lock(&g_pub_mu);
+    pl_publish_locked();
+    pthread_mutex_unlock(&g_pub_mu);
+}
+
+/* Удачная проверка живого узла: если демону последним сказано down (пусть и неверно — снимок
+ * разошёлся с жизнью, гонка до g_pub_mu или потерянное событие), сказать up сейчас, а не ждать
+ * следующей перемены. Сказано up — ничего: публикация по каждой проверке (раз в interval) писала бы
+ * файл состояния зря. said_up читается под тем же замком, под которым меняется. */
+static void pl_publish_if_down(void) {
+    pthread_mutex_lock(&g_pub_mu);
+    if (!g_pl.said_up) pl_publish_locked();
+    pthread_mutex_unlock(&g_pub_mu);
+}
+
+static void pl_publish_locked(void) {
     char nodes[480] = "";
     size_t nn = 0;
     int any = 0;
@@ -730,6 +755,7 @@ static void pl_check(int i) {
         sl->fails = sl->streak = 0;
         sl->due = sl->checked_at + (uint64_t)g_pl.cf.interval_s * 1000ull;
         pthread_mutex_unlock(&g_pl.mu);
+        pl_publish_if_down();
         return;
     }
     if (unproven)

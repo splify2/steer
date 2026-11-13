@@ -383,9 +383,9 @@ int main(void) {
         {
             char n0[64], n1[64];
             group_set_name(&g_spec, n0, sizeof(n0), "wg", "ip", g_spec.lan.from, g_spec.lan.from_n, 0,
-                           &CH_LIST(0)->l4);
+                           &CH_LIST(0)->l4, 0);
             group_set_name(&g_spec, n1, sizeof(n1), "wg", "ip", g_spec.lan.from, g_spec.lan.from_n, 0,
-                           &CH_LIST(1)->l4);
+                           &CH_LIST(1)->l4, 0);
             /* Канал без сужения обязан сохранить ПРЕЖНЕЕ имя: на установленных роутерах от
              * имени набора зависит перенос счётчиков, и переименование стоило бы обнулённых
              * объёмов у каждого канала при обновлении движка. */

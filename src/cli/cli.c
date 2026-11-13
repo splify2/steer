@@ -599,10 +599,10 @@ const char *cli_core_version(void) {
 }
 
 /* `steer version --json`: что ядро даёт плагинам (manifest.md, «compat»): версия ядра, steer-api,
- * steer-abi. Версии осей — в src/pluginmgr/pm.h; здесь — те же числа, сверяет стенд pluginmgrmatch. */
+ * steer-abi, steer-crypto. Версии осей — в src/pluginmgr/pm.h; здесь — те же числа, сверяет стенд pluginmgrmatch. */
 void cli_version_json(FILE *out) {
-    fprintf(out, "{\"core\":\"%s\",\"api\":\"%s\",\"abi\":\"%s\",\"build\":\"%s\",\"rev\":\"%s\"}\n",
-            STEER_VERSION, CLI_STEER_API, CLI_STEER_ABI, prof()->build, STEER_REV);
+    fprintf(out, "{\"core\":\"%s\",\"api\":\"%s\",\"abi\":\"%s\",\"crypto\":\"%s\",\"build\":\"%s\",\"rev\":\"%s\"}\n",
+            STEER_VERSION, CLI_STEER_API, CLI_STEER_ABI, CLI_STEER_CRYPTO, prof()->build, STEER_REV);
 }
 
 /* ---- подсказка по опечатке -------------------------------------------------- */

@@ -2167,6 +2167,22 @@ static void t_pool_stale(void) {
     pm_drain(NULL, NULL);
 }
 
+/* Демону сказано down при живом узле (снимок разошёлся с жизнью — гонка публикаций до g_pub_mu или
+ * потерянное событие): удачная периодическая проверка узла говорит up сама, а не ждёт следующей
+ * перемены состава — прежде выход так и оставался выключенным при живом туннеле. */
+static void t_pool_reup(void) {
+    for (int i = 0; i < 5; i++) g_fn[i].alive = 1;
+    pool_new(1, BY_CONNECTION, 2, NULL);
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.said_up, "живой узел — демону сказано up");
+    g_pl.said_up = 0;                                   /* неверное down, узел жив */
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 0 && g_pl.said_up,
+          "удачная проверка живого узла при сказанном down — снова up");
+    pl_check(0);
+    check(g_pl.said_up, "следующая удачная проверка — up держится");
+}
+
 /* ---- пул ------------------------------------------------------------------------------------ */
 
 static void t_pool_pick(void) {
@@ -2912,6 +2928,7 @@ static int pool_part(void) {
     dev_drain(NULL);
     t_pool_stack();
     t_pool_stale();
+    t_pool_reup();
     t_pool_pick();
     t_pool_many();
     t_pool_refill();

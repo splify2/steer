@@ -37,7 +37,7 @@
 #define S2P_NET_ABI_MAJOR 1
 #define S2P_NET_ABI_MINOR 4
 /* Версия плагина net1 (plugins/net1/plugin.json, сверяет tests/buildmatch.sh): major = номер в id. */
-#define S2P_NET_VERSION "1.4.3"
+#define S2P_NET_VERSION "1.5.0"
 
 struct s2p_net_abi {
     uint32_t size;           /* sizeof(struct s2p_net_abi) — новые поля только в конец */

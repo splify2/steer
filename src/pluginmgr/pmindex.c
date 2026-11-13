@@ -106,6 +106,9 @@ void pm_target_load(struct pm_target *t) {
     if (dash) *dash = '\0';
     t->api = pm_strdup(PM_STEER_API);
     t->abi = pm_strdup(PM_STEER_ABI);
+    /* STEER_PLUGIN_CRYPTO — стенды (другая сборка библиотек ядра); пусто — оси нет, как у ядра без них. */
+    const char *cr = getenv("STEER_PLUGIN_CRYPTO");
+    t->crypto = cr ? (*cr ? pm_strdup(cr) : NULL) : pm_strdup(PM_STEER_CRYPTO);
     const char *h = getenv("STEER_PLUGIN_HOST_API");
     if (h) t->host = *h ? pm_strdup(h) : NULL;
     else {
@@ -161,6 +164,9 @@ const char *pm_compat_why(const struct pm_target *t, const struct ynode *compat,
         const char *have = NULL, *who = "у ядра";
         if (!strcmp(axis, "steer-api")) have = t->api;
         else if (!strcmp(axis, "steer-abi")) have = t->abi;
+        /* Общие библиотеки криптографии и QUIC ядра (libsteer-wolfssl.so, libsteer-ngtcp2.so), с которыми связан
+         * плагин (net1, tgws): другая их сборка — плагин не загрузится, поэтому отказ называет ось и обе версии. */
+        else if (!strcmp(axis, "steer-crypto")) have = t->crypto;
         else if (!strcmp(axis, "steer-core")) have = t->core;
         else if (!strcmp(axis, "host-api")) { have = t->host; who = "у панели"; if (!have) continue; }
         else if (!strcmp(axis, "splify2")) { have = t->splify2; who = "у панели"; if (!have) continue; }

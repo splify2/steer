@@ -1033,6 +1033,92 @@ int main(void) {
         }
     }
 
+    /* ---- ПОРЯДОК ПРАВИЛ ПРИ ПЕРЕСЕЧЕНИИ СПИСКОВ (rule_segs, model/parse.c) --------------------
+     *
+     * [insta→A, youtube→B, google→A], youtube.com — и у youtube, и у google. Прежде google сливался с
+     * insta в один канал A_dom, стоящий выше канала youtube, и первым каналом youtube.com был A —
+     * ответ (режим, сервер DNS) строило правило, которое в спеке ниже. Теперь google — вторая часть
+     * группы (A_dom_s2) после B_dom, как и в цепочке компилятора. И наоборот: общий домен в верхнем
+     * правиле выигрывает у более точного в нижнем — решает порядок правил, а не длина суффикса. */
+    {
+        char d1[] = "/tmp/dnsmatch-ord-a.XXXXXX", d2[] = "/tmp/dnsmatch-ord-b.XXXXXX",
+             d3[] = "/tmp/dnsmatch-ord-c.XXXXXX", sp[] = "/tmp/dnsmatch-ord-spec.XXXXXX";
+        int f1 = mkstemp(d1), f2 = mkstemp(d2), f3 = mkstemp(d3), sf = mkstemp(sp);
+        check("порядок: файлы созданы", 1, f1 >= 0 && f2 >= 0 && f3 >= 0 && sf >= 0);
+        if (f1 >= 0 && f2 >= 0 && f3 >= 0 && sf >= 0) {
+            FILE *w = fdopen(f1, "w"); fputs("instagram.com\n", w); fclose(w);
+            w = fdopen(f2, "w"); fputs("youtube.com\n", w); fclose(w);
+            w = fdopen(f3, "w"); fputs("google.com\nyoutube.com\n", w); fclose(w);
+            for (int round = 0; round < 3; round++) {
+                FILE *ws = fopen(sp, "w");
+                fprintf(ws,
+                        "version: 2\n"
+                        "lists:\n"
+                        "  insta: { domains_file: %s }\n"
+                        "  yt:    { domains_file: %s }\n"
+                        "  g:     { domains_file: %s }\n"
+                        "outputs:\n"
+                        "  A: { kind: interface, device: lo }\n"
+                        "  B: { kind: interface, device: lo }\n"
+                        "rules:\n", d1, d2, d3);
+                if (round == 0)       /* пересечение через правило другого выхода */
+                    fputs("  - { name: insta, to: insta, out: A }\n"
+                          "  - { name: youtube, to: yt, out: B }\n"
+                          "  - { name: google, to: g, out: A }\n", ws);
+                else if (round == 1)  /* правила одного выхода подряд — сливаются, как раньше */
+                    fputs("  - { name: insta, to: insta, out: A }\n"
+                          "  - { name: google, to: g, out: A }\n"
+                          "  - { name: youtube, to: yt, out: B }\n", ws);
+                else                  /* общий домен выше конкретного */
+                    fputs("  - { name: google, to: g, out: A }\n"
+                          "  - { name: youtube, to: yt, out: B }\n", ws);
+                fclose(ws);
+                static struct spec cfg;
+                struct err e = {0};
+                if (load_spec(sp, &cfg, &e) < 0) err_die(&e);
+                dch_build(&cfg);
+                for (size_t i = 0; i < g_dch_n; i++) {
+                    struct dpart *parts;
+                    size_t parts_n;
+                    int composite;
+                    dch_rules_load(&g_dch[i], &g_dch[i].rules, &parts, &parts_n, &composite);
+                    g_dch[i].parts = parts;
+                    g_dch[i].parts_n = parts_n;
+                    g_dch[i].composite = composite;
+                }
+                int f = dch_first(dch_match_mask("youtube.com"));
+                int fw = dch_first(dch_match_mask("www.youtube.com"));
+                int fg = dch_first(dch_match_mask("google.com"));
+                const char *set = f >= 0 ? g_dch[f].set : "-";
+                const char *setw = fw >= 0 ? g_dch[fw].set : "-";
+                const char *setg = fg >= 0 ? g_dch[fg].set : "-";
+                if (round == 0) {
+                    check("порядок: три канала (google — своя часть)", 3, (int)g_dch_n);
+                    check("порядок: youtube.com — первым канал youtube→B", 0, strcmp(set, "B_dom"));
+                    check("порядок: поддомен — тоже B", 0, strcmp(setw, "B_dom"));
+                    check("порядок: google.com — вторая часть A", 0, strcmp(setg, "A_dom_s2"));
+                    check("порядок: youtube.com лежит и во второй части A (оба набора)", 1,
+                          (int)chm_has(dch_match_mask("youtube.com"), (size_t)fg));
+                } else if (round == 1) {
+                    check("порядок: одного выхода подряд — два канала, не три", 2, (int)g_dch_n);
+                    check("порядок: одного выхода подряд — youtube.com в A (google выше)", 0,
+                          strcmp(set, "A_dom"));
+                } else {
+                    check("порядок: общий домен выше — youtube.com у верхнего правила (A)", 0,
+                          strcmp(set, "A_dom"));
+                }
+                for (size_t i = 0; i < g_dch_n; i++) {
+                    ruleset_free(&g_dch[i].rules);
+                    dch_parts_free(g_dch[i].parts, g_dch[i].parts_n);
+                    g_dch[i].parts = NULL;
+                    g_dch[i].parts_n = 0;
+                }
+                g_dch_n = 0;
+            }
+        }
+        unlink(sp); unlink(d1); unlink(d2); unlink(d3);
+    }
+
     /* ---- ФОРМАТ ТАБЛИЦЫ (src/dnsd/tabfmt.h): сборка → разбор возвращают тот же g_dch --------
      *
      * Контракт демон/резолвер (docs/architecture.md, раздел 4а, «dnsd»): демон строит таблицу

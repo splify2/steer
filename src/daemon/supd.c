@@ -465,6 +465,11 @@ static void ev_dispatch(struct supd *s, struct helper *h, const struct evline *e
         st->known = 1;
         st->said_down = 0;
         st->watch = evline_int(&e, "watch", &v) && v == 1;
+        /* Клиент, который сам следит за узлом, о потере узла скажет down — status обязан назвать её
+         * (node_down, probe_mem), даже если перебора не было: узел, названный в спеке одним номером
+         * (nodes: [N]), клиент берёт без перебора и событий node не шлёт. Без этого выход с таким узлом
+         * в отказе был в status без причины, и панель перезапускала службу вместо смены узла. */
+        if (st->watch) h->picks = 1;
         st->since = (long)time(NULL);
         st->why[0] = '\0';
         st->why_code[0] = st->why_args[0] = '\0';

@@ -415,6 +415,20 @@ static int pkg_installed(const struct pm_ctx *x, const char *name) {
     /* --pkg ИМЯ: менеджер зовёт скрипт этого пакета изнутри его транзакции — в базе его ещё нет (apk и opkg
      * пишут базу в конце транзакции, после скриптов). */
     if (x && x->pkg_tx && !strcmp(x->pkg_tx, name)) return 1;
+    /* STEER_PLUGIN_TXN — имена через пробел: пакеты, которые ставит та же транзакция, из скрипта которой зовут
+     * менеджер (postinst steer-core: его зависимость kmod-tun распакована, но в базе её ещё нет). Без этого
+     * менеджер звал бы `apk add kmod-tun` при занятой базе и не ставил плагин протокола вовсе. */
+    const char *tx = getenv("STEER_PLUGIN_TXN");
+    if (tx) {
+        size_t nl = strlen(name);
+        for (const char *p = tx; *p; ) {
+            while (*p == ' ') p++;
+            const char *q = p;
+            while (*q && *q != ' ') q++;
+            if ((size_t)(q - p) == nl && !strncmp(p, name, nl)) return 1;
+            p = q;
+        }
+    }
     const char *pk = getenv("STEER_PLUGIN_PKG");
     if (pk && *pk) {
         char *argv[] = { (char *)pk, "installed", (char *)name, NULL };
@@ -660,7 +674,7 @@ static char *fetch_asset(struct pm_ctx *x, const struct pm_cand *c, int *tmp, st
             }
         }
         free(cands[0]); free(cands[1]);
-        pm_errc(e, why[0] ? "plugin.seed_archive_broken" : "plugin.seed_archive_missing", PMA("id", c->id, "version", c->version, "why", why), "архива %s %s в семени нет%s%s", c->id, c->version, why[0] ? " или он испорчен: " : "", why);
+        pm_errc(e, why[0] ? "plugin.seed_archive_broken" : "plugin.seed_archive_missing", PMA("id", c->id, "version", c->version, "why", why), "архива %s %s в семени нет%s%s", c->id, c->version, why[0] ? " или он испорчен: " : " (архив стоявшего плагина убирается после установки) — нужна сеть", why);
         return NULL;
     }
     pm_mkdirs(pm_tmp());

@@ -90,6 +90,16 @@ while :; do
         # Тысяча узлов — событие в ~3,9 КиБ: прежний предел был 160 символов списка и 480 байт на запись.
         printf '{"ev":"active","nodes":"%s"}\n' "\$(seq -s, 1 1000)" >&9
     fi
+    # Клиент, следящий за узлом сам (up с watch), без перебора — узел назван в спеке одним номером:
+    # событий node у него нет, а потерю узла он называет down.
+    if [ -e "$tmp/lost.\$2" ]; then
+        rm -f "$tmp/lost.\$2"
+        printf '{"ev":"up","watch":1}\n{"ev":"down","why":"стенд: узел молчит"}\n' >&9
+    fi
+    if [ -e "$tmp/found.\$2" ]; then
+        rm -f "$tmp/found.\$2"
+        printf '{"ev":"up","watch":1}\n' >&9
+    fi
     if [ -e "$tmp/health.\$2" ]; then
         rm -f "$tmp/health.\$2"
         printf '{"ev":"health","dc":2,"media":1,"domain":"kws2.example","cool":300}\n' >&9
@@ -278,6 +288,20 @@ check "помощник убит молча после up — helper-down с п�
     "$(grep '"out":"t","helper":"obfs","why"' "$tmp/sub.out")"
 wait_for '[ "$(runs t)" = 2 ] && [ "$(alive t)" = yes ]' 8
 wait_for '[ "$(runs b)" -ge 4 ] && [ "$(alive b)" = yes ]' 12
+
+# Узел, названный в спеке одним номером, клиент берёт без перебора (событий node нет) и следит за ним сам:
+# его потеря — node_down в status с причиной клиента, как и у клиента, перебиравшего узлы. Прежде память
+# демона отвечала только за помощника, приславшего node, и такой выход стоял в отказе без причины.
+tnd() { ctl status | python3 -c 'import json,sys
+d = json.loads(json.load(sys.stdin)["stdout"])["outputs"]["t"]; n = d.get("node_down") or {}
+print(n.get("why", "-"), n.get("since", 0) > 0, sep="|")' 2>&1; }
+check "клиент без перебора, следящий за узлом: node_down нет, пока узел жив" "-|False" "$(tnd)"
+touch "$tmp/lost.t"
+wait_for '[ "$(tnd)" = "стенд: узел молчит|True" ]' 5
+check "  узел потерян — node_down с причиной клиента" "стенд: узел молчит|True" "$(tnd)"
+touch "$tmp/found.t"
+wait_for '[ "$(tnd)" = "-|False" ]' 5
+check "  узел снова отвечает — node_down нет" "-|False" "$(tnd)"
 
 # Тишина: помощники и резолвер живы и молчат — демон не просыпается.
 sleep 1

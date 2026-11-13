@@ -84,6 +84,10 @@ struct group {
      * правило не ведёт ничего. У группы без политики fam — 3, и всё, как до неё. */
     int famreq, famblk;
     int fam, blocked;
+    /* Номер части (rule_segs в model/parse.c): правила одной группы с правилом другого действия
+     * между ними — разные части и разные наборы, чтобы первое совпавшее правило спеки решало и при
+     * пересечении списков. Входит в ключ слияния и в имя набора (хвост «_s<номер>» после первой). */
+    int seg;
     /* Which channels fed it — reported so a counter still has names behind it. */
     const char **members;       /* куча, растёт по числу каналов группы (member_add) */
     size_t members_n, members_cap;

@@ -98,9 +98,11 @@ check "steer-core содержит libsteer.so.<версия>" "1" \
     "$(printf '%s\n' "$core_files" | grep -c '^/usr/lib/libsteer\.so\.[0-9.]*$')"
 check "steer-core содержит libsteer-wolfssl.so.<версия wolfSSL>" "1" \
     "$(printf '%s\n' "$core_files" | grep -c '^/usr/lib/libsteer-wolfssl\.so\.[0-9.]*$')"
+check "steer-core содержит libsteer-ngtcp2.so.<версия ngtcp2>-<серия патчей> (2.1.4)" "1" \
+    "$(printf '%s\n' "$core_files" | grep -c '^/usr/lib/libsteer-ngtcp2\.so\.[0-9.]*-[0-9]*$')"
 check "steer-tools — ссылка на steerd" "steerd" "$(readlink "$T/apk/steer-core/usr/sbin/steer-tools")"
 check "у steer-core нет других файлов" "0" \
-    "$(printf '%s\n' "$core_files" | grep -vcE '^/(usr/sbin/(steerd|steer|steer-tools|steer-nfqws)|usr/lib/libsteer(-wolfssl)?\.so\.[0-9.]+|etc/init\.d/steer|etc/hotplug\.d/iface/95-steer|lib/upgrade/keep\.d/steer|usr/share/steer/steer-abi|usr/share/nftables\.d/chain-pre/input/30-steer\.nft|usr/share/steer/seed/.*|usr/share/steer/keys/.*|etc/steer/plugins/.*|lib/upgrade/keep\.d/steer-plugins|etc/init\.d/steer-plugins)$')"
+    "$(printf '%s\n' "$core_files" | grep -vcE '^/(usr/sbin/(steerd|steer|steer-tools|steer-nfqws)|usr/lib/libsteer(-wolfssl|-ngtcp2)?\.so\.[0-9.-]+|etc/init\.d/steer|etc/hotplug\.d/iface/95-steer|lib/upgrade/keep\.d/steer|usr/share/steer/steer-abi|usr/share/nftables\.d/chain-pre/input/30-steer\.nft|usr/share/steer/seed/.*|usr/share/steer/keys/.*|etc/steer/plugins/.*|lib/upgrade/keep\.d/steer-plugins|etc/init\.d/steer-plugins)$')"
 if [ "$LAYOUT" = 2.1 ]; then
     # Семя (plugin-sdk/docs/migration-2.1.md, раздел 5): подписанный индекс и архивы протоколов и net1.
     check "steer-core 2.1: семя — index.json и подпись" "1 1" \
@@ -122,7 +124,7 @@ allf=""
 for p in $PKGS; do allf="$allf$(files_of "$T/apk/$p")
 "; done
 check "файлы разных пакетов не пересекаются" "" "$(printf '%s' "$allf" | sort | uniq -d | tr '\n' ' ')"
-check "библиотеки есть только в steer-core" "2" "$(printf '%s' "$allf" | grep -c 'libsteer')"
+check "библиотеки (libsteer, wolfSSL, ngtcp2) есть только в steer-core" "3" "$(printf '%s' "$allf" | grep -c 'libsteer')"
 for p in $PKGS; do
     check "$p: состав .apk и .ipk одинаков" "$(files_of "$T/apk/$p")" "$(files_of "$T/ipk/$p")"
 done

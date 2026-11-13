@@ -3,13 +3,14 @@
 # build.sh, — libsteer-wolfssl.so, libsteer.so, steerd, net1 и программы плагинов (с мостом tgws), —
 # только хостовым компилятором, и проверяется как устроенное целое:
 #
-#   • списки экспорта (build/libsteer.map, build/wolfssl/libsteer-wolfssl.map, build/net1/libs2p-net.map)
-#     сходятся с кодом, а в .dynsym библиотек лежит ровно то, что в списках;
-#   • SONAME, NEEDED и RUNPATH: плагины — только с net1, net1 — ни с чем нашим;
+#   • списки экспорта (build/libsteer.map, build/wolfssl/libsteer-wolfssl.map, build/ngtcp2/libsteer-ngtcp2.map,
+#     build/net1/libs2p-net.map) сходятся с кодом, а в .dynsym библиотек лежит ровно то, что в списках;
+#   • SONAME, NEEDED и RUNPATH: плагины — только с net1, net1 и мост tgws — только с библиотеками криптографии
+#     ядра (libsteer-wolfssl, libsteer-ngtcp2; ось steer-crypto), не с libsteer;
 #   • команды протоколов — из манифестов плагинов: без плагина команды нет, с плагином steerd
 #     запускает его программу и отвечает ровно тем же (вывод и код); вид без плагина — «нужен плагин»;
 #   • hello: первое сообщение программы плагина — api, версия сборки и id;
-#   • ABI между библиотеками: libsteer при загрузке сверяет отпечаток libsteer-wolfssl.so, и
+#   • ABI между библиотеками: libsteer, net1 и tgws при загрузке сверяют отпечаток libsteer-wolfssl.so, и
 #     библиотека другой сборки — отказ со строкой, а не порча памяти;
 #   • снимок генератора динамическим steerd (139 снимков) — ядро в раскладке пакета ведёт себя
 #     так же, как статическое.
@@ -59,7 +60,7 @@ fi
 # в раскладке библиотека находится по RUNPATH $ORIGIN/../../net1/lib.
 LD_LIBRARY_PATH="$L:$L/plugins/net1/lib"; export LD_LIBRARY_PATH
 N1SO="$L/plugins/net1/lib/libs2p-net.so.1"
-SO="$L/libsteer.so.$VER"; WSO="$L/libsteer-wolfssl.so.$WVER"
+SO="$L/libsteer.so.$VER"; WSO="$L/libsteer-wolfssl.so.$WVER"; NGSO="$L/libsteer-ngtcp2.so.$(sh build/ngtcp2/fetch.sh soname)"
 
 # ---- списки экспорта и таблица символов -----------------------------------------------------
 if command -v nm >/dev/null 2>&1; then
@@ -74,6 +75,9 @@ if command -v nm >/dev/null 2>&1; then
     wwant="$(sed -n 's/^ *\([A-Za-z_0-9]*\);$/\1/p' build/wolfssl/libsteer-wolfssl.map | sort)"
     whave="$(nm -D --defined-only "$WSO" | awk '$2 ~ /^[TDBRVW]$/ {sub(/@.*/, "", $3); print $3}' | sort)"
     check "в .dynsym libsteer-wolfssl — ровно список её карты" "$wwant" "$whave"
+    ngwant="$(sed -n 's/^ *\([A-Za-z_0-9]*\);$/\1/p' build/ngtcp2/libsteer-ngtcp2.map | sort)"
+    nghave="$(nm -D --defined-only "$NGSO" | awk '$2 ~ /^[TDBRVW]$/ {sub(/@.*/, "", $3); print $3}' | sort)"
+    check "в .dynsym libsteer-ngtcp2 — ровно список её карты" "$ngwant" "$nghave"
     # Раскладка 2.1: стек протоколов ушёл из ядра в net1 (build/sources.mk, «РАСКЛАДКА 2.1»).
     check "в libsteer нет стека TUN, транспортов и разбора ссылок узлов" "0" \
         "$(printf '%s\n' "$have" | grep -c '^pool_run$\|^stack_run$\|^transport_open$\|^tun_open$\|^sl_link_parse$')"
@@ -98,14 +102,18 @@ if command -v readelf >/dev/null 2>&1; then
         "$(readelf -d "$SO" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')"
     check "SONAME libsteer-wolfssl — по версии wolfSSL" "libsteer-wolfssl.so.$WVER" \
         "$(readelf -d "$WSO" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')"
-    check "libsteer зависит от libsteer-wolfssl" "libsteer-wolfssl.so.$WVER" \
-        "$(readelf -d "$SO" | sed -n 's/.*Shared library: \[\(libsteer[^]]*\)\]/\1/p')"
+    check "libsteer зависит от libsteer-ngtcp2 и libsteer-wolfssl" "$(basename "$NGSO") libsteer-wolfssl.so.$WVER" \
+        "$(readelf -d "$SO" | sed -n 's/.*Shared library: \[\(libsteer[^]]*\)\]/\1/p' | tr '\n' ' ' | sed 's/ $//')"
+    check "SONAME libsteer-ngtcp2 — по версии ngtcp2 и серии патчей; она — от libsteer-wolfssl" \
+        "$(basename "$NGSO") libsteer-wolfssl.so.$WVER" \
+        "$(readelf -d "$NGSO" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p') $(readelf -d "$NGSO" | sed -n 's/.*Shared library: \[\(libsteer[^]]*\)\]/\1/p')"
     ours() { readelf -d "$1" | sed -n 's/.*Shared library: \[\(lib\(steer\|s2p\)[^]]*\)\]/\1/p' | tr '\n' ' ' | sed 's/ $//'; }
     check "steerd: из нашего только libsteer.so.$VER" "libsteer.so.$VER" "$(ours "$L/steerd")"
     check "модуля steer-tgws в раскладке нет (мост — плагин tgws)" "no" "$([ -e "$L/steer-tgws" ] && echo yes || echo no)"
     check "SONAME net1 — по major ABI" "libs2p-net.so.1" \
         "$(readelf -d "$N1SO" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')"
-    check "  net1 ни с чем нашим не связан" "" "$(ours "$N1SO")"
+    check "  net1 из нашего связана только с библиотеками криптографии ядра (ось steer-crypto)" \
+        "$(basename "$NGSO") libsteer-wolfssl.so.$WVER" "$(ours "$N1SO")"
     for m in vless hysteria2 proxy xsteer warpbox; do
         check "плагин $m: из нашего только libs2p-net.so.1, RUNPATH \$ORIGIN/../../net1/lib" \
             'libs2p-net.so.1|$ORIGIN/../../net1/lib' \
@@ -376,7 +384,7 @@ check "программа плагина чужой команды не берё
 o="$(TGWS_PROG="$L/plugins/tgws/bin/tgws" BUILD="$BUILD" sh tests/tgwsmatch.sh 2>&1 | tail -1)"
 check "плагин tgws: стенд tests/tgwsmatch.sh с программой раскладки" "1" "$(printf '%s' "$o" | grep -c ' 0 fail$')"
 [ "$(printf '%s' "$o" | grep -c ' 0 fail$')" = 1 ] || printf '    %s\n' "$o"
-check "плагин tgws ни с чем нашим не связан (статически со своим TLS)" "" "$(ours "$L/plugins/tgws/bin/tgws")"
+check "плагин tgws: свой TLS статически, из нашего — только libsteer-wolfssl (ось steer-crypto)" "libsteer-wolfssl.so.$WVER" "$(ours "$L/plugins/tgws/bin/tgws")"
 
 # ---- ABI между библиотеками ---------------------------------------------------------------------
 # Подложная libsteer-wolfssl.so с чужим отпечатком: то же имя (SONAME) и те же символы (иначе
@@ -384,7 +392,7 @@ check "плагин tgws ни с чем нашим не связан (стати
 # библиотека иной сборки (иные опции — иные размеры структур). Собирается из того же архива wolfSSL.
 bad="$L/badabi"
 mkdir -p "$bad"
-cp "$L"/libsteer.so.* "$bad/"
+cp "$L"/libsteer.so.* "$NGSO" "$bad/"
 cat > "$bad/abi.c" <<'EOF'
 __attribute__((visibility("default")))
 const unsigned long steer_wolfssl_abi[13] = { 0x05009004, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
@@ -398,7 +406,15 @@ $CC -shared -fPIC -o "$bad/libsteer-wolfssl.so.$WVER" "$bad/abi.c" \
 o="$(LD_LIBRARY_PATH="$bad" "$L/steerd" version 2>&1)"; r=$?
 check "libsteer-wolfssl другой сборки: процесс не стартует, код 3" "3" "$r"
 check "  и строка называет причину и лечение" "1" \
-    "$(printf '%s' "$o" | grep -c 'другой сборки.*обновите пакеты libsteer и libsteer-wolfssl вместе')"
+    "$(printf '%s' "$o" | grep -c '^steer: библиотека libsteer-wolfssl.so другой сборки, чем ядро steer.*переустановите пакет steer-core')"
+# net1 (и мост tgws) связаны с той же библиотекой ядра (2.1.4) и сверяют её сами: программа плагина на net1 с
+# библиотекой другой сборки не стартует, а строка начинается с «steer: библиотека» — её узнаёт проба менеджера
+# плагинов (src/pluginmgr/pminst.c, ABI_MARK).
+o="$(STEER_LIB_PROBE=1 LD_LIBRARY_PATH="$bad:$L/plugins/net1/lib" "$L/plugins/vless/bin/vless" 2>&1)"; r=$?
+check "libsteer-wolfssl другой сборки под net1: код 3 и строка для пробы менеджера" "3 1" \
+    "$r $(printf '%s' "$o" | grep -c '^steer: библиотека libsteer-wolfssl.so ядра другой сборки, чем net1.*steer plugin migrate')"
+o="$(LD_LIBRARY_PATH="$bad" "$L/plugins/tgws/bin/tgws" 2>&1)"; r=$?
+check "  и под мостом tgws" "3 1" "$r $(printf '%s' "$o" | grep -c 'другой сборки, чем мост tgws')"
 # Настоящая библиотека — проходит.
 o="$("$L/steerd" version 2>&1)"
 check "настоящая libsteer-wolfssl: сверка молчит" "0" "$(printf '%s' "$o" | grep -c 'другой сборки')"
@@ -448,7 +464,8 @@ if [ -x "$BUILD/abihost" ]; then
     N1DIR="$(cd "$L/plugins/net1/lib" && pwd)"
     $CC -shared -fPIC -fvisibility=hidden -O2 -Isrc/daemon -o "$L/n1abi/net1plug.so" tests/abi/net1plug.c "$N1SO" \
         -Wl,-rpath,"$N1DIR" -Wl,-z,defs -Wl,-soname,net1plug.so > "$L/n1abi/net1plug.log" 2>&1
-    o="$(env -u LD_LIBRARY_PATH "$BUILD/abihost" "$L/n1abi/net1plug.so" net1test load 2>&1)"
+    # Библиотеки ядра net1 ищет там, где их кладёт пакет (/usr/lib — путь загрузчика по умолчанию); здесь — $L.
+    o="$(env LD_LIBRARY_PATH="$L" "$BUILD/abihost" "$L/n1abi/net1plug.so" net1test load 2>&1)"
     check ".so-плагин с net1: загружен, net1 ответила из своей __thread-переменной" "1 1" \
         "$(printf '%s' "$o" | grep -c '^LOAD rc=0 state=1') $(printf '%s' "$o" | grep -c 'NET1 strerror=сервер ответил')"
 else
@@ -503,7 +520,7 @@ fi
 if [ -x "$BUILD/steer" ] && [ -x "$BUILD/steer-android" ]; then
     core="$L/core"
     mkdir -p "$core"
-    cp "$L/steerd" "$L"/libsteer.so.* "$L"/libsteer-wolfssl.so.* "$core/"
+    cp "$L/steerd" "$L"/libsteer.so.* "$L"/libsteer-wolfssl.so.* "$L"/libsteer-ngtcp2.so.* "$core/"
     cp "$BUILD/steer" "$core/steer"
     # env -u: STEER_WOLFSSL (путь к исходникам библиотеки) — тоже STEER_*, и снимок записал бы его.
     o="$(env -u STEER_WOLFSSL -u STEER_NGTCP2 LD_LIBRARY_PATH="$core" STEER="$core/steer" sh tests/snapshot.sh 2>&1 | tail -1)"

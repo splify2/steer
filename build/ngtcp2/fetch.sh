@@ -4,6 +4,7 @@
 #
 #     sh build/ngtcp2/fetch.sh <каталог>
 #     sh build/ngtcp2/fetch.sh version
+#     sh build/ngtcp2/fetch.sh soname     версия и серия патчей: хвост SONAME libsteer-ngtcp2.so
 #
 # ВЕРСИЯ И СУММА ЗАПИСАНЫ ЗДЕСЬ И ТОЛЬКО ЗДЕСЬ — как у build/wolfssl/fetch.sh, и по тем же
 # причинам: образ сборки (build/Dockerfile копирует скрипт и патчи и зовёт его), стенды на
@@ -35,7 +36,13 @@ NGTCP2_SHA256=2a34d2484ba17847a5d11965704e9dd0fac4c6d8efc75ffe1ec7de66d8c6b6fb
 URL="https://github.com/ngtcp2/ngtcp2/releases/download/v${NGTCP2_VERSION}/ngtcp2-${NGTCP2_VERSION}.tar.xz"
 HERE=$(cd "$(dirname "$0")" && pwd)
 
+# Серия наших патчей: растёт с каждой правкой build/ngtcp2/patches, меняющей то, что видят потребители
+# (заголовки, поля, функции). Входит в SONAME общей библиотеки ядра libsteer-ngtcp2.so.<версия>-<серия>
+# (build/build-libs.sh): плагин net1 прежней серии с ней не загрузится, а не прочтёт чужие поля. Сверяет
+# сумму патчей с записанной для серии build/wolfssl/crypto.lst (tests/buildmatch.sh).
+NGTCP2_PATCHLEVEL=2
 [ "${1:-}" = version ] && { echo "$NGTCP2_VERSION"; exit 0; }
+[ "${1:-}" = soname ] && { echo "$NGTCP2_VERSION-$NGTCP2_PATCHLEVEL"; exit 0; }
 DEST="${1:?нужен каталог, куда распаковать исходники}"
 # Метка — сумма тарбола и сумма наших патчей: другая версия или другой патч в том же каталоге
 # заменяются, а не берутся.

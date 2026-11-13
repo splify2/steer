@@ -396,10 +396,18 @@ int dnsd_sig_print(const char *spec, FILE *out) {
  * и слияние каналов в один набор — решения о смысле, и проверять их надо прямо, а не
  * через запуск резолвера с сетью и netlink. */
 /* Имя доменного набора канала `c`, если бы у него был режим `realip`. */
+/* Номера частей групп по правилу спеки (rule_segs, model/parse.c) — те же, что у компилятора:
+ * правило не сливается с набором соседа через правило другого действия. Живут до следующей сборки. */
+static int *g_segs;
+
+static int rule_seg(const struct spec *sp, const struct spec_rule *c) {
+    return g_segs ? g_segs[c - sp->rule] : 0;
+}
+
 static void dch_name(const struct spec *sp, char *dst, size_t n, const struct spec_rule *c, int realip) {
     const struct spec_client *w = rule_who(sp, c);
     group_set_name(sp, dst, n, rule_out(sp, c)->name, "dom", w->from, w->from_n, realip,
-                   &rule_list(sp, c)->l4);
+                   &rule_list(sp, c)->l4, rule_seg(sp, c));
     set_name_famtag(dst, n, rule_famtag(c));       /* политика семейства (R-154) — как у компилятора */
 }
 
@@ -420,12 +428,13 @@ static void unit_name(const struct spec *sp, const struct spec_rule *c, const st
     const struct spec_list *l = rule_list(sp, c);
     const char *out = rule_out(sp, c)->name;
     if (p->kind == SP_COMPOSITE)
-        group_set_name_mixed(sp, dst, n, out, "dom", w->from, w->from_n, realip);
+        group_set_name_mixed(sp, dst, n, out, "dom", w->from, w->from_n, realip, rule_seg(sp, c));
     else if (p->kind == SP_EXTRA)
-        group_set_name_extra(sp, dst, n, out, "dom", w->from, w->from_n, realip, p->id);
+        group_set_name_extra(sp, dst, n, out, "dom", w->from, w->from_n, realip, p->id,
+                             rule_seg(sp, c));
     else
         group_set_name(sp, dst, n, out, "dom", w->from, w->from_n, realip,
-                       l4match_same(&p->l4, &l->l4) ? &l->l4 : &p->l4);
+                       l4match_same(&p->l4, &l->l4) ? &l->l4 : &p->l4, rule_seg(sp, c));
     set_name_famtag(dst, n, rule_famtag(c));
 }
 
@@ -770,6 +779,10 @@ void dch_build(const struct spec *sp) {
         struct err e = {0};
         g_plan_ok[i] = srs_plan_rule(sp, &sp->rule[i], -1, &g_plans[i], &e) == 0;
     }
+    /* Части групп — той же функцией, что у компилятора. Без памяти — все нули, то есть прежнее
+     * слияние: имена тогда разойдутся с компилятором лишь у правил, которым часть нужна. */
+    free(g_segs);
+    g_segs = rule_segs(sp);
     /* Same coalescing the compiler does, and it must agree with it exactly: the set
      * names here ARE the sets it generated. Domain channels that share an output, the
      * same clients and the same mode are one set — which is why this groups by
@@ -793,9 +806,14 @@ void dch_build(const struct spec *sp) {
      * настоящим префиксом, а `youtube.com` — поддельным адресом плюс правилом DNAT. Набор
      * с `flags interval,timeout` держит и то и то (проверено опытом — там же, в
      * parse_channels, src/model/v1.c). */
+    /* ПОРЯДОК КАНАЛОВ — порядок правил ядра: сначала правила на устройство, потом остальные (как
+     * build_groups). Первый канал имени (dch_first) решает режим ответа и сервер DNS, и решать он
+     * обязан так же, как первое правило цепочки решает выход. */
+    for (int pass = 0; pass < 2; pass++)
     for (size_t i = 0; i < sp->rule_n; i++) {
         const struct spec_rule *r = &sp->rule[i];
         const struct spec_list *l = rule_list(sp, r);
+        if ((pass == 0) != (r->dev_scope != 0)) continue;
         /* ВЫКЛЮЧЕННОЕ ПРАВИЛО РЕЗОЛВЕР НЕ БЕРЁТ. Компилятор набора его уже не берёт
          * (build_groups в compile/groups.c), а здесь брал — и это худший из возможных исходов, потому что «не
          * действует» превращалось в «ломает».

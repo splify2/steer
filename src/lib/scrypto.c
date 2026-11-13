@@ -939,9 +939,22 @@ __attribute__((constructor)) static void sc_abi_check(void) {
     };
     for (int i = 0; i < SC_ABI_N; i++) {
         if (steer_wolfssl_abi[i] == want[i]) continue;
+        /* Начало строки — «steer: библиотека »: по нему менеджер плагинов узнаёт отказ ABI в выводе пробы
+         * (src/pluginmgr/pminst.c, ABI_MARK). У net1 и моста tgws (SC_ABI_NET1, SC_ABI_TGWS, build/build-libs.sh)
+         * лечение — их сборка под это ядро: библиотека ядра стоит та, что пришла с ним. */
+#ifdef SC_ABI_NET1
         static const char msg[] =
-            "steer: libsteer-wolfssl.so другой сборки, чем libsteer.so (версия wolfSSL или размеры "
-            "структур не совпали) — обновите пакеты libsteer и libsteer-wolfssl вместе\n";
+            "steer: библиотека libsteer-wolfssl.so ядра другой сборки, чем net1 (версия wolfSSL или размеры "
+            "структур не совпали) — net1 нужна сборка под это ядро: steer plugin migrate\n";
+#elif defined(SC_ABI_TGWS)
+        static const char msg[] =
+            "steer: библиотека libsteer-wolfssl.so ядра другой сборки, чем мост tgws (версия wolfSSL или размеры "
+            "структур не совпали) — tgws нужна сборка под это ядро: steer plugin update tgws\n";
+#else
+        static const char msg[] =
+            "steer: библиотека libsteer-wolfssl.so другой сборки, чем ядро steer (версия wolfSSL или размеры "
+            "структур не совпали) — переустановите пакет steer-core\n";
+#endif
         (void)!write(2, msg, sizeof(msg) - 1);
         _exit(3);
     }

@@ -421,6 +421,23 @@ PLUGINS_STATIC := obfs
 PLUGINS_TLS := tgws
 PLUGINS_EXTENDED := tgws
 
+# Горячий путь пакета роутера (build/build-libs.sh, 2.1.4): эти файлы собираются -O2, остальное — -Os. Горячий —
+# то, через что идёт каждый байт или каждый пакет: шифры и слой примитивов, TLS 1.3, REALITY и HTTP/2 (запись
+# данных), QUIC, стек TUN и пул, транспорты, данные протоколов (дайлеры и провод), обфускатор, резолвер (каждый
+# запрос DNS: src/dnsd, индекс доменов, наборы nft). Холодный — компилятор спеки, модель, YAML и JSON, команды,
+# виды, менеджер плагинов, подписки и разбор ссылок, сторож, doctor и diag: там размер важнее тактов.
+# Рукопожатие (certverify.c, ech.c, roots.c) — холодное: оно раз на соединение, а время в нём — подписи wolfSSL.
+HOT_SRC := $(CRYPTO_SRC) $(QUIC_SRC) $(TUNNEL_SRC) $(TRANSPORT_ONLY_SRC) \
+           src/proto/tls/chello.c src/proto/tls/tls13.c src/proto/tls/reality.c src/proto/tls/h2.c \
+           src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/vless/vldial.c \
+           src/proto/hysteria2/hy2conn.c src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2wire.c \
+           src/proto/proxy/pxwire.c src/proto/proxy/pxdial.c src/proto/proxy/pxtrojan.c src/proto/proxy/pxss.c \
+           src/proto/proxy/pxsocks.c src/proto/proxy/pxhttp.c src/proto/proxy/pxvmess.c \
+           src/proto/xsteer/xsclient.c src/proto/xsteer/xsconn.c src/proto/xsteer/xsstream.c src/proto/xsteer/xswire.c \
+           src/proto/xsteer/xsepoch.c src/proto/xsteer/xslink.c src/proto/xsteer/xsroute.c \
+           src/proto/obfs/obfs.c src/proto/tgws/tgws.c src/proto/warp/wbmq.c \
+           $(DNSD_SRC)
+
 # steer-box-connector (sing-box для podkop и forkop) живёт в своём репозитории
 # (github.com/splify2/steer-box-connector) и собирается build/ext-build.sh. С 2.1 он — плагин ядра
 # `box-connector` (plugin-sdk/docs/migration-2.1.md, раздел 6): программа статическая, как tgws, со своей

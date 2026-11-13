@@ -327,8 +327,12 @@ for spec in $ISAS; do
     # Клиент. Без него пакета нет: /usr/sbin/steer зовут все, кто был до демона, — пакет с одним
     # steerd выглядел бы установленным, а splify2 получал бы «команда не найдена».
     printf '  %-26s ' "$arch (клиент steer)"
+    # Размер (2.1.4): без таблиц раскрутки, сборка мёртвых секций, страница 4 КБ, на MIPS без .pdr — те же доводы,
+    # что у библиотек (build/build-libs.sh, «РАЗМЕР И СКОРОСТЬ»).
+    _cl="-ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -Wl,--gc-sections -Wl,-z,max-page-size=4096 -s"
+    case "$target" in mips*) _cl="$_cl -Wl,-T,build/nopdr.ld" ;; esac
     if docker run --rm -v "$PWD:/src" -w /src "$IMAGE" \
-            cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra \
+            cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra $_cl \
                -o "build/steer-client-$arch" $BASE_INC $CLIENT_SRC \
                2>"build/$arch-client.err"; then
         echo "$(stat -c %s "build/steer-client-$arch") bytes"
@@ -365,6 +369,7 @@ for spec in $ISAS; do
             "/src/$libs" "$VERSION" "$REV" "$(id -u):$(id -g)" \
             >"build/$arch-libs.log" 2>"build/$arch-libs.err"; then
         echo "libsteer $(stat -c %s "$libs"/libsteer.so.*) + wolfssl $(stat -c %s "$libs"/libsteer-wolfssl.so.*)" \
+             "+ ngtcp2 $(stat -c %s "$libs"/libsteer-ngtcp2.so.*)" \
              "+ steerd $(stat -c %s "$libs/steerd") bytes"
         if [ "$LAYOUT" = 2.1 ]; then
             printf '  %-26s net1 %s' "" "$(stat -c %s "$libs/plugins/net1/lib/libs2p-net.so.1")"
@@ -417,7 +422,7 @@ for spec in $ISAS; do
              "$root/lib/upgrade/keep.d" "$root/etc/hotplug.d/iface"
     # Обе библиотеки — часть ядра (см. комментарий к раскладке выше): steerd и каждый модуль
     # находят их по SONAME в /usr/lib.
-    cp "$libs"/libsteer.so.* "$libs"/libsteer-wolfssl.so.* "$root/usr/lib/"
+    cp "$libs"/libsteer.so.* "$libs"/libsteer-wolfssl.so.* "$libs"/libsteer-ngtcp2.so.* "$root/usr/lib/"
     # Три имени (docs/architecture.md, раздел 4а): steerd — движок целиком, steer — клиент сокета,
     # steer-tools — ссылка на steerd, под этим именем движок отвечает только на инструменты.
     cp "$libs/steerd" "$root/usr/sbin/steerd"
@@ -542,7 +547,8 @@ EOF
 [ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null
 # Плагины протоколов — по спеке и по прежним пакетам модулей, из семени без сети (раскладка 2.1);
 # в прежней раскладке команды нет — отказ молчит. До перезапуска службы: демон встаёт с плагинами.
-/usr/sbin/steer plugin migrate 2>&1 | sed 's/^/steer: /'
+# kmod-tun ставит та же транзакция (зависимость steer-core), но в базе его до её конца нет — менеджер считает его стоящим.
+env STEER_PLUGIN_TXN=kmod-tun /usr/sbin/steer plugin migrate 2>&1 | sed 's/^/steer: /'
 if grep -q steer-box-connector /etc/init.d/sing-box 2>/dev/null || [ -e /var/run/steer-box-installing ]; then
 	/etc/init.d/steer stop 2>/dev/null
 	/etc/init.d/steer disable 2>/dev/null
@@ -555,7 +561,9 @@ fi
 # фоновое автообновление ставит новое только в ночное окно. Исправление, вышедшее в плагине (net1 у 2.1.1),
 # человек, обновивший ядро, ждал бы до ночи — поэтому сразу после установки пакета обновление плагинов
 # спрашивается один раз, в фоне: установку не задерживает, без сети молча кончается ничем.
-( sleep 15; /usr/sbin/steer plugin update 2>&1 | logger -t steer-plugins ) >/dev/null 2>&1 &
+# Тем же заходом — migrate ещё раз: плагин, которому нужен системный пакет не из этой транзакции (warpbox —
+# kmod-wireguard), внутри неё не встаёт (база apk/opkg занята); после её конца ставится и подхватывается службой.
+( sleep 15; /usr/sbin/steer plugin migrate 2>&1 | logger -t steer-plugins; /usr/sbin/steer plugin update 2>&1 | logger -t steer-plugins ) >/dev/null 2>&1 &
 exit 0
 EOF
     {
@@ -584,7 +592,27 @@ EOF
     cp build/scripts/noop.postinst build/scripts/noop.prerm
     cp build/scripts/noop.postinst build/scripts/noop.postrm
     # Включение входа fw4 (usr/share/nftables.d) уходит с пакетом — fw4 перечитывает набор без него.
-    printf '#!/bin/sh\n[ -n "${IPKG_INSTROOT}" ] && exit 0\n[ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null\nexit 0\n' > build/scripts/steer.postrm
+    # Удаление ядра (не обновление: при обновлении steerd на месте) уносит и плагины, распакованные
+    # менеджером в /usr/lib/steer/plugins, — пакету они не принадлежат, и без ядра это около мегабайта
+    # мёртвого кода на флеше; пустые каталоги семени и ключей — следом. /etc/steer (спека, подписки,
+    # настройки плагинов) остаётся: это настройки человека.
+    cat > build/scripts/steer.postrm <<'EOF'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+[ -x /sbin/fw4 ] && fw4 -q reload 2>/dev/null
+[ "${1:-}" = upgrade ] && exit 0
+[ -e /usr/sbin/steerd ] && exit 0
+rm -rf /usr/lib/steer/plugins /etc/steer/plugins/cache
+# Реестр поставленных плагинов уходит вместе с ними: иначе после новой установки ядро считало бы их стоящими,
+# а файлов нет. Настройки плагинов (conf) и репозитории (repos.d) остаются.
+rm -f /etc/steer/plugins/state.json
+# rmdir снимает только пустое (find -empty в busybox нет): каталоги семени по плагинам, затем сами каталоги
+for _d in /usr/share/steer/seed/*/* /usr/share/steer/seed/* /usr/share/steer/seed /usr/share/steer/keys/* \
+	/usr/share/steer/keys /usr/share/steer /usr/lib/steer; do
+	[ -d "$_d" ] && rmdir "$_d" 2>/dev/null
+done
+exit 0
+EOF
     chmod +x build/scripts/*
 
     # pack ИМЯ КОРЕНЬ ЗАВИСИМОСТИ ОПИСАНИЕ ВИД-СКРИПТОВ [КОНФЛИКТЫ] [ЗАМЕНЯЕТ] — оба формата из одного

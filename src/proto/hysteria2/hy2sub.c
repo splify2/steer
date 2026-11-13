@@ -571,12 +571,36 @@ static void parse_xray_doc(const char *text, struct hy2_node *out, size_t max, s
         return;
     }
     /* Корень — объект конфига (outbounds внутри), массив конфигов или массив outbound. Обходим
-     * оба уровня. */
+     * оба уровня.
+     *
+     * ИМЯ — ИЗ remarks КОНФИГА, как у VLESS (xray_remarks и xray_name в src/proto/vless/sub.c): панель
+     * отдаёт клиенту Happ массив конфигов, у которых tag исходящего — одно слово «proxy», а различает
+     * их только remarks («🇳🇱 Амстердам 3»). По tag все узлы hysteria2 такой подписки назывались
+     * «proxy», и человек не находил в списке ни одного своего сервера. Второй и дальше узел hysteria2
+     * того же конфига получает номер в скобках; конфиг без remarks — прежнее имя из tag. Токены
+     * лежат в порядке документа, поэтому конфиг всегда встречается раньше своих исходящих. */
+    int cfg_end = -1;
+    char remarks[sizeof(((struct hy2_node *)0)->name)] = "";
+    size_t ord = 0;
     for (int i = 0; i < j.n; i++) {
         if (j.t[i].type != J_OBJ) continue;
+        int obs = j_get(&j, i, "outbounds");
+        if (obs >= 0 && j.t[obs].type == J_ARR) {
+            cfg_end = j_next(&j, i);
+            j_get_str(&j, i, "remarks", remarks, sizeof remarks);
+            utf8_trim(remarks);
+            ord = 0;
+            continue;
+        }
         struct hy2_node nd;
         int rc = xray_outbound(&j, i, &nd);
         if (rc < 0) continue;
+        if (i < cfg_end && remarks[0]) {
+            if (ord == 0) snprintf(nd.name, sizeof nd.name, "%s", remarks);
+            else snprintf(nd.name, sizeof nd.name, "%s (%zu)", remarks, ord + 1);
+            utf8_trim(nd.name);
+        }
+        if (i < cfg_end) ord++;
         take(out, max, cnt, &nd, rc, st);
     }
     free(j.t);

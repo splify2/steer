@@ -98,8 +98,9 @@ struct helper {
     /* id плагина, чья это программа (kind_helper.plugin); пусто — помощник ядра. У программы плагина
      * первое событие — hello с версией steer-api (steer-api.md, 2.1): supd.c, plug_hello. */
     char plugin[64];
-    /* Помощник перебирает узлы (прислал node, nonode или excluded хоть раз): память демона отвечает
-     * про его перебор (supd.c, probe_mem). Не сбрасывается с новым процессом. */
+    /* Помощник перебирает узлы или следит за узлом (прислал node, nonode, excluded или up с watch хоть
+     * раз): память демона отвечает про его перебор и потерю узла (supd.c, probe_mem). Не сбрасывается с
+     * новым процессом. */
     int picks;
     /* Вид помощника объявил paths (kind_helper.paths): paths_down в status — всегда, и пустым. */
     int paths;

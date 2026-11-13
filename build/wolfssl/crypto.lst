@@ -1,0 +1,18 @@
+# Ось compat.steer-crypto (2.1.4): общие библиотеки криптографии и QUIC ядра, с которыми связаны плагин-библиотека
+# net1 и мост tgws, — libsteer-wolfssl.so.<версия wolfSSL> и libsteer-ngtcp2.so.<версия ngtcp2>-<серия патчей>
+# (build/build-libs.sh). Одна строка на значение оси, новые — в конец, старые не правятся:
+#
+#   ось  wolfSSL  ngtcp2-серия  экспорт-wolfssl  экспорт-ngtcp2  патчи-ngtcp2  раскладка
+#
+# экспорт — первые 16 знаков sha256 отсортированных имён карты (build/wolfssl/libsteer-wolfssl.map,
+# build/ngtcp2/libsteer-ngtcp2.map); патчи — сумма build/ngtcp2/patches/*.patch; раскладка — сумма
+# build/wolfssl/abi.c и build/wolfssl/user_settings.h (размеры структур, которые делят слой и библиотека).
+# tests/buildmatch.sh считает всё по дереву и сверяет с последней строкой, а её ось — с CLI_STEER_CRYPTO
+# (src/cli/cli.h) и с compat.steer-crypto манифестов net1 и tgws.
+#
+# Как поднимать. Сменились версия wolfSSL или ngtcp2, серия патчей, раскладка или из экспорта ушло имя — мажор
+# (net1 и tgws прежней сборки с такими библиотеками не загрузятся); в экспорт добавилось имя — минор. Затем:
+# CLI_STEER_CRYPTO, строка сюда, compat.steer-crypto в plugins/net1 и plugins/tgws («^<ось>»), новая версия net1
+# (S2P_NET_VERSION, plugins/net1/plugin.json, строка build/net1/abi.lst) — индекс не примет другой архив под
+# прежним номером.
+1.0 5.9.4 1.25.0-2 1d2839115991c52b e7dccfb99110bda0 12437f35b0ddf2af 582bd53544c77de0

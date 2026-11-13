@@ -114,19 +114,42 @@ static void t_rules(void) {
     /* Имена наборов считаются по правилам: клиенты по умолчанию — без суффикса, свой клиент —
      * номер различного списка клиентов в порядке правил (у tv — второй, c1). */
     char n0[64], n1[64];
-    group_set_name(&g_spec, n0, sizeof(n0), "vpn", "dom", g_spec.lan.from, g_spec.lan.from_n, 0, NULL);
+    group_set_name(&g_spec, n0, sizeof(n0), "vpn", "dom", g_spec.lan.from, g_spec.lan.from_n, 0, NULL, 0);
     check_str("имя набора правила без своих клиентов", "vpn_dom", n0);
     const struct spec_client *tv = rule_who(&g_spec, &g_spec.rule[1]);
-    group_set_name(&g_spec, n1, sizeof(n1), "direct", "ip", tv->from, tv->from_n, 0, NULL);
+    group_set_name(&g_spec, n1, sizeof(n1), "direct", "ip", tv->from, tv->from_n, 0, NULL, 0);
     check_str("имя набора правила со своим клиентом", "direct_ip_c1", n1);
 
     /* I-518: выходы с общим началом длиннее места в имени набора не сливаются, а короткие имена
      * остаются прежними (от них зависит перенос счётчиков). */
     char l0[64], l1[64];
-    group_set_name(&g_spec, l0, sizeof(l0), "provider-frankfurt-node-1", "ip", tv->from, tv->from_n, 0, NULL);
-    group_set_name(&g_spec, l1, sizeof(l1), "provider-frankfurt-node-2", "ip", tv->from, tv->from_n, 0, NULL);
+    group_set_name(&g_spec, l0, sizeof(l0), "provider-frankfurt-node-1", "ip", tv->from, tv->from_n, 0, NULL, 0);
+    group_set_name(&g_spec, l1, sizeof(l1), "provider-frankfurt-node-2", "ip", tv->from, tv->from_n, 0, NULL, 0);
     check("длинные выходы с общим началом — разные наборы", 1, strcmp(l0, l1) != 0);
     check("имя набора длинного выхода не длиннее 31", 1, strlen(l0) <= 31 && strlen(l1) <= 31);
+
+    /* Части группы (rule_segs): у первой имя прежнее, у следующих — хвост «_s<номер>», и имя с буквой
+     * семейства и «6» двойника по-прежнему в 31 знаке; номер 16 — с «x», иначе имя части 1 плюс «6»
+     * двойника совпало бы с ним. */
+    char s1[64], s2[64], s16[64], s15[64], sl[64];
+    group_set_name(&g_spec, s1, sizeof(s1), "vpn", "dom", g_spec.lan.from, g_spec.lan.from_n, 0, NULL, 1);
+    check_str("часть 2 группы: хвост _s2", "vpn_dom_s2", s1);
+    group_set_name(&g_spec, s2, sizeof(s2), "direct", "ip", tv->from, tv->from_n, 0, NULL, 1);
+    check_str("часть 2 со своим клиентом", "direct_ip_c1_s2", s2);
+    group_set_name(&g_spec, s15, sizeof(s15), "vpn", "dom", g_spec.lan.from, g_spec.lan.from_n, 0, NULL, 0);
+    check_str("часть 1 (seg 0) — имя прежнее", "vpn_dom", s15);
+    group_set_name(&g_spec, s16, sizeof(s16), "vpn", "dom", g_spec.lan.from, g_spec.lan.from_n, 0, NULL, 15);
+    check_str("часть 16: с «x», не двойник IPv6 части 1", "vpn_dom_s16x", s16);
+    int lmax = 1;
+    for (int sg = 0; sg < 1200; sg += 7) {
+        group_set_name(&g_spec, sl, sizeof(sl), "provider-frankfurt-node-1", "dom", tv->from, tv->from_n, 1,
+                       NULL, sg);
+        if (strlen(sl) + 2 > 31) lmax = 0;
+        group_set_name(&g_spec, sl, sizeof(sl), "provider-frankfurt-node-1-very-long", "ip",
+                       g_spec.lan.from, g_spec.lan.from_n, 0, NULL, sg);
+        if (strlen(sl) + 2 > 31) lmax = 0;
+    }
+    check("имя части длинного выхода с буквой семейства и «6» — не длиннее 31", 1, lmax);
 
     check("allow_all спеки v1 по-прежнему нужен", -1, load(
         "{\"schema\":1,\"from_default\":[\"192.168.1.0/24\"],"
@@ -586,14 +609,14 @@ static void t_set_name_twin(void) {
     char a[64], b[64], b6[70];
     const struct spec_client *c1 = rule_who(&g_spec, &g_spec.rule[1]);
     const struct spec_client *c16 = rule_who(&g_spec, &g_spec.rule[16]);
-    group_set_name(&g_spec, a, sizeof(a), "vpn", "ip", c1->from, c1->from_n, 0, NULL);
-    group_set_name(&g_spec, b, sizeof(b), "vpn", "ip", c16->from, c16->from_n, 0, NULL);
+    group_set_name(&g_spec, a, sizeof(a), "vpn", "ip", c1->from, c1->from_n, 0, NULL, 0);
+    group_set_name(&g_spec, b, sizeof(b), "vpn", "ip", c16->from, c16->from_n, 0, NULL, 0);
     check_str("клиенты 1: имя прежнее", "vpn_ip_c1", a);
     snprintf(b6, sizeof(b6), "%s6", a);
     check("клиенты 16: имя не совпадает с двойником IPv6 набора 1", 1, strcmp(b, b6) != 0);
     check_str("клиенты 16: имя", "vpn_ip_c16x", b);
     const struct spec_client *c15 = rule_who(&g_spec, &g_spec.rule[15]);
-    group_set_name(&g_spec, a, sizeof(a), "vpn", "ip", c15->from, c15->from_n, 0, NULL);
+    group_set_name(&g_spec, a, sizeof(a), "vpn", "ip", c15->from, c15->from_n, 0, NULL, 0);
     check_str("клиенты 15: имя прежнее", "vpn_ip_c15", a);
 
     o = spec;
@@ -607,8 +630,8 @@ static void t_set_name_twin(void) {
     if (g_msg[0]) printf("     %s\n", g_msg);
     const struct l4match *l1 = &rule_list(&g_spec, &g_spec.rule[0])->l4;
     const struct l4match *l16 = &rule_list(&g_spec, &g_spec.rule[15])->l4;
-    group_set_name(&g_spec, a, sizeof(a), "vpn", "ip", g_spec.lan.from, g_spec.lan.from_n, 0, l1);
-    group_set_name(&g_spec, b, sizeof(b), "vpn", "ip", g_spec.lan.from, g_spec.lan.from_n, 0, l16);
+    group_set_name(&g_spec, a, sizeof(a), "vpn", "ip", g_spec.lan.from, g_spec.lan.from_n, 0, l1, 0);
+    group_set_name(&g_spec, b, sizeof(b), "vpn", "ip", g_spec.lan.from, g_spec.lan.from_n, 0, l16, 0);
     check_str("сужение 1: имя прежнее", "vpn_ip_c0_p1", a);
     snprintf(b6, sizeof(b6), "%s6", a);
     check("сужение 16: имя не совпадает с двойником IPv6 сужения 1", 1, strcmp(b, b6) != 0);
@@ -628,7 +651,7 @@ static void t_set_name_twin(void) {
     check("17 списков клиентов, первый — в другой выход, разобраны", 0, load(spec));
     if (g_msg[0]) printf("     %s\n", g_msg);
     c16 = rule_who(&g_spec, &g_spec.rule[16]);
-    group_set_name(&g_spec, b, sizeof(b), "vpn", "ip", c16->from, c16->from_n, 0, NULL);
+    group_set_name(&g_spec, b, sizeof(b), "vpn", "ip", c16->from, c16->from_n, 0, NULL, 0);
     check_str("клиенты 16 без соседа в том же выходе: имя прежнее", "vpn_ip_c16", b);
 }
 

@@ -30,7 +30,7 @@ check() {
 W="$(mktemp -d)"
 trap 'rm -rf "$W"' EXIT
 mkdir -p "$W/core" "$W/plugins" "$W/none"
-cp "$LIBS/steerd" "$LIBS"/libsteer.so.* "$LIBS"/libsteer-wolfssl.so.* "$W/core/"
+cp "$LIBS/steerd" "$LIBS"/libsteer.so.* "$LIBS"/libsteer-wolfssl.so.* "$LIBS"/libsteer-ngtcp2.so.* "$W/core/"
 cp -R "$LIBS/plugins/." "$W/plugins/"
 # Манифесты и схемы ключей — те, что едут в .s2p (plugins/<id>/ дерева, build/pack-s2p.sh): ядро читает их
 # реестром (src/kinds/plugin.c), и виды протоколов на стенде — виды плагинов, а не встроенные записи.
@@ -42,6 +42,10 @@ for d in plugins/*/; do
     sed -i "s/\"@VERSION@\"/\"$VER\"/" "$W/plugins/$q/plugin.json"
 done
 CORE="$W/core/steerd"
+# Библиотеки криптографии ядра (libsteer-wolfssl, libsteer-ngtcp2) net1 ищет там, где их кладёт пакет, — в /usr/lib, пути
+# загрузчика по умолчанию (2.1.4, ось steer-crypto); на стенде этот путь — $W/core и для программ плагинов тоже (ниже, где
+# проверяется, что net1 находится по RUNPATH, — тоже он: в $W/core net1 нет).
+LD_LIBRARY_PATH="$W/core"; export LD_LIBRARY_PATH
 P="$W/plugins"
 run_core() { _d="$1"; shift; env -u STEER_MODULE_DIR LD_LIBRARY_PATH="$W/core" STEER_PLUGINS_ROOT="$_d" STEER_PLUGINS_ETC="$W/petc" "$CORE" "$@"; }
 
@@ -70,7 +74,7 @@ check "  спека с vless — отказ «нужен плагин vless»" "
 
 # ---- с плагином ----------------------------------------------------------------------------------
 a="$(run_core "$P" vless-nodes "$W/sub.txt" 2>&1; echo "rc=$?")"
-b="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes "$W/sub.txt" 2>&1; echo "rc=$?")"
+b="$(env LD_LIBRARY_PATH="$W/core" "$P/vless/bin/vless" vless-nodes "$W/sub.txt" 2>&1; echo "rc=$?")"
 check "с плагином: steerd vless-nodes отвечает как программа плагина (вывод и код)" "$b" "$a"
 check "  и это перечень узлов, а не отказ" "1 0" \
     "$(printf '%s' "$a" | grep -c '"name":"B"') $(printf '%s' "$a" | grep -c 'нужен пакет')"
@@ -90,10 +94,10 @@ if command -v readelf >/dev/null 2>&1; then
 fi
 if command -v ldd >/dev/null 2>&1; then
     check "net1 находится по RUNPATH из каталога плагинов, без LD_LIBRARY_PATH" "$P/vless/bin/../../net1/lib/libs2p-net.so.1" \
-        "$(env -u LD_LIBRARY_PATH ldd "$P/vless/bin/vless" | sed -n 's/.*libs2p-net.so.1 => \([^ ]*\) .*/\1/p')"
+        "$(env LD_LIBRARY_PATH="$W/core" ldd "$P/vless/bin/vless" | sed -n 's/.*libs2p-net.so.1 => \([^ ]*\) .*/\1/p')"
 fi
 mv "$P/net1" "$W/net1.away"
-o="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes "$W/sub.txt" 2>&1)"; r=$?
+o="$(env LD_LIBRARY_PATH="$W/core" "$P/vless/bin/vless" vless-nodes "$W/sub.txt" 2>&1)"; r=$?
 check "без net1 плагин не стартует, загрузчик называет libs2p-net.so.1" "1" \
     "$([ "$r" != 0 ] && printf '%s' "$o" | grep -c 'libs2p-net.so.1' || echo 0)"
 mv "$W/net1.away" "$P/net1"
@@ -108,15 +112,15 @@ cat > "$W/vl.json" <<CONF
  "paths":{"etc":"$W/nonexistent-etc","state":"$W/nonexistent-state","plugin":"$P/vless","plugin_state":"$W/pst"},
  "platform":"openwrt"}
 CONF
-a="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes vl --conf "$W/vl.json" 2>&1; echo "rc=$?")"
+a="$(env LD_LIBRARY_PATH="$W/core" "$P/vless/bin/vless" vless-nodes vl --conf "$W/vl.json" 2>&1; echo "rc=$?")"
 b="$(run_core "$P" vless-nodes vl --spec "$W/etc/spec.yaml" --state-dir "$W/st2" 2>&1; echo "rc=$?")"
 # Программа знает о выходе только {conf}: спеки человека и каталогов ядра (их в {conf} нарочно нет на
 # диске) она не читает — перечень тот же, что у ядра, давшего ей {conf} по спеке.
 check "--conf {conf}: выход только из {conf}, без спеки человека — то же, что через ядро" "$b" "$a"
-o="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes vl --spec "$W/etc/spec.yaml" 2>&1)"; r=$?
+o="$(env LD_LIBRARY_PATH="$W/core" "$P/vless/bin/vless" vless-nodes vl --spec "$W/etc/spec.yaml" 2>&1)"; r=$?
 check "  --spec программа плагина не принимает (код 2)" "2 1" "$r $(printf '%s' "$o" | grep -c -- '--spec')"
 check "  и это перечень узлов выхода" "1" "$(printf '%s' "$a" | grep -c '"name":"A"')"
-o="$(env -u LD_LIBRARY_PATH "$P/vless/bin/vless" vless-nodes vl --conf "$W/nope.json" 2>&1)"; r=$?
+o="$(env LD_LIBRARY_PATH="$W/core" "$P/vless/bin/vless" vless-nodes vl --conf "$W/nope.json" 2>&1)"; r=$?
 check "--conf без файла — код 2 со словами" "2 1" "$r $(printf '%s' "$o" | grep -c 'не читается')"
 
 # hysteria2 по {conf}: ключи пула (silence) и снятый IPv6 доходят до разбора, узел честно не отвечает.
@@ -126,7 +130,7 @@ cat > "$W/pst/hy.json" <<CONF
            "mark":"0x00300000","table":302,"ipv6":false,"sock_mark":"0x00000000","sock_mark_required":false,"tcp_port":0},
  "paths":{"plugin_state":"$W/pst"},"platform":"openwrt"}
 CONF
-o="$(timeout 30 env -u LD_LIBRARY_PATH "$P/hysteria2/bin/hysteria2" hysteria2 hy --conf "$W/pst/hy.json" 2>&1)"
+o="$(timeout 30 env LD_LIBRARY_PATH="$W/core" "$P/hysteria2/bin/hysteria2" hysteria2 hy --conf "$W/pst/hy.json" 2>&1)"
 check "hysteria2 --conf: выход из {conf} разобран, узлы подписки перебраны" "1 1" \
     "$(printf '%s' "$o" | grep -c 'узлов 1 (пропущено 0') $(printf '%s' "$o" | grep -c 'ни один узел подписки не отвечает')"
 check "  модели спеки ядра у программы нет: ничего, кроме файла состояния, она не пишет" "hy.json hy.status.json" \

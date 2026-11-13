@@ -30,6 +30,7 @@
 #include "cli.h"
 #define PM_STEER_API CLI_STEER_API
 #define PM_STEER_ABI CLI_STEER_ABI
+#define PM_STEER_CRYPTO CLI_STEER_CRYPTO
 
 /* ---- ошибка ---- */
 /* Отказ менеджера: текст (русский, для журнала и командной строки) и машинная часть — code (стабильное слово,
@@ -195,7 +196,7 @@ int pm_sig_check(const struct pm_keyset *ks, const char *sig, size_t sig_n, cons
                  size_t msg_n, const char *what, struct pm_err *e);
 
 /* ---- цель отбора ---- */
-struct pm_target { char *core, *api, *abi, *host, *splify2, *arch; };
+struct pm_target { char *core, *api, *abi, *crypto, *host, *splify2, *arch; };
 void pm_target_load(struct pm_target *t);
 
 /* ---- индекс и отбор (pmindex.c) ---- */

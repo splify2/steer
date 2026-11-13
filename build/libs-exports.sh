@@ -1,9 +1,10 @@
 #!/bin/sh
 # Списки экспорта разделяемых библиотек (шаг 4 выпуска 1.10): что libsteer.so отдаёт steerd и
-# модулям, а libsteer-wolfssl.so — libsteer.
+# модулям, а libsteer-wolfssl.so и libsteer-ngtcp2.so (2.1.4) — libsteer, net1 и мосту tgws.
 #
-#     sh build/libs-exports.sh gen     переписать build/libsteer.map, build/wolfssl/libsteer-wolfssl.map
-#                                      и build/net1/libs2p-net.map (экспорт плагина net1)
+#     sh build/libs-exports.sh gen     переписать build/libsteer.map, build/wolfssl/libsteer-wolfssl.map,
+#                                      build/ngtcp2/libsteer-ngtcp2.map и build/net1/libs2p-net.map (экспорт
+#                                      плагина net1)
 #     sh build/libs-exports.sh check   сверить файлы с кодом (выход 1 — расходятся)
 #
 # ЗАЧЕМ СПИСКИ, А НЕ «ВСЁ ВИДИМОЕ». Без version-script библиотека отдаёт наружу каждый глобальный
@@ -22,6 +23,8 @@
 # $BUILD/wolfssl-host/src, и исходники ngtcp2 с патчем (обёртка QUIC): STEER_NGTCP2 или
 # $BUILD/ngtcp2-host/src (их кладёт tests/ext-test.sh).
 set -eu
+# sort и comm — в одном порядке байтов, иначе в UTF-8-локали comm отказывает «не отсортирован».
+export LC_ALL=C
 MODE="${1:-check}"
 BUILD="${BUILD:-build}"
 CC="${CC:-cc}"
@@ -115,6 +118,16 @@ nm -g --defined-only "$W"/net1/*.o | awk 'NF==3 {print $3}' | sort -u > "$W/n1de
 nm -u "$W"/plug/*.o | awk '$1=="U" || $1=="w" {print $2}' | sort -u > "$W/n1undef"
 comm -12 "$W/n1defs" "$W/n1undef" | grep -v '^s2p_' > "$W/n1need" || true
 
+# ---- libsteer-ngtcp2.so -----------------------------------------------------------------------
+# Что берут из ngtcp2 обёртки QUIC libsteer и net1 (исходник один, но net1 собирает свой набор NET1_QUIC_SRC).
+# net1 и tgws зовут из wolfSSL то же, что слой libsteer (тот же scrypto.c и qcssl.c), — wneed выше их покрывает.
+nm -g --defined-only "$W/libngtcp2.a" 2>/dev/null | awk 'NF==3 && $2 != "U" {print $3}' | sort -u > "$W/ngdefs"
+for f in $QUIC_ALL $(profile_var NET1_QUIC_SRC); do
+    o="$W/lib/$(echo "$f" | tr / _).o"
+    [ -f "$o" ] || o="$W/net1/$(echo "$f" | tr / _).o"
+    nm -u "$o"
+done | awk '$1=="U" || $1=="w" {print $2}' | sort -u | comm -12 "$W/ngdefs" - > "$W/ngneed"
+
 emit_net1() {
     echo "/* Экспорт libs2p-net.so.1 (плагин net1) — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками"
     echo " * не правится. Имена исходников стека, которые берут плагины протоколов ($(profile_var PLUGINS_NET1 | sed 's/ /, /g')),"
@@ -145,7 +158,8 @@ emit_wolfssl() {
     echo "/* Экспорт libsteer-wolfssl.so — ЭТОТ ФАЙЛ ПОРОЖДАЕТ build/libs-exports.sh (gen), руками не правится."
     echo " * Символы wolfSSL, которые зовут слой src/lib/scrypto.c, обёртка QUIC src/proto/quic/qcssl.c и"
     echo " * криптобэкенд ngtcp2 (crypto/wolfssl), и отпечаток сборки steer_wolfssl_abi (build/wolfssl/"
-    echo " * abi.c). Остальное скрыто: наружу торчит не библиотека, а нужное. */"
+    echo " * abi.c); net1 и мост tgws берут те же (те же исходники). Остальное скрыто: наружу торчит не"
+    echo " * библиотека, а нужное. Новое имя — минор оси steer-crypto, убранное — её мажор (crypto.lst). */"
     echo "{"
     echo "  global:"
     echo "    steer_wolfssl_abi;"
@@ -154,7 +168,19 @@ emit_wolfssl() {
     echo "    *;"
     echo "};"
 }
+emit_ngtcp2() {
+    echo "/* Экспорт libsteer-ngtcp2.so (ngtcp2 с криптобэкендом wolfSSL, build/build-libs.sh) — ЭТОТ ФАЙЛ ПОРОЖДАЕТ"
+    echo " * build/libs-exports.sh (gen), руками не правится. То, что зовёт обёртка QUIC src/proto/quic в libsteer.so и"
+    echo " * в net1. Новое имя — минор оси steer-crypto, убранное — её мажор (build/wolfssl/crypto.lst). */"
+    echo "LIBSTEER_NGTCP2 {"
+    echo "  global:"
+    sed 's/$/;/; s/^/    /' "$W/ngneed"
+    echo "  local:"
+    echo "    *;"
+    echo "};"
+}
 emit_libsteer > "$W/libsteer.map"
+emit_ngtcp2 > "$W/libsteer-ngtcp2.map"
 emit_wolfssl > "$W/libsteer-wolfssl.map"
 emit_net1 > "$W/libs2p-net.map"
 
@@ -162,13 +188,15 @@ case "$MODE" in
 gen)
     cp "$W/libsteer.map" build/libsteer.map
     cp "$W/libsteer-wolfssl.map" build/wolfssl/libsteer-wolfssl.map
+    cp "$W/libsteer-ngtcp2.map" build/ngtcp2/libsteer-ngtcp2.map
     mkdir -p build/net1
     cp "$W/libs2p-net.map" build/net1/libs2p-net.map
-    echo "libs-exports: libsteer.map — $(wc -l < "$W/need") символов, libsteer-wolfssl.map — $(wc -l < "$W/wneed"), libs2p-net.map — $(($(wc -l < "$W/n1need") + 1))"
+    echo "libs-exports: libsteer.map — $(wc -l < "$W/need") символов, libsteer-wolfssl.map — $(wc -l < "$W/wneed"), libsteer-ngtcp2.map — $(wc -l < "$W/ngneed"), libs2p-net.map — $(($(wc -l < "$W/n1need") + 1))"
     ;;
 check)
     bad=0
-    for pair in libsteer.map:build/libsteer.map libsteer-wolfssl.map:build/wolfssl/libsteer-wolfssl.map libs2p-net.map:build/net1/libs2p-net.map; do
+    for pair in libsteer.map:build/libsteer.map libsteer-wolfssl.map:build/wolfssl/libsteer-wolfssl.map \
+                libsteer-ngtcp2.map:build/ngtcp2/libsteer-ngtcp2.map libs2p-net.map:build/net1/libs2p-net.map; do
         gen="$W/${pair%%:*}"; have="${pair#*:}"
         if ! diff -u "$have" "$gen" > "$W/diff" 2>&1; then
             echo "libs-exports: $have разошёлся с кодом (sh build/libs-exports.sh gen):"

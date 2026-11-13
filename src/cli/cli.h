@@ -111,6 +111,11 @@ void cli_version(FILE *out);
  * число на всё ядро: реестр плагинов (STEER_API_VERSION, kinds/plugin.h), менеджер и version --json. */
 #define CLI_STEER_API "1.5"
 #define CLI_STEER_ABI "1.0"
+/* steer-crypto (2.1.4): общие библиотеки криптографии и QUIC ядра — libsteer-wolfssl.so.<версия wolfSSL> и
+ * libsteer-ngtcp2.so.<версия ngtcp2>-<серия патчей>, — с которыми связаны net1 и мост tgws. Мажор — смена SONAME
+ * любой из них или раскладки структур (build/wolfssl/abi.c), минор — новое имя в экспорте. Записанные значения и
+ * правило подъёма — build/wolfssl/crypto.lst, сверяет tests/buildmatch.sh. */
+#define CLI_STEER_CRYPTO "1.0"
 void cli_version_json(FILE *out);
 const char *cli_core_version(void);
 

@@ -142,7 +142,7 @@ static void member_add(struct group *g, const char *name) {
  * тем же выходом, клиентами, режимом и сужением (в том числе к группе обычного правила);
  * составная — к составной с тем же выходом и клиентами; доп. часть — своей группой всегда. */
 static int add_srs_channel(const struct spec *sp, struct groups *gr, const struct spec_rule *c,
-                           struct err *e) {
+                           int seg, struct err *e) {
     if (gr->plans_n == gr->plans_cap) {
         size_t nc = gr->plans_cap ? gr->plans_cap * 2 : 8;
         struct srs_plan *np = realloc(gr->plans, nc * sizeof(*np));
@@ -170,6 +170,7 @@ static int add_srs_channel(const struct spec *sp, struct groups *gr, const struc
             for (size_t k = 0; k < gr->n && !g; k++) {
                 struct group *h = &gr->g[k];
                 if (strcmp(h->out, out) != 0 || h->all || h->extra) continue;
+                if (h->seg != seg) continue;
                 if (h->composite != composite) continue;
                 if (domains && h->domains && h->realip != c->realip) continue;
                 if (!same_from(sp, c, h)) continue;
@@ -188,6 +189,7 @@ static int add_srs_channel(const struct spec *sp, struct groups *gr, const struc
             g->from_n = from_n;
             g->l4 = l4;
             g->composite = composite;
+            g->seg = seg;
             if (p->kind == SP_EXTRA) {
                 g->extra = p->id;
                 g->all = p->all;
@@ -203,13 +205,13 @@ static int add_srs_channel(const struct spec *sp, struct groups *gr, const struc
                 }
                 group_set_name_extra(sp, g->name, sizeof(g->name), g->out,
                                      p->all ? "all" : domains ? "dom" : "ip", from, from_n,
-                                     c->realip, p->id);
+                                     c->realip, p->id, seg);
             } else if (composite) {
                 group_set_name_mixed(sp, g->name, sizeof(g->name), g->out,
-                                     domains ? "dom" : "ip", from, from_n, c->realip);
+                                     domains ? "dom" : "ip", from, from_n, c->realip, seg);
             } else {
                 group_set_name(sp, g->name, sizeof(g->name), g->out, domains ? "dom" : "ip",
-                               from, from_n, c->realip, l4);
+                               from, from_n, c->realip, l4, seg);
             }
             set_name_famtag(g->name, sizeof(g->name), rule_famtag(c));
         }
@@ -234,6 +236,10 @@ static int add_srs_channel(const struct spec *sp, struct groups *gr, const struc
 int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
     /* Прежние векторы файлов не теряются: повторный разбор в том же значении их отдаёт. */
     groups_free(gr);
+    /* Части групп — по порядку правил (rule_segs, model/parse.c): правило не сливается с группой,
+     * если между ними стоит правило другого действия, способное забрать те же пакеты. */
+    int *segs = rule_segs(sp);
+    if (!segs) return err_setf(e, "compile.no_memory", "out of memory building channel groups");
     for (int pass = 0; pass < 2; pass++)
     for (size_t i = 0; i < sp->rule_n; i++) {
         const struct spec_rule *c = &sp->rule[i];
@@ -247,8 +253,9 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
         if (c->disabled) continue;
         /* Канал с наборами sing-box — по своей раскладке (у набора бывает своё сужение у каждой
          * клаузы, свои условия и исключения). Канал без них — ровно как раньше, до байта. */
+        int seg = segs[i];
         if (l->srs_n) {
-            if (add_srs_channel(sp, gr, c, e) != 0) return -1;
+            if (add_srs_channel(sp, gr, c, seg, e) != 0) { free(segs); return -1; }
             continue;
         }
         int domains = l->domains_n > 0;
@@ -266,6 +273,8 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
              * этой сети в туннель» превращался в «только адреса из списка», и об этом не
              * сообщалось ни отказом, ни в status, ни в diag. */
             if (g->all != all) continue;
+            /* Другая часть — другая группа: между ними правило с другим действием (rule_segs). */
+            if (g->seg != seg) continue;
             /* Вид больше НЕ разделяет группы: адресное и доменное правило одного сервиса,
              * ведущие в один outbound для одних клиентов, — это одно правило и один набор.
              * Разделение по виду было следствием запрета смешивать, а не требованием ядра. */
@@ -288,8 +297,9 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
         }
         if (k == gr->n) {
             struct group *g = group_new(gr, e);
-            if (!g) return -1;
+            if (!g) { free(segs); return -1; }
             g->out = out;
+            g->seg = seg;
             g->famreq = c->family;
             g->famblk = c->fam_block;
             g->domains = 0;
@@ -302,7 +312,7 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
              * правилом, и тогда набор обязан называться _dom, иначе резолвер его не найдёт
              * (он вычисляет имя сам, той же функцией group_set_name). */
             group_set_name(sp, g->name, sizeof(g->name), g->out, all ? "all" : domains ? "dom" : "ip",
-                           g->from, g->from_n, g->realip, g->l4);
+                           g->from, g->from_n, g->realip, g->l4, g->seg);
             set_name_famtag(g->name, sizeof(g->name), fam_tag_of(g->famreq, g->famblk));
         }
         struct group *g = &gr->g[k];
@@ -314,9 +324,10 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
             g->dfiles_n += l->domains_n;
         }
         for (size_t f = 0; f < l->prefixes_n; f++)
-            if (group_add_file(g, l->prefixes_files[f], e) != 0) return -1;
+            if (group_add_file(g, l->prefixes_files[f], e) != 0) { free(segs); return -1; }
         member_add(g, c->name);
     }
+    free(segs);
     /* Окончательные имена. Группа с доменами — всегда _dom, потому что имя набора резолвер
      * вычисляет тем же правилом и по-другому его не найдёт. Группы `any` не трогаем: у них
      * набора нет вовсе. */
@@ -337,10 +348,10 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
         if (g->extra) continue;
         if (g->composite)
             group_set_name_mixed(sp, g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
-                                 g->from, g->from_n, g->realip);
+                                 g->from, g->from_n, g->realip, g->seg);
         else
             group_set_name(sp, g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
-                           g->from, g->from_n, g->realip, g->l4);
+                           g->from, g->from_n, g->realip, g->l4, g->seg);
         set_name_famtag(g->name, sizeof(g->name), fam_tag_of(g->famreq, g->famblk));
         /* Половина IPv6 доменной группы — тем же решением, что у резолвера (dom6_ok): он
          * кладёт адреса в «<имя>6», только если у группы есть набор и правило IPv6. */
