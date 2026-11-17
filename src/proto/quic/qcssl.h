@@ -16,6 +16,9 @@
 #define STEER_QCSSL_H
 #include <stddef.h>
 #include <stdint.h>
+#if defined(QC_WITH_SERVER) || defined(QC_WITH_ENDPOINT)
+int qcssl_material_sha256(const uint8_t *,size_t,uint8_t out[32]);
+#endif
 
 /* Клиентский контекст. insecure — не проверять сертификат; иначе корни из ca_pem либо из ca_file
  * (файл PEM). NULL — не создалось. */

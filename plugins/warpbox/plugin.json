@@ -25,7 +25,7 @@
   ],
   "requires": {
     "plugins": {
-      "net1": "^1.4",
+      "net1": "^1.6.0",
       "awg": "^2.1"
     },
     "system": [

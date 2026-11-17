@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <net/if.h>
+#include <poll.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 
@@ -36,6 +37,7 @@ static enum mode g_mode;
 static int g_reqs;               /* сколько запросов прислано */
 static uint32_t g_seq;           /* номер последнего */
 static uint16_t g_type;          /* тип последнего запроса */
+static int g_fd;
 static int g_pending;            /* ответ на последний ещё не отдан */
 
 ssize_t __real_sendto(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
@@ -45,6 +47,7 @@ ssize_t __wrap_sendto(int fd, const void *buf, size_t len, int flags, const stru
                       socklen_t tl) {
     (void)fd; (void)flags; (void)to; (void)tl;
     const struct nlmsghdr *h = buf;
+    g_fd = fd;
     g_seq = h->nlmsg_seq;
     g_type = h->nlmsg_type;
     g_reqs++;
@@ -115,6 +118,18 @@ ssize_t __wrap_recv(int fd, void *buf, size_t cap, int flags) {
         break;
     }
     return (ssize_t)n;
+}
+
+int __real_poll(struct pollfd *,nfds_t,int);
+int __wrap_poll(struct pollfd *p,nfds_t n,int timeout){if(n==1&&p->fd==g_fd&&g_pending){p->revents=p->events;return 1;}return __real_poll(p,n,timeout);}
+int __real___poll_chk(struct pollfd *,nfds_t,int,size_t);
+int __wrap___poll_chk(struct pollfd *p,nfds_t n,int timeout,size_t bytes){if(n==1&&p->fd==g_fd&&g_pending){if(bytes<sizeof *p){errno=EINVAL;return -1;}return __wrap_poll(p,n,timeout);}return __real___poll_chk(p,n,timeout,bytes);}
+ssize_t __real_recvmsg(int,struct msghdr *,int);
+ssize_t __wrap_recvmsg(int fd,struct msghdr *msg,int flags){
+    if(fd!=g_fd)return __real_recvmsg(fd,msg,flags);
+    if(msg->msg_iovlen!=1||msg->msg_namelen<sizeof(struct sockaddr_nl)){errno=EINVAL;return -1;}
+    struct sockaddr_nl source={.nl_family=AF_NETLINK};memcpy(msg->msg_name,&source,sizeof source);msg->msg_namelen=sizeof source;msg->msg_flags=0;
+    return __wrap_recv(fd,msg->msg_iov[0].iov_base,msg->msg_iov[0].iov_len,flags);
 }
 
 static int pass, fail;

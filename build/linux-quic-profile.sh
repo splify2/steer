@@ -14,6 +14,8 @@ case "$MODE" in client) DEFS= ;; server) DEFS=-DQC_WITH_ENDPOINT ;; *) exit 2 ;;
 [ -r "$WLIB.cflags" ] && [ -r "$NGLIB.cflags" ]
 if grep -q -- '-DSTEER_WOLFSSL_SERVER' "$WLIB.cflags"; then HAS_SERVER=1; else HAS_SERVER=0; fi
 if [ "$MODE" = server ] && [ "$HAS_SERVER" != 1 ]; then echo 'server profile requires server-enabled wolfSSL' >&2; exit 2; fi
+if [ "$MODE" = server ]; then grep -Eq -- '(^|[[:space:]])-DSTEER_WOLFSSL_POSIX_TIME_SAFE=1([[:space:]]|$)' "$WLIB.cflags" || { echo 'rebuilt POSIX time-safe server archive required' >&2; exit 2; }; fi
+if [ "$MODE" = server ]; then grep -q -- '-DWOLFSSL_VALIDATE_ECC_IMPORT' "$WLIB.cflags" || { echo 'server profile requires ECC private/public correspondence validation' >&2; exit 2; }; fi
 if [ "$MODE" = client ] && [ "$HAS_SERVER" != 0 ]; then echo 'minimal baseline requires client-only wolfSSL' >&2; exit 2; fi
 mkdir -p "$OUT"
 OUT=$(CDPATH= cd -- "$OUT" && pwd)

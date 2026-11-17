@@ -41,7 +41,7 @@ struct foprobe {
     struct fospawn *sp;
     foprobe_cb cb;
     void *arg;
-    long t0;
+    int64_t t0;
     struct in_addr dst;
     /* ICMP: свои запросы — номера с seq0 по seq; rtm — таймер повтора, left — сколько запросов
      * ещё послать, gap — через сколько миллисекунд следующий. */
@@ -78,8 +78,8 @@ static void probe_timeout(struct loop *l, struct loop_timer *t, void *arg) {
     probe_finish(p, 0, -1);
 }
 
-static int elapsed_ms(long t0) {
-    long ms = loop_now_ms() - t0;
+static int elapsed_ms(int64_t t0) {
+    int64_t ms = loop_now_ms() - t0;
     if (ms < 0) ms = 0;
     if (ms > 1000000) ms = 1000000;
     return (int)ms;
@@ -115,7 +115,7 @@ struct foprobe *foprobe_tcp(struct loop *l, const char *dev, unsigned mark, cons
                             int timeout_ms, foprobe_cb cb, void *arg, int *ok, int *ms) {
     *ok = 0;
     *ms = -1;
-    long t0 = loop_now_ms();
+    int64_t t0 = loop_now_ms();
     struct in_addr a;
     if (inet_aton(host, &a) == 0) return NULL;
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);

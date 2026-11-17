@@ -69,7 +69,7 @@ THIRD_DEFS := -DHAVE_CONFIG_H
 # метки), пути состояния. Стенды, компонующие модель, получают платформу тем же списком.
 # С ней же — умолчания профиля (src/profile/profile.c): поле метки профиля подменяет
 # поле роутера в plat(), так что платформа без профиля не компонуется.
-PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/android.c src/profile/profile.c
+PLATFORM_SRC := src/platform/platform.c src/platform/capabilities.c src/platform/openwrt.c src/platform/android.c src/profile/profile.c
 
 # Чтение YAML (docs/architecture.md, «3. Спека v2»): событийный парсер libyaml 0.2.5
 # (src/third_party/libyaml, MIT; только разбор — без загрузчика и эмиттера) и обёртка движка
@@ -212,7 +212,7 @@ XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/x
 #                  годность): половина разбора sub.c, которую с ним делит модуль steer-proxy
 #                  (trojan://, vmess://), — в libsteer, как и сам транспорт.
 SUBLINK_SRC := src/proto/vless/sublink.c
-STACK_SRC := src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/pool.c src/tunnel/geo.c \
+STACK_SRC := src/tunnel/stack.c src/tunnel/fakeip.c src/tunnel/rtx.c src/tunnel/pool.c src/tunnel/geo.c \
              src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/tls/httpc.c src/proto/tls/plughttp.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/tls/ech.c src/proto/transport/trgrpc.c \
@@ -380,7 +380,7 @@ PROFILE_steerd     := $(STEERD_DYN_SRC)
 # на процесс помощника и отдаётся наружу (s2p_plat, s2p_evline_emit…): иначе у плагина и у net1 было
 # бы по своей платформе, и выбор --platform или каталог состояния расходились бы между ними.
 NET1_BASE_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/run.c src/lib/jsonw.c src/lib/evline.c
-TUNNEL_SRC := src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/pool.c src/tunnel/geo.c src/tunnel/tun.c
+TUNNEL_SRC := src/tunnel/stack.c src/tunnel/fakeip.c src/tunnel/rtx.c src/tunnel/pool.c src/tunnel/geo.c src/tunnel/tun.c
 TRANSPORT_ONLY_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                       src/proto/transport/trsec.c src/proto/transport/trgrpc.c \
                       src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c \

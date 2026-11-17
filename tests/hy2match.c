@@ -606,6 +606,24 @@ static void test_rasm(void) {
     }
     CHECK(!toobig);                                                   /* 48 × 1400 = 67200 > 65507 */
     hy2_rasm_free(&r2);
+    /* Same packet ID must not revive a matching expired assembly. */
+    rasm_msg(&m, 30, 0, 2, p1, 4); CHECK(!hy2_rasm_feed(&ras,&m,10,0,&tot));
+    rasm_msg(&m, 30, 1, 2, p3, 2);
+    got=hy2_rasm_feed(&ras,&m,10+HY2_RASM_TTL_MS+1,0,&tot);
+    CHECK(got==NULL);free(got);hy2_rasm_free(&ras);
+    /* The oldest of more than sixteen incomplete packets must be evicted,
+     * while the newest packet remains usable. */
+    for(unsigned i=0;i<20;i++) { rasm_msg(&m,(uint16_t)(100+i),0,2,p1,4);CHECK(!hy2_rasm_feed(&ras,&m,100+i,0,&tot)); }
+    rasm_msg(&m,100,1,2,p3,2);got=hy2_rasm_feed(&ras,&m,130,0,&tot);CHECK(!got);free(got);
+    rasm_msg(&m,119,1,2,p3,2);got=hy2_rasm_feed(&ras,&m,131,0,&tot);CHECK(got&&tot==6);free(got);
+    hy2_rasm_free(&ras);
+    /* Reject before allocating an oversized fragment or accumulating >65507. */
+    static uint8_t oversized[65508];
+    rasm_msg(&m,200,0,2,oversized,sizeof oversized);CHECK(!hy2_rasm_feed(&ras,&m,200,0,&tot));CHECK(ras==NULL);
+    hy2_rasm_free(&ras);
+    rasm_msg(&m,201,0,3,oversized,40000);CHECK(!hy2_rasm_feed(&ras,&m,200,0,&tot));
+    rasm_msg(&m,201,1,3,oversized,40000);CHECK(!hy2_rasm_feed(&ras,&m,200,0,&tot));CHECK(ras==NULL);
+    hy2_rasm_free(&ras);
 }
 
 /* Чужая скобка или запятая на месте значения в конфиге Xray: отказ «не разобран» сразу и без

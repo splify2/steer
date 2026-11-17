@@ -705,27 +705,27 @@ struct ctl_srv {
     int on;                   /* движок включён — как сказали последние apply, reload, SIGHUP */
     /* Когда ставились последние починки по сверке прохода (srv_resync), мс монотонных, по кругу;
      * 0 — не было. Размер — RESYNC_BURST. */
-    long resync_at[3];
+    int64_t resync_at[3];
     int resync_i;
     /* Устройство раздачи пересоздано (srv_lan): сверка набора правил через LAN_SETTLE_MS; ещё
      * одна после идущей (lan_again) — та могла собрать план до нового устройства. Сверок по
      * устройствам раздачи за окно — lan_n с начала окна lan_win. */
     struct loop_timer *lan_tm;
     int lan_again;
-    long lan_win;
+    int64_t lan_win;
     int lan_n;
-    long lan_said;
+    int64_t lan_said;
     /* Лимит сверок прохода (srv_kcheck): когда устройство раздачи последний раз пропадало или
      * появлялось (lan_at) и когда начинался последний план (plan_at), мс монотонных. Расхождение
      * после смены устройства раздачи, которую ещё не видел ни один план, — объяснимое и не в счёт
      * RESYNC_BURST. resync_said — окно (самая старая починка в нём), о котором отказ уже сказан. */
-    long lan_at, plan_at, resync_said;
+    int64_t lan_at, plan_at, resync_said;
     /* Повтор стартового применения (boot_retry): таймер, номер следующей попытки и пауза перед ней. */
     struct loop_timer *boot_tm;
     int boot_try;
     long boot_pause_ms;
     /* Журнал отказов приёма (srv_deny_log): начало окна, строк в нём и сколько опущено. */
-    long deny_win;
+    int64_t deny_win;
     int deny_n;
     unsigned long deny_more;
 };
@@ -2977,7 +2977,7 @@ static void srv_accept_resume(struct loop *l, struct loop_timer *t, void *arg) {
 #define CTL_DENY_WIN_MS 60000L
 
 static void srv_deny_log(struct ctl_srv *s, const char *who) {
-    long now = loop_now_ms();
+    int64_t now = loop_now_ms();
     if (!s->deny_win || now - s->deny_win >= CTL_DENY_WIN_MS) {
         if (s->deny_more > 1)
             fprintf(stderr, LOG_W "отказ: и ещё %lu таких за %ld с — строки о них опущены\n",
@@ -3132,7 +3132,7 @@ static void srv_jobs_stop(struct ctl_srv *s) {
     int any = 0;
     for (struct conn *c = s->conns; c; c = c->next)
         if (c->job.running) { kill(-c->job.pid, SIGTERM); any = 1; }
-    long dl = loop_now_ms() + 2000;
+    int64_t dl = loop_now_ms() + 2000;
     while (any) {
         any = 0;
         for (struct conn *c = s->conns; c; c = c->next) {
@@ -3504,7 +3504,7 @@ static void srv_kcheck(void *arg) {
         drift = 1;
     }
     if (drift != 1) return;
-    long now = loop_now_ms();
+    int64_t now = loop_now_ms();
     int lan = s->lan_at && s->lan_at >= s->plan_at;
     if (lan && srv_lan_budget(s)) {
         fprintf(stderr, LOG_W "проход сторожа: набор правил в ядре разошёлся с поставленным (%s) "
@@ -3513,14 +3513,14 @@ static void srv_kcheck(void *arg) {
         return;
     }
     /* resync_at[resync_i] — самая старая из последних RESYNC_BURST починок (0 — их было меньше). */
-    long oldest = s->resync_at[s->resync_i];
+    int64_t oldest = s->resync_at[s->resync_i];
     if (oldest && now - oldest < RESYNC_WINDOW_MS) {
         if (s->resync_said != oldest) {
             s->resync_said = oldest;
             fprintf(stderr, LOG_W "проход сторожа: набор правил в ядре разошёлся с поставленным (%s), "
                     "но починок по сверке уже %d за %ld мин — следующая через %ld с\n", why,
                     RESYNC_BURST, RESYNC_WINDOW_MS / 60000L,
-                    (oldest + RESYNC_WINDOW_MS - now + 999) / 1000);
+                    (long)((oldest + RESYNC_WINDOW_MS - now + 999) / 1000));
         }
         return;
     }
@@ -3562,7 +3562,7 @@ static int srv_resync_pending(const struct ctl_srv *s) {
 /* Ещё одна сверка по устройствам раздачи в окне: 1 — можно (и посчитана), 0 — предел, строка в
  * журнал одна на окно. */
 static int srv_lan_budget(struct ctl_srv *s) {
-    long now = loop_now_ms();
+    int64_t now = loop_now_ms();
     if (!s->lan_win || now - s->lan_win >= RESYNC_WINDOW_MS) { s->lan_win = now; s->lan_n = 0; }
     if (s->lan_n >= LAN_RESYNC_BURST) {
         if (s->lan_said != s->lan_win) {

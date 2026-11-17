@@ -104,6 +104,7 @@ func main() {
 	}
 	address := os.Args[1]
 	if len(os.Args) == 3 {
+		if os.Args[2]=="once" { c:=dial(address,2*time.Second);echo(c,7);c.CloseWithError(0,"");fmt.Println("PASS single family echo");return }
 		if os.Args[2] != "release" {
 			panic("unknown mode")
 		}
@@ -128,8 +129,10 @@ func main() {
 	}
 	defer socket.Close()
 	captured := &capture{PacketConn: socket}
+	transport := &quic.Transport{Conn: captured, ConnectionIDLength: 20}
+	defer transport.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	one, err := quic.Dial(ctx, captured, peer, tlsConfig(), config())
+	one, err := transport.Dial(ctx, peer, tlsConfig(), config())
 	cancel()
 	if err != nil {
 		panic(err)
@@ -155,6 +158,17 @@ func main() {
 	go func() { defer group.Done(); echo(one, 1) }()
 	go func() { defer group.Done(); echo(two, 2) }()
 	group.Wait()
+	// The C peer must size its datagram for our 20-byte destination CID,
+	// rather than its own shorter source CID. Exercise the exact promised cap.
+	if err = one.SendDatagram([]byte{0xfe}); err != nil {
+		panic(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	maximum, err := one.ReceiveDatagram(ctx)
+	cancel()
+	if err != nil || len(maximum) < 1100 || !bytes.Equal(maximum, bytes.Repeat([]byte{0xa5}, len(maximum))) {
+		panic("maximum datagram with 20-byte peer CID failed")
+	}
 	ctx, cancel = context.WithTimeout(context.Background(), 400*time.Millisecond)
 	extra, err := quic.DialAddr(ctx, address, tlsConfig(), config())
 	cancel()

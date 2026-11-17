@@ -61,6 +61,7 @@ static void loaded(struct steer_prototype_store*s,uint64_t generation){
     steer_prototype_config_destroy(c);
 }
 int main(void){
+    alarm(20);
     char path[]="/tmp/steer-store-test-XXXXXX",name[256],link[256];
     struct steer_prototype_store*s=NULL,*other=NULL;
     struct steer_prototype_store_transaction*t=NULL;
@@ -120,6 +121,15 @@ int main(void){
     assert(steer_prototype_store_commit(t).phase==STEER_PROTOTYPE_STORE_RENAMED);
     assert(!steer_prototype_store_abort(t).code);
     loaded(s,2);
+    const char spec_document[]="{\"version\":3,\"plugin_remotes\":{},\"plugins\":{},\"inbounds\":{},\"outbounds\":{\"d\":{\"type\":\"direct\",\"flow\":[\"stream\"]}},\"routing\":{\"default\":\"d\",\"rules\":[]}}";
+    struct steer_store_document typed={3,STEER_STORE_FORMAT_SPEC_V3,(char *)spec_document,sizeof(spec_document)-1},*snapshot=NULL;
+    assert(!steer_prototype_store_prepare_document(s,&typed,&t).code);
+    result=steer_prototype_store_commit(t);assert(!result.error.code&&result.phase==STEER_PROTOTYPE_STORE_SYNCED);assert(!steer_prototype_store_abort(t).code);
+    assert(!steer_prototype_store_load_document(s,&snapshot).code&&snapshot->generation==3&&snapshot->format==STEER_STORE_FORMAT_SPEC_V3&&!strcmp(snapshot->document,spec_document));steer_store_document_destroy(snapshot);
+    assert(steer_prototype_store_load(s,&readback).code==STEER_PV1_INVALID&&!readback);
+    typed.format=99;assert(steer_prototype_store_prepare_document(s,&typed,&t).code==STEER_PV1_INVALID&&!t);
+    typed.format=STEER_STORE_FORMAT_SPEC_V3;typed.length=STEER_STORE_DOCUMENT_MAX+1u;assert(steer_prototype_store_prepare_document(s,&typed,&t).code==STEER_PV1_INVALID&&!t);
+    assert(!steer_prototype_store_prepare(s,c,&t).code);assert(!steer_prototype_store_commit(t).error.code);assert(!steer_prototype_store_abort(t).code);loaded(s,2);
     assert(!temporary_count(path));
     assert(!steer_prototype_store_close(s).code);
     assert(!chmod(path,0755));
@@ -138,6 +148,7 @@ int main(void){
     assert(!symlink("/etc/passwd",name));
     assert(steer_prototype_store_load(s,&readback).code==STEER_PV1_INVALID&&!readback);
     assert(!unlink(name));
+    assert(!mkfifo(name,0600));assert(steer_prototype_store_load(s,&readback).code==STEER_PV1_INVALID&&!readback);assert(!unlink(name));
     assert(!steer_prototype_store_close(s).code);
     snprintf(name,sizeof(name),"%s/.writer.lock",path);
     assert(!unlink(name)&&!rmdir(path));

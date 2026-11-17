@@ -181,6 +181,32 @@ int main(void) {
         check("начало UUID: ждём остальное, ничего не отдаём", 1, rc == 0 && pl_n == 0);
     }
 
+    /* DIRECT is announced by its header but activates only after BOTH body and
+     * padding. Every split can be a separate outer TLS record. */
+    {
+        unsigned char wire[64];
+        size_t frame = make_stream(wire, VISION_CMD_DIRECT, "abc", 3);
+        wire[19] = 0; wire[20] = 5;
+        memset(wire + frame, 0x91, 5); frame += 5;
+        memcpy(wire + frame, "raw", 3);
+        for (size_t split = 1; split <= frame; split++) {
+            struct vision v; char result[16]; size_t result_n = 0, pos = 0;
+            vision_init(&v, UUID);
+            while (pos < frame + 3) {
+                size_t end = pos < split ? split : pos < frame ? frame : frame + 3;
+                size_t used = 0, amount = 0; const unsigned char *payload = NULL;
+                int rc = vision_unwrap(&v, wire + pos, end - pos, &used, &payload, &amount);
+                if (rc || (!used && !amount)) { fails++; break; }
+                if (amount) { memcpy(result + result_n, payload, amount); result_n += amount; }
+                pos += used;
+                if (pos < frame && (v.recv_direct || v.recv_done)) { fails++; break; }
+                if (pos >= frame && (!v.recv_direct || !v.recv_done)) { fails++; break; }
+            }
+            if (result_n != 6 || memcmp(result, "abcraw", 6)) fails++;
+        }
+        check("DIRECT fragmented body+padding activates at exact boundary", 1, fails == 0);
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

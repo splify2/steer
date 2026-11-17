@@ -46,6 +46,7 @@
 #include "spsc.h"
 #include "dialer.h"
 #include "stack.h"
+#include "fakeip.h"
 #include "spec.h"
 #include "run.h"
 #include "thrstack.h"
@@ -106,6 +107,7 @@ static int flow_rejected(const struct flow_key *k, int udp) {
 #define TOK_EFD   0x1FFFFF01u
 #define TOK_LST   0x1FFFFF02u
 #define TOK_LOOP  0x1FFFFF03u
+#define TOK_FAKEIP 0x1FFFFF04u
 /* Сколько событий epoll забираем за виток: не число соединений, а порция — остальное ядро отдаст
  * следующим вызовом (готовые держатся в списке готовности). */
 #define EV_BATCH 512
@@ -260,8 +262,8 @@ struct conn {
     int fd;                   /* копия сокета сессии: нужна при снятии с epoll */
     int done;                 /* установщик закончил: читать только с ACQUIRE */
     int rc;                   /* его результат: 0 или код ошибки дайлера */
-    /* Когда сервер закрылся: предел ожидания, пока сокет клиента примет остаток кольца (CLOSE_DRAIN_MS);
-     * потом закрываем всё равно — клиент мог уйти совсем. */
+    /* EOF узла или последнее продвижение хвоста клиенту. CLOSE_DRAIN_MS мерит
+     * отсутствие прогресса; недописанный хвост по сроку требует RST, не FIN. */
     uint64_t closed_at;
     /* ---- ранние данные клиента ----
      *
@@ -284,6 +286,9 @@ struct conn {
     /* Клиент прислал FIN и принят он по порядку: от клиента больше данных не будет, но
      * ответ сервера ему ещё идёт (I-319). */
     uint8_t client_fin;
+    uint8_t tx_fin; /* 0 pending, 1 accepted, 2 unsupported legacy */
+    uint8_t rx_fin_sent;
+    uint8_t flow_checked;
     /* Связь с узлом оборвана, а не закрыта (ядро не дождалось узла, узел сбросил связь) или узел
      * соединения больше не активен (dialer_ops.stale): клиенту — RST из общего прохода, а не FIN.
      * FIN сказал бы «ответ кончился», и обрезанная закачка выглядела бы целой. Ставится вместе с
@@ -550,6 +555,16 @@ static __thread size_t g_tab_off_live, g_tab_off_free, g_tab_off_sess, g_tab_pag
 /* Дайлер процесса: таблица протокола и узел. Задаётся в stack_run до запуска потоков и дальше
  * только читается — потому и не __thread: установщикам он нужен тот же, что циклу. */
 static const struct dialer *g_dl;
+static __thread const struct stack_flow_extensions *g_flow_ext;
+static struct fakeip_service *g_fakeip_service;
+static const char *g_fakeip_table;
+static __thread struct fakeip_worker *g_fakeip_worker;
+static int conn_halfclose(const struct conn *c) {
+    return !c->is_udp && c->flow_checked && g_flow_ext && g_flow_ext->shutdown_write &&
+           g_flow_ext->read_end && c->tx_fin != 2;
+}
+
+
 /* Дайлер живёт в цикле рабочего (DC_INLOOP): у соединения клиента нет дескриптора, а установщика нет вовсе.
  * Задаётся в stack_setup вместе с g_dl. */
 static int g_inloop;
@@ -622,6 +637,7 @@ struct xpkt {
 };
 struct xfd {
     struct xfd *next;
+    uint64_t accepted_ns;
     int fd;
 };
 struct xmail {
@@ -698,12 +714,16 @@ static int xmail_put(unsigned o, const unsigned char *pkt, size_t n) {
 }
 
 /* Отдать принятый сокет клиента рабочему o (kaccept). 0 — отдан. */
-static int xmail_fd(unsigned o, int fd) {
+static int xmail_fd(unsigned o, int fd, uint64_t accepted_ns) {
     struct ring_work *w = &g_rw[o];
     struct xfd *x = malloc(sizeof(*x));
     if (!x) return -1;
     x->fd = fd;
+    x->accepted_ns = accepted_ns;
     pthread_mutex_lock(&w->mail.mu);
+    if (w->mail.nfd >= FAKEIP_PENDING_MAX) {
+        pthread_mutex_unlock(&w->mail.mu); free(x); return -1;
+    }
     x->next = w->mail.fds;
     w->mail.fds = x;
     __atomic_store_n(&w->mail.nfd, w->mail.nfd + 1, __ATOMIC_RELAXED);
@@ -723,6 +743,24 @@ static struct xfd *xmail_take_fds(struct xmail *m) {
     __atomic_store_n(&m->nfd, 0, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&m->mu);
     return l;
+}
+
+/* All reader/worker producers must be joined before closing shared wake fds. */
+static void xmail_shutdown(struct ring_work *workers, int count) {
+    for (int i = 0; i < count; i++) {
+        struct xfd *pending = xmail_take_fds(&workers[i].mail);
+        while (pending) {
+            struct xfd *next = pending->next;
+            close(pending->fd); free(pending); pending = next;
+        }
+        struct xpkt *packets = workers[i].mail.head;
+        while (packets) { struct xpkt *next = packets->next; free(packets); packets = next; }
+        workers[i].mail.head = workers[i].mail.tail = NULL;
+        if (workers[i].ring.efd >= 0) close(workers[i].ring.efd);
+        workers[i].ring.efd = -1;
+        spsc_free(&workers[i].ring);
+        pthread_mutex_destroy(&workers[i].mail.mu);
+    }
 }
 
 /* Забрать всю почту разом: цепочка, которую владелец разбирает и освобождает сам. */
@@ -2066,7 +2104,7 @@ static struct conn *conn_new(const struct tun_dev *tun) {
         /* Закрытые сервером — первые кандидаты в любом возрасте: они уже ничего не принесут,
          * а живут только чтобы додать клиенту остаток. */
         if (c->pending) continue;        /* установщик пишет в эту запись — не трогать */
-        int cheap = c->srv_closed != 0;
+        int cheap = c->srv_closed && !conn_halfclose(c);
         /* Остальные — только если ДЕЙСТВИТЕЛЬНО простаивают. Порог не осторожность, а
          * исправление: без него вытеснялось самое давнее из ЖИВЫХ, и это оказалось хуже
          * прежнего молчаливого отказа. Каждый новый SYN стоит блокирующего рукопожатия
@@ -2086,8 +2124,8 @@ static struct conn *conn_new(const struct tun_dev *tun) {
          * мест нет и иначе пришлось бы отказать. */
         int dns_done = c->is_udp && c->key.dport == 53 && now - c->last >= DNS_IDLE_S;
         if (!cheap && !dns_done && now - c->last < IDLE_EVICT_S) continue;
-        if (!old || cheap > (old->srv_closed != 0) ||
-            (cheap == (old->srv_closed != 0) && c->last < old->last))
+        if (!old || cheap > (old->srv_closed && !conn_halfclose(old)) ||
+            (cheap == (old->srv_closed && !conn_halfclose(old)) && c->last < old->last))
             old = c;
     }
     if (!old) {
@@ -2174,6 +2212,15 @@ static long conn_room(const struct conn *c) {
 /* Связь соединения отдана циклу: запись узлу больше не ждёт сокета (dialer_ops.live, I-534). */
 static void conn_live(struct conn *c) {
     if (g_dl->ops->live) g_dl->ops->live(SESS(c));
+}
+
+static void conn_flow_init(struct conn *c) {
+    if (c->flow_checked || c->pending) return;
+    c->flow_checked = 1;
+    if (!g_flow_ext || !g_flow_ext->shutdown_write || !g_flow_ext->read_end ||
+        !g_flow_ext->can_halfclose ||
+        g_flow_ext->can_halfclose(g_flow_ext->context, g_dl->ctx, SESS(c)) != 1)
+        c->tx_fin = 2;
 }
 
 /* Сколько байт связь ещё не отправила узлу (dialer_ops.out_pending). */
@@ -2397,7 +2444,12 @@ static int sock_flush(struct conn *c) {
         if (first > c->rtx.len) first = c->rtx.len;
         struct iovec iov[2] = { { c->rtx.buf + c->rtx.head, first }, { c->rtx.buf, c->rtx.len - first } };
         ssize_t w = writev(conn_cfd(c), iov, iov[1].iov_len ? 2 : 1);
-        if (w > 0) { rtx_drop(&c->rtx, (uint32_t)w); c->last = g_now_s; continue; }
+        if (w > 0) {
+            rtx_drop(&c->rtx, (uint32_t)w);
+            c->last = g_now_s;
+            if (c->srv_closed) c->closed_at = g_now_ns;
+            continue;
+        }
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { c->carmed &= (uint8_t)~CWR; return 0; }
         c->client_gone = 1;
@@ -2802,6 +2854,17 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
         return;
     }
 
+    if (c && c->srv_closed) {
+        /* Terminal UDP sessions cannot carry the next packet, even if the
+         * deadline sweep has not run yet. Never free a connector-owned slot. */
+        if (c->pending) {
+            if (g_stats) g_st.udp_drops++;
+            return;
+        }
+        conn_drop(c);
+        c = NULL;
+    }
+
     if (!c) {
         if (flow_rejected(k, 1)) {
             udp_refuse(tun, pkt, n);
@@ -3148,6 +3211,7 @@ static void drain_conn(struct conn *c, const struct tun_dev *tun) {
 }
 
 static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
+    conn_flow_init(c);
     const struct dialer_ops *d = g_dl->ops;
     void *s = SESS(c);
     int reads = 0;
@@ -3162,7 +3226,10 @@ static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
             c->srv_closed = 1;
             c->closed_at = g_now_ns;
             /* Оборвана, а не закрыта — клиенту RST из общего прохода (поле aborted). */
-            if (conn_node_lost(c) && !c->is_udp) c->aborted = 1;
+            if (conn_halfclose(c)) {
+                if (g_flow_ext->read_end(g_flow_ext->context, s) != STACK_FLOW_END_EOF)
+                    c->aborted = 1;
+            } else if (conn_node_lost(c) && !c->is_udp) c->aborted = 1;
             TR("сервер закрыл conn#%ld, ждём подтверждения %u байт\n",
                (long)(c - g_conns), c->rtx.len);
             return;
@@ -3296,6 +3363,7 @@ static void sock_read(struct conn *c, const struct tun_dev *tun);
 static inline int sock_want_read(const struct conn *c);
 
 static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t now) {
+    conn_flow_init(c);
     /* Хвост ранних данных, не поместившийся в окно h2 на готовности потока:
      * дослать. Новых данных клиента может и не быть — досылать больше некому. */
     if (c->early && early_flush(c) < 0) {
@@ -3344,27 +3412,53 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
         return 1;
     }
 
+    /* FIN follows every accepted application byte, including an early tail. */
+    if (c->client_fin && !c->early && conn_halfclose(c) && !c->tx_fin) {
+        if (!c->sent_any) {
+            int sr = upstream_send(c, NULL, 0);
+            if (sr == SEND_AGAIN) return 0;
+            if (sr != SEND_OK) { conn_reset(c, tun); return 1; }
+        }
+        int rc = g_flow_ext->shutdown_write(g_flow_ext->context, g_dl->ctx, SESS(c));
+        if (rc == SEND_FATAL) { conn_reset(c, tun); return 1; }
+        if (rc == SEND_OK) c->tx_fin = 1;
+        else if (rc == SEND_UNSUPPORTED) c->tx_fin = 2;
+        else if (rc != SEND_AGAIN) { conn_reset(c, tun); return 1; }
+    }
+
     /* Клиент закрыл свою половину и замолчал, а сервер своей не закрывает (узнать
      * о FIN клиента ему неоткуда): дальше ждать нечего — закрываем тем же путём,
      * что и после сервера. */
-    if (c->client_fin && !c->srv_closed && g_now_s - c->last > CLOSE_DRAIN_MS / 1000) {
+    if (!conn_halfclose(c) && c->client_fin && !c->srv_closed && g_now_s - c->last > CLOSE_DRAIN_MS / 1000) {
         c->srv_closed = 1;
         c->closed_at = now;
     }
 
-    /* Закрытые сервером: как только клиенту дописано всё — закрываем (FIN). Если сокет не принял
-     * остаток за отведённое время, закрываем всё равно: клиент мог уйти совсем. */
+    /* После EOF узла ждём продвижения хвоста, а не общего времени загрузки.
+     * Чистый FIN допустим только после передачи ВСЕГО кольца ядру клиента. */
     if (c->srv_closed) {
-        if (c->cfd1 && c->rtx.len && sock_flush(c) < 0) { conn_drop(c); return 1; }
+        if (c->cfd1 && c->rtx.len && sock_flush(c) < 0) { conn_reset(c, tun); return 1; }
         int drained = c->rtx.len == 0;
         if (!drained && (now - c->closed_at) / 1000000 < CLOSE_DRAIN_MS) return 0;
-        if (!drained)
+        if (!drained) {
             TR("conn#%ld: клиенту не дописано %u байт за %d мс, закрываю\n",
                (long)(c - g_conns), c->rtx.len, CLOSE_DRAIN_MS);
+            conn_reset(c, tun);
+            return 1;
+        }
+        if (conn_halfclose(c) && c->cfd1) {
+            if (!c->rx_fin_sent) {
+                if (shutdown(conn_cfd(c), SHUT_WR) != 0) { conn_reset(c, tun); return 1; }
+                c->rx_fin_sent = 1;
+            }
+            if (!c->client_fin || !c->tx_fin || c->early || conn_out_pending(c) ||
+                (g_dl->ops->aux_pending && g_dl->ops->aux_pending(SESS(c)))) goto housekeeping;
+        }
         conn_drop(c);                       /* FIN клиенту посылает само закрытие сокета */
         return 1;
     }
 
+housekeeping:
     /* Пустое кольцо отдаём обратно системе. Соединение при этом полностью рабочее:
      * при следующих данных кольцо появится снова. Именно после простоя, а не сразу по
      * опустошении, — иначе на каждом залпе подтверждений шли бы malloc и free. */
@@ -3435,207 +3529,12 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
 /* Пул IPv6 — fdfe:dcba:9876::/96, поддельный IPv6 = префикс и поддельный IPv4 той же записи в младших 32
  * битах (fakeip6_of в spec.h, резолвер): по IPv6 находится запись IPv4, а у неё — настоящий IPv6. */
 static const uint8_t FAKE6_PREFIX[12] = { 0xfd, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0, 0, 0, 0, 0, 0 };
-struct fake_pair {
-    uint32_t fake, real;        /* хостовый порядок у fake, сетевой у real (0 — настоящего IPv4 нет) */
-    uint8_t has6;               /* настоящий IPv6 записи известен (четвёртое поле файла) */
-    uint8_t real6[16];
-};
-static __thread struct fake_pair *g_fp;
-static __thread size_t g_fp_n;
-static __thread time_t g_fp_mtime;
-
-static int fp_cmp(const void *a, const void *b) {
-    uint32_t x = ((const struct fake_pair *)a)->fake, y = ((const struct fake_pair *)b)->fake;
-    return x < y ? -1 : x > y;
-}
-
-static char *g_fakeip_path;   /* задан помощником плагина из {conf}; живёт до конца процесса */
-
+static char *g_fakeip_path;
 void stack_set_fakeip_path(const char *path) {
     free(g_fakeip_path);
     g_fakeip_path = path && *path ? strdup(path) : NULL;
 }
-
-static void fake_load(void) {
-    char path[4096];
-    if (g_fakeip_path) snprintf(path, sizeof(path), "%s", g_fakeip_path);
-    else if (snprintf(path, sizeof(path), "%s/fakeip.state", steer_state_dir()) >= (int)sizeof(path)) return;
-    struct stat st;
-    if (stat(path, &st) != 0 || st.st_mtime == g_fp_mtime) return;
-    FILE *f = fopen(path, "r");
-    if (!f) return;
-    g_fp_mtime = st.st_mtime;
-    size_t cap = 256, n = 0;
-    struct fake_pair *a = malloc(cap * sizeof(*a));
-    char line[512];
-    while (a && fgets(line, sizeof(line), f)) {
-        /* «домен \t поддельный \t настоящий IPv4 или - [\t настоящий IPv6]» */
-        char *t1 = strchr(line, '\t');
-        if (!t1) continue;
-        char *t2 = strchr(t1 + 1, '\t');
-        if (!t2) continue;
-        *t2 = 0;
-        char *r4 = t2 + 1, *r6 = NULL;
-        char *t3 = strpbrk(r4, "\t\n");
-        if (t3) {
-            char c3 = *t3;
-            *t3 = 0;
-            if (c3 == '\t') {
-                r6 = t3 + 1;
-                char *e6 = strpbrk(r6, "\t\n");
-                if (e6) *e6 = 0;
-            }
-        }
-        struct in_addr fk, rl;
-        struct fake_pair x;
-        memset(&x, 0, sizeof(x));
-        if (inet_pton(AF_INET, t1 + 1, &fk) != 1) continue;
-        if (inet_pton(AF_INET, r4, &rl) == 1) x.real = rl.s_addr;
-        if (r6 && inet_pton(AF_INET6, r6, x.real6) == 1) x.has6 = 1;
-        if (!x.real && !x.has6) continue;
-        if (n == cap) {
-            struct fake_pair *b2 = realloc(a, cap * 2 * sizeof(*a));
-            if (!b2) break;
-            a = b2;
-            cap *= 2;
-        }
-        x.fake = ntohl(fk.s_addr);
-        a[n++] = x;
-    }
-    fclose(f);
-    if (!a) return;
-    qsort(a, n, sizeof(*a), fp_cmp);
-    free(g_fp);
-    g_fp = a;
-    g_fp_n = n;
-}
-
-/* Атрибут netlink в buf[*n]: заголовок и значение, с выравниванием. Возврат — смещение атрибута (для
- * вложенных: длину дописывает fk_end). */
-static size_t fk_attr(unsigned char *buf, size_t *n, uint16_t type, const void *v, size_t vl) {
-    size_t at = *n;
-    struct nlattr *a = (struct nlattr *)(buf + at);
-    a->nla_type = type;
-    a->nla_len = (uint16_t)(NLA_HDRLEN + vl);
-    if (vl) memcpy(buf + at + NLA_HDRLEN, v, vl);
-    *n = at + NLA_ALIGN(NLA_HDRLEN + vl);
-    return at;
-}
-
-static void fk_end(unsigned char *buf, size_t n, size_t at) {
-    ((struct nlattr *)(buf + at))->nla_len = (uint16_t)(n - at);
-}
-
-static const struct nlattr *fk_find(const unsigned char *p, size_t len, uint16_t type) {
-    while (len >= NLA_HDRLEN) {
-        const struct nlattr *a = (const struct nlattr *)p;
-        if (a->nla_len < NLA_HDRLEN || a->nla_len > len) return NULL;
-        if ((a->nla_type & NLA_TYPE_MASK) == type) return a;
-        size_t step = NLA_ALIGN(a->nla_len);
-        if (step >= len) return NULL;
-        p += step;
-        len -= step;
-    }
-    return NULL;
-}
-#define FK_PAY(a) ((const unsigned char *)(a) + NLA_HDRLEN)
-#define FK_PLEN(a) ((size_t)(a)->nla_len - NLA_HDRLEN)
-
-/* Настоящий адрес из карты таблицы inet steer — запросом GETSETELEM (не транзакция: доли
- * миллисекунды), сокет netlink на поток. set — карта (fakeip или fakeip6), key — поддельный адрес
- * (klen байт, сетевой порядок), в out (olen байт) ложится настоящий. 1 — нашёлся, 0 — элемента нет или
- * ответа нет (тогда — файл). */
-static int fake_kernel_lookup(const char *set, const void *key_p, size_t klen, void *out_p, size_t olen) {
-    static __thread int fd = -2;
-    static __thread uint32_t seq;
-    if (fd == -2) {
-        fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
-        struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
-        if (fd >= 0 && bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); fd = -1; }
-        struct timeval tv = { 0, 200000 };
-        if (fd >= 0) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    }
-    if (fd < 0) return 0;
-    int found = 0;
-    _Alignas(8) unsigned char buf[256];
-    memset(buf, 0, sizeof(buf));
-    struct nlmsghdr *nh = (struct nlmsghdr *)buf;
-    struct nfgenmsg *nfg = (struct nfgenmsg *)(buf + NLMSG_HDRLEN);
-    size_t n = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(*nfg));
-    const char *tbl = nft_table();
-    fk_attr(buf, &n, NFTA_SET_ELEM_LIST_TABLE, tbl, strlen(tbl) + 1);
-    fk_attr(buf, &n, NFTA_SET_ELEM_LIST_SET, set, strlen(set) + 1);
-    size_t els = fk_attr(buf, &n, NLA_F_NESTED | NFTA_SET_ELEM_LIST_ELEMENTS, NULL, 0);
-    size_t el = fk_attr(buf, &n, NLA_F_NESTED | NFTA_LIST_ELEM, NULL, 0);
-    size_t key = fk_attr(buf, &n, NLA_F_NESTED | NFTA_SET_ELEM_KEY, NULL, 0);
-    fk_attr(buf, &n, NFTA_DATA_VALUE, key_p, klen);
-    fk_end(buf, n, key);
-    fk_end(buf, n, el);
-    fk_end(buf, n, els);
-    nh->nlmsg_len = (uint32_t)n;
-    nh->nlmsg_type = (uint16_t)((NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETSETELEM);
-    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-    nh->nlmsg_seq = ++seq;
-    nfg->nfgen_family = NFPROTO_INET;
-    nfg->version = NFNETLINK_V0;
-    struct sockaddr_nl dst = { .nl_family = AF_NETLINK };
-    if (sendto(fd, buf, n, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) return 0;
-    _Alignas(8) unsigned char rb[2048];
-    for (;;) {
-        ssize_t r = recv(fd, rb, sizeof(rb), 0);
-        if (r < (ssize_t)NLMSG_HDRLEN) return found;
-        size_t left = (size_t)r;
-        for (struct nlmsghdr *h = (struct nlmsghdr *)rb; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
-            if (h->nlmsg_seq != seq) continue;                  /* хвост прежнего запроса */
-            if (h->nlmsg_type == NLMSG_ERROR) return found;
-            if (h->nlmsg_type != ((NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWSETELEM)) continue;
-            size_t hl = NLMSG_ALIGN(sizeof(struct nfgenmsg));
-            if (h->nlmsg_len < NLMSG_HDRLEN + hl) continue;
-            const unsigned char *p = (const unsigned char *)NLMSG_DATA(h) + hl;
-            size_t pl = h->nlmsg_len - NLMSG_HDRLEN - hl;
-            const struct nlattr *es = fk_find(p, pl, NFTA_SET_ELEM_LIST_ELEMENTS);
-            const struct nlattr *e1 = es ? fk_find(FK_PAY(es), FK_PLEN(es), NFTA_LIST_ELEM) : NULL;
-            const struct nlattr *da = e1 ? fk_find(FK_PAY(e1), FK_PLEN(e1), NFTA_SET_ELEM_DATA) : NULL;
-            const struct nlattr *dv = da ? fk_find(FK_PAY(da), FK_PLEN(da), NFTA_DATA_VALUE) : NULL;
-            if (dv && FK_PLEN(dv) == olen) { memcpy(out_p, FK_PAY(dv), olen); found = 1; }
-        }
-    }
-}
-
-/* Настоящий адрес для поддельного (сетевой порядок) или 0 — не знаем: карта ядра, затем файл. */
-static uint32_t fake_real(uint32_t fake_be) {
-    uint32_t k = 0;
-    if (fake_kernel_lookup("fakeip", &fake_be, 4, &k, 4) && k) return k;
-    struct fake_pair key;
-    memset(&key, 0, sizeof(key));
-    key.fake = ntohl(fake_be);
-    for (int pass = 0; pass < 2; pass++) {
-        struct fake_pair *hit = g_fp_n ? bsearch(&key, g_fp, g_fp_n, sizeof(*g_fp), fp_cmp) : NULL;
-        if (hit && hit->real) return hit->real;
-        if (pass == 0) fake_load();
-    }
-    return 0;
-}
-
-/* Поддельный IPv6 из пула? Тогда в младших четырёх байтах — поддельный IPv4 той же записи. */
 static int fake6_is(const uint8_t a[16]) { return !memcmp(a, FAKE6_PREFIX, 12); }
-
-/* То же для IPv6: настоящий адрес в real (16 байт). 1 — найден. Сначала карта fakeip6 в ядре (её резолвер
- * ставит до ответа клиенту, как fakeip), затем файл: запись IPv4 с тем же младшим словом и её IPv6. */
-static int fake_real6(const uint8_t fake[16], uint8_t real[16]) {
-    if (fake_kernel_lookup("fakeip6", fake, 16, real, 16)) return 1;
-    struct fake_pair key;
-    memset(&key, 0, sizeof(key));
-    uint32_t lo;
-    memcpy(&lo, fake + 12, 4);
-    key.fake = ntohl(lo);
-    for (int pass = 0; pass < 2; pass++) {
-        struct fake_pair *hit = g_fp_n ? bsearch(&key, g_fp, g_fp_n, sizeof(*g_fp), fp_cmp) : NULL;
-        if (hit && hit->has6) { memcpy(real, hit->real6, 16); return 1; }
-        if (pass == 0) fake_load();
-    }
-    return 0;
-}
 
 static void sock_rst_close(int fd) {
     struct linger lg = { 1, 0 };
@@ -3646,7 +3545,7 @@ static void sock_rst_close(int fd) {
 /* Одно принятое соединение — в таблицу этого рабочего (R-152): назначение у ядра, поток к узлу. */
 static struct conn *conn_accept(int fd, const struct flow_key *k, const struct tun_dev *tun);
 
-static void kaccept_fd(int fd, const struct tun_dev *tun) {
+static void kaccept_fd(int fd, const struct tun_dev *tun, uint64_t accepted_ns) {
     struct sockaddr_storage peer, me;
     socklen_t pl = sizeof(peer), ml = sizeof(me);
     if (getpeername(fd, (struct sockaddr *)&peer, &pl) != 0 ||
@@ -3681,23 +3580,6 @@ static void kaccept_fd(int fd, const struct tun_dev *tun) {
             return;
         }
         uint32_t dst = od.sin_addr.s_addr;
-        uint32_t dh = ntohl(dst);
-        if (dh - FAKE4_BASE < FAKE4_SIZE) {
-            uint32_t real = fake_real(dst);
-            if (!real) {
-                static __thread time_t said;
-                if (g_now_s - said >= 10) {
-                    said = g_now_s;
-                    char a[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &dst, a, sizeof(a));
-                    fprintf(stderr, LOG_W "поддельный адрес %s без настоящего в fakeip.state — соединение "
-                                    "сброшено\n", a);
-                }
-                sock_rst_close(fd);
-                return;
-            }
-            dst = real;
-        }
         key.src = psrc;
         key.dst = dst;
         key.sport = ntohs(pport);
@@ -3713,29 +3595,22 @@ static void kaccept_fd(int fd, const struct tun_dev *tun) {
         }
         uint8_t dst[16];
         memcpy(dst, &od.sin6_addr, 16);
-        if (fake6_is(dst)) {
-            uint8_t real[16];
-            if (!fake_real6(dst, real)) {
-                static __thread time_t said6;
-                if (g_now_s - said6 >= 10) {
-                    said6 = g_now_s;
-                    char a[INET6_ADDRSTRLEN];
-                    inet_ntop(AF_INET6, dst, a, sizeof(a));
-                    fprintf(stderr, LOG_W "поддельный адрес %s без настоящего в карте fakeip6 и fakeip.state — "
-                                    "соединение сброшено\n", a);
-                }
-                sock_rst_close(fd);
-                return;
-            }
-            memcpy(dst, real, 16);
-        }
         key.v6 = 1;
         memcpy(key.src6, &p6->sin6_addr, 16);
         memcpy(key.dst6, dst, 16);
         key.sport = ntohs(p6->sin6_port);
         key.dport = ntohs(od.sin6_port);
     }
+    int is_fake = key.v6 ? fake6_is(key.dst6) : ntohl(key.dst) - FAKE4_BASE < FAKE4_SIZE;
+    if (is_fake) {
+        if (fakeip_worker_submit(g_fakeip_worker, fd, &key, accepted_ns) != 0) sock_rst_close(fd);
+        return;
+    }
     conn_accept(fd, &key, tun);
+}
+static void fakeip_admitted(void *context, int fd, const struct flow_key *key, int found) {
+    if (found) conn_accept(fd, key, context);
+    else sock_rst_close(fd);
 }
 
 /* Принятый сокет клиента с уже известным назначением — в таблицу этого рабочего: соединение, поток к узлу
@@ -3797,11 +3672,12 @@ static int kaccept(int lfd, const struct tun_dev *tun) {
     for (int k = 0; k < 64; k++) {
         int fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) return errno == EMFILE || errno == ENFILE ? -1 : 0;
+        uint64_t accepted_ns = now_ns();
         if (g_rw && g_nwork > 1) {
             unsigned t = __atomic_fetch_add(&g_accept_rr, 1, __ATOMIC_RELAXED) % g_nwork;
-            if (t != (unsigned)g_worker && xmail_fd(t, fd) == 0) continue;
+            if (t != (unsigned)g_worker && xmail_fd(t, fd, accepted_ns) == 0) continue;
         }
-        kaccept_fd(fd, tun);
+        kaccept_fd(fd, tun, accepted_ns);
     }
     return 0;
 }
@@ -3816,10 +3692,11 @@ static int kaccept(int lfd, const struct tun_dev *tun) {
  * открытого текста). Прежде чтение было ровно UP_MAX = 16400 байт, на 16 больше записи: каждые 16 КБ
  * уходили двумя записями TLS и двумя write (122 вызова write на МБ против 64 у пути через TUN). */
 static void sock_read(struct conn *c, const struct tun_dev *tun) {
+    conn_flow_init(c);
     static __thread unsigned char buf[SOCK_READ_MAX];
     size_t got = 0;
     while (got < SOCK_READ_BUDGET && c->used && (c->carmed & CRD) && !c->early && !c->client_fin &&
-           !c->srv_closed) {
+           (!c->srv_closed || conn_halfclose(c))) {
         size_t chunk = conn_up_max(c);
         if (chunk > SOCK_SEND_CHUNK && chunk <= UP_MAX) chunk = SOCK_SEND_CHUNK;   /* больше UP_MAX — свой предел дайлера */
         size_t cap = sizeof(buf);
@@ -3863,11 +3740,12 @@ static void sock_read(struct conn *c, const struct tun_dev *tun) {
 
 /* Читать ли сокет клиента сейчас: фронт не дочитан, узел принимает, обе стороны открыты. */
 static inline int sock_want_read(const struct conn *c) {
-    return (c->carmed & CRD) && !c->early && !c->client_fin && !c->srv_closed && conn_room(c) != 0;
+    return (c->carmed & CRD) && !c->early && !c->client_fin && (!c->srv_closed || conn_halfclose(c)) && conn_room(c) != 0;
 }
 
 struct worker {
     struct tun_dev tun;
+    const struct stack_flow_extensions *extensions;
     int id;
     /* Кольцо и почта этого рабочего; NULL — прежний путь: поток сам читает свою очередь TUN. В
      * режиме с читателем дескриптор TUN общий и принадлежит читателю: рабочий только пишет в него и
@@ -3885,6 +3763,7 @@ struct worker {
 
 static void *worker_loop(void *arg) {
     struct worker *w = arg;
+    g_flow_ext = w->extensions;
     struct tun_dev tun = w->tun;
     int tun_fd = tun.fd;
     g_stat_tun = &tun;
@@ -3984,6 +3863,16 @@ static void *worker_loop(void *arg) {
             epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &e);
         }
     }
+    if (g_fakeip_service) {
+        g_fakeip_worker = fakeip_worker_create(g_fakeip_service, g_fakeip_table, fakeip_admitted, &tun);
+        int fake_fd = fakeip_worker_fd(g_fakeip_worker);
+        if (fake_fd >= 0) {
+            struct epoll_event fe = { .events = EPOLLIN, .data = { .u32 = TOK_FAKEIP } };
+            if (epoll_ctl(ep, EPOLL_CTL_ADD, fake_fd, &fe) != 0) {
+                fakeip_worker_destroy(g_fakeip_worker); g_fakeip_worker = NULL;
+            }
+        }
+    }
     /* Читатель будит этот же eventfd: побудка от установщика и от читателя — одно и то же «проснись и
      * посмотри», а разбор всего сразу — в витке. Ставится ДО state: читатель не начнёт, пока не доложат
      * все, и увидит дескриптор. */
@@ -4056,7 +3945,7 @@ static void *worker_loop(void *arg) {
              * нечего ставить: события потока приходят из loop_poll (stack_sess_rx). EPOLLOUT (по уровню) — только
              * пока узел не принял данные клиента сокета: SEND_AGAIN у дайлера без своего окна (room -1, сокет
              * узла полон) ждёт записи узла событием, а не опросом (R-152). */
-            unsigned arm = ARM_IN | (((c->cfd1 && c->early && conn_room(c) < 0) || outp) ? ARM_OUT : 0u);
+            unsigned arm = ARM_IN | (((c->cfd1 && (c->early || (c->client_fin && conn_halfclose(c) && !c->tx_fin)) && conn_room(c) < 0) || outp) ? ARM_OUT : 0u);
             if (!g_inloop && arm != c->armed) {
                 struct epoll_event e = { .events = EPOLLIN | EPOLLET | (arm & ARM_OUT ? EPOLLOUT : 0u),
                                          .data = { .u32 = (uint32_t)(c - g_conns) } };
@@ -4146,6 +4035,8 @@ static void *worker_loop(void *arg) {
             if (own_tun) epoll_ctl(ep, EPOLL_CTL_MOD, tun_fd, &oe);
             else epoll_ctl(ep, want_out ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, tun_fd, &oe);
         }
+        int fake_wait = fakeip_worker_wait(g_fakeip_worker, now_ns());
+        if (fake_wait >= 0 && fake_wait < wait_ms) wait_ms = fake_wait;
         int r = epoll_wait(ep, evs, EV_BATCH, wait_ms);
         if (sleeping) spsc_sleep_end(&rw->ring);
         g_turn++;
@@ -4164,6 +4055,8 @@ static void *worker_loop(void *arg) {
             if (errno == EINTR) continue;
             break;
         }
+
+        fakeip_worker_pump(g_fakeip_worker, after_poll);
 
         /* Дайлер в цикле разбирает свой сокет и сроки ПЕРВЫМ: исход открытия (stack_sess_ready) нужен
          * проходу по заявкам ниже, а пришедшие данные и подтверждения — проходу чтения. Ему же принадлежит
@@ -4227,7 +4120,7 @@ static void *worker_loop(void *arg) {
             while (l) {
                 struct xfd *x = l;
                 l = x->next;
-                kaccept_fd(x->fd, &tun);
+                kaccept_fd(x->fd, &tun, x->accepted_ns);
                 free(x);
             }
         }
@@ -4295,6 +4188,10 @@ static void *worker_loop(void *arg) {
                 uint64_t t0 = g_stats ? now_ns() : 0;
                 ssize_t rn = tun_read_packet(&tun, pkt, sizeof(pkt));
                 uint64_t t1 = g_stats ? now_ns() : 0;
+                if (rn < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    fprintf(stderr, LOG_W "чтение из TUN отказало (%s) — рабочий останавливается\n", strerror(errno));
+                    goto worker_done;
+                }
                 if (rn <= 0) break;
                 if (g_stats) { g_st.tun_reads++; g_st.tun_read_ns += t1 - t0; }
                 handle_packet(&tun, pkt, (size_t)rn);
@@ -4362,6 +4259,7 @@ static void *worker_loop(void *arg) {
             /* Узел не забирает ответы — отложить до EPOLLOUT (conn_node_backlog). */
             if (conn_node_backlog(c)) { c->rx_ready = 1; continue; }
             drain_conn(c, &tun);
+            if (c->used && c->rx_ready && !c->srv_closed) rx_dirty = 1;
         }
 
         /* Соединения, у которых данные уже лежат в буфере или у сокета, но читать было нельзя или нечем
@@ -4401,6 +4299,9 @@ static void *worker_loop(void *arg) {
             if (c->pending || !conn_deadlines(c, &tun, now)) li++;
         }
     }
+worker_done:
+    fakeip_worker_destroy(g_fakeip_worker); g_fakeip_worker = NULL;
+
     /* Сначала отпустить установщиков, только потом закрывать сессии: иначе закрываем то,
      * с чем они работают. Почему это важно — у connq_release. eventfd — тоже только
      * после: установщик пишет в него по готовности, и закрытый раньше времени номер
@@ -4411,10 +4312,10 @@ static void *worker_loop(void *arg) {
         conn_table_free();
     }
     tun_wq_free();
-    if (efd >= 0) close(efd);
+    if (efd >= 0 && !rw) close(efd);
     g_conn_efd = -1;
     close(ep);
-    if (own_tun) close(tun_fd);
+    if (own_tun) { close(tun_fd); free(tun.rx); }
     if (lfd >= 0) close(lfd);
     /* Рабочий вышел — читателю больше некому отдавать, и процесс должен завершиться. */
     if (rw) __atomic_store_n(&g_ring_stop, 1, __ATOMIC_RELAXED);
@@ -4426,12 +4327,12 @@ static void *worker_loop(void *arg) {
  * потоке stack_run (так процесс остаётся тем, чем был для procd: вышел цикл — вышел процесс).
  *
  * Ничего не ждёт: кольцо полно — пакет отбрасывается и считается. Ждать значило бы остановить
- * чтение для всех рабочих из-за одного медленного, а TCP повторит потерянное сам.
+ * чтение для всех рабочих из-за одного медленного. Перегруженный владелец теряет
+ * только свои лишние пакеты; остальные продолжают получать свои UDP-датаграммы.
  *
  * Выход — только по ошибке устройства или останову рабочего (g_ring_stop): штатно процесс умирает от
  * сигнала. */
 #define READER_BATCH 256
-#define READER_WAIT_NS 20000000ull
 static void reader_loop(struct tun_dev *t, struct ring_work *rws, int nw) {
     unsigned char pkt[TUNNEL_BUF];
     struct pollfd pf = { .fd = t->fd, .events = POLLIN };
@@ -4460,20 +4361,9 @@ static void reader_loop(struct tun_dev *t, struct ring_work *rws, int nw) {
                 continue;
             }
             unsigned char *slot = spsc_reserve(&w->ring);
-            if (!slot) {
-                /* Кольцо полно — рабочий занят (читает у узлов, шифрует). Ждём место (спим, а не крутимся:
-                 * spsc_reserve_wait), а не бросаем сразу: пока читатель ждёт, пакеты копятся в очереди
-                 * устройства в ядре, ровно как при одном потоке, а брошенный пакет выгрузки стоил бы клиенту
-                 * повтора и сброса окна (без ожидания стенд run-tunnel-mt при 2 рабочих: 830–1253 брошенных
-                 * пакета, 1,1–1,5 с против 0,4). Ждать вечно нельзя — остальные рабочие ждут вместе с
-                 * читателем, — поэтому не дольше READER_WAIT_NS, 20 мс. Не меньше: порция разбора — десятки
-                 * микросекунд, но запись к узлу у TCP и TLS блокирующая и при полном сокете узла занимает
-                 * миллисекунды (при 2 мс стенд run-tunnel-mt ловил 3 брошенных на 250 тыс.), а брошенный
-                 * пакет стоит клиенту повтора не раньше 200 мс. Рабочий, не освободивший ни слота за 20 мс,
-                 * завис, а не отстал, и тогда пакет бросается со счётом, как раньше. */
-                w->rd_waits++;
-                slot = spsc_reserve_wait(&w->ring, READER_WAIT_NS);
-            }
+            /* Never wait for one owner's queue here: this is the sole TUN
+             * reader for every owner. A full ring sheds only its excess packet;
+             * no additional queue, allocation or cross-owner retry is created. */
             if (!slot) {
                 w->rd_full++;
                 if (now_ns() - said_full > 5000000000ull) {
@@ -4639,7 +4529,9 @@ static unsigned long stack_nofile_raise(void) {
 /* host_fd < 0 — устройство заводит и поднимает сам стек (stack_run); иначе это готовый TUN хоста
  * (stack_run_fd), и ни очередей, ни адреса, ни программы раздачи стек не трогает. */
 static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack_ready_fn ready, void *arg,
-                          int host_fd) {
+                          int host_fd, const struct stack_flow_extensions *extensions) {
+    if (extensions && (extensions->size < sizeof(*extensions) ||
+                       extensions->version != STACK_FLOW_EXT_VERSION)) return 1;
     const char *dev = o->device;
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     g_stats = getenv("STEER_TUN_STATS") != NULL;
@@ -4723,10 +4615,6 @@ static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack
      * выхода держит то, что поставили apply или сторож (запрет у on_fail=drop, «напрямую» у
      * direct), а помеченный пакет не в устройство выхода
      * отбрасывает postrouting_guard, так что окно — «ещё не работает», а не «мимо туннеля». */
-    if (ready) ready(arg, dev);
-    char desc[512];
-    d->ops->describe(d->ctx, desc, sizeof(desc));
-    fprintf(stderr, LOG_I "%s -> %s\n", dev, desc);
 
     struct worker *workers = calloc((size_t)want, sizeof(*workers));
     pthread_t *tids = calloc((size_t)want, sizeof(*tids));
@@ -4737,8 +4625,29 @@ static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack
         memset(rws, 0, (size_t)want * sizeof(*rws));
     if (!workers || !tids || (want > 1 && !rws)) {
         fprintf(stderr, LOG_W "нет памяти под %d рабочих потоков\n", want);
-        return 1;
+        goto before_workers_fail;
     }
+
+    g_fakeip_service = NULL;
+    if (g_kport > 0) {
+        char fake_path[4096];
+        int path_n = g_fakeip_path ? snprintf(fake_path, sizeof(fake_path), "%s", g_fakeip_path) :
+            snprintf(fake_path, sizeof(fake_path), "%s/fakeip.state", steer_state_dir());
+        if (path_n < 0 || (size_t)path_n >= sizeof(fake_path)) {
+            fprintf(stderr, LOG_W "Fake-IP state path exceeds the supported bound\n");
+            goto before_workers_fail;
+        }
+        g_fakeip_table = nft_table();
+        g_fakeip_service = fakeip_service_create(fake_path);
+        if (!g_fakeip_service) {
+            fprintf(stderr, LOG_W "Fake-IP admission service initialization failed\n");
+            goto before_workers_fail;
+        }
+    }
+    if (ready) ready(arg, dev);
+    char desc[512];
+    d->ops->describe(d->ctx, desc, sizeof(desc));
+    fprintf(stderr, LOG_I "%s -> %s\n", dev, desc);
 
     int n = 1;                          /* сколько рабочих встало */
     int started = 0;
@@ -4747,6 +4656,7 @@ static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack
         /* Прежний путь: один поток читает устройство сам, читателя и колец нет. Ничем не отличается от
          * того, что было до R-146 (STEER_TUN_THREADS=1 и одноядерные). */
         workers[0].tun = q0;
+        workers[0].extensions = extensions;
         workers[0].id = 0;
         workers[0].rw = NULL;
     } else {
@@ -4778,6 +4688,7 @@ static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack
                 w->tun.rx = NULL;           /* читает только читатель: у рабочих буфера склейки нет */
                 w->tun.rx_gso = 0;
             }
+            w->extensions = extensions;
             w->id = made;
             w->rw = rw;
             int failed = pthread_create(&tids[made], &at, worker_loop, w) != 0;
@@ -4807,6 +4718,8 @@ static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack
                     }
                 }
                 for (int k = 0; k < made; k++) pthread_join(tids[k], NULL);
+                xmail_shutdown(rws, made);
+                fakeip_service_destroy(g_fakeip_service); g_fakeip_service = NULL;
                 return 1;
             }
             if (failed) {
@@ -4820,6 +4733,7 @@ static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack
         n = made;
         if (!made) {
             fprintf(stderr, LOG_W "%s не поднялся ни одним рабочим потоком\n", dev);
+            fakeip_service_destroy(g_fakeip_service); g_fakeip_service = NULL;
             return 1;
         }
         /* Остался один рабочий (на остальных не хватило памяти или потока) — читатель всё равно
@@ -4860,7 +4774,12 @@ static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack
         for (int i = 0; i < started; i++) pthread_join(tids[i], NULL);
         served = 1;
         close(q0.fd);
+        free(q0.rx);
     }
+
+    if (rws) xmail_shutdown(rws, started);
+    fakeip_service_destroy(g_fakeip_service); g_fakeip_service = NULL;
+    free(rws); free(tids); free(workers); free(qs);
 
     /* Досюда мы доходим ТОЛЬКО когда все очереди завершились, а завершиться они могут
      * лишь по ошибке: успешного выхода у worker_loop нет ни одного. Штатное окончание
@@ -4877,10 +4796,15 @@ static int stack_run_impl(const struct tun_out *o, const struct dialer *d, stack
         fprintf(stderr, LOG_W "%s больше не несёт трафик — все потоки (%d) "
                         "завершились\n", dev, n);
     return 1;
+before_workers_fail:
+    if (g_lfd0 >= 0) { close(g_lfd0); g_lfd0 = -1; }
+    for (int i = 0; i < nq; i++) close(qs[i].fd);
+    free(rws); free(tids); free(workers); free(qs);
+    return 1;
 }
 
 int stack_run(const struct tun_out *o, const struct dialer *d, stack_ready_fn ready, void *arg) {
-    return stack_run_impl(o, d, ready, arg, -1);
+    return stack_run_ex(o, d, NULL, ready, arg);
 }
 
 int stack_run_fd(const struct tun_out *o, const struct dialer *d, int fd, stack_ready_fn ready, void *arg) {
@@ -4888,5 +4812,15 @@ int stack_run_fd(const struct tun_out *o, const struct dialer *d, int fd, stack_
         fprintf(stderr, LOG_W "%s: дескриптор устройства от хоста не задан (%d)\n", o->device, fd);
         return 1;
     }
-    return stack_run_impl(o, d, ready, arg, fd);
+    return stack_run_fd_ex(o, d, fd, NULL, ready, arg);
+}
+
+int stack_run_ex(const struct tun_out *o, const struct dialer *d,
+ const struct stack_flow_extensions *extensions, stack_ready_fn ready, void *arg) {
+ return stack_run_impl(o, d, ready, arg, -1, extensions);
+}
+int stack_run_fd_ex(const struct tun_out *o, const struct dialer *d, int fd,
+ const struct stack_flow_extensions *extensions, stack_ready_fn ready, void *arg) {
+ if (fd < 0) return 1;
+ return stack_run_impl(o, d, ready, arg, fd, extensions);
 }

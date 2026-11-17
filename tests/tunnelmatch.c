@@ -80,11 +80,27 @@ int poll(struct pollfd *fds, nfds_t n, int timeout) {
 /* Запись клиенту (sock_flush) — одним writev по кольцу недописанного за проход. Стенд считает вызовы:
  * запись на каждое чтение у узла стоила бы системного вызова и отправки TCP на каждые 16 КБ. */
 static int g_writev_calls;
+/* Reproduce a slow but progressing client without sleeping past wall deadlines.
+ * One real write of at most cap bytes, then EAGAIN until the next test tick. */
+static int g_writev_test_fd = -1, g_writev_test_cap, g_writev_test_block;
 
 ssize_t writev(int fd, const struct iovec *iov, int n) {
     static ssize_t (*real)(int, const struct iovec *, int);
     g_writev_calls++;
     if (!real) real = (ssize_t (*)(int, const struct iovec *, int))dlsym(RTLD_NEXT, "writev");
+    if (fd == g_writev_test_fd) {
+        struct iovec limited[2];
+        size_t remaining = (size_t)g_writev_test_cap;
+        int count = 0, i;
+        if (g_writev_test_block) { errno = EAGAIN; return -1; }
+        for (i = 0; i < n && i < 2 && remaining; i++) {
+            limited[count] = iov[i];
+            if (limited[count].iov_len > remaining) limited[count].iov_len = remaining;
+            remaining -= limited[count++].iov_len;
+        }
+        g_writev_test_block = 1;
+        return real(fd, limited, count);
+    }
     return real(fd, iov, n);
 }
 
@@ -227,6 +243,9 @@ void transport_live(struct transport *c) { (void)c; }
 static size_t g_out_pending;
 size_t transport_out_pending(const struct transport *c) { (void)c; return g_out_pending; }
 int transport_out_flush(struct transport *c) { (void)c; return 0; }
+int transport_read_end(const struct transport *c, int result) { (void)c; return result == TR_ECLOSED ? STACK_FLOW_END_EOF : STACK_FLOW_END_ERROR; }
+int transport_can_halfclose(const struct transport *c) { (void)c; return 1; }
+int transport_shutdown_write(struct transport *c) { (void)c; return SEND_OK; }
 /* Принимает ли транспорт запись любой длины (xhttp packet-up). */
 static int g_big_write;
 int transport_big_write(const struct transport *c) { (void)c; return g_big_write; }
@@ -799,6 +818,164 @@ static void t_srv_close_drain(void) {
 /* I-193: установщик доложил за время ПОСЛЕДНЕГО сна ожидания. Прежде проверка стояла перед
  * сном, результат последнего не спрашивался, и приговор «не доложил за 15 с» ставился по
  * счётчику кругов — таблица при этом намеренно не освобождается. */
+static void t_close_drain_progress(void) {
+    struct conn *c = ready_conn(sock_conn(45671, SRV_IP));
+    unsigned char payload[16384], received[sizeof(payload) + 32];
+    uint64_t saved_ns = g_now_ns;
+    time_t saved_s = g_now_s;
+    size_t got = 0;
+    int peer, i;
+    if (!c) { check(0, "close drain progress: connection"); return; }
+    memset(payload, 0x6d, sizeof(payload));
+    check(!emit_to_client(c, payload, sizeof(payload)), "close drain progress: queue payload");
+    c->srv_closed = 1; c->closed_at = g_now_ns; c->sent_any = 1;
+    peer = cli_fd(c);
+    g_writev_test_fd = conn_cfd(c); g_writev_test_cap = 1024;
+    for (i = 0; i < 32 && c->used; i++) {
+        g_now_ns += (CLOSE_DRAIN_MS - 1000ull) * 1000000ull;
+        g_now_s = (time_t)(g_now_ns / 1000000000ull);
+        g_writev_test_block = 0;
+        conn_deadlines(c, &g_tun, g_now_ns);
+        got += cli_get(peer, received + got, sizeof(received) - got);
+    }
+    g_writev_test_fd = -1;
+    check(!c->used && got == sizeof(payload) && !memcmp(payload, received, sizeof(payload)) &&
+          cli_end(peer) == 1 && i > CLOSE_DRAIN_MS / 1000,
+          "close drain: ongoing progress survives total >5s and delivers all bytes before EOF");
+    if (c->used) conn_drop(c);
+    g_now_ns = saved_ns; g_now_s = saved_s;
+}
+
+/* Actual elapsed time and a throttled reader, without the writev fault hook. */
+static void t_close_drain_real_reader(void) {
+    struct conn *c = ready_conn(sock_conn(45674, SRV_IP));
+    static unsigned char payload[262144], received[sizeof(payload)];
+    size_t got = 0;
+    uint64_t start = now_ns();
+    int peer, small = 4096;
+    if (!c) { check(0, "real slow reader: connection"); return; }
+    peer = cli_fd(c);
+    setsockopt(conn_cfd(c), SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    for (size_t i = 0; i < sizeof(payload); i++) payload[i] = stream_byte(i);
+    check(!emit_to_client(c, payload, sizeof(payload)), "real slow reader: queue payload");
+    c->srv_closed = 1; c->closed_at = g_now_ns; c->sent_any = 1;
+    for (int i = 0; i < 200 && (c->used || got < sizeof(payload)); i++) {
+        usleep(100000);
+        ssize_t n = recv(peer, received + got,
+                         sizeof(received) - got < 4096 ? sizeof(received) - got : 4096, MSG_DONTWAIT);
+        if (n > 0) got += (size_t)n;
+        g_now_ns = now_ns(); g_now_s = (time_t)(g_now_ns / 1000000000ull);
+        if (c->used) { c->carmed |= CWR; conn_deadlines(c, &g_tun, g_now_ns); }
+    }
+    check(now_ns() - start > 5000000000ull && !c->used && got == sizeof(payload) &&
+          !memcmp(payload, received, sizeof(payload)) && cli_end(peer) == 1,
+          "real slow reader: >5 seconds, exact payload and clean EOF");
+    if (c->used) conn_drop(c);
+}
+
+static int g_fin_calls, g_fin_again, g_end_kind, g_cap_calls;
+static int test_shutdown_write(void *ctx, const void *node, void *session) {
+    (void)ctx; (void)node; (void)session;
+    g_fin_calls++;
+    if (g_fin_again) { g_fin_again--; return SEND_AGAIN; }
+    return SEND_OK;
+}
+static int test_read_end(void *ctx, const void *session) {
+    (void)ctx; (void)session; return g_end_kind;
+}
+static int test_can_halfclose(void *ctx, const void *node, const void *session) {
+    (void)ctx; (void)node; (void)session; g_cap_calls++; return 1;
+}
+static const struct stack_flow_extensions test_flow_ext = {
+    sizeof(test_flow_ext), STACK_FLOW_EXT_VERSION, NULL, test_shutdown_write, test_read_end, test_can_halfclose
+};
+static void t_halfclose_contract(void) {
+    struct conn *c = ready_conn(sock_conn_tcp(45675, SRV_IP));
+    int peer;
+    if (!c) { check(0, "halfclose: connection"); return; }
+    peer = cli_fd(c); c->flow_checked = c->tx_fin = 0; g_flow_ext = &test_flow_ext;
+    g_cap_calls = 0; g_fin_calls = 0; g_fin_again = 1; g_end_kind = STACK_FLOW_END_EOF;
+    shutdown(peer, SHUT_WR);
+    { struct pollfd pf = { .fd = conn_cfd(c), .events = POLLIN }; poll(&pf, 1, 1000); }
+    c->carmed |= CRD;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(c->client_fin && !c->tx_fin && g_fin_calls == 1, "halfclose: FIN retries AGAIN");
+    check(c->sent_any && g_sent_n == 26 && ((struct vl_sess *)SESS(c))->header_sent,
+          "halfclose: empty request sends protocol header before FIN");
+    conn_deadlines(c, &g_tun, g_now_ns);
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(c->tx_fin == 1 && g_fin_calls == 2 && g_cap_calls == 1,
+          "halfclose: capability latched once and accepted FIN sent once");
+    usleep(5200000);
+    g_now_ns = now_ns(); g_now_s = (time_t)(g_now_ns / 1000000000ull);
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(c->used && !c->srv_closed, "halfclose: client FIN permits response after >5 seconds");
+    g_recv_rc = -1; drain_conn(c, &g_tun); g_recv_rc = 0;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(!c->used && cli_end(peer) == 1, "halfclose: clean EOF completes both directions");
+    g_flow_ext = NULL;
+    if (c->used) conn_drop(c);
+
+    c = ready_conn(sock_conn_tcp(45676, SRV_IP));
+    if (!c) { check(0, "halfclose reverse: connection"); return; }
+    peer = cli_fd(c); c->flow_checked = c->tx_fin = 0; g_flow_ext = &test_flow_ext; g_end_kind = STACK_FLOW_END_EOF;
+    g_recv_rc = -1; drain_conn(c, &g_tun); g_recv_rc = 0;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(c->used && c->rx_fin_sent && cli_end(peer) == 1,
+          "halfclose: server FIN leaves uplink open");
+    g_sent_n = 0;
+    send(peer, "uplink", 6, MSG_NOSIGNAL);
+    { struct pollfd pf = { .fd = conn_cfd(c), .events = POLLIN }; poll(&pf, 1, 1000); }
+    c->carmed |= CRD; sock_read(c, &g_tun);
+    check(c->used && g_sent_n >= 6 && !memcmp(g_sent + g_sent_n - 6, "uplink", 6),
+          "halfclose: uplink data accepted after server EOF");
+    shutdown(peer, SHUT_WR);
+    { struct pollfd pf = { .fd = conn_cfd(c), .events = POLLIN }; poll(&pf, 1, 1000); }
+    c->carmed |= CRD;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(!c->used, "halfclose: reverse EOF finishes independently");
+    g_flow_ext = NULL;
+    if (c->used) conn_drop(c);
+
+    c = ready_conn(sock_conn_tcp(45677, SRV_IP));
+    if (!c) { check(0, "halfclose idle: connection"); return; }
+    c->flow_checked = c->tx_fin = 0; g_flow_ext = &test_flow_ext; g_end_kind = STACK_FLOW_END_EOF;
+    g_recv_rc = -1; drain_conn(c, &g_tun); g_recv_rc = 0;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    time_t saved_s = g_now_s;
+    g_now_s = c->last + IDLE_EVICT_S + 1;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(!c->used, "halfclose: receiver-first idle flow obeys normal resource deadline");
+    g_now_s = saved_s; g_flow_ext = NULL;
+    if (c->used) conn_drop(c);
+
+    c = ready_conn(sock_conn_tcp(45678, SRV_IP));
+    if (!c) { check(0, "halfclose unknown: connection"); return; }
+    peer = cli_fd(c); c->flow_checked = c->tx_fin = 0; g_flow_ext = &test_flow_ext; g_end_kind = STACK_FLOW_END_UNKNOWN;
+    g_recv_rc = -1; drain_conn(c, &g_tun); g_recv_rc = 0;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(!c->used && cli_end(peer) == 2, "halfclose: unknown terminal is reset, never clean EOF");
+    g_flow_ext = NULL;
+    if (c->used) conn_drop(c);
+}
+
+static void t_close_drain_stall_reset(void) {
+    struct conn *c = ready_conn(sock_conn_tcp(45672, SRV_IP));
+    unsigned char payload[2048];
+    int peer;
+    if (!c) { check(0, "close drain stall: connection"); return; }
+    memset(payload, 0x37, sizeof(payload));
+    check(!emit_to_client(c, payload, sizeof(payload)), "close drain stall: queue payload");
+    c->srv_closed = 1; c->closed_at = g_now_ns; c->sent_any = 1;
+    peer = cli_fd(c);
+    g_writev_test_fd = conn_cfd(c); g_writev_test_block = 1;
+    conn_deadlines(c, &g_tun, g_now_ns + (CLOSE_DRAIN_MS + 1ull) * 1000000ull);
+    g_writev_test_fd = -1;
+    check(!c->used && cli_end(peer) == 2,
+          "close drain: stalled unsent tail resets TCP instead of clean truncated EOF");
+    if (c->used) conn_drop(c);
+}
+
 static void t_release_last_sleep(void) {
     struct conn *c = &g_conns[g_nslots - 1];
     struct conn save = *c;
@@ -945,6 +1122,43 @@ static int es_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     g_es_n++;
     return SEND_OK;
 }
+static int g_udp_reopen_calls;
+static int udp_count_open(const void *ctx, void *session, const struct flow_key *key, int udp) {
+    g_udp_reopen_calls++;
+    return vless_dialer.flow_open(ctx, session, key, udp);
+}
+
+static void t_udp_closed_reopen(void) {
+    static struct dialer_ops ops;
+    static struct dialer dl;
+    ops = *g_dial.ops; dl = g_dial;
+    const struct dialer *saved = g_dl;
+    struct flow_key key = cli_key();
+    unsigned char packet[17];
+    struct conn *c;
+    int ready;
+    key.proto = 17; key.sport = 45673;
+    memset(packet, 0x73, sizeof(packet));
+    ops.flow_open = udp_count_open; dl.ops = &ops; g_dl = &dl;
+    g_udp_reopen_calls = 0;
+    udp_packet(&g_tun, NULL, &key, packet, sizeof(packet), 0);
+    c = conn_find(&key);
+    ready = c && c->pending && wait_ready(c, 2000) == 0;
+    check(ready, "UDP terminal reuse: first session opened");
+    if (ready) {
+        c->srv_closed = 1;
+        g_sent_n = 0;
+        udp_packet(&g_tun, c, &key, packet, sizeof(packet), 0);
+        c = conn_find(&key);
+        if (c && c->pending) wait_ready(c, 2000);
+        check(c && c->used && !c->srv_closed && g_udp_reopen_calls == 2 &&
+              g_sent_n == 26 + 2 + sizeof(packet),
+              "UDP terminal reuse: next datagram opens a fresh session and includes its new protocol header");
+    }
+    if (c && c->used && !c->pending) conn_drop(c);
+    g_dl = saved;
+}
+
 static void t_udp_early_bounds(void) {
     static const struct dialer_ops es_ops = { .name = "границы", .dgram_frame = es_frame,
                                               .send = es_send };
@@ -1949,10 +2163,17 @@ static const struct pool_proto f_proto = { .ops = &f_ops, .probe = f_probe, .nam
 static int g_sel[80] = { 0, 1, 2, 3, 4 };
 
 static int g_pick, g_tol = -1;
+static void geo_wait(void);
 
 /* Пул заново: active слотов, кандидаты 0..ncand-1, первый — узел 0; выбор — g_pick и g_tol. */
 static void pool_new(int active, int by, int ncand, const char *out) {
     while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
+    /* Fixture-only reinitialization must quiesce detached geo readers. */
+    geo_wait();
+    pthread_mutex_lock(&g_pl.mu);
+    int geo_busy = g_pl.geo_busy;
+    pthread_mutex_unlock(&g_pl.mu);
+    if (geo_busy) { check(0, "pool fixture: geo worker quiesced"); abort(); }
     free(g_pl.slot);
     memset(&g_pl.cf, 0, sizeof g_pl.cf);
     g_pl.sig[0] = '\0';
@@ -3325,6 +3546,36 @@ static size_t pkt6(unsigned char *p, const uint8_t *src, const uint8_t *dst, uns
     return 40 + l4 + pay;
 }
 
+/* File-format compatibility through the new bounded admission service. */
+static struct flow_key g_fake_test_result;
+static int g_fake_test_found;
+static void fake_test_complete(void *context, int fd, const struct flow_key *key, int found) {
+    (void)context; g_fake_test_result = *key; g_fake_test_found = found; close(fd);
+}
+static int test_cached_fake(struct flow_key *key) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/fakeip.state", steer_state_dir());
+    struct fakeip_service *service = fakeip_service_create(path);
+    if (!service) return 0;
+    struct fakeip_worker *worker = fakeip_worker_create(service, "steer_test_absent", fake_test_complete, NULL);
+    int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    uint64_t now = now_ns(); g_fake_test_found = 0;
+    if (!worker || fakeip_worker_submit(worker, fd, key, now)) { if (fd >= 0) close(fd); }
+    else fakeip_worker_pump(worker, now + FAKEIP_LOOKUP_MS * 1000000ull);
+    fakeip_worker_destroy(worker); fakeip_service_destroy(service);
+    if (g_fake_test_found) *key = g_fake_test_result;
+    return g_fake_test_found;
+}
+static uint32_t test_cached_fake4(uint32_t address) {
+    struct flow_key key = { .dst = address };
+    return test_cached_fake(&key) ? key.dst : 0;
+}
+static int test_cached_fake6(const uint8_t address[16], uint8_t real[16]) {
+    struct flow_key key = { .v6 = 1 }; memcpy(key.dst6, address, 16);
+    if (!test_cached_fake(&key)) return 0;
+    memcpy(real, key.dst6, 16); return 1;
+}
+
 static void t_v6(void) {
     unsigned char p[2048];
     struct flow_key k;
@@ -3551,16 +3802,16 @@ static void t_v6(void) {
             check(!fake6_is(V6_SRV), "IPv6: обычный адрес не из пула fake-IP");
             inet_pton(AF_INET6, "fdfe:dcba:9876::c612:5", f6);
             inet_pton(AF_INET6, "2606:4700::1111", want);
-            check(fake6_is(f6) && fake_real6(f6, r6) && !memcmp(r6, want, 16),
+            check(fake6_is(f6) && test_cached_fake6(f6, r6) && !memcmp(r6, want, 16),
                   "fake-IP IPv6: поддельный fdfe:dcba:9876::c612:5 → настоящий IPv6 из четвёртого поля fakeip.state");
             inet_pton(AF_INET6, "fdfe:dcba:9876::c612:6", f6);
             inet_pton(AF_INET6, "2606:4700::2222", want);
-            check(fake_real6(f6, r6) && !memcmp(r6, want, 16),
+            check(test_cached_fake6(f6, r6) && !memcmp(r6, want, 16),
                   "fake-IP IPv6: запись без настоящего IPv4 («-») тоже даёт настоящий IPv6");
             inet_pton(AF_INET6, "fdfe:dcba:9876::c612:7", f6);
-            check(!fake_real6(f6, r6), "fake-IP IPv6: у записи без IPv6 (три поля) настоящего IPv6 нет");
+            check(!test_cached_fake6(f6, r6), "fake-IP IPv6: у записи без IPv6 (три поля) настоящего IPv6 нет");
             inet_pton(AF_INET6, "fdfe:dcba:9876::c612:99", f6);
-            check(!fake_real6(f6, r6), "fake-IP IPv6: неизвестный поддельный адрес — не найден");
+            check(!test_cached_fake6(f6, r6), "fake-IP IPv6: неизвестный поддельный адрес — не найден");
             uint32_t fk5, fk6, fk7;
             inet_pton(AF_INET, "198.18.0.5", &fk5);
             inet_pton(AF_INET, "198.18.0.6", &fk6);
@@ -3568,7 +3819,7 @@ static void t_v6(void) {
             uint32_t rl5, rl7;
             inet_pton(AF_INET, "104.20.1.1", &rl5);
             inet_pton(AF_INET, "1.2.3.4", &rl7);
-            check(fake_real(fk5) == rl5 && fake_real(fk7) == rl7 && fake_real(fk6) == 0,
+            check(test_cached_fake4(fk5) == rl5 && test_cached_fake4(fk7) == rl7 && test_cached_fake4(fk6) == 0,
                   "fake-IP IPv4 с четырёхпольным файлом: настоящие адреса прежние, у записи «-» его нет");
             unlink(path);
             rmdir(dir);
@@ -4182,6 +4433,11 @@ int main(void) {
     t_sendagain_hold();
     t_client_full();
     t_srv_close_drain();
+    t_close_drain_progress();
+    t_close_drain_stall_reset();
+    t_close_drain_real_reader();
+    t_halfclose_contract();
+    t_udp_closed_reopen();
     t_sock_path();
     t_release_last_sleep();
     t_bad_uuid();

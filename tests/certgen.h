@@ -19,6 +19,11 @@ int tcg_der_to_pem(const unsigned char *der, size_t n, char *pem, size_t cap);
 /* Подпись ECDSA над готовым хешем SHA-256, DER (r, s). */
 int tcg_sign_sha256(struct tcg_key *k, const unsigned char digest[32],
                     unsigned char *sig, size_t cap, size_t *sig_n);
+/* Deterministic public test seed, private contexts local to each call. Available
+ * only in the existing WOLFSSL_CERT_GEN fixture library, never engine builds. */
+int tcg_ed25519_public(const unsigned char seed[32], unsigned char public_key[32]);
+int tcg_ed25519_sign(const unsigned char seed[32], const unsigned char *message,
+                     size_t length, unsigned char signature[64]);
 /* Сколько сертификатов из блоков PEM в тексте разбирается; текст между блоками пропускается. */
 int tcg_count_pem_certs(const char *pem, size_t n);
 

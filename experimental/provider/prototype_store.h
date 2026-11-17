@@ -10,6 +10,19 @@ struct steer_prototype_store_result {
     struct steer_pv1_error error;
     uint32_t phase;
 };
+#define STEER_STORE_FORMAT_PROTOTYPE 1u
+#define STEER_STORE_FORMAT_SPEC_V3 3u
+#define STEER_STORE_DOCUMENT_MAX (1024u*1024u)
+struct steer_store_document {uint64_t generation;uint32_t format;char *document;size_t length;};
+/* Typed framing only, NOT a replacement schema validator. Caller must compile/
+ * validate the exact matching schema+factory options and canonical refs-only
+ * JSON before prepare, and again before activating a loaded snapshot. Prototype
+ * envelope stays byte-compatible; v3 has an explicit format tag. Unknown tags
+ * fail closed. Old prototype load rejects v3 as INVALID, never missing/fallback. */
+struct steer_pv1_error steer_prototype_store_prepare_document(struct steer_prototype_store *,
+ const struct steer_store_document *,struct steer_prototype_store_transaction **);
+struct steer_pv1_error steer_prototype_store_load_document(struct steer_prototype_store *,struct steer_store_document **);
+void steer_store_document_destroy(struct steer_store_document *);
 /* Linux, one serialized owner, no reentry or concurrent calls. Ownership may
  * transfer to another thread only through external synchronization establishing
  * happens-before (e.g. start worker after bootstrap; join before closing).

@@ -12,7 +12,7 @@
 # приходится помнить. С -fvisibility=hidden и списком наружу торчит ровно то, что кто-то снаружи
 # (steerd, модуль) действительно зовёт. Список — не ручной: он вычисляется как пересечение
 # неопределённых символов потребителей (steerd и всех модулей) с определёнными в libsteer, так что
-# ни забыть нужный, ни оставить лишний нельзя — `check` падает, если файл разошёлся с кодом.
+# новые нужды не забываются; net1 также сохраняет опубликованный ledger после миграции потребителей.
 # Забытый символ ловит и сама сборка (-Wl,-z,defs у библиотеки; у потребителя — неопределённая
 # ссылка), но `check` показывает разницу словами, а не строкой линковщика.
 #
@@ -51,7 +51,7 @@ CC="$CC" AR="${AR:-ar}" CFLAGS="-O0 -w -fPIC" sh build/ngtcp2/build.sh "$NSRC" "
 NGCFLAGS="$(cat "$W/libngtcp2.a.cflags")"
 comp() {  # ДЕЛО КАТАЛОГ ФАЙЛЫ…
     d="$1"; shift
-    printf '%s\n' "$@" | OD="$d" CCF="$F" xargs -P "$(nproc 2>/dev/null || echo 4)" -I{} \
+    printf '%s\n' "$@" | OD="$d" CCF="$F" xargs -P "${STEER_EXPORT_JOBS:-$(nproc 2>/dev/null || echo 4)}" -I{} \
         sh -c '$CC $CCF -c "$1" -o "$OD/$(echo "$1" | tr / _).o"' _ {}
 }
 export CC
@@ -93,9 +93,17 @@ comm -12 "$W/defs" "$W/undef" > "$W/need"
 # (wc_ChaCha20Poly1305_*_ex): символы «не зависят от архитектуры» только если взять оба набора.
 # shellcheck disable=SC2086
 $CC $F -DSTEER_CP_OWN -c $CRYPTO -o "$W/scrypto-own.o"
+# Optional server backend has additional public dependencies. The map is the
+# union of actual client/server consumers; profile capability still decides
+# whether server code is built, never a promise manufactured by this map.
+$CC $F $NGCFLAGS -DQC_WITH_SERVER -DSTEER_WOLFSSL_SERVER -DWOLFSSL_VALIDATE_ECC_IMPORT \
+    -DSTEER_WOLFSSL_POSIX_TIME_SAFE=1 -c "$(profile_var QUIC_SSL_SRC)" -o "$W/qcssl-server.o"
 {
-    nm -u "$W/lib/$(echo "$CRYPTO" | tr / _).o" "$W/scrypto-own.o" "$W/lib/$(echo "$(profile_var QUIC_SSL_SRC)" | tr / _).o"
+    nm -u "$W/lib/$(echo "$CRYPTO" | tr / _).o" "$W/scrypto-own.o" "$W/lib/$(echo "$(profile_var QUIC_SSL_SRC)" | tr / _).o" "$W/qcssl-server.o"
     nm -u "$W/libngtcp2.a"
+    # Published compatibility symbol: current callers use the backend-owned
+    # init seam, but migrating a caller must not silently remove the old export.
+    printf '%s\n' '                 U wolfSSL_Init'
 } | awk '$1=="U" && ($2 ~ /^(wc_|wolf)/) {print $2}' | sort -u > "$W/wneed"
 
 # ---- net1: libs2p-net.so.1 -------------------------------------------------------------------
@@ -117,6 +125,27 @@ comp "$W/plug" $(cat "$W/plug.lst")
 nm -g --defined-only "$W"/net1/*.o | awk 'NF==3 {print $3}' | sort -u > "$W/n1defs"
 nm -u "$W"/plug/*.o | awk '$1=="U" || $1=="w" {print $2}' | sort -u > "$W/n1undef"
 comm -12 "$W/n1defs" "$W/n1undef" | grep -v '^s2p_' > "$W/n1need" || true
+# Published ABI does not shrink when current consumers migrate to a replacement.
+# The ledger is checked against actual definitions, not a manually patched map.
+[ -f build/net1/exports.lst ] || { echo "libs-exports: missing net1 published ledger" >&2; exit 2; }
+sed '/^#/d; /^$/d' build/net1/exports.lst | sort -u > "$W/n1published"
+if grep -vE '^s2p_[A-Za-z0-9_]+$' "$W/n1published"; then
+    echo "libs-exports: invalid net1 published symbol" >&2; exit 2
+fi
+sed '/^s2p_net_abi$/d; s/^s2p_//' "$W/n1published" > "$W/n1published-source"
+comm -23 "$W/n1published-source" "$W/n1defs" > "$W/n1missing"
+if [ -s "$W/n1missing" ]; then
+    echo "libs-exports: published net1 definitions disappeared (major ABI break):" >&2
+    cat "$W/n1missing" >&2; exit 1
+fi
+cat "$W/n1need" "$W/n1published-source" | sort -u > "$W/n1union"
+mv "$W/n1union" "$W/n1need"
+{
+    echo '# Published net1 symbols. Additive within SONAME major; retain after caller migration.'
+    echo s2p_net_abi
+    sed 's/^/s2p_/' "$W/n1need"
+} | { IFS= read -r header; echo "$header"; sort -u; } > "$W/exports.lst"
+
 
 # ---- libsteer-ngtcp2.so -----------------------------------------------------------------------
 # Что берут из ngtcp2 обёртки QUIC libsteer и net1 (исходник один, но net1 собирает свой набор NET1_QUIC_SRC).
@@ -191,12 +220,13 @@ gen)
     cp "$W/libsteer-ngtcp2.map" build/ngtcp2/libsteer-ngtcp2.map
     mkdir -p build/net1
     cp "$W/libs2p-net.map" build/net1/libs2p-net.map
+    cp "$W/exports.lst" build/net1/exports.lst
     echo "libs-exports: libsteer.map — $(wc -l < "$W/need") символов, libsteer-wolfssl.map — $(wc -l < "$W/wneed"), libsteer-ngtcp2.map — $(wc -l < "$W/ngneed"), libs2p-net.map — $(($(wc -l < "$W/n1need") + 1))"
     ;;
 check)
     bad=0
     for pair in libsteer.map:build/libsteer.map libsteer-wolfssl.map:build/wolfssl/libsteer-wolfssl.map \
-                libsteer-ngtcp2.map:build/ngtcp2/libsteer-ngtcp2.map libs2p-net.map:build/net1/libs2p-net.map; do
+                libsteer-ngtcp2.map:build/ngtcp2/libsteer-ngtcp2.map libs2p-net.map:build/net1/libs2p-net.map exports.lst:build/net1/exports.lst; do
         gen="$W/${pair%%:*}"; have="${pair#*:}"
         if ! diff -u "$have" "$gen" > "$W/diff" 2>&1; then
             echo "libs-exports: $have разошёлся с кодом (sh build/libs-exports.sh gen):"

@@ -10,7 +10,7 @@
   "compat": {
     "steer-api": "^1.5",
     "splify2-api": "^1.0",
-    "steer-crypto": "^1.0"
+    "steer-crypto": "^2.0"
   },
   "arch": [
     "aarch64_cortex-a53",

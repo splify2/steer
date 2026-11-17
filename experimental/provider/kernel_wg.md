@@ -77,3 +77,66 @@ a socket fwmark alone does not turn WG UDP into VLESS XUDP. Legacy host-TUN
 currently carries UDP only and resets TCP; protocol egress requires a preserved
 identity source into the shared net1 runtime. These are subsequent integration
 work, not capabilities claimed by this device/guard gate.
+
+Managed ownership groundwork (source-only)
+------------------------------------------
+
+Pinned Linux ignores IFLA_IFALIAS in a new WireGuard link creation request. The
+alias-request helper is not a usable managed-creation ownership mechanism; no
+post-create retag is used to fill that gap. New composite helpers instead include
+a nonzero IFLA_GROUP in the exclusive RTM_NEWLINK request, then issue a fresh GET
+after ACK to verify the persisted physical name, kernel kind, index and group.
+The coordinator must mint a cryptographic-random physical name separately from
+the logical spec name (two prefix plus thirteen base32 characters:65 random bits)
+and a random nonzero32bit group, and durably record them with boot/netns identity
+before mutation. Lower-level helpers do not mint, adopt or journal identities.
+
+Group is not unique by itself. Mutations always use a precise verified ifindex;
+no group-only delete/change is emitted. Isolated kernel tests deliberately put
+two devices in the same group and verify that deleting one preserves its peer.
+A different group on the same name/index, including a recreated foreign device,
+is refused. This is fresh query plus guarded action, not a kernel atomic CAS
+against a concurrently privileged external actor.
+
+`tests/wg-owned-build.sh /tmp/wg-owned` builds the wire/kernel gate. Kernel
+execution requires a disposable root namespace and explicit opt-in:
+`unshare -n -- env STEER_TEST_OWNED_NETNS=1 /tmp/wg-owned/owned`. Strict and
+ASan/UBSan/LSan runs passed on the current WSL kernel. Full32bit groups persist
+through netlink even though this environment's iproute2 group setter rejects
+values above INT_MAX; the marker entropy is not reduced for that CLI limit.
+Durable recovery, worker-backed device lifecycle and managed factory/config/UI
+integration remain subsequent work. Existing configure/live CLI helpers still
+have shared static state and must not be assumed reentrant from the transport
+race fix alone.
+
+Recovery primitive checkpoint
+-----------------------------
+
+`kernel_wg_ownership.{h,c}` provides synchronous worker-only identity/record,
+reconcile, create-DOWN and guarded-retire primitives. It starts no threads and
+writes no provider-private journal. The future common coordinator must persist
+its exact128byte version1 record before mutation and retain the pinned namespace
+FD/transaction/generation guards. The little-endian record contains boot UUID,
+namespace device/inode, generation/token, random intent ID, random physical name,
+kind and group; it contains no pointers, FDs or key material. Its CRC detects
+corruption and is not authentication against a privileged actor.
+
+Recovery freshly verifies boot, pinned namespace FD and actual calling thread
+namespace, then name/kind/group. A record never authorizes name-only adoption.
+Absent recovery is read-only and repeatable. Foreign identity refuses mutation.
+Cancellation before effects is UNCHANGED; cancellation after confirmed create
+still reports CHANGED/owned. Lost create/delete result reports uncertainty until
+a fresh observation proves the state. Cleanup never invents an unchanged result
+from timeout. Create-DOWN does not configure keys, peers, admission guards,
+endpoints or publish a usable WireGuard provider.
+
+The recovery fixture persists/fsyncs intent before a child creates the device,
+then loses the creation result and reconstructs only from that record. It also
+covers lost deletion result, repeated cleanup, valid-CRC semantic malformed
+records, actual different namespace FD/current-thread mismatch, boot refusal,
+pre/post-effect cancellation and foreign group preservation. A separate
+`recovery --workers` gate uses four actual thread-local network namespaces,
+including one refused ownership check while healthy owners continue their own
+create/retire cycles. This verifies this narrow owned-operation subset, not the
+legacy configure/live helpers or managed host crash recovery. Execute kernel
+modes only with the namespace opt-in described above.

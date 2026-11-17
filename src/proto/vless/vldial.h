@@ -57,6 +57,8 @@ struct vl_sess {
 };
 
 extern const struct dialer_ops vless_dialer;
+struct stack_flow_extensions;
+const struct stack_flow_extensions *vless_flow_extensions(void);
 
 /* Поднять туннель выхода на пуле узлов pc (src/tunnel/pool.h; узлы — struct vless_node, первый
  * активный — pc->first): проверка узла, которую нельзя отложить до первого соединения, и стек с

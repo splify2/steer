@@ -13,6 +13,8 @@ LIBSTEER_NGTCP2 {
     ngtcp2_conn_encode_0rtt_transport_params2;
     ngtcp2_conn_extend_max_offset;
     ngtcp2_conn_extend_max_stream_offset;
+    ngtcp2_conn_extend_max_streams_bidi;
+    ngtcp2_conn_extend_max_streams_uni;
     ngtcp2_conn_get_conn_info2_versioned;
     ngtcp2_conn_get_expiry;
     ngtcp2_conn_get_path_max_tx_udp_payload_size2;

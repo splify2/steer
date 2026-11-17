@@ -1011,6 +1011,7 @@ check "  родная s2p_net_abi экспортируется" "1" "$(grep -c '
 n1maj="$(sed -n 's/^#define S2P_NET_ABI_MAJOR \([0-9]*\)$/\1/p' src/net1/s2pnet.h)"
 n1min="$(sed -n 's/^#define S2P_NET_ABI_MINOR \([0-9]*\)$/\1/p' src/net1/s2pnet.h)"
 n1ver="$(sed -n 's/^#define S2P_NET_VERSION "\(.*\)"$/\1/p' src/net1/s2pnet.h)"
+n1floor="$(sed -n 's/^#define S2P_NET_ABI_PACKAGE_FLOOR "\(.*\)"$/\1/p' src/net1/s2pnet.h)"
 jget() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$@" 2>/dev/null; }
 if command -v python3 >/dev/null 2>&1; then
     check "plugins/net1/plugin.json: версия = S2P_NET_VERSION, major версии = номер в id" "$n1ver net1" \
@@ -1025,6 +1026,8 @@ if command -v python3 >/dev/null 2>&1; then
     n1row="$(grep -v '^#' "$N1LST" | awk -v v="$n1ver" '$1 == v')"
     check "abi.lst: строка версии net1 $n1ver есть, одна, abi $n1maj.$n1min" "1 $n1maj.$n1min" \
         "$(printf '%s\n' "$n1row" | grep -c .) $(printf '%s' "$n1row" | awk '{print $2}')"
+    check "net1 dependency floor is the first PACKAGE release providing current ABI" "$n1floor" \
+        "$(grep -v '^#' "$N1LST" | awk -v abi="$n1maj.$n1min" '$2 == abi {print $1; exit}')"
     check "abi.lst: версии не повторяются и растут" "" \
         "$(grep -v '^#' "$N1LST" | awk 'NF { print $1 }' | python3 -c '
 import sys
@@ -1071,7 +1074,7 @@ print("" if len(set(v)) == len(v) and k == sorted(k) else " ".join(v))')"
     done
     check "  build-libs.sh: SONAME библиотек ядра — по версии wolfSSL и серии ngtcp2" "1 1" \
         "$(grep -c 'soname,"libsteer-wolfssl.so.$WVER"' build/build-libs.sh) $(grep -c 'soname,"libsteer-ngtcp2.so.$NGTAG"' build/build-libs.sh)"
-    # Манифест протокола: requires.plugins.net1 по ABI; подкоманды, помощник и хуки манифеста — ровно
+    # Манифест протокола: requires.plugins.net1 по первой версии ПАКЕТА с этим ABI; подкоманды, помощник и хуки манифеста — ровно
     # команды программы плагина (таблица CMDS у PK_PROGRAM в src/modules/main_<id>.c), а не список ядра.
     for q in $(profile_var PLUGINS_NET1) $(profile_var PLUGINS_STATIC) $(profile_var PLUGINS_TLS); do
         mf="plugins/$q/plugin.json"
@@ -1079,7 +1082,7 @@ print("" if len(set(v)) == len(v) and k == sorted(k) else " ".join(v))')"
         have="$(jget "$mf" '" ".join(sorted({(c.get("argv") or [c["name"]])[0] for c in d["steer"].get("commands",[])} | {k["helper"].get("cmd", k["name"]) for k in d["steer"].get("kinds",[]) if k.get("helper")} | {k[h]["argv"][0] for k in d["steer"].get("kinds",[]) for h in ("check","expand") if k.get(h)}))') "
         check "plugins/$q: подкоманды, помощник и хуки — команды программы плагина (PK_PROGRAM)" "$want" "$have"
         case " $(profile_var PLUGINS_NET1) " in
-            *" $q "*) check "plugins/$q: requires.plugins.net1 = ^$n1maj.$n1min" "^$n1maj.$n1min" "$(jget "$mf" 'd["requires"]["plugins"]["net1"]')" ;;
+            *" $q "*) check "plugins/$q: requires.plugins.net1 = ^$n1floor" "^$n1floor" "$(jget "$mf" 'd["requires"]["plugins"]["net1"]')" ;;
             *) check "plugins/$q: без net1 (стек ему не нужен)" "None" "$(jget "$mf" 'd.get("requires",{}).get("plugins",{}).get("net1")')" ;;
         esac
         check "plugins/$q: помощник запускается с --conf {conf}" "" \

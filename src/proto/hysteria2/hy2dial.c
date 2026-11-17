@@ -103,6 +103,28 @@ static int h2_aborted(const void *sess) {
     return hy2c_aborted(sess);
 }
 
+static int h2_shutdown_write(void *context,const void *dialer_ctx,void *session) {
+    (void)context;(void)dialer_ctx;return hy2c_shutdown_write(session);
+}
+static int h2_read_end(void *context,const void *session) {
+    const struct hy2_flow *f=session;(void)context;
+    if(f->aborted) return STACK_FLOW_END_ERROR;
+    if(f->rx_fin&&!f->pend_n) return STACK_FLOW_END_EOF;
+    if(f->gone||!f->q) return STACK_FLOW_END_ERROR;
+    return STACK_FLOW_END_UNKNOWN;
+}
+static int h2_can_halfclose(void *context,const void *dialer_ctx,const void *session) {
+    const struct hy2_flow *f=session;(void)context;(void)dialer_ctx;
+    return f&&!f->udp&&f->q&&!f->aborted;
+}
+const struct stack_flow_extensions *hy2_flow_extensions(void) {
+    static const struct stack_flow_extensions extensions={
+        .size=sizeof extensions,.version=STACK_FLOW_EXT_VERSION,
+        .shutdown_write=h2_shutdown_write,.read_end=h2_read_end,.can_halfclose=h2_can_halfclose
+    };
+    return &extensions;
+}
+
 const struct dialer_ops hy2_dialer = {
     .name = "hysteria2",
     /* DC_INLOOP: QUIC живёт в цикле рабочего потока, у соединения клиента нет ни дескриптора, ни потока,
@@ -141,5 +163,5 @@ int hy2_tunnel_run(const struct tun_out *o, const struct hy2_node *node,
     static struct dialer d;
     d.ops = &hy2_dialer;
     d.ctx = node;
-    return stack_run(o, &d, ready, arg);
+    return stack_run_ex(o, &d, hy2_flow_extensions(), ready, arg);
 }

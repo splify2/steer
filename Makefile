@@ -90,7 +90,11 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
+test: $(BUILD)/loopfairmatch $(BUILD)/fakeipadmissionmatch $(BUILD)/clock64match $(BUILD)/tunreadermatch
 test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/nldonematch $(BUILD)/b3match $(BUILD)/subpq $(BUILD)/abihost $(BUILD)/abihost-static $(BUILD)/steerd-static $(BUILD)/pluginmodel $(BUILD)/pkhooks $(BUILD)/pkmatch $(BUILD)/pmkindmatch $(BUILD)/foprobematch $(BUILD)/tunfloodmatch $(BUILD)/hsdlmatch $(BUILD)/httpcspinmatch
+	@$(BUILD)/loopfairmatch
+	@$(BUILD)/clock64match
+	@$(BUILD)/fakeipadmissionmatch
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -191,6 +195,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 		$(MAKE) -s $(BUILD)/spscmatch-tsan && $$R $(BUILD)/spscmatch-tsan; \
 	else echo "spscmatch-tsan: ПРОПУСК — компилятор или система не умеет -fsanitize=thread (это не падение)"; fi
 	@$(BUILD)/tunnelmatch
+	@$(BUILD)/tunreadermatch
 	@$(BUILD)/tunfloodmatch
 	@$(BUILD)/tunnamematch
 	@$(BUILD)/xsconfmatch
@@ -404,7 +409,7 @@ $(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.
 # tests/awgmatch.c.
 # Дважды — роутерная и Android-сборка: у них разная метка сокета туннеля без via (0 против
 # STEER_SELF_MARK). С ядром — tests/awgns.sh.
-$(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awgdev.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
+$(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awgdev.c src/kinds/awg.h src/kinds/awgdev.h src/lib/nlbuf.h src/lib/nltransport.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/awgmatch.c $(filter-out src/kinds/awgdev.c,$(MODEL_KINDS))
 
@@ -417,7 +422,7 @@ $(BUILD)/warpmatch: tests/warpmatch.c src/kinds/awg.c src/kinds/awg.h src/proto/
 	$(CC) $(CFLAGS) -o $@ tests/warpmatch.c src/kinds/awg.c src/proto/warp/wbconf.c src/proto/warp/wbjson.c \
 		src/proto/warp/wbexpand.c src/plugkit/pkjson.c src/lib/jsonw.c $(MODEL_KINDS)
 
-$(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awgdev.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
+$(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awgdev.c src/kinds/awg.h src/kinds/awgdev.h src/lib/nlbuf.h src/lib/nltransport.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -DSTEER_DEFAULT_PLATFORM=android -o $@ tests/awgmatch.c $(filter-out src/kinds/awgdev.c,$(MODEL_KINDS))
 
@@ -522,6 +527,16 @@ $(BUILD)/runmatch: tests/runmatch.c src/lib/run.c src/lib/run.h
 
 # Проба ICMP сторожа (src/daemon/foprobe.c) одним вызовом — для tests/foprobe.sh (потери и задержки
 # эхо-ответов в пространствах имён).
+$(BUILD)/loopfairmatch: tests/loopfairmatch.c src/daemon/loop.c src/daemon/loop.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/loopfairmatch.c src/daemon/loop.c
+
+# Real ILP32 can use the same target/toolchain; injected time crosses LONG_MAX
+# without changing system time. GC isolates helpers_now_ms from helper startup.
+$(BUILD)/clock64match: tests/clock64match.c src/daemon/loop.c src/daemon/loop.h src/daemon/helpers.c src/daemon/helpers.h src/lib/monotime.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o $@ tests/clock64match.c src/daemon/loop.c src/daemon/helpers.c -Wl,--gc-sections -Wl,--wrap=clock_gettime -Wl,--wrap=timerfd_settime
+
 $(BUILD)/foprobematch: tests/foprobematch.c src/daemon/foprobe.c src/daemon/foprobe.h src/daemon/loop.c \
                        src/daemon/loop.h
 	@mkdir -p $(BUILD)
@@ -551,15 +566,15 @@ $(BUILD)/rtnl-tool: tests/rtnl-tool.c src/lib/rtnl.c src/lib/rtnl.h src/lib/nlbu
 	$(CC) $(CFLAGS) -o $@ tests/rtnl-tool.c src/lib/rtnl.c
 
 # Дампы nftables по netlink (src/lib/nftdump.c) — инструмент стенда tests/nftdumpmatch.sh.
-$(BUILD)/nftdump-tool: tests/nftdump-tool.c src/lib/nftdump.c src/lib/nftdump.h
+$(BUILD)/nftdump-tool: tests/nftdump-tool.c src/lib/nftdump.c src/lib/nftdump.h src/lib/nltransport.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/nftdump-tool.c src/lib/nftdump.c
 
 # Конец дампа netlink у читателей ядра steer (nftdump, nftvmap, rtnl, ctnl) — на подставном ядре:
 # sendto и recv подменяются ключами компоновщика, исходники собираются как есть (шапка стенда).
-$(BUILD)/nldonematch: tests/nldonematch.c src/lib/nftdump.c src/lib/nftvmap.c src/lib/rtnl.c src/lib/ctnl.c src/lib/nlbuf.h
+$(BUILD)/nldonematch: tests/nldonematch.c src/lib/nftdump.c src/lib/nftvmap.c src/lib/rtnl.c src/lib/ctnl.c src/lib/nlbuf.h src/lib/nltransport.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Wl,--wrap=sendto -Wl,--wrap=recv -o $@ tests/nldonematch.c src/lib/nftdump.c src/lib/nftvmap.c src/lib/rtnl.c src/lib/ctnl.c
+	$(CC) $(CFLAGS) -Wl,--wrap=sendto,--wrap=recv,--wrap=recvmsg,--wrap=poll,--wrap=__poll_chk -o $@ tests/nldonematch.c src/lib/nftdump.c src/lib/nftvmap.c src/lib/rtnl.c src/lib/ctnl.c
 
 # Зависимость выхода от чужого firewall: fw_check судит о конфигурации по тексту дампа
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
@@ -572,7 +587,7 @@ $(BUILD)/fwmatch: tests/fwmatch.c $(CORE_SRC) $(CORE_HDR)
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. tls13.h, который h2.c тянет ради одной
 # константы, криптобиблиотеки не требует: её типов в нём нет (src/lib/scrypto.h).
-$(BUILD)/h2match: tests/h2match.c src/proto/tls/h2.c src/proto/tls/h2.h src/proto/tls/tls13.h
+$(BUILD)/h2match: tests/h2match.c src/proto/tls/h2.c src/proto/tls/h2.h src/proto/tls/h2status.h src/proto/tls/tls13.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/h2match.c
 
@@ -584,7 +599,7 @@ XHUPMATCH_SRC = src/proto/tls/h2.c src/proto/transport/transport.c src/proto/tra
                 src/proto/transport/trdial.c src/proto/transport/trgrpc.c src/proto/tls/roots.c \
                 src/proto/transport/trws.c src/proto/transport/trupgrade.c src/proto/transport/trpath.c
 $(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/transport/trxhttp.c src/proto/transport/transport.h \
-                    src/proto/tls/h2.h $(XHUPMATCH_SRC)
+                    src/proto/tls/h2.h src/proto/tls/h2status.h $(XHUPMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xhupmatch.c tests/trvenc-stub.c \
 		$(XHUPMATCH_SRC) $(PLATFORM_SRC) -lpthread
@@ -594,7 +609,7 @@ $(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/transport/trxhttp.c src/proto/tr
 # и h2.c настоящие и компонуются объектами (а не include .c: храповик tests/buildmatch.sh), связь голая на сокетной
 # паре, TLS и Reality заглушены.
 $(BUILD)/grpcmatch: tests/grpcmatch.c src/proto/transport/trgrpc.c src/proto/transport/transport.h \
-                    src/proto/tls/h2.h $(XHUPMATCH_SRC)
+                    src/proto/tls/h2.h src/proto/tls/h2status.h $(XHUPMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/grpcmatch.c tests/trvenc-stub.c \
 		$(XHUPMATCH_SRC) src/proto/transport/trxhttp.c $(PLATFORM_SRC) -lpthread
@@ -808,13 +823,31 @@ $(BUILD)/spscmatch-tsan: tests/spscmatch.c src/tunnel/spsc.h tests/unit.h
 # Второй половиной стенд включает пул узлов выхода (src/tunnel/pool.c) с поддельным протоколом под
 # ним: обрыв связи с узлом — RST клиенту, порог молчания на сокете, замена мёртвого узла без
 # перезапуска, раздача by. Молчание узла в сети — tests/run-silence.sh (root).
-TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
+TUNNELMATCH_SRC = src/tunnel/fakeip.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
                   src/proto/vless/vldial.c \
                   src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS)
 $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/stack.c src/tunnel/pool.c src/tunnel/pool.h src/tunnel/dialer.h $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/tunnelmatch.c \
 		$(TUNNELMATCH_SRC) -lpthread -ldl
+
+# Actual shared-reader/SPSC overload gate; default fd mode needs no privileges.
+# Kernel driver mode: isolated root netns + STEER_TEST_READER_NETNS=1 reader --tun.
+$(BUILD)/tunreadermatch: tests/tunreadermatch.c src/tunnel/stack.c src/tunnel/tun.c $(CORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o $@ tests/tunreadermatch.c src/tunnel/tun.c -pthread -Wl,--gc-sections
+
+$(BUILD)/fakeipadmissionmatch: tests/fakeipadmissionmatch.c src/tunnel/fakeip.c src/tunnel/fakeip.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/fakeipadmissionmatch.c src/tunnel/fakeip.c -lpthread
+
+# Source-only _ex lifecycle gate. Requires task-owned netns (root):
+# STEER_FLOW_HOST=./build/tunnel-flow-host sh tests/run-tunnel-halfclose.sh
+TUNNEL_FLOW_SRC = src/tunnel/stack.c src/tunnel/fakeip.c src/tunnel/tun.c src/tunnel/rtx.c src/lib/run.c \
+                  src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS)
+$(BUILD)/tunnel-flow-host: tests/tunnel-flow-host.c src/tunnel/stack.c src/tunnel/stack.h src/tunnel/dialer.h $(TUNNEL_FLOW_SRC)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/tunnel-flow-host.c $(TUNNEL_FLOW_SRC) -lpthread
 
 # Один клиент LAN не кладёт туннель всем (аудит 2.1.0, T1 и T2): спрей датаграмм на 20 000 адресов, очередь
 # установщиков, срок заявки, бюджет памяти при сотнях медленных читателей. Стенд — tunnelmatch.c с его
@@ -908,6 +941,8 @@ clean:
 
 # Explicit disposable Linux lab targets; absent from production/all/test lists.
 LAB_LOOPBACK_SRC := experimental/provider/loopback_host.c experimental/provider/stream.c \
+    experimental/provider/stream_backend.c experimental/provider/route_stream.c \
+    experimental/provider/native_stream_backend.c experimental/provider/binding_lease.c experimental/provider/flow_metadata.c \
     experimental/provider/buffers.c experimental/provider/operations.c experimental/provider/route_dial.c experimental/provider/resolver.c \
     experimental/provider/policy.c experimental/provider/policy_route.c src/daemon/loop.c \
     experimental/provider/prototype_config.c experimental/provider/prototype_store.c $(YAML_SRC) src/lib/err.c src/lib/jsonw.c \

@@ -162,9 +162,16 @@ size_t awg_build_set(uint8_t *buf, size_t cap, uint16_t famid, int famver, int i
                      const char *ifname, const struct awg_conf *c,
                      const struct awg_secrets *s, uint32_t fwmark, int replace_peers,
                      uint32_t seq);
+/* Managed companion selects the precise kernel index, never a name fallback. */
+size_t awg_build_set_index(uint8_t *,size_t,uint16_t,int,int,int,const struct awg_conf *,const struct awg_secrets *,uint32_t,int,uint32_t);
 /* RTM_NEWLINK с IFLA_INFO_KIND: создать устройство. */
 size_t awg_build_newlink(uint8_t *buf, size_t cap, const char *ifname, const char *kind,
                          int mtu, uint32_t seq);
+/* Atomically includes the nonsecret ownership marker in exclusive creation. */
+size_t awg_build_newlink_marked(uint8_t *,size_t,const char *,const char *,int,const char *,uint32_t);
+/* Composite ownership: physical random name + nonzero random group in one
+ * exclusive RTM_NEWLINK. No later retag is needed to establish ownership. */
+size_t awg_build_newlink_owned(uint8_t *,size_t,const char *,const char *,int,uint32_t,uint32_t);
 /* CTRL_CMD_GETFAMILY по имени семейства. */
 size_t awg_build_getfamily(uint8_t *buf, size_t cap, const char *name, uint32_t seq);
 

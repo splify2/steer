@@ -71,6 +71,7 @@
 #include <sys/socket.h>
 
 #include "dialer.h"
+#include "stack.h"
 #include "hy2conn.h"
 #include "quic.h"
 #include "roots.h"
@@ -167,7 +168,7 @@ struct hq {
     uint64_t state_at_ms, next_try_ms, bg_try_ms;
     unsigned bg_ms;                 /* текущая пауза попыток поднять упавшее: растёт при отказах, 0 — после подъёма */
     uint64_t timer_due_ms;          /* срок таймера QUIC, снятый перед ожиданием; 0 — нет */
-    uint64_t open_at_ms, status_at_ms, dg_seen, dg_log_ms;
+    uint64_t open_at_ms, status_at_ms, dg_seen, dg_log_ms, rasm_at_ms;
     struct obfs_state *ob;          /* обфускация текущего соединения (make_cfg) */
     int64_t auth_sid;
     uint8_t abuf[4096];
@@ -793,13 +794,21 @@ static void flow_down(struct hy2_flow *f, const uint8_t *d, size_t n) {
  * переписывал весь остаток — квадрат по объёму. */
 static void flow_up_flush(struct hy2_flow *f) {
     struct hq *h = f->q;
-    if (!f->up_n || f->gone || f->sclosed) return;
+    if (f->gone || f->sclosed) return;
+    if (!f->up_n) {
+        if(f->tx_fin_requested&&!f->tx_fin_queued) {
+            if(qc_stream_send(h->qc,f->sid,NULL,0,1)<0) flow_kill(f,0);
+            else f->tx_fin_queued=1;
+        }
+        return;
+    }
     ssize_t k = qc_stream_send(h->qc, f->sid, f->up + f->up_off, f->up_n, 0);
     if (k < 0) { flow_kill(f, 0); return; }
     h->tx_bytes += (uint64_t)k;
     f->up_off += (size_t)k;
     f->up_n -= (size_t)k;
     if (!f->up_n) f->up_off = 0;   /* буфер остаётся до конца потока: следующий остаток ляжет без malloc */
+    if(!f->up_n&&f->tx_fin_requested) flow_up_flush(f);
 }
 
 /* Положить в остаток n байт. Места не хватает: снятое начало не меньше остатка — сдвиг (переносится
@@ -857,6 +866,7 @@ int hy2c_send(struct hy2_flow *f, const unsigned char *d, size_t n) {
     struct hq *h = f->q;
     if (!h || !h->qc || h->dead || f->gone || f->sclosed || f->state != FL_OPEN) return SEND_FATAL;
     if (f->udp) return udp_send(f, d, n);
+    if (f->tx_fin_requested) return SEND_FATAL;
     if (!n) return SEND_OK;         /* запрос потока ушёл при открытии: серверу, говорящему первым, нечего добавить */
     if (f->up_n) {
         /* Остаток ещё ждёт места: порядок байт дороже скорости, новое — за ним. */
@@ -932,7 +942,23 @@ int hy2c_aborted(const struct hy2_flow *f) {
 }
 
 void hy2c_close(struct hy2_flow *f) {
-    flow_release(f, 1);
+    /* Successful bidirectional EOF detaches only the application. qc_stream
+     * owns retained chunks/FIN independently until ngtcp2 ACK/stream close;
+     * resetting here would preempt retransmission of the final packet. */
+    int graceful=!f->udp&&f->tx_fin_queued&&f->rx_fin&&!f->aborted&&!f->up_n;
+    flow_release(f, !graceful);
+}
+
+int hy2c_shutdown_write(struct hy2_flow *f) {
+    struct hq *h=f->q;
+    if(f->udp) return SEND_UNSUPPORTED;
+    if(f->tx_fin_queued) return SEND_OK;
+    if(!h||!h->qc||h->dead||f->gone||f->sclosed||f->state!=FL_OPEN) return SEND_FATAL;
+    f->tx_fin_requested=1;
+    flow_up_flush(f);
+    if(f->aborted||f->gone) return SEND_FATAL;
+    if(!f->tx_fin_queued) { act_add(h,f);return SEND_AGAIN; }
+    return SEND_OK;
 }
 
 /* ---- сроки и жизнь соединения: объявления ------------------------------------------------------ */
@@ -1106,20 +1132,18 @@ static void on_stream_data(void *u, int64_t sid, const uint8_t *d, size_t n, int
     struct hy2_flow *f = flow_by_sid(h, sid);
     if (!f) { qc_stream_consumed(h->qc, sid, n); return; }
     if (f->state == FL_RESP) {
-        if (!f->hbuf) f->hbuf = malloc(4300);
+        if (!f->hbuf) f->hbuf = calloc(1,sizeof(struct hy2_tcp_response_stream));
         if (!f->hbuf) { qc_stream_consumed(h->qc, sid, n); flow_fail(f, HY2E_BUSY, NULL, 1); return; }
-        /* Ответ короче hbuf (сообщение и набивка ограничены при разборе), поэтому не влезшее — уже
-         * негодный ответ. Копится вся порция: разбор скажет, где ответ кончился. */
-        size_t before = f->hn_;
-        int bad = n > (size_t)(4300 - f->hn_);
+        /* A callback can coalesce the response and arbitrary application data.
+         * Parse/credit only header bytes and hand remaining bytes to the queue. */
+        size_t resp_here=0;
         struct hy2_tcp_resp resp;
-        int used = -1;
-        if (!bad) {
-            memcpy(f->hbuf + f->hn_, d, n);
-            f->hn_ += (uint16_t)n;
-            used = hy2_tcp_response(f->hbuf, f->hn_, &resp);
+        int used=hy2_tcp_response_feed((struct hy2_tcp_response_stream *)f->hbuf,d,n,&resp_here,&resp);
+        if (used == 0) {
+            qc_stream_consumed(h->qc,sid,n);
+            if(fin) flow_fail(f,HY2E_DENIED,"сервер оборвал заголовок ответа потока",1);
+            return;
         }
-        if (used == 0) { qc_stream_consumed(h->qc, sid, n); return; }   /* ответ пришёл не весь */
         if (used < 0 || !resp.ok) {
             qc_stream_consumed(h->qc, sid, n);
             const char *m = used < 0 ? "негодный ответ на запрос потока" : resp.msg;
@@ -1128,7 +1152,6 @@ static void on_stream_data(void *u, int64_t sid, const uint8_t *d, size_t n, int
         }
         /* Окно возвращаем за сам ответ; данные потока, пришедшие с ним, вернёт hy2c_read по мере
          * того, как стек их заберёт. */
-        size_t resp_here = (size_t)used - before;
         qc_stream_consumed(h->qc, sid, resp_here);
         free(f->hbuf);
         f->hbuf = NULL;
@@ -1142,9 +1165,43 @@ static void on_stream_data(void *u, int64_t sid, const uint8_t *d, size_t n, int
     if (fin && f->q) { f->rx_fin = 1; stack_sess_rx(f); }
 }
 
+#ifdef STEER_HY2_RESPONSE_TEST
+int hy2c_test_graceful(struct qc *qc,int64_t sid,const uint8_t *data,size_t n) {
+    struct hq h={0};struct hy2_flow f={0};int result;
+    h.qc=qc;h.state=S_UP;h.nflows=1;
+    f.q=&h;f.sid=sid;f.state=FL_OPEN;f.rx_fin=1;
+    list_add(&h,&f);sid_add(&h,&f);
+    result=hy2c_send(&f,data,n);
+    if(result==SEND_OK) result=hy2c_shutdown_write(&f);
+    if(result==SEND_OK&&!f.tx_fin_queued) result=SEND_FATAL;
+    hy2c_close(&f);
+    return result;
+}
+/* Source-linked regression seam: exercise the real FL_RESP callback and queue,
+ * without exposing private hq state or including this translation unit in tests. */
+int hy2c_test_response(const uint8_t *wire,size_t length,size_t split,uint8_t *out,size_t capacity,size_t *got) {
+    struct hq h={0};struct hy2_flow f={0};int result;
+    if(split>length) return -1;
+    h.state=S_UP;h.auth_sid=-1;h.stream_win=128u*1024;h.nflows=1;
+    f.q=&h;f.sid=0;f.state=FL_RESP;list_add(&h,&f);sid_add(&h,&f);*got=0;
+    if(split) on_stream_data(&h,0,wire,split,0);
+    if(f.q) on_stream_data(&h,0,wire+split,length-split,1);
+    result=f.q&&f.state==FL_OPEN?0:-1;
+    while(!result&&*got<capacity) {
+        const uint8_t *data;size_t n=0;
+        int rc=hy2c_read(&f,capacity-*got,&data,&n);
+        if(rc<0) { if(!f.rx_fin||f.aborted) result=-1;break; }
+        if(!n) break;
+        memcpy(out+*got,data,n);*got+=n;
+    }
+    flow_release(&f,0);
+    while(h.freeb) { struct pblk *next=h.freeb->next;free(h.freeb);h.freeb=next; }
+    return result;
+}
+#endif
 static void on_stream_close(void *u, int64_t sid, uint64_t err) {
     struct hq *h = u;
-    (void)err;
+    unsigned terminal=qc_stream_terminal_flags(h->qc,sid);
     struct hy2_flow *f = flow_by_sid(h, sid);
     if (!f) return;
     f->sclosed = 1;                         /* потока QUIC больше нет: ни слать, ни сбрасывать */
@@ -1153,11 +1210,39 @@ static void on_stream_close(void *u, int64_t sid, uint64_t err) {
         flow_fail(f, HY2E_DENIED, "сервер закрыл поток, не ответив", 0);
         return;
     }
-    /* Закрыт с обеих сторон: клиенту остался конец потока (после очереди), и стек ответит FIN. */
-    f->rx_fin = 1;
+    /* Transport closure is not evidence of STREAM FIN: RESET_STREAM code0 is
+     * also terminal. Only the data callback can establish a clean peer EOF. */
+    if(err||!f->rx_fin||(terminal&(QC_STREAM_RX_RESET|QC_STREAM_TX_RESET))) { flow_kill(f,0);return; }
     stack_sess_rx(f);
 }
 
+#ifdef STEER_HY2_RESPONSE_TEST
+extern int qc_test_terminal(unsigned,uint64_t,uint64_t,void (*)(void *,struct qc *,uint64_t),void *);
+struct terminal_case { struct hq *h;uint64_t expected;int failed; };
+static void terminal_case_done(void *user,struct qc *q,uint64_t error) {
+    struct terminal_case *test=user;test->h->qc=q;
+    if(error!=test->expected)test->failed=1;
+    on_stream_close(test->h,0,error);test->h->qc=NULL;
+}
+int hy2c_test_terminal_ex(int peer_fin,unsigned flags,uint64_t rx,uint64_t tx,uint64_t expected) {
+    struct hq h={0};struct hy2_flow f={0};struct terminal_case test={&h,expected,0};
+    h.state=S_UP;h.nflows=1;f.q=&h;f.sid=0;f.state=FL_OPEN;
+    list_add(&h,&f);sid_add(&h,&f);
+    if(peer_fin)on_stream_data(&h,0,NULL,0,1);
+    int result=qc_test_terminal(flags,rx,tx,terminal_case_done,&test);
+    int aborted=f.aborted;flow_release(&f,0);
+    return result||test.failed?-1:aborted;
+}
+int hy2c_test_terminal(int peer_fin,uint64_t error) {
+    struct hq h={0};struct hy2_flow f={0};
+    h.state=S_UP;h.nflows=1;f.q=&h;f.sid=0;f.state=FL_OPEN;
+    list_add(&h,&f);sid_add(&h,&f);
+    if(peer_fin)on_stream_data(&h,0,NULL,0,1);
+    on_stream_close(&h,0,error);
+    int aborted=f.aborted;
+    flow_release(&f,0);return aborted;
+}
+#endif
 static void on_datagram(void *u, const uint8_t *d, size_t n) {
     struct hq *h = u;
     struct hy2_udp_msg m;
@@ -1282,6 +1367,7 @@ static void teardown(struct hq *h, const char *why) {
         f->gone = 1;
         f->aborted = 1;
         f->rx_fin = 1;
+        if(f->ux) hy2_rasm_free(&f->ux->ras);
         act_del(h, f);
         stack_sess_rx(f);
     }
@@ -1291,6 +1377,11 @@ static void teardown(struct hq *h, const char *why) {
 }
 
 static void expire(struct hq *h, uint64_t now) {
+    if(now-h->rasm_at_ms>=1000) {
+        unsigned entries=0;h->rasm_at_ms=now;hy2_rasm_usage(&entries,NULL);
+        if(entries) for(struct hy2_flow *f=h->fl;f;f=f->nx)
+            if(f->ux) hy2_rasm_expire(&f->ux->ras,now);
+    }
     if (h->nopen && now - h->open_at_ms >= OPEN_TICK_MS) {
         h->open_at_ms = now;
         for (struct hy2_flow *f = h->fl, *nx; f; f = nx) {
@@ -1311,7 +1402,7 @@ static void expire(struct hq *h, uint64_t now) {
 static void act_run(struct hq *h) {
     for (struct hy2_flow *f = h->act, *nx; f; f = nx) {
         nx = f->anx;
-        if (f->up_n) flow_up_flush(f);
+        if (f->up_n || (f->tx_fin_requested&&!f->tx_fin_queued)) flow_up_flush(f);
         stack_sess_room(f);
         if (f->act && !f->up_n && (f->gone || f->sclosed || qc_stream_buffered(h->qc, f->sid) == 0))
             act_del(h, f);

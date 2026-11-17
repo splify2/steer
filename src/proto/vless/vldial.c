@@ -405,6 +405,7 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
                    const unsigned char *data, size_t n) {
     const struct vless_node *node = ctx;
     struct vl_sess *s = sess;
+    if(s->header_sent & 2u)return SEND_FATAL;
     /* Буфер нужен ТОЛЬКО чтобы приклеить заголовок или кадр Vision к данным одной записью.
      * Когда клеить нечего — а это обычный случай, потому что заголовок уходит один раз на
      * соединение, а Vision заканчивает набивку первым же кадром, — данные отдаются прямо из
@@ -490,7 +491,7 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     } else if (len) {
         /* Заголовок уже лежит в out — данные приклеиваем к нему. */
         if (len + n > sizeof(out)) return SEND_FATAL;
-        memcpy(out + len, data, n);
+        if (n) memcpy(out + len, data, n);
         len += n;
         body = out;
     } else {
@@ -555,9 +556,15 @@ static int vl_read(void *sess, unsigned char *buf, size_t cap, const unsigned ch
     if (s->utail) {
         /* Окно могло открыться тем, что мы сейчас прочтём; хвост — до чтения, чтобы порядок не менялся. */
         int tr = vl_tail_flush(s);
-        if (tr && tr != H2_EWINDOW) return tr;
+        if (tr && tr != H2_EWINDOW) {s->established|=4u;return tr;}
     }
-    return transport_read_zc(&s->t, buf, cap, data, got);
+    int rc=transport_read_zc(&s->t, buf, cap, data, got);
+    if(rc) {
+        int partial_vision=s->vis.rx_data_left||s->vis.rx_pad_left||s->vis.rx_hdr_n||
+            (!s->vis.recv_uuid_seen && !s->vis.recv_done && s->vis.rx_pre_n);
+        s->established |= transport_read_end(&s->t,rc)==1 && (s->established & 1u) && !partial_vision?2u:4u;
+    }
+    return rc;
 }
 
 /* Разобрать поток датаграмм от узла и отдать их клиенту.
@@ -631,7 +638,7 @@ static int udp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
     return 0;
 }
 
-static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char *rx, size_t got,
+static int vl_deliver_in(const void *ctx, void *sess, int udp, const unsigned char *rx, size_t got,
                       dialer_emit_fn emit, void *arg) {
     const struct vless_node *node = ctx;
     struct vl_sess *s = sess;
@@ -647,7 +654,7 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
     const unsigned char *cur = rx;
     size_t left = got;
 
-    if (!s->established) {
+    if (!(s->established & 1u)) {
         size_t skip = 0;
         int header = vless_response_feed(&s->response, cur, left, &skip);
         if (header == VLESS_EAGAIN) return 0;
@@ -729,11 +736,18 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
      * знает только этот код. */
     /* Под VLESS encryption прямого копирования не бывает: записи слоя шифрования остаются записями
      * до конца соединения (у Xray там CanSpliceCopy = 3, и сервер команду не шлёт). */
-    if (s->vis.recv_direct && !s->t.link.rx_direct && !s->t.enc) {
+    if (s->vis.recv_direct && s->vis.recv_done && !s->t.link.rx_direct && !s->t.enc) {
         transport_direct(&s->t);
         TR("сервер перешёл на прямое копирование — читаем сокет как есть\n");
     }
     return 0;
+}
+
+static int vl_deliver(const void *ctx,void *sess,int udp,const unsigned char *rx,size_t got,
+                      dialer_emit_fn emit,void *arg) {
+    int rc=vl_deliver_in(ctx,sess,udp,rx,got,emit,arg);
+    if(rc)((struct vl_sess *)sess)->established|=4u;
+    return rc;
 }
 
 /* ---- подъём ---------------------------------------------------------------------------- */
@@ -753,7 +767,7 @@ int vless_tunnel_run(const struct tun_out *o, const struct pool_cfg *pc,
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     /* Узлы соединений выбирает пул (src/tunnel/pool.c): активных может быть несколько, у каждого
      * соединения свой, и замена умершего — без перезапуска процесса. */
-    return pool_run(o, pc, ready, arg);
+    return pool_run_ex(o, pc, vless_flow_extensions(), ready, arg);
 }
 
 /* Что примет vl_send сейчас (dialer_ops.room): место у транспорта без того, что vl_send ставит
@@ -821,3 +835,29 @@ const struct dialer_ops vless_dialer = {
     .read = vl_read,
     .deliver = vl_deliver,
 };
+
+static int vl_can_halfclose(void *context,const void *dialer_ctx,const void *session) {
+    (void)context;const struct vless_node *node=dialer_ctx;
+    const struct vl_sess *s=session;
+    return !node->flow[0] && transport_can_halfclose(&s->t);
+}
+static int vl_shutdown_write(void *context,const void *dialer_ctx,void *session) {
+    (void)context;(void)dialer_ctx;struct vl_sess *s=session;
+    if(s->header_sent & 2u)return SEND_OK;
+    if(!(s->header_sent & 1u))return SEND_AGAIN;
+    if(s->utail)return SEND_AGAIN;
+    int rc=transport_shutdown_write(&s->t);
+    if(!rc)s->header_sent|=2u;
+    return rc;
+}
+static int vl_read_end(void *context,const void *session) {
+    (void)context;const struct vl_sess *s=session;
+    return s->established & 4u?STACK_FLOW_END_ERROR:s->established & 2u?STACK_FLOW_END_EOF:STACK_FLOW_END_UNKNOWN;
+}
+const struct stack_flow_extensions *vless_flow_extensions(void) {
+    static const struct stack_flow_extensions extensions={
+        .size=sizeof(struct stack_flow_extensions),.version=STACK_FLOW_EXT_VERSION,
+        .shutdown_write=vl_shutdown_write,.read_end=vl_read_end,.can_halfclose=vl_can_halfclose
+    };
+    return &extensions;
+}

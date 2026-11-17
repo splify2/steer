@@ -250,6 +250,13 @@ size_t qc_stream_buffered(const struct qc *q, int64_t sid);
 size_t qc_stream_room(const struct qc *q, int64_t sid);
 /* Отменить поток (RESET_STREAM и STOP_SENDING с кодом). */
 int  qc_stream_reset(struct qc *q, int64_t sid, uint64_t app_err);
+/* Scoped terminal metadata, available only inside the matching stream-close
+ * callback. Zero means unavailable; clean close returns AVAILABLE alone.
+ * Reset bits are authoritative even with application error code zero. */
+#define QC_STREAM_TERMINAL_AVAILABLE 1u
+#define QC_STREAM_RX_RESET 2u
+#define QC_STREAM_TX_RESET 4u
+unsigned qc_stream_terminal_flags(const struct qc *,int64_t sid);
 /* Stop only peer->local input while allowing a final protocol response/FIN. */
 #ifdef QC_WITH_ENDPOINT
 int  qc_stream_stop_receive(struct qc *q, int64_t sid, uint64_t app_err);
@@ -321,6 +328,14 @@ uint16_t qc_local_port(const struct qc *q);
  * Stream/datagram APIs are usable on accepted children; qc_run/on_readable are
  * endpoint operations instead. QUIC authentication is not application auth. */
 struct qc_endpoint;
+struct qc_server_tls;
+/* Bounded server TLS preparation can run on a fixed prepare worker. On
+ * success the fully configured context is immutable: hand it to the owner
+ * loop through a synchronized queue. Endpoint open retains one reference;
+ * callers release theirs after success/failure. No concurrent ctx mutation. */
+int qc_server_tls_create(const uint8_t *,size_t,const uint8_t *,size_t,struct qc_server_tls **);
+int qc_server_tls_retain(struct qc_server_tls *);
+void qc_server_tls_release(struct qc_server_tls *);
 struct qc_endpoint_ops {
     /* Invoked before the first packet is passed to ngtcp2. Fill callbacks and
      * user; return 0 to admit, nonzero to reject without consuming a slot. */
@@ -330,6 +345,7 @@ struct qc_endpoint_cfg {
     struct qc_srv_cfg server;
     unsigned max_connections; /* 1..64 */
     int flow_manual; /* caller returns stream credit after bounded downstream IO */
+    struct qc_server_tls *prepared_tls; /* optional validated immutable context */
 };
 int qc_endpoint_open(const struct qc_endpoint_cfg *, const struct qc_endpoint_ops *,
                      void *user, struct qc_endpoint **out);

@@ -11,6 +11,8 @@ OUT=$(CDPATH= cd -- "$OUT" && pwd)
 cd "$HERE"
 [ -r "$NGLIB.cflags" ] && [ -r "$WLIB.cflags" ]
 grep -q -- '-DSTEER_WOLFSSL_SERVER' "$WLIB.cflags" || { echo 'server-enabled wolfSSL archive required' >&2; exit 2; }
+grep -Eq -- '(^|[[:space:]])-DSTEER_WOLFSSL_POSIX_TIME_SAFE=1([[:space:]]|$)' "$WLIB.cflags" || { echo 'rebuilt POSIX time-safe server archive required' >&2; exit 2; }
+grep -q -- '-DWOLFSSL_VALIDATE_ECC_IMPORT' "$WLIB.cflags" || { echo 'validated server wolfSSL profile required' >&2; exit 2; }
 find src -type d -print | sed 's|.*|"-I&"|' > "$OUT/includes.rsp"
 NGFLAGS=$(cat "$NGLIB.cflags")
 WFLAGS=$(cat "$WLIB.cflags")
@@ -29,3 +31,7 @@ $CC $FLAGS $NGFLAGS $WFLAGS @"$OUT/includes.rsp" -Itests -DQC_WITH_SERVER \
     tests/qcbatch.c src/proto/quic/quic.c src/proto/quic/qcssl.c "$NGLIB" "$WLIB" -lpthread -lm -o "$OUT/qcbatch"
 "$OUT/qcloop"
 "$OUT/qcbatch"
+# Namespace-only wildcard family fixture; launch explicitly with unshare -n.
+# shellcheck disable=SC2086
+$CC $FLAGS $NGFLAGS $WFLAGS @"$OUT/includes.rsp" -Itests -DQC_WITH_ENDPOINT \
+    tests/qcendpoint_family.c src/proto/quic/quic.c src/proto/quic/qcssl.c "$NGLIB" "$WLIB" -lpthread -lm -o "$OUT/family"

@@ -58,6 +58,8 @@ void loop_fd_del(struct loop *l, int fd);
  * (в том числе из его же обратного вызова: так делается период). ms <= 0 — сработать при
  * ближайшем обороте цикла. loop_timer_free снимает и освобождает; вызывать можно откуда
  * угодно, включая обратный вызов этого же таймера. */
+/* Bounded due snapshots: rearmed/new timers wait for another loop turn, so
+ * zero-delay chains cannot monopolize descriptors or signals. */
 struct loop_timer *loop_timer_new(struct loop *l, loop_timer_cb cb, void *arg);
 void loop_timer_set(struct loop_timer *t, long ms);
 void loop_timer_stop(struct loop_timer *t);
@@ -76,6 +78,6 @@ int loop_child(struct loop *l, pid_t pid, loop_child_cb cb, void *arg);
 void loop_child_reset(void);
 
 /* Монотонное время в миллисекундах (CLOCK_MONOTONIC: не прыгает при переводе часов). */
-long loop_now_ms(void);
+int64_t loop_now_ms(void);
 
 #endif

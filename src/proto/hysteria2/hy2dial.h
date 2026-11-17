@@ -6,6 +6,8 @@
 
 struct tun_out;
 extern const struct dialer_ops hy2_dialer;
+struct stack_flow_extensions;
+const struct stack_flow_extensions *hy2_flow_extensions(void);
 
 /* Запустить соединение с узлом и стек TUN с дайлером hysteria2 (stack_run). ready — как у
  * stack_run: устройство поднято, модуль говорит об этом демону. Возвращает код выхода процесса,

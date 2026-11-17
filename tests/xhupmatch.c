@@ -49,6 +49,8 @@ size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap)
     { (void)t; (void)out; (void)cap; return 0; }
 int tls13_write(struct tls13 *t, const unsigned char *d, size_t n)
     { (void)t; (void)d; (void)n; return -1; }
+int tls13_flush(struct tls13 *t) { return outq_flush(t->fd, &t->oq); }
+int tls13_shutdown_write(struct tls13 *t) { (void)t; return 2; }
 int tls13_read(struct tls13 *t, unsigned char *o, size_t cap, size_t *got)
     { (void)t; (void)o; (void)cap; *got = 0; return -1; }
 int tls13_read_ref(struct tls13 *t, const unsigned char **b, size_t *bn)
@@ -412,6 +414,12 @@ static void t_aux(void) {
     int ro = up_request(&c, -1);
     srv_drain();
     check(ro == 0 && transport_aux_fd(&c) == fd, "stream-up: связь выгрузки названа для слежки");
+    close(g_srv); g_srv = -1;
+    int closed_aux=transport_aux_drain(&c),closed_error=c.xh.drain_err;
+    check(closed_aux != 0 && closed_error != 0,
+          "stream-up: закрытие aux сохраняет отказ для следующей отправки");
+    check(transport_write(&c, piece, sizeof(piece)) == closed_error,
+          "stream-up: следующая отправка получает сохранённый отказ aux");
     conn_init(&c, XH_STREAM_ONE, fd);
     check(transport_aux_fd(&c) == -1, "stream-one: второй связи нет");
     close(fd);
@@ -509,7 +517,16 @@ static void t_live_before_first_request(void) {
     close(fd);
 }
 
+static void t_authority_bounds(void) {
+    struct transport t;memset(&t,0,sizeof(t));
+    char authority[140];memset(authority,'a',sizeof(authority)-1);authority[sizeof(authority)-1]=0;
+    struct tr_node n={.host="127.0.0.1",.sni="",.http_host=authority,.path="/"};
+    check(xhttp_open(&t,&n,1)==H2_ETOOBIG,"xhttp: oversized authority rejected before IO");
+    n.http_host=NULL;n.host=authority;authority[0]=':';
+    check(xhttp_open(&t,&n,1)==H2_ETOOBIG,"xhttp: oversized bracketed authority rejected before IO");
+}
 int main(void) {
+    t_authority_bounds();
     t_live_before_first_request();
     t_packet_up_goaway();
     t_aux();

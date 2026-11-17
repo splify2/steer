@@ -76,10 +76,27 @@ case "$ASM:$TRIPLE" in
 esac
 
 DEFS="-DWOLFSSL_USER_SETTINGS $ASMDEF ${STEER_WOLFSSL_DEFS:-}"
+# In pinned5.9.4 wc_ecc_check_key only checks private/public correspondence
+# with this option. Server certificate/key validation must not accept a valid
+# scalar paired with an unrelated valid public point. Keep client profile lean.
+case " ${STEER_WOLFSSL_DEFS:-} " in
+    *"-DSTEER_WOLFSSL_SERVER"*) DEFS="$DEFS -DWOLFSSL_VALIDATE_ECC_IMPORT" ;;
+esac
+# Record the effective archive profile, not a consumer's later header. Old
+# archives/sidecars intentionally lack this marker and must be rebuilt. Probe
+# with the same target/compiler/flags before stamping and compiling any object.
+MACROS=$(printf '%s\n' '#include <wolfssl/wolfcrypt/wc_port.h>' | \
+    $CC $CFLAGS $DEFS -I"$HERE" -I"$SRC" -dM -E -x c -)
+if printf '%s\n' "$MACROS" | grep -Eq '^#define (__linux__|__APPLE__) ' && \
+   ! printf '%s\n' "$MACROS" | grep -q '^#define _WIN32' && \
+   printf '%s\n' "$MACROS" | grep -q '^#define HAVE_GMTIME_R' && \
+   printf '%s\n' "$MACROS" | grep -q '^#define XGMTIME.*gmtime_r'; then
+    DEFS="$DEFS -DSTEER_WOLFSSL_POSIX_TIME_SAFE=1"
+fi
 OBJ="$OUT.obj"
 # Отпечаток сборки: опции, флаги, компилятор. Архив с тем же отпечатком не пересобирается — у
 # одиннадцати архитектур это минуты, — а любая правка user_settings.h или флагов пересобирает его.
-STAMP="$(cat "$HERE/user_settings.h" "$0"; echo "$CC|$CFLAGS|$DEFS|$TRIPLE")"
+STAMP="$(cat "$HERE/user_settings.h" "$HERE/steer_init.c" "$HERE/steer_init.h" "$0"; echo "$CC|$CFLAGS|$DEFS|$TRIPLE")"
 if [ -f "$OUT" ] && [ -f "$OUT.stamp" ] && [ "$(cat "$OUT.stamp")" = "$STAMP" ]; then
     exit 0
 fi
@@ -110,6 +127,7 @@ for f in $(wolfssl_c_files) $ASMFILES; do
     fi
     rm -f "$o.err"
 done
+$CC $CFLAGS $DEFS -I"$HERE" -I"$SRC" -c "$HERE/steer_init.c" -o "$OBJ/steer_init.o"
 [ -z "$failed" ] || { echo "wolfssl: сборка не удалась у файлов:$failed" >&2; exit 1; }
 
 rm -f "$OUT"

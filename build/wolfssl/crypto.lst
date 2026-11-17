@@ -16,3 +16,5 @@
 # (S2P_NET_VERSION, plugins/net1/plugin.json, строка build/net1/abi.lst) — индекс не примет другой архив под
 # прежним номером.
 1.0 5.9.4 1.25.0-2 1d2839115991c52b e7dccfb99110bda0 12437f35b0ddf2af 582bd53544c77de0
+1.1 5.9.4 1.25.0-2 1d2839115991c52b 76700325d5ad27c0 12437f35b0ddf2af 582bd53544c77de0
+2.0 5.9.4 1.25.0-2 996b05e56dbeb6a1 76700325d5ad27c0 12437f35b0ddf2af dbe5b59467e60f63

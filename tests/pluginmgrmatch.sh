@@ -19,6 +19,8 @@
 set -u
 BUILD=${BUILD:-build}
 CC=${CC:-cc}
+PM_EXPECT_CRYPTO=${PM_EXPECT_CRYPTO:-$(tr -d '\r' < src/cli/cli.h | sed -n 's/^#define CLI_STEER_CRYPTO "\(.*\)"$/\1/p')}
+[ -n "$PM_EXPECT_CRYPTO" ] || { echo "pluginmgrmatch: current crypto axis unavailable"; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "pluginmgrmatch: python3 нет — ПРОПУСК"; exit 0; }
 S2P="${S2P:-}"
 if [ -z "$S2P" ]; then
@@ -160,8 +162,72 @@ export STEER_SOCKET="$T/none.sock" STEER_PLUGIN_SPEC="$T/spec.yaml" STEER_PLUGIN
 export STEER_PLUGIN_AUTO=0
 P() { "$BIN" plugin "$@"; }
 
+crypto_boundary_regression() {
+# Compatibility must reject the old init protocol before installing/loading it.
+before=""; [ ! -f root/cry/plugin.json ] || before="$(jq_ 'd["version"]' < root/cry/plugin.json)"
+mk cry 3.0.0 ''
+mk cry 4.0.0 ''
+sed -i 's/"steer-api":"\^1.0"/"steer-api":"^1.0","steer-crypto":"^1.0"/' src/cry-3.0.0/plugin.json
+sed -i 's/"steer-api":"\^1.0"/"steer-api":"^1.0","steer-crypto":"^2.0"/' src/cry-4.0.0/plugin.json
+build src/cry-3.0.0 proto.sec
+build src/cry-4.0.0 proto.sec
+index
+P search --json >/dev/null 2>&1
+o="$(P install cry 3.0.0 --json 2>/dev/null)"; rc=$?
+check "crypto boundary: old ^1.x package rejected before install" "1" "$rc"
+has "crypto boundary: error identifies old protocol and current axis" "требует steer-crypto ^1.0, у ядра $PM_EXPECT_CRYPTO" "$o"
+o="$(P install cry 4.0.0 --json 2>/dev/null)"; rc=$?
+check "crypto boundary: new ^2.x package accepted" "0 4.0.0" "$rc $(printf '%s\n' "$o" | jq_ 'd["version"]')"
+P remove cry --json >/dev/null 2>&1
+rm -rf repo/cry/3.0.0 repo/cry/4.0.0
+rm -f dist/cry-3.0.0-all.s2p dist/cry-4.0.0-all.s2p
+index
+P search --json >/dev/null 2>&1
+[ -z "$before" ] || P install cry "$before" --json >/dev/null 2>&1
+}
+if [ "${PM_CRYPTO_ONLY:-0}" = 1 ]; then
+    crypto_boundary_regression
+    printf "crypto-boundary: %s passed, %s failed\n" "$pass" "$fail"
+    [ "$fail" = 0 ]; exit $?
+fi
+
+package_floor_regression() {
+# Package version and ABI number are separate. ABI1.5 first appears in package
+# 1.6.0; an already installed package1.5.0 must not satisfy its new consumers.
+export STEER_SOCKET="$T/none.sock"
+python3 - meta.json <<'PY'
+import json,sys
+p=sys.argv[1];d=json.load(open(p))
+for name in ("n1floor","flowfloor"): d["plugins"][name]={"key_role":"protocols"}
+json.dump(d,open(p,"w"))
+PY
+mk n1floor 1.5.0 ''
+mk flowfloor 1.0.0 ',"requires":{"plugins":{"n1floor":"^1.6.0"}}'
+build src/n1floor-1.5.0 proto.sec
+build src/flowfloor-1.0.0 proto.sec
+index
+P search --json >/dev/null 2>&1
+P install n1floor 1.5.0 --json >/dev/null 2>&1
+o="$(P install flowfloor --json 2>err.txt)"; rc=$?
+check "package floor: installed1.5.0 cannot satisfy API first provided by package1.6.0" "1 1.5.0 no" \
+    "$rc $(jq_ 'd["version"]' < root/n1floor/plugin.json) $([ -d root/flowfloor ] && echo yes || echo no)"
+mk n1floor 1.6.0 ''
+build src/n1floor-1.6.0 proto.sec
+index
+P search --json >/dev/null 2>&1
+o="$(P install flowfloor --json 2>err.txt)"; rc=$?
+check "package floor: planner upgrades old dependency before its new consumer" "0 1.6.0 n1floor,flowfloor" \
+    "$rc $(jq_ 'd["version"]' < root/n1floor/plugin.json) $(printf '%s\n' "$o" | jq_ '",".join(x["id"] for x in d["installed"])')"
+
+}
+if [ "${PM_FLOOR_ONLY:-0}" = 1 ]; then
+    package_floor_regression
+    printf "package-floor: %s passed, %s failed\n" "$pass" "$fail"
+    [ "$fail" = 0 ]; exit $?
+fi
+
 # ---- версия ядра для оси compat ----
-check "steer version --json: core, api, abi, crypto" "2.1.0 1.5 1.0 1.0" \
+check "steer version --json: core, api, abi, crypto" "${PM_EXPECT_CORE:-2.1.0} 1.5 1.0 $PM_EXPECT_CRYPTO" \
     "$("$BIN" version --json | jq_ 'd["core"]+" "+d["api"]+" "+d["abi"]+" "+d["crypto"]')"
 
 # ---- каталог ----
@@ -203,7 +269,7 @@ o="$(P install cry --json 2>/dev/null)"
 check "install cry: взята 1.0.0 (2.0.0 требует библиотеки ядра steer-crypto ^9)" "1.0.0" "$(printf '%s\n' "$o" | jq_ 'd["version"]')"
 o="$(P install cry 2.0.0 --json 2>/dev/null)"; rc=$?
 check "install cry 2.0.0: отказ" "1" "$rc"
-has "  причина: ось и обе версии" "требует steer-crypto ^9.0, у ядра 1.0" "$o"
+has "  причина: ось и обе версии" "требует steer-crypto ^9.0, у ядра $PM_EXPECT_CRYPTO" "$o"
 o="$(STEER_PLUGIN_CRYPTO= P install cry 2.0.0 --json 2>/dev/null)"
 has "  ядро без библиотек (статическая сборка): «нет»" "требует steer-crypto ^9.0, у ядра нет" "$o"
 
@@ -1006,6 +1072,11 @@ E
 else
     echo "pluginmgrmatch: блок с демоном ПРОПУЩЕН — нужен root и unshare (сеть демона и reload)"
 fi
+
+package_floor_regression
+# Terminal fixture: installing newer signed cry versions intentionally changes
+# manager history; do not let that history affect unrelated update-window tests.
+crypto_boundary_regression
 
 printf '\npluginmgrmatch: %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

@@ -23,6 +23,7 @@
 #include <wolfssl/wolfcrypt/settings.h>
 #include <wolfssl/version.h>
 #include <wolfssl/ssl.h>
+#include "steer_init.h"
 #include <wolfssl/wolfcrypt/sha256.h>
 #include <wolfssl/wolfcrypt/sha512.h>
 #include <wolfssl/wolfcrypt/sha.h>
@@ -960,15 +961,11 @@ __attribute__((constructor)) static void sc_abi_check(void) {
     }
 }
 
-static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
-static int g_init_rc = -1;
-static void lib_init(void) { g_init_rc = wolfSSL_Init() == WOLFSSL_SUCCESS ? 0 : -1; }
 
 int sc_roots_load(struct sc_roots **out, const unsigned char *pem, size_t n) {
     *out = NULL;
     if (!pem || !n || n > INT32_MAX) return SC_EINVAL;
-    pthread_once(&g_init_once, lib_init);
-    if (g_init_rc != 0) return SC_ECRYPTO;
+    if (wolfSSL_steer_init() != 0) return SC_ECRYPTO;
     struct sc_roots *r = calloc(1, sizeof(*r));
     if (!r) return SC_ENOMEM;
     r->store = wolfSSL_X509_STORE_new();
@@ -991,8 +988,7 @@ int sc_roots_load(struct sc_roots **out, const unsigned char *pem, size_t n) {
 int sc_roots_load_der(struct sc_roots **out, const unsigned char *der, size_t n) {
     *out = NULL;
     if (!der || !n || n > INT32_MAX) return SC_EINVAL;
-    pthread_once(&g_init_once, lib_init);
-    if (g_init_rc != 0) return SC_ECRYPTO;
+    if (wolfSSL_steer_init() != 0) return SC_ECRYPTO;
     struct sc_roots *r = calloc(1, sizeof(*r));
     if (!r) return SC_ENOMEM;
     r->store = wolfSSL_X509_STORE_new();

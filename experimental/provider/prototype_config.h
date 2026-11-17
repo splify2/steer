@@ -7,9 +7,11 @@
 #define STEER_PROTOTYPE_MAX_RULES 128u
 #define STEER_PROTOTYPE_SOCKS 1u
 #define STEER_PROTOTYPE_VLESS 2u
+#define STEER_PROTOTYPE_HYSTERIA2 3u
 #define STEER_PROTOTYPE_AUTH_NONE 0u
 #define STEER_PROTOTYPE_AUTH_USERPASS 1u
 #define STEER_PROTOTYPE_AUTH_UUID 2u
+#define STEER_PROTOTYPE_AUTH_PASSWORD 3u
 struct steer_prototype_listener {
     char id[65], address[46];
     uint16_t port;
@@ -17,6 +19,7 @@ struct steer_prototype_listener {
     uint32_t enabled;
     char label[129];
     char principal_id[65], username_ref[100], password_ref[100], uuid_ref[100];
+    char certificate_ref[100],private_key_ref[100]; /* env refs to PEM/DER file paths */
 };
 struct steer_prototype_config {
     uint64_t generation;

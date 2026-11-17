@@ -119,6 +119,13 @@ size_t vision_wrap(struct vision *v, const unsigned char *data, size_t n,
  * Сервер отвечает такими же кадрами, пока не пришлёт `end`; после него поток чистый.
  * Состояние держится в структуре, потому что кадр может прийти не целиком за одно чтение —
  * TLS-запись и кадр Vision это разные границы, и совпадать они не обязаны. */
+static void frame_complete(struct vision *v) {
+    if (v->rx_end_after && !v->rx_data_left && !v->rx_pad_left) {
+        v->recv_done = 1;
+        if (v->rx_end_after == VISION_CMD_DIRECT) v->recv_direct = 1;
+    }
+}
+
 int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
                   size_t *consumed, const unsigned char **payload, size_t *payload_n) {
     *consumed = 0;
@@ -190,7 +197,7 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
         v->rx_data_left -= (uint32_t)take;
         i += take;
         *consumed += i;
-        if (!v->rx_data_left && !v->rx_pad_left && v->rx_end_after) v->recv_done = 1;
+        frame_complete(v);
         return 0;
     }
 
@@ -200,7 +207,7 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
         v->rx_pad_left -= (uint32_t)take;
         i += take;
         *consumed += i;
-        if (!v->rx_pad_left && v->rx_end_after) v->recv_done = 1;
+        frame_complete(v);
         return 0;
     }
 
@@ -213,17 +220,19 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
     if (cmd > VISION_CMD_DIRECT) return VISION_EPROTO;
     v->rx_data_left = ((uint32_t)v->rx_hdr[1] << 8) | v->rx_hdr[2];
     v->rx_pad_left = ((uint32_t)v->rx_hdr[3] << 8) | v->rx_hdr[4];
-    v->rx_end_after = (cmd == VISION_CMD_END || cmd == VISION_CMD_DIRECT);
+    v->rx_end_after = cmd;
     /* direct — не «end с другим номером». Сервер сообщает, что дальше пишет в сокет поток
      * целевого соединения БЕЗ своего TLS, и читать его надо в обход расшифровки. Считать
      * это концом набивки и продолжать разбирать записи — значит принимать чужие записи за
      * свои: длины выходят бессмысленные, AEAD не сходится, и соединение умирает посреди
      * передачи. Именно так и ломался любой https через узел с Vision, причём место обрыва
      * каждый раз было другим — оно зависит от того, когда сервер разглядел TLS внутри. */
-    if (cmd == VISION_CMD_DIRECT) v->recv_direct = 1;
+    /* Команда ещё не граница TLS: остаток payload/padding этого кадра может
+     * находиться в следующих внешних записях. Только frame_complete включает
+     * recv_direct, когда все эти записи уже расшифрованы. */
     v->rx_hdr_n = 0;
     /* Кадр без данных и без набивки: сервер так закрывает набивку. */
-    if (!v->rx_data_left && !v->rx_pad_left && v->rx_end_after) v->recv_done = 1;
+    frame_complete(v);
     return 0;
 }
 

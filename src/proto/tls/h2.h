@@ -20,6 +20,8 @@ struct h2_io {
 };
 
 #define H2_OPEN_MAX 16
+#define H2_GRPC_STATUS_OK 16u
+#define H2_GRPC_STATUS_ERROR 32u
 
 /* Состояние держится МАЛЕНЬКИМ сознательно: по одному такому на соединение VLESS, а их
  * до 64. Буфера на кадр здесь нет — записи читаются в общий буфер, а через вызовы
@@ -28,15 +30,15 @@ struct h2_io {
 struct h2 {
     struct h2_io io;
     int started;
-    int status;                 /* 200, 0 = ещё не знаем, -1 = не смогли разобрать */
-    int done;                   /* END_STREAM от сервера */
+    int status;                 /* validated HTTP status,0 until complete */
+    int done;                   /* 1 END_STREAM received,2 terminal error (both truthy) */
     /* Отказ сервера на ПРЕЖНЕМ потоке этого соединения: код не-200 из HEADERS потока, который
      * уже не текущий. Так бывает только у packet-up — ответ на кусок приходит, когда открыт
      * следующий, — и без этого поля отказ терялся: кадр «не наш» и не разбирался (I-219).
      * h2_next его НЕ сбрасывает: отказанный кусок уже потерян, и поток VLESS за ним цел
      * не будет. 0 — отказа не видели. */
     int old_status;
-    unsigned char frame_peeked; /* статус из этого кадра HEADERS уже спрошен */
+    unsigned char frame_peeked; /* private header-block phase + validated gRPC trailer flags */
 
     /* Обрывок заголовка кадра, не поместившийся в прошлую запись. */
     unsigned char pend[9];

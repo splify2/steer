@@ -64,6 +64,8 @@ struct pool_cfg {
  * устройство поднято, и ready модуля после неё (может быть NULL). Код выхода процесса — как у
  * stack_run. */
 int pool_run(const struct tun_out *o, const struct pool_cfg *pc, stack_ready_fn ready, void *arg);
+int pool_run_ex(const struct tun_out *, const struct pool_cfg *,
+                const struct stack_flow_extensions *, stack_ready_fn, void *);
 /* Файл состояния пула для status. Помощник плагина пишет <state>/plugin/<id>/<выход>.status.json и
  * говорит ядру событием state (steer-api.md, 2.2); не задан — <каталог состояния>/<tag>-<выход>, как в 2.0. */
 void pool_set_status_path(const char *path);

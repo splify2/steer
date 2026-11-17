@@ -104,3 +104,41 @@ capability inventory → adapters from ready IR to the existing generation/store
 transaction → groups/health, routed DNS, datagram/device and platform capture →
 full reference plus unrelated end-to-end topologies. No active router/server
 network defaults change during compiler validation.
+
+## Source-only executor checkpoint
+
+`experimental/spec/execution` prepares typed construction dependencies on a
+worker and binds each owner in bounded steps. Factory guards span foreign calls
+and reverse cleanup; failed preparation or partial binding cannot publish a
+partial generation. Rule decisions remain ordered separately from construction.
+
+The native execution fixture routes real TCP and UDP through ordered rules,
+holds old origin references across failed replacement preparation/partial bind
+and a new blocked generation, and verifies their exact payload after retirement.
+It runs one and four independent owners with sanitizer gates. Its worker joins
+are a fixture synchronization shortcut, not the final host's async apply path.
+The prototype control/apply entry still needs the shared bounded host worker and
+transaction coordinator before this module becomes a deployed v3 executor.
+Devices remain rejected until durable intent authorizes their fallible effects;
+memory-only publication does not perform kernel or file operations.
+
+The shared source-only worker and async preparation adapter now cover queued
+success followed by cancellation before owner handoff, and discard on another
+fixed worker after synchronized transfer. The returned cancelled execution is
+retired before callback delivery; cleanup ownership is still returned. Journal
+primitives preserve immutable intent/outcome/reconcile records and report
+post-rename uncertainty, with bounded validated restart scans and owned orphan
+temporary reporting. They are not yet a device authorization coordinator:
+persisted teardown reservations, config-commit reconciliation and host v3
+apply/admission integration remain required.
+
+The bounded ownership ledger now retains durable cleanup/reconcile credits for
+ACTIVE and uncertain resources. Operation intents reference an exact provider/
+instance anchor across transactions; fresh grants consume physical space too.
+Only a current-operation fact proving RETIRED releases unused credits. Whole
+restart validation rejects missing/cross-provider anchors, duplicate grants and
+stale historical reconciliation. Exhaustion refuses new effects while preserving
+ownership; safe history compaction remains pending. Normal `make test` includes
+the reservation regressions. The mandatory device authority interface matches
+one exact transaction and intent sequence; its production cache/coordinator is
+still unavailable, so this ledger does not yet enable a kernel device factory.

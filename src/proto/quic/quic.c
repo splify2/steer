@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +97,7 @@ struct qc_stream {
     int       fin_req;      /* потребитель закрыл передачу */
     int       fin_sent;
     int       blocked;      /* ngtcp2 отказала по окну потока: ждём extend_max_stream_data */
+    int       write_failed; /* peer stopped/reset the accepted send direction */
 };
 
 struct qc_dg {
@@ -109,7 +111,7 @@ struct qc_rx {
     struct mmsghdr mm[QC_RX_BATCH];
     struct iovec iov[QC_RX_BATCH];
     struct sockaddr_storage from[QC_RX_BATCH];
-    union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr a; } ctl[QC_RX_BATCH];    /* UDP_GRO: размер сегмента */
+    struct { _Alignas(struct cmsghdr) char b[CMSG_SPACE(sizeof(int))]; } ctl[QC_RX_BATCH]; /* UDP_GRO */
 };
 
 struct qc {
@@ -150,6 +152,8 @@ struct qc {
     int       hs_done;
     int       closed;           /* on_closed уже вызвано */
     int       in_cb;            /* внутри колбэка потребителя: qc_free запрещён */
+    int64_t terminal_stream;
+    unsigned terminal_flags;
     int       brutal;
     int       flow_manual;      /* окна приёма продлевает потребитель (qc_stream_consumed) */
     int       credit_dirty;     /* окна продлены, а пакет с их обновлением ещё не уходил (qc_flush_credit) */
@@ -461,6 +465,9 @@ static int recv_stream_data_cb(ngtcp2_conn *conn, uint32_t flags, int64_t sid, u
     if (q->endpoint && (!q->hs_done || (flags & NGTCP2_STREAM_DATA_FLAG_0RTT))) return NGTCP2_ERR_CALLBACK_FAILURE;
 #endif
     (void)offset; (void)sud;
+    /* Track peer-created streams before application callbacks can reply. This
+     * also distinguishes a live peer stream from a stale application handle. */
+    if (!stream_get(q,sid)) return NGTCP2_ERR_CALLBACK_FAILURE;
     if (q->ops.on_stream_data) {
         q->in_cb++;
         q->ops.on_stream_data(q->user, sid, data, datalen, (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0);
@@ -512,17 +519,58 @@ static int acked_stream_data_offset_cb(ngtcp2_conn *conn, int64_t sid, uint64_t 
 static int stream_close_cb(ngtcp2_conn *conn, uint32_t flags, int64_t sid, uint64_t rx_err,
                            uint64_t tx_err, void *ud, void *sud) {
     struct qc *q = ud;
-    (void)conn; (void)sud; (void)tx_err;
-    uint64_t err = (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET) ? rx_err : 0;
+    (void)sud;
+    uint64_t err = (flags & NGTCP2_STREAM_CLOSE2_FLAG_RX_APP_ERROR_CODE_SET)&&rx_err ? rx_err :
+        (flags & NGTCP2_STREAM_CLOSE2_FLAG_TX_APP_ERROR_CODE_SET) ? tx_err : 0;
     struct qc_stream *s = stream_find(q, sid);
     if (s) stream_drop(q, s);
     if (q->ops.on_stream_close) {
+        int64_t previous_stream=q->terminal_stream;unsigned previous_flags=q->terminal_flags;
+        q->terminal_stream=sid;q->terminal_flags=QC_STREAM_TERMINAL_AVAILABLE;
+        if(flags&NGTCP2_STREAM_CLOSE2_FLAG_RX_APP_ERROR_CODE_SET)q->terminal_flags|=QC_STREAM_RX_RESET;
+        if(flags&NGTCP2_STREAM_CLOSE2_FLAG_TX_APP_ERROR_CODE_SET)q->terminal_flags|=QC_STREAM_TX_RESET;
         q->in_cb++;
         q->ops.on_stream_close(q->user, sid, err);
         q->in_cb--;
+        q->terminal_stream=previous_stream;q->terminal_flags=previous_flags;
+    }
+    /* ngtcp2 does not replenish explicitly admitted peer streams on close.
+     * Return exactly one slot only after the entire transport stream closes;
+     * local streams consume the peer's limit, not ours. */
+    if((sid&1)!=(q->server?1:0)) {
+        if(sid&2)ngtcp2_conn_extend_max_streams_uni(conn,1);
+        else ngtcp2_conn_extend_max_streams_bidi(conn,1);
     }
     return 0;
 }
+unsigned qc_stream_terminal_flags(const struct qc *q,int64_t sid) {
+    return q&&q->terminal_stream==sid?q->terminal_flags:0;
+}
+#ifdef STEER_HY2_RESPONSE_TEST
+struct terminal_test { struct qc *q;void (*done)(void *,struct qc *,uint64_t);void *user;int nested,failed; };
+static void terminal_test_close(void *user,int64_t sid,uint64_t error) {
+    struct terminal_test *t=user;unsigned flags=qc_stream_terminal_flags(t->q,sid);
+    if(!(flags&QC_STREAM_TERMINAL_AVAILABLE))t->failed=1;
+    if(t->nested) {
+        if(flags!=(QC_STREAM_TERMINAL_AVAILABLE|QC_STREAM_TX_RESET)||qc_stream_terminal_flags(t->q,0))t->failed=1;
+        return;
+    }
+    if(qc_stream_terminal_flags(t->q,4))t->failed=1;
+    t->nested=1;
+    (void)stream_close_cb(NULL,NGTCP2_STREAM_CLOSE2_FLAG_TX_APP_ERROR_CODE_SET,4,0,3,t->q,NULL);
+    t->nested=0;
+    if(qc_stream_terminal_flags(t->q,sid)!=flags)t->failed=1;
+    t->done(t->user,t->q,error);
+}
+int qc_test_terminal(unsigned flags,uint64_t rx,uint64_t tx,void (*done)(void *,struct qc *,uint64_t),void *user) {
+    struct qc q={0};struct terminal_test t={.q=&q,.done=done,.user=user};uint32_t ngflags=0;
+    q.ops.on_stream_close=terminal_test_close;q.user=&t;
+    if(flags&QC_STREAM_RX_RESET)ngflags|=NGTCP2_STREAM_CLOSE2_FLAG_RX_APP_ERROR_CODE_SET;
+    if(flags&QC_STREAM_TX_RESET)ngflags|=NGTCP2_STREAM_CLOSE2_FLAG_TX_APP_ERROR_CODE_SET;
+    (void)stream_close_cb(NULL,ngflags,0,rx,tx,&q,NULL);
+    return t.failed||qc_stream_terminal_flags(&q,0)?-1:0;
+}
+#endif
 
 static int extend_max_stream_data_cb(ngtcp2_conn *conn, int64_t sid, uint64_t max, void *ud, void *sud) {
     struct qc *q = ud;
@@ -814,7 +862,7 @@ static ngtcp2_ssize write_pkt_cb(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pk
         nw = ngtcp2_conn_writev_stream(conn, path, pi, dest, destlen, &dl, flags, s->id, v, nv, ts);
         if (nw < 0) {
             if (nw == NGTCP2_ERR_STREAM_DATA_BLOCKED) { s->blocked = 1; continue; }
-            if (nw == NGTCP2_ERR_STREAM_SHUT_WR) { s->fin_sent = 1; s->sent = s->total; continue; }
+            if (nw == NGTCP2_ERR_STREAM_SHUT_WR) { s->write_failed=1;s->fin_sent = 1; s->sent = s->total; continue; }
             return nw;
         }
         if (dl >= 0) {
@@ -1463,8 +1511,15 @@ int qc_stream_open_uni(struct qc *q, int64_t *sid) {
 
 ssize_t qc_stream_send(struct qc *q, int64_t sid, const uint8_t *d, size_t n, int fin) {
     if (!q || q->closed) return QC_ECLOSED;
-    struct qc_stream *s = stream_get(q, sid);
-    if (!s) return QC_ENOMEM;
+    if (sid < 0 || (n && !d)) return QC_EINVAL;
+    struct qc_stream *s = stream_find(q, sid);
+    /* Locally initiated streams must have been opened through qc_stream_open*.
+     * Recreating a retired stream would feed STREAM_NOT_FOUND into flush and
+     * turn a stale application handle into a connection-wide failure. Peer
+     * streams are registered by recv_stream_data_cb before the callback. */
+    if (!s) return QC_ENOSTREAM;
+    if (s->write_failed) return QC_ENOSTREAM;
+    if ((sid & 2) && (sid & 1) != (q->server ? 1 : 0)) return QC_ENOSTREAM;
     if (s->fin_req) return QC_EINVAL;       /* передача уже закрыта */
     size_t used = (size_t)(s->total - s->acked);
     size_t room = used < q->send_buf ? q->send_buf - used : 0;
@@ -1473,6 +1528,7 @@ ssize_t qc_stream_send(struct qc *q, int64_t sid, const uint8_t *d, size_t n, in
     if (fin && take == n) s->fin_req = 1;
     int rv = flush(q);
     if (rv != 0 && rv != QC_ECLOSED) fail_close(q, rv);
+    if(s->write_failed)return QC_ENOSTREAM;
     return (ssize_t)take;
 }
 
@@ -1519,7 +1575,10 @@ size_t qc_datagram_max(const struct qc *q) {
     /* Размер пути, а не потолок настроек: пакет больше пути ngtcp2 не собирает (до разведки PMTU —
      * 1200), и датаграмма по потолку застревала бы в очереди навсегда (I-480). */
     size_t udp = ngtcp2_conn_get_path_max_tx_udp_payload_size2(q->conn);
-    size_t over = 1 + QC_CID_LEN + 4 + 16 + 3;
+    /* The destination CID belongs to the peer and need not have our local
+     * QC_CID_LEN. Reserve the protocol maximum (20), including after CID
+     * rotation. This conservative cap needs no dependency ABI extension. */
+    size_t over = 1 + NGTCP2_MAX_CIDLEN + 4 + 16 + 3;
     size_t cap = udp > over ? udp - over : 0;
     size_t peer = rp->max_datagram_frame_size > 3 ? (size_t)rp->max_datagram_frame_size - 3 : 0;
     return cap < peer ? cap : peer;
@@ -1582,6 +1641,26 @@ void qc_free(struct qc *q) {
 #ifdef QC_WITH_ENDPOINT
 #define QC_EP_CONNECTIONS 64
 #define QC_EP_CIDS 8
+struct qc_server_tls { void *ctx;unsigned references; };
+int qc_server_tls_create(const uint8_t *certificate,size_t certificate_length,const uint8_t *key,size_t key_length,struct qc_server_tls **out) {
+    if(!out)return QC_EINVAL;
+    *out=NULL;
+    if(!certificate||!certificate_length||certificate_length>1048576||!key||!key_length||key_length>65536)return QC_EINVAL;
+    struct qc_server_tls *tls=calloc(1,sizeof *tls);if(!tls)return QC_ENOMEM;
+    tls->ctx=qcssl_ctx_server(certificate,certificate_length,key,key_length);
+    if(!tls->ctx) { free(tls);return QC_ETLS; }
+    tls->references=1;*out=tls;return 0;
+}
+int qc_server_tls_retain(struct qc_server_tls *tls) {
+    if(!tls)return QC_EINVAL;
+    unsigned old=__atomic_load_n(&tls->references,__ATOMIC_RELAXED);
+    do { if(!old||old==UINT_MAX)return QC_EINVAL; }
+    while(!__atomic_compare_exchange_n(&tls->references,&old,old+1,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED));
+    return 0;
+}
+void qc_server_tls_release(struct qc_server_tls *tls) {
+    if(tls&&__atomic_sub_fetch(&tls->references,1,__ATOMIC_ACQ_REL)==0) { qcssl_ctx_free(tls->ctx);free(tls); }
+}
 struct endpoint_child {
     struct qc *q;
     ngtcp2_cid cid[QC_EP_CIDS];
@@ -1592,6 +1671,7 @@ struct qc_endpoint {
     int flow_manual;
     unsigned maximum;
     void *ctx, *user;
+    struct qc_server_tls *tls;
     struct qc_endpoint_ops ops;
     struct qc_srv_cfg cfg;
     char alpn[32];
@@ -1683,7 +1763,7 @@ int qc_endpoint_open(const struct qc_endpoint_cfg *cfg,const struct qc_endpoint_
     *out=NULL;
     if(!cfg||!ops||!ops->on_connection||!cfg->max_connections||cfg->max_connections>QC_EP_CONNECTIONS||
        !cfg->server.bind_host||!cfg->server.alpn||!cfg->server.alpn[0]||strlen(cfg->server.alpn)>=32||
-       !cfg->server.cert_der||!cfg->server.cert_n||!cfg->server.key_der||!cfg->server.key_n||
+       (!cfg->prepared_tls&&(!cfg->server.cert_der||!cfg->server.cert_n||!cfg->server.key_der||!cfg->server.key_n))||
        cfg->server.send_buf>16u*1024*1024||cfg->server.max_data>64u*1024*1024||
        cfg->server.max_stream_data>8u*1024*1024||cfg->server.max_streams>256||
        cfg->server.datagram_max>65535) return QC_EINVAL;
@@ -1691,11 +1771,23 @@ int qc_endpoint_open(const struct qc_endpoint_cfg *cfg,const struct qc_endpoint_
     ep->fd=-1; ep->maximum=cfg->max_connections; ep->ops=*ops; ep->user=user;ep->flow_manual=cfg->flow_manual!=0;
     ep->cfg=cfg->server; snprintf(ep->alpn,sizeof ep->alpn,"%s",cfg->server.alpn); ep->cfg.alpn=ep->alpn;
     if(addr_parse(cfg->server.bind_host,cfg->server.port,&ep->local,&ep->local_length)) { result=QC_EINVAL; goto fail; }
-    ep->ctx=qcssl_ctx_server(cfg->server.cert_der,cfg->server.cert_n,cfg->server.key_der,cfg->server.key_n);
-    if(!ep->ctx) { result=QC_ETLS; goto fail; }
+    if(cfg->prepared_tls) {
+        result=qc_server_tls_retain(cfg->prepared_tls);if(result)goto fail;
+        ep->tls=cfg->prepared_tls;
+    } else {
+        result=qc_server_tls_create(cfg->server.cert_der,cfg->server.cert_n,cfg->server.key_der,cfg->server.key_n,&ep->tls);
+        if(result)goto fail;
+    }
+    ep->ctx=ep->tls->ctx;
+    result=QC_ESOCK;
     ep->cfg.cert_der=NULL; ep->cfg.key_der=NULL; ep->cfg.cert_n=ep->cfg.key_n=0;
     ep->fd=socket(ep->local.ss_family,SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
-    if(ep->fd<0||bind(ep->fd,(struct sockaddr *)&ep->local,ep->local_length)) goto fail;
+    if(ep->fd<0)goto fail;
+    if(ep->local.ss_family==AF_INET6) {
+        int only=1;
+        if(setsockopt(ep->fd,IPPROTO_IPV6,IPV6_V6ONLY,&only,sizeof only))goto fail;
+    }
+    if(bind(ep->fd,(struct sockaddr *)&ep->local,ep->local_length)) goto fail;
     ep->local_length=sizeof ep->local;
     if(getsockname(ep->fd,(struct sockaddr *)&ep->local,&ep->local_length)) goto fail;
     /* Deliberately no UDP_GRO: endpoint packet dispatch operates on datagrams.
@@ -1784,7 +1876,7 @@ void qc_endpoint_free(struct qc_endpoint *ep) {
         qc_close(ep->children[i].q,0); endpoint_destroy_child(&ep->children[i]);
     }
     if(ep->fd>=0) close(ep->fd);
-    qcssl_ctx_free(ep->ctx); free(ep);
+    qc_server_tls_release(ep->tls); free(ep);
 }
 #endif
 

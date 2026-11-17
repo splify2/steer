@@ -18,6 +18,7 @@
 #define STEER_HELPERS_H
 
 #include <stdio.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #include "spec.h"
@@ -119,8 +120,8 @@ struct helper {
 
     /* Перезапуск. */
     pid_t pid;
-    long next_ms;         /* когда можно запускать (монотонные мс; 0 — сразу) */
-    long started_ms;
+    int64_t next_ms;         /* когда можно запускать (монотонные мс; 0 — сразу) */
+    int64_t started_ms;
     long delay_ms;        /* пауза следующего перезапуска */
     int gone;             /* выход убран из спеки: не перезапускать */
     int restart;          /* погашен ради новых параметров: поднять сразу, без паузы */
@@ -214,7 +215,7 @@ int pidfd_of(pid_t pid);
  * (waitpid), цикл событий к этому моменту уже не крутится. */
 void helpers_stop(struct helper_set *s, int ordered);
 
-long helpers_now_ms(void);
+int64_t helpers_now_ms(void);
 
 /* ---- супервизор демона (supd.c) --------------------------------------------------------- */
 

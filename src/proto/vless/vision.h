@@ -33,7 +33,7 @@ struct vision {
      *
      * Xray включает такой режим, когда видит внутри туннеля TLS 1.3 (см. XtlsFilterTls):
      * то есть на любом https он включается почти сразу. */
-    int recv_direct;
+    int recv_direct;         /* только после полного DIRECT payload + padding */
 
     /* Разбор идёт ПОТОКОМ: кадр может приехать несколькими записями TLS, и требовать его
      * целиком значило бы либо держать буфер на 128 КБ на каждое соединение, либо терять
@@ -51,7 +51,7 @@ struct vision {
     unsigned char rx_pre_n;
     uint32_t rx_data_left;   /* сколько осталось от данных текущего кадра */
     uint32_t rx_pad_left;    /* сколько осталось от набивки текущего кадра */
-    int rx_end_after;        /* у текущего кадра команда end или direct */
+    int rx_end_after;        /* 0 / VISION_CMD_END / VISION_CMD_DIRECT */
 
     unsigned long sent_frames;
 };

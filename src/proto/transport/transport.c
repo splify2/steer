@@ -17,6 +17,55 @@
 #include "ech.h"
 
 /* ---- ввод-вывод связи ----------------------------------------------------------------- */
+int transport_can_halfclose(const struct transport *t) {
+    if(t->enc)return 0;
+    if(t->fr==&tr_grpc)return 1;
+    if(t->fr==&tr_xhttp)return t->xh.mode!=XH_PACKET_UP;
+    return t->fr==&tr_tcp && (t->link.plain || (!t->link.tls.v12 && t->link.tls.post.phase==TLS13_POST_PHASE));
+}
+int transport_shutdown_write(struct transport *t) {
+    if (!transport_can_halfclose(t)) return 2;
+    struct tr_link *link=&t->link;
+    struct h2 *h=NULL;
+    if(t->fr==&tr_grpc || t->fr==&tr_xhttp) {
+        h=&t->h2;
+        if(t->fr==&tr_xhttp && t->xh.mode==XH_STREAM_UP){link=&t->xh.up.link;h=&t->xh.up.h2;}
+        if(!(link->live & TR_LINK_WRITE_END)) {
+            if(h2_end_stream(h))return -1;
+            link->live|=TR_LINK_WRITE_END;t->link.live|=TR_LINK_WRITE_END;
+        }
+        int rc=tr_link_flush(link);return rc>0?1:rc<0?-1:0;
+    }
+    if(!link->plain) {
+        int rc=tls13_shutdown_write(&link->tls);
+        if(!rc)link->live|=TR_LINK_WRITE_END;
+        return rc>=0?rc:-1;
+    }
+    if(link->live & TR_LINK_WRITE_END)return 0;
+    int rc=tr_link_flush(link);
+    if(rc)return rc>0?1:-1;
+    do {rc=shutdown(link->fd,SHUT_WR);} while(rc<0 && errno==EINTR);
+    if(!rc)link->live|=TR_LINK_WRITE_END;
+    return rc<0?-1:0;
+}
+int transport_read_end(const struct transport *t,int result) {
+    if(!result)return 0;
+    if(t->enc)return 2;
+    if(t->fr==&tr_tcp) {
+        if(t->link.plain || t->link.rx_direct)return result==TR_ECLOSED?1:2;
+        return result==TLS13_ECLOSED && t->link.tls.post.phase==TLS13_POST_PHASE && t->link.tls.post.read_closed?1:2;
+    }
+    if(t->fr==&tr_grpc || t->fr==&tr_xhttp) {
+        const struct h2 *h=&t->h2;
+        if(result!=H2_ERESET || h->done!=1 || h->pend_err || h->status!=200 || h->frame_left)return 2;
+        if(h->why[0] && (!(t->link.live & TR_LINK_WRITE_END) || strcmp(h->why,"RST_STREAM NO_ERROR")))return 2;
+        if(t->fr==&tr_grpc && (t->de.hdr_n||t->de.msg_left||t->de.pb_n||t->de.field_left||
+           !(h->frame_peeked & H2_GRPC_STATUS_OK)||(h->frame_peeked & H2_GRPC_STATUS_ERROR)))return 2;
+        if(t->fr==&tr_xhttp && t->xh.drain_err)return 2;
+        return 1;
+    }
+    return 0;
+}
 
 int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
     struct tr_link *l = ctx;
@@ -71,17 +120,17 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
 }
 
 void tr_link_live(struct tr_link *l) {
-    l->live = 1;
+    l->live |= 1;
     l->tls.live = 1;
 }
 
 size_t tr_link_pending(const struct tr_link *l) {
-    return outq_pending(l->plain ? &l->oq : &l->tls.oq);
+    return l->plain ? outq_pending(&l->oq) : tls13_pending(&l->tls);
 }
 
 int tr_link_flush(struct tr_link *l) {
     if (l->fd < 0) return -1;
-    return l->plain ? outq_flush(l->fd, &l->oq) : outq_flush(l->tls.fd, &l->tls.oq);
+    return l->plain ? outq_flush(l->fd, &l->oq) : tls13_flush(&l->tls);
 }
 
 void tr_link_close(struct tr_link *l) {
@@ -195,6 +244,7 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) 
 }
 
 int transport_write(struct transport *t, const unsigned char *d, size_t n) {
+    if(t->link.live & TR_LINK_WRITE_END)return TR_ECLOSED;
     if (t->enc) return tr_venc_write(t, d, n);
     return t->fr->write(t, d, n);
 }
@@ -204,6 +254,7 @@ int transport_big_write(const struct transport *t) {
 }
 
 long transport_room(struct transport *t) {
+    if(t->link.live & TR_LINK_WRITE_END)return 0;
     long r = -1;
     if (t->fr && t->fr->room) {
         r = t->fr->room(t);

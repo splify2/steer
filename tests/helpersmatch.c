@@ -51,7 +51,7 @@ static long stop_ms(int ordered) {
         st.h[i].evfd = -1;
     }
     usleep(20000);                       /* дети дошли до pause */
-    long t0 = helpers_now_ms();
+    int64_t t0 = helpers_now_ms();
     helpers_stop(&st, ordered);
     long dt = helpers_now_ms() - t0;
     int alive = 0;

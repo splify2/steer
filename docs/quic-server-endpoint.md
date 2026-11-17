@@ -92,7 +92,9 @@ sh tests/qcendpoint_build.sh /path/libngtcp2.a /path/libwolfssl-server.a /tmp/en
 python3 tests/qcendpoint_test.py --server /tmp/endpoint-check/server --client /path/pinned-quic-client
 ```
 
-The wolfSSL recipe requires `STEER_WOLFSSL_DEFS=-DSTEER_WOLFSSL_SERVER`; default
+The wolfSSL recipe requires `STEER_WOLFSSL_DEFS=-DSTEER_WOLFSSL_SERVER` and
+automatically adds `WOLFSSL_VALIDATE_ECC_IMPORT` for private/public EC key
+correspondence validation. Server profile gates require both in `.cflags`; default
 client/minimal builds define NO_WOLFSSL_SERVER. Consequently a new endpoint
 object cannot be linked against the existing client-only wolfSSL artifact.
 Shipping a Linux server profile requires explicit server capability and size

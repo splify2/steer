@@ -10,6 +10,7 @@
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#define STREAM_COMPLETION_BATCH 32u
 
 struct io;
 struct steer_draft_stream_runtime {
@@ -103,7 +104,7 @@ static void pump(struct loop *l, int fd, uint32_t events, void *arg) {
     (void)l; (void)events;
     do { n = read(fd, &counter, sizeof(counter)); } while (n < 0 && errno == EINTR);
     r->dispatching = 1;
-    (void)steer_draft_operations_dispatch(r->operations, UINT32_MAX, NULL);
+    (void)steer_draft_operations_dispatch(r->operations, STREAM_COMPLETION_BATCH, NULL);
     r->dispatching = 0;
     steer_draft_operations_usage(r->operations, NULL, &queued);
     if (queued) wake(r);

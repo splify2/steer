@@ -17,6 +17,7 @@
 #include <linux/netfilter/nf_tables.h>
 
 #include "nlbuf.h"
+#include "nltransport.h"
 #include "nftdump.h"
 
 /* Номера из nf_tables.h, появившиеся позже 4.9, — числами: заголовки ядра в тулчейне бывают
@@ -44,9 +45,6 @@ static int nfd_open(void) {
     memset(&sa, 0, sizeof(sa));
     sa.nl_family = AF_NETLINK;
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); return -1; }
-    /* Страховка от вечного recv — тот же приём, что у rtnl.c: ядро отвечает внутри вызова. */
-    struct timeval tv = { 2, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return fd;
 }
 
@@ -55,9 +53,9 @@ typedef void (*nfd_cb)(const struct nlmsghdr *h, void *arg);
 /* Один запрос и весь ответ. dump — NLM_F_DUMP (ответ частями до NLMSG_DONE), иначе одиночный GET
  * с подтверждением. До двух строковых атрибутов запроса (таблица, имя). 0, errno ответа ядра
  * (ENOENT — объекта нет) или EINTR — набор правил поменялся посреди дампа (NLM_F_DUMP_INTR). */
-static int nfd_talk(int fd, uint16_t msg, int dump, uint8_t family,
+static int nfd_talk_until(int fd, uint16_t msg, int dump, uint8_t family,
                     uint16_t a1, const char *s1, uint16_t a2, const char *s2,
-                    nfd_cb cb, void *arg) {
+                    nfd_cb cb, void *arg,uint64_t deadline) {
     _Alignas(8) uint8_t req[512];
     memset(req, 0, sizeof(req));
     struct nlbuf b;
@@ -65,7 +63,7 @@ static int nfd_talk(int fd, uint16_t msg, int dump, uint8_t family,
     struct nlmsghdr *nh = (struct nlmsghdr *)req;
     nh->nlmsg_type = (uint16_t)((NFNL_SUBSYS_NFTABLES << 8) | msg);
     nh->nlmsg_flags = (uint16_t)(NLM_F_REQUEST | (dump ? NLM_F_DUMP : NLM_F_ACK));
-    nh->nlmsg_seq = ++g_nfd_seq;
+    nh->nlmsg_seq = steer_nl_next_sequence(&g_nfd_seq);
     b.p += NLMSG_HDRLEN;
     struct nfgenmsg *g = (struct nfgenmsg *)b.p;
     g->nfgen_family = family;
@@ -77,38 +75,14 @@ static int nfd_talk(int fd, uint16_t msg, int dump, uint8_t family,
     if (b.overflow) return EMSGSIZE;
     nh->nlmsg_len = (uint32_t)(b.p - b.base);
 
-    struct sockaddr_nl to;
-    memset(&to, 0, sizeof(to));
-    to.nl_family = AF_NETLINK;
-    if (sendto(fd, req, nh->nlmsg_len, 0, (struct sockaddr *)&to, sizeof(to)) < 0) return errno;
-
-    /* Буфер на вызов, а не статический: вызовы не вкладываются, но на куче он не держит 64 КБ
-     * памяти процесса между опросами. */
-    size_t cap = 65536;
-    uint8_t *rbuf = malloc(cap);
-    if (!rbuf) return ENOMEM;
-    int rc = EIO, intr = 0;
-    for (int done = 0; !done; ) {
-        ssize_t n = recv(fd, rbuf, cap, 0);
-        if (n < 0) { if (errno == EINTR) continue; rc = errno; break; }
-        if (n == 0) break;
-        for (struct nlmsghdr *h = (struct nlmsghdr *)rbuf; NLMSG_OK(h, (size_t)n);
-             h = NLMSG_NEXT(h, n)) {
-            if (h->nlmsg_seq != nh->nlmsg_seq) continue;
-            if (h->nlmsg_flags & NLM_F_DUMP_INTR) intr = 1;
-            if (h->nlmsg_type == NLMSG_ERROR) {
-                const struct nlmsgerr *e = NLMSG_DATA(h);
-                rc = e->error ? -e->error : 0;
-                done = 1;
-                break;
-            }
-            if (h->nlmsg_type == NLMSG_DONE) { rc = nl_done_errno(h); done = 1; break; }
-            if (cb) cb(h, arg);
-        }
-    }
-    free(rbuf);
-    return rc == 0 && intr ? EINTR : rc;
+    return steer_nl_exchange_until(fd,req,nh->nlmsg_len,cb,arg,deadline);
 }
+static int nfd_talk(int fd,uint16_t msg,int dump,uint8_t family,uint16_t a1,const char *s1,uint16_t a2,const char *s2,nfd_cb cb,void *arg){
+    uint64_t now=steer_nl_now_ns();return now?nfd_talk_until(fd,msg,dump,family,a1,s1,a2,s2,cb,arg,now+2000000000ULL):EIO;
+}
+#ifdef STEER_NFD_NETLINK_TEST
+int steer_nfd_netlink_test_exchange(int fd,void *msg,size_t n,steer_nl_reply_fn cb,void *context,uint64_t deadline){return steer_nl_exchange_until(fd,msg,n,cb,context,deadline);}
+#endif
 
 /* ---- атрибуты ------------------------------------------------------------------------------ */
 
@@ -272,6 +246,15 @@ int nfd_chain_rules(uint8_t family, const char *table, const char *const *chains
                       chain_rules_cb, &c);
     close(fd);
     return rc == ENOENT || rc == EINTR ? 0 : rc;
+}
+
+int nfd_chain_rules_until(uint8_t family,const char *table,const char *const *chains,size_t n,nfd_rule_fn fn,void *arg,uint64_t deadline){
+    if(!deadline||!table||strnlen(table,NFD_NAME)>=NFD_NAME||!fn||!chains||!n||n>64)return EINVAL;
+    for(size_t j=0;j<n;j++)if(!chains[j]||strnlen(chains[j],NFD_NAME)>=NFD_NAME)return EINVAL;
+    int fd=nfd_open();if(fd<0)return errno?errno:EIO;
+    struct chain_rules_ctx c={table,chains,n,fn,arg};
+    int rc=nfd_talk_until(fd,NFT_MSG_GETRULE,1,family,NFTA_RULE_TABLE,table,0,NULL,chain_rules_cb,&c,deadline);
+    close(fd);return rc;
 }
 
 /* ---- число элементов набора ---------------------------------------------------------------- */
@@ -489,11 +472,11 @@ static void tfp_reset(void *arg) {
  * ложное «изменено снаружи», то есть замену набора правил на пустом месте. Пять попыток подряд
  * прерваны — «ядро не ответило»: проход сторожа тогда ничего не решает (решит следующий), apply
  * ставит набор заново, как при любом незнании. */
-static int tfp_dump(int fd, uint16_t msg, uint16_t attr, const char *table, struct tfp_ctx *c) {
+static int tfp_dump_until(int fd, uint16_t msg, uint16_t attr, const char *table, struct tfp_ctx *c,uint64_t deadline) {
     int rc = EINTR;
     for (int i = 0; i < 5 && rc == EINTR; i++) {
         tfp_reset(c);
-        rc = nfd_talk(fd, msg, 1, NFPROTO_UNSPEC, attr, attr ? table : NULL, 0, NULL, tfp_cb, c);
+        rc = deadline?nfd_talk_until(fd,msg,1,NFPROTO_UNSPEC,attr,attr?table:NULL,0,NULL,tfp_cb,c,deadline):nfd_talk(fd,msg,1,NFPROTO_UNSPEC,attr,attr?table:NULL,0,NULL,tfp_cb,c);
     }
     return rc;
 }
@@ -523,17 +506,17 @@ static void ttab_reset(void *arg) {
     c->handle = 0;
 }
 
-int nfd_table_fp(const char *table, struct nfd_tfp *out) {
+static int table_fp_until(const char *table, struct nfd_tfp *out,uint64_t deadline) {
     memset(out, 0, sizeof(*out));
     int fd = nfd_open();
-    if (fd < 0) return -1;
+    if (fd < 0) return errno?errno:EIO;
     struct ttab_ctx tt = { table, 0, 0 };
     int rc = EINTR;
     for (int i = 0; i < 5 && rc == EINTR; i++) {
         ttab_reset(&tt);
-        rc = nfd_talk(fd, NFT_MSG_GETTABLE, 1, NFPROTO_UNSPEC, 0, NULL, 0, NULL, ttab_cb, &tt);
+        rc = deadline?nfd_talk_until(fd,NFT_MSG_GETTABLE,1,NFPROTO_UNSPEC,0,NULL,0,NULL,ttab_cb,&tt,deadline):nfd_talk(fd,NFT_MSG_GETTABLE,1,NFPROTO_UNSPEC,0,NULL,0,NULL,ttab_cb,&tt);
     }
-    if (rc != 0) { close(fd); return -1; }
+    if (rc != 0) { close(fd); return rc; }
     uint64_t h = NFD_FNV_INIT;
     fp_mix(&h, &tt.fams, sizeof(tt.fams));
     if (!tt.fams) {
@@ -552,8 +535,8 @@ int nfd_table_fp(const char *table, struct nfd_tfp *out) {
         c[k].table = table;
         c[k].msg = kinds[k].add;
         c[k].take = kinds[k].take;
-        rc = tfp_dump(fd, kinds[k].get, kinds[k].attr, table, &c[k]);
-        if (rc != 0 && rc != ENOENT) { close(fd); return -1; }
+        rc = tfp_dump_until(fd,kinds[k].get,kinds[k].attr,table,&c[k],deadline);
+        if (rc != 0 && rc != ENOENT) { close(fd); return rc; }
     }
     close(fd);
     /* Три вида объектов — число и свёртка. */
@@ -566,6 +549,14 @@ int nfd_table_fp(const char *table, struct nfd_tfp *out) {
     out->handle = tt.handle;
     out->fams = tt.fams;
     return 0;
+}
+
+int nfd_table_fp(const char *table,struct nfd_tfp *out){return table_fp_until(table,out,0)?-1:0;}
+int nfd_table_fp_until(const char *table,struct nfd_tfp *out,uint64_t deadline){
+    if(!out)return EINVAL;
+    memset(out,0,sizeof *out);
+    if(!deadline||!table||strnlen(table,NFD_NAME)>=NFD_NAME)return EINVAL;
+    return table_fp_until(table,out,deadline);
 }
 
 /* ---- наборы и их элементы (сверка элементов статических наборов, recon.c) ------------------ */

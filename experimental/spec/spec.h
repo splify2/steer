@@ -54,6 +54,12 @@ struct steer_spec_node_view {
     uint32_t flows;
     const struct ynode *options;
     int options_validated;
+    int enabled;
+    /* Private borrowed intent, never a diagnostic export. Includes validated
+     * builtin settings, so execution never reparses source or guesses enabled. */
+    const struct ynode *intent, *listen, *device, *endpoint, *transport, *security, *variant;
+    /* PLUGIN only: resolved private remote identity; plan-owned lifetime. */
+    const struct ynode *resolved_remote;
 };
 struct steer_spec_edge_view {
     enum steer_spec_edge_kind kind;
@@ -66,10 +72,13 @@ struct steer_spec_rule_view {
     const struct ynode *match;
     uint32_t flows;
     int dns_rule;
+    int enabled;
+    const struct ynode *strategy, *cache_timeout;
 };
 struct steer_spec_requirement_view {
     const char *name, *path;
     uint32_t state;
+    uint32_t owner_node; /* exact node index; UINT32_MAX for common/rule requirements */
 };
 /* Owns parsed intent/IR until destroy. Unknown provider options are preserved in
  * the plan but never emitted by summary/diagnostics. Failure may still return a
@@ -84,6 +93,9 @@ int steer_spec_requirement(const struct steer_spec_plan *, uint32_t, struct stee
 /* Original private intent, not a redacted status/export. Caller must preserve
  * its secret-handling policy; this accessor is never used by JSON diagnostics. */
 const char *steer_spec_document(const struct steer_spec_plan *, size_t *);
+/* Private parsed root includes routing/DNS defaults. Same borrowed lifetime
+ * and runtime_ready execution gate as node views. */
+const struct ynode *steer_spec_intent(const struct steer_spec_plan *);
 void steer_spec_write_json(const struct steer_spec_plan *, FILE *);
 void steer_spec_destroy(struct steer_spec_plan *);
 #endif

@@ -33,6 +33,9 @@ int pool_run(const struct tun_out *o, const struct pool_cfg *pc, stack_ready_fn 
     (void)o; (void)pc; (void)ready; (void)arg;
     return 1;
 }
+int pool_run_ex(const struct tun_out *o,const struct pool_cfg *pc,const struct stack_flow_extensions *ext,stack_ready_fn ready,void *arg) {
+    (void)ext;return pool_run(o,pc,ready,arg);
+}
 
 static int g_got;
 static int emit(void *arg, const unsigned char *p, size_t n) {

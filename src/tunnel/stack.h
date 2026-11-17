@@ -20,6 +20,30 @@ struct tun_out {
  * устройства (evline.h, поле dev), и маршрут выхода к устройству привязывает демон. */
 typedef void (*stack_ready_fn)(void *arg, const char *dev);
 
+/* Additive source-only flow control; legacy dialer/pool layouts stay unchanged.
+ * Immutable table/context live until all workers stop. Callbacks run on the
+ * owning worker; shared context requires synchronization by its owner.
+ * shutdown_write is idempotent: OK accepts exactly one ordered protocol FIN;
+ * AGAIN waits for existing writable/room progress, FATAL fails the flow.
+ * Accepted FIN/control bytes must be represented by existing out_pending /
+ * out_flush (or in-loop readiness), and survive teardown after both EOFs.
+ * UNSUPPORTED leaves legacy behavior; it is not advertised as half-close support.
+ * can_halfclose returns exactly 1 for supported, 0 for legacy fallback; it is
+ * latched once after session readiness, before the first FIN/EOF.
+ * read_end is consulted only after a terminal read/deliver; UNKNOWN is not EOF. */
+#define STACK_FLOW_EXT_VERSION 1u
+#define SEND_UNSUPPORTED 2
+#define STACK_FLOW_END_UNKNOWN 0
+#define STACK_FLOW_END_EOF 1
+#define STACK_FLOW_END_ERROR 2
+struct stack_flow_extensions {
+    uint32_t size, version;
+    void *context;
+    int (*shutdown_write)(void *context, const void *dialer_ctx, void *session);
+    int (*read_end)(void *context, const void *session);
+    int (*can_halfclose)(void *context, const void *dialer_ctx, const void *session);
+};
+
 /* Метка выхода, чей TCP ядро Linux перенаправляет к слушателю стека (R-152); 0 — стек такого выхода не ведёт
  * (или ещё не запущен). Соединение процесса с этой меткой идёт путём трафика клиентов выхода; через устройство
  * TCP не несётся. Внутреннее имя библиотеки: наружу не экспортируется. */
@@ -34,6 +58,8 @@ uint32_t stack_redir_mark(void);
  *
  * Возвращает всегда 1: успешного выхода у цикла нет (см. конец stack_run). */
 int stack_run(const struct tun_out *o, const struct dialer *d, stack_ready_fn ready, void *arg);
+int stack_run_ex(const struct tun_out *, const struct dialer *,
+                 const struct stack_flow_extensions *, stack_ready_fn, void *);
 /* То же поверх готового TUN хоста (по PR #11): приложение на Android с VpnService получает
  * устройство от системы (VpnService.Builder.establish) уже с адресом и маршрутами, и завести его
  * самому стеку там нечем и незачем — ни прав на /dev/net/tun, ни права трогать маршруты телефона.
@@ -49,6 +75,8 @@ int stack_run(const struct tun_out *o, const struct dialer *d, stack_ready_fn re
  * несёт он UDP (QUIC, DNS и прочее). Путь TCP для устройства хоста — отдельная работа.
  * Возвращает всегда 1, как stack_run. */
 int stack_run_fd(const struct tun_out *o, const struct dialer *d, int fd, stack_ready_fn ready, void *arg);
+int stack_run_fd_ex(const struct tun_out *, const struct dialer *, int,
+                    const struct stack_flow_extensions *, stack_ready_fn, void *);
 /* Таблица fake-IP резолвера (только чтение): помощнику плагина путь даёт ядро в {conf}
  * (paths.fakeip, steer-api.md 1.4); NULL или не задан — <каталог состояния>/fakeip.state, как в 2.0. */
 void stack_set_fakeip_path(const char *path);

@@ -35,9 +35,11 @@
 #include "quic.h"
 
 #define S2P_NET_ABI_MAJOR 1
-#define S2P_NET_ABI_MINOR 4
+#define S2P_NET_ABI_MINOR 5
 /* Версия плагина net1 (plugins/net1/plugin.json, сверяет tests/buildmatch.sh): major = номер в id. */
-#define S2P_NET_VERSION "1.5.0"
+#define S2P_NET_VERSION "1.6.0"
+/* First PACKAGE version providing this ABI: dependency ranges use package semver. */
+#define S2P_NET_ABI_PACKAGE_FLOOR "1.6.0"
 
 struct s2p_net_abi {
     uint32_t size;           /* sizeof(struct s2p_net_abi) — новые поля только в конец */

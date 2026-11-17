@@ -191,6 +191,27 @@ if [ -n "$asan_why" ]; then
 fi
 rm -f "$probe" "$probe.c" "$probe-leak" "$probe-leak.c"
 
+echo "ext-test: real TLS post-handshake/half-close and encrypted Vision records..."
+$CC -O1 -g -Wall -Wextra $STEER_INC $ASAN -DSTEER_TLS13_TEST \
+    -ffunction-sections -fdata-sections -o "$BUILD/tls13postmatch" \
+    tests/tls13postmatch.c src/proto/tls/tls13.c src/proto/vless/vision.c \
+    $CRYPTO -Wl,--gc-sections -lpthread
+"$BUILD/tls13postmatch"
+
+echo "ext-test: prepared trust snapshots, authentication failures and parallel verification..."
+if [ -n "$ASAN" ]; then
+    python3 tests/certprepared.py --wolfssl-library "$WLIB" --sanitizer address
+else
+    python3 tests/certprepared.py --wolfssl-library "$WLIB"
+fi
+
+echo "ext-test: authenticated REALITY CertificateVerify and parallel verification..."
+if [ -n "$ASAN" ]; then
+    python3 tests/certreality.py --wolfssl-library "$WLIB" --sanitizer address
+else
+    python3 tests/certreality.py --wolfssl-library "$WLIB"
+fi
+
 echo "ext-test: собираю и прогоняю spokematch (ASan: ${ASAN:-нет})..."
 # xslink.c в списке ОБЯЗАТЕЛЕН: командная строка клиента принимает и ссылку xs://, и файл
 # одним xs_conf_load_any, и живёт эта функция там. Без неё сборка стенда падает на компоновке,
@@ -296,7 +317,7 @@ $CC -O2 -w $STEER_INC -o "$BUILD/hubmatch" tests/hubmatch.c \
 # tests/buildmatch.sh сверяет, что стенды компонуют всё, что включают.
 echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w $STEER_INC -o "$BUILD/devupmatch" tests/devupmatch.c \
-	src/tunnel/stack.c src/tunnel/rtx.c src/tunnel/tun.c \
+	src/tunnel/stack.c src/tunnel/fakeip.c src/tunnel/rtx.c src/tunnel/tun.c \
 	src/proto/vless/vldial.c src/tunnel/pool.c src/tunnel/geo.c src/proto/warp/wbhttps.c src/proto/warp/wbjson.c src/proto/tls/httpc.c \
 	src/proto/vless/client.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/vless/sub.c src/proto/vless/sublink.c \

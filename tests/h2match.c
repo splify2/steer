@@ -35,6 +35,7 @@ struct fake_io {
     size_t sent_n;
     const unsigned char *feed;
     size_t feed_n, feed_pos;
+    size_t chunk;
 };
 
 static int fake_write(void *ctx, const unsigned char *d, size_t n) {
@@ -49,6 +50,7 @@ static int fake_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
     struct fake_io *io = ctx;
     size_t left = io->feed_n - io->feed_pos;
     size_t take = left < cap ? left : cap;
+    if(io->chunk && take>io->chunk)take=io->chunk;
     memcpy(d, io->feed + io->feed_pos, take);
     io->feed_pos += take;
     *got = take;
@@ -59,6 +61,9 @@ static void h2_open(struct h2 *h, struct fake_io *io) {
     memset(io, 0, sizeof(*io));
     struct h2_io ops = { io, fake_write, fake_read };
     h2_start(h, &ops, "example.org", "/x", "application/grpc", NULL);
+    /* Frame/flow-control fixtures begin after a successful response. Status
+     * decoder fixtures explicitly reset this before feeding response HEADERS. */
+    h->status=200;
     io->sent_n = 0;                      /* преамбула и HEADERS дальше не интересны */
 }
 
@@ -352,6 +357,7 @@ int main(void) {
         while (io.feed_pos < io.feed_n)
             if (h2_read(&h, out, sizeof(out), &got) != 0) break;
         h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST);
+        h.status=200; /* New response HEADERS accepted before the DATA fixture. */
         io.sent_n = 0;
         put_data(feed, h.sid, 16384);
         io.feed = feed; io.feed_n = 9 + 16384; io.feed_pos = 0;
@@ -378,12 +384,14 @@ int main(void) {
         h2_open(&h, &io);
         g_last_status = 0;
         io.feed = feed; io.feed_pos = 0;
+        h.status=0;
         io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS, h.sid, st502, sizeof st502);
         check(":status 502 в Huffman: H2_ESTATUS", H2_ESTATUS, h2_read(&h, out, sizeof(out), &got));
         check(":status 502 в Huffman: код назван", 502, g_last_status);
 
         h2_open(&h, &io);
         io.feed = feed; io.feed_pos = 0;
+        h.status=0;
         io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS, h.sid, st200, sizeof st200);
         check(":status 200 в Huffman: не ошибка", 0, h2_read(&h, out, sizeof(out), &got));
         check(":status 200 в Huffman: статус 200", 200, h.status);
@@ -497,6 +505,7 @@ int main(void) {
         h2_open(&h, &io);
         g_last_status = 0;
         io.feed = feed; io.feed_pos = 0;
+        h.status=0;
         io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS | 0x08 | 0x20, h.sid,
                               hdrs, sizeof hdrs);
         check("HEADERS с PADDED и PRIORITY: статус 404 прочитан",
@@ -507,6 +516,7 @@ int main(void) {
         static const unsigned char hdrs_pri[] = { 0, 0, 0, 0, 16, 0x88 };
         h2_open(&h, &io);
         io.feed = feed; io.feed_pos = 0;
+        h.status=0;
         io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS | 0x20, h.sid,
                               hdrs_pri, sizeof hdrs_pri);
         check("HEADERS с PRIORITY: не ошибка", 0, h2_read(&h, out, sizeof(out), &got));
@@ -622,7 +632,7 @@ int main(void) {
          * десятого-третьего клиентского соединения терялся хвост ответа. Данные обязаны дойти, а
          * конец потока — прийти СЛЕДУЮЩИМ вызовом. */
         static const unsigned char hdr200[] = { 0x88 };
-        static const unsigned char trailers[] = { 0x88 };      /* содержимое концевых HEADERS не читается */
+        static const unsigned char trailers[] = {0,11,'g','r','p','c','-','s','t','a','t','u','s',1,'0'};
         static const unsigned char no_error[4] = { 0, 0, 0, 0 };
         struct h2 h;
         struct fake_io io;
@@ -631,6 +641,7 @@ int main(void) {
         size_t got = 0, n = 0;
 
         h2_open(&h, &io);
+        h.status=0;
         n += put_frame(feed + n, FR_HEADERS, FLAG_END_HEADERS, h.sid, hdr200, sizeof hdr200);
         n += put_frame(feed + n, FR_DATA, 0, h.sid, (const unsigned char *)"hello", 5);
         n += put_frame(feed + n, FR_DATA, 0, h.sid, (const unsigned char *)" world", 6);
@@ -766,6 +777,94 @@ int main(void) {
         outq_free(&g_pq);
     }
 
+    {
+        struct h2 h;struct fake_io io;unsigned char feed[512],out[H2_MIN_READ_CAP];size_t got;
+        unsigned char literal[]={0x08,3,'5','0','2'};
+        for(size_t split=1;split<sizeof(literal);split++) {
+            h2_open(&h,&io);h.status=0;io.chunk=1;
+            size_t a=put_frame(feed,FR_HEADERS,FLAG_END_STREAM,h.sid,literal,split);
+            io.feed_n=a+put_frame(feed+a,FR_CONTINUATION,FLAG_END_HEADERS,h.sid,literal+split,sizeof(literal)-split);io.feed=feed;
+            int rc=0;while(io.feed_pos<io.feed_n && !rc)rc=h2_read(&h,out,sizeof(out),&got);
+            check("fragmented HEADERS+CONTINUATION status502 rejects",H2_ESTATUS,rc);
+            check("CONTINUATION status502 retained",502,h.status);
+        }
+        h2_open(&h,&io);h.status=0;
+        io.feed_n=put_frame(feed,FR_HEADERS,0,h.sid,literal,1);
+        io.feed_n+=put_frame(feed+io.feed_n,FR_DATA,0,h.sid,(const unsigned char *)"html",4);io.feed=feed;
+        check("interleaved DATA during header block rejected",H2_EPROTO,h2_read(&h,out,sizeof(out),&got));
+        h2_open(&h,&io);h.status=0;
+        unsigned char bad[]={0x08,3,'6','0','0'};
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,bad,sizeof(bad));io.feed=feed;
+        check("status600 rejected",H2_EPROTO,h2_read(&h,out,sizeof(out),&got));
+        h2_open(&h,&io);h.status=0;
+        unsigned char named[]={0,7,':','s','t','a','t','u','s',3,'2','0','0'};
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,named,sizeof(named));io.feed=feed;io.chunk=1;
+        int rc=0;while(io.feed_pos<io.feed_n&&!rc)rc=h2_read(&h,out,sizeof(out),&got);
+        check("literal new name split bytewise accepted",200,rc?rc:h.status);
+        h2_open(&h,&io);h.status=0;unsigned char hn[]={0,0x85,0xb8,0x84,0x8d,0x36,0xa3,3,'2','0','0'};
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,hn,sizeof(hn));io.feed=feed;io.chunk=1;
+        rc=0;while(io.feed_pos<io.feed_n&&!rc)rc=h2_read(&h,out,sizeof(out),&got);
+        check("Huffman new name split bytewise accepted",200,rc?rc:h.status);
+        h2_open(&h,&io);h.status=0;
+        unsigned char info[]={0x08,3,'1','0','3'},ok[]={0x88};
+        size_t z=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,info,sizeof(info));
+        io.feed_n=z+put_frame(feed+z,FR_DATA,0,h.sid,(const unsigned char *)"bad",3);io.feed=feed;
+        check("informational response cannot authorize DATA",H2_EPROTO,h2_read(&h,out,sizeof(out),&got));
+        h2_open(&h,&io);h.status=0;
+        z=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,info,sizeof(info));
+        z+=put_frame(feed+z,FR_HEADERS,FLAG_END_HEADERS,h.sid,ok,sizeof(ok));
+        io.feed_n=z+put_frame(feed+z,FR_DATA,0,h.sid,(const unsigned char *)"yes",3);io.feed=feed;
+        rc=h2_read(&h,out,sizeof(out),&got);
+        check("informational then final200 authorizes DATA",3,rc?rc:(int)got);
+        h2_open(&h,&io);h.status=0;
+        io.feed_n=put_frame(feed,FR_DATA,0,h.sid,(const unsigned char *)"bad",3);io.feed=feed;
+        check("DATA before response HEADERS rejected",H2_EPROTO,h2_read(&h,out,sizeof(out),&got));
+        h2_open(&h,&io);h.status=0;
+        z=put_frame(feed,FR_HEADERS,FLAG_END_STREAM,h.sid,ok,sizeof(ok));
+        io.feed_n=z+put_frame(feed+z,FR_CONTINUATION,FLAG_END_HEADERS,h.sid,NULL,0);io.feed=feed;io.chunk=z;
+        rc=h2_read(&h,out,sizeof(out),&got);
+        check("END_STREAM waits for END_HEADERS",0,rc?rc:h.done);
+        rc=h2_read(&h,out,sizeof(out),&got);
+        check("END_HEADERS completes deferred END_STREAM",1,rc?rc:h.done);
+        h2_open(&h,&io);h.status=0;
+        z=put_frame(feed,FR_HEADERS,0,h.sid,ok,sizeof(ok));
+        io.feed_n=z+put_frame(feed+z,FR_CONTINUATION,FLAG_END_HEADERS,h.sid+2,NULL,0);io.feed=feed;
+        check("CONTINUATION wrong stream rejected",H2_EPROTO,h2_read(&h,out,sizeof(out),&got));
+        h2_open(&h,&io);h.status=0;
+        unsigned char excessive[65];memset(excessive,0x20,sizeof(excessive));
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,excessive,sizeof(excessive));io.feed=feed;
+        check("bounded status prefix exhaustion fails closed",H2_ETOOBIG,h2_read(&h,out,sizeof(out),&got));
+        h2_open(&h,&io);h.status=0;
+        unsigned char dynamic[]={0x88,0xbe};
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,dynamic,sizeof(dynamic));io.feed=feed;
+        check("dynamic index after valid status rejected",H2_EPROTO,h2_read(&h,out,sizeof(out),&got));
+        h2_open(&h,&io);h.status=0;unsigned char resized[]={0x21,0x88};
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,resized,sizeof(resized));io.feed=feed;
+        check("nonzero dynamic table update rejected",H2_EPROTO,h2_read(&h,out,sizeof(out),&got));
+        h2_open(&h,&io);h.status=0;unsigned char longvalue[136]={0x88,0x0f,0x10,0x7f,3};
+        memset(longvalue+5,'a',130);
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,longvalue,135);io.feed=feed;io.chunk=1;
+        rc=0;while(io.feed_pos<io.feed_n&&!rc)rc=h2_read(&h,out,sizeof(out),&got);
+        check("split HPACK integer and long unrelated literal",200,rc?rc:h.status);
+        h2_open(&h,&io);unsigned char grpcok[]={0,0x88,0x9a,0xca,0xc8,0xb2,0x12,0x34,0xda,0x8f,1,'0'};
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS|FLAG_END_STREAM,h.sid,grpcok,sizeof(grpcok));io.feed=feed;io.chunk=1;
+        rc=0;while(io.feed_pos<io.feed_n&&!rc)rc=h2_read(&h,out,sizeof(out),&got);
+        check("fragmented Huffman grpc-status0 verified",H2_GRPC_STATUS_OK,rc?rc:(int)(h.frame_peeked & H2_GRPC_STATUS_OK));
+        h2_open(&h,&io);grpcok[11]='1';
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS|FLAG_END_STREAM,h.sid,grpcok,sizeof(grpcok));io.feed=feed;
+        check("grpc-status1 is error rather than clean EOF",H2_EPROTO,h2_read(&h,out,sizeof(out),&got));
+        h2_open(&h,&io);h.status=0;grpcok[11]='0';
+        unsigned char early_status[13]={0x88};memcpy(early_status+1,grpcok,sizeof(grpcok));
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,early_status,sizeof(early_status));io.feed=feed;
+        check("grpc-status0 outside terminal HEADERS rejected",H2_EPROTO,h2_read(&h,out,sizeof(out),&got));
+        h2_open(&h,&io);h.status=0;io.chunk=11;
+        io.feed_n=put_frame(feed,FR_HEADERS,FLAG_END_HEADERS,h.sid,literal,sizeof(literal));io.feed=feed;
+        rc=h2_read(&h,out,sizeof(out),&got);check("old status prefix initially incomplete",0,rc?rc:h.status);
+        h2_next(&h,"example.org","/next","application/grpc",NULL,H2_POST);
+        rc=0;while(io.feed_pos<io.feed_n&&!rc)rc=h2_read(&h,out,sizeof(out),&got);
+        check("fragmented old stream status refuses its request",H2_ESTATUS,rc);
+        check("old stream status does not overwrite new current",0,h.status);
+    }
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
 
     return fails ? 1 : 0;

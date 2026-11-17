@@ -53,13 +53,16 @@ static uint8_t pat(size_t i) { return (uint8_t)((i * 7 + 3) & 0xff); }
 /* ---- сервер стенда: эхо потоков и датаграмм ---------------------------------------------------- */
 struct srv {
     struct qc *q;
-    int hs, closed, close_reason;
+    int hs, closed, close_reason,streams_closed;
     size_t stream_in, dg_in;
+    int reset_stream,seed_fin;uint64_t reset_code,stream_error;
 };
 
 static void srv_hs(void *u) { ((struct srv *)u)->hs = 1; }
 static void srv_stream(void *u, int64_t sid, const uint8_t *d, size_t n, int fin) {
     struct srv *s = u;
+    if(s->reset_stream) { s->reset_stream=0;(void)qc_stream_reset(s->q,sid,s->reset_code);return; }
+    if(s->seed_fin) { s->seed_fin=0;(void)qc_stream_send(s->q,sid,NULL,0,1);return; }
     s->stream_in += n;
     /* Буфер потока 1 МиБ, тест шлёт 300 КБ: принимается всё; иначе стенд упал бы в проверке ниже. */
     if (qc_stream_send(s->q, sid, d, n, fin) != (ssize_t)n) s->stream_in = (size_t)-1;
@@ -79,13 +82,15 @@ static void srv_closed(void *u, int reason, const char *why) {
 /* ---- клиент стенда ---------------------------------------------------------------------------- */
 struct cli {
     struct qc *q;
-    int hs, closed, close_reason;
+    int hs, closed, close_reason,streams_closed;
     int64_t sid;
     size_t got, bad;
     int fin;
     int dg_got, dg_bad;
     uint8_t *sendbuf;
     size_t sent;
+    uint64_t stream_error;
+    unsigned terminal_flags;int drop;
 };
 
 static void cli_hs(void *u) { ((struct cli *)u)->hs = 1; }
@@ -111,20 +116,28 @@ static void cli_closed(void *u, int reason, const char *why) {
     c->close_reason = reason;
 }
 
-static const struct qc_ops srv_ops = { .on_handshake=srv_hs, .on_stream_data=srv_stream, .on_datagram=srv_dg, .on_closed=srv_closed };
-static const struct qc_ops cli_ops = { .on_handshake=cli_hs, .on_stream_data=cli_stream, .on_datagram=cli_dg, .on_closed=cli_closed };
+static void srv_stream_closed(void *u,int64_t sid,uint64_t error) { (void)sid;((struct srv *)u)->stream_error=error;((struct srv *)u)->streams_closed++; }
+static void cli_stream_closed(void *u,int64_t sid,uint64_t error) { struct cli *c=u;c->terminal_flags=qc_stream_terminal_flags(c->q,sid);c->stream_error=error;c->streams_closed++; }
+static size_t cli_loss(void *u,uint8_t *dst,const uint8_t *src,size_t n) { if(((struct cli *)u)->drop)return 0;memcpy(dst,src,n);return n; }
+static const struct qc_ops srv_ops = { .on_handshake=srv_hs, .on_stream_data=srv_stream, .on_stream_close=srv_stream_closed,.on_datagram=srv_dg, .on_closed=srv_closed };
+static const struct qc_ops cli_ops = { .on_handshake=cli_hs, .on_stream_data=cli_stream, .on_stream_close=cli_stream_closed,.on_datagram=cli_dg, .on_closed=cli_closed };
 
-static int start_srv(struct srv *s, size_t dg_max, uint64_t brutal, uint16_t *port) {
+static int start_srv_credit(struct srv *s, size_t dg_max, uint64_t brutal, uint16_t *port,
+                            uint64_t max_data,uint64_t max_stream_data) {
     struct qc_srv_cfg sc = {
         .bind_host = "127.0.0.1", .alpn = ALPN,
         .cert_der = qc_cert_der, .cert_n = sizeof qc_cert_der,
         .key_der = qc_key_der, .key_n = sizeof qc_key_der,
         .datagram_max = dg_max, .brutal_bps = brutal,
+        .max_data=max_data,.max_stream_data=max_stream_data,
     };
     memset(s, 0, sizeof *s);
     int rc = qc_listen(&sc, &srv_ops, s, &s->q);
     if (rc == 0) *port = qc_local_port(s->q);
     return rc;
+}
+static int start_srv(struct srv *s,size_t dg_max,uint64_t brutal,uint16_t *port) {
+    return start_srv_credit(s,dg_max,brutal,port,0,0);
 }
 
 static void cfg_default(struct qc_cfg *c, uint16_t port) {
@@ -308,6 +321,119 @@ static void scenario_fail(const char *name, const char *alpn, const char *sni, c
  * должна застревать — следом идут поток и ещё одна датаграмма. Дефект I-480: датаграмма,
  * не влезавшая в пакет, оставалась головой очереди навсегда, и всё соединение замирало. */
 static int c_bigdg_done(struct srv *s, struct cli *c) { (void)s; return c->fin; }
+static int c_stream_reaped(struct srv *s,struct cli *c) { return c->fin&&c->streams_closed&&s->streams_closed; }
+static int c_reset_reaped(struct srv *s,struct cli *c) { return c->streams_closed&&s->streams_closed; }
+static void scenario_fin_then_cancel(void) {
+    struct srv s;struct cli c={0};uint16_t port=0;struct qc_cfg cfg;
+    int rc=start_srv(&s,0,0,&port);check("FIN then cancel: server",0,rc);if(rc)return;
+    cfg_default(&cfg,port);const struct qc_filter filter={.tx=cli_loss,.user=&c};cfg.filter=&filter;
+    rc=qc_open(&cfg,&cli_ops,&c,&c.q);check("FIN then cancel: client",0,rc);if(rc) { qc_free(s.q);return; }
+    check("FIN then cancel: handshake",1,pump(&s,&c,c_hs,5000));
+    if(c.hs) {
+        int64_t sid;s.seed_fin=1;uint8_t bytes[4096];for(size_t i=0;i<sizeof bytes;i++)bytes[i]=pat(i);
+        check("FIN then cancel: open",0,qc_stream_open(c.q,&sid));
+        check("FIN then cancel: seed",1,qc_stream_send(c.q,sid,bytes,1,0));
+        check("FIN then cancel: observed real peer FIN",1,pump(&s,&c,c_bigdg_done,2000));
+        c.drop=1;
+        check("FIN then cancel: accepted uplink retained",sizeof bytes,qc_stream_send(c.q,sid,bytes,sizeof bytes,0));
+        check("FIN then cancel: unacknowledged uplink exists",1,qc_stream_buffered(c.q,sid)>0);
+        check("FIN then cancel: peer cancels with code0",0,qc_stream_reset(s.q,sid,0));
+        for(unsigned i=0;i<8;i++) { qc_run(s.q,1);qc_run(c.q,1); }
+        check("FIN then cancel: send rejection is scoped",QC_ENOSTREAM,qc_stream_send(c.q,sid,bytes,1,1));
+        c.drop=0;
+        check("FIN then cancel: transport closes",1,pump(&s,&c,c_reset_reaped,2000));
+        check("FIN then cancel: zero TX reset is authoritative",1,(c.terminal_flags&QC_STREAM_TX_RESET)!=0);
+        check("FIN then cancel: terminal query unavailable outside callback",0,qc_stream_terminal_flags(c.q,sid));
+        c.fin=0;c.got=c.bad=0;
+        check("FIN then cancel: neighbor opens",0,qc_stream_open(c.q,&sid));
+        check("FIN then cancel: neighbor writes",128,qc_stream_send(c.q,sid,bytes,128,1));
+        check("FIN then cancel: neighbor completes",1,pump(&s,&c,c_bigdg_done,2000));
+        check("FIN then cancel: neighbor payload",128,c.got);
+        check("FIN then cancel: no corruption",0,c.bad);
+    }
+    check("FIN then cancel: connection alive",0,c.closed||s.closed);
+    qc_free(c.q);qc_free(s.q);
+}
+static void scenario_reset_isolation(void) {
+    struct srv s;struct cli c={0};uint16_t port=0;struct qc_cfg cfg;
+    int rc=start_srv(&s,0,0,&port);check("reset isolation: server",0,rc);if(rc)return;
+    cfg_default(&cfg,port);rc=qc_open(&cfg,&cli_ops,&c,&c.q);
+    check("reset isolation: client",0,rc);if(rc) { qc_free(s.q);return; }
+    check("reset isolation: handshake",1,pump(&s,&c,c_hs,5000));
+    uint8_t bytes[128];for(size_t i=0;i<sizeof bytes;i++)bytes[i]=pat(i);
+    if(c.hs)for(unsigned code=0;code<=7;code+=7) {
+        int64_t sid;s.reset_stream=1;s.reset_code=code;s.streams_closed=c.streams_closed=c.fin=0;
+        check("reset isolation: stream open",0,qc_stream_open(c.q,&sid));
+        check("reset isolation: write",sizeof bytes,qc_stream_send(c.q,sid,bytes,sizeof bytes,1));
+        check("reset isolation: both transport sides close",1,pump(&s,&c,c_reset_reaped,2000));
+        check("reset isolation: RESET is not STREAM FIN",0,c.fin);
+        check("reset isolation: receive error preserved",code,c.stream_error);
+        check("reset isolation: transmit error preserved",code,s.stream_error);
+    }
+    if(c.hs&&!c.closed&&!s.closed) {
+        int64_t sid;c.fin=0;c.got=c.bad=0;
+        check("reset isolation: healthy neighbor opens",0,qc_stream_open(c.q,&sid));
+        check("reset isolation: healthy neighbor writes",sizeof bytes,qc_stream_send(c.q,sid,bytes,sizeof bytes,1));
+        check("reset isolation: healthy neighbor EOF echo",1,pump(&s,&c,c_bigdg_done,2000));
+        check("reset isolation: exact neighbor payload",sizeof bytes,c.got);
+        check("reset isolation: no neighbor corruption",0,c.bad);
+    }
+    check("reset isolation: connection stays alive",0,c.closed||s.closed);
+    qc_free(c.q);qc_free(s.q);
+}
+static void scenario_stream_credit(void) {
+    struct srv s;struct cli c={0};uint16_t port=0;struct qc_cfg cfg;unsigned completed=0;
+    int rc=start_srv(&s,0,0,&port);check("stream credit: server",0,rc);if(rc)return;
+    cfg_default(&cfg,port);rc=qc_open(&cfg,&cli_ops,&c,&c.q);
+    check("stream credit: client",0,rc);if(rc) { qc_free(s.q);return; }
+    check("stream credit: handshake",1,pump(&s,&c,c_hs,5000));
+    uint8_t bytes[128];for(size_t i=0;i<sizeof bytes;i++)bytes[i]=pat(i);
+    if(c.hs)for(unsigned i=0;i<40;i++) {
+        int64_t sid;c.got=c.bad=0;c.fin=c.streams_closed=s.streams_closed=0;
+        if(qc_stream_open(c.q,&sid)||qc_stream_send(c.q,sid,bytes,sizeof bytes,1)!=(ssize_t)sizeof bytes||
+           !pump(&s,&c,c_stream_reaped,1000)||c.got!=sizeof bytes||c.bad)break;
+        completed++;
+    }
+    check("40 sequential fully closed streams replenish negotiated16credit",40,completed);
+    check("stream credit exhaustion does not close connection",0,c.closed||s.closed);
+    qc_free(c.q);qc_free(s.q);
+}
+
+static void scenario_connection_credit(void) {
+    struct srv s;struct cli c={0};uint16_t port=0;struct qc_cfg cfg;
+    int rc=start_srv_credit(&s,0,0,&port,1024,65536);
+    check("MAX_DATA-only progress: server",0,rc);if(rc)return;
+    cfg_default(&cfg,port);rc=qc_open(&cfg,&cli_ops,&c,&c.q);
+    check("MAX_DATA-only progress: client",0,rc);if(rc) { qc_free(s.q);return; }
+    check("MAX_DATA-only progress: handshake",1,pump(&s,&c,c_hs,5000));
+    if(c.hs) {
+        uint8_t data[8192];for(size_t i=0;i<sizeof data;i++)data[i]=pat(i);
+        int64_t sid;check("MAX_DATA-only progress: stream open",0,qc_stream_open(c.q,&sid));
+        check("MAX_DATA-only progress: queued",sizeof data,qc_stream_send(c.q,sid,data,sizeof data,1));
+        check("MAX_DATA-only progress: FIN echo completes",1,pump(&s,&c,c_bigdg_done,3000));
+        check("MAX_DATA-only progress: exact bytes",sizeof data,c.got);
+        check("MAX_DATA-only progress: no corruption",0,c.bad);
+    }
+    qc_free(c.q);qc_free(s.q);
+}
+
+static void scenario_stream_isolation(void) {
+    struct srv s;struct cli c={0};uint16_t port=0;struct qc_cfg cfg;
+    int rc=start_srv(&s,1200,0,&port);
+    check("stream isolation: server",0,rc);if(rc) return;
+    cfg_default(&cfg,port);cfg.datagram_max=1200;
+    rc=qc_open(&cfg,&cli_ops,&c,&c.q);
+    check("stream isolation: client",0,rc);if(rc) { qc_free(s.q);return; }
+    check("stream isolation: handshake",1,pump(&s,&c,c_hs,5000));
+    if(c.hs) {
+        const uint8_t byte=1;
+        check("unopened local stream rejected without closing connection",QC_ENOSTREAM,
+              qc_stream_send(c.q,1<<20,&byte,1,1));
+        check("invalid stream leaves connection alive",0,c.closed);
+        if(!c.closed) echo_round("healthy neighbor after rejected stream",&s,&c);
+    }
+    qc_free(c.q);qc_free(s.q);
+}
 
 static void scenario_bigdg(void) {
     struct srv s;
@@ -358,6 +484,11 @@ static void scenario_bigdg(void) {
 }
 
 int main(void) {
+    scenario_fin_then_cancel();
+    scenario_reset_isolation();
+    scenario_stream_credit();
+    scenario_connection_credit();
+    scenario_stream_isolation();
     scenario_echo("CUBIC", 0, -1, -1);
     scenario_echo("Brutal", 50u * 1000 * 1000, -1, -1);
     /* Запасные пути ввода-вывода: без GSO — sendmmsg, без GRO — recvmmsg, без обоих; с GRO принудительно. */

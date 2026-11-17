@@ -31,6 +31,8 @@ struct hy2_flow {
     uint8_t udp;
     uint8_t opening;            /* открытие не закончено: считается в hq.nopen и ждёт срока */
     uint8_t rx_fin;             /* сервер закончил передачу: после очереди — конец потока */
+    uint8_t tx_fin_requested;   /* no further application bytes accepted */
+    uint8_t tx_fin_queued;      /* FIN and bytes now owned by QUIC until ACK/close */
     uint8_t sclosed;            /* поток QUIC закрыт целиком: ему не слать и не сбрасывать */
     uint8_t gone;               /* соединение QUIC кончилось: связь оборвана, потока больше нет */
     uint8_t aborted;            /* конец — обрыв, а не закрытие (клиенту RST, а не FIN) */
@@ -85,6 +87,7 @@ int  hy2c_connect(struct hy2_flow *f, int timeout_s);
 void hy2c_close(struct hy2_flow *f);
 /* Байты клиента узлу (SEND_*), у UDP — одна датаграмма. */
 int  hy2c_send(struct hy2_flow *f, const unsigned char *d, size_t n);
+int  hy2c_shutdown_write(struct hy2_flow *f);
 /* Следующий кусок очереди без копии: не больше cap байт TCP или одна датаграмма; got == 0 — пока пусто. */
 int  hy2c_read(struct hy2_flow *f, size_t cap, const unsigned char **data, size_t *got);
 int  hy2c_has_data(const struct hy2_flow *f);

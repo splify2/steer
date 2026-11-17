@@ -3,15 +3,26 @@
 #define _GNU_SOURCE
 #include "stream.h"
 #include "buffers.h"
+#include "prototype_resources.h"
 #include "loop.h"
 #include "codec.h"
-#include "inbound.h"
+#include "vless/inbound.h"
 #include "loopback_host.h"
 #include "route_dial.h"
+#include "route_stream.h"
+#include "native_stream_backend.h"
 #include "policy_route.h"
 #include "prototype_config.h"
 #include "resolver.h"
 #include "prototype_store.h"
+#include "inbound_tls.h"
+#ifdef STEER_PROTOTYPE_HY2
+#include "hy2_inbound.h"
+#include "datagram.h"
+#include "datagram_routes.h"
+#include "qcssl.h"
+#include "prototype_prepare.h"
+#endif
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
@@ -25,17 +36,20 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <limits.h>
 #include <sys/eventfd.h>
 
 #define CLIENTS 32
 #define CAPACITY 16384
 #define GENERATIONS 8
 #define LISTENERS 32 /* 16 published plus 16 transactionally prepared */
+#define HY2_DRAIN_MS 30000u /* host-owned monotonic retirement policy */
 #define CONTROLS 8
 #define CONTROL_INPUT (STEER_PROTOTYPE_CONFIG_MAX_BYTES + 128u)
 #define CONTROL_OUTPUT (STEER_PROTOTYPE_CONFIG_MAX_BYTES + 2048u)
 struct host;
 struct prepared;
+struct steer_prototype_prepared_input;
 struct store_writer {
     struct host *host;
     pthread_t thread;
@@ -48,14 +62,23 @@ struct store_writer {
 struct control {
     struct host *host;
     struct loop_timer *deadline;
-    int fd, writing, operation, parsed, waiting_store;
-    uint64_t serial;
+    int fd, writing, operation, parsed, waiting_store,waiting_prepare;
+    uint64_t serial,deadline_ms;
     uint64_t expected;
     size_t used, header_length, body_length, sent, output_length;
     char input[CONTROL_INPUT], output[CONTROL_OUTPUT];
 };
 struct generation {
     struct steer_draft_routes *routes;
+    struct steer_draft_stream_routes *streams;
+    struct steer_draft_native_stream_backend *native;
+#ifdef STEER_PROTOTYPE_HY2
+    struct steer_draft_datagram_runtime *datagram_native;
+    struct steer_draft_datagram_router *datagrams;
+    struct steer_draft_binding_lease *datagram_binding;
+    int datagram_retired,datagram_finalized;
+#endif
+    struct host *host;
     struct steer_policy *policy;
     struct steer_prototype_config *config;
     char *document;
@@ -70,6 +93,8 @@ struct listener_identity {
     const char *user, *password;
     size_t user_length, password_length;
     uint8_t uuid[16];
+    const char *token;size_t token_length;
+    uint8_t certificate_hash[32],private_key_hash[32]; /* never exposed in status/logs */
 };
 struct listener {
     struct host *host;
@@ -77,6 +102,11 @@ struct listener {
     int active;
     struct steer_prototype_listener spec;
     struct listener_identity identity;
+#ifdef STEER_PROTOTYPE_HY2
+    struct steer_draft_hy2 *hy2;
+    uint64_t admission_epoch,drain_deadline;
+    int retiring;
+#endif
 };
 enum phase { HANDSHAKE, REPLY, DIALING, RELAY, CLOSING };
 struct client;
@@ -85,15 +115,20 @@ struct direction {
     struct steer_pv1_buffer *buffer;
     struct steer_pv1_async_start operation;
     uint32_t offset, length, bytes, error;
-    int pending, completed, writing, eof;
+    int pending, completed, writing, eof, finishing, finished;
 };
 struct host {
     struct loop *loop;
     struct steer_pv1_host *buffers;
     struct steer_draft_stream_runtime *runtime;
+    struct steer_draft_backend_runtime *backend_runtime;
     struct steer_draft_resolver *resolver;
     struct steer_prototype_store *store;
     struct store_writer writer;
+#ifdef STEER_PROTOTYPE_HY2
+    struct steer_prototype_prepare *preparer;
+    struct steer_draft_hy2_datagram_budget datagram_budget;
+#endif
     int store_busy, durability_uncertain;
     struct generation generations[GENERATIONS], *current;
     struct listener listeners[LISTENERS];
@@ -104,6 +139,7 @@ struct host {
     char control_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     struct control *controls;
     unsigned live;
+    uint64_t next_admission_epoch;
 };
 struct prepared {
     struct generation *generation;
@@ -115,7 +151,7 @@ struct client {
     struct host *host;
     struct generation *generation;
     struct listener_identity identity;
-    struct steer_pv1_stream *down, *up;
+    struct steer_pv1_stream_ref down, up;
     struct loop_timer *deadline;
     struct direction directions[2]; /* down->up, up->down */
     struct s5_codec codec;
@@ -128,22 +164,26 @@ struct client {
     uint32_t route_error, dial_failure;
     enum phase phase, after_reply;
     uint32_t input_offset, input_length;
-    int live, authenticated, route_pending, route_completed;
+    int live, authenticated, route_pending, route_completed, release_failed;
 };
-static const struct steer_pv1_stream_api *sa;
 static const struct steer_pv1_buffer_api *ba;
 static void advance(struct client *);
 static void reap_generations(struct host *);
 static void close_control(struct control *);
 static void stop_writer(struct host *);
+static void close_listener(struct host *,struct listener *);
+#ifdef STEER_PROTOTYPE_HY2
+static int reap_hy2_listeners(struct host *);
+static void prepared_ready(void *,struct steer_prototype_prepared_input *);
+#endif
 static void close_client(struct client *c)
 {
     if (!c->live || c->phase == CLOSING) return;
     c->phase = CLOSING;
     loop_timer_stop(c->deadline);
     if (c->route_pending) c->route.operation.api->cancel(c->route.operation.handle);
-    if (c->down) sa->close(c->down);
-    if (c->up) sa->close(c->up);
+    if (c->down.handle) c->down.api->close(c->down.handle);
+    if (c->up.handle) c->up.api->close(c->up.handle);
     loop_timer_set(c->host->work, 0);
 }
 static void deadline(struct loop *l, struct loop_timer *t, void *arg)
@@ -160,12 +200,18 @@ static void done(void *arg, struct steer_pv1_error e,
     d->completed = 1;
     loop_timer_set(d->client->host->work, 0);
 }
-static int submit(struct direction *d, struct steer_pv1_stream *stream,
+static void finish_done(void *arg, struct steer_pv1_error error)
+{
+    struct direction *d = arg;
+    d->error = error.code; d->bytes = 0; d->completed = 1;
+    loop_timer_set(d->client->host->work, 0);
+}
+static int submit(struct direction *d, struct steer_pv1_stream_ref stream,
                   int writing, uint32_t offset, uint32_t length)
 {
     d->writing = writing; d->offset = offset; d->length = length;
-    d->operation = writing ? sa->write(stream, d->buffer, offset, length, done, d) :
-                             sa->read(stream, d->buffer, offset, length, done, d);
+    d->operation = writing ? stream.api->write(stream.handle, d->buffer, offset, length, done, d) :
+                             stream.api->read(stream.handle, d->buffer, offset, length, done, d);
     if (d->operation.disposition != STEER_PV1_PENDING) {
         close_client(d->client); return 0;
     }
@@ -215,18 +261,21 @@ static int verify(void *arg, const uint8_t *user, size_t un,
            !memcmp(user, identity->user, un) && !memcmp(password, identity->password, pn);
     return c->authenticated;
 }
-static void route_done(void *arg, struct steer_pv1_error error, uint32_t failure,
-                       struct steer_pv1_stream *stream, const struct steer_pv1_endpoint *bound)
+static void route_done(void *arg, struct steer_pv1_error error,
+                       struct steer_pv1_stream_ref stream, const struct steer_pv1_endpoint *bound,
+                       const struct steer_pv1_endpoint *peer,
+                       const struct steer_pv1_stream_open_diagnostic *diagnostic)
 {
     struct client *c = arg;
-    c->route_error = error.code; c->dial_failure = failure;
+    (void)peer;
+    c->route_error = error.code; c->dial_failure = diagnostic ? diagnostic->dial_failure : 0;
     c->route_completed = 1; c->up = stream;
     if (bound) {
         c->bound.type = bound->tag == STEER_PV1_ENDPOINT_IPV4 ? 1 : 4;
         c->bound.length = (uint8_t)bound->address.len; c->bound.port = bound->port;
         memcpy(c->bound.bytes, bound->address.data, bound->address.len);
     }
-    if (c->phase == CLOSING && stream) sa->close(stream);
+    if (c->phase == CLOSING && stream.handle) stream.api->close(stream.handle);
     loop_timer_set(c->host->work, 0);
 }
 static uint8_t route_reply_code(uint32_t error, uint32_t failure)
@@ -242,9 +291,10 @@ static uint8_t route_reply_code(uint32_t error, uint32_t failure)
 }
 static void dial(struct client *c)
 {
-    struct steer_draft_accepted flow = {0};
+    struct steer_pv1_flow_metadata flow = {0};
     const char *inbound = c->identity.id;
     const char *principal = c->identity.principal;
+    flow.size = sizeof(flow); flow.version = STEER_PV1_DRAFT_LAYOUT;
     flow.generation = c->generation->number;
     flow.inbound_id.data = (const uint8_t *)inbound;
     flow.inbound_id.len = (uint32_t)strlen(inbound);
@@ -262,7 +312,7 @@ static void dial(struct client *c)
     flow.destination.port = c->target.port;
     c->phase = DIALING;
     loop_timer_set(c->deadline, 5000);
-    c->route = steer_draft_route_dial(c->generation->routes, &flow,
+    c->route = steer_draft_stream_route_open(c->generation->streams, &flow,
         ((uint64_t)loop_now_ms() + 5000u) * 1000000u, route_done, c);
     if (c->route.disposition == STEER_PV1_PENDING) c->route_pending = 1;
     else dial_reply(c, route_reply_code(c->route.error.code, 0), NULL);
@@ -316,8 +366,13 @@ static void relay_start(struct client *c)
 static void relay_done(struct client *c, unsigned index)
 {
     struct direction *d = &c->directions[index];
-    struct steer_pv1_stream *source = index ? c->up : c->down;
-    struct steer_pv1_stream *target = index ? c->down : c->up;
+    struct steer_pv1_stream_ref source = index ? c->up : c->down;
+    struct steer_pv1_stream_ref target = index ? c->down : c->up;
+    if (d->finishing) {
+        d->finishing = 0; d->finished = 1;
+        if (c->directions[1-index].finished) close_client(c);
+        return;
+    }
     if (d->writing) {
         if (!d->bytes) { close_client(c); return; }
         if (d->bytes < d->length) {
@@ -326,8 +381,12 @@ static void relay_done(struct client *c, unsigned index)
     } else if (d->bytes) (void)submit(d, target, 1, 0, d->bytes);
     else {
         d->eof = 1;
-        if (sa->shutdown_write(target).code) close_client(c);
-        else if (c->directions[1-index].eof) close_client(c);
+        if (!(target.api->capabilities(target.handle) & STEER_PV1_STREAM_CAP_HALF_CLOSE)) {
+            close_client(c); return;
+        }
+        d->operation = target.api->finish_write(target.handle, finish_done, d);
+        if (d->operation.disposition != STEER_PV1_PENDING) close_client(c);
+        else { d->pending = 1; d->finishing = 1; }
     }
 }
 static void advance(struct client *c)
@@ -364,9 +423,19 @@ static void advance(struct client *c)
             }
         }
     }
-    if (c->phase == CLOSING && !c->route_pending && !c->directions[0].pending && !c->directions[1].pending) {
-        if (c->up && sa->release(c->up).code) abort();
-        if (c->down && sa->release(c->down).code) abort();
+    if (c->phase == CLOSING && !c->release_failed && !c->route_pending &&
+        !c->directions[0].pending && !c->directions[1].pending) {
+        struct steer_pv1_stream_ref *streams[2] = {&c->up, &c->down};
+        for (i = 0; i < 2; ++i) if (streams[i]->handle) {
+            if (streams[i]->api->release(streams[i]->handle).code) {
+                /* Contract violation: retain the handle, client budget and
+                 * generation. Do not retry a foreign release on every pump. */
+                c->release_failed = 1;
+                fputs("stream provider release refused; client quarantined\n", stderr);
+                return;
+            }
+            memset(streams[i], 0, sizeof(*streams[i]));
+        }
         for (i = 0; i < 2; ++i)
             if (c->directions[i].buffer) ba->release(c->host->buffers, c->directions[i].buffer);
         loop_timer_free(c->deadline); c->deadline = NULL;
@@ -379,11 +448,23 @@ static void work(struct loop *l, struct loop_timer *t, void *arg)
     struct host *h = arg; unsigned i;
     (void)t;
     for (i = 0; i < CLIENTS; ++i) if (h->clients[i].live) advance(&h->clients[i]);
+#ifdef STEER_PROTOTYPE_HY2
+    int hy2_pending=reap_hy2_listeners(h);
+    if(h->stopping&&h->preparer) {
+        steer_prototype_prepare_stop(h->preparer);
+        if(!steer_prototype_prepare_destroy(h->preparer))h->preparer=NULL;
+        else { hy2_pending=1;loop_timer_set(h->work,10); }
+    }
+#else
+    int hy2_pending=0;
+#endif
     reap_generations(h);
-    if (h->stopping && !h->live && !h->store_busy) {
+    if (h->stopping && !h->live && !h->store_busy && !hy2_pending) {
         h->current = NULL;
         reap_generations(h); /* release route-generation resolver references */
-        if (h->resolver && steer_draft_resolver_jobs(h->resolver)) {
+        unsigned generations = 0;
+        for (i = 0; i < GENERATIONS; ++i) generations += h->generations[i].number != 0;
+        if (generations || (h->resolver && steer_draft_resolver_jobs(h->resolver))) {
             loop_timer_set(h->work, 10); /* cancelled NSS still owns bounded job */
         } else loop_stop(l, 0);
     }
@@ -418,8 +499,14 @@ static void accept_clients(struct loop *l, int fd, uint32_t events, void *arg)
         }
         c->deadline = loop_timer_new(l, deadline, c);
         c->directions[0].client = c; c->directions[1].client = c;
-        if (!c->deadline || steer_draft_stream_adopt(h->runtime, accepted, &c->down).code) {
+        struct steer_pv1_stream *native = NULL;
+        if (!c->deadline || steer_draft_stream_adopt(h->runtime, accepted, &native).code) {
             close(accepted); close_client(c); continue;
+        }
+        if (steer_draft_backend_wrap_native(h->backend_runtime, native, NULL, &c->down).code) {
+            steer_draft_stream_api()->close(native);
+            (void)steer_draft_stream_api()->release(native);
+            close_client(c); continue;
         }
         if (ba->allocate(h->buffers, CAPACITY, &c->directions[0].buffer).code ||
             ba->allocate(h->buffers, CAPACITY, &c->directions[1].buffer).code) {
@@ -436,13 +523,14 @@ static void stop(struct loop *l, int signo, void *arg)
     struct host *h = arg; unsigned i;
     (void)l; (void)signo;
     h->stopping = 1;
+#ifdef STEER_PROTOTYPE_HY2
+    if(h->preparer)steer_prototype_prepare_stop(h->preparer);
+#endif
     if (h->control_fd >= 0) {
         loop_fd_del(h->loop, h->control_fd); close(h->control_fd); h->control_fd = -1;
     }
     if (h->controls) for (i = 0; i < CONTROLS; ++i) close_control(&h->controls[i]);
-    for (i = 0; i < LISTENERS; ++i) if (h->listeners[i].fd >= 0) {
-        loop_fd_del(h->loop, h->listeners[i].fd); close(h->listeners[i].fd); h->listeners[i].fd = -1;
-    }
+    for (i = 0; i < LISTENERS; ++i) close_listener(h,&h->listeners[i]);
     for (i = 0; i < CLIENTS; ++i) if (h->clients[i].live) close_client(&h->clients[i]);
     loop_timer_set(h->work, 0);
 }
@@ -470,13 +558,98 @@ static int parse_uuid(const char *text, uint8_t uuid[16])
     }
     return out == 16;
 }
-static void destroy_generation(struct generation *g)
+static struct steer_pv1_error select_stream(void *context,
+    const struct steer_pv1_flow_metadata *flow, uint32_t *index)
 {
-    if (g->routes && steer_draft_routes_destroy(g->routes).code) abort();
+    struct steer_policy_input input = {flow->generation, flow->inbound_id,
+                                      flow->principal_id, &flow->destination};
+    struct steer_policy_decision decision;
+    struct steer_pv1_error error = steer_policy_evaluate(context, &input, &decision);
+    *index = !error.code && decision.action == STEER_POLICY_DIRECT ? 0 : STEER_DRAFT_STREAM_ROUTE_BLOCK;
+    return error;
+}
+static void generation_retired(void *arg)
+{
+    struct generation *g = arg;
+    loop_timer_set(g->host->work, 0);
+}
+static int prepare_stream_routes(struct host *h, struct generation *g)
+{
+    g->host = h;
+    if (steer_draft_native_stream_backend_create(h->loop, h->runtime, h->backend_runtime,
+        h->resolver, g->number, g->number, CLIENTS, 16*CLIENTS,
+        generation_retired, g, &g->native).code) return 0;
+    return !steer_draft_stream_routes_create(h->loop, g->number, CLIENTS, CLIENTS,
+        steer_draft_native_stream_binding(g->native), 1, select_stream, g->policy,
+        NULL, &g->streams).code;
+}
+#ifdef STEER_PROTOTYPE_HY2
+static struct steer_pv1_error select_datagram(void *context,const struct steer_pv1_flow_metadata *flow,uint32_t *action){
+    struct steer_policy_input input={flow->generation,flow->inbound_id,flow->principal_id,&flow->destination};
+    struct steer_policy_decision decision;struct steer_pv1_error error=steer_policy_evaluate(context,&input,&decision);
+    *action=!error.code&&decision.action==STEER_POLICY_DIRECT?STEER_DRAFT_DATAGRAM_ROUTE_DIRECT:STEER_DRAFT_DATAGRAM_ROUTE_BLOCK;
+    return error;
+}
+static void datagram_finalized(void *user,const struct steer_draft_binding_identity *identity){
+    struct generation *g=user;(void)identity;g->datagram_finalized=1;loop_timer_set(g->host->work,0);
+}
+static void retire_datagram_generation(struct generation *g){
+    if(g->datagrams)steer_draft_datagram_router_quiesce(g->datagrams);
+    if(g->datagram_binding&&!g->datagram_retired){
+        (void)steer_draft_binding_retire(g->datagram_binding);g->datagram_retired=1;
+    }
+}
+static void datagram_drained(void *user,struct steer_draft_datagram_router *router){
+    struct generation *g=user;if(g->datagrams!=router)abort();
+    /* Destroy only from the separate host-owner turn, after notification. */
+    loop_timer_set(g->host->work,0);
+}
+static int prepare_datagram_routes(struct host *h,struct generation *g){
+    struct steer_draft_binding_identity identity={.size=sizeof identity,.version=STEER_PV1_DRAFT_LAYOUT,
+        .generation=g->number,.instance_token=g->number,.provider_id={(const uint8_t *)"native-udp",10},.flow_class=STEER_PV1_FLOW_DATAGRAM};
+    struct steer_draft_datagram_route_limits limits={64,64,8,256,8*65507+262144,60000000000ULL};
+    if(steer_draft_binding_lease_create(h->loop,&identity,4096,datagram_finalized,g,&g->datagram_binding).code||
+       steer_draft_datagram_runtime_create(h->loop,h->buffers,64,256,8*65507+262144,&g->datagram_native).code)return 0;
+    if(h->resolver&&steer_draft_datagram_use_resolver(g->datagram_native,h->resolver).code)return 0;
+    if(steer_draft_datagram_router_create(h->loop,h->buffers,g->datagram_binding,steer_draft_datagram_backend_api(),
+        g->datagram_native,&limits,select_datagram,g->policy,&g->datagrams).code)return 0;
+    return !steer_draft_datagram_router_on_drained(g->datagrams,datagram_drained,g).code;
+}
+#endif
+static int destroy_generation(struct generation *g)
+{
+    g->preparing = 0;
+#ifdef STEER_PROTOTYPE_HY2
+    retire_datagram_generation(g);
+    if(g->datagrams){
+        steer_draft_datagram_router_close(g->datagrams);
+        if(steer_draft_datagram_router_destroy(g->datagrams).code)return 0;
+        g->datagrams=NULL;
+    }
+    if(g->datagram_native){if(steer_draft_datagram_runtime_destroy(g->datagram_native).code)return 0;g->datagram_native=NULL;}
+    if(g->datagram_binding){
+        if(!g->datagram_finalized||steer_draft_binding_lease_destroy(g->datagram_binding).code)return 0;
+        g->datagram_binding=NULL;
+    }
+#endif
+    if (g->streams) {
+        if (steer_draft_stream_routes_destroy(g->streams).code) return 0;
+        g->streams = NULL;
+    }
+    if (g->native) {
+        (void)steer_draft_native_stream_backend_retire(g->native);
+        if (steer_draft_native_stream_backend_destroy(g->native).code) return 0;
+        g->native = NULL;
+    }
+    if (g->routes) {
+        if (steer_draft_routes_destroy(g->routes).code) return 0;
+        g->routes = NULL;
+    }
     if (g->config) steer_prototype_config_destroy(g->config);
     else steer_policy_destroy(g->policy);
     free(g->document);
     memset(g, 0, sizeof(*g));
+    return 1;
 }
 static void reap_generations(struct host *h)
 {
@@ -489,34 +662,143 @@ static void reap_generations(struct host *h)
 static int initialize_host(struct host *h, struct client *clients)
 {
     unsigned i;
-    struct steer_draft_buffer_limits limits = {2 * CLIENTS * (CAPACITY + 256), 2 * CLIENTS, 1};
+    struct steer_draft_buffer_limits limits = steer_draft_prototype_buffer_limits(CLIENTS,CAPACITY,0);
+#ifdef STEER_PROTOTYPE_HY2
+    steer_draft_hy2_datagram_budget_init(&h->datagram_budget);
+    /* Keep the original TCP byte and slot reserve even at full UDP envelope. */
+    limits=steer_draft_prototype_buffer_limits(CLIENTS,CAPACITY,1);
+#endif
     h->clients = clients;
     h->control_fd = -1;
     h->writer.wake = -1;
     for (i = 0; i < LISTENERS; ++i) h->listeners[i].fd = -1;
-    sa = steer_draft_stream_api(); ba = steer_draft_buffers_api();
+    ba = steer_draft_buffers_api();
     h->loop = loop_new();
     if (!h->loop || steer_draft_buffers_create(&limits, NULL, &h->buffers).code) return 0;
     if (steer_draft_stream_runtime_create(h->loop, h->buffers, 2*CLIENTS, 2*CLIENTS,
                                         2*CLIENTS*CAPACITY, &h->runtime).code) return 0;
     h->work = loop_timer_new(h->loop, work, h);
     if (!h->work) return 0;
+    if (steer_draft_backend_runtime_create(h->loop, 2*CLIENTS, 4*CLIENTS,
+                                          2*CLIENTS*CAPACITY, &h->backend_runtime).code) return 0;
     (void)loop_signal(h->loop, SIGTERM, stop, h); (void)loop_signal(h->loop, SIGINT, stop, h);
     return 1;
 }
 static void close_listener(struct host *h, struct listener *listener)
 {
+#ifdef STEER_PROTOTYPE_HY2
+    if(listener->hy2) {
+        steer_draft_hy2_stop(listener->hy2);
+        if(!steer_draft_hy2_destroy(listener->hy2)) { listener->hy2=NULL;listener->retiring=0; }
+        else if(h->work)loop_timer_set(h->work,0);
+    }
+#endif
     if (listener->fd >= 0) {
         loop_fd_del(h->loop, listener->fd); close(listener->fd); listener->fd = -1;
     }
     listener->active = 0;
 }
-static int bind_listener(struct host *h, struct listener *listener)
+static int listener_bound(const struct listener *listener) {
+#ifdef STEER_PROTOTYPE_HY2
+    if(listener->hy2)return 1;
+#endif
+    return listener->fd>=0;
+}
+static int same_transport(const struct steer_prototype_listener *a,const struct steer_prototype_listener *b) {
+    return (a->protocol==STEER_PROTOTYPE_HYSTERIA2)==(b->protocol==STEER_PROTOTYPE_HYSTERIA2);
+}
+#ifdef STEER_PROTOTYPE_HY2
+static int hy2_authenticate(void *user,struct steer_pv1_span inbound,const uint8_t *token,size_t n,char principal[65],uint64_t *epoch) {
+    struct listener *l=user;unsigned difference=0;
+    if(!l->active||l->host->stopping||inbound.len!=strlen(l->spec.id)||memcmp(inbound.data,l->spec.id,inbound.len)||n!=l->identity.token_length)return 0;
+    for(size_t i=0;i<n;i++)difference|=token[i]^(uint8_t)l->identity.token[i];
+    if(difference)return 0;
+    strcpy(principal,l->identity.principal);*epoch=l->admission_epoch;return 1;
+}
+static struct steer_pv1_error hy2_acquire(void *user,struct steer_pv1_span inbound,struct steer_pv1_span principal,uint64_t epoch,struct steer_draft_route_lease *lease) {
+    struct listener *l=user;struct host *h=l->host;
+    if(!l->active||h->stopping||epoch!=l->admission_epoch||!h->current||
+       inbound.len!=strlen(l->spec.id)||memcmp(inbound.data,l->spec.id,inbound.len)||
+       principal.len!=strlen(l->identity.principal)||memcmp(principal.data,l->identity.principal,principal.len))
+        return (struct steer_pv1_error){STEER_PV1_POLICY_DENIED,0};
+    if(h->current->references==UINT_MAX)return (struct steer_pv1_error){STEER_PV1_RESOURCE_EXHAUSTED,0};
+    h->current->references++;
+    *lease=(struct steer_draft_route_lease){h->current->routes,h->current->number,h->current};
+    return (struct steer_pv1_error){0,0};
+}
+static void hy2_release(void *user,struct steer_draft_route_lease *lease) {
+    struct listener *l=user;struct generation *g=lease->handle;
+    if(!g||!g->references)abort();
+    g->references--;memset(lease,0,sizeof *lease);loop_timer_set(l->host->work,0);
+}
+static struct steer_pv1_error hy2_datagram_acquire(void *user,struct steer_pv1_span inbound,struct steer_pv1_span principal,
+    uint64_t epoch,struct steer_draft_hy2_datagram_binding *out){
+    struct listener *listener=user;struct steer_draft_route_lease lease={0};
+    struct steer_pv1_error error=hy2_acquire(user,inbound,principal,epoch,&lease);if(error.code)return error;
+    struct generation *g=lease.handle;
+    error=steer_draft_binding_admit(g->datagram_binding,g->number,STEER_PV1_FLOW_DATAGRAM);
+    if(error.code){hy2_release(user,&lease);return error;}
+    *out=(struct steer_draft_hy2_datagram_binding){steer_draft_datagram_router_api(),g->datagrams,g,g->number};
+    (void)listener;return (struct steer_pv1_error){0,0};
+}
+static void hy2_datagram_release(void *user,struct steer_draft_hy2_datagram_binding *binding){
+    struct listener *listener=user;struct generation *g=binding->lease;
+    if(!g||!g->references||steer_draft_binding_unpin(g->datagram_binding).code)abort();
+    g->references--;memset(binding,0,sizeof *binding);loop_timer_set(listener->host->work,0);
+}
+static int bind_hy2(struct host *h,struct listener *listener,struct qc_server_tls *tls) {
+    if(!tls||h->next_admission_epoch==UINT64_MAX)return 0;
+    listener->admission_epoch=++h->next_admission_epoch;
+    struct steer_draft_hy2_datagram_services datagrams={h->loop,h->buffers,&h->datagram_budget,listener,hy2_datagram_acquire,hy2_datagram_release};
+    struct steer_draft_inbound_services services={h->loop,h->buffers,h->runtime,listener,hy2_authenticate,hy2_acquire,hy2_release,&datagrams};
+    struct steer_draft_hy2_config cfg={.inbound_id=listener->spec.id,.max_flows=CLIENTS,.start_paused=1,
+        .endpoint={.max_connections=8,.prepared_tls=tls,.server={.bind_host=listener->spec.address,.port=listener->spec.port,.alpn="h3"}}};
+    int result=steer_draft_hy2_open(&cfg,&services,&listener->hy2);
+    if(result)return 0;
+    listener->spec.port=steer_draft_hy2_port(listener->hy2);return 1;
+}
+static void retire_listener(struct host *h,struct listener *listener) {
+    if(listener->hy2&&!h->stopping) {
+        listener->active=0;
+        if(!listener->retiring) {
+            listener->retiring=1;listener->drain_deadline=(uint64_t)loop_now_ms()+HY2_DRAIN_MS;
+            steer_draft_hy2_retire(listener->hy2,listener->drain_deadline);
+        }
+        loop_timer_set(h->work,100);return;
+    }
+    close_listener(h,listener);
+}
+static int reap_hy2_listeners(struct host *h) {
+    int pending=0;
+    for(unsigned i=0;i<LISTENERS;i++) {
+        struct listener *l=&h->listeners[i];
+        if(!l->hy2||(!h->stopping&&!l->retiring))continue;
+        if(h->stopping)steer_draft_hy2_stop(l->hy2);
+        if(!steer_draft_hy2_connections(l->hy2)&&!steer_draft_hy2_flows(l->hy2)) {
+            steer_draft_hy2_stop(l->hy2);
+            if(!steer_draft_hy2_destroy(l->hy2)) { l->hy2=NULL;l->retiring=0;continue; }
+        }
+        pending=1;
+    }
+    if(pending)loop_timer_set(h->work,100);
+    return pending;
+}
+#endif
+struct qc_server_tls;
+static int bind_listener(struct host *h, struct listener *listener,struct qc_server_tls *tls)
 {
     struct sockaddr_storage address;
     socklen_t length;
     int family, reuse = 1;
     memset(&address, 0, sizeof(address)); listener->host = h;
+    if(listener->spec.protocol==STEER_PROTOTYPE_HYSTERIA2) {
+#ifdef STEER_PROTOTYPE_HY2
+        return bind_hy2(h,listener,tls);
+#else
+        (void)tls;
+        return 0;
+#endif
+    }
     if (strchr(listener->spec.address, ':')) {
         struct sockaddr_in6 *a = (struct sockaddr_in6 *)&address;
         family = AF_INET6; length = sizeof(*a); a->sin6_family = AF_INET6;
@@ -543,18 +825,32 @@ static int bind_listener(struct host *h, struct listener *listener)
 static void cleanup_host(struct host *h)
 {
     unsigned i;
-    if (h->control_fd >= 0) { loop_fd_del(h->loop, h->control_fd); close(h->control_fd); }
+    if (h->control_fd >= 0) {
+        loop_fd_del(h->loop, h->control_fd); close(h->control_fd); h->control_fd = -1;
+    }
     if (h->controls) {
         for (i = 0; i < CONTROLS; ++i) close_control(&h->controls[i]);
-        free(h->controls);
+        free(h->controls); h->controls = NULL;
     }
     if (h->control_path[0]) unlink(h->control_path);
     stop_writer(h);
+#ifdef STEER_PROTOTYPE_HY2
+    steer_prototype_prepare_join_destroy(h->preparer);h->preparer=NULL;
+#endif
     for (i = 0; i < LISTENERS; ++i) close_listener(h, &h->listeners[i]);
+    /* Startup rollback may retire a prepared binding before the first loop
+     * dispatch. Its deferred finalizer still owns generation storage. */
+    h->current = NULL;
+    unsigned pending = 0;
+    for (i = 0; i < GENERATIONS; ++i) pending += !destroy_generation(&h->generations[i]);
+    if (pending && h->work) {
+        h->stopping = 1; loop_timer_set(h->work, 0);
+        (void)loop_run(h->loop);
+    }
     loop_timer_free(h->work);
-    for (i = 0; i < GENERATIONS; ++i) destroy_generation(&h->generations[i]);
     if (h->resolver && steer_draft_resolver_destroy(h->resolver).code) abort();
     if (h->store && steer_prototype_store_close(h->store).code) abort();
+    if (h->backend_runtime && steer_draft_backend_runtime_destroy(h->backend_runtime).code) abort();
     if (h->runtime && steer_draft_stream_runtime_destroy(h->runtime).code) abort();
     if (h->buffers && steer_draft_buffers_destroy(h->buffers).code) abort();
     if (h->loop) loop_free(h->loop);
@@ -599,12 +895,16 @@ int steer_lab_loopback_main(int argc, char **argv, int vless)
     rule.action = !strcmp(argv[1], "block") ? STEER_POLICY_BLOCK : STEER_POLICY_DIRECT;
     if (steer_policy_compile(1, &rule, 1, STEER_POLICY_BLOCK, &g->policy).code) goto cleanup;
     if (steer_draft_routes_create(h.loop, h.runtime, 1, CLIENTS, steer_policy_route, g->policy, &g->routes).code) goto cleanup;
+    if (!prepare_stream_routes(&h, g)) goto cleanup;
+#ifdef STEER_PROTOTYPE_HY2
+    if (!prepare_datagram_routes(&h, g)) goto cleanup;
+#endif
     h.current = g; listener->identity = identity;
     listener->active = 1;
     strcpy(listener->spec.id, identity.id); strcpy(listener->spec.address, bind_address);
     listener->spec.port = (uint16_t)port;
     listener->spec.protocol = vless ? STEER_PROTOTYPE_VLESS : STEER_PROTOTYPE_SOCKS;
-    if (!bind_listener(&h, listener)) goto cleanup;
+    if (!bind_listener(&h, listener,NULL)) goto cleanup;
     printf("PORT %u\n", listener->spec.port); fflush(stdout);
     status = loop_run(h.loop);
 cleanup:
@@ -626,6 +926,12 @@ static int resolve_identity(const struct steer_prototype_listener *spec, struct 
         return identity->user_length && identity->user_length <= 255 &&
                identity->password_length && identity->password_length <= 255;
     }
+    if(spec->auth==STEER_PROTOTYPE_AUTH_PASSWORD&&spec->protocol==STEER_PROTOTYPE_HYSTERIA2) {
+        identity->token=getenv(spec->password_ref+4);
+        if(!identity->token)return 0;
+        identity->token_length=strlen(identity->token);
+        return identity->token_length&&identity->token_length<=1024;
+    }
     return !identity->vless && spec->auth == STEER_PROTOTYPE_AUTH_NONE;
 }
 static int same_listener(const struct steer_prototype_listener *a, const struct steer_prototype_listener *b)
@@ -633,26 +939,67 @@ static int same_listener(const struct steer_prototype_listener *a, const struct 
     return a->port == b->port && a->protocol == b->protocol && a->auth == b->auth &&
         !strcmp(a->id, b->id) && !strcmp(a->address, b->address) &&
         !strcmp(a->principal_id, b->principal_id) && !strcmp(a->username_ref, b->username_ref) &&
-        !strcmp(a->password_ref, b->password_ref) && !strcmp(a->uuid_ref, b->uuid_ref);
+        !strcmp(a->password_ref, b->password_ref) && !strcmp(a->uuid_ref, b->uuid_ref)&&
+        !strcmp(a->certificate_ref,b->certificate_ref)&&!strcmp(a->private_key_ref,b->private_key_ref);
+}
+static int same_identity(const struct listener_identity *a,const struct listener_identity *b) {
+    return a->user_length==b->user_length&&a->password_length==b->password_length&&a->token_length==b->token_length&&
+        (!a->user_length||!memcmp(a->user,b->user,a->user_length))&&
+        (!a->password_length||!memcmp(a->password,b->password,a->password_length))&&
+        (!a->token_length||!memcmp(a->token,b->token,a->token_length))&&
+        !memcmp(a->uuid,b->uuid,sizeof a->uuid)&&!memcmp(a->certificate_hash,b->certificate_hash,32)&&
+        !memcmp(a->private_key_hash,b->private_key_hash,32);
 }
 /* No callbacks interleave preparation/publication: one owning loop shard.
  * New sockets are closed on failure; old listeners and generation stay live. */
 static int prepare_configuration(struct host *h, const char *document, size_t length,
                                  uint64_t expected, int validate, uint64_t initial_revision,
-                                 struct prepared *prepared_state)
+                                 struct prepared *prepared_state,struct steer_prototype_prepared_input *inputs)
 {
     struct steer_prototype_config *config = NULL;
     struct listener_identity identities[STEER_PROTOTYPE_MAX_LISTENERS];
+#ifdef STEER_PROTOTYPE_HY2
+    struct qc_server_tls *contexts[STEER_PROTOTYPE_MAX_LISTENERS]={0};
+#endif
     struct generation *g = NULL;
     unsigned i, j;
     int result = 422;
     uint64_t next = h->current ? h->current->number + 1 : initial_revision;
     memset(prepared_state, 0, sizeof(*prepared_state));
     if (!validate && expected != (h->current ? h->current->number : 0)) return 409;
-    if (!next || steer_prototype_config_parse(document, length, next, &config).code) return 422;
+    if(!next)return 422;
+#ifdef STEER_PROTOTYPE_HY2
+    if(inputs) { config=inputs->config;inputs->config=NULL;if(!config)return 422; }
+    else
+#else
+    (void)inputs;
+#endif
+    if(steer_prototype_config_parse(document,length,next,&config).code)return 422;
     if (!config->document_json || config->document_length > STEER_PROTOTYPE_CONFIG_MAX_BYTES) goto cleanup;
-    for (i = 0; i < config->listener_count; ++i)
-        if (config->listeners[i].enabled && !resolve_identity(&config->listeners[i], &identities[i])) goto cleanup;
+    if(!validate&&config->generation!=next) { result=409;goto cleanup; }
+    for (i = 0; i < config->listener_count; ++i)if(config->listeners[i].enabled) {
+#ifndef STEER_PROTOTYPE_HY2
+        if(config->listeners[i].protocol==STEER_PROTOTYPE_HYSTERIA2)goto cleanup;
+#endif
+        if(!resolve_identity(&config->listeners[i],&identities[i]))goto cleanup;
+#ifdef STEER_PROTOTYPE_HY2
+        if(config->listeners[i].protocol==STEER_PROTOTYPE_HYSTERIA2) {
+            if(inputs) {
+                contexts[i]=inputs->tls[i];inputs->tls[i]=NULL;if(!contexts[i])goto cleanup;
+                memcpy(identities[i].certificate_hash,inputs->certificate_hash[i],32);
+                memcpy(identities[i].private_key_hash,inputs->private_key_hash[i],32);
+            } else {
+                /* Bootstrap only: no packet IO has been dispatched yet. */
+                const struct steer_prototype_listener *spec=&config->listeners[i];struct steer_draft_tls_material material;
+                if(steer_draft_tls_material_load(getenv(spec->certificate_ref+4),getenv(spec->private_key_ref+4),&material))goto cleanup;
+                int error=qcssl_material_sha256(material.certificate,material.certificate_length,identities[i].certificate_hash)||
+                    qcssl_material_sha256(material.private_key,material.private_key_length,identities[i].private_key_hash);
+                if(!error)error=qc_server_tls_create(material.certificate,material.certificate_length,material.private_key,material.private_key_length,&contexts[i]);
+                steer_draft_tls_material_clear(&material);if(error)goto cleanup;
+            }
+        }
+#endif
+    }
     if (validate) { result = 200; goto cleanup; }
     reap_generations(h);
     for (i = 0; i < GENERATIONS; ++i) if (!h->generations[i].number) { g = &h->generations[i]; break; }
@@ -670,27 +1017,38 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     if (h->resolver && steer_draft_routes_use_resolver(g->routes, h->resolver).code) {
         result = 503; goto cleanup;
     }
+    if (!prepare_stream_routes(h, g)) { result = 503; goto cleanup; }
+#ifdef STEER_PROTOTYPE_HY2
+    if (!prepare_datagram_routes(h, g)) { result = 503; goto cleanup; }
+#endif
     for (i = 0; i < g->config->listener_count; ++i) {
         const struct steer_prototype_listener *spec = &g->config->listeners[i];
         struct listener *listener = NULL;
         if (!spec->enabled) continue;
-        for (j = 0; j < LISTENERS; ++j) if (h->listeners[j].fd >= 0 &&
-            same_listener(&h->listeners[j].spec, spec)) {
+        for (j = 0; j < LISTENERS; ++j) if (listener_bound(&h->listeners[j])&&h->listeners[j].active&&
+            same_listener(&h->listeners[j].spec, spec)&&same_identity(&h->listeners[j].identity,&identities[i])) {
             listener = &h->listeners[j]; prepared_state->keep[j] = 1; break;
         }
         if (listener) continue;
         /* Changing a live endpoint's protocol/auth/ID requires disable then
          * create. No SO_REUSEPORT split or nontransactional close/rebind. */
-        for (j = 0; j < LISTENERS; ++j) if (h->listeners[j].fd >= 0 &&
+        for (j = 0; j < LISTENERS; ++j) if (listener_bound(&h->listeners[j])&&same_transport(&h->listeners[j].spec,spec)&&
             h->listeners[j].spec.port == spec->port && !strcmp(h->listeners[j].spec.address, spec->address)) goto cleanup;
-        for (j = 0; j < LISTENERS; ++j) if (h->listeners[j].fd < 0) { listener = &h->listeners[j]; break; }
+        for (j = 0; j < LISTENERS; ++j) if (!listener_bound(&h->listeners[j])) { listener = &h->listeners[j]; break; }
         if (!listener) { result = 503; goto cleanup; }
         listener->spec = *spec; listener->identity = identities[i]; listener->active = 0;
-        if (!bind_listener(h, listener)) goto cleanup;
+        struct qc_server_tls *tls=NULL;
+#ifdef STEER_PROTOTYPE_HY2
+        tls=contexts[i];
+#endif
+        if (!bind_listener(h, listener,tls)) goto cleanup;
         prepared_state->keep[j] = prepared_state->created[j] = 1;
     }
     prepared_state->generation = g; g = NULL; result = 200;
 cleanup:
+#ifdef STEER_PROTOTYPE_HY2
+    for(i=0;i<STEER_PROTOTYPE_MAX_LISTENERS;i++)qc_server_tls_release(contexts[i]);
+#endif
     if (result != 200) for (i = 0; i < LISTENERS; ++i) if (prepared_state->created[i]) close_listener(h, &h->listeners[i]);
     if (g) destroy_generation(g);
     steer_prototype_config_destroy(config);
@@ -709,9 +1067,22 @@ static void publish_prepared(struct host *h, struct prepared *prepared)
 {
     unsigned i;
     for (i = 0; i < LISTENERS; ++i) {
-        if (!prepared->keep[i] || h->stopping) close_listener(h, &h->listeners[i]);
-        else h->listeners[i].active = 1;
+        if (!prepared->keep[i] || h->stopping) {
+#ifdef STEER_PROTOTYPE_HY2
+            retire_listener(h,&h->listeners[i]);
+#else
+            close_listener(h,&h->listeners[i]);
+#endif
+        } else {
+            h->listeners[i].active = 1;
+#ifdef STEER_PROTOTYPE_HY2
+            if(h->listeners[i].hy2)steer_draft_hy2_activate(h->listeners[i].hy2);
+#endif
+        }
     }
+#ifdef STEER_PROTOTYPE_HY2
+    if(h->current)retire_datagram_generation(h->current);
+#endif
     h->current = prepared->generation; h->current->preparing = 0;
     prepared->generation = NULL;
     reap_generations(h);
@@ -720,7 +1091,7 @@ static int configure(struct host *h, const char *document, size_t length, uint64
                      int validate, uint64_t initial_revision)
 {
     struct prepared prepared;
-    int result = prepare_configuration(h, document, length, expected, validate, initial_revision, &prepared);
+    int result = prepare_configuration(h, document, length, expected, validate, initial_revision, &prepared,NULL);
     if (result == 200 && !validate) publish_prepared(h, &prepared);
     return result;
 }
@@ -728,26 +1099,59 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 {
     size_t used;
     unsigned i, count = 0;
-    int n = snprintf(out, capacity, "{\"prototype\":\"steer-linux-v1\",\"generation\":%llu,\"revision\":%llu,\"runtimeReady\":true,\"persistence\":%s,\"durability_uncertain\":%s,\"activeClients\":%u,\"listeners\":[",
+    unsigned retained=0;for(i=0;i<GENERATIONS;i++)retained+=h->generations[i].number!=0;
+    unsigned active_clients=h->live;
+#ifdef STEER_PROTOTYPE_HY2
+    for(i=0;i<LISTENERS;i++)if(h->listeners[i].hy2)active_clients+=(unsigned)steer_draft_hy2_flows(h->listeners[i].hy2);
+#endif
+    int n = snprintf(out, capacity, "{\"prototype\":\"steer-linux-v1\",\"generation\":%llu,\"revision\":%llu,\"runtimeReady\":true,\"persistence\":%s,\"durability_uncertain\":%s,\"activeClients\":%u,\"retainedGenerations\":%u,\"listeners\":[",
         (unsigned long long)h->current->number, (unsigned long long)h->current->number,
-        h->store ? "true" : "false", h->durability_uncertain ? "true" : "false", h->live);
+        h->store ? "true" : "false", h->durability_uncertain ? "true" : "false", active_clients,retained);
     if (n < 0 || (size_t)n >= capacity) return 0;
     used = (size_t)n;
-    for (i = 0; i < LISTENERS; ++i) if (h->listeners[i].fd >= 0 && h->listeners[i].active) {
+    for (i = 0; i < LISTENERS; ++i) if (listener_bound(&h->listeners[i]) && h->listeners[i].active) {
         const struct listener *listener = &h->listeners[i];
         n = snprintf(out + used, capacity - used, "%s{\"id\":\"%s\",\"protocol\":\"%s\",\"address\":\"%s\",\"port\":%u}",
-            count++ ? "," : "", listener->identity.id, listener->identity.vless ? "vless" : "socks",
+            count++ ? "," : "", listener->identity.id, listener->spec.protocol==STEER_PROTOTYPE_HYSTERIA2?"hysteria2":listener->identity.vless ? "vless" : "socks",
             listener->spec.address, listener->spec.port);
         if (n < 0 || (size_t)n >= capacity - used) return 0;
         used += (size_t)n;
     }
+    const char *hy2="false",*hy2_udp="false",*provider="";
+#ifdef STEER_PROTOTYPE_HY2
+    hy2="true";hy2_udp=h->current&&h->current->datagrams?"true":"false";provider=",\"hysteria2\"";
+#endif
+    n=snprintf(out+used,capacity-used,"],\"capabilities\":{\"providers\":[\"socks\",\"vless\"%s],\"inbound\":{\"hysteria2\":{\"tcp\":%s,\"udp\":%s,\"tls\":%s}}},\"drainingListeners\":[",provider,hy2,hy2_udp,hy2);
+    if(n<0||(size_t)n>=capacity-used)return 0;
+    used+=(size_t)n;count=0;
+#ifdef STEER_PROTOTYPE_HY2
+    for(i=0;i<LISTENERS;i++)if(h->listeners[i].hy2&&h->listeners[i].retiring) {
+        const struct listener *listener=&h->listeners[i];uint64_t now=(uint64_t)loop_now_ms();
+        n=snprintf(out+used,capacity-used,"%s{\"id\":\"%s\",\"protocol\":\"hysteria2\",\"port\":%u,\"drainRemainingMs\":%llu}",
+            count++?",":"",listener->spec.id,listener->spec.port,(unsigned long long)(listener->drain_deadline>now?listener->drain_deadline-now:0));
+        if(n<0||(size_t)n>=capacity-used)return 0;
+        used+=(size_t)n;
+    }
+#endif
+#ifdef STEER_PROTOTYPE_HY2
+    n=snprintf(out+used,capacity-used,"],\"udpBudget\":{\"receiveSlots\":%u,\"maxReceiveSlots\":%u,\"uploadBytes\":%llu,\"maxUploadBytes\":%llu,\"packets\":%u,\"maxPackets\":%u}}",
+        h->datagram_budget.receives,h->datagram_budget.max_receives,(unsigned long long)h->datagram_budget.upload_bytes,
+        (unsigned long long)h->datagram_budget.max_upload_bytes,h->datagram_budget.packets,h->datagram_budget.max_packets);
+    if(n<0||(size_t)n>=capacity-used)return 0;
+    return used+(size_t)n;
+#else
     if (capacity - used < 3) return 0;
     memcpy(out + used, "]}", 3);
     return used + 2;
+#endif
 }
 static void close_control(struct control *c)
 {
     if (c->fd < 0) return;
+#ifdef STEER_PROTOTYPE_HY2
+    if(c->waiting_prepare&&c->host->preparer)steer_prototype_prepare_cancel(c->host->preparer,(unsigned)(c-c->host->controls),c->serial);
+    c->waiting_prepare=0;
+#endif
     loop_fd_del(c->host->loop, c->fd); close(c->fd); c->fd = -1;
     loop_timer_free(c->deadline); c->deadline = NULL;
 }
@@ -858,27 +1262,58 @@ static void stop_writer(struct host *h)
     if (writer->wake >= 0) { loop_fd_del(h->loop, writer->wake); close(writer->wake); }
     if (writer->initialized) { pthread_cond_destroy(&writer->changed); pthread_mutex_destroy(&writer->lock); }
 }
-static int durable_apply(struct control *c)
+static int queue_durable(struct control *c,struct prepared *prepared)
 {
     struct host *h = c->host;
-    struct prepared *prepared;
-    int result;
     if (h->store_busy) return 503;
-    prepared = calloc(1, sizeof(*prepared));
-    if (!prepared) return 503;
-    result = prepare_configuration(h, c->input + c->header_length, c->body_length,
-                                   c->expected, 0, 1, prepared);
-    if (result != 200) { free(prepared); return result; }
     prepared->control = c; prepared->control_serial = c->serial;
-    if (loop_fd_mod(h->loop, c->fd, EPOLLRDHUP)) {
-        discard_prepared(h, prepared); free(prepared); return 503;
-    }
+    if (loop_fd_mod(h->loop, c->fd, EPOLLRDHUP))return 503;
     c->waiting_store = 1; h->store_busy = 1;
     pthread_mutex_lock(&h->writer.lock);
     h->writer.prepared = prepared; h->writer.queued = 1;
     pthread_cond_signal(&h->writer.changed); pthread_mutex_unlock(&h->writer.lock);
     return 0; /* response deferred until the writer's eventfd completion */
 }
+#ifndef STEER_PROTOTYPE_HY2
+static int durable_apply(struct control *c) {
+    struct host *h=c->host;struct prepared *prepared;int result;
+    if(h->store_busy)return 503;
+    prepared=calloc(1,sizeof *prepared);if(!prepared)return 503;
+    result=prepare_configuration(h,c->input+c->header_length,c->body_length,c->expected,0,1,prepared,NULL);
+    if(result==200)result=queue_durable(c,prepared);
+    if(result) { if(prepared->generation)discard_prepared(h,prepared);free(prepared); }
+    return result;
+}
+#else
+static void prepared_ready(void *user,struct steer_prototype_prepared_input *input) {
+    struct host *h=user;struct control *c;struct prepared *prepared;int code,n;char body[128];
+    loop_timer_set(h->work,0);
+    if(h->stopping||input->control_index>=CONTROLS)return;
+    c=&h->controls[input->control_index];
+    if(c->fd<0||c->serial!=input->serial||!c->waiting_prepare)return;
+    c->waiting_prepare=0;
+    if(input->error||(uint64_t)loop_now_ms()>=input->deadline_ms) {
+        control_error(c,input->error&&input->error!=499?input->error:408);return;
+    }
+    /* CAS is rechecked after worker result, before any bind/route preparation. */
+    if(!input->validate&&input->expected!=h->current->number) { control_error(c,409);return; }
+    prepared=calloc(1,sizeof *prepared);if(!prepared) { control_error(c,503);return; }
+    code=prepare_configuration(h,NULL,0,input->expected,input->validate,1,prepared,input);
+    if(code!=200) { free(prepared);control_error(c,code);return; }
+    if((uint64_t)loop_now_ms()>=input->deadline_ms) {
+        if(prepared->generation)discard_prepared(h,prepared);
+        free(prepared);control_error(c,408);return;
+    }
+    if(input->validate) {
+        free(prepared);n=snprintf(body,sizeof body,"{\"valid\":true,\"persistence\":%s}",h->store?"true":"false");
+        control_response(c,200,body,(size_t)n);return;
+    }
+    if(h->store) {
+        code=queue_durable(c,prepared);
+        if(code) { discard_prepared(h,prepared);free(prepared);control_error(c,code); }
+    } else { publish_prepared(h,prepared);free(prepared);applied_response(c,200); }
+}
+#endif
 static int decimal(const char **cursor, uint64_t *value)
 {
     const char *p = *cursor;
@@ -937,6 +1372,18 @@ static void control_execute(struct control *c)
         c->input[n + g->document_length] = '}';
         control_response(c, 200, c->input, length);
     } else {
+#ifdef STEER_PROTOTYPE_HY2
+        if(c->operation==4&&c->expected!=h->current->number) { control_error(c,409);return; }
+        if(!h->preparer||h->store_busy||steer_prototype_prepare_busy(h->preparer)) { control_error(c,503);return; }
+        code=steer_prototype_prepare_submit(h->preparer,c->input+c->header_length,c->body_length,h->current->number+1,
+            c->expected,(unsigned)(c-h->controls),c->serial,c->operation==3,c->deadline_ms);
+        if(code) { control_error(c,code);return; }
+        c->waiting_prepare=1;
+        if(loop_fd_mod(h->loop,c->fd,EPOLLRDHUP)) {
+            steer_prototype_prepare_cancel(h->preparer,(unsigned)(c-h->controls),c->serial);c->waiting_prepare=0;control_error(c,503);
+        }
+        return;
+#else
         if (c->operation == 4 && h->store) {
             code = durable_apply(c);
             if (code) control_error(c, code);
@@ -948,6 +1395,7 @@ static void control_execute(struct control *c)
             n = snprintf(status, sizeof(status), "{\"valid\":true,\"persistence\":%s}", h->store ? "true" : "false");
             control_response(c, 200, status, (size_t)n);
         } else applied_response(c, 200);
+#endif
     }
 }
 static void control_ready(struct loop *l, int fd, uint32_t events, void *arg)
@@ -955,7 +1403,7 @@ static void control_ready(struct loop *l, int fd, uint32_t events, void *arg)
     struct control *c = arg;
     ssize_t n;
     (void)l;
-    if (c->waiting_store) {
+    if (c->waiting_store||c->waiting_prepare) {
         if (events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) close_control(c);
         return;
     }
@@ -994,6 +1442,7 @@ static void accept_controls(struct loop *l, int fd, uint32_t events, void *arg)
         c = &h->controls[i];
         { uint64_t serial = c->serial + 1; memset(c, 0, sizeof(*c)); c->serial = serial; }
         c->host = h; c->fd = accepted;
+        c->deadline_ms=(uint64_t)loop_now_ms()+5000;
         c->deadline = loop_timer_new(l, control_timeout, c);
         if (!c->deadline || loop_fd_add(l, accepted, EPOLLIN | EPOLLRDHUP, control_ready, c)) {
             close_control(c); continue;
@@ -1065,6 +1514,9 @@ int steer_prototype_main(int argc, char **argv)
     }
     if (!bind_control(&h, argv[4])) goto cleanup;
     if (h.store && !start_writer(&h)) goto cleanup;
+#ifdef STEER_PROTOTYPE_HY2
+    if(steer_prototype_prepare_create(h.loop,prepared_ready,&h,&h.preparer))goto cleanup;
+#endif
     if (seed) {
         struct steer_prototype_store_transaction *transaction = NULL;
         struct steer_prototype_store_result committed;

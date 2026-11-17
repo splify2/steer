@@ -26,7 +26,26 @@ static void valid_address(const char *address){
     assert(!strcmp(c->listeners[0].address,address));
     steer_prototype_config_destroy(c);
 }
+static void hysteria2(void) {
+    const char *hy="{\"id\":\"hy\",\"protocol\":\"hysteria2\",\"listen\":{\"address\":\"127.0.0.1\",\"port\":1080},"
+        "\"auth\":{\"type\":\"password\",\"principal_id\":\"alice\",\"password_ref\":\"env:HY2_PASSWORD\"},"
+        "\"tls\":{\"certificate_ref\":\"env:HY2_CERT\",\"private_key_ref\":\"env:HY2_KEY\"}}";
+    const char *socks="{\"id\":\"tcp\",\"protocol\":\"socks\",\"listen\":{\"address\":\"127.0.0.1\",\"port\":1080},\"auth\":{\"type\":\"none\"}}";
+    char document[4096],changed[4096],second[2048];struct steer_prototype_config *c,*round;
+    snprintf(document,sizeof document,"{\"prototype\":\"steer-linux-v1\",\"listeners\":[%s,%s],\"routing\":{\"default\":\"block\",\"rules\":[]}}",socks,hy);
+    assert(!steer_prototype_config_parse(document,strlen(document),1,&c).code);
+    assert(c->listeners[1].protocol==STEER_PROTOTYPE_HYSTERIA2&&c->listeners[1].auth==STEER_PROTOTYPE_AUTH_PASSWORD);
+    assert(!strcmp(c->listeners[1].certificate_ref,"env:HY2_CERT"));
+    assert(!steer_prototype_config_parse(c->document_json,c->document_length,1,&round).code);
+    assert(!strcmp(round->listeners[1].private_key_ref,"env:HY2_KEY"));
+    steer_prototype_config_destroy(round);steer_prototype_config_destroy(c);
+    const char *from="env:HY2_KEY",*p=strstr(document,from);assert(p);
+    snprintf(changed,sizeof changed,"%.*s%s%s",(int)(p-document),document,"/literal/key.pem",p+strlen(from));bad(changed);
+    strcpy(second,hy);p=strstr(second,"\"hy\"");assert(p);((char *)p)[2]='z';
+    snprintf(changed,sizeof changed,"{\"prototype\":\"steer-linux-v1\",\"listeners\":[%s,%s],\"routing\":{\"default\":\"block\",\"rules\":[]}}",hy,second);bad(changed);
+}
 int main(void){
+    hysteria2();
     struct steer_prototype_config*c=NULL,*round=NULL;
     uint8_t ip[4]={
         127,0,0,1

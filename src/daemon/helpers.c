@@ -20,13 +20,10 @@
 #include "spec.h"
 #include "platform.h"
 #include "helpers.h"
+#include "../lib/monotime.h"
 #include "plugin.h"
 
-long helpers_now_ms(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (long)t.tv_sec * 1000L + t.tv_nsec / 1000000L;
-}
+int64_t helpers_now_ms(void) { return steer_mono_ms(); }
 
 /* ПОДПИСЬ ПАРАМЕТРОВ ПОМОЩНИКА — то, что он читает из спеки ОДИН РАЗ, при старте.
  *
@@ -355,8 +352,8 @@ struct helper *helpers_exited(struct helper_set *s, pid_t pid, int st) {
         /* Проработал дольше минуты — пауза снова пять секунд. Эта пауза и ждётся сейчас, а
          * удваивается следующая: первый перезапуск упавшего всегда через пять секунд, как у
          * procd. */
-        long now = helpers_now_ms();
-        long lived = now - h->started_ms;
+        int64_t now = helpers_now_ms();
+        int64_t lived = now - h->started_ms;
         long cap = h->st.said_down ? HELPERS_DELAY_DOWN_MAX_MS : HELPERS_DELAY_MAX_MS;
         if (lived >= HELPERS_STABLE_MS) h->delay_ms = HELPERS_DELAY_MS;
         if (h->delay_ms > cap) h->delay_ms = cap;
@@ -387,8 +384,8 @@ void helpers_compact(struct helper_set *s) {
 }
 
 long helpers_due(struct helper_set *s, helper_start_fn start, void *arg) {
-    long now = helpers_now_ms();
-    long wait = -1;
+    int64_t now = helpers_now_ms();
+    int64_t wait = -1;
     for (size_t i = 0; i < s->n; i++) {
         struct helper *h = &s->h[i];
         if (h->pid || h->gone) continue;
@@ -396,7 +393,7 @@ long helpers_due(struct helper_set *s, helper_start_fn start, void *arg) {
         if (!h->pid && (wait < 0 || h->next_ms - now < wait))
             wait = h->next_ms - now > 0 ? h->next_ms - now : 0;
     }
-    return wait;
+    return wait > LONG_MAX ? LONG_MAX : (long)wait;
 }
 
 void helper_started(struct helper *h, pid_t pid) {
@@ -478,12 +475,12 @@ int pidfd_of(pid_t pid) {
  *
  * По pidfd — проснуться ровно в миг выхода, а не на очередном шаге опроса в 50 мс: остановка службы с десятком
  * помощников копила эти шаги (I-534). Ядро без pidfd — прежний опрос. */
-static int wait_until(pid_t pid, long deadline) {
+static int wait_until(pid_t pid, int64_t deadline) {
     int pfd = pidfd_of(pid);
     for (;;) {
         pid_t w = waitpid(pid, NULL, WNOHANG);
         if (w == pid || (w < 0 && errno == ECHILD)) { if (pfd >= 0) close(pfd); return 1; }
-        long left = deadline - helpers_now_ms();
+        int64_t left = deadline - helpers_now_ms();
         if (left <= 0) { if (pfd >= 0) close(pfd); return 0; }
         if (pfd >= 0) {
             struct pollfd p = { .fd = pfd, .events = POLLIN };
@@ -497,7 +494,7 @@ static int wait_until(pid_t pid, long deadline) {
 
 /* Дождаться выхода всех pid из h[0..n) до срока: один poll по всем pidfd вместо шага опроса в 100 мс на каждого.
  * У вышедших h[i].pid обнуляется. */
-static void wait_all(struct helper *h, size_t n, long deadline) {
+static void wait_all(struct helper *h, size_t n, int64_t deadline) {
     struct pollfd *pf = calloc(n ? n : 1, sizeof(*pf));
     for (;;) {
         size_t left = 0;
@@ -506,7 +503,7 @@ static void wait_all(struct helper *h, size_t n, long deadline) {
             if (waitpid(h[i].pid, NULL, WNOHANG) == h[i].pid) h[i].pid = 0;
             else left++;
         }
-        long ms = deadline - helpers_now_ms();
+        int64_t ms = deadline - helpers_now_ms();
         if (!left || ms <= 0) break;
         size_t k = 0;
         int ok = pf != NULL;
@@ -544,13 +541,13 @@ void helpers_stop(struct helper_set *s, int ordered) {
      * идёт, и не успевает перебрать узлы через уже снятое устройство. Каждому — три секунды на
      * уборку, всем вместе — не больше десяти: дальше оставшимся сразу SIGKILL (procd и init
      * ждут остановки службы не бесконечно). */
-    long all = helpers_now_ms() + 10000L;
+    int64_t all = helpers_now_ms() + 10000L;
     for (size_t i = n; i-- > 0;) {
         if (!h[i].pid) continue;
-        long now = helpers_now_ms();
+        int64_t now = helpers_now_ms();
         if (now < all) {
             kill(h[i].pid, SIGTERM);
-            long dl = now + 3000L < all ? now + 3000L : all;
+            int64_t dl = now + 3000L < all ? now + 3000L : all;
             if (wait_until(h[i].pid, dl)) { h[i].pid = 0; continue; }
         }
         kill(h[i].pid, SIGKILL);

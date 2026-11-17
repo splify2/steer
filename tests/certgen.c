@@ -17,12 +17,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include <wolfssl/wolfcrypt/settings.h>
 #include <wolfssl/wolfcrypt/ecc.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/asn_public.h>
 #include <wolfssl/wolfcrypt/asn.h>
+#include <wolfssl/wolfcrypt/ed25519.h>
 
 #include "certgen.h"
 
@@ -108,6 +110,23 @@ int tcg_sign_sha256(struct tcg_key *k, const unsigned char digest[32],
     if (!rng() || wc_ecc_sign_hash(digest, 32, sig, &sn, rng(), &k->k) != 0) return -1;
     *sig_n = sn;
     return 0;
+}
+int tcg_ed25519_public(const unsigned char seed[32], unsigned char public_key[32]) {
+    ed25519_key key;
+    if (wc_ed25519_init(&key)) return -1;
+    int rc = wc_ed25519_import_private_only(seed,32,&key);
+    if (!rc) rc = wc_ed25519_make_public(&key,public_key,32);
+    wc_ed25519_free(&key); return rc ? -1 : 0;
+}
+int tcg_ed25519_sign(const unsigned char seed[32], const unsigned char *message,
+                     size_t length, unsigned char signature[64]) {
+    if (length > UINT32_MAX) return -1;
+    ed25519_key key; unsigned char public_key[32]; word32 size = 64;
+    if (wc_ed25519_init(&key)) return -1;
+    int rc = wc_ed25519_import_private_only(seed,32,&key);
+    if (!rc) rc = wc_ed25519_make_public(&key,public_key,32);
+    if (!rc) rc = wc_ed25519_sign_msg(message,(word32)length,signature,&size,&key);
+    wc_ed25519_free(&key); return rc || size != 64 ? -1 : 0;
 }
 
 int tcg_count_pem_certs(const char *pem, size_t n) {

@@ -3,6 +3,7 @@
 #ifndef STEER_DRAFT_INBOUND_SERVICES_H
 #define STEER_DRAFT_INBOUND_SERVICES_H
 #include "route_dial.h"
+#include "hy2_datagram.h"
 struct steer_draft_route_lease {
     struct steer_draft_routes *routes;
     uint64_t generation;
@@ -25,5 +26,6 @@ struct steer_draft_inbound_services {
     struct steer_pv1_error (*acquire_route)(void *,struct steer_pv1_span inbound,
         struct steer_pv1_span principal,uint64_t admission_epoch,struct steer_draft_route_lease *);
     void (*release_route)(void *,struct steer_draft_route_lease *);
+    const struct steer_draft_hy2_datagram_services *datagrams; /* optional; copied by adapter open */
 };
 #endif

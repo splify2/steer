@@ -13,7 +13,7 @@ struct node {
     char id[64], path[192], type[32], provider[128];
     uint32_t flows;
     int enabled, options_validated;
-    const struct ynode *intent, *options;
+    const struct ynode *intent, *options, *resolved_remote;
 };
 struct edge {
     enum steer_spec_edge_kind kind;
@@ -23,8 +23,8 @@ struct edge {
     int dependency;
 };
 struct diagnostic { unsigned phase; char code[64], path[192]; };
-struct requirement { char name[384], path[192]; uint32_t state; };
-struct rule { char id[64], path[192], action[32], target[64]; const struct ynode *match; uint32_t flows; int dns; };
+struct requirement { char name[384], path[192]; uint32_t state,owner_node; };
+struct rule { char id[64], path[192], action[32], target[64]; const struct ynode *match,*strategy,*cache_timeout; uint32_t flows; int dns,enabled; };
 struct steer_spec_plan {
     struct steer_spec_summary summary;
     struct ydoc *document;
@@ -35,6 +35,7 @@ struct steer_spec_plan {
     struct requirement requirements[REQUIREMENTS];
     struct rule rules[RULES]; uint32_t rule_count;
     const struct steer_spec_capability *inventory; size_t inventory_count;
+    uint32_t requirement_owner;
 };
 static void copy(char *out, size_t capacity, const char *text) {
     size_t n = strlen(text); if (n >= capacity) n = capacity - 1;
@@ -104,6 +105,32 @@ static int unsigned_value(struct steer_spec_plan *p, const struct ynode *n, long
     }
     return 1;
 }
+static int dns_strategy(struct steer_spec_plan *p,const struct ynode *n,const char *path) {
+    if(!n)return 1;
+    if(!text(n)||(strcmp(n->str,"ipv4_only")&&strcmp(n->str,"ipv6_only")&&
+        strcmp(n->str,"prefer_ipv4")&&strcmp(n->str,"prefer_ipv6"))){
+        diagnostic(p,0,"unknown_dns_strategy",path);return 0;
+    }
+    return 1;
+}
+static int cache_duration(struct steer_spec_plan *p,const struct ynode *n,const char *path) {
+    uint64_t value=0,multiplier;size_t i=0;
+    if(!text(n)||n->len>12)goto invalid;
+    while(i<n->len&&n->str[i]>='0'&&n->str[i]<='9'){
+        unsigned digit=(unsigned)(n->str[i++]-'0');
+        if(value>(604800000ull-digit)/10)goto invalid;
+        value=value*10+digit;
+    }
+    if(!i)goto invalid;
+    if(!strcmp(n->str+i,"ms"))multiplier=1;
+    else if(!strcmp(n->str+i,"s"))multiplier=1000;
+    else if(!strcmp(n->str+i,"m"))multiplier=60000;
+    else if(!strcmp(n->str+i,"h"))multiplier=3600000;
+    else goto invalid;
+    if(value>604800000ull/multiplier)goto invalid;
+    return 1;
+invalid:diagnostic(p,0,"invalid_cache_duration",path);return 0;
+}
 static int named(struct steer_spec_plan *p, const struct ynode *n, char out[64], const char *path) {
     if (!text(n) || !identifier(n->str)) { diagnostic(p, 0, "invalid_identifier", path); return 0; }
     copy(out, 64, n->str); return 1;
@@ -134,6 +161,7 @@ static int requirement(struct steer_spec_plan *p, const char *name, const char *
     if (p->summary.requirements == REQUIREMENTS) { diagnostic(p, 0, "requirement_limit", path); return 0; }
     for (i = 0; i < p->inventory_count; i++) if (!strcmp(p->inventory[i].name, name)) { cap = &p->inventory[i]; break; }
     r = &p->requirements[p->summary.requirements++]; copy(r->name, sizeof(r->name), name); copy(r->path, sizeof(r->path), path);
+    r->owner_node=p->requirement_owner;
     r->state = cap ? cap->state : 0;
     if ((r->state & STEER_SPEC_READY) != STEER_SPEC_READY) diagnostic(p, 2, "capability_unavailable", path);
     if (options && (!cap || !cap->validate_options)) { diagnostic(p, 2, "provider_options_unvalidated", path); return 0; }
@@ -182,6 +210,7 @@ static void common_node(struct steer_spec_plan *p, uint32_t index) {
     struct node *node = &p->nodes[index]; const struct ynode *n = node->intent, *v;
     char at[192];
     path_at(at, node->path, "enabled"); node->enabled = boolean(p, ynode_get(n, "enabled"), 1, at);
+    node->options = ynode_get(n, "options");
     v = ynode_get(n, "label"); if (v && (!text(v) || v->len > 128)) diagnostic(p, 0, "invalid_label", node->path);
     path_at(at, node->path, "flow"); node->flows = flows(p, ynode_get(n, "flow"), node->flows, at);
 }
@@ -192,7 +221,7 @@ static void secret_references(struct steer_spec_plan *p, uint32_t index, const s
         const struct ynode *secret = ynode_get(n, "secret");
         if (secret) {
             if (n->len != 1) diagnostic(p, 0, "invalid_secret_reference", path);
-            edge(p, index, STEER_SPEC_SECRET, secret, STEER_SPEC_REFERENCE, 0, 0, path);
+            edge(p, index, STEER_SPEC_SECRET, secret, STEER_SPEC_REFERENCE, 0, 1, path);
             return;
         }
         for (i = 0; i < n->len; i++) {
@@ -265,6 +294,11 @@ static void provider(struct steer_spec_plan *p, uint32_t index, const char *tran
     if (!identifier(id) || !identifier(alias)) { diagnostic(p, 0, "invalid_provider_reference", node->path); return; }
     copy(node->provider, sizeof(node->provider), plugin->str);
     if (lookup(p, STEER_SPEC_PLUGIN, alias) < 0) diagnostic(p, 1, "dangling_plugin_alias", node->path);
+    /* Alias/module verification precedes provider preparation. Keep this in
+     * typed IR rather than requiring an executor to parse provider spelling. */
+    struct ynode alias_node={0};alias_node.kind=YN_SCALAR;alias_node.style=YS_DOUBLE;
+    alias_node.str=alias;alias_node.len=strlen(alias);
+    edge(p,index,STEER_SPEC_PLUGIN,&alias_node,STEER_SPEC_REFERENCE,0,1,node->path);
     if (variant && (!text(variant) || !identifier(variant->str))) diagnostic(p, 0, "invalid_provider_variant", node->path);
     node->options = field(p, node->intent, "options", node->path, 1);
     if (!node->options || node->options->kind != YN_MAP) diagnostic(p, 0, "expected_provider_options", node->path);
@@ -363,6 +397,7 @@ static void resource_node(struct steer_spec_plan *p, uint32_t index, const struc
         v = field(p, n, "remote", node->path, 1);
         if (!text(v) || !identifier(v->str)) diagnostic(p, 0, "invalid_remote_reference", node->path);
         else if (!ynode_get(remotes, v->str)) diagnostic(p, 1, "dangling_remote", node->path);
+        if(text(v))node->resolved_remote=ynode_get(remotes,v->str);
         if (!text(field(p, n, "package", node->path, 1)) || !text(field(p, n, "version", node->path, 1)))
             diagnostic(p, 0, "invalid_package_constraint", node->path);
         v = ynode_get(n, "dependencies");
@@ -423,6 +458,8 @@ static void dns_node(struct steer_spec_plan *p, uint32_t index) {
         diagnostic(p, 0, "unknown_dns_transport", node->path); return;
     }
     copy(node->type, sizeof(node->type), type->str);
+    v=ynode_get(n,"strategy");
+    if(v&&dns_strategy(p,v,node->path)&&node->enabled)requirement(p,"core.dns.strategy",node->path,NULL);
     if (!strcmp(type->str, "udp")) wire_flow = STEER_SPEC_FLOW_DATAGRAM;
     if (ynode_get(n, "endpoint")) endpoint(p, index, ynode_get(n, "endpoint"));
     if (!strcmp(type->str, "https")) {
@@ -460,6 +497,7 @@ static void rules(struct steer_spec_plan *p, const struct ynode *list, int dns, 
         name = field(p, n, "name", path, 1); named(p, name, rule->id, path);
         for (j = begin; j + 1 < p->rule_count; j++) if (!strcmp(p->rules[j].id, rule->id)) diagnostic(p, 0, "duplicate_rule_name", path);
         enabled = boolean(p, ynode_get(n, "enabled"), 1, path);
+        rule->enabled = enabled;
         match = field(p, n, "match", path, 1); rule->match = match;
         if (match && keys(p, match, "inbound user flow domain domain_suffix cidr rule_set network_type protocol port", path)) {
             static const char *lists[] = {"user", "domain", "domain_suffix", "cidr", "rule_set", "network_type", "protocol"};
@@ -491,7 +529,16 @@ static void rules(struct steer_spec_plan *p, const struct ynode *list, int dns, 
         } else if (strcmp(rule->action, "sniff") && strcmp(rule->action, "reject")) diagnostic(p, 0, "unknown_rule_action", path);
         if (enabled) { snprintf(cap, sizeof(cap), "core.%s.action.%s", dns ? "dns" : "routing", rule->action); requirement(p, cap, path, NULL); }
         path_at(at, path, "strategy"); v = ynode_get(n, "strategy");
-        if (v && (!text(v) || (strcmp(v->str, "ipv4_only") && strcmp(v->str, "ipv6_only") && strcmp(v->str, "prefer_ipv4") && strcmp(v->str, "prefer_ipv6")))) diagnostic(p, 0, "unknown_dns_strategy", at);
+        rule->strategy = v; rule->cache_timeout = ynode_get(n, "cache_timeout");
+        if(v){
+            if(strcmp(rule->action,"resolve")&&strcmp(rule->action,"hijack_dns"))diagnostic(p,0,"strategy_requires_dns_action",at);
+            if(dns_strategy(p,v,at)&&enabled)requirement(p,"core.dns.strategy",at,NULL);
+        }
+        v=rule->cache_timeout;path_at(at,path,"cache_timeout");
+        if(v){
+            if(!dns||strcmp(rule->action,"resolve"))diagnostic(p,0,"cache_timeout_requires_dns_resolve",at);
+            if(cache_duration(p,v,at)&&enabled)requirement(p,"core.dns.rule.cache_timeout",at,NULL);
+        }
     }
 }
 static int dependency_cycle(struct steer_spec_plan *p, uint32_t node, unsigned char *marks) {
@@ -522,6 +569,7 @@ struct steer_spec_plan *steer_spec_compile(const char *source, size_t length,
     struct steer_spec_plan *p = calloc(1, sizeof(*p)); struct err error = {0};
     const struct ynode *root, *routing, *dns, *remotes, *v; long version; uint32_t i; size_t j;
     if (!p) return NULL;
+    p->requirement_owner=UINT32_MAX;
     p->summary.syntax_valid = p->summary.topology_valid = p->summary.runtime_ready = 1;
     if (!source || !length || length > STEER_SPEC_MAX_BYTES || (!inventory && inventory_count)) {
         diagnostic(p, 0, "invalid_input_bounds", "$ "); return p;
@@ -555,6 +603,21 @@ struct steer_spec_plan *steer_spec_compile(const char *source, size_t length,
     collect(p, STEER_SPEC_PROFILE, ynode_get(root, "profiles"), "$.profiles");
     dns = ynode_get(root, "dns");
     if (dns && keys(p, dns, "servers rules default strategy reverse_mapping cache", "$.dns")) {
+        v=ynode_get(dns,"strategy");
+        if(v&&dns_strategy(p,v,"$.dns.strategy"))requirement(p,"core.dns.strategy","$.dns.strategy",NULL);
+        v=ynode_get(dns,"reverse_mapping");
+        if(v&&boolean(p,v,0,"$.dns.reverse_mapping"))requirement(p,"core.dns.reverse_mapping","$.dns.reverse_mapping",NULL);
+        v=ynode_get(dns,"cache");
+        if(v){
+            if(v->kind==YN_MAP){
+                if(keys(p,v,"capacity persistent","$.dns.cache")){
+                    unsigned_value(p,field(p,v,"capacity","$.dns.cache",1),0,131072,"$.dns.cache.capacity");
+                    if(boolean(p,ynode_get(v,"persistent"),0,"$.dns.cache.persistent"))
+                        requirement(p,"core.dns.cache.persistent","$.dns.cache.persistent",NULL);
+                }
+            }else unsigned_value(p,v,0,131072,"$.dns.cache");
+            requirement(p,"core.dns.cache","$.dns.cache",NULL);
+        }
         collect(p, STEER_SPEC_DNS, field(p, dns, "servers", "$.dns", 1), "$.dns.servers");
         requirement(p, "core.dns.policy", "$.dns", NULL);
     }
@@ -565,10 +628,12 @@ struct steer_spec_plan *steer_spec_compile(const char *source, size_t length,
     }
     for (i = 0; i < p->summary.nodes; i++) {
         enum steer_spec_node_kind kind = p->nodes[i].kind;
+        p->requirement_owner=i;
         if (kind == STEER_SPEC_INBOUND || kind == STEER_SPEC_OUTBOUND) flow_node(p, i);
         else if (kind == STEER_SPEC_DNS) dns_node(p, i);
         else resource_node(p, i, remotes);
     }
+    p->requirement_owner=UINT32_MAX;
     routing = field(p, root, "routing", "$", 1);
     if (routing && keys(p, routing, "rules default default_domain_resolver", "$.routing")) {
         uint32_t required = inbound_flows(p, NULL, "$.routing.default");
@@ -596,7 +661,11 @@ int steer_spec_node(const struct steer_spec_plan *p, uint32_t i, struct steer_sp
     if (!p || !out || i >= p->summary.nodes) return 0;
     n = &p->nodes[i]; out->kind = n->kind; out->id = n->id; out->path = n->path;
     out->type = n->type; out->provider = n->provider; out->flows = n->flows;
-    out->options = n->options; out->options_validated = n->options_validated; return 1;
+    out->options = n->options; out->options_validated = n->options_validated;
+    out->enabled = n->enabled; out->intent = n->intent;out->resolved_remote=n->resolved_remote;
+    out->listen = ynode_get(n->intent, "listen"); out->device = ynode_get(n->intent, "device");
+    out->endpoint = ynode_get(n->intent, "endpoint"); out->transport = ynode_get(n->intent, "transport");
+    out->security = ynode_get(n->intent, "security"); out->variant = ynode_get(n->intent, "variant"); return 1;
 }
 int steer_spec_edge(const struct steer_spec_plan *p, uint32_t i, struct steer_spec_edge_view *out) {
     const struct edge *e;
@@ -608,15 +677,20 @@ int steer_spec_rule(const struct steer_spec_plan *p, uint32_t i, struct steer_sp
     const struct rule *r;
     if (!p || !out || i >= p->rule_count) return 0;
     r = &p->rules[i]; out->id = r->id; out->path = r->path; out->action = r->action;
-    out->target = r->target; out->match = r->match; out->flows = r->flows; out->dns_rule = r->dns; return 1;
+    out->target = r->target; out->match = r->match; out->flows = r->flows; out->dns_rule = r->dns;
+    out->enabled = r->enabled; out->strategy = r->strategy; out->cache_timeout = r->cache_timeout; return 1;
 }
 int steer_spec_requirement(const struct steer_spec_plan *p, uint32_t i, struct steer_spec_requirement_view *out) {
     if (!p || !out || i >= p->summary.requirements) return 0;
-    out->name = p->requirements[i].name; out->path = p->requirements[i].path; out->state = p->requirements[i].state; return 1;
+    out->name = p->requirements[i].name; out->path = p->requirements[i].path; out->state = p->requirements[i].state;
+    out->owner_node=p->requirements[i].owner_node; return 1;
 }
 const char *steer_spec_document(const struct steer_spec_plan *p, size_t *length) {
     if (!p || !length) return NULL;
     *length = p->source_length; return p->source;
+}
+const struct ynode *steer_spec_intent(const struct steer_spec_plan *p) {
+    return p && p->document ? ydoc_root(p->document) : NULL;
 }
 void steer_spec_write_json(const struct steer_spec_plan *p, FILE *f) {
     uint32_t i;

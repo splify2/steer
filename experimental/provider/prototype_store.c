@@ -82,14 +82,14 @@ struct steer_pv1_error steer_prototype_store_close(struct steer_prototype_store*
     free(s);
     return error(STEER_PV1_OK);
 }
-struct steer_pv1_error steer_prototype_store_prepare(struct steer_prototype_store*s,const struct steer_prototype_config*c,struct steer_prototype_store_transaction**out){
+struct steer_pv1_error steer_prototype_store_prepare_document(struct steer_prototype_store*s,const struct steer_store_document*c,struct steer_prototype_store_transaction**out){
     struct steer_prototype_store_transaction*t;
     char prefix[96];
     unsigned attempt;
     int fd=-1,created=0;
     size_t prefix_length;
     if(out)*out=NULL;
-    if(!s||!c||!out||!c->generation||!c->document_json||!c->document_length||c->document_length>STEER_PROTOTYPE_CONFIG_MAX_BYTES||memchr(c->document_json,0,c->document_length))return error(STEER_PV1_INVALID);
+    if(!s||!c||!out||!c->generation||!c->document||!c->length||c->length>(c->format==STEER_STORE_FORMAT_PROTOTYPE?STEER_PROTOTYPE_CONFIG_MAX_BYTES:STEER_STORE_DOCUMENT_MAX)||(c->format!=STEER_STORE_FORMAT_PROTOTYPE&&c->format!=STEER_STORE_FORMAT_SPEC_V3)||c->document[0]!='{'||c->document[c->length-1]!='}'||memchr(c->document,0,c->length))return error(STEER_PV1_INVALID);
     if(s->transaction)return error(STEER_PV1_POLICY_DENIED);
     t=calloc(1,sizeof(*t));
     if(!t)return error(STEER_PV1_RESOURCE_EXHAUSTED);
@@ -111,8 +111,9 @@ struct steer_pv1_error steer_prototype_store_prepare(struct steer_prototype_stor
         if(errno!=EEXIST)goto fail;
     }
     if(fd<0||fchmod(fd,0600))goto fail;
-    prefix_length=(size_t)snprintf(prefix,sizeof(prefix),"{\"revision\":%llu,\"document\":",(unsigned long long)c->generation);
-    if(write_all(fd,prefix,prefix_length)||write_all(fd,c->document_json,c->document_length)||write_all(fd,"}\n",2)||fsync(fd))goto fail;
+    prefix_length=(size_t)snprintf(prefix,sizeof(prefix),c->format==STEER_STORE_FORMAT_PROTOTYPE?"{\"revision\":%llu,\"document\":":"{\"revision\":%llu,\"format\":\"steer-spec-v3\",\"document\":",(unsigned long long)c->generation);
+    if(prefix_length>=sizeof(prefix))goto fail;
+    if(write_all(fd,prefix,prefix_length)||write_all(fd,c->document,c->length)||write_all(fd,"}\n",2)||fsync(fd))goto fail;
     if(close(fd)){
         fd=-1;
         goto fail;
@@ -125,6 +126,11 @@ struct steer_pv1_error steer_prototype_store_prepare(struct steer_prototype_stor
     if(created)unlinkat(s->directory,t->temporary,0);
     free(t);
     return error(STEER_PV1_IO);
+}
+struct steer_pv1_error steer_prototype_store_prepare(struct steer_prototype_store *s,const struct steer_prototype_config *c,struct steer_prototype_store_transaction **out){
+    if(!c){if(out)*out=NULL;return error(STEER_PV1_INVALID);}
+    struct steer_store_document document={c->generation,STEER_STORE_FORMAT_PROTOTYPE,c->document_json,c->document_length};
+    return steer_prototype_store_prepare_document(s,&document,out);
 }
 struct steer_prototype_store_result steer_prototype_store_commit(struct steer_prototype_store_transaction*t){
     struct steer_prototype_store_result invalid={
@@ -151,22 +157,23 @@ struct steer_pv1_error steer_prototype_store_abort(struct steer_prototype_store_
     free(t);
     return e;
 }
-struct steer_pv1_error steer_prototype_store_load(struct steer_prototype_store*s,struct steer_prototype_config**out){
+struct steer_pv1_error steer_prototype_store_load_document(struct steer_prototype_store*s,struct steer_store_document**out){
     int fd;
     struct stat st;
     char *data,*p,*document;
     size_t used=0,length;
     uint64_t revision=0;
+    uint32_t format=STEER_STORE_FORMAT_PROTOTYPE;
     struct steer_pv1_error e=error(STEER_PV1_INVALID);
     if(out)*out=NULL;
     if(!s||!out)return e;
-    fd=openat(s->directory,"config.json",O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+    fd=openat(s->directory,"config.json",O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW);
     if(fd<0)return error(errno==ENOENT?STEER_PV1_UNSUPPORTED:errno==ELOOP?STEER_PV1_INVALID:STEER_PV1_IO);
     if(!private_file(fd)||fstat(fd,&st)){
         close(fd);
         return e;
     }
-    if(st.st_size<=0||(uint64_t)st.st_size>STEER_PROTOTYPE_CONFIG_MAX_BYTES+128u){
+    if(st.st_size<=0||(uint64_t)st.st_size>STEER_STORE_DOCUMENT_MAX+128u){
         close(fd);
         return error(STEER_PV1_RESOURCE_EXHAUSTED);
     }
@@ -185,6 +192,9 @@ struct steer_pv1_error steer_prototype_store_load(struct steer_prototype_store*s
         }
         used+=(size_t)n;
     }
+    char extra;ssize_t extra_size;
+    do{extra_size=read(fd,&extra,1);}while(extra_size<0&&errno==EINTR);
+    if(extra_size!=0){e=error(extra_size<0?STEER_PV1_IO:STEER_PV1_INVALID);goto done;}
     data[length]=0;
     if(memchr(data,0,length)||length<30||memcmp(data,"{\"revision\":",12))goto done;
     p=data+12;
@@ -194,13 +204,29 @@ struct steer_pv1_error steer_prototype_store_load(struct steer_prototype_store*s
         if(revision>(UINT64_MAX-digit)/10u)goto done;
         revision=revision*10u+digit;
     }
+    static const char format_tag[]=",\"format\":\"steer-spec-v3\"";
+    if(!strncmp(p,format_tag,sizeof(format_tag)-1)){format=STEER_STORE_FORMAT_SPEC_V3;p+=sizeof(format_tag)-1;}
     if(strncmp(p,",\"document\":",12))goto done;
     document=p+12;
     if(data[length-1]!='\n'||data[length-2]!='}')goto done;
     length=(size_t)((data+length-2)-document);
-    if(!length||length>STEER_PROTOTYPE_CONFIG_MAX_BYTES)goto done;
-    e=steer_prototype_config_parse(document,length,revision,out);
+    if(!length||length>(format==STEER_STORE_FORMAT_PROTOTYPE?STEER_PROTOTYPE_CONFIG_MAX_BYTES:STEER_STORE_DOCUMENT_MAX)||document[0]!='{'||document[length-1]!='}')goto done;
+    struct steer_store_document *snapshot=calloc(1,sizeof(*snapshot));
+    if(!snapshot){e=error(STEER_PV1_RESOURCE_EXHAUSTED);goto done;}
+    memmove(data,document,length);data[length]=0;
+    *snapshot=(struct steer_store_document){revision,format,data,length};*out=snapshot;data=NULL;e=error(0);
     done:close(fd);
     free(data);
     return e;
+}
+
+void steer_store_document_destroy(struct steer_store_document *document){if(document){free(document->document);free(document);}}
+struct steer_pv1_error steer_prototype_store_load(struct steer_prototype_store *s,struct steer_prototype_config **out){
+    if(out)*out=NULL;
+    if(!out)return error(STEER_PV1_INVALID);
+    struct steer_store_document *document=NULL;struct steer_pv1_error result=steer_prototype_store_load_document(s,&document);
+    if(result.code)return result;
+    if(document->format!=STEER_STORE_FORMAT_PROTOTYPE)result=error(STEER_PV1_INVALID);
+    else result=steer_prototype_config_parse(document->document,document->length,document->generation,out);
+    steer_store_document_destroy(document);return result;
 }

@@ -24,6 +24,7 @@ LIBS2P_NET_1 {
     s2p_plat_spec_resolve;
     s2p_pool_race_first;
     s2p_pool_run;
+    s2p_pool_run_ex;
     s2p_pool_set_status_path;
     s2p_qc_close;
     s2p_qc_datagram_max;
@@ -45,6 +46,7 @@ LIBS2P_NET_1 {
     s2p_qc_stream_reset;
     s2p_qc_stream_room;
     s2p_qc_stream_send;
+    s2p_qc_stream_terminal_flags;
     s2p_qc_timeout_ms;
     s2p_qc_tls_free;
     s2p_qc_tls_new;
@@ -101,6 +103,8 @@ LIBS2P_NET_1 {
     s2p_stack_now_ns;
     s2p_stack_now_s;
     s2p_stack_run;
+    s2p_stack_run_ex;
+    s2p_stack_run_fd_ex;
     s2p_stack_sess_ready;
     s2p_stack_sess_room;
     s2p_stack_sess_rx;
@@ -118,6 +122,7 @@ LIBS2P_NET_1 {
     s2p_transport_aux_fd;
     s2p_transport_aux_pending;
     s2p_transport_big_write;
+    s2p_transport_can_halfclose;
     s2p_transport_close;
     s2p_transport_direct;
     s2p_transport_has_data;
@@ -127,9 +132,11 @@ LIBS2P_NET_1 {
     s2p_transport_out_flush;
     s2p_transport_out_pending;
     s2p_transport_read;
+    s2p_transport_read_end;
     s2p_transport_read_zc;
     s2p_transport_room;
     s2p_transport_set_sock_mark;
+    s2p_transport_shutdown_write;
     s2p_transport_strerror;
     s2p_transport_write;
     s2p_tun_gro_flush;

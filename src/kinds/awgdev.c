@@ -11,6 +11,8 @@
 #include <sched.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <poll.h>
+#include <limits.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <stdint.h>
@@ -32,6 +34,7 @@
 
 #include "awg.h"
 #include "awgdev.h"
+#include "nltransport.h"
 #include "kind.h"
 #include "platform.h"
 #include "nlbuf.h"
@@ -557,8 +560,8 @@ size_t awg_build_getfamily(uint8_t *buf, size_t cap, const char *name, uint32_t 
     return msg_end(&b, nh);
 }
 
-size_t awg_build_newlink(uint8_t *buf, size_t cap, const char *ifname, const char *kind,
-                         int mtu, uint32_t seq) {
+static size_t build_newlink(uint8_t *buf, size_t cap, const char *ifname, const char *kind,
+                         int mtu, const char *marker, uint32_t group, uint32_t seq) {
     struct nlbuf b;
     struct ifinfomsg ifi = { .ifi_family = AF_UNSPEC };
     struct nlmsghdr *nh = msg_begin(&b, buf, cap, RTM_NEWLINK,
@@ -566,10 +569,25 @@ size_t awg_build_newlink(uint8_t *buf, size_t cap, const char *ifname, const cha
                                     seq, &ifi, sizeof ifi);
     nlbuf_put_str(&b, IFLA_IFNAME, ifname);
     if (mtu > 0) nlbuf_put_u32(&b, IFLA_MTU, (uint32_t)mtu);
+    if (marker) nlbuf_put_str(&b, IFLA_IFALIAS, marker);
+    if (group) nlbuf_put_u32(&b, IFLA_GROUP, group);
     struct nlattr *li = nlbuf_begin_nested(&b, IFLA_LINKINFO);
     nlbuf_put_str(&b, IFLA_INFO_KIND, kind);
     nlbuf_end_nested(&b, li);
     return msg_end(&b, nh);
+}
+
+size_t awg_build_newlink(uint8_t *buf,size_t cap,const char *ifname,const char *kind,int mtu,uint32_t seq){
+    return build_newlink(buf,cap,ifname,kind,mtu,NULL,0,seq);
+}
+size_t awg_build_newlink_marked(uint8_t *buf,size_t cap,const char *ifname,const char *kind,int mtu,const char *marker,uint32_t seq){
+    if(!marker||!marker[0]||strnlen(marker,AWG_LINK_MARKER_MAX)>=AWG_LINK_MARKER_MAX)return 0;
+    return build_newlink(buf,cap,ifname,kind,mtu,marker,0,seq);
+}
+
+size_t awg_build_newlink_owned(uint8_t *buf,size_t cap,const char *name,const char *kind,int mtu,uint32_t group,uint32_t seq){
+    if(!group)return 0;
+    return build_newlink(buf,cap,name,kind,mtu,NULL,group,seq);
 }
 
 /* H в той форме, которую ждёт версия семейства (так же поступает awg из amneziawg-tools):
@@ -586,15 +604,16 @@ static void put_h(struct nlbuf *b, int famver, uint16_t attr, uint64_t h) {
     } else nlbuf_put_u64(b, attr, h);
 }
 
-size_t awg_build_set(uint8_t *buf, size_t cap, uint16_t famid, int famver, int is_awg,
-                     const char *ifname, const struct awg_conf *c,
+static size_t build_set(uint8_t *buf, size_t cap, uint16_t famid, int famver, int is_awg,
+                     const char *ifname, int index, const struct awg_conf *c,
                      const struct awg_secrets *s, uint32_t fwmark, int replace_peers,
                      uint32_t seq) {
     struct nlbuf b;
     struct genlmsghdr g = { .cmd = AWG_CMD_SET_DEVICE, .version = (uint8_t)famver };
     struct nlmsghdr *nh = msg_begin(&b, buf, cap, famid, NLM_F_REQUEST | NLM_F_ACK, seq,
                                     &g, sizeof g);
-    nlbuf_put_str(&b, AD_IFNAME, ifname);
+    if(index>0)nlbuf_put_u32(&b,AD_IFINDEX,(uint32_t)index);
+    else nlbuf_put_str(&b, AD_IFNAME, ifname);
     nlbuf_put_data(&b, AD_PRIVATE_KEY, s->priv, AWG_KEY_LEN);
     if (c->has_listen_port) nlbuf_put_u16(&b, AD_LISTEN_PORT, c->listen_port);
     /* Метка сокета — всегда, в том числе нулевая: иначе метка прежнего via осталась бы на
@@ -653,54 +672,46 @@ size_t awg_build_set(uint8_t *buf, size_t cap, uint16_t famid, int famver, int i
     return msg_end(&b, nh);
 }
 
+size_t awg_build_set(uint8_t *b,size_t n,uint16_t family,int version,int awg,const char *name,const struct awg_conf *c,const struct awg_secrets *keys,uint32_t mark,int replace,uint32_t seq){
+    return build_set(b,n,family,version,awg,name,0,c,keys,mark,replace,seq);
+}
+size_t awg_build_set_index(uint8_t *b,size_t n,uint16_t family,int version,int awg,int index,const struct awg_conf *c,const struct awg_secrets *keys,uint32_t mark,int replace,uint32_t seq){
+    if(index<=0)return 0;
+    return build_set(b,n,family,version,awg,NULL,index,c,keys,mark,replace,seq);
+}
+
 /* ---- разговор с ядром -------------------------------------------------------------- */
 
 static uint32_t g_seq;
+static uint32_t next_seq(void){
+    uint32_t value=__atomic_add_fetch(&g_seq,1,__ATOMIC_RELAXED);
+    if(!value)value=__atomic_add_fetch(&g_seq,1,__ATOMIC_RELAXED);
+    return value;
+}
+static uint64_t nl_now_ns(void){return steer_nl_now_ns();}
 
 static int nl_open(int proto) {
     int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, proto);
     if (fd < 0) return -1;
     struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); return -1; }
-    /* Страховка от вечного recv при невозможном «ядро не ответило»; ядро отвечает внутри
-     * того же системного вызова, и в работе таймаут не срабатывает. */
-    struct timeval tv = { 2, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return fd;
 }
 
 /* Отправить одно сообщение и прочитать ответ до подтверждения (или до NLMSG_DONE у дампа).
  * Каждое сообщение ответа, кроме служебных, отдаётся cb. Возврат — 0 или errno ядра. Буфер
  * приёма затирается перед возвратом: в ответе GET_DEVICE лежит приватный ключ. */
-typedef void (*nl_cb)(const struct nlmsghdr *h, void *ctx);
-
-static int nl_talk(int fd, void *msg, size_t len, nl_cb cb, void *ctx) {
-    struct nlmsghdr *req = msg;
-    int dump = (req->nlmsg_flags & NLM_F_DUMP) == NLM_F_DUMP;
-    struct sockaddr_nl to = { .nl_family = AF_NETLINK };
-    if (sendto(fd, msg, len, 0, (struct sockaddr *)&to, sizeof(to)) < 0) return errno;
-    static _Alignas(8) uint8_t rbuf[65536];
-    int rc = EIO, done = 0;
-    while (!done) {
-        ssize_t n = recv(fd, rbuf, sizeof rbuf, 0);
-        if (n < 0) { if (errno == EINTR) continue; rc = errno; break; }
-        for (struct nlmsghdr *h = (struct nlmsghdr *)rbuf; NLMSG_OK(h, (size_t)n);
-             h = NLMSG_NEXT(h, n)) {
-            if (h->nlmsg_seq != req->nlmsg_seq) continue;
-            if (h->nlmsg_type == NLMSG_ERROR) {
-                const struct nlmsgerr *e = NLMSG_DATA(h);
-                rc = e->error ? -e->error : 0;
-                done = 1;
-                break;
-            }
-            if (h->nlmsg_type == NLMSG_DONE) { rc = 0; done = 1; break; }
-            if (cb) cb(h, ctx);
-            if (!dump && !(req->nlmsg_flags & NLM_F_ACK)) { rc = 0; done = 1; break; }
-        }
-    }
-    wipe(rbuf, sizeof rbuf);
-    return rc;
+typedef steer_nl_reply_fn nl_cb;
+static int nl_talk_until(int fd,void *msg,size_t n,nl_cb cb,void *context,uint64_t deadline){return steer_nl_exchange_until(fd,msg,n,cb,context,deadline);}
+static int nl_talk(int fd,void *msg,size_t len,nl_cb cb,void *ctx){
+    uint64_t now=nl_now_ns();return now?nl_talk_until(fd,msg,len,cb,ctx,now+2000000000ULL):EIO;
 }
+
+#ifdef STEER_AWG_NETLINK_TEST
+int steer_awg_netlink_test_exchange(int fd,void *msg,size_t len,nl_cb cb,void *ctx,uint64_t deadline){
+    return nl_talk_until(fd,msg,len,cb,ctx,deadline);
+}
+#endif
 
 /* Разбор атрибутов в [p, p+len): table[type] = атрибут. Тип без флагов: NLA_F_NESTED ставят не
  * все отвечающие. */
@@ -734,13 +745,13 @@ static void fam_cb(const struct nlmsghdr *h, void *ctx) {
 
 /* Номер и версия семейства generic netlink. 0 — нашлось. Спрашивание само подгружает модуль,
  * если ядро умеет (MODULE_ALIAS_GENL_FAMILY у wireguard и amneziawg). */
-static int genl_family(const char *name, uint16_t *id, int *ver) {
+static int genl_family_until(const char *name, uint16_t *id, int *ver,uint64_t deadline) {
     int fd = nl_open(NETLINK_GENERIC);
     if (fd < 0) return errno;
     uint8_t buf[128];
-    size_t n = awg_build_getfamily(buf, sizeof buf, name, ++g_seq);
+    size_t n = awg_build_getfamily(buf, sizeof buf, name, next_seq());
     struct fam_ctx f = { 0, 0 };
-    int rc = nl_talk(fd, buf, n, fam_cb, &f);
+    int rc = deadline?nl_talk_until(fd,buf,n,fam_cb,&f,deadline):nl_talk(fd,buf,n,fam_cb,&f);
     close(fd);
     if (rc == 0 && !f.id) rc = ENOENT;
     if (rc) return rc;
@@ -749,7 +760,9 @@ static int genl_family(const char *name, uint16_t *id, int *ver) {
     return 0;
 }
 
-struct link_ctx { char kind[32]; int index; };
+static int genl_family(const char *name,uint16_t *id,int *ver){return genl_family_until(name,id,ver,0);}
+
+struct link_ctx { char kind[32]; int index; char marker[256]; int malformed_marker; uint32_t group; int have_group; };
 
 static void link_cb(const struct nlmsghdr *h, void *ctx) {
     struct link_ctx *l = ctx;
@@ -760,6 +773,16 @@ static void link_cb(const struct nlmsghdr *h, void *ctx) {
     l->index = ifi->ifi_index;
     const struct nlattr *tb[IFLA_MAX + 1];
     attrs_parse((const uint8_t *)ifi + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, IFLA_MAX);
+    if(tb[IFLA_GROUP] && NLA_PLEN(tb[IFLA_GROUP])==sizeof(uint32_t)){
+        memcpy(&l->group,NLA_DATA(tb[IFLA_GROUP]),sizeof l->group);
+        l->have_group=1;
+    }
+    if(tb[IFLA_IFALIAS]){
+        size_t n=NLA_PLEN(tb[IFLA_IFALIAS]);const char *alias=NLA_DATA(tb[IFLA_IFALIAS]);
+        const char *end=memchr(alias,0,n);
+        if(!end||(size_t)(end-alias)>=sizeof l->marker)l->malformed_marker=1;
+        else memcpy(l->marker,alias,(size_t)(end-alias)+1);
+    }
     if (!tb[IFLA_LINKINFO]) return;
     const struct nlattr *li[IFLA_INFO_MAX + 1];
     attrs_parse(NLA_DATA(tb[IFLA_LINKINFO]), NLA_PLEN(tb[IFLA_LINKINFO]), li, IFLA_INFO_MAX);
@@ -773,44 +796,154 @@ static void link_cb(const struct nlmsghdr *h, void *ctx) {
 
 /* Есть ли устройство и какого вида. 0 — есть (kind может быть пустым у устройств без вида,
  * например eth0), ENODEV — нет. */
-int awg_dev_link_query(const char *ifname, char *kind, size_t kn, int *index) {
+static int link_query_until(const char *ifname,char *kind,size_t kn,int *index,char *marker,size_t mn,uint32_t *group,uint64_t deadline) {
     int fd = nl_open(NETLINK_ROUTE);
     if (fd < 0) return errno;
     uint8_t buf[256];
     struct nlbuf b;
     struct ifinfomsg ifi = { .ifi_family = AF_UNSPEC };
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, RTM_GETLINK, NLM_F_REQUEST | NLM_F_ACK,
-                                    ++g_seq, &ifi, sizeof ifi);
+                                    next_seq(), &ifi, sizeof ifi);
     nlbuf_put_str(&b, IFLA_IFNAME, ifname);
     size_t n = msg_end(&b, nh);
-    struct link_ctx l = { "", 0 };
-    int rc = nl_talk(fd, buf, n, link_cb, &l);
+    struct link_ctx l = {0};
+    int rc = deadline?nl_talk_until(fd,buf,n,link_cb,&l,deadline):nl_talk(fd,buf,n,link_cb,&l);
     close(fd);
     if (rc == 0 && !l.index) rc = ENODEV;
     if (rc) return rc;
+    if(group){if(!l.have_group)return EPROTO;*group=l.group;}
     if (kind) snprintf(kind, kn, "%s", l.kind);
     if (index) *index = l.index;
+    if(marker){
+        if(l.malformed_marker||strlen(l.marker)+1>mn)return EMSGSIZE;
+        memcpy(marker,l.marker,strlen(l.marker)+1);
+    }
     return 0;
 }
+int awg_dev_link_query(const char *ifname,char *kind,size_t kn,int *index){return link_query_until(ifname,kind,kn,index,NULL,0,NULL,0);}
+int awg_dev_link_query_marked(const char *ifname,char *kind,size_t kn,int *index,char *marker,size_t mn){
+    if(!marker||!mn||!ifname||!*ifname||strlen(ifname)>=IFNAMSIZ)return EINVAL;
+    marker[0]=0;return link_query_until(ifname,kind,kn,index,marker,mn,NULL,0);
+}
 
-static int rtnl_simple(void *buf, size_t n) {
+int awg_dev_link_query_marked_until(const char *ifname,char *kind,size_t kn,int *index,char *marker,size_t mn,uint64_t deadline){
+ if(!deadline||!marker||!mn||!ifname||!*ifname||strlen(ifname)>=IFNAMSIZ)return EINVAL;
+ marker[0]=0;return link_query_until(ifname,kind,kn,index,marker,mn,NULL,deadline);
+}
+static int rtnl_simple_until(void *buf,size_t n,uint64_t deadline) {
     int fd = nl_open(NETLINK_ROUTE);
     if (fd < 0) return errno;
-    int rc = nl_talk(fd, buf, n, NULL, NULL);
+    int rc = deadline?nl_talk_until(fd,buf,n,NULL,NULL,deadline):nl_talk(fd,buf,n,NULL,NULL);
     close(fd);
     return rc;
 }
 
+static int rtnl_simple(void *buf,size_t n){return rtnl_simple_until(buf,n,0);}
+static int marker_valid(const char *marker){
+    size_t n=marker?strnlen(marker,AWG_LINK_MARKER_MAX):0;
+    if(!n||n>=AWG_LINK_MARKER_MAX)return 0;
+    for(size_t i=0;i<n;i++){
+        unsigned c=(unsigned char)marker[i];
+        if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c==':'||c=='_'||c=='-'||c=='.'))return 0;
+    }
+    return 1;
+}
+int awg_dev_link_create_marked_until(const char *ifname,const char *kind,int mtu,const char *marker,int *out_index,uint64_t deadline){
+    uint8_t buffer[512];struct link_ctx created={0};int fd,rc;size_t n;
+    if(out_index)*out_index=0;
+    if(!ifname||!*ifname||strlen(ifname)>=IFNAMSIZ||!kind||!awg_dev_ours(kind)||
+       !marker_valid(marker)||!out_index||!deadline||mtu<576||mtu>65535)return EINVAL;
+    fd=nl_open(NETLINK_ROUTE);if(fd<0)return errno;
+    n=awg_build_newlink_marked(buffer,sizeof buffer,ifname,kind,mtu,marker,next_seq());
+    if(!n){close(fd);return EINVAL;}
+    ((struct nlmsghdr *)buffer)->nlmsg_flags|=NLM_F_ECHO;
+    rc=nl_talk_until(fd,buffer,n,link_cb,&created,deadline);close(fd);
+    *out_index=created.index; /* Capture even if a later ACK/result was lost. */
+    if(rc)return rc;
+    return created.index&&!strcmp(created.kind,kind)&&!created.malformed_marker&&!strcmp(created.marker,marker)?0:ESTALE;
+}
+static int marked_identity_until(const char *ifname,const char *kind,int index,const char *marker,uint64_t deadline){
+    char actual_kind[32],actual_marker[256];int actual_index=0;
+    if(!ifname||!*ifname||strlen(ifname)>=IFNAMSIZ||!kind||!awg_dev_ours(kind)||index<=0||!marker_valid(marker))return EINVAL;
+    int rc=awg_dev_link_query_marked_until(ifname,actual_kind,sizeof actual_kind,&actual_index,actual_marker,sizeof actual_marker,deadline);
+    if(rc)return rc;
+    return actual_index==index&&!strcmp(actual_kind,kind)&&!strcmp(actual_marker,marker)?0:ESTALE;
+}
+int awg_dev_link_delete_marked_until(const char *ifname,const char *kind,int index,const char *marker,uint64_t deadline){
+    int rc=marked_identity_until(ifname,kind,index,marker,deadline);if(rc)return rc;
+    uint8_t buffer[128];struct nlbuf b;struct ifinfomsg ifi={.ifi_family=AF_UNSPEC,.ifi_index=index};
+    struct nlmsghdr *header=msg_begin(&b,buffer,sizeof buffer,RTM_DELLINK,NLM_F_REQUEST|NLM_F_ACK,next_seq(),&ifi,sizeof ifi);
+    return rtnl_simple_until(buffer,msg_end(&b,header),deadline);
+}
+int awg_dev_link_down_marked_until(const char *ifname,const char *kind,int index,const char *marker,uint64_t deadline){
+    int rc=marked_identity_until(ifname,kind,index,marker,deadline);if(rc)return rc;
+    uint8_t buffer[128];struct nlbuf b;struct ifinfomsg ifi={.ifi_family=AF_UNSPEC,.ifi_index=index,.ifi_flags=0,.ifi_change=IFF_UP};
+    struct nlmsghdr *header=msg_begin(&b,buffer,sizeof buffer,RTM_NEWLINK,NLM_F_REQUEST|NLM_F_ACK,next_seq(),&ifi,sizeof ifi);
+    return rtnl_simple_until(buffer,msg_end(&b,header),deadline);
+}
+
+int awg_dev_link_create_marked(const char *name,const char *kind,int mtu,const char *marker,int *index){
+ uint64_t now=nl_now_ns();return now?awg_dev_link_create_marked_until(name,kind,mtu,marker,index,now+2000000000ULL):EIO;
+}
+int awg_dev_link_delete_marked(const char *name,const char *kind,int index,const char *marker){
+ uint64_t now=nl_now_ns();return now?awg_dev_link_delete_marked_until(name,kind,index,marker,now+2000000000ULL):EIO;
+}
+int awg_dev_link_down_marked(const char *name,const char *kind,int index,const char *marker){
+ uint64_t now=nl_now_ns();return now?awg_dev_link_down_marked_until(name,kind,index,marker,now+2000000000ULL):EIO;
+}
+
+int awg_dev_link_query_owned_until(const char *name,char *kind,size_t kn,int *index,uint32_t *group,uint64_t deadline){
+    if(!deadline||!group||!name||!*name||strlen(name)>=IFNAMSIZ)return EINVAL;
+    *group=0;
+    return link_query_until(name,kind,kn,index,NULL,0,group,deadline);
+}
+static int owned_identity_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline){
+    char found_kind[32];int found_index=0;uint32_t found_group=0;
+    if(!kind||!awg_dev_ours(kind)||index<=0||!group)return EINVAL;
+    int rc=awg_dev_link_query_owned_until(name,found_kind,sizeof found_kind,&found_index,&found_group,deadline);
+    if(rc)return rc;
+    return found_index==index&&found_group==group&&!strcmp(found_kind,kind)?0:ESTALE;
+}
+int awg_dev_link_create_owned_until(const char *name,const char *kind,int mtu,uint32_t group,int *out_index,uint64_t deadline){
+    uint8_t buffer[512];struct link_ctx created={0};
+    if(out_index)*out_index=0;
+    if(!name||!*name||strlen(name)>=IFNAMSIZ||!kind||!awg_dev_ours(kind)||!group||!out_index||!deadline||mtu<576||mtu>65535)return EINVAL;
+    int fd=nl_open(NETLINK_ROUTE);if(fd<0)return errno;
+    size_t n=awg_build_newlink_owned(buffer,sizeof buffer,name,kind,mtu,group,next_seq());
+    if(!n){close(fd);return EINVAL;}
+    ((struct nlmsghdr *)buffer)->nlmsg_flags|=NLM_F_ECHO;
+    int rc=nl_talk_until(fd,buffer,n,link_cb,&created,deadline);close(fd);
+    *out_index=created.index; /* Even an ACK loss may follow a committed create. */
+    if(rc)return rc;
+    char actual_kind[32];int actual_index=0;uint32_t actual_group=0;
+    rc=awg_dev_link_query_owned_until(name,actual_kind,sizeof actual_kind,&actual_index,&actual_group,deadline);
+    if(rc)return rc;
+    if((created.index&&actual_index!=created.index)||actual_group!=group||strcmp(actual_kind,kind))return ESTALE;
+    *out_index=actual_index;
+    return 0;
+}
+static int owned_mutate_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline,int remove){
+    int rc=owned_identity_until(name,kind,index,group,deadline);if(rc)return rc;
+    uint8_t buffer[128];struct nlbuf b;
+    struct ifinfomsg ifi={.ifi_family=AF_UNSPEC,.ifi_index=index,.ifi_flags=0,.ifi_change=remove?0:IFF_UP};
+    struct nlmsghdr *h=msg_begin(&b,buffer,sizeof buffer,remove?RTM_DELLINK:RTM_NEWLINK,NLM_F_REQUEST|NLM_F_ACK,next_seq(),&ifi,sizeof ifi);
+    /* Intentionally no IFLA_GROUP: never invoke rtnl_dellink's group fallback. */
+    return rtnl_simple_until(buffer,msg_end(&b,h),deadline);
+}
+int awg_dev_link_down_owned_until(const char *n,const char *k,int i,uint32_t g,uint64_t d){return owned_mutate_until(n,k,i,g,d,0);}
+int awg_dev_link_delete_owned_until(const char *n,const char *k,int i,uint32_t g,uint64_t d){return owned_mutate_until(n,k,i,g,d,1);}
+
+
 static int link_create(const char *ifname, const char *kind, int mtu) {
     uint8_t buf[256];
-    size_t n = awg_build_newlink(buf, sizeof buf, ifname, kind, mtu, ++g_seq);
+    size_t n = awg_build_newlink(buf, sizeof buf, ifname, kind, mtu, next_seq());
     return rtnl_simple(buf, n);
 }
 
 int awg_dev_link_create_exclusive(const char *ifname, const char *kind, int mtu,
                                   int *out_index) {
     uint8_t buf[256];
-    struct link_ctx created = { "", 0 };
+    struct link_ctx created = {0};
     size_t n;
     int fd, rc;
     if (out_index) *out_index = 0;
@@ -818,7 +951,7 @@ int awg_dev_link_create_exclusive(const char *ifname, const char *kind, int mtu,
         !awg_dev_ours(kind) || !out_index || mtu < 576 || mtu > 65535) return EINVAL;
     fd = nl_open(NETLINK_ROUTE);
     if (fd < 0) return errno;
-    n = awg_build_newlink(buf, sizeof buf, ifname, kind, mtu, ++g_seq);
+    n = awg_build_newlink(buf, sizeof buf, ifname, kind, mtu, next_seq());
     ((struct nlmsghdr *)buf)->nlmsg_flags |= NLM_F_ECHO;
     rc = nl_talk(fd, buf, n, link_cb, &created);
     close(fd);
@@ -842,7 +975,7 @@ int awg_dev_link_delete_owned(const char *ifname, const char *kind, int index) {
     if (rc) return rc;
     if (actual_index != index || strcmp(actual_kind, kind)) return ESTALE;
     nh = msg_begin(&b, buf, sizeof buf, RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK,
-                   ++g_seq, &ifi, sizeof ifi);
+                   next_seq(), &ifi, sizeof ifi);
     return rtnl_simple(buf, msg_end(&b, nh));
 }
 
@@ -851,7 +984,7 @@ int awg_dev_link_delete(const char *ifname) {
     struct nlbuf b;
     struct ifinfomsg ifi = { .ifi_family = AF_UNSPEC };
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK,
-                                    ++g_seq, &ifi, sizeof ifi);
+                                    next_seq(), &ifi, sizeof ifi);
     nlbuf_put_str(&b, IFLA_IFNAME, ifname);
     return rtnl_simple(buf, msg_end(&b, nh));
 }
@@ -869,7 +1002,7 @@ int awg_dev_link_down_owned(const char *ifname, const char *kind, int index) {
     if (rc) return rc;
     if (actual_index != index || strcmp(actual_kind, kind)) return ESTALE;
     nh = msg_begin(&b, buf, sizeof buf, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK,
-                   ++g_seq, &ifi, sizeof ifi);
+                   next_seq(), &ifi, sizeof ifi);
     return rtnl_simple(buf, msg_end(&b, nh));
 }
 
@@ -880,7 +1013,7 @@ static int link_set_up(int index, int mtu) {
     struct ifinfomsg ifi = { .ifi_family = AF_UNSPEC, .ifi_index = index,
                              .ifi_flags = IFF_UP, .ifi_change = IFF_UP };
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK,
-                                    ++g_seq, &ifi, sizeof ifi);
+                                    next_seq(), &ifi, sizeof ifi);
     if (mtu > 0) nlbuf_put_u32(&b, IFLA_MTU, (uint32_t)mtu);
     return rtnl_simple(buf, msg_end(&b, nh));
 }
@@ -950,10 +1083,62 @@ int awg_dev_live_read(const char *ifname, const char *kind, struct awg_live *L) 
     struct nlbuf b;
     struct genlmsghdr g = { .cmd = AWG_CMD_GET_DEVICE, .version = (uint8_t)ver };
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, id, NLM_F_REQUEST | NLM_F_DUMP,
-                                    ++g_seq, &g, sizeof g);
+                                    next_seq(), &g, sizeof g);
     nlbuf_put_str(&b, AD_IFNAME, ifname);
     rc = nl_talk(fd, buf, msg_end(&b, nh), live_cb, L);
     close(fd);
+    return rc;
+}
+
+static int managed_config_valid(const struct awg_conf *c,const struct awg_secrets *keys){
+    if(!c||!keys||!keys->has_priv||c->peer_n>AWG_MAX_PEERS||c->aips_n>AWG_MAX_AIPS)return EINVAL;
+    unsigned key=0;for(unsigned j=0;j<AWG_KEY_LEN;j++)key|=keys->priv[j];if(!key)return EINVAL;
+    for(size_t j=0;j<c->aips_n;j++)if((c->aips[j].family!=AF_INET&&c->aips[j].family!=AF_INET6)||c->aips[j].cidr>(c->aips[j].family==AF_INET?32:128))return EINVAL;
+    for(size_t j=0;j<c->peer_n;j++){
+        const struct awg_peer *p=&c->peer[j];
+        if(p->aip_first>c->aips_n||p->aip_n>c->aips_n-p->aip_first)return EINVAL;
+        unsigned pub=0;for(unsigned k=0;k<AWG_KEY_LEN;k++)pub|=p->pub[k];if(!pub)return EINVAL;
+        if(p->has_ep){
+            if(!p->ep_len)return EDESTADDRREQ;
+            if((p->ep.ss_family==AF_INET&&p->ep_len!=sizeof(struct sockaddr_in))||(p->ep.ss_family==AF_INET6&&p->ep_len!=sizeof(struct sockaddr_in6))||(p->ep.ss_family!=AF_INET&&p->ep.ss_family!=AF_INET6))return EINVAL;
+            uint16_t port=p->ep.ss_family==AF_INET?((const struct sockaddr_in *)&p->ep)->sin_port:((const struct sockaddr_in6 *)&p->ep)->sin6_port;
+            if(!p->ep_port||ntohs(port)!=p->ep_port)return EINVAL;
+        }else if(p->ep_len)return EINVAL;
+    }
+    for(unsigned j=0;j<5;j++)if(c->istr[j]&&strnlen(c->istr[j],AWG_MAX_ISTR+1)>AWG_MAX_ISTR)return EINVAL;
+    return 0;
+}
+int awg_dev_configure_owned_until(const char *name,const char *kind,int index,uint32_t group,const struct awg_conf *c,const struct awg_secrets *keys,uint32_t mark,uint64_t deadline){
+    if(!deadline)return EINVAL;
+    int rc=managed_config_valid(c,keys);if(rc)return rc;
+    if(!kind||!awg_dev_ours(kind))return EINVAL;
+    int is_awg=!strcmp(kind,AWG_GENL_NAME);
+    if(!is_awg&&awg_conf_needs_awg(c))return EOPNOTSUPP;
+    rc=owned_identity_until(name,kind,index,group,deadline);if(rc)return rc;
+    uint16_t family=0;int version=0;rc=genl_family_until(kind,&family,&version,deadline);if(rc)return rc;
+    if(is_awg&&awg_conf_min_version(c,NULL)>version)return EOPNOTSUPP;
+    size_t cap=65536u;
+    for(unsigned j=0;j<5;j++)if(c->istr[j])cap+=NLA_ALIGN(NLA_HDRLEN+strlen(c->istr[j])+1);
+    uint8_t *message=malloc(cap);if(!message)return ENOMEM;
+    size_t n=awg_build_set_index(message,cap,family,version,is_awg,index,c,keys,mark,1,next_seq());
+    if(!n){wipe(message,cap);free(message);return EMSGSIZE;}
+    rc=owned_identity_until(name,kind,index,group,deadline);
+    if(!rc){int fd=nl_open(NETLINK_GENERIC);if(fd<0)rc=errno;else{rc=nl_talk_until(fd,message,n,NULL,NULL,deadline);close(fd);}}
+    wipe(message,cap);free(message);
+    if(!rc)rc=owned_identity_until(name,kind,index,group,deadline);
+    return rc;
+}
+int awg_dev_live_read_owned_until(const char *name,const char *kind,int index,uint32_t group,struct awg_live *out,uint64_t deadline){
+    if(!out||!deadline)return EINVAL;
+    memset(out,0,sizeof *out);int rc=owned_identity_until(name,kind,index,group,deadline);if(rc)return rc;
+    uint16_t family=0;int version=0;rc=genl_family_until(kind,&family,&version,deadline);if(rc)return rc;
+    int fd=nl_open(NETLINK_GENERIC);if(fd<0)return errno;
+    uint8_t buffer[128];struct nlbuf b;struct genlmsghdr g={.cmd=AWG_CMD_GET_DEVICE,.version=(uint8_t)version};
+    struct nlmsghdr *h=msg_begin(&b,buffer,sizeof buffer,family,NLM_F_REQUEST|NLM_F_DUMP,next_seq(),&g,sizeof g);
+    nlbuf_put_u32(&b,AD_IFINDEX,(uint32_t)index);
+    rc=nl_talk_until(fd,buffer,msg_end(&b,h),live_cb,out,deadline);close(fd);
+    if(!rc)rc=owned_identity_until(name,kind,index,group,deadline);
+    if(rc)memset(out,0,sizeof *out);
     return rc;
 }
 
@@ -1022,7 +1207,7 @@ static int addr_msg(int add, const struct awg_prefix *p, int index) {
                              .ifa_scope = RT_SCOPE_UNIVERSE, .ifa_index = (unsigned)index };
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, add ? RTM_NEWADDR : RTM_DELADDR,
                                     NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0),
-                                    ++g_seq, &ifa, sizeof ifa);
+                                    next_seq(), &ifa, sizeof ifa);
     size_t al = p->family == AF_INET ? 4 : 16;
     nlbuf_put_data(&b, IFA_LOCAL, p->addr, al);
     nlbuf_put_data(&b, IFA_ADDRESS, p->addr, al);
@@ -1338,7 +1523,7 @@ int awg_dev_configure(const char *who, const char *dev, const char *conf_path, u
     cap = 65536 + 5 * AWG_MAX_ISTR;
     msg = malloc(cap);
     if (!msg) goto out;
-    size_t n = awg_build_set(msg, cap, famid, famver, is_awg, dev, &c, &s, fwmark, replace, ++g_seq);
+    size_t n = awg_build_set(msg, cap, famid, famver, is_awg, dev, &c, &s, fwmark, replace, next_seq());
     if (!n) {
         fprintf(stderr, LOG_W "выход %s: настройка не влезает в одно сообщение ядру\n", who);
         goto out;
@@ -1402,7 +1587,7 @@ static int link_to_ns(int index, int ns) {
     struct nlbuf b;
     struct ifinfomsg ifi = { .ifi_family = AF_UNSPEC, .ifi_index = index };
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK,
-                                    ++g_seq, &ifi, sizeof ifi);
+                                    next_seq(), &ifi, sizeof ifi);
     nlbuf_put_u32(&b, IFLA_NET_NS_FD, (uint32_t)ns);
     return rtnl_simple(buf, msg_end(&b, nh));
 }
@@ -1414,7 +1599,7 @@ static int route_default(int index) {
     struct rtmsg rt = { .rtm_family = AF_INET, .rtm_table = RT_TABLE_MAIN, .rtm_protocol = RTPROT_STATIC,
                         .rtm_scope = RT_SCOPE_LINK, .rtm_type = RTN_UNICAST };
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, RTM_NEWROUTE,
-                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE, ++g_seq, &rt, sizeof rt);
+                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE, next_seq(), &rt, sizeof rt);
     nlbuf_put_u32(&b, RTA_OIF, (uint32_t)index);
     return rtnl_simple(buf, msg_end(&b, nh));
 }

@@ -17,7 +17,8 @@
  * дампом набора.
  *
  * Синхронно: ядро отвечает на запрос внутри того же системного вызова. Зовёт только основной
- * поток. */
+ * поток. Новые *_until companions используются также ограниченным worker;
+ * состояние callback принадлежит вызывающему, номер запроса выдаётся атомарно. */
 #ifndef STEER_NFTDUMP_H
 #define STEER_NFTDUMP_H
 
@@ -69,6 +70,15 @@ struct nfd_tfp {
     unsigned fams;              /* 1 — таблица inet есть, 0 — нет */
 };
 int nfd_table_fp(const char *table, struct nfd_tfp *out);
+/* Worker companions keep one absolute CLOCK_MONOTONIC deadline across dumps
+ * and bounded retries. Zero invalid; return 0 or errno (unlike legacy fp -1).
+ * Chain list<=64, names<NFD_NAME; callback must be bounded and owns its state.
+ * Interrupted/partial dumps remain errors, never a successful ownership proof.
+ * No kernel mutation, implicit retries beyond existing five dump attempts, or
+ * global lock. Every exchange owns/wipes its bounded64KiB receive scratch. */
+int nfd_table_fp_until(const char *,struct nfd_tfp *,uint64_t);
+int nfd_chain_rules_until(uint8_t,const char *,const char *const *,size_t,nfd_rule_fn,void *,uint64_t);
+
 /* Свёртка одного сообщения дампа (NEWCHAIN, NEWSET, NEWRULE таблицы table семейства inet) — та,
  * что идёт в отпечаток: только по разрешённым атрибутам вида. 1 — посчитана. Для стенда
  * (tests/nftdump-tool.c): отпечаток не должен зависеть от атрибутов, которых ядро steer не задаёт. */

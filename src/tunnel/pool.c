@@ -1418,3 +1418,35 @@ int pool_run(const struct tun_out *o, const struct pool_cfg *pc, stack_ready_fn 
     r.arg = arg;
     return stack_run(o, d, pl_ready_cb, &r);
 }
+
+/* Run-scoped adapter forwards the selected node and the inner session. */
+static int pl_shutdown_write(void *context, const void *ctx, void *sess) {
+ (void)ctx;
+ const struct stack_flow_extensions *ext = context;
+ struct pl_sess *s = sess;
+ return s->node && ext->shutdown_write ?
+ ext->shutdown_write(ext->context, s->node, INNER(s)) : SEND_UNSUPPORTED;
+}
+static int pl_read_end(void *context, const void *sess) {
+ const struct stack_flow_extensions *ext = context;
+ return ext->read_end ? ext->read_end(ext->context, CINNER(sess)) : STACK_FLOW_END_UNKNOWN;
+}
+static int pl_can_halfclose(void *context, const void *ctx, const void *sess) {
+ (void)ctx;
+ const struct stack_flow_extensions *ext = context;
+ const struct pl_sess *s = sess;
+ return s->node && ext->can_halfclose ?
+ ext->can_halfclose(ext->context, s->node, CINNER(s)) : 0;
+}
+int pool_run_ex(const struct tun_out *o, const struct pool_cfg *pc,
+ const struct stack_flow_extensions *ext, stack_ready_fn ready, void *arg) {
+ if (!ext) return pool_run(o, pc, ready, arg);
+ if (ext->size < sizeof(*ext) || ext->version != STACK_FLOW_EXT_VERSION) return 1;
+ const struct dialer *d = pool_setup(pc);
+ if (!d) return 1;
+ struct pl_ready r = { .ready = ready, .arg = arg };
+ const struct stack_flow_extensions adapter = {
+ sizeof(adapter), STACK_FLOW_EXT_VERSION, (void *)ext, pl_shutdown_write, pl_read_end, pl_can_halfclose
+ };
+ return stack_run_ex(o, d, &adapter, pl_ready_cb, &r);
+}

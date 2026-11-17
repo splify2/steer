@@ -9,6 +9,7 @@
 
 #include "awg.h"
 
+#define AWG_LINK_MARKER_MAX 64u
 struct kind_name;
 
 struct awg_live_peer {
@@ -37,6 +38,35 @@ int awg_dev_configure(const char *who, const char *dev, const char *conf_path, u
 /* Устройство: 0 — есть (kind — вид ядра, index — номер; оба необязательны), иначе errno. */
 int awg_dev_link_query(const char *ifname, char *kind, size_t kn, int *index);
 int awg_dev_link_delete(const char *ifname);
+/* Marker companions for journaled managed resources; legacy helpers unchanged.
+ * This emits IFLA_IFALIAS in the creation request, but pinned Linux ignores
+ * alias at create. Managed creation must use the composite owned API below.
+ * Marker is a bounded nonsecret owner token, never credentials. Missing/wrong
+ * marker refuses mutation. Caller pins boot/netns identity and serializes
+ * privileged ownership; rtnetlink supplies no cross-process marker CAS. */
+int awg_dev_link_query_marked(const char *,char *,size_t,int *,char *,size_t);
+int awg_dev_link_create_marked(const char *,const char *,int,const char *,int *);
+int awg_dev_link_down_marked(const char *,const char *,int,const char *);
+int awg_dev_link_delete_marked(const char *,const char *,int,const char *);
+/* Managed variants preserve ONE absolute CLOCK_MONOTONIC deadline across
+ * identity query and mutation. Zero is invalid, never a timeout reset. */
+int awg_dev_link_query_marked_until(const char *,char *,size_t,int *,char *,size_t,uint64_t);
+int awg_dev_link_create_marked_until(const char *,const char *,int,const char *,int *,uint64_t);
+int awg_dev_link_down_marked_until(const char *,const char *,int,const char *,uint64_t);
+int awg_dev_link_delete_marked_until(const char *,const char *,int,const char *,uint64_t);
+
+/* Composite managed ownership. The coordinator MUST durably record a freshly
+ * cryptographic-random physical name (not the logical spec name), nonzero random
+ * group, boot/netns identity BEFORE create. Intended marker entropy: 13 base32
+ * name characters + 32 group bits. These helpers never generate/adopt a marker.
+ * Fresh query verifies persisted group; mutators use precise ifindex only after
+ * name/kind/index/group comparison. Never group-only delete/change. External
+ * privileged mutation between query and action is not an atomic kernel CAS. */
+int awg_dev_link_query_owned_until(const char *,char *,size_t,int *,uint32_t *,uint64_t);
+int awg_dev_link_create_owned_until(const char *,const char *,int,uint32_t,int *,uint64_t);
+int awg_dev_link_down_owned_until(const char *,const char *,int,uint32_t,uint64_t);
+int awg_dev_link_delete_owned_until(const char *,const char *,int,uint32_t,uint64_t);
+
 /* Exclusive device creation for the experimental owned-device adapter. Never
  * adopts/reconfigures an existing link. kind must be wireguard/amneziawg.
  * On success out_index identifies the fresh link in the current net namespace;
@@ -49,6 +79,16 @@ int awg_dev_link_create_exclusive(const char *ifname, const char *kind, int mtu,
 int awg_dev_link_delete_owned(const char *ifname, const char *kind, int index);
 /* Fail-closed quiesce by captured identity; never changes a replacement link. */
 int awg_dev_link_down_owned(const char *ifname, const char *kind, int index);
+/* Managed parsed-input companions. Caller owns immutable config/keys through
+ * return, including every non-NULL istr target (deep owned or prepared pin).
+ * All temporary message storage is operation-owned and wiped. No
+ * file/state writes, DNS, create/recreate, address changes or implicit UP.
+ * Numeric endpoints must already be resolved. Exact IFINDEX is sent after a
+ * fresh composite check; caller additionally pins boot/netns and guards policy.
+ * Errors after mutation submission may mean UNCERTAIN, not rolled back. */
+int awg_dev_configure_owned_until(const char *,const char *,int,uint32_t,
+    const struct awg_conf *,const struct awg_secrets *,uint32_t,uint64_t);
+int awg_dev_live_read_owned_until(const char *,const char *,int,uint32_t,struct awg_live *,uint64_t);
 /* Вид устройства — наш туннель (amneziawg или wireguard). */
 int awg_dev_ours(const char *kind);
 /* Пиры устройства из ядра (рукопожатие, счётчики, эндпоинт). 0 — прочитано. */

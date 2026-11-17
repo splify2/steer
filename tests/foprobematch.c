@@ -12,7 +12,7 @@
 #include "foprobe.h"
 
 static int g_ok = -1;
-static long g_t0;
+static int64_t g_t0;
 
 static void done(void *arg, int ok, int ms) {
     (void)ms;
@@ -33,7 +33,7 @@ int main(int argc, char **argv) {
                                      done, l, &ok);
     if (p) loop_run(l);
     else g_ok = ok;
-    printf("%s %ld\n", g_ok == 1 ? "ok" : "fail", loop_now_ms() - g_t0);
+    printf("%s %lld\n", g_ok == 1 ? "ok" : "fail", (long long)(loop_now_ms() - g_t0));
     loop_free(l);
     return g_ok == 1 ? 0 : 1;
 }

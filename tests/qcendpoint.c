@@ -23,6 +23,12 @@ static void stream(void *user,int64_t sid,const uint8_t *data,size_t length,int 
 }
 static void datagram(void *user,const uint8_t *data,size_t length) {
     struct connection *c=user; struct server *s=c->server;
+    uint8_t maximum[1600];
+    if(length==1&&data[0]==0xfe) {
+        length=qc_datagram_max(c->q);
+        if(length>sizeof maximum) { s->errors++;return; }
+        memset(maximum,0xa5,length);data=maximum;
+    }
     if(!c->handshake||qc_datagram_send(c->q,data,length)) s->errors++;
 }
 static void closed(void *user,int reason,const char *why) {

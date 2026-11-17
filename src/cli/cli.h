@@ -115,7 +115,7 @@ void cli_version(FILE *out);
  * libsteer-ngtcp2.so.<версия ngtcp2>-<серия патчей>, — с которыми связаны net1 и мост tgws. Мажор — смена SONAME
  * любой из них или раскладки структур (build/wolfssl/abi.c), минор — новое имя в экспорте. Записанные значения и
  * правило подъёма — build/wolfssl/crypto.lst, сверяет tests/buildmatch.sh. */
-#define CLI_STEER_CRYPTO "1.0"
+#define CLI_STEER_CRYPTO "2.0"
 void cli_version_json(FILE *out);
 const char *cli_core_version(void);
 

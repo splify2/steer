@@ -40,6 +40,7 @@
  * AAAA; метка члена ведёт его по правилу и таблице IPv6 члена (ip -6 rule), как трафик группы. */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -85,13 +86,13 @@ struct dns_ent {
     int fam;
     int ok;
     struct sockaddr_storage a;
-    long until;
+    int64_t until;
 };
 static struct dns_ent g_dns[DNS_CACHE_N];
 
 /* 1 — в кэше годный адрес; 0 — в кэше отказ (свежий); -1 — нет записи. */
 static int dns_get(const char *host, int fam, struct sockaddr_storage *a) {
-    long now = loop_now_ms();
+    int64_t now = loop_now_ms();
     for (size_t i = 0; i < DNS_CACHE_N; i++)
         if (g_dns[i].host[0] && g_dns[i].fam == fam && !strcmp(g_dns[i].host, host) &&
             g_dns[i].until > now) {
@@ -103,7 +104,7 @@ static int dns_get(const char *host, int fam, struct sockaddr_storage *a) {
 
 static void dns_put(const char *host, int fam, int ok, const struct sockaddr_storage *a) {
     size_t slot = 0;
-    long oldest = 0;
+    int64_t oldest = 0;
     for (size_t i = 0; i < DNS_CACHE_N; i++) {
         if (g_dns[i].fam == fam && !strcmp(g_dns[i].host, host)) { slot = i; break; }
         if (i == 0 || g_dns[i].until < oldest) { oldest = g_dns[i].until; slot = i; }
@@ -129,13 +130,13 @@ struct urltest {
     urltest_cb cb;
     void *arg;
     struct loop_timer *tm;
-    long deadline;
+    int64_t deadline;
     int st;
     int fd;
     struct gaiw *gw;
     struct urltls *tls;
     struct sockaddr_storage dst;
-    long t0, t_first;
+    int64_t t0, t_first;
     char req[512];
     size_t req_n, req_off;
     char buf[80];
@@ -262,8 +263,9 @@ static void ut_recv(struct urltest *u) {
         u->buf[u->bn] = '\0';
         char *eol = memchr(u->buf, '\n', u->bn);
         if (eol || u->bn >= 64) {
-            long ms = u->t_first - u->t0;
+            int64_t ms = u->t_first - u->t0;
             if (ms < 0) ms = 0;
+            if (ms > INT_MAX) ms = INT_MAX;
             int ok = status_ok(u->buf, u->bn);
             if (!ok) ut_status_why(u);
             ut_finish(u, ok ? (int)ms : -1);
@@ -316,7 +318,7 @@ static void ut_connect(struct urltest *u, const struct sockaddr_storage *a) {
         ((struct sockaddr_in *)&u->dst)->sin_port = htons(u->u.port);
         dl = sizeof(struct sockaddr_in);
     }
-    long left = u->deadline - loop_now_ms();
+    int64_t left = u->deadline - loop_now_ms();
     if (left <= 0) { ut_why(u, "срок вышел до соединения"); ut_finish(u, -1); return; }
 
     if (u->u.https) {

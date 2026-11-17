@@ -107,13 +107,20 @@ static int tags(const struct ynode*n){
     return 1;
 }
 static int listener(const struct ynode*n,struct steer_prototype_listener*l){
-    const struct ynode*a,*v;
+    const struct ynode*a,*v,*tls;
     uint8_t ip[16];
     int family;
-    if(!keys(n,"id label enabled protocol listen auth")||!id(ynode_get(n,"id"),l->id)||!label(ynode_get(n,"label"),l->label)||!flag(ynode_get(n,"enabled"),1,&l->enabled))return 0;
+    if(!keys(n,"id label enabled protocol listen auth tls")||!id(ynode_get(n,"id"),l->id)||!label(ynode_get(n,"label"),l->label)||!flag(ynode_get(n,"enabled"),1,&l->enabled))return 0;
     if(eq(ynode_get(n,"protocol"),"socks"))l->protocol=STEER_PROTOTYPE_SOCKS;
     else if(eq(ynode_get(n,"protocol"),"vless"))l->protocol=STEER_PROTOTYPE_VLESS;
+    else if(eq(ynode_get(n,"protocol"),"hysteria2"))l->protocol=STEER_PROTOTYPE_HYSTERIA2;
     else return 0;
+    tls=ynode_get(n,"tls");
+    if(l->protocol==STEER_PROTOTYPE_HYSTERIA2) {
+        if(!keys(tls,"certificate_ref private_key_ref")||tls->len!=2||
+           !reference(ynode_get(tls,"certificate_ref"),l->certificate_ref)||
+           !reference(ynode_get(tls,"private_key_ref"),l->private_key_ref))return 0;
+    } else if(tls)return 0;
     v=ynode_get(n,"listen");
     a=ynode_get(n,"auth");
     if(!keys(v,"address port")||!copy(ynode_get(v,"address"),l->address,sizeof(l->address))||!port(ynode_get(v,"port"),&l->port))return 0;
@@ -136,6 +143,10 @@ static int listener(const struct ynode*n,struct steer_prototype_listener*l){
     if(eq(v,"uuid")){
         l->auth=STEER_PROTOTYPE_AUTH_UUID;
         return l->protocol==STEER_PROTOTYPE_VLESS&&a->len==3&&reference(ynode_get(a,"uuid_ref"),l->uuid_ref);
+    }
+    if(eq(v,"password")){
+        l->auth=STEER_PROTOTYPE_AUTH_PASSWORD;
+        return l->protocol==STEER_PROTOTYPE_HYSTERIA2&&a->len==3&&reference(ynode_get(a,"password_ref"),l->password_ref);
     }
     return 0;
 }
@@ -275,7 +286,9 @@ struct steer_pv1_error steer_prototype_config_parse(const char*data,size_t lengt
     c->listener_count=(uint32_t)list->len;
     for(i=0;i<c->listener_count;i++){
         if(!listener(ynode_at(list,i),&c->listeners[i]))goto done;
-        for(j=0;j<i;j++)if(!strcmp(c->listeners[i].id,c->listeners[j].id)||(c->listeners[i].enabled&&c->listeners[j].enabled&&c->listeners[i].port==c->listeners[j].port&&!strcmp(c->listeners[i].address,c->listeners[j].address)))goto done;
+        for(j=0;j<i;j++)if(!strcmp(c->listeners[i].id,c->listeners[j].id)||(c->listeners[i].enabled&&c->listeners[j].enabled&&
+            (c->listeners[i].protocol==STEER_PROTOTYPE_HYSTERIA2)==(c->listeners[j].protocol==STEER_PROTOTYPE_HYSTERIA2)&&
+            c->listeners[i].port==c->listeners[j].port&&!strcmp(c->listeners[i].address,c->listeners[j].address)))goto done;
     }
     for(i=0;i<rules->len;i++){
         uint32_t enabled;

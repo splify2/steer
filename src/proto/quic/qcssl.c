@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 
 #include <wolfssl/ssl.h>
+#include "steer_init.h"
 #include <wolfssl/quic.h>
 #include <wolfssl/wolfcrypt/sha256.h>
 #include <ngtcp2/ngtcp2.h>
@@ -32,6 +33,7 @@ static unsigned char *read_file(const char *path, size_t *n) {
 }
 
 void *qcssl_ctx_client(int insecure, const uint8_t *ca_pem, size_t ca_pem_n, const char *ca_file) {
+    if (wolfSSL_steer_init() != 0) return NULL;
     WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
     if (!ctx) return NULL;
     /* Версии, билеты сессии и кодовая точка параметров транспорта выставляет ngtcp2. */
@@ -59,12 +61,24 @@ fail:
 }
 
 #if defined(QC_WITH_SERVER) || defined(QC_WITH_ENDPOINT)
+#if (defined(__unix__) || defined(__linux__)) && (!defined(STEER_WOLFSSL_POSIX_TIME_SAFE) || STEER_WOLFSSL_POSIX_TIME_SAFE != 1)
+#error "QUIC POSIX server requires rebuilt recipe-verified thread-safe date profile"
+#endif
+#ifndef WOLFSSL_VALIDATE_ECC_IMPORT
+#error "QUIC server requires wolfSSL server profile with WOLFSSL_VALIDATE_ECC_IMPORT"
+#endif
 void *qcssl_ctx_server(const uint8_t *cert_der, size_t cert_n, const uint8_t *key_der, size_t key_n) {
+    if (wolfSSL_steer_init() != 0) return NULL;
     WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfTLSv1_3_server_method());
     if (!ctx) return NULL;
+    int cert_pem=cert_n>=11&&!memcmp(cert_der,"-----BEGIN ",11);
+    int key_pem=key_n>=11&&!memcmp(key_der,"-----BEGIN ",11);
+    int certificate=cert_pem?wolfSSL_CTX_use_certificate_chain_buffer_format(ctx,cert_der,(long)cert_n,WOLFSSL_FILETYPE_PEM):
+        wolfSSL_CTX_use_certificate_buffer(ctx,cert_der,(long)cert_n,WOLFSSL_FILETYPE_ASN1);
     if (ngtcp2_crypto_wolfssl_configure_server_context(ctx) != 0 ||
-        wolfSSL_CTX_use_certificate_buffer(ctx, cert_der, (long)cert_n, WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS ||
-        wolfSSL_CTX_use_PrivateKey_buffer(ctx, key_der, (long)key_n, WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
+        certificate != WOLFSSL_SUCCESS ||
+        wolfSSL_CTX_use_PrivateKey_buffer(ctx, key_der, (long)key_n,key_pem?WOLFSSL_FILETYPE_PEM:WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS ||
+        wolfSSL_CTX_check_private_key(ctx)!=WOLFSSL_SUCCESS) {
         wolfSSL_CTX_free(ctx);
         return NULL;
     }
@@ -78,6 +92,9 @@ void *qcssl_ctx_server(const uint8_t *cert_der, size_t cert_n, const uint8_t *ke
         }
     }
     return ctx;
+}
+int qcssl_material_sha256(const uint8_t *data,size_t length,uint8_t out[32]) {
+    return data&&length<=UINT32_MAX&&wc_Sha256Hash(data,(word32)length,out)==0?0:-1;
 }
 #endif
 
