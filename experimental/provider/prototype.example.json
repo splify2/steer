@@ -1,0 +1,31 @@
+{
+  "prototype": "steer-linux-v1",
+  "listeners": [
+    {
+      "id": "local-socks",
+      "label": "Локальный SOCKS",
+      "enabled": true,
+      "protocol": "socks",
+      "listen": { "address": "127.0.0.1", "port": 18080 },
+      "auth": { "type": "none" }
+    },
+    {
+      "id": "local-vless",
+      "label": "Локальный VLESS TCP",
+      "enabled": true,
+      "protocol": "vless",
+      "listen": { "address": "127.0.0.1", "port": 18443 },
+      "auth": {
+        "type": "uuid",
+        "principal_id": "local-user",
+        "uuid_ref": "env:STEER_LOCAL_UUID"
+      }
+    }
+  ],
+  "routing": {
+    "default": "block",
+    "rules": [
+      { "id": "default-route", "label": "Весь трафик", "enabled": true, "match_all": true, "action": "direct" }
+    ]
+  }
+}

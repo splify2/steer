@@ -9,5 +9,8 @@
 
 int run(const char *const argv[]);
 int run_quiet(const char *const argv[]);
+/* Same deadline/process-group semantics as run. Stdout goes to caller-owned
+ * fd (caller bounds/validates result); stderr remains suppressed. */
+int run_output(const char *const argv[], int output_fd);
 
 #endif

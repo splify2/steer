@@ -898,3 +898,18 @@ void nft_print(const struct nft_rs *rs, FILE *f) {
         fprintf(f, "}\n");
     }
 }
+
+int nft_print_chains(const struct nft_rs *rs, FILE *f) {
+    const struct nft_table *t;
+    if (!rs || !f || rs->oom) return -1;
+    for (t = rs->tables; t; t = t->next)
+        for (const struct nft_obj *o = t->objs; o; o = o->next)
+            if (o->k != NFT_OBJ_CHAIN) return -1;
+    for (t = rs->tables; t; t = t->next) {
+        fprintf(f, "table inet %s {\n", t->name);
+        for (const struct nft_obj *o = t->objs; o; o = o->next)
+            print_chain(f, (const struct nft_chain *)o);
+        fprintf(f, "}\n");
+    }
+    return ferror(f) ? -1 : 0;
+}

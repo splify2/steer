@@ -232,6 +232,8 @@ static inline struct nft_chain *ir_obj_chain(struct nft_obj *o) {
 /* ---- печать (print.c) ---- */
 /* Текст nft всего дерева в f. Элементы наборов читаются из файлов потоком. */
 void nft_print(const struct nft_rs *rs, FILE *f);
+/* Chain-only consumer: same printer, rejects sets before output. */
+int nft_print_chains(const struct nft_rs *rs, FILE *f);
 /* 1 (по умолчанию) — элементы из файла состояния резолвера (NFT_EL_FAKEIP_STATE и засев наборов
  * каналов ниже) печатаются; 0 — пропускаются, будто файла нет. 0 ставит отпечаток плана
  * apply-сверки (apply-plan в src/daemon/apply.c) — зачем, у print_elements в print.c, — и apply,

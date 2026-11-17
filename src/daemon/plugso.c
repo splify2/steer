@@ -28,6 +28,7 @@
 #include "loop.h"
 #include "marks.h"
 #include "platform.h"
+#include "plugmanifest.h"
 #include "sockmark.h"
 #include "spec.h"
 #include "state.h"
@@ -331,23 +332,30 @@ static void mkdirs(const char *path) {
     mkdir(t, 0755);
 }
 
-static char *slurp(const char *path, size_t *n) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+static char *slurp_limit(const char *path, size_t *n, size_t limit) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) return NULL;
     struct stat st;
-    if (fstat(fd, &st) != 0) { close(fd); return NULL; }
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uintmax_t)st.st_size > limit) { close(fd); return NULL; }
     char *b = malloc((size_t)st.st_size + 1);
     if (!b) { close(fd); return NULL; }
     size_t got = 0;
     while (got < (size_t)st.st_size) {
         ssize_t r = read(fd, b + got, (size_t)st.st_size - got);
+        if (r < 0 && errno == EINTR) continue;
         if (r <= 0) break;
         got += (size_t)r;
     }
     close(fd);
+    if (got != (size_t)st.st_size) { free(b); return NULL; }
     b[got] = 0;
     if (n) *n = got;
     return b;
+}
+
+static char *slurp(const char *path, size_t *n) {
+    return slurp_limit(path, n, SIZE_MAX - 1);
 }
 
 struct crash_info { int n; char fn[64], sig[16]; };
@@ -1043,6 +1051,47 @@ static void adopt_events(struct plugso *p) {
     g_sub_on = 1;
 }
 
+/* Legacy callers may load a bare .so (including ABI fixtures). Preserve that
+ * contract for now, but never ignore an existing package's new manifest.
+ * Future provider loading MUST require a verified schema2 manifest; it must not
+ * use this absent-manifest exception or fall back to this loader. */
+static int manifest_contract_check(struct plugso *p, char *why, size_t wn) {
+    char path[PATH_MAX];
+    int len = snprintf(path, sizeof path, "%s/plugin.json", p->dir);
+    if (len < 0 || (size_t)len >= sizeof path) {
+        snprintf(why, wn, "plugin.json: путь слишком длинный");
+        return -1;
+    }
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT) return 0; /* existing bare-library API */
+        snprintf(why, wn, "plugin.json: не удалось проверить манифест");
+        return -1;
+    }
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size < 0 || (uintmax_t)st.st_size > YDOC_MAX_BYTES) {
+        snprintf(why, wn, "plugin.json: нужен обычный файл в пределах лимита");
+        return -1;
+    }
+    size_t n = 0;
+    char *txt = slurp_limit(path, &n, YDOC_MAX_BYTES);
+    if (!txt) {
+        snprintf(why, wn, "plugin.json: не удалось прочитать манифест");
+        return -1;
+    }
+    struct err e = {0};
+    struct ydoc *d = ydoc_parse_buf(txt, n, path, &e);
+    free(txt);
+    if (!d) {
+        snprintf(why, wn, "plugin.json: не удалось разобрать манифест");
+        return -1;
+    }
+    const char *reason = plugin_legacy_contract_why(ydoc_root(d));
+    if (reason) snprintf(why, wn, "%s", reason);
+    ydoc_free(d);
+    return reason ? -1 : 0;
+}
+
 static void load_one(struct plugso *p) {
     char root[PATH_MAX], why[512];
     free(p->why);
@@ -1051,6 +1100,10 @@ static void load_one(struct plugso *p) {
     root_dir(root, sizeof root);
 
     if (plugso_supported(why, sizeof why) != 0) { fail(p, PLUGSO_FAILED, "%s", why); return; }
+    if (manifest_contract_check(p, why, sizeof why) != 0) {
+        fail(p, PLUGSO_FAILED, "%s", why);
+        return;
+    }
 
     /* Отключение по падениям: отметка человека/ядра или три записи в окне. */
     char off[PATH_MAX + 80];

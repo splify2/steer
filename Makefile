@@ -45,6 +45,14 @@ override CFLAGS += $(addprefix -I,$(INC_DIRS)) $(THIRD_DEFS)
 .PHONY: all test clean ext-syntax ext-test libs-test libs-exports snapshot-record print-inc ndk-check
 all: $(BUILD)/steerd $(BUILD)/steer
 
+# Standalone inventory foundation: no net1 linkage or runtime platform selection.
+.PHONY: capabilities-test
+capabilities-test: $(BUILD)/capabilitiesmatch
+	@$(BUILD)/capabilitiesmatch
+$(BUILD)/capabilitiesmatch: tests/capabilitiesmatch.c src/platform/capabilities.c src/platform/capabilities.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc/platform -o $@ tests/capabilitiesmatch.c src/platform/capabilities.c
+
 # Два бинарника, как в пакете (docs/architecture.md, раздел 4а, «Бинарники»): build/steerd — весь
 # движок, build/steer — клиент сокета. Стенды зовут ./build/steer, как звали всегда: команды,
 # которые не к демону (а без демона — любые), клиент отдаёт движку execv'ом, и steerd он берёт
@@ -896,4 +904,41 @@ clean:
 	       $(BUILD)/scryptomatch $(BUILD)/sigmatch $(BUILD)/vlessmatch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
 	       $(BUILD)/devupmatch $(BUILD)/ndk \
 	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool \
-	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out
+	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts $(BUILD)/socks-loopback $(BUILD)/vless-loopback out
+
+# Explicit disposable Linux lab targets; absent from production/all/test lists.
+LAB_LOOPBACK_SRC := experimental/provider/loopback_host.c experimental/provider/stream.c \
+    experimental/provider/buffers.c experimental/provider/operations.c experimental/provider/route_dial.c experimental/provider/resolver.c \
+    experimental/provider/policy.c experimental/provider/policy_route.c src/daemon/loop.c \
+    experimental/provider/prototype_config.c experimental/provider/prototype_store.c $(YAML_SRC) src/lib/err.c src/lib/jsonw.c \
+    ../steer-protocols/src/socks5/codec.c ../steer-protocols/src/vless/inbound.c
+LAB_LOOPBACK_HDR := experimental/provider/loopback_host.h experimental/provider/stream.h \
+    experimental/provider/buffers.h experimental/provider/operations.h experimental/provider/route_dial.h experimental/provider/resolver.h \
+    experimental/provider/policy.h experimental/provider/policy_route.h experimental/provider/prototype_config.h experimental/provider/prototype_store.h src/daemon/loop.h \
+    ../steer-protocols/src/socks5/codec.h ../steer-protocols/src/vless/inbound.h \
+    ../plugin-sdk/include/steer/draft/provider_v1.h ../plugin-sdk/include/steer/draft/stream_v1.h
+LAB_LOOPBACK_INC := -I../plugin-sdk/include -Isrc/daemon -Isrc/lib -Isrc/third_party/libyaml -DHAVE_CONFIG_H -D_POSIX_C_SOURCE=200809L -I../steer-protocols/src/socks5 -I../steer-protocols/src/vless
+LAB_CFLAGS ?= -O2 -std=c11 -pedantic -Wall -Wextra -Werror
+$(BUILD)/socks-loopback: experimental/provider/socks_loopback.c $(LAB_LOOPBACK_SRC) $(LAB_LOOPBACK_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(LAB_CFLAGS) $(LAB_LOOPBACK_INC) $< $(LAB_LOOPBACK_SRC) -pthread -o $@
+$(BUILD)/vless-loopback: experimental/provider/vless_loopback.c $(LAB_LOOPBACK_SRC) $(LAB_LOOPBACK_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(LAB_CFLAGS) $(LAB_LOOPBACK_INC) $< $(LAB_LOOPBACK_SRC) -pthread -o $@
+$(BUILD)/steer-prototype: experimental/provider/prototype_main.c $(LAB_LOOPBACK_SRC) $(LAB_LOOPBACK_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(LAB_CFLAGS) $(LAB_LOOPBACK_INC) $< $(LAB_LOOPBACK_SRC) -pthread -o $@
+lab-loopback: $(BUILD)/socks-loopback $(BUILD)/vless-loopback
+lab-loopback-test: lab-loopback
+	python3 experimental/provider/socks_loopback_test.py $(BUILD)/socks-loopback
+	python3 experimental/provider/vless_loopback_test.py $(BUILD)/vless-loopback
+.PHONY: lab-loopback lab-loopback-test
+$(BUILD)/policy-test: experimental/provider/policy.c experimental/provider/policy_test.c experimental/provider/policy_route.c experimental/provider/policy.h experimental/provider/policy_route.h experimental/provider/route_dial.h ../plugin-sdk/include/steer/draft/provider_v1.h
+	@mkdir -p $(BUILD)
+	$(CC) $(LAB_CFLAGS) -UNDEBUG -I../plugin-sdk/include experimental/provider/policy.c experimental/provider/policy_test.c experimental/provider/policy_route.c -o $@
+policy-test: $(BUILD)/policy-test
+	$(BUILD)/policy-test
+.PHONY: policy-test
+prototype-test: $(BUILD)/steer-prototype
+	python3 experimental/provider/prototype_test.py $(BUILD)/steer-prototype
+.PHONY: prototype-test

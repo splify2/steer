@@ -20,7 +20,7 @@
 /* Клиентский контекст. insecure — не проверять сертификат; иначе корни из ca_pem либо из ca_file
  * (файл PEM). NULL — не создалось. */
 void *qcssl_ctx_client(int insecure, const uint8_t *ca_pem, size_t ca_pem_n, const char *ca_file);
-#ifdef QC_WITH_SERVER
+#if defined(QC_WITH_SERVER) || defined(QC_WITH_ENDPOINT)
 /* Серверный контекст стенда: сертификат и ключ — DER. */
 void *qcssl_ctx_server(const uint8_t *cert_der, size_t cert_n, const uint8_t *key_der, size_t key_n);
 #endif

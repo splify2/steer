@@ -37,6 +37,18 @@ int awg_dev_configure(const char *who, const char *dev, const char *conf_path, u
 /* Устройство: 0 — есть (kind — вид ядра, index — номер; оба необязательны), иначе errno. */
 int awg_dev_link_query(const char *ifname, char *kind, size_t kn, int *index);
 int awg_dev_link_delete(const char *ifname);
+/* Exclusive device creation for the experimental owned-device adapter. Never
+ * adopts/reconfigures an existing link. kind must be wireguard/amneziawg.
+ * On success out_index identifies the fresh link in the current net namespace;
+ * a captured index may also be returned on later ACK failure for rollback.
+ * Same namespace and serialized privileged ownership are caller obligations. */
+int awg_dev_link_create_exclusive(const char *ifname, const char *kind, int mtu,
+                                  int *out_index);
+/* Deletes by captured index only after name/kind/index identity matches.
+ * Replacement links are refused with ESTALE; legacy delete-by-name unchanged. */
+int awg_dev_link_delete_owned(const char *ifname, const char *kind, int index);
+/* Fail-closed quiesce by captured identity; never changes a replacement link. */
+int awg_dev_link_down_owned(const char *ifname, const char *kind, int index);
 /* Вид устройства — наш туннель (amneziawg или wireguard). */
 int awg_dev_ours(const char *kind);
 /* Пиры устройства из ядра (рукопожатие, счётчики, эндпоинт). 0 — прочитано. */

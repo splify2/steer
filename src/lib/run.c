@@ -75,7 +75,7 @@ static int run_wait_exit(pid_t p, long deadline) {
     }
 }
 
-int run(const char *const argv[]) {
+static int run_with_output(const char *const argv[], int output_fd) {
     pid_t p = fork();
     if (p < 0) return -1;
     if (p == 0) {
@@ -84,7 +84,8 @@ int run(const char *const argv[]) {
         /* Both streams: `nft get element` prints the whole set on success, which
          * would otherwise land in the middle of explain's answer. */
         int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+        if (devnull >= 0) { dup2(output_fd >= 0 ? output_fd : devnull, 1); dup2(devnull, 2); close(devnull); }
+        else if (output_fd >= 0) dup2(output_fd, 1);
         /* SIG_IGN переживает execve: модульные команды выключают SIGPIPE (cli/modcmd.c), и без
          * сброса его унаследовали бы nft, ip и загрузчик подписок. */
         signal(SIGPIPE, SIG_DFL);
@@ -106,6 +107,12 @@ int run(const char *const argv[]) {
     while (waitpid(p, &st, 0) < 0 && errno == EINTR) {}
     if (late) return -1;
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+int run(const char *const argv[]) { return run_with_output(argv, -1); }
+int run_output(const char *const argv[], int output_fd) {
+    if (output_fd < 0) return -1;
+    return run_with_output(argv, output_fd);
 }
 
 int run_quiet(const char *const argv[]) { return run(argv); }

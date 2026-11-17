@@ -51,6 +51,18 @@ static const char *why_of(const char *id) {
     return p ? (p->why ? p->why : "") : "(нет плагина)";
 }
 
+/* Direct-directory fixtures: installer rejection alone does not protect runtime. */
+static void schema_plugin(const char *id, const char *schema, const char *extra_compat) {
+    char rel[128], text[1024];
+    snprintf(rel, sizeof(rel), "%s/plugin.json", id);
+    snprintf(text, sizeof(text),
+             "{%s\"id\":\"%s\",\"version\":\"1.0.0\","
+             "\"compat\":{\"steer-api\":\"^1.0\"%s},"
+             "\"steer\":{\"kinds\":[{\"name\":\"k-%s\",\"caps\":[\"mark\"]}]}}",
+             schema, id, extra_compat, id);
+    put(rel, text);
+}
+
 static int load(const char *name, const char *text, struct spec *sp, char *msg, size_t n) {
     char path[600];
     snprintf(path, sizeof(path), "%s/%s", g_dir, name);        /* вне каталога плагинов: время его не меняется */
@@ -88,7 +100,24 @@ int main(void) {
     compat_plugin("c-lt", "<1.0");
     compat_plugin("c-zero", "^0.9");
     compat_plugin("c-junk", "abc");
+    schema_plugin("s-future", "\"schema\":2,", "");
+    schema_plugin("s-missing", "", "");
+    schema_plugin("s-string", "\"schema\":\"1\",", "");
+    schema_plugin("s-provider", "\"schema\":1,", ",\"steer-provider-api\":\"^1.0\"");
     plugin_reload(NULL);
+    const char *schema_rejected[] = { "s-future", "s-missing", "s-string" };
+    for (size_t i = 0; i < sizeof(schema_rejected) / sizeof(schema_rejected[0]); i++) {
+        const struct plugin *p = plugin_find(schema_rejected[i]);
+        check("unsupported/missing schema is disabled", 1, p && !p->enabled);
+        check_str("schema rejection reason", "plugin.json: поддерживается только schema 1",
+                  why_of(schema_rejected[i]));
+    }
+    const struct plugin *provider = plugin_find("s-provider");
+    check("provider axis cannot fall back to legacy", 1, provider && !provider->enabled);
+    check_str("provider axis rejection reason", "steer-provider-api не поддерживается legacy runtime",
+              why_of("s-provider"));
+    check("future schema kind is not registered", 1, plugin_kind_find("k-s-future") == NULL);
+    check("provider kind is not registered", 1, plugin_kind_find("k-s-provider") == NULL);
     check("^1.0 — совместим с steer-api 1.5", 1, plugin_find("c-caret")->enabled);
     check("~1.5 — совместим", 1, plugin_find("c-tilde")->enabled);
     check(">=1.0 <2 — совместим", 1, plugin_find("c-ge")->enabled);

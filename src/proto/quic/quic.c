@@ -116,6 +116,9 @@ struct qc {
     struct qc_ops ops;
     void     *user;
     int       fd;
+#ifdef QC_WITH_ENDPOINT
+    struct qc_endpoint *endpoint; /* endpoint owns shared fd/context and child */
+#endif
     int       epfd;
     int       server;
     int       connected;        /* сокет connect()-нут (клиент) */
@@ -360,6 +363,10 @@ static int stream_append(struct qc_stream *s, const uint8_t *d, size_t n) {
 }
 
 /* ---- колбэки ngtcp2 -------------------------------------------------------------------------- */
+#ifdef QC_WITH_ENDPOINT
+static int endpoint_cid_add(struct qc *, const ngtcp2_cid *);
+static void endpoint_cid_remove(struct qc *, const ngtcp2_cid *);
+#endif
 
 static ngtcp2_conn *get_conn_cb(ngtcp2_crypto_conn_ref *ref) {
     return ((struct qc *)ref->user_data)->conn;
@@ -378,8 +385,18 @@ static int new_cid_cb(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset
     cid->datalen = cidlen;
     if (ngtcp2_crypto_generate_stateless_reset_token(token->data, q->secret, sizeof q->secret, cid) != 0)
         return NGTCP2_ERR_CALLBACK_FAILURE;
+#ifdef QC_WITH_ENDPOINT
+    if (q->endpoint && endpoint_cid_add(q, cid) != 0) return NGTCP2_ERR_CALLBACK_FAILURE;
+#endif
     return 0;
 }
+#ifdef QC_WITH_ENDPOINT
+static int retire_cid_cb(ngtcp2_conn *conn, const ngtcp2_cid *cid, void *user) {
+    (void)conn;
+    endpoint_cid_remove(user,cid);
+    return 0;
+}
+#endif
 
 /* Срок PING — по сроку простоя, о котором договорились, а не только по своему. Действует меньший
  * из двух max_idle_timeout (RFC 9000, 10.1), а сервер вправе объявить свой короче нашего (у apernet
@@ -440,6 +457,9 @@ static int handshake_completed_cb(ngtcp2_conn *conn, void *ud) {
 static int recv_stream_data_cb(ngtcp2_conn *conn, uint32_t flags, int64_t sid, uint64_t offset,
                                const uint8_t *data, size_t datalen, void *ud, void *sud) {
     struct qc *q = ud;
+#ifdef QC_WITH_ENDPOINT
+    if (q->endpoint && (!q->hs_done || (flags & NGTCP2_STREAM_DATA_FLAG_0RTT))) return NGTCP2_ERR_CALLBACK_FAILURE;
+#endif
     (void)offset; (void)sud;
     if (q->ops.on_stream_data) {
         q->in_cb++;
@@ -514,6 +534,9 @@ static int extend_max_stream_data_cb(ngtcp2_conn *conn, int64_t sid, uint64_t ma
 
 static int recv_datagram_cb(ngtcp2_conn *conn, uint32_t flags, const uint8_t *data, size_t datalen, void *ud) {
     struct qc *q = ud;
+#ifdef QC_WITH_ENDPOINT
+    if (q->endpoint && (!q->hs_done || (flags & NGTCP2_DATAGRAM_FLAG_0RTT))) return NGTCP2_ERR_CALLBACK_FAILURE;
+#endif
     (void)conn; (void)flags;
     if (q->ops.on_datagram) {
         q->in_cb++;
@@ -909,7 +932,7 @@ static int addr_parse(const char *host, uint16_t port, struct sockaddr_storage *
 static int sock_tune(int fd);
 static struct qc *qc_alloc(const struct qc_ops *ops, void *user);
 
-#ifdef QC_WITH_SERVER
+#if defined(QC_WITH_SERVER) || defined(QC_WITH_ENDPOINT)
 /* ---- сервер для стендов ----------------------------------------------------------------------
  * Не входит в libsteer: ключ QC_WITH_SERVER задают только стенды (tests/qcloop.c, tests/qcserver.c).
  * Одно соединение на сокет — принимается первый же Initial, остальные пакеты чужих адресов
@@ -934,6 +957,9 @@ static const ngtcp2_callbacks g_server_cbs = {
     .get_new_connection_id2 = new_cid_cb,
     .get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb,
     .stream_close2 = stream_close_cb,
+#ifdef QC_WITH_ENDPOINT
+    .remove_connection_id = retire_cid_cb,
+#endif
 };
 
 static int srv_accept(struct qc *q, const struct sockaddr_storage *from, socklen_t fl,
@@ -951,6 +977,9 @@ static int srv_accept(struct qc *q, const struct sockaddr_storage *from, socklen
     ngtcp2_cid scid;
     scid.datalen = QC_CID_LEN;
     fill_random(scid.data, scid.datalen);
+#ifdef QC_WITH_ENDPOINT
+    if (q->endpoint && (endpoint_cid_add(q, &hd.dcid) || endpoint_cid_add(q, &scid))) return -1;
+#endif
     tp.original_dcid = hd.dcid;
     tp.original_dcid_present = 1;
     tp.stateless_reset_token_present = 1;
@@ -1030,7 +1059,7 @@ int qc_on_timer(struct qc *q) {
  * датаграмма отброшена), QC_ECLOSED — соединение закрылось. */
 static int rx_dgram(struct qc *q, uint8_t *buf, size_t n, const struct sockaddr_storage *src, socklen_t fl) {
     struct sockaddr_storage from = *src;
-#ifdef QC_WITH_SERVER
+#if defined(QC_WITH_SERVER) || defined(QC_WITH_ENDPOINT)
     if (!q->conn && q->server && srv_accept(q, &from, fl, buf, n) != 0) return 0;
 #endif
     if (!q->conn) return 0;     /* клиент без соединения бывает только после qc_free — сюда не дойти */
@@ -1470,6 +1499,17 @@ int qc_stream_reset(struct qc *q, int64_t sid, uint64_t app_err) {
     if (rv != 0 && rv != QC_ECLOSED) fail_close(q, rv);
     return 0;
 }
+#ifdef QC_WITH_ENDPOINT
+int qc_stream_stop_receive(struct qc *q,int64_t sid,uint64_t app_err) {
+    int result;
+    if(!q||q->closed||!q->conn) return QC_ECLOSED;
+    result=ngtcp2_conn_shutdown_stream_read(q->conn,0,sid,app_err);
+    if(result) return QC_ENOSTREAM;
+    result=flush(q);
+    if(result&&result!=QC_ECLOSED) fail_close(q,result);
+    return 0;
+}
+#endif
 
 size_t qc_datagram_max(const struct qc *q) {
     if (!q || !q->conn || !q->hs_done) return 0;
@@ -1517,6 +1557,9 @@ void qc_close(struct qc *q, uint64_t app_err) {
 
 void qc_free(struct qc *q) {
     if (!q) return;
+#ifdef QC_WITH_ENDPOINT
+    if (q->endpoint) { qc_close(q, 0); return; }
+#endif
     if (q->conn) ngtcp2_conn_del(q->conn);
     qcssl_free(q->ssl);
     if (q->own_ctx) qcssl_ctx_free(q->ctx);
@@ -1535,6 +1578,215 @@ void qc_free(struct qc *q) {
     free(q->rx);
     free(q);
 }
+
+#ifdef QC_WITH_ENDPOINT
+#define QC_EP_CONNECTIONS 64
+#define QC_EP_CIDS 8
+struct endpoint_child {
+    struct qc *q;
+    ngtcp2_cid cid[QC_EP_CIDS];
+    unsigned cid_used[QC_EP_CIDS];
+};
+struct qc_endpoint {
+    int fd, processing;
+    int flow_manual;
+    unsigned maximum;
+    void *ctx, *user;
+    struct qc_endpoint_ops ops;
+    struct qc_srv_cfg cfg;
+    char alpn[32];
+    struct sockaddr_storage local;
+    socklen_t local_length;
+    struct endpoint_child children[QC_EP_CONNECTIONS];
+    uint8_t packet[65536];
+};
+static struct endpoint_child *endpoint_child_of(struct qc *q) {
+    struct qc_endpoint *ep=q->endpoint;
+    if(ep) for(unsigned i=0;i<ep->maximum;i++) if(ep->children[i].q==q) return &ep->children[i];
+    return NULL;
+}
+static int endpoint_cid_add(struct qc *q,const ngtcp2_cid *cid) {
+    struct endpoint_child *child=endpoint_child_of(q);
+    if(!child||!cid->datalen||cid->datalen>NGTCP2_MAX_CIDLEN) return -1;
+    for(unsigned i=0;i<q->endpoint->maximum;i++) {
+        struct endpoint_child *other=&q->endpoint->children[i];
+        if(!other->q||other==child) continue;
+        for(unsigned j=0;j<QC_EP_CIDS;j++) if(other->cid_used[j]&&other->cid[j].datalen==cid->datalen&&
+            !memcmp(other->cid[j].data,cid->data,cid->datalen)) return -1;
+    }
+    for(unsigned i=0;i<QC_EP_CIDS;i++) if(child->cid_used[i]&&
+        child->cid[i].datalen==cid->datalen&&!memcmp(child->cid[i].data,cid->data,cid->datalen)) return 0;
+    for(unsigned i=0;i<QC_EP_CIDS;i++) if(!child->cid_used[i]) {
+        child->cid[i]=*cid; child->cid_used[i]=1; return 0;
+    }
+    return -1;
+}
+static void endpoint_cid_remove(struct qc *q,const ngtcp2_cid *cid) {
+    struct endpoint_child *child=endpoint_child_of(q);
+    if(!child) return;
+    /* Slot0 is original destination CID, retained through all Initial retries.
+     * ngtcp2 retirement names server-issued CIDs only; never retire slot0. */
+    for(unsigned i=1;i<QC_EP_CIDS;i++) if(child->cid_used[i]&&
+        child->cid[i].datalen==cid->datalen&&!memcmp(child->cid[i].data,cid->data,cid->datalen)) child->cid_used[i]=0;
+}
+static int endpoint_peer(const struct qc *q,const struct sockaddr_storage *from,socklen_t length) {
+    return length==q->remote_len&&!memcmp(from,&q->remote,length);
+}
+static void endpoint_destroy_child(struct endpoint_child *child) {
+    struct qc *q=child->q;
+    if(!q) return;
+    q->endpoint=NULL; q->fd=-1; qc_free(q); memset(child,0,sizeof *child);
+}
+static void endpoint_reap(struct qc_endpoint *ep) {
+    for(unsigned i=0;i<ep->maximum;i++) if(ep->children[i].q&&ep->children[i].q->closed)
+        endpoint_destroy_child(&ep->children[i]);
+}
+static struct qc *endpoint_find(struct qc_endpoint *ep,const ngtcp2_version_cid *cid,
+                                const struct sockaddr_storage *from,socklen_t length) {
+    for(unsigned i=0;i<ep->maximum;i++) {
+        struct endpoint_child *child=&ep->children[i];
+        if(!child->q||child->q->closed||!endpoint_peer(child->q,from,length)) continue;
+        for(unsigned j=0;j<QC_EP_CIDS;j++) if(child->cid_used[j]&&child->cid[j].datalen==cid->dcidlen&&
+            !memcmp(child->cid[j].data,cid->dcid,cid->dcidlen)) return child->q;
+    }
+    return NULL;
+}
+static struct qc *endpoint_admit(struct qc_endpoint *ep,uint8_t *packet,size_t length,
+                                 const struct sockaddr_storage *from,socklen_t from_length) {
+    ngtcp2_pkt_hd hd;
+    struct endpoint_child *slot=NULL; struct qc *q; struct qc_ops ops={0}; void *user=NULL;
+    if(length<1200||ngtcp2_accept(&hd,packet,length)!=0||hd.type!=NGTCP2_PKT_INITIAL) return NULL;
+    for(unsigned i=0;i<ep->maximum;i++) if(!ep->children[i].q) { slot=&ep->children[i]; break; }
+    if(!slot) return NULL; /* No response/allocation when at configured ceiling. */
+    q=qc_alloc(&ops,NULL); if(!q) return NULL;
+    /* Children do not read a socket; discard standalone per-socket RX workspace. */
+    free(q->rxbuf); q->rxbuf=NULL; free(q->rx); q->rx=NULL;
+    q->endpoint=ep; q->fd=ep->fd; q->server=1; q->ctx=ep->ctx;
+    q->local=ep->local; q->local_len=ep->local_length;
+    q->brutal_bps=ep->cfg.brutal_bps; q->brutal=q->brutal_bps!=0;
+    q->datagram_max=ep->cfg.datagram_max; q->idle_ms=ep->cfg.idle_ms;q->flow_manual=ep->flow_manual;
+    q->max_data=ep->cfg.max_data; q->max_stream_data=ep->cfg.max_stream_data;
+    q->max_streams=ep->cfg.max_streams; q->send_buf=ep->cfg.send_buf?ep->cfg.send_buf:1u<<20;
+    snprintf(q->alpn,sizeof q->alpn,"%s",ep->cfg.alpn);
+    slot->q=q;
+    if(srv_accept(q,from,from_length,packet,length)!=0||
+       ep->ops.on_connection(ep->user,q,&ops,&user)!=0) {
+        endpoint_destroy_child(slot); return NULL;
+    }
+    q->ops=ops; q->user=user;
+    return q;
+}
+int qc_endpoint_open(const struct qc_endpoint_cfg *cfg,const struct qc_endpoint_ops *ops,
+                      void *user,struct qc_endpoint **out) {
+    struct qc_endpoint *ep; int result=QC_ESOCK;
+    if(!out) return QC_EINVAL;
+    *out=NULL;
+    if(!cfg||!ops||!ops->on_connection||!cfg->max_connections||cfg->max_connections>QC_EP_CONNECTIONS||
+       !cfg->server.bind_host||!cfg->server.alpn||!cfg->server.alpn[0]||strlen(cfg->server.alpn)>=32||
+       !cfg->server.cert_der||!cfg->server.cert_n||!cfg->server.key_der||!cfg->server.key_n||
+       cfg->server.send_buf>16u*1024*1024||cfg->server.max_data>64u*1024*1024||
+       cfg->server.max_stream_data>8u*1024*1024||cfg->server.max_streams>256||
+       cfg->server.datagram_max>65535) return QC_EINVAL;
+    ep=calloc(1,sizeof *ep); if(!ep) return QC_ENOMEM;
+    ep->fd=-1; ep->maximum=cfg->max_connections; ep->ops=*ops; ep->user=user;ep->flow_manual=cfg->flow_manual!=0;
+    ep->cfg=cfg->server; snprintf(ep->alpn,sizeof ep->alpn,"%s",cfg->server.alpn); ep->cfg.alpn=ep->alpn;
+    if(addr_parse(cfg->server.bind_host,cfg->server.port,&ep->local,&ep->local_length)) { result=QC_EINVAL; goto fail; }
+    ep->ctx=qcssl_ctx_server(cfg->server.cert_der,cfg->server.cert_n,cfg->server.key_der,cfg->server.key_n);
+    if(!ep->ctx) { result=QC_ETLS; goto fail; }
+    ep->cfg.cert_der=NULL; ep->cfg.key_der=NULL; ep->cfg.cert_n=ep->cfg.key_n=0;
+    ep->fd=socket(ep->local.ss_family,SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
+    if(ep->fd<0||bind(ep->fd,(struct sockaddr *)&ep->local,ep->local_length)) goto fail;
+    ep->local_length=sizeof ep->local;
+    if(getsockname(ep->fd,(struct sockaddr *)&ep->local,&ep->local_length)) goto fail;
+    /* Deliberately no UDP_GRO: endpoint packet dispatch operates on datagrams.
+     * Child send_batch still uses the existing GSO/fallback implementation. */
+    { int size=1<<20; (void)setsockopt(ep->fd,SOL_SOCKET,SO_RCVBUF,&size,sizeof size);
+      (void)setsockopt(ep->fd,SOL_SOCKET,SO_SNDBUF,&size,sizeof size); }
+    *out=ep; return 0;
+fail:
+    qc_endpoint_free(ep); return result;
+}
+int qc_endpoint_fd(const struct qc_endpoint *ep) { return ep?ep->fd:-1; }
+int qc_endpoint_peer(const struct qc *q,char *address,size_t capacity,uint16_t *port) {
+    const void *source;
+    if(!q||!q->endpoint||!address||!capacity||!port) return QC_EINVAL;
+    if(q->remote.ss_family==AF_INET) source=&((const struct sockaddr_in *)&q->remote)->sin_addr;
+    else if(q->remote.ss_family==AF_INET6) source=&((const struct sockaddr_in6 *)&q->remote)->sin6_addr;
+    else return QC_EINVAL;
+    if(!inet_ntop(q->remote.ss_family,source,address,(socklen_t)capacity)) return QC_EINVAL;
+    *port=ntohs(*sa_port((struct sockaddr_storage *)&q->remote));return 0;
+}
+uint16_t qc_endpoint_port(const struct qc_endpoint *ep) {
+    return ep?ntohs(*sa_port((struct sockaddr_storage *)&ep->local)):0;
+}
+size_t qc_endpoint_count(const struct qc_endpoint *ep) {
+    size_t n=0;
+    if(ep) for(unsigned i=0;i<ep->maximum;i++) if(ep->children[i].q) n++;
+    return n;
+}
+int qc_endpoint_timeout_ms(const struct qc_endpoint *ep) {
+    int minimum=-1;
+    if(ep) for(unsigned i=0;i<ep->maximum;i++) if(ep->children[i].q) {
+        if(ep->children[i].q->closed) return 0; /* Deferred owned-child free must wake reaping. */
+        int timeout=qc_timeout_ms(ep->children[i].q);
+        if(timeout>=0&&(minimum<0||timeout<minimum)) minimum=timeout;
+    }
+    return minimum;
+}
+static int endpoint_known_cid(struct qc_endpoint *ep,const ngtcp2_version_cid *cid) {
+    for(unsigned i=0;i<ep->maximum;i++) for(unsigned j=0;j<QC_EP_CIDS;j++) {
+        struct endpoint_child *child=&ep->children[i];
+        if(child->q&&child->cid_used[j]&&child->cid[j].datalen==cid->dcidlen&&
+           !memcmp(child->cid[j].data,cid->dcid,cid->dcidlen)) return 1;
+    }
+    return 0;
+}
+int qc_endpoint_on_readable(struct qc_endpoint *ep) {
+    int result=0;
+    if(!ep||ep->processing) return QC_EINVAL;
+    ep->processing=1; endpoint_reap(ep);
+    for(unsigned budget=0;budget<64;budget++) {
+        struct sockaddr_storage from={0}; struct iovec io={ep->packet,sizeof ep->packet};
+        struct msghdr message={0}; ngtcp2_version_cid cid; struct qc *q; ssize_t n;
+        message.msg_name=&from; message.msg_namelen=sizeof from; message.msg_iov=&io; message.msg_iovlen=1;
+        n=recvmsg(ep->fd,&message,MSG_DONTWAIT);
+        if(n<0) { if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR) result=QC_ESOCK; break; }
+        if(message.msg_flags&MSG_TRUNC||!n) continue;
+        if(ngtcp2_pkt_decode_version_cid(&cid,ep->packet,(size_t)n,QC_CID_LEN)!=0) continue;
+        if(ep->packet[0]&128) {
+            ngtcp2_pkt_hd hd;
+            if(cid.version!=NGTCP2_PROTO_VER_V1||ngtcp2_pkt_decode_hd_long(&hd,ep->packet,(size_t)n)<0||hd.type==NGTCP2_PKT_0RTT) continue;
+        }
+        q=endpoint_find(ep,&cid,&from,message.msg_namelen);
+        if(!q) {
+            if(endpoint_known_cid(ep,&cid)) continue; /* Fixed peer: no address migration. */
+            q=endpoint_admit(ep,ep->packet,(size_t)n,&from,message.msg_namelen);
+        }
+        if(q) {
+            int rv=rx_dgram(q,ep->packet,(size_t)n,&from,message.msg_namelen);
+            if(!rv) { rv=flush(q); if(rv&&rv!=QC_ECLOSED) fail_close(q,rv); }
+        }
+        endpoint_reap(ep);
+    }
+    ep->processing=0; return result;
+}
+int qc_endpoint_on_timer(struct qc_endpoint *ep) {
+    if(!ep||ep->processing) return QC_EINVAL;
+    ep->processing=1;
+    for(unsigned i=0;i<ep->maximum;i++) if(ep->children[i].q&&!ep->children[i].q->closed)
+        (void)qc_on_timer(ep->children[i].q);
+    endpoint_reap(ep); ep->processing=0; return 0;
+}
+void qc_endpoint_free(struct qc_endpoint *ep) {
+    if(!ep) return;
+    /* Caller precondition: outside endpoint callbacks/processing. */
+    for(unsigned i=0;i<ep->maximum;i++) if(ep->children[i].q) {
+        qc_close(ep->children[i].q,0); endpoint_destroy_child(&ep->children[i]);
+    }
+    if(ep->fd>=0) close(ep->fd);
+    qcssl_ctx_free(ep->ctx); free(ep);
+}
+#endif
 
 void qc_io_force(struct qc *q, int gso, int gro) {
     q->gso_ok = gso != 0;

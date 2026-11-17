@@ -8,6 +8,13 @@
 
 #include "plugabi.h"
 
+#ifdef MANIFEST_CONSTRUCTOR_PROBE
+/* Manifest rejection must precede dlopen, not merely the exported entrypoint. */
+__attribute__((constructor)) static void manifest_constructor_probe(void) {
+    fputs("MANIFEST_CONSTRUCTOR_RAN\n", stderr);
+}
+#endif
+
 #ifndef PLUGIN_ID
 #define PLUGIN_ID "abitest"
 #endif

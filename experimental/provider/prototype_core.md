@@ -1,0 +1,160 @@
+# Configured Linux foreground prototype
+
+`steer-prototype` runs configured SOCKS5 and VLESS plain TCP listeners in one
+foreground process, on one existing Steer loop, stream service and routing
+runtime. This is an executable prototype format, not full v3 configuration, a
+production daemon integration, a loaded provider package or a release.
+
+Build and verify from the hub:
+
+```sh
+make -C steer/experimental/provider BUILD=/tmp/steer-provider-build test
+```
+
+Run with `steer-prototype --config FILE --control /private/directory/core.sock`
+and optional `--state-dir /private/state-directory`.
+The control parent directory must belong to the effective UID and have no group
+or other permissions (normally mode 0700). The socket is mode 0600 and accepts
+only the same effective UID through `SO_PEERCRED`. An existing socket path is
+never unlinked to take ownership. SIGTERM/SIGINT close admission and drain active
+IO/cancellation callbacks before releasing services and removing the owned
+socket. Stdout emits one `READY <status-JSON>` line only after all initial
+listeners and the control socket are prepared.
+
+The parser accepts the explicit `prototype: steer-linux-v1` schema and produces
+canonical JSON for reads. Generation/revision is host-issued, starting at 1.
+Credentials are environment references; values are neither stored in the
+document nor returned by control. Enabled listeners resolve and validate their
+references before publication. Disabled listeners retain configuration without
+reading credentials. A minimal JSON document is:
+
+```json
+{"prototype":"steer-linux-v1","listeners":[{"id":"local-socks","protocol":"socks","enabled":true,"listen":{"address":"127.0.0.1","port":1080},"auth":{"type":"none"}}],"routing":{"default":"direct","rules":[]}}
+```
+
+VLESS requires `auth.type: uuid`, a host-configured `principal_id` and `uuid_ref:
+env:NAME`. SOCKS USERPASS uses `type: userpass`, `principal_id`, `username_ref`
+and `password_ref`. Successful credential verification supplies that trusted
+principal ID to policy; anonymous SOCKS explicitly supplies no principal.
+The runtime never treats a peer-provided UUID/username as a trusted policy ID.
+Enabled numeric IPv4/IPv6 listeners have ports 1..65535. Loopback remains the
+sample/default; wildcard or other unicast binds require an explicit configured
+address. IPv6 uses `IPV6_V6ONLY=1`, allowing deterministic separate IPv4/IPv6
+listeners on one port. Multicast, broadcast/reserved IPv4 and mapped IPv6 are
+rejected. Management HTTP stays on loopback and Unix control stays private.
+Numeric outbound TCP targets may be outside loopback; use a controlled lab.
+
+Each accepted flow pins its immutable generation and listener credential scope.
+Policy sees inbound ID, verified principal ID and the original destination;
+the shared `route_dial` service performs direct dialing after evaluation.
+SOCKS/VLESS responses indicate success only after an actual successful dial.
+Numeric IPv4/IPv6 and validated ASCII domain TCP targets work. Original domain
+policy is evaluated before resolution. One shared pool of two fixed NSS workers
+and 64 jobs serves all generations; up to eight resolved addresses are tried
+in order under the route deadline. There is no thread per flow and no blocking
+resolver fallback on the event loop. This does not configure DNS servers or
+provide the full DNS management subsystem. UDP and nonempty VLESS flows remain denied.
+Existing two-buffer relay, pipelining, backpressure, half-close and deadlines
+are shared with the standalone [SOCKS](socks_loopback.md) and
+[VLESS](vless_loopback.md) fixtures; their CLI remains available.
+
+Applying configuration prepares every new listener before publication, reuses
+identical live listener specifications and closes removed/disabled admission
+sockets only at commit. Bind, parse, credential or policy failures close all
+newly prepared sockets and leave the old revision and traffic intact. Changing
+an occupied endpoint's protocol, identity or auth configuration requires disable
+then create; the prototype rejects that direct replacement with 422. A label
+change does not reopen a socket. `SO_REUSEADDR` supports re-enabling an endpoint
+after established connections; `SO_REUSEPORT` is never used. Accepted old flows
+continue on their pinned generation when new flows switch to new policy.
+
+Bounds: 16 configured listeners, 32 concurrent flows, two 16 KiB buffers per
+flow, 64 streams/stream operations, 32 route operations per generation, eight
+live generations including the active one, 64 shared resolver jobs, eight control connections, a 128-byte
+command header and 64 KiB documents. Old generations are destroyed after their
+flows drain. Applying at the retained-generation ceiling returns 503. A control
+request has an absolute five-second read/write deadline. Resource metadata and
+the fixed bounded control buffers are additional to relay payload capacities.
+On shutdown, cancelled in-progress NSS jobs retain their pool slots until the
+backend returns. The host drains route-generation references and continues the
+loop until those jobs finish before joining workers. An arbitrarily stuck NSS
+backend cannot be forcibly cancelled safely, so shutdown may wait for it.
+
+## Local control protocol
+
+One request per Unix stream connection. Lengths count UTF-8 bytes. Commands are
+case-sensitive ASCII followed by LF; document bytes follow immediately:
+
+```text
+STATUS\n
+GET\n
+VALIDATE <length>\n<document>
+APPLY <expected-revision> <length>\n<document>
+```
+
+Responses are `OK <length>\n<JSON>` or `ERR <code> <length>\n<JSON>`, then EOF.
+The error body is generic and contains no document excerpts or credentials.
+400 means malformed framing, 409 stale revision, 422 rejected configuration or
+listener preparation, and 503 exhausted resources. Validation does not bind
+sockets or mutate state. Apply compares the expected revision, assigns the next
+revision internally, then prepares/commits atomically on the loop shard.
+
+- `STATUS`: `prototype`, `generation`, `revision`, `runtimeReady`,
+  actual `persistence`, `durability_uncertain`, `activeClients`, and active `listeners` with
+  `id`, `protocol`, `address`, `port`.
+- `GET`: one atomic `{revision,persistence,durability_uncertain,document}` envelope with the
+  canonical configuration, including environment references only.
+- `VALIDATE`: `{valid:true,persistence}` on success.
+- `APPLY`: `{applied:true,revision,generation,persistence,durability_uncertain}` on success.
+
+Without `--state-dir`, apply changes memory and reports `persistence:false`;
+restart reloads the startup file. With the option, the existing private directory
+must belong to the effective UID, have no group/other permissions and permit an
+exclusive writer lock. The core seeds an absent committed snapshot at startup.
+Subsequent boots load its `config.json` document and revision before considering
+the source file. A corrupt or unsafe snapshot fails closed, even if the source
+file is valid; a missing snapshot alone allows source bootstrap. Secret values
+are never persisted, only validated environment references. The source file is
+never overwritten.
+
+Durable apply prepares the policy, routes and listener sockets on the loop;
+a single bounded writer thread writes an exclusive 0600 temporary snapshot,
+fsyncs it, renames it atomically and fsyncs the directory. Disk IO does not block
+packet processing. Prepared listeners are inactive and omitted from runtime
+until publication; precommit connections to a newly bound port are rejected.
+Only one durable apply is in flight; another apply receives 503. Writer
+completion returns through eventfd. All fallible runtime preparation precedes
+rename; publication afterwards performs no allocation or new socket registration.
+Before-rename failure rolls back new listeners and preserves the old runtime
+and committed revision. Once rename succeeds, the new runtime is published even
+if directory fsync fails: the response is 503 with `applied:true`, actual revision
+and `durability_uncertain:true`. GET and runtime report that actual state; the
+UI reconciles it and warns rather than claiming either rollback or confirmed
+durability. Shutdown waits for the bounded writer transaction before service
+cleanup. HTTP and UI remain in the separate management bridge.
+
+The black-box `prototype_test.py` exercises both protocols simultaneously,
+atomic reads, fragmented control requests, validate/apply/stale revisions,
+new-flow block with old-flow continuity, rollback after one prepared listener
+and a second occupied port, listener creation/disable/re-enable, and graceful
+cleanup. Native epoll/allocation failure injection, cross-UID control testing, production loading,
+full v3 migration and non-Linux platforms remain unverified.
+The configured fixture also verifies localhost through SOCKS and VLESS, address
+fallback to an IPv4 echo target, and original-domain blocking while numeric
+requests remain direct. Standalone lab CLIs retain their explicit numeric-only
+profile and do not attach this resolver pool.
+
+`prototype_persistence_test.py` verifies snapshot priority/revision across
+restarts, stale revision handling, real disk-create failure rollback and corrupt
+state rejection. The independent UI HTTP crash/restart gate also verifies a
+SIGKILL/restart retaining committed routing. `server_bind_test.py` passed actual
+IPv4 and IPv6 wildcard ingress on the same port from a separate Linux network
+namespace, with exact binary echo and half-close. These are prototype Linux
+checks, not production deployment or a release.
+
+`make store-fault-test` adds a test-only `LD_PRELOAD` fsync interposer, never
+linked into runtime binaries. Strict and ASan/UBSan executions passed: paused
+file fsync keeps old packet traffic and STATUS responsive, hides prepared
+listeners and rejects a second apply; file fsync failure rolls back, directory
+fsync failure publishes the visible revision with explicit uncertainty, and an
+abandoned caller's apply response cannot leak into a reused control slot.

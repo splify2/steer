@@ -111,8 +111,8 @@ static void cli_closed(void *u, int reason, const char *why) {
     c->close_reason = reason;
 }
 
-static const struct qc_ops srv_ops = { srv_hs, srv_stream, NULL, srv_dg, srv_closed };
-static const struct qc_ops cli_ops = { cli_hs, cli_stream, NULL, cli_dg, cli_closed };
+static const struct qc_ops srv_ops = { .on_handshake=srv_hs, .on_stream_data=srv_stream, .on_datagram=srv_dg, .on_closed=srv_closed };
+static const struct qc_ops cli_ops = { .on_handshake=cli_hs, .on_stream_data=cli_stream, .on_datagram=cli_dg, .on_closed=cli_closed };
 
 static int start_srv(struct srv *s, size_t dg_max, uint64_t brutal, uint16_t *port) {
     struct qc_srv_cfg sc = {

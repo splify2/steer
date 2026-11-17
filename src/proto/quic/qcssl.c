@@ -58,7 +58,7 @@ fail:
     return NULL;
 }
 
-#ifdef QC_WITH_SERVER
+#if defined(QC_WITH_SERVER) || defined(QC_WITH_ENDPOINT)
 void *qcssl_ctx_server(const uint8_t *cert_der, size_t cert_n, const uint8_t *key_der, size_t key_n) {
     WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfTLSv1_3_server_method());
     if (!ctx) return NULL;
@@ -67,6 +67,15 @@ void *qcssl_ctx_server(const uint8_t *cert_der, size_t cert_n, const uint8_t *ke
         wolfSSL_CTX_use_PrivateKey_buffer(ctx, key_der, (long)key_n, WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
         wolfSSL_CTX_free(ctx);
         return NULL;
+    }
+    /* This server endpoint does not admit replayable 0-RTT application data.
+     * wolfSSL's success convention depends on its OpenSSL compatibility flag. */
+    {
+        int result = wolfSSL_CTX_set_max_early_data(ctx, 0);
+        if (result != 0 && result != WOLFSSL_SUCCESS) {
+            wolfSSL_CTX_free(ctx);
+            return NULL;
+        }
     }
     return ctx;
 }

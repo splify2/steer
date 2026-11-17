@@ -250,6 +250,10 @@ size_t qc_stream_buffered(const struct qc *q, int64_t sid);
 size_t qc_stream_room(const struct qc *q, int64_t sid);
 /* Отменить поток (RESET_STREAM и STOP_SENDING с кодом). */
 int  qc_stream_reset(struct qc *q, int64_t sid, uint64_t app_err);
+/* Stop only peer->local input while allowing a final protocol response/FIN. */
+#ifdef QC_WITH_ENDPOINT
+int  qc_stream_stop_receive(struct qc *q, int64_t sid, uint64_t app_err);
+#endif
 /* Датаграмма: 0 — в очереди; QC_ETOOBIG — больше qc_datagram_max; QC_EAGAIN — очередь полна (64).
  * Датаграммы ненадёжны: отправленную можно потерять, повторять их — дело потребителя. */
 int  qc_datagram_send(struct qc *q, const uint8_t *d, size_t n);
@@ -284,7 +288,7 @@ int qc_io_gso_fatal(int err);
  * (0 — не склеен) начиная со смещения off; 0 — конец. */
 size_t qc_io_gro_next(size_t total, size_t seg, size_t off);
 
-#ifdef QC_WITH_SERVER
+#if defined(QC_WITH_SERVER) || defined(QC_WITH_ENDPOINT)
 /* Сервер ДЛЯ СТЕНДОВ (ключ QC_WITH_SERVER задают tests/qcloop.c и tests/qcserver.c, в libsteer его
  * нет): одно соединение на сокет, сертификат и ключ — DER. Те же колбэки, те же qc_on_readable,
  * qc_on_timer, qc_run, qc_stream_send, qc_datagram_send, что у клиента — это и делает эхо-сервер
@@ -303,6 +307,41 @@ struct qc_srv_cfg {
 };
 int qc_listen(const struct qc_srv_cfg *cfg, const struct qc_ops *ops, void *user, struct qc **out);
 uint16_t qc_local_port(const struct qc *q);
+#endif
+
+#ifdef QC_WITH_ENDPOINT
+/* Bounded Linux server endpoint: one UDP descriptor, independently owned
+ * connections/CIDs/timers. No migration, Retry service or 0-RTT admission.
+ * Serialized owning event loop only. cfg.bind_host must be a numeric address.
+ * The endpoint owns every child and shared TLS context. Child qc_free requests
+ * closure, then defers destruction to endpoint processing. Never retain a child
+ * after on_closed; qc_endpoint_free closes/notifies all remaining children.
+ * qc_endpoint_free must never be called from any endpoint/child callback or
+ * while an endpoint processing function is active; free it after return.
+ * Stream/datagram APIs are usable on accepted children; qc_run/on_readable are
+ * endpoint operations instead. QUIC authentication is not application auth. */
+struct qc_endpoint;
+struct qc_endpoint_ops {
+    /* Invoked before the first packet is passed to ngtcp2. Fill callbacks and
+     * user; return 0 to admit, nonzero to reject without consuming a slot. */
+    int (*on_connection)(void *user, struct qc *child, struct qc_ops *ops, void **child_user);
+};
+struct qc_endpoint_cfg {
+    struct qc_srv_cfg server;
+    unsigned max_connections; /* 1..64 */
+    int flow_manual; /* caller returns stream credit after bounded downstream IO */
+};
+int qc_endpoint_open(const struct qc_endpoint_cfg *, const struct qc_endpoint_ops *,
+                     void *user, struct qc_endpoint **out);
+int qc_endpoint_fd(const struct qc_endpoint *);
+uint16_t qc_endpoint_port(const struct qc_endpoint *);
+size_t qc_endpoint_count(const struct qc_endpoint *);
+int qc_endpoint_timeout_ms(const struct qc_endpoint *);
+int qc_endpoint_on_readable(struct qc_endpoint *);
+int qc_endpoint_on_timer(struct qc_endpoint *);
+void qc_endpoint_free(struct qc_endpoint *);
+/* Genuine numeric peer from transport, never a proxy request's claimed source. */
+int qc_endpoint_peer(const struct qc *,char *address,size_t capacity,uint16_t *port);
 #endif
 
 #endif

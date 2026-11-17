@@ -39,6 +39,7 @@
 #include "plugutil.h"
 #include "module.h"
 #include "ynode.h"
+#include "plugmanifest.h"
 #include "offkinds.h"
 #include "ir.h"
 #include "marks.h"
@@ -548,7 +549,17 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
             if (nm0 && vec_add(&p->kind_names, &p->kind_names_n, nm0) != 0) { ydoc_free(d); return -1; }
         }
     }
-    const struct ynode *compat = ynode_get(ynode_get(root_n, "compat"), "steer-api");
+    /* Installation is not the only entry path: embedded manifests and manually
+     * placed directories reach this loader too. Reject new contracts before
+     * registering kinds, commands, services or hooks; never fall back to legacy. */
+    const char *contract_why = plugin_legacy_contract_why(root_n);
+    if (contract_why) {
+        snprintf(why, sizeof(why), "%s", contract_why);
+        ydoc_free(d);
+        goto bad;
+    }
+    const struct ynode *compat_map = ynode_get(root_n, "compat");
+    const struct ynode *compat = ynode_get(compat_map, "steer-api");
     if (st && st->kind == YN_MAP && ynode_len(st)) {
         if (!compat || compat->kind != YN_SCALAR) {
             snprintf(why, sizeof(why), "нет compat.steer-api — несовместим с ядром (steer-api %s)", STEER_API_VERSION);

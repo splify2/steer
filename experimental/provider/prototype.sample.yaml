@@ -1,0 +1,26 @@
+prototype: steer-linux-v1
+listeners:
+  - id: socks-local
+    label: Local SOCKS
+    enabled: true
+    protocol: socks
+    listen: {address: 127.0.0.1, port: 1080}
+    auth: {type: none}
+  - id: vless-local
+    label: Local VLESS
+    enabled: false
+    protocol: vless
+    listen: {address: '::1', port: 1081}
+    auth:
+      type: uuid
+      principal_id: local-user
+      uuid_ref: env:STEER_LOCAL_UUID
+routing:
+  default: block
+  rules:
+    - id: local-only
+      label: Local destinations
+      enabled: true
+      inbound: socks-local
+      cidr: 127.0.0.0/8
+      action: direct

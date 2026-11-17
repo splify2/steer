@@ -49,6 +49,7 @@ st() { rm -rf "$tmp/st"; mkdir -p "$tmp/st"; STEER_STATE_DIR="$tmp/st"; export S
 # Моды plugin.c: 0 ok, 1 крах в init, 2 отказ init, 3 крах таймера, 4 зависание таймера, 5 крах health,
 # 6 зависание health, 7 крах on_event, 8 abort в health.
 mk "$tmp/ok.so"
+mk "$tmp/manifest-probe.so" -DMANIFEST_CONSTRUCTOR_PROBE
 mk "$tmp/major2.so" -DABI_MAJOR=2
 mk "$tmp/minor5.so" -DABI_MINOR=5
 mk "$tmp/fp.so" -DFP_XOR=0x100
@@ -69,6 +70,30 @@ needed="$(readelf -d "$tmp/ok.so" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr 
 case "$needed" in *libsteer*) check "плагин без DT_NEEDED на libsteer*" "" "$needed" ;; *) check "плагин без DT_NEEDED на libsteer*" 1 1 ;; esac
 exports="$(nm -D --defined-only "$tmp/ok.so" | awk '$2 ~ /^[TDBR]$/ {print $3}' | tr '\n' ' ')"
 check "плагин экспортирует один символ" "steer_plugin_v1_entry " "$exports"
+
+# Existing manifests must be admitted before native entry/init. Bare .so loading
+# remains a legacy API; the future provider loader must not inherit that exception.
+for manifest in \
+    '{"schema":2}' \
+    '{"schema":"1"}' \
+    '{}' \
+    '{"schema":1,"compat":{"steer-provider-api":"^1.0"}}' \
+    '{broken'; do
+    printf '%s\n' "$manifest" > "$tmp/plugin.json"
+    st
+    out="$("$HOST" "$tmp/manifest-probe.so" abitest load 2>&1)"
+    has "unsupported manifest fails before native entry: $manifest" "$out" "LOAD rc=-1 state=2"
+    case "$out" in *"INIT abi="*) check "manifest rejection does not call init" 0 1 ;;
+        *) check "manifest rejection does not call init" 1 1 ;; esac
+    case "$out" in *"MANIFEST_CONSTRUCTOR_RAN"*) check "manifest rejection precedes dlopen" 0 1 ;;
+        *) check "manifest rejection precedes dlopen" 1 1 ;; esac
+done
+printf '{"schema":1}\n' > "$tmp/plugin.json"
+st
+out="$("$HOST" "$tmp/manifest-probe.so" abitest load 2>&1)"
+has "legacy schema still loads" "$out" "LOAD rc=0 state=1"
+has "constructor probe is observable for accepted manifest" "$out" "MANIFEST_CONSTRUCTOR_RAN"
+rm "$tmp/plugin.json"
 
 # ---- 2-3. загрузка и вызовы хоста --------------------------------------------------------------
 st

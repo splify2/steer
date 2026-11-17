@@ -807,6 +807,45 @@ static int link_create(const char *ifname, const char *kind, int mtu) {
     return rtnl_simple(buf, n);
 }
 
+int awg_dev_link_create_exclusive(const char *ifname, const char *kind, int mtu,
+                                  int *out_index) {
+    uint8_t buf[256];
+    struct link_ctx created = { "", 0 };
+    size_t n;
+    int fd, rc;
+    if (out_index) *out_index = 0;
+    if (!ifname || !*ifname || strlen(ifname) >= IFNAMSIZ || !kind ||
+        !awg_dev_ours(kind) || !out_index || mtu < 576 || mtu > 65535) return EINVAL;
+    fd = nl_open(NETLINK_ROUTE);
+    if (fd < 0) return errno;
+    n = awg_build_newlink(buf, sizeof buf, ifname, kind, mtu, ++g_seq);
+    ((struct nlmsghdr *)buf)->nlmsg_flags |= NLM_F_ECHO;
+    rc = nl_talk(fd, buf, n, link_cb, &created);
+    close(fd);
+    /* Echo supplies the created identity without allocating another socket
+     * after mutation. Publish it even on a later ACK failure for rollback. */
+    *out_index = created.index;
+    if (rc) return rc;
+    if (!created.index || strcmp(kind, created.kind)) return ESTALE;
+    return 0;
+}
+
+int awg_dev_link_delete_owned(const char *ifname, const char *kind, int index) {
+    char actual_kind[32];
+    int actual_index = 0, rc;
+    uint8_t buf[128];
+    struct nlbuf b;
+    struct ifinfomsg ifi = { .ifi_family = AF_UNSPEC, .ifi_index = index };
+    struct nlmsghdr *nh;
+    if (!ifname || !kind || !awg_dev_ours(kind) || index <= 0) return EINVAL;
+    rc = awg_dev_link_query(ifname, actual_kind, sizeof(actual_kind), &actual_index);
+    if (rc) return rc;
+    if (actual_index != index || strcmp(actual_kind, kind)) return ESTALE;
+    nh = msg_begin(&b, buf, sizeof buf, RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK,
+                   ++g_seq, &ifi, sizeof ifi);
+    return rtnl_simple(buf, msg_end(&b, nh));
+}
+
 int awg_dev_link_delete(const char *ifname) {
     uint8_t buf[128];
     struct nlbuf b;
@@ -814,6 +853,23 @@ int awg_dev_link_delete(const char *ifname) {
     struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, RTM_DELLINK, NLM_F_REQUEST | NLM_F_ACK,
                                     ++g_seq, &ifi, sizeof ifi);
     nlbuf_put_str(&b, IFLA_IFNAME, ifname);
+    return rtnl_simple(buf, msg_end(&b, nh));
+}
+
+int awg_dev_link_down_owned(const char *ifname, const char *kind, int index) {
+    char actual_kind[32];
+    int actual_index = 0, rc;
+    uint8_t buf[128];
+    struct nlbuf b;
+    struct ifinfomsg ifi = { .ifi_family = AF_UNSPEC, .ifi_index = index,
+                            .ifi_flags = 0, .ifi_change = IFF_UP };
+    struct nlmsghdr *nh;
+    if (!ifname || !kind || !awg_dev_ours(kind) || index <= 0) return EINVAL;
+    rc = awg_dev_link_query(ifname, actual_kind, sizeof(actual_kind), &actual_index);
+    if (rc) return rc;
+    if (actual_index != index || strcmp(actual_kind, kind)) return ESTALE;
+    nh = msg_begin(&b, buf, sizeof buf, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK,
+                   ++g_seq, &ifi, sizeof ifi);
     return rtnl_simple(buf, msg_end(&b, nh));
 }
 
