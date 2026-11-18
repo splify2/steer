@@ -1112,7 +1112,7 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 #ifdef STEER_PROTOTYPE_HY2
     hy2="true";hy2_udp=h->current&&h->current->datagrams?"true":"false";provider=",\"hysteria2\"";
 #endif
-    n=snprintf(out+used,capacity-used,"],\"capabilities\":{\"spec_v3_profile\":\"linked-socks-v1\",\"spec_v3_vless_tcp\":true,\"providers\":[\"socks\",\"vless\"%s],\"inbound\":{\"hysteria2\":{\"tcp\":%s,\"udp\":%s,\"tls\":%s}}},\"drainingListeners\":[",provider,hy2,hy2_udp,hy2);
+    n=snprintf(out+used,capacity-used,"],\"capabilities\":{\"spec_v3_profile\":\"linked-socks-v1\",\"spec_v3_vless_tcp\":true,\"spec_v3_hysteria2\":%s,\"providers\":[\"socks\",\"vless\"%s],\"inbound\":{\"hysteria2\":{\"tcp\":%s,\"udp\":%s,\"tls\":%s}}},\"drainingListeners\":[",hy2_udp,provider,hy2,hy2_udp,hy2);
     if(n<0||(size_t)n>=capacity-used)return 0;
     used+=(size_t)n;count=0;
 #ifdef STEER_PROTOTYPE_HY2

@@ -1,6 +1,6 @@
 # Experimental HY2 inbound runtime
 
-The optional Linux server profile joins the shared managed host, QUIC endpoint, HY2 engine and route/buffer/operation/resolver services. TCP uses shared stream routing; UDP uses origin-owned datagram refs. No independent default-direct socket path exists in the adapter. This is a local prototype, not a production release.
+The optional Linux server profile joins the shared managed host, QUIC endpoint, HY2 engine and route/buffer/operation/resolver services. TCP uses shared stream routing; UDP uses origin-owned datagram refs. No independent default-direct socket path exists in the adapter. The [linked v3 profile](../experimental/provider/prototype_core.md#managed-spec-v3-linked-socks-v1) also accepts the explicit QUIC/TLS stream+datagram tuple; it reuses this adapter and transaction. This is a local prototype, not a production release.
 
 New TCP streams and UDP destinations check CURRENT listener/auth admission and generation. Existing destinations retain their generation; a new destination in the same actual UDP session acquires current policy in a separate context. Contexts never merge across actual sessions. Principal IDs are authenticated/copied; source endpoints come from the real QUIC peer.
 

@@ -129,8 +129,34 @@ VLESS variant. Routing supports ordered `route` and `reject`, named
 direct/block outbounds, and an explicit default. Match fields are `inbound`
 and either `domain` or `domain_suffix`, each with one list entry; an empty map
 matches all. Other variants and settings are rejected, even on disabled
-objects. Hysteria2 remains available only in the earlier prototype format.
-The general v3 provider executor and signed lock are not wired in.
+objects. The general v3 provider executor and signed lock are not wired in.
+
+On the optional HY2 server build, merge the following entries into the
+same intent to enable Hysteria2 TCP/UDP over QUIC/TLS:
+
+```yaml
+secrets:
+  hy2-password: {source: env, kind: password, name: STEER_HY2_PASSWORD}
+  hy2-cert: {source: env, kind: certificate, name: STEER_HY2_CERT}
+  hy2-key: {source: env, kind: private_key, name: STEER_HY2_KEY}
+inbounds:
+  hy2-local:
+    plugin: hysteria2:proxy
+    flow: [stream, datagram]
+    listen: {address: 127.0.0.1, port: 8443}
+    transport: {type: quic}
+    security: {type: tls, certificate: {secret: hy2-cert}, private_key: {secret: hy2-key}}
+    options: {principal_id: local-client, password: {secret: hy2-password}}
+```
+
+Add `flow: [stream, datagram]` to both `internet` and `deny` in the example and
+add an ordered route for `hy2-local` to `internet`. The HY2 tuple requires both
+flow classes, and the compiler rejects a default or route that cannot handle
+the selected traffic. TCP and UDP share the same ordered routing policy. The
+certificate and key variables contain paths in the core's environment; the
+password variable contains the password. No values or resolved paths are stored
+in the intent. A minimal build rejects HY2 documents. The prototype caps typed
+secret declarations at 16.
 
 GET returns the whole accepted v3 intent, not its lowered listener/policy
 representation. The durable envelope records `format: "steer-spec-v3"`;
@@ -162,7 +188,8 @@ revision internally, then prepares/commits atomically on the loop shard.
   actual `persistence`, `durability_uncertain`, `activeClients`, and active `listeners` with
   `id`, `protocol`, `address`, `port`. `capabilities.spec_v3_profile` advertises
   `linked-socks-v1` for compatibility; `capabilities.spec_v3_vless_tcp: true`
-  separately advertises plain VLESS in that profile, not general v3 execution.
+  separately advertises plain VLESS and `capabilities.spec_v3_hysteria2: true`
+  advertises the QUIC/TLS TCP+UDP HY2 tuple, not general v3 execution.
 - `GET`: one atomic `{revision,persistence,durability_uncertain,document}` envelope with the
   canonical configuration, including environment references only.
 - `VALIDATE`: `{valid:true,persistence}` on success.

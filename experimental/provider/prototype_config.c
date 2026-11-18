@@ -277,35 +277,81 @@ static int v3_socks_options(void *unused,const struct ynode *options){
     (void)unused;
     return keys(options,"");
 }
-static const struct ynode *v3_vless_secret(const struct ynode *options,char principal[65]){
-    if(!keys(options,"principal_id uuid")||!id(ynode_get(options,"principal_id"),principal))return NULL;
-    const struct ynode *uuid=ynode_get(options,"uuid"),*secret=ynode_get(uuid,"secret");
+static const struct ynode *v3_secret_id(const struct ynode *ref){
+    const struct ynode *secret=ynode_get(ref,"secret");
     char identifier[65];
-    return keys(uuid,"secret")&&id(secret,identifier)?secret:NULL;
+    return keys(ref,"secret")&&id(secret,identifier)?secret:NULL;
+}
+static int v3_env_ref(const struct ynode *secrets,const struct ynode *ref,const char *kind,char out[100]){
+    const struct ynode *id=v3_secret_id(ref);
+    const struct ynode *secret=id?ynode_get(secrets,id->str):NULL;
+    const struct ynode *name=ynode_get(secret,"name");
+    if(!eq(ynode_get(secret,"kind"),kind)||!scalar(name)||!env_name(name->str,name->len))return 0;
+    memcpy(out,"env:",4);
+    memcpy(out+4,name->str,name->len+1);
+    return 1;
+}
+static int v3_auth_options(const struct ynode *options,const char *allowed,const char *field,char principal[65]){
+    return keys(options,allowed)&&id(ynode_get(options,"principal_id"),principal)&&v3_secret_id(ynode_get(options,field));
 }
 static int v3_vless_options(void *unused,const struct ynode *options){
     (void)unused;
     char principal[65];
-    return v3_vless_secret(options,principal)!=NULL;
+    return v3_auth_options(options,"principal_id uuid","uuid",principal);
+}
+#ifdef STEER_PROTOTYPE_HY2
+static int v3_hy2_options(void *unused,const struct ynode *options){
+    (void)unused;
+    char principal[65];
+    return v3_auth_options(options,"principal_id password","password",principal);
+}
+static int v3_hy2_inbound(const struct steer_spec_node_view *node,const struct ynode *secrets,
+    struct steer_prototype_listener *l){
+    const struct ynode *transport=node->transport,*tls=node->security;
+    if(node->flows!=(STEER_SPEC_FLOW_STREAM|STEER_SPEC_FLOW_DATAGRAM)||
+        !keys(node->intent,"label enabled plugin options listen flow transport security")||
+        !keys(transport,"type")||!eq(ynode_get(transport,"type"),"quic")||
+        !keys(tls,"type certificate private_key")||!eq(ynode_get(tls,"type"),"tls")||
+        !v3_auth_options(node->options,"principal_id password","password",l->principal_id)||
+        !v3_env_ref(secrets,ynode_get(node->options,"password"),"password",l->password_ref)||
+        !v3_env_ref(secrets,ynode_get(tls,"certificate"),"certificate",l->certificate_ref)||
+        !v3_env_ref(secrets,ynode_get(tls,"private_key"),"private_key",l->private_key_ref))return 0;
+    l->protocol=STEER_PROTOTYPE_HYSTERIA2;
+    l->auth=STEER_PROTOTYPE_AUTH_PASSWORD;
+    return 1;
+}
+#endif
+static int v3_tcp_inbound(const struct steer_spec_node_view *node,const struct ynode *secrets,
+    struct steer_prototype_listener *l){
+    if(node->flows!=STEER_SPEC_FLOW_STREAM||!keys(node->intent,"label enabled plugin options listen flow"))return 0;
+    if(!strncmp(node->provider,"socks:",6)&&v3_socks_options(NULL,node->options)){
+        l->protocol=STEER_PROTOTYPE_SOCKS;
+        return 1;
+    }
+    if(strncmp(node->provider,"vless:",6)||!v3_auth_options(node->options,"principal_id uuid","uuid",l->principal_id)||
+        !v3_env_ref(secrets,ynode_get(node->options,"uuid"),"uuid",l->uuid_ref))return 0;
+    l->protocol=STEER_PROTOTYPE_VLESS;
+    l->auth=STEER_PROTOTYPE_AUTH_UUID;
+    return 1;
 }
 static int v3_inbound(const struct steer_spec_node_view *node,const struct ynode *secrets,
     struct steer_prototype_listener *l){
-    if(!keys(node->intent,"label enabled plugin options listen flow"))return 0;
-    if(!strncmp(node->provider,"socks:",6)&&v3_socks_options(NULL,node->options)){
-        l->protocol=STEER_PROTOTYPE_SOCKS;
-    }else if(!strncmp(node->provider,"vless:",6)){
-        const struct ynode *ref=v3_vless_secret(node->options,l->principal_id);
-        const struct ynode *name=ref?ynode_get(ynode_get(secrets,ref->str),"name"):NULL;
-        if(!name)return 0;
-        l->protocol=STEER_PROTOTYPE_VLESS;
-        l->auth=STEER_PROTOTYPE_AUTH_UUID;
-        memcpy(l->uuid_ref,"env:",4);
-        memcpy(l->uuid_ref+4,name->str,name->len+1);
-    }else return 0;
+#ifdef STEER_PROTOTYPE_HY2
+    if(!strncmp(node->provider,"hysteria2:",10)){
+        if(!v3_hy2_inbound(node,secrets,l))return 0;
+    }else
+#endif
+    if(!v3_tcp_inbound(node,secrets,l))return 0;
     l->enabled=(uint32_t)node->enabled;
     strcpy(l->id,node->id);
     return label(ynode_get(node->intent,"label"),l->label)&&listen_address(node->listen,l)&&
         (!strncmp(l->address,"127.",4)||!strcmp(l->address,"::1"));
+}
+static int v3_secret_kind(const struct ynode *kind){
+#ifdef STEER_PROTOTYPE_HY2
+    if(eq(kind,"password")||eq(kind,"certificate")||eq(kind,"private_key"))return 1;
+#endif
+    return eq(kind,"uuid");
 }
 static int v3_named_action(const struct ynode *outbounds,const char *name,uint32_t *out){
     return action(ynode_get(ynode_get(outbounds,name),"type"),out);
@@ -349,10 +395,24 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         {"core.classifier.domain",STEER_SPEC_READY,NULL,NULL},
         {"core.classifier.domain_suffix",STEER_SPEC_READY,NULL,NULL},
         {"core.secret.env",STEER_SPEC_READY,NULL,NULL},
+#ifdef STEER_PROTOTYPE_HY2
+        {"core.transport.quic",STEER_SPEC_READY,NULL,NULL},
+        {"core.security.tls",STEER_SPEC_READY,NULL,NULL},
+#endif
     };
-    struct steer_spec_capability inventory[sizeof(core)/sizeof(core[0])+3*STEER_PROTOTYPE_MAX_LISTENERS];
+    const unsigned outbound_flows=STEER_SPEC_FLOW_STREAM
+#ifdef STEER_PROTOTYPE_HY2
+        |STEER_SPEC_FLOW_DATAGRAM
+#endif
+        ;
+#ifdef STEER_PROTOTYPE_HY2
+    enum { alias_requirements=5 };
+#else
+    enum { alias_requirements=3 };
+#endif
+    struct steer_spec_capability inventory[sizeof(core)/sizeof(core[0])+alias_requirements*STEER_PROTOTYPE_MAX_LISTENERS];
     size_t count=sizeof(core)/sizeof(core[0]);
-    char requirements[STEER_PROTOTYPE_MAX_LISTENERS][3][128];
+    char requirements[STEER_PROTOTYPE_MAX_LISTENERS][alias_requirements][128];
     struct steer_policy_rule all[STEER_PROTOTYPE_MAX_RULES]={0},active[STEER_PROTOTYPE_MAX_RULES]={0};
     struct steer_pv1_error result=err(STEER_PV1_INVALID);
     uint32_t enabled=0,fallback;
@@ -383,11 +443,17 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         inventory[count++]=(struct steer_spec_capability){requirements[i][0],STEER_SPEC_READY,NULL,NULL};
         inventory[count++]=(struct steer_spec_capability){requirements[i][1],STEER_SPEC_READY,v3_socks_options,NULL};
         inventory[count++]=(struct steer_spec_capability){requirements[i][2],STEER_SPEC_READY,v3_vless_options,NULL};
+#ifdef STEER_PROTOTYPE_HY2
+        snprintf(requirements[i][3],sizeof(requirements[i][3]),"provider.hysteria2:%s/inbound/stream/quic/tls/default",alias->str);
+        snprintf(requirements[i][4],sizeof(requirements[i][4]),"provider.hysteria2:%s/inbound/datagram/quic/tls/default",alias->str);
+        inventory[count++]=(struct steer_spec_capability){requirements[i][3],STEER_SPEC_READY,v3_hy2_options,NULL};
+        inventory[count++]=(struct steer_spec_capability){requirements[i][4],STEER_SPEC_READY,v3_hy2_options,NULL};
+#endif
     }
     for(size_t i=0;secrets&&i<secrets->len;i++){
         const struct ynode *secret=ynode_val_at(secrets,i),*name=ynode_get(secret,"name");
         if(!keys(secret,"source name kind")||!eq(ynode_get(secret,"source"),"env")||
-            !eq(ynode_get(secret,"kind"),"uuid")||!scalar(name)||!env_name(name->str,name->len))return result;
+            !v3_secret_kind(ynode_get(secret,"kind"))||!scalar(name)||!env_name(name->str,name->len))return result;
     }
     struct steer_spec_plan *plan=steer_spec_compile(data,length,inventory,count);
     if(!plan)return err(STEER_PV1_RESOURCE_EXHAUSTED);
@@ -397,10 +463,9 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         struct steer_spec_node_view node;
         if(!steer_spec_node(plan,i,&node))goto done;
         if(node.kind==STEER_SPEC_PLUGIN||node.kind==STEER_SPEC_SECRET)continue;
-        if(node.flows!=STEER_SPEC_FLOW_STREAM)goto done;
         if(node.kind==STEER_SPEC_OUTBOUND){
             uint32_t a;
-            if(!keys(node.intent,"type label flow")||
+            if(!node.flows||(node.flows&~outbound_flows)||!keys(node.intent,"type label flow")||
                 !v3_named_action(outbounds,node.id,&a))goto done;
             continue;
         }

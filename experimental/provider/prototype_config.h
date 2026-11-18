@@ -32,7 +32,7 @@ struct steer_prototype_config {
     char *document_json;
     size_t document_length;
 };
-/* steer-linux-v1 or the linked TCP v3 subset. YAML and JSON
+/* steer-linux-v1 or the linked v3 subset (optional HY2). YAML and JSON
  * through existing bounded ynode. Unknown fields/tags/duplicates fail closed.
  * Generation is host-owned, never read from document. All result data owned.
  * No credential values are read or logged: env:NAME references only.
