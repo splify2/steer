@@ -2,6 +2,7 @@
 #include "kernel_wg_ownership.h"
 #include "awgdev.h"
 #include <steer/draft/device_v1.h>
+#include <netinet/in.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
@@ -95,6 +96,36 @@ int steer_draft_wg_identity_create(const struct steer_draft_wg_identity *i,int f
     rc=awg_dev_link_create_owned_until(i->physical_name,i->kind,mtu,i->group,&o->index,deadline);
     if(rc){o->effect=rc==EEXIST?STEER_PV1_DEVICE_UNCHANGED:STEER_PV1_DEVICE_EFFECT_UNCERTAIN;return observed_error(o,rc);}
     o->effect=STEER_PV1_DEVICE_CHANGED;o->state=STEER_DRAFT_WG_OWNED;
+    return observed_error(o,interrupted(deadline,cancel));
+}
+int steer_draft_wg_identity_stage(const struct steer_draft_wg_identity *i,int fd,int index,
+    const struct awg_conf *config,const struct awg_secrets *keys,uint32_t mark,uint64_t deadline,
+    const atomic_uint *cancel,struct steer_draft_wg_observation *o){
+    if(!o)return EINVAL;
+    *o=(struct steer_draft_wg_observation){STEER_DRAFT_WG_UNKNOWN,STEER_PV1_DEVICE_UNCHANGED,0,0};
+    if(!config||!keys||index<=0||!config->addr_n||config->addr_n>AWG_MAX_ADDRS)return observed_error(o,EINVAL);
+    for(size_t j=0;j<config->addr_n;j++){
+        const struct awg_prefix *p=&config->addr[j];
+        if((p->family!=AF_INET&&p->family!=AF_INET6)||p->cidr>(p->family==AF_INET?32:128))
+            return observed_error(o,EINVAL);
+    }
+    int rc=interrupted(deadline,cancel);
+    if(!rc)rc=steer_draft_wg_identity_reconcile(i,fd,deadline,o);
+    if(rc)return observed_error(o,rc);
+    if(o->state!=STEER_DRAFT_WG_OWNED||o->index!=index)
+        return observed_error(o,o->state==STEER_DRAFT_WG_ABSENT?ENODEV:ESTALE);
+    rc=awg_dev_link_require_down_owned_until(i->physical_name,i->kind,index,i->group,deadline);
+    if(!rc)rc=interrupted(deadline,cancel);
+    if(rc)return observed_error(o,rc);
+    rc=awg_dev_configure_owned_until(i->physical_name,i->kind,index,i->group,config,keys,mark,deadline);
+    if(rc){o->effect=STEER_PV1_DEVICE_EFFECT_UNCERTAIN;return observed_error(o,rc);}
+    o->effect=STEER_PV1_DEVICE_CHANGED;
+    for(size_t j=0;j<config->addr_n;j++){
+        rc=interrupted(deadline,cancel);
+        if(rc)return observed_error(o,rc);
+        rc=awg_dev_address_add_owned_until(i->physical_name,i->kind,index,i->group,&config->addr[j],deadline);
+        if(rc){o->effect=STEER_PV1_DEVICE_EFFECT_UNCERTAIN;return observed_error(o,rc);}
+    }
     return observed_error(o,interrupted(deadline,cancel));
 }
 int steer_draft_wg_identity_retire(const struct steer_draft_wg_identity *i,int fd,uint64_t deadline,const atomic_uint *cancel,struct steer_draft_wg_observation *o){

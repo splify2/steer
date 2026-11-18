@@ -69,6 +69,12 @@ static void spec_v3(void){
     assert(!strcmp(round->document_json,c->document_json));
     steer_prototype_config_destroy(round);steer_prototype_config_destroy(c);
     puts("managed v3 YAML/JSON, linked SOCKS/VLESS aliases, typed UUID and disabled entries PASS");
+    bad("version: 3\n"
+        "plugin_remotes: {local: {url: 'https://github.com/splify2/steer-protocols', trust: steer-linked-prototype-v1}}\n"
+        "plugins: {local: {remote: local, package: steer-protocols, version: '0.0.0'}}\n"
+        "inbounds: {vpn: {plugin: 'wireguard:local', flow: [device], device: {name: gateway}, options: {}}}\n"
+        "outbounds: {deny: {type: block, flow: [device]}}\n"
+        "routing: {default: deny, rules: []}\n");
 }
 int main(void){
     hysteria2();

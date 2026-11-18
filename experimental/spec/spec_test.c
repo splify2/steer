@@ -120,4 +120,41 @@ static void dangling(void){
         assert((unresolved!=0)==(i!=0));steer_spec_destroy(p);
     }
 }
-int main(void){types();views();readiness();dangling();puts("spec typed DNS settings/private views/construction edges PASS");return 0;}
+static void device_inbound(void){
+    const char *variants[]={
+        "\"flow\":[\"device\"],\"device\":{\"name\":\"gateway\"}",
+        "\"flow\":[\"device\"]",
+        "\"flow\":[\"device\"],\"device\":{\"name\":\"gateway\"},\"listen\":{\"address\":\"127.0.0.1\",\"port\":51820}",
+        "\"flow\":[\"device\",\"stream\"],\"device\":{\"name\":\"gateway\"}",
+        "\"flow\":[\"stream\"],\"device\":{\"name\":\"gateway\"}",
+        "\"flow\":[\"device\"],\"device\":{\"name\":\"bad/name\"}",
+    };
+    for(size_t i=0;i<sizeof(variants)/sizeof(variants[0]);i++){
+        char source[1024];
+        int n=snprintf(source,sizeof(source),
+            "{\"version\":3,\"plugin_remotes\":{\"local\":{\"url\":\"https://example.invalid\",\"trust\":\"local\"}},"
+            "\"plugins\":{\"protocols\":{\"remote\":\"local\",\"package\":\"protocols\",\"version\":\"0.0.0\"}},"
+            "\"inbounds\":{\"vpn\":{\"plugin\":\"wireguard:protocols\",\"options\":{},%s}},"
+            "\"outbounds\":{\"deny\":{\"type\":\"block\",\"flow\":[\"device\"]}},\"routing\":{\"default\":\"deny\",\"rules\":[]}}",
+            variants[i]);
+        assert(n>0&&(size_t)n<sizeof(source));
+        struct steer_spec_plan *p=steer_spec_compile(source,(size_t)n,NULL,0);assert(p);
+        struct steer_spec_summary s=steer_spec_summary(p);
+        assert(s.syntax_valid==(i==0)&&!s.runtime_ready);
+        if(i==0){
+            unsigned found=0;
+            assert(s.topology_valid);
+            for(uint32_t j=0;j<s.requirements;j++){
+                struct steer_spec_requirement_view r;assert(steer_spec_requirement(p,j,&r));
+                if(strcmp(r.name,"provider.wireguard:protocols/inbound/device/device/none/default"))continue;
+                struct steer_spec_node_view v;assert(!r.state&&steer_spec_node(p,r.owner_node,&v));
+                assert(v.kind==STEER_SPEC_INBOUND&&v.flows==STEER_SPEC_FLOW_DEVICE&&v.device&&!v.listen);
+                assert(!strcmp(ynode_get(v.device,"name")->str,"gateway"));found++;
+            }
+            assert(found==1);
+        }
+        steer_spec_destroy(p);
+    }
+    puts("spec device inbound: exact non-socket tuple, mixed flow and socket fields rejected PASS");
+}
+int main(void){types();views();readiness();dangling();device_inbound();puts("spec typed DNS settings/private views/construction edges PASS");return 0;}

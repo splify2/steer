@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "kernel_wg_ownership.h"
+#include "../spec/execution_journal.h"
 #include "awgdev.h"
 #include <steer/draft/device_v1.h>
 #include <assert.h>
@@ -64,10 +65,78 @@ static void *owner(void *arg){
     assert(!awg_dev_live_read_owned_until(id.physical_name,id.kind,index,id.group,live,deadline())&&live->peer_n==1&&!memcmp(live->peer[0].pub,c->peer[0].pub,32));
     assert(!steer_draft_wg_identity_retire(&id,ns,deadline(),&cancel,&o));awg_secrets_wipe(&keys);free(live);free(c);close(ns);return NULL;
 }
+static int stage_fixture(const char *mode,const char *directory,const char *path){
+    struct steer_spec_journal *journal=NULL;
+    struct steer_spec_journal_key key={1,1,1,STEER_SPEC_JOURNAL_INTENT};
+    struct steer_spec_journal_record record={0};
+    struct steer_draft_wg_identity id;
+    struct steer_draft_wg_observation o;
+    atomic_uint cancel=0;
+    int ns=open("/proc/thread-self/ns/net",O_RDONLY|O_CLOEXEC);assert(ns>=0);
+    assert(!steer_spec_journal_open(directory,8,8,&journal).code);
+    if(!strcmp(mode,"--recover")){
+        assert(!steer_spec_journal_sync_existing(journal).code);
+        assert(!steer_spec_journal_read(journal,&key,&record).code&&!strcmp(record.provider,"wireguard-fixture"));
+        assert(!steer_draft_wg_identity_decode(record.data,record.length,&id));
+        assert(id.generation==record.generation&&id.instance_token==record.key.instance);
+        assert(!steer_draft_wg_identity_retire(&id,ns,deadline(),&cancel,&o)&&o.state==STEER_DRAFT_WG_ABSENT);
+        puts("RECOVERED");
+    }else{
+        struct awg_conf *c=calloc(1,sizeof *c);struct awg_secrets keys;
+        char error[256];assert(c&&path);
+        assert(!awg_conf_load(path,c,&keys,error,sizeof error));
+        assert(!steer_draft_wg_identity_prepare(ns,1,key.instance,"wireguard",deadline(),&cancel,&id));
+        record.key=key;record.generation=1;record.operation=1;record.phase=1;
+        strcpy(record.provider,"wireguard-fixture");strcpy(record.provider_version,"1");
+        record.length=STEER_DRAFT_WG_RECORD_BYTES;
+        assert(!steer_draft_wg_identity_encode(&id,record.data));
+        struct steer_spec_journal_result stored=steer_spec_journal_append(journal,&record);
+        assert(!stored.error.code&&stored.durability==STEER_SPEC_JOURNAL_SYNCED);
+        assert(!steer_draft_wg_identity_create(&id,ns,1420,deadline(),&cancel,&o));
+        int index=o.index;
+        uint32_t wrong=id.group==1?2:1;
+        assert(awg_dev_address_add_owned_until(id.physical_name,id.kind,index,wrong,&c->addr[0],deadline())==ESTALE);
+        assert(awg_dev_link_up_owned_until(id.physical_name,id.kind,index,wrong,deadline())==ESTALE);
+        assert(awg_dev_address_add_owned_until(id.physical_name,id.kind,index,id.group,&c->addr[0],1)==ETIMEDOUT);
+        assert(awg_dev_link_up_owned_until(id.physical_name,id.kind,index,id.group,1)==ETIMEDOUT);
+        atomic_store(&cancel,1);
+        assert(steer_draft_wg_identity_stage(&id,ns,index,c,&keys,0,deadline(),&cancel,&o)==ECANCELED&&
+            o.effect==STEER_PV1_DEVICE_UNCHANGED);
+        atomic_store(&cancel,0);
+        if(!strcmp(mode,"--rollback"))
+            assert(!awg_dev_address_add_owned_until(id.physical_name,id.kind,index,id.group,&c->addr[0],deadline()));
+        int rc=steer_draft_wg_identity_stage(&id,ns,index,c,&keys,0,deadline(),&cancel,&o);
+        awg_secrets_wipe(&keys);awg_conf_free(c);free(c);
+        assert(!awg_dev_link_require_down_owned_until(id.physical_name,id.kind,index,id.group,deadline()));
+        if(!strcmp(mode,"--rollback")){
+            assert(rc==EEXIST&&o.effect==STEER_PV1_DEVICE_EFFECT_UNCERTAIN);
+            assert(!steer_draft_wg_identity_retire(&id,ns,deadline(),&cancel,&o)&&o.state==STEER_DRAFT_WG_ABSENT);
+            printf("ROLLED_BACK %s\n",id.physical_name);
+        }else{
+            assert(!rc&&o.effect==STEER_PV1_DEVICE_CHANGED);
+            printf("DOWN %s\n",id.physical_name);fflush(stdout);
+            assert(getchar()=='\n'); /* The isolated fixture installs its guard first. */
+            assert(!awg_dev_link_up_owned_until(id.physical_name,id.kind,index,id.group,deadline()));
+            assert(awg_dev_link_require_down_owned_until(id.physical_name,id.kind,index,id.group,deadline())==EBUSY);
+            assert(awg_dev_link_up_owned_until(id.physical_name,id.kind,index,id.group,deadline())==EBUSY);
+            puts("UP");fflush(stdout);
+            assert(getchar()=='\n');
+            assert(!steer_draft_wg_identity_retire(&id,ns,deadline(),&cancel,&o)&&o.state==STEER_DRAFT_WG_ABSENT);
+            puts("RETIRED");
+        }
+    }
+    assert(!steer_spec_journal_close(journal).code);
+    close(ns);
+    return 0;
+}
 int main(int argc,char **argv){
     wire();if(argc==2&&!strcmp(argv[1],"--wire")){puts("WG parsed config exact-index wire PASS");return 0;}
     struct stat current,initial;assert(!stat("/proc/thread-self/ns/net",&current)&&!stat("/proc/1/ns/net",&initial));
     if(!getenv("STEER_TEST_OWNED_NETNS")||(current.st_dev==initial.st_dev&&current.st_ino==initial.st_ino)){fputs("isolated namespace required\n",stderr);return 2;}
+    if(argc==3&&!strcmp(argv[1],"--recover"))return stage_fixture(argv[1],argv[2],NULL);
+    if(argc==4&&(!strcmp(argv[1],"--serve")||!strcmp(argv[1],"--rollback")))
+        return stage_fixture(argv[1],argv[2],argv[3]);
+    if(argc!=1)return 2;
     pthread_t t[4];for(uintptr_t j=0;j<4;j++)assert(!pthread_create(t+j,NULL,owner,(void *)j));for(unsigned j=0;j<4;j++)assert(!pthread_join(t[j],NULL));
     puts("WG parsed config: four thread namespaces, real key/peer SET+GET, isolated ownership failures, invalid/unresolved variants fail closed PASS");return 0;
 }

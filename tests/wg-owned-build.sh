@@ -11,5 +11,5 @@ ${CC:-cc} $F @"$OUT/includes.rsp" experimental/provider/kernel_wg_owned_test.c s
 "$OUT/owned" --wire
 ${CC:-cc} $F @"$OUT/includes.rsp" -I../plugin-sdk/include -pthread experimental/provider/kernel_wg_ownership_test.c experimental/provider/kernel_wg_ownership.c src/kinds/awgdev.c -Wl,--gc-sections,--wrap=awg_dev_link_create_owned_until,--wrap=awg_dev_link_delete_owned_until -o "$OUT/recovery"
 "$OUT/recovery" --record
-${CC:-cc} $F @"$OUT/includes.rsp" -I../plugin-sdk/include -pthread experimental/provider/kernel_wg_config_owned_test.c experimental/provider/kernel_wg_ownership.c src/kinds/awgdev.c -Wl,--gc-sections,--wrap=malloc,--wrap=free -o "$OUT/config"
+${CC:-cc} $F @"$OUT/includes.rsp" -I../plugin-sdk/include -pthread experimental/provider/kernel_wg_config_owned_test.c experimental/provider/kernel_wg_ownership.c experimental/spec/execution_journal.c src/kinds/awgdev.c -Wl,--gc-sections,--wrap=malloc,--wrap=free -o "$OUT/config"
 "$OUT/config" --wire

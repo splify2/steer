@@ -15,6 +15,8 @@ struct steer_draft_wg_identity {
 #define STEER_DRAFT_WG_FOREIGN 3u
 #define STEER_DRAFT_WG_UNKNOWN 4u
 struct steer_draft_wg_observation { uint32_t state,effect;int index,error; };
+struct awg_conf;
+struct awg_secrets;
 /* Worker-only blocking primitives, not a factory or private journal. Caller
  * owns/pins namespace_fd through return and enters that namespace on its bounded
  * worker. Every call verifies current thread namespace, pinned fd and boot.
@@ -29,7 +31,14 @@ int steer_draft_wg_identity_reconcile(const struct steer_draft_wg_identity *,int
 /* Create only a DOWN device, never keys/guard/publish. Before-effect cancel is
  * unchanged; an error after possible kernel effect remains uncertain. */
 int steer_draft_wg_identity_create(const struct steer_draft_wg_identity *,int namespace_fd,
-    int mtu,uint64_t deadline_ns,const atomic_uint *cancel,struct steer_draft_wg_observation *);
+     int mtu,uint64_t deadline_ns,const atomic_uint *cancel,struct steer_draft_wg_observation *);
+/* Stage keys, peers and exclusive addresses on the exact owned DOWN link.
+ * Caller holds journal-authorized serialized ownership, config and keys.
+ * Never creates a link or sets UP. After a possible effect caller still owns
+ * cleanup even when the result is an error or a late cancellation. */
+int steer_draft_wg_identity_stage(const struct steer_draft_wg_identity *,int namespace_fd,int index,
+    const struct awg_conf *,const struct awg_secrets *,uint32_t mark,uint64_t deadline_ns,
+    const atomic_uint *cancel,struct steer_draft_wg_observation *);
 /* Fresh reconciliation then guarded precise-index cleanup. Foreign or wrong
  * boot/ns refuses all mutation; repeated absent recovery is read-only. */
 int steer_draft_wg_identity_retire(const struct steer_draft_wg_identity *,int namespace_fd,

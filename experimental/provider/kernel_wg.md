@@ -140,3 +140,29 @@ including one refused ownership check while healthy owners continue their own
 create/retire cycles. This verifies this narrow owned-operation subset, not the
 legacy configure/live helpers or managed host crash recovery. Execute kernel
 modes only with the namespace opt-in described above.
+
+Owned DOWN staging checkpoint
+-----------------------------
+
+`steer_draft_wg_identity_stage` checks boot, the pinned/current namespace,
+name, kind, index and group. It stages parsed keys/peers by exact index and
+adds addresses exclusively to a DOWN link. It does not create, replace, or
+bring up a link. The separate owned UP operation uses the same identity and
+absolute deadline; the caller must install the admission guard before UP.
+An address conflict after peer configuration is not an unchanged result.
+Late cancellation or uncertain netlink results retain cleanup responsibility.
+
+```sh
+sh tests/wg-owned-build.sh /tmp/wg-owned
+unshare -n -- env STEER_TEST_OWNED_NETNS=1 \
+  python3 experimental/provider/kernel_wg_owned_stage_test.py /tmp/wg-owned/config
+```
+
+The fixture syncs the exact link record with the common journal before create.
+In paired disposable namespaces it verifies stage while DOWN, handshake with
+DROP, ICMP and exact UDP echo after allow, a real address conflict that leaves the
+old peer working, and precise cleanup/reprovisioning after SIGKILL. It uses its
+own independently installed nft rules and reinitializes the test peer session
+after reconnection. It is not a managed config transaction. The host still needs
+to bind typed WG options, durable nft guard ownership, and the common authority
+and commit/recovery ordering before advertising or accepting this provider.

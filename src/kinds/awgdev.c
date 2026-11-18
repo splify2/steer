@@ -762,7 +762,7 @@ static int genl_family_until(const char *name, uint16_t *id, int *ver,uint64_t d
 
 static int genl_family(const char *name,uint16_t *id,int *ver){return genl_family_until(name,id,ver,0);}
 
-struct link_ctx { char kind[32]; int index; char marker[256]; int malformed_marker; uint32_t group; int have_group; };
+struct link_ctx { char kind[32]; int index; char marker[256]; int malformed_marker; uint32_t group; int have_group; unsigned flags; };
 
 static void link_cb(const struct nlmsghdr *h, void *ctx) {
     struct link_ctx *l = ctx;
@@ -771,6 +771,7 @@ static void link_cb(const struct nlmsghdr *h, void *ctx) {
     size_t hl = NLMSG_ALIGN(sizeof(*ifi));
     if (h->nlmsg_len < NLMSG_HDRLEN + hl) return;
     l->index = ifi->ifi_index;
+    l->flags = ifi->ifi_flags;
     const struct nlattr *tb[IFLA_MAX + 1];
     attrs_parse((const uint8_t *)ifi + hl, h->nlmsg_len - NLMSG_HDRLEN - hl, tb, IFLA_MAX);
     if(tb[IFLA_GROUP] && NLA_PLEN(tb[IFLA_GROUP])==sizeof(uint32_t)){
@@ -796,7 +797,7 @@ static void link_cb(const struct nlmsghdr *h, void *ctx) {
 
 /* Есть ли устройство и какого вида. 0 — есть (kind может быть пустым у устройств без вида,
  * например eth0), ENODEV — нет. */
-static int link_query_until(const char *ifname,char *kind,size_t kn,int *index,char *marker,size_t mn,uint32_t *group,uint64_t deadline) {
+static int link_query_until(const char *ifname,char *kind,size_t kn,int *index,char *marker,size_t mn,uint32_t *group,unsigned *flags,uint64_t deadline) {
     int fd = nl_open(NETLINK_ROUTE);
     if (fd < 0) return errno;
     uint8_t buf[256];
@@ -814,21 +815,22 @@ static int link_query_until(const char *ifname,char *kind,size_t kn,int *index,c
     if(group){if(!l.have_group)return EPROTO;*group=l.group;}
     if (kind) snprintf(kind, kn, "%s", l.kind);
     if (index) *index = l.index;
+    if (flags) *flags = l.flags;
     if(marker){
         if(l.malformed_marker||strlen(l.marker)+1>mn)return EMSGSIZE;
         memcpy(marker,l.marker,strlen(l.marker)+1);
     }
     return 0;
 }
-int awg_dev_link_query(const char *ifname,char *kind,size_t kn,int *index){return link_query_until(ifname,kind,kn,index,NULL,0,NULL,0);}
+int awg_dev_link_query(const char *ifname,char *kind,size_t kn,int *index){return link_query_until(ifname,kind,kn,index,NULL,0,NULL,NULL,0);}
 int awg_dev_link_query_marked(const char *ifname,char *kind,size_t kn,int *index,char *marker,size_t mn){
     if(!marker||!mn||!ifname||!*ifname||strlen(ifname)>=IFNAMSIZ)return EINVAL;
-    marker[0]=0;return link_query_until(ifname,kind,kn,index,marker,mn,NULL,0);
+    marker[0]=0;return link_query_until(ifname,kind,kn,index,marker,mn,NULL,NULL,0);
 }
 
 int awg_dev_link_query_marked_until(const char *ifname,char *kind,size_t kn,int *index,char *marker,size_t mn,uint64_t deadline){
  if(!deadline||!marker||!mn||!ifname||!*ifname||strlen(ifname)>=IFNAMSIZ)return EINVAL;
- marker[0]=0;return link_query_until(ifname,kind,kn,index,marker,mn,NULL,deadline);
+ marker[0]=0;return link_query_until(ifname,kind,kn,index,marker,mn,NULL,NULL,deadline);
 }
 static int rtnl_simple_until(void *buf,size_t n,uint64_t deadline) {
     int fd = nl_open(NETLINK_ROUTE);
@@ -895,14 +897,22 @@ int awg_dev_link_down_marked(const char *name,const char *kind,int index,const c
 int awg_dev_link_query_owned_until(const char *name,char *kind,size_t kn,int *index,uint32_t *group,uint64_t deadline){
     if(!deadline||!group||!name||!*name||strlen(name)>=IFNAMSIZ)return EINVAL;
     *group=0;
-    return link_query_until(name,kind,kn,index,NULL,0,group,deadline);
+    return link_query_until(name,kind,kn,index,NULL,0,group,NULL,deadline);
 }
-static int owned_identity_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline){
+static int owned_identity_state_until(const char *name,const char *kind,int index,uint32_t group,unsigned *flags,uint64_t deadline){
     char found_kind[32];int found_index=0;uint32_t found_group=0;
-    if(!kind||!awg_dev_ours(kind)||index<=0||!group)return EINVAL;
-    int rc=awg_dev_link_query_owned_until(name,found_kind,sizeof found_kind,&found_index,&found_group,deadline);
+    if(!name||!*name||strlen(name)>=IFNAMSIZ||!kind||!awg_dev_ours(kind)||index<=0||!group||!deadline)return EINVAL;
+    int rc=link_query_until(name,found_kind,sizeof found_kind,&found_index,NULL,0,&found_group,flags,deadline);
     if(rc)return rc;
     return found_index==index&&found_group==group&&!strcmp(found_kind,kind)?0:ESTALE;
+}
+static int owned_identity_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline){
+    return owned_identity_state_until(name,kind,index,group,NULL,deadline);
+}
+int awg_dev_link_require_down_owned_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline){
+    unsigned flags=0;
+    int rc=owned_identity_state_until(name,kind,index,group,&flags,deadline);
+    return rc?rc:(flags&IFF_UP)?EBUSY:0;
 }
 int awg_dev_link_create_owned_until(const char *name,const char *kind,int mtu,uint32_t group,int *out_index,uint64_t deadline){
     uint8_t buffer[512];struct link_ctx created={0};
@@ -922,16 +932,19 @@ int awg_dev_link_create_owned_until(const char *name,const char *kind,int mtu,ui
     *out_index=actual_index;
     return 0;
 }
-static int owned_mutate_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline,int remove){
-    int rc=owned_identity_until(name,kind,index,group,deadline);if(rc)return rc;
+static int owned_mutate_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline,int remove,int up){
+    int rc=up?awg_dev_link_require_down_owned_until(name,kind,index,group,deadline):
+        owned_identity_until(name,kind,index,group,deadline);
+    if(rc)return rc;
     uint8_t buffer[128];struct nlbuf b;
-    struct ifinfomsg ifi={.ifi_family=AF_UNSPEC,.ifi_index=index,.ifi_flags=0,.ifi_change=remove?0:IFF_UP};
+    struct ifinfomsg ifi={.ifi_family=AF_UNSPEC,.ifi_index=index,.ifi_flags=up?IFF_UP:0,.ifi_change=remove?0:IFF_UP};
     struct nlmsghdr *h=msg_begin(&b,buffer,sizeof buffer,remove?RTM_DELLINK:RTM_NEWLINK,NLM_F_REQUEST|NLM_F_ACK,next_seq(),&ifi,sizeof ifi);
     /* Intentionally no IFLA_GROUP: never invoke rtnl_dellink's group fallback. */
     return rtnl_simple_until(buffer,msg_end(&b,h),deadline);
 }
-int awg_dev_link_down_owned_until(const char *n,const char *k,int i,uint32_t g,uint64_t d){return owned_mutate_until(n,k,i,g,d,0);}
-int awg_dev_link_delete_owned_until(const char *n,const char *k,int i,uint32_t g,uint64_t d){return owned_mutate_until(n,k,i,g,d,1);}
+int awg_dev_link_down_owned_until(const char *n,const char *k,int i,uint32_t g,uint64_t d){return owned_mutate_until(n,k,i,g,d,0,0);}
+int awg_dev_link_delete_owned_until(const char *n,const char *k,int i,uint32_t g,uint64_t d){return owned_mutate_until(n,k,i,g,d,1,0);}
+int awg_dev_link_up_owned_until(const char *n,const char *k,int i,uint32_t g,uint64_t d){return owned_mutate_until(n,k,i,g,d,0,1);}
 
 
 static int link_create(const char *ifname, const char *kind, int mtu) {
@@ -1199,7 +1212,7 @@ static void prefix_str(const struct awg_prefix *p, char *dst, size_t n) {
  * dev X` (IFA_LOCAL и IFA_ADDRESS — один и тот же адрес, как у iproute2 без peer). 0 или errno.
  * IPv6 — с IFA_F_NODAD: адрес на точке-точке без соседей, и проверка дубликата только задержала
  * бы его на секунду в состоянии tentative. */
-static int addr_msg(int add, const struct awg_prefix *p, int index) {
+static int addr_msg_until(int add, const struct awg_prefix *p, int index,uint64_t deadline) {
     uint8_t buf[128];
     struct nlbuf b;
     struct ifaddrmsg ifa = { .ifa_family = p->family, .ifa_prefixlen = p->cidr,
@@ -1212,7 +1225,17 @@ static int addr_msg(int add, const struct awg_prefix *p, int index) {
     nlbuf_put_data(&b, IFA_LOCAL, p->addr, al);
     nlbuf_put_data(&b, IFA_ADDRESS, p->addr, al);
     size_t n = msg_end(&b, nh);
-    return n ? rtnl_simple(buf, n) : EMSGSIZE;
+    return n ? rtnl_simple_until(buf,n,deadline) : EMSGSIZE;
+}
+static int addr_msg(int add,const struct awg_prefix *p,int index){
+    return addr_msg_until(add,p,index,0);
+}
+int awg_dev_address_add_owned_until(const char *name,const char *kind,int index,uint32_t group,
+    const struct awg_prefix *prefix,uint64_t deadline){
+    if(!prefix||(prefix->family!=AF_INET&&prefix->family!=AF_INET6)||
+        prefix->cidr>(prefix->family==AF_INET?32:128))return EINVAL;
+    int rc=awg_dev_link_require_down_owned_until(name,kind,index,group,deadline);
+    return rc?rc:addr_msg_until(1,prefix,index,deadline);
 }
 
 /* Привести адреса устройства к файлу: недостающие добавить, лишние снять. Не «снять всё и

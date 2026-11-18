@@ -66,6 +66,12 @@ int awg_dev_link_query_owned_until(const char *,char *,size_t,int *,uint32_t *,u
 int awg_dev_link_create_owned_until(const char *,const char *,int,uint32_t,int *,uint64_t);
 int awg_dev_link_down_owned_until(const char *,const char *,int,uint32_t,uint64_t);
 int awg_dev_link_delete_owned_until(const char *,const char *,int,uint32_t,uint64_t);
+/* Stage one address on a verified DOWN link, exclusive (no replace/delete).
+ * UP is a separate guarded step; caller must have installed packet admission
+ * policy first. All errors after send need observation before claiming rollback. */
+int awg_dev_link_require_down_owned_until(const char *,const char *,int,uint32_t,uint64_t);
+int awg_dev_address_add_owned_until(const char *,const char *,int,uint32_t,const struct awg_prefix *,uint64_t);
+int awg_dev_link_up_owned_until(const char *,const char *,int,uint32_t,uint64_t);
 
 /* Exclusive device creation for the experimental owned-device adapter. Never
  * adopts/reconfigures an existing link. kind must be wireguard/amneziawg.

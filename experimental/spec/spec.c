@@ -320,9 +320,21 @@ static void flow_node(struct steer_spec_plan *p, uint32_t index) {
     type = ynode_get(n, "type"); plugin = ynode_get(n, "plugin");
     if (!!type == !!plugin) { diagnostic(p, 0, "provider_or_builtin_required", node->path); return; }
     if (plugin) {
-        keys(p, n, node->kind == STEER_SPEC_INBOUND ?
-            "label enabled plugin flow listen options transport security variant" :
-            "label enabled plugin flow endpoint options transport security variant detour resolve_via", node->path);
+        if (node->kind == STEER_SPEC_INBOUND && node->flows == STEER_SPEC_FLOW_DEVICE) {
+            const struct ynode *device = field(p, n, "device", node->path, 1), *name;
+            keys(p, n, "label enabled plugin flow device options variant", node->path);
+            if (device && keys(p, device, "name", node->path)) {
+                name = field(p, device, "name", node->path, 1);
+                if (!text(name) || !identifier(name->str)) diagnostic(p, 0, "invalid_device_name", node->path);
+            }
+            copy(transport, sizeof(transport), "device");
+        } else {
+            keys(p, n, node->kind == STEER_SPEC_INBOUND ?
+                "label enabled plugin flow listen options transport security variant" :
+                "label enabled plugin flow endpoint options transport security variant detour resolve_via", node->path);
+            if (node->kind == STEER_SPEC_INBOUND && (node->flows & STEER_SPEC_FLOW_DEVICE))
+                diagnostic(p, 0, "mixed_device_inbound", node->path);
+        }
         provider(p, index, transport, security);
     }
     else if (!text(type)) diagnostic(p, 0, "invalid_builtin_type", node->path);
