@@ -12,6 +12,8 @@
 #define STEER_PROTOTYPE_AUTH_USERPASS 1u
 #define STEER_PROTOTYPE_AUTH_UUID 2u
 #define STEER_PROTOTYPE_AUTH_PASSWORD 3u
+#define STEER_STORE_FORMAT_PROTOTYPE 1u
+#define STEER_STORE_FORMAT_SPEC_V3 3u
 struct steer_prototype_listener {
     char id[65], address[46];
     uint16_t port;
@@ -23,17 +25,18 @@ struct steer_prototype_listener {
 };
 struct steer_prototype_config {
     uint64_t generation;
+    uint32_t format;
     uint32_t listener_count;
     struct steer_prototype_listener listeners[STEER_PROTOTYPE_MAX_LISTENERS];
     struct steer_policy *policy;
     char *document_json;
     size_t document_length;
 };
-/* Distinct prototype: steer-linux-v1 document, NOT complete v3. YAML and JSON
+/* steer-linux-v1 or the linked SOCKS v3 subset. YAML and JSON
  * through existing bounded ynode. Unknown fields/tags/duplicates fail closed.
  * Generation is host-owned, never read from document. All result data owned.
  * No credential values are read or logged: env:NAME references only.
- * Numeric IPv4 127/8 or IPv6 ::1 binds only; 1..65535 ports. Caller resolves
+ * Explicit numeric IPv4/IPv6 binds; 1..65535 ports. Caller resolves
  * refs and checks credentials before publication. Failures clear *out and expose
  * only error code (no raw parser message or secret-bearing document excerpt). */
 struct steer_pv1_error steer_prototype_config_parse(const char *, size_t,

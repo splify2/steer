@@ -129,7 +129,7 @@ struct steer_pv1_error steer_prototype_store_prepare_document(struct steer_proto
 }
 struct steer_pv1_error steer_prototype_store_prepare(struct steer_prototype_store *s,const struct steer_prototype_config *c,struct steer_prototype_store_transaction **out){
     if(!c){if(out)*out=NULL;return error(STEER_PV1_INVALID);}
-    struct steer_store_document document={c->generation,STEER_STORE_FORMAT_PROTOTYPE,c->document_json,c->document_length};
+    struct steer_store_document document={c->generation,c->format,c->document_json,c->document_length};
     return steer_prototype_store_prepare_document(s,&document,out);
 }
 struct steer_prototype_store_result steer_prototype_store_commit(struct steer_prototype_store_transaction*t){
@@ -244,6 +244,11 @@ struct steer_pv1_error steer_prototype_store_load(struct steer_prototype_store *
     struct steer_store_document *document=NULL;struct steer_pv1_error result=steer_prototype_store_load_document(s,&document);
     if(result.code)return result;
     if(document->format!=STEER_STORE_FORMAT_PROTOTYPE)result=error(STEER_PV1_INVALID);
-    else result=steer_prototype_config_parse(document->document,document->length,document->generation,out);
+    else {
+        result=steer_prototype_config_parse(document->document,document->length,document->generation,out);
+        if(!result.code&&(*out)->format!=document->format) {
+            steer_prototype_config_destroy(*out);*out=NULL;result=error(STEER_PV1_INVALID);
+        }
+    }
     steer_store_document_destroy(document);return result;
 }

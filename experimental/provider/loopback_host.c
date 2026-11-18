@@ -15,13 +15,13 @@
 #include "prototype_config.h"
 #include "resolver.h"
 #include "prototype_store.h"
+#include "prototype_prepare.h"
 #include "inbound_tls.h"
 #ifdef STEER_PROTOTYPE_HY2
 #include "hy2_inbound.h"
 #include "datagram.h"
 #include "datagram_routes.h"
 #include "qcssl.h"
-#include "prototype_prepare.h"
 #endif
 #include <arpa/inet.h>
 #include <errno.h>
@@ -125,8 +125,8 @@ struct host {
     struct steer_draft_resolver *resolver;
     struct steer_prototype_store *store;
     struct store_writer writer;
-#ifdef STEER_PROTOTYPE_HY2
     struct steer_prototype_prepare *preparer;
+#ifdef STEER_PROTOTYPE_HY2
     struct steer_draft_hy2_datagram_budget datagram_budget;
 #endif
     int store_busy, durability_uncertain;
@@ -449,17 +449,16 @@ static void work(struct loop *l, struct loop_timer *t, void *arg)
     (void)t;
     for (i = 0; i < CLIENTS; ++i) if (h->clients[i].live) advance(&h->clients[i]);
 #ifdef STEER_PROTOTYPE_HY2
-    int hy2_pending=reap_hy2_listeners(h);
-    if(h->stopping&&h->preparer) {
-        steer_prototype_prepare_stop(h->preparer);
-        if(!steer_prototype_prepare_destroy(h->preparer))h->preparer=NULL;
-        else { hy2_pending=1;loop_timer_set(h->work,10); }
-    }
+    int pending=reap_hy2_listeners(h);
 #else
-    int hy2_pending=0;
+    int pending=0;
 #endif
+    if(h->stopping&&h->preparer) {
+        if(!steer_prototype_prepare_destroy(h->preparer))h->preparer=NULL;
+        else { pending=1;loop_timer_set(h->work,10); }
+    }
     reap_generations(h);
-    if (h->stopping && !h->live && !h->store_busy && !hy2_pending) {
+    if (h->stopping && !h->live && !h->store_busy && !pending) {
         h->current = NULL;
         reap_generations(h); /* release route-generation resolver references */
         unsigned generations = 0;
@@ -523,9 +522,7 @@ static void stop(struct loop *l, int signo, void *arg)
     struct host *h = arg; unsigned i;
     (void)l; (void)signo;
     h->stopping = 1;
-#ifdef STEER_PROTOTYPE_HY2
     if(h->preparer)steer_prototype_prepare_stop(h->preparer);
-#endif
     if (h->control_fd >= 0) {
         loop_fd_del(h->loop, h->control_fd); close(h->control_fd); h->control_fd = -1;
     }
@@ -834,9 +831,7 @@ static void cleanup_host(struct host *h)
     }
     if (h->control_path[0]) unlink(h->control_path);
     stop_writer(h);
-#ifdef STEER_PROTOTYPE_HY2
     steer_prototype_prepare_join_destroy(h->preparer);h->preparer=NULL;
-#endif
     for (i = 0; i < LISTENERS; ++i) close_listener(h, &h->listeners[i]);
     /* Startup rollback may retire a prepared binding before the first loop
      * dispatch. Its deferred finalizer still owns generation storage. */
@@ -953,7 +948,7 @@ static int same_identity(const struct listener_identity *a,const struct listener
 /* No callbacks interleave preparation/publication: one owning loop shard.
  * New sockets are closed on failure; old listeners and generation stay live. */
 static int prepare_configuration(struct host *h, const char *document, size_t length,
-                                 uint64_t expected, int validate, uint64_t initial_revision,
+                                 uint64_t expected, int validate, uint64_t initial_revision,uint32_t initial_format,
                                  struct prepared *prepared_state,struct steer_prototype_prepared_input *inputs)
 {
     struct steer_prototype_config *config = NULL;
@@ -968,13 +963,9 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     memset(prepared_state, 0, sizeof(*prepared_state));
     if (!validate && expected != (h->current ? h->current->number : 0)) return 409;
     if(!next)return 422;
-#ifdef STEER_PROTOTYPE_HY2
     if(inputs) { config=inputs->config;inputs->config=NULL;if(!config)return 422; }
-    else
-#else
-    (void)inputs;
-#endif
-    if(steer_prototype_config_parse(document,length,next,&config).code)return 422;
+    else if(steer_prototype_config_parse(document,length,next,&config).code)return 422;
+    if(initial_format&&initial_format!=config->format)goto cleanup;
     if (!config->document_json || config->document_length > STEER_PROTOTYPE_CONFIG_MAX_BYTES) goto cleanup;
     if(!validate&&config->generation!=next) { result=409;goto cleanup; }
     for (i = 0; i < config->listener_count; ++i)if(config->listeners[i].enabled) {
@@ -1087,12 +1078,12 @@ static void publish_prepared(struct host *h, struct prepared *prepared)
     prepared->generation = NULL;
     reap_generations(h);
 }
-static int configure(struct host *h, const char *document, size_t length, uint64_t expected,
-                     int validate, uint64_t initial_revision)
+static int configure_initial(struct host *h,const char *document,size_t length,
+                             uint64_t revision,uint32_t format)
 {
     struct prepared prepared;
-    int result = prepare_configuration(h, document, length, expected, validate, initial_revision, &prepared,NULL);
-    if (result == 200 && !validate) publish_prepared(h, &prepared);
+    int result = prepare_configuration(h,document,length,0,0,revision,format,&prepared,NULL);
+    if (result == 200) publish_prepared(h, &prepared);
     return result;
 }
 static size_t status_json(struct host *h, char *out, size_t capacity)
@@ -1121,7 +1112,7 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 #ifdef STEER_PROTOTYPE_HY2
     hy2="true";hy2_udp=h->current&&h->current->datagrams?"true":"false";provider=",\"hysteria2\"";
 #endif
-    n=snprintf(out+used,capacity-used,"],\"capabilities\":{\"providers\":[\"socks\",\"vless\"%s],\"inbound\":{\"hysteria2\":{\"tcp\":%s,\"udp\":%s,\"tls\":%s}}},\"drainingListeners\":[",provider,hy2,hy2_udp,hy2);
+    n=snprintf(out+used,capacity-used,"],\"capabilities\":{\"spec_v3_profile\":\"linked-socks-v1\",\"providers\":[\"socks\",\"vless\"%s],\"inbound\":{\"hysteria2\":{\"tcp\":%s,\"udp\":%s,\"tls\":%s}}},\"drainingListeners\":[",provider,hy2,hy2_udp,hy2);
     if(n<0||(size_t)n>=capacity-used)return 0;
     used+=(size_t)n;count=0;
 #ifdef STEER_PROTOTYPE_HY2
@@ -1148,10 +1139,8 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 static void close_control(struct control *c)
 {
     if (c->fd < 0) return;
-#ifdef STEER_PROTOTYPE_HY2
     if(c->waiting_prepare&&c->host->preparer)steer_prototype_prepare_cancel(c->host->preparer,(unsigned)(c-c->host->controls),c->serial);
     c->waiting_prepare=0;
-#endif
     loop_fd_del(c->host->loop, c->fd); close(c->fd); c->fd = -1;
     loop_timer_free(c->deadline); c->deadline = NULL;
 }
@@ -1274,17 +1263,6 @@ static int queue_durable(struct control *c,struct prepared *prepared)
     pthread_cond_signal(&h->writer.changed); pthread_mutex_unlock(&h->writer.lock);
     return 0; /* response deferred until the writer's eventfd completion */
 }
-#ifndef STEER_PROTOTYPE_HY2
-static int durable_apply(struct control *c) {
-    struct host *h=c->host;struct prepared *prepared;int result;
-    if(h->store_busy)return 503;
-    prepared=calloc(1,sizeof *prepared);if(!prepared)return 503;
-    result=prepare_configuration(h,c->input+c->header_length,c->body_length,c->expected,0,1,prepared,NULL);
-    if(result==200)result=queue_durable(c,prepared);
-    if(result) { if(prepared->generation)discard_prepared(h,prepared);free(prepared); }
-    return result;
-}
-#else
 static void prepared_ready(void *user,struct steer_prototype_prepared_input *input) {
     struct host *h=user;struct control *c;struct prepared *prepared;int code,n;char body[128];
     loop_timer_set(h->work,0);
@@ -1298,7 +1276,7 @@ static void prepared_ready(void *user,struct steer_prototype_prepared_input *inp
     /* CAS is rechecked after worker result, before any bind/route preparation. */
     if(!input->validate&&input->expected!=h->current->number) { control_error(c,409);return; }
     prepared=calloc(1,sizeof *prepared);if(!prepared) { control_error(c,503);return; }
-    code=prepare_configuration(h,NULL,0,input->expected,input->validate,1,prepared,input);
+    code=prepare_configuration(h,NULL,0,input->expected,input->validate,0,0,prepared,input);
     if(code!=200) { free(prepared);control_error(c,code);return; }
     if((uint64_t)loop_now_ms()>=input->deadline_ms) {
         if(prepared->generation)discard_prepared(h,prepared);
@@ -1313,7 +1291,6 @@ static void prepared_ready(void *user,struct steer_prototype_prepared_input *inp
         if(code) { discard_prepared(h,prepared);free(prepared);control_error(c,code); }
     } else { publish_prepared(h,prepared);free(prepared);applied_response(c,200); }
 }
-#endif
 static int decimal(const char **cursor, uint64_t *value)
 {
     const char *p = *cursor;
@@ -1372,7 +1349,6 @@ static void control_execute(struct control *c)
         c->input[n + g->document_length] = '}';
         control_response(c, 200, c->input, length);
     } else {
-#ifdef STEER_PROTOTYPE_HY2
         if(c->operation==4&&c->expected!=h->current->number) { control_error(c,409);return; }
         if(!h->preparer||h->store_busy||steer_prototype_prepare_busy(h->preparer)) { control_error(c,503);return; }
         code=steer_prototype_prepare_submit(h->preparer,c->input+c->header_length,c->body_length,h->current->number+1,
@@ -1382,20 +1358,6 @@ static void control_execute(struct control *c)
         if(loop_fd_mod(h->loop,c->fd,EPOLLRDHUP)) {
             steer_prototype_prepare_cancel(h->preparer,(unsigned)(c-h->controls),c->serial);c->waiting_prepare=0;control_error(c,503);
         }
-        return;
-#else
-        if (c->operation == 4 && h->store) {
-            code = durable_apply(c);
-            if (code) control_error(c, code);
-            return;
-        }
-        code = configure(h, c->input + c->header_length, c->body_length, c->expected, c->operation == 3, 1);
-        if (code != 200) { control_error(c, code); return; }
-        if (c->operation == 3) {
-            n = snprintf(status, sizeof(status), "{\"valid\":true,\"persistence\":%s}", h->store ? "true" : "false");
-            control_response(c, 200, status, (size_t)n);
-        } else applied_response(c, 200);
-#endif
     }
 }
 static void control_ready(struct loop *l, int fd, uint32_t events, void *arg)
@@ -1482,11 +1444,10 @@ int steer_prototype_main(int argc, char **argv)
 {
     struct host h = {0}; struct client clients[CLIENTS] = {{0}};
     char *document = NULL, status[8192];
-    struct steer_prototype_config *snapshot = NULL;
+    struct steer_store_document *snapshot = NULL;
     struct steer_pv1_error error;
     FILE *file;
     size_t length = 0;
-    uint64_t revision = 1;
     int result = 1, seed = 0;
     if ((argc != 5 && argc != 7) || strcmp(argv[1], "--config") || strcmp(argv[3], "--control") ||
         (argc == 7 && strcmp(argv[5], "--state-dir"))) return 2;
@@ -1494,14 +1455,13 @@ int steer_prototype_main(int argc, char **argv)
     if (steer_draft_resolver_create(h.loop, 2, 64, NULL, NULL, &h.resolver).code) goto cleanup;
     if (argc == 7) {
         if (steer_prototype_store_open(argv[6], &h.store).code) goto cleanup;
-        error = steer_prototype_store_load(h.store, &snapshot);
+        error = steer_prototype_store_recover_document(h.store, &snapshot);
         if (error.code && error.code != STEER_PV1_UNSUPPORTED) goto cleanup;
         seed = error.code == STEER_PV1_UNSUPPORTED;
     }
     if (snapshot) {
-        revision = snapshot->generation;
-        if (configure(&h, snapshot->document_json, snapshot->document_length, 0, 0, revision) != 200) goto cleanup;
-        steer_prototype_config_destroy(snapshot); snapshot = NULL;
+        if(configure_initial(&h,snapshot->document,snapshot->length,snapshot->generation,snapshot->format)!=200)goto cleanup;
+        steer_store_document_destroy(snapshot);snapshot=NULL;
     } else {
         document = malloc(STEER_PROTOTYPE_CONFIG_MAX_BYTES + 1);
         if (!document) goto cleanup;
@@ -1510,13 +1470,11 @@ int steer_prototype_main(int argc, char **argv)
         length = fread(document, 1, STEER_PROTOTYPE_CONFIG_MAX_BYTES + 1, file);
         if (ferror(file) || length > STEER_PROTOTYPE_CONFIG_MAX_BYTES) { fclose(file); result = 2; goto cleanup; }
         fclose(file);
-        if (configure(&h, document, length, 0, 0, revision) != 200) goto cleanup;
+        if(configure_initial(&h,document,length,1,0)!=200)goto cleanup;
     }
     if (!bind_control(&h, argv[4])) goto cleanup;
     if (h.store && !start_writer(&h)) goto cleanup;
-#ifdef STEER_PROTOTYPE_HY2
     if(steer_prototype_prepare_create(h.loop,prepared_ready,&h,&h.preparer))goto cleanup;
-#endif
     if (seed) {
         struct steer_prototype_store_transaction *transaction = NULL;
         struct steer_prototype_store_result committed;
@@ -1532,6 +1490,6 @@ int steer_prototype_main(int argc, char **argv)
     printf("READY %.*s\n", (int)length, status); fflush(stdout);
     result = loop_run(h.loop);
 cleanup:
-    cleanup_host(&h); free(document); steer_prototype_config_destroy(snapshot);
+    cleanup_host(&h); free(document); steer_store_document_destroy(snapshot);
     return result;
 }

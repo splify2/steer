@@ -21,8 +21,9 @@ IO/cancellation callbacks before releasing services and removing the owned
 socket. Stdout emits one `READY <status-JSON>` line only after all initial
 listeners and the control socket are prepared.
 
-The parser accepts the explicit `prototype: steer-linux-v1` schema and produces
-canonical JSON for reads. Generation/revision is host-issued, starting at 1.
+The parser accepts the explicit `prototype: steer-linux-v1` schema and the
+linked SOCKS v3 profile below, and produces canonical JSON for reads.
+Generation/revision is host-issued, starting at 1.
 Credentials are environment references; values are neither stored in the
 document nor returned by control. Enabled listeners resolve and validate their
 references before publication. Disabled listeners retain configuration without
@@ -80,6 +81,52 @@ backend returns. The host drains route-generation references and continues the
 loop until those jobs finish before joining workers. An arbitrarily stuck NSS
 backend cannot be forcibly cancelled safely, so shutdown may wait for it.
 
+## Managed spec v3: `linked-socks-v1`
+
+This is an experimental subset, accepted by `--config` and by the same
+validate/apply control commands. For example:
+
+```yaml
+version: 3
+plugin_remotes:
+  local:
+    url: https://github.com/splify2/steer-protocols
+    trust: steer-linked-prototype-v1
+plugins:
+  proxy: {remote: local, package: steer-protocols, version: "0.0.0"}
+inbounds:
+  socks-local:
+    plugin: socks:proxy
+    options: {}
+    listen: {address: 127.0.0.1, port: 1080}
+outbounds:
+  internet: {type: direct}
+  deny: {type: block}
+routing:
+  default: deny
+  rules:
+    - {name: local-route, match: {inbound: [socks-local]}, outbound: internet}
+```
+
+The fixed remote, trust, package and `0.0.0` prototype marker select code
+already linked into this build. They do not grant trust, read a remote index,
+install a package, or represent a signed lock. Aliases and object IDs are
+user-defined. The compiler and runtime accept SOCKS5 CONNECT with no
+authentication on numeric loopback only (`127/8`, `::1`); explicit `flow` is
+limited to `[stream]`. Routing supports ordered `route` and `reject`, named
+direct/block outbounds, and an explicit default. Match fields are `inbound`
+and either `domain` or `domain_suffix`, each with one list entry; an empty map
+matches all. Other variants and settings are rejected, even on disabled
+objects. VLESS and Hysteria2 are still available only in the earlier prototype
+format. The general v3 provider executor and signed lock are not wired in.
+
+GET returns the whole accepted v3 intent, not its lowered listener/policy
+representation. The durable envelope records `format: "steer-spec-v3"`;
+recovery syncs the store and recompiles the saved intent with the same
+catalogue and revision. A format mismatch refuses startup without fallback.
+To bootstrap a different configuration, use a fresh private state directory;
+the source file never replaces an existing committed snapshot.
+
 ## Local control protocol
 
 One request per Unix stream connection. Lengths count UTF-8 bytes. Commands are
@@ -101,7 +148,8 @@ revision internally, then prepares/commits atomically on the loop shard.
 
 - `STATUS`: `prototype`, `generation`, `revision`, `runtimeReady`,
   actual `persistence`, `durability_uncertain`, `activeClients`, and active `listeners` with
-  `id`, `protocol`, `address`, `port`.
+  `id`, `protocol`, `address`, `port`. `capabilities.spec_v3_profile` advertises
+  `linked-socks-v1`, not general v3 execution.
 - `GET`: one atomic `{revision,persistence,durability_uncertain,document}` envelope with the
   canonical configuration, including environment references only.
 - `VALIDATE`: `{valid:true,persistence}` on success.
@@ -117,7 +165,8 @@ file is valid; a missing snapshot alone allows source bootstrap. Secret values
 are never persisted, only validated environment references. The source file is
 never overwritten.
 
-Durable apply prepares the policy, routes and listener sockets on the loop;
+One bounded prepare worker parses configuration and compiles policy. Apply
+rechecks revision on the owner loop, then prepares routes and listener sockets;
 a single bounded writer thread writes an exclusive 0600 temporary snapshot,
 fsyncs it, renames it atomically and fsyncs the directory. Disk IO does not block
 packet processing. Prepared listeners are inactive and omitted from runtime

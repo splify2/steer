@@ -3,14 +3,15 @@
 #ifndef STEER_PROTOTYPE_PREPARE_H
 #define STEER_PROTOTYPE_PREPARE_H
 #include "prototype_config.h"
-#include "quic.h"
 struct loop;
 struct steer_prototype_prepare;
 struct steer_prototype_prepared_input {
     struct steer_prototype_config *config;
+#ifdef STEER_PROTOTYPE_HY2
     struct qc_server_tls *tls[STEER_PROTOTYPE_MAX_LISTENERS];
     uint8_t certificate_hash[STEER_PROTOTYPE_MAX_LISTENERS][32];
     uint8_t private_key_hash[STEER_PROTOTYPE_MAX_LISTENERS][32];
+#endif
     uint64_t expected,serial,deadline_ms;
     unsigned control_index;
     int validate,error; /* HTTP-style error;499 means cancelled, never published */

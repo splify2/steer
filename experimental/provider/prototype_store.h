@@ -10,8 +10,6 @@ struct steer_prototype_store_result {
     struct steer_pv1_error error;
     uint32_t phase;
 };
-#define STEER_STORE_FORMAT_PROTOTYPE 1u
-#define STEER_STORE_FORMAT_SPEC_V3 3u
 #define STEER_STORE_DOCUMENT_MAX (1024u*1024u)
 struct steer_store_document {uint64_t generation;uint32_t format;char *document;size_t length;};
 /* Typed framing only, NOT a replacement schema validator. Caller must compile/

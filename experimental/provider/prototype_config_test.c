@@ -44,8 +44,31 @@ static void hysteria2(void) {
     strcpy(second,hy);p=strstr(second,"\"hy\"");assert(p);((char *)p)[2]='z';
     snprintf(changed,sizeof changed,"{\"prototype\":\"steer-linux-v1\",\"listeners\":[%s,%s],\"routing\":{\"default\":\"block\",\"rules\":[]}}",hy,second);bad(changed);
 }
+static void spec_v3(void){
+    static const char document[]=
+        "version: 3\n"
+        "plugin_remotes:\n  local: {url: 'https://github.com/splify2/steer-protocols', trust: steer-linked-prototype-v1}\n"
+        "plugins:\n  first: {remote: local, package: steer-protocols, version: '0.0.0'}\n"
+        "  second: {remote: local, package: steer-protocols, version: '0.0.0'}\n"
+        "inbounds:\n"
+        "  a: {plugin: 'socks:first', listen: {address: '::1', port: 1080}, options: {}}\n"
+        "  b: {plugin: 'socks:second', enabled: false, listen: {address: 127.0.0.2, port: 1080}, options: {}}\n"
+        "outbounds:\n  deny: {type: block}\n"
+        "routing:\n  default: deny\n  rules: [{name: off, enabled: false, match: {domain_suffix: [example.org]}, outbound: deny}]\n";
+    struct steer_prototype_config *c,*round;
+    assert(!steer_prototype_config_parse(document,sizeof(document)-1,9,&c).code);
+    assert(c->format==STEER_STORE_FORMAT_SPEC_V3&&c->listener_count==2);
+    assert(c->listeners[0].enabled&&!c->listeners[1].enabled);
+    assert(!strcmp(c->listeners[0].address,"::1")&&!strcmp(c->listeners[1].address,"127.0.0.2"));
+    assert(strstr(c->document_json,"\"version\":3")&&strstr(c->document_json,"\"version\":\"0.0.0\""));
+    assert(!steer_prototype_config_parse(c->document_json,c->document_length,9,&round).code);
+    assert(!strcmp(round->document_json,c->document_json));
+    steer_prototype_config_destroy(round);steer_prototype_config_destroy(c);
+    puts("managed v3 YAML/JSON, multiple local aliases and disabled entries PASS");
+}
 int main(void){
     hysteria2();
+    spec_v3();
     struct steer_prototype_config*c=NULL,*round=NULL;
     uint8_t ip[4]={
         127,0,0,1

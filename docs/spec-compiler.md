@@ -92,12 +92,13 @@ and `authorized` are separate evidence bits. Existing legacy outbound code or a
 standalone interop fixture does not establish a loaded native provider, a secret
 service, a TUN capture adapter or a generation-ready backend.
 
-The current executable checkpoint provides actual SOCKS/plain-VLESS TCP,
-direct/block policy, bounded stream IO, shared NSS resolution and durable
-generation/listener transactions. It does not yet provide v3 apply, generic
-groups, datagram/device routing, network-profile activation or routed DNS.
-Those are precise runtime blockers, not reasons to narrow the schema to the
-reference or to claim unsupported features were applied.
+The managed Linux prototype can apply the
+[linked SOCKS5 TCP v3 subset](../experimental/provider/prototype_core.md#managed-spec-v3-linked-socks-v1).
+It compiles the intent on a bounded worker and lowers listeners and ordered
+direct/block policy into the existing generation transaction. GET and durable
+recovery retain the v3 intent and revision. The full provider catalogue,
+generic groups, v3 datagram/device routing, network-profile activation and
+routed DNS are still unavailable in the managed v3 path.
 
 Next gates: strict C compiler/reference fixtures → typed dependency tests and
 capability inventory → adapters from ready IR to the existing generation/store
@@ -117,8 +118,9 @@ holds old origin references across failed replacement preparation/partial bind
 and a new blocked generation, and verifies their exact payload after retirement.
 It runs one and four independent owners with sanitizer gates. Its worker joins
 are a fixture synchronization shortcut, not the final host's async apply path.
-The prototype control/apply entry still needs the shared bounded host worker and
-transaction coordinator before this module becomes a deployed v3 executor.
+The managed linked-SOCKS subset uses the prototype's listener transaction. The
+general executor still needs its transaction coordinator before it can replace
+that path.
 Devices remain rejected until durable intent authorizes their fallible effects;
 memory-only publication does not perform kernel or file operations.
 

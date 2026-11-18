@@ -9,10 +9,10 @@ CPPFLAGS += -I$(SDK)/include -I../../src/daemon -I$(PROTOCOLS)/src -I$(PROTOCOLS
 CPPFLAGS += -I../../src/lib -I../../src/third_party/libyaml -DHAVE_CONFIG_H -D_POSIX_C_SOURCE=200809L
 STREAM_SRC = stream.c buffers.c operations.c ../../src/daemon/loop.c
 ROUTE_STREAM_SRC = $(STREAM_SRC) stream_backend.c binding_lease.c flow_metadata.c route_stream.c
-CONFIG_SRC = prototype_config.c ../../src/lib/ynode.c ../../src/lib/err.c ../../src/lib/jsonw.c \
+CONFIG_SRC = prototype_config.c ../spec/spec.c ../../src/lib/ynode.c ../../src/lib/err.c ../../src/lib/jsonw.c \
     ../../src/third_party/libyaml/api.c ../../src/third_party/libyaml/reader.c \
     ../../src/third_party/libyaml/scanner.c ../../src/third_party/libyaml/parser.c
-HOST_SRC = $(ROUTE_STREAM_SRC) native_stream_backend.c $(CONFIG_SRC) loopback_host.c prototype_store.c route_dial.c resolver.c policy.c policy_route.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/vless/inbound.c
+HOST_SRC = $(ROUTE_STREAM_SRC) native_stream_backend.c $(CONFIG_SRC) loopback_host.c prototype_prepare.c prototype_store.c route_dial.c resolver.c policy.c policy_route.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/vless/inbound.c
 LDLIBS += -pthread
 UNIT_NAMES = buffers operations admission host lifecycle stream stream-backend stream-backend-fairness policy route-dial prototype-config resolver route-domain prototype-store inbound-tls
 UNIT_NAMES += route-stream route-stream-release datagram-routes datagram-registry datagram flow-metadata binding-lease vless-stream vless-stream-deadline
@@ -87,6 +87,7 @@ $(BUILD)/steer-prototype-startup-signal: $(HOST_SRC) prototype_main.c prototype_
 # Header changes must invalidate every lab binary, including sibling SDK changes.
 $(UNITS) $(BUILD)/socks-loopback $(BUILD)/vless-loopback $(BUILD)/steer-prototype: $(wildcard *.h $(SDK)/include/steer/draft/*.h)
 $(BUILD)/socks-loopback $(BUILD)/vless-loopback $(BUILD)/steer-prototype: $(PROTOCOLS)/src/socks5/codec.h $(PROTOCOLS)/src/vless/inbound.h ../../src/daemon/loop.h
+$(BUILD)/prototype-config-test $(BUILD)/prototype-store-test $(BUILD)/socks-loopback $(BUILD)/vless-loopback $(BUILD)/steer-prototype $(BUILD)/steer-prototype-startup-signal: ../spec/spec.h
 $(BUILD)/stream-test: ../../src/daemon/loop.h
 
 unit-test: $(UNITS)
@@ -104,7 +105,7 @@ test: unit-test integration-test
 # default/client builds retain their existing dependency and feature surface.
 NGTCP2_LIB ?=
 WOLFSSL_SERVER_LIB ?=
-HY2_SRC = hy2_inbound.c hy2_datagram.c datagram.c datagram_routes.c ../../src/proto/hysteria2/hy2wire.c inbound_tls.c prototype_prepare.c $(PROTOCOLS)/src/hysteria2/server.c \
+HY2_SRC = hy2_inbound.c hy2_datagram.c datagram.c datagram_routes.c ../../src/proto/hysteria2/hy2wire.c inbound_tls.c $(PROTOCOLS)/src/hysteria2/server.c \
     $(PROTOCOLS)/src/hysteria2/auth.c $(PROTOCOLS)/src/hysteria2/inbound.c \
     ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c
 HY2_INC = $(shell find ../../src -type d -printf '-I%p ')
@@ -120,7 +121,7 @@ $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype-hy2-fault: $(HOST_SRC) $(H
 	    $(HOST_SRC) $(HY2_SRC) prototype_main.c "$(NGTCP2_LIB)" "$(WOLFSSL_SERVER_LIB)" \
 	    $(HY2_TEST_EXTRA) $(LDFLAGS) $(LDLIBS) -lm -o $@
 $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype-hy2-fault: $(wildcard $(PROTOCOLS)/src/hysteria2/*.h $(PROTOCOLS)/src/hysteria2/*.inc) \
-    ../../src/proto/quic/quic.h ../../src/proto/quic/qcssl.h \
+    ../../src/proto/quic/quic.h ../../src/proto/quic/qcssl.h ../spec/spec.h \
     $(wildcard $(SDK)/include/steer/draft/*.h) ../../src/daemon/loop.h \
     $(PROTOCOLS)/src/socks5/codec.h $(PROTOCOLS)/src/vless/inbound.h \
     $(if $(NGTCP2_LIB),$(NGTCP2_LIB) $(NGTCP2_LIB).cflags) $(if $(WOLFSSL_SERVER_LIB),$(WOLFSSL_SERVER_LIB) $(WOLFSSL_SERVER_LIB).cflags)
@@ -128,7 +129,7 @@ $(BUILD)/prototype-prepare-test: prototype_prepare_test.c prototype_prepare.c in
     ../../src/daemon/loop.c ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c $(wildcard *.h) | $(BUILD)
 	@test -r "$(NGTCP2_LIB).cflags" -a -r "$(WOLFSSL_SERVER_LIB).cflags"
 	@grep -Eq -- '(^|[[:space:]])-DSTEER_WOLFSSL_POSIX_TIME_SAFE=1([[:space:]]|$$)' "$(WOLFSSL_SERVER_LIB).cflags" || { echo 'rebuild wolfSSL archive with current POSIX time-safe profile' >&2; exit 2; }
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(HY2_INC) -DQC_WITH_ENDPOINT -UNDEBUG \
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(HY2_INC) -DQC_WITH_ENDPOINT -DSTEER_PROTOTYPE_HY2 -UNDEBUG \
 	    $$(cat "$(NGTCP2_LIB).cflags" "$(WOLFSSL_SERVER_LIB).cflags") \
 	    prototype_prepare_test.c prototype_prepare.c inbound_tls.c $(CONFIG_SRC) policy.c \
 	    ../../src/daemon/loop.c ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c \

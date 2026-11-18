@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 #define _GNU_SOURCE
 #include "prototype_prepare.h"
+#ifdef STEER_PROTOTYPE_HY2
 #include "inbound_tls.h"
+#include "quic.h"
 #include "qcssl.h"
+#endif
 #include "loop.h"
 #include <errno.h>
 #include <limits.h>
@@ -24,13 +27,17 @@ static int interrupted(struct job *job) {
 }
 static void dispose(struct job *job) {
     if(!job)return;
+#ifdef STEER_PROTOTYPE_HY2
     for(unsigned i=0;i<STEER_PROTOTYPE_MAX_LISTENERS;i++)qc_server_tls_release(job->result.tls[i]);
+#endif
     steer_prototype_config_destroy(job->result.config);free(job->document);free(job);
 }
 static void prepare(struct job *job) {
     struct steer_prototype_prepared_input *r=&job->result;
     r->error=interrupted(job);if(r->error)return;
-    if(steer_prototype_config_parse(job->document,job->length,job->generation,&r->config).code) { r->error=422;return; }
+    uint32_t code=steer_prototype_config_parse(job->document,job->length,job->generation,&r->config).code;
+    if(code) { r->error=code==STEER_PV1_RESOURCE_EXHAUSTED?503:422;return; }
+#ifdef STEER_PROTOTYPE_HY2
     for(unsigned i=0;i<r->config->listener_count;i++) {
         const struct steer_prototype_listener *spec=&r->config->listeners[i];struct steer_draft_tls_material material;
         char certificate[PATH_MAX],key[PATH_MAX];const char *path;
@@ -52,6 +59,7 @@ static void prepare(struct job *job) {
         steer_draft_tls_material_clear(&material);
         if(error) { r->error=error==QC_ENOMEM?503:422;return; }
     }
+#endif
     r->error=interrupted(job);
 }
 static void notify(struct steer_prototype_prepare *p) { uint64_t value=1;while(write(p->wake,&value,sizeof value)<0&&errno==EINTR){} }

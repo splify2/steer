@@ -945,14 +945,16 @@ LAB_LOOPBACK_SRC := experimental/provider/loopback_host.c experimental/provider/
     experimental/provider/native_stream_backend.c experimental/provider/binding_lease.c experimental/provider/flow_metadata.c \
     experimental/provider/buffers.c experimental/provider/operations.c experimental/provider/route_dial.c experimental/provider/resolver.c \
     experimental/provider/policy.c experimental/provider/policy_route.c src/daemon/loop.c \
-    experimental/provider/prototype_config.c experimental/provider/prototype_store.c $(YAML_SRC) src/lib/err.c src/lib/jsonw.c \
+    experimental/provider/prototype_config.c experimental/provider/prototype_prepare.c experimental/provider/prototype_store.c \
+    experimental/spec/spec.c $(YAML_SRC) src/lib/err.c src/lib/jsonw.c \
     ../steer-protocols/src/socks5/codec.c ../steer-protocols/src/vless/inbound.c
 LAB_LOOPBACK_HDR := experimental/provider/loopback_host.h experimental/provider/stream.h \
     experimental/provider/buffers.h experimental/provider/operations.h experimental/provider/route_dial.h experimental/provider/resolver.h \
-    experimental/provider/policy.h experimental/provider/policy_route.h experimental/provider/prototype_config.h experimental/provider/prototype_store.h src/daemon/loop.h \
+    experimental/provider/policy.h experimental/provider/policy_route.h experimental/provider/prototype_config.h experimental/provider/prototype_prepare.h \
+    experimental/provider/prototype_store.h experimental/spec/spec.h src/daemon/loop.h \
     ../steer-protocols/src/socks5/codec.h ../steer-protocols/src/vless/inbound.h \
     ../plugin-sdk/include/steer/draft/provider_v1.h ../plugin-sdk/include/steer/draft/stream_v1.h
-LAB_LOOPBACK_INC := -I../plugin-sdk/include -Isrc/daemon -Isrc/lib -Isrc/third_party/libyaml -DHAVE_CONFIG_H -D_POSIX_C_SOURCE=200809L -I../steer-protocols/src/socks5 -I../steer-protocols/src/vless
+LAB_LOOPBACK_INC := -I../plugin-sdk/include -Isrc/daemon -Isrc/lib -Isrc/third_party/libyaml -DHAVE_CONFIG_H -D_POSIX_C_SOURCE=200809L -I../steer-protocols/src -I../steer-protocols/src/socks5
 LAB_CFLAGS ?= -O2 -std=c11 -pedantic -Wall -Wextra -Werror
 $(BUILD)/socks-loopback: experimental/provider/socks_loopback.c $(LAB_LOOPBACK_SRC) $(LAB_LOOPBACK_HDR)
 	@mkdir -p $(BUILD)
