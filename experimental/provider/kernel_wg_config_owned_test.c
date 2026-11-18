@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "kernel_wg_ownership.h"
+#include "kernel_wg_v3.h"
 #include "../spec/execution_journal.h"
+#include "../spec/spec.h"
 #include "awgdev.h"
 #include <steer/draft/device_v1.h>
 #include <assert.h>
@@ -65,6 +67,50 @@ static void *owner(void *arg){
     assert(!awg_dev_live_read_owned_until(id.physical_name,id.kind,index,id.group,live,deadline())&&live->peer_n==1&&!memcmp(live->peer[0].pub,c->peer[0].pub,32));
     assert(!steer_draft_wg_identity_retire(&id,ns,deadline(),&cancel,&o));awg_secrets_wipe(&keys);free(live);free(c);close(ns);return NULL;
 }
+static int load_options(const char *path,struct steer_draft_wg_v3_config *config){
+    static const struct steer_spec_capability options={
+        "provider.wireguard:main/inbound/device/device/none/default",
+        STEER_SPEC_BUILT|STEER_SPEC_SUPPORTED,steer_draft_wg_v3_options,NULL
+    };
+    char *source=malloc(STEER_SPEC_MAX_BYTES+1u);
+    FILE *f=fopen(path,"rb");assert(source&&f);
+    size_t n=fread(source,1,STEER_SPEC_MAX_BYTES+1u,f);
+    assert(!ferror(f)&&n<=STEER_SPEC_MAX_BYTES);fclose(f);
+    struct steer_spec_plan *plan=steer_spec_compile(source,n,&options,1);free(source);
+    struct steer_spec_summary summary=steer_spec_summary(plan);
+    assert(plan&&!summary.runtime_ready);
+    int valid=0;
+    for(uint32_t i=0;i<summary.nodes;i++){
+        struct steer_spec_node_view node;assert(steer_spec_node(plan,i,&node));
+        if(node.kind==STEER_SPEC_INBOUND&&!strcmp(node.id,"vpn"))
+            valid=steer_draft_wg_v3_configure(plan,i,config);
+    }
+    steer_spec_destroy(plan);
+    return valid;
+}
+static struct steer_pv1_error fixture_secret(void *unused,struct steer_pv1_span id,uint8_t out[44]){
+    (void)unused;
+    const char *key=NULL;
+    if(id.len==3&&!memcmp(id.data,"psk",3))key=getenv("STEER_WG_TEST_PSK");
+    if(id.len==6&&!memcmp(id.data,"server",6))key=getenv("STEER_WG_TEST_KEY");
+    if(!key||strlen(key)!=44)return (struct steer_pv1_error){STEER_PV1_AUTH_FAILED,0};
+    memcpy(out,key,44);
+    return (struct steer_pv1_error){0,0};
+}
+static int options_fixture(const char *path){
+    struct steer_draft_wg_v3_config config;
+    struct awg_secrets keys;
+    if(!load_options(path,&config))return 2;
+    struct steer_pv1_error e=steer_draft_wg_v3_keys(&config,fixture_secret,NULL,&keys);
+    if(e.code){
+        const unsigned char *p=(const unsigned char *)&keys;
+        for(size_t i=0;i<sizeof(keys);i++)assert(!p[i]);
+        return 3;
+    }
+    assert(keys.has_priv&&config.kernel.peer_n==config.guard.peer_count);
+    awg_secrets_wipe(&keys);
+    return 0;
+}
 static int stage_fixture(const char *mode,const char *directory,const char *path){
     struct steer_spec_journal *journal=NULL;
     struct steer_spec_journal_key key={1,1,1,STEER_SPEC_JOURNAL_INTENT};
@@ -82,17 +128,27 @@ static int stage_fixture(const char *mode,const char *directory,const char *path
         assert(!steer_draft_wg_identity_retire(&id,ns,deadline(),&cancel,&o)&&o.state==STEER_DRAFT_WG_ABSENT);
         puts("RECOVERED");
     }else{
-        struct awg_conf *c=calloc(1,sizeof *c);struct awg_secrets keys;
-        char error[256];assert(c&&path);
-        assert(!awg_conf_load(path,c,&keys,error,sizeof error));
+        struct steer_draft_wg_v3_config config;
+        struct awg_conf *c=&config.kernel;struct awg_secrets keys;
+        struct steer_draft_kernel_wg_guard *guard=NULL;
+        assert(load_options(path,&config));
+        assert(!steer_draft_wg_v3_keys(&config,fixture_secret,NULL,&keys).code);
         assert(!steer_draft_wg_identity_prepare(ns,1,key.instance,"wireguard",deadline(),&cancel,&id));
+        struct steer_policy *policy=NULL;
+        struct steer_policy_rule allow={.id={(const uint8_t *)"client-only",11},
+            .principal={(const uint8_t *)"local-client",12},.action=STEER_POLICY_DIRECT};
+        config.guard.generation=id.generation;
+        strcpy(config.guard.device,id.physical_name);
+        assert(!steer_policy_compile(id.generation,&allow,1,STEER_POLICY_BLOCK,&policy).code);
+        assert(!steer_draft_kernel_wg_guard_prepare(&config.guard,policy,&guard).code);
+        steer_policy_destroy(policy);
         record.key=key;record.generation=1;record.operation=1;record.phase=1;
         strcpy(record.provider,"wireguard-fixture");strcpy(record.provider_version,"1");
         record.length=STEER_DRAFT_WG_RECORD_BYTES;
         assert(!steer_draft_wg_identity_encode(&id,record.data));
         struct steer_spec_journal_result stored=steer_spec_journal_append(journal,&record);
         assert(!stored.error.code&&stored.durability==STEER_SPEC_JOURNAL_SYNCED);
-        assert(!steer_draft_wg_identity_create(&id,ns,1420,deadline(),&cancel,&o));
+        assert(!steer_draft_wg_identity_create(&id,ns,c->mtu,deadline(),&cancel,&o));
         int index=o.index;
         uint32_t wrong=id.group==1?2:1;
         assert(awg_dev_address_add_owned_until(id.physical_name,id.kind,index,wrong,&c->addr[0],deadline())==ESTALE);
@@ -106,7 +162,7 @@ static int stage_fixture(const char *mode,const char *directory,const char *path
         if(!strcmp(mode,"--rollback"))
             assert(!awg_dev_address_add_owned_until(id.physical_name,id.kind,index,id.group,&c->addr[0],deadline()));
         int rc=steer_draft_wg_identity_stage(&id,ns,index,c,&keys,0,deadline(),&cancel,&o);
-        awg_secrets_wipe(&keys);awg_conf_free(c);free(c);
+        awg_secrets_wipe(&keys);
         assert(!awg_dev_link_require_down_owned_until(id.physical_name,id.kind,index,id.group,deadline()));
         if(!strcmp(mode,"--rollback")){
             assert(rc==EEXIST&&o.effect==STEER_PV1_DEVICE_EFFECT_UNCERTAIN);
@@ -114,22 +170,30 @@ static int stage_fixture(const char *mode,const char *directory,const char *path
             printf("ROLLED_BACK %s\n",id.physical_name);
         }else{
             assert(!rc&&o.effect==STEER_PV1_DEVICE_CHANGED);
-            printf("DOWN %s\n",id.physical_name);fflush(stdout);
-            assert(getchar()=='\n'); /* The isolated fixture installs its guard first. */
+            assert(!steer_draft_kernel_wg_guard_bind(guard,id.physical_name,index).code);
+            printf("DOWN %s %s\n",id.physical_name,steer_draft_kernel_wg_guard_table(guard));fflush(stdout);
+            assert(getchar()=='\n');
             assert(!awg_dev_link_up_owned_until(id.physical_name,id.kind,index,id.group,deadline()));
             assert(awg_dev_link_require_down_owned_until(id.physical_name,id.kind,index,id.group,deadline())==EBUSY);
             assert(awg_dev_link_up_owned_until(id.physical_name,id.kind,index,id.group,deadline())==EBUSY);
             puts("UP");fflush(stdout);
             assert(getchar()=='\n');
+            struct steer_draft_kernel_wg_guard_result applied=steer_draft_kernel_wg_guard_publish(guard);
+            assert(!applied.error.code&&applied.phase==STEER_DRAFT_WG_GUARD_CHANGED);
+            puts("ALLOWED");fflush(stdout);
+            assert(getchar()=='\n');
             assert(!steer_draft_wg_identity_retire(&id,ns,deadline(),&cancel,&o)&&o.state==STEER_DRAFT_WG_ABSENT);
+            assert(!steer_draft_kernel_wg_guard_retire(guard).code);
             puts("RETIRED");
         }
+        assert(!steer_draft_kernel_wg_guard_destroy(guard).code);
     }
     assert(!steer_spec_journal_close(journal).code);
     close(ns);
     return 0;
 }
 int main(int argc,char **argv){
+    if(argc==3&&!strcmp(argv[1],"--options"))return options_fixture(argv[2]);
     wire();if(argc==2&&!strcmp(argv[1],"--wire")){puts("WG parsed config exact-index wire PASS");return 0;}
     struct stat current,initial;assert(!stat("/proc/thread-self/ns/net",&current)&&!stat("/proc/1/ns/net",&initial));
     if(!getenv("STEER_TEST_OWNED_NETNS")||(current.st_dev==initial.st_dev&&current.st_ino==initial.st_ino)){fputs("isolated namespace required\n",stderr);return 2;}

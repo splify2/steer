@@ -158,10 +158,11 @@ flows при reload, диапазоны проверяются на коллиз
 становятся незаметной утечкой напрямую.
 
 Packet device ingress (WG/TUN) — отдельный вариант inbound без обязательного
-`listen: address/port`; текущий minimal draft пока его не выражает. Следующий
-schema step вводит tagged stream/datagram/device descriptors, а не фиктивный
-port для WireGuard. WG peer allowed IPs и конфликт ownership проверяются до
-активации; plugin пишет desired peer state, broker применяет netlink diff.
+`listen: address/port`. SDK draft и C-компилятор уже выражают plugin device ingress
+через `flow: [device]` и `device: {name: …}` без фиктивного порта. Это проверка
+формата, не managed Apply. WG peer allowed IPs и конфликт ownership должны
+проверяться до активации; plugin пишет desired peer state, broker применяет
+netlink diff.
 
 ## 5. Пользователи, подписки и durable state
 

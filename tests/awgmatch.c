@@ -194,12 +194,12 @@ int main(void) {
 
     /* ---- 2. ключи base64 --------------------------------------------------------------- */
     uint8_t k[32];
-    check("ключ: 44 знака — годен", 0, key_from_b64(k, PRIV));
-    check("ключ: 43 знака — отказ", -1, key_from_b64(k, "YAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk"));
-    check("ключ: без '=' в конце — отказ", -1, key_from_b64(k, "YAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmkA"));
-    check("ключ: чужой знак — отказ", -1, key_from_b64(k, "YAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3f-mk="));
+    check("ключ: 44 знака — годен", 0, awg_key_from_b64(k, PRIV));
+    check("ключ: 43 знака — отказ", -1, awg_key_from_b64(k, "YAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk"));
+    check("ключ: без '=' в конце — отказ", -1, awg_key_from_b64(k, "YAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmkA"));
+    check("ключ: чужой знак — отказ", -1, awg_key_from_b64(k, "YAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3f-mk="));
     check("ключ: лишние биты в последнем знаке — отказ", -1,
-          key_from_b64(k, "YAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmn="));
+          awg_key_from_b64(k, "YAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmn="));
 
     /* ---- 3. ошибки, и в тексте ошибки нет значений ------------------------------------ */
 #define IFACE "[Interface]\nPrivateKey = " PRIV "\n"
@@ -318,7 +318,7 @@ int main(void) {
             check("пир: REPLACE_ALLOWEDIPS", AWG_PEER_F_REPLACE_ALLOWEDIPS, (long)u32of(a));
             a = find(pd, pl, AP_PRESHARED_KEY);
             uint8_t psk[32];
-            key_from_b64(psk, PSK);
+            awg_key_from_b64(psk, PSK);
             check("пир: PRESHARED_KEY", 1, a && NLA_PLEN(a) == 32 && !memcmp(NLA_DATA(a), psk, 32));
             a = find(pd, pl, AP_ENDPOINT);
             struct sockaddr_in ep;

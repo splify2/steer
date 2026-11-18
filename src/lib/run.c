@@ -58,12 +58,14 @@ static int run_spawn(const char *const argv[],int fd,pid_t *child){if(!argv||!ar
 static int run_child_state(pid_t child,int *exited){
     siginfo_t status;memset(&status,0,sizeof status);
     if(waitid(P_PID,(id_t)child,&status,WEXITED|WNOHANG|WNOWAIT)<0)return errno==EINTR?0:-1;
-    if(status.si_pid==child)*exited=1;return 0;
+    if(status.si_pid==child)*exited=1;
+    return 0;
 }
 static int run_poll_ms(uint64_t deadline,int fallback){
     uint64_t now=run_now_ns();if(!now||now>=deadline)return 0;
     uint64_t ms=(deadline-now)/1000000ULL+((deadline-now)%1000000ULL!=0);
-    if(fallback&&ms>20)ms=20;return ms>INT_MAX?INT_MAX:(int)ms;
+    if(fallback&&ms>20)ms=20;
+    return ms>INT_MAX?INT_MAX:(int)ms;
 }
 static int run_forward(int fd,const unsigned char *p,size_t n,uint64_t deadline){
     while(n){if(run_expired(deadline))return -1;ssize_t wrote=write(fd,p,n);if(wrote<0){if(errno==EINTR)continue;return -1;}if(!wrote){errno=EIO;return -1;}p+=(size_t)wrote;n-=(size_t)wrote;}return 0;

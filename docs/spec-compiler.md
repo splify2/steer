@@ -100,14 +100,18 @@ recovery retain the v3 intent and revision. The full provider catalogue,
 generic groups, generic datagram/device providers, network-profile activation and
 routed DNS are still unavailable in the managed v3 path.
 
-The generic compiler now represents plugin device inbounds with
+The generic compiler and the SDK minimum draft schema represent plugin device inbounds with
 `flow: [device]` and `device: {name: …}` instead of a socket `listen`.
-Mixed socket and device flows are rejected. The device name is logical;
+`make test-schema` checks agreement on both inbound forms and rejects mixed
+socket and device flows. The device name is logical;
 the host must mint and persist a separate physical ownership identity.
 The inventory tuple for `wireguard:alias` is
 `provider.wireguard:alias/inbound/device/device/none/default`. A valid
 device plan is still unavailable for managed Apply until a deployed host
 binds that tuple and coordinates the device and its admission guard.
+The [isolated WireGuard fixture](../experimental/provider/kernel_wg.md#typed-spec-v3-staging)
+uses the typed options lowerer with journaled link staging and nft admission;
+its guard table is not recovered by the journal.
 
 Next gates: strict C compiler/reference fixtures → typed dependency tests and
 capability inventory → adapters from ready IR to the existing generation/store

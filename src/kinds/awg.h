@@ -131,6 +131,9 @@ struct awg_secrets {
     uint8_t psk[AWG_MAX_PEERS][AWG_KEY_LEN];
 };
 
+int awg_key_from_b64(uint8_t out[AWG_KEY_LEN], const char *s);
+int awg_prefix_parse(const char *s, struct awg_prefix *p);
+
 /* Разобрать текст файла. 0 — годен; -1 — нет, в err причина с номером строки. В причине НЕТ
  * значений — только имя параметра: значение может быть ключом, а текст ошибки уходит в
  * журнал и на экран. conf и secrets заполняются с нуля; после любого исхода conf надо

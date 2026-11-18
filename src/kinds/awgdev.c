@@ -117,7 +117,7 @@ static int b64v(int ch) {
     return -1;
 }
 
-static int key_from_b64(uint8_t out[AWG_KEY_LEN], const char *s) {
+int awg_key_from_b64(uint8_t out[AWG_KEY_LEN], const char *s) {
     if (strlen(s) != 44 || s[43] != '=') return -1;
     uint32_t acc = 0;
     size_t o = 0;
@@ -180,7 +180,7 @@ static int parse_bool(const char *s, int *out) {
 }
 
 /* «адрес[/префикс]». Без префикса — один хозяин (/32 или /128), как у wg-quick. */
-static int parse_prefix(const char *s, struct awg_prefix *p) {
+int awg_prefix_parse(const char *s, struct awg_prefix *p) {
     char buf[64];
     if (strlen(s) >= sizeof buf) return -1;
     snprintf(buf, sizeof buf, "%s", s);
@@ -285,7 +285,7 @@ int awg_conf_parse(const char *text, size_t n, struct awg_conf *c, struct awg_se
 
         if (sec == SEC_IF) {
             if (!strcasecmp(key, "PrivateKey")) {
-                if (key_from_b64(s->priv, val) != 0)
+                if (awg_key_from_b64(s->priv, val) != 0)
                     PERR("строка %d: PrivateKey — не ключ WireGuard (44 знака base64)", line_no);
                 s->has_priv = 1;
             } else if (!strcasecmp(key, "Address")) {
@@ -294,7 +294,7 @@ int awg_conf_parse(const char *text, size_t n, struct awg_conf *c, struct awg_se
                     t = awg_dev_trim(t);
                     if (!*t) continue;
                     if (c->addr_n >= AWG_MAX_ADDRS) PERR("строка %d: адресов больше %d", line_no, AWG_MAX_ADDRS);
-                    if (parse_prefix(t, &c->addr[c->addr_n]) != 0)
+                    if (awg_prefix_parse(t, &c->addr[c->addr_n]) != 0)
                         PERR("строка %d: Address — не адрес или адрес/префикс", line_no);
                     c->addr_n++;
                 }
@@ -335,7 +335,7 @@ int awg_conf_parse(const char *text, size_t n, struct awg_conf *c, struct awg_se
                 c->istr[k] = strdup(val);
                 if (!c->istr[k]) PERR("нет памяти");
             } else if (!strcasecmp(key, "HeaderProtectionKey")) {
-                if (key_from_b64(s->hpk, val) != 0)
+                if (awg_key_from_b64(s->hpk, val) != 0)
                     PERR("строка %d: HeaderProtectionKey — не ключ (44 знака base64)", line_no);
                 c->has_hpk = 1;
             } else {
@@ -363,12 +363,12 @@ int awg_conf_parse(const char *text, size_t n, struct awg_conf *c, struct awg_se
         } else {
             size_t pi = (size_t)(pe - c->peer);
             if (!strcasecmp(key, "PublicKey")) {
-                if (key_from_b64(pe->pub, val) != 0)
+                if (awg_key_from_b64(pe->pub, val) != 0)
                     PERR("строка %d: PublicKey — не ключ WireGuard (44 знака base64)", line_no);
                 /* Ключ пира — не секрет и лежит в conf. Отдельного признака «задан» нет:
                  * нулевой ключ WireGuard недопустим, по нему и проверяется в конце разбора. */
             } else if (!strcasecmp(key, "PresharedKey")) {
-                if (key_from_b64(s->psk[pi], val) != 0)
+                if (awg_key_from_b64(s->psk[pi], val) != 0)
                     PERR("строка %d: PresharedKey — не ключ (44 знака base64)", line_no);
                 pe->has_psk = 1;
             } else if (!strcasecmp(key, "Endpoint")) {
@@ -382,7 +382,7 @@ int awg_conf_parse(const char *text, size_t n, struct awg_conf *c, struct awg_se
                     if (!*t) continue;
                     if (c->aips_n >= AWG_MAX_AIPS)
                         PERR("строка %d: AllowedIPs больше %d на файл", line_no, AWG_MAX_AIPS);
-                    if (parse_prefix(t, &c->aips[c->aips_n]) != 0)
+                    if (awg_prefix_parse(t, &c->aips[c->aips_n]) != 0)
                         PERR("строка %d: AllowedIPs — адрес или адрес/префикс", line_no);
                     c->aips_n++;
                     pe->aip_n++;

@@ -158,11 +158,26 @@ unshare -n -- env STEER_TEST_OWNED_NETNS=1 \
   python3 experimental/provider/kernel_wg_owned_stage_test.py /tmp/wg-owned/config
 ```
 
-The fixture syncs the exact link record with the common journal before create.
-In paired disposable namespaces it verifies stage while DOWN, handshake with
-DROP, ICMP and exact UDP echo after allow, a real address conflict that leaves the
-old peer working, and precise cleanup/reprovisioning after SIGKILL. It uses its
-own independently installed nft rules and reinitializes the test peer session
-after reconnection. It is not a managed config transaction. The host still needs
-to bind typed WG options, durable nft guard ownership, and the common authority
-and commit/recovery ordering before advertising or accepting this provider.
+Typed spec v3 staging
+---------------------
+
+`kernel_wg_v3` validates the default WireGuard device tuple and lowers provider
+options to parsed kernel configuration plus the guard's principal-to-AllowedIPs
+mapping. Both use the same validated CIDRs. A host resolver receives typed
+declaration IDs only; key material is kept apart from config and guard state,
+and failed resolution wipes partially decoded keys. No logical device name is
+used for a kernel mutation.
+
+```sh
+python3 experimental/provider/kernel_wg_owned_stage_test.py --validate /tmp/wg-owned/config
+```
+
+The namespace fixture now starts from v3 intent, syncs the exact owned link
+record before create, stages keys/PSK and addresses while DOWN, then binds the nft
+DROP guard before UP. An independent peer handshakes while inner traffic is
+blocked, then exercises ICMP and exact UDP echo after guard publication. The
+fixture also checks address conflict rollback, live traffic on the previous
+link, and exact cleanup/reprovisioning after SIGKILL. After SIGKILL the fixture
+removes its own nft table externally: the journal recovers only the owned link.
+Production Apply still needs durable nft guard identity, authority wiring and
+coordinated commit/recovery. The provider is not advertised by the managed host.
