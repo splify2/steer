@@ -139,6 +139,26 @@ Only a current-operation fact proving RETIRED releases unused credits. Whole
 restart validation rejects missing/cross-provider anchors, duplicate grants and
 stale historical reconciliation. Exhaustion refuses new effects while preserving
 ownership; safe history compaction remains pending. Normal `make test` includes
-the reservation regressions. The mandatory device authority interface matches
-one exact transaction and intent sequence; its production cache/coordinator is
-still unavailable, so this ledger does not yet enable a kernel device factory.
+the reservation regressions. The experimental device authority service matches
+one exact transaction, instance and intent sequence. After an uncertain journal
+write, successful storage recovery closes claims only for exact intents with a
+validated durable outcome or reconciliation record. It preserves issued permits
+until release and never re-enables blocked claims. A missing fact still requires
+explicit reconciliation, and a durable UNKNOWN fact does not prove that the
+device was retired. The host apply coordinator and managed kernel device factory
+are not wired into the prototype yet.
+
+The startup worker can now take a bounded snapshot of all non-retired anchors,
+including unused anchors and ones whose last result was ACTIVE. The inventory
+contains the exact keys of the current intent and its latest fact (if present),
+the last sequence including grants, and remaining cleanup credits. Once the host
+excludes live operations, it can spend the pending intent's reserved outcome slot
+to record a lost result as UNCERTAIN. This persists the original recovery payload
+and does not start device work. The configuration store also has a recovery read:
+it returns the visible typed envelope, or confirms its absence, only after a
+successful directory sync. `execution_startup` combines these reads for a worker
+that holds both stores. It requires the host's v3 verifier and compares generation
+and plan identity for the anchor and current intent separately. A later retire
+intent may belong to a different generation than the anchored resource. The
+production host still needs to supply its catalogue/lock verifier and reconcile
+device ownership before making any publication or cleanup decision.

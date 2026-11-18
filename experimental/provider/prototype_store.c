@@ -221,6 +221,23 @@ struct steer_pv1_error steer_prototype_store_load_document(struct steer_prototyp
 }
 
 void steer_store_document_destroy(struct steer_store_document *document){if(document){free(document->document);free(document);}}
+struct steer_pv1_error steer_prototype_store_recover_document(struct steer_prototype_store *s,struct steer_store_document **out){
+    if(out)*out=NULL;
+    if(!s||!out)return error(STEER_PV1_INVALID);
+    if(s->transaction)return error(STEER_PV1_POLICY_DENIED);
+    struct stat st;
+    if(fstat(s->directory,&st))return error(STEER_PV1_IO);
+    if(st.st_uid!=geteuid()||(st.st_mode&0077))return error(STEER_PV1_INVALID);
+    struct steer_store_document *snapshot=NULL;
+    struct steer_pv1_error result=steer_prototype_store_load_document(s,&snapshot);
+    if(result.code&&result.code!=STEER_PV1_UNSUPPORTED)return result;
+    if(fsync(s->directory)){
+        steer_store_document_destroy(snapshot);
+        return error(STEER_PV1_IO);
+    }
+    *out=snapshot;
+    return result;
+}
 struct steer_pv1_error steer_prototype_store_load(struct steer_prototype_store *s,struct steer_prototype_config **out){
     if(out)*out=NULL;
     if(!out)return error(STEER_PV1_INVALID);

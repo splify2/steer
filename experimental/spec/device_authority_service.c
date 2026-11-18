@@ -38,7 +38,19 @@ static void ready(struct loop *l,int fd,uint32_t events,void *arg){
  if(s->stopped&&!s->live_scopes&&!s->live_claims&&!s->jobs&&!s->pending&&!s->notified&&s->drained){s->notified=1;s->dispatching=1;s->drained(s->drained_user);s->dispatching=0;}
 }
 static void clear_claim(struct claim *c){struct steer_spec_authority_service *s=c->scope->service;c->scope->claims--;s->live_claims--;memset(c,0,sizeof(*c));notify(s);}
+static void finish_claim(struct claim *c){c->state=TERMINAL;if(!c->permit)clear_claim(c);}
 static void release_permit(void *arg){struct claim *c=arg;if(!c||!c->permit)return;c->permit=0;if(c->state==TERMINAL)clear_claim(c);else c->state=CONSUMED;}
+static void update_fence(struct steer_spec_authority_service *s){
+ s->fenced=s->host_fenced||s->storage_fenced;
+ if(s->fenced)for(uint32_t i=0;i<s->limits.claims;i++)if(s->claims[i].state==READY)s->claims[i].state=BLOCKED;
+}
+static int claim_for_fact(const struct claim *c,const struct steer_spec_authority_scope *scope,const struct steer_spec_journal_record *fact){
+ const struct steer_spec_journal_key *key=&c->record.key;
+ return c->scope==scope&&c->state!=EMPTY&&key->transaction==fact->key.transaction&&
+  key->instance==fact->key.instance&&key->sequence==fact->intent_sequence&&
+  c->record.operation==fact->operation&&!strcmp(c->record.provider,fact->provider)&&
+  !strcmp(c->record.provider_version,fact->provider_version);
+}
 static int span_equal(struct steer_pv1_span a,const void *data,size_t size){return a.len==size&&(!size||(a.data&&!memcmp(a.data,data,size)));}
 static struct steer_pv1_error acquire(void *arg,const struct steer_draft_device_authorization *r,struct steer_draft_device_permit *out){
  if(out)*out=(struct steer_draft_device_permit){0};
@@ -60,7 +72,7 @@ static struct steer_pv1_error pin_retain(void *arg){struct pin *p=arg;struct ste
 static void pin_release(void *arg){struct pin *p=arg;struct steer_spec_authority_service *s=p->scope->service;p->scope->jobs--;s->jobs--;notify(s);pin_drop(p);}
 struct steer_pv1_error steer_spec_authority_service_create(struct loop *loop,struct steer_draft_host_worker *worker,struct steer_spec_ledger **ledger,const struct steer_spec_authority_limits *limits,struct steer_spec_authority_service **out){
  if(out)*out=NULL;
- if(!loop||!worker||!ledger||!*ledger||!limits||!out||steer_draft_host_worker_owner(worker)!=loop||!limits->generations||limits->generations>16||!limits->claims||limits->claims>128||!limits->jobs||limits->jobs>64)return error(STEER_PV1_INVALID);
+ if(!loop||!worker||!ledger||!*ledger||!limits||!out||steer_draft_host_worker_owner(worker)!=loop||!limits->generations||limits->generations>16||!limits->claims||limits->claims>STEER_SPEC_LEDGER_RECOVERY_CHECKS_MAX||!limits->jobs||limits->jobs>64)return error(STEER_PV1_INVALID);
  struct steer_draft_host_worker_limits worker_limits;steer_draft_host_worker_limits(worker,&worker_limits);
  if(worker_limits.max_input<sizeof(struct steer_spec_journal_record)||worker_limits.max_bytes<sizeof(struct steer_spec_journal_record))return error(STEER_PV1_UNSUPPORTED);
  struct steer_spec_authority_service *s=calloc(1,sizeof(*s));if(!s)return error(STEER_PV1_RESOURCE_EXHAUSTED);
@@ -100,7 +112,7 @@ static void recorded(void *arg,struct steer_draft_host_work_result result){
  int cancelled=steer_draft_host_job_cancelled(request->job);
  if(result.worker_flags)s->host_fenced=1;
  if(request->result.error.code==STEER_PV1_IO||request->result.durability==STEER_SPEC_JOURNAL_RENAMED)s->storage_fenced=1;
- s->fenced=s->host_fenced||s->storage_fenced;
+ update_fence(s);
  if(request->claim){
   if(!request->result.error.code&&request->result.durability==STEER_SPEC_JOURNAL_SYNCED){request->claim->state=!cancelled&&now()<request->deadline&&!s->fenced&&!s->stopped&&!(scope->retired&&request->record.operation==1)?READY:BLOCKED;}
   else if(request->result.durability==STEER_SPEC_JOURNAL_NOT_RENAMED)clear_claim(request->claim);
@@ -108,8 +120,7 @@ static void recorded(void *arg,struct steer_draft_host_work_result result){
  }
  if(!request->result.error.code&&(request->record.key.kind==STEER_SPEC_JOURNAL_OUTCOME||request->record.key.kind==STEER_SPEC_JOURNAL_RECONCILE)){
   for(uint32_t i=0;i<s->limits.claims;i++){
-   struct claim *c=&s->claims[i];if(c->scope!=scope||c->state==EMPTY||c->record.key.transaction!=request->record.key.transaction||c->record.key.instance!=request->record.key.instance||c->record.key.sequence!=request->record.intent_sequence)continue;
-   c->state=TERMINAL;if(!c->permit)clear_claim(c);
+   struct claim *c=&s->claims[i];if(claim_for_fact(c,scope,&request->record))finish_claim(c);
   }
  }
  request->done(request->user,request->result,&request->record,cancelled);
@@ -132,7 +143,14 @@ struct steer_pv1_error steer_spec_authority_record(struct steer_spec_authority_s
  if(claim){claim->scope=scope;claim->record=*record;claim->deadline=deadline;claim->state=WAITING;s->live_claims++;scope->claims++;}
  s->pending=1;struct steer_draft_host_work_guard guard={pin,pin_retain,pin_release};
  struct steer_pv1_error result=steer_draft_host_worker_submit(s->worker,record,sizeof(*record),deadline,record_work,request,&guard,recorded,request,out);
- if(result.code){s->pending=0;if(claim)clear_claim(claim);free(request);}else request->job=*out;
+ if(result.code){s->pending=0;if(claim)clear_claim(claim);free(request);}
+ else{
+  request->job=*out;
+  /* Reporting a fact relinquishes an unspent permit before the worker's reply. */
+  if(fact)for(uint32_t i=0;i<s->limits.claims;i++){
+   struct claim *c=&s->claims[i];if(c->state==READY&&claim_for_fact(c,scope,record))c->state=BLOCKED;
+  }
+ }
  pin_drop(pin);return result;
 }
 void steer_spec_authority_service_stop(struct steer_spec_authority_service *s){if(s&&!s->detached){s->stopped=1;notify(s);}}
@@ -157,10 +175,12 @@ struct recovery_request {
  struct steer_spec_authority_scope *scope;struct steer_draft_host_job *job;uint64_t deadline;
  struct steer_spec_ledger_summary summary;struct steer_pv1_error result;
  steer_spec_authority_recovered done;void *user;
+ uint32_t check_count;
+ struct steer_spec_ledger_recovery_check checks[];
 };
 static struct steer_draft_host_work_result recover_work(void *arg,const void *input,size_t size,uint64_t deadline,const struct steer_draft_cancel *cancel){
  struct recovery_request *r=arg;(void)input;(void)size;(void)deadline;(void)cancel;
- r->result=steer_spec_ledger_recover_journal(r->scope->service->ledger,&r->summary);
+ r->result=steer_spec_ledger_recover_journal(r->scope->service->ledger,&r->summary,r->checks,r->check_count);
  return (struct steer_draft_host_work_result){r->result,r,0};
 }
 static void recovered(void *arg,struct steer_draft_host_work_result result){
@@ -169,8 +189,12 @@ static void recovered(void *arg,struct steer_draft_host_work_result result){
  if(!result.value)r->result=result.error;
  if(result.worker_flags)s->host_fenced=1;
  if(result.value&&r->result.code)s->storage_fenced=1;
- else if(result.value&&!r->result.code&&!cancelled&&!result.worker_flags)s->storage_fenced=0;
- s->fenced=s->storage_fenced||s->host_fenced;
+ else if(result.value&&!r->result.code&&!cancelled&&!result.worker_flags){
+  s->storage_fenced=0;
+  /* No record job can allocate or recycle claim slots while recovery is pending. */
+  for(uint32_t i=0;i<r->check_count;i++)if(r->checks[i].has_fact&&s->claims[i].state!=EMPTY)finish_claim(&s->claims[i]);
+ }
+ update_fence(s);
  r->done(r->user,r->result,&r->summary,cancelled);free(r);
 }
 struct steer_pv1_error steer_spec_authority_recover_journal(struct steer_spec_authority_scope *scope,uint64_t deadline,steer_spec_authority_recovered done,void *user,struct steer_draft_host_job **out){
@@ -178,7 +202,9 @@ struct steer_pv1_error steer_spec_authority_recover_journal(struct steer_spec_au
  if(!scope||!scope->live||!done||!out)return error(STEER_PV1_INVALID);
  struct steer_spec_authority_service *s=scope->service;
  if(s->detached||s->foreign_depth||s->pending||s->jobs==s->limits.jobs)return error(STEER_PV1_POLICY_DENIED);
- struct recovery_request *r=calloc(1,sizeof(*r));struct pin *pin=calloc(1,sizeof(*pin));if(!r||!pin){free(r);free(pin);return error(STEER_PV1_RESOURCE_EXHAUSTED);}
+ struct recovery_request *r=calloc(1,sizeof(*r)+s->limits.claims*sizeof(*r->checks));struct pin *pin=calloc(1,sizeof(*pin));if(!r||!pin){free(r);free(pin);return error(STEER_PV1_RESOURCE_EXHAUSTED);}
+ r->check_count=s->limits.claims;
+ for(uint32_t i=0;i<r->check_count;i++)if(s->claims[i].state!=EMPTY)r->checks[i].intent=s->claims[i].record.key;
  r->scope=scope;r->done=done;r->user=user;r->deadline=deadline;pin->scope=scope;pin->refs=1;s->pending=1;
  struct steer_draft_host_work_guard guard={pin,pin_retain,pin_release};struct steer_pv1_error result=steer_draft_host_worker_submit(s->worker,"R",1,deadline,recover_work,r,&guard,recovered,r,out);
  if(result.code){s->pending=0;free(r);}else r->job=*out;

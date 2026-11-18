@@ -22,6 +22,11 @@ struct steer_store_document {uint64_t generation;uint32_t format;char *document;
 struct steer_pv1_error steer_prototype_store_prepare_document(struct steer_prototype_store *,
  const struct steer_store_document *,struct steer_prototype_store_transaction **);
 struct steer_pv1_error steer_prototype_store_load_document(struct steer_prototype_store *,struct steer_store_document **);
+/* Startup/recovery worker. With no live transaction, read and check the visible
+ * envelope then sync the directory before returning it. Missing stays
+ * UNSUPPORTED only after sync; failures return no snapshot. No fallback, temp
+ * adoption, rewrite or schema validation. A prior commit receipt is immutable. */
+struct steer_pv1_error steer_prototype_store_recover_document(struct steer_prototype_store *,struct steer_store_document **);
 void steer_store_document_destroy(struct steer_store_document *);
 /* Linux, one serialized owner, no reentry or concurrent calls. Ownership may
  * transfer to another thread only through external synchronization establishing

@@ -45,7 +45,7 @@ static struct steer_spec_authority_status status(struct fixture *f){struct steer
 static void denied(struct fixture *f){const struct steer_draft_device_authority *a=steer_spec_authority_scope_api(f->scope);struct steer_draft_device_permit p;assert(a->acquire(a->context,&f->authorization,&p).code&&!p.context);}
 static void recorded(void *arg,struct steer_spec_journal_result result,const struct steer_spec_journal_record *r,int cancelled){
  struct fixture *f=arg;assert(!cancelled&&r->key.sequence==f->record.key.sequence&&++f->called==1);
- if(f->phase==1&&f->mode==2)assert(result.error.code==STEER_PV1_IO&&result.durability==STEER_SPEC_JOURNAL_RENAMED);
+ if((f->phase==1&&f->mode==2)||f->phase==40)assert(result.error.code==STEER_PV1_IO&&result.durability==STEER_SPEC_JOURNAL_RENAMED);
  else assert(!result.error.code&&result.durability==STEER_SPEC_JOURNAL_SYNCED);
  assert(steer_spec_authority_scope_release(f->scope).code==STEER_PV1_POLICY_DENIED);wake(f);
 }
@@ -54,6 +54,7 @@ static void job_release(struct fixture *f){assert(!steer_draft_host_job_release(
 static void recovery_done(void *arg,struct steer_pv1_error e,const struct steer_spec_ledger_summary *s,int cancelled){
  struct fixture *f=arg;assert(++f->recovered==1);
  if(f->phase==2)assert(e.code==STEER_PV1_IO&&!cancelled);
+ else if(f->phase==41||f->phase==42){assert(!e.code&&s->records==3&&s->retired==1&&!s->pending_intents);assert(cancelled==(f->phase==41));}
  else{assert(!e.code&&s->pending_intents==1&&s->recovery_required==1);assert(cancelled==(f->phase==20||f->phase==21));}
  wake(f);
 }
@@ -65,7 +66,7 @@ static struct steer_draft_host_work_result destroy(void *arg,const void *input,s
 static void destroyed(void *arg,struct steer_draft_host_work_result r){struct fixture *f=arg;assert(!r.error.code&&!r.value);f->destroyed=1;wake(f);}
 static void step(struct loop *l,struct loop_timer *timer,void *arg){
  struct fixture *f=arg;(void)timer;
- if(f->phase==0){if(!f->called)return;job_release(f);f->record.key.kind=STEER_SPEC_JOURNAL_INTENT;f->record.key.sequence=2;f->record.operation=1;f->record.phase=1;f->record.anchor_transaction=1;f->record.anchor_sequence=1;f->record.credits=f->record.cleanup_floor=0;f->record.grant_id=0;if(f->mode==1)inject_flags=1;else atomic_store(&fail_sync,1);submit(f);f->phase=1;return;}
+ if(f->phase==0){if(!f->called)return;job_release(f);f->record.key.kind=STEER_SPEC_JOURNAL_INTENT;f->record.key.sequence=2;f->record.operation=1;f->record.phase=1;f->record.anchor_transaction=1;f->record.anchor_sequence=1;f->record.credits=f->record.cleanup_floor=0;f->record.grant_id=0;if(f->mode==1)inject_flags=1;else if(f->mode==2)atomic_store(&fail_sync,1);submit(f);f->phase=f->mode<=2?1:39;return;}
  if(f->phase==1){if(!f->called)return;job_release(f);denied(f);struct steer_spec_authority_status s=status(f);assert(s.blocked_intents==1&&s.live_claims==1);if(f->mode==1){assert(s.host_fenced&&!s.storage_fenced);recover(f);f->phase=30;return;}assert(s.storage_fenced&&!s.host_fenced);atomic_store(&fail_sync,1);recover(f);f->phase=2;return;}
  if(f->phase==30){if(!f->recovered)return;job_release(f);assert(status(f).host_fenced&&!status(f).storage_fenced);denied(f);steer_spec_authority_service_stop(f->service);f->record.key.kind=STEER_SPEC_JOURNAL_OUTCOME;f->record.key.sequence=3;f->record.intent_sequence=2;f->record.effect=0;f->record.phase=5;submit(f);f->phase=7;return;}
  if(f->phase==2){if(!f->recovered)return;job_release(f);assert(status(f).storage_fenced&&status(f).blocked_intents==1);denied(f);assert(steer_spec_authority_scope_release(f->scope).code==STEER_PV1_POLICY_DENIED);uint64_t until=deadline()-4900000000ull;delay_until=until+20000000ull;recover_at(f,until);f->phase=20;return;}
@@ -76,6 +77,26 @@ static void step(struct loop *l,struct loop_timer *timer,void *arg){
  if(f->phase==5){if(!f->called)return;job_release(f);const struct steer_draft_device_authority *a=steer_spec_authority_scope_api(f->scope);assert(!a->acquire(a->context,&f->authorization,&f->permit).code);assert(f->resource>=0);int old=f->resource;assert(!close(old)&&fcntl(old,F_GETFD)<0&&errno==EBADF);f->resource=-1;
   f->record.key.kind=STEER_SPEC_JOURNAL_OUTCOME;f->record.key.sequence=5;f->record.intent_sequence=4;f->record.effect=1;f->record.phase=5;submit(f);f->phase=6;return;}
  if(f->phase==6||f->phase==7){if(!f->called)return;job_release(f);if(f->mode==2){assert(steer_spec_authority_scope_release(f->scope).code==STEER_PV1_POLICY_DENIED);f->permit.release(f->permit.context);}assert(!steer_spec_authority_scope_release(f->scope).code);f->scope=NULL;steer_spec_authority_service_stop(f->service);f->phase=8;return;}
+ if(f->phase==39){
+  if(!f->called)return;
+  job_release(f);assert(status(f).live_claims==1&&!status(f).blocked_intents);
+  if(f->mode==4){const struct steer_draft_device_authority *a=steer_spec_authority_scope_api(f->scope);assert(!a->acquire(a->context,&f->authorization,&f->permit).code);}
+  f->record.key.kind=STEER_SPEC_JOURNAL_OUTCOME;f->record.key.sequence=3;f->record.intent_sequence=2;f->record.phase=5;
+  atomic_store(&fail_sync,1);submit(f);denied(f);f->phase=40;return;
+ }
+ if(f->phase==40||f->phase==41){
+  if(f->phase==40?!f->called:!f->recovered)return;
+  job_release(f);assert(status(f).storage_fenced&&status(f).live_claims==1);denied(f);
+  if(f->phase==40)cancel_slot=&f->job;
+  recover(f);f->phase++;return;
+ }
+ if(f->phase==42){
+  if(!f->recovered)return;
+  job_release(f);assert(!status(f).storage_fenced&&!status(f).blocked_intents);denied(f);
+  if(f->mode==4){assert(status(f).live_claims==1&&steer_spec_authority_scope_release(f->scope).code==STEER_PV1_POLICY_DENIED);f->permit.release(f->permit.context);}
+  assert(!status(f).live_claims&&!steer_spec_authority_scope_release(f->scope).code);
+  f->scope=NULL;steer_spec_authority_service_stop(f->service);f->phase=8;return;
+ }
  if(f->phase==8){if(!f->service_drained)return;assert(!steer_spec_authority_service_detach_owner(f->service).code);struct steer_draft_host_work_guard guard={f,retain,release};assert(!steer_draft_host_worker_submit(f->worker,"x",1,deadline(),destroy,f,&guard,destroyed,f,&f->job).code);f->phase=9;return;}
  if(f->phase==9){if(!f->destroyed)return;job_release(f);assert(atomic_load(&f->guards)==1);steer_draft_host_worker_stop(f->worker);f->phase=10;return;}
  if(f->phase==10&&f->worker_drained){assert(!steer_draft_host_worker_destroy(f->worker).code);f->phase=11;loop_stop(l,0);}
@@ -90,4 +111,4 @@ static void scenario(unsigned mode){
  f.authorization=(struct steer_draft_device_authorization){.operation=1,.intent_sequence=2,.transaction=1,.generation=7,.instance_token=10,.provider_id={(const uint8_t *)"fixture.device",14},.provider_version={(const uint8_t *)"1",1},.recovery_record={(const uint8_t *)"opaque!",7}};
  submit(&f);assert(!loop_run(f.loop)&&f.phase==11&&f.resource<0);loop_timer_free(f.work);loop_free(f.loop);cleanup(path);
 }
-int main(void){alarm(20);atomic_init(&fail_sync,0);scenario(1);scenario(2);puts("device-authority-recovery: host flags preserve receipt/fence + uncertain fsync/failed recovery/fresh retire/owned resource drain PASS");return 0;}
+int main(void){alarm(20);atomic_init(&fail_sync,0);for(unsigned mode=1;mode<=4;mode++)scenario(mode);puts("device-authority-recovery: host/storage fences, fresh retire, durable fact recovery with/without outstanding permit PASS");return 0;}

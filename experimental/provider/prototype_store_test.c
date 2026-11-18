@@ -74,9 +74,15 @@ int main(void){
     assert(!steer_prototype_store_open(path,&s).code);
     assert(steer_prototype_store_open(path,&other).code==STEER_PV1_POLICY_DENIED&&!other);
     assert(steer_prototype_store_load(s,&readback).code==STEER_PV1_UNSUPPORTED&&!readback);
+    struct steer_store_document *snapshot=NULL;
+    directory_sync_failure=1;
+    assert(steer_prototype_store_recover_document(s,&snapshot).code==STEER_PV1_IO&&!snapshot);
+    directory_sync_failure=0;
+    assert(steer_prototype_store_recover_document(s,&snapshot).code==STEER_PV1_UNSUPPORTED&&!snapshot);
     assert(!steer_prototype_store_prepare(s,c,&t).code);
     assert(temporary_count(path)==1);
     assert(steer_prototype_store_close(s).code==STEER_PV1_POLICY_DENIED);
+    assert(steer_prototype_store_recover_document(s,&snapshot).code==STEER_PV1_POLICY_DENIED&&!snapshot);
     assert(!steer_prototype_store_abort(t).code);
     assert(!temporary_count(path));
     /* Collision exhaustion must not unlink a temp this transaction did not own. */
@@ -122,10 +128,14 @@ int main(void){
     assert(!steer_prototype_store_abort(t).code);
     loaded(s,2);
     const char spec_document[]="{\"version\":3,\"plugin_remotes\":{},\"plugins\":{},\"inbounds\":{},\"outbounds\":{\"d\":{\"type\":\"direct\",\"flow\":[\"stream\"]}},\"routing\":{\"default\":\"d\",\"rules\":[]}}";
-    struct steer_store_document typed={3,STEER_STORE_FORMAT_SPEC_V3,(char *)spec_document,sizeof(spec_document)-1},*snapshot=NULL;
+    struct steer_store_document typed={3,STEER_STORE_FORMAT_SPEC_V3,(char *)spec_document,sizeof(spec_document)-1};
     assert(!steer_prototype_store_prepare_document(s,&typed,&t).code);
-    result=steer_prototype_store_commit(t);assert(!result.error.code&&result.phase==STEER_PROTOTYPE_STORE_SYNCED);assert(!steer_prototype_store_abort(t).code);
-    assert(!steer_prototype_store_load_document(s,&snapshot).code&&snapshot->generation==3&&snapshot->format==STEER_STORE_FORMAT_SPEC_V3&&!strcmp(snapshot->document,spec_document));steer_store_document_destroy(snapshot);
+    directory_sync_failure=1;
+    result=steer_prototype_store_commit(t);assert(result.error.code==STEER_PV1_IO&&result.phase==STEER_PROTOTYPE_STORE_RENAMED);assert(!steer_prototype_store_abort(t).code);
+    assert(!steer_prototype_store_close(s).code&&!steer_prototype_store_open(path,&s).code);
+    assert(steer_prototype_store_recover_document(s,&snapshot).code==STEER_PV1_IO&&!snapshot);
+    directory_sync_failure=0;
+    assert(!steer_prototype_store_recover_document(s,&snapshot).code&&snapshot->generation==3&&snapshot->format==STEER_STORE_FORMAT_SPEC_V3&&!strcmp(snapshot->document,spec_document));steer_store_document_destroy(snapshot);snapshot=NULL;
     assert(steer_prototype_store_load(s,&readback).code==STEER_PV1_INVALID&&!readback);
     typed.format=99;assert(steer_prototype_store_prepare_document(s,&typed,&t).code==STEER_PV1_INVALID&&!t);
     typed.format=STEER_STORE_FORMAT_SPEC_V3;typed.length=STEER_STORE_DOCUMENT_MAX+1u;assert(steer_prototype_store_prepare_document(s,&typed,&t).code==STEER_PV1_INVALID&&!t);
@@ -144,6 +154,7 @@ int main(void){
     assert(fd>=0&&write(fd,"corrupt",7)==7);
     close(fd);
     assert(steer_prototype_store_load(s,&readback).code&&!readback);
+    assert(steer_prototype_store_recover_document(s,&snapshot).code==STEER_PV1_INVALID&&!snapshot);
     assert(!unlink(name));
     assert(!symlink("/etc/passwd",name));
     assert(steer_prototype_store_load(s,&readback).code==STEER_PV1_INVALID&&!readback);

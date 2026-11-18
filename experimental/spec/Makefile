@@ -11,7 +11,7 @@ EXECUTION_SRC = execution.c ../provider/flow_metadata.c ../provider/binding_leas
     ../provider/route_stream.c ../provider/datagram_routes.c ../provider/buffers.c \
     ../provider/operations.c ../../src/daemon/loop.c
 all: $(BUILD)/steer-spec-compile
-test: $(BUILD)/spec-test $(BUILD)/execution-prepare-test $(BUILD)/execution-owner-test $(BUILD)/execution-journal-test $(BUILD)/execution-async-test $(BUILD)/execution-reservations-test $(BUILD)/device-authority-test $(BUILD)/device-authority-recovery-test $(BUILD)/execution-static-test
+test: $(BUILD)/spec-test $(BUILD)/execution-prepare-test $(BUILD)/execution-owner-test $(BUILD)/execution-journal-test $(BUILD)/execution-async-test $(BUILD)/execution-reservations-test $(BUILD)/device-authority-test $(BUILD)/device-authority-recovery-test $(BUILD)/execution-static-test $(BUILD)/execution-startup-test
 	$(BUILD)/spec-test
 	$(BUILD)/execution-prepare-test
 	$(BUILD)/execution-owner-test
@@ -21,6 +21,7 @@ test: $(BUILD)/spec-test $(BUILD)/execution-prepare-test $(BUILD)/execution-owne
 	$(BUILD)/device-authority-test
 	$(BUILD)/device-authority-recovery-test
 	$(BUILD)/execution-static-test
+	$(BUILD)/execution-startup-test
 test-schema: $(BUILD)/steer-spec-compile
 	python3 schema_agreement_test.py $(BUILD)/steer-spec-compile
 $(BUILD):
@@ -54,3 +55,8 @@ $(BUILD)/device-authority-recovery-test: device_authority_service.c device_autho
 
 $(BUILD)/execution-static-test: execution_static.c execution_static.h execution_static_test.c $(EXECUTION_SRC) $(SOURCES) ../../src/pluginmgr/pmver.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) execution_static.c execution_static_test.c $(EXECUTION_SRC) $(SOURCES) ../../src/pluginmgr/pmver.c $(LDFLAGS) $(LDLIBS) -pthread -o $@
+
+STARTUP_SRC = execution_startup.c execution_reservations.c execution_journal.c ../provider/prototype_store.c \
+    ../provider/prototype_config.c ../provider/policy.c $(SOURCES)
+$(BUILD)/execution-startup-test: execution_startup_test.c $(STARTUP_SRC) execution_startup.h execution_reservations.h execution_journal.h ../provider/prototype_store.h ../provider/prototype_config.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) execution_startup_test.c $(STARTUP_SRC) $(LDFLAGS) $(LDLIBS) -o $@

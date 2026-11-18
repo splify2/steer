@@ -21,15 +21,17 @@ void steer_spec_authority_scope_retire(struct steer_spec_authority_scope *); /* 
 struct steer_pv1_error steer_spec_authority_scope_release(struct steer_spec_authority_scope *);
 /* Receipt is factual even on latecancel: caller owns no borrowed views beyond
  * return. INTENT_SYNCED only mints a claim if not cancelled/retired/fenced. Jobs
- * are released AFTER callback; result memory/guard remains budgeted meanwhile. */
+ * are released AFTER callback; result memory/guard remains budgeted meanwhile.
+ * Submitting an exact fact relinquishes any unspent permit for its intent. */
 typedef void (*steer_spec_authority_record_done)(void *,struct steer_spec_journal_result,
  const struct steer_spec_journal_record *,int cancelled);
 struct steer_pv1_error steer_spec_authority_record(struct steer_spec_authority_scope *,
  const struct steer_spec_journal_record *,uint64_t deadline_ns,steer_spec_authority_record_done,void *,struct steer_draft_host_job **);
 typedef void (*steer_spec_authority_recovered)(void *,struct steer_pv1_error,
  const struct steer_spec_ledger_summary *,int cancelled_or_expired);
-/* Storage-only recovery; never rearms old claim. Lost resource result still
- * needs factual UNKNOWN outcome and a fresh guarded recovery intent. */
+/* Storage-only recovery; never rearms a blocked claim. Exact durable facts
+ * finish corresponding claims; outstanding permits remain pinned through release.
+ * Lost resource results still need an UNKNOWN outcome and a fresh recovery intent. */
 struct steer_pv1_error steer_spec_authority_recover_journal(struct steer_spec_authority_scope *,uint64_t,
  steer_spec_authority_recovered,void *,struct steer_draft_host_job **);
 struct steer_spec_authority_status {uint32_t storage_fenced,host_fenced,blocked_intents,live_claims,journal_pending;};
