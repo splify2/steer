@@ -61,14 +61,16 @@ static int id(const struct ynode*n,char*s){
     }
     return 1;
 }
-static int reference(const struct ynode*n,char*s){
-    size_t i;
-    if(!copy(n,s,100)||n->len<=4||memcmp(s,"env:",4))return 0;
-    for(i=4;i<n->len;i++){
-        unsigned c=(unsigned char)s[i];
-        if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_'||(i>4&&c>='0'&&c<='9')))return 0;
+static int env_name(const char *name,size_t length){
+    if(!length||length>95)return 0;
+    for(size_t i=0;i<length;i++){
+        unsigned c=(unsigned char)name[i];
+        if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_'||(i&&c>='0'&&c<='9')))return 0;
     }
     return 1;
+}
+static int reference(const struct ynode*n,char*s){
+    return copy(n,s,100)&&n->len>4&&!memcmp(s,"env:",4)&&env_name(s+4,n->len-4);
 }
 static int flag(const struct ynode*n,uint32_t fallback,uint32_t*out){
     int b;
@@ -271,9 +273,39 @@ static struct steer_pv1_error compile_policy(struct steer_prototype_config *c,
     return steer_policy_compile(c->generation,active,count,fallback,&c->policy);
 }
 
-static int v3_options(void *unused,const struct ynode *options){
+static int v3_socks_options(void *unused,const struct ynode *options){
     (void)unused;
     return keys(options,"");
+}
+static const struct ynode *v3_vless_secret(const struct ynode *options,char principal[65]){
+    if(!keys(options,"principal_id uuid")||!id(ynode_get(options,"principal_id"),principal))return NULL;
+    const struct ynode *uuid=ynode_get(options,"uuid"),*secret=ynode_get(uuid,"secret");
+    char identifier[65];
+    return keys(uuid,"secret")&&id(secret,identifier)?secret:NULL;
+}
+static int v3_vless_options(void *unused,const struct ynode *options){
+    (void)unused;
+    char principal[65];
+    return v3_vless_secret(options,principal)!=NULL;
+}
+static int v3_inbound(const struct steer_spec_node_view *node,const struct ynode *secrets,
+    struct steer_prototype_listener *l){
+    if(!keys(node->intent,"label enabled plugin options listen flow"))return 0;
+    if(!strncmp(node->provider,"socks:",6)&&v3_socks_options(NULL,node->options)){
+        l->protocol=STEER_PROTOTYPE_SOCKS;
+    }else if(!strncmp(node->provider,"vless:",6)){
+        const struct ynode *ref=v3_vless_secret(node->options,l->principal_id);
+        const struct ynode *name=ref?ynode_get(ynode_get(secrets,ref->str),"name"):NULL;
+        if(!name)return 0;
+        l->protocol=STEER_PROTOTYPE_VLESS;
+        l->auth=STEER_PROTOTYPE_AUTH_UUID;
+        memcpy(l->uuid_ref,"env:",4);
+        memcpy(l->uuid_ref+4,name->str,name->len+1);
+    }else return 0;
+    l->enabled=(uint32_t)node->enabled;
+    strcpy(l->id,node->id);
+    return label(ynode_get(node->intent,"label"),l->label)&&listen_address(node->listen,l)&&
+        (!strncmp(l->address,"127.",4)||!strcmp(l->address,"::1"));
 }
 static int v3_named_action(const struct ynode *outbounds,const char *name,uint32_t *out){
     return action(ynode_get(ynode_get(outbounds,name),"type"),out);
@@ -306,7 +338,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
     struct steer_prototype_config *c){
     const struct ynode *remotes=ynode_get(root,"plugin_remotes"),*plugins=ynode_get(root,"plugins"),
         *inbounds=ynode_get(root,"inbounds"),*outbounds=ynode_get(root,"outbounds"),
-        *routing=ynode_get(root,"routing"),*rules=ynode_get(routing,"rules");
+        *routing=ynode_get(root,"routing"),*rules=ynode_get(routing,"rules"),*secrets=ynode_get(root,"secrets");
     static const struct steer_spec_capability core[]={
         {"core.spec-v3.apply",STEER_SPEC_READY,NULL,NULL},
         {"core.outbound.direct",STEER_SPEC_READY,NULL,NULL},
@@ -316,18 +348,20 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         {"core.classifier.inbound",STEER_SPEC_READY,NULL,NULL},
         {"core.classifier.domain",STEER_SPEC_READY,NULL,NULL},
         {"core.classifier.domain_suffix",STEER_SPEC_READY,NULL,NULL},
+        {"core.secret.env",STEER_SPEC_READY,NULL,NULL},
     };
-    struct steer_spec_capability inventory[sizeof(core)/sizeof(core[0])+2*STEER_PROTOTYPE_MAX_LISTENERS];
+    struct steer_spec_capability inventory[sizeof(core)/sizeof(core[0])+3*STEER_PROTOTYPE_MAX_LISTENERS];
     size_t count=sizeof(core)/sizeof(core[0]);
-    char requirements[STEER_PROTOTYPE_MAX_LISTENERS][2][128];
+    char requirements[STEER_PROTOTYPE_MAX_LISTENERS][3][128];
     struct steer_policy_rule all[STEER_PROTOTYPE_MAX_RULES]={0},active[STEER_PROTOTYPE_MAX_RULES]={0};
     struct steer_pv1_error result=err(STEER_PV1_INVALID);
     uint32_t enabled=0,fallback;
-    if(!keys(root,"version plugin_remotes plugins inbounds outbounds routing")||
+    if(!keys(root,"version plugin_remotes plugins inbounds outbounds routing secrets")||
         !remotes||remotes->kind!=YN_MAP||remotes->len>1||
         !plugins||plugins->kind!=YN_MAP||plugins->len>STEER_PROTOTYPE_MAX_LISTENERS||
         !inbounds||inbounds->kind!=YN_MAP||inbounds->len>STEER_PROTOTYPE_MAX_LISTENERS||
         !outbounds||outbounds->kind!=YN_MAP||outbounds->len>STEER_PROTOTYPE_MAX_LISTENERS||
+        (secrets&&(secrets->kind!=YN_MAP||secrets->len>STEER_PROTOTYPE_MAX_LISTENERS))||
         !keys(routing,"default rules")||!rules||rules->kind!=YN_SEQ||rules->len>STEER_PROTOTYPE_MAX_RULES)return result;
     memcpy(inventory,core,sizeof(core));
     /* Only the code linked into this binary satisfies this local profile. The
@@ -345,8 +379,15 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
             !eq(ynode_get(plugin,"package"),"steer-protocols")||!eq(ynode_get(plugin,"version"),"0.0.0"))return result;
         snprintf(requirements[i][0],sizeof(requirements[i][0]),"plugin.lock.%s",alias->str);
         snprintf(requirements[i][1],sizeof(requirements[i][1]),"provider.socks:%s/inbound/stream/tcp/none/default",alias->str);
+        snprintf(requirements[i][2],sizeof(requirements[i][2]),"provider.vless:%s/inbound/stream/tcp/none/default",alias->str);
         inventory[count++]=(struct steer_spec_capability){requirements[i][0],STEER_SPEC_READY,NULL,NULL};
-        inventory[count++]=(struct steer_spec_capability){requirements[i][1],STEER_SPEC_READY,v3_options,NULL};
+        inventory[count++]=(struct steer_spec_capability){requirements[i][1],STEER_SPEC_READY,v3_socks_options,NULL};
+        inventory[count++]=(struct steer_spec_capability){requirements[i][2],STEER_SPEC_READY,v3_vless_options,NULL};
+    }
+    for(size_t i=0;secrets&&i<secrets->len;i++){
+        const struct ynode *secret=ynode_val_at(secrets,i),*name=ynode_get(secret,"name");
+        if(!keys(secret,"source name kind")||!eq(ynode_get(secret,"source"),"env")||
+            !eq(ynode_get(secret,"kind"),"uuid")||!scalar(name)||!env_name(name->str,name->len))return result;
     }
     struct steer_spec_plan *plan=steer_spec_compile(data,length,inventory,count);
     if(!plan)return err(STEER_PV1_RESOURCE_EXHAUSTED);
@@ -355,7 +396,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
     for(uint32_t i=0;i<summary.nodes;i++){
         struct steer_spec_node_view node;
         if(!steer_spec_node(plan,i,&node))goto done;
-        if(node.kind==STEER_SPEC_PLUGIN)continue;
+        if(node.kind==STEER_SPEC_PLUGIN||node.kind==STEER_SPEC_SECRET)continue;
         if(node.flows!=STEER_SPEC_FLOW_STREAM)goto done;
         if(node.kind==STEER_SPEC_OUTBOUND){
             uint32_t a;
@@ -363,14 +404,8 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
                 !v3_named_action(outbounds,node.id,&a))goto done;
             continue;
         }
-        if(node.kind!=STEER_SPEC_INBOUND||!keys(node.intent,"label enabled plugin options listen flow")||
-            strncmp(node.provider,"socks:",6)||!v3_options(NULL,node.options)||
-            c->listener_count>=STEER_PROTOTYPE_MAX_LISTENERS)goto done;
-        struct steer_prototype_listener *l=&c->listeners[c->listener_count];
-        l->protocol=STEER_PROTOTYPE_SOCKS;l->enabled=(uint32_t)node.enabled;
-        strcpy(l->id,node.id);
-        if(!label(ynode_get(node.intent,"label"),l->label)||!listen_address(node.listen,l)||
-            (strncmp(l->address,"127.",4)&&strcmp(l->address,"::1"))||
+        if(node.kind!=STEER_SPEC_INBOUND||c->listener_count>=STEER_PROTOTYPE_MAX_LISTENERS||
+            !v3_inbound(&node,secrets,&c->listeners[c->listener_count])||
             !distinct_listener(c,c->listener_count))goto done;
         c->listener_count++;
     }

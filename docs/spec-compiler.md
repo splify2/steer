@@ -93,7 +93,7 @@ standalone interop fixture does not establish a loaded native provider, a secret
 service, a TUN capture adapter or a generation-ready backend.
 
 The managed Linux prototype can apply the
-[linked SOCKS5 TCP v3 subset](../experimental/provider/prototype_core.md#managed-spec-v3-linked-socks-v1).
+[linked SOCKS5 and plain VLESS TCP v3 subset](../experimental/provider/prototype_core.md#managed-spec-v3-linked-socks-v1).
 It compiles the intent on a bounded worker and lowers listeners and ordered
 direct/block policy into the existing generation transaction. GET and durable
 recovery retain the v3 intent and revision. The full provider catalogue,
@@ -118,7 +118,7 @@ holds old origin references across failed replacement preparation/partial bind
 and a new blocked generation, and verifies their exact payload after retirement.
 It runs one and four independent owners with sanitizer gates. Its worker joins
 are a fixture synchronization shortcut, not the final host's async apply path.
-The managed linked-SOCKS subset uses the prototype's listener transaction. The
+The managed linked TCP subset uses the prototype's listener transaction. The
 general executor still needs its transaction coordinator before it can replace
 that path.
 Devices remain rejected until durable intent authorizes their fallible effects;

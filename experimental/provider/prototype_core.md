@@ -94,11 +94,17 @@ plugin_remotes:
     trust: steer-linked-prototype-v1
 plugins:
   proxy: {remote: local, package: steer-protocols, version: "0.0.0"}
+secrets:
+  client-id: {source: env, kind: uuid, name: STEER_VLESS_UUID}
 inbounds:
   socks-local:
     plugin: socks:proxy
     options: {}
     listen: {address: 127.0.0.1, port: 1080}
+  vless-local:
+    plugin: vless:proxy
+    options: {principal_id: local-client, uuid: {secret: client-id}}
+    listen: {address: 127.0.0.1, port: 18443}
 outbounds:
   internet: {type: direct}
   deny: {type: block}
@@ -106,19 +112,25 @@ routing:
   default: deny
   rules:
     - {name: local-route, match: {inbound: [socks-local]}, outbound: internet}
+    - {name: vless-route, match: {inbound: [vless-local]}, outbound: internet}
 ```
 
 The fixed remote, trust, package and `0.0.0` prototype marker select code
 already linked into this build. They do not grant trust, read a remote index,
 install a package, or represent a signed lock. Aliases and object IDs are
-user-defined. The compiler and runtime accept SOCKS5 CONNECT with no
-authentication on numeric loopback only (`127/8`, `::1`); explicit `flow` is
-limited to `[stream]`. Routing supports ordered `route` and `reject`, named
+user-defined. SOCKS5 CONNECT (no auth) and plain VLESS TCP (UUID auth) are
+supported on numeric loopback only (`127/8`, `::1`); explicit `flow` is
+limited to `[stream]`. VLESS requires one typed `uuid` reference to an inherited
+environment variable. Supply the UUID in the core process's private environment,
+never in the intent. Validate/apply and startup reject an enabled VLESS listener
+if its value is absent or malformed. The intent, snapshots and status never
+include the resolved value. TLS, REALITY, Vision and UDP are not part of this
+VLESS variant. Routing supports ordered `route` and `reject`, named
 direct/block outbounds, and an explicit default. Match fields are `inbound`
 and either `domain` or `domain_suffix`, each with one list entry; an empty map
 matches all. Other variants and settings are rejected, even on disabled
-objects. VLESS and Hysteria2 are still available only in the earlier prototype
-format. The general v3 provider executor and signed lock are not wired in.
+objects. Hysteria2 remains available only in the earlier prototype format.
+The general v3 provider executor and signed lock are not wired in.
 
 GET returns the whole accepted v3 intent, not its lowered listener/policy
 representation. The durable envelope records `format: "steer-spec-v3"`;
@@ -149,7 +161,8 @@ revision internally, then prepares/commits atomically on the loop shard.
 - `STATUS`: `prototype`, `generation`, `revision`, `runtimeReady`,
   actual `persistence`, `durability_uncertain`, `activeClients`, and active `listeners` with
   `id`, `protocol`, `address`, `port`. `capabilities.spec_v3_profile` advertises
-  `linked-socks-v1`, not general v3 execution.
+  `linked-socks-v1` for compatibility; `capabilities.spec_v3_vless_tcp: true`
+  separately advertises plain VLESS in that profile, not general v3 execution.
 - `GET`: one atomic `{revision,persistence,durability_uncertain,document}` envelope with the
   canonical configuration, including environment references only.
 - `VALIDATE`: `{valid:true,persistence}` on success.

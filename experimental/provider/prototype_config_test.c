@@ -50,9 +50,11 @@ static void spec_v3(void){
         "plugin_remotes:\n  local: {url: 'https://github.com/splify2/steer-protocols', trust: steer-linked-prototype-v1}\n"
         "plugins:\n  first: {remote: local, package: steer-protocols, version: '0.0.0'}\n"
         "  second: {remote: local, package: steer-protocols, version: '0.0.0'}\n"
+        "secrets:\n  vless-uuid: {source: env, name: STEER_TEST_UUID, kind: uuid}\n"
         "inbounds:\n"
         "  a: {plugin: 'socks:first', listen: {address: '::1', port: 1080}, options: {}}\n"
-        "  b: {plugin: 'socks:second', enabled: false, listen: {address: 127.0.0.2, port: 1080}, options: {}}\n"
+        "  b: {plugin: 'vless:second', enabled: false, listen: {address: 127.0.0.2, port: 1080},\n"
+        "      options: {principal_id: alice, uuid: {secret: vless-uuid}}}\n"
         "outbounds:\n  deny: {type: block}\n"
         "routing:\n  default: deny\n  rules: [{name: off, enabled: false, match: {domain_suffix: [example.org]}, outbound: deny}]\n";
     struct steer_prototype_config *c,*round;
@@ -60,11 +62,13 @@ static void spec_v3(void){
     assert(c->format==STEER_STORE_FORMAT_SPEC_V3&&c->listener_count==2);
     assert(c->listeners[0].enabled&&!c->listeners[1].enabled);
     assert(!strcmp(c->listeners[0].address,"::1")&&!strcmp(c->listeners[1].address,"127.0.0.2"));
+    assert(c->listeners[1].protocol==STEER_PROTOTYPE_VLESS&&c->listeners[1].auth==STEER_PROTOTYPE_AUTH_UUID);
+    assert(!strcmp(c->listeners[1].principal_id,"alice")&&!strcmp(c->listeners[1].uuid_ref,"env:STEER_TEST_UUID"));
     assert(strstr(c->document_json,"\"version\":3")&&strstr(c->document_json,"\"version\":\"0.0.0\""));
     assert(!steer_prototype_config_parse(c->document_json,c->document_length,9,&round).code);
     assert(!strcmp(round->document_json,c->document_json));
     steer_prototype_config_destroy(round);steer_prototype_config_destroy(c);
-    puts("managed v3 YAML/JSON, multiple local aliases and disabled entries PASS");
+    puts("managed v3 YAML/JSON, linked SOCKS/VLESS aliases, typed UUID and disabled entries PASS");
 }
 int main(void){
     hysteria2();
