@@ -19,3 +19,9 @@ ${CC:-cc} $F @"$OUT/includes.rsp" -I../plugin-sdk/include -DHAVE_CONFIG_H -D_POS
     src/third_party/libyaml/api.c src/third_party/libyaml/reader.c src/third_party/libyaml/scanner.c \
     src/third_party/libyaml/parser.c -Wl,--gc-sections,--wrap=malloc,--wrap=free -o "$OUT/config"
 "$OUT/config" --wire
+${CC:-cc} $F @"$OUT/includes.rsp" -I../plugin-sdk/include -DHAVE_CONFIG_H -D_POSIX_C_SOURCE=200809L -pthread \
+    experimental/provider/kernel_wg_guard_test.c experimental/provider/kernel_wg.c \
+    experimental/provider/kernel_wg_guard.c experimental/provider/policy.c src/kinds/awgdev.c \
+    src/lib/ir.c src/lib/run.c src/lib/nftdump.c src/lib/ynode.c src/lib/err.c src/compile/print.c \
+    src/third_party/libyaml/api.c src/third_party/libyaml/reader.c src/third_party/libyaml/scanner.c \
+    src/third_party/libyaml/parser.c -Wl,--gc-sections,--wrap=run_output,--wrap=if_indextoname -o "$OUT/guard"

@@ -2,7 +2,7 @@
 # Experimental adapter lifecycle + independent kernel WireGuard interoperability.
 set -eu
 BIN=$(realpath "${STEER_KERNEL_WG_TEST:-/tmp/steer-kernel-wg-guard-test}")
-for tool in unshare nsenter ip wg ping python3; do command -v "$tool" >/dev/null || { echo "SKIP missing $tool"; exit 77; }; done
+for tool in unshare nsenter ip nft wg ping python3; do command -v "$tool" >/dev/null || { echo "SKIP missing $tool"; exit 77; }; done
 [ -x "$BIN" ] || { echo 'Missing kernel WG test runner'; exit 2; }
 if [ "${STEER_KERNEL_WG_GUARD_NS:-}" != 1 ]; then
     [ "$(id -u)" = 0 ] || { echo 'SKIP root required'; exit 77; }
@@ -39,7 +39,7 @@ wg pubkey < "$work/client.key" > "$work/client.pub"
 STEER_TEST_PRIVATE=$(cat "$work/server.key")
 export STEER_TEST_PRIVATE
 client_pub=$(cat "$work/client.pub")
-for mode in unknown-echo race replace-exit replace-unknown; do
+for mode in retire-index unknown-echo race replace-exit replace-unknown; do
     stage=$mode
     "$BIN" "$mode" srvwg 51821 "$server_ip/$network_bits" "$client_pub" "$client_ip/$host_bits"
     if ip link show srvwg >/dev/null 2>&1; then exit 1; fi

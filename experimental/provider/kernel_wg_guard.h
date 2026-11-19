@@ -45,8 +45,9 @@ struct steer_draft_kernel_wg_guard_result steer_draft_kernel_wg_guard_publish(st
  * transfers to prepared and active can be destroyed. Failure preserves active. */
 struct steer_draft_kernel_wg_guard_result steer_draft_kernel_wg_guard_replace(
     struct steer_draft_kernel_wg_guard *active,struct steer_draft_kernel_wg_guard *prepared);
-/* Caller removes/quiesces owned WG device BEFORE removing its guard. Foreign
- * nft table replacement is refused. Destroy refuses a still-owned table. */
+/* Caller removes the owned WG device BEFORE removing its guard. The captured
+ * ifindex must be absent in the owning namespace; an inconclusive lookup or
+ * foreign nft table replacement is refused. Destroy refuses a still-owned table. */
 struct steer_pv1_error steer_draft_kernel_wg_guard_retire(struct steer_draft_kernel_wg_guard *);
 struct steer_pv1_error steer_draft_kernel_wg_guard_destroy(struct steer_draft_kernel_wg_guard *);
 /* Read-only recovery after explicit external cleanup: requires owned WG device

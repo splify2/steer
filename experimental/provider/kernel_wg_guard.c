@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,7 @@ static struct steer_pv1_error error(uint32_t c){struct steer_pv1_error e={c,0};r
 static int identifier(const char*s,size_t cap){size_t i;if(!memchr(s,0,cap)||!*s)return 0;for(i=0;s[i];i++){unsigned c=(unsigned char)s[i];if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='-'||c=='.'))return 0;}return 1;}
 static int prefix(const char*s,struct source_prefix*out){char text[64],*slash,*p;unsigned bits=0;uint32_t i;if(!memchr(s,0,64))return 0;snprintf(text,sizeof(text),"%s",s);slash=strchr(text,'/');if(!slash)return 0;*slash++=0;if(!*slash)return 0;for(p=slash;*p;p++){if(*p<'0'||*p>'9'||bits>128)return 0;bits=bits*10+(unsigned)(*p-'0');}out->family=inet_pton(AF_INET,text,out->address)==1?4:inet_pton(AF_INET6,text,out->address)==1?6:0;if(!out->family||bits>(out->family==4?32u:128u))return 0;out->bits=(uint8_t)bits;for(i=bits;i<(out->family==4?32u:128u);i++)if(out->address[i/8]&(0x80u>>(i%8)))return 0;return 1;}
 static int overlap(const struct source_prefix*a,const struct source_prefix*b){uint32_t i,bits=a->bits<b->bits?a->bits:b->bits;if(a->family!=b->family)return 0;for(i=0;i<bits;i++)if((a->address[i/8]^b->address[i/8])&(0x80u>>(i%8)))return 0;return 1;}
-static int same_namespace(const struct steer_draft_kernel_wg_guard*g){struct stat st;return !stat("/proc/self/ns/net",&st)&&st.st_dev==g->ns_device&&st.st_ino==g->ns_inode;}
+static int same_namespace(const struct steer_draft_kernel_wg_guard*g){struct stat st;return !stat("/proc/thread-self/ns/net",&st)&&st.st_dev==g->ns_device&&st.st_ino==g->ns_inode;}
 static int same_identity(const struct steer_draft_kernel_wg_guard*g){char kind[32];int index;return same_namespace(g)&&!awg_dev_link_query(g->device,kind,sizeof(kind),&index)&&index==g->index&&!strcmp(kind,"wireguard");}
 static int table_owned(const struct steer_draft_kernel_wg_guard*g){struct nfd_tfp actual;return same_namespace(g)&&!nfd_table_fp(g->table,&actual)&&actual.fams&&actual.handle==g->handle&&g->handle;}
 static void ingress_match(struct steer_draft_kernel_wg_guard*g,struct nft_rule*r){ir_x(r,"meta iif 0");if(r&&r->x)r->x->text=g->index_match;}
@@ -29,7 +30,7 @@ struct visitor {struct steer_draft_kernel_wg_guard*g;struct nft_chain*chain;uint
 static int span_equal(struct steer_pv1_span value,const char*text){return value.len==strlen(text)&&!memcmp(value.data,text,value.len);}
 static void emit_rule(struct visitor*v,const struct steer_policy_rule*rule,int protocol){struct nft_rule*r=ir_rule(v->chain);char address[INET6_ADDRSTRLEN];if(rule->cidr_tag){int family=rule->cidr_tag==STEER_PV1_ENDPOINT_IPV4?AF_INET:AF_INET6;inet_ntop(family,rule->network,address,sizeof(address));ir_x(r,"%s daddr %s/%u",family==AF_INET?"ip":"ip6",address,rule->prefix_bits);}if(protocol)ir_x(r,"%s dport %u-%u",protocol==6?"tcp":"udp",rule->port_first,rule->port_last);ir_counter(r,0,0);ir_x(r,"%s",rule->action==STEER_POLICY_DIRECT?"accept":"drop");ir_comment(r,"steer-wg:%.*s",(int)rule->id.len,rule->id.data);}
 static struct steer_pv1_error visit(void*context,const struct steer_policy_rule*rule){struct visitor*v=context;if(rule->inbound.len&&!span_equal(rule->inbound,v->g->inbound))return error(STEER_PV1_OK);if(rule->principal.len&&!span_equal(rule->principal,v->g->principals[v->peer]))return error(STEER_PV1_OK);if(rule->domain.len)return error(STEER_PV1_UNSUPPORTED);if(v->count++>=STEER_DRAFT_WG_GUARD_RULES)return error(STEER_PV1_RESOURCE_EXHAUSTED);if(rule->port_first){emit_rule(v,rule,6);emit_rule(v,rule,17);}else emit_rule(v,rule,0);return error(STEER_PV1_OK);}
-struct steer_pv1_error steer_draft_kernel_wg_guard_prepare(const struct steer_draft_kernel_wg_guard_config*c,const struct steer_policy*p,struct steer_draft_kernel_wg_guard**out){struct steer_draft_kernel_wg_guard*g;struct stat ns;struct nft_table*table;struct nft_chain*base;uint32_t i,j,k,fallback;uint64_t random;struct steer_pv1_error e=error(STEER_PV1_INVALID);if(out)*out=NULL;if(!c||!p||!out||!c->generation||!identifier(c->inbound_id,sizeof(c->inbound_id))||!identifier(c->device,sizeof(c->device))||!c->peer_count||c->peer_count>8)return e;if(stat("/proc/self/ns/net",&ns)||getrandom(&random,sizeof(random),0)!=(ssize_t)sizeof(random))return error(STEER_PV1_IO);g=calloc(1,sizeof(*g));if(!g)return error(STEER_PV1_RESOURCE_EXHAUSTED);nft_rs_init(&g->drop);nft_rs_init(&g->policy);g->generation=c->generation;g->ns_device=ns.st_dev;g->ns_inode=ns.st_ino;g->peer_count=c->peer_count;snprintf(g->inbound,sizeof(g->inbound),"%s",c->inbound_id);snprintf(g->device,sizeof(g->device),"%s",c->device);snprintf(g->table,sizeof(g->table),"steer_wg_%016llx",(unsigned long long)random);snprintf(g->index_match,sizeof(g->index_match),"meta iif 0");
+struct steer_pv1_error steer_draft_kernel_wg_guard_prepare(const struct steer_draft_kernel_wg_guard_config*c,const struct steer_policy*p,struct steer_draft_kernel_wg_guard**out){struct steer_draft_kernel_wg_guard*g;struct stat ns;struct nft_table*table;struct nft_chain*base;uint32_t i,j,k,fallback;uint64_t random;struct steer_pv1_error e=error(STEER_PV1_INVALID);if(out)*out=NULL;if(!c||!p||!out||!c->generation||!identifier(c->inbound_id,sizeof(c->inbound_id))||!identifier(c->device,sizeof(c->device))||!c->peer_count||c->peer_count>8)return e;if(stat("/proc/thread-self/ns/net",&ns)||getrandom(&random,sizeof(random),0)!=(ssize_t)sizeof(random))return error(STEER_PV1_IO);g=calloc(1,sizeof(*g));if(!g)return error(STEER_PV1_RESOURCE_EXHAUSTED);nft_rs_init(&g->drop);nft_rs_init(&g->policy);g->generation=c->generation;g->ns_device=ns.st_dev;g->ns_inode=ns.st_ino;g->peer_count=c->peer_count;snprintf(g->inbound,sizeof(g->inbound),"%s",c->inbound_id);snprintf(g->device,sizeof(g->device),"%s",c->device);snprintf(g->table,sizeof(g->table),"steer_wg_%016llx",(unsigned long long)random);snprintf(g->index_match,sizeof(g->index_match),"meta iif 0");
 for(i=0;i<c->peer_count;i++){if(!identifier(c->peers[i].principal_id,sizeof(c->peers[i].principal_id))||!c->peers[i].allowed_count||c->peers[i].allowed_count>8)goto fail;snprintf(g->principals[i],sizeof(g->principals[i]),"%s",c->peers[i].principal_id);for(j=0;j<c->peers[i].allowed_count;j++){struct source_prefix*source=&g->sources[g->source_count];if(!prefix(c->peers[i].allowed_ips[j],source))goto fail;source->peer=i;for(k=0;k<g->source_count;k++)if(overlap(source,&g->sources[k]))goto fail;g->source_count++;}}
 table=ir_table_add(&g->drop,NFT_FAM_INET,g->table);base=ir_base_chain_add(table,"ingress","filter","prerouting","mangle",-10);{struct nft_rule*r=ir_rule(base);ingress_match(g,r);ir_counter(r,0,0);ir_x(r,"drop");}
 table=ir_table_add(&g->policy,NFT_FAM_INET,g->table);
@@ -79,8 +80,29 @@ static struct steer_draft_kernel_wg_guard_result apply(struct steer_draft_kernel
     return uncertain(g,STEER_PV1_IO);
 }
 struct steer_pv1_error steer_draft_kernel_wg_guard_bind(void*context,const char*device,int index){struct steer_draft_kernel_wg_guard*g=context;if(!g||!device||index<=0)return error(STEER_PV1_INVALID);if(g->index||g->handle||strcmp(device,g->device)||!same_namespace(g))return error(STEER_PV1_POLICY_DENIED);g->index=index;if(!same_identity(g)){g->index=0;return error(STEER_PV1_POLICY_DENIED);}snprintf(g->index_match,sizeof(g->index_match),"meta iif %d",index);return apply(g,&g->drop,1,0).error;}
-struct steer_draft_kernel_wg_guard_result steer_draft_kernel_wg_guard_publish(struct steer_draft_kernel_wg_guard*g){if(!g)return outcome(STEER_PV1_INVALID,0);if(!same_identity(g))return uncertain(g,STEER_PV1_POLICY_DENIED);return apply(g,&g->policy,0,0);}
-struct steer_pv1_error steer_draft_kernel_wg_guard_retire(struct steer_draft_kernel_wg_guard*g){int index;char kind[32];int rc;if(!g)return error(STEER_PV1_INVALID);if(!same_namespace(g)||g->uncertain)return error(STEER_PV1_POLICY_DENIED);if(!g->handle)return error(STEER_PV1_OK);rc=awg_dev_link_query(g->device,kind,sizeof(kind),&index);if(!rc&&index==g->index&&!strcmp(kind,"wireguard"))return error(STEER_PV1_POLICY_DENIED);return apply(g,NULL,0,1).error;}
+struct steer_draft_kernel_wg_guard_result steer_draft_kernel_wg_guard_publish(struct steer_draft_kernel_wg_guard*g){
+    if(!g)return outcome(STEER_PV1_INVALID,STEER_DRAFT_WG_GUARD_UNCHANGED);
+    if(!same_namespace(g))return outcome(STEER_PV1_POLICY_DENIED,STEER_DRAFT_WG_GUARD_UNCHANGED);
+    if(!same_identity(g))return uncertain(g,STEER_PV1_POLICY_DENIED);
+    return apply(g,&g->policy,0,0);
+}
+/* The rules match iif, which outlives an interface rename. */
+static struct steer_pv1_error require_index_absent(int index){
+    char name[IF_NAMESIZE];
+    if(!index)return error(STEER_PV1_OK);
+    if(if_indextoname((unsigned)index,name))return error(STEER_PV1_POLICY_DENIED);
+    /* Linux libc implementations report a missing index as ENXIO or ENODEV. */
+    return error(errno==ENXIO||errno==ENODEV?STEER_PV1_OK:STEER_PV1_IO);
+}
+struct steer_pv1_error steer_draft_kernel_wg_guard_retire(struct steer_draft_kernel_wg_guard*g){
+    struct steer_pv1_error e;
+    if(!g)return error(STEER_PV1_INVALID);
+    if(!same_namespace(g)||g->uncertain)return error(STEER_PV1_POLICY_DENIED);
+    if(!g->handle)return error(STEER_PV1_OK);
+    e=require_index_absent(g->index);
+    if(e.code)return e;
+    return apply(g,NULL,0,1).error;
+}
 struct steer_pv1_error steer_draft_kernel_wg_guard_destroy(struct steer_draft_kernel_wg_guard*g){if(!g)return error(STEER_PV1_INVALID);if(g->uncertain)return error(STEER_PV1_POLICY_DENIED);if(g->handle){struct nfd_tfp actual;if(!same_namespace(g)||nfd_table_fp(g->table,&actual))return error(STEER_PV1_IO);if(actual.fams&&actual.handle==g->handle)return error(STEER_PV1_POLICY_DENIED);}nft_rs_free(&g->drop);nft_rs_free(&g->policy);free(g);return error(STEER_PV1_OK);}
 const char*steer_draft_kernel_wg_guard_table(const struct steer_draft_kernel_wg_guard*g){return g?g->table:NULL;}
 
@@ -88,4 +110,15 @@ struct steer_draft_kernel_wg_guard_result steer_draft_kernel_wg_guard_replace(st
 
 
 
-struct steer_pv1_error steer_draft_kernel_wg_guard_reconcile_absent(struct steer_draft_kernel_wg_guard*g){struct nfd_tfp state;int index;char kind[32];if(!g)return error(STEER_PV1_INVALID);if(!same_namespace(g))return error(STEER_PV1_POLICY_DENIED);if(!awg_dev_link_query(g->device,kind,sizeof(kind),&index)&&index==g->index&&!strcmp(kind,"wireguard"))return error(STEER_PV1_POLICY_DENIED);if(nfd_table_fp(g->table,&state))return error(STEER_PV1_IO);if(state.fams)return error(STEER_PV1_POLICY_DENIED);g->uncertain=0;g->handle=0;g->index=0;return error(STEER_PV1_OK);}
+struct steer_pv1_error steer_draft_kernel_wg_guard_reconcile_absent(struct steer_draft_kernel_wg_guard*g){
+    struct nfd_tfp state;
+    struct steer_pv1_error e;
+    if(!g)return error(STEER_PV1_INVALID);
+    if(!same_namespace(g))return error(STEER_PV1_POLICY_DENIED);
+    e=require_index_absent(g->index);
+    if(e.code)return e;
+    if(nfd_table_fp(g->table,&state))return error(STEER_PV1_IO);
+    if(state.fams)return error(STEER_PV1_POLICY_DENIED);
+    g->uncertain=0;g->handle=0;g->index=0;
+    return error(STEER_PV1_OK);
+}

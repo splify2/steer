@@ -43,10 +43,11 @@ the adapter never guesses ownership or deletes a table observed only by name.
 Policy-only replacement uses a prepared snapshot with identical peer/device
 identity mapping, atomic per packet. Existing WG flows can be affected; these are
 not pinned stream generations. Peer/device replacement needs separate resource
-preparation; same-port atomic handover is not claimed. On normal teardown remove
-the device before its guard. Wrong namespace and foreign table/interface identity
-are rejected. An existing source file and runtime core configuration are untouched
-by these standalone adapters.
+preparation; same-port atomic handover is not claimed. Teardown and absence
+reconciliation require the captured ifindex to be absent in the owning thread's
+network namespace. A rename, index reuse or lookup error is not proof of absence.
+Wrong namespace and foreign table/interface identity are rejected. An existing
+source file and runtime core configuration are untouched by these standalone adapters.
 
 Strict C11 and ASan/UBSan+leak namespace suites passed in WSL Linux, 2026-11-17:
 prepare-without-mutation, rollback, raced device refusal, namespace identity,
@@ -59,13 +60,20 @@ BLOCK/DIRECT reload on the same interface. All disposable keys/namespaces clean 
 Legacy `awgmatch` rebuilt: 153 passed, 0 failed. Existing endpointless legacy
 `tests/awg-inbound-ns.sh` also passed independently.
 
-Build the adapter runner from kernel_wg_test.c, kernel_wg.c and existing awgdev.c
-with SDK and core includes. The guard runner additionally links kernel_wg_guard.c,
-policy.c, ir.c, print.c, nftdump.c, run.c, ynode.c, err.c and existing libyaml
-sources. Use function/data sections and linker GC for the chain-only printer;
-the guard test wraps run_output for deterministic failure/race injection.
-Run kernel_wg_ns_test.sh or kernel_wg_guard_ns_test.sh in an isolated root WSL
-namespace with nft/ip/wg/ping tools. Normalize CRLF copies into /tmp first.
+From the Steer repository root, build and run the guard suite with root
+permissions and nft/ip/wg/ping available. The script isolates network and mount
+changes in disposable namespaces.
+
+```sh
+build=$(mktemp -d)
+sh tests/wg-owned-build.sh "$build"
+STEER_KERNEL_WG_TEST="$build/guard" sh experimental/provider/kernel_wg_guard_ns_test.sh
+```
+
+The guard suite checks that renaming the link or injecting an index lookup error
+leaves the guard installed, and that a call from a different thread namespace
+cannot change it. For the standalone adapter suite, build `kernel_wg_test.c`
+with `kernel_wg.c` and `awgdev.c`, then run `kernel_wg_ns_test.sh`.
 
 This is not yet configured prototype/UI support, a stable SDK device API or the
 full product gate. Kernel WG UDP ListenPort binds all addresses; loopback-only
