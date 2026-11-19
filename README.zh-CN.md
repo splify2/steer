@@ -88,6 +88,25 @@ steer explain example.org
 make && make test                   # 在开发机器上构建并运行测试
 ```
 
+## 支持 steer
+
+[通过 CloudTips 捐赠](https://pay.cloudtips.ru/p/fb925110)
+
+<details>
+<summary>加密货币捐赠</summary>
+
+| 比特币（BTC） | TON / USDT（TON 网络） | ETH（仅限以太坊网络） |
+| :---: | :---: | :---: |
+| <img src="docs/donate-btc.png" width="140" alt="比特币地址二维码"> | <img src="docs/donate-ton.png" width="140" alt="TON 网络地址二维码"> | <img src="docs/donate-eth.png" width="140" alt="以太坊地址二维码"> |
+
+- **比特币：** `bc1q0d2j8zgrfnr33j83y9hza3mk0py8xtpzg5wxxv`
+- **TON 网络：** `UQA_zsyjS1uVC4r0aGfCiY6skZvMsqeeUb7K425eq42KYVai`
+- **以太坊：** `0xD6dc71Eba770A4527a94FBa9D369cf6f2B2CFB15`
+
+向 TON 地址转账前，请在钱包中选择 Toncoin（TON）或 USDT。发送 USDT 时请选择 TON 网络，不要使用 Ethereum 或 Tron 网络。
+
+</details>
+
 ## 许可证
 
 [GPL-3.0](LICENSE)。第三方代码：libyaml（MIT）、wolfSSL（GPL-3.0）和 ngtcp2

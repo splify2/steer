@@ -88,6 +88,25 @@ protocols: [VLESS](docs/vless.md), [hysteria2](docs/hysteria2.md), [trojan and o
 make && make test                   # build and run tests on the development machine
 ```
 
+## Support steer
+
+[Donate via CloudTips](https://pay.cloudtips.ru/p/fb925110)
+
+<details>
+<summary>Crypto donations</summary>
+
+| Bitcoin (BTC) | TON / USDT on TON | ETH (Ethereum only) |
+| :---: | :---: | :---: |
+| <img src="docs/donate-btc.png" width="140" alt="Bitcoin address QR code"> | <img src="docs/donate-ton.png" width="140" alt="TON network address QR code"> | <img src="docs/donate-eth.png" width="140" alt="Ethereum address QR code"> |
+
+- **Bitcoin:** `bc1q0d2j8zgrfnr33j83y9hza3mk0py8xtpzg5wxxv`
+- **TON network:** `UQA_zsyjS1uVC4r0aGfCiY6skZvMsqeeUb7K425eq42KYVai`
+- **Ethereum:** `0xD6dc71Eba770A4527a94FBa9D369cf6f2B2CFB15`
+
+For the TON address, select Toncoin (TON) or USDT in your wallet before sending. Use the TON network for USDT, not Ethereum or Tron.
+
+</details>
+
 ## License
 
 [GPL-3.0](LICENSE). Third-party code: libyaml (MIT), wolfSSL (GPL-3.0), and ngtcp2 (MIT, with the

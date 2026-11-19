@@ -88,6 +88,25 @@ steer explain example.org
 make && make test                   # сборка и стенды на машине разработки
 ```
 
+## Поддержать steer
+
+[Поддержать через CloudTips](https://pay.cloudtips.ru/p/fb925110)
+
+<details>
+<summary>Донаты в криптовалюте</summary>
+
+| Bitcoin (BTC) | TON / USDT в сети TON | ETH (только сеть Ethereum) |
+| :---: | :---: | :---: |
+| <img src="docs/donate-btc.png" width="140" alt="QR-код адреса Bitcoin"> | <img src="docs/donate-ton.png" width="140" alt="QR-код адреса в сети TON"> | <img src="docs/donate-eth.png" width="140" alt="QR-код адреса Ethereum"> |
+
+- **Bitcoin:** `bc1q0d2j8zgrfnr33j83y9hza3mk0py8xtpzg5wxxv`
+- **Сеть TON:** `UQA_zsyjS1uVC4r0aGfCiY6skZvMsqeeUb7K425eq42KYVai`
+- **Ethereum:** `0xD6dc71Eba770A4527a94FBa9D369cf6f2B2CFB15`
+
+Для адреса TON выберите в кошельке Toncoin (TON) или USDT перед отправкой. Для USDT используйте сеть TON, а не Ethereum или Tron.
+
+</details>
+
 ## Лицензия
 
 [GPL-3.0](LICENSE). Сторонний код: libyaml (MIT), wolfSSL (GPL-3.0) и ngtcp2 (MIT, с патчем Brutal) —
