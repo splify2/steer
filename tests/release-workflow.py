@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Offline checks of the actual release workflow ordering and channel predicates."""
 import pathlib
+import os
+import subprocess
 import unittest
 import yaml
 
@@ -23,6 +25,21 @@ class ReleaseWorkflow(unittest.TestCase):
         release = steps[by_name['Опубликовать релиз']]['with']
         self.assertEqual(release['target_commitish'], '${{ steps.release_commit.outputs.sha }}')
         self.assertIn('git ls-remote --tags', steps[by_name[gates[-1]]]['run'])
+
+    def test_strict_pluginmgr_gate(self):
+        step = steps[by_name['Стенды расширенной части на настоящей wolfSSL (внутри образа сборки)']]
+        self.assertFalse(step.get('continue-on-error', False))
+        for fragment in ('-v "$S2P:/opt/s2p:ro"', '-e S2P=/opt/s2p', '-e PM_STRICT=1', 'set -o pipefail'):
+            self.assertIn(fragment, step['run'])
+        self.assertNotIn('|| true', step['run'])
+        env = dict(os.environ, S2P='/nonexistent/steer-s2p', PM_STRICT='1')
+        result = subprocess.run(['sh', 'tests/pluginmgrmatch.sh'], env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('strict', result.stderr)
+        env['PM_STRICT'] = '0'
+        result = subprocess.run(['sh', 'tests/pluginmgrmatch.sh'], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('ПРОПУСК', result.stdout)
 
     def test_simulated_failures(self):
         # Inject failure at every step; record only publication steps actually reached.

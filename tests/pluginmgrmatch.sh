@@ -15,28 +15,37 @@
 #
 #   sh tests/pluginmgrmatch.sh [steerd с менеджером]
 # Без аргумента — собирает его сам (профиль extended + PLUGMGR_SRC + wolfSSL из $BUILD/wolfssl-host, как
-# tests/ext-test.sh). Нет wolfSSL, s2p или python3 — громкий пропуск.
+# tests/ext-test.sh). Нет wolfSSL, s2p или python3 — громкий пропуск; PM_STRICT=1 превращает его в ошибку.
 set -u
 BUILD=${BUILD:-build}
 CC=${CC:-cc}
 PM_EXPECT_CRYPTO=${PM_EXPECT_CRYPTO:-$(tr -d '\r' < src/cli/cli.h | sed -n 's/^#define CLI_STEER_CRYPTO "\(.*\)"$/\1/p')}
 [ -n "$PM_EXPECT_CRYPTO" ] || { echo "pluginmgrmatch: current crypto axis unavailable"; exit 2; }
-command -v python3 >/dev/null 2>&1 || { echo "pluginmgrmatch: python3 нет — ПРОПУСК"; exit 0; }
+skip() {
+    if [ "${PM_STRICT:-0}" = 1 ]; then
+        echo "pluginmgrmatch: $1 — ОШИБКА (strict)" >&2; exit 2
+    fi
+    echo "pluginmgrmatch: $1 — ПРОПУСК"; exit 0
+}
+command -v python3 >/dev/null 2>&1 || skip "python3 нет"
 S2P="${S2P:-}"
+if [ "${PM_STRICT:-0}" = 1 ] && { [ -z "$S2P" ] || [ ! -x "$S2P" ]; }; then
+    skip "нужен исполняемый S2P"
+fi
 if [ -z "$S2P" ]; then
     for c in "$(command -v s2p 2>/dev/null)" ../plugin-sdk/bin/s2p ../../plugin-sdk/bin/s2p \
              /home/yo1nk/splicicd/plugin-sdk/bin/s2p; do
         [ -n "$c" ] && [ -x "$c" ] && { S2P="$c"; break; }
     done
 fi
-[ -n "$S2P" ] && [ -x "$S2P" ] || { echo "pluginmgrmatch: инструмента s2p нет (S2P=… или plugin-sdk/bin/s2p) — ПРОПУСК"; exit 0; }
+[ -n "$S2P" ] && [ -x "$S2P" ] || skip "инструмента s2p нет (S2P=… или plugin-sdk/bin/s2p)"
 S2P="$(cd "$(dirname "$S2P")" && pwd)/$(basename "$S2P")"
 
 BIN="${1:-${PMSTEERD:-}}"
 if [ -z "$BIN" ]; then
     CCTAG=$(printf '%s' "$CC" | tr -c 'a-zA-Z0-9' '_')
     WLIB="$BUILD/wolfssl-host/libwolfssl-$CCTAG.a"
-    [ -f "$WLIB" ] || { echo "pluginmgrmatch: нет $WLIB (make ext-test собирает его) — ПРОПУСК"; exit 0; }
+    [ -f "$WLIB" ] || skip "нет $WLIB (make ext-test собирает его)"
     . build/sources.sh
     INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s ' "$d"; done) $(profile_var THIRD_DEFS)"
     WCF=$(cat "$WLIB.cflags")
