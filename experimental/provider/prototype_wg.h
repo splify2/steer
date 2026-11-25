@@ -6,7 +6,7 @@
 struct steer_pv1_flow_metadata;
 struct steer_prototype_wg;
 /* Isolated host profile, never enabled in the default binary. */
-int steer_prototype_wg_open(const char *,int outer_ns,uint16_t socks_port,struct steer_prototype_wg **);
+int steer_prototype_wg_open(const char *,int outer_ns,uint16_t socks_port,int scoped,struct steer_prototype_wg **);
 void steer_prototype_wg_close(struct steer_prototype_wg *);
 int steer_prototype_wg_request(struct steer_prototype_wg *,int operation,uint64_t expected,
     const char *,size_t,char *,size_t,size_t *);

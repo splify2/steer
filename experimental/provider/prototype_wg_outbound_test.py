@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real Core-selected TCP egress to a passive peer, in disposable namespaces."""
 import copy
+from contextlib import ExitStack
 import ipaddress
 import json
 import os
@@ -12,7 +13,7 @@ import tempfile
 from jsonschema import Draft202012Validator, FormatChecker
 
 from kernel_wg_owned_stage_test import child, line, run
-from prototype_test import control, free_port
+from prototype_test import control, core as normal_core, free_port, listener
 from socks_loopback_test import greeting, response
 
 DEST = "198.51.100.77"
@@ -78,7 +79,8 @@ def guard_tables():
     return {row for row in run("nft","list","tables").splitlines() if row.startswith("table inet steer_wg_")}
 
 
-def main(binary):
+def main(binary, ordinary=None):
+    scoped = ordinary is not None
     if (os.path.samefile("/proc/self/ns/net", "/proc/self/fd/3") or
             os.path.samefile("/proc/self/ns/net", "/proc/1/ns/net")):
         sys.exit("disposable netns required")
@@ -90,7 +92,7 @@ def main(binary):
         ns = ("nsenter", "-t", str(remote.pid), "-n")
         root = Path(tmp)
         state = root / "state"
-        (state / "wg-journal").mkdir(mode=0o700, parents=True)
+        (state / ("wg-scoped-journal" if scoped else "wg-journal")).mkdir(mode=0o700, parents=True)
         active_secret, passive_secret = run("wg", "genkey"), run("wg", "genkey")
         active_key = run("wg", "pubkey", input=active_secret).strip()
         passive_key = run("wg", "pubkey", input=passive_secret).strip()
@@ -139,15 +141,43 @@ def main(binary):
 
         def start(path, with_socks=True):
             args = ("--socks-port", str(socks)) if with_socks else ()
+            if scoped and with_socks:
+                args += ("--scoped-route",)
+            elif scoped:
+                return child(binary, "--wg-netns-profile", "--control", str(path), "--state-dir",
+                             str(inbound_state), env=env, pass_fds=(3,))
             return child(binary, "--wg-netns-profile", "--control", str(path), "--state-dir", str(state),
                          *args, env=env, pass_fds=(3,))
+
+        inbound_state = root / "inbound"
+        (inbound_state / "wg-journal").mkdir(mode=0o700, parents=True)
+
+        def scoped_device(address):
+            rules = json.loads(run("ip", "-j", "rule", "show"))
+            [lookup] = [r for r in rules if r.get("oif", "").startswith("sw") and r["priority"] == 1]
+            table = lookup["table"]
+            device = lookup["oif"]
+            [route] = json.loads(run("ip", "-j", "route", "show", "table", table))
+            assert route["dst"] == address and route["dev"] == device
+            return device, table
 
         def ready(p):
             value = line(p)
             assert value.startswith("READY ")
             return json.loads(value[6:])
 
-        with child(*ns, sys.executable, "-c", ECHO) as echo:
+        with ExitStack() as stack:
+            echo = stack.enter_context(child(*ns, sys.executable, "-c", ECHO))
+            if scoped:
+                direct_port = free_port()
+                ordinary_dir = root / "ordinary"
+                ordinary_dir.mkdir(mode=0o700)
+                direct_doc = {"prototype": "steer-linux-v1",
+                              "listeners": [listener("direct-entry", direct_port)],
+                              "routing": {"default": "direct", "rules": []}}
+                direct_ctl = stack.enter_context(normal_core(ordinary, ordinary_dir, direct_doc))
+                assert control(direct_ctl, "VALIDATE", doc)[0] == 422
+                assert control(direct_ctl, "APPLY", doc, 1)[0] == 422
             service = int(line(echo))
             direct_is_possible(DEST, service)
             assert line(echo) == "192.0.2.1"
@@ -178,11 +208,29 @@ def main(binary):
                     assert control(path, "VALIDATE", invalid)[0] == 422
                     assert control(path, "APPLY", invalid, 0)[0] == 422
                 assert "(none)" in run(*ns, "wg", "show", "passive-wg", "endpoints")
+                main_before = run("ip", "-j", "route", "show", "table", "main")
+                if scoped:
+                    # A rule with the same priority but without an oif can
+                    # preempt the selector. Never replace or remove it.
+                    run("ip", "rule", "add", "pref", "1", "lookup", "main")
+                    foreign_rules = run("ip", "-j", "rule", "show")
+                    assert control(path, "APPLY", doc, 0)[0] == 503
+                    assert run("ip", "-j", "rule", "show") == foreign_rules
+                    assert not guard_tables()
+                    run("ip", "rule", "del", "pref", "1", "lookup", "main")
                 result = control(path, "APPLY", doc, 0)
                 assert result[0] == 200, result
                 [route] = json.loads(run("ip", "-j", "route", "get", DEST))
-                device = route["dev"]
-                assert device.startswith("sw") and route["prefsrc"] == SOURCE
+                if scoped:
+                    device, table = scoped_device(DEST)
+                    assert route["dev"] == "wg-underlay"
+                    assert run("ip", "-j", "route", "show", "table", "main") == main_before
+                    connect(direct_port, DEST, service, "192.0.2.1")
+                    assert line(echo) == "192.0.2.1"
+                else:
+                    device = route["dev"]
+                    assert device.startswith("sw") and route["prefsrc"] == SOURCE
+                revision = control(path, "STATUS")[1]["revision"]
                 assert run(*ns, "wg", "show", "passive-wg", "latest-handshakes").split()[1] == "0"
                 connect(socks, DEST, service, SOURCE)
                 assert line(echo) == SOURCE
@@ -205,8 +253,8 @@ except TimeoutError:
 """
                     run(*ns,sys.executable,"-c",try_new,SOURCE,str(blocked),DEST)
                     no_connect(local_echo)
-                # Colliding main-table route leaves the foreign route and the
-                # previous WG resource intact, after the candidate reached UP.
+                # A foreign main route (legacy mode) or an intercepting rule
+                # (scoped mode) fails staging without replacing either owner.
                 conflict = "198.51.100.79"
                 current_guards = guard_tables()
                 assert len(current_guards) == 1
@@ -218,7 +266,11 @@ except TimeoutError:
                 changed["peers"][0]["allowed_ips"] = [f"{conflict}/32"]
                 changed["listen_port"] = udp_port()
                 assert control(path,"VALIDATE",candidate)[0] == 200
-                assert control(path,"APPLY",candidate,1)[0] == 503
+                if scoped:
+                    run("ip", "rule", "add", "pref", "1", "lookup", "main")
+                assert control(path,"APPLY",candidate,revision)[0] == 503
+                if scoped:
+                    run("ip", "rule", "del", "pref", "1", "lookup", "main")
                 assert control(path,"GET")[1]["document"] == doc
                 assert json.loads(run("ip","-j","route","get",conflict))[0]["dev"] == "wg-underlay"
                 assert {r["ifname"] for r in json.loads(run("ip","-j","link","show"))
@@ -230,8 +282,24 @@ except TimeoutError:
                 assert core.wait(timeout=5) == -9
             path = root / "restart.sock"
             with start(path) as core:
-                assert ready(core)["revision"] == 1 and control(path, "GET")[1]["document"] == doc
-                assert json.loads(run("ip", "-j", "route", "get", DEST))[0]["dev"] == device
+                assert ready(core)["revision"] == revision and control(path, "GET")[1]["document"] == doc
+                if scoped:
+                    assert scoped_device(DEST) == (device, table)
+                    run("ip", "route", "del", f"{DEST}/32", "table", table, "dev", device)
+                    connect(socks, DEST, service)
+                    no_connect(echo)
+                    assert not control(path, "STATUS")[1]["runtimeReady"]
+                    connect(direct_port, DEST, service, "192.0.2.1")
+                    assert line(echo) == "192.0.2.1"
+                    run("ip", "route", "add", f"{DEST}/32", "table", table,
+                        "dev", device, "scope", "link", "proto", "242")
+                    rule = ("pref", "2", "oif", device, "unreachable", "table", table, "protocol", "242")
+                    run("ip", "rule", "del", *rule)
+                    connect(socks, DEST, service)
+                    no_connect(echo)
+                    run("ip", "rule", "add", *rule)
+                else:
+                    assert json.loads(run("ip", "-j", "route", "get", DEST))[0]["dev"] == device
                 connect(socks, DEST, service, SOURCE)
                 assert line(echo) == SOURCE
                 # A handshake already accepted on generation 1 cannot use
@@ -248,13 +316,16 @@ except TimeoutError:
                 run(*ns,"ip","route","add",f"{source2}/32","dev","passive-wg")
                 with socket.create_connection(("127.0.0.1",socks),timeout=4) as old:
                     greeting(old)
-                    result = control(path,"APPLY",replacement,1)
+                    result = control(path,"APPLY",replacement,revision)
                     assert result[0] == 200, result
                     old.sendall(b"\x05\x01\x00\x01"+ipaddress.IPv4Address(OUTSIDE).packed+service.to_bytes(2,"big"))
                     assert response(old) == 2
                     no_connect(echo)
                 assert control(path,"GET")[1]["document"] == replacement
-                new_device = json.loads(run("ip","-j","route","get",OUTSIDE))[0]["dev"]
+                if scoped:
+                    new_device, _ = scoped_device(OUTSIDE)
+                else:
+                    new_device = json.loads(run("ip","-j","route","get",OUTSIDE))[0]["dev"]
                 assert new_device.startswith("sw") and new_device != device
                 connect(socks,OUTSIDE,service,source2)
                 assert line(echo) == source2
@@ -271,7 +342,11 @@ except TimeoutError:
                 assert not (root / "missing.sock").exists()
             print("PASS restart and generation switch; old handshake cannot use new WG; device loss never falls back",
                   flush=True)
+            if scoped:
+                print("PASS ordinary Core direct to same target before first WG handshake; missing route and rule denied",
+                      flush=True)
 
 
 if __name__ == "__main__":
-    main(str(Path(sys.argv[1]).resolve(strict=True)))
+    main(str(Path(sys.argv[1]).resolve(strict=True)),
+         str(Path(sys.argv[3]).resolve(strict=True)) if len(sys.argv) == 4 and sys.argv[2] == "--scoped-route" else None)

@@ -1753,15 +1753,16 @@ int steer_prototype_main(int argc, char **argv)
 #ifdef STEER_PROTOTYPE_WG_NETNS
     /* One exclusive opt-in profile, kernel dataplane, serialized control.
      * fd 3 must pin the original netns from before entry into the fixture. */
-    if((argc==6||argc==8)&&!strcmp(argv[1],"--wg-netns-profile")&&!strcmp(argv[2],"--control")&&
+    if((argc==6||argc==8||argc==9)&&!strcmp(argv[1],"--wg-netns-profile")&&!strcmp(argv[2],"--control")&&
        !strcmp(argv[4],"--state-dir")){
         uint64_t socks=0;
-        if(argc==8){
+        if(argc>=8){
             const char *p=argv[7];
             if(strcmp(argv[6],"--socks-port")||!decimal(&p,&socks)||*p||!socks||socks>UINT16_MAX)return 2;
         }
+        if(argc==9&&strcmp(argv[8],"--scoped-route"))return 2;
         if(!initialize_host(&h,clients))goto cleanup;
-        if(steer_prototype_wg_open(argv[5],3,(uint16_t)socks,&h.wg))goto cleanup;
+        if(steer_prototype_wg_open(argv[5],3,(uint16_t)socks,argc==9,&h.wg))goto cleanup;
         if(socks){
             /* Frontend lifetime is independent of WG revisions; each accepted
              * SOCKS request still pins the published WG revision. */

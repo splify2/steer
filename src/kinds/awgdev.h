@@ -78,6 +78,12 @@ int awg_dev_link_up_owned_until(const char *,const char *,int,uint32_t,uint64_t)
  * default route; deleting the owned link also removes its attached route. */
 int awg_dev_route_add_owned_until(const char *,const char *,int,uint32_t,const struct awg_prefix *,uint64_t);
 int awg_dev_route_check_owned_until(const char *,const char *,int,uint32_t,const struct awg_prefix *,uint64_t);
+/* Disposable namespace only. Group-derived private table; exact oif lookup
+ * and terminal stop rules. Retire rules before deleting the owned link. */
+int awg_dev_scoped_route_add_until(const char *,const char *,int,uint32_t,const struct awg_prefix *,uint64_t);
+int awg_dev_scoped_route_check_until(const char *,const char *,int,uint32_t,const struct awg_prefix *,uint64_t);
+int awg_dev_scoped_route_match_until(int,uint32_t,const struct awg_prefix *,const uint8_t [4],const uint8_t [4],uint64_t);
+int awg_dev_scoped_rules_retire_until(const char *,int,uint32_t,uint64_t);
 
 /* Exclusive device creation for the experimental owned-device adapter. Never
  * adopts/reconfigures an existing link. kind must be wireguard/amneziawg.

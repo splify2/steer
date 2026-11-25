@@ -190,9 +190,8 @@ The next linked profile should extend the existing Core, not dispatch into
    `select_stream`; use the existing ordered route action and binding index
    instead of a protocol-specific branch. WG gets its own native binding and
    no resolver. Keep the separate direct binding unchanged for flows explicitly
-   routed there; do not use a namespace `main`-table route that could reroute
-   direct traffic into WG. Put the owned destination route in a scoped routing
-   table selected by that binding only, and verify both route and selector.
+   routed there; use the scoped route binding below rather than the old
+   namespace `main`-table route.
 2. The prepare worker lowers intent and resolves keys. The serialized durable
    writer reserves lifecycle credits and stages owned link, DROP, route and
    binding; only a verified immutable candidate may enter the owner registry.
@@ -210,3 +209,48 @@ The next linked profile should extend the existing Core, not dispatch into
    on both sides of commit. Do not advertise mixed profile support until
    independent SOCKS5/VLESS/HY2 TCP clients and a passive WG peer pass that
    test on the same committed revision.
+
+### Scoped route prerequisite
+
+In the existing isolated outbound profile only, append `--scoped-route`
+after `--socks-port PORT` and use a fresh state directory with a private
+`wg-scoped-journal` instead of `wg-journal`. These state directories are
+intentionally not interchangeable. The old invocation and ordinary build
+are unchanged. This flag does not enable WG in linked Apply or add a
+capability.
+
+The bounded IPv4 route lives in a private table keyed by the journaled
+random link group. RPDB priority 1 selects that table only for `oif` equal
+to the owned interface; priority 2 terminates that lookup path with
+`unreachable` rather than continuing to `main`. The connector pins the
+socket to the exact ifindex and source, so this needs no shared packet mark,
+does not select the encrypted UDP underlay, and does not affect unbound
+direct sockets. A Linux bound-interface lookup can synthesize a link route
+after a FIB failure; the connector never relies on the stop rule alone.
+Before connecting it verifies the namespace, link identity and UP state,
+guard, both rules, the sole exact route, and the effective TCP FIB result.
+Any mismatch denies the connection. There is no unbound retry.
+
+Staging rejects nonempty private tables and RPDB selectors that can
+intercept the early lookup or reference the private table, without
+replacing them. Rules for a different non-inverted `oif` may coexist at the
+reserved priorities. Route and rule protocol 242 is private to this
+disposable profile; this is not protection against an administrator racing
+or forging kernel state. Retirement requires an exact owned link and its
+private route as evidence before deleting rules. If evidence has vanished
+or changed, leave ambiguous rules alone and fail closed. Deleting the link
+removes the route; restart verifies the committed generation before cleanup.
+
+After building both binaries, run:
+
+```sh
+unshare -n -- env TMPDIR="$out" PYTHONDONTWRITEBYTECODE=1 \
+    python3 experimental/provider/prototype_wg_outbound_test.py \
+    "$out/steer-prototype-wg-netns" --scoped-route "$out/steer-prototype" \
+    3</proc/self/ns/net
+```
+
+The fixture uses an ordinary Core for the direct path (before the passive
+peer's first handshake) and the opt-in Core for WG, both reaching the same
+IP and TCP port with different source addresses. This checks the kernel
+isolation prerequisite, not a mixed configuration in one active revision.

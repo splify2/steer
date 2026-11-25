@@ -16,7 +16,7 @@
 struct steer_draft_wg_stream {
     struct steer_draft_wg_guard_record guard;
     struct awg_prefix source,route;
-    int ns;
+    int ns,scoped;
 };
 
 int steer_draft_wg_stream_verify(const struct steer_draft_wg_stream *w,uint64_t d){
@@ -31,13 +31,14 @@ int steer_draft_wg_stream_verify(const struct steer_draft_wg_stream *w,uint64_t 
     if(rc)return rc;
     if(steer_draft_wg_guard_record_observe(r,table.handle,table.comment)!=STEER_DRAFT_WG_OWNED)return ESTALE;
     /* The route check also checks UP, kind, group and index. */
-    return awg_dev_route_check_owned_until(r->link.physical_name,r->link.kind,seen.index,
+    return (w->scoped?awg_dev_scoped_route_check_until:awg_dev_route_check_owned_until)(
+        r->link.physical_name,r->link.kind,seen.index,
         r->link.group,&w->route,d);
 }
 
 int steer_draft_wg_stream_create(const struct steer_draft_wg_linux_link *link,
     const struct steer_draft_wg_guard_record *r,const struct awg_prefix *source,
-    const struct awg_prefix *route,uint64_t deadline,struct steer_draft_wg_stream **out){
+    const struct awg_prefix *route,int scoped,uint64_t deadline,struct steer_draft_wg_stream **out){
     if(!out)return EINVAL;
     *out=NULL;
     uint8_t bytes[STEER_DRAFT_WG_GUARD_RECORD_BYTES];
@@ -48,7 +49,7 @@ int steer_draft_wg_stream_create(const struct steer_draft_wg_linux_link *link,
     if(ns<0)return errno;
     struct steer_draft_wg_stream *w=malloc(sizeof(*w));
     if(!w){close(ns);return ENOMEM;}
-    *w=(struct steer_draft_wg_stream){.guard=*r,.source=*source,.route=*route,.ns=ns};
+    *w=(struct steer_draft_wg_stream){.guard=*r,.source=*source,.route=*route,.ns=ns,.scoped=scoped};
     int rc=steer_draft_wg_stream_verify(w,deadline);
     if(rc){steer_draft_wg_stream_destroy(w);return rc;}
     *out=w;
@@ -77,10 +78,12 @@ uint32_t steer_draft_wg_stream_bind(void *ctx,int fd,const struct sockaddr_stora
     if(!now)return STEER_PV1_IO;
     const uint64_t maximum=now+50000000u;
     if(d>maximum)d=maximum;
-    if(steer_draft_wg_stream_verify(w,d))return STEER_PV1_POLICY_DENIED;
     int idx=(int)w->guard.ifindex;
     memcpy(&source.sin_addr,w->source.addr,4);
     if(setsockopt(fd,SOL_SOCKET,SO_BINDTOIFINDEX,&idx,sizeof(idx))||
        bind(fd,(const struct sockaddr *)&source,sizeof(source)))return STEER_PV1_POLICY_DENIED;
+    if(steer_draft_wg_stream_verify(w,d))return STEER_PV1_POLICY_DENIED;
+    if(w->scoped&&awg_dev_scoped_route_match_until(idx,w->guard.link.group,&w->route,
+        w->source.addr,(const uint8_t *)&target.sin_addr,d))return STEER_PV1_POLICY_DENIED;
     return STEER_PV1_OK;
 }

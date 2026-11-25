@@ -211,7 +211,8 @@ static int verify(void *ctx,const struct steer_draft_wg_guard_record *r,uint64_t
     rc=awg_dev_link_require_down_owned_until(r->link.physical_name,r->link.kind,
         (int)r->ifindex,r->link.group,d);
     if(rc!=EBUSY)return rc?rc:ESTALE;
-    return g->route?awg_dev_route_check_owned_until(r->link.physical_name,r->link.kind,
+    return g->route?(g->scoped_route?awg_dev_scoped_route_check_until:awg_dev_route_check_owned_until)(
+        r->link.physical_name,r->link.kind,
         (int)r->ifindex,r->link.group,g->route,d):0;
 }
 static int recovery(struct steer_prototype_wg *w){
@@ -267,22 +268,26 @@ void steer_prototype_wg_close(struct steer_prototype_wg *w){
     steer_draft_wg_linux_link_close(w->guard.link);
     free(w);
 }
-int steer_prototype_wg_open(const char *state,int outer,uint16_t socks,struct steer_prototype_wg **out){
+int steer_prototype_wg_open(const char *state,int outer,uint16_t socks,int scoped,struct steer_prototype_wg **out){
     *out=NULL;
     struct __user_cap_header_struct header={_LINUX_CAPABILITY_VERSION_3,0};
     struct __user_cap_data_struct caps[2]={0};
-    char journal[PATH_MAX];
-    int len=snprintf(journal,sizeof(journal),"%s/wg-journal",state);
+    char journal[PATH_MAX],other[PATH_MAX];
+    int len=snprintf(journal,sizeof(journal),"%s/%s",state,scoped?"wg-scoped-journal":"wg-journal");
+    int other_len=snprintf(other,sizeof(other),"%s/%s",state,scoped?"wg-journal":"wg-scoped-journal");
     if(geteuid()!=0||syscall(SYS_capget,&header,caps)||!(caps[0].effective&(1u<<CAP_NET_ADMIN))||
-       len<0||(size_t)len>=sizeof(journal)||*state!='/')return EPERM;
+       len<0||(size_t)len>=sizeof(journal)||other_len<0||(size_t)other_len>=sizeof(other)||*state!='/')return EPERM;
     struct steer_prototype_wg *w=calloc(1,sizeof(*w));
     if(!w)return ENOMEM;
     w->socks_port=socks;
+    w->guard.scoped_route=scoped;
     int rc=EIO;
+    struct stat st;
     struct steer_store_document *on_disk=NULL;
     if(steer_draft_wg_linux_link_open(outer,&w->guard.link)||!forwarding_disabled()||
        (socks&&!bind_index_available())||
        steer_prototype_store_open(state,&w->store).code||
+       !lstat(other,&st)||errno!=ENOENT||
        steer_draft_wg_selection_open(journal,32,&w->journal))goto fail;
     struct steer_pv1_error loaded=steer_prototype_store_recover_document(w->store,&on_disk);
     if(loaded.code!=STEER_PV1_UNSUPPORTED){
@@ -297,7 +302,7 @@ int steer_prototype_wg_open(const char *state,int outer,uint16_t socks,struct st
     rc=recovery(w);
     if(rc)goto fail;
     if(w->egress){
-        rc=steer_draft_wg_stream_create(w->guard.link,&w->selected,&w->address,&w->route,deadline(),&w->stream);
+        rc=steer_draft_wg_stream_create(w->guard.link,&w->selected,&w->address,&w->route,scoped,deadline(),&w->stream);
         if(rc)goto fail;
     }
     steer_store_document_destroy(on_disk);
@@ -355,7 +360,7 @@ static int apply(struct steer_prototype_wg *w,struct parsed *p){
     if(steer_draft_wg_selection_stage(w->journal,&steer_draft_wg_linux_guard_backend,&w->guard,
         &w->revision,w->port,&tx,&c,d,&candidate))goto done;
     if(p->egress&&steer_draft_wg_stream_create(w->guard.link,&candidate.guard,&p->cfg.kernel.addr[0],
-        &p->route,d,&stream))goto done;
+        &p->route,w->guard.scoped_route,d,&stream))goto done;
     struct steer_prototype_store_result r=steer_prototype_store_commit(txn);
     if(r.phase==STEER_PROTOTYPE_STORE_SYNCED&&!r.error.code){
         choose(w,p);

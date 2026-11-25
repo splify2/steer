@@ -16,6 +16,15 @@ static int stage(void *ctx,const struct steer_draft_wg_identity *id,int index,
 }
 static int retire(void *ctx,const struct steer_draft_wg_identity *id,uint64_t d){
     const struct steer_draft_wg_linux_guard *g=ctx;
+    if(g&&g->scoped_route){
+        struct steer_draft_wg_observation seen;
+        int rc=steer_draft_wg_identity_reconcile(id,steer_draft_wg_linux_link_namespace(g->link),d,&seen);
+        if(rc)return rc;
+        if(seen.state!=STEER_DRAFT_WG_OWNED&&seen.state!=STEER_DRAFT_WG_ABSENT)return ESTALE;
+        rc=awg_dev_scoped_rules_retire_until(id->physical_name,
+            seen.state==STEER_DRAFT_WG_OWNED?seen.index:0,id->group,d);
+        if(rc)return rc;
+    }
     return g?steer_draft_wg_linux_link_backend.retire_link(g->link,id,d):EINVAL;
 }
 static int guard(void *ctx,const struct steer_draft_wg_guard_record *r,int publish,
@@ -53,6 +62,8 @@ static int up(void *ctx,const struct steer_draft_wg_guard_record *r,uint64_t d){
     rc=awg_dev_link_up_owned_until(r->link.physical_name,r->link.kind,(int)r->ifindex,r->link.group,d);
     const struct steer_draft_wg_linux_guard *g=ctx;
     if(rc||!g->route)return rc;
+    if(g->scoped_route)return awg_dev_scoped_route_add_until(r->link.physical_name,r->link.kind,
+        (int)r->ifindex,r->link.group,g->route,d);
     /* Linux requires the route's nexthop to be UP. This is still before
      * policy publication: the journal-proven DROP remains installed. */
     rc=awg_dev_route_add_owned_until(r->link.physical_name,r->link.kind,

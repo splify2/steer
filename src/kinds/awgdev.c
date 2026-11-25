@@ -31,6 +31,7 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/genetlink.h>
+#include <linux/fib_rules.h>
 
 #include "awg.h"
 #include "awgdev.h"
@@ -923,24 +924,58 @@ static int owned_identity_state_until(const char *name,const char *kind,int inde
 static int owned_identity_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline){
     return owned_identity_state_until(name,kind,index,group,NULL,deadline);
 }
-struct wg_route_check { const struct awg_prefix *prefix; int index,found; };
+/* Private disposable-netns selector. The nonzero owned link group is the
+ * full-width table ID, not an 8-bit rtm_table value. */
+#define WG_ROUTE_PROTOCOL 242
+#define WG_LOOKUP_PRIORITY 1
+#define WG_STOP_PRIORITY 2
+struct wg_route_check { const struct awg_prefix *prefix; uint32_t table; int index,found,count; };
+static uint32_t wg_attr_u32(const struct nlattr *a){
+    uint32_t n=0;
+    if(a&&NLA_PLEN(a)==4)memcpy(&n,NLA_DATA(a),4);
+    return n;
+}
 static void wg_route_cb(const struct nlmsghdr *h,void *ctx){
     struct wg_route_check *r=ctx;
     const struct rtmsg *rt=NLMSG_DATA(h);
     size_t head=NLMSG_LENGTH(sizeof(*rt));
-    if(h->nlmsg_type!=RTM_NEWROUTE||h->nlmsg_len<head||rt->rtm_family!=AF_INET||
-       rt->rtm_table!=RT_TABLE_MAIN||rt->rtm_protocol!=RTPROT_STATIC||
-       rt->rtm_type!=RTN_UNICAST||rt->rtm_scope!=RT_SCOPE_LINK||rt->rtm_dst_len!=r->prefix->cidr)return;
+    if(h->nlmsg_type!=RTM_NEWROUTE||h->nlmsg_len<head||rt->rtm_family!=AF_INET)return;
     const struct nlattr *a[RTA_MAX+1];
     attrs_parse((const uint8_t *)h+head,h->nlmsg_len-head,a,RTA_MAX);
-    if(!a[RTA_DST]||NLA_PLEN(a[RTA_DST])!=4||memcmp(NLA_DATA(a[RTA_DST]),r->prefix->addr,4)||
-       !a[RTA_OIF]||NLA_PLEN(a[RTA_OIF])!=4||a[RTA_GATEWAY]||a[RTA_MULTIPATH]||a[RTA_PRIORITY])return;
+    uint32_t table=a[RTA_TABLE]?wg_attr_u32(a[RTA_TABLE]):rt->rtm_table;
+    if(table!=r->table)return;
+    r->count++;
+    if(rt->rtm_protocol!=(table==RT_TABLE_MAIN?RTPROT_STATIC:WG_ROUTE_PROTOCOL)||
+       rt->rtm_type!=RTN_UNICAST||rt->rtm_scope!=RT_SCOPE_LINK||
+       rt->rtm_src_len||rt->rtm_tos||rt->rtm_dst_len<24||rt->rtm_dst_len>32||
+       (r->prefix&&rt->rtm_dst_len!=r->prefix->cidr))return;
+    if(!a[RTA_DST]||NLA_PLEN(a[RTA_DST])!=4||(r->prefix&&memcmp(NLA_DATA(a[RTA_DST]),r->prefix->addr,4))||
+       !a[RTA_OIF]||NLA_PLEN(a[RTA_OIF])!=4||a[RTA_GATEWAY]||a[RTA_MULTIPATH]||a[RTA_PRIORITY]||a[RTA_NH_ID])return;
+    if(table!=RT_TABLE_MAIN){
+        if(rt->rtm_flags)return;
+        for(int i=1;i<=RTA_MAX;i++)
+            if(a[i]&&i!=RTA_TABLE&&i!=RTA_DST&&i!=RTA_OIF)return;
+    }
     uint32_t index;
     memcpy(&index,NLA_DATA(a[RTA_OIF]),4);
     if(index==(uint32_t)r->index)r->found=1;
 }
+static int wg_route_dump(uint32_t table,const struct awg_prefix *prefix,int index,uint64_t deadline,
+    struct wg_route_check *out){
+    _Alignas(8) uint8_t buf[128];
+    struct nlbuf b;
+    struct rtmsg rt={.rtm_family=AF_INET};
+    struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),RTM_GETROUTE,NLM_F_REQUEST|NLM_F_DUMP,
+        next_seq(),&rt,sizeof(rt));
+    int fd=nl_open(NETLINK_ROUTE);
+    if(fd<0)return errno;
+    *out=(struct wg_route_check){.prefix=prefix,.table=table,.index=index};
+    int rc=nl_talk_until(fd,buf,msg_end(&b,h),wg_route_cb,out,deadline);
+    close(fd);
+    return rc;
+}
 static int wg_route(const char *name,const char *kind,int index,uint32_t group,
-    const struct awg_prefix *route,uint64_t deadline,int add){
+    const struct awg_prefix *route,uint64_t deadline,int add,uint32_t table){
     if(!route||route->family!=AF_INET||route->cidr<24||route->cidr>32||!deadline)return EINVAL;
     for(unsigned bit=route->cidr;bit<32;bit++)
         if(route->addr[bit/8]&(0x80u>>(bit%8)))return EINVAL;
@@ -948,37 +983,165 @@ static int wg_route(const char *name,const char *kind,int index,uint32_t group,
     int rc=owned_identity_state_until(name,kind,index,group,&flags,deadline);
     if(rc)return rc;
     if(!(flags&IFF_UP))return ENETDOWN;
+    if(!add){
+        struct wg_route_check check;
+        rc=wg_route_dump(table,route,index,deadline,&check);
+        return rc?rc:!check.found||(table!=RT_TABLE_MAIN&&check.count!=1)?ENOENT:0;
+    }
     int fd=nl_open(NETLINK_ROUTE);
     if(fd<0)return errno;
     _Alignas(8) uint8_t buf[128];
     struct nlbuf b;
-    struct rtmsg rt={.rtm_family=AF_INET};
-    if(add){
-        rt.rtm_dst_len=route->cidr;
-        rt.rtm_table=RT_TABLE_MAIN;
-        rt.rtm_protocol=RTPROT_STATIC;
-        rt.rtm_scope=RT_SCOPE_LINK;
-        rt.rtm_type=RTN_UNICAST;
-    }
-    struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),add?RTM_NEWROUTE:RTM_GETROUTE,
-        NLM_F_REQUEST|(add?(NLM_F_ACK|NLM_F_CREATE|NLM_F_EXCL):NLM_F_DUMP),
+    struct rtmsg rt={.rtm_family=AF_INET,.rtm_dst_len=route->cidr,
+        .rtm_table=table<=255?(uint8_t)table:RT_TABLE_UNSPEC,
+        .rtm_protocol=table==RT_TABLE_MAIN?RTPROT_STATIC:WG_ROUTE_PROTOCOL,
+        .rtm_scope=RT_SCOPE_LINK,.rtm_type=RTN_UNICAST};
+    struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),RTM_NEWROUTE,
+        NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE|NLM_F_EXCL,
         next_seq(),&rt,sizeof(rt));
-    if(add){
-        nlbuf_put_data(&b,RTA_DST,route->addr,4);
-        nlbuf_put_u32(&b,RTA_OIF,(uint32_t)index);
-    }
-    struct wg_route_check check={.prefix=route,.index=index};
-    rc=nl_talk_until(fd,buf,msg_end(&b,h),add?NULL:wg_route_cb,&check,deadline);
+    nlbuf_put_data(&b,RTA_DST,route->addr,4);
+    nlbuf_put_u32(&b,RTA_OIF,(uint32_t)index);
+    if(table>255)nlbuf_put_u32(&b,RTA_TABLE,table);
+    rc=nl_talk_until(fd,buf,msg_end(&b,h),NULL,NULL,deadline);
     close(fd);
-    return rc?rc:!add&&!check.found?ENOENT:0;
+    return rc;
 }
 int awg_dev_route_add_owned_until(const char *name,const char *kind,int index,uint32_t group,
     const struct awg_prefix *route,uint64_t deadline){
-    return wg_route(name,kind,index,group,route,deadline,1);
+    return wg_route(name,kind,index,group,route,deadline,1,RT_TABLE_MAIN);
 }
 int awg_dev_route_check_owned_until(const char *name,const char *kind,int index,uint32_t group,
     const struct awg_prefix *route,uint64_t deadline){
-    return wg_route(name,kind,index,group,route,deadline,0);
+    return wg_route(name,kind,index,group,route,deadline,0,RT_TABLE_MAIN);
+}
+struct wg_rules {
+    const char *name;
+    uint32_t table;
+    unsigned lookup,stop,conflict,detached;
+};
+static void wg_rule_cb(const struct nlmsghdr *h,void *arg){
+    struct wg_rules *r=arg;
+    const size_t head=NLMSG_LENGTH(sizeof(struct fib_rule_hdr));
+    if(h->nlmsg_type!=RTM_NEWRULE||h->nlmsg_len<head)return;
+    const struct fib_rule_hdr *f=NLMSG_DATA(h);
+    if(f->family!=AF_INET)return;
+    const struct nlattr *a[FRA_MAX+1];
+    attrs_parse((const uint8_t *)h+head,h->nlmsg_len-head,a,FRA_MAX);
+    uint32_t table=a[FRA_TABLE]?wg_attr_u32(a[FRA_TABLE]):f->table;
+    uint32_t prio=wg_attr_u32(a[FRA_PRIORITY]);
+    const struct nlattr *oif=a[FRA_OIFNAME];
+    size_t len=strlen(r->name)+1;
+    int same=oif&&NLA_PLEN(oif)==len&&!memcmp(NLA_DATA(oif),r->name,len);
+    int simple=!f->src_len&&!f->dst_len&&!f->tos&&!(f->flags&~FIB_RULE_OIF_DETACHED);
+    for(int i=1;i<=FRA_MAX;i++){
+        if(a[i]&&i!=FRA_TABLE&&i!=FRA_PRIORITY&&i!=FRA_OIFNAME&&i!=FRA_PROTOCOL&&i!=FRA_PAD&&i!=FRA_SUPPRESS_PREFIXLEN)
+            simple=0;
+    }
+    if(a[FRA_SUPPRESS_PREFIXLEN]&&wg_attr_u32(a[FRA_SUPPRESS_PREFIXLEN])!=UINT32_MAX)simple=0;
+    int ours=same&&simple&&a[FRA_PROTOCOL]&&NLA_PLEN(a[FRA_PROTOCOL])==1&&
+        *(const uint8_t *)NLA_DATA(a[FRA_PROTOCOL])==WG_ROUTE_PROTOCOL;
+    if(ours&&prio==WG_LOOKUP_PRIORITY&&f->action==FR_ACT_TO_TBL&&table==r->table){
+        r->lookup++;r->detached|=f->flags&FIB_RULE_OIF_DETACHED;return;
+    }
+    /* Give the terminal rule the same ownership token in FRA_TABLE. Its
+     * action does not consult that table. */
+    if(ours&&prio==WG_STOP_PRIORITY&&f->action==FR_ACT_UNREACHABLE&&table==r->table){
+        r->stop++;r->detached|=f->flags&FIB_RULE_OIF_DETACHED;return;
+    }
+    if(table==r->table)r->conflict++;
+    else if(prio<=WG_STOP_PRIORITY){
+        if(!prio&&!oif&&simple&&!f->flags&&f->action==FR_ACT_TO_TBL&&table==RT_TABLE_LOCAL)return;
+        if(oif&&!same&&!(f->flags&FIB_RULE_INVERT))return;
+        r->conflict++;
+    }
+}
+static int wg_rule(const char *name,uint32_t table,int op,int stop,uint64_t deadline,struct wg_rules *rules){
+    _Alignas(8) uint8_t buf[256];
+    struct nlbuf b;
+    struct fib_rule_hdr f={.family=AF_INET};
+    if(op!=RTM_GETRULE)f.action=stop?FR_ACT_UNREACHABLE:FR_ACT_TO_TBL;
+    struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),op,NLM_F_REQUEST|
+        (op==RTM_GETRULE?NLM_F_DUMP:NLM_F_ACK|(op==RTM_NEWRULE?(NLM_F_CREATE|NLM_F_EXCL):0)),
+        next_seq(),&f,sizeof(f));
+    if(op!=RTM_GETRULE){
+        nlbuf_put_u32(&b,FRA_PRIORITY,stop?WG_STOP_PRIORITY:WG_LOOKUP_PRIORITY);
+        nlbuf_put_u32(&b,FRA_TABLE,table);
+        nlbuf_put_data(&b,FRA_OIFNAME,name,strlen(name)+1);
+        const uint8_t proto=WG_ROUTE_PROTOCOL;
+        nlbuf_put_data(&b,FRA_PROTOCOL,&proto,sizeof(proto));
+    }
+    int fd=nl_open(NETLINK_ROUTE);
+    if(fd<0)return errno;
+    if(rules)*rules=(struct wg_rules){.name=name,.table=table};
+    int rc=nl_talk_until(fd,buf,msg_end(&b,h),rules?wg_rule_cb:NULL,rules,deadline);
+    close(fd);
+    return rc;
+}
+int awg_dev_scoped_route_check_until(const char *name,const char *kind,int index,uint32_t group,
+    const struct awg_prefix *prefix,uint64_t d){
+    if(group<=255||!name||!d)return EINVAL;
+    struct wg_rules rules;
+    int rc=wg_rule(name,group,RTM_GETRULE,0,d,&rules);
+    if(rc)return rc;
+    if(rules.conflict||rules.detached||rules.lookup!=1||rules.stop!=1)return ESTALE;
+    return wg_route(name,kind,index,group,prefix,d,0,group);
+}
+int awg_dev_scoped_route_match_until(int index,uint32_t table,const struct awg_prefix *prefix,
+    const uint8_t source[4],const uint8_t destination[4],uint64_t d){
+    if(index<=0||table<=255||!prefix||!source||!destination||!d)return EINVAL;
+    _Alignas(8) uint8_t buf[128];
+    struct nlbuf b;
+    struct rtmsg rt={.rtm_family=AF_INET,.rtm_src_len=32,.rtm_dst_len=32,
+        .rtm_flags=RTM_F_FIB_MATCH|RTM_F_LOOKUP_TABLE};
+    struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),RTM_GETROUTE,NLM_F_REQUEST|NLM_F_ACK,
+        next_seq(),&rt,sizeof(rt));
+    nlbuf_put_data(&b,RTA_SRC,source,4);
+    nlbuf_put_data(&b,RTA_DST,destination,4);
+    nlbuf_put_u32(&b,RTA_OIF,(uint32_t)index);
+    /* Match the TCP socket's route key rather than a lookup with no protocol. */
+    const uint8_t proto=IPPROTO_TCP;
+    nlbuf_put_data(&b,RTA_IP_PROTO,&proto,sizeof(proto));
+    int fd=nl_open(NETLINK_ROUTE);
+    if(fd<0)return errno;
+    struct wg_route_check check={.prefix=prefix,.table=table,.index=index};
+    int rc=nl_talk_until(fd,buf,msg_end(&b,h),wg_route_cb,&check,d);
+    close(fd);
+    return rc?rc:check.found&&check.count==1?0:ESTALE;
+}
+int awg_dev_scoped_route_add_until(const char *name,const char *kind,int index,uint32_t group,
+    const struct awg_prefix *prefix,uint64_t d){
+    if(group<=255||!name||!d)return EINVAL;
+    struct wg_rules rules;
+    struct wg_route_check routes;
+    int rc=wg_rule(name,group,RTM_GETRULE,0,d,&rules);
+    if(rc)return rc;
+    if(rules.conflict||rules.lookup||rules.stop)return EEXIST;
+    rc=wg_route_dump(group,NULL,0,d,&routes);
+    if(rc||routes.count)return rc?rc:EEXIST;
+    rc=wg_route(name,kind,index,group,prefix,d,1,group);
+    if(!rc)rc=wg_rule(name,group,RTM_NEWRULE,1,d,NULL);
+    if(!rc)rc=wg_rule(name,group,RTM_NEWRULE,0,d,NULL);
+    return rc?rc:awg_dev_scoped_route_check_until(name,kind,index,group,prefix,d);
+}
+int awg_dev_scoped_rules_retire_until(const char *name,int owned_index,uint32_t group,uint64_t d){
+    if(!name||!*name||strlen(name)>=IFNAMSIZ||!d)return EINVAL;
+    if(group<=255)return 0; /* no scoped allocation was possible */
+    struct wg_rules rules;
+    int rc=wg_rule(name,group,RTM_GETRULE,0,d,&rules);
+    if(rc)return rc;
+    if(rules.lookup>1||rules.stop>1)return ESTALE;
+    if(!rules.lookup&&!rules.stop)return 0;
+    /* Do not delete an identical pre-existing rule on candidate preflight
+     * failure. Only the journal-owned link AND its private protocol route
+     * authorize retirement; rule deletions precede deletion of that link. */
+    if(owned_index<=0)return ESTALE;
+    struct wg_route_check routes;
+    rc=wg_route_dump(group,NULL,owned_index,d,&routes);
+    if(rc)return rc;
+    if(routes.count!=1||!routes.found)return ESTALE;
+    if(rules.lookup)rc=wg_rule(name,group,RTM_DELRULE,0,d,NULL);
+    if(!rc&&rules.stop)rc=wg_rule(name,group,RTM_DELRULE,1,d,NULL);
+    return rc;
 }
 int awg_dev_link_require_down_owned_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline){
     unsigned flags=0;
