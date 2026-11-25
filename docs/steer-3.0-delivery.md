@@ -323,6 +323,35 @@ service registration и artifact cache. GC не удаляет предыдущ�
 до успешного upgrade и отдельной retention policy. Невозможность восстановить
 OS state — degraded с recovery instruction, не «успешный откат».
 
+Экспериментальный первый слой для частного временного Linux prefix —
+`experimental/offline-bundle/bundle.py`. Он не устанавливает службу, не
+переносит legacy intent и не закрывает gate E. Оператор заранее доверяет
+локальному SHA256 manifest; проверка подписи релиза отсутствует. Для локального
+набора из файлов `core`, `ui` и `assets/**` manifest — JSON-объект
+`{"core":"<sha256>", "ui":"<sha256>", "assets/index.html":"<sha256>", ...}`
+со всеми файлами набора и строчными hex SHA256. Лишние файлы и ссылки в наборе
+отвергаются. `assets/index.html` обязателен. Зависимости среды (например libc)
+не включены и проверка совместимости ABI и runtime health не выполняется.
+
+```sh
+mkdir -m 700 /tmp/my-steer-test
+python3 experimental/offline-bundle/bundle.py --prefix /tmp/my-steer-test install /path/to/bundle --manifest /path/to/trusted.json
+python3 experimental/offline-bundle/bundle.py --prefix /tmp/my-steer-test status
+python3 experimental/offline-bundle/bundle.py --prefix /tmp/my-steer-test rollback
+python3 -m unittest discover -s experimental/offline-bundle -p 'test_*.py' -v
+```
+
+Prefix должен уже существовать, быть абсолютным, без ссылок в пути, принадлежать
+вызывающему пользователю и быть закрыт для остальных. Файлы копируются в новый
+каталог в том же prefix, проверяются по manifest и выбираются атомарной заменой
+`active`; rollback повторно проверяет hashes предыдущего комплекта. Каталоги
+комплектов доступны только для чтения, но владелец может изменить права: это не
+защита от злонамеренного владельца. Конфигурация пользователя не читается и не
+изменяется. Прерванная подготовка может оставить невыбранный каталог staging;
+автоматической очистки и проверки восстановления при power loss пока нет.
+Это не активация службы, не миграция и не подтверждение работоспособности
+выбранных бинарников; запрещено считать legacy intent сконвертированным.
+
 Concurrent applies сериализуются core; expected revision перепроверяется в
 commit после validate. Idempotency key привязан к actor + normalized payload hash:
 тот же key/то же тело возвращает job, другое тело — conflict. Apply не fetch-ит
