@@ -115,6 +115,45 @@ static void check_table_adoption(void) {
     check("пустая таблица заменяет прежнюю", 0, (int)g_dch_n);
 }
 
+static void check_table_rules_transaction(void) {
+    char path[] = "/tmp/dnsmatch-rules-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) { perror("mkstemp"); exit(2); }
+    if (write(fd, "old.example\n", 12) != 12) exit(2);
+    close(fd);
+    char table[1024];
+    struct tabfmt_feed feed = { .load_rules = 1 };
+    snprintf(table, sizeof(table), "1\nold|out|0|4|old|%s\n", path);
+    check("snapshot: первая таблица и правила", 1, tabfmt_feed(&feed, table, strlen(table)));
+    check("snapshot: старое правило загружено", 1, dch_matches(&g_dch[0], "old.example"));
+    unlink(path);
+    snprintf(table, sizeof(table), "1\nmissing|out|0|4|new|%s\n", path);
+    check("snapshot: отсутствующий список отклонён", 2, tabfmt_feed(&feed, table, strlen(table)));
+    check("snapshot: старое правило сохранено", 1,
+          g_dch_n == 1 && !strcmp(g_dch[0].set, "old") && dch_matches(&g_dch[0], "old.example"));
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || write(fd, "re:[\n", 5) != 5) exit(2);
+    close(fd);
+    check("snapshot: битое правило отклонено", 2, tabfmt_feed(&feed, table, strlen(table)));
+    check("snapshot: после ошибки действует прежнее", 1,
+          g_dch_n == 1 && !strcmp(g_dch[0].set, "old") && dch_matches(&g_dch[0], "old.example"));
+    fd = open(path, O_WRONLY | O_TRUNC);
+    if (fd < 0 || write(fd, "new.example\n", 12) != 12) exit(2);
+    close(fd);
+    check("snapshot: следующий полный кадр принят", 1, tabfmt_feed(&feed, table, strlen(table)));
+    check("snapshot: новые правила применены", 1,
+          g_dch_n == 1 && !strcmp(g_dch[0].set, "missing") && dch_matches(&g_dch[0], "new.example"));
+    fd = open(path, O_WRONLY | O_TRUNC);
+    if (fd < 0) exit(2);
+    close(fd);
+    check("snapshot: пустой файл списка допустим", 1, tabfmt_feed(&feed, table, strlen(table)));
+    check("snapshot: пустой список заменил правила", 0, dch_matches(&g_dch[0], "new.example"));
+    check("snapshot: пустая таблица принята", 1, tabfmt_feed(&feed, "0\n", 2));
+    check("snapshot: пустая таблица заменила прежнюю", 0, (int)g_dch_n);
+    free(feed.buf);
+    unlink(path);
+}
+
 /* Набор из строк списка — в том же виде, в каком их читает load_rules_into. */
 static void build(struct ruleset *rs, const char *const *lines) {
     memset(rs, 0, sizeof(*rs));
@@ -139,6 +178,7 @@ static int pool_live_stub(uint8_t *bits) {
 
 int main(void) {
     check_table_adoption();
+    check_table_rules_transaction();
     {
         struct ruleset rs;
         memset(&rs, 0, sizeof(rs));

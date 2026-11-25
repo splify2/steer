@@ -7,6 +7,7 @@
 #include "dnsd_int.h"
 #include "tabfmt.h"
 #include <errno.h>
+#include <limits.h>
 
 /* ---- сборка: демон и `steer dnsd-table --spec` ------------------------------------------- */
 
@@ -204,13 +205,15 @@ static int parse_chan_line(const char *buf, size_t from, size_t line_end, struct
 static int parse_header(const char *buf, size_t nl, long *want, long *upn, struct dcache_cfg *cc,
                         long *other) {
     char h[96];
+    if (nl >= sizeof(h)) return -1;
     field_copy(h, sizeof(h), buf, nl);
     char *end = NULL;
+    errno = 0;
     long n = strtol(h, &end, 10);
     *upn = 0;
     *other = 0;
     memset(cc, 0, sizeof(*cc));
-    if (end == h || n < 0) return -1;       /* число каналов ничем, кроме памяти, не ограничено */
+    if (errno == ERANGE || end == h || n < 0 || n > TABFMT_FEED_MAX) return -1;
     *want = n;
     if (*end == '\0') return 0;
     if (*end != ' ') return -1;
@@ -224,7 +227,7 @@ static int parse_header(const char *buf, size_t nl, long *want, long *upn, struc
     } else if (end[1 + used] != '\0') {
         return -1;
     }
-    if (u < 0 || e < 0 || e > 1000000 || mn < 0 || mx < 0 || ng < 0) return -1;
+    if (u < 0 || u > TABFMT_FEED_MAX || e < 0 || e > 1000000 || mn < 0 || mx < 0 || ng < 0) return -1;
     *upn = u;
     *other = ot;
     cc->entries = e; cc->ttl_min = mn; cc->ttl_max = mx; cc->ttl_neg = ng;
@@ -409,11 +412,20 @@ static int tabfmt_parse_inner(const char *buf, size_t len, struct tabfmt_snapsho
     return 0;
 }
 
-int tabfmt_parse(const char *buf, size_t len) {
+static int tabfmt_apply(const char *buf, size_t len, int load) {
     struct tabfmt_snapshot fresh = {0};
     if (tabfmt_parse_inner(buf, len, &fresh) != 0) {
         snapshot_free(&fresh);
         return -1;
+    }
+    if (load) {
+        for (size_t i = 0; i < fresh.n; i++) {
+            struct dchan *d = &fresh.dch[i];
+            if (dch_rules_load(d, &d->rules, &d->parts, &d->parts_n, &d->composite)) {
+                snapshot_free(&fresh);
+                return -1;
+            }
+        }
     }
     struct tabfmt_snapshot old = { g_dch, g_dch_n, g_dch_cap, g_dup_cfg,
                                    g_dup_cfg_n, g_dup_cfg_cap, g_dup_other, g_dcache_cfg };
@@ -422,6 +434,10 @@ int tabfmt_parse(const char *buf, size_t len) {
     g_dup_other = fresh.other; g_dcache_cfg = fresh.cache;
     snapshot_free(&old);
     return 0;
+}
+
+int tabfmt_parse(const char *buf, size_t len) {
+    return tabfmt_apply(buf, len, 0);
 }
 
 /* ---- приёмник из трубы: буферизация между вызовами epoll ---------------------------------- */
@@ -434,7 +450,7 @@ void tabfmt_feed_reset(struct tabfmt_feed *st) {
 
 int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
     if (n) {
-        if (st->len + n > TABFMT_FEED_MAX) return -1;
+        if (n > TABFMT_FEED_MAX - st->len) return -1;
         if (st->len + n > st->cap) {
             size_t nc = st->cap ? st->cap : 16384;
             while (nc < st->len + n) nc *= 2;
@@ -452,6 +468,7 @@ int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
     long want, upn, other;
     struct dcache_cfg cc;
     if (parse_header(st->buf, nl, &want, &upn, &cc, &other) != 0) return -1;
+    if (want > LONG_MAX - upn) return -1;
     want += upn;                 /* строки каналов и строки апстримов идут подряд */
 
     size_t pos = st->scan_pos ? st->scan_pos : nl + 1;
@@ -467,10 +484,11 @@ int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
     st->scan_pos = 0;
     /* pos — конец РОВНО ОДНОЙ таблицы: столько и передаётся в tabfmt_parse, остаток (начало
      * следующей, если демон прислал две таблицы одной записью в трубу) остаётся в буфере. */
-    if (tabfmt_parse(st->buf, pos) != 0) return -1;
+    int rc = tabfmt_apply(st->buf, pos, st->load_rules);
+    if (rc && !st->load_rules) return -1;
     memmove(st->buf, st->buf + pos, st->len - pos);
     st->len -= pos;
-    return 1;
+    return rc ? 2 : 1;
 }
 
 int tabfmt_read_first(int fd, struct tabfmt_feed *st) {
@@ -488,7 +506,8 @@ int tabfmt_read_first(int fd, struct tabfmt_feed *st) {
         if (r == 0) return -1; /* труба закрылась раньше первой таблицы — демон умер */
         int rc = tabfmt_feed(st, chunk, (size_t)r);
         if (rc < 0) return -1;
-        if (rc > 0) return 0; /* первая таблица разобрана; хвост (если демон прислал вторую
+        if (rc == 2) return -1;
+        if (rc == 1) return 0; /* первая таблица разобрана; хвост (если демон прислал вторую
                                 * следом же записью) остался в st — его доберёт та же tabfmt_feed
                                 * из цикла epoll, без потери байт */
     }
