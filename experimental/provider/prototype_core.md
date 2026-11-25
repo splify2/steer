@@ -118,9 +118,11 @@ routing:
 The fixed remote, trust, package and `0.0.0` prototype marker select code
 already linked into this build. They do not grant trust, read a remote index,
 install a package, or represent a signed lock. Aliases and object IDs are
-user-defined. SOCKS5 CONNECT (no auth) and plain VLESS TCP (UUID auth) are
-supported on numeric loopback only (`127/8`, `::1`); explicit `flow` is
-limited to `[stream]`. VLESS requires one typed `uuid` reference to an inherited
+user-defined. By default the profile accepts numeric loopback only (`127/8`,
+`::1`). SOCKS5 CONNECT supports NOAUTH (`options: {}`) or USERPASS;
+only the latter can use an [operator-approved VPN address](#managed-socks5-tcp-on-a-vpn-address).
+Plain VLESS TCP (UUID auth) stays loopback-only. For these two providers explicit
+`flow` is limited to `[stream]`. VLESS requires one typed `uuid` reference to an inherited
 environment variable. Supply the UUID in the core process's private environment,
 never in the intent. Validate/apply and startup reject an enabled VLESS listener
 if its value is absent or malformed. The intent, snapshots and status never
@@ -130,6 +132,90 @@ direct/block outbounds, and an explicit default. Match fields are `inbound`
 and either `domain` or `domain_suffix`, each with one list entry; an empty map
 matches all. Other variants and settings are rejected, even on disabled
 objects. The general v3 provider executor and signed lock are not wired in.
+
+### Managed SOCKS5 TCP on a VPN address
+
+The VPN address must already be set up by the operator. Add the following
+**startup option** to the core process, not to the UI or v3 intent:
+
+```text
+--allow-socks-vpn-bind 10.8.0.1 STEER_VPN_SOCKS_USER STEER_VPN_SOCKS_PASSWORD
+```
+
+The last two arguments are names of **distinct** process environment variables,
+not their values. Provision dedicated credentials privately in the core
+environment; enabled entries require 1–255 bytes in each value. The repeatable
+option allows up to 16 unique numeric addresses, each with one approved pair of
+environment names. The core compares canonical addresses and the exact resolved
+reference names; a v3 document cannot use another environment variable in their
+place. Wildcards, hostnames, CIDR ranges, mapped IPv6, multicast, IPv6
+link-local addresses and loopback are not allowlist entries. Without the option
+there is no non-loopback exception. The port and principal ID are intent fields;
+the option does not bind a socket by itself.
+
+For the example above, merge these entries into the v3 document (add a
+routing rule selecting `socks-vpn` only if you want it to reach the chosen
+outbound):
+
+```yaml
+secrets:
+  vpn-user: {source: env, name: STEER_VPN_SOCKS_USER, kind: username}
+  vpn-pass: {source: env, name: STEER_VPN_SOCKS_PASSWORD, kind: password}
+inbounds:
+  socks-vpn:
+    plugin: socks:proxy
+    listen: {address: 10.8.0.1, port: 11080}
+    options:
+      principal_id: vpn-client
+      username: {secret: vpn-user}
+      password: {secret: vpn-pass}
+```
+
+The SOCKS5 TCP listener accepts only USERPASS at this endpoint; failed
+negotiation or authentication never reaches the route or target. The core
+supplies `principal_id` to the runtime after authentication. This profile
+does not add v3 principal-based route filters, SOCKS UDP, a secret store or
+multi-user authentication. Validate checks configuration and enabled credentials
+without binds; Apply can still fail if the address cannot be bound or the port
+is occupied. On recovery the operator must supply the same approval and
+credentials again; they are not saved in the durable envelope. Removing the
+approval for a saved non-loopback entry makes startup refuse that snapshot
+(including disabled entries), rather than silently fall back or expose it.
+Remove or relocate the entry first if intentionally retiring that approval.
+
+To prevent a format downgrade from bypassing the bind policy, a managed v3
+core refuses `steer-linux-v1` over control; the startup option also refuses
+legacy files and snapshots. A standalone legacy fixture started without the
+option keeps its existing behavior and must not be offered as managed v3.
+
+**UI form contract:** `STATUS.capabilities.spec_v3_socks_tcp_userpass: true`
+advertises SOCKS5 USERPASS. `spec_v3_socks_vpn_bind` is
+`{"auth":"userpass","addresses":["10.8.0.1"]}` with a read-only array of
+canonical startup-approved addresses (empty by default). If absent, or if no
+addresses are advertised, do not offer a VPN address selector. For a managed
+SOCKS5 TCP row, offer numeric loopback by default and choose a non-loopback
+address from this array. Require port 1–65535; for a VPN address lock auth to
+USERPASS and require a principal matching `[A-Za-z0-9_.-]{1,64}` and two
+typed `{secret: ID}` refs matching the example. Collect or select env **names**
+only (syntax `[A-Za-z_][A-Za-z0-9_]{0,94}`), not credential values. The actual
+pair approval is checked by Validate/Apply; STATUS does not advertise the names.
+For loopback, serialize NOAUTH as `{}` or use the same USERPASS options when
+supported. Treat capabilities as guidance, not as a substitute for core
+validation, and never generate a wildcard or fall back to legacy to bypass it.
+The existing UI bridge/form is not changed by this core contract.
+
+Binding by destination address is not binding to the WireGuard interface and
+does not install firewall rules. Ensure only intended VPN peers can reach that
+address/port and limit outbound access in routing and firewall policy as needed.
+SOCKS5 USERPASS is not encrypted by SOCKS; the fixture relies on the WireGuard
+tunnel. The managed UI and existing WireGuard configuration are not changed.
+To reproduce using two disposable network namespaces with real WireGuard peers
+and `curl` (requires namespace privileges, kernel WireGuard, iproute2, `wg` and
+`ping`), run:
+
+```sh
+make -C steer/experimental/provider BUILD=/tmp/steer-provider-build socks-vpn-netns-test
+```
 
 ### Managed plain VLESS TCP outbound
 

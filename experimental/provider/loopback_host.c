@@ -158,6 +158,7 @@ struct host {
     struct steer_prototype_store *store;
     struct store_writer writer;
     struct steer_prototype_prepare *preparer;
+    struct steer_prototype_socks_vpn_allowlist socks_vpn;
 #ifdef STEER_PROTOTYPE_HY2
     struct steer_draft_hy2_datagram_budget datagram_budget;
 #endif
@@ -1168,8 +1169,12 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     if (!validate && expected != (h->current ? h->current->number : 0)) return 409;
     if(!next)return 422;
     if(inputs) { config=inputs->config;inputs->config=NULL;if(!config)return 422; }
-    else if(steer_prototype_config_parse(document,length,next,&config).code)return 422;
+    else if(steer_prototype_config_parse_with_vpn(document,length,next,&h->socks_vpn,&config).code)return 422;
     if(initial_format&&initial_format!=config->format)goto cleanup;
+    /* A managed control session must not sidestep its bind policy by applying
+     * the legacy developer format, which intentionally supports wildcard. */
+    if(h->current&&h->current->config->format==STEER_STORE_FORMAT_SPEC_V3&&
+        config->format!=STEER_STORE_FORMAT_SPEC_V3)goto cleanup;
     if (!config->document_json || config->document_length > STEER_PROTOTYPE_CONFIG_MAX_BYTES) goto cleanup;
     if(!validate&&config->generation!=next) { result=409;goto cleanup; }
     for (i = 0; i < config->stream_outbound_count; ++i) {
@@ -1342,6 +1347,15 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
     hy2="true";hy2_udp=h->current&&h->current->datagrams?"true":"false";provider=",\"hysteria2\"";
 #endif
     n=snprintf(out+used,capacity-used,"],\"capabilities\":{\"spec_v3_profile\":\"linked-socks-v1\",\"spec_v3_vless_tcp\":true,"
+        "\"spec_v3_socks_tcp_userpass\":true,\"spec_v3_socks_vpn_bind\":{\"auth\":\"userpass\",\"addresses\":[");
+    if(n<0||(size_t)n>=capacity-used)return 0;
+    used+=(size_t)n;
+    for(i=0;i<h->socks_vpn.count;i++){
+        n=snprintf(out+used,capacity-used,"%s\"%s\"",i?",":"",h->socks_vpn.entries[i].address);
+        if(n<0||(size_t)n>=capacity-used)return 0;
+        used+=(size_t)n;
+    }
+    n=snprintf(out+used,capacity-used,"]},"
 #ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
         "\"spec_v3_vless_tcp_outbound\":true,"
 #endif
@@ -1685,17 +1699,28 @@ int steer_prototype_main(int argc, char **argv)
 {
     struct host h = {0}; struct client clients[CLIENTS] = {{0}};
     char *document = NULL, status[8192];
+    const char *state_dir = NULL;
     struct steer_store_document *snapshot = NULL;
     struct steer_pv1_error error;
     FILE *file;
     size_t length = 0;
     int result = 1, seed = 0;
-    if ((argc != 5 && argc != 7) || strcmp(argv[1], "--config") || strcmp(argv[3], "--control") ||
-        (argc == 7 && strcmp(argv[5], "--state-dir"))) return 2;
+    if(argc<5||strcmp(argv[1],"--config")||strcmp(argv[3],"--control"))return 2;
+    for(int i=5;i<argc;){
+        if(!strcmp(argv[i],"--state-dir")&&i+1<argc&&!state_dir){
+            state_dir=argv[i+1];i+=2;
+        }else if(!strcmp(argv[i],"--allow-socks-vpn-bind")&&i+3<argc){
+            if(!steer_prototype_socks_vpn_allow(&h.socks_vpn,argv[i+1],argv[i+2],argv[i+3])){
+                fputs("invalid or duplicate SOCKS VPN startup allowlist entry\n",stderr);
+                return 2;
+            }
+            i+=4;
+        }else return 2;
+    }
     if (!initialize_host(&h, clients)) goto cleanup;
     if (steer_draft_resolver_create(h.loop, 2, 64, NULL, NULL, &h.resolver).code) goto cleanup;
-    if (argc == 7) {
-        if (steer_prototype_store_open(argv[6], &h.store).code) goto cleanup;
+    if (state_dir) {
+        if (steer_prototype_store_open(state_dir, &h.store).code) goto cleanup;
         error = steer_prototype_store_recover_document(h.store, &snapshot);
         if (error.code && error.code != STEER_PV1_UNSUPPORTED) goto cleanup;
         seed = error.code == STEER_PV1_UNSUPPORTED;
@@ -1715,7 +1740,7 @@ int steer_prototype_main(int argc, char **argv)
     }
     if (!bind_control(&h, argv[4])) goto cleanup;
     if (h.store && !start_writer(&h)) goto cleanup;
-    if(steer_prototype_prepare_create(h.loop,prepared_ready,&h,&h.preparer))goto cleanup;
+    if(steer_prototype_prepare_create(h.loop,prepared_ready,&h,&h.socks_vpn,&h.preparer))goto cleanup;
     if (seed) {
         struct steer_prototype_store_transaction *transaction = NULL;
         struct steer_prototype_store_result committed;

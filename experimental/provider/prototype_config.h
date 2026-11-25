@@ -44,6 +44,16 @@ struct steer_prototype_config {
     char *document_json;
     size_t document_length;
 };
+/* Immutable process startup policy, not part of intent or the durable store.
+ * Each address has exactly one operator-provisioned credential pair. */
+struct steer_prototype_socks_vpn_allowlist {
+    unsigned count;
+    struct {
+        char address[46], username_ref[100], password_ref[100];
+    } entries[STEER_PROTOTYPE_MAX_LISTENERS];
+};
+int steer_prototype_socks_vpn_allow(struct steer_prototype_socks_vpn_allowlist *,
+    const char *address, const char *username_env, const char *password_env);
 /* steer-linux-v1 or the linked v3 subset (optional HY2). YAML and JSON
  * through existing bounded ynode. Unknown fields/tags/duplicates fail closed.
  * Generation is host-owned, never read from document. All result data owned.
@@ -53,5 +63,8 @@ struct steer_prototype_config {
  * only error code (no raw parser message or secret-bearing document excerpt). */
 struct steer_pv1_error steer_prototype_config_parse(const char *, size_t,
     uint64_t generation, struct steer_prototype_config **out);
+struct steer_pv1_error steer_prototype_config_parse_with_vpn(const char *, size_t,
+    uint64_t generation, const struct steer_prototype_socks_vpn_allowlist *,
+    struct steer_prototype_config **out);
 void steer_prototype_config_destroy(struct steer_prototype_config *);
 #endif

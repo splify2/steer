@@ -96,7 +96,11 @@ The managed Linux prototype can apply the
 [linked v3 subset for SOCKS5, plain VLESS TCP and optional Hysteria2 TCP/UDP](../experimental/provider/prototype_core.md#managed-spec-v3-linked-socks-v1).
 It compiles the intent on a bounded worker and lowers listeners and ordered
 direct/block policy into the existing generation transaction. GET and durable
-recovery retain the v3 intent and revision. The full provider catalogue,
+recovery retain the v3 intent and revision. The managed profile also accepts
+[explicit SOCKS5 TCP VPN binds](../experimental/provider/prototype_core.md#managed-socks5-tcp-on-a-vpn-address)
+with typed USERPASS references and an operator-owned startup allowlist;
+compiler graph readiness alone grants no authority to bind a non-loopback address.
+The full provider catalogue,
 generic groups, generic datagram/device providers, network-profile activation and
 routed DNS are still unavailable in the managed v3 path.
 

@@ -26,7 +26,7 @@ static void run(int mode) {
     struct fixture f={0};struct timespec pause={0,1000000};
     f.expected=mode==1||mode==3?499:mode==2?408:0;f.deadline=(uint64_t)loop_now_ms()+3000;
     f.loop=loop_new();assert(f.loop);f.finish=loop_timer_new(f.loop,finish,&f);assert(f.finish);
-    assert(!steer_prototype_prepare_create(f.loop,done,&f,&f.worker));
+    assert(!steer_prototype_prepare_create(f.loop,done,&f,NULL,&f.worker));
     uint64_t deadline=(uint64_t)loop_now_ms()+(mode==2?100:2000);char *copy=strdup(document);assert(copy);
     assert(!steer_prototype_prepare_submit(f.worker,copy,strlen(copy),1,0,2,77,1,deadline));
     memset(copy,0,strlen(copy));free(copy);

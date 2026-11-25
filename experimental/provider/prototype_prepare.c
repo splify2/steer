@@ -21,6 +21,7 @@ struct job { struct steer_prototype_prepared_input result;char *document;size_t 
 struct steer_prototype_prepare {
     struct loop *loop;pthread_t thread;pthread_mutex_t lock;pthread_cond_t changed;
     struct job *job;steer_prototype_prepare_done done;void *user;
+    const struct steer_prototype_socks_vpn_allowlist *socks_vpn;
     int wake,stopping,exited,dispatching;
 };
 static int interrupted(struct job *job) {
@@ -47,10 +48,10 @@ int steer_prototype_prepare_hy2_outbound(const struct steer_prototype_stream_out
         getenv(spec->ca_ref+4),getenv(spec->password_ref+4),out);
 }
 #endif
-static void prepare(struct job *job) {
+static void prepare(struct job *job,const struct steer_prototype_socks_vpn_allowlist *socks_vpn) {
     struct steer_prototype_prepared_input *r=&job->result;
     r->error=interrupted(job);if(r->error)return;
-    uint32_t code=steer_prototype_config_parse(job->document,job->length,job->generation,&r->config).code;
+    uint32_t code=steer_prototype_config_parse_with_vpn(job->document,job->length,job->generation,socks_vpn,&r->config).code;
     if(code) { r->error=code==STEER_PV1_RESOURCE_EXHAUSTED?503:422;return; }
 #ifdef STEER_PROTOTYPE_HY2
     for(unsigned i=0;i<r->config->stream_outbound_count;i++){
@@ -94,7 +95,7 @@ static void *worker(void *user) {
         while((!p->job||p->job->done)&&!p->stopping)pthread_cond_wait(&p->changed,&p->lock);
         if(p->stopping&&(!p->job||p->job->done))break;
         struct job *job=p->job;pthread_mutex_unlock(&p->lock);
-        prepare(job);
+        prepare(job,p->socks_vpn);
         pthread_mutex_lock(&p->lock);job->done=1;pthread_mutex_unlock(&p->lock);
         notify(p);pthread_mutex_lock(&p->lock);
     }
@@ -111,11 +112,12 @@ static void ready(struct loop *loop,int fd,uint32_t events,void *user) {
         p->dispatching=1;p->done(p->user,&job->result);dispose(job);p->dispatching=0;
     }
 }
-int steer_prototype_prepare_create(struct loop *loop,steer_prototype_prepare_done done,void *user,struct steer_prototype_prepare **out) {
+int steer_prototype_prepare_create(struct loop *loop,steer_prototype_prepare_done done,void *user,
+    const struct steer_prototype_socks_vpn_allowlist *socks_vpn,struct steer_prototype_prepare **out) {
     if(out)*out=NULL;
     if(!out||!loop||!done)return -1;
     struct steer_prototype_prepare *p=calloc(1,sizeof *p);if(!p)return -1;
-    p->loop=loop;p->done=done;p->user=user;p->wake=-1;
+    p->loop=loop;p->done=done;p->user=user;p->wake=-1;p->socks_vpn=socks_vpn;
     if(pthread_mutex_init(&p->lock,NULL)) { free(p);return -1; }
     if(pthread_cond_init(&p->changed,NULL)) { pthread_mutex_destroy(&p->lock);free(p);return -1; }
     p->wake=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);

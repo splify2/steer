@@ -26,7 +26,9 @@ int steer_prototype_prepare_hy2_outbound(const struct steer_prototype_stream_out
  * Borrowed result is disposed after return: take ownership by clearing fields.
  * No control/listener pointers cross to worker. Inputs are copied before submit. */
 typedef void (*steer_prototype_prepare_done)(void *,struct steer_prototype_prepared_input *);
-int steer_prototype_prepare_create(struct loop *,steer_prototype_prepare_done,void *,struct steer_prototype_prepare **);
+/* The startup allowlist, if supplied, stays immutable until the worker joins. */
+int steer_prototype_prepare_create(struct loop *,steer_prototype_prepare_done,void *,
+    const struct steer_prototype_socks_vpn_allowlist *,struct steer_prototype_prepare **);
 int steer_prototype_prepare_submit(struct steer_prototype_prepare *,const char *,size_t,
     uint64_t generation,uint64_t expected,unsigned control_index,uint64_t serial,int validate,uint64_t deadline_ms);
 void steer_prototype_prepare_cancel(struct steer_prototype_prepare *,unsigned,uint64_t);

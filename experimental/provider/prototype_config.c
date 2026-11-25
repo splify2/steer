@@ -109,17 +109,41 @@ static int tags(const struct ynode*n){
     for(i=0;i<total;i++)if(!tags(n->items[i]))return 0;
     return 1;
 }
-static int listen_address(const struct ynode*v,struct steer_prototype_listener*l){
+static int numeric_address(const char *address,char *canonical,size_t size){
     uint8_t ip[16];
-    int family;
-    if(!keys(v,"address port")||!copy(ynode_get(v,"address"),l->address,sizeof(l->address))||!port(ynode_get(v,"port"),&l->port))return 0;
-    family=inet_pton(AF_INET,l->address,ip)==1?AF_INET:inet_pton(AF_INET6,l->address,ip)==1?AF_INET6:0;
+    int family=inet_pton(AF_INET,address,ip)==1?AF_INET:inet_pton(AF_INET6,address,ip)==1?AF_INET6:0;
     if(!family)return 0;
     if(family==AF_INET && (ip[0]>=224 ||
        (ip[0]==0 && (ip[1]||ip[2]||ip[3]))))return 0;
     if(family==AF_INET6 && (ip[0]==0xff ||
        !memcmp(ip,(uint8_t[12]){0,0,0,0,0,0,0,0,0,0,255,255},12)))return 0;
-    return inet_ntop(family,ip,l->address,sizeof(l->address))!=NULL;
+    return inet_ntop(family,ip,canonical,size)!=NULL;
+}
+static int loopback_address(const char *address){
+    return !strncmp(address,"127.",4)||!strcmp(address,"::1");
+}
+int steer_prototype_socks_vpn_allow(struct steer_prototype_socks_vpn_allowlist *allow,
+    const char *address,const char *username_env,const char *password_env){
+    char canonical[46];
+    struct in6_addr ip6;
+    if(allow->count>=STEER_PROTOTYPE_MAX_LISTENERS||
+        !numeric_address(address,canonical,sizeof canonical)||loopback_address(canonical)||
+        !strcmp(canonical,"0.0.0.0")||!strcmp(canonical,"::")||
+        (inet_pton(AF_INET6,canonical,&ip6)==1&&IN6_IS_ADDR_LINKLOCAL(&ip6))||
+        !env_name(username_env,strlen(username_env))||!env_name(password_env,strlen(password_env))||
+        !strcmp(username_env,password_env))return 0;
+    for(unsigned i=0;i<allow->count;i++)
+        if(!strcmp(allow->entries[i].address,canonical))return 0;
+    unsigned i=allow->count++;
+    strcpy(allow->entries[i].address,canonical);
+    snprintf(allow->entries[i].username_ref,sizeof allow->entries[i].username_ref,"env:%s",username_env);
+    snprintf(allow->entries[i].password_ref,sizeof allow->entries[i].password_ref,"env:%s",password_env);
+    return 1;
+}
+static int listen_address(const struct ynode*v,struct steer_prototype_listener*l){
+    char address[46];
+    return keys(v,"address port")&&copy(ynode_get(v,"address"),address,sizeof address)&&
+        port(ynode_get(v,"port"),&l->port)&&numeric_address(address,l->address,sizeof l->address);
 }
 static int listener(const struct ynode*n,struct steer_prototype_listener*l){
     const struct ynode*a,*v,*tls;
@@ -279,10 +303,6 @@ static struct steer_pv1_error compile_policy(struct steer_prototype_config *c,
         c->stream_outbound_count,&c->policy);
 }
 
-static int v3_socks_options(void *unused,const struct ynode *options){
-    (void)unused;
-    return keys(options,"");
-}
 static const struct ynode *v3_secret_id(const struct ynode *ref){
     const struct ynode *secret=ynode_get(ref,"secret");
     char identifier[65];
@@ -299,6 +319,13 @@ static int v3_env_ref(const struct ynode *secrets,const struct ynode *ref,const 
 }
 static int v3_auth_options(const struct ynode *options,const char *allowed,const char *field,char principal[65]){
     return keys(options,allowed)&&id(ynode_get(options,"principal_id"),principal)&&v3_secret_id(ynode_get(options,field));
+}
+static int v3_socks_options(void *unused,const struct ynode *options){
+    (void)unused;
+    char principal[65];
+    return keys(options,"")||
+        (v3_auth_options(options,"principal_id username password","username",principal)&&
+         v3_secret_id(ynode_get(options,"password")));
 }
 static int v3_vless_options(void *unused,const struct ynode *options){
     (void)unused;
@@ -406,6 +433,12 @@ static int v3_tcp_inbound(const struct steer_spec_node_view *node,const struct y
     if(node->flows!=STEER_SPEC_FLOW_STREAM||!keys(node->intent,"label enabled plugin options listen flow"))return 0;
     if(!strncmp(node->provider,"socks:",6)&&v3_socks_options(NULL,node->options)){
         l->protocol=STEER_PROTOTYPE_SOCKS;
+        if(node->options->len){
+            if(!id(ynode_get(node->options,"principal_id"),l->principal_id)||
+                !v3_env_ref(secrets,ynode_get(node->options,"username"),"username",l->username_ref)||
+                !v3_env_ref(secrets,ynode_get(node->options,"password"),"password",l->password_ref))return 0;
+            l->auth=STEER_PROTOTYPE_AUTH_USERPASS;
+        }
         return 1;
     }
     if(strncmp(node->provider,"vless:",6)||!v3_auth_options(node->options,"principal_id uuid","uuid",l->principal_id)||
@@ -415,7 +448,7 @@ static int v3_tcp_inbound(const struct steer_spec_node_view *node,const struct y
     return 1;
 }
 static int v3_inbound(const struct steer_spec_node_view *node,const struct ynode *secrets,
-    struct steer_prototype_listener *l){
+    const struct steer_prototype_socks_vpn_allowlist *allow,struct steer_prototype_listener *l){
 #ifdef STEER_PROTOTYPE_HY2
     if(!strncmp(node->provider,"hysteria2:",10)){
         if(!v3_hy2_inbound(node,secrets,l))return 0;
@@ -424,15 +457,19 @@ static int v3_inbound(const struct steer_spec_node_view *node,const struct ynode
     if(!v3_tcp_inbound(node,secrets,l))return 0;
     l->enabled=(uint32_t)node->enabled;
     strcpy(l->id,node->id);
-    return label(ynode_get(node->intent,"label"),l->label)&&listen_address(node->listen,l)&&
-        (!strncmp(l->address,"127.",4)||!strcmp(l->address,"::1"));
+    if(!label(ynode_get(node->intent,"label"),l->label)||!listen_address(node->listen,l))return 0;
+    if(loopback_address(l->address))return 1;
+    if(!allow||l->protocol!=STEER_PROTOTYPE_SOCKS||l->auth!=STEER_PROTOTYPE_AUTH_USERPASS)return 0;
+    for(unsigned i=0;i<allow->count;i++)
+        if(!strcmp(l->address,allow->entries[i].address)&&
+            !strcmp(l->username_ref,allow->entries[i].username_ref)&&
+            !strcmp(l->password_ref,allow->entries[i].password_ref))return 1;
+    return 0;
 }
 static int v3_secret_kind(const struct ynode *kind){
-#ifdef STEER_PROTOTYPE_SOCKS_OUTBOUND
     if(eq(kind,"username")||eq(kind,"password"))return 1;
-#endif
 #ifdef STEER_PROTOTYPE_HY2
-    if(eq(kind,"password")||eq(kind,"certificate")||eq(kind,"private_key"))return 1;
+    if(eq(kind,"certificate")||eq(kind,"private_key"))return 1;
 #endif
     return eq(kind,"uuid");
 }
@@ -469,7 +506,7 @@ static int v3_rule(const struct steer_spec_rule_view *r,const struct ynode *sour
     return 1;
 }
 static struct steer_pv1_error parse_v3(const char *data,size_t length,const struct ynode *root,
-    struct steer_prototype_config *c){
+    const struct steer_prototype_socks_vpn_allowlist *allow,struct steer_prototype_config *c){
     const struct ynode *remotes=ynode_get(root,"plugin_remotes"),*plugins=ynode_get(root,"plugins"),
         *inbounds=ynode_get(root,"inbounds"),*outbounds=ynode_get(root,"outbounds"),
         *routing=ynode_get(root,"routing"),*rules=ynode_get(routing,"rules"),*secrets=ynode_get(root,"secrets");
@@ -572,7 +609,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
             continue;
         }
         if(node.kind!=STEER_SPEC_INBOUND||c->listener_count>=STEER_PROTOTYPE_MAX_LISTENERS||
-            !v3_inbound(&node,secrets,&c->listeners[c->listener_count])||
+            !v3_inbound(&node,secrets,allow,&c->listeners[c->listener_count])||
             !distinct_listener(c,c->listener_count))goto done;
         c->listener_count++;
     }
@@ -590,7 +627,8 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
     return result;
 }
 
-struct steer_pv1_error steer_prototype_config_parse(const char*data,size_t length,uint64_t generation,struct steer_prototype_config**out){
+struct steer_pv1_error steer_prototype_config_parse_with_vpn(const char*data,size_t length,uint64_t generation,
+    const struct steer_prototype_socks_vpn_allowlist *allow,struct steer_prototype_config**out){
     struct err diagnostic={
         0
     }
@@ -622,11 +660,12 @@ struct steer_pv1_error steer_prototype_config_parse(const char*data,size_t lengt
     c->generation=generation;
     if(ynode_get(root,"version")){
         c->format=STEER_STORE_FORMAT_SPEC_V3;
-        e=parse_v3(data,length,root,c);
+        e=parse_v3(data,length,root,allow,c);
         if(e.code)goto done;
         goto serialize;
     }
-    if(!keys(root,"prototype listeners routing")||!eq(ynode_get(root,"prototype"),"steer-linux-v1"))goto done;
+    if((allow&&allow->count)||!keys(root,"prototype listeners routing")||
+        !eq(ynode_get(root,"prototype"),"steer-linux-v1"))goto done;
     c->format=STEER_STORE_FORMAT_PROTOTYPE;
     list=ynode_get(root,"listeners");
     routing=ynode_get(root,"routing");
@@ -676,4 +715,7 @@ struct steer_pv1_error steer_prototype_config_parse(const char*data,size_t lengt
     done:ydoc_free(doc);
     steer_prototype_config_destroy(c);
     return e;
+}
+struct steer_pv1_error steer_prototype_config_parse(const char*data,size_t length,uint64_t generation,struct steer_prototype_config**out){
+    return steer_prototype_config_parse_with_vpn(data,length,generation,NULL,out);
 }

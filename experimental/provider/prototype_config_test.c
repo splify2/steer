@@ -76,9 +76,62 @@ static void spec_v3(void){
         "outbounds: {deny: {type: block, flow: [device]}}\n"
         "routing: {default: deny, rules: []}\n");
 }
+static void spec_v3_socks_vpn(void){
+    const char *header=
+        "version: 3\n"
+        "plugin_remotes: {local: {url: 'https://github.com/splify2/steer-protocols', trust: steer-linked-prototype-v1}}\n"
+        "plugins: {local: {remote: local, package: steer-protocols, version: '0.0.0'}}\n"
+        "secrets:\n"
+        "  user: {source: env, name: VPN_USERNAME, kind: username}\n"
+        "  pass: {source: env, name: VPN_PASSWORD, kind: password}\n"
+        "  other: {source: env, name: OTHER_PASSWORD, kind: password}\n";
+    const char *auth="{principal_id: vpn-peer, username: {secret: user}, password: {secret: pass}}";
+    struct steer_prototype_socks_vpn_allowlist allow={0};
+    struct steer_prototype_config *c=NULL;
+    char document[4096];
+    assert(steer_prototype_socks_vpn_allow(&allow,"10.8.0.1","VPN_USERNAME","VPN_PASSWORD"));
+    assert(steer_prototype_socks_vpn_allow(&allow,"fd00:0000::0001","VPN_USERNAME","VPN_PASSWORD"));
+    const char *invalid[]={"0.0.0.0","::","::ffff:10.8.0.1","10.8.0.1/32","localhost","127.0.0.2",
+        "::1","ff01::1","fe80::1","224.1.2.3","fd00::1"};
+    for(size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++)
+        assert(!steer_prototype_socks_vpn_allow(&allow,invalid[i],"VPN_USERNAME","VPN_PASSWORD"));
+    assert(!steer_prototype_socks_vpn_allow(&allow,"10.8.0.2","env:VPN_USERNAME","VPN_PASSWORD"));
+    assert(!steer_prototype_socks_vpn_allow(&allow,"10.8.0.2","VPN_PASSWORD","VPN_PASSWORD"));
+    const struct {const char *address,*options; int valid;} cases[]={
+        {"10.8.0.1",auth,1},
+        {"fd00::1",auth,1},
+        {"127.0.0.2",auth,1},
+        {"10.8.0.2",auth,0},
+        {"0.0.0.0",auth,0},
+        {"::",auth,0},
+        {"10.8.0.1","{}",0},
+        {"10.8.0.1","{username: {secret: user}, password: {secret: pass}}",0},
+        {"10.8.0.1","{principal_id: vpn-peer, username: {secret: user}, password: {secret: user}}",0},
+        {"10.8.0.1","{principal_id: vpn-peer, username: {secret: user}, password: {secret: other}}",0},
+        {"10.8.0.1","{principal_id: vpn-peer, username: {secret: user}, password: 'env:VPN_PASSWORD'}",0},
+    };
+    for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++){
+        snprintf(document,sizeof document,"%sinbounds:\n"
+            "  entry: {plugin: 'socks:local', enabled: false, listen: {address: '%s', port: 11080}, options: %s}\n"
+            "outbounds: {deny: {type: block}}\nrouting: {default: deny, rules: []}\n",
+            header,cases[i].address,cases[i].options);
+        if(!cases[i].valid){
+            assert(steer_prototype_config_parse_with_vpn(document,strlen(document),1,&allow,&c).code&&!c);
+            continue;
+        }
+        assert(!steer_prototype_config_parse_with_vpn(document,strlen(document),1,&allow,&c).code);
+        assert(c->listeners[0].auth==STEER_PROTOTYPE_AUTH_USERPASS&&!c->listeners[0].enabled);
+        assert(!strcmp(c->listeners[0].principal_id,"vpn-peer"));
+        assert(!strcmp(c->listeners[0].username_ref,"env:VPN_USERNAME"));
+        assert(!strcmp(c->listeners[0].password_ref,"env:VPN_PASSWORD"));
+        steer_prototype_config_destroy(c);
+        if(i<2)bad(document);
+    }
+}
 int main(void){
     hysteria2();
     spec_v3();
+    spec_v3_socks_vpn();
     struct steer_prototype_config*c=NULL,*round=NULL;
     uint8_t ip[4]={
         127,0,0,1

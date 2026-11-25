@@ -20,7 +20,7 @@ UNIT_NAMES += route-stream route-stream-release datagram-routes datagram-registr
 UNIT_NAMES += route-stream-drain host-worker host-worker-namespace host-worker-registration
 UNITS = $(addprefix $(BUILD)/,$(addsuffix -test,$(UNIT_NAMES)))
 
-.PHONY: all test unit-test integration-test
+.PHONY: all test unit-test integration-test socks-vpn-netns-test
 all: $(UNITS) $(BUILD)/socks-loopback $(BUILD)/vless-loopback $(BUILD)/steer-prototype
 
 $(BUILD):
@@ -103,6 +103,10 @@ integration-test: $(BUILD)/socks-loopback $(BUILD)/vless-loopback $(BUILD)/steer
 	$(PYTHON) prototype_persistence_test.py $(BUILD)/steer-prototype
 	$(PYTHON) prototype_startup_signal_test.py $(BUILD)/steer-prototype-startup-signal
 test: unit-test integration-test
+
+# Explicit privileged fixture; both WireGuard peers and veth live in test namespaces.
+socks-vpn-netns-test: $(BUILD)/steer-prototype
+	$(PYTHON) prototype_socks_vpn_test.py $(BUILD)/steer-prototype
 
 # Explicit Linux server profile. Verified dependencies are supplied by caller;
 # default/client builds retain their existing dependency and feature surface.
