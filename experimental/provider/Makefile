@@ -140,16 +140,22 @@ $(BUILD)/hy2-tcp-client-test: hy2_tcp_client_test.c hy2_tcp_client.h $(HY2_TCP_S
 	    $(LDFLAGS) $(LDLIBS) -lm -o $@
 $(BUILD)/steer-prototype-hy2-fault: HY2_TEST_EXTRA = -DSTEER_PREPARE_WRAP_READ prepare_read_fault.c -Wl,--wrap=read -Wl,--wrap=__read_chk
 $(BUILD)/steer-prototype-hy2-fault: prepare_read_fault.c
-$(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype-hy2-fault: $(HOST_SRC) $(HY2_SRC) prototype_main.c $(wildcard *.h) | $(BUILD)
+# Same acceptance binary, two explicitly selected runtime profiles. Never part of all/Nano.
+$(BUILD)/steer-prototype-hy2-wg-netns: WG_BUILD_FLAGS = -DSTEER_PROTOTYPE_WG_NETNS -ffunction-sections -fdata-sections
+$(BUILD)/steer-prototype-hy2-wg-netns: WG_BUILD_SRC = $(WG_NETNS_SRC)
+$(BUILD)/steer-prototype-hy2-wg-netns: WG_LINK_FLAGS = -Wl,--gc-sections
+$(BUILD)/steer-prototype-hy2-wg-netns: $(WG_NETNS_SRC)
+HY2_HOSTS = $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype-hy2-fault $(BUILD)/steer-prototype-hy2-wg-netns
+$(HY2_HOSTS): $(HOST_SRC) $(HY2_SRC) prototype_main.c $(wildcard *.h) | $(BUILD)
 	@test -r "$(NGTCP2_LIB).cflags" -a -r "$(WOLFSSL_SERVER_LIB).cflags"
 	@grep -q -- '-DSTEER_WOLFSSL_SERVER' "$(WOLFSSL_SERVER_LIB).cflags"
 	@grep -q -- '-DWOLFSSL_VALIDATE_ECC_IMPORT' "$(WOLFSSL_SERVER_LIB).cflags"
 	@grep -Eq -- '(^|[[:space:]])-DSTEER_WOLFSSL_POSIX_TIME_SAFE=1([[:space:]]|$$)' "$(WOLFSSL_SERVER_LIB).cflags" || { echo 'rebuild wolfSSL archive with current POSIX time-safe profile' >&2; exit 2; }
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(HY2_INC) -DSTEER_PROTOTYPE_HY2 -DQC_WITH_ENDPOINT \
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(HY2_INC) $(WG_BUILD_FLAGS) -DSTEER_PROTOTYPE_HY2 -DQC_WITH_ENDPOINT \
 	    $$(cat "$(NGTCP2_LIB).cflags" "$(WOLFSSL_SERVER_LIB).cflags") \
-	    $(HOST_SRC) $(HY2_SRC) prototype_main.c "$(NGTCP2_LIB)" "$(WOLFSSL_SERVER_LIB)" \
-	    $(HY2_TEST_EXTRA) $(LDFLAGS) $(LDLIBS) -lm -o $@
-$(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype-hy2-fault: $(wildcard $(PROTOCOLS)/src/hysteria2/*.h $(PROTOCOLS)/src/hysteria2/*.inc) \
+	    $(HOST_SRC) $(HY2_SRC) $(WG_BUILD_SRC) prototype_main.c "$(NGTCP2_LIB)" "$(WOLFSSL_SERVER_LIB)" \
+	    $(HY2_TEST_EXTRA) $(WG_LINK_FLAGS) $(LDFLAGS) $(LDLIBS) -lm -o $@
+$(HY2_HOSTS): $(wildcard $(PROTOCOLS)/src/hysteria2/*.h $(PROTOCOLS)/src/hysteria2/*.inc) \
     ../../src/proto/quic/quic.h ../../src/proto/quic/qcssl.h ../../src/proto/hysteria2/hy2wire.h ../spec/spec.h \
     $(wildcard $(SDK)/include/steer/draft/*.h) ../../src/daemon/loop.h \
     $(PROTOCOLS)/src/socks5/codec.h $(PROTOCOLS)/src/socks5/outbound.h $(PROTOCOLS)/src/vless/inbound.h $(PROTOCOLS)/src/vless/outbound.h \

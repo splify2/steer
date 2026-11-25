@@ -108,6 +108,15 @@ unshare -n -- env TMPDIR="$out" PYTHONDONTWRITEBYTECODE=1 \
     3</proc/self/ns/net
 ```
 
+For cross-protocol acceptance, the additional explicit make target
+`"$out/steer-prototype-hy2-wg-netns"` takes `NGTCP2_LIB` and `WOLFSSL_SERVER_LIB`
+from the optional HY2 build. Use that executable as the **first** binary in the
+WG test above and as `CORE_BINARY` for Steer UI's `spec-v3-matrix-test`.
+Ordinary `--config` runs the proxy profile; only `--wg-netns-profile` enters
+the WG device profile, under the same namespace and fd checks described above.
+These are separate invocations: success on both does not establish a mixed
+WG/proxy document, a proxy-to-WG route, or a host networking deployment.
+
 This does not wire WG into the general host executor or UI. Before doing that,
 move serialized control work to the bounded host worker, replace the isolated
 reservation with common `execution_reservations`/`device_authority_service`,
