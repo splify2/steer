@@ -205,7 +205,7 @@ static int huff_decode(const uint8_t *in, size_t n, char *out, size_t cap) {
         if (len > 30) return -1;
         for (unsigned s = 0; s < 257; s++) {
             if (HL[s] != len || HC[s] != code) continue;
-            if (s == 256) return -1;
+            if (s == 256 || s == 0 || s == '\r' || s == '\n') return -1;
             /* Строка длиннее места (набивка ответа сервера — до двух килобайт) читается до конца,
              * чтобы проверить её и найти границу, но хранится только начало. */
             if (o + 1 < cap) out[o++] = (char)s;
@@ -246,6 +246,8 @@ static size_t r_str(const uint8_t *d, size_t n, unsigned prefix, char *out, size
     if (huff) {
         if (huff_decode(d + k, (size_t)l, out, cap) < 0) return 0;
     } else {
+        for (size_t i = 0; i < l; i++)
+            if (!d[k + i] || d[k + i] == '\r' || d[k + i] == '\n') return 0;
         size_t keep = (size_t)l + 1 > cap ? cap - 1 : (size_t)l;      /* хранится начало, см. huff_decode */
         memcpy(out, d + k, keep);
         out[keep] = '\0';
@@ -263,13 +265,18 @@ static int static_status_val(uint64_t i) {
     return 0;
 }
 
-static void note_header(struct hy2_auth_resp *r, const char *name, const char *val) {
-    if (!strcasecmp(name, ":status")) r->status = atoi(val);
+static int note_header(struct hy2_auth_resp *r, const char *name, const char *val) {
+    if (!strcasecmp(name, ":status")) {
+        if (r->status || strlen(val) != 3 || val[0] < '1' || val[0] > '5' ||
+            val[1] < '0' || val[1] > '9' || val[2] < '0' || val[2] > '9') return -1;
+        r->status = (val[0] - '0') * 100 + (val[1] - '0') * 10 + val[2] - '0';
+    }
     else if (!strcasecmp(name, "hysteria-udp")) r->udp = !strcasecmp(val, "true");
     else if (!strcasecmp(name, "hysteria-cc-rx")) {
         if (!strcasecmp(val, "auto")) r->rx_auto = 1;
         else r->rx = strtoull(val, NULL, 10);
     }
+    return 0;
 }
 
 static int qpack_section(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why) {
@@ -286,23 +293,26 @@ static int qpack_section(const uint8_t *d, size_t n, struct hy2_auth_resp *r, co
         if (b & 0x80) {                                 /* 1T: индекс */
             if (!(b & 0x40)) { if (why) *why = "динамическая таблица QPACK"; return -1; }
             k = r_qint(d, n, 6, &v);
-            if (!k) goto trunc;
-            if (static_is_status(v)) r->status = static_status_val(v);
+            if (!k || v > 98) goto trunc;
+            if (static_is_status(v)) {
+                if (r->status) goto status;
+                r->status = static_status_val(v);
+            }
         } else if ((b & 0xc0) == 0x40) {                /* 01NT: имя по индексу */
             if (!(b & 0x10)) { if (why) *why = "динамическая таблица QPACK"; return -1; }
             k = r_qint(d, n, 4, &v);
-            if (!k) goto trunc;
+            if (!k || v > 98) goto trunc;
             size_t m = r_str(d + k, n - k, 7, val, sizeof val);
             if (!m) goto trunc;
             k += m;
-            if (static_is_status(v)) note_header(r, ":status", val);
+            if (static_is_status(v) && note_header(r, ":status", val)) goto status;
         } else if ((b & 0xe0) == 0x20) {                /* 001NH: литеральное имя */
             size_t m1 = r_str(d, n, 3, name, sizeof name);
             if (!m1) goto trunc;
             size_t m2 = r_str(d + m1, n - m1, 7, val, sizeof val);
             if (!m2) goto trunc;
             k = m1 + m2;
-            note_header(r, name, val);
+            if (note_header(r, name, val)) goto status;
         } else {                                        /* 0001, 0000: после-базовые — их нет без таблицы */
             if (why) *why = "динамическая таблица QPACK";
             return -1;
@@ -310,6 +320,9 @@ static int qpack_section(const uint8_t *d, size_t n, struct hy2_auth_resp *r, co
         d += k; n -= k;
     }
     return 0;
+status:
+    if (why) *why = "негодный или повторный :status";
+    return -1;
 trunc:
     if (why) *why = "заголовки ответа не разобрать";
     return -1;

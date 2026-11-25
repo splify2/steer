@@ -225,6 +225,17 @@ static void test_auth_response(void) {
     /* Ссылка на динамическую таблицу (Required Insert Count != 0) — отказ. */
     uint8_t dyn[] = { 0x01, 0x03, 0x01, 0x00, 0x80 };
     CHECK(hy2_auth_response(dyn, sizeof dyn, &r, NULL) == -1);
+    /* Hysteria authentication must require one exact, unambiguous status. */
+    static const char *invalid[] = {
+        "010900005f090432333378",    /* 233x */
+        "010900005f090432333300",    /* 233 NUL */
+        "010a00005f090432333300d8",  /* malformed status followed by indexed status */
+        "01090000d85f0903323333",    /* duplicate status (indexed 103, then 233) */
+    };
+    for(size_t i=0;i<sizeof invalid/sizeof invalid[0];i++) {
+        n=unhex(invalid[i],b);
+        CHECK(hy2_auth_response(b,n,&r,NULL)==-1);
+    }
 }
 
 /* Разбор запроса нашими же руками: проверяется форма (что кадр самосогласован и статическая часть

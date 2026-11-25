@@ -112,6 +112,17 @@ HY2_SRC = hy2_inbound.c hy2_datagram.c datagram.c datagram_routes.c ../../src/pr
     $(PROTOCOLS)/src/hysteria2/auth.c $(PROTOCOLS)/src/hysteria2/inbound.c \
     ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c
 HY2_INC = $(shell find ../../src -type d -printf '-I%p ')
+HY2_TCP_SRC = hy2_tcp_client.c ../../src/proto/hysteria2/hy2wire.c \
+    ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c
+$(BUILD)/hy2-tcp-client-test: hy2_tcp_client_test.c hy2_tcp_client.h $(HY2_TCP_SRC) \
+    ../../src/proto/hysteria2/hy2wire.h ../../src/proto/quic/quic.h ../../src/proto/quic/qcssl.h \
+    $(NGTCP2_LIB) $(WOLFSSL_SERVER_LIB) $(wildcard $(NGTCP2_LIB).cflags $(WOLFSSL_SERVER_LIB).cflags) | $(BUILD)
+	@test -r "$(NGTCP2_LIB).cflags" -a -r "$(WOLFSSL_SERVER_LIB).cflags"
+	@grep -Eq -- '(^|[[:space:]])-DSTEER_WOLFSSL_POSIX_TIME_SAFE=1([[:space:]]|$$)' "$(WOLFSSL_SERVER_LIB).cflags"
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(HY2_INC) -UNDEBUG \
+	    $$(cat "$(NGTCP2_LIB).cflags" "$(WOLFSSL_SERVER_LIB).cflags") \
+	    $(HY2_TCP_SRC) hy2_tcp_client_test.c "$(NGTCP2_LIB)" "$(WOLFSSL_SERVER_LIB)" \
+	    $(LDFLAGS) $(LDLIBS) -lm -o $@
 $(BUILD)/steer-prototype-hy2-fault: HY2_TEST_EXTRA = -DSTEER_PREPARE_WRAP_READ prepare_read_fault.c -Wl,--wrap=read -Wl,--wrap=__read_chk
 $(BUILD)/steer-prototype-hy2-fault: prepare_read_fault.c
 $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype-hy2-fault: $(HOST_SRC) $(HY2_SRC) prototype_main.c $(wildcard *.h) | $(BUILD)

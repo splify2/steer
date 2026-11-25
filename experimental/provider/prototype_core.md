@@ -212,6 +212,83 @@ python3 steer/experimental/provider/prototype_socks_outbound_test.py \
   --core /tmp/steer-provider-build/steer-prototype --xray /path/to/xray --wire-cases
 ```
 
+### Hysteria2 TCP outbound transport checkpoint (not managed yet)
+
+`hy2_tcp_client.c` is an isolated Linux TCP transport, not a registered
+spec-v3 outbound. It reuses Steer's ngtcp2/wolfSSL client and the legacy HY2
+HTTP/3 and TCP codecs, without the global node, worker, or TUN callbacks of
+`hy2conn.c`. It connects only to a numeric upstream, strictly checks the
+certificate against prepared PEM roots and an explicit DNS/IP identity, and
+sends the password only after verified TLS. It does not expose a stream until
+both HTTP 233 and a positive HY2 TCP response arrive. There is no direct
+fallback, DNS lookup on the owner, UDP relay, 0-RTT, obfuscation or port hopping.
+DNS targets are forwarded as wire names for server-side resolution.
+
+Preparation (regular PEM file, up to 1 MiB, and TLS context creation) belongs on
+the prepare worker or at bootstrap. The owner drives nonblocking QUIC/UDP via
+fd and timer; it must re-evaluate deadlines after writes and read-credit
+returns. An absolute open deadline covers TLS, auth and upstream TCP response.
+The checkpoint uses one QUIC connection per TCP flow, up to 16 per profile,
+with 64 KiB send and receive flow bounds. Retire rejects further admissions,
+including for stale generations, but admitted opens and streams can drain; a
+profile cannot be destroyed until those flows are released. The adapter still
+needs to supply the host's aggregate limits and drain deadline.
+
+Proposed spec-v3 fields for the UI form; **not accepted by managed Apply
+yet**. The plugin alias `proxy` is the alias declared by the existing linked
+profile:
+
+```yaml
+secrets:
+  hy2-out-password: {source: env, kind: password, name: STEER_HY2_OUT_PASSWORD}
+  hy2-out-roots: {source: env, kind: certificate, name: STEER_HY2_OUT_CA}
+outbounds:
+  hy2-exit:
+    plugin: hysteria2:proxy
+    flow: [stream]
+    endpoint: {address: 192.0.2.10, port: 443}
+    transport: {type: quic}
+    security: {type: tls, server_name: relay.example, verify: true}
+    options: {password: {secret: hy2-out-password}, ca_bundle: {secret: hy2-out-roots}}
+```
+
+The form takes a numeric IPv4/IPv6 endpoint and port 1–65535, a required
+ASCII DNS name (IDNA A-labels only) or IP SAN identity, and references to
+the password and trusted CA bundle. `STEER_HY2_OUT_CA` is a path to a regular
+PEM file in the core's environment, not a URL or a leaf-certificate bypass.
+The password is 1–256 visible ASCII bytes; the form and intent must not return
+resolved values or paths. TLS verification and ALPN `h3` are fixed, not UI
+switches. Do not expose UDP. The graph must reject HY2 TCP as a route/default
+for a selected ingress class that also requires datagrams.
+
+Next integration step: lower the strict stream/quic/tls tuple into typed
+configuration and snapshot the above references in `prototype_prepare.c`.
+Hand the prepared profile through `steer_prototype_prepared_input`; add a
+generation-owned `steer_pv1_stream_backend_api` adapter over the fd/timer
+transport in `prepare_stream_routes()` (no fallback), quiesce its admission on
+publication/stop, and reclaim it only after all operations and streams drain.
+Use the existing binding lease, callback deferral, and per-route budgets. Add
+spec integration coverage for Validate/Apply/CAS failure, TCP relay, held old
+stream across Apply, TCP-only graph rejection, forced drain, and restart.
+
+To reproduce the isolated test, build
+`experimental/provider` target `$BUILD/hy2-tcp-client-test` with the same
+`NGTCP2_LIB` and `WOLFSSL_SERVER_LIB` archives and `.cflags` as the optional
+server profile. Build `tests/hy2_outbound_oracle.go` via `go build -o
+$ORACLE_SERVER /absolute/path/to/tests/hy2_outbound_oracle.go` from the pinned
+upstream Hysteria Go workspace (its `core` directory). Then run:
+
+```sh
+python3 experimental/provider/hy2_tcp_client_test.py \
+  --client "$BUILD/hy2-tcp-client-test" --server "$ORACLE_SERVER" \
+  --oracle-client /tmp/opencode/steer-hy2-oracle-bin
+```
+
+The supplied oracle binary is an independent **client**; it verifies the
+upstream server fixture before the Steer client runs. All test addresses are
+loopback; the fixture explicitly maps `target.test` to a local echo service
+without DNS and rejects other targets.
+
 ### Optional Hysteria2 server build
 
 On the optional HY2 server build, merge the following entries into the
