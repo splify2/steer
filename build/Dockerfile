@@ -26,7 +26,9 @@ FROM alpine:3.20
 ARG ZIG_VERSION=0.13.0
 ARG ZIG_SHA256=d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
 
-RUN apk add --no-cache curl xz \
+# Python и openssl нужны обязательным ext-test/pluginmgrmatch/httpsmatch;
+# iproute2 и nftables — демоническому fixture, если разрешён изолированный netns.
+RUN apk add --no-cache curl xz python3 openssl iproute2 nftables \
  && curl -fsSL -o /tmp/zig.tar.xz \
       "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
  && echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - \

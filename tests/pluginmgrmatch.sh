@@ -523,8 +523,41 @@ mk lnocc 1.0.0 ',"steer":{"links":[{"path":"/usr/bin/occ","target":"bin/lnocc"}]
 mk lndup 1.0.0 ',"steer":{"links":[{"path":"/usr/bin/lnprog","target":"bin/lndup"}]},"permissions":["fs:/usr/bin/lnprog"]'
 mk lnsys 1.0.0 ',"requires":{"system":["standin-pkg"]},"permissions":["system-packages"]'
 for p in lnocc lndup lnsys; do build "src/$p-1.0.0" plg.sec; done
-# Ссылку без права fs: s2p новых версий отвергает сам — тогда отказ менеджера проверить нечем.
-LNBAD=0; "$S2P" build src/lnbad-1.0.0 --key plg.sec -o dist >/dev/null 2>&1 && LNBAD=1
+# Два разных барьера: SDK обязан отклонить неверный манифест до сборки;
+# менеджер должен проверять также архивы, созданные не этим упаковщиком.
+"$S2P" build src/lnbad-1.0.0 --key plg.sec -o dist >lnbad-build.out 2>lnbad-build.err; rc=$?
+check "links: SDK отвергает путь без fs" "yes" "$([ "$rc" -ne 0 ] && echo yes || echo no)"
+has "  SDK называет отсутствие права" "не разрешена правом fs:" "$(cat lnbad-build.err)"
+# Контрольный корректный unsigned-архив от того же SDK; меняем только plugin.json
+# и его запись в MANIFEST, сохраняя порядок/режимы. Это намеренно не подписанный
+# вредоносный fixture для --file --unsigned, а не артефакт SDK или релиза.
+mk lnfixture 1.0.0 ',"steer":{"links":[{"path":"/usr/bin/lnfixture","target":"bin/lnfixture"}]},"permissions":["fs:/usr/bin/lnfixture"]'
+"$S2P" build src/lnfixture-1.0.0 --unsigned -o udist >/dev/null 2>lnfixture-build.err || { cat lnfixture-build.err; exit 1; }
+python3 - udist/lnfixture-1.0.0-all.s2p udist/lnfixture-bad.s2p <<'PYFIX'
+import hashlib, io, json, sys, tarfile
+with tarfile.open(sys.argv[1], 'r:gz') as src:
+    entries = [(m, src.extractfile(m).read() if m.isfile() else None) for m in src]
+assert [m.name for m, _ in entries[:3]] == ['plugin.json', 'MANIFEST', 'MANIFEST.sig']
+assert entries[2][1] == b''
+doc = json.loads(entries[0][1]); del doc['permissions']
+data = (json.dumps(doc, separators=(',', ':')) + '\n').encode()
+manifest = entries[1][1].decode().splitlines()
+for i, line in enumerate(manifest):
+    fields = line.split(' ', 3)
+    if len(fields) == 4 and fields[3] == 'plugin.json':
+        fields[0], fields[1] = hashlib.sha256(data).hexdigest(), str(len(data))
+        manifest[i] = ' '.join(fields)
+        break
+else: raise SystemExit('plugin.json отсутствует в MANIFEST')
+entries[0] = (entries[0][0], data)
+entries[1] = (entries[1][0], ('\n'.join(manifest) + '\n').encode())
+with tarfile.open(sys.argv[2], 'w:gz', format=tarfile.USTAR_FORMAT) as dst:
+    for m, content in entries:
+        if content is not None:
+            m.size = len(content)
+        dst.addfile(m, io.BytesIO(content) if content is not None else None)
+PYFIX
+[ "$?" = 0 ] || { echo "lnfixture: не удалось подготовить архив"; exit 1; }
 index
 P search --json >/dev/null 2>&1
 o="$(P install ln --json 2>err.txt)"; rc=$?
@@ -548,11 +581,14 @@ o="$(P update ln --json 2>/dev/null)"; rc=$?
 check "links: обновление с упавшим postinst — откат" "1 ln 1.1.0" "$rc $(sys/usr/bin/lnprog)"
 has "  откат — по postinst, а не по проверке манифеста" "возвращена прежняя версия" "$o"
 check "  путь новой версии снят при откате" "no" "$([ -e sys/usr/bin/lnextra ] || [ -L sys/usr/bin/lnextra ] && echo yes || echo no)"
-if [ "$LNBAD" = 1 ]; then
-    o="$(P install lnbad --json 2>/dev/null)"; rc=$?
-    check "links: путь без права fs: — отказ" "1" "$rc"
-    has "  причина" "ссылка /usr/bin/lnbad без права fs:" "$o"
-else echo "pluginmgrmatch: s2p сам отвергает ссылку без права fs: — отказ менеджера не проверен"; fi
+o="$(P install --file udist/lnfixture-1.0.0-all.s2p --unsigned --json 2>/dev/null)"; rc=$?
+check "links: контрольный архив SDK устанавливается" "0" "$rc"
+P remove lnfixture --force --json >/dev/null 2>&1
+o="$(P install --file udist/lnfixture-bad.s2p --unsigned --json 2>/dev/null)"; rc=$?
+check "links: менеджер отвергает архив без fs" "1 plugin.link_perm" "$rc $(printf '%s\n' "$o" | jq_ 'd["code"]')"
+has "  менеджер называет запрещённую ссылку" "ссылка /usr/bin/lnfixture без права fs:" "$o"
+check "  ссылка не создана" "no" "$([ -e sys/usr/bin/lnfixture ] || [ -L sys/usr/bin/lnfixture ] && echo yes || echo no)"
+check "  плагин не установлен" "no" "$([ -e root/lnfixture ] && echo yes || echo no)"
 o="$(P install lndup --json 2>/dev/null)"; rc=$?
 check "links: путь чужого плагина — отказ" "1" "$rc"
 has "  называет плагин" "путь /usr/bin/lnprog уже занят плагином ln" "$o"
@@ -919,6 +955,7 @@ P remove abu --force --json >/dev/null 2>&1; P remove abv --force --json >/dev/n
 
 # ---- с демоном: plugin-* сокета, событие plugin, plugin-reload ----
 if [ "${PM_INNER:-}" = 1 ]; then
+    echo "pluginmgrmatch: блок с демоном (изолированный netns)"
     mkdir -p st
     printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > dspec.yaml
     export STEER_SOCKET="$T/s.sock"
@@ -1043,9 +1080,9 @@ PY
         "$rc $(jq_ 'd["plugins"]["net1"]["version"]+" "+d["plugins"]["foo"]["version"]' < etc/state.json)"
     check "  проверка здоровья одна на группу, не по плагину" "1 0" \
         "$(grep -c 'проверка здоровья группы' err.txt) $(grep -c 'проверка здоровья foo\|проверка здоровья net1' err.txt)"
-    # ABI: перечитывание падает на соседе прежней сборки (его хук не запускается с новой библиотекой) — не вина
-    # ставящегося плагина, если он сам с библиотекой совместим: установка не откатывается. Так на стенде после
-    # net1 1.3.0 другой раскладки каждый плагин по одному откатывался из-за соседа («по одному нельзя»).
+    # ABI: несовместимый expand соседнего плагина не роняет весь reload: демон
+    # сообщает об отказе в журнале и оставляет этот выход недоступным с on_fail=drop.
+    # Совместимый с библиотекой abu при этом устанавливается, но не исцеляет abx.
     P install --file adB/abl1-1.0.0-all.s2p --file adB/abu-1.0.0-all.s2p --json >/dev/null 2>&1
     mk abx 1.0.0 ',"permissions":["spec.transform"],"requires":{"plugins":{"abl1":"^1.0"}},"steer":{"kinds":[{"name":"abx","caps":["mark"],"resources":{"ports":1},"expand":{"prog":"bin/expand","argv":["{out}"]}}]}'
     cat > src/abx-1.0.0/bin/expand <<'E'
@@ -1068,12 +1105,19 @@ E
     # Библиотека другой сборки встала без зависимых (как net1 у 2.1.0-g3d6c8f1): MANIFEST другой — другая сборка.
     printf 'A\n' > root/abl1/lib/libs2p-abl.so.1
     echo >> root/abl1/MANIFEST
+    : > d.err
     o="$("$BIN" ctl --socket "$T/s.sock" plugin-reload 2>&1)"
-    has "  перечитывание теперь падает на хуке abx" "другой раскладкой структур" "$o"
+    check "  reload остаётся доступным" "0" "$(printf '%s\n' "$o" | jq_ 'd["code"]')"
+    has "  демон сообщает отказ expand по ABI" "другой раскладкой структур" "$(cat d.err)"
+    o="$("$BIN" ctl --socket "$T/s.sock" status)"
+    check "  выход abx недоступен и настроен на on_fail=drop" "True drop" \
+        "$(printf '%s\n' "$o" | jq_ 'str(json.loads(d["stdout"])["outputs"]["a1"]["failed"])+" "+json.loads(d["stdout"])["outputs"]["a1"]["on_fail"]')"
     o="$(P install --file adA/abu-1.0.0-all.s2p --json 2>err.txt)"; rc=$?
-    check "abi с демоном: abu, совместимый со стоящей abl1, ставится, хотя перечитывание падает на abx" "0 A" \
+    check "abi с демоном: совместимый abu ставится при отказе expand соседа" "0 A" \
         "$rc $(root/abu/bin/abu | cut -d' ' -f3)"
-    has "  вывод называет виноватого соседа" "из-за стоящих abx прежней сборки" "$(cat err.txt)"
+    o="$("$BIN" ctl --socket "$T/s.sock" status)"
+    check "  после установки abu выход abx остаётся недоступен" "True drop" \
+        "$(printf '%s\n' "$o" | jq_ 'str(json.loads(d["stdout"])["outputs"]["a1"]["failed"])+" "+json.loads(d["stdout"])["outputs"]["a1"]["on_fail"]')"
     printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > dspec.yaml
     for p in abx abu abl1; do P remove $p --force --json >/dev/null 2>&1; done
     "$BIN" ctl --socket "$T/s.sock" plugin-reload >/dev/null 2>&1
