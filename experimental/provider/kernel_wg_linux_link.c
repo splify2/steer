@@ -38,6 +38,10 @@ void steer_draft_wg_linux_link_close(struct steer_draft_wg_linux_link *link){
     if(link){close(link->ns);free(link);}
 }
 
+int steer_draft_wg_linux_link_namespace(const struct steer_draft_wg_linux_link *link){
+    return link?link->ns:-1;
+}
+
 int steer_draft_wg_linux_link_prepare(struct steer_draft_wg_linux_link *link,
     const struct steer_draft_wg_tx *tx,uint64_t deadline,const atomic_uint *cancel,
     struct steer_draft_wg_identity *id){

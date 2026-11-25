@@ -38,39 +38,81 @@ The fixture checks the staged peer and address on the DOWN link, normal
 rollback, and exact recovery after SIGKILL leaves a staged link and a durable
 guard intent. Without `--netns` it only builds and checks namespace refusal.
 
-## Guard API still needed
+## Guard identity and recovery
 
-The current guard accessor exposes only the table name. The random marker is
-private until creation, bind discards the transaction phase, and the captured
-handle is private. Publication exports its phase but not the handle. The
-current `nfd_inet_table_identity()` is a useful exact lookup, not a substitute
-for the pre-bind identity or the transaction's captured handle.
+`guard_plan` mints a managed marker before bind; the legacy bind hook is
+unchanged for standalone callers. The managed transaction attaches the marker
+at creation and validates it together with the name, family and new handle
+in the transaction echo. A subsequent lookup alone cannot promote an unknown
+result to CHANGED. Before UP the host checks the durably captured DROP handle
+and marker using exact `inet` GETTABLE. `guard_retire_record` rechecks the
+worker/pinned namespace, boot, and captured index absence through RTM_GETLINK,
+then deletes only the exact observed marker+handle. These calls reuse the
+existing bounded netlink and nft transaction paths under one deadline.
 
-Proposed source-only additions (keep the legacy bind hook):
+## Core Apply: privileged isolated profile
 
-```c
-int steer_draft_kernel_wg_guard_plan(
-    const struct steer_draft_kernel_wg_guard *, char table[26], char marker[42]);
-struct steer_draft_kernel_wg_guard_result steer_draft_kernel_wg_guard_apply_owned(
-    struct steer_draft_kernel_wg_guard *, const struct steer_draft_wg_guard_record *,
-    int pinned_netns_fd, int publish, uint64_t deadline_ns, uint64_t *captured_handle);
-int steer_draft_kernel_wg_guard_retire_record(
-    const struct steer_draft_wg_guard_record *, int pinned_netns_fd, uint64_t deadline_ns);
-int nfd_inet_table_identity_until(
-    const char *, struct nfd_table_identity *, uint64_t deadline_ns);
+The optional `steer-prototype-wg-netns` binary accepts `--wg-netns-profile
+--control PATH --state-dir DIR`; fd 3 must pin the outer network namespace.
+The profile requires Linux root with CAP_NET_ADMIN, a different namespace
+from the outer namespace and PID 1, disabled IPv4 forwarding, and an owned private state directory
+containing a pre-existing owned private `wg-journal` directory. The default
+prototype binary and ordinary server arguments never register this profile.
+There is no fallback to existing host interfaces or services.
+
+This uses the same Core control `STATUS`, `GET`, `VALIDATE`, and revision-CAS
+`APPLY`. The frozen spec-v3 subset is one enabled builtin `wireguard:main`
+inbound `vpn`, one IPv4 /24 with host-only peer AllowedIPs, env key refs, and
+one `direct` or `block` device default. No arbitrary plugin fetch/lock
+resolution is implied by this exact local tuple. Stage separate port/subnet
+resources; no same-port or overlapping-prefix replacement. The profile
+only claims device inbound in its own namespace and LAN-local testing,
+not WireGuard outbound, generic routing, or production use.
+
+`prototype_store`'s config rename and directory sync are the only commit
+decision. The bounded device journal stores link and guard identities keyed by
+revision and profile-domain digest of exact canonical JSON. Startup
+recompiles and cross-checks the committed document, then freshly verifies
+its exact UP device and guard before any cleanup. Missing or ambiguous live
+state blocks startup, not fallback/adoption. Before rename, only the failed
+candidate can be cleaned; at RENAMED with uncertain durability, fence further
+Apply and leave both generations for the next validated startup. After
+SYNCED, retire the superseded generation using its reserved cleanup records.
+The retained selected link and firewall remain in the disposable netns across
+Core exit; neither production shutdown nor machine reboot is modeled.
+
+Build directly from a clean source archive, with sibling source archives of
+`plugin-sdk` at `fa2b823d928f6bdd3f1b4a533a0b2cb874b4f4dd` and
+`steer-protocols` at `cb6d369022300b8b26275d000b76021e1267f62b`. No local
+guard/nft overlays or patches are required. The test starts two independent
+WireGuard peers, initiates ICMP and UDP traffic from both directions, injects
+a real occupied listen port, and checks live peer traffic after recovery on
+both sides of the config commit. Server-initiated traffic on this inbound
+device is not a spec-configured outbound.
+
+```sh
+# From the workspace containing the three repositories; choose the WG Apply
+# commit explicitly rather than archiving the working tree.
+scratch=$(mktemp -d /tmp/opencode/wg-sources.XXXXXX)
+mkdir "$scratch/steer" "$scratch/plugin-sdk" "$scratch/steer-protocols"
+git -C steer archive "$STEER_WG_COMMIT" | tar -xf - -C "$scratch/steer"
+git -C plugin-sdk archive fa2b823d928f6bdd3f1b4a533a0b2cb874b4f4dd | tar -xf - -C "$scratch/plugin-sdk"
+git -C steer-protocols archive cb6d369022300b8b26275d000b76021e1267f62b | tar -xf - -C "$scratch/steer-protocols"
+cd "$scratch/steer"
+out=$(mktemp -d /tmp/opencode/wg-core.XXXXXX)
+make -C experimental/provider BUILD="$out" "$out/steer-prototype" \
+    "$out/steer-prototype-wg-netns" "$out/wg-commit-fault.so"
+unshare -n -- env TMPDIR="$out" PYTHONDONTWRITEBYTECODE=1 \
+    python3 experimental/provider/prototype_wg_apply_test.py \
+    "$out/steer-prototype-wg-netns" "$out/steer-prototype" "$out/wg-commit-fault.so" \
+    3</proc/self/ns/net
 ```
 
-`plan` is read-only, before bind. `apply_owned` reuses the current transaction
-and echo path with `run_output_until`, validates namespace/boot and exact
-name/kind/index/group, and returns the captured handle on CHANGED even when
-the command errors. The managed uncertainty path must also use the group-aware
-owned DOWN helper; the legacy name/kind/index check is not enough here. A fresh
-lookup cannot promote UNCERTAIN to CHANGED. Before UP the host checks the
-durably captured DROP handle and marker with an exact lookup, then uses the
-existing owned UP primitive. `retire_record` rechecks the worker/pinned
-namespace, boot, captured index absence, and table marker+handle before the
-existing delete-by-handle transaction. No name-only delete or re-adoption.
-All these steps must share the supplied absolute deadline.
-
-No live guard backend, managed WG Apply, or WireGuard inbound/outbound
-interoperability is claimed by this checkpoint.
+This does not wire WG into the general host executor or UI. Before doing that,
+move serialized control work to the bounded host worker, replace the isolated
+reservation with common `execution_reservations`/`device_authority_service`,
+add a normal deliberate retire/disable transition, and specify endpoint,
+route, transport and secret ownership for outbound and bidirectional
+configuration. The isolated journal has no compaction; accumulated orphans can
+fence admission. Real host work also needs machine-reboot and multi-device
+recovery, and an explicitly scoped privileged network integration contract.

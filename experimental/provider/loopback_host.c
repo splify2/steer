@@ -22,6 +22,9 @@
 #include "prototype_config.h"
 #include "resolver.h"
 #include "prototype_store.h"
+#ifdef STEER_PROTOTYPE_WG_NETNS
+#include "prototype_wg.h"
+#endif
 #include "prototype_prepare.h"
 #include "inbound_tls.h"
 #ifdef STEER_PROTOTYPE_HY2
@@ -156,6 +159,9 @@ struct host {
     struct steer_draft_backend_runtime *backend_runtime;
     struct steer_draft_resolver *resolver;
     struct steer_prototype_store *store;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    struct steer_prototype_wg *wg;
+#endif
     struct store_writer writer;
     struct steer_prototype_prepare *preparer;
     struct steer_prototype_socks_vpn_allowlist socks_vpn;
@@ -1587,6 +1593,14 @@ static void control_execute(struct control *c)
     char status[8192], prefix[128];
     size_t length;
     int code, n;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(h->wg){
+        code=steer_prototype_wg_request(h->wg,c->operation,c->expected,c->input+c->header_length,
+            c->body_length,c->input,sizeof(c->input),&length);
+        control_response(c,code,c->input,length);
+        return;
+    }
+#endif
     if (c->operation == 1) {
         length = status_json(h, status, sizeof(status));
         control_response(c, 200, status, length);
@@ -1706,6 +1720,21 @@ int steer_prototype_main(int argc, char **argv)
     FILE *file;
     size_t length = 0;
     int result = 1, seed = 0;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    /* One exclusive opt-in profile, kernel dataplane, serialized control.
+     * fd 3 must pin the original netns from before entry into the fixture. */
+    if(argc==6&&!strcmp(argv[1],"--wg-netns-profile")&&!strcmp(argv[2],"--control")&&
+       !strcmp(argv[4],"--state-dir")){
+        if(!initialize_host(&h,clients))goto cleanup;
+        if(steer_prototype_wg_open(argv[5],3,&h.wg))goto cleanup;
+        if(!bind_control(&h,argv[3]))goto cleanup;
+        size_t ready;
+        (void)steer_prototype_wg_request(h.wg,1,0,NULL,0,status,sizeof(status),&ready);
+        printf("READY %.*s\n",(int)ready,status);fflush(stdout);
+        result=loop_run(h.loop);
+        goto cleanup;
+    }
+#endif
     if(argc<5||strcmp(argv[1],"--config")||strcmp(argv[3],"--control"))return 2;
     for(int i=5;i<argc;){
         if(!strcmp(argv[i],"--state-dir")&&i+1<argc&&!state_dir){
@@ -1757,6 +1786,9 @@ int steer_prototype_main(int argc, char **argv)
     printf("READY %.*s\n", (int)length, status); fflush(stdout);
     result = loop_run(h.loop);
 cleanup:
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    steer_prototype_wg_close(h.wg);
+#endif
     cleanup_host(&h); free(document); steer_store_document_destroy(snapshot);
     return result;
 }

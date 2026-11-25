@@ -82,6 +82,17 @@ $(BUILD)/vless-loopback: $(HOST_SRC) vless_loopback.c stream.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HOST_SRC) vless_loopback.c $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/steer-prototype: $(HOST_SRC) prototype_main.c stream.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HOST_SRC) prototype_main.c $(LDFLAGS) $(LDLIBS) -o $@
+WG_NETNS_SRC = prototype_wg.c kernel_wg_linux_guard.c kernel_wg_linux_link.c kernel_wg_coordinator.c \
+    kernel_wg_guard.c kernel_wg_guard_record.c kernel_wg_ownership.c kernel_wg_v3.c ../spec/execution_journal.c \
+    ../../src/kinds/awgdev.c ../../src/lib/ir.c ../../src/lib/nftdump.c ../../src/lib/run.c ../../src/compile/print.c
+# Explicit, excluded from all/default/production. See docs/experimental-wg-coordinator.md.
+$(BUILD)/steer-prototype-wg-netns: $(HOST_SRC) $(WG_NETNS_SRC) prototype_main.c $(wildcard *.h) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DSTEER_PROTOTYPE_WG_NETNS \
+	    $(addprefix -I../../src/,kinds model platform profile compile tools cli) \
+	    -ffunction-sections -fdata-sections $(HOST_SRC) $(WG_NETNS_SRC) prototype_main.c \
+	    -Wl,--gc-sections $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD)/wg-commit-fault.so: prototype_wg_commit_fault.c | $(BUILD)
+	$(CC) $(CFLAGS) -fPIC -shared $< -o $@
 $(BUILD)/steer-prototype-startup-signal: $(HOST_SRC) prototype_main.c prototype_startup_signal_wrap.c $(wildcard *.h) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HOST_SRC) prototype_main.c prototype_startup_signal_wrap.c -Wl,--wrap=loop_run $(LDFLAGS) $(LDLIBS) -o $@
 

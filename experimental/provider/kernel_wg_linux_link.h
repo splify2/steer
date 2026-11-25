@@ -9,6 +9,8 @@
 struct steer_draft_wg_linux_link;
 int steer_draft_wg_linux_link_open(int outer_namespace_fd,struct steer_draft_wg_linux_link **);
 void steer_draft_wg_linux_link_close(struct steer_draft_wg_linux_link *);
+/* Borrowed, only for guarded operations on the same worker. Never close it. */
+int steer_draft_wg_linux_link_namespace(const struct steer_draft_wg_linux_link *);
 int steer_draft_wg_linux_link_prepare(struct steer_draft_wg_linux_link *,
     const struct steer_draft_wg_tx *,uint64_t deadline,const atomic_uint *cancel,
     struct steer_draft_wg_identity *);
