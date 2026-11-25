@@ -867,7 +867,7 @@ static struct steer_pv1_error hy2_acquire(void *user,struct steer_pv1_span inbou
         return (struct steer_pv1_error){STEER_PV1_POLICY_DENIED,0};
     if(h->current->references==UINT_MAX)return (struct steer_pv1_error){STEER_PV1_RESOURCE_EXHAUSTED,0};
     h->current->references++;
-    *lease=(struct steer_draft_route_lease){h->current->routes,h->current->number,h->current};
+    *lease=(struct steer_draft_route_lease){h->current->routes,h->current->number,h->current,h->current->streams};
     return (struct steer_pv1_error){0,0};
 }
 static void hy2_release(void *user,struct steer_draft_route_lease *lease) {
@@ -880,6 +880,16 @@ static struct steer_pv1_error hy2_datagram_acquire(void *user,struct steer_pv1_s
     struct listener *listener=user;struct steer_draft_route_lease lease={0};
     struct steer_pv1_error error=hy2_acquire(user,inbound,principal,epoch,&lease);if(error.code)return error;
     struct generation *g=lease.handle;
+    /* Consult the admitted generation, not the reusable socket's old spec. */
+    int allowed=0;
+    for(uint32_t i=0;i<g->config->listener_count;i++){
+        const struct steer_prototype_listener *spec=&g->config->listeners[i];
+        if(strlen(spec->id)==inbound.len&&!memcmp(spec->id,inbound.data,inbound.len)){
+            allowed=spec->protocol==STEER_PROTOTYPE_HYSTERIA2&&!spec->datagram_disabled;
+            break;
+        }
+    }
+    if(!allowed){hy2_release(user,&lease);return (struct steer_pv1_error){STEER_PV1_POLICY_DENIED,0};}
     error=steer_draft_binding_admit(g->datagram_binding,g->number,STEER_PV1_FLOW_DATAGRAM);
     if(error.code){hy2_release(user,&lease);return error;}
     *out=(struct steer_draft_hy2_datagram_binding){steer_draft_datagram_router_api(),g->datagrams,g,g->number};

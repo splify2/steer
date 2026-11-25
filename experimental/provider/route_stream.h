@@ -44,8 +44,8 @@ typedef void (*steer_draft_stream_routes_drained)(void *,struct steer_draft_stre
 struct steer_pv1_error steer_draft_stream_routes_on_drained(struct steer_draft_stream_routes *,
     steer_draft_stream_routes_drained,void *);
 void steer_draft_stream_routes_quiesce(struct steer_draft_stream_routes *);
-/* Legacy route_dial remains native-only for current HY2 compatibility. This
- * new API returns origin pairs. PENDING always defers completion, including
+/* Legacy route_dial remains native-only for the standalone adapter fixture.
+ * This API returns origin pairs. PENDING always defers completion, including
  * backend rejection, and pins binding/open state until operation release. */
 struct steer_pv1_async_start steer_draft_stream_route_open(struct steer_draft_stream_routes *,
     const struct steer_pv1_flow_metadata *,uint64_t deadline_ns,steer_pv1_stream_open_done,void *);

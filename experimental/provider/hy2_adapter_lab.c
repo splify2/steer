@@ -67,7 +67,7 @@ static struct steer_pv1_error acquire(void *user,struct steer_pv1_span inbound,s
     struct lab *l=user;
     if(!l->admitting||epoch!=l->epoch||!same(inbound,"hy2-lab")||!same(principal,"lab-user"))
         return (struct steer_pv1_error){STEER_PV1_POLICY_DENIED,0};
-    *lease=(struct steer_draft_route_lease){l->routes,7,l};l->leases++;
+    *lease=(struct steer_draft_route_lease){l->routes,7,l,NULL};l->leases++;
     return (struct steer_pv1_error){0,0};
 }
 static void release(void *user,struct steer_draft_route_lease *lease) {

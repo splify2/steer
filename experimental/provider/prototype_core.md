@@ -233,9 +233,14 @@ inbounds:
 ```
 
 Add `flow: [stream, datagram]` to both `internet` and `deny` in the example and
-add an ordered route for `hy2-local` to `internet`. The HY2 tuple requires both
-flow classes, and the compiler rejects a default or route that cannot handle
-the selected traffic. TCP and UDP share the same ordered routing policy. The
+add an ordered route for `hy2-local` to `internet`. For a TCP-only SOCKS5 or
+plain VLESS proxy default, explicitly use `flow: [stream]` on the HY2 inbound:
+new UDP associations are denied even if the policy selects direct. Existing
+UDP associations remain pinned to their admitted generation and drain normally.
+The compiler rejects the two-class HY2 document when its default or a matching
+route targets a stream-only proxy; it does not infer compatibility from
+component capabilities. A datagram-only HY2 inbound is unsupported. With the
+two-class profile TCP and UDP share the same ordered routing policy. The
 certificate and key variables contain paths in the core's environment; the
 password variable contains the password. No values or resolved paths are stored
 in the intent. A minimal build rejects HY2 documents. The prototype caps typed

@@ -24,6 +24,7 @@ $CC $FLAGS $NGFLAGS $WFLAGS @"$OUT/includes.rsp" -Itests -DQC_WITH_ENDPOINT \
     experimental/provider/hy2_datagram.c experimental/provider/flow_metadata.c src/proto/hysteria2/hy2wire.c \
     experimental/provider/stream.c experimental/provider/buffers.c \
     experimental/provider/operations.c experimental/provider/route_dial.c \
+    experimental/provider/route_stream.c experimental/provider/binding_lease.c \
     experimental/provider/resolver.c src/daemon/loop.c \
     ../steer-protocols/src/hysteria2/server.c ../steer-protocols/src/hysteria2/auth.c \
     ../steer-protocols/src/hysteria2/inbound.c src/proto/quic/quic.c src/proto/quic/qcssl.c \

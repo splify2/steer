@@ -3,11 +3,13 @@
 #ifndef STEER_DRAFT_INBOUND_SERVICES_H
 #define STEER_DRAFT_INBOUND_SERVICES_H
 #include "route_dial.h"
+#include "route_stream.h"
 #include "hy2_datagram.h"
 struct steer_draft_route_lease {
     struct steer_draft_routes *routes;
     uint64_t generation;
     void *handle;
+    struct steer_draft_stream_routes *stream_routes; /* optional native-only legacy lab */
 };
 struct steer_draft_inbound_services {
     struct loop *loop;

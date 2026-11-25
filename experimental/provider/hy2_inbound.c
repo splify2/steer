@@ -28,6 +28,10 @@ struct flow {
     struct steer_draft_route_lease lease;
     struct steer_pv1_async_start route;
     struct steer_pv1_stream *target;
+    struct steer_pv1_stream_ref backend;
+    struct steer_pv1_async_start finish;
+    uint32_t finish_error;
+    int finish_pending,finish_completed;
     struct direction upload,download;
     uint32_t route_error;
     int route_pending,route_completed,cancelled,target_fin,remote_fin,lease_owned;
@@ -76,6 +80,7 @@ static void cancel_flow(struct flow *f) {
     f->cancelled=1;
     if(f->route_pending) f->route.operation.api->cancel(f->route.operation.handle);
     if(f->target) a->streams->close(f->target);
+    if(f->backend.handle) f->backend.api->close(f->backend.handle);
     wake(a);
 }
 static void abort_flow(struct flow *f) {
@@ -91,7 +96,10 @@ static void completed(void *user,struct steer_pv1_error error,struct steer_pv1_b
 static int submit(struct direction *d,int write,uint32_t offset,uint32_t length) {
     struct flow *f=d->flow;struct steer_draft_hy2 *a=f->connection->owner;
     d->offset=offset;d->length=length;
-    d->operation=write?a->streams->write(f->target,d->buffer,offset,length,completed,d):
+    if(f->backend.handle)
+        d->operation=write?f->backend.api->write(f->backend.handle,d->buffer,offset,length,completed,d):
+            f->backend.api->read(f->backend.handle,d->buffer,offset,length,completed,d);
+    else d->operation=write?a->streams->write(f->target,d->buffer,offset,length,completed,d):
         a->streams->read(f->target,d->buffer,offset,length,completed,d);
     if(d->operation.disposition!=STEER_PV1_PENDING) { abort_flow(f);return -1; }
     d->pending=1;return 0;
@@ -109,6 +117,19 @@ static void route_done(void *user,struct steer_pv1_error error,uint32_t failure,
     if(f->cancelled) { a->route_callbacks_after_cancel++;if(!error.code&&target)a->success_after_cancel++; }
     if(f->cancelled&&target)a->streams->close(target);
     wake(a);
+}
+static void backend_done(void *user,struct steer_pv1_error error,struct steer_pv1_stream_ref target,
+    const struct steer_pv1_endpoint *bound,const struct steer_pv1_endpoint *peer,
+    const struct steer_pv1_stream_open_diagnostic *diagnostic) {
+    struct flow *f=user;struct steer_draft_hy2 *a=f->connection->owner;
+    (void)bound;(void)peer;(void)diagnostic;
+    f->route_error=error.code;f->backend=target;f->route_completed=1;
+    if(f->cancelled){a->route_callbacks_after_cancel++;if(!error.code&&target.handle)a->success_after_cancel++;}
+    if(f->cancelled&&target.handle)target.api->close(target.handle);
+    wake(a);
+}
+static void finish_done(void *user,struct steer_pv1_error error) {
+    struct flow *f=user;f->finish_error=error.code;f->finish_completed=1;wake(f->connection->owner);
 }
 /* Address identity stays intact until core policy/resolution. IPv6 requires
  * standard brackets; domains are borrowed only through route_dial start. */
@@ -133,7 +154,13 @@ static void request(void *user,struct hy2_server_tcp *tcp,const uint8_t *address
     }
     accepted.generation=f->lease.generation;accepted.inbound_id=span(a->inbound);
     accepted.principal_id=span(c->principal);accepted.source=c->peer;accepted.flow_class=STEER_PV1_FLOW_STREAM;
-    f->route=steer_draft_route_dial(f->lease.routes,&accepted,((uint64_t)loop_now_ms()+5000u)*1000000u,route_done,f);
+    if(f->lease.stream_routes){
+        struct steer_pv1_flow_metadata flow={.size=sizeof flow,.version=STEER_PV1_DRAFT_LAYOUT,
+            .generation=accepted.generation,.inbound_id=accepted.inbound_id,.principal_id=accepted.principal_id,
+            .source=accepted.source,.destination=accepted.destination,.flow_class=STEER_PV1_FLOW_STREAM};
+        f->route=steer_draft_stream_route_open(f->lease.stream_routes,&flow,
+            ((uint64_t)loop_now_ms()+5000u)*1000000u,backend_done,f);
+    }else f->route=steer_draft_route_dial(f->lease.routes,&accepted,((uint64_t)loop_now_ms()+5000u)*1000000u,route_done,f);
     if(f->route.disposition==STEER_PV1_PENDING)f->route_pending=1;
     else (void)hy2_server_tcp_ready(tcp,0);
 }
@@ -206,7 +233,12 @@ static void pump_flow(struct flow *f) {
     struct steer_draft_hy2 *a=f->connection->owner;struct direction *u=&f->upload,*d=&f->download;
     if(f->route_completed) {
         f->route.operation.api->release(f->route.operation.handle);f->route_pending=f->route_completed=0;
-        if(!f->cancelled)(void)hy2_server_tcp_ready(f->tcp,!f->route_error&&f->target);
+        if(!f->cancelled)(void)hy2_server_tcp_ready(f->tcp,!f->route_error&&(f->target||f->backend.handle));
+    }
+    if(f->finish_completed){
+        f->finish.operation.api->release(f->finish.operation.handle);
+        f->finish_completed=f->finish_pending=0;
+        if(f->finish_error&&!f->cancelled)abort_flow(f);
     }
     struct direction *directions[]={u,d};
     for(unsigned i=0;i<2;i++) if(directions[i]->completed) {
@@ -219,11 +251,17 @@ static void pump_flow(struct flow *f) {
         } else if(!x->bytes) { f->remote_fin=1;x->length=0; }
         else { x->offset=0;x->length=x->bytes; }
     }
-    if(f->cancelled||!f->target||f->route_pending)return;
+    if(f->cancelled||(!f->target&&!f->backend.handle)||f->route_pending)return;
     if(!u->pending&&!f->target_fin) {
         const uint8_t *bytes;int fin=0;size_t n=hy2_server_tcp_peek(f->tcp,&bytes,&fin);
         if(n) { if(n>CHUNK)n=CHUNK;uint8_t *out=view(u);if(!out)return;memcpy(out,bytes,n);if(submit(u,1,0,(uint32_t)n))return; }
-        else if(fin) { if(a->streams->shutdown_write(f->target).code)abort_flow(f);else f->target_fin=1; }
+        else if(fin) {
+            if(f->backend.handle){
+                f->finish=f->backend.api->finish_write(f->backend.handle,finish_done,f);
+                if(f->finish.disposition!=STEER_PV1_PENDING)abort_flow(f);
+                else {f->finish_pending=1;f->target_fin=1;}
+            }else if(a->streams->shutdown_write(f->target).code)abort_flow(f);else f->target_fin=1;
+        }
     }
     if(f->cancelled||d->pending)return;
     if(d->length) {
@@ -240,8 +278,9 @@ static void pump_flow(struct flow *f) {
 static void reap(struct steer_draft_hy2 *a) {
     for(struct flow **p=&a->flows;*p;) {
         struct flow *f=*p;
-        if(!f->cancelled||f->route_pending||f->upload.pending||f->download.pending) { p=&f->next;continue; }
+        if(!f->cancelled||f->route_pending||f->upload.pending||f->download.pending||f->finish_pending) { p=&f->next;continue; }
         if(f->target) { a->streams->close(f->target);if(a->streams->release(f->target).code) { p=&f->next;continue; } }
+        if(f->backend.handle) { f->backend.api->close(f->backend.handle);if(f->backend.api->release(f->backend.handle).code) { p=&f->next;continue; } }
         if(f->upload.buffer)a->buffers->release(a->services.buffers,f->upload.buffer);
         if(f->download.buffer)a->buffers->release(a->services.buffers,f->download.buffer);
         /* Last: only after route callback AND both stream operations drain. */

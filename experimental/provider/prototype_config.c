@@ -361,7 +361,8 @@ static int v3_hy2_options(void *unused,const struct ynode *options){
 static int v3_hy2_inbound(const struct steer_spec_node_view *node,const struct ynode *secrets,
     struct steer_prototype_listener *l){
     const struct ynode *transport=node->transport,*tls=node->security;
-    if(node->flows!=(STEER_SPEC_FLOW_STREAM|STEER_SPEC_FLOW_DATAGRAM)||
+    if((node->flows!=STEER_SPEC_FLOW_STREAM&&
+        node->flows!=(STEER_SPEC_FLOW_STREAM|STEER_SPEC_FLOW_DATAGRAM))||
         !keys(node->intent,"label enabled plugin options listen flow transport security")||
         !keys(transport,"type")||!eq(ynode_get(transport,"type"),"quic")||
         !keys(tls,"type certificate private_key")||!eq(ynode_get(tls,"type"),"tls")||
@@ -371,6 +372,7 @@ static int v3_hy2_inbound(const struct steer_spec_node_view *node,const struct y
         !v3_env_ref(secrets,ynode_get(tls,"private_key"),"private_key",l->private_key_ref))return 0;
     l->protocol=STEER_PROTOTYPE_HYSTERIA2;
     l->auth=STEER_PROTOTYPE_AUTH_PASSWORD;
+    l->datagram_disabled=node->flows==STEER_SPEC_FLOW_STREAM;
     return 1;
 }
 #endif
