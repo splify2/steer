@@ -295,7 +295,7 @@ static int inventory_read(struct steer_draft_wg_selection *s,struct inventory *i
         const struct steer_spec_journal_record *r=e->r;
         if(reconcile_records(r,&e->tx,&e->link,&e->guard))return EPROTO;
         if(e->tx.generation==revision->generation){
-            if(!r[PUBLISHED].length||r[PUBLISHED].effect!=STEER_PV1_DEVICE_CHANGED||
+            if(revision->without_wg||!r[PUBLISHED].length||r[PUBLISHED].effect!=STEER_PV1_DEVICE_CHANGED||
                !e->guard.handle||memcmp(e->tx.plan_digest,revision->digest,32))return EPROTO;
             i->active=n;
         }
@@ -310,8 +310,16 @@ static int inventory_read(struct steer_draft_wg_selection *s,struct inventory *i
                 return EPROTO;
         }
     }
-    if(revision->generation&&(i->active==SELECTION_MAX||i->e[i->active].r[CLEAN].length))return EPROTO;
+    if(revision->generation&&!revision->without_wg&&
+       (i->active==SELECTION_MAX||i->e[i->active].r[CLEAN].length))return EPROTO;
     return 0;
+}
+
+static int revision_valid(const struct steer_draft_wg_revision *r){
+    if(!r||(r->without_wg!=0&&r->without_wg!=1))return 0;
+    if(r->generation)return 1;
+    static const uint8_t zero[32];
+    return !r->without_wg&&!memcmp(r->digest,zero,sizeof(zero));
 }
 
 static int synced(struct steer_spec_journal_result result){
@@ -354,7 +362,7 @@ void steer_draft_wg_selection_close(struct steer_draft_wg_selection *s){
 int steer_draft_wg_selection_startup(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
     void *ctx,const struct steer_draft_wg_revision *revision,steer_draft_wg_verify_ready verify,
     uint64_t deadline,uint64_t *next_revision,struct steer_draft_wg_guard_record *selected){
-    if(!s||!cleanup_backend(b)||!revision||!verify||!next_revision)return EINVAL;
+    if(!s||!cleanup_backend(b)||!revision_valid(revision)||!verify||!next_revision)return EINVAL;
     *next_revision=0;
     if(selected)*selected=(struct steer_draft_wg_guard_record){0};
     int rc=running(deadline,NULL);
@@ -364,15 +372,16 @@ int steer_draft_wg_selection_startup(struct steer_draft_wg_selection *s,const st
     if(!rc&&i.active!=SELECTION_MAX)rc=verify(ctx,&i.e[i.active].guard,deadline);
     if(!rc&&i.used+i.reserved>s->max)rc=ENOSPC;
     if(!rc){
-        uint64_t highest=0;
+        uint64_t highest=revision->generation;
+        for(unsigned n=0;n<i.n;n++)if(i.e[n].tx.generation>highest)highest=i.e[n].tx.generation;
+        if(highest==UINT64_MAX){free(i.e);return EOVERFLOW;}
         for(unsigned n=0;n<i.n;n++){
-            if(i.e[n].tx.generation>highest)highest=i.e[n].tx.generation;
             if(n==i.active)continue;
             int err=clean_entry(s,b,ctx,&i.e[n],deadline);
             /* Stop on any ambiguity, retaining reservations for retry. */
             if(err){rc=err;break;}
         }
-        if(!rc){if(highest==UINT64_MAX)rc=EOVERFLOW;else *next_revision=highest+1;}
+        if(!rc)*next_revision=highest+1;
     }
     if(!rc&&selected&&i.active!=SELECTION_MAX)*selected=i.e[i.active].guard;
     free(i.e);
@@ -385,7 +394,9 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *s,const stru
     struct steer_draft_wg_ready *ready){
     if(!ready)return EINVAL;
     *ready=(struct steer_draft_wg_ready){0};
-    if(!s||!tx_valid(t)||!c||!c->config||!revision||!!revision->generation!=!!previous_port)return EINVAL;
+    if(!s||!tx_valid(t)||!c||!c->config||!revision_valid(revision)||
+       (revision->generation&&!revision->without_wg)!=!!previous_port||
+       t->generation<=revision->generation)return EINVAL;
     int rc=running(deadline,NULL);
     if(rc)return rc;
     struct inventory i;

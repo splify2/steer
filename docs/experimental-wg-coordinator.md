@@ -201,14 +201,26 @@ The next linked profile should extend the existing Core, not dispatch into
    and admission, SYNCED publishes the already allocated generation.
 3. Pin the binding to the accepted flow's generation and keep the previous
    WG resource while its admitted streams drain. Never retarget a pending
-   connect to the newer interface. Startup must classify a validated committed
-   document with no WG separately from a missing WG outcome; the existing
-   single-WG journal cannot tell these apart. Verify a selected WG before
-   retiring other identities, or fence. Test disjoint updates, no-WG
+   connect to the newer interface. For startup, the journal now distinguishes
+   a validated committed document that intentionally has no WG (`without_wg`)
+   from a missing required WG outcome. It rejects a WG record at the same
+   committed generation when the document omits WG, and the next revision
+   is above both the committed generation and all journal attempts. Verify a
+   selected WG before retiring other identities, or fence. Test disjoint updates, no-WG
    transitions, unavailable WG without direct fallback, and ambiguous storage
    on both sides of commit. Do not advertise mixed profile support until
    independent SOCKS5/VLESS/HY2 TCP clients and a passive WG peer pass that
    test on the same committed revision.
+
+The hook points are the ordinary `prototype_config` v3 outbound lowering,
+`prototype_prepare`, `prepare_configuration`/`prepare_stream_routes` on the
+owner, and `store_worker`/`writer_ready`. In particular, the current
+ordinary `writer_ready` publishes on RENAMED even when not SYNCED. A future
+WG-enabled generation cannot use that branch unchanged: keep both sets of
+owned resources on uncertainty and fence new admissions until validated
+restart. The startup-only journal sweeper is not a drain-time retirement
+API. The existing staged WG path still admits only one selected WG and
+rejects unreconciled candidates; it has not been connected to those hooks.
 
 ### Scoped route prerequisite
 

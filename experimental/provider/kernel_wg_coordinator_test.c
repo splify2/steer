@@ -57,10 +57,12 @@ static void check_link(const struct fixture *f,const struct steer_draft_wg_ident
 
 static int create(void *ctx,const struct steer_draft_wg_identity *link,int mtu,uint64_t d,int *index){
     struct fixture *f=ctx;check_link(f,link,d);
-    struct steer_spec_journal_record r=read_fact(f,1,STEER_SPEC_JOURNAL_INTENT);
-    struct steer_draft_wg_identity from_disk;
-    assert(!steer_draft_wg_identity_decode(r.data,r.length,&from_disk));
-    check_link(f,&from_disk,d);
+    if(f->journal){
+        struct steer_spec_journal_record r=read_fact(f,1,STEER_SPEC_JOURNAL_INTENT);
+        struct steer_draft_wg_identity from_disk;
+        assert(!steer_draft_wg_identity_decode(r.data,r.length,&from_disk));
+        check_link(f,&from_disk,d);
+    }
     assert(mtu==1420&&!f->link);
     event(f,'C');f->link=1;*index=37;
     return 0;
@@ -82,11 +84,14 @@ static void check_guard(const struct fixture *f,const struct steer_draft_wg_guar
 static int guard(void *ctx,const struct steer_draft_wg_guard_record *g,int publish,uint64_t d,
     uint32_t *effect,uint64_t *handle){
     struct fixture *f=ctx;check_guard(f,g,d);
-    struct steer_spec_journal_record r=read_fact(f,publish?4:2,STEER_SPEC_JOURNAL_INTENT);
-    struct steer_draft_wg_guard_record from_disk;
-    assert(!steer_draft_wg_guard_record_decode(r.data,r.length,&from_disk));
-    check_guard(f,&from_disk,d);
-    assert(g->handle==from_disk.handle&&f->link&&!f->allow&&f->up==publish&&f->handle==g->handle);
+    if(f->journal){
+        struct steer_spec_journal_record r=read_fact(f,publish?4:2,STEER_SPEC_JOURNAL_INTENT);
+        struct steer_draft_wg_guard_record from_disk;
+        assert(!steer_draft_wg_guard_record_decode(r.data,r.length,&from_disk));
+        check_guard(f,&from_disk,d);
+        assert(g->handle==from_disk.handle);
+    }
+    assert(f->link&&!f->allow&&f->up==publish&&f->handle==g->handle);
     event(f,publish?'P':'B');
     if(publish&&f->mode==PUBLISH_UNCHANGED){
         *effect=STEER_PV1_DEVICE_UNCHANGED;
@@ -101,10 +106,13 @@ static int guard(void *ctx,const struct steer_draft_wg_guard_record *g,int publi
 
 static int up(void *ctx,const struct steer_draft_wg_guard_record *g,uint64_t d){
     struct fixture *f=ctx;check_guard(f,g,d);
-    struct steer_spec_journal_record r=read_fact(f,3,STEER_SPEC_JOURNAL_OUTCOME);
-    struct steer_draft_wg_guard_record captured;
-    assert(!steer_draft_wg_guard_record_decode(r.data,r.length,&captured));
-    assert(captured.handle==g->handle&&g->handle==f->handle&&g->handle&&f->link&&!f->up&&!f->allow);
+    if(f->journal){
+        struct steer_spec_journal_record r=read_fact(f,3,STEER_SPEC_JOURNAL_OUTCOME);
+        struct steer_draft_wg_guard_record captured;
+        assert(!steer_draft_wg_guard_record_decode(r.data,r.length,&captured));
+        assert(captured.handle==g->handle);
+    }
+    assert(g->handle==f->handle&&g->handle&&f->link&&!f->up&&!f->allow);
     event(f,'U');f->up=1;
     return 0;
 }
@@ -156,6 +164,47 @@ static int apply(struct fixture *f,const struct steer_draft_wg_ready *previous,
     struct steer_draft_wg_ready *out,int *cleanup){
     return steer_draft_wg_coordinator_apply(f->journal,&backend,f,&f->tx,&f->candidate,
         previous,UINT64_MAX,NULL,out,cleanup);
+}
+
+static int verify_selected(void *ctx,const struct steer_draft_wg_guard_record *g,uint64_t d){
+    struct fixture *f=ctx;
+    check_guard(f,g,d);
+    event(f,'V');
+    return f->link&&f->up&&f->allow&&f->handle==g->handle?0:ESTALE;
+}
+
+static void linked_selection(const char *path){
+    char local[4096];
+    int n=snprintf(local,sizeof(local),"%s/linked",path);
+    assert(n>0&&(size_t)n<sizeof(local)&&!mkdir(local,0700));
+    struct steer_draft_wg_selection *s;
+    assert(!steer_draft_wg_selection_open(local,32,&s));
+    struct awg_conf cfg={0};
+    struct fixture f=fixture(NULL,&cfg,11,OK);
+    struct steer_draft_wg_revision direct={.generation=10,.digest={2},.without_wg=1};
+    struct steer_draft_wg_guard_record selected;
+    uint64_t next;
+    assert(!steer_draft_wg_selection_startup(s,&backend,&f,&direct,verify_selected,UINT64_MAX,&next,&selected));
+    assert(next==11&&!selected.handle&&!f.n);
+    struct steer_draft_wg_ready candidate;
+    assert(!steer_draft_wg_selection_stage(s,&backend,&f,&direct,0,&f.tx,&f.candidate,UINT64_MAX,&candidate));
+    assert(candidate.guard.handle==201&&!strcmp(f.events,"CSBUP"));
+    steer_draft_wg_selection_close(s);
+    assert(!steer_draft_wg_selection_open(local,32,&s));
+    struct steer_draft_wg_revision committed={.generation=11,.digest={1}};
+    assert(!steer_draft_wg_selection_startup(s,&backend,&f,&committed,verify_selected,UINT64_MAX,&next,&selected));
+    assert(next==12&&selected.handle==201&&!strcmp(f.events,"CSBUPV"));
+    committed.without_wg=1; /* contradicts the WG record at the selected revision */
+    assert(steer_draft_wg_selection_startup(s,&backend,&f,&committed,verify_selected,UINT64_MAX,&next,&selected)==EPROTO);
+    committed.generation=15;
+    committed.without_wg=0; /* required WG entry missing: no cleanup */
+    assert(steer_draft_wg_selection_startup(s,&backend,&f,&committed,verify_selected,UINT64_MAX,&next,&selected)==EPROTO);
+    assert(f.link&&!strcmp(f.events,"CSBUPV"));
+    committed.without_wg=1;
+    assert(!steer_draft_wg_selection_startup(s,&backend,&f,&committed,verify_selected,UINT64_MAX,&next,&selected));
+    assert(next==16&&!selected.handle&&!f.link&&!strcmp(f.events,"CSBUPVRLD"));
+    steer_draft_wg_selection_close(s);
+    puts("WG linked selection: intentional absence, contradiction, and missing required WG PASS");
 }
 
 int main(int argc,char **argv){
@@ -216,5 +265,6 @@ int main(int argc,char **argv){
     assert(!strcmp(old.events,"CSBUPRLD")&&!old.handle);
     assert(!steer_spec_journal_close(j).code);
     puts("WG coordinator: journaled admission, failed Apply retains active, exact rollback, lost outcome and restart PASS");
+    linked_selection(argv[1]);
     return 0;
 }

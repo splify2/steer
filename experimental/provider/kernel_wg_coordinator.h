@@ -72,12 +72,16 @@ void steer_draft_wg_selection_close(struct steer_draft_wg_selection *);
 
 /* The externally committed prototype_store document is the ONLY selection.
  * A missing document passes an all-zero revision; IO/corruption is not absence.
- * Digest covers the exact validated persisted bytes for this frozen profile. */
-struct steer_draft_wg_revision { uint64_t generation; uint8_t digest[32]; };
+ * Digest covers the exact validated persisted bytes. Set without_wg only
+ * after validating a committed linked document that intentionally omits WG;
+ * a WG journal entry at that generation is then contradictory. */
+struct steer_draft_wg_revision { uint64_t generation; uint8_t digest[32]; int without_wg; };
 typedef int (*steer_draft_wg_verify_ready)(void *,const struct steer_draft_wg_guard_record *,uint64_t);
 /* Read and sync the complete journal, resolve external generation+digest and
  * verify the live selected resource before cleaning anything. next_revision
- * includes failed attempts. Cleanup errors do not authorize fallback. */
+ * includes the committed revision and failed attempts. Call at startup (no
+ * live drains), not after ordinary linked publication. Cleanup errors do not
+ * authorize fallback. */
 int steer_draft_wg_selection_startup(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
     void *,const struct steer_draft_wg_revision *,steer_draft_wg_verify_ready,
     uint64_t deadline,uint64_t *next_revision,struct steer_draft_wg_guard_record *selected);
