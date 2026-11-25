@@ -18,6 +18,19 @@ on:
         required: false
         default: false
         type: boolean
+      nano:
+        description: 'Добавить экспериментальные Linux-артефакты steer-nano и steer-ui-nano (только pre-release)'
+        required: false
+        default: false
+        type: boolean
+      nano_ui_ref:
+        description: 'Полный SHA коммита steer-ui для Nano'
+        required: false
+        type: string
+      nano_protocols_ref:
+        description: 'Полный SHA коммита steer-protocols для Nano'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -115,6 +128,39 @@ jobs:
           set -eu
           S2P_OUT="$RUNNER_TEMP/s2p-bin" sh .plugin-sdk/build.sh
           echo "S2P=$RUNNER_TEMP/s2p-bin/s2p" >> "$GITHUB_ENV"
+
+      - name: Проверить закрепления Nano
+        if: inputs.nano
+        env:
+          PREVIEW: ${{ inputs.prerelease }}
+          UI_REF: ${{ inputs.nano_ui_ref }}
+          PROTOCOLS_REF: ${{ inputs.nano_protocols_ref }}
+          SDK_REF: ${{ vars.PLUGIN_SDK_REF }}
+        run: |
+          set -eu
+          [ "$PREVIEW" = true ] || { echo "::error::Nano пока доступен только для pre-release"; exit 2; }
+          for ref in "$UI_REF" "$PROTOCOLS_REF" "$SDK_REF"; do
+            printf '%s\n' "$ref" | grep -qxE '[0-9a-f]{40}' ||
+              { echo "::error::Nano требует полные SHA steer-ui, steer-protocols и PLUGIN_SDK_REF"; exit 2; }
+          done
+
+      - name: Исходники Steer UI для Nano
+        if: inputs.nano
+        uses: actions/checkout@v4
+        with:
+          repository: splify2/steer-ui
+          ref: ${{ inputs.nano_ui_ref }}
+          path: .nano-ui
+          persist-credentials: false
+
+      - name: Исходники провайдеров для Nano
+        if: inputs.nano
+        uses: actions/checkout@v4
+        with:
+          repository: splify2/steer-protocols
+          ref: ${{ inputs.nano_protocols_ref }}
+          path: .nano-protocols
+          persist-credentials: false
 
       - name: Стенды
         run: |
@@ -390,6 +436,32 @@ jobs:
             exit 1
           fi
           printf '%s' "$NOTES" >> "$notes"
+
+      - name: Собрать и проверить Nano (Linux x86_64)
+        if: inputs.nano
+        run: |
+          set -eu
+          nano="$RUNNER_TEMP/steer-nano"
+          make NANO=1 NANO_BUILD="$nano/core" NANO_SDK="$PWD/.plugin-sdk" \
+            NANO_PROTOCOLS="$PWD/.nano-protocols" nano-test
+          make -C .nano-ui NANO=1 BUILD="$nano/ui" CORE_LIB="$PWD/src/lib" \
+            YAML_DIR="$PWD/src/third_party/libyaml" test
+          PYTHONPATH="$PWD/.nano-protocols/tests" python3 -B .nano-ui/tests/core_persistence.py \
+            --core "$nano/core/steer-nano" --ui "$nano/ui/steer-ui-nano" --assets "$nano/ui/nano-assets"
+          mkdir -p "$nano/release/assets" out
+          cp "$nano/core/steer-nano" "$nano/ui/steer-ui-nano" "$nano/release/"
+          cp "$nano/ui/nano-assets/"* "$nano/release/assets/"
+          cp docs/nano.md "$nano/release/README.md"
+          cp LICENSE "$nano/release/LICENSE"
+          printf 'steer=%s\nsteer-ui=%s\nsteer-protocols=%s\nplugin-sdk=%s\n' \
+            "$(git rev-parse HEAD)" "$(git -C .nano-ui rev-parse HEAD)" \
+            "$(git -C .nano-protocols rev-parse HEAD)" "$(git -C .plugin-sdk rev-parse HEAD)" \
+            > "$nano/release/SOURCE-REVISIONS"
+          tar -C "$nano/release" -czf "out/steer-nano-$VERSION-linux-x86_64.tar.gz" steer-nano README.md LICENSE SOURCE-REVISIONS
+          cp .nano-ui/LICENSE "$nano/release/LICENSE"
+          tar -C "$nano/release" -czf "out/steer-ui-nano-$VERSION-linux-x86_64.tar.gz" steer-ui-nano assets README.md LICENSE SOURCE-REVISIONS
+          printf '\n**Экспериментальные Linux x86_64 архивы:** `steer-nano` и `steer-ui-nano`. Не пакеты OpenWrt.\n' \
+            >> "$RUNNER_TEMP/release-notes.md"
 
       - name: Опубликовать релиз
         uses: softprops/action-gh-release@v2

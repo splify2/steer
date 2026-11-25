@@ -45,6 +45,33 @@ override CFLAGS += $(addprefix -I,$(INC_DIRS)) $(THIRD_DEFS)
 .PHONY: all test clean ext-syntax ext-test libs-test libs-exports snapshot-record print-inc ndk-check
 all: $(BUILD)/steerd $(BUILD)/steer
 
+# The v3 nano profile uses the same source-linked core and revisioned control
+# socket; it is not the legacy OpenWrt package or a second daemon implementation.
+NANO ?= 0
+ifeq ($(NANO),1)
+.DEFAULT_GOAL := nano
+NANO_BUILD ?= $(abspath $(BUILD)/nano)
+NANO_SDK ?= $(abspath ../plugin-sdk)
+NANO_PROTOCOLS ?= $(abspath ../steer-protocols)
+STRIP ?= strip
+.PHONY: nano nano-test
+nano:
+	$(MAKE) -C experimental/provider BUILD=$(NANO_BUILD) SDK=$(NANO_SDK) PROTOCOLS=$(NANO_PROTOCOLS) \
+		CFLAGS="-Os -std=c11 -Wall -Wextra -Werror -pedantic -ffunction-sections -fdata-sections" \
+		LDFLAGS="-Wl,--gc-sections" $(NANO_BUILD)/steer-prototype
+	cp $(NANO_BUILD)/steer-prototype $(NANO_BUILD)/steer-nano
+	$(STRIP) --strip-unneeded $(NANO_BUILD)/steer-nano
+nano-test: nano
+	python3 -B experimental/provider/prototype_test.py $(NANO_BUILD)/steer-nano
+	python3 -B experimental/provider/prototype_persistence_test.py $(NANO_BUILD)/steer-nano
+	$(MAKE) -C experimental/provider BUILD=$(NANO_BUILD) SDK=$(NANO_SDK) PROTOCOLS=$(NANO_PROTOCOLS) \
+		CFLAGS="-Os -std=c11 -Wall -Wextra -Werror -pedantic -ffunction-sections -fdata-sections" \
+		LDFLAGS="-Wl,--gc-sections" $(NANO_BUILD)/vless-loopback
+	python3 -B experimental/provider/prototype_vless_outbound_test.py --core $(NANO_BUILD)/steer-nano --fixture $(NANO_BUILD)/vless-loopback
+else ifneq ($(NANO),0)
+$(error NANO must be 0 or 1)
+endif
+
 # Standalone inventory foundation: no net1 linkage or runtime platform selection.
 .PHONY: capabilities-test
 capabilities-test: $(BUILD)/capabilitiesmatch
