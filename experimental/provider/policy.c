@@ -16,8 +16,9 @@ struct steer_policy {
 static struct steer_pv1_error error(uint32_t code) {
     struct steer_pv1_error e = {code, 0}; return e;
 }
-static int action_ok(uint32_t action) {
-    return action == STEER_POLICY_DIRECT || action == STEER_POLICY_BLOCK;
+static int action_ok(uint32_t action, uint32_t bindings) {
+    return action == STEER_POLICY_DIRECT || action == STEER_POLICY_BLOCK ||
+        action - STEER_POLICY_STREAM_BINDING_BASE < bindings;
 }
 static int identifier(struct steer_pv1_span s, int empty) {
     uint32_t i;
@@ -57,14 +58,15 @@ static int prefix_equal(const uint8_t *a,const uint8_t *b,uint32_t bits) {
     return (!whole || !memcmp(a,b,whole)) &&
         (!part || !((a[whole]^b[whole]) & (0xffu << (8-part))));
 }
-struct steer_pv1_error steer_policy_compile(uint64_t generation,
+struct steer_pv1_error steer_policy_compile_stream(uint64_t generation,
     const struct steer_policy_rule *rules,uint32_t count,uint32_t fallback,
-    struct steer_policy **out) {
+    uint32_t bindings,struct steer_policy **out) {
     struct steer_policy *p;
     uint32_t i,j;
     if (out) *out=NULL;
     if (!out || !generation || count>STEER_POLICY_MAX_RULES ||
-        (count && !rules) || !action_ok(fallback)) return error(STEER_PV1_INVALID);
+        bindings>STEER_POLICY_STREAM_BINDINGS_MAX ||
+        (count && !rules) || !action_ok(fallback,bindings)) return error(STEER_PV1_INVALID);
     p=calloc(1,sizeof(*p)+(size_t)count*sizeof(struct rule));
     if (!p) return error(STEER_PV1_RESOURCE_EXHAUSTED);
     p->generation=generation; p->count=count; p->fallback=fallback;
@@ -75,7 +77,7 @@ struct steer_pv1_error steer_policy_compile(uint64_t generation,
         int any=s->inbound.len || s->principal.len || s->domain.len ||
                 s->cidr_tag || s->port_first || s->port_last;
         if (!identifier(s->id,0) || !identifier(s->inbound,1) ||
-            !identifier(s->principal,1) || !action_ok(s->action) ||
+            !identifier(s->principal,1) || !action_ok(s->action,bindings) ||
             s->match_all>1 || s->domain_suffix>1 ||
             (any ? s->match_all!=0 : s->match_all!=1) ||
             ((!s->port_first)!=(!s->port_last)) || s->port_first>s->port_last ||
@@ -101,6 +103,14 @@ struct steer_pv1_error steer_policy_compile(uint64_t generation,
     *out=p; return error(STEER_PV1_OK);
 invalid:
     free(p); return error(STEER_PV1_INVALID);
+}
+struct steer_pv1_error steer_policy_compile(uint64_t generation,
+    const struct steer_policy_rule *rules,uint32_t count,uint32_t fallback,
+    struct steer_policy **out) {
+    return steer_policy_compile_stream(generation,rules,count,fallback,0,out);
+}
+static uint32_t packet_action(uint32_t action) {
+    return action>=STEER_POLICY_STREAM_BINDING_BASE ? STEER_POLICY_BLOCK : action;
 }
 void steer_policy_destroy(struct steer_policy *p) { free(p); }
 static int id_matches(const char *id,struct steer_pv1_span value) {
@@ -139,9 +149,11 @@ static struct steer_pv1_error evaluate(const struct steer_policy *p,
                 if(lower(e->address.data[offset+j])!=(unsigned char)r->domain[j]) break;
             if(j!=r->domain_length) continue;
         }
-        out->action=r->action; out->rule_index=i; return error(STEER_PV1_OK);
+        out->action=packet ? packet_action(r->action) : r->action;
+        out->rule_index=i; return error(STEER_PV1_OK);
     }
-    out->action=p->fallback; return error(STEER_PV1_OK);
+    out->action=packet ? packet_action(p->fallback) : p->fallback;
+    return error(STEER_PV1_OK);
 }
 struct steer_pv1_error steer_policy_evaluate(const struct steer_policy *p,
     const struct steer_policy_input *f,struct steer_policy_decision *out) {
@@ -174,9 +186,9 @@ struct steer_pv1_error steer_policy_visit(const struct steer_policy *p,uint64_t 
         view.domain.data=(const uint8_t *)r->domain;view.domain.len=r->domain_length;
         view.domain_suffix=r->suffix;view.cidr_tag=r->tag;view.prefix_bits=r->bits;
         memcpy(view.network,r->network,sizeof(view.network));
-        view.port_first=r->first;view.port_last=r->last;view.action=r->action;
+        view.port_first=r->first;view.port_last=r->last;view.action=packet_action(r->action);
         view.match_all=!view.inbound.len&&!view.principal.len&&!view.domain.len&&!view.cidr_tag&&!view.port_first;
         e=visitor(context,&view);if(e.code) return e;
     }
-    *fallback=p->fallback;return error(STEER_PV1_OK);
+    *fallback=packet_action(p->fallback);return error(STEER_PV1_OK);
 }

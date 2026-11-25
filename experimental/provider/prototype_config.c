@@ -266,11 +266,13 @@ static int distinct_listener(const struct steer_prototype_config *c,uint32_t i){
 static struct steer_pv1_error compile_policy(struct steer_prototype_config *c,
     const struct steer_policy_rule *all,uint32_t total,const struct steer_policy_rule *active,
     uint32_t count,uint32_t fallback){
-    struct steer_pv1_error e=steer_policy_compile(c->generation,all,total,fallback,&c->policy);
+    struct steer_pv1_error e=steer_policy_compile_stream(c->generation,all,total,fallback,
+        c->vless_outbound_count,&c->policy);
     if(e.code||count==total)return e;
     steer_policy_destroy(c->policy);
     c->policy=NULL;
-    return steer_policy_compile(c->generation,active,count,fallback,&c->policy);
+    return steer_policy_compile_stream(c->generation,active,count,fallback,
+        c->vless_outbound_count,&c->policy);
 }
 
 static int v3_socks_options(void *unused,const struct ynode *options){
@@ -299,6 +301,34 @@ static int v3_vless_options(void *unused,const struct ynode *options){
     char principal[65];
     return v3_auth_options(options,"principal_id uuid","uuid",principal);
 }
+#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+static int v3_vless_outbound_options(void *unused,const struct ynode *options){
+    (void)unused;
+    return keys(options,"uuid")&&v3_secret_id(ynode_get(options,"uuid"));
+}
+static int v3_vless_outbound(const struct steer_spec_node_view *node,const struct ynode *secrets,
+    struct steer_prototype_vless_outbound *out){
+    const struct ynode *address=ynode_get(node->endpoint,"address");
+    if(strncmp(node->provider,"vless:",6)||!node->enabled||!node->options_validated||
+        node->flows!=STEER_SPEC_FLOW_STREAM||
+        !keys(node->intent,"label enabled plugin flow endpoint options")||
+        !keys(node->endpoint,"address port")||!scalar(address)||
+        !port(ynode_get(node->endpoint,"port"),&out->port)||
+        !v3_env_ref(secrets,ynode_get(node->options,"uuid"),"uuid",out->uuid_ref))return 0;
+    if(inet_pton(AF_INET,address->str,out->address)==1){
+        if(!out->address[0]||out->address[0]>=224)return 0;
+        out->endpoint_tag=STEER_PV1_ENDPOINT_IPV4;
+    }else if(inet_pton(AF_INET6,address->str,out->address)==1){
+        struct in6_addr ip;
+        memcpy(&ip,out->address,sizeof(ip));
+        if(IN6_IS_ADDR_UNSPECIFIED(&ip)||IN6_IS_ADDR_MULTICAST(&ip)||IN6_IS_ADDR_V4MAPPED(&ip)||
+           IN6_IS_ADDR_LINKLOCAL(&ip))return 0;
+        out->endpoint_tag=STEER_PV1_ENDPOINT_IPV6;
+    }else return 0;
+    strcpy(out->id,node->id);
+    return 1;
+}
+#endif
 #ifdef STEER_PROTOTYPE_HY2
 static int v3_hy2_options(void *unused,const struct ynode *options){
     (void)unused;
@@ -353,16 +383,21 @@ static int v3_secret_kind(const struct ynode *kind){
 #endif
     return eq(kind,"uuid");
 }
-static int v3_named_action(const struct ynode *outbounds,const char *name,uint32_t *out){
+static int v3_named_action(const struct steer_prototype_config *c,
+    const struct ynode *outbounds,const char *name,uint32_t *out){
+    for(uint32_t i=0;i<c->vless_outbound_count;i++)if(!strcmp(c->vless_outbounds[i].id,name)){
+        *out=STEER_POLICY_STREAM_BINDING_BASE+i;
+        return 1;
+    }
     return action(ynode_get(ynode_get(outbounds,name),"type"),out);
 }
 static int v3_rule(const struct steer_spec_rule_view *r,const struct ynode *source,
-    const struct ynode *outbounds,struct steer_policy_rule *out){
+    const struct steer_prototype_config *c,const struct ynode *outbounds,struct steer_policy_rule *out){
     static const char *fields[]={"inbound","domain","domain_suffix"};
     if(r->dns_rule||!keys(source,"name enabled match action outbound")||
         !keys(r->match,"inbound domain domain_suffix"))return 0;
     if(!strcmp(r->action,"route")){
-        if(!v3_named_action(outbounds,r->target,&out->action))return 0;
+        if(!v3_named_action(c,outbounds,r->target,&out->action))return 0;
     }else if(!strcmp(r->action,"reject")&&!ynode_get(source,"outbound"))out->action=STEER_POLICY_BLOCK;
     else return 0;
     out->id=span(ynode_get(source,"name"));
@@ -405,11 +440,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         |STEER_SPEC_FLOW_DATAGRAM
 #endif
         ;
-#ifdef STEER_PROTOTYPE_HY2
-    enum { alias_requirements=5 };
-#else
-    enum { alias_requirements=3 };
-#endif
+    enum { alias_requirements=6 };
     struct steer_spec_capability inventory[sizeof(core)/sizeof(core[0])+alias_requirements*STEER_PROTOTYPE_MAX_LISTENERS];
     size_t count=sizeof(core)/sizeof(core[0]);
     char requirements[STEER_PROTOTYPE_MAX_LISTENERS][alias_requirements][128];
@@ -449,6 +480,10 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         inventory[count++]=(struct steer_spec_capability){requirements[i][3],STEER_SPEC_READY,v3_hy2_options,NULL};
         inventory[count++]=(struct steer_spec_capability){requirements[i][4],STEER_SPEC_READY,v3_hy2_options,NULL};
 #endif
+#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+        snprintf(requirements[i][5],sizeof(requirements[i][5]),"provider.vless:%s/outbound/stream/tcp/none/default",alias->str);
+        inventory[count++]=(struct steer_spec_capability){requirements[i][5],STEER_SPEC_READY,v3_vless_outbound_options,NULL};
+#endif
     }
     for(size_t i=0;secrets&&i<secrets->len;i++){
         const struct ynode *secret=ynode_val_at(secrets,i),*name=ynode_get(secret,"name");
@@ -464,9 +499,17 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         if(!steer_spec_node(plan,i,&node))goto done;
         if(node.kind==STEER_SPEC_PLUGIN||node.kind==STEER_SPEC_SECRET)continue;
         if(node.kind==STEER_SPEC_OUTBOUND){
+#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+            if(node.provider[0]){
+                if(c->vless_outbound_count>=STEER_POLICY_STREAM_BINDINGS_MAX||
+                   !v3_vless_outbound(&node,secrets,&c->vless_outbounds[c->vless_outbound_count]))goto done;
+                c->vless_outbound_count++;
+                continue;
+            }
+#endif
             uint32_t a;
             if(!node.flows||(node.flows&~outbound_flows)||!keys(node.intent,"type label flow")||
-                !v3_named_action(outbounds,node.id,&a))goto done;
+                !action(ynode_get(node.intent,"type"),&a))goto done;
             continue;
         }
         if(node.kind!=STEER_SPEC_INBOUND||c->listener_count>=STEER_PROTOTYPE_MAX_LISTENERS||
@@ -475,10 +518,12 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         c->listener_count++;
     }
     const struct ynode *target=ynode_get(routing,"default");
-    if(!scalar(target)||!v3_named_action(outbounds,target->str,&fallback))goto done;
+    if(!scalar(target)||!v3_named_action(c,outbounds,target->str,&fallback))goto done;
+    /* The v3 graph has already required that default and named targets
+     * support every selected ingress class, including HY2's datagrams. */
     for(uint32_t i=0;i<rules->len;i++){
         struct steer_spec_rule_view r;
-        if(!steer_spec_rule(plan,i,&r)||!v3_rule(&r,ynode_at(rules,i),outbounds,&all[i]))goto done;
+        if(!steer_spec_rule(plan,i,&r)||!v3_rule(&r,ynode_at(rules,i),c,outbounds,&all[i]))goto done;
         if(r.enabled)active[enabled++]=all[i];
     }
     result=compile_policy(c,all,(uint32_t)rules->len,active,enabled,fallback);

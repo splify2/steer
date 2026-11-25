@@ -11,6 +11,10 @@
 #include "route_dial.h"
 #include "route_stream.h"
 #include "native_stream_backend.h"
+#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+#include "vless_stream_backend.h"
+#include "vless/outbound.h"
+#endif
 #include "policy_route.h"
 #include "prototype_config.h"
 #include "resolver.h"
@@ -82,6 +86,10 @@ struct generation {
     struct steer_draft_routes *routes;
     struct steer_draft_stream_routes *streams;
     struct steer_draft_native_stream_backend *native;
+#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+    struct steer_draft_vless_stream_backend *vless[STEER_POLICY_STREAM_BINDINGS_MAX];
+    unsigned vless_count;
+#endif
 #ifdef STEER_PROTOTYPE_HY2
     struct steer_draft_datagram_runtime *datagram_native;
     struct steer_draft_datagram_router *datagrams;
@@ -271,7 +279,11 @@ static void dial_reply(struct client *c, uint8_t code, const struct s5_address *
         c->codec.reply_length = vl_response_encode(c->codec.reply, sizeof(c->codec.reply));
         reply(c, RELAY);
     } else {
-        (void)s5_dial_result(&c->codec, code, bound);
+        /* Some layered protocols have no final-target BND.ADDR/BND.PORT. */
+        const struct s5_address unspecified = {.type=1,.length=4};
+        if (!s5_dial_result(&c->codec, code, !code && !bound ? &unspecified : bound)) {
+            close_client(c); return;
+        }
         reply(c, code ? CLOSING : RELAY);
     }
 }
@@ -434,7 +446,8 @@ static void advance(struct client *c)
         c->route_pending = c->route_completed = 0;
         if (c->phase != CLOSING) {
             if (!c->route_error) loop_timer_set(c->deadline, 30000);
-            dial_reply(c, route_reply_code(c->route_error, c->dial_failure), c->route_error ? NULL : &c->bound);
+            dial_reply(c, route_reply_code(c->route_error, c->dial_failure),
+                       !c->route_error && c->bound.length ? &c->bound : NULL);
         }
     }
     for (i = 0; i < 2; ++i) {
@@ -610,7 +623,12 @@ static struct steer_pv1_error select_stream(void *context,
                                       flow->principal_id, &flow->destination};
     struct steer_policy_decision decision;
     struct steer_pv1_error error = steer_policy_evaluate(context, &input, &decision);
-    *index = !error.code && decision.action == STEER_POLICY_DIRECT ? 0 : STEER_DRAFT_STREAM_ROUTE_BLOCK;
+    *index = STEER_DRAFT_STREAM_ROUTE_BLOCK;
+    if (!error.code) {
+        if (decision.action == STEER_POLICY_DIRECT) *index = 0;
+        else if (decision.action >= STEER_POLICY_STREAM_BINDING_BASE)
+            *index = 1 + decision.action - STEER_POLICY_STREAM_BINDING_BASE;
+    }
     return error;
 }
 static void generation_retired(void *arg)
@@ -618,14 +636,32 @@ static void generation_retired(void *arg)
     struct generation *g = arg;
     loop_timer_set(g->host->work, 0);
 }
-static int prepare_stream_routes(struct host *h, struct generation *g)
+static int prepare_stream_routes(struct host *h, struct generation *g, uint8_t (*uuids)[16])
 {
     g->host = h;
     if (steer_draft_native_stream_backend_create(h->loop, h->runtime, h->backend_runtime,
         h->resolver, g->number, g->number, CLIENTS, 16*CLIENTS,
         generation_retired, g, &g->native).code) return 0;
+    struct steer_draft_stream_binding bindings[1 + STEER_POLICY_STREAM_BINDINGS_MAX];
+    unsigned count = 1;
+    bindings[0] = *steer_draft_native_stream_binding(g->native);
+#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+    if (g->config) for (uint32_t i = 0; i < g->config->vless_outbound_count; ++i) {
+        const struct steer_prototype_vless_outbound *cfg = &g->config->vless_outbounds[i];
+        struct steer_pv1_endpoint upstream = {sizeof upstream, STEER_PV1_DRAFT_LAYOUT,
+            cfg->endpoint_tag, {cfg->address, cfg->endpoint_tag == STEER_PV1_ENDPOINT_IPV4 ? 4 : 16},
+            cfg->port, 0};
+        if (steer_draft_vless_stream_backend_create(h->loop, h->buffers, &bindings[0],
+            &upstream, uuids[i], g->number, i + 1, CLIENTS, 2*CLIENTS, 2*CLIENTS*CAPACITY,
+            16*CLIENTS, generation_retired, g, &g->vless[i]).code) return 0;
+        g->vless_count++;
+        bindings[count++] = *steer_draft_vless_stream_binding(g->vless[i]);
+    }
+#else
+    (void)uuids;
+#endif
     return !steer_draft_stream_routes_create(h->loop, g->number, CLIENTS, CLIENTS,
-        steer_draft_native_stream_binding(g->native), 1, select_stream, g->policy,
+        bindings, count, select_stream, g->policy,
         NULL, &g->streams).code;
 }
 #ifdef STEER_PROTOTYPE_HY2
@@ -683,6 +719,16 @@ static int destroy_generation(struct generation *g)
         if (steer_draft_stream_routes_destroy(g->streams).code) return 0;
         g->streams = NULL;
     }
+#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+    /* Release router pins first, then layers, then the lower TCP binding. */
+    for (unsigned i = 0; i < g->vless_count; ++i)
+        (void)steer_draft_vless_stream_backend_retire(g->vless[i]);
+    while (g->vless_count) {
+        unsigned i = g->vless_count - 1;
+        if (steer_draft_vless_stream_backend_destroy(g->vless[i]).code) return 0;
+        g->vless[i] = NULL; g->vless_count--;
+    }
+#endif
     if (g->native) {
         (void)steer_draft_native_stream_backend_retire(g->native);
         if (steer_draft_native_stream_backend_destroy(g->native).code) return 0;
@@ -715,6 +761,11 @@ static int initialize_host(struct host *h, struct client *clients)
     steer_draft_hy2_datagram_budget_init(&h->datagram_budget);
     /* Keep the original TCP byte and slot reserve even at full UDP envelope. */
     limits=steer_draft_prototype_buffer_limits(CLIENTS,CAPACITY,1);
+#endif
+#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+    /* One bounded handshake buffer per pending TCP open, in addition to relay. */
+    limits.max_buffers += CLIENTS;
+    limits.max_bytes += CLIENTS*(VL_REQUEST_TCP_MAX+256ULL);
 #endif
     h->clients = clients;
     h->control_fd = -1;
@@ -941,7 +992,7 @@ int steer_lab_loopback_main(int argc, char **argv, int vless)
     rule.action = !strcmp(argv[1], "block") ? STEER_POLICY_BLOCK : STEER_POLICY_DIRECT;
     if (steer_policy_compile(1, &rule, 1, STEER_POLICY_BLOCK, &g->policy).code) goto cleanup;
     if (steer_draft_routes_create(h.loop, h.runtime, 1, CLIENTS, steer_policy_route, g->policy, &g->routes).code) goto cleanup;
-    if (!prepare_stream_routes(&h, g)) goto cleanup;
+    if (!prepare_stream_routes(&h, g, NULL)) goto cleanup;
 #ifdef STEER_PROTOTYPE_HY2
     if (!prepare_datagram_routes(&h, g)) goto cleanup;
 #endif
@@ -1006,6 +1057,7 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
 {
     struct steer_prototype_config *config = NULL;
     struct listener_identity identities[STEER_PROTOTYPE_MAX_LISTENERS];
+    uint8_t outbound_uuids[STEER_POLICY_STREAM_BINDINGS_MAX][16] = {{0}};
 #ifdef STEER_PROTOTYPE_HY2
     struct qc_server_tls *contexts[STEER_PROTOTYPE_MAX_LISTENERS]={0};
 #endif
@@ -1021,6 +1073,8 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     if(initial_format&&initial_format!=config->format)goto cleanup;
     if (!config->document_json || config->document_length > STEER_PROTOTYPE_CONFIG_MAX_BYTES) goto cleanup;
     if(!validate&&config->generation!=next) { result=409;goto cleanup; }
+    for (i = 0; i < config->vless_outbound_count; ++i)
+        if (!parse_uuid(getenv(config->vless_outbounds[i].uuid_ref + 4), outbound_uuids[i])) goto cleanup;
     for (i = 0; i < config->listener_count; ++i)if(config->listeners[i].enabled) {
 #ifndef STEER_PROTOTYPE_HY2
         if(config->listeners[i].protocol==STEER_PROTOTYPE_HYSTERIA2)goto cleanup;
@@ -1061,7 +1115,7 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     if (h->resolver && steer_draft_routes_use_resolver(g->routes, h->resolver).code) {
         result = 503; goto cleanup;
     }
-    if (!prepare_stream_routes(h, g)) { result = 503; goto cleanup; }
+    if (!prepare_stream_routes(h, g, outbound_uuids)) { result = 503; goto cleanup; }
 #ifdef STEER_PROTOTYPE_HY2
     if (!prepare_datagram_routes(h, g)) { result = 503; goto cleanup; }
 #endif
@@ -1092,6 +1146,7 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
         if (prepared_state->keep[i]) prepare_socks(g, i, &h->listeners[i]);
     prepared_state->generation = g; g = NULL; result = 200;
 cleanup:
+    explicit_bzero(outbound_uuids, sizeof outbound_uuids);
 #ifdef STEER_PROTOTYPE_HY2
     for(i=0;i<STEER_PROTOTYPE_MAX_LISTENERS;i++)qc_server_tls_release(contexts[i]);
 #endif
@@ -1169,7 +1224,11 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 #ifdef STEER_PROTOTYPE_HY2
     hy2="true";hy2_udp=h->current&&h->current->datagrams?"true":"false";provider=",\"hysteria2\"";
 #endif
-    n=snprintf(out+used,capacity-used,"],\"capabilities\":{\"spec_v3_profile\":\"linked-socks-v1\",\"spec_v3_vless_tcp\":true,\"spec_v3_hysteria2\":%s,\"providers\":[\"socks\",\"vless\"%s],\"inbound\":{\"hysteria2\":{\"tcp\":%s,\"udp\":%s,\"tls\":%s}}},\"drainingListeners\":[",hy2_udp,provider,hy2,hy2_udp,hy2);
+    n=snprintf(out+used,capacity-used,"],\"capabilities\":{\"spec_v3_profile\":\"linked-socks-v1\",\"spec_v3_vless_tcp\":true,"
+#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+        "\"spec_v3_vless_tcp_outbound\":true,"
+#endif
+        "\"spec_v3_hysteria2\":%s,\"providers\":[\"socks\",\"vless\"%s],\"inbound\":{\"hysteria2\":{\"tcp\":%s,\"udp\":%s,\"tls\":%s}}},\"drainingListeners\":[",hy2_udp,provider,hy2,hy2_udp,hy2);
     if(n<0||(size_t)n>=capacity-used)return 0;
     used+=(size_t)n;count=0;
 #ifdef STEER_PROTOTYPE_HY2

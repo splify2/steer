@@ -23,11 +23,19 @@ struct steer_prototype_listener {
     char principal_id[65], username_ref[100], password_ref[100], uuid_ref[100];
     char certificate_ref[100],private_key_ref[100]; /* env refs to PEM/DER file paths */
 };
+struct steer_prototype_vless_outbound {
+    char id[65], uuid_ref[100];
+    uint32_t endpoint_tag;
+    uint8_t address[16];
+    uint16_t port;
+};
 struct steer_prototype_config {
     uint64_t generation;
     uint32_t format;
     uint32_t listener_count;
     struct steer_prototype_listener listeners[STEER_PROTOTYPE_MAX_LISTENERS];
+    uint32_t vless_outbound_count;
+    struct steer_prototype_vless_outbound vless_outbounds[STEER_POLICY_STREAM_BINDINGS_MAX];
     struct steer_policy *policy;
     char *document_json;
     size_t document_length;

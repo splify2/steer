@@ -131,6 +131,53 @@ and either `domain` or `domain_suffix`, each with one list entry; an empty map
 matches all. Other variants and settings are rejected, even on disabled
 objects. The general v3 provider executor and signed lock are not wired in.
 
+### Managed plain VLESS TCP outbound
+
+Build from `experimental/provider/Makefile` to include the source-linked stream
+backend. The separate top-level lab build does not include this outbound.
+For example, merge these entries and replace the `socks-local` rule above
+(use the numeric address/port of your own upstream):
+
+```yaml
+secrets:
+  upstream-id: {source: env, kind: uuid, name: STEER_VLESS_UPSTREAM_UUID}
+outbounds:
+  via-vless:
+    plugin: vless:proxy
+    endpoint: {address: 127.0.0.1, port: 24443}
+    options: {uuid: {secret: upstream-id}}
+routing:
+  default: deny
+  rules:
+    - {name: local-route, match: {inbound: [socks-local]}, outbound: via-vless}
+    - {name: vless-route, match: {inbound: [vless-local]}, outbound: internet}
+```
+
+Validate and startup check the inherited UUID without contacting the peer.
+Apply prepares the VLESS binding over the native TCP binding before publication.
+Each selected session sends the original target to the VLESS peer, not to local
+direct dial; a failed peer connection never falls back. Old sessions keep their
+original bindings across Apply. VLESS provides no target-connect ACK, so a
+SOCKS success reply means the VLESS request was sent, not that the far target
+connected; its unknown bind address is reported as `0.0.0.0:0`.
+
+This slice allows enabled plain VLESS v0 TCP outbounds with a numeric upstream
+and no explicit detour, transport, security or resolver settings. The UUID travels unencrypted
+in this variant. TLS, REALITY, Vision, UDP and VLESS routing for HY2 ingress
+are not supported by this binding. A VLESS default is valid only with TCP
+inbounds. The local alias check uses the same linked profile and spec graph,
+not a dynamic provider loader or a stable ABI.
+
+`integration-test` uses a separate Steer VLESS fixture; the independent
+loopback interoperability test takes an existing Xray executable:
+
+```sh
+python3 steer/experimental/provider/prototype_vless_outbound_test.py \
+  --core /tmp/steer-provider-build/steer-prototype --xray /path/to/xray
+```
+
+### Optional Hysteria2 server build
+
 On the optional HY2 server build, merge the following entries into the
 same intent to enable Hysteria2 TCP/UDP over QUIC/TLS:
 
@@ -190,7 +237,8 @@ revision internally, then prepares/commits atomically on the loop shard.
   actual `persistence`, `durability_uncertain`, `activeClients`, and active `listeners` with
   `id`, `protocol`, `address`, `port`. `capabilities.spec_v3_profile` advertises
   `linked-socks-v1` for compatibility; `capabilities.spec_v3_vless_tcp: true`
-  separately advertises plain VLESS and `capabilities.spec_v3_hysteria2: true`
+   advertises plain VLESS inbound; `capabilities.spec_v3_vless_tcp_outbound: true`
+   indicates the linked outbound above. `capabilities.spec_v3_hysteria2: true`
   advertises the QUIC/TLS TCP+UDP HY2 tuple, not general v3 execution.
 - `GET`: one atomic `{revision,persistence,durability_uncertain,document}` envelope with the
   canonical configuration, including environment references only.

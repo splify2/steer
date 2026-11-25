@@ -59,7 +59,8 @@ answers before FIN: the gate does not establish Xray forwarding request FIN,
 TLS/certificate verification or response addons. The local test separately
 checks EOF-dependent reverse response.
 
-This source-only checkpoint is not registered as a managed config outbound,
-stable provider ABI or plugin-loader integration. TLS/WS/H2/gRPC/XHTTP composition,
-Vision/REALITY, UDP and spec-v3 execution remain subsequent prepared capabilities.
-Unsupported features are not silently enabled.
+The [managed linked profile](prototype_core.md#managed-plain-vless-tcp-outbound)
+can prepare this backend as a named spec v3 TCP outbound. It uses the same
+source-linked provider and generation leases, not the general v3 executor,
+plugin loader or stable ABI. TLS/WS/H2/gRPC/XHTTP composition, Vision/REALITY and
+UDP remain unsupported.

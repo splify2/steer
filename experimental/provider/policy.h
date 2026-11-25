@@ -5,6 +5,10 @@
 
 #define STEER_POLICY_DIRECT 1u
 #define STEER_POLICY_BLOCK 2u
+/* Profile-local stream actions. Ordinal zero denotes the first protocol
+ * binding, not the native direct route. Legacy compilers do not admit these. */
+#define STEER_POLICY_STREAM_BINDING_BASE 256u
+#define STEER_POLICY_STREAM_BINDINGS_MAX 16u
 #define STEER_POLICY_MAX_RULES 1024u
 struct steer_policy;
 /* Empty inbound/principal means any. A domain matches the original requested
@@ -42,8 +46,9 @@ struct steer_policy_packet_input {
 };
 struct steer_pv1_error steer_policy_packet_evaluate(const struct steer_policy *,
     const struct steer_policy_packet_input *,struct steer_policy_decision *);
-/* Validated immutable snapshot, same order/conditions as evaluator. Rule/spans
- * borrowed only on callback; compiler consumers must copy retained data. */
+/* Validated immutable packet-policy snapshot, same order/conditions as evaluator.
+ * Stream binding actions lower to BLOCK for this visitor and packet evaluation.
+ * Rule/spans borrowed only on callback; consumers must copy retained data. */
 typedef struct steer_pv1_error (*steer_policy_rule_visitor)(void *,
     const struct steer_policy_rule *);
 struct steer_pv1_error steer_policy_visit(const struct steer_policy *,uint64_t generation,
@@ -53,6 +58,9 @@ struct steer_pv1_error steer_policy_visit(const struct steer_policy *,uint64_t g
 struct steer_pv1_error steer_policy_compile(uint64_t generation,
     const struct steer_policy_rule *, uint32_t count, uint32_t default_action,
     struct steer_policy **out);
+struct steer_pv1_error steer_policy_compile_stream(uint64_t generation,
+    const struct steer_policy_rule *, uint32_t count, uint32_t default_action,
+    uint32_t binding_count, struct steer_policy **out);
 void steer_policy_destroy(struct steer_policy *);
 /* Allocation-free, immutable read. Invalid input/generation mismatch returns
  * error with BLOCK decision. Policy must outlive all concurrent evaluations. */

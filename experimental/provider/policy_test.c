@@ -17,6 +17,12 @@ static struct steer_policy_decision evaluate(struct steer_policy *p,const char *
     e.address=span(name); f.inbound=span("public");
     assert(!steer_policy_evaluate(p,&f,&d).code); return d;
 }
+static struct steer_pv1_error packet_rule(void *context,const struct steer_policy_rule *rule) {
+    unsigned *visited=context;
+    assert(rule->action==STEER_POLICY_BLOCK);
+    ++*visited;
+    return (struct steer_pv1_error){0};
+}
 int main(void) {
     struct steer_draft_accepted accepted;
     uint32_t route_action;
@@ -108,5 +114,18 @@ int main(void) {
     steer_policy_destroy(p);
     assert(steer_policy_compile(0,NULL,0,STEER_POLICY_BLOCK,&p).code && !p);
     assert(steer_policy_compile(7,NULL,0,99,&p).code && !p);
+    memset(r,0,sizeof(r)); r[0].id=span("proxy"); r[0].inbound=span("public");
+    r[0].action=STEER_POLICY_STREAM_BINDING_BASE+1;
+    assert(steer_policy_compile(7,r,1,STEER_POLICY_BLOCK,&p).code && !p);
+    assert(steer_policy_compile_stream(7,r,1,STEER_POLICY_BLOCK,1,&p).code && !p);
+    assert(!steer_policy_compile_stream(7,r,1,STEER_POLICY_STREAM_BINDING_BASE,2,&p).code);
+    assert(evaluate(p,"any.example").action==STEER_POLICY_STREAM_BINDING_BASE+1);
+    struct steer_policy_packet_input packet={7,span("public"),{0},&e,6};
+    assert(!steer_policy_packet_evaluate(p,&packet,&d).code && d.action==STEER_POLICY_BLOCK && d.rule_index==0);
+    packet.inbound=span("other");
+    assert(!steer_policy_packet_evaluate(p,&packet,&d).code && d.action==STEER_POLICY_BLOCK && d.rule_index==UINT32_MAX);
+    unsigned visited=0; uint32_t fallback;
+    assert(!steer_policy_visit(p,7,packet_rule,&visited,&fallback).code && visited==1 && fallback==STEER_POLICY_BLOCK);
+    steer_policy_destroy(p);
     puts("ordered policy tests passed"); return 0;
 }
