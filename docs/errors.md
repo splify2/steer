@@ -351,6 +351,7 @@
 | `plugin.index_rollback` | `name`, `generated`, `seen` | индекс репозитория {name} старее уже виденного ({generated} < {seen}) — откат индекса отвергнут |
 | `plugin.index_sig_download` | `url`, `why` | подпись индекса {url} не скачалась: {why} |
 | `plugin.index_url_download` | `url`, `why` | индекс {url} не скачался: {why} |
+| `plugin.install_degraded` | `path` | установка не завершена; проверьте состояние плагинов и журнал {path} |
 | `plugin.job_failed` | — | задание не удалось (или «задание оборвано»; если задание успело написать ход — его последняя строка) |
 | `plugin.job_not_found` | — | такого задания нет |
 | `plugin.job_start_failed` | — | не завести задание |
@@ -378,6 +379,7 @@
 | `plugin.link_owned_by_package` | `id`, `path`, `pkg` | {id} не встаёт: {path} принадлежит пакету {pkg} |
 | `plugin.link_path` | `id`, `path` | {id}: путь ссылки «{path}» не абсолютный путь файла |
 | `plugin.link_perm` | `id`, `path` | {id}: ссылка {path} без права fs: |
+| `plugin.link_remove` | `path`, `why` | не снять ссылку {path}: {why} |
 | `plugin.link_taken` | `path`, `other`, `repo` | путь {path} уже занят плагином {other} из {repo} |
 | `plugin.link_target_missing` | `id`, `path`, `target` | {id}: цели ссылки {path} ({target}) нет в плагине |
 | `plugin.link_target_outside` | `id`, `path` | {id}: цель ссылки {path} вне каталога плагина |

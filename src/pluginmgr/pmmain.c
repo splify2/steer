@@ -1437,11 +1437,21 @@ int pm_main(int argc, char **argv) {
     int rc = 2;
     struct pm_err e = {0};
     int listing = !strcmp(act, "list") || !strcmp(act, "status");
-    if (listing && pm_install_pending(&e) != 0) { rc = fail_e(&x, &e); goto out; }
-    if (pm_state_load(&x.st, &e) != 0 || pm_repos_load(&x.repos, &e) != 0) { rc = fail_e(&x, &e); goto out; }
+    int readonly = listing || !strcmp(act, "search") || !strcmp(act, "job") ||
+                   (!strcmp(act, "repo") && npos == 2 && !strcmp(pos[1], "list"));
+    if (listing && pm_install_pending(&e) != 0) {
+        if (pm_lock() != 0) { rc = fail_e(&x, &e); goto out; }
+        int recover = pm_install_recover(&x, &e);
+        pm_unlock();
+        if (recover != 0) { rc = fail_e(&x, &e); goto out; }
+    }
+    if (readonly && (pm_state_load(&x.st, &e) != 0 || pm_repos_load(&x.repos, &e) != 0)) {
+        rc = fail_e(&x, &e);
+        goto out;
+    }
     pm_target_load(&x.tg);
     if (!x.tg.arch) x.tg.arch = pm_strdup("");
-    /* Только чтение — без блокировки. */
+    /* Чтение без блокировки, когда нет журнала установки. */
     if (!strcmp(act, "list") && npos == 1) { rc = cmd_list(&x, NULL, 0); goto out; }
     if (!strcmp(act, "status") && npos <= 2) {
         if (npos == 2 && !pm_id_ok(pos[1])) { rc = failc(&x, "plugin.bad_name", NULL, "недопустимое имя плагина"); goto out; }
@@ -1469,10 +1479,8 @@ int pm_main(int argc, char **argv) {
         }
     }
     if (pm_lock() != 0) { rc = failc(&x, "plugin.busy", NULL, "busy: менеджер плагинов занят другим запросом — повторите позже"); goto out; }
-    if (pm_install_pending(&e) != 0) { rc = fail_e(&x, &e); goto out_nojob; }
-    /* Состояние — заново под блокировкой: прочитанное до неё могло устареть. */
-    pm_state_free(&x.st);
-    if (pm_state_load(&x.st, &e) != 0) { rc = fail_e(&x, &e); goto out; }
+    if (pm_install_recover(&x, &e) != 0 || pm_state_load(&x.st, &e) != 0 ||
+        pm_repos_load(&x.repos, &e) != 0) { rc = fail_e(&x, &e); goto out_nojob; }
     if (job && (!strcmp(act, "install") || !strcmp(act, "update") || !strcmp(act, "ensure"))) {
         int prc = 0;
         if (!job_fork(&x, &prc)) { rc = prc; goto out_nojob; }

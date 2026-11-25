@@ -16,5 +16,5 @@ inc=$(for d in $(profile_var INC_DIRS); do printf -- '-I%s ' "$d"; done)
 $CC -O0 -g $inc $(profile_var THIRD_DEFS) $(cat "$WOLFSSL_LIB.cflags") \
     -DSTEER_VERSION="\"$(cat VERSION)\"" -o "$t/steerd-pm" \
     $(profile_src extended) $(profile_var PLUGMGR_SRC) tests/pluginmgr-reopen-fault.c \
-    -Wl,--wrap=rename "$WOLFSSL_LIB" -lpthread
+    -Wl,--wrap=rename -Wl,--wrap=unlink "$WOLFSSL_LIB" -lpthread
 python3 tests/pluginmgr-reopen.py "$t/steerd-pm"

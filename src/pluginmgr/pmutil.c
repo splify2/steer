@@ -132,7 +132,12 @@ char *pm_read(const char *path, size_t *n) {
         if (got + 1 >= cap) { cap *= 2; b = pm_realloc(b, cap); }
         ssize_t m = read(fd, b + got, cap - got - 1);
         if (m < 0 && errno == EINTR) continue;
-        if (m < 0) { close(fd); free(b); return NULL; }
+        if (m < 0) {
+            int err = errno;
+            close(fd); free(b);
+            errno = err;
+            return NULL;
+        }
         if (m == 0) break;
         got += (size_t)m;
     }

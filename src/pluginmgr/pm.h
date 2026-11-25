@@ -276,6 +276,8 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
                struct pm_result *res, struct pm_err *e);
 /* Не выдавать смешанный набор как нормальный после незавершённой установки. */
 int pm_install_pending(struct pm_err *e);
+/* Восстановить незавершённую установку, если её можно безопасно отменить. Только под pm_lock. */
+int pm_install_recover(struct pm_ctx *x, struct pm_err *e);
 int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_err *e);
 /* Стоящие плагины, несовместимые по ABI со стоящими библиотеками (проба программ, pminst.c), кроме skip: их ids
  * в *bad, библиотеки — в *libs (NULL — не нужны), строка первого отказа — в *first_why (NULL — не нужна; куча). */
