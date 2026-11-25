@@ -23,7 +23,7 @@ def main(binary):
             assert original["persistence"] and not original["durability_uncertain"]
             assert (state / "config.json").stat().st_mode & 0o777 == 0o600
             candidate = copy.deepcopy(document); candidate["listeners"][0]["label"] = "Saved configuration"
-            assert control(path, "APPLY", candidate, 1)[1]["revision"] == 2
+            assert control(path, "APPLY", candidate, 1, half_close=True)[1]["revision"] == 2
             assert json.loads((state / "config.json").read_text())["revision"] == 2
             if os.geteuid() != 0:
                 # Directory-fd ownership does not bypass create permissions.

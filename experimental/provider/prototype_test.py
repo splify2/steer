@@ -21,7 +21,7 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def control(path, op, document=None, revision=None, fragmented=False):
+def control(path, op, document=None, revision=None, fragmented=False, half_close=False):
     body = b"" if document is None else json.dumps(document, separators=(",", ":")).encode()
     header = op
     if revision is not None:
@@ -37,6 +37,8 @@ def control(path, op, document=None, revision=None, fragmented=False):
             sock.sendall(wire[20:])
         else:
             sock.sendall(wire)
+        if half_close:
+            sock.shutdown(socket.SHUT_WR)
         line = b""
         while not line.endswith(b"\n"):
             line += exact(sock, 1)
@@ -134,7 +136,7 @@ def main(binary):
             assert control(path, "VALIDATE", invalid)[0] == 422
             assert control(path, "APPLY", invalid, 1)[0] == 422
             assert control(path, "GET")[1]["revision"] == 1
-            assert control(path, "VALIDATE", document, fragmented=True) == (200, {"valid": True, "persistence": False})
+            assert control(path, "VALIDATE", document, fragmented=True, half_close=True) == (200, {"valid": True, "persistence": False})
             blocked = copy.deepcopy(document); blocked["routing"]["default"] = "block"
             assert control(path, "APPLY", blocked, 1, fragmented=True)[1]["revision"] == 2
             roundtrip(pinned, b"old-generation-still-direct")

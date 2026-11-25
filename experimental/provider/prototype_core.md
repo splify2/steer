@@ -167,7 +167,9 @@ the source file never replaces an existing committed snapshot.
 
 ## Local control protocol
 
-One request per Unix stream connection. Lengths count UTF-8 bytes. Commands are
+One request per Unix stream connection. After sending the entire request a client
+may shut down its write half and still read the reply, including while validation
+or persistent apply is pending. Lengths count UTF-8 bytes. Commands are
 case-sensitive ASCII followed by LF; document bytes follow immediately:
 
 ```text

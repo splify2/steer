@@ -1256,7 +1256,7 @@ static int queue_durable(struct control *c,struct prepared *prepared)
     struct host *h = c->host;
     if (h->store_busy) return 503;
     prepared->control = c; prepared->control_serial = c->serial;
-    if (loop_fd_mod(h->loop, c->fd, EPOLLRDHUP))return 503;
+    if (loop_fd_mod(h->loop, c->fd, 0))return 503;
     c->waiting_store = 1; h->store_busy = 1;
     pthread_mutex_lock(&h->writer.lock);
     h->writer.prepared = prepared; h->writer.queued = 1;
@@ -1355,7 +1355,9 @@ static void control_execute(struct control *c)
             c->expected,(unsigned)(c-h->controls),c->serial,c->operation==3,c->deadline_ms);
         if(code) { control_error(c,code);return; }
         c->waiting_prepare=1;
-        if(loop_fd_mod(h->loop,c->fd,EPOLLRDHUP)) {
+        /* The full request is already buffered. A peer may close only its
+         * write half and still expect the reply. HUP/ERR are always reported. */
+        if(loop_fd_mod(h->loop,c->fd,0)) {
             steer_prototype_prepare_cancel(h->preparer,(unsigned)(c-h->controls),c->serial);c->waiting_prepare=0;control_error(c,503);
         }
     }
@@ -1366,7 +1368,7 @@ static void control_ready(struct loop *l, int fd, uint32_t events, void *arg)
     ssize_t n;
     (void)l;
     if (c->waiting_store||c->waiting_prepare) {
-        if (events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) close_control(c);
+        if (events & (EPOLLHUP | EPOLLERR)) close_control(c);
         return;
     }
     if (c->writing) {
