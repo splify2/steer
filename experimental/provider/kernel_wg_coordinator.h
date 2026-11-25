@@ -80,7 +80,7 @@ typedef int (*steer_draft_wg_verify_ready)(void *,const struct steer_draft_wg_gu
  * includes failed attempts. Cleanup errors do not authorize fallback. */
 int steer_draft_wg_selection_startup(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
     void *,const struct steer_draft_wg_revision *,steer_draft_wg_verify_ready,
-    uint64_t deadline,uint64_t *next_revision);
+    uint64_t deadline,uint64_t *next_revision,struct steer_draft_wg_guard_record *selected);
 /* Staging only. Caller may commit the document on success. On NOT_RENAMED
  * use startup with the old revision; on RENAMED do not clean either side
  * until the exact document has been durably recovered. */

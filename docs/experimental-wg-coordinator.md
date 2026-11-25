@@ -88,7 +88,7 @@ guard/nft overlays or patches are required. The test starts two independent
 WireGuard peers, initiates ICMP and UDP traffic from both directions, injects
 a real occupied listen port, and checks live peer traffic after recovery on
 both sides of the config commit. Server-initiated traffic on this inbound
-device is not a spec-configured outbound.
+device is not a spec-configured outbound; see the separate TCP profile below.
 
 ```sh
 # From the workspace containing the three repositories; choose the WG Apply
@@ -114,14 +114,58 @@ from the optional HY2 build. Use that executable as the **first** binary in the
 WG test above and as `CORE_BINARY` for Steer UI's `spec-v3-matrix-test`.
 Ordinary `--config` runs the proxy profile; only `--wg-netns-profile` enters
 the WG device profile, under the same namespace and fd checks described above.
-These are separate invocations: success on both does not establish a mixed
-WG/proxy document, a proxy-to-WG route, or a host networking deployment.
+These are separate invocations. To test the specific SOCKS-to-WG route, use
+the outbound acceptance below with the same executable.
 
-This does not wire WG into the general host executor or UI. Before doing that,
-move serialized control work to the bounded host worker, replace the isolated
-reservation with common `execution_reservations`/`device_authority_service`,
-add a normal deliberate retire/disable transition, and specify endpoint,
-route, transport and secret ownership for outbound and bidirectional
-configuration. The isolated journal has no compaction; accumulated orphans can
-fence admission. Real host work also needs machine-reboot and multi-device
-recovery, and an explicitly scoped privileged network integration contract.
+## Core-selected WireGuard TCP outbound
+
+The same opt-in binary can take `--socks-port PORT` after `--state-dir DIR`.
+It opens only `127.0.0.1:PORT`, uses the regular Core SOCKS CONNECT implementation
+and stream router, and requires Linux `SO_BINDTOIFINDEX`. Until an outbound
+document is committed, the listener rejects every CONNECT. The router has
+only a WG-constrained binding in this mode; no direct or DNS binding.
+
+For UI discovery, require `capabilities.wg_stream_outbound_netns: true` and
+`capabilities.wg_stream_outbound_netns_schema: "wireguard-tcp-netns-outbound-v1"`.
+[`schemas/wireguard-tcp-netns-outbound-v1.json`](schemas/wireguard-tcp-netns-outbound-v1.json)
+describes `outbounds.tunnel`, not a general-purpose provider schema. The v3
+document uses the same builtin plugin alias and typed env refs as inbound,
+one `socks-entry` inbound with `plugin: socks:main`, `flow: [stream]`, the
+matching loopback `listen` and empty `options`, and
+`routing: {default: tunnel, rules: []}`. A real document is in
+`experimental/provider/prototype_wg_outbound_test.py`. The schema is for form
+construction; Core `VALIDATE` also enforces the cross-field invariants.
+`runtimeReady` is false until an exact selected link, guard and route exist;
+the capability is not a health signal. `wg_device_outbound` remains false.
+
+The outbound needs one passive peer, a numeric IPv4 UDP endpoint outside the
+route, a distinct IPv4 `/32` local source, and one explicit `/24`–`/32` route
+equal to its sole AllowedIPs prefix. The route is exclusive, in the
+disposable namespace's main table, and attached to the journal-owned link.
+Linux requires the nexthop UP to add it, so stage it only after the durable DROP
+guard and before publishing a return-traffic-only policy. STARTUP verifies the
+exact route with the link and guard before cleanup. The router admits only
+numeric TCP targets in the prefix, then the connector verifies the live objects
+under a short deadline and binds both the owned ifindex and source address
+before connect. A missing route or link never falls back to direct. Removing
+the owned link also removes its attached route; no delete or
+replace by prefix is used. Staging a new revision requires disjoint source,
+route and listen port; role changes are not supported.
+
+After building clean sources as above, run the outbound acceptance in a
+separate disposable netns (`python3-jsonschema` is needed for the UI schema
+check):
+
+```sh
+unshare -n -- env TMPDIR="$out" PYTHONDONTWRITEBYTECODE=1 \
+    python3 experimental/provider/prototype_wg_outbound_test.py \
+    "$out/steer-prototype-wg-netns" 3</proc/self/ns/net
+```
+
+This is IPv4 TCP through the isolated SOCKS entry, not packet forwarding,
+UDP egress, general WireGuard Device ABI, namespace management, or a production
+dataplane/UI integration. Short kernel checks still run on the opt-in control
+owner; the general host needs a bounded worker and common device authority.
+The isolated journal has no compaction or deliberate disable transition;
+multi-device Apply, same-resource handover and machine-reboot recovery remain
+out of scope.

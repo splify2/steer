@@ -1,6 +1,7 @@
 #ifndef STEER_EXPERIMENTAL_NATIVE_STREAM_BACKEND_H
 #define STEER_EXPERIMENTAL_NATIVE_STREAM_BACKEND_H
 #include "route_stream.h"
+#include "route_dial.h"
 struct steer_draft_resolver;
 struct steer_draft_native_stream_backend;
 typedef void (*steer_draft_native_stream_retired)(void *);
@@ -14,6 +15,8 @@ struct steer_pv1_error steer_draft_native_stream_backend_create(struct loop *,
     uint32_t max_operations,uint32_t max_references,steer_draft_native_stream_retired,void *,
     struct steer_draft_native_stream_backend **);
 const struct steer_draft_stream_binding *steer_draft_native_stream_binding(const struct steer_draft_native_stream_backend *);
+struct steer_pv1_error steer_draft_native_stream_socket_guard(struct steer_draft_native_stream_backend *,
+    steer_draft_socket_guard,void *);
 /* Retire stops new admissions; already admitted opens/streams retain their
  * generation. Destroy refuses until finalizer notification and all pins/ops
  * retire. It runs only on owner and never unloads a module by itself. */

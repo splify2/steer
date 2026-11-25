@@ -17,6 +17,8 @@ struct steer_draft_routes {
     struct steer_draft_operations *operations;
     steer_draft_route_evaluate evaluate;
     void *context;
+    steer_draft_socket_guard guard_socket;
+    void *guard_context;
     struct steer_draft_resolver *resolver;
     uint64_t generation;
     uint32_t live;
@@ -144,6 +146,11 @@ static void dial_address(struct route_operation *op) {
     length=address->ss_family==AF_INET?sizeof(struct sockaddr_in):sizeof(struct sockaddr_in6);
     op->fd=socket(address->ss_family,SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
     if(op->fd<0) { finish(op,STEER_PV1_IO);return; }
+    if(op->routes->guard_socket){
+        uint32_t denied=op->routes->guard_socket(op->routes->guard_context,op->fd,address,op->deadline_ns);
+        if(denied){finish(op,denied<=STEER_PV1_INTERNAL?denied:STEER_PV1_INVALID);return;}
+        if(now_ns()>=op->deadline_ns){finish(op,STEER_PV1_TIMEOUT);return;}
+    }
     result=connect(op->fd,(struct sockaddr *)address,length);
     if(!result) connected(op,0);
     else if(errno!=EINPROGRESS) connected(op,errno);
@@ -218,10 +225,18 @@ struct steer_pv1_error steer_draft_routes_use_resolver(struct steer_draft_routes
     struct steer_draft_resolver *resolver) {
     struct steer_pv1_error e;
     if(!r||!resolver) return error(STEER_PV1_INVALID);
-    if(r->live||r->resolver) return error(STEER_PV1_POLICY_DENIED);
+    if(r->live||r->resolver||r->guard_socket) return error(STEER_PV1_POLICY_DENIED);
     e=steer_draft_resolver_retain(resolver);
     if(!e.code) r->resolver=resolver;
     return e;
+}
+struct steer_pv1_error steer_draft_routes_socket_guard(struct steer_draft_routes *r,
+    steer_draft_socket_guard guard,void *ctx){
+    if(!r||!guard)return error(STEER_PV1_INVALID);
+    if(r->live||r->guard_socket||r->resolver)return error(STEER_PV1_POLICY_DENIED);
+    r->guard_socket=guard;
+    r->guard_context=ctx;
+    return error(STEER_PV1_OK);
 }
 struct steer_pv1_async_start steer_draft_route_dial(struct steer_draft_routes *r,
     const struct steer_draft_accepted *flow,uint64_t deadline_ns,

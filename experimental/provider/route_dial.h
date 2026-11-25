@@ -1,8 +1,14 @@
 #ifndef STEER_EXPERIMENTAL_ROUTE_DIAL_H
 #define STEER_EXPERIMENTAL_ROUTE_DIAL_H
+#include <sys/socket.h>
 #include "stream.h"
 struct steer_draft_routes;
 struct steer_draft_resolver;
+/* Optional owner-only socket constraint, before connect on every attempt.
+ * Returns a provider status. It must not take ownership of the fd. */
+typedef uint32_t (*steer_draft_socket_guard)(void *,int,const struct sockaddr_storage *,uint64_t);
+struct steer_pv1_error steer_draft_routes_socket_guard(struct steer_draft_routes *,
+    steer_draft_socket_guard,void *);
 /* Source-only accepted-flow seam, NOT a frozen provider ABI. Every span is
  * borrowed through route_dial start only. Destination retains domain/IP identity
  * until policy; source must be numeric. Currently TCP only: non-NULL opaque

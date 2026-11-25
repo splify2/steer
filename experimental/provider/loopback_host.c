@@ -189,6 +189,9 @@ struct prepared {
 struct client {
     struct host *host;
     struct generation *generation;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    uint64_t wg_revision;
+#endif
     struct socks_instance *socks; /* pins the instance and its parent generation */
     struct listener_identity identity;
     struct steer_pv1_stream_ref down, up;
@@ -354,6 +357,12 @@ static uint8_t route_reply_code(uint32_t error, uint32_t failure)
  * host router. Only the host selects/dials a backend; metadata is call-borrowed. */
 static void accept_flow(struct client *c, const struct steer_pv1_flow_metadata *flow)
 {
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(c->host->wg&&c->wg_revision!=steer_prototype_wg_revision(c->host->wg)){
+        dial_reply(c,2,NULL);
+        return;
+    }
+#endif
     c->phase = DIALING;
     loop_timer_set(c->deadline, 5000);
     c->route = steer_draft_stream_route_open(c->generation->streams, flow,
@@ -562,6 +571,9 @@ static void accept_clients(struct loop *l, int fd, uint32_t events, void *arg)
         c = &h->clients[i]; memset(c, 0, sizeof(*c));
         c->host = h; c->live = 1; h->live++;
         c->generation = g; c->socks = socks;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+        if(h->wg)c->wg_revision=steer_prototype_wg_revision(h->wg);
+#endif
         if (socks) g->socks_sessions++;
         else { g->references++; c->identity = listener->identity; }
         c->source.size = sizeof(c->source); c->source.version = STEER_PV1_DRAFT_LAYOUT;
@@ -659,6 +671,16 @@ static struct steer_pv1_error select_stream(void *context,
     }
     return error;
 }
+#ifdef STEER_PROTOTYPE_WG_NETNS
+static struct steer_pv1_error select_wg_stream(void *context,const struct steer_pv1_flow_metadata *flow,
+    uint32_t *index){
+    const struct steer_prototype_wg *w=context;
+    /* This registry has exactly one binding: the kernel-pinned connector.
+     * No general direct or resolver binding is installed in this profile. */
+    *index=steer_prototype_wg_select(w,steer_prototype_wg_revision(w),flow)?0:STEER_DRAFT_STREAM_ROUTE_BLOCK;
+    return (struct steer_pv1_error){STEER_PV1_OK,0};
+}
+#endif
 static void generation_retired(void *arg)
 {
     struct generation *g = arg;
@@ -678,6 +700,10 @@ static int prepare_stream_routes(struct host *h, struct generation *g,
     if (steer_draft_native_stream_backend_create(h->loop, h->runtime, h->backend_runtime,
         h->resolver, g->number, g->number, CLIENTS, 16*CLIENTS,
         generation_retired, g, &g->native).code) return 0;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(h->wg&&steer_draft_native_stream_socket_guard(g->native,steer_prototype_wg_bind_stream,h->wg).code)
+        return 0;
+#endif
     struct steer_draft_stream_binding bindings[1 + STEER_POLICY_STREAM_BINDINGS_MAX];
     unsigned count = 1;
     bindings[0] = *steer_draft_native_stream_binding(g->native);
@@ -721,6 +747,10 @@ static int prepare_stream_routes(struct host *h, struct generation *g,
     }
 #else
     (void)credentials;
+#endif
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(h->wg)return !steer_draft_stream_routes_create(h->loop,g->number,CLIENTS,CLIENTS,
+        bindings,count,select_wg_stream,h->wg,NULL,&g->streams).code;
 #endif
     return !steer_draft_stream_routes_create(h->loop, g->number, CLIENTS, CLIENTS,
         bindings, count, select_stream, g->policy,
@@ -1723,10 +1753,32 @@ int steer_prototype_main(int argc, char **argv)
 #ifdef STEER_PROTOTYPE_WG_NETNS
     /* One exclusive opt-in profile, kernel dataplane, serialized control.
      * fd 3 must pin the original netns from before entry into the fixture. */
-    if(argc==6&&!strcmp(argv[1],"--wg-netns-profile")&&!strcmp(argv[2],"--control")&&
+    if((argc==6||argc==8)&&!strcmp(argv[1],"--wg-netns-profile")&&!strcmp(argv[2],"--control")&&
        !strcmp(argv[4],"--state-dir")){
+        uint64_t socks=0;
+        if(argc==8){
+            const char *p=argv[7];
+            if(strcmp(argv[6],"--socks-port")||!decimal(&p,&socks)||*p||!socks||socks>UINT16_MAX)return 2;
+        }
         if(!initialize_host(&h,clients))goto cleanup;
-        if(steer_prototype_wg_open(argv[5],3,&h.wg))goto cleanup;
+        if(steer_prototype_wg_open(argv[5],3,(uint16_t)socks,&h.wg))goto cleanup;
+        if(socks){
+            /* Frontend lifetime is independent of WG revisions; each accepted
+             * SOCKS request still pins the published WG revision. */
+            struct generation *g=&h.generations[0];
+            struct listener *l=&h.listeners[0];
+            g->number=1;
+            if(!prepare_stream_routes(&h,g,NULL))goto cleanup;
+            strcpy(l->identity.id,"socks-entry");
+            strcpy(l->spec.id,"socks-entry");
+            strcpy(l->spec.address,"127.0.0.1");
+            l->spec.protocol=STEER_PROTOTYPE_SOCKS;
+            l->spec.port=(uint16_t)socks;
+            prepare_socks(g,0,l);
+            if(!bind_listener(&h,l,NULL))goto cleanup;
+            h.current=g;l->active=1;
+            set_socks_admission(g,1);
+        }
         if(!bind_control(&h,argv[3]))goto cleanup;
         size_t ready;
         (void)steer_prototype_wg_request(h.wg,1,0,NULL,0,status,sizeof(status),&ready);
@@ -1786,9 +1838,10 @@ int steer_prototype_main(int argc, char **argv)
     printf("READY %.*s\n", (int)length, status); fflush(stdout);
     result = loop_run(h.loop);
 cleanup:
+    cleanup_host(&h);
 #ifdef STEER_PROTOTYPE_WG_NETNS
     steer_prototype_wg_close(h.wg);
 #endif
-    cleanup_host(&h); free(document); steer_store_document_destroy(snapshot);
+    free(document); steer_store_document_destroy(snapshot);
     return result;
 }

@@ -353,9 +353,10 @@ void steer_draft_wg_selection_close(struct steer_draft_wg_selection *s){
 
 int steer_draft_wg_selection_startup(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
     void *ctx,const struct steer_draft_wg_revision *revision,steer_draft_wg_verify_ready verify,
-    uint64_t deadline,uint64_t *next_revision){
+    uint64_t deadline,uint64_t *next_revision,struct steer_draft_wg_guard_record *selected){
     if(!s||!cleanup_backend(b)||!revision||!verify||!next_revision)return EINVAL;
     *next_revision=0;
+    if(selected)*selected=(struct steer_draft_wg_guard_record){0};
     int rc=running(deadline,NULL);
     if(rc)return rc;
     struct inventory i;
@@ -373,6 +374,7 @@ int steer_draft_wg_selection_startup(struct steer_draft_wg_selection *s,const st
         }
         if(!rc){if(highest==UINT64_MAX)rc=EOVERFLOW;else *next_revision=highest+1;}
     }
+    if(!rc&&selected&&i.active!=SELECTION_MAX)*selected=i.e[i.active].guard;
     free(i.e);
     return rc;
 }

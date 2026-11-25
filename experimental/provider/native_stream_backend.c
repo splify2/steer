@@ -99,6 +99,10 @@ fail:
  (void)steer_draft_routes_destroy(b->routes);free(b);return e;
 }
 const struct steer_draft_stream_binding *steer_draft_native_stream_binding(const struct steer_draft_native_stream_backend *b){return b?&b->binding:NULL;}
+struct steer_pv1_error steer_draft_native_stream_socket_guard(struct steer_draft_native_stream_backend *b,
+    steer_draft_socket_guard guard,void *ctx){
+    return b?steer_draft_routes_socket_guard(b->routes,guard,ctx):error(STEER_PV1_INVALID);
+}
 struct steer_pv1_error steer_draft_native_stream_backend_retire(struct steer_draft_native_stream_backend *b){
  return b?steer_draft_binding_retire(b->binding.lease):error(STEER_PV1_INVALID);
 }
