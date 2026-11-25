@@ -142,11 +142,15 @@ def run(args, echo, directory):
         state.mkdir(mode=0o700)
         if args.minimal:
             with core(args.minimal, directory, base) as path:
-                assert "spec_v3_hysteria2_tcp_outbound" not in control(path, "STATUS")[1]["capabilities"]
+                caps = control(path, "STATUS")[1]["capabilities"]
+                assert "spec_v3_hysteria2_tcp_outbound" not in caps
+                assert "spec_v3_hysteria2_stream_only_inbound" not in caps
                 assert control(path, "VALIDATE", staged)[0] == 422
 
         with core(args.core, directory, base, state_directory=state, extra_env=env) as path:
-            assert control(path, "STATUS")[1]["capabilities"]["spec_v3_hysteria2_tcp_outbound"] is True
+            caps = control(path, "STATUS")[1]["capabilities"]
+            assert caps["spec_v3_hysteria2_tcp_outbound"] is True
+            assert caps["spec_v3_hysteria2_stream_only_inbound"] is True
             for edit in (
                 lambda d, h: h.update(flow=["stream", "datagram"]),
                 lambda d, h: h["options"].update(password="literal"),

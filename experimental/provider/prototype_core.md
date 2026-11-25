@@ -410,6 +410,12 @@ password variable contains the password. No values or resolved paths are stored
 in the intent. A minimal build rejects HY2 documents. The prototype caps typed
 secret declarations at 16.
 
+For the inbound flow selector, STATUS advertises
+`capabilities.spec_v3_hysteria2_stream_only_inbound: true` when the core
+accepts an explicit `flow: [stream]`. This is independent of outbound support.
+On older cores without this flag, keep the existing TCP+UDP choice when
+advertised; do not generate the stream-only profile from a form.
+
 GET returns the whole accepted v3 intent, not its lowered listener/policy
 representation. The durable envelope records `format: "steer-spec-v3"`;
 recovery syncs the store and recompiles the saved intent with the same
