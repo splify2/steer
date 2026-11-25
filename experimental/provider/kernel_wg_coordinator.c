@@ -381,7 +381,10 @@ int steer_draft_wg_selection_startup(struct steer_draft_wg_selection *s,const st
 
 int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
     void *ctx,const struct steer_draft_wg_revision *revision,uint16_t previous_port,
-    const struct steer_draft_wg_tx *t,const struct steer_draft_wg_candidate *c,uint64_t deadline){
+    const struct steer_draft_wg_tx *t,const struct steer_draft_wg_candidate *c,uint64_t deadline,
+    struct steer_draft_wg_ready *ready){
+    if(!ready)return EINVAL;
+    *ready=(struct steer_draft_wg_ready){0};
     if(!s||!tx_valid(t)||!c||!c->config||!revision||!!revision->generation!=!!previous_port)return EINVAL;
     int rc=running(deadline,NULL);
     if(rc)return rc;
@@ -404,7 +407,6 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *s,const stru
     free(i.e);
     if(rc)return rc;
     int started=0;
-    struct steer_draft_wg_ready ready;
-    return stage_candidate(s->j,b,ctx,t,c,previous.listen_port?&previous:NULL,deadline,NULL,&ready,
+    return stage_candidate(s->j,b,ctx,t,c,previous.listen_port?&previous:NULL,deadline,NULL,ready,
         &started,durable_provider);
 }

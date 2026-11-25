@@ -234,10 +234,34 @@ except TimeoutError:
                 assert json.loads(run("ip", "-j", "route", "get", DEST))[0]["dev"] == device
                 connect(socks, DEST, service, SOURCE)
                 assert line(echo) == SOURCE
-                run("ip", "link", "delete", "dev", device)
-                direct_is_possible(DEST, service)
+                # A handshake already accepted on generation 1 cannot use
+                # generation 3's connector, even for a newly allowed target.
+                source2 = "10.215.0.9"
+                replacement = copy.deepcopy(doc)
+                cfg = replacement["outbounds"]["tunnel"]["options"]
+                cfg["addresses"] = [f"{source2}/32"]
+                cfg["route_prefix"] = f"{OUTSIDE}/32"
+                cfg["peers"][0]["allowed_ips"] = [f"{OUTSIDE}/32"]
+                while cfg["listen_port"] == local_port:
+                    cfg["listen_port"] = udp_port()
+                run(*ns,"wg","set","passive-wg","peer",active_key,"allowed-ips",f"{SOURCE}/32,{source2}/32")
+                run(*ns,"ip","route","add",f"{source2}/32","dev","passive-wg")
+                with socket.create_connection(("127.0.0.1",socks),timeout=4) as old:
+                    greeting(old)
+                    result = control(path,"APPLY",replacement,1)
+                    assert result[0] == 200, result
+                    old.sendall(b"\x05\x01\x00\x01"+ipaddress.IPv4Address(OUTSIDE).packed+service.to_bytes(2,"big"))
+                    assert response(old) == 2
+                    no_connect(echo)
+                assert control(path,"GET")[1]["document"] == replacement
+                new_device = json.loads(run("ip","-j","route","get",OUTSIDE))[0]["dev"]
+                assert new_device.startswith("sw") and new_device != device
+                connect(socks,OUTSIDE,service,source2)
+                assert line(echo) == source2
+                run("ip", "link", "delete", "dev", new_device)
+                direct_is_possible(OUTSIDE, service)
                 assert line(echo) == "192.0.2.1"
-                connect(socks, DEST, service)
+                connect(socks, OUTSIDE, service)
                 no_connect(echo)
                 assert not control(path, "STATUS")[1]["runtimeReady"]
                 core.terminate()
@@ -245,7 +269,7 @@ except TimeoutError:
             with start(root / "missing.sock") as core:
                 assert core.wait(timeout=5) != 0
                 assert not (root / "missing.sock").exists()
-            print("PASS durable restart preserved WG; after device loss real direct path exists but Core blocks",
+            print("PASS restart and generation switch; old handshake cannot use new WG; device loss never falls back",
                   flush=True)
 
 

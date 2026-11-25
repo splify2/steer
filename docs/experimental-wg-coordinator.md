@@ -169,3 +169,44 @@ owner; the general host needs a bounded worker and common device authority.
 The isolated journal has no compaction or deliberate disable transition;
 multi-device Apply, same-resource handover and machine-reboot recovery remain
 out of scope.
+
+## Linked spec v3 integration boundary
+
+`kernel_wg_stream` is a generation-local native TCP socket constraint, not a
+second router or configuration store. It owns a copy of the exact journal
+guard identity, source and prefix and a duplicate of the pinned namespace FD.
+It has no `current` pointer and no authority to retire the device. In the
+isolated profile the candidate constraint is allocated and verified after
+journaled staging but **before** committing the document. Failure here is
+pre-commit rollback. Startup builds a new constraint only after the committed
+revision has been verified. No new linked capability is registered.
+
+The next linked profile should extend the existing Core, not dispatch into
+`steer_prototype_wg_request`:
+
+1. The opt-in namespace gate controls WG capability inventory in the ordinary
+   v3 compiler. Lower one `wireguard:main/.../kernel` outbound into a normal
+   `stream_outbounds` slot. SOCKS5, VLESS and Hysteria2 streams already share
+   `select_stream`; use the existing ordered route action and binding index
+   instead of a protocol-specific branch. WG gets its own native binding and
+   no resolver. Keep the separate direct binding unchanged for flows explicitly
+   routed there; do not use a namespace `main`-table route that could reroute
+   direct traffic into WG. Put the owned destination route in a scoped routing
+   table selected by that binding only, and verify both route and selector.
+2. The prepare worker lowers intent and resolves keys. The serialized durable
+   writer reserves lifecycle credits and stages owned link, DROP, route and
+   binding; only a verified immutable candidate may enter the owner registry.
+   Reserve a cleanup path even when stream preparation or listener bind fails.
+   One canonical linked `prototype_store` revision is the commit decision.
+   NOT_RENAMED retires only the candidate, RENAMED-but-unsynced fences cleanup
+   and admission, SYNCED publishes the already allocated generation.
+3. Pin the binding to the accepted flow's generation and keep the previous
+   WG resource while its admitted streams drain. Never retarget a pending
+   connect to the newer interface. Startup must classify a validated committed
+   document with no WG separately from a missing WG outcome; the existing
+   single-WG journal cannot tell these apart. Verify a selected WG before
+   retiring other identities, or fence. Test disjoint updates, no-WG
+   transitions, unavailable WG without direct fallback, and ambiguous storage
+   on both sides of commit. Do not advertise mixed profile support until
+   independent SOCKS5/VLESS/HY2 TCP clients and a passive WG peer pass that
+   test on the same committed revision.

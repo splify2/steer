@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "prototype_wg.h"
 #include "kernel_wg_linux_guard.h"
+#include "kernel_wg_stream.h"
 #include "kernel_wg_v3.h"
 #include "prototype_store.h"
 #include "flow_metadata.h"
@@ -33,6 +34,7 @@ struct steer_prototype_wg {
     struct awg_prefix address;
     struct awg_prefix route,endpoint;
     struct steer_draft_wg_guard_record selected;
+    struct steer_draft_wg_stream *stream;
     uint16_t socks_port;
     uint16_t port;
     uint64_t next;
@@ -258,6 +260,7 @@ static int bind_index_available(void){
 }
 void steer_prototype_wg_close(struct steer_prototype_wg *w){
     if(!w)return;
+    steer_draft_wg_stream_destroy(w->stream);
     steer_store_document_destroy(w->current);
     steer_draft_wg_selection_close(w->journal);
     if(w->store)steer_prototype_store_close(w->store);
@@ -293,6 +296,10 @@ int steer_prototype_wg_open(const char *state,int outer,uint16_t socks,struct st
     }
     rc=recovery(w);
     if(rc)goto fail;
+    if(w->egress){
+        rc=steer_draft_wg_stream_create(w->guard.link,&w->selected,&w->address,&w->route,deadline(),&w->stream);
+        if(rc)goto fail;
+    }
     steer_store_document_destroy(on_disk);
     *out=w;
     return 0;
@@ -327,6 +334,8 @@ static int apply(struct steer_prototype_wg *w,struct parsed *p){
         return 422;
     struct steer_prototype_store_transaction *txn=NULL;
     struct steer_policy *policy=NULL;
+    struct steer_draft_wg_stream *stream=NULL;
+    struct steer_draft_wg_ready candidate;
     struct steer_draft_wg_tx tx={.generation=w->next,.transaction=w->next,.instance=w->next};
     document_digest(tx.plan_digest,p->doc);
     struct steer_draft_wg_candidate c={.config=&p->cfg.kernel,.keys=&keys};
@@ -344,11 +353,20 @@ static int apply(struct steer_prototype_wg *w,struct parsed *p){
     attempted=1;
     w->guard.route=p->egress?&p->route:NULL;
     if(steer_draft_wg_selection_stage(w->journal,&steer_draft_wg_linux_guard_backend,&w->guard,
-        &w->revision,w->port,&tx,&c,d))goto done;
+        &w->revision,w->port,&tx,&c,d,&candidate))goto done;
+    if(p->egress&&steer_draft_wg_stream_create(w->guard.link,&candidate.guard,&p->cfg.kernel.addr[0],
+        &p->route,d,&stream))goto done;
     struct steer_prototype_store_result r=steer_prototype_store_commit(txn);
-    if(r.phase==STEER_PROTOTYPE_STORE_SYNCED&&!r.error.code){choose(w,p);status=200;}
+    if(r.phase==STEER_PROTOTYPE_STORE_SYNCED&&!r.error.code){
+        choose(w,p);
+        steer_draft_wg_stream_destroy(w->stream);
+        w->stream=stream;
+        stream=NULL;
+        status=200;
+    }
     else if(r.phase>=STEER_PROTOTYPE_STORE_RENAMED)w->uncertain=w->fenced=1;
 done:
+    steer_draft_wg_stream_destroy(stream);
     w->guard.route=NULL;
     awg_secrets_wipe(&keys);
     if(txn)steer_prototype_store_abort(txn);
@@ -368,10 +386,7 @@ static uint64_t stream_deadline(void){
     return (uint64_t)now.tv_sec*1000000000u+(uint64_t)now.tv_nsec+50000000u;
 }
 static int egress_live(struct steer_prototype_wg *w,uint64_t d){
-    const struct steer_draft_wg_guard_record *r=&w->selected;
-    if(!w->egress||w->fenced||!r->handle||!d)return 0;
-    return !verify(&w->guard,r,d)&&!awg_dev_route_check_owned_until(r->link.physical_name,
-        r->link.kind,(int)r->ifindex,r->link.group,&w->route,d);
+    return w->egress&&!w->fenced&&!steer_draft_wg_stream_verify(w->stream,d);
 }
 int steer_prototype_wg_request(struct steer_prototype_wg *w,int op,uint64_t expected,
     const char *data,size_t size,char *out,size_t cap,size_t *length){
@@ -413,27 +428,14 @@ uint64_t steer_prototype_wg_revision(const struct steer_prototype_wg *w){
 int steer_prototype_wg_select(const struct steer_prototype_wg *w,uint64_t revision,
     const struct steer_pv1_flow_metadata *flow){
     static const char inlet[]="socks-entry";
-    return w->egress&&!w->fenced&&revision&&revision==w->revision.generation&&w->selected.handle&&
+    return w->egress&&!w->fenced&&revision&&revision==steer_draft_wg_stream_generation(w->stream)&&
         flow->flow_class==STEER_PV1_FLOW_STREAM&&flow->inbound_id.len==sizeof(inlet)-1&&
         !memcmp(flow->inbound_id.data,inlet,sizeof(inlet)-1)&&flow->destination.tag==STEER_PV1_ENDPOINT_IPV4&&
-        flow->destination.address.len==4&&contains(&w->route,flow->destination.address.data);
+        flow->destination.address.len==4&&steer_draft_wg_stream_contains(w->stream,flow->destination.address.data);
 }
 
 uint32_t steer_prototype_wg_bind_stream(void *ctx,int fd,const struct sockaddr_storage *to,uint64_t d){
     struct steer_prototype_wg *w=ctx;
-    struct sockaddr_in source={.sin_family=AF_INET},target;
-    if(!w->egress||w->fenced||!w->selected.handle||to->ss_family!=AF_INET)return STEER_PV1_POLICY_DENIED;
-    memcpy(&target,to,sizeof(target));
-    if(!contains(&w->route,(const uint8_t *)&target.sin_addr))return STEER_PV1_POLICY_DENIED;
-    /* Only a small bounded local netlink read on the owner. No DNS/resolver or
-     * retry to another route. Verify the installed route and link afresh. */
-    uint64_t cap=stream_deadline();
-    if(d>cap)d=cap;
-    const struct steer_draft_wg_guard_record *r=&w->selected;
-    int idx=(int)r->ifindex;
-    if(!egress_live(w,d))return STEER_PV1_POLICY_DENIED;
-    memcpy(&source.sin_addr,w->address.addr,4);
-    if(setsockopt(fd,SOL_SOCKET,SO_BINDTOIFINDEX,&idx,sizeof(idx))||
-       bind(fd,(const struct sockaddr *)&source,sizeof(source)))return STEER_PV1_POLICY_DENIED;
-    return STEER_PV1_OK;
+    if(w->fenced)return STEER_PV1_POLICY_DENIED;
+    return steer_draft_wg_stream_bind(w->stream,fd,to,d);
 }

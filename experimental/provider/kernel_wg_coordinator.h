@@ -81,12 +81,13 @@ typedef int (*steer_draft_wg_verify_ready)(void *,const struct steer_draft_wg_gu
 int steer_draft_wg_selection_startup(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
     void *,const struct steer_draft_wg_revision *,steer_draft_wg_verify_ready,
     uint64_t deadline,uint64_t *next_revision,struct steer_draft_wg_guard_record *selected);
-/* Staging only. Caller may commit the document on success. On NOT_RENAMED
+/* Staging only. Returns exact durable candidate identity, allowing allocation
+ * and validation of its runtime binding before commit. On NOT_RENAMED
  * use startup with the old revision; on RENAMED do not clean either side
  * until the exact document has been durably recovered. */
 int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
     void *,const struct steer_draft_wg_revision *,uint16_t previous_port,
     const struct steer_draft_wg_tx *,const struct steer_draft_wg_candidate *,
-    uint64_t deadline);
+     uint64_t deadline,struct steer_draft_wg_ready *);
 
 #endif
