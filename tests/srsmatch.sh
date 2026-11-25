@@ -148,11 +148,69 @@ check "тело не zlib — отказ" "1" "$?"
 # командой, и именно поэтому такой файл объявлен негодным к применению.
 "$STEER" srs-read "$FIX/telegram.srs" > "$T/one.txt" 2>/dev/null
 check "без --prefixes-out всё в один поток" "30" "$(grep -c . "$T/one.txt")"
-# Непишущийся путь называется до разбора, а не после.
+# Непишущийся путь назван в отказе.
 "$STEER" srs-read "$FIX/youtube.srs" --out /nonexistent-dir/x.lst >/dev/null 2>"$T/e5"
 check "непишущийся путь — отказ" "1" "$?"
 check "и путь назван" "yes" \
     "$(grep -q 'nonexistent-dir' "$T/e5" && echo yes || echo no)"
+
+printf 'старые домены\n' > "$T/old.dom"
+printf 'старые подсети\n' > "$T/old.pfx"
+printf 'старое сужение\n' > "$T/old.meta"
+chmod 0600 "$T/old.dom"
+"$STEER" srs-read "$T/bad.body" --out "$T/old.dom" --prefixes-out "$T/old.pfx" \
+    --meta-out "$T/old.meta" >/dev/null 2>"$T/io.err"
+check "ошибка разбора при трёх выходах — отказ" "1" "$?"
+check "ошибка разбора сохраняет домены" "старые домены" "$(cat "$T/old.dom")"
+check "ошибка разбора сохраняет подсети" "старые подсети" "$(cat "$T/old.pfx")"
+check "ошибка разбора сохраняет сужение" "старое сужение" "$(cat "$T/old.meta")"
+
+"$STEER" srs-read "$FIX/discord.srs" --out "$T/old.dom" --prefixes-out "$T/old.pfx" 2>"$T/io.err"
+check "невыразимый вывод — отказ" "2" "$?"
+check "невыразимый вывод не меняет подсети" "старые подсети" "$(cat "$T/old.pfx")"
+
+"$STEER" srs-read "$FIX/telegram.srs" --out "$T/old.dom" --prefixes-out "$T/no-dir/x" 2>"$T/io.err"
+check "не удалось открыть второй выход — отказ" "1" "$?"
+check "ошибка открытия второго выхода сохраняет первый" "старые домены" "$(cat "$T/old.dom")"
+
+if [ -c /dev/full ]; then
+    "$STEER" srs-read "$FIX/youtube.srs" > /dev/full 2>"$T/io.err"
+    check "сбой записи в stdout — отказ" "1" "$?"
+    check "в отказе назван stdout" "yes" "$(grep -q stdout "$T/io.err" && echo yes || echo no)"
+    "$STEER" srs-read "$FIX/discord.srs" --out "$T/old.dom" --prefixes-out "$T/old.pfx" \
+        --meta-out /dev/full 2>"$T/io.err"
+    check "сбой записи именованного потока — отказ" "1" "$?"
+    check "в отказе назван именованный поток" "yes" "$(grep -q /dev/full "$T/io.err" && echo yes || echo no)"
+    check "до подтверждения записи соседние файлы не заменяются" "старые домены" "$(cat "$T/old.dom")"
+fi
+python3 - "$STEER" "$FIX/telegram.srs" "$T/old.pfx" <<'PY'
+import os
+import subprocess
+import sys
+
+r, w = os.pipe()
+os.close(r)
+try:
+    result = subprocess.run([sys.argv[1], "srs-read", sys.argv[2], "--prefixes-out", sys.argv[3]],
+                            stdout=w, stderr=subprocess.PIPE)
+finally:
+    os.close(w)
+assert result.returncode == 1 and b"stdout" in result.stderr, result
+PY
+check "закрытая труба stdout даёт ошибку записи" "0" "$?"
+check "закрытая труба не меняет файл подсетей" "старые подсети" "$(cat "$T/old.pfx")"
+check "после отказов нет временных выходов" "" "$(find "$T" -name '.steer-srs.*' -print)"
+
+ln -s old.dom "$T/link.dom"
+(umask 027; "$STEER" srs-read "$FIX/discord.srs" --out "$T/link.dom" \
+    --prefixes-out "$T/new.pfx" --meta-out "$T/new.meta" 2>"$T/io.err")
+check "успешная запись именованных выходов" "0" "$?"
+check "ссылка осталась ссылкой" "old.dom" "$(readlink "$T/link.dom")"
+check "домены совпадают с обычным выводом" "" "$(diff "$T/dc.dom" "$T/old.dom")"
+check "подсети совпадают с обычным выводом" "" "$(diff "$T/dc.pfx" "$T/new.pfx")"
+check "сужение совпадает с обычным выводом" "" "$(diff "$T/dc.meta" "$T/new.meta")"
+check "режим прежнего файла сохранён" "600" "$(stat -c %a "$T/old.dom")"
+check "режим нового файла учитывает umask" "640" "$(stat -c %a "$T/new.pfx")"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

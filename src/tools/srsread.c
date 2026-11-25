@@ -13,10 +13,16 @@
  * ЧЕГО ТРИ ФАЙЛА НЕ ВЫРАЖАЮТ (и отвергается кодом 2): исключения («x.com, но не y.x.com»),
  * ограничение по клиенту (source_ip_cidr) и по приложению (package_name). Канал с `srs_files`
  * выражает и это — поэтому, а не ради команды, набор теперь подключается к каналу сам. */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "srs.h"
 #include "srsread.h"
@@ -50,21 +56,6 @@ static int print_elem(void *ctx, const struct srs_elem *el) {
     fprintf(o->pfx, "%u.%u.%u.%u/%d\n", el->addr[0], el->addr[1], el->addr[2], el->addr[3],
             el->plen);
     return 0;
-}
-
-static int srs_dump_set(const struct srs_set *s, const char *path, FILE *dom, FILE *pfx,
-                        FILE *meta);
-
-static int srs_dump_to(const char *path, FILE *dom, FILE *pfx, FILE *meta) {
-    const struct srs_set *s;
-    struct err e = {0};
-    if (srs_open(path, &s, &e) != 0) {
-        fprintf(stderr, "steer: %s\n", e.msg);
-        return 1;
-    }
-    int rc = srs_dump_set(s, path, dom, pfx, meta);
-    srs_release(s);
-    return rc;
 }
 
 static int srs_dump_set(const struct srs_set *s, const char *path, FILE *dom, FILE *pfx,
@@ -153,39 +144,149 @@ static int srs_dump_set(const struct srs_set *s, const char *path, FILE *dom, FI
     return 0;
 }
 
-/* Открыть все выходы, разобрать, закрыть. Выходы открываются ДО разбора: файл, который не
- * удалось создать, надо назвать раньше, чем половина набора уехала в другой. */
+struct output_file {
+    const char *name;       /* как указано пользователем */
+    char *resolved;         /* цель существующей символической ссылки */
+    const char *target;
+    char *temp;             /* только для обычного файла, рядом с target */
+    FILE *file;
+    mode_t mode;
+    struct stat previous;
+    int existed;
+};
+
+static int open_output(struct output_file *out, mode_t create_mode) {
+    char *temp = NULL;
+    struct stat st;
+    const char *target = out->name;
+    int fd = -1;
+    if (lstat(target, &st) == 0 && S_ISLNK(st.st_mode)) {
+        out->resolved = realpath(target, NULL);
+        if (!out->resolved) goto fail;
+        target = out->resolved;
+    }
+    out->target = target;
+    if (lstat(target, &st) == 0) {
+        if (!S_ISREG(st.st_mode) && !S_ISCHR(st.st_mode) && !S_ISFIFO(st.st_mode)) {
+            errno = EINVAL;
+            goto fail;
+        }
+        /* Не подменяем возможность писать в существующий файл правами на каталог. */
+        fd = open(target, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0 || fstat(fd, &out->previous) != 0) goto fail;
+        if ((st.st_mode & S_IFMT) != (out->previous.st_mode & S_IFMT)) {
+            errno = EINVAL;
+            goto fail;
+        }
+        if (!S_ISREG(st.st_mode)) goto stream;
+        out->existed = 1;
+        out->mode = out->previous.st_mode & 0777;
+        int rc = close(fd);
+        fd = -1;
+        if (rc != 0) goto fail;
+    } else {
+        if (errno != ENOENT || out->resolved) goto fail;
+        out->mode = create_mode;
+    }
+    const char *slash = strrchr(target, '/');
+    int dir_len = slash ? (int)(slash + 1 - target) : 0;
+    if (asprintf(&temp, "%.*s.steer-srs.XXXXXX", dir_len, target) < 0) {
+        temp = NULL;
+        goto fail;
+    }
+    fd = mkstemp(temp);
+    if (fd < 0) goto fail;
+    out->temp = temp;
+    temp = NULL;
+stream:
+    out->file = fdopen(fd, "w");
+    if (out->file) return 0;
+fail:
+    fprintf(stderr, "steer: srs: не открыть %s: %s\n", out->name, strerror(errno));
+    if (fd >= 0) close(fd);
+    free(temp);
+    return -1;
+}
+
+/* Сброс/закрытие не скрывают отложенный отказ записи (например, ENOSPC). */
+static int finish_output(struct output_file *out, int check) {
+    FILE *file = out->file;
+    if (!file) return 0;
+    int error = 0;
+    if (check) {
+        if (fflush(file) != 0) error = errno;
+        if (!error && ferror(file)) error = EIO;
+        if (!error && out->temp) {
+            int fd = fileno(file);
+            if (out->existed) {
+                struct stat st;
+                if (fstat(fd, &st) != 0 ||
+                    ((st.st_uid != out->previous.st_uid || st.st_gid != out->previous.st_gid) &&
+                     fchown(fd, out->previous.st_uid, out->previous.st_gid) != 0))
+                    error = errno;
+            }
+            if (!error && (fchmod(fd, out->mode) != 0 || fsync(fd) != 0)) error = errno;
+        }
+    }
+    if (file != stdout && fclose(file) != 0 && !error) error = errno;
+    if (!check || !error) return 0;
+    fprintf(stderr, "steer: srs: %s не записался до конца: %s\n",
+            out->name ? out->name : "stdout", strerror(error));
+    return -1;
+}
+
 int srs_dump(const char *path, const char *dom_path, const char *pfx_path,
              const char *meta_path) {
-    FILE *dom = stdout, *pfx = stdout, *meta = NULL;
-    if (dom_path && !(dom = fopen(dom_path, "w"))) {
-        fprintf(stderr, "steer: srs: не создался %s\n", dom_path);
+    const struct srs_set *s;
+    struct err e = {0};
+    if (srs_open(path, &s, &e) != 0) {
+        fprintf(stderr, "steer: %s\n", e.msg);
         return 1;
     }
-    if (pfx_path && !(pfx = fopen(pfx_path, "w"))) {
-        fprintf(stderr, "steer: srs: не создался %s\n", pfx_path);
-        if (dom != stdout) fclose(dom);
+    /* EPIPE тоже должен пройти через обычную очистку временных файлов. */
+    struct sigaction ignore = { .sa_handler = SIG_IGN }, previous;
+    sigemptyset(&ignore.sa_mask);
+    if (sigaction(SIGPIPE, &ignore, &previous) != 0) {
+        fprintf(stderr, "steer: srs: не обработать SIGPIPE: %s\n", strerror(errno));
+        srs_release(s);
         return 1;
     }
-    if (meta_path && !(meta = fopen(meta_path, "w"))) {
-        fprintf(stderr, "steer: srs: не создался %s\n", meta_path);
-        if (dom != stdout) fclose(dom);
-        if (pfx != stdout && pfx != dom) fclose(pfx);
-        return 1;
+    struct output_file out[] = {
+        { .name = dom_path }, { .name = pfx_path }, { .name = meta_path },
+        { .file = dom_path && pfx_path ? NULL : stdout },
+    };
+    const size_t count = sizeof(out) / sizeof(*out);
+    mode_t mask = umask(0);
+    umask(mask);
+    int rc = 1;
+    for (size_t i = 0; i < count; i++)
+        if (out[i].name && open_output(&out[i], 0666 & ~mask) != 0) goto done;
+    rc = srs_dump_set(s, path, dom_path ? out[0].file : stdout,
+                      pfx_path ? out[1].file : stdout, out[2].file);
+done:
+    srs_release(s);
+    for (size_t i = 0; i < count; i++)
+        if (finish_output(&out[i], rc == 0) != 0) rc = 1;
+
+    /* Ничего не заменяем до конца чтения и записи всех потоков. Каждое имя
+     * заменяется одним rename, но это не общая транзакция нескольких имён. */
+    for (size_t i = 0; !rc && i < count; i++) {
+        if (!out[i].temp) continue;
+        if (rename(out[i].temp, out[i].target) != 0) {
+            fprintf(stderr, "steer: srs: не заменить %s: %s\n", out[i].name, strerror(errno));
+            rc = 1;
+        } else {
+            free(out[i].temp);
+            out[i].temp = NULL;
+        }
     }
-    int rc = srs_dump_to(path, dom, pfx, meta);
-    /* Закрытие проверяется: на полном overlay ошибка приходит именно здесь, при сбросе буфера. */
-    if (dom != stdout && fclose(dom) != 0) {
-        fprintf(stderr, "steer: srs: %s не записался до конца\n", dom_path);
-        rc = rc ? rc : 1;
+    for (size_t i = 0; i < count; i++) {
+        if (out[i].temp) {
+            unlink(out[i].temp);
+            free(out[i].temp);
+        }
+        free(out[i].resolved);
     }
-    if (pfx != stdout && pfx != dom && fclose(pfx) != 0) {
-        fprintf(stderr, "steer: srs: %s не записался до конца\n", pfx_path);
-        rc = rc ? rc : 1;
-    }
-    if (meta && fclose(meta) != 0) {
-        fprintf(stderr, "steer: srs: %s не записался до конца\n", meta_path);
-        rc = rc ? rc : 1;
-    }
+    (void)sigaction(SIGPIPE, &previous, NULL);
     return rc;
 }
