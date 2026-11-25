@@ -473,7 +473,7 @@ static void table_pipe_lost(void) {
     epoll_ctl(g_epfd, EPOLL_CTL_DEL, g_table_fd, NULL);
     close(g_table_fd);
     g_table_fd = -1;
-    g_table_feed.len = 0;             /* недописанная таблица умершего демона — не наша */
+    tabfmt_feed_reset(&g_table_feed);  /* недописанная таблица умершего демона — не наша */
     if (!g_running) return;           /* SIGTERM уже пришёл: это остановка, а не пропажа */
     if (g_orphan_sec <= 0 || g_adopt_fd < 0) {
         fprintf(stderr, "steer dnsd: труба таблицы закрыта родителем — выходим\n");
@@ -505,7 +505,7 @@ int table_pipe_take(int fd, long *waited) {
     tev.data.ptr = &g_table_fd;
     if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &tev) != 0) return -1;
     g_table_fd = fd;
-    g_table_feed.len = 0;
+    tabfmt_feed_reset(&g_table_feed);
     *waited = g_orphan_since ? (long)(mono_sec() - g_orphan_since) : 0;
     g_orphan_since = 0;
     return 0;

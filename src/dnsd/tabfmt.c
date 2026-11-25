@@ -385,6 +385,12 @@ int tabfmt_parse(const char *buf, size_t len) {
 
 /* ---- приёмник из трубы: буферизация между вызовами epoll ---------------------------------- */
 
+void tabfmt_feed_reset(struct tabfmt_feed *st) {
+    st->len = 0;
+    st->scan_pos = 0;
+    st->scan_lines = 0;
+}
+
 int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
     if (n) {
         if (st->len + n > TABFMT_FEED_MAX) return -1;
