@@ -184,6 +184,9 @@ LIBSTEER_1 {
     qc_stream_send;
     reality_build_hello_carry;
     registry_assign;
+    registry_plan;
+    registry_publish;
+    registry_render;
     rtnl_addrs6;
     rtnl_default6;
     rtnl_default_devs;

@@ -114,6 +114,16 @@ $(BUILD)/client-delivery-steer: $(CLIENT_SRC) src/lib/ctlcall.h src/platform/pla
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(CLIENT_SRC)
 
+# Настоящие check/plan/commit с подставным nft, без доступа к сетевым сокетам ядра.
+.PHONY: registry-test
+registry-test: $(BUILD)/steerd-registry-test
+	@python3 tests/registrymatch.py $<
+
+$(BUILD)/steerd-registry-test: tests/registry-backend.c $(CORE_SRC) $(CORE_HDR) VERSION
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) $< \
+	    -Wl,--wrap=socket,--wrap=steer_rt_tables_dir,--wrap=steer_tmp_template
+
 # Серверная половина обфускации (VPS, server/install.sh и архив steer-obfs-<версия>-<арх>.tar.gz в build.sh):
 # программа плагина obfs из тех же исходников (PROFILE_plug_obfs) — её команда obfs-server. Ядро (steerd)
 # этой команды с 2.1 не несёт, клиент сокета build/steer — тем более; без своей цели установка из исходников
@@ -136,7 +146,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: $(BUILD)/loopfairmatch $(BUILD)/fakeipadmissionmatch $(BUILD)/clock64match $(BUILD)/tunreadermatch
+test: registry-test $(BUILD)/loopfairmatch $(BUILD)/fakeipadmissionmatch $(BUILD)/clock64match $(BUILD)/tunreadermatch
 test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/nldonematch $(BUILD)/b3match $(BUILD)/subpq $(BUILD)/abihost $(BUILD)/abihost-static $(BUILD)/steerd-static $(BUILD)/pluginmodel $(BUILD)/pkhooks $(BUILD)/pkmatch $(BUILD)/pmkindmatch $(BUILD)/foprobematch $(BUILD)/tunfloodmatch $(BUILD)/hsdlmatch $(BUILD)/httpcspinmatch
 	@$(BUILD)/loopfairmatch
 	@$(BUILD)/clock64match

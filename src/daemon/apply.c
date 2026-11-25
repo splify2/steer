@@ -51,8 +51,8 @@ static int table_has_default(int table);    /* ниже, у apply-commit */
  * но копятся с каждым переименованием и засоряют `ip rule show` ровно тогда,
  * когда по нему пытаются понять, куда ушёл трафик.
  *
- * Снимок прежнего реестра берётся ДО registry_assign — тот перезаписывает файл
- * текущими выходами, и после него сравнивать уже не с чем. Живой считается метка,
+ * Снимок прежнего реестра берётся до публикации новых назначений: иначе сравнивать
+ * уже не с чем. Живой считается метка,
  * которую несёт ЛЮБОЙ текущий недирект-выход: устройство здесь не проверяется
  * нарочно, у vless его создаёт сам процесс туннеля, и снять правило выхода за то,
  * что его устройство ещё не поднялось, значило бы обрубить туннель на ровном
@@ -525,11 +525,10 @@ static void apply_prepare(const char *spec, struct spec *cfg, struct groups *gr,
         e.msg[0] = '\0';
     }
     if (load_spec_mode(spec, cfg, &e, strict ? LOAD_STRICT : LOAD_PREPARED) < 0) err_die(&e);
-    /* Снимок реестра — строго до registry_assign: тот перезапишет файл текущими
-     * выходами, и метки удалённых/переименованных будут потеряны вместе с
-     * единственным способом снять их правила из ядра. */
+    /* И проверка, и применение считают от прежнего реестра. Кандидат не должен
+     * вытеснять из него метки работающих выходов, пока его только проверяют. */
     registry_snapshot();
-    if (registry_assign(cfg, &e) < 0) err_die(&e);
+    if (registry_plan(cfg, &e) < 0) err_die(&e);
     tcp_redir_learn(cfg);
     if (!full) {
         outputs_adopt_active(cfg);
@@ -809,6 +808,8 @@ int cmd_apply(const char *spec, int dry) {
         return 0;
     }
 
+    char *reg = registry_render(&cfg, &e);
+    if (!reg) err_die(&e);
     /* ПОРЯДОК: МАРШРУТИЗАЦИЯ ДО НАБОРА ПРАВИЛ.
      *
      * Прежде набор правил грузился первым, а правила fwmark и таблицы выходов ставились следом.
@@ -837,7 +838,9 @@ int cmd_apply(const char *spec, int dry) {
      * без устройства (blackhole при on_fail=drop), а причина уже названа в журнале. */
     awg_apply_all(&cfg);
     apply_routing(&cfg);
-    if (ruleset_load(&cfg, &gr) != 0) return 1;
+    if (ruleset_load(&cfg, &gr) != 0) { free(reg); return 1; }
+    registry_publish(&cfg, reg);
+    free(reg);
     failopen_after_load(&cfg);
     tcp_redir_after_load(&cfg);
     /* Карта balance из набора правил — «все члены живы»; сразу к живым по подхвату, как её
@@ -1095,6 +1098,9 @@ int cmd_apply_commit(int argc, char **argv) {
     static struct spec cfg;
     static struct groups gr;
     apply_prepare(a.spec, &cfg, &gr, a.ruleset, a.nftc, a.ruleset, 0);
+    struct err e = {0};
+    char *reg = registry_render(&cfg, &e);
+    if (!reg) err_die(&e);
     /* Порядок — как у подкоманды (cmd_apply, «ПОРЯДОК»): устройства kind=awg, привязка выходов,
      * и только потом набор правил — чтобы новая метка не существовала без своего правила. Этим
      * путём идёт и старт демона (--apply: первый apply применяет всё). */
@@ -1103,7 +1109,7 @@ int cmd_apply_commit(int argc, char **argv) {
         if (name_in_list(a.route, cfg.out[i].name)) apply_routing_one(&cfg.out[i]);
     if (a.ruleset) {
         counters_load();
-        if (ruleset_load(&cfg, &gr) != 0) return 1;
+        if (ruleset_load(&cfg, &gr) != 0) { free(reg); return 1; }
         /* Ожидаемое для сверки демона с ядром — сразу после nft -f: правка таблицы снаружи за то
          * время, что идёт остальное, иначе вошла бы в ожидаемое (шапка recon.c, «СВЕРКА С
          * ЯДРОМ»). Строка — в stdout; демон вырезает её из ответа. Вместе с отпечатком — сводка
@@ -1145,6 +1151,8 @@ int cmd_apply_commit(int argc, char **argv) {
     }
     if (a.masq && plat()->iptables_masq) iptables_masq_sync(&cfg);
     else if (a.masq_ensure && plat()->iptables_masq) iptables_masq_ensure(&cfg);
+    registry_publish(&cfg, reg);
+    free(reg);
     /* Починка (только --rule и --masq-ensure) — не применение: снимок status описывает то же, что
      * и до неё, а отчёты apply о зависимостях и итоговая строка в журнале демона были бы
      * повтором последнего apply. */
