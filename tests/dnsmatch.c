@@ -97,6 +97,13 @@ static void check_table_adoption(void) {
           tabfmt_feed(&g_table_feed, "\n", 1));
     check("adoption: действует новая полная таблица", 1,
           g_dch_n == 1 && !strcmp(g_dch[0].set, "new_set"));
+    {
+        const char bad[] = "2\npartial|out|0|4|x\nbroken\n";
+        check("ошибочная полная таблица отклонена", -1,
+              tabfmt_parse(bad, sizeof(bad) - 1));
+        check("ошибочная таблица сохраняет last-good", 1,
+              g_dch_n == 1 && !strcmp(g_dch[0].set, "new_set"));
+    }
 
     close(new_pipe[0]);
     close(new_pipe[1]);
