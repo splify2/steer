@@ -1,0 +1,67 @@
+#ifndef STEER_DRAFT_KERNEL_WG_COORDINATOR_H
+#define STEER_DRAFT_KERNEL_WG_COORDINATOR_H
+
+#include "kernel_wg_guard_record.h"
+#include "../spec/execution_journal.h"
+
+/* Isolated, synchronous worker profile. No network backend is implicit. All
+ * callbacks are serialized and must verify the pinned/current netns and boot
+ * against the owned identity, respect the deadline and refuse foreign state.
+ * No name-only adoption, no network helpers selected by config or fallback. */
+struct steer_draft_wg_backend {
+    int (*create_down)(void *,const struct steer_draft_wg_identity *,int mtu,uint64_t,int *);
+    int (*stage_down)(void *,const struct steer_draft_wg_identity *,int,const struct awg_conf *,
+        const struct awg_secrets *,uint32_t mark,uint64_t);
+    /* bind exclusive DROP if publish==0; replace the exact prior guard otherwise.
+     * A CHANGED result must report the captured new handle, even on error.
+     * UNCHANGED must be a fact; return EFFECT_UNCERTAIN for unknown results. */
+    int (*guard)(void *,const struct steer_draft_wg_guard_record *,int publish,uint64_t,
+        uint32_t *effect,uint64_t *handle);
+    /* Verify exact owned DOWN link and exact DROP guard before bringing it UP. */
+    int (*up)(void *,const struct steer_draft_wg_guard_record *,uint64_t);
+    int (*retire_link)(void *,const struct steer_draft_wg_identity *,uint64_t);
+    /* Fresh lookup by exact recorded inet table name. Successful absence
+     * reports 0 + empty comment; errors must never be reported as absence. */
+    int (*lookup_guard)(void *,const struct steer_draft_wg_guard_record *,uint64_t,
+        uint64_t *,char comment[256]);
+    /* Recheck captured ifindex is absent and delete only by exact table
+     * marker+handle (not name); success means that exact guard is absent. */
+    int (*retire_guard)(void *,const struct steer_draft_wg_guard_record *,uint64_t);
+};
+
+struct steer_draft_wg_tx {
+    uint64_t transaction,generation,instance;
+    uint8_t plan_digest[32];
+};
+
+struct steer_draft_wg_candidate {
+    struct steer_draft_wg_identity link;
+    /* Minted by the prepared guard before any mutation. */
+    char table[26],marker[42];
+    const struct awg_conf *config;
+    const struct awg_secrets *keys; /* borrowed, caller wipes */
+    uint32_t mark;
+};
+
+struct steer_draft_wg_ready {
+    struct steer_draft_wg_guard_record guard;
+    uint16_t listen_port;
+};
+
+/* Positive errno. On failure ready stays unchanged and cleanup_error reports
+ * whether candidate cleanup is still needed. The previous generation is never
+ * mutated here. Caller owns promotion/commit and retirement of the previous
+ * generation. Only disjoint listen ports; the isolated caller must also
+ * provision disjoint prefixes/routes and other resources. */
+int steer_draft_wg_coordinator_apply(struct steer_spec_journal *,const struct steer_draft_wg_backend *,
+    void *,const struct steer_draft_wg_tx *,const struct steer_draft_wg_candidate *,
+    const struct steer_draft_wg_ready *previous,uint64_t deadline,const atomic_uint *cancel,
+    struct steer_draft_wg_ready *ready,int *cleanup_error);
+
+/* Clean up one explicitly selected transaction (never decide which generation
+ * to keep). After a complete journal scan: link first, then exact guard.
+ * A lost guard outcome leaves a matching-marker table unresolved, not owned. */
+int steer_draft_wg_coordinator_recover(struct steer_spec_journal *,const struct steer_draft_wg_backend *,
+    void *,const struct steer_draft_wg_tx *,uint64_t deadline);
+
+#endif
