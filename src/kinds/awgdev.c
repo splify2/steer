@@ -823,6 +823,20 @@ static int link_query_until(const char *ifname,char *kind,size_t kn,int *index,c
     return 0;
 }
 int awg_dev_link_query(const char *ifname,char *kind,size_t kn,int *index){return link_query_until(ifname,kind,kn,index,NULL,0,NULL,NULL,0);}
+int awg_dev_link_index_until(int index,uint64_t deadline){
+    if(index<=0||!deadline)return EINVAL;
+    int fd=nl_open(NETLINK_ROUTE);
+    if(fd<0)return errno;
+    _Alignas(8) uint8_t buf[128];
+    struct nlbuf b;
+    struct ifinfomsg ifi={.ifi_family=AF_UNSPEC,.ifi_index=index};
+    struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),RTM_GETLINK,NLM_F_REQUEST|NLM_F_ACK,
+        next_seq(),&ifi,sizeof(ifi));
+    struct link_ctx result={0};
+    int rc=nl_talk_until(fd,buf,msg_end(&b,h),link_cb,&result,deadline);
+    close(fd);
+    return rc?rc:result.index==index?0:EPROTO;
+}
 int awg_dev_link_query_marked(const char *ifname,char *kind,size_t kn,int *index,char *marker,size_t mn){
     if(!marker||!mn||!ifname||!*ifname||strlen(ifname)>=IFNAMSIZ)return EINVAL;
     marker[0]=0;return link_query_until(ifname,kind,kn,index,marker,mn,NULL,NULL,0);

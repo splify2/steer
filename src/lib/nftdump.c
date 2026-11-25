@@ -288,6 +288,78 @@ long nfd_set_count(uint8_t family, const char *table, const char *set) {
 
 /* ---- наличие ------------------------------------------------------------------------------- */
 
+/* Ownership checks are stricter than stats/dumps: duplicate or malformed
+ * identity fields must not be interpreted as absence or a matching marker. */
+struct exact_table { const char *name; struct nfd_exact_table table; int valid; };
+
+static int exact_comment(const struct nlattr *a,char dst[256]){
+    size_t left=nla_size(a);
+    const uint8_t *p=nla_ptr(a);
+    int found=0;
+    while(left){
+        if(left<2||(size_t)p[1]+2>left)return EPROTO;
+        size_t n=p[1];
+        if(p[0]==NFD_UDATA_COMMENT){
+            if(found++||!n||memchr(p+2,0,n)!=p+2+n-1)return EPROTO;
+            memcpy(dst,p+2,n);
+        }
+        left-=n+2;
+        p+=n+2;
+    }
+    return 0;
+}
+
+static void exact_table_reply(const struct nlmsghdr *h,void *arg){
+    struct exact_table *r=arg;
+    const unsigned head=NLMSG_HDRLEN+NLMSG_ALIGN(sizeof(struct nfgenmsg));
+    if(r->valid||h->nlmsg_len<head||!msg_is(h,NFT_MSG_NEWTABLE)||msg_family(h)!=NFPROTO_INET){
+        r->valid=-1;return;
+    }
+    r->valid=-1;
+    enum { TABLE_USERDATA=6 }; /* stable UAPI, including builds against pre-comment headers */
+    const struct nlattr *name=NULL,*handle=NULL,*userdata=NULL;
+    const uint8_t *p=(const uint8_t *)h+head;
+    size_t left=h->nlmsg_len-head;
+    while(left){
+        if(left<NLA_HDRLEN)return;
+        const struct nlattr *a=(const void *)p;
+        const struct nlattr **slot=NULL;
+        size_t aligned=NLA_ALIGN(a->nla_len);
+        if(a->nla_len<NLA_HDRLEN||aligned>left)return;
+        switch(a->nla_type&NLA_TYPE_MASK){
+            case NFTA_TABLE_NAME:slot=&name;break;
+            case NFTA_TABLE_HANDLE:slot=&handle;break;
+            case TABLE_USERDATA:slot=&userdata;break;
+        }
+        if(slot){if(*slot)return;*slot=a;}
+        left-=aligned;
+        p+=aligned;
+    }
+    const size_t want=strlen(r->name)+1;
+    if(!name||nla_size(name)!=want||memcmp(nla_ptr(name),r->name,want)||
+       !handle||nla_size(handle)!=8||!nla_be64(handle)||
+       (userdata&&exact_comment(userdata,r->table.comment)))return;
+    r->table.handle=nla_be64(handle);
+    r->valid=1;
+}
+
+int nfd_exact_inet_until(const char *name,struct nfd_exact_table *out,uint64_t deadline){
+    if(!out)return EINVAL;
+    *out=(struct nfd_exact_table){0};
+    if(!name||!*name||strnlen(name,NFD_NAME)==NFD_NAME||!deadline)return EINVAL;
+    int fd=nfd_open();
+    if(fd<0)return errno;
+    struct exact_table reply={.name=name};
+    int rc=nfd_talk_until(fd,NFT_MSG_GETTABLE,0,NFPROTO_INET,NFTA_TABLE_NAME,name,
+        0,NULL,exact_table_reply,&reply,deadline);
+    close(fd);
+    if(rc==ENOENT&&!reply.valid)return 0;
+    if(rc)return rc;
+    if(reply.valid!=1)return EPROTO;
+    *out=reply.table;
+    return 0;
+}
+
 int nfd_table_exists(uint8_t family, const char *table) {
     int fd = nfd_open();
     if (fd < 0) return 0;

@@ -55,4 +55,18 @@ struct steer_pv1_error steer_draft_kernel_wg_guard_destroy(struct steer_draft_ke
  * a table observed by name. Until reconciled, uncertain handles refuse destroy. */
 struct steer_pv1_error steer_draft_kernel_wg_guard_reconcile_absent(struct steer_draft_kernel_wg_guard *);
 const char *steer_draft_kernel_wg_guard_table(const struct steer_draft_kernel_wg_guard *);
+
+struct steer_draft_wg_guard_record;
+/* Enables managed use of this prepared guard, assigning its marker before
+ * the first effect. Copy the plan into the durable intent before bind. */
+int steer_draft_kernel_wg_guard_plan(struct steer_draft_kernel_wg_guard *,char table[26],char marker[42]);
+/* A CHANGED result carries the exact newly created handle, even on a tool
+ * error. Recovery after UNCERTAIN does not adopt a marker-only match. */
+struct steer_draft_kernel_wg_guard_result steer_draft_kernel_wg_guard_apply_owned(
+    struct steer_draft_kernel_wg_guard *,const struct steer_draft_wg_guard_record *,
+    int pinned_netns_fd,int publish,uint64_t deadline,uint64_t *captured_handle);
+int steer_draft_kernel_wg_guard_retire_record(const struct steer_draft_wg_guard_record *,
+    int pinned_netns_fd,uint64_t deadline);
+/* Memory only. Managed callers retain kernel responsibility in the journal. */
+void steer_draft_kernel_wg_guard_forget_prepared(struct steer_draft_kernel_wg_guard *);
 #endif

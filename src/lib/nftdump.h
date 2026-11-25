@@ -54,6 +54,12 @@ long nfd_set_count(uint8_t family, const char *table, const char *set);
 int nfd_table_exists(uint8_t family, const char *table);
 int nfd_chain_exists(uint8_t family, const char *table, const char *chain);
 
+/* Exact inet GETTABLE (not a dump), with an absolute monotonic deadline.
+ * Success with handle zero means ENOENT; a present table may lack a comment.
+ * Errors (including malformed replies) never count as absence. */
+struct nfd_exact_table { uint64_t handle; char comment[256]; };
+int nfd_exact_inet_until(const char *,struct nfd_exact_table *,uint64_t deadline);
+
 /* Отпечаток таблиц ИМЯ для сверки демона с ядром (src/daemon/recon.c): FNV-1a 64 по цепочкам,
  * правилам по порядку и заголовкам наборов — без номеров объектов, без состояния выражений
  * (counter, quota, last) и без элементов наборов (их кладут резолвер и сторож; что входит и
