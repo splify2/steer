@@ -14,8 +14,9 @@ make -C steer-ui NANO=1 test
 
 Ядро лежит в `steer/build/nano/steer-nano`. Оно собрано с `-Os`,
 удалением неиспользуемых секций и символов. Включены Linux loopback,
-управляемый вход SOCKS5 TCP, вход/выход plain VLESS TCP, правила и revisioned Apply. Этот
-профиль не включает QUIC/TLS Hysteria2, управляемый WireGuard и захват
+управляемые вход и выход SOCKS5 CONNECT TCP и plain VLESS TCP, правила и
+revisioned Apply. `nano-test` проверяет входы, оба прокси-выхода и
+восстановление конфигурации. Профиль не включает QUIC/TLS Hysteria2, управляемый WireGuard и захват
 трафика. Отсутствующие возможности не обещаются конфигурацией или UI.
 
 Бинарник панели — `steer-ui/build/steer-ui-nano`. Передайте

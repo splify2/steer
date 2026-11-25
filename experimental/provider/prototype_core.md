@@ -176,6 +176,42 @@ python3 steer/experimental/provider/prototype_vless_outbound_test.py \
   --core /tmp/steer-provider-build/steer-prototype --xray /path/to/xray
 ```
 
+### Managed SOCKS5 TCP outbound
+
+The local provider Makefile also builds a source-linked SOCKS5 CONNECT backend.
+For an unauthenticated upstream, use an empty `options: {}`. For USERPASS use
+two typed environment references:
+
+```yaml
+secrets:
+  proxy-user: {source: env, kind: username, name: STEER_SOCKS_USER}
+  proxy-pass: {source: env, kind: password, name: STEER_SOCKS_PASSWORD}
+outbounds:
+  via-socks:
+    plugin: socks:proxy
+    endpoint: {address: 127.0.0.1, port: 1081}
+    options:
+      username: {secret: proxy-user}
+      password: {secret: proxy-pass}
+```
+
+Select `via-socks` in a TCP routing rule or as the TCP-only default.
+The upstream endpoint is numeric; the requested target can be IPv4, IPv6, or
+a domain forwarded unchanged to the peer. The backend waits for the complete
+CONNECT reply under one absolute deadline, then transfers the same stream to
+the host relay without reading ahead. An upstream error never falls back to
+`direct`. Credential values are not stored in the intent or status. The wire
+authentication exchange is plaintext and cannot downgrade to NOAUTH. BIND,
+UDP ASSOCIATE, TLS, detours and dynamic provider loading are not supported.
+
+`integration-test` runs a separate Steer SOCKS5 fixture plus wire-level edge
+cases. For the independent upstream, run from the hub:
+
+```sh
+python3 steer/experimental/provider/prototype_socks_outbound_test.py \
+  --core /tmp/steer-provider-build/steer-prototype --xray /path/to/xray --wire-cases
+```
+
 ### Optional Hysteria2 server build
 
 On the optional HY2 server build, merge the following entries into the
@@ -238,7 +274,8 @@ revision internally, then prepares/commits atomically on the loop shard.
   `id`, `protocol`, `address`, `port`. `capabilities.spec_v3_profile` advertises
   `linked-socks-v1` for compatibility; `capabilities.spec_v3_vless_tcp: true`
    advertises plain VLESS inbound; `capabilities.spec_v3_vless_tcp_outbound: true`
-   indicates the linked outbound above. `capabilities.spec_v3_hysteria2: true`
+   indicates the linked VLESS outbound above. `capabilities.spec_v3_socks_tcp_outbound: true`
+   indicates the linked SOCKS5 outbound. `capabilities.spec_v3_hysteria2: true`
   advertises the QUIC/TLS TCP+UDP HY2 tuple, not general v3 execution.
 - `GET`: one atomic `{revision,persistence,durability_uncertain,document}` envelope with the
   canonical configuration, including environment references only.

@@ -65,8 +65,9 @@ nano-test: nano
 	python3 -B experimental/provider/prototype_persistence_test.py $(NANO_BUILD)/steer-nano
 	$(MAKE) -C experimental/provider BUILD=$(NANO_BUILD) SDK=$(NANO_SDK) PROTOCOLS=$(NANO_PROTOCOLS) \
 		CFLAGS="-Os -std=c11 -Wall -Wextra -Werror -pedantic -ffunction-sections -fdata-sections" \
-		LDFLAGS="-Wl,--gc-sections" $(NANO_BUILD)/vless-loopback
+		LDFLAGS="-Wl,--gc-sections" $(NANO_BUILD)/vless-loopback $(NANO_BUILD)/socks-loopback
 	python3 -B experimental/provider/prototype_vless_outbound_test.py --core $(NANO_BUILD)/steer-nano --fixture $(NANO_BUILD)/vless-loopback
+	python3 -B experimental/provider/prototype_socks_outbound_test.py --core $(NANO_BUILD)/steer-nano --fixture $(NANO_BUILD)/socks-loopback --wire-cases
 else ifeq ($(NANO),0)
 all: $(BUILD)/steerd $(BUILD)/steer
 else

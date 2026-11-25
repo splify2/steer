@@ -7,13 +7,13 @@ SDK ?= ../../../plugin-sdk
 PROTOCOLS ?= ../../../steer-protocols
 CPPFLAGS += -I$(SDK)/include -I../../src/daemon -I$(PROTOCOLS)/src -I$(PROTOCOLS)/src/socks5 -I$(PROTOCOLS)/src/vless
 CPPFLAGS += -I../../src/lib -I../../src/third_party/libyaml -DHAVE_CONFIG_H -D_POSIX_C_SOURCE=200809L
-CPPFLAGS += -DSTEER_PROTOTYPE_VLESS_OUTBOUND
+CPPFLAGS += -DSTEER_PROTOTYPE_VLESS_OUTBOUND -DSTEER_PROTOTYPE_SOCKS_OUTBOUND
 STREAM_SRC = stream.c buffers.c operations.c ../../src/daemon/loop.c
 ROUTE_STREAM_SRC = $(STREAM_SRC) stream_backend.c binding_lease.c flow_metadata.c route_stream.c
 CONFIG_SRC = prototype_config.c ../spec/spec.c ../../src/lib/ynode.c ../../src/lib/err.c ../../src/lib/jsonw.c \
     ../../src/third_party/libyaml/api.c ../../src/third_party/libyaml/reader.c \
     ../../src/third_party/libyaml/scanner.c ../../src/third_party/libyaml/parser.c
-HOST_SRC = $(ROUTE_STREAM_SRC) native_stream_backend.c vless_stream_backend.c $(CONFIG_SRC) loopback_host.c prototype_prepare.c prototype_store.c route_dial.c resolver.c policy.c policy_route.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/vless/inbound.c $(PROTOCOLS)/src/vless/outbound.c
+HOST_SRC = $(ROUTE_STREAM_SRC) native_stream_backend.c vless_stream_backend.c socks_stream_backend.c $(CONFIG_SRC) loopback_host.c prototype_prepare.c prototype_store.c route_dial.c resolver.c policy.c policy_route.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/socks5/outbound.c $(PROTOCOLS)/src/vless/inbound.c $(PROTOCOLS)/src/vless/outbound.c
 LDLIBS += -pthread
 UNIT_NAMES = buffers operations admission host lifecycle stream stream-backend stream-backend-fairness policy route-dial prototype-config resolver route-domain prototype-store inbound-tls
 UNIT_NAMES += route-stream route-stream-release datagram-routes datagram-registry datagram flow-metadata binding-lease vless-stream vless-stream-deadline
@@ -87,7 +87,7 @@ $(BUILD)/steer-prototype-startup-signal: $(HOST_SRC) prototype_main.c prototype_
 
 # Header changes must invalidate every lab binary, including sibling SDK changes.
 $(UNITS) $(BUILD)/socks-loopback $(BUILD)/vless-loopback $(BUILD)/steer-prototype: $(wildcard *.h $(SDK)/include/steer/draft/*.h)
-$(BUILD)/socks-loopback $(BUILD)/vless-loopback $(BUILD)/steer-prototype $(BUILD)/steer-prototype-startup-signal: $(PROTOCOLS)/src/socks5/codec.h $(PROTOCOLS)/src/vless/inbound.h $(PROTOCOLS)/src/vless/outbound.h ../../src/daemon/loop.h
+$(BUILD)/socks-loopback $(BUILD)/vless-loopback $(BUILD)/steer-prototype $(BUILD)/steer-prototype-startup-signal: $(PROTOCOLS)/src/socks5/codec.h $(PROTOCOLS)/src/socks5/outbound.h $(PROTOCOLS)/src/vless/inbound.h $(PROTOCOLS)/src/vless/outbound.h ../../src/daemon/loop.h
 $(BUILD)/prototype-config-test $(BUILD)/prototype-store-test $(BUILD)/socks-loopback $(BUILD)/vless-loopback $(BUILD)/steer-prototype $(BUILD)/steer-prototype-startup-signal: ../spec/spec.h
 $(BUILD)/stream-test: ../../src/daemon/loop.h
 
@@ -99,6 +99,7 @@ integration-test: $(BUILD)/socks-loopback $(BUILD)/vless-loopback $(BUILD)/steer
 	$(PYTHON) vless_loopback_test.py $(BUILD)/vless-loopback
 	$(PYTHON) prototype_test.py $(BUILD)/steer-prototype
 	$(PYTHON) prototype_vless_outbound_test.py --core $(BUILD)/steer-prototype --fixture $(BUILD)/vless-loopback
+	$(PYTHON) prototype_socks_outbound_test.py --core $(BUILD)/steer-prototype --fixture $(BUILD)/socks-loopback --wire-cases
 	$(PYTHON) prototype_persistence_test.py $(BUILD)/steer-prototype
 	$(PYTHON) prototype_startup_signal_test.py $(BUILD)/steer-prototype-startup-signal
 test: unit-test integration-test
@@ -125,7 +126,7 @@ $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype-hy2-fault: $(HOST_SRC) $(H
 $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype-hy2-fault: $(wildcard $(PROTOCOLS)/src/hysteria2/*.h $(PROTOCOLS)/src/hysteria2/*.inc) \
     ../../src/proto/quic/quic.h ../../src/proto/quic/qcssl.h ../spec/spec.h \
     $(wildcard $(SDK)/include/steer/draft/*.h) ../../src/daemon/loop.h \
-    $(PROTOCOLS)/src/socks5/codec.h $(PROTOCOLS)/src/vless/inbound.h $(PROTOCOLS)/src/vless/outbound.h \
+    $(PROTOCOLS)/src/socks5/codec.h $(PROTOCOLS)/src/socks5/outbound.h $(PROTOCOLS)/src/vless/inbound.h $(PROTOCOLS)/src/vless/outbound.h \
     $(if $(NGTCP2_LIB),$(NGTCP2_LIB) $(NGTCP2_LIB).cflags) $(if $(WOLFSSL_SERVER_LIB),$(WOLFSSL_SERVER_LIB) $(WOLFSSL_SERVER_LIB).cflags)
 $(BUILD)/prototype-prepare-test: prototype_prepare_test.c prototype_prepare.c inbound_tls.c $(CONFIG_SRC) policy.c \
     ../../src/daemon/loop.c ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c $(wildcard *.h) | $(BUILD)

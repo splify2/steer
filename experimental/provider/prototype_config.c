@@ -267,12 +267,12 @@ static struct steer_pv1_error compile_policy(struct steer_prototype_config *c,
     const struct steer_policy_rule *all,uint32_t total,const struct steer_policy_rule *active,
     uint32_t count,uint32_t fallback){
     struct steer_pv1_error e=steer_policy_compile_stream(c->generation,all,total,fallback,
-        c->vless_outbound_count,&c->policy);
+        c->stream_outbound_count,&c->policy);
     if(e.code||count==total)return e;
     steer_policy_destroy(c->policy);
     c->policy=NULL;
     return steer_policy_compile_stream(c->generation,active,count,fallback,
-        c->vless_outbound_count,&c->policy);
+        c->stream_outbound_count,&c->policy);
 }
 
 static int v3_socks_options(void *unused,const struct ynode *options){
@@ -306,15 +306,38 @@ static int v3_vless_outbound_options(void *unused,const struct ynode *options){
     (void)unused;
     return keys(options,"uuid")&&v3_secret_id(ynode_get(options,"uuid"));
 }
-static int v3_vless_outbound(const struct steer_spec_node_view *node,const struct ynode *secrets,
-    struct steer_prototype_vless_outbound *out){
+#endif
+#ifdef STEER_PROTOTYPE_SOCKS_OUTBOUND
+static int v3_socks_outbound_options(void *unused,const struct ynode *options){
+    (void)unused;
+    return keys(options,"username password")&&(!options->len||
+        (v3_secret_id(ynode_get(options,"username"))&&v3_secret_id(ynode_get(options,"password"))));
+}
+#endif
+#if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND)
+static int v3_stream_outbound(const struct steer_spec_node_view *node,const struct ynode *secrets,
+    struct steer_prototype_stream_outbound *out){
     const struct ynode *address=ynode_get(node->endpoint,"address");
-    if(strncmp(node->provider,"vless:",6)||!node->enabled||!node->options_validated||
+    if(!node->enabled||!node->options_validated||
         node->flows!=STEER_SPEC_FLOW_STREAM||
         !keys(node->intent,"label enabled plugin flow endpoint options")||
         !keys(node->endpoint,"address port")||!scalar(address)||
-        !port(ynode_get(node->endpoint,"port"),&out->port)||
-        !v3_env_ref(secrets,ynode_get(node->options,"uuid"),"uuid",out->uuid_ref))return 0;
+        !port(ynode_get(node->endpoint,"port"),&out->port))return 0;
+#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+    if(!strncmp(node->provider,"vless:",6)){
+        if(!v3_env_ref(secrets,ynode_get(node->options,"uuid"),"uuid",out->uuid_ref))return 0;
+        out->protocol=STEER_PROTOTYPE_VLESS;
+    }
+#endif
+#ifdef STEER_PROTOTYPE_SOCKS_OUTBOUND
+    if(!strncmp(node->provider,"socks:",6)){
+        if(node->options->len&&
+           (!v3_env_ref(secrets,ynode_get(node->options,"username"),"username",out->username_ref)||
+            !v3_env_ref(secrets,ynode_get(node->options,"password"),"password",out->password_ref)))return 0;
+        out->protocol=STEER_PROTOTYPE_SOCKS;
+    }
+#endif
+    if(!out->protocol)return 0;
     if(inet_pton(AF_INET,address->str,out->address)==1){
         if(!out->address[0]||out->address[0]>=224)return 0;
         out->endpoint_tag=STEER_PV1_ENDPOINT_IPV4;
@@ -378,6 +401,9 @@ static int v3_inbound(const struct steer_spec_node_view *node,const struct ynode
         (!strncmp(l->address,"127.",4)||!strcmp(l->address,"::1"));
 }
 static int v3_secret_kind(const struct ynode *kind){
+#ifdef STEER_PROTOTYPE_SOCKS_OUTBOUND
+    if(eq(kind,"username")||eq(kind,"password"))return 1;
+#endif
 #ifdef STEER_PROTOTYPE_HY2
     if(eq(kind,"password")||eq(kind,"certificate")||eq(kind,"private_key"))return 1;
 #endif
@@ -385,7 +411,7 @@ static int v3_secret_kind(const struct ynode *kind){
 }
 static int v3_named_action(const struct steer_prototype_config *c,
     const struct ynode *outbounds,const char *name,uint32_t *out){
-    for(uint32_t i=0;i<c->vless_outbound_count;i++)if(!strcmp(c->vless_outbounds[i].id,name)){
+    for(uint32_t i=0;i<c->stream_outbound_count;i++)if(!strcmp(c->stream_outbounds[i].id,name)){
         *out=STEER_POLICY_STREAM_BINDING_BASE+i;
         return 1;
     }
@@ -440,7 +466,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         |STEER_SPEC_FLOW_DATAGRAM
 #endif
         ;
-    enum { alias_requirements=6 };
+    enum { alias_requirements=7 };
     struct steer_spec_capability inventory[sizeof(core)/sizeof(core[0])+alias_requirements*STEER_PROTOTYPE_MAX_LISTENERS];
     size_t count=sizeof(core)/sizeof(core[0]);
     char requirements[STEER_PROTOTYPE_MAX_LISTENERS][alias_requirements][128];
@@ -484,6 +510,10 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         snprintf(requirements[i][5],sizeof(requirements[i][5]),"provider.vless:%s/outbound/stream/tcp/none/default",alias->str);
         inventory[count++]=(struct steer_spec_capability){requirements[i][5],STEER_SPEC_READY,v3_vless_outbound_options,NULL};
 #endif
+#ifdef STEER_PROTOTYPE_SOCKS_OUTBOUND
+        snprintf(requirements[i][6],sizeof(requirements[i][6]),"provider.socks:%s/outbound/stream/tcp/none/default",alias->str);
+        inventory[count++]=(struct steer_spec_capability){requirements[i][6],STEER_SPEC_READY,v3_socks_outbound_options,NULL};
+#endif
     }
     for(size_t i=0;secrets&&i<secrets->len;i++){
         const struct ynode *secret=ynode_val_at(secrets,i),*name=ynode_get(secret,"name");
@@ -499,11 +529,11 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         if(!steer_spec_node(plan,i,&node))goto done;
         if(node.kind==STEER_SPEC_PLUGIN||node.kind==STEER_SPEC_SECRET)continue;
         if(node.kind==STEER_SPEC_OUTBOUND){
-#ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
+#if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND)
             if(node.provider[0]){
-                if(c->vless_outbound_count>=STEER_POLICY_STREAM_BINDINGS_MAX||
-                   !v3_vless_outbound(&node,secrets,&c->vless_outbounds[c->vless_outbound_count]))goto done;
-                c->vless_outbound_count++;
+                if(c->stream_outbound_count>=STEER_POLICY_STREAM_BINDINGS_MAX||
+                   !v3_stream_outbound(&node,secrets,&c->stream_outbounds[c->stream_outbound_count]))goto done;
+                c->stream_outbound_count++;
                 continue;
             }
 #endif

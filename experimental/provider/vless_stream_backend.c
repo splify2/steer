@@ -2,15 +2,13 @@
 #include "vless_stream_backend.h"
 #include "buffers.h"
 #include "operations.h"
-#include "loop.h"
+#include "stream_open_deadline.h"
 #include "vless/outbound.h"
 #include <errno.h>
-#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
-#include <time.h>
 #include <unistd.h>
 #define VLESS_BATCH 32u
 enum operation_kind { OPEN_LOWER, OPEN_HEADER, READ_BODY, WRITE_BODY, FINISH_BODY };
@@ -59,7 +57,6 @@ struct vless_operation {
 };
 static struct steer_pv1_error error(uint32_t code){struct steer_pv1_error e={code,0};return e;}
 static struct steer_pv1_async_start rejected(uint32_t code){struct steer_pv1_async_start a={STEER_PV1_REJECTED,{code,0},{NULL,NULL}};return a;}
-static uint64_t now_ns(void){struct timespec t;if(clock_gettime(CLOCK_MONOTONIC,&t))return UINT64_MAX;return (uint64_t)t.tv_sec*UINT64_C(1000000000)+(uint64_t)t.tv_nsec;}
 static void wipe(void *p,size_t length){volatile uint8_t *bytes=p;while(length--)*bytes++=0;}
 static void notify(struct steer_draft_vless_stream_backend *b){uint64_t one=1;ssize_t n;do{n=write(b->wake,&one,sizeof(one));}while(n<0&&errno==EINTR);}
 static void enqueue(struct vless_operation *op){
@@ -129,7 +126,7 @@ static void delivered(void *arg,struct steer_pv1_error e){
     b->bytes-=op->length;
     if(op->open_done){
         struct steer_pv1_stream_ref result={NULL,NULL};
-        if(!e.code&&now_ns()>=op->absolute_deadline){e=error(STEER_PV1_TIMEOUT);consume_stream(op->stream);op->stream=NULL;}
+        if(!e.code&&steer_draft_stream_now_ns()>=op->absolute_deadline){e=error(STEER_PV1_TIMEOUT);consume_stream(op->stream);op->stream=NULL;}
         if(!e.code){result.handle=(struct steer_pv1_backend_stream *)op->stream;result.api=&origin_api;op->stream=NULL;}
         op->open_done(op->userdata,e,result,NULL,NULL,&op->diagnostic);
     }else{
@@ -157,7 +154,7 @@ static void complete(struct vless_operation *op,struct steer_pv1_error e){
     op->terminal=1;
     if(op->deadline){loop_timer_free(op->deadline);op->deadline=NULL;}
     if(op->open_done){
-        if(!e.code&&now_ns()>=op->absolute_deadline)e=error(STEER_PV1_TIMEOUT);
+        if(!e.code&&steer_draft_stream_now_ns()>=op->absolute_deadline)e=error(STEER_PV1_TIMEOUT);
         if(op->buffer){
             struct steer_pv1_mut_span span;
             if(!op->backend->buffer_api->writable(op->backend->buffers,op->buffer,&span).code)wipe(span.data,span.len);
@@ -167,16 +164,11 @@ static void complete(struct vless_operation *op,struct steer_pv1_error e){
     }
     (void)steer_draft_operation_resolve(op->completion.handle,e);notify(op->backend);
 }
-static void arm_deadline(struct vless_operation *op,uint64_t current){
-    uint64_t remaining=op->absolute_deadline>current?op->absolute_deadline-current:0;
-    uint64_t milliseconds=remaining/UINT64_C(1000000)+(remaining%UINT64_C(1000000)!=0);
-    loop_timer_set(op->deadline,milliseconds>(uint64_t)LONG_MAX?LONG_MAX:(long)milliseconds);
-}
 static void open_timeout(struct loop *loop,struct loop_timer *timer,void *arg){
     struct vless_operation *op=arg;(void)loop;(void)timer;
     if(op->terminal)return;
-    uint64_t current=now_ns();
-    if(current<op->absolute_deadline){arm_deadline(op,current);return;}
+    uint64_t current=steer_draft_stream_now_ns();
+    if(current<op->absolute_deadline){steer_draft_stream_arm_deadline(timer,op->absolute_deadline,current);return;}
     op->abort_code=STEER_PV1_TIMEOUT;close_stream(op->stream);
     if(op->inner.handle)op->inner.api->cancel(op->inner.handle);
 }
@@ -196,7 +188,7 @@ static void header_again(struct vless_operation *op){
 static void progress(struct vless_operation *op){
     if(op->inner_done&&op->inner.handle){op->inner.api->release(op->inner.handle);op->inner.handle=NULL;op->inner.api=NULL;}
     if(op->abort_code){complete(op,error((uint32_t)op->abort_code));return;}
-    if(op->open_done&&now_ns()>=op->absolute_deadline){complete(op,error(STEER_PV1_TIMEOUT));return;}
+    if(op->open_done&&steer_draft_stream_now_ns()>=op->absolute_deadline){complete(op,error(STEER_PV1_TIMEOUT));return;}
     if(op->result.code>STEER_PV1_INTERNAL||op->result.transient>1||(!op->result.code&&op->result.transient))op->result=error(STEER_PV1_PROTOCOL);
     if(op->result.code){complete(op,op->result);return;}
     if(op->kind==OPEN_LOWER){
@@ -302,7 +294,7 @@ static struct steer_pv1_async_start STEER_PV1_CALL open_vless(void *context,
     struct steer_draft_vless_stream_backend *b=context;
     if(!b||!done)return rejected(STEER_PV1_INVALID);
     struct steer_pv1_error e=steer_draft_flow_validate(flow,STEER_PV1_FLOW_STREAM);if(e.code)return rejected(e.code);
-    if(deadline<=now_ns())return rejected(STEER_PV1_TIMEOUT);
+    if(deadline<=steer_draft_stream_now_ns())return rejected(STEER_PV1_TIMEOUT);
     e=steer_draft_binding_admit(b->binding.lease,flow->generation,STEER_PV1_FLOW_STREAM);if(e.code)return rejected(e.code);
     if(b->streams>=b->max_streams||b->live>=b->max_operations||VL_REQUEST_TCP_MAX>b->max_bytes-b->bytes){e=error(STEER_PV1_RESOURCE_EXHAUSTED);goto fail_pin;}
     struct vless_stream *s=calloc(1,sizeof(*s));if(!s){e=error(STEER_PV1_RESOURCE_EXHAUSTED);goto fail_pin;}
@@ -324,7 +316,7 @@ static struct steer_pv1_async_start STEER_PV1_CALL open_vless(void *context,
     op->absolute_deadline=deadline;b->bytes+=length;
     op->deadline=loop_timer_new(b->loop,open_timeout,op);
     if(!op->deadline){complete(op,error(STEER_PV1_RESOURCE_EXHAUSTED));return exported(op);}
-    arm_deadline(op,now_ns());
+    steer_draft_stream_arm_deadline(op->deadline,deadline,steer_draft_stream_now_ns());
     struct steer_pv1_flow_metadata upstream=*flow;upstream.destination=b->upstream.value.destination;
     struct steer_pv1_async_start a=b->lower.api->open(b->lower.context,&upstream,deadline,lower_ready,op);
     if(a.disposition==STEER_PV1_PENDING)op->inner=a.operation;
