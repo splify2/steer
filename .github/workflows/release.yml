@@ -288,84 +288,6 @@ jobs:
             echo "::warning::стенды расширенной части в этом релизе не прогнаны до конца — смотрите лог шага"
             exit 1; }
 
-      - name: Зафиксировать версию в репозитории
-        run: |
-          set -eu
-          # Чтобы репозиторий и релиз не расходились: тег vX.Y.Z должен указывать на
-          # коммит, в котором VERSION действительно X.Y.Z.
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          if ! git diff --quiet VERSION; then
-            git add VERSION
-            git commit -m "Версия ${VERSION}"
-            git push
-          fi
-
-      - name: Выложить пакеты роутера в ветку dist
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DIST: dist
-        run: |
-          set -eu
-          # ЗАЧЕМ ВТОРАЯ ВЫКЛАДКА, КОГДА ЕСТЬ РЕЛИЗ. splify2#15: провайдер закрывает не
-          # GitHub, а `githubusercontent.com` — и целиком: `raw.`, `objects.` и
-          # `release-assets.` стоят на одних адресах Fastly (185.199.108-111.133). Прямая
-          # ссылка релиза перенаправляет как раз на `release-assets`, поэтому у такого
-          # человека движок нельзя ни поставить, ни обновить — ни install.sh, ни кнопкой в
-          # splify2. Хосты самого GitHub (`api.` и `codeload.`, сеть 140.82.121.x) работают,
-          # и оба умеют отдать файл из ветки: поштучно через contents API и архивом.
-          #
-          # Только пакеты роутера. Сборки для VPS (`steer-hub-*`, `steer-obfs-*`) едут в
-          # СВОЮ ветку соседним шагом: эту роутер качает архивом ЦЕЛИКОМ, и лишние два
-          # мегабайта платил бы каждый роутер, который до архива дойдёт.
-          #
-          # Ветка сиротская и переписывается каждым релизом: это канал выкладки, а не
-          # история. Иначе архив рос бы каждым выпуском, а качает его роутер целиком.
-          rm -rf /tmp/dist
-          mkdir -p /tmp/dist
-          cp out/*.apk out/*.ipk /tmp/dist/
-          echo "$VERSION" > /tmp/dist/VERSION
-          cd /tmp/dist
-          git init -q -b "$DIST"
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git commit -q -m "Пакеты ${VERSION}"
-          git push -q --force \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$DIST:$DIST"
-
-      - name: Выложить сборки VPS в ветку dist-vps
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DIST_VPS: dist-vps
-        run: |
-          set -eu
-          # То же обещание, что у ветки dist, но для серверной половины. Раньше считалось,
-          # что VPS этой беды не знает: «сервер стоит там, где не блокируют». Это неправда
-          # для российского VPS, а он у людей обычный — и `server/xs_install.sh` качал хаб
-          # ровно по той ссылке, что перенаправляет на release-assets.githubusercontent.com.
-          # То есть у половины аудитории серверная часть не ставилась по той же причине, по
-          # которой не ставилась роутерная, и отличить это от «сервер релизов лежит» было
-          # нельзя: источник был один, и отказ звучал одинаково.
-          #
-          # СВОЯ ВЕТКА, А НЕ ТА ЖЕ. Ветку dist роутер качает архивом целиком (codeload), и
-          # архивы для VPS весом под мегабайт каждый платил бы каждый такой роутер, ничего
-          # не получая взамен. Установщик на VPS, наоборот, берёт ОДИН файл поштучно через
-          # contents API, и размер ветки его не касается.
-          rm -rf /tmp/dist-vps
-          mkdir -p /tmp/dist-vps
-          cp out/steer-hub-*.tar.gz /tmp/dist-vps/
-          cp out/steer-obfs-*.tar.gz /tmp/dist-vps/
-          echo "$VERSION" > /tmp/dist-vps/VERSION
-          cd /tmp/dist-vps
-          git init -q -b "$DIST_VPS"
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git commit -q -m "Сборки VPS ${VERSION}"
-          git push -q --force \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$DIST_VPS:$DIST_VPS"
-
       - name: Текст выпуска
         # Один текст на два выпуска: этот файл идёт и в выпуск здесь, и в splify2/releases
         # (последний шаг). Выражения раскрываются в env, оболочка пишет его как есть.
@@ -463,10 +385,102 @@ jobs:
           printf '\n**Экспериментальные Linux x86_64 архивы:** `steer-nano` и `steer-ui-nano`. Не пакеты OpenWrt.\n' \
             >> "$RUNNER_TEMP/release-notes.md"
 
+      - name: Проверить отсутствие тега выпуска
+        run: |
+          set -eu
+          existing=$(git ls-remote --tags origin "refs/tags/v$VERSION")
+          [ -z "$existing" ] || { echo "::error::тег v$VERSION уже существует"; exit 1; }
+
+      - name: Зафиксировать версию в репозитории
+        if: ${{ !inputs.prerelease }}
+        run: |
+          set -eu
+          # Чтобы репозиторий и релиз не расходились: тег vX.Y.Z должен указывать на
+          # коммит, в котором VERSION действительно X.Y.Z.
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          if ! git diff --quiet VERSION; then
+            git add VERSION
+            git commit -m "Версия ${VERSION}"
+            git push
+          fi
+
+      - name: Выложить пакеты роутера в ветку dist
+        if: ${{ !inputs.prerelease }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIST: dist
+        run: |
+          set -eu
+          # ЗАЧЕМ ВТОРАЯ ВЫКЛАДКА, КОГДА ЕСТЬ РЕЛИЗ. splify2#15: провайдер закрывает не
+          # GitHub, а `githubusercontent.com` — и целиком: `raw.`, `objects.` и
+          # `release-assets.` стоят на одних адресах Fastly (185.199.108-111.133). Прямая
+          # ссылка релиза перенаправляет как раз на `release-assets`, поэтому у такого
+          # человека движок нельзя ни поставить, ни обновить — ни install.sh, ни кнопкой в
+          # splify2. Хосты самого GitHub (`api.` и `codeload.`, сеть 140.82.121.x) работают,
+          # и оба умеют отдать файл из ветки: поштучно через contents API и архивом.
+          #
+          # Только пакеты роутера. Сборки для VPS (`steer-hub-*`, `steer-obfs-*`) едут в
+          # СВОЮ ветку соседним шагом: эту роутер качает архивом ЦЕЛИКОМ, и лишние два
+          # мегабайта платил бы каждый роутер, который до архива дойдёт.
+          #
+          # Ветка сиротская и переписывается каждым релизом: это канал выкладки, а не
+          # история. Иначе архив рос бы каждым выпуском, а качает его роутер целиком.
+          rm -rf /tmp/dist
+          mkdir -p /tmp/dist
+          cp out/*.apk out/*.ipk /tmp/dist/
+          echo "$VERSION" > /tmp/dist/VERSION
+          cd /tmp/dist
+          git init -q -b "$DIST"
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -q -m "Пакеты ${VERSION}"
+          git push -q --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$DIST:$DIST"
+
+      - name: Выложить сборки VPS в ветку dist-vps
+        if: ${{ !inputs.prerelease }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIST_VPS: dist-vps
+        run: |
+          set -eu
+          # То же обещание, что у ветки dist, но для серверной половины. Раньше считалось,
+          # что VPS этой беды не знает: «сервер стоит там, где не блокируют». Это неправда
+          # для российского VPS, а он у людей обычный — и `server/xs_install.sh` качал хаб
+          # ровно по той ссылке, что перенаправляет на release-assets.githubusercontent.com.
+          # То есть у половины аудитории серверная часть не ставилась по той же причине, по
+          # которой не ставилась роутерная, и отличить это от «сервер релизов лежит» было
+          # нельзя: источник был один, и отказ звучал одинаково.
+          #
+          # СВОЯ ВЕТКА, А НЕ ТА ЖЕ. Ветку dist роутер качает архивом целиком (codeload), и
+          # архивы для VPS весом под мегабайт каждый платил бы каждый такой роутер, ничего
+          # не получая взамен. Установщик на VPS, наоборот, берёт ОДИН файл поштучно через
+          # contents API, и размер ветки его не касается.
+          rm -rf /tmp/dist-vps
+          mkdir -p /tmp/dist-vps
+          cp out/steer-hub-*.tar.gz /tmp/dist-vps/
+          cp out/steer-obfs-*.tar.gz /tmp/dist-vps/
+          echo "$VERSION" > /tmp/dist-vps/VERSION
+          cd /tmp/dist-vps
+          git init -q -b "$DIST_VPS"
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -q -m "Сборки VPS ${VERSION}"
+          git push -q --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$DIST_VPS:$DIST_VPS"
+
+      - name: Определить коммит выпуска
+        id: release_commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Опубликовать релиз
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
+          target_commitish: ${{ steps.release_commit.outputs.sha }}
           name: steer ${{ env.VERSION }}
           prerelease: ${{ inputs.prerelease }}
           files: |
