@@ -64,4 +64,29 @@ int steer_draft_wg_coordinator_apply(struct steer_spec_journal *,const struct st
 int steer_draft_wg_coordinator_recover(struct steer_spec_journal *,const struct steer_draft_wg_backend *,
     void *,const struct steer_draft_wg_tx *,uint64_t deadline);
 
+/* Exclusive bounded single-slot experimental store. Do not share its directory
+ * with the standalone staging API or the general device authority ledger. */
+struct steer_draft_wg_selection;
+int steer_draft_wg_selection_open(const char *,uint32_t max_records,struct steer_draft_wg_selection **);
+void steer_draft_wg_selection_close(struct steer_draft_wg_selection *);
+
+/* The externally committed prototype_store document is the ONLY selection.
+ * A missing document passes an all-zero revision; IO/corruption is not absence.
+ * Digest covers the exact validated persisted bytes for this frozen profile. */
+struct steer_draft_wg_revision { uint64_t generation; uint8_t digest[32]; };
+typedef int (*steer_draft_wg_verify_ready)(void *,const struct steer_draft_wg_guard_record *,uint64_t);
+/* Read and sync the complete journal, resolve external generation+digest and
+ * verify the live selected resource before cleaning anything. next_revision
+ * includes failed attempts. Cleanup errors do not authorize fallback. */
+int steer_draft_wg_selection_startup(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
+    void *,const struct steer_draft_wg_revision *,steer_draft_wg_verify_ready,
+    uint64_t deadline,uint64_t *next_revision);
+/* Staging only. Caller may commit the document on success. On NOT_RENAMED
+ * use startup with the old revision; on RENAMED do not clean either side
+ * until the exact document has been durably recovered. */
+int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
+    void *,const struct steer_draft_wg_revision *,uint16_t previous_port,
+    const struct steer_draft_wg_tx *,const struct steer_draft_wg_candidate *,
+    uint64_t deadline);
+
 #endif
