@@ -8,6 +8,7 @@ struct steer_prototype_prepare;
 struct steer_prototype_prepared_input {
     struct steer_prototype_config *config;
 #ifdef STEER_PROTOTYPE_HY2
+    struct steer_hy2_profile *hy2_out[STEER_POLICY_STREAM_BINDINGS_MAX];
     struct qc_server_tls *tls[STEER_PROTOTYPE_MAX_LISTENERS];
     uint8_t certificate_hash[STEER_PROTOTYPE_MAX_LISTENERS][32];
     uint8_t private_key_hash[STEER_PROTOTYPE_MAX_LISTENERS][32];
@@ -16,6 +17,11 @@ struct steer_prototype_prepared_input {
     unsigned control_index;
     int validate,error; /* HTTP-style error;499 means cancelled, never published */
 };
+#ifdef STEER_PROTOTYPE_HY2
+/* Worker or bootstrap only. The environment is immutable for this process. */
+int steer_prototype_prepare_hy2_outbound(const struct steer_prototype_stream_outbound *,
+    uint64_t generation,struct steer_hy2_profile **);
+#endif
 /* Callback runs on owner loop after synchronized immutable result handoff.
  * Borrowed result is disposed after return: take ownership by clearing fields.
  * No control/listener pointers cross to worker. Inputs are copied before submit. */

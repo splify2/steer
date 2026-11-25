@@ -212,10 +212,10 @@ python3 steer/experimental/provider/prototype_socks_outbound_test.py \
   --core /tmp/steer-provider-build/steer-prototype --xray /path/to/xray --wire-cases
 ```
 
-### Hysteria2 TCP outbound transport checkpoint (not managed yet)
+### Managed Hysteria2 TCP outbound (optional HY2 build)
 
-`hy2_tcp_client.c` is an isolated Linux TCP transport, not a registered
-spec-v3 outbound. It reuses Steer's ngtcp2/wolfSSL client and the legacy HY2
+`hy2_stream_backend.c` adds a TCP stream binding to the same table as SOCKS
+and VLESS. `hy2_tcp_client.c` reuses Steer's ngtcp2/wolfSSL client and the legacy HY2
 HTTP/3 and TCP codecs, without the global node, worker, or TUN callbacks of
 `hy2conn.c`. It connects only to a numeric upstream, strictly checks the
 certificate against prepared PEM roots and an explicit DNS/IP identity, and
@@ -224,19 +224,22 @@ both HTTP 233 and a positive HY2 TCP response arrive. There is no direct
 fallback, DNS lookup on the owner, UDP relay, 0-RTT, obfuscation or port hopping.
 DNS targets are forwarded as wire names for server-side resolution.
 
-Preparation (regular PEM file, up to 1 MiB, and TLS context creation) belongs on
-the prepare worker or at bootstrap. The owner drives nonblocking QUIC/UDP via
-fd and timer; it must re-evaluate deadlines after writes and read-credit
-returns. An absolute open deadline covers TLS, auth and upstream TCP response.
-The checkpoint uses one QUIC connection per TCP flow, up to 16 per profile,
-with 64 KiB send and receive flow bounds. Retire rejects further admissions,
-including for stale generations, but admitted opens and streams can drain; a
-profile cannot be destroyed until those flows are released. The adapter still
-needs to supply the host's aggregate limits and drain deadline.
+Validate/Apply prepare the password, a regular PEM file (up to 1 MiB), and
+its TLS context on the prepare worker without contacting the peer. Bootstrap
+prepares the same material from persisted references before accepting traffic.
+Name/trust matching against the peer and password authentication happen
+at TCP open, not at Validate/Apply. One absolute open deadline covers TLS,
+auth and the upstream TCP response; the owner drives nonblocking QUIC with
+fd/timer readiness. The binding uses one QUIC connection per TCP flow,
+up to 16 per outbound per generation, with 64 KiB send/receive flow bounds and
+the shared host TCP admission cap. Apply retires old HY2 bindings: new opens
+cannot select them, admitted opens and established streams drain on the
+old profile for up to 30 seconds, then outstanding transport is closed. The
+binding is reclaimed after its stream and operation references release.
 
-Proposed spec-v3 fields for the UI form; **not accepted by managed Apply
-yet**. The plugin alias `proxy` is the alias declared by the existing linked
-profile:
+Spec-v3 fields for the UI form. Only offer it when STATUS advertises
+`capabilities.spec_v3_hysteria2_tcp_outbound`. The plugin alias `proxy` is
+the alias declared by the existing linked profile:
 
 ```yaml
 secrets:
@@ -258,18 +261,11 @@ the password and trusted CA bundle. `STEER_HY2_OUT_CA` is a path to a regular
 PEM file in the core's environment, not a URL or a leaf-certificate bypass.
 The password is 1–256 visible ASCII bytes; the form and intent must not return
 resolved values or paths. TLS verification and ALPN `h3` are fixed, not UI
-switches. Do not expose UDP. The graph must reject HY2 TCP as a route/default
-for a selected ingress class that also requires datagrams.
-
-Next integration step: lower the strict stream/quic/tls tuple into typed
-configuration and snapshot the above references in `prototype_prepare.c`.
-Hand the prepared profile through `steer_prototype_prepared_input`; add a
-generation-owned `steer_pv1_stream_backend_api` adapter over the fd/timer
-transport in `prepare_stream_routes()` (no fallback), quiesce its admission on
-publication/stop, and reclaim it only after all operations and streams drain.
-Use the existing binding lease, callback deferral, and per-route budgets. Add
-spec integration coverage for Validate/Apply/CAS failure, TCP relay, held old
-stream across Apply, TCP-only graph rejection, forced drain, and restart.
+switches. Omitted `verify` is `true`; `false` is rejected. Select `hy2-exit`
+in a TCP routing rule or as the TCP-only default. Do not expose UDP.
+This path is verified with SOCKS ingress; it does not change the current
+spec-v3 datagram routing semantics or enable HY2 ingress to use a TCP-only
+outbound.
 
 To reproduce the isolated test, build
 `experimental/provider` target `$BUILD/hy2-tcp-client-test` with the same
@@ -282,12 +278,17 @@ upstream Hysteria Go workspace (its `core` directory). Then run:
 python3 experimental/provider/hy2_tcp_client_test.py \
   --client "$BUILD/hy2-tcp-client-test" --server "$ORACLE_SERVER" \
   --oracle-client /tmp/opencode/steer-hy2-oracle-bin
+python3 experimental/provider/prototype_hy2_outbound_test.py \
+  --core "$BUILD/steer-prototype-hy2" --server "$ORACLE_SERVER" \
+  --minimal "$BUILD/steer-prototype"
 ```
 
 The supplied oracle binary is an independent **client**; it verifies the
 upstream server fixture before the Steer client runs. All test addresses are
 loopback; the fixture explicitly maps `target.test` to a local echo service
-without DNS and rejects other targets.
+without DNS and rejects other targets. The managed fixture accepts
+`--fault-core "$BUILD/steer-prototype-hy2-fault"` to verify that a deliberately
+blocked outbound CA read does not interrupt Relay or STATUS/GET.
 
 ### Optional Hysteria2 server build
 

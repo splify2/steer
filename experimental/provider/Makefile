@@ -108,9 +108,9 @@ test: unit-test integration-test
 # default/client builds retain their existing dependency and feature surface.
 NGTCP2_LIB ?=
 WOLFSSL_SERVER_LIB ?=
-HY2_SRC = hy2_inbound.c hy2_datagram.c datagram.c datagram_routes.c ../../src/proto/hysteria2/hy2wire.c inbound_tls.c $(PROTOCOLS)/src/hysteria2/server.c \
+HY2_SRC = hy2_inbound.c hy2_datagram.c datagram.c datagram_routes.c hy2_stream_backend.c inbound_tls.c $(PROTOCOLS)/src/hysteria2/server.c \
     $(PROTOCOLS)/src/hysteria2/auth.c $(PROTOCOLS)/src/hysteria2/inbound.c \
-    ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c
+    $(HY2_TCP_SRC)
 HY2_INC = $(shell find ../../src -type d -printf '-I%p ')
 HY2_TCP_SRC = hy2_tcp_client.c ../../src/proto/hysteria2/hy2wire.c \
     ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c
@@ -135,18 +135,18 @@ $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype-hy2-fault: $(HOST_SRC) $(H
 	    $(HOST_SRC) $(HY2_SRC) prototype_main.c "$(NGTCP2_LIB)" "$(WOLFSSL_SERVER_LIB)" \
 	    $(HY2_TEST_EXTRA) $(LDFLAGS) $(LDLIBS) -lm -o $@
 $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype-hy2-fault: $(wildcard $(PROTOCOLS)/src/hysteria2/*.h $(PROTOCOLS)/src/hysteria2/*.inc) \
-    ../../src/proto/quic/quic.h ../../src/proto/quic/qcssl.h ../spec/spec.h \
+    ../../src/proto/quic/quic.h ../../src/proto/quic/qcssl.h ../../src/proto/hysteria2/hy2wire.h ../spec/spec.h \
     $(wildcard $(SDK)/include/steer/draft/*.h) ../../src/daemon/loop.h \
     $(PROTOCOLS)/src/socks5/codec.h $(PROTOCOLS)/src/socks5/outbound.h $(PROTOCOLS)/src/vless/inbound.h $(PROTOCOLS)/src/vless/outbound.h \
     $(if $(NGTCP2_LIB),$(NGTCP2_LIB) $(NGTCP2_LIB).cflags) $(if $(WOLFSSL_SERVER_LIB),$(WOLFSSL_SERVER_LIB) $(WOLFSSL_SERVER_LIB).cflags)
 $(BUILD)/prototype-prepare-test: prototype_prepare_test.c prototype_prepare.c inbound_tls.c $(CONFIG_SRC) policy.c \
-    ../../src/daemon/loop.c ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c $(wildcard *.h) | $(BUILD)
+    ../../src/daemon/loop.c $(HY2_TCP_SRC) $(wildcard *.h) | $(BUILD)
 	@test -r "$(NGTCP2_LIB).cflags" -a -r "$(WOLFSSL_SERVER_LIB).cflags"
 	@grep -Eq -- '(^|[[:space:]])-DSTEER_WOLFSSL_POSIX_TIME_SAFE=1([[:space:]]|$$)' "$(WOLFSSL_SERVER_LIB).cflags" || { echo 'rebuild wolfSSL archive with current POSIX time-safe profile' >&2; exit 2; }
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HY2_INC) -DQC_WITH_ENDPOINT -DSTEER_PROTOTYPE_HY2 -UNDEBUG \
 	    $$(cat "$(NGTCP2_LIB).cflags" "$(WOLFSSL_SERVER_LIB).cflags") \
 	    prototype_prepare_test.c prototype_prepare.c inbound_tls.c $(CONFIG_SRC) policy.c \
-	    ../../src/daemon/loop.c ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c \
+	    ../../src/daemon/loop.c $(HY2_TCP_SRC) \
 	    "$(NGTCP2_LIB)" "$(WOLFSSL_SERVER_LIB)" $(LDFLAGS) $(LDLIBS) -lm -o $@
 
 $(BUILD)/store-fault.so: store_fault.c | $(BUILD)

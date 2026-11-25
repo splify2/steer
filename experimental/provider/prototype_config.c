@@ -224,7 +224,11 @@ static void json(FILE*f,const struct ynode*n,const char*key,unsigned depth){
             (void)ynode_long(n,&x);
             fprintf(f,"%ld",x);
         }
-        else if((!strcmp(key,"enabled")||!strcmp(key,"domain_suffix")||!strcmp(key,"match_all"))&&!ynode_bool(n,&b)){
+        else if((!strcmp(key,"enabled")||!strcmp(key,"domain_suffix")||!strcmp(key,"match_all")
+#ifdef STEER_PROTOTYPE_HY2
+                 ||!strcmp(key,"verify")
+#endif
+                )&&!ynode_bool(n,&b)){
             fputs(b?"true":"false",f);
         }
         else jsonw_str(f,n->str);
@@ -314,13 +318,19 @@ static int v3_socks_outbound_options(void *unused,const struct ynode *options){
         (v3_secret_id(ynode_get(options,"username"))&&v3_secret_id(ynode_get(options,"password"))));
 }
 #endif
-#if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND)
+#ifdef STEER_PROTOTYPE_HY2
+static int v3_hy2_outbound_options(void *unused,const struct ynode *options){
+    (void)unused;
+    return keys(options,"password ca_bundle")&&v3_secret_id(ynode_get(options,"password"))&&
+        v3_secret_id(ynode_get(options,"ca_bundle"));
+}
+#endif
+#if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND) || defined(STEER_PROTOTYPE_HY2)
 static int v3_stream_outbound(const struct steer_spec_node_view *node,const struct ynode *secrets,
     struct steer_prototype_stream_outbound *out){
     const struct ynode *address=ynode_get(node->endpoint,"address");
     if(!node->enabled||!node->options_validated||
         node->flows!=STEER_SPEC_FLOW_STREAM||
-        !keys(node->intent,"label enabled plugin flow endpoint options")||
         !keys(node->endpoint,"address port")||!scalar(address)||
         !port(ynode_get(node->endpoint,"port"),&out->port))return 0;
 #ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
@@ -337,6 +347,21 @@ static int v3_stream_outbound(const struct steer_spec_node_view *node,const stru
         out->protocol=STEER_PROTOTYPE_SOCKS;
     }
 #endif
+#ifdef STEER_PROTOTYPE_HY2
+    if(!strncmp(node->provider,"hysteria2:",10)){
+        const struct ynode *tls=node->security,*transport=node->transport;
+        uint32_t verify;
+        if(!keys(node->intent,"label enabled plugin flow endpoint options transport security")||
+           !keys(transport,"type")||!eq(ynode_get(transport,"type"),"quic")||
+           !keys(tls,"type server_name verify")||!eq(ynode_get(tls,"type"),"tls")||
+           !flag(ynode_get(tls,"verify"),1,&verify)||!verify||
+           !copy(ynode_get(tls,"server_name"),out->tls_name,sizeof out->tls_name)||
+           !v3_env_ref(secrets,ynode_get(node->options,"password"),"password",out->password_ref)||
+           !v3_env_ref(secrets,ynode_get(node->options,"ca_bundle"),"certificate",out->ca_ref))return 0;
+        out->protocol=STEER_PROTOTYPE_HYSTERIA2;
+    }else
+#endif
+    if(!keys(node->intent,"label enabled plugin flow endpoint options"))return 0;
     if(!out->protocol)return 0;
     if(inet_pton(AF_INET,address->str,out->address)==1){
         if(!out->address[0]||out->address[0]>=224)return 0;
@@ -468,7 +493,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         |STEER_SPEC_FLOW_DATAGRAM
 #endif
         ;
-    enum { alias_requirements=7 };
+    enum { alias_requirements=8 };
     struct steer_spec_capability inventory[sizeof(core)/sizeof(core[0])+alias_requirements*STEER_PROTOTYPE_MAX_LISTENERS];
     size_t count=sizeof(core)/sizeof(core[0]);
     char requirements[STEER_PROTOTYPE_MAX_LISTENERS][alias_requirements][128];
@@ -507,6 +532,8 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         snprintf(requirements[i][4],sizeof(requirements[i][4]),"provider.hysteria2:%s/inbound/datagram/quic/tls/default",alias->str);
         inventory[count++]=(struct steer_spec_capability){requirements[i][3],STEER_SPEC_READY,v3_hy2_options,NULL};
         inventory[count++]=(struct steer_spec_capability){requirements[i][4],STEER_SPEC_READY,v3_hy2_options,NULL};
+        snprintf(requirements[i][7],sizeof(requirements[i][7]),"provider.hysteria2:%s/outbound/stream/quic/tls/default",alias->str);
+        inventory[count++]=(struct steer_spec_capability){requirements[i][7],STEER_SPEC_READY,v3_hy2_outbound_options,NULL};
 #endif
 #ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
         snprintf(requirements[i][5],sizeof(requirements[i][5]),"provider.vless:%s/outbound/stream/tcp/none/default",alias->str);
@@ -531,7 +558,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         if(!steer_spec_node(plan,i,&node))goto done;
         if(node.kind==STEER_SPEC_PLUGIN||node.kind==STEER_SPEC_SECRET)continue;
         if(node.kind==STEER_SPEC_OUTBOUND){
-#if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND)
+#if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND) || defined(STEER_PROTOTYPE_HY2)
             if(node.provider[0]){
                 if(c->stream_outbound_count>=STEER_POLICY_STREAM_BINDINGS_MAX||
                    !v3_stream_outbound(&node,secrets,&c->stream_outbounds[c->stream_outbound_count]))goto done;

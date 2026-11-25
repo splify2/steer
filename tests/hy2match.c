@@ -211,6 +211,7 @@ static void test_auth_response(void) {
     CHECK(n == 3 + 379);
     CHECK(hy2_auth_response(bp, n, &r, NULL) == 1);
     CHECK(r.status == 233 && r.udp == 1 && r.rx == 12500000 && !r.rx_auto);
+    CHECK(hy2_auth_response_strict(bp, n, &r, NULL) == 1 && r.status == 233);
     /* Незнакомый кадр перед HEADERS пропускается (GREASE: тип 0x21, длина 2). */
     uint8_t g[600];
     size_t gl = 0;
@@ -234,7 +235,7 @@ static void test_auth_response(void) {
     };
     for(size_t i=0;i<sizeof invalid/sizeof invalid[0];i++) {
         n=unhex(invalid[i],b);
-        CHECK(hy2_auth_response(b,n,&r,NULL)==-1);
+        CHECK(hy2_auth_response_strict(b,n,&r,NULL)==-1);
     }
 }
 

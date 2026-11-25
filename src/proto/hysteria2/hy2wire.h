@@ -45,6 +45,8 @@ struct hy2_auth_resp {
  * 0 — данных мало; -1 — ответ негоден (причина в *why, если не NULL). Кадры до HEADERS
  * (незнакомые, GREASE) пропускаются. */
 int hy2_auth_response(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why);
+/* Managed outbound: exact unique :status and no invalid QPACK field bytes. */
+int hy2_auth_response_strict(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why);
 
 /* ---- TCP ---- */
 #define HY2_TCP_REQ_ID 0x401

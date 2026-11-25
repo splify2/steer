@@ -2,11 +2,13 @@
 #define _GNU_SOURCE
 #include "prototype_prepare.h"
 #ifdef STEER_PROTOTYPE_HY2
+#include "hy2_tcp_client.h"
 #include "inbound_tls.h"
 #include "quic.h"
 #include "qcssl.h"
 #endif
 #include "loop.h"
+#include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
@@ -28,16 +30,38 @@ static int interrupted(struct job *job) {
 static void dispose(struct job *job) {
     if(!job)return;
 #ifdef STEER_PROTOTYPE_HY2
+    for(unsigned i=0;i<STEER_POLICY_STREAM_BINDINGS_MAX;i++)
+        (void)steer_hy2_profile_destroy(job->result.hy2_out[i]);
     for(unsigned i=0;i<STEER_PROTOTYPE_MAX_LISTENERS;i++)qc_server_tls_release(job->result.tls[i]);
 #endif
     steer_prototype_config_destroy(job->result.config);free(job->document);free(job);
 }
+#ifdef STEER_PROTOTYPE_HY2
+int steer_prototype_prepare_hy2_outbound(const struct steer_prototype_stream_outbound *spec,
+    uint64_t generation,struct steer_hy2_profile **out) {
+    char address[INET6_ADDRSTRLEN];
+    int family=spec->endpoint_tag==STEER_PV1_ENDPOINT_IPV4?AF_INET:AF_INET6;
+    *out=NULL;
+    if(!inet_ntop(family,spec->address,address,sizeof address))return -1;
+    return steer_hy2_profile_prepare(generation,address,spec->port,spec->tls_name,
+        getenv(spec->ca_ref+4),getenv(spec->password_ref+4),out);
+}
+#endif
 static void prepare(struct job *job) {
     struct steer_prototype_prepared_input *r=&job->result;
     r->error=interrupted(job);if(r->error)return;
     uint32_t code=steer_prototype_config_parse(job->document,job->length,job->generation,&r->config).code;
     if(code) { r->error=code==STEER_PV1_RESOURCE_EXHAUSTED?503:422;return; }
 #ifdef STEER_PROTOTYPE_HY2
+    for(unsigned i=0;i<r->config->stream_outbound_count;i++){
+        const struct steer_prototype_stream_outbound *spec=&r->config->stream_outbounds[i];
+        if(spec->protocol!=STEER_PROTOTYPE_HYSTERIA2)continue;
+        r->error=interrupted(job);if(r->error)return;
+        if(steer_prototype_prepare_hy2_outbound(spec,job->generation,&r->hy2_out[i])){
+            r->error=422;
+            return;
+        }
+    }
     for(unsigned i=0;i<r->config->listener_count;i++) {
         const struct steer_prototype_listener *spec=&r->config->listeners[i];struct steer_draft_tls_material material;
         char certificate[PATH_MAX],key[PATH_MAX];const char *path;

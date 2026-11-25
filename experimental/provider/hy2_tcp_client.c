@@ -178,7 +178,7 @@ static void stream_data(void *user,int64_t sid,const uint8_t *d,size_t n,int fin
         if(n) memcpy(f->auth+f->auth_len,d,n);
         f->auth_len+=n;
         qc_stream_consumed(f->quic,sid,n);
-        int result=hy2_auth_response(f->auth,f->auth_len,&r,NULL);
+        int result=hy2_auth_response_strict(f->auth,f->auth_len,&r,NULL);
         if(result==1&&r.status==HY2_AUTH_OK) f->stage=REQUEST;
         else if(result||fin||f->auth_len==sizeof f->auth) fail(f,STEER_HY2_REJECTED);
         return;

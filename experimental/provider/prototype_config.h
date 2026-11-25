@@ -29,6 +29,9 @@ struct steer_prototype_stream_outbound {
     uint32_t protocol, endpoint_tag;
     uint8_t address[16];
     uint16_t port;
+#ifdef STEER_PROTOTYPE_HY2
+    char tls_name[254], ca_ref[100];
+#endif
 };
 struct steer_prototype_config {
     uint64_t generation;

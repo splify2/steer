@@ -195,7 +195,7 @@ static const uint8_t HL[257] = {
 /* Развернуть строку Huffman в out (с завершающим нулём). Побитовый разбор с поиском по таблице —
  * медленно, но строк в ответе три-четыре по десятку знаков, а таблица индексов стоила бы килобайты.
  * Возвращает длину или -1: символ EOS в строке, недобор, набивка не из единиц (RFC 7541, 5.2). */
-static int huff_decode(const uint8_t *in, size_t n, char *out, size_t cap) {
+static int huff_decode(const uint8_t *in, size_t n, char *out, size_t cap, int strict) {
     uint32_t code = 0;
     unsigned len = 0;
     size_t o = 0;
@@ -205,7 +205,7 @@ static int huff_decode(const uint8_t *in, size_t n, char *out, size_t cap) {
         if (len > 30) return -1;
         for (unsigned s = 0; s < 257; s++) {
             if (HL[s] != len || HC[s] != code) continue;
-            if (s == 256 || s == 0 || s == '\r' || s == '\n') return -1;
+            if (s == 256 || (strict && (s == 0 || s == '\r' || s == '\n'))) return -1;
             /* Строка длиннее места (набивка ответа сервера — до двух килобайт) читается до конца,
              * чтобы проверить её и найти границу, но хранится только начало. */
             if (o + 1 < cap) out[o++] = (char)s;
@@ -238,15 +238,15 @@ static size_t r_qint(const uint8_t *d, size_t n, unsigned bits, uint64_t *v) {
 }
 
 /* Строка: H в бите hbit первого байта, длина — в остальных prefix битах. */
-static size_t r_str(const uint8_t *d, size_t n, unsigned prefix, char *out, size_t cap) {
+static size_t r_str(const uint8_t *d, size_t n, unsigned prefix, char *out, size_t cap, int strict) {
     uint64_t l;
     size_t k = r_qint(d, n, prefix, &l);
     if (!k || l > n - k) return 0;
     int huff = (d[0] >> prefix) & 1;
     if (huff) {
-        if (huff_decode(d + k, (size_t)l, out, cap) < 0) return 0;
+        if (huff_decode(d + k, (size_t)l, out, cap, strict) < 0) return 0;
     } else {
-        for (size_t i = 0; i < l; i++)
+        if (strict) for (size_t i = 0; i < l; i++)
             if (!d[k + i] || d[k + i] == '\r' || d[k + i] == '\n') return 0;
         size_t keep = (size_t)l + 1 > cap ? cap - 1 : (size_t)l;      /* хранится начало, см. huff_decode */
         memcpy(out, d + k, keep);
@@ -265,11 +265,13 @@ static int static_status_val(uint64_t i) {
     return 0;
 }
 
-static int note_header(struct hy2_auth_resp *r, const char *name, const char *val) {
+static int note_header(struct hy2_auth_resp *r, const char *name, const char *val, int strict) {
     if (!strcasecmp(name, ":status")) {
-        if (r->status || strlen(val) != 3 || val[0] < '1' || val[0] > '5' ||
-            val[1] < '0' || val[1] > '9' || val[2] < '0' || val[2] > '9') return -1;
-        r->status = (val[0] - '0') * 100 + (val[1] - '0') * 10 + val[2] - '0';
+        if (strict) {
+            if (r->status || strlen(val) != 3 || val[0] < '1' || val[0] > '5' ||
+                val[1] < '0' || val[1] > '9' || val[2] < '0' || val[2] > '9') return -1;
+            r->status = (val[0] - '0') * 100 + (val[1] - '0') * 10 + val[2] - '0';
+        } else r->status = atoi(val);
     }
     else if (!strcasecmp(name, "hysteria-udp")) r->udp = !strcasecmp(val, "true");
     else if (!strcasecmp(name, "hysteria-cc-rx")) {
@@ -279,7 +281,7 @@ static int note_header(struct hy2_auth_resp *r, const char *name, const char *va
     return 0;
 }
 
-static int qpack_section(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why) {
+static int qpack_section(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why, int strict) {
     uint64_t v;
     size_t k = r_qint(d, n, 8, &v);
     if (!k || v != 0) { if (why) *why = "ответ ссылается на динамическую таблицу QPACK"; return -1; }
@@ -293,26 +295,26 @@ static int qpack_section(const uint8_t *d, size_t n, struct hy2_auth_resp *r, co
         if (b & 0x80) {                                 /* 1T: индекс */
             if (!(b & 0x40)) { if (why) *why = "динамическая таблица QPACK"; return -1; }
             k = r_qint(d, n, 6, &v);
-            if (!k || v > 98) goto trunc;
+            if (!k || (strict && v > 98)) goto trunc;
             if (static_is_status(v)) {
-                if (r->status) goto status;
+                if (strict && r->status) goto status;
                 r->status = static_status_val(v);
             }
         } else if ((b & 0xc0) == 0x40) {                /* 01NT: имя по индексу */
             if (!(b & 0x10)) { if (why) *why = "динамическая таблица QPACK"; return -1; }
             k = r_qint(d, n, 4, &v);
-            if (!k || v > 98) goto trunc;
-            size_t m = r_str(d + k, n - k, 7, val, sizeof val);
+            if (!k || (strict && v > 98)) goto trunc;
+            size_t m = r_str(d + k, n - k, 7, val, sizeof val, strict);
             if (!m) goto trunc;
             k += m;
-            if (static_is_status(v) && note_header(r, ":status", val)) goto status;
+            if (static_is_status(v) && note_header(r, ":status", val, strict)) goto status;
         } else if ((b & 0xe0) == 0x20) {                /* 001NH: литеральное имя */
-            size_t m1 = r_str(d, n, 3, name, sizeof name);
+            size_t m1 = r_str(d, n, 3, name, sizeof name, strict);
             if (!m1) goto trunc;
-            size_t m2 = r_str(d + m1, n - m1, 7, val, sizeof val);
+            size_t m2 = r_str(d + m1, n - m1, 7, val, sizeof val, strict);
             if (!m2) goto trunc;
             k = m1 + m2;
-            if (note_header(r, name, val)) goto status;
+            if (note_header(r, name, val, strict)) goto status;
         } else {                                        /* 0001, 0000: после-базовые — их нет без таблицы */
             if (why) *why = "динамическая таблица QPACK";
             return -1;
@@ -328,7 +330,7 @@ trunc:
     return -1;
 }
 
-int hy2_auth_response(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why) {
+static int auth_response(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why, int strict) {
     memset(r, 0, sizeof *r);
     size_t off = 0;
     for (;;) {
@@ -341,13 +343,19 @@ int hy2_auth_response(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const
         if (len > (1u << 16)) { if (why) *why = "кадр ответа слишком велик"; return -1; }
         if (n - off - hdr < len) return 0;
         if (type == 0x01) {
-            if (qpack_section(d + off + hdr, (size_t)len, r, why) != 0) return -1;
+            if (qpack_section(d + off + hdr, (size_t)len, r, why, strict) != 0) return -1;
             if (!r->status) { if (why) *why = "в ответе нет :status"; return -1; }
             return 1;
         }
         if (type == 0x00) { if (why) *why = "данные раньше заголовков ответа"; return -1; }
         off += hdr + (size_t)len;                       /* незнакомый кадр, GREASE — пропустить */
     }
+}
+int hy2_auth_response(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why) {
+    return auth_response(d,n,r,why,0);
+}
+int hy2_auth_response_strict(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why) {
+    return auth_response(d,n,r,why,1);
 }
 
 /* ---- TCP ------------------------------------------------------------------------------------ */

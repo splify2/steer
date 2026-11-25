@@ -26,6 +26,8 @@
 #include "inbound_tls.h"
 #ifdef STEER_PROTOTYPE_HY2
 #include "hy2_inbound.h"
+#include "hy2_stream_backend.h"
+#include "hy2_tcp_client.h"
 #include "datagram.h"
 #include "datagram_routes.h"
 #include "qcssl.h"
@@ -51,6 +53,9 @@
 #define GENERATIONS 8
 #define LISTENERS 32 /* 16 published plus 16 transactionally prepared */
 #define HY2_DRAIN_MS 30000u /* host-owned monotonic retirement policy */
+#ifndef STEER_PROTOTYPE_HY2_OUTBOUND_DRAIN_MS
+#define STEER_PROTOTYPE_HY2_OUTBOUND_DRAIN_MS 30000u
+#endif
 #define CONTROLS 8
 #define CONTROL_INPUT (STEER_PROTOTYPE_CONFIG_MAX_BYTES + 128u)
 #define CONTROL_OUTPUT (STEER_PROTOTYPE_CONFIG_MAX_BYTES + 2048u)
@@ -97,6 +102,7 @@ struct generation {
 #endif
     unsigned prepared_outbounds;
 #ifdef STEER_PROTOTYPE_HY2
+    struct steer_hy2_stream_backend *hy2_out[STEER_POLICY_STREAM_BINDINGS_MAX];
     struct steer_draft_datagram_runtime *datagram_native;
     struct steer_draft_datagram_router *datagrams;
     struct steer_draft_binding_lease *datagram_binding;
@@ -583,12 +589,21 @@ static void accept_clients(struct loop *l, int fd, uint32_t events, void *arg)
         (void)submit(&c->directions[0], c->down, 0, 0, CAPACITY);
     }
 }
+#ifdef STEER_PROTOTYPE_HY2
+static void retire_hy2_outbounds(struct generation *g) {
+    if(g) for(unsigned i=0;i<g->prepared_outbounds;i++)
+        steer_hy2_stream_backend_retire(g->hy2_out[i]);
+}
+#endif
 static void stop(struct loop *l, int signo, void *arg)
 {
     struct host *h = arg; unsigned i;
     (void)l; (void)signo;
     h->stopping = 1;
     set_socks_admission(h->current, 0);
+#ifdef STEER_PROTOTYPE_HY2
+    retire_hy2_outbounds(h->current);
+#endif
     if(h->preparer)steer_prototype_prepare_stop(h->preparer);
     if (h->control_fd >= 0) {
         loop_fd_del(h->loop, h->control_fd); close(h->control_fd); h->control_fd = -1;
@@ -645,9 +660,12 @@ static void generation_retired(void *arg)
 struct outbound_credentials {
     uint8_t uuid[16];
     struct steer_pv1_span username, password;
+#ifdef STEER_PROTOTYPE_HY2
+    struct steer_hy2_profile *hy2;
+#endif
 };
 static int prepare_stream_routes(struct host *h, struct generation *g,
-                                 const struct outbound_credentials *credentials)
+                                 struct outbound_credentials *credentials)
 {
     g->host = h;
     if (steer_draft_native_stream_backend_create(h->loop, h->runtime, h->backend_runtime,
@@ -656,12 +674,14 @@ static int prepare_stream_routes(struct host *h, struct generation *g,
     struct steer_draft_stream_binding bindings[1 + STEER_POLICY_STREAM_BINDINGS_MAX];
     unsigned count = 1;
     bindings[0] = *steer_draft_native_stream_binding(g->native);
-#if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND)
+#if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND) || defined(STEER_PROTOTYPE_HY2)
     if (g->config) for (uint32_t i = 0; i < g->config->stream_outbound_count; ++i) {
         const struct steer_prototype_stream_outbound *cfg = &g->config->stream_outbounds[i];
+#if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND)
         struct steer_pv1_endpoint upstream = {sizeof upstream, STEER_PV1_DRAFT_LAYOUT,
             cfg->endpoint_tag, {cfg->address, cfg->endpoint_tag == STEER_PV1_ENDPOINT_IPV4 ? 4 : 16},
             cfg->port, 0};
+#endif
         switch(cfg->protocol){
 #ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
         case STEER_PROTOTYPE_VLESS:
@@ -677,6 +697,15 @@ static int prepare_stream_routes(struct host *h, struct generation *g,
                 &upstream, credentials[i].username, credentials[i].password, g->number, i + 1,
                 CLIENTS, 16*CLIENTS, generation_retired, g, &g->socks_out[i]).code) return 0;
             bindings[count++] = *steer_draft_socks_stream_binding(g->socks_out[i]);
+            break;
+#endif
+#ifdef STEER_PROTOTYPE_HY2
+        case STEER_PROTOTYPE_HYSTERIA2:
+            if (steer_hy2_stream_backend_create(h->loop,h->buffers,credentials[i].hy2,
+                g->number,i+1,4*CLIENTS,2*CLIENTS*CAPACITY,16*CLIENTS,
+                STEER_PROTOTYPE_HY2_OUTBOUND_DRAIN_MS,generation_retired,g,&g->hy2_out[i]).code)return 0;
+            credentials[i].hy2=NULL;
+            bindings[count++]=*steer_hy2_stream_binding(g->hy2_out[i]);
             break;
 #endif
         default: return 0;
@@ -729,6 +758,7 @@ static int destroy_generation(struct generation *g)
     set_socks_admission(g, 0);
     if (g->references || g->socks_sessions) return 0;
 #ifdef STEER_PROTOTYPE_HY2
+    retire_hy2_outbounds(g);
     retire_datagram_generation(g);
     if(g->datagrams){
         steer_draft_datagram_router_close(g->datagrams);
@@ -764,6 +794,10 @@ static int destroy_generation(struct generation *g)
 #ifdef STEER_PROTOTYPE_SOCKS_OUTBOUND
         if(g->socks_out[i]&&steer_draft_socks_stream_backend_destroy(g->socks_out[i]).code)return 0;
         g->socks_out[i]=NULL;
+#endif
+#ifdef STEER_PROTOTYPE_HY2
+        if(g->hy2_out[i]&&steer_hy2_stream_backend_destroy(g->hy2_out[i]).code)return 0;
+        g->hy2_out[i]=NULL;
 #endif
         g->prepared_outbounds--;
     }
@@ -1147,6 +1181,14 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
             (!credential_span(out->username_ref,&credentials[i].username)||
              !credential_span(out->password_ref,&credentials[i].password)))goto cleanup;
 #endif
+#ifdef STEER_PROTOTYPE_HY2
+        if(out->protocol==STEER_PROTOTYPE_HYSTERIA2) {
+            if(inputs) {
+                credentials[i].hy2=inputs->hy2_out[i];inputs->hy2_out[i]=NULL;
+                if(!credentials[i].hy2)goto cleanup;
+            }else if(steer_prototype_prepare_hy2_outbound(out,next,&credentials[i].hy2))goto cleanup;
+        }
+#endif
     }
     for (i = 0; i < config->listener_count; ++i)if(config->listeners[i].enabled) {
 #ifndef STEER_PROTOTYPE_HY2
@@ -1219,10 +1261,11 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
         if (prepared_state->keep[i]) prepare_socks(g, i, &h->listeners[i]);
     prepared_state->generation = g; g = NULL; result = 200;
 cleanup:
-    explicit_bzero(credentials, sizeof credentials);
 #ifdef STEER_PROTOTYPE_HY2
+    for(i=0;i<STEER_POLICY_STREAM_BINDINGS_MAX;i++)(void)steer_hy2_profile_destroy(credentials[i].hy2);
     for(i=0;i<STEER_PROTOTYPE_MAX_LISTENERS;i++)qc_server_tls_release(contexts[i]);
 #endif
+    explicit_bzero(credentials, sizeof credentials);
     if (result != 200) for (i = 0; i < LISTENERS; ++i) if (prepared_state->created[i]) close_listener(h, &h->listeners[i]);
     if (g) destroy_generation(g);
     steer_prototype_config_destroy(config);
@@ -1256,6 +1299,7 @@ static void publish_prepared(struct host *h, struct prepared *prepared)
         }
     }
 #ifdef STEER_PROTOTYPE_HY2
+    retire_hy2_outbounds(h->current);
     if(h->current)retire_datagram_generation(h->current);
 #endif
     h->current = prepared->generation; h->current->preparing = 0;
@@ -1303,6 +1347,9 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 #endif
 #ifdef STEER_PROTOTYPE_SOCKS_OUTBOUND
         "\"spec_v3_socks_tcp_outbound\":true,"
+#endif
+#ifdef STEER_PROTOTYPE_HY2
+        "\"spec_v3_hysteria2_tcp_outbound\":true,"
 #endif
         "\"spec_v3_hysteria2\":%s,\"providers\":[\"socks\",\"vless\"%s],\"inbound\":{\"hysteria2\":{\"tcp\":%s,\"udp\":%s,\"tls\":%s}}},\"drainingListeners\":[",hy2_udp,provider,hy2,hy2_udp,hy2);
     if(n<0||(size_t)n>=capacity-used)return 0;
