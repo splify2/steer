@@ -54,6 +54,9 @@ with tempfile.TemporaryDirectory(prefix='steer-cli-') as tmp:
                             assert len(body) == n
                         seen.append(line)
                         if mode == 'invalid': conn.sendall(b'{"code":0,}\n')
+                        elif mode == 'overflow': conn.sendall(b'{"code":4294967296}\n')
+                        elif mode == 'fraction': conn.sendall(b'{"code":0.5}\n')
+                        elif mode == 'duplicate': conn.sendall(b'{"stdout":"first","stdout":"broken\\u12"}\n')
                         elif mode == 'nocode': conn.sendall(b'{"error":"internal"}\n')
                         elif mode.startswith('busy'):
                             conn.sendall((b'{"error":"busy","code":"ctl.busy"}\n' if mode == 'busy-string' else b'{"error":"busy"}\n'))
@@ -66,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix='steer-cli-') as tmp:
         assert not thread.is_alive(), mode
         return result, len(seen), calls.exists()
     r = invoke('apply'); assert r.returncode == 42 and calls.exists(), ('offline', r)
-    for mode in ('drop', 'invalid', 'nocode', 'partial'):
+    for mode in ('drop', 'invalid', 'overflow', 'fraction', 'duplicate', 'nocode', 'partial'):
         r, n, fallback = run(mode)
         assert r.returncode == 4 and n == 1 and not fallback and 'неизвест' in r.stderr.decode(), (mode, r, n, fallback)
     r, n, fallback = run('preconnect'); assert r.returncode == 42 and not n and fallback

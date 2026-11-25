@@ -42,7 +42,8 @@ char *ctlcall_roundtrip(const char *line, const char *body, size_t body_n, int t
 char *ctlcall_roundtrip_sent(const char *line, const char *body, size_t body_n,
                             int timeout_s, int *sent);
 
-/* Разобрать ответ. 0 — разобран. */
+/* Разобрать ответ. 0 — разобран; при ошибке частичные поля уже освобождены.
+ * После любого результата ctlcall_resp_free безопасен. */
 int ctlcall_parse(const char *s, struct ctlcall_resp *r);
 void ctlcall_resp_free(struct ctlcall_resp *r);
 

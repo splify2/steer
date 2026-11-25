@@ -332,6 +332,7 @@ int main(int argc, char **argv) {
         if (kind == K_ROUTE) run_engine();
         fprintf(stderr, "steer: %s: %s\n", c.cmd, r.message.p ? r.message.p :
                 r.error.p ? r.error.p : "демон отказал");
+        ctlcall_resp_free(&r);
         return 1;
     }
     /* Обрезанный вывод читающей команды — повторить движком целиком, а не отдать обрубок. */
@@ -357,5 +358,7 @@ int main(int argc, char **argv) {
     if (!strcmp(c.cmd, "apply") && r.applied == 0 && r.enabled == 0)
         fputs("steer: ядро выключено — спека сохранена, в ядро Linux не применялась\n", stderr);
     fflush(stdout);
-    return r.error.p && r.code == 0 ? 1 : r.code;
+    int code = r.error.p && r.code == 0 ? 1 : r.code;
+    ctlcall_resp_free(&r);
+    return code;
 }

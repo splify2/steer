@@ -198,9 +198,10 @@ static const char *json_skip(const char *s) {
     return s;
 }
 
-int ctlcall_parse(const char *s, struct ctlcall_resp *r) {
+static int parse_resp(const char *s, struct ctlcall_resp *r) {
     memset(r, 0, sizeof(*r));
     r->enabled = r->applied = -1;
+    int seen_code = 0;
     s = skip_ws(s);
     if (*s++ != '{') return -1;
     for (;;) {
@@ -220,26 +221,45 @@ int ctlcall_parse(const char *s, struct ctlcall_resp *r) {
         else if (!strcmp(key.p, "state_dir")) dst = &r->state_dir;
         else if (!strcmp(key.p, "ecode")) dst = &r->ecode;
         if (dst && *s == '"') {
-            free(dst->p);
-            s = json_str(s, dst);
+            struct ctlcall_str value = {0};
+            s = json_str(s, &value);
+            if (s) {
+                free(dst->p);
+                *dst = value;
+            }
         } else if (!strcmp(key.p, "args") && *s == '{') {
             const char *end = json_skip(s);
             if (end) {
-                free(r->args.p);
-                r->args.p = strndup(s, (size_t)(end - s));
-                r->args.n = (size_t)(end - s);
+                size_t n = (size_t)(end - s);
+                char *value = strndup(s, n);
+                if (!value) end = NULL;
+                else {
+                    free(r->args.p);
+                    r->args.p = value;
+                    r->args.n = n;
+                }
             }
             s = end;
-        } else if (!strcmp(key.p, "code") && *s == '"') {
-            /* Машинное слово отказа сервера, не код завершения подкоманды. */
-            s = json_str(s, NULL);
         } else if (!strcmp(key.p, "code")) {
-            char *e = NULL;
-            long v = strtol(s, &e, 10);
-            if (e == s) { free(key.p); return -1; }
-            r->has_code = 1;
-            r->code = (int)v;
-            s = e;
+            if (seen_code++) { free(key.p); return -1; }
+            if (*s == '"') {
+                /* Машинное слово отказа сервера, не код завершения подкоманды. */
+                s = json_str(s, NULL);
+            } else {
+                /* Код процесса — целое 0..255: exit(256) иначе превратился бы в успех. */
+                char *e = NULL;
+                if (*s < '0' || *s > '9' || (*s == '0' && s[1] >= '0' && s[1] <= '9')) {
+                    free(key.p); return -1;
+                }
+                errno = 0;
+                long v = strtol(s, &e, 10);
+                if (errno == ERANGE || v > 255 || (*skip_ws(e) != ',' && *skip_ws(e) != '}')) {
+                    free(key.p); return -1;
+                }
+                r->has_code = 1;
+                r->code = (int)v;
+                s = e;
+            }
         } else {
             int *flag = !strcmp(key.p, "truncated") ? &r->truncated :
                         !strcmp(key.p, "enabled") ? &r->enabled :
@@ -259,6 +279,12 @@ int ctlcall_parse(const char *s, struct ctlcall_resp *r) {
         if (*s == '}') return *skip_ws(s + 1) ? -1 : 0;
         return -1;
     }
+}
+
+int ctlcall_parse(const char *s, struct ctlcall_resp *r) {
+    int rc = parse_resp(s, r);
+    if (rc != 0) ctlcall_resp_free(r);
+    return rc;
 }
 
 void ctlcall_resp_free(struct ctlcall_resp *r) {

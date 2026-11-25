@@ -98,9 +98,18 @@ $(BUILD)/steer: $(CLIENT_SRC) src/platform/platform.h | $(BUILD)/steerd
 	$(CC) $(CFLAGS) -o $@ $(CLIENT_SRC)
 
 # Изолированный клиент и fake Unix socket: без сборки/запуска движка и сетевых правил.
-.PHONY: client-delivery-test
-client-delivery-test: $(BUILD)/client-delivery-steer
+.PHONY: client-delivery-test ctlcall-parse-test ctlcall-parse-asan
+client-delivery-test: $(BUILD)/client-delivery-steer ctlcall-parse-test
 	python3 tests/client-delivery.py $(BUILD)/client-delivery-steer
+ctlcall-parse-test: $(BUILD)/ctlcall-parse-test
+	$(BUILD)/ctlcall-parse-test
+$(BUILD)/ctlcall-parse-test: tests/ctlcall-parse-test.c src/lib/ctlcall.c src/lib/ctlcall.h $(PLATFORM_SRC)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Wl,--wrap=malloc,--wrap=realloc,--wrap=strndup -o $@ tests/ctlcall-parse-test.c src/lib/ctlcall.c $(PLATFORM_SRC)
+ctlcall-parse-asan:
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -g -O1 -fsanitize=address -fno-omit-frame-pointer -Wl,--wrap=malloc,--wrap=realloc,--wrap=strndup -o $(BUILD)/ctlcall-parse-asan tests/ctlcall-parse-test.c src/lib/ctlcall.c $(PLATFORM_SRC)
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 $(BUILD)/ctlcall-parse-asan
 $(BUILD)/client-delivery-steer: $(CLIENT_SRC) src/lib/ctlcall.h src/platform/platform.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(CLIENT_SRC)
