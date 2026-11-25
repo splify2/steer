@@ -38,6 +38,9 @@ int ctlcall_open(int timeout_s);
 /* Один запрос — один ответ: строка JSON до '\n' (malloc; без '\n'). NULL — соединения нет или
  * ответ не пришёл за срок. */
 char *ctlcall_roundtrip(const char *line, const char *body, size_t body_n, int timeout_s);
+/* sent становится ненулевым после отправки хотя бы одного байта запроса. */
+char *ctlcall_roundtrip_sent(const char *line, const char *body, size_t body_n,
+                            int timeout_s, int *sent);
 
 /* Разобрать ответ. 0 — разобран. */
 int ctlcall_parse(const char *s, struct ctlcall_resp *r);

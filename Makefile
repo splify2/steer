@@ -97,6 +97,14 @@ $(BUILD)/steer: $(CLIENT_SRC) src/platform/platform.h | $(BUILD)/steerd
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(CLIENT_SRC)
 
+# Изолированный клиент и fake Unix socket: без сборки/запуска движка и сетевых правил.
+.PHONY: client-delivery-test
+client-delivery-test: $(BUILD)/client-delivery-steer
+	python3 tests/client-delivery.py $(BUILD)/client-delivery-steer
+$(BUILD)/client-delivery-steer: $(CLIENT_SRC) src/lib/ctlcall.h src/platform/platform.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(CLIENT_SRC)
+
 # Серверная половина обфускации (VPS, server/install.sh и архив steer-obfs-<версия>-<арх>.tar.gz в build.sh):
 # программа плагина obfs из тех же исходников (PROFILE_plug_obfs) — её команда obfs-server. Ядро (steerd)
 # этой команды с 2.1 не несёт, клиент сокета build/steer — тем более; без своей цели установка из исходников
@@ -148,6 +156,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@sh tests/platmatch.sh
 	@sh tests/supervisematch.sh
 	@sh tests/ctlmatch.sh
+	@$(MAKE) client-delivery-test
 	@sh tests/pluginlimits.sh
 	@sh tests/pluginkindmatch.sh
 	@sh tests/reroutematch.sh

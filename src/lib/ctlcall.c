@@ -43,7 +43,7 @@ int ctlcall_open(int timeout_s) {
     return s;
 }
 
-static int write_all(int fd, const char *p, size_t n) {
+static int write_all(int fd, const char *p, size_t n, int *sent) {
     while (n) {
         /* send с MSG_NOSIGNAL, а не write: демон, закрывший сокет раньше, чем дочитал тело, —
          * отказ записи, после которого ответ всё равно читается (ctlcall_roundtrip, ниже), а не
@@ -51,6 +51,7 @@ static int write_all(int fd, const char *p, size_t n) {
         ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
         if (w < 0 && errno == EINTR) continue;
         if (w <= 0) return -1;
+        if (sent) *sent = 1;
         p += w;
         n -= (size_t)w;
     }
@@ -58,11 +59,17 @@ static int write_all(int fd, const char *p, size_t n) {
 }
 
 char *ctlcall_roundtrip(const char *line, const char *body, size_t body_n, int timeout_s) {
+    return ctlcall_roundtrip_sent(line, body, body_n, timeout_s, NULL);
+}
+
+char *ctlcall_roundtrip_sent(const char *line, const char *body, size_t body_n,
+                            int timeout_s, int *sent) {
+    if (sent) *sent = 0;
     int s = ctlcall_open(timeout_s);
     if (s < 0) return NULL;
     /* Ошибка записи не повод молчать: сервер мог отказать (тело больше предела) и закрыть
      * соединение, не читая, — его ответ всё равно лежит в сокете. */
-    if (write_all(s, line, strlen(line)) == 0 && body_n) write_all(s, body, body_n);
+    if (write_all(s, line, strlen(line), sent) == 0 && body_n) write_all(s, body, body_n, sent);
     size_t cap = 4096, n = 0;
     char *r = malloc(cap);
     if (!r) { close(s); return NULL; }
@@ -198,7 +205,7 @@ int ctlcall_parse(const char *s, struct ctlcall_resp *r) {
     if (*s++ != '{') return -1;
     for (;;) {
         s = skip_ws(s);
-        if (*s == '}') return 0;
+        if (*s == '}') return *skip_ws(s + 1) ? -1 : 0;
         struct ctlcall_str key = {0};
         if (!(s = json_str(s, &key))) return -1;
         s = skip_ws(s);
@@ -223,6 +230,9 @@ int ctlcall_parse(const char *s, struct ctlcall_resp *r) {
                 r->args.n = (size_t)(end - s);
             }
             s = end;
+        } else if (!strcmp(key.p, "code") && *s == '"') {
+            /* Машинное слово отказа сервера, не код завершения подкоманды. */
+            s = json_str(s, NULL);
         } else if (!strcmp(key.p, "code")) {
             char *e = NULL;
             long v = strtol(s, &e, 10);
@@ -241,8 +251,12 @@ int ctlcall_parse(const char *s, struct ctlcall_resp *r) {
         free(key.p);
         if (!s) return -1;
         s = skip_ws(s);
-        if (*s == ',') { s++; continue; }
-        if (*s == '}') return 0;
+        if (*s == ',') {
+            s = skip_ws(s + 1);
+            if (*s == '}') return -1;
+            continue;
+        }
+        if (*s == '}') return *skip_ws(s + 1) ? -1 : 0;
         return -1;
     }
 }

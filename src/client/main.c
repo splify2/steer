@@ -14,8 +14,8 @@
  *
  * ВЫВОД ТОТ ЖЕ. Ответ демона несёт код возврата, stdout и stderr одноимённой подкоманды — их
  * клиент и печатает, байт в байт, и выходит тем же кодом. Отказ самого сервера без кода
- * (denied, internal, bad-request…) — не ответ на вопрос, и клиент тогда тоже отдаёт команду
- * движку: прежнее поведение лучше отказа, который раньше не случался.
+ * (denied, internal, bad-request…) обычно передаётся движку, но для отправленного apply исход
+ * неизвестен: повторять его в обход демона нельзя.
  *
  * К ТОМУ ЛИ ДЕМОНУ. Сокет — STEER_SOCKET или путь платформы. Демон на нём может обслуживать
  * другую спеку или другой каталог состояния (стенд, ручной запуск с --spec), и тогда ответ на
@@ -48,6 +48,8 @@
  * кодов подкоманд (0, 1 — поломка, 2 — отказ разбора), чтобы init.d мог сказать «демон не
  * запущен» отдельно от «reload не прошёл». */
 #define EXIT_NODAEMON 3
+/* Исход отправленного apply неизвестен: повтор может применить его второй раз. */
+#define EXIT_UNKNOWN 4
 
 static char **g_argv;
 static char g_engine[PATH_MAX + 16];
@@ -282,9 +284,17 @@ int main(int argc, char **argv) {
     char *raw = NULL;
     for (int tries = 0;; tries++) {
         /* Срок ответа: apply у демона идёт до 420 с (план и применение), сверх того — зависание. */
-        raw = ctlcall_roundtrip(line, body, body_n, 600);
+        int sent = 0;
+        raw = ctlcall_roundtrip_sent(line, body, body_n, 600, &sent);
         if (!raw || ctlcall_parse(raw, &r) != 0) {
+            if (raw) ctlcall_resp_free(&r);
             free(raw);
+            if (!strcmp(c.cmd, "apply") && sent) {
+                free(body);
+                fprintf(stderr, "steer: apply: исход неизвестен — ответ демона потерян или "
+                                "некорректен; проверьте состояние перед повтором\n");
+                return EXIT_UNKNOWN;
+            }
             if (readonly || kind == K_ROUTE) {
                 if (!readonly) fprintf(stderr, "steer[warn] демон не ответил на %s — "
                                                "исполняю ядром\n", c.cmd);
@@ -305,9 +315,20 @@ int main(int argc, char **argv) {
     free(raw);
     free(body);
 
+    if (!strcmp(c.cmd, "apply") && r.error.p && !strcmp(r.error.p, "busy")) {
+        fprintf(stderr, "steer: apply: демон занят — повторите позже\n");
+        ctlcall_resp_free(&r);
+        return 1;
+    }
     if (!r.has_code) {
-        /* Отказ сервера без исполнения: прежний путь — движок — лучше отказа, которого раньше не
-         * было. Только демону принадлежащие команды отказом и отвечают. */
+        /* Для apply отсутствие кода не доказывает отсутствие исполнения. Для остальных команд
+         * сохраняется прежний fallback; команды только демона отвечают отказом. */
+        if (!strcmp(c.cmd, "apply")) {
+            fprintf(stderr, "steer: apply: исход неизвестен — ответ демона без кода; "
+                            "проверьте состояние перед повтором\n");
+            ctlcall_resp_free(&r);
+            return EXIT_UNKNOWN;
+        }
         if (kind == K_ROUTE) run_engine();
         fprintf(stderr, "steer: %s: %s\n", c.cmd, r.message.p ? r.message.p :
                 r.error.p ? r.error.p : "демон отказал");
