@@ -239,6 +239,7 @@ struct pm_ctx {
     size_t nundo;
     struct pm_err before_err;    /* ошибка plugin-reload до установки (before_bad) */
     int before_bad;
+    int install_degraded;       /* журнал оставлен: эту команду нельзя продолжать */
     const char *pkg_tx;          /* --pkg ИМЯ: менеджер зовёт скрипт этого системного пакета изнутри
                                     транзакции apk/opkg — пакет считается стоящим, база заперта */
     struct pm_mslot *mc;         /* кэш манифестов команд только чтения (pm_mcache_on): хеш по id */
@@ -273,6 +274,8 @@ struct pm_done { char *id, *version, *from, *old; int updated; };
 struct pm_result { struct pm_done *v; size_t n; char **failed; size_t nfailed; };
 int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const struct pm_opts *o,
                struct pm_result *res, struct pm_err *e);
+/* Не выдавать смешанный набор как нормальный после незавершённой установки. */
+int pm_install_pending(struct pm_err *e);
 int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_err *e);
 /* Стоящие плагины, несовместимые по ABI со стоящими библиотеками (проба программ, pminst.c), кроме skip: их ids
  * в *bad, библиотеки — в *libs (NULL — не нужны), строка первого отказа — в *first_why (NULL — не нужна; куча). */

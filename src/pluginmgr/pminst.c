@@ -1408,16 +1408,18 @@ static int links_validate(struct pm_ctx *x, const char *id, const struct ynode *
  * conf — только с purge), поставить недостающие из want. want NULL — снять всё. */
 static int links_apply(const char *id, const struct ynode *want, const struct ynode *drop, int purge, struct pm_err *e) {
     const struct ynode *wl = links_of(want), *dl = links_of(drop);
+    int rc = 0;
     for (size_t i = 0; i < ynode_len(dl); i++) {
         const struct ynode *l = ynode_at(dl, i);
         const char *path = yn_str(l, "path");
         if (!path || links_has(wl, path)) continue;
         char *full = pm_fmt("%s%s", pm_sysroot(), path);
         if (!strcmp(link_mode(l), "conf")) { if (purge) unlink(full); }
-        else if (link_ours(full, id)) unlink(full);
+        else if (link_ours(full, id) && unlink(full) != 0 && errno != ENOENT)
+            rc = pm_errc(e, "plugin.link_remove", PMA("path", path, "why", strerror(errno)),
+                         "не снять ссылку %s: %s", path, strerror(errno));
         free(full);
     }
-    int rc = 0;
     for (size_t i = 0; i < ynode_len(wl); i++) {
         const struct ynode *l = ynode_at(wl, i);
         const char *path = yn_str(l, "path"), *target = yn_str(l, "target");
@@ -1843,6 +1845,30 @@ struct src {
     const char *reason;          /* причина варианта (облегчённый) */
 };
 
+/* Маркер под тем же flock, что и установка. Убирается только после полного commit/отката;
+ * в случае SIGKILL остаётся вместе с .prev или .stage для диагностики. */
+static char *install_marker(void) { return pm_path(pm_root(), ".install-in-progress"); }
+
+static int install_degraded(struct pm_err *e, const char *marker) {
+    return pm_errc(e, "plugin.install_degraded", PMA("path", marker),
+                   "установка не завершена; проверьте состояние плагинов и журнал %s", marker);
+}
+
+int pm_install_pending(struct pm_err *e) {
+    char *marker = install_marker();
+    struct stat st;
+    int pending = lstat(marker, &st) == 0 || errno != ENOENT;
+    int rc = pending ? install_degraded(e, marker) : 0;
+    free(marker);
+    return rc;
+}
+
+static int install_marker_clear(struct pm_ctx *x, const char *marker, struct pm_err *e) {
+    if (unlink(marker) == 0) return 0;
+    x->install_degraded = 1;
+    return install_degraded(e, marker);
+}
+
 static int install_one(struct pm_ctx *x, const struct src *s, const char *want_id, struct pm_result *res,
                        struct pm_err *e) {
     char *archive = NULL;
@@ -1882,6 +1908,7 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     size_t nsys = 0;
     struct outs before = {0};
     const char *mid = id;
+    char *marker = NULL;
     /* У файла id ещё неизвестен: распаковка под временным именем, id — из заголовка MANIFEST. */
     if (unpack_verified(archive, stage, s->c ? id : NULL, &ks, s->c ? 0 : s->unsigned_ok, &is_unsigned, hid, hver,
                         harch, sizeof(hver), e) != 0)
@@ -1962,6 +1989,18 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     }
     if (manifest_checks(x, id, m, official, repo, e) != 0) goto out_stage;
     if (links_validate(x, id, m, stage, e) != 0) goto out_stage;
+    if (!x->defer) {
+        char *path = install_marker();
+        char *note = pm_fmt("%s %s\n", id, mver);
+        int r = pm_write_atomic(path, note, strlen(note), 0600);
+        free(note);
+        if (r != 0) {
+            pm_errc(e, "plugin.write_failed", PMA("path", path), "не записать %s", path);
+            free(path);
+            goto out_stage;
+        }
+        marker = path;
+    }
     if (system_deps(x, id, m, &sys, &nsys, e) != 0) goto out_stage;
     if (run_script(id, stage, m, "postinst", "--check", e) != 0) goto out_stage;
     if (abi_check(x, id, mver, m, stage, res, e) != 0) goto out_stage;
@@ -1972,10 +2011,14 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     char *dir = pm_path(pm_root(), id);
     char *prevd = pm_path(pm_root(), ".prev");
     char *prev = pm_path(prevd, id);
-    pm_mkdirs(prevd);
-    pm_rmrf(prev);
     int had_dir = pm_is_dir(dir);
     char *old_ver = NULL;
+    if (pm_mkdirs(prevd) != 0 || pm_rmrf(prev) != 0) {
+        pm_errc(e, "plugin.prev_move_failed", PMA("id", id, "why", strerror(errno)),
+                "не подготовить .prev для %s: %s", id, strerror(errno));
+        free(dir); free(prevd); free(prev);
+        goto out_stage;
+    }
     struct ydoc *oldman = had_dir ? pm_manifest(id) : NULL;
     if (oldman) old_ver = pm_strdup(yn_str(ydoc_root(oldman), "version"));
     if (!old_ver && old.version) old_ver = pm_strdup(old.version);
@@ -2001,7 +2044,10 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     }
     if (rename(stage, dir) != 0) {
         pm_errc(e, "plugin.place_failed", PMA("id", id, "why", strerror(errno)), "не поставить %s на место: %s", id, strerror(errno));
-        if (had_dir) rename(prev, dir);
+        if (had_dir && rename(prev, dir) != 0 && marker) {
+            x->install_degraded = 1;
+            install_degraded(e, marker);
+        }
         free(dir); free(prevd); free(prev); free(old_ver);
         goto out_stage;
     }
@@ -2048,9 +2094,17 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     if (healthy && old_ver && pm_ver_major(old_ver) != pm_ver_major(mver) &&
         run_script(id, dir, m, "migrate", old_ver, &he) != 0) healthy = 0;
     if (healthy && run_script(id, dir, m, "postinst", old_ver ? old_ver : "", &he) != 0) healthy = 0;
-    struct pm_err se = {0};
-    pm_state_save(&x->st, &se);
-    pm_keepd_write(x);
+    int save_failed = 0;
+    if (healthy) {
+        save_failed = pm_state_save(&x->st, &he) != 0;
+        if (save_failed) healthy = 0;
+        else if (pm_keepd_write(x) != 0 && marker) {
+            pm_errc(&he, "plugin.write_failed", PMA("path", pm_keepd()),
+                    "не записать данные платформы или %s", pm_keepd());
+            save_failed = 1;
+            healthy = 0;
+        }
+    }
     if (healthy && x->defer) {
         /* Группа: проверка здоровья одна, в конце (group_finish); здесь — только запись для отката. */
         struct undo *u;
@@ -2079,41 +2133,58 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     if (!healthy) {
         /* Откат (s2p.md, «Откат»). */
         pm_progress(x, "откат %s: %s", id, he.msg);
-        pm_rmrf(dir);
+        int rollback_bad = pm_rmrf(dir) != 0;
         int restored = 0;
         if (had_dir && rename(prev, dir) == 0) restored = 1;
+        if (had_dir && !restored) rollback_bad = 1;
         {
             /* Ссылки — к восстановленной версии; новые пути без неё снимаются. */
             struct ydoc *rd = restored ? pm_manifest(id) : NULL;
             struct pm_err le = {0};
-            links_apply(id, rd ? ydoc_root(rd) : NULL, m, 0, &le);
+            if ((restored && !rd) || links_apply(id, rd ? ydoc_root(rd) : NULL, m, 0, &le) != 0)
+                rollback_bad = 1;
             if (rd) ydoc_free(rd);
         }
         inst = pm_state_find(&x->st, id);
         char *bad_why = restored ? pm_fmt("%s — возвращена %s", he.msg, old_ver ? old_ver : "прежняя")
                                  : pm_strdup(he.msg);
-        if (restored && inst) {
+        if (old.had && inst) {
             snap_put(&old, inst);
-            pm_bad_set(inst, mver, bad_why);
+            if (!save_failed) pm_bad_set(inst, mver, bad_why);
         } else if (inst) {
             pm_state_del(&x->st, id);
         }
-        pm_state_save(&x->st, &se);
-        pm_keepd_write(x);
+        struct pm_err se = {0};
+        if (pm_state_save(&x->st, &se) != 0) rollback_bad = 1;
+        if (pm_keepd_write(x) != 0) rollback_bad = 1;
         struct pm_err re = {0};
         if (restored && pm_daemon_reload(x, &re) != 0 && inst) {
             /* И откат не здоров: плагин failed, его выходы — в on_fail. */
             inst = pm_state_find(&x->st, id);
-            if (inst) { pm_inst_set(&inst->state, "failed"); pm_inst_set(&inst->why, re.msg); pm_state_save(&x->st, &se); }
+            if (inst) {
+                pm_inst_set(&inst->state, "failed"); pm_inst_set(&inst->why, re.msg);
+                if (pm_state_save(&x->st, &se) != 0) rollback_bad = 1;
+            }
         }
-        pm_event(x, id, restored ? "rolled-back" : "failed", restored ? old_ver : mver, mver, bad_why);
-        pm_errc(e, restored ? "plugin.health_failed_restored" : "plugin.health_failed", PMA("id", id, "version", mver, "why", he.msg), "%s %s не прошёл проверку здоровья: %s%s", id, mver, he.msg,
-                restored ? " — возвращена прежняя версия" : "");
+        if (rollback_bad && marker) {
+            x->install_degraded = 1;
+            install_degraded(e, marker);
+        } else {
+            if (save_failed) *e = he;
+            else pm_errc(e, restored ? "plugin.health_failed_restored" : "plugin.health_failed", PMA("id", id, "version", mver, "why", he.msg), "%s %s не прошёл проверку здоровья: %s%s", id, mver, he.msg,
+                         restored ? " — возвращена прежняя версия" : "");
+            if (!marker || install_marker_clear(x, marker, e) == 0)
+                pm_event(x, id, restored ? "rolled-back" : "failed", restored ? old_ver : mver, mver, bad_why);
+        }
         free(bad_why);
         free(dir); free(prevd); free(prev); free(old_ver);
         goto out;
     }
     if (!x->defer) {
+        if (install_marker_clear(x, marker, e) != 0) {
+            free(dir); free(prevd); free(prev); free(old_ver);
+            goto out;
+        }
         pm_rmrf(prev);
         pm_event(x, id, old_ver && strcmp(old_ver, mver) ? "updated" : (was_disabled ? "installed" : "enabled"), mver,
                  old_ver, s->reason);
@@ -2129,8 +2200,10 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     rc = 0;
     goto out;
 out_stage:
-    pm_rmrf(stage);
+    if (marker && !x->install_degraded) install_marker_clear(x, marker, e);
+    if (!x->install_degraded) pm_rmrf(stage);
 out:
+    free(marker);
     if (man) ydoc_free(man);
     snap_free(&old);
     outs_free(&before);
@@ -2309,6 +2382,7 @@ static int plan_skip(struct pm_ctx *x, const struct pm_cand *c, char *const *for
 int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const struct pm_opts *o,
                struct pm_result *res, struct pm_err *e) {
     memset(res, 0, sizeof(*res));
+    if (pm_install_pending(e) != 0) return -1;
     if (o->nfiles) return install_files(x, o->files, o->nfiles, o, res, e);
     if (o->file) { const char *one[] = { o->file }; return install_files(x, one, 1, o, res, e); }
     x->allow_bad = o->allow_bad;
