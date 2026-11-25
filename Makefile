@@ -43,13 +43,12 @@ MODEL_KINDS := $(MODEL_SRC) $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC))
 override CFLAGS += $(addprefix -I,$(INC_DIRS)) $(THIRD_DEFS)
 
 .PHONY: all test clean ext-syntax ext-test libs-test libs-exports snapshot-record print-inc ndk-check
-all: $(BUILD)/steerd $(BUILD)/steer
 
 # The v3 nano profile uses the same source-linked core and revisioned control
 # socket; it is not the legacy OpenWrt package or a second daemon implementation.
 NANO ?= 0
 ifeq ($(NANO),1)
-.DEFAULT_GOAL := nano
+all: nano
 NANO_BUILD ?= $(abspath $(BUILD)/nano)
 NANO_SDK ?= $(abspath ../plugin-sdk)
 NANO_PROTOCOLS ?= $(abspath ../steer-protocols)
@@ -68,7 +67,9 @@ nano-test: nano
 		CFLAGS="-Os -std=c11 -Wall -Wextra -Werror -pedantic -ffunction-sections -fdata-sections" \
 		LDFLAGS="-Wl,--gc-sections" $(NANO_BUILD)/vless-loopback
 	python3 -B experimental/provider/prototype_vless_outbound_test.py --core $(NANO_BUILD)/steer-nano --fixture $(NANO_BUILD)/vless-loopback
-else ifneq ($(NANO),0)
+else ifeq ($(NANO),0)
+all: $(BUILD)/steerd $(BUILD)/steer
+else
 $(error NANO must be 0 or 1)
 endif
 
