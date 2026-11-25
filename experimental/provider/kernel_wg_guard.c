@@ -38,6 +38,11 @@ table=ir_table_add(&g->policy,NFT_FAM_INET,g->table);
 for(i=0;i<g->peer_count;i++){char name[24];struct visitor v;struct nft_rule*r;snprintf(name,sizeof(name),"peer_%u",i);v.g=g;v.peer=i;v.count=0;v.chain=ir_chain_add(table,name);e=steer_policy_visit(p,c->generation,visit,&v,&fallback);if(e.code)goto fail;r=ir_rule(v.chain);ir_counter(r,0,0);ir_x(r,"%s",fallback==STEER_POLICY_DIRECT?"accept":"drop");}
 base=ir_base_chain_add(table,"ingress","filter","prerouting","mangle",-10);
 {struct nft_rule*r=ir_rule(base);ingress_match(g,r);ir_x(r,"ct state invalid drop");}
+if(c->return_only){
+    struct nft_rule *r=ir_rule(base);
+    ingress_match(g,r);
+    ir_x(r,"ct state != { established, related } drop");
+}
 for(i=0;i<g->source_count;i++){struct source_prefix*s=&g->sources[i];struct nft_rule*r=ir_rule(base);char address[INET6_ADDRSTRLEN];inet_ntop(s->family==4?AF_INET:AF_INET6,s->address,address,sizeof(address));ingress_match(g,r);ir_x(r,"%s saddr %s/%u",s->family==4?"ip":"ip6",address,s->bits);ir_x(r,"goto peer_%u",s->peer);}
 {struct nft_rule*r=ir_rule(base);ingress_match(g,r);ir_counter(r,0,0);ir_x(r,"drop");}
 if(g->drop.oom||g->policy.oom){e=error(STEER_PV1_RESOURCE_EXHAUSTED);goto fail;}*out=g;return error(STEER_PV1_OK);

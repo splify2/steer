@@ -74,6 +74,10 @@ int awg_dev_link_delete_owned_until(const char *,const char *,int,uint32_t,uint6
 int awg_dev_link_require_down_owned_until(const char *,const char *,int,uint32_t,uint64_t);
 int awg_dev_address_add_owned_until(const char *,const char *,int,uint32_t,const struct awg_prefix *,uint64_t);
 int awg_dev_link_up_owned_until(const char *,const char *,int,uint32_t,uint64_t);
+/* Isolated IPv4 egress: exclusive main-table link route. No replace or
+ * default route; deleting the owned link also removes its attached route. */
+int awg_dev_route_add_owned_until(const char *,const char *,int,uint32_t,const struct awg_prefix *,uint64_t);
+int awg_dev_route_check_owned_until(const char *,const char *,int,uint32_t,const struct awg_prefix *,uint64_t);
 
 /* Exclusive device creation for the experimental owned-device adapter. Never
  * adopts/reconfigures an existing link. kind must be wireguard/amneziawg.

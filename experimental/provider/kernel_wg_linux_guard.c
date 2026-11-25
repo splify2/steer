@@ -50,7 +50,16 @@ static int up(void *ctx,const struct steer_draft_wg_guard_record *r,uint64_t d){
     int rc=lookup(ctx,r,d,&handle,marker);
     if(rc)return rc;
     if(steer_draft_wg_guard_record_observe(r,handle,marker)!=STEER_DRAFT_WG_OWNED)return ESTALE;
-    return awg_dev_link_up_owned_until(r->link.physical_name,r->link.kind,(int)r->ifindex,r->link.group,d);
+    rc=awg_dev_link_up_owned_until(r->link.physical_name,r->link.kind,(int)r->ifindex,r->link.group,d);
+    const struct steer_draft_wg_linux_guard *g=ctx;
+    if(rc||!g->route)return rc;
+    /* Linux requires the route's nexthop to be UP. This is still before
+     * policy publication: the journal-proven DROP remains installed. */
+    rc=awg_dev_route_add_owned_until(r->link.physical_name,r->link.kind,
+        (int)r->ifindex,r->link.group,g->route,d);
+    if(rc)return rc;
+    return awg_dev_route_check_owned_until(r->link.physical_name,r->link.kind,
+        (int)r->ifindex,r->link.group,g->route,d);
 }
 static int retire_guard(void *ctx,const struct steer_draft_wg_guard_record *r,uint64_t d){
     const struct steer_draft_wg_linux_guard *g=ctx;

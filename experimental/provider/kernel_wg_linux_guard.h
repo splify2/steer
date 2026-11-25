@@ -8,6 +8,7 @@
 struct steer_draft_wg_linux_guard {
     struct steer_draft_wg_linux_link *link;
     struct steer_draft_kernel_wg_guard *prepared;
+    const struct awg_prefix *route; /* optional; valid through staging only */
 };
 extern const struct steer_draft_wg_backend steer_draft_wg_linux_guard_backend;
 

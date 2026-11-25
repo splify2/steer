@@ -16,6 +16,11 @@ int steer_draft_wg_v3_options(void *, const struct ynode *);
  * supplies guard generation and physical name from the owned link identity. */
 int steer_draft_wg_v3_configure(const struct steer_spec_plan *, uint32_t,
     struct steer_draft_wg_v3_config *);
+/* Opt-in kernel-backed TCP egress: one numeric UDP peer, one IPv4 /32 source
+ * and one explicit route equal to its sole AllowedIPs prefix. */
+int steer_draft_wg_v3_egress_options(void *,const struct ynode *);
+int steer_draft_wg_v3_egress(const struct steer_spec_plan *,uint32_t,
+    struct steer_draft_wg_v3_config *,struct awg_prefix *route);
 /* Resolver receives validated secret declaration IDs, not names or values from
  * intent. On failure keys are wiped; on success caller must wipe after use. */
 struct steer_pv1_error steer_draft_wg_v3_keys(const struct steer_draft_wg_v3_config *,

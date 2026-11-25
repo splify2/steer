@@ -64,15 +64,15 @@ static int secret(const struct ynode *node,char out[64]){
     return 1;
 }
 
-static int parse(const struct ynode *options,struct steer_draft_wg_v3_config *out){
-    static const char *const fields[]={"private_key","listen_port","mtu","addresses","peers"};
+static int parse(const struct ynode *options,struct steer_draft_wg_v3_config *out,struct awg_prefix *route){
+    static const char *const fields[]={"private_key","listen_port","mtu","addresses","peers","route_prefix"};
     static const char *const peer_fields[]={"public_key","preshared_key","principal_id","allowed_ips"};
     struct awg_conf *kernel=&out->kernel;
     const struct ynode *addresses=ynode_get(options,"addresses"),*peers=ynode_get(options,"peers");
     const struct ynode *mtu=ynode_get(options,"mtu");
     long port,mtu_value=1420;
     memset(out,0,sizeof(*out));
-    if(!map(options,fields,sizeof(fields)/sizeof(fields[0]))||
+    if(!map(options,fields,sizeof(fields)/sizeof(fields[0])-(route?0:1))||
        !secret(ynode_get(options,"private_key"),out->private_key)||
        !integer(ynode_get(options,"listen_port"),1,65535,&port)||
        (mtu&&!integer(mtu,1280,9000,&mtu_value))||
@@ -114,13 +114,39 @@ static int parse(const struct ynode *options,struct steer_draft_wg_v3_config *ou
     }
     kernel->peer_n=peers->len;
     out->guard.peer_count=(uint32_t)peers->len;
+    if(route){
+        const struct awg_prefix *source=&kernel->addr[0],*aip=&kernel->aips[0];
+        if(kernel->addr_n!=1||source->family!=AF_INET||source->cidr!=32||
+           kernel->peer_n!=1||kernel->aips_n!=1||
+           !prefix(ynode_get(options,"route_prefix"),route)||route->family!=AF_INET||
+           route->cidr<24||route->cidr!=aip->cidr||aip->family!=AF_INET||
+           memcmp(route->addr,aip->addr,4)||overlap(source,route)||
+           !route->addr[0]||route->addr[0]==127||route->addr[0]>=224||
+           !source->addr[0]||source->addr[0]==127||source->addr[0]>=224)return 0;
+    }
     return 1;
 }
 
 int steer_draft_wg_v3_options(void *unused,const struct ynode *options){
     (void)unused;
     struct steer_draft_wg_v3_config config;
-    return parse(options,&config);
+    return parse(options,&config,NULL);
+}
+
+int steer_draft_wg_v3_egress_options(void *unused,const struct ynode *options){
+    (void)unused;
+    struct steer_draft_wg_v3_config config;
+    struct awg_prefix route;
+    return parse(options,&config,&route);
+}
+
+static int secret_kinds(const struct steer_spec_plan *plan,const struct steer_draft_wg_v3_config *out){
+    const struct ynode *secrets=ynode_get(steer_spec_intent(plan),"secrets");
+    if(strcmp(text(ynode_get(ynode_get(secrets,out->private_key),"kind")),"wireguard_private_key"))return 0;
+    for(size_t i=0;i<out->kernel.peer_n;i++)
+        if(out->kernel.peer[i].has_psk&&strcmp(text(ynode_get(ynode_get(secrets,out->preshared_keys[i]),"kind")),
+           "wireguard_preshared_key"))return 0;
+    return 1;
 }
 
 int steer_draft_wg_v3_configure(const struct steer_spec_plan *plan,uint32_t index,
@@ -129,13 +155,36 @@ int steer_draft_wg_v3_configure(const struct steer_spec_plan *plan,uint32_t inde
     if(!steer_spec_summary(plan).topology_valid||!steer_spec_node(plan,index,&node)||
        !node.enabled||node.kind!=STEER_SPEC_INBOUND||node.flows!=STEER_SPEC_FLOW_DEVICE||
        strncmp(node.provider,"wireguard:",10)||(node.variant&&strcmp(text(node.variant),"default"))||
-       !parse(node.options,out))return 0;
-    const struct ynode *secrets=ynode_get(steer_spec_intent(plan),"secrets");
-    if(strcmp(text(ynode_get(ynode_get(secrets,out->private_key),"kind")),"wireguard_private_key"))return 0;
-    for(size_t i=0;i<out->kernel.peer_n;i++)
-        if(out->kernel.peer[i].has_psk&&strcmp(text(ynode_get(ynode_get(secrets,out->preshared_keys[i]),"kind")),
-           "wireguard_preshared_key"))return 0;
+       !parse(node.options,out,NULL)||!secret_kinds(plan,out))return 0;
     strcpy(out->guard.inbound_id,node.id);
+    return 1;
+}
+
+int steer_draft_wg_v3_egress(const struct steer_spec_plan *plan,uint32_t index,
+    struct steer_draft_wg_v3_config *out,struct awg_prefix *route){
+    struct steer_spec_node_view n;
+    if(!route||!steer_spec_summary(plan).runtime_ready||!steer_spec_node(plan,index,&n)||
+       !n.enabled||n.kind!=STEER_SPEC_OUTBOUND||n.flows!=STEER_SPEC_FLOW_STREAM||
+       strcmp(n.provider,"wireguard:main")||strcmp(text(n.variant),"kernel")||
+       strcmp(text(ynode_get(n.transport,"type")),"udp")||n.transport->len!=1||
+       n.security||ynode_get(n.intent,"detour")||ynode_get(n.intent,"resolve_via")||
+       !n.endpoint||n.endpoint->len!=2||!parse(n.options,out,route)||!secret_kinds(plan,out))return 0;
+    long port;
+    struct sockaddr_in endpoint={.sin_family=AF_INET};
+    if(inet_pton(AF_INET,text(ynode_get(n.endpoint,"address")),&endpoint.sin_addr)!=1||
+       !integer(ynode_get(n.endpoint,"port"),1,65535,&port))return 0;
+    struct awg_prefix underlay={.family=AF_INET,.cidr=32};
+    memcpy(underlay.addr,&endpoint.sin_addr,4);
+    if(!underlay.addr[0]||underlay.addr[0]==127||underlay.addr[0]>=224||
+       overlap(&underlay,route)||overlap(&underlay,&out->kernel.addr[0]))return 0;
+    endpoint.sin_port=htons((uint16_t)port);
+    out->kernel.peer[0].has_ep=1;
+    out->kernel.peer[0].ep_port=(uint16_t)port;
+    if(!inet_ntop(AF_INET,&endpoint.sin_addr,out->kernel.peer[0].ep_host,
+        sizeof(out->kernel.peer[0].ep_host)))return 0;
+    out->kernel.peer[0].ep_len=sizeof(endpoint);
+    memcpy(&out->kernel.peer[0].ep,&endpoint,sizeof(endpoint));
+    strcpy(out->guard.inbound_id,n.id);
     return 1;
 }
 

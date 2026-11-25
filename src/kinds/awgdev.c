@@ -923,6 +923,63 @@ static int owned_identity_state_until(const char *name,const char *kind,int inde
 static int owned_identity_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline){
     return owned_identity_state_until(name,kind,index,group,NULL,deadline);
 }
+struct wg_route_check { const struct awg_prefix *prefix; int index,found; };
+static void wg_route_cb(const struct nlmsghdr *h,void *ctx){
+    struct wg_route_check *r=ctx;
+    const struct rtmsg *rt=NLMSG_DATA(h);
+    size_t head=NLMSG_LENGTH(sizeof(*rt));
+    if(h->nlmsg_type!=RTM_NEWROUTE||h->nlmsg_len<head||rt->rtm_family!=AF_INET||
+       rt->rtm_table!=RT_TABLE_MAIN||rt->rtm_protocol!=RTPROT_STATIC||
+       rt->rtm_type!=RTN_UNICAST||rt->rtm_scope!=RT_SCOPE_LINK||rt->rtm_dst_len!=r->prefix->cidr)return;
+    const struct nlattr *a[RTA_MAX+1];
+    attrs_parse((const uint8_t *)h+head,h->nlmsg_len-head,a,RTA_MAX);
+    if(!a[RTA_DST]||NLA_PLEN(a[RTA_DST])!=4||memcmp(NLA_DATA(a[RTA_DST]),r->prefix->addr,4)||
+       !a[RTA_OIF]||NLA_PLEN(a[RTA_OIF])!=4||a[RTA_GATEWAY]||a[RTA_MULTIPATH]||a[RTA_PRIORITY])return;
+    uint32_t index;
+    memcpy(&index,NLA_DATA(a[RTA_OIF]),4);
+    if(index==(uint32_t)r->index)r->found=1;
+}
+static int wg_route(const char *name,const char *kind,int index,uint32_t group,
+    const struct awg_prefix *route,uint64_t deadline,int add){
+    if(!route||route->family!=AF_INET||route->cidr<24||route->cidr>32||!deadline)return EINVAL;
+    for(unsigned bit=route->cidr;bit<32;bit++)
+        if(route->addr[bit/8]&(0x80u>>(bit%8)))return EINVAL;
+    unsigned flags=0;
+    int rc=owned_identity_state_until(name,kind,index,group,&flags,deadline);
+    if(rc)return rc;
+    if(!(flags&IFF_UP))return ENETDOWN;
+    int fd=nl_open(NETLINK_ROUTE);
+    if(fd<0)return errno;
+    _Alignas(8) uint8_t buf[128];
+    struct nlbuf b;
+    struct rtmsg rt={.rtm_family=AF_INET};
+    if(add){
+        rt.rtm_dst_len=route->cidr;
+        rt.rtm_table=RT_TABLE_MAIN;
+        rt.rtm_protocol=RTPROT_STATIC;
+        rt.rtm_scope=RT_SCOPE_LINK;
+        rt.rtm_type=RTN_UNICAST;
+    }
+    struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),add?RTM_NEWROUTE:RTM_GETROUTE,
+        NLM_F_REQUEST|(add?(NLM_F_ACK|NLM_F_CREATE|NLM_F_EXCL):NLM_F_DUMP),
+        next_seq(),&rt,sizeof(rt));
+    if(add){
+        nlbuf_put_data(&b,RTA_DST,route->addr,4);
+        nlbuf_put_u32(&b,RTA_OIF,(uint32_t)index);
+    }
+    struct wg_route_check check={.prefix=route,.index=index};
+    rc=nl_talk_until(fd,buf,msg_end(&b,h),add?NULL:wg_route_cb,&check,deadline);
+    close(fd);
+    return rc?rc:!add&&!check.found?ENOENT:0;
+}
+int awg_dev_route_add_owned_until(const char *name,const char *kind,int index,uint32_t group,
+    const struct awg_prefix *route,uint64_t deadline){
+    return wg_route(name,kind,index,group,route,deadline,1);
+}
+int awg_dev_route_check_owned_until(const char *name,const char *kind,int index,uint32_t group,
+    const struct awg_prefix *route,uint64_t deadline){
+    return wg_route(name,kind,index,group,route,deadline,0);
+}
 int awg_dev_link_require_down_owned_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline){
     unsigned flags=0;
     int rc=owned_identity_state_until(name,kind,index,group,&flags,deadline);

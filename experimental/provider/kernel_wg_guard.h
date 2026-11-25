@@ -26,6 +26,9 @@ struct steer_draft_kernel_wg_guard_config {
         uint32_t allowed_count;
         char allowed_ips[STEER_DRAFT_WG_PREFIXES][64];
     } peers[STEER_DRAFT_WG_PEERS];
+    /* Client-only outbound device: permit authenticated return traffic, not
+     * peer-initiated connections to this host. */
+    int return_only;
 };
 /* No kernel mutation; compiles shared immutable policy visitor into existing
  * nft IR. Overlapping peer prefixes and applicable domain rules fail closed.
