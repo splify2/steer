@@ -143,6 +143,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@$(BUILD)/fakeipadmissionmatch
 	@sh tests/run.sh
 	@sh tests/gen.sh
+	@sh tests/fit-output.sh
 	@sh tests/snapshot.sh
 	@sh tests/v2match.sh
 	@sh tests/specschemamatch.sh

@@ -35,6 +35,9 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 
 /* An inclusive address range. Everything downstream of parsing works in ranges
@@ -350,6 +353,23 @@ static void out_flush(FILE *f) {
     if (g_outbuf_n) { fwrite(g_outbuf, 1, g_outbuf_n, f); g_outbuf_n = 0; }
 }
 
+static int finish_output(FILE *f, const char *path, int named) {
+    int error = 0;
+    if (fflush(f) != 0) error = errno;
+    if (!error && ferror(f)) error = EIO;
+    if (named) {
+        if (!error) {
+            struct stat st;
+            int fd = fileno(f);
+            if (fstat(fd, &st) != 0 || (S_ISREG(st.st_mode) && fsync(fd) != 0)) error = errno;
+        }
+        if (fclose(f) != 0 && !error) error = errno;
+    }
+    if (!error) return 0;
+    fprintf(stderr, "steer fit: %s не записался до конца: %s\n", path, strerror(error));
+    return -1;
+}
+
 /* Место под самую длинную строку: два адреса, дефис и перевод строки — 32 байта с
  * запасом. Сброс делается ДО записи, а не после, чтобы в буфере всегда было место. */
 static void out_reserve(FILE *f) {
@@ -642,6 +662,24 @@ int aggregate_main(int argc, char **argv) {
         if (l.n) covered_through = l.v[l.n - 1].hi;
     }
 
+    struct sigaction ignore = { .sa_handler = SIG_IGN }, previous;
+    sigemptyset(&ignore.sa_mask);
+    if (sigaction(SIGPIPE, &ignore, &previous) != 0) {
+        fprintf(stderr, "steer fit: не обработать SIGPIPE: %s\n", strerror(errno));
+        return 2;
+    }
+    int rc = 2;                         /* Ошибка записи, а не недостаточный бюджет. */
+    /* Сначала диапазоны, нужные вызывающему для исключений: без них основной
+     * результат применять нельзя. Не выдаём основной список и JSON при отказе. */
+    if (punch_path) {
+        merge_lossless(&g_punch);
+        FILE *pf = fopen(punch_path, "w");
+        if (!pf) { fprintf(stderr, "steer aggregate: %s: %s\n", punch_path, strerror(errno)); goto done; }
+        for (size_t i = 0; i < g_punch.n; i++) emit_range(pf, g_punch.v[i].lo, g_punch.v[i].hi);
+        out_flush(pf);
+        if (finish_output(pf, punch_path, 1) != 0) goto done;
+    }
+
     for (size_t i = 0; i < l.n; i++) emit_range(stdout, l.v[i].lo, l.v[i].hi);
     /* Свой буфер обязан быть сброшен явно: он не stdio, и его никто не допишет за нас
      * ни на exit, ни на fclose. Один забытый сброс здесь — это молча урезанный список. */
@@ -654,23 +692,12 @@ int aggregate_main(int argc, char **argv) {
         fputc('\n', stdout);
         v6_out++;
     }
-    fflush(stdout);
-
-    /* The ranges a collapse swallowed. The caller MUST route these ahead of the
-     * fitted list, or the addresses it promised to keep direct ride the tunnel. */
-    if (punch_path) {
-        merge_lossless(&g_punch);
-        FILE *pf = fopen(punch_path, "w");
-        if (!pf) { fprintf(stderr, "steer aggregate: %s: %s\n", punch_path, strerror(errno)); return 2; }
-        for (size_t i = 0; i < g_punch.n; i++) emit_range(pf, g_punch.v[i].lo, g_punch.v[i].hi);
-        out_flush(pf);
-        fclose(pf);
-    }
+    if (finish_output(stdout, "stdout", 0) != 0) goto done;
 
     FILE *rf = stderr;
     if (report_path) {
         rf = fopen(report_path, "w");
-        if (!rf) { fprintf(stderr, "steer aggregate: %s: %s\n", report_path, strerror(errno)); return 2; }
+        if (!rf) { fprintf(stderr, "steer aggregate: %s: %s\n", report_path, strerror(errno)); goto done; }
     }
     fprintf(rf, "{\"source\":%zu,\"kept\":%zu,\"waste_addresses\":%" PRIu64
                 ",\"level\":%u,\"min_count\":%zu,\"malformed\":%lu,\"truncated\":%s",
@@ -684,6 +711,9 @@ int aggregate_main(int argc, char **argv) {
         fprintf(rf, ",\"covered_through\":\"%s\"", a);
     }
     fprintf(rf, "}\n");
-    if (rf != stderr) fclose(rf);
-    return fits ? 0 : 1;
+    if (finish_output(rf, report_path ? report_path : "stderr", rf != stderr) == 0)
+        rc = fits ? 0 : 1;
+done:
+    (void)sigaction(SIGPIPE, &previous, NULL);
+    return rc;
 }
