@@ -212,5 +212,55 @@ def main(binary):
     print("configured core transactional TCP fixtures passed")
 
 
+def socks_instances(binary):
+    # Two independent instances on the same shard. Keep the secured socket
+    # across publication while a pre-auth session still pins the old instance.
+    secured, anonymous = free_port(), free_port()
+    while anonymous == secured:
+        anonymous = free_port()
+    protected = listener("secured", secured)
+    protected["auth"] = {"type": "userpass", "principal_id": "alice",
+                         "username_ref": "env:STEER_TEST_USER",
+                         "password_ref": "env:STEER_TEST_PASSWORD"}
+    document = {"prototype": "steer-linux-v1",
+                "listeners": [protected, listener("anonymous", anonymous)],
+                "routing": {"default": "block", "rules": [
+                    {"id": "allow-user", "inbound": "secured", "principal": "alice",
+                     "action": "direct"}]}}
+    blocked = copy.deepcopy(document)
+    blocked["listeners"].reverse()  # a reused listener is not a config-array index
+    blocked["routing"]["rules"] = []
+    credentials = b"\x01\x04user\x04pass"
+    env = {"STEER_TEST_USER": "user", "STEER_TEST_PASSWORD": "pass"}
+    with tempfile.TemporaryDirectory(prefix="steer-socks-instances-") as directory, \
+            server() as target, core(binary, directory, document, extra_env=env) as path:
+        with connect(secured) as old, connect(anonymous) as anon:
+            greeting(old, auth=True)
+            greeting(anon)
+            anon.sendall(request(target)); assert response(anon) == 2
+            code, state = control(path, "APPLY", blocked, 1)
+            assert code == 200 and state["revision"] == 2
+            with connect(secured) as current:
+                greeting(current, auth=True)
+                current.sendall(credentials + request(target))
+                assert exact(current, 2) == b"\x01\x00" and response(current) == 2
+            old.sendall(credentials + request(target) + b"old-instance")
+            assert exact(old, 2) == b"\x01\x00" and response(old) == 0
+            assert exact(old, 12) == b"old-instance"
+            old.shutdown(socket.SHUT_WR); eof(old)
+        # More commits than there are generation slots: a retired instance
+        # must stop pinning its generation after IO releases, not at publication.
+        for revision in range(2, 12):
+            with connect(secured) as retiring:
+                greeting(retiring, auth=True)
+                code, state = control(path, "APPLY", blocked, revision)
+                assert code == 200 and state["revision"] == revision + 1
+                retiring.sendall(credentials + request(target))
+                assert exact(retiring, 2) == b"\x01\x00" and response(retiring) == 2
+                eof(retiring)
+    print("SOCKS instances: isolated auth, old handshake/relay and generation turnover passed")
+
+
 if __name__ == "__main__":
     main(sys.argv[1])
+    socks_instances(sys.argv[1])

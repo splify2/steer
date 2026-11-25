@@ -20,6 +20,30 @@ USERPASS verification maps to host-issued `lab-socks-user`; NOAUTH has an empty
 principal. Raw credentials and peer-supplied identity never enter route metadata.
 The route service sees the original destination before denying unresolved domains.
 
+## Source-linked instance lifecycle
+
+The standalone fixture and the managed prototype now use a separate in-process
+SOCKS instance per listener and generation. Preparation snapshots listener
+identity and auth policy into generation-owned storage without opening sockets.
+The host activates it at publication and quiesces the old instance even when
+the listener socket is reused. A TCP session keeps its instance from accept
+through the final IO/route operation release, including a handshake already in
+progress at publication. The host destroys the retired generation only after
+its sessions release those pins. Existing handshake/connect/idle timeouts and
+shutdown cancellation are unchanged.
+
+After a valid CONNECT the host takes a `steer_pv1_flow_metadata` record built
+from the instance to the existing route service. The instance supplies immutable
+generation and inbound identity; the host verifier determines principal, and
+the requested destination reaches policy before resolution or dial. Neither
+the host nor the relay is duplicated. This is an internal, source-linked
+lifecycle, not the draft async provider entrypoint or a separate package.
+
+The managed loopback test checks simultaneous anonymous and authenticated
+instances, listener reuse with reordered config, a pending old handshake and
+half-close across direct-to-block Apply, and retirement over more commits than
+there are generation slots.
+
 ## Run
 
 From the hub root in Linux, with the sibling SDK and protocols checkouts:
@@ -71,8 +95,9 @@ owned by the process; the codec clears its parsed credential storage.
   handles are released from that timer, after callback return, before resubmission
   or stream release. Shutdown uses the same deferred cleanup path.
 
-There is no UDP, domain resolver, TLS, full routing, config reload, generation
-drain, provider discovery/loader or connection to the working daemon dataplane.
+There is no UDP, domain resolver, TLS, full routing, or config reload in the
+standalone fixture. The managed lifecycle above does not implement a provider
+drain deadline, provider discovery/loader or production daemon integration.
 Admission is fixed and has no fairness or tenant quota model. Connect readiness
 uses the existing loop through `route_dial`; listener readiness uses that loop
 directly and payload IO uses the stream service.

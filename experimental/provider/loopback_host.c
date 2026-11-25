@@ -68,6 +68,16 @@ struct control {
     size_t used, header_length, body_length, sent, output_length;
     char input[CONTROL_INPUT], output[CONTROL_OUTPUT];
 };
+/* One source-linked SOCKS instance per listener slot and generation. Listener
+ * sockets may survive publication; their protocol instances never do. Auth
+ * secrets remain host-owned process environment strings, as before. */
+struct socks_instance {
+    uint64_t generation;
+    char inbound[65], principal[65];
+    const char *user, *password;
+    size_t user_length, password_length;
+    int admitting;
+};
 struct generation {
     struct steer_draft_routes *routes;
     struct steer_draft_stream_routes *streams;
@@ -84,8 +94,9 @@ struct generation {
     char *document;
     size_t document_length;
     uint64_t number;
-    unsigned references;
+    unsigned references, socks_sessions;
     int preparing;
+    struct socks_instance socks[LISTENERS];
 };
 struct listener_identity {
     int vless;
@@ -120,6 +131,7 @@ struct direction {
 struct host {
     struct loop *loop;
     struct steer_pv1_host *buffers;
+    const struct steer_pv1_buffer_api *buffer_api;
     struct steer_draft_stream_runtime *runtime;
     struct steer_draft_backend_runtime *backend_runtime;
     struct steer_draft_resolver *resolver;
@@ -150,13 +162,13 @@ struct prepared {
 struct client {
     struct host *host;
     struct generation *generation;
+    struct socks_instance *socks; /* pins the instance and its parent generation */
     struct listener_identity identity;
     struct steer_pv1_stream_ref down, up;
     struct loop_timer *deadline;
     struct direction directions[2]; /* down->up, up->down */
     struct s5_codec codec;
     struct vl_decoder vless;
-    struct s5_address target; /* normalized numeric/domain target for host dial */
     struct steer_pv1_endpoint source;
     uint8_t source_bytes[16];
     struct steer_pv1_async_start route;
@@ -166,7 +178,6 @@ struct client {
     uint32_t input_offset, input_length;
     int live, authenticated, route_pending, route_completed, release_failed;
 };
-static const struct steer_pv1_buffer_api *ba;
 static void advance(struct client *);
 static void reap_generations(struct host *);
 static void close_control(struct control *);
@@ -176,6 +187,25 @@ static void close_listener(struct host *,struct listener *);
 static int reap_hy2_listeners(struct host *);
 static void prepared_ready(void *,struct steer_prototype_prepared_input *);
 #endif
+/* All instance transitions run on the existing owning shard. Preparation is
+ * resource-free; activating after commit cannot fail. */
+static void prepare_socks(struct generation *g, unsigned slot,
+                          const struct listener *listener)
+{
+    if (listener->spec.protocol != STEER_PROTOTYPE_SOCKS) return;
+    struct socks_instance *instance = &g->socks[slot];
+    const struct listener_identity *id = &listener->identity;
+    instance->generation = g->number;
+    strcpy(instance->inbound, id->id);
+    strcpy(instance->principal, id->principal);
+    instance->user = id->user; instance->user_length = id->user_length;
+    instance->password = id->password; instance->password_length = id->password_length;
+}
+static void set_socks_admission(struct generation *g, int active)
+{
+    if (g) for (unsigned i = 0; i < LISTENERS; ++i)
+        g->socks[i].admitting = active && g->socks[i].generation != 0;
+}
 static void close_client(struct client *c)
 {
     if (!c->live || c->phase == CLOSING) return;
@@ -221,7 +251,7 @@ static int submit(struct direction *d, struct steer_pv1_stream_ref stream,
 static uint8_t *view(struct client *c, unsigned index)
 {
     struct steer_pv1_mut_span span;
-    if (ba->writable(c->host->buffers, c->directions[index].buffer, &span).code) {
+    if (c->host->buffer_api->writable(c->host->buffers, c->directions[index].buffer, &span).code) {
         close_client(c); return NULL;
     }
     return span.data;
@@ -236,7 +266,7 @@ static void reply(struct client *c, enum phase next)
 }
 static void dial_reply(struct client *c, uint8_t code, const struct s5_address *bound)
 {
-    if (c->identity.vless) {
+    if (!c->socks) {
         if (code) { close_client(c); return; }
         c->codec.reply_length = vl_response_encode(c->codec.reply, sizeof(c->codec.reply));
         reply(c, RELAY);
@@ -251,11 +281,11 @@ static int verify_uuid(void *arg, const uint8_t uuid[16])
     c->authenticated = !memcmp(uuid, c->identity.uuid, sizeof(c->identity.uuid));
     return c->authenticated;
 }
-static int verify(void *arg, const uint8_t *user, size_t un,
-                  const uint8_t *password, size_t pn)
+static int verify_socks(void *arg, const uint8_t *user, size_t un,
+                        const uint8_t *password, size_t pn)
 {
     struct client *c = arg;
-    struct listener_identity *identity = &c->identity;
+    const struct socks_instance *identity = c->socks;
     /* Lab credentials only; no logging. Not an authentication database. */
     c->authenticated = un == identity->user_length && pn == identity->password_length &&
            !memcmp(user, identity->user, un) && !memcmp(password, identity->password, pn);
@@ -289,13 +319,24 @@ static uint8_t route_reply_code(uint32_t error, uint32_t failure)
     if (failure == STEER_DRAFT_DIAL_HOST_UNREACHABLE) return 4;
     return 1;
 }
-static void dial(struct client *c)
+/* The source-linked inbound hands the SDK accepted-flow record to the shared
+ * host router. Only the host selects/dials a backend; metadata is call-borrowed. */
+static void accept_flow(struct client *c, const struct steer_pv1_flow_metadata *flow)
+{
+    c->phase = DIALING;
+    loop_timer_set(c->deadline, 5000);
+    c->route = steer_draft_stream_route_open(c->generation->streams, flow,
+        ((uint64_t)loop_now_ms() + 5000u) * 1000000u, route_done, c);
+    if (c->route.disposition == STEER_PV1_PENDING) c->route_pending = 1;
+    else dial_reply(c, route_reply_code(c->route.error.code, 0), NULL);
+}
+static void publish_flow(struct client *c, const struct s5_address *target)
 {
     struct steer_pv1_flow_metadata flow = {0};
-    const char *inbound = c->identity.id;
-    const char *principal = c->identity.principal;
+    const char *inbound = c->socks ? c->socks->inbound : c->identity.id;
+    const char *principal = c->socks ? c->socks->principal : c->identity.principal;
     flow.size = sizeof(flow); flow.version = STEER_PV1_DRAFT_LAYOUT;
-    flow.generation = c->generation->number;
+    flow.generation = c->socks ? c->socks->generation : c->generation->number;
     flow.inbound_id.data = (const uint8_t *)inbound;
     flow.inbound_id.len = (uint32_t)strlen(inbound);
     if (c->authenticated) {
@@ -305,17 +346,12 @@ static void dial(struct client *c)
     flow.source = c->source; flow.flow_class = STEER_PV1_FLOW_STREAM;
     flow.destination.size = sizeof(flow.destination);
     flow.destination.version = STEER_PV1_DRAFT_LAYOUT;
-    flow.destination.tag = c->target.type == 1 ? STEER_PV1_ENDPOINT_IPV4 :
-        c->target.type == 4 ? STEER_PV1_ENDPOINT_IPV6 : STEER_PV1_ENDPOINT_DOMAIN;
-    flow.destination.address.data = c->target.bytes;
-    flow.destination.address.len = c->target.length;
-    flow.destination.port = c->target.port;
-    c->phase = DIALING;
-    loop_timer_set(c->deadline, 5000);
-    c->route = steer_draft_stream_route_open(c->generation->streams, &flow,
-        ((uint64_t)loop_now_ms() + 5000u) * 1000000u, route_done, c);
-    if (c->route.disposition == STEER_PV1_PENDING) c->route_pending = 1;
-    else dial_reply(c, route_reply_code(c->route.error.code, 0), NULL);
+    flow.destination.tag = target->type == 1 ? STEER_PV1_ENDPOINT_IPV4 :
+        target->type == 4 ? STEER_PV1_ENDPOINT_IPV6 : STEER_PV1_ENDPOINT_DOMAIN;
+    flow.destination.address.data = target->bytes;
+    flow.destination.address.len = target->length;
+    flow.destination.port = target->port;
+    accept_flow(c, &flow);
 }
 static void handshake(struct client *c)
 {
@@ -323,7 +359,7 @@ static void handshake(struct client *c)
     size_t consumed;
     enum s5_event event;
     if (!p) return;
-    if (c->identity.vless) {
+    if (!c->socks) {
         enum vl_result result = vl_decoder_feed(&c->vless, p + c->input_offset,
                                                 c->input_length, &consumed);
         c->input_offset += (uint32_t)consumed;
@@ -333,10 +369,11 @@ static void handshake(struct client *c)
         }
         if (result == VL_DONE) {
             const struct vl_request *r = &c->vless.request;
-            c->target.type = r->address_type == 1 ? 1 : r->address_type == 3 ? 4 : 3;
-            c->target.length = (uint8_t)r->address_length; c->target.port = r->port;
-            memcpy(c->target.bytes, r->address, r->address_length);
-            dial(c); return;
+            struct s5_address target;
+            target.type = r->address_type == 1 ? 1 : r->address_type == 3 ? 4 : 3;
+            target.length = (uint8_t)r->address_length; target.port = r->port;
+            memcpy(target.bytes, r->address, r->address_length);
+            publish_flow(c, &target); return;
         }
         c->input_offset = 0;
         (void)submit(&c->directions[0], c->down, 0, 0, CAPACITY);
@@ -349,7 +386,7 @@ static void handshake(struct client *c)
     else if (event == S5_ERROR) {
         if (c->codec.reply_length) reply(c, CLOSING);
         else close_client(c);
-    } else if (event == S5_CONNECT) { c->target = c->codec.target; dial(c); }
+    } else if (event == S5_CONNECT) publish_flow(c, &c->codec.target);
     else {
         c->input_offset = 0;
         (void)submit(&c->directions[0], c->down, 0, 0, CAPACITY);
@@ -437,9 +474,12 @@ static void advance(struct client *c)
             memset(streams[i], 0, sizeof(*streams[i]));
         }
         for (i = 0; i < 2; ++i)
-            if (c->directions[i].buffer) ba->release(c->host->buffers, c->directions[i].buffer);
+            if (c->directions[i].buffer)
+                c->host->buffer_api->release(c->host->buffers, c->directions[i].buffer);
         loop_timer_free(c->deadline); c->deadline = NULL;
-        c->generation->references--;
+        /* All route/IO callbacks and origin operation references are gone. */
+        if (c->socks) c->generation->socks_sessions--;
+        else c->generation->references--;
         c->live = 0; c->host->live--;
     }
 }
@@ -478,13 +518,20 @@ static void accept_clients(struct loop *l, int fd, uint32_t events, void *arg)
         struct sockaddr_storage peer; socklen_t peer_length = sizeof(peer);
         int accepted = accept4(fd, (struct sockaddr *)&peer, &peer_length, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (accepted < 0) { if (errno == EINTR) continue; return; }
-        if (!listener->active) { close(accepted); continue; }
+        struct generation *g = h->current;
+        if (!listener->active || !g) { close(accepted); continue; }
+        struct socks_instance *socks = NULL;
+        if (listener->spec.protocol == STEER_PROTOTYPE_SOCKS) {
+            socks = &g->socks[listener - h->listeners];
+            if (!socks->admitting) { close(accepted); continue; }
+        } else if (listener->spec.protocol != STEER_PROTOTYPE_VLESS) { close(accepted); continue; }
         for (i = 0; i < CLIENTS && h->clients[i].live; ++i) {}
         if (i == CLIENTS) { close(accepted); continue; }
         c = &h->clients[i]; memset(c, 0, sizeof(*c));
         c->host = h; c->live = 1; h->live++;
-        c->generation = h->current; c->generation->references++;
-        c->identity = listener->identity;
+        c->generation = g; c->socks = socks;
+        if (socks) g->socks_sessions++;
+        else { g->references++; c->identity = listener->identity; }
         c->source.size = sizeof(c->source); c->source.version = STEER_PV1_DRAFT_LAYOUT;
         c->source.address.data = c->source_bytes;
         if (peer.ss_family == AF_INET) {
@@ -507,12 +554,12 @@ static void accept_clients(struct loop *l, int fd, uint32_t events, void *arg)
             (void)steer_draft_stream_api()->release(native);
             close_client(c); continue;
         }
-        if (ba->allocate(h->buffers, CAPACITY, &c->directions[0].buffer).code ||
-            ba->allocate(h->buffers, CAPACITY, &c->directions[1].buffer).code) {
+        if (h->buffer_api->allocate(h->buffers, CAPACITY, &c->directions[0].buffer).code ||
+            h->buffer_api->allocate(h->buffers, CAPACITY, &c->directions[1].buffer).code) {
             close_client(c); continue;
         }
-        if (c->identity.vless) vl_decoder_init(&c->vless, verify_uuid, c);
-        else s5_init(&c->codec, c->identity.user ? S5_USERPASS : S5_NOAUTH, verify, c);
+        if (socks) s5_init(&c->codec, socks->user ? S5_USERPASS : S5_NOAUTH, verify_socks, c);
+        else vl_decoder_init(&c->vless, verify_uuid, c);
         loop_timer_set(c->deadline, 5000);
         (void)submit(&c->directions[0], c->down, 0, 0, CAPACITY);
     }
@@ -522,6 +569,7 @@ static void stop(struct loop *l, int signo, void *arg)
     struct host *h = arg; unsigned i;
     (void)l; (void)signo;
     h->stopping = 1;
+    set_socks_admission(h->current, 0);
     if(h->preparer)steer_prototype_prepare_stop(h->preparer);
     if (h->control_fd >= 0) {
         loop_fd_del(h->loop, h->control_fd); close(h->control_fd); h->control_fd = -1;
@@ -616,6 +664,8 @@ static int prepare_datagram_routes(struct host *h,struct generation *g){
 static int destroy_generation(struct generation *g)
 {
     g->preparing = 0;
+    set_socks_admission(g, 0);
+    if (g->references || g->socks_sessions) return 0;
 #ifdef STEER_PROTOTYPE_HY2
     retire_datagram_generation(g);
     if(g->datagrams){
@@ -653,7 +703,8 @@ static void reap_generations(struct host *h)
     unsigned i;
     for (i = 0; i < GENERATIONS; ++i) {
         struct generation *g = &h->generations[i];
-        if (g != h->current && g->number && !g->references && !g->preparing) destroy_generation(g);
+        if (g != h->current && g->number && !g->references && !g->socks_sessions && !g->preparing)
+            destroy_generation(g);
     }
 }
 static int initialize_host(struct host *h, struct client *clients)
@@ -669,7 +720,7 @@ static int initialize_host(struct host *h, struct client *clients)
     h->control_fd = -1;
     h->writer.wake = -1;
     for (i = 0; i < LISTENERS; ++i) h->listeners[i].fd = -1;
-    ba = steer_draft_buffers_api();
+    h->buffer_api = steer_draft_buffers_api();
     h->loop = loop_new();
     if (!h->loop || steer_draft_buffers_create(&limits, NULL, &h->buffers).code) return 0;
     if (steer_draft_stream_runtime_create(h->loop, h->buffers, 2*CLIENTS, 2*CLIENTS,
@@ -894,12 +945,14 @@ int steer_lab_loopback_main(int argc, char **argv, int vless)
 #ifdef STEER_PROTOTYPE_HY2
     if (!prepare_datagram_routes(&h, g)) goto cleanup;
 #endif
-    h.current = g; listener->identity = identity;
-    listener->active = 1;
+    listener->identity = identity;
     strcpy(listener->spec.id, identity.id); strcpy(listener->spec.address, bind_address);
     listener->spec.port = (uint16_t)port;
     listener->spec.protocol = vless ? STEER_PROTOTYPE_VLESS : STEER_PROTOTYPE_SOCKS;
+    prepare_socks(g, 0, listener);
     if (!bind_listener(&h, listener,NULL)) goto cleanup;
+    h.current = g; listener->active = 1;
+    set_socks_admission(g, 1);
     printf("PORT %u\n", listener->spec.port); fflush(stdout);
     status = loop_run(h.loop);
 cleanup:
@@ -1035,6 +1088,8 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
         if (!bind_listener(h, listener,tls)) goto cleanup;
         prepared_state->keep[j] = prepared_state->created[j] = 1;
     }
+    for (i = 0; i < LISTENERS; ++i)
+        if (prepared_state->keep[i]) prepare_socks(g, i, &h->listeners[i]);
     prepared_state->generation = g; g = NULL; result = 200;
 cleanup:
 #ifdef STEER_PROTOTYPE_HY2
@@ -1057,6 +1112,7 @@ static void discard_prepared(struct host *h, struct prepared *prepared)
 static void publish_prepared(struct host *h, struct prepared *prepared)
 {
     unsigned i;
+    set_socks_admission(h->current, 0);
     for (i = 0; i < LISTENERS; ++i) {
         if (!prepared->keep[i] || h->stopping) {
 #ifdef STEER_PROTOTYPE_HY2
@@ -1075,6 +1131,7 @@ static void publish_prepared(struct host *h, struct prepared *prepared)
     if(h->current)retire_datagram_generation(h->current);
 #endif
     h->current = prepared->generation; h->current->preparing = 0;
+    set_socks_admission(h->current, !h->stopping);
     prepared->generation = NULL;
     reap_generations(h);
 }
