@@ -263,9 +263,9 @@ The password is 1–256 visible ASCII bytes; the form and intent must not return
 resolved values or paths. TLS verification and ALPN `h3` are fixed, not UI
 switches. Omitted `verify` is `true`; `false` is rejected. Select `hy2-exit`
 in a TCP routing rule or as the TCP-only default. Do not expose UDP.
-This path is verified with SOCKS ingress; it does not change the current
-spec-v3 datagram routing semantics or enable HY2 ingress to use a TCP-only
-outbound.
+The independent server test below exercises this outbound from SOCKS ingress.
+The stream-only HY2 ingress profile is separately tested with SOCKS and VLESS
+egress. Neither test establishes HY2-to-HY2 interoperability or UDP egress.
 
 To reproduce the isolated test, build
 `experimental/provider` target `$BUILD/hy2-tcp-client-test` with the same
