@@ -111,7 +111,8 @@ static void check_table_adoption(void) {
     g_table_fd = g_adopt_fd = g_epfd = -1;
     free(g_table_feed.buf);
     g_table_feed = (struct tabfmt_feed){0};
-    tabfmt_parse("0\n", 2);
+    check("пустая таблица допустима", 0, tabfmt_parse("0\n", 2));
+    check("пустая таблица заменяет прежнюю", 0, (int)g_dch_n);
 }
 
 /* Набор из строк списка — в том же виде, в каком их читает load_rules_into. */
