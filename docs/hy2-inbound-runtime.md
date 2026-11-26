@@ -54,3 +54,52 @@ control returned ICMP *fragmentation needed* for the 1406-byte probe. The shared
 endpoint now forbids IP fragmentation so a probe cannot validate a segment
 larger than the path can carry. This gate tests a reduced MTU at connection
 start; it does not establish recovery from an MTU decrease on an established path.
+
+### D2: live 1500 → 1380 downshift on an established stream
+
+**Server transmit recovery and client transmit recovery are independent.** To
+exercise the former with the stock client and its 3-second deadline:
+
+```sh
+unshare -n sh -ec 'ip link set lo mtu 1500 up; exec python3 experimental/provider/prototype_hy2_mtu_test.py --live-reply --host "$1" --client "$2"' sh "$HOST" "$PINNED_CLIENT"
+```
+
+After five verified 32768-byte exchanges, the target reads all 32768 bytes of
+the next request on the **same TCP socket**, lowers MTU and only then echoes
+them. On `1a72adf` the managed server repeatedly sends 1444-byte UDP payloads;
+even a diagnostic 12-second deadline yielded 0/32768 bytes. The regression now
+passes for IPv4 and IPv6, including a 512-byte message on the pre-existing HY2
+UDP session both before and after restoring MTU 1500. An IPv4 three-namespace
+veth control changed only the **return route's** MTU at the forwarding router
+(both NICs still 1500, interface GSO/GRO off). ICMP reported MTU 1380; all
+32768 request bytes sent *after* the change reached the target. The response
+timed out before the fix and arrived intact after it.
+
+The pinned ngtcp2 v1.25 public API reports the discovered transmit size but
+has no same-path setter; its migration API is client-only. Single-packet
+stream/datagram writers accept a smaller destination buffer (minimum 1200).
+The aggregate writer still requires a buffer at least as large as the discovered
+size. On a single-datagram `EMSGSIZE` at an already validated size, limit only
+the affected child's single-packet writer and datagram admission. A failed GSO
+batch is first retried as individual datagrams; an oversized discovery probe
+does not lower the limit. The first step halves the headroom above 1200
+(1444 → 1322 in this test); a second size failure can reach 1200. Loss recovery
+repacketizes stream data. This requires a local size error, not just silent loss.
+
+The conservative limit lasts for that connection. Other connections keep their
+normal probing and batching. The reduced size can cost throughput: below the
+library's discovered size the aggregate helper produces one packet at a time.
+In one local 128 × 32768-byte exact echo sample, goodput was 35.1 MiB/s before
+and 31.3 MiB/s after the return-path cut. This is a fixture measurement, not
+a link-rate benchmark.
+
+**Remaining interop boundary:** if `lo` shrinks *before* the next request, the
+stock upstream client keeps sending oversized packets (e.g. 1439-byte segments)
+on that unchanged path. The target saw no new request bytes, with either the
+managed or the upstream IPv4 server. Disabling client GSO did not cure it.
+Pinned quic-go's `send_queue.go` ignores `EMSGSIZE`; its initial-size fallback
+does not reset the established path's MTU. Widening the client deadline alone
+to 12 seconds did not deliver data. With that diagnostic deadline, restoring
+MTU 1500 after four seconds let the outstanding exchange finish without a
+reconnect (7.2 s managed, 7.4 s upstream, from request start). That is recovery
+after **restoration**, not adaptation of the upstream sender to MTU 1380.

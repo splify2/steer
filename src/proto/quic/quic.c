@@ -120,6 +120,7 @@ struct qc {
     int       fd;
 #ifdef QC_WITH_ENDPOINT
     struct qc_endpoint *endpoint; /* endpoint owns shared fd/context and child */
+    size_t tx_path_cap;         /* Per child, only after an established datagram size stops fitting. */
 #endif
     int       epfd;
     int       server;
@@ -768,8 +769,13 @@ static void send_batch(struct qc *q, struct iovec *iov, size_t n) {
                 uint16_t sz = (uint16_t)lens[0];
                 memcpy(CMSG_DATA(c), &sz, sizeof sz);
                 q->tx_calls++;
-                if (sendmsg(q->fd, &mh, MSG_DONTWAIT) >= 0 || !qc_io_gso_fatal(errno)) { i += run; continue; }
-                q->gso_ok = 0;      /* ядро без GSO или устройство без контрольной суммы */
+                if (sendmsg(q->fd, &mh, MSG_DONTWAIT) >= 0) { i += run; continue; }
+                if (qc_io_gso_fatal(errno)) q->gso_ok = 0;
+#ifdef QC_WITH_ENDPOINT
+                /* Confirm the size error on individual packets, not the aggregate. */
+                else if (q->endpoint && errno == EMSGSIZE) cnt = run;
+#endif
+                else { i += run; continue; }
             }
         }
         if (!q->gso_ok) cnt = m;
@@ -786,6 +792,16 @@ static void send_batch(struct qc *q, struct iovec *iov, size_t n) {
         if (r > 0) { i += (size_t)r; continue; }
         if (r < 0 && errno == EINTR) continue;
         if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) return;
+#ifdef QC_WITH_ENDPOINT
+        if (r < 0 && errno == EMSGSIZE && q->endpoint && q->hs_done) {
+            size_t failed = iov[i].iov_len, floor = NGTCP2_MAX_UDP_PAYLOAD_SIZE;
+            size_t known = ngtcp2_conn_get_path_max_tx_udp_payload_size2(q->conn);
+            /* A larger discovery probe is expected to fail. For ordinary packets,
+             * step down at most twice; ngtcp2 retains stream offsets for loss recovery. */
+            if (failed > floor && failed <= known && (!q->tx_path_cap || failed <= q->tx_path_cap))
+                q->tx_path_cap = q->tx_path_cap ? floor : floor + (failed - floor) / 2;
+        }
+#endif
         i++;                        /* эту датаграмму сокет не принял (порт закрыт, слишком велика) — к следующей */
     }
 }
@@ -817,6 +833,11 @@ static ngtcp2_ssize write_pkt_cb(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pk
     struct qc *q = ud;
     ngtcp2_ssize nw;
     ngtcp2_ssize dl = -1;
+#ifdef QC_WITH_ENDPOINT
+    /* Only bound the single-packet writer. The aggregate buffer must still
+     * accommodate ngtcp2's discovered size (there is no same-path MTU setter). */
+    if (q->tx_path_cap && destlen > q->tx_path_cap) destlen = q->tx_path_cap;
+#endif
 
     /* Голова очереди, что уже не влезает в пакет (путь уже, чем было при постановке), не должна
      * стоять вечно: ngtcp2 на такую отвечает «0, не принята», как на окно перегрузки, и очередь
@@ -1575,6 +1596,9 @@ size_t qc_datagram_max(const struct qc *q) {
     /* Размер пути, а не потолок настроек: пакет больше пути ngtcp2 не собирает (до разведки PMTU —
      * 1200), и датаграмма по потолку застревала бы в очереди навсегда (I-480). */
     size_t udp = ngtcp2_conn_get_path_max_tx_udp_payload_size2(q->conn);
+#ifdef QC_WITH_ENDPOINT
+    if (q->tx_path_cap && udp > q->tx_path_cap) udp = q->tx_path_cap;
+#endif
     /* The destination CID belongs to the peer and need not have our local
      * QC_CID_LEN. Reserve the protocol maximum (20), including after CID
      * rotation. This conservative cap needs no dependency ABI extension. */
