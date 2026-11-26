@@ -69,7 +69,8 @@ def main():
                 for i in range(34):
                     try:held.append(socks_connect(socks,echo.port))
                     except (OSError,RuntimeError) as exc:failure=type(exc).__name__;break
-                emit('session_probe',successful=len(held),first_failure=failure,attempted=len(held)+(1 if failure else 0))
+                emit('session_probe',successful=len(held),first_failure=failure,attempted=len(held)+(1 if failure else 0),
+                     core=stats(proc.pid),ui=stats(host.pid))
             finally:
                 for s in held:s.close()
             time.sleep(.5)

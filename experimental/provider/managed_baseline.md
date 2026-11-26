@@ -38,6 +38,8 @@ applies a label-only revision every 20 seconds while traffic is active.
 The optional `--ui-reads` adds HTTP runtime reads at two per second;
 the UI is otherwise started but idle. This is offered load, not saturation
 throughput. `--check --seconds 30` is only a short harness check.
+The session probe records FD and memory while admitted sockets are still
+held; this is an admission check, not 32 simultaneous transferring clients.
 
 `hy2_long_budget.py` separately exercises one independent Hysteria2 client
 against the full core: verified TLS/QUIC, TCP 4096-byte echo, UDP 512-byte
