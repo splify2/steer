@@ -18,9 +18,11 @@ fi
     [ "$(readlink /proc/self/ns/mnt)" != "${OLDMNT:-}" ] &&
     [ -n "${OLDNET:-}" ] && [ -n "${OLDMNT:-}" ] || exit 2
 mount --make-rprivate / || exit 2
+awk_path="$(readlink -f "$(command -v awk)")" || { echo "apply-fallback: нет awk"; exit 2; }
 mount -t tmpfs tmpfs /run || exit 2
 mkdir -p /run/apply-fixture
 cp "$BIN" /run/apply-fixture/steerd || exit 2
+cp "$awk_path" /run/apply-fixture/awk || exit 2
 mount -t tmpfs tmpfs /tmp || exit 2
 mount -t tmpfs tmpfs /etc || exit 2
 mount -t tmpfs tmpfs /var || exit 2
@@ -51,8 +53,8 @@ EOF
     rc=$?
     check "$policy: код Apply" 0 "$rc"
     check "$policy: nft загружена" 0 "$(nft list table inet steer_fixture >/dev/null 2>&1; echo $?)"
-    mark="$(awk '$1=="vpn"{print $2}' /tmp/state/registry 2>/dev/null)"
-    table="$(awk '$1=="vpn"{print $3}' /tmp/state/registry 2>/dev/null)"
+    mark="$(/run/apply-fixture/awk '$1=="vpn"{print $2}' /tmp/state/registry 2>/dev/null)"
+    table="$(/run/apply-fixture/awk '$1=="vpn"{print $3}' /tmp/state/registry 2>/dev/null)"
     if [ -z "$mark" ] || [ -z "$table" ]; then
         check "$policy: реестр выхода" present missing
         cat "/tmp/$policy.log"
@@ -89,8 +91,8 @@ STEER_NFT_TABLE=steer_fixture /run/apply-fixture/steerd apply --spec /tmp/spec.j
 rc=$?
 check "IPv4 без IPv6: код Apply" 0 "$rc"
 check "IPv4 без IPv6: nft загружена" 0 "$(nft list table inet steer_fixture >/dev/null 2>&1; echo $?)"
-mark="$(awk '$1=="vpn"{print $2}' /tmp/state/registry 2>/dev/null)"
-table="$(awk '$1=="vpn"{print $3}' /tmp/state/registry 2>/dev/null)"
+mark="$(/run/apply-fixture/awk '$1=="vpn"{print $2}' /tmp/state/registry 2>/dev/null)"
+table="$(/run/apply-fixture/awk '$1=="vpn"{print $3}' /tmp/state/registry 2>/dev/null)"
 if [ -n "$mark" ] && [ -n "$table" ]; then
     check "IPv4 без IPv6: маршрут IPv4 в устройство" 1 \
         "$(ip -4 route get 203.0.113.7 mark "0x$mark" 2>/dev/null | grep -c 'dev v4only')"

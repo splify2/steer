@@ -19,9 +19,11 @@ fi
     [ "$(readlink /proc/self/ns/net)" != "$OLDNET" ] &&
     [ "$(readlink /proc/self/ns/mnt)" != "$OLDMNT" ] || exit 2
 mount --make-rprivate / || exit 2
+awk_path="$(readlink -f "$(command -v awk)")" || { echo "rule-fault: нет awk"; exit 2; }
 mount -t tmpfs tmpfs /run || exit 2
 mkdir -p /run/fixture
 cp "$BIN" /run/fixture/steerd || exit 2
+cp "$awk_path" /run/fixture/awk || exit 2
 mount -t tmpfs tmpfs /tmp || exit 2
 mount -t tmpfs tmpfs /etc || exit 2
 mount -t tmpfs tmpfs /var || exit 2
@@ -38,8 +40,8 @@ EOF
 export STEER_NFT_TABLE=steer_fixture STEER_TEST_RULE_FAULT=/tmp/fault
 STEER_RULE_PREF=200 /run/fixture/steerd apply --spec /tmp/spec.json --state-dir /tmp/state \
     >/tmp/initial.log 2>&1 || { cat /tmp/initial.log; exit 2; }
-mark="$(awk '$1=="vpn"{print $2}' /tmp/state/registry)"
-table="$(awk '$1=="vpn"{print $3}' /tmp/state/registry)"
+mark="$(/run/fixture/awk '$1=="vpn"{print $2}' /tmp/state/registry)"
+table="$(/run/fixture/awk '$1=="vpn"{print $3}' /tmp/state/registry)"
 old="$(ip -4 rule show | grep "^200:.*fwmark 0x$mark/.*lookup ")"
 [ -n "$old" ] || { echo "rule-fault: старое правило не установлено ($mark $table)"; ip -4 rule show; cat /tmp/initial.log; exit 2; }
 old_nft="$(nft list table inet steer_fixture | cksum)"
@@ -47,6 +49,15 @@ fail=0
 check() {
     if [ "$2" = "$3" ]; then echo "ok   $1"
     else echo "FAIL $1: expected $2, got $3"; fail=$((fail+1)); fi
+}
+ctl_code() {
+    python3 -c 'import json,sys
+try:
+    obj = json.load(sys.stdin)
+    code = obj.get("code") if isinstance(obj, dict) else None
+    print(code if type(code) is int else "invalid")
+except (ValueError, TypeError):
+    print("invalid")'
 }
 if [ "$RULE_TEST_MODE" = cli ]; then
 touch /tmp/fault
@@ -83,9 +94,13 @@ sed 's/"name":"all"/"name":"changed"/' /tmp/spec.json >/tmp/candidate.json
 : >/tmp/rule-fault-hit
 touch /tmp/fault
 response="$(/run/fixture/steerd ctl --socket /tmp/ctl.sock apply </tmp/candidate.json)"
-code="$(printf '%s' "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("code","missing"))')"
+code="$(printf '%s' "$response" | ctl_code)" || code=invalid
 check "ctl: отказ действительно внедрён" 1 "$([ -s /tmp/rule-fault-hit ] && echo 1 || echo 0)"
-check "ctl: ответ не сообщает успех" 1 "$([ "$code" != 0 ] && [ "$code" != missing ] && echo 1 || echo 0)"
+check "ctl: корректный JSON с числовым code=1" 1 "$code"
+check "ctl: пустой ответ не считается отказом" invalid "$(printf '' | ctl_code)"
+check "ctl: битый JSON не считается отказом" invalid "$(printf '{' | ctl_code)"
+check "ctl: строковый code не считается числом" invalid "$(printf '{\"code\":\"1\"}' | ctl_code)"
+check "ctl: логический code не считается числом" invalid "$(printf '{\"code\":true}' | ctl_code)"
 check "ctl: старое правило сохранилось" 1 "$(ip -4 rule show | grep -Fxc "$old")"
 check "ctl: старый маршрут работает" 1 \
     "$(ip -4 route get 203.0.113.7 mark "0x$mark" 2>/dev/null | grep -c 'dev vpn0')"
