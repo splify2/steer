@@ -66,6 +66,11 @@ int awg_dev_link_query_owned_until(const char *,char *,size_t,int *,uint32_t *,u
 /* Compare effective key material without returning it; no mutations. */
 int awg_dev_attest_single_wg_until(const char *,int,uint32_t,const struct awg_conf *,
     const struct awg_secrets *,uint64_t);
+/* Inbound identity only: exactly one peer and one IPv4 /32 AllowedIPs entry.
+ * Endpoint is intentionally ignored (roaming); no local address or secret
+ * material is attested. Refuses split/ambiguous device replies. */
+int awg_dev_attest_inbound_peer_until(const char *,int,uint32_t,const uint8_t public_key[32],
+    const struct awg_prefix *,uint64_t);
 /* Exact RTM_GETLINK by index: zero means a link exists, ENODEV means absent. */
 int awg_dev_link_index_until(int index,uint64_t deadline);
 int awg_dev_link_create_owned_until(const char *,const char *,int,uint32_t,int *,uint64_t);

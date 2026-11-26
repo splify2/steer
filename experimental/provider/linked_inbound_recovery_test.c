@@ -9,7 +9,8 @@
 #include <string.h>
 #include <time.h>
 
-static const char document[]="{\"version\":3,\"inbound\":\"vpn\",\"source\":\"10.80.0.2/32\"}";
+static const char document[]="{\"version\":3,\"inbound\":\"vpn\",\"source\":\"10.80.0.2/32\","
+    "\"public_key\":\"3p7bfXt9wbTTW2HC7OQ1Nz+DQ8hbeGdNrfx+FG+IK08=\"}";
 static uint64_t deadline(void){struct timespec t;assert(!clock_gettime(CLOCK_MONOTONIC,&t));return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec+10000000000u;}
 static struct steer_draft_wg_revision choice(void){
     static const char domain[]="steer linked spec v3: scoped WG stream";uint8_t hash[32];
@@ -35,7 +36,7 @@ int main(int argc,char **argv){
     struct steer_prototype_store *store=NULL;assert(!steer_prototype_store_open(store_path,&store).code);
     struct awg_conf wg;struct steer_draft_kernel_wg_guard_config g;conf(1,&wg,&g);
     struct steer_policy *policy=NULL;assert(!steer_policy_compile(1,NULL,0,STEER_POLICY_DIRECT,&policy).code);
-    struct steer_linked_inbound_recovery ctx={.guard={.link=link},.revision=choice(),.inbound=&g,.policy=policy};
+    struct steer_linked_inbound_recovery ctx={.guard={.link=link},.revision=choice(),.inbound=&g,.policy=policy,.wireguard=&wg};
     struct steer_linked_inbound p={.journal=journal,.backend=&steer_draft_wg_linux_guard_backend,.context=&ctx,.backend_guard=&ctx.guard.prepared};
     struct steer_draft_wg_guard_record selected;uint64_t next;int rc=0;
     if(!strcmp(mode,"setup")){

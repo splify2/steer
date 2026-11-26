@@ -1526,6 +1526,59 @@ int awg_dev_attest_single_wg_until(const char *name,int index,uint32_t group,con
     return owned_identity_until(name,kind,index,group,d);
 }
 
+struct wg_inbound_attest {
+    const uint8_t *key;
+    const struct awg_prefix *allowed;
+    uint32_t index;
+    uint16_t family;
+    int count,match;
+};
+static void wg_inbound_attest_cb(const struct nlmsghdr *h,void *arg){
+    struct wg_inbound_attest *c=arg;
+    c->count++;
+    const size_t head=NLMSG_HDRLEN+NLMSG_ALIGN(sizeof(struct genlmsghdr));
+    if(c->count!=1||h->nlmsg_type!=c->family||h->nlmsg_len<head||
+       ((const struct genlmsghdr *)NLMSG_DATA(h))->cmd!=AWG_CMD_GET_DEVICE)return;
+    const struct nlattr *device[AD_PEERS+1],*peer[AP_PROTOCOL_VERSION+1],*ip[AA_CIDR_MASK+1];
+    if(!wg_attrs_once((const uint8_t *)h+head,h->nlmsg_len-head,device,AD_PEERS)||
+       !device[AD_IFINDEX]||NLA_PLEN(device[AD_IFINDEX])!=4||
+       wg_attr_u32(device[AD_IFINDEX])!=c->index)return;
+    const struct nlattr *p=wg_only_child(device[AD_PEERS]);
+    if(!p||!wg_attrs_once(NLA_DATA(p),NLA_PLEN(p),peer,AP_PROTOCOL_VERSION)||
+       !peer[AP_PUBLIC_KEY]||NLA_PLEN(peer[AP_PUBLIC_KEY])!=AWG_KEY_LEN||
+       memcmp(NLA_DATA(peer[AP_PUBLIC_KEY]),c->key,AWG_KEY_LEN))return;
+    /* AP_ENDPOINT is intentionally not used: an authenticated peer can roam. */
+    p=wg_only_child(peer[AP_ALLOWEDIPS]);
+    if(!p||!wg_attrs_once(NLA_DATA(p),NLA_PLEN(p),ip,AA_CIDR_MASK)||
+       !wg_u16_equal(ip[AA_FAMILY],AF_INET)||!ip[AA_IPADDR]||NLA_PLEN(ip[AA_IPADDR])!=4||
+       memcmp(NLA_DATA(ip[AA_IPADDR]),c->allowed->addr,4)||!ip[AA_CIDR_MASK]||
+       NLA_PLEN(ip[AA_CIDR_MASK])!=1||*(const uint8_t *)NLA_DATA(ip[AA_CIDR_MASK])!=32)return;
+    c->match=1;
+}
+int awg_dev_attest_inbound_peer_until(const char *name,int index,uint32_t group,const uint8_t key[32],
+    const struct awg_prefix *allowed,uint64_t d){
+    if(!key||!allowed||allowed->family!=AF_INET||allowed->cidr!=32||!d)return EINVAL;
+    unsigned nonzero=0;for(unsigned i=0;i<AWG_KEY_LEN;i++)nonzero|=key[i];
+    if(!nonzero)return EINVAL;
+    int rc=owned_identity_until(name,"wireguard",index,group,d);
+    if(rc)return rc;
+    uint16_t family=0;int version=0;
+    rc=genl_family_until("wireguard",&family,&version,d);
+    if(rc)return rc;
+    int fd=nl_open(NETLINK_GENERIC);
+    if(fd<0)return errno;
+    _Alignas(8) uint8_t buf[128];struct nlbuf b;
+    struct genlmsghdr g={.cmd=AWG_CMD_GET_DEVICE,.version=(uint8_t)version};
+    struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),family,NLM_F_REQUEST|NLM_F_DUMP,next_seq(),&g,sizeof(g));
+    nlbuf_put_u32(&b,AD_IFINDEX,(uint32_t)index);
+    struct wg_inbound_attest check={key,allowed,(uint32_t)index,family,0,0};
+    rc=nl_talk_until(fd,buf,msg_end(&b,h),wg_inbound_attest_cb,&check,d);
+    close(fd);
+    if(rc)return rc;
+    if(check.count!=1||!check.match)return ESTALE;
+    return owned_identity_until(name,"wireguard",index,group,d);
+}
+
 /* ТУННЕЛЬ ЧЕРЕЗ via — ТОЛЬКО ПО IPv4, и это проверка, а не пожелание.
  *
  * Метка цели ведёт пакет в её таблицу через `ip rule fwmark …`. До 1.9 и правило, и маршрут по

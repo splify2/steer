@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real process restarts, real journal/store and guarded resources in netns."""
 import errno
+import base64
 import json
 import os
 from pathlib import Path
@@ -24,8 +25,16 @@ def main(binary):
             line=next(x for x in out.splitlines() if x.startswith('DEVICE '));_,name,table,marker,handle,index=line.split()
             return name,table,marker,int(handle),int(index)
         active=parse_device(run('setup',0))
+        addresses=json.loads(command(['ip','-j','addr','show','dev',active[0]]))
+        assert any(a.get('local')=='10.80.0.1' and a.get('prefixlen')==24
+                   for a in addresses[0]['addr_info'])
         assert run('recover',0)=='RECOVERY 0\n'
-        print('PASS first process restart: real inbound journal and exact guard')
+        original=command(['wg','show',active[0],'peers']).strip()
+        assert original=='3p7bfXt9wbTTW2HC7OQ1Nz+DQ8hbeGdNrfx+FG+IK08='
+        command(['wg','set',active[0],'peer',original,'endpoint','127.0.0.1:55555'])
+        assert command(['wg','show',active[0],'endpoints']).strip().split('\t')[-1]=='127.0.0.1:55555'
+        assert run('recover',0)=='RECOVERY 0\n'
+        print('PASS first process restart: inbound peer, guard and roaming endpoint')
         orphan=parse_device(run('orphan',0))
         def table(t):return json.loads(command(['nft','-j','-n','list','table','inet',t]))
         def journal_state():
@@ -42,6 +51,42 @@ def main(binary):
         assert run('recover',1,dict(os.environ,PATH=str(fake)+':/usr/bin:/bin'))==f'RECOVERY {errno.EIO}\n'
         assert table(orphan[1])==prior
         assert journal_state()==records, 'failure changed journal or appended cleanup'
+        selected_before=table(active[1])
+        different=base64.b64encode(bytes([5])*32).decode()
+        assert different!=original
+        command(['wg','set',active[0],'peer',different,'allowed-ips','10.80.0.3/32'])
+        try:
+            assert run('recover',1)==f'RECOVERY {errno.ESTALE}\n'
+            assert table(orphan[1])==prior and journal_state()==records
+        finally:
+            command(['wg','set',active[0],'peer',different,'remove'])
+        command(['wg','set',active[0],'peer',original,'allowed-ips','10.80.0.2/32,10.80.0.3/32'])
+        try:
+            assert run('recover',1)==f'RECOVERY {errno.ESTALE}\n'
+            assert table(orphan[1])==prior and journal_state()==records
+        finally:
+            command(['wg','set',active[0],'peer',original,'allowed-ips','10.80.0.2/32'])
+        print('PASS extra peer or extra AllowedIPs: ESTALE before cleanup')
+        command(['wg','set',active[0],'peer',original,'remove'])
+        command(['wg','set',active[0],'peer',different,'allowed-ips','10.80.0.2/32'])
+        try:
+            assert run('recover',1)==f'RECOVERY {errno.ESTALE}\n'
+            assert table(orphan[1])==prior and table(active[1])==selected_before
+            assert journal_state()==records
+            command(['ip','link','show','dev',orphan[0]])
+        finally:
+            command(['wg','set',active[0],'peer',different,'remove'])
+            command(['wg','set',active[0],'peer',original,'allowed-ips','10.80.0.2/32'])
+        print('PASS changed public key: ESTALE, guard and unselected resource preserved')
+        command(['wg','set',active[0],'peer',original,'allowed-ips','10.80.0.3/32'])
+        try:
+            assert run('recover',1)==f'RECOVERY {errno.ESTALE}\n'
+            assert table(orphan[1])==prior and table(active[1])==selected_before
+            assert journal_state()==records
+            command(['ip','link','show','dev',orphan[0]])
+        finally:
+            command(['wg','set',active[0],'peer',original,'allowed-ips','10.80.0.2/32'])
+        print('PASS changed AllowedIPs: ESTALE, guard and unselected resource preserved')
         command(['ip','link','set','dev',active[0],'name','wg_moved'])
         try:
             assert run('recover',1)==f'RECOVERY {errno.ESTALE}\n'
