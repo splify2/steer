@@ -145,12 +145,15 @@ socks-vpn-netns-test: $(BUILD)/steer-prototype
 # default/client builds retain their existing dependency and feature surface.
 NGTCP2_LIB ?=
 WOLFSSL_SERVER_LIB ?=
-HY2_SRC = hy2_inbound.c hy2_datagram.c datagram.c datagram_routes.c hy2_stream_backend.c hy2_datagram_backend.c hy2_datagram_backend_io.c inbound_tls.c $(PROTOCOLS)/src/hysteria2/server.c \
+HY2_SRC = socks_datagram.c hy2_inbound.c hy2_datagram.c datagram.c datagram_routes.c hy2_stream_backend.c hy2_datagram_backend.c hy2_datagram_backend_io.c inbound_tls.c $(PROTOCOLS)/src/hysteria2/server.c \
     $(PROTOCOLS)/src/hysteria2/auth.c $(PROTOCOLS)/src/hysteria2/inbound.c \
     $(HY2_TCP_SRC)
 HY2_INC = $(shell find ../../src -type d -printf '-I%p ')
 HY2_TCP_SRC = hy2_tcp_client.c ../../src/proto/hysteria2/hy2wire.c \
     ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c
+$(BUILD)/socks-datagram-test: socks_datagram_test.c socks_datagram.c hy2_datagram.c datagram_routes.c datagram.c binding_lease.c flow_metadata.c buffers.c operations.c resolver.c ../../src/daemon/loop.c ../../src/proto/hysteria2/hy2wire.c $(PROTOCOLS)/src/socks5/codec.c $(wildcard *.h) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I../../src/proto/hysteria2 -UNDEBUG \
+	    socks_datagram_test.c socks_datagram.c hy2_datagram.c datagram_routes.c datagram.c binding_lease.c flow_metadata.c buffers.c operations.c resolver.c ../../src/daemon/loop.c ../../src/proto/hysteria2/hy2wire.c $(PROTOCOLS)/src/socks5/codec.c $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/hy2-datagram-backend-test: hy2_datagram_backend_test.c hy2_datagram_backend.c \
     hy2_datagram_backend_io.c binding_lease.c flow_metadata.c buffers.c operations.c \
     ../../src/daemon/loop.c $(HY2_TCP_SRC) $(wildcard *.h) \
@@ -193,7 +196,7 @@ $(HY2_HOSTS): $(HOST_SRC) $(HY2_SRC) prototype_main.c $(wildcard *.h) | $(BUILD)
 	@grep -q -- '-DSTEER_WOLFSSL_SERVER' "$(WOLFSSL_SERVER_LIB).cflags"
 	@grep -q -- '-DWOLFSSL_VALIDATE_ECC_IMPORT' "$(WOLFSSL_SERVER_LIB).cflags"
 	@grep -Eq -- '(^|[[:space:]])-DSTEER_WOLFSSL_POSIX_TIME_SAFE=1([[:space:]]|$$)' "$(WOLFSSL_SERVER_LIB).cflags" || { echo 'rebuild wolfSSL archive with current POSIX time-safe profile' >&2; exit 2; }
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(HY2_INC) $(WG_BUILD_FLAGS) -DSTEER_PROTOTYPE_HY2 -DQC_WITH_ENDPOINT \
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(HY2_INC) $(WG_BUILD_FLAGS) -DSTEER_PROTOTYPE_HY2 -DSTEER_PROTOTYPE_SOCKS_UDP -DQC_WITH_ENDPOINT \
 	    $$(cat "$(NGTCP2_LIB).cflags" "$(WOLFSSL_SERVER_LIB).cflags") \
 	    $(HOST_SRC) $(HY2_SRC) $(WG_BUILD_SRC) prototype_main.c "$(NGTCP2_LIB)" "$(WOLFSSL_SERVER_LIB)" \
 	    $(HY2_TEST_EXTRA) $(WG_LINK_FLAGS) $(LDFLAGS) $(LDLIBS) -lm -o $@
