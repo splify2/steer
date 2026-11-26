@@ -8,19 +8,61 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
+import tempfile
 
 
 SCHEMA = "steer.gate-e.preflight.v1"
+MAX_SOURCE_BYTES = 16 * 1024 * 1024
 
 
-def sha256(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as src:
-        for chunk in iter(lambda: src.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+class SourceError(Exception):
+    pass
+
+
+def signature(st):
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_nlink, st.st_uid, st.st_gid,
+            st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def source_snapshot(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise SourceError("source_unavailable") from exc
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise SourceError("source_not_regular")
+        if before.st_size > MAX_SOURCE_BYTES:
+            raise SourceError("source_too_large")
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(fd, min(1024 * 1024, MAX_SOURCE_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_SOURCE_BYTES:
+                raise SourceError("source_too_large")
+        data = b"".join(chunks)
+        after = os.fstat(fd)
+        if signature(before) != signature(after):
+            raise SourceError("source_changed")
+        return data, signature(after)
+    finally:
+        os.close(fd)
+
+
+def source_still_matches(path, expected):
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(current.st_mode) and signature(current) == expected
 
 
 def block(blockers, code, semantic):
@@ -94,50 +136,90 @@ def main():
     spec = os.path.abspath(args.spec)
     if not os.path.isfile(steer) or not os.access(steer, os.X_OK):
         parser.error("--steer must name an executable")
-    if not os.path.isfile(spec):
-        parser.error("--spec must name an existing file")
+    try:
+        raw, source_identity = source_snapshot(spec)
+    except SourceError as exc:
+        report = {
+            "schema": SCHEMA,
+            "tool_version": "unknown",
+            "source_sha256": None,
+            "input_unchanged": False,
+            "preflight_only": True,
+            "conversion_performed": False,
+            "status": "rejected",
+            "supported_semantics": [],
+            "blocking_semantics": [{"code": str(exc), "semantic": "source"}],
+        }
+        print(json.dumps(report, sort_keys=True))
+        return 2
 
-    before = sha256(spec)
-    # The existing CLI parser/converter is authoritative for v2 syntax. JSON is
-    # also parsed from the original bytes below: spec convert normalizes defaults
-    # and can omit explicit default-valued fields, so its output is not a safe
-    # source for a lossless inventory. YAML is rejected until exact source-level
-    # inspection is available. An empty PATH rules out helpers/fetchers.
-    env = dict(os.environ)
-    env["PATH"] = ""
-    version_run = subprocess.run(
-        [steer, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, env=env, check=False,
-    )
-    cli_version = version_run.stdout.strip() if version_run.returncode == 0 else "unknown"
-    parsed = subprocess.run(
-        [steer, "spec", "convert", "--json", "--spec", spec],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env,
-        check=False,
-    )
-    after = sha256(spec)
+    before = hashlib.sha256(raw).hexdigest()
     report = {
         "schema": SCHEMA,
-        "tool_version": cli_version,
         "source_sha256": before,
-        "input_unchanged": before == after,
         "preflight_only": True,
         "conversion_performed": False,
     }
-    if before != after:
+
+    # `spec convert --spec -` reads stdin as LOAD_HUMAN, so the trusted CLI
+    # parses the exact bytes inventoried below without reopening the caller path.
+    # This mode does not execute plugin hooks. Empty cwd and plugin roots also
+    # prevent environment-dependent plugin discovery for unsupported inputs.
+    try:
+        with tempfile.TemporaryDirectory(prefix="gate-e-preflight-") as isolated:
+            empty_dirs = {
+                name: os.path.join(isolated, name)
+                for name in ("cwd", "home", "tmp", "plugin-dir", "plugin-etc",
+                             "plugin-seed", "plugin-panel", "plugins-root",
+                             "plugins-etc")
+            }
+            for path in empty_dirs.values():
+                os.mkdir(path, 0o700)
+            env = {
+                "PATH": "",
+                "HOME": empty_dirs["home"],
+                "TMPDIR": empty_dirs["tmp"],
+                "LC_ALL": "C",
+                "LANG": "C",
+                "STEER_PLUGIN_DIR": empty_dirs["plugin-dir"],
+                "STEER_PLUGIN_ETC": empty_dirs["plugin-etc"],
+                "STEER_PLUGIN_SEED": empty_dirs["plugin-seed"],
+                "STEER_PLUGIN_PANEL_DIR": empty_dirs["plugin-panel"],
+                "STEER_PLUGINS_ROOT": empty_dirs["plugins-root"],
+                "STEER_PLUGINS_ETC": empty_dirs["plugins-etc"],
+                "STEER_PLUGIN_AUTO": "0",
+            }
+            version_run = subprocess.run(
+                [steer, "--version"], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, env=env,
+                cwd=empty_dirs["cwd"],
+                check=False, timeout=30,
+            )
+            cli_version = version_run.stdout.strip() if version_run.returncode == 0 else "unknown"
+            parsed = subprocess.run(
+                [steer, "spec", "convert", "--json", "--spec", "-"],
+                input=raw, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env=env, cwd=empty_dirs["cwd"], check=False, timeout=30,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        parsed = None
+        cli_version = "unknown"
+
+    report["tool_version"] = cli_version
+    unchanged = source_still_matches(spec, source_identity)
+    report["input_unchanged"] = unchanged
+    if not unchanged:
         report.update(status="rejected", supported_semantics=[],
                       blocking_semantics=[{"code": "input_changed", "semantic": "source"}])
         print(json.dumps(report, sort_keys=True))
         return 2
-    if parsed.returncode != 0:
+    if parsed is None or parsed.returncode != 0:
         report.update(status="rejected", supported_semantics=[],
                       blocking_semantics=[{"code": "legacy_parser_rejected", "semantic": "document"}])
         print(json.dumps(report, sort_keys=True))
         return 2
     try:
         effective = json.loads(parsed.stdout)
-        with open(spec, "rb") as src:
-            raw = src.read()
         stripped = raw.lstrip()
         if not stripped.startswith(b"{"):
             report.update(status="rejected", supported_semantics=[],
@@ -146,7 +228,7 @@ def main():
             print(json.dumps(report, sort_keys=True))
             return 2
         doc = json.loads(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, UnicodeError):
         report.update(status="rejected", supported_semantics=[],
                       blocking_semantics=[{"code": "source_json_invalid", "semantic": "document"}])
         print(json.dumps(report, sort_keys=True))

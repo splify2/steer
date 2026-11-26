@@ -9,16 +9,22 @@ make build/steerd build/steer
 python3 tools/gate_e_preflight.py --steer build/steer --spec /path/to/spec.json
 ```
 
-The CLI invocation is `steer spec convert --json --spec …`, with an empty
-`PATH`; its output is captured and never included in the report. The tool also
-reads the original JSON itself for inventory because the existing converter
-normalizes defaults and can omit explicit default-valued fields. YAML is
-therefore rejected for now rather than inventorying a potentially incomplete
-normalized document.
+The source is opened once without following symlinks and read into a bounded
+byte snapshot. SHA-256 and `json.loads` inventory use those exact bytes; the
+trusted CLI receives the same snapshot on stdin via
+`steer spec convert --json --spec -`. Its normalized output is needed only to
+detect parser defaults and is never included in the report. The CLI's stdin
+mode is `LOAD_HUMAN` and does not execute plugin hooks. It runs with an empty
+`PATH`, empty working directory, and isolated empty plugin-discovery roots.
+YAML is rejected because exact source-level inventory is JSON-only.
 
-The JSON report includes the CLI version, SHA-256 of the original bytes,
-whether the input stayed unchanged, and generic semantic categories only.
-It never emits spec values, names, paths, credentials, or parser diagnostics.
+The JSON report includes the CLI version, SHA-256 of the snapshot, whether the
+source path still has the same regular-file identity/stat signature at the
+final check, and generic semantic categories only. Deletion or replacement
+during parsing is a controlled rejection. This final check is not a claim of
+continuous immutability; bytes parsed and inventoried always come from the
+single snapshot. The report never emits spec values, names, paths, credentials,
+or parser diagnostics.
 Exit codes:
 
 - `0`: syntax accepted and only the conservative preflight subset was found;
@@ -37,9 +43,11 @@ legacy parser is a rejection, not a successful inventory.
 
 Even exit code 0 means `preflight_subset`, **not migrated or convertible**:
 `conversion_performed` remains false. This fixture is not the Linux installer,
-backup, cutover, or offline rollback contract required by E4. Tests take a
-single immutable JSON byte sequence, pass it to the actual v2.1.4 parser, and
-assert the original SHA-256 and bytes are unchanged.
+backup, cutover, or offline rollback contract required by E4. The normal
+preflight fixture invokes the actual v2.1.4 parser. An instrumented CLI test
+captures its stdin, performs ordinary source replacement/deletion while
+parsing, and verifies controlled rejection with no temporary source copy left
+after completion.
 
 The disposable supervisor acceptance test runs as an unprivileged user. It
 installs an actual v2.1.4 `steerd` plus its legacy spec in a private prefix,
