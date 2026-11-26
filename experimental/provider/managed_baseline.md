@@ -73,6 +73,12 @@ unshare -n sh -ec 'ip link set lo up; exec python3 -B experimental/provider/lega
   sh /path/to/legacy-steerd /tmp/opencode/ctl.jsonl
 ```
 
+`startup_budget.py` runs 5–50 fresh managed core/UI startups and applies one
+label-only revision to each fresh private state directory. It emits every
+sample and p50/p95/p99; a small number of samples cannot characterize a tail.
+These fresh-state timings are distinct from long-lived churn and from package
+installation time.
+
 The short `managed_baseline.py` can additionally measure a
 bounded burst, but neither it nor the offered-load rate establishes line
 capacity. Run profiles on a quiet machine for comparable budgets; overlapping
