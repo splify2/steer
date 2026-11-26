@@ -24,6 +24,8 @@ test: $(BUILD)/spec-test $(BUILD)/execution-prepare-test $(BUILD)/execution-owne
 	$(BUILD)/execution-startup-test
 test-schema: $(BUILD)/steer-spec-compile
 	python3 schema_agreement_test.py $(BUILD)/steer-spec-compile
+test-plan-storage:
+	CC="$(CC)" python3 plan_storage_test.py
 $(BUILD):
 	mkdir -p $@
 $(BUILD)/steer-spec-compile: main.c $(SOURCES) spec.h | $(BUILD)
@@ -32,7 +34,7 @@ $(BUILD)/spec-test: spec_test.c $(SOURCES) spec.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) spec_test.c $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/execution-prepare-test: execution_prepare_test.c $(EXECUTION_SRC) execution.h ../provider/cancel.h $(SOURCES) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) execution_prepare_test.c $(EXECUTION_SRC) $(SOURCES) $(LDFLAGS) $(LDLIBS) -pthread -o $@
-.PHONY: all test test-schema
+.PHONY: all test test-schema test-plan-storage
 
 EXECUTION_NATIVE_SRC = execution_native.c ../provider/native_stream_backend.c ../provider/stream_backend.c ../provider/stream.c ../provider/route_dial.c ../provider/resolver.c ../provider/datagram.c
 $(BUILD)/execution-owner-test: execution_owner_test.c $(EXECUTION_NATIVE_SRC) $(EXECUTION_SRC) $(SOURCES) execution.h execution_native.h ../provider/cancel.h | $(BUILD)

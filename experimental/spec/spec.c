@@ -54,7 +54,7 @@ static void diagnostic(struct steer_spec_plan *p, unsigned phase, const char *co
     if (phase < 2) p->summary.topology_valid = 0;
     if (!phase) p->summary.syntax_valid = 0;
     if (p->summary.diagnostics == STEER_SPEC_MAX_DIAGNOSTICS) return;
-    d = &p->diagnostics[p->summary.diagnostics++]; d->phase = phase;
+    d = &p->diagnostics[p->summary.diagnostics++]; memset(d, 0, sizeof(*d)); d->phase = phase;
     copy(d->code, sizeof(d->code), code); copy(d->path, sizeof(d->path), path);
 }
 static int scalar(const struct ynode *n) { return n && n->kind == YN_SCALAR && !n->tag; }
@@ -160,7 +160,7 @@ static int requirement(struct steer_spec_plan *p, const char *name, const char *
     struct requirement *r; const struct steer_spec_capability *cap = NULL; size_t i;
     if (p->summary.requirements == REQUIREMENTS) { diagnostic(p, 0, "requirement_limit", path); return 0; }
     for (i = 0; i < p->inventory_count; i++) if (!strcmp(p->inventory[i].name, name)) { cap = &p->inventory[i]; break; }
-    r = &p->requirements[p->summary.requirements++]; copy(r->name, sizeof(r->name), name); copy(r->path, sizeof(r->path), path);
+    r = &p->requirements[p->summary.requirements++]; memset(r, 0, sizeof(*r)); copy(r->name, sizeof(r->name), name); copy(r->path, sizeof(r->path), path);
     r->owner_node=p->requirement_owner;
     r->state = cap ? cap->state : 0;
     if ((r->state & STEER_SPEC_READY) != STEER_SPEC_READY) diagnostic(p, 2, "capability_unavailable", path);
@@ -174,7 +174,7 @@ static void edge(struct steer_spec_plan *p, uint32_t source, enum steer_spec_nod
     struct edge *e; char id[64];
     if (!named(p, reference, id, path)) return;
     if (p->summary.edges == STEER_SPEC_MAX_EDGES) { diagnostic(p, 0, "edge_limit", path); return; }
-    e = &p->edges[p->summary.edges++]; e->source = source; e->target = UINT32_MAX;
+    e = &p->edges[p->summary.edges++]; memset(e, 0, sizeof(*e)); e->source = source; e->target = UINT32_MAX;
     e->target_kind = target; e->kind = kind; e->flows = required; e->dependency = dependency;
     copy(e->id, sizeof(e->id), id); copy(e->path, sizeof(e->path), path);
 }
@@ -194,7 +194,7 @@ static void collect(struct steer_spec_plan *p, enum steer_spec_node_kind kind, c
         path_at(at, path, key->str);
         if (!identifier(key->str)) { diagnostic(p, 0, "invalid_identifier", at); continue; }
         if (p->summary.nodes == STEER_SPEC_MAX_NODES) { diagnostic(p, 0, "node_limit", path); return; }
-        node = &p->nodes[p->summary.nodes++]; node->kind = kind;
+        node = &p->nodes[p->summary.nodes++]; memset(node, 0, sizeof(*node)); node->kind = kind;
         copy(node->id, sizeof(node->id), key->str); copy(node->path, sizeof(node->path), at);
         node->intent = ynode_val_at(map, i); node->enabled = 1;
         node->flows = STEER_SPEC_FLOW_STREAM;
@@ -505,7 +505,7 @@ static void rules(struct steer_spec_plan *p, const struct ynode *list, int dns, 
         snprintf(position, sizeof(position), "%zu", i); path_at(path, base, position);
         if (!keys(p, n, "name enabled match action outbound server strategy cache_timeout", path)) continue;
         if (p->rule_count == RULES) { diagnostic(p, 0, "rule_limit", path); return; }
-        rule = &p->rules[p->rule_count++]; copy(rule->path, sizeof(rule->path), path); rule->dns = dns;
+        rule = &p->rules[p->rule_count++]; memset(rule, 0, sizeof(*rule)); copy(rule->path, sizeof(rule->path), path); rule->dns = dns;
         name = field(p, n, "name", path, 1); named(p, name, rule->id, path);
         for (j = begin; j + 1 < p->rule_count; j++) if (!strcmp(p->rules[j].id, rule->id)) diagnostic(p, 0, "duplicate_rule_name", path);
         enabled = boolean(p, ynode_get(n, "enabled"), 1, path);
@@ -578,9 +578,14 @@ static void resolve(struct steer_spec_plan *p) {
 }
 struct steer_spec_plan *steer_spec_compile(const char *source, size_t length,
     const struct steer_spec_capability *inventory, size_t inventory_count) {
-    struct steer_spec_plan *p = calloc(1, sizeof(*p)); struct err error = {0};
+    struct steer_spec_plan *p = malloc(sizeof(*p)); struct err error = {0};
     const struct ynode *root, *routing, *dns, *remotes, *v; long version; uint32_t i; size_t j;
     if (!p) return NULL;
+    /* Initialise the header and each table entry on insertion, not the unused
+     * capacity. Early diagnostic returns and destruction need this header. */
+    p->summary = (struct steer_spec_summary){0};
+    p->document = NULL; p->source = NULL; p->source_length = 0;
+    p->rule_count = 0; p->inventory = NULL; p->inventory_count = 0;
     p->requirement_owner=UINT32_MAX;
     p->summary.syntax_valid = p->summary.topology_valid = p->summary.runtime_ready = 1;
     if (!source || !length || length > STEER_SPEC_MAX_BYTES || (!inventory && inventory_count)) {
