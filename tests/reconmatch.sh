@@ -64,6 +64,13 @@ for d in wga wgb; do "$real_ip" link add $d type dummy && "$real_ip" link set $d
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/st" "$tmp/st2" "$tmp/bin"
+# interface/obfs is a core kind whose helper is supplied by the obfs plugin.
+# Give this isolated test its real manifest instead of relying on system plugins.
+mkdir -p "$tmp/plugins/obfs" "$tmp/plugins-etc"
+cp "$(dirname "$0")/../plugins/obfs/plugin.json" "$tmp/plugins/obfs/plugin.json"
+STEER_PLUGINS_ROOT="$tmp/plugins"
+STEER_PLUGINS_ETC="$tmp/plugins-etc"
+export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 D="" D2="" W="" AP="" UPR=""
 trap 'kill $D $D2 $W $AP $UPR 2>/dev/null; rm -rf "$tmp"' EXIT
 pass=0 fail=0
@@ -94,7 +101,14 @@ export PATH
 
 cat > "$tmp/helper" <<H
 #!/bin/sh
-echo "\$1 \$2 \$\$" >> "$tmp/log"
+conf_path=
+want_conf=0
+for arg do
+    if [ "\$want_conf" = 1 ]; then conf_path=\$arg; break; fi
+    [ "\$arg" = --conf ] && want_conf=1
+done
+conf=\$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["output"]["on_fail"])' "\$conf_path" 2>/dev/null || echo missing)
+echo "\$1 \$2 \$\$ \$conf" >> "$tmp/log"
 trap 'exit 0' TERM
 while :; do sleep 1; done
 H
@@ -176,14 +190,44 @@ spec S6.json p3.lst drop 10.99.0.4:4443 "$D12"
 cp "$tmp/S1.json" "$tmp/spec.json"
 
 pid_of() { grep "^obfs $1 " "$tmp/log" | tail -1 | cut -d' ' -f3; }
+helper_conf_of() { grep "^obfs $1 " "$tmp/log" | tail -1 | awk '{print $4}'; }
 handle() { "$real_nft" -a list table inet steer 2>/dev/null | sed -n '1s/.*# handle \([0-9]*\).*/\1/p'; }
 dnsd_pid() { grep -o 'supervise: dnsd запущен (pid [0-9]*' "$tmp/d.err" | tail -1 | grep -o '[0-9]*$'; }
-tabs() { grep -c "channel b_dom: .*rule(s)" "$tmp/d.err"; }
+tabs() { grep -c 'steer dnsd: таблица от демона: [0-9][0-9]* доменных канал' "$tmp/d.err" || true; }
 nft_runs() { [ -f "$tmp/nft.log" ] && wc -l < "$tmp/nft.log" | tr -d ' ' || echo 0; }
 nft_loads() { [ -f "$tmp/nft.log" ] && { grep -c '^-f ' "$tmp/nft.log" || true; } || echo 0; }
-ip_changes() { [ -f "$tmp/ip.log" ] && grep -E 'route (replace|add|flush|del)|rule (add|del)' "$tmp/ip.log" |
-               sed -n 's/.* table \([0-9]*\).*/\1/p' | sort -u | tr '\n' ' ' | sed 's/ $//'; }
-fresh() { : > "$tmp/nft.log"; : > "$tmp/ip.log"; }
+ip_changes() {
+    [ -f "$tmp/ip.log" ] && grep -E 'route (replace|add|flush|del)|rule (add|del)' "$tmp/ip.log" |
+        sed -n 's/.* table \([0-9]*\).*/\1/p' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+route_snapshot() {
+    for table in "$TA" "$TB"; do
+        {
+            "$real_ip" -4 route show table "$table" 2>/dev/null
+            "$real_ip" -6 route show table "$table" 2>/dev/null
+            "$real_ip" -4 rule show table "$table" 2>/dev/null
+            "$real_ip" -6 rule show table "$table" 2>/dev/null
+        } > "$tmp/routing.$table"
+    done
+}
+# ip.log observes only calls through the ip wrapper. This snapshot compares
+# final state; it does not prove the absence of a transient replacement.
+route_state_changes() {
+    route_snapshot
+    changed=""
+    for table in "$TA" "$TB"; do
+        if ! cmp -s "$tmp/routing.before.$table" "$tmp/routing.$table"; then
+            changed="${changed}${changed:+ }$table"
+        fi
+    done
+    printf '%s' "$changed"
+}
+fresh() {
+    : > "$tmp/nft.log"
+    : > "$tmp/ip.log"
+    route_snapshot
+    for table in "$TA" "$TB"; do cp "$tmp/routing.$table" "$tmp/routing.before.$table"; done
+}
 
 DARGS="daemon --supervise --socket $tmp/s.sock --spec $tmp/spec.json --state-dir $tmp/st
     --dnsd-flag --listen-port --dnsd-flag 15411 --dnsd-flag --upstream-port --dnsd-flag 15475"
@@ -200,7 +244,9 @@ else
 fi
 D=$!
 wait_for '[ -S "$tmp/s.sock" ] && [ -n "$(pid_of a)" ] && [ -n "$(pid_of b)" ] && [ -n "$(dnsd_pid)" ]' 5
+wait_for '[ "$(helper_conf_of a)" = direct ]' 5
 wait_for '[ "$(tabs)" -ge 1 ]' 5
+check "  helper a прочитал {conf} с on_fail=direct" "direct" "$(helper_conf_of a)"
 TA=$(awk '$1 == "a" { print $3 }' "$tmp/st/registry")
 TB=$(awk '$1 == "b" { print $3 }' "$tmp/st/registry")
 
@@ -423,10 +469,18 @@ check "  real-ip: адрес из ответа снова в новом набо
 # ---- 4. режим отказа выхода a ----------------------------------------------------------------
 fresh
 r="$(ctl apply < "$tmp/S3.json")"
-check "сменился on_fail выхода a: привязан заново только a" "[a] []" \
+wait_for '[ -n "$(pid_of a)" ] && [ "$(pid_of a)" != "$PA" ] && kill -0 "$(pid_of a)" 2>/dev/null && [ "$(helper_conf_of a)" = drop ]' 5
+check "сменился on_fail выхода a: изменились маршрут и подпись helper {conf}" "[a] [a]" \
     "$(ch "$r" | awk '{print $2, $3}')"
-check "  в ядре тронута только таблица a" "$TA" "$(ip_changes)"
-check "  помощники — те же" "$PA $PB" "$(pid_of a) $(pid_of b)"
+check "  helper a перезапущен с новым живым PID и прочитал on_fail=drop" "yes" \
+    "$([ -n "$(pid_of a)" ] && [ "$(pid_of a)" != "$PA" ] && kill -0 "$(pid_of a)" 2>/dev/null && \
+       [ "$(helper_conf_of a)" = drop ] && echo yes || echo no)"
+check "  helper b остался прежним и живым" "$PB" \
+    "$([ "$(pid_of b)" = "$PB" ] && kill -0 "$PB" 2>/dev/null && echo "$PB" || echo no)"
+check "  обёртка ip не наблюдала CLI-вызовов маршрутизации" "" "$(ip_changes)"
+check "  изменилось итоговое состояние только таблицы a (не доказательство отсутствия промежуточной перестановки)" \
+    "$TA" "$(route_state_changes)"
+PA="$(pid_of a)"
 
 # ---- 5. сервер обфускации выхода b ----------------------------------------------------------
 fresh

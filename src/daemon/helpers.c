@@ -32,8 +32,9 @@ int64_t helpers_now_ms(void) { return steer_mono_ms(); }
  * продолжал работать со старым до своего перезапуска, то есть до перезагрузки. Тот же открытый
  * пункт закрывает на роутере сам splify2 отпечатками vless_fingerprint и obfs_fingerprint
  * (rpcd/m-spec.sh); здесь поля те же, и по тем же доводам в подпись входит ТОЛЬКО то, что
- * помощник действительно читает при старте. Правка устройства, on_fail или каналов помощника
- * не касается, а перезапуск рвёт туннель и меняет выходной адрес — трогать его из-за неё нельзя.
+ * помощник действительно читает при старте. Для плагина steer-api 1.4 отдельно предписывает
+ * хешировать весь {conf}; он содержит on_fail, поэтому его смена перезапускает и plugin-helper.
+ * Это исключение к общей подписи ниже, а не основание сужать документированный контракт.
  *
  * Поля по видам называет сам вид (kind_ops.helper в src/kinds): vless — файл подписки и выбор
  * узлов; xsteer — файл конфигурации и режим потока; tgws — домен точек; obfs у interface —
@@ -85,7 +86,7 @@ size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *
             if (kd->helper(sp, o, &hp) != 0) { kind_helper_free(&hp); continue; }
             /* Помощник плагина читает {conf} (steer-api.md, 1.4): файл кладётся здесь, до запуска, при
              * каждом сборе помощников — его содержимое входит и в подпись перезапуска (plugin.c). */
-            if (hp.conf_path && plugin_conf_write(sp, o) != 0)
+            if (hp.conf_path && plugin_conf_write_kind(sp, o, hp.plugin_kind) != 0)
                 fprintf(stderr, "steer[warn] %s: файл настройки выхода %s не записан: %s\n", o->name,
                         hp.conf_path, strerror(errno));
             if (hp.marks && need_marks) *need_marks = 1;

@@ -219,6 +219,7 @@ char *plugin_conf_json(const struct spec *sp, const struct output *o, const stru
 /* Записать {conf} выхода атомарно (0600) в <state>/plugin/<id>/<выход>.json до запуска помощника.
  * 0 / -1 (причина — errno). */
 int plugin_conf_write(const struct spec *sp, const struct output *o);
+int plugin_conf_write_kind(const struct spec *sp, const struct output *o, const struct plugin_kind *pk);
 /* Перечитать реестр плагинов, если каталог плагинов или state.json изменились с прошлого чтения
  * (1 — перечитан). Зовёт загрузка спеки в демоне, чтобы смена плагинов подхватывалась на reload. */
 int plugin_refresh(void);

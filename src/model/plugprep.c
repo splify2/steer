@@ -189,8 +189,7 @@ int spec_prepare_report(const char *path, char **json) {
 }
 
 /* {conf} выхода — перед запуском его помощника (steer-api.md, 1.4). */
-int plugin_conf_write(const struct spec *sp, const struct output *o) {
-    const struct plugin_kind *pk = plugin_helper_kind(o);
+int plugin_conf_write_kind(const struct spec *sp, const struct output *o, const struct plugin_kind *pk) {
     if (!pk) return -1;
     char *json = plugin_conf_json(sp, o, pk);
     if (!json) return -1;
@@ -200,6 +199,10 @@ int plugin_conf_write(const struct spec *sp, const struct output *o) {
     int rc = pu_mkdir_p(dir) == 0 ? pu_write_atomic(path, json, strlen(json), 0600) : -1;
     free(json);
     return rc;
+}
+
+int plugin_conf_write(const struct spec *sp, const struct output *o) {
+    return plugin_conf_write_kind(sp, o, plugin_helper_kind(o));
 }
 
 /* ---- подкоманды плагинов (steer-api.md, 4.3; manifest.md, commands[]) ------------------------------ */
