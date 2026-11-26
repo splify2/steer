@@ -31,8 +31,10 @@ static int interrupted(struct job *job) {
 static void dispose(struct job *job) {
     if(!job)return;
 #ifdef STEER_PROTOTYPE_HY2
-    for(unsigned i=0;i<STEER_POLICY_STREAM_BINDINGS_MAX;i++)
+    for(unsigned i=0;i<STEER_POLICY_STREAM_BINDINGS_MAX;i++) {
         (void)steer_hy2_profile_destroy(job->result.hy2_out[i]);
+        (void)steer_hy2_profile_destroy(job->result.hy2_udp_out[i]);
+    }
     for(unsigned i=0;i<STEER_PROTOTYPE_MAX_LISTENERS;i++)qc_server_tls_release(job->result.tls[i]);
 #endif
     steer_prototype_config_destroy(job->result.config);free(job->document);free(job);
@@ -61,6 +63,12 @@ static void prepare(struct job *job,const struct steer_prototype_socks_vpn_allow
         if(steer_prototype_prepare_hy2_outbound(spec,job->generation,&r->hy2_out[i])){
             r->error=422;
             return;
+        }
+        if(spec->hy2_datagram) {
+            r->error=interrupted(job);if(r->error)return;
+            if(steer_prototype_prepare_hy2_outbound(spec,job->generation,&r->hy2_udp_out[i])) {
+                r->error=422;return;
+            }
         }
     }
     for(unsigned i=0;i<r->config->listener_count;i++) {

@@ -363,7 +363,7 @@ static int v3_stream_outbound(const struct steer_spec_node_view *node,const stru
     struct steer_prototype_stream_outbound *out){
     const struct ynode *address=ynode_get(node->endpoint,"address");
     if(!node->enabled||!node->options_validated||
-        node->flows!=STEER_SPEC_FLOW_STREAM||
+        !(node->flows&STEER_SPEC_FLOW_STREAM)||
         !keys(node->endpoint,"address port")||!scalar(address)||
         !port(ynode_get(node->endpoint,"port"),&out->port))return 0;
 #ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
@@ -384,7 +384,11 @@ static int v3_stream_outbound(const struct steer_spec_node_view *node,const stru
     if(!strncmp(node->provider,"hysteria2:",10)){
         const struct ynode *tls=node->security,*transport=node->transport;
         uint32_t verify;
-        if(!keys(node->intent,"label enabled plugin flow endpoint options transport security")||
+        if(node->flows==(STEER_SPEC_FLOW_STREAM|STEER_SPEC_FLOW_DATAGRAM)) {
+            if(!eq(node->variant,"numeric-udp-1000"))return 0;
+            out->hy2_datagram=1;
+        } else if(node->flows!=STEER_SPEC_FLOW_STREAM || node->variant) return 0;
+        if(!keys(node->intent,"label enabled plugin flow endpoint options transport security variant")||
            !keys(transport,"type")||!eq(ynode_get(transport,"type"),"quic")||
            !keys(tls,"type server_name verify")||!eq(ynode_get(tls,"type"),"tls")||
            !flag(ynode_get(tls,"verify"),1,&verify)||!verify||
@@ -396,6 +400,11 @@ static int v3_stream_outbound(const struct steer_spec_node_view *node,const stru
 #endif
     if(!keys(node->intent,"label enabled plugin flow endpoint options"))return 0;
     if(!out->protocol)return 0;
+#ifdef STEER_PROTOTYPE_HY2
+    if(out->protocol!=STEER_PROTOTYPE_HYSTERIA2 && node->flows!=STEER_SPEC_FLOW_STREAM)return 0;
+#else
+    if(node->flows!=STEER_SPEC_FLOW_STREAM)return 0;
+#endif
     if(inet_pton(AF_INET,address->str,out->address)==1){
         if(!out->address[0]||out->address[0]>=224)return 0;
         out->endpoint_tag=STEER_PV1_ENDPOINT_IPV4;
@@ -539,7 +548,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         |((allow&&allow->wg_inbound_validate)?STEER_SPEC_FLOW_DEVICE:0)
 #endif
         ;
-    enum { alias_requirements=10 };
+    enum { alias_requirements=12 };
     struct steer_spec_capability inventory[1+sizeof(core)/sizeof(core[0])+alias_requirements*STEER_PROTOTYPE_MAX_LISTENERS];
     size_t count=sizeof(core)/sizeof(core[0]);
     char requirements[STEER_PROTOTYPE_MAX_LISTENERS][alias_requirements][128];
@@ -596,6 +605,10 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         inventory[count++]=(struct steer_spec_capability){requirements[i][4],STEER_SPEC_READY,v3_hy2_options,NULL};
         snprintf(requirements[i][7],sizeof(requirements[i][7]),"provider.hysteria2:%s/outbound/stream/quic/tls/default",alias->str);
         inventory[count++]=(struct steer_spec_capability){requirements[i][7],STEER_SPEC_READY,v3_hy2_outbound_options,NULL};
+        snprintf(requirements[i][10],sizeof(requirements[i][10]),"provider.hysteria2:%s/outbound/stream/quic/tls/numeric-udp-1000",alias->str);
+        snprintf(requirements[i][11],sizeof(requirements[i][11]),"provider.hysteria2:%s/outbound/datagram/quic/tls/numeric-udp-1000",alias->str);
+        inventory[count++]=(struct steer_spec_capability){requirements[i][10],STEER_SPEC_READY,v3_hy2_outbound_options,NULL};
+        inventory[count++]=(struct steer_spec_capability){requirements[i][11],STEER_SPEC_READY,v3_hy2_outbound_options,NULL};
 #endif
 #ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
         snprintf(requirements[i][5],sizeof(requirements[i][5]),"provider.vless:%s/outbound/stream/tcp/none/default",alias->str);

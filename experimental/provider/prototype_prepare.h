@@ -9,6 +9,7 @@ struct steer_prototype_prepared_input {
     struct steer_prototype_config *config;
 #ifdef STEER_PROTOTYPE_HY2
     struct steer_hy2_profile *hy2_out[STEER_POLICY_STREAM_BINDINGS_MAX];
+    struct steer_hy2_profile *hy2_udp_out[STEER_POLICY_STREAM_BINDINGS_MAX];
     struct qc_server_tls *tls[STEER_PROTOTYPE_MAX_LISTENERS];
     uint8_t certificate_hash[STEER_PROTOTYPE_MAX_LISTENERS][32];
     uint8_t private_key_hash[STEER_PROTOTYPE_MAX_LISTENERS][32];

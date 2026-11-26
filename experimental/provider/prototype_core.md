@@ -545,11 +545,8 @@ the message in that slot. Zero length is a valid local message, not EOF;
 however, the independently tested upstream Hysteria v2.13.0 discards
 zero-payload wire messages, so local send acceptance does not establish remote
 delivery. The existing profile generation and flow limit pin
-the association until destruction. This transport primitive is **not** an SDK
-datagram backend and is not connected to managed routing: do not advertise
-HY2 UDP outbound capability or infer spec-v3 support from this test.
-Any future managed binding must validate numeric targets and its actual message
-limit; it must not advertise unrestricted datagram routing based on this slice.
+the association until destruction. This transport primitive by itself is
+not an SDK datagram backend; its tests alone do not establish managed routing.
 
 The experimental standalone `hy2_datagram_backend` provides an owner-loop SDK
 binding with deferred opens and completion, operation deadlines, cancellation,
@@ -559,8 +556,8 @@ Zero-length send is valid locally even though the upstream version measured
 above discards such frames. Receive zero is a message; an undersized SDK receive
 discards one message with RESOURCE_EXHAUSTED. The advertised per-association
 message limit is at most 1000 and also reflects the current QUIC path limit.
-This binding is not registered with managed routing and does not enable a
-managed capability. Its dedicated lab fixture is built with the same QUIC
+The optional Full host registers this binding only for an explicit
+`numeric-udp-1000` outbound variant. Its dedicated lab fixture is built with the same QUIC
 libraries as the host and run in a private loopback-only namespace:
 
 ```sh
@@ -581,6 +578,33 @@ caller. This test verifies actual 1000-byte loopback echo and associates the
 echo's source socket with the upstream server process for IPv4 and compressed
 and expanded IPv6 targets; it also verifies domain rejection before network
 activity, disabled UDP negotiation and an offline peer without direct fallback.
+
+The optional Full build accepts the following **experimental bounded** variant
+on an otherwise valid HY2 outbound:
+
+```yaml
+flow: [stream, datagram]
+variant: numeric-udp-1000
+```
+
+Both fields are mandatory for this variant; the default stream-only outbound
+does not support datagrams. Routing can select that named outbound for the
+HY2 inbound. UDP targets must be numeric IPv4/IPv6 unicast, excluding mapped,
+unspecified, multicast and IPv6 link-local addresses. Domains are rejected;
+there is no DNS resolution or direct fallback. Payloads are at most 1000 bytes
+and may be limited further by the negotiated QUIC path. Fragmented replies,
+larger messages and packets arriving while the receive slot is occupied are
+dropped. The upstream v2.13.0 discards empty UDP payloads; successful local send
+does not promise remote delivery. These limits mean this variant is not an
+unrestricted UDP outbound or a general UDP capability.
+
+In a private loopback-only network namespace, the managed fixture is:
+
+```sh
+python3 experimental/provider/prototype_hy2_udp_outbound_test.py \
+  --core "$BUILD/steer-prototype-hy2" --server /path/to/upstream/hysteria \
+  --client /path/to/independent/hy2-client --minimal "$BUILD/steer-prototype"
+```
 
 ### Optional Hysteria2 server build
 

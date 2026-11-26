@@ -193,7 +193,8 @@ static struct steer_pv1_async_start forward_io(struct steer_pv1_datagram *opaque
     if(!h||!buffer||!done||(!writing&&!length)||deadline<=now_ns())return a;
     uint32_t limit=routed_limit(opaque);
     if(!limit||h->closed||(writing?h->send:h->receive)){a.error=error(STEER_PV1_POLICY_DENIED);return a;}
-    if(length>limit)return a;
+    /* message_limit bounds datagram payload, not the caller's receive buffer. */
+    if(writing&&length>limit)return a;
     struct steer_pv1_datagram_association *association=h->target->association;
     struct steer_draft_datagram_router *r=association->router;
     struct steer_pv1_mut_span view;

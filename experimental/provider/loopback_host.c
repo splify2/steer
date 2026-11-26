@@ -38,6 +38,7 @@
 #ifdef STEER_PROTOTYPE_HY2
 #include "hy2_inbound.h"
 #include "hy2_stream_backend.h"
+#include "hy2_datagram_backend.h"
 #include "hy2_tcp_client.h"
 #include "datagram.h"
 #include "datagram_routes.h"
@@ -119,6 +120,8 @@ struct generation {
     unsigned prepared_outbounds;
 #ifdef STEER_PROTOTYPE_HY2
     struct steer_hy2_stream_backend *hy2_out[STEER_POLICY_STREAM_BINDINGS_MAX];
+    struct steer_hy2_datagram_backend *hy2_udp_out[STEER_POLICY_STREAM_BINDINGS_MAX];
+    uint32_t udp_index[STEER_POLICY_STREAM_BINDINGS_MAX];
     struct steer_draft_datagram_runtime *datagram_native;
     struct steer_draft_datagram_router *datagrams;
     struct steer_draft_binding_lease *datagram_binding;
@@ -649,8 +652,10 @@ static void accept_clients(struct loop *l, int fd, uint32_t events, void *arg)
 }
 #ifdef STEER_PROTOTYPE_HY2
 static void retire_hy2_outbounds(struct generation *g) {
-    if(g) for(unsigned i=0;i<g->prepared_outbounds;i++)
+    if(g) for(unsigned i=0;i<g->prepared_outbounds;i++) {
         steer_hy2_stream_backend_retire(g->hy2_out[i]);
+        steer_hy2_datagram_backend_retire(g->hy2_udp_out[i]);
+    }
 }
 #endif
 #ifdef STEER_PROTOTYPE_WG_NETNS
@@ -745,6 +750,7 @@ struct outbound_credentials {
     struct steer_pv1_span username, password;
 #ifdef STEER_PROTOTYPE_HY2
     struct steer_hy2_profile *hy2;
+    struct steer_hy2_profile *hy2_udp;
 #endif
 };
 static int prepare_stream_routes(struct host *h, struct generation *g,
@@ -820,9 +826,15 @@ static int prepare_stream_routes(struct host *h, struct generation *g,
 }
 #ifdef STEER_PROTOTYPE_HY2
 static struct steer_pv1_error select_datagram(void *context,const struct steer_pv1_flow_metadata *flow,uint32_t *action){
+    struct generation *g=context;
     struct steer_policy_input input={flow->generation,flow->inbound_id,flow->principal_id,&flow->destination};
-    struct steer_policy_decision decision;struct steer_pv1_error error=steer_policy_evaluate(context,&input,&decision);
-    *action=!error.code&&decision.action==STEER_POLICY_DIRECT?STEER_DRAFT_DATAGRAM_ROUTE_DIRECT:STEER_DRAFT_DATAGRAM_ROUTE_BLOCK;
+    struct steer_policy_decision decision;struct steer_pv1_error error=steer_policy_evaluate(g->policy,&input,&decision);
+    *action=STEER_DRAFT_DATAGRAM_ROUTE_BLOCK_INDEX;
+    if(!error.code&&decision.action==STEER_POLICY_DIRECT)*action=0;
+    else if(!error.code&&decision.action>=STEER_POLICY_STREAM_BINDING_BASE) {
+        uint32_t i=decision.action-STEER_POLICY_STREAM_BINDING_BASE;
+        if(i<STEER_POLICY_STREAM_BINDINGS_MAX)*action=g->udp_index[i];
+    }
     return error;
 }
 static void datagram_finalized(void *user,const struct steer_draft_binding_identity *identity){
@@ -839,15 +851,29 @@ static void datagram_drained(void *user,struct steer_draft_datagram_router *rout
     /* Destroy only from the separate host-owner turn, after notification. */
     loop_timer_set(g->host->work,0);
 }
-static int prepare_datagram_routes(struct host *h,struct generation *g){
+static int prepare_datagram_routes(struct host *h,struct generation *g,struct outbound_credentials *credentials){
     struct steer_draft_binding_identity identity={.size=sizeof identity,.version=STEER_PV1_DRAFT_LAYOUT,
-        .generation=g->number,.instance_token=g->number,.provider_id={(const uint8_t *)"native-udp",10},.flow_class=STEER_PV1_FLOW_DATAGRAM};
+        .generation=g->number,.instance_token=g->number,.provider_id={(const uint8_t *)"native-udp",10},
+        .prepared_capabilities=STEER_DRAFT_DATAGRAM_BINDING_PREPARED|STEER_DRAFT_DATAGRAM_BINDING_TARGET_DOMAIN,.flow_class=STEER_PV1_FLOW_DATAGRAM};
     struct steer_draft_datagram_route_limits limits={64,64,8,256,8*65507+262144,60000000000ULL};
     if(steer_draft_binding_lease_create(h->loop,&identity,4096,datagram_finalized,g,&g->datagram_binding).code||
        steer_draft_datagram_runtime_create(h->loop,h->buffers,64,256,8*65507+262144,&g->datagram_native).code)return 0;
     if(h->resolver&&steer_draft_datagram_use_resolver(g->datagram_native,h->resolver).code)return 0;
-    if(steer_draft_datagram_router_create(h->loop,h->buffers,g->datagram_binding,steer_draft_datagram_backend_api(),
-        g->datagram_native,&limits,select_datagram,g->policy,&g->datagrams).code)return 0;
+    struct steer_draft_datagram_binding bindings[1+STEER_POLICY_STREAM_BINDINGS_MAX];
+    uint32_t count=1;
+    bindings[0]=(struct steer_draft_datagram_binding){h->loop,g->datagram_binding,steer_draft_datagram_backend_api(),g->datagram_native};
+    for(unsigned i=0;i<STEER_POLICY_STREAM_BINDINGS_MAX;i++)g->udp_index[i]=STEER_DRAFT_DATAGRAM_ROUTE_BLOCK_INDEX;
+    if(g->config)for(unsigned i=0;i<g->config->stream_outbound_count;i++) {
+        if(!g->config->stream_outbounds[i].hy2_datagram)continue;
+        if(!credentials||!credentials[i].hy2_udp||
+           steer_hy2_datagram_backend_create(h->loop,h->buffers,credentials[i].hy2_udp,g->number,i+1,
+             4*CLIENTS,2*CLIENTS*CAPACITY,16*CLIENTS,STEER_PROTOTYPE_HY2_OUTBOUND_DRAIN_MS,
+             generation_retired,g,&g->hy2_udp_out[i]).code)return 0;
+        credentials[i].hy2_udp=NULL;
+        g->udp_index[i]=count;bindings[count++]=*steer_hy2_datagram_binding(g->hy2_udp_out[i]);
+    }
+    if(steer_draft_datagram_router_create_registry(h->loop,h->buffers,g->datagram_binding,
+        bindings,count,&limits,select_datagram,g,&g->datagrams).code)return 0;
     return !steer_draft_datagram_router_on_drained(g->datagrams,datagram_drained,g).code;
 }
 #endif
@@ -897,6 +923,8 @@ static int destroy_generation(struct generation *g)
 #ifdef STEER_PROTOTYPE_HY2
         if(g->hy2_out[i]&&steer_hy2_stream_backend_destroy(g->hy2_out[i]).code)return 0;
         g->hy2_out[i]=NULL;
+        if(g->hy2_udp_out[i]&&steer_hy2_datagram_backend_destroy(g->hy2_udp_out[i]).code)return 0;
+        g->hy2_udp_out[i]=NULL;
 #endif
         g->prepared_outbounds--;
     }
@@ -1215,7 +1243,7 @@ int steer_lab_loopback_main(int argc, char **argv, int vless)
     if (steer_draft_routes_create(h.loop, h.runtime, 1, CLIENTS, steer_policy_route, g->policy, &g->routes).code) goto cleanup;
     if (!prepare_stream_routes(&h, g, NULL)) goto cleanup;
 #ifdef STEER_PROTOTYPE_HY2
-    if (!prepare_datagram_routes(&h, g)) goto cleanup;
+    if (!prepare_datagram_routes(&h, g, NULL)) goto cleanup;
 #endif
     listener->identity = identity;
     strcpy(listener->spec.id, identity.id); strcpy(listener->spec.address, bind_address);
@@ -1429,7 +1457,13 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
             if(inputs) {
                 credentials[i].hy2=inputs->hy2_out[i];inputs->hy2_out[i]=NULL;
                 if(!credentials[i].hy2)goto cleanup;
+                if(out->hy2_datagram) {
+                    credentials[i].hy2_udp=inputs->hy2_udp_out[i];inputs->hy2_udp_out[i]=NULL;
+                    if(!credentials[i].hy2_udp)goto cleanup;
+                }
             }else if(steer_prototype_prepare_hy2_outbound(out,next,&credentials[i].hy2))goto cleanup;
+            if(!inputs&&out->hy2_datagram&&
+               steer_prototype_prepare_hy2_outbound(out,next,&credentials[i].hy2_udp))goto cleanup;
         }
 #endif
     }
@@ -1524,7 +1558,7 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     }
     if (!prepare_stream_routes(h, g, credentials)) { result = 503; goto cleanup; }
 #ifdef STEER_PROTOTYPE_HY2
-    if (!prepare_datagram_routes(h, g)) { result = 503; goto cleanup; }
+    if (!prepare_datagram_routes(h, g, credentials)) { result = 503; goto cleanup; }
 #endif
     for (i = 0; i < g->config->listener_count; ++i) {
         const struct steer_prototype_listener *spec = &g->config->listeners[i];
@@ -1577,7 +1611,10 @@ cleanup:
     steer_draft_wg_stream_destroy(recovered_wg);
 #endif
 #ifdef STEER_PROTOTYPE_HY2
-    for(i=0;i<STEER_POLICY_STREAM_BINDINGS_MAX;i++)(void)steer_hy2_profile_destroy(credentials[i].hy2);
+    for(i=0;i<STEER_POLICY_STREAM_BINDINGS_MAX;i++) {
+        (void)steer_hy2_profile_destroy(credentials[i].hy2);
+        (void)steer_hy2_profile_destroy(credentials[i].hy2_udp);
+    }
     for(i=0;i<STEER_PROTOTYPE_MAX_LISTENERS;i++)qc_server_tls_release(contexts[i]);
 #endif
     explicit_bzero(credentials, sizeof credentials);

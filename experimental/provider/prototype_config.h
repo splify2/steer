@@ -33,6 +33,7 @@ struct steer_prototype_stream_outbound {
     uint16_t port;
 #ifdef STEER_PROTOTYPE_HY2
     char tls_name[254], ca_ref[100];
+    uint32_t hy2_datagram; /* explicit bounded numeric-only variant */
 #endif
 };
 struct steer_prototype_config {

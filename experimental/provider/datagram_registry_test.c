@@ -32,7 +32,7 @@ struct fixture {
     uint8_t ip[4];unsigned selected,slot,phase,drained;int peer;uint32_t bytes,code;
 };
 static uint64_t deadline(void){struct timespec t;assert(!clock_gettime(CLOCK_MONOTONIC,&t));return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec+1000000000ull;}
-static uint32_t limit(struct steer_pv1_datagram *p){struct origin *o=(void *)p;return o->inner.api->message_limit(o->inner.handle);}
+static uint32_t limit(struct steer_pv1_datagram *p){struct origin *o=(void *)p;return o->inner.api->message_limit(o->inner.handle)?8:0;}
 static struct steer_pv1_async_start send_message(struct steer_pv1_datagram *p,struct steer_pv1_buffer *b,
     uint32_t at,uint32_t n,uint64_t until,steer_pv1_datagram_done done,void *u){
     struct origin *o=(void *)p;return o->inner.api->send(o->inner.handle,b,at,n,until,done,u);
@@ -154,6 +154,7 @@ static void step(struct loop *loop,struct loop_timer *timer,void *arg){
         f->selected=1;
         assert(f->association.api->open_target(f->association.handle,&f->endpoint,deadline(),opened,f).error.code==STEER_PV1_RESOURCE_EXHAUSTED);
         assert(!steer_draft_buffers_api()->writable(f->host,f->buffer,&span).code);memcpy(span.data,"ping0",5);
+        assert(f->refs[0].api->send(f->refs[0].handle,f->buffer,0,9,deadline(),completed,f).disposition==STEER_PV1_REJECTED);
         f->phase=2;remember(f,f->refs[0].api->send(f->refs[0].handle,f->buffer,0,5,deadline(),completed,f));break;
     case 2:
         assert(!f->code&&f->bytes==5);server_reply(f,0,"ping0","old0");f->phase=3;
