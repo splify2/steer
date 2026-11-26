@@ -333,10 +333,21 @@ PY
         "$(printf '%s\n' "$ex" | grep -c 'поддельный адрес имени fake.test')"
     check "explain real-ip v6: правило real-ip" "1" \
         "$("$BIN" explain 2001:db8:8::1 $DS 2>/dev/null | grep -c "domain set \"${set_r}\" -> output \"wg\"")"
-    # Адресный список «a» и доменный «f» — один выход и одни клиенты, то есть одна группа и один
-    # набор (гибридный): подсеть списка лежит в его паре IPv6.
+    # Между a и f находится t с другим выходом. Порядок правил разделяет их
+    # на адресную группу wg_ip и доменную set_f, несмотря на общий выход wg.
+    check "раздельные правила: адресная и доменная группы различаются" "yes" \
+        "$([ -n "$set_f" ] && [ "$set_f" != wg_ip ] && echo yes || echo no)"
+    check "  адрес списка действительно в wg_ip6" "0" \
+        "$(nft get element inet steer wg_ip6 '{ 2001:db8:1::9 }' >/dev/null 2>&1; echo $?)"
+    check "  адрес списка отсутствует в доменном наборе" "no" \
+        "$(nft get element inet steer "${set_f}6" '{ 2001:db8:1::9 }' >/dev/null 2>&1 && echo yes || echo no)"
+    check "  fake-IP действительно в доменном, но не адресном наборе" "yes" \
+        "$(nft get element inet steer "${set_f}6" "{ $fk }" >/dev/null 2>&1 &&
+           ! nft get element inet steer wg_ip6 "{ $fk }" >/dev/null 2>&1 && echo yes || echo no)"
     check "explain подсети IPv6 списка" "1" \
-        "$("$BIN" explain 2001:db8:1::9 $DS 2>/dev/null | grep -c "address+domain set \"${set_f}\" -> output \"wg\"")"
+        "$("$BIN" explain 2001:db8:1::9 $DS 2>/dev/null | grep -c '^2001:db8:1::9 -> address set "wg_ip" -> output "wg" -> dev t0')"
+    check "explain адреса вне списков — не канал wg" "1" \
+        "$("$BIN" explain 2001:db8:9::1 $DS 2>/dev/null | grep -c '^2001:db8:9::1 -> no channel matches -> direct')"
     check "explain IPv6 правила в выход без IPv6 — отбрасывается" "1" \
         "$("$BIN" explain 2001:db8:5::1 $DS 2>/dev/null | grep -c 'выход без IPv6')"
     # Спека v1 с теми же каналами: набор правил тот же до байта (с «<канал>6» и v6-двойниками),
@@ -363,7 +374,48 @@ PY
     kill "$DN" "$DN1" "$UP" 2>/dev/null
     wait "$DN" 2>/dev/null
     wait "$DN1" 2>/dev/null
+    wait "$UP" 2>/dev/null
     [ "$fail" -gt 0 ] && tail -n 20 "$tmp/dnsd.out" "$tmp/dnsd1.out"
+
+    # Действительно гибридное правило: один to включает и адресный, и
+    # доменный список. Оба элемента обязаны оказаться в одном IPv6-наборе.
+    cat > "$tmp/hspec.yaml" <<EOF
+version: 2
+lan: { devices: [r0] }
+lists:
+  a: { prefixes_file: $tmp/a.lst }
+  f: { domains_file: $tmp/f.lst }
+outputs:
+  wg: { kind: interface, device: t0, on_fail: drop }
+rules:
+  - { name: hybrid, to: [a, f], out: wg }
+EOF
+    HS="--spec $tmp/hspec.yaml --state-dir $tmp/hst"
+    "$BIN" apply $HS >"$tmp/apply-h.out" 2>&1
+    check "hybrid: одно правило to [a, f] применяется" "0" "$?"
+    set_h="$("$BIN" dnsd-table $HS 2>/dev/null | awk -F'|' '$5 == "hybrid" { print $1 }')"
+    check "hybrid: доменный набор правила определён" "yes" "$([ -n "$set_h" ] && echo yes || echo no)"
+    python3 "$tmp/up.py" 15393 >/dev/null 2>&1 & UH=$!
+    "$BIN" dnsd $HS --listen-port 15392 --upstream-port 15393 >"$tmp/dnsdh.out" 2>&1 & DH=$!
+    pids="$pids $UH $DH"
+    wait_for 'grep -q "listening on" "$tmp/dnsdh.out"' 5
+    fh="$($IC python3 "$tmp/q6.py" fd00:1::1 15392 fake.test)"
+    check "hybrid: fake-IP получен" "fdfe:dcba:9876::c612" \
+        "$(echo "$fh" | sed 's/:[0-9a-f]*$//')"
+    check "hybrid: адрес списка и fake-IP реально в одном наборе" "yes" \
+        "$(nft get element inet steer "${set_h}6" '{ 2001:db8:1::9 }' >/dev/null 2>&1 &&
+           nft get element inet steer "${set_h}6" "{ $fh }" >/dev/null 2>&1 && echo yes || echo no)"
+    check "hybrid: чужой адрес в набор не попал" "no" \
+        "$(nft get element inet steer "${set_h}6" '{ 2001:db8:9::1 }' >/dev/null 2>&1 && echo yes || echo no)"
+    check "hybrid: explain адреса списка указывает общий набор и выход" "1" \
+        "$("$BIN" explain 2001:db8:1::9 $HS 2>/dev/null | grep -c "^2001:db8:1::9 -> address+domain set \"${set_h}\" -> output \"wg\" -> dev t0")"
+    check "hybrid: explain fake-IP указывает тот же набор и выход" "1" \
+        "$("$BIN" explain "$fh" $HS 2>/dev/null | grep -c "^$fh -> domain set \"${set_h}\" -> output \"wg\" -> dev t0")"
+    check "hybrid: explain чужого адреса не приписывает его правилу" "1" \
+        "$("$BIN" explain 2001:db8:9::1 $HS 2>/dev/null | grep -c '^2001:db8:9::1 -> no channel matches -> direct')"
+    kill "$DH" "$UH" 2>/dev/null
+    wait "$DH" 2>/dev/null
+    wait "$UH" 2>/dev/null
 else
     echo "v6ns: python3 нет — доменные правила по IPv6 пропущены"
 fi
