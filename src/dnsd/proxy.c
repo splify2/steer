@@ -1383,7 +1383,7 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
             int maprc = nft_map_set_element6(g_fakeip6_map, f6, r6, known);
             if (maprc == 0) {
                 g_map_fail_since = 0;
-                fakeip_entry_set_real6(qname, r6);
+                fakeip_entry_set_real6(qname, r6, time(NULL));
                 fakeip_route_set6(qname, dch_fakeip_only(sets));
                 if (quiet) return 1;
                 uint8_t out[512];
@@ -1468,7 +1468,7 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
                 g_map_fail_since = 0;               /* серия отказов ядра окончена */
                 /* Record the real backend so a post-restart rehydrate can rebuild
                  * the DNAT map from state without re-resolving every domain. */
-                fakeip_entry_set_real(qname, real_host);
+                fakeip_entry_set_real(qname, real_host, time(NULL));
 
                 /* Route the fake IP into its channel's set as a PERMANENT element.
                  * This replaces the old `nft_add_element(..., ips[0].ttl)`: a TTL

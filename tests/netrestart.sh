@@ -616,6 +616,7 @@ cat > "$tmp/up.py" <<'PY'
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("127.0.0.1", int(sys.argv[1])))
+log = open(sys.argv[2], "a", buffering=1)
 while True:
     data, addr = s.recvfrom(2048)
     qend = 12
@@ -623,6 +624,7 @@ while True:
     qend += 5
     hdr = data[:2] + b'\x81\x80' + data[4:6] + b'\x00\x01\x00\x00\x00\x00'
     ans = b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x01\x2c\x00\x04' + bytes([203, 0, 113, 10])
+    log.write("203.0.113.10 ttl=300\n")
     s.sendto(hdr + data[12:qend] + ans, addr)
 PY
 cat > "$tmp/qa.py" <<'PY'
@@ -639,24 +641,40 @@ try:
 except socket.timeout:
     print("timeout")
 PY
-python3 "$tmp/up.py" 15615 & UP=$!
+: > "$tmp/up.log"
+python3 "$tmp/up.py" 15615 "$tmp/up.log" & UP=$!
 pids="$pids $UP"
 "$BIN" dnsd $BS --listen-port 15611 --upstream-port 15615 >"$tmp/dnsd.log" 2>&1 & DN=$!
 pids="$pids $DN"
 wait_for 'grep -q "listening on" "$tmp/dnsd.log"' 5
+state_row() {
+    awk -F '\t' -v d="$1" -v f="$2" -v r="$3" -v r6="$4" \
+        '$1 == d && $2 == f && $3 == r && ($4 == r6 || (r6 == "-" && NF == 3)) { ok=1 }
+         END { if (ok) print "yes"; else print "no" }' "$tmp/bst/fakeip.state"
+}
 check "B: резолвер поднят до набора правил — подмену ставить некуда" "yes" \
     "$(grep -q '0 map rehydrated' "$tmp/dnsd.log" && echo yes || echo no)"
 "$BIN" apply $BS >/dev/null 2>&1
 check "  набор правил поставлен (карта засеяна из файла)" "1" \
     "$("$real_nft" list map inet steer fakeip 2>/dev/null | grep -c '198.18.0.2 : 203.0.113.10')"
+check "  до первого запроса файл содержит старый backend n1" "yes" \
+    "$(state_row n1.s19.test 198.18.0.1 203.0.113.99 -)"
+check "  до первого запроса карта засеяна старым backend n1" "1" \
+    "$("$real_nft" list map inet steer fakeip 2>/dev/null | grep -c '198.18.0.1 : 203.0.113.99')"
+check "  до первого запроса upstream ещё не опрошен" "yes" \
+    "$([ ! -s "$tmp/up.log" ] && echo yes || echo no)"
 check "  n1 спрошен — клиенту поддельный адрес" "198.18.0.1" "$(python3 "$tmp/qa.py" 15611 n1.s19.test)"
-wait_for 'grep -q "^n1.s19.test	198.18.0.1	203.0.113.10$" "$tmp/bst/fakeip.state"' 5
+wait_for '[ "$(state_row n1.s19.test 198.18.0.1 203.0.113.10 -)" = yes ]' 5
 check "  файл перезаписан новым адресом n1" "yes" \
-    "$(grep -q "^n1.s19.test	198.18.0.1	203.0.113.10$" "$tmp/bst/fakeip.state" && echo yes || echo no)"
+    "$(state_row n1.s19.test 198.18.0.1 203.0.113.10 -)"
+check "  первый ответ n1 пришёл от upstream с данными .10 и TTL 300" "yes" \
+    "$(grep -q '^203.0.113.10 ttl=300$' "$tmp/up.log" && echo yes || echo no)"
 check "  а у имён, которых не спрашивали, настоящие адреса на месте (и IPv6)" "yes yes" \
-    "$(grep -q "^n2.s19.test	198.18.0.2	203.0.113.10	2001:db8:7::10$" "$tmp/bst/fakeip.state" && echo yes || echo no) $(grep -q "^n3.s19.test	198.18.0.3	203.0.113.10$" "$tmp/bst/fakeip.state" && echo yes || echo no)"
+    "$(state_row n2.s19.test 198.18.0.2 203.0.113.10 2001:db8:7::10) $(state_row n3.s19.test 198.18.0.3 203.0.113.10 -)"
 check "  карта n1 — новый адрес (замена одной транзакцией, а не EEXIST на засеве)" "1" \
     "$("$real_nft" list map inet steer fakeip | grep -c '198.18.0.1 : 203.0.113.10')"
+check "  старый backend n1 больше не остался в карте" "0" \
+    "$("$real_nft" list map inet steer fakeip | grep -c '198.18.0.1 : 203.0.113.99')"
 # Снять правило канала и поставить набор заново — под трафиком клиента с поддельными адресами в кэше.
 nomap() { "$real_nft" list chain inet steer prerouting_dnat | grep 'steer-fakeip-nomap' |
           grep 'ip daddr' | sed -n 's/.*counter packets \([0-9]*\).*/\1/p'; }
