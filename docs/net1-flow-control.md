@@ -68,6 +68,21 @@ through an independent Xray server to an HTTP target in an isolated network,
 with both its original and candidate shared libraries. That traffic check
 applies to plain VLESS TCP only.
 
+The signed Hysteria2 `2.1.4` helper was also tested without rebuilding it
+(executable SHA-256 `b246e6b955a055370bdd6984e0d8fc1305a539f201ede659bddc54872311fa23`).
+In two disposable x86_64-musl containers with no external network, mount
+the original or candidate shared distribution read-only at `/libs`, then
+mount the same verified Hysteria2 package at `/libs/plugins/hysteria2` in both.
+From the Steer source root run
+`LIBS=/libs HY2_SERVER=/path/to/hysteria sh tests/run-hy2.sh smoke`
+with TUN and network/mount namespace support. Both runs passed 6/6 against
+Hysteria v2.13.0: valid and invalid authentication, a hash-checked 1 MiB TCP
+transfer and UDP echo. The SHA-256 of `plugins/net1/lib/libs2p-net.so.1` was
+`ead0ba992a994941ea730cd144b84b078216ae9976b94685e5f414b803202f52` for the
+original and `9c3a2454bd37f7be4c3ed33674216ef2ad7734970a58a410a55a4698b9753486`
+for the candidate. This checks the old client with both library sets; the
+proxy, xsteer and warpbox results above remain loader probes.
+
 The package-manager regression separately checks that package 1.5.0 cannot
 satisfy `^1.6.0`, and that the planner upgrades the dependency before installing
 its new consumer. The strict Alpine/Zig run at `7e77680` passed all 231
