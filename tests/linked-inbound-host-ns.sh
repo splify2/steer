@@ -10,10 +10,10 @@ SDK=$(realpath "$SDK")
 PROTOCOLS=$(realpath "$PROTOCOLS")
 make -s -C experimental/provider BUILD="$OUT" SDK="$SDK" PROTOCOLS="$PROTOCOLS" \
     "$OUT/steer-prototype-wg-netns" "$OUT/steer-prototype-inbound-fault" "$OUT/steer-prototype-inbound-pause" "$OUT/store-fault.so"
-for mode in success fault shutdown disconnect not-renamed unsynced shutdown-publish foreign-shutdown; do
+for mode in success fault shutdown disconnect not-renamed unsynced shutdown-publish foreign-shutdown crash; do
     binary="$OUT/steer-prototype-wg-netns"
     if [ "$mode" = fault ]; then binary="$OUT/steer-prototype-inbound-fault"; fi
     if [ "$mode" = shutdown-publish ]; then binary="$OUT/steer-prototype-inbound-pause"; fi
     unshare -n python3 -B experimental/provider/linked_inbound_host_test.py \
-        "$binary" "$mode" "$OUT/store-fault.so" 3</proc/self/ns/net
+        "$binary" "$mode" "$OUT/store-fault.so" "$OUT/steer-prototype-wg-netns" 3</proc/self/ns/net
 done

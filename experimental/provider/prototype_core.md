@@ -148,10 +148,20 @@ The separate experimental
 netns build is a narrow first-Apply path, not the validation-only switch and
 not a capability declaration. It requires the same private namespace gate and
 a state directory. It accepts the first transition from one existing SOCKS
-listener to the same SOCKS listener plus the supported DEVICE. A second Apply,
-DEVICE startup from source, and restart of a persisted DEVICE are refused; key
-and PSK attestation and automatic recovery are not implemented. It cannot be
+listener to the same SOCKS listener plus the supported DEVICE. A second Apply
+and DEVICE startup from a source file are refused. On restart from the actual
+store snapshot, only a role-tagged journal selection with a confirmed DOWN
+owned device and matching guard is considered. Before reopening, the host
+checks the current private key, PSK, peer key and AllowedIPs, listen port,
+fwmark, MTU and IPv4 address against the validated stored document and local
+secret references. The authenticated peer endpoint is not fixed. It cannot be
 combined with the existing outbound-WG or validation-only modes.
+
+An already UP or otherwise unconfirmed device is refused, including after
+SIGKILL; a selected but unpublished journal entry is also refused. A DOWN
+device after a crash is not automatically trusted: the same checks apply.
+This is a narrow recovery path, not general restart/reuse, and is not atomic
+against a concurrently mutating privileged actor in the namespace.
 
 The common host keeps the closed participant slot with `prepared` and passes
 the receipt from its store writer to normal finish or shutdown finish according

@@ -30,6 +30,15 @@ namespace during or after verification.
 Successful return must not be used to advertise production readiness or
 authorize traffic before the remaining device verification is in place.
 
+The separate `steer_linked_inbound_recover_down_checked` variant requires a
+confirmed DOWN owned device and verifies its private key, PSK, listen port,
+fwmark, MTU, address and single-peer geometry in addition to the same guard
+capture. The host rechecks this state before attempting to open the link.
+The expected key material comes from the same validated store selection and
+is wiped after use; endpoints are intentionally ignored. This narrow check is
+not an atomic transaction against another privileged namespace actor, nor a
+claim of complete recovery for other profiles.
+
 Inbound records use the role-specific journal provider
 `wireguard-inbound-selected`. The existing role-ambiguous
 `wireguard-isolated-selected` format remains unchanged for existing users and

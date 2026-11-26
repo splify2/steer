@@ -28,6 +28,7 @@
 #include "prototype_linked_wg.h"
 #include "nltransport.h"
 #include "linked_inbound_participant.h"
+#include "linked_inbound_recovery.h"
 #include "kernel_wg_linux_guard.h"
 #include "blake3.h"
 #include <steer/draft/device_v1.h>
@@ -1380,7 +1381,9 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     if(!validate&&h->inbound_runtime&&
        (!h->current||h->current->config->wg_inbound_validate||!config->wg_inbound_validate)) {
         if(h->current){result=422;goto cleanup;}
-        if(config->wg_inbound_validate)goto cleanup;
+        if(config->wg_inbound_validate&&!initial_format)goto cleanup;
+        if(config->wg_inbound_validate&&(length!=config->document_length||
+            memcmp(document,config->document_json,length)))goto cleanup;
     }
     if(!validate&&h->inbound_runtime&&h->current&&config->wg_inbound_validate&&
        (h->current->config->format!=STEER_STORE_FORMAT_SPEC_V3||
@@ -1532,7 +1535,7 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
         if (prepared_state->keep[i]) prepare_socks(g, i, &h->listeners[i]);
     prepared_state->generation = g;
 #ifdef STEER_PROTOTYPE_WG_NETNS
-    if(h->inbound_runtime&&g->config->wg_inbound_validate){
+    if(h->inbound_runtime&&g->config->wg_inbound_validate&&!initial_format){
         if(inbound_prepare_slot(h,prepared_state,&wg_keys)){
             h->split_fenced=1;prepared_state->generation=NULL;result=503;goto cleanup;
         }
@@ -2257,9 +2260,30 @@ int steer_prototype_main(int argc, char **argv)
 #ifdef STEER_PROTOTYPE_INBOUND_PAUSE
         h.inbound.barrier_open=inbound_pause_open;
 #endif
-        struct steer_draft_wg_revision revision=inbound_revision(h.current->config);
+        struct steer_prototype_config *config=h.current->config;
+        struct steer_draft_wg_revision revision=inbound_revision(config);
         uint64_t next;struct steer_draft_wg_guard_record record;
-        if(steer_linked_inbound_recover(&h.inbound,&revision,inbound_verify_none,inbound_deadline(),&next,&record))goto cleanup;
+        if(!config->wg_inbound_validate){
+            if(steer_linked_inbound_recover(&h.inbound,&revision,inbound_verify_none,inbound_deadline(),&next,&record))goto cleanup;
+        }else{
+            struct awg_secrets keys={0};
+            struct steer_draft_kernel_wg_guard_config guard=config->wg_inbound_validate->cfg.guard;
+            guard.generation=config->generation;
+            struct steer_linked_inbound_recovery recovery={.guard=h.inbound_guard,.revision=revision,
+                .inbound=&guard,.policy=config->policy,.wireguard=&config->wg_inbound_validate->cfg.kernel,
+                .keys=&keys,.require_down=1};
+            h.inbound.context=&recovery;h.inbound.backend_guard=&recovery.guard.prepared;
+            int rc=steer_linked_wg_keys(config->wg_inbound_validate,&keys)?EACCES:
+                steer_linked_inbound_recover_down_checked(&h.inbound,&recovery,inbound_deadline(),&next,&record);
+            if(!rc)rc=steer_linked_inbound_verify_down(&recovery,&record,inbound_deadline());
+            h.inbound.context=&h.inbound_guard;h.inbound.backend_guard=&h.inbound_guard.prepared;
+            awg_secrets_wipe(&keys);
+            if(rc)goto cleanup;
+            h.inbound.candidate.guard=record;
+            h.inbound.barrier_state=STEER_INBOUND_BARRIER_UNKNOWN;
+            rc=h.inbound.barrier_open(h.inbound.context,&record,inbound_deadline(),&h.inbound.barrier_state);
+            if(rc||h.inbound.barrier_state!=STEER_INBOUND_BARRIER_OPEN)goto cleanup;
+        }
     }
 #endif
     length = status_json(&h, status, sizeof(status));

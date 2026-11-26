@@ -35,22 +35,36 @@ static int verify(void *arg,const struct steer_draft_wg_guard_record *r,uint64_t
     int rc=steer_draft_wg_identity_reconcile(&r->link,ns,deadline,&seen);
     if(rc)return rc;
     if(seen.state!=STEER_DRAFT_WG_OWNED||seen.index<=0||(uint32_t)seen.index!=r->ifindex)return ESTALE;
-    rc=awg_dev_link_require_up_owned_until(r->link.physical_name,r->link.kind,seen.index,r->link.group,deadline);
+    rc=c->require_down?awg_dev_link_require_down_owned_until(r->link.physical_name,r->link.kind,seen.index,r->link.group,deadline):
+        awg_dev_link_require_up_owned_until(r->link.physical_name,r->link.kind,seen.index,r->link.group,deadline);
     if(rc)return rc;
     struct steer_inbound_guard_plan plan={r->table,r->marker,peer,r->handle,r->ifindex};
     rc=steer_inbound_guard_capture_verify(&plan,deadline);
     if(rc)return rc;
-    rc=awg_dev_attest_inbound_peer_until(r->link.physical_name,seen.index,r->link.group,
-        wg->peer[0].pub,&wg->aips[0],deadline);
+    rc=c->require_down?awg_dev_attest_inbound_down_until(r->link.physical_name,seen.index,r->link.group,wg,c->keys,deadline):
+        awg_dev_attest_inbound_peer_until(r->link.physical_name,seen.index,r->link.group,wg->peer[0].pub,&wg->aips[0],deadline);
     if(rc)return rc;
     rc=steer_draft_wg_identity_reconcile(&r->link,ns,deadline,&seen);
     if(rc)return rc;
     if(seen.state!=STEER_DRAFT_WG_OWNED||seen.index<=0||(uint32_t)seen.index!=r->ifindex)return ESTALE;
-    return awg_dev_link_require_up_owned_until(r->link.physical_name,r->link.kind,seen.index,r->link.group,deadline);
+    return c->require_down?awg_dev_link_require_down_owned_until(r->link.physical_name,r->link.kind,seen.index,r->link.group,deadline):
+        awg_dev_link_require_up_owned_until(r->link.physical_name,r->link.kind,seen.index,r->link.group,deadline);
 }
 int steer_linked_inbound_recover_checked(struct steer_linked_inbound *p,
     struct steer_linked_inbound_recovery *c,uint64_t deadline,uint64_t *next,struct steer_draft_wg_guard_record *selected){
     if(!p||!c||p->context!=c||p->backend!=&steer_draft_wg_linux_guard_backend||
-       p->backend_guard!=&c->guard.prepared||!c->revision.generation||c->revision.without_wg)return EINVAL;
+       p->backend_guard!=&c->guard.prepared||!c->revision.generation||c->revision.without_wg||c->require_down)return EINVAL;
     return steer_linked_inbound_recover(p,&c->revision,verify,deadline,next,selected);
+}
+int steer_linked_inbound_recover_down_checked(struct steer_linked_inbound *p,
+    struct steer_linked_inbound_recovery *c,uint64_t deadline,uint64_t *next,struct steer_draft_wg_guard_record *selected){
+    if(!p||!c||p->context!=c||p->backend!=&steer_draft_wg_linux_guard_backend||
+       p->backend_guard!=&c->guard.prepared||!c->revision.generation||c->revision.without_wg||
+       !c->require_down||!c->keys)return EINVAL;
+    return steer_linked_inbound_recover(p,&c->revision,verify,deadline,next,selected);
+}
+int steer_linked_inbound_verify_down(struct steer_linked_inbound_recovery *c,
+    const struct steer_draft_wg_guard_record *r,uint64_t deadline){
+    if(!c||!c->require_down||!c->keys)return EINVAL;
+    return verify(c,r,deadline);
 }

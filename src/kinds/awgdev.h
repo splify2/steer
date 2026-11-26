@@ -68,6 +68,8 @@ int awg_dev_link_require_up_owned_until(const char *,const char *,int,uint32_t,u
 /* Compare effective key material without returning it; no mutations. */
 int awg_dev_attest_single_wg_until(const char *,int,uint32_t,const struct awg_conf *,
     const struct awg_secrets *,uint64_t);
+int awg_dev_attest_inbound_down_until(const char *,int,uint32_t,const struct awg_conf *,
+    const struct awg_secrets *,uint64_t);
 /* Inbound identity only: exactly one peer and one IPv4 /32 AllowedIPs entry.
  * Endpoint is intentionally ignored (roaming); no local address or secret
  * material is attested. Refuses split/ambiguous device replies. */

@@ -1443,17 +1443,19 @@ struct wg_attest {
     uint32_t index;
     uint16_t family;
     int count,match;
+    int require_down;
 };
 static void wg_source_cb(const struct nlmsghdr *h,void *arg){
     struct wg_attest *c=arg;
     const size_t head=NLMSG_LENGTH(sizeof(struct ifaddrmsg));
     if(h->nlmsg_type!=RTM_NEWADDR||h->nlmsg_len<head)return;
     const struct ifaddrmsg *msg=NLMSG_DATA(h);
-    if(msg->ifa_family!=AF_INET||msg->ifa_index!=c->index)return;
+    if(msg->ifa_index!=c->index||(!c->require_down&&msg->ifa_family!=AF_INET))return;
     c->count++;
+    if(msg->ifa_family!=AF_INET)return;
     const struct nlattr *a[IFA_MAX+1];
     if(!wg_attrs_once((const uint8_t *)h+head,h->nlmsg_len-head,a,IFA_MAX)||
-       msg->ifa_prefixlen!=32||msg->ifa_scope!=RT_SCOPE_UNIVERSE||
+       msg->ifa_prefixlen!=c->cfg->addr[0].cidr||msg->ifa_scope!=RT_SCOPE_UNIVERSE||
        !a[IFA_LOCAL]||NLA_PLEN(a[IFA_LOCAL])!=4||!a[IFA_ADDRESS]||NLA_PLEN(a[IFA_ADDRESS])!=4||
        memcmp(NLA_DATA(a[IFA_LOCAL]),c->cfg->addr[0].addr,4)||
        memcmp(NLA_DATA(a[IFA_ADDRESS]),c->cfg->addr[0].addr,4))return;
@@ -1469,9 +1471,10 @@ static int wg_attest_geometry(struct wg_attest *c,const char *kind,uint32_t grou
     struct link_ctx live={0};
     int rc=nl_talk_until(fd,buf,msg_end(&b,h),link_cb,&live,d);
     if(!rc&&((uint32_t)live.index!=c->index||!live.have_group||live.group!=group||
-        strcmp(live.kind,kind)||!(live.flags&IFF_UP)||live.mtu!=(uint32_t)c->cfg->mtu))rc=ESTALE;
+        strcmp(live.kind,kind)||(c->require_down?(live.flags&IFF_UP):!(live.flags&IFF_UP))||
+        live.mtu!=(uint32_t)c->cfg->mtu))rc=ESTALE;
     if(!rc){
-        struct ifaddrmsg addr={.ifa_family=AF_INET};
+        struct ifaddrmsg addr={.ifa_family=c->require_down?AF_UNSPEC:AF_INET};
         h=msg_begin(&b,buf,sizeof(buf),RTM_GETADDR,NLM_F_REQUEST|NLM_F_DUMP,next_seq(),&addr,sizeof addr);
         c->count=c->match=0;
         rc=nl_talk_until(fd,buf,msg_end(&b,h),wg_source_cb,c,d);
@@ -1505,10 +1508,10 @@ static void wg_attest_cb(const struct nlmsghdr *h,void *arg){
        NLA_PLEN(ip[AA_CIDR_MASK])!=1||*(const uint8_t *)NLA_DATA(ip[AA_CIDR_MASK])!=prefix->cidr)return;
     c->match=1;
 }
-int awg_dev_attest_single_wg_until(const char *name,int index,uint32_t group,const struct awg_conf *cfg,
-    const struct awg_secrets *keys,uint64_t d){
+static int attest_full_wg_until(const char *name,int index,uint32_t group,const struct awg_conf *cfg,
+    const struct awg_secrets *keys,uint64_t d,int down){
     if(managed_config_valid(cfg,keys)||cfg->peer_n!=1||cfg->aips_n!=1||cfg->aips[0].family!=AF_INET||
-       cfg->addr_n!=1||cfg->addr[0].family!=AF_INET||cfg->addr[0].cidr!=32)return EINVAL;
+       cfg->addr_n!=1||cfg->addr[0].family!=AF_INET||cfg->addr[0].cidr!=(down?24:32))return EINVAL;
     const char *kind="wireguard";
     int rc=owned_identity_until(name,kind,index,group,d);
     if(rc)return rc;
@@ -1521,7 +1524,7 @@ int awg_dev_attest_single_wg_until(const char *name,int index,uint32_t group,con
     struct genlmsghdr g={.cmd=AWG_CMD_GET_DEVICE,.version=(uint8_t)version};
     struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),family,NLM_F_REQUEST|NLM_F_DUMP,next_seq(),&g,sizeof(g));
     nlbuf_put_u32(&b,AD_IFINDEX,(uint32_t)index);
-    struct wg_attest check={cfg,keys,(uint32_t)index,family,0,0};
+    struct wg_attest check={cfg,keys,(uint32_t)index,family,0,0,down};
     rc=nl_talk_until(fd,buf,msg_end(&b,h),wg_attest_cb,&check,d);
     close(fd);
     if(rc)return rc;
@@ -1529,6 +1532,14 @@ int awg_dev_attest_single_wg_until(const char *name,int index,uint32_t group,con
     rc=wg_attest_geometry(&check,kind,group,d);
     if(rc)return rc;
     return owned_identity_until(name,kind,index,group,d);
+}
+int awg_dev_attest_single_wg_until(const char *name,int index,uint32_t group,const struct awg_conf *cfg,
+    const struct awg_secrets *keys,uint64_t d){
+    return attest_full_wg_until(name,index,group,cfg,keys,d,0);
+}
+int awg_dev_attest_inbound_down_until(const char *name,int index,uint32_t group,const struct awg_conf *cfg,
+    const struct awg_secrets *keys,uint64_t d){
+    return attest_full_wg_until(name,index,group,cfg,keys,d,1);
 }
 
 struct wg_inbound_attest {

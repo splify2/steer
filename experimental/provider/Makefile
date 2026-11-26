@@ -87,7 +87,7 @@ $(BUILD)/steer-prototype: $(HOST_SRC) prototype_main.c stream.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HOST_SRC) prototype_main.c $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/steer-prototype-split-fault: $(HOST_SRC) prototype_main.c $(wildcard *.h) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DSTEER_PROTOTYPE_SPLIT_FAULT $(HOST_SRC) prototype_main.c $(LDFLAGS) $(LDLIBS) -o $@
-WG_NETNS_SRC = prototype_wg.c prototype_linked_wg.c linked_inbound_participant.c kernel_wg_stream.c kernel_wg_linux_guard.c kernel_wg_linux_link.c kernel_wg_coordinator.c \
+WG_NETNS_SRC = prototype_wg.c prototype_linked_wg.c linked_inbound_participant.c linked_inbound_recovery.c inbound_guard_capture.c inbound_guard_verify.c kernel_wg_stream.c kernel_wg_linux_guard.c kernel_wg_linux_link.c kernel_wg_coordinator.c \
     kernel_wg_guard.c kernel_wg_guard_record.c kernel_wg_ownership.c kernel_wg_v3.c ../spec/execution_journal.c \
     ../../src/kinds/awgdev.c ../../src/lib/ir.c ../../src/lib/nftdump.c ../../src/lib/run.c ../../src/compile/print.c
 # Explicit, excluded from all/default/production. See docs/experimental-wg-coordinator.md.
