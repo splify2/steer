@@ -75,9 +75,11 @@ $(error NANO must be 0 or 1)
 endif
 
 # Explicit privileged, loopback-only integration gate; not part of the suite.
-.PHONY: dns-late-upstream-test
+.PHONY: dns-late-upstream-test dns-reused-upstream-cache-test
 dns-late-upstream-test: $(BUILD)/steer
 	unshare -n sh -ec 'ip link set lo up; exec python3 -B tests/dns_late_upstream_test.py --binary "$(abspath $(BUILD)/steer)"'
+dns-reused-upstream-cache-test: $(BUILD)/steer
+	unshare -n sh -ec 'ip link set lo up; exec python3 -B tests/dns_reused_upstream_cache_test.py --binary "$(abspath $(BUILD)/steer)"'
 
 # Standalone inventory foundation: no net1 linkage or runtime platform selection.
 .PHONY: capabilities-test

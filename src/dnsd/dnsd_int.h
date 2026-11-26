@@ -687,6 +687,7 @@ struct pending {
     uint32_t sgen;
     uint8_t cput;
     unsigned cup;
+    uint64_t cache_gen; /* table whose upstream index was used for this question */
     /* Имя вне правил ушло на сервер `dns.other`: не ответит — вопрос уходит прежним путём
      * (proxy.c, sec_done), а не SERVFAIL клиенту. */
     uint8_t oth;

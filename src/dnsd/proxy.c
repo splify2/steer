@@ -314,6 +314,9 @@ static void on_sigterm(int sig) { (void)sig; g_running = 0; }
  * старое решение к новым правилам — это класс ошибок, который снаружи не
  * виден вовсе. */
 static unsigned g_rules_gen;
+/* Cache keys contain table-local upstream indices. A retained transport may
+ * complete after its index has acquired a different meaning in a new table. */
+static uint64_t g_cache_gen;
 
 /* Перечитать списки всех каналов.
  *
@@ -362,6 +365,7 @@ static void reload_rules(void) {
 /* Апстримы и кэш из свежей таблицы (dup.h, dcache.c). Кэш сбрасывается всегда: номера апстримов в
  * ключе — номера этой таблицы, и в новой они могли означать другие серверы. */
 static void apply_upstreams(void) {
+    g_cache_gen++;
     dup_apply(g_dup_cfg, g_dup_cfg_n);
     dcache_config(&g_dcache_cfg);
     if (g_dup_cfg_n || g_dcache_cfg.entries)
@@ -633,6 +637,7 @@ static void pending_arm(struct pending *p, const struct sockaddr_storage *from, 
     p->sconn = -1;
     p->cput = 0;
     p->cup = 0;
+    p->cache_gen = g_cache_gen;
     p->qfp = 0;
     p->qsec_end = 0;
     p->quiet = quiet;
@@ -1083,6 +1088,7 @@ static void forward_old(struct pending *p, uint8_t *buf, size_t n, size_t qend,
     p->sconn = -1;
     p->cput = (uint8_t)cacheable;
     p->cup = cup;
+    p->cache_gen = g_cache_gen;
     p->quiet = quiet;
     p->hit = hit;
     p->sets = sets;
@@ -1187,9 +1193,11 @@ static void fakeip_refuse(struct pending *p, const uint8_t *buf, size_t qend, in
 /* Ответ сверху, уже сверенный со своим ожиданием, — один путь для UDP и TCP: доменные каналы,
  * fakeip, наборы, ответ клиенту. Кому отвечать, решает g_tcp_cur (см. reply_client). */
 static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
-    /* Настоящий ответ апстрима — в кэш (dcache.c), пока он ещё не переписан. Из кэша выданный ответ
-     * сюда приходит с cput == 0 и заново не кладётся. */
-    if (p->cput && n > 0) dcache_put(p->cup, buf, (size_t)n, (long)mono_sec());
+    /* Настоящий ответ — в кэш до переписывания. Номер upstream принадлежит таблице,
+     * в которой начат запрос: сохранённый транспорт может ответить после её замены.
+     * Из кэша выданный ответ приходит с cput == 0 и заново не кладётся. */
+    if (p->cput && p->cache_gen == g_cache_gen && n > 0)
+        dcache_put(p->cup, buf, (size_t)n, (long)mono_sec());
     /* Номер клиента возвращается на место ДО любой отправки вниз: клиент сопоставляет
      * ответ с запросом именно по нему, а дальше буфер уходит клиенту и как есть, и
      * переписанным. */
