@@ -1864,7 +1864,6 @@ int plugin_kind_helper(const struct plugin_kind *pk, const struct spec *sp, cons
     if (kind_helper_cmd(h, pk->helper_cmd ? pk->helper_cmd : pk->name) != 0) return -1;
     if (kind_helper_prog(h, pk->helper.prog) != 0) return -1;
     h->plugin = pl->id;
-    h->plugin_kind = pk;
     h->paths = pk->paths;
     /* {conf} несёт метки и таблицы — супервизор без демона назначает их до сбора (kind.h, marks). */
     h->marks = 1;

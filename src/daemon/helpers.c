@@ -86,7 +86,7 @@ size_t helpers_plan(const struct spec *sp, struct helper *out, size_t max, int *
             if (kd->helper(sp, o, &hp) != 0) { kind_helper_free(&hp); continue; }
             /* Помощник плагина читает {conf} (steer-api.md, 1.4): файл кладётся здесь, до запуска, при
              * каждом сборе помощников — его содержимое входит и в подпись перезапуска (plugin.c). */
-            if (hp.conf_path && plugin_conf_write_kind(sp, o, hp.plugin_kind) != 0)
+            if (hp.conf_path && plugin_conf_write(sp, o) != 0)
                 fprintf(stderr, "steer[warn] %s: файл настройки выхода %s не записан: %s\n", o->name,
                         hp.conf_path, strerror(errno));
             if (hp.marks && need_marks) *need_marks = 1;

@@ -107,7 +107,6 @@ struct kind_helper {
      * ({out}, {conf}…), conf_path — путь файла настройки выхода {conf} (куча), который ядро кладёт до
      * запуска. У помощника ядра plugin NULL и всё остальное как выше. */
     const char *plugin;
-    const struct plugin_kind *plugin_kind; /* заимствован до конца helpers_plan; поставщик, также для вида ядра */
     char *conf_path;
     /* Помощнику нужны метки реестра (номер очереди выводится из метки): супервизор,
      * который иначе реестр не трогает (supervise.c), назначает их перед подсчётом состава. */
@@ -424,5 +423,6 @@ const char *group_why_name(int why);
 
 /* interface: обфускация транспорта или NULL, если её нет (или выход не interface). */
 const struct out_obfs *iface_obfs(const struct output *o);
+const struct plugin_kind *iface_helper_kind(const struct output *o);
 
 #endif
