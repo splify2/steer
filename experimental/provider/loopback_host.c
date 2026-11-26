@@ -22,6 +22,7 @@
 #include "prototype_config.h"
 #include "resolver.h"
 #include "prototype_store.h"
+#include "control_get.h"
 #ifdef STEER_PROTOTYPE_WG_NETNS
 #include "prototype_wg.h"
 #include "prototype_linked_wg.h"
@@ -1811,9 +1812,9 @@ static int control_header(struct control *c)
 static void control_execute(struct control *c)
 {
     struct host *h = c->host;
-    char status[8192], prefix[256];
+    char status[8192];
     size_t length;
-    int code, n;
+    int code;
 #ifdef STEER_PROTOTYPE_WG_NETNS
     if(h->wg){
         code=steer_prototype_wg_request(h->wg,c->operation,c->expected,c->input+c->header_length,
@@ -1831,21 +1832,12 @@ static void control_execute(struct control *c)
         const char *document=h->selected_document?h->selected_document:g->document;
         size_t document_length=h->selected_document?h->selected_length:g->document_length;
         uint64_t revision=h->selected_document?h->selected_revision:g->number;
-        if(h->experimental_durable_split)
-            n=snprintf(prefix,sizeof(prefix),"{\"revision\":%llu,\"runtimeGeneration\":%llu,\"splitFenced\":%s,\"persistence\":%s,\"durability_uncertain\":%s,\"document\":",
-                (unsigned long long)revision,(unsigned long long)g->number,h->split_fenced?"true":"false",
-                h->store?"true":"false",h->durability_uncertain?"true":"false");
-        else n = snprintf(prefix, sizeof(prefix), "{\"revision\":%llu,\"persistence\":%s,\"durability_uncertain\":%s,\"document\":",
-                     (unsigned long long)revision, h->store ? "true" : "false",
-                     h->durability_uncertain ? "true" : "false");
-        if(n<0||(size_t)n>=sizeof(prefix)){control_error(c,500);return;}
-        length = (size_t)n + document_length + 1;
-        if (length > sizeof(c->output) - 64) { control_error(c, 500); return; }
-        /* Build in input storage after execution; no request bytes are needed. */
-        memcpy(c->input, prefix, (size_t)n);
-        memcpy(c->input + n, document, document_length);
-        c->input[n + document_length] = '}';
-        control_response(c, 200, c->input, length);
+        if(!steer_control_get_frame(c->output,sizeof c->output,&c->output_length,document,document_length,
+            revision,g->number,h->experimental_durable_split,h->split_fenced,h->store!=NULL,h->durability_uncertain)){
+            control_error(c,500);return;
+        }
+        c->writing=1;
+        if(loop_fd_mod(c->host->loop,c->fd,EPOLLOUT))close_control(c);
     } else {
         uint64_t generation=h->current->number+1;
         if(c->operation==4&&h->split_fenced){control_error(c,503);return;}

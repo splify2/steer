@@ -28,6 +28,10 @@ returns an Apply error, fences subsequent Apply and sets `runtimeReady` false.
 Existing SOCKS admission is not globally fenced. If durability is uncertain,
 selected revision is null in STATUS and GET refuses instead of returning a
 document with an unproven revision. Ordinary non-opt-in responses are unchanged.
+GET is framed directly into the control output buffer; its serializer unit test
+covers a maximum-size document, maximum-width revision numbers and exact-fit
+and insufficient-capacity buffers. The existing `store-fault-test` also checks
+split-mode directory-fsync failure and continued old SOCKS traffic.
 
 The separate `steer-prototype-split-fault` build provides the test-only
 `--test-fail-after-sync` switch; the ordinary build has no fault switch or

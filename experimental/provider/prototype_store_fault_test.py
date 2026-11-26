@@ -104,7 +104,31 @@ def main(binary, shim):
                     assert header.startswith(b"OK ")
                     status = json.loads(exact(reused, int(header.split()[1])))
                     assert status["revision"] == 5 and "applied" not in status and "listeners" in status
-    print("prototype fsync stage and responsiveness fixtures passed")
+        split_state = base / "split-state"; split_state.mkdir(mode=0o700)
+        with core(binary, directory, document, state_directory=split_state, extra_env=env,
+                  extra_args=("--experimental-durable-split",)) as path:
+            with socks_flow(port, target) as pinned:
+                candidate = copy.deepcopy(document)
+                candidate["routing"]["default"] = "block"
+                dir_fail.touch()
+                try:
+                    code, body = control(path, "APPLY", candidate, 1)
+                    assert code == 503 and not body.get("applied", False)
+                    status = control(path, "STATUS")[1]
+                    assert status["revision"] is None and status["selectedRevision"] is None
+                    assert status["durability_uncertain"] and status["splitFenced"]
+                    assert status["runtimeGeneration"] == status["generation"] == 1
+                    assert not status["runtimeReady"]
+                    assert control(path, "GET")[0] == 503
+                    assert json.loads((split_state / "config.json").read_text())["revision"] == 2
+                    for revision in (1, 2):
+                        assert control(path, "APPLY", document, revision)[0] == 503
+                    roundtrip(pinned, b"old-flow-after-unknown-durability")
+                    with socks_flow(port, target) as fresh:
+                        roundtrip(fresh, b"new-flow-after-unknown-durability")
+                finally:
+                    dir_fail.unlink(missing_ok=True)
+    print("prototype fsync stage, split uncertainty and responsiveness fixtures passed")
 
 
 if __name__ == "__main__":

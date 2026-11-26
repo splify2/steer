@@ -16,6 +16,7 @@ CONFIG_SRC = prototype_config.c ../spec/spec.c ../../src/lib/ynode.c ../../src/l
 HOST_SRC = $(ROUTE_STREAM_SRC) native_stream_backend.c vless_stream_backend.c socks_stream_backend.c $(CONFIG_SRC) loopback_host.c prototype_prepare.c prototype_store.c route_dial.c resolver.c policy.c policy_route.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/socks5/outbound.c $(PROTOCOLS)/src/vless/inbound.c $(PROTOCOLS)/src/vless/outbound.c
 LDLIBS += -pthread
 UNIT_NAMES = buffers operations admission host lifecycle stream stream-backend stream-backend-fairness policy route-dial prototype-config resolver route-domain prototype-store inbound-tls
+UNIT_NAMES += control-get
 UNIT_NAMES += route-stream route-stream-release datagram-routes datagram-registry datagram flow-metadata binding-lease vless-stream vless-stream-deadline
 UNIT_NAMES += route-stream-drain host-worker host-worker-namespace host-worker-registration
 UNITS = $(addprefix $(BUILD)/,$(addsuffix -test,$(UNIT_NAMES)))
@@ -28,6 +29,8 @@ $(BUILD):
 
 $(BUILD)/buffers-test: buffers.c buffers_test.c buffers.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG buffers.c buffers_test.c $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD)/control-get-test: control_get_test.c control_get.h prototype_config.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG control_get_test.c $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/operations-test: operations.c operations_test.c operations.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG operations.c operations_test.c $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/admission-test: admission.c admission_test.c admission.h | $(BUILD)
