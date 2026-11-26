@@ -479,7 +479,15 @@ check "  IPv6 правила в донора доходит" "ok" "$(ping6c 2001
 check "  цель видит адрес выхода wg1" "yes" "$([ "$(seen exit1)" -gt 0 ] && echo yes || echo no)"
 check "  IPv6 правила во второй выход доходит" "ok" "$(ping6c 2001:db8:e::2)"
 check "  цель видит адрес выхода wg2" "yes" "$([ "$(seen exit2)" -gt 0 ] && echo yes || echo no)"
-check "diag nat: у LAN только ULA и ra_default нет — сказано" "1" \
+# Без IPv6-only правила предупреждение намеренно не выдаётся (b401ba0).
+check "diag nat: без family: 6 предупреждения ra_default нет" "0" \
+    "$(diagv | grep -c 'задайте ra_default=1 в dhcp.lan')"
+# Диагностика отдельной спеки: действующий NAT и все проверки трафика выше
+# остаются на прежних правилах; дополнительное правило не применяется к ядру.
+cp "$tmp/n.yaml" "$tmp/n6.yaml"
+printf '  - { name: only6, to: a, out: host, family: 6 }\n' >> "$tmp/n6.yaml"
+S="--spec $tmp/n6.yaml --state-dir $tmp/st"
+check "diag nat: family: 6, только ULA, ra_default нет — сказано" "1" \
     "$(diagv | grep -c 'задайте ra_default=1 в dhcp.lan')"
 # Глобальный адрес на LAN есть, но устаревший (ip6prefix сняли): клиентам он не раздаётся, и про
 # ra_default сказать всё равно надо.
@@ -487,8 +495,13 @@ ip addr add 2001:db8:1:10::1/64 dev r0 nodad preferred_lft 0
 check "  и при устаревшем глобальном адресе на LAN — тоже" "1" \
     "$(diagv | grep -c 'задайте ra_default=1 в dhcp.lan')"
 ip addr del 2001:db8:1:10::1/64 dev r0
+ip addr add 2001:db8:1:10::1/64 dev r0 nodad
+check "  годный глобальный адрес LAN — предупреждения нет" "0" \
+    "$(diagv | grep -c 'задайте ra_default=1 в dhcp.lan')"
+ip addr del 2001:db8:1:10::1/64 dev r0
 printf '\toption ra_default %s\n' "'1'" >> "$tmp/uci/dhcp"
 check "  ra_default=1 — молчит" "0" "$(diagv | grep -c 'ra_default')"
+S="--spec $tmp/n.yaml --state-dir $tmp/st"
 check "diag nat: хост отвечает по IPv6" "2" "$(diagv | grep -c 'отвечает')"
 ip addr del 2001:db8:2:ff::2/128 dev wg2
 check "diag nat: у устройства нет адреса IPv6 — сказано" "1" \
