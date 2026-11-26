@@ -60,7 +60,7 @@ unshare -n sh -ec 'ip link set lo up; exec python3 -B experimental/provider/mana
   --core "$1" --ui "$2" --assets "$3" --output "$4" --seconds 620 --ui-reads' \
   sh /path/to/core /path/to/ui /path/to/assets /tmp/opencode/tcp.jsonl
 unshare -n sh -ec 'ip link set lo up; exec python3 -B experimental/provider/hy2_long_budget.py \
-  --core "$1" --client "$2" --output "$3" --seconds 620' \
+  --core "$1" --client "$2" --output "$3" --seconds 620 --windows 1' \
   sh /path/to/hy2-core /path/to/independent-client /tmp/opencode/hy2.jsonl
 ```
 
@@ -122,8 +122,10 @@ the producing environment. Run again on the actual target before proposing
 numeric budgets.
 
 The separately run full-only HY2 profile completed 620.44 seconds, 1,234
-TCP and 1,234 UDP verified exchanges, 62 client connections and 31 Apply
-operations without reported errors. TCP echo p50/p95/p99 was
+TCP and 1,234 UDP verified exchanges, 62 client connections and 31 measured
+Apply calls without reported errors. The historical harness did not propagate
+unexpected churn-thread exceptions, so its Apply success must not be inferred
+solely from a successful process exit. TCP echo p50/p95/p99 was
 1.176/2.298/5.054 ms; UDP echo was 0.360/0.724/1.736 ms. Core RSS/PSS
 started at 4,024/1,976 KiB and ended at 8,224/6,448 KiB; sampled FD was
 23–24 during activity. PSS grew in steps even after 70 seconds. This
@@ -140,3 +142,31 @@ compare either dataplane with managed v3. The logical sums of stripped
 core + full UI host + UI assets were 2,232,572 bytes for full and 480,172
 bytes for Nano in this build. These are file sums, not installed package
 sizes, and exclude shared system libraries and packaging overhead.
+The 480,172-byte sum used **Nano core with the full UI host and full UI
+assets**, not the Nano UI; it must not be called a Nano/Nano installation.
+
+For separately rebuilt Core `f907c01` and UI `a687901`, the actual stripped
+full/core + full/UI + full asset tree totals **2,311,028 logical bytes**
+(2,033,888 + 133,256 + 143,884). The stripped Nano core + `steer-ui-nano`
++ generated `nano-assets` totals **402,418 logical bytes**
+(203,032 + 92,360 + 107,026). The full asset tree includes the bundled font
+licence; the Nano Makefile produces four files without fonts. The manifest
+`/tmp/opencode/steer-f907-ui-a687-logical-sizes.json` records every file,
+size and SHA-256. These are logical file sums, not a packaged or installed
+image and not dependency-inclusive.
+
+The revised HY2 harness propagates exceptions from its churn thread, counts
+only Apply replies that advance the revision, and requires time, TCP, UDP,
+reconnect and successful Apply progress in every long window. `--check`
+can finish before the first 20-second Apply interval. `--windows 2 --seconds
+900` runs two consecutive windows in one core process; `--no-churn` provides
+an independently started, otherwise equivalent control. Churn changes only
+the listener label and revision, not network topology or secret values.
+
+```sh
+python3 -B experimental/provider/hy2_long_budget_test.py
+unshare -n sh -ec 'ip link set lo up; exec python3 -B experimental/provider/hy2_long_budget.py \
+  --core "$1" --client "$2" --output "$3" --seconds 900 --windows 2' \
+  sh /path/to/f907-core /path/to/independent-client /tmp/opencode/churn.jsonl
+# Same invocation with --no-churn and a different output file for the control.
+```
