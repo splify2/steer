@@ -16,7 +16,7 @@
 # потерю и на канале с 5% потерь и RTT 40 мс проседает до нескольких мегабит; Brutal держит заданное
 # BPS (БАЙТ/с) и поправляет отправку на потери.
 #
-# Нужно: root, ip(8) с netns, tc(8) с netem, собранные build/qcserver и build/qcbench (tests/ext-test.sh
+# Нужно: root, unshare/nsenter, ip(8), tc(8) с netem, собранные build/qcserver и build/qcbench (tests/ext-test.sh
 # собирает их вместе с остальным). Нет чего-то — явный пропуск; PM_STRICT=1 делает его ошибкой.
 set -u
 BUILD=${BUILD:-build}
@@ -29,10 +29,12 @@ SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd) || exit 1
 [ "$MODE" = check ] && SECS=${SECS_CHECK:-4}
 
 skip() { echo "qcbench: ПРОПУСК — $1"; [ "${PM_STRICT:-0}" != 1 ] || exit 1; exit 0; }
-[ "$(id -u)" = 0 ] || skip "нужен root (ip netns)"
+[ "$(id -u)" = 0 ] || skip "нужен root (сетевые пространства имён)"
 command -v ip >/dev/null 2>&1 || skip "нет ip(8)"
 command -v tc >/dev/null 2>&1 || skip "нет tc(8)"
 command -v setsid >/dev/null 2>&1 || skip "нет setsid(1)"
+command -v unshare >/dev/null 2>&1 || skip "нет unshare(1)"
+command -v nsenter >/dev/null 2>&1 || skip "нет nsenter(1)"
 [ -x "$BUILD/qcserver" ] && [ -x "$BUILD/qcbench" ] || skip "нет $BUILD/qcserver и $BUILD/qcbench (make ext-test)"
 case "$SECS" in ''|*[!0-9]*) echo "qcbench: неверное время" >&2; exit 1;; esac
 case "$BPS" in ''|*[!0-9]*) echo "qcbench: неверный BPS" >&2; exit 1;; esac
@@ -41,10 +43,8 @@ case "$BPS" in ''|*[!0-9]*) echo "qcbench: неверный BPS" >&2; exit 1;; e
 }
 
 ID=$$
-NS_S=qcb-s-$ID
-NS_C=qcb-c-$ID
 LOG=$(mktemp -d) || exit 1
-HAVE_S=0 HAVE_C=0 SPID= CPID= SGID= CGID= SWATCH= CWATCH= START_PID= START_FILE= WATCH_PENDING= WATCH_READY=
+HOLDER_S= HOLDER_C= HOLDER_GROUP_S= HOLDER_GROUP_C= SPID= CPID= SGID= CGID= SWATCH= CWATCH= START_PID= START_FILE= WATCH_PENDING= WATCH_READY=
 stop_group() {
     [ -n "$1" ] || return 0
     kill -TERM "-$1" 2>/dev/null || :
@@ -112,8 +112,10 @@ cleanup() {
     stop_group "$CGID"; stop_group "$SGID"
     [ -z "$CPID" ] || { kill "$CPID" 2>/dev/null || :; wait "$CPID" 2>/dev/null || :; }
     [ -z "$SPID" ] || { kill "$SPID" 2>/dev/null || :; wait "$SPID" 2>/dev/null || :; }
-    [ "$HAVE_S" = 0 ] || ip netns del "$NS_S" 2>/dev/null || :
-    [ "$HAVE_C" = 0 ] || ip netns del "$NS_C" 2>/dev/null || :
+    stop_group "$HOLDER_GROUP_S"; stop_group "$HOLDER_GROUP_C"
+    for holder in "$HOLDER_S" "$HOLDER_C"; do
+        [ -z "$holder" ] || { kill "$holder" 2>/dev/null || :; wait "$holder" 2>/dev/null || :; }
+    done
     # KEEP=1 — оставить журналы сервера и клиента (разбор отказа): путь напечатан ниже.
     if [ -n "${KEEP:-}" ]; then echo "qcbench: журналы в $LOG"; else rm -rf "$LOG"; fi
 }
@@ -121,29 +123,46 @@ trap cleanup EXIT INT TERM
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-ip netns add "$NS_S" 2>/dev/null || skip "не создать пространство имён сервера"
-HAVE_S=1
-ip netns add "$NS_C" 2>/dev/null || skip "не создать пространство имён клиента"
-HAVE_C=1
+# Никаких mount --make-shared и именованных netns: дочерние процессы держат
+# анонимные netns, исчезающие вместе с последним процессом и veth.
+start_group "$LOG/ns.s.pgid" unshare -n sh -c 'echo "$$" > "$1"; exec sleep 2147483647' sh "$LOG/ns.s" 2>"$LOG/ns.s.err"
+started=$?; HOLDER_S=$START_PID; HOLDER_GROUP_S=$START_GID; START_PID= START_FILE=
+[ "$started" = 0 ] || skip "не создать держатель пространства сервера"
+start_group "$LOG/ns.c.pgid" unshare -n sh -c 'echo "$$" > "$1"; exec sleep 2147483647' sh "$LOG/ns.c" 2>"$LOG/ns.c.err"
+started=$?; HOLDER_C=$START_PID; HOLDER_GROUP_C=$START_GID; START_PID= START_FILE=
+[ "$started" = 0 ] || skip "не создать держатель пространства клиента"
+tries=0
+while { [ ! -s "$LOG/ns.s" ] || [ ! -s "$LOG/ns.c" ]; } && [ "$tries" -lt 50 ]; do
+    kill -0 "$HOLDER_S" 2>/dev/null && kill -0 "$HOLDER_C" 2>/dev/null || break
+    sleep 0.1; tries=$((tries + 1))
+done
+[ -s "$LOG/ns.s" ] && [ -s "$LOG/ns.c" ] || skip "не создать анонимные сетевые пространства"
+[ "$(cat "$LOG/ns.s")" = "$HOLDER_S" ] && [ "$(cat "$LOG/ns.c")" = "$HOLDER_C" ] ||
+    skip "не подтверждено владение пространствами"
+NS_SELF=$(readlink "/proc/$$/ns/net") || skip "нет /proc сетевых пространств"
+NS_S=$(readlink "/proc/$HOLDER_S/ns/net") || skip "пространство сервера недоступно"
+NS_C=$(readlink "/proc/$HOLDER_C/ns/net") || skip "пространство клиента недоступно"
+[ "$NS_S" != "$NS_SELF" ] && [ "$NS_C" != "$NS_SELF" ] && [ "$NS_S" != "$NS_C" ] ||
+    skip "сетевые пространства не изолированы"
 V1=qcs$ID
 V2=qcc$ID
-ip netns exec "$NS_S" ip link add "$V1" type veth peer name "$V2" 2>/dev/null || skip "не создать veth"
-ip -n "$NS_S" link set "$V2" netns "$NS_C" || exit 1
-ip -n "$NS_S" addr add 10.77.0.1/24 dev "$V1" || exit 1
-ip -n "$NS_C" addr add 10.77.0.2/24 dev "$V2" || exit 1
-ip -n "$NS_S" link set "$V1" up || exit 1
-ip -n "$NS_C" link set "$V2" up || exit 1
-ip -n "$NS_S" link set lo up || exit 1
-ip -n "$NS_C" link set lo up || exit 1
-for pair in "$NS_S:$V1" "$NS_C:$V2"; do
-    ip netns exec "${pair%%:*}" tc qdisc add dev "${pair#*:}" root netem delay "$DELAY" loss "$LOSS" limit 20000 2>/dev/null \
+nsenter -t "$HOLDER_S" -n ip link add "$V1" type veth peer name "$V2" 2>/dev/null || skip "не создать veth"
+nsenter -t "$HOLDER_S" -n ip link set "$V2" netns "$HOLDER_C" || exit 1
+nsenter -t "$HOLDER_S" -n ip addr add 10.77.0.1/24 dev "$V1" || exit 1
+nsenter -t "$HOLDER_C" -n ip addr add 10.77.0.2/24 dev "$V2" || exit 1
+nsenter -t "$HOLDER_S" -n ip link set "$V1" up || exit 1
+nsenter -t "$HOLDER_C" -n ip link set "$V2" up || exit 1
+nsenter -t "$HOLDER_S" -n ip link set lo up || exit 1
+nsenter -t "$HOLDER_C" -n ip link set lo up || exit 1
+for pair in "$HOLDER_S:$V1" "$HOLDER_C:$V2"; do
+    nsenter -t "${pair%%:*}" -n tc qdisc add dev "${pair#*:}" root netem delay "$DELAY" loss "$LOSS" limit 20000 2>/dev/null \
         || skip "нет netem в ядре (tc qdisc add ... netem)"
 done
 # net.core buffer maxima могут быть общими между namespace: стенд их не меняет.
 
 run_one() {  # ИМЯ АРГУМЕНТЫ-КЛИЕНТА…
     name=$1; shift
-    start_group "$LOG/srv.$name.pgid" ip netns exec "$NS_S" "$BUILD/qcserver" --bind 10.77.0.1 --port 4433 --idle 20 > "$LOG/srv.$name" 2>"$LOG/srv.$name.err"
+    start_group "$LOG/srv.$name.pgid" nsenter -t "$HOLDER_S" -n "$BUILD/qcserver" --bind 10.77.0.1 --port 4433 --idle 20 > "$LOG/srv.$name" 2>"$LOG/srv.$name.err"
     started=$?; SPID=$START_PID; SGID=$START_GID; START_PID= START_FILE=
     if [ "$started" = 0 ]; then
         start_watch "$((SECS + 45))" "$SGID" "$LOG/srv.$name.timeout"
@@ -156,7 +175,7 @@ run_one() {  # ИМЯ АРГУМЕНТЫ-КЛИЕНТА…
         sleep 0.1; n=$((n + 1))
     done
     if [ "$started" = 0 ] && grep -q '^listening [0-9][0-9]*$' "$LOG/srv.$name"; then
-        start_group "$LOG/cli.$name.pgid" ip netns exec "$NS_C" "$BUILD/qcbench" 10.77.0.1 4433 "$SECS" "$@" > "$LOG/cli.$name" 2>"$LOG/cli.$name.err"
+        start_group "$LOG/cli.$name.pgid" nsenter -t "$HOLDER_C" -n "$BUILD/qcbench" 10.77.0.1 4433 "$SECS" "$@" > "$LOG/cli.$name" 2>"$LOG/cli.$name.err"
         client_started=$?; CPID=$START_PID; CGID=$START_GID; START_PID= START_FILE=
         if [ "$client_started" = 0 ]; then
             start_watch "$((SECS + 35))" "$CGID" "$LOG/cli.$name.timeout"

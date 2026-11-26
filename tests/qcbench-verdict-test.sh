@@ -7,8 +7,24 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir "$tmp/bin" "$tmp/build" "$tmp/case"
 cat > "$tmp/bin/ip" <<'EOF'
 #!/bin/sh
-if [ "$1" = netns ] && [ "$2" = exec ]; then shift 3; exec "$@"; fi
 exit 0
+EOF
+cat > "$tmp/bin/unshare" <<'EOF'
+#!/bin/sh
+[ "${QC_FAKE_UNSHARE_FAIL:-0}" != 1 ] || exit 1
+[ "$1" = -n ] || exit 1
+shift
+exec "$@"
+EOF
+cat > "$tmp/bin/nsenter" <<'EOF'
+#!/bin/sh
+[ "$1" = -t ] && [ "$3" = -n ] || exit 1
+shift 3
+exec "$@"
+EOF
+cat > "$tmp/bin/readlink" <<'EOF'
+#!/bin/sh
+if [ "${QC_FAKE_SAME_NS:-0}" = 1 ]; then echo 'net:[same]'; else echo "$1"; fi
 EOF
 cat > "$tmp/bin/tc" <<'EOF'
 #!/bin/sh
@@ -123,4 +139,10 @@ if ! BUILD="$tmp/missing" python3 tests/qcbench-process-test.py sh tests/qcbench
 grep -q 'ПРОПУСК' "$tmp/output"
 if PM_STRICT=1 BUILD="$tmp/missing" python3 tests/qcbench-process-test.py sh tests/qcbench.sh check > "$tmp/output" 2>&1; then exit 1; fi
 grep -q 'ПРОПУСК' "$tmp/output"
+if ! QC_FAKE_UNSHARE_FAIL=1 python3 tests/qcbench-process-test.py sh tests/qcbench.sh check > "$tmp/output" 2>&1; then cat "$tmp/output"; exit 1; fi
+grep -q 'ПРОПУСК' "$tmp/output"
+if PM_STRICT=1 QC_FAKE_UNSHARE_FAIL=1 python3 tests/qcbench-process-test.py sh tests/qcbench.sh check > "$tmp/output" 2>&1; then exit 1; fi
+grep -q 'ПРОПУСК' "$tmp/output"
+if PM_STRICT=1 QC_FAKE_SAME_NS=1 python3 tests/qcbench-process-test.py sh tests/qcbench.sh check > "$tmp/output" 2>&1; then exit 1; fi
+grep -q 'не изолированы' "$tmp/output"
 echo 'qcbench verdict replay: PASS'
