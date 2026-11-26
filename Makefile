@@ -74,6 +74,11 @@ else
 $(error NANO must be 0 or 1)
 endif
 
+# Explicit privileged, loopback-only integration gate; not part of the suite.
+.PHONY: dns-late-upstream-test
+dns-late-upstream-test: $(BUILD)/steer
+	unshare -n sh -ec 'ip link set lo up; exec python3 -B tests/dns_late_upstream_test.py --binary "$(abspath $(BUILD)/steer)"'
+
 # Standalone inventory foundation: no net1 linkage or runtime platform selection.
 .PHONY: capabilities-test
 capabilities-test: $(BUILD)/capabilitiesmatch
