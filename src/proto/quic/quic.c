@@ -1783,8 +1783,14 @@ int qc_endpoint_open(const struct qc_endpoint_cfg *cfg,const struct qc_endpoint_
     ep->cfg.cert_der=NULL; ep->cfg.key_der=NULL; ep->cfg.cert_n=ep->cfg.key_n=0;
     ep->fd=socket(ep->local.ss_family,SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
     if(ep->fd<0)goto fail;
-    if(ep->local.ss_family==AF_INET6) {
-        int only=1;
+    /* ngtcp2 discovers the QUIC datagram size with probes. A fragmented
+     * probe can be ACKed even though a GSO segment of that size cannot fit. */
+    if(ep->local.ss_family==AF_INET) {
+        int mode=IP_PMTUDISC_DO;
+        if(setsockopt(ep->fd,IPPROTO_IP,IP_MTU_DISCOVER,&mode,sizeof mode))goto fail;
+    } else {
+        int mode=IPV6_PMTUDISC_DO,only=1;
+        if(setsockopt(ep->fd,IPPROTO_IPV6,IPV6_MTU_DISCOVER,&mode,sizeof mode))goto fail;
         if(setsockopt(ep->fd,IPPROTO_IPV6,IPV6_V6ONLY,&only,sizeof only))goto fail;
     }
     if(bind(ep->fd,(struct sockaddr *)&ep->local,ep->local_length)) goto fail;

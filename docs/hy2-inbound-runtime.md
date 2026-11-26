@@ -25,3 +25,32 @@ Official oracle pin: apernet/hysteria`c2b181e0b0e72b077e4b0b7297735af14d1f9929` 
 `prototype_hy2_udp_test.py --host HOST --client PINNED_CLIENT` covers real trusted-TLS3000-byte binary numeric/domain messages, two peers and old/new generations sharing eight RX slots, ninth-target rejection/recovery and listener drain. Near256KiB retained upload and eight RX slots remain present while ten extra SOCKS TCP roundtrips finish. The pinned client rejects zero data and limits its serialization buffer to4096; its gate does not prove zero/65507-byte interop. Those boundaries have independent native tests.
 
 The WSL host routes127.0.0.1 through Windows-facing table127/loopback0(MTU1500). Plain Python UDP1500+ may drop despite send success. Large-message gates run in disposable unshare network namespaces with their own loopback, not the live WSL route. No live network settings change. Host sanitizer gates do not automatically instrument dependency archives or establish throughput/soak.
+
+### D2: first stream on a reduced-MTU path
+
+Run from the repository root with the Full host and pinned adapter client:
+
+```sh
+unshare -n sh -ec 'ip link set lo mtu 1380 up; exec python3 experimental/provider/prototype_hy2_mtu_test.py --host "$1" --client "$2"' sh "$HOST" "$PINNED_CLIENT"
+```
+
+The gate checks the first 8192-byte echo at the stock 3-second deadline, another
+stream, HY2 UDP and 32768 more bytes on the held stream, over both IPv4 and IPv6.
+IPv4 controls on `6607986` used the same client and payload:
+
+| Path | Managed before fix | Upstream HY2 server | Managed after fix |
+| --- | --- | --- | --- |
+| Ordinary loopback | pass | pass | pass |
+| Loopback MTU 1380, GSO/GRO on | timeout | pass | pass |
+| Server veth MTU 1380, interface GSO/GRO off | timeout | pass | pass |
+| Server egress 1500, router egress 1380, ICMP allowed | pass | pass | pass |
+
+On reduced loopback the target received and wrote all 8192 bytes. Single UDP
+probes (1406, 1444 bytes) fragmented and were acknowledged after reassembly;
+Linux then rejected `UDP_SEGMENT` sends with 1444-byte segments (`EMSGSIZE`).
+In a diagnostic 12-second run the client read only 1421 matching bytes while
+another peer exchanged a small stream and UDP. In contrast, the routed 1500→1380
+control returned ICMP *fragmentation needed* for the 1406-byte probe. The shared
+endpoint now forbids IP fragmentation so a probe cannot validate a segment
+larger than the path can carry. This gate tests a reduced MTU at connection
+start; it does not establish recovery from an MTU decrease on an established path.
