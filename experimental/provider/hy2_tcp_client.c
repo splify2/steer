@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
@@ -323,4 +324,194 @@ void steer_hy2_tcp_destroy(struct steer_hy2_tcp *f) {
     qc_free(f->quic);
     f->profile->live--;
     free(f);
+}
+
+/* A deliberately narrow, bounded fixed-target association. The TCP client and
+ * UDP association share only the prepared TLS profile and generation limit;
+ * each owns its QUIC callbacks, connection, and receive slot. */
+#define UDP_PAYLOAD_MAX 1000u
+struct steer_hy2_udp {
+    struct steer_hy2_profile *profile;
+    struct qc *quic;
+    uint64_t deadline;
+    enum stage stage;
+    enum steer_hy2_state state;
+    int64_t auth_sid, control_sid;
+    uint32_t session;
+    uint16_t packet;
+    char address[264];
+    size_t auth_len, received;
+    int receive_present;
+    uint8_t auth[8192], rx[UDP_PAYLOAD_MAX];
+};
+
+static void udp_fail(struct steer_hy2_udp *f, enum steer_hy2_state state) {
+    if (f->state <= STEER_HY2_READY) { f->state = state; f->received = 0; f->receive_present = 0; }
+}
+static void udp_handshake(void *user) {
+    struct steer_hy2_udp *f = user;
+    if (f->state == STEER_HY2_OPENING) f->stage = AUTH_START;
+}
+static void udp_closed(void *user, int reason, const char *why) {
+    (void)reason; (void)why;
+    udp_fail(user, STEER_HY2_UNAVAILABLE);
+}
+static void udp_stream_closed(void *user, int64_t sid, uint64_t error) {
+    struct steer_hy2_udp *f = user;
+    (void)error;
+    if (f->state == STEER_HY2_OPENING && sid == f->auth_sid && f->stage == AUTH_RESPONSE)
+        udp_fail(f, STEER_HY2_REJECTED);
+}
+static void udp_stream_data(void *user, int64_t sid, const uint8_t *data, size_t n, int fin) {
+    struct steer_hy2_udp *f = user;
+    if (f->state > STEER_HY2_READY) return;
+    if (f->stage != AUTH_RESPONSE || sid != f->auth_sid) {
+        qc_stream_consumed(f->quic, sid, n);
+        return;
+    }
+    struct hy2_auth_resp r;
+    if (n > sizeof f->auth - f->auth_len) { udp_fail(f, STEER_HY2_REJECTED); return; }
+    if (n) memcpy(f->auth + f->auth_len, data, n);
+    f->auth_len += n;
+    qc_stream_consumed(f->quic, sid, n);
+    int result = hy2_auth_response_strict(f->auth, f->auth_len, &r, NULL);
+    if (result == 1 && r.status == HY2_AUTH_OK && r.udp) {
+        uint8_t header[320];
+        size_t n = hy2_udp_header(header, sizeof header, f->session, 0, 0, 1, f->address);
+        if (!n || qc_datagram_max(f->quic) <= n) udp_fail(f, STEER_HY2_REJECTED);
+        else f->state = STEER_HY2_READY;
+    } else if (result || fin || f->auth_len == sizeof f->auth) {
+        udp_fail(f, STEER_HY2_REJECTED);
+    }
+}
+static void udp_datagram(void *user, const uint8_t *data, size_t n) {
+    struct steer_hy2_udp *f = user;
+    struct hy2_udp_msg m;
+    if (f->state != STEER_HY2_READY || f->receive_present ||
+        hy2_udp_parse(data, n, &m) || m.sid != f->session ||
+        strcmp(m.addr, f->address) || m.nfrag != 1 || m.frag != 0 ||
+        m.n > sizeof f->rx) return;
+    if (m.n) memcpy(f->rx, m.data, m.n);
+    f->received = m.n;
+    f->receive_present = 1;
+}
+static const struct qc_ops udp_ops = {
+    .on_handshake = udp_handshake, .on_closed = udp_closed,
+    .on_stream_data = udp_stream_data, .on_stream_close = udp_stream_closed,
+    .on_datagram = udp_datagram
+};
+
+static void udp_advance(struct steer_hy2_udp *f) {
+    if (f->state != STEER_HY2_OPENING || f->stage != AUTH_START) return;
+    uint8_t wire[1400];
+    int result;
+    if (f->control_sid < 0) {
+        result = qc_stream_open_uni(f->quic, &f->control_sid);
+        if (result == QC_EAGAIN) return;
+        if (result) goto broken;
+        size_t n = hy2_h3_control(wire, sizeof wire);
+        if (!n || qc_stream_send(f->quic, f->control_sid, wire, n, 0) != (ssize_t)n) goto broken;
+    }
+    result = qc_stream_open(f->quic, &f->auth_sid);
+    if (result == QC_EAGAIN) return;
+    if (result) goto broken;
+    size_t n = hy2_auth_request(wire, sizeof wire, f->profile->password, 0, 64);
+    ssize_t accepted = n ? qc_stream_send(f->quic, f->auth_sid, wire, n, 1) : -1;
+    explicit_bzero(wire, sizeof wire);
+    if (accepted < 0 || (size_t)accepted != n) goto broken;
+    f->stage = AUTH_RESPONSE;
+    return;
+broken:
+    explicit_bzero(wire, sizeof wire);
+    udp_fail(f, STEER_HY2_UNAVAILABLE);
+}
+
+int steer_hy2_udp_open(struct steer_hy2_profile *p, uint64_t generation, const char *target,
+    uint16_t port, uint64_t now, uint64_t deadline, struct steer_hy2_udp **out) {
+    if (!out) return -1;
+    *out = NULL;
+    uint8_t ip[16];
+    char canonical[INET6_ADDRSTRLEN];
+    int family = target ? numeric(target, ip) : 0;
+    if (!p || p->generation != generation || p->retired || p->live >= MAX_FLOWS ||
+        !family || !inet_ntop(family, ip, canonical, sizeof canonical) || !peer_address(canonical) ||
+        !port || deadline <= now) return -1;
+    struct steer_hy2_udp *f = calloc(1, sizeof *f);
+    if (!f) return -1;
+    int len = snprintf(f->address, sizeof f->address, family == AF_INET6 ? "[%s]:%u" : "%s:%u",
+                       canonical, (unsigned)port);
+    if (len <= 0 || (size_t)len >= sizeof f->address ||
+        getrandom(&f->session, sizeof f->session, 0) != (ssize_t)sizeof f->session) {
+        free(f); return -1;
+    }
+    f->profile = p; f->deadline = deadline; f->auth_sid = f->control_sid = -1;
+    struct qc_cfg cfg = { .host=p->upstream, .port=p->port, .sni=p->name, .alpn="h3", .tls=p->tls,
+        .flow_manual=1, .bbr=1, .keepalive_ms=10000, .max_data=2*WINDOW, .max_stream_data=WINDOW,
+        .send_buf=WINDOW, .datagram_max=1200 };
+    if (qc_open(&cfg, &udp_ops, f, &f->quic)) { free(f); return -1; }
+    p->live++; *out = f; return 0;
+}
+int steer_hy2_udp_fd(const struct steer_hy2_udp *f) { return qc_fd(f->quic); }
+int steer_hy2_udp_timeout(struct steer_hy2_udp *f, uint64_t now) {
+    if (f->state > STEER_HY2_READY) return -1;
+    int timeout = qc_timeout_ms(f->quic);
+    if (f->state == STEER_HY2_OPENING) {
+        uint64_t left = f->deadline > now ? f->deadline - now : 0;
+        if (timeout < 0 || left < (uint64_t)timeout) timeout = left > INT_MAX ? INT_MAX : (int)left;
+    }
+    return timeout;
+}
+void steer_hy2_udp_drive(struct steer_hy2_udp *f, uint64_t now, int readable) {
+    if (f->state > STEER_HY2_READY) return;
+    if (f->state == STEER_HY2_OPENING && now >= f->deadline) { udp_fail(f, STEER_HY2_TIMEOUT); return; }
+    if (readable) (void)qc_on_readable(f->quic);
+    if (f->state <= STEER_HY2_READY && qc_timeout_ms(f->quic) == 0) (void)qc_on_timer(f->quic);
+    udp_advance(f);
+}
+enum steer_hy2_state steer_hy2_udp_state(const struct steer_hy2_udp *f) { return f->state; }
+size_t steer_hy2_udp_message_limit(const struct steer_hy2_udp *f) {
+    if (!f || f->state != STEER_HY2_READY) return 0;
+    uint8_t header[320];
+    size_t head=hy2_udp_header(header,sizeof header,f->session,0,0,1,f->address);
+    size_t cap=qc_datagram_max(f->quic);
+    if (!head || cap<=head) return 0;
+    cap-=head;
+    return cap<UDP_PAYLOAD_MAX?cap:UDP_PAYLOAD_MAX;
+}
+int steer_hy2_udp_send(struct steer_hy2_udp *f, const void *data, size_t n) {
+    if (!f || f->state != STEER_HY2_READY || (!data && n) || n > UDP_PAYLOAD_MAX) return -1;
+    uint8_t wire[1200];
+    size_t head = hy2_udp_header(wire, sizeof wire, f->session, ++f->packet, 0, 1, f->address);
+    if (!head || n > sizeof wire - head || head + n > qc_datagram_max(f->quic)) return -1;
+    if (n) memcpy(wire + head, data, n);
+    int result = qc_datagram_send(f->quic, wire, head + n);
+    if (f->state != STEER_HY2_READY) return -1;
+    return result == QC_EAGAIN ? -2 : result ? -1 : 0;
+}
+ssize_t steer_hy2_udp_receive(struct steer_hy2_udp *f, void *out, size_t cap) {
+    if (!f || f->state != STEER_HY2_READY || !out) return -1;
+    if (!f->receive_present) return -2;
+    if (cap < f->received) return -1;
+    size_t n = f->received;
+    if (n) memcpy(out, f->rx, n);
+    f->received = 0; f->receive_present = 0;
+    return (ssize_t)n;
+}
+void steer_hy2_udp_discard(struct steer_hy2_udp *f) {
+    if (f) { f->received = 0; f->receive_present = 0; }
+}
+#ifdef STEER_HY2_UDP_TEST
+int steer_hy2_udp_test_inject(struct steer_hy2_udp *f, const void *data, size_t n) {
+    if (!f || (!data && n) || n > UDP_PAYLOAD_MAX) return -1;
+    uint8_t wire[1200];
+    size_t head = hy2_udp_header(wire, sizeof wire, f->session, 0, 0, 1, f->address);
+    if (!head || n > sizeof wire - head) return -1;
+    if (n) memcpy(wire + head, data, n);
+    udp_datagram(f, wire, head + n);
+    return 0;
+}
+#endif
+void steer_hy2_udp_destroy(struct steer_hy2_udp *f) {
+    if (!f) return;
+    qc_close(f->quic, 0); qc_free(f->quic); f->profile->live--; free(f);
 }

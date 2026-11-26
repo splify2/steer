@@ -531,6 +531,57 @@ without DNS and rejects other targets. The managed fixture accepts
 `--fault-core "$BUILD/steer-prototype-hy2-fault"` to verify that a deliberately
 blocked outbound CA read does not interrupt Relay or STATUS/GET.
 
+An experimental **unmanaged** fixed-target UDP association is separately
+available in `hy2_tcp_client.h`. It authenticates a separate QUIC connection
+and requires both the server's `Hysteria-UDP` response and QUIC DATAGRAM
+negotiation. The target must be a numeric IPv4 or IPv6 literal; it is normalized
+before framing, and domains, IPv4-mapped IPv6, unspecified, multicast and IPv6
+link-local addresses are rejected before any network activity. The first
+slice queues unfragmented messages up to
+1000 bytes (and no larger than the negotiated transport limit); replies with
+another session/address, fragments, oversized messages and packets arriving
+while its one receive slot is occupied are dropped. An undersized read leaves
+the message in that slot. Zero length is a valid local message, not EOF;
+however, the independently tested upstream Hysteria v2.13.0 discards
+zero-payload wire messages, so local send acceptance does not establish remote
+delivery. The existing profile generation and flow limit pin
+the association until destruction. This transport primitive is **not** an SDK
+datagram backend and is not connected to managed routing: do not advertise
+HY2 UDP outbound capability or infer spec-v3 support from this test.
+Any future managed binding must validate numeric targets and its actual message
+limit; it must not advertise unrestricted datagram routing based on this slice.
+
+The experimental standalone `hy2_datagram_backend` provides an owner-loop SDK
+binding with deferred opens and completion, operation deadlines, cancellation,
+generation lease and bounded messages. Its send completion means the complete
+message was accepted by the local QUIC transport, not that a peer received it.
+Zero-length send is valid locally even though the upstream version measured
+above discards such frames. Receive zero is a message; an undersized SDK receive
+discards one message with RESOURCE_EXHAUSTED. The advertised per-association
+message limit is at most 1000 and also reflects the current QUIC path limit.
+This binding is not registered with managed routing and does not enable a
+managed capability. Its dedicated lab fixture is built with the same QUIC
+libraries as the host and run in a private loopback-only namespace:
+
+```sh
+python3 experimental/provider/hy2_datagram_backend_test.py \
+  --client "$BUILD/hy2-datagram-backend-test" --server /path/to/upstream/hysteria
+```
+
+Build `$BUILD/hy2-udp-client-test` using the same pinned QUIC libraries and
+run in a private network namespace with loopback up:
+
+```sh
+python3 experimental/provider/hy2_udp_client_test.py \
+  --client "$BUILD/hy2-udp-client-test" --server /path/to/upstream/hysteria
+```
+
+The independent upstream Hysteria CLI and its SHA must be recorded by the
+caller. This test verifies actual 1000-byte loopback echo and associates the
+echo's source socket with the upstream server process for IPv4 and compressed
+and expanded IPv6 targets; it also verifies domain rejection before network
+activity, disabled UDP negotiation and an offline peer without direct fallback.
+
 ### Optional Hysteria2 server build
 
 On the optional HY2 server build, merge the following entries into the
