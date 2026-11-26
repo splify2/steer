@@ -143,6 +143,43 @@ runtime capability is advertised. This is not a kernel device, peer exchange,
 private-key/PSK attestation, forwarding guarantee or 4×4 protocol matrix.
 Normal profiles and Nano reject this DEVICE configuration.
 
+The separate experimental
+`--experimental-wg-inbound-netns` switch in the WG
+netns build is a narrow first-Apply path, not the validation-only switch and
+not a capability declaration. It requires the same private namespace gate and
+a state directory. It accepts the first transition from one existing SOCKS
+listener to the same SOCKS listener plus the supported DEVICE. A second Apply,
+DEVICE startup from source, and restart of a persisted DEVICE are refused; key
+and PSK attestation and automatic recovery are not implemented. It cannot be
+combined with the existing outbound-WG or validation-only modes.
+
+The common host keeps the closed participant slot with `prepared` and passes
+the receipt from its store writer to normal finish or shutdown finish according
+to the host's stopping state, not the control socket. STATUS/GET expose selected
+revision separately from the live generation; `inboundBarrier` is `closed`,
+`open`, or `unknown`. A post-sync publication failure does not return Apply
+success and leaves the old SOCKS generation serving while the selected document
+is rev2. UNKNOWN does not prove traffic is blocked.
+
+`tests/linked-inbound-host-ns.sh` builds the explicit WG host and a separate
+test-only backend fault binary, then exercises same-host control/store, a real
+peer TCP echo and SOCKS echo, confirmed policy-change failure, control
+disconnect, shutdown while store fsync is paused, shutdown during publication,
+active-link shutdown and refusal of mismatched ownership. It uses disposable netns;
+it is not a release, UI capability, full recovery or protocol-matrix claim.
+
+Shutdown is accepted when the serialized loop handles its signal callback and
+sets `h->stopping`, not when the asynchronous signal is sent or queued. Before
+that point an in-progress publication can complete and traffic can pass.
+After accepted shutdown a still-prepared slot takes shutdown finish when its
+receipt arrives; an already committed DEVICE is closed using a fresh
+exact-ownership check before the host exits. If closure or ownership cannot be
+confirmed, the link and guard are retained and the host exits nonzero; an
+unconfirmed state is UNKNOWN, not a claim that packets are blocked. A process kill,
+crash, external privileged mutation and the period before the loop accepts a
+signal are not covered by that guarantee. Pause hooks are compiled only into
+the separate test binary. This gate remains subject to independent acceptance.
+
 Given separately built full HY2+WG and Nano binaries, run the real control test:
 
 ```sh

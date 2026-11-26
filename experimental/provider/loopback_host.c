@@ -27,6 +27,10 @@
 #include "prototype_wg.h"
 #include "prototype_linked_wg.h"
 #include "nltransport.h"
+#include "linked_inbound_participant.h"
+#include "kernel_wg_linux_guard.h"
+#include "blake3.h"
+#include <steer/draft/device_v1.h>
 #endif
 #include "prototype_prepare.h"
 #include "inbound_tls.h"
@@ -172,6 +176,12 @@ struct host {
     struct steer_prototype_linked_wg *linked_wg;
     uint64_t wg_next;
     int wg_fenced,wg_retire_error;
+    int inbound_runtime,inbound_shutdown_error;
+    struct steer_draft_wg_linux_guard inbound_guard;
+    struct steer_linked_inbound inbound;
+#ifdef STEER_PROTOTYPE_INBOUND_FAULT
+    struct steer_draft_wg_backend inbound_fault_backend;
+#endif
 #endif
     struct store_writer writer;
     struct steer_prototype_prepare *preparer;
@@ -202,6 +212,10 @@ struct prepared {
     struct generation *generation;
     unsigned keep[LISTENERS], created[LISTENERS];
     int validation_only;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    int inbound_slot;
+    struct steer_draft_wg_revision inbound_choice;
+#endif
     struct control *control;
     uint64_t control_serial;
 };
@@ -638,11 +652,26 @@ static void retire_hy2_outbounds(struct generation *g) {
         steer_hy2_stream_backend_retire(g->hy2_out[i]);
 }
 #endif
+#ifdef STEER_PROTOTYPE_WG_NETNS
+static uint64_t inbound_deadline(void);
+#endif
 static void stop(struct loop *l, int signo, void *arg)
 {
     struct host *h = arg; unsigned i;
     (void)l; (void)signo;
     h->stopping = 1;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    /* The loop serializes this decision with writer_ready. A staged slot
+     * takes the shutdown finish path after its actual writer receipt. */
+    if(h->inbound_runtime&&!h->inbound.staged&&h->inbound.committed.generation&&
+       !h->inbound.committed.without_wg){
+        h->inbound.fenced=1;
+        h->inbound.barrier_state=STEER_INBOUND_BARRIER_UNKNOWN;
+        int rc=h->inbound.barrier_close(h->inbound.context,&h->inbound.candidate.guard,
+            inbound_deadline(),&h->inbound.barrier_state);
+        if(rc||h->inbound.barrier_state!=STEER_INBOUND_BARRIER_CLOSED)h->inbound_shutdown_error=1;
+    }
+#endif
     set_socks_admission(h->current, 0);
 #ifdef STEER_PROTOTYPE_HY2
     retire_hy2_outbounds(h->current);
@@ -1252,6 +1281,65 @@ static int credential_span(const char *reference,struct steer_pv1_span *out)
     return 1;
 }
 #endif
+#ifdef STEER_PROTOTYPE_WG_NETNS
+#ifdef STEER_PROTOTYPE_INBOUND_PAUSE
+static int inbound_pause_open(void *ctx,const struct steer_draft_wg_guard_record *r,uint64_t d,uint32_t *state){
+    const char *pause=getenv("STEER_TEST_INBOUND_PAUSE");
+    const char *entered=getenv("STEER_TEST_INBOUND_ENTERED");
+    if(pause&&entered){
+        int fd=open(entered,O_WRONLY|O_CREAT|O_CLOEXEC,0600);
+        if(fd>=0)close(fd);
+        while(!access(pause,F_OK))usleep(10000);
+    }
+    return steer_draft_wg_linux_guard_barrier_open(ctx,r,d,state);
+}
+#endif
+#ifdef STEER_PROTOTYPE_INBOUND_FAULT
+static int inbound_fault_guard(void *ctx,const struct steer_draft_wg_guard_record *r,int publish,
+    uint64_t d,uint32_t *effect,uint64_t *handle){
+    int rc=steer_draft_wg_linux_guard_backend.guard(ctx,r,publish,d,effect,handle);
+    return publish&&!rc&&*effect==STEER_PV1_DEVICE_CHANGED?EIO:rc;
+}
+#endif
+static uint64_t inbound_deadline(void){
+    uint64_t now=steer_nl_now_ns();
+    return now?now+8000000000u:0;
+}
+static int inbound_verify_none(void *ctx,const struct steer_draft_wg_guard_record *record,uint64_t d){
+    (void)ctx;(void)record;(void)d;return EPROTO;
+}
+static struct steer_draft_wg_revision inbound_revision(const struct steer_prototype_config *config){
+    struct steer_draft_wg_revision r={.generation=config->generation,.without_wg=!config->wg_inbound_validate};
+    static const char domain[]="steer linked spec v3: inbound device";
+    uint8_t digest[32];b3_hash(digest,config->document_json,config->document_length);
+    b3_derive_key(r.digest,32,domain,sizeof(domain)-1,digest,sizeof digest);
+    return r;
+}
+static int inbound_prepare_slot(struct host *h,struct prepared *prepared,const struct awg_secrets *keys){
+    const struct steer_prototype_config *cfg=prepared->generation->config;
+    const struct steer_linked_wg_config *wg=cfg->wg_inbound_validate;
+    struct steer_draft_wg_revision selected=inbound_revision(cfg);
+    struct steer_draft_wg_tx tx={.transaction=cfg->generation,.generation=cfg->generation,.instance=cfg->generation};
+    memcpy(tx.plan_digest,selected.digest,sizeof tx.plan_digest);
+    struct steer_draft_wg_candidate candidate={.config=&wg->cfg.kernel,.keys=keys};
+    uint64_t deadline=inbound_deadline();
+    int rc=steer_draft_wg_linux_link_prepare(h->inbound_guard.link,&tx,deadline,NULL,&candidate.link);
+    if(rc)return rc;
+    struct steer_draft_kernel_wg_guard_config guard=wg->cfg.guard;
+    guard.generation=cfg->generation;
+    strcpy(guard.device,candidate.link.physical_name);
+    rc=steer_linked_inbound_prepare_closed(&h->inbound,&tx,&candidate,&guard,cfg->policy,deadline);
+    if(!rc){prepared->inbound_slot=1;prepared->inbound_choice=selected;}
+    return rc;
+}
+static int inbound_finish_slot(struct host *h,struct prepared *prepared,struct steer_prototype_store_result result){
+    if(!prepared->inbound_slot)return 0;
+    prepared->inbound_slot=0;
+    return h->stopping?
+        steer_linked_inbound_finish_closed_shutdown(&h->inbound,result,&prepared->inbound_choice,inbound_verify_none,inbound_deadline()):
+        steer_linked_inbound_finish_closed(&h->inbound,result,&prepared->inbound_choice,inbound_verify_none,inbound_deadline());
+}
+#endif
 static int prepare_configuration(struct host *h, const char *document, size_t length,
                                  uint64_t expected, int validate, uint64_t initial_revision,uint32_t initial_format,
                                  struct prepared *prepared_state,struct steer_prototype_prepared_input *inputs)
@@ -1285,9 +1373,20 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     if(!validate&&config->generation!=next) { result=409;goto cleanup; }
 #ifdef STEER_PROTOTYPE_WG_NETNS
     if(config->wg&&(!h->linked_wg||steer_linked_wg_keys(config->wg,&wg_keys)))goto cleanup;
-    /* Parsing/Validate only. No runtime device participant is wired here yet.
-     * In particular, never persist or report Apply success for this profile. */
-    if(config->wg_inbound_validate&&(!validate||steer_linked_wg_keys(config->wg_inbound_validate,&wg_keys)))goto cleanup;
+    /* The validation-only flag must never activate a device; the separate
+     * runtime opt-in admits only the first SOCKS-to-SOCKS+DEVICE transition. */
+    if(config->wg_inbound_validate&&((!validate&&!h->inbound_runtime)||
+       steer_linked_wg_keys(config->wg_inbound_validate,&wg_keys)))goto cleanup;
+    if(!validate&&h->inbound_runtime&&
+       (!h->current||h->current->config->wg_inbound_validate||!config->wg_inbound_validate)) {
+        if(h->current){result=422;goto cleanup;}
+        if(config->wg_inbound_validate)goto cleanup;
+    }
+    if(!validate&&h->inbound_runtime&&h->current&&config->wg_inbound_validate&&
+       (h->current->config->format!=STEER_STORE_FORMAT_SPEC_V3||
+        h->current->config->listener_count!=1||config->listener_count!=1||
+        !h->current->config->listeners[0].enabled||
+        !same_listener(&h->current->config->listeners[0],&config->listeners[0])))goto cleanup;
     if(!validate&&h->linked_wg&&!wg_generation_ready(h->current)){result=503;goto cleanup;}
     if(h->linked_wg&&!h->current){
         if(config->format!=STEER_STORE_FORMAT_SPEC_V3)goto cleanup;
@@ -1431,7 +1530,15 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     }
     for (i = 0; i < LISTENERS; ++i)
         if (prepared_state->keep[i]) prepare_socks(g, i, &h->listeners[i]);
-    prepared_state->generation = g; g = NULL; result = 200;
+    prepared_state->generation = g;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(h->inbound_runtime&&g->config->wg_inbound_validate){
+        if(inbound_prepare_slot(h,prepared_state,&wg_keys)){
+            h->split_fenced=1;prepared_state->generation=NULL;result=503;goto cleanup;
+        }
+    }
+#endif
+    g = NULL; result = 200;
 cleanup:
 #ifdef STEER_PROTOTYPE_WG_NETNS
     awg_secrets_wipe(&wg_keys);
@@ -1450,6 +1557,13 @@ cleanup:
 static void discard_prepared(struct host *h, struct prepared *prepared)
 {
     unsigned i;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(prepared->inbound_slot){
+        struct steer_prototype_store_result not_renamed={{0,0},STEER_PROTOTYPE_STORE_NOT_RENAMED};
+        (void)inbound_finish_slot(h,prepared,not_renamed);
+        if(h->inbound.fenced)h->split_fenced=1;
+    }
+#endif
     for (i = 0; i < LISTENERS; ++i) if (prepared->created[i]) close_listener(h, &h->listeners[i]);
     if (prepared->generation) destroy_generation(prepared->generation);
     memset(prepared, 0, sizeof(*prepared));
@@ -1536,6 +1650,15 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
             (unsigned long long)h->current->number,h->split_fenced?"true":"false");
         if(n<0||(size_t)n>=capacity-used)return 0;
         used+=(size_t)n;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+        if(h->inbound_runtime){
+            const char *barrier=h->inbound.barrier_state==STEER_INBOUND_BARRIER_CLOSED?"closed":
+                h->inbound.barrier_state==STEER_INBOUND_BARRIER_OPEN?"open":"unknown";
+            n=snprintf(out+used,capacity-used,",\"inboundBarrier\":\"%s\"",barrier);
+            if(n<0||(size_t)n>=capacity-used)return 0;
+            used+=(size_t)n;
+        }
+#endif
     }else{
         if(used+1>=capacity)return 0;
         out[used++]=']';
@@ -1674,6 +1797,20 @@ static void writer_ready(struct loop *l, int fd, uint32_t events, void *arg)
     int publication_failed=0;
 #ifdef STEER_PROTOTYPE_SPLIT_FAULT
     publication_failed=h->test_fail_after_sync;
+#endif
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(prepared->inbound_slot){
+        int rc=inbound_finish_slot(h,prepared,result);
+        if(h->stopping&&((result.phase==STEER_PROTOTYPE_STORE_SYNCED&&rc!=ECANCELED)||
+                         h->inbound.durable_unknown))h->inbound_shutdown_error=1;
+        if(rc){
+            published=0;
+            if(h->inbound.fenced)h->split_fenced=1;
+            if(h->inbound.durable_unknown)h->durability_uncertain=1;
+            if(result.phase==STEER_PROTOTYPE_STORE_SYNCED&&!result.error.code&&
+               !h->inbound.durable_unknown)publication_failed=1;
+        }
+    }
 #endif
     if(h->experimental_durable_split&&publication_failed&&
        result.phase==STEER_PROTOTYPE_STORE_SYNCED&&!result.error.code){
@@ -1949,7 +2086,7 @@ int steer_prototype_main(int argc, char **argv)
     struct steer_pv1_error error;
     FILE *file;
     size_t length = 0;
-    int result = 1, seed = 0, linked_wg=0, inbound_validate=0;
+    int result = 1, seed = 0, linked_wg=0, inbound_validate=0, inbound_runtime=0;
 #ifdef STEER_PROTOTYPE_WG_NETNS
     /* One exclusive opt-in profile, kernel dataplane, serialized control.
      * fd 3 must pin the original netns from before entry into the fixture. */
@@ -2011,18 +2148,23 @@ int steer_prototype_main(int argc, char **argv)
         else if(!strcmp(argv[i],"--allow-wg-stream-netns")&&!linked_wg){linked_wg=1;i++;}
         else if(!strcmp(argv[i],"--validate-wg-inbound-netns")&&!inbound_validate){inbound_validate=1;i++;}
 #endif
+#ifdef STEER_PROTOTYPE_WG_NETNS
+        else if(!strcmp(argv[i],"--experimental-wg-inbound-netns")&&!inbound_runtime){inbound_runtime=1;i++;}
+#endif
         else return 2;
     }
     if(h.experimental_durable_split&&!state_dir)return 2;
     if(h.experimental_durable_split&&(linked_wg||inbound_validate))return 2;
+    if(inbound_runtime&&(linked_wg||inbound_validate||!state_dir))return 2;
 #ifdef STEER_PROTOTYPE_SPLIT_FAULT
-    if(h.test_fail_after_sync&&!h.experimental_durable_split)return 2;
+    if(h.test_fail_after_sync&&(!h.experimental_durable_split||inbound_runtime))return 2;
 #endif
-    if(inbound_validate){
+    if(inbound_validate||inbound_runtime){
 #ifdef STEER_PROTOTYPE_WG_NETNS
         struct steer_draft_wg_linux_link *gate=NULL;
         if(linked_wg||!state_dir||steer_prototype_wg_gate(3,0,&gate))return 2;
-        steer_draft_wg_linux_link_close(gate);
+        if(inbound_runtime){h.inbound_runtime=1;h.inbound_guard.link=gate;h.experimental_durable_split=1;}
+        else steer_draft_wg_linux_link_close(gate);
         h.socks_vpn.wg_inbound_validate=1;
 #else
         return 2;
@@ -2092,14 +2234,47 @@ int steer_prototype_main(int argc, char **argv)
         }
 #endif
     }
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(h.inbound_runtime){
+        char path[PATH_MAX];
+        int n=snprintf(path,sizeof path,"%s/wg-inbound-journal",state_dir);
+        if(n<0||(size_t)n>=sizeof path)goto cleanup;
+        if(mkdir(path,0700)&&errno!=EEXIST)goto cleanup;
+        int fd=open(state_dir,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+        if(fd<0)goto cleanup;
+        int sync_error=fsync(fd);close(fd);
+        if(sync_error)goto cleanup;
+        if(steer_draft_wg_selection_open_inbound(path,64,&h.inbound.journal))goto cleanup;
+        h.inbound.backend=&steer_draft_wg_linux_guard_backend;
+#ifdef STEER_PROTOTYPE_INBOUND_FAULT
+        h.inbound_fault_backend=steer_draft_wg_linux_guard_backend;
+        h.inbound_fault_backend.guard=inbound_fault_guard;
+        h.inbound.backend=&h.inbound_fault_backend;
+#endif
+        h.inbound.context=&h.inbound_guard;h.inbound.backend_guard=&h.inbound_guard.prepared;
+        h.inbound.barrier_close=steer_draft_wg_linux_guard_barrier_close;
+        h.inbound.barrier_open=steer_draft_wg_linux_guard_barrier_open;
+#ifdef STEER_PROTOTYPE_INBOUND_PAUSE
+        h.inbound.barrier_open=inbound_pause_open;
+#endif
+        struct steer_draft_wg_revision revision=inbound_revision(h.current->config);
+        uint64_t next;struct steer_draft_wg_guard_record record;
+        if(steer_linked_inbound_recover(&h.inbound,&revision,inbound_verify_none,inbound_deadline(),&next,&record))goto cleanup;
+    }
+#endif
     length = status_json(&h, status, sizeof(status));
     printf("READY %.*s\n", (int)length, status); fflush(stdout);
     result = loop_run(h.loop);
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(h.inbound_shutdown_error)result=1;
+#endif
 cleanup:
     cleanup_host(&h);
 #ifdef STEER_PROTOTYPE_WG_NETNS
     steer_prototype_wg_close(h.wg);
     steer_linked_wg_close(h.linked_wg);
+    steer_draft_wg_selection_close(h.inbound.journal);
+    steer_draft_wg_linux_link_close(h.inbound_guard.link);
 #endif
     free(document); steer_store_document_destroy(snapshot);
     return result;
