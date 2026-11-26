@@ -268,12 +268,19 @@ jobs:
           # у build/build-ext.sh, там экранирование внутри кавычек однажды стоило сборки.
           # Отдельный контейнер без внешней сети; лишь права для unshare/netns и loopback.
           # При отсутствии этих прав strict pluginmgrmatch прерывает gate, а не пропускает демон.
+          # s2p runner может быть доступен только его владельцу. Копия содержит только
+          # исполняемый инструмент и читается в контейнере без DAC_OVERRIDE.
+          gate_dir=$(mktemp -d "$RUNNER_TEMP/steer-ext-gate.XXXXXX")
+          trap 'rm -rf "$gate_dir"' EXIT
+          install -m 0555 "$S2P" "$gate_dir/s2p"
+          # Входное дерево только для чтения, сборка — в одноразовой файловой системе
+          # контейнера. Иначе root без DAC_OVERRIDE не может писать в checkout runner.
           docker run --rm --network none --cap-drop ALL --cap-add SYS_ADMIN --cap-add NET_ADMIN \
             --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,exec,size=1g \
-            -v "$PWD:/src" -v "$S2P:/opt/s2p:ro" \
+            -v "$PWD:/input:ro" -v "$gate_dir/s2p:/opt/s2p:ro" \
             -e S2P=/opt/s2p -e PM_STRICT=1 -w /src --entrypoint sh \
             "${STEER_BUILDER_IMAGE:-steer-builder:wolfssl}" \
-            /src/build/ext-test-image.sh 2>&1 | tee /tmp/ext-test.log
+            -c 'cp -R /input/. /src/ && exec sh /src/build/ext-test-image.sh' 2>&1 | tee /tmp/ext-test.log
           # Пропуск обязан быть виден. tests/ext-test.sh при ненайденной библиотеке выходит
           # НУЛЁМ (громкий пропуск — так задумано), и без этой проверки шаг был бы зелёным,
           # не прогнав ни одного стенда: ровно то, как молчаливо пропускался ui-harness в

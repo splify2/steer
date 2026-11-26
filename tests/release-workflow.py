@@ -29,7 +29,9 @@ class ReleaseWorkflow(unittest.TestCase):
     def test_strict_pluginmgr_gate(self):
         step = steps[by_name['Стенды расширенной части на настоящей wolfSSL (внутри образа сборки)']]
         self.assertFalse(step.get('continue-on-error', False))
-        for fragment in ('-v "$S2P:/opt/s2p:ro"', '-e S2P=/opt/s2p', '-e PM_STRICT=1',
+        for fragment in ('-v "$PWD:/input:ro"', '-v "$gate_dir/s2p:/opt/s2p:ro"',
+                         'install -m 0555 "$S2P" "$gate_dir/s2p"',
+                         'cp -R /input/. /src/', '-e S2P=/opt/s2p', '-e PM_STRICT=1',
                          'set -o pipefail', '--network none', '--cap-drop ALL',
                          '--cap-add SYS_ADMIN', '--cap-add NET_ADMIN', '--security-opt no-new-privileges'):
             self.assertIn(fragment, step['run'])
