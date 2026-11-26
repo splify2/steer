@@ -67,6 +67,7 @@ const char *plat_setting(const char *name) {
     const char *e = getenv(name);
     if (e) return e;
     static char *text;
+    static size_t text_len;
     static int loaded;
     if (!loaded) {
         loaded = 1;
@@ -78,17 +79,21 @@ const char *plat_setting(const char *name) {
             size_t cap = 0;
             ssize_t got = getdelim(&text, &cap, 0, f);
             if (got <= 0) { free(text); text = NULL; }
+            else {
+                text_len = (size_t)got;
+                /* Разделяем весь снимок сразу: указатели стабильны, поиск его не меняет. */
+                for (size_t i = 0; i < text_len; i++)
+                    if (text[i] == '\n') text[i] = '\0';
+            }
             fclose(f);
         }
     }
     size_t nl = strlen(name);
-    for (char *l = text; l && *l;) {
-        char *end = strchr(l, '\n');
-        if (!strncmp(l, name, nl) && l[nl] == '=') {
-            if (end) *end = 0;              /* строка нужна только целиком; буфер свой */
+    for (char *l = text; l && l < text + text_len;) {
+        size_t len = strlen(l);
+        if (len > nl && !memcmp(l, name, nl) && l[nl] == '=')
             return l + nl + 1;
-        }
-        l = end ? end + 1 : NULL;
+        l += len + 1;
     }
     return NULL;
 }
