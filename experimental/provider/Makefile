@@ -200,6 +200,15 @@ $(HY2_HOSTS): $(HOST_SRC) $(HY2_SRC) prototype_main.c $(wildcard *.h) | $(BUILD)
 	    $$(cat "$(NGTCP2_LIB).cflags" "$(WOLFSSL_SERVER_LIB).cflags") \
 	    $(HOST_SRC) $(HY2_SRC) $(WG_BUILD_SRC) prototype_main.c "$(NGTCP2_LIB)" "$(WOLFSSL_SERVER_LIB)" \
 	    $(HY2_TEST_EXTRA) $(WG_LINK_FLAGS) $(LDFLAGS) $(LDLIBS) -lm -o $@
+.PHONY: socks-managed-udp-test
+socks-managed-udp-test: $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype
+	@test -n "$(XRAY)" || { echo 'set XRAY to independent Xray binary' >&2; exit 2; }
+	unshare -n sh -ec 'ip link set lo up; exec $(PYTHON) -B prototype_socks_udp_test.py "$(abspath $(BUILD)/steer-prototype-hy2)" "$(XRAY)" "$(abspath $(BUILD)/steer-prototype)"'
+	unshare -n sh -ec 'ip link set lo up; exec $(PYTHON) -B prototype_socks_udp_persistence_test.py "$(abspath $(BUILD)/steer-prototype-hy2)"'
+.PHONY: socks-managed-udp-http-persistence-test
+socks-managed-udp-http-persistence-test: $(BUILD)/steer-prototype-hy2
+	@test -n "$(UI_HOST)" -a -n "$(UI_ASSETS)" || { echo 'set UI_HOST and UI_ASSETS' >&2; exit 2; }
+	unshare -n sh -ec 'ip link set lo up; exec $(PYTHON) -B prototype_socks_udp_persistence_test.py "$(abspath $(BUILD)/steer-prototype-hy2)" "$(UI_HOST)" "$(UI_ASSETS)"'
 $(HY2_HOSTS): $(wildcard $(PROTOCOLS)/src/hysteria2/*.h $(PROTOCOLS)/src/hysteria2/*.inc) \
     ../../src/proto/quic/quic.h ../../src/proto/quic/qcssl.h ../../src/proto/hysteria2/hy2wire.h ../spec/spec.h \
     $(wildcard $(SDK)/include/steer/draft/*.h) ../../src/daemon/loop.h \

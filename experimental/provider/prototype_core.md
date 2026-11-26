@@ -288,6 +288,37 @@ and either `domain` or `domain_suffix`, each with one list entry; an empty map
 matches all. Other variants and settings are rejected, even on disabled
 objects. The general v3 provider executor and signed lock are not wired in.
 
+### Experimental SOCKS UDP ASSOCIATE on IPv4 loopback
+
+Full `HY2_HOSTS` builds accept `options: {udp_associate: true}` on a v3 SOCKS
+listener bound to `127.0.0.1`; it may be combined with the existing USERPASS
+options. The v3 `flow` remains `[stream]`: the flag opts the SOCKS control
+connection into this separate UDP relay, not a general datagram inbound ABI.
+Without the flag command 3 is rejected. Nano, the legacy profile, IPv6 and VPN
+binds do not advertise or accept this option.
+JSON `true` and `false` remain booleans in GET and the durable snapshot;
+strings such as `"true"` are invalid for this option, and an omitted option
+remains omitted.
+
+The TCP control peer and requested UDP peer constrain one non-wildcard relay.
+An unspecified UDP source port is learned from the first valid permitted packet;
+foreign peers, nonzero RSV/FRAG and oversized packets are dropped. Each original
+destination is evaluated against the authenticated generation's policy; this
+slice supports direct and explicit block, not UDP detours. Closing TCP or idle
+expiry closes the relay and drains outstanding operations. Successful Apply
+closes old UDP controls and their relay before retiring the old generation;
+existing CONNECT streams retain their normal drain. Rejected Apply leaves the
+association intact. The owner retains generation pins through asynchronous
+cleanup; refused provider releases are quarantined rather than repeatedly retried.
+
+The Full status key `spec_v3_socks_udp_associate_loopback_ipv4` identifies this
+experimental scope. Run `make ... socks-managed-udp-test XRAY=/path/to/xray`
+with the Full dependency archives and an independent Xray binary in a private
+network namespace. This is not a VPN, Nano or release claim.
+The additional `socks-managed-udp-http-persistence-test` target takes
+`UI_HOST` and `UI_ASSETS` and exercises HTTP GET/Validate plus persisted restart
+using a separately started loopback bridge.
+
 ### Managed SOCKS5 TCP on a VPN address
 
 The VPN address must already be set up by the operator. Add the following

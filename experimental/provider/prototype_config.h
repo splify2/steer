@@ -22,6 +22,7 @@ struct steer_prototype_listener {
     uint32_t protocol, auth;
     uint32_t enabled;
     uint32_t datagram_disabled; /* explicit v3 stream-only HY2; legacy defaults to enabled */
+    uint32_t socks_udp_associate; /* opt-in v3 IPv4 loopback Full only */
     char label[129];
     char principal_id[65], username_ref[100], password_ref[100], uuid_ref[100];
     char certificate_ref[100],private_key_ref[100]; /* env refs to PEM/DER file paths */

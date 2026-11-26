@@ -87,6 +87,12 @@ void steer_socks_datagram_stop(struct steer_socks_datagram *s)
     if(s->fd>=0){loop_fd_del(s->outer.loop,s->fd);close(s->fd);s->fd=-1;}
     steer_draft_hy2_datagram_stop(s->route);
 }
+int steer_socks_datagram_stopped(const struct steer_socks_datagram *s) { return !s || s->stopped; }
+int steer_socks_datagram_quarantined(const struct steer_socks_datagram *s) {
+    struct steer_draft_hy2_datagram_usage usage;
+    if(!s)return 0;
+    steer_draft_hy2_datagram_usage(s->route,&usage);return usage.quarantined!=0;
+}
 static void idle(struct loop *loop,struct loop_timer *timer,void *user)
 {
     struct steer_socks_datagram *s=user;(void)loop;(void)timer;

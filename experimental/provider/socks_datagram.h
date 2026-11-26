@@ -25,6 +25,8 @@ int steer_socks_datagram_open(const struct steer_socks_datagram_config *,
     const struct steer_draft_hy2_datagram_services *, struct steer_socks_datagram **,
     struct s5_address *bound);
 void steer_socks_datagram_stop(struct steer_socks_datagram *);
+int steer_socks_datagram_stopped(const struct steer_socks_datagram *);
+int steer_socks_datagram_quarantined(const struct steer_socks_datagram *);
 /* Returns -1 while asynchronous callbacks/refs are still draining. */
 int steer_socks_datagram_destroy(struct steer_socks_datagram *);
 #endif

@@ -256,6 +256,9 @@ static void json(FILE*f,const struct ynode*n,const char*key,unsigned depth){
 #ifdef STEER_PROTOTYPE_HY2
                  ||!strcmp(key,"verify")
 #endif
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+                 ||(!strcmp(key,"udp_associate") && !n->tag)
+#endif
                 )&&!ynode_bool(n,&b)){
             fputs(b?"true":"false",f);
         }
@@ -329,9 +332,20 @@ static int v3_auth_options(const struct ynode *options,const char *allowed,const
 static int v3_socks_options(void *unused,const struct ynode *options){
     (void)unused;
     char principal[65];
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+    uint32_t udp;
+    const struct ynode *udp_node=ynode_get(options,"udp_associate");
+    if(!keys(options,"principal_id username password udp_associate") ||
+       (udp_node && udp_node->tag) || !flag(udp_node,0,&udp))return 0;
+    if(!ynode_get(options,"username") && !ynode_get(options,"password") &&
+       !ynode_get(options,"principal_id"))return 1;
+    return id(ynode_get(options,"principal_id"),principal) &&
+        v3_secret_id(ynode_get(options,"username")) && v3_secret_id(ynode_get(options,"password"));
+#else
     return keys(options,"")||
         (v3_auth_options(options,"principal_id username password","username",principal)&&
          v3_secret_id(ynode_get(options,"password")));
+#endif
 }
 static int v3_vless_options(void *unused,const struct ynode *options){
     (void)unused;
@@ -448,12 +462,15 @@ static int v3_tcp_inbound(const struct steer_spec_node_view *node,const struct y
     if(node->flows!=STEER_SPEC_FLOW_STREAM||!keys(node->intent,"label enabled plugin options listen flow"))return 0;
     if(!strncmp(node->provider,"socks:",6)&&v3_socks_options(NULL,node->options)){
         l->protocol=STEER_PROTOTYPE_SOCKS;
-        if(node->options->len){
+        if(ynode_get(node->options,"username")){
             if(!id(ynode_get(node->options,"principal_id"),l->principal_id)||
                 !v3_env_ref(secrets,ynode_get(node->options,"username"),"username",l->username_ref)||
                 !v3_env_ref(secrets,ynode_get(node->options,"password"),"password",l->password_ref))return 0;
             l->auth=STEER_PROTOTYPE_AUTH_USERPASS;
         }
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+        if(!flag(ynode_get(node->options,"udp_associate"),0,&l->socks_udp_associate))return 0;
+#endif
         return 1;
     }
     if(strncmp(node->provider,"vless:",6)||!v3_auth_options(node->options,"principal_id uuid","uuid",l->principal_id)||
@@ -473,6 +490,7 @@ static int v3_inbound(const struct steer_spec_node_view *node,const struct ynode
     l->enabled=(uint32_t)node->enabled;
     strcpy(l->id,node->id);
     if(!label(ynode_get(node->intent,"label"),l->label)||!listen_address(node->listen,l))return 0;
+    if(l->socks_udp_associate && strcmp(l->address,"127.0.0.1"))return 0;
     if(loopback_address(l->address))return 1;
     if(!allow||l->protocol!=STEER_PROTOTYPE_SOCKS||l->auth!=STEER_PROTOTYPE_AUTH_USERPASS)return 0;
     for(unsigned i=0;i<allow->count;i++)

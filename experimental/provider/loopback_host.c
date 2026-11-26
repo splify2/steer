@@ -44,6 +44,9 @@
 #include "datagram_routes.h"
 #include "qcssl.h"
 #endif
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+#include "socks_datagram.h"
+#endif
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
@@ -101,6 +104,7 @@ struct socks_instance {
     const char *user, *password;
     size_t user_length, password_length;
     int admitting;
+    int udp_associate;
 };
 struct generation {
     struct steer_draft_routes *routes;
@@ -158,7 +162,7 @@ struct listener {
     int retiring;
 #endif
 };
-enum phase { HANDSHAKE, REPLY, DIALING, RELAY, CLOSING };
+enum phase { HANDSHAKE, REPLY, DIALING, RELAY, CLOSING, UDP_CONTROL };
 struct client;
 struct direction {
     struct client *client;
@@ -244,6 +248,9 @@ struct client {
     enum phase phase, after_reply;
     uint32_t input_offset, input_length;
     int live, authenticated, route_pending, route_completed, release_failed;
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+    struct steer_socks_datagram *udp;
+#endif
 };
 static void advance(struct client *);
 static void reap_generations(struct host *);
@@ -267,6 +274,9 @@ static void prepare_socks(struct generation *g, unsigned slot,
     strcpy(instance->principal, id->principal);
     instance->user = id->user; instance->user_length = id->user_length;
     instance->password = id->password; instance->password_length = id->password_length;
+    for(unsigned i=0;g->config && i<g->config->listener_count;i++)
+        if(!strcmp(g->config->listeners[i].id,id->id))
+            instance->udp_associate=g->config->listeners[i].socks_udp_associate;
 }
 static void set_socks_admission(struct generation *g, int active)
 {
@@ -277,6 +287,9 @@ static void close_client(struct client *c)
 {
     if (!c->live || c->phase == CLOSING) return;
     c->phase = CLOSING;
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+    if(c->udp)steer_socks_datagram_stop(c->udp);
+#endif
     loop_timer_stop(c->deadline);
     if (c->route_pending) c->route.operation.api->cancel(c->route.operation.handle);
     if (c->down.handle) c->down.api->close(c->down.handle);
@@ -431,6 +444,61 @@ static void publish_flow(struct client *c, const struct s5_address *target)
     flow.destination.port = target->port;
     accept_flow(c, &flow);
 }
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+static void socks_udp_wake(void *user) {
+    struct client *c=user;loop_timer_set(c->host->work,0);
+}
+static int socks_udp_authorize(void *user,const struct s5_address *a) {
+    struct client *c=user;
+    struct steer_pv1_endpoint dest={.size=sizeof dest,.version=STEER_PV1_DRAFT_LAYOUT,
+        .tag=a->type==1?STEER_PV1_ENDPOINT_IPV4:a->type==4?STEER_PV1_ENDPOINT_IPV6:STEER_PV1_ENDPOINT_DOMAIN,
+        .address={a->bytes,a->length},.port=a->port};
+    const char *principal=c->authenticated?c->socks->principal:"";
+    struct steer_policy_input input={c->generation->number,
+        {(const uint8_t *)c->socks->inbound,(uint32_t)strlen(c->socks->inbound)},
+        {(const uint8_t *)principal,(uint32_t)strlen(principal)},&dest};
+    struct steer_policy_decision decision;
+    return steer_policy_evaluate(c->generation->policy,&input,&decision).code ||
+        decision.action!=STEER_POLICY_DIRECT;
+}
+static struct steer_pv1_error socks_udp_acquire(void *user,struct steer_pv1_span inbound,
+    struct steer_pv1_span principal,uint64_t epoch,struct steer_draft_hy2_datagram_binding *out) {
+    struct client *c=user;struct generation *g=c->generation;(void)inbound;(void)principal;(void)epoch;
+    if(c->phase==CLOSING || c->host->current!=g || !g->datagrams)
+        return (struct steer_pv1_error){STEER_PV1_POLICY_DENIED,0};
+    struct steer_pv1_error e=steer_draft_binding_admit(g->datagram_binding,g->number,STEER_PV1_FLOW_DATAGRAM);
+    if(e.code)return e;
+    g->references++;
+    *out=(struct steer_draft_hy2_datagram_binding){steer_draft_datagram_router_api(),g->datagrams,g,g->number};
+    return (struct steer_pv1_error){0,0};
+}
+static void socks_udp_release(void *user,struct steer_draft_hy2_datagram_binding *binding) {
+    struct client *c=user;struct generation *g=binding->lease;
+    if(!g||!g->references||steer_draft_binding_unpin(g->datagram_binding).code)abort();
+    g->references--;memset(binding,0,sizeof *binding);socks_udp_wake(c);
+}
+static void socks_udp_start(struct client *c) {
+    struct s5_address bound;struct sockaddr_in peer={0};
+    const char *principal=c->authenticated?c->socks->principal:"";
+    if(c->input_length || c->source.tag!=STEER_PV1_ENDPOINT_IPV4 ||
+       c->host->current!=c->generation)goto fail;
+    peer.sin_family=AF_INET;peer.sin_port=htons(c->source.port);
+    memcpy(&peer.sin_addr,c->source_bytes,4);
+    struct steer_socks_datagram_config cfg={
+        .inbound={(const uint8_t *)c->socks->inbound,(uint32_t)strlen(c->socks->inbound)},
+        .principal={(const uint8_t *)principal,(uint32_t)strlen(principal)},
+        .tcp_peer=peer,.requested_peer=c->codec.target,.generation=c->generation->number,
+        .admission_epoch=c->generation->number,.idle_ms=60000,.user=c,
+        .authorize=socks_udp_authorize,.wake=socks_udp_wake};
+    struct steer_draft_hy2_datagram_services svc={c->host->loop,c->host->buffers,
+        &c->host->datagram_budget,c,socks_udp_acquire,socks_udp_release};
+    if(steer_socks_datagram_open(&cfg,&svc,&c->udp,&bound))goto fail;
+    if(!s5_udp_result(&c->codec,0,&bound)){close_client(c);return;}
+    reply(c,UDP_CONTROL);return;
+fail:
+    if(s5_udp_result(&c->codec,1,NULL))reply(c,CLOSING);else close_client(c);
+}
+#endif
 static void handshake(struct client *c)
 {
     uint8_t *p = view(c, 0);
@@ -465,6 +533,9 @@ static void handshake(struct client *c)
         if (c->codec.reply_length) reply(c, CLOSING);
         else close_client(c);
     } else if (event == S5_CONNECT) publish_flow(c, &c->codec.target);
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+    else if (event == S5_UDP_ASSOCIATE) socks_udp_start(c);
+#endif
     else {
         c->input_offset = 0;
         (void)submit(&c->directions[0], c->down, 0, 0, CAPACITY);
@@ -507,6 +578,9 @@ static void relay_done(struct client *c, unsigned index)
 static void advance(struct client *c)
 {
     unsigned i;
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+    if(c->udp && c->phase!=CLOSING && steer_socks_datagram_stopped(c->udp))close_client(c);
+#endif
     if (c->route_completed) {
         c->route.operation.api->release(c->route.operation.handle);
         c->route_pending = c->route_completed = 0;
@@ -523,7 +597,9 @@ static void advance(struct client *c)
         d->pending = d->completed = 0;
         if (c->phase == CLOSING) continue;
         if (d->error) { close_client(c); continue; }
-        if (c->phase == RELAY) {
+        if (c->phase == UDP_CONTROL) {
+            close_client(c); /* EOF or unexpected control payload */
+        } else if (c->phase == RELAY) {
             loop_timer_set(c->deadline, 30000); relay_done(c, i);
         } else if (c->phase == HANDSHAKE) {
             if (!d->bytes) close_client(c);
@@ -535,12 +611,28 @@ static void advance(struct client *c)
             } else if (c->after_reply == CLOSING) close_client(c);
             else {
                 c->phase = c->after_reply;
-                if (c->phase == RELAY) relay_start(c); else handshake(c);
+                if (c->phase == RELAY) relay_start(c);
+                else if(c->phase == UDP_CONTROL) {
+                    loop_timer_stop(c->deadline);
+                    (void)submit(&c->directions[0],c->down,0,0,CAPACITY);
+                } else handshake(c);
             }
         }
     }
     if (c->phase == CLOSING && !c->release_failed && !c->route_pending &&
         !c->directions[0].pending && !c->directions[1].pending) {
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+        if(c->udp) {
+            if(steer_socks_datagram_destroy(c->udp)) {
+                if(steer_socks_datagram_quarantined(c->udp)) {
+                    c->release_failed=1;
+                    fputs("SOCKS UDP provider release refused; client quarantined\n",stderr);
+                } else loop_timer_set(c->host->work,10);
+                return;
+            }
+            c->udp=NULL;
+        }
+#endif
         struct steer_pv1_stream_ref *streams[2] = {&c->up, &c->down};
         for (i = 0; i < 2; ++i) if (streams[i]->handle) {
             if (streams[i]->api->release(streams[i]->handle).code) {
@@ -644,7 +736,12 @@ static void accept_clients(struct loop *l, int fd, uint32_t events, void *arg)
             h->buffer_api->allocate(h->buffers, CAPACITY, &c->directions[1].buffer).code) {
             close_client(c); continue;
         }
-        if (socks) s5_init(&c->codec, socks->user ? S5_USERPASS : S5_NOAUTH, verify_socks, c);
+        if (socks) {
+            s5_init(&c->codec, socks->user ? S5_USERPASS : S5_NOAUTH, verify_socks, c);
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+            if(socks->udp_associate && !s5_enable_udp(&c->codec)){close_client(c);continue;}
+#endif
+        }
         else vl_decoder_init(&c->vless, verify_uuid, c);
         loop_timer_set(c->deadline, 5000);
         (void)submit(&c->directions[0], c->down, 0, 0, CAPACITY);
@@ -1642,6 +1739,11 @@ static void discard_prepared(struct host *h, struct prepared *prepared)
 static void publish_prepared(struct host *h, struct prepared *prepared)
 {
     unsigned i;
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+    for(i=0;i<CLIENTS;i++)
+        if(h->clients[i].live && h->clients[i].udp && h->clients[i].generation==h->current)
+            close_client(&h->clients[i]);
+#endif
     set_socks_admission(h->current, 0);
     for (i = 0; i < LISTENERS; ++i) {
         if (!prepared->keep[i] || h->stopping) {
@@ -1769,6 +1871,9 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
         used+=(size_t)n;
     }
     n=snprintf(out+used,capacity-used,"]},"
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+        "\"spec_v3_socks_udp_associate_loopback_ipv4\":true,"
+#endif
 #ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
         "\"spec_v3_vless_tcp_outbound\":true,"
 #endif

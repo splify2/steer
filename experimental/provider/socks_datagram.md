@@ -27,8 +27,9 @@ the admitted generation, or shutdown. Stop removes and closes the relay fd
 before cancelling dispatcher work. An idle timer also stops it. `destroy`
 returns busy until callbacks and provider references drain; the caller must
 keep its generation pin, callback context and adapter alive until it succeeds.
-No host handshake, Validate/Apply integration, generation-retirement hook,
-VPN-bind support or public capability is implemented here.
+The Full host connects this adapter to the opt-in v3 handshake and retires it
+on successful generation replacement. VPN-bind and Nano remain unsupported;
+see `prototype_core.md` for the managed contract.
 
 The source-only `socks-datagram-test` target uses a real SDK router and native
 UDP echo in a private network namespace. It exercises different direct/block
