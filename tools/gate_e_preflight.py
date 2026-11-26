@@ -29,32 +29,41 @@ def signature(st):
 
 def source_snapshot(path):
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    except OSError as exc:
-        raise SourceError("source_unavailable") from exc
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        raise SourceError("source_unavailable") from None
     try:
-        before = os.fstat(fd)
+        try:
+            before = os.fstat(fd)
+        except OSError:
+            raise SourceError("source_unavailable") from None
         if not stat.S_ISREG(before.st_mode):
             raise SourceError("source_not_regular")
         if before.st_size > MAX_SOURCE_BYTES:
             raise SourceError("source_too_large")
         chunks = []
         size = 0
-        while True:
-            chunk = os.read(fd, min(1024 * 1024, MAX_SOURCE_BYTES + 1 - size))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-            if size > MAX_SOURCE_BYTES:
-                raise SourceError("source_too_large")
-        data = b"".join(chunks)
-        after = os.fstat(fd)
+        try:
+            while True:
+                chunk = os.read(fd, min(1024 * 1024, MAX_SOURCE_BYTES + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_SOURCE_BYTES:
+                    raise SourceError("source_too_large")
+            data = b"".join(chunks)
+            after = os.fstat(fd)
+        except OSError:
+            raise SourceError("source_unavailable") from None
         if signature(before) != signature(after):
             raise SourceError("source_changed")
         return data, signature(after)
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def source_still_matches(path, expected):

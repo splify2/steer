@@ -151,4 +151,21 @@ sys.stdout.buffer.write(raw)
 
 changed_source("replace")
 changed_source("delete")
+
+with tempfile.TemporaryDirectory(prefix="gate-e-preflight-fifo-") as td:
+    fifo = pathlib.Path(td) / "input.json"
+    os.mkfifo(fifo)
+    result = subprocess.run(
+        [sys.executable, str(PREFLIGHT), "--steer", str(STEER), "--spec", str(fifo)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        timeout=3,
+    )
+    report = json.loads(result.stdout)
+    assert result.returncode == 2
+    assert report["status"] == "rejected"
+    assert report["input_unchanged"] is False
+    assert report["blocking_semantics"] == [
+        {"code": "source_not_regular", "semantic": "source"}
+    ]
+    assert result.stderr == ""
 print("gate_e_preflight_test: parser acceptance, conservative block, rejection, redaction and immutability PASS")
