@@ -369,7 +369,11 @@ fake-backend coordinator fixture, не состояние настоящего k
 Его исполняет поставляемый рядом `legacy-gateway-v2`, не native v3. Частный
 netns-тест проверяет один и тот же LAN-клиент до переноса, после switch и после
 offline rollback, включая отсутствие обхода при блокировке транспорта WG.
-Эта проверка относится к cold one-shot Apply и IPv4 TCP; E4 в целом остаётся открыт.
+Помимо cold one-shot Apply, [частный supervisor](gate-e-preflight.md#private-service-switch-and-recovery)
+проверяет запуск обеих пар через `daemon --apply`, защищённый stop/down/switch/start,
+возврат после отказа запуска и холодный перезапуск службы с тем же LAN-клиентом.
+Невозможность восстановления видна как `degraded`. Это Linux netns и IPv4 TCP,
+не systemd или загрузка машины; E4 в целом остаётся открыт.
 
 Concurrent applies сериализуются core; expected revision перепроверяется в
 commit после validate. Idempotency key привязан к actor + normalized payload hash:

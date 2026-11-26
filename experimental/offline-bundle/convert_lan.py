@@ -69,75 +69,77 @@ def write(root, files):
             os.fsync(f.fileno())
 
 
-def rollback(prefix):
+def rollback_locked(prefix):
     # The generic rollback intentionally doesn't authenticate writable state.
     # For this stopped profile *all* legacy bytes/modes must match the inventory.
-    with bundle.locked(prefix):
-        current = bundle.active(prefix)
-        require(current, 'no active candidate')
-        gen = prefix / current
-        expected = bundle.manifest(gen / '.manifest')
-        require(ENGINE in expected and 'state/recovery.json' in expected,
-                'active generation is not a LAN compatibility candidate')
-        state = bundle.state_path(prefix, current)
-        require(bundle.read_file(state, 'FORMAT') == (FORMAT + '\n').encode(), 'foreign format')
-        previous = bundle.read_file(gen, '.previous').decode()
-        _, inventory, identities = inspect(prefix, previous)
-        require(sha(encode(inventory)) == expected['state/recovery.json'] and
-                all(source_still_matches(p, sig) for p, sig in identities.items()),
-                'legacy recovery pair changed; inspect private backup before retrying')
-        bundle.switch(prefix, previous)
-        print(previous)
+    current = bundle.active(prefix)
+    require(current, 'no active candidate')
+    gen = prefix / current
+    expected = bundle.manifest(gen / '.manifest')
+    require(ENGINE in expected and 'state/recovery.json' in expected,
+            'active generation is not a LAN compatibility candidate')
+    state = bundle.state_path(prefix, current)
+    require(bundle.read_file(state, 'FORMAT') == (FORMAT + '\n').encode(), 'foreign format')
+    previous = bundle.read_file(gen, '.previous').decode()
+    _, inventory, identities = inspect(prefix, previous)
+    require(sha(encode(inventory)) == expected['state/recovery.json'] and
+            all(source_still_matches(p, sig) for p, sig in identities.items()),
+            'legacy recovery pair changed; inspect private backup before retrying')
+    bundle.switch(prefix, previous)
+    return previous
 
 
-def convert(args):
+def legacy_plan(blobs):
+    doc = decode(blobs['spec.json'])
+    plan = lift(doc, sha(blobs['spec.json']))
+    require(blobs['registry'] == (plan['egress']['id'] + ' 100000 300\n').encode(),
+            'only the first default legacy mark/table allocation is supported')
+    return doc, plan
+
+
+def convert_locked(args):
     prefix, work = args.prefix, args.work
     bundle.private_dir(prefix)
     bundle.private_dir(work)
     require(not (prefix.is_relative_to(work) or work.is_relative_to(prefix)),
             'work must be separate from prefix')
-    with bundle.locked(prefix):
-        blobs, inventory, ids = inspect(prefix, bundle.active(prefix))
-        doc = decode(blobs['spec.json'])
-        plan = lift(doc, sha(blobs['spec.json']))
-        require(blobs['registry'] == (plan['egress']['id'] + ' 100000 300\n').encode(),
-                'only the first default legacy mark/table allocation is supported')
-        backend = bundle.read_file(args.backend.parent, args.backend.name)
-        with tempfile.TemporaryDirectory(dir=work) as tmp:
-            empty = Path(tmp) / 'empty'
-            empty.mkdir()
-            for name, image, spec in [('source', blobs['core'], blobs['spec.json']),
-                                      ('target', backend, encode(lower(plan)))]:
-                exe = Path(tmp) / name
-                exe.write_bytes(image)
-                exe.chmod(0o500)
-                require(effective(exe, spec, empty) == doc, 'normalized semantics differ')
-        files = {'core': (HERE / 'lan_profile.py').read_bytes(), ENGINE: backend,
-                 'state/FORMAT': (FORMAT + '\n').encode(), 'state/plan.json': encode(plan),
-                 'state/registry': blobs['registry'], 'state/recovery.json': encode(inventory)}
-        expected = {k: sha(v) for k, v in files.items()}
-        meta = {'inventory.json': encode(inventory), 'manifest.json': encode(expected)}
-        require(all(source_still_matches(path, sig) for path, sig in ids.items()),
-                'source changed during conversion')
-        if args.command == 'plan':
-            require(not any(work.iterdir()), 'plan needs an empty private work directory')
-            write(work / 'backup', blobs)
-            write(work / 'bundle', files)
-            write(work, meta)
-            for directory, _, _ in os.walk(work, topdown=False):
-                bundle.syncdir(directory)
-        else:
-            # Re-derive the reviewed manifest from the still-active legacy source
-            # under the switcher's lock; do not trust an editable staging manifest.
-            for root, entries in [(work, meta), (work / 'backup', blobs)]:
-                require(all(bundle.read_file(root, n) == v for n, v in entries.items()),
-                        'backup, input or reviewed manifest changed; plan again')
-            with tempfile.TemporaryDirectory(dir=work) as temp:
-                trusted = Path(temp) / 'manifest'
-                trusted.write_bytes(meta['manifest.json'])
-                bundle.install(prefix, work / 'bundle', trusted)
-        print(encode({'engine': ENGINE, 'source_sha256': plan['source_sha256'],
-                      'selected': bundle.active(prefix)}).decode().strip())
+    blobs, inventory, ids = inspect(prefix, bundle.active(prefix))
+    doc, plan = legacy_plan(blobs)
+    backend = bundle.read_file(args.backend.parent, args.backend.name)
+    with tempfile.TemporaryDirectory(dir=work) as tmp:
+        empty = Path(tmp) / 'empty'
+        empty.mkdir()
+        for name, image, spec in [('source', blobs['core'], blobs['spec.json']),
+                                  ('target', backend, encode(lower(plan)))]:
+            exe = Path(tmp) / name
+            exe.write_bytes(image)
+            exe.chmod(0o500)
+            require(effective(exe, spec, empty) == doc, 'normalized semantics differ')
+    files = {'core': (HERE / 'lan_profile.py').read_bytes(), ENGINE: backend,
+             'state/FORMAT': (FORMAT + '\n').encode(), 'state/plan.json': encode(plan),
+             'state/registry': blobs['registry'], 'state/recovery.json': encode(inventory)}
+    expected = {k: sha(v) for k, v in files.items()}
+    meta = {'inventory.json': encode(inventory), 'manifest.json': encode(expected)}
+    require(all(source_still_matches(path, sig) for path, sig in ids.items()),
+            'source changed during conversion')
+    if args.command == 'plan':
+        require(not any(work.iterdir()), 'plan needs an empty private work directory')
+        write(work / 'backup', blobs)
+        write(work / 'bundle', files)
+        write(work, meta)
+        for directory, _, _ in os.walk(work, topdown=False):
+            bundle.syncdir(directory)
+    else:
+        # Re-derive the reviewed manifest from the still-active legacy source
+        # under the switcher's lock; do not trust an editable staging manifest.
+        for root, entries in [(work, meta), (work / 'backup', blobs)]:
+            require(all(bundle.read_file(root, n) == v for n, v in entries.items()),
+                    'backup, input or reviewed manifest changed; plan again')
+        with tempfile.TemporaryDirectory(dir=work) as temp:
+            trusted = Path(temp) / 'manifest'
+            trusted.write_bytes(meta['manifest.json'])
+            bundle.install(prefix, work / 'bundle', trusted)
+    return {'engine': ENGINE, 'source_sha256': plan['source_sha256'], 'selected': bundle.active(prefix)}
 
 
 if __name__ == '__main__':
@@ -152,10 +154,11 @@ if __name__ == '__main__':
     os.umask(0o077)
     try:
         args = ap.parse_args()
-        if args.command == 'rollback':
-            rollback(args.prefix)
-        else:
-            convert(args)
+        with bundle.locked(args.prefix):
+            if args.command == 'rollback':
+                print(rollback_locked(args.prefix))
+            else:
+                print(encode(convert_locked(args)).decode().strip())
     except (OSError, ValueError, TypeError, KeyError, RecursionError, SourceError,
             subprocess.SubprocessError) as exc:
         sys.exit('LAN conversion refused: ' + str(exc))

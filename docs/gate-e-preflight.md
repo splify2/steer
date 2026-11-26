@@ -185,7 +185,8 @@ Inside the isolated router the lifecycle is (invoke `convert_lan.py` and
 3. `"$prefix/active/core" apply` lowers the sealed plan to a transient backend
    spec, verifies the external devices and invokes the bundled engine's real
    Apply. The launcher exits; Linux forwards subsequent packets. No daemon,
-   watchdog, host boot registration or ongoing reconciliation is promised.
+   watchdog, host boot registration or ongoing reconciliation is promised by
+   this one-shot command. For a supervised daemon see below.
 4. `"$prefix/active/core" down`, verify the dataplane is down, then
    `convert_lan.py rollback --prefix "$prefix"`. This profile-specific command
    checks the predecessor against the sealed backup inventory before selecting
@@ -211,3 +212,70 @@ packages/services, inherited firewall policy, IPv6/UDP parity and any broader
 inventory need their own acceptance. Before replacing this backend with a
 native one, run the same client/negative control on that backend and demonstrate
 equivalence of legacy selectors, exclusions, family and failure defaults.
+
+### Private service switch and recovery
+
+`experimental/offline-bundle/lan_service.py` is an optional foreground service
+supervisor for this **same** sealed profile. Unlike the one-shot launcher, it
+keeps the selected `steerd daemon --apply` alive. For the legacy generation it
+starts `core` with the original spec; for the compatibility generation it
+starts the manifest-verified `legacy-gateway-v2` with a lowered transient spec.
+Both receive their actual paired `states/<generation>` and a private control
+socket. The daemon itself performs boot Apply. No supervisor or client command
+issues a separate Apply.
+
+Reproduce the service gate (same binaries and Linux prerequisites as above):
+
+```sh
+sh tests/gate_e_lan_netns.sh --service /path/to/v2.1.4/build/steerd build/steerd
+```
+
+The wrapper creates an isolated PID namespace with its own procfs, nested
+router mount/network namespaces, private writable OS paths, and two peers.
+The trusted wrapper records the outer PID namespace for the service's startup
+check. This is a dedicated, single-writer router; another daemon, firewall
+manager or process editing the prefix is outside the contract.
+
+Inside that router, prepare `convert_lan.py plan` against the stopped legacy
+pair with its populated registry. The foreground supervisor then owns the
+bundle lock for its lifetime. Commands below use `python3 lan_service.py
+--prefix "$prefix"` followed by:
+
+| Command | Result |
+| --- | --- |
+| `serve` | Start the selected pair; listen on the private `service.sock`. A cold start needs only the selected bundle, supervisor tools and external WG setup. |
+| `status` | Query the live supervisor for `phase`, `selected`, `daemon_pid` and `detail`. A selected pointer alone is not readiness. |
+| `upgrade --work "$work" --backend "$steerd"` | Block LAN forwarding, terminate/wait the old daemon, run its `down`, check kernel cleanup, revalidate the reviewed plan/backup, switch, and boot the candidate. |
+| `rollback` | Stop/down the candidate under the same guard. Verify the previous binary/state inventory, switch and boot the previous daemon without staging or network fetch. |
+| `stop` (or SIGTERM to `serve`) | Stop/down the pair; keep LAN forwarding blocked. Start a new `serve` for a cold service restart. |
+
+The transfer guard is a separate nft `inet` forward chain dropping `br-lan`
+traffic. It remains effective when either backend removes its own table. Only
+after a clean starting baseline, live daemon control reply for the exact
+spec/state paths, new `inet steer` table, expected fwmark rule and table 300
+default route via `wg0` does the supervisor remove its guard. It does not
+replace any steady-state legacy selector. Client reachability is tested
+independently rather than inferred from the control socket.
+
+An `upgrade` whose new daemon fails returns **nonzero**, even when verified
+rollback and restart succeed: `phase=running`, `selected` points back to the
+old pair and `detail` records the first failure. An uncertain stop/down,
+changed predecessor or unsuccessful recovery yields `degraded`, not a direct
+route or a search for some other binary. The supervisor attempts guarded
+shutdown; if it cannot confirm guard/down it reports that uncertainty.
+`service-state.json` records the last phase atomically; it is not a liveness
+probe. A new `serve` refuses an unclean/degraded predecessor. Inspect this
+record, the paired state, retained backup, children and kernel state; for
+this fixture discard the disposable router and reprovision before retrying.
+The one-shot tool and generic bundle CLI remain usable offline, but do not
+clear a service stop guard in a running namespace.
+
+The test exercises real bind failure on the candidate socket, recovery of the
+original client without a manual Apply, successful upgrade, complete service
+stop and cold restart with staging and input backend absent, explicit rollback,
+and a missing external WG peer that prevents recovery. It verifies the daemon
+executable/PID and state path, byte-exact TCP echo through WG and a calibrated
+underlay counter with continuous LAN traffic during the transitions. This is
+a controlled service lifecycle in a private namespace, **not** systemd or
+machine boot. Power-loss recovery, adoption of orphan processes, host package
+integration and full E4 remain open.
