@@ -182,7 +182,8 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
     /* Буфер по мерке транспорта, а не «с запасом»: поверх HTTP/2 за один раз приезжает до
      * целой записи TLS, и меньший буфер дал бы ошибку на совершенно законном кадре. */
     static __thread unsigned char buf[VLESS_MIN_RECV_CAP];
-    size_t got = 0;
+    struct vless_response_stream response = {0};
+    size_t received = 0;
     /* Ждём данных ПО ЧАСАМ, а не заданным числом попыток.
      *
      * Ноль байт от чтения означает «пока нечего», и причин тому две: служебный кадр
@@ -199,31 +200,31 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
      * нашего кадра Vision, и отправленный нам ответ.
      *
      * Ждём на сокете, а не в холостом цикле: иначе это те же микросекунды, только дороже. */
-    int64_t rx_deadline = now_ms() + (int64_t)(timeout_s > 0 ? timeout_s : 8) * 1000;
-    for (;;) {
+    int64_t rx_deadline = t_sent + (int64_t)(timeout_s > 0 ? timeout_s : 8) * 1000;
+    int pr = VLESS_EAGAIN;
+    while (now_ms() < rx_deadline) {
+        size_t got;
         rc = transport_read(&c, buf, sizeof(buf), &got);
-        if (rc) { transport_close(&c); snprintf(why, why_n, "ответа нет: %s", vless_strerror(rc)); return rc; }
-        if (got) break;
-        if (now_ms() >= rx_deadline) break;
+        if (rc) break;
+        if (got) {
+            /* TTFB — первый байт, даже если остальной заголовок придёт позже.
+             * Заголовок идёт до данных Vision и может пересекать границы чтений. */
+            if (!received && ttfb_ms) *ttfb_ms = (int)(now_ms() - t_sent);
+            received += got;
+            size_t skip;
+            pr = vless_response_feed(&response, buf, got, &skip);
+            if (pr != VLESS_EAGAIN) break;
+            continue;
+        }
+        if (transport_has_data(&c)) continue;
+        int64_t left = rx_deadline - now_ms();
+        if (left <= 0) break;
         struct pollfd pw = { .fd = transport_fd(&c), .events = POLLIN, .revents = 0 };
-        poll(&pw, 1, 200);
+        poll(&pw, 1, left < 200 ? (int)left : 200);
     }
-    if (!got) { transport_close(&c); snprintf(why, why_n, "сервер не прислал данных"); return TR_EIO; }
-    /* Первый байт пришёл. Замер сделан ДО разбора ответа: разбор ничего не ждёт, а
-     * включать его в задержку значило бы мерить свою же работу. */
-    if (ttfb_ms) *ttfb_ms = (int)(now_ms() - t_sent);
-
-    /* Заголовок ответа VLESS идёт ДО кадров Vision и обёрткой не покрыт — разбирается из буфера как
-     * есть, тем же порядком, что у туннеля (vl_deliver: сначала заголовок, потом кадры). Прежде здесь
-     * сперва разворачивался кадр Vision — состоянием, объявленным внутри блока и обнулённым вместо UUID
-     * узла, — и разбор читал заголовок из rx_pre этого состояния уже после выхода из блока: чтение стека
-     * вне области видимости (ASan: stack-use-after-scope на первой же пробе узла с flow). Работало это
-     * случайно: нулевой «UUID» расходился с ответом сразу за «00 00», и в rx_pre лежали ровно байты
-     * заголовка. */
-    size_t skip = 0;
-    int pr = vless_parse_response(buf, got, &skip);
     transport_close(&c);
-
+    if (rc) { snprintf(why, why_n, "ответа нет: %s", vless_strerror(rc)); return rc; }
+    if (!received) { snprintf(why, why_n, "сервер не прислал данных"); return TR_EIO; }
     if (pr == VLESS_EPROTO) {
         /* Вот он, тихий отказ Reality. Говорим прямо, потому что иначе это неотличимо
          * от рабочего узла: TLS установлен, ответ пришёл, но он от чужого сайта. */
@@ -233,10 +234,10 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
         return VLESS_CONN_EREJECTED;
     }
     if (pr == VLESS_EAGAIN) {
-        snprintf(why, why_n, "ответ слишком короткий (%zu байт)", got);
+        snprintf(why, why_n, "ответ слишком короткий (%zu байт)", received);
         return TR_EIO;
     }
-    snprintf(why, why_n, "ok, ответ VLESS (%zu байт)", got);
+    snprintf(why, why_n, "ok, ответ VLESS (%zu байт)", received);
     return 0;
 }
 

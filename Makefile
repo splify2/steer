@@ -108,6 +108,15 @@ $(BUILD)/capabilitiesmatch: tests/capabilitiesmatch.c src/platform/capabilities.
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Isrc/platform -o $@ tests/capabilitiesmatch.c src/platform/capabilities.c
 
+.PHONY: vless-probe-stream-test
+test: vless-probe-stream-test
+vless-probe-stream-test: $(BUILD)/vlessprobematch
+	@$(BUILD)/vlessprobematch
+$(BUILD)/vlessprobematch: tests/vlessprobematch.c src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
+                          $(wildcard src/proto/vless/*.h src/proto/transport/*.h)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--wrap=clock_gettime,--wrap=poll -o $@ $(filter %.c,$^)
+
 # Два бинарника, как в пакете (docs/architecture.md, раздел 4а, «Бинарники»): build/steerd — весь
 # движок, build/steer — клиент сокета. Стенды зовут ./build/steer, как звали всегда: команды,
 # которые не к демону (а без демона — любые), клиент отдаёт движку execv'ом, и steerd он берёт
@@ -1023,7 +1032,7 @@ clean:
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext $(BUILD)/obfs-server \
 	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/yamlmatch $(BUILD)/pmkindmatch $(BUILD)/wolfssl-host \
-	       $(BUILD)/scryptomatch $(BUILD)/sigmatch $(BUILD)/vlessmatch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
+	       $(BUILD)/scryptomatch $(BUILD)/sigmatch $(BUILD)/vlessmatch $(BUILD)/vlessprobematch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
 	       $(BUILD)/devupmatch $(BUILD)/ndk \
 	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts $(BUILD)/socks-loopback $(BUILD)/vless-loopback out
