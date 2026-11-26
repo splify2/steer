@@ -36,6 +36,9 @@ class ReleaseWorkflow(unittest.TestCase):
                          '--cap-add SYS_ADMIN', '--cap-add NET_ADMIN', '--security-opt no-new-privileges'):
             self.assertIn(fragment, step['run'])
         self.assertNotIn('|| true', step['run'])
+        image_script = pathlib.Path('build/ext-test-image.sh').read_text()
+        self.assertIn('STEER_NGTCP2="$NSRC"', image_script)
+        self.assertIn('[ "${PM_STRICT:-0}" = 1 ] && [ ! -f "$NSRC/lib/ngtcp2_brutal.c" ]', image_script)
         env = dict(os.environ, S2P='/nonexistent/steer-s2p', PM_STRICT='1')
         result = subprocess.run(['sh', 'tests/pluginmgrmatch.sh'], env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)

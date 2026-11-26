@@ -22,6 +22,7 @@
 set -eu
 
 WSRC=${WOLFSSL_DIR:-/opt/wolfssl}
+NSRC=${STEER_NGTCP2:-${NGTCP2_DIR:-/opt/ngtcp2}}
 SRC=${SRC:-/src}
 
 if [ ! -f "$WSRC/wolfssl/wolfcrypt/settings.h" ]; then
@@ -30,6 +31,10 @@ if [ ! -f "$WSRC/wolfssl/wolfcrypt/settings.h" ]; then
 fi
 command -v zig >/dev/null 2>&1 || {
 	echo "ext-test-image: в образе нет zig — это не образ сборщика steer" >&2; exit 2; }
+if [ "${PM_STRICT:-0}" = 1 ] && [ ! -f "$NSRC/lib/ngtcp2_brutal.c" ]; then
+	echo "ext-test-image: в образе нет исходников ngtcp2 ($NSRC) — strict прогон невозможен" >&2
+	exit 2
+fi
 
 cd "$SRC"
 # Стенд пишет в build/ от root (образ). Владелец на выходе возвращается тому, кому принадлежит
@@ -39,4 +44,4 @@ cd "$SRC"
 if [ "$OWNER" != "0:0" ]; then
 	trap 'chown -R "$OWNER" "$SRC/${BUILD:-build}" 2>/dev/null || true' EXIT
 fi
-STEER_WOLFSSL="$WSRC" CC="zig cc" BUILD="${BUILD:-build}" sh tests/ext-test.sh
+STEER_WOLFSSL="$WSRC" STEER_NGTCP2="$NSRC" CC="zig cc" BUILD="${BUILD:-build}" sh tests/ext-test.sh
