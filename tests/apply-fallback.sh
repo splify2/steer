@@ -25,6 +25,7 @@ mount -t tmpfs tmpfs /tmp || exit 2
 mount -t tmpfs tmpfs /etc || exit 2
 mount -t tmpfs tmpfs /var || exit 2
 mount -t sysfs sysfs /sys || exit 2
+mount -t proc proc /proc || exit 2
 ip link set lo up || exit 2
 ip link add wan0 type dummy || exit 2
 ip link set wan0 up || exit 2
@@ -71,5 +72,33 @@ EOF
     fi
     [ "$rc" = 0 ] || cat "/tmp/$policy.log"
 done
+# Живой IPv4 при выключенном IPv6 устройства — не отказ политики on_fail.
+rm -rf /tmp/state
+mkdir -p /tmp/state
+nft delete table inet steer_fixture 2>/dev/null || :
+ip link add v4only type dummy || exit 2
+ip link set v4only up || exit 2
+printf 1 > /proc/sys/net/ipv6/conf/v4only/disable_ipv6 || exit 2
+cat >/tmp/spec.json <<'EOF'
+{"schema":2,"from_default":["192.168.1.0/24"],
+ "outputs":{"vpn":{"kind":"interface","device":"v4only","on_fail":"drop"}},
+ "channels":[{"name":"all","match":{"any":true,"allow_all":true},"out":"vpn"}]}
+EOF
+STEER_NFT_TABLE=steer_fixture /run/apply-fixture/steerd apply --spec /tmp/spec.json \
+    --state-dir /tmp/state >/tmp/v4only.log 2>&1
+rc=$?
+check "IPv4 без IPv6: код Apply" 0 "$rc"
+check "IPv4 без IPv6: nft загружена" 0 "$(nft list table inet steer_fixture >/dev/null 2>&1; echo $?)"
+mark="$(awk '$1=="vpn"{print $2}' /tmp/state/registry 2>/dev/null)"
+table="$(awk '$1=="vpn"{print $3}' /tmp/state/registry 2>/dev/null)"
+if [ -n "$mark" ] && [ -n "$table" ]; then
+    check "IPv4 без IPv6: маршрут IPv4 в устройство" 1 \
+        "$(ip -4 route get 203.0.113.7 mark "0x$mark" 2>/dev/null | grep -c 'dev v4only')"
+    check "IPv4 без IPv6: маршрут IPv6 запрещён" 1 \
+        "$(ip -6 route show table "$table" | grep -q '^prohibit default' && echo 1 || echo 0)"
+else
+    check "IPv4 без IPv6: реестр выхода" present missing
+fi
+[ "$rc" = 0 ] || cat /tmp/v4only.log
 echo "apply-fallback: $pass ok, $fail fail"
 [ "$fail" = 0 ]

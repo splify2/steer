@@ -359,7 +359,7 @@ static int rule_cmd(int fam, const char *verb, unsigned mark, const char *mask, 
                           pref ? atoi(pref) : 0);
 }
 
-static void rule_add_fam(int fam, unsigned mark, int table) {
+static int rule_add_fam(int fam, unsigned mark, int table) {
     char mk[16];
     snprintf(mk, sizeof(mk), "0x%08x", STEER_MARK_MASK);
     /* Приоритет — только если сборка его задаёт (STEER_RULE_PREF, spec.h): на роутере его нет,
@@ -369,10 +369,9 @@ static void rule_add_fam(int fam, unsigned mark, int table) {
     if (STEER_RULE_PREF) {
         char pr[16];
         snprintf(pr, sizeof(pr), "%d", STEER_RULE_PREF);
-        rule_cmd(fam, "add", mark, mk, table, pr);
-        return;
+        return rule_cmd(fam, "add", mark, mk, table, pr);
     }
-    rule_cmd(fam, "add", mark, mk, table, NULL);
+    return rule_cmd(fam, "add", mark, mk, table, NULL);
 }
 
 void rule_add(unsigned mark, int table) {
@@ -557,11 +556,11 @@ static void rule_del_at(int fam, unsigned mark, int table, unsigned long pref) {
 }
 
 /* Правило одного семейства — ровно одной копией (см. rule_ensure ниже). */
-static void rule_ensure_fam(int fam, unsigned mark, int table) {
+static int rule_ensure_fam(int fam, unsigned mark, int table) {
     /* Дамп в куче любой длины — по той же причине, что в route_facts_read: это ВСЕ правила
      * коробки, и обрезанный дамп значил бы «нашего нет» и лишнюю копию. */
     char *rules = rules_dump(fam);
-    if (!rules) return;
+    if (!rules) return ENOMEM;
     struct rule_copies c = rule_copies_of(rules, mark, table);
     free(rules);
     /* Нет памяти под список — копии неполны: добавляем, если верной нет, но ничего не снимаем. */
@@ -569,15 +568,26 @@ static void rule_ensure_fam(int fam, unsigned mark, int table) {
     /* Прочитать не вышло (нет ip, отказал popen) — добавляем, ничего не снимая: лишняя копия
      * того же правила ничего не меняет в маршрутизации, а снятие вслепую могло бы оставить
      * метку без правила — то есть ту самую утечку, ради которой всё это. */
-    if (!c.known || c.n == 0) rule_add_fam(fam, mark, table);
+    if (!c.known || c.n == 0) {
+        int rc = rule_add_fam(fam, mark, table);
+        if (rc == EEXIST) {
+            char *again = rules_dump(fam);
+            struct rule_copies found = rule_copies_of(again, mark, table);
+            free(again);
+            if (found.known && !found.oom && found.n > 0) rc = 0;
+            rule_copies_free(&found);
+        }
+        if (rc) { rule_copies_free(&c); return rc; }
+    }
     /* Верная копия есть (или только что добавлена) — теперь можно убирать лишнее. */
     for (int k = 1; k < c.n; k++) rule_del_at(fam, mark, table, c.pref[k]);
     for (int k = 0; k < c.wrong_n; k++) rule_del_at(fam, mark, table, c.wrong[k]);
     rule_copies_free(&c);
+    return 0;
 }
 
-void rule_ensure(unsigned mark, int table) {
-    rule_ensure_fam(4, mark, table);
+int rule_ensure(unsigned mark, int table) {
+    return rule_ensure_fam(4, mark, table);
 }
 
 void rule_ensure6(unsigned mark, int table) {
@@ -1067,7 +1077,7 @@ void v6donor_sync(const struct spec *sp) {
  * длится, а состояние в ядре с тех пор разъехалось (см. сверку ниже). Строку «живых
  * устройств нет» в этом случае печатает вызывающий, и печатает вместе с причиной
  * расхождения — иначе журнал раз в минуту повторял бы одно и то же без новостей. */
-static void apply_failed(const struct output *o, int announce) {
+static int apply_failed(const struct output *o, int announce) {
     char tbl[16];
     snprintf(tbl, sizeof(tbl), "%d", o->table);
 
@@ -1086,7 +1096,7 @@ static void apply_failed(const struct output *o, int announce) {
          * случиться в режиме direct/zapret (ниже), и режим меняют в интерфейсе, не
          * перезапуская ничего. Стоящее правило не снимается (rule_ensure): снять и поставить
          * заново значило бы на миг открыть тот же путь напрямую. */
-        rule_ensure(o->mark, o->table);
+        if (rule_ensure(o->mark, o->table)) return 1;
         /* IPv6 выхода — тот же запрет в его таблице IPv6. */
         route6_bind(o, NULL);
         /* Режим мог смениться с direct/zapret на drop, пока выход лежал: отметка «пущен
@@ -1098,7 +1108,7 @@ static void apply_failed(const struct output *o, int announce) {
         if (announce)
             fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик остановлен "
                             "(on_fail=drop)\n", o->name);
-        return;
+        return 0;
     }
 
     /* direct и zapret: снимаем правило, чтобы помеченный трафик шёл обычным путём, — и
@@ -1119,7 +1129,7 @@ static void apply_failed(const struct output *o, int announce) {
     failopen_mark(o, 1);
     conntrack_evict(o->mark);
 
-    if (!announce) return;
+    if (!announce) return 0;
     if (o->on_fail == FAIL_ZAPRET && !zapret_running())
         fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик пущен напрямую, "
                         "но zapret не запущен — обхода DPI не будет\n", o->name);
@@ -1127,10 +1137,11 @@ static void apply_failed(const struct output *o, int announce) {
         fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик пущен напрямую "
                         "(on_fail=%s)\n", o->name,
                 o->on_fail == FAIL_ZAPRET ? "zapret" : "direct");
+    return 0;
 }
 
-void fo_fail_apply(const struct output *o) {
-    apply_failed(o, 1);
+int fo_fail_apply(const struct output *o) {
+    return apply_failed(o, 1);
 }
 
 /* Привязать таблицу выхода к устройству. Правило проверяется и при нужде возвращается,

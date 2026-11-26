@@ -67,7 +67,7 @@ void rule_copies_free(struct rule_copies *c);
  * Наружу — ради команды select (fogroup.c): выбранный человеком член не работает, — и ради apply
  * (apply_routing_one): группа v2, у которой по известным приговорам членов живого нет, получает
  * on_fail сразу, а не устройство до первого прохода. */
-void fo_fail_apply(const struct output *o);
+int fo_fail_apply(const struct output *o);
 
 /* ---- прочее, что тест дёргает напрямую, в обход cmd_failover ----------------------- */
 void active_get(const char *out, char *dev, size_t n);

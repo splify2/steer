@@ -1451,7 +1451,7 @@ void rule_drop(unsigned mark, int table);
 /* Правило выхода — ровно одной копией, НЕ СНИМАЯ стоящую: недостающее добавляется, лишние
  * копии и прежние формы снимаются уже после. Зачем так, а не rule_drop + rule_add, — у
  * определения в failover.c («без мгновения пустоты»). */
-void rule_ensure(unsigned mark, int table);
+int rule_ensure(unsigned mark, int table);
 
 /* ---- маршрутизация IPv6 выхода (docs/architecture.md, «4б») ------------------------------
  *

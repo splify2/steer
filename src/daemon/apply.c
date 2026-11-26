@@ -392,8 +392,8 @@ static void iptables_masq_sync(const struct spec *sp) {
 /* Привязка одного выхода — тело прежнего цикла apply_routing. Одна функция на два пути: apply
  * подкомандой проходит все выходы, apply-commit демона — только те, чья часть маршрутизации
  * изменилась (apply-сверка, src/daemon/recon.c). */
-static void apply_routing_one(const struct output *o) {
-    if (!out_has_device(o)) return;
+static int apply_routing_one(const struct output *o) {
+    if (!out_has_device(o)) return 0;
     /* IPv6 выхода снят спекой (ipv6: off или выход рядом с донором — spec_v6_resolve): правило и
      * таблица IPv6, поставленные прежней спекой, снимаются. Вреда от них не было бы — IPv6 такого
      * выхода отвергает forward_v6 по метке, — но `ip -6 rule` с правилом выхода, который IPv6 не
@@ -407,8 +407,7 @@ static void apply_routing_one(const struct output *o) {
      * выбирал. У выхода с одним устройством и у пула v1 `failed` — прошлый приговор пробы, и
      * apply по-прежнему привязывает устройство: судить его может только новая проба. */
     if (o->failed && group_named(out_group(o))) {
-        fo_fail_apply(o);
-        return;
+        return fo_fail_apply(o);
     }
     char table[16];
     snprintf(table, sizeof(table), "%d", o->table);
@@ -418,7 +417,10 @@ static void apply_routing_one(const struct output *o) {
      * то есть уходил напрямую, мимо туннеля, — подробно у table_bind. Маршрут первым: если
      * правила не было, появившееся должно найти в таблице устройство, а не пустоту. */
     int rc = table_bind(o, o->device);
-    rule_ensure(o->mark, o->table);
+    if (rule_ensure(o->mark, o->table)) {
+        fprintf(stderr, LOG_W "output %s: правило IPv4 не подтверждено\n", o->name);
+        return 1;
+    }
     /* Половина IPv6 (docs/architecture.md, «4б») — у выхода с KC_IPV6. Не встала при живом IPv4 —
      * у устройства выключен IPv6: в таблице IPv6 запрет, и IPv6 правил выхода стоит. */
     if (rc == 0 && route6_bind(o, o->device) != 0)
@@ -455,10 +457,13 @@ static void apply_routing_one(const struct output *o) {
             failopen_mark(o, 1);
         }
     }
+    return 0;
 }
 
-static void apply_routing(const struct spec *sp) {
-    for (size_t i = 0; i < sp->out_n; i++) apply_routing_one(&sp->out[i]);
+static int apply_routing(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (apply_routing_one(&sp->out[i])) return 1;
+    return 0;
 }
 
 /* Стоит ли в ядре таблица «<семейство> <наша таблица>» — вопрос ядру по netlink (nfd_table_exists),
@@ -837,7 +842,7 @@ int cmd_apply(const char *spec, int dry) {
      * туннеля не отменяет применённых правил: его таблица получит то же, что у любого выхода
      * без устройства (blackhole при on_fail=drop), а причина уже названа в журнале. */
     awg_apply_all(&cfg);
-    apply_routing(&cfg);
+    if (apply_routing(&cfg)) { free(reg); return 1; }
     if (ruleset_load(&cfg, &gr) != 0) { free(reg); return 1; }
     registry_publish(&cfg, reg);
     free(reg);
@@ -1106,7 +1111,9 @@ int cmd_apply_commit(int argc, char **argv) {
      * путём идёт и старт демона (--apply: первый apply применяет всё). */
     if (a.awg) awg_apply_all(&cfg);
     for (size_t i = 0; i < cfg.out_n; i++)
-        if (name_in_list(a.route, cfg.out[i].name)) apply_routing_one(&cfg.out[i]);
+        if (name_in_list(a.route, cfg.out[i].name) && apply_routing_one(&cfg.out[i])) {
+            free(reg); return 1;
+        }
     if (a.ruleset) {
         counters_load();
         if (ruleset_load(&cfg, &gr) != 0) { free(reg); return 1; }
@@ -1145,7 +1152,7 @@ int cmd_apply_commit(int argc, char **argv) {
     for (size_t i = 0; i < cfg.out_n; i++) {
         const struct output *o = &cfg.out[i];
         if (!name_in_list(a.rule, o->name) || !out_has_device(o)) continue;
-        rule_ensure(o->mark, o->table);
+        if (rule_ensure(o->mark, o->table)) { free(reg); return 1; }
         /* Правило IPv6 — тем же ходом (страж ловит и RTNLGRP_IPV6_RULE, см. rulewd.c). */
         if (out_route6(o)) rule_ensure6(o->mark, o->table);
     }

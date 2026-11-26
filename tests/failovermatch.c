@@ -30,6 +30,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <errno.h>
+#include "platform.h"
 
 int rule_added = 0;
 int rule_deleted = 0;
@@ -42,6 +44,9 @@ static int g_cmd_n;
  * проверкой и привязкой, таблица занята, нет прав. Подделать это можно только здесь —
  * настоящего ядра у стенда нет. */
 int g_route_add_fails = 0;
+static int g_rule_add_fails;
+static int g_rule_appears;
+static const char *g_rules = "";
 
 int run_quiet(const char *const argv[]) {
     if (!argv || !argv[0]) return -1;
@@ -74,6 +79,10 @@ int run_quiet(const char *const argv[]) {
     /* Отказывает только привязка к устройству: blackhole в ту же таблицу обязан
      * пройти, иначе стенд проверял бы не то. */
     if (g_route_add_fails && strstr(joined, "route replace default dev")) return 2;
+    if (g_rule_add_fails && strstr(joined, "rule add")) {
+        if (g_rule_appears) g_rules = "100: from all fwmark 0x100000/0xff00000 lookup 301\n";
+        return g_rule_add_fails;
+    }
     return 0;
 }
 
@@ -98,7 +107,6 @@ static int cmd_count(const char *line) {
 }
 
 /* Что «ответит» ядро на запросы состояния. */
-static const char *g_rules = "";
 static const char *g_routes = "";
 
 /* Состояние ядра — из памяти: правила (table < 0) и таблица выхода. */
@@ -570,7 +578,25 @@ static void tick(const char *rules, const char *routes) {
     cmd_failover("/dev/null", 0);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "rule-fault")) {
+        setenv("STEER_RULE_PREF", "100", 1);
+        plat_select("openwrt");
+        g_route_hook = run_quiet;
+        g_ip_show = fake_ip_show;
+        g_rules = "200: from all fwmark 0x100000/0xff00000 lookup 301\n";
+        g_rule_add_fails = EACCES;
+        if (rule_ensure(0x100000, 301) != EACCES ||
+            !cmd_seen("rule add") || cmd_seen("rule del")) return 1;
+        g_cmd_n = 0;
+        g_rule_add_fails = EEXIST;
+        if (rule_ensure(0x100000, 301) != EEXIST || cmd_seen("rule del")) return 2;
+        g_cmd_n = 0;
+        g_rule_appears = 1;
+        if (rule_ensure(0x100000, 301) || !cmd_seen("rule del")) return 3;
+        puts("rule-fault: OK");
+        return 0;
+    }
     /* Маршруты таблиц выходов демон ставит сообщением rtnetlink (route_put): стенду — командой
      * словами в тот же журнал run_quiet, что и прежде. */
     g_route_hook = run_quiet;

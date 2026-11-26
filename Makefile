@@ -91,6 +91,11 @@ $(BUILD)/steerd: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC)
 
+# Отдельный тестовый бинарник; в обычный steerd шов отказа не включается.
+$(BUILD)/steerd-rule-fault: $(CORE_SRC) $(CORE_HDR) tests/apply-rule-fault.c VERSION
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(DEFS) -Wl,--wrap=sendto -o $@ $(CORE_SRC) tests/apply-rule-fault.c
+
 # Клиенту без steerd рядом делать нечего: зависимость порядка, чтобы `make build/steer` давал
 # рабочую пару.
 $(BUILD)/steer: $(CLIENT_SRC) src/platform/platform.h | $(BUILD)/steerd
@@ -210,6 +215,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@$(BUILD)/specmatch
 	@$(BUILD)/specmatch-ext
 	@$(BUILD)/failovermatch
+	@$(BUILD)/failovermatch rule-fault
 	@$(BUILD)/helpersmatch
 	@$(BUILD)/rrkeepmatch
 	@$(BUILD)/runmatch
