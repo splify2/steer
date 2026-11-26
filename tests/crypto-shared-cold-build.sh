@@ -10,7 +10,7 @@ find src -type d -print | sed 's|.*|"-I&"|' > "$OUT/includes.rsp"
 $CC $F $WF -c "$WSRC/src/ssl.c" -o "$OUT/ssl.o"
 cp "$WLIB" "$OUT/backend.a"
 ar d "$OUT/backend.a" src_ssl.c.o
-$CC $F -shared "$OUT/ssl.o" -Wl,--whole-archive "$OUT/backend.a" -Wl,--no-whole-archive -Wl,--version-script=build/wolfssl/libsteer-wolfssl.map -lm -o "$OUT/libbackend.so"
+$CC $F -shared "$OUT/ssl.o" -Wl,--whole-archive "$OUT/backend.a" -Wl,--no-whole-archive -Wl,--version-script=build/wolfssl/libsteer-wolfssl-server.map -lm -o "$OUT/libbackend.so"
 printf '%s\n' '{ global: qcssl_ctx_client; qcssl_ctx_server; qcssl_ctx_free; local: *; };' > "$OUT/qc.map"
 printf '%s\n' '{ global: sc_roots_load_der; sc_roots_free; local: *; };' > "$OUT/roots.map"
 $CC $F $WF $NF -Ibuild/wolfssl @"$OUT/includes.rsp" -DQC_WITH_SERVER -ffunction-sections -fdata-sections -shared src/proto/quic/qcssl.c "$NGLIB" -L"$OUT" -lbackend -Wl,-rpath,'$ORIGIN',--gc-sections,--version-script="$OUT/qc.map" -o "$OUT/libqc.so"

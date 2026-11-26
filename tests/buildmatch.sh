@@ -1104,6 +1104,14 @@ check "libsteer.map: экспорт списком, остальное лока�
     "$(grep -c '^  local:$' build/libsteer.map)"
 check "libsteer-wolfssl.map: экспорт списком, остальное локально" "1" \
     "$(grep -c '^  local:$' build/wolfssl/libsteer-wolfssl.map)"
+check "wolfSSL: client карта сохраняет все имена опубликованной legacy-линии" "" \
+    "$(while IFS= read -r sym; do grep -q "^    $sym;$" build/wolfssl/libsteer-wolfssl.map || echo "$sym"; done < build/wolfssl/exports-legacy.lst)"
+check "wolfSSL: server-only метод отсутствует в client и доступен в server карте" "0 1" \
+    "$(grep -c '^    wolfTLSv1_3_server_method;$' build/wolfssl/libsteer-wolfssl.map) $(grep -c '^    wolfTLSv1_3_server_method;$' build/wolfssl/libsteer-wolfssl-server.map)"
+check "wolfSSL: server карта включает всю client карту" "" \
+    "$(sed -n 's/^    \([A-Za-z_0-9]*\);$/\1/p' build/wolfssl/libsteer-wolfssl.map | while IFS= read -r sym; do grep -q "^    $sym;$" build/wolfssl/libsteer-wolfssl-server.map || echo "$sym"; done)"
+check "wolfSSL: build-libs выбирает server карту по реальным флагам архива" "1 1" \
+    "$(grep -c 'case " \$WCFLAGS " in' build/build-libs.sh) $(grep -c 'WMAP="build/wolfssl/libsteer-wolfssl-server.map"' build/build-libs.sh)"
 check "build-libs.sh линкует libsteer с version-script и SONAME по версии движка" "1 1" \
     "$(grep -v '^[[:space:]]*#' build/build-libs.sh | grep -c 'LIB_MAP=build/libsteer.map ;;') \
 $(grep -v '^[[:space:]]*#' build/build-libs.sh | grep -c -- '-soname,"libsteer.so.$VERSION"')"

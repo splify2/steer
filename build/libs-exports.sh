@@ -3,6 +3,7 @@
 # модулям, а libsteer-wolfssl.so и libsteer-ngtcp2.so (2.1.4) — libsteer, net1 и мосту tgws.
 #
 #     sh build/libs-exports.sh gen     переписать build/libsteer.map, build/wolfssl/libsteer-wolfssl.map,
+#                                      build/wolfssl/libsteer-wolfssl-server.map (opt-in server),
 #                                      build/ngtcp2/libsteer-ngtcp2.map и build/net1/libs2p-net.map (экспорт
 #                                      плагина net1)
 #     sh build/libs-exports.sh check   сверить файлы с кодом (выход 1 — расходятся)
@@ -93,18 +94,27 @@ comm -12 "$W/defs" "$W/undef" > "$W/need"
 # (wc_ChaCha20Poly1305_*_ex): символы «не зависят от архитектуры» только если взять оба набора.
 # shellcheck disable=SC2086
 $CC $F -DSTEER_CP_OWN -c $CRYPTO -o "$W/scrypto-own.o"
-# Optional server backend has additional public dependencies. The map is the
-# union of actual client/server consumers; profile capability still decides
-# whether server code is built, never a promise manufactured by this map.
+# Server-only dependencies belong to a separate opt-in map. The ordinary
+# client archive is compiled without server symbols and must not claim them.
 $CC $F $NGCFLAGS -DQC_WITH_SERVER -DSTEER_WOLFSSL_SERVER -DWOLFSSL_VALIDATE_ECC_IMPORT \
     -DSTEER_WOLFSSL_POSIX_TIME_SAFE=1 -c "$(profile_var QUIC_SSL_SRC)" -o "$W/qcssl-server.o"
 {
-    nm -u "$W/lib/$(echo "$CRYPTO" | tr / _).o" "$W/scrypto-own.o" "$W/lib/$(echo "$(profile_var QUIC_SSL_SRC)" | tr / _).o" "$W/qcssl-server.o"
+    nm -u "$W/lib/$(echo "$CRYPTO" | tr / _).o" "$W/scrypto-own.o" "$W/lib/$(echo "$(profile_var QUIC_SSL_SRC)" | tr / _).o"
     nm -u "$W/libngtcp2.a"
     # Published compatibility symbol: current callers use the backend-owned
     # init seam, but migrating a caller must not silently remove the old export.
     printf '%s\n' '                 U wolfSSL_Init'
 } | awk '$1=="U" && ($2 ~ /^(wc_|wolf)/) {print $2}' | sort -u > "$W/wneed"
+# The released client ABI is a floor even if current callers stop using a name.
+[ -f build/wolfssl/exports-legacy.lst ] || { echo "libs-exports: missing wolfSSL legacy ledger" >&2; exit 2; }
+if grep -vE '^(wc_|wolf)[A-Za-z0-9_]+$' build/wolfssl/exports-legacy.lst; then
+    echo "libs-exports: invalid wolfSSL legacy symbol" >&2; exit 2
+fi
+cat "$W/wneed" build/wolfssl/exports-legacy.lst | sort -u > "$W/wclient"
+{
+    cat "$W/wclient"
+    nm -u "$W/qcssl-server.o" | awk '$1=="U" && ($2 ~ /^(wc_|wolf)/) {print $2}'
+} | sort -u > "$W/wserver"
 
 # ---- net1: libs2p-net.so.1 -------------------------------------------------------------------
 # Экспорт net1 — то, что плагины протоколов на ней (PLUGINS_NET1) берут из её исходников; имена — с
@@ -192,7 +202,7 @@ emit_wolfssl() {
     echo "{"
     echo "  global:"
     echo "    steer_wolfssl_abi;"
-    sed 's/$/;/; s/^/    /' "$W/wneed"
+    sed 's/$/;/; s/^/    /' "$1"
     echo "  local:"
     echo "    *;"
     echo "};"
@@ -210,22 +220,25 @@ emit_ngtcp2() {
 }
 emit_libsteer > "$W/libsteer.map"
 emit_ngtcp2 > "$W/libsteer-ngtcp2.map"
-emit_wolfssl > "$W/libsteer-wolfssl.map"
+emit_wolfssl "$W/wclient" > "$W/libsteer-wolfssl.map"
+emit_wolfssl "$W/wserver" > "$W/libsteer-wolfssl-server.map"
 emit_net1 > "$W/libs2p-net.map"
 
 case "$MODE" in
 gen)
     cp "$W/libsteer.map" build/libsteer.map
     cp "$W/libsteer-wolfssl.map" build/wolfssl/libsteer-wolfssl.map
+    cp "$W/libsteer-wolfssl-server.map" build/wolfssl/libsteer-wolfssl-server.map
     cp "$W/libsteer-ngtcp2.map" build/ngtcp2/libsteer-ngtcp2.map
     mkdir -p build/net1
     cp "$W/libs2p-net.map" build/net1/libs2p-net.map
     cp "$W/exports.lst" build/net1/exports.lst
-    echo "libs-exports: libsteer.map — $(wc -l < "$W/need") символов, libsteer-wolfssl.map — $(wc -l < "$W/wneed"), libsteer-ngtcp2.map — $(wc -l < "$W/ngneed"), libs2p-net.map — $(($(wc -l < "$W/n1need") + 1))"
+    echo "libs-exports: libsteer.map — $(wc -l < "$W/need") символов, wolfSSL client/server — $(wc -l < "$W/wclient")/$(wc -l < "$W/wserver"), libsteer-ngtcp2.map — $(wc -l < "$W/ngneed"), libs2p-net.map — $(($(wc -l < "$W/n1need") + 1))"
     ;;
 check)
     bad=0
     for pair in libsteer.map:build/libsteer.map libsteer-wolfssl.map:build/wolfssl/libsteer-wolfssl.map \
+                libsteer-wolfssl-server.map:build/wolfssl/libsteer-wolfssl-server.map \
                 libsteer-ngtcp2.map:build/ngtcp2/libsteer-ngtcp2.map libs2p-net.map:build/net1/libs2p-net.map exports.lst:build/net1/exports.lst; do
         gen="$W/${pair%%:*}"; have="${pair#*:}"
         if ! diff -u "$have" "$gen" > "$W/diff" 2>&1; then

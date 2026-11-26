@@ -109,19 +109,16 @@
     wc_ed25519_init;
     wc_ed25519_verify_msg;
     wolfSSL_CTX_UseSessionTicket;
-    wolfSSL_CTX_check_private_key;
     wolfSSL_CTX_free;
     wolfSSL_CTX_load_verify_buffer;
     wolfSSL_CTX_new;
     wolfSSL_CTX_sess_set_new_cb;
-    wolfSSL_CTX_set_max_early_data;
     wolfSSL_CTX_set_max_proto_version;
     wolfSSL_CTX_set_min_proto_version;
     wolfSSL_CTX_set_quic_method;
     wolfSSL_CTX_set_verify;
     wolfSSL_CTX_use_PrivateKey_buffer;
     wolfSSL_CTX_use_certificate_buffer;
-    wolfSSL_CTX_use_certificate_chain_buffer_format;
     wolfSSL_CertManagerLoadCABuffer;
     wolfSSL_CertManagerLoadCABuffer_ex;
     wolfSSL_EVP_CIPHER_CTX_free;
@@ -193,7 +190,6 @@
     wolfSSL_sk_X509_push;
     wolfSSL_steer_init;
     wolfTLSv1_3_client_method;
-    wolfTLSv1_3_server_method;
   local:
     *;
 };

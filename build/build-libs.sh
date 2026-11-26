@@ -116,6 +116,9 @@ $CC -O2 -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections $NOUNW -Wa
 # libsteer.so не слинкуется (-z defs). Список — файлом, а не вычисляется здесь, потому что nm в
 # образе сборщика нет (там только zig), а состав символов от архитектуры не зависит.
 WMAP="build/wolfssl/libsteer-wolfssl.map"
+case " $WCFLAGS " in
+    *" -DSTEER_WOLFSSL_SERVER "*) WMAP="build/wolfssl/libsteer-wolfssl-server.map" ;;
+esac
 
 # ---- ngtcp2: статический архив с -fPIC (шаг 7) и общая библиотека (2.1.4) ------------------------
 # Исходники — с нашим патчем Brutal (build/ngtcp2/fetch.sh; в образе сборщика — /opt/ngtcp2), рецепт —
