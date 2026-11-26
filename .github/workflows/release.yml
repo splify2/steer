@@ -367,22 +367,33 @@ jobs:
           nano="$RUNNER_TEMP/steer-nano"
           make NANO=1 NANO_BUILD="$nano/core" NANO_SDK="$PWD/.plugin-sdk" \
             NANO_PROTOCOLS="$PWD/.nano-protocols" nano-test
-          make -C .nano-ui NANO=1 BUILD="$nano/ui" CORE_LIB="$PWD/src/lib" \
-            YAML_DIR="$PWD/src/third_party/libyaml" test
+          # Пути от .nano-ui: __FILE__ в диагностике libyaml не должен зависеть от checkout.
+          make -C .nano-ui NANO=1 BUILD="$nano/ui" CORE_LIB=../src/lib \
+            YAML_DIR=../src/third_party/libyaml test
           PYTHONPATH="$PWD/.nano-protocols/tests" python3 -B .nano-ui/tests/core_persistence.py \
             --core "$nano/core/steer-nano" --ui "$nano/ui/steer-ui-nano" --assets "$nano/ui/nano-assets"
-          mkdir -p "$nano/release/assets" out
-          cp "$nano/core/steer-nano" "$nano/ui/steer-ui-nano" "$nano/release/"
-          cp "$nano/ui/nano-assets/"* "$nano/release/assets/"
-          cp docs/nano.md "$nano/release/README.md"
-          cp LICENSE "$nano/release/LICENSE"
+          install -d -m 0755 "$nano/release/assets"
+          mkdir -p out
+          install -m 0755 "$nano/core/steer-nano" "$nano/ui/steer-ui-nano" "$nano/release/"
+          install -m 0644 "$nano/ui/nano-assets/"* "$nano/release/assets/"
+          install -m 0644 docs/nano.md "$nano/release/README.md"
+          install -m 0644 LICENSE "$nano/release/LICENSE"
+          core_rev=$(git rev-parse HEAD)
           printf 'steer=%s\nsteer-ui=%s\nsteer-protocols=%s\nplugin-sdk=%s\n' \
-            "$(git rev-parse HEAD)" "$(git -C .nano-ui rev-parse HEAD)" \
+            "$core_rev" "$(git -C .nano-ui rev-parse HEAD)" \
             "$(git -C .nano-protocols rev-parse HEAD)" "$(git -C .plugin-sdk rev-parse HEAD)" \
             > "$nano/release/SOURCE-REVISIONS"
-          tar -C "$nano/release" -czf "out/steer-nano-$VERSION-linux-x86_64.tar.gz" steer-nano README.md LICENSE SOURCE-REVISIONS
-          cp .nano-ui/LICENSE "$nano/release/LICENSE"
-          tar -C "$nano/release" -czf "out/steer-ui-nano-$VERSION-linux-x86_64.tar.gz" steer-ui-nano assets README.md LICENSE SOURCE-REVISIONS
+          chmod 0644 "$nano/release/SOURCE-REVISIONS"
+          epoch=$(git show -s --format=%ct "$core_rev")
+          set -o pipefail
+          pack_nano() {
+            local archive="out/$1-$VERSION-linux-x86_64.tar.gz"
+            LC_ALL=C tar -C "$nano/release" --format=ustar --sort=name --mtime="@$epoch" \
+              --owner=0 --group=0 --numeric-owner -cf - "$@" | gzip -n -6 > "$archive"
+          }
+          pack_nano steer-nano README.md LICENSE SOURCE-REVISIONS
+          install -m 0644 .nano-ui/LICENSE "$nano/release/LICENSE"
+          pack_nano steer-ui-nano assets README.md LICENSE SOURCE-REVISIONS
           printf '\n**Экспериментальные Linux x86_64 архивы:** `steer-nano` и `steer-ui-nano`. Не пакеты OpenWrt.\n' \
             >> "$RUNNER_TEMP/release-notes.md"
 
