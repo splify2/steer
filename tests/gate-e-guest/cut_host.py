@@ -11,7 +11,7 @@ import time
 import uuid
 
 
-def cut(command, env, phase):
+def cut(command, env, phase, required=()):
     buf = b''
     with subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as vm:
@@ -28,6 +28,7 @@ def cut(command, env, phase):
                 if match:
                     record = json.loads(match[1])
                     assert record['phase'] == phase and vm.poll() is None
+                    assert all(line.encode() in buf for line in required)
                     vm.kill()  # SIGKILL to this QEMU child, not ACPI, QMP quit, or guest shutdown
                     assert vm.wait(timeout=10) == -signal.SIGKILL
                     return record
@@ -45,7 +46,7 @@ def copy(src, dest):
     subprocess.run(['cp', '--sparse=always', '--reflink=auto', src, dest], check=True)
 
 
-def replay_copy(args, disk, witness):
+def replay_copy(args, disk, witness, prior=None):
     sb = subprocess.check_output(['dumpe2fs', '-h', disk], stderr=subprocess.DEVNULL,
                                  env=dict(os.environ, LC_ALL='C'))
     assert re.search(rb'^Filesystem features:.*\bneeds_recovery\b', sb, re.M)
@@ -57,6 +58,10 @@ def replay_copy(args, disk, witness):
     j = json.loads(raw)
     assert hashlib.sha256(raw).hexdigest() == witness['journal']
     assert (j['phase'], j['boot_id'], j['selected']) == (witness['phase'], witness['boot'], witness['selected'])
+    if prior:
+        receipt = disk_read(replay, 'prefix/service-recovery.json')
+        assert json.loads(receipt)['source_record_sha256'] == prior['journal']
+        assert j['after_recovery_sha256'] == hashlib.sha256(receipt).hexdigest()
     assert re.fullmatch(r'generations/stage-[a-z0-9_-]+', j['selected'])
     # The pointer itself, not just the journal's claimed selection.
     st = subprocess.check_output(['debugfs', '-R', 'stat /lab/prefix/active', replay], stderr=subprocess.DEVNULL)
@@ -90,6 +95,19 @@ def exercise(args, pristine, env, vm_command):
         copy(pristine, disk)
         record = cut(vm_command(args, disk, 'gate_e_cut=' + phase), env, phase)
         previous = replay_copy(args, disk, record)
+        if phase == 'running':
+            # A completed recovery produces a fresh running source, even for
+            # the same selected generation. Prove a second real cut can use it.
+            original = record
+            record = cut(vm_command(args, disk, 'gate_e_cut=recover-running gate_e_recut=1'),
+                         env, phase, ['GATE_E_REPEAT_REFUSED ' + original['journal'],
+                                      'GATE_E_RESTORED recover-running'])
+            assert record['selected'] == original['selected'] and record['journal'] != original['journal']
+            assert uuid.UUID(original['boot']) not in boots
+            boots.add(uuid.UUID(original['boot']))
+            assert previous == replay_copy(args, disk, record, prior=original)
+            print('PASS interrupted durable decision refused before socket cleanup; '
+                  'independent recovered-running journal witnessed on disk', flush=True)
         result = subprocess.run(vm_command(args, disk, 'gate_e_cut=recover-' + phase), env=env,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, timeout=75, check=True)

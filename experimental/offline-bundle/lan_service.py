@@ -72,6 +72,7 @@ class Service:
         self.prefix, self.tmp = prefix, tmp
         self.proc = self.backend = None
         self.legacy_inventory = None
+        self.after_recovery = None
         self.phase = 'starting'
         self.guard = 'steer_hold_' + sha(os.fsencode(prefix))[:16]
         self.env = engine_env(tmp / 'empty')
@@ -94,6 +95,8 @@ class Service:
                            manifest_hash(self.prefix, selected) if phase in ('starting', 'running') else None),
                        'daemon_pid': self.proc.pid if self.proc and self.proc.poll() is None else None,
                        'detail': detail}
+        if self.after_recovery is not None:
+            self.status['after_recovery_sha256'] = self.after_recovery
         publish_record(self.prefix, 'service-state.json', self.status)
 
     def start(self):
@@ -253,6 +256,20 @@ def recover_locked(svc, disposition):
     clean()
     raw = bundle.read_file(prefix, 'service-state.json')
     record = decode(raw)
+    source_hash = sha(raw)
+    # The decision is published before the next service-state. The same
+    # source in this window has already been consumed even if the PID died.
+    # A different hash alone does not prove a later publication.
+    try:
+        receipt = bundle.read_file(prefix, 'service-recovery.json')
+    except FileNotFoundError:
+        require('after_recovery_sha256' not in record, 'missing prior recovery decision')
+    else:
+        prior = decode(receipt)
+        require(isinstance(prior, dict) and isinstance(prior.get('source_record_sha256'), str)
+                and re.fullmatch(r'[0-9a-f]{64}', prior['source_record_sha256']), 'invalid prior recovery decision')
+        require(prior['source_record_sha256'] != source_hash, 'source journal already consumed')
+        require(record.get('after_recovery_sha256') == sha(receipt), 'journal does not follow prior recovery decision')
     current = bundle.active(prefix)
     require(current and record['selected'] == current and record['manifest_sha256'] ==
             manifest_hash(prefix, current), 'selection and journal disagree')
@@ -276,12 +293,14 @@ def recover_locked(svc, disposition):
     # Preserve the admitted cut and the operator's decision even after normal
     # startup replaces service-state.json. This is intent, not health or
     # permission to resume a second interruption during recovery.
-    publish_record(prefix, 'service-recovery.json', {
+    decision = {
         'source_boot_id': record['boot_id'], 'source_phase': record['phase'],
-        'source_generation': current, 'source_record_sha256': sha(raw),
+        'source_generation': current, 'source_record_sha256': source_hash,
         'source_manifest_sha256': record['manifest_sha256'], 'boot_id': boot_id(),
         'choice': disposition, 'requested_generation': previous if disposition == 'previous' else current,
-    })
+    }
+    publish_record(prefix, 'service-recovery.json', decision)
+    svc.after_recovery = sha(encode(decision))
     if disposition == 'previous':
         bundle.switch(prefix, previous)
 
@@ -304,8 +323,10 @@ def serve(prefix, disposition=None):
             svc.hold()
             recover_locked(svc, disposition)
         elif (prefix / 'service-state.json').exists():
-            require(decode(bundle.read_file(prefix, 'service-state.json'))['phase'] == 'stopped',
+            stopped = decode(bundle.read_file(prefix, 'service-state.json'))
+            require(stopped['phase'] == 'stopped',
                     'unclean service state: isolate and inspect before restart')
+            svc.after_recovery = stopped.get('after_recovery_sha256')
         listener.bind(str(path))
         listener.listen(4)
         listener.settimeout(.2)

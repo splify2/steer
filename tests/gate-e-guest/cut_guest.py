@@ -4,9 +4,11 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -64,6 +66,57 @@ def blocked():
     no_bypass()
 
 
+def interrupted_decision():
+    # This worker has a private mount namespace. Exercise the actual write
+    # and retry on a disk-backed clone at the *same* prefix (same LAN guard).
+    # Leave the original dirty-boot pair untouched for positive admission.
+    with tempfile.TemporaryDirectory(dir=lab.LAB) as tmp:
+        clone = Path(tmp) / 'prefix'
+        shutil.copytree(lab.PREFIX, clone, symlinks=True, ignore=shutil.ignore_patterns('*.sock'))
+        lan.cmd('mount', '--bind', clone, lab.PREFIX)
+        try:
+            state = lab.PREFIX / 'service-state.json'
+            decision = lab.PREFIX / 'service-recovery.json'
+            active = os.readlink(lab.PREFIX / 'active')
+            source = state.read_bytes()
+            # Test-side interposition only: exit the supervisor after both
+            # file and directory fsync, before it can replace service-state.
+            crash = """import os,sys
+sys.path.insert(0,sys.argv.pop(1))
+import lan_service as service
+publish = service.publish_record
+def after(prefix, name, value):
+    publish(prefix, name, value)
+    if name == 'service-recovery.json': os._exit(76)
+service.publish_record = after
+sys.exit(0 if service.main() else 1)
+"""
+            p = subprocess.run([sys.executable, '-B', '-c', crash, lab.SERVICE.parent,
+                                '--prefix', lab.PREFIX, 'recover', 'selected'], timeout=8)
+            assert p.returncode == 76 and state.read_bytes() == source
+            receipt = decision.read_bytes()
+            assert json.loads(receipt)['source_record_sha256'] == hashlib.sha256(source).hexdigest()
+            inode = decision.stat().st_ino
+            sentinel = lab.PREFIX / 'service.sock'
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as s:
+                s.bind(str(sentinel))
+            # An actually stale socket would be unlinked by normal recovery.
+            sock_inode = sentinel.stat().st_ino
+            for raw, diagnostic in [(source, b'source journal already consumed'),
+                                    (source + b'\n', b'journal does not follow prior recovery decision')]:
+                if raw != source:
+                    state.write_bytes(raw)  # distinct digest, not a later supervisor publication
+                p = subprocess.run([*lab.CLI, 'recover', 'selected'], capture_output=True, timeout=5)
+                assert p.returncode and diagnostic in p.stderr, (p.returncode, p.stderr)
+                assert state.read_bytes() == raw and os.readlink(lab.PREFIX / 'active') == active
+                assert decision.read_bytes() == receipt and decision.stat().st_ino == inode
+                assert sentinel.stat().st_ino == sock_inode and 'fwmark' not in lan.output('ip', '-4', 'rule')
+                blocked()
+            print('GATE_E_REPEAT_REFUSED', hashlib.sha256(source).hexdigest(), flush=True)
+        finally:
+            lan.cmd('umount', lab.PREFIX)
+
+
 def admit(choice):
     # Called before explicit recovery in the new boot, with guard and topology up.
     assert 'EXT4-fs (vda): recovery complete' in lan.output('dmesg')
@@ -91,6 +144,9 @@ def admit(choice):
         refused('recover', choice, diagnostic=b'compatibility pair changed')
     finally:
         path.write_bytes(registry)
+    if 'gate_e_recut=1' in Path('/proc/cmdline').read_text().split():
+        subprocess.run(['unshare', '--mount', '--propagation', 'private', sys.executable, '-B',
+                        __file__, 'interrupted-decision'], check=True, timeout=25)
     print('GATE_E_ADMIT', hashlib.sha256(raw).hexdigest(), 'replay guarded refusal', flush=True)
 
 
@@ -133,6 +189,8 @@ def run(point):
         with echo():
             serving(engine)
         print('GATE_E_RESTORED', point, lab.BOOT.read_text().strip(), engine, flush=True)
+        if 'gate_e_recut=1' in Path('/proc/cmdline').read_text().split():
+            witness('running')
         return
     with echo():
         serving('core')
@@ -179,6 +237,8 @@ if __name__ == '__main__':
         sys.exit('requires isolated acceptance guest')
     if sys.argv[1] == 'admit':
         admit(sys.argv[2])
+    elif sys.argv[1] == 'interrupted-decision':
+        interrupted_decision()
     elif sys.argv[1] == 'tripwire':
         tripwire()
     elif sys.argv[1] == 'traffic':

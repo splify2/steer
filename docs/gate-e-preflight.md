@@ -380,6 +380,23 @@ and requested target before selection. It records a decision, **not**
 readiness. The normal fresh daemon/socket, external WG and kernel policy checks
 still gate opening the LAN. `status` reports actual service startup.
 
+Publishing and fsyncing the decision **consumes the exact source journal**.
+A supervisor exit after that publication but before the next `service-state.json`
+is an interrupted recovery: retry is a refusal, not an idempotent start.
+Under the lock and guard, admission compares the live journal's byte hash with
+the existing decision's `source_record_sha256` **before** socket cleanup,
+decision replacement or pointer switch. Refusal keeps both records intact.
+
+A later service journal written after that decision carries
+`after_recovery_sha256`, the hash of the complete published decision bytes;
+a clean stop/restart carries this link forward. A subsequent independent
+recovery may replace the last decision only if the source differs, its link
+matches that decision exactly, and all the usual phase, boot and pair checks
+pass. An unlinked source with an existing decision (including older records),
+a missing linked decision, or unreadable/mismatched evidence is not sufficient.
+This is a last-decision contract for a trusted single writer, not a log of all
+historical decisions or authentication against a writer replacing both files.
+
 On the restored guest a usable main route and a calibrated upstream counter
 detect plaintext arrival. A continuous, heartbeat-checked UDP sender from the
 same client runs across transition/recovery, alongside the independent TCP
@@ -387,6 +404,13 @@ echo. The baseline counter must not increase. The tests also require refusal
 of plain `serve`, the wrong disposition and a changed registry with the guard,
 pointer and prior journal intact. The final disk records tie the served
 generation back to the externally observed cut.
+
+The running-cut case also exits **only the supervisor** immediately after
+the real decision fsync on a disk-backed copy of the prefix inside the guest.
+It verifies the retry leaves the decision bytes/inode, stale control socket,
+source journal, active pointer and LAN guard intact. On the original prefix
+the test then recovers, checks WG echo, kills QEMU again, and recovers the
+same generation from its genuinely new, decision-linked `running` journal.
 
 **Model boundary.** QEMU uses a raw virtio disk with `cache=none` (direct I/O,
 guest flushes honored). Killing the emulator loses guest RAM, guest page cache
