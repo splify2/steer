@@ -4,20 +4,22 @@
 # direct выше канала туннеля, метка соединения (steer conns), fake-IP (dnat по карте после
 # разметки на ingress), сужение по порту с фрагментами, balance — раздача по членам и память
 # соединения, выгрузка потоков flowtable; откаты — чужая перезапись метки между ingress и нами,
-# устройство моста пересоздано (хук ingress снят ядром; apply и reload демона ставят его на новое),
+# устройство моста пересоздано (привязка hook снята ядром; apply и reload ставят её на новое),
 # устройство раздачи, которого нет, STEER_NFT_INGRESS=0.
 #
 # Сеть — пять пространств: роутер (сам стенд, мост br-lan с портом p0), клиент C за портом (c0),
 # «туннели» T (t0) и U (u0) — устройства выходов kind=interface, и «провайдер» W (w0, маршрут по
 # умолчанию). Адрес за туннелем есть ТОЛЬКО у туннеля, адрес вне списков — только у провайдера:
 # ответ и есть доказательство пути, а утечка напрямую ответила бы там, где ответа быть не должно.
-# NAT нет: у T, U и W есть маршрут назад в сеть клиента.
+# У T, U и W есть маршрут назад в сеть клиента; для TCP-свидетельства
+# учитывается исходящий адрес после masquerade выхода t0.
 #
 # INGRESSNS_BENCH=1 — ещё и грубый замер (iperf3, UDP 64 байта и TCP): разметка на ingress,
 # та же спека только в prerouting (STEER_NFT_INGRESS=0) и без движка вовсе. Числа печатаются, не
 # проверяются: в make test замер не входит.
 #
-# Нужны root, unshare, nsenter, ip, nft, ping и python3; ядро без inet ingress — стенд
+# Нужны root, unshare, nsenter, ip, nft, ping, python3 и conntrack: последний
+# обязателен для подтверждения OFFLOAD в CI. Ядро без inet ingress — стенд
 # пропускается вслух, с кодом 0.
 set -u
 BIN="${STEER:-./build/steer}"
@@ -25,6 +27,7 @@ BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 [ -x "$BIN" ] || { echo "not built: $BIN (make)"; exit 2; }
 skip() { echo "ingressns: $1 — пропускаю"; exit 0; }
 for t in ip nft unshare nsenter ping python3; do command -v $t >/dev/null 2>&1 || skip "нет $t"; done
+command -v conntrack >/dev/null 2>&1 || { echo "ingressns: нужен conntrack для проверки OFFLOAD" >&2; exit 2; }
 if [ "${INGRESSNS_INNER:-}" != 1 ]; then
     [ "$(id -u)" = 0 ] || skip "нужен root"
     unshare -nm true 2>/dev/null || skip "unshare -nm недоступен"
@@ -183,14 +186,14 @@ elif mode == "sink":
     s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", 9100)); s.listen(8)
     while True:
-        c, _ = s.accept()
+        c, peer = s.accept()
         n = 0
         while True:
             d = c.recv(65536)
             if not d: break
             n += len(d)
         with open(sys.argv[3], "a") as f:
-            f.write("%d\n" % n)
+            f.write("%s %d %d\n" % (peer[0], peer[1], n))
         c.close()
 PY
 $IT python3 "$tmp/who.py" T http >/dev/null 2>&1 & pids="$pids $!"
@@ -242,6 +245,19 @@ elif mode == "sink":
     b = b"z" * 65536
     for i in range(int(sys.argv[3])):
         s.sendall(b)
+    if len(sys.argv) > 4:
+        import os
+        source, sport = s.getsockname()
+        with open(sys.argv[4] + ".tmp", "w") as f:
+            f.write("%s %d\n" % (source, sport))
+        os.replace(sys.argv[4] + ".tmp", sys.argv[4])
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if open(sys.argv[5]).read().strip() == "go": break
+            except OSError:
+                pass
+            time.sleep(0.05)
     s.close()
 PY
 
@@ -289,9 +305,51 @@ cnt() {   # cnt ЦЕПОЧКА ИМЯ_ПРАВИЛА — пакеты прави
         sed -n 's/.*counter packets \([0-9]*\).*/\1/p' | awk '{ s += $1 } END { print s + 0 }'
 }
 gt0() { [ "$1" -gt 0 ] 2>/dev/null && echo yes || echo "no:$1"; }
-# Правила a и f ведут в один выход без сужения — это одна группа «про сервис» (адреса и домены в
-# одном наборе), её имя — у таблицы резолвера.
-GA="$("$BIN" dnsd-table $S 2>/dev/null | awk -F'|' '$5 == "f" { print $1 }')"
+# Между a и f есть правила других действий: при сохранении порядка это
+# разные группы. Имя доменной группы сообщает таблица резолвера, адресной —
+# explain; затем независимо сверяем содержимое набора и правило ядра.
+GF="$("$BIN" dnsd-table $S 2>/dev/null | awk -F'|' '$5 == "f" { print $1 }')"
+GA="$("$BIN" explain 203.0.113.9 $S 2>/dev/null |
+    sed -n 's/^203\.0\.113\.9 -> address set "\([^"]*\)" -> output "wg".*/\1/p')"
+check "подсеть и домен — разные группы согласно порядку правил" "yes" \
+    "$([ -n "$GA" ] && [ -n "$GF" ] && [ "$GA" != "$GF" ] && echo yes || echo no)"
+check "подсеть действительно в адресном, а не доменном наборе" "yes" \
+    "$(nft get element inet steer "$GA" '{ 203.0.113.9 }' >/dev/null 2>&1 &&
+       ! nft get element inet steer "$GF" '{ 203.0.113.9 }' >/dev/null 2>&1 && echo yes || echo no)"
+cat > "$tmp/rule-stat.py" <<'PY'
+import json, sys
+chain, group, mark = sys.argv[1:]
+data = json.load(sys.stdin)
+hits = []
+for entry in data["nftables"]:
+    rule = entry.get("rule", {})
+    if rule.get("chain") != chain or rule.get("comment") != "steer:" + group:
+        continue
+    expr = rule.get("expr", [])
+    matches = [e["match"] for e in expr if "match" in e]
+    dest = any(m.get("left") == {"payload": {"protocol": "ip", "field": "daddr"}}
+               and m.get("right") == "@" + group for m in matches)
+    interface = any(m.get("left") == {"meta": {"key": "iifname"}} and m.get("right") == "br-lan" for m in matches)
+    marks = False
+    for e in expr:
+        m = e.get("mangle", {})
+        value = m.get("value", {})
+        if m.get("key") == {"meta": {"key": "mark"}} and isinstance(value, dict):
+            args = value.get("|", [])
+            marks = any(isinstance(x, int) and x & 0x0ff00000 == int(mark, 16) for x in args)
+    counters = [e["counter"]["packets"] for e in expr if "counter" in e]
+    if dest and interface and marks and len(counters) == 1:
+        hits.append((rule["handle"], counters[0]))
+if len(hits) != 1:
+    sys.exit(1)
+print(*hits[0])
+PY
+wgmark="$(awk '$1 == "wg" { print $2 }' "$tmp/st/registry")"
+rule_stat() { nft -j -a list chain inet steer "$1" 2>/dev/null | python3 "$tmp/rule-stat.py" "$1" "$2" "$wgmark"; }
+cnt4() { rule_stat "$1" "$2" | awk '{print $2}'; }
+check "адресная группа: уникальный IPv4 handle, набор и запись mark в nft JSON" "yes" \
+    "$(rule_stat ingress_mark "$GA" >/dev/null && rule_stat prerouting_mark "$GA" >/dev/null && echo yes || echo no)"
+echo "ingressns: nft JSON адресная группа=$GA ingress handle/packets=$(rule_stat ingress_mark "$GA"); доменная=$GF"
 
 # IPv4 и IPv6 канала a — в туннель; прочее — напрямую; утечки нет.
 check "IPv4 из списка — в туннель (ответил туннель)" "ok" "$(ping4 203.0.113.9)"
@@ -308,6 +366,7 @@ check "клиент по MAC (за портом моста) — в туннел�
 GM="$(nft list chain inet steer ingress_mark | sed -n 's/.*ether saddr.* comment "steer:\([^"]*\)".*/\1/p' | head -n 1)"
 check "  правило по ether saddr на ingress_mark узнало клиента" "yes" "$(gt0 "$(cnt ingress_mark "$GM")")"
 check "счётчики канала a — в ingress_mark" "yes" "$(gt0 "$(cnt ingress_mark "$GA")")"
+check "  IPv4 handle в nft JSON действительно считал трафик подсети" "yes" "$(gt0 "$(cnt4 ingress_mark "$GA")")"
 check "  запасные правила prerouting пакетов не видели" "0" "$(cnt prerouting_mark "$GA")"
 check "  счётчик direct — в ingress_mark" "yes" "$(gt0 "$(cnt ingress_mark dir_ip)")"
 # Метка соединения ставит prerouting по готовой метке пакета (ingress_ct): `steer conns` видит
@@ -325,7 +384,7 @@ check "status: пакеты канала — из ingress_mark" "$(cnt ingress_m
 
 # fake-IP: поддельный адрес в наборе канала и в карте — разметка на ingress по поддельному
 # адресу, dnat на prerouting по карте, маршрут — туннель (192.0.2.50 есть только там).
-set_f="$GA"
+set_f="$GF"
 nft add element inet steer "$set_f" '{ 198.18.0.5 }'
 nft add element inet steer fakeip '{ 198.18.0.5 : 192.0.2.50 }'
 check "fake-IP: клиент по поддельному адресу доходит до цели за туннелем" "ok" "$(ping4 198.18.0.5)"
@@ -371,9 +430,35 @@ check "  новые соединения — по новой карте" "$([ "$
 # ---- выгрузка потоков: flowtable на ingress с приоритетом filter — раньше нас ----
 # Сначала тот же поток без выгрузки: разметка видит каждый его пакет (на veth — сотни: GRO
 # склеивает сегменты в пакеты до 64 КБ). С выгрузкой — единицы: пакеты до установления потока.
+receipt() { # receipt ФАЙЛ_TUPLE ЧИСЛО_БАЙТ — ровно одна запись для этого клиента
+    src="" sport=""
+    [ ! -s "$1" ] || read -r src sport < "$1"
+    [ "$src" = 192.168.1.2 ] && [ -n "$sport" ] || { echo 0; return; }
+    # У приёмника адрес источника после NAT выхода t0; порт этого потока
+    # сверяется также с оригинальным tuple conntrack выше.
+    awk -v src="10.9.0.1" -v port="$sport" -v bytes="$2" \
+        '$1 == src && $2 == port { total++; if ($3 == bytes && NF == 3) good++ }
+         END { print (total == 1 && good == 1) ? 1 : 0 }' "$tmp/sink.T" 2>/dev/null || echo 0
+}
 b0=$(cnt ingress_mark "$GA")
-$IC python3 "$tmp/cli.py" sink 203.0.113.9 160
+$IC python3 "$tmp/cli.py" sink 203.0.113.9 160 "$tmp/noflow-sent" "$tmp/noflow-go" &
+NOFLOW=$!
+wait_for '[ -s "$tmp/noflow-sent" ]' 10
+noport="$(awk 'NR==1 { print $2 }' "$tmp/noflow-sent" 2>/dev/null)"
+check "flowtable: контрольное соединение без выгрузки установлено" "yes" \
+    "$([ -n "$noport" ] && conntrack -L -p tcp 2>/dev/null | grep 'src=192.168.1.2 dst=203.0.113.9' | grep "sport=$noport dport=9100" | grep -q 'ESTABLISHED' && echo yes || echo no)"
+check "  контрольное соединение не помечено OFFLOAD" "no" \
+    "$(conntrack -L -p tcp 2>/dev/null | grep 'src=192.168.1.2 dst=203.0.113.9' | grep "sport=$noport dport=9100" | grep -q '\[OFFLOAD\]' && echo yes || echo no)"
+echo go > "$tmp/noflow-go"
+if wait "$NOFLOW"; then noflow_rc=0; else noflow_rc=$?; fi
+check "  клиент контрольного потока завершился успешно" "0" "$noflow_rc"
+wait_for '[ "$(receipt "$tmp/noflow-sent" 10485760)" = 1 ]' 5
 seen_nf=$(( $(cnt ingress_mark "$GA") - b0 ))
+check "flowtable: отдельная квитанция контрольного соединения — ровно 10 МБ" "1" \
+    "$(receipt "$tmp/noflow-sent" 10485760)"
+printf 'ingressns: контроль tuple=%s; квитанция=%s\n' \
+    "$(cat "$tmp/noflow-sent" 2>/dev/null)" "$(awk -v p="$noport" '$2 == p {print}' "$tmp/sink.T" 2>/dev/null)"
+check "  контроль без выгрузки действительно разметил пакеты" "yes" "$(gt0 "$seen_nf")"
 nft -f - <<'EOF'
 table inet ftab {
     flowtable ft {
@@ -388,16 +473,30 @@ table inet ftab {
 EOF
 if nft list flowtable inet ftab ft >/dev/null 2>&1; then
     b0=$(cnt ingress_mark "$GA")
-    $IC python3 "$tmp/cli.py" sink 203.0.113.9 160
-    sleep 0.5
-    got="$(tail -n 1 "$tmp/sink.T" 2>/dev/null)"
-    check "flowtable: поток в туннель дошёл целиком (10 МБ)" "10485760" "$got"
+    $IC python3 "$tmp/cli.py" sink 203.0.113.9 160 "$tmp/flow-sent" "$tmp/flow-go" &
+    FLOW=$!
+    wait_for '[ -s "$tmp/flow-sent" ]' 10
+    flowport="$(awk 'NR==1 { print $2 }' "$tmp/flow-sent" 2>/dev/null)"
+    check "  второе соединение имеет отдельный исходный порт" "yes" \
+        "$([ -n "$noport" ] && [ -n "$flowport" ] && [ "$noport" != "$flowport" ] && echo yes || echo no)"
+    wait_for 'conntrack -L -p tcp 2>/dev/null | grep "src=192.168.1.2 dst=203.0.113.9" | grep "sport=$flowport dport=9100" | grep -q "\\[OFFLOAD\\]"' 5
+    check "  активное соединение помечено kernel conntrack OFFLOAD" "yes" \
+        "$([ -n "$flowport" ] && conntrack -L -p tcp 2>/dev/null | grep 'src=192.168.1.2 dst=203.0.113.9' | grep "sport=$flowport dport=9100" | grep -q '\[OFFLOAD\]' && echo yes || echo no)"
+    echo go > "$tmp/flow-go"
+    if wait "$FLOW"; then flow_rc=0; else flow_rc=$?; fi
+    check "  клиент выгруженного потока завершился успешно" "0" "$flow_rc"
+    wait_for '[ "$(receipt "$tmp/flow-sent" 10485760)" = 1 ]' 5
+    check "flowtable: отдельная квитанция выгруженного соединения — ровно 10 МБ" "1" \
+        "$(receipt "$tmp/flow-sent" 10485760)"
+    printf 'ingressns: offload tuple=%s; квитанция=%s\n' \
+        "$(cat "$tmp/flow-sent" 2>/dev/null)" "$(awk -v p="$flowport" '$2 == p {print}' "$tmp/sink.T" 2>/dev/null)"
     seen=$(( $(cnt ingress_mark "$GA") - b0 ))
     check "  выгруженные пакеты мимо ingress_mark (разметка увидела $seen пакетов, без выгрузки — $seen_nf)" \
         "yes" "$([ $((seen * 10)) -lt "$seen_nf" ] && echo yes || echo no)"
     nft delete table inet ftab
 else
     echo "ingressns: flowtable не встал — проверка выгрузки пропущена"
+    nft delete table inet ftab 2>/dev/null || true
 fi
 
 # ---- откат: чужая перезапись метки между ingress и нами ----
@@ -418,12 +517,25 @@ check "  разобран заново запасными правилами pre
 check "  адрес вне списков — по-прежнему напрямую" "ok" "$(ping4 198.51.100.9)"
 nft delete table inet stomp
 
-# ---- откат: мост пересоздан — ядро сняло цепочку ingress, разметку ведёт prerouting ----
+# ---- откат: мост пересоздан — старая привязка hook больше не действует ----
+attached() { nft list chain inet steer ingress_mark 2>/dev/null | grep -q 'hook ingress device "br-lan"'; }
+old_ifindex="$(cat /sys/class/net/br-lan/ifindex)"
 ip link del br-lan
-check "мост удалён: цепочки ingress_mark в ядре нет (одно устройство — снята целиком)" "1" \
-    "$(nft list chain inet steer ingress_mark >/dev/null 2>&1; echo $?)"
+check "мост удалён: активной привязки ingress к нему нет" "no" \
+    "$(attached && echo yes || echo no)"
+if nft -j -a list chain inet steer ingress_mark > "$tmp/chain-after-delete.json" 2>/dev/null; then
+    echo "ingressns: ядро $(uname -r): объект ingress_mark сохранён без привязки"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("ingressns: nft JSON chain",next(x["chain"] for x in d["nftables"] if "chain" in x))' "$tmp/chain-after-delete.json"
+else
+    echo "ingressns: ядро $(uname -r): объект ingress_mark удалён вместе с привязкой"
+fi
 mkbridge
 sleep 0.5
+new_ifindex="$(cat /sys/class/net/br-lan/ifindex)"
+echo "ingressns: ifindex моста до=$old_ifindex после=$new_ifindex"
+check "  новый мост имеет другой ifindex" "yes" "$([ "$old_ifindex" != "$new_ifindex" ] && echo yes || echo no)"
+check "  имя нового моста само по себе не восстановило hook" "no" "$(attached && echo yes || echo no)"
+ig0="$(cnt ingress_mark "$GA")"
 p0=$(cnt prerouting_mark "$GA")
 check "  мост создан заново: трафик канала в туннель (запасные правила prerouting)" "ok" \
     "$(ping4 203.0.113.9)"
@@ -431,11 +543,16 @@ check "  мост создан заново: трафик канала в тун
 wait_for '[ "$(ping6c 2001:db8:1::1)" = ok ]' 5
 check "  и IPv6 тоже" "ok" "$(ping6c 2001:db8:1::1)"
 check "  разметка — в prerouting_mark" "yes" "$(gt0 $(( $(cnt prerouting_mark "$GA") - p0 )))"
+check "  прежний ingress hook не считал пакеты нового ifindex" "0" "$(( $(cnt ingress_mark "$GA") - ig0 ))"
 check "  утечки нет" "нет" "$(ping4 203.0.113.88)"
 "$BIN" apply $S >/dev/null 2>&1
 check "  apply ставит ingress_mark на новый мост" "1" \
     "$(nft list chain inet steer ingress_mark 2>/dev/null | grep -c 'device "br-lan"')"
-check "  трафик снова размечается на ingress" "ok" "$(ping4 203.0.113.9)"
+ig0="$(cnt ingress_mark "$GA")"
+p0="$(cnt prerouting_mark "$GA")"
+check "  трафик снова проходит в туннель" "ok" "$(ping4 203.0.113.9)"
+check "  новый ingress hook действительно считал пакет" "yes" "$(gt0 $(( $(cnt ingress_mark "$GA") - ig0 )))"
+check "  запасной prerouting не считал пакет после привязки" "0" "$(( $(cnt prerouting_mark "$GA") - p0 ))"
 
 # ---- демон: reload после пересоздания моста — apply-сверка видит, что набор в ядре разошёлся с
 # применённым (отпечаток таблицы, хук входит в него целиком), и ставит его заново ----
@@ -443,15 +560,25 @@ check "  трафик снова размечается на ingress" "ok" "$(pi
 D=$!
 pids="$pids $D"
 wait_for 'grep -q "спека применена при старте" "$tmp/d.err"' 10
+old_ifindex="$(cat /sys/class/net/br-lan/ifindex)"
 ip link del br-lan
 mkbridge
 sleep 0.3
-check "демон: мост пересоздан — ingress_mark снята ядром" "1" \
-    "$(nft list chain inet steer ingress_mark >/dev/null 2>&1; echo $?)"
+check "демон: новый ifindex и отсутствие действующей привязки" "yes" \
+    "$([ "$old_ifindex" != "$(cat /sys/class/net/br-lan/ifindex)" ] && ! attached && echo yes || echo no)"
+p0="$(cnt prerouting_mark "$GA")"
+ig0="$(cnt ingress_mark "$GA")"
+check "  до reload пакет проходит в туннель через запасной путь" "ok" "$(ping4 203.0.113.9)"
+check "  до reload растёт prerouting, а не старый ingress" "yes" \
+    "$([ $(( $(cnt prerouting_mark "$GA") - p0 )) -gt 0 ] &&
+       [ $(( $(cnt ingress_mark "$GA") - ig0 )) -eq 0 ] && echo yes || echo no)"
 "$BIN" ctl --socket "$tmp/s.sock" reload >"$tmp/reload.out" 2>&1
 check "  reload ставит набор заново — ingress_mark на новом мосту" "1" \
     "$(nft list chain inet steer ingress_mark 2>/dev/null | grep -c 'device "br-lan"')"
+ig0="$(cnt ingress_mark "$GA")"
 check "  трафик канала в туннель" "ok" "$(ping4 203.0.113.9)"
+check "  после reload пакет действительно считан новым ingress" "yes" \
+    "$(gt0 $(( $(cnt ingress_mark "$GA") - ig0 )))"
 kill "$D" 2>/dev/null
 wait "$D" 2>/dev/null
 
