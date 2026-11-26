@@ -191,7 +191,6 @@ def main(binary,mode,shim=None,normal=None):
                 else:
                     assert status['runtimeGeneration']==2
                     assert control(control_path,'APPLY',candidate,2)[0]==422
-                    assert control(control_path,'APPLY',base,2)[0]==422
                 roundtrip(pinned,b'after')
                 with socks_flow(port,target) as fresh:roundtrip(fresh,b'new')
                 cmd('ip','link','show','dev','witness0');cmd('nft','list','table','inet','witness_table')

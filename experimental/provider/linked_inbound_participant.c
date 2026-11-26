@@ -34,7 +34,7 @@ int steer_linked_inbound_prepare(struct steer_linked_inbound *p,const struct ste
 }
 int steer_linked_inbound_live_commit(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
     const struct steer_draft_wg_revision *chosen){
-    if(!p||!p->staged||p->closed_stage)return EINVAL;
+    if(!p||!p->staged||p->closed_stage||p->removal_stage)return EINVAL;
     p->staged=0;
     p->fenced=1;
     if(!chosen||result.phase!=STEER_PROTOTYPE_STORE_SYNCED||result.error.code||
@@ -46,7 +46,7 @@ int steer_linked_inbound_live_commit(struct steer_linked_inbound *p,struct steer
 }
 int steer_linked_inbound_finish(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
     steer_draft_wg_verify_ready verify,uint64_t deadline){
-    if(!p||!p->staged||p->closed_stage)return EINVAL;
+    if(!p||!p->staged||p->closed_stage||p->removal_stage)return EINVAL;
     p->staged=0;
     if(result.phase==STEER_PROTOTYPE_STORE_SYNCED&&!result.error.code){
         /* Owner must supply the new committed selection through recovery before
@@ -140,4 +140,39 @@ int steer_linked_inbound_finish_closed(struct steer_linked_inbound *p,struct ste
 int steer_linked_inbound_finish_closed_shutdown(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
     const struct steer_draft_wg_revision *chosen,steer_draft_wg_verify_ready verify,uint64_t deadline){
     return finish_closed(p,result,chosen,verify,deadline,1);
+}
+int steer_linked_inbound_prepare_removal(struct steer_linked_inbound *p,
+    const struct steer_draft_wg_revision *chosen,uint64_t deadline){
+    if(!p||!chosen||!p->recovered||p->fenced||p->staged||!p->barrier_close||
+       !p->committed.generation||p->committed.without_wg||!chosen->without_wg||
+       chosen->generation<=p->committed.generation||!p->candidate.guard.handle)return EINVAL;
+    p->fenced=1;p->barrier_state=STEER_INBOUND_BARRIER_UNKNOWN;
+    int rc=p->barrier_close(p->context,&p->candidate.guard,deadline,&p->barrier_state);
+    if(rc)return rc;
+    if(p->barrier_state!=STEER_INBOUND_BARRIER_CLOSED)return EIO;
+    p->pending=*chosen;p->removal_stage=1;p->staged=1;
+    return 0;
+}
+int steer_linked_inbound_finish_removal(struct steer_linked_inbound *p,
+    struct steer_prototype_store_result result,const struct steer_draft_wg_revision *chosen,uint64_t deadline,int shutdown){
+    if(!p||!p->staged||!p->removal_stage)return EINVAL;
+    p->staged=0;p->removal_stage=0;p->fenced=1;
+    if(result.phase==STEER_PROTOTYPE_STORE_NOT_RENAMED)return EIO;
+    if(result.phase!=STEER_PROTOTYPE_STORE_SYNCED||result.error.code||result.error.transient||
+       !chosen||!chosen->without_wg||chosen->generation!=p->pending.generation||
+       memcmp(chosen->digest,p->pending.digest,32)){
+        p->durable_unknown=1;return EIO;
+    }
+    p->committed=*chosen;p->durable_unknown=0;
+    p->barrier_state=STEER_INBOUND_BARRIER_UNKNOWN;
+    int rc=p->barrier_close(p->context,&p->candidate.guard,deadline,&p->barrier_state);
+    if(rc)return rc;
+    if(p->barrier_state!=STEER_INBOUND_BARRIER_CLOSED)return EIO;
+    rc=steer_draft_wg_selection_retire_inbound_exact(p->journal,p->backend,p->context,
+        chosen,&p->candidate.guard,deadline);
+    if(rc){p->barrier_state=STEER_INBOUND_BARRIER_UNKNOWN;return rc;}
+    p->barrier_state=STEER_INBOUND_BARRIER_ABSENT;
+    if(shutdown)return ECANCELED;
+    p->fenced=0;
+    return 0;
 }

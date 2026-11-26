@@ -50,6 +50,7 @@ struct steer_draft_wg_ready {
 #define STEER_INBOUND_BARRIER_UNKNOWN 0u
 #define STEER_INBOUND_BARRIER_CLOSED 1u
 #define STEER_INBOUND_BARRIER_OPEN 2u
+#define STEER_INBOUND_BARRIER_ABSENT 3u
 
 /* Positive errno. On failure ready stays unchanged and cleanup_error reports
  * whether candidate cleanup is still needed. The previous generation is never
@@ -121,6 +122,13 @@ int steer_draft_wg_selection_publish_closed(struct steer_draft_wg_selection *,co
  * The durable selected revision is rechecked; it cannot be retired here. */
 int steer_draft_wg_selection_retire(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
     void *,const struct steer_draft_wg_revision *,uint64_t generation,uint64_t deadline);
+/* No-WG selection only. Require the exact published physical guard record;
+ * a missing/mismatched record is an error, not successful retirement. */
+int steer_draft_wg_selection_retire_inbound_exact(struct steer_draft_wg_selection *,
+    const struct steer_draft_wg_backend *,void *,const struct steer_draft_wg_revision *,
+    const struct steer_draft_wg_guard_record *,uint64_t);
+int steer_draft_wg_selection_inbound_had_published(struct steer_draft_wg_selection *,
+    const struct steer_draft_wg_revision *,uint64_t,int *);
 /* No kernel effects. Record a new full revision digest against the exact
  * currently selected physical PUBLISHED outcome (never another alias).
  * Caller must attest unchanged WG intent and live keys before this call. */

@@ -23,7 +23,7 @@ struct steer_linked_inbound {
     struct steer_draft_kernel_wg_guard *closed_guard;
     steer_inbound_barrier_fn barrier_close,barrier_open;
     uint32_t barrier_state,publication_state;
-    int staged, fenced, recovered, closed_stage, durable_unknown;
+    int staged, fenced, recovered, closed_stage, durable_unknown, removal_stage;
 };
 int steer_linked_inbound_recover(struct steer_linked_inbound *,const struct steer_draft_wg_revision *,
     steer_draft_wg_verify_ready,uint64_t,uint64_t *,struct steer_draft_wg_guard_record *);
@@ -48,6 +48,14 @@ int steer_linked_inbound_finish_closed(struct steer_linked_inbound *,struct stee
  * the same rollback/uncertainty rules as finish_closed. Not Apply success. */
 int steer_linked_inbound_finish_closed_shutdown(struct steer_linked_inbound *,struct steer_prototype_store_result,
     const struct steer_draft_wg_revision *,steer_draft_wg_verify_ready,uint64_t);
+/* Close the selected owned device before the owner queues the exact no-WG
+ * document. Never reopen on failure; the owner must expose the fence. After
+ * SYNCED, record the new selection before rechecking closure and retiring the
+ * exact journaled resource. Cleanup ambiguity sets barrier UNKNOWN. */
+int steer_linked_inbound_prepare_removal(struct steer_linked_inbound *,
+    const struct steer_draft_wg_revision *,uint64_t);
+int steer_linked_inbound_finish_removal(struct steer_linked_inbound *,
+    struct steer_prototype_store_result,const struct steer_draft_wg_revision *,uint64_t,int);
 /* SYNCED requires later recovery of the external selection; RENAMED fences
  * without cleanup; NOT_RENAMED reconciles the previous external selection.
  * Never rewrites store. */

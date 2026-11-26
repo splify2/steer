@@ -177,7 +177,7 @@ struct host {
     struct steer_prototype_linked_wg *linked_wg;
     uint64_t wg_next;
     int wg_fenced,wg_retire_error;
-    int inbound_runtime,inbound_shutdown_error;
+    int inbound_runtime,inbound_shutdown_error,inbound_removed;
     struct steer_draft_wg_linux_guard inbound_guard;
     struct steer_linked_inbound inbound;
 #ifdef STEER_PROTOTYPE_INBOUND_FAULT
@@ -1335,10 +1335,20 @@ static int inbound_prepare_slot(struct host *h,struct prepared *prepared,const s
 }
 static int inbound_finish_slot(struct host *h,struct prepared *prepared,struct steer_prototype_store_result result){
     if(!prepared->inbound_slot)return 0;
+    int removal=prepared->inbound_slot==2;
     prepared->inbound_slot=0;
+    if(removal){
+        int rc=steer_linked_inbound_finish_removal(&h->inbound,result,&prepared->inbound_choice,
+            inbound_deadline(),h->stopping);
+        if(h->inbound.barrier_state==STEER_INBOUND_BARRIER_ABSENT)h->inbound_removed=1;
+        return rc;
+    }
     return h->stopping?
         steer_linked_inbound_finish_closed_shutdown(&h->inbound,result,&prepared->inbound_choice,inbound_verify_none,inbound_deadline()):
         steer_linked_inbound_finish_closed(&h->inbound,result,&prepared->inbound_choice,inbound_verify_none,inbound_deadline());
+}
+static struct steer_pv1_error inbound_no_rules(void *ctx,const struct steer_policy_rule *rule){
+    (void)ctx;(void)rule;return (struct steer_pv1_error){STEER_PV1_UNSUPPORTED,0};
 }
 #endif
 static int prepare_configuration(struct host *h, const char *document, size_t length,
@@ -1378,16 +1388,24 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
      * runtime opt-in admits only the first SOCKS-to-SOCKS+DEVICE transition. */
     if(config->wg_inbound_validate&&((!validate&&!h->inbound_runtime)||
        steer_linked_wg_keys(config->wg_inbound_validate,&wg_keys)))goto cleanup;
-    if(!validate&&h->inbound_runtime&&
-       (!h->current||h->current->config->wg_inbound_validate||!config->wg_inbound_validate)) {
-        if(h->current){result=422;goto cleanup;}
+    if(!validate&&h->inbound_runtime&&!h->current){
         if(config->wg_inbound_validate&&!initial_format)goto cleanup;
         if(config->wg_inbound_validate&&(length!=config->document_length||
             memcmp(document,config->document_json,length)))goto cleanup;
     }
-    if(!validate&&h->inbound_runtime&&h->current&&config->wg_inbound_validate&&
+    if(!validate&&h->inbound_runtime&&h->current){
+        int old_wg=h->current->config->wg_inbound_validate!=NULL;
+        int new_wg=config->wg_inbound_validate!=NULL;
+        uint32_t fallback=0;
+        if(old_wg==new_wg||(!old_wg&&h->inbound_removed)||config->format!=STEER_STORE_FORMAT_SPEC_V3||
+           config->stream_outbound_count||
+           steer_policy_visit(config->policy,config->generation,inbound_no_rules,NULL,&fallback).code||
+           fallback!=STEER_POLICY_DIRECT)goto cleanup;
+    }
+    if(!validate&&h->inbound_runtime&&h->current&&
        (h->current->config->format!=STEER_STORE_FORMAT_SPEC_V3||
         h->current->config->listener_count!=1||config->listener_count!=1||
+        !config->listeners[0].enabled||
         !h->current->config->listeners[0].enabled||
         !same_listener(&h->current->config->listeners[0],&config->listeners[0])))goto cleanup;
     if(!validate&&h->linked_wg&&!wg_generation_ready(h->current)){result=503;goto cleanup;}
@@ -1540,6 +1558,13 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
             h->split_fenced=1;prepared_state->generation=NULL;result=503;goto cleanup;
         }
     }
+    if(h->inbound_runtime&&h->current&&h->current->config->wg_inbound_validate&&!g->config->wg_inbound_validate){
+        prepared_state->inbound_choice=inbound_revision(g->config);
+        if(steer_linked_inbound_prepare_removal(&h->inbound,&prepared_state->inbound_choice,inbound_deadline())){
+            h->split_fenced=1;prepared_state->generation=NULL;result=503;goto cleanup;
+        }
+        prepared_state->inbound_slot=2;
+    }
 #endif
     g = NULL; result = 200;
 cleanup:
@@ -1617,6 +1642,7 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
     int ready=1;
 #ifdef STEER_PROTOTYPE_WG_NETNS
     ready=!h->wg_fenced&&wg_generation_ready(h->current);
+    if(h->inbound_runtime&&h->inbound.removal_stage)ready=0;
 #endif
     if(h->experimental_durable_split&&h->split_fenced)ready=0;
 #ifdef STEER_PROTOTYPE_HY2
@@ -1656,7 +1682,8 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 #ifdef STEER_PROTOTYPE_WG_NETNS
         if(h->inbound_runtime){
             const char *barrier=h->inbound.barrier_state==STEER_INBOUND_BARRIER_CLOSED?"closed":
-                h->inbound.barrier_state==STEER_INBOUND_BARRIER_OPEN?"open":"unknown";
+                h->inbound.barrier_state==STEER_INBOUND_BARRIER_OPEN?"open":
+                h->inbound.barrier_state==STEER_INBOUND_BARRIER_ABSENT?"absent":"unknown";
             n=snprintf(out+used,capacity-used,",\"inboundBarrier\":\"%s\"",barrier);
             if(n<0||(size_t)n>=capacity-used)return 0;
             used+=(size_t)n;
@@ -1803,8 +1830,10 @@ static void writer_ready(struct loop *l, int fd, uint32_t events, void *arg)
 #endif
 #ifdef STEER_PROTOTYPE_WG_NETNS
     if(prepared->inbound_slot){
+        int removal=prepared->inbound_slot==2;
         int rc=inbound_finish_slot(h,prepared,result);
-        if(h->stopping&&((result.phase==STEER_PROTOTYPE_STORE_SYNCED&&rc!=ECANCELED)||
+        if(h->stopping&&((result.phase==STEER_PROTOTYPE_STORE_SYNCED&&
+                         (rc!=ECANCELED||(removal&&h->inbound.barrier_state!=STEER_INBOUND_BARRIER_ABSENT)))||
                          h->inbound.durable_unknown))h->inbound_shutdown_error=1;
         if(rc){
             published=0;
@@ -2265,6 +2294,8 @@ int steer_prototype_main(int argc, char **argv)
         uint64_t next;struct steer_draft_wg_guard_record record;
         if(!config->wg_inbound_validate){
             if(steer_linked_inbound_recover(&h.inbound,&revision,inbound_verify_none,inbound_deadline(),&next,&record))goto cleanup;
+            if(steer_draft_wg_selection_inbound_had_published(h.inbound.journal,&revision,
+                inbound_deadline(),&h.inbound_removed))goto cleanup;
         }else{
             struct awg_secrets keys={0};
             struct steer_draft_kernel_wg_guard_config guard=config->wg_inbound_validate->cfg.guard;

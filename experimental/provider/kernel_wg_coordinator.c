@@ -544,3 +544,38 @@ int steer_draft_wg_selection_retire(struct steer_draft_wg_selection *s,const str
     free(i.e);
     return rc;
 }
+int steer_draft_wg_selection_retire_inbound_exact(struct steer_draft_wg_selection *s,
+    const struct steer_draft_wg_backend *b,void *ctx,const struct steer_draft_wg_revision *r,
+    const struct steer_draft_wg_guard_record *expected,uint64_t d){
+    if(!steer_draft_wg_selection_is_inbound(s)||!cleanup_backend(b)||!revision_valid(r)||
+       !r->without_wg||!expected||!expected->link.generation||
+       expected->link.generation>=r->generation)return EINVAL;
+    int rc=running(d,NULL);
+    if(rc)return rc;
+    struct inventory i;
+    rc=inventory_read(s,&i,r);
+    int found=0;
+    for(unsigned n=0;!rc&&n<i.n;n++)if(i.e[n].tx.generation==expected->link.generation){
+        uint8_t a[STEER_DRAFT_WG_GUARD_RECORD_BYTES],brec[STEER_DRAFT_WG_GUARD_RECORD_BYTES];
+        found=1;
+        if(n==i.active||!i.e[n].r[PUBLISHED].length||
+           steer_draft_wg_guard_record_encode(&i.e[n].guard,a)||
+           steer_draft_wg_guard_record_encode(expected,brec)||memcmp(a,brec,sizeof a))rc=ESTALE;
+        else rc=clean_entry(s,b,ctx,&i.e[n],d);
+        break;
+    }
+    if(!rc&&!found)rc=ENOENT;
+    free(i.e);
+    return rc;
+}
+int steer_draft_wg_selection_inbound_had_published(struct steer_draft_wg_selection *s,
+    const struct steer_draft_wg_revision *r,uint64_t d,int *out){
+    if(!steer_draft_wg_selection_is_inbound(s)||!revision_valid(r)||!r->without_wg||!out)return EINVAL;
+    *out=0;
+    int rc=running(d,NULL);if(rc)return rc;
+    struct inventory i;
+    rc=inventory_read(s,&i,r);
+    for(unsigned n=0;!rc&&n<i.n;n++)
+        if(i.e[n].r[PUBLISHED].length&&i.e[n].r[PUBLISHED].effect==STEER_PV1_DEVICE_CHANGED)*out=1;
+    free(i.e);return rc;
+}

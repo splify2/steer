@@ -148,8 +148,9 @@ The separate experimental
 netns build is a narrow first-Apply path, not the validation-only switch and
 not a capability declaration. It requires the same private namespace gate and
 a state directory. It accepts the first transition from one existing SOCKS
-listener to the same SOCKS listener plus the supported DEVICE. A second Apply
-and DEVICE startup from a source file are refused. On restart from the actual
+listener to the same SOCKS listener plus the supported DEVICE, and removal
+back to the same SOCKS listener with direct routing and no rules. Other live
+DEVICE changes and DEVICE startup from a source file are refused. On restart from the actual
 store snapshot, only a role-tagged journal selection with a confirmed DOWN
 owned device and matching guard is considered. Before reopening, the host
 checks the current private key, PSK, peer key and AllowedIPs, listen port,
@@ -167,9 +168,28 @@ The common host keeps the closed participant slot with `prepared` and passes
 the receipt from its store writer to normal finish or shutdown finish according
 to the host's stopping state, not the control socket. STATUS/GET expose selected
 revision separately from the live generation; `inboundBarrier` is `closed`,
-`open`, or `unknown`. A post-sync publication failure does not return Apply
+`open`, `absent`, or `unknown`. A post-sync publication failure does not return Apply
 success and leaves the old SOCKS generation serving while the selected document
 is rev2. UNKNOWN does not prove traffic is blocked.
+
+For removal, the serialized owner closes and confirms the exact owned DEVICE
+before it hands the candidate no-WG document to the store writer. The previous
+selected revision and SOCKS remain in place until the receipt. A NOT_RENAMED
+failure retains the old revision and fences the host; while the write is
+pending STATUS already reports `runtimeReady: false` and a closed barrier.
+The DEVICE is not
+automatically reopened. Checked recovery may reopen it after restart. A
+RENAMED-unsynced outcome retains the closed candidate and reports unknown
+durability; GET refuses and no cleanup is attempted. After matching SYNCED the
+new no-WG document is selected and the owned link is closed and checked again
+before journaled retirement of the exact old owned link and guard. Only
+completed cleanup permits Apply success. If closure or cleanup
+fails or ownership is ambiguous, the selected new revision is still reported,
+the old runtime is fenced, the barrier is UNKNOWN, and no success is returned.
+The participant and journal remain a single serialized slot; this does not
+introduce live DEVICE replacement, re-add after removal or general reuse; the
+published journal history preserves that restriction across restart. A restarted rev3 can
+reconcile interrupted cleanup only where existing ownership checks prove it.
 
 `tests/linked-inbound-host-ns.sh` builds the explicit WG host and a separate
 test-only backend fault binary, then exercises same-host control/store, a real
@@ -200,6 +220,12 @@ unshare -n python3 -B experimental/provider/linked_inbound_validate_test.py \
 
 The test disables forwarding only inside that newly created namespace and
 checks that rejected Apply preserves the common store and SOCKS echo.
+
+The separate `tests/linked-inbound-remove-ns.sh` exercises removal immediately
+after Apply and after a checked restart, the next rev3 restart, real peer and
+SOCKS traffic, store and ownership failures, cleanup ambiguity, disconnected
+control, and shutdown with an outstanding receipt. The tests do not operate
+on the host network.
 
 This is an experimental subset, accepted by `--config` and by the same
 validate/apply control commands. For example:
