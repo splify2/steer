@@ -53,11 +53,25 @@ new flow-extension entrypoints. This is a binary loading/ABI gate, not a traffic
 interoperability test. The export ledger retains all 142 baseline symbols and
 adds seven; no published symbol was removed.
 
+The x86_64-musl check also passed with the five **published** `v2.1.4`
+helpers as `OLD_LIBS`, without recompiling them. To repeat, take the old core
+libraries and the `protocols` public key from `steer-core-2.1.4-1_x86_64.ipk`
+(release asset SHA-256 `9ffef3289759468569161c1b36dce6745be26e672d94893f4e54f421d2c3627e`).
+Use the `splify2/plugins` tree at `af830ba3d10a45084b213d1f5c179c0b8e242948`:
+net1 `1.5.0` and each helper `2.1.4`, all `x86_64`. Verify each `.s2p` with
+`s2p verify ARCHIVE --keys-dir KEY_DIRECTORY --role protocols` before
+extracting it. Place the old core libraries at the root of `OLD_LIBS` and
+the verified packages beneath `OLD_LIBS/plugins/<id>`. Run
+`OLD_LIBS=/old NEW_LIBS=/new sh tests/net1-compat.sh` inside musl with
+`nm` available. The old VLESS executable additionally passed `vless-probe`
+through an independent Xray server to an HTTP target in an isolated network,
+with both its original and candidate shared libraries. That traffic check
+applies to plain VLESS TCP only.
+
 The package-manager regression separately checks that package 1.5.0 cannot
 satisfy `^1.6.0`, and that the planner upgrades the dependency before installing
-its new consumer. The full manager suite still has two daemon-reload fixture
-failures, reproduced with both the pinned baseline and candidate in the same
-environment; that suite is not reported as passing.
+its new consumer. The strict Alpine/Zig run at `7e77680` passed all 231
+`pluginmgrmatch` checks, including the daemon in its own network namespace.
 
 `make build/tunnelmatch && ./build/tunnelmatch` includes retry/order, immediate
 empty request, independent directions, idle cleanup, unknown-terminal reset,
