@@ -170,3 +170,32 @@ unshare -n sh -ec 'ip link set lo up; exec python3 -B experimental/provider/hy2_
   sh /path/to/f907-core /path/to/independent-client /tmp/opencode/churn.jsonl
 # Same invocation with --no-churn and a different output file for the control.
 ```
+
+### Follow-up on `f907c01`: two consecutive windows
+
+Two independent processes used the same full executable and equivalent HY2
+TCP/UDP topology in separate loopback netns, concurrently on the same host.
+Their generated credentials and ports differed. Each process stayed alive for
+two consecutive 900-second windows; the churn process applied only label
+changes, while the control did not Apply. Raw output is indexed at
+`/tmp/opencode/steer-f907-budget-index.md` in the producing environment.
+
+| Measurement | Churn, window 1 / 2 | No churn, window 1 / 2 |
+|---|---:|---:|
+| elapsed, seconds | 900.372 / 900.294 | 900.372 / 900.292 |
+| verified TCP echoes | 1,792 / 1,792 | 1,792 / 1,792 |
+| verified UDP echoes | 1,792 / 1,792 | 1,792 / 1,792 |
+| client connections | 90 / 90 | 90 / 90 |
+| successful Apply replies | 44 / 45 | 0 / 0 |
+| PSS at window end, KiB | 5,695 / 5,705 | 2,287 / 2,308 |
+| RSS at window end, KiB | 8,352 / 8,360 | 4,944 / 4,964 |
+| FD at window end | 22 / 22 | 22 / 22 |
+
+Each second window has 89 active snapshots. Sampled PSS ranged 5,690–5,703
+KiB with churn and 2,286–2,308 KiB without; both had 23 active FDs in every
+sample. PSS grew during the first window and the second-window samples were
+nearly flat. This is an observed association, not proof of a memory leak,
+allocator cause or long-term bound. The final `complete` record in the churn
+file reads PSS 6,583 KiB as the concurrent control was completing, while RSS
+remained 8,360 KiB: shared-page attribution can change and the exact cause
+was not investigated. Both workloads were paced, not saturation tests.
