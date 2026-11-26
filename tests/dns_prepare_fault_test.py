@@ -125,7 +125,7 @@ rules:
             unchanged_b=spec.read_bytes()
             ack2=json.loads(subprocess.check_output([binary,"ctl","--socket",str(ctl),"reload"],timeout=5))
             assert ack2["reload"]["dnsd"]=="table",ack2
-            assert ack2["changed"]["dnsd"] is True,ack2
+            assert ack2["changed"]["dnsd"] is False,ack2
             assert spec.read_bytes()==unchanged_b
             print("identical B retry daemon ack:",ack2,flush=True)
             wait_for(lambda:log.read_text().count("таблица от демона:")>before,
@@ -170,7 +170,7 @@ rules:
             # table is already confirmed, replacement must force a new frame.
             prior_forced=log.read_text().count("dnsd table result seq=2 accepted")
             forced=json.loads(subprocess.check_output([binary,"ctl","--socket",str(ctl),"reload"],timeout=5))
-            assert forced["changed"]["ruleset"] is True and forced["changed"]["dnsd"] is True,forced
+            assert forced["changed"]["ruleset"] is True and forced["changed"]["dnsd"] is False,forced
             wait_for(lambda:log.read_text().count("dnsd table result seq=2 accepted")>prior_forced,
                      "forced table reassert was not confirmed")
             assert ask("after-adopt.switch.test")=="192.0.2.3"

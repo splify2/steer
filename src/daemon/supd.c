@@ -158,6 +158,8 @@ struct supd {
     struct table_ack_window tab_window;
     struct table_ack_reader tab_reader;
     struct table_ack_dispatch tab_dispatch;
+    unsigned long long tab_report_fp;
+    int tab_report_ok;
     char *q;
     size_t qn, qoff, qcap;
     /* Резолвер забран у прежнего демона (adopt_dnsd): соединение с его управляющим сокетом —
@@ -593,6 +595,7 @@ static void tab_close(struct supd *s) {
     memset(&s->tab_window,0,sizeof s->tab_window);
     memset(&s->tab_reader,0,sizeof s->tab_reader);
     table_ack_dispatch_done(&s->tab_dispatch);
+    s->tab_report_ok = 0;
     s->qn = s->qoff = 0;
 }
 
@@ -632,7 +635,7 @@ static void tab_result(void *user,uint64_t seq,int result) {
     fprintf(stderr,"steer[info] supervise: dnsd table result seq=%llu %s\n",
             (unsigned long long)seq,result==1?"accepted":"rejected");
 }
-static int tab_send(struct supd *s, int force);
+static int tab_send(struct supd *s, int force, int *changed);
 static void tab_out_cb(struct loop *l, int fd, uint32_t events, void *arg) {
     (void)l;
     struct supd *s=arg;
@@ -653,7 +656,7 @@ static void tab_out_cb(struct loop *l, int fd, uint32_t events, void *arg) {
     if(s->dn_fd>=0 && s->dn_out && (events&EPOLLOUT))tab_flush(s);
     /* Only a desire deferred by a full window is resumed, never a rejection. */
     if(s->dn_fd>=0 && s->dn_ack && s->tab_dispatch.pending &&
-       table_ack_window_ready(&s->tab_window)) (void)tab_send(s,0);
+       table_ack_window_ready(&s->tab_window)) (void)tab_send(s,0,NULL);
 }
 
 static int tab_socket_attach(struct supd *s,int fd) {
@@ -705,9 +708,10 @@ static unsigned long long tab_fingerprint(const char *p, size_t n) {
     return h;
 }
 
-/* Собрать таблицу по спеке в памяти и поставить в трубу. force=0 — только если она (или файлы
- * списков) изменилась с прошлой отдачи; 1 — всегда (резолвер только что запущен). 1 — отдана. */
-static int tab_send(struct supd *s, int force) {
+/* Отправка и изменение текста/файлов — разные вещи: reassert и повтор после отказа
+ * могут отправить прежний fingerprint. Отчёт не является квитанцией резолвера. */
+static int tab_send(struct supd *s, int force, int *changed) {
+    if (changed) *changed = 0;
     if (s->dn_fd < 0 || !s->d->have) return 0;
     char *p = NULL;
     size_t n = 0;
@@ -724,7 +728,10 @@ static int tab_send(struct supd *s, int force) {
             table_ack_dispatch_done(&s->tab_dispatch);
             free(p); return 0;
         }
-        if (decision == TABLE_ACK_DEFER) { free(p); return 2; }
+        if (decision == TABLE_ACK_DEFER) {
+            if (changed) *changed = !s->tab_report_ok || s->tab_report_fp != fp;
+            free(p); return 2;
+        }
     }
     if (s->qoff) {
         memmove(s->q, s->q + s->qoff, s->qn - s->qoff);
@@ -751,6 +758,9 @@ static int tab_send(struct supd *s, int force) {
     s->qn += n;
     free(p);
     if(s->dn_ack) (void)table_ack_window_push(&s->tab_window,fp);
+    if (changed) *changed = !s->tab_report_ok || s->tab_report_fp != fp;
+    s->tab_report_fp = fp;
+    s->tab_report_ok = 1;
     table_ack_dispatch_done(&s->tab_dispatch);
     tab_flush(s);
     return 1;
@@ -1225,7 +1235,7 @@ static void ad_conn_cb(struct supd *s) {
         loop_timer_stop(s->ad_tm);
         fprintf(stderr, "steer[info] supervise: dnsd подхвачен (pid %d) — резолвер пережил прежний "
                         "демон\n", (int)s->ad_pid);
-        tab_send(s, 1);
+        tab_send(s, 1, NULL);
         return;
     }
     if (!strcmp(s->ad_ans, "busy\n")) {
@@ -1368,7 +1378,7 @@ static int dnsd_spawn(struct supd *s, struct helper *h) {
     tab_close(s);
     helper_started(h, pid);
     if(tab_socket_attach(s,p[1])!=0) { close(p[1]);kill(pid,SIGTERM);return 0; }
-    tab_send(s, 1);
+    tab_send(s, 1, NULL);
     return 0;
 }
 
@@ -1652,8 +1662,9 @@ void supd_spec_changed(struct supd *s, struct supd_changes *ch, int replaced) {
     if (ch) changes_of(s, fn, ch);
     helpers_merge(&s->set, s->fresh, fn);
     helpers_compact(&s->set);
-    int sent = tab_send(s, replaced);
-    if (ch) ch->dnsd = sent == 1;
+    int changed = 0;
+    (void)tab_send(s, replaced, &changed);
+    if (ch) ch->dnsd = changed;
     supd_kick(s);
 }
 
