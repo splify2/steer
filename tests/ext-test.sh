@@ -434,8 +434,10 @@ if [ -n "$NSRC" ]; then
 	$CC $QCF -o "$BUILD/qcserver" tests/qcserver.c $QCSRC "$NGLIB" "$WLIB" -lpthread -lm
 	# shellcheck disable=SC2086
 	$CC $QCF -o "$BUILD/qcbench" tests/qcbench.c $QCSRC "$NGLIB" "$WLIB" -lpthread -lm
+	echo "ext-test: проверяю вердикт qcbench на записях успешного и неполного прогона..."
+	python3 tests/qcbench-process-test.py sh tests/qcbench-verdict-test.sh
 	echo "ext-test: замер Brutal против CUBIC на канале с потерями (tests/qcbench.sh check)..."
-	BUILD="$BUILD" sh tests/qcbench.sh check
+	BUILD="$BUILD" python3 tests/qcbench-process-test.py sh tests/qcbench.sh check
 fi
 
 # Разделяемая раскладка роутера (шаг 4 выпуска 1.10): те же исходники wolfSSL, тот же рецепт, что у
