@@ -29,8 +29,15 @@ static int fails;
 /* Подмена strdup: ruleset_add обязан пережить отказ выделения (раньше str_lower(NULL) валил резолвер).
  * Тест линкуется с кодом резолвера одним объектом, так что наш strdup перекрывает libc. */
 static int g_strdup_fail;
+static const char *g_strdup_fail_for;
+static int g_strdup_fail_hits;
 char *strdup(const char *s) {
     if (g_strdup_fail) return NULL;
+    if (g_strdup_fail_for && !strcmp(s, g_strdup_fail_for)) {
+        g_strdup_fail_hits++;
+        errno = ENOMEM;
+        return NULL;
+    }
     size_t n = strlen(s) + 1;
     char *p = malloc(n);
     if (p) memcpy(p, s, n);
@@ -162,6 +169,48 @@ static void check_table_rules_transaction(void) {
     unlink(path);
 }
 
+/* Полные кадры --table-fd: отказ strdup только на правиле кандидата B,
+ * уже после разбора его каналов и апстримов. Это не SIGHUP и не системный OOM. */
+static void check_table_oom_upstream_transaction(void) {
+    char a[] = "/tmp/dnsmatch-oom-a-XXXXXX", b[] = "/tmp/dnsmatch-oom-b-XXXXXX";
+    int fa = mkstemp(a), fb = mkstemp(b);
+    if (fa < 0 || fb < 0 || write(fa, "old.example\n", 12) != 12 ||
+        write(fb, "new.example\n", 12) != 12) { perror("fixture"); exit(2); }
+    close(fa); close(fb);
+    char frame_a[1024], frame_b[1024];
+    const char *ups = "alpha|udp://192.0.2.1:5301|-|0|-|-\n"
+                      "beta|udp://192.0.2.2:5302|-|0|-|-\n";
+    snprintf(frame_a, sizeof(frame_a), "1 2 11 1 50 5 1\noldset|out|0|4|old|%s|dns:1\n%s", a, ups);
+    snprintf(frame_b, sizeof(frame_b), "1 2 22 2 60 6 2\nnewset|out|0|4|new|%s|dns:2\n%s", b, ups);
+    struct tabfmt_feed feed = { .load_rules = 1 };
+    check("OOM full-table: A принят целиком", 1, tabfmt_feed(&feed, frame_a, strlen(frame_a)));
+    check("  A: правило выбирает alpha, dns.other и кэш A", 1,
+          g_dch_n == 1 && g_dup_cfg_n == 2 &&
+          dch_first(dch_match_mask("x.old.example")) == 0 && !dch_match_mask("new.example") &&
+          g_dch[0].up == 1 && !strcmp(g_dup_cfg[0].u.host, "192.0.2.1") &&
+          g_dup_cfg[0].u.port == 5301 && g_dup_other == 1 && g_dcache_cfg.entries == 11);
+    g_strdup_fail_hits = 0;
+    g_strdup_fail_for = "new.example";
+    int rc = tabfmt_feed(&feed, frame_b, strlen(frame_b));
+    g_strdup_fail_for = NULL;
+    check("  B: отказ выделения правила действительно произошёл один раз", 1, g_strdup_fail_hits);
+    check("  B с ENOMEM отклонён как полный кадр", 2, rc);
+    check("  после ENOMEM остаются правило и привязки A, не B", 1,
+          g_dch_n == 1 && g_dup_cfg_n == 2 && !strcmp(g_dch[0].set, "oldset") &&
+          dch_first(dch_match_mask("x.old.example")) == 0 && !dch_match_mask("new.example") &&
+          g_dch[0].up == 1 && !strcmp(g_dup_cfg[0].u.host, "192.0.2.1") &&
+          g_dup_cfg[0].u.port == 5301 && g_dup_other == 1 && g_dcache_cfg.entries == 11);
+    check("  следующий полный B принят", 1, tabfmt_feed(&feed, frame_b, strlen(frame_b)));
+    check("  B: новое правило выбирает beta, dns.other и кэш B", 1,
+          g_dch_n == 1 && g_dup_cfg_n == 2 && !strcmp(g_dch[0].set, "newset") &&
+          dch_first(dch_match_mask("x.new.example")) == 0 && !dch_match_mask("old.example") &&
+          g_dch[0].up == 2 && !strcmp(g_dup_cfg[1].u.host, "192.0.2.2") &&
+          g_dup_cfg[1].u.port == 5302 && g_dup_other == 2 && g_dcache_cfg.entries == 22);
+    check("  очистка таблицы после опыта", 1, tabfmt_feed(&feed, "0\n", 2));
+    free(feed.buf);
+    unlink(a); unlink(b);
+}
+
 /* Набор из строк списка — в том же виде, в каком их читает load_rules_into. */
 static void build(struct ruleset *rs, const char *const *lines) {
     memset(rs, 0, sizeof(*rs));
@@ -187,6 +236,7 @@ static int pool_live_stub(uint8_t *bits) {
 int main(void) {
     check_table_adoption();
     check_table_rules_transaction();
+    check_table_oom_upstream_transaction();
     {
         struct ruleset rs;
         memset(&rs, 0, sizeof(rs));
