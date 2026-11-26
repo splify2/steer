@@ -8,7 +8,7 @@
 #include <time.h>
 
 enum { LINK=1, BIND, BOUND, PUBLISH, PUBLISHED, STEPS };
-enum { CLEAN=STEPS, CLEANED };
+enum { CLEAN=STEPS, CLEANED, REUSE };
 static const char provider[]="wireguard-isolated";
 static const char durable_provider[]="wireguard-isolated-selected";
 static const char version[]="1";
@@ -235,7 +235,7 @@ int steer_draft_wg_coordinator_apply(struct steer_spec_journal *j,const struct s
 struct steer_draft_wg_selection { struct steer_spec_journal *j; uint32_t max; };
 struct entry {
     struct steer_draft_wg_tx tx;
-    struct steer_spec_journal_record r[CLEANED+1];
+    struct steer_spec_journal_record r[REUSE+1];
     struct steer_draft_wg_identity link;
     struct steer_draft_wg_guard_record guard;
 };
@@ -255,11 +255,20 @@ static struct steer_spec_journal_record selection_record(const struct steer_draf
     return r;
 }
 
+static struct steer_spec_journal_record reuse_record(const struct steer_draft_wg_tx *t,uint64_t anchor){
+    struct steer_spec_journal_record r=record(t,REUSE,0,durable_provider);
+    r.operation=3;
+    r.phase=STEER_PV1_DEVICE_ACTIVE;
+    r.anchor_transaction=anchor;
+    r.anchor_sequence=PUBLISHED;
+    return r;
+}
+
 static struct steer_pv1_error collect_selection(void *ctx,const struct steer_spec_journal_record *r){
     struct inventory *i=ctx;
     const struct steer_pv1_error invalid={STEER_PV1_INVALID,0};
     unsigned step=r->key.sequence,n=0;
-    if(step<LINK||step>CLEANED||strcmp(r->provider,durable_provider))return invalid;
+    if(step<LINK||step>REUSE||strcmp(r->provider,durable_provider))return invalid;
     for(;n<i->n;n++)if(i->e[n].tx.transaction==r->key.transaction)break;
     if(n==i->n){
         if(n>=i->capacity)return invalid;
@@ -272,6 +281,12 @@ static struct steer_pv1_error collect_selection(void *ctx,const struct steer_spe
     if(e->r[step].length||e->tx.instance!=r->key.instance)return invalid;
     if(step<STEPS){
         if(!stage_envelope(r,&e->tx,durable_provider))return invalid;
+    }else if(step==REUSE){
+        if(!r->anchor_transaction||r->anchor_sequence!=PUBLISHED)return invalid;
+        struct steer_spec_journal_record expected=reuse_record(&e->tx,0),actual=*r;
+        actual.anchor_transaction=actual.anchor_sequence=0;
+        expected.anchor_sequence=0;
+        if(!same_envelope(&actual,&expected))return invalid;
     }else{
         struct steer_spec_journal_record expected=selection_record(&e->tx,step);
         if(!same_envelope(r,&expected))return invalid;
@@ -293,21 +308,40 @@ static int inventory_read(struct steer_draft_wg_selection *s,struct inventory *i
     for(unsigned n=0;n<i->n;n++){
         struct entry *e=&i->e[n];
         const struct steer_spec_journal_record *r=e->r;
-        if(reconcile_records(r,&e->tx,&e->link,&e->guard))return EPROTO;
-        if(e->tx.generation==revision->generation){
-            if(revision->without_wg||!r[PUBLISHED].length||r[PUBLISHED].effect!=STEER_PV1_DEVICE_CHANGED||
-               !e->guard.handle||memcmp(e->tx.plan_digest,revision->digest,32))return EPROTO;
-            i->active=n;
+        if(r[REUSE].length){
+            for(unsigned k=LINK;k<=CLEANED;k++)if(r[k].length)return EPROTO;
+        }else{
+            if(reconcile_records(r,&e->tx,&e->link,&e->guard))return EPROTO;
+            for(unsigned k=CLEAN;k<=CLEANED;k++)
+                if(r[k].length&&memcmp(r[k].data,r[LINK].data,r[k].length))return EPROTO;
+            if(!r[CLEANED].length)i->reserved+=r[CLEAN].length?1:2;
         }
-        for(unsigned k=CLEAN;k<=CLEANED;k++)
-            if(r[k].length&&memcmp(r[k].data,r[LINK].data,r[k].length))return EPROTO;
-        if(!r[CLEANED].length)i->reserved+=r[CLEAN].length?1:2;
         for(unsigned prev=0;prev<n;prev++){
             const struct entry *other=&i->e[prev];
             if(other->tx.generation==e->tx.generation||
-               !strcmp(other->link.physical_name,e->link.physical_name)||
+               (e->link.physical_name[0]&&!strcmp(other->link.physical_name,e->link.physical_name))||
                (other->guard.table[0]&&e->guard.table[0]&&!strcmp(other->guard.table,e->guard.table)))
                 return EPROTO;
+        }
+    }
+    for(unsigned n=0;n<i->n;n++){
+        const struct entry *e=&i->e[n],*anchor=e;
+        unsigned physical=n;
+        if(e->r[REUSE].length){
+            const struct steer_spec_journal_record *alias=&e->r[REUSE];
+            for(physical=0;physical<i->n;physical++)
+                if(i->e[physical].tx.transaction==alias->anchor_transaction)break;
+            if(physical==i->n)return EPROTO;
+            anchor=&i->e[physical];
+            if(anchor->tx.generation>=e->tx.generation||anchor->r[REUSE].length||!anchor->r[PUBLISHED].length||
+               anchor->r[PUBLISHED].effect!=STEER_PV1_DEVICE_CHANGED||
+               memcmp(alias->data,anchor->r[PUBLISHED].data,STEER_DRAFT_WG_GUARD_RECORD_BYTES))return EPROTO;
+        }
+        if(e->tx.generation==revision->generation){
+            if(revision->without_wg||!anchor->r[PUBLISHED].length||
+               anchor->r[PUBLISHED].effect!=STEER_PV1_DEVICE_CHANGED||
+               !anchor->guard.handle||memcmp(e->tx.plan_digest,revision->digest,32))return EPROTO;
+            i->active=physical;
         }
     }
     if(revision->generation&&!revision->without_wg&&
@@ -328,7 +362,7 @@ static int synced(struct steer_spec_journal_result result){
 
 static int clean_entry(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
     void *ctx,const struct entry *e,uint64_t deadline){
-    if(e->r[CLEANED].length)return 0;
+    if(e->r[CLEANED].length||e->r[REUSE].length)return 0;
     int rc=running(deadline,NULL);
     if(rc)return rc;
     if(!e->r[CLEAN].length){
@@ -409,7 +443,7 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *s,const stru
     /* Link records must never be replayed, even after their cleanup completed. */
     if(!rc)for(unsigned n=0;n<i.n;n++){
         const struct entry *e=&i.e[n];
-        if(n!=i.active&&!e->r[CLEANED].length){rc=EBUSY;break;}
+        if(n!=i.active&&!e->r[CLEANED].length&&!e->r[REUSE].length){rc=EBUSY;break;}
         if(t->transaction==e->tx.transaction||t->generation<=e->tx.generation||
            !memcmp(c->link.physical_name,e->link.physical_name,sizeof(e->link.physical_name))||
            !memcmp(c->table,e->guard.table,sizeof(c->table))){rc=EEXIST;break;}
@@ -422,6 +456,27 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *s,const stru
         &started,durable_provider);
 }
 
+int steer_draft_wg_selection_reuse(struct steer_draft_wg_selection *s,const struct steer_draft_wg_revision *r,
+    const struct steer_draft_wg_tx *t,const struct steer_draft_wg_guard_record *guard,uint64_t d){
+    if(!s||!revision_valid(r)||!r->generation||r->without_wg||!tx_valid(t)||
+       t->generation<=r->generation||!guard)return EINVAL;
+    int rc=running(d,NULL);
+    if(rc)return rc;
+    struct inventory i;
+    rc=inventory_read(s,&i,r);
+    for(unsigned n=0;!rc&&n<i.n;n++)if(t->generation<=i.e[n].tx.generation||t->transaction==i.e[n].tx.transaction)rc=EEXIST;
+    if(!rc&&i.used+i.reserved+2>s->max)rc=ENOSPC;
+    if(!rc){
+        const struct entry *e=&i.e[i.active];
+        struct steer_spec_journal_record alias=reuse_record(t,e->tx.transaction);
+        if(steer_draft_wg_guard_record_encode(guard,alias.data)||
+           memcmp(alias.data,e->r[PUBLISHED].data,alias.length))rc=ESTALE;
+        else if(!(rc=running(d,NULL))&&!synced(steer_spec_journal_append(s->j,&alias)))rc=EIO;
+    }
+    free(i.e);
+    return rc;
+}
+
 int steer_draft_wg_selection_retire(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
     void *ctx,const struct steer_draft_wg_revision *r,uint64_t generation,uint64_t d){
     if(!s||!cleanup_backend(b)||!revision_valid(r)||!generation||generation==r->generation)return EINVAL;
@@ -430,7 +485,7 @@ int steer_draft_wg_selection_retire(struct steer_draft_wg_selection *s,const str
     struct inventory i;
     rc=inventory_read(s,&i,r);
     if(!rc)for(unsigned n=0;n<i.n;n++)if(i.e[n].tx.generation==generation){
-        rc=clean_entry(s,b,ctx,&i.e[n],d);
+        rc=n==i.active?EBUSY:clean_entry(s,b,ctx,&i.e[n],d);
         break;
     }
     free(i.e);

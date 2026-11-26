@@ -97,5 +97,10 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *,const struc
  * The durable selected revision is rechecked; it cannot be retired here. */
 int steer_draft_wg_selection_retire(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
     void *,const struct steer_draft_wg_revision *,uint64_t generation,uint64_t deadline);
+/* No kernel effects. Record a new full revision digest against the exact
+ * currently selected physical PUBLISHED outcome (never another alias).
+ * Caller must attest unchanged WG intent and live keys before this call. */
+int steer_draft_wg_selection_reuse(struct steer_draft_wg_selection *,const struct steer_draft_wg_revision *,
+    const struct steer_draft_wg_tx *,const struct steer_draft_wg_guard_record *,uint64_t deadline);
 
 #endif

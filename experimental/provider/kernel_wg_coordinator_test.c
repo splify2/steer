@@ -194,17 +194,34 @@ static void linked_selection(const char *path){
     struct steer_draft_wg_revision committed={.generation=11,.digest={1}};
     assert(!steer_draft_wg_selection_startup(s,&backend,&f,&committed,verify_selected,UINT64_MAX,&next,&selected));
     assert(next==12&&selected.handle==201&&!strcmp(f.events,"CSBUPV"));
+    struct steer_draft_wg_tx reuse={12,12,12,{3}},reuse_again={13,13,13,{4}};
+    struct steer_draft_wg_guard_record foreign=selected;
+    foreign.handle++;
+    assert(steer_draft_wg_selection_reuse(s,&committed,&reuse,&foreign,UINT64_MAX)==ESTALE);
+    assert(!steer_draft_wg_selection_reuse(s,&committed,&reuse,&selected,UINT64_MAX));
+    /* Visibility of an uncommitted alias never selects the newer revision. */
+    assert(!steer_draft_wg_selection_startup(s,&backend,&f,&committed,verify_selected,UINT64_MAX,&next,&selected));
+    assert(next==13&&selected.link.generation==11&&!strcmp(f.events,"CSBUPVV"));
+    struct steer_draft_wg_revision aliased={.generation=12,.digest={3}};
+    assert(!steer_draft_wg_selection_reuse(s,&aliased,&reuse_again,&selected,UINT64_MAX));
+    aliased.generation=13;
+    assert(steer_draft_wg_selection_startup(s,&backend,&f,&aliased,verify_selected,UINT64_MAX,&next,&selected)==EPROTO);
+    aliased.digest[0]=4;
+    assert(!steer_draft_wg_selection_startup(s,&backend,&f,&aliased,verify_selected,UINT64_MAX,&next,&selected));
+    assert(next==14&&selected.link.generation==11&&!strcmp(f.events,"CSBUPVVV"));
+    assert(steer_draft_wg_selection_retire(s,&backend,&f,&aliased,11,UINT64_MAX)==EBUSY);
+    assert(!steer_draft_wg_selection_retire(s,&backend,&f,&aliased,12,UINT64_MAX));
     committed.without_wg=1; /* contradicts the WG record at the selected revision */
     assert(steer_draft_wg_selection_startup(s,&backend,&f,&committed,verify_selected,UINT64_MAX,&next,&selected)==EPROTO);
     committed.generation=15;
     committed.without_wg=0; /* required WG entry missing: no cleanup */
     assert(steer_draft_wg_selection_startup(s,&backend,&f,&committed,verify_selected,UINT64_MAX,&next,&selected)==EPROTO);
-    assert(f.link&&!strcmp(f.events,"CSBUPV"));
+    assert(f.link&&!strcmp(f.events,"CSBUPVVV"));
     committed.without_wg=1;
     assert(!steer_draft_wg_selection_startup(s,&backend,&f,&committed,verify_selected,UINT64_MAX,&next,&selected));
-    assert(next==16&&!selected.handle&&!f.link&&!strcmp(f.events,"CSBUPVRLD"));
+    assert(next==16&&!selected.handle&&!f.link&&!strcmp(f.events,"CSBUPVVVRLD"));
     steer_draft_wg_selection_close(s);
-    puts("WG linked selection: intentional absence, contradiction, and missing required WG PASS");
+    puts("WG linked selection: exact reuse anchor, active retirement fence, and intentional absence PASS");
 }
 
 int main(int argc,char **argv){
