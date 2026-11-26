@@ -80,8 +80,32 @@ Hysteria v2.13.0: valid and invalid authentication, a hash-checked 1 MiB TCP
 transfer and UDP echo. The SHA-256 of `plugins/net1/lib/libs2p-net.so.1` was
 `ead0ba992a994941ea730cd144b84b078216ae9976b94685e5f414b803202f52` for the
 original and `9c3a2454bd37f7be4c3ed33674216ef2ad7734970a58a410a55a4698b9753486`
-for the candidate. This checks the old client with both library sets; the
-proxy, xsteer and warpbox results above remain loader probes.
+for the candidate.
+
+The signed `proxy` helper from the same release (executable SHA-256
+`500b49538bf81b9b52b2baa88d0255cb2063d9e6660fbb1903896ed4055aec62`)
+also passed a TCP traffic probe with **each** of those two library sets.
+Mount the verified package at `/libs/plugins/proxy` and use its binary, not
+the source-built `pxprobe`. In a network namespace with only loopback, assign
+`192.0.2.8/32` to Xray and `1.1.1.1/32` to the local probe target; no
+external connectivity is needed. Start an HTTP target on port 80 and Xray
+26.11.9 with the following inbounds on distinct ports: password-authenticated
+SOCKS5 and HTTP CONNECT, Shadowsocks AES-256-GCM, VMess AES-128-GCM/TCP,
+and Trojan/TLS with the test certificate pinned via `pcs`. Use one matching
+subscription URL per file and run, as an unprivileged user:
+
+```sh
+LD_LIBRARY_PATH=/libs /libs/plugins/proxy/bin/proxy proxy-probe /tmp/subscription --node 0 --timeout 3
+```
+
+For each of the five cases, the target received exactly the helper's
+`GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n` and the probe
+reported `working: 0` after the response. A wrong SOCKS password produced
+exit 1 without a target request. Stopping Xray produced the same failure for
+all five URLs on both library sets. This exercises the old helper's TCP
+probe, not UDP, a TUN installation, or v3 providers for those protocols.
+For the signed xsteer and warpbox helpers the evidence here remains limited
+to loader probes.
 
 The package-manager regression separately checks that package 1.5.0 cannot
 satisfy `^1.6.0`, and that the planner upgrades the dependency before installing
