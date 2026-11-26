@@ -42,6 +42,12 @@ int steer_linked_inbound_prepare_closed(struct steer_linked_inbound *,const stru
     const struct steer_policy *,uint64_t);
 int steer_linked_inbound_finish_closed(struct steer_linked_inbound *,struct steer_prototype_store_result,
     const struct steer_draft_wg_revision *,steer_draft_wg_verify_ready,uint64_t);
+/* Owner-selected shutdown: never publish or open. Matching SYNCED records the
+ * durable selection and returns ECANCELED after successful confirmed closure.
+ * On error inspect barrier_state; UNKNOWN is not confirmed closed. Other receipts have
+ * the same rollback/uncertainty rules as finish_closed. Not Apply success. */
+int steer_linked_inbound_finish_closed_shutdown(struct steer_linked_inbound *,struct steer_prototype_store_result,
+    const struct steer_draft_wg_revision *,steer_draft_wg_verify_ready,uint64_t);
 /* SYNCED requires later recovery of the external selection; RENAMED fences
  * without cleanup; NOT_RENAMED reconciles the previous external selection.
  * Never rewrites store. */

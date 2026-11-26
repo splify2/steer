@@ -43,6 +43,19 @@ unconditional claim of blocked traffic is made. These are fresh checks, not
 an atomic CAS against another privileged namespace actor. A DOWN/UP transition
 can invalidate the WG session, so seamless peer reconnection is not claimed.
 
+The serialized owner may instead call `steer_linked_inbound_finish_closed_shutdown`
+with the same prepared slot, matching selection and store receipt, independently
+of whether the requesting control socket still exists. This path never calls
+allow-policy publication or barrier open. For matching SYNCED it records the
+new durable selection, attempts to close and freshly confirm the owned link,
+retains fencing and returns ECANCELED on confirmed closure, not Apply success.
+If closure fails, its error and barrier state must be examined: UNKNOWN is not
+proof of closed traffic. NOT_RENAMED reconciles only confirmed owned resources
+and retains the shutdown fence; RENAMED-unsynced or a mismatch retains resources
+and marks the durable selection unknown. The existing journal still refuses a
+restart of a selected but unpublished generation rather than silently adopting
+or cleaning it. This operation is not yet connected to the common host.
+
 The existing inbound journal's `BOUND` without `PUBLISHED` is a valid
 unselected preparation. If the process exits after SYNCED but before PUBLISH,
 the current selection scanner refuses the committed but unpublished generation
@@ -69,4 +82,7 @@ In the confirmed-closed cases the real peer cannot transfer payload. It also
 checks a separately started real SOCKS lab host and pinned stream stay usable;
 that is not a claim of common-host integration. Separate process restarts are
 tested both before publication and after nft change but before outcome.
+Shutdown cases separately exercise SYNCED, NOT_RENAMED, RENAMED-unsynced and
+unconfirmed ownership: they verify no allow publication, the actual peer's
+payload, on-disk document and unrelated link/table.
 The test uses fixed synthetic local key material and logs no private key or PSK.

@@ -62,7 +62,7 @@ def main(binary,mode,socks_binary):
             assert int(handshakes[-1])>0,'no WG handshake; drop test would be inconclusive'
             roundtrip(socks,b'during-drop')
             print('PASS durable intent precedes create; peer handshake, payload blocked before receipt')
-            if mode in ('n','u','j','o','f'):
+            if mode in ('n','u','j','o','f','z','v','w','t'):
                 command('ip','link','add','witness0','type','wireguard')
                 command('nft','add','table','inet','witness_table')
             fixture.stdin.write(mode+'\n');fixture.stdin.flush()
@@ -100,20 +100,35 @@ def main(binary,mode,socks_binary):
                 reset_peer()
                 assert ping()==0 or ping()==0,'traffic failed after synced receipt and new peer handshake'
                 print('PASS SYNCED receipt then publication: peer traffic succeeds after new handshake')
-            elif mode=='n':
-                assert (rc,phase,fenced,unknown,committed,disk)==(errno.EIO,0,0,0,1,1) and error,done
+            elif mode in ('n','v'):
+                assert (rc,phase,fenced,unknown,committed,disk)==(errno.EIO,0,1 if mode=='v' else 0,0,1,1) and error,done
                 assert (barrier,publication)==(0,0),done
                 assert subprocess.run(['ip','link','show','dev',device],capture_output=True).returncode!=0
                 assert subprocess.run(['nft','list','table','inet',table],capture_output=True).returncode!=0
                 command('ip','link','show','dev','witness0')
                 command('nft','list','table','inet','witness_table')
-                print('PASS NOT_RENAMED: owned device/guard retired, old store remains')
-            elif mode=='r':
+                print('PASS '+('shutdown ' if mode=='v' else '')+'NOT_RENAMED: owned device/guard retired, old store remains')
+            elif mode in ('r','w'):
                 assert (rc,phase,fenced,unknown,committed,disk)==(errno.EIO,1,1,1,1,2) and error,done
                 assert (barrier,publication)==(0,0),done
                 assert ping()!=0 and json.loads(command('nft','-j','list','table','inet',table))
                 command('ip','link','show','dev',device)
-                print('PASS RENAMED unsynced: fenced, resources retained, traffic blocked')
+                if mode=='w':
+                    command('ip','link','show','dev','witness0')
+                    command('nft','list','table','inet','witness_table')
+                print('PASS '+('shutdown ' if mode=='w' else '')+'RENAMED unsynced: fenced, resources retained, traffic blocked')
+            elif mode in ('z','t'):
+                assert (rc,phase,error,fenced,unknown,committed,disk)==(
+                    errno.ECANCELED if mode=='z' else errno.ESTALE,2,0,1,0,2,2),done
+                assert (barrier,publication)==((1,0) if mode=='z' else (0,0)),done
+                reset_peer()
+                assert ping()!=0
+                link=json.loads(command('ip','-j','link','show','dev',device))[0]
+                if mode=='z':assert 'UP' not in link['flags'],link
+                command('nft','list','table','inet',table)
+                command('ip','link','show','dev','witness0')
+                command('nft','list','table','inet','witness_table')
+                print('PASS shutdown SYNCED: rev2, no publication, '+('closed' if mode=='z' else 'closure UNKNOWN')+', peer blocked')
             elif mode=='m':
                 assert (rc,phase,error,fenced,unknown,committed,disk)==(errno.EIO,2,0,1,1,1,2),done
                 assert (barrier,publication)==(0,0),done
@@ -188,5 +203,5 @@ def main(binary,mode,socks_binary):
 
 
 if __name__=='__main__':
-    if len(sys.argv)!=4 or sys.argv[2] not in ('s','n','r','p','a','u','j','o','f','m','x','k'):raise SystemExit('expected fixture, mode and independent SOCKS host')
+    if len(sys.argv)!=4 or sys.argv[2] not in ('s','n','r','p','a','u','j','o','f','m','x','k','z','v','w','t'):raise SystemExit('expected fixture, mode and independent SOCKS host')
     main(*sys.argv[1:])

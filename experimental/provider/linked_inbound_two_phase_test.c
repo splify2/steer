@@ -151,11 +151,11 @@ int main(int argc,char **argv){
     assert(steer_linked_inbound_live_commit(&p,forged,&selected)==EINVAL);
     assert(p.staged&&p.closed_stage&&!strcmp(events,"CSBU"));
     printf("CLOSED %s %s\n",p.candidate.guard.link.physical_name,p.candidate.guard.table);fflush(stdout);
-    int mode=getchar();assert(mode=='s'||mode=='n'||mode=='r'||mode=='p'||mode=='a'||mode=='u'||mode=='j'||mode=='o'||mode=='f'||mode=='m'||mode=='x'||mode=='k');
+    int mode=getchar();assert(mode=='s'||mode=='n'||mode=='r'||mode=='p'||mode=='a'||mode=='u'||mode=='j'||mode=='o'||mode=='f'||mode=='m'||mode=='x'||mode=='k'||mode=='z'||mode=='v'||mode=='w'||mode=='t');
     doc=(struct steer_store_document){2,STEER_STORE_FORMAT_SPEC_V3,(char *)newdoc,strlen(newdoc)};
     assert(!steer_prototype_store_prepare_document(store,&doc,&transaction).code);
-    if(mode=='n')fail_rename=1;
-    if(mode=='r')fail_directory_sync=1;
+    if(mode=='n'||mode=='v')fail_rename=1;
+    if(mode=='r'||mode=='w')fail_directory_sync=1;
     result=steer_prototype_store_commit(transaction);
     assert(!steer_prototype_store_abort(transaction).code);
     if(mode=='x'){
@@ -172,12 +172,18 @@ int main(int argc,char **argv){
     if(mode=='u'){fail_publish=2;fail_reconfirm=1;}
     if(mode=='j')fail_publish=4;
     if(mode=='o')fail_after_open=1;
-    if(mode=='f')foreign_barrier=1;
+    if(mode=='f'||mode=='t')foreign_barrier=1;
     if(mode=='k')fail_publish=3;
     if(mode=='m')selected.digest[0]^=1;
-    int rc=steer_linked_inbound_finish_closed(&p,result,&selected,none,deadline());
-    assert(!strcmp(events,mode=='s'?"CSBUDLPO":mode=='o'?"CSBUDLPOL":mode=='f'?"CSBUDLL":mode=='p'||mode=='a'||mode=='u'||mode=='j'?"CSBUDLPL":mode=='m'?"CSBUD":mode=='r'?"CSBUR":"CSBUN"));
+    int shutdown=mode=='z'||mode=='v'||mode=='w'||mode=='t';
+    int rc=shutdown?steer_linked_inbound_finish_closed_shutdown(&p,result,&selected,none,deadline()):
+        steer_linked_inbound_finish_closed(&p,result,&selected,none,deadline());
+    assert(!strcmp(events,mode=='s'?"CSBUDLPO":mode=='o'?"CSBUDLPOL":mode=='f'?"CSBUDLL":
+        mode=='z'||mode=='t'?"CSBUDL":mode=='p'||mode=='a'||mode=='u'||mode=='j'?"CSBUDLPL":
+        mode=='m'?"CSBUD":mode=='r'||mode=='w'?"CSBUR":"CSBUN"));
     struct steer_store_document *on_disk=NULL;assert(!steer_prototype_store_load_document(store,&on_disk).code);
+    const char *expected_doc=mode=='n'||mode=='v'?olddoc:newdoc;
+    assert(on_disk->length==strlen(expected_doc)&&!memcmp(on_disk->document,expected_doc,on_disk->length));
     printf("DONE %d %u %u %d %d %llu %llu %u %u\n",rc,result.phase,result.error.code,p.fenced,p.durable_unknown,
         (unsigned long long)p.committed.generation,(unsigned long long)on_disk->generation,p.barrier_state,p.publication_state);fflush(stdout);
     steer_store_document_destroy(on_disk);

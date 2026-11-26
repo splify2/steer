@@ -90,13 +90,14 @@ int steer_linked_inbound_prepare_closed(struct steer_linked_inbound *p,const str
     p->closed_stage=1;p->staged=1;
     return 0;
 }
-int steer_linked_inbound_finish_closed(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
-    const struct steer_draft_wg_revision *chosen,steer_draft_wg_verify_ready verify,uint64_t deadline){
+static int finish_closed(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
+    const struct steer_draft_wg_revision *chosen,steer_draft_wg_verify_ready verify,uint64_t deadline,int shutdown){
     if(!p||!p->staged||!p->closed_stage||!p->closed_guard)return EINVAL;
     p->staged=0;p->closed_stage=0;p->fenced=1;
     if(result.phase==STEER_PROTOTYPE_STORE_NOT_RENAMED){
         uint64_t next;struct steer_draft_wg_guard_record selected;
         int rc=steer_linked_inbound_recover(p,&p->committed,verify,deadline,&next,&selected);
+        if(shutdown)p->fenced=1;
         forget_closed(p);
         return rc?rc:EIO;
     }
@@ -112,6 +113,10 @@ int steer_linked_inbound_finish_closed(struct steer_linked_inbound *p,struct ste
     p->barrier_state=STEER_INBOUND_BARRIER_UNKNOWN;
     int rc=p->barrier_close(p->context,&p->candidate.guard,deadline,&p->barrier_state);
     if(!rc&&p->barrier_state!=STEER_INBOUND_BARRIER_CLOSED)rc=EIO;
+    if(shutdown){
+        forget_closed(p);
+        return rc?rc:ECANCELED;
+    }
     if(!rc)rc=steer_draft_wg_selection_publish_closed(p->journal,p->backend,p->context,&previous,&p->closed_tx,
         deadline,&p->candidate,&p->publication_state);
     if(!rc&&p->publication_state!=STEER_INBOUND_PUBLICATION_CONFIRMED)rc=EIO;
@@ -127,4 +132,12 @@ int steer_linked_inbound_finish_closed(struct steer_linked_inbound *p,struct ste
     forget_closed(p);
     if(!rc)p->fenced=0;
     return rc;
+}
+int steer_linked_inbound_finish_closed(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
+    const struct steer_draft_wg_revision *chosen,steer_draft_wg_verify_ready verify,uint64_t deadline){
+    return finish_closed(p,result,chosen,verify,deadline,0);
+}
+int steer_linked_inbound_finish_closed_shutdown(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
+    const struct steer_draft_wg_revision *chosen,steer_draft_wg_verify_ready verify,uint64_t deadline){
+    return finish_closed(p,result,chosen,verify,deadline,1);
 }

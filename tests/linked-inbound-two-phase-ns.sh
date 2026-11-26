@@ -20,6 +20,6 @@ ${CC:-cc} $F @"$OUT/includes.rsp" -I"$SDK/include" -DHAVE_CONFIG_H -D_POSIX_C_SO
     src/third_party/libyaml/api.c src/third_party/libyaml/reader.c src/third_party/libyaml/scanner.c \
     src/third_party/libyaml/parser.c -Wl,--gc-sections,--wrap=renameat,--wrap=fsync -o "$OUT/two-phase"
 make -s NANO=1 NANO_BUILD="$OUT/socks" NANO_SDK="$SDK" NANO_PROTOCOLS="$PROTOCOLS"
-for mode in s n r p a u j o f m x k; do
+for mode in s n r p a u j o f m x k z v w t; do
     unshare -n python3 -B experimental/provider/linked_inbound_two_phase_test.py "$OUT/two-phase" "$mode" "$OUT/socks/steer-nano" 3</proc/self/ns/net
 done
