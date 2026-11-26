@@ -145,12 +145,25 @@ socks-vpn-netns-test: $(BUILD)/steer-prototype
 # default/client builds retain their existing dependency and feature surface.
 NGTCP2_LIB ?=
 WOLFSSL_SERVER_LIB ?=
-HY2_SRC = socks_datagram.c hy2_inbound.c hy2_datagram.c datagram.c datagram_routes.c hy2_stream_backend.c hy2_datagram_backend.c hy2_datagram_backend_io.c inbound_tls.c $(PROTOCOLS)/src/hysteria2/server.c \
+HY2_SRC = socks_datagram.c socks_udp_backend.c socks_udp_transport.c hy2_inbound.c hy2_datagram.c datagram.c datagram_routes.c hy2_stream_backend.c hy2_datagram_backend.c hy2_datagram_backend_io.c inbound_tls.c $(PROTOCOLS)/src/hysteria2/server.c \
     $(PROTOCOLS)/src/hysteria2/auth.c $(PROTOCOLS)/src/hysteria2/inbound.c \
     $(HY2_TCP_SRC)
 HY2_INC = $(shell find ../../src -type d -printf '-I%p ')
 HY2_TCP_SRC = hy2_tcp_client.c ../../src/proto/hysteria2/hy2wire.c \
     ../../src/proto/quic/quic.c ../../src/proto/quic/qcssl.c
+$(BUILD)/socks-udp-backend-test: socks_udp_backend_test.c socks_udp_backend.c socks_udp_transport.c datagram_routes.c binding_lease.c flow_metadata.c buffers.c operations.c ../../src/daemon/loop.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/socks5/outbound.c $(wildcard *.h) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG socks_udp_backend_test.c socks_udp_backend.c socks_udp_transport.c datagram_routes.c binding_lease.c flow_metadata.c buffers.c operations.c ../../src/daemon/loop.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/socks5/outbound.c $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD)/socks-udp-backend-negative-test: socks_udp_backend_negative_test.c socks_udp_backend.c socks_udp_transport.c binding_lease.c flow_metadata.c buffers.c operations.c ../../src/daemon/loop.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/socks5/outbound.c $(wildcard *.h) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG socks_udp_backend_negative_test.c socks_udp_backend.c socks_udp_transport.c binding_lease.c flow_metadata.c buffers.c operations.c ../../src/daemon/loop.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/socks5/outbound.c $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD)/socks-udp-contract-test: socks_udp_contract_test.c socks_udp_backend.c socks_udp_transport.c binding_lease.c flow_metadata.c buffers.c operations.c ../../src/daemon/loop.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/socks5/outbound.c $(wildcard *.h) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG socks_udp_contract_test.c socks_udp_backend.c socks_udp_transport.c binding_lease.c flow_metadata.c buffers.c operations.c ../../src/daemon/loop.c $(PROTOCOLS)/src/socks5/codec.c $(PROTOCOLS)/src/socks5/outbound.c $(LDFLAGS) $(LDLIBS) -o $@
+.PHONY: socks-outbound-udp-contract-test
+socks-outbound-udp-contract-test: $(BUILD)/socks-udp-contract-test
+	unshare -n sh -ec 'ip link set lo up; exec $(PYTHON) -B socks_udp_contract_test.py "$(abspath $(BUILD)/socks-udp-contract-test)"'
+.PHONY: socks-outbound-udp-test
+socks-outbound-udp-test: $(BUILD)/socks-udp-backend-test $(BUILD)/socks-udp-backend-negative-test
+	@test -n "$(XRAY)" || { echo 'set XRAY to independent Xray binary' >&2; exit 2; }
+	unshare -n sh -ec 'ip link set lo up; exec $(PYTHON) -B socks_udp_backend_xray_test.py "$(abspath $(BUILD)/socks-udp-backend-test)" "$(abspath $(BUILD)/socks-udp-backend-negative-test)" "$(XRAY)"'
 $(BUILD)/socks-datagram-test: socks_datagram_test.c socks_datagram.c hy2_datagram.c datagram_routes.c datagram.c binding_lease.c flow_metadata.c buffers.c operations.c resolver.c ../../src/daemon/loop.c ../../src/proto/hysteria2/hy2wire.c $(PROTOCOLS)/src/socks5/codec.c $(wildcard *.h) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I../../src/proto/hysteria2 -UNDEBUG \
 	    socks_datagram_test.c socks_datagram.c hy2_datagram.c datagram_routes.c datagram.c binding_lease.c flow_metadata.c buffers.c operations.c resolver.c ../../src/daemon/loop.c ../../src/proto/hysteria2/hy2wire.c $(PROTOCOLS)/src/socks5/codec.c $(LDFLAGS) $(LDLIBS) -o $@
