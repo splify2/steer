@@ -392,7 +392,13 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
  * (tests/vlessmatch.c, R-114; стенд включает этот файл, чтобы дотянуться до шва).
  *
  * Возвращает то же, что tcp_connect: дескриптор либо отрицательный код TR_*. */
+#ifdef STEER_HSDL_TEST
+/* Только для отдельного стенда срока: локальная пара вместо сетевого dial. */
+extern int hsdl_test_dial(const char *host, uint16_t port, int timeout_s);
+static int (*g_tcp_dial)(const char *host, uint16_t port, int timeout_s) = hsdl_test_dial;
+#else
 static int (*g_tcp_dial)(const char *host, uint16_t port, int timeout_s);
+#endif
 
 /* ---- общий срок установления (transport.h, tr_watch_begin) -----------------------------------------
  *
@@ -518,6 +524,15 @@ int tr_watch_end(void) {
     g_scope = 0;
     return fired;
 }
+
+#ifdef STEER_HSDL_TEST
+/* Отрицательный контроль стенда: намеренно заменить общий срок новым. */
+void hsdl_test_restart_watch(int fd, int ms) {
+    tr_watch_end();
+    tr_watch_begin(ms);
+    watch_add(fd);
+}
+#endif
 
 int tr_dial(const char *host, uint16_t port, int timeout_s) {
     /* Внутри общего срока перебор адресов не ждёт дольше его остатка. */

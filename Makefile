@@ -715,12 +715,11 @@ $(BUILD)/tls13readmatch: tests/tls13readmatch.c tests/unit.h src/proto/tls/tls13
 	$(CC) $(CFLAGS) -Isrc/lib -Isrc/proto/tls -o $@ tests/tls13readmatch.c src/proto/tls/tls13.c \
 	      -Wl,--unresolved-symbols=ignore-all -ldl
 
-# Общий срок установления связи с узлом (аудит 2.1.0, F1): сервер, капающий ответ по байту, не держит
-# рукопожатие бесконечно — tr_watch_begin в trdial.c закрывает сокет по сроку. Настоящие tr_dial и tls13.c,
-# криптография не нужна (до неё не доходит; хеш транскрипта заглушен в стенде), сеть — петля.
-$(BUILD)/hsdlmatch: tests/hsdlmatch.c tests/unit.h src/proto/transport/trdial.c src/proto/transport/transport.h src/proto/tls/tls13.c src/proto/tls/tls13.h
+# Общий срок: настоящий tr_dial регистрирует socketpair через тестовый шов;
+# TLS использует frozen ClientHello, хеш транскрипта заглушен.
+$(BUILD)/hsdlmatch: tests/hsdlmatch.c tests/unit.h tests/chello-frozen.h src/proto/transport/trdial.c src/proto/transport/transport.h src/proto/tls/tls13.c src/proto/tls/tls13.h src/proto/tls/tls13_offered.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Isrc/lib -Isrc/proto/tls -Isrc/proto/transport -Itests -o $@ tests/hsdlmatch.c \
+	$(CC) $(CFLAGS) -DSTEER_HSDL_TEST -Isrc/lib -Isrc/proto/tls -Isrc/proto/transport -Itests -o $@ tests/hsdlmatch.c \
 	      src/proto/transport/trdial.c src/proto/tls/tls13.c -Wl,--unresolved-symbols=ignore-all -lpthread -ldl
 
 # Запасной путь при потере длинного ClientHello (tr_link_open): TLS и Reality — заглушки стенда, трогается
