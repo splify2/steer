@@ -358,6 +358,10 @@ $(BUILD)/diagsim: $(CORE_SRC) $(CORE_HDR) src/profile/extended.c VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) src/profile/extended.c
 
+.PHONY: hwid-order-test
+hwid-order-test: $(BUILD)/steer $(BUILD)/steerd
+	python3 -B tests/hwid-order.py $(BUILD)/steer
+
 # SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
 # хеш: в самом идентификаторе он обрезан до двадцати знаков, и расхождение в старших байтах
 # такой проверкой не поймать. Ни сети, ни криптобиблиотеки — файл вложенный и самодостаточный.

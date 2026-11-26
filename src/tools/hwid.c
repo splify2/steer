@@ -191,7 +191,6 @@ void steer_pbkdf2_sha256(const unsigned char *pw, size_t pwlen,
  * знаков, приставка «splify2-». Изменить здесь хоть один шаг — значит объявить каждый уже
  * заведённый роутер новым устройством и отобрать у человека его слот в панели.
  */
-#define HWID_MAX_IFACES 64
 #define HWID_NAME_MAX 32
 
 static int read_line(const char *path, char *out, size_t n) {
@@ -226,12 +225,9 @@ static int mac_usable(const char *m) {
  * wan*) по алфавиту, потом всё остальное физическое. Виртуальные интерфейсы исключены
  * признаком `device` — у моста, туннеля и wifi-ap ссылки на устройство нет.
  *
- * Имена СОРТИРУЮТСЯ. В оболочке это делал сам glob, а readdir отдаёт их в порядке
- * файловой системы — то есть без сортировки идентификатор менялся бы от перезагрузки к
- * перезагрузке на коробке с несколькими портами, и человек терял бы слот в панели без
- * всякого повода. */
+ * readdir не задаёт порядок. За один полный обход храним только лучший годный порт:
+ * виртуальные интерфейсы не должны вытеснять кандидатов, даже если их сотни. */
 static int hwid_mac(char *out, size_t n) {
-    static const char *PFX[] = { "eth", "lan", "wan", "" };
     /* Каталог копируется в буфер известного размера: дальше из него собираются пути, и
      * компилятор обязан видеть, что они влезают. Молча обрезанный путь означал бы чтение
      * чужого файла. Настоящий путь короткий (/sys/class/net), длинным он бывает только у
@@ -240,62 +236,35 @@ static int hwid_mac(char *out, size_t n) {
     if (snprintf(sysnet, sizeof sysnet, "%s",
                  steer_env_or("STEER_SYSNET", "/sys/class/net")) >= (int)sizeof sysnet)
         return 0;
-    char names[HWID_MAX_IFACES][HWID_NAME_MAX];
-    size_t nn = 0;
+    char best[HWID_NAME_MAX] = "";
+    int best_rank = 4;
 
     DIR *d = opendir(sysnet);
     if (!d) return 0;
     const struct dirent *e;
-    while ((e = readdir(d)) != NULL && nn < HWID_MAX_IFACES) {
+    while ((e = readdir(d)) != NULL) {
         if (e->d_name[0] == '.') continue;
         size_t nl = strlen(e->d_name);
         if (nl >= HWID_NAME_MAX) continue;
-        /* Копия ДЛИНОЙ, а не через snprintf с «%s»: длина уже проверена строкой выше, но по
-         * `e->d_name` компилятор этого не видит и предупреждает об усечении, которого не
-         * бывает. Заглушить предупреждение прагмой значило бы спрятать проверку, которая
-         * однажды пригодится; memcpy по проверенной длине её наоборот показывает. */
-        memcpy(names[nn], e->d_name, nl + 1);
-        nn++;
+        char nm[HWID_NAME_MAX];
+        memcpy(nm, e->d_name, nl + 1);
+        int rank = !strncmp(nm, "eth", 3) ? 0 : !strncmp(nm, "lan", 3) ? 1 :
+                   !strncmp(nm, "wan", 3) ? 2 : 3;
+        if (rank > best_rank || (rank == best_rank && strcmp(nm, best) >= 0)) continue;
+
+        char p[384], m[64];
+        snprintf(p, sizeof p, "%s/%s/device", sysnet, nm);
+        if (access(p, F_OK) != 0) continue;
+        snprintf(p, sizeof p, "%s/%s/address", sysnet, nm);
+        if (!read_line(p, m, sizeof m)) continue;
+        for (char *q = m; *q; q++) if (*q >= 'A' && *q <= 'F') *q += 'a' - 'A';
+        if (!mac_usable(m)) continue;
+        memcpy(best, nm, nl + 1);
+        best_rank = rank;
+        snprintf(out, n, "%s", m);
     }
     closedir(d);
-
-    /* Сортировка вставками: имён на роутере десяток-полтора, и заводить ради них qsort с
-     * функцией сравнения было бы больше кода, чем сама сортировка. */
-    for (size_t i = 1; i < nn; i++)
-        for (size_t j = i; j && strcmp(names[j - 1], names[j]) > 0; j--) {
-            /* Обмен через memcpy, а не через snprintf: обе строки лежат в одном массиве,
-             * и `snprintf` с «%s» из него же — это перекрытие источника и приёмника, о
-             * котором компилятор законно предупреждает (-Wrestrict). Длина известна, обмен
-             * целыми ячейками её и использует. */
-            char t[HWID_NAME_MAX];
-            memcpy(t, names[j - 1], HWID_NAME_MAX);
-            memcpy(names[j - 1], names[j], HWID_NAME_MAX);
-            memcpy(names[j], t, HWID_NAME_MAX);
-        }
-
-    for (size_t k = 0; k < sizeof PFX / sizeof PFX[0]; k++) {
-        size_t pl = strlen(PFX[k]);
-        for (size_t i = 0; i < nn; i++) {
-            if (pl && strncmp(names[i], PFX[k], pl)) continue;
-            /* Имя через свой буфер известного размера: по `names[i]` компилятор не видит,
-             * где кончается строка внутри общего массива, и не может доказать, что путь
-             * влезает. Доказательство здесь дешевле подавленного предупреждения. */
-            char nm[HWID_NAME_MAX];
-            memcpy(nm, names[i], HWID_NAME_MAX);
-            nm[HWID_NAME_MAX - 1] = 0;
-            char p[384];
-            snprintf(p, sizeof p, "%s/%s/device", sysnet, nm);
-            if (access(p, F_OK) != 0) continue;   /* виртуальный интерфейс */
-            snprintf(p, sizeof p, "%s/%s/address", sysnet, nm);
-            char m[64];
-            if (!read_line(p, m, sizeof m)) continue;
-            for (char *q = m; *q; q++) if (*q >= 'A' && *q <= 'F') *q += 'a' - 'A';
-            if (!mac_usable(m)) continue;
-            snprintf(out, n, "%s", m);
-            return 1;
-        }
-    }
-    return 0;
+    return best[0] != '\0';
 }
 
 /* Сам идентификатор. Приставка НЕ украшение: HWID человек видит в панели и в боте, и по
