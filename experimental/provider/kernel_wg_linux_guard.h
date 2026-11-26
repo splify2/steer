@@ -12,5 +12,9 @@ struct steer_draft_wg_linux_guard {
     int scoped_route;
 };
 extern const struct steer_draft_wg_backend steer_draft_wg_linux_guard_backend;
+/* Owned-link admission barrier; fresh namespace/identity and state checks.
+ * On error, state distinguishes confirmed closed from unknown. */
+int steer_draft_wg_linux_guard_barrier_close(void *,const struct steer_draft_wg_guard_record *,uint64_t,uint32_t *);
+int steer_draft_wg_linux_guard_barrier_open(void *,const struct steer_draft_wg_guard_record *,uint64_t,uint32_t *);
 
 #endif

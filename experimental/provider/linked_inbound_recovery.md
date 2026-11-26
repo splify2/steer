@@ -12,7 +12,9 @@ The supported plan is one peer/source IPv4 `/32`, empty ordered policy and
 DIRECT default. A return-only guard, other policy, or other source geometry is
 rejected. Before and after guard capture, recovery reconciles the journaled
 owned WireGuard identity against pinned and current network namespace and boot,
-and compares the observed effective ifindex with the record. The capture then
+compares the observed effective ifindex with the record, and requires the owned
+link to be UP before and after the other checks. A DOWN barrier is not silently
+treated as ready. The capture then
 compares table name, recorded handle and marker, and the actual guard rules.
 An inbound-specific generic-netlink check requires exactly one complete device
 message, one peer with the expected public key and one expected IPv4 `/32`

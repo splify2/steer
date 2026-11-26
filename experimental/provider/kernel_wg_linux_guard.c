@@ -3,6 +3,7 @@
 #include "nftdump.h"
 #include <steer/draft/device_v1.h>
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 
 static int create(void *ctx,const struct steer_draft_wg_identity *id,int mtu,uint64_t d,int *index){
@@ -80,3 +81,42 @@ const struct steer_draft_wg_backend steer_draft_wg_linux_guard_backend={
     .create_down=create,.stage_down=stage,.guard=guard,.up=up,.retire_link=retire,
     .lookup_guard=lookup,.retire_guard=retire_guard
 };
+
+static int barrier_identity(const struct steer_draft_wg_linux_guard *g,
+    const struct steer_draft_wg_guard_record *r,uint64_t d){
+    if(!g||!g->link||!r||!r->ifindex||r->ifindex>INT_MAX||strcmp(r->link.kind,"wireguard"))return EINVAL;
+    struct steer_draft_wg_observation seen;
+    int rc=steer_draft_wg_identity_reconcile(&r->link,steer_draft_wg_linux_link_namespace(g->link),d,&seen);
+    if(rc)return rc;
+    return seen.state==STEER_DRAFT_WG_OWNED&&seen.index==(int)r->ifindex?0:ESTALE;
+}
+static int barrier_state(const struct steer_draft_wg_linux_guard *g,
+    const struct steer_draft_wg_guard_record *r,uint64_t d,int up){
+    int rc=barrier_identity(g,r,d);if(rc)return rc;
+    return up?awg_dev_link_require_up_owned_until(r->link.physical_name,r->link.kind,(int)r->ifindex,r->link.group,d):
+        awg_dev_link_require_down_owned_until(r->link.physical_name,r->link.kind,(int)r->ifindex,r->link.group,d);
+}
+int steer_draft_wg_linux_guard_barrier_close(void *ctx,const struct steer_draft_wg_guard_record *r,uint64_t d,uint32_t *state){
+    if(!state)return EINVAL;
+    *state=STEER_INBOUND_BARRIER_UNKNOWN;
+    const struct steer_draft_wg_linux_guard *g=ctx;
+    int rc=barrier_identity(g,r,d);
+    if(rc)return rc;
+    int mutate=awg_dev_link_down_owned_until(r->link.physical_name,r->link.kind,(int)r->ifindex,r->link.group,d);
+    rc=barrier_state(g,r,d,0);
+    if(!rc)*state=STEER_INBOUND_BARRIER_CLOSED;
+    return mutate?mutate:rc;
+}
+int steer_draft_wg_linux_guard_barrier_open(void *ctx,const struct steer_draft_wg_guard_record *r,uint64_t d,uint32_t *state){
+    if(!state)return EINVAL;
+    *state=STEER_INBOUND_BARRIER_UNKNOWN;
+    const struct steer_draft_wg_linux_guard *g=ctx;
+    int rc=barrier_state(g,r,d,0);
+    if(rc)return rc;
+    int mutate=awg_dev_link_up_owned_until(r->link.physical_name,r->link.kind,(int)r->ifindex,r->link.group,d);
+    rc=barrier_state(g,r,d,1);
+    if(!mutate&&!rc){*state=STEER_INBOUND_BARRIER_OPEN;return 0;}
+    int failure=mutate?mutate:rc;
+    (void)steer_draft_wg_linux_guard_barrier_close(ctx,r,d,state);
+    return failure;
+}

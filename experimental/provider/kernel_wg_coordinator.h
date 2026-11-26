@@ -47,6 +47,9 @@ struct steer_draft_wg_ready {
     struct steer_draft_wg_guard_record guard;
     uint16_t listen_port;
 };
+#define STEER_INBOUND_BARRIER_UNKNOWN 0u
+#define STEER_INBOUND_BARRIER_CLOSED 1u
+#define STEER_INBOUND_BARRIER_OPEN 2u
 
 /* Positive errno. On failure ready stays unchanged and cleanup_error reports
  * whether candidate cleanup is still needed. The previous generation is never
@@ -100,13 +103,20 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *,const struc
 /* Inbound-only first device: durable link/guard intent, stage and UP under a
  * confirmed DROP guard. No allow-policy publication. The caller keeps the
  * prepared guard alive. Publication requires a confirmed matching store receipt
- * at the higher participant boundary. Old eager APIs are unchanged. */
+ * and a confirmed closed independent barrier at the higher participant
+ * boundary; this low-level API cannot verify the receipt. Old eager APIs are
+ * unchanged. */
 int steer_draft_wg_selection_stage_closed(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
     void *,const struct steer_draft_wg_revision *,const struct steer_draft_wg_tx *,
     const struct steer_draft_wg_candidate *,uint64_t,struct steer_draft_wg_ready *);
+#define STEER_INBOUND_PUBLICATION_NONE 0u
+/* CONFIRMED requires CHANGED plus a synced journal outcome, even if the
+ * backend also returned an error. UNKNOWN never authorizes opening. */
+#define STEER_INBOUND_PUBLICATION_CONFIRMED 1u
+#define STEER_INBOUND_PUBLICATION_UNKNOWN 2u
 int steer_draft_wg_selection_publish_closed(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
     void *,const struct steer_draft_wg_revision *,const struct steer_draft_wg_tx *,
-    uint64_t,struct steer_draft_wg_ready *);
+    uint64_t,struct steer_draft_wg_ready *,uint32_t *);
 /* Owner has stopped admission and joined this generation's bindings.
  * The durable selected revision is rechecked; it cannot be retired here. */
 int steer_draft_wg_selection_retire(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,

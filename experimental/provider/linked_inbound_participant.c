@@ -68,7 +68,7 @@ int steer_linked_inbound_prepare_closed(struct steer_linked_inbound *p,const str
     const struct steer_draft_wg_candidate *input,const struct steer_draft_kernel_wg_guard_config *config,
     const struct steer_policy *policy,uint64_t deadline){
     if(!p||!steer_draft_wg_selection_is_inbound(p->journal)||!p->backend||!p->backend_guard||*p->backend_guard||
-       !tx||!input||!config||!policy||!p->recovered||p->fenced||p->staged||p->closed_guard||
+       !p->barrier_close||!p->barrier_open||!tx||!input||!config||!policy||!p->recovered||p->fenced||p->staged||p->closed_guard||
        !p->committed.generation||!p->committed.without_wg||config->return_only||!config->peer_count||
        config->generation!=tx->generation||strcmp(config->device,input->link.physical_name)||
        input->link.generation!=tx->generation)return EINVAL;
@@ -85,6 +85,8 @@ int steer_linked_inbound_prepare_closed(struct steer_linked_inbound *p,const str
     p->closed_tx=*tx;
     p->pending=(struct steer_draft_wg_revision){.generation=tx->generation};
     memcpy(p->pending.digest,tx->plan_digest,sizeof(p->pending.digest));
+    p->barrier_state=STEER_INBOUND_BARRIER_UNKNOWN;
+    p->publication_state=STEER_INBOUND_PUBLICATION_NONE;
     p->closed_stage=1;p->staged=1;
     return 0;
 }
@@ -107,7 +109,21 @@ int steer_linked_inbound_finish_closed(struct steer_linked_inbound *p,struct ste
      * guard publication fails. Journal intent precedes the fallible mutation. */
     struct steer_draft_wg_revision previous=p->committed;
     p->committed=*chosen;p->durable_unknown=0;
-    int rc=steer_draft_wg_selection_publish_closed(p->journal,p->backend,p->context,&previous,&p->closed_tx,deadline,&p->candidate);
+    p->barrier_state=STEER_INBOUND_BARRIER_UNKNOWN;
+    int rc=p->barrier_close(p->context,&p->candidate.guard,deadline,&p->barrier_state);
+    if(!rc&&p->barrier_state!=STEER_INBOUND_BARRIER_CLOSED)rc=EIO;
+    if(!rc)rc=steer_draft_wg_selection_publish_closed(p->journal,p->backend,p->context,&previous,&p->closed_tx,
+        deadline,&p->candidate,&p->publication_state);
+    if(!rc&&p->publication_state!=STEER_INBOUND_PUBLICATION_CONFIRMED)rc=EIO;
+    if(!rc){
+        p->barrier_state=STEER_INBOUND_BARRIER_UNKNOWN;
+        rc=p->barrier_open(p->context,&p->candidate.guard,deadline,&p->barrier_state);
+        if(!rc&&p->barrier_state!=STEER_INBOUND_BARRIER_OPEN)rc=EIO;
+    }
+    if(rc){
+        p->barrier_state=STEER_INBOUND_BARRIER_UNKNOWN;
+        (void)p->barrier_close(p->context,&p->candidate.guard,deadline,&p->barrier_state);
+    }
     forget_closed(p);
     if(!rc)p->fenced=0;
     return rc;

@@ -35,6 +35,8 @@ static int verify(void *arg,const struct steer_draft_wg_guard_record *r,uint64_t
     int rc=steer_draft_wg_identity_reconcile(&r->link,ns,deadline,&seen);
     if(rc)return rc;
     if(seen.state!=STEER_DRAFT_WG_OWNED||seen.index<=0||(uint32_t)seen.index!=r->ifindex)return ESTALE;
+    rc=awg_dev_link_require_up_owned_until(r->link.physical_name,r->link.kind,seen.index,r->link.group,deadline);
+    if(rc)return rc;
     struct steer_inbound_guard_plan plan={r->table,r->marker,peer,r->handle,r->ifindex};
     rc=steer_inbound_guard_capture_verify(&plan,deadline);
     if(rc)return rc;
@@ -43,7 +45,8 @@ static int verify(void *arg,const struct steer_draft_wg_guard_record *r,uint64_t
     if(rc)return rc;
     rc=steer_draft_wg_identity_reconcile(&r->link,ns,deadline,&seen);
     if(rc)return rc;
-    return seen.state==STEER_DRAFT_WG_OWNED&&seen.index>0&&(uint32_t)seen.index==r->ifindex?0:ESTALE;
+    if(seen.state!=STEER_DRAFT_WG_OWNED||seen.index<=0||(uint32_t)seen.index!=r->ifindex)return ESTALE;
+    return awg_dev_link_require_up_owned_until(r->link.physical_name,r->link.kind,seen.index,r->link.group,deadline);
 }
 int steer_linked_inbound_recover_checked(struct steer_linked_inbound *p,
     struct steer_linked_inbound_recovery *c,uint64_t deadline,uint64_t *next,struct steer_draft_wg_guard_record *selected){

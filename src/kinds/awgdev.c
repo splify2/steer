@@ -1149,6 +1149,11 @@ int awg_dev_link_require_down_owned_until(const char *name,const char *kind,int 
     int rc=owned_identity_state_until(name,kind,index,group,&flags,deadline);
     return rc?rc:(flags&IFF_UP)?EBUSY:0;
 }
+int awg_dev_link_require_up_owned_until(const char *name,const char *kind,int index,uint32_t group,uint64_t deadline){
+    unsigned flags=0;
+    int rc=owned_identity_state_until(name,kind,index,group,&flags,deadline);
+    return rc?rc:(flags&IFF_UP)?0:ENETDOWN;
+}
 int awg_dev_link_create_owned_until(const char *name,const char *kind,int mtu,uint32_t group,int *out_index,uint64_t deadline){
     uint8_t buffer[512];struct link_ctx created={0};
     if(out_index)*out_index=0;

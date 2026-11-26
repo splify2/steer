@@ -41,6 +41,13 @@ def main(binary):
             return {str(p.relative_to(journal)):p.read_bytes() for p in journal.rglob('*') if p.is_file()}
         prior=table(orphan[1]);assert prior['nftables'][1]['table']['handle']==orphan[3]
         records=journal_state()
+        command(['ip','link','set','dev',active[0],'down'])
+        try:
+            assert run('recover',1)==f'RECOVERY {errno.ENETDOWN}\n'
+            assert table(orphan[1])==prior and journal_state()==records
+        finally:
+            command(['ip','link','set','dev',active[0],'up'])
+        print('PASS owned but DOWN device refused before cleanup')
         assert run('wrong-digest',1)==f'RECOVERY {errno.EPROTO}\n'
         assert run('wrong-generation',1)==f'RECOVERY {errno.EPROTO}\n'
         assert run('wrong-role',1)==f'RECOVERY {errno.EOPNOTSUPP}\n'

@@ -156,7 +156,8 @@ int steer_draft_wg_coordinator_recover(struct steer_spec_journal *j,const struct
 
 static int change_guard(struct steer_spec_journal *j,const struct steer_draft_wg_backend *b,void *ctx,
     const struct steer_draft_wg_tx *t,struct steer_draft_wg_guard_record *g,int publish,
-    uint64_t deadline,const atomic_uint *cancel,const char *owner){
+    uint64_t deadline,const atomic_uint *cancel,const char *owner,uint32_t *publication){
+    if(publication)*publication=STEER_INBOUND_PUBLICATION_NONE;
     unsigned step=publish?PUBLISH:BIND;
     int rc=append(j,t,step,0,NULL,g,owner);
     if(rc)return rc;
@@ -168,6 +169,7 @@ static int change_guard(struct steer_spec_journal *j,const struct steer_draft_wg
     uint32_t effect=STEER_PV1_DEVICE_EFFECT_UNCERTAIN;
     uint64_t handle=0;
     int work=b->guard(ctx,g,publish,deadline,&effect,&handle);
+    if(publication)*publication=STEER_INBOUND_PUBLICATION_UNKNOWN;
     if(effect>STEER_PV1_DEVICE_EFFECT_UNCERTAIN||
        (effect==STEER_PV1_DEVICE_CHANGED?(!handle||handle==g->handle):handle!=0)){
         effect=STEER_PV1_DEVICE_EFFECT_UNCERTAIN;
@@ -176,6 +178,8 @@ static int change_guard(struct steer_spec_journal *j,const struct steer_draft_wg
     if(effect==STEER_PV1_DEVICE_CHANGED)g->handle=handle;
     rc=append(j,t,step+1,effect,NULL,g,owner);
     if(rc)return rc;
+    if(publication)*publication=effect==STEER_PV1_DEVICE_CHANGED?STEER_INBOUND_PUBLICATION_CONFIRMED:
+        effect==STEER_PV1_DEVICE_UNCHANGED?STEER_INBOUND_PUBLICATION_NONE:STEER_INBOUND_PUBLICATION_UNKNOWN;
     return work?work:effect==STEER_PV1_DEVICE_CHANGED?0:EIO;
 }
 
@@ -206,12 +210,12 @@ static int stage_candidate(struct steer_spec_journal *j,const struct steer_draft
     if(!rc)rc=running(deadline,cancel);
     if(!rc){
         g.ifindex=(uint32_t)index;
-        rc=change_guard(j,b,ctx,t,&g,0,deadline,cancel,owner);
+        rc=change_guard(j,b,ctx,t,&g,0,deadline,cancel,owner,NULL);
     }
     if(!rc)rc=running(deadline,cancel);
     if(!rc)rc=b->up(ctx,&g,deadline);
     if(!rc)rc=running(deadline,cancel);
-    if(!rc&&publish)rc=change_guard(j,b,ctx,t,&g,1,deadline,cancel,owner);
+    if(!rc&&publish)rc=change_guard(j,b,ctx,t,&g,1,deadline,cancel,owner,NULL);
     if(!rc)rc=running(deadline,cancel);
     if(!rc)*ready=(struct steer_draft_wg_ready){g,c->config->listen_port};
     return rc;
@@ -481,9 +485,10 @@ int steer_draft_wg_selection_stage_closed(struct steer_draft_wg_selection *s,con
 }
 int steer_draft_wg_selection_publish_closed(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
     void *ctx,const struct steer_draft_wg_revision *previous,const struct steer_draft_wg_tx *tx,
-    uint64_t deadline,struct steer_draft_wg_ready *ready){
+    uint64_t deadline,struct steer_draft_wg_ready *ready,uint32_t *publication){
+    if(publication)*publication=STEER_INBOUND_PUBLICATION_NONE;
     if(!steer_draft_wg_selection_is_inbound(s)||!b||!b->guard||!previous||!previous->without_wg||
-       !tx_valid(tx)||!ready||!ready->guard.handle)return EINVAL;
+       !tx_valid(tx)||!ready||!ready->guard.handle||!publication)return EINVAL;
     int rc=running(deadline,NULL);
     if(rc)return rc;
     struct inventory i;
@@ -501,7 +506,7 @@ int steer_draft_wg_selection_publish_closed(struct steer_draft_wg_selection *s,c
     }
     free(i.e);
     if(rc)return rc;
-    return change_guard(s->j,b,ctx,tx,&ready->guard,1,deadline,NULL,s->owner);
+    return change_guard(s->j,b,ctx,tx,&ready->guard,1,deadline,NULL,s->owner,publication);
 }
 
 int steer_draft_wg_selection_reuse(struct steer_draft_wg_selection *s,const struct steer_draft_wg_revision *r,

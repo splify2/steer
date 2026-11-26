@@ -4,6 +4,9 @@
 #include "kernel_wg_guard.h"
 #include "prototype_store.h"
 
+/* Serialized callbacks must use the pinned namespace and freshly verify
+ * ownership/state. UNKNOWN is not proof that the dataplane is closed. */
+typedef int (*steer_inbound_barrier_fn)(void *,const struct steer_draft_wg_guard_record *,uint64_t,uint32_t *);
 /* Internal serialized worker participant; no store, revision selection or
  * schema. The owner supplies an already validated inbound config, externally
  * recovered revision, backend and exact identity/peer attestation callback.
@@ -18,6 +21,8 @@ struct steer_linked_inbound {
     struct steer_draft_wg_ready candidate;
     struct steer_draft_wg_tx closed_tx;
     struct steer_draft_kernel_wg_guard *closed_guard;
+    steer_inbound_barrier_fn barrier_close,barrier_open;
+    uint32_t barrier_state,publication_state;
     int staged, fenced, recovered, closed_stage, durable_unknown;
 };
 int steer_linked_inbound_recover(struct steer_linked_inbound *,const struct steer_draft_wg_revision *,
