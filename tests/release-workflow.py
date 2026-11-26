@@ -29,7 +29,9 @@ class ReleaseWorkflow(unittest.TestCase):
     def test_strict_pluginmgr_gate(self):
         step = steps[by_name['Стенды расширенной части на настоящей wolfSSL (внутри образа сборки)']]
         self.assertFalse(step.get('continue-on-error', False))
-        for fragment in ('-v "$S2P:/opt/s2p:ro"', '-e S2P=/opt/s2p', '-e PM_STRICT=1', 'set -o pipefail'):
+        for fragment in ('-v "$S2P:/opt/s2p:ro"', '-e S2P=/opt/s2p', '-e PM_STRICT=1',
+                         'set -o pipefail', '--network none', '--cap-drop ALL',
+                         '--cap-add SYS_ADMIN', '--cap-add NET_ADMIN', '--security-opt no-new-privileges'):
             self.assertIn(fragment, step['run'])
         self.assertNotIn('|| true', step['run'])
         env = dict(os.environ, S2P='/nonexistent/steer-s2p', PM_STRICT='1')
@@ -40,6 +42,12 @@ class ReleaseWorkflow(unittest.TestCase):
         result = subprocess.run(['sh', 'tests/pluginmgrmatch.sh'], env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
         self.assertIn('ПРОПУСК', result.stdout)
+        env.update(S2P='/bin/true', PM_STRICT='1', PM_INNER='1')
+        env.pop('PM_PARENT_NETNS', None)
+        result = subprocess.run(['sh', 'tests/pluginmgrmatch.sh', '/bin/true'],
+                                env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('не изолирован', result.stderr)
 
     def test_simulated_failures(self):
         # Inject failure at every step; record only publication steps actually reached.

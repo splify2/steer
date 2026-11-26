@@ -266,7 +266,11 @@ jobs:
           #
           # Логика — в отдельном скрипте, а не строкой в `docker run -c`: тот же довод, что
           # у build/build-ext.sh, там экранирование внутри кавычек однажды стоило сборки.
-          docker run --rm -v "$PWD:/src" -v "$S2P:/opt/s2p:ro" \
+          # Отдельный контейнер без внешней сети; лишь права для unshare/netns и loopback.
+          # При отсутствии этих прав strict pluginmgrmatch прерывает gate, а не пропускает демон.
+          docker run --rm --network none --cap-drop ALL --cap-add SYS_ADMIN --cap-add NET_ADMIN \
+            --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,exec,size=1g \
+            -v "$PWD:/src" -v "$S2P:/opt/s2p:ro" \
             -e S2P=/opt/s2p -e PM_STRICT=1 -w /src --entrypoint sh \
             "${STEER_BUILDER_IMAGE:-steer-builder:wolfssl}" \
             /src/build/ext-test-image.sh 2>&1 | tee /tmp/ext-test.log

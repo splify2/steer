@@ -62,10 +62,24 @@ fi
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 [ -x "$BIN" ] || { echo "pluginmgrmatch: нет $BIN"; exit 2; }
 
-if [ "${PM_INNER:-}" != 1 ] && [ "$(id -u)" = 0 ] && unshare -n true 2>/dev/null; then
-    PM_INNER=1 S2P="$S2P" exec unshare -n sh "$0" "$BIN"
+if [ "${PM_INNER:-}" != 1 ]; then
+    if [ "$(id -u)" = 0 ] && unshare -n true 2>/dev/null; then
+        parent_ns=$(readlink /proc/self/ns/net) || skip "не удалось проверить исходный сетевой namespace"
+        PM_INNER=1 PM_PARENT_NETNS="$parent_ns" S2P="$S2P" exec unshare -n sh "$0" "$BIN"
+    elif [ "${PM_STRICT:-0}" = 1 ]; then
+        skip "блоку с демоном нужны root и отдельный сетевой namespace (unshare)"
+    fi
 fi
-[ "${PM_INNER:-}" = 1 ] && ip link set lo up 2>/dev/null
+if [ "${PM_INNER:-}" = 1 ]; then
+    if [ "${PM_STRICT:-0}" = 1 ]; then
+        self_ns=$(readlink /proc/self/ns/net) || skip "не удалось проверить сетевой namespace"
+        [ -n "${PM_PARENT_NETNS:-}" ] && [ "$self_ns" != "$PM_PARENT_NETNS" ] ||
+            skip "блок с демоном не изолирован от исходного сетевого namespace"
+    fi
+    ip link set lo up 2>/dev/null || {
+        [ "${PM_STRICT:-0}" != 1 ] || skip "не удалось поднять loopback в отдельном namespace"
+    }
+fi
 
 T="$(mktemp -d /tmp/pluginmgrmatch.XXXXXX)"
 HP="" D="" SUBP=""
