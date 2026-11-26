@@ -334,6 +334,27 @@ o="$(P search --json 2>/dev/null)"
 has "индекс чужим ключом не принят" "такого ключа у ядра нет" "$o"
 rm -rf repo && mv repo.good repo
 
+# Подписанные индексы с чужим id и истёкшим сроком: проверяем не только отказ,
+# но и сохранение значений из разобранного документа в диагностике.
+cp repo/index.json index.good
+cp repo/index.json.sig index.good.sig
+"$S2P" index dist -o foreign-index --repo other --pub proto.pub --pub plg.pub --key idx.sec \
+    --mirror https://mirror.invalid/ --meta meta.json >/dev/null 2>&1 || exit 1
+cp foreign-index/index.json repo/index.json
+cp foreign-index/index.json.sig repo/index.json.sig
+rm -rf run/splify2
+o="$(P search --json 2>/dev/null)"
+has "чужой подписанный индекс называет его id" "назван «other»" "$o"
+"$S2P" index dist -o expired-index --repo splify2 --pub proto.pub --pub plg.pub --key idx.sec \
+    --mirror https://mirror.invalid/ --meta meta.json --now 2001-01-01T00:00:00Z >/dev/null 2>&1 || exit 1
+cp expired-index/index.json repo/index.json
+cp expired-index/index.json.sig repo/index.json.sig
+rm -rf run/splify2
+o="$(P search --json 2>/dev/null)"
+has "просроченный индекс называет срок" "просрочен (2001-01-31T00:00:00Z)" "$o"
+cp index.good repo/index.json
+cp index.good.sig repo/index.json.sig
+
 # ---- откат индекса ----
 cp etc/repos.d/splify2.json repo.bak
 python3 - etc/repos.d/splify2.json <<'PY'
@@ -343,6 +364,8 @@ PY
 rm -rf run/splify2
 o="$(P search --json 2>/dev/null)"
 has "индекс старее виденного отвергнут" "старее уже виденного" "$o"
+has "отказ отката называет сохранённое время" "2099-01-01T00:00:00Z" "$o"
+has "отказ отката называет время индекса" "$(jq_ 'd["generated"]' < repo/index.json)" "$o"
 cp repo.bak etc/repos.d/splify2.json
 
 # ---- обновление и откат ----
