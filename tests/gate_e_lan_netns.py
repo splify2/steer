@@ -21,7 +21,7 @@ DEST = '198.51.100.42'
 PORT = '28081'
 
 
-def topology():
+def topology(key_dir=None):
     cmd('ip', 'link', 'set', 'lo', 'up')
     Path('/proc/sys/net/ipv4/ip_forward').write_text('1\n')
     for ns, dev, prefix in [('client', 'br-lan', '10.17.0'), ('upstream', 'underlay', '192.0.2')]:
@@ -36,8 +36,9 @@ def topology():
     cmd(*PEER, 'ip', 'addr', 'add', DEST + '/32', 'dev', 'lo')
     keys = []
     for name in ['router', 'peer']:
-        path = Path('/tmp') / name
-        path.write_bytes(cmd('wg', 'genkey', stdout=subprocess.PIPE).stdout)
+        path = (key_dir or Path('/tmp')) / name
+        if key_dir is None:
+            path.write_bytes(cmd('wg', 'genkey', stdout=subprocess.PIPE).stdout)
         keys.append((path, cmd('wg', 'pubkey', input=path.read_bytes(), stdout=subprocess.PIPE)
                      .stdout.decode().strip()))
     for i, (ns, dev, ip, allowed) in enumerate([

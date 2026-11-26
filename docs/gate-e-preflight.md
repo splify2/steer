@@ -279,3 +279,57 @@ underlay counter with continuous LAN traffic during the transitions. This is
 a controlled service lifecycle in a private namespace, **not** systemd or
 machine boot. Power-loss recovery, adoption of orphan processes, host package
 integration and full E4 remain open.
+
+### Three actual systemd guest boots on one offline disk
+
+`tests/gate-e-guest/boot.py` builds a disposable ext4 root image and runs a
+single QEMU/KVM VM through **two clean guest reboots and a poweroff**. QEMU
+loads a local Linux kernel directly; the root filesystem, real systemd PID 1,
+boot units, both service generations and paired state are on the same writable
+virtio disk. This tests guest boot from persistent root, not installation of
+GRUB/EFI or bootloader selection. The tested kernel has virtio-blk, virtio-pci
+and ext4 built in; an initrd is unnecessary. No host filesystem is mounted
+into the VM. `-nodefaults -nic none` gives it no external NIC; the initial
+guest network namespace must contain only `lo`.
+
+| Boot | Before any management action | Operation after the LAN smoke |
+| --- | --- | --- |
+| 0 | The router unit provisions the fixture, private WG keys and plan, then automatically starts the selected legacy daemon | Upgrade to compatibility mode, recheck WG echo, remove staging paths, request `reboot.target` |
+| 1 | The same unit rebuilds the private topology from disk; the selected candidate starts itself with its sealed plan and original peer keys | Verify candidate binary/state, rollback offline, recheck the restored LAN echo, request `reboot.target` |
+| 2 | The old daemon starts with its original binary, spec and registry, all under a third kernel boot ID | Verify LAN again and request `poweroff.target` |
+
+The router runs under the same PID/mount/netns guards as the private service;
+systemd `ExecStop` requests its guarded stop on shutdown. A separate check unit
+joins the running service's namespaces and queries it. It never starts a daemon
+or issues Apply. Every boot checks executable and state paths, exact source
+bytes and registry, both WG public identities and peer selections, fixed client
+MAC/IP, byte-exact TCP echo and WG transfer. Only the boot IDs and modes are
+printed; private keys stay on the disposable disk. After poweroff the runner
+uses **read-only** debugfs to check boot history, stopped service state, both
+executable images and the persisted spec/plan/registries. It also checks ext4
+was cleanly unmounted and runs `e2fsck -fn`. A missing boot or timeout fails.
+
+Reproducer for the tested Ubuntu 24.04 x86_64 layout: accessible `/dev/kvm`,
+readable `vmlinuz-<release>` and matching `/lib/modules/<release>`, systemd
+255, distro `/usr/bin/python3`, BusyBox, dash, kmod, util-linux, iproute2,
+nftables, wireguard-tools and e2fsprogs. The builder copies individual tools,
+ELF dependencies, Python stdlib and matching modules, not host `/etc` or units
+from a running installation. With the unpacked QEMU tools under `$T`:
+
+```sh
+make build/steerd
+/usr/bin/python3 -B tests/gate-e-guest/boot.py \
+  --work "$private_tmp" --kernel "/boot/vmlinuz-$release" \
+  --qemu "$T/usr/bin/qemu-system-x86_64" --roms "$T/usr/share/qemu" \
+  --bios "$T/usr/share/seabios/bios-256k.bin" --libdir "$T/usr/lib/x86_64-linux-gnu" \
+  --legacy /path/to/v2.1.4/build/steerd --backend build/steerd
+```
+
+When QEMU is absent, the tested local tool tree was obtained with `apt-get
+download` in a private temporary directory and `dpkg-deb -x "$deb" "$T"` for
+each archive: `qemu-system-x86 qemu-system-data seabios libfdt1 libpmem1
+libslirp0 libdaxctl1 libndctl6`. This installs nothing on the host. No guest
+downloads or host loop devices, network changes, systemd registration or reboot
+are involved. The root image is deleted after the run. This gate covers
+orderly guest shutdown/reboot for this one LAN profile; **power loss**, package
+upgrade on an existing host, and general distro boot integration remain open.

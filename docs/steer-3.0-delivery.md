@@ -372,8 +372,12 @@ offline rollback, включая отсутствие обхода при бло
 Помимо cold one-shot Apply, [частный supervisor](gate-e-preflight.md#private-service-switch-and-recovery)
 проверяет запуск обеих пар через `daemon --apply`, защищённый stop/down/switch/start,
 возврат после отказа запуска и холодный перезапуск службы с тем же LAN-клиентом.
-Невозможность восстановления видна как `degraded`. Это Linux netns и IPv4 TCP,
-не systemd или загрузка машины; E4 в целом остаётся открыт.
+Невозможность восстановления видна как `degraded`. Отдельно [проверка загрузки
+гостя](gate-e-preflight.md#three-actual-systemd-guest-boots-on-one-offline-disk)
+запускает systemd на одном ext4-диске KVM: legacy → reboot с выбранным
+кандидатом → offline rollback → reboot с прежней парой. У всех трёх загрузок
+разные `boot_id` и тот же IPv4 LAN-клиент и WG-пиры. Это штатные перезагрузки,
+не потеря питания или установка на рабочий хост; E4 в целом остаётся открыт.
 
 Concurrent applies сериализуются core; expected revision перепроверяется в
 commit после validate. Idempotency key привязан к actor + normalized payload hash:
