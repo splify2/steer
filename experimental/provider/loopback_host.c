@@ -193,6 +193,7 @@ struct host {
 struct prepared {
     struct generation *generation;
     unsigned keep[LISTENERS], created[LISTENERS];
+    int validation_only;
     struct control *control;
     uint64_t control_serial;
 };
@@ -1275,6 +1276,9 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     if(!validate&&config->generation!=next) { result=409;goto cleanup; }
 #ifdef STEER_PROTOTYPE_WG_NETNS
     if(config->wg&&(!h->linked_wg||steer_linked_wg_keys(config->wg,&wg_keys)))goto cleanup;
+    /* Parsing/Validate only. No runtime device participant is wired here yet.
+     * In particular, never persist or report Apply success for this profile. */
+    if(config->wg_inbound_validate&&(!validate||steer_linked_wg_keys(config->wg_inbound_validate,&wg_keys)))goto cleanup;
     if(!validate&&h->linked_wg&&!wg_generation_ready(h->current)){result=503;goto cleanup;}
     if(h->linked_wg&&!h->current){
         if(config->format!=STEER_STORE_FORMAT_SPEC_V3)goto cleanup;
@@ -1323,7 +1327,10 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
         }
 #endif
     }
-    if (validate) { result = 200; goto cleanup; }
+    if (validate) {
+        prepared_state->validation_only=config->wg_inbound_validate!=NULL;
+        result = 200; goto cleanup;
+    }
 #ifdef STEER_PROTOTYPE_WG_NETNS
     if(h->linked_wg&&initial_format&&steer_linked_wg_recover(h->linked_wg,config,&wg_keys,&h->wg_next,&recovered_wg)){
         result=503;goto cleanup;
@@ -1709,7 +1716,9 @@ static void prepared_ready(void *user,struct steer_prototype_prepared_input *inp
         free(prepared);control_error(c,408);return;
     }
     if(input->validate) {
-        free(prepared);n=snprintf(body,sizeof body,"{\"valid\":true,\"persistence\":%s}",h->store?"true":"false");
+        int validation_only=prepared->validation_only;
+        free(prepared);n=snprintf(body,sizeof body,"{\"valid\":true,\"persistence\":%s%s}",h->store?"true":"false",
+            validation_only?",\"validationOnly\":true,\"candidateRuntimeReady\":false":"");
         control_response(c,200,body,(size_t)n);return;
     }
     if(h->store) {
@@ -1892,7 +1901,7 @@ int steer_prototype_main(int argc, char **argv)
     struct steer_pv1_error error;
     FILE *file;
     size_t length = 0;
-    int result = 1, seed = 0, linked_wg=0;
+    int result = 1, seed = 0, linked_wg=0, inbound_validate=0;
 #ifdef STEER_PROTOTYPE_WG_NETNS
     /* One exclusive opt-in profile, kernel dataplane, serialized control.
      * fd 3 must pin the original netns from before entry into the fixture. */
@@ -1944,8 +1953,19 @@ int steer_prototype_main(int argc, char **argv)
         }
 #if defined(STEER_PROTOTYPE_WG_NETNS) && defined(STEER_PROTOTYPE_HY2)
         else if(!strcmp(argv[i],"--allow-wg-stream-netns")&&!linked_wg){linked_wg=1;i++;}
+        else if(!strcmp(argv[i],"--validate-wg-inbound-netns")&&!inbound_validate){inbound_validate=1;i++;}
 #endif
         else return 2;
+    }
+    if(inbound_validate){
+#ifdef STEER_PROTOTYPE_WG_NETNS
+        struct steer_draft_wg_linux_link *gate=NULL;
+        if(linked_wg||!state_dir||steer_prototype_wg_gate(3,0,&gate))return 2;
+        steer_draft_wg_linux_link_close(gate);
+        h.socks_vpn.wg_inbound_validate=1;
+#else
+        return 2;
+#endif
     }
     if (!initialize_host(&h, clients)) goto cleanup;
     if (steer_draft_resolver_create(h.loop, 2, 64, NULL, NULL, &h.resolver).code) goto cleanup;

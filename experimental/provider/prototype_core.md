@@ -83,6 +83,38 @@ backend cannot be forcibly cancelled safely, so shutdown may wait for it.
 
 ## Managed spec v3: `linked-socks-v1`
 
+### Experimental inbound DEVICE validation only
+
+The HY2+WG netns build has a separate `--validate-wg-inbound-netns` option for
+testing the common parser and control socket, **not a working WG inbound**.
+It requires a private `--state-dir`, CAP_NET_ADMIN, disabled IPv4 forwarding,
+and fd 3 pinned to the outer network namespace; the current namespace must be
+different from both that fd and the initial namespace. It cannot be combined
+with `--allow-wg-stream-netns`. It never creates a device, journal or guard.
+
+With that option, `VALIDATE` accepts only one DEVICE WireGuard inbound and
+one independent SOCKS TCP inbound, a single direct outbound explicitly carrying
+both `device` and `stream` flow classes, no routing rules, and one IPv4 peer
+`/32` on the same `/24` as the single device address. Private-key and optional
+PSK are typed env references under `STEER_WG_`; values must resolve and parse.
+DEVICE stays separate from a proxy stream. The reply explicitly includes
+`validationOnly: true` and `candidateRuntimeReady: false`. **APPLY always
+rejects this candidate**, leaves the existing revision/store untouched, and no
+runtime capability is advertised. This is not a kernel device, peer exchange,
+private-key/PSK attestation, forwarding guarantee or 4×4 protocol matrix.
+Normal profiles and Nano reject this DEVICE configuration.
+
+Given separately built full HY2+WG and Nano binaries, run the real control test:
+
+```sh
+unshare -n python3 -B experimental/provider/linked_inbound_validate_test.py \
+  /absolute/path/to/steer-prototype-hy2-wg-netns /absolute/path/to/steer-nano \
+  3</proc/self/ns/net
+```
+
+The test disables forwarding only inside that newly created namespace and
+checks that rejected Apply preserves the common store and SOCKS echo.
+
 This is an experimental subset, accepted by `--config` and by the same
 validate/apply control commands. For example:
 

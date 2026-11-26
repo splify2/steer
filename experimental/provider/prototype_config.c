@@ -280,6 +280,7 @@ void steer_prototype_config_destroy(struct steer_prototype_config*c){
     if(c){
         steer_policy_destroy(c->policy);
         free(c->wg);
+        free(c->wg_inbound_validate);
         free(c->document_json);
         free(c);
     }
@@ -534,8 +535,11 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
 #ifdef STEER_PROTOTYPE_HY2
         |STEER_SPEC_FLOW_DATAGRAM
 #endif
+#ifdef STEER_PROTOTYPE_WG_NETNS
+        |((allow&&allow->wg_inbound_validate)?STEER_SPEC_FLOW_DEVICE:0)
+#endif
         ;
-    enum { alias_requirements=9 };
+    enum { alias_requirements=10 };
     struct steer_spec_capability inventory[1+sizeof(core)/sizeof(core[0])+alias_requirements*STEER_PROTOTYPE_MAX_LISTENERS];
     size_t count=sizeof(core)/sizeof(core[0]);
     char requirements[STEER_PROTOTYPE_MAX_LISTENERS][alias_requirements][128];
@@ -552,6 +556,8 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
     memcpy(inventory,core,sizeof(core));
 #ifdef STEER_PROTOTYPE_WG_NETNS
     int wg_allowed=allow&&allow->wg_stream;
+    int wg_inbound_validate=allow&&allow->wg_inbound_validate;
+    int device_output=0;
     if(wg_allowed)inventory[count++]=(struct steer_spec_capability){"core.transport.udp",STEER_SPEC_READY,NULL,NULL};
 #endif
     /* Only the code linked into this binary satisfies this local profile. The
@@ -578,6 +584,10 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
             snprintf(requirements[i][8],sizeof(requirements[i][8]),"provider.wireguard:%s/outbound/stream/udp/none/kernel",alias->str);
             inventory[count++]=(struct steer_spec_capability){requirements[i][8],STEER_SPEC_READY,steer_draft_wg_v3_egress_options,NULL};
         }
+        if(wg_inbound_validate){
+            snprintf(requirements[i][9],sizeof(requirements[i][9]),"provider.wireguard:%s/inbound/device/device/none/default",alias->str);
+            inventory[count++]=(struct steer_spec_capability){requirements[i][9],STEER_SPEC_READY,steer_draft_wg_v3_options,NULL};
+        }
 #endif
 #ifdef STEER_PROTOTYPE_HY2
         snprintf(requirements[i][3],sizeof(requirements[i][3]),"provider.hysteria2:%s/inbound/stream/quic/tls/default",alias->str);
@@ -600,7 +610,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         const struct ynode *secret=ynode_val_at(secrets,i),*name=ynode_get(secret,"name");
         int kind=v3_secret_kind(ynode_get(secret,"kind"));
 #ifdef STEER_PROTOTYPE_WG_NETNS
-        if(wg_allowed&&(eq(ynode_get(secret,"kind"),"wireguard_private_key")||
+        if((wg_allowed||wg_inbound_validate)&&(eq(ynode_get(secret,"kind"),"wireguard_private_key")||
             eq(ynode_get(secret,"kind"),"wireguard_preshared_key")))
             kind=scalar(name)&&name->len>9&&name->len<64&&!strncmp(name->str,"STEER_WG_",9);
 #endif
@@ -617,6 +627,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         if(node.kind==STEER_SPEC_PLUGIN||node.kind==STEER_SPEC_SECRET)continue;
         if(node.kind==STEER_SPEC_OUTBOUND){
 #ifdef STEER_PROTOTYPE_WG_NETNS
+            if(node.flows&STEER_SPEC_FLOW_DEVICE)device_output=1;
             if(!strncmp(node.provider,"wireguard:",10)){
                 if(!wg_allowed||c->wg||c->stream_outbound_count>=STEER_POLICY_STREAM_BINDINGS_MAX||
                    !keys(node.intent,"plugin flow variant transport endpoint options label"))goto done;
@@ -650,6 +661,35 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
                 !action(ynode_get(node.intent,"type"),&a))goto done;
             continue;
         }
+#ifdef STEER_PROTOTYPE_WG_NETNS
+        if(node.kind==STEER_SPEC_INBOUND&&!strncmp(node.provider,"wireguard:",10)){
+            if(!wg_inbound_validate||c->wg_inbound_validate||c->wg||
+               !keys(node.intent,"plugin flow device options label variant"))goto done;
+            c->wg_inbound_validate=calloc(1,sizeof(*c->wg_inbound_validate));
+            if(!c->wg_inbound_validate||!steer_draft_wg_v3_configure(plan,i,&c->wg_inbound_validate->cfg))goto done;
+            struct steer_linked_wg_config *w=c->wg_inbound_validate;
+            if(w->cfg.kernel.peer_n!=1||w->cfg.kernel.aips_n!=1||
+               w->cfg.kernel.aips[0].family!=AF_INET||w->cfg.kernel.aips[0].cidr!=32||
+               w->cfg.kernel.addr_n!=1||w->cfg.kernel.addr[0].family!=AF_INET||
+               w->cfg.kernel.addr[0].cidr!=24||!w->cfg.kernel.addr[0].addr[0]||
+               w->cfg.kernel.addr[0].addr[0]==127||w->cfg.kernel.addr[0].addr[0]>=224||
+               !w->cfg.kernel.addr[0].addr[3]||
+               w->cfg.kernel.addr[0].addr[3]==255||
+               memcmp(w->cfg.kernel.addr[0].addr,w->cfg.kernel.aips[0].addr,3)||
+               !w->cfg.kernel.aips[0].addr[3]||w->cfg.kernel.aips[0].addr[3]==255||
+               w->cfg.kernel.aips[0].addr[3]==w->cfg.kernel.addr[0].addr[3]||
+               !secrets||secrets->len!=(size_t)(*w->cfg.preshared_keys[0]?2:1))goto done;
+            const struct ynode *name=ynode_get(ynode_get(secrets,w->cfg.private_key),"name");
+            if(!scalar(name)||name->len>=sizeof(w->private_env))goto done;
+            strcpy(w->private_env,name->str);
+            if(*w->cfg.preshared_keys[0]){
+                name=ynode_get(ynode_get(secrets,w->cfg.preshared_keys[0]),"name");
+                if(!scalar(name)||name->len>=sizeof(w->psk_env))goto done;
+                strcpy(w->psk_env,name->str);
+            }
+            continue;
+        }
+#endif
         if(node.kind!=STEER_SPEC_INBOUND||c->listener_count>=STEER_PROTOTYPE_MAX_LISTENERS||
             !v3_inbound(&node,secrets,allow,&c->listeners[c->listener_count])||
             !distinct_listener(c,c->listener_count))goto done;
@@ -657,6 +697,12 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
     }
     const struct ynode *target=ynode_get(routing,"default");
     if(!scalar(target)||!v3_named_action(c,outbounds,target->str,&fallback))goto done;
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(device_output&&!c->wg_inbound_validate)goto done;
+    if(c->wg_inbound_validate&&(c->wg||inbounds->len!=2||outbounds->len!=1||c->listener_count!=1||
+       c->listeners[0].protocol!=STEER_PROTOTYPE_SOCKS||!c->listeners[0].enabled||
+       c->stream_outbound_count||rules->len||fallback!=STEER_POLICY_DIRECT))goto done;
+#endif
     /* The v3 graph has already required that default and named targets
      * support every selected ingress class, including HY2's datagrams. */
     for(uint32_t i=0;i<rules->len;i++){
