@@ -30,7 +30,7 @@ static int attest(void *ctx,const struct steer_draft_wg_guard_record *r,uint64_t
 }
 static void run(const char *base,int scenario){
     char path[4096];snprintf(path,sizeof(path),"%s/case%d",base,scenario);assert(!mkdir(path,0700));
-    struct steer_draft_wg_selection *journal;assert(!steer_draft_wg_selection_open(path,32,&journal));
+    struct steer_draft_wg_selection *journal;assert(!steer_draft_wg_selection_open_inbound(path,32,&journal));
     struct awg_conf cfg={0};struct fixture f=fixture(NULL,&cfg,11,OK);
     struct steer_draft_kernel_wg_guard *slot=NULL;
     struct steer_linked_inbound p={.journal=journal,.backend=&inbound_backend,.context=&f,.backend_guard=&slot};
@@ -65,7 +65,7 @@ static void run(const char *base,int scenario){
         assert(!steer_linked_inbound_recover(&p,&chosen,attest,UINT64_MAX,&next,&selected));assert(!p.fenced&&selected.handle==201);}
     else {assert(!steer_linked_inbound_finish(&p,r,attest,UINT64_MAX));assert(p.fenced);
         steer_draft_wg_selection_close(journal);
-        assert(!steer_draft_wg_selection_open(path,32,&journal));p.journal=journal;
+        assert(!steer_draft_wg_selection_open_inbound(path,32,&journal));p.journal=journal;
         f.foreign=1;assert(steer_linked_inbound_recover(&p,&chosen,attest,UINT64_MAX,&next,&selected)==ESTALE);
         assert(p.fenced&&f.link&&f.handle&&!strcmp(f.events,"CSBUP"));
         f.foreign=0;f.mode=PUBLISH_UNCHANGED;
@@ -88,7 +88,7 @@ static void actual_store(const char *base,int scenario){
     assert(snprintf(store_path,sizeof(store_path),"%s/store",path)>0);
     assert(!mkdir(journal_path,0700)&&!mkdir(store_path,0700));
     struct steer_prototype_store *store;assert(!steer_prototype_store_open(store_path,&store).code);
-    struct steer_draft_wg_selection *journal;assert(!steer_draft_wg_selection_open(journal_path,32,&journal));
+    struct steer_draft_wg_selection *journal;assert(!steer_draft_wg_selection_open_inbound(journal_path,32,&journal));
     struct awg_conf cfg={0};struct fixture f=fixture(NULL,&cfg,11,OK);
     struct steer_draft_kernel_wg_guard *slot=NULL;
     struct steer_linked_inbound p={.journal=journal,.backend=&inbound_backend,.context=&f,.backend_guard=&slot};
@@ -141,8 +141,27 @@ static void actual_store(const char *base,int scenario){
     steer_policy_destroy(policy);steer_draft_wg_selection_close(journal);
     assert(!steer_prototype_store_close(store).code);
 }
+static void role_boundary(const char *base){
+    char path[4096];assert(snprintf(path,sizeof(path),"%s/legacy-role",base)>0&&!mkdir(path,0700));
+    struct steer_draft_wg_selection *journal=NULL;
+    assert(!steer_draft_wg_selection_open(path,32,&journal));
+    struct awg_conf cfg={0};struct fixture f=fixture(NULL,&cfg,11,OK);
+    struct steer_draft_wg_revision old={.generation=10,.digest={2},.without_wg=1},chosen={.generation=11,.digest={1}};
+    struct steer_draft_wg_ready ready;
+    assert(!steer_draft_wg_selection_stage(journal,&backend,&f,&old,0,&f.tx,&f.candidate,UINT64_MAX,&ready));
+    assert(!strcmp(f.events,"CSBUP"));
+    struct steer_linked_inbound p={.journal=journal,.backend=&backend,.context=&f};
+    uint64_t next;struct steer_draft_wg_guard_record selected;
+    assert(steer_linked_inbound_recover(&p,&chosen,attest,UINT64_MAX,&next,&selected)==EINVAL);
+    steer_draft_wg_selection_close(journal);
+    assert(!steer_draft_wg_selection_open_inbound(path,32,&journal));p.journal=journal;
+    assert(steer_linked_inbound_recover(&p,&chosen,attest,UINT64_MAX,&next,&selected)==EPROTO);
+    assert(p.fenced&&f.link&&f.handle&&!strcmp(f.events,"CSBUP"));
+    steer_draft_wg_selection_close(journal);
+}
 int main(int argc,char **argv){
     assert(argc==2);for(int i=0;i<4;i++)run(argv[1],i);
     for(int i=0;i<5;i++)actual_store(argv[1],i);
+    role_boundary(argv[1]);
     puts("linked inbound participant and real store live commit PASS");return 0;
 }

@@ -68,6 +68,10 @@ int steer_draft_wg_coordinator_recover(struct steer_spec_journal *,const struct 
  * with the standalone staging API or the general device authority ledger. */
 struct steer_draft_wg_selection;
 int steer_draft_wg_selection_open(const char *,uint32_t max_records,struct steer_draft_wg_selection **);
+/* Role-scoped journal: accepts only entries explicitly written as inbound,
+ * never the existing role-ambiguous/outbound journal format. */
+int steer_draft_wg_selection_open_inbound(const char *,uint32_t max_records,struct steer_draft_wg_selection **);
+int steer_draft_wg_selection_is_inbound(const struct steer_draft_wg_selection *);
 void steer_draft_wg_selection_close(struct steer_draft_wg_selection *);
 
 /* The externally committed prototype_store document is the ONLY selection.

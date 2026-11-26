@@ -4,7 +4,7 @@
 
 int steer_linked_inbound_recover(struct steer_linked_inbound *p,const struct steer_draft_wg_revision *chosen,
     steer_draft_wg_verify_ready verify,uint64_t deadline,uint64_t *next,struct steer_draft_wg_guard_record *selected){
-    if(!p||!p->journal||!p->backend||!chosen||!verify||!next||!selected||p->staged)return EINVAL;
+    if(!p||!steer_draft_wg_selection_is_inbound(p->journal)||!p->backend||!chosen||!verify||!next||!selected||p->staged)return EINVAL;
     p->fenced=1;
     int rc=steer_draft_wg_selection_startup(p->journal,p->backend,p->context,chosen,verify,deadline,next,selected);
     if(!rc){p->committed=*chosen;p->fenced=0;p->recovered=1;}
@@ -13,7 +13,7 @@ int steer_linked_inbound_recover(struct steer_linked_inbound *p,const struct ste
 int steer_linked_inbound_prepare(struct steer_linked_inbound *p,const struct steer_draft_wg_tx *tx,
     const struct steer_draft_wg_candidate *input,const struct steer_draft_kernel_wg_guard_config *config,
     const struct steer_policy *policy,uint16_t previous_port,uint64_t deadline){
-    if(!p||!p->journal||!p->backend||!p->backend_guard||*p->backend_guard||!tx||!input||!config||!policy||
+    if(!p||!steer_draft_wg_selection_is_inbound(p->journal)||!p->backend||!p->backend_guard||*p->backend_guard||!tx||!input||!config||!policy||
        !p->recovered||p->fenced||p->staged||config->return_only||!config->peer_count||config->generation!=tx->generation||
        strcmp(config->device,input->link.physical_name)||input->link.generation!=tx->generation)return EINVAL;
     struct steer_draft_kernel_wg_guard *guard=NULL;

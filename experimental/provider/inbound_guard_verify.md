@@ -23,7 +23,9 @@ This function does not capture a snapshot or impose an I/O deadline. A future
 caller must do bounded capture under an absolute deadline (e.g. existing
 `run_output_until`), validate the owned link and peer, and handle concurrent
 mutation and snapshot consistency; this comparison is not an atomic netlink
-proof. It is not connected to participant recovery or host Apply and advertises
+proof. The experimental participant recovery path uses bounded capture and
+owned-link checks, but does not validate the peer; see
+`linked_inbound_recovery.md`. It is not connected to host Apply and advertises
 no capability. Python is only used by the netns test driver, not the verifier.
 
 ```sh

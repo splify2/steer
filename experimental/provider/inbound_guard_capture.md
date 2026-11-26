@@ -28,8 +28,8 @@ a missing table, an injected memfd read failure, empty output and output over 64
 nft replacements in the timeout/size cases exist only in the isolated test
 process PATH. No key/peer identity or host integration is claimed.
 
-**Not yet connected to `steer_linked_inbound_recover` or selection startup.**
-Recovery still needs a verified supported-policy plan constructed from the
-committed config, owned-link/namespace checks, and a real-journal test proving
-that a rejected snapshot stops before cleanup. This function by itself is not
+The experimental `steer_linked_inbound_recover_checked` invokes this function
+inside selection startup, after owned-link/namespace checks and before
+unselected cleanup. Its narrow plan, trust boundaries and real-journal tests
+are described in `linked_inbound_recovery.md`. This function by itself is not
 peer attestation or an advertised inbound capability.

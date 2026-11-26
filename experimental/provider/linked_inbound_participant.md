@@ -3,6 +3,10 @@
 This is an isolated worker-side transaction participant, **not wired into the
 host**, not an external schema or capability, and not an end-to-end WG ingress.
 It does not open a store, decide its revision, or start a service. The owner must
+open a role-scoped inbound journal with `steer_draft_wg_selection_open_inbound`;
+existing role-ambiguous selection records are not adopted. See
+`linked_inbound_recovery.md` for the narrow checked Linux recovery entry point.
+The owner must
 first recover the common store and pass its validated exact revision/digest to
 `recover`, then supply a verified inbound-only config/peer mapping and policy.
 The backend and its prepared-guard slot must belong to the same serialized owner.

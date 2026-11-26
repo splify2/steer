@@ -11,6 +11,7 @@ enum { LINK=1, BIND, BOUND, PUBLISH, PUBLISHED, STEPS };
 enum { CLEAN=STEPS, CLEANED, REUSE };
 static const char provider[]="wireguard-isolated";
 static const char durable_provider[]="wireguard-isolated-selected";
+static const char inbound_provider[]="wireguard-inbound-selected";
 static const char version[]="1";
 
 static int running(uint64_t deadline,const atomic_uint *cancel){
@@ -232,17 +233,17 @@ int steer_draft_wg_coordinator_apply(struct steer_spec_journal *j,const struct s
  * Reserve one extra slot for an interrupted pre-rename write. Repeated orphan
  * accumulation fences admission; never repurpose an active cleanup reserve. */
 #define SELECTION_MAX 128u
-struct steer_draft_wg_selection { struct steer_spec_journal *j; uint32_t max; };
+struct steer_draft_wg_selection { struct steer_spec_journal *j; uint32_t max; const char *owner; };
 struct entry {
     struct steer_draft_wg_tx tx;
     struct steer_spec_journal_record r[REUSE+1];
     struct steer_draft_wg_identity link;
     struct steer_draft_wg_guard_record guard;
 };
-struct inventory { struct entry *e; unsigned n,active,used,reserved,capacity; };
+struct inventory { struct entry *e; unsigned n,active,used,reserved,capacity; const char *owner; };
 
-static struct steer_spec_journal_record selection_record(const struct steer_draft_wg_tx *t,unsigned step){
-    struct steer_spec_journal_record r=record(t,step,0,durable_provider);
+static struct steer_spec_journal_record selection_record(const struct steer_draft_wg_tx *t,unsigned step,const char *owner){
+    struct steer_spec_journal_record r=record(t,step,0,owner);
     r.operation=4;
     r.phase=step==CLEAN?STEER_PV1_DEVICE_RETIRING:STEER_PV1_DEVICE_RETIRED;
     r.length=STEER_DRAFT_WG_RECORD_BYTES;
@@ -255,8 +256,8 @@ static struct steer_spec_journal_record selection_record(const struct steer_draf
     return r;
 }
 
-static struct steer_spec_journal_record reuse_record(const struct steer_draft_wg_tx *t,uint64_t anchor){
-    struct steer_spec_journal_record r=record(t,REUSE,0,durable_provider);
+static struct steer_spec_journal_record reuse_record(const struct steer_draft_wg_tx *t,uint64_t anchor,const char *owner){
+    struct steer_spec_journal_record r=record(t,REUSE,0,owner);
     r.operation=3;
     r.phase=STEER_PV1_DEVICE_ACTIVE;
     r.anchor_transaction=anchor;
@@ -268,7 +269,7 @@ static struct steer_pv1_error collect_selection(void *ctx,const struct steer_spe
     struct inventory *i=ctx;
     const struct steer_pv1_error invalid={STEER_PV1_INVALID,0};
     unsigned step=r->key.sequence,n=0;
-    if(step<LINK||step>REUSE||strcmp(r->provider,durable_provider))return invalid;
+    if(step<LINK||step>REUSE||strcmp(r->provider,i->owner))return invalid;
     for(;n<i->n;n++)if(i->e[n].tx.transaction==r->key.transaction)break;
     if(n==i->n){
         if(n>=i->capacity)return invalid;
@@ -280,15 +281,15 @@ static struct steer_pv1_error collect_selection(void *ctx,const struct steer_spe
     struct entry *e=&i->e[n];
     if(e->r[step].length||e->tx.instance!=r->key.instance)return invalid;
     if(step<STEPS){
-        if(!stage_envelope(r,&e->tx,durable_provider))return invalid;
+        if(!stage_envelope(r,&e->tx,i->owner))return invalid;
     }else if(step==REUSE){
         if(!r->anchor_transaction||r->anchor_sequence!=PUBLISHED)return invalid;
-        struct steer_spec_journal_record expected=reuse_record(&e->tx,0),actual=*r;
+        struct steer_spec_journal_record expected=reuse_record(&e->tx,0,i->owner),actual=*r;
         actual.anchor_transaction=actual.anchor_sequence=0;
         expected.anchor_sequence=0;
         if(!same_envelope(&actual,&expected))return invalid;
     }else{
-        struct steer_spec_journal_record expected=selection_record(&e->tx,step);
+        struct steer_spec_journal_record expected=selection_record(&e->tx,step,i->owner);
         if(!same_envelope(r,&expected))return invalid;
     }
     e->r[step]=*r;
@@ -297,7 +298,7 @@ static struct steer_pv1_error collect_selection(void *ctx,const struct steer_spe
 
 static int inventory_read(struct steer_draft_wg_selection *s,struct inventory *i,
     const struct steer_draft_wg_revision *revision){
-    *i=(struct inventory){.active=SELECTION_MAX,.capacity=s->max};
+    *i=(struct inventory){.active=SELECTION_MAX,.capacity=s->max,.owner=s->owner};
     if(steer_spec_journal_sync_existing(s->j).code)return EIO;
     /* The physical journal bound also bounds allocation and pair checks. */
     i->e=calloc(s->max,sizeof(*i->e));
@@ -366,18 +367,18 @@ static int clean_entry(struct steer_draft_wg_selection *s,const struct steer_dra
     int rc=running(deadline,NULL);
     if(rc)return rc;
     if(!e->r[CLEAN].length){
-        struct steer_spec_journal_record r=selection_record(&e->tx,CLEAN);
+        struct steer_spec_journal_record r=selection_record(&e->tx,CLEAN,s->owner);
         memcpy(r.data,e->r[LINK].data,r.length);
         if(!synced(steer_spec_journal_append(s->j,&r)))return EIO;
     }
     rc=retire_records(b,ctx,e->r,&e->tx,deadline);
     if(rc)return rc;
-    struct steer_spec_journal_record r=selection_record(&e->tx,CLEANED);
+    struct steer_spec_journal_record r=selection_record(&e->tx,CLEANED,s->owner);
     memcpy(r.data,e->r[LINK].data,r.length);
     return synced(steer_spec_journal_append(s->j,&r))?0:EIO;
 }
 
-int steer_draft_wg_selection_open(const char *path,uint32_t max,struct steer_draft_wg_selection **out){
+static int selection_open(const char *path,uint32_t max,struct steer_draft_wg_selection **out,const char *owner){
     if(!out)return EINVAL;
     *out=NULL;
     if(max<CLEANED+1||max>SELECTION_MAX)return EINVAL;
@@ -385,8 +386,18 @@ int steer_draft_wg_selection_open(const char *path,uint32_t max,struct steer_dra
     if(!s)return ENOMEM;
     if(steer_spec_journal_open(path,max,CLEANED,&s->j).code){free(s);return EIO;}
     s->max=max;
+    s->owner=owner;
     *out=s;
     return 0;
+}
+int steer_draft_wg_selection_open(const char *path,uint32_t max,struct steer_draft_wg_selection **out){
+    return selection_open(path,max,out,durable_provider);
+}
+int steer_draft_wg_selection_open_inbound(const char *path,uint32_t max,struct steer_draft_wg_selection **out){
+    return selection_open(path,max,out,inbound_provider);
+}
+int steer_draft_wg_selection_is_inbound(const struct steer_draft_wg_selection *s){
+    return s&&s->owner==inbound_provider;
 }
 
 void steer_draft_wg_selection_close(struct steer_draft_wg_selection *s){
@@ -453,7 +464,7 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *s,const stru
     if(rc)return rc;
     int started=0;
     return stage_candidate(s->j,b,ctx,t,c,previous.listen_port?&previous:NULL,deadline,NULL,ready,
-        &started,durable_provider);
+        &started,s->owner);
 }
 
 int steer_draft_wg_selection_reuse(struct steer_draft_wg_selection *s,const struct steer_draft_wg_revision *r,
@@ -468,7 +479,7 @@ int steer_draft_wg_selection_reuse(struct steer_draft_wg_selection *s,const stru
     if(!rc&&i.used+i.reserved+2>s->max)rc=ENOSPC;
     if(!rc){
         const struct entry *e=&i.e[i.active];
-        struct steer_spec_journal_record alias=reuse_record(t,e->tx.transaction);
+        struct steer_spec_journal_record alias=reuse_record(t,e->tx.transaction,s->owner);
         if(steer_draft_wg_guard_record_encode(guard,alias.data)||
            memcmp(alias.data,e->r[PUBLISHED].data,alias.length))rc=ESTALE;
         else if(!(rc=running(d,NULL))&&!synced(steer_spec_journal_append(s->j,&alias)))rc=EIO;
