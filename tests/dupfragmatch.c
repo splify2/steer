@@ -169,7 +169,7 @@ int main(void) {
           strstr(txt, "|1.1.1.1|-|frag\n") != NULL && strstr(txt, "|8.8.8.8|-|frag\n") != NULL);
     check("  у p и o поля нет (прежний формат до байта)", 1, strstr(txt, "|192.0.2.1|-\n") != NULL);
     for (size_t i = 0; i < g_dch_n; i++) free(g_dch[i].rules_path);
-    memset(g_dch, 0, g_dch_cap * sizeof(*g_dch));
+    if (g_dch) memset(g_dch, 0, g_dch_cap * sizeof(*g_dch));
     g_dch_n = 0;
     check("  таблица разбирается", 0, tabfmt_parse(txt, tn));
     int fr[4] = {0}, nfr = 0;

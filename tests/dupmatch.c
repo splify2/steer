@@ -160,6 +160,9 @@ int main(void) {
     fclose(f);
     static struct spec cfg2;
     check("спека без dns читается", 0, load_spec(sp, &cfg2, &e) < 0);
+    /* Предыдущая таблица разобрана резолвером и владеет строками путей.
+     * Построитель, напротив, считает строки заимствованными из spec. */
+    if (tabfmt_parse("0\n", 2) != 0) return 2;
     txt = NULL; m = open_memstream(&txt, &tn);
     tabfmt_build(&cfg2, m); fclose(m);
     check("таблица без dns: заголовок «1»", 0, strncmp(txt, "1\n", 2));
@@ -195,6 +198,7 @@ int main(void) {
     check("  сервер вне групп и назначений не используется", 0, spec_dns_up_used(&cfgg, 4));
     check("  член группы dns.other используется", 1, spec_dns_up_used(&cfgg, 3));
     cfgg.out[0].mark = 0x00100000;
+    if (tabfmt_parse("0\n", 2) != 0) return 2;
     txt = NULL; m = open_memstream(&txt, &tn);
     tabfmt_build(&cfgg, m); fclose(m);
     check("таблица: седьмое число заголовка — dns.other", 1, !strncmp(txt, "2 6 0 10 3600 30 ", 17));

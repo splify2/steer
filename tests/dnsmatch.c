@@ -54,6 +54,14 @@ static void dch_zero(size_t n) {
     g_dch_n = 0;
 }
 
+/* Стенд владеет таблицей между сценариями; нельзя терять её указатели при сбросе. */
+static void fakeip_test_clear(void) {
+    for (size_t i = 0; i < g_fakeip.n; i++) free(g_fakeip.entries[i].domain);
+    free(g_fakeip.entries);
+    memset(&g_fakeip, 0, sizeof(g_fakeip));
+    sindex_free(&g_fakeip_idx);
+}
+
 /* Набор каналов из двух номеров (chm_t — номер записи в таблице наборов, а не битовая маска). */
 static chm_t chm2(size_t a, size_t b) { return chm_or(chm_one(a), chm_one(b)); }
 
@@ -618,8 +626,7 @@ int main(void) {
         fputs("z.test\t198.18.0.8\t6.6.6.6\n", f);
         fputs("ok.test\t198.18.0.10\t93.184.216.34\n", f);
         fclose(f);
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 0;
         g_fakeip_state_path = NULL;
         g_fakeip_dirty = 0;
@@ -634,8 +641,7 @@ int main(void) {
         check("D3: строка после длинной цела", 1, fakeip_entry_known_real("ok.test") == 0x5DB8D822u);
         check("D3: отвергнутое помечает файл к перезаписи", 1, g_fakeip_dirty);
         g_fakeip_dirty = 0;
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 0;
         unlink(path);
         rmdir(dir);
@@ -646,8 +652,7 @@ int main(void) {
          * правилом, прежде занимал весь пул, и новые имена ВСЕХ клиентов получали настоящий адрес.
          * Теперь за клиентом не больше fakeip_per_client() адресов; сверх — -2 (резолвер отвечает
          * SERVFAIL ему одному), а другой клиент получает адрес как обычно. */
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 1;
         g_fakeip_state_path = NULL;
         struct sockaddr_storage ca, cb, c6a, c6b;
@@ -711,11 +716,7 @@ int main(void) {
         check("D5: другой клиент и тогда получает адрес", 0,
               fakeip_lookup_or_alloc_for("victim2.flood.test", kb, &addr));
         g_fakeip_live = live_was;
-        for (size_t i = 0; i < g_fakeip.n; i++) free(g_fakeip.entries[i].domain);
-        free(g_fakeip.entries);
-        sindex_free(&g_fakeip_idx);
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         fakeip_pool_reset();
         g_fakeip_next = 1;
     }
@@ -796,7 +797,7 @@ int main(void) {
         char path[768];
         snprintf(path, sizeof(path), "%s/fakeip.state", dir);
 
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        fakeip_test_clear();
         g_fakeip_next = 0;
         uint32_t addr = 0;
         g_fakeip_state_path = NULL;             /* без append: пишет только rewrite */
@@ -814,7 +815,7 @@ int main(void) {
             fclose(rf);
         }
         g_fakeip_state_path = NULL;
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        fakeip_test_clear();
         g_fakeip_next = 0;
     }
 
@@ -827,8 +828,7 @@ int main(void) {
     {
         size_t cap = FAKEIP_POOL_SIZE - 2;      /* без адреса сети и последнего */
         fakeip_pool_reset();
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 1;
         g_fakeip_state_path = NULL;
         char nm[64];
@@ -883,8 +883,7 @@ int main(void) {
         check("пул: без conntrack возвращается по сроку простоя", 7, (int)fakeip_reclaim(now));
         check("пул: и выдаётся из возвращённых", 0, fakeip_lookup_or_alloc("nolive.pool.test", &addr));
         fakeip_pool_reset();
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 1;
         g_fakeip_live = NULL;
     }
@@ -896,7 +895,7 @@ int main(void) {
         char path[128];
         if (!mkdtemp(dirt)) { perror("mkdtemp"); return 1; }
         snprintf(path, sizeof(path), "%s/fakeip.state", dirt);
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        fakeip_test_clear();
         g_fakeip_next = 0;
         g_fakeip_state_path = NULL;
         uint32_t aa = 0;
@@ -922,7 +921,7 @@ int main(void) {
         unlink(path);
         rmdir(dirt);
         g_fakeip_state_path = NULL;
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        fakeip_test_clear();
         g_fakeip_next = 0;
     }
 
@@ -938,8 +937,7 @@ int main(void) {
         int lost_flush = 0, lost_append = 0;
         for (int round = 0; round < 40; round++) {
             fakeip_pool_reset();
-            memset(&g_fakeip, 0, sizeof(g_fakeip));
-            memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+            fakeip_test_clear();
             g_fakeip_next = 1;
             g_fakeip_state_path = NULL;
             uint32_t aa = 0;
@@ -976,7 +974,7 @@ int main(void) {
         unlink(tmp);
         rmdir(dirt);
         g_fakeip_state_path = NULL;
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        fakeip_test_clear();
         g_fakeip_next = 0;
     }
 
@@ -1048,6 +1046,7 @@ int main(void) {
             check("классификатор: подсеть IPv6 — не хозяин", 0, spec_one_host("fd00::/64"));
             check("гибрид: IPv6 не стал доменным правилом", 0,
                   ruleset_match(&rs, "2606:4700::/32"));
+            ruleset_free(&rs);
             unlink(path);
         }
     }
@@ -1205,6 +1204,8 @@ int main(void) {
                     dch_parts_free(g_dch[i].parts, g_dch[i].parts_n);
                     g_dch[i].parts = NULL;
                     g_dch[i].parts_n = 0;
+                    free(g_dch[i].rules_path); /* строки принадлежат cfg */
+                    g_dch[i].rules_path = NULL;
                 }
                 g_dch_n = 0;
             }
@@ -1455,8 +1456,7 @@ int main(void) {
         FILE *f = fopen(path, "w");
         fputs("bad.test\t203.0.113.5\n", f);
         fclose(f);
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 0;
         g_fakeip_state_path = NULL;
         fakeip_state_load(path);
@@ -1475,8 +1475,7 @@ int main(void) {
         f = fopen(path, "w");
         fputs("known.test\t198.18.0.7\t93.184.216.34\n", f);
         fclose(f);
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 0;
         fakeip_state_load(path);
         check("трёхполевая строка загружена", 1, (int)g_fakeip.n);
@@ -1485,8 +1484,7 @@ int main(void) {
         check("без netlink ничего не восстановлено", 0, (int)restored);
         check("и real_host сброшен — быстрый путь закрыт", 0, g_fakeip.n ? (int)(g_fakeip.entries[0].real_host != 0) : -1);
         check("маршруты без ядра не утверждались", 0, (int)routed);
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 0;
         unlink(path);
         rmdir(dir);
@@ -1523,8 +1521,7 @@ int main(void) {
         inet_pton(AF_INET6, "2001:db8::c612:5", other);
         check("fake6: чужой префикс — не поддельный", 0, (int)fakeip6_to4(other));
 
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 1;
         g_fakeip_state_path = NULL;
         uint32_t a = 0;
@@ -1559,8 +1556,7 @@ int main(void) {
               "only6.test\t198.18.0.11\t-\t2001:db8::b\n"
               "bad6.test\t198.18.0.12\t93.184.216.36\tне-адрес\n", f);
         fclose(f);
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 1;
         fakeip_state_load(path);
         check("состояние: все четыре строки загружены", 4, (int)g_fakeip.n);
@@ -1579,8 +1575,7 @@ int main(void) {
         fakeip_rehydrate(-1, &routed);
         check("восстановление без ядра: настоящий IPv6 сброшен — быстрый путь AAAA закрыт", 1,
               !fakeip_entry_get_real6("both.test") && !fakeip_entry_get_real6("only6.test"));
-        memset(&g_fakeip, 0, sizeof(g_fakeip));
-        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        fakeip_test_clear();
         g_fakeip_next = 1;
         g_fakeip_state_path = NULL;
         unlink(path);
@@ -1783,6 +1778,7 @@ int main(void) {
             check_str("… первый — с сужением набора",
                       "srs:0:tests/srs/dnsmixed.srs", g_dch_n ? g_dch[0].rules_path[0] : "");
             srs_concat_override = -1;
+            for (size_t i = 0; i < g_dch_n; i++) free(g_dch[i].rules_path);
             g_dch_n = 0;
             unlink(sp);
         }
@@ -1838,6 +1834,7 @@ int main(void) {
             if (o) fclose(o);
             check("adguard: эталон прочитан", 1, n_all >= 40);
             check("adguard: вердикты совпадают с sing-box", n_all, n_ok);
+            for (size_t i = 0; i < g_dch_n; i++) free(g_dch[i].rules_path);
             g_dch_n = 0;
             unlink(sp);
         }
@@ -1972,6 +1969,10 @@ int main(void) {
         check("общий индекс: набор освобождён — имя не находится", 0, (int)dch_match_mask("late.added.test"));
 
         /* Много каналов и много правил: счёт тот же, что у прохода (число каналов не ограничено). */
+        for (size_t i = 0; i < g_dch_n; i++) {
+            ruleset_free(&g_dch[i].rules);
+            dch_parts_free(g_dch[i].parts, g_dch[i].parts_n);
+        }
         dch_zero(300);
         g_dch_n = 300;
         int ok300 = 1;
@@ -1992,6 +1993,7 @@ int main(void) {
         chm_t allm = dch_match_mask("x.common.big.test");
         for (size_t i = 0; i < 300; i++) if (!chm_has(allm, i)) ok300 = 0;
         check("общий индекс: 300 каналов, имя в каждом — набор из 300", 1, ok300);
+        for (size_t i = 0; i < g_dch_n; i++) ruleset_free(&g_dch[i].rules);
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
