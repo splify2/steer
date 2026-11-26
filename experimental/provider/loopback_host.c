@@ -1778,6 +1778,7 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 #ifdef STEER_PROTOTYPE_HY2
         "\"spec_v3_hysteria2_stream_only_inbound\":true,"
         "\"spec_v3_hysteria2_tcp_outbound\":true,"
+        "\"spec_v3_hysteria2_numeric_udp_1000_outbound\":true,"
 #endif
         "\"spec_v3_hysteria2\":%s,\"providers\":[\"socks\",\"vless\"%s],\"inbound\":{\"hysteria2\":{\"tcp\":%s,\"udp\":%s,\"tls\":%s}}},\"drainingListeners\":[",hy2_udp,provider,hy2,hy2_udp,hy2);
     if(n<0||(size_t)n>=capacity-used)return 0;

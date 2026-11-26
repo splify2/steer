@@ -597,6 +597,10 @@ larger messages and packets arriving while the receive slot is occupied are
 dropped. The upstream v2.13.0 discards empty UDP payloads; successful local send
 does not promise remote delivery. These limits mean this variant is not an
 unrestricted UDP outbound or a general UDP capability.
+Full STATUS advertises this exact variant separately as the boolean
+`spec_v3_hysteria2_numeric_udp_1000_outbound`; the flag does not assert
+unrestricted UDP, domain targets or delivery of empty payloads. Minimal
+builds do not advertise it.
 
 In a private loopback-only network namespace, the managed fixture is:
 
