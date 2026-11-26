@@ -34,6 +34,11 @@ mount -t sysfs sysfs /sys 2>/dev/null || echo "diagmatch: свой sysfs не с
 pass=0 fail=0
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+# Манифесты и схемы официальных плагинов; pkhooks исполняет только тестовые
+# хуки, а не настоящие команды плагинов (в частности не vless-nodes).
+sh tests/plugroot.sh "$tmp/plugins" "$(dirname "$DIAG")" || exit 2
+STEER_PLUGINS_ROOT="$tmp/plugins" STEER_PLUGINS_ETC="$tmp/plugetc"
+export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 
 check() {
     if [ "$2" = "$3" ]; then
@@ -173,6 +178,25 @@ check "  у интерфейса её тоже нет" "" "$(printf '%s' "$out" 
 mkdir -p "$tmp/state"
 probe() { printf '%s\n' "$1" > "$tmp/state/probe-vpn"; }
 dg() { $DIAG diag --spec "$tmp/vless.json" --state-dir "$tmp/state" 2>/dev/null; }
+st() { $DIAG status --spec "$tmp/vless.json" --state-dir "$tmp/state" 2>/dev/null; }
+missing_device() {
+    dg > "$tmp/diag-output.json"
+    st > "$tmp/status-output.json"
+    python3 - "$tmp/diag-output.json" "$tmp/status-output.json" <<'PY'
+import json, sys
+try:
+    diag, status = (json.load(open(p)) for p in sys.argv[1:])
+    device = status["outputs"]["vpn"]["device"]
+    assert isinstance(device, str) and device and status["outputs"]["vpn"]["kind"] == "vless"
+    matches = [x for x in diag["checks"] if x.get("id") == "output"
+               and x.get("what") == f"выход vpn: устройства {device} нет"]
+    assert len(matches) == 1 and matches[0]["verdict"] == "fail"
+    assert matches[0]["why"] == "туннель не поднят — смотрите журнал ядра steer"
+    print("yes")
+except (OSError, ValueError, KeyError, AssertionError, TypeError):
+    print("no")
+PY
+}
 # what у проверки с данным id — им и отличаются три случая одного «устройства нет».
 what() { sed -n 's/.*{"id":"output","verdict":"[a-z]*","what":"\([^"]*\)".*/\1/p' | head -1; }
 
@@ -191,8 +215,7 @@ check "перебор не считается предупреждением" "0
 # Первая защита от устаревания: «проверяю» верно, только пока жив написавший процесс.
 probe "probing 3 26 999999 $(date +%s)"
 check "перебор от мёртвого процесса читается как «не знаем»" "fail" "$(dg | verdict output)"
-check "и приговор возвращается к прежнему тексту" "1" \
-      "$(dg | what | grep -c 'устройства vpn нет')"
+check "и приговор называет реальное устройство выхода и причину" "yes" "$(missing_device)"
 
 probe "failed 0 26 999999 $(date +%s)"
 check "ни один узел не ответил — отказ, а не «устройства нет»" "fail" "$(dg | verdict output)"
@@ -207,17 +230,14 @@ check "узлов в подписке нет — сказано именно э�
 # заново каждые пять секунд), но живёт, пока свеж. Старше двух минут — никто больше не
 # пробует, и говорить за него нельзя.
 probe "failed 0 26 999999 $(( $(date +%s) - 200 ))"
-check "устаревший приговор не выдаётся за свежий" "1" \
-      "$(dg | what | grep -c 'устройства vpn нет')"
+check "устаревший приговор не выдаётся за свежий" "yes" "$(missing_device)"
 
 # Мусор в файле — тоже «не знаем»: разбор обязан отличать «нечего сказать» от «сломано».
 probe "какая-то ерунда"
-check "неразбираемый файл читается как «не знаем»" "1" \
-      "$(dg | what | grep -c 'устройства vpn нет')"
+check "неразбираемый файл читается как «не знаем»" "yes" "$(missing_device)"
 
 # ---- то же поле в status: интерфейс не должен гадать -------------------------
 probe "probing 7 26 $$ $(date +%s)"
-st() { $DIAG status --spec "$tmp/vless.json" --state-dir "$tmp/state" 2>/dev/null; }
 check "status несёт ход перебора" "1" \
       "$(st | grep -c '"probe":{"state":"probing","node":7,"total":26}')"
 probe "failed 0 26 999999 $(date +%s)"
@@ -228,17 +248,31 @@ check "нечего сказать — поля нет вовсе" "0" "$(st | g
 
 # ---- выбранные узлы подписки в status ----------------------------------------
 #
-# Поле обязано печататься ВСЕГДА у kind=vless, в том числе пустым, и это здесь главное.
-# Незнакомый ключ спеки движок пропускает молча (js_skip), поэтому интерфейс, записавший
-# `nodes` в движок, который их не понимает, получил бы применённую спеку и трафик через узел,
-# которого не выбирал. Наличие поля в status — единственный способ отличить такой движок, не
-# применяя спеку; ровно тем же приёмом отличается движок с lan_devices.
-check "status: выбор узлов есть и пустым" "1" \
-      "$(st | grep -c '"nodes":\[\]')"
+# С 2.1 выбор сообщает настоящий плагин vless-nodes полем chosen; status
+# объявляет умение nodes, но больше не выдаёт outputs.vpn.nodes (contract-v1).
+# pkhooks — не реализация vless-nodes и здесь chosen не проверяет.
+status_nodes_contract() {
+    python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin); o=d["outputs"]["vpn"]
+ assert "nodes" in d["features"] and o["kind"] == "vless" and "unavail" not in o and o["plugin"]["id"] == "vless" and "nodes" not in o
+ print("yes")
+except (ValueError,KeyError,TypeError,AssertionError): print("no")'
+}
+check "status: доступный vless объявляет умение nodes без устаревшего поля выхода" "yes" \
+      "$(st | status_nodes_contract)"
 sed 's/"on_fail": "drop"/"on_fail": "drop", "nodes": [6, 7, 12]/' \
     "$tmp/vless.json" > "$tmp/vless-nodes.json"
-check "status: выбранные узлы в порядке предпочтения" "1" \
-      "$($DIAG status --spec "$tmp/vless-nodes.json" 2>/dev/null | grep -c '"nodes":\[6,7,12\]')"
+check "status: выбор не появляется устаревшим полем даже при заданных nodes" "yes" \
+      "$($DIAG status --spec "$tmp/vless-nodes.json" 2>/dev/null | status_nodes_contract)"
+mkdir -p "$tmp/no-plugins"
+check "status: отсутствующий плагин не принимается за доступный vless" "no" \
+      "$(STEER_PLUGINS_ROOT="$tmp/no-plugins" st | status_nodes_contract)"
+check "status: отсутствие vless отмечено как unavail" "yes" \
+      "$(STEER_PLUGINS_ROOT="$tmp/no-plugins" st | python3 -c 'import json,sys
+try:
+ o=json.load(sys.stdin)["outputs"]["vpn"]; print("yes" if o["unavail"]["plugin"] == "vless" else "no")
+except (ValueError,KeyError,TypeError): print("no")')"
 # У выхода без подписки поля нет вовсе: кандидаты kind=interface — устройства, и пустой
 # `nodes` рядом с ними читался бы как «узлы есть, но не выбраны».
 #
