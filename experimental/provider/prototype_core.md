@@ -13,6 +13,41 @@ make -C steer/experimental/provider BUILD=/tmp/steer-provider-build test
 
 Run with `steer-prototype --config FILE --control /private/directory/core.sock`
 and optional `--state-dir /private/state-directory`.
+
+### Experimental selected/runtime divergence
+
+`--experimental-durable-split` opts the standalone configured host into an
+experimental control contract and requires a state directory. It cannot be
+combined with the existing WG netns modes. It does not enable a DEVICE, WG
+inbound, or a UI capability. In this mode STATUS additionally reports
+`selectedRevision`, `runtimeGeneration`, and `splitFenced`; GET returns the
+selected document and revision together with the runtime generation and fence.
+On a post-SYNCED runtime-publication failure the host keeps the selected
+document from the same prepared transaction, retains the previous runtime,
+returns an Apply error, fences subsequent Apply and sets `runtimeReady` false.
+Existing SOCKS admission is not globally fenced. If durability is uncertain,
+selected revision is null in STATUS and GET refuses instead of returning a
+document with an unproven revision. Ordinary non-opt-in responses are unchanged.
+
+The separate `steer-prototype-split-fault` build provides the test-only
+`--test-fail-after-sync` switch; the ordinary build has no fault switch or
+environment hook. The fault is injected after the real store receipt, before
+runtime publication. It does not test DEVICE, peer traffic, or DEVICE restart.
+For the executable control/store and pinned/new SOCKS regression, build
+`steer-prototype` and `steer-prototype-split-fault` using this directory's
+Makefile, and pass both paths plus a separately built pre-change baseline to
+`prototype_split_test.py`. Run it in a disposable network namespace with its
+loopback up. The test compares ordinary STATUS/GET against the baseline.
+
+```sh
+make -C experimental/provider BUILD=/tmp/opencode/split-build \
+  SDK=/absolute/path/to/plugin-sdk PROTOCOLS=/absolute/path/to/steer-protocols \
+  /tmp/opencode/split-build/steer-prototype /tmp/opencode/split-build/steer-prototype-split-fault
+unshare -n sh -c 'ip link set lo up && python3 -B experimental/provider/prototype_split_test.py \
+  /tmp/opencode/split-build/steer-prototype /tmp/opencode/split-build/steer-prototype-split-fault \
+  /absolute/path/to/pre-change/steer-prototype'
+```
+
 The control parent directory must belong to the effective UID and have no group
 or other permissions (normally mode 0700). The socket is mode 0600 and accepts
 only the same effective UID through `SO_PEERCRED`. An existing socket path is

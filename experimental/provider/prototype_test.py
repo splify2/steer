@@ -56,13 +56,14 @@ def listener(identity, port, protocol="socks"):
 
 
 @contextlib.contextmanager
-def core(binary, directory, document, state_directory=None, expected_revision=1, extra_env=None):
+def core(binary, directory, document, state_directory=None, expected_revision=1, extra_env=None, extra_args=()):
     path = Path(directory) / "core.sock"
     config = Path(directory) / "config.json"
     config.write_text(document if isinstance(document, str) else json.dumps(document), encoding="utf-8")
     arguments = [binary, "--config", str(config), "--control", str(path)]
     if state_directory:
         arguments += ["--state-dir", str(state_directory)]
+    arguments += list(extra_args)
     env = dict(os.environ, STEER_TEST_UUID=UUID)
     if extra_env:
         env.update(extra_env)

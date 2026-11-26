@@ -179,6 +179,13 @@ struct host {
     struct steer_draft_hy2_datagram_budget datagram_budget;
 #endif
     int store_busy, durability_uncertain;
+    int experimental_durable_split, split_fenced;
+    char *selected_document;
+    size_t selected_length;
+    uint64_t selected_revision;
+#ifdef STEER_PROTOTYPE_SPLIT_FAULT
+    int test_fail_after_sync;
+#endif
     struct generation generations[GENERATIONS], *current;
     struct listener listeners[LISTENERS];
     struct loop_timer *work;
@@ -1133,6 +1140,7 @@ static void cleanup_host(struct host *h)
     if (h->runtime && steer_draft_stream_runtime_destroy(h->runtime).code) abort();
     if (h->buffers && steer_draft_buffers_destroy(h->buffers).code) abort();
     if (h->loop) loop_free(h->loop);
+    free(h->selected_document);
 }
 int steer_lab_loopback_main(int argc, char **argv, int vless)
 {
@@ -1492,11 +1500,15 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 #ifdef STEER_PROTOTYPE_WG_NETNS
     ready=!h->wg_fenced&&wg_generation_ready(h->current);
 #endif
+    if(h->experimental_durable_split&&h->split_fenced)ready=0;
 #ifdef STEER_PROTOTYPE_HY2
     for(i=0;i<LISTENERS;i++)if(h->listeners[i].hy2)active_clients+=(unsigned)steer_draft_hy2_flows(h->listeners[i].hy2);
 #endif
-    int n = snprintf(out, capacity, "{\"prototype\":\"steer-linux-v1\",\"generation\":%llu,\"revision\":%llu,\"runtimeReady\":%s,\"persistence\":%s,\"durability_uncertain\":%s,\"activeClients\":%u,\"retainedGenerations\":%u,\"listeners\":[",
-        (unsigned long long)h->current->number, (unsigned long long)h->current->number,
+    char revision[32];
+    if(h->experimental_durable_split&&h->durability_uncertain)strcpy(revision,"null");
+    else snprintf(revision,sizeof revision,"%llu",(unsigned long long)(h->selected_document?h->selected_revision:h->current->number));
+    int n = snprintf(out, capacity, "{\"prototype\":\"steer-linux-v1\",\"generation\":%llu,\"revision\":%s,\"runtimeReady\":%s,\"persistence\":%s,\"durability_uncertain\":%s,\"activeClients\":%u,\"retainedGenerations\":%u,\"listeners\":[",
+        (unsigned long long)h->current->number, revision,
         ready?"true":"false",h->store ? "true" : "false", h->durability_uncertain ? "true" : "false", active_clients,retained);
     if (n < 0 || (size_t)n >= capacity) return 0;
     used = (size_t)n;
@@ -1515,7 +1527,19 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 #ifdef STEER_PROTOTYPE_HY2
     hy2="true";hy2_udp=h->current&&h->current->datagrams?"true":"false";provider=",\"hysteria2\"";
 #endif
-    n=snprintf(out+used,capacity-used,"],\"capabilities\":{\"spec_v3_profile\":\"linked-socks-v1\",\"spec_v3_vless_tcp\":true,"
+    if(h->experimental_durable_split){
+        n=snprintf(out+used,capacity-used,"],\"selectedRevision\":%s",revision);
+        if(n<0||(size_t)n>=capacity-used)return 0;
+        used+=(size_t)n;
+        n=snprintf(out+used,capacity-used,",\"runtimeGeneration\":%llu,\"splitFenced\":%s",
+            (unsigned long long)h->current->number,h->split_fenced?"true":"false");
+        if(n<0||(size_t)n>=capacity-used)return 0;
+        used+=(size_t)n;
+    }else{
+        if(used+1>=capacity)return 0;
+        out[used++]=']';
+    }
+    n=snprintf(out+used,capacity-used,",\"capabilities\":{\"spec_v3_profile\":\"linked-socks-v1\",\"spec_v3_vless_tcp\":true,"
         "%s\"spec_v3_socks_tcp_userpass\":true,\"spec_v3_socks_vpn_bind\":{\"auth\":\"userpass\",\"addresses\":[",wg_cap);
     if(n<0||(size_t)n>=capacity-used)return 0;
     used+=(size_t)n;
@@ -1640,6 +1664,27 @@ static void writer_ready(struct loop *l, int fd, uint32_t events, void *arg)
     pthread_mutex_unlock(&writer->lock);
     control = prepared->control; serial = prepared->control_serial;
     int published=result.phase>=STEER_PROTOTYPE_STORE_RENAMED;
+    if(h->experimental_durable_split&&published&&
+       (result.phase!=STEER_PROTOTYPE_STORE_SYNCED||result.error.code)){
+        h->durability_uncertain=1;
+        h->split_fenced=1;
+        published=0;
+    }
+    int publication_failed=0;
+#ifdef STEER_PROTOTYPE_SPLIT_FAULT
+    publication_failed=h->test_fail_after_sync;
+#endif
+    if(h->experimental_durable_split&&publication_failed&&
+       result.phase==STEER_PROTOTYPE_STORE_SYNCED&&!result.error.code){
+        struct generation *candidate=prepared->generation;
+        free(h->selected_document);
+        h->selected_document=candidate->document;
+        h->selected_length=candidate->document_length;
+        h->selected_revision=candidate->number;
+        candidate->document=NULL;candidate->document_length=0;
+        h->split_fenced=1;h->durability_uncertain=0;
+        published=0;
+    }
 #ifdef STEER_PROTOTYPE_WG_NETNS
     if(h->linked_wg&&published&&result.phase!=STEER_PROTOTYPE_STORE_SYNCED){
         h->durability_uncertain=1;
@@ -1707,6 +1752,7 @@ static void prepared_ready(void *user,struct steer_prototype_prepared_input *inp
         control_error(c,input->error&&input->error!=499?input->error:408);return;
     }
     /* CAS is rechecked after worker result, before any bind/route preparation. */
+    if(!input->validate&&h->split_fenced) { control_error(c,503);return; }
     if(!input->validate&&input->expected!=h->current->number) { control_error(c,409);return; }
     prepared=calloc(1,sizeof *prepared);if(!prepared) { control_error(c,503);return; }
     code=prepare_configuration(h,NULL,0,input->expected,input->validate,0,0,prepared,input);
@@ -1765,7 +1811,7 @@ static int control_header(struct control *c)
 static void control_execute(struct control *c)
 {
     struct host *h = c->host;
-    char status[8192], prefix[128];
+    char status[8192], prefix[256];
     size_t length;
     int code, n;
 #ifdef STEER_PROTOTYPE_WG_NETNS
@@ -1781,18 +1827,28 @@ static void control_execute(struct control *c)
         control_response(c, 200, status, length);
     } else if (c->operation == 2) {
         struct generation *g = h->current;
-        n = snprintf(prefix, sizeof(prefix), "{\"revision\":%llu,\"persistence\":%s,\"durability_uncertain\":%s,\"document\":",
-                     (unsigned long long)g->number, h->store ? "true" : "false",
+        if(h->experimental_durable_split&&h->durability_uncertain){control_error(c,503);return;}
+        const char *document=h->selected_document?h->selected_document:g->document;
+        size_t document_length=h->selected_document?h->selected_length:g->document_length;
+        uint64_t revision=h->selected_document?h->selected_revision:g->number;
+        if(h->experimental_durable_split)
+            n=snprintf(prefix,sizeof(prefix),"{\"revision\":%llu,\"runtimeGeneration\":%llu,\"splitFenced\":%s,\"persistence\":%s,\"durability_uncertain\":%s,\"document\":",
+                (unsigned long long)revision,(unsigned long long)g->number,h->split_fenced?"true":"false",
+                h->store?"true":"false",h->durability_uncertain?"true":"false");
+        else n = snprintf(prefix, sizeof(prefix), "{\"revision\":%llu,\"persistence\":%s,\"durability_uncertain\":%s,\"document\":",
+                     (unsigned long long)revision, h->store ? "true" : "false",
                      h->durability_uncertain ? "true" : "false");
-        length = (size_t)n + g->document_length + 1;
+        if(n<0||(size_t)n>=sizeof(prefix)){control_error(c,500);return;}
+        length = (size_t)n + document_length + 1;
         if (length > sizeof(c->output) - 64) { control_error(c, 500); return; }
         /* Build in input storage after execution; no request bytes are needed. */
         memcpy(c->input, prefix, (size_t)n);
-        memcpy(c->input + n, g->document, g->document_length);
-        c->input[n + g->document_length] = '}';
+        memcpy(c->input + n, document, document_length);
+        c->input[n + document_length] = '}';
         control_response(c, 200, c->input, length);
     } else {
         uint64_t generation=h->current->number+1;
+        if(c->operation==4&&h->split_fenced){control_error(c,503);return;}
 #ifdef STEER_PROTOTYPE_WG_NETNS
         if(h->linked_wg){
             if(h->wg_fenced||(c->operation==4&&h->wg_retire_error)){control_error(c,503);return;}
@@ -1951,12 +2007,25 @@ int steer_prototype_main(int argc, char **argv)
             }
             i+=4;
         }
+        else if(!strcmp(argv[i],"--experimental-durable-split")&&!h.experimental_durable_split){
+            h.experimental_durable_split=1;i++;
+        }
+#ifdef STEER_PROTOTYPE_SPLIT_FAULT
+        else if(!strcmp(argv[i],"--test-fail-after-sync")&&!h.test_fail_after_sync){
+            h.test_fail_after_sync=1;i++;
+        }
+#endif
 #if defined(STEER_PROTOTYPE_WG_NETNS) && defined(STEER_PROTOTYPE_HY2)
         else if(!strcmp(argv[i],"--allow-wg-stream-netns")&&!linked_wg){linked_wg=1;i++;}
         else if(!strcmp(argv[i],"--validate-wg-inbound-netns")&&!inbound_validate){inbound_validate=1;i++;}
 #endif
         else return 2;
     }
+    if(h.experimental_durable_split&&!state_dir)return 2;
+    if(h.experimental_durable_split&&(linked_wg||inbound_validate))return 2;
+#ifdef STEER_PROTOTYPE_SPLIT_FAULT
+    if(h.test_fail_after_sync&&!h.experimental_durable_split)return 2;
+#endif
     if(inbound_validate){
 #ifdef STEER_PROTOTYPE_WG_NETNS
         struct steer_draft_wg_linux_link *gate=NULL;
@@ -2023,6 +2092,7 @@ int steer_prototype_main(int argc, char **argv)
         (void)steer_prototype_store_abort(transaction);
         if (committed.phase < STEER_PROTOTYPE_STORE_RENAMED) goto cleanup;
         h.durability_uncertain = committed.phase != STEER_PROTOTYPE_STORE_SYNCED;
+        if(h.experimental_durable_split&&h.durability_uncertain)goto cleanup;
 #ifdef STEER_PROTOTYPE_WG_NETNS
         if(h.linked_wg){
             if(h.durability_uncertain){h.wg_fenced=1;goto cleanup;}
