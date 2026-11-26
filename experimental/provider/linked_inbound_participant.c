@@ -7,7 +7,7 @@ int steer_linked_inbound_recover(struct steer_linked_inbound *p,const struct ste
     if(!p||!steer_draft_wg_selection_is_inbound(p->journal)||!p->backend||!chosen||!verify||!next||!selected||p->staged)return EINVAL;
     p->fenced=1;
     int rc=steer_draft_wg_selection_startup(p->journal,p->backend,p->context,chosen,verify,deadline,next,selected);
-    if(!rc){p->committed=*chosen;p->fenced=0;p->recovered=1;}
+    if(!rc){p->committed=*chosen;p->fenced=0;p->recovered=1;p->durable_unknown=0;}
     return rc;
 }
 int steer_linked_inbound_prepare(struct steer_linked_inbound *p,const struct steer_draft_wg_tx *tx,
@@ -34,7 +34,7 @@ int steer_linked_inbound_prepare(struct steer_linked_inbound *p,const struct ste
 }
 int steer_linked_inbound_live_commit(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
     const struct steer_draft_wg_revision *chosen){
-    if(!p||!p->staged)return EINVAL;
+    if(!p||!p->staged||p->closed_stage)return EINVAL;
     p->staged=0;
     p->fenced=1;
     if(!chosen||result.phase!=STEER_PROTOTYPE_STORE_SYNCED||result.error.code||
@@ -46,7 +46,7 @@ int steer_linked_inbound_live_commit(struct steer_linked_inbound *p,struct steer
 }
 int steer_linked_inbound_finish(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
     steer_draft_wg_verify_ready verify,uint64_t deadline){
-    if(!p||!p->staged)return EINVAL;
+    if(!p||!p->staged||p->closed_stage)return EINVAL;
     p->staged=0;
     if(result.phase==STEER_PROTOTYPE_STORE_SYNCED&&!result.error.code){
         /* Owner must supply the new committed selection through recovery before
@@ -58,4 +58,57 @@ int steer_linked_inbound_finish(struct steer_linked_inbound *p,struct steer_prot
     if(result.phase!=STEER_PROTOTYPE_STORE_NOT_RENAMED)return EIO;
     uint64_t next;struct steer_draft_wg_guard_record selected;
     return steer_linked_inbound_recover(p,&p->committed,verify,deadline,&next,&selected);
+}
+static void forget_closed(struct steer_linked_inbound *p){
+    if(p->backend_guard)*p->backend_guard=NULL;
+    steer_draft_kernel_wg_guard_forget_prepared(p->closed_guard);
+    p->closed_guard=NULL;
+}
+int steer_linked_inbound_prepare_closed(struct steer_linked_inbound *p,const struct steer_draft_wg_tx *tx,
+    const struct steer_draft_wg_candidate *input,const struct steer_draft_kernel_wg_guard_config *config,
+    const struct steer_policy *policy,uint64_t deadline){
+    if(!p||!steer_draft_wg_selection_is_inbound(p->journal)||!p->backend||!p->backend_guard||*p->backend_guard||
+       !tx||!input||!config||!policy||!p->recovered||p->fenced||p->staged||p->closed_guard||
+       !p->committed.generation||!p->committed.without_wg||config->return_only||!config->peer_count||
+       config->generation!=tx->generation||strcmp(config->device,input->link.physical_name)||
+       input->link.generation!=tx->generation)return EINVAL;
+    struct steer_draft_kernel_wg_guard *guard=NULL;
+    if(steer_draft_kernel_wg_guard_prepare(config,policy,&guard).code)return EINVAL;
+    p->closed_guard=guard;
+    struct steer_draft_wg_candidate c=*input;
+    int rc=steer_draft_kernel_wg_guard_plan(guard,c.table,c.marker);
+    if(!rc){
+        *p->backend_guard=guard;
+        rc=steer_draft_wg_selection_stage_closed(p->journal,p->backend,p->context,&p->committed,tx,&c,deadline,&p->candidate);
+    }
+    if(rc){p->fenced=1;forget_closed(p);return rc;}
+    p->closed_tx=*tx;
+    p->pending=(struct steer_draft_wg_revision){.generation=tx->generation};
+    memcpy(p->pending.digest,tx->plan_digest,sizeof(p->pending.digest));
+    p->closed_stage=1;p->staged=1;
+    return 0;
+}
+int steer_linked_inbound_finish_closed(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
+    const struct steer_draft_wg_revision *chosen,steer_draft_wg_verify_ready verify,uint64_t deadline){
+    if(!p||!p->staged||!p->closed_stage||!p->closed_guard)return EINVAL;
+    p->staged=0;p->closed_stage=0;p->fenced=1;
+    if(result.phase==STEER_PROTOTYPE_STORE_NOT_RENAMED){
+        uint64_t next;struct steer_draft_wg_guard_record selected;
+        int rc=steer_linked_inbound_recover(p,&p->committed,verify,deadline,&next,&selected);
+        forget_closed(p);
+        return rc?rc:EIO;
+    }
+    if(result.phase!=STEER_PROTOTYPE_STORE_SYNCED||result.error.code||result.error.transient||
+       !chosen||chosen->without_wg||chosen->generation!=p->pending.generation||
+       memcmp(chosen->digest,p->pending.digest,32)){
+        p->durable_unknown=1;forget_closed(p);return EIO;
+    }
+    /* The store is already durable: never report the old selection even if
+     * guard publication fails. Journal intent precedes the fallible mutation. */
+    struct steer_draft_wg_revision previous=p->committed;
+    p->committed=*chosen;p->durable_unknown=0;
+    int rc=steer_draft_wg_selection_publish_closed(p->journal,p->backend,p->context,&previous,&p->closed_tx,deadline,&p->candidate);
+    forget_closed(p);
+    if(!rc)p->fenced=0;
+    return rc;
 }

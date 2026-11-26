@@ -6,6 +6,9 @@ It does not open a store, decide its revision, or start a service. The owner mus
 open a role-scoped inbound journal with `steer_draft_wg_selection_open_inbound`;
 existing role-ambiguous selection records are not adopted. See
 `linked_inbound_recovery.md` for the narrow checked Linux recovery entry point.
+For a first inbound device that must remain closed until the durable store
+receipt, use the separate two-phase API described in
+`linked_inbound_two_phase.md`; the older participant path is eager.
 The owner must
 first recover the common store and pass its validated exact revision/digest to
 `recover`, then supply a verified inbound-only config/peer mapping and policy.

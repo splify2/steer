@@ -16,7 +16,9 @@ struct steer_linked_inbound {
     struct steer_draft_wg_revision committed;
     struct steer_draft_wg_revision pending;
     struct steer_draft_wg_ready candidate;
-    int staged, fenced, recovered;
+    struct steer_draft_wg_tx closed_tx;
+    struct steer_draft_kernel_wg_guard *closed_guard;
+    int staged, fenced, recovered, closed_stage, durable_unknown;
 };
 int steer_linked_inbound_recover(struct steer_linked_inbound *,const struct steer_draft_wg_revision *,
     steer_draft_wg_verify_ready,uint64_t,uint64_t *,struct steer_draft_wg_guard_record *);
@@ -28,6 +30,13 @@ int steer_linked_inbound_prepare(struct steer_linked_inbound *,const struct stee
  * any non-SYNCED receipt fence until startup recovery. */
 int steer_linked_inbound_live_commit(struct steer_linked_inbound *,
     struct steer_prototype_store_result,const struct steer_draft_wg_revision *);
+/* First inbound device only; guard remains DROP until a matching SYNCED store
+ * result. No cleanup is authorized on uncertain rename or post-sync failure. */
+int steer_linked_inbound_prepare_closed(struct steer_linked_inbound *,const struct steer_draft_wg_tx *,
+    const struct steer_draft_wg_candidate *,const struct steer_draft_kernel_wg_guard_config *,
+    const struct steer_policy *,uint64_t);
+int steer_linked_inbound_finish_closed(struct steer_linked_inbound *,struct steer_prototype_store_result,
+    const struct steer_draft_wg_revision *,steer_draft_wg_verify_ready,uint64_t);
 /* SYNCED requires later recovery of the external selection; RENAMED fences
  * without cleanup; NOT_RENAMED reconciles the previous external selection.
  * Never rewrites store. */

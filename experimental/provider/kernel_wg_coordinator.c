@@ -182,7 +182,7 @@ static int change_guard(struct steer_spec_journal *j,const struct steer_draft_wg
 static int stage_candidate(struct steer_spec_journal *j,const struct steer_draft_wg_backend *b,
     void *ctx,const struct steer_draft_wg_tx *t,const struct steer_draft_wg_candidate *c,
     const struct steer_draft_wg_ready *previous,uint64_t deadline,const atomic_uint *cancel,
-    struct steer_draft_wg_ready *ready,int *started,const char *owner){
+    struct steer_draft_wg_ready *ready,int *started,const char *owner,int publish){
     if(!j||!cleanup_backend(b)||!b->create_down||!b->stage_down||!b->guard||!b->up||
        !tx_valid(t)||!c||!ready||ready==previous||!c->config||!c->keys||!c->config->has_listen_port||
        !c->config->listen_port||c->link.generation!=t->generation||c->link.instance_token!=t->instance)
@@ -211,7 +211,7 @@ static int stage_candidate(struct steer_spec_journal *j,const struct steer_draft
     if(!rc)rc=running(deadline,cancel);
     if(!rc)rc=b->up(ctx,&g,deadline);
     if(!rc)rc=running(deadline,cancel);
-    if(!rc)rc=change_guard(j,b,ctx,t,&g,1,deadline,cancel,owner);
+    if(!rc&&publish)rc=change_guard(j,b,ctx,t,&g,1,deadline,cancel,owner);
     if(!rc)rc=running(deadline,cancel);
     if(!rc)*ready=(struct steer_draft_wg_ready){g,c->config->listen_port};
     return rc;
@@ -224,7 +224,7 @@ int steer_draft_wg_coordinator_apply(struct steer_spec_journal *j,const struct s
     if(!cleanup_error)return EINVAL;
     int started=0;
     *cleanup_error=0;
-    int rc=stage_candidate(j,b,ctx,t,c,previous,deadline,cancel,ready,&started,provider);
+    int rc=stage_candidate(j,b,ctx,t,c,previous,deadline,cancel,ready,&started,provider,1);
     if(rc&&started)*cleanup_error=steer_draft_wg_coordinator_recover(j,b,ctx,t,deadline);
     return rc;
 }
@@ -433,10 +433,10 @@ int steer_draft_wg_selection_startup(struct steer_draft_wg_selection *s,const st
     return rc;
 }
 
-int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
+static int selection_stage(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
     void *ctx,const struct steer_draft_wg_revision *revision,uint16_t previous_port,
     const struct steer_draft_wg_tx *t,const struct steer_draft_wg_candidate *c,uint64_t deadline,
-    struct steer_draft_wg_ready *ready){
+    struct steer_draft_wg_ready *ready,int publish){
     if(!ready)return EINVAL;
     *ready=(struct steer_draft_wg_ready){0};
     if(!s||!tx_valid(t)||!c||!c->config||!revision_valid(revision)||
@@ -464,7 +464,44 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *s,const stru
     if(rc)return rc;
     int started=0;
     return stage_candidate(s->j,b,ctx,t,c,previous.listen_port?&previous:NULL,deadline,NULL,ready,
-        &started,s->owner);
+        &started,s->owner,publish);
+}
+int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
+    void *ctx,const struct steer_draft_wg_revision *revision,uint16_t previous_port,
+    const struct steer_draft_wg_tx *t,const struct steer_draft_wg_candidate *c,uint64_t deadline,
+    struct steer_draft_wg_ready *ready){
+    return selection_stage(s,b,ctx,revision,previous_port,t,c,deadline,ready,1);
+}
+int steer_draft_wg_selection_stage_closed(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
+    void *ctx,const struct steer_draft_wg_revision *revision,
+    const struct steer_draft_wg_tx *t,const struct steer_draft_wg_candidate *c,uint64_t deadline,
+    struct steer_draft_wg_ready *ready){
+    if(!steer_draft_wg_selection_is_inbound(s)||!revision||!revision->without_wg)return EINVAL;
+    return selection_stage(s,b,ctx,revision,0,t,c,deadline,ready,0);
+}
+int steer_draft_wg_selection_publish_closed(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
+    void *ctx,const struct steer_draft_wg_revision *previous,const struct steer_draft_wg_tx *tx,
+    uint64_t deadline,struct steer_draft_wg_ready *ready){
+    if(!steer_draft_wg_selection_is_inbound(s)||!b||!b->guard||!previous||!previous->without_wg||
+       !tx_valid(tx)||!ready||!ready->guard.handle)return EINVAL;
+    int rc=running(deadline,NULL);
+    if(rc)return rc;
+    struct inventory i;
+    rc=inventory_read(s,&i,previous);
+    struct entry *match=NULL;
+    if(!rc)for(unsigned n=0;n<i.n;n++)if(i.e[n].tx.transaction==tx->transaction){match=&i.e[n];break;}
+    if(!rc){
+        uint8_t actual[STEER_DRAFT_WG_GUARD_RECORD_BYTES],expected[STEER_DRAFT_WG_GUARD_RECORD_BYTES];
+        if(!match||match->tx.instance!=tx->instance||match->tx.generation!=tx->generation||
+           memcmp(match->tx.plan_digest,tx->plan_digest,32)||!match->r[BOUND].length||
+           match->r[BOUND].effect!=STEER_PV1_DEVICE_CHANGED||match->r[PUBLISH].length||
+           match->r[CLEAN].length||!match->guard.handle||
+           steer_draft_wg_guard_record_encode(&match->guard,actual)||
+           steer_draft_wg_guard_record_encode(&ready->guard,expected)||memcmp(actual,expected,sizeof(actual)))rc=ESTALE;
+    }
+    free(i.e);
+    if(rc)return rc;
+    return change_guard(s->j,b,ctx,tx,&ready->guard,1,deadline,NULL,s->owner);
 }
 
 int steer_draft_wg_selection_reuse(struct steer_draft_wg_selection *s,const struct steer_draft_wg_revision *r,

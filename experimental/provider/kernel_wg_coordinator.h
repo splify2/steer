@@ -97,6 +97,16 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *,const struc
     void *,const struct steer_draft_wg_revision *,uint16_t previous_port,
     const struct steer_draft_wg_tx *,const struct steer_draft_wg_candidate *,
      uint64_t deadline,struct steer_draft_wg_ready *);
+/* Inbound-only first device: durable link/guard intent, stage and UP under a
+ * confirmed DROP guard. No allow-policy publication. The caller keeps the
+ * prepared guard alive. Publication requires a confirmed matching store receipt
+ * at the higher participant boundary. Old eager APIs are unchanged. */
+int steer_draft_wg_selection_stage_closed(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
+    void *,const struct steer_draft_wg_revision *,const struct steer_draft_wg_tx *,
+    const struct steer_draft_wg_candidate *,uint64_t,struct steer_draft_wg_ready *);
+int steer_draft_wg_selection_publish_closed(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
+    void *,const struct steer_draft_wg_revision *,const struct steer_draft_wg_tx *,
+    uint64_t,struct steer_draft_wg_ready *);
 /* Owner has stopped admission and joined this generation's bindings.
  * The durable selected revision is rechecked; it cannot be retired here. */
 int steer_draft_wg_selection_retire(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
