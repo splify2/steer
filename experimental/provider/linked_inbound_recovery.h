@@ -24,4 +24,6 @@ int steer_linked_inbound_recover_down_checked(struct steer_linked_inbound *,
     struct steer_linked_inbound_recovery *,uint64_t,uint64_t *,struct steer_draft_wg_guard_record *);
 int steer_linked_inbound_verify_down(struct steer_linked_inbound_recovery *,
     const struct steer_draft_wg_guard_record *,uint64_t);
+int steer_linked_inbound_verify_up(struct steer_linked_inbound_recovery *,
+    const struct steer_draft_wg_guard_record *,uint64_t);
 #endif

@@ -145,8 +145,8 @@ Normal profiles and Nano reject this DEVICE configuration.
 
 The separate experimental
 `--experimental-wg-inbound-netns` switch in the WG
-netns build is a narrow first-Apply path, not the validation-only switch and
-not a capability declaration. It requires the same private namespace gate and
+netns build is a narrow first-Apply path, not the validation-only switch or
+a production capability declaration. It requires the same private namespace gate and
 a state directory. It accepts the first transition from one existing SOCKS
 listener to the same SOCKS listener plus the supported DEVICE, and removal
 back to the same SOCKS listener with direct routing and no rules. Other live
@@ -157,6 +157,17 @@ checks the current private key, PSK, peer key and AllowedIPs, listen port,
 fwmark, MTU and IPv4 address against the validated stored document and local
 secret references. The authenticated peer endpoint is not fixed. It cannot be
 combined with the existing outbound-WG or validation-only modes.
+
+For the common control bridge, STATUS exposes the explicitly experimental
+`spec_v3_wg_inbound_netns` capability with `mode`, `add`, `remove`, and
+`replace`. In validation-only mode both mutations are false; in runtime mode
+add/remove reflect the selected slot, the journal's re-add restriction,
+runtime health, fencing, durability and pending operations. Replace is always
+false. An active slot is read-only checked against its link, guard and peer
+before reporting it ready. This is not a production WG capability or a protocol
+matrix claim. In runtime mode VALIDATE checks the same supported transition
+constraints as APPLY; it never prepares the device. The validation-only mode
+continues to return `validationOnly: true` for its DEVICE candidate.
 
 An already UP or otherwise unconfirmed device is refused, including after
 SIGKILL; a selected but unpublished journal entry is also refused. A DOWN

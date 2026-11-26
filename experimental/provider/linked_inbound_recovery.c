@@ -68,3 +68,8 @@ int steer_linked_inbound_verify_down(struct steer_linked_inbound_recovery *c,
     if(!c||!c->require_down||!c->keys)return EINVAL;
     return verify(c,r,deadline);
 }
+int steer_linked_inbound_verify_up(struct steer_linked_inbound_recovery *c,
+    const struct steer_draft_wg_guard_record *r,uint64_t deadline){
+    if(!c||c->require_down)return EINVAL;
+    return verify(c,r,deadline);
+}

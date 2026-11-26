@@ -1393,7 +1393,7 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
         if(config->wg_inbound_validate&&(length!=config->document_length||
             memcmp(document,config->document_json,length)))goto cleanup;
     }
-    if(!validate&&h->inbound_runtime&&h->current){
+    if(h->inbound_runtime&&h->current){
         int old_wg=h->current->config->wg_inbound_validate!=NULL;
         int new_wg=config->wg_inbound_validate!=NULL;
         uint32_t fallback=0;
@@ -1402,7 +1402,7 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
            steer_policy_visit(config->policy,config->generation,inbound_no_rules,NULL,&fallback).code||
            fallback!=STEER_POLICY_DIRECT)goto cleanup;
     }
-    if(!validate&&h->inbound_runtime&&h->current&&
+    if(h->inbound_runtime&&h->current&&
        (h->current->config->format!=STEER_STORE_FORMAT_SPEC_V3||
         h->current->config->listener_count!=1||config->listener_count!=1||
         !config->listeners[0].enabled||
@@ -1457,7 +1457,11 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
 #endif
     }
     if (validate) {
-        prepared_state->validation_only=config->wg_inbound_validate!=NULL;
+        prepared_state->validation_only=config->wg_inbound_validate!=NULL
+#ifdef STEER_PROTOTYPE_WG_NETNS
+            &&!h->inbound_runtime
+#endif
+            ;
         result = 200; goto cleanup;
     }
 #ifdef STEER_PROTOTYPE_WG_NETNS
@@ -1643,6 +1647,18 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
 #ifdef STEER_PROTOTYPE_WG_NETNS
     ready=!h->wg_fenced&&wg_generation_ready(h->current);
     if(h->inbound_runtime&&h->inbound.removal_stage)ready=0;
+    if(h->inbound_runtime&&h->current&&h->current->config->wg_inbound_validate&&
+       h->inbound.barrier_state!=STEER_INBOUND_BARRIER_OPEN)ready=0;
+    if(ready&&h->inbound_runtime&&h->current&&h->current->config->wg_inbound_validate&&
+       !h->split_fenced&&!h->inbound.staged){
+        struct steer_prototype_config *cfg=h->current->config;
+        struct steer_draft_kernel_wg_guard_config guard=cfg->wg_inbound_validate->cfg.guard;
+        guard.generation=cfg->generation;
+        struct steer_linked_inbound_recovery check={.guard=h->inbound_guard,.revision=inbound_revision(cfg),
+            .inbound=&guard,.policy=cfg->policy,.wireguard=&cfg->wg_inbound_validate->cfg.kernel};
+        uint64_t now=steer_nl_now_ns();
+        if(!now||steer_linked_inbound_verify_up(&check,&h->inbound.candidate.guard,now+50000000u))ready=0;
+    }
 #endif
     if(h->experimental_durable_split&&h->split_fenced)ready=0;
 #ifdef STEER_PROTOTYPE_HY2
@@ -1665,8 +1681,21 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
         used += (size_t)n;
     }
     const char *hy2="false",*hy2_udp="false",*provider="",*wg_cap="";
+    char inbound_cap[256]="";
 #ifdef STEER_PROTOTYPE_WG_NETNS
     if(h->linked_wg)wg_cap="\"spec_v3_wireguard_stream_outbound_netns\":true,";
+    if(h->socks_vpn.wg_inbound_validate){
+        int active=h->current&&h->current->config&&h->current->config->wg_inbound_validate!=NULL;
+        int available=h->inbound_runtime&&!h->split_fenced&&!h->durability_uncertain&&!h->stopping&&
+            !h->store_busy&&h->inbound.recovered&&!h->inbound.fenced&&!h->inbound.staged&&ready&&h->current&&h->current->config&&
+            h->current->config->format==STEER_STORE_FORMAT_SPEC_V3&&
+            h->current->config->listener_count==1&&h->current->config->listeners[0].enabled&&
+            h->current->config->listeners[0].protocol==STEER_PROTOTYPE_SOCKS;
+        snprintf(inbound_cap,sizeof inbound_cap,
+            "\"spec_v3_wg_inbound_netns\":{\"mode\":\"%s\",\"add\":%s,\"remove\":%s,\"replace\":false},",
+            h->inbound_runtime?"experimental":"validate-only",
+            available&&!active&&!h->inbound_removed?"true":"false",available&&active?"true":"false");
+    }
 #endif
 #ifdef STEER_PROTOTYPE_HY2
     hy2="true";hy2_udp=h->current&&h->current->datagrams?"true":"false";provider=",\"hysteria2\"";
@@ -1694,7 +1723,7 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
         out[used++]=']';
     }
     n=snprintf(out+used,capacity-used,",\"capabilities\":{\"spec_v3_profile\":\"linked-socks-v1\",\"spec_v3_vless_tcp\":true,"
-        "%s\"spec_v3_socks_tcp_userpass\":true,\"spec_v3_socks_vpn_bind\":{\"auth\":\"userpass\",\"addresses\":[",wg_cap);
+        "%s%s\"spec_v3_socks_tcp_userpass\":true,\"spec_v3_socks_vpn_bind\":{\"auth\":\"userpass\",\"addresses\":[",wg_cap,inbound_cap);
     if(n<0||(size_t)n>=capacity-used)return 0;
     used+=(size_t)n;
     for(i=0;i<h->socks_vpn.count;i++){
@@ -1922,6 +1951,9 @@ static void prepared_ready(void *user,struct steer_prototype_prepared_input *inp
         control_error(c,input->error&&input->error!=499?input->error:408);return;
     }
     /* CAS is rechecked after worker result, before any bind/route preparation. */
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    if(h->inbound_runtime&&h->split_fenced) { control_error(c,503);return; }
+#endif
     if(!input->validate&&h->split_fenced) { control_error(c,503);return; }
     if(!input->validate&&input->expected!=h->current->number) { control_error(c,409);return; }
     prepared=calloc(1,sizeof *prepared);if(!prepared) { control_error(c,503);return; }
