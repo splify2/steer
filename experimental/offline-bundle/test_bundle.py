@@ -26,11 +26,17 @@ class OfflineTest(unittest.TestCase):
             os.chmod(root, 0o700)
         self.tmp.cleanup()
 
-    def fixture(self, version):
+    def fixture(self, version, state_format=None):
         bundle = self.root / ('bundle' + version)
         (bundle / 'assets').mkdir(parents=True)
         for name in ('core', 'ui', 'assets/index.html', 'assets/app.js'):
             (bundle / name).write_text(version + name)
+        if state_format:
+            (bundle / 'state').mkdir()
+            (bundle / 'state/FORMAT').write_text(state_format + '\n')
+            (bundle / 'state/config.json').write_text('{"generation":"' + version + '"}')
+            if state_format.startswith('steer-v3'):
+                (bundle / 'state/wg-linked-journal').write_text('v3 journal fixture')
         manifest = self.root / ('manifest' + version + '.json')
         manifest.write_text(json.dumps({p.relative_to(bundle).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                                         for p in bundle.rglob('*') if p.is_file()}))
@@ -43,20 +49,45 @@ class OfflineTest(unittest.TestCase):
         return result.stdout.strip()
 
     def test_install_failure_rollback_and_state(self):
-        a, ma = self.fixture('a')
-        b, mb = self.fixture('b')
+        a, ma = self.fixture('a', 'steer-v2.1.4')
+        b, mb = self.fixture('b', 'steer-v3-linked-wg-v1')
         self.assertEqual(self.cli('status'), 'none')
         first = self.cli('install', a, '--manifest', ma)
+        first_state = Path(self.cli('state-dir'))
+        self.assertEqual((first_state / 'FORMAT').read_text(), 'steer-v2.1.4\n')
+        self.assertFalse((first_state / 'wg-linked-journal').exists())
         (b / 'ui').write_text('corrupt')
         self.cli('install', b, '--manifest', mb, ok=False)
         self.assertEqual(self.cli('status'), first)
+        self.assertEqual(self.cli('state-dir'), str(first_state))
         (b / 'ui').write_text('bui')
         second = self.cli('install', b, '--manifest', mb)
         self.assertNotEqual(first, second)
         self.assertEqual((self.prefix / 'active/core').read_text(), 'bcore')
+        second_state = Path(self.cli('state-dir'))
+        self.assertNotEqual(first_state, second_state)
+        self.assertEqual((second_state / 'FORMAT').read_text(), 'steer-v3-linked-wg-v1\n')
+        self.assertEqual((second_state / 'wg-linked-journal').read_text(), 'v3 journal fixture')
         self.assertEqual(self.cli('rollback'), first)
         self.assertEqual((self.prefix / 'active/core').read_text(), 'acore')
+        self.assertEqual(self.cli('state-dir'), str(first_state))
+        self.assertFalse((first_state / 'wg-linked-journal').exists())
+        self.assertTrue((second_state / 'wg-linked-journal').exists())
         self.assertEqual(self.state.read_text(), '{"legacy":"untouched"}')
+
+    def test_pair_format_mismatch_blocks_rollback(self):
+        a, ma = self.fixture('a', 'steer-v2.1.4')
+        b, mb = self.fixture('b', 'steer-v3-linked-wg-v1')
+        first = self.cli('install', a, '--manifest', ma)
+        second = self.cli('install', b, '--manifest', mb)
+        second_state = self.cli('state-dir')
+        first_state = Path(self.prefix / 'states' / first.split('/')[-1])
+        first_state.chmod(0o700)
+        (first_state / 'FORMAT').chmod(0o600)
+        (first_state / 'FORMAT').write_text('steer-v3-linked-wg-v1\n')
+        self.cli('rollback', ok=False)
+        self.assertEqual(self.cli('status'), second)
+        self.assertEqual(self.cli('state-dir'), second_state)
 
     def test_paths_and_extra_files_rejected(self):
         a, ma = self.fixture('a')

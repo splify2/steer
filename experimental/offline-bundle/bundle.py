@@ -73,17 +73,24 @@ def manifest(path):
             result[key] = value
         return result
     obj = json.loads(raw, object_pairs_hook=unique)
-    if not isinstance(obj, dict) or not 3 <= len(obj) <= MAX_FILES:
+    if not isinstance(obj, dict) or not 1 <= len(obj) <= MAX_FILES:
         fail('manifest must be a bounded path-to-sha256 object')
     for name, digest in obj.items():
         p = PurePosixPath(name)
         if (not name or p.is_absolute() or str(p) != name or
                 any(x in ('.', '..') for x in name.split('/')) or
-                not (name in ('core', 'ui') or name.startswith('assets/')) or
+                not (name in ('core', 'ui') or name.startswith('assets/') or
+                     name.startswith('state/')) or
                 not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest)):
             fail('invalid manifest entry: ' + name)
-    if not {'core', 'ui', 'assets/index.html'} <= obj.keys():
-        fail('manifest requires core, ui and assets/index.html')
+    if 'core' not in obj:
+        fail('manifest requires core')
+    has_ui = 'ui' in obj or any(name.startswith('assets/') for name in obj)
+    if has_ui and not {'ui', 'assets/index.html'} <= obj.keys():
+        fail('UI bundles require ui and assets/index.html')
+    state_files = {name for name in obj if name.startswith('state/')}
+    if state_files and 'state/FORMAT' not in state_files:
+        fail('state bundle requires state/FORMAT')
     return obj
 
 
@@ -114,6 +121,62 @@ def switch(prefix, target):
             temp.unlink()
 
 
+def state_path(prefix, target):
+    generation = prefix / target
+    fmt = read_file(generation, '.state-format').decode('ascii')
+    if not fmt:
+        fail('generation has no paired state')
+    name = target.split('/', 1)[1]
+    states = prefix / 'states'
+    if states.is_symlink() or not states.is_dir():
+        fail('paired state directory is missing')
+    private_dir(states)
+    state = states / name
+    if state.is_symlink() or not state.is_dir():
+        fail('paired state snapshot is missing')
+    private_dir(state)
+    if read_file(state, 'FORMAT').decode('ascii') != fmt:
+        fail('paired state format mismatch')
+    return state
+
+
+def copy_state(prefix, generation_name, expected, bundle):
+    entries = {name: digest for name, digest in expected.items() if name.startswith('state/')}
+    if not entries:
+        return ''
+    state_root = prefix / 'states'
+    state_root.mkdir(mode=0o700, exist_ok=True)
+    private_dir(state_root)
+    target = state_root / generation_name
+    target.mkdir(mode=0o700)
+    try:
+        for name, digest in sorted(entries.items()):
+            data = read_file(bundle, name)
+            if hashlib.sha256(data).hexdigest() != digest:
+                fail('SHA256 mismatch: ' + name)
+            relative = name[len('state/'):]
+            dest = target / relative
+            dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with dest.open('xb') as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            dest.chmod(0o400 if relative == 'FORMAT' else 0o600)
+        for root, dirs, files in os.walk(target, topdown=False):
+            syncdir(root)
+            os.chmod(root, 0o700)
+        syncdir(state_root)
+        fmt = read_file(target, 'FORMAT').decode('ascii')
+        if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}\n?', fmt):
+            fail('invalid state format identifier')
+        return fmt
+    except BaseException:
+        for root, dirs, files in os.walk(target):
+            os.chmod(root, 0o700)
+        shutil.rmtree(target)
+        raise
+
+
 def install(prefix, bundle, manifest_path):
     expected = manifest(manifest_path)
     if bundle.is_symlink() or not bundle.is_dir():
@@ -134,8 +197,15 @@ def install(prefix, bundle, manifest_path):
     gens.mkdir(mode=0o700, exist_ok=True)
     private_dir(gens)
     stage = Path(tempfile.mkdtemp(prefix='stage-', dir=gens))
+    state_created = False
     try:
+        state_format = copy_state(prefix, stage.name, expected, bundle)
+        state_created = bool(state_format)
+        if state_created:
+            syncdir(prefix)
         for name, digest in sorted(expected.items()):
+            if name.startswith('state/'):
+                continue
             data = read_file(bundle, name)
             if hashlib.sha256(data).hexdigest() != digest:
                 fail('SHA256 mismatch: ' + name)
@@ -152,6 +222,12 @@ def install(prefix, bundle, manifest_path):
             f.flush()
             os.fsync(f.fileno())
         meta.chmod(0o400)
+        state_meta = stage / '.state-format'
+        with state_meta.open('x') as f:
+            f.write(state_format)
+            f.flush()
+            os.fsync(f.fileno())
+        state_meta.chmod(0o400)
         with (stage / '.manifest').open('x') as f:
             json.dump(expected, f, sort_keys=True)
             f.flush()
@@ -169,6 +245,11 @@ def install(prefix, bundle, manifest_path):
             for root, dirs, files in os.walk(stage):
                 os.chmod(root, 0o700)
             shutil.rmtree(stage)
+            if state_created:
+                state = prefix / 'states' / stage.name
+                for root, dirs, files in os.walk(state):
+                    os.chmod(root, 0o700)
+                shutil.rmtree(state)
         raise
 
 
@@ -181,6 +262,7 @@ def main():
     inst.add_argument('--manifest', required=True, type=Path, help='operator-trusted SHA256 JSON manifest')
     sub.add_parser('status')
     sub.add_parser('rollback')
+    sub.add_parser('state-dir')
     args = parser.parse_args()
     prefix = Path(args.prefix)
     if not args.prefix or not prefix.is_absolute() or str(prefix) != args.prefix or prefix == Path('/'):
@@ -205,9 +287,19 @@ def main():
                 fail('previous generation unavailable')
             expected = manifest(path / '.manifest')
             for name, digest in expected.items():
+                if name.startswith('state/'):
+                    continue
                 if hashlib.sha256(read_file(path, name)).hexdigest() != digest:
                     fail('previous generation SHA256 mismatch: ' + name)
+            if read_file(path, '.state-format'):
+                state_path(prefix, previous)
             switch(prefix, previous)
+        elif args.command == 'state-dir':
+            current = active(prefix)
+            if not current:
+                fail('no active generation')
+            print(state_path(prefix, current))
+            return
         print(active(prefix) or 'none')
     finally:
         os.close(lock)

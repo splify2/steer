@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "lan": { "devices": ["br-lan"] },
+  "outputs": {
+    "vpn": { "kind": "interface", "device": "wg0" }
+  },
+  "rules": [
+    { "name": "lan-default", "to": "all", "out": "vpn" }
+  ]
+}

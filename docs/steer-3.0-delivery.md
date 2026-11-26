@@ -324,14 +324,19 @@ service registration и artifact cache. GC не удаляет предыдущ�
 OS state — degraded с recovery instruction, не «успешный откат».
 
 Экспериментальный первый слой для частного временного Linux prefix —
-`experimental/offline-bundle/bundle.py`. Он не устанавливает службу, не
-переносит legacy intent и не закрывает gate E. Оператор заранее доверяет
-локальному SHA256 manifest; проверка подписи релиза отсутствует. Для локального
-набора из файлов `core`, `ui` и `assets/**` manifest — JSON-объект
-`{"core":"<sha256>", "ui":"<sha256>", "assets/index.html":"<sha256>", ...}`
-со всеми файлами набора и строчными hex SHA256. Лишние файлы и ссылки в наборе
-отвергаются. `assets/index.html` обязателен. Зависимости среды (например libc)
-не включены и проверка совместимости ABI и runtime health не выполняется.
+`experimental/offline-bundle/bundle.py`. Он не устанавливает службу и сам по
+себе не мигрирует legacy intent или не закрывает gate E. Оператор заранее
+доверяет локальному SHA256 manifest; проверки подписи релиза нет. Manifest
+содержит `core`, необязательную пару `ui` + `assets/index.html`/`assets/**`,
+а для состояния — `state/FORMAT` и `state/**` с SHA256. Лишние файлы и ссылки
+отвергаются. При установке кодовая generation неизменяема, а state-копия
+отдельно writable в `states/<generation>`; `state-dir` выдаёт каталог,
+связанный с тем же атомарным `active` pointer. Rollback проверяет предыдущий
+код и state-format marker до переключения. Marker — заявление упаковщика, не
+проверка формата данных; совместимость всё равно должен подтвердить supervisor.
+Состояние runtime изменяемо, поэтому его hash после старта намеренно не
+сверяется с исходным seed manifest. Зависимости среды (например libc) не
+включены.
 
 ```sh
 mkdir -m 700 /tmp/my-steer-test
@@ -343,14 +348,22 @@ python3 -m unittest discover -s experimental/offline-bundle -p 'test_*.py' -v
 
 Prefix должен уже существовать, быть абсолютным, без ссылок в пути, принадлежать
 вызывающему пользователю и быть закрыт для остальных. Файлы копируются в новый
-каталог в том же prefix, проверяются по manifest и выбираются атомарной заменой
-`active`; rollback повторно проверяет hashes предыдущего комплекта. Каталоги
-комплектов доступны только для чтения, но владелец может изменить права: это не
-защита от злонамеренного владельца. Конфигурация пользователя не читается и не
-изменяется. Прерванная подготовка может оставить невыбранный каталог staging;
-автоматической очистки и проверки восстановления при power loss пока нет.
-Это не активация службы, не миграция и не подтверждение работоспособности
-выбранных бинарников; запрещено считать legacy intent сконвертированным.
+вызывающему пользователю и закрыт для остальных. Кодовые файлы доступны только
+для чтения, но владелец может изменить права: это не защита от злонамеренного
+владельца. Конфигурация пользователя не читается и не изменяется. Прерванная
+подготовка может оставить невыбранную generation/state; автоматической очистки
+и проверки power-loss recovery нет. Это не service activation и не production
+migration.
+
+`tools/gate_e_preflight.py` с реальным parser CLI v2.1.4 блокирует переход
+LAN-capture/rules в loopback SOCKS: это разные ingress semantics. Disposable
+unprivileged supervisor fixture проверяет отдельный clean v3 start и привязку
+реальных v2.1.4/v3 executable к разным state generations; он не переносит
+legacy intent. Парный тест содержит journal serialization из детерминированного
+fake-backend coordinator fixture, не состояние настоящего kernel WireGuard и
+не доказательство восстановления WG runtime. Общее ограничение: в этом
+checkpoint эквивалентной legacy migration для этого набора нет, поэтому
+preflight отказ не переключает legacy generation.
 
 Concurrent applies сериализуются core; expected revision перепроверяется в
 commit после validate. Idempotency key привязан к actor + normalized payload hash:

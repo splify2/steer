@@ -91,6 +91,13 @@ $(BUILD)/steer-prototype-wg-netns: $(HOST_SRC) $(WG_NETNS_SRC) prototype_main.c 
 	    $(addprefix -I../../src/,kinds model platform profile compile tools cli) \
 	    -ffunction-sections -fdata-sections $(HOST_SRC) $(WG_NETNS_SRC) prototype_main.c \
 	    -Wl,--gc-sections $(LDFLAGS) $(LDLIBS) -o $@
+GATE_E_WG_JOURNAL_SRC = kernel_wg_coordinator.c kernel_wg_guard_record.c kernel_wg_ownership.c \
+    ../spec/execution_journal.c ../../src/lib/jsonw.c ../../src/lib/err.c
+$(BUILD)/gate-e-wg-journal-fixture: gate_e_wg_journal_fixture.c kernel_wg_coordinator_test.c $(GATE_E_WG_JOURNAL_SRC) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections \
+	    -I../../src/kinds -I../../src/model -I../../src/platform -I../../src/profile \
+	    -I../../src/compile -I../../src/tools -I../../src/cli \
+	    $< $(GATE_E_WG_JOURNAL_SRC) -Wl,--gc-sections $(LDLIBS) -o $@
 $(BUILD)/wg-commit-fault.so: prototype_wg_commit_fault.c | $(BUILD)
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@
 $(BUILD)/steer-prototype-startup-signal: $(HOST_SRC) prototype_main.c prototype_startup_signal_wrap.c $(wildcard *.h) | $(BUILD)
