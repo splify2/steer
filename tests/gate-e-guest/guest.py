@@ -54,6 +54,9 @@ def provision():
             'steer-legacy-v2.1.4', {'spec.json': raw, 'registry': b'vpn 100000 300\n'}))
         lan.cmd(sys.executable, '-B', g.BUNDLE.with_name('convert_lan.py'), 'plan',
                 '--prefix', PREFIX, *FLAGS)
+    # This precedes creation of br-lan, its client and forwarding, including
+    # on a dirty boot where normal serve will refuse the stale service state.
+    lan.cmd(*CLI, 'arm')
     lan.topology(KEYS)
     lan.cmd('ip', '-n', 'client', 'link', 'set', 'eth0', 'address', '02:00:00:17:00:02')
     actual = peers()
@@ -62,6 +65,12 @@ def provision():
                        'legacy': hashes(g.state_dir(PREFIX), ['spec.json', 'registry', 'FORMAT']),
                        'plan': g.digest(WORK / 'bundle/state/plan.json'),
                        'backend': g.digest(LAB / 'backend')})
+        for path in (KEYS / 'router', KEYS / 'peer', WITNESS, KEYS, LAB):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
     assert actual == json.loads(WITNESS.read_bytes())['peers']
     assert all((KEYS / n).stat().st_mode & 0o077 == 0 for n in ('router', 'peer'))
 
@@ -135,24 +144,32 @@ def outer():
     assert set(p.name for p in Path('/sys/class/net').iterdir()) == {'lo'}
     assert Path('/').stat().st_dev == Path('/dev/vda').stat().st_rdev
     assert any(line.split()[1:3] == ['/', 'ext4'] for line in Path('/proc/mounts').read_text().splitlines())
+    words = Path('/proc/cmdline').read_text().split()
+    stage = next((w.split('=', 1)[1] for w in words if w.startswith('gate_e_cut=')), None)
+    action = (['recover', 'previous' if stage == 'recover-starting' else 'selected']
+              if stage and stage.startswith('recover-') else ['serve'])
     until = time.monotonic() + 30
     while time.monotonic() < until:
         matches = []
         for p in Path('/proc').glob('[0-9]*/cmdline'):
             try:
                 args = p.read_bytes().split(b'\0')
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 continue
-            if args[1:] == [b'-B', os.fsencode(SERVICE), b'--prefix', os.fsencode(PREFIX), b'serve', b'']:
+            if args[1:] == [b'-B', os.fsencode(SERVICE), b'--prefix', os.fsencode(PREFIX),
+                            *map(os.fsencode, action), b'']:
                 matches.append(p.parent.name)
         if len(matches) == 1 and (PREFIX / 'service.sock').is_socket():
-            break
+            state = PREFIX / 'service-state.json'
+            if state.exists() and json.loads(state.read_bytes())['boot_id'] == BOOT.read_text().strip():
+                break
         time.sleep(.05)
     else:
         raise RuntimeError('boot unit did not launch private supervisor')
+    test = Path(__file__).with_name('cut_guest.py') if stage else __file__
     subprocess.run(['nsenter', '--target', matches[0], '--mount', '--net', '--pid', '--',
-                    sys.executable, '-B', __file__, 'check'], check=True, timeout=90)
-    target = 'poweroff.target' if len(json.loads(HISTORY.read_bytes())) == 3 else 'reboot.target'
+                    sys.executable, '-B', test, stage or 'check'], check=True, timeout=90)
+    target = 'poweroff.target' if stage or len(json.loads(HISTORY.read_bytes())) == 3 else 'reboot.target'
     subprocess.run(['systemctl', '--no-block', 'start', target], check=True)
 
 

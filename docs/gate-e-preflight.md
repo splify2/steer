@@ -331,5 +331,69 @@ each archive: `qemu-system-x86 qemu-system-data seabios libfdt1 libpmem1
 libslirp0 libdaxctl1 libndctl6`. This installs nothing on the host. No guest
 downloads or host loop devices, network changes, systemd registration or reboot
 are involved. The root image is deleted after the run. This gate covers
-orderly guest shutdown/reboot for this one LAN profile; **power loss**, package
-upgrade on an existing host, and general distro boot integration remain open.
+orderly guest shutdown/reboot for this one LAN profile. The separate abrupt
+stop check below covers two explicit recovery points.
+
+### Abrupt guest stop and guarded recovery
+
+Add `--powercut` to the `boot.py` command above. The host builds one offline
+root and tests two separate writable copies. In each, the old daemon first
+serves the same LAN TCP echo through the externally provisioned WG pair.
+The host waits for a serial witness from inside the router, then sends
+**SIGKILL solely to its QEMU child** and checks the exit signal. There is no
+guest shutdown request, ExecStop, test `os.sync`, or QEMU orderly exit at the
+cut. Ordinary fsyncs of the installation, keys and service records still run.
+
+| Cut witness (candidate already selected in both) | Explicit next-boot choice | Required outcome |
+| --- | --- | --- |
+| `running`: installed candidate process, matching boot/generation and fresh WG echo | `recover selected` | The same verified compatibility generation boots and serves WG again |
+| `starting`, detail `upgrade`: old plane down; `active` switched; the real candidate process exists but its Unix socket probe is blocked on a full accept queue. No `inet steer` table or fwmark; LAN probe blocked by the hold table | `recover previous` | The verified original binary/spec/registry is selected, booted and serves WG again |
+
+The service's atomic `service-state.json` is the last phase, not a list of
+past events. `starting`/`running` now include the boot ID and hash of the
+selected manifest. The witness contains the SHA-256 of those **exact bytes**.
+Before restarting the VM the host checks `needs_recovery` on the raw disk,
+performs `e2fsck -p -E journal_only` on a **separate copy**, and reads it with
+debugfs. Journal digest, actual `active` symlink, manifest, `.previous`, both
+binary images, original spec, plan provenance and both registries must agree.
+A read-only check on this journal-only copy can report stale aggregate
+free-block/inode counts. The actual restart uses the untouched dirty disk;
+the guest must observe kernel ext4 recovery. The final orderly poweroff is
+followed by an independent read-only filesystem and decision-record check.
+
+**Recovery procedure (private router only).** The guest init calls
+`lan_service.py --prefix "$prefix" arm` before creating `br-lan` or enabling
+forwarding. Kernel firewall state does not survive a VM stop. Ordinary `serve`
+still refuses an unclean record. An operator chooses a foreground
+`recover selected` or `recover previous` as above, in the same isolated
+environment as `serve`. The runner makes that choice explicitly in the
+second VM launch; the supervisor does not automatically guess a target.
+
+Under the bundle lock and hold guard, recovery requires a different kernel
+boot, clean backend rules/routes, the exact reviewed phase/choice, matching
+active pointer and manifest, the intact candidate software/state, the sealed
+legacy inventory, and a plan and registry derived from that predecessor.
+Only refused, owned Unix socket endpoints may be unlinked; the old PID is
+never signalled or adopted. `service-recovery.json` records the admitted
+source journal hash, source phase/boot/generation, new boot, operator choice
+and requested target before selection. It records a decision, **not**
+readiness. The normal fresh daemon/socket, external WG and kernel policy checks
+still gate opening the LAN. `status` reports actual service startup.
+
+On the restored guest a usable main route and a calibrated upstream counter
+detect plaintext arrival. A continuous, heartbeat-checked UDP sender from the
+same client runs across transition/recovery, alongside the independent TCP
+echo. The baseline counter must not increase. The tests also require refusal
+of plain `serve`, the wrong disposition and a changed registry with the guard,
+pointer and prior journal intact. The final disk records tie the served
+generation back to the externally observed cut.
+
+**Model boundary.** QEMU uses a raw virtio disk with `cache=none` (direct I/O,
+guest flushes honored). Killing the emulator loses guest RAM, guest page cache
+and potentially outstanding I/O; writes already delivered to the host storage
+remain there. It does not interrupt the host PSU, simulate loss of a physical
+drive's volatile cache, or inject torn sectors. Only the two stated cuts on
+the trusted, single-writer prefix are admitted. Older unclean records, other
+phases, inconsistent selections and an interruption during recovery are not
+authority to clear the guard. Arbitrary crash points and host package/boot
+integration remain open.

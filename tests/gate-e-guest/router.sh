@@ -15,5 +15,19 @@ exec unshare --mount --net --pid --fork --kill-child --mount-proc --propagation 
     mount -t sysfs sysfs /sys
     umask 077
     python3 -B /lab/src/tests/gate-e-guest/guest.py provision
-    exec python3 -B /lab/src/experimental/offline-bundle/lan_service.py --prefix /lab/prefix serve
+    case " $(cat /proc/cmdline) " in
+      *" gate_e_cut="*)
+        python3 -B /lab/src/tests/gate-e-guest/cut_guest.py tripwire
+        ip netns exec client python3 -B /lab/src/tests/gate-e-guest/cut_guest.py traffic &
+        ;;
+    esac
+    set -- serve
+    case " $(cat /proc/cmdline) " in
+      *" gate_e_cut=recover-running "*) set -- recover selected ;;
+      *" gate_e_cut=recover-starting "*) set -- recover previous ;;
+    esac
+    if [ "$1" = recover ]; then
+        python3 -B /lab/src/tests/gate-e-guest/cut_guest.py admit "$2"
+    fi
+    exec python3 -B /lab/src/experimental/offline-bundle/lan_service.py --prefix /lab/prefix "$@"
   ' sh "$outer"

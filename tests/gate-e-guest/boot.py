@@ -55,7 +55,7 @@ def image(root, args):
         link(name, 'usr/' + name)
     link('var/run', '/run')
     copy('/usr/bin/busybox')
-    for applet in ('cat', 'ls', 'ln', 'grep', 'readlink'):
+    for applet in ('cat', 'ls', 'ln', 'grep', 'readlink', 'dmesg'):
         link('usr/bin/' + applet, 'busybox')
     link('usr/bin/sh', 'dash')
     for name in ('dash', 'ip', 'nft', 'wg', 'unshare', 'nsenter', 'mount', 'umount', 'kmod', 'systemctl'):
@@ -101,7 +101,7 @@ def image(root, args):
          'ExecStart=/usr/bin/python3 -B /lab/src/tests/gate-e-guest/guest.py outer\n')
     for rel in ('tests/gate_e_lan_netns.py', 'tests/gate_e_supervised.py',
                 'tests/fixtures/gate-e/legacy-v2-lan.json', 'tools/gate_e_preflight.py',
-                'tests/gate-e-guest/router.sh', 'tests/gate-e-guest/guest.py',
+                'tests/gate-e-guest/router.sh', 'tests/gate-e-guest/guest.py', 'tests/gate-e-guest/cut_guest.py',
                 *('experimental/offline-bundle/' + n for n in
                   ('bundle.py', 'convert_lan.py', 'lan_profile.py', 'lan_service.py'))):
         copy(REPO / rel, 'lab/src/' + rel)
@@ -144,6 +144,15 @@ def inspect_disk(disk, boots, args):
     subprocess.run(['e2fsck', '-fn', disk], check=True)
 
 
+def vm_command(args, disk, extra=''):
+    return [args.qemu, '-no-user-config', '-nodefaults', '-machine', 'pc,accel=kvm',
+            '-cpu', 'host', '-smp', '2', '-m', '512', '-nic', 'none', '-display', 'none',
+            '-monitor', 'none', '-serial', 'stdio', '-L', args.roms, '-bios', args.bios,
+            '-kernel', args.kernel, '-append', 'root=/dev/vda rw rootfstype=ext4 console=ttyS0 '
+            'quiet panic=0 gate_e_guest=1 systemd.unit=gate-e.target systemd.log_target=console ' + extra,
+            '-drive', f'if=none,id=root,cache=none,format=raw,file={disk}', '-device', 'virtio-blk-pci,drive=root']
+
+
 def main(args):
     os.umask(0o077)
     # No loop devices, host mounts or host boot configuration changes.
@@ -161,14 +170,13 @@ def main(args):
         env = dict(os.environ)
         if args.libdir:
             env['LD_LIBRARY_PATH'] = str(args.libdir)
+        if args.powercut:
+            from cut_host import exercise
+            exercise(args, disk, env, vm_command)
+            return
         with log.open('wb') as console:
             try:
-                subprocess.run([args.qemu, '-no-user-config', '-nodefaults', '-machine', 'pc,accel=kvm',
-                    '-cpu', 'host', '-smp', '2', '-m', '512', '-nic', 'none', '-display', 'none',
-                    '-monitor', 'none', '-serial', 'stdio', '-L', args.roms, '-bios', args.bios,
-                    '-kernel', args.kernel, '-append', 'root=/dev/vda rw rootfstype=ext4 console=ttyS0 '
-                    'quiet panic=0 gate_e_guest=1 systemd.unit=gate-e.target systemd.log_target=console',
-                    '-drive', f'if=none,id=root,format=raw,file={disk}', '-device', 'virtio-blk-pci,drive=root'],
+                subprocess.run(vm_command(args, disk),
                     stdin=subprocess.DEVNULL, stdout=console, stderr=console, env=env, check=True, timeout=120)
             except (subprocess.SubprocessError, OSError):
                 print(log.read_text(errors='replace')[-7000:], file=sys.stderr)
@@ -188,6 +196,7 @@ def main(args):
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--powercut', action='store_true', help='SIGKILL two disposable VMs and recover their disks')
     for name in ('work', 'kernel', 'qemu', 'roms', 'bios', 'legacy', 'backend', 'libdir'):
         ap.add_argument('--' + name, type=Path, required=name != 'libdir')
     main(ap.parse_args())

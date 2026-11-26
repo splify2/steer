@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,15 @@ def candidate(gen, state, tmp):
     return gen / ENGINE, path, 'compat'
 
 
+def publish_record(prefix, name, data):
+    with tempfile.NamedTemporaryFile(dir=prefix, delete=False) as f:
+        f.write(encode(data))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(f.name, prefix / name)
+    bundle.syncdir(prefix)
+
+
 class Service:
     def __init__(self, prefix, tmp):
         self.prefix, self.tmp = prefix, tmp
@@ -78,15 +88,13 @@ class Service:
 
     def record(self, phase, detail=''):
         self.phase = phase
-        self.status = {'phase': phase, 'selected': bundle.active(self.prefix),
+        selected = bundle.active(self.prefix)
+        self.status = {'phase': phase, 'selected': selected,
+                       'boot_id': boot_id(), 'manifest_sha256': (
+                           manifest_hash(self.prefix, selected) if phase in ('starting', 'running') else None),
                        'daemon_pid': self.proc.pid if self.proc and self.proc.poll() is None else None,
                        'detail': detail}
-        with tempfile.NamedTemporaryFile(dir=self.prefix, delete=False) as f:
-            f.write(encode(self.status))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(f.name, self.prefix / 'service-state.json')
-        bundle.syncdir(self.prefix)
+        publish_record(self.prefix, 'service-state.json', self.status)
 
     def start(self):
         clean()  # Kernel readiness below cannot be satisfied by the former pair.
@@ -204,7 +212,15 @@ class Service:
             return False
 
 
-def serve(prefix):
+def boot_id():
+    return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+
+def manifest_hash(prefix, selected):
+    return sha(bundle.read_file(prefix / selected, '.manifest')) if selected else None
+
+
+def private_router():
     require(not os.path.samefile('/proc/self/ns/net', '/proc/1/ns/net') and
             not os.path.samefile('/proc/self/ns/mnt', '/proc/1/ns/mnt') and
             all(not os.path.samefile(p, '/proc/1/root' + p) for p in ('/etc', '/tmp', '/var', '/run')),
@@ -213,6 +229,65 @@ def serve(prefix):
     require(re.fullmatch(r'pid:\[\d+\]', outer_pidns) and
             outer_pidns != os.readlink('/proc/self/ns/pid') and
             os.readlink('/proc/self') == str(os.getpid()), 'requires a private PID namespace and procfs')
+
+
+def stale_socket(path, kind):
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return
+    require(stat.S_ISSOCK(st.st_mode) and st.st_uid == os.geteuid(), 'unexpected control endpoint')
+    with socket.socket(socket.AF_UNIX, kind) as probe:
+        probe.settimeout(.3)
+        try:
+            probe.connect(str(path))
+        except ConnectionRefusedError:
+            path.unlink()
+            return
+    raise ValueError('control endpoint is still live')
+
+
+def recover_locked(svc, disposition):
+    """Admission only, with lock and drop guard held; never signal or adopt a recorded PID."""
+    prefix = svc.prefix
+    clean()
+    raw = bundle.read_file(prefix, 'service-state.json')
+    record = decode(raw)
+    current = bundle.active(prefix)
+    require(current and record['selected'] == current and record['manifest_sha256'] ==
+            manifest_hash(prefix, current), 'selection and journal disagree')
+    require(re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', record['boot_id'])
+            and record['boot_id'] != boot_id(), 'requires a different kernel boot')
+    require((disposition == 'selected' and record['phase'] == 'running') or
+            (disposition == 'previous' and record['phase'] == 'starting' and record['detail'] == 'upgrade'),
+            'no reviewed recovery for this phase and choice')
+    gen = prefix / current
+    state = bundle.state_path(prefix, current)
+    require(bundle.read_file(state, 'FORMAT') == (FORMAT + '\n').encode(), 'not a compatibility pair')
+    candidate(gen, state, svc.tmp)
+    previous = migration.verified_previous(prefix)
+    old, _, _ = migration.inspect(prefix, previous)
+    _, plan = migration.legacy_plan(old)
+    require(encode(plan) == bundle.read_file(state, 'plan.json') and
+            old['registry'] == bundle.read_file(state, 'registry'), 'plan differs from predecessor')
+    for name, kind in [('service.sock', socket.SOCK_SEQPACKET), ('legacy.sock', socket.SOCK_STREAM),
+                       ('compat.sock', socket.SOCK_STREAM)]:
+        stale_socket(prefix / name, kind)
+    # Preserve the admitted cut and the operator's decision even after normal
+    # startup replaces service-state.json. This is intent, not health or
+    # permission to resume a second interruption during recovery.
+    publish_record(prefix, 'service-recovery.json', {
+        'source_boot_id': record['boot_id'], 'source_phase': record['phase'],
+        'source_generation': current, 'source_record_sha256': sha(raw),
+        'source_manifest_sha256': record['manifest_sha256'], 'boot_id': boot_id(),
+        'choice': disposition, 'requested_generation': previous if disposition == 'previous' else current,
+    })
+    if disposition == 'previous':
+        bundle.switch(prefix, previous)
+
+
+def serve(prefix, disposition=None):
+    private_router()
     quitting = False
 
     def quit_service(*_):
@@ -225,7 +300,10 @@ def serve(prefix):
         path = prefix / 'service.sock'
         # A crashed supervisor may have left a live daemon; never adopt or
         # signal a PID from a file, or silently start a second writer.
-        if (prefix / 'service-state.json').exists():
+        if disposition:
+            svc.hold()
+            recover_locked(svc, disposition)
+        elif (prefix / 'service-state.json').exists():
             require(decode(bundle.read_file(prefix, 'service-state.json'))['phase'] == 'stopped',
                     'unclean service state: isolate and inspect before restart')
         listener.bind(str(path))
@@ -276,15 +354,24 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--prefix', required=True, type=Path)
     sub = ap.add_subparsers(dest='command', required=True)
-    for name in ('serve', 'status', 'stop', 'rollback', 'upgrade'):
+    for name in ('serve', 'arm', 'recover', 'status', 'stop', 'rollback', 'upgrade'):
         parser = sub.add_parser(name)
         if name == 'upgrade':
             for flag in ('work', 'backend'):
                 parser.add_argument('--' + flag, required=True)
+        elif name == 'recover':
+            parser.add_argument('disposition', choices=['selected', 'previous'])
     args = ap.parse_args()
     bundle.private_dir(args.prefix)
     if args.command == 'serve':
         return serve(args.prefix)
+    if args.command == 'recover':
+        return serve(args.prefix, args.disposition)
+    if args.command == 'arm':
+        private_router()
+        with bundle.locked(args.prefix), tempfile.TemporaryDirectory(dir='/run') as tmp:
+            Service(args.prefix, Path(tmp)).hold()
+        return True
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as ctl:
         ctl.settimeout(90)
         ctl.connect(str(args.prefix / 'service.sock'))

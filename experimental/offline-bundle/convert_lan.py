@@ -69,7 +69,7 @@ def write(root, files):
             os.fsync(f.fileno())
 
 
-def rollback_locked(prefix):
+def verified_previous(prefix):
     # The generic rollback intentionally doesn't authenticate writable state.
     # For this stopped profile *all* legacy bytes/modes must match the inventory.
     current = bundle.active(prefix)
@@ -85,6 +85,11 @@ def rollback_locked(prefix):
     require(sha(encode(inventory)) == expected['state/recovery.json'] and
             all(source_still_matches(p, sig) for p, sig in identities.items()),
             'legacy recovery pair changed; inspect private backup before retrying')
+    return previous
+
+
+def rollback_locked(prefix):
+    previous = verified_previous(prefix)
     bundle.switch(prefix, previous)
     return previous
 

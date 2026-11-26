@@ -376,8 +376,12 @@ offline rollback, включая отсутствие обхода при бло
 гостя](gate-e-preflight.md#three-actual-systemd-guest-boots-on-one-offline-disk)
 запускает systemd на одном ext4-диске KVM: legacy → reboot с выбранным
 кандидатом → offline rollback → reboot с прежней парой. У всех трёх загрузок
-разные `boot_id` и тот же IPv4 LAN-клиент и WG-пиры. Это штатные перезагрузки,
-не потеря питания или установка на рабочий хост; E4 в целом остаётся открыт.
+разные `boot_id` и тот же IPv4 LAN-клиент и WG-пиры. Отдельный
+[тест нештатной остановки гостя](gate-e-preflight.md#abrupt-guest-stop-and-guarded-recovery)
+проверяет две точки: работающий кандидат и выбранный, но ещё не готовый
+кандидат при upgrade. После replay ext4 оператор явно выбирает запуск проверенной
+пары или возврат прежней, пока LAN закрыт. Это `SIGKILL` QEMU с `cache=none`,
+не потеря питания носителя хоста. Произвольные точки сбоя и E4 в целом остаются открыты.
 
 Concurrent applies сериализуются core; expected revision перепроверяется в
 commit после validate. Idempotency key привязан к actor + normalized payload hash:
