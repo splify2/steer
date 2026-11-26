@@ -1,5 +1,12 @@
 # Клиент hysteria2
 
+Для короткой изолированной проверки клиентской shared-раскладки используйте
+`LIBS=/путь/к/раскладке HY2_SERVER=/путь/к/hysteria sh tests/run-hy2.sh smoke`.
+Стенд запускает пакетный `plugins/hysteria2/bin/hysteria2` с тестовым `{conf}`,
+проверяет авторизацию и передачу TCP/UDP через независимый сервер. Нужны root,
+TUN и отдельные mount/network namespaces; запускать только в одноразовом
+окружении. `smoke` не заменяет полный interop-прогон.
+
 Этот документ описывает клиент hysteria2 — плагин `hysteria2`. Его архив лежит в пакете `steer-core`
 (семя) и ставится без сети: `steer plugin install hysteria2` ([guide.md](guide.md#плагины)); общая
 библиотека `net1` ставится вместе с ним. Выход — `kind: tunnel, protocol: hysteria2`.

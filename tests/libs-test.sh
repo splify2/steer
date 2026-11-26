@@ -537,11 +537,14 @@ fi
 # ---- hysteria2 против настоящего сервера (apernet/hysteria) ----------------------------------------
 # Сетевые пространства, TUN и docker-образ tobyxdd/hysteria:v2 (или HY2_SERVER): нет чего-то из этого —
 # стенд сам говорит «ПРОПУСК» и выходит с нулём, это не падение.
-o="$(LIBS="$L" sh tests/run-hy2.sh 2>&1 | tail -1)"
+full="$(LIBS="$L" sh tests/run-hy2.sh 2>&1)"; rc=$?
+o="$(printf '%s\n' "$full" | tail -1)"
 case "$o" in
-    *ПРОПУСК*) echo "libs-test: $o" ;;
-    *) check "hysteria2 против настоящего сервера: стенд tests/run-hy2.sh" "0" "$(printf '%s' "$o" | grep -c 'провалено [1-9]')"
-       check "  и он дошёл до итога" "1" "$(printf '%s' "$o" | grep -c 'проверок пройдено')" ;;
+    *ПРОПУСК*) [ "$rc" = 0 ] && echo "libs-test: $o" || check "run-hy2: код пропуска" "0" "$rc" ;;
+    *) check "hysteria2: код стенда" "0" "$rc"
+       check "hysteria2 против настоящего сервера: стенд tests/run-hy2.sh" "0" "$(printf '%s' "$o" | grep -c 'провалено [1-9]')"
+       check "  и он дошёл до итога" "1" "$(printf '%s' "$o" | grep -c 'проверок пройдено')"
+       [ "$rc" = 0 ] || printf '%s\n' "$full" | sed 's/^/    run-hy2: /' ;;
 esac
 # Долгие соединения через вложенную группу с туннелями hysteria2 (демон раскладки, мост, fake-IP,
 # IPv6; клиент управляющего сокета — build/steer): то же условие пропуска.
@@ -568,11 +571,12 @@ esac
 # Линия клиента с задержкой и потерями: TCP через слушатель модуля, выгрузка не упирается в «64 КБ на круг»
 # ни с задержкой, ни с потерей 0,5 %, клиент без масштаба работает (R-152). Нужны root, сетевые пространства,
 # tc с netem и ss — нет их, и стенд сам говорит «пропуск».
-full="$(LIBS="$L" sh tests/rcvwnd.sh 2>&1)"
+full="$(LIBS="$L" sh tests/rcvwnd.sh 2>&1)"; rc=$?
 o="$(printf '%s\n' "$full" | tail -n 1)"
 case "$o" in
-    *пропуск*) echo "libs-test: $o" ;;
-    *) check "линия клиента с задержкой и потерями: выгрузка не упирается в 64 КБ на круг: стенд tests/rcvwnd.sh" "1" \
+    *пропуск*) [ "$rc" = 0 ] && echo "libs-test: $o" || check "rcvwnd: код пропуска" "0" "$rc" ;;
+    *) check "rcvwnd: код стенда" "0" "$rc"
+       check "линия клиента с задержкой и потерями: выгрузка не упирается в 64 КБ на круг: стенд tests/rcvwnd.sh" "1" \
            "$(printf '%s' "$o" | grep -c '^rcvwnd: [0-9]* ok, 0 fail$')"
        printf '%s\n' "$o" | grep -q ', 0 fail$' || printf '%s\n' "$full" | sed 's/^/    rcvwnd: /' ;;
 esac

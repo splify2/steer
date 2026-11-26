@@ -36,6 +36,14 @@ truncated EOF. A new UDP packet cannot reuse a terminal provider session.
 
 ## Verification
 
+For a short isolated client shared-profile check, run
+`LIBS=/path/to/layout RCVWND_MODE=smoke RCVWND_SECS=2 RCVWND_MAX_BYTES=4194304 sh tests/rcvwnd.sh`
+inside a disposable root environment with TUN, netem and separate mount/network
+namespaces. It uses the packaged `plugins/vless/bin/vless` helper and checks
+window scaling, an advertised window above 64 KiB, acknowledged data and bytes
+received by the test node. This bounded smoke check does not replace the full
+loss/throughput fixture.
+
 `tests/net1-compat.sh` takes separately built `OLD_LIBS` and `NEW_LIBS`
 distributions. With immediate dynamic binding, the frozen VLESS, Hysteria2,
 proxy, xsteer and warpbox programs pass the library probe against both providers;
