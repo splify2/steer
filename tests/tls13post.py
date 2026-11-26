@@ -17,7 +17,7 @@ lib = pathlib.Path(a.wolfssl_library).resolve()
 flags = shlex.split(pathlib.Path(str(lib) + ".cflags").read_text())
 cc = shlex.split(os.environ.get("CC", "cc"))
 includes = ["-Isrc/lib", "-Isrc/proto/tls", "-Isrc/proto/vless"]
-base = ["-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-ffunction-sections", "-fdata-sections"]
+base = ["-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-UNDEBUG", "-ffunction-sections", "-fdata-sections"]
 san = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if a.sanitize else []
 def run(args, **kw):
     subprocess.run(args, cwd=root, check=True, timeout=90, **kw)
@@ -27,7 +27,7 @@ with tempfile.TemporaryDirectory(prefix="steer-tls-post-") as path:
     run([str(work / "offers")], env=dict(os.environ, ASAN_OPTIONS="detect_leaks=1:abort_on_error=1", UBSAN_OPTIONS="halt_on_error=1"))
     crypto = str(work / "crypto.o")
     run(cc + base + san + includes + flags + ["-Wno-switch", "-c", "src/lib/scrypto.c", "-o", crypto])
-    run(cc + base + san + includes + ["-DSTEER_TLS13_TEST", "-Wl,--wrap=write", "-Wl,--wrap=send", "-Wl,--wrap=realloc", "tests/tls13postmatch.c", "src/proto/tls/tls13.c", "src/proto/tls/certverify.c", "src/proto/vless/vision.c", crypto, str(lib), "-Wl,--gc-sections", "-pthread", "-lm", "-o", str(work / "records")])
+    run(cc + base + san + includes + ["-DSTEER_TLS13_TEST", "-Wl,-wrap,write", "-Wl,-wrap,send", "-Wl,-wrap,realloc", "tests/tls13postmatch.c", "src/proto/tls/tls13.c", "src/proto/tls/certverify.c", "src/proto/vless/vision.c", crypto, str(lib), "-Wl,--gc-sections", "-pthread", "-lm", "-o", str(work / "records")])
     env = dict(os.environ, ASAN_OPTIONS="detect_leaks=1:abort_on_error=1", UBSAN_OPTIONS="halt_on_error=1")
     run([str(work / "records")], env=env)
     # Old header is fixed independently of the working tree or later commits.

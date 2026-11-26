@@ -1,4 +1,7 @@
 #define _GNU_SOURCE
+#ifdef NDEBUG
+#error "certpreparedmatch requires active assertions"
+#endif
 #include "certverify.h"
 #include "scrypto.h"
 #include <assert.h>

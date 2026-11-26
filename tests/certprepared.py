@@ -16,7 +16,7 @@ args = parser.parse_args()
 library = Path(args.wolfssl_library).resolve()
 flags = shlex.split(Path(str(library) + ".cflags").read_text())
 cc = shlex.split(os.environ.get("CC", "cc"))
-base = ["-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-Isrc/lib", "-Isrc/proto/tls"]
+base = ["-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-UNDEBUG", "-Isrc/lib", "-Isrc/proto/tls"]
 san = (["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if args.sanitizer == "address"
        else ["-fsanitize=thread", "-fno-omit-frame-pointer"] if args.sanitizer == "thread" else [])
 
@@ -55,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix="steer-cert-prepared-") as directory:
     openssl("dgst", "-sha256", "-sign", work / "leaf.key", "-out", work / "verify.sig", work / "content")
     run(cc + base + san + flags + ["-Wno-switch", "-c", "src/lib/scrypto.c", "-o", str(work / "crypto.o")])
     run(cc + base + san + ["tests/certpreparedmatch.c", "src/proto/tls/certverify.c", str(work / "crypto.o"),
-                         str(library), "-Wl,--wrap=fopen", "-pthread", "-lm", "-o", str(work / "test")])
+                         str(library), "-Wl,-wrap,fopen", "-pthread", "-lm", "-o", str(work / "test")])
     env = dict(os.environ, ASAN_OPTIONS="detect_leaks=1:abort_on_error=1", UBSAN_OPTIONS="halt_on_error=1", TSAN_OPTIONS="halt_on_error=1")
     run([str(work / "test"), str(work / "root.pem"), str(work / "wrong.pem"),
          str(work / "leaf.der"), str(work / "verify.sig"), str(work / "expired.der")], env=env)

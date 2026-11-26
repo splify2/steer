@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#error "certrealitymatch requires active assertions"
+#endif
 #include "certverify.h"
 #include "scrypto.h"
 #include "certgen.h"

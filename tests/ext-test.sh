@@ -192,10 +192,10 @@ fi
 rm -f "$probe" "$probe.c" "$probe-leak" "$probe-leak.c"
 
 echo "ext-test: real TLS post-handshake/half-close and encrypted Vision records..."
-$CC -O1 -g -Wall -Wextra $STEER_INC $ASAN -DSTEER_TLS13_TEST \
+$CC -O1 -g -Wall -Wextra -UNDEBUG $STEER_INC $ASAN -DSTEER_TLS13_TEST \
     -ffunction-sections -fdata-sections -o "$BUILD/tls13postmatch" \
-    tests/tls13postmatch.c src/proto/tls/tls13.c src/proto/vless/vision.c \
-    $CRYPTO -Wl,--gc-sections -lpthread
+    tests/tls13postmatch.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/vless/vision.c \
+    $CRYPTO -Wl,-wrap,write -Wl,-wrap,send -Wl,-wrap,realloc -Wl,--gc-sections -lpthread
 "$BUILD/tls13postmatch"
 
 echo "ext-test: prepared trust snapshots, authentication failures and parallel verification..."

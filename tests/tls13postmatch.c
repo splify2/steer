@@ -1,4 +1,7 @@
 /* Real AEAD records; lab runner links the pinned wolfCrypt backend. */
+#ifdef NDEBUG
+#error "tls13postmatch requires active assertions"
+#endif
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>

@@ -16,7 +16,7 @@ flags = shlex.split(Path(str(library) + ".cflags").read_text())
 if "-DWOLFSSL_CERT_GEN" not in flags:
     parser.error("requires an archive built with fixture-only WOLFSSL_CERT_GEN")
 cc = shlex.split(os.environ.get("CC", "cc"))
-base = ["-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-Isrc/lib", "-Isrc/proto/tls", "-Itests"]
+base = ["-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-UNDEBUG", "-Isrc/lib", "-Isrc/proto/tls", "-Itests"]
 san = (["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if args.sanitizer == "address"
        else ["-fsanitize=thread", "-fno-omit-frame-pointer"] if args.sanitizer == "thread" else [])
 def run(command, **kwargs):
