@@ -8,6 +8,8 @@
 #define STEER_PROTOTYPE_SOCKS 1u
 #define STEER_PROTOTYPE_VLESS 2u
 #define STEER_PROTOTYPE_HYSTERIA2 3u
+#define STEER_PROTOTYPE_WIREGUARD 4u
+struct steer_linked_wg_config;
 #define STEER_PROTOTYPE_AUTH_NONE 0u
 #define STEER_PROTOTYPE_AUTH_USERPASS 1u
 #define STEER_PROTOTYPE_AUTH_UUID 2u
@@ -40,6 +42,7 @@ struct steer_prototype_config {
     struct steer_prototype_listener listeners[STEER_PROTOTYPE_MAX_LISTENERS];
     uint32_t stream_outbound_count;
     struct steer_prototype_stream_outbound stream_outbounds[STEER_POLICY_STREAM_BINDINGS_MAX];
+    struct steer_linked_wg_config *wg;
     struct steer_policy *policy;
     char *document_json;
     size_t document_length;
@@ -48,6 +51,7 @@ struct steer_prototype_config {
  * Each address has exactly one operator-provisioned credential pair. */
 struct steer_prototype_socks_vpn_allowlist {
     unsigned count;
+    int wg_stream; /* host-only linked WG permission, not a document field */
     struct {
         char address[46], username_ref[100], password_ref[100];
     } entries[STEER_PROTOTYPE_MAX_LISTENERS];

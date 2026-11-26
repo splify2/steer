@@ -165,7 +165,7 @@ int steer_draft_wg_v3_egress(const struct steer_spec_plan *plan,uint32_t index,
     struct steer_spec_node_view n;
     if(!route||!steer_spec_summary(plan).runtime_ready||!steer_spec_node(plan,index,&n)||
        !n.enabled||n.kind!=STEER_SPEC_OUTBOUND||n.flows!=STEER_SPEC_FLOW_STREAM||
-       strcmp(n.provider,"wireguard:main")||strcmp(text(n.variant),"kernel")||
+       strncmp(n.provider,"wireguard:",10)||strcmp(text(n.variant),"kernel")||
        strcmp(text(ynode_get(n.transport,"type")),"udp")||n.transport->len!=1||
        n.security||ynode_get(n.intent,"detour")||ynode_get(n.intent,"resolve_via")||
        !n.endpoint||n.endpoint->len!=2||!parse(n.options,out,route)||!secret_kinds(plan,out))return 0;

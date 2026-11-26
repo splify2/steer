@@ -5,6 +5,8 @@
 #include <sys/socket.h>
 struct steer_pv1_flow_metadata;
 struct steer_prototype_wg;
+struct steer_draft_wg_linux_link;
+int steer_prototype_wg_gate(int outer,int outbound,struct steer_draft_wg_linux_link **);
 /* Isolated host profile, never enabled in the default binary. */
 int steer_prototype_wg_open(const char *,int outer_ns,uint16_t socks_port,int scoped,struct steer_prototype_wg **);
 void steer_prototype_wg_close(struct steer_prototype_wg *);

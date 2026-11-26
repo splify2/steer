@@ -259,6 +259,14 @@ static int bind_index_available(void){
     close(fd);
     return ok;
 }
+int steer_prototype_wg_gate(int outer,int outbound,struct steer_draft_wg_linux_link **link){
+    struct __user_cap_header_struct header={_LINUX_CAPABILITY_VERSION_3,0};
+    struct __user_cap_data_struct caps[2]={0};
+    *link=NULL;
+    if(geteuid()!=0||syscall(SYS_capget,&header,caps)||!(caps[0].effective&(1u<<CAP_NET_ADMIN))||
+       !forwarding_disabled()||(outbound&&!bind_index_available()))return EPERM;
+    return steer_draft_wg_linux_link_open(outer,link);
+}
 void steer_prototype_wg_close(struct steer_prototype_wg *w){
     if(!w)return;
     steer_draft_wg_stream_destroy(w->stream);

@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
 #include "prototype_config.h"
+#ifdef STEER_PROTOTYPE_WG_NETNS
+#include "prototype_linked_wg.h"
+#endif
 #include "../spec/spec.h"
 #include "ynode.h"
 #include "jsonw.h"
@@ -243,7 +246,8 @@ static void json(FILE*f,const struct ynode*n,const char*key,unsigned depth){
     size_t i;
     if(n->kind==YN_SCALAR){
         int b;
-        if(!strcmp(key,"port")||!strcmp(key,"ports")||(depth==1&&!strcmp(key,"version"))){
+        if(!strcmp(key,"port")||!strcmp(key,"ports")||!strcmp(key,"listen_port")||!strcmp(key,"mtu")||
+           (depth==1&&!strcmp(key,"version"))){
             long x=0;
             (void)ynode_long(n,&x);
             fprintf(f,"%ld",x);
@@ -275,6 +279,7 @@ static void json(FILE*f,const struct ynode*n,const char*key,unsigned depth){
 void steer_prototype_config_destroy(struct steer_prototype_config*c){
     if(c){
         steer_policy_destroy(c->policy);
+        free(c->wg);
         free(c->document_json);
         free(c);
     }
@@ -530,8 +535,8 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         |STEER_SPEC_FLOW_DATAGRAM
 #endif
         ;
-    enum { alias_requirements=8 };
-    struct steer_spec_capability inventory[sizeof(core)/sizeof(core[0])+alias_requirements*STEER_PROTOTYPE_MAX_LISTENERS];
+    enum { alias_requirements=9 };
+    struct steer_spec_capability inventory[1+sizeof(core)/sizeof(core[0])+alias_requirements*STEER_PROTOTYPE_MAX_LISTENERS];
     size_t count=sizeof(core)/sizeof(core[0]);
     char requirements[STEER_PROTOTYPE_MAX_LISTENERS][alias_requirements][128];
     struct steer_policy_rule all[STEER_PROTOTYPE_MAX_RULES]={0},active[STEER_PROTOTYPE_MAX_RULES]={0};
@@ -545,6 +550,10 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         (secrets&&(secrets->kind!=YN_MAP||secrets->len>STEER_PROTOTYPE_MAX_LISTENERS))||
         !keys(routing,"default rules")||!rules||rules->kind!=YN_SEQ||rules->len>STEER_PROTOTYPE_MAX_RULES)return result;
     memcpy(inventory,core,sizeof(core));
+#ifdef STEER_PROTOTYPE_WG_NETNS
+    int wg_allowed=allow&&allow->wg_stream;
+    if(wg_allowed)inventory[count++]=(struct steer_spec_capability){"core.transport.udp",STEER_SPEC_READY,NULL,NULL};
+#endif
     /* Only the code linked into this binary satisfies this local profile. The
      * declared remote is a fixed identity, never a source of code or trust. */
     for(size_t i=0;i<remotes->len;i++){
@@ -564,6 +573,12 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         inventory[count++]=(struct steer_spec_capability){requirements[i][0],STEER_SPEC_READY,NULL,NULL};
         inventory[count++]=(struct steer_spec_capability){requirements[i][1],STEER_SPEC_READY,v3_socks_options,NULL};
         inventory[count++]=(struct steer_spec_capability){requirements[i][2],STEER_SPEC_READY,v3_vless_options,NULL};
+#ifdef STEER_PROTOTYPE_WG_NETNS
+        if(wg_allowed){
+            snprintf(requirements[i][8],sizeof(requirements[i][8]),"provider.wireguard:%s/outbound/stream/udp/none/kernel",alias->str);
+            inventory[count++]=(struct steer_spec_capability){requirements[i][8],STEER_SPEC_READY,steer_draft_wg_v3_egress_options,NULL};
+        }
+#endif
 #ifdef STEER_PROTOTYPE_HY2
         snprintf(requirements[i][3],sizeof(requirements[i][3]),"provider.hysteria2:%s/inbound/stream/quic/tls/default",alias->str);
         snprintf(requirements[i][4],sizeof(requirements[i][4]),"provider.hysteria2:%s/inbound/datagram/quic/tls/default",alias->str);
@@ -583,8 +598,14 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
     }
     for(size_t i=0;secrets&&i<secrets->len;i++){
         const struct ynode *secret=ynode_val_at(secrets,i),*name=ynode_get(secret,"name");
+        int kind=v3_secret_kind(ynode_get(secret,"kind"));
+#ifdef STEER_PROTOTYPE_WG_NETNS
+        if(wg_allowed&&(eq(ynode_get(secret,"kind"),"wireguard_private_key")||
+            eq(ynode_get(secret,"kind"),"wireguard_preshared_key")))
+            kind=scalar(name)&&name->len>9&&name->len<64&&!strncmp(name->str,"STEER_WG_",9);
+#endif
         if(!keys(secret,"source name kind")||!eq(ynode_get(secret,"source"),"env")||
-            !v3_secret_kind(ynode_get(secret,"kind"))||!scalar(name)||!env_name(name->str,name->len))return result;
+            !kind||!scalar(name)||!env_name(name->str,name->len))return result;
     }
     struct steer_spec_plan *plan=steer_spec_compile(data,length,inventory,count);
     if(!plan)return err(STEER_PV1_RESOURCE_EXHAUSTED);
@@ -595,6 +616,27 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         if(!steer_spec_node(plan,i,&node))goto done;
         if(node.kind==STEER_SPEC_PLUGIN||node.kind==STEER_SPEC_SECRET)continue;
         if(node.kind==STEER_SPEC_OUTBOUND){
+#ifdef STEER_PROTOTYPE_WG_NETNS
+            if(!strncmp(node.provider,"wireguard:",10)){
+                if(!wg_allowed||c->wg||c->stream_outbound_count>=STEER_POLICY_STREAM_BINDINGS_MAX||
+                   !keys(node.intent,"plugin flow variant transport endpoint options label"))goto done;
+                c->wg=calloc(1,sizeof(*c->wg));
+                if(!c->wg||!steer_draft_wg_v3_egress(plan,i,&c->wg->cfg,&c->wg->route))goto done;
+                const struct ynode *name=ynode_get(ynode_get(secrets,c->wg->cfg.private_key),"name");
+                const char *psk=c->wg->cfg.preshared_keys[0];
+                if(!scalar(name)||name->len>=sizeof(c->wg->private_env))goto done;
+                strcpy(c->wg->private_env,name->str);
+                if(*psk){
+                    name=ynode_get(ynode_get(secrets,psk),"name");
+                    if(!scalar(name)||name->len>=sizeof(c->wg->psk_env))goto done;
+                    strcpy(c->wg->psk_env,name->str);
+                }
+                struct steer_prototype_stream_outbound *out=&c->stream_outbounds[c->stream_outbound_count++];
+                strcpy(out->id,node.id);
+                out->protocol=STEER_PROTOTYPE_WIREGUARD;
+                continue;
+            }
+#endif
 #if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND) || defined(STEER_PROTOTYPE_HY2)
             if(node.provider[0]){
                 if(c->stream_outbound_count>=STEER_POLICY_STREAM_BINDINGS_MAX||

@@ -93,5 +93,9 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *,const struc
     void *,const struct steer_draft_wg_revision *,uint16_t previous_port,
     const struct steer_draft_wg_tx *,const struct steer_draft_wg_candidate *,
      uint64_t deadline,struct steer_draft_wg_ready *);
+/* Owner has stopped admission and joined this generation's bindings.
+ * The durable selected revision is rechecked; it cannot be retired here. */
+int steer_draft_wg_selection_retire(struct steer_draft_wg_selection *,const struct steer_draft_wg_backend *,
+    void *,const struct steer_draft_wg_revision *,uint64_t generation,uint64_t deadline);
 
 #endif

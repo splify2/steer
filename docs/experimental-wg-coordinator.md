@@ -170,57 +170,102 @@ The isolated journal has no compaction or deliberate disable transition;
 multi-device Apply, same-resource handover and machine-reboot recovery remain
 out of scope.
 
-## Linked spec v3 integration boundary
+## Linked spec v3 WireGuard TCP outbound
 
-`kernel_wg_stream` is a generation-local native TCP socket constraint, not a
-second router or configuration store. It owns a copy of the exact journal
-guard identity, source and prefix and a duplicate of the pinned namespace FD.
-It has no `current` pointer and no authority to retire the device. In the
-isolated profile the candidate constraint is allocated and verified after
-journaled staging but **before** committing the document. Failure here is
-pre-commit rollback. Startup builds a new constraint only after the committed
-revision has been verified. No new linked capability is registered.
+`steer-prototype-hy2-wg-netns` accepts the ordinary linked-v3 `--config`,
+`--control` and `--state-dir` invocation with the additional authorization
+`--allow-wg-stream-netns`. Prepare a private `wg-linked-journal` subdirectory
+inside the private state directory. FD 3 must pin the original network
+namespace; the Core requires a different disposable netns, root with
+`CAP_NET_ADMIN`, IPv4 forwarding off, and `SO_BINDTOIFINDEX`. The journal
+records owned kernel effects only; `prototype_store` remains the sole
+durable revision selector. No alternate daemon or control protocol is used.
+The legacy WG-only state directories and the linked WG directory are not
+interchangeable. Ordinary startup without permission will not consume linked
+WG state.
 
-The next linked profile should extend the existing Core, not dispatch into
-`steer_prototype_wg_request`:
+**UI discovery:** `STATUS.capabilities.spec_v3_wireguard_stream_outbound_netns`
+is `true` only with that authorization in the combined netns build; otherwise
+the key is absent. It is not a production/device/UDP capability or a health
+signal. `runtimeReady` becomes false when the selected WG identity is missing,
+even though explicitly direct flows can still work.
 
-1. The opt-in namespace gate controls WG capability inventory in the ordinary
-   v3 compiler. Lower one `wireguard:main/.../kernel` outbound into a normal
-   `stream_outbounds` slot. SOCKS5, VLESS and Hysteria2 streams already share
-   `select_stream`; use the existing ordered route action and binding index
-   instead of a protocol-specific branch. WG gets its own native binding and
-   no resolver. Keep the separate direct binding unchanged for flows explicitly
-   routed there; use the scoped route binding below rather than the old
-   namespace `main`-table route.
-2. The prepare worker lowers intent and resolves keys. The serialized durable
-   writer reserves lifecycle credits and stages owned link, DROP, route and
-   binding; only a verified immutable candidate may enter the owner registry.
-   Reserve a cleanup path even when stream preparation or listener bind fails.
-   One canonical linked `prototype_store` revision is the commit decision.
-   NOT_RENAMED retires only the candidate, RENAMED-but-unsynced fences cleanup
-   and admission, SYNCED publishes the already allocated generation.
-3. Pin the binding to the accepted flow's generation and keep the previous
-   WG resource while its admitted streams drain. Never retarget a pending
-   connect to the newer interface. For startup, the journal now distinguishes
-   a validated committed document that intentionally has no WG (`without_wg`)
-   from a missing required WG outcome. It rejects a WG record at the same
-   committed generation when the document omits WG, and the next revision
-   is above both the committed generation and all journal attempts. Verify a
-   selected WG before retiring other identities, or fence. Test disjoint updates, no-WG
-   transitions, unavailable WG without direct fallback, and ambiguous storage
-   on both sides of commit. Do not advertise mixed profile support until
-   independent SOCKS5/VLESS/HY2 TCP clients and a passive WG peer pass that
-   test on the same committed revision.
+The outbound uses an ordinary linked plugin alias (here `bundle`), one TCP
+stream binding, and the same ordered v3 rules as any other outbound:
 
-The hook points are the ordinary `prototype_config` v3 outbound lowering,
-`prototype_prepare`, `prepare_configuration`/`prepare_stream_routes` on the
-owner, and `store_worker`/`writer_ready`. In particular, the current
-ordinary `writer_ready` publishes on RENAMED even when not SYNCED. A future
-WG-enabled generation cannot use that branch unchanged: keep both sets of
-owned resources on uncertainty and fence new admissions until validated
-restart. The startup-only journal sweeper is not a drain-time retirement
-API. The existing staged WG path still admits only one selected WG and
-rejects unreconciled candidates; it has not been connected to those hooks.
+```yaml
+secrets:
+  wg-key: {source: env, kind: wireguard_private_key, name: STEER_WG_CLIENT}
+outbounds:
+  vpn:
+    plugin: wireguard:bundle
+    flow: [stream]
+    variant: kernel
+    transport: {type: udp}
+    endpoint: {address: 192.0.2.2, port: 51820}
+    options:
+      private_key: {secret: wg-key}
+      listen_port: 51821
+      addresses: [10.215.0.1/32]
+      route_prefix: 198.51.100.77/32
+      peers:
+        - public_key: "<WireGuard peer public key, base64>"
+          principal_id: passive
+          allowed_ips: [198.51.100.77/32]
+  net: {type: direct}
+routing:
+  default: net
+  rules:
+    - name: via-vpn
+      match: {inbound: [socks-vpn]}
+      outbound: vpn
+```
+
+The existing linked-v3 `version`, builtin remote, plugin lock, and inbound
+declarations are still required. See the acceptance fixture for complete
+SOCKS5, plain VLESS and HY2 `[stream]` declarations. One WG outbound is allowed
+per revision. The peer endpoint must be numeric IPv4/UDP and outside both
+the route and the `/32` inner source; the sole canonical IPv4 `/24`–`/32`
+route must equal the peer's sole AllowedIPs. Optional `mtu` and
+`peers[0].preshared_key: {secret: ...}` are supported; the PSK must be a
+`wireguard_preshared_key` env declaration. Both secret values come only from
+`STEER_WG_*` environment variables; only references are stored. Use numeric
+IPv4 TCP destinations for the WG slot. It has no resolver or direct fallback.
+
+**Apply and recovery.** The common prepare worker lowers the document and
+prepares TLS. The owner resolves and wipes WG keys, then stages the owned
+link, guard, scoped route and immutable binding under a deadline before
+binding listeners or asking the ordinary store writer to commit. Failed
+preparation or NOT_RENAMED retires only the candidate. SYNCED publishes the
+prepared route registry; old native bindings finish draining before their
+WG link is retired. RENAMED-but-unsynced publishes neither a candidate
+registry nor new admissions, retains both sets of kernel objects, and
+requires restart. Startup validates the selected document and exact live
+WG before retiring others; intentional absence of WG is distinct from a
+missing required WG resource. Shutdown retains the committed WG for
+same-netns restart.
+
+Same-port or same-inner-source WG replacement is not supported: use a
+disjoint source and listen port, or remove WG, wait for drain, and add it
+back. The journal is bounded and uncompacted; further WG staging can be
+blocked by an unreconciled generation. The privileged kernel work is
+serialized on the experimental owner, not a production worker, and
+machine-reboot recovery and multiple WG outbounds are out of scope.
+
+The full fixture is `experimental/provider/prototype_linked_wg_test.py`.
+It builds its independent HY2 client from `linked_wg_hy2_client.go` using
+upstream Hysteria core `c2b181e0b0e72b077e4b0b7297735af14d1f9929`.
+With normal server-enabled QUIC archives and the test client built:
+
+```sh
+make -C experimental/provider BUILD="$out" NGTCP2_LIB="$ngtcp2" \
+    WOLFSSL_SERVER_LIB="$wolfssl_server" "$out/steer-prototype-hy2-wg-netns" \
+    "$out/wg-commit-fault.so"
+unshare -n -- env TMPDIR="$out" PYTHONDONTWRITEBYTECODE=1 \
+    python3 experimental/provider/prototype_linked_wg_test.py \
+    "$out/steer-prototype-hy2-wg-netns" "$out/linked-wg-hy2-client" \
+    "$out/wg-commit-fault.so" 3</proc/self/ns/net
+```
 
 ### Scoped route prerequisite
 

@@ -82,7 +82,7 @@ $(BUILD)/vless-loopback: $(HOST_SRC) vless_loopback.c stream.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HOST_SRC) vless_loopback.c $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/steer-prototype: $(HOST_SRC) prototype_main.c stream.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HOST_SRC) prototype_main.c $(LDFLAGS) $(LDLIBS) -o $@
-WG_NETNS_SRC = prototype_wg.c kernel_wg_stream.c kernel_wg_linux_guard.c kernel_wg_linux_link.c kernel_wg_coordinator.c \
+WG_NETNS_SRC = prototype_wg.c prototype_linked_wg.c kernel_wg_stream.c kernel_wg_linux_guard.c kernel_wg_linux_link.c kernel_wg_coordinator.c \
     kernel_wg_guard.c kernel_wg_guard_record.c kernel_wg_ownership.c kernel_wg_v3.c ../spec/execution_journal.c \
     ../../src/kinds/awgdev.c ../../src/lib/ir.c ../../src/lib/nftdump.c ../../src/lib/run.c ../../src/compile/print.c
 # Explicit, excluded from all/default/production. See docs/experimental-wg-coordinator.md.
@@ -140,7 +140,7 @@ $(BUILD)/hy2-tcp-client-test: hy2_tcp_client_test.c hy2_tcp_client.h $(HY2_TCP_S
 	    $(LDFLAGS) $(LDLIBS) -lm -o $@
 $(BUILD)/steer-prototype-hy2-fault: HY2_TEST_EXTRA = -DSTEER_PREPARE_WRAP_READ prepare_read_fault.c -Wl,--wrap=read -Wl,--wrap=__read_chk
 $(BUILD)/steer-prototype-hy2-fault: prepare_read_fault.c
-# Same acceptance binary, two explicitly selected runtime profiles. Never part of all/Nano.
+# Combined acceptance binary with explicit netns gates. Never part of all/Nano.
 $(BUILD)/steer-prototype-hy2-wg-netns: WG_BUILD_FLAGS = -DSTEER_PROTOTYPE_WG_NETNS -ffunction-sections -fdata-sections
 $(BUILD)/steer-prototype-hy2-wg-netns: WG_BUILD_SRC = $(WG_NETNS_SRC)
 $(BUILD)/steer-prototype-hy2-wg-netns: WG_LINK_FLAGS = -Wl,--gc-sections

@@ -421,3 +421,18 @@ int steer_draft_wg_selection_stage(struct steer_draft_wg_selection *s,const stru
     return stage_candidate(s->j,b,ctx,t,c,previous.listen_port?&previous:NULL,deadline,NULL,ready,
         &started,durable_provider);
 }
+
+int steer_draft_wg_selection_retire(struct steer_draft_wg_selection *s,const struct steer_draft_wg_backend *b,
+    void *ctx,const struct steer_draft_wg_revision *r,uint64_t generation,uint64_t d){
+    if(!s||!cleanup_backend(b)||!revision_valid(r)||!generation||generation==r->generation)return EINVAL;
+    int rc=running(d,NULL);
+    if(rc)return rc;
+    struct inventory i;
+    rc=inventory_read(s,&i,r);
+    if(!rc)for(unsigned n=0;n<i.n;n++)if(i.e[n].tx.generation==generation){
+        rc=clean_entry(s,b,ctx,&i.e[n],d);
+        break;
+    }
+    free(i.e);
+    return rc;
+}
