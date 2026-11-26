@@ -1,4 +1,10 @@
-# Gate E v2 read-only preflight
+# Gate E: v2 preflight and Linux LAN compatibility profile
+
+There are two distinct targets. The loopback SOCKS preflight below still
+blocks the LAN fixture. To run that fixture as a gateway, use the explicit
+[`steer-linux-lan-compat-v1` profile](#linux-lan-compatibility-profile).
+
+## Read-only loopback preflight
 
 `tools/gate_e_preflight.py` inventories a deliberately small subset of v2 JSON
 using the pinned `steer` CLI parser. It does **not** convert a spec, install
@@ -117,3 +123,91 @@ python3 -m unittest discover -s experimental/offline-bundle -p 'test_*.py' -v
 There is no `tests/gate-e-legacy-readonly.sh` in this checkout; the historical
 reference was removed from the local-check list rather than pointing users to
 a nonexistent test.
+
+## Linux LAN compatibility profile
+
+`experimental/offline-bundle/convert_lan.py` converts the **stopped private
+generation** from the LAN fixture to a source-bound gateway plan. The selected
+generation contains a one-shot Python launcher (`core`) and the real, separately
+hashed `legacy-gateway-v2` executable. The latter is `build/steerd` from the
+candidate checkout, **not** `steer-prototype`. It owns all packet classification,
+nftables rules, marks, policy routes, legacy destination exclusions, family
+defaults and failure handling. The launcher owns admission and lowers the plan
+on each Apply. Linux and the operator own forwarding, firewall and `wg0`
+(including peer keys, allowed IPs and return routes). No v3 provider or proxy
+is in this datapath.
+
+| Admitted input | Plan and effect |
+| --- | --- |
+| Explicit v2 JSON `lan.devices: ["br-lan"]` | Capture packets arriving from the LAN; no listener |
+| Exactly one named `kind: interface, device: wg0` | Named external device egress, legacy default `on_fail: drop` made explicit |
+| Exactly one named `to: all, out: <that ID>` | Keep rule ID and output reference; `all` has the legacy compiler's meaning |
+| Registry `<output> 100000 300\n` | Preserve the existing hexadecimal mark and table, rather than allocate them again |
+
+Only the default first allocation and lowercase ASCII identifiers matching
+`[a-z][a-z0-9_-]{0,30}` are admitted. Extra fields, implicit LAN, duplicates,
+other outputs/allocations, files, lists, plugins, clients, DNS and keys are
+outside this slice. Both actual binaries must normalize the exact source
+and the lowered candidate to the same document. `plan` rejects an active state
+directory containing anything except `FORMAT`, `spec.json` and `registry`;
+it is not an inventory of an arbitrary installed Linux system.
+
+**Run the complete reproducer** from the candidate checkout, with the source
+`steerd` built separately from tag `v2.1.4` (`70d11eb`):
+
+```sh
+make build/steerd
+python3 -B tests/gate_e_lan_plan_test.py /path/to/v2.1.4/build/steerd build/steerd
+sh tests/gate_e_lan_netns.sh /path/to/v2.1.4/build/steerd build/steerd
+```
+
+The second check requires Linux namespaces/mount privileges, iproute2, nftables,
+WireGuard tools and kernel support. It creates its own PID/mount/net namespaces,
+private `/etc`, `/run`, `/tmp` and `/var`, and disposable client/router/upstream;
+there is no service installation. The prefix and both image inputs are local.
+Python 3.9+, the OS tools, loader/libc and kernel are platform prerequisites,
+not downloaded/bundled dependencies. The SDK and protocol providers are not
+linked into this gateway mode.
+
+Inside the isolated router the lifecycle is (invoke `convert_lan.py` and
+`bundle.py` from `experimental/offline-bundle/` with `python3`):
+
+1. With legacy writers stopped and after `down`, use `convert_lan.py plan
+   --prefix "$prefix" --work "$work" --backend "$steerd"`. `work` must be a
+   separate empty private directory. The active pointer stays put. `backup/`
+   contains exact core, format, registry and spec bytes; `inventory.json` records
+   their SHA-256, UID, GID, mode and original generation. Inspect
+   `bundle/state/plan.json` (including the source SHA-256) and `manifest.json`.
+2. `convert_lan.py switch` with the same arguments re-inventories the source and
+   checks backup, staged artifacts and reviewed manifest under the bundle lock.
+   It selects a new software/state pair, not new kernel rules. The candidate
+   state contains the plan, registry and recovery inventory, **no source spec**.
+3. `"$prefix/active/core" apply` lowers the sealed plan to a transient backend
+   spec, verifies the external devices and invokes the bundled engine's real
+   Apply. The launcher exits; Linux forwards subsequent packets. No daemon,
+   watchdog, host boot registration or ongoing reconciliation is promised.
+4. `"$prefix/active/core" down`, verify the dataplane is down, then
+   `convert_lan.py rollback --prefix "$prefix"`. This profile-specific command
+   checks the predecessor against the sealed backup inventory before selecting
+   it; it needs neither staging nor the supplied backend. If old files drifted,
+   it refuses the switch; inspect/restore from the private backup first.
+   Get the returned state with `bundle.py --prefix "$prefix" state-dir` and
+   run `"$prefix/active/core" apply --spec "$state/spec.json" --state-dir "$state"`.
+   A pointer change by itself does not restore forwarding.
+
+The regression uses the **same non-proxy LAN client and WG peers** throughout.
+It checks no route before each Apply, byte-exact 4096-byte TCP echo, handshakes
+and growing tunnel transfer counters. With a usable plaintext route in main,
+it drops WireGuard UDP at the peer: the client fails, encrypted drops increase,
+and zero plaintext TCP packets reach the alternate path. An uncaptured probe
+from the router trips that same plaintext counter. Removing the fault restores
+the client. After `down` and offline rollback, the old binary, spec and registry
+match the originals and the client works again.
+
+This is a cold, single-writer, private-prefix migration for **one** legacy
+policy shape; acceptance covers IPv4 TCP. It is neither native managed spec v3
+nor production E4. Hot cutover, automatic rollback across power loss, system
+packages/services, inherited firewall policy, IPv6/UDP parity and any broader
+inventory need their own acceptance. Before replacing this backend with a
+native one, run the same client/negative control on that backend and demonstrate
+equivalence of legacy selectors, exclusions, family and failure defaults.

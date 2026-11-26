@@ -361,9 +361,15 @@ unprivileged supervisor fixture проверяет отдельный clean v3 s
 реальных v2.1.4/v3 executable к разным state generations; он не переносит
 legacy intent. Парный тест содержит journal serialization из детерминированного
 fake-backend coordinator fixture, не состояние настоящего kernel WireGuard и
-не доказательство восстановления WG runtime. Общее ограничение: в этом
-checkpoint эквивалентной legacy migration для этого набора нет, поэтому
-preflight отказ не переключает legacy generation.
+не доказательство восстановления WG runtime. Отказ loopback preflight не
+переключает legacy generation.
+
+Отдельный [Linux LAN compatibility profile](gate-e-preflight.md#linux-lan-compatibility-profile)
+переносит один явный `br-lan → to: all → внешний wg0` в план с хешем исходника.
+Его исполняет поставляемый рядом `legacy-gateway-v2`, не native v3. Частный
+netns-тест проверяет один и тот же LAN-клиент до переноса, после switch и после
+offline rollback, включая отсутствие обхода при блокировке транспорта WG.
+Эта проверка относится к cold one-shot Apply и IPv4 TCP; E4 в целом остаётся открыт.
 
 Concurrent applies сериализуются core; expected revision перепроверяется в
 commit после validate. Idempotency key привязан к actor + normalized payload hash:

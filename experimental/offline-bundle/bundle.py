@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline, private-prefix software bundle switcher; not a service installer."""
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -79,7 +80,7 @@ def manifest(path):
         p = PurePosixPath(name)
         if (not name or p.is_absolute() or str(p) != name or
                 any(x in ('.', '..') for x in name.split('/')) or
-                not (name in ('core', 'ui') or name.startswith('assets/') or
+                not (name in ('core', 'ui', 'legacy-gateway-v2') or name.startswith('assets/') or
                      name.startswith('state/')) or
                 not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest)):
             fail('invalid manifest entry: ' + name)
@@ -215,7 +216,7 @@ def install(prefix, bundle, manifest_path):
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
-            dest.chmod(0o500 if name in ('core', 'ui') else 0o400)
+            dest.chmod(0o500 if name in ('core', 'ui', 'legacy-gateway-v2') else 0o400)
         meta = stage / '.previous'
         with meta.open('x') as f:
             f.write(previous or '')
@@ -253,6 +254,19 @@ def install(prefix, bundle, manifest_path):
         raise
 
 
+@contextmanager
+def locked(prefix):
+    private_dir(prefix)
+    lock = os.open(prefix / '.bundle.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(lock).st_mode):
+            fail('invalid lock file')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(lock)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--prefix', required=True, help='existing absolute private directory')
@@ -267,12 +281,7 @@ def main():
     prefix = Path(args.prefix)
     if not args.prefix or not prefix.is_absolute() or str(prefix) != args.prefix or prefix == Path('/'):
         fail('prefix must be an explicit absolute non-root path')
-    private_dir(prefix)
-    lock = os.open(prefix / '.bundle.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    try:
-        if not stat.S_ISREG(os.fstat(lock).st_mode):
-            fail('invalid lock file')
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with locked(prefix):
         if args.command == 'install':
             install(prefix, args.bundle, args.manifest)
         elif args.command == 'rollback':
@@ -314,8 +323,6 @@ def main():
             print(state_path(prefix, current))
             return
         print(active(prefix) or 'none')
-    finally:
-        os.close(lock)
 
 
 if __name__ == '__main__':
