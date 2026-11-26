@@ -11,6 +11,7 @@ find src -type d -print | sed 's|.*|"-I&"|' > "$OUT/includes.rsp"
 ${CC:-cc} -O1 -g -std=c11 -Wall -Wextra -Werror -ffunction-sections -fdata-sections \
     @"$OUT/includes.rsp" -I"$SDK/include" -DHAVE_CONFIG_H -D_POSIX_C_SOURCE=200809L -pthread \
     experimental/provider/linked_inbound_participant_test.c experimental/provider/linked_inbound_participant.c \
+    experimental/provider/prototype_store.c \
     experimental/provider/kernel_wg_coordinator.c experimental/provider/kernel_wg_guard_record.c \
     experimental/provider/kernel_wg_ownership.c experimental/provider/kernel_wg_guard.c experimental/provider/policy.c \
     experimental/spec/execution_journal.c src/kinds/awgdev.c src/lib/ir.c src/lib/run.c src/lib/nftdump.c \

@@ -15,11 +15,19 @@ not implemented by the fake verifier in the test.
 Prepare compiles a real non-return-only inbound guard, plans its durable marker
 and calls the existing selection journal stage. A failure fences until recovery
 against the owner's durable revision. NOT_RENAMED reconciles the previous
-selection. RENAMED without sync fences without deleting either side. SYNCED also
-fences: the owner must recover the exact selected durable document before this
-experimental participant can be used again. This conservative boundary does not
-implement live host publication or draining; recovery is only safe when the
-owner has stopped and joined other generation bindings.
+selection. RENAMED without sync fences without deleting either side.
+`steer_linked_inbound_live_commit` accepts a SYNCED success only if the
+externally selected generation and digest equal the staged transaction and
+`without_wg` is false. It updates memory only: no journal scan, kernel IO,
+cleanup, startup recovery or interruption of bindings. Mismatch or uncertainty
+fences and consumes the staged attempt; restart recovery must then use the
+actual durable store selection. The serialized host is responsible for associating
+the receipt and selection with the *same* store transaction and computing the
+digest from its exact validated document; the store result is not a signed or
+document-bound receipt. The older `finish` path does not perform this live
+promotion. This experiment does not implement live host publication or
+draining; startup recovery remains safe only when the owner has stopped and
+joined other generation bindings.
 
 Run independently of CI, with no privileges or network modifications:
 
@@ -30,7 +38,11 @@ SDK=/absolute/path/to/plugin-sdk sh tests/linked-inbound-participant-build.sh /t
 The executable uses the real policy/guard compiler and selection journal with a
 fake kernel backend. It tests return-only rejection, journaled guard ordering,
 precommit failure and recovery, NOT_RENAMED cleanup, RENAMED fencing, and
-restart with injected identity refusal. It does not prove actual nft rules,
+restart with injected identity refusal. Additional tests use a real
+`prototype_store` and journal: synced live promotion, wrong generation, digest
+and `without_wg` flag, and an injected directory-fsync failure after rename. They check that
+no fake-backend recovery or cleanup occurred and that the journal accepts the
+new selection. Kernel operations remain simulated. This does not prove nft rules,
 peer handshake, kernel identity attestation, socket traffic, crash durability of
 an actual common store, or concurrent WG/SOCKS operation. Those require further
 integration and isolated real-kernel tests before any capability is advertised.

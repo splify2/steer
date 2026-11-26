@@ -14,6 +14,7 @@ struct steer_linked_inbound {
     void *context;
     struct steer_draft_kernel_wg_guard **backend_guard;
     struct steer_draft_wg_revision committed;
+    struct steer_draft_wg_revision pending;
     struct steer_draft_wg_ready candidate;
     int staged, fenced, recovered;
 };
@@ -22,6 +23,11 @@ int steer_linked_inbound_recover(struct steer_linked_inbound *,const struct stee
 int steer_linked_inbound_prepare(struct steer_linked_inbound *,const struct steer_draft_wg_tx *,
     const struct steer_draft_wg_candidate *,const struct steer_draft_kernel_wg_guard_config *,
     const struct steer_policy *,uint16_t,uint64_t);
+/* The serialized store owner supplies its exact committed document selection
+ * and the receipt from that same transaction. No IO or recovery; mismatch and
+ * any non-SYNCED receipt fence until startup recovery. */
+int steer_linked_inbound_live_commit(struct steer_linked_inbound *,
+    struct steer_prototype_store_result,const struct steer_draft_wg_revision *);
 /* SYNCED requires later recovery of the external selection; RENAMED fences
  * without cleanup; NOT_RENAMED reconciles the previous external selection.
  * Never rewrites store. */

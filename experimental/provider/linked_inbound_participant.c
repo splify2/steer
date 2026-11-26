@@ -27,7 +27,21 @@ int steer_linked_inbound_prepare(struct steer_linked_inbound *p,const struct ste
     }
     steer_draft_kernel_wg_guard_forget_prepared(guard);
     if(rc){p->fenced=1;return rc;}
+    p->pending=(struct steer_draft_wg_revision){.generation=tx->generation};
+    memcpy(p->pending.digest,tx->plan_digest,sizeof(p->pending.digest));
     p->staged=1;
+    return 0;
+}
+int steer_linked_inbound_live_commit(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
+    const struct steer_draft_wg_revision *chosen){
+    if(!p||!p->staged)return EINVAL;
+    p->staged=0;
+    p->fenced=1;
+    if(!chosen||result.phase!=STEER_PROTOTYPE_STORE_SYNCED||result.error.code||
+       chosen->without_wg||chosen->generation!=p->pending.generation||
+       memcmp(chosen->digest,p->pending.digest,sizeof(chosen->digest)))return ESTALE;
+    p->committed=*chosen;
+    p->fenced=0;
     return 0;
 }
 int steer_linked_inbound_finish(struct steer_linked_inbound *p,struct steer_prototype_store_result result,
