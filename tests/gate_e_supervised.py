@@ -161,6 +161,44 @@ def supervised_legacy_version(binary, state):
     ).stdout
 
 
+def legacy_daemon_roundtrip(binary, cli, state, socket_path):
+    spec = state / "spec.json"
+    lists = state / "lists"
+    lists.mkdir(mode=0o700, exist_ok=True)
+    proc = subprocess.Popen(
+        [str(binary), "daemon", "--socket", str(socket_path), "--spec", str(spec),
+         "--state-dir", str(state), "--lists-dir", str(lists),
+         "--allow-uid", str(os.getuid())],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 8
+        last_ctl = None
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                raise AssertionError(("v2.1.4 daemon exited", proc.returncode, out, err))
+            if socket_path.exists():
+                result = subprocess.run(
+                    [str(cli), "ctl", "--socket", str(socket_path), "status"],
+                    capture_output=True, text=True, timeout=4,
+                )
+                last_ctl = (result.returncode, result.stdout, result.stderr)
+                if result.returncode == 0:
+                    assert result.stdout.strip(), "v2.1.4 Unix ctl returned empty status"
+                    return result.stdout.strip()
+            time.sleep(0.05)
+        raise AssertionError(f"v2.1.4 daemon did not answer Unix ctl: {last_ctl!r}")
+    finally:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate(timeout=5)
+
+
 def main():
     require_unprivileged()
     if len(sys.argv) != 5:
@@ -289,7 +327,13 @@ def main():
         assert not (a_state / "wg-linked-journal").exists()
         assert len(list((b_state / "wg-linked-journal").iterdir())) >= 2
         assert "2.1.4" in supervised_legacy_version(pair_prefix / "active/core", state_dir(pair_prefix))
-        print("PASS offline rollback restores v2 executable+legacy state; serialized v3 WG journal stays isolated")
+        restored_state = state_dir(pair_prefix)
+        ctl_status = legacy_daemon_roundtrip(
+            pair_prefix / "active/core", legacy_cli, restored_state, root / "restored-v2.sock",
+        )
+        assert (restored_state / "spec.json").read_bytes() == b'{"version":2}'
+        assert ctl_status
+        print("PASS real v2.1.4 daemon/Unix ctl uses restored private state; serialized v3 WG journal stays isolated")
 
 
 if __name__ == "__main__":

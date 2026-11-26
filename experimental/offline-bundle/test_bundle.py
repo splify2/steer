@@ -48,6 +48,39 @@ class OfflineTest(unittest.TestCase):
         self.assertEqual(result.returncode == 0, ok, result.stderr)
         return result.stdout.strip()
 
+    def old_installer_generation(self, name='old-software'):
+        # Independent representation of 68adcc1: no state bundle and no
+        # .state-format, with the old on-disk .manifest and .previous files.
+        generations = self.prefix / 'generations'
+        generations.mkdir(mode=0o700)
+        generation = generations / name
+        generation.mkdir(mode=0o700)
+        files = {'core': b'old-core', 'ui': b'old-ui',
+                 'assets/index.html': b'old-index'}
+        (generation / 'assets').mkdir(mode=0o700)
+        for path, data in files.items():
+            dest = generation / path
+            dest.write_bytes(data)
+            dest.chmod(0o500 if path in ('core', 'ui') else 0o400)
+        manifest = {path: hashlib.sha256(data).hexdigest()
+                    for path, data in files.items()}
+        (generation / '.manifest').write_text(json.dumps(manifest))
+        (generation / '.manifest').chmod(0o400)
+        (generation / '.previous').write_text('')
+        (generation / '.previous').chmod(0o400)
+        for root, dirs, _ in os.walk(generation, topdown=False):
+            os.chmod(root, 0o500)
+        os.symlink('generations/' + name, self.prefix / 'active')
+        return 'generations/' + name
+
+    def test_rollback_accepts_independent_old_software_only_generation(self):
+        old = self.old_installer_generation()
+        b, mb = self.fixture('b', 'steer-v3-linked-wg-v1')
+        self.cli('install', b, '--manifest', mb)
+        self.assertEqual(self.cli('rollback'), old)
+        self.assertEqual((self.prefix / 'active/core').read_text(), 'old-core')
+        self.assertEqual(self.cli('status'), old)
+
     def test_install_failure_rollback_and_state(self):
         a, ma = self.fixture('a', 'steer-v2.1.4')
         b, mb = self.fixture('b', 'steer-v3-linked-wg-v1')
@@ -88,6 +121,18 @@ class OfflineTest(unittest.TestCase):
         self.cli('rollback', ok=False)
         self.assertEqual(self.cli('status'), second)
         self.assertEqual(self.cli('state-dir'), second_state)
+
+    def test_pair_without_state_marker_blocks_rollback(self):
+        a, ma = self.fixture('a', 'steer-v2.1.4')
+        b, mb = self.fixture('b', 'steer-v3-linked-wg-v1')
+        first = self.cli('install', a, '--manifest', ma)
+        second = self.cli('install', b, '--manifest', mb)
+        old_generation = self.prefix / first
+        old_generation.chmod(0o700)
+        (old_generation / '.state-format').unlink()
+        old_generation.chmod(0o500)
+        self.cli('rollback', ok=False)
+        self.assertEqual(self.cli('status'), second)
 
     def test_paths_and_extra_files_rejected(self):
         a, ma = self.fixture('a')

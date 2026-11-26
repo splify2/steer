@@ -291,8 +291,21 @@ def main():
                     continue
                 if hashlib.sha256(read_file(path, name)).hexdigest() != digest:
                     fail('previous generation SHA256 mismatch: ' + name)
-            if read_file(path, '.state-format'):
+            try:
+                state_format = read_file(path, '.state-format')
+            except FileNotFoundError:
+                state_format = None
+            has_paired_state = any(name.startswith('state/') for name in expected)
+            if state_format is None:
+                if has_paired_state:
+                    fail('paired previous generation has no state-format marker')
+                # Pre-state-format installers had software-only manifests.
+                # Their rollback remains valid, but a manifest that declares
+                # paired state must never be admitted without its marker.
+            elif state_format:
                 state_path(prefix, previous)
+            elif has_paired_state:
+                fail('paired previous generation has an empty state-format marker')
             switch(prefix, previous)
         elif args.command == 'state-dir':
             current = active(prefix)
