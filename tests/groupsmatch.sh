@@ -164,8 +164,9 @@ export PATH
 
 # HTTP-ответчик: 204 на /generate_204 и /idle_204 (порты 8080 и 80), журнал «путь адрес» по строке; /who — адрес.
 cat > "$tmp/http.py" <<'PY'
-import os, socket, sys, threading
+import os, socket, sys, threading, time
 log = open(sys.argv[1], 'a', buffering=1)
+ivlog = open(sys.argv[4], 'a', buffering=1)
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('10.2.0.1', 8080)); s.listen(64)
 def serve(c, a):
@@ -177,6 +178,8 @@ def serve(c, a):
             d += x
         path = d.split(b' ')[1].decode()
         log.write('%s %s\n' % (path, a[0]))
+        if path == '/iv_204':
+            ivlog.write('%d %s\n' % (time.monotonic_ns(), a[0]))
         if path == '/who':
             body = a[0].encode()
             c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % len(body) + body)
@@ -245,7 +248,7 @@ while True:
 PY
 : > "$tmp/http.log"
 # nsenter напрямую, а не функцией R: у функции в фоне $! — подоболочка, и kill её не снял бы сервер.
-nsenter -t "$RPID" -n python3 "$tmp/http.py" "$tmp/http.log" "$V6" "$tmp/rt.fail" >"$tmp/http.err" 2>&1 & HP=$!
+nsenter -t "$RPID" -n python3 "$tmp/http.py" "$tmp/http.log" "$V6" "$tmp/rt.fail" "$tmp/http.iv" >"$tmp/http.err" 2>&1 & HP=$!
 nsenter -t "$RPID" -n python3 "$tmp/echo.py" >"$tmp/echo.err" 2>&1 & EP=$!
 nsenter -t "$RPID" -n python3 "$tmp/site.py" >"$tmp/site.err" 2>&1 & SP=$!
 sleep 0.5
@@ -488,29 +491,36 @@ R tc qdisc del dev sw1p root
 # ---- 2а. interval короче периода сторожа ----
 # Период 60 — проход по периоду за время проверки не наступает (события сети сторожа будят, но
 # задержка netem на стороне ответчика — не событие в нашем пространстве). Первый замер — проходом,
-# дальше — таймером группы раз в 10 с: по два запроса (член a и член b) на замер.
+# дальше — таймером группы раз в 10 с: по три параллельные пробы каждого из двух членов.
 stop_daemon
 PERIOD=60
-ivs="$(grep -c '^/iv_204 ' "$tmp/http.log")"
+check "оракул кругов отвергает залп, пропуски, неверный период и лишний круг" "yes" \
+    "$(python3 tests/groupsrounds.py --selftest)"
+ivs="$(wc -l < "$tmp/http.iv")"
 kicks="$(grep -c 'iv: по замеру быстрее другой член' "$tmp/d.err")"
 start_daemon
-wait_for '[ "$(grep -c "^/iv_204 " "$tmp/http.log")" -ge $((ivs + 2)) ]' 20
-check "interval 10 при периоде 60: первый замер — в первом проходе (запрос через каждого члена)" "yes" \
-    "$([ "$(grep -c '^/iv_204 ' "$tmp/http.log")" -ge $((ivs + 2)) ] && echo yes || echo no)"
-iv0="$(grep -c '^/iv_204 ' "$tmp/http.log")"
+wait_for '[ "$(wc -l < "$tmp/http.iv")" -ge $((ivs + 6)) ]' 20
+tail -n "+$((ivs + 1))" "$tmp/http.iv" > "$tmp/iv-first"
+first="$(python3 tests/groupsrounds.py "$tmp/iv-first" 1)"
+echo "groupsmatch: первый круг: $first"
+check "interval 10: первый круг — по три пробы обоих членов" "yes" "${first%% *}"
 # Таймеры групп заводятся в конце первого прохода (он ещё меряет другие группы) — окно с запасом.
 sleep 23
-iv1="$(grep -c '^/iv_204 ' "$tmp/http.log")"
-check "  за 23 с — два замера таймером группы (по запросу на члена), а не ноль до прохода" "yes" \
-    "$([ $((iv1 - iv0)) -ge 4 ] && [ $((iv1 - iv0)) -le 6 ] && echo yes || echo "запросов: $((iv1 - iv0))")"
+tail -n "+$((ivs + 1))" "$tmp/http.iv" > "$tmp/iv-rounds"
+rounds="$(python3 tests/groupsrounds.py "$tmp/iv-rounds" 3)"
+echo "groupsmatch: первый и два таймерных круга: $rounds"
+check "  два таймерных круга по три пробы каждого, с интервалом 10 с и без лишнего" "yes" "${rounds%% *}"
 # Медленным становится тот член, что несёт группу сейчас (оба быстры — держится текущий).
 case "$(tdev iv)" in sw1) slow=sw1p want="sw2 b" ;; *) slow=sw2p want="sw1 a" ;; esac
 R tc qdisc add dev "$slow" root netem delay 200ms
 wait_for '[ "$(tdev iv) $(st outputs.iv.group.selected)" = "$want" ]' 25
+actual="$(tdev iv) $(st outputs.iv.group.selected)"
+new_kicks="$(grep -c 'iv: по замеру быстрее другой член' "$tmp/d.err")"
+echo "groupsmatch: замедлен $slow, выбор=$actual, ожидается=$want; внеочередные проходы $kicks -> $new_kicks"
 check "  несущий член стал медленным — группа на другом по замеру таймера, не дожидаясь прохода" \
-    "$want" "$(tdev iv) $(st outputs.iv.group.selected)"
+    "$want" "$actual"
 check "  внеочередной проход — по замеру" "yes" \
-    "$([ "$(grep -c 'iv: по замеру быстрее другой член' "$tmp/d.err")" -gt "$kicks" ] && echo yes || echo no)"
+    "$([ "$new_kicks" -gt "$kicks" ] && echo yes || echo no)"
 R tc qdisc del dev "$slow" root
 PERIOD=3
 
