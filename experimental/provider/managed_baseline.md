@@ -97,3 +97,46 @@ for the same operation and offered rate. Report full/Nano side by side only
 for common TCP work; keep full-only HY2 UDP/QUIC separate. Establish any
 numeric limits only after repeated baseline runs on the target class of
 machine; one isolated run is evidence for that run, not a release threshold.
+
+### One observed Linux TCP run
+
+On Linux x86-64 with eight CPUs in the process affinity, Core `ebe2d8e`
+and Nano from the same sources ran concurrently in distinct namespaces with
+UI `a687901`. Each completed 620 seconds at four reconnecting clients and
+30 label-only Apply operations; every 4096-byte echo matched. The session
+probe held 32 connections and the 33rd was refused on both binaries. This
+does not mean 32 concurrent clients sustained data at that rate.
+
+| Managed TCP | Full | Nano |
+|---|---:|---:|
+| completed reconnect/echo operations | 12,316 | 12,314 |
+| offered payload bytes/s, one direction | 81,365 | 81,352 |
+| echo p50/p95/p99, ms | 0.239 / 1.042 / 3.452 | 0.243 / 1.094 / 3.507 |
+| Apply p50/p95/p99, ms (30 samples) | 2.647 / 6.328 / 6.936 | 2.411 / 4.184 / 4.193 |
+| core PSS after warm-up, KiB, sampled after 70 s | 4,631–4,985 | 4,575–4,680 |
+
+The PSS rose from the post-probe idle sample (1,575 / 1,267 KiB) during
+warm-up; subsequent samples alone do not establish absence of leaks.
+The output and companion short checks are stored under `/tmp/opencode` in
+the producing environment. Run again on the actual target before proposing
+numeric budgets.
+
+The separately run full-only HY2 profile completed 620.44 seconds, 1,234
+TCP and 1,234 UDP verified exchanges, 62 client connections and 31 Apply
+operations without reported errors. TCP echo p50/p95/p99 was
+1.176/2.298/5.054 ms; UDP echo was 0.360/0.724/1.736 ms. Core RSS/PSS
+started at 4,024/1,976 KiB and ended at 8,224/6,448 KiB; sampled FD was
+23–24 during activity. PSS grew in steps even after 70 seconds. This
+observation neither proves a leak nor demonstrates a long-term plateau.
+The configured pacing was about two exchanges per second; the observed
+payload rate is not a saturation result. UI was not active in this
+HY2-specific profile.
+
+For the separate common legacy-control workload, the first 500 sequential
+`version` requests measured p50/p95/p99 of 0.083/0.143/0.253 ms on tagged
+v2.1.4 and 0.086/0.161/0.246 ms on the `ebe2d8e` legacy engine. Two short
+additional runs are retained alongside it; these measurements do not
+compare either dataplane with managed v3. The logical sums of stripped
+core + full UI host + UI assets were 2,232,572 bytes for full and 480,172
+bytes for Nano in this build. These are file sums, not installed package
+sizes, and exclude shared system libraries and packaging overhead.
