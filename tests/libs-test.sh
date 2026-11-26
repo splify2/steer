@@ -153,7 +153,12 @@ out="$(STEER_PLUGIN_SEED="$L/hy2spec/seed" STEER_PLUGINS_ROOT="$empty" "$L/steer
 check "спека с protocol: hysteria2 без плагина: отказ «нужен плагин hysteria2» (по семени)" "1" \
     "$(printf '%s' "$out" | grep -c 'outputs.hy: нужен плагин hysteria2 — поставить')"
 out="$(STEER_PLUGIN_SEED="$empty" STEER_PLUGINS_ROOT="$empty" "$L/steerd" apply --dry-run --spec "$L/hy2spec/spec.yaml" --state-dir "$L/hy2spec/st" 2>&1)"
-check "  без плагина и семени: «протокол не знаю»" "1" "$(printf '%s' "$out" | grep -c 'протокол «hysteria2» не знаю')"
+check "  без плагина и семени: официальный протокол требует плагин" "1" \
+    "$(printf '%s' "$out" | grep -c 'outputs.hy: нужен плагин hysteria2 — поставить')"
+sed 's/protocol: hysteria2/protocol: nosuch/' "$L/hy2spec/spec.yaml" > "$L/hy2spec/unknown.yaml"
+out="$(STEER_PLUGIN_SEED="$empty" STEER_PLUGINS_ROOT="$empty" "$L/steerd" apply --dry-run --spec "$L/hy2spec/unknown.yaml" --state-dir "$L/hy2spec/st-unknown" 2>&1)"
+check "  неизвестный протокол по-прежнему отвергается" "1" \
+    "$(printf '%s' "$out" | grep -c 'протокол «nosuch» не знаю')"
 out="$(P apply --dry-run --spec "$L/hy2spec/spec.yaml" --state-dir "$L/hy2spec/st" 2>&1)"
 check "  с плагином та же спека принимается (хук check — программой плагина)" "0" "$(printf '%s' "$out" | grep -c 'плагин\|не знаю')"
 # ---- TCP выхода — к слушателю модуля (R-152, generate.c: build_tcp_redir) ------------------------

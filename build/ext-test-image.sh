@@ -24,6 +24,7 @@ set -eu
 WSRC=${WOLFSSL_DIR:-/opt/wolfssl}
 NSRC=${STEER_NGTCP2:-${NGTCP2_DIR:-/opt/ngtcp2}}
 SRC=${SRC:-/src}
+SDK=${PLUGIN_SDK:-$SRC/.plugin-sdk}
 
 if [ ! -f "$WSRC/wolfssl/wolfcrypt/settings.h" ]; then
 	echo "ext-test-image: в образе нет исходников wolfSSL ($WSRC) — прогон невозможен" >&2
@@ -35,8 +36,22 @@ if [ "${PM_STRICT:-0}" = 1 ] && [ ! -f "$NSRC/lib/ngtcp2_brutal.c" ]; then
 	echo "ext-test-image: в образе нет исходников ngtcp2 ($NSRC) — strict прогон невозможен" >&2
 	exit 2
 fi
+if [ "${PM_STRICT:-0}" = 1 ] && [ ! -f "$SDK/tests/compat/steer-2.1/host.py" ]; then
+	echo "ext-test-image: нет SDK compatibility fixture ($SDK) — strict прогон невозможен" >&2
+	exit 2
+fi
 
 cd "$SRC"
+if [ "${PM_STRICT:-0}" = 1 ]; then
+	# Host outputs from the runner may be glibc binaries, not executable on
+	# Alpine. Build the legacy test prerequisites in the disposable copy.
+	for tool in make nm readelf; do
+		command -v "$tool" >/dev/null 2>&1 || {
+			echo "ext-test-image: нет $tool — strict прогон невозможен" >&2; exit 2; }
+	done
+	make -B -j "${STEER_TEST_JOBS:-4}" CC="zig cc" \
+		build/steerd build/steer build/steer-android build/pkhooks build/abihost
+fi
 # Стенд пишет в build/ от root (образ). Владелец на выходе возвращается тому, кому принадлежит
 # смонтированное дерево (OWNER=uid:gid задаёт его явно); иначе следующая сборка на машине без
 # root не снимет build/libs-host и соседей. Дерево root-а — ничего не меняем.
@@ -44,4 +59,5 @@ cd "$SRC"
 if [ "$OWNER" != "0:0" ]; then
 	trap 'chown -R "$OWNER" "$SRC/${BUILD:-build}" 2>/dev/null || true' EXIT
 fi
-STEER_WOLFSSL="$WSRC" STEER_NGTCP2="$NSRC" CC="zig cc" BUILD="${BUILD:-build}" sh tests/ext-test.sh
+STEER_WOLFSSL="$WSRC" STEER_NGTCP2="$NSRC" PLUGIN_SDK="$SDK" \
+	CC="zig cc" BUILD="${BUILD:-build}" sh tests/ext-test.sh
