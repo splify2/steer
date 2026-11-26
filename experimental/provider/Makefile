@@ -222,6 +222,10 @@ socks-managed-udp-test: $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype
 socks-managed-udp-http-persistence-test: $(BUILD)/steer-prototype-hy2
 	@test -n "$(UI_HOST)" -a -n "$(UI_ASSETS)" || { echo 'set UI_HOST and UI_ASSETS' >&2; exit 2; }
 	unshare -n sh -ec 'ip link set lo up; exec $(PYTHON) -B prototype_socks_udp_persistence_test.py "$(abspath $(BUILD)/steer-prototype-hy2)" "$(UI_HOST)" "$(UI_ASSETS)"'
+.PHONY: socks-managed-udp-outbound-test
+socks-managed-udp-outbound-test: $(BUILD)/steer-prototype-hy2 $(BUILD)/steer-prototype
+	@test -n "$(XRAY)" -a -n "$(UI_HOST)" -a -n "$(UI_ASSETS)" || { echo 'set XRAY UI_HOST UI_ASSETS' >&2; exit 2; }
+	unshare -n sh -ec 'ip link set lo up; exec $(PYTHON) -B prototype_socks_udp_outbound_test.py "$(abspath $(BUILD)/steer-prototype-hy2)" "$(XRAY)" "$(UI_HOST)" "$(UI_ASSETS)" "$(abspath $(BUILD)/steer-prototype)"'
 $(HY2_HOSTS): $(wildcard $(PROTOCOLS)/src/hysteria2/*.h $(PROTOCOLS)/src/hysteria2/*.inc) \
     ../../src/proto/quic/quic.h ../../src/proto/quic/qcssl.h ../../src/proto/hysteria2/hy2wire.h ../spec/spec.h \
     $(wildcard $(SDK)/include/steer/draft/*.h) ../../src/daemon/loop.h \

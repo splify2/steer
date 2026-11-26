@@ -288,6 +288,44 @@ and either `domain` or `domain_suffix`, each with one list entry; an empty map
 matches all. Other variants and settings are rejected, even on disabled
 objects. The general v3 provider executor and signed lock are not wired in.
 
+### Experimental managed SOCKS5 UDP outbound
+
+Full `HY2_HOSTS` builds accept a named `socks:` outbound with exactly
+`flow: [stream, datagram]`, `variant: numeric-ipv4-udp`, `options: {}` and
+`endpoint: {address: 127.0.0.1, port: <1..65535>}`. Both flow classes and the
+variant are the explicit opt-in. The existing default stream-only SOCKS
+outbound, including USERPASS, is unchanged; UDP upstream uses NOAUTH only.
+Only a local SOCKS UDP ASSOCIATE inbound can use this route. Numeric IPv4
+targets only are supported, the upstream must return a non-wildcard
+`127.0.0.1` relay, and failures never fall back to direct. The option is not
+available in Nano, with VPN-bound listeners, WG, or HY2 datagram inbounds.
+This does not claim a general UDP provider or a structured UI form. Generic
+HTTP JSON Validate/Apply can submit the profile. The Full status key
+`spec_v3_socks_udp_outbound_loopback_ipv4` denotes this narrow managed subset.
+For an existing `proxy` plugin alias, the outbound and route can be declared as:
+
+```yaml
+outbounds:
+  proxy-udp:
+    plugin: socks:proxy
+    flow: [stream, datagram]
+    variant: numeric-ipv4-udp
+    options: {}
+    endpoint: {address: 127.0.0.1, port: 1081}
+routing:
+  default: deny
+  rules:
+    - {name: local-via-proxy, match: {inbound: [socks-local]}, outbound: proxy-udp}
+```
+
+Here `deny` is a separately declared block outbound and `socks-local` is a
+loopback SOCKS inbound with `options: {udp_associate: true}`.
+
+`socks-managed-udp-outbound-test` requires `XRAY`, `UI_HOST` and `UI_ASSETS`:
+it runs in a private netns with an independent upstream, checks the echo source
+socket belongs to Xray, HTTP and durable restart, generation revocation and
+fail-closed behavior. It is not a release or general interoperability claim.
+
 ### Experimental SOCKS UDP ASSOCIATE on IPv4 loopback
 
 Full `HY2_HOSTS` builds accept `options: {udp_associate: true}` on a v3 SOCKS
@@ -303,8 +341,9 @@ remains omitted.
 The TCP control peer and requested UDP peer constrain one non-wildcard relay.
 An unspecified UDP source port is learned from the first valid permitted packet;
 foreign peers, nonzero RSV/FRAG and oversized packets are dropped. Each original
-destination is evaluated against the authenticated generation's policy; this
-slice supports direct and explicit block, not UDP detours. Closing TCP or idle
+destination is evaluated against the authenticated generation's policy. A rule
+may select direct, explicit block, or the [named SOCKS5 UDP outbound](#experimental-managed-socks5-udp-outbound)
+for a numeric IPv4 target. An unavailable upstream does not fall back to direct. Closing TCP or idle
 expiry closes the relay and drains outstanding operations. Successful Apply
 closes old UDP controls and their relay before retiring the old generation;
 existing CONNECT streams retain their normal drain. Rejected Apply leaves the

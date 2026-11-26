@@ -46,6 +46,7 @@
 #endif
 #ifdef STEER_PROTOTYPE_SOCKS_UDP
 #include "socks_datagram.h"
+#include "socks_udp_backend.h"
 #endif
 #include <arpa/inet.h>
 #include <errno.h>
@@ -125,6 +126,9 @@ struct generation {
 #ifdef STEER_PROTOTYPE_HY2
     struct steer_hy2_stream_backend *hy2_out[STEER_POLICY_STREAM_BINDINGS_MAX];
     struct steer_hy2_datagram_backend *hy2_udp_out[STEER_POLICY_STREAM_BINDINGS_MAX];
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+    struct steer_socks_udp_backend *socks_udp_out[STEER_POLICY_STREAM_BINDINGS_MAX];
+#endif
     uint32_t udp_index[STEER_POLICY_STREAM_BINDINGS_MAX];
     struct steer_draft_datagram_runtime *datagram_native;
     struct steer_draft_datagram_router *datagrams;
@@ -458,8 +462,14 @@ static int socks_udp_authorize(void *user,const struct s5_address *a) {
         {(const uint8_t *)c->socks->inbound,(uint32_t)strlen(c->socks->inbound)},
         {(const uint8_t *)principal,(uint32_t)strlen(principal)},&dest};
     struct steer_policy_decision decision;
-    return steer_policy_evaluate(c->generation->policy,&input,&decision).code ||
-        decision.action!=STEER_POLICY_DIRECT;
+    if(steer_policy_evaluate(c->generation->policy,&input,&decision).code)return 1;
+    if(decision.action==STEER_POLICY_DIRECT)return 0;
+    if(decision.action>=STEER_POLICY_STREAM_BINDING_BASE && c->generation->config) {
+        uint32_t i=decision.action-STEER_POLICY_STREAM_BINDING_BASE;
+        if(i<c->generation->config->stream_outbound_count &&
+           c->generation->config->stream_outbounds[i].socks_datagram)return 0;
+    }
+    return 1;
 }
 static struct steer_pv1_error socks_udp_acquire(void *user,struct steer_pv1_span inbound,
     struct steer_pv1_span principal,uint64_t epoch,struct steer_draft_hy2_datagram_binding *out) {
@@ -752,6 +762,9 @@ static void retire_hy2_outbounds(struct generation *g) {
     if(g) for(unsigned i=0;i<g->prepared_outbounds;i++) {
         steer_hy2_stream_backend_retire(g->hy2_out[i]);
         steer_hy2_datagram_backend_retire(g->hy2_udp_out[i]);
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+        steer_socks_udp_backend_retire(g->socks_udp_out[i]);
+#endif
     }
 }
 #endif
@@ -961,6 +974,18 @@ static int prepare_datagram_routes(struct host *h,struct generation *g,struct ou
     bindings[0]=(struct steer_draft_datagram_binding){h->loop,g->datagram_binding,steer_draft_datagram_backend_api(),g->datagram_native};
     for(unsigned i=0;i<STEER_POLICY_STREAM_BINDINGS_MAX;i++)g->udp_index[i]=STEER_DRAFT_DATAGRAM_ROUTE_BLOCK_INDEX;
     if(g->config)for(unsigned i=0;i<g->config->stream_outbound_count;i++) {
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+        if(g->config->stream_outbounds[i].socks_datagram) {
+            const struct steer_prototype_stream_outbound *out=&g->config->stream_outbounds[i];
+            struct sockaddr_in upstream={.sin_family=AF_INET,.sin_port=htons(out->port)};
+            memcpy(&upstream.sin_addr,out->address,4);
+            if(steer_socks_udp_backend_create(h->loop,h->buffers,&upstream,g->number,i+1,
+                4*CLIENTS,2*CLIENTS*CAPACITY,16*CLIENTS,STEER_PROTOTYPE_HY2_OUTBOUND_DRAIN_MS,
+                generation_retired,g,&g->socks_udp_out[i]).code)return 0;
+            g->udp_index[i]=count;bindings[count++]=*steer_socks_udp_backend_binding(g->socks_udp_out[i]);
+            continue;
+        }
+#endif
         if(!g->config->stream_outbounds[i].hy2_datagram)continue;
         if(!credentials||!credentials[i].hy2_udp||
            steer_hy2_datagram_backend_create(h->loop,h->buffers,credentials[i].hy2_udp,g->number,i+1,
@@ -1022,6 +1047,10 @@ static int destroy_generation(struct generation *g)
         g->hy2_out[i]=NULL;
         if(g->hy2_udp_out[i]&&steer_hy2_datagram_backend_destroy(g->hy2_udp_out[i]).code)return 0;
         g->hy2_udp_out[i]=NULL;
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+        if(g->socks_udp_out[i]&&steer_socks_udp_backend_destroy(g->socks_udp_out[i]).code)return 0;
+        g->socks_udp_out[i]=NULL;
+#endif
 #endif
         g->prepared_outbounds--;
     }
@@ -1873,6 +1902,7 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
     n=snprintf(out+used,capacity-used,"]},"
 #ifdef STEER_PROTOTYPE_SOCKS_UDP
         "\"spec_v3_socks_udp_associate_loopback_ipv4\":true,"
+        "\"spec_v3_socks_udp_outbound_loopback_ipv4\":true,"
 #endif
 #ifdef STEER_PROTOTYPE_VLESS_OUTBOUND
         "\"spec_v3_vless_tcp_outbound\":true,"

@@ -1,9 +1,9 @@
 # Experimental outgoing SOCKS5 UDP backend
 
-This is a source-level Full-only SDK datagram backend, not a managed option,
-capability or released service. Constructing a binding explicitly enables it;
-the managed generation registry does not yet construct or select it. Nano and
-the existing SOCKS TCP CONNECT backend are unchanged.
+This Full-only SDK datagram backend is also constructed by the narrow managed
+SOCKS profile in [prototype_core.md](prototype_core.md#experimental-managed-socks5-udp-outbound).
+It is experimental, not a released service. Nano and the existing SOCKS TCP
+CONNECT backend are unchanged.
 
 The first slice accepts a numeric IPv4 target and an IPv4 upstream bound at
 `127.0.0.1` only. It negotiates SOCKS5 NOAUTH and UDP ASSOCIATE over a retained

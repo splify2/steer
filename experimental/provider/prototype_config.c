@@ -388,6 +388,14 @@ static int v3_stream_outbound(const struct steer_spec_node_view *node,const stru
 #endif
 #ifdef STEER_PROTOTYPE_SOCKS_OUTBOUND
     if(!strncmp(node->provider,"socks:",6)){
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+        if(node->flows==(STEER_SPEC_FLOW_STREAM|STEER_SPEC_FLOW_DATAGRAM)) {
+            if(!eq(node->variant,"numeric-ipv4-udp")||node->options->len||
+               !eq(address,"127.0.0.1")||
+               !keys(node->intent,"label enabled plugin flow endpoint options variant"))return 0;
+            out->socks_datagram=1;
+        } else if(node->flows!=STEER_SPEC_FLOW_STREAM||node->variant)return 0;
+#endif
         if(node->options->len&&
            (!v3_env_ref(secrets,ynode_get(node->options,"username"),"username",out->username_ref)||
             !v3_env_ref(secrets,ynode_get(node->options,"password"),"password",out->password_ref)))return 0;
@@ -412,10 +420,16 @@ static int v3_stream_outbound(const struct steer_spec_node_view *node,const stru
         out->protocol=STEER_PROTOTYPE_HYSTERIA2;
     }else
 #endif
-    if(!keys(node->intent,"label enabled plugin flow endpoint options"))return 0;
+    if(!keys(node->intent,
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+             out->socks_datagram?"label enabled plugin flow endpoint options variant":
+#endif
+             "label enabled plugin flow endpoint options"))return 0;
     if(!out->protocol)return 0;
 #ifdef STEER_PROTOTYPE_HY2
-    if(out->protocol!=STEER_PROTOTYPE_HYSTERIA2 && node->flows!=STEER_SPEC_FLOW_STREAM)return 0;
+    if(out->protocol!=STEER_PROTOTYPE_HYSTERIA2 &&
+       !(out->protocol==STEER_PROTOTYPE_SOCKS && out->socks_datagram) &&
+       node->flows!=STEER_SPEC_FLOW_STREAM)return 0;
 #else
     if(node->flows!=STEER_SPEC_FLOW_STREAM)return 0;
 #endif
@@ -566,7 +580,7 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
         |((allow&&allow->wg_inbound_validate)?STEER_SPEC_FLOW_DEVICE:0)
 #endif
         ;
-    enum { alias_requirements=12 };
+    enum { alias_requirements=14 };
     struct steer_spec_capability inventory[1+sizeof(core)/sizeof(core[0])+alias_requirements*STEER_PROTOTYPE_MAX_LISTENERS];
     size_t count=sizeof(core)/sizeof(core[0]);
     char requirements[STEER_PROTOTYPE_MAX_LISTENERS][alias_requirements][128];
@@ -635,6 +649,12 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
 #ifdef STEER_PROTOTYPE_SOCKS_OUTBOUND
         snprintf(requirements[i][6],sizeof(requirements[i][6]),"provider.socks:%s/outbound/stream/tcp/none/default",alias->str);
         inventory[count++]=(struct steer_spec_capability){requirements[i][6],STEER_SPEC_READY,v3_socks_outbound_options,NULL};
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+        snprintf(requirements[i][12],sizeof(requirements[i][12]),"provider.socks:%s/outbound/stream/tcp/none/numeric-ipv4-udp",alias->str);
+        snprintf(requirements[i][13],sizeof(requirements[i][13]),"provider.socks:%s/outbound/datagram/tcp/none/numeric-ipv4-udp",alias->str);
+        inventory[count++]=(struct steer_spec_capability){requirements[i][12],STEER_SPEC_READY,v3_socks_outbound_options,NULL};
+        inventory[count++]=(struct steer_spec_capability){requirements[i][13],STEER_SPEC_READY,v3_socks_outbound_options,NULL};
+#endif
 #endif
     }
     for(size_t i=0;secrets&&i<secrets->len;i++){
@@ -726,6 +746,16 @@ static struct steer_pv1_error parse_v3(const char *data,size_t length,const stru
             !distinct_listener(c,c->listener_count))goto done;
         c->listener_count++;
     }
+#ifdef STEER_PROTOTYPE_SOCKS_UDP
+    for(uint32_t i=0;i<c->stream_outbound_count;i++) if(c->stream_outbounds[i].socks_datagram) {
+#ifdef STEER_PROTOTYPE_WG_NETNS
+        if(c->wg||c->wg_inbound_validate)goto done;
+#endif
+        for(uint32_t j=0;j<c->listener_count;j++)
+            if(!loopback_address(c->listeners[j].address)||
+               (c->listeners[j].protocol==STEER_PROTOTYPE_HYSTERIA2&&!c->listeners[j].datagram_disabled))goto done;
+    }
+#endif
     const struct ynode *target=ynode_get(routing,"default");
     if(!scalar(target)||!v3_named_action(c,outbounds,target->str,&fallback))goto done;
 #ifdef STEER_PROTOTYPE_WG_NETNS
