@@ -119,7 +119,7 @@ MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c $(MODEL_SPEC_SRC)
 # и шлёт в трубу, обслуживать LAN не обслуживает сам. Сегодня это подмножество DNSD_SRC (один
 # бинарник несёт всё сразу); шаг 6 (раздельные бинарники) сможет собрать steerd этим списком, не
 # трогая DNSD_SRC вовсе.
-DNSD_TABLE_SRC := src/dnsd/table.c src/dnsd/tabfmt.c
+DNSD_TABLE_SRC := src/dnsd/table.c src/dnsd/tabfmt.c src/dnsd/table_ack.c
 
 # dnsd/fpseed.c — засев наборов каналов fake-IP в тексте набора правил (src/dnsd/fpseed.h): код
 # резолвера, но зовёт его apply, а не резолвер, — поэтому он в любой сборке, где есть и apply, и

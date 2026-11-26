@@ -6,6 +6,7 @@
  * DNSD_SRC переменной DNSD_TABLE_SRC (build/sources.mk). */
 #include "dnsd_int.h"
 #include "tabfmt.h"
+#include "table_ack.h"
 #include <errno.h>
 #include <limits.h>
 
@@ -506,6 +507,7 @@ int tabfmt_read_first(int fd, struct tabfmt_feed *st) {
         if (r == 0) return -1; /* труба закрылась раньше первой таблицы — демон умер */
         int rc = tabfmt_feed(st, chunk, (size_t)r);
         if (rc < 0) return -1;
+        if (rc == 2 && table_ack_emit(fd, rc) != 0) return -1;
         if (rc == 2) return -1;
         if (rc == 1) return 0; /* первая таблица разобрана; хвост (если демон прислал вторую
                                 * следом же записью) остался в st — его доберёт та же tabfmt_feed

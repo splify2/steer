@@ -81,6 +81,25 @@ dns-late-upstream-test: $(BUILD)/steer
 dns-reused-upstream-cache-test: $(BUILD)/steer
 	unshare -n sh -ec 'ip link set lo up; exec python3 -B tests/dns_reused_upstream_cache_test.py --binary "$(abspath $(BUILD)/steer)"'
 
+# A separate binary pair; linker hooks are absent from ordinary steerd.
+.PHONY: dns-prepare-fault-test
+$(BUILD)/table-ack-test: tests/table_ack_test.c src/dnsd/table_ack.c src/dnsd/table_ack.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc/dnsd -o $@ tests/table_ack_test.c src/dnsd/table_ack.c
+dns-table-ack-test: $(BUILD)/table-ack-test
+	$(BUILD)/table-ack-test
+	$(MAKE) $(BUILD)/steerd
+	unshare -n sh -ec 'ip link set lo up; exec python3 -B tests/table_ack_integration.py --steerd "$(abspath $(BUILD)/steerd)"'
+.PHONY: dns-table-ack-test
+$(BUILD)/dns-prepare-fault/steerd: $(CORE_SRC) $(CORE_HDR) tests/dns_prepare_fault_wrap.c VERSION
+	@mkdir -p $(BUILD)/dns-prepare-fault
+	$(CC) $(CFLAGS) $(DEFS) -Wl,--wrap=tabfmt_feed,--wrap=dch_rules_load,--wrap=strdup -o $@ $(CORE_SRC) tests/dns_prepare_fault_wrap.c
+$(BUILD)/dns-prepare-fault/steer: $(CLIENT_SRC) src/platform/platform.h | $(BUILD)/dns-prepare-fault/steerd
+	@mkdir -p $(BUILD)/dns-prepare-fault
+	$(CC) $(CFLAGS) -o $@ $(CLIENT_SRC)
+dns-prepare-fault-test: $(BUILD)/dns-prepare-fault/steer
+	unshare -n sh -ec 'ip link set lo up; exec python3 -B tests/dns_prepare_fault_test.py --binary "$(abspath $(BUILD)/dns-prepare-fault/steer)"'
+
 # Standalone inventory foundation: no net1 linkage or runtime platform selection.
 .PHONY: capabilities-test
 capabilities-test: $(BUILD)/capabilitiesmatch
