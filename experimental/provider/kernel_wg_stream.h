@@ -14,7 +14,9 @@ int steer_draft_wg_stream_create(const struct steer_draft_wg_linux_link *,
     const struct steer_draft_wg_guard_record *,const struct awg_prefix *source,
     const struct awg_prefix *route,int scoped,uint64_t deadline,struct steer_draft_wg_stream **);
 void steer_draft_wg_stream_destroy(struct steer_draft_wg_stream *);
+/* Physical ownership generation, not necessarily the routing revision. */
 uint64_t steer_draft_wg_stream_generation(const struct steer_draft_wg_stream *);
+const struct steer_draft_wg_guard_record *steer_draft_wg_stream_record(const struct steer_draft_wg_stream *);
 int steer_draft_wg_stream_contains(const struct steer_draft_wg_stream *,const uint8_t address[4]);
 int steer_draft_wg_stream_verify(const struct steer_draft_wg_stream *,uint64_t deadline);
 /* Native TCP socket constraint. No direct fallback, DNS or namespace changes.

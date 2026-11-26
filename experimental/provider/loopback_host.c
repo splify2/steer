@@ -872,10 +872,18 @@ static int destroy_generation(struct generation *g)
         if(steer_draft_native_stream_backend_destroy(g->wg_native).code)return 0;
         g->wg_native=NULL;
     }
+    uint64_t resource=steer_draft_wg_stream_generation(g->wg_stream);
     steer_draft_wg_stream_destroy(g->wg_stream);
     g->wg_stream=NULL;
-    if(g->wg_staged&&!g->host->wg_fenced&&steer_linked_wg_retire(g->host->linked_wg,g->number))
-        g->host->wg_retire_error=1; /* retain ambiguous journal state until restart */
+    if(g->wg_staged&&!g->host->wg_fenced){
+        if(!resource)resource=g->number; /* failed physical staging, possibly journaled */
+        int pinned=0;
+        for(unsigned i=0;i<GENERATIONS;i++)
+            if(steer_draft_wg_stream_generation(g->host->generations[i].wg_stream)==resource)pinned=1;
+        if(!pinned&&steer_linked_wg_retire(g->host->linked_wg,resource))
+            g->host->wg_retire_error=1; /* retain ambiguous journal state until restart */
+        g->wg_staged=0;
+    }
 #endif
     if (g->routes) {
         if (steer_draft_routes_destroy(g->routes).code) return 0;
@@ -1317,7 +1325,7 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     }
     if (validate) { result = 200; goto cleanup; }
 #ifdef STEER_PROTOTYPE_WG_NETNS
-    if(h->linked_wg&&initial_format&&steer_linked_wg_recover(h->linked_wg,config,&h->wg_next,&recovered_wg)){
+    if(h->linked_wg&&initial_format&&steer_linked_wg_recover(h->linked_wg,config,&wg_keys,&h->wg_next,&recovered_wg)){
         result=503;goto cleanup;
     }
 #endif
@@ -1339,6 +1347,11 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
         if(g->config->wg){
             if(initial_format){
                 g->wg_stream=recovered_wg;recovered_wg=NULL;
+                g->wg_staged=1;
+            }else if(h->current&&steer_linked_wg_same_device(h->current->config->wg,g->config->wg)){
+                int rc=steer_linked_wg_reuse(h->linked_wg,g->config,&wg_keys,h->current->config->wg,h->current->wg_stream,
+                    inputs?inputs->deadline_ms*1000000u:0,&g->wg_stream);
+                if(rc){result=rc==ESTALE?409:503;goto cleanup;}
                 g->wg_staged=1;
             }else{
                 for(unsigned k=0;k<GENERATIONS;k++){
@@ -1626,7 +1639,8 @@ static void writer_ready(struct loop *l, int fd, uint32_t events, void *arg)
         h->wg_fenced=1; /* leave both journal generations for restart */
         published=0;
     }
-    if(h->linked_wg&&published)steer_linked_wg_commit(h->linked_wg,prepared->generation->config);
+    if(h->linked_wg&&published)steer_linked_wg_commit(h->linked_wg,prepared->generation->config,
+        prepared->generation->wg_stream);
 #endif
     if (published) {
         h->durability_uncertain = result.phase != STEER_PROTOTYPE_STORE_SYNCED;
@@ -1970,7 +1984,7 @@ int steer_prototype_main(int argc, char **argv)
 #ifdef STEER_PROTOTYPE_WG_NETNS
         if(h.linked_wg){
             struct steer_draft_wg_stream *unused=NULL;
-            if(steer_linked_wg_recover(h.linked_wg,NULL,&h.wg_next,&unused))goto cleanup;
+            if(steer_linked_wg_recover(h.linked_wg,NULL,NULL,&h.wg_next,&unused))goto cleanup;
             initial=h.wg_next;
         }
 #endif
@@ -1992,7 +2006,7 @@ int steer_prototype_main(int argc, char **argv)
 #ifdef STEER_PROTOTYPE_WG_NETNS
         if(h.linked_wg){
             if(h.durability_uncertain){h.wg_fenced=1;goto cleanup;}
-            steer_linked_wg_commit(h.linked_wg,h.current->config);
+            steer_linked_wg_commit(h.linked_wg,h.current->config,h.current->wg_stream);
         }
 #endif
     }

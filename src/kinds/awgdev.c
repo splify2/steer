@@ -763,7 +763,7 @@ static int genl_family_until(const char *name, uint16_t *id, int *ver,uint64_t d
 
 static int genl_family(const char *name,uint16_t *id,int *ver){return genl_family_until(name,id,ver,0);}
 
-struct link_ctx { char kind[32]; int index; char marker[256]; int malformed_marker; uint32_t group; int have_group; unsigned flags; };
+struct link_ctx { char kind[32]; int index; char marker[256]; int malformed_marker; uint32_t group,mtu; int have_group; unsigned flags; };
 
 static void link_cb(const struct nlmsghdr *h, void *ctx) {
     struct link_ctx *l = ctx;
@@ -779,6 +779,7 @@ static void link_cb(const struct nlmsghdr *h, void *ctx) {
         memcpy(&l->group,NLA_DATA(tb[IFLA_GROUP]),sizeof l->group);
         l->have_group=1;
     }
+    if(tb[IFLA_MTU]&&NLA_PLEN(tb[IFLA_MTU])==sizeof(l->mtu))memcpy(&l->mtu,NLA_DATA(tb[IFLA_MTU]),sizeof(l->mtu));
     if(tb[IFLA_IFALIAS]){
         size_t n=NLA_PLEN(tb[IFLA_IFALIAS]);const char *alias=NLA_DATA(tb[IFLA_IFALIAS]);
         const char *end=memchr(alias,0,n);
@@ -1387,6 +1388,142 @@ int awg_dev_live_read_owned_until(const char *name,const char *kind,int index,ui
     if(!rc)rc=owned_identity_until(name,kind,index,group,deadline);
     if(rc)memset(out,0,sizeof *out);
     return rc;
+}
+
+/* Linked v3 has exactly one peer and one IPv4 AllowedIPs entry. The reply
+ * fits in one device message; reject partial/ambiguous dumps instead of
+ * merging them. The generic transport wipes the raw key-bearing buffer. */
+static int wg_attrs_once(const void *p,size_t len,const struct nlattr **a,unsigned max){
+    memset(a,0,(max+1)*sizeof(*a));
+    const uint8_t *q=p;
+    while(len){
+        if(len<NLA_HDRLEN)return 0;
+        const struct nlattr *n=(const void *)q;
+        unsigned type=n->nla_type&NLA_TYPE_MASK,size=NLA_ALIGN(n->nla_len);
+        if(n->nla_len<NLA_HDRLEN||size>len||type>max)return 0;
+        if(type){
+            if(a[type])return 0;
+            a[type]=n;
+        }else if(n->nla_len!=NLA_HDRLEN)return 0; /* u64 alignment pad */
+        q+=size;len-=size;
+    }
+    return 1;
+}
+static const struct nlattr *wg_only_child(const struct nlattr *a){
+    if(!a||NLA_PLEN(a)<NLA_HDRLEN)return NULL;
+    const struct nlattr *n=NLA_DATA(a);
+    return n->nla_len>=NLA_HDRLEN&&(size_t)NLA_ALIGN(n->nla_len)==NLA_PLEN(a)?n:NULL;
+}
+static int wg_u16_equal(const struct nlattr *a,uint16_t expected){
+    uint16_t got=0;
+    if(!a||NLA_PLEN(a)!=sizeof(got))return 0;
+    memcpy(&got,NLA_DATA(a),sizeof got);
+    return got==expected;
+}
+static int wg_secret_equal(const struct nlattr *a,const uint8_t key[AWG_KEY_LEN],int clamp){
+    if(!a||NLA_PLEN(a)!=AWG_KEY_LEN)return 0;
+    const uint8_t *live=NLA_DATA(a);
+    unsigned diff=0;
+    for(unsigned j=0;j<AWG_KEY_LEN;j++){
+        unsigned byte=key[j];
+        if(clamp&&j==0)byte&=248u;
+        if(clamp&&j==AWG_KEY_LEN-1)byte=(byte&127u)|64u;
+        diff|=live[j]^byte;
+    }
+    return !diff;
+}
+struct wg_attest {
+    const struct awg_conf *cfg;
+    const struct awg_secrets *keys;
+    uint32_t index;
+    uint16_t family;
+    int count,match;
+};
+static void wg_source_cb(const struct nlmsghdr *h,void *arg){
+    struct wg_attest *c=arg;
+    const size_t head=NLMSG_LENGTH(sizeof(struct ifaddrmsg));
+    if(h->nlmsg_type!=RTM_NEWADDR||h->nlmsg_len<head)return;
+    const struct ifaddrmsg *msg=NLMSG_DATA(h);
+    if(msg->ifa_family!=AF_INET||msg->ifa_index!=c->index)return;
+    c->count++;
+    const struct nlattr *a[IFA_MAX+1];
+    if(!wg_attrs_once((const uint8_t *)h+head,h->nlmsg_len-head,a,IFA_MAX)||
+       msg->ifa_prefixlen!=32||msg->ifa_scope!=RT_SCOPE_UNIVERSE||
+       !a[IFA_LOCAL]||NLA_PLEN(a[IFA_LOCAL])!=4||!a[IFA_ADDRESS]||NLA_PLEN(a[IFA_ADDRESS])!=4||
+       memcmp(NLA_DATA(a[IFA_LOCAL]),c->cfg->addr[0].addr,4)||
+       memcmp(NLA_DATA(a[IFA_ADDRESS]),c->cfg->addr[0].addr,4))return;
+    c->match=1;
+}
+static int wg_attest_geometry(struct wg_attest *c,const char *kind,uint32_t group,uint64_t d){
+    _Alignas(8) uint8_t buf[128];struct nlbuf b;
+    struct ifinfomsg link={.ifi_family=AF_UNSPEC,.ifi_index=(int)c->index};
+    struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),RTM_GETLINK,NLM_F_REQUEST|NLM_F_ACK,
+        next_seq(),&link,sizeof link);
+    int fd=nl_open(NETLINK_ROUTE);
+    if(fd<0)return errno;
+    struct link_ctx live={0};
+    int rc=nl_talk_until(fd,buf,msg_end(&b,h),link_cb,&live,d);
+    if(!rc&&((uint32_t)live.index!=c->index||!live.have_group||live.group!=group||
+        strcmp(live.kind,kind)||!(live.flags&IFF_UP)||live.mtu!=(uint32_t)c->cfg->mtu))rc=ESTALE;
+    if(!rc){
+        struct ifaddrmsg addr={.ifa_family=AF_INET};
+        h=msg_begin(&b,buf,sizeof(buf),RTM_GETADDR,NLM_F_REQUEST|NLM_F_DUMP,next_seq(),&addr,sizeof addr);
+        c->count=c->match=0;
+        rc=nl_talk_until(fd,buf,msg_end(&b,h),wg_source_cb,c,d);
+        if(!rc&&(c->count!=1||!c->match))rc=ESTALE;
+    }
+    close(fd);
+    return rc;
+}
+static void wg_attest_cb(const struct nlmsghdr *h,void *arg){
+    struct wg_attest *c=arg;
+    c->count++;
+    const size_t head=NLMSG_HDRLEN+NLMSG_ALIGN(sizeof(struct genlmsghdr));
+    if(c->count!=1||h->nlmsg_type!=c->family||h->nlmsg_len<head||
+       ((const struct genlmsghdr *)NLMSG_DATA(h))->cmd!=AWG_CMD_GET_DEVICE)return;
+    const struct nlattr *a[AD_PEERS+1],*peer[AP_PROTOCOL_VERSION+1],*ip[AA_CIDR_MASK+1];
+    if(!wg_attrs_once((const uint8_t *)h+head,h->nlmsg_len-head,a,AD_PEERS)||
+       wg_attr_u32(a[AD_IFINDEX])!=c->index||!wg_u16_equal(a[AD_LISTEN_PORT],c->cfg->listen_port)||
+       !a[AD_FWMARK]||NLA_PLEN(a[AD_FWMARK])!=4||wg_attr_u32(a[AD_FWMARK])!=steer_own_mark(0)||
+       !wg_secret_equal(a[AD_PRIVATE_KEY],c->keys->priv,1))return;
+    const struct nlattr *p=wg_only_child(a[AD_PEERS]);
+    if(!p||!wg_attrs_once(NLA_DATA(p),NLA_PLEN(p),peer,AP_PROTOCOL_VERSION)||
+       !peer[AP_PUBLIC_KEY]||NLA_PLEN(peer[AP_PUBLIC_KEY])!=AWG_KEY_LEN||
+       memcmp(NLA_DATA(peer[AP_PUBLIC_KEY]),c->cfg->peer[0].pub,AWG_KEY_LEN)||
+       !wg_secret_equal(peer[AP_PRESHARED_KEY],c->keys->psk[0],0)||
+       !wg_u16_equal(peer[AP_PERSISTENT_KEEPALIVE_INTERVAL],0))return;
+    p=wg_only_child(peer[AP_ALLOWEDIPS]);
+    const struct awg_prefix *prefix=&c->cfg->aips[0];
+    if(!p||!wg_attrs_once(NLA_DATA(p),NLA_PLEN(p),ip,AA_CIDR_MASK)||
+       !wg_u16_equal(ip[AA_FAMILY],AF_INET)||!ip[AA_IPADDR]||NLA_PLEN(ip[AA_IPADDR])!=4||
+       memcmp(NLA_DATA(ip[AA_IPADDR]),prefix->addr,4)||!ip[AA_CIDR_MASK]||
+       NLA_PLEN(ip[AA_CIDR_MASK])!=1||*(const uint8_t *)NLA_DATA(ip[AA_CIDR_MASK])!=prefix->cidr)return;
+    c->match=1;
+}
+int awg_dev_attest_single_wg_until(const char *name,int index,uint32_t group,const struct awg_conf *cfg,
+    const struct awg_secrets *keys,uint64_t d){
+    if(managed_config_valid(cfg,keys)||cfg->peer_n!=1||cfg->aips_n!=1||cfg->aips[0].family!=AF_INET||
+       cfg->addr_n!=1||cfg->addr[0].family!=AF_INET||cfg->addr[0].cidr!=32)return EINVAL;
+    const char *kind="wireguard";
+    int rc=owned_identity_until(name,kind,index,group,d);
+    if(rc)return rc;
+    uint16_t family=0;int version=0;
+    rc=genl_family_until(kind,&family,&version,d);
+    if(rc)return rc;
+    int fd=nl_open(NETLINK_GENERIC);
+    if(fd<0)return errno;
+    _Alignas(8) uint8_t buf[128];struct nlbuf b;
+    struct genlmsghdr g={.cmd=AWG_CMD_GET_DEVICE,.version=(uint8_t)version};
+    struct nlmsghdr *h=msg_begin(&b,buf,sizeof(buf),family,NLM_F_REQUEST|NLM_F_DUMP,next_seq(),&g,sizeof(g));
+    nlbuf_put_u32(&b,AD_IFINDEX,(uint32_t)index);
+    struct wg_attest check={cfg,keys,(uint32_t)index,family,0,0};
+    rc=nl_talk_until(fd,buf,msg_end(&b,h),wg_attest_cb,&check,d);
+    close(fd);
+    if(rc)return rc;
+    if(check.count!=1||!check.match)return ESTALE;
+    rc=wg_attest_geometry(&check,kind,group,d);
+    if(rc)return rc;
+    return owned_identity_until(name,kind,index,group,d);
 }
 
 /* ТУННЕЛЬ ЧЕРЕЗ via — ТОЛЬКО ПО IPv4, и это проверка, а не пожелание.

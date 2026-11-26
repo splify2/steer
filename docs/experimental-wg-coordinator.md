@@ -245,12 +245,35 @@ WG before retiring others; intentional absence of WG is distinct from a
 missing required WG resource. Shutdown retains the committed WG for
 same-netns restart.
 
-Same-port or same-inner-source WG replacement is not supported: use a
-disjoint source and listen port, or remove WG, wait for drain, and add it
-back. The journal is bounded and uncompacted; further WG staging can be
-blocked by an unreconciled generation. The privileged kernel work is
-serialized on the experimental owner, not a production worker, and
-machine-reboot recovery and multiple WG outbounds are out of scope.
+**Rule-only Apply.** If the lowered device, peer and guard settings are
+unchanged, the new registry can pin the same kernel resource. The private
+key and optional PSK resolved for the new intent must match both the values
+resolved from the committed intent and the effective live keys. Recovery
+compares the persisted intent's resolved keys to the live ones before any
+cleanup. Checks use an exact-ifindex WireGuard dump, wipe its buffer and never persist values
+or key fingerprints. The live listen port, MTU, IPv4 source, peer identity
+and AllowedIPs must also match. Secret-ref names are not a substitute for
+comparing values. The declared endpoint is compared as intent; WireGuard roaming
+does not rewrite the declaration. Incompatible same-port or same-source
+changes, including a key rotation, fail Apply rather than modifying the
+old device. Use a disjoint source and port, or remove WG, wait for drain
+and add it back.
+
+Each reuse writes one synced journal fact tying the full new revision digest
+to the exact original `PUBLISHED` record, without an alias chain or kernel
+mutation. `prototype_store` alone selects that fact; an unused fact (e.g.
+after pre-commit failure) never selects a device. Retirement requires that
+no runtime generation still pins the resource and that it is not the
+physical resource of the committed revision. Startup rejects missing,
+contradictory or retired anchors instead of adopting by name. Existing
+linked journals are read unchanged; older binaries cannot read journals once
+a reuse fact exists and must not be used to recover them. No automatic
+downgrade or journal rewrite is provided.
+
+The journal is bounded and uncompacted; further WG staging can be blocked
+by an unreconciled generation. The privileged kernel work is serialized on
+the experimental owner, not a production worker, and machine-reboot recovery
+and multiple WG outbounds are out of scope.
 
 The full fixture is `experimental/provider/prototype_linked_wg_test.py`.
 It builds its independent HY2 client from `linked_wg_hy2_client.go` using

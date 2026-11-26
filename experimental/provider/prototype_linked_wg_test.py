@@ -81,6 +81,8 @@ def main(binary, oracle, fault):
         env = dict(os.environ, STEER_LAB_CA_FILE=str(crt), STEER_LAB_HY2_TOKEN="disposable-hy2",
                    STEER_TEST_TLS_KEY=str(tls_key), STEER_TEST_UUID=UUID,
                    STEER_WG_ONE=keys[0].strip(), STEER_WG_TWO=keys[1].strip(), STEER_WG_PSK=psk.strip())
+        wrong_psk = run("wg", "genpsk").strip()
+        env.update(STEER_WG_WRONG_PSK=wrong_psk, STEER_WG_SAME_KEY=keys[0].strip())
         run("ip", "link", "set", "lo", "up")
         run(*ns, "ip", "link", "set", "lo", "up")
         run("ip", "link", "add", "wg-underlay", "type", "veth", "peer", "name", "passive-lan")
@@ -95,9 +97,9 @@ def main(binary, oracle, fault):
         passive_port = udp_port()
         run(*ns, "wg", "set", "passive-wg", "private-key", str(keyfile), "listen-port", str(passive_port))
         run(*ns, "ip", "link", "set", "passive-wg", "up")
-        for source, pub in zip(SOURCES, public):
-            run(*ns, "wg", "set", "passive-wg", "peer", pub, "preshared-key", str(psk_path),
-                "allowed-ips", f"{source}/32")
+        for i, (source, pub) in enumerate(zip(SOURCES, public)):
+            run(*ns, "wg", "set", "passive-wg", "peer", pub,
+                *(("preshared-key", str(psk_path)) if i == 0 else ()), "allowed-ips", f"{source}/32")
             run(*ns, "ip", "route", "add", f"{source}/32", "dev", "passive-wg")
 
         # Explicit rules for six ordinary listeners. Each pair reaches the
@@ -151,6 +153,9 @@ def main(binary, oracle, fault):
                             "addresses": [f"{SOURCES[which]}/32"], "route_prefix": f"{DEST}/32",
                             "peers": [{"allowed_ips": [f"{DEST}/32"], "principal_id": "passive",
                                        "public_key": remote_pub, "preshared_key": psk_ref}]}}
+            if which:
+                del doc["outbounds"]["vpn"]["options"]["peers"][0]["preshared_key"]
+                del doc["secrets"]["wg-psk"]
             for rule in doc["routing"]["rules"]:
                 if rule["name"].endswith("-wg"):
                     rule["outbound"] = "vpn"
@@ -160,10 +165,11 @@ def main(binary, oracle, fault):
         seed = root / "seed.json"
         seed.write_text(json.dumps(base))
 
-        def start(label, *, enabled=True, crash=None):
+        def start(label, *, enabled=True, crash=None, extra_env=None):
             ctl = root / f"{label}.sock"
             args = [binary, "--config", str(seed), "--control", str(ctl)]
             proc_env = env.copy()
+            proc_env.update(extra_env or {})
             if enabled:
                 args += ["--state-dir", str(state), "--allow-wg-stream-netns"]
             if crash:
@@ -190,8 +196,8 @@ def main(binary, oracle, fault):
         def inlet(name):
             return base["inbounds"][name]["listen"]["port"]
 
-        def matrix(path, source, *, linked=True):
-            for protocol in ("socks", "vless", "hysteria2"):
+        def matrix(path, source, *, linked=True, protocols=("socks", "vless", "hysteria2")):
+            for protocol in protocols:
                 entry = inlet(f"{protocol}-{path}")
                 before = counters()
                 if protocol == "socks":
@@ -230,6 +236,11 @@ def main(binary, oracle, fault):
             assert control(ctl, "GET")[1]["document"] == doc
             return reply["revision"]
 
+        def owned_state():
+            links = json.loads(run("ip", "-j", "link", "show"))
+            return ({row["ifname"]: row["ifindex"] for row in links if row["ifname"].startswith("sw")},
+                    run("ip", "-j", "rule", "show"), run("nft", "-a", "list", "tables"))
+
         with child(*ns, sys.executable, "-c", ECHO) as echo:
             target = int(line(echo))
             rejected = root / "same-namespace.sock"
@@ -264,6 +275,58 @@ def main(binary, oracle, fault):
                 assert handshake() == {key: 0 for key in public}
                 matrix("wg", SOURCES[0])
                 assert handshake()[public[0]] > 0 and handshake()[public[1]] == 0
+                rule_only = copy.deepcopy(first)
+                rule_only["routing"]["rules"][0]["outbound"] = "net"
+                assert control(ctl, "VALIDATE", rule_only)[0] == 200
+                if os.environ.get("STEER_TEST_REPRO_WG_RULE_ONLY"):
+                    assert control(ctl, "APPLY", rule_only, revision)[0] == 409
+                    assert control(ctl, "GET")[1]["document"] == first
+                    assert device_set() == {old_device}
+                    print("REPRO: unchanged WG, rule-only VALIDATE=200 and APPLY=409", flush=True)
+                    core.terminate()
+                    assert core.wait(timeout=5) == 0
+                    return
+                owned = owned_state()
+                for declaration, invalid_env in (("wg-private", "STEER_WG_TWO"),
+                                                  ("wg-psk", "STEER_WG_WRONG_PSK")):
+                    rotated = copy.deepcopy(rule_only)
+                    rotated["secrets"][declaration]["name"] = invalid_env
+                    assert control(ctl, "APPLY", rotated, revision)[0] == 409
+                    assert control(ctl, "GET")[1]["document"] == first and owned_state() == owned
+                changed_endpoint = copy.deepcopy(rule_only)
+                changed_endpoint["outbounds"]["vpn"]["endpoint"]["port"] = port(udp_port)
+                assert control(ctl, "APPLY", changed_endpoint, revision)[0] == 409
+                rotated = copy.deepcopy(rule_only)
+                rotated["secrets"]["wg-private"]["name"] = "STEER_WG_TWO"
+                run("wg", "set", old_device, "private-key", "/dev/stdin", input=keys[1])
+                assert control(ctl, "APPLY", rotated, revision)[0] == 409
+                run("wg", "set", old_device, "private-key", "/dev/stdin", input=keys[0])
+                run("ip", "link", "set", "dev", old_device, "mtu", "1380")
+                assert control(ctl, "APPLY", rule_only, revision)[0] == 409
+                run("ip", "link", "set", "dev", old_device, "mtu", "1420")
+                with socks(inlet("socks-wg"), target) as old:
+                    assert response(old) == 0 and line(echo) == SOURCES[0]
+                    with socket.socket() as occupied:
+                        occupied.bind(("127.0.0.1", 0))
+                        occupied.listen()
+                        failed = copy.deepcopy(rule_only)
+                        failed["inbounds"]["blocked-alias"] = copy.deepcopy(base["inbounds"]["socks-wg"])
+                        failed["inbounds"]["blocked-alias"]["listen"]["port"] = occupied.getsockname()[1]
+                        result = control(ctl, "APPLY", failed, revision)
+                        assert result[0] == 422, result
+                        assert control(ctl, "GET")[1]["document"] == first and owned_state() == owned
+                        roundtrip(old)
+                    revision = apply(ctl, rule_only, revision)
+                    assert owned_state() == owned
+                    roundtrip(old, b"rule-only apply preserves old tunnel flow")
+                    matrix("wg", DIRECT, protocols=("socks",))
+                    matrix("wg", SOURCES[0], protocols=("vless", "hysteria2"))
+                    equivalent = copy.deepcopy(first)
+                    equivalent["secrets"]["wg-private"]["name"] = "STEER_WG_SAME_KEY"
+                    revision = apply(ctl, equivalent, revision)
+                    assert owned_state() == owned
+                    roundtrip(old, b"two aliases pin the same owned device")
+                print("PASS rule-only Apply reuses the exact WG; rejects real key/endpoint changes", flush=True)
                 print("PASS one linked revision: independent SOCKS5, VLESS and upstream HY2 use WG or direct", flush=True)
 
                 with socks(inlet("socks-wg"), target) as old:
@@ -321,6 +384,34 @@ def main(binary, oracle, fault):
                     core.terminate()
                     assert core.wait(timeout=5) == 0
 
+            owned = owned_state()
+            for phase in ("before", "after"):
+                ctl, instance = start(f"alias-crash-{phase}", crash=phase)
+                with instance as core:
+                    assert ready(core)["revision"] == revision
+                    try:
+                        control(ctl, "APPLY", rule_only, revision)
+                    except (OSError, AssertionError):
+                        pass
+                    assert core.wait(timeout=5) == -signal.SIGKILL
+                ctl, instance = start(f"alias-recover-{phase}")
+                with instance as core:
+                    got = ready(core)["revision"]
+                    assert (got == revision if phase == "before" else got > revision)
+                    assert owned_state() == owned
+                    assert control(ctl, "GET")[1]["document"] == (first if phase == "before" else rule_only)
+                    matrix("wg", SOURCES[0] if phase == "before" else DIRECT, protocols=("socks",))
+                    matrix("wg", SOURCES[0], protocols=("vless", "hysteria2"))
+                    revision = got
+                    core.terminate()
+                    assert core.wait(timeout=5) == 0
+            for name, value in (("STEER_WG_ONE", keys[1].strip()), ("STEER_WG_PSK", wrong_psk)):
+                ctl, instance = start(f"changed-{name}", extra_env={name: value})
+                with instance as core:
+                    assert core.wait(timeout=5) != 0 and not ctl.exists()
+                    assert owned_state() == owned
+            print("PASS rule-only crash/restart on both sides; changed env cannot adopt the old device", flush=True)
+
             ctl, instance = start("uncertain", crash="unsynced")
             with instance as core:
                 assert ready(core)["revision"] == revision
@@ -328,7 +419,7 @@ def main(binary, oracle, fault):
                 assert code == 503 and reply["durability_uncertain"], (code, reply)
                 status = control(ctl, "STATUS")[1]
                 assert status["revision"] == revision and not status["runtimeReady"]
-                assert len(device_set()) == 2 and control(ctl, "GET")[1]["document"] == first
+                assert len(device_set()) == 2 and control(ctl, "GET")[1]["document"] == rule_only
                 assert control(ctl, "APPLY", second, revision)[0] == 503
                 with socket.create_connection(("127.0.0.1", inlet("vless-direct")), timeout=5) as s:
                     eof(s)
@@ -356,7 +447,7 @@ def main(binary, oracle, fault):
             for entry in state.rglob("*"):
                 if entry.is_file():
                     data = entry.read_bytes()
-                    assert all(k.strip().encode() not in data for k in [*keys, psk])
+                    assert all(k.strip().encode() not in data for k in [*keys, psk, wrong_psk])
             print("PASS late listener rollback, live WG drain, both crash boundaries, uncertainty fence and device loss",
                   flush=True)
 

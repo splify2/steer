@@ -62,6 +62,9 @@ void steer_draft_wg_stream_destroy(struct steer_draft_wg_stream *w){
 uint64_t steer_draft_wg_stream_generation(const struct steer_draft_wg_stream *w){
     return w?w->guard.link.generation:0;
 }
+const struct steer_draft_wg_guard_record *steer_draft_wg_stream_record(const struct steer_draft_wg_stream *w){
+    return w?&w->guard:NULL;
+}
 int steer_draft_wg_stream_contains(const struct steer_draft_wg_stream *w,const uint8_t addr[4]){
     if(!w)return 0;
     const struct awg_prefix *p=&w->route;

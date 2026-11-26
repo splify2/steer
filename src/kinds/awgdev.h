@@ -63,6 +63,9 @@ int awg_dev_link_delete_marked_until(const char *,const char *,int,const char *,
  * name/kind/index/group comparison. Never group-only delete/change. External
  * privileged mutation between query and action is not an atomic kernel CAS. */
 int awg_dev_link_query_owned_until(const char *,char *,size_t,int *,uint32_t *,uint64_t);
+/* Compare effective key material without returning it; no mutations. */
+int awg_dev_attest_single_wg_until(const char *,int,uint32_t,const struct awg_conf *,
+    const struct awg_secrets *,uint64_t);
 /* Exact RTM_GETLINK by index: zero means a link exists, ENODEV means absent. */
 int awg_dev_link_index_until(int index,uint64_t deadline);
 int awg_dev_link_create_owned_until(const char *,const char *,int,uint32_t,int *,uint64_t);
