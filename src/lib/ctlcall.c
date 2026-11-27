@@ -62,6 +62,8 @@ char *ctlcall_roundtrip(const char *line, const char *body, size_t body_n, int t
     return ctlcall_roundtrip_sent(line, body, body_n, timeout_s, NULL);
 }
 
+static char *read_reply(int s);
+
 char *ctlcall_roundtrip_sent(const char *line, const char *body, size_t body_n,
                             int timeout_s, int *sent) {
     if (sent) *sent = 0;
@@ -70,6 +72,15 @@ char *ctlcall_roundtrip_sent(const char *line, const char *body, size_t body_n,
     /* Ошибка записи не повод молчать: сервер мог отказать (тело больше предела) и закрыть
      * соединение, не читая, — его ответ всё равно лежит в сокете. */
     if (write_all(s, line, strlen(line), sent) == 0 && body_n) write_all(s, body, body_n, sent);
+    return read_reply(s);
+}
+
+char *ctlcall_exchange(int s, const char *line) {
+    if (write_all(s,line,strlen(line),NULL)) { close(s); return NULL; }
+    return read_reply(s);
+}
+
+static char *read_reply(int s) {
     size_t cap = 4096, n = 0;
     char *r = malloc(cap);
     if (!r) { close(s); return NULL; }

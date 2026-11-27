@@ -10,11 +10,15 @@ struct pm_group {
     struct group_file *v;
     size_t n;
     int preparing;
+    char owner[128];     /* offline либо identity именно соединённого ctl */
+    char config_err[65]; /* код и полные байты stderr до установки */
 };
 
+int pm_group_baseline(struct pm_group *g, struct pm_err *e);
+int pm_group_health(const struct pm_group *g, struct pm_err *e);
 int pm_group_preparing(const struct pm_group *g);
 int pm_group_publish(const struct pm_group *g);
-int pm_group_finish(const char *marker, int accept, struct pm_ctx *x);
+int pm_group_finish(const char *marker, int accept);
 int pm_group_write(const struct pm_group *g, const char *name, const char *path,
                    const char *buf, size_t n);
 int pm_state_save_group(const struct pm_state *s, const struct pm_group *g, struct pm_err *e);

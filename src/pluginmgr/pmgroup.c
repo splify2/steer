@@ -10,10 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include "pmgroup.h"
+#include "ctlcall.h"
 #include "scrypto.h"
 
 int pm_group_reader(int writer) {
@@ -45,6 +48,152 @@ int pm_group_pending(void) {
 
 static void hex(const unsigned char b[32], char s[65]) {
     for (int i = 0; i < 32; i++) sprintf(s+i*2, "%02x", b[i]);
+}
+
+/* ynode проверяет вложенность, UTF-8 и повторы ключей, но допускает YAML.
+ * Для квитанции v1 сверяем также лексемы JSON, включая тип скаляра. В этом
+ * протоколе из чисел приходят только неотрицательные целые. */
+static const char *ws(const char *s) { return s + strspn(s," \r\n\t"); }
+static const char *wire_value(const char *s, const struct ynode *v) {
+    s = ws(s);
+    if (v->kind == YN_SCALAR) {
+        if (*s == '"' && v->style == YS_DOUBLE) {
+            if (strlen(v->str) != v->len) return NULL;
+            for (s++; *s && *s != '"'; s++) {
+                if ((unsigned char)*s < 32) return NULL;
+                if (*s != '\\') continue;
+                if (!*++s) return NULL;
+                if (*s == 'u') {
+                    if (strspn(s+1,"0123456789abcdefABCDEF") < 4) return NULL;
+                    s += 4;
+                } else if (!strchr("\"\\/bfnrt",*s)) return NULL;
+            }
+            return *s ? s+1 : NULL;
+        }
+        if (v->style != YS_PLAIN) return NULL;
+        if (!strncmp(s,"true",4) || !strncmp(s,"null",4)) return s+4;
+        if (!strncmp(s,"false",5)) return s+5;
+        size_t n = strspn(s,"0123456789");
+        return n && (n == 1 || *s != '0') ? s+n : NULL;
+    }
+    int map = v->kind == YN_MAP;
+    if (*s++ != (map ? '{' : '[')) return NULL;
+    for (size_t i = 0; i < v->len; i++) {
+        if (i && *ws(s) != ',') return NULL;
+        if (i) s = ws(s)+1;
+        if (map) {
+            if (ynode_key_at(v,i)->style != YS_DOUBLE) return NULL;
+            s = wire_value(s,ynode_key_at(v,i));
+            if (!s || *ws(s) != ':') return NULL;
+            s = ws(s)+1;
+        }
+        s = wire_value(s,map ? ynode_val_at(v,i) : ynode_at(v,i));
+        if (!s) return NULL;
+    }
+    s = ws(s);
+    return *s == (map ? '}' : ']') ? s+1 : NULL;
+}
+
+enum reload_result { UNCERTAIN = -1, CONFIRMED, CONFIG_ERROR };
+
+static char *ctl_path(void) {
+    const char *path = ctlcall_socket(NULL);
+    if (*path == '/') return pm_strdup(path);
+    char *cwd = getcwd(NULL,0), *p = cwd ? pm_path(cwd,path) : NULL;
+    free(cwd);
+    return p;
+}
+
+static int reply_string(const struct ynode *map, const char *k) {
+    const struct ynode *n = ynode_get(map,k);
+    return n && n->kind == YN_SCALAR && n->style == YS_DOUBLE && n->len;
+}
+
+static int string_list(const struct ynode *map, const char *k) {
+    const struct ynode *a = ynode_get(map,k);
+    if (!a || a->kind != YN_SEQ) return 0;
+    for (size_t i = 0; i < a->len; i++)
+        if (ynode_at(a,i)->style != YS_DOUBLE) return 0;
+    return 1;
+}
+
+/* Вызывать только на fd того владельца, которого проверили. При replay не
+ * посылать даже первый байт другому слушателю. */
+static int group_reload(const char *owner, char found[128], char failure[65], struct pm_err *e) {
+    const char *path = ctlcall_socket(NULL);
+    struct stat a, b;
+    int fd = -1;
+    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) goto uncertain;
+    if (lstat(path,&a)) {
+        if (errno != ENOENT || (owner && strcmp(owner,"offline"))) goto uncertain;
+        strcpy(found,"offline");
+        return CONFIRMED;
+    }
+    if (!S_ISSOCK(a.st_mode) || (owner && !strcmp(owner,"offline"))) goto uncertain;
+    fd = ctlcall_open(300);
+    struct ucred peer;
+    socklen_t len = sizeof(peer);
+    if (fd < 0 || getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&peer,&len) || len != sizeof(peer) ||
+        peer.pid <= 0 || lstat(path,&b) || a.st_dev != b.st_dev || a.st_ino != b.st_ino) goto uncertain;
+    snprintf(found,128,"%ju:%ju:%jd:%ju",(uintmax_t)b.st_dev,(uintmax_t)b.st_ino,
+             (intmax_t)peer.pid,(uintmax_t)peer.uid);
+    if (owner && strcmp(owner,found)) goto uncertain;
+    char *reply = ctlcall_exchange(fd,"plugin-reload\n");
+    fd = -1;
+    if (!reply) goto uncertain;
+    struct ydoc *d = pm_json_parse(reply,strlen(reply),"plugin-reload",NULL);
+    const struct ynode *r = d ? ydoc_root(d) : NULL, *reload = ynode_get(r,"reload"), *changed = ynode_get(r,"changed");
+    const char *end = r ? wire_value(reply,r) : NULL, *cmd = yn_str(r,"cmd");
+    long code = yn_long(r,"code",-1);
+    int flag, trunc, rc = UNCERTAIN;
+    if (end && !*ws(end) && yn_long(r,"v",-1) == 1 && cmd && !strcmp(cmd,"plugin-reload") &&
+        !ynode_get(r,"error") && !ynode_get(r,"ok") && !ynode_bool(ynode_get(r,"enabled"),&flag) &&
+        (!ynode_get(r,"truncated") || (!ynode_bool(ynode_get(r,"truncated"),&trunc) && !trunc)) &&
+        reply_string(reload,"dnsd") && reply_string(reload,"outputs") &&
+        !ynode_bool(ynode_get(changed,"ruleset"),&flag) && !ynode_bool(ynode_get(changed,"dnsd"),&flag) &&
+        string_list(changed,"routing") && string_list(changed,"helpers")) {
+        if (!code) rc = CONFIRMED;
+        const struct ynode *err = ynode_get(r,"stderr");
+        if (code > 0 && code <= 255 && err && err->style == YS_DOUBLE && err->len && strlen(err->str) == err->len) {
+            unsigned char sum[32];
+            char *key = pm_fmt("%ld:%s",code,err->str);
+            if (!sc_hash(SC_SHA256,key,strlen(key),sum)) {
+                hex(sum,failure);
+                pm_errc(e,"plugin.reload_failed",PMA("why",err->str),"ядро не перечитало плагины: %s",err->str);
+                rc = CONFIG_ERROR;
+            }
+            free(key);
+        }
+    }
+    if (d) ydoc_free(d);
+    free(reply);
+    if (rc != UNCERTAIN) return rc;
+uncertain:
+    if (fd >= 0) close(fd);
+    return pm_errc(e,"plugin.group_reload_unconfirmed",NULL,"нет подтверждённого ответа владельца ctl на plugin-reload");
+}
+
+/* Штатная повторная подготовка спеки — только после полученного отказа,
+ * повтор на том же владельце. Обрыв транспорта не является config-error. */
+static int reload_checked(const char *owner, char found[128], char failure[65], struct pm_err *e) {
+    int rc = group_reload(owner,found,failure,e);
+    if (rc != CONFIG_ERROR || !strstr(e->msg,"нужен reload")) return rc;
+    char retry[128];
+    return group_reload(found,retry,failure,e);
+}
+
+int pm_group_baseline(struct pm_group *g, struct pm_err *e) {
+    char failure[65];
+    int rc = reload_checked(NULL,g->owner,failure,e);
+    if (rc == CONFIG_ERROR) strcpy(g->config_err,failure);
+    return rc == UNCERTAIN ? -1 : 0;
+}
+
+int pm_group_health(const struct pm_group *g, struct pm_err *e) {
+    char found[128], failure[65];
+    int rc = reload_checked(g->owner,found,failure,e);
+    if (rc == CONFIG_ERROR && !strcmp(g->config_err,failure)) return 0;
+    return rc == CONFIRMED ? 0 : -1;
 }
 
 static int by_name(const struct dirent **a, const struct dirent **b) {
@@ -231,9 +380,12 @@ int pm_group_publish(const struct pm_group *g) {
     FILE *f = open_memstream(&buf, &n);
     if (!f) return -1;
     struct jw w; jw_init(&w, f); jw_obj(&w);
+    char *ctl = ctl_path();
+    jw_kstr(&w,"ctl_path",ctl);
+    jw_kstr(&w,"ctl_owner",g->owner);
     char *sp = pm_state_path();
-    int bad = save_file(&w, g->dir, "registry", sp) || save_file(&w, g->dir, "keep", pm_keepd());
-    free(sp);
+    int bad = !ctl || save_file(&w, g->dir, "registry", sp) || save_file(&w, g->dir, "keep", pm_keepd());
+    free(ctl); free(sp);
     jw_key(&w, "members"); jw_obj(&w);
     for (size_t i = 0; !bad && i < g->n; i++) {
         const char *id = g->v[i].id;
@@ -281,7 +433,7 @@ out:
     free(live); free(old); free(next); return rc;
 }
 
-int pm_group_finish(const char *marker, int accept, struct pm_ctx *x) {
+int pm_group_finish(const char *marker, int accept) {
     size_t n; char *record = pm_read(marker, &n);
     char phase[12], sum[65], hash[65]; int end = -1, rc = -1;
     uintmax_t dev, ino;
@@ -305,14 +457,21 @@ int pm_group_finish(const char *marker, int accept, struct pm_ctx *x) {
         struct pm_err why = {0};
         if (digest(plan,hash) || strcmp(hash,sum) || !(d = pm_json_load(plan,&why))) goto out;
         const struct ynode *root = ydoc_root(d), *rows = ynode_get(root,"members");
-        if (!rows || rows->kind != YN_MAP || rows->len < 2 ||
+        const char *owner = yn_str(root,"ctl_owner"), *path = yn_str(root,"ctl_path");
+        if (!owner || !*owner || !path || !rows || rows->kind != YN_MAP || rows->len < 2 ||
             metadata(root,dir,"registry",sp,0,accept) || metadata(root,dir,"keep",pm_keepd(),0,accept)) goto out;
         /* Проверить ВСЮ группу до первого обратного rename. */
         for (int pass = 0; pass < (accept ? 1 : 2); pass++)
             for (size_t i = rows->len; i-- > 0;)
                 if (member(dir,ynode_key_at(rows,i)->str,ynode_val_at(rows,i),pass,accept)) goto out;
-        if (!accept && (metadata(root,dir,"registry",sp,1,0) || metadata(root,dir,"keep",pm_keepd(),1,0) ||
-                        pm_daemon_reload(x,&why))) goto out;
+        if (!accept) {
+            char found[128], failure[65];
+            char *ctl = ctl_path();
+            int same = ctl && !strcmp(path,ctl);
+            free(ctl);
+            if (metadata(root,dir,"registry",sp,1,0) || metadata(root,dir,"keep",pm_keepd(),1,0) ||
+                !same || reload_checked(owner,found,failure,&why) != CONFIRMED) goto out;
+        }
         if (mark(marker,"finished",dir,sum,dev,ino)) goto out;
     }
     /* После решения даже частично удалённый каталог журнала — только мусор. */

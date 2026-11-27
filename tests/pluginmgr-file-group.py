@@ -11,6 +11,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 import socketserver
 import shutil
 from contextlib import contextmanager
@@ -81,22 +82,57 @@ def observer(path, journal):
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
             line = self.rfile.readline().split()
+            if not line:
+                return
             code = 0
             if line[0] == b"plugin-event":
                 d = json.loads(self.rfile.read(int(line[1])))
                 server.events.append((d["id"], d["version"], journal.exists()))
             if line[0] == b"plugin-reload":
                 server.reloads += 1
+                server.observed.append(tuple(
+                    json.loads(p.read_bytes())["version"] if p.exists() else None
+                    for p in (journal.parent/i/"plugin.json" for i in IDS)))
                 if server.reloads == server.reject:
                     code = 1
                 if server.reloads == server.pause:
                     server.at_health.set()
                     server.resume.wait(timeout=5)
-            self.wfile.write(json.dumps(dict(code=code, stdout="{}", stderr="fixture health" if code else ""))
-                             .encode() + b"\n")
+                reply = dict(v=1,cmd="plugin-reload",code=code,enabled=True,
+                             reload=dict(dnsd="none",outputs="none"),
+                             changed=dict(ruleset=False,routing=[],helpers=[],dnsd=False))
+                if code:
+                    reply.update(stderr="fixture health")
+                mode = server.replies.get(server.reloads)
+                if mode == "lost":
+                    return  # запрос прочитан, listener остаётся на месте
+                if mode == "partial":
+                    self.wfile.write(json.dumps(reply).encode())  # EOF без LF
+                    return
+                if mode == "unknown":
+                    reply = dict(v=1,error="unknown-command",code="ctl.unknown_command")
+                if mode == "bare":
+                    reply = dict(code=0)
+                if mode == "wrong":
+                    reply.update(cmd="status")
+                if mode == "truncated":
+                    reply.update(truncated=True)
+                if mode == "incomplete":
+                    del reply["changed"]
+                if mode == "malformed":
+                    self.wfile.write(json.dumps(reply).encode()[:-1]+b",}\n")
+                    return
+                if mode == "config":
+                    reply.update(code=1,stderr="invalid fixture spec")
+                if mode == "changed-error":
+                    reply.update(code=2,stderr="invalid fixture spec")
+            else:
+                reply = dict(code=0,stdout="{}")
+            self.wfile.write(json.dumps(reply).encode()+b"\n")
     with socketserver.UnixStreamServer(str(path), Handler) as server:
         server.reloads = server.reject = server.pause = 0
         server.events = []
+        server.replies, server.observed = {}, []
         server.at_health, server.resume = threading.Event(), threading.Event()
         t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
         t.start()
@@ -161,6 +197,112 @@ def scenario(work, case):
         platform.parent.mkdir(exist_ok=True)
         platform.write_bytes(b"owned by platform\n")
         ctl.events.clear()
+        start = ctl.reloads
+        ctl.observed.clear()
+        def readback(v):
+            for action in ("status","list"):
+                assert {p["id"]:p["version"] for p in cmd(action)["plugins"]} == {i:v for i in IDS}
+                contents(v)
+            assert not marker.exists() and not list(tree.glob(".group-*"))
+
+        if case == "real-ctl":
+            path = work/"daemon.sock"
+            env.update(STEER_SOCKET=str(path), STEER_CTL_ENABLED="0", STEER_PLUGIN_AUTO="0",
+                       STEER_PLUGINS_ROOT=str(tree), STEER_PLUGINS_ETC=str(state.parent))
+            (work/"spec").write_text("version: 2\noutputs:\n  d: { kind: direct }\n")
+            (work/"daemon-state").mkdir()
+            with subprocess.Popen([BIN,"daemon","--socket",path,"--allow-uid",str(os.getuid()),
+                                   "--spec",work/"spec","--state-dir",work/"daemon-state"],
+                                  env=env,stderr=subprocess.PIPE) as p:
+                try:
+                    for _ in range(100):
+                        if path.is_socket() or p.poll() is not None:
+                            break
+                        time.sleep(.02)
+                    assert path.is_socket(), p.poll()
+                    cmd(*args(NEW))
+                    readback(NEW)
+                finally:
+                    p.terminate()
+                    p.communicate(timeout=5)
+            record(case=case,versions=[NEW,NEW])
+            return
+        if case.startswith(("pre:","post:")) or case in ("config","config-changed","config-lost","rollback-lost"):
+            mode = case.partition(":")[2]
+            post = not case.startswith("pre:")
+            ctl.replies[start + (2 if post else 1)] = mode
+            if case.startswith("config"):
+                ctl.replies.update({start+1:"config",start+2:{"config":"config","config-lost":"lost",
+                                                             "config-changed":"changed-error"}[case]})
+            if case == "rollback-lost":
+                ctl.replies.update({start+2:"lost",start+3:"partial",start+4:"unknown"})
+            code = ("plugin.install_degraded" if case == "rollback-lost" else
+                    "plugin.group_health_failed" if case == "config-changed" else "plugin.group_reload_unconfirmed")
+            rc = int(case != "config")
+            result = cmd(*args(NEW),rc=rc,fault="publish" if not post else "")
+            if rc:
+                assert result["code"] == code
+            for path,_ in packs.values():
+                path.unlink()
+            if case == "rollback-lost":
+                assert marker.exists() and cmd("status",rc=1)["code"] == "plugin.install_degraded"
+                assert marker.exists()
+            readback(OLD if rc else NEW)
+            if rc and case != "config-changed":
+                assert before == [state.read_bytes(),keep.read_bytes()]
+            assert ctl.events == ([] if rc else [(i,NEW,False) for i in IDS])
+            expected = [(OLD,OLD)] + ([(NEW,NEW)] if post else [])
+            if post and rc:
+                expected.extend([(OLD,OLD)]*(3 if case == "rollback-lost" else 1))
+            assert ctl.observed == expected, ctl.observed
+            record(case=case,code=result.get("code"),observed=ctl.observed,events=ctl.events)
+            return
+        if case in ("offline","owner-running","owner-starting","stale","replay-owner"):
+            path = work/"ctl"
+            if case == "replay-owner":
+                cmd(*args(NEW),fault="state2",rc=-signal.SIGKILL)
+                for archive,_ in packs.values():
+                    archive.unlink()
+            path.rename(work/"original")
+            if case == "replay-owner":
+                for _ in range(2):
+                    assert cmd("status",rc=1)["code"] == "plugin.install_degraded" and marker.exists()
+                    contents(OLD)
+                with observer(path,marker) as other:
+                    assert cmd("list",rc=1)["code"] == "plugin.install_degraded" and marker.exists()
+                    env["STEER_SOCKET"] = str(work/"original")
+                    assert cmd("list",rc=1)["code"] == "plugin.install_degraded" and marker.exists()
+                    env["STEER_SOCKET"] = str(path)
+                    assert not other.observed and not other.events
+                path.unlink()
+                assert ctl.observed == [(OLD,OLD)]
+            elif case == "stale":
+                with socket.socket(socket.AF_UNIX) as sock:
+                    sock.bind(str(path))
+                assert cmd(*args(NEW),rc=1)["code"] == "plugin.group_reload_unconfirmed"
+                path.unlink()
+            else:
+                init = work/"initd"
+                init.write_text("#!/bin/sh\n[ \"$1\" = running ] || exit 9\nexit "+
+                                ("0\n" if case == "owner-running" else "1\n"))
+                if case == "owner-starting":
+                    init.write_text('#!/bin/sh\n[ "$1" = running ] || exit 9\n'
+                                    '[ -f "$HOME/started" ] && exit 0\ntouch "$HOME/started"\nexit 1\n')
+                init.chmod(0o755)
+                env["STEER_PLUGIN_INITD"] = str(init)
+                rc = int(case != "offline")
+                result = cmd(*args(NEW),rc=rc)
+                if rc:
+                    assert result["code"] == "plugin.group_reload_unconfirmed"
+            (work/"original").rename(path)
+            readback(NEW if case == "offline" else OLD)
+            assert not ctl.events
+            if case != "offline":
+                assert before == [state.read_bytes(),keep.read_bytes()]
+            if case == "replay-owner":
+                assert ctl.observed == [(OLD,OLD)]*2
+            record(case=case,observed=ctl.observed,events=ctl.events)
+            return
         if case == "hook":
             cmd(*args(NEW,"2.0.2"))
             assert not marker.exists() and not list(tree.glob(".group-*"))
@@ -283,7 +425,11 @@ if __name__ == "__main__":
     assert os.getpid() == 1 and os.getuid() == 65534 and socket.if_nameindex() == [(1, "lo")]
     for case in ("success","refusal","health","duplicate","hook","state1","state2","replay","decision",
                  "absent","mixed","damaged","foreign-keep","missing-marker","preparing","publish","gc",
-                 "error:publish","error:state2","error:keep","error:place","error:decision"):
+                 "error:publish","error:state2","error:keep","error:place","error:decision",
+                 "pre:lost","pre:partial","pre:bare","post:lost","post:partial","post:unknown",
+                 "post:wrong","post:bare","post:truncated","post:incomplete","post:malformed",
+                 "config","config-changed","config-lost","rollback-lost","replay-owner","offline",
+                 "owner-running","owner-starting","stale","real-ctl"):
         with tempfile.TemporaryDirectory() as tmp:
             scenario(Path(tmp),case)
     with tempfile.TemporaryDirectory() as tmp:

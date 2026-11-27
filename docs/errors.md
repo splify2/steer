@@ -336,6 +336,7 @@
 | `plugin.file_unreadable` | `path`, `why` | {path} не читается: {why} |
 | `plugin.files_missing` | `id` | файлов плагина {id} нет — поставьте его заново |
 | `plugin.group_health_failed` | `why` | группа плагинов не прошла проверку здоровья: {why} — возвращены прежние версии |
+| `plugin.group_reload_unconfirmed` | — | не подтверждён `plugin-reload` файловой группы или остановка службы при отсутствующем ctl |
 | `plugin.health_failed` | `id`, `version`, `why` | {id} {version} не прошёл проверку здоровья: {why} |
 | `plugin.health_failed_restored` | `id`, `version`, `why` | {id} {version} не прошёл проверку здоровья: {why} — возвращена прежняя версия |
 | `plugin.incompatible` | `id`, `version` | {id} {version} несовместим |

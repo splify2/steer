@@ -34,6 +34,8 @@ const char *ctlcall_socket(const char *path);
 
 /* Соединиться (срок чтения timeout_s; 0 — без срока). -1 — нет. */
 int ctlcall_open(int timeout_s);
+/* Запрос по уже проверенному соединению; принимает владение fd и закрывает его. */
+char *ctlcall_exchange(int fd, const char *line);
 
 /* Один запрос — один ответ: строка JSON до '\n' (malloc; без '\n'). NULL — соединения нет или
  * ответ не пришёл за срок. */

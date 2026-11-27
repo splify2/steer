@@ -1815,7 +1815,19 @@ static void undo_apply(struct pm_ctx *x, struct undo *u, const char *why) {
     free(bad_why);
 }
 
-/* Одна проверка здоровья на всю группу. 0 — здорова (прежние каталоги убраны); -1 — всё откатано, причина в e. */
+static int group_service_offline(const struct pm_group *g, struct pm_err *e) {
+    if (strcmp(g->owner,"offline")) return 0;
+    const char *init = getenv("STEER_PLUGIN_INITD");
+    if (!init) init = "/etc/init.d/steer";
+    if (!*init || (access(init,F_OK) && errno == ENOENT)) return 0;
+    /* Для имеющегося init.d только ответ «остановлена» (1) подтверждает
+     * отсутствие ожидаемого владельца. Не звать init.d при replay. */
+    char *argv[] = {(char *)init,"running",NULL};
+    return run_prog(argv,NULL,NULL,NULL,30) == 1 ? 0 :
+        pm_errc(e,"plugin.group_reload_unconfirmed",NULL,"нет ctl и не подтверждена остановка службы");
+}
+
+/* У журнальной группы решение и уборку делает finish_files после этой проверки. */
 static int group_finish(struct pm_ctx *x, int before_bad, const char *before_msg, struct pm_err *e) {
     struct undo *u = x->undo;
     size_t n = x->nundo;
@@ -1823,6 +1835,15 @@ static int group_finish(struct pm_ctx *x, int before_bad, const char *before_msg
     int healthy = 1;
     int active = 0;
     for (size_t i = 0; i < n; i++) if (!u[i].was_disabled) active = 1;
+    if (x->file_group) {
+        /* У файлового подмножества нет видов с выходами для wait_outs. */
+        if (group_service_offline(x->file_group,e)) return -1;
+        if (strcmp(x->file_group->owner,"offline")) pm_progress(x,"проверка здоровья группы (%zu)",n);
+        if (!pm_group_health(x->file_group,&he)) return 0;
+        if (strcmp(he.code,"plugin.reload_failed")) return pm_errcopy(e,&he);
+        return pm_errc(e,"plugin.group_health_failed",PMA("why",he.msg),
+                       "группа плагинов не прошла проверку здоровья: %s",he.msg);
+    }
     if (active && !x->no_daemon) {
         pm_progress(x, "проверка здоровья группы (%zu)", n);
         if (pm_daemon_reload(x, &he) != 0) {
@@ -1834,19 +1855,10 @@ static int group_finish(struct pm_ctx *x, int before_bad, const char *before_msg
             else if (!abi_blame_others(x, gids, n, he.msg)) healthy = 0;
             free(gids);
         }
-        if (x->file_group && x->no_daemon) {
-            healthy = 0;
-            pm_errf(&he,"демон пропал до проверки здоровья группы");
-        }
         for (size_t i = 0; healthy && i < n; i++)
             if (!u[i].was_disabled && wait_outs(x, &u[i].before, u[i].timeout_s, &he) != 0) healthy = 0;
     }
     struct pm_err se = {0};
-    if (x->file_group) {
-        if (healthy) return 0;
-        return pm_errc(e, "plugin.group_health_failed", PMA("why", he.msg),
-                       "группа плагинов не прошла проверку здоровья: %s", he.msg);
-    }
     if (healthy) {
         for (size_t i = 0; i < n; i++) pm_rmrf(u[i].prev);
         return 0;
@@ -2006,7 +2018,7 @@ int pm_install_recover(struct pm_ctx *x, struct pm_err *e) {
     struct stat st;
     char *record = lstat(marker, &st) == 0 && S_ISREG(st.st_mode) ? pm_read(marker, &n) : NULL;
     if (!pm_managed() && record && !strncmp(record, "G1 ", 3)) {
-        int r = pm_group_finish(marker, 0, x);
+        int r = pm_group_finish(marker, 0);
         free(record); free(marker);
         return r; /* pm_install_pending уже выставил install_degraded */
     }
@@ -2620,7 +2632,9 @@ static int prepare_files(struct pm_ctx *x, struct pm_group *g, const char **ord,
         if (replay_dir(prev) != 0) { install_degraded(e,prev); free(prev); goto out; }
         free(prev);
     }
-    if (pm_group_publish(g)) pm_errc(e,"plugin.write_failed",NULL,"не сохранить исходное состояние группы");
+    struct pm_err baseline = {0};
+    if (pm_group_baseline(g,&baseline) || group_service_offline(g,&baseline)) *e = baseline;
+    else if (pm_group_publish(g)) pm_errc(e,"plugin.write_failed",NULL,"не сохранить исходное состояние группы");
     else rc = 1;
 out:
     pm_keys_free(&ks);
@@ -2654,7 +2668,7 @@ static int finish_files(struct pm_ctx *x, int rc, struct pm_result *res, struct 
     if (!rc) rc = group_finish(x,x->before_bad,x->before_err.msg,e);
     char *marker = install_marker();
     /* При ошибке commit не угадывать фазу и не пытаться выполнить другой исход. */
-    if (pm_group_finish(marker,!rc,x)) {
+    if (pm_group_finish(marker,!rc)) {
         x->install_degraded = 1;
         rc = install_degraded(e,marker);
     } else if (!rc) {
@@ -2665,7 +2679,8 @@ static int finish_files(struct pm_ctx *x, int rc, struct pm_result *res, struct 
                      p->version,p->old,NULL);
         }
     } else if (res->n && strcmp(e->code,"plugin.write_failed") && strcmp(e->code,"plugin.place_failed") &&
-               strcmp(e->code,"plugin.prev_move_failed") && strcmp(e->code,"plugin.install_degraded")) {
+               strcmp(e->code,"plugin.prev_move_failed") && strcmp(e->code,"plugin.install_degraded") &&
+               strcmp(e->code,"plugin.group_reload_unconfirmed")) {
         /* Только штатный отказ живой установки помечает версии, не replay. */
         if (pm_group_bad_versions(res,e->msg))
             pm_errc(e,"plugin.write_failed",NULL,"группа восстановлена, не записать bad_versions");
@@ -2705,13 +2720,16 @@ static int install_files(struct pm_ctx *x, const char *const *files, size_t n, c
             if (prep > 0) x->file_group = &g;
             else if (g.preparing) {
                 char *marker = install_marker();
-                if (pm_group_finish(marker,0,x)) { x->install_degraded = 1; rc = install_degraded(e,marker); }
+                if (pm_group_finish(marker,0)) { x->install_degraded = 1; rc = install_degraded(e,marker); }
                 free(marker);
             } else if (g.dir) pm_rmrf(g.dir); /* пустой каталог до маркера */
             if (!prep) { close(gate); gate = -1; }
         }
     }
-    if (!rc && n > 1) group_begin(x);
+    if (x->file_group) {
+        x->defer = 1;
+        x->no_daemon = !strcmp(g.owner,"offline");
+    } else if (!rc && n > 1) group_begin(x);
     for (size_t i = 0; i < n && rc == 0; i++) {
         struct src s = { NULL, ord[i], o->unsigned_ok, NULL };
         if (install_one(x, &s, NULL, res, e) != 0) rc = -1;
