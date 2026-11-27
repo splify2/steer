@@ -7,6 +7,7 @@
 #include "dnsd_int.h"
 #include "tabfmt.h"
 #include <errno.h>
+#include <limits.h>
 
 /* ---- сборка: демон и `steer dnsd-table --spec` ------------------------------------------- */
 
@@ -98,20 +99,31 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
 
 /* ---- разбор: резолвер (--table-fd) --------------------------------------------------------- */
 
-/* Освободить всё, чем СЕЙЧАС владеет g_dch: набор правил (загружает reload_rules, proxy.c,
- * не эта функция) и пути его файлов, которые в режиме --table-fd всегда strdup'нуты прежним
- * вызовом tabfmt_parse (первым — нечего освобождать, g_dch тогда ещё в нулях BSS, free(NULL)
- * от этого не портится). */
-static void tabfmt_release_current(void) {
-    for (size_t i = 0; i < g_dch_n; i++) {
-        ruleset_free(&g_dch[i].rules);
-        dch_parts_free(g_dch[i].parts, g_dch[i].parts_n);
-        for (size_t k = 0; k < g_dch[i].rules_n; k++)
-            free((char *)g_dch[i].rules_path[k]);
-        free(g_dch[i].rules_path);
+/* В режиме --table-fd пути и настройки апстримов принадлежат снимку. */
+struct tabfmt_snapshot {
+    struct dchan *dch;
+    size_t n, cap;
+    struct dup_cfg *dup;
+    size_t dup_n, dup_cap;
+    unsigned other;
+    struct dcache_cfg cache;
+};
+
+static void snapshot_free(struct tabfmt_snapshot *s) {
+    for (size_t i = 0; i < s->n; i++) {
+        struct dchan *d = &s->dch[i];
+        ruleset_free(&d->rules);
+        dch_parts_free(d->parts, d->parts_n);
+        for (size_t k = 0; k < d->rules_n; k++) free((char *)d->rules_path[k]);
+        free(d->rules_path);
     }
-    if (g_dch) memset(g_dch, 0, g_dch_n * sizeof(*g_dch));
-    g_dch_n = 0;
+    free(s->dch);
+    for (size_t i = 0; i < s->dup_n; i++) {
+        if (s->dup[i].own) { free(s->dup[i].u.ips); free(s->dup[i].u.boot); }
+        free(s->dup[i].gm);
+    }
+    free(s->dup);
+    memset(s, 0, sizeof(*s));
 }
 
 /* Индекс первого '\n' в buf[from, len), или len — «не нашли» (len сам никогда не индекс
@@ -193,13 +205,15 @@ static int parse_chan_line(const char *buf, size_t from, size_t line_end, struct
 static int parse_header(const char *buf, size_t nl, long *want, long *upn, struct dcache_cfg *cc,
                         long *other) {
     char h[96];
+    if (nl >= sizeof(h)) return -1;
     field_copy(h, sizeof(h), buf, nl);
     char *end = NULL;
+    errno = 0;
     long n = strtol(h, &end, 10);
     *upn = 0;
     *other = 0;
     memset(cc, 0, sizeof(*cc));
-    if (end == h || n < 0) return -1;       /* число каналов ничем, кроме памяти, не ограничено */
+    if (errno == ERANGE || end == h || n < 0 || n > TABFMT_FEED_MAX) return -1;
     *want = n;
     if (*end == '\0') return 0;
     if (*end != ' ') return -1;
@@ -213,7 +227,7 @@ static int parse_header(const char *buf, size_t nl, long *want, long *upn, struc
     } else if (end[1 + used] != '\0') {
         return -1;
     }
-    if (u < 0 || e < 0 || e > 1000000 || mn < 0 || mx < 0 || ng < 0) return -1;
+    if (u < 0 || u > TABFMT_FEED_MAX || e < 0 || e > 1000000 || mn < 0 || mx < 0 || ng < 0) return -1;
     *upn = u;
     *other = ot;
     cc->entries = e; cc->ttl_min = mn; cc->ttl_max = mx; cc->ttl_neg = ng;
@@ -320,16 +334,14 @@ static int parse_up_line(const char *buf, size_t from, size_t end, struct dup_cf
     return 0;
 }
 
-int tabfmt_parse(const char *buf, size_t len) {
+static int tabfmt_parse_inner(const char *buf, size_t len, struct tabfmt_snapshot *s) {
     size_t nl = find_nl(buf, len, 0);
     if (nl >= len) return -1; /* нет даже строки-счётчика */
     long want, upn, other;
     struct dcache_cfg cc;
     if (parse_header(buf, nl, &want, &upn, &cc, &other) != 0) return -1;
 
-    tabfmt_release_current();
-    dup_cfg_list_reset();
-    g_dcache_cfg = cc;
+    s->cache = cc;
 
     size_t out_n = 0;
     size_t pos = nl + 1;
@@ -338,56 +350,107 @@ int tabfmt_parse(const char *buf, size_t len) {
         if (line_end >= len) return -1; /* обещали want строк, а текст кончился раньше */
         struct dchan tmp;
         char family[8];
-        if (parse_chan_line(buf, pos, line_end, &tmp, family, sizeof(family)) != 0) return -1;
+        if (parse_chan_line(buf, pos, line_end, &tmp, family, sizeof(family)) != 0) {
+            for (size_t k = 0; k < tmp.rules_n; k++) free((char *)tmp.rules_path[k]);
+            free(tmp.rules_path);
+            return -1;
+        }
         /* family — «4», «6» или «46» (1.9, IPv6): DCH_V6 — у канала есть парный набор «<set>6»,
          * и на AAAA его имён резолвер отвечает адресом (fake-IP v6 или настоящим) вместо
          * пустого ответа. Канал «6» (без IPv4) принимается так же: A его имён он не забирает
          * (proxy.c, match_for). */
         int has4 = !strcmp(family, "4") || !strcmp(family, "46");
         int has6 = !strcmp(family, "6") || !strcmp(family, "46");
-        if (!has4 && !has6) return -1; /* не «4», не «6», не «46» — испорченный текст */
+        if (!has4 && !has6) {
+            for (size_t k = 0; k < tmp.rules_n; k++) free((char *)tmp.rules_path[k]);
+            free(tmp.rules_path);
+            return -1;
+        }
         tmp.fam = (has4 ? DCH_V4 : 0) | (has6 ? DCH_V6 : 0);
-        struct dchan *nd = dch_new();
-        if (!nd) return -1;
+        if (s->n == s->cap) {
+            size_t nc = s->cap ? s->cap * 2 : 16;
+            struct dchan *p = realloc(s->dch, nc * sizeof(*p));
+            if (p) { s->dch = p; s->cap = nc; }
+        }
+        struct dchan *nd = s->n < s->cap ? &s->dch[s->n] : NULL;
+        if (!nd) {
+            for (size_t k = 0; k < tmp.rules_n; k++) free((char *)tmp.rules_path[k]);
+            free(tmp.rules_path);
+            return -1;
+        }
         *nd = tmp;
-        g_dch_n = ++out_n;
+        s->n = ++out_n;
         pos = line_end + 1;
     }
-    g_dch_n = out_n;
+    s->n = out_n;
     for (long i = 0; i < upn; i++) {
         size_t line_end = find_nl(buf, len, pos);
         if (line_end >= len) return -1;
-        if (g_dup_cfg_n == g_dup_cfg_cap) {
-            size_t nc = g_dup_cfg_cap ? g_dup_cfg_cap * 2 : 8;
-            struct dup_cfg *np = realloc(g_dup_cfg, nc * sizeof(*np));
+        if (s->dup_n == s->dup_cap) {
+            size_t nc = s->dup_cap ? s->dup_cap * 2 : 8;
+            struct dup_cfg *np = realloc(s->dup, nc * sizeof(*np));
             if (!np) return -1;
-            g_dup_cfg = np;
-            g_dup_cfg_cap = nc;
+            s->dup = np;
+            s->dup_cap = nc;
         }
-        if (parse_up_line(buf, pos, line_end, &g_dup_cfg[g_dup_cfg_n]) != 0) return -1;
-        g_dup_cfg_n++;
+        if (parse_up_line(buf, pos, line_end, &s->dup[s->dup_n]) != 0) return -1;
+        s->dup_n++;
         pos = line_end + 1;
     }
     /* Канал, чей апстрим в таблице не назван, спрашивает прежним путём. */
-    for (size_t i = 0; i < g_dch_n; i++)
-        if (g_dch[i].up < 0 || (size_t)g_dch[i].up > g_dup_cfg_n) g_dch[i].up = 0;
+    for (size_t i = 0; i < s->n; i++)
+        if (s->dch[i].up < 0 || (size_t)s->dch[i].up > s->dup_n) s->dch[i].up = 0;
     /* Член группы — сервер этой же таблицы, не группа: иначе он из группы выпадает. */
-    for (size_t i = 0; i < g_dup_cfg_n; i++) {
-        struct dup_cfg *c = &g_dup_cfg[i];
+    for (size_t i = 0; i < s->dup_n; i++) {
+        struct dup_cfg *c = &s->dup[i];
         size_t k = 0;
         for (size_t j = 0; j < c->gm_n; j++)
-            if (c->gm[j] < g_dup_cfg_n && c->gm[j] != i && !g_dup_cfg[c->gm[j]].grp) c->gm[k++] = c->gm[j];
+            if (c->gm[j] < s->dup_n && c->gm[j] != i && !s->dup[c->gm[j]].grp) c->gm[k++] = c->gm[j];
         c->gm_n = k;
     }
-    g_dup_other = (unsigned)other;
+    s->other = (unsigned)other;
     return 0;
+}
+
+static int tabfmt_apply(const char *buf, size_t len, int load) {
+    struct tabfmt_snapshot fresh = {0};
+    if (tabfmt_parse_inner(buf, len, &fresh) != 0) {
+        snapshot_free(&fresh);
+        return -1;
+    }
+    if (load) {
+        for (size_t i = 0; i < fresh.n; i++) {
+            struct dchan *d = &fresh.dch[i];
+            if (dch_rules_load(d, &d->rules, &d->parts, &d->parts_n, &d->composite)) {
+                snapshot_free(&fresh);
+                return -1;
+            }
+        }
+    }
+    struct tabfmt_snapshot old = { g_dch, g_dch_n, g_dch_cap, g_dup_cfg,
+                                   g_dup_cfg_n, g_dup_cfg_cap, g_dup_other, g_dcache_cfg };
+    g_dch = fresh.dch; g_dch_n = fresh.n; g_dch_cap = fresh.cap;
+    g_dup_cfg = fresh.dup; g_dup_cfg_n = fresh.dup_n; g_dup_cfg_cap = fresh.dup_cap;
+    g_dup_other = fresh.other; g_dcache_cfg = fresh.cache;
+    snapshot_free(&old);
+    return 0;
+}
+
+int tabfmt_parse(const char *buf, size_t len) {
+    return tabfmt_apply(buf, len, 0);
 }
 
 /* ---- приёмник из трубы: буферизация между вызовами epoll ---------------------------------- */
 
+void tabfmt_feed_reset(struct tabfmt_feed *st) {
+    st->len = 0;
+    st->scan_pos = 0;
+    st->scan_lines = 0;
+}
+
 int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
     if (n) {
-        if (st->len + n > TABFMT_FEED_MAX) return -1;
+        if (n > TABFMT_FEED_MAX - st->len) return -1;
         if (st->len + n > st->cap) {
             size_t nc = st->cap ? st->cap : 16384;
             while (nc < st->len + n) nc *= 2;
@@ -405,6 +468,7 @@ int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
     long want, upn, other;
     struct dcache_cfg cc;
     if (parse_header(st->buf, nl, &want, &upn, &cc, &other) != 0) return -1;
+    if (want > LONG_MAX - upn) return -1;
     want += upn;                 /* строки каналов и строки апстримов идут подряд */
 
     size_t pos = st->scan_pos ? st->scan_pos : nl + 1;
@@ -420,10 +484,11 @@ int tabfmt_feed(struct tabfmt_feed *st, const char *data, size_t n) {
     st->scan_pos = 0;
     /* pos — конец РОВНО ОДНОЙ таблицы: столько и передаётся в tabfmt_parse, остаток (начало
      * следующей, если демон прислал две таблицы одной записью в трубу) остаётся в буфере. */
-    if (tabfmt_parse(st->buf, pos) != 0) return -1;
+    int rc = tabfmt_apply(st->buf, pos, st->load_rules);
+    if (rc && !st->load_rules) return -1;
     memmove(st->buf, st->buf + pos, st->len - pos);
     st->len -= pos;
-    return 1;
+    return rc ? 2 : 1;
 }
 
 int tabfmt_read_first(int fd, struct tabfmt_feed *st) {
@@ -441,7 +506,8 @@ int tabfmt_read_first(int fd, struct tabfmt_feed *st) {
         if (r == 0) return -1; /* труба закрылась раньше первой таблицы — демон умер */
         int rc = tabfmt_feed(st, chunk, (size_t)r);
         if (rc < 0) return -1;
-        if (rc > 0) return 0; /* первая таблица разобрана; хвост (если демон прислал вторую
+        if (rc == 2) return -1;
+        if (rc == 1) return 0; /* первая таблица разобрана; хвост (если демон прислал вторую
                                 * следом же записью) остался в st — его доберёт та же tabfmt_feed
                                 * из цикла epoll, без потери байт */
     }

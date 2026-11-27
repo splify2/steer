@@ -63,6 +63,97 @@ static void check_str(const char *what, const char *want, const char *got) {
     if (!ok) { fails++; printf("     хочу: %s\n     есть: %s\n", want, got); }
 }
 
+/* EOF посреди таблицы, затем adoption. Только анонимные трубы и epoll, без запуска DNS. */
+static void check_table_adoption(void) {
+    static const char good[] = "1\nlast_good|out|0|4|old\n";
+    static const char unfinished[] = "2\nx|out|0|4|x\n";
+    static const char next[] = "1\nnew_set|out|0|4|new";
+    int old_pipe[2], new_pipe[2];
+    long waited;
+    g_epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (g_epfd < 0 || pipe(old_pipe) != 0 || pipe(new_pipe) != 0) {
+        perror("epoll/pipe");
+        exit(2);
+    }
+    g_adopt_fd = g_epfd;  /* Для table_pipe_lost: adoption доступен, выходить на EOF не надо. */
+    if (tabfmt_parse(good, sizeof(good) - 1) != 0 ||
+        table_pipe_take(old_pipe[0], &waited) != 0 ||
+        write(old_pipe[1], unfinished, sizeof(unfinished) - 1) != (ssize_t)(sizeof(unfinished) - 1)) {
+        fputs("не удалось подготовить трубы таблиц\n", stderr);
+        exit(2);
+    }
+    close(old_pipe[1]);
+    if (table_pipe_take(new_pipe[0], &waited) != 0) {
+        fputs("не удалось принять новую трубу таблицы\n", stderr);
+        exit(2);
+    }
+    check("adoption: обрыв не заменил последнюю полную таблицу", 1,
+          g_dch_n == 1 && !strcmp(g_dch[0].set, "last_good"));
+    check("adoption: первая часть новой таблицы ждёт конца строки", 0,
+          tabfmt_feed(&g_table_feed, next, sizeof(next) - 1));
+    check("adoption: до конца новой таблицы действует прежняя", 1,
+          g_dch_n == 1 && !strcmp(g_dch[0].set, "last_good"));
+    check("adoption: новая таблица принята после конца строки", 1,
+          tabfmt_feed(&g_table_feed, "\n", 1));
+    check("adoption: действует новая полная таблица", 1,
+          g_dch_n == 1 && !strcmp(g_dch[0].set, "new_set"));
+    {
+        const char bad[] = "2\npartial|out|0|4|x\nbroken\n";
+        check("ошибочная полная таблица отклонена", -1,
+              tabfmt_parse(bad, sizeof(bad) - 1));
+        check("ошибочная таблица сохраняет last-good", 1,
+              g_dch_n == 1 && !strcmp(g_dch[0].set, "new_set"));
+    }
+
+    close(new_pipe[0]);
+    close(new_pipe[1]);
+    close(g_epfd);
+    g_table_fd = g_adopt_fd = g_epfd = -1;
+    free(g_table_feed.buf);
+    g_table_feed = (struct tabfmt_feed){0};
+    check("пустая таблица допустима", 0, tabfmt_parse("0\n", 2));
+    check("пустая таблица заменяет прежнюю", 0, (int)g_dch_n);
+}
+
+static void check_table_rules_transaction(void) {
+    char path[] = "/tmp/dnsmatch-rules-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) { perror("mkstemp"); exit(2); }
+    if (write(fd, "old.example\n", 12) != 12) exit(2);
+    close(fd);
+    char table[1024];
+    struct tabfmt_feed feed = { .load_rules = 1 };
+    snprintf(table, sizeof(table), "1\nold|out|0|4|old|%s\n", path);
+    check("snapshot: первая таблица и правила", 1, tabfmt_feed(&feed, table, strlen(table)));
+    check("snapshot: старое правило загружено", 1, dch_matches(&g_dch[0], "old.example"));
+    unlink(path);
+    snprintf(table, sizeof(table), "1\nmissing|out|0|4|new|%s\n", path);
+    check("snapshot: отсутствующий список отклонён", 2, tabfmt_feed(&feed, table, strlen(table)));
+    check("snapshot: старое правило сохранено", 1,
+          g_dch_n == 1 && !strcmp(g_dch[0].set, "old") && dch_matches(&g_dch[0], "old.example"));
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || write(fd, "re:[\n", 5) != 5) exit(2);
+    close(fd);
+    check("snapshot: битое правило отклонено", 2, tabfmt_feed(&feed, table, strlen(table)));
+    check("snapshot: после ошибки действует прежнее", 1,
+          g_dch_n == 1 && !strcmp(g_dch[0].set, "old") && dch_matches(&g_dch[0], "old.example"));
+    fd = open(path, O_WRONLY | O_TRUNC);
+    if (fd < 0 || write(fd, "new.example\n", 12) != 12) exit(2);
+    close(fd);
+    check("snapshot: следующий полный кадр принят", 1, tabfmt_feed(&feed, table, strlen(table)));
+    check("snapshot: новые правила применены", 1,
+          g_dch_n == 1 && !strcmp(g_dch[0].set, "missing") && dch_matches(&g_dch[0], "new.example"));
+    fd = open(path, O_WRONLY | O_TRUNC);
+    if (fd < 0) exit(2);
+    close(fd);
+    check("snapshot: пустой файл списка допустим", 1, tabfmt_feed(&feed, table, strlen(table)));
+    check("snapshot: пустой список заменил правила", 0, dch_matches(&g_dch[0], "new.example"));
+    check("snapshot: пустая таблица принята", 1, tabfmt_feed(&feed, "0\n", 2));
+    check("snapshot: пустая таблица заменила прежнюю", 0, (int)g_dch_n);
+    free(feed.buf);
+    unlink(path);
+}
+
 /* Набор из строк списка — в том же виде, в каком их читает load_rules_into. */
 static void build(struct ruleset *rs, const char *const *lines) {
     memset(rs, 0, sizeof(*rs));
@@ -86,6 +177,8 @@ static int pool_live_stub(uint8_t *bits) {
 }
 
 int main(void) {
+    check_table_adoption();
+    check_table_rules_transaction();
     {
         struct ruleset rs;
         memset(&rs, 0, sizeof(rs));

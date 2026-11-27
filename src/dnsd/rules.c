@@ -144,8 +144,8 @@ static int srs_to_rules(void *ctx, const struct srs_elem *el) {
     if (!rs) return 0;
     char buf[4200];
     int k = dom_rule(el, buf, sizeof(buf));
-    if (k > 0 && (size_t)k < sizeof(buf)) ruleset_add(rs, buf);
-    return 0;
+    if (k <= 0 || (size_t)k >= sizeof(buf)) return -1;
+    return ruleset_add(rs, buf);
 }
 
 /* Имена набора целиком — в rs: клаузы имён без исключений (путь к `.srs` без выбора клауз, как
@@ -194,10 +194,11 @@ int load_rules_into(const char *path, struct ruleset *rs) {
          * которое не совпадёт ни с одним запросом и займёт место в индексе. На списке из
          * девятнадцати тысяч префиксов таких правил было бы девятнадцать тысяч. */
         if (spec_line_is_addr(line)) continue;
-        ruleset_add(rs, line);
+        if (ruleset_add(rs, line) != 0) { fclose(f); return -1; }
     }
-    fclose(f);
-    return 0;
+    int failed = ferror(f);
+    if (fclose(f) != 0) failed = 1;
+    return failed ? -1 : 0;
 }
 
 /* ---- источники правил канала ------------------------------------------------------------ */

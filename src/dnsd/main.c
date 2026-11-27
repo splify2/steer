@@ -272,6 +272,7 @@ int dnsd_main(int argc, char **argv) {
      * запросы без единого канала, ещё не зная, есть ли у резолвера вообще правила, — хуже,
      * чем подождать несколько миллисекунд первую запись демона. */
     if (g_table_fd >= 0) {
+        g_table_feed.load_rules = 1;
         if (tabfmt_read_first(g_table_fd, &g_table_feed) != 0) {
             fprintf(stderr, "steer dnsd: труба таблицы (--table-fd %d) закрылась или испортилась "
                             "до первой таблицы — резолверу без демона отвечать не на что\n",
