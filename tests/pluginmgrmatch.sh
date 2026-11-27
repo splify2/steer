@@ -161,7 +161,7 @@ export STEER_PLUGIN_AUTO=0
 P() { "$BIN" plugin "$@"; }
 
 # ---- версия ядра для оси compat ----
-check "steer version --json: core, api, abi, crypto" "2.1.0 1.5 1.0 1.0" \
+check "steer version --json: core, api, abi, crypto" "2.1.0 1.5 1.0 2.0" \
     "$("$BIN" version --json | jq_ 'd["core"]+" "+d["api"]+" "+d["abi"]+" "+d["crypto"]')"
 
 # ---- каталог ----
@@ -203,7 +203,7 @@ o="$(P install cry --json 2>/dev/null)"
 check "install cry: взята 1.0.0 (2.0.0 требует библиотеки ядра steer-crypto ^9)" "1.0.0" "$(printf '%s\n' "$o" | jq_ 'd["version"]')"
 o="$(P install cry 2.0.0 --json 2>/dev/null)"; rc=$?
 check "install cry 2.0.0: отказ" "1" "$rc"
-has "  причина: ось и обе версии" "требует steer-crypto ^9.0, у ядра 1.0" "$o"
+has "  причина: ось и обе версии" "требует steer-crypto ^9.0, у ядра 2.0" "$o"
 o="$(STEER_PLUGIN_CRYPTO= P install cry 2.0.0 --json 2>/dev/null)"
 has "  ядро без библиотек (статическая сборка): «нет»" "требует steer-crypto ^9.0, у ядра нет" "$o"
 
@@ -259,6 +259,27 @@ o="$(P search --json 2>/dev/null)"
 has "индекс чужим ключом не принят" "такого ключа у ядра нет" "$o"
 rm -rf repo && mv repo.good repo
 
+# Подписанные индексы с чужим id и истёкшим сроком: проверяем не только отказ,
+# но и сохранение значений из разобранного документа в диагностике.
+cp repo/index.json index.good
+cp repo/index.json.sig index.good.sig
+"$S2P" index dist -o foreign-index --repo other --pub proto.pub --pub plg.pub --key idx.sec \
+    --mirror https://mirror.invalid/ --meta meta.json >/dev/null 2>&1 || exit 1
+cp foreign-index/index.json repo/index.json
+cp foreign-index/index.json.sig repo/index.json.sig
+rm -rf run/splify2
+o="$(P search --json 2>/dev/null)"
+has "чужой подписанный индекс называет его id" "назван «other»" "$o"
+"$S2P" index dist -o expired-index --repo splify2 --pub proto.pub --pub plg.pub --key idx.sec \
+    --mirror https://mirror.invalid/ --meta meta.json --now 2001-01-01T00:00:00Z >/dev/null 2>&1 || exit 1
+cp expired-index/index.json repo/index.json
+cp expired-index/index.json.sig repo/index.json.sig
+rm -rf run/splify2
+o="$(P search --json 2>/dev/null)"
+has "просроченный индекс называет срок" "просрочен (2001-01-31T00:00:00Z)" "$o"
+cp index.good repo/index.json
+cp index.good.sig repo/index.json.sig
+
 # ---- откат индекса ----
 cp etc/repos.d/splify2.json repo.bak
 python3 - etc/repos.d/splify2.json <<'PY'
@@ -268,6 +289,8 @@ PY
 rm -rf run/splify2
 o="$(P search --json 2>/dev/null)"
 has "индекс старее виденного отвергнут" "старее уже виденного" "$o"
+has "отказ отката называет сохранённое время" "2099-01-01T00:00:00Z" "$o"
+has "отказ отката называет время индекса" "$(jq_ 'd["generated"]' < repo/index.json)" "$o"
 cp repo.bak etc/repos.d/splify2.json
 
 # ---- обновление и откат ----
@@ -968,9 +991,9 @@ PY
         "$rc $(jq_ 'd["plugins"]["net1"]["version"]+" "+d["plugins"]["foo"]["version"]' < etc/state.json)"
     check "  проверка здоровья одна на группу, не по плагину" "1 0" \
         "$(grep -c 'проверка здоровья группы' err.txt) $(grep -c 'проверка здоровья foo\|проверка здоровья net1' err.txt)"
-    # ABI: перечитывание падает на соседе прежней сборки (его хук не запускается с новой библиотекой) — не вина
-    # ставящегося плагина, если он сам с библиотекой совместим: установка не откатывается. Так на стенде после
-    # net1 1.3.0 другой раскладки каждый плагин по одному откатывался из-за соседа («по одному нельзя»).
+    # ABI: отказ expand делает соответствующий выход unavail (steer-api 3.5),
+    # а reload остальных выходов продолжает работать. Совместимый сосед ставится
+    # независимо от неисправного abx; причина отказа остаётся в журнале.
     P install --file adB/abl1-1.0.0-all.s2p --file adB/abu-1.0.0-all.s2p --json >/dev/null 2>&1
     mk abx 1.0.0 ',"permissions":["spec.transform"],"requires":{"plugins":{"abl1":"^1.0"}},"steer":{"kinds":[{"name":"abx","caps":["mark"],"resources":{"ports":1},"expand":{"prog":"bin/expand","argv":["{out}"]}}]}'
     cat > src/abx-1.0.0/bin/expand <<'E'
@@ -994,11 +1017,17 @@ E
     printf 'A\n' > root/abl1/lib/libs2p-abl.so.1
     echo >> root/abl1/MANIFEST
     o="$("$BIN" ctl --socket "$T/s.sock" plugin-reload 2>&1)"
-    has "  перечитывание теперь падает на хуке abx" "другой раскладкой структур" "$o"
+    check "  reload продолжает работать при недоступном выходе" "0" "$(printf '%s\n' "$o" | jq_ 'd["code"]')"
+    has "  журнал называет ABI-отказ хука abx" "другой раскладкой структур" "$(cat d.err)"
+    o="$("$BIN" ctl --socket "$T/s.sock" status)"
+    check "  неисправный выход отмечен unavail с владельцем abx" "abx" \
+        "$(printf '%s\n' "$o" | jq_ 'json.loads(d["stdout"])["outputs"]["a1"]["unavail"]["plugin"]')"
     o="$(P install --file adA/abu-1.0.0-all.s2p --json 2>err.txt)"; rc=$?
     check "abi с демоном: abu, совместимый со стоящей abl1, ставится, хотя перечитывание падает на abx" "0 A" \
         "$rc $(root/abu/bin/abu | cut -d' ' -f3)"
-    has "  вывод называет виноватого соседа" "из-за стоящих abx прежней сборки" "$(cat err.txt)"
+    o="$("$BIN" ctl --socket "$T/s.sock" status)"
+    check "  установка abu не скрыла недоступность abx" "abx" \
+        "$(printf '%s\n' "$o" | jq_ 'json.loads(d["stdout"])["outputs"]["a1"]["unavail"]["plugin"]')"
     printf 'version: 2\noutputs:\n  d: { kind: direct }\n' > dspec.yaml
     for p in abx abu abl1; do P remove $p --force --json >/dev/null 2>&1; done
     "$BIN" ctl --socket "$T/s.sock" plugin-reload >/dev/null 2>&1

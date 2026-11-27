@@ -2,6 +2,7 @@
  * «Ключи и ротация»; index.md, «Репозитории на роутере»). */
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,11 +41,22 @@ int pm_state_load(struct pm_state *s, struct pm_err *e) {
     s->retry_s = 0;
     char *p = state_path();
     struct pm_err le = {0};
-    struct ydoc *d = pm_json_load(p, &le);
-    if (!d) {
-        if (le.msg[0]) { pm_errc(e, "plugin.file_unreadable", PMA("path", p, "why", le.msg), "%s не читается: %s", p, le.msg); free(p); return -1; }
+    size_t n = 0;
+    char *raw = pm_read(p, &n);
+    if (!raw) {
+        int err = errno;
+        if (err == ENOENT) { free(p); return 0; }
+        pm_errc(e, "plugin.file_unreadable", PMA("path", p, "why", strerror(err)),
+                "%s не читается: %s", p, strerror(err));
         free(p);
-        return 0;
+        return -1;
+    }
+    struct ydoc *d = pm_json_parse(raw, n, p, &le);
+    free(raw);
+    if (!d) {
+        pm_errc(e, "plugin.file_unreadable", PMA("path", p, "why", le.msg), "%s не читается: %s", p, le.msg);
+        free(p);
+        return -1;
     }
     free(p);
     const struct ynode *r = ydoc_root(d);
@@ -133,7 +145,8 @@ int pm_state_save(const struct pm_state *s, struct pm_err *e) {
     }
     jw_end(&w);
     fputc('\n', f);
-    if (fclose(f) != 0) { free(buf); return pm_errc(e, "plugin.no_memory", NULL, "нет памяти"); }
+    int bad = ferror(f);
+    if (fclose(f) != 0 || bad) { free(buf); return pm_errc(e, "plugin.no_memory", NULL, "нет памяти"); }
     char *p = state_path();
     int r = pm_write_atomic(p, buf, n, 0644);
     free(buf);

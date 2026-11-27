@@ -240,25 +240,25 @@ static struct ydoc *idx_verify(struct pm_repo *r, const char *body, size_t bn, c
     }
     const char *rid = yn_str(ynode_get(root, "repo"), "id");
     if (!seed && (!rid || strcmp(rid, r->name))) {
-        ydoc_free(d);
         pm_errc(e, "plugin.index_foreign", PMA("name", r->name, "id", rid ? rid : ""), "индекс репозитория %s назван «%s» — это чужой индекс", r->name, rid ? rid : "");
+        ydoc_free(d);
         return NULL;
     }
     if (check_time) {
         time_t now = time(NULL);
         time_t ex = pm_parse_time(yn_str(root, "expires"));
         if (ex >= 0 && ex < now) {
-            ydoc_free(d);
             pm_errc(e, "plugin.index_expired", PMA("name", r->name, "expires", yn_str(root, "expires")), "индекс репозитория %s просрочен (%s) — зеркало отдаёт старый индекс", r->name,
                     yn_str(root, "expires"));
+            ydoc_free(d);
             return NULL;
         }
         time_t gen = pm_parse_time(yn_str(root, "generated"));
         time_t seen = pm_parse_time(r->last_generated);
         if (gen >= 0 && seen >= 0 && gen < seen) {
-            ydoc_free(d);
             pm_errc(e, "plugin.index_rollback", PMA("name", r->name, "generated", yn_str(root, "generated"), "seen", r->last_generated), "индекс репозитория %s старее уже виденного (%s < %s) — откат индекса отвергнут",
                     r->name, yn_str(root, "generated"), r->last_generated);
+            ydoc_free(d);
             return NULL;
         }
     }

@@ -767,8 +767,8 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
     const char *window = x->st.auto_window ? x->st.auto_window : "03:00-05:00";
     int inwin = in_window(window, now, NULL);
     /* Порядок зависимостей: библиотеки (type library) — раньше. */
-    for (int pass = 0; pass < 2; pass++) {
-        for (size_t i = 0; i < x->st.n; i++) {
+    for (int pass = 0; pass < 2 && !x->install_degraded; pass++) {
+        for (size_t i = 0; i < x->st.n && !x->install_degraded; i++) {
             struct pm_inst *p = &x->st.v[i];
             if (id && strcmp(p->id, id)) continue;
             struct ydoc *m = pm_manifest(p->id);
@@ -802,7 +802,7 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
             struct pm_result res;
             char *pid = pm_strdup(p->id);
             if (pm_install(x, &rq, 1, &o, &res, &e) != 0) {
-                if (!nerr) first_err = e;
+                if (!nerr || x->install_degraded) first_err = e;
                 errs = pm_realloc(errs, sizeof(char *) * (nerr + 1));
                 errs[nerr++] = pm_strdup(e.msg);
             }
@@ -815,6 +815,12 @@ static int cmd_update(struct pm_ctx *x, const char *id, int auto_, int if_stale)
             pm_result_free(&res);
             free(pid);
         }
+    }
+    if (x->install_degraded) {
+        for (size_t i = 0; i < nerr; i++) free(errs[i]);
+        free(errs);
+        pm_result_free(&all);
+        return fail_e(x, &first_err);
     }
     if (id && !pm_state_find(&x->st, id)) {
         char *m = pm_fmt("плагин %s не установлен", id);
@@ -924,7 +930,7 @@ static int ensure_one(struct pm_ctx *x, const char *id, struct pm_result *all, c
     o.allow_seed = 1;
     struct pm_result res;
     int rc = pm_install(x, &rq, 1, &o, &res, e);
-    if (rc != 0 && pm_seed_repo()) {
+    if (rc != 0 && !x->install_degraded && pm_seed_repo()) {
         struct pm_err se = {0};
         pm_result_free(&res);
         o.seed_only = 1;
@@ -1235,10 +1241,13 @@ static int cmd_migrate(struct pm_ctx *x) {
             idset_add(&bad, m);
             free(m);
             nfail++;
+            if (x->install_degraded) { e = ee; break; }
         }
     }
-    migrate_refresh(x, &all, &bad, &nfail);
-    if (!x->json) {
+    if (!x->install_degraded) migrate_refresh(x, &all, &bad, &nfail);
+    if (x->install_degraded) {
+        fail_e(x, &e);
+    } else if (!x->json) {
         emit_result(x, &all, NULL, NULL, 0);
         for (size_t i = 0; i < bad.n; i++) fprintf(stderr, "не удалось: %s\n", bad.v[i]);
     } else {
@@ -1246,7 +1255,7 @@ static int cmd_migrate(struct pm_ctx *x) {
     }
     for (size_t i = 0; i < absent.n; i++) free(absent.v[i]);
     free(absent.v);
-    if (have_mj && !nfail) {
+    if (have_mj && !nfail && !x->install_degraded) {
         char *dn = pm_path(pm_etc(), "migrate.done.json");
         rename(mj, dn);
         free(dn);
@@ -1255,7 +1264,7 @@ static int cmd_migrate(struct pm_ctx *x) {
     free(present);
     pm_result_free(&all);
     ydoc_free(idx);
-    return nfail ? 1 : 0;
+    return nfail || x->install_degraded ? 1 : 0;
 }
 
 /* ---- задания ---- */
@@ -1427,10 +1436,22 @@ int pm_main(int argc, char **argv) {
     if (auto_) x.by = "auto";
     int rc = 2;
     struct pm_err e = {0};
-    if (pm_state_load(&x.st, &e) != 0 || pm_repos_load(&x.repos, &e) != 0) { rc = fail_e(&x, &e); goto out; }
+    int listing = !strcmp(act, "list") || !strcmp(act, "status");
+    int readonly = listing || !strcmp(act, "search") || !strcmp(act, "job") ||
+                   (!strcmp(act, "repo") && npos == 2 && !strcmp(pos[1], "list"));
+    if (listing && pm_install_pending(&e) != 0) {
+        if (pm_lock() != 0) { rc = fail_e(&x, &e); goto out; }
+        int recover = pm_install_recover(&x, &e);
+        pm_unlock();
+        if (recover != 0) { rc = fail_e(&x, &e); goto out; }
+    }
+    if (readonly && (pm_state_load(&x.st, &e) != 0 || pm_repos_load(&x.repos, &e) != 0)) {
+        rc = fail_e(&x, &e);
+        goto out;
+    }
     pm_target_load(&x.tg);
     if (!x.tg.arch) x.tg.arch = pm_strdup("");
-    /* Только чтение — без блокировки. */
+    /* Чтение без блокировки, когда нет журнала установки. */
     if (!strcmp(act, "list") && npos == 1) { rc = cmd_list(&x, NULL, 0); goto out; }
     if (!strcmp(act, "status") && npos <= 2) {
         if (npos == 2 && !pm_id_ok(pos[1])) { rc = failc(&x, "plugin.bad_name", NULL, "недопустимое имя плагина"); goto out; }
@@ -1458,9 +1479,8 @@ int pm_main(int argc, char **argv) {
         }
     }
     if (pm_lock() != 0) { rc = failc(&x, "plugin.busy", NULL, "busy: менеджер плагинов занят другим запросом — повторите позже"); goto out; }
-    /* Состояние — заново под блокировкой: прочитанное до неё могло устареть. */
-    pm_state_free(&x.st);
-    if (pm_state_load(&x.st, &e) != 0) { rc = fail_e(&x, &e); goto out; }
+    if (pm_install_recover(&x, &e) != 0 || pm_state_load(&x.st, &e) != 0 ||
+        pm_repos_load(&x.repos, &e) != 0) { rc = fail_e(&x, &e); goto out_nojob; }
     if (job && (!strcmp(act, "install") || !strcmp(act, "update") || !strcmp(act, "ensure"))) {
         int prc = 0;
         if (!job_fork(&x, &prc)) { rc = prc; goto out_nojob; }
@@ -1497,7 +1517,7 @@ int pm_main(int argc, char **argv) {
     }
     /* Семя после установки (seed_prune выше): после всякой команды, которая могла поставить плагин, — и после
      * неудачной: частично вставшие плагины тоже стоят. */
-    if (!strcmp(act, "install") || !strcmp(act, "update") || !strcmp(act, "ensure") || !strcmp(act, "migrate"))
+    if (!x.install_degraded && (!strcmp(act, "install") || !strcmp(act, "update") || !strcmp(act, "ensure") || !strcmp(act, "migrate")))
         seed_prune(&x);
     job_finish(rc);
 out_nojob:
