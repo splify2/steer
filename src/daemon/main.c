@@ -40,6 +40,7 @@
 #include "srs.h"
 #include "srsread.h"
 #include "ctl.h"
+#include "full_domain.h"
 #include "daemon.h"
 #include "groups.h"
 #include "v2.h"
@@ -148,6 +149,14 @@ static int is_tool(const char *cmd) {
 }
 
 int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--supd-full-prefix") && strncmp(argv[i], "--supd-full-prefix=", 19)) continue;
+        if (argc == 5 && i == 3 && !strcmp(argv[i], "--supd-full-prefix") &&
+            !strcmp(argv[1], "daemon") && !strcmp(argv[2], "--supervise") && !tools_role(argv[0]))
+            return supd_full_main(argv[4]);
+        fputs("steerd: daemon --supervise --supd-full-prefix PREFIX\n", stderr);
+        return 2;
+    }
     /* До platform, встроенных программ, поиска команд плагина и обращения к ctl. */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--managed-prefix") && strncmp(argv[i], "--managed-prefix=", 17)) continue;

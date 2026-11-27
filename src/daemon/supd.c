@@ -122,6 +122,7 @@
 #include "state.h"
 #include "watchd.h"
 #include "helpers.h"
+#include "full_domain.h"
 #include "awg.h"
 #include "table_ack.h"
 
@@ -135,6 +136,7 @@
 #define SUPD_TABQ_TABS 8
 
 struct supd {
+    struct full_domain *full; /* exclusive plan; NULL for every legacy caller */
     struct steerd *d;
     struct loop *l;
     int (*enabled)(void);
@@ -1424,10 +1426,23 @@ static int start_one(struct helper *h, void *arg) {
         const char *path = av[0];
         char a0[PATH_MAX + 8];
         av[0] = helper_argv0(path, a0, sizeof(a0));
+        int lease = -1;
+        if (s->full && (lease = full_launch_lease(s->full)) < 0) {
+            free(av); close(p[0]); close(p[1]); return -1;
+        }
         pid_t pid = fork();
-        if (pid < 0) { free(av); close(p[0]); close(p[1]); return -1; }
+        if (pid < 0) { if (lease >= 0) close(lease); free(av); close(p[0]); close(p[1]); return -1; }
         if (pid == 0) {
             loop_child_reset();
+            if (s->full) {
+                /* No legacy orphan tag, loader environment or executable seam. */
+                if (prctl(PR_SET_PDEATHSIG, SIGTERM) || getppid() != s->me ||
+                    fcntl(lease, F_SETFD, 0)) _exit(126);
+                child_fd3(p[1]);
+                char *env[] = {"STEER_PLUGIN_ID=steer-ui","STEER_PLUGIN_VERSION=0.0.0","STEER_EVENT_FD=3",NULL};
+                execve(path, (char *const *)av, env);
+                _exit(127);
+            }
             child_arm(s);
             child_fd3(p[1]);
             putenv("STEER_EVENT_FD=3");
@@ -1437,6 +1452,7 @@ static int start_one(struct helper *h, void *arg) {
             execv(path, (char *const *)av);
             _exit(127);
         }
+        if (lease >= 0) close(lease);
         free(av);
         close(p[1]);
         fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
@@ -1541,6 +1557,12 @@ static size_t supd_plan(struct supd *s) {
     /* Прежний план отдан сверке и больше не нужен: его строки — свои у каждой записи. */
     helpers_launch_free(s->fresh, s->fresh_n);
     s->fresh_n = 0;
+    if (s->full) {
+        if (!s->fresh) s->fresh = calloc(1, sizeof(*s->fresh));
+        if (s->fresh && full_active(s->full) == 1 && !full_plan(s->full, s->fresh))
+            s->fresh_n = 1;
+        return s->fresh_n;
+    }
     if (!s->d->have || (s->enabled && !s->enabled())) return 0;
     /* Помощников не больше выходов спеки, служб плагинов и резолвера. */
     size_t need = helpers_max(s->d->sp);
@@ -1563,10 +1585,11 @@ static size_t supd_plan(struct supd *s) {
     return s->fresh_n = n;
 }
 
-struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
+static struct supd *supd_start_mode(struct steerd *d, const struct supd_conf *c, struct full_domain *full) {
     struct supd *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->d = d;
+    s->full = full;
     s->l = d->loop;
     s->enabled = c->enabled;
     s->dn_fd = -1;
@@ -1583,17 +1606,17 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     s->self[el] = '\0';
     /* Шов стенда — тот же, что у `steer supervise`: помощником становится программа стенда. */
     const char *seam = getenv("STEER_SUPERVISE_EXE");
-    s->seam = seam && *seam;
+    s->seam = !full && seam && *seam;
     snprintf(s->exe, sizeof(s->exe), "%s", s->seam ? seam : s->self);
     s->tm = loop_timer_new(s->l, supd_timer, s);
     s->ad_tm = loop_timer_new(s->l, ad_timer, s);
     if (!s->tm || !s->ad_tm) { free(s); return NULL; }
     s->me = getpid();
-    snprintf(s->tag, sizeof(s->tag), "STEER_SUPD=%d:%llu:%s", (int)s->me,
-             proc_start(s->me), steer_state_dir());
+    if (!full) snprintf(s->tag, sizeof(s->tag), "STEER_SUPD=%d:%llu:%s", (int)s->me,
+                        proc_start(s->me), steer_state_dir());
     /* Раньше первого запуска своих: сирота прежнего демона держит устройство или порт, и свой
      * помощник на них не встал бы (шапка, «Помощники демона не переживают»). */
-    orphans_stop("supervise");
+    if (!full) orphans_stop("supervise");
     d->sup = s;
     /* status демона отвечает в процессе — ход перебора узлов берёт отсюда (probe.h). */
     g_probe_sup = s;
@@ -1608,9 +1631,24 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
         fprintf(stderr, "steer[info] supervise: выходов со своим процессом в спеке нет\n");
     int dn = 0;
     for (size_t i = 0; i < fn; i++) dn |= s->set.h[i].table;
-    if (!dn) orphan_stop();
+    if (!dn && !full) orphan_stop();
     supd_kick(s);
     return s;
+}
+
+struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
+    return supd_start_mode(d, c, NULL);
+}
+
+struct supd *supd_full_open(struct loop *l, struct full_domain *f) {
+    static struct steerd d;
+    const struct supd_conf conf = {0};
+    d.loop = l;
+    return supd_start_mode(&d, &conf, f);
+}
+
+int supd_full_pid(struct supd *s) {
+    return s->set.n ? s->set.h[0].pid : 0;
 }
 
 /* Кого тронет сверка: помощник новый (или возвращён, пока прежний гас), с новой подписью,
@@ -1663,7 +1701,7 @@ void supd_spec_changed(struct supd *s, struct supd_changes *ch, int replaced) {
     helpers_merge(&s->set, s->fresh, fn);
     helpers_compact(&s->set);
     int changed = 0;
-    (void)tab_send(s, replaced, &changed);
+    if (!s->full) (void)tab_send(s, replaced, &changed);
     if (ch) ch->dnsd = changed;
     supd_kick(s);
 }
