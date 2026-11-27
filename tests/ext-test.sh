@@ -57,7 +57,7 @@ STEER_INC="$STEER_INC $(profile_var THIRD_DEFS)"
 # Разбор спеки спрашивает вид у реестра (src/kinds/kind.c), поэтому стенды, компонующие парсер,
 # берут и виды выхода — из того же манифеста. Без awg.c: ему нужен lib/run.c, а стенды подменяют
 # run_quiet сами, и вида awg им не нужно (реестр оставит на его месте запись отказа).
-KINDS_SRC="$(for f in $(profile_var KINDS_BASE_SRC) $(profile_var KINDS_EXT_SRC); do
+KINDS_SRC="$(for f in $(profile_var KINDS_BASE_SRC); do
     [ "$f" = src/kinds/awg.c ] || printf '%s ' "$f"; done)"
 # Модель — тоже из манифеста, вместе с платформой (src/platform): её спрашивают и разбор, и пути.
 MODEL_SRC="$(profile_var MODEL_SRC)"
