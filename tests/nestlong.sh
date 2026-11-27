@@ -226,13 +226,14 @@ outputs:
   hys2.hys2-2: { kind: interface, device: hys2-2, on_fail: drop }
   hys2: { kind: group, pick: latency, members: [hys2.hys2-1, hys2.hys2-2], url: "http://probe.test:8080/generate_204", $IV idle_timeout: 0, on_fail: drop }
   vpn: { kind: interface, device: sw3, ipv6: nat, on_fail: drop }
-  all: { kind: group, pick: latency, tolerance: 200, members: [hys2, vpn], url: "http://probe.test:8080/generate_204", $IV idle_timeout: 0, on_fail: drop }
+  all: { kind: group, pick: latency, tolerance: 0, members: [hys2, vpn], url: "http://probe.test:8080/generate_204", $IV idle_timeout: 0, on_fail: drop }
 rules:
   - { name: r, to: [l], out: $OUT, resolve: fakeip }
 EOF
 S="--spec $tmp/spec.yaml --state-dir $tmp/st"
 STEER_SOCKET="$tmp/steer.sock"
 export STEER_SOCKET
+# Нулевая tolerance исключает удержание первого медленного члена в пределах допуска.
 # Задержки как на живом роутере: vpn ~60 мс, туннели — 116…440: all выбирает vpn.
 R tc qdisc add dev sw3p root netem delay 30ms
 R tc qdisc add dev sw0p root netem delay 120ms

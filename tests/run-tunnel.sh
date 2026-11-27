@@ -25,12 +25,14 @@ STREAMS="${2:-1}"
 # его ядро придерживает подтверждение отложенным таймером. На настоящей сети сегмент
 # нарезается, подтверждения идут густо, и этого замедления нет.
 MB=8
-BIN="${STEER:-./build/libs-host/steerd}"
+LIBS="${LIBS:-$(dirname "${STEER:-./build/libs-host/steerd}")}"
+LIBS="$(cd "$LIBS" && pwd)"
+BIN="${VLESS_CLIENT:-$LIBS/plugins/vless/bin/vless}"
 [ -x "$BIN" ] || { echo "нет бинарника: $BIN (раскладку build/libs-host собирает make libs-test)"; exit 2; }
 # steerd динамический: libsteer.so и libsteer-wolfssl.so лежат рядом с ним, а не в системных путях.
 LD_LIBRARY_PATH="$(cd "$(dirname "$BIN")" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; export LD_LIBRARY_PATH
 
-NS=steer-tunnel
+NS=steer-tunnel-$$
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
 PORT=10800
 # Узел стенда — на обычном адресе, а не на петле: движок отвергает узел в 127.0.0.0/8
@@ -50,11 +52,17 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 printf '%s\n' "vless://$UUID@$NODE_URL:$PORT?security=none&type=tcp#local" > "$WORK/sub.txt"
-cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
-SPEC
+python3 - "$WORK" <<'PYCONF'
+import json, os, sys
+w=sys.argv[1]
+conf={"api":"1.5","plugin":{"id":"vless","version":"fixture"},
+      "output":{"name":"vl","kind":"tunnel:vless","device":"vl",
+                "keys":{"subscription":os.path.join(w,"sub.txt"),"nodes":[0]},
+                "mark":"0x00100000","mark_mask":"0x0ff00000","table":100,
+                "sock_mark":"0","sock_mark_required":False,"ipv6":False,"tcp_port":9480},
+      "paths":{"plugin_state":os.path.join(w,"state")}}
+with open(os.path.join(w,"conf.json"),"w") as f:json.dump(conf,f)
+PYCONF
 
 ip netns delete "$NS" 2>/dev/null || true
 ip netns add "$NS"
@@ -79,7 +87,7 @@ if [ "$LOSS" = 0 ] && [ "$STREAMS" = 1 ] && command -v strace >/dev/null 2>&1; t
     TRACE="strace -f -qq -e trace=epoll_ctl -o $WORK/ctl.txt"
 fi
 ip netns exec "$NS" env STEER_TUN_STATS=1 $TRACE "$BIN" vless vl \
-    --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/tun.log" 2>&1 &
+    --conf "$WORK/conf.json" > "$WORK/tun.log" 2>&1 &
 TUN_PID=$!
 
 # Ждём появления устройства, а не спим наугад: подъём занимает разное время.

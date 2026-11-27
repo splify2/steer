@@ -28,16 +28,39 @@
 # сервера (HY2_SERVER, иначе извлекается из образа tobyxdd/hysteria:v2 через docker create/cp).
 # Клиент — раскладка libs (LIBS, по умолчанию build/libs-host; её собирает tests/libs-test.sh).
 #
-# Использование: tests/run-hy2.sh [bench]
+# Использование: tests/run-hy2.sh [smoke|bench]; smoke — только короткие TCP/UDP проверки.
 set -u
 cd "$(dirname "$0")/.."
 
-LIBS="${LIBS:-build/libs-host}"
-MOD="$LIBS/steer-hysteria2"
-[ -x "$MOD" ] || { echo "run-hy2: нет $MOD (сначала tests/libs-test.sh) — ПРОПУСК"; exit 0; }
+LIBS_INPUT="${LIBS:-build/libs-host}"
+LIBS="$(cd "$LIBS_INPUT" 2>/dev/null && pwd)" || {
+    echo "run-hy2: нет каталога раскладки $LIBS_INPUT — ОШИБКА"; exit 2; }
+MOD="$LIBS/plugins/hysteria2/bin/hysteria2"
+[ -x "$MOD" ] && [ -f "$LIBS/plugins/net1/lib/libs2p-net.so.1" ] || {
+    echo "run-hy2: нет пакетного hysteria2 или net1 в $LIBS — ОШИБКА"; exit 2; }
+for tool in ip nft openssl python3 curl unshare mount readlink; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "run-hy2: нет $tool — ПРОПУСК"; exit 0; }
+done
+if [ "${HY2_FIXTURE_INNER:-}" != 1 ]; then
+    [ "$(id -u)" = 0 ] || { echo "run-hy2: нужен root — ПРОПУСК"; exit 0; }
+    unshare -nm true 2>/dev/null || { echo "run-hy2: unshare -nm недоступен — ПРОПУСК"; exit 0; }
+    parent_net="$(readlink /proc/self/ns/net)" || exit 2
+    parent_mnt="$(readlink /proc/self/ns/mnt)" || exit 2
+    HY2_FIXTURE_INNER=1 HY2_PARENT_NET="$parent_net" HY2_PARENT_MNT="$parent_mnt" \
+        LIBS="$LIBS" exec unshare -nm sh "$0" "$@"
+fi
+[ -n "${HY2_PARENT_NET:-}" ] && [ -n "${HY2_PARENT_MNT:-}" ] &&
+    [ "$(readlink /proc/self/ns/net)" != "$HY2_PARENT_NET" ] &&
+    [ "$(readlink /proc/self/ns/mnt)" != "$HY2_PARENT_MNT" ] || {
+        echo "run-hy2: отсутствует отдельная пара namespace — ОШИБКА"; exit 2; }
+mount --make-rprivate / || { echo "run-hy2: не изолировать mount namespace — ОШИБКА"; exit 2; }
+mount -t tmpfs tmpfs /run || { echo "run-hy2: не изолировать /run — ПРОПУСК"; exit 0; }
+mkdir -p /run/netns
 WORK="$(mktemp -d)"
-NSC=hy2c
-NSS=hy2s
+NSC="hy2c-$$"
+NSS="hy2s-$$"
+CREATED_C=0
+CREATED_S=0
 SIP=10.66.0.1
 CIP=10.66.0.2
 TARGET=203.0.113.7
@@ -55,13 +78,17 @@ contains() {   # ИМЯ ТЕКСТ ОБРАЗЕЦ
 }
 
 cleanup() {
-    stop_client
-    stop_server
+    command -v stop_client >/dev/null 2>&1 && stop_client
+    command -v stop_server >/dev/null 2>&1 && stop_server
     [ -n "$TGT_PID" ] && kill "$TGT_PID" 2>/dev/null
-    ip netns pids "$NSC" 2>/dev/null | xargs -r kill 2>/dev/null
-    ip netns pids "$NSS" 2>/dev/null | xargs -r kill 2>/dev/null
-    ip netns delete "$NSC" 2>/dev/null
-    ip netns delete "$NSS" 2>/dev/null
+    if [ "$CREATED_C" = 1 ]; then
+        ip netns pids "$NSC" 2>/dev/null | xargs -r kill 2>/dev/null
+        ip netns delete "$NSC" 2>/dev/null
+    fi
+    if [ "$CREATED_S" = 1 ]; then
+        ip netns pids "$NSS" 2>/dev/null | xargs -r kill 2>/dev/null
+        ip netns delete "$NSS" 2>/dev/null
+    fi
     rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -80,8 +107,10 @@ fi
 [ -x "$HY2" ] || { echo "run-hy2: нет бинарника сервера hysteria (HY2_SERVER или образ tobyxdd/hysteria:v2) — ПРОПУСК"; exit 0; }
 
 # ---- сеть ------------------------------------------------------------------------------------
-ip netns delete "$NSC" 2>/dev/null; ip netns delete "$NSS" 2>/dev/null
-ip netns add "$NSC" && ip netns add "$NSS" || { echo "run-hy2: нет прав на ip netns — ПРОПУСК"; exit 0; }
+ip netns add "$NSC" || { echo "run-hy2: нет прав на ip netns — ПРОПУСК"; exit 0; }
+CREATED_C=1
+ip netns add "$NSS" || { echo "run-hy2: нет прав на второй ip netns — ПРОПУСК"; exit 0; }
+CREATED_S=1
 ip netns exec "$NSC" ip link set lo up
 ip netns exec "$NSS" ip link set lo up
 ip link add hy2-c type veth peer name hy2-s
@@ -102,10 +131,15 @@ PIN="$(openssl x509 -in "$WORK/cert.pem" -outform der | sha256sum | cut -d' ' -f
 mkdir -p "$WORK/www"
 # Фоновые процессы — прямым `ip netns exec`, а не через функцию nss/nsc: функция в фоне порождает
 # подоболочку, $! называет её, а не процесс, и kill убивал бы оболочку, оставляя сервер жить.
-ip netns exec "$NSS" python3 tests/hy2-targets.py --ip "$TARGET" --dir "$WORK/www" --mb 8 > "$WORK/targets.log" 2>&1 &
+target_mb=8
+[ "${1:-}" = smoke ] && target_mb=1
+ip netns exec "$NSS" python3 tests/hy2-targets.py --ip "$TARGET" --dir "$WORK/www" --mb "$target_mb" > "$WORK/targets.log" 2>&1 &
 TGT_PID=$!
 for _ in $(seq 50); do grep -q ready "$WORK/targets.log" 2>/dev/null && break; sleep 0.2; done
+grep -q ready "$WORK/targets.log" || {
+    echo "run-hy2: тестовые TCP/UDP цели не поднялись"; cat "$WORK/targets.log"; exit 1; }
 WANT_SHA="$(cat "$WORK/www/big.sha256" 2>/dev/null)"
+[ -n "$WANT_SHA" ] || { echo "run-hy2: нет суммы тестового файла"; exit 1; }
 
 # ---- сервер ----------------------------------------------------------------------------------
 # start_server ИМЯ [дополнительные строки yaml]: пароль hunter2.
@@ -134,14 +168,21 @@ stop_server() {
 }
 
 # ---- клиент ----------------------------------------------------------------------------------
-# write_sub ССЫЛКА: подписка и спека v1 с выходом hy (kind hysteria2).
+# write_sub ССЫЛКА: подписка и тестовый {conf} по контракту helper плагина.
 write_sub() {
     printf '%s\n' "$1" > "$WORK/sub.txt"
-    cat > "$WORK/spec.json" <<SPEC
-{"schema":1,
- "outputs":{"hy":{"name":"hy","kind":"hysteria2","sub_file":"$WORK/sub.txt","node":0}},
- "channels":[]}
-SPEC
+    mkdir -p "$WORK/state"
+    python3 - "$WORK" <<'PY'
+import json, os, sys
+w = sys.argv[1]
+conf = {"api":"1.5","plugin":{"id":"hysteria2","version":"fixture"},
+        "output":{"name":"hy","kind":"tunnel:hysteria2","device":"hy",
+                  "keys":{"subscription":os.path.join(w,"sub.txt"),"nodes":[0],"insecure":True},
+                  "mark":"0x00100000","mark_mask":"0x0ff00000","table":100,
+                  "sock_mark":"0","sock_mark_required":False,"ipv6":False,"tcp_port":9480},
+        "paths":{"plugin_state":os.path.join(w,"state")}}
+with open(os.path.join(w,"conf.json"),"w") as f: json.dump(conf,f)
+PY
 }
 mod() { nsc env LD_LIBRARY_PATH="$LIBS" "$MOD" "$@"; }
 # Рабочих потоков стека — два: у каждого своё соединение QUIC к узлу и своя авторизация (hy2conn.c), и стенд
@@ -150,21 +191,21 @@ NW=2
 start_client() {
     stop_client
     rm -rf "$WORK/state"
-    ip netns exec "$NSC" env LD_LIBRARY_PATH="$LIBS" STEER_TUN_STATS=1 STEER_TUN_THREADS="$NW" "$MOD" hysteria2 hy --spec "$WORK/spec.json" \
-        --state-dir "$WORK/state" > "$WORK/client.log" 2>&1 &
+    mkdir -p "$WORK/state"
+    ip netns exec "$NSC" env LD_LIBRARY_PATH="$LIBS" STEER_TUN_STATS=1 STEER_TUN_THREADS="$NW" "$MOD" hysteria2 hy --conf "$WORK/conf.json" > "$WORK/client.log" 2>&1 &
     CLI_PID=$!
     for _ in $(seq 60); do
-        nsc ip link show hy >/dev/null 2>&1 && break
+        nsc ip link show up dev hy 2>/dev/null | grep -q 'state UNKNOWN\|state UP' && break
         kill -0 "$CLI_PID" 2>/dev/null || break
         sleep 0.2
     done
-    nsc ip link show hy >/dev/null 2>&1 || return 1
-    nsc ip route replace "$TARGET/32" dev hy
+    nsc ip link show up dev hy 2>/dev/null | grep -q 'state UNKNOWN\|state UP' || return 1
+    nsc ip route replace "$TARGET/32" dev hy || return 1
     . tests/lib-redir.sh
-    redir_dev "$NSC" hy   # TCP — к слушателю модуля (R-152), как на роутере
+    redir_dev "$NSC" hy || return 1   # TCP — к слушателю модуля (R-152), как на роутере
     # Соединение с сервером поднимается сразу, но не мгновенно: ждём принятую авторизацию.
     for _ in $(seq 40); do grep -q "принял авторизацию" "$WORK/client.log" && return 0; sleep 0.1; done
-    return 0
+    return 1
 }
 stop_client() {
     [ -n "$CLI_PID" ] && kill "$CLI_PID" 2>/dev/null && wait "$CLI_PID" 2>/dev/null
@@ -179,17 +220,41 @@ echo "run-hy2: сервер $("$HY2" version 2>/dev/null | grep -i '^version' | 
 echo "1. авторизация"
 start_server "" || exit 1
 write_sub "$URI#ok"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --conf "$WORK/conf.json" 2>&1)"
 contains "проба: узел принял" "$out" '"ok":true'
 contains "  и назвал задержку" "$out" '"handshake_ms":'
 write_sub "hysteria2://wrong@$SIP:4433/?insecure=1#bad"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --conf "$WORK/conf.json" 2>&1)"
 contains "неверный пароль: отказ" "$out" '"ok":false'
 contains "  с причиной (HTTP-ответ маскировки)" "$out" 'отказал в авторизации (HTTP 404)'
 
 # ---- 2. TCP и UDP -----------------------------------------------------------------------------
 echo "2. TCP и UDP"
 write_sub "$URI#ok"
+if [ "${1:-}" = smoke ]; then
+    start_client || { echo "run-hy2 smoke: клиент не поднялся"; cat "$WORK/client.log"; exit 1; }
+    got="$(nsc curl -fsS -m 15 "http://$TARGET/big.bin" | sha256sum | cut -d' ' -f1)"
+    check "TCP: файл 1 МиБ целиком через пакетный helper" "$WANT_SHA" "$got"
+    got="$(nsc python3 - "$TARGET" <<'PY'
+import socket, sys
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(5)
+data=b"shared-hy2-fixture"
+s.sendto(data,(sys.argv[1],7))
+try: print("same" if s.recvfrom(1024)[0] == data else "different")
+except OSError: print("missing")
+PY
+)"
+    check "UDP: ответ эха через пакетный helper" "same" "$got"
+    if [ "$fail" != 0 ]; then
+        echo "run-hy2 smoke: журнал клиента:"
+        tail -n 40 "$WORK/client.log"
+        echo "run-hy2 smoke: журнал сервера:"
+        tail -n 20 "$WORK/server.log"
+        nsc nft list table inet steer_stand_redir 2>/dev/null || true
+    fi
+    echo "run-hy2 smoke: $pass passed, $fail failed"
+    [ "$fail" = 0 ]; exit $?
+fi
 start_client || { echo "  клиент не поднялся:"; sed 's/^/    /' "$WORK/client.log" | head; }
 got="$(nsc curl -s -m 60 "http://$TARGET/big.bin" | sha256sum | cut -d' ' -f1)"
 check "TCP: файл 8 МиБ прошёл целиком (хеш)" "$WANT_SHA" "$got"
@@ -253,9 +318,9 @@ print(" ".join(map(str, sorted(got))))
 PY
 )"
 check "UDP: залп 1000+2300+3000 в новый поток — три датаграммы, а не склейка" "1000 2300 3000" "$burst"
-st="$(cat "$WORK/state/../state/hy2-hy" 2>/dev/null || true)"
+st="$(cat "$WORK/state/hy.status.json" 2>/dev/null || true)"
 sleep 3.5
-st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+st="$(cat "$WORK/state/hy.status.json" 2>/dev/null)"
 contains "файл состояния: соединение поднято" "$st" '"up":true'
 contains "  режим перегрузки BBR (up в ссылке не задан)" "$st" '"cc":"bbr"'
 contains "  UDP разрешён сервером" "$st" '"udp":true'
@@ -271,14 +336,14 @@ check "salamander: файл прошёл" "$WANT_SHA" "$got"
 contains "  и журнал называет обфускацию" "$(cat "$WORK/client.log")" "Salamander"
 stop_client
 write_sub "$URI&obfs=salamander&obfs-password=wrongpass#s"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --timeout 4 --conf "$WORK/conf.json" 2>&1)"
 contains "salamander: чужой пароль — отказ" "$out" '"ok":false'
 write_sub "$URI#plain"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --timeout 4 --conf "$WORK/conf.json" 2>&1)"
 contains "salamander: сервер с obfs, клиент без — отказ" "$out" '"ok":false'
 start_server "" || exit 1
 write_sub "$URI&obfs=salamander&obfs-password=obfspass1#s"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --timeout 4 --conf "$WORK/conf.json" 2>&1)"
 contains "salamander: клиент с obfs, сервер без — отказ" "$out" '"ok":false'
 
 # Gecko — Salamander плюс нарезка пакетов рукопожатия (extras/obfs эталона): рукопожатие, TCP и UDP
@@ -293,35 +358,35 @@ check "  и UDP (эхо 3000 байт)" "same" "$(udp_echo 3000)"
 contains "  журнал называет Gecko" "$(cat "$WORK/client.log")" "Gecko"
 stop_client
 write_sub "$URI&obfs=gecko&obfs-password=wrongpass#g"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --timeout 4 --conf "$WORK/conf.json" 2>&1)"
 contains "gecko: чужой пароль — отказ" "$out" '"ok":false'
 write_sub "$URI&obfs=salamander&obfs-password=geckopass1#s"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --timeout 4 --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --timeout 4 --conf "$WORK/conf.json" 2>&1)"
 contains "gecko-сервер, клиент с salamander — отказ" "$out" '"ok":false'
 start_server "" || exit 1
 
 # ---- 4. pinSHA256 и проверка сертификата ---------------------------------------------------------
 echo "4. сертификат"
 write_sub "hysteria2://hunter2@$SIP:4433/?pinSHA256=$PIN&sni=hy2.test#pin"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --conf "$WORK/conf.json" 2>&1)"
 contains "pinSHA256 верный: узел принят" "$out" '"ok":true'
 write_sub "hysteria2://hunter2@$SIP:4433/?pinSHA256=$(printf '%064d' 0)&sni=hy2.test#pin"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --conf "$WORK/conf.json" 2>&1)"
 contains "pinSHA256 чужой: отказ" "$out" '"ok":false'
 contains "  с причиной" "$out" 'не совпал с pinSHA256'
 write_sub "hysteria2://hunter2@$SIP:4433/?sni=hy2.test#nocheck"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --conf "$WORK/conf.json" 2>&1)"
 contains "самоподписанный без insecure и без отпечатка: отказ" "$out" '"ok":false'
 # sni — адрес, а не имя (так Xray раздаёт узлы с сертификатом на IP): SNI не уходит, сертификат
 # сверяется с SAN IP. Прежде клиент отказывал ещё до первого пакета («QUIC не открылся (-4)»), здесь
 # рукопожатие обязано дойти до проверки сертификата — самоподписанный без insecure она не пропускает.
 write_sub "hysteria2://hunter2@$SIP:4433/?sni=$SIP&alpn=h3#ipsni"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --conf "$WORK/conf.json" 2>&1)"
 contains "sni=адрес: отказ проверкой сертификата" "$out" '"ok":false'
 case "$out" in *"QUIC не открылся"*) fail=$((fail + 1)); echo "  FAIL sni=адрес: QUIC не открылся до первого пакета";;
     *) pass=$((pass + 1)); echo "  ok   sni=адрес: QUIC открылся, SNI-адрес не роняет TLS";; esac
 write_sub "hysteria2://hunter2@$SIP:4433/?sni=$SIP&alpn=h3&pinSHA256=$PIN#ippin"
-out="$(mod hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+out="$(mod hysteria2-probe hy --conf "$WORK/conf.json" 2>&1)"
 contains "sni=адрес и pinSHA256: узел принят" "$out" '"ok":true'
 # Хост — адрес, sni нет: имя сверяется с адресом (SAN IP), как у эталона (Go кладёт хост в ServerName,
 # адрес в нём — проверка по SAN IP). Прежде без sni у адреса имени не проверял никто, и годился
@@ -342,16 +407,16 @@ if [ -f /etc/ssl/certs/ca-certificates.crt ] && command -v unshare >/dev/null 2>
     TLS_EXTRA=", sniGuard: disable"
     start_server "" || exit 1
     write_sub "hysteria2://hunter2@$SIP:4433/#ipnosni"
-    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --conf "$WORK/conf.json" 2>&1)"
     contains "адрес без sni, в сертификате только имя: отказ" "$out" '"ok":false'
     write_sub "hysteria2://hunter2@$SIP:4433/?sni=hy2.test#dnsni"
-    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --conf "$WORK/conf.json" 2>&1)"
     contains "  тот же сервер с sni=hy2.test: принят (корни из своего файла)" "$out" '"ok":true'
     cp "$WORK/cert-ip.pem" "$WORK/cert.pem"; cp "$WORK/key-ip.pem" "$WORK/key.pem"
     start_server "" || exit 1
     TLS_EXTRA=""
     write_sub "hysteria2://hunter2@$SIP:4433/#ipsan"
-    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --spec "$WORK/spec.json" --state-dir "$WORK/state" 2>&1)"
+    out="$(modca "$WORK/cert.pem" hysteria2-probe hy --conf "$WORK/conf.json" 2>&1)"
     contains "адрес без sni, адрес в SAN IP: принят" "$out" '"ok":true'
 else
     echo "  пропуск: нет /etc/ssl/certs/ca-certificates.crt или unshare — проверка имени по адресу"
@@ -363,7 +428,7 @@ start_server "ignoreClientBandwidth: true" || exit 1
 write_sub "$URI&up=100&down=100#brutal"
 start_client
 sleep 3.5
-st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+st="$(cat "$WORK/state/hy.status.json" 2>/dev/null)"
 contains "сервер ответил auto (ignoreClientBandwidth): клиент перешёл с Brutal на BBR" "$st" '"cc":"bbr"'
 got="$(nsc curl -s -m 30 "http://$TARGET/big.bin" | sha256sum | cut -d' ' -f1)"
 check "  файл прошёл" "$WANT_SHA" "$got"
@@ -371,7 +436,7 @@ stop_client
 start_server "bandwidth: { up: 50 mbps, down: 50 mbps }" || exit 1
 start_client
 sleep 3.5
-st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+st="$(cat "$WORK/state/hy.status.json" 2>/dev/null)"
 contains "предел сервера 50 Мбит/с, up клиента 100: Brutal на 50 (6250000 байт/с)" "$st" '"brutal_bps":6250000'
 got="$(nsc curl -s -m 30 "http://$TARGET/big.bin" | sha256sum | cut -d' ' -f1)"
 check "  файл прошёл" "$WANT_SHA" "$got"
@@ -379,7 +444,7 @@ stop_client
 start_server "" || exit 1
 start_client
 sleep 3.5
-st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+st="$(cat "$WORK/state/hy.status.json" 2>/dev/null)"
 contains "сервер без предела (0): Brutal на своём up (12500000 байт/с)" "$st" '"brutal_bps":12500000'
 stop_client
 
@@ -419,7 +484,7 @@ start_server "" || exit 1
 write_sub "$URI#idle"
 start_client
 sleep 75
-st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+st="$(cat "$WORK/state/hy.status.json" 2>/dev/null)"
 contains "75 с без потоков: соединение поднято" "$st" '"up":true'
 check "  и не переподключалось (по одной авторизации на рабочего)" "$NW" "$(auths)"
 got="$(nsc curl -s -m 30 "http://$TARGET/big.bin" | sha256sum | cut -d' ' -f1)"
@@ -432,14 +497,14 @@ sleep 4
 start_server "" || exit 1
 for _ in $(seq 100); do [ "$(auths)" -ge $((NW * 2)) ] && break; sleep 0.5; done
 sleep 3.5
-st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+st="$(cat "$WORK/state/hy.status.json" 2>/dev/null)"
 check "сервер перезапущен: соединения рабочих поднялись сами, без потока" "$((NW * 2))" "$(auths)"
 contains "  и файл состояния говорит «поднято»" "$st" '"up":true'
 stop_client
 start_server "quic: { maxIdleTimeout: 5s }" || exit 1
 start_client
 sleep 25
-st="$(cat "$WORK/state/hy2-hy" 2>/dev/null)"
+st="$(cat "$WORK/state/hy.status.json" 2>/dev/null)"
 contains "сервер со сроком простоя 5 с, 25 с без потоков: соединение поднято" "$st" '"up":true'
 check "  и не переподключалось" "$NW" "$(auths)"
 stop_client
@@ -541,7 +606,7 @@ stop_client
 # клиента: каждый байт делал круг стек → пара → поток → пара → стек (замер 2026-10-11: скачивание одним
 # потоком 5,58 с процессора на ГиБ против 3,27 у sing-box). Теперь сокет QUIC стоит в epoll рабочего, а
 # потоки клиента ложатся прямо в сессию стека. Проверяется устройство, а не скорость: задач у процесса —
-# читатель/главный, NW рабочих и поток состояния, и их число не растёт с соединениями клиента (установщики
+# читатель/главный, NW рабочих, поток состояния и временный запрос геолокации, и их число не растёт с соединениями клиента (установщики
 # и мультиплексор не заводятся); пар сокетов unix у процесса нет вовсе; у соединения клиента — только его
 # сокет (R-152), и после закрытия соединений дескрипторов снова столько же, сколько в покое.
 echo "10. устройство: QUIC в цикле рабочего"
@@ -557,7 +622,8 @@ unix_socks() {
     nsc cat /proc/net/unix | awk -v list="$_ino" 'BEGIN { n = split(list, a, "\n"); for (i = 1; i <= n; i++) w[a[i]] = 1 } NR > 1 && ($7 in w) { c++ } END { print c + 0 }'
 }
 idle_tasks="$(tasks)"; idle_fds="$(fds)"
-check "в покое: задач $((NW + 2)) (главная, $NW рабочих, поток состояния)" "$((NW + 2))" "$idle_tasks"
+check "в покое: главная, $NW рабочих, состояние и не более одного geo-запроса" "yes" \
+    "$([ "$idle_tasks" -ge $((NW + 2)) ] && [ "$idle_tasks" -le $((NW + 3)) ] && echo yes || echo no)"
 check "  пар сокетов unix нет" "0" "$(unix_socks)"
 # Двадцать соединений клиента к цели разом, медленно — чтобы они все были открыты на момент замера.
 # Прямым `ip netns exec`, а не через nsc: у функции в фоне $! — подоболочка, а не curl.
@@ -567,7 +633,9 @@ for i in $(seq 20); do
     SLOW_PIDS="$SLOW_PIDS $!"
 done
 sleep 4
-check "20 соединений клиента: задач столько же ($((NW + 2)))" "$((NW + 2))" "$(tasks)"
+load_tasks="$(tasks)"
+check "20 соединений клиента не создают поток на каждое соединение" "yes" \
+    "$([ "$load_tasks" -ge $((NW + 2)) ] && [ "$load_tasks" -le "$idle_tasks" ] && echo yes || echo no)"
 check "  пар сокетов unix нет" "0" "$(unix_socks)"
 # TCP клиента завершает ядро и отдаёт модулю сокетом (R-152): у каждого открытого соединения — ровно его
 # сокет, и больше ничего (потоки QUIC дескрипторов не заводят). После закрытия соединений — снова покой:
