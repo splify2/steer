@@ -421,11 +421,7 @@ static int apply_routing_one(const struct output *o) {
         fprintf(stderr, LOG_W "output %s: правило IPv4 не подтверждено\n", o->name);
         return 1;
     }
-    /* Половина IPv6 (docs/architecture.md, «4б») — у выхода с KC_IPV6. Не встала при живом IPv4 —
-     * у устройства выключен IPv6: в таблице IPv6 запрет, и IPv6 правил выхода стоит. */
-    if (rc == 0 && route6_bind(o, o->device) != 0)
-        fprintf(stderr, LOG_W "output %s: маршрут IPv6 в %s не встал (IPv6 на устройстве "
-                        "выключен?) — IPv6 правил выхода остановлен\n", o->name, o->device);
+    if (rc == 0 && route6_bind(o, o->device)) return 1;
     if (rc != 0) {
         fprintf(stderr, LOG_W "выход %s: не проложить маршрут через %s — устройство поднято?\n",
                 o->name, o->device);
@@ -436,7 +432,7 @@ static int apply_routing_one(const struct output *o) {
          * а это хуже, чем не работает вовсе. */
         if (o->on_fail == FAIL_DROP) {
             table_bind(o, NULL);
-            route6_bind(o, NULL);
+            if (route6_bind(o, NULL)) return 1;
             fprintf(stderr, LOG_W "output %s: трафик остановлен до появления "
                             "рабочего устройства (on_fail=drop)\n", o->name);
         } else {
@@ -449,12 +445,14 @@ static int apply_routing_one(const struct output *o) {
             const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
             run(flush);
             tcp_redir_sync(o, NULL);
+            int rc6 = 0;
             if (out_route6(o)) {
-                /* IPv6 — тем же путём напрямую: правило на месте, таблица пуста. */
-                rule_ensure6(o->mark, o->table);
+                /* Политика direct не меняется при ошибке, но Apply о ней сообщает. */
+                rc6 = rule_ensure6(o);
                 route6_flush(o->table);
             }
             failopen_mark(o, 1);
+            if (rc6) return 1;
         }
     }
     return 0;
@@ -1154,7 +1152,7 @@ int cmd_apply_commit(int argc, char **argv) {
         if (!name_in_list(a.rule, o->name) || !out_has_device(o)) continue;
         if (rule_ensure(o->mark, o->table)) { free(reg); return 1; }
         /* Правило IPv6 — тем же ходом (страж ловит и RTNLGRP_IPV6_RULE, см. rulewd.c). */
-        if (out_route6(o)) rule_ensure6(o->mark, o->table);
+        if (rule_ensure6(o)) { free(reg); return 1; }
     }
     if (a.masq && plat()->iptables_masq) iptables_masq_sync(&cfg);
     else if (a.masq_ensure && plat()->iptables_masq) iptables_masq_ensure(&cfg);

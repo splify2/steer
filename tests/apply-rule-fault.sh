@@ -1,5 +1,5 @@
 #!/bin/sh
-# Тестовая сборка make build/steerd-rule-fault; настоящее ядро, отказ только RTM_NEWRULE.
+# make build/steerd-rule-fault: настоящее ядро в netns, подменён только выбранный результат.
 set -u
 if [ "${RULE_FAULT_INNER:-}" != 1 ]; then
     bin="${STEERD_FAULT:-build/steerd-rule-fault}"
@@ -9,6 +9,7 @@ if [ "${RULE_FAULT_INNER:-}" != 1 ]; then
     if [ -z "${RULE_TEST_MODE:-}" ]; then
         RULE_TEST_MODE=cli STEERD_FAULT="$bin" sh "$script" || exit 1
         RULE_TEST_MODE=ctl STEERD_FAULT="$bin" sh "$script" || exit 1
+        RULE_TEST_MODE=ipv6 STEERD_FAULT="$bin" sh "$script" || exit 1
         exit 0
     fi
     [ "$(id -u)" = 0 ] || exit 2
@@ -23,6 +24,9 @@ awk_path="$(readlink -f "$(command -v awk)")" || { echo "rule-fault: нет awk"
 mount -t tmpfs tmpfs /run || exit 2
 mkdir -p /run/fixture
 cp "$BIN" /run/fixture/steerd || exit 2
+if [ "$RULE_TEST_MODE" = ipv6 ]; then
+    cp "$(dirname "$0")/apply-rule6.py" /run/fixture/ || exit 2
+fi
 cp "$awk_path" /run/fixture/awk || exit 2
 mount -t tmpfs tmpfs /tmp || exit 2
 mount -t tmpfs tmpfs /etc || exit 2
@@ -32,6 +36,9 @@ mkdir -p /etc/steer /tmp/state
 ip link set lo up || exit 2
 ip link add vpn0 type dummy || exit 2
 ip link set vpn0 up || exit 2
+if [ "$RULE_TEST_MODE" = ipv6 ]; then
+    exec python3 -Bu /run/fixture/apply-rule6.py
+fi
 cat >/tmp/spec.json <<'EOF'
 {"schema":2,"from_default":["192.168.1.0/24"],
  "outputs":{"vpn":{"kind":"interface","device":"vpn0","on_fail":"drop","ipv6":"off"}},

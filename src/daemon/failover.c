@@ -590,8 +590,25 @@ int rule_ensure(unsigned mark, int table) {
     return rule_ensure_fam(4, mark, table);
 }
 
-void rule_ensure6(unsigned mark, int table) {
-    rule_ensure_fam(6, mark, table);
+static int route6_required(const struct output *o) {
+    if (!out_route6(o)) return 0;
+    /* Отсутствие семейства — не ошибка Apply. Пустой дамп правил, отказ в доступе
+     * и выключенный IPv6 отдельного устройства такого вывода не дают. */
+    int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return errno != EAFNOSUPPORT;
+    close(fd);
+    return 1;
+}
+
+static int rule6_install(const struct output *o) {
+    int rc = rule_ensure_fam(6, o->mark, o->table);
+    if (rc) fprintf(stderr, LOG_W "выход %s: правило IPv6 таблицы %d не подтверждено: %s\n",
+                    o->name, o->table, strerror(rc));
+    return rc;
+}
+
+int rule_ensure6(const struct output *o) {
+    return route6_required(o) ? rule6_install(o) : 0;
 }
 
 /* Одна строка `ip -4 route show table N`, разобранная на то, чем её можно снять точно: тип
@@ -716,7 +733,7 @@ static int route_put(const char *const argv[], int fam, int table, int type, con
 
 /* Поставить запасной запрет (см. STEER_BACKSTOP_METRIC в spec.h). Заменой: стоящий такой же
  * она не дублирует. */
-static void backstop_set_fam(int fam, int table) {
+static int backstop_set_fam(int fam, int table) {
     char t[16], m[16];
     snprintf(t, sizeof(t), "%d", table);
     snprintf(m, sizeof(m), "%d", STEER_BACKSTOP_METRIC);
@@ -724,8 +741,8 @@ static void backstop_set_fam(int fam, int table) {
                          "table", t, NULL };
     const char *bs6[] = { "ip", "-6", "route", "replace", table_bh_type(6), "default", "metric",
                           m, "table", t, NULL };
-    if (fam == 6) route_put(bs6, 6, table, RTN_PROHIBIT, NULL, STEER_BACKSTOP_METRIC);
-    else route_put(bs, 4, table, RTN_BLACKHOLE, NULL, STEER_BACKSTOP_METRIC);
+    if (fam == 6) return route_put(bs6, 6, table, RTN_PROHIBIT, NULL, STEER_BACKSTOP_METRIC);
+    return route_put(bs, 4, table, RTN_BLACKHOLE, NULL, STEER_BACKSTOP_METRIC);
 }
 
 static void backstop_set(int table) { backstop_set_fam(4, table); }
@@ -768,7 +785,7 @@ int table_bind(const struct output *o, const char *dev) {
 static int table_bind6(const struct output *o, const char *dev) {
     char t[16];
     snprintf(t, sizeof(t), "%d", o->table);
-    backstop_set_fam(6, o->table);
+    int backstop_rc = backstop_set_fam(6, o->table);
     const char *to_dev[] = { "ip", "-6", "route", "replace", "default", "dev", dev, "table", t,
                              NULL };
     const char *to_bh[] = { "ip", "-6", "route", "replace", table_bh_type(6), "default", "table",
@@ -778,20 +795,25 @@ static int table_bind6(const struct output *o, const char *dev) {
     if (rc != 0 && dev) {
         /* Устройство IPv6 не несёт (выключен на нём IPv6) или исчезло. Прежний маршрут в
          * другое устройство оставлять нельзя — IPv6 ушёл бы не туда; запрет на его место. */
-        if (route_put(to_bh, 6, o->table, RTN_PROHIBIT, NULL, 0) == 0) table_prune_fam(6, o->table, NULL, 1);
-        return rc;
+        rc = route_put(to_bh, 6, o->table, RTN_PROHIBIT, NULL, 0);
+        if (!rc)
+            fprintf(stderr, LOG_W "выход %s: маршрут IPv6 в %s не встал — в таблице %d установлен prohibit\n",
+                    o->name, dev, o->table);
+        dev = NULL;
     }
     if (rc != 0) return rc;
     table_prune_fam(6, o->table, dev, 1);
-    return 0;
+    return backstop_rc;
 }
 
 int route6_bind(const struct output *o, const char *dev) {
-    if (!out_route6(o)) return 0;
+    if (!route6_required(o)) return 0;
     /* Маршрут первым, правило вторым — как у IPv4 (bind_device). */
     int rc = table_bind6(o, dev);
-    rule_ensure6(o->mark, o->table);
-    return rc;
+    if (rc) fprintf(stderr, LOG_W "выход %s: маршруты IPv6 таблицы %d не подтверждены: %s\n",
+                    o->name, o->table, strerror(rc));
+    int rule_rc = rule6_install(o);
+    return rule_rc ? rule_rc : rc;
 }
 
 /* Пущен ли выход напрямую — отметка в наборе FAILOPEN_SET нашей таблицы. Зачем она и почему
@@ -1098,17 +1120,17 @@ static int apply_failed(const struct output *o, int announce) {
          * заново значило бы на миг открыть тот же путь напрямую. */
         if (rule_ensure(o->mark, o->table)) return 1;
         /* IPv6 выхода — тот же запрет в его таблице IPv6. */
-        route6_bind(o, NULL);
+        int rc6 = route6_bind(o, NULL);
         /* Режим мог смениться с direct/zapret на drop, пока выход лежал: отметка «пущен
          * напрямую» от прежнего отказа здесь больше не правда. */
         failopen_mark(o, 0);
         /* Запрет поставлен — теперь он обязан касаться и уже установленных соединений,
          * иначе on_fail=drop это обещание только для новых. */
         conntrack_evict(o->mark);
-        if (announce)
+        if (announce && !rc6)
             fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик остановлен "
                             "(on_fail=drop)\n", o->name);
-        return 0;
+        return rc6 ? 1 : 0;
     }
 
     /* direct и zapret: снимаем правило, чтобы помеченный трафик шёл обычным путём, — и
@@ -1187,11 +1209,7 @@ void bind_device(struct output *o, const char *dev) {
     failopen_mark(o, 0);
     int rc = table_bind(o, dev);
     rule_ensure(o->mark, o->table);
-    /* Половина IPv6 (выход с KC_IPV6). Не встала при живом IPv4 — у устройства выключен IPv6:
-     * в таблице IPv6 запрет, IPv6 правил выхода стоит, а не уходит напрямую. */
-    if (rc == 0 && route6_bind(o, dev) != 0)
-        fprintf(stderr, LOG_W "выход %s: маршрут IPv6 в %s не встал (IPv6 на устройстве "
-                        "выключен?) — IPv6 правил выхода остановлен\n", o->name, dev);
+    if (rc == 0) route6_bind(o, dev); /* диагностика IPv6 — в route6_bind */
     /* Соединения снимаются ЗДЕСЬ, а не в сторожевом проходе целиком: bind_device зовут,
      * когда маршрут выхода действительно меняется (первая привязка, смена устройства,
      * расхождение состояния), а не каждую минуту. Снимать записи на здоровом тике значило бы
@@ -1221,8 +1239,8 @@ void bind_device(struct output *o, const char *dev) {
                         "устройство ещё живо?\n", o->name, tbl, dev);
         if (o->on_fail == FAIL_DROP) {
             table_bind(o, NULL);
-            route6_bind(o, NULL);
-            fprintf(stderr, LOG_W "выход %s: трафик остановлен до успешной привязки "
+            if (!route6_bind(o, NULL))
+                fprintf(stderr, LOG_W "выход %s: трафик остановлен до успешной привязки "
                             "(on_fail=drop)\n", o->name);
         } else {
             /* direct/zapret: пустая таблица уводит пакет в main, то есть напрямую, — пусть

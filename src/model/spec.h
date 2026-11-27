@@ -1463,11 +1463,11 @@ int rule_ensure(unsigned mark, int table);
 static inline int out_route6(const struct output *o) {
     return out_has_device(o) && out_has_cap(o, KC_IPV6);
 }
-void rule_ensure6(unsigned mark, int table);
+int rule_ensure6(const struct output *o);
 void rule_drop6(unsigned mark, int table);
 void route6_flush(int table);
-/* Половина IPv6 привязки: маршрут в dev (NULL — запрет) и правило. У выхода без out_route6 — ничего,
- * 0. Иначе 0 — маршрут встал; не встал — в таблице запрет. */
+/* Без out_route6 или семейства AF_INET6 — ничего. Иначе 0 подтверждает правило,
+ * запасной запрет и основной маршрут (в dev либо prohibit вместо него). */
 int route6_bind(const struct output *o, const char *dev);
 /* Маршрут по умолчанию таблицы выхода — в устройство dev (или запрет, если dev == NULL) одной
  * заменой, без сброса таблицы; всё прочее в таблице снимается после. 0 — встал; иначе
