@@ -78,15 +78,18 @@ def syncdir(p):
         os.close(fd)
 
 
-def init(p):
+def init(p,profile=PROFILE,dirs=()):
     parent(p)
     require(not os.path.lexists(p),"new-prefix-required")
     tmp = Path(tempfile.mkdtemp(dir=p.parent,prefix=".e4-init-"))
     try:
         for name in NAMES:
             (tmp/name).touch(mode=0o600,exist_ok=False)
-        stamp = {"profile":PROFILE,"id":ID,"nonce":uuid.uuid4().hex,"path":str(p),
-                 "root":ident(tmp),"objects":{n:ident(tmp/n) for n in NAMES}}
+        for name in dirs:
+            (tmp/name).mkdir(mode=0o700)
+            syncdir(tmp/name)
+        stamp = {"profile":profile,"id":ID,"nonce":uuid.uuid4().hex,"path":str(p),
+                 "root":ident(tmp),"objects":{n:ident(tmp/n) for n in NAMES+dirs}}
         (tmp/"type").write_bytes(enc(stamp))
         os.setxattr(tmp/"history",ATTR,sha(enc(stamp)).encode(),os.XATTR_CREATE)
         for n in NAMES:
@@ -102,11 +105,14 @@ def init(p):
             shutil.rmtree(tmp)
 
 
-def boundary(p):
+def boundary(p,profile=PROFILE,dirs=()):
     parent(p)
     s = p.lstat()
     require(s.st_uid == os.getuid() and s.st_mode == stat.S_IFDIR | 0o700 and mount(p) == mount(p.parent))
-    require(set(os.listdir(p)) == set(NAMES))
+    require(set(os.listdir(p)) == set(NAMES+dirs))
+    for n in dirs:
+        s = (p/n).lstat()
+        require(s.st_mode == stat.S_IFDIR | 0o700 and s.st_uid == os.getuid() and mount(p/n) == mount(p))
     for n in NAMES:
         s = (p/n).lstat()
         require(s.st_mode == stat.S_IFREG | 0o600 and s.st_nlink == 1 and s.st_uid == os.getuid()
@@ -117,8 +123,8 @@ def boundary(p):
     raw = (p/"type").read_bytes()
     t = json.loads(raw)
     require(isinstance(t,dict) and isinstance(t.get("nonce"),str) and TOKEN.fullmatch(t["nonce"]))
-    require(raw == enc({"profile":PROFILE,"id":ID,"nonce":t["nonce"],"path":str(p),
-                        "root":ident(p),"objects":{n:ident(p/n) for n in NAMES}}))
+    require(raw == enc({"profile":profile,"id":ID,"nonce":t["nonce"],"path":str(p),
+                        "root":ident(p),"objects":{n:ident(p/n) for n in NAMES+dirs}}))
     return t
 
 
@@ -197,8 +203,18 @@ def address(t):
 def request(p,op,g,endpoint=None):
     t = boundary(p)
     require(belongs(t["nonce"],g),"wrong-prefix-generation")
+    reply = exchange(p,t,op,g,endpoint)
+    if op == "fence":
+        require(boundary(p) == t)
+        h = Ledger(p,t)
+        require(reply.get("excluded") is True and h.last == g and h.rows[g] == "fence"
+                and h.head == h.seal == reply.get("head"),"unconfirmed-fence")
+    return reply
+
+
+def exchange(p,t,op,g,endpoint=None,timeout=3):
     with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as s:
-        s.settimeout(3)
+        s.settimeout(timeout)
         s.connect(endpoint if endpoint is not None else address(t))
         pid,uid,_ = struct.unpack("3i",s.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
         with (p/"owner.lock").open("rb") as f:
@@ -206,21 +222,19 @@ def request(p,op,g,endpoint=None):
         require(LOCK.unpack(lock) == (fcntl.F_WRLCK,os.SEEK_SET,0,0,pid)
                 and pid > 0 and uid == os.getuid(),"foreign-owner")
         challenge = uuid.uuid4().hex
-        q = [PROFILE,t["nonce"],ID,g,op,challenge]
+        q = [t["profile"],t["nonce"],ID,g,op,challenge]
         s.sendall(enc(q))
         reply = json.loads(s.recv(8192))
         require(isinstance(reply,dict) and reply.get("request") == q and reply.get("owner") == pid,"unconfirmed")
         if reply.get("ok") is not True:
             raise Refusal(reply.get("error","unconfirmed"))
-        if op == "fence":
-            require(boundary(p) == t)
-            h = Ledger(p,t)
-            require(reply.get("excluded") is True and h.last == g and h.rows[g] == "fence"
-                    and h.head == h.seal == reply.get("head"),"unconfirmed-fence")
         return reply
 
 
 class Supervisor:
+    boundary = staticmethod(boundary)
+    journal = Ledger
+
     def __init__(self,p,checkpoint):
         self.p,self.checkpoint = p,checkpoint
         self.child,self.reader,self.g = None,None,None
@@ -246,12 +260,15 @@ class Supervisor:
         if self.child or not h.last or h.rows[h.last] != "publish":
             return
         require(h.head == h.seal)
+        self.spawn(h.last,HOST,"/run/e4/assets","0.0.0")
+
+    def spawn(self,g,host,assets,version):
         with self.lease() as lease:
             r,w = os.pipe()
             try:
-                args = [HOST,"--assets","/run/e4/assets","--port","0",
+                args = [host,"--assets",assets,"--port","0",
                         "--core-control",str(self.p.parent/(self.p.name+"-v3.sock"))]
-                self.child = subprocess.Popen(args,env={"STEER_PLUGIN_ID":"steer-ui","STEER_PLUGIN_VERSION":"0.0.0",
+                self.child = subprocess.Popen(args,env={"STEER_PLUGIN_ID":"steer-ui","STEER_PLUGIN_VERSION":version,
                     "STEER_EVENT_FD":str(w)},pass_fds=(lease.fileno(),w),stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             except BaseException:
@@ -259,7 +276,7 @@ class Supervisor:
                 raise
             finally:
                 os.close(w)
-            self.reader,self.g = r,h.last
+            self.reader,self.g = r,g
 
     def apply(self,h,op,g):
         require(belongs(h.nonce,g),"bad-generation")
@@ -284,11 +301,14 @@ class Supervisor:
             self.reconcile(h)
         return {"phase":h.rows.get(g),"head":h.head,"pid":self.child.pid if self.g == g else None}
 
+    def tick_needed(self):
+        return True
+
     def serve(self):
-        t = boundary(self.p)
+        t = self.boundary(self.p)
         with (self.p/"owner.lock").open("r+b") as owner, socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as server:
             fcntl.lockf(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            h = Ledger(self.p,t)
+            h = self.journal(self.p,t)
             server.bind(address(t))
             # No clients yet. Complete only an intact, single prepared tail.
             h.seal_tail()
@@ -298,10 +318,11 @@ class Supervisor:
             while True:
                 if time.monotonic() >= next_tick:
                     try:
-                        require(boundary(self.p) == t)
-                        h = Ledger(self.p,t)
-                        h.seal_tail()
-                        self.reconcile(h)
+                        if self.tick_needed():
+                            require(self.boundary(self.p) == t)
+                            h = self.journal(self.p,t)
+                            h.seal_tail()
+                            self.reconcile(h)
                     except (OSError,ValueError,TypeError,Refusal):
                         pass  # no launch or cleanup on a damaged boundary
                     next_tick = time.monotonic()+.1
@@ -316,9 +337,9 @@ class Supervisor:
                         _,uid,_ = struct.unpack("3i",c.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
                         require(uid == os.getuid())
                         q = json.loads(c.recv(1024))
-                        require(isinstance(q,list) and len(q)==6 and q[:3]==[PROFILE,t["nonce"],ID])
-                        require(boundary(self.p) == t)
-                        result = self.apply(Ledger(self.p,t),q[4],q[3])
+                        require(isinstance(q,list) and len(q)==6 and q[:3]==[t["profile"],t["nonce"],ID])
+                        require(self.boundary(self.p) == t)
+                        result = self.apply(self.journal(self.p,t),q[4],q[3])
                         reply = dict(ok=True,**result)
                     except (OSError,ValueError,TypeError,Refusal,subprocess.TimeoutExpired) as e:
                         reply = dict(ok=False,error=str(e))
