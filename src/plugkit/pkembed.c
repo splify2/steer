@@ -572,7 +572,7 @@ static const struct plugin_embed_file f_tgws[] = {
     "  \"compat\": {\n"
     "    \"steer-api\": \"^1.5\",\n"
     "    \"splify2-api\": \"^1.0\",\n"
-    "    \"steer-crypto\": \"^1.0\"\n"
+    "    \"steer-crypto\": \"^2.0\"\n"
     "  },\n"
     "  \"arch\": [\n"
     "    \"aarch64_cortex-a53\",\n"

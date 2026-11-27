@@ -9,7 +9,7 @@
   "homepage": "https://github.com/splify2/steer",
   "compat": {
     "steer-api": "^1.1",
-    "steer-crypto": "^1.0"
+    "steer-crypto": "^2.0"
   },
   "arch": [
     "aarch64_cortex-a53",

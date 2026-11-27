@@ -1079,7 +1079,7 @@ print("" if len(set(v)) == len(v) and k == sorted(k) else " ".join(v))')"
         have="$(jget "$mf" '" ".join(sorted({(c.get("argv") or [c["name"]])[0] for c in d["steer"].get("commands",[])} | {k["helper"].get("cmd", k["name"]) for k in d["steer"].get("kinds",[]) if k.get("helper")} | {k[h]["argv"][0] for k in d["steer"].get("kinds",[]) for h in ("check","expand") if k.get(h)}))') "
         check "plugins/$q: подкоманды, помощник и хуки — команды программы плагина (PK_PROGRAM)" "$want" "$have"
         case " $(profile_var PLUGINS_NET1) " in
-            *" $q "*) check "plugins/$q: requires.plugins.net1 = ^$n1maj.$n1min" "^$n1maj.$n1min" "$(jget "$mf" 'd["requires"]["plugins"]["net1"]')" ;;
+            *" $q "*) check "plugins/$q: requires.plugins.net1 = ^$n1ver" "^$n1ver" "$(jget "$mf" 'd["requires"]["plugins"]["net1"]')" ;;
             *) check "plugins/$q: без net1 (стек ему не нужен)" "None" "$(jget "$mf" 'd.get("requires",{}).get("plugins",{}).get("net1")')" ;;
         esac
         check "plugins/$q: помощник запускается с --conf {conf}" "" \

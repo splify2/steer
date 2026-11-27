@@ -181,6 +181,11 @@ if [ -n "${ZIG:-}" ]; then
     _ms="$(zig env | sed -n 's/.*"lib_dir": *"\([^"]*\)".*/\1/p')/libc/musl/src/string"
     case "$CC" in *aarch64*) _ma=aarch64 ;; *x86_64*) _ma=x86_64 ;; *" arm"*) _ma=arm ;; *) _ma="" ;; esac
     mkdir -p "$OBJ/memops"
+    # The integrated assembler keeps CPU-default FP/NEON attributes even
+    # when -mcpu disables those features. For soft-float ARM, forbid them
+    # explicitly in the musl assembly too (and reject any such instruction).
+    _maf=""
+    case "$CC " in *"arm-linux-musleabi "*) _maf="-mfpu=none" ;; esac
     _mf="memcpy memmove memset"
     [ "$_ma" = arm ] && _mf="$_mf __aeabi_memcpy __aeabi_memset"
     for _f in $_mf; do
@@ -188,7 +193,7 @@ if [ -n "${ZIG:-}" ]; then
         for _e in S s; do [ -n "$_ma" ] && [ -f "$_ms/$_ma/$_f.$_e" ] && _src="$_ms/$_ma/$_f.$_e"; done
         [ -f "$_src" ] || { echo "build-libs: нет $_src (исходники musl в zig)" >&2; exit 1; }
         # shellcheck disable=SC2086
-        $CC -O2 -fPIC -ffreestanding -fno-builtin $NOUNW -c "$_src" -o "$OBJ/memops/$_f.o"
+        $CC -O2 -fPIC -ffreestanding -fno-builtin $NOUNW $_maf -c "$_src" -o "$OBJ/memops/$_f.o"
         MEMOPS="$MEMOPS $OBJ/memops/$_f.o"
     done
 fi

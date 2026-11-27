@@ -35,6 +35,10 @@ RUN apk add --no-cache curl xz \
  && rm /tmp/zig.tar.xz \
  && zig version
 
+# Zig 0.13: libc.S использует PTR32 для экспортов time64, но задаёт только PTR64.
+# Определяем его в 32-битной ветке импортной libc; сам libc роутера не меняется.
+RUN sed -i '/^#define WEAK64 \.globl$/i #define PTR32' "/opt/zig-linux-x86_64-${ZIG_VERSION}/lib/libc/musl/libc.S"
+
 # ВЕРСИЯ wolfSSL И ЕЁ СУММА ЗАПИСАНЫ НЕ ЗДЕСЬ, а в build/wolfssl/fetch.sh — одном месте на все
 # сборки (образ, стенды на хосте, проверку под телефон): образ копирует скрипт и зовёт его. Скрипт
 # сверяет sha256 тарбола и отказывается распаковывать несошедшийся (I-033: прежде тарбол mbedtls
