@@ -336,6 +336,49 @@ int main(void) {
     check("повтор после явного отказа", 1, plugin_refresh());
     check("после исправного повтора отметка принята", 0, plugin_refresh());
 
+    char state[400], saved[400];
+    snprintf(state, sizeof(state), "%s/state.json", g_etc);
+    snprintf(saved, sizeof(saved), "%s/state.saved", g_etc);
+    if (rename(state, saved)) { perror(state); return 2; }
+    const struct plugin *last_hp = plugin_find("hp");
+    const struct plugin_kind *last_ge = plugin_kind_find("k-c-ge"), *last_late = plugin_kind_find("k-c-late");
+    const char *bad_states[] = { "{\"plugins\":", "", "[]", "{\"schema\":1}", "{\"plugins\":[]}", "{\"schema\":2,\"plugins\":{}}",
+                                 "{\"plugins\":{\"hp\":null}}", "{\"plugins\":{\"hp\":{\"enabled\":\"no\"}}}" };
+    for (size_t i = 0; i < sizeof(bad_states) / sizeof(bad_states[0]); i++) {
+        put("../etc/state.json", bad_states[i]);
+        rc = plugin_refresh();
+        if (!i) printf("truncated state: rc=%d kinds=%zu same=%d\n", rc, plugin_kinds_n(), plugin_find("hp") == last_hp);
+        check("непригодная политика сохраняет прежние виды и адреса", 1,
+              rc == -1 && plugin_n() == packages && plugin_kinds_n() == 2 && plugin_find("hp") == last_hp &&
+              plugin_kind_find("k-c-ge") == last_ge && plugin_kind_find("k-c-late") == last_late);
+    }
+    /* На Linux чтение каталога даёт EISDIR даже под root; chmod 000 под root ненадёжен. */
+    if (unlink(state) || mkdir(state, 0700)) { perror(state); return 2; }
+    rc = plugin_refresh();
+    printf("unreadable state: rc=%d kinds=%zu same=%d\n", rc, plugin_kinds_n(), plugin_find("hp") == last_hp);
+    check("ошибка чтения не открывает ручную раскладку", 1,
+          rc == -1 && plugin_find("hp") == last_hp && plugin_kinds_n() == 2 && !plugin_kind_find("hpkind"));
+    check("пока чтение не исправилось, повтор тоже отказывает", -1, plugin_refresh());
+    if (rmdir(state) || rename(saved, state)) { perror(state); return 2; }
+    check("первое исправное чтение даже с прежней отметкой публикует политику", 1,
+          plugin_refresh() == 1 && plugin_find("hp") != last_hp && plugin_kinds_n() == 2 &&
+          plugin_kind_find("k-c-ge") && plugin_kind_find("k-c-late") && !plugin_cmd_find("hp-cmd"));
+    check("повтор без изменений", 0, plugin_refresh());
+    put("../etc/state.json", "{\"schema\":1,\"plugins\":{}}\n");
+    check("пустой реестр менеджера оставляет все пакеты выключенными", 1,
+          plugin_refresh() == 1 && plugin_n() == packages && !plugin_kinds_n() && !plugin_cmd_find("hp-cmd"));
+    if (unlink(state)) { perror(state); return 2; }
+    check("только отсутствие политики возвращает ручную раскладку", 1,
+          plugin_refresh() == 1 && plugin_kinds_n() == kinds && plugin_kind_find("hpkind") && plugin_cmd_find("hp-cmd"));
+    last_hp = plugin_find("hp");
+    if (symlink("missing-target", state)) { perror(state); return 2; }
+    check("висячая ссылка не совпадает с отметкой отсутствующего файла", 1,
+          plugin_refresh() == -1 && plugin_find("hp") == last_hp);
+    if (unlink(state)) { perror(state); return 2; }
+    put("../etc/state.json", "{\"schema\":1,\"plugins\":{\"c-ge\":{\"enabled\":true},\"c-late\":{\"enabled\":true}},\"system_ours\":[]}");
+    check("непустая политика после ручной раскладки", 1,
+          plugin_refresh() == 1 && plugin_kinds_n() == 2 && plugin_kind_find("k-c-ge") && plugin_kind_find("k-c-late"));
+
     /* Удаление пакета (менеджер уносит каталог целиком) — исправное перечитывание. */
     char late[400], removed[400];
     snprintf(late, sizeof(late), "%s/c-late", g_root);

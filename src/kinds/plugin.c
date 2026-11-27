@@ -777,8 +777,53 @@ static int pl_cmp(const void *a, const void *b) {
     return strcmp(((const struct plugin *)a)->id, ((const struct plugin *)b)->id);
 }
 
+/* ENOENT при stat/open бывает и у висячей ссылки. Ручная раскладка — только без самого файла. */
+static int state_absent(const char *path) {
+    struct stat st;
+    return errno == ENOENT && lstat(path, &st) < 0 && errno == ENOENT;
+}
+
+/* pm_state_save_group пишет plugins как объект записей. Разрешены пустой plugins и краткие
+ * legacy-записи без schema/version. Не требуем полей менеджера, не участвующих в выборе видов. */
+static int state_policy_valid(const struct ynode *root) {
+    const struct ynode *plugins = ynode_get(root, "plugins"), *schema = ynode_get(root, "schema");
+    long version;
+    if (!plugins || plugins->kind != YN_MAP || (schema && (ynode_long(schema, &version) || version != 1))) return 0;
+    for (size_t i = 0; i < ynode_len(plugins); i++) {
+        const struct ynode *p = ynode_val_at(plugins, i);
+        const struct ynode *enabled = ynode_get(p, "enabled"), *state = ynode_get(p, "state"), *why = ynode_get(p, "why");
+        int en;
+        if (p->kind != YN_MAP || (enabled && ynode_bool(enabled, &en)) ||
+            (state && state->kind != YN_SCALAR) || (why && why->kind != YN_SCALAR)) return 0;
+    }
+    return 1;
+}
+
+/* Успех с NULL — файла нет; существующий надо дочитать до EOF и принять целиком. */
+static int state_read(const char *path, struct ydoc **out) {
+    *out = NULL;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return state_absent(path) ? 0 : -1;
+    struct sbuf b = {0};
+    char chunk[4096];
+    ssize_t n;
+    for (;;) {
+        n = read(fd, chunk, sizeof(chunk));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0 || b.n + (size_t)n > YDOC_MAX_BYTES) break;
+        sb_put(&b, chunk, (size_t)n);
+        if (b.oom) break;
+    }
+    struct err e = {0};
+    struct ydoc *d = close(fd) == 0 && n == 0 ? ydoc_parse_buf(b.p, b.n, path, &e) : NULL;
+    free(b.p);
+    if (!state_policy_valid(ydoc_root(d))) { ydoc_free(d); return -1; }
+    *out = d;
+    return 0;
+}
+
 /* state.json менеджера: что включено. Нет файла — включено всё, что лежит (стенды, ручная
- * раскладка); есть — только записанное с enabled: true. */
+ * раскладка); есть — только записанное с enabled: true (по умолчанию). */
 static int state_enabled(const char *id, int have_state, const struct ydoc *sd, char **why) {
     *why = NULL;
     if (!have_state) return 1;
@@ -860,31 +905,28 @@ static int stamp_of(struct timespec *a, struct timespec *b, off_t *sz) {
     struct stat st;
     char etc[PATH_MAX], sp[PATH_MAX + 16];
     memset(a, 0, sizeof(*a)); memset(b, 0, sizeof(*b)); *sz = -1;
-    int have = 0;
-    if (stat(plugin_root(), &st) == 0) { *a = st.st_mtim; have = 1; }
+    if (stat(plugin_root(), &st) == 0) *a = st.st_mtim;
     plugin_etc(etc, sizeof(etc));
     snprintf(sp, sizeof(sp), "%s/state.json", etc);
-    if (stat(sp, &st) == 0) { *b = st.st_mtim; *sz = st.st_size; have = 1; }
-    return have;
+    if (stat(sp, &st) == 0) { *b = st.st_mtim; *sz = st.st_size; }
+    else if (!state_absent(sp)) return -1;
+    return 0;
 }
 int plugin_reload(const char *root) {
     struct plugin_registry next = {0};
     /* И принудительный reload при том же stamp после отказа надо повторить. */
     retry_reload = 1;
-    stamp_of(&next.dir_time, &next.state_time, &next.state_size);
+    if (stamp_of(&next.dir_time, &next.state_time, &next.state_size) < 0) return -1;
     if (!root) root = plugin_root();
     DIR *d = opendir(root);
     if (!d && errno != ENOENT) return -1;
     char etc[PATH_MAX], sp[PATH_MAX + 16];
     plugin_etc(etc, sizeof(etc));
     snprintf(sp, sizeof(sp), "%s/state.json", etc);
-    size_t sn;
-    char *stxt = slurp(sp, &sn);
-    struct ydoc *sd = NULL;
-    if (stxt) {
-        struct err e;
-        memset(&e, 0, sizeof(e));
-        sd = ydoc_parse_buf(stxt, sn, sp, &e);
+    struct ydoc *sd;
+    if (state_read(sp, &sd) < 0) {
+        if (d) closedir(d);
+        return -1;
     }
     struct dirent *de;
     int rc = 0;
@@ -927,7 +969,6 @@ int plugin_reload(const char *root) {
     }
     if (d) closedir(d);
     ydoc_free(sd);
-    free(stxt);
     if (rc) goto fail;
     if (next.n > 1) qsort(next.pl, next.n, sizeof(*next.pl), pl_cmp);
     /* Записи видов указывают на плагин по адресу в массиве: после сортировки и роста массива
@@ -961,7 +1002,7 @@ fail:
 int plugin_refresh(void) {
     struct timespec a, b;
     off_t sz;
-    stamp_of(&a, &b, &sz);
+    if (stamp_of(&a, &b, &sz) < 0) { retry_reload = 1; return -1; }
     if (g_loaded && !retry_reload &&
         a.tv_sec == current.dir_time.tv_sec && a.tv_nsec == current.dir_time.tv_nsec &&
         b.tv_sec == current.state_time.tv_sec && b.tv_nsec == current.state_time.tv_nsec && sz == current.state_size)
