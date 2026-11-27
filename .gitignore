@@ -54,6 +54,7 @@ build/subfetchmatch
 build/fwmatch
 build/obfsmatch
 build/visionmatch
+build/vlessprobematch
 build/tlsprobematch
 build/specmatch-ext
 build/awgmatch

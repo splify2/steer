@@ -921,3 +921,15 @@ protocol-test:
 	python3 tests/tls13abi.py --baseline v2.1.4
 	python3 tests/tls13post.py --wolfssl-library "$(WOLFSSL_LIBRARY)" --sanitize
 	python3 tests/hy2response_build.py --wolfssl-library "$(WOLFSSL_LIBRARY)" --ngtcp2-library "$(NGTCP2_LIBRARY)" --sanitize
+
+.PHONY: vless-probe-stream-test
+test: vless-probe-stream-test
+vless-probe-stream-test: $(BUILD)/vlessprobematch
+	@$(BUILD)/vlessprobematch
+$(BUILD)/vlessprobematch: tests/vlessprobematch.c src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c $(wildcard src/proto/vless/*.h src/proto/transport/*.h)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--wrap=clock_gettime,--wrap=poll -o $@ $(filter %.c,$^)
+
+.PHONY: dns-cache-generation-test
+dns-cache-generation-test: all
+	unshare -n sh -c 'ip link set lo up && python3 tests/dns_reused_upstream_cache_test.py --binary $(BUILD)/steer'
