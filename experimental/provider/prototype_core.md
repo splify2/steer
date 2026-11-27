@@ -14,6 +14,10 @@ make -C steer/experimental/provider BUILD=/tmp/steer-provider-build test
 Run with `steer-prototype --config FILE --control /private/directory/core.sock`
 and optional `--state-dir /private/state-directory`.
 
+The combined Linux Full host also accepts `--direct-tcp-clients 100|1000`
+for the managed v3 direct TCP profile. The default is 32 shared clients.
+See [profile limits, measurements and reproduction](direct-tcp-budget.md).
+
 ### Experimental selected/runtime divergence
 
 `--experimental-durable-split` opts the standalone configured host into an

@@ -63,9 +63,12 @@
 #include <pthread.h>
 #include <limits.h>
 #include <sys/eventfd.h>
+#include <sys/resource.h>
 
 #define CLIENTS 32
 #define CAPACITY 16384
+#define DIRECT_CHUNK 4096 /* expanded profile: one in-flight slice per direction */
+#define DIRECT_FD_RESERVE 128 /* control, listeners, generations and transient opens */
 #define GENERATIONS 8
 #define LISTENERS 32 /* 16 published plus 16 transactionally prepared */
 #define HY2_DRAIN_MS 30000u /* host-owned monotonic retirement policy */
@@ -213,6 +216,7 @@ struct host {
     struct listener listeners[LISTENERS];
     struct loop_timer *work;
     struct client *clients;
+    unsigned client_limit, chunk, work_cursor;
     int stopping;
     int control_fd;
     char control_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
@@ -532,7 +536,7 @@ static void handshake(struct client *c)
             publish_flow(c, &target); return;
         }
         c->input_offset = 0;
-        (void)submit(&c->directions[0], c->down, 0, 0, CAPACITY);
+        (void)submit(&c->directions[0], c->down, 0, 0, c->host->chunk);
         return;
     }
     event = s5_feed(&c->codec, p + c->input_offset, c->input_length, &consumed);
@@ -548,15 +552,15 @@ static void handshake(struct client *c)
 #endif
     else {
         c->input_offset = 0;
-        (void)submit(&c->directions[0], c->down, 0, 0, CAPACITY);
+        (void)submit(&c->directions[0], c->down, 0, 0, c->host->chunk);
     }
 }
 static void relay_start(struct client *c)
 {
     struct direction *d = &c->directions[0];
     if (c->input_length) (void)submit(d, c->up, 1, c->input_offset, c->input_length);
-    else (void)submit(d, c->down, 0, 0, CAPACITY);
-    if (c->phase != CLOSING) (void)submit(&c->directions[1], c->up, 0, 0, CAPACITY);
+    else (void)submit(d, c->down, 0, 0, c->host->chunk);
+    if (c->phase != CLOSING) (void)submit(&c->directions[1], c->up, 0, 0, c->host->chunk);
     c->input_length = c->input_offset = 0;
 }
 static void relay_done(struct client *c, unsigned index)
@@ -573,7 +577,7 @@ static void relay_done(struct client *c, unsigned index)
         if (!d->bytes) { close_client(c); return; }
         if (d->bytes < d->length) {
             (void)submit(d, target, 1, d->offset + d->bytes, d->length - d->bytes);
-        } else (void)submit(d, source, 0, 0, CAPACITY);
+        } else (void)submit(d, source, 0, 0, c->host->chunk);
     } else if (d->bytes) (void)submit(d, target, 1, 0, d->bytes);
     else {
         d->eof = 1;
@@ -624,7 +628,7 @@ static void advance(struct client *c)
                 if (c->phase == RELAY) relay_start(c);
                 else if(c->phase == UDP_CONTROL) {
                     loop_timer_stop(c->deadline);
-                    (void)submit(&c->directions[0],c->down,0,0,CAPACITY);
+                    (void)submit(&c->directions[0],c->down,0,0,c->host->chunk);
                 } else handshake(c);
             }
         }
@@ -668,7 +672,22 @@ static void work(struct loop *l, struct loop_timer *t, void *arg)
 {
     struct host *h = arg; unsigned i;
     (void)t;
-    for (i = 0; i < CLIENTS; ++i) if (h->clients[i].live) advance(&h->clients[i]);
+    if (h->client_limit == CLIENTS) {
+        for (i = 0; i < CLIENTS; ++i) if (h->clients[i].live) advance(&h->clients[i]);
+    } else {
+        /* Expanded TCP only. Bound callback work, rotate past the last served
+         * slot and let epoll deliver control/worker events between batches. */
+        unsigned advanced = 0;
+        for (i = 0; i < h->client_limit && h->live; ++i) {
+            struct client *c = &h->clients[h->work_cursor++];
+            if (h->work_cursor == h->client_limit) h->work_cursor = 0;
+            if (!c->live || !(c->route_completed || c->directions[0].completed ||
+                c->directions[1].completed || (c->phase == CLOSING && !c->release_failed &&
+                !c->route_pending && !c->directions[0].pending && !c->directions[1].pending))) continue;
+            advance(c);
+            if (++advanced == CLIENTS) { loop_timer_set(h->work, 0); break; }
+        }
+    }
 #ifdef STEER_PROTOTYPE_HY2
     int pending=reap_hy2_listeners(h);
 #else
@@ -710,8 +729,8 @@ static void accept_clients(struct loop *l, int fd, uint32_t events, void *arg)
             socks = &g->socks[listener - h->listeners];
             if (!socks->admitting) { close(accepted); continue; }
         } else if (listener->spec.protocol != STEER_PROTOTYPE_VLESS) { close(accepted); continue; }
-        for (i = 0; i < CLIENTS && h->clients[i].live; ++i) {}
-        if (i == CLIENTS) { close(accepted); continue; }
+        if (h->live == h->client_limit) { close(accepted); continue; }
+        for (i = 0; h->clients[i].live; ++i) {}
         c = &h->clients[i]; memset(c, 0, sizeof(*c));
         c->host = h; c->live = 1; h->live++;
         c->generation = g; c->socks = socks;
@@ -742,8 +761,8 @@ static void accept_clients(struct loop *l, int fd, uint32_t events, void *arg)
             (void)steer_draft_stream_api()->release(native);
             close_client(c); continue;
         }
-        if (h->buffer_api->allocate(h->buffers, CAPACITY, &c->directions[0].buffer).code ||
-            h->buffer_api->allocate(h->buffers, CAPACITY, &c->directions[1].buffer).code) {
+        if (h->buffer_api->allocate(h->buffers, h->chunk, &c->directions[0].buffer).code ||
+            h->buffer_api->allocate(h->buffers, h->chunk, &c->directions[1].buffer).code) {
             close_client(c); continue;
         }
         if (socks) {
@@ -754,7 +773,7 @@ static void accept_clients(struct loop *l, int fd, uint32_t events, void *arg)
         }
         else vl_decoder_init(&c->vless, verify_uuid, c);
         loop_timer_set(c->deadline, 5000);
-        (void)submit(&c->directions[0], c->down, 0, 0, CAPACITY);
+        (void)submit(&c->directions[0], c->down, 0, 0, h->chunk);
     }
 }
 #ifdef STEER_PROTOTYPE_HY2
@@ -798,7 +817,7 @@ static void stop(struct loop *l, int signo, void *arg)
     }
     if (h->controls) for (i = 0; i < CONTROLS; ++i) close_control(&h->controls[i]);
     for (i = 0; i < LISTENERS; ++i) close_listener(h,&h->listeners[i]);
-    for (i = 0; i < CLIENTS; ++i) if (h->clients[i].live) close_client(&h->clients[i]);
+    for (i = 0; i < h->client_limit; ++i) if (h->clients[i].live) close_client(&h->clients[i]);
     loop_timer_set(h->work, 0);
 }
 static int hex_digit(unsigned char value)
@@ -868,7 +887,7 @@ static int prepare_stream_routes(struct host *h, struct generation *g,
 {
     g->host = h;
     if (steer_draft_native_stream_backend_create(h->loop, h->runtime, h->backend_runtime,
-        h->resolver, g->number, g->number, CLIENTS, 16*CLIENTS,
+        h->resolver, g->number, g->number, CLIENTS, 16*CLIENTS + 2*(h->client_limit-CLIENTS),
         generation_retired, g, &g->native).code) return 0;
 #ifdef STEER_PROTOTYPE_WG_NETNS
     if(h->wg&&steer_draft_native_stream_socket_guard(g->native,steer_prototype_wg_bind_stream,h->wg).code)
@@ -930,7 +949,7 @@ static int prepare_stream_routes(struct host *h, struct generation *g,
     if(h->wg)return !steer_draft_stream_routes_create(h->loop,g->number,CLIENTS,CLIENTS,
         bindings,count,select_wg_stream,h->wg,NULL,&g->streams).code;
 #endif
-    return !steer_draft_stream_routes_create(h->loop, g->number, CLIENTS, CLIENTS,
+    return !steer_draft_stream_routes_create(h->loop, g->number, CLIENTS, h->client_limit,
         bindings, count, select_stream, g->policy,
         NULL, &g->streams).code;
 }
@@ -1100,11 +1119,14 @@ static void reap_generations(struct host *h)
 static int initialize_host(struct host *h, struct client *clients)
 {
     unsigned i;
-    struct steer_draft_buffer_limits limits = steer_draft_prototype_buffer_limits(CLIENTS,CAPACITY,0);
+    unsigned n = h->client_limit ? h->client_limit : CLIENTS;
+    h->client_limit = n;
+    h->chunk = n == CLIENTS ? CAPACITY : DIRECT_CHUNK;
+    struct steer_draft_buffer_limits limits = steer_draft_prototype_buffer_limits(n,h->chunk,0);
 #ifdef STEER_PROTOTYPE_HY2
     steer_draft_hy2_datagram_budget_init(&h->datagram_budget);
     /* Keep the original TCP byte and slot reserve even at full UDP envelope. */
-    limits=steer_draft_prototype_buffer_limits(CLIENTS,CAPACITY,1);
+    if (n == CLIENTS) limits=steer_draft_prototype_buffer_limits(n,h->chunk,1);
 #endif
 #if defined(STEER_PROTOTYPE_VLESS_OUTBOUND) || defined(STEER_PROTOTYPE_SOCKS_OUTBOUND)
     /* One bounded handshake buffer per pending TCP open, in addition to relay. */
@@ -1115,22 +1137,25 @@ static int initialize_host(struct host *h, struct client *clients)
 #ifdef STEER_PROTOTYPE_SOCKS_OUTBOUND
     if(handshake_max<STEER_DRAFT_SOCKS_HANDSHAKE_MAX)handshake_max=STEER_DRAFT_SOCKS_HANDSHAKE_MAX;
 #endif
-    limits.max_buffers += CLIENTS;
-    limits.max_bytes += CLIENTS*(handshake_max+256ULL);
+    if (n == CLIENTS) {
+        limits.max_buffers += CLIENTS;
+        limits.max_bytes += CLIENTS*(handshake_max+256ULL);
+    }
 #endif
-    h->clients = clients;
     h->control_fd = -1;
     h->writer.wake = -1;
     for (i = 0; i < LISTENERS; ++i) h->listeners[i].fd = -1;
+    h->clients = n == CLIENTS ? clients : calloc(n, sizeof(*clients));
+    if (!h->clients) return 0;
     h->buffer_api = steer_draft_buffers_api();
     h->loop = loop_new();
     if (!h->loop || steer_draft_buffers_create(&limits, NULL, &h->buffers).code) return 0;
-    if (steer_draft_stream_runtime_create(h->loop, h->buffers, 2*CLIENTS, 2*CLIENTS,
-                                        2*CLIENTS*CAPACITY, &h->runtime).code) return 0;
+    if (steer_draft_stream_runtime_create(h->loop, h->buffers, 2*n, 2*n,
+                                        2*n*h->chunk, &h->runtime).code) return 0;
     h->work = loop_timer_new(h->loop, work, h);
     if (!h->work) return 0;
-    if (steer_draft_backend_runtime_create(h->loop, 2*CLIENTS, 4*CLIENTS,
-                                          2*CLIENTS*CAPACITY, &h->backend_runtime).code) return 0;
+    if (steer_draft_backend_runtime_create(h->loop, 2*n, 2*n + 2*CLIENTS,
+                                          2*n*h->chunk, &h->backend_runtime).code) return 0;
     (void)loop_signal(h->loop, SIGTERM, stop, h); (void)loop_signal(h->loop, SIGINT, stop, h);
     return 1;
 }
@@ -1325,6 +1350,7 @@ static void cleanup_host(struct host *h)
     if (h->runtime && steer_draft_stream_runtime_destroy(h->runtime).code) abort();
     if (h->buffers && steer_draft_buffers_destroy(h->buffers).code) abort();
     if (h->loop) loop_free(h->loop);
+    if (h->client_limit > CLIENTS) free(h->clients);
     free(h->selected_document);
 }
 int steer_lab_loopback_main(int argc, char **argv, int vless)
@@ -1530,6 +1556,14 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     if(inputs) { config=inputs->config;inputs->config=NULL;if(!config)return 422; }
     else if(steer_prototype_config_parse_with_vpn(document,length,next,&h->socks_vpn,&config).code)return 422;
     if(initial_format&&initial_format!=config->format)goto cleanup;
+    if (h->client_limit > CLIENTS) {
+        if (config->format != STEER_STORE_FORMAT_SPEC_V3 || config->stream_outbound_count ||
+            config->wg || config->wg_inbound_validate) goto cleanup;
+        for (i = 0; i < config->listener_count; i++)
+            if ((config->listeners[i].protocol != STEER_PROTOTYPE_SOCKS &&
+                 config->listeners[i].protocol != STEER_PROTOTYPE_VLESS) ||
+                config->listeners[i].socks_udp_associate) goto cleanup;
+    }
     /* A managed control session must not sidestep its bind policy by applying
      * the legacy developer format, which intentionally supports wildcard. */
     if(h->current&&h->current->config->format==STEER_STORE_FORMAT_SPEC_V3&&
@@ -1684,7 +1718,7 @@ static int prepare_configuration(struct host *h, const char *document, size_t le
     }
     if (!prepare_stream_routes(h, g, credentials)) { result = 503; goto cleanup; }
 #ifdef STEER_PROTOTYPE_HY2
-    if (!prepare_datagram_routes(h, g, credentials)) { result = 503; goto cleanup; }
+    if (h->client_limit == CLIENTS && !prepare_datagram_routes(h, g, credentials)) { result = 503; goto cleanup; }
 #endif
     for (i = 0; i < g->config->listener_count; ++i) {
         const struct steer_prototype_listener *spec = &g->config->listeners[i];
@@ -1769,7 +1803,7 @@ static void publish_prepared(struct host *h, struct prepared *prepared)
 {
     unsigned i;
 #ifdef STEER_PROTOTYPE_SOCKS_UDP
-    for(i=0;i<CLIENTS;i++)
+    for(i=0;i<h->client_limit;i++)
         if(h->clients[i].live && h->clients[i].udp && h->clients[i].generation==h->current)
             close_client(&h->clients[i]);
 #endif
@@ -1835,9 +1869,9 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
     char revision[32];
     if(h->experimental_durable_split&&h->durability_uncertain)strcpy(revision,"null");
     else snprintf(revision,sizeof revision,"%llu",(unsigned long long)(h->selected_document?h->selected_revision:h->current->number));
-    int n = snprintf(out, capacity, "{\"prototype\":\"steer-linux-v1\",\"generation\":%llu,\"revision\":%s,\"runtimeReady\":%s,\"persistence\":%s,\"durability_uncertain\":%s,\"activeClients\":%u,\"retainedGenerations\":%u,\"listeners\":[",
+    int n = snprintf(out, capacity, "{\"prototype\":\"steer-linux-v1\",\"generation\":%llu,\"revision\":%s,\"runtimeReady\":%s,\"persistence\":%s,\"durability_uncertain\":%s,\"activeClients\":%u,\"tcpClientLimit\":%u,\"retainedGenerations\":%u,\"listeners\":[",
         (unsigned long long)h->current->number, revision,
-        ready?"true":"false",h->store ? "true" : "false", h->durability_uncertain ? "true" : "false", active_clients,retained);
+        ready?"true":"false",h->store ? "true" : "false", h->durability_uncertain ? "true" : "false", active_clients,h->client_limit,retained);
     if (n < 0 || (size_t)n >= capacity) return 0;
     used = (size_t)n;
     for (i = 0; i < LISTENERS; ++i) if (listener_bound(&h->listeners[i]) && h->listeners[i].active) {
@@ -1899,7 +1933,9 @@ static size_t status_json(struct host *h, char *out, size_t capacity)
         if(n<0||(size_t)n>=capacity-used)return 0;
         used+=(size_t)n;
     }
-    n=snprintf(out+used,capacity-used,"]},"
+    if (h->client_limit > CLIENTS)
+        n=snprintf(out+used,capacity-used,"]},\"providers\":[\"socks\",\"vless\"]},\"drainingListeners\":[");
+    else n=snprintf(out+used,capacity-used,"]},"
 #ifdef STEER_PROTOTYPE_SOCKS_UDP
         "\"spec_v3_socks_udp_associate_loopback_ipv4\":true,"
         "\"spec_v3_socks_udp_outbound_loopback_ipv4\":true,"
@@ -2382,6 +2418,18 @@ int steer_prototype_main(int argc, char **argv)
         }
 #endif
 #if defined(STEER_PROTOTYPE_WG_NETNS) && defined(STEER_PROTOTYPE_HY2)
+        else if(!strcmp(argv[i],"--direct-tcp-clients") && i+1<argc && !h.client_limit){
+            if(!strcmp(argv[i+1],"100"))h.client_limit=100;
+            else if(!strcmp(argv[i+1],"1000"))h.client_limit=1000;
+            else return 2;
+            struct rlimit lim;
+            unsigned need=2*h.client_limit + DIRECT_FD_RESERVE;
+            if(getrlimit(RLIMIT_NOFILE,&lim) || lim.rlim_cur<need){
+                fprintf(stderr,"--direct-tcp-clients requires soft NOFILE >= %u\n",need);
+                return 2;
+            }
+            i+=2;
+        }
         else if(!strcmp(argv[i],"--allow-wg-stream-netns")&&!linked_wg){linked_wg=1;i++;}
         else if(!strcmp(argv[i],"--validate-wg-inbound-netns")&&!inbound_validate){inbound_validate=1;i++;}
 #endif
@@ -2391,6 +2439,7 @@ int steer_prototype_main(int argc, char **argv)
         else return 2;
     }
     if(h.experimental_durable_split&&!state_dir)return 2;
+    if(h.client_limit&&(linked_wg||inbound_validate||inbound_runtime))return 2;
     if(h.experimental_durable_split&&(linked_wg||inbound_validate))return 2;
     if(inbound_runtime&&(linked_wg||inbound_validate||!state_dir))return 2;
 #ifdef STEER_PROTOTYPE_SPLIT_FAULT
