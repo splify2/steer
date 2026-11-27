@@ -25,7 +25,7 @@ from signed import (DIRS, ELF, FEED, LAB, PROFILE, SLOT, History, Owner, Refusal
                     boundary, call, sha)
 
 
-def fixtures():
+def fixtures(first=False):
     assert os.getuid() == 0
     with tempfile.TemporaryDirectory() as private:
         tmp = Path(private)
@@ -43,8 +43,9 @@ def fixtures():
         for name, key in zip(("A", "B", "foreign"), (keys[0], keys[0], keys[1])):
             meta = Path("pkg/plugin.json")
             m = json.loads(meta.read_bytes())
-            m["description"] = "Full UI fixture "+name
-            meta.write_text(json.dumps(m))
+            if not first or name!="A":
+                m["description"] = "Full UI fixture "+name
+                meta.write_text(json.dumps(m))
             sp.run(["./s2p", "build", "pkg", "--arch", "x86_64", "--key", key.with_suffix(".sec"),
                     "-o", tmp], check=True)
             archive, = tmp.glob("*.s2p")
@@ -59,6 +60,33 @@ def fixtures():
                     data = bytes([data[0]^1])+data[1:]
                 dst.addfile(member, io.BytesIO(data) if member.isfile() else None)
         save("tampered", buf.getvalue())
+        if first:
+            buf=io.BytesIO()
+            with tarfile.open(FEED/(ids["A"]+".s2p")) as src, tarfile.open(fileobj=buf,mode="w:gz") as dst:
+                for member in src:
+                    data=src.extractfile(member).read() if member.isfile() else b""
+                    if member.name=="MANIFEST.sig":
+                        pos=data.index(b"\n")+24
+                        data=data[:pos]+(b"A" if data[pos:pos+1]!=b"A" else b"B")+data[pos+1:]
+                    dst.addfile(member,io.BytesIO(data) if member.isfile() else None)
+            save("bad-signature",buf.getvalue())
+            for case in ("wrong-mode","extra","wrong-host"):
+                extra=Path("pkg/extra")
+                css=Path("pkg/assets/app.css")
+                if case=="extra":
+                    extra.write_text("unexpected signed file")
+                elif case=="wrong-mode":
+                    css.chmod(0o755)
+                else:
+                    with Path("pkg",ELF).open("ab") as f:
+                        f.write(b"not the approved ELF")
+                sp.run(["./s2p","build","pkg","--arch","x86_64","--key",keys[0].with_suffix(".sec"),
+                        "-o",tmp],check=True)
+                archive,=tmp.glob("*.s2p")
+                save(case,archive.read_bytes())
+                archive.unlink()
+                css.chmod(0o644)
+                extra.unlink(missing_ok=True)
         (FEED/"fixtures.json").write_text(json.dumps(ids))
 
 
@@ -118,7 +146,7 @@ def observe(p, g, info):
     return pid
 
 
-def served_assets(p, pid):
+def served_assets(p, pid, slot=SLOT):
     # Test ancestor only: ask the already identified child for its listening
     # address. No global socket/PID enumeration; a port is never identity.
     libc = ctypes.CDLL(None, use_errno=True)
@@ -141,7 +169,7 @@ def served_assets(p, pid):
         with contextlib.closing(HTTPConnection(host, port, timeout=2)) as conn:
             conn.request("GET", "/"+name)
             reply = conn.getresponse()
-            assert reply.status == 200 and reply.read() == (p/SLOT/"assets"/name).read_bytes()
+            assert reply.status == 200 and reply.read() == (p/slot/"assets"/name).read_bytes()
 
 
 def hist(p):
@@ -330,8 +358,8 @@ def main():
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["fixtures"]:
-        fixtures()
+    if sys.argv[1:] in (["fixtures"],["first-fixtures"]):
+        fixtures(sys.argv[1]=="first-fixtures")
     elif sys.argv[1:2] == ["owner"]:
         def cut(point):
             if point == sys.argv[3]:

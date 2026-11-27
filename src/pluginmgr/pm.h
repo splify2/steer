@@ -295,6 +295,10 @@ int pm_keepd_write(struct pm_ctx *x);
  * недостающие у стоящего плагина (ensure). 0 — на месте; -1 — путь занят чужим, причина в e. */
 int pm_links_repair(struct pm_ctx *x, const char *id, struct pm_err *e);
 int pm_file_sha256(const char *path, unsigned char out[32], unsigned long long *size);
+struct full_package;
+int pm_full_unpack(const char *blob,const char *tree,struct sigv_key *key,
+                   struct full_package *pkg,struct pm_err *e);
+int pm_binding_sha(const void *buf,size_t n,char out[65]);
 /* Скачать url в память (pmindex.c). 0 — ответ 2xx; why — причина отказа. */
 /* sig — подпись (потолок 1 МиБ), иначе индекс (16 МиБ): см. pmindex.c. */
 int pm_http_mem(const char *url, int sig, char **body, size_t *n, char *why, size_t wn);

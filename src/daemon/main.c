@@ -116,6 +116,7 @@ int aggregate_main(int argc, char **argv);
 int pm_main(int argc, char **argv) __attribute__((weak));
 int pm_prefix_main(const char *prefix, int argc, char **argv) __attribute__((weak));
 int pm_full_main(const char *,const char *,const char *,const char *,const char *) __attribute__((weak));
+int pm_first_main(const char *,int,char **) __attribute__((weak));
 
 static int no_plugin_mgr(void) {
     fprintf(stderr, "steer: менеджера плагинов в этой сборке нет — он в пакете steer-core\n");
@@ -155,10 +156,14 @@ int main(int argc, char **argv) {
         if (argc == 5 && i == 3 && !strcmp(argv[i], "--supd-full-prefix") &&
             !strcmp(argv[1], "daemon") && !strcmp(argv[2], "--supervise") && !tools_role(argv[0]))
             return supd_full_main(argv[4]);
+        if (argc>=5 && i==1 && !strcmp(argv[i],"--supd-full-prefix") && !strcmp(argv[3],"plugin") &&
+            (!strcmp(argv[4],"install-first") || !strcmp(argv[4],"confirm-first")) && !tools_role(argv[0]))
+            return pm_first_main ? pm_first_main(argv[2],argc-4,argv+4) : no_plugin_mgr();
         if (argc==8 && i==1 && !strcmp(argv[i],"--supd-full-prefix") && !strcmp(argv[3],"plugin") && !tools_role(argv[0]))
             return pm_full_main ? pm_full_main(argv[2],argv[4],argv[5],argv[6],argv[7]) : no_plugin_mgr();
         fputs("steerd: daemon --supervise --supd-full-prefix PREFIX; "
-              "либо --supd-full-prefix PREFIX plugin {remove,recover,inspect}-exact G BINDING TX\n", stderr);
+              "либо --supd-full-prefix PREFIX plugin {remove,recover,inspect}-exact G BINDING TX,\n"
+              "install-first TX ARCHIVE SHA256 TRUSTED_PUB HOST_SHA256 или confirm-first TX\n", stderr);
         return 2;
     }
     /* До platform, встроенных программ, поиска команд плагина и обращения к ctl. */

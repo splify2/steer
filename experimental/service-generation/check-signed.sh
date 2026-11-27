@@ -4,10 +4,13 @@ set -eu
 test_script=check_signed.py
 compat=
 old=
+musl=
 if [ "$#" != 3 ]; then
     case "$4:$#" in
         --native-supd:5) compat=$(realpath "$5"); test_script=check_native.py ;;
         --exact-remove:6) compat=$(realpath "$5"); old=$(realpath "$6"); test_script=check_remove.py ;;
+        --first-install:4) test_script=check_first.py ;;
+        --first-install-musl:5) test_script=check_first.py; musl=$(realpath "$5") ;;
         *) exit 2 ;;
     esac
 fi
@@ -40,12 +43,26 @@ exec unshare -mpnf --mount-proc --propagation private sh -ec '
         cp "$7"/steerd "$7"/libsteer*.so.* v214/
         cc -Wall -Wextra -Werror -shared -fPIC "$4/remove-cut.c" -o cut.so
     fi
+    if [ "$5" = check_first.py ]; then
+        cp "$4/check_first.py" .
+        cc -Wall -Wextra -Werror -shared -fPIC -nostdlib "$4/first-cut.c" -o first-cut.so
+        if [ -n "$8" ]; then
+            # Mount-private loader at PT_INTERP of the unchanged delivery ELF.
+            lib=$(realpath /lib)
+            mkdir upper work
+            mount -t overlay overlay -o "lowerdir=$lib,upperdir=$PWD/upper,workdir=$PWD/work" "$lib"
+            cp --remove-destination "$8" "$lib/ld-musl-x86_64.so.1"
+        fi
+    fi
     for d in /etc /var /tmp; do mount -t tmpfs tmpfs "$d"; done
     chmod 1777 /tmp
     ip link set lo up
     ldconfig -X -f /dev/null /run/e4
-    python3 -B check_signed.py fixtures
+    if [ -n "$8" ]; then echo /run/e4 >/etc/ld-musl-x86_64.path; fi
+    fixtures=fixtures
+    if [ "$5" = check_first.py ]; then fixtures=first-fixtures; fi
+    python3 -B check_signed.py "$fixtures"
     rm -r build pkg
     exec setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
         env -i PATH=/usr/bin:/bin HOME=/tmp python3 -Bu "$5"
-' sh "$ui" "$(realpath "$2")" "$(realpath "$3")" "$src" "$test_script" "$compat" "$old"
+' sh "$ui" "$(realpath "$2")" "$(realpath "$3")" "$src" "$test_script" "$compat" "$old" "$musl"

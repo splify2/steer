@@ -17,11 +17,13 @@
 #include <sys/epoll.h>
 #include "full_domain.h"
 #include "full_remove.h"
+#include "full_install.h"
 #include "helpers.h"
 #include "loop.h"
 #include "plugin.h"
 
-#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__) && defined(STATX_MNT_ID)
+#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__)
+#include <sys/time.h>
 #include <sys/xattr.h>
 #include <sys/random.h>
 #include <sys/syscall.h>
@@ -31,6 +33,7 @@
 /* Static/compatible builds without the verifier must refuse this profile. */
 extern int pm_file_sha256(const char *, unsigned char [32], unsigned long long *) __attribute__((weak));
 extern int pm_binding_sha(const void *,size_t,char [65]) __attribute__((weak));
+extern int pm_statx_mount_id(const char *,uint64_t *) __attribute__((weak));
 #define BIND "user.steer.supd1.binding"
 #define PHASE "user.steer.supd1.phase"
 #define TYPE "supd-full/1"
@@ -69,12 +72,13 @@ static int count_entries(const char *path) {
     return n;
 }
 
-static int disk_binding(struct full_domain *f) {
-    char actual[4096], expected[sizeof(actual)], path[512];
+static int walk_binding(struct full_domain *f,const struct full_package *pkg,const char *host,
+                        const char *type_hash,char actual[4096]) {
+    char path[512];
     size_t used = 0;
-    struct statx base;
+    uint64_t base;
     snprintf(path,sizeof(path),"%s/..",f->path);
-    if (statx(AT_FDCWD,path,0,STATX_MNT_ID,&base) || !(base.stx_mask & STATX_MNT_ID)) return -1;
+    if (!pm_statx_mount_id || pm_statx_mount_id(path,&base) || !base) return -1;
     f->retired=0;
     if (f->v2) {
         struct stat st;
@@ -90,9 +94,9 @@ static int disk_binding(struct full_domain *f) {
             snprintf(path,sizeof(path),"%s/retired-%s%s",f->path,f->g,e->name+4);
         else snprintf(path,sizeof(path),"%s/%s",f->path,e->name);
         struct stat st;
-        struct statx sx;
+        uint64_t mount;
         if (lstat(path,&st) || st.st_uid != getuid() ||
-            statx(AT_FDCWD,path,AT_SYMLINK_NOFOLLOW,STATX_MNT_ID,&sx) || sx.stx_mnt_id != base.stx_mnt_id)
+            pm_statx_mount_id(path,&mount) || mount!=base)
             return -1;
         char hex[65] = "-";
         if (e->children >= 0) {
@@ -107,14 +111,53 @@ static int disk_binding(struct full_domain *f) {
                 for (unsigned j=0;j<32;j++) snprintf(hex+2*j,3,"%02x",hash[j]);
             } else if (strcmp(e->name,"history") && st.st_size != 0) return -1;
         }
-        int n = snprintf(actual+used,sizeof(actual)-used,"%s %llu %llu %o %s\n",e->name,
+        if (pkg) {
+            int tree=!strncmp(e->name,"tree",4);
+            mode_t mode=e->children>=0 ? (tree?0755:0700) : !tree?0600:!strcmp(e->name,ELF)?0755:0644;
+            if (f->retired || (st.st_mode & 07777)!=mode ||
+                (!strcmp(e->name,"tree") && (st.st_dev!=pkg->dev || st.st_ino!=pkg->ino)) ||
+                (!strcmp(e->name,"type") && strcmp(type_hash,hex))) return -1;
+            if (tree && e->children<0) {
+                unsigned j=0;
+                while (j<pkg->n && strcmp(pkg->files[j].name,e->name+5)) j++;
+                if (j==pkg->n || pkg->files[j].dev!=st.st_dev || pkg->files[j].ino!=st.st_ino) return -1;
+                char signed_hex[65];
+                for (unsigned k=0;k<32;k++) snprintf(signed_hex+2*k,3,"%02x",pkg->files[j].hash[k]);
+                if (strcmp(hex,signed_hex) || (!strcmp(e->name,ELF) && strcmp(hex,host))) return -1;
+            }
+            int fd=open(path,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+            if (fd<0) return -1;
+            int rc=fsync(fd);
+            close(fd);
+            if (rc) return -1;
+        }
+        int n = snprintf(actual+used,sizeof(f->binding)-used,"%s %llu %llu %o %s\n",e->name,
                          (unsigned long long)st.st_dev,(unsigned long long)st.st_ino,(unsigned)st.st_mode,hex);
-        if (n < 0 || (size_t)n >= sizeof(actual)-used) return -1;
+        if (n < 0 || (size_t)n >= sizeof(f->binding)-used) return -1;
         used += (size_t)n;
     }
-    ssize_t n = lgetxattr(f->path,f->v2?FULL_BIND2:BIND,expected,sizeof(expected));
+    return (int)used;
+}
+
+static int disk_binding(struct full_domain *f) {
+    char actual[4096],expected[4096];
+    int used=walk_binding(f,NULL,NULL,NULL,actual);
+    if (used<0) return -1;
+    ssize_t n=lgetxattr(f->path,f->v2?FULL_BIND2:BIND,expected,sizeof(expected));
     return n == (ssize_t)used && n == f->binding_n && !memcmp(f->binding,expected,used) &&
            !memcmp(actual,expected,used) ? 0 : -1;
+}
+
+int full_first_capable(void) { return pm_file_sha256 && pm_binding_sha && pm_statx_mount_id; }
+
+int full_seal_new(const char *stage,const struct full_package *pkg,const char *host,
+                  const char *type_hash,char binding[65]) {
+    struct full_domain f={.v2=1};
+    if (!full_first_capable() || strlen(stage)>=sizeof(f.path) || pkg->n!=FULL_FILES) return -1;
+    strcpy(f.path,stage);
+    int n=walk_binding(&f,pkg,host,type_hash,f.binding);
+    return n<0 || lsetxattr(stage,FULL_BIND2,f.binding,(size_t)n,XATTR_CREATE) ||
+           pm_binding_sha(f.binding,(size_t)n,binding) ? -1 : 0;
 }
 
 static int hex32(const char *s) {
@@ -336,21 +379,25 @@ static void sig_cb(struct loop *l,int sig,void *arg) {
     else loop_stop(l,0);
 }
 
-static int read_domain(struct full_domain *f,const char *prefix,int writer) {
+static int read_domain(struct full_domain *f,const char *prefix,const char *location,int writer) {
     char path[300], meta[512], expected[512], archive[65], key[65], real[4096];
     const char *base="/tmp/e4-lab-";
     if (!getuid() || geteuid()!=getuid() || getegid()!=getgid() ||
         strlen(prefix)>80 || strncmp(prefix,base,strlen(base)) ||
-        !realpath(prefix,real) || strcmp(real,prefix)) return -1;
+        strlen(location)>=sizeof(f->path) || !realpath(location,real) || strcmp(real,location)) return -1;
     const char *slash=strchr(prefix+strlen(base),'/');
     if (!slash || slash==prefix+strlen(base) || !slash[1] ||
         strspn(slash+1,"abcdefghijklmnopqrstuvwxyz0123456789-")!=strlen(slash+1)) return -1;
-    strcpy(f->path,prefix);
-    f->binding_n=lgetxattr(prefix,FULL_BIND2,f->binding,sizeof(f->binding));
+    strcpy(f->path,location);
+    f->binding_n=lgetxattr(location,FULL_BIND2,f->binding,sizeof(f->binding));
     if (f->binding_n>=0) f->v2=1;
-    else if (errno==ENODATA) f->binding_n=lgetxattr(prefix,BIND,f->binding,sizeof(f->binding));
+#ifdef STATX_MNT_ID
+    /* /1 retains its original libc/build boundary. /2 can get the exact
+     * same mount-ID evidence from the stock Linux UAPI helper on musl. */
+    else if (errno==ENODATA) f->binding_n=lgetxattr(location,BIND,f->binding,sizeof(f->binding));
+#endif
     if (f->binding_n<=0) return -1;
-    snprintf(path,sizeof(path),"%s/type",prefix);
+    snprintf(path,sizeof(path),"%s/type",location);
     struct stat st;
     if (lstat(path,&st) || st.st_mode!=(S_IFREG|0600) || st.st_nlink!=1 || st.st_uid!=getuid()) return -1;
     int fd=open(path,O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
@@ -364,18 +411,18 @@ static int read_domain(struct full_domain *f,const char *prefix,int writer) {
     int want=snprintf(expected,sizeof(expected),"%s\n%s\n%s\n%s\n%s\n",f->v2?FULL_TYPE2:TYPE,prefix,f->g,archive,key);
     if (want!=n || memcmp(meta,expected,(size_t)n) || domain_ok(f)) return -1;
     if (f->v2 && (!pm_binding_sha || pm_binding_sha(f->binding,(size_t)f->binding_n,f->digest))) return -1;
-    snprintf(path,sizeof(path),"%s/owner.lock",prefix);
+    snprintf(path,sizeof(path),"%s/owner.lock",location);
     f->lock=open(path,(writer?O_RDWR:O_RDONLY)|O_CLOEXEC|O_NOFOLLOW);
     struct flock lk={.l_type=F_WRLCK,.l_whence=SEEK_SET};
     if (f->lock<0 || (writer && fcntl(f->lock,F_SETLK,&lk))) return -1;
-    snprintf(path,sizeof(path),"%s/history",prefix);
+    snprintf(path,sizeof(path),"%s/history",location);
     f->history=open(path,(writer?(O_RDWR|O_APPEND):O_RDONLY)|O_CLOEXEC|O_NOFOLLOW);
     if (f->history<0 || state(f)<0) return -1;
     return 0;
 }
 
 static int open_domain(struct full_domain *f,const char *prefix) {
-    if (read_domain(f,prefix,1)) return -1;
+    if (read_domain(f,prefix,prefix,1)) return -1;
     if (full_nonce(f->ticket)) return -1;
     struct sockaddr_un addr={.sun_family=AF_UNIX};
     int al=snprintf(addr.sun_path+1,sizeof(addr.sun_path)-1,"steer-supd%d-%s",f->v2?2:1,f->g);
@@ -387,12 +434,21 @@ static int open_domain(struct full_domain *f,const char *prefix) {
 int full_manager_view(const char *prefix,const char *g,const char *binding,const char *committed) {
     struct full_domain f={.history=-1,.lock=-1};
     char tx[33], seal;
-    int ok=!read_domain(&f,prefix,0) && f.v2 && !strcmp(f.g,g) && !strcmp(f.digest,binding) &&
+    int ok=!read_domain(&f,prefix,prefix,0) && f.v2 && !strcmp(f.g,g) && !strcmp(f.digest,binding) &&
            (!committed || (tx_state(&f,tx,&seal)==REMOVED && !strcmp(tx,committed)));
     if (f.history>=0) close(f.history);
     if (ok) return f.lock;
     if (f.lock>=0) close(f.lock);
     return -1;
+}
+
+int full_first_check(const char *stage,const char *prefix,const char *g,const char *binding) {
+    struct full_domain f={.history=-1,.lock=-1};
+    int ok=!read_domain(&f,prefix,stage,0) && f.v2 && !strcmp(f.g,g) &&
+           !strcmp(f.digest,binding) && state(&f)==ACTIVE;
+    if (f.history>=0) close(f.history);
+    if (f.lock>=0) close(f.lock);
+    return ok ? 0 : -1;
 }
 
 int supd_full_main(const char *prefix) {
@@ -407,6 +463,13 @@ int supd_full_main(const char *prefix) {
     return rc; /* standalone process exits, releasing owner.lock last */
 }
 #else
+int full_first_capable(void) { return 0; }
+int full_seal_new(const char *s,const struct full_package *p,const char *h,const char *t,char b[65]) {
+    (void)s;(void)p;(void)h;(void)t;(void)b;return -1;
+}
+int full_first_check(const char *s,const char *p,const char *g,const char *b) {
+    (void)s;(void)p;(void)g;(void)b;return -1;
+}
 int full_manager_view(const char *p,const char *g,const char *b,const char *c) {
     (void)p; (void)g; (void)b; (void)c; return -1;
 }

@@ -35,6 +35,7 @@
 #include "pm.h"
 #include "pmgroup.h"
 #include "pmkind.h"
+#include "full_install.h"
 #include "httpc.h"
 #include "untar.h"
 #include "scrypto.h"
@@ -782,6 +783,7 @@ static char *fetch_asset(struct pm_ctx *x, const struct pm_cand *c, int *tmp, st
 struct mline { char *path; unsigned char sha[32]; unsigned long long size; unsigned mode; int seen; };
 
 struct uv {
+    struct full_package *full;
     const char *stage, *id;
     const struct pm_keyset *ks;
     int unsigned_ok, is_unsigned;
@@ -841,6 +843,22 @@ static struct mline *mline_find(struct uv *u, const char *path) {
 static int uv_cb(void *arg, const struct untar_entry *en) {
     struct uv *u = arg;
     int idx = u->count++;
+    if (u->full && idx>=FULL_FILES+4) return pm_errf(u->e,"слишком много записей Full UI");
+    if (u->full && en->type==UNTAR_FILE) {
+        struct full_package *pkg=u->full;
+        if (pkg->n==FULL_FILES || strlen(en->path)>=sizeof(pkg->files[0].name) ||
+            en->size>(8u<<20) || en->rawmode!=(unsigned)(!strcmp(en->path,"bin/steer-ui-service")?0755:0644))
+            return pm_errf(u->e,"неожиданный файл или режим Full UI: %s",en->path);
+        struct full_file *f=&pkg->files[pkg->n++];
+        struct stat st;
+        char *path=pm_path(u->stage,en->path);
+        int rc=lstat(path,&st);
+        free(path);
+        if (rc || !S_ISREG(st.st_mode)) return pm_errf(u->e,"нет проверяемого файла %s",en->path);
+        strcpy(f->name,en->path);
+        memcpy(f->hash,en->sha256,sizeof(f->hash));
+        f->dev=st.st_dev; f->ino=st.st_ino;
+    }
     unsigned special = en->rawmode & 07000;
     if (special) return pm_errc(u->e, "plugin.entry_special", PMA("path", en->path), "запись %s: setuid, setgid или sticky", en->path);
     static const char *first[3] = { "plugin.json", "MANIFEST", "MANIFEST.sig" };
@@ -907,19 +925,21 @@ static void uv_free(struct uv *u) {
 /* Распаковать archive в stage с полной сверкой. 0 — годится; *is_unsigned — без подписи. */
 static int unpack_verified(const char *archive, const char *stage, const char *id, const struct pm_keyset *ks,
                            int unsigned_ok, int *is_unsigned, char *hdr_id, char *hdr_ver, char *hdr_arch, size_t hn,
-                           struct pm_err *e) {
-    pm_rmrf(stage);
-    char *sd = pm_path(pm_root(), ".stage");
-    pm_mkdirs(sd);
-    free(sd);
-    struct uv u = {0};
+                           struct pm_err *e, struct full_package *full) {
+    if (!full) {
+        pm_rmrf(stage);
+        char *sd = pm_path(pm_root(), ".stage");
+        pm_mkdirs(sd);
+        free(sd);
+    } /* Full: the caller exclusively created the empty destination. */
+    struct uv u = {.full=full};
     u.stage = stage;
     u.id = id ? id : "из файла";
     u.ks = ks;
     u.unsigned_ok = unsigned_ok;
     u.e = e;
     e->msg[0] = '\0';
-    struct untar_opts uo = { uv_cb, &u, 0, UNTAR_NO_LINKS | UNTAR_STRICT_END };
+    struct untar_opts uo = { uv_cb, &u, full ? 32u<<20 : 0, UNTAR_NO_LINKS | UNTAR_STRICT_END };
     char why[512] = "";
     int rc = untar_gz_file(archive, stage, &uo, why, sizeof(why));
     if (rc != 0) {
@@ -2020,6 +2040,29 @@ static int plain_manifest(const struct ynode *m, const char *id, int group) {
 
 static int file_manifest(const struct ynode *m, const char *id) { return plain_manifest(m,id,0); }
 
+int pm_full_unpack(const char *blob,const char *tree,struct sigv_key *key,
+                   struct full_package *pkg,struct pm_err *e) {
+    struct pm_keyset ks={.k=key,.n=1};
+    char id[128],ver[128],arch[128];
+    int uns;
+    struct stat st;
+    if (mkdir(tree,0755) || lstat(tree,&st)) return -1;
+    pkg->dev=st.st_dev; pkg->ino=st.st_ino;
+    if (unpack_verified(blob,tree,"steer-ui",&ks,0,&uns,id,ver,arch,sizeof(id),e,pkg) ||
+        uns || strcmp(ver,"0.0.0") || strcmp(arch,"x86_64")) return -1;
+    char *pj=pm_path(tree,"plugin.json");
+    struct ydoc *doc=pm_json_load(pj,e);
+    free(pj);
+    if (!doc) return -1;
+    const struct ynode *m=ydoc_root(doc), *a=ynode_get(m,"arch"), *c=ynode_get(m,"compat");
+    const char *v=yn_str(m,"version"), *range=yn_str(c,"steer-core");
+    int ok=file_manifest(m,id) && v && !strcmp(v,ver) && a && a->kind==YN_SEQ &&
+           a->len==1 && yn_is_str(ynode_at(a,0)) && !strcmp(ynode_at(a,0)->str,arch) &&
+           c && c->kind==YN_MAP && c->len==1 && range && pm_range_match(range,cli_core_version())>0;
+    ydoc_free(doc);
+    return ok ? 0 : pm_errf(e,"неподдерживаемые метаданные Full UI");
+}
+
 /* Разрешительный список, включая вложенные места хуков (kinds[].expand/nft).
  * Программа проверки, helper и подкоманды у этой пары — один и тот же ELF. */
 static int keys_only(const struct ynode *m, const char *keys) {
@@ -2281,7 +2324,7 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         strcpy(hid,v->id); strcpy(hver,v->ver); strcpy(harch,v->arch);
         free(stage); stage = pm_fmt("%s/new-%s", x->file_group->dir, hid);
     } else if (unpack_verified(archive, stage, s->c ? id : NULL, &ks, s->c ? 0 : s->unsigned_ok, &is_unsigned, hid, hver,
-                        harch, sizeof(hver), e) != 0)
+                        harch, sizeof(hver), e, NULL) != 0)
         goto out;
     {
         char *pj = pm_path(stage, "plugin.json");
@@ -2755,7 +2798,7 @@ static int prepare_files(struct pm_ctx *x, struct pm_group *g, const char **ord,
         char id[128];
         int uns = 0;
         char *next = pm_fmt("%s/new-%s",g->dir,v->id);
-        int r = unpack_verified(ord[i],next,NULL,&ks,pair ? 0 : allow_unsigned,&uns,id,v->ver,v->arch,sizeof(id),e);
+        int r = unpack_verified(ord[i],next,NULL,&ks,pair ? 0 : allow_unsigned,&uns,id,v->ver,v->arch,sizeof(id),e,NULL);
         struct ydoc *d = r ? NULL : replay_manifest(next,e);
         free(next);
         if (r) goto out;
