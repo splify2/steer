@@ -26,6 +26,7 @@ int rename(const char *from, const char *to) {
         if (!strcmp(phase,"finished")) step = "decision";
     }
     if (strstr(from,"/old-fixture-app")) step = "restore";
+    if (strstr(from,"/.group-txn/old-vless") && name && !strcmp(name,"/vless")) step = "restore-vless";
     if (strstr(from,"/new-fixture-app") && name && !strcmp(name,"/fixture-app")) step = "place";
     if (name && !strcmp(name,"/plugins") && strstr(to,"/keep.d/")) step = "keep";
     if (!strncmp(fault,"error:",6) && !strcmp(fault+6,step)) {

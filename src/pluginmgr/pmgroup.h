@@ -5,17 +5,22 @@
 #define PM_GROUP_DIR ".group-txn"
 
 struct group_file { char id[128], ver[128], arch[128]; };
+struct outs { char **v; size_t n; };
 struct pm_group {
     char *dir;
     struct group_file *v;
     size_t n;
     int preparing;
+    int net1;            /* только подписанная пара net1 и bin/vless */
+    struct outs before;  /* поднятые выходы VLESS до первого rename */
     char owner[128];     /* offline либо identity именно соединённого ctl */
     char config_err[65]; /* код и полные байты stderr до установки */
 };
 
 int pm_group_baseline(struct pm_group *g, struct pm_err *e);
 int pm_group_health(const struct pm_group *g, struct pm_err *e);
+struct ydoc *pm_group_status(const struct pm_group *g);
+int pm_group_output_up(const struct ynode *v);
 int pm_group_preparing(const struct pm_group *g);
 int pm_group_publish(const struct pm_group *g);
 int pm_group_finish(const char *marker, int accept);

@@ -15,6 +15,7 @@
  *   9–10. plugin-reload у демона и проверка здоровья; не здоров — откат и bad_versions. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <link.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
@@ -271,8 +272,6 @@ void pm_event(struct pm_ctx *x, const char *id, const char *state, const char *v
 static int daemon_spec_ok(struct pm_ctx *x);
 
 /* Выходы видов плагина, которые сейчас подняты (по status демона). */
-struct outs { char **v; size_t n; };
-
 static int kind_matches(const char *status_kind, const struct ynode *kinds) {
     for (size_t i = 0; i < ynode_len(kinds); i++) {
         const char *k = yn_str(ynode_at(kinds, i), "name");
@@ -308,20 +307,25 @@ static int daemon_spec_ok(struct pm_ctx *x) {
     return 1;
 }
 
-static void outs_up(struct pm_ctx *x, const struct ynode *kinds, struct outs *o) {
+static int outs_up(struct pm_ctx *x, const struct ynode *kinds, struct outs *o, const struct pm_group *g) {
     memset(o, 0, sizeof(*o));
-    if (!ynode_len(kinds)) return;
-    struct ydoc *d = daemon_status(x);
-    if (!d) return;
+    if (!ynode_len(kinds)) return 0;
+    struct ydoc *d = g ? pm_group_status(g) : daemon_status(x);
+    if (!d) return -1;
     const struct ynode *outs = ynode_get(ydoc_root(d), "outputs");
     for (size_t i = 0; i < ynode_len(outs); i++) {
         const struct ynode *v = ynode_val_at(outs, i);
         const char *k = yn_str(v, "kind");
+        int up;
+        if (g && (!k || (kind_matches(k,kinds) && ynode_bool(ynode_get(v,"up"),&up)))) {
+            ydoc_free(d); return -1;
+        }
         if (!k || !kind_matches(k, kinds) || !yn_bool(v, "up", 0)) continue;
         o->v = pm_realloc(o->v, sizeof(char *) * (o->n + 1));
         o->v[o->n++] = pm_strdup(ynode_key_at(outs, i)->str);
     }
     ydoc_free(d);
+    return 0;
 }
 
 static void outs_free(struct outs *o) {
@@ -383,15 +387,21 @@ static int wait_outs(struct pm_ctx *x, const struct outs *o, int timeout_s, stru
     if (!o->n || x->no_daemon) return 0;
     long long until_ms = mono_ms() + (long long)timeout_s * 1000;
     /* Будильники — до первого status: событие между ответом и подпиской не теряется. */
-    struct pollfd pf[2] = { { wake_sub(), POLLIN, 0 }, { wake_link(), POLLIN, 0 } };
+    struct pollfd pf[2] = { { x->file_group ? -1 : wake_sub(), POLLIN, 0 }, { wake_link(), POLLIN, 0 } };
     int rc = -1;
     for (;;) {
-        struct ydoc *d = daemon_status(x);
+        struct ydoc *d = x->file_group ? pm_group_status(x->file_group) : daemon_status(x);
         const char *down = NULL;
+        if (!d && x->file_group) {
+            pm_errc(e,"plugin.group_reload_unconfirmed",NULL,"не подтверждено состояние выходов после установки");
+            break;
+        }
         if (d) {
             const struct ynode *outs = ynode_get(ydoc_root(d), "outputs");
-            for (size_t i = 0; i < o->n && !down; i++)
-                if (!yn_bool(ynode_get(outs, o->v[i]), "up", 0)) down = o->v[i];
+            for (size_t i = 0; i < o->n && !down; i++) {
+                const struct ynode *v = ynode_get(outs,o->v[i]);
+                if (!(x->file_group ? pm_group_output_up(v) : yn_bool(v,"up",0))) down = o->v[i];
+            }
             if (!down) { ydoc_free(d); rc = 0; break; }
         }
         long long now_ms = mono_ms();
@@ -1610,6 +1620,79 @@ static char *probe_verdict(int rc, const char *out) {
     return pm_fmt("%.*s", (int)(le ? le - ls : (long)strlen(ls)), ls);
 }
 
+#define NET1_SO "libs2p-net.so.1"
+
+/* --list вызываем только у системного загрузчика нативного ELF, не у
+ * произвольной программы из PT_INTERP. Скрипт или статический ELF не проба. */
+static int net1_interp(const char *exe, char interp[PATH_MAX]) {
+    ElfW(Ehdr) eh;
+    int fd = open(exe,O_RDONLY|O_NOFOLLOW|O_CLOEXEC), rc = -1;
+    if (fd < 0) return -1;
+    if (read(fd,&eh,sizeof eh) != sizeof eh || memcmp(eh.e_ident,ELFMAG,SELFMAG) ||
+        eh.e_ident[EI_CLASS] != (sizeof(void *) == 8 ? ELFCLASS64 : ELFCLASS32) ||
+        eh.e_phentsize != sizeof(ElfW(Phdr)) || eh.e_phnum > 256 ||
+        lseek(fd,eh.e_phoff,SEEK_SET) < 0) goto out;
+    for (unsigned i = 0; i < eh.e_phnum; i++) {
+        ElfW(Phdr) ph;
+        if (read(fd,&ph,sizeof ph) != sizeof ph) break;
+        if (ph.p_type != PT_INTERP) continue;
+        size_t n = ph.p_filesz;
+        if (n < 2 || n > PATH_MAX || pread(fd,interp,n,ph.p_offset) != (ssize_t)n ||
+            strnlen(interp,n) != n-1) break;
+        if (strncmp(interp,"/lib/ld-",8) && strncmp(interp,"/lib64/ld-",10) &&
+            strcmp(interp,"/lib/ld.so.1")) break;
+        if (strchr(strchr(interp+1,'/')+1,'/')) break;
+        rc = 0;
+        break;
+    }
+out:
+    close(fd); return rc;
+}
+
+/* Два ответа одной среды загрузки: сопоставление SONAME с inode и
+ * конструктор именно целевой программы. Код 0 без полной квитанции не успех. */
+static int net1_probe(const char *pdir, const char *base, const struct ynode *lib, int staged, char **why) {
+    char *exe = pm_path(pdir,"bin/vless"), *so = pm_path(base,"lib/" NET1_SO);
+    char *ld = pm_fmt("LD_LIBRARY_PATH=%s/lib",base);
+    char *env[] = {"STEER_LIB_PROBE=1","LD_BIND_NOW=1",staged ? ld : NULL,NULL};
+    char interp[PATH_MAX], *out = NULL;
+    struct stat expected, loaded;
+    char *list[] = {interp,"--list",exe,NULL}, *probe[] = {exe,NULL};
+    int matched = 0, ok = 0;
+    *why = NULL;
+    if (net1_interp(exe,interp) || lstat(so,&expected) || !S_ISREG(expected.st_mode) ||
+        run_prog(list,NULL,env,&out,20) || !out) goto done;
+    char *save = NULL;
+    for (char *l = strtok_r(out,"\n",&save); l; l = strtok_r(NULL,"\n",&save)) {
+        l += strspn(l," \t");
+        static const char prefix[] = NET1_SO " => ";
+        if (strncmp(l,prefix,sizeof(prefix)-1)) continue;
+        char *path = l+sizeof(prefix)-1, *end = strrchr(path,' ');
+        if (!end || end[1] != '(') goto done;
+        *end = 0;
+        if (stat(path,&loaded) || loaded.st_dev != expected.st_dev || loaded.st_ino != expected.st_ino) goto done;
+        matched++;
+    }
+    if (matched != 1) goto done;
+    free(out); out = NULL;
+    int rc = run_prog(probe,NULL,env,&out,20);
+    if (rc || !out) {
+        if (out && *out) { *why = trim_out(out); out = NULL; }
+        goto done;
+    }
+    const char *abi = yn_str(ynode_at(ynode_get(lib,"libs"),0),"abi");
+    char *head = pm_fmt("steer: net1 %s (ABI %s, отпечаток ",yn_str(lib,"version"),abi);
+    if (!strncmp(out,head,strlen(head))) {
+        const char *fp = out+strlen(head);
+        ok = strspn(fp,"0123456789abcdef") == 16 && !strcmp(fp+16,") подходит\n");
+    }
+    free(head);
+done:
+    if (!ok && !*why) *why = pm_strdup("не подтверждены установленная net1 и ответ ABI целевой программы");
+    free(out); free(ld); free(so); free(exe);
+    return !ok;
+}
+
 /* Программы плагина из каталога pdir, связанные с библиотеками l, против копии l. 1 — несовместим (*why —
  * строка отказа, куча); 0 — подходит или проверять нечего. */
 static int probe_plugin(const char *pdir, const struct libset *l, char **why) {
@@ -1708,7 +1791,8 @@ static int abi_check(struct pm_ctx *x, const char *id, const char *ver, const st
         int rc = 0;
         if (is_library(ydoc_root(lm)) && libset_of(ydoc_root(lm), base, &l) == 0) {
             char *why = NULL;
-            if (probe_plugin(stage, &l, &why)) {
+            if (x->file_group && x->file_group->net1 ? net1_probe(stage,base,ydoc_root(lm),1,&why) :
+                probe_plugin(stage, &l, &why)) {
                 const char *lv = yn_str(ydoc_root(lm), "version");
                 rc = pm_errc(e, "plugin.lib_abi_mismatch", PMA("id", id, "version", ver, "lib", lid, "lib_version", lv ? lv : "?", "why", why),
                              "%s %s собран под другую сборку %s, чем стоящая %s %s (%s) — ставьте их вместе из одного источника или steer plugin migrate",
@@ -1836,11 +1920,13 @@ static int group_finish(struct pm_ctx *x, int before_bad, const char *before_msg
     int active = 0;
     for (size_t i = 0; i < n; i++) if (!u[i].was_disabled) active = 1;
     if (x->file_group) {
-        /* У файлового подмножества нет видов с выходами для wait_outs. */
         if (group_service_offline(x->file_group,e)) return -1;
         if (strcmp(x->file_group->owner,"offline")) pm_progress(x,"проверка здоровья группы (%zu)",n);
-        if (!pm_group_health(x->file_group,&he)) return 0;
-        if (strcmp(he.code,"plugin.reload_failed")) return pm_errcopy(e,&he);
+        if (!pm_group_health(x->file_group,&he)) {
+            if (!x->file_group->net1 || u[1].was_disabled ||
+                !wait_outs(x,&x->file_group->before,u[1].timeout_s,&he)) return 0;
+        }
+        if (strcmp(he.code,"plugin.reload_failed") && strcmp(he.code,"plugin.output_not_up")) return pm_errcopy(e,&he);
         return pm_errc(e,"plugin.group_health_failed",PMA("why",he.msg),
                        "группа плагинов не прошла проверку здоровья: %s",he.msg);
     }
@@ -1933,6 +2019,54 @@ static int plain_manifest(const struct ynode *m, const char *id, int group) {
 }
 
 static int file_manifest(const struct ynode *m, const char *id) { return plain_manifest(m,id,0); }
+
+/* Разрешительный список, включая вложенные места хуков (kinds[].expand/nft).
+ * Программа проверки, helper и подкоманды у этой пары — один и тот же ELF. */
+static int keys_only(const struct ynode *m, const char *keys) {
+    if (!m || m->kind != YN_MAP) return 0;
+    for (size_t i = 0; i < m->len; i++) {
+        const char *key = ynode_key_at(m,i)->str;
+        if (!*key || strchr(key,' ')) return 0;
+        char *word = pm_fmt(" %s ",key);
+        int ok = strstr(keys,word) != NULL;
+        free(word);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+static int field_is(const struct ynode *m, const char *key, const char *value) {
+    const char *s = yn_str(m,key);
+    return s && !strcmp(s,value);
+}
+
+static int net1_manifest(const struct ynode *m, const char *id, size_t pos) {
+    if (!field_is(m,"id",id) || yn_long(m,"schema",-1) != 1 || !pm_ver_ok(yn_str(m,"version"))) return 0;
+    if (pos == 0) {
+        const struct ynode *libs = ynode_get(m,"libs"), *l = ynode_at(libs,0);
+        return !strcmp(id,"net1") && field_is(m,"type","library") &&
+            keys_only(m," schema id version type name description license homepage arch compat libs i18n ") &&
+            ynode_len(libs) == 1 && keys_only(l," soname file abi ") &&
+            field_is(l,"soname",NET1_SO) && field_is(l,"file","lib/" NET1_SO) && yn_str(l,"abi");
+    }
+    const struct ynode *req = ynode_get(m,"requires"), *deps = ynode_get(req,"plugins");
+    const struct ynode *s = ynode_get(m,"steer"), *kinds = ynode_get(s,"kinds"), *k = ynode_at(kinds,0);
+    const struct ynode *helper = ynode_get(k,"helper"), *check = ynode_get(k,"check"), *cmds = ynode_get(s,"commands");
+    if (strcmp(id,"vless") || !field_is(m,"type","plugin") ||
+        !keys_only(m," schema id version type name description license homepage arch compat requires permissions steer keep health i18n ") ||
+        (ynode_get(m,"health") && !keys_only(ynode_get(m,"health")," timeout_s ")) ||
+        !keys_only(req," plugins ") || !keys_only(deps," net1 ") || !yn_str(deps,"net1") ||
+        !keys_only(s," kinds commands ") || ynode_len(kinds) != 1 ||
+        !keys_only(k," name description texts keys caps helper check health resources ") || !field_is(k,"name","tunnel:vless") ||
+        !keys_only(helper," prog cmd argv ") || !field_is(helper,"prog","bin/vless") ||
+        (check && (!keys_only(check," prog argv timeout_s ") || !field_is(check,"prog","bin/vless"))) ||
+        (cmds && cmds->kind != YN_SEQ)) return 0;
+    for (size_t i = 0; i < ynode_len(cmds); i++) {
+        const struct ynode *cmd = ynode_at(cmds,i);
+        if (!keys_only(cmd," name prog argv help usage conf ctl ") || !field_is(cmd,"prog","bin/vless")) return 0;
+    }
+    return 1;
+}
 
 static int not_file_package(struct pm_err *e) {
     return pm_errc(e, "plugin.prefix_package", NULL, "этот префикс принимает только подписанные файловые пакеты без служб, скриптов и расширений");
@@ -2273,9 +2407,9 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         /* Выходы видов прежней и новой версии, поднятые до обновления. */
         const struct ynode *k = ynode_get(ynode_get(m, "steer"), "kinds");
         if (!ynode_len(k) && oldman) k = ynode_get(ynode_get(ydoc_root(oldman), "steer"), "kinds");
-        outs_up(x, k, &before);
+        if (!x->file_group) outs_up(x, k, &before,NULL);
     }
-    int spec_ok = x->no_daemon ? 1 : daemon_spec_ok(x);
+    int spec_ok = x->file_group || x->no_daemon || daemon_spec_ok(x);
     /* Что говорило ядро о перечитывании плагинов ДО установки: прежняя ошибка — не вина этого плагина. */
     if (!x->defer) x->before_bad = !x->no_daemon && pm_daemon_reload(x, &x->before_err) != 0;
     if (oldman) {
@@ -2558,7 +2692,7 @@ static struct ydoc *file_peek(const char *archive) {
 /* Выбор пути по peek — только подсказка; допуск повторяется на ПОДПИСАННОМ
  * содержимом до публикации. Не оставлять неполный список ID в журнале. */
 static int prepare_files(struct pm_ctx *x, struct pm_group *g, const char **ord, int allow_unsigned, struct pm_err *e) {
-    int plain = 1;
+    int plain = 1, pair = g->n == 2;
     for (size_t i = 0; i < g->n; i++) {
         struct ydoc *d = file_peek(ord[i]);
         const struct ynode *m = d ? ydoc_root(d) : NULL;
@@ -2573,6 +2707,7 @@ static int prepare_files(struct pm_ctx *x, struct pm_group *g, const char **ord,
             ydoc_free(d); return -1;
         }
         if (!plain_manifest(m,id,1)) plain = 0;
+        if (pair && !net1_manifest(m,id,i)) pair = 0;
         char *live = pm_path(pm_root(),id);
         int had = replay_dir(live);
         struct ydoc *old = had == 1 ? pm_manifest(id) : NULL;
@@ -2585,6 +2720,7 @@ static int prepare_files(struct pm_ctx *x, struct pm_group *g, const char **ord,
             install_degraded(e,live); free(live); ydoc_free(d); ydoc_free(old); return -1;
         }
         if (old && !plain_manifest(ydoc_root(old),id,1)) plain = 0;
+        if (pair && old && (!inst || inst->unsigned_ || !net1_manifest(ydoc_root(old),id,i))) pair = 0;
         if (old && inst && (!inst->version || !yn_str(ydoc_root(old),"version") ||
                             strcmp(inst->version,yn_str(ydoc_root(old),"version")))) {
             install_degraded(e,live); free(live); ydoc_free(d); ydoc_free(old);
@@ -2593,7 +2729,17 @@ static int prepare_files(struct pm_ctx *x, struct pm_group *g, const char **ord,
         free(live); if (old) ydoc_free(old);
         ydoc_free(d);
     }
-    if (!plain) return 0; /* hooks, библиотеки и т.п.: прежняя группа */
+    /* Legacy пробует и оставшихся потребителей net1 (в том числе произвольный
+     * исполняемый bin/). Это уже не изолированная пара. */
+    for (size_t i = 0; pair && i < x->st.n; i++) {
+        const char *id = x->st.v[i].id;
+        if (!strcmp(id,"net1") || !strcmp(id,"vless")) continue;
+        struct ydoc *d = pm_manifest(id);
+        if (!d || requires_id(ydoc_root(d),"net1")) pair = 0;
+        if (d) ydoc_free(d);
+    }
+    if (!plain && !pair) return 0;
+    g->net1 = pair;
     g->dir = pm_path(pm_root(),PM_GROUP_DIR);
     if (mkdir(g->dir,0700)) {
         free(g->dir); g->dir = NULL;
@@ -2609,11 +2755,11 @@ static int prepare_files(struct pm_ctx *x, struct pm_group *g, const char **ord,
         char id[128];
         int uns = 0;
         char *next = pm_fmt("%s/new-%s",g->dir,v->id);
-        int r = unpack_verified(ord[i],next,NULL,&ks,allow_unsigned,&uns,id,v->ver,v->arch,sizeof(id),e);
+        int r = unpack_verified(ord[i],next,NULL,&ks,pair ? 0 : allow_unsigned,&uns,id,v->ver,v->arch,sizeof(id),e);
         struct ydoc *d = r ? NULL : replay_manifest(next,e);
         free(next);
         if (r) goto out;
-        if (!d || strcmp(v->id,id) || !plain_manifest(ydoc_root(d),id,1) ||
+        if (!d || strcmp(v->id,id) || !(pair ? net1_manifest(ydoc_root(d),id,i) : plain_manifest(ydoc_root(d),id,1)) ||
             strcmp(v->ver,yn_str(ydoc_root(d),"version"))) {
             pm_errc(e,"plugin.group_changed",NULL,"участник группы изменился во время подготовки");
             if (d) ydoc_free(d);
@@ -2627,15 +2773,28 @@ static int prepare_files(struct pm_ctx *x, struct pm_group *g, const char **ord,
             if (lib) ydoc_free(lib);
         }
         ydoc_free(d);
-        if (uns || abi) { rc = 0; goto out; } /* --unsigned или реальная ABI-проба */
+        if (uns || (abi && !pair)) { rc = 0; goto out; }
         char *prev = pm_fmt("%s/.prev/%s",pm_root(),id);
         if (replay_dir(prev) != 0) { install_degraded(e,prev); free(prev); goto out; }
         free(prev);
     }
     struct pm_err baseline = {0};
     if (pm_group_baseline(g,&baseline) || group_service_offline(g,&baseline)) *e = baseline;
-    else if (pm_group_publish(g)) pm_errc(e,"plugin.write_failed",NULL,"не сохранить исходное состояние группы");
-    else rc = 1;
+    else {
+        if (pair && strcmp(g->owner,"offline")) {
+            char *dir = pm_fmt("%s/new-vless",g->dir);
+            struct ydoc *d = replay_manifest(dir,e);
+            free(dir);
+            int bad = !d || outs_up(x,ynode_get(ynode_get(ydoc_root(d),"steer"),"kinds"),&g->before,g);
+            if (d) ydoc_free(d);
+            if (bad) {
+                pm_errc(e,"plugin.group_reload_unconfirmed",NULL,"не подтверждено состояние выходов до установки");
+                goto out;
+            }
+        }
+        if (pm_group_publish(g)) pm_errc(e,"plugin.write_failed",NULL,"не сохранить исходное состояние группы");
+        else rc = 1;
+    }
 out:
     pm_keys_free(&ks);
     return rc;
@@ -2665,6 +2824,16 @@ static int group_dependencies(struct pm_ctx *x, const struct pm_group *g, struct
 
 static int finish_files(struct pm_ctx *x, int rc, struct pm_result *res, struct pm_err *e) {
     if (!rc) rc = group_dependencies(x,x->file_group,e);
+    if (!rc && x->file_group->net1) {
+        struct ydoc *lib = pm_manifest("net1");
+        char *base = pm_path(pm_root(),"net1"), *app = pm_path(pm_root(),"vless"), *why = NULL;
+        if (!lib || !net1_manifest(ydoc_root(lib),"net1",0)) rc = install_degraded(e,base);
+        else if (net1_probe(app,base,ydoc_root(lib),0,&why))
+            rc = pm_errc(e,"plugin.lib_abi_mismatch",PMA("id","vless","version",res->v[1].version,"lib","net1",
+                         "lib_version",res->v[0].version,"why",why),"ABI установленной пары не подтверждён: %s",why);
+        free(why); free(base); free(app);
+        if (lib) ydoc_free(lib);
+    }
     if (!rc) rc = group_finish(x,x->before_bad,x->before_err.msg,e);
     char *marker = install_marker();
     /* При ошибке commit не угадывать фазу и не пытаться выполнить другой исход. */
@@ -2737,7 +2906,7 @@ static int install_files(struct pm_ctx *x, const char *const *files, size_t n, c
     if (x->file_group) rc = finish_files(x,rc,res,e);
     else if (x->defer) rc = group_end(x, rc, res, e);
     if (gate >= 0) close(gate);
-    free(g.v); free(g.dir);
+    outs_free(&g.before); free(g.v); free(g.dir);
     ids_free(&x->tx_ids, &x->ntx);
     free(ord);
     free(lib);

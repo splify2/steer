@@ -62,7 +62,7 @@ static int sha256(const void *buf, size_t n, unsigned char out[32]) {
 
 /* ynode проверяет вложенность, UTF-8 и повторы ключей, но допускает YAML.
  * Для квитанции v1 сверяем также лексемы JSON, включая тип скаляра. В этом
- * протоколе из чисел приходят только неотрицательные целые. */
+ * конверте код целый, внутри status встречаются также дробные измерения. */
 static const char *ws(const char *s) { return s + strspn(s," \r\n\t"); }
 static const char *wire_value(const char *s, const struct ynode *v) {
     s = ws(s);
@@ -83,8 +83,22 @@ static const char *wire_value(const char *s, const struct ynode *v) {
         if (v->style != YS_PLAIN) return NULL;
         if (!strncmp(s,"true",4) || !strncmp(s,"null",4)) return s+4;
         if (!strncmp(s,"false",5)) return s+5;
+        if (*s == '-') s++;
         size_t n = strspn(s,"0123456789");
-        return n && (n == 1 || *s != '0') ? s+n : NULL;
+        if (!n || (n > 1 && *s == '0')) return NULL;
+        s += n;
+        if (*s == '.') {
+            n = strspn(++s,"0123456789");
+            if (!n) return NULL;
+            s += n;
+        }
+        if (*s == 'e' || *s == 'E') {
+            s++; if (*s == '-' || *s == '+') s++;
+            n = strspn(s,"0123456789");
+            if (!n) return NULL;
+            s += n;
+        }
+        return s;
     }
     int map = v->kind == YN_MAP;
     if (*s++ != (map ? '{' : '[')) return NULL;
@@ -129,7 +143,7 @@ static int string_list(const struct ynode *map, const char *k) {
 
 /* Вызывать только на fd того владельца, которого проверили. При replay не
  * посылать даже первый байт другому слушателю. */
-static int group_reload(const char *owner, char found[128], char failure[65], struct pm_err *e) {
+static int group_request(const char *owner, char found[128], const char *request, char **reply) {
     const char *path = ctlcall_socket(NULL);
     struct stat a, b;
     int fd = -1;
@@ -148,12 +162,44 @@ static int group_reload(const char *owner, char found[128], char failure[65], st
     snprintf(found,128,"%ju:%ju:%jd:%ju",(uintmax_t)b.st_dev,(uintmax_t)b.st_ino,
              (intmax_t)peer.pid,(uintmax_t)peer.uid);
     if (owner && strcmp(owner,found)) goto uncertain;
-    static const char request[] = "plugin-reload\n";
-    if (ctl_write_all(fd,request,sizeof(request)-1,NULL)) goto uncertain;
-    char *reply = ctl_read_reply(fd);
+    if (ctl_write_all(fd,request,strlen(request),NULL)) goto uncertain;
+    *reply = ctl_read_reply(fd);
     close(fd);
-    fd = -1;
-    if (!reply) goto uncertain;
+    return *reply ? CONFIRMED : UNCERTAIN;
+uncertain:
+    if (fd >= 0) close(fd);
+    return UNCERTAIN;
+}
+
+struct ydoc *pm_group_status(const struct pm_group *g) {
+    char found[128], *reply = NULL;
+    if (group_request(g->owner,found,"status\n",&reply) != CONFIRMED || !reply) return NULL;
+    struct ydoc *d = pm_json_parse(reply,strlen(reply),"status",NULL), *out = NULL;
+    const struct ynode *r = d ? ydoc_root(d) : NULL;
+    const char *end = r ? wire_value(reply,r) : NULL;
+    const char *cmd = yn_str(r,"cmd"), *body = yn_str(r,"stdout");
+    int trunc;
+    if (end && !*ws(end) && yn_long(r,"v",-1) == 1 && cmd && !strcmp(cmd,"status") &&
+        !ynode_get(r,"error") && !ynode_get(r,"ok") && yn_long(r,"code",-1) == 0 &&
+        (!ynode_get(r,"truncated") || (!ynode_bool(ynode_get(r,"truncated"),&trunc) && !trunc)) &&
+        body && reply_string(r,"stdout")) {
+        out = pm_json_parse(body,strlen(body),"status.stdout",NULL);
+        const struct ynode *s = out ? ydoc_root(out) : NULL, *outputs = ynode_get(s,"outputs");
+        const char *tail = s ? wire_value(body,s) : NULL;
+        if (out && (!tail || *ws(tail) || yn_long(s,"schema",-1) != 1 ||
+                    ynode_get(s,"cached") || !outputs || outputs->kind != YN_MAP)) {
+            ydoc_free(out); out = NULL;
+        }
+    }
+    if (d) ydoc_free(d);
+    free(reply);
+    return out;
+}
+
+static int group_reload(const char *owner, char found[128], char failure[65], struct pm_err *e) {
+    char *reply = NULL;
+    if (group_request(owner,found,"plugin-reload\n",&reply) == UNCERTAIN) goto uncertain;
+    if (!reply) return CONFIRMED; /* offline */
     struct ydoc *d = pm_json_parse(reply,strlen(reply),"plugin-reload",NULL);
     const struct ynode *r = d ? ydoc_root(d) : NULL, *reload = ynode_get(r,"reload"), *changed = ynode_get(r,"changed");
     const char *end = r ? wire_value(reply,r) : NULL, *cmd = yn_str(r,"cmd");
@@ -182,8 +228,14 @@ static int group_reload(const char *owner, char found[128], char failure[65], st
     free(reply);
     if (rc != UNCERTAIN) return rc;
 uncertain:
-    if (fd >= 0) close(fd);
     return pm_errc(e,"plugin.group_reload_unconfirmed",NULL,"нет подтверждённого ответа владельца ctl на plugin-reload");
+}
+
+int pm_group_output_up(const struct ynode *v) {
+    const char *kind = yn_str(v,"kind");
+    int up;
+    return kind && (!strcmp(kind,"vless") || !strcmp(kind,"tunnel:vless")) &&
+        !ynode_bool(ynode_get(v,"up"),&up) && up;
 }
 
 /* Штатная повторная подготовка спеки — только после полученного отказа,
@@ -396,6 +448,11 @@ int pm_group_publish(const struct pm_group *g) {
     char *ctl = ctl_path();
     jw_kstr(&w,"ctl_path",ctl);
     jw_kstr(&w,"ctl_owner",g->owner);
+    if (g->before.n) {
+        jw_key(&w,"vless_up"); jw_arr(&w);
+        for (size_t i = 0; i < g->before.n; i++) jw_str(&w,g->before.v[i]);
+        jw_aend(&w);
+    }
     char *sp = pm_state_path();
     int bad = !ctl || save_file(&w, g->dir, "registry", sp) || save_file(&w, g->dir, "keep", pm_keepd());
     free(ctl); free(sp);
@@ -484,6 +541,20 @@ int pm_group_finish(const char *marker, int accept) {
             free(ctl);
             if (metadata(root,dir,"registry",sp,1,0) || metadata(root,dir,"keep",pm_keepd(),1,0) ||
                 !same || reload_checked(owner,found,failure,&why) != CONFIRMED) goto out;
+            const struct ynode *up = ynode_get(root,"vless_up");
+            if (up) {
+                struct pm_group g = {0};
+                if (!string_list(root,"vless_up") || strlen(owner) >= sizeof(g.owner)) goto out;
+                strcpy(g.owner,owner);
+                struct ydoc *status = pm_group_status(&g);
+                if (!status) goto out;
+                const struct ynode *outputs = ynode_get(ydoc_root(status),"outputs");
+                int ok = 1;
+                for (size_t i = 0; i < up->len; i++)
+                    if (!pm_group_output_up(ynode_get(outputs,ynode_at(up,i)->str))) ok = 0;
+                ydoc_free(status);
+                if (!ok) goto out;
+            }
         }
         if (mark(marker,"finished",dir,sum,dev,ino)) goto out;
     }
