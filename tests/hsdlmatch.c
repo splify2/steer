@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -26,6 +27,7 @@
 #include "tls13.h"
 #include "scrypto.h"
 #include "unit.h"
+#include "chello-frozen.h"
 
 /* Хеш рукопожатия — заглушка: ClientHello вбирается в транскрипт до первого чтения. */
 size_t sc_hash_len(enum sc_hash h) { return h == SC_SHA384 ? 48 : h == SC_SHA512 ? 64 : 32; }
@@ -42,13 +44,13 @@ static long ms_now(void) {
 }
 
 static int g_srv = -1;
-static volatile int g_stop;
+static atomic_int g_stop;
 
 /* Запись ServerHello на 16383 байта — по байту раз в 300 мс. */
 static void *drip(void *a) {
     (void)a;
     static const unsigned char hdr[5] = { 0x16, 3, 3, 0x3f, 0xff };
-    for (int i = 0; !g_stop; i++) {
+    for (int i = 0; i < 16 && !atomic_load(&g_stop); i++) {
         unsigned char b = i < 5 ? hdr[i] : 0;
         if (send(g_srv, &b, 1, MSG_NOSIGNAL) != 1) break;
         usleep(300000);
@@ -60,16 +62,17 @@ static struct tls13 g_t;
 static int g_rc;
 static long g_ms;
 static int g_fd = -1;
-static volatile int g_done;
+static atomic_int g_done;
 
 static void *hs(void *a) {
     (void)a;
-    unsigned char hello[64] = { 0x16, 3, 1, 0, 59, 1 }, priv[32] = { 0 };
+    unsigned char priv[32] = { 0 };
     struct tls13_auth au = { .host = "example.com" };
     long t0 = ms_now();
-    g_rc = tls13_handshake_auth(&g_t, g_fd, hello, sizeof hello, priv, &au);
+    g_rc = tls13_handshake_auth(&g_t, g_fd, (const unsigned char *)FROZEN_AES,
+                                sizeof(FROZEN_AES) - 1, priv, &au);
     g_ms = ms_now() - t0;
-    g_done = 1;
+    atomic_store(&g_done, 1);
     return NULL;
 }
 
@@ -94,15 +97,15 @@ static int run(int scope_ms, int wait_ms) {
     g_fd = tr_dial("127.0.0.1", port, 8);
     g_srv = accept(l, NULL, NULL);
     close(l);
-    g_stop = 0;
-    g_done = 0;
+    atomic_store(&g_stop, 0);
+    atomic_store(&g_done, 0);
     memset(&g_t, 0, sizeof g_t);
     pthread_t d, h;
     pthread_create(&d, NULL, drip, NULL);
     pthread_create(&h, NULL, hs, NULL);
-    for (int i = 0; i < wait_ms / 10 && !g_done; i++) usleep(10000);
+    for (int i = 0; i < wait_ms / 10 && !atomic_load(&g_done); i++) usleep(10000);
     int fired = -1;
-    if (g_done) {
+    if (atomic_load(&g_done)) {
         pthread_join(h, NULL);
         if (scope_ms > 0) fired = tr_watch_end();
     } else {
@@ -112,7 +115,7 @@ static int run(int scope_ms, int wait_ms) {
         if (scope_ms > 0) fired = tr_watch_end();
         g_ms = -1;
     }
-    g_stop = 1;
+    atomic_store(&g_stop, 1);
     shutdown(g_srv, SHUT_RDWR);
     pthread_join(d, NULL);
     close(g_srv);

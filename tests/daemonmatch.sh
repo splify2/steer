@@ -167,6 +167,9 @@ unshare -m sh -c 'mount -t sysfs sysfs /sys' 2>/dev/null || skip "свой /sys 
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/st" "$tmp/bin"
+sh "$ROOT/tests/plugroot.sh" "$tmp/plugins" "$(dirname "$BIN")" || exit 2
+STEER_PLUGINS_ROOT="$tmp/plugins" STEER_PLUGINS_ETC="$tmp/plugetc"
+export STEER_PLUGINS_ROOT STEER_PLUGINS_ETC
 D="" DU="" SUB="" UP="" RPID=""
 trap 'kill $SUB $UP $RPID 2>/dev/null; [ -n "$D" ] && kill $D 2>/dev/null; rm -rf "$tmp"' EXIT
 
@@ -190,8 +193,21 @@ chmod +x "$tmp/bin/ifdown" "$tmp/bin/ifup"
 PATH="$tmp/bin:$PATH"
 export PATH
 
+cat > "$tmp/helper-receipt.py" <<'PY'
+import json, sys
+pid, *args = sys.argv[1:]
+try:
+    path = args[args.index("--conf") + 1]
+    with open(path) as f:
+        conf = json.load(f)
+    print(pid, conf["output"]["name"], conf["output"]["keys"]["obfs"]["server"], flush=True)
+except (ValueError, IndexError, OSError, KeyError, json.JSONDecodeError) as e:
+    print("helper: cannot read --conf:", e, file=sys.stderr)
+    sys.exit(1)
+PY
 cat > "$tmp/helper" <<H
 #!/bin/sh
+python3 "$tmp/helper-receipt.py" "\$\$" "\$@" >> "$tmp/helper-receipts" || exit 1
 echo "\$1 \$2 \$\$" >> "$tmp/log"
 [ -n "\${STEER_EVENT_FD:-}" ] && eval "exec 9>&\$STEER_EVENT_FD" && printf '{"ev":"up"}\n' >&9
 trap 'exit 0' TERM
@@ -272,8 +288,15 @@ export STEER_SOCKET
 c() { "$BIN" "$@" $S; }                                  # клиент к демону стенда
 # Движок без демона — в своём /sys, как демон: иначе /sys/class/net показывал бы устройства хоста.
 local_status() { STEER_SOCKET="$tmp/nobody.sock" unshare -m sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" status $S"; }
-runs() { grep -c "^obfs $1 " "$tmp/log" 2>/dev/null; }
-pid_of() { grep "^obfs $1 " "$tmp/log" | tail -1 | cut -d' ' -f3; }
+runs() { grep -c "^obfs $1 " "$tmp/log" 2>/dev/null || [ "$?" = 1 ]; }
+pid_of() { grep "^obfs $1 " "$tmp/log" 2>/dev/null | tail -1 | cut -d' ' -f3; }
+alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+helper_conf() {
+    python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(d["output"]["name"], d["output"]["keys"]["obfs"]["server"])' "$tmp/st/plugin/obfs/o.json" 2>/dev/null
+}
+helper_receipt() { awk -v pid="$1" '$1 == pid { n++; line=$0 } END { if (n == 1) print line }' "$tmp/helper-receipts" 2>/dev/null; }
 dev() { c status | j outputs.vpn.device; }
 
 spec 10.99.0.3:4443
@@ -304,6 +327,12 @@ check "steer subscribe — поток событий демона" "0" "$(head -
 
 wait_for '[ "$(runs o)" = 1 ]' 5
 check "помощник-заглушка поднят демоном" "1" "$(runs o)"
+initial_pid="$(pid_of o)"
+check "  помощник жив и получил путь своей конфигурации" "yes" \
+    "$(alive "$initial_pid" && tr '\0' ' ' < "/proc/$initial_pid/cmdline" | grep -q -- "--conf $tmp/st/plugin/obfs/o.json" && echo yes || echo no)"
+check "  конфигурация помощника соответствует первому серверу" "o 10.99.0.3:4443" "$(helper_conf)"
+check "  первый помощник прочитал свой сервер при старте" "$initial_pid o 10.99.0.3:4443" \
+    "$(helper_receipt "$initial_pid")"
 DN="$(grep -o 'supervise: dnsd запущен (pid [0-9]*' "$tmp/d.err" | grep -o '[0-9]*$')"
 check "  резолвер — ребёнок демона, argv[0] прежний (…/steer dnsd)" "1" \
     "$(tr '\0' ' ' < "/proc/$DN/cmdline" 2>/dev/null | grep -c '/steer dnsd --table-fd ')"
@@ -333,10 +362,21 @@ spec 10.99.0.3:4443 q
 out="$(STEER_ENGINE=/bin/false "$BIN" apply $S 2>"$tmp/a.err")"; rc=$?
 check "apply через клиент: код 0, вывод подкоманды" "0 steer: applied 3 channel(s), 4 output(s)" "$rc $out"
 check "  применил демон" "1" "$(grep -c 'ctl: спека применена$' "$tmp/d.err")"
-# Соседние подсети в наборе склеены в интервал: 10.1.0.0/16 и 10.2.0.0/16 — 10.1.0.0-10.2.255.255.
+# Между p и q стоит другое действие: подсети находятся в разных сегментах.
+qset="$("$BIN" explain 10.2.1.1 $S 2>/dev/null | sed -n 's/^10\.2\.1\.1 -> address set "\([^"]*\)" -> output "vpn".*/\1/p')"
 check "  подсеть нового канала — в наборе выхода в ядре" "1" \
-    "$("$real_nft" list set inet steer vpn_ip 2>/dev/null | grep -c '10\.2\.255\.255')"
+    "$([ -n "$qset" ] && "$real_nft" get element inet steer "$qset" '{ 10.2.1.1 }' >/dev/null 2>&1 && echo 1 || echo 0)"
+check "  чужой адрес не входит в новый набор" "no" \
+    "$("$real_nft" get element inet steer "$qset" '{ 10.3.1.1 }' >/dev/null 2>&1 && echo yes || echo no)"
+check "  старый набор не содержит новую подсеть" "no" \
+    "$("$real_nft" get element inet steer vpn_ip '{ 10.2.1.1 }' >/dev/null 2>&1 && echo yes || echo no)"
+check "  правило ядра действительно ссылается на новый набор" "yes" \
+    "$("$real_nft" -j list chain inet steer prerouting_mark | python3 -c 'import json,sys
+d=json.load(sys.stdin); n=sys.argv[1]
+print("yes" if n and any(x.get("rule",{}).get("comment") == "steer:"+n and any(e.get("match",{}).get("right") == "@"+n for e in x["rule"].get("expr",[])) for x in d["nftables"]) else "no")' "$qset")"
 check "  помощник не тронут" "1" "$(runs o)"
+check "  после apply прежний PID жив и конфигурация прежняя" "yes" \
+    "$([ "$(pid_of o)" = "$initial_pid" ] && alive "$initial_pid" && [ "$(helper_conf)" = 'o 10.99.0.3:4443' ] && echo yes || echo no)"
 check "  подписчику — applied" "1" "$(grep -c '"ev":"applied","by":"apply"' "$tmp/sub.out")"
 bad="$(STEER_ENGINE=/bin/false "$BIN" apply --dry-run $S 2>&1 >/dev/null)"; rc=$?
 check "apply --dry-run — движку (компилятор), не демону" "1" "$rc"
@@ -354,11 +394,21 @@ po="$(pid_of o)"
 out="$(STEER_ENGINE=/bin/false "$BIN" reload $S 2>&1)"; rc=$?
 check "reload без изменений: код 0, вывода нет" "0 " "$rc $out"
 check "  помощник тот же" "$po" "$(pid_of o)"
+check "  при reload без изменений прежний помощник жив" "yes" \
+    "$([ -n "$po" ] && alive "$po" && [ "$(helper_conf)" = 'o 10.99.0.3:4443' ] && echo yes || echo no)"
 spec 10.99.0.4:4443 q
 out="$(STEER_ENGINE=/bin/false "$BIN" reload $S 2>&1)"; rc=$?
 check "reload со сменой сервера обфускации: код 0" "0 " "$rc $out"
 wait_for '[ "$(runs o)" = 2 ]' 5
 check "  помощник o перезапущен" "2" "$(runs o)"
+pn="$(pid_of o)"
+wait_for '! alive "$po"' 5
+check "  старый PID остановлен, новый жив и отличается" "yes" \
+    "$([ -n "$po" ] && [ -n "$pn" ] && [ "$po" != "$pn" ] && ! alive "$po" && alive "$pn" && echo yes || echo no)"
+check "  новый помощник получил конфигурацию нового сервера" "yes" \
+    "$(alive "$pn" && tr '\0' ' ' < "/proc/$pn/cmdline" | grep -q -- "--conf $tmp/st/plugin/obfs/o.json" && [ "$(helper_conf)" = 'o 10.99.0.4:4443' ] && echo yes || echo no)"
+check "  новый помощник прочитал свой сервер при старте" "$pn o 10.99.0.4:4443" \
+    "$(helper_receipt "$pn")"
 
 # ---- страж правил ----
 # Проход сторожа после reload (через 5 с) — пусть кончится: он и сам возвращает недостающее
@@ -425,7 +475,8 @@ kill "$D"
 wait $D 2>/dev/null
 D=""
 po="$(pid_of o)"
-check "SIGTERM: помощника нет" "no" "$(kill -0 "$po" 2>/dev/null && echo yes || echo no)"
+check "SIGTERM: запущенный помощник остановлен" "yes" \
+    "$([ -n "$po" ] && ! kill -0 "$po" 2>/dev/null && echo yes || echo no)"
 check "  резолвера нет" "no" "$(kill -0 "$DN" 2>/dev/null && echo yes || echo no)"
 check "  сокет убран" "no" "$([ -S "$tmp/steer.sock" ] && echo yes || echo no)"
 out="$("$BIN" reload $S 2>&1)"; rc=$?
@@ -454,6 +505,8 @@ check "  строк «разъехалась» нет" "0" "$(grep -c 'разъ�
 # правила выходов всё время в ядре, резолвер не гаснет и достаётся новому демону; помощник гаснет.
 DN2="$(grep -o 'supervise: dnsd запущен (pid [0-9]*' "$tmp/d2.err" | grep -o '[0-9]*$')"
 po2="$(pid_of o)"
+check "restart: новый помощник жив до TERM и отличается от прежнего" "yes" \
+    "$([ -n "$po2" ] && [ "$po2" != "$pn" ] && alive "$po2" && echo yes || echo no)"
 h0="$("$real_nft" list table inet steer 2>/dev/null | grep -c .)"
 r0="$(ours)"
 : > "$tmp/st/restart"
@@ -461,7 +514,8 @@ kill "$D"; wait $D 2>/dev/null; D=""
 check "restart: набор правил остался в ядре" "yes" "$([ "$h0" -gt 0 ] && [ "$("$real_nft" list table inet steer 2>/dev/null | grep -c .)" -gt 0 ] && echo yes || echo no)"
 check "  правила выходов остались" "$r0" "$(ours)"
 check "  резолвер жив" "yes" "$([ -n "$DN2" ] && kill -0 "$DN2" 2>/dev/null && echo yes || echo no)"
-check "  помощник погашен" "no" "$(kill -0 "$po2" 2>/dev/null && echo yes || echo no)"
+check "  запущенный помощник погашен" "yes" \
+    "$([ -n "$po2" ] && ! kill -0 "$po2" 2>/dev/null && echo yes || echo no)"
 check "  просьба снята демоном" "no" "$([ -e "$tmp/st/restart" ] && echo yes || echo no)"
 STEER_SUPERVISE_EXE="$tmp/helper" unshare -m sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" \
     daemon --watch --supervise --apply --socket \"$tmp/steer.sock\" $S \

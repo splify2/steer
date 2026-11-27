@@ -93,8 +93,17 @@ ip netns exec $NSA ethtool -K ph tx off rx off >/dev/null 2>&1
 
 # Ключи и конфигурация хаба. Пир в списке нужен даже без запуска: файл без пиров хаб отвергает,
 # а проверяем мы не разбор файла.
-eval "$("$BIN" xsteer-key | sed 's/PrivateKey *= */HUB_PRIV=/; s/PublicKey *= */HUB_PUB=/')"
-eval "$("$BIN" xsteer-key | sed 's/PrivateKey *= */A_PRIV=/; s/PublicKey *= */A_PUB=/')"
+# Generate independent X25519 pairs: the server profile does not embed client
+# plugin commands such as xsteer-key. OpenSSL is already required by this test.
+keypair() {
+    openssl genpkey -algorithm X25519 -out "$WORK/$1.pem" 2>/dev/null || return 1
+    openssl pkey -in "$WORK/$1.pem" -outform DER 2>/dev/null | tail -c 32 | openssl base64 -A > "$WORK/$1.priv"
+    openssl pkey -in "$WORK/$1.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | openssl base64 -A > "$WORK/$1.pub"
+    [ "$(wc -c < "$WORK/$1.priv")" = 44 ] && [ "$(wc -c < "$WORK/$1.pub")" = 44 ]
+}
+keypair hub && keypair peer || { echo "probe: OpenSSL X25519 key generation failed" >&2; exit 2; }
+HUB_PRIV=$(cat "$WORK/hub.priv")
+A_PUB=$(cat "$WORK/peer.pub")
 
 # Сайт-прикрытие: НАСТОЯЩИЙ сервер TLS со своим сертификатом. Живёт в пространстве хаба — именно
 # хаб к нему дозванивается, и прибор о его существовании знать не должен вовсе.

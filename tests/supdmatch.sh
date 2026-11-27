@@ -22,7 +22,7 @@
 # строки снова в свой stderr; последняя строка перед выходом (срок ожидания, `steerd down`) доходит.
 #
 # Сторож и супервизор вместе (--watch --supervise; root, своё сетевое пространство и свой /sys,
-# демон build/steer-xk — базовая сборка с видами vless и xsteer): здоровье выходов xsteer сторож
+# настоящий build/steerd и официальные тестовые манифесты vless и xsteer): здоровье выходов xsteer сторож
 # берёт из событий помощников — помощник пишет down, и выход-пул переключается на следующее
 # устройство (switched у подписчика), пишет up — возвращается, и всё это без файлов probe-* и
 # xsteer-*.json в каталоге состояния; клиент vless, следящий за узлом сам (up с watch), — приговор
@@ -687,15 +687,49 @@ fi
 # 2 из 5). wo — interface с обфускатором;
 # у его устройства нет адреса, проба ICMP его не находит, и сторож его оживляет. ubus, ifdown и
 # ifup — заглушки в PATH демона: ubus записывает вызов, ifdown/ifup отказывают.
-XK="${STEER_XK:-$(dirname "$BIN")/steer-xk}"
-if [ "${SUPD_INNER:-}" = 1 ] && [ -x "$XK" ] && command -v unshare >/dev/null 2>&1 &&
-   unshare -m sh -c 'mount -t sysfs sysfs /sys' 2>/dev/null &&
+XK="$(dirname "$BIN")/steerd"
+[ -x "$XK" ] || { echo "supdmatch: настоящий steerd не собран: $XK" >&2; exit 2; }
+if [ "${SUPD_INNER:-}" = 1 ] && command -v unshare >/dev/null 2>&1 &&
+   unshare -m sh -c 'mount --make-rprivate / && mount -t sysfs -o ro,nosuid,nodev,noexec sysfs /sys' 2>/dev/null &&
    ip link add xa type dummy 2>/dev/null && ip link add xb type dummy 2>/dev/null &&
    ip link add wo type dummy 2>/dev/null && ip link add va type dummy 2>/dev/null &&
    ip link add vb type dummy 2>/dev/null; then
     for dv in xa xb wo va vb; do ip link set "$dv" addrgenmode none 2>/dev/null; ip link set "$dv" up; done
     W="$tmp/w"
     mkdir -p "$W/st" "$W/bin"
+    cat > "$W/event-check.py" <<'PY'
+import json, sys
+
+expected = {"v": 1, "ev": "helper-down", "out": "wo", "helper": "obfs",
+            "why": "перезапуск: выход не отвечает",
+            "code": "supd.restart_unresponsive", "args": {}}
+
+def valid(events):
+    selected = [e for e in events if isinstance(e, dict)
+                and e.get("ev") == "helper-down" and e.get("out") == "wo"]
+    return len(selected) == 1 and all(type(selected[0].get(k)) is type(v) and selected[0][k] == v
+                                      for k, v in expected.items())
+
+if sys.argv[1] == "--selftest":
+    assert valid([dict(expected, future="allowed")])
+    assert not valid([])
+    assert not valid([expected, expected])
+    for key in expected:
+        changed = dict(expected)
+        changed[key] = {"bad": 1} if key == "args" else "wrong"
+        assert not valid([changed]), key
+    assert not valid([dict(expected, v=True)])
+    print("yes")
+else:
+    try:
+        with open(sys.argv[1]) as f:
+            events = [json.loads(line) for line in f if line.strip()]
+        print("yes" if valid(events) else "no")
+    except (OSError, ValueError, TypeError):
+        print("no")
+PY
+    check "оракул helper-down допускает новые поля, но отвергает неверные поля и повторы" "yes" \
+        "$(python3 "$W/event-check.py" --selftest)"
     printf '#!/bin/sh\necho "ubus $*" >> "%s/ubus.log"\nexit 0\n' "$W" > "$W/bin/ubus"
     printf '#!/bin/sh\nexit 1\n' > "$W/bin/ifdown"
     printf '#!/bin/sh\nexit 1\n' > "$W/bin/ifup"
@@ -751,7 +785,7 @@ EOF
     # STEER_FAILOVER_HYST=0 — возврат на ожившее предпочтительное устройство без выдержки в три
     # прохода: стенд смотрит на то, откуда сторож берёт здоровье, а не на гистерезис. Период —
     # 600 с: всё, что стенд ждёт от сторожа, обязано прийти внеочередным проходом по событию.
-    unshare -m sh -c "mount -t sysfs sysfs /sys && PATH=\"$W/bin:\$PATH\" STEER_FAILOVER_HYST=0 \
+    unshare -m sh -c "mount --make-rprivate / && mount -t sysfs -o ro,nosuid,nodev,noexec sysfs /sys && PATH=\"$W/bin:\$PATH\" STEER_FAILOVER_HYST=0 \
         STEER_SUPERVISE_EXE=\"$W/helper\" exec \"$XK\" daemon --watch --watch-period 600 --supervise $self_uid \
         --socket \"$W/s.sock\" --spec \"$W/spec.json\" --state-dir \"$W/st\" \
         --dnsd-flag --listen-port --dnsd-flag 15411 --dnsd-flag --upstream-port --dnsd-flag 15475" \
@@ -886,8 +920,7 @@ for c in d["checks"]:
               [ "$(grep -c "\"ev\":\"helper-up\",\"out\":\"wo\"" "$W/sub.out")" = 2 ]' 40
     check "оживление обфускатора: помощник перезапущен демоном" "2" "$(wruns obfs wo)"
     check "  подписчику — helper-down с причиной" \
-        '{"v":1,"ev":"helper-down","out":"wo","helper":"obfs","why":"перезапуск: выход не отвечает"}' \
-        "$(grep '"ev":"helper-down","out":"wo"' "$W/sub.out")"
+        "yes" "$(python3 "$W/event-check.py" "$W/sub.out")"
     check "  и helper-up после подъёма" "2" "$(grep -c '"ev":"helper-up","out":"wo"' "$W/sub.out")"
     check "  в журнале — почему" "1" "$(grep -c 'supervise: obfs wo — выход не отвечает, поднимаю заново' "$W/d.err")"
     check "  ubus не звался" "" "$(cat "$W/ubus.log" 2>/dev/null)"
@@ -901,7 +934,7 @@ for c in d["checks"]:
     WD=""
     ip link del xa; ip link del xb; ip link del wo; ip link del va; ip link del vb
 else
-    echo "supdmatch: нет root, своего сетевого пространства, своего /sys или $XK — сторож с супервизором пропущен"
+    echo "supdmatch: нужны root, своё сетевое пространство, mount/unshare, sysfs и пять dummy — сторож с супервизором пропущен"
 fi
 
 printf '\nsupdmatch: %s passed, %s failed\n' "$pass" "$fail"

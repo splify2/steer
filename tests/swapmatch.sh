@@ -53,14 +53,14 @@
 #          резолверу: он сверяет карту с памятью и ставит свой (строка «заменён на тот, что знает
 #          резолвер»), а не верит EEXIST.
 #
-# Нужны root, unshare -nm, nsenter, ip, nft и python3. Чего-то нет — стенд пропускается вслух.
+# Нужны root, unshare -nm, nsenter, ip, nft, python3 и C-компилятор для часов стенда.
 set -u
 BIN="${STEER:-./build/steer}"
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 [ -x "$BIN" ] || { echo "not built: $BIN (make)"; exit 2; }
 FIX="$(pwd)/tests/srs"
 skip() { echo "swapmatch: $1 — пропускаю"; exit 0; }
-for t in ip nft unshare nsenter python3; do command -v $t >/dev/null 2>&1 || skip "нет $t"; done
+for t in ip nft unshare nsenter python3 cc; do command -v $t >/dev/null 2>&1 || skip "нет $t"; done
 if [ "${SWAP_INNER:-}" != 1 ]; then
     [ "$(id -u)" = 0 ] || skip "нужен root"
     unshare -nm true 2>/dev/null || skip "unshare -nm недоступен"
@@ -242,14 +242,20 @@ cnt() {   # cnt ПРОСТРАНСТВО real|pool
         sed -n 's/.*counter packets \([0-9]*\).*/\1/p'
 }
 
-# Журнал вызовов nft и ip — ОДИН файл на оба: по нему виден порядок.
+# ip wrapper не видит rtnetlink. Перед настоящим nft -f снимем правила и
+# маршруты ядра синхронно, пока вызов nft ещё не начал загрузку.
 mkdir -p "$tmp/bin"
-for t in nft ip; do
-    real="$(command -v $t)"
-    printf '#!/bin/sh\nprintf "%s %%s\\n" "$*" >> "%s/calls.log"\nexec "%s" "$@"\n' "$t" "$tmp" "$real" \
-        > "$tmp/bin/$t"
-    chmod +x "$tmp/bin/$t"
-done
+cat > "$tmp/bin/nft" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = -f ] && [ -s "$tmp/order-phase" ]; then
+    phase=\$(cat "$tmp/order-phase")
+    snapshot="$tmp/route-\$phase-\$\$"
+    "$real_ip" -N -4 rule show > "\$snapshot.rules" 2>&1
+    "$real_ip" -4 route show table "\$(cat "$tmp/order-table")" > "\$snapshot.routes" 2>&1
+fi
+exec "$real_nft" "\$@"
+EOF
+chmod +x "$tmp/bin/nft"
 PATH="$tmp/bin:$PATH"
 export PATH
 
@@ -357,8 +363,48 @@ check "  счётчик правила steer-fakeip-nomap вырос" "yes" \
 # ---- 4. старт демона с непустым fakeip.state -------------------------------------------------
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
 TBL="$(awk '$1 == "wg" { print $3 }' "$tmp/st/registry")"
-check "после down: правила fwmark выхода нет" "0" "$("$real_ip" rule show | grep -c "lookup $TBL")"
-: > "$tmp/calls.log"
+MARK="$(awk '$1 == "wg" { print $2 }' "$tmp/st/registry")"
+printf '%s\n' "$TBL" > "$tmp/order-table"
+snapshot_ok() {
+    [ -n "$TBL" ] && [ -n "$MARK" ] &&
+    grep -Eq "fwmark 0x$MARK/0xff00000 lookup $TBL([[:space:]]|$)" "$1.rules" &&
+    grep -Eq '^default .*dev t0([[:space:]]|$)' "$1.routes" &&
+    grep -Eq '^blackhole default metric 65535([[:space:]]|$)' "$1.routes"
+}
+snapshots_ok() {
+    found=0
+    for rules in "$tmp/route-$1-"*.rules; do
+        [ -f "$rules" ] || continue
+        found=$((found + 1))
+        if ! snapshot_ok "${rules%.rules}"; then
+            printf 'Снимок перед nft не совпал: mark=%s table=%s\n' "$MARK" "$TBL" >&2
+            cat "$rules" "${rules%.rules}.routes" >&2
+            return 1
+        fi
+    done
+    [ "$found" -gt 0 ]
+}
+show_snapshots() {
+    for rules in "$tmp/route-$1-"*.rules; do
+        [ -f "$rules" ] || continue
+        printf '  снимок перед nft -f (%s):\n' "$1"
+        grep "fwmark 0x$MARK/0xff00000 lookup $TBL" "$rules"
+        cat "${rules%.rules}.routes"
+    done
+}
+empty_route_table() {
+    rc=0
+    "$real_ip" -4 route show table "$TBL" > "$1.routes" 2> "$1.route-error" || rc=$?
+    [ ! -s "$1.routes" ] && { [ "$rc" -eq 0 ] ||
+        { [ "$rc" -eq 2 ] && grep -q 'FIB table does not exist' "$1.route-error"; }; }
+}
+rule_rc=0
+"$real_ip" -N -4 rule show > "$tmp/pre.rules" || rule_rc=$?
+empty_route_table "$tmp/pre" && routes_empty=yes || routes_empty=no
+check "после down: правила fwmark выхода нет" "0" "$(grep -c "lookup $TBL\$" "$tmp/pre.rules")"
+check "после down: маршрута выхода нет и отрицательный снимок отвергнут" "yes" \
+    "$([ "$rule_rc" -eq 0 ] && [ "$routes_empty" = yes ] && ! snapshot_ok "$tmp/pre" && echo yes || echo no)"
+printf 'daemon\n' > "$tmp/order-phase"
 W0="$(cnt "$IW" real)" T0="$(cnt "$IT" real)"
 send_start 198.18.0.1
 sleep 0.3
@@ -387,23 +433,45 @@ check "старт демона, перезапуск после kill -9, reload 
     "$(($(cnt "$IW" real) - W0))"
 check "  туннель получал (отправлено $sent)" "yes" \
     "$([ $(($(cnt "$IT" real) - T0)) -gt 50 ] && echo yes || echo "no:$(($(cnt "$IT" real) - T0))")"
-first_rule="$(grep -n "^ip rule add fwmark .* table $TBL" "$tmp/calls.log" | head -n 1 | cut -d: -f1)"
-first_load="$(grep -n '^nft -f ' "$tmp/calls.log" | head -n 1 | cut -d: -f1)"
-check "  порядок: правило fwmark выхода — раньше загрузки набора правил" "yes" \
-    "$([ -n "$first_rule" ] && [ -n "$first_load" ] && [ "$first_rule" -lt "$first_load" ] && echo yes ||
-       echo "no:rule=$first_rule load=$first_load")"
+check "  порядок: fwmark и маршрут в ядре до каждого nft -f демона" "yes" \
+    "$(snapshots_ok daemon && echo yes || echo no)"
+show_snapshots daemon
 kill "$D" 2>/dev/null
 wait "$D" 2>/dev/null
 
 # Подкоманда — тот же порядок (init без демона, reapply).
 "$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
-: > "$tmp/calls.log"
+rule_rc=0
+"$real_ip" -N -4 rule show > "$tmp/pre-apply.rules" || rule_rc=$?
+empty_route_table "$tmp/pre-apply" && routes_empty=yes || routes_empty=no
+check "перед подкомандой: правило и маршрут отсутствуют" "yes" \
+    "$([ "$rule_rc" -eq 0 ] && [ "$routes_empty" = yes ] &&
+       ! grep -Eq "fwmark 0x$MARK(/0x[0-9a-f]+)? lookup $TBL([[:space:]]|$)" "$tmp/pre-apply.rules" &&
+       ! snapshot_ok "$tmp/pre-apply" && echo yes || echo no)"
+printf 'apply\n' > "$tmp/order-phase"
+W0="$(cnt "$IW" real)" WP0="$(cnt "$IW" pool)" T0="$(cnt "$IT" real)"
 "$BIN" apply $S >/dev/null 2>&1
-first_rule="$(grep -n "^ip rule add fwmark .* table $TBL" "$tmp/calls.log" | head -n 1 | cut -d: -f1)"
-first_load="$(grep -n '^nft -f ' "$tmp/calls.log" | head -n 1 | cut -d: -f1)"
-check "подкоманда apply: правило fwmark — раньше загрузки набора правил" "yes" \
-    "$([ -n "$first_rule" ] && [ -n "$first_load" ] && [ "$first_rule" -lt "$first_load" ] && echo yes ||
-       echo "no:rule=$first_rule load=$first_load")"
+check "подкоманда apply: fwmark и маршрут в ядре до каждого nft -f" "yes" \
+    "$(snapshots_ok apply && echo yes || echo no)"
+show_snapshots apply
+burst 198.18.0.1 5
+check "  после apply: пять пакетов в туннель, у провайдера нет ни настоящих, ни fake-IP" "yes" \
+    "$([ $(($(cnt "$IT" real) - T0)) -eq 5 ] && [ $(($(cnt "$IW" real) - W0)) -eq 0 ] &&
+       [ $(($(cnt "$IW" pool) - WP0)) -eq 0 ] && echo yes || echo no)"
+"$real_ip" -N -4 rule show > "$tmp/post.rules"
+"$real_ip" -4 route show table "$TBL" > "$tmp/post.routes" 2>/dev/null
+check "положительный снимок установленного выхода принят" "yes" \
+    "$(snapshot_ok "$tmp/post" && echo yes || echo no)"
+grep -v "lookup $TBL\$" "$tmp/post.rules" > "$tmp/no-rule.rules"
+cp "$tmp/post.routes" "$tmp/no-rule.routes"
+cp "$tmp/post.rules" "$tmp/no-route.rules"
+grep -v '^default .*dev t0' "$tmp/post.routes" > "$tmp/no-route.routes"
+cp "$tmp/post.rules" "$tmp/no-blackhole.rules"
+grep -v '^blackhole default metric 65535' "$tmp/post.routes" > "$tmp/no-blackhole.routes"
+check "отрицательный контроль: отсутствие правила, маршрута или blackhole обнаруживается" "yes" \
+    "$(! snapshot_ok "$tmp/no-rule" && ! snapshot_ok "$tmp/no-route" &&
+       ! snapshot_ok "$tmp/no-blackhole" && echo yes || echo no)"
+rm -f "$tmp/order-phase"
 
 # ---- 5. резолвер вырезает адрес из слитого засевом отрезка -----------------------------------
 printf 'x1.a.test\nx2.a.test\nx3.a.test\n' > "$tmp/a.lst"
@@ -508,11 +576,67 @@ wait "$D" 2>/dev/null
 "$BIN" down --state-dir "$tmp/rst" >/dev/null 2>&1
 
 # ---- 7. засев не отстаёт от памяти резолвера ------------------------------------------------
+# Часы только тестового dnsd: обычно time() возвращает реальные часы. Маркер
+# включает фиксированную секунду лишь в процессе с аргументом dnsd и лишь в
+# конце B3; monotonic, остальные процессы и системное время не меняются.
+cat > "$tmp/dns-clock.c" <<'C'
+#define _POSIX_C_SOURCE 200809L
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+static int is_dnsd(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    char b[4096]; int fd = open("/proc/self/cmdline", O_RDONLY);
+    ssize_t n = fd < 0 ? -1 : read(fd, b, sizeof(b) - 1);
+    if (fd >= 0) close(fd);
+    cached = 0;
+    if (n <= 0) return cached;
+    b[n] = 0;
+    for (ssize_t i = 0; i < n; i += (ssize_t)strlen(b + i) + 1)
+        if (!strcmp(b + i, "dnsd")) { cached = 1; break; }
+    return cached;
+}
+time_t time(time_t *out) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return (time_t)-1;
+    time_t now = ts.tv_sec;
+    const char *path = getenv("SWAP_DNS_CLOCK");
+    if (path && is_dnsd()) {
+        char b[64]; int fd = open(path, O_RDONLY);
+        ssize_t n = fd < 0 ? -1 : read(fd, b, sizeof(b) - 1);
+        if (fd >= 0) close(fd);
+        if (n > 0) {
+            b[n] = 0; char *end;
+            long long value = strtoll(b, &end, 10);
+            if (end != b && value > 0) {
+                static int logged;
+                now = (time_t)value;
+                if (!logged) {
+                    const char *log = getenv("SWAP_DNS_CLOCK_LOG");
+                    int f = log ? open(log, O_WRONLY|O_CREAT|O_APPEND, 0600) : -1;
+                    if (f >= 0) { dprintf(f, "%ld %lld\n", (long)getpid(), value); close(f); }
+                    logged = 1;
+                }
+            }
+        }
+    }
+    if (out) *out = now;
+    return now;
+}
+C
+if ! cc -shared -fPIC -O2 -o "$tmp/dns-clock.so" "$tmp/dns-clock.c"; then
+    echo "не собран тестовый clock seam" >&2
+    exit 2
+fi
 # Апстрим отвечает по файлу «имя адрес-IPv4 адрес-IPv6» (перечитывает на каждый вопрос: B3 меняет
 # адрес на ходу); имени нет в файле — 203.0.113.10 и 2001:db8:77::10.
 cat > "$tmp/up2.py" <<'PY'
-import socket, struct, sys
-port, mapf = int(sys.argv[1]), sys.argv[2]
+import socket, struct, sys, time
+port, mapf, logf = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("127.0.0.1", port))
 def lookup(name):
@@ -533,14 +657,17 @@ while True:
         qend += 1 + l
     qtype = struct.unpack('>H', data[qend + 1:qend + 3])[0]
     qend += 5
-    a = lookup(".".join(labels))
+    name = ".".join(labels)
+    a = lookup(name)
     rd = None
     if qtype == 1:
         rd = socket.inet_pton(socket.AF_INET, a[0])
     elif qtype == 28:
         rd = socket.inet_pton(socket.AF_INET6, a[1])
     hdr = data[:2] + b'\x81\x80' + data[4:6] + (b'\x00\x01' if rd else b'\x00\x00') + b'\x00' * 4
-    ans = struct.pack('>HHHIH', 0xc00c, qtype, 1, 300, len(rd)) + rd if rd else b''
+    ans = struct.pack('>HHHIH', 0xc00c, qtype, 1, 1, len(rd)) + rd if rd else b''
+    with open(logf, 'a') as log:
+        print(f'{time.monotonic():.6f} {name} {qtype} {a[0] if qtype == 1 else a[1]}', file=log, flush=True)
     s.sendto(hdr + data[12:qend] + ans, addr)
 PY
 cat > "$tmp/qa2.py" <<'PY'
@@ -559,12 +686,14 @@ try:
     elif t == 28:
         print(socket.inet_ntop(socket.AF_INET6, d[-16:]))
     else:
-        print(".".join(str(b) for b in d[-4:]))
+        ip = ".".join(str(b) for b in d[-4:])
+        print(ip + (" " + str(struct.unpack('>I', d[-10:-6])[0]) if len(sys.argv) > 3 and sys.argv[3] == "TTL" else ""))
 except socket.timeout:
     print("timeout")
 PY
 : > "$tmp/up2.map"
-python3 "$tmp/up2.py" 15595 "$tmp/up2.map" & UP2=$!
+: > "$tmp/up2.log"
+python3 "$tmp/up2.py" 15595 "$tmp/up2.map" "$tmp/up2.log" & UP2=$!
 pids="$pids $UP2"
 cat > "$tmp/f7.yaml" <<EOF
 version: 2
@@ -573,13 +702,17 @@ lists:
   f: { domains_file: $tmp/d.lst }
 outputs:
   wg: { kind: interface, device: t0, on_fail: drop }
+dns:
+  cache: 0
 rules:
   - { name: f, to: f, out: wg }
 EOF
 mkdir -p "$tmp/fst"
 F7="--spec $tmp/f7.yaml --state-dir $tmp/fst"
 start7() {   # start7 ЖУРНАЛ
-    "$BIN" daemon --supervise --apply --socket "$tmp/f.sock" $F7 --dnsd-flag --listen-port \
+    SWAP_DNS_CLOCK="$tmp/dns-clock.now" SWAP_DNS_CLOCK_LOG="$tmp/dns-clock.log" \
+        LD_PRELOAD="$tmp/dns-clock.so" STEER_DNSD_REAL_IDLE_S=5 \
+        "$BIN" daemon --supervise --apply --socket "$tmp/f.sock" $F7 --dnsd-flag --listen-port \
         --dnsd-flag 15591 --dnsd-flag --upstream-port --dnsd-flag 15595 >/dev/null 2>"$1" &
     D=$!
     pids="$pids $D"
@@ -600,6 +733,8 @@ del_chan7() {
 }
 start7 "$tmp/fd1.err"
 check "7: демон с резолвером поднялся" "1" "$(grep -c 'спека применена при старте' "$tmp/fd1.err")"
+check "7: DNS cache выключен в таблице" "1" \
+    "$("$BIN" dnsd-table $F7 2>/dev/null | head -n 1 | awk '{print NF}')"
 
 # B1. Новое имя — и сразу замена набора: клиент получил поддельный адрес и шлёт на него, а таблицу
 # в этот миг ставят заново (правило канала снято снаружи, apply чинит заменой).
@@ -643,32 +778,86 @@ check "  клиент с поддельным адресом из кэша: 5 и
     "$(($(cnt "$IT" real) - T0)) $(($(cnt "$IW" real) - W0))"
 
 # B3. Апстрим сменил адрес имени: в памяти резолвера и в карте новый, в файле — ещё прежний
-# (перезапись по сроку — раз в минуту). Замена набора засевает карту из файла.
+# (debounce записи сейчас одна секунда). Замена набора засевает карту из файла.
 printf 'b3n1.s19.test 203.0.113.11\n' > "$tmp/up2.map"
-F="$(qa7 b3n1.s19.test)"
+answer="$(qa7 b3n1.s19.test TTL)"
+F="${answer% *}"
+check "  B3: поддельный ответ имеет TTL 60" "$F 60" "$answer"
 wait_for "grep -q '^b3n1.s19.test	$F	203.0.113.11$' '$tmp/fst/fakeip.state'" 3
 check "  B3: n1 = .11 — в карте и в файле" "1 1" \
     "$(inmap fakeip "$F" 203.0.113.11) $(grep -c "^b3n1.s19.test	$F	203.0.113.11$" "$tmp/fst/fakeip.state")"
-printf 'b3n1.s19.test 203.0.113.12\n' > "$tmp/up2.map"
+# Первый повтор может запустить фоновую проверку; фиксируем её завершение,
+# пока upstream ещё возвращает .11. Следующий запрос — внутри окна 60 с.
 qa7 b3n1.s19.test >/dev/null
+wait_for '[ "$(grep -c " b3n1.s19.test 1 203.0.113.11$" "$tmp/up2.log")" -ge 2 ]' 5
+check "  B3: исходный ответ и refresh действительно дошли до upstream" "yes" \
+    "$([ "$(grep -c ' b3n1.s19.test 1 203.0.113.11$' "$tmp/up2.log")" -ge 2 ] && echo yes || echo no)"
+window_start="$(python3 -c 'import time; print(time.monotonic())')"
+printf 'b3n1.s19.test 203.0.113.12\n' > "$tmp/up2.map"
+check "  B3: повтор внутри TTL возвращает тот же fake-IP" "$F" "$(qa7 b3n1.s19.test)"
+early12=no
+if wait_for '[ "$(grep -c " b3n1.s19.test 1 203.0.113.12$" "$tmp/up2.log")" -gt 0 ]' 2; then early12=yes; fi
+check "  B3: контроль внутри окна выполнен до истечения TTL" "yes" \
+    "$(python3 -c 'import sys,time; print("yes" if time.monotonic()-float(sys.argv[1]) < 60 else "no")' "$window_start")"
+check "  B3: внутри окна upstream .12 не запрошен за 2 с, карта и файл ещё .11" "no 0 1 1" \
+    "$early12 $(grep -c ' b3n1.s19.test 1 203.0.113.12$' "$tmp/up2.log") $(inmap fakeip "$F" 203.0.113.11) $(grep -c "^b3n1.s19.test	$F	203.0.113.11$" "$tmp/fst/fakeip.state")"
+# Реальное истечение окна по monotonic до включения seam: TTL продукта не
+# меняется. TTL ответа upstream равен 1 с, а кэш резолвера выше выключен.
+python3 - "$window_start" <<'PY'
+import sys, time
+target = float(sys.argv[1]) + 61
+while True:
+    remaining = target - time.monotonic()
+    if remaining <= 0:
+        break
+    time.sleep(min(remaining, 1))
+PY
+# После реального TTL фиксируем только wall-clock тестового dnsd на время
+# проверки окна debounce (он равен одной секунде и иначе гоняется с тестом).
+date +%s > "$tmp/dns-clock.next"
+mv "$tmp/dns-clock.next" "$tmp/dns-clock.now"
+# Перед сменой адреса обновляем файл .11 и debounce: новое имя делает его
+# грязным, а реальная замена заставляет загрузчик дождаться записи.
+qa7 b3flush.s19.test >/dev/null
+del_chan7
+apply7
+check "  B3: перед refresh файл подтверждён и ещё содержит .11" "1 1" \
+    "$(grep -c '^b3flush.s19.test	' "$tmp/fst/fakeip.state") $(grep -c "^b3n1.s19.test	$F	203.0.113.11$" "$tmp/fst/fakeip.state")"
+check "  B3: после окна клиент снова получил тот же fake-IP" "$F" "$(qa7 b3n1.s19.test)"
+wait_for '[ "$(grep -c " b3n1.s19.test 1 203.0.113.12$" "$tmp/up2.log")" -ge 1 ]' 5
+check "  B3: после окна upstream действительно ответил .12" "yes" \
+    "$([ "$(grep -c ' b3n1.s19.test 1 203.0.113.12$' "$tmp/up2.log")" -ge 1 ] && echo yes || echo no)"
 wait_for "[ \"\$(inmap fakeip '$F' 203.0.113.12)\" = 1 ]" 3
 check "  апстрим сменил адрес: карта .12, файл ещё .11" "1 1" \
     "$(inmap fakeip "$F" 203.0.113.12) $(grep -c "^b3n1.s19.test	$F	203.0.113.11$" "$tmp/fst/fakeip.state")"
+check "  перед apply: .11 в карте нет, .12 в файле ещё нет" "0 0" \
+    "$(inmap fakeip "$F" 203.0.113.11) $(grep -c "^b3n1.s19.test	$F	203.0.113.12$" "$tmp/fst/fakeip.state")"
 del_chan7
 apply7
 now12="$(inmap fakeip "$F" 203.0.113.12)"
 sleep 1
 check "  замена набора: в карте .12 сразу после apply и через секунду, .11 нет" "1 1 0" \
     "$now12 $(inmap fakeip "$F" 203.0.113.12) $(inmap fakeip "$F" 203.0.113.11)"
+check "  после apply: файл обновлён до .12, .11 отсутствует" "1 0" \
+    "$(grep -c "^b3n1.s19.test	$F	203.0.113.12$" "$tmp/fst/fakeip.state") $(grep -c "^b3n1.s19.test	$F	203.0.113.11$" "$tmp/fst/fakeip.state")"
 # Карта испорчена руками — резолвер на SIGHUP сверяет её с памятью, а не верит EEXIST.
 "$real_nft" delete element inet steer fakeip "{ $F }"
 "$real_nft" add element inet steer fakeip "{ $F : 203.0.113.99 }"
+check "  перед SIGHUP: карта действительно испорчена, файл остаётся .12" "1 0 1" \
+    "$(inmap fakeip "$F" 203.0.113.99) $(inmap fakeip "$F" 203.0.113.12) $(grep -c "^b3n1.s19.test	$F	203.0.113.12$" "$tmp/fst/fakeip.state")"
 DN="$(pgrep -P "$D" -f dnsd | head -n 1)"
 n0="$(grep -c 'заменён на тот, что знает резолвер' "$tmp/fd2.err")"
 kill -HUP "$DN" 2>/dev/null
 wait_for "[ \"\$(grep -c 'заменён на тот, что знает резолвер' '$tmp/fd2.err')\" -gt $n0 ]" 5
 check "  карта испорчена руками, SIGHUP: резолвер вернул свой адрес и сказал об этом" "1 0 yes" \
     "$(inmap fakeip "$F" 203.0.113.12) $(inmap fakeip "$F" 203.0.113.99) $([ "$(grep -c 'заменён на тот, что знает резолвер' "$tmp/fd2.err")" -gt "$n0" ] && echo yes || echo no)"
+check "  после SIGHUP: .11 отсутствует в карте и файле, файл остаётся .12" "0 0 1" \
+    "$(inmap fakeip "$F" 203.0.113.11) $(grep -c "^b3n1.s19.test	$F	203.0.113.11$" "$tmp/fst/fakeip.state") $(grep -c "^b3n1.s19.test	$F	203.0.113.12$" "$tmp/fst/fakeip.state")"
+check "  B3: clock seam сработал именно в дочернем dnsd" "yes" \
+    "$(grep -q "^$DN " "$tmp/dns-clock.log" 2>/dev/null && echo yes || echo no)"
+rm -f "$tmp/dns-clock.now"
+printf '  B3 upstream (monotonic, имя, тип, ответ):\n'
+grep ' b3n1.s19.test 1 ' "$tmp/up2.log"
 kill "$D" 2>/dev/null
 wait "$D" 2>/dev/null
 "$BIN" down --state-dir "$tmp/fst" >/dev/null 2>&1
