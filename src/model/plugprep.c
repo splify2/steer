@@ -189,8 +189,7 @@ int spec_prepare_report(const char *path, char **json) {
 }
 
 /* {conf} выхода — перед запуском его помощника (steer-api.md, 1.4). */
-int plugin_conf_write(const struct spec *sp, const struct output *o) {
-    const struct plugin_kind *pk = plugin_helper_kind(o);
+static int plugin_conf_write_kind(const struct spec *sp, const struct output *o, const struct plugin_kind *pk) {
     if (!pk) return -1;
     char *json = plugin_conf_json(sp, o, pk);
     if (!json) return -1;
@@ -200,6 +199,11 @@ int plugin_conf_write(const struct spec *sp, const struct output *o) {
     int rc = pu_mkdir_p(dir) == 0 ? pu_write_atomic(path, json, strlen(json), 0600) : -1;
     free(json);
     return rc;
+}
+
+int plugin_conf_write(const struct spec *sp, const struct output *o) {
+    const struct plugin_kind *pk = iface_helper_kind(o);
+    return plugin_conf_write_kind(sp, o, pk ? pk : plugin_helper_kind(o));
 }
 
 /* ---- подкоманды плагинов (steer-api.md, 4.3; manifest.md, commands[]) ------------------------------ */
@@ -243,7 +247,7 @@ static int cmd_conf(const struct plugin_cmd *c, const char *name, const char *sp
         return off == len ? 0 : 2;
     }
     free(json);
-    if (plugin_conf_write(sp, o) != 0) {
+    if (plugin_conf_write_kind(sp, o, pk) != 0) {
         fprintf(stderr, "steer: %s: файл настройки выхода %s не записан: %s\n", c->name, name, strerror(errno));
         return 2;
     }

@@ -22,6 +22,10 @@ const struct out_obfs *iface_obfs(const struct output *o) {
     return kind_of(o) == &kind_interface && o->iface.obfs.on ? &o->iface.obfs : NULL;
 }
 
+const struct plugin_kind *iface_helper_kind(const struct output *o) {
+    return iface_obfs(o) ? plugin_core_ext("interface", "obfs") : NULL;
+}
+
 static int iface_parse(struct output *o, const struct out_keys *k, struct err *e) {
     /* device и devices описывают одно и то же с разных сторон: device — что
      * работает сейчас, devices — из чего выбирать. Задан только список — устройство выводится
@@ -102,7 +106,7 @@ static void iface_diag(kind_diag_fn *diag, const struct spec *sp, const struct o
     /* Обфускатор — помощник плагина (iface_helper). Нет плагина — так и сказать: перезапуск ядра его
      * не поставит. Есть — обходом /proc (src/lib/procscan.c): у демона помощник — его ребёнок с
      * командной строкой «<программа> <cmd> <выход> --conf …». */
-    const struct plugin_kind *pk = plugin_core_ext("interface", "obfs");
+    const struct plugin_kind *pk = iface_helper_kind(o);
     if (!pk) {
         snprintf(what, sizeof(what), "выход %.40s: обфускатора нет", o->name);
         diag("obfs", "fail", what, "у выхода есть obfs, а плагина, который ведёт обфускатор (ключ obfs вида "
@@ -160,8 +164,7 @@ static void iface_diag(kind_diag_fn *diag, const struct spec *sp, const struct o
  * подпись перезапуска — всё содержимое {conf} (plugin.c). Плагина нет — помощника нет, а diag говорит,
  * какой плагин поставить. */
 static int iface_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
-    if (!o->iface.obfs.on) return -1;
-    const struct plugin_kind *pk = plugin_core_ext("interface", "obfs");
+    const struct plugin_kind *pk = iface_helper_kind(o);
     return pk ? plugin_kind_helper(pk, sp, o, h) : -1;
 }
 

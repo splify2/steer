@@ -423,5 +423,6 @@ const char *group_why_name(int why);
 
 /* interface: обфускация транспорта или NULL, если её нет (или выход не interface). */
 const struct out_obfs *iface_obfs(const struct output *o);
+const struct plugin_kind *iface_helper_kind(const struct output *o);
 
 #endif
