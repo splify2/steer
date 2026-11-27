@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 
 #include "pm.h"
+#include "pmgroup.h"
 #include "pmkind.h"
 #include "err.h"
 #include "sigverify.h"
@@ -334,7 +335,7 @@ static char **all_ids(struct pm_ctx *x, size_t *n) {
     return v;
 }
 
-static int cmd_list(struct pm_ctx *x, const char *only, int deep) {
+static int cmd_list(struct pm_ctx *x, const char *only, int deep, FILE *out) {
     /* Без записи: манифесты разбираются по разу (used_by и отбор обновления смотрят манифесты всех). */
     pm_mcache_on(x);
     size_t n = 0;
@@ -353,7 +354,7 @@ static int cmd_list(struct pm_ctx *x, const char *only, int deep) {
     }
     if (x->json) {
         struct jw w;
-        jw_init(&w, stdout);
+        jw_init(&w, out);
         jw_obj(&w);
         jw_kbool(&w, "ok", 1);
         jw_key(&w, "plugins");
@@ -374,12 +375,12 @@ static int cmd_list(struct pm_ctx *x, const char *only, int deep) {
             jw_arr(&w);
             for (size_t i = 0; i < x->st.nsys; i++) jw_str(&w, x->st.system_ours[i]);
             jw_aend(&w);
-            int busy = pm_lock() != 0;
-            if (!busy) pm_unlock();
+            int busy = out == stdout && pm_lock() != 0;
+            if (out == stdout && !busy) pm_unlock();
             jw_kbool(&w, "busy", busy);
         }
         jw_end(&w);
-        fputc('\n', stdout);
+        fputc('\n', out);
     } else {
         for (size_t i = 0; i < n; i++) {
             if (only && strcmp(only, ids[i])) continue;
@@ -387,7 +388,7 @@ static int cmd_list(struct pm_ctx *x, const char *only, int deep) {
             int sec;
             const char *y;
             const char *u = update_of(x, p, &sec, &y);
-            printf("%-16s %-10s %-9s %-10s%s%s%s%s\n", ids[i], p && p->version ? p->version : "?",
+            fprintf(out,"%-16s %-10s %-9s %-10s%s%s%s%s\n", ids[i], p && p->version ? p->version : "?",
                    p && p->state ? p->state : "installed", p && p->repo ? p->repo : "-",
                    u ? " обновление " : "", u ? u : "", p && p->why ? " — " : "", p && p->why ? p->why : "");
         }
@@ -1440,7 +1441,12 @@ int pm_main(int argc, char **argv) {
     int listing = !strcmp(act, "list") || !strcmp(act, "status");
     int readonly = listing || !strcmp(act, "search") || !strcmp(act, "job") ||
                    (!strcmp(act, "repo") && npos == 2 && !strcmp(pos[1], "list"));
-    if (listing && pm_install_pending(&e) != 0) {
+    int read_gate = -1;
+    if (readonly && !pm_managed()) {
+        read_gate = pm_group_reader(0);
+        if (read_gate == -1) { rc = failc(&x,"plugin.busy",NULL,"каталог плагинов занят"); goto out; }
+    }
+    if ((listing || (readonly && pm_group_pending())) && pm_install_pending(&e) != 0) {
         if (pm_lock() != 0) { rc = fail_e(&x, &e); goto out; }
         int recover = pm_install_recover(&x, &e);
         pm_unlock();
@@ -1453,10 +1459,20 @@ int pm_main(int argc, char **argv) {
     pm_target_load(&x.tg);
     if (!x.tg.arch) x.tg.arch = pm_strdup("");
     /* Чтение без блокировки, когда нет журнала установки. */
-    if (!strcmp(act, "list") && npos == 1) { rc = cmd_list(&x, NULL, 0); goto out; }
-    if (!strcmp(act, "status") && npos <= 2) {
+    if ((!strcmp(act, "list") && npos == 1) || (!strcmp(act, "status") && npos <= 2)) {
         if (npos == 2 && !pm_id_ok(pos[1])) { rc = failc(&x, "plugin.bad_name", NULL, "недопустимое имя плагина"); goto out; }
-        rc = cmd_list(&x, npos == 2 ? pos[1] : NULL, 1);
+        char *buf = NULL; size_t len = 0;
+        FILE *out = read_gate == -2 ? open_memstream(&buf,&len) : stdout;
+        if (!out) { rc = failc(&x,"plugin.no_memory",NULL,"нет памяти"); goto out; }
+        rc = cmd_list(&x, npos == 2 ? pos[1] : NULL, !strcmp(act,"status"), out);
+        if (out != stdout) {
+            int bad = fclose(out);
+            /* Пустой префикс: не создавать каталог только ради чтения. */
+            read_gate = pm_group_reader(0);
+            if (!rc && (bad || read_gate != -2)) rc = failc(&x,"plugin.busy",NULL,"каталог плагинов изменился");
+            if (!rc) fwrite(buf,1,len,stdout);
+            free(buf);
+        }
         goto out;
     }
     if (!strcmp(act, "search") && npos <= 2) { rc = cmd_search(&x, npos == 2 ? pos[1] : NULL); goto out; }
@@ -1524,6 +1540,7 @@ int pm_main(int argc, char **argv) {
 out_nojob:
     pm_unlock();
 out:
+    if (read_gate >= 0) close(read_gate);
     fflush(stdout);
     pm_mcache_free(&x);
     pm_state_free(&x.st);

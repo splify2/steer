@@ -239,6 +239,7 @@ struct pm_ctx {
     int no_daemon;               /* не звать демон (без сокета) */
     int allow_bad;               /* отбор берёт и версии из bad_versions (явная версия) */
     int defer;                   /* группа: проверка здоровья откладывается до конца группы (pm_opts.group) */
+    struct pm_group *file_group; /* только подготовленная простая подписанная группа */
     void *undo;                  /* записи отката группы (pminst.c) */
     size_t nundo;
     struct pm_err before_err;    /* ошибка plugin-reload до установки (before_bad) */

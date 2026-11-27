@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "pm.h"
+#include "pmgroup.h"
 
 /* ---- state.json ---- */
 
@@ -109,7 +110,7 @@ int pm_state_load(struct pm_state *s, struct pm_err *e) {
     return 0;
 }
 
-int pm_state_save(const struct pm_state *s, struct pm_err *e) {
+int pm_state_save_group(const struct pm_state *s, const struct pm_group *g, struct pm_err *e) {
     char *buf = NULL;
     size_t n = 0;
     FILE *f = open_memstream(&buf, &n);
@@ -165,11 +166,15 @@ int pm_state_save(const struct pm_state *s, struct pm_err *e) {
     int bad = ferror(f);
     if (fclose(f) != 0 || bad) { free(buf); return pm_errc(e, "plugin.no_memory", NULL, "нет памяти"); }
     char *p = pm_state_path();
-    int r = pm_write_atomic(p, buf, n, pm_managed() ? 0600 : 0644);
+    int r = g ? pm_group_write(g,"registry",p,buf,n) : pm_write_atomic(p, buf, n, pm_managed() ? 0600 : 0644);
     free(buf);
     if (r != 0) { pm_errc(e, "plugin.write_failed", PMA("path", p), "не записать %s", p); free(p); return -1; }
     free(p);
     return 0;
+}
+
+int pm_state_save(const struct pm_state *s, struct pm_err *e) {
+    return pm_state_save_group(s,NULL,e);
 }
 
 static void inst_free(struct pm_inst *x) {

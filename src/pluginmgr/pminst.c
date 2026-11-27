@@ -32,6 +32,7 @@
 #include <linux/rtnetlink.h>
 
 #include "pm.h"
+#include "pmgroup.h"
 #include "pmkind.h"
 #include "httpc.h"
 #include "untar.h"
@@ -1180,10 +1181,13 @@ int pm_keepd_write(struct pm_ctx *x) {
         }
         ydoc_free(m);
     }
-    fclose(f);
-    int r = pm_write_atomic(pm_keepd(), buf, n, 0644);
+    int bad = ferror(f);
+    if (fclose(f) || bad) { free(buf); return -1; }
+    int r = x->file_group ? pm_group_write(x->file_group,"keep",pm_keepd(),buf,n) :
+                            pm_write_atomic(pm_keepd(), buf, n, 0644);
     free(buf);
-    if (platform_write(x) != 0) r = -1;
+    /* У простых участников нет steer.platform. Не переиздавать чужую конфигурацию. */
+    if (!x->file_group && platform_write(x) != 0) r = -1;
     return r;
 }
 
@@ -1830,10 +1834,19 @@ static int group_finish(struct pm_ctx *x, int before_bad, const char *before_msg
             else if (!abi_blame_others(x, gids, n, he.msg)) healthy = 0;
             free(gids);
         }
+        if (x->file_group && x->no_daemon) {
+            healthy = 0;
+            pm_errf(&he,"демон пропал до проверки здоровья группы");
+        }
         for (size_t i = 0; healthy && i < n; i++)
             if (!u[i].was_disabled && wait_outs(x, &u[i].before, u[i].timeout_s, &he) != 0) healthy = 0;
     }
     struct pm_err se = {0};
+    if (x->file_group) {
+        if (healthy) return 0;
+        return pm_errc(e, "plugin.group_health_failed", PMA("why", he.msg),
+                       "группа плагинов не прошла проверку здоровья: %s", he.msg);
+    }
     if (healthy) {
         for (size_t i = 0; i < n; i++) pm_rmrf(u[i].prev);
         return 0;
@@ -1869,6 +1882,11 @@ int pm_install_pending(struct pm_err *e) {
     char *marker = install_marker();
     struct stat st;
     int pending = lstat(marker, &st) == 0 || errno != ENOENT;
+    if (!pending && !pm_managed()) {
+        char *dir = pm_path(pm_root(),PM_GROUP_DIR);
+        pending = lstat(dir,&st) == 0 || errno != ENOENT;
+        free(dir);
+    }
     int rc = pending ? install_degraded(e, marker) : 0;
     free(marker);
     return rc;
@@ -1881,18 +1899,28 @@ static int install_marker_clear(struct pm_ctx *x, const char *marker, struct pm_
 }
 
 /* Только то, что умеем восстановить без выполнения кода пакета или стороннего менеджера. */
-static int file_manifest(const struct ynode *m, const char *id) {
+static int plain_manifest(const struct ynode *m, const char *id, int group) {
     static const char *const metadata[] = {"schema","id","version","name","description","license","arch","compat"};
     const char *owner = yn_str(m, "id");
     if (!owner || !id || strcmp(owner, id) || yn_long(m, "schema", -1) != 1 || !pm_ver_ok(yn_str(m, "version"))) return 0;
     for (size_t i = 0; i < ynode_len(m); i++) {
         const char *k = ynode_key_at(m, i)->str;
+        if (group && (!strcmp(k,"keep") || !strcmp(k,"permissions") || !strcmp(k,"variant"))) continue;
+        if (group && !strcmp(k,"requires")) {
+            const struct ynode *req = ynode_val_at(m,i), *deps = ynode_get(req,"plugins");
+            if (req->kind != YN_MAP || req->len != 1 || !deps || deps->kind != YN_MAP) return 0;
+            for (size_t j = 0; j < deps->len; j++)
+                if (!pm_id_ok(ynode_key_at(deps,j)->str) || !yn_is_str(ynode_val_at(deps,j))) return 0;
+            continue;
+        }
         size_t j = 0;
         while (j < sizeof(metadata)/sizeof(*metadata) && strcmp(k, metadata[j])) j++;
         if (j == sizeof(metadata)/sizeof(*metadata)) return 0;
     }
     return 1;
 }
+
+static int file_manifest(const struct ynode *m, const char *id) { return plain_manifest(m,id,0); }
 
 static int not_file_package(struct pm_err *e) {
     return pm_errc(e, "plugin.prefix_package", NULL, "этот префикс принимает только подписанные файловые пакеты без служб, скриптов и расширений");
@@ -1977,6 +2005,17 @@ int pm_install_recover(struct pm_ctx *x, struct pm_err *e) {
     size_t n = 0;
     struct stat st;
     char *record = lstat(marker, &st) == 0 && S_ISREG(st.st_mode) ? pm_read(marker, &n) : NULL;
+    if (!pm_managed() && record && !strncmp(record, "G1 ", 3)) {
+        int r = pm_group_finish(marker, 0, x);
+        free(record); free(marker);
+        return r; /* pm_install_pending уже выставил install_degraded */
+    }
+    if (!pm_managed()) {
+        char *work = pm_path(pm_root(),PM_GROUP_DIR);
+        int ambiguous = lstat(work,&st) == 0 || errno != ENOENT;
+        free(work);
+        if (ambiguous) { free(record); free(marker); return -1; }
+    }
     char id[65], ver[128];
     int had_dir, safe, offset = -1;
     unsigned mode, pid;
@@ -2090,7 +2129,12 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     char *marker = NULL, *dir = NULL, *prevd = NULL, *prev = NULL, *old_ver = NULL;
     int replay = 0;
     /* У файла id ещё неизвестен: распаковка под временным именем, id — из заголовка MANIFEST. */
-    if (unpack_verified(archive, stage, s->c ? id : NULL, &ks, s->c ? 0 : s->unsigned_ok, &is_unsigned, hid, hver,
+    if (x->file_group) {
+        /* Проверенный до публикации каталог — тот самый inode из журнала. */
+        const struct group_file *v = &x->file_group->v[res->n];
+        strcpy(hid,v->id); strcpy(hver,v->ver); strcpy(harch,v->arch);
+        free(stage); stage = pm_fmt("%s/new-%s", x->file_group->dir, hid);
+    } else if (unpack_verified(archive, stage, s->c ? id : NULL, &ks, s->c ? 0 : s->unsigned_ok, &is_unsigned, hid, hver,
                         harch, sizeof(hver), e) != 0)
         goto out;
     {
@@ -2118,11 +2162,13 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     }
     if (!s->c) {
         /* Файл: заголовок MANIFEST и id из plugin.json должны совпасть (проверка в unpack шла с пустым id). */
-        char *real = pm_fmt("%s/.stage/%s-%s", pm_root(), mid, mver);
-        pm_rmrf(real);
-        if (rename(stage, real) != 0) { free(real); pm_errc(e, "plugin.stage_move_failed", NULL, "не переложить распаковку"); goto out_stage; }
-        free(stage);
-        stage = real;
+        if (!x->file_group) {
+            char *real = pm_fmt("%s/.stage/%s-%s", pm_root(), mid, mver);
+            pm_rmrf(real);
+            if (rename(stage, real) != 0) { free(real); pm_errc(e, "plugin.stage_move_failed", NULL, "не переложить распаковку"); goto out_stage; }
+            free(stage);
+            stage = real;
+        }
         if (strcmp(hid, mid)) { pm_errc(e, "plugin.json_id_mismatch", PMA("id", mid, "header", hid), "plugin.json (%s) не совпадает с MANIFEST (%s) — подмена", mid, hid); goto out_stage; }
         id = mid;
         struct pm_inst *ex = pm_state_find(&x->st, mid);
@@ -2176,6 +2222,10 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     dir = pm_path(pm_root(), id);
     prevd = pm_path(pm_root(), ".prev");
     prev = pm_path(prevd, id);
+    if (x->file_group) {
+        free(prev);
+        prev = pm_fmt("%s/old-%s", x->file_group->dir, id);
+    }
     int had_dir = pm_is_dir(dir);
     oldman = had_dir ? pm_manifest(id) : NULL;
     if (pm_managed() && (had_dir != (pm_state_find(&x->st, id) != NULL) ||
@@ -2183,7 +2233,7 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         not_file_package(e);
         goto out_stage;
     }
-    if (pm_mkdirs(prevd) != 0 || pm_rmrf(prev) != 0) {
+    if (!x->file_group && (pm_mkdirs(prevd) != 0 || pm_rmrf(prev) != 0)) {
         pm_errc(e, "plugin.prev_move_failed", PMA("id", id, "why", strerror(errno)),
                 "не подготовить .prev для %s: %s", id, strerror(errno));
         goto out_stage;
@@ -2227,7 +2277,7 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     }
     if (rename(stage, dir) != 0) {
         pm_errc(e, "plugin.place_failed", PMA("id", id, "why", strerror(errno)), "не поставить %s на место: %s", id, strerror(errno));
-        if (had_dir && rename(prev, dir) != 0 && marker) {
+        if (!x->file_group && had_dir && rename(prev, dir) != 0 && marker) {
             x->install_degraded = 1;
             install_degraded(e, marker);
         }
@@ -2273,9 +2323,9 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     if (healthy && run_script(id, dir, m, "postinst", old_ver ? old_ver : "", &he) != 0) healthy = 0;
     int save_failed = 0;
     if (healthy) {
-        save_failed = pm_state_save(&x->st, &he) != 0;
+        save_failed = pm_state_save_group(&x->st, x->file_group, &he) != 0;
         if (save_failed) healthy = 0;
-        else if (pm_keepd_write(x) != 0 && marker) {
+        else if (pm_keepd_write(x) != 0 && (marker || x->file_group)) {
             pm_errc(&he, "plugin.write_failed", PMA("path", pm_keepd()),
                     "не записать данные платформы или %s", pm_keepd());
             save_failed = 1;
@@ -2308,6 +2358,7 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         }
     }
     if (!healthy) {
+        if (x->file_group) { *e = he; goto out; } /* один общий откат */
         /* Откат (s2p.md, «Откат»). */
         pm_progress(x, "откат %s: %s", id, he.msg);
         if (replay && save_failed) {
@@ -2384,7 +2435,7 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     goto out;
 out_stage:
     if (marker && !x->install_degraded) install_marker_clear(x, marker, e);
-    if (!x->install_degraded) pm_rmrf(stage);
+    if (!x->install_degraded && !x->file_group) pm_rmrf(stage);
 out:
     free(dir); free(prevd); free(prev); free(old_ver);
     free(marker);
@@ -2492,6 +2543,139 @@ static struct ydoc *file_peek(const char *archive) {
     return doc;
 }
 
+/* Выбор пути по peek — только подсказка; допуск повторяется на ПОДПИСАННОМ
+ * содержимом до публикации. Не оставлять неполный список ID в журнале. */
+static int prepare_files(struct pm_ctx *x, struct pm_group *g, const char **ord, int allow_unsigned, struct pm_err *e) {
+    int plain = 1;
+    for (size_t i = 0; i < g->n; i++) {
+        struct ydoc *d = file_peek(ord[i]);
+        const struct ynode *m = d ? ydoc_root(d) : NULL;
+        const char *id = yn_str(m,"id");
+        if (!pm_id_ok(id)) {
+            if (d) ydoc_free(d);
+            return pm_errc(e,"plugin.bad_name",NULL,"не определить участника группы из %s",ord[i]);
+        }
+        strcpy(g->v[i].id,id);
+        for (size_t j = 0; j < i; j++) if (!strcmp(g->v[j].id,id)) {
+            pm_errc(e,"plugin.group_duplicate",PMA("id",id),"повтор участника группы %s",id);
+            ydoc_free(d); return -1;
+        }
+        if (!plain_manifest(m,id,1)) plain = 0;
+        char *live = pm_path(pm_root(),id);
+        int had = replay_dir(live);
+        struct ydoc *old = had == 1 ? pm_manifest(id) : NULL;
+        const struct pm_inst *inst = pm_state_find(&x->st,id);
+        if (had < 0 || (had && !old) || (inst && !had)) {
+            install_degraded(e,live); free(live); ydoc_free(d); if (old) ydoc_free(old);
+            return -1;
+        }
+        if (old && (!yn_str(ydoc_root(old),"id") || strcmp(yn_str(ydoc_root(old),"id"),id))) {
+            install_degraded(e,live); free(live); ydoc_free(d); ydoc_free(old); return -1;
+        }
+        if (old && !plain_manifest(ydoc_root(old),id,1)) plain = 0;
+        if (old && inst && (!inst->version || !yn_str(ydoc_root(old),"version") ||
+                            strcmp(inst->version,yn_str(ydoc_root(old),"version")))) {
+            install_degraded(e,live); free(live); ydoc_free(d); ydoc_free(old);
+            return -1;
+        }
+        free(live); if (old) ydoc_free(old);
+        ydoc_free(d);
+    }
+    if (!plain) return 0; /* hooks, библиотеки и т.п.: прежняя группа */
+    g->dir = pm_path(pm_root(),PM_GROUP_DIR);
+    if (mkdir(g->dir,0700)) {
+        free(g->dir); g->dir = NULL;
+        return pm_errc(e,"plugin.write_failed",NULL,"не создать каталог журнала группы");
+    }
+    struct pm_keyset ks = {0};
+    if (pm_group_preparing(g)) return pm_errc(e,"plugin.write_failed",NULL,"не обозначить подготовку группы");
+    g->preparing = 1;
+    pm_keys_all(&ks);
+    int rc = -1;
+    for (size_t i = 0; i < g->n; i++) {
+        struct group_file *v = &g->v[i];
+        char id[128];
+        int uns = 0;
+        char *next = pm_fmt("%s/new-%s",g->dir,v->id);
+        int r = unpack_verified(ord[i],next,NULL,&ks,allow_unsigned,&uns,id,v->ver,v->arch,sizeof(id),e);
+        struct ydoc *d = r ? NULL : replay_manifest(next,e);
+        free(next);
+        if (r) goto out;
+        if (!d || strcmp(v->id,id) || !plain_manifest(ydoc_root(d),id,1) ||
+            strcmp(v->ver,yn_str(ydoc_root(d),"version"))) {
+            pm_errc(e,"plugin.group_changed",NULL,"участник группы изменился во время подготовки");
+            if (d) ydoc_free(d);
+            goto out;
+        }
+        const struct ynode *deps = ynode_get(ynode_get(ydoc_root(d),"requires"),"plugins");
+        int abi = 0;
+        for (size_t j = 0; j < ynode_len(deps); j++) {
+            struct ydoc *lib = pm_manifest(ynode_key_at(deps,j)->str);
+            if (lib && is_library(ydoc_root(lib))) abi = 1;
+            if (lib) ydoc_free(lib);
+        }
+        ydoc_free(d);
+        if (uns || abi) { rc = 0; goto out; } /* --unsigned или реальная ABI-проба */
+        char *prev = pm_fmt("%s/.prev/%s",pm_root(),id);
+        if (replay_dir(prev) != 0) { install_degraded(e,prev); free(prev); goto out; }
+        free(prev);
+    }
+    if (pm_group_publish(g)) pm_errc(e,"plugin.write_failed",NULL,"не сохранить исходное состояние группы");
+    else rc = 1;
+out:
+    pm_keys_free(&ks);
+    return rc;
+}
+
+/* Проверки install_one смотрят на уже установленных зависимых. Последующий
+ * участник мог сменить версию: перед health проверяем окончательную пару. */
+static int group_dependencies(struct pm_ctx *x, const struct pm_group *g, struct pm_err *e) {
+    for (size_t i = 0; i < g->n; i++) {
+        const char *id = g->v[i].id;
+        struct ydoc *d = pm_manifest(id);
+        if (!d) return install_degraded(e,id);
+        const struct ynode *deps = ynode_get(ynode_get(ydoc_root(d),"requires"),"plugins");
+        for (size_t j = 0; j < ynode_len(deps); j++) {
+            const char *dep = ynode_key_at(deps,j)->str, *range = ynode_val_at(deps,j)->str;
+            struct pm_inst *p = pm_state_find(&x->st,dep);
+            if (!p || !p->version || pm_range_match(range,p->version) <= 0) {
+                pm_errc(e,"plugin.needs_plugin",PMA("id",id,"dep",dep,"range",range),
+                        "%s требует плагин %s %s",id,dep,range);
+                ydoc_free(d); return -1;
+            }
+        }
+        ydoc_free(d);
+    }
+    return 0;
+}
+
+static int finish_files(struct pm_ctx *x, int rc, struct pm_result *res, struct pm_err *e) {
+    if (!rc) rc = group_dependencies(x,x->file_group,e);
+    if (!rc) rc = group_finish(x,x->before_bad,x->before_err.msg,e);
+    char *marker = install_marker();
+    /* При ошибке commit не угадывать фазу и не пытаться выполнить другой исход. */
+    if (pm_group_finish(marker,!rc,x)) {
+        x->install_degraded = 1;
+        rc = install_degraded(e,marker);
+    } else if (!rc) {
+        for (size_t i = 0; i < res->n; i++) {
+            struct pm_done *p = &res->v[i];
+            struct undo *u = &((struct undo *)x->undo)[i];
+            pm_event(x,p->id,p->updated ? "updated" : u->was_disabled ? "installed" : "enabled",
+                     p->version,p->old,NULL);
+        }
+    } else if (res->n && strcmp(e->code,"plugin.write_failed") && strcmp(e->code,"plugin.place_failed") &&
+               strcmp(e->code,"plugin.prev_move_failed") && strcmp(e->code,"plugin.install_degraded")) {
+        /* Только штатный отказ живой установки помечает версии, не replay. */
+        if (pm_group_bad_versions(res,e->msg))
+            pm_errc(e,"plugin.write_failed",NULL,"группа восстановлена, не записать bad_versions");
+    }
+    if (rc) { pm_result_free(res); memset(res,0,sizeof(*res)); }
+    free(marker); undo_clear(x);
+    x->defer = 0; x->file_group = NULL;
+    return rc;
+}
+
 /* Установка из файлов: один — как был; несколько — одной группой, библиотеки первыми (их зависимые из тех же
  * файлов пробуются уже против новой копии). */
 static int install_files(struct pm_ctx *x, const char *const *files, size_t n, const struct pm_opts *o,
@@ -2507,13 +2691,35 @@ static int install_files(struct pm_ctx *x, const char *const *files, size_t n, c
     }
     for (int pass = 0; pass < 2; pass++)
         for (size_t i = 0; i < n; i++) if ((pass == 0) == !!lib[i]) ord[k++] = files[i];
-    if (n > 1) group_begin(x);
-    int rc = 0;
+    struct pm_group g = {.n = n};
+    int gate = -1, rc = 0;
+    if (n > 1) {
+        g.v = pm_alloc(sizeof(*g.v)*n);
+        /* Живой читатель либо закончит старый снимок, либо получит busy.
+         * Писатели уже сериализованы внешним pm_lock. */
+        gate = pm_group_reader(1);
+        if (gate < 0) rc = pm_errc(e,"plugin.busy",NULL,"каталог группы занят читателем");
+        else {
+            int prep = prepare_files(x,&g,ord,o->unsigned_ok,e);
+            if (prep < 0) rc = -1;
+            if (prep > 0) x->file_group = &g;
+            else if (g.preparing) {
+                char *marker = install_marker();
+                if (pm_group_finish(marker,0,x)) { x->install_degraded = 1; rc = install_degraded(e,marker); }
+                free(marker);
+            } else if (g.dir) pm_rmrf(g.dir); /* пустой каталог до маркера */
+            if (!prep) { close(gate); gate = -1; }
+        }
+    }
+    if (!rc && n > 1) group_begin(x);
     for (size_t i = 0; i < n && rc == 0; i++) {
         struct src s = { NULL, ord[i], o->unsigned_ok, NULL };
         if (install_one(x, &s, NULL, res, e) != 0) rc = -1;
     }
-    if (n > 1) rc = group_end(x, rc, res, e);
+    if (x->file_group) rc = finish_files(x,rc,res,e);
+    else if (x->defer) rc = group_end(x, rc, res, e);
+    if (gate >= 0) close(gate);
+    free(g.v); free(g.dir);
     ids_free(&x->tx_ids, &x->ntx);
     free(ord);
     free(lib);
