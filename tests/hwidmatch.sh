@@ -199,6 +199,8 @@ check "RFC 6070, вывод в два блока" \
       "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9" \
       "$("$SUM" --pbkdf2 passwordPASSWORDpassword saltSALTsaltSALTsaltSALTsaltSALTsalt 4096 40)"
 
+python3 -B tests/hwid-memory.py "$SUM" "$STEER" || exit 1
+
 # ---- описание устройства ---------------------------------------------------------------
 rm -rf "$T/net"; mkdev eth0 "10:bb:cc:dd:ee:ff" 1
 printf "DISTRIB_RELEASE='24.10.0'\n" > "$T/release"

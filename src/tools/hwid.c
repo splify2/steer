@@ -29,13 +29,13 @@ const char *steer_env_or(const char *name, const char *dflt) {
  * `mbedtls_sha256`, которым считалось раньше, и с `sha256sum`, которым считала оболочка до
  * движка. Проверяется это не чтением, а известными ответами (стенд hwidmatch): «abc» и
  * пустая строка — те самые векторы, которые печатает сам стандарт, плюс сверка настоящего
- * идентификатора с выводом `sha256sum` в оболочке.
- *
- * Реализация ровно на один вызов: всё сообщение в памяти, потокового интерфейса нет. Нам
- * хешировать двадцать пять байт, а поток — это состояние, которое нечем проверить. */
+ * идентификатора с выводом `sha256sum` в оболочке. */
 static uint32_t ror(uint32_t x, int k) { return (x >> k) | (x << (32 - k)); }
 
-void steer_sha256(const unsigned char *in, size_t n, unsigned char out[32]) {
+static const uint32_t iv[8] = { 0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+                                0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u };
+
+static void sha_block(uint32_t h[8], const unsigned char p[64]) {
     static const uint32_t K[64] = {
         0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u,
         0x923f82a4u, 0xab1c5ed5u, 0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
@@ -49,55 +49,51 @@ void steer_sha256(const unsigned char *in, size_t n, unsigned char out[32]) {
         0x5b9cca4fu, 0x682e6ff3u, 0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
         0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
     };
-    uint32_t h[8] = { 0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
-                      0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u };
-    /* Дополнение считается заранее, целиком: сообщение у нас короткое, и держать его в
-     * одном буфере дешевле, чем вести состояние между блоками. */
-    size_t total = n + 1 + 8;
-    size_t blocks = (total + 63) / 64;
-    size_t padded = blocks * 64;
-    unsigned char stack_buf[128];
-    unsigned char *buf = stack_buf;
-    unsigned char *heap = NULL;
-    if (padded > sizeof stack_buf) {
-        heap = (unsigned char *)calloc(1, padded);
-        if (!heap) { memset(out, 0, 32); return; }
-        buf = heap;
-    } else {
-        memset(buf, 0, sizeof stack_buf);
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
+               ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        uint32_t s1 = ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
     }
-    memcpy(buf, in, n);
-    buf[n] = 0x80;
-    uint64_t bits = (uint64_t)n * 8;
-    for (int i = 0; i < 8; i++) buf[padded - 1 - i] = (unsigned char)(bits >> (8 * i));
+    uint32_t a = h[0], bb = h[1], c = h[2], d = h[3];
+    uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = ror(e, 6) ^ ror(e, 11) ^ ror(e, 25);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t t1 = hh + S1 + ch + K[i] + w[i];
+        uint32_t S0 = ror(a, 2) ^ ror(a, 13) ^ ror(a, 22);
+        uint32_t mj = (a & bb) ^ (a & c) ^ (bb & c);
+        uint32_t t2 = S0 + mj;
+        hh = g; g = f; f = e; e = d + t1;
+        d = c; c = bb; bb = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += bb; h[2] += c; h[3] += d;
+    h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
 
-    for (size_t b = 0; b < blocks; b++) {
-        const unsigned char *p = buf + b * 64;
-        uint32_t w[64];
-        for (int i = 0; i < 16; i++)
-            w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
-                   ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
-        for (int i = 16; i < 64; i++) {
-            uint32_t s0 = ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
-            uint32_t s1 = ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-        }
-        uint32_t a = h[0], bb = h[1], c = h[2], d = h[3];
-        uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
-        for (int i = 0; i < 64; i++) {
-            uint32_t S1 = ror(e, 6) ^ ror(e, 11) ^ ror(e, 25);
-            uint32_t ch = (e & f) ^ ((~e) & g);
-            uint32_t t1 = hh + S1 + ch + K[i] + w[i];
-            uint32_t S0 = ror(a, 2) ^ ror(a, 13) ^ ror(a, 22);
-            uint32_t mj = (a & bb) ^ (a & c) ^ (bb & c);
-            uint32_t t2 = S0 + mj;
-            hh = g; g = f; f = e; e = d + t1;
-            d = c; c = bb; bb = a; a = t1 + t2;
-        }
-        h[0] += a; h[1] += bb; h[2] += c; h[3] += d;
-        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+/* prefix байт уже сжаты в start (0 либо один блок HMAC). Номер блока PBKDF2,
+ * если нужен, помещается в хвост вместе с дополнением, без копии всей соли. */
+static void sha_finish(const uint32_t start[8], unsigned prefix, const unsigned char *p,
+                       size_t n, const unsigned char *counter, unsigned char out[32]) {
+    uint32_t h[8];
+    memcpy(h, start, sizeof h);
+    uint64_t bits = ((uint64_t)n + prefix + (counter ? 4 : 0)) * 8;
+    while (n >= 64) {
+        sha_block(h, p);
+        p += 64;
+        n -= 64;
     }
-    free(heap);
+    unsigned char tail[128] = {0};
+    if (n) memcpy(tail, p, n);
+    if (counter) { memcpy(tail + n, counter, 4); n += 4; }
+    tail[n] = 0x80;
+    size_t padded = n < 56 ? 64 : 128;
+    for (int i = 0; i < 8; i++) tail[padded - 1 - i] = (unsigned char)(bits >> (8 * i));
+    sha_block(h, tail);
+    if (padded == 128) sha_block(h, tail + 64);
     for (int i = 0; i < 8; i++) {
         out[i * 4]     = (unsigned char)(h[i] >> 24);
         out[i * 4 + 1] = (unsigned char)(h[i] >> 16);
@@ -106,34 +102,8 @@ void steer_sha256(const unsigned char *in, size_t n, unsigned char out[32]) {
     }
 }
 
-/* ---- HMAC-SHA256 и PBKDF2 ----------------------------------------------------------
- *
- * Ровно столько, сколько нужно одному вызову: ключ короче блока, длина вывода 16 или 32
- * байта. Потоковый интерфейс не заводится — считать надо один раз за жизнь роутера. */
-static void hmac_sha256(const unsigned char *key, size_t klen,
-                        const unsigned char *msg, size_t mlen, unsigned char out[32]) {
-    unsigned char k[64];
-    memset(k, 0, sizeof k);
-    if (klen > 64) {
-        unsigned char kh[32];
-        steer_sha256(key, klen, kh);
-        memcpy(k, kh, 32);
-    } else {
-        memcpy(k, key, klen);
-    }
-    unsigned char in[64 + 64];
-    /* Внутренний проход: (ключ^0x36) ‖ сообщение. Буфер под сообщение фиксирован, потому что
-     * длиннее 64 байт мы здесь не хешируем — это проверяет вызывающий, а не удача. */
-    unsigned char *buf = (unsigned char *)malloc(64 + mlen);
-    if (!buf) { memset(out, 0, 32); return; }
-    for (int i = 0; i < 64; i++) buf[i] = (unsigned char)(k[i] ^ 0x36);
-    memcpy(buf + 64, msg, mlen);
-    unsigned char ih[32];
-    steer_sha256(buf, 64 + mlen, ih);
-    free(buf);
-    for (int i = 0; i < 64; i++) in[i] = (unsigned char)(k[i] ^ 0x5c);
-    memcpy(in + 64, ih, 32);
-    steer_sha256(in, 96, out);
+void steer_sha256(const unsigned char *in, size_t n, unsigned char out[32]) {
+    sha_finish(iv, 0, in, n, NULL, out);
 }
 
 void steer_pbkdf2_sha256(const unsigned char *pw, size_t pwlen,
@@ -141,22 +111,29 @@ void steer_pbkdf2_sha256(const unsigned char *pw, size_t pwlen,
                          unsigned iters, unsigned char *out, size_t outlen) {
     unsigned block = 1;
     size_t done = 0;
+    if (!outlen) return;
+    /* Пароль одинаков для всех Ui. Сохраняем состояния после ipad и opad. */
+    unsigned char pad[64] = {0};
+    uint32_t inner[8], outer[8];
+    if (pwlen > sizeof pad) steer_sha256(pw, pwlen, pad);
+    else if (pwlen) memcpy(pad, pw, pwlen);
+    memcpy(inner, iv, sizeof inner);
+    memcpy(outer, iv, sizeof outer);
+    for (size_t i = 0; i < sizeof pad; i++) pad[i] ^= 0x36;
+    sha_block(inner, pad);
+    for (size_t i = 0; i < sizeof pad; i++) pad[i] ^= 0x36 ^ 0x5c;
+    sha_block(outer, pad);
     if (iters == 0) iters = 1;
     while (done < outlen) {
         /* U1 = HMAC(пароль, соль ‖ номер блока), дальше Ui = HMAC(пароль, U(i-1)). */
-        unsigned char *m = (unsigned char *)malloc(saltlen + 4);
-        if (!m) { memset(out + done, 0, outlen - done); return; }
-        memcpy(m, salt, saltlen);
-        m[saltlen]     = (unsigned char)(block >> 24);
-        m[saltlen + 1] = (unsigned char)(block >> 16);
-        m[saltlen + 2] = (unsigned char)(block >> 8);
-        m[saltlen + 3] = (unsigned char)block;
+        unsigned char ctr[4] = {block >> 24, block >> 16, block >> 8, block};
         unsigned char u[32], acc[32];
-        hmac_sha256(pw, pwlen, m, saltlen + 4, u);
-        free(m);
+        sha_finish(inner, 64, salt, saltlen, ctr, u);
+        sha_finish(outer, 64, u, sizeof u, NULL, u);
         memcpy(acc, u, 32);
         for (unsigned i = 1; i < iters; i++) {
-            hmac_sha256(pw, pwlen, u, 32, u);
+            sha_finish(inner, 64, u, sizeof u, NULL, u);
+            sha_finish(outer, 64, u, sizeof u, NULL, u);
             for (int j = 0; j < 32; j++) acc[j] ^= u[j];
         }
         size_t take = outlen - done < 32 ? outlen - done : 32;

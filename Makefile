@@ -368,7 +368,7 @@ hwid-order-test: $(BUILD)/steer $(BUILD)/steerd
 # такой проверкой не поймать. Ни сети, ни криптобиблиотеки — файл вложенный и самодостаточный.
 $(BUILD)/hwidsum: tests/hwidsum.c src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/hwidsum.c src/tools/hwid.c src/lib/jsonw.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc -o $@ tests/hwidsum.c src/tools/hwid.c src/lib/jsonw.c $(PLATFORM_SRC)
 
 # Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка расширенной части идёт
 # только в build.sh через docker с wolfSSL, поэтому локальный make test оставался зелёным,
