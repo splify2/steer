@@ -97,7 +97,8 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
     t->entries[t->n].real_host = 0;
     t->entries[t->n].real_saved = 0;
     t->entries[t->n].has_real6_saved = 0;
-    t->entries[t->n].real_seen = t->entries[t->n].real6_seen = t->entries[t->n].last_used;
+    t->entries[t->n].real_seen = t->entries[t->n].real6_seen = 0;
+    t->entries[t->n].real_seen_valid = t->entries[t->n].real6_seen_valid = 0;
     t->entries[t->n].idle4 = t->entries[t->n].idle6 = 0;
     t->entries[t->n].sets = 0;            /* unknown until the resolver routes it */
     t->entries[t->n].route_asserted = 0;
@@ -222,14 +223,22 @@ void fakeip_state_load(const char *path) {
              * struct fakeip_entry). */
             uint32_t rh = inet_aton(real_s, &r) != 0 ? ntohl(r.s_addr) : 0;
             if (rh >= FAKEIP_POOL_BASE && rh < FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE) { rh = 0; bad++; }
-            if (rh)
+            if (rh) {
                 g_fakeip.entries[g_fakeip.n - 1].real_host =
                     g_fakeip.entries[g_fakeip.n - 1].real_saved = rh;
+                /* В fakeip.state нет времени наблюдения. Не продлеваем срок удержания
+                 * отсутствующего backend только потому, что процесс загрузил строку при старте. */
+                g_fakeip.entries[g_fakeip.n - 1].real_seen = 0;
+                g_fakeip.entries[g_fakeip.n - 1].real_seen_valid = 0;
+            }
             uint8_t r6[16];
             if (tab3 && inet_pton(AF_INET6, tab3 + 1, r6) == 1) {
-                memcpy(g_fakeip.entries[g_fakeip.n - 1].real6, r6, 16);
-                g_fakeip.entries[g_fakeip.n - 1].has_real6 = 1;
-                g_fakeip.entries[g_fakeip.n - 1].has_real6_saved = 1;
+                struct fakeip_entry *e = &g_fakeip.entries[g_fakeip.n - 1];
+                memcpy(e->real6, r6, 16);
+                e->has_real6 = 1;
+                e->has_real6_saved = 1;
+                e->real6_seen = 0;
+                e->real6_seen_valid = 0;
             }
         }
     }
@@ -287,8 +296,7 @@ static char *fakeip_state_serialize(size_t *len) {
         if ((en->has_real6 || en->has_real6_saved) &&
             !inet_ntop(AF_INET6, en->real6, r6str, sizeof(r6str)))
             r6str[0] = '\0';
-        /* Строка без IPv6 — прежней формы до байта: файл, который пишет движок без IPv6 в
-         * доменных правилах, не меняется. */
+        /* Сохраняем действующий формат из 2–4 полей; время наблюдения намеренно не пишется. */
         if (r6str[0])
             fprintf(f, "%s\t%s\t%s\t%s\n", en->domain, fstr, rstr[0] ? rstr : "-", r6str);
         else if (rstr[0])
@@ -578,18 +586,19 @@ uint32_t fakeip_entry_known_real(const char *domain) {
     return e->real_host ? e->real_host : e->real_saved;
 }
 
-/* Подмена встала (ack ядра): и «в ядре», и «знаем». Файл перезаписывается, только когда меняется
- * то, что в нём лежит (fakeip_state_rewrite пишет «знаем»): подтверждение сохранённого адреса
- * после отказа ядра — не новость для файла. */
-void fakeip_entry_set_real(const char *domain, uint32_t real_host) {
+/* Подмена встала (ack ядра): и «в ядре», и «знаем». Время наблюдения обновляется только при смене
+ * backend: ACK повторно установленного адреса мог последовать за выбором grace-held значения и не
+ * означает нового ответа upstream с этим адресом. Файл перезаписывается лишь при смене значения. */
+void fakeip_entry_set_real(const char *domain, uint32_t real_host, time_t now) {
     long at = fakeip_find(domain);
     if (at < 0) return;
     struct fakeip_entry *e = &g_fakeip.entries[at];
     uint32_t was = e->real_host ? e->real_host : e->real_saved;
     e->real_host = e->real_saved = real_host;
     if (was != real_host) {
+        e->real_seen = now;
+        e->real_seen_valid = 1;
         g_fakeip_dirty = 1;
-        e->real_seen = time(NULL);
     }
 }
 
@@ -606,7 +615,7 @@ const uint8_t *fakeip_entry_known_real6(const char *domain) {
     return e->has_real6 || e->has_real6_saved ? e->real6 : NULL;
 }
 
-void fakeip_entry_set_real6(const char *domain, const uint8_t real6[16]) {
+void fakeip_entry_set_real6(const char *domain, const uint8_t real6[16], time_t now) {
     long at = fakeip_find(domain);
     if (at < 0) return;
     struct fakeip_entry *e = &g_fakeip.entries[at];
@@ -614,8 +623,9 @@ void fakeip_entry_set_real6(const char *domain, const uint8_t real6[16]) {
     memcpy(e->real6, real6, 16);
     e->has_real6 = e->has_real6_saved = 1;
     if (!same) {
+        e->real6_seen = now;
+        e->real6_seen_valid = 1;
         g_fakeip_dirty = 1;
-        e->real6_seen = time(NULL);
     }
 }
 
@@ -664,9 +674,11 @@ void fakeip_touch(struct fakeip_entry *e, time_t now) {
 }
 
 /* Прежний адрес остаётся: его нет в ответе, но именем пользуются и пропал он недавно. */
-static int real_hold(int after_idle, time_t seen, time_t now) {
+static int real_hold(int after_idle, time_t seen, int seen_valid, time_t now) {
     real_env();
-    return !after_idle && now - seen < g_fakeip_real_absent;
+    /* A timestamp of zero is a real instant too; only the explicit validity bit means «unknown».
+     * Clock rollback invalidates the old horizon instead of making it fresh for an extra interval. */
+    return seen_valid && !after_idle && now >= seen && now - seen < g_fakeip_real_absent;
 }
 
 uint32_t fakeip_real_pick(const char *domain, const struct answer_ip *ips, int nips, time_t now) {
@@ -683,9 +695,10 @@ uint32_t fakeip_real_pick(const char *domain, const struct answer_ip *ips, int n
     for (int k = 0; k < nips; k++)
         if (ntohl(ips[k].addr) == known) {
             e->real_seen = now;
+            e->real_seen_valid = 1;
             return known;
         }
-    return real_hold(after_idle, e->real_seen, now) ? known : first;
+    return real_hold(after_idle, e->real_seen, e->real_seen_valid, now) ? known : first;
 }
 
 void fakeip_real_pick6(const char *domain, const struct answer_ip6 *ips, int nips, time_t now,
@@ -700,10 +713,11 @@ void fakeip_real_pick6(const char *domain, const struct answer_ip6 *ips, int nip
     for (int k = 0; k < nips; k++)
         if (!memcmp(ips[k].addr, e->real6, 16)) {
             e->real6_seen = now;
+            e->real6_seen_valid = 1;
             memcpy(out, e->real6, 16);
             return;
         }
-    if (real_hold(after_idle, e->real6_seen, now)) memcpy(out, e->real6, 16);
+    if (real_hold(after_idle, e->real6_seen, e->real6_seen_valid, now)) memcpy(out, e->real6, 16);
 }
 
 /* Ensures DOMAIN's fake IP is a PERMANENT member of channel NEW_SET_IDX's nft set
@@ -991,6 +1005,7 @@ void fakeip_entry_blocked(const char *domain, int v6) {
         }
         e->sets6 = 0;
         e->has_real6 = e->has_real6_saved = 0;
+        e->real6_seen_valid = 0;
         e->route6_asserted = e->refreshed6 = 0;
     } else {
         if (!other || e->sets || e->real_host || e->real_saved) {
@@ -1002,6 +1017,7 @@ void fakeip_entry_blocked(const char *domain, int v6) {
         }
         e->sets = 0;
         e->real_host = e->real_saved = 0;
+        e->real_seen_valid = 0;
         e->route_asserted = e->refreshed = 0;
     }
     if (other) return;

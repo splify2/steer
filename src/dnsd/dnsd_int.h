@@ -238,10 +238,14 @@ struct fakeip_entry {
     int has_real6_saved;
     /* ПРИВЯЗКА ПОДДЕЛЬНОГО АДРЕСА К НАСТОЯЩЕМУ (fakeip_real_pick, fakeip.c). real_seen и
      * real6_seen — когда настоящий адрес записи в последний раз был среди адресов ответа (или
-     * поставлен). idle4 и idle6 — имя спросили после простоя дольше g_fakeip_real_idle, и ответа
+     * выбран из реального ответа upstream). ACK установки карты сам по себе наблюдением не является.
+     * idle4 и idle6 — имя спросили после простоя дольше g_fakeip_real_idle, и ответа
      * на этот вопрос ещё не было: ставит fakeip_touch, снимает первый разобранный ответ своего
-     * семейства. В файл не пишутся: после перезапуска сроки начинаются заново. */
+     * семейства. В файл не пишутся: после перезапуска наблюдение backend неизвестно. */
     time_t real_seen, real6_seen;
+    /* Timestamp zero is valid (e.g. a cold boot without RTC); these flags distinguish it from
+     * a backend loaded without any observation time. */
+    uint8_t real_seen_valid, real6_seen_valid;
     uint8_t idle4, idle6;
     /* В КАКИХ наборах доменных каналов сейчас лежит этот поддельный адрес — по биту
      * на канал (0 = ни в одном). Набор битов, а не один номер, и это разница по
@@ -511,7 +515,7 @@ uint32_t fakeip_entry_get_real(const char *domain);
 /* Настоящий адрес, который знаем: стоящий в ядре, а если не стоит — из файла или прошлого ответа
  * (real_saved). 0 — не знаем. Им сверяется новый ответ и смена значения в карте. */
 uint32_t fakeip_entry_known_real(const char *domain);
-void fakeip_entry_set_real(const char *domain, uint32_t real_host);
+void fakeip_entry_set_real(const char *domain, uint32_t real_host, time_t now);
 void fakeip_route_set(const char *domain, chm_t want);
 size_t fakeip_rehydrate(int nk_open, size_t *routed_out);
 /* fake-IP v6: настоящий адрес под элементом карты fakeip6 (NULL — не знаем), его запись и
@@ -519,7 +523,7 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out);
 const uint8_t *fakeip_entry_get_real6(const char *domain);
 /* То же, что fakeip_entry_known_real, для IPv6: стоящий в карте fakeip6 или сохранённый. */
 const uint8_t *fakeip_entry_known_real6(const char *domain);
-void fakeip_entry_set_real6(const char *domain, const uint8_t real6[16]);
+void fakeip_entry_set_real6(const char *domain, const uint8_t real6[16], time_t now);
 void fakeip_route_set6(const char *domain, chm_t want);
 extern const char *g_fakeip6_map;
 
@@ -683,6 +687,7 @@ struct pending {
     uint32_t sgen;
     uint8_t cput;
     unsigned cup;
+    uint64_t cache_gen; /* table whose upstream index was used for this question */
     /* Имя вне правил ушло на сервер `dns.other`: не ответит — вопрос уходит прежним путём
      * (proxy.c, sec_done), а не SERVFAIL клиенту. */
     uint8_t oth;

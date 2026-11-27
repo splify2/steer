@@ -26,6 +26,14 @@
 
 static int fails;
 
+static void fakeip_test_clear(void) {
+    for (size_t i = 0; i < g_fakeip.n; i++) free(g_fakeip.entries[i].domain);
+    free(g_fakeip.entries);
+    memset(&g_fakeip, 0, sizeof(g_fakeip));
+    sindex_free(&g_fakeip_idx);
+}
+
+
 /* Подмена strdup: ruleset_add обязан пережить отказ выделения (раньше str_lower(NULL) валил резолвер).
  * Тест линкуется с кодом резолвера одним объектом, так что наш strdup перекрывает libc. */
 static int g_strdup_fail;
@@ -274,7 +282,7 @@ int main(void) {
         check("fake-IP: повторный запрос — тот же адрес", 0,
               fakeip_lookup_or_alloc("one.test", &again));
         check("fake-IP: адрес постоянен", 1, again == a);
-        fakeip_entry_set_real("one.test", 0x01020304u);
+        fakeip_entry_set_real("one.test", 0x01020304u, time(NULL));
         check("fake-IP: реальный адрес запомнен", 1,
               fakeip_entry_get_real("one.test") == 0x01020304u);
         check("fake-IP: у другого домена своего нет", 1, fakeip_entry_get_real("two.test") == 0);
@@ -293,7 +301,7 @@ int main(void) {
         time_t t0 = time(NULL);
         check("привязка: первый ответ — первый адрес ответа", 1,
               fakeip_real_pick("bind.test", ob, 1, t0) == B);
-        fakeip_entry_set_real("bind.test", A);
+        fakeip_entry_set_real("bind.test", A, t0);
         struct fakeip_entry *e = &g_fakeip.entries[fakeip_find("bind.test")];
         check("привязка: прежний адрес среди ответов (не первым) — остаётся", 1,
               fakeip_real_pick("bind.test", ab, 2, t0 + 10) == A);
@@ -313,7 +321,7 @@ int main(void) {
         check("привязка: прежнего адреса нет в ответах полчаса — заменяется", 1,
               fakeip_real_pick("bind.test", ob, 1, t0 + 10 + FAKEIP_REAL_ABSENT_DEFAULT) == B);
         /* Замена состоялась (ядро приняло): отсчёт начинается заново с новым адресом. */
-        fakeip_entry_set_real("bind.test", B);
+        fakeip_entry_set_real("bind.test", B, t0 + 10 + FAKEIP_REAL_ABSENT_DEFAULT);
         e->real_seen = t0 + 2000;
         fakeip_touch(e, t0 + 2000);
         fakeip_touch(e, t0 + 2000 + FAKEIP_REAL_IDLE_DEFAULT);       /* ровно срок — ещё не простой */
@@ -323,7 +331,7 @@ int main(void) {
         fakeip_touch(e, t1);
         check("привязка: имя спросили после долгого простоя — адрес берётся из ответа", 1,
               fakeip_real_pick("bind.test", oc, 1, t1) == C);
-        fakeip_entry_set_real("bind.test", C);
+        fakeip_entry_set_real("bind.test", C, t1);
         e->real_seen = t1;
         fakeip_touch(e, t1 + 5);
         check("  а следующий ответ с другим адресом привязку уже не трогает", 1,
@@ -336,7 +344,7 @@ int main(void) {
         a6[0].addr[0] = 0x2a; a6[0].addr[15] = 1;
         b6[0].addr[0] = 0x2a; b6[0].addr[15] = 2;
         uint8_t got[16];
-        fakeip_entry_set_real6("bind.test", a6[0].addr);
+        fakeip_entry_set_real6("bind.test", a6[0].addr, t1);
         e->real6_seen = t1;
         e->idle6 = 0;
         fakeip_touch(e, t1 + 10);
@@ -368,7 +376,7 @@ int main(void) {
         uint32_t fa = 0, fb = 0, fc = 0, again = 0;
         fakeip_lookup_or_alloc("old-blocked.test", &fa);
         fakeip_lookup_or_alloc("neighbour.test", &fb);
-        fakeip_entry_set_real("neighbour.test", 0x05060708u);
+        fakeip_entry_set_real("neighbour.test", 0x05060708u, time(NULL));
         size_t before = g_fakeip.n;
         fakeip_entry_blocked("old-blocked.test", 0);
         check("блок апстрима: запись без настоящего адреса снята", 1, fakeip_find("old-blocked.test") < 0);
@@ -385,8 +393,8 @@ int main(void) {
         uint8_t r6[16] = { 0x2a, 0 };
         r6[15] = 9;
         fakeip_lookup_or_alloc("half.test", &fc);
-        fakeip_entry_set_real("half.test", 0x0a0b0c0du);
-        fakeip_entry_set_real6("half.test", r6);
+        fakeip_entry_set_real("half.test", 0x0a0b0c0du, time(NULL));
+        fakeip_entry_set_real6("half.test", r6, time(NULL));
         g_fakeip_dirty = 0;
         fakeip_entry_blocked("half.test", 0);
         check("блок апстрима: пустой A — настоящий IPv4 забыт", 0, (long)fakeip_entry_known_real("half.test"));
@@ -637,6 +645,110 @@ int main(void) {
         memset(&g_fakeip, 0, sizeof(g_fakeip));
         memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
         g_fakeip_next = 0;
+        unlink(path);
+        rmdir(dir);
+    }
+
+    {
+        /* fakeip.state has no backend timestamp. Loading a persisted mapping must not renew the
+         * absent-backend grace period; the first upstream answer can replace stale disk data. */
+        char dir[] = "/tmp/dnsmatch-real-seen.XXXXXX";
+        if (!mkdtemp(dir)) { perror("mkdtemp"); return 2; }
+        char path[768];
+        snprintf(path, sizeof(path), "%s/state", dir);
+        struct answer_ip current = { htonl(0xCB00710Au), 300 }; /* 203.0.113.10 */
+        struct answer_ip later = { htonl(0xCB00710Bu), 300 };   /* 203.0.113.11 */
+        struct answer_ip rollback = { htonl(0xCB00710Cu), 300 };/* 203.0.113.12 */
+        struct answer_ip6 current6 = { .addr = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                                                 0, 0, 0, 0, 0, 0, 0, 0x10 }, .ttl = 300 };
+        struct answer_ip6 later6 = { .addr = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                                              0, 0, 0, 0, 0, 0, 0, 0x11 }, .ttl = 300 };
+        struct answer_ip6 rollback6 = { .addr = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                                                  0, 0, 0, 0, 0, 0, 0, 0x12 }, .ttl = 300 };
+        uint8_t real6[16], picked6[16];
+        inet_pton(AF_INET6, "2001:db8::99", real6);
+        FILE *f = fopen(path, "w");
+        if (!f) { perror("fopen"); return 2; }
+        fputs("n1.s19.test\t198.18.0.1\t203.0.113.99\t2001:db8::99\n", f);
+        fclose(f);
+        fakeip_test_clear();
+        g_fakeip_next = 1;
+        fakeip_state_load(path);
+        long at = fakeip_find("n1.s19.test");
+        check("real-IP IPv4: backend без отметки заменяется при малом now", 1,
+              at >= 0 && !g_fakeip.entries[at].real_seen_valid &&
+              fakeip_real_pick("n1.s19.test", &current, 1, 300) == 0xCB00710Au);
+        fakeip_real_pick6("n1.s19.test", &current6, 1, 300, picked6);
+        check("real-IP IPv6: backend без отметки заменяется при малом now", 1,
+              !memcmp(picked6, current6.addr, sizeof(picked6)) &&
+              !g_fakeip.entries[at].real6_seen_valid);
+        check("real-IP: отказ map не подтверждает новую подмену", 1,
+              fakeip_entry_known_real("n1.s19.test") == 0xCB007163u &&
+              fakeip_entry_known_real6("n1.s19.test") &&
+              !memcmp(fakeip_entry_known_real6("n1.s19.test"), real6, sizeof(real6)));
+
+        /* Exercise proxy's pick -> successful map ACK -> setter -> next pick path. An ACK for
+         * the grace-held address is not another observation and must not move the deadline. */
+        fakeip_entry_set_real("n1.s19.test", 0xCB00710Au, 300);
+        fakeip_entry_set_real6("n1.s19.test", current6.addr, 300);
+        check("real-IP IPv4: ACK новой upstream-подмены устанавливает срок", 1,
+              g_fakeip.entries[at].real_seen_valid && g_fakeip.entries[at].real_seen == 300);
+        check("real-IP IPv6: ACK новой upstream-подмены устанавливает срок", 1,
+              g_fakeip.entries[at].real6_seen_valid && g_fakeip.entries[at].real6_seen == 300);
+        time_t deadline = 300 + FAKEIP_REAL_ABSENT_DEFAULT;
+        check("real-IP IPv4: pick→ACK удержанного backend не сдвигает срок", 1,
+              fakeip_real_pick("n1.s19.test", &later, 1, deadline - 1) == 0xCB00710Au);
+        fakeip_entry_set_real("n1.s19.test", 0xCB00710Au, deadline - 1);
+        check("real-IP IPv6: pick→ACK удержанного backend не сдвигает срок", 1,
+              (fakeip_real_pick6("n1.s19.test", &later6, 1, deadline - 1, picked6),
+               !memcmp(picked6, current6.addr, sizeof(picked6))));
+        fakeip_entry_set_real6("n1.s19.test", current6.addr, deadline - 1);
+        check("real-IP IPv4: замена происходит на исходном дедлайне после ACK", 1,
+              fakeip_real_pick("n1.s19.test", &later, 1, deadline) == 0xCB00710Bu);
+        fakeip_entry_set_real("n1.s19.test", 0xCB00710Bu, deadline);
+        fakeip_real_pick6("n1.s19.test", &later6, 1, deadline, picked6);
+        check("real-IP IPv6: замена происходит на исходном дедлайне после ACK", 1,
+              !memcmp(picked6, later6.addr, sizeof(picked6)));
+        fakeip_entry_set_real6("n1.s19.test", later6.addr, deadline);
+
+        /* A real upstream answer containing the selected backend refreshes its observation;
+         * a later rotation is held from that answer time, independently of map ACKs. */
+        check("real-IP IPv4: реальный повтор backend подтверждает срок", 1,
+              fakeip_real_pick("n1.s19.test", &later, 1, deadline + 20) == 0xCB00710Bu &&
+              g_fakeip.entries[at].real_seen == deadline + 20);
+        fakeip_real_pick6("n1.s19.test", &later6, 1, deadline + 20, picked6);
+        check("real-IP IPv6: реальный повтор backend подтверждает срок", 1,
+              !memcmp(picked6, later6.addr, sizeof(picked6)) &&
+              g_fakeip.entries[at].real6_seen == deadline + 20);
+        check("real-IP IPv4: подтверждённый backend удерживается при ротации", 1,
+              fakeip_real_pick("n1.s19.test", &rollback, 1, deadline + 21) == 0xCB00710Bu);
+        fakeip_real_pick6("n1.s19.test", &rollback6, 1, deadline + 21, picked6);
+        check("real-IP IPv6: подтверждённый backend удерживается при ротации", 1,
+              !memcmp(picked6, later6.addr, sizeof(picked6)));
+
+        check("real-IP IPv4: подтверждение при now=0 — валидная эпоха", 1,
+              fakeip_real_pick("n1.s19.test", &later, 1, 0) == 0xCB00710Bu &&
+              g_fakeip.entries[at].real_seen_valid && g_fakeip.entries[at].real_seen == 0);
+        fakeip_real_pick6("n1.s19.test", &later6, 1, 0, picked6);
+        check("real-IP IPv6: подтверждение при now=0 — валидная эпоха", 1,
+              !memcmp(picked6, later6.addr, sizeof(picked6)) &&
+              g_fakeip.entries[at].real6_seen_valid && g_fakeip.entries[at].real6_seen == 0);
+        check("real-IP IPv4: отметка эпохи удерживает backend", 1,
+              fakeip_real_pick("n1.s19.test", &rollback, 1, 1) == 0xCB00710Bu);
+        fakeip_real_pick6("n1.s19.test", &rollback6, 1, 1, picked6);
+        check("real-IP IPv6: отметка эпохи удерживает backend", 1,
+              !memcmp(picked6, later6.addr, sizeof(picked6)));
+
+        /* A backward wall-clock step is separate from «no observation»: it must not extend
+         * an already confirmed backend's horizon. */
+        g_fakeip.entries[at].real_seen = g_fakeip.entries[at].real6_seen = 5000;
+        check("real-IP IPv4: обратный ход часов не продлевает удержание", 1,
+              fakeip_real_pick("n1.s19.test", &rollback, 1, 300) == 0xCB00710Cu);
+        fakeip_real_pick6("n1.s19.test", &rollback6, 1, 300, picked6);
+        check("real-IP IPv6: обратный ход часов не продлевает удержание", 1,
+              !memcmp(picked6, rollback6.addr, sizeof(picked6)));
+        fakeip_test_clear();
+        g_fakeip_next = 1;
         unlink(path);
         rmdir(dir);
     }
@@ -1534,7 +1646,7 @@ int main(void) {
         check("fake6: у записи ещё нет настоящего IPv6", 1, fakeip_entry_get_real6("v6.test") == NULL);
         uint8_t r6[16];
         inet_pton(AF_INET6, "2001:db8::77", r6);
-        fakeip_entry_set_real6("v6.test", r6);
+        fakeip_entry_set_real6("v6.test", r6, time(NULL));
         const uint8_t *got6 = fakeip_entry_get_real6("v6.test");
         check("fake6: настоящий IPv6 запомнен", 1, got6 && !memcmp(got6, r6, 16));
         check("fake6: IPv4 записи не тронут", 0, (int)fakeip_entry_get_real("v6.test"));
