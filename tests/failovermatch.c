@@ -580,8 +580,21 @@ static void tick(const char *rules, const char *routes) {
     cmd_failover("/dev/null", 0);
 }
 
+struct route_events {
+    int switched, failed;
+    char out[32], from[32], to[32], why[16], member[32];
+};
+
 static void route_event(void *arg, const struct fo_event *e) {
-    if (e->kind == FO_EV_FAILED || e->kind == FO_EV_SWITCHED) ++*(int *)arg;
+    struct route_events *ev = arg;
+    if (e->kind == FO_EV_SWITCHED) ev->switched++;
+    else if (e->kind == FO_EV_FAILED) ev->failed++;
+    else return;
+    snprintf(ev->out, sizeof(ev->out), "%s", e->out);
+    snprintf(ev->from, sizeof(ev->from), "%s", e->from ? e->from : "");
+    snprintf(ev->to, sizeof(ev->to), "%s", e->to ? e->to : "");
+    snprintf(ev->why, sizeof(ev->why), "%s", e->why);
+    snprintf(ev->member, sizeof(ev->member), "%s", e->member ? e->member : "");
 }
 
 static void blackhole_events(void) {
@@ -592,17 +605,83 @@ static void blackhole_events(void) {
         for (int fault = 0; fault <= 1; fault++) {
             out_set(live ? "lo" : "nodev", FAIL_DROP);
             state_write("active", live ? "vl - 0\n" : "vl lo 0\n");
-            int events = 0;
+            struct route_events events = {0};
+            g_routes = "";
             g_cmd_n = 0;
             g_blackhole_fault = fault ? op : NULL;
             failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
             check("проход запросил нужный маршрут", cmd_seen(op), 1);
-            check("событие перехода — только после подтверждения", events, !fault);
+            check("событие перехода — только после подтверждения", events.switched + events.failed, !fault);
             if (live)
                 check("отказ запаса не вызывает основной blackhole", cmd_seen("blackhole default table 300"), 0);
+            if (fault) {
+                char active[32];
+                active_dev(active, sizeof(active));
+                check("active отражает здоровье, включая неподтверждённый выбор", !strcmp(active, live ? "lo" : "-"), 1);
+                /* Даже частичный успех уже виден в таблице. Больше active не подменяем. */
+                g_routes = live ? "default dev lo scope link\n" : "blackhole default metric 65535\n";
+                g_blackhole_fault = NULL;
+                g_cmd_n = 0;
+                failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+                check("повтор действительно подтвердил обязательный маршрут", cmd_seen(op), 1);
+            }
+            check("ровно один нужный переход", events.switched == live && events.failed == !live, 1);
+            check("переход сохранил откуда, куда и почему", !strcmp(events.from, live ? "" : "lo") &&
+                  !strcmp(events.to, live ? "lo" : "") && !strcmp(events.why, live ? "recovered" : "down"), 1);
+            g_routes = live ? "default dev lo scope link\nblackhole default metric 65535\n"
+                            : "blackhole default\nblackhole default metric 65535\n";
+            g_cmd_n = 0;
+            failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+            check("стабильный проход — без события и повторной привязки", events.switched + events.failed == 1 && !cmd_seen(op), 1);
         }
     }
+    /* Не объявлять recovered, если предшествующий failed так и не был подтверждён. */
+    struct route_events events = {0};
+    out_set("nodev", FAIL_DROP);
+    state_write("active", "vl lo 0\n");
+    g_blackhole_fault = "ip route replace blackhole default table 300";
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
     g_blackhole_fault = NULL;
+    out_set("lo", FAIL_DROP);
+    g_cmd_n = 0;
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("возврат к исходному выбору подтверждается без ложной пары событий",
+          !events.switched && !events.failed && cmd_seen("default dev lo table 300"), 1);
+
+    /* Член и группа имеют разные таблицы и подтверждаются независимо. */
+    events = (struct route_events){0};
+    out_set_wg_group();
+    state_write("active", "wg - 0\nall - 0\n");
+    g_rules = RULES_WITH;
+    g_routes = "default dev lo scope link\nblackhole default metric 65535\n";
+    g_blackhole_fault = "ip route replace blackhole default metric 65535 table 301";
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("член уже переключён, группа ещё нет", events.switched == 1 && !strcmp(events.out, "wg"), 1);
+    g_blackhole_fault = NULL;
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("группа подтвердилась позже и называет своего живого члена", events.switched == 2 &&
+          !strcmp(events.out, "all") && !strcmp(events.member, "wg") && !strcmp(events.why, "recovered"), 1);
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("событие группы не дублируется", events.switched + events.failed, 2);
+
+    /* В промежутке может прийти ручной select: даже если статус уже называет
+     * этот лист, успех разрешён только после ACK. Следующий проход не дублирует его. */
+    events = (struct route_events){0};
+    char path[128];
+    snprintf(path, sizeof(path), "%s/spec", g_dir);
+    steer_set_keep_dir_of(path);
+    state_write("active", "wg lo 0\nall - 0\n");
+    g_blackhole_fault = "ip route replace blackhole default metric 65535 table 301";
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("select не поглощает ожидающий переход при отказе",
+          fog_select(&g_spec, &fo_store_files, "all", "wg", 1, route_event, &events, stdout), 1);
+    check("до подтверждения select тоже молчит", events.switched + events.failed, 0);
+    g_blackhole_fault = NULL;
+    check("select подтвердил ожидающий переход",
+          fog_select(&g_spec, &fo_store_files, "all", "wg", 1, route_event, &events, stdout), 0);
+    check("один switched от select", events.switched == 1 && !strcmp(events.why, "select") && !strcmp(events.member, "wg"), 1);
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("после select сторож не повторяет событие", events.switched + events.failed, 1);
 }
 
 int main(int argc, char **argv) {

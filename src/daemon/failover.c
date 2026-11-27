@@ -1666,15 +1666,12 @@ static int failover_hyst(void) {
 void failover_hyst_reset_for_test(void) { g_hyst_cache = -2; }
 
 /* Счётчик подряд-здоровых тиков более предпочтительного устройства — рядом с активным, третьим
- * полем в том же файле. Все читатели файла обязаны СЪЕДАТЬ три поля, иначе оставшийся на строке
- * счётчик уедет в имя следующего выхода. Старый файл без счётчика читается как ноль. Серия
+ * полем в том же файле. Строки читаются по отдельности: старый файл без счётчика даёт ноль. Серия
  * прохода — массив по выходам спеки у failover_pass, в хранилище она уходит с active_save. */
 
 /* ---- состояние замеров задержки -----------------------------------------------------
  *
- * ОТДЕЛЬНЫМ ФАЙЛОМ, а не четвёртым полем в `active`. Тот читается fscanf по трём полям, и у
- * него уже есть оговорка про запись без третьего поля; четвёртое означало бы правку формата,
- * который пишут и читают в трёх местах. Отдельный файл вдобавок необязателен сам по себе:
+ * ОТДЕЛЬНЫМ ФАЙЛОМ: замер не обязан совпадать по времени с проходом. Файл необязателен:
  * нет его — значит не мерили, и это законное начальное состояние.
  *
  * Строка: `выход устройство мс отметка`. Отметка — CLOCK_MONOTONIC в секундах, то есть время
@@ -1692,30 +1689,27 @@ static long mono_now(void) {
     return (long)t.tv_sec;
 }
 
-static int active_streak_get(struct fo_store *st, const char *out) {
+void fo_active_read(struct fo_store *st, const char *out, struct fo_active_record *a) {
+    memset(a, 0, sizeof(*a));
     FILE *f = st->ops->open_r(st, "active");
-    if (!f) return 0;
-    char name[32], d[32];
-    int sk = 0, val = 0;
-    while (fscanf(f, "%31s %31s %d", name, d, &sk) >= 2) {
-        if (!strcmp(name, out)) val = sk;
-        sk = 0;   /* следующая запись без третьего поля не должна унаследовать этот */
+    if (!f) return;
+    char line[160], name[32];
+    while (fgets(line, sizeof(line), f)) {
+        struct fo_active_record rec = {0};
+        int fields = sscanf(line, "%31s %31s %d #%15s %31s", name, rec.dev, &rec.streak, rec.why, rec.from);
+        if (fields < 2 || strcmp(name, out)) continue;
+        if (fields != 5) rec.why[0] = '\0';
+        if (!strcmp(rec.from, "?")) rec.from[0] = '\0';
+        *a = rec;
+        break;
     }
     fclose(f);
-    return val;
 }
 
 void active_get_st(struct fo_store *st, const char *out, char *dev, size_t n) {
-    dev[0] = '\0';
-    FILE *f = st->ops->open_r(st, "active");
-    if (!f) return;
-    char name[32], d[32];
-    int sk = 0;
-    while (fscanf(f, "%31s %31s %d", name, d, &sk) >= 2) {
-        if (!strcmp(name, out)) snprintf(dev, n, "%s", d);
-        sk = 0;
-    }
-    fclose(f);
+    struct fo_active_record a;
+    fo_active_read(st, out, &a);
+    snprintf(dev, n, "%s", a.dev);
 }
 
 void active_get(const char *out, char *dev, size_t n) {
@@ -1733,17 +1727,21 @@ void active_get(const char *out, char *dev, size_t n) {
  *
  * Заменой целиком (у файлов — через временный файл и rename, см. files_put): status и apply
  * читают этот файл в любой момент. */
-static void active_save(struct fo_store *st, const struct spec *sp, const int *streak,
+static void active_save(struct fo_store *st, const struct spec *sp, const struct fo_active_record *active,
                         const int *failed) {
-    /* Строка — имя ≤ 31, устройство ≤ 31, число серии и пробелы: не больше 96 байт. Буфер — по
-     * числу выходов (раньше 80 байт на 16 выходов, и хвост записи терялся). */
-    size_t wcap = sp->out_n * 96 + 1, wn = 0;
+    /* Только при незавершённом переходе дописываем `#причина откуда 0`. Старый
+     * fscanf читает это как ещё одну полную тройку: имя с # не бывает выходом,
+     * и следующая строка не сдвигается. «?» — до старта записи не было. */
+    size_t wcap = sp->out_n * 160 + 1, wn = 0;
     char *want = malloc(wcap);
     if (!want) return;
     for (size_t i = 0; i < sp->out_n; i++) {
         if (!out_has_device(&sp->out[i])) continue;
-        int w = snprintf(want + wn, wcap - wn, "%s %s %d\n", sp->out[i].name,
-                         !failed[i] && sp->out[i].device[0] ? sp->out[i].device : "-", streak[i]);
+        const struct fo_active_record *a = &active[i];
+        char tail[64] = "";
+        if (a->why[0]) snprintf(tail, sizeof(tail), " #%s %s 0", a->why, a->from[0] ? a->from : "?");
+        int w = snprintf(want + wn, wcap - wn, "%s %s %d%s\n", sp->out[i].name,
+                         !failed[i] && sp->out[i].device[0] ? sp->out[i].device : "-", a->streak, tail);
         if (w < 0 || (size_t)w >= wcap - wn) break;
         wn += (size_t)w;
     }
@@ -1816,7 +1814,7 @@ void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
         /* Вид недоступен (нет плагина): устройства нет и не будет, выход живёт по on_fail. */
         if (o->unavail) { o->failed = 1; continue; }
         char rec[32];
-        active_get_st(st, o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
+        active_get_st(st, o->name, rec, sizeof(rec));
         /* «-» — сторож признал выход неработающим и поставил on_fail (out_finish): и у группы, и
          * у выхода с одним устройством. Устройство ниже всё равно выбирается — о нём и говорят
          * поля status, — но трафик через него не идёт, и status с diag обязаны это сказать, а не
@@ -2166,7 +2164,7 @@ struct fo_run {
      * группы (maxm), выделяются в run_new и отдаются run_free: раньше стояли статическими на 16
      * выходов и 16 членов. */
     size_t n_out, maxm;
-    int *streak_new;
+    struct fo_active_record *active;
     /* Кто в ЭТОМ проходе нашёл живое устройство (ALIVE_YES) или удержан в сомнении
      * (ALIVE_HELD): трафик через удержанного идёт, как шёл, — выход поверх него (via) остаётся,
      * а группа v2 считает такого члена не отвечающим и держится за него, только если живых нет. */
@@ -2183,7 +2181,6 @@ struct fo_run {
     size_t cand_n;
     const struct output *via;
     int via_down;
-    char was[32];
     int cur, first_h;
     size_t k;
     const char *chosen;
@@ -2575,7 +2572,7 @@ static void run_free_arrays(struct fo_run *r) {
     if (r->grp_alive)
         for (size_t i = 0; i < r->n_out; i++) free(r->grp_alive[i]);
     free(r->grp_alive);
-    free(r->streak_new); free(r->alive); free(r->failed); free(r->ord); free(r->grp_cur);
+    free(r->active); free(r->alive); free(r->failed); free(r->ord); free(r->grp_cur);
     free(r->cand); free(r->ms); free(r->ms4); free(r->ms6); free(r->galive);
 }
 
@@ -2590,7 +2587,7 @@ static struct fo_run *run_new(struct loop *l, struct spec *sp, struct fo_store *
         const struct group_cfg *g = out_group(&sp->out[i]);
         if (g && g->members_n > r->maxm) r->maxm = g->members_n;
     }
-    r->streak_new = calloc(r->n_out, sizeof(int));
+    r->active = calloc(r->n_out, sizeof(*r->active));
     r->alive = calloc(r->n_out, sizeof(int));
     r->failed = calloc(r->n_out, sizeof(int));
     r->ord = calloc(r->n_out, sizeof(size_t));
@@ -2601,7 +2598,7 @@ static struct fo_run *run_new(struct loop *l, struct spec *sp, struct fo_store *
     r->ms4 = calloc(r->maxm, sizeof(int));
     r->ms6 = calloc(r->maxm, sizeof(int));
     r->galive = calloc(r->maxm, 1);
-    if (!r->streak_new || !r->alive || !r->failed || !r->ord || !r->grp_cur || !r->grp_alive ||
+    if (!r->active || !r->alive || !r->failed || !r->ord || !r->grp_cur || !r->grp_alive ||
         !r->cand || !r->ms || !r->ms4 || !r->ms6 || !r->galive) {
         run_free_arrays(r);
         free(r);
@@ -2808,11 +2805,18 @@ static int named_member(const struct spec *sp, const struct output *o) {
 
 /* ---- шаг выхода: действия после решения (прежний хвост тела цикла failover_pass) ----------- */
 
+static void transition_pending(struct fo_active_record *a, const char *why) {
+    if (!a->why[0]) snprintf(a->from, sizeof(a->from), "%s", a->dev);
+    if (why != a->why) snprintf(a->why, sizeof(a->why), "%s", why);
+}
+
 static void out_finish(struct fo_run *r) {
     struct output *o = r->o;
     const char *chosen = r->chosen;
-    const char *was = r->was;
-    r->streak_new[r->i] = r->new_streak;
+    struct fo_active_record *a = &r->active[r->i];
+    int pending = a->why[0] != '\0';
+    const char *was = pending ? a->from : a->dev;
+    a->streak = r->new_streak;
     r->alive[r->i] = !chosen ? ALIVE_NO : r->held ? ALIVE_HELD : ALIVE_YES;
     /* Группа v2: выбранный член — в событие и в запись groups. */
     const char *member = NULL;
@@ -2834,7 +2838,7 @@ static void out_finish(struct fo_run *r) {
     if (chosen) {
         /* У выхода-одиночки кандидат — он сам, и chosen указывает в его же device. */
         if (chosen != o->device) snprintf(o->device, sizeof(o->device), "%s", chosen);
-        if (strcmp(was, chosen) != 0) {
+        if (pending || strcmp(was, chosen) != 0) {
             int bound = !bind_device(o, chosen);
             const char *why = !was[0] ? "start" : !strcmp(was, "-") ? "recovered"
                             : r->cur < 0 ? "spec" : r->by_latency ? "latency"
@@ -2845,13 +2849,17 @@ static void out_finish(struct fo_run *r) {
             if (r->named && had && r->cur >= 0 && r->cur == r->pk) why = "leaf";
             else if (r->named && had && gcf && gcf->pick == PICK_MANUAL && r->cur >= 0)
                 why = "select";
-            if (bound) {
+            if (pending && !strcmp(a->dev, chosen)) why = a->why;
+            if (!bound) {
+                transition_pending(a, why);
+            } else if (strcmp(was, chosen)) {
                 printf("steer: выход %s -> %s%s\n", o->name, chosen,
                        had ? " (переключение)" : "");
                 r->changed = 1;
                 fo_emit(r->ev, r->ev_arg, FO_EV_SWITCHED, o,
                         had ? was : NULL, chosen, why, member);
             }
+            if (bound) a->why[0] = '\0';
         } else {
             /* Имя устройства то же — и это НЕ значит, что маршрутизация цела.
              * Спрашиваем ядро, а не свою память: см. «сверка фактического
@@ -2899,16 +2907,21 @@ static void out_finish(struct fo_run *r) {
     } else {
         /* Устройство выхода не стирается — отказ записывает failed (в active он «-»). */
         r->failed[r->i] = 1;
-        /* Тоже по факту, а не по записи в active. Запись «-» говорит лишь о том, что
-         * об отказе уже сообщали, а не о том, что заявленный on_fail всё ещё стоит в
+        /* После подтверждения — сверка по факту. Запись «-» без ожидающего перехода
+         * не гарантирует, что заявленный on_fail всё ещё стоит в
          * ядре: клиент туннеля мог с тех пор подняться и привязать таблицу к
          * устройству, которое не отвечает, — тогда трафик уходит в мёртвый туннель
          * вместо остановки, обещанной on_fail=drop. */
-        if (strcmp(was, "-") != 0) {
-            if (!apply_failed(o, 1)) {  /* failed подписчикам обещает применённый on_fail */
-                r->changed = 1;
-                fo_emit(r->ev, r->ev_arg, FO_EV_FAILED, o, was[0] ? was : NULL, NULL,
-                        r->via_down ? "via" : "down", NULL);
+        if (pending || strcmp(was, "-") != 0) {
+            const char *why = r->via_down ? "via" : "down";
+            if (apply_failed(o, strcmp(was, "-") != 0)) {
+                transition_pending(a, why);
+            } else {
+                if (strcmp(was, "-")) {
+                    r->changed = 1;
+                    fo_emit(r->ev, r->ev_arg, FO_EV_FAILED, o, was[0] ? was : NULL, NULL, why, NULL);
+                }
+                a->why[0] = '\0';
             }
         } else {
             struct route_facts f = route_facts_read(o);
@@ -3027,7 +3040,7 @@ static void fo_step(struct fo_run *r) {
              * них выбрал. */
             r->via = out_over(sp, o);
             r->via_down = r->via && !r->alive[r->via - sp->out];
-            active_get_st(r->st, o->name, r->was, sizeof(r->was));
+            fo_active_read(r->st, o->name, &r->active[r->i]);
             r->cand_n = out_members_n(sp, o);
             for (size_t k = 0; k < r->cand_n; k++) r->cand[k] = out_member(sp, o, k);
             /* Где в списке предпочтения стоит несущее трафик сейчас. -1 — записи нет или её
@@ -3035,7 +3048,7 @@ static void fo_step(struct fo_run *r) {
              * лучшее здоровое сразу. */
             r->cur = -1;
             for (size_t k = 0; k < r->cand_n; k++)
-                if (!strcmp(r->cand[k]->device, r->was)) { r->cur = (int)k; break; }
+                if (!strcmp(r->cand[k]->device, r->active[r->i].dev)) { r->cur = (int)k; break; }
             /* Группа v2: несущий член — по записи groups (устройство листа у вложенных групп могут
              * делить два члена, а у вложенной лист меняется, пока член тот же). */
             r->named = group_named(out_group(o));
@@ -3043,7 +3056,7 @@ static void fo_step(struct fo_run *r) {
             memset(r->galive, 0, r->maxm);
             if (r->named) {
                 int gc = fog_groups_cur(r->st, sp, o);
-                if (gc >= 0 && strcmp(r->was, "-") != 0) r->cur = gc;
+                if (gc >= 0 && strcmp(r->active[r->i].dev, "-") != 0) r->cur = gc;
             }
             r->first_h = -1;
             r->cur_net = 0;
@@ -3072,7 +3085,7 @@ static void fo_step(struct fo_run *r) {
 
         case S_LAT:
             r->chosen = NULL;
-            r->streak = active_streak_get(r->st, o->name);
+            r->streak = r->active[r->i].streak;
             r->new_streak = 0;
             /* Для события switched: чем выбор объяснить. Устройства 0..first_h пробой уже
              * спрошены, поэтому «текущее мертво» при cur < first_h известно без новой пробы. */
@@ -3401,7 +3414,7 @@ static void fo_step(struct fo_run *r) {
             continue;
 
         case S_END:
-            active_save(r->st, sp, r->streak_new, r->failed);
+            active_save(r->st, sp, r->active, r->failed);
             fog_groups_save(r->st, sp, r->grp_cur, r->grp_alive);
             /* Префикс хоста у донора IPv6 — по ядру этого прохода (v6donor_sync: без спеки с
              * донором — ничего, два чтения netlink и getifaddrs — иначе). */
