@@ -123,6 +123,7 @@
 #include "watchd.h"
 #include "helpers.h"
 #include "awg.h"
+#include "table_ack.h"
 
 #define LOG_SW "steer[warn] supervise: "
 /* Таблицы, не забранные резолвером: резолвер, у которого в очереди лежит больше восьми таблиц
@@ -147,13 +148,18 @@ struct supd {
     char self[PATH_MAX];      /* настоящий файл движка: резолвер и помощники-программы */
     int seam;
     int stopping;
-    /* Отпечаток последней отданной резолверу таблицы (текст и файлы списков); tab_ok=0 — не
-     * отдавали. */
-    unsigned long long tab_fp;
-    int tab_ok;
     /* Резолвер: конец записи трубы таблицы и не отданные ещё байты. */
     int dn_fd;
     int dn_out;               /* ждём EPOLLOUT */
+    int dn_ack;
+    uint64_t tab_result_seq;
+    int tab_result;
+    int tab_bad;
+    struct table_ack_window tab_window;
+    struct table_ack_reader tab_reader;
+    struct table_ack_dispatch tab_dispatch;
+    unsigned long long tab_report_fp;
+    int tab_report_ok;
     char *q;
     size_t qn, qoff, qcap;
     /* Резолвер забран у прежнего демона (adopt_dnsd): соединение с его управляющим сокетом —
@@ -163,7 +169,7 @@ struct supd {
      * 1 — ответ «ok» на «adopt»; 2 — выхода резолвера после SIGTERM; 3 — после SIGKILL), ad_ans/ad_an —
      * принятая часть ответа, ad_pid — резолвер, ad_p1 — конец записи новой трубы таблицы (до «ok» — не
      * s->dn_fd), ad_tm — срок ожидания. */
-    int ad_ph, ad_p1;
+    int ad_ph, ad_p1, ad_legacy;
     char ad_ans[16];
     size_t ad_an;
     pid_t ad_pid;
@@ -268,7 +274,7 @@ static void route_up(struct supd *s, struct helper *h, const char *dev) {
                         "привязан\n", h->cmd, h->name, dev, o->device);
         return;
     }
-    bind_device(o, dev);
+    if (bind_device(o, dev)) return;
     snprintf(st->bound, sizeof(st->bound), "%s", dev);
     fprintf(stderr, "steer[info] supervise: %s %s — %s поднят, маршрут выхода привязан "
                     "(таблица %d)\n", h->cmd, h->name, dev, o->table);
@@ -577,11 +583,19 @@ static void ev_cb(struct loop *l, int fd, uint32_t events, void *arg) {
 
 static void tab_close(struct supd *s) {
     if (s->dn_fd >= 0) {
-        if (s->dn_out) loop_fd_del(s->l, s->dn_fd);
+        if (s->dn_out || s->dn_ack) loop_fd_del(s->l, s->dn_fd);
         close(s->dn_fd);
     }
     s->dn_fd = -1;
     s->dn_out = 0;
+    s->dn_ack = 0;
+    s->tab_result_seq = 0;
+    s->tab_result = 0;
+    s->tab_bad=0;
+    memset(&s->tab_window,0,sizeof s->tab_window);
+    memset(&s->tab_reader,0,sizeof s->tab_reader);
+    table_ack_dispatch_done(&s->tab_dispatch);
+    s->tab_report_ok = 0;
     s->qn = s->qoff = 0;
 }
 
@@ -593,7 +607,9 @@ static void tab_flush(struct supd *s) {
         if (w > 0) { s->qoff += (size_t)w; continue; }
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (!s->dn_out && loop_fd_add(s->l, s->dn_fd, EPOLLOUT, tab_out_cb, s) == 0)
+            if (!s->dn_out && (s->dn_ack ?
+                loop_fd_mod(s->l,s->dn_fd,EPOLLIN|EPOLLOUT) :
+                loop_fd_add(s->l, s->dn_fd, EPOLLOUT, tab_out_cb, s)) == 0)
                 s->dn_out = 1;
             return;
         }
@@ -602,12 +618,53 @@ static void tab_flush(struct supd *s) {
         return;
     }
     s->qn = s->qoff = 0;
-    if (s->dn_out) { loop_fd_del(s->l, s->dn_fd); s->dn_out = 0; }
+    if (s->dn_out) {
+        if(s->dn_ack) (void)loop_fd_mod(s->l,s->dn_fd,EPOLLIN);
+        else loop_fd_del(s->l, s->dn_fd);
+        s->dn_out = 0;
+    }
 }
 
+static void tab_result(void *user,uint64_t seq,int result) {
+    struct supd *s=user;
+    if(table_ack_window_settle(&s->tab_window,seq,result)) {
+        s->tab_bad=1;return;
+    }
+    s->tab_result_seq=seq;
+    s->tab_result=result;
+    fprintf(stderr,"steer[info] supervise: dnsd table result seq=%llu %s\n",
+            (unsigned long long)seq,result==1?"accepted":"rejected");
+}
+static int tab_send(struct supd *s, int force, int *changed);
 static void tab_out_cb(struct loop *l, int fd, uint32_t events, void *arg) {
-    (void)l; (void)fd; (void)events;
-    tab_flush(arg);
+    (void)l;
+    struct supd *s=arg;
+    if(s->dn_ack && (events&(EPOLLIN|EPOLLERR|EPOLLHUP))) {
+        uint8_t data[256];
+        for(;;) {
+            ssize_t n=recv(fd,data,sizeof data,MSG_DONTWAIT);
+            if(n>0) {
+                if(table_ack_read(&s->tab_reader,data,(size_t)n,tab_result,s)<0 ||
+                   s->tab_bad) { tab_close(s);return; }
+                continue;
+            }
+            if(n<0&&errno==EINTR)continue;
+            if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK))break;
+            tab_close(s);return;
+        }
+    }
+    if(s->dn_fd>=0 && s->dn_out && (events&EPOLLOUT))tab_flush(s);
+    /* Only a desire deferred by a full window is resumed, never a rejection. */
+    if(s->dn_fd>=0 && s->dn_ack && s->tab_dispatch.pending &&
+       table_ack_window_ready(&s->tab_window)) (void)tab_send(s,0,NULL);
+}
+
+static int tab_socket_attach(struct supd *s,int fd) {
+    s->dn_fd=fd;s->dn_ack=1;
+    if(loop_fd_add(s->l,fd,EPOLLIN,tab_out_cb,s)!=0) {
+        s->dn_ack=0;s->dn_fd=-1;return -1;
+    }
+    return 0;
 }
 
 /* Отпечаток таблицы: сам текст и то, что резолвер прочтёт по путям из неё (устройство, inode,
@@ -651,9 +708,10 @@ static unsigned long long tab_fingerprint(const char *p, size_t n) {
     return h;
 }
 
-/* Собрать таблицу по спеке в памяти и поставить в трубу. force=0 — только если она (или файлы
- * списков) изменилась с прошлой отдачи; 1 — всегда (резолвер только что запущен). 1 — отдана. */
-static int tab_send(struct supd *s, int force) {
+/* Отправка и изменение текста/файлов — разные вещи: reassert и повтор после отказа
+ * могут отправить прежний fingerprint. Отчёт не является квитанцией резолвера. */
+static int tab_send(struct supd *s, int force, int *changed) {
+    if (changed) *changed = 0;
     if (s->dn_fd < 0 || !s->d->have) return 0;
     char *p = NULL;
     size_t n = 0;
@@ -662,7 +720,19 @@ static int tab_send(struct supd *s, int force) {
     tabfmt_build(s->d->sp, f);
     if (fclose(f) != 0 || !p) { free(p); return 0; }
     unsigned long long fp = tab_fingerprint(p, n);
-    if (!force && s->tab_ok && fp == s->tab_fp) { free(p); return 0; }
+    if (s->dn_ack) {
+        if (s->tab_window.sent == UINT64_MAX) { free(p); tab_close(s); return 0; }
+        enum table_ack_decision decision =
+            table_ack_dispatch_decide(&s->tab_dispatch, &s->tab_window, fp, force);
+        if (decision == TABLE_ACK_NOOP) {
+            table_ack_dispatch_done(&s->tab_dispatch);
+            free(p); return 0;
+        }
+        if (decision == TABLE_ACK_DEFER) {
+            if (changed) *changed = !s->tab_report_ok || s->tab_report_fp != fp;
+            free(p); return 2;
+        }
+    }
     if (s->qoff) {
         memmove(s->q, s->q + s->qoff, s->qn - s->qoff);
         s->qn -= s->qoff;
@@ -687,8 +757,11 @@ static int tab_send(struct supd *s, int force) {
     memcpy(s->q + s->qn, p, n);
     s->qn += n;
     free(p);
-    s->tab_fp = fp;
-    s->tab_ok = 1;
+    if(s->dn_ack) (void)table_ack_window_push(&s->tab_window,fp);
+    if (changed) *changed = !s->tab_report_ok || s->tab_report_fp != fp;
+    s->tab_report_fp = fp;
+    s->tab_report_ok = 1;
+    table_ack_dispatch_done(&s->tab_dispatch);
     tab_flush(s);
     return 1;
 }
@@ -1081,6 +1154,7 @@ static void dn_conn_close(struct supd *s) {
 }
 
 static int dnsd_spawn(struct supd *s, struct helper *h);
+static int adopt_dnsd_mode(struct supd *s, struct helper *h, int legacy);
 
 /* Забор не удался или резолвер погашен: поднять свой ребёнок вместо него. Зовётся из событий цикла,
  * поэтому за start_one докладывает сам — loop_child и повторный подъём по паузе. */
@@ -1129,6 +1203,16 @@ static void ad_conn_cb(struct supd *s) {
     ssize_t m = recv(s->dn_conn, b, sizeof(b), MSG_DONTWAIT);
     if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
     if (m <= 0) {                         /* закрыл: ответа не будет (прежняя версия) или он вышел */
+        if(s->ad_ph==1 && !s->ad_legacy) {
+            pid_t old=s->ad_pid;
+            s->ad_ph=0;loop_timer_stop(s->ad_tm);dn_conn_close(s);
+            if(s->ad_p1>=0) { close(s->ad_p1);s->ad_p1=-1; }
+            for(size_t i=0;i<s->set.n;i++) {
+                struct helper *h=&s->set.h[i];
+                if(h->table&&h->pid==old && adopt_dnsd_mode(s,h,1))return;
+            }
+            ad_spawn_own(s);return;
+        }
         if (s->ad_ph == 1) kill(s->ad_pid, SIGTERM);
         ad_spawn_own(s);
         return;
@@ -1142,13 +1226,16 @@ static void ad_conn_cb(struct supd *s) {
     if (!strcmp(s->ad_ans, "ok\n")) {
         fcntl(s->ad_p1, F_SETFL, fcntl(s->ad_p1, F_GETFL) | O_NONBLOCK);
         tab_close(s);
-        s->dn_fd = s->ad_p1;
+        if(s->ad_legacy) s->dn_fd=s->ad_p1;
+        else if(tab_socket_attach(s,s->ad_p1)!=0) {
+            close(s->ad_p1);s->ad_p1=-1;ad_spawn_own(s);return;
+        }
         s->ad_p1 = -1;
         s->ad_ph = 0;
         loop_timer_stop(s->ad_tm);
         fprintf(stderr, "steer[info] supervise: dnsd подхвачен (pid %d) — резолвер пережил прежний "
                         "демон\n", (int)s->ad_pid);
-        tab_send(s, 1);
+        tab_send(s, 1, NULL);
         return;
     }
     if (!strcmp(s->ad_ans, "busy\n")) {
@@ -1183,7 +1270,7 @@ static void dn_conn_cb(struct loop *l, int fd, uint32_t events, void *arg) {
  * функция: резолвер, занятый перечитыванием списков, отвечает не сразу, и демон на это время не
  * замирал бы. 1 — забор начат, резолвер считается принадлежащим помощнику (h->pid), и если не
  * отдастся — цикл сам поднимет свой (ad_spawn_own); 0 — живого нет, запускать надо свой. */
-static int adopt_dnsd(struct supd *s, struct helper *h) {
+static int adopt_dnsd_mode(struct supd *s, struct helper *h, int legacy) {
     pid_t pid;
     if (s->ad_ph) return 1;               /* забор уже идёт */
     int c = dnsd_connect(&pid);
@@ -1207,7 +1294,9 @@ static int adopt_dnsd(struct supd *s, struct helper *h) {
         }
     }
     int p[2];
-    if (pipe2(p, O_CLOEXEC) != 0) { dnsd_kill(c, pid); return 0; }
+    if ((legacy ? pipe2(p,O_CLOEXEC) : socketpair(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0,p)) != 0) {
+        dnsd_kill(c, pid); return 0;
+    }
     int fds[2] = { p[0], 2 };
     size_t nfd = fcntl(2, F_GETFD) >= 0 ? 2 : 1;     /* stderr закрыт — отдать одну трубу */
     union { struct cmsghdr h; char b[CMSG_SPACE(sizeof(fds))]; } cm;
@@ -1245,6 +1334,7 @@ static int adopt_dnsd(struct supd *s, struct helper *h) {
         return 0;
     }
     s->ad_ph = 1;
+    s->ad_legacy = legacy;
     s->ad_p1 = p[1];
     s->ad_an = 0;
     s->ad_ans[0] = '\0';
@@ -1258,7 +1348,7 @@ static int adopt_dnsd(struct supd *s, struct helper *h) {
 /* 0 — запущен свой ребёнок, 1 — забран живой (loop_child ему не нужен), -1 — не вышло. */
 static int dnsd_spawn(struct supd *s, struct helper *h) {
     int p[2];
-    if (pipe2(p, O_CLOEXEC) != 0) return -1;
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, p) != 0) return -1;
     const char **av = malloc((8 + s->dnsd_flag_n) * sizeof(*av));
     if (!av) { close(p[0]); close(p[1]); return -1; }
     size_t n = 0;
@@ -1286,14 +1376,14 @@ static int dnsd_spawn(struct supd *s, struct helper *h) {
     close(p[0]);
     fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL) | O_NONBLOCK);
     tab_close(s);
-    s->dn_fd = p[1];
     helper_started(h, pid);
-    tab_send(s, 1);
+    if(tab_socket_attach(s,p[1])!=0) { close(p[1]);kill(pid,SIGTERM);return 0; }
+    tab_send(s, 1, NULL);
     return 0;
 }
 
 static int start_dnsd(struct supd *s, struct helper *h) {
-    if (adopt_dnsd(s, h)) return 1;
+    if (adopt_dnsd_mode(s, h, 0)) return 1;
     return dnsd_spawn(s, h);
 }
 
@@ -1572,9 +1662,9 @@ void supd_spec_changed(struct supd *s, struct supd_changes *ch, int replaced) {
     if (ch) changes_of(s, fn, ch);
     helpers_merge(&s->set, s->fresh, fn);
     helpers_compact(&s->set);
-    int sent = tab_send(s, 0);
-    if (!sent && replaced) tab_send(s, 1);
-    if (ch) ch->dnsd = sent;
+    int changed = 0;
+    (void)tab_send(s, replaced, &changed);
+    if (ch) ch->dnsd = changed;
     supd_kick(s);
 }
 

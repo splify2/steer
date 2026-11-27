@@ -1,4 +1,5 @@
 #include "dnsd_int.h"
+#include "table_ack.h"
 #include "sindex.h"
 #include "nftnl.h"
 #include "tabfmt.h"
@@ -420,7 +421,30 @@ static void reassert_routes(void) {
  * Возвращает 1 — труба открыта и дочитана; 0 — демон её закрыл (EOF: он вышел или убит, см.
  * table_pipe_lost ниже). При повреждённом framing граница следующего кадра неизвестна:
  * труба закрывается, а последняя таблица остаётся действующей на время ожидания демона. */
+static int table_frames(int rc) {
+    int got=0;
+    while (rc == 1 || rc == 2) {
+        if (rc == 1) {
+            fprintf(stderr, "steer dnsd: таблица от демона: %zu доменных канал(ов)\n", g_dch_n);
+            g_rules_gen++;
+            apply_upstreams();
+        } else {
+            fprintf(stderr, "steer[warn] dnsd: таблица отклонена, сохранена прежняя\n");
+        }
+        got=1;
+        if (table_ack_emit(g_table_fd, rc) != 0) return 0;
+        rc = tabfmt_feed(&g_table_feed, NULL, 0);
+    }
+    if (got) reassert_routes();
+    if (rc < 0) {
+        fprintf(stderr, "steer[warn] dnsd: труба таблицы: испорченный текст\n");
+        return 0;
+    }
+    return 1;
+}
 static int table_pipe_readable(void) {
+    /* tabfmt_read_first can have already buffered further complete frames. */
+    if (!table_frames(tabfmt_feed(&g_table_feed,NULL,0))) return 0;
     for (;;) {
         char chunk[4096];
         ssize_t r = read(g_table_fd, chunk, sizeof(chunk));
@@ -431,31 +455,7 @@ static int table_pipe_readable(void) {
             return 0;
         }
         if (r == 0) return 0;
-        int rc = tabfmt_feed(&g_table_feed, chunk, (size_t)r);
-        if (rc < 0) {
-            fprintf(stderr, "steer[warn] dnsd: труба таблицы: испорченный текст\n");
-            return 0;
-        }
-        /* rc == 1 может повториться без нового чтения — демон вправе прислать две таблицы
-         * подряд одной записью, а следующая уже целиком лежит в g_table_feed. */
-        int got = 0;
-        while (rc == 1 || rc == 2) {
-            if (rc == 1) {
-                fprintf(stderr, "steer dnsd: таблица от демона: %zu доменных канал(ов)\n", g_dch_n);
-                g_rules_gen++;
-                apply_upstreams();
-                got = 1;
-            } else {
-                fprintf(stderr, "steer[warn] dnsd: таблица отклонена, сохранена прежняя\n");
-                got = 1; /* apply мог уже заменить наборы nftables */
-            }
-            rc = tabfmt_feed(&g_table_feed, NULL, 0);
-        }
-        if (got) reassert_routes();
-        if (rc < 0) {
-            fprintf(stderr, "steer[warn] dnsd: труба таблицы: испорченный текст\n");
-            return 0;
-        }
+        if (!table_frames(tabfmt_feed(&g_table_feed,chunk,(size_t)r))) return 0;
     }
 }
 
@@ -481,6 +481,7 @@ static void table_pipe_lost(void) {
     epoll_ctl(g_epfd, EPOLL_CTL_DEL, g_table_fd, NULL);
     close(g_table_fd);
     g_table_fd = -1;
+    table_ack_reset(-1);
     tabfmt_feed_reset(&g_table_feed);  /* недописанная таблица умершего демона — не наша */
     if (!g_running) return;           /* SIGTERM уже пришёл: это остановка, а не пропажа */
     if (g_orphan_sec <= 0 || g_adopt_fd < 0) {
@@ -513,6 +514,7 @@ int table_pipe_take(int fd, long *waited) {
     tev.data.ptr = &g_table_fd;
     if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &tev) != 0) return -1;
     g_table_fd = fd;
+    table_ack_reset(fd);
     tabfmt_feed_reset(&g_table_feed);
     *waited = g_orphan_since ? (long)(mono_sec() - g_orphan_since) : 0;
     g_orphan_since = 0;
@@ -2473,6 +2475,8 @@ int run_proxy(int listen_port, int upstream_port) {
 
     if (g_table_fd < 0) reload_rules();
     apply_upstreams();
+    if (g_table_fd >= 0 && table_ack_emit(g_table_fd, 1) != 0) return 1;
+    if (g_table_fd >= 0 && g_table_feed.len && !table_pipe_readable()) table_pipe_lost();
     if (g_fakeip_state_path) fakeip_state_load(g_fakeip_state_path);
 
     /* Rehydrate the DNAT map AND the channel sets after a (re)start. fw4 reload /

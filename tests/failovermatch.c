@@ -30,6 +30,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <errno.h>
+#include "platform.h"
 
 int rule_added = 0;
 int rule_deleted = 0;
@@ -42,6 +44,10 @@ static int g_cmd_n;
  * проверкой и привязкой, таблица занята, нет прав. Подделать это можно только здесь —
  * настоящего ядра у стенда нет. */
 int g_route_add_fails = 0;
+static int g_rule_add_fails;
+static const char *g_blackhole_fault;
+static int g_rule_appears;
+static const char *g_rules = "";
 
 int run_quiet(const char *const argv[]) {
     if (!argv || !argv[0]) return -1;
@@ -74,6 +80,11 @@ int run_quiet(const char *const argv[]) {
     /* Отказывает только привязка к устройству: blackhole в ту же таблицу обязан
      * пройти, иначе стенд проверял бы не то. */
     if (g_route_add_fails && strstr(joined, "route replace default dev")) return 2;
+    if (g_blackhole_fault && !strcmp(joined, g_blackhole_fault)) return EACCES;
+    if (g_rule_add_fails && strstr(joined, "rule add")) {
+        if (g_rule_appears) g_rules = "100: from all fwmark 0x100000/0xff00000 lookup 301\n";
+        return g_rule_add_fails;
+    }
     return 0;
 }
 
@@ -98,7 +109,6 @@ static int cmd_count(const char *line) {
 }
 
 /* Что «ответит» ядро на запросы состояния. */
-static const char *g_rules = "";
 static const char *g_routes = "";
 
 /* Состояние ядра — из памяти: правила (table < 0) и таблица выхода. */
@@ -570,7 +580,129 @@ static void tick(const char *rules, const char *routes) {
     cmd_failover("/dev/null", 0);
 }
 
-int main(void) {
+struct route_events {
+    int switched, failed;
+    char out[32], from[32], to[32], why[16], member[32];
+};
+
+static void route_event(void *arg, const struct fo_event *e) {
+    struct route_events *ev = arg;
+    if (e->kind == FO_EV_SWITCHED) ev->switched++;
+    else if (e->kind == FO_EV_FAILED) ev->failed++;
+    else return;
+    snprintf(ev->out, sizeof(ev->out), "%s", e->out);
+    snprintf(ev->from, sizeof(ev->from), "%s", e->from ? e->from : "");
+    snprintf(ev->to, sizeof(ev->to), "%s", e->to ? e->to : "");
+    snprintf(ev->why, sizeof(ev->why), "%s", e->why);
+    snprintf(ev->member, sizeof(ev->member), "%s", e->member ? e->member : "");
+}
+
+static void blackhole_events(void) {
+    g_rules = RULES_WITH;
+    for (int live = 0; live <= 1; live++) {
+        const char *op = live ? "ip route replace blackhole default metric 65535 table 300"
+                              : "ip route replace blackhole default table 300";
+        for (int fault = 0; fault <= 1; fault++) {
+            out_set(live ? "lo" : "nodev", FAIL_DROP);
+            state_write("active", live ? "vl - 0\n" : "vl lo 0\n");
+            struct route_events events = {0};
+            g_routes = "";
+            g_cmd_n = 0;
+            g_blackhole_fault = fault ? op : NULL;
+            failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+            check("проход запросил нужный маршрут", cmd_seen(op), 1);
+            check("событие перехода — только после подтверждения", events.switched + events.failed, !fault);
+            if (live)
+                check("отказ запаса не вызывает основной blackhole", cmd_seen("blackhole default table 300"), 0);
+            if (fault) {
+                char active[32];
+                active_dev(active, sizeof(active));
+                check("active отражает здоровье, включая неподтверждённый выбор", !strcmp(active, live ? "lo" : "-"), 1);
+                /* Даже частичный успех уже виден в таблице. Больше active не подменяем. */
+                g_routes = live ? "default dev lo scope link\n" : "blackhole default metric 65535\n";
+                g_blackhole_fault = NULL;
+                g_cmd_n = 0;
+                failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+                check("повтор действительно подтвердил обязательный маршрут", cmd_seen(op), 1);
+            }
+            check("ровно один нужный переход", events.switched == live && events.failed == !live, 1);
+            check("переход сохранил откуда, куда и почему", !strcmp(events.from, live ? "" : "lo") &&
+                  !strcmp(events.to, live ? "lo" : "") && !strcmp(events.why, live ? "recovered" : "down"), 1);
+            g_routes = live ? "default dev lo scope link\nblackhole default metric 65535\n"
+                            : "blackhole default\nblackhole default metric 65535\n";
+            g_cmd_n = 0;
+            failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+            check("стабильный проход — без события и повторной привязки", events.switched + events.failed == 1 && !cmd_seen(op), 1);
+        }
+    }
+    /* Не объявлять recovered, если предшествующий failed так и не был подтверждён. */
+    struct route_events events = {0};
+    out_set("nodev", FAIL_DROP);
+    state_write("active", "vl lo 0\n");
+    g_blackhole_fault = "ip route replace blackhole default table 300";
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    g_blackhole_fault = NULL;
+    out_set("lo", FAIL_DROP);
+    g_cmd_n = 0;
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("возврат к исходному выбору подтверждается без ложной пары событий",
+          !events.switched && !events.failed && cmd_seen("default dev lo table 300"), 1);
+
+    /* Член и группа имеют разные таблицы и подтверждаются независимо. */
+    events = (struct route_events){0};
+    out_set_wg_group();
+    state_write("active", "wg - 0\nall - 0\n");
+    g_rules = RULES_WITH;
+    g_routes = "default dev lo scope link\nblackhole default metric 65535\n";
+    g_blackhole_fault = "ip route replace blackhole default metric 65535 table 301";
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("член уже переключён, группа ещё нет", events.switched == 1 && !strcmp(events.out, "wg"), 1);
+    g_blackhole_fault = NULL;
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("группа подтвердилась позже и называет своего живого члена", events.switched == 2 &&
+          !strcmp(events.out, "all") && !strcmp(events.member, "wg") && !strcmp(events.why, "recovered"), 1);
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("событие группы не дублируется", events.switched + events.failed, 2);
+
+    /* В промежутке может прийти ручной select: даже если статус уже называет
+     * этот лист, успех разрешён только после ACK. Следующий проход не дублирует его. */
+    events = (struct route_events){0};
+    char path[128];
+    snprintf(path, sizeof(path), "%s/spec", g_dir);
+    steer_set_keep_dir_of(path);
+    state_write("active", "wg lo 0\nall - 0\n");
+    g_blackhole_fault = "ip route replace blackhole default metric 65535 table 301";
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("select не поглощает ожидающий переход при отказе",
+          fog_select(&g_spec, &fo_store_files, "all", "wg", 1, route_event, &events, stdout), 1);
+    check("до подтверждения select тоже молчит", events.switched + events.failed, 0);
+    g_blackhole_fault = NULL;
+    check("select подтвердил ожидающий переход",
+          fog_select(&g_spec, &fo_store_files, "all", "wg", 1, route_event, &events, stdout), 0);
+    check("один switched от select", events.switched == 1 && !strcmp(events.why, "select") && !strcmp(events.member, "wg"), 1);
+    failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+    check("после select сторож не повторяет событие", events.switched + events.failed, 1);
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "rule-fault")) {
+        setenv("STEER_RULE_PREF", "100", 1);
+        plat_select("openwrt");
+        g_route_hook = run_quiet;
+        g_ip_show = fake_ip_show;
+        g_rules = "200: from all fwmark 0x100000/0xff00000 lookup 301\n";
+        g_rule_add_fails = EACCES;
+        if (rule_ensure(0x100000, 301) != EACCES ||
+            !cmd_seen("rule add") || cmd_seen("rule del")) return 1;
+        g_cmd_n = 0;
+        g_rule_add_fails = EEXIST;
+        if (rule_ensure(0x100000, 301) != EEXIST || cmd_seen("rule del")) return 2;
+        g_cmd_n = 0;
+        g_rule_appears = 1;
+        if (rule_ensure(0x100000, 301) || !cmd_seen("rule del")) return 3;
+        puts("rule-fault: OK");
+        return 0;
+    }
     /* Маршруты таблиц выходов демон ставит сообщением rtnetlink (route_put): стенду — командой
      * словами в тот же журнал run_quiet, что и прежде. */
     g_route_hook = run_quiet;
@@ -587,6 +719,11 @@ int main(void) {
     g_upstream_probe = fake_upstream;
     g_dev_rx = fake_rx;
 
+    if (argc > 1 && !strcmp(argv[1], "blackhole4")) {
+        blackhole_events();
+        if (!g_fail) puts("blackhole4 events: OK");
+        return !!g_fail;
+    }
     /* Test sig_cleanup/cleanup_probe_rule indirectly by checking rule_deleted */
     cleanup_probe_rule();
     if (rule_deleted != 1) {

@@ -580,23 +580,6 @@ void fog_adopt(struct spec *sp, struct fo_store *st) {
 
 /* ---- select ------------------------------------------------------------------------------- */
 
-/* Запись active: устройство выхода и серия. "" — записи нет. */
-static void active_of(struct fo_store *st, const char *out, char *dev, size_t n, int *streak) {
-    dev[0] = '\0';
-    if (streak) *streak = 0;
-    char *text = rec_read(st, "active");
-    char val[96];
-    if (text && rec_get(text, out, val, sizeof(val))) {
-        char d[32] = "";
-        int sk = 0;
-        if (sscanf(val, "%31s %d", d, &sk) >= 1) {
-            snprintf(dev, n, "%s", d);
-            if (streak) *streak = sk;
-        }
-    }
-    free(text);
-}
-
 static int dev_up(const char *dev) {
     char path[128];
     snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", dev);
@@ -641,8 +624,8 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
     snprintf(was, sizeof(was), "%s", go->failed ? "-" : go->device);
     char line[80];
     snprintf(line, sizeof(line), "%s %s", gname, mname);
-    rec_set(st, "select", gname, line);
     if (!route) {
+        rec_set(st, "select", gname, line);
         fprintf(out, "steer: группа %s — выбран %s; ядро выключено, выбор применится при "
                      "включении\n", gname, mname);
         return 0;
@@ -652,16 +635,21 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
      * active: «-» — отказ). Записи нет (сторож ещё не проходил) — по наличию устройства. */
     const struct output *m = spec_out(sp, g->members[k]);
     char mdev[32];
-    active_of(st, m->name, mdev, sizeof(mdev), NULL);
+    active_get_st(st, m->name, mdev, sizeof(mdev));
     int alive = strcmp(mdev, "-") != 0;
     if (!mdev[0]) {
         snprintf(mdev, sizeof(mdev), "%s", m->device);
         alive = dev_up(mdev);
     }
+    /* При незавершённом переходе подхват уже видит свежую пробу, но это не ACK.
+     * Подтвердить выбор и только затем обычной строкой active закрыть переход. */
+    struct fo_active_record a;
+    fo_active_read(st, go->name, &a);
+    if (a.why[0]) snprintf(was, sizeof(was), "%s", a.from);
     char gline[96];
     if (alive) {
         int moved = strcmp(was, mdev) != 0;
-        if (moved) bind_device(go, mdev);
+        if ((moved || a.why[0]) && bind_device(go, mdev)) return 1;
         snprintf(gline, sizeof(gline), "%s %s 0", go->name, mdev);
         rec_set(st, "active", go->name, gline);
         /* Событие — только если маршрут группы действительно сменился (повтор того же выбора —
@@ -678,7 +666,7 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
          * Группа получает свой on_fail, пока выбранный член не поднимется (сторож вернёт трафик
          * на него сам, как только его проход скажет «жив»). */
         int moved = strcmp(was, "-") != 0;
-        if (moved) fo_fail_apply(go);
+        if ((moved || a.why[0]) && fo_fail_apply(go)) return 1;
         snprintf(gline, sizeof(gline), "%s - 0", go->name);
         rec_set(st, "active", go->name, gline);
         const char *of = go->on_fail == FAIL_DROP ? "drop" : go->on_fail == FAIL_ZAPRET ? "zapret"
@@ -692,6 +680,7 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
         fprintf(out, "steer: группа %s — выбран %s, но он не работает: трафик группы по on_fail=%s, "
                      "пока %s не поднимется\n", gname, mname, of, mname);
     }
+    rec_set(st, "select", gname, line);
     /* Запись groups — выбранный член сразу, чтобы status не ждал прохода. */
     char *text = rec_read(st, "groups");
     /* Живые члены — в куче по длине записи: у группы balance на сотню членов строка длиннее

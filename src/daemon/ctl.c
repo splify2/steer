@@ -1626,9 +1626,8 @@ static void check_done(struct conn *c, int code) {
  * --dry-run` по нему; текст набора правил (stdout) не нужен и не копится, stderr —
  * предупреждения и причина отказа — идёт в ответ.
  *
- * Идёт в очереди изменяющих, хотя спеку не трогает: dry-run не чисто читающий — он раздаёт
- * выходам метки в реестре каталога состояния (registry_assign в cmd_apply), и проверка,
- * идущая одновременно с чужим apply, писала бы реестр посреди его применения. */
+ * Остаётся в общей очереди: dry-run читает действующие назначения и файлы списков,
+ * которые меняют соседние команды, но не записывает назначения кандидата. */
 static void st_check(struct conn *c) {
     if (ctl_write_tmp(c->srv->cf.spec, c->q.body, c->q.body_n, c->tmp, sizeof(c->tmp)) != 0) {
         resp_error(&c->resp, "internal", "не удалось записать временный файл спеки");
@@ -2572,7 +2571,11 @@ static void st_plugin(struct conn *c) {
 
 /* plugin-reload: реестр плагинов ядра заново, затем то же, что reload (спека, помощники, правила). */
 static void st_plugin_reload(struct conn *c) {
-    if (plugin_reload) plugin_reload(NULL);
+    if (plugin_reload && plugin_reload(NULL) < 0) {
+        resp_error(&c->resp, "internal", "не удалось перечитать реестр плагинов");
+        conn_reply(c);
+        return;
+    }
     st_reload(c);
 }
 
@@ -3895,4 +3898,3 @@ int ctl_client_main(int argc, char **argv) {
     free(resp.p);
     return ok ? 0 : 1;
 }
-

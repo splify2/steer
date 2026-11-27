@@ -1057,14 +1057,18 @@ check "refuses an address that is not address-shaped" "2" "$?"
 # ---- registry ----------------------------------------------------------------
 # An output must keep its mark across runs: a reshuffle leaves stale `ip rule`
 # entries pointing at the wrong table, and traffic silently takes another path.
+mkdir -p "$tmp/state"
+printf 'vpn 100000 300\n' > "$tmp/state/registry"
 before="$(cat "$tmp/state/registry")"
 sed 's|"vpn":    { "kind": "interface", "device": "wg0" }|"vpn": { "kind": "interface", "device": "wg0" }, "extra": { "kind": "interface", "device": "wg1" }|' \
     "$tmp/spec.json" > "$tmp/s5.json"
 "$BIN" apply --dry-run --spec "$tmp/s5.json" $S >/dev/null 2>&1
-check "adding an output keeps the existing marks" "$before" \
-    "$(grep -v '^extra ' "$tmp/state/registry")"
-check "and gives the new one its own" "1" \
-    "$(grep -c '^extra ' "$tmp/state/registry")"
+check "dry-run with a new output leaves the registry unchanged" "$before" \
+    "$(cat "$tmp/state/registry")"
+plan="$("$BIN" apply-plan --spec "$tmp/s5.json" $S 2>/dev/null)"
+check "the plan keeps the existing mark and gives the new output its own" \
+    "$(printf 'vpn 100000 300\nextra 200000 301')" \
+    "$(printf '%s\n' "$plan" | awk '$1 == "out" && ($2 == "vpn" || $2 == "extra") {print $2, $3, $4}')"
 
 # ---- пропавший список канала не рушит ВЕСЬ набор правил -----------------------
 # Так выглядит роутер после обновления образа: спека выжила (она в keep.d), а каталог
@@ -1565,7 +1569,8 @@ check "ingress: правила каналов — те же, в том же по
 check "ingress: каналы групп с картой (balance, order, latency) — те же и на ingress" \
     "$(printf '%s\n' "$carded" | sort)" \
     "$(chain_of "$iout" ingress_mark | grep -oF "$carded" | sort)"
-regmark() { printf '0x%08x' "0x$(awk -v o="$1" '$1 == o { print $2 }' "$tmp/st-ing/registry")"; }
+iplan="$("$BIN" apply-plan $IS --nftc 0 2>/dev/null)"
+regmark() { printf '0x%08x' "0x$(printf '%s\n' "$iplan" | awk -v o="$1" '$1 == "out" && $2 == o { print $3 }')"; }
 bmark="$(regmark bal)"
 bchain="$(chain_of "$pout" prerouting_mark | sed -n 's/.*counter goto \(bal_[0-9]*\) comment "steer:bal_all.*/\1/p' | head -n 1)"
 check "ingress: balance — метка группы на ingress (IPv4 и IPv6)" "2" \
@@ -1779,4 +1784,3 @@ check "порядок: выключенное правило между — не
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
-

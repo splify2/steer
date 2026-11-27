@@ -36,7 +36,7 @@ static int steer_table_slot(int table) {
  * and the symptom is traffic silently taking someone else's path. */
 static void rt_tables_write(const struct spec *s);
 
-int registry_assign(struct spec *s, struct err *e) {
+int registry_plan(struct spec *s, struct err *e) {
     char path[512];
     snprintf(path, sizeof(path), "%s/registry", steer_state_dir());
     FILE *f = fopen(path, "r");
@@ -111,18 +111,16 @@ int registry_assign(struct spec *s, struct err *e) {
         s->out[i].table = steer_slot_table(slot);
     }
     free(taken);
-    /* Прежде чем писать — сравнить с тем, что уже на диске. registry_assign
-     * зовут все подкоманды, включая status, который интерфейс опрашивает каждые
-     * пять секунд: безусловная перезапись — это ~17 тысяч записей файла в сутки
-     * с неизменным содержимым. Сравнивается будущий текст целиком, а не «были ли
-     * новые назначения»: перезапись заодно вычищает строки исчезнувших выходов,
-     * и пропускать её можно только когда файл уже дословно совпадает. */
+    return 0;
+}
+
+char *registry_render(const struct spec *s, struct err *e) {
     /* Строка — не больше 96 байт (имя ≤ 31, метка ≤ 8, таблица ≤ 11, пробелы и конец строки), и
      * буфер берётся по числу выходов, а не по числу выходов, которое кто-то когда-то назвал
      * пределом. */
     size_t wcap = s->out_n * 96 + 1, wn = 0;
     char *want = malloc(wcap);
-    if (!want) return err_set(e, "%s", "out of memory: registry text");
+    if (!want) { err_set(e, "%s", "out of memory: registry text"); return NULL; }
     for (size_t i = 0; i < s->out_n; i++)
         if (out_needs_mark(&s->out[i])) {
             int w = snprintf(want + wn, wcap - wn, "%s %x %d\n",
@@ -130,22 +128,39 @@ int registry_assign(struct spec *s, struct err *e) {
             if (w < 0 || (size_t)w >= wcap - wn) break; /* не бывает, но не рвём буфер */
             wn += (size_t)w;
         }
-    f = fopen(path, "r");
+    want[wn] = '\0';
+    return want;
+}
+
+void registry_publish(const struct spec *s, const char *want) {
+    /* status тоже сохраняет назначения; сравниваем весь текст, чтобы не писать прежнее
+     * при каждом опросе, но удалять строки исчезнувших выходов. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/registry", steer_state_dir());
+    size_t wn = strlen(want);
+    FILE *f = fopen(path, "r");
     if (f) {
         char *have = malloc(wn + 1);
         size_t hn = have ? fread(have, 1, wn + 1, f) : (size_t)-1;
         fclose(f);
         int same = have && hn == wn && memcmp(have, want, wn) == 0;
         free(have);
-        if (same) { free(want); return 0; }
+        if (same) return;
     }
     mkdir(steer_state_dir(), 0755);
     f = fopen(path, "w");
-    if (!f) { free(want); return 0; }   /* best effort: apply still works, next boot re-assigns */
+    if (!f) return;   /* best effort: apply still works, next boot re-assigns */
     fwrite(want, 1, wn, f);
     fclose(f);
-    free(want);
     rt_tables_write(s);
+}
+
+int registry_assign(struct spec *s, struct err *e) {
+    if (registry_plan(s, e) < 0) return -1;
+    char *want = registry_render(s, e);
+    if (!want) return -1;
+    registry_publish(s, want);
+    free(want);
     return 0;
 }
 

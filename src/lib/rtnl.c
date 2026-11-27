@@ -437,12 +437,12 @@ int rtnl_rule_mark(int add, int fam, uint32_t mark, uint32_t mask, int table, in
     nlbuf_put_u32(&b, FRA_FWMASK, mask);
     nlbuf_put_u32(&b, FRA_TABLE, (uint32_t)table);
     if (prio > 0) nlbuf_put_u32(&b, FRA_PRIORITY, (uint32_t)prio);
-    int rc = rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
-    return add && rc == EEXIST ? 0 : rc;
+    return rtnl_talk(buf, msg_end(&b, nh), NULL, NULL);
 }
 
 int rtnl_rule_fwmark(int fam, uint32_t mark, uint32_t mask, int table, int prio) {
-    return rtnl_rule_mark(1, fam, mark, mask, table, prio);
+    int rc = rtnl_rule_mark(1, fam, mark, mask, table, prio);
+    return rc == EEXIST ? 0 : rc;
 }
 
 int rtnl_route_default(int fam, int table, int type, int ifindex, int metric) {

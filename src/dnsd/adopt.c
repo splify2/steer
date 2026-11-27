@@ -1,5 +1,6 @@
 #include "dnsd_int.h"
 #include "tabfmt.h"
+#include "table_ack.h"
 #include <poll.h>
 #include <syslog.h>             /* константы LOG_*; сам syslog(3) не зовётся (stderr_rescue) */
 
@@ -245,7 +246,8 @@ void adopt_conn_event(int *slot) {
     }
     struct stat sb;
     int ok = m == 6 && !memcmp(buf, "adopt\n", 6) && nfd >= 1 && !(mh.msg_flags & MSG_CTRUNC) &&
-             fstat(fds[0], &sb) == 0 && S_ISFIFO(sb.st_mode);
+             fstat(fds[0], &sb) == 0 &&
+             (S_ISFIFO(sb.st_mode) || (S_ISSOCK(sb.st_mode) && table_ack_is_socket(fds[0])));
     if (!ok) {
         for (size_t i = 0; i < nfd; i++) close(fds[i]);
         conn_drop(slot);

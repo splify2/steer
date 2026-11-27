@@ -91,6 +91,7 @@ cc_defaults {
         "src/dnsd/fakeip.c",
         "src/dnsd/table.c",
         "src/dnsd/tabfmt.c",
+        "src/dnsd/table_ack.c",
         "src/dnsd/dlog.c",
         "src/dnsd/realip.c",
         "src/dnsd/adopt.c",

@@ -67,7 +67,7 @@ void rule_copies_free(struct rule_copies *c);
  * Наружу — ради команды select (fogroup.c): выбранный человеком член не работает, — и ради apply
  * (apply_routing_one): группа v2, у которой по известным приговорам членов живого нет, получает
  * on_fail сразу, а не устройство до первого прохода. */
-void fo_fail_apply(const struct output *o);
+int fo_fail_apply(const struct output *o);
 
 /* ---- прочее, что тест дёргает напрямую, в обход cmd_failover ----------------------- */
 void active_get(const char *out, char *dev, size_t n);
@@ -77,6 +77,13 @@ int device_present(const char *dev);
 /* Устройство выхода out по записи active памяти st ("" — записи нет, "-" — отказ). */
 struct fo_store;
 void active_get_st(struct fo_store *st, const char *out, char *dev, size_t n);
+/* dev и streak — выбор по здоровью и серия гистерезиса. Только пока привязка
+ * не подтверждена, why и from помнят причину и исходное состояние перехода. */
+struct fo_active_record {
+    char dev[32], from[32], why[16];
+    int streak;
+};
+void fo_active_read(struct fo_store *st, const char *out, struct fo_active_record *a);
 int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose);
 void cleanup_probe_rule(void);
 int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev);

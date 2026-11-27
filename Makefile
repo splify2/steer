@@ -128,6 +128,8 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@sh tests/buildmatch.sh
 	@sh tests/abimatch.sh
 	@sh tests/srsmatch.sh
+	@sh tests/fit-output.sh
+	@python3 tests/fit-waste.py
 	@$(BUILD)/srsunit
 	@$(BUILD)/procscanmatch
 	@$(BUILD)/modelmatch
@@ -464,7 +466,7 @@ $(BUILD)/abihost: tests/abihost.c src/daemon/plugso.c src/daemon/loop.c src/daem
 # объектов, что у modelmatch; манифесты фальшивых плагинов стенд пишет сам во временный каталог.
 $(BUILD)/pluginmodel: tests/pluginmodel.c tests/unit.h $(MODEL_KINDS) src/kinds/awg.c $(CORE_HDR)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/pluginmodel.c $(MODEL_KINDS) src/kinds/awg.c
+	$(CC) $(CFLAGS) -Wl,--wrap=realloc -o $@ tests/pluginmodel.c $(MODEL_KINDS) src/kinds/awg.c
 
 # Обход /proc (src/lib/procscan.c): хвост длинной командной строки.
 $(BUILD)/procscanmatch: tests/procscanmatch.c tests/unit.h src/lib/procscan.c src/lib/procscan.h
@@ -933,3 +935,37 @@ $(BUILD)/vlessprobematch: tests/vlessprobematch.c src/proto/vless/client.c src/p
 .PHONY: dns-cache-generation-test
 dns-cache-generation-test: all
 	unshare -n sh -c 'ip link set lo up && python3 tests/dns_reused_upstream_cache_test.py --binary $(BUILD)/steer'
+
+.PHONY: registry-test
+test: registry-test
+registry-test: $(BUILD)/steerd-registry-test
+	@python3 tests/registrymatch.py $<
+$(BUILD)/steerd-registry-test: tests/registry-backend.c $(CORE_SRC) $(CORE_HDR) VERSION
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC) $< -Wl,--wrap=socket,--wrap=steer_rt_tables_dir,--wrap=steer_tmp_template
+
+.PHONY: apply-rule-fault-test
+apply-rule-fault-test: $(BUILD)/steerd-rule-fault
+	sh tests/apply-rule-fault.sh
+	RULE_TEST_MODE=blackhole4 sh tests/apply-rule-fault.sh
+$(BUILD)/steerd-rule-fault: $(CORE_SRC) $(CORE_HDR) tests/apply-rule-fault.c VERSION
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(DEFS) -Wl,--wrap=sendto,--wrap=socket -o $@ $(CORE_SRC) tests/apply-rule-fault.c
+
+.PHONY: dns-table-ack-test dns-prepare-fault-test plugin-reopen-test
+dns-table-ack-test: $(BUILD)/table-ack-test $(BUILD)/steerd
+	$(BUILD)/table-ack-test
+	unshare -n sh -ec 'ip link set lo up; exec python3 -B tests/table_ack_integration.py --steerd "$(abspath $(BUILD)/steerd)"'
+$(BUILD)/table-ack-test: tests/table_ack_test.c src/dnsd/table_ack.c src/dnsd/table_ack.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc/dnsd -o $@ tests/table_ack_test.c src/dnsd/table_ack.c
+$(BUILD)/dns-prepare-fault/steerd: $(CORE_SRC) $(CORE_HDR) tests/dns_prepare_fault_wrap.c VERSION
+	@mkdir -p $(BUILD)/dns-prepare-fault
+	$(CC) $(CFLAGS) $(DEFS) -Wl,--wrap=tabfmt_feed,--wrap=dch_rules_load,--wrap=strdup -o $@ $(CORE_SRC) tests/dns_prepare_fault_wrap.c
+$(BUILD)/dns-prepare-fault/steer: $(CLIENT_SRC) src/platform/platform.h | $(BUILD)/dns-prepare-fault/steerd
+	@mkdir -p $(BUILD)/dns-prepare-fault
+	$(CC) $(CFLAGS) -o $@ $(CLIENT_SRC)
+dns-prepare-fault-test: $(BUILD)/dns-prepare-fault/steer
+	unshare -n sh -ec 'ip link set lo up; exec python3 -B tests/dns_prepare_fault_test.py --binary "$(abspath $(BUILD)/dns-prepare-fault/steer)"'
+plugin-reopen-test:
+	sh tests/pluginmgr-reopen.sh
