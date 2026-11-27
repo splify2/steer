@@ -221,6 +221,14 @@ static void merge_lossless(struct list *l) {
     merge_sorted(l);
 }
 
+/* После слияния диапазоны не пересекаются. Вся IPv4 /0 занимает 2^32 адресов. */
+static uint64_t merged_addresses(const struct list *l) {
+    uint64_t total = 0;
+    for (size_t i = 0; i < l->n; i++)
+        total += (uint64_t)l->v[i].hi - l->v[i].lo + 1;
+    return total;
+}
+
 /* ---- exclusions ---------------------------------------------------------- */
 /* Addresses that must NOT be swallowed by a widening — in splify's case the RU/CN
  * list, because an address dragged into a tunnel-bound range loses its direct
@@ -242,10 +250,7 @@ static int excl_hits(uint32_t lo, uint32_t hi) {
 /* ---- density collapse ---------------------------------------------------- */
 /* One pass over the sorted list: for each /LEVEL network, count the entries that
  * fall entirely inside it; if there are at least MIN_COUNT of them and the network
- * holds nothing excluded, replace them all with the network itself.
- *
- * Returns the number of addresses added to the covered set (the "waste"), so the
- * caller can report the real cost instead of a reassuring element count. */
+ * holds nothing excluded, replace them all with the network itself. */
 /* What to do with a candidate network that holds excluded addresses. Measured on
  * the RU blocklist against the 44 095-prefix RU/CN exclusion:
  *
@@ -276,10 +281,9 @@ static void punch_record(uint32_t lo, uint32_t hi) {
     }
 }
 
-static uint64_t collapse_level(struct list *l, unsigned level, size_t min_count) {
-    if (level == 0 || level > 32 || l->n == 0) return 0;
+static void collapse_level(struct list *l, unsigned level, size_t min_count) {
+    if (level == 0 || level > 32 || l->n == 0) return;
     uint32_t mask = (uint32_t)(0xFFFFFFFFu << (32 - level));
-    uint64_t waste = 0;
 
     /* Уплотнение НА МЕСТЕ: каждая ветка записывает не больше диапазонов, чем
      * прочла (широкий — 1 за 1, схлопывание — 1 за j-i, сохранение — j-i за
@@ -299,20 +303,14 @@ static uint64_t collapse_level(struct list *l, unsigned level, size_t min_count)
             i++;
             continue;
         }
-        size_t j = i, count = 0;
-        uint64_t covered = 0;
-        while (j < l->n && l->v[j].lo >= net && l->v[j].hi <= net_end) {
-            covered += (uint64_t)l->v[j].hi - l->v[j].lo + 1;
-            count++;
-            j++;
-        }
+        size_t j = i;
+        while (j < l->n && l->v[j].lo >= net && l->v[j].hi <= net_end) j++;
         int blocked = excl_hits(net, net_end);
-        if (count >= min_count && (!blocked || g_excl_mode == EXCL_PUNCH)) {
+        if (j - i >= min_count && (!blocked || g_excl_mode == EXCL_PUNCH)) {
             if (blocked) punch_record(net, net_end);
             l->v[w].lo = net;
             l->v[w].hi = net_end;
             w++;
-            waste += ((uint64_t)net_end - net + 1) - covered;
         } else {
             for (size_t k = i; k < j; k++) l->v[w++] = l->v[k];
         }
@@ -321,7 +319,6 @@ static uint64_t collapse_level(struct list *l, unsigned level, size_t min_count)
     l->n = w;
     /* Выход упорядочен по построению — сортировка не нужна, только слияние. */
     merge_sorted(l);
-    return waste;
 }
 
 /* ---- output -------------------------------------------------------------- */
@@ -617,6 +614,7 @@ int aggregate_main(int argc, char **argv) {
      * to spare must not route one extra address, which is why this never starts
      * from the widest level. */
     if (budget && l.n > budget) {
+        const uint64_t initial = merged_addresses(&l);
         const char *p = levels;
         while (*p && l.n > budget) {
             char *endp = NULL;
@@ -637,12 +635,15 @@ int aggregate_main(int argc, char **argv) {
             while (*p == ' ' || *p == ',') p++;
             if (lvl == 0 || lvl > 32) continue;
             size_t before = l.n;
-            waste += collapse_level(&l, lvl, mc);
+            collapse_level(&l, lvl, mc);
             /* Only a level that actually changed something gets reported — saying
              * "level 16" for a run where nothing collapsed reads as if the widest
              * rung had been used. */
             if (l.n != before) used_level = lvl;
         }
+        /* Каждая ступень сохраняет или расширяет объединение. Соседний
+         * диапазон может уже покрывать край кандидата, не входя в его j-i. */
+        waste = merged_addresses(&l) - initial;
     }
 
     /* Dropping the tail is a hole in coverage, not a smaller list, so it is OPT-IN:

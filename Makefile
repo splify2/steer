@@ -194,6 +194,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch 
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/fit-output.sh
+	@STEER=$(BUILD)/steer python3 tests/fit-waste.py
 	@sh tests/snapshot.sh
 	@sh tests/v2match.sh
 	@sh tests/specschemamatch.sh
