@@ -39,4 +39,11 @@ cd "$SRC"
 if [ "$OWNER" != "0:0" ]; then
 	trap 'chown -R "$OWNER" "$SRC/${BUILD:-build}" 2>/dev/null || true' EXIT
 fi
-STEER_WOLFSSL="$WSRC" CC="zig cc" BUILD="${BUILD:-build}" STEER_NGTCP2="${STEER_NGTCP2:-/opt/ngtcp2}" sh tests/ext-test.sh
+# Хостовые glibc-бинарники не запускаются в Alpine: вспомогательные программы
+# строятся тем же Zig отдельно от результатов make test на runner.
+BUILD=${BUILD:-build}
+make -j"${JOBS:-4}" BUILD="$BUILD" CC="zig cc" all "$BUILD/pkhooks" "$BUILD/abihost"
+TEST_BUILD=$(cd "$BUILD" && pwd)
+STEER="$TEST_BUILD/steer" STEERD="$TEST_BUILD/steerd" \
+STEER_WOLFSSL="$WSRC" CC="zig cc" BUILD="$BUILD" \
+STEER_NGTCP2="${STEER_NGTCP2:-/opt/ngtcp2}" sh tests/ext-test.sh

@@ -230,7 +230,7 @@ jobs:
           # Логика — в отдельном скрипте, а не строкой в `docker run -c`: тот же довод, что
           # у build/build-ext.sh, там экранирование внутри кавычек однажды стоило сборки.
           docker run --rm -v "$PWD:/src" -v "$S2P:/usr/local/bin/s2p:ro" \
-            -e BUILD=build/ext-ci -e S2P=/usr/local/bin/s2p -w /src --entrypoint sh \
+            -e BUILD=build/ext-ci -e S2P=/usr/local/bin/s2p -e PLUGIN_SDK=/src/.plugin-sdk -w /src --entrypoint sh \
             "${STEER_BUILDER_IMAGE:-steer-builder:wolfssl}" \
             /src/build/ext-test-image.sh 2>&1 | tee /tmp/ext-test.log || true
           # `|| true` не прощает отказ, а отдаёт решение проверке ниже: иначе падение прогона

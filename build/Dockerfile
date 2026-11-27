@@ -57,7 +57,7 @@ RUN sh /opt/steer-wolfssl-fetch.sh /opt/wolfssl \
 # патчи. Другая версия или другой патч — другой слой, образ пересобирается сам. Утилита patch в
 # базовом Alpine отсутствует (busybox собран без неё), поэтому ставится пакетом. Готовых .a нет
 # по той же причине, что у wolfSSL: рецепт build/ngtcp2/build.sh собирает под нужную цель.
-RUN apk add --no-cache patch
+RUN apk add --no-cache patch make
 COPY ngtcp2/fetch.sh /opt/steer-ngtcp2/fetch.sh
 COPY ngtcp2/patches /opt/steer-ngtcp2/patches
 RUN sh /opt/steer-ngtcp2/fetch.sh /opt/ngtcp2 \
