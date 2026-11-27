@@ -82,8 +82,9 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: $(BUILD)/clock64match $(BUILD)/loopfairmatch
+test: $(BUILD)/clock64match $(BUILD)/loopfairmatch $(BUILD)/hy2rasmbudget
 test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/nldonematch $(BUILD)/b3match $(BUILD)/subpq $(BUILD)/abihost $(BUILD)/abihost-static $(BUILD)/steerd-static $(BUILD)/pluginmodel $(BUILD)/pkhooks $(BUILD)/pkmatch $(BUILD)/pmkindmatch $(BUILD)/foprobematch $(BUILD)/tunfloodmatch $(BUILD)/hsdlmatch $(BUILD)/httpcspinmatch
+	@$(BUILD)/hy2rasmbudget
 	@$(BUILD)/clock64match
 	@$(BUILD)/loopfairmatch
 	@sh tests/run.sh
@@ -910,3 +911,13 @@ clean:
 	       $(BUILD)/devupmatch $(BUILD)/ndk \
 	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out
+
+$(BUILD)/hy2rasmbudget: tests/hy2rasmbudget.c src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2wire.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/hy2rasmbudget.c src/proto/hysteria2/hy2wire.c -pthread -Wl,--wrap=malloc,--wrap=calloc
+
+.PHONY: protocol-test
+protocol-test:
+	python3 tests/tls13abi.py --baseline v2.1.4
+	python3 tests/tls13post.py --wolfssl-library "$(WOLFSSL_LIBRARY)" --sanitize
+	python3 tests/hy2response_build.py --wolfssl-library "$(WOLFSSL_LIBRARY)" --ngtcp2-library "$(NGTCP2_LIBRARY)" --sanitize

@@ -195,7 +195,7 @@ static const uint8_t HL[257] = {
 /* Развернуть строку Huffman в out (с завершающим нулём). Побитовый разбор с поиском по таблице —
  * медленно, но строк в ответе три-четыре по десятку знаков, а таблица индексов стоила бы килобайты.
  * Возвращает длину или -1: символ EOS в строке, недобор, набивка не из единиц (RFC 7541, 5.2). */
-static int huff_decode(const uint8_t *in, size_t n, char *out, size_t cap) {
+static int huff_decode(const uint8_t *in, size_t n, char *out, size_t cap, int strict) {
     uint32_t code = 0;
     unsigned len = 0;
     size_t o = 0;
@@ -205,7 +205,7 @@ static int huff_decode(const uint8_t *in, size_t n, char *out, size_t cap) {
         if (len > 30) return -1;
         for (unsigned s = 0; s < 257; s++) {
             if (HL[s] != len || HC[s] != code) continue;
-            if (s == 256) return -1;
+            if (s == 256 || (strict && (s == 0 || s == '\r' || s == '\n'))) return -1;
             /* Строка длиннее места (набивка ответа сервера — до двух килобайт) читается до конца,
              * чтобы проверить её и найти границу, но хранится только начало. */
             if (o + 1 < cap) out[o++] = (char)s;
@@ -238,14 +238,16 @@ static size_t r_qint(const uint8_t *d, size_t n, unsigned bits, uint64_t *v) {
 }
 
 /* Строка: H в бите hbit первого байта, длина — в остальных prefix битах. */
-static size_t r_str(const uint8_t *d, size_t n, unsigned prefix, char *out, size_t cap) {
+static size_t r_str(const uint8_t *d, size_t n, unsigned prefix, char *out, size_t cap, int strict) {
     uint64_t l;
     size_t k = r_qint(d, n, prefix, &l);
     if (!k || l > n - k) return 0;
     int huff = (d[0] >> prefix) & 1;
     if (huff) {
-        if (huff_decode(d + k, (size_t)l, out, cap) < 0) return 0;
+        if (huff_decode(d + k, (size_t)l, out, cap, strict) < 0) return 0;
     } else {
+        if (strict) for (size_t i = 0; i < l; i++)
+            if (!d[k + i] || d[k + i] == '\r' || d[k + i] == '\n') return 0;
         size_t keep = (size_t)l + 1 > cap ? cap - 1 : (size_t)l;      /* хранится начало, см. huff_decode */
         memcpy(out, d + k, keep);
         out[keep] = '\0';
@@ -263,16 +265,23 @@ static int static_status_val(uint64_t i) {
     return 0;
 }
 
-static void note_header(struct hy2_auth_resp *r, const char *name, const char *val) {
-    if (!strcasecmp(name, ":status")) r->status = atoi(val);
+static int note_header(struct hy2_auth_resp *r, const char *name, const char *val, int strict) {
+    if (!strcasecmp(name, ":status")) {
+        if (strict) {
+            if (r->status || strlen(val) != 3 || val[0] < '1' || val[0] > '5' ||
+                val[1] < '0' || val[1] > '9' || val[2] < '0' || val[2] > '9') return -1;
+            r->status = (val[0] - '0') * 100 + (val[1] - '0') * 10 + val[2] - '0';
+        } else r->status = atoi(val);
+    }
     else if (!strcasecmp(name, "hysteria-udp")) r->udp = !strcasecmp(val, "true");
     else if (!strcasecmp(name, "hysteria-cc-rx")) {
         if (!strcasecmp(val, "auto")) r->rx_auto = 1;
         else r->rx = strtoull(val, NULL, 10);
     }
+    return 0;
 }
 
-static int qpack_section(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why) {
+static int qpack_section(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why, int strict) {
     uint64_t v;
     size_t k = r_qint(d, n, 8, &v);
     if (!k || v != 0) { if (why) *why = "ответ ссылается на динамическую таблицу QPACK"; return -1; }
@@ -286,23 +295,26 @@ static int qpack_section(const uint8_t *d, size_t n, struct hy2_auth_resp *r, co
         if (b & 0x80) {                                 /* 1T: индекс */
             if (!(b & 0x40)) { if (why) *why = "динамическая таблица QPACK"; return -1; }
             k = r_qint(d, n, 6, &v);
-            if (!k) goto trunc;
-            if (static_is_status(v)) r->status = static_status_val(v);
+            if (!k || (strict && v > 98)) goto trunc;
+            if (static_is_status(v)) {
+                if (strict && r->status) goto status;
+                r->status = static_status_val(v);
+            }
         } else if ((b & 0xc0) == 0x40) {                /* 01NT: имя по индексу */
             if (!(b & 0x10)) { if (why) *why = "динамическая таблица QPACK"; return -1; }
             k = r_qint(d, n, 4, &v);
-            if (!k) goto trunc;
-            size_t m = r_str(d + k, n - k, 7, val, sizeof val);
+            if (!k || (strict && v > 98)) goto trunc;
+            size_t m = r_str(d + k, n - k, 7, val, sizeof val, strict);
             if (!m) goto trunc;
             k += m;
-            if (static_is_status(v)) note_header(r, ":status", val);
+            if (static_is_status(v) && note_header(r, ":status", val, strict)) goto status;
         } else if ((b & 0xe0) == 0x20) {                /* 001NH: литеральное имя */
-            size_t m1 = r_str(d, n, 3, name, sizeof name);
+            size_t m1 = r_str(d, n, 3, name, sizeof name, strict);
             if (!m1) goto trunc;
-            size_t m2 = r_str(d + m1, n - m1, 7, val, sizeof val);
+            size_t m2 = r_str(d + m1, n - m1, 7, val, sizeof val, strict);
             if (!m2) goto trunc;
             k = m1 + m2;
-            note_header(r, name, val);
+            if (note_header(r, name, val, strict)) goto status;
         } else {                                        /* 0001, 0000: после-базовые — их нет без таблицы */
             if (why) *why = "динамическая таблица QPACK";
             return -1;
@@ -310,12 +322,15 @@ static int qpack_section(const uint8_t *d, size_t n, struct hy2_auth_resp *r, co
         d += k; n -= k;
     }
     return 0;
+status:
+    if (why) *why = "негодный или повторный :status";
+    return -1;
 trunc:
     if (why) *why = "заголовки ответа не разобрать";
     return -1;
 }
 
-int hy2_auth_response(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why) {
+static int auth_response(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why, int strict) {
     memset(r, 0, sizeof *r);
     size_t off = 0;
     for (;;) {
@@ -328,13 +343,19 @@ int hy2_auth_response(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const
         if (len > (1u << 16)) { if (why) *why = "кадр ответа слишком велик"; return -1; }
         if (n - off - hdr < len) return 0;
         if (type == 0x01) {
-            if (qpack_section(d + off + hdr, (size_t)len, r, why) != 0) return -1;
+            if (qpack_section(d + off + hdr, (size_t)len, r, why, strict) != 0) return -1;
             if (!r->status) { if (why) *why = "в ответе нет :status"; return -1; }
             return 1;
         }
         if (type == 0x00) { if (why) *why = "данные раньше заголовков ответа"; return -1; }
         off += hdr + (size_t)len;                       /* незнакомый кадр, GREASE — пропустить */
     }
+}
+int hy2_auth_response(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why) {
+    return auth_response(d,n,r,why,0);
+}
+int hy2_auth_response_strict(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why) {
+    return auth_response(d,n,r,why,1);
 }
 
 /* ---- TCP ------------------------------------------------------------------------------------ */
@@ -353,28 +374,43 @@ size_t hy2_tcp_request(uint8_t *out, size_t cap, const char *host, uint16_t port
     return w.over ? 0 : w.n;
 }
 
-int hy2_tcp_response(const uint8_t *d, size_t n, struct hy2_tcp_resp *r) {
-    memset(r, 0, sizeof *r);
-    if (!n) return 0;
-    size_t off = 1;
-    uint64_t ml, pl;
-    size_t k = hy2_varint_get(d + off, n - off, &ml);
-    if (!k) return 0;
-    off += k;
-    if (ml > 4096) return -1;
-    if (n - off < ml) return 0;
-    size_t cp = ml < sizeof r->msg - 1 ? (size_t)ml : sizeof r->msg - 1;
-    memcpy(r->msg, d + off, cp);
-    r->msg[cp] = '\0';
-    off += (size_t)ml;
-    k = hy2_varint_get(d + off, n - off, &pl);
-    if (!k) return 0;
-    off += k;
-    if (pl > 4096) return -1;
-    if (n - off < pl) return 0;
-    off += (size_t)pl;
-    r->ok = d[0] == 0;
-    return (int)off;
+int hy2_tcp_response_feed(struct hy2_tcp_response_stream *s,const uint8_t *data,size_t n,
+                          size_t *consumed,struct hy2_tcp_resp *response) {
+    *consumed=0;
+    if(!data&&n) s->result=-1;
+    while(*consumed<n&&!s->result) {
+        if(s->phase==2||s->phase==4) {
+            size_t take=s->remaining<n-*consumed?(size_t)s->remaining:n-*consumed;
+            if(s->phase==2) {
+                size_t keep=sizeof s->response.msg-1-s->kept;
+                if(keep>take) keep=take;
+                if(keep) memcpy(s->response.msg+s->kept,data+*consumed,keep);
+                s->kept+=keep;s->response.msg[s->kept]=0;
+            }
+            *consumed+=take;s->remaining-=take;
+            if(!s->remaining) { if(s->phase==2) s->phase=3;else s->result=1; }
+            continue;
+        }
+        uint8_t byte=data[(*consumed)++];
+        if(!s->phase) { s->response.ok=byte==0;s->phase=1;continue; }
+        if(!s->var_have) { s->var_need=1u<<(byte>>6);s->value=byte&63u; }
+        else s->value=(s->value<<8)|byte;
+        if(++s->var_have<s->var_need) continue;
+        s->var_have=0;
+        if(s->value>4096) { s->result=-1;break; }
+        s->remaining=s->value;
+        if(s->phase==1) s->phase=s->remaining?2:3;
+        else if(s->remaining) s->phase=4;
+        else s->result=1;
+    }
+    if(s->result==1) *response=s->response;
+    return s->result;
+}
+int hy2_tcp_response(const uint8_t *data,size_t n,struct hy2_tcp_resp *response) {
+    struct hy2_tcp_response_stream stream={0};size_t consumed;
+    memset(response,0,sizeof *response);
+    int result=hy2_tcp_response_feed(&stream,data,n,&consumed,response);
+    return result>0?(int)consumed:result;
 }
 
 /* ---- UDP ------------------------------------------------------------------------------------ */
@@ -399,7 +435,7 @@ int hy2_udp_parse(const uint8_t *d, size_t n, struct hy2_udp_msg *m) {
     m->nfrag = d[7];
     uint64_t al;
     size_t k = hy2_varint_get(d + 8, n - 8, &al);
-    if (!k || al >= sizeof m->addr || n - 8 - k < al) return -1;
+    if (!k || !al || al >= sizeof m->addr || n - 8 - k < al || memchr(d+8+k,0,(size_t)al)) return -1;
     memcpy(m->addr, d + 8 + k, (size_t)al);
     m->addr[al] = '\0';
     m->data = d + 8 + k + al;
@@ -667,14 +703,51 @@ struct hy2_rasm {
     struct hy2_rasm *next;
     uint64_t t;                 /* когда пришёл первый фрагмент */
     uint32_t total;             /* сумма длин пришедших */
+    unsigned charge;            /* allocated metadata and fragment bytes */
     uint16_t pkt;
+    char address[264]; /* bind fragmented bytes to one original destination */
     uint8_t n, got;
     struct { uint8_t *p; uint16_t len; } fr[];
 };
-
+size_t hy2_rasm_local_bytes(const struct hy2_rasm *head){
+    size_t total=0;for(;head;head=head->next)total+=head->charge;return total;
+}
+size_t hy2_rasm_required(const struct hy2_rasm *head,const struct hy2_udp_msg *m){
+    if(!m||!m->nfrag||m->frag>=m->nfrag||m->n>65507||!memchr(m->addr,0,sizeof m->addr))return SIZE_MAX;
+    size_t metadata=sizeof(struct hy2_rasm)+(size_t)m->nfrag*sizeof head->fr[0];
+    size_t fragment=m->n?m->n:1;
+    for(;head;head=head->next)if(head->pkt==m->pkt&&head->n==m->nfrag&&!strcmp(head->address,m->addr)){
+        if(head->fr[m->frag].p)return 0;
+        size_t complete=head->got+1==head->n?(size_t)head->total+m->n:0;
+        if(head->got+1==head->n&&!complete)complete=1;
+        return fragment+complete;
+    }
+    return metadata+fragment+(m->nfrag==1?fragment:0);
+}
+static unsigned rasm_entries,rasm_bytes;
+static int rasm_reserve(unsigned *counter,unsigned amount,unsigned limit) {
+    unsigned old=__atomic_load_n(counter,__ATOMIC_RELAXED);
+    do { if(old>limit||amount>limit-old) return 0; }
+    while(!__atomic_compare_exchange_n(counter,&old,old+amount,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED));
+    return 1;
+}
+void hy2_rasm_usage(unsigned *entries,unsigned *bytes) {
+    if(entries) *entries=__atomic_load_n(&rasm_entries,__ATOMIC_RELAXED);
+    if(bytes) *bytes=__atomic_load_n(&rasm_bytes,__ATOMIC_RELAXED);
+}
 static void rasm_free_one(struct hy2_rasm *r) {
     for (unsigned i = 0; i < r->n; i++) free(r->fr[i].p);
+    __atomic_sub_fetch(&rasm_bytes,r->charge,__ATOMIC_RELAXED);
+    __atomic_sub_fetch(&rasm_entries,1,__ATOMIC_RELAXED);
     free(r);
+}
+void hy2_rasm_expire(struct hy2_rasm **head,uint64_t now_ms) {
+    if(!head) return;
+    for(struct hy2_rasm **p=head;*p;) {
+        struct hy2_rasm *r=*p;
+        if(now_ms<r->t||now_ms-r->t>=HY2_RASM_TTL_MS) { *p=r->next;rasm_free_one(r); }
+        else p=&r->next;
+    }
 }
 
 void hy2_rasm_free(struct hy2_rasm **head) {
@@ -687,33 +760,76 @@ void hy2_rasm_free(struct hy2_rasm **head) {
 
 uint8_t *hy2_rasm_feed(struct hy2_rasm **head, const struct hy2_udp_msg *m, uint64_t now_ms, size_t pre,
                        size_t *total) {
-    if (!m->nfrag || m->frag >= m->nfrag) return NULL;
+    if (!head || !m || !total) return NULL;
+    *total = 0;
+    if (!m->nfrag || m->frag >= m->nfrag || m->n > 65507 || (!m->data && m->n)) return NULL;
+    if(!memchr(m->addr,0,sizeof m->addr))return NULL;
     struct hy2_rasm *r = NULL, **pp = head;
+    unsigned count = 0;
     while (*pp) {
         struct hy2_rasm *c = *pp;
-        if (c->pkt == m->pkt && c->n == m->nfrag) { r = c; pp = &c->next; continue; }
-        if (now_ms - c->t > HY2_RASM_TTL_MS) { *pp = c->next; rasm_free_one(c); continue; }
+        /* Expiry precedes identity matching: a wrapped/reused packet ID must
+         * never resurrect an old partial packet. Inconsistent fragment counts
+         * for one ID replace the old assembly rather than multiplying it. */
+        if (now_ms < c->t || now_ms - c->t >= HY2_RASM_TTL_MS ||
+            (c->pkt == m->pkt && (c->n != m->nfrag || strcmp(c->address,m->addr)))) {
+            *pp = c->next; rasm_free_one(c); continue;
+        }
+        if (c->pkt == m->pkt) r = c;
+        count++;
         pp = &c->next;
     }
     if (!r) {
-        r = calloc(1, sizeof *r + (size_t)m->nfrag * sizeof r->fr[0]);
-        if (!r) return NULL;
+        if (count >= HY2_RASM_MAX) {
+            struct hy2_rasm **oldest = head;
+            for (pp = head; *pp; pp = &(*pp)->next)
+                if ((*pp)->t < (*oldest)->t) oldest = pp;
+            struct hy2_rasm *old = *oldest;
+            *oldest = old->next; rasm_free_one(old);
+        }
+        unsigned metadata=(unsigned)(sizeof *r+(size_t)m->nfrag*sizeof r->fr[0]);
+        if(!rasm_reserve(&rasm_entries,1,HY2_RASM_TOTAL_ENTRIES)) return NULL;
+        if(!rasm_reserve(&rasm_bytes,metadata,HY2_RASM_TOTAL_BYTES)) {
+            __atomic_sub_fetch(&rasm_entries,1,__ATOMIC_RELAXED);return NULL;
+        }
+        r=calloc(1,metadata);
+        if(!r) {
+            __atomic_sub_fetch(&rasm_bytes,metadata,__ATOMIC_RELAXED);
+            __atomic_sub_fetch(&rasm_entries,1,__ATOMIC_RELAXED);return NULL;
+        }
+        r->charge=metadata;
         r->t = now_ms;
         r->pkt = m->pkt;
+        memcpy(r->address,m->addr,strlen(m->addr)+1);
         r->n = m->nfrag;
         r->next = *head;
         *head = r;
     }
     if (r->fr[m->frag].p) return NULL;                  /* повтор фрагмента */
-    r->fr[m->frag].p = malloc(m->n ? m->n : 1);
-    if (!r->fr[m->frag].p) return NULL;
-    memcpy(r->fr[m->frag].p, m->data, m->n);
+    if (m->n > 65507u - r->total) {
+        for (pp = head; *pp != r; pp = &(*pp)->next) {}
+        *pp = r->next; rasm_free_one(r); return NULL;
+    }
+    unsigned charge=m->n?(unsigned)m->n:1;
+    if(!rasm_reserve(&rasm_bytes,charge,HY2_RASM_TOTAL_BYTES)) {
+        if(!r->got) { for(pp=head;*pp!=r;pp=&(*pp)->next) {} *pp=r->next;rasm_free_one(r); }
+        return NULL;
+    }
+    r->fr[m->frag].p=malloc(charge);
+    if(!r->fr[m->frag].p) {
+        __atomic_sub_fetch(&rasm_bytes,charge,__ATOMIC_RELAXED);
+        if(!r->got) { for(pp=head;*pp!=r;pp=&(*pp)->next) {} *pp=r->next;rasm_free_one(r); }
+        return NULL;
+    }
+    r->charge+=charge;
+    if (m->n) memcpy(r->fr[m->frag].p, m->data, m->n);
     r->fr[m->frag].len = (uint16_t)m->n;
     r->total += (uint32_t)m->n;
     if (++r->got < r->n) return NULL;
     for (pp = head; *pp != r; pp = &(*pp)->next) {}
     *pp = r->next;
-    uint8_t *blk = r->total <= 65507 ? malloc(pre + r->total) : NULL;   /* больше датаграммы UDP по IPv4 не бывает */
+    size_t allocation = pre <= SIZE_MAX - r->total ? pre + r->total : 0;
+    uint8_t *blk = allocation || (!pre && !r->total) ? malloc(allocation ? allocation : 1) : NULL;
     if (blk) {
         size_t t = pre;
         for (unsigned i = 0; i < r->n; i++) { memcpy(blk + t, r->fr[i].p, r->fr[i].len); t += r->fr[i].len; }

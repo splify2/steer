@@ -241,6 +241,8 @@ static void scenario_echo(const char *tag, uint64_t cli_brutal, int gso, int gro
     snprintf(nm, sizeof nm, "%s: клиент знает, что рукопожатие завершено", tag);
     check(nm, 1, qc_handshake_done(c.q));
     if (c.hs) {
+        snprintf(nm, sizeof nm, "%s: stale stream cannot close connection", tag);
+        check(nm, QC_ENOSTREAM, qc_stream_send(c.q, 1000000, (const uint8_t *)"x", 1, 0));
         struct qc_stats st;
         qc_stats_get(c.q, &st);
         snprintf(nm, sizeof nm, "%s: алгоритм перегрузки — %s", tag, cli_brutal ? "Brutal" : "не Brutal");

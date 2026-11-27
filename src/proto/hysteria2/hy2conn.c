@@ -167,7 +167,7 @@ struct hq {
     uint64_t state_at_ms, next_try_ms, bg_try_ms;
     unsigned bg_ms;                 /* текущая пауза попыток поднять упавшее: растёт при отказах, 0 — после подъёма */
     uint64_t timer_due_ms;          /* срок таймера QUIC, снятый перед ожиданием; 0 — нет */
-    uint64_t open_at_ms, status_at_ms, dg_seen, dg_log_ms;
+    uint64_t open_at_ms, status_at_ms, dg_seen, dg_log_ms, rasm_at_ms;
     struct obfs_state *ob;          /* обфускация текущего соединения (make_cfg) */
     int64_t auth_sid;
     uint8_t abuf[4096];
@@ -1106,20 +1106,18 @@ static void on_stream_data(void *u, int64_t sid, const uint8_t *d, size_t n, int
     struct hy2_flow *f = flow_by_sid(h, sid);
     if (!f) { qc_stream_consumed(h->qc, sid, n); return; }
     if (f->state == FL_RESP) {
-        if (!f->hbuf) f->hbuf = malloc(4300);
+        if (!f->hbuf) f->hbuf = calloc(1,sizeof(struct hy2_tcp_response_stream));
         if (!f->hbuf) { qc_stream_consumed(h->qc, sid, n); flow_fail(f, HY2E_BUSY, NULL, 1); return; }
-        /* Ответ короче hbuf (сообщение и набивка ограничены при разборе), поэтому не влезшее — уже
-         * негодный ответ. Копится вся порция: разбор скажет, где ответ кончился. */
-        size_t before = f->hn_;
-        int bad = n > (size_t)(4300 - f->hn_);
+        /* A callback can coalesce the response and arbitrary application data.
+         * Parse/credit only header bytes and hand remaining bytes to the queue. */
+        size_t resp_here=0;
         struct hy2_tcp_resp resp;
-        int used = -1;
-        if (!bad) {
-            memcpy(f->hbuf + f->hn_, d, n);
-            f->hn_ += (uint16_t)n;
-            used = hy2_tcp_response(f->hbuf, f->hn_, &resp);
+        int used=hy2_tcp_response_feed((struct hy2_tcp_response_stream *)f->hbuf,d,n,&resp_here,&resp);
+        if (used == 0) {
+            qc_stream_consumed(h->qc,sid,n);
+            if(fin) flow_fail(f,HY2E_DENIED,"сервер оборвал заголовок ответа потока",1);
+            return;
         }
-        if (used == 0) { qc_stream_consumed(h->qc, sid, n); return; }   /* ответ пришёл не весь */
         if (used < 0 || !resp.ok) {
             qc_stream_consumed(h->qc, sid, n);
             const char *m = used < 0 ? "негодный ответ на запрос потока" : resp.msg;
@@ -1128,7 +1126,6 @@ static void on_stream_data(void *u, int64_t sid, const uint8_t *d, size_t n, int
         }
         /* Окно возвращаем за сам ответ; данные потока, пришедшие с ним, вернёт hy2c_read по мере
          * того, как стек их заберёт. */
-        size_t resp_here = (size_t)used - before;
         qc_stream_consumed(h->qc, sid, resp_here);
         free(f->hbuf);
         f->hbuf = NULL;
@@ -1142,6 +1139,27 @@ static void on_stream_data(void *u, int64_t sid, const uint8_t *d, size_t n, int
     if (fin && f->q) { f->rx_fin = 1; stack_sess_rx(f); }
 }
 
+#ifdef STEER_HY2_RESPONSE_TEST
+int hy2c_test_response(const uint8_t *wire,size_t length,size_t split,uint8_t *out,size_t capacity,size_t *got) {
+    struct hq h={0};struct hy2_flow f={0};int result;
+    if(split>length) return -1;
+    h.state=S_UP;h.auth_sid=-1;h.stream_win=128u*1024;h.nflows=1;
+    f.q=&h;f.sid=0;f.state=FL_RESP;list_add(&h,&f);sid_add(&h,&f);*got=0;
+    if(split) on_stream_data(&h,0,wire,split,0);
+    if(f.q) on_stream_data(&h,0,wire+split,length-split,1);
+    result=f.q&&f.state==FL_OPEN?0:-1;
+    while(!result&&*got<capacity) {
+        const uint8_t *data;size_t n=0;
+        int rc=hy2c_read(&f,capacity-*got,&data,&n);
+        if(rc<0) { if(!f.rx_fin||f.aborted) result=-1;break; }
+        if(!n) break;
+        memcpy(out+*got,data,n);*got+=n;
+    }
+    flow_release(&f,0);
+    while(h.freeb) { struct pblk *next=h.freeb->next;free(h.freeb);h.freeb=next; }
+    return result;
+}
+#endif
 static void on_stream_close(void *u, int64_t sid, uint64_t err) {
     struct hq *h = u;
     (void)err;
@@ -1282,6 +1300,7 @@ static void teardown(struct hq *h, const char *why) {
         f->gone = 1;
         f->aborted = 1;
         f->rx_fin = 1;
+        if (f->ux) hy2_rasm_free(&f->ux->ras);
         act_del(h, f);
         stack_sess_rx(f);
     }
@@ -1291,6 +1310,11 @@ static void teardown(struct hq *h, const char *why) {
 }
 
 static void expire(struct hq *h, uint64_t now) {
+    if(now-h->rasm_at_ms>=1000) {
+        unsigned entries=0;h->rasm_at_ms=now;hy2_rasm_usage(&entries,NULL);
+        if(entries) for(struct hy2_flow *f=h->fl;f;f=f->nx)
+            if(f->ux) hy2_rasm_expire(&f->ux->ras,now);
+    }
     if (h->nopen && now - h->open_at_ms >= OPEN_TICK_MS) {
         h->open_at_ms = now;
         for (struct hy2_flow *f = h->fl, *nx; f; f = nx) {

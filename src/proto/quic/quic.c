@@ -96,6 +96,7 @@ struct qc_stream {
     int       fin_req;      /* потребитель закрыл передачу */
     int       fin_sent;
     int       blocked;      /* ngtcp2 отказала по окну потока: ждём extend_max_stream_data */
+    int       write_failed; /* peer stopped/reset the accepted send direction */
 };
 
 struct qc_dg {
@@ -441,6 +442,7 @@ static int recv_stream_data_cb(ngtcp2_conn *conn, uint32_t flags, int64_t sid, u
                                const uint8_t *data, size_t datalen, void *ud, void *sud) {
     struct qc *q = ud;
     (void)offset; (void)sud;
+    if (!stream_get(q, sid)) return NGTCP2_ERR_CALLBACK_FAILURE;
     if (q->ops.on_stream_data) {
         q->in_cb++;
         q->ops.on_stream_data(q->user, sid, data, datalen, (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0);
@@ -791,7 +793,7 @@ static ngtcp2_ssize write_pkt_cb(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pk
         nw = ngtcp2_conn_writev_stream(conn, path, pi, dest, destlen, &dl, flags, s->id, v, nv, ts);
         if (nw < 0) {
             if (nw == NGTCP2_ERR_STREAM_DATA_BLOCKED) { s->blocked = 1; continue; }
-            if (nw == NGTCP2_ERR_STREAM_SHUT_WR) { s->fin_sent = 1; s->sent = s->total; continue; }
+            if (nw == NGTCP2_ERR_STREAM_SHUT_WR) { s->write_failed=1;s->fin_sent = 1; s->sent = s->total; continue; }
             return nw;
         }
         if (dl >= 0) {
@@ -1434,8 +1436,15 @@ int qc_stream_open_uni(struct qc *q, int64_t *sid) {
 
 ssize_t qc_stream_send(struct qc *q, int64_t sid, const uint8_t *d, size_t n, int fin) {
     if (!q || q->closed) return QC_ECLOSED;
-    struct qc_stream *s = stream_get(q, sid);
-    if (!s) return QC_ENOMEM;
+    if (sid < 0 || (n && !d)) return QC_EINVAL;
+    struct qc_stream *s = stream_find(q, sid);
+    /* Locally initiated streams must have been opened through qc_stream_open*.
+     * Recreating a retired stream would feed STREAM_NOT_FOUND into flush and
+     * turn a stale application handle into a connection-wide failure. Peer
+     * streams are registered by recv_stream_data_cb before the callback. */
+    if (!s) return QC_ENOSTREAM;
+    if (s->write_failed) return QC_ENOSTREAM;
+    if ((sid & 2) && (sid & 1) != (q->server ? 1 : 0)) return QC_ENOSTREAM;
     if (s->fin_req) return QC_EINVAL;       /* передача уже закрыта */
     size_t used = (size_t)(s->total - s->acked);
     size_t room = used < q->send_buf ? q->send_buf - used : 0;
@@ -1444,6 +1453,7 @@ ssize_t qc_stream_send(struct qc *q, int64_t sid, const uint8_t *d, size_t n, in
     if (fin && take == n) s->fin_req = 1;
     int rv = flush(q);
     if (rv != 0 && rv != QC_ECLOSED) fail_close(q, rv);
+    if(s->write_failed)return QC_ENOSTREAM;
     return (ssize_t)take;
 }
 
@@ -1479,7 +1489,10 @@ size_t qc_datagram_max(const struct qc *q) {
     /* Размер пути, а не потолок настроек: пакет больше пути ngtcp2 не собирает (до разведки PMTU —
      * 1200), и датаграмма по потолку застревала бы в очереди навсегда (I-480). */
     size_t udp = ngtcp2_conn_get_path_max_tx_udp_payload_size2(q->conn);
-    size_t over = 1 + QC_CID_LEN + 4 + 16 + 3;
+    /* The destination CID belongs to the peer and need not have our local
+     * QC_CID_LEN. Reserve the protocol maximum (20), including after CID
+     * rotation. This conservative cap needs no dependency ABI extension. */
+    size_t over = 1 + NGTCP2_MAX_CIDLEN + 4 + 16 + 3;
     size_t cap = udp > over ? udp - over : 0;
     size_t peer = rp->max_datagram_frame_size > 3 ? (size_t)rp->max_datagram_frame_size - 3 : 0;
     return cap < peer ? cap : peer;

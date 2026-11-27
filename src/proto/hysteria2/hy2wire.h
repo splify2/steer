@@ -45,6 +45,8 @@ struct hy2_auth_resp {
  * 0 — данных мало; -1 — ответ негоден (причина в *why, если не NULL). Кадры до HEADERS
  * (незнакомые, GREASE) пропускаются. */
 int hy2_auth_response(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why);
+/* Managed outbound: exact unique :status and no invalid QPACK field bytes. */
+int hy2_auth_response_strict(const uint8_t *d, size_t n, struct hy2_auth_resp *r, const char **why);
 
 /* ---- TCP ---- */
 #define HY2_TCP_REQ_ID 0x401
@@ -57,6 +59,17 @@ struct hy2_tcp_resp {
 /* Разобрать TCPResponse с начала потока. Возвращает: >0 — сколько байт заняла (дальше идут данные
  * потока); 0 — данных мало; -1 — негоден. */
 int hy2_tcp_response(const uint8_t *d, size_t n, struct hy2_tcp_resp *r);
+/* Incremental response header only. Zero-initialize; returns1 complete,0 more,
+ * -1 invalid. consumed excludes coalesced payload; no payload buffering. */
+struct hy2_tcp_response_stream {
+    struct hy2_tcp_resp response;
+    uint64_t value,remaining;
+    size_t kept;
+    unsigned phase,var_have,var_need;
+    int result;
+};
+int hy2_tcp_response_feed(struct hy2_tcp_response_stream *,const uint8_t *,size_t,
+                          size_t *consumed,struct hy2_tcp_resp *);
 
 /* ---- UDP ---- */
 struct hy2_udp_msg {
@@ -74,11 +87,15 @@ size_t hy2_udp_header(uint8_t *out, size_t cap, uint32_t sid, uint16_t pkt, uint
 /* Сборка фрагментированных датаграмм UDP от сервера, по одной на packet id.
  *
  * Фрагменты хранятся каждый своим куском по реальной длине (сервер режет по своему MTU), слотов —
- * заявленное nfrag (u8, протокол сам ограничивает его 255). Сборок на поток столько, сколько пришло
- * разных packet id: сервер шлёт фрагменты нескольких датаграмм вперемешку, и одна сборка на поток
- * теряла бы обе. Недособранная (фрагмент потерян) живёт HY2_RASM_TTL_MS и снимается при следующем
- * фрагменте любой сборки. *head — список сборок потока (NULL — пусто). */
+ * заявленное nfrag (u8, протокол сам ограничивает его 255). На UDP-поток не более HY2_RASM_MAX
+ * незавершённых пакетов; самая старая сборка вытесняется. Срок HY2_RASM_TTL_MS проверяется
+ * перед поиском packet id и периодическим hy2_rasm_expire рабочего. *head — список потока.
+ * TOTAL_* — module-wide safety ceilings for metadata and retained fragment allocations,
+ * not a configured per-runtime/RSS budget. Completed caller-owned packets are excluded. */
 #define HY2_RASM_TTL_MS 5000
+#define HY2_RASM_MAX 16 /* per UDP flow: incomplete packets; oldest is evicted */
+#define HY2_RASM_TOTAL_BYTES (16u*1024u*1024u)
+#define HY2_RASM_TOTAL_ENTRIES 1024u
 struct hy2_rasm;
 /* Принять фрагмент (m уже разобран hy2_udp_parse, nfrag > 1). Собралась — вернуть блок malloc: pre байт
  * места под заголовок вызывающего, затем *total байт датаграммы; не собралась или брак (число
@@ -86,6 +103,14 @@ struct hy2_rasm;
 uint8_t *hy2_rasm_feed(struct hy2_rasm **head, const struct hy2_udp_msg *m, uint64_t now_ms, size_t pre,
                        size_t *total);
 void hy2_rasm_free(struct hy2_rasm **head);
+/* Owner-only accounting: local retained allocation bytes, and conservative
+ * maximum extra allocations for next feed(pre=0), including completed output
+ * overlap. Caller reserves required bytes BEFORE feed, then reconciles local
+ * usage and caller-owned output (at least one byte for an empty packet). */
+size_t hy2_rasm_local_bytes(const struct hy2_rasm *);
+size_t hy2_rasm_required(const struct hy2_rasm *,const struct hy2_udp_msg *);
+void hy2_rasm_usage(unsigned *entries,unsigned *bytes); /* atomic diagnostic snapshot */
+void hy2_rasm_expire(struct hy2_rasm **head,uint64_t now_ms);
 /* Разбор датаграммы; 0 — годна (m->data указывает внутрь d), -1 — негодна. */
 int hy2_udp_parse(const uint8_t *d, size_t n, struct hy2_udp_msg *m);
 
