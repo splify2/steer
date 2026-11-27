@@ -5,7 +5,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/fs.h>
-#include <linux/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +15,7 @@
 #include <unistd.h>
 
 #include "pm.h"
+#include "pmstatx.h"
 #include "platform.h"
 
 static int selected;
@@ -100,12 +100,8 @@ static int safe_parent(const char *parent) {
 /* st_dev не отличает bind одного каталога на том же разделе. Если ядро
  * не может подтвердить границу монтирования, не обещаем её и при init. */
 static unsigned long long mount_id(const char *path) {
-#if defined(SYS_statx) && defined(STATX_MNT_ID)
-    struct statx sx;
-    if (!syscall(SYS_statx, AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_MNT_ID, &sx) &&
-        (sx.stx_mask & STATX_MNT_ID)) return sx.stx_mnt_id;
-#endif
-    return 0;
+    uint64_t id;
+    return pm_statx_mount_id(path, &id) == 0 ? id : 0;
 }
 
 static int object(const char *path, int dir, unsigned long long mount) {

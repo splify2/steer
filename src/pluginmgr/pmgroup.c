@@ -6,16 +6,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <linux/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 #include "pmgroup.h"
+#include "pmstatx.h"
 #include "ctlcall.h"
 #include "ctlcall_io.h"
 #include "scrypto.h"
@@ -268,17 +267,13 @@ static int by_name(const struct dirent **a, const struct dirent **b) {
 /* st_dev недостаточно для bind на том же разделе. На старых ядрах — только
  * fdinfo нашего открытого fd, а не обход процессов/таблиц монтирования. */
 static uint64_t mount_of(const char *p) {
-#if defined(SYS_statx) && defined(STATX_MNT_ID)
-    struct statx sx;
-    if (!syscall(SYS_statx, AT_FDCWD, p, AT_SYMLINK_NOFOLLOW, STATX_MNT_ID, &sx) &&
-        (sx.stx_mask & STATX_MNT_ID)) return sx.stx_mnt_id;
-#endif
+    uint64_t id = 0;
+    if (!pm_statx_mount_id(p, &id)) return id;
     int fd = open(p,O_PATH|O_NOFOLLOW|O_CLOEXEC);
     if (fd < 0) return 0;
     char name[64], line[160];
     snprintf(name,sizeof(name),"/proc/self/fdinfo/%d",fd);
     FILE *f = fopen(name,"r");
-    uint64_t id = 0;
     if (f) {
         while (fgets(line,sizeof(line),f) && sscanf(line,"mnt_id: %" SCNu64,&id) != 1) {}
         fclose(f);
