@@ -113,6 +113,7 @@ int aggregate_main(int argc, char **argv);
  * Статическим сборкам без криптобиблиотеки (базовая, мини-сборка tgws, хаб, телефон) его не дают:
  * там команда отвечает отказом. */
 int pm_main(int argc, char **argv) __attribute__((weak));
+int pm_prefix_main(const char *prefix, int argc, char **argv) __attribute__((weak));
 
 static int no_plugin_mgr(void) {
     fprintf(stderr, "steer: менеджера плагинов в этой сборке нет — он в пакете steer-core\n");
@@ -147,6 +148,15 @@ static int is_tool(const char *cmd) {
 }
 
 int main(int argc, char **argv) {
+    /* До platform, встроенных программ, поиска команд плагина и обращения к ctl. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--managed-prefix") && strncmp(argv[i], "--managed-prefix=", 17)) continue;
+        if (i != 1 || strcmp(argv[i], "--managed-prefix") || argc < 5 || strcmp(argv[3], "plugin") || tools_role(argv[0])) {
+            fputs("steerd: требуется --managed-prefix /путь plugin <действие>; этот режим только для менеджера\n", stderr);
+            return 2;
+        }
+        return pm_prefix_main ? pm_prefix_main(argv[2], argc-4, argv+4) : no_plugin_mgr();
+    }
     if (pk_prog_find && pk_prog_run && argv[0]) {
         const char *bi = getenv("STEER_PK_BUILTIN");
         const struct pk_prog *p = bi && *bi ? pk_prog_find(bi) : NULL;
@@ -417,4 +427,3 @@ int main(int argc, char **argv) {
     die("команда %s объявлена, но не подключена — это ошибка в ядре steer", cmd);
     return 2;
 }
-

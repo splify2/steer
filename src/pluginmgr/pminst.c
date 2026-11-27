@@ -1881,7 +1881,25 @@ static int install_marker_clear(struct pm_ctx *x, const char *marker, struct pm_
 }
 
 /* Только то, что умеем восстановить без выполнения кода пакета или стороннего менеджера. */
+static int file_manifest(const struct ynode *m, const char *id) {
+    static const char *const metadata[] = {"schema","id","version","name","description","license","arch","compat"};
+    const char *owner = yn_str(m, "id");
+    if (!owner || !id || strcmp(owner, id) || yn_long(m, "schema", -1) != 1 || !pm_ver_ok(yn_str(m, "version"))) return 0;
+    for (size_t i = 0; i < ynode_len(m); i++) {
+        const char *k = ynode_key_at(m, i)->str;
+        size_t j = 0;
+        while (j < sizeof(metadata)/sizeof(*metadata) && strcmp(k, metadata[j])) j++;
+        if (j == sizeof(metadata)/sizeof(*metadata)) return 0;
+    }
+    return 1;
+}
+
+static int not_file_package(struct pm_err *e) {
+    return pm_errc(e, "plugin.prefix_package", NULL, "этот префикс принимает только подписанные файловые пакеты без служб, скриптов и расширений");
+}
+
 static int replayable(const struct ynode *m, const char *id) {
+    if (pm_managed()) return file_manifest(m, id);
     const char *mid = yn_str(m, "id"), *type = yn_str(m, "type");
     const struct ynode *steer = ynode_get(m, "steer"), *links = links_of(m);
     if (!mid || strcmp(mid, id) || !pm_ver_ok(yn_str(m, "version")) ||
@@ -1894,8 +1912,6 @@ static int replayable(const struct ynode *m, const char *id) {
     return 1;
 }
 
-static char *install_state_path(void) { return pm_path(pm_etc(), "state.json"); }
-
 /* Заголовок журнала + исходный state.json как есть (включая неизвестные legacy-поля).
  * mode == 0 означает, что state.json отсутствовал. */
 static int install_marker_write(const char *path, const char *id, const char *ver, int had_dir,
@@ -1905,7 +1921,7 @@ static int install_marker_write(const char *path, const char *id, const char *ve
     char *state = NULL;
     if (safe) {
         struct stat st;
-        char *sp = install_state_path();
+        char *sp = pm_state_path();
         if (lstat(sp, &st) == 0) {
             if (!S_ISREG(st.st_mode) || !(mode = st.st_mode & 0777) || !(state = pm_read(sp, &n))) {
                 pm_errc(e, "plugin.file_unreadable", PMA("path", sp), "не сохранить прежний %s", sp);
@@ -1919,7 +1935,7 @@ static int install_marker_write(const char *path, const char *id, const char *ve
         }
         free(sp);
     }
-    char *header = pm_fmt("1 %s %s %d %d %03o %d\n", id, ver, had_dir, safe, mode, (int)getpid());
+    char *header = pm_fmt("%s %s %s %d %d %03o %d\n", pm_managed() ? "M1" : "1", id, ver, had_dir, safe, mode, (int)getpid());
     size_t hn = strlen(header);
     char *record = pm_realloc(header, hn + n);
     if (n) memcpy(record + hn, state, n);
@@ -1968,16 +1984,23 @@ int pm_install_recover(struct pm_ctx *x, struct pm_err *e) {
     char *dir = NULL, *stage = NULL, *prev = NULL, *sp = NULL;
     struct ydoc *newman = NULL, *oldman = NULL, *state = NULL;
     struct pm_err why = {0};
-    if (!record || sscanf(record, "1 %64s %127s %1d %1d %3o %10u%n",
+    const char *format = pm_managed() ? "M1 %64s %127s %1d %1d %3o %10u%n" :
+                                          "1 %64s %127s %1d %1d %3o %10u%n";
+    if (!record || sscanf(record, format,
                           id, ver, &had_dir, &safe, &mode, &pid, &offset) != 6 ||
         offset < 0 || (size_t)offset >= n || record[offset] != '\n' || !pm_id_ok(id) ||
         !pm_ver_ok(ver) || (had_dir != 0 && had_dir != 1) || safe != 1 ||
         !pid || pid > INT_MAX)
         goto out;
     offset++;
+    if (pm_managed() && mode != 0600) goto out;
     if (mode) {
         state = pm_json_parse(record + offset, n - (size_t)offset, marker, &why);
         if (!state || ydoc_root(state)->kind != YN_MAP) goto out;
+        if (pm_managed()) {
+            if (!pm_registry_valid(ydoc_root(state)) ||
+                had_dir != (ynode_get(ynode_get(ydoc_root(state), "plugins"), id) != NULL)) goto out;
+        }
     } else if ((size_t)offset != n) goto out;
 
     dir = pm_path(pm_root(), id);
@@ -2003,7 +2026,7 @@ int pm_install_recover(struct pm_ctx *x, struct pm_err *e) {
     if ((!staged && rename(dir, stage) != 0) || (previous && rename(prev, dir) != 0)) goto out;
     if (links_apply_pid(id, om, nm, 0, (int)pid, &why) != 0 ||
         links_scratch_clear(id, nm, (int)pid) != 0 || links_scratch_clear(id, om, (int)pid) != 0) goto out;
-    sp = install_state_path();
+    sp = pm_state_path();
     if (mode ? pm_write_atomic(sp, record + offset, n - (size_t)offset, mode) != 0
              : unlink(sp) != 0 && errno != ENOENT)
         goto out;
@@ -2047,7 +2070,8 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
         }
     } else {
         archive = pm_strdup(s->file);
-        pm_keys_all(&ks);
+        if (pm_managed()) pm_keys_role(&ks, "plugins");
+        else pm_keys_all(&ks);
     }
     /* id архива из файла узнаётся из MANIFEST: распаковка во временный stage. */
     char *stage = s->c ? pm_fmt("%s/.stage/%s-%s", pm_root(), id, s->c->version)
@@ -2086,6 +2110,10 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
      * плагинов. Те же правила, что у имени и версии из командной строки и индекса. */
     if (!pm_id_ok(mid) || !pm_ver_ok(mver) || !pm_id_ok(hid) || !pm_ver_ok(hver)) {
         pm_errc(e, "plugin.bad_id_version", NULL, "недопустимые id или version в архиве");
+        goto out_stage;
+    }
+    if (pm_managed() && (is_unsigned || !file_manifest(m, mid))) {
+        not_file_package(e);
         goto out_stage;
     }
     if (!s->c) {
@@ -2150,6 +2178,11 @@ static int install_one(struct pm_ctx *x, const struct src *s, const char *want_i
     prev = pm_path(prevd, id);
     int had_dir = pm_is_dir(dir);
     oldman = had_dir ? pm_manifest(id) : NULL;
+    if (pm_managed() && (had_dir != (pm_state_find(&x->st, id) != NULL) ||
+                         (had_dir && (!oldman || !file_manifest(ydoc_root(oldman), id))))) {
+        not_file_package(e);
+        goto out_stage;
+    }
     if (pm_mkdirs(prevd) != 0 || pm_rmrf(prev) != 0) {
         pm_errc(e, "plugin.prev_move_failed", PMA("id", id, "why", strerror(errno)),
                 "не подготовить .prev для %s: %s", id, strerror(errno));
@@ -2535,6 +2568,14 @@ int pm_install(struct pm_ctx *x, const struct pm_req *req, size_t nreq, const st
                struct pm_result *res, struct pm_err *e) {
     memset(res, 0, sizeof(*res));
     if (pm_install_pending(e) != 0) return -1;
+    if (pm_managed()) {
+        /* Даже новый вызывающий код не должен начать план, импорт семени,
+         * группу или распаковку для file_peek до проверки подписанного пакета. */
+        if (nreq || o->unsigned_ok || o->group || o->nfiles != 1 || !o->files || o->file)
+            return not_file_package(e);
+        struct src s = { NULL, o->files[0], 0, NULL };
+        return install_one(x, &s, NULL, res, e);
+    }
     if (o->nfiles) return install_files(x, o->files, o->nfiles, o, res, e);
     if (o->file) { const char *one[] = { o->file }; return install_files(x, one, 1, o, res, e); }
     x->allow_bad = o->allow_bad;
@@ -2661,6 +2702,11 @@ int pm_remove(struct pm_ctx *x, const char *id, int force, int purge, struct pm_
     if (!inst && !pm_is_dir(dir)) { free(dir); return pm_errc(e, "plugin.not_installed", PMA("id", id), "плагин %s не установлен", id); }
     struct ydoc *man = pm_manifest(id);
     const struct ynode *m = man ? ydoc_root(man) : NULL;
+    if (pm_managed() && (!inst || !file_manifest(m, id))) {
+        if (man) ydoc_free(man);
+        free(dir);
+        return not_file_package(e);
+    }
     if (!force) {
         /* Зависимые плагины. */
         char *users = NULL;

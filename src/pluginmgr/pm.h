@@ -52,6 +52,10 @@ const char *pm_oct(unsigned v);
 void pm_err_json(const struct pm_err *e, char *buf, size_t cap);
 
 /* ---- пути (pmutil.c). Подмены — переменные окружения STEER_PLUGIN_* (стенды). ---- */
+int pm_managed(void);
+int pm_prefix_main(const char *prefix, int argc, char **argv);
+char *pm_state_path(void);
+int pm_registry_valid(const struct ynode *root);
 const char *pm_root(void);      /* /usr/lib/steer/plugins            STEER_PLUGIN_DIR */
 const char *pm_etc(void);       /* /etc/steer/plugins                STEER_PLUGIN_ETC */
 const char *pm_keys(void);      /* /usr/share/steer/keys             STEER_PLUGIN_KEYS */

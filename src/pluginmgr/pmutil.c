@@ -289,9 +289,9 @@ static int g_lock_fd = -1;
 
 int pm_lock(void) {
     if (g_lock_fd >= 0) return 0;
-    pm_mkdirs(pm_root());
-    char *p = pm_path(pm_root(), ".lock");
-    int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (!pm_managed()) pm_mkdirs(pm_root());
+    char *p = pm_path(pm_root(), pm_managed() ? ".lock/writer" : ".lock");
+    int fd = open(p, O_RDWR | (pm_managed() ? O_NOFOLLOW : O_CREAT) | O_CLOEXEC, 0644);
     free(p);
     if (fd < 0) return -1;
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) { close(fd); return -1; }

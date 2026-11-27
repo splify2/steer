@@ -1399,6 +1399,7 @@ int pm_main(int argc, char **argv) {
     struct pm_ctx x;
     memset(&x, 0, sizeof(x));
     x.by = "human";
+    x.no_daemon = pm_managed();
     const char *pos[16];
     size_t npos = 0;
     char **ens = NULL;
@@ -1517,7 +1518,7 @@ int pm_main(int argc, char **argv) {
     }
     /* Семя после установки (seed_prune выше): после всякой команды, которая могла поставить плагин, — и после
      * неудачной: частично вставшие плагины тоже стоят. */
-    if (!x.install_degraded && (!strcmp(act, "install") || !strcmp(act, "update") || !strcmp(act, "ensure") || !strcmp(act, "migrate")))
+    if (!pm_managed() && !x.install_degraded && (!strcmp(act, "install") || !strcmp(act, "update") || !strcmp(act, "ensure") || !strcmp(act, "migrate")))
         seed_prune(&x);
     job_finish(rc);
 out_nojob:

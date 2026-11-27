@@ -53,6 +53,9 @@ steer plugin install vless                                   # недостаю�
 нужные плагины по выходам спеки. Мост Telegram — плагин `tgws` из репозитория
 `splify2-extended-plugins`. Подробно — [docs/guide.md](docs/guide.md#установка).
 
+Для локальной установки подписанного файлового `.s2p` на Linux у `steerd` есть
+[отдельный управляемый префикс](docs/managed-prefix.md). Он выбирается явно для каждой команды.
+
 ## Быстрый старт
 
 `/etc/steer/spec.yaml` — домены из списка через WireGuard, остальное напрямую:

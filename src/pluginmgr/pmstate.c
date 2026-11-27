@@ -34,18 +34,31 @@ static void free_list(char **v, size_t n) {
     free(v);
 }
 
-static char *state_path(void) { return pm_path(pm_etc(), "state.json"); }
+char *pm_state_path(void) { return pm_path(pm_etc(), pm_managed() ? "registry.json" : "state.json"); }
+
+/* Проверяется и до replay, и для снимка, прежде чем он станет рабочим реестром. */
+int pm_registry_valid(const struct ynode *root) {
+    const struct ynode *pl = ynode_get(root, "plugins");
+    if (yn_long(root, "schema", -1) != 1 || !pl || pl->kind != YN_MAP) return 0;
+    for (size_t i = 0; i < ynode_len(pl); i++) {
+        const struct ynode *entry = ynode_val_at(pl, i);
+        const struct ynode *bad = ynode_get(entry, "bad_versions");
+        if (!pm_id_ok(ynode_key_at(pl, i)->str) || !pm_ver_ok(yn_str(entry, "version")) ||
+            (bad && bad->kind != YN_MAP)) return 0;
+    }
+    return 1;
+}
 
 int pm_state_load(struct pm_state *s, struct pm_err *e) {
     memset(s, 0, sizeof(*s));
     s->retry_s = 0;
-    char *p = state_path();
+    char *p = pm_state_path();
     struct pm_err le = {0};
     size_t n = 0;
     char *raw = pm_read(p, &n);
     if (!raw) {
         int err = errno;
-        if (err == ENOENT) { free(p); return 0; }
+        if (err == ENOENT && !pm_managed()) { free(p); return 0; }
         pm_errc(e, "plugin.file_unreadable", PMA("path", p, "why", strerror(err)),
                 "%s не читается: %s", p, strerror(err));
         free(p);
@@ -61,6 +74,10 @@ int pm_state_load(struct pm_state *s, struct pm_err *e) {
     free(p);
     const struct ynode *r = ydoc_root(d);
     const struct ynode *pl = ynode_get(r, "plugins");
+    if (pm_managed() && !pm_registry_valid(r)) {
+        ydoc_free(d);
+        return pm_errc(e, "plugin.prefix_invalid", NULL, "повреждён реестр управляемого префикса");
+    }
     for (size_t i = 0; i < ynode_len(pl); i++) {
         const struct ynode *k = ynode_key_at(pl, i), *v = ynode_val_at(pl, i);
         struct pm_inst *x = pm_state_add(s, k->str);
@@ -147,8 +164,8 @@ int pm_state_save(const struct pm_state *s, struct pm_err *e) {
     fputc('\n', f);
     int bad = ferror(f);
     if (fclose(f) != 0 || bad) { free(buf); return pm_errc(e, "plugin.no_memory", NULL, "нет памяти"); }
-    char *p = state_path();
-    int r = pm_write_atomic(p, buf, n, 0644);
+    char *p = pm_state_path();
+    int r = pm_write_atomic(p, buf, n, pm_managed() ? 0600 : 0644);
     free(buf);
     if (r != 0) { pm_errc(e, "plugin.write_failed", PMA("path", p), "не записать %s", p); free(p); return -1; }
     free(p);
@@ -290,7 +307,7 @@ static int repo_cmp(const void *a, const void *b) {
 
 int pm_repos_load(struct pm_repos *rs, struct pm_err *e) {
     memset(rs, 0, sizeof(*rs));
-    char *dir = pm_path(pm_etc(), "repos.d");
+    char *dir = pm_path(pm_etc(), pm_managed() ? "sources.d" : "repos.d");
     DIR *d = opendir(dir);
     if (!d) { free(dir); return 0; }
     struct dirent *de;
@@ -365,7 +382,7 @@ int pm_repo_save(const struct pm_repo *x, struct pm_err *e) {
     jw_end(&w);
     fputc('\n', f);
     fclose(f);
-    char *p = x->file ? pm_strdup(x->file) : pm_fmt("%s/repos.d/%s.json", pm_etc(), x->name);
+    char *p = x->file ? pm_strdup(x->file) : pm_fmt("%s/%s/%s.json", pm_etc(), pm_managed() ? "sources.d" : "repos.d", x->name);
     int r = pm_write_atomic(p, buf, n, 0644);
     free(buf);
     if (r != 0) { pm_errc(e, "plugin.write_failed", PMA("path", p), "не записать %s", p); free(p); return -1; }

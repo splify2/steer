@@ -228,6 +228,12 @@ static int do_subscribe(void) {
 }
 
 int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--managed-prefix") || !strncmp(argv[i], "--managed-prefix=", 17)) {
+            fputs("steer: управляемый префикс выбирается напрямую: steerd --managed-prefix /путь plugin …\n", stderr);
+            return 2;
+        }
+    }
     g_argv = argv;
     engine_path();
     struct call c;
