@@ -30,6 +30,11 @@ concurrency:
 
 jobs:
   build:
+    env:
+      GIT_AUTHOR_NAME: xyzmean
+      GIT_AUTHOR_EMAIL: 163691714+xyzmean@users.noreply.github.com
+      GIT_COMMITTER_NAME: xyzmean
+      GIT_COMMITTER_EMAIL: 163691714+xyzmean@users.noreply.github.com
     runs-on: ubuntu-latest
     # Десять архитектур, и под каждую wolfSSL компилируется заново (один раз на архитектуру:
     # архив ложится в build/wolfssl-obj и переживает четыре роли сборки).
@@ -104,7 +109,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: splify2/plugin-sdk
-          ref: ${{ vars.PLUGIN_SDK_REF || 'main' }}
+          ref: 644867b57644dd9129dfc67d3e5fa66c5dfa2e47
           path: .plugin-sdk
       - uses: actions/setup-go@v5
         with:
@@ -115,6 +120,9 @@ jobs:
           set -eu
           S2P_OUT="$RUNNER_TEMP/s2p-bin" sh .plugin-sdk/build.sh
           echo "S2P=$RUNNER_TEMP/s2p-bin/s2p" >> "$GITHUB_ENV"
+
+      - name: Инструменты сетевых стендов
+        run: sudo apt-get update -qq && sudo apt-get install -y nftables iproute2 iputils-ping conntrack ethtool
 
       - name: Стенды
         run: |
@@ -211,13 +219,7 @@ jobs:
           ls -la out/
 
       - name: Стенды расширенной части на настоящей wolfSSL (внутри образа сборки)
-        # ПОКА НЕ БАРЬЕР, и это осознанно (R-063, поле risks). Стенды прогонялись руками, а в
-        # образе идут на той wolfSSL, которой собирается расширенный пакет (исходники и опции —
-        # build/wolfssl). Блокирующий барьер на непроверенном прогоне гасил бы релизы по своей же
-        # неуверенности, поэтому первый шаг — прогнать и посмотреть. Когда прогон покажет
-        # зелёное в релизе, строка continue-on-error снимается, и шаг встаёт барьером наравне с
-        # `make test`. (Локально в образе steer-builder:wolfssl он зелёный с шага 1 выпуска 1.10.)
-        continue-on-error: true
+        # Отказ криптографических стендов блокирует публикацию.
         run: |
           set -eu
           set -o pipefail
@@ -227,7 +229,8 @@ jobs:
           #
           # Логика — в отдельном скрипте, а не строкой в `docker run -c`: тот же довод, что
           # у build/build-ext.sh, там экранирование внутри кавычек однажды стоило сборки.
-          docker run --rm -v "$PWD:/src" -w /src --entrypoint sh \
+          docker run --rm -v "$PWD:/src" -v "$S2P:/usr/local/bin/s2p:ro" \
+            -e BUILD=build/ext-ci -e S2P=/usr/local/bin/s2p -w /src --entrypoint sh \
             "${STEER_BUILDER_IMAGE:-steer-builder:wolfssl}" \
             /src/build/ext-test-image.sh 2>&1 | tee /tmp/ext-test.log || true
           # `|| true` не прощает отказ, а отдаёт решение проверке ниже: иначе падение прогона
@@ -239,7 +242,7 @@ jobs:
           # не прогнав ни одного стенда: ровно то, как молчаливо пропускался ui-harness в
           # splify2. Признак прохода — последняя строка самого скрипта.
           grep -q 'ext-test: все стенды прошли' /tmp/ext-test.log || {
-            echo "::warning::стенды расширенной части в этом релизе не прогнаны до конца — смотрите лог шага"
+            echo "::error::стенды расширенной части в этом релизе не прогнаны до конца — смотрите лог шага"
             exit 1; }
 
       - name: Зафиксировать версию в репозитории
@@ -395,6 +398,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
           name: steer ${{ env.VERSION }}
           prerelease: ${{ inputs.prerelease }}
           files: |

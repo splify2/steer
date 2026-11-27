@@ -39,4 +39,4 @@ cd "$SRC"
 if [ "$OWNER" != "0:0" ]; then
 	trap 'chown -R "$OWNER" "$SRC/${BUILD:-build}" 2>/dev/null || true' EXIT
 fi
-STEER_WOLFSSL="$WSRC" CC="zig cc" BUILD="${BUILD:-build}" sh tests/ext-test.sh
+STEER_WOLFSSL="$WSRC" CC="zig cc" BUILD="${BUILD:-build}" STEER_NGTCP2="${STEER_NGTCP2:-/opt/ngtcp2}" sh tests/ext-test.sh
