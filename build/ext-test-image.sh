@@ -45,5 +45,5 @@ BUILD=${BUILD:-build}
 make -j"${JOBS:-4}" BUILD="$BUILD" CC="zig cc" all "$BUILD/pkhooks" "$BUILD/abihost"
 TEST_BUILD=$(cd "$BUILD" && pwd)
 STEER="$TEST_BUILD/steer" STEERD="$TEST_BUILD/steerd" \
-STEER_WOLFSSL="$WSRC" CC="zig cc" BUILD="$BUILD" \
-STEER_NGTCP2="${STEER_NGTCP2:-/opt/ngtcp2}" sh tests/ext-test.sh
+STEER_WOLFSSL="$WSRC" STEER_NGTCP2="${STEER_NGTCP2:-/opt/ngtcp2}" \
+CC="zig cc" BUILD="$BUILD" sh tests/ext-test.sh
