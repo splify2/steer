@@ -230,7 +230,7 @@ static int do_subscribe(void) {
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--supd-full-prefix") || !strncmp(argv[i], "--supd-full-prefix=", 19)) {
-            fputs("steer: используйте steerd daemon --supervise --supd-full-prefix /путь\n", stderr);
+            fputs("steer: префикс Full UI выбирается напрямую у steerd, не через legacy ctl\n", stderr);
             return 2;
         }
         if (!strcmp(argv[i], "--managed-prefix") || !strncmp(argv[i], "--managed-prefix=", 17)) {

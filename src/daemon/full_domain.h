@@ -1,4 +1,5 @@
-/* Private one-generation Linux Full UI profile. Not a package removal API. */
+/* Private one-generation Linux Full UI supervisor. /2 manager interface:
+ * full_remove.h; /1 retains the fence-only contract. */
 #ifndef STEER_FULL_DOMAIN_H
 #define STEER_FULL_DOMAIN_H
 struct full_domain;

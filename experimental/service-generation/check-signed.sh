@@ -3,10 +3,13 @@
 set -eu
 test_script=check_signed.py
 compat=
+old=
 if [ "$#" != 3 ]; then
-    test "$#" -eq 5 && test "$4" = --native-supd || exit 2
-    compat=$(realpath "$5")
-    test_script=check_native.py
+    case "$4:$#" in
+        --native-supd:5) compat=$(realpath "$5"); test_script=check_native.py ;;
+        --exact-remove:6) compat=$(realpath "$5"); old=$(realpath "$6"); test_script=check_remove.py ;;
+        *) exit 2 ;;
+    esac
 fi
 ui=$(realpath "$1")
 test "$(git -C "$ui" rev-parse HEAD)" = 6195d89589f347c15538c64fb2179cafdd9f7225
@@ -30,6 +33,13 @@ exec unshare -mpnf --mount-proc --propagation private sh -ec '
         cp "$6" steerd-compatible
         if cmp -s steerd steerd-compatible; then echo "expected a distinct compatible build" >&2; exit 2; fi
     fi
+    if [ "$5" = check_remove.py ]; then
+        cp "$4"/native_manager.py "$4"/check_remove.py .
+        mkdir prior v214
+        cp "$6"/steerd "$6"/libsteer*.so.* prior/
+        cp "$7"/steerd "$7"/libsteer*.so.* v214/
+        cc -Wall -Wextra -Werror -shared -fPIC "$4/remove-cut.c" -o cut.so
+    fi
     for d in /etc /var /tmp; do mount -t tmpfs tmpfs "$d"; done
     chmod 1777 /tmp
     ip link set lo up
@@ -38,4 +48,4 @@ exec unshare -mpnf --mount-proc --propagation private sh -ec '
     rm -r build pkg
     exec setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
         env -i PATH=/usr/bin:/bin HOME=/tmp python3 -Bu "$5"
-' sh "$ui" "$(realpath "$2")" "$(realpath "$3")" "$src" "$test_script" "$compat"
+' sh "$ui" "$(realpath "$2")" "$(realpath "$3")" "$src" "$test_script" "$compat" "$old"

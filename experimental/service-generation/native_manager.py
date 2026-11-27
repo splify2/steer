@@ -25,16 +25,17 @@ ORDER = (".", "owner.lock", "child.lock", "history", "type", "tree", "tree/bin",
          "tree/assets/fonts/onest-latin.woff2")
 
 
-def inventory(p):
+def inventory(p, removable=False):
     lines = []
     base = mount(p.parent)
-    for name in ORDER:
+    order = ORDER + ((".lock",) if removable else ())
+    for name in order:
         f = p/name
         s = f.lstat()
         require(s.st_uid == os.getuid() and mount(f) == base, "foreign-object")
         digest = "-"
-        children = {Path(n).name for n in ORDER if n != "." and str(Path(n).parent) == name}
-        if children:
+        children = {Path(n).name for n in order if n != "." and str(Path(n).parent) == name}
+        if children or name == ".lock":
             require(stat.S_ISDIR(s.st_mode) and not s.st_mode & 0o7022 and set(os.listdir(f)) == children,
                     "changed-directory")
         else:
@@ -46,7 +47,7 @@ def inventory(p):
     return "".join(lines).encode()
 
 
-def init(p, archive):
+def init(p, archive, removable=False):
     require(os.geteuid()==os.getuid() and os.getegid()==os.getgid(), "unprivileged-domain-required")
     parent(p)
     require(not os.path.lexists(p) and len(os.fsencode(p)) <= 80, "new-private-domain-required")
@@ -62,10 +63,14 @@ def init(p, archive):
         (tmp/"stage").rmdir()
         for name in ("owner.lock", "child.lock", "type", "history"):
             (tmp/name).touch(mode=0o600)
-        (tmp/"type").write_text(f"{TYPE}\n{p}\n{g}\n{archive}\n{info['key']}\n")
+        profile = TYPE if not removable else "supd-full/2"
+        if removable:
+            (tmp/".lock").mkdir(mode=0o700)
+            syncdir(tmp/".lock")
+        (tmp/"type").write_text(f"{profile}\n{p}\n{g}\n{archive}\n{info['key']}\n")
         (tmp/"history").write_text(f"start {g}\n")
-        os.setxattr(tmp/"history", PHASE, b"A", os.XATTR_CREATE)
-        os.setxattr(tmp, BIND, inventory(tmp), os.XATTR_CREATE)
+        os.setxattr(tmp/"history", PHASE if not removable else "user.steer.supd2.phase", b"A", os.XATTR_CREATE)
+        os.setxattr(tmp, BIND if not removable else "user.steer.supd2.binding", inventory(tmp,removable), os.XATTR_CREATE)
         for name in ("owner.lock", "child.lock", "type", "history"):
             with (tmp/name).open("rb") as f:
                 os.fsync(f.fileno())
@@ -109,12 +114,16 @@ def request(p, op, g, ticket="-", endpoint=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--supd-full-prefix",required=True,type=Path)
-    parser.add_argument("op",choices=("init","status","fence","check"))
+    parser.add_argument("op",choices=("init","init-removable","status","fence","check"))
     parser.add_argument("identity",help="archive digest for init; exact generation otherwise")
     parser.add_argument("receipt",nargs="?",default="-")
     a = parser.parse_args()
     try:
         p = a.supd_full_prefix
-        print(json.dumps(init(p,a.identity) if a.op=="init" else request(p,a.op,a.identity,a.receipt)))
+        if a.op=="init-removable":
+            g=init(p,a.identity,True)
+            print(json.dumps(dict(generation=g,binding=sha(os.getxattr(p,"user.steer.supd2.binding")))))
+        else:
+            print(json.dumps(init(p,a.identity) if a.op=="init" else request(p,a.op,a.identity,a.receipt)))
     except (OSError,ValueError,Refusal) as e:
         raise SystemExit("supd-full refused: "+str(e))
