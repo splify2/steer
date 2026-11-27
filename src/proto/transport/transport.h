@@ -377,6 +377,15 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s);
  * знает — иначе о нём пришлось бы помнить и в туннеле, и в проверке, и в каждом новом
  * месте, а забытое место означало бы поток, который уходит не в той упаковке. */
 int transport_write(struct transport *t, const unsigned char *d, size_t n);
+/* Additive companion, no transport_ops layout change. TCP plain/TLS1.3 and
+ * grpc/xhttp stream-one/up; other framing/security returns unsupported(2).
+ * 0 accepted,1 drain/retry,-1 error. Per-session capability must be checked. */
+int transport_can_halfclose(const struct transport *t);
+int transport_shutdown_write(struct transport *t);
+/* Factual terminal classification after a nonzero read result:0 unknown,
+ * 1 clean protocol EOF,2 error/truncation. Does not mutate the connection. */
+int transport_read_end(const struct transport *t,int result);
+#define TR_LINK_WRITE_END 2
 
 /* Сколько байт данных вызывающего transport_write примет сейчас, после собственной упаковки
  * транспорта (заголовок сообщения gRPC, записи шифрования VLESS); -1 — предела нет. Туннель

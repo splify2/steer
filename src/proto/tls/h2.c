@@ -11,8 +11,8 @@
  *     открывает своё TCP+TLS, и мы делаем так же: мультиплексирование экономило бы
  *     рукопожатия, но потребовало бы планировщика окон между потоками — то есть кода,
  *     который на роутере с одним ядром отлаживать дороже, чем он стоит;
- *   - HPACK на приём. Заголовки ответа не разбираются, из них добывается только :status:
- *     статическим индексом или литералом с именем из таблицы, цифрами или кодом Хаффмана
+ *   - динамической таблицы HPACK на приём. Ограниченный scanner проверяет :status и grpc-status,
+ *     статические индексы и длины остальных литералов; известные имена/цифры допускают Huffman.
  *     (Go-сервер пишет так 502, 401, 301 — см. status_huff). Полный HPACK
  *     потребовал бы динамической таблицы, то есть памяти на соединение и кода, который
  *     исполняется один раз за соединение;
@@ -40,6 +40,13 @@
 #define FR_PING          0x06
 #define FR_GOAWAY        0x07
 #define FR_WINDOW_UPDATE 0x08
+#define FR_CONTINUATION  0x09
+
+/* frame_peeked is ABI-existing storage for a contiguous header-block phase. */
+#define HP_HAVE 1u
+#define HP_CONT 2u
+#define HP_END  4u
+#define HP_TRAILER 8u
 
 #define FLAG_END_STREAM  0x01
 #define FLAG_ACK         0x01
@@ -282,12 +289,13 @@ int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
     /* SETTINGS: запретить push (нам он не нужен и только усложнил бы разбор) и объявить
      * своё окно потока. */
     {
-        unsigned char s[12];
+        unsigned char s[18];
         s[0] = 0; s[1] = 0x02; put32(s + 2, 0);              /* ENABLE_PUSH = 0 */
         s[6] = 0; s[7] = 0x04; put32(s + 8, OUR_WINDOW);     /* INITIAL_WINDOW_SIZE */
-        unsigned char hdr[9] = { 0, 0, 12, FR_SETTINGS, 0, 0, 0, 0, 0 };
+        s[12] = 0; s[13] = 0x01; put32(s + 14, 0);         /* HEADER_TABLE_SIZE = 0 */
+        unsigned char hdr[9] = { 0, 0, 18, FR_SETTINGS, 0, 0, 0, 0, 0 };
         wb(&b, hdr, 9);
-        wb(&b, s, 12);
+        wb(&b, s, sizeof(s));
     }
 
     /* Окно СОЕДИНЕНИЯ настройками не задаётся — только этим кадром. Без него сервер
@@ -338,6 +346,8 @@ int h2_next(struct h2 *h, const char *authority, const char *path,
      * номер закрытого потока нельзя — сервер ответит на такое ошибкой соединения, а не
      * потока, и связь оборвётся целиком. */
     h->sid += 2;
+    h->frame_ours=(h->frame_sid==h->sid);
+    h->frame_peeked &= (unsigned char)~(H2_GRPC_STATUS_OK|H2_GRPC_STATUS_ERROR);
     open_add(h, h->sid);
 
     /* Состояние ПОТОКА свежее, состояние СОЕДИНЕНИЯ нетронуто. Разница существенная: окно
@@ -507,12 +517,8 @@ static int ctl_handle(struct h2 *h) {
     return 0;
 }
 
-/* Статус ответа из первых байт HEADERS.
- *
- * Разбираем только то, что можно разобрать без динамической таблицы. В жизни сервер
- * отдаёт «:status 200» индексом 8 — один байт 0x88. Если встретилось что-то другое,
- * ставим -1 и НЕ считаем это ошибкой: догадка о статусе хуже, чем его отсутствие, а
- * пришли данные или нет — покажет чтение. */
+/* Bounded response status scanner: malformed/unsupported prefixes fail closed.
+ * Header blocks may span arbitrary transport reads and CONTINUATION frames. */
 /* Код последнего чужого статуса — для объяснения отказа. В потоке: соединители работают
  * параллельно, и общий на всех перетирался бы. */
 static __thread int g_last_status;
@@ -525,12 +531,12 @@ static __thread int g_last_status;
  * Нужны только цифры: у «0», «1», «2» пятибитные коды 00000…00010, у «3»…«9» шестибитные
  * 011001…011111. Любой другой символ значит, что это не код ответа, — тогда -1. После трёх
  * цифр допускается только набивка единицами короче байта (§5.2). */
-static int status_huff(const unsigned char *p, size_t n) {
+static int digits_huff(const unsigned char *p, size_t n,int digits) {
     uint32_t acc = 0;
     unsigned bits = 0;
     size_t i = 0;
     int v = 0;
-    for (int d = 0; d < 3; d++) {
+    for (int d = 0; d < digits; d++) {
         while (bits < 6 && i < n) { acc = (acc << 8) | p[i++]; bits += 8; }
         if (bits < 5) return -1;
         unsigned c5 = (acc >> (bits - 5)) & 0x1F;
@@ -547,44 +553,18 @@ static int status_huff(const unsigned char *p, size_t n) {
     if (i != n || bits >= 8 || acc != (1u << bits) - 1) return -1;
     return v;
 }
+static int status_huff(const unsigned char *p,size_t n){return digits_huff(p,n,3);}
 
-static void status_peek(struct h2 *h, const unsigned char *p, size_t n) {
-    size_t i = 0;
-    /* Обновление размера динамической таблицы (001xxxxx) идёт первым, если вообще есть.
-     * Значение — целое с префиксом в 5 бит: при 0x1F в младших битах продолжение лежит
-     * в следующих байтах со старшим битом 1. */
-    while (i < n && (p[i] & 0xE0) == 0x20) {
-        int cont = (p[i] & 0x1F) == 0x1F;
-        i++;
-        if (!cont) continue;
-        while (i < n && (p[i] & 0x80)) i++;
-        if (i < n) i++;
+#include "h2status.h"
+static int header_finish(struct h2 *h) {
+    if(!(h->frame_flags & FLAG_END_HEADERS)) {h->frame_peeked|=HP_CONT;return 0;}
+    if(!status_complete(h) || !(h->frame_peeked & (HP_HAVE|HP_TRAILER)))return H2_EPROTO;
+    h->frame_peeked &= (unsigned char)~HP_CONT;
+    if(h->frame_peeked & HP_END) {
+        if(h->frame_ours && h->status<200)return H2_EPROTO;
+        open_end(h,h->frame_sid);if(h->frame_ours)h->done=1;
     }
-    if (i >= n) { h->status = -1; return; }
-    switch (p[i]) {
-        case 0x88: h->status = 200; break;
-        case 0x89: h->status = 204; break;
-        case 0x8A: h->status = 206; break;
-        case 0x8B: h->status = 304; break;
-        case 0x8C: h->status = 400; break;
-        case 0x8D: h->status = 404; break;
-        case 0x8E: h->status = 500; break;
-        default:
-            /* Литерал с именем :status (индекс 8) — значение строкой из трёх цифр. */
-            if ((p[i] & 0x0F) == 0x08 && i + 2 < n) {
-                size_t len = p[i + 1] & 0x7F;
-                if (!(p[i + 1] & 0x80) && len == 3 && i + 4 < n) {
-                    h->status = (p[i + 2] - '0') * 100 + (p[i + 3] - '0') * 10 + (p[i + 4] - '0');
-                    break;
-                }
-                /* То же значение кодом Хаффмана: три цифры занимают от 15 до 18 бит. */
-                if ((p[i + 1] & 0x80) && len >= 2 && len <= 3 && i + 1 + len < n) {
-                    int v = status_huff(p + i + 2, len);
-                    if (v >= 100) { h->status = v; break; }
-                }
-            }
-            h->status = -1;
-    }
+    return 0;
 }
 
 /* Остановить разбор записи отказом rc. Если данные этого вызова уже лежат в out, они ОТДАЮТСЯ, а
@@ -598,7 +578,7 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
     if (h->pend_err) {
         int e = h->pend_err;
         h->pend_err = 0;
-        h->done = 1;                 /* дальше — тот же конец, сколько ни спрашивай */
+        if(!h->done)h->done=2;       /* Preserve an independently observed END_STREAM. */
         return e;
     }
     if (h->done) return H2_ERESET;
@@ -663,24 +643,14 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
                  * Зачитывается и набивка: окно тратит весь кадр (RFC 7540 §6.9.1). */
                 h->recv_credit_conn += (int32_t)take;
                 if (h->frame_ours) {
+                    if (h->status != 200) H2_STOP(H2_EPROTO);
                     if (*got + real > cap) H2_STOP(H2_ETOOBIG);
                     memcpy(out + *got, rec + p, real);
                     *got += real;
                     h->recv_credit += (int32_t)take;
                 }
-            } else if (h->frame_type == FR_HEADERS) {
-                if (h->frame_ours && h->status == 0 && real) status_peek(h, rec + p, real);
-                else if (!h->frame_ours && !h->frame_peeked && real) {
-                    /* Ответ на прежний поток (packet-up: прошлый кусок). Спрашивается только
-                     * начало кадра, как и у своего: статус в HEADERS идёт первым полем.
-                     * status_peek пишет в h->status — текущий поток его не должен видеть. */
-                    int keep = h->status;
-                    h->status = 0;
-                    status_peek(h, rec + p, real);
-                    if (h->status > 0 && h->status != 200) h->old_status = h->status;
-                    h->status = keep;
-                }
-                if (real) h->frame_peeked = 1;
+            } else if (h->frame_type == FR_HEADERS || h->frame_type == FR_CONTINUATION) {
+                rc=status_append(h,rec+p,real);if(rc)H2_STOP(rc);
             } else {
                 /* Служебный кадр: собираем тело, пока влезает. Не влезло — значит это
                  * SETTINGS с десятком настроек, из которых нас интересуют первые. */
@@ -692,12 +662,14 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
             p += take;
             h->frame_left -= (uint32_t)take;
             if (h->frame_left == 0) {
-                if (h->frame_type != FR_DATA && h->frame_type != FR_HEADERS) {
+                if(h->frame_type==FR_HEADERS||h->frame_type==FR_CONTINUATION) {
+                    rc=header_finish(h);if(rc)H2_STOP(rc);
+                } else if (h->frame_type != FR_DATA) {
                     rc = ctl_handle(h);
                     if (rc) H2_STOP(rc);
                 }
                 if ((h->frame_flags & FLAG_END_STREAM) &&
-                    (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS)) {
+                    h->frame_type == FR_DATA) {
                     open_end(h, h->frame_sid);
                     if (h->frame_ours) h->done = 1;
                 }
@@ -715,7 +687,12 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
         }
 
         uint32_t len = ((uint32_t)rec[p] << 16) | ((uint32_t)rec[p + 1] << 8) | rec[p + 2];
-        h->frame_type = rec[p + 3];
+        unsigned char next_type=rec[p+3];
+        uint32_t next_sid=get32(rec+p+5)&0x7fffffff;
+        int continuing=(h->frame_peeked & HP_CONT)!=0;
+        if(continuing && (next_type!=FR_CONTINUATION||next_sid!=h->frame_sid))H2_STOP(H2_EPROTO);
+        if(!continuing && next_type==FR_CONTINUATION)H2_STOP(H2_EPROTO);
+        h->frame_type = next_type;
         h->frame_flags = rec[p + 4];
         uint32_t sid = get32(rec + p + 5) & 0x7FFFFFFF;
         /* «Наш» — только ТЕКУЩИЙ поток. У packet-up позади остаются закрытые потоки
@@ -724,10 +701,18 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
          * делает общий разбор ниже) и отбрасываются: их содержимое — пустой ответ 200 на
          * выгрузку, читать в нём нечего. */
         h->frame_ours = (sid == h->sid);
+        if(h->frame_ours && h->done && (h->frame_type==FR_DATA || h->frame_type==FR_HEADERS))H2_STOP(H2_EPROTO);
+        if(h->frame_type==FR_DATA && h->frame_ours && h->status!=200)H2_STOP(H2_EPROTO);
         h->frame_sid = sid;
-        h->frame_peeked = 0;
+        if(!continuing) {
+            h->frame_peeked &= H2_GRPC_STATUS_OK|H2_GRPC_STATUS_ERROR;h->ctl_n=0;
+            if(h->frame_type==FR_HEADERS) {
+                if(!sid)H2_STOP(H2_EPROTO);
+                if(h->frame_flags & FLAG_END_STREAM)h->frame_peeked|=HP_END;
+                if(h->frame_ours && h->status>=200)h->frame_peeked|=HP_TRAILER;
+            }
+        }
         h->frame_left = len;
-        h->ctl_n = 0;
         p += 9;
         h->pad_left = 0;
         h->pad_wait = 0;
@@ -741,12 +726,14 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
 
         /* Кадр без тела обрабатывается сразу: цикл выше ждёт байт, которых не будет. */
         if (len == 0) {
-            if (h->frame_type != FR_DATA && h->frame_type != FR_HEADERS) {
+            if(h->frame_type==FR_HEADERS||h->frame_type==FR_CONTINUATION) {
+                rc=header_finish(h);if(rc)H2_STOP(rc);
+            } else if (h->frame_type != FR_DATA) {
                 rc = ctl_handle(h);
                 if (rc) H2_STOP(rc);
             }
             if ((h->frame_flags & FLAG_END_STREAM) &&
-                (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS)) {
+                h->frame_type == FR_DATA) {
                 open_end(h, h->frame_sid);
                 if (h->frame_ours) h->done = 1;
             }
@@ -755,7 +742,7 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
     }
 
 deliver:
-    if (h->status > 0 && h->status != 200) { g_last_status = h->status; return H2_ESTATUS; }
+    if (h->status >= 200 && h->status != 200) { g_last_status = h->status; return H2_ESTATUS; }
     if (h->old_status) { g_last_status = h->old_status; return H2_ESTATUS; }
     /* Поток закончен отказом, который ждёт следующего вызова: растить его окно незачем. */
     if (h->pend_err) return 0;

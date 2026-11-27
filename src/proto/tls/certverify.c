@@ -56,6 +56,22 @@ struct roots_ent {
 static struct roots_ent *g_roots_list;
 static pthread_mutex_t g_roots_mu = PTHREAD_MUTEX_INITIALIZER;
 
+struct cert_trust { struct sc_roots *store; };
+int cert_trust_prepare_pem(const unsigned char *pem, size_t length, struct cert_trust **out) {
+    if (out) *out = NULL;
+    if (!out || !pem || !length || length > CERT_TRUST_PEM_MAX) return CERTV_EPARSE;
+    struct cert_trust *trust = calloc(1, sizeof(*trust));
+    if (!trust) return CERTV_ENOROOTS;
+    if (sc_roots_load(&trust->store, pem, length) || !trust->store) {
+        sc_roots_free(trust->store); free(trust); return CERTV_ENOROOTS;
+    }
+    *out = trust; return 0;
+}
+void cert_trust_destroy(struct cert_trust *trust) {
+    if (!trust) return;
+    sc_roots_free(trust->store); free(trust);
+}
+
 static int roots_read(const char *path, struct sc_roots **out) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -297,10 +313,11 @@ static int chain_by_names(struct sc_roots *roots, const unsigned char *const *de
     return rc;
 }
 
-int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
+static int verify_server(const unsigned char *cert_body, size_t cert_n,
                           const unsigned char *cv_body, size_t cv_n,
                           const unsigned char *transcript, size_t thash_n,
-                          const char *host, const char *roots, const struct cert_policy *pol) {
+                          const char *host, const char *roots, const struct cert_policy *pol,
+                          struct sc_roots *prepared, int prepared_only) {
     if (!cert_body || !cv_body || !host || !host[0]) return CERTV_EPARSE;
 
     const unsigned char *der[CHAIN_MAX];
@@ -341,7 +358,10 @@ int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
     if (!leaf_pinned) {
         struct sc_roots *store = pinned_ca;
         if (!store) {
-            if (roots_get(roots, &store) != 0) return CERTV_ENOROOTS;
+            if (prepared_only) {
+                store = prepared;
+                if (!store) return CERTV_ENOROOTS;
+            } else if (roots_get(roots, &store) != 0) return CERTV_ENOROOTS;
         }
         /* ИМЯ ПРОВЕРЯЕТСЯ ЗДЕСЬ ЖЕ, вместе с цепочкой: отдельной проверкой оно оказалось бы
          * вторым местом, где живёт разбор SAN, и разошлось бы с библиотечным. */
@@ -350,6 +370,21 @@ int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
         if (rc) return rc;
     }
     return check_signature(der[0], der_n[0], cv_body, cv_n, transcript, thash_n);
+}
+
+int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
+    const unsigned char *cv_body, size_t cv_n, const unsigned char *transcript,
+    size_t thash_n, const char *host, const char *roots, const struct cert_policy *policy) {
+    return verify_server(cert_body, cert_n, cv_body, cv_n, transcript, thash_n,
+                         host, roots, policy, NULL, 0);
+}
+int cert_verify_server_prepared(const unsigned char *cert_body, size_t cert_n,
+    const unsigned char *cv_body, size_t cv_n, const unsigned char *transcript,
+    size_t thash_n, const char *host, const struct cert_trust *trust, const struct cert_policy *policy) {
+    if (!trust || !trust->store) return CERTV_ENOROOTS;
+    if (!transcript || !thash_n || thash_n > 64) return CERTV_EPARSE;
+    return verify_server(cert_body, cert_n, cv_body, cv_n, transcript, thash_n,
+                         host, NULL, policy, trust->store, 1);
 }
 
 /* ---- Reality: сервер доказывает подлинность нам ------------------------------------
@@ -462,6 +497,25 @@ int cert_reality_check(const unsigned char *cert_body, size_t cert_n,
     unsigned char diff = 0;
     for (size_t i = 0; i < sizeof(want); i++) diff |= (unsigned char)(want[i] ^ sig[i]);
     return diff ? CERTV_ENOTREALITY : 0;
+}
+
+int cert_reality_verify(const unsigned char *cert_body, size_t cert_n,
+    const unsigned char *cv_body, size_t cv_n, const unsigned char *transcript, size_t transcript_n) {
+    if (!cert_body || !cv_body || !transcript || (transcript_n != 32 && transcript_n != 48) || cv_n < 4)
+        return CERTV_EPARSE;
+    if (cv_body[0] != 8 || cv_body[1] != 7) return CERTV_EALG;
+    if (cv_n != 68 || cv_body[2] != 0 || cv_body[3] != 64) return CERTV_EPARSE;
+    const unsigned char *der[CHAIN_MAX]; size_t lengths[CHAIN_MAX], count;
+    int rc = parse_chain(cert_body, cert_n, der, lengths, &count);
+    if (rc) return rc;
+    const unsigned char *pub = find_ed25519_pub(der[0], lengths[0]);
+    if (!pub) return CERTV_ENOTREALITY;
+    unsigned char content[176]; size_t n = 64;
+    memset(content, 0x20, n);
+    memcpy(content + n, CV_LABEL, sizeof(CV_LABEL) - 1); n += sizeof(CV_LABEL) - 1;
+    content[n++] = 0;
+    memcpy(content + n, transcript, transcript_n); n += transcript_n;
+    return sc_ed25519_verify(pub, content, n, cv_body + 4) ? CERTV_ESIG : 0;
 }
 
 /* Значение первого расширения X.509 (extnValue, содержимое OCTET STRING) временного сертификата

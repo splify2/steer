@@ -133,7 +133,8 @@ static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
  * телом, отправка возвращала успех, и узел выглядел живым, а трафик не шёл (I-219). Прочие
  * коды h2_read здесь не отказ: H2_ERESET у packet-up — это законный конец ответа на кусок,
  * а обрыв связи назовёт следующая запись. */
-static int up_drain(struct xh_up *u) {
+static int up_drain(struct xh_state *x) {
+    struct xh_up *u=&x->up;
     if (!u->started) return 0;
     /* Живая запись (I-534): то, что сокет не принял сразу, лежит в очереди связи и уходит здесь — слив
      * зовётся перед каждой отправкой, при каждом ответе сервера и при низком месте. Сам сокет выгрузки
@@ -146,6 +147,8 @@ static int up_drain(struct xh_up *u) {
      * по этому признаку брала по одной записи за вызов, а ответ на кусок лежал за WINDOW_UPDATE и
      * SETTINGS. */
     for (int i = 0; i < 64; i++) {
+        if(u->h2.done && !u->h2.pend_err && x->mode==XH_STREAM_UP &&
+           !(u->link.live & TR_LINK_WRITE_END))return H2_ERESET;
         /* packet-up: ответ на ТЕКУЩИЙ кусок (done) ничего не говорит о старых, ответы на которые
          * ещё в пути: сервер отвечает в любом порядке. h2_read отказался бы читать, раз done стоит,
          * и ответ на самый старый кусок никогда не прочитался бы: его окно оставалось полным, и
@@ -160,8 +163,12 @@ static int up_drain(struct xh_up *u) {
         if (!more) return 0;
         size_t got = 0;
         int rc = h2_read(&u->h2, sink, sizeof(sink), &got);
-        if (rc == H2_ESTATUS) return rc;
-        if (rc) return 0;
+        if (rc) {
+            if(rc==H2_ERESET && u->h2.done && !u->h2.why[0] && !u->h2.pend_err &&
+               ((u->link.live & TR_LINK_WRITE_END) ||
+                (x->mode==XH_PACKET_UP && h2_open_streams(&u->h2)==0)))return 0;
+            return rc;
+        }
     }
     return 0;
 }
@@ -275,16 +282,19 @@ static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_
                           : n->sni[0] ? n->sni : n->host;
     char abuf[136];
     if (authority == n->host && strchr(authority, ':')) {   /* адрес IPv6 в :authority — в скобках */
-        snprintf(abuf, sizeof(abuf), "[%s]", authority);
+        int count = snprintf(abuf, sizeof(abuf), "[%s]", authority);
+        if (count < 0 || (size_t)count >= sizeof(abuf)) return H2_ETOOBIG;
         authority = abuf;
     }
+    size_t authority_n = strlen(authority);
+    if (authority_n >= sizeof(x->authority)) return H2_ETOOBIG;
     char path[320];
 
     /* Режим определяется ЗДЕСЬ, один раз: дальше он читается и при открытии потоков, и при
      * каждой отправке, и три независимых разбора строки разошлись бы. */
     x->mode = xhttp_mode_of(n);
     xhttp_path(n, path, sizeof(path));
-    snprintf(x->authority, sizeof(x->authority), "%s", authority);
+    memcpy(x->authority, authority, authority_n + 1);
     x->pad_from = n->pad_from;
     x->pad_to = n->pad_to;
     x->pad_set = n->pad_set;
@@ -442,8 +452,8 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
              * сервер успел ответить. Закрытое окно может значить лишь непрочитанный
              * WINDOW_UPDATE: слить и попробовать ещё раз, прежде чем отказывать. */
             int rc = h2_write(&x->up.h2, d, n);
-            if (rc == H2_EWINDOW && up_drain(&x->up) == 0) rc = h2_write(&x->up.h2, d, n);
-            int dr = up_drain(&x->up);
+            if (rc == H2_EWINDOW && up_drain(x) == 0) rc = h2_write(&x->up.h2, d, n);
+            int dr = up_drain(x);
             return rc ? rc : dr;
         }
         case XH_PACKET_UP: {
@@ -471,7 +481,7 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
              * ушёл бы на поток сверх last_stream_id — сервер его молча отбросит. Запрос на кусок
              * дороже одного poll, так что цена здесь пренебрежима. */
             if (x->up.started) {
-                int pre = up_drain(&x->up);
+                int pre = up_drain(x);
                 if (pre) return pre;        /* отказ на прошлый кусок (I-219): поток уже не цел */
             }
             if (x->up.started && x->up.h2.goaway) {
@@ -492,7 +502,7 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
 #define PACKET_FITS() ((long)piece <= packet_room(&x->up) && (long)n <= packet_conn_room(&x->up) && \
                        (packet_slots(&x->up) >= pieces || \
                         (pieces > PACKET_INFLIGHT && !h2_open_streams(&x->up.h2))))
-            if (!PACKET_FITS()) up_drain(&x->up);
+            if (!PACKET_FITS()) up_drain(x);
             if (!PACKET_FITS()) return H2_EWINDOW;
 #undef PACKET_FITS
             int rc = 0;
@@ -510,7 +520,7 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
                 if (rc == H2_EWINDOW && off) rc = H2_EIO;
                 off += m;
             }
-            int dr = up_drain(&x->up);
+            int dr = up_drain(x);
             return rc ? rc : dr;
         }
     }
@@ -576,7 +586,7 @@ static long xhttp_room_win(struct transport *t) {
     switch (x->mode) {
         case XH_STREAM_ONE: return h2_room(&t->h2);
         case XH_STREAM_UP:
-            if (h2_room(&x->up.h2) < UP_ROOM_LOW) up_drain(&x->up);
+            if (h2_room(&x->up.h2) < UP_ROOM_LOW) up_drain(x);
             return h2_room(&x->up.h2);
         case XH_PACKET_UP: {
             /* В БАЙТАХ, которые несут свободные места под куски, а не окно HTTP/2: окно бывает в
@@ -586,7 +596,7 @@ static long xhttp_room_win(struct transport *t) {
              * (post_floor): запись не больше места занимает не больше свободных мест, как бы ни
              * выпали случайные размеры; без предела у узла — по 64 КБ, окну по умолчанию. */
             if (packet_room(&x->up) < UP_ROOM_LOW || packet_slots(&x->up) <= PACKET_INFLIGHT / 2)
-                up_drain(&x->up);
+                up_drain(x);
             long r = packet_room(&x->up);
             long slots = packet_slots(&x->up);
             size_t fl = post_floor(x);
@@ -619,20 +629,23 @@ static int xhttp_aux_fd(const struct transport *t) {
 
 static int xhttp_aux_drain(struct transport *t) {
     struct xh_state *x = &t->xh;
-    int rc = up_drain(&x->up);
+    int rc = up_drain(x);
     /* Отказ не теряем: он останется записи. Читать эту связь дальше незачем — сломанная, она
      * иначе будила бы цикл на каждом витке. */
     if (rc && !x->drain_err) x->drain_err = rc;
     if (rc) return rc;
     /* Закрытая сервером связь читается всегда (конец потока): будить цикл ею бесконечно нельзя. */
     if (up_hung(&x->up)) {
+        if(x->mode==XH_STREAM_UP && (x->up.link.live & TR_LINK_WRITE_END) &&
+           x->up.h2.done && !x->up.h2.why[0] && !x->up.h2.pend_err)return -1;
         /* Предел запросов на соединение (GOAWAY) при отвеченных кусках — не конец: поднимаем
          * связь заново, и цикл подхватит новый дескриптор (aux_fd). Иначе слежка за выгрузкой
          * снялась бы навсегда, и ответы снова читались бы только попутно с отправкой. */
         if (x->mode == XH_PACKET_UP && x->up.h2.goaway && h2_open_streams(&x->up.h2) == 0 &&
             up_reopen(t) == 0)
             return 0;
-        if (x->mode == XH_PACKET_UP && h2_open_streams(&x->up.h2) > 0 && !x->drain_err)
+        if ((x->mode == XH_STREAM_UP ||
+             (x->mode == XH_PACKET_UP && h2_open_streams(&x->up.h2) > 0)) && !x->drain_err)
             x->drain_err = H2_ERESET;
         return -1;
     }

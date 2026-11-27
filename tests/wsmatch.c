@@ -71,6 +71,8 @@ int tls13_read(struct tls13 *t, unsigned char *o, size_t cap, size_t *got)
 int tls13_read_ref(struct tls13 *t, const unsigned char **b, size_t *bn)
     { (void)t; *b = NULL; *bn = 0; return -1; }
 void tls13_free(struct tls13 *t) { (void)t; }
+int tls13_flush(struct tls13 *t) { return outq_flush(t->fd, &t->oq); }
+int tls13_shutdown_write(struct tls13 *t) { (void)t; return 2; }
 
 /* ---- стенд ----------------------------------------------------------------------- */
 

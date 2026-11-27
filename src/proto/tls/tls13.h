@@ -78,6 +78,20 @@ struct tls13_keys {
  * не заведёт в контексте указатель, слой не может. Передавайте указатель; нужен второй
  * экземпляр — разворачивайте его из ключа заново. */
 
+/* Private phase overlay in the former handshake-only transcript footprint.
+ * Not additional ABI storage. Both sc_hash contexts are destroyed before use;
+ * phase is the discriminator even after a terminal post-handshake error. */
+#define TLS13_POST_PHASE (-8446)
+struct tls13_post {
+    int phase;
+    unsigned char app_rd_secret[48], app_wr_secret[48];
+    unsigned char header[4], header_n, type;
+    uint32_t left;
+    int key_update_pending, error;
+    int write_closed, read_closed;
+};
+_Static_assert(sizeof(struct tls13_post) <= 2 * sizeof(struct sc_hash_ctx), "TLS post state must fit legacy transcript storage");
+
 struct tls13 {
     int fd;
     int ready;
@@ -109,8 +123,7 @@ struct tls13 {
      * симптом — «узел подключается и молчит», и отличить его от закрытого порта нельзя. */
     char alpn[16];
     struct tls13_keys rd, wr;
-    /* Счётчики записей. НЕ сбрасываются: сброс означал бы повтор nonce, то есть
-     * полную потерю защиты AEAD. */
+    /* Sequence resets only with a fresh traffic secret/key (RFC8446 §7.2). */
     uint64_t rd_seq, wr_seq;
     /* Транскрипт рукопожатия — СРАЗУ ДВА, по SHA-256 и по SHA-384.
      *
@@ -123,8 +136,11 @@ struct tls13 {
      * AES_256_GCM_SHA384, а список обязан совпадать с браузерным. Предложить набор и не
      * уметь его обслужить — это «рукопожатие прошло, поток не расшифровывается», ровно то,
      * что и наблюдалось на узле, выбравшем 0x1302. */
-    struct sc_hash_ctx tr;
-    struct sc_hash_ctx tr384;
+    union {
+        struct { struct sc_hash_ctx tr; struct sc_hash_ctx tr384; };
+        struct tls13_post post;
+        unsigned char phase_storage[2 * sizeof(struct sc_hash_ctx)];
+    };
     size_t hash_n;                  /* 32 или 48 — известно после ServerHello */
 };
 
@@ -225,6 +241,16 @@ size_t tls13_buffered(const struct tls13 *t);
 size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap);
 
 int tls13_write(struct tls13 *t, const unsigned char *data, size_t n);
+/* Flush queued ciphertext and read-triggered control replies without blocking.
+ * 0 drained, 1 socket busy, negative fatal. Pending includes a bounded deferred
+ * KeyUpdate response, so event loops must rearm writes after read-side controls. */
+int tls13_flush(struct tls13 *t);
+/* 0 write half closed after ordered close_notify drain;1 retry,2 unsupported,
+ * negative fatal. Read half remains usable. No blocking socket write. */
+int tls13_shutdown_write(struct tls13 *t);
+static inline size_t tls13_pending(const struct tls13 *t) {
+    return outq_pending(&t->oq) + (t->post.phase == TLS13_POST_PHASE && t->post.key_update_pending ? 27u : 0u);
+}
 /* Живая запись (I-534): при t->live tls13_write не ждёт сокета — непринятое остаётся в t->oq (outq.h), его досылают
  * outq_flush(t->fd, &t->oq) по событию записи. */
 int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got);

@@ -168,9 +168,11 @@ struct plan {
     /* Ниже — путь security=tls: настоящая цепочка, выпущенная стендом (R-118). Поле cert у
      * этих случаев не читается: чем именно отвечать, решает leaf. */
     int chain;            /* 0 — не путь tls; иначе номер листа из g_leaf[] */
+    int phase_fault;       /* authenticated malformed handshake sequence/EE */
     int no_cv;            /* прислать Certificate и НЕ прислать CertificateVerify */
     int cv_bad_sig;       /* испортить байт подписи */
     int cv_bad_alg;       /* подписать кодом, которого мы не предлагали (rsa_pkcs1_sha256) */
+    int cv_wrong_key, cv_bad_transcript; /* REALITY proof negative cases */
     /* Шаг 5 выпуска 1.10: ws и httpupgrade поверх tls и reality — на настоящей библиотеке.
      * reality_ok — временный сертификат Reality с настоящей подписью HMAC-SHA512 на authkey
      * (единственный путь к УДАВШЕМУСЯ Reality в этом стенде); upg — после рукопожатия сервер
@@ -625,6 +627,29 @@ static int app_phase(struct srv *s) {
     return rc;
 }
 
+static int send_reality_cv(struct srv *s, const struct plan *pl) {
+    unsigned char message[72] = {15,0,0,68,8,7,0,64};
+#if defined(STEER_HAVE_X509WRITE)
+    unsigned char content[160], hash[HLEN], seed[32] = {42};
+    static const char label[] = "TLS 1.3, server CertificateVerify";
+    tr_snapshot(&s->tr, hash);
+    memset(content, 32, 64); memcpy(content + 64, label, sizeof(label));
+    memcpy(content + 64 + sizeof(label), hash, HLEN);
+    size_t length = 64 + sizeof(label) + HLEN;
+    if (pl->cv_bad_transcript) content[length - 1] ^= 1;
+    if (pl->cv_wrong_key) seed[0]++;
+    if (tcg_ed25519_sign(seed, content, length, message + 8)) return -1;
+#else
+    /* Only the deliberately malformed-cert negative case may use this branch.
+     * Successful REALITY fixtures are explicitly skipped without the signer. */
+    if (pl->reality_ok) return -1;
+#endif
+    if (pl->cv_bad_sig) message[71] ^= 1;
+    if (pl->cv_bad_alg) message[5] = 4;
+    if (send_enc(s, message, sizeof(message))) return -1;
+    sc_hash_update(&s->tr, message, sizeof(message));
+    return 0;
+}
 static void *server_half(void *arg) {
     struct srv *s = arg;
     const struct plan *pl = s->plan;
@@ -656,14 +681,15 @@ static void *server_half(void *arg) {
     m += 32;
     sh[m++] = (unsigned char)sid_n;
     memcpy(sh + m, sid, sid_n); m += sid_n;
-    sh[m++] = SUITE_HI; sh[m++] = SUITE_LO;
+    if (pl->phase_fault == 14 && sid_n) sh[39] ^= 1;
+    sh[m++] = SUITE_HI; sh[m++] = pl->phase_fault == 15 ? 4 : SUITE_LO;
     sh[m++] = 0x00;                                  /* compression */
     size_t exts_at = m; m += 2;
     sh[m++] = 0x00; sh[m++] = 0x2b; sh[m++] = 0x00; sh[m++] = 0x02;
     sh[m++] = 0x03; sh[m++] = 0x04;                  /* supported_versions: TLS 1.3 */
     if (!pl->no_keyshare) {
         sh[m++] = 0x00; sh[m++] = 0x33; sh[m++] = 0x00; sh[m++] = 0x24;
-        sh[m++] = 0x00; sh[m++] = 0x1d; sh[m++] = 0x00; sh[m++] = 0x20;
+        sh[m++] = 0x00; sh[m++] = pl->phase_fault == 16 ? 23 : 0x1d; sh[m++] = 0x00; sh[m++] = 0x20;
         memcpy(sh + m, spub, 32); m += 32;
     }
     sh[exts_at]     = (unsigned char)((m - exts_at - 2) >> 8);
@@ -715,8 +741,26 @@ static void *server_half(void *arg) {
     ee[elist_at]     = (unsigned char)((en - elist_at - 2) >> 8);
     ee[elist_at + 1] = (unsigned char)(en - elist_at - 2);
     ee[1] = 0; ee[2] = (unsigned char)((en - 4) >> 8); ee[3] = (unsigned char)(en - 4);
+    if (pl->phase_fault == 12) ee[elist_at + 11] = 0; /* h2\0junk, length retained */
+    if (pl->phase_fault == 8) ee[elist_at + 1]++;
+    if (pl->phase_fault == 9) { ee[en++] = 0; ee[elist_at + 1]++; ee[3]++; }
+    if (pl->phase_fault == 10 && pl->alpn) ee[elist_at + 6]++;
+    if (pl->phase_fault == 11 && pl->alpn) {
+        size_t ext_n = en - elist_at - 2;
+        memcpy(ee + en, ee + elist_at + 2, ext_n); en += ext_n;
+        ee[elist_at + 1] = (unsigned char)(en - elist_at - 2); ee[3] = (unsigned char)(en - 4);
+    }
     if (send_enc(s, ee, en)) return NULL;
     sc_hash_update(&s->tr, ee, en);
+    if (pl->phase_fault == 1) {
+        if (send_enc(s, ee, en)) return NULL;
+        sc_hash_update(&s->tr, ee, en);
+    }
+    if (pl->phase_fault == 5) {
+        const unsigned char unknown[4] = { 99, 0, 0, 0 };
+        if (send_enc(s, unknown, sizeof(unknown))) return NULL;
+        sc_hash_update(&s->tr, unknown, sizeof(unknown));
+    }
 
 #if defined(STEER_HAVE_X509WRITE)
     /* ---- Certificate и CertificateVerify настоящей цепочкой (путь security=tls) ---- */
@@ -725,10 +769,20 @@ static void *server_half(void *arg) {
         unsigned char msg[3072];
         size_t mn = cert_msg(l, msg, sizeof(msg));
         if (!mn) return NULL;
+        if (pl->phase_fault == 4) {
+            unsigned char before[HLEN], early_cv[1024]; tr_snapshot(&s->tr, before);
+            size_t early_n = cv_msg(l, before, pl, early_cv, sizeof(early_cv));
+            if (!early_n || send_enc(s, early_cv, early_n)) return NULL;
+            sc_hash_update(&s->tr, early_cv, early_n);
+        }
         if (send_enc(s, msg, mn)) return NULL;
         sc_hash_update(&s->tr, msg, mn);
+        if (pl->phase_fault == 2) {
+            if (send_enc(s, msg, mn)) return NULL;
+            sc_hash_update(&s->tr, msg, mn);
+        }
 
-        if (!pl->no_cv) {
+        if (!pl->no_cv && pl->phase_fault != 4) {
             /* Хеш снимается ПОСЛЕ Certificate и ДО CertificateVerify — ровно то, что
              * подписывает сервер по RFC 8446 §4.4.3, и ровно то место, где клиент снимает
              * свой (tls13.c, разбор сообщения 0x0F). Ошибка на один шаг здесь дала бы
@@ -739,6 +793,10 @@ static void *server_half(void *arg) {
             if (!cn) return NULL;
             if (send_enc(s, msg, cn)) return NULL;
             sc_hash_update(&s->tr, msg, cn);
+            if (pl->phase_fault == 3) {
+                if (send_enc(s, msg, cn)) return NULL;
+                sc_hash_update(&s->tr, msg, cn);
+            }
         }
         goto finished;
     }
@@ -754,15 +812,20 @@ static void *server_half(void *arg) {
         return NULL;
     }
     if (pl->reality_ok) {
-        /* Временный сертификат Reality: ключ Ed25519 (любые 32 байта — его никто не проверяет
-         * как ключ) и поле подписи = HMAC-SHA512(authkey, ключ), где authkey — HKDF-SHA256 от
+        /* Временный сертификат Reality: настоящий ключ Ed25519 фикстуры и
+         * поле подписи = HMAC-SHA512(authkey, ключ), где authkey — HKDF-SHA256 от
          * ECDH(постоянный ключ сервера, эфемерный клиента) с солью Random[0..20) и info
          * «REALITY» (reality.go у Xray; клиентская половина — reality.c). DER — ровно столько,
          * сколько читает cert_reality_check: SEQUENCE { tbs с SPKI Ed25519, algid, BIT STRING }. */
         unsigned char shared[32], authkey[32], epub[32], sig[64];
         if (x25519_shared_ext(g_rs_priv, cpub, shared) != 0) return NULL;
         if (sc_hkdf(SC_SHA256, ch + 6, 20, shared, 32, "REALITY", 7, authkey, 32) != 0) return NULL;
-        for (int i = 0; i < 32; i++) epub[i] = (unsigned char)(0x40 + i);
+#if defined(STEER_HAVE_X509WRITE)
+        const unsigned char ed_seed[32] = {42};
+        if (tcg_ed25519_public(ed_seed, epub)) return NULL;
+#else
+        return NULL;
+#endif
         if (sc_hmac(SC_SHA512, authkey, 32, epub, 32, sig) != 0) return NULL;
         static const unsigned char spki[] = { 0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70,
                                               0x03, 0x21, 0x00 };
@@ -799,6 +862,8 @@ static void *server_half(void *arg) {
         sc_hash_update(&s->tr, cr, 36);
     }
 
+    if ((pl->reality_ok || pl->cert == 1) && !pl->no_cv && send_reality_cv(s, pl)) return NULL;
+
     /* ---- Finished ---- */
 #if defined(STEER_HAVE_X509WRITE)
 finished:;
@@ -811,7 +876,11 @@ finished:;
     unsigned char fin[4 + HLEN];
     fin[0] = 0x14; fin[1] = 0; fin[2] = 0; fin[3] = (unsigned char)HLEN;
     memcpy(fin + 4, vd, HLEN);
-    if (send_enc(s, fin, sizeof(fin))) return NULL;
+    if (pl->phase_fault == 6 || pl->phase_fault == 7) {
+        unsigned char tail[sizeof(fin) + 4]; memcpy(tail, fin, sizeof(fin));
+        memset(tail + sizeof(fin), 0, 4); tail[sizeof(fin)] = 4;
+        if (send_enc(s, tail, sizeof(fin) + (pl->phase_fault == 6 ? 4 : 1))) return NULL;
+    } else if (send_enc(s, fin, sizeof(fin))) return NULL;
     sc_hash_update(&s->tr, fin, sizeof(fin));
 
     if (pl->upg) { s->rc = app_phase(s); return NULL; }
@@ -1090,6 +1159,7 @@ int main(void) {
      * http/1.1» — Hello у tcp шагом не тронут). У ws и httpupgrade — всё до данных: ALPN один
      * http/1.1, запрос Upgrade с путём без ed, ответ 101 и первые данные ОДНОЙ записью TLS (остаток
      * не теряется), ответ клиента дошёл — у ws кадром с маской. */
+#if defined(STEER_HAVE_X509WRITE)
     if (xc_x25519_keypair(g_rs_priv, g_rs_pub) != 0) {
         printf("%-64s %s\n", "пара сервера Reality", "ПРОВАЛ");
         fails++;
@@ -1134,7 +1204,22 @@ int main(void) {
             snprintf(what, sizeof(what), "reality + %s: в куче ничего не осталось", rtype[u]);
             check(what, 0, LEAK_CHECK());
         }
+        static const char *bad_cv[] = {"tampered signature","wrong signing key","wrong transcript","missing CV"};
+        for (unsigned k = 0; k < 4; k++) {
+            struct plan bad = {.name="REALITY CV rejection",.reality_ok=1,
+                .cv_bad_sig=k==0,.cv_wrong_key=k==1,.cv_bad_transcript=k==2,.no_cv=k==3};
+            struct vless_node rn;node_reality(&rn,"tcp");b64url(g_rs_pub,32,rn.pbk);
+            char what[160];int fd0=fd_count();
+            int rc=run_case(&bad,&rn,NULL,0,NULL);
+            snprintf(what,sizeof(what),"REALITY CV %s rejected",bad_cv[k]);check(what,TLS13_ECERT,rc);
+            check("REALITY CV rejection: descriptors drained",fd0,fd_count());
+            check("REALITY CV rejection: no leaked allocations",0,LEAK_CHECK());
+        }
     }
+
+#else
+    printf("REALITY success/CV fixtures skipped: build with STEER_HAVE_X509WRITE and fixture signing profile\n");
+#endif
 
     /* ---- security=tls со своими корнями (R-118) ---------------------------------
      *
@@ -1158,6 +1243,24 @@ int main(void) {
             node_tls(&w, "tcp");
             int rc = run_case(&warm, &w, NULL, 0, NULL);
             check("прогрев tls: цепочка сошлась, соединение установлено", 0, rc);
+        }
+
+        /* Valid record keys and signed transcript: failures must be parser decisions. */
+        for (int fault = 1; fault <= 16; fault++) {
+            struct plan malformed = {.name="strict TLS phase/EE", .chain=LEAF_OK,
+                .phase_fault=fault, .alpn=fault == 12 ? "h2xjunk" : fault == 13 ? "ftp" : "h2"};
+            struct vless_node node; node_tls(&node, "grpc");
+            char name[96]; snprintf(name, sizeof(name), "strict TLS phase/EE case %d", fault);
+            check(name, TLS13_EBADREC, run_case(&malformed, &node, NULL, 0, NULL));
+        }
+
+        {
+            /* Identical mandatory REALITY0807 proof has no generic TLS exception. */
+            struct plan ed = {.name="unoffered0807 outside REALITY", .reality_ok=1};
+            struct vless_node node; node_tls(&node,"tcp"); char reason[256]={0};
+            check("standard TLS rejects unoffered0807", TLS13_ECERT,
+                  run_case(&ed,&node,reason,sizeof(reason),NULL));
+            check_str("standard TLS unoffered0807 diagnostic", "которого мы не предлага", reason);
         }
 
         static const struct plan tls_plans[] = {
@@ -1313,7 +1416,7 @@ int main(void) {
             struct vless_node tn;
             node_tls(&tn, "ws");
             int rc = run_case(&up, &tn, NULL, 0, NULL);
-            check("tls + ws: сервер выбрал h2 — отказ TR_ENOH1", TR_ENOH1, rc);
+            check("tls + ws: unoffered h2 rejected in TLS negotiation", TLS13_EBADREC, rc);
         }
         g_cert_roots = NULL;
         chain_free();

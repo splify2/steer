@@ -55,6 +55,8 @@ int tls13_read(struct tls13 *t, unsigned char *o, size_t cap, size_t *got)
 int tls13_read_ref(struct tls13 *t, const unsigned char **b, size_t *bn)
     { (void)t; *b = NULL; *bn = 0; return -1; }
 void tls13_free(struct tls13 *t) { (void)t; }
+int tls13_flush(struct tls13 *t) { return outq_flush(t->fd, &t->oq); }
+int tls13_shutdown_write(struct tls13 *t) { (void)t; return 2; }
 
 /* ---- стенд ----------------------------------------------------------------------- */
 
@@ -133,7 +135,8 @@ static void t_end_in_one_record(int with_rst, int with_end_stream, const char *w
     unsigned char m[64];
     size_t mn = grpc_msg(m, "hello");
     n += frame(w + n, FRD, 0, 1, m, mn);
-    if (with_end_stream) n += frame(w + n, FRH, FEND_HEADERS | FEND_STREAM, 1, ok, 1);  /* концевые */
+    static const unsigned char trailers[]={0,11,'g','r','p','c','-','s','t','a','t','u','s',1,'0'};
+    if (with_end_stream) n += frame(w + n, FRH, FEND_HEADERS | FEND_STREAM, 1, trailers, sizeof(trailers));
     if (with_rst) { unsigned char z[4] = { 0, 0, 0, 0 }; n += frame(w + n, FRR, 0, 1, z, 4); }
     if (write(g_srv, w, n) != (ssize_t)n) { perror("write"); exit(2); }
 
@@ -150,6 +153,8 @@ static void t_end_in_one_record(int with_rst, int with_end_stream, const char *w
         rc = transport_read(&c, buf, sizeof(buf), &got);
         snprintf(line, sizeof(line), "%s: следующее чтение — конец потока", what);
         check(rc == H2_ERESET, line);
+        check(transport_read_end(&c,rc)==(with_end_stream && !with_rst?1:2),
+              "gRPC: verified status0 END_STREAM differs from reset");
     } else {
         snprintf(line, sizeof(line), "%s: без конца потока has_data молчит", what);
         check(transport_has_data(&c) == 0, line);
@@ -204,7 +209,38 @@ static void t_trailers_only(const char *what) {
     transport_close(&c);
 }
 
+static void t_halfclose(void) {
+    struct transport c;unsigned char wire[512],out[TRANSPORT_MIN_READ_CAP],message[64];size_t got;
+    static const unsigned char ok[]={0x88},trailers[]={0,11,'g','r','p','c','-','s','t','a','t','u','s',1,'0'};
+    check(!open_stream(&c),"half-close stream open");transport_live(&c);
+    check(transport_can_halfclose(&c)==1,"gRPC advertises END_STREAM companion");
+    check(!transport_shutdown_write(&c)&&!transport_shutdown_write(&c),"H2 write shutdown idempotent");
+    ssize_t sent=recv(g_srv,wire,sizeof(wire),MSG_DONTWAIT);
+    check(sent==9&&wire[3]==FRD&&wire[4]==FEND_STREAM,"exactly one empty END_STREAM emitted");
+    transport_live(&c);
+    check(transport_write(&c,(const unsigned char *)"x",1)==TR_ECLOSED,"live reentry cannot reopen closed write half");
+    size_t n=frame(wire,FRH,FEND_HEADERS,1,ok,sizeof(ok));
+    size_t mn=grpc_msg(message,"reverse");n+=frame(wire+n,FRD,0,1,message,mn);
+    n+=frame(wire+n,FRH,FEND_HEADERS|FEND_STREAM,1,trailers,sizeof(trailers));
+    check(write(g_srv,wire,n)==(ssize_t)n,"server reverse response queued after local FIN");
+    int rc=transport_read(&c,out,sizeof(out),&got);
+    check(!rc&&got==7&&!memcmp(out,"reverse",7),"gRPC reverse payload survives local END_STREAM");
+    rc=transport_read(&c,out,sizeof(out),&got);
+    check(transport_read_end(&c,rc)==1,"verified terminal grpc-status0 is clean EOF");transport_close(&c);
+    check(!open_stream(&c),"missing-trailer stream open");
+    n=frame(wire,FRH,FEND_HEADERS|FEND_STREAM,1,ok,sizeof(ok));write(g_srv,wire,n);
+    transport_read(&c,out,sizeof(out),&got);rc=transport_read(&c,out,sizeof(out),&got);
+    check(transport_read_end(&c,rc)==2,"missing grpc-status is error rather than EOF");transport_close(&c);
+    check(!open_stream(&c),"partial-message stream open");
+    n=frame(wire,FRH,FEND_HEADERS,1,ok,sizeof(ok));mn=grpc_msg(message,"tail");
+    n+=frame(wire+n,FRD,0,1,message,mn-2);
+    n+=frame(wire+n,FRH,FEND_HEADERS|FEND_STREAM,1,trailers,sizeof(trailers));write(g_srv,wire,n);
+    transport_read(&c,out,sizeof(out),&got);rc=transport_read(&c,out,sizeof(out),&got);
+    check(transport_read_end(&c,rc)==2,"partial gRPC message with status0 is truncation");transport_close(&c);
+}
+
 int main(void) {
+    t_halfclose();
     t_end_in_one_record(1, 1, "данные + END_STREAM + RST_STREAM одной записью");
     t_end_in_one_record(0, 1, "данные + END_STREAM без RST_STREAM");
     t_end_in_one_record(1, 0, "данные + RST_STREAM без END_STREAM");

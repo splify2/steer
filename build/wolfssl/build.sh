@@ -76,6 +76,17 @@ case "$ASM:$TRIPLE" in
 esac
 
 DEFS="-DWOLFSSL_USER_SETTINGS $ASMDEF ${STEER_WOLFSSL_DEFS:-}"
+# Record the effective archive profile, not a consumer's later header. Old
+# archives/sidecars intentionally lack this marker and must be rebuilt. Probe
+# with the same target/compiler/flags before stamping and compiling any object.
+MACROS=$(printf '%s\n' '#include <wolfssl/wolfcrypt/wc_port.h>' | \
+    $CC $CFLAGS $DEFS -I"$HERE" -I"$SRC" -dM -E -x c -)
+if printf '%s\n' "$MACROS" | grep -Eq '^#define (__linux__|__APPLE__) ' && \
+   ! printf '%s\n' "$MACROS" | grep -q '^#define _WIN32' && \
+   printf '%s\n' "$MACROS" | grep -q '^#define HAVE_GMTIME_R' && \
+   printf '%s\n' "$MACROS" | grep -q '^#define XGMTIME.*gmtime_r'; then
+    DEFS="$DEFS -DSTEER_WOLFSSL_POSIX_TIME_SAFE=1"
+fi
 OBJ="$OUT.obj"
 # Отпечаток сборки: опции, флаги, компилятор. Архив с тем же отпечатком не пересобирается — у
 # одиннадцати архитектур это минуты, — а любая правка user_settings.h или флагов пересобирает его.

@@ -38,6 +38,20 @@
 #define STEER_WOLFSSL_USER_SETTINGS_H
 
 /* ---- платформа ------------------------------------------------------------------------- */
+/* X.509 date validation must not use libc gmtime's process-global struct tm.
+ * A per-root verification mutex cannot protect different root stores. These
+ * supported POSIX targets provide gmtime_r; Windows/non-POSIX keep their own
+ * wolfSSL platform selection. Set its declaration feature level before this
+ * profile's first system header (callers with _GNU_SOURCE already expose it). */
+#if !defined(_WIN32) && (defined(__linux__) || defined(__APPLE__))
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#define HAVE_GMTIME_R
+/* Strict POSIX feature exposure also requires the declaration header for
+ * wolfSSL's POSIX strcasecmp/strncasecmp mappings. */
+#define HAVE_STRINGS_H
+#endif
 /* Источник случайности для DRBG — getrandom(2), а не открытие /dev/urandom: у процесса на
  * телефоне под SELinux нет права открывать устройство, а системный вызов разрешён всем, и на
  * роутере он есть с ядра 3.17. Свои случайные байты движок берёт так же (reality.c). */
@@ -135,7 +149,9 @@
 
 #define HAVE_CURVE25519
 #define HAVE_ED25519
+#if !defined(WOLFSSL_CERT_GEN) /* fixture server signing only; never production */
 #define NO_ED25519_SIGN
+#endif
 #define NO_ED25519_CLIENT_AUTH
 
 #define HAVE_ECC

@@ -70,6 +70,29 @@ int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
                           const unsigned char *transcript, size_t thash_n,
                           const char *host, const char *roots, const struct cert_policy *pol);
 
+/* Source-only prepared trust snapshot for the incremental TLS path. Parse
+ * bounded PEM bytes on a configuration worker, before publishing the object.
+ * Input is copied by the crypto backend and may be discarded after return.
+ * At least one usable CA is required; unsupported/invalid PEM certificates are
+ * skipped with the same documented sc_roots_load policy as the legacy path.
+ * No path, process-global cache or default roots fallback. On failure *out=NULL.
+ * After preparation the snapshot is immutable. Verification uses the crypto
+ * backend's per-store mutex: sharing is concurrency-safe with a thread-safe
+ * backend profile, but is NOT a nonblocking owner-loop guarantee. Prepare one
+ * bounded store per owner or use a bounded verification worker service.
+ * Caller retains ownership through every verifier return and
+ * destroys only after all users quiesce; no refcount/module ownership implied. */
+#define CERT_TRUST_PEM_MAX (8u * 1024u * 1024u)
+struct cert_trust;
+int cert_trust_prepare_pem(const unsigned char *, size_t, struct cert_trust **out);
+void cert_trust_destroy(struct cert_trust *);
+/* Same chain/name/signature/pin policy as _ex, but exclusively prepared roots.
+ * No file/cache IO on this path. Peer-controlled certificate work still needs
+ * separate handshake byte/count/CPU admission at the engine/host boundary. */
+int cert_verify_server_prepared(const unsigned char *cert_body, size_t cert_n,
+    const unsigned char *cv_body, size_t cv_n, const unsigned char *transcript,
+    size_t thash_n, const char *host, const struct cert_trust *, const struct cert_policy *);
+
 #define CERTV_ENOTREALITY (-75) /* сервер не доказал, что он Reality: не признал нас */
 #define CERTV_EPQ         (-76) /* Reality признал, но подпись ML-DSA-65 (pqv) отсутствует или неверна */
 
@@ -93,6 +116,11 @@ int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
  */
 int cert_reality_check(const unsigned char *cert_body, size_t cert_n,
                        const unsigned char *authkey);
+/* After the HMAC authenticates the temporary certificate's Ed25519 public key,
+ * verify its real TLS CertificateVerify proof over the pre-CV transcript.
+ * Pinned REALITY4bb46b2afd8b emits Ed25519 CV, not a no-CV handshake. */
+int cert_reality_verify(const unsigned char *cert_body, size_t cert_n,
+    const unsigned char *cv_body, size_t cv_n, const unsigned char *transcript, size_t transcript_n);
 
 /* Человеческое объяснение кода. Пустая строка для 0. */
 /* Вторая половина доказательства Reality — подпись ML-DSA-65 (`mldsa65Verify`, `pqv` в ссылке).
