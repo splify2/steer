@@ -11,8 +11,9 @@ aarch64_cortex-a53:aarch64-linux-musl:cortex_a53
 aarch64_cortex-a72:aarch64-linux-musl:cortex_a72
 aarch64_cortex-a73:aarch64-linux-musl:cortex_a73
 aarch64_generic:aarch64-linux-musl:baseline
+arm_cortex-a7:arm-linux-musleabi:cortex_a7+soft_float-neon-vfp4-vfp3-vfp2-vfp2sp-vfp3d16-vfp3d16sp-vfp3sp-vfp4d16-vfp4d16sp-vfp4sp-fp16-fpregs-d32-fp64
 arm_cortex-a7_neon-vfpv4:arm-linux-musleabihf:cortex_a7
-arm_cortex-a9:arm-linux-musleabi:cortex_a9
+arm_cortex-a9:arm-linux-musleabi:cortex_a9+soft_float-neon-vfp4-vfp3-vfp2-vfp2sp-vfp3d16-vfp3d16sp-vfp3sp-vfp4d16-vfp4d16sp-vfp4sp-fp16-fpregs-d32-fp64
 arm_cortex-a9_neon:arm-linux-musleabihf:cortex_a9+neon
 arm_cortex-a9_vfpv3-d16:arm-linux-musleabihf:cortex_a9+vfp3d16
 x86_64:x86_64-linux-musl:baseline
