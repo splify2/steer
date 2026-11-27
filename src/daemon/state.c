@@ -53,7 +53,15 @@ int steerd_load(struct steerd *d) {
     }
     /* Плагины могли смениться (менеджер, ручная раскладка): реестр перечитывается, если каталог
      * плагинов или state.json изменились. */
-    plugin_refresh();
+    if (plugin_refresh() < 0) {
+        free(ns);
+        free(ng);
+        snprintf(d->err, sizeof(d->err), "не удалось перечитать реестр плагинов");
+        snprintf(d->err_code, sizeof(d->err_code), "plugin.reload_failed");
+        d->err_args[0] = '\0';
+        err_args_add(d->err_args, sizeof(d->err_args), "why", d->err);
+        return -1;
+    }
     /* Подготовка спеки (хуки плагинов, kinds/plugprep.c) — при старте и reload; сбой не роняет
      * остальное: выходы, которым подготовка нужна, остаются недоступными и живут по on_fail. */
     if (spec_prepare(d->spec_path, &e) < 0) {

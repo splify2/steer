@@ -577,7 +577,7 @@ $(BUILD)/abihost: tests/abihost.c src/daemon/plugso.c src/daemon/loop.c src/daem
 # объектов, что у modelmatch; манифесты фальшивых плагинов стенд пишет сам во временный каталог.
 $(BUILD)/pluginmodel: tests/pluginmodel.c tests/unit.h $(MODEL_KINDS) src/kinds/awg.c $(CORE_HDR)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/pluginmodel.c $(MODEL_KINDS) src/kinds/awg.c
+	$(CC) $(CFLAGS) -Wl,--wrap=realloc -o $@ tests/pluginmodel.c $(MODEL_KINDS) src/kinds/awg.c
 
 # Обход /proc (src/lib/procscan.c): хвост длинной командной строки.
 $(BUILD)/procscanmatch: tests/procscanmatch.c tests/unit.h src/lib/procscan.c src/lib/procscan.h

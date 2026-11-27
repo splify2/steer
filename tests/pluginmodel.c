@@ -13,6 +13,7 @@
  *
  * Модель линкуется отдельными объектами (MODEL_KINDS + awg.c), как у modelmatch. */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,19 @@
 #include "unit.h"
 
 static char g_root[256], g_etc[256], g_st[256], g_dir[256];
+
+/* Только модель: один обычный отказ роста массива пакетов с одного до двух.
+ * Другие выделения работают; отказ не требует исчерпания памяти. */
+static int fail_growth, hits;
+void *__real_realloc(void *p, size_t n);
+void *__wrap_realloc(void *p, size_t n) {
+    if (fail_growth && p && n == 2 * sizeof(struct plugin)) {
+        fail_growth = 0; hits++;
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_realloc(p, n);
+}
 
 static void put(const char *rel, const char *text) {
     char p[600], d[600];
@@ -157,7 +171,9 @@ int main(void) {
     /* ---- вид с помощником ---- */
     put("hp/plugin.json",
         "{\"schema\":1,\"id\":\"hp\",\"version\":\"3.1.4\",\"compat\":{\"steer-api\":\"^1.5\"},"
-        "\"steer\":{\"settings\":\"restart\",\"kinds\":[{\"name\":\"hpkind\",\"keys\":\"kinds/hp.schema.json\",\"paths\":true,"
+        "\"steer\":{\"settings\":\"restart\",\"commands\":[{\"name\":\"hp-cmd\",\"prog\":\"bin/c\"}],"
+        "\"services\":[{\"name\":\"hp-svc\",\"prog\":\"bin/s\"}],"
+        "\"kinds\":[{\"name\":\"hpkind\",\"keys\":\"kinds/hp.schema.json\",\"paths\":true,"
         "\"caps\":[\"device\",\"mark\",\"ctmark\",\"over\"],"
         "\"helper\":{\"prog\":\"bin/h\",\"cmd\":\"hphelper\",\"argv\":[\"run\",\"{out}\",\"--conf\",\"{conf}\",\"--x\",\"{{lit}}\"],"
         "\"env\":{\"HP_MODE\":\"fast\"}}}]}}");
@@ -270,6 +286,65 @@ int main(void) {
     check("появился новый каталог — реестр перечитан", 1, plugin_refresh());
     check("  и новый плагин в нём", 1, plugin_find("c-late") != NULL);
     check("  а прежний вид по-прежнему на месте", 1, plugin_kind_find("hpkind") != NULL);
+
+    /* Текущие запросы и более старая спека sp уже относятся к разным поколениям. */
+    const struct plugin *hp = plugin_find("hp");
+    const struct plugin_cmd *cmd0 = plugin_cmd_find("hp-cmd");
+    const struct plugin_svc *svc0 = plugin_svc_at(0);
+    size_t packages = plugin_n(), kinds = plugin_kinds_n();
+    const struct plugin *old_pl[packages];
+    const struct kind_ops *old_kind[kinds];
+    for (size_t i = 0; i < packages; i++) old_pl[i] = plugin_at(i);
+    for (size_t i = 0; i < kinds; i++) old_kind[i] = plugin_kind_ops_at(i);
+    put("../etc/state.json", "{\"plugins\":{\"c-ge\":{\"enabled\":true},\"c-late\":{\"enabled\":true},"
+                            "\"hp\":{\"enabled\":false,\"why\":\"paused\"}}}");
+    fail_growth = 1;
+    int rc = plugin_refresh();
+    printf("refresh fault: rc=%d hits=%d packages=%zu/%zu kinds=%zu/%zu\n",
+           rc, hits, plugin_n(), packages, plugin_kinds_n(), kinds);
+    check("отказ перестроения не объявлен перечитыванием", -1, rc);
+    check("инъекция сработала", 1, hits);
+    check("карта пакетов не заменилась префиксом кандидата", packages, plugin_n());
+    check("все виды на месте", kinds, plugin_kinds_n());
+    int same = 1;
+    for (size_t i = 0; i < packages; i++)
+        if (plugin_at(i) != old_pl[i] || plugin_find(old_pl[i]->id) != old_pl[i]) same = 0;
+    for (size_t i = 0; i < kinds; i++)
+        if (plugin_kind_ops_at(i) != old_kind[i] || plugin_kind_find(old_kind[i]->name) != old_kind[i]->plugin) same = 0;
+    check("перечисление и поиск сохранили каждый пакет и вид", 1, same);
+    check("поиск по-прежнему возвращает старые адреса", 1,
+          hp && plugin_find("hp") == hp && cmd0 && plugin_cmd_find("hp-cmd") == cmd0 &&
+          svc0 && plugin_svc_at(0) == svc0 && plugin_kind_find("hpkind") == hp->kind[0]);
+    rc = plugin_refresh();  /* ни одного изменения на диске после отказа */
+    printf("refresh retry: rc=%d packages=%zu kinds=%zu\n", rc, plugin_n(), plugin_kinds_n());
+    check("повтор на той же отметке публикует кандидата", 1, rc);
+    check("опубликованы все записи пакетов", packages, plugin_n());
+    check("индекс содержит ровно два разрешённых вида по порядку", 1, plugin_kinds_n() == 2 &&
+          !strcmp(plugin_kind_ops_at(0)->name, "k-c-ge") && !strcmp(plugin_kind_ops_at(1)->name, "k-c-late"));
+    check_str("отключение пакета — нормальный результат", "paused", why_of("hp"));
+    check("выключенные команды и службы не видны", 1, !plugin_cmd_find("hp-cmd") && !plugin_svc_n());
+    check("повтор после публикации ничего не меняет", 0, plugin_refresh());
+    check("старые команда и служба сохраняют владельца", 1,
+          cmd0 && svc0 && cmd0->owner == hp && svc0->owner == hp && hp->enabled &&
+          !strcmp(cmd0->name, "hp-cmd") && !strcmp(svc0->name, "hp-svc"));
+    check("ранее разобранная спека сохраняет kind_ops и данные своего поколения", 1,
+          o && pk && out_plugin_kind(o) == pk && kind_of(o) == &pk->ops && pk->ops.plugin == pk &&
+          pk->owner->enabled && !strcmp(pk->owner->version, "3.1.4") && pk->schema);
+    /* Принудительный reload может быть нужен даже при прежней отметке. */
+    fail_growth = 1;
+    check("явный reload сообщает ошибку", -1, plugin_reload(NULL));
+    check("повтор после явного отказа", 1, plugin_refresh());
+    check("после исправного повтора отметка принята", 0, plugin_refresh());
+
+    /* Удаление пакета (менеджер уносит каталог целиком) — исправное перечитывание. */
+    char late[400], removed[400];
+    snprintf(late, sizeof(late), "%s/c-late", g_root);
+    snprintf(removed, sizeof(removed), "%s/removed", g_dir);
+    check("каталог убран из реестра", 0, rename(late, removed));
+    check("удалённый пакет не мешает перечитать реестр", 1, plugin_refresh());
+    check("исчезли только удалённый пакет и его вид", 1,
+          plugin_n() == packages - 1 && !plugin_find("c-late") && !plugin_kind_find("k-c-late") &&
+          plugin_kinds_n() == 1 && plugin_kind_find("k-c-ge"));
 
     spec_release(&sp);
     spec_release(&sp2);

@@ -182,11 +182,17 @@ static int range_ok(const char *range, const char *ver) {
 
 /* ---- реестр ------------------------------------------------------------------------------- */
 
-static struct plugin *g_pl;
-static size_t g_pl_n;
-static struct plugin_kind **g_kind;     /* виды включённых плагинов в порядке реестра, без impl: core */
-static size_t g_kind_n;
-static int g_loaded;
+struct plugin_registry {
+    struct plugin *pl;
+    size_t n;
+    struct plugin_kind **kind; /* виды включённых плагинов, без impl: core */
+    size_t kind_n;
+    struct timespec dir_time, state_time;
+    off_t state_size;
+    struct plugin_registry *older;
+};
+static struct plugin_registry current;
+static int g_loaded, retry_reload;
 
 static struct pnft *pnft_load(const char *path, int per_out, char *why, size_t wn);
 static void pnft_free(struct pnft *f);
@@ -244,20 +250,18 @@ static void plugin_free(struct plugin *p) {
  * записи видов, и спека, читаемая сторожем или status в этот миг, пережила бы reload. Реестр —
  * килобайты, а перечитывается он только при смене плагинов (plugin_refresh), поэтому «прежние
  * живут до конца процесса» дешевле счётчика ссылок на каждой спеке. */
-struct retired { struct plugin *pl; size_t n; struct plugin_kind **kind; };
-static struct retired *g_old;
-static size_t g_old_n;
-
-static void registry_clear(void) {
-    if (g_pl || g_kind) {
-        struct retired *nr = realloc(g_old, (g_old_n + 1) * sizeof(*nr));
-        if (nr) {
-            g_old = nr;
-            g_old[g_old_n++] = (struct retired){ g_pl, g_pl_n, g_kind };
-        }                           /* нет памяти — прежний реестр просто остаётся висеть, как и был */
+static int plugin_registry_publish(struct plugin_registry *next) {
+    next->older = current.older;
+    if (current.pl) {
+        struct plugin_registry *old = malloc(sizeof(*old));
+        if (!old) return -1;
+        *old = current;
+        next->older = old;
     }
-    g_pl = NULL; g_kind = NULL;
-    g_pl_n = g_kind_n = 0;
+    current = *next;
+    g_loaded = 1;
+    retry_reload = 0;
+    return 0;
 }
 
 /* Манифест: узлы. */
@@ -620,6 +624,7 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
         memset(c, 0, sizeof(*c));
         p->cmd_n++;
         c->name = strdup(nm);
+        if (!c->name) { ydoc_free(d); return -1; }
         c->owner = p;
         char w2[256] = "";
         if (m_prog(p->dir, cn, nm, &c->run, w2, sizeof(w2)) != 0) {
@@ -751,8 +756,9 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
             char fp[PATH_MAX];
             snprintf(fp, sizeof(fp), "%s/%s", p->dir, nl[i]);
             struct pnft **np = realloc(p->nftp, (p->nft_n + 1) * sizeof(*np));
-            if (!np || vec_add(&p->nft, &p->nft_n, fp) != 0) { vec_free(nl, nn); ydoc_free(d); return -1; }
+            if (!np) { vec_free(nl, nn); ydoc_free(d); return -1; }
             p->nftp = np;
+            if (vec_add(&p->nft, &p->nft_n, fp) != 0) { vec_free(nl, nn); ydoc_free(d); return -1; }
             p->nftp[p->nft_n - 1] = pnft_load(fp, 0, why, sizeof(why));
             if (!p->nftp[p->nft_n - 1]) { vec_free(nl, nn); ydoc_free(d); goto bad; }
         }
@@ -764,7 +770,7 @@ static int plugin_load(const char *root, const char *dirname, struct plugin *p, 
 bad:
     p->enabled = 0;
     p->why = strdup(why);
-    return 0;
+    return p->why ? 0 : -1;
 }
 
 static int pl_cmp(const void *a, const void *b) {
@@ -796,12 +802,12 @@ static int state_enabled(const char *id, int have_state, const struct ydoc *sd, 
 }
 
 /* Конфликты имён: регистрируется плагин, стоявший раньше (по id), второй — выключен с причиной. */
-static void resolve_conflicts(void) {
-    for (size_t i = 0; i < g_pl_n; i++) {
-        struct plugin *p = &g_pl[i];
+static int resolve_conflicts(struct plugin_registry *r) {
+    for (size_t i = 0; i < r->n; i++) {
+        struct plugin *p = &r->pl[i];
         if (!p->enabled) continue;
         for (size_t j = 0; j < i && p->enabled; j++) {
-            const struct plugin *q = &g_pl[j];
+            const struct plugin *q = &r->pl[j];
             if (!q->enabled) continue;
             for (size_t a = 0; a < p->kind_n && p->enabled; a++)
                 for (size_t b = 0; b < q->kind_n; b++)
@@ -823,7 +829,7 @@ static void resolve_conflicts(void) {
                     }
         }
         for (size_t j = 0; j < i && p->enabled; j++) {
-            const struct plugin *q = &g_pl[j];
+            const struct plugin *q = &r->pl[j];
             if (!q->enabled) continue;
             for (size_t a = 0; a < p->svc_n && p->enabled; a++)
                 for (size_t b = 0; b < q->svc_n; b++)
@@ -843,7 +849,9 @@ static void resolve_conflicts(void) {
                 p->enabled = 0;
                 p->why = strdup(w);
             }
+        if (!p->enabled && !p->why) return -1;
     }
+    return 0;
 }
 
 /* Отпечаток того, из чего собран реестр: каталог плагинов (менеджер подменяет <id> переименованием,
@@ -859,15 +867,14 @@ static int stamp_of(struct timespec *a, struct timespec *b, off_t *sz) {
     if (stat(sp, &st) == 0) { *b = st.st_mtim; *sz = st.st_size; have = 1; }
     return have;
 }
-static struct timespec g_stamp_a, g_stamp_b;
-static off_t g_stamp_sz = -1;
-
 int plugin_reload(const char *root) {
-    registry_clear();
-    g_loaded = 1;
-    stamp_of(&g_stamp_a, &g_stamp_b, &g_stamp_sz);
+    struct plugin_registry next = {0};
+    /* И принудительный reload при том же stamp после отказа надо повторить. */
+    retry_reload = 1;
+    stamp_of(&next.dir_time, &next.state_time, &next.state_size);
     if (!root) root = plugin_root();
     DIR *d = opendir(root);
+    if (!d && errno != ENOENT) return -1;
     char etc[PATH_MAX], sp[PATH_MAX + 16];
     plugin_etc(etc, sizeof(etc));
     snprintf(sp, sizeof(sp), "%s/state.json", etc);
@@ -885,17 +892,19 @@ int plugin_reload(const char *root) {
     const struct plugin_embed *emb = steer_plugin_embed;
     for (;;) {
         const char *r, *nm;
+        errno = 0;
         if (d && (de = readdir(d))) {
             if (de->d_name[0] == '.') continue;
             r = root;
             nm = de->d_name;
         } else {
+            if (d && errno) { rc = -1; break; }
             if (d) { closedir(d); d = NULL; }
             if (!emb || !emb->id) break;
             nm = (emb++)->id;
             r = PLUGIN_BUILTIN_DIR;
             int have = 0;
-            for (size_t i = 0; i < g_pl_n && !have; i++) have = !strcmp(g_pl[i].id, nm);
+            for (size_t i = 0; i < next.n && !have; i++) have = !strcmp(next.pl[i].id, nm);
             if (have) continue;
         }
         struct plugin p;
@@ -905,65 +914,77 @@ int plugin_reload(const char *root) {
         p.builtin = r != root;
         if (p.enabled) {
             char *why;
-            if (!state_enabled(p.id, sd != NULL, sd, &why)) { p.enabled = 0; p.why = why; }
+            if (!state_enabled(p.id, sd != NULL, sd, &why)) {
+                if (!why) { plugin_free(&p); rc = -1; break; }
+                p.enabled = 0;
+                p.why = why;
+            }
         }
-        struct plugin *np = realloc(g_pl, (g_pl_n + 1) * sizeof(*np));
+        struct plugin *np = realloc(next.pl, (next.n + 1) * sizeof(*np));
         if (!np) { plugin_free(&p); rc = -1; break; }
-        g_pl = np;
-        g_pl[g_pl_n++] = p;
+        next.pl = np;
+        next.pl[next.n++] = p;
     }
     if (d) closedir(d);
     ydoc_free(sd);
     free(stxt);
-    if (g_pl_n > 1) qsort(g_pl, g_pl_n, sizeof(*g_pl), pl_cmp);
-    /* Записи видов указывают на плагин по адресу в g_pl: после сортировки и роста массива
+    if (rc) goto fail;
+    if (next.n > 1) qsort(next.pl, next.n, sizeof(*next.pl), pl_cmp);
+    /* Записи видов указывают на плагин по адресу в массиве: после сортировки и роста массива
      * владельцев переставляют заново. */
-    for (size_t i = 0; i < g_pl_n; i++) {
-        for (size_t j = 0; j < g_pl[i].kind_n; j++) g_pl[i].kind[j]->owner = &g_pl[i];
-        for (size_t j = 0; j < g_pl[i].cmd_n; j++) g_pl[i].cmd[j].owner = &g_pl[i];
-        for (size_t j = 0; j < g_pl[i].svc_n; j++) g_pl[i].svc[j].owner = &g_pl[i];
+    for (size_t i = 0; i < next.n; i++) {
+        struct plugin *p = &next.pl[i];
+        for (size_t j = 0; j < p->kind_n; j++) p->kind[j]->owner = p;
+        for (size_t j = 0; j < p->cmd_n; j++) p->cmd[j].owner = p;
+        for (size_t j = 0; j < p->svc_n; j++) p->svc[j].owner = p;
     }
-    resolve_conflicts();
-    for (size_t i = 0; i < g_pl_n; i++) {
-        if (!g_pl[i].enabled) continue;
-        for (size_t j = 0; j < g_pl[i].kind_n; j++) {
-            if (g_pl[i].kind[j]->impl_core) continue;
-            struct plugin_kind **nk = realloc(g_kind, (g_kind_n + 1) * sizeof(*nk));
-            if (!nk) { rc = -1; break; }
-            g_kind = nk;
-            g_kind[g_kind_n++] = g_pl[i].kind[j];
+    if (resolve_conflicts(&next)) goto fail;
+    for (size_t i = 0; i < next.n; i++) {
+        const struct plugin *p = &next.pl[i];
+        if (!p->enabled) continue;
+        for (size_t j = 0; j < p->kind_n; j++) {
+            if (p->kind[j]->impl_core) continue;
+            struct plugin_kind **nk = realloc(next.kind, (next.kind_n + 1) * sizeof(*nk));
+            if (!nk) goto fail;
+            next.kind = nk;
+            next.kind[next.kind_n++] = p->kind[j];
         }
     }
-    return rc;
+    if (!plugin_registry_publish(&next)) return 0;
+fail:
+    for (size_t i = 0; i < next.n; i++) plugin_free(&next.pl[i]);
+    free(next.pl);
+    free(next.kind);
+    return -1;
 }
 
 int plugin_refresh(void) {
     struct timespec a, b;
     off_t sz;
     stamp_of(&a, &b, &sz);
-    if (g_loaded && a.tv_sec == g_stamp_a.tv_sec && a.tv_nsec == g_stamp_a.tv_nsec &&
-        b.tv_sec == g_stamp_b.tv_sec && b.tv_nsec == g_stamp_b.tv_nsec && sz == g_stamp_sz)
+    if (g_loaded && !retry_reload &&
+        a.tv_sec == current.dir_time.tv_sec && a.tv_nsec == current.dir_time.tv_nsec &&
+        b.tv_sec == current.state_time.tv_sec && b.tv_nsec == current.state_time.tv_nsec && sz == current.state_size)
         return 0;
-    plugin_reload(NULL);
-    return 1;
+    return plugin_reload(NULL) == 0 ? 1 : -1;
 }
 
 static void ensure(void) { if (!g_loaded) plugin_reload(NULL); }
 
-size_t plugin_n(void) { ensure(); return g_pl_n; }
-const struct plugin *plugin_at(size_t i) { ensure(); return i < g_pl_n ? &g_pl[i] : NULL; }
+size_t plugin_n(void) { ensure(); return current.n; }
+const struct plugin *plugin_at(size_t i) { ensure(); return i < current.n ? &current.pl[i] : NULL; }
 const struct plugin *plugin_find(const char *id) {
     ensure();
-    for (size_t i = 0; i < g_pl_n; i++) if (!strcmp(g_pl[i].id, id)) return &g_pl[i];
+    for (size_t i = 0; i < current.n; i++) if (!strcmp(current.pl[i].id, id)) return &current.pl[i];
     return NULL;
 }
 
-size_t plugin_kinds_n(void) { ensure(); return g_kind_n; }
-const struct kind_ops *plugin_kind_ops_at(size_t i) { ensure(); return i < g_kind_n ? &g_kind[i]->ops : NULL; }
+size_t plugin_kinds_n(void) { ensure(); return current.kind_n; }
+const struct kind_ops *plugin_kind_ops_at(size_t i) { ensure(); return i < current.kind_n ? &current.kind[i]->ops : NULL; }
 
 const struct plugin_kind *plugin_kind_find(const char *name) {
     ensure();
-    for (size_t i = 0; i < g_kind_n; i++) if (!strcmp(g_kind[i]->name, name)) return g_kind[i];
+    for (size_t i = 0; i < current.kind_n; i++) if (!strcmp(current.kind[i]->name, name)) return current.kind[i];
     return NULL;
 }
 
@@ -974,27 +995,27 @@ const struct plugin_kind *plugin_kind_of_ops(const struct kind_ops *k) {
 size_t plugin_svc_n(void) {
     ensure();
     size_t n = 0;
-    for (size_t i = 0; i < g_pl_n; i++)
-        if (g_pl[i].enabled) n += g_pl[i].svc_n;
+    for (size_t i = 0; i < current.n; i++)
+        if (current.pl[i].enabled) n += current.pl[i].svc_n;
     return n;
 }
 
 const struct plugin_svc *plugin_svc_at(size_t k) {
     ensure();
-    for (size_t i = 0; i < g_pl_n; i++) {
-        if (!g_pl[i].enabled) continue;
-        if (k < g_pl[i].svc_n) return &g_pl[i].svc[k];
-        k -= g_pl[i].svc_n;
+    for (size_t i = 0; i < current.n; i++) {
+        if (!current.pl[i].enabled) continue;
+        if (k < current.pl[i].svc_n) return &current.pl[i].svc[k];
+        k -= current.pl[i].svc_n;
     }
     return NULL;
 }
 
 const struct plugin_cmd *plugin_cmd_find(const char *name) {
     ensure();
-    for (size_t i = 0; i < g_pl_n; i++) {
-        if (!g_pl[i].enabled) continue;
-        for (size_t j = 0; j < g_pl[i].cmd_n; j++)
-            if (!strcmp(g_pl[i].cmd[j].name, name)) return &g_pl[i].cmd[j];
+    for (size_t i = 0; i < current.n; i++) {
+        if (!current.pl[i].enabled) continue;
+        for (size_t j = 0; j < current.pl[i].cmd_n; j++)
+            if (!strcmp(current.pl[i].cmd[j].name, name)) return &current.pl[i].cmd[j];
     }
     return NULL;
 }
@@ -1032,12 +1053,12 @@ static char *seed_kind_plugin(const char *kind) {
 const char *plugin_kind_why(const char *name, char *buf, size_t n, const char **id) {
     ensure();
     if (id) *id = NULL;
-    for (size_t i = 0; i < g_pl_n; i++)
-        for (size_t j = 0; j < g_pl[i].kind_names_n; j++)
-            if (!strcmp(g_pl[i].kind_names[j], name)) {
-                if (id) *id = g_pl[i].id;
-                if (g_pl[i].enabled) snprintf(buf, n, "плагин %s не отдал вид %s", g_pl[i].id, name);
-                else snprintf(buf, n, "плагин %s отключён: %s", g_pl[i].id, g_pl[i].why ? g_pl[i].why : "—");
+    for (size_t i = 0; i < current.n; i++)
+        for (size_t j = 0; j < current.pl[i].kind_names_n; j++)
+            if (!strcmp(current.pl[i].kind_names[j], name)) {
+                if (id) *id = current.pl[i].id;
+                if (current.pl[i].enabled) snprintf(buf, n, "плагин %s не отдал вид %s", current.pl[i].id, name);
+                else snprintf(buf, n, "плагин %s отключён: %s", current.pl[i].id, current.pl[i].why ? current.pl[i].why : "—");
                 return buf;
             }
     char *sid = seed_kind_plugin(name);
@@ -1969,10 +1990,10 @@ int plugin_svc_helper(const struct plugin_svc *sv, const struct spec *sp, struct
 
 const struct plugin_kind *plugin_core_ext(const char *kind, const char *key) {
     ensure();
-    for (size_t i = 0; i < g_pl_n; i++) {
-        if (!g_pl[i].enabled) continue;
-        for (size_t j = 0; j < g_pl[i].kind_n; j++) {
-            const struct plugin_kind *k = g_pl[i].kind[j];
+    for (size_t i = 0; i < current.n; i++) {
+        if (!current.pl[i].enabled) continue;
+        for (size_t j = 0; j < current.pl[i].kind_n; j++) {
+            const struct plugin_kind *k = current.pl[i].kind[j];
             if (k->impl_core && k->helper.prog && k->helper_when && !strcmp(k->name, kind) &&
                 !strcmp(k->helper_when, key))
                 return k;
@@ -2559,8 +2580,8 @@ int plugin_emit_all(struct nft_rs *rs, const struct spec *sp, struct err *e) {
     struct pn_emit pe = { .rs = rs, .sp = sp };
     pe.t = ir_table_find(rs, NFT_FAM_INET, NULL);
     if (!pe.t) return 0;
-    for (size_t i = 0; i < g_pl_n; i++) {
-        const struct plugin *pl = &g_pl[i];
+    for (size_t i = 0; i < current.n; i++) {
+        const struct plugin *pl = &current.pl[i];
         if (!pl->enabled) continue;
         for (size_t f = 0; f < pl->nft_n; f++)
             if (pn_emit_file(&pe, pl, pl->nftp[f], NULL, e) != 0) return -1;

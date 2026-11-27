@@ -2571,7 +2571,11 @@ static void st_plugin(struct conn *c) {
 
 /* plugin-reload: реестр плагинов ядра заново, затем то же, что reload (спека, помощники, правила). */
 static void st_plugin_reload(struct conn *c) {
-    if (plugin_reload) plugin_reload(NULL);
+    if (plugin_reload && plugin_reload(NULL) < 0) {
+        resp_error(&c->resp, "internal", "не удалось перечитать реестр плагинов");
+        conn_reply(c);
+        return;
+    }
     st_reload(c);
 }
 
