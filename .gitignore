@@ -182,3 +182,7 @@ build/pkmatch
 build/pmkindmatch
 build/foprobematch
 build/nldonematch
+
+# Release backport verification binaries
+build/dns-prepare-fault/
+build/table-ack-test

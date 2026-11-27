@@ -19,11 +19,15 @@
 # Нужны root, unshare -nm, ip, tc (netem), ss, nsenter и python3 — иначе пропуск, а не падение.
 # LIBS — раскладка libs (tests/libs-test.sh, build/libs-host).
 set -u
-LIBS="$(cd "${LIBS:-build/libs-host}" 2>/dev/null && pwd)"
+LIBS_INPUT="${LIBS:-build/libs-host}"
+LIBS="$(cd "$LIBS_INPUT" 2>/dev/null && pwd)" || {
+    echo "rcvwnd: нет каталога раскладки $LIBS_INPUT — ошибка"; exit 2; }
 skip() { echo "rcvwnd: $1 — пропуск"; exit 0; }
-[ -x "$LIBS/steerd" ] && [ -x "$LIBS/steer-vless" ] || skip "нет раскладки libs ($LIBS, tests/libs-test.sh)"
+MOD="$LIBS/plugins/vless/bin/vless"
+[ -x "$MOD" ] && [ -f "$LIBS/plugins/net1/lib/libs2p-net.so.1" ] || {
+    echo "rcvwnd: нет пакетного vless или net1 в $LIBS — ошибка"; exit 2; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
-LD_LIBRARY_PATH="$LIBS"; export LD_LIBRARY_PATH
+LD_LIBRARY_PATH="$LIBS:$LIBS/plugins/net1/lib"; export LD_LIBRARY_PATH
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else
@@ -38,19 +42,27 @@ wait_for() {
     eval "$1" && return 0
     return 1
 }
-for t in ip tc ss python3 nsenter unshare awk; do command -v $t >/dev/null 2>&1 || skip "$t нет"; done
+for t in ip tc ss nft python3 nsenter unshare mount sysctl readlink awk; do command -v $t >/dev/null 2>&1 || skip "$t нет"; done
 if [ "${RCVWND_INNER:-}" != 1 ]; then
     [ "$(id -u)" = 0 ] || skip "нужен root"
     unshare -nm true 2>/dev/null || skip "unshare -nm недоступен"
-    RCVWND_INNER=1 exec unshare -nm sh "$0" "$@"
+    parent_net="$(readlink /proc/self/ns/net)" || exit 2
+    parent_mnt="$(readlink /proc/self/ns/mnt)" || exit 2
+    RCVWND_INNER=1 RCVWND_PARENT_NET="$parent_net" RCVWND_PARENT_MNT="$parent_mnt" \
+        exec unshare -nm sh "$0" "$@"
 fi
-mount --make-rprivate / 2>/dev/null
+[ -n "${RCVWND_PARENT_NET:-}" ] && [ -n "${RCVWND_PARENT_MNT:-}" ] &&
+    [ "$(readlink /proc/self/ns/net)" != "$RCVWND_PARENT_NET" ] &&
+    [ "$(readlink /proc/self/ns/mnt)" != "$RCVWND_PARENT_MNT" ] || {
+        echo "rcvwnd: отсутствует отдельная пара namespace — ошибка"; exit 2; }
+mount --make-rprivate / 2>/dev/null || { echo "rcvwnd: не изолировать mount namespace — ошибка"; exit 2; }
 mount -t sysfs sysfs /sys 2>/dev/null || skip "свой /sys не смонтировать"
 ip link set lo up
 ip link add nemprobe type dummy 2>/dev/null && tc qdisc add dev nemprobe root netem delay 1ms 2>/dev/null \
     || skip "netem недоступен (sch_netem)"
 ip link del nemprobe
-sysctl -qw net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
+sysctl -qw net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 ||
+    skip "сетевые sysctl недоступны в отдельном namespace"
 
 UUID=8f7d3b1a-2c4e-4f60-9a81-b5d7e6c30124
 TARGET=203.0.113.7
@@ -92,39 +104,47 @@ tc qdisc add dev p0 root netem delay "${DELAY}ms" limit 100000
 python3 "$HERE/sigpipe-node.py" --bind 10.78.0.1 --port 10444 --uuid "$UUID" >"$tmp/node.out" 2>"$tmp/node.err" & NP=$!
 wait_for 'grep -q ready "$tmp/node.out"' 10
 printf 'vless://%s@10.78.0.1:10444?security=none&type=tcp#node\n' "$UUID" > "$tmp/sub.txt"
-cat > "$tmp/spec.json" <<EOF
-{"schema":1,
- "outputs":{"vl":{"name":"vl","kind":"vless","sub_file":"$tmp/sub.txt","node":0}},
- "channels":[]}
-EOF
+python3 - "$tmp" <<'PY'
+import json, os, sys
+t = sys.argv[1]
+conf = {"api":"1.5","plugin":{"id":"vless","version":"fixture"},
+        "output":{"name":"vl","kind":"tunnel:vless","device":"vl",
+                  "keys":{"subscription":os.path.join(t,"sub.txt"),"nodes":[0]},
+                  "mark":"0x00100000","mark_mask":"0x0ff00000","table":100,
+                  "sock_mark":"0","sock_mark_required":False,"ipv6":False,"tcp_port":9480},
+        "paths":{"plugin_state":os.path.join(t,"st")}}
+with open(os.path.join(t,"conf.json"),"w") as f: json.dump(conf,f)
+PY
 
 # Клиент: выгрузка на порт 82 узла (приёмник, который не закрывается) SECS секунд; соединение держится
 # открытым, пока стенд не снимет ss.
 cat > "$tmp/up.py" <<'PY'
 import socket, sys, time
-target, secs = sys.argv[1], float(sys.argv[2])
+target, secs, limit = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
 s = socket.socket()
 s.settimeout(10)
 s.connect((target, 82))
 blob = b"\xa5" * (1 << 20)
 end = time.time() + secs
+sent = 0
 try:
-    while time.time() < end:
-        s.send(blob)
+    while time.time() < end and (not limit or sent < limit):
+        part = blob if not limit else blob[:min(len(blob),limit-sent)]
+        sent += s.send(part)
 except OSError as e:
     print("клиент: запись оборвалась:", e, flush=True)
-print("клиент: послал", flush=True)
+print("клиент: послал", sent, flush=True)
 time.sleep(30)
 PY
 
 # Один прогон: модуль (env — «К=З» или пусто), выгрузка, ss клиента в середине и в конце. Печатает в $tmp/run.*
 run() {
     name="$1"; shift
-    env "$@" "$LIBS/steerd" vless vl --spec "$tmp/spec.json" --state-dir "$tmp/st" >"$tmp/mod.log" 2>&1 &
+    env "$@" "$MOD" vless vl --conf "$tmp/conf.json" >"$tmp/mod.log" 2>&1 &
     MP=$!
-    wait_for 'ip link show vl >/dev/null 2>&1' 20
-    wait_for 'grep -q "запасных сессий" "$tmp/mod.log"' 20
-    ip route replace "$TARGET/32" dev vl
+    wait_for 'ip link show up dev vl 2>/dev/null | grep -q "state UNKNOWN\|state UP"' 20 || return 1
+    wait_for 'grep -q "запасных сессий" "$tmp/mod.log"' 20 || return 1
+    ip route replace "$TARGET/32" dev vl || return 1
     # TCP клиента — к слушателю модуля (порт 9480: единственный выход стенда, место 0).
     nft list table inet rcvwnd_redir >/dev/null 2>&1 || nft -f - <<NFT
 table inet rcvwnd_redir {
@@ -133,7 +153,7 @@ table inet rcvwnd_redir {
 }
 NFT
     # nsenter напрямую, а не функцией C: у функции $! — подоболочка, и kill её не убил бы сам python.
-    nsenter -t "$CPID" -n python3 "$tmp/up.py" "$TARGET" "$SECS" >"$tmp/cl.$name" 2>&1 & CL=$!
+    nsenter -t "$CPID" -n python3 "$tmp/up.py" "$TARGET" "$SECS" "${RCVWND_MAX_BYTES:-0}" >"$tmp/cl.$name" 2>&1 & CL=$!
     sleep "$(awk -v s="$SECS" 'BEGIN { print s / 2 }')"
     C ss -tin dst "$TARGET" > "$tmp/ss.mid.$name" 2>&1
     sleep "$(awk -v s="$SECS" 'BEGIN { print s / 2 + 0.5 }')"
@@ -150,7 +170,28 @@ mbit() { awk -v b="$(field "$1" bytes_acked)" -v s="$SECS" 'BEGIN { printf "%d",
 # Потолок «окно 64 КБ на круг» в Мбит/с: 65535 байт на (круг + то, что стоит сам модуль — берём один пакет).
 CEIL="$(awk -v d="$DELAY" 'BEGIN { printf "%d", 65535 * 8 / (2 * d / 1000) / 1e6 }')"
 
-run scaled STEER_X=1
+run scaled STEER_X=1 || { fail=$((fail+1)); echo "rcvwnd: helper не поднялся"; exit 1; }
+if [ "${RCVWND_MODE:-}" = smoke ]; then
+    check "перенаправление к пакетному helper сработало" "1" \
+        "$([ "$(nft list table inet rcvwnd_redir | grep -o 'packets [0-9]*' | grep -o '[0-9]*')" -ge 1 ] 2>/dev/null && echo 1 || echo 0)"
+    check "клиент видит масштаб окна" "1" \
+        "$([ "$(field "$tmp/ss.mid.scaled" wscale | cut -d, -f1)" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
+    check "окно клиента выше 64 КиБ" "1" \
+        "$([ "$(field "$tmp/ss.mid.scaled" snd_wnd)" -gt 65535 ] 2>/dev/null && echo 1 || echo 0)"
+    check "клиент получил подтверждение более 64 КиБ" "1" \
+        "$([ "$(field "$tmp/ss.end.scaled" bytes_acked)" -gt 65535 ] 2>/dev/null && echo 1 || echo 0)"
+    received="$(sed -n 's/.*байт принято=\([0-9][0-9]*\).*/\1/p' "$tmp/node.err" | tail -1)"
+    echo "  узел принял ${received:-0} байт"
+    check "независимый узел принял более 64 КиБ" "1" \
+        "$([ "${received:-0}" -gt 65535 ] 2>/dev/null && echo 1 || echo 0)"
+    C sysctl -qw net.ipv4.tcp_window_scaling=0 || { fail=$((fail+1)); echo "rcvwnd: не выключить масштаб в клиентском namespace"; exit 1; }
+    run nows STEER_X=1 || { fail=$((fail+1)); echo "rcvwnd: helper не поднялся без масштаба"; exit 1; }
+    C sysctl -qw net.ipv4.tcp_window_scaling=1 || { fail=$((fail+1)); echo "rcvwnd: не вернуть масштаб в клиентском namespace"; exit 1; }
+    check "без масштаба соединение также передаёт данные" "1" \
+        "$([ "$(field "$tmp/ss.end.nows" bytes_acked)" -gt 65535 ] 2>/dev/null && [ -z "$(field "$tmp/ss.mid.nows" wscale)" ] && echo 1 || echo 0)"
+    echo "rcvwnd smoke: $pass ok, $fail fail"
+    [ "$fail" = 0 ]; exit $?
+fi
 C tc qdisc change dev c0 root netem delay "${DELAY}ms" loss 0.5% limit 100000
 tc qdisc change dev p0 root netem delay "${DELAY}ms" loss 0.5% limit 100000
 run lossy STEER_X=1

@@ -912,7 +912,7 @@ clean:
 	       $(BUILD)/scryptomatch $(BUILD)/sigmatch $(BUILD)/vlessmatch $(BUILD)/androidroots $(BUILD)/hubmatch $(BUILD)/spokematch \
 	       $(BUILD)/devupmatch $(BUILD)/ndk \
 	       $(BUILD)/urltestmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool \
-	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out
+	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts $(BUILD)/dns-prepare-fault $(BUILD)/table-ack-test $(BUILD)/steerd-registry-test $(BUILD)/steerd-rule-fault $(BUILD)/vlessprobematch out
 
 $(BUILD)/hy2rasmbudget: tests/hy2rasmbudget.c src/proto/hysteria2/hy2wire.c src/proto/hysteria2/hy2wire.h
 	@mkdir -p $(BUILD)
