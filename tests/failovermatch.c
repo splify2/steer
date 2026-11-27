@@ -45,6 +45,7 @@ static int g_cmd_n;
  * настоящего ядра у стенда нет. */
 int g_route_add_fails = 0;
 static int g_rule_add_fails;
+static const char *g_blackhole_fault;
 static int g_rule_appears;
 static const char *g_rules = "";
 
@@ -79,6 +80,7 @@ int run_quiet(const char *const argv[]) {
     /* Отказывает только привязка к устройству: blackhole в ту же таблицу обязан
      * пройти, иначе стенд проверял бы не то. */
     if (g_route_add_fails && strstr(joined, "route replace default dev")) return 2;
+    if (g_blackhole_fault && !strcmp(joined, g_blackhole_fault)) return EACCES;
     if (g_rule_add_fails && strstr(joined, "rule add")) {
         if (g_rule_appears) g_rules = "100: from all fwmark 0x100000/0xff00000 lookup 301\n";
         return g_rule_add_fails;
@@ -578,6 +580,31 @@ static void tick(const char *rules, const char *routes) {
     cmd_failover("/dev/null", 0);
 }
 
+static void route_event(void *arg, const struct fo_event *e) {
+    if (e->kind == FO_EV_FAILED || e->kind == FO_EV_SWITCHED) ++*(int *)arg;
+}
+
+static void blackhole_events(void) {
+    g_rules = RULES_WITH;
+    for (int live = 0; live <= 1; live++) {
+        const char *op = live ? "ip route replace blackhole default metric 65535 table 300"
+                              : "ip route replace blackhole default table 300";
+        for (int fault = 0; fault <= 1; fault++) {
+            out_set(live ? "lo" : "nodev", FAIL_DROP);
+            state_write("active", live ? "vl - 0\n" : "vl lo 0\n");
+            int events = 0;
+            g_cmd_n = 0;
+            g_blackhole_fault = fault ? op : NULL;
+            failover_pass(&g_spec, &fo_store_files, 0, route_event, &events);
+            check("проход запросил нужный маршрут", cmd_seen(op), 1);
+            check("событие перехода — только после подтверждения", events, !fault);
+            if (live)
+                check("отказ запаса не вызывает основной blackhole", cmd_seen("blackhole default table 300"), 0);
+        }
+    }
+    g_blackhole_fault = NULL;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "rule-fault")) {
         setenv("STEER_RULE_PREF", "100", 1);
@@ -613,6 +640,11 @@ int main(int argc, char **argv) {
     g_upstream_probe = fake_upstream;
     g_dev_rx = fake_rx;
 
+    if (argc > 1 && !strcmp(argv[1], "blackhole4")) {
+        blackhole_events();
+        if (!g_fail) puts("blackhole4 events: OK");
+        return !!g_fail;
+    }
     /* Test sig_cleanup/cleanup_probe_rule indirectly by checking rule_deleted */
     cleanup_probe_rule();
     if (rule_deleted != 1) {

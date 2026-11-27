@@ -276,7 +276,7 @@ static void route_up(struct supd *s, struct helper *h, const char *dev) {
                         "привязан\n", h->cmd, h->name, dev, o->device);
         return;
     }
-    bind_device(o, dev);
+    if (bind_device(o, dev)) return;
     snprintf(st->bound, sizeof(st->bound), "%s", dev);
     fprintf(stderr, "steer[info] supervise: %s %s — %s поднят, маршрут выхода привязан "
                     "(таблица %d)\n", h->cmd, h->name, dev, o->table);

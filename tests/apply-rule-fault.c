@@ -40,13 +40,16 @@ ssize_t __wrap_sendto(int fd, const void *buf, size_t len, int flags,
             errno = EACCES;
             return -1;
         }
-        if (mode && h->nlmsg_type == RTM_NEWROUTE && r->rtm_family == AF_INET6 &&
-            r->rtm_type == RTN_PROHIBIT) {
+        if (mode && h->nlmsg_type == RTM_NEWROUTE &&
+            ((r->rtm_family == AF_INET6 && r->rtm_type == RTN_PROHIBIT) ||
+             (r->rtm_family == AF_INET && r->rtm_type == RTN_BLACKHOLE))) {
             int n = RTM_PAYLOAD(h), metric = 0;
             for (struct rtattr *a = RTM_RTA(r); RTA_OK(a,n); a = RTA_NEXT(a,n))
                 if (a->rta_type == RTA_PRIORITY) metric = 1;
-            if (!strcmp(mode, metric ? "backstop6" : "fallback6")) {
-                hit(metric ? "backstop6\n" : "fallback6\n"); errno = EACCES; return -1;
+            const char *op = r->rtm_family == AF_INET ? (metric ? "backstop4" : "fallback4")
+                                                       : (metric ? "backstop6" : "fallback6");
+            if (!strcmp(mode, op)) {
+                hit(op); hit("\n"); errno = EACCES; return -1;
             }
         }
     }

@@ -96,7 +96,8 @@ const char *fog_lat_key(const struct output *m);
  * лист члена — как сторож при переключении, — а упавший член даёт группе её on_fail, а не
  * другого члена. ev — событие switched (by: select) или failed. route = 0 — только запомнить
  * выбор (движок выключен: маршрутизацию трогать нельзя, выбор применит следующий проход после
- * включения). Текст для человека — в out, отказы — в stderr. Код: 0 — выбор принят; 2 — отказ
+ * включения). Текст для человека — в out, отказы — в stderr. Код: 0 — выбор принят;
+ * 1 — привязка не подтверждена, выбор не записан; 2 — отказ
  * (нет такой группы, не manual, не член). */
 int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const char *mname,
                int route, fo_event_fn ev, void *arg, FILE *out);

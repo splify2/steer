@@ -131,6 +131,12 @@ $(BUILD)/steerd-rule-fault: $(CORE_SRC) $(CORE_HDR) tests/apply-rule-fault.c VER
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -Wl,--wrap=sendto,--wrap=socket -o $@ $(CORE_SRC) tests/apply-rule-fault.c
 
+# Отдельная проверка маршрутов IPv4: dummy и ctl в приватном namespace, без проб трафиком.
+.PHONY: apply-blackhole4-test
+apply-blackhole4-test: $(BUILD)/steerd-rule-fault $(BUILD)/failovermatch
+	RULE_TEST_MODE=blackhole4 STEERD_FAULT="$(abspath $(BUILD)/steerd-rule-fault)" sh tests/apply-rule-fault.sh
+	unshare -nm sh -ec 'mount --make-rprivate /; mount -t sysfs sysfs /sys; ip link set lo up; exec "$$1" blackhole4' sh "$(abspath $(BUILD)/failovermatch)"
+
 # Клиенту без steerd рядом делать нечего: зависимость порядка, чтобы `make build/steer` давал
 # рабочую пару.
 $(BUILD)/steer: $(CLIENT_SRC) src/lib/ctlcall.h src/lib/ctlcall_io.h src/platform/platform.h | $(BUILD)/steerd

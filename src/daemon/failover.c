@@ -745,29 +745,36 @@ static int backstop_set_fam(int fam, int table) {
     return route_put(bs, 4, table, RTN_BLACKHOLE, NULL, STEER_BACKSTOP_METRIC);
 }
 
-static void backstop_set(int table) { backstop_set_fam(4, table); }
+static int backstop_set(int table) {
+    int rc = backstop_set_fam(4, table);
+    if (rc) fprintf(stderr, LOG_W "таблица %d: запасной blackhole IPv4 не подтверждён: %s\n", table, strerror(rc));
+    return rc;
+}
 static void table_prune(int table, const char *dev, int backstop) {
     table_prune_fam(4, table, dev, backstop);
 }
 
-int table_bind(const struct output *o, const char *dev) {
+enum table_bind_result table_bind(const struct output *o, const char *dev) {
     char t[16];
     snprintf(t, sizeof(t), "%d", o->table);
     /* Запасной запрет — ПЕРВЫМ: с этого мгновения исчезновение устройства (помощник умер, awg
      * пересоздаётся) оставляет в таблице запрет, а не пустоту. */
     int backstop = o->on_fail == FAIL_DROP;
-    if (backstop) backstop_set(o->table);
+    int spare_failed = backstop && backstop_set(o->table);
     const char *to_dev[] = { "ip", "route", "replace", "default", "dev", dev, "table", t, NULL };
     const char *to_bh[] = { "ip", "route", "replace", "blackhole", "default", "table", t, NULL };
     int rc = dev ? route_put(to_dev, 4, o->table, RTN_UNICAST, dev, 0)
                  : route_put(to_bh, 4, o->table, RTN_BLACKHOLE, NULL, 0);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        if (!dev) fprintf(stderr, LOG_W "таблица %d: основной blackhole IPv4 не подтверждён: %s\n", o->table, strerror(rc));
+        return TABLE_MAIN_FAILED;
+    }
     /* Без on_fail=drop запасной запрет снимается здесь же: режим мог смениться с drop, а
      * пустая таблица у direct/zapret — обещанное «напрямую», а не утечка. */
     table_prune(o->table, dev, backstop);
     /* TCP выхода — за маршрутом: к слушателю модуля этого устройства или никуда из карты. */
     tcp_redir_sync(o, dev);
-    return 0;
+    return spare_failed ? TABLE_BACKSTOP_FAILED : TABLE_BOUND;
 }
 
 /* ---- маршрутизация IPv6 выхода (docs/architecture.md, «4б») -------------------------------
@@ -1111,7 +1118,7 @@ static int apply_failed(const struct output *o, int announce) {
          * Заменой, а не «сбросить таблицу и добавить запрет»: между сбросом и добавлением
          * таблица пуста, и помеченный пакет в это мгновение уходил напрямую — ровно то, от
          * чего запрет и ставится (см. «без мгновения пустоты» у table_bind). */
-        table_bind(o, NULL);
+        int rc4 = table_bind(o, NULL);
         /* Правило — и здесь: без него blackhole лежит в таблице, которую никто не
          * спрашивает, и помеченный пакет провалится дальше и уйдёт напрямую — то самое, от
          * чего on_fail=drop и защищает. А снять правило было кому: прежний отказ мог
@@ -1127,10 +1134,10 @@ static int apply_failed(const struct output *o, int announce) {
         /* Запрет поставлен — теперь он обязан касаться и уже установленных соединений,
          * иначе on_fail=drop это обещание только для новых. */
         conntrack_evict(o->mark);
-        if (announce && !rc6)
+        if (announce && !rc4 && !rc6)
             fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик остановлен "
                             "(on_fail=drop)\n", o->name);
-        return rc6 ? 1 : 0;
+        return rc4 || rc6;
     }
 
     /* direct и zapret: снимаем правило, чтобы помеченный трафик шёл обычным путём, — и
@@ -1197,7 +1204,7 @@ static int routing_already(const struct output *o, const char *dev) {
     return 1;
 }
 
-void bind_device(struct output *o, const char *dev) {
+int bind_device(struct output *o, const char *dev) {
     char tbl[16];
     snprintf(tbl, sizeof(tbl), "%d", o->table);
     /* Был ли маршрут в dev ДО привязки — решает, снимать ли соединения (ниже). */
@@ -1207,9 +1214,9 @@ void bind_device(struct output *o, const char *dev) {
      * до привязки и до снятия соединений по той же причине, по какой в apply_failed
      * ставится до них. При отказе привязки ниже отметка возвращается. */
     failopen_mark(o, 0);
-    int rc = table_bind(o, dev);
-    rule_ensure(o->mark, o->table);
-    if (rc == 0) route6_bind(o, dev); /* диагностика IPv6 — в route6_bind */
+    enum table_bind_result rc = table_bind(o, dev);
+    int rule_rc = rule_ensure(o->mark, o->table);
+    int rc6 = rc != TABLE_MAIN_FAILED ? route6_bind(o, dev) : 0;
     /* Соединения снимаются ЗДЕСЬ, а не в сторожевом проходе целиком: bind_device зовут,
      * когда маршрут выхода действительно меняется (первая привязка, смена устройства,
      * расхождение состояния), а не каждую минуту. Снимать записи на здоровом тике значило бы
@@ -1227,8 +1234,8 @@ void bind_device(struct output *o, const char *dev) {
      *
      * Отказ привязки (rc != 0) — не «маршрут уже туда»: ниже таблица сбросится или встанет запрет,
      * и записи, шедшие в это устройство, уйдут напрямую или в пустоту — снимать их надо. */
-    if (!same || rc != 0) conntrack_evict(o->mark);
-    if (rc != 0) {
+    if (!same || rc == TABLE_MAIN_FAILED) conntrack_evict(o->mark);
+    if (rc == TABLE_MAIN_FAILED) {
         /* Замена не прошла: устройство исчезло между проверкой и привязкой (свой же процесс
          * туннеля умер), нет прав. В таблице осталось то, что было, — прежнее устройство,
          * запрет или ничего, — и оставлять это на волю случая нельзя: пустая таблица — это не
@@ -1238,8 +1245,9 @@ void bind_device(struct output *o, const char *dev) {
         fprintf(stderr, LOG_W "выход %s: не удалось привязать таблицу %s к %s — "
                         "устройство ещё живо?\n", o->name, tbl, dev);
         if (o->on_fail == FAIL_DROP) {
-            table_bind(o, NULL);
-            if (!route6_bind(o, NULL))
+            int rc4 = table_bind(o, NULL);
+            rc6 = route6_bind(o, NULL);
+            if (!rule_rc && !rc4 && !rc6)
                 fprintf(stderr, LOG_W "выход %s: трафик остановлен до успешной привязки "
                             "(on_fail=drop)\n", o->name);
         } else {
@@ -1253,6 +1261,7 @@ void bind_device(struct output *o, const char *dev) {
             failopen_mark(o, 1);
         }
     }
+    return rc != TABLE_BOUND || rule_rc || rc6;
 }
 
 /* ---- сверка фактического состояния маршрутизации -----------------------------
@@ -2826,10 +2835,7 @@ static void out_finish(struct fo_run *r) {
         /* У выхода-одиночки кандидат — он сам, и chosen указывает в его же device. */
         if (chosen != o->device) snprintf(o->device, sizeof(o->device), "%s", chosen);
         if (strcmp(was, chosen) != 0) {
-            bind_device(o, chosen);
-            printf("steer: выход %s -> %s%s\n", o->name, chosen,
-                   was[0] && strcmp(was, "-") ? " (переключение)" : "");
-            r->changed = 1;
+            int bound = !bind_device(o, chosen);
             const char *why = !was[0] ? "start" : !strcmp(was, "-") ? "recovered"
                             : r->cur < 0 ? "spec" : r->by_latency ? "latency"
                             : r->cur_dead ? "down" : "preferred";
@@ -2839,8 +2845,13 @@ static void out_finish(struct fo_run *r) {
             if (r->named && had && r->cur >= 0 && r->cur == r->pk) why = "leaf";
             else if (r->named && had && gcf && gcf->pick == PICK_MANUAL && r->cur >= 0)
                 why = "select";
-            fo_emit(r->ev, r->ev_arg, FO_EV_SWITCHED, o,
-                    was[0] && strcmp(was, "-") ? was : NULL, chosen, why, member);
+            if (bound) {
+                printf("steer: выход %s -> %s%s\n", o->name, chosen,
+                       had ? " (переключение)" : "");
+                r->changed = 1;
+                fo_emit(r->ev, r->ev_arg, FO_EV_SWITCHED, o,
+                        had ? was : NULL, chosen, why, member);
+            }
         } else {
             /* Имя устройства то же — и это НЕ значит, что маршрутизация цела.
              * Спрашиваем ядро, а не свою память: см. «сверка фактического
@@ -2894,10 +2905,11 @@ static void out_finish(struct fo_run *r) {
          * устройству, которое не отвечает, — тогда трафик уходит в мёртвый туннель
          * вместо остановки, обещанной on_fail=drop. */
         if (strcmp(was, "-") != 0) {
-            apply_failed(o, 1);         /* отказ только что случился — объявляем */
-            r->changed = 1;
-            fo_emit(r->ev, r->ev_arg, FO_EV_FAILED, o, was[0] ? was : NULL, NULL,
-                    r->via_down ? "via" : "down", NULL);
+            if (!apply_failed(o, 1)) {  /* failed подписчикам обещает применённый on_fail */
+                r->changed = 1;
+                fo_emit(r->ev, r->ev_arg, FO_EV_FAILED, o, was[0] ? was : NULL, NULL,
+                        r->via_down ? "via" : "down", NULL);
+            }
         } else {
             struct route_facts f = route_facts_read(o);
             if (!f.known) {

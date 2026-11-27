@@ -26,6 +26,12 @@ mkdir -p /run/fixture
 cp "$BIN" /run/fixture/steerd || exit 2
 if [ "$RULE_TEST_MODE" = ipv6 ]; then
     cp "$(dirname "$0")/apply-rule6.py" /run/fixture/ || exit 2
+elif [ "$RULE_TEST_MODE" = blackhole4 ]; then
+    cp "$(dirname "$0")/apply-blackhole4.py" /run/fixture/ || exit 2
+    for scope in all default; do
+        knob=/proc/sys/net/ipv6/conf/$scope/disable_ipv6
+        [ ! -e "$knob" ] || echo 1 > "$knob" || exit 2
+    done
 fi
 cp "$awk_path" /run/fixture/awk || exit 2
 mount -t tmpfs tmpfs /tmp || exit 2
@@ -38,6 +44,8 @@ ip link add vpn0 type dummy || exit 2
 ip link set vpn0 up || exit 2
 if [ "$RULE_TEST_MODE" = ipv6 ]; then
     exec python3 -Bu /run/fixture/apply-rule6.py
+elif [ "$RULE_TEST_MODE" = blackhole4 ]; then
+    exec python3 -Bu /run/fixture/apply-blackhole4.py
 fi
 cat >/tmp/spec.json <<'EOF'
 {"schema":2,"from_default":["192.168.1.0/24"],

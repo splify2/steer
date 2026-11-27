@@ -1470,15 +1470,16 @@ void route6_flush(int table);
  * запасной запрет и основной маршрут (в dev либо prohibit вместо него). */
 int route6_bind(const struct output *o, const char *dev);
 /* Маршрут по умолчанию таблицы выхода — в устройство dev (или запрет, если dev == NULL) одной
- * заменой, без сброса таблицы; всё прочее в таблице снимается после. 0 — встал; иначе
- * таблица осталась, как была, и решать вызывающему. Там же, в failover.c. */
-int table_bind(const struct output *o, const char *dev);
+ * заменой, без сброса таблицы. Отличать отказ основного от отказа только запасного:
+ * во втором случае основной уже встал, подменять устройство запретом нельзя. */
+enum table_bind_result { TABLE_BOUND, TABLE_MAIN_FAILED, TABLE_BACKSTOP_FAILED };
+enum table_bind_result table_bind(const struct output *o, const char *dev);
 
 /* Привязать таблицу выхода к устройству: правило по метке и маршрут по умолчанию. Живёт в
  * failover.c, и зовёт её только демон: сторож на смене устройства и сверке, группы, супервизор по
  * up помощника с именем устройства (daemon/supd.c, route_up). До 1.10 её звали и клиенты VLESS и
  * xsteer сами; с шага 3 модули маршрута не трогают (evline.h, поле dev). */
-void bind_device(struct output *o, const char *dev);
+int bind_device(struct output *o, const char *dev);
 
 /* TCP клиентов — к слушателю модуля (R-152): карта TCP_REDIR_MAP «метка → порт» идёт за
  * привязкой таблицы выхода (table_bind). learn — устройства модулей с KC_TCP_REDIR и их порты из

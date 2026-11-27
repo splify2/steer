@@ -641,8 +641,8 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
     snprintf(was, sizeof(was), "%s", go->failed ? "-" : go->device);
     char line[80];
     snprintf(line, sizeof(line), "%s %s", gname, mname);
-    rec_set(st, "select", gname, line);
     if (!route) {
+        rec_set(st, "select", gname, line);
         fprintf(out, "steer: группа %s — выбран %s; ядро выключено, выбор применится при "
                      "включении\n", gname, mname);
         return 0;
@@ -661,7 +661,7 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
     char gline[96];
     if (alive) {
         int moved = strcmp(was, mdev) != 0;
-        if (moved) bind_device(go, mdev);
+        if (moved && bind_device(go, mdev)) return 1;
         snprintf(gline, sizeof(gline), "%s %s 0", go->name, mdev);
         rec_set(st, "active", go->name, gline);
         /* Событие — только если маршрут группы действительно сменился (повтор того же выбора —
@@ -678,7 +678,7 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
          * Группа получает свой on_fail, пока выбранный член не поднимется (сторож вернёт трафик
          * на него сам, как только его проход скажет «жив»). */
         int moved = strcmp(was, "-") != 0;
-        if (moved) fo_fail_apply(go);
+        if (moved && fo_fail_apply(go)) return 1;
         snprintf(gline, sizeof(gline), "%s - 0", go->name);
         rec_set(st, "active", go->name, gline);
         const char *of = go->on_fail == FAIL_DROP ? "drop" : go->on_fail == FAIL_ZAPRET ? "zapret"
@@ -692,6 +692,7 @@ int fog_select(struct spec *sp, struct fo_store *st, const char *gname, const ch
         fprintf(out, "steer: группа %s — выбран %s, но он не работает: трафик группы по on_fail=%s, "
                      "пока %s не поднимется\n", gname, mname, of, mname);
     }
+    rec_set(st, "select", gname, line);
     /* Запись groups — выбранный член сразу, чтобы status не ждал прохода. */
     char *text = rec_read(st, "groups");
     /* Живые члены — в куче по длине записи: у группы balance на сотню членов строка длиннее

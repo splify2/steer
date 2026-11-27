@@ -416,13 +416,14 @@ static int apply_routing_one(const struct output *o) {
      * каждом apply помеченный трафик выхода на миг оставался без правила и без маршрута,
      * то есть уходил напрямую, мимо туннеля, — подробно у table_bind. Маршрут первым: если
      * правила не было, появившееся должно найти в таблице устройство, а не пустоту. */
-    int rc = table_bind(o, o->device);
+    enum table_bind_result rc = table_bind(o, o->device);
     if (rule_ensure(o->mark, o->table)) {
         fprintf(stderr, LOG_W "output %s: правило IPv4 не подтверждено\n", o->name);
         return 1;
     }
-    if (rc == 0 && route6_bind(o, o->device)) return 1;
-    if (rc != 0) {
+    if (rc != TABLE_MAIN_FAILED && route6_bind(o, o->device)) return 1;
+    if (rc == TABLE_BACKSTOP_FAILED) return 1;
+    if (rc == TABLE_MAIN_FAILED) {
         fprintf(stderr, LOG_W "выход %s: не проложить маршрут через %s — устройство поднято?\n",
                 o->name, o->device);
         /* Пустая таблица — это не «нет маршрута», а «ищи дальше»: помеченный
@@ -431,8 +432,9 @@ static int apply_routing_one(const struct output *o) {
          * тиком failover обязано быть закрыто, иначе защита работает не всегда,
          * а это хуже, чем не работает вовсе. */
         if (o->on_fail == FAIL_DROP) {
-            table_bind(o, NULL);
-            if (route6_bind(o, NULL)) return 1;
+            int rc4 = table_bind(o, NULL);
+            int rc6 = route6_bind(o, NULL);
+            if (rc4 || rc6) return 1;
             fprintf(stderr, LOG_W "output %s: трафик остановлен до появления "
                             "рабочего устройства (on_fail=drop)\n", o->name);
         } else {
