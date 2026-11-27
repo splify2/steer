@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include "pmgroup.h"
 #include "ctlcall.h"
+#include "ctlcall_io.h"
 #include "scrypto.h"
 
 int pm_group_reader(int writer) {
@@ -48,6 +49,15 @@ int pm_group_pending(void) {
 
 static void hex(const unsigned char b[32], char s[65]) {
     for (int i = 0; i < 32; i++) sprintf(s+i*2, "%02x", b[i]);
+}
+
+static int sha256(const void *buf, size_t n, unsigned char out[32]) {
+    struct sc_hash_ctx h;
+    if (sc_hash_init(&h, SC_SHA256)) return -1;
+    int rc = sc_hash_update(&h, buf, n);
+    if (!rc) rc = sc_hash_final(&h, out);
+    sc_hash_free(&h);
+    return rc;
 }
 
 /* ynode проверяет вложенность, UTF-8 и повторы ключей, но допускает YAML.
@@ -138,7 +148,10 @@ static int group_reload(const char *owner, char found[128], char failure[65], st
     snprintf(found,128,"%ju:%ju:%jd:%ju",(uintmax_t)b.st_dev,(uintmax_t)b.st_ino,
              (intmax_t)peer.pid,(uintmax_t)peer.uid);
     if (owner && strcmp(owner,found)) goto uncertain;
-    char *reply = ctlcall_exchange(fd,"plugin-reload\n");
+    static const char request[] = "plugin-reload\n";
+    if (ctl_write_all(fd,request,sizeof(request)-1,NULL)) goto uncertain;
+    char *reply = ctl_read_reply(fd);
+    close(fd);
     fd = -1;
     if (!reply) goto uncertain;
     struct ydoc *d = pm_json_parse(reply,strlen(reply),"plugin-reload",NULL);
@@ -157,7 +170,7 @@ static int group_reload(const char *owner, char found[128], char failure[65], st
         if (code > 0 && code <= 255 && err && err->style == YS_DOUBLE && err->len && strlen(err->str) == err->len) {
             unsigned char sum[32];
             char *key = pm_fmt("%ld:%s",code,err->str);
-            if (!sc_hash(SC_SHA256,key,strlen(key),sum)) {
+            if (!sha256(key,strlen(key),sum)) {
                 hex(sum,failure);
                 pm_errc(e,"plugin.reload_failed",PMA("why",err->str),"ядро не перечитало плагины: %s",err->str);
                 rc = CONFIG_ERROR;
@@ -281,7 +294,7 @@ static int digest(const char *p, char out[65]) {
 int pm_group_write(const struct pm_group *g, const char *name, const char *path,
                    const char *buf, size_t n) {
     unsigned char b[32]; char sum[65];
-    if (sc_hash(SC_SHA256,buf,n,b)) return -1;
+    if (sha256(buf,n,b)) return -1;
     struct stat st;
     unsigned mode = 0644;
     if (!lstat(path,&st)) {
@@ -357,7 +370,7 @@ static int mark(const char *path, const char *phase, const char *dir, const char
                 uintmax_t dev, uintmax_t ino) {
     char *s = pm_fmt("G1 %s %s %ju %ju %s", phase, strrchr(dir, '/')+1, dev, ino, sum);
     unsigned char b[32]; char check[65]; int rc = -1;
-    if (!sc_hash(SC_SHA256,s,strlen(s),b)) {
+    if (!sha256(s,strlen(s),b)) {
         hex(b,check);
         char *record = pm_fmt("%s %s\n",s,check);
         rc = pm_write_atomic(path,record,strlen(record),0600);
@@ -440,7 +453,7 @@ int pm_group_finish(const char *marker, int accept) {
     unsigned char b[32];
     if (!record || sscanf(record,"G1 %11s " PM_GROUP_DIR " %ju %ju %64[-0-9a-f]%n",
                           phase, &dev, &ino, sum, &end) != 4 || end < 0 || (size_t)end+66 != n ||
-        record[end] != ' ' || record[n-1] != '\n' || sc_hash(SC_SHA256,record,end,b) ||
+        record[end] != ' ' || record[n-1] != '\n' || sha256(record,end,b) ||
         (!strcmp(phase,"preparing") ? strcmp(sum,"-") :
         (strlen(sum) != 64 || (strcmp(phase,"active") && strcmp(phase,"finished"))))) {
         free(record); return -1;

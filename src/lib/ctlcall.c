@@ -14,8 +14,7 @@
 #include "platform.h"
 #include "ctlcall.h"
 
-/* Ответ: stdout до 1 МиБ и stderr до 64 КиБ, а экранирование (\u00XX) раздувает до шести раз. */
-#define RESP_MAX (8UL * 1024UL * 1024UL)
+#include "ctlcall_io.h"
 
 static const char *g_sock;
 
@@ -43,26 +42,9 @@ int ctlcall_open(int timeout_s) {
     return s;
 }
 
-static int write_all(int fd, const char *p, size_t n, int *sent) {
-    while (n) {
-        /* send с MSG_NOSIGNAL, а не write: демон, закрывший сокет раньше, чем дочитал тело, —
-         * отказ записи, после которого ответ всё равно читается (ctlcall_roundtrip, ниже), а не
-         * SIGPIPE, убивающий вызвавшего молча. Из этого файла пишут и модули (xsteer-peers). */
-        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
-        if (w < 0 && errno == EINTR) continue;
-        if (w <= 0) return -1;
-        if (sent) *sent = 1;
-        p += w;
-        n -= (size_t)w;
-    }
-    return 0;
-}
-
 char *ctlcall_roundtrip(const char *line, const char *body, size_t body_n, int timeout_s) {
     return ctlcall_roundtrip_sent(line, body, body_n, timeout_s, NULL);
 }
-
-static char *read_reply(int s);
 
 char *ctlcall_roundtrip_sent(const char *line, const char *body, size_t body_n,
                             int timeout_s, int *sent) {
@@ -71,38 +53,10 @@ char *ctlcall_roundtrip_sent(const char *line, const char *body, size_t body_n,
     if (s < 0) return NULL;
     /* Ошибка записи не повод молчать: сервер мог отказать (тело больше предела) и закрыть
      * соединение, не читая, — его ответ всё равно лежит в сокете. */
-    if (write_all(s, line, strlen(line), sent) == 0 && body_n) write_all(s, body, body_n, sent);
-    return read_reply(s);
-}
-
-char *ctlcall_exchange(int s, const char *line) {
-    if (write_all(s,line,strlen(line),NULL)) { close(s); return NULL; }
-    return read_reply(s);
-}
-
-static char *read_reply(int s) {
-    size_t cap = 4096, n = 0;
-    char *r = malloc(cap);
-    if (!r) { close(s); return NULL; }
-    for (;;) {
-        if (n + 1 >= cap) {
-            if (cap >= RESP_MAX) break;
-            char *q = realloc(r, cap * 2);
-            if (!q) break;
-            r = q;
-            cap *= 2;
-        }
-        ssize_t m = read(s, r + n, cap - n - 1);
-        if (m < 0 && errno == EINTR) continue;
-        if (m <= 0) break;
-        n += (size_t)m;
-        if (memchr(r + n - (size_t)m, '\n', (size_t)m)) break;
-    }
+    if (ctl_write_all(s, line, strlen(line), sent) == 0 && body_n)
+        ctl_write_all(s, body, body_n, sent);
+    char *r = ctl_read_reply(s);
     close(s);
-    r[n] = '\0';
-    char *nl = strchr(r, '\n');
-    if (!nl) { free(r); return NULL; }
-    *nl = '\0';
     return r;
 }
 
