@@ -163,7 +163,7 @@ struct folat_m {
 #define LOG_WL "steer[warn] latency: "
 struct fl_note {
     char grp[32], key[32], why[192];
-    long at;                          /* CLOCK_MONOTONIC, с; 0 — говорить, как только случится */
+    int64_t at;                       /* CLOCK_MONOTONIC, с; 0 — говорить, как только случится */
 };
 static struct fl_note *g_notes;
 static size_t g_notes_n, g_notes_cap;
@@ -179,7 +179,7 @@ static void fm_note(const struct folat_m *fm, int fam, int ms) {
     }
     const char *why = urltest_why();
     if (!why[0]) return;
-    long now = loop_now_ms() / 1000 + 1;
+    int64_t now = loop_now_ms() / 1000 + 1;
     if (n && n->at && now - n->at < FOLAT_NOTE_S && !strcmp(n->why, why)) return;
     if (!n) {
         if (g_notes_n == g_notes_cap) {
@@ -292,7 +292,7 @@ struct fl_grp {
      * таймер сработает (loop_now_ms): по первому — повтор раньше срока (fl_delay_ms), по второму
      * folat_sync не отодвигает повтор, который и так ближе. */
     int fails;
-    long due;
+    int64_t due;
     /* Идущий замер: ключи членов на момент начала (сверка в конце), кого мерить, итоги. */
     int running;
     size_t n, k;

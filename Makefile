@@ -82,7 +82,10 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
+test: $(BUILD)/clock64match $(BUILD)/loopfairmatch
 test: all ext-syntax $(BUILD)/steer-android $(BUILD)/dnsmatch $(BUILD)/dupmatch $(BUILD)/dupconnmatch $(BUILD)/dupfragmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunsteermatch $(BUILD)/spscmatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/helpersmatch $(BUILD)/rrkeepmatch $(BUILD)/runmatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/grpcmatch $(BUILD)/xhupmatch $(BUILD)/wsmatch $(BUILD)/tls13readmatch $(BUILD)/certrootsmatch $(BUILD)/pqfallbackmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/httpmatch $(BUILD)/tarmatch $(BUILD)/hy2match $(BUILD)/pxsubmatch $(BUILD)/pxdialmatch $(BUILD)/trdialmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/outqmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/warpmatch $(BUILD)/evmatch $(BUILD)/srsunit $(BUILD)/procscanmatch $(BUILD)/modelmatch $(BUILD)/yamlmatch $(BUILD)/urltestmatch $(BUILD)/urltlsmatch $(BUILD)/nftvmap-tool $(BUILD)/rtnl-tool $(BUILD)/nftdump-tool $(BUILD)/nldonematch $(BUILD)/b3match $(BUILD)/subpq $(BUILD)/abihost $(BUILD)/abihost-static $(BUILD)/steerd-static $(BUILD)/pluginmodel $(BUILD)/pkhooks $(BUILD)/pkmatch $(BUILD)/pmkindmatch $(BUILD)/foprobematch $(BUILD)/tunfloodmatch $(BUILD)/hsdlmatch $(BUILD)/httpcspinmatch
+	@$(BUILD)/clock64match
+	@$(BUILD)/loopfairmatch
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -514,6 +517,16 @@ $(BUILD)/runmatch: tests/runmatch.c src/lib/run.c src/lib/run.h
 
 # Проба ICMP сторожа (src/daemon/foprobe.c) одним вызовом — для tests/foprobe.sh (потери и задержки
 # эхо-ответов в пространствах имён).
+$(BUILD)/loopfairmatch: tests/loopfairmatch.c src/daemon/loop.c src/daemon/loop.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/loopfairmatch.c src/daemon/loop.c
+
+# Real ILP32 can use the same target/toolchain; injected time crosses LONG_MAX
+# without changing system time. GC isolates helpers_now_ms from helper startup.
+$(BUILD)/clock64match: tests/clock64match.c src/daemon/loop.c src/daemon/loop.h src/daemon/helpers.c src/daemon/helpers.h src/lib/monotime.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o $@ tests/clock64match.c src/daemon/loop.c src/daemon/helpers.c -Wl,--gc-sections -Wl,--wrap=clock_gettime -Wl,--wrap=timerfd_settime
+
 $(BUILD)/foprobematch: tests/foprobematch.c src/daemon/foprobe.c src/daemon/foprobe.h src/daemon/loop.c \
                        src/daemon/loop.h
 	@mkdir -p $(BUILD)

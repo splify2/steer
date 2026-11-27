@@ -14,6 +14,7 @@
 #include <sys/timerfd.h>
 
 #include "loop.h"
+#include "../lib/monotime.h"
 
 /* Запись дескриптора. Снятая (dead) доживает до конца пачки событий: указатель на неё мог
  * остаться в массиве, который epoll_wait уже вернул. */
@@ -28,7 +29,8 @@ struct loop_io {
 struct loop_timer {
     struct loop_timer *next;
     struct loop *l;
-    long due;                 /* срок, мс CLOCK_MONOTONIC; 0 — не заведён */
+    int64_t due;              /* срок, мс CLOCK_MONOTONIC; 0 — не заведён */
+    uint64_t ready_epoch;      /* due occurrence captured before timer callbacks */
     loop_timer_cb cb;
     void *arg;
 };
@@ -53,19 +55,16 @@ struct loop {
     struct loop_timer *timers;
     struct loop_kid *kids;
     struct loop_sig sigs[3];          /* SIGHUP, SIGTERM, SIGINT */
-    long armed;                       /* на какой срок взведён timerfd; 0 — снят */
+    int64_t armed;                    /* на какой срок взведён timerfd; 0 — снят */
     int stop, code;
     int reap_dead;                    /* в ios есть снятые записи */
+    uint64_t timer_epoch;
 };
 
 /* Маркеры для data.ptr своих дескрипторов — сравниваются по адресу. */
 static char LOOP_SIG_TAG, LOOP_TIMER_TAG;
 
-long loop_now_ms(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (long)t.tv_sec * 1000L + t.tv_nsec / 1000000L;
-}
+int64_t loop_now_ms(void) { return steer_mono_ms(); }
 
 static void loop_sigset(sigset_t *s) {
     sigemptyset(s);
@@ -184,11 +183,12 @@ struct loop_timer *loop_timer_new(struct loop *l, loop_timer_cb cb, void *arg) {
 }
 
 void loop_timer_set(struct loop_timer *t, long ms) {
-    long due = loop_now_ms() + (ms > 0 ? ms : 0);
+    int64_t due = steer_mono_after(loop_now_ms(),ms);
     t->due = due > 0 ? due : 1;
+    t->ready_epoch = 0;                    /* rescheduled work belongs to a later turn */
 }
 
-void loop_timer_stop(struct loop_timer *t) { if (t) t->due = 0; }
+void loop_timer_stop(struct loop_timer *t) { if (t) { t->due = 0; t->ready_epoch = 0; } }
 
 int loop_timer_armed(const struct loop_timer *t) { return t && t->due != 0; }
 
@@ -204,7 +204,7 @@ void loop_timer_free(struct loop_timer *t) {
  * тогда сон действительно бессрочный. Пересчёт дешёвый (таймеров единицы), а системный
  * вызов делается, только если срок изменился. */
 static void timers_arm(struct loop *l) {
-    long first = 0;
+    int64_t first = 0;
     for (struct loop_timer *t = l->timers; t; t = t->next)
         if (t->due && (!first || t->due < first)) first = t->due;
     if (first == l->armed) return;
@@ -218,19 +218,26 @@ static void timers_arm(struct loop *l) {
     l->armed = first;
 }
 
-/* Сработавшие таймеры — по одному, заново ища следующий после каждого вызова: обратный вызов
- * может освободить или переставить любой таймер, включая соседей по списку. */
+/* Capture due occurrences before invoking callbacks. Rearmed/new work waits for
+ * another epoll turn; a zero-delay chain cannot starve fds/signals. Re-search the
+ * live list after every callback: neighbors may have been freed or rescheduled. */
+#define LOOP_TIMER_BATCH 64u
 static void timers_fire(struct loop *l) {
     uint64_t n;
     while (read(l->tfd, &n, sizeof(n)) > 0) {}
     l->armed = -1;                         /* взведённого больше нет — пересчитать перед сном */
-    for (;;) {
-        long now = loop_now_ms();
+    int64_t now = loop_now_ms();
+    uint64_t epoch = ++l->timer_epoch;
+    if (!epoch) epoch = ++l->timer_epoch;
+    for (struct loop_timer *t = l->timers; t; t = t->next)
+        t->ready_epoch = t->due && t->due <= now ? epoch : 0;
+    for (unsigned fired = 0; fired < LOOP_TIMER_BATCH && !l->stop; fired++) {
         struct loop_timer *due = NULL;
         for (struct loop_timer *t = l->timers; t; t = t->next)
-            if (t->due && t->due <= now && (!due || t->due < due->due)) due = t;
+            if (t->ready_epoch == epoch && t->due && t->due <= now && (!due || t->due < due->due)) due = t;
         if (!due) break;
         due->due = 0;
+        due->ready_epoch = 0;
         due->cb(l, due, due->arg);
     }
 }

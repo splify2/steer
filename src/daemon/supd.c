@@ -871,7 +871,7 @@ static int orphans_stop(const char *who) {
                         "гашу\n", who, p, what);
     }
     closedir(d);
-    long due = helpers_now_ms() + 3000;
+    int64_t due = helpers_now_ms() + 3000;
     int hard = 0;
     for (;;) {
         size_t left = 0;
@@ -895,7 +895,7 @@ static int orphans_stop(const char *who) {
             hard = 1;
             due = helpers_now_ms() + 1000;
         }
-        long ms = due - helpers_now_ms();
+        int64_t ms = due - helpers_now_ms();
         if (ms < 1) ms = 1;
         if (all_fd) {
             struct pollfd *pf = calloc(left, sizeof(*pf));
@@ -949,9 +949,9 @@ static int dnsd_connect(pid_t *pid) {
 
 /* Ждать закрытия соединения резолвером (его выхода) до ms. 1 — закрыл. */
 static int dnsd_gone(int fd, long ms) {
-    long end = helpers_now_ms() + ms;
+    int64_t end = helpers_now_ms() + ms;
     for (;;) {
-        long left = end - helpers_now_ms();
+        int64_t left = end - helpers_now_ms();
         if (left <= 0) return 0;
         struct pollfd p = { fd, POLLIN, 0 };
         int r = poll(&p, 1, (int)left);

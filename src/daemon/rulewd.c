@@ -171,11 +171,11 @@ struct rulewd {
     int nl;
     struct loop_timer *tm;
     int pending;                  /* было наше удаление — нужна проверка */
-    long first;                   /* когда пришло первое событие пачки, мс монотонных */
+    int64_t first;                   /* когда пришло первое событие пачки, мс монотонных */
     /* Когда страж возвращал правила сам, по кругу (0 — не было): по ним узнаётся шторм. */
-    long back_at[RULEWD_STORM_N + 1];
+    int64_t back_at[RULEWD_STORM_N + 1];
     int back_i;
-    long storm_said;              /* когда последний раз сказали о шторме в журнал */
+    int64_t storm_said;              /* когда последний раз сказали о шторме в журнал */
     /* Приоритеты снятых правил: с каким вернуть (см. шапку). */
     struct { int fam; uint32_t mark; uint32_t prio; } *pref;
     size_t pref_n, pref_cap;
@@ -364,8 +364,8 @@ static int rulewd_restore(struct rulewd *r, const struct spec *sp, char *all, ch
 
 /* Шторм ли сейчас: больше RULEWD_STORM_N возвратов за окно (см. шапку, «ШТОРМ»). back_at — круг
  * из RULEWD_STORM_N + 1 мест: самое старое место — back_at[back_i]. */
-static int rulewd_storm(const struct rulewd *r, long now) {
-    long oldest = r->back_at[r->back_i];
+static int rulewd_storm(const struct rulewd *r, int64_t now) {
+    int64_t oldest = r->back_at[r->back_i];
     return oldest && now - oldest < RULEWD_STORM_WIN_MS;
 }
 
@@ -515,7 +515,7 @@ static void rulewd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
         }
     }
     if (!ours || !r->on) return;
-    long now = loop_now_ms();
+    int64_t now = loop_now_ms();
     int storm = rulewd_storm(r, now);
     if (storm && (!r->storm_said || now - r->storm_said >= RULEWD_STORM_WIN_MS)) {
         r->storm_said = now;
@@ -526,7 +526,7 @@ static void rulewd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
     long quiet = storm ? RULEWD_QUIET_MS : RULEWD_FAST_MS;
     long most = storm ? RULEWD_MAX_MS : RULEWD_FAST_MAX_MS;
     if (!r->pending) { r->pending = 1; r->first = now; }
-    long left = r->first + most - now;
+    int64_t left = r->first + most - now;
     loop_timer_set(r->tm, left < quiet ? (left > 0 ? left : 0) : quiet);
 }
 

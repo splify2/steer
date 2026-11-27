@@ -26,6 +26,8 @@ build/gcm-size
 # менялся в каждом коммите, который трогал tgws.c: собранный файл в истории — это
 # бинарный дифф на ровном месте и лишний повод для конфликта (I-237).
 build/httpmatch
+build/clock64match
+build/loopfairmatch
 build/httpsget
 build/sigmatch
 build/tarmatch

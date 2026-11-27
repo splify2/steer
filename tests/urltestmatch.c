@@ -137,7 +137,7 @@ static int run_fam(const char *url, int fam, int timeout_ms, long *took) {
     g_ms = -2;
     g_whyc[0] = '\0';
     fresh();
-    long t0 = loop_now_ms();
+    int64_t t0 = loop_now_ms();
     int ms = -2;
     struct urltest *u = urltest_start(g_l, url, fam, 0, NULL, timeout_ms, on_done, NULL, &ms);
     if (!u) snprintf(g_whyc, sizeof(g_whyc), "%s", urltest_why());
